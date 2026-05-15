@@ -2,7 +2,7 @@ import numpy as np
 from PIL import Image
 
 # 读取 CSV 文件（假设数据在一行内，以逗号分隔）
-csv_file = "digit.csv"
+csv_file = "./build/digit.csv"
 with open(csv_file, "r") as f:
     data = f.read().strip().split(",")
 
@@ -21,6 +21,6 @@ img_array = (img_array * 255).astype(np.uint8)
 
 # 创建图像并保存
 img = Image.fromarray(img_array, mode="L")  # "L" 表示灰度图
-img.save("output.png")
+img.save("./build/output.png")
 
 print("图片已保存为 output.png")
