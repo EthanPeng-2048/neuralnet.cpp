@@ -14,10 +14,6 @@
 #include <vector>
 #include "matrix.hpp"
 
-#ifndef NN_EXEC_POLICY
-#define NN_EXEC_POLICY std::execution::par_unseq
-#endif
-
 namespace nn {
 class Layer {
 public:
