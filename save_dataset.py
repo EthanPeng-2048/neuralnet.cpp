@@ -13,7 +13,7 @@ def export_to_csv(dataset, filename):
             writer.writerow([label] + pixels)
 
 def main():
-    os.makedirs("./mnist_data", exist_ok=True)
+    os.makedirs("./build/mnist_data", exist_ok=True)
 
     train_dataset = torchvision.datasets.MNIST(
         "./mnist_data/raw", train=True, download=True,
@@ -24,9 +24,9 @@ def main():
         transform=torchvision.transforms.ToTensor()
     )
 
-    export_to_csv(train_dataset, "./mnist_data/train.csv")
-    export_to_csv(test_dataset, "./mnist_data/test.csv")
-    print("Saved train.csv and test.csv to ./mnist_data/")
+    export_to_csv(train_dataset, "./build/mnist_data/train.csv")
+    export_to_csv(test_dataset, "./build/mnist_data/test.csv")
+    print("Saved train.csv and test.csv to ./build/mnist_data/")
 
 if __name__ == "__main__":
     main()
