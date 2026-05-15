@@ -1,0 +1,40 @@
+# Build output
+build/
+
+# Compiled executables
+*.exe
+*.out
+
+# Object files
+*.o
+*.obj
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.cmake
+!build.cmake
+!CMakeLists.txt
+
+# IDE / Editor
+.vs/
+.vscode/
+*.swp
+*.swo
+*~
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Generated data / images (optional, uncomment if needed)
+mnist_data/
+*.png
+*.csv
+
+# OS
+.DS_Store
+Thumbs.db
