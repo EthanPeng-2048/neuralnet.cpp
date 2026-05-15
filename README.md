@@ -31,22 +31,13 @@ neuralnet.cpp/
 ### build.cmake
 
 ```powershell
-cmake -P build.cmake
+cmake -B build -G Ninja
 ```
 
-### 准备数据（方法1）
+### 准备数据
 
 ```bash
-# 从 Kaggle 下载 MNIST CSV 数据
-# https://www.kaggle.com/datasets/oddrationale/mnist-in-csv
-# 将 train.csv 和 test.csv 放到 mnist_data/ 目录下
-mkdir mnist_data
-```
-
-### 准备数据（方法2）
-
-```bash
-# 直接运行下载脚本
+#运行下载脚本
 pip install pillow
 python save_dataset.py
 ```
