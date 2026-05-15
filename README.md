@@ -6,25 +6,34 @@
 
 ```
 neuralnet.cpp/
-├── CMakeLists.txt              # CMake 构建配置
+├── .gitignore
+├── CMakeLists.txt
 ├── README.md
-├── .vscode/
-│   └── c_cpp_properties.json   # VS Code IntelliSense 配置
+├── csv_png.py
+├── extract_digits.py
+├── save_dataset.py
+├── build/
+│   ├── mnist_infer.exe
+│   ├── mnist_train.exe
+│   └── mnist_data/
+│       ├── test.csv
+│       └── train.csv
 ├── include/
 │   └── neuralnet.cpp/
-│       └── nn.hpp              # 核心库（单头文件）
-├── src/
-│   └── train.cpp               # MNIST 训练入口
-└── mnist_data/                 # MNIST CSV 数据集（需自行下载）
-    ├── train.csv
-    └── test.csv
+│       ├── layer.hpp
+│       ├── loss.hpp
+│       ├── matrix.hpp
+│       └── optimizer.hpp
+└── src/
+    ├── infer.cpp
+    └── train.cpp
 ```
 
 ## 依赖
 
 - **编译器**: LLVM Clang++ 22.1+（`C:/Program Files/LLVM/bin/clang++.exe`）
 - **C++ 标准**: C++26
-- **构建工具**: CMake 4.x
+- **构建工具**: CMake 4.x Ninja
 
 ## 构建与运行
 
