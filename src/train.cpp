@@ -27,7 +27,7 @@ std::pair<nn::Matrix, nn::Matrix> load_csv(const std::string& filename, int max_
         labels.push_back(label);
 
         while (std::getline(ss, token, ',')) {
-            features.push_back(std::stod(token) / 255.0);
+            features.push_back(std::stod(token));  // 数据已由 ToTensor() 归一化到 [0,1]
         }
     }
 
@@ -58,61 +58,6 @@ std::pair<nn::Matrix, nn::Matrix> load_csv(const std::string& filename, int max_
 
     return {feat_mat, label_mat};
 }
-
-// -------------------- 交叉熵损失 --------------------
-class CrossEntropyLoss {
-private:
-    nn::Matrix grad_input_;   // 对输入 logits 的梯度
-
-public:
-    double forward(const nn::Matrix& logits, const nn::Matrix& target_onehot) {
-        std::size_t classes = logits.rows();
-        std::size_t batch = logits.cols();
-        grad_input_ = nn::Matrix(classes, batch);
-
-        double total_loss = 0.0;
-
-        for (std::size_t i = 0; i < batch; ++i) {
-            // 1. 数值稳定的 softmax
-            double max_val = logits.at_unchecked(0, i);
-            for (std::size_t c = 1; c < classes; ++c) {
-                max_val = std::max(max_val, logits.at_unchecked(c, i));
-            }
-            double sum_exp = 0.0;
-            std::vector<double> exp_vals(classes);
-            for (std::size_t c = 0; c < classes; ++c) {
-                double e = std::exp(logits.at_unchecked(c, i) - max_val);
-                exp_vals[c] = e;
-                sum_exp += e;
-            }
-
-            // 2. 找到真实类别（one‑hot 中 1 的位置）
-            std::size_t true_class = 0;
-            for (std::size_t c = 0; c < classes; ++c) {
-                if (target_onehot.at_unchecked(c, i) == 1.0) {
-                    true_class = c;
-                    break;
-                }
-            }
-
-            // 3. 计算 loss = -log(softmax[true_class])
-            double prob_true = exp_vals[true_class] / sum_exp;
-            total_loss += -std::log(prob_true);
-
-            // 4. 计算梯度：grad = softmax - target_onehot
-            for (std::size_t c = 0; c < classes; ++c) {
-                double softmax_c = exp_vals[c] / sum_exp;
-                grad_input_.set_value_unchecked(c, i, softmax_c - target_onehot.at_unchecked(c, i));
-            }
-        }
-
-        return total_loss / batch;
-    }
-
-    const nn::Matrix& backward() const {
-        return grad_input_;
-    }
-};
 
 // -------------------- 评估函数 --------------------
 double evaluate(nn::Linear& l1, nn::ReLU& r1, nn::Linear& l2, nn::ReLU& r2,
@@ -199,7 +144,7 @@ int main(int argc, char* argv[]) {
     for (auto& g : l4.param_gradients()) grads.push_back(g);
 
     nn::SGD optimizer(params, grads, 0.01);
-    CrossEntropyLoss ce_loss;
+    nn::CrossEntropyLoss ce_loss;
 
     const std::size_t batch_size = 64;
     const std::size_t num_batches = train_x.cols() / batch_size;

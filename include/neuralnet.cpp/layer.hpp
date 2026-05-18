@@ -42,7 +42,9 @@ public:
           grad_W_(out_features, in_features),   // 添加
           grad_b_(out_features, 1),             // 添加
           input_cache_() {
-        std::uniform_real_distribution<double> dist(-0.1, 0.1);
+        // Xavier 均匀初始化：适合 tanh/sigmoid，对 ReLU 也可用
+        const double limit = std::sqrt(6.0 / static_cast<double>(in_features + out_features));
+        std::uniform_real_distribution<double> dist(-limit, limit);
         std::ranges::generate(W_.data(), [&] { return dist(rng_); });
     }
     
