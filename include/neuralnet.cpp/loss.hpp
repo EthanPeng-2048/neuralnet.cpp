@@ -10,8 +10,16 @@
 
 namespace nn
 {
+    class Loss
+    {
+    public:
+        virtual ~Loss() = default;
+        virtual double forward(const Matrix &pred, const Matrix &target) = 0;
+        virtual Matrix backward() const = 0;
+    };
 
-    class MSELoss final
+
+    class MSELoss: public Loss
     {
     private:
         Matrix grad_input_;
@@ -63,7 +71,7 @@ namespace nn
         [[nodiscard]] Matrix backward() const { return grad_input_; }
     };
 
-    class CrossEntropyLoss final
+    class CrossEntropyLoss: public Loss
     {
     private:
         Matrix grad_input_;
