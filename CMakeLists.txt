@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # 为所有目标添加编译标志
-add_compile_options(-fexperimental-library)
+add_compile_options(-fexperimental-library -O3 -ffast-math -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function)
 
 # 定义可执行文件
 add_executable(mnist_train src/train.cpp)
@@ -15,7 +15,8 @@ add_executable(mnist_infer src/infer.cpp)
 target_include_directories(mnist_train PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(mnist_infer PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
-# 为特定目标链接 TBB 库
-target_link_libraries(mnist_train PRIVATE tbb)
-target_link_libraries(mnist_infer PRIVATE tbb)
+# 查找并链接 TBB 库
+find_package(TBB REQUIRED)
+target_link_libraries(mnist_train PRIVATE TBB::tbb)
+target_link_libraries(mnist_infer PRIVATE TBB::tbb)
 
