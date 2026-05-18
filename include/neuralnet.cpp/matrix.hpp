@@ -2,6 +2,7 @@
 #define MATRIX_HPP
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstddef>
 #include <execution>
@@ -20,6 +21,8 @@
 namespace nn {
 class Matrix {
 private:
+    static constexpr std::size_t BLOCK_SIZE = 64;
+
     std::vector<double> data_{};
     std::size_t rows_{0};
     std::size_t cols_{0};
@@ -155,20 +158,53 @@ public:
             throw std::invalid_argument("matrix multiplication dimension mismatch");
         }
 
-        Matrix result(rows_, other.cols_);
-        const Matrix other_t = other.transpose();
+        const std::size_t M = rows_;
+        const std::size_t N = other.cols_;
+        const std::size_t K = cols_;
 
-        auto indices = std::views::iota(std::size_t{0}, rows_ * other.cols_);
-        std::for_each(NN_EXEC_POLICY, indices.begin(), indices.end(),
-                      [&](std::size_t idx) {
-                          const std::size_t row = idx / other.cols_;
-                          const std::size_t col = idx % other.cols_;
-                          double sum = 0.0;
-                          for (std::size_t k = 0; k < cols_; ++k) {
-                              sum += data_[index(row, k)] * other_t.data_[other_t.index(col, k)];
-                          }
-                          result.data_[idx] = sum;
-                      });
+        Matrix result(M, N);
+
+        const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+        auto block_indices = std::views::iota(std::size_t{0}, i_blocks * j_blocks);
+        std::for_each(NN_EXEC_POLICY, block_indices.begin(), block_indices.end(),
+            [&](std::size_t block_idx) {
+                const std::size_t i_block = block_idx / j_blocks;
+                const std::size_t j_block = block_idx % j_blocks;
+
+                const std::size_t i_start = i_block * BLOCK_SIZE;
+                const std::size_t i_end   = std::min(i_start + BLOCK_SIZE, M);
+                const std::size_t j_start = j_block * BLOCK_SIZE;
+                const std::size_t j_end   = std::min(j_start + BLOCK_SIZE, N);
+
+                for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE) {
+                    const std::size_t k_end  = std::min(k_start + BLOCK_SIZE, K);
+                    const std::size_t k_len  = k_end - k_start;
+                    const std::size_t j_len  = j_end - j_start;
+
+                    // 加载 B 的子块到栈数组并转置：b_block[jj * k_len + kk] = B(k_start+kk, j_start+jj)
+                    std::array<double, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                    for (std::size_t jj = 0; jj < j_len; ++jj) {
+                        for (std::size_t kk = 0; kk < k_len; ++kk) {
+                            b_block[jj * k_len + kk] = other.data_[other.index(k_start + kk, j_start + jj)];
+                        }
+                    }
+
+                    // 累加当前 K 块对 C 块的贡献
+                    for (std::size_t i = i_start; i < i_end; ++i) {
+                        const std::size_t a_base = i * K + k_start;
+                        for (std::size_t j = j_start; j < j_end; ++j) {
+                            double sum = 0.0;
+                            const std::size_t b_base = (j - j_start) * k_len;
+                            for (std::size_t kk = 0; kk < k_len; ++kk) {
+                                sum += data_[a_base + kk] * b_block[b_base + kk];
+                            }
+                            result.data_[result.index(i, j)] += sum;
+                        }
+                    }
+                }
+            });
 
         return result;
     }
