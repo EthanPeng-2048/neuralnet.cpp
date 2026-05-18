@@ -9,11 +9,13 @@
 #include <cstdint>
 
 // -------------------- 从 CSV 字符串读取单样本 --------------------
-nn::Matrix load_image_from_csv(const std::string& csv_line) {
+nn::Matrix load_image_from_csv(const std::string &csv_line)
+{
     std::vector<double> pixels;
     std::stringstream ss(csv_line);
     std::string token;
-    while (std::getline(ss, token, ',')) {
+    while (std::getline(ss, token, ','))
+    {
         pixels.push_back(std::stod(token));
     }
     if (pixels.size() != 784)
@@ -27,16 +29,19 @@ nn::Matrix load_image_from_csv(const std::string& csv_line) {
 }
 
 // -------------------- 预测函数 --------------------
-int predict(nn::Linear& l1, nn::ReLU& r1, nn::Linear& l2, nn::ReLU& r2,
-            nn::Linear& l3, nn::ReLU& r3, nn::Linear& l4,
-            const nn::Matrix& img) {
+int predict(nn::Linear &l1, nn::ReLU &r1, nn::Linear &l2, nn::ReLU &r2,
+            nn::Linear &l3, nn::ReLU &r3, nn::Linear &l4,
+            const nn::Matrix &img)
+{
     auto out = l4.forward(r3.forward(l3.forward(r2.forward(l2.forward(r1.forward(l1.forward(img)))))));
     // 找到最大值的索引
     double max_val = out.at_unchecked(0, 0);
     int pred = 0;
-    for (int i = 1; i < 10; ++i) {
+    for (int i = 1; i < 10; ++i)
+    {
         double val = out.at_unchecked(i, 0);
-        if (val > max_val) {
+        if (val > max_val)
+        {
             max_val = val;
             pred = i;
         }
@@ -45,44 +50,54 @@ int predict(nn::Linear& l1, nn::ReLU& r1, nn::Linear& l2, nn::ReLU& r2,
 }
 
 // -------------------- 主函数 --------------------
-int main(int argc, char* argv[]) {
-    if (argc < 3) {
+int main(int argc, char *argv[])
+{
+    if (argc < 3)
+    {
         std::cerr << "Usage: " << argv[0] << " <model.bin> <image.csv>" << std::endl;
         std::cerr << "   or: " << argv[0] << " <model.bin> <image.png>  (if compiled with stb_image)" << std::endl;
         return 1;
     }
 
     std::string model_path = argv[1];
-    std::string img_path   = argv[2];
+    std::string img_path = argv[2];
 
     // 构建网络（与训练时结构一致）
     nn::Linear l1(784, 64);
-    nn::ReLU   r1;
+    nn::ReLU r1;
     nn::Linear l2(64, 64);
-    nn::ReLU   r2;
+    nn::ReLU r2;
     nn::Linear l3(64, 64);
-    nn::ReLU   r3;
+    nn::ReLU r3;
     nn::Linear l4(64, 10);
 
     // 加载模型参数
-    try {
+    try
+    {
         nn::load_model(model_path, l1, l2, l3, l4);
-    } catch (const std::exception& e) {
+    }
+    catch (const std::exception &e)
+    {
         std::cerr << "Error loading model: " << e.what() << std::endl;
         return 1;
     }
 
     // 读取图片
     nn::Matrix img;
-    try {
+    try
+    {
         // 判断文件扩展名（简单处理）
-        if (img_path.find(".csv") != std::string::npos || img_path.find(".txt") != std::string::npos) {
+        if (img_path.find(".csv") != std::string::npos || img_path.find(".txt") != std::string::npos)
+        {
             std::ifstream file(img_path);
-            if (!file) throw std::runtime_error("Cannot open image file");
+            if (!file)
+                throw std::runtime_error("Cannot open image file");
             std::string line;
             std::getline(file, line);
             img = load_image_from_csv(line);
-        } else {
+        }
+        else
+        {
             // 图像文件需要额外依赖，此处仅作示例框架
             std::cerr << "Image file loading not implemented in this example.\n";
             std::cerr << "Please use a CSV file with 784 pixel values.\n";
@@ -102,7 +117,9 @@ int main(int argc, char* argv[]) {
             stbi_image_free(data);
             */
         }
-    } catch (const std::exception& e) {
+    }
+    catch (const std::exception &e)
+    {
         std::cerr << "Error loading image: " << e.what() << std::endl;
         return 1;
     }
