@@ -1,4 +1,5 @@
 #include "neuralnet.cpp/nn.hpp"
+#include "neuralnet.cpp/model_io.hpp"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -6,42 +7,6 @@
 #include <vector>
 #include <algorithm>
 #include <cstdint>
-
-// -------------------- 模型加载（与训练程序相同）--------------------
-void load_model(const std::string& filename,
-                nn::Linear& l1, nn::Linear& l2, nn::Linear& l3, nn::Linear& l4) {
-    std::ifstream ifs(filename, std::ios::binary);
-    if (!ifs) throw std::runtime_error("Cannot read model file");
-
-    uint32_t magic, version;
-    ifs.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-    ifs.read(reinterpret_cast<char*>(&version), sizeof(version));
-    if (magic != 0x4E4E4E4E || version != 1)
-        throw std::runtime_error("Invalid model file format");
-
-    auto read_matrix = [&](nn::Matrix& m) {
-        std::size_t rows, cols;
-        ifs.read(reinterpret_cast<char*>(&rows), sizeof(rows));
-        ifs.read(reinterpret_cast<char*>(&cols), sizeof(cols));
-        if (rows != m.rows() || cols != m.cols())
-            throw std::runtime_error("Model shape mismatch");
-        auto& data = m.data();
-        ifs.read(reinterpret_cast<char*>(data.data()), data.size() * sizeof(double));
-    };
-
-    auto params1 = l1.parameters();
-    auto params2 = l2.parameters();
-    auto params3 = l3.parameters();
-    auto params4 = l4.parameters();
-    read_matrix(params1[0].get()); // W1
-    read_matrix(params1[1].get()); // b1
-    read_matrix(params2[0].get());
-    read_matrix(params2[1].get());
-    read_matrix(params3[0].get());
-    read_matrix(params3[1].get());
-    read_matrix(params4[0].get());
-    read_matrix(params4[1].get());
-}
 
 // -------------------- 从 CSV 字符串读取单样本 --------------------
 nn::Matrix load_image_from_csv(const std::string& csv_line) {
@@ -101,7 +66,7 @@ int main(int argc, char* argv[]) {
 
     // 加载模型参数
     try {
-        load_model(model_path, l1, l2, l3, l4);
+        nn::load_model(model_path, l1, l2, l3, l4);
     } catch (const std::exception& e) {
         std::cerr << "Error loading model: " << e.what() << std::endl;
         return 1;

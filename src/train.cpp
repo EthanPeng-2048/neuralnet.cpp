@@ -1,4 +1,5 @@
 #include "neuralnet.cpp/nn.hpp"
+#include "neuralnet.cpp/model_io.hpp"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -7,79 +8,6 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdint>
-
-// -------------------- 模型保存/加载 --------------------
-void save_model(const std::string& filename,
-                nn::Linear& l1, nn::Linear& l2, nn::Linear& l3, nn::Linear& l4) {
-    std::ofstream ofs(filename, std::ios::binary);
-    if (!ofs) throw std::runtime_error("Cannot write model file");
-
-    const uint32_t magic = 0x4E4E4E4E;
-    const uint32_t version = 1;
-    ofs.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
-    ofs.write(reinterpret_cast<const char*>(&version), sizeof(version));
-
-    auto write_matrix = [&](const nn::Matrix& m) {
-        std::size_t rows = m.rows(), cols = m.cols();
-        ofs.write(reinterpret_cast<const char*>(&rows), sizeof(rows));
-        ofs.write(reinterpret_cast<const char*>(&cols), sizeof(cols));
-        const auto& data = m.data();
-        ofs.write(reinterpret_cast<const char*>(data.data()), data.size() * sizeof(double));
-    };
-
-    // 注意：Linear 类的 parameters() 返回顺序为 [W, b]
-    auto params1 = l1.parameters();
-    auto params2 = l2.parameters();
-    auto params3 = l3.parameters();
-    auto params4 = l4.parameters();
-    write_matrix(params1[0].get()); // W1
-    write_matrix(params1[1].get()); // b1
-    write_matrix(params2[0].get()); // W2
-    write_matrix(params2[1].get()); // b2
-    write_matrix(params3[0].get()); // W3
-    write_matrix(params3[1].get()); // b3
-    write_matrix(params4[0].get()); // W4
-    write_matrix(params4[1].get()); // b4
-
-    std::cout << "Model saved to " << filename << std::endl;
-}
-
-void load_model(const std::string& filename,
-                nn::Linear& l1, nn::Linear& l2, nn::Linear& l3, nn::Linear& l4) {
-    std::ifstream ifs(filename, std::ios::binary);
-    if (!ifs) throw std::runtime_error("Cannot read model file");
-
-    uint32_t magic, version;
-    ifs.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-    ifs.read(reinterpret_cast<char*>(&version), sizeof(version));
-    if (magic != 0x4E4E4E4E || version != 1)
-        throw std::runtime_error("Invalid model file format");
-
-    auto read_matrix = [&](nn::Matrix& m) {
-        std::size_t rows, cols;
-        ifs.read(reinterpret_cast<char*>(&rows), sizeof(rows));
-        ifs.read(reinterpret_cast<char*>(&cols), sizeof(cols));
-        if (rows != m.rows() || cols != m.cols())
-            throw std::runtime_error("Model shape mismatch");
-        auto& data = m.data();
-        ifs.read(reinterpret_cast<char*>(data.data()), data.size() * sizeof(double));
-    };
-
-    auto params1 = l1.parameters();
-    auto params2 = l2.parameters();
-    auto params3 = l3.parameters();
-    auto params4 = l4.parameters();
-    read_matrix(params1[0].get());
-    read_matrix(params1[1].get());
-    read_matrix(params2[0].get());
-    read_matrix(params2[1].get());
-    read_matrix(params3[0].get());
-    read_matrix(params3[1].get());
-    read_matrix(params4[0].get());
-    read_matrix(params4[1].get());
-
-    std::cout << "Model loaded from " << filename << std::endl;
-}
 
 // -------------------- 数据加载 --------------------
 std::pair<nn::Matrix, nn::Matrix> load_csv(const std::string& filename, int max_samples = -1) {
@@ -99,7 +27,7 @@ std::pair<nn::Matrix, nn::Matrix> load_csv(const std::string& filename, int max_
         labels.push_back(label);
 
         while (std::getline(ss, token, ',')) {
-            features.push_back(std::stod(token));
+            features.push_back(std::stod(token) / 255.0);
         }
     }
 
@@ -253,7 +181,7 @@ int main(int argc, char* argv[]) {
     // 如果指定加载，则载入已有参数
     if (load_existing) {
         try {
-            load_model(model_path, l1, l2, l3, l4);
+            nn::load_model(model_path, l1, l2, l3, l4);
         } catch (const std::exception& e) {
             std::cerr << "Failed to load model: " << e.what() << ", starting from scratch.\n";
         }
@@ -325,6 +253,6 @@ int main(int argc, char* argv[]) {
     }
 
     // 训练结束后保存模型（也可每个 epoch 保存一次）
-    save_model(model_path, l1, l2, l3, l4);
+    nn::save_model(model_path, l1, l2, l3, l4);
     return 0;
 }
