@@ -102,20 +102,6 @@ int main(int argc, char *argv[])
             std::cerr << "Image file loading not implemented in this example.\n";
             std::cerr << "Please use a CSV file with 784 pixel values.\n";
             return 1;
-            /* 若使用 stb_image，可添加以下代码：
-            #define STB_IMAGE_IMPLEMENTATION
-            #include "stb_image.h"
-            int w, h, channels;
-            unsigned char* data = stbi_load(img_path.c_str(), &w, &h, &channels, 1); // 强制灰度
-            if (!data) throw std::runtime_error("Failed to load image");
-            if (w != 28 || h != 28) {
-                // 需要缩放到 28x28，此处略
-            }
-            img = nn::Matrix(784, 1);
-            for (int i = 0; i < 784; ++i)
-                img.set_value_unchecked(i, 0, data[i] / 255.0);
-            stbi_image_free(data);
-            */
         }
     }
     catch (const std::exception &e)
