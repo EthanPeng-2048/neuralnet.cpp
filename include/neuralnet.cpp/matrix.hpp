@@ -19,8 +19,6 @@ namespace nn
     class Matrix
     {
     private:
-        static constexpr std::size_t BLOCK_SIZE = 64;
-
         std::vector<double> data_{};
         std::size_t rows_{0};
         std::size_t cols_{0};
@@ -142,13 +140,34 @@ namespace nn
         [[nodiscard]] Matrix transpose() const
         {
             Matrix result(cols_, rows_);
-            for (std::size_t row = 0; row < rows_; ++row)
-            {
-                for (std::size_t col = 0; col < cols_; ++col)
-                {
-                    result.set_value_unchecked(col, row, data_[index(row, col)]);
-                }
-            }
+
+            // 块内行列数，32×32×8byte = 8KB，安全装入 L1
+
+            const std::size_t i_blocks = (rows_ + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            const std::size_t j_blocks = (cols_ + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+            auto block_indices = std::views::iota(
+                std::size_t{0}, i_blocks * j_blocks);
+
+            std::for_each(NN_EXEC_POLICY,
+                          block_indices.begin(), block_indices.end(),
+                          [&](std::size_t block_idx)
+                          {
+                              const std::size_t ib = block_idx / j_blocks;
+                              const std::size_t jb = block_idx % j_blocks;
+
+                              const std::size_t i0 = ib * BLOCK_SIZE;
+                              const std::size_t j0 = jb * BLOCK_SIZE;
+                              const std::size_t i1 = std::min(i0 + BLOCK_SIZE, rows_); // 边界截断
+                              const std::size_t j1 = std::min(j0 + BLOCK_SIZE, cols_);
+
+                              // 块内转置：A[i][j] -> R[j][i]
+                              // 两层循环都在小块内，全部命中缓存
+                              for (std::size_t i = i0; i < i1; ++i)
+                                  for (std::size_t j = j0; j < j1; ++j)
+                                      result.data_[j * rows_ + i] = data_[i * cols_ + j];
+                          });
+
             return result;
         }
 

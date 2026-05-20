@@ -15,7 +15,7 @@
 
 namespace nn
 {
-
+    inline constexpr std::size_t BLOCK_SIZE = 32;
     [[nodiscard]] inline Matrix one_hot(const std::vector<std::size_t> &true_i, std::size_t mat_size)
     {
         const std::size_t batch_size = true_i.size();
