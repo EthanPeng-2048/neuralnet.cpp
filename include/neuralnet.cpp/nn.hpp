@@ -1,12 +1,13 @@
 #ifndef NN_HPP
 #define NN_HPP
 
-#ifndef NN_EXEC_POLICY
-#define NN_EXEC_POLICY std::execution::par_unseq
-#endif
+// nn_config 必须最先包含：定义 BLOCK_SIZE 和 NN_EXEC_POLICY
+// matrix.hpp 及后续所有头文件都依赖这两个符号
+#include "nn_config.hpp"
 
 #include "layer.hpp"
 #include "loss.hpp"
+#include "model.hpp"
 #include "optimizer.hpp"
 
 #include <cstddef>
@@ -15,7 +16,6 @@
 
 namespace nn
 {
-    inline constexpr std::size_t BLOCK_SIZE = 32;
     [[nodiscard]] inline Matrix one_hot(const std::vector<std::size_t> &true_i, std::size_t mat_size)
     {
         const std::size_t batch_size = true_i.size();
