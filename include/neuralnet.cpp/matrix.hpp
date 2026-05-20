@@ -14,10 +14,6 @@
 #include <utility>
 #include <vector>
 
-#ifndef NN_EXEC_POLICY
-#define NN_EXEC_POLICY std::execution::par_unseq
-#endif
-
 namespace nn
 {
     class Matrix

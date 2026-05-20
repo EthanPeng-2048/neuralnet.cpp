@@ -1,6 +1,10 @@
 #ifndef NN_HPP
 #define NN_HPP
 
+#ifndef NN_EXEC_POLICY
+#define NN_EXEC_POLICY std::execution::par_unseq
+#endif
+
 #include "layer.hpp"
 #include "loss.hpp"
 #include "optimizer.hpp"
