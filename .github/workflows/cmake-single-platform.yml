@@ -48,3 +48,43 @@ jobs:
     - name: Test
       working-directory: ${{github.workspace}}/build
       run: ctest -C ${{env.BUILD_TYPE}}
+
+    # 将编译产物打包为 artifact，供 release job 使用
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: linux-binaries
+        path: |
+          ${{github.workspace}}/build/mnist_train
+          ${{github.workspace}}/build/mnist_infer
+        retention-days: 1
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: linux-binaries
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        name: Nightly Build - ${{ github.sha }}
+        tag_name: nightly
+        prerelease: true
+        body: |
+          自动构建版本，commit: ${{ github.sha }}
+
+          ### 构建环境
+          - OS: Ubuntu Latest
+          - Compiler: Clang (Latest)
+          - C++ Standard: C++26
+        files: |
+          mnist_train
+          mnist_infer
