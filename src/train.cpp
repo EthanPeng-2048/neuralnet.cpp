@@ -111,6 +111,7 @@ int main(int argc, char *argv[])
 {
     // 可选命令行参数：--load model.bin 或 --save model.bin
     std::string model_path = "mnist_model.bin";
+    std::string dataset_path = "mnist_data";
     bool load_existing = false;
 
     for (int i = 1; i < argc; ++i)
@@ -126,12 +127,16 @@ int main(int argc, char *argv[])
             model_path = argv[++i];
             // 仅指定保存路径，不加载
         }
+        else if (arg == "--dataset" && i + 1 < argc)
+        {
+            dataset_path = argv[++i];
+        }
     }
 
     // 加载数据
-    std::cout << "Loading MNIST data..." << std::endl;
-    auto [train_x, train_y] = load_csv("./mnist_data/train.csv");
-    auto [test_x, test_y] = load_csv("./mnist_data/test.csv");
+    std::cout << "Loading MNIST data from " << dataset_path << "..." << std::endl;
+    auto [train_x, train_y] = load_csv(dataset_path + "/train.csv");
+    auto [test_x, test_y] = load_csv(dataset_path + "/test.csv");
     std::cout << "Train: " << train_x.cols() << " samples, features " << train_x.rows()
               << " x " << train_x.cols() << std::endl;
 
