@@ -18,8 +18,7 @@ namespace nn
         virtual const Matrix &backward() const = 0;
     };
 
-
-    class MSELoss: public Loss
+    class MSELoss : public Loss
     {
     private:
         Matrix grad_input_;
@@ -71,7 +70,7 @@ namespace nn
         [[nodiscard]] const Matrix &backward() const { return grad_input_; }
     };
 
-    class CrossEntropyLoss: public Loss
+    class CrossEntropyLoss : public Loss
     {
     private:
         Matrix grad_input_;

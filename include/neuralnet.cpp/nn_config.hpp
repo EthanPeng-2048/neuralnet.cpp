@@ -16,7 +16,7 @@
 // 修改时需同步评估 b_block 栈占用（BLOCK_SIZE² × 8 字节）
 namespace nn
 {
-    inline constexpr std::size_t BLOCK_SIZE = 32;
+    inline constexpr std::size_t BLOCK_SIZE = 64;
 } // namespace nn
 
 #endif // NN_CONFIG_HPP
