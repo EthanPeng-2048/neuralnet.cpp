@@ -1,5 +1,5 @@
 # .github/workflows/cmake-clang-latest.yml
-name: CMake on Linux (Clang Latest, C++26)
+name: CMake (Clang Latest, C++26)
 
 on:
   push:
@@ -12,24 +12,47 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            artifact-name: linux-binaries
+            binary-suffix: ""
+          - os: windows-latest
+            artifact-name: windows-binaries
+            binary-suffix: ".exe"
+
+    runs-on: ${{ matrix.os }}
 
     steps:
     - uses: actions/checkout@v4
 
-    # 使用 LLVM 官方脚本安装最新的 Clang
-    # 该脚本会自动添加仓库并安装最新稳定版 Clang，例如 clang-21 或更高版本
-    - name: Install latest Clang
+    # ========== Linux: 安装 LLVM Clang + Ninja ==========
+    - name: Install Clang & Ninja (Linux)
+      if: runner.os == 'Linux'
       run: |
         wget https://apt.llvm.org/llvm.sh
         chmod +x llvm.sh
         sudo ./llvm.sh all
-        # 创建符号链接，确保 clang/clang++ 命令指向新安装的版本
         sudo ln -sf $(ls /usr/bin/clang-[0-9]* | sort -V | tail -n1) /usr/bin/clang
         sudo ln -sf $(ls /usr/bin/clang++-[0-9]* | sort -V | tail -n1) /usr/bin/clang++
+        sudo apt-get install -y ninja-build
 
-    - name: Configure CMake
-      # 使用 Ninja 生成器，并显式指定编译器
+    # ========== Windows: 安装 LLVM Clang + Ninja ==========
+    - name: Install Clang & Ninja (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        choco install llvm --yes --no-progress
+        choco install ninja --yes --no-progress
+        # 将 LLVM 的 bin 目录加入 PATH
+        $llvmPath = "C:\Program Files\LLVM\bin"
+        echo "$llvmPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+    # ========== CMake 配置（分平台，因为 bash/pwsh 换行语法不同）==========
+    - name: Configure CMake (Linux)
+      if: runner.os == 'Linux'
       run: |
         cmake -B ${{github.workspace}}/build \
           -G Ninja \
@@ -37,6 +60,21 @@ jobs:
           -DCMAKE_C_COMPILER=clang \
           -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
           -DCMAKE_CXX_STANDARD=26 \
+          -DCMAKE_CXX_STANDARD_REQUIRED=ON
+      env:
+        CC: clang
+        CXX: clang++
+
+    - name: Configure CMake (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        cmake -B ${{github.workspace}}/build `
+          -G Ninja `
+          -DCMAKE_CXX_COMPILER=clang++ `
+          -DCMAKE_C_COMPILER=clang `
+          -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} `
+          -DCMAKE_CXX_STANDARD=26 `
           -DCMAKE_CXX_STANDARD_REQUIRED=ON
       env:
         CC: clang
@@ -53,10 +91,10 @@ jobs:
     - name: Upload build artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: linux-binaries
+        name: ${{ matrix.artifact-name }}
         path: |
-          ${{github.workspace}}/build/mnist_train
-          ${{github.workspace}}/build/mnist_infer
+          ${{github.workspace}}/build/mnist_train${{ matrix.binary-suffix }}
+          ${{github.workspace}}/build/mnist_infer${{ matrix.binary-suffix }}
         retention-days: 1
 
   release:
@@ -67,10 +105,17 @@ jobs:
       contents: write
 
     steps:
-    - name: Download build artifacts
+    - name: Download Linux artifacts
       uses: actions/download-artifact@v4
       with:
         name: linux-binaries
+        path: artifacts/linux
+
+    - name: Download Windows artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: windows-binaries
+        path: artifacts/windows
 
     - name: Create Release
       uses: softprops/action-gh-release@v2
@@ -82,9 +127,13 @@ jobs:
           自动构建版本，commit: ${{ github.sha }}
 
           ### 构建环境
-          - OS: Ubuntu Latest
           - Compiler: Clang (Latest)
           - C++ Standard: C++26
+
+          | 平台 | 产物 |
+          |------|------|
+          | 🐧 Linux (Ubuntu Latest) | `mnist_train`, `mnist_infer` |
+          | 🪟 Windows (Latest) | `mnist_train.exe`, `mnist_infer.exe` |
         files: |
-          mnist_train
-          mnist_infer
+          artifacts/linux/*
+          artifacts/windows/*
