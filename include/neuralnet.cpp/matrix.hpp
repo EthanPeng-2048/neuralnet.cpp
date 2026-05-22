@@ -41,8 +41,8 @@ namespace nn
     public:
         Matrix() = default;
 
-        Matrix(std::size_t rows, std::size_t cols)
-            : data_(rows * cols, 0.0), rows_(rows), cols_(cols) {}
+        explicit Matrix(std::size_t rows, std::size_t cols)
+            : data_(rows * cols), rows_(rows), cols_(cols) {}
 
         Matrix(std::vector<double> data, std::size_t rows, std::size_t cols)
             : data_(std::move(data)), rows_(rows), cols_(cols)
@@ -52,6 +52,10 @@ namespace nn
                 throw std::invalid_argument("data size mismatch");
             }
         }
+        
+        // 从标量值初始化矩阵
+        Matrix(std::size_t rows, std::size_t cols, double value)
+            : data_(rows * cols, value), rows_(rows), cols_(cols) {}
         Matrix(const Matrix &) = default;
         Matrix(Matrix &&) noexcept = default;
         Matrix &operator=(const Matrix &) = default;
@@ -59,10 +63,10 @@ namespace nn
         ~Matrix() = default;
 
         // 访问器
-        [[nodiscard]] std::size_t rows() const noexcept { return rows_; }
-        [[nodiscard]] std::size_t cols() const noexcept { return cols_; }
-        [[nodiscard]] std::size_t size() const noexcept { return data_.size(); }
-        [[nodiscard]] bool empty() const noexcept { return data_.empty(); }
+        [[nodiscard]] constexpr std::size_t rows() const noexcept { return rows_; }
+        [[nodiscard]] constexpr std::size_t cols() const noexcept { return cols_; }
+        [[nodiscard]] constexpr std::size_t size() const noexcept { return data_.size(); }
+        [[nodiscard]] constexpr bool empty() const noexcept { return data_.empty(); }
         [[nodiscard]] double at(std::size_t row, std::size_t col) const
         {
             if (row >= rows_ || col >= cols_)
@@ -79,8 +83,8 @@ namespace nn
             }
             data_[index(row, col)] = value;
         }
-        [[nodiscard]] double at_unchecked(std::size_t row, std::size_t col) const noexcept { return data_[index(row, col)]; } // 无校验
-        void set_value_unchecked(std::size_t row, std::size_t col, double value) noexcept { data_[index(row, col)] = value; } // 无校验
+        [[nodiscard]] constexpr double at_unchecked(std::size_t row, std::size_t col) const noexcept { return data_[index(row, col)]; } // 无校验
+        constexpr void set_value_unchecked(std::size_t row, std::size_t col, double value) noexcept { data_[index(row, col)] = value; } // 无校验
         [[nodiscard]] const std::vector<double> &data() const noexcept { return data_; }
         [[nodiscard]] std::vector<double> &data() noexcept { return data_; }
         [[nodiscard]] std::vector<std::vector<double>> get_data() const
@@ -142,7 +146,7 @@ namespace nn
 
             std::for_each(NN_EXEC_POLICY,
                           block_indices.begin(), block_indices.end(),
-                          [&](std::size_t block_idx)
+                          [&](std::size_t block_idx) noexcept
                           {
                               const std::size_t ib = block_idx / j_blocks;
                               const std::size_t jb = block_idx % j_blocks;
@@ -184,9 +188,13 @@ namespace nn
         {
             Matrix result(rows_, cols_);
             std::transform(NN_EXEC_POLICY, data_.begin(), data_.end(), result.data_.begin(),
-                           [scalar](double value)
-                           { return value * scalar; });
+                           [scalar](double value) noexcept { return value * scalar; });
             return result;
+        }
+
+        friend Matrix operator*(double scalar, const Matrix &mat) noexcept
+        {
+            return mat * scalar;
         }
 
         [[nodiscard]] Matrix operator*(const Matrix &other) const
@@ -255,8 +263,29 @@ namespace nn
         void scale_inplace(double scalar) noexcept
         {
             std::for_each(NN_EXEC_POLICY, data_.begin(), data_.end(),
-                          [scalar](double &value)
-                          { value *= scalar; });
+                          [scalar](double &value) noexcept { value *= scalar; });
+        }
+
+        // 逐元素加法 inplace
+        void add_inplace(const Matrix &other) noexcept
+        {
+            if (rows_ != other.rows_ || cols_ != other.cols_) return;
+            std::transform(NN_EXEC_POLICY, data_.begin(), data_.end(), other.data_.begin(),
+                           data_.begin(), std::plus<>{});
+        }
+
+        // 逐元素减法 inplace
+        void subtract_inplace(const Matrix &other) noexcept
+        {
+            if (rows_ != other.rows_ || cols_ != other.cols_) return;
+            std::transform(NN_EXEC_POLICY, data_.begin(), data_.end(), other.data_.begin(),
+                           data_.begin(), std::minus<>{});
+        }
+
+        // 填充零
+        void zero() noexcept
+        {
+            std::fill(data_.begin(), data_.end(), 0.0);
         }
     };
 }

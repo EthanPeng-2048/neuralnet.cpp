@@ -26,6 +26,10 @@ namespace nn
         virtual Matrix backward(const Matrix &grad_output) = 0;
         virtual std::vector<std::reference_wrapper<Matrix>> parameters() { return {}; }
         virtual std::vector<std::reference_wrapper<Matrix>> param_gradients() { return {}; }
+        
+        // 添加参数更新辅助方法，避免虚函数调用开销
+        virtual void update_params(double /*lr*/) noexcept {}
+        virtual void zero_grad() noexcept {}
     };
 
     class Linear final : public Layer
@@ -76,16 +80,16 @@ namespace nn
             const Matrix product = W_ * input;
             Matrix result(product.rows(), product.cols());
 
-            for (std::size_t row = 0; row < product.rows(); ++row)
-            {
-                const double bias_value = b_.at_unchecked(row, 0);
-                const auto begin = product.data().begin() + static_cast<std::ptrdiff_t>(row * product.cols());
-                const auto end = begin + static_cast<std::ptrdiff_t>(product.cols());
-                const auto out_begin = result.data().begin() + static_cast<std::ptrdiff_t>(row * product.cols());
-                std::transform(begin, end, out_begin,
-                               [bias_value](double value)
-                               { return value + bias_value; });
-            }
+            // 使用并行 transform 进行 bias 加法，避免显式循环
+            const std::size_t total_elems = product.size();
+            std::transform(NN_EXEC_POLICY,
+                           product.data().begin(), product.data().end(),
+                           result.data().begin(),
+                           [this, &product](std::size_t idx) -> double
+                           {
+                               const std::size_t row = idx / product.cols();
+                               return product.data()[idx] + b_.at_unchecked(row, 0);
+                           });
 
             return result;
         }
@@ -105,11 +109,11 @@ namespace nn
             const std::size_t out_feat = W_.rows();
             const std::size_t batch = grad_output.cols();
 
-            // 计算 grad_input
+            // 计算 grad_input: dL/dx = W^T * dL/dy
             Matrix grad_input(in_feat, batch);
             auto grad_in_indices = std::views::iota(std::size_t{0}, in_feat * batch);
             std::for_each(NN_EXEC_POLICY, grad_in_indices.begin(), grad_in_indices.end(),
-                          [&](std::size_t idx)
+                          [&, this](std::size_t idx) noexcept
                           {
                               const std::size_t input_feature = idx / batch;
                               const std::size_t batch_index = idx % batch;
@@ -122,10 +126,10 @@ namespace nn
                               grad_input.set_value_unchecked(input_feature, batch_index, sum);
                           });
 
-            // 计算 grad_W
+            // 计算 grad_W: dL/dW = dL/dy * x^T
             auto grad_w_indices = std::views::iota(std::size_t{0}, out_feat * in_feat);
             std::for_each(NN_EXEC_POLICY, grad_w_indices.begin(), grad_w_indices.end(),
-                          [&](std::size_t idx)
+                          [&, this](std::size_t idx) noexcept
                           {
                               const std::size_t out_feature = idx / in_feat;
                               const std::size_t input_feature = idx % in_feat;
@@ -135,27 +139,22 @@ namespace nn
                                   sum += grad_output.at_unchecked(out_feature, batch_index) *
                                          input_cache_.at_unchecked(input_feature, batch_index);
                               }
-                              double old = grad_W_.at_unchecked(out_feature, input_feature);
-                              grad_W_.set_value_unchecked(out_feature, input_feature, old + sum);
+                              grad_W_.set_value_unchecked(out_feature, input_feature, 
+                                                          grad_W_.at_unchecked(out_feature, input_feature) + sum);
                           });
 
-            // 计算 grad_b
+            // 计算 grad_b: dL/db = sum(dL/dy, dim=batch)
             auto out_indices = std::views::iota(std::size_t{0}, out_feat);
-            auto batch_indices = std::views::iota(std::size_t{0}, batch);
             std::for_each(NN_EXEC_POLICY, out_indices.begin(), out_indices.end(),
-                          [&](std::size_t out_feature)
+                          [&, this](std::size_t out_feature) noexcept
                           {
-                              const double sum = std::transform_reduce(
-                                  NN_EXEC_POLICY,
-                                  batch_indices.begin(), batch_indices.end(),
-                                  0.0,
-                                  std::plus<>{},
-                                  [&](std::size_t batch_index)
-                                  {
-                                      return grad_output.at_unchecked(out_feature, batch_index);
-                                  });
-                              double old = grad_b_.at_unchecked(out_feature, 0);
-                              grad_b_.set_value_unchecked(out_feature, 0, old + sum);
+                              double sum = 0.0;
+                              for (std::size_t batch_index = 0; batch_index < batch; ++batch_index)
+                              {
+                                  sum += grad_output.at_unchecked(out_feature, batch_index);
+                              }
+                              grad_b_.set_value_unchecked(out_feature, 0,
+                                                          grad_b_.at_unchecked(out_feature, 0) + sum);
                           });
             return grad_input;
         }
@@ -174,8 +173,8 @@ namespace nn
             input_cache_ = input;
             Matrix result(input.rows(), input.cols());
             std::transform(NN_EXEC_POLICY, input.data().begin(), input.data().end(),
-                           result.data().begin(), [](double value)
-                           { return std::max(0.0, value); });
+                           result.data().begin(), [](double value) noexcept
+                           { return value > 0.0 ? value : 0.0; });
             return result;
         }
 
@@ -191,7 +190,7 @@ namespace nn
                            input_cache_.data().begin(), input_cache_.data().end(),
                            grad_output.data().begin(),
                            grad_input.data().begin(),
-                           [](double input_value, double grad_value)
+                           [](double input_value, double grad_value) noexcept
                            {
                                return input_value > 0.0 ? grad_value : 0.0;
                            });
