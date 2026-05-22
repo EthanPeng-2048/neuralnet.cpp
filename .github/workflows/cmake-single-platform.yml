@@ -19,9 +19,11 @@ jobs:
           - os: ubuntu-latest
             artifact-name: linux-binaries
             binary-suffix: ""
+            archive-name: neuralnet-linux-x64.7z
           - os: windows-latest
             artifact-name: windows-binaries
             binary-suffix: ".exe"
+            archive-name: neuralnet-windows-x64.7z
 
     runs-on: ${{ matrix.os }}
 
@@ -37,7 +39,7 @@ jobs:
         sudo ./llvm.sh all
         sudo ln -sf $(ls /usr/bin/clang-[0-9]* | sort -V | tail -n1) /usr/bin/clang
         sudo ln -sf $(ls /usr/bin/clang++-[0-9]* | sort -V | tail -n1) /usr/bin/clang++
-        sudo apt-get install -y ninja-build
+        sudo apt-get install -y ninja-build p7zip-full
 
     # ========== Windows: 安装 LLVM Clang + Ninja ==========
     - name: Install Clang & Ninja (Windows)
@@ -46,6 +48,7 @@ jobs:
       run: |
         choco install llvm --yes --no-progress
         choco install ninja --yes --no-progress
+        choco install 7zip --yes --no-progress
         # 将 LLVM 的 bin 目录加入 PATH
         $llvmPath = "C:\Program Files\LLVM\bin"
         echo "$llvmPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
@@ -87,14 +90,27 @@ jobs:
       working-directory: ${{github.workspace}}/build
       run: ctest -C ${{env.BUILD_TYPE}}
 
-    # 将编译产物打包为 artifact，供 release job 使用
+    # 将编译产物打包为 7z
+    - name: Package binaries (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        7z a ${{github.workspace}}/build/${{ matrix.archive-name }} \
+          ${{github.workspace}}/build/mnist_train \
+          ${{github.workspace}}/build/mnist_infer
+
+    - name: Package binaries (Windows)
+      if: runner.os == 'Windows'
+      run: |
+        7z a ${{github.workspace}}/build/${{ matrix.archive-name }} `
+          ${{github.workspace}}/build/mnist_train.exe `
+          ${{github.workspace}}/build/mnist_infer.exe
+
+    # 将 7z 包上传为 artifact，供 release job 使用
     - name: Upload build artifacts
       uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.artifact-name }}
-        path: |
-          ${{github.workspace}}/build/mnist_train${{ matrix.binary-suffix }}
-          ${{github.workspace}}/build/mnist_infer${{ matrix.binary-suffix }}
+        path: ${{github.workspace}}/build/${{ matrix.archive-name }}
         retention-days: 1
 
   release:
@@ -132,8 +148,7 @@ jobs:
 
           | 平台 | 产物 |
           |------|------|
-          | 🐧 Linux (Ubuntu Latest) | `mnist_train`, `mnist_infer` |
-          | 🪟 Windows (Latest) | `mnist_train.exe`, `mnist_infer.exe` |
+          | 🐧 Linux (Ubuntu Latest) | `neuralnet-linux-x64.7z` |
+          | 🪟 Windows (Latest) | `neuralnet-windows-x64.7z` |
         files: |
-          artifacts/linux/*
-          artifacts/windows/*
+          artifacts/**/*.7z
