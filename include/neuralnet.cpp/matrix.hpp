@@ -56,11 +56,11 @@ namespace nn
         Matrix &operator=(Matrix &&) noexcept = default;
         ~Matrix() = default;
 
+        // 访问器
         [[nodiscard]] std::size_t rows() const noexcept { return rows_; }
         [[nodiscard]] std::size_t cols() const noexcept { return cols_; }
         [[nodiscard]] std::size_t size() const noexcept { return data_.size(); }
         [[nodiscard]] bool empty() const noexcept { return data_.empty(); }
-
         [[nodiscard]] double at(std::size_t row, std::size_t col) const
         {
             if (row >= rows_ || col >= cols_)
@@ -69,7 +69,6 @@ namespace nn
             }
             return data_[index(row, col)];
         }
-
         void set_value(std::size_t row, std::size_t col, double value)
         {
             if (row >= rows_ || col >= cols_)
@@ -78,20 +77,10 @@ namespace nn
             }
             data_[index(row, col)] = value;
         }
-
-        [[nodiscard]] double at_unchecked(std::size_t row, std::size_t col) const noexcept
-        {
-            return data_[index(row, col)];
-        }
-
-        void set_value_unchecked(std::size_t row, std::size_t col, double value) noexcept
-        {
-            data_[index(row, col)] = value;
-        }
-
+        [[nodiscard]] double at_unchecked(std::size_t row, std::size_t col) const noexcept { return data_[index(row, col)]; } // 无校验
+        void set_value_unchecked(std::size_t row, std::size_t col, double value) noexcept { data_[index(row, col)] = value; } // 无校验
         [[nodiscard]] const std::vector<double> &data() const noexcept { return data_; }
         [[nodiscard]] std::vector<double> &data() noexcept { return data_; }
-
         [[nodiscard]] std::vector<std::vector<double>> get_data() const
         {
             std::vector<std::vector<double>> result(rows_, std::vector<double>(cols_, 0.0));
@@ -251,9 +240,7 @@ namespace nn
                                           double sum = 0.0;
                                           const std::size_t b_base = (j - j_start) * k_len;
                                           for (std::size_t kk = 0; kk < k_len; ++kk)
-                                          {
                                               sum += data_[a_base + kk] * b_block[b_base + kk];
-                                          }
                                           result.data_[result.index(i, j)] += sum;
                                       }
                                   }
