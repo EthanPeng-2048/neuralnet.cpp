@@ -80,16 +80,14 @@ namespace nn
             const Matrix product = W_ * input;
             Matrix result(product.rows(), product.cols());
 
-            // 使用并行 transform 进行 bias 加法，避免显式循环
-            [[maybe_unused]] const std::size_t total_elems = product.size();
-            std::transform(NN_EXEC_POLICY,
-                           product.data().begin(), product.data().end(),
-                           result.data().begin(),
-                           [this, &product](std::size_t idx) -> double
-                           {
-                               const std::size_t row = idx / product.cols();
-                               return product.data()[idx] + b_.at_unchecked(row, 0);
-                           });
+            // 并行 bias 加法：使用 iota 生成索引，避免 std::transform 值类型混淆
+            auto indices = std::views::iota(std::size_t{0}, product.size());
+            std::for_each(NN_EXEC_POLICY, indices.begin(), indices.end(),
+                          [&](std::size_t idx) noexcept
+                          {
+                              const std::size_t row = idx / product.cols();
+                              result.data()[idx] = product.data()[idx] + b_.at_unchecked(row, 0);
+                          });
 
             return result;
         }

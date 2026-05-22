@@ -9,6 +9,7 @@
 
 #include <neuralnet.cpp/nn_config.hpp>
 #include <neuralnet.cpp/layer.hpp>
+#include <neuralnet.cpp/model.hpp>
 
 namespace nn
 {
@@ -100,6 +101,80 @@ namespace nn
         read_matrix(params3[1].get()); // b3
         read_matrix(params4[0].get()); // W4
         read_matrix(params4[1].get()); // b4
+
+        std::cout << "Model loaded from " << filename << std::endl;
+    }
+
+    // ── Model 版本 ──────────────────────────────────────────────────────────
+    // 保存模型（nn::Model 版本）：按 parameters() 顺序依次写入
+    inline void save_model(const std::string &filename, Model &model)
+    {
+        std::ofstream ofs(filename, std::ios::binary);
+        if (!ofs)
+        {
+            throw std::runtime_error("Cannot write model file: " + filename);
+        }
+
+        const uint32_t magic = 0x4E4E4E4E;
+        const uint32_t version = 1;
+        ofs.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
+        ofs.write(reinterpret_cast<const char *>(&version), sizeof(version));
+
+        auto write_matrix = [&](const Matrix &m)
+        {
+            std::size_t rows = m.rows(), cols = m.cols();
+            ofs.write(reinterpret_cast<const char *>(&rows), sizeof(rows));
+            ofs.write(reinterpret_cast<const char *>(&cols), sizeof(cols));
+            const auto &data = m.data();
+            ofs.write(reinterpret_cast<const char *>(data.data()),
+                      data.size() * sizeof(double));
+        };
+
+        auto params = model.parameters();
+        for (auto &p_ref : params)
+        {
+            write_matrix(p_ref.get());
+        }
+
+        std::cout << "Model saved to " << filename << std::endl;
+    }
+
+    // 加载模型（nn::Model 版本）：按 parameters() 顺序依次读取
+    inline void load_model(const std::string &filename, Model &model)
+    {
+        std::ifstream ifs(filename, std::ios::binary);
+        if (!ifs)
+        {
+            throw std::runtime_error("Cannot read model file: " + filename);
+        }
+
+        uint32_t magic, version;
+        ifs.read(reinterpret_cast<char *>(&magic), sizeof(magic));
+        ifs.read(reinterpret_cast<char *>(&version), sizeof(version));
+        if (magic != 0x4E4E4E4E || version != 1)
+        {
+            throw std::runtime_error("Invalid model file format");
+        }
+
+        auto read_matrix = [&](Matrix &m)
+        {
+            std::size_t rows, cols;
+            ifs.read(reinterpret_cast<char *>(&rows), sizeof(rows));
+            ifs.read(reinterpret_cast<char *>(&cols), sizeof(cols));
+            if (rows != m.rows() || cols != m.cols())
+            {
+                throw std::runtime_error("Model shape mismatch in loaded file");
+            }
+            auto &data = m.data();
+            ifs.read(reinterpret_cast<char *>(data.data()),
+                     data.size() * sizeof(double));
+        };
+
+        auto params = model.parameters();
+        for (auto &p_ref : params)
+        {
+            read_matrix(p_ref.get());
+        }
 
         std::cout << "Model loaded from " << filename << std::endl;
     }
