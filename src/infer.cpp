@@ -28,12 +28,10 @@ nn::Matrix load_image_from_csv(const std::string &csv_line)
     return img;
 }
 
-// -------------------- 预测函数 --------------------
-int predict(nn::Linear &l1, nn::ReLU &r1, nn::Linear &l2, nn::ReLU &r2,
-            nn::Linear &l3, nn::ReLU &r3, nn::Linear &l4,
-            const nn::Matrix &img)
+// -------------------- 预测函数（Model 版本） --------------------
+int predict(nn::Model &model, const nn::Matrix &img)
 {
-    auto out = l4.forward(r3.forward(l3.forward(r2.forward(l2.forward(r1.forward(l1.forward(img)))))));
+    auto out = model.forward(img);
     // 找到最大值的索引
     double max_val = out.at_unchecked(0, 0);
     int pred = 0;
@@ -62,19 +60,20 @@ int main(int argc, char *argv[])
     std::string model_path = argv[1];
     std::string img_path = argv[2];
 
-    // 构建网络（与训练时结构一致）
-    nn::Linear l1(784, 64);
-    nn::ReLU r1;
-    nn::Linear l2(64, 64);
-    nn::ReLU r2;
-    nn::Linear l3(64, 64);
-    nn::ReLU r3;
-    nn::Linear l4(64, 10);
+    // 构建网络 — 使用 nn::Model（与训练时结构一致）
+    nn::Model model;
+    model.add<nn::Linear>(784, 64)
+         .add<nn::ReLU>()
+         .add<nn::Linear>(64, 64)
+         .add<nn::ReLU>()
+         .add<nn::Linear>(64, 64)
+         .add<nn::ReLU>()
+         .add<nn::Linear>(64, 10);
 
-    // 加载模型参数
+    // 加载模型参数（Model 版本）
     try
     {
-        nn::load_model(model_path, l1, l2, l3, l4);
+        nn::load_model(model_path, model);
     }
     catch (const std::exception &e)
     {
@@ -110,7 +109,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    int result = predict(l1, r1, l2, r2, l3, r3, l4, img);
+    int result = predict(model, img);
     std::cout << "Predicted digit: " << result << std::endl;
     return 0;
 }

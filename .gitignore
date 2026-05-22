@@ -5,6 +5,8 @@
 *.out
 build/
 dist/
+datasets/
+pretrained/
 
 # Dependencies
 __pycache__/

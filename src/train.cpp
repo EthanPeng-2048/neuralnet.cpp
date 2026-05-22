@@ -1,5 +1,5 @@
-#include "neuralnet.cpp/nn.hpp"
-#include "neuralnet.cpp/model_io.hpp"
+#include <neuralnet.cpp/nn.hpp>
+#include <neuralnet.cpp/model_io.hpp>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -68,13 +68,11 @@ std::pair<nn::Matrix, nn::Matrix> load_csv(const std::string &filename, int max_
     return {feat_mat, label_mat};
 }
 
-// -------------------- 评估函数 --------------------
-double evaluate(nn::Linear &l1, nn::ReLU &r1, nn::Linear &l2, nn::ReLU &r2,
-                nn::Linear &l3, nn::ReLU &r3, nn::Linear &l4,
-                const nn::Matrix &x, const nn::Matrix &y_onehot)
+// -------------------- 评估函数（Model 版本） --------------------
+double evaluate(nn::Model &model, const nn::Matrix &x, const nn::Matrix &y_onehot)
 {
     std::size_t N = x.cols();
-    auto out = l4.forward(r3.forward(l3.forward(r2.forward(l2.forward(r1.forward(l1.forward(x)))))));
+    auto out = model.forward(x);
     int correct = 0;
     for (std::size_t i = 0; i < N; ++i)
     {
@@ -109,138 +107,130 @@ double evaluate(nn::Linear &l1, nn::ReLU &r1, nn::Linear &l2, nn::ReLU &r2,
 // -------------------- 主函数 --------------------
 int main(int argc, char *argv[])
 {
-    // 可选命令行参数：--load model.bin 或 --save model.bin
-    std::string model_path = "mnist_model.bin";
-    std::string dataset_path = "mnist_data";
-    bool load_existing = false;
-
-    for (int i = 1; i < argc; ++i)
+    try
     {
-        std::string arg = argv[i];
-        if (arg == "--load" && i + 1 < argc)
+        // 可选命令行参数：--load model.bin 或 --save model.bin
+        std::string model_path = "mnist_model.bin";
+        std::string dataset_path = "mnist_data";
+        bool load_existing = false;
+
+        for (int i = 1; i < argc; ++i)
         {
-            model_path = argv[++i];
-            load_existing = true;
-        }
-        else if (arg == "--save" && i + 1 < argc)
-        {
-            model_path = argv[++i];
-            // 仅指定保存路径，不加载
-        }
-        else if (arg == "--dataset" && i + 1 < argc)
-        {
-            dataset_path = argv[++i];
-        }
-    }
-
-    // 加载数据
-    std::cout << "Loading MNIST data from " << dataset_path << "..." << std::endl;
-    auto [train_x, train_y] = load_csv(dataset_path + "/train.csv");
-    auto [test_x, test_y] = load_csv(dataset_path + "/test.csv");
-    std::cout << "Train: " << train_x.cols() << " samples, features " << train_x.rows()
-              << " x " << train_x.cols() << std::endl;
-
-    // 构建网络
-    nn::Linear l1(784, 64);
-    nn::ReLU r1;
-    nn::Linear l2(64, 64);
-    nn::ReLU r2;
-    nn::Linear l3(64, 64);
-    nn::ReLU r3;
-    nn::Linear l4(64, 10);
-
-    // 如果指定加载，则载入已有参数
-    if (load_existing)
-    {
-        try
-        {
-            nn::load_model(model_path, l1, l2, l3, l4);
-        }
-        catch (const std::exception &e)
-        {
-            std::cerr << "Failed to load model: " << e.what() << ", starting from scratch.\n";
-        }
-    }
-
-    // 收集参数和梯度（同前）
-    std::vector<std::reference_wrapper<nn::Matrix>> params, grads;
-    for (auto &p : l1.parameters())
-        params.push_back(p);
-    for (auto &p : l2.parameters())
-        params.push_back(p);
-    for (auto &p : l3.parameters())
-        params.push_back(p);
-    for (auto &p : l4.parameters())
-        params.push_back(p);
-    for (auto &g : l1.param_gradients())
-        grads.push_back(g);
-    for (auto &g : l2.param_gradients())
-        grads.push_back(g);
-    for (auto &g : l3.param_gradients())
-        grads.push_back(g);
-    for (auto &g : l4.param_gradients())
-        grads.push_back(g);
-
-    nn::SGD optimizer(params, grads, 0.01);
-    nn::CrossEntropyLoss ce_loss;
-
-    const std::size_t batch_size = 64;
-    const std::size_t num_batches = train_x.cols() / batch_size;
-
-    // 训练
-    const int epochs = 5;
-    for (int epoch = 0; epoch < epochs; ++epoch)
-    {
-        double total_loss = 0.0;
-
-        for (std::size_t batch = 0; batch < num_batches; ++batch)
-        {
-            // 提取当前 batch
-            std::size_t start = batch * batch_size;
-            nn::Matrix x_batch(train_x.rows(), batch_size);
-            nn::Matrix y_batch(train_y.rows(), batch_size);
-            for (std::size_t i = 0; i < batch_size; ++i)
+            std::string arg = argv[i];
+            if (arg == "--load" && i + 1 < argc)
             {
-                for (std::size_t r = 0; r < train_x.rows(); ++r)
+                model_path = argv[++i];
+                load_existing = true;
+            }
+            else if (arg == "--save" && i + 1 < argc)
+            {
+                model_path = argv[++i];
+                // 仅指定保存路径，不加载
+            }
+            else if (arg == "--dataset" && i + 1 < argc)
+            {
+                dataset_path = argv[++i];
+            }
+        }
+
+        // 加载数据
+        std::cout << "Loading MNIST data from " << dataset_path << "..." << std::endl;
+        auto [train_x, train_y] = load_csv(dataset_path + "/train.csv");
+        auto [test_x, test_y] = load_csv(dataset_path + "/test.csv");
+        std::cout << "Train: " << train_x.cols() << " samples, features " << train_x.rows()
+                  << " x " << train_x.cols() << std::endl;
+        // 构建网络 — 使用 nn::Model
+        nn::Model model;
+        model.add<nn::Linear>(784, 64)
+             .add<nn::ReLU>()
+             .add<nn::Linear>(64, 64)
+             .add<nn::ReLU>()
+             .add<nn::Linear>(64, 64)
+             .add<nn::ReLU>()
+             .add<nn::Linear>(64, 10);
+
+        // 如果指定加载，则载入已有参数
+        if (load_existing)
+        {
+            try
+            {
+                nn::load_model(model_path, model);
+            }
+            catch (const std::exception &e)
+            {
+                std::cerr << "Failed to load model: " << e.what() << ", starting from scratch.\n";
+            }
+        }
+
+        // 收集参数和梯度（Model 自动聚合所有层）
+        nn::SGD optimizer(model.parameters(), model.param_gradients(), 0.01);
+        nn::CrossEntropyLoss ce_loss;
+
+        const std::size_t batch_size = 64;
+        const std::size_t num_batches = train_x.cols() / batch_size;
+
+        std::cout << "Starting training: " << num_batches << " batches per epoch, "
+                  << batch_size << " batch size" << std::endl;
+
+        // 训练
+        const int epochs = 5;
+        for (int epoch = 0; epoch < epochs; ++epoch)
+        {
+            double total_loss = 0.0;
+
+            for (std::size_t batch = 0; batch < num_batches; ++batch)
+            {
+                // 提取当前 batch
+                std::size_t start = batch * batch_size;
+                nn::Matrix x_batch(train_x.rows(), batch_size);
+                nn::Matrix y_batch(train_y.rows(), batch_size);
+                for (std::size_t i = 0; i < batch_size; ++i)
                 {
-                    x_batch.set_value_unchecked(r, i, train_x.at_unchecked(r, start + i));
+                    for (std::size_t r = 0; r < train_x.rows(); ++r)
+                    {
+                        x_batch.set_value_unchecked(r, i, train_x.at_unchecked(r, start + i));
+                    }
+                    for (std::size_t r = 0; r < train_y.rows(); ++r)
+                    {
+                        y_batch.set_value_unchecked(r, i, train_y.at_unchecked(r, start + i));
+                    }
                 }
-                for (std::size_t r = 0; r < train_y.rows(); ++r)
-                {
-                    y_batch.set_value_unchecked(r, i, train_y.at_unchecked(r, start + i));
-                }
+
+                // 前向 — Model 自动串联所有层
+                auto out = model.forward(x_batch);
+                double loss = ce_loss.forward(out, y_batch);
+                total_loss += loss;
+
+                // 反向 — Model 自动反向传播所有层
+                auto grad = ce_loss.backward();
+                model.backward(grad);
+
+                // 更新参数
+                optimizer.step();
+                optimizer.zero_grad();
             }
 
-            // 前向
-            auto out = l4.forward(r3.forward(l3.forward(r2.forward(l2.forward(r1.forward(l1.forward(x_batch)))))));
-            double loss = ce_loss.forward(out, y_batch);
-            total_loss += loss;
-
-            // 反向
-            auto grad = ce_loss.backward();
-            grad = l4.backward(grad);
-            grad = r3.backward(grad);
-            grad = l3.backward(grad);
-            grad = r2.backward(grad);
-            grad = l2.backward(grad);
-            grad = r1.backward(grad);
-            grad = l1.backward(grad);
-
-            // 更新参数
-            optimizer.step();
-            optimizer.zero_grad();
+            double avg_loss = total_loss / num_batches;
+            double train_acc = evaluate(model, train_x, train_y);
+            double test_acc = evaluate(model, test_x, test_y);
+            std::cout << "Epoch " << epoch + 1 << "/" << epochs
+                      << "  loss = " << avg_loss
+                      << "  train acc = " << train_acc
+                      << "  test acc = " << test_acc << std::endl;
         }
 
-        double avg_loss = total_loss / num_batches;
-        double train_acc = evaluate(l1, r1, l2, r2, l3, r3, l4, train_x, train_y);
-        double test_acc = evaluate(l1, r1, l2, r2, l3, r3, l4, test_x, test_y);
-        std::cout << "Epoch " << epoch + 1 << "/" << epochs
-                  << "  loss = " << avg_loss
-                  << "  train acc = " << train_acc
-                  << "  test acc = " << test_acc << std::endl;
+        // 训练结束后保存模型（Model 版本）
+        nn::save_model(model_path, model);
+        return 0;
     }
-
-    // 训练结束后保存模型（也可每个 epoch 保存一次）
-    nn::save_model(model_path, l1, l2, l3, l4);
-    return 0;
+    catch (const std::exception &e)
+    {
+        std::cerr << "\nFATAL ERROR: " << e.what() << std::endl;
+        return 1;
+    }
+    catch (...)
+    {
+        std::cerr << "\nFATAL ERROR: unknown exception" << std::endl;
+        return 1;
+    }
 }

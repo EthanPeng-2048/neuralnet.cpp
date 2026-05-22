@@ -44,6 +44,6 @@ def extract_digits(test_csv_path, output_dir):
 
 
 if __name__ == "__main__":
-    test_csv = "./build/mnist_data/test.csv"
-    output = "./build/test"
+    test_csv = "./datasets/mnist_data/test.csv"
+    output = "./datasets/test"
     extract_digits(test_csv, output)
