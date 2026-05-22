@@ -81,7 +81,7 @@ namespace nn
             Matrix result(product.rows(), product.cols());
 
             // 使用并行 transform 进行 bias 加法，避免显式循环
-            const std::size_t total_elems = product.size();
+            [[maybe_unused]] const std::size_t total_elems = product.size();
             std::transform(NN_EXEC_POLICY,
                            product.data().begin(), product.data().end(),
                            result.data().begin(),
