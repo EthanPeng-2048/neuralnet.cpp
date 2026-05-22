@@ -14,6 +14,8 @@
 #include <vector>
 #include "matrix.hpp"
 
+#include <neuralnet.cpp/nn_config.hpp>
+
 namespace nn
 {
     class Layer

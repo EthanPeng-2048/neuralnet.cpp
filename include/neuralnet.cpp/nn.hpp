@@ -1,18 +1,15 @@
 #ifndef NN_HPP
 #define NN_HPP
 
-// nn_config 必须最先包含：定义 BLOCK_SIZE 和 NN_EXEC_POLICY
-// matrix.hpp 及后续所有头文件都依赖这两个符号
-#include "nn_config.hpp"
-
-#include "layer.hpp"
-#include "loss.hpp"
-#include "model.hpp"
-#include "optimizer.hpp"
-
 #include <cstddef>
 #include <stdexcept>
 #include <vector>
+
+#include <neuralnet.cpp/nn_config.hpp>
+#include <neuralnet.cpp/layer.hpp>
+#include <neuralnet.cpp/loss.hpp>
+#include <neuralnet.cpp/model.hpp>
+#include <neuralnet.cpp/optimizer.hpp>
 
 namespace nn
 {

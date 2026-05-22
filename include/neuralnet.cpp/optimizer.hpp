@@ -1,10 +1,10 @@
 #ifndef OPTIMIZER_HPP
 #define OPTIMIZER_HPP
 
-#include "matrix.hpp"
-
 #include <functional>
 #include <vector>
+
+#include <neuralnet.cpp/matrix.hpp>
 
 namespace nn
 {

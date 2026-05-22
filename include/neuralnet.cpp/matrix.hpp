@@ -14,6 +14,8 @@
 #include <utility>
 #include <vector>
 
+#include <neuralnet.cpp/nn_config.hpp>
+
 namespace nn
 {
     class Matrix
