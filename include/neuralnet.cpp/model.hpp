@@ -1,12 +1,13 @@
 #ifndef MODEL_HPP
 #define MODEL_HPP
 
-#include "layer.hpp"
-
 #include <functional>
 #include <memory>
 #include <stdexcept>
 #include <vector>
+
+#include <neuralnet.cpp/nn_config.hpp>
+#include <neuralnet.cpp/layer.hpp>
 
 namespace nn
 {

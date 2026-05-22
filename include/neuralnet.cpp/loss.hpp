@@ -1,12 +1,13 @@
 #ifndef LOSS_HPP
 #define LOSS_HPP
 
-#include "matrix.hpp"
-
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <vector>
+
+#include <neuralnet.cpp/nn_config.hpp>
+#include <neuralnet.cpp/matrix.hpp>
 
 namespace nn
 {

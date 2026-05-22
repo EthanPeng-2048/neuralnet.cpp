@@ -1,13 +1,14 @@
 #ifndef MODEL_IO_HPP
 #define MODEL_IO_HPP
 
-#include "layer.hpp"
-
 #include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+
+#include <neuralnet.cpp/nn_config.hpp>
+#include <neuralnet.cpp/layer.hpp>
 
 namespace nn
 {
