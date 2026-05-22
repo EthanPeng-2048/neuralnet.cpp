@@ -47,7 +47,7 @@ namespace nn
                 target.data().begin(),
                 0.0,
                 std::plus<>{},
-                [](double prediction, double actual)
+                [](double prediction, double actual) noexcept
                 {
                     const double diff = prediction - actual;
                     return diff * diff;
@@ -60,7 +60,7 @@ namespace nn
                            pred.data().begin(), pred.data().end(),
                            target.data().begin(),
                            grad_input_.data().begin(),
-                           [factor](double prediction, double actual)
+                           [factor](double prediction, double actual) noexcept
                            {
                                return factor * (prediction - actual);
                            });
@@ -68,7 +68,7 @@ namespace nn
             return loss;
         }
 
-        [[nodiscard]] const Matrix &backward() const { return grad_input_; }
+        [[nodiscard]] const Matrix &backward() const noexcept { return grad_input_; }
     };
 
     class CrossEntropyLoss : public Loss
@@ -93,10 +93,15 @@ namespace nn
                 double max_val = logits.at_unchecked(0, i);
                 for (std::size_t c = 1; c < classes; ++c)
                 {
-                    max_val = std::max(max_val, logits.at_unchecked(c, i));
+                    const double val = logits.at_unchecked(c, i);
+                    if (val > max_val) max_val = val;
                 }
+                
+                // 预分配 exp_vals 避免重复分配
+                std::array<double, 128> exp_vals_storage{}; // 栈上分配，支持最多 128 类
+                double* exp_vals = exp_vals_storage.data();
+                
                 double sum_exp = 0.0;
-                std::vector<double> exp_vals(classes);
                 for (std::size_t c = 0; c < classes; ++c)
                 {
                     const double e = std::exp(logits.at_unchecked(c, i) - max_val);
@@ -131,7 +136,7 @@ namespace nn
             return total_loss / static_cast<double>(batch);
         }
 
-        [[nodiscard]] const Matrix &backward() const { return grad_input_; }
+        [[nodiscard]] const Matrix &backward() const noexcept { return grad_input_; }
     };
 
 } // namespace nn

@@ -17,6 +17,10 @@
 namespace nn
 {
     inline constexpr std::size_t BLOCK_SIZE = 64;
+    
+    // ── 数值常量 ─────────────────────────────────────────────────────────────
+    // 使用 constexpr 避免运行时计算
+    inline constexpr double EPSILON = 1e-8;
 } // namespace nn
 
 #endif // NN_CONFIG_HPP
