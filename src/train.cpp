@@ -163,7 +163,7 @@ int main(int argc, char *argv[])
         }
 
         // 收集参数和梯度（Model 自动聚合所有层）
-        nn::SGD optimizer(model.parameters(), model.param_gradients(), 0.01);
+        nn::SGD_w_Momentum optimizer(model.parameters(), model.param_gradients(), 0.01);
         nn::CrossEntropyLoss ce_loss;
 
         const std::size_t batch_size = 64;
