@@ -8,8 +8,89 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdint>
+#include <chrono>
+#include <iomanip>
 
-// -------------------- 数据加载 --------------------
+// ==================== 常量 ====================
+static constexpr std::size_t INPUT_DIM = 784;
+static constexpr std::size_t HIDDEN_DIM = 64;
+static constexpr std::size_t NUM_CLASSES = 10;
+static constexpr std::size_t NUM_HIDDEN_LAYERS = 3;
+
+// ==================== 帮助信息 ====================
+void print_usage(const char *prog)
+{
+    std::cout
+        << "MNIST 手写数字训练程序\n\n"
+        << "用法: " << prog << " [选项]\n\n"
+        << "选项:\n"
+        << "  --resume <path>    从已有模型恢复训练\n"
+        << "  --save <path>      模型保存路径 (默认: mnist_model.bin)\n"
+        << "  --dataset <path>   数据集目录 (默认: datasets/mnist_data)\n"
+        << "  --epochs <n>       训练轮数 (默认: 5)\n"
+        << "  --lr <lr>          学习率 (默认: 0.01)\n"
+        << "  --batch-size <n>   批大小 (默认: 64)\n"
+        << "  --help             显示此帮助信息\n";
+}
+
+// ==================== 命令行参数 ====================
+struct TrainConfig
+{
+    std::string save_path = "mnist_model.bin";
+    std::string dataset_path = "datasets/mnist_data";
+    std::string resume_path;
+    int epochs = 5;
+    double lr = 0.01;
+    std::size_t batch_size = 64;
+    bool load_existing = false;
+};
+
+TrainConfig parse_args(int argc, char *argv[])
+{
+    TrainConfig cfg;
+    for (int i = 1; i < argc; ++i)
+    {
+        std::string arg = argv[i];
+        if (arg == "--help")
+        {
+            print_usage(argv[0]);
+            std::exit(0);
+        }
+        else if (arg == "--resume" && i + 1 < argc)
+        {
+            cfg.resume_path = argv[++i];
+            cfg.load_existing = true;
+        }
+        else if (arg == "--save" && i + 1 < argc)
+        {
+            cfg.save_path = argv[++i];
+        }
+        else if (arg == "--dataset" && i + 1 < argc)
+        {
+            cfg.dataset_path = argv[++i];
+        }
+        else if (arg == "--epochs" && i + 1 < argc)
+        {
+            cfg.epochs = std::stoi(argv[++i]);
+        }
+        else if (arg == "--lr" && i + 1 < argc)
+        {
+            cfg.lr = std::stod(argv[++i]);
+        }
+        else if (arg == "--batch-size" && i + 1 < argc)
+        {
+            cfg.batch_size = std::stoi(argv[++i]);
+        }
+        else
+        {
+            std::cerr << "未知参数: " << arg << "\n使用 --help 查看用法\n";
+            std::exit(1);
+        }
+    }
+    return cfg;
+}
+
+// ==================== 数据加载 ====================
 std::pair<nn::Matrix, nn::Matrix> load_csv(const std::string &filename, int max_samples = -1)
 {
     std::ifstream file(filename);
@@ -68,7 +149,7 @@ std::pair<nn::Matrix, nn::Matrix> load_csv(const std::string &filename, int max_
     return {feat_mat, label_mat};
 }
 
-// -------------------- 评估函数（Model 版本） --------------------
+// -------------------- 评估函数 --------------------
 double evaluate(nn::Model &model, const nn::Matrix &x, const nn::Matrix &y_onehot)
 {
     std::size_t N = x.cols();
@@ -76,10 +157,9 @@ double evaluate(nn::Model &model, const nn::Matrix &x, const nn::Matrix &y_oneho
     int correct = 0;
     for (std::size_t i = 0; i < N; ++i)
     {
-        // 预测类别：logits 最大值索引
         double max_val = out.at_unchecked(0, i);
         int pred = 0;
-        for (int j = 1; j < 10; ++j)
+        for (int j = 1; j < static_cast<int>(NUM_CLASSES); ++j)
         {
             double val = out.at_unchecked(j, i);
             if (val > max_val)
@@ -88,9 +168,8 @@ double evaluate(nn::Model &model, const nn::Matrix &x, const nn::Matrix &y_oneho
                 pred = j;
             }
         }
-        // 真实类别
         int true_label = -1;
-        for (int j = 0; j < 10; ++j)
+        for (int j = 0; j < static_cast<int>(NUM_CLASSES); ++j)
         {
             if (y_onehot.at_unchecked(j, i) == 1.0)
             {
@@ -104,133 +183,136 @@ double evaluate(nn::Model &model, const nn::Matrix &x, const nn::Matrix &y_oneho
     return static_cast<double>(correct) / N;
 }
 
-// -------------------- 主函数 --------------------
+// -------------------- 构建网络 --------------------
+nn::Model build_model()
+{
+    nn::Model model;
+    model.add<nn::Linear>(INPUT_DIM, HIDDEN_DIM)
+         .add<nn::ReLU>();
+    for (std::size_t i = 0; i < NUM_HIDDEN_LAYERS - 1; ++i)
+    {
+        model.add<nn::Linear>(HIDDEN_DIM, HIDDEN_DIM)
+             .add<nn::ReLU>();
+    }
+    model.add<nn::Linear>(HIDDEN_DIM, NUM_CLASSES);
+    return model;
+}
+
+// ==================== 主函数 ====================
 int main(int argc, char *argv[])
 {
     try
     {
-        // 可选命令行参数：--load model.bin 或 --save model.bin
-        std::string model_path = "mnist_model.bin";
-        std::string dataset_path = "mnist_data";
-        bool load_existing = false;
+        TrainConfig cfg = parse_args(argc, argv);
 
-        for (int i = 1; i < argc; ++i)
-        {
-            std::string arg = argv[i];
-            if (arg == "--load" && i + 1 < argc)
-            {
-                model_path = argv[++i];
-                load_existing = true;
-            }
-            else if (arg == "--save" && i + 1 < argc)
-            {
-                model_path = argv[++i];
-                // 仅指定保存路径，不加载
-            }
-            else if (arg == "--dataset" && i + 1 < argc)
-            {
-                dataset_path = argv[++i];
-            }
-        }
+        // ── 打印配置 ─────────────────────────────────────────────
+        std::cout << "========================================\n";
+        std::cout << "  MNIST 手写数字训练\n";
+        std::cout << "========================================\n";
+        std::cout << "  网络: " << INPUT_DIM;
+        for (std::size_t i = 0; i < NUM_HIDDEN_LAYERS; ++i)
+            std::cout << " -> " << HIDDEN_DIM << "(ReLU)";
+        std::cout << " -> " << NUM_CLASSES << "\n";
+        std::cout << "  优化器: SGD+Momentum  学习率: " << cfg.lr << "\n";
+        std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
+        std::cout << "  模型: " << (cfg.load_existing ? cfg.resume_path : "(从头训练)")
+                  << " -> " << cfg.save_path << "\n";
+        std::cout << "========================================\n\n";
 
-        // 加载数据
-        std::cout << "Loading MNIST data from " << dataset_path << "..." << std::endl;
-        auto [train_x, train_y] = load_csv(dataset_path + "/train.csv");
-        auto [test_x, test_y] = load_csv(dataset_path + "/test.csv");
-        std::cout << "Train: " << train_x.cols() << " samples, features " << train_x.rows()
-                  << " x " << train_x.cols() << std::endl;
-        // 构建网络 — 使用 nn::Model
-        nn::Model model;
-        model.add<nn::Linear>(784, 64)
-             .add<nn::ReLU>()
-             .add<nn::Linear>(64, 64)
-             .add<nn::ReLU>()
-             .add<nn::Linear>(64, 64)
-             .add<nn::ReLU>()
-             .add<nn::Linear>(64, 10);
+        // ── 加载数据 ─────────────────────────────────────────────
+        std::cout << "加载数据: " << cfg.dataset_path << " ..." << std::endl;
+        auto [train_x, train_y] = load_csv(cfg.dataset_path + "/train.csv");
+        auto [test_x, test_y] = load_csv(cfg.dataset_path + "/test.csv");
+        std::cout << "训练集: " << train_x.cols() << " 样本, 测试集: " << test_x.cols() << " 样本\n" << std::endl;
 
-        // 如果指定加载，则载入已有参数
-        if (load_existing)
+        // ── 构建模型 ─────────────────────────────────────────────
+        auto model = build_model();
+
+        if (cfg.load_existing)
         {
             try
             {
-                nn::load_model(model_path, model);
+                nn::load_model(cfg.resume_path, model);
+                std::cout << "已加载模型: " << cfg.resume_path << "\n" << std::endl;
             }
             catch (const std::exception &e)
             {
-                std::cerr << "Failed to load model: " << e.what() << ", starting from scratch.\n";
+                std::cerr << "加载模型失败: " << e.what() << "，将从头训练。\n" << std::endl;
             }
         }
 
-        // 收集参数和梯度（Model 自动聚合所有层）
-        nn::SGD_w_Momentum optimizer(model.parameters(), model.param_gradients(), 0.01);
+        // ── 训练 ─────────────────────────────────────────────────
+        nn::SGD_w_Momentum optimizer(model.parameters(), model.param_gradients(), cfg.lr);
         nn::CrossEntropyLoss ce_loss;
+        const std::size_t num_batches = train_x.cols() / cfg.batch_size;
 
-        const std::size_t batch_size = 64;
-        const std::size_t num_batches = train_x.cols() / batch_size;
+        auto t_start = std::chrono::steady_clock::now();
 
-        std::cout << "Starting training: " << num_batches << " batches per epoch, "
-                  << batch_size << " batch size" << std::endl;
-
-        // 训练
-        const int epochs = 5;
-        for (int epoch = 0; epoch < epochs; ++epoch)
+        for (int epoch = 0; epoch < cfg.epochs; ++epoch)
         {
+            auto ep_start = std::chrono::steady_clock::now();
             double total_loss = 0.0;
 
             for (std::size_t batch = 0; batch < num_batches; ++batch)
             {
-                // 提取当前 batch
-                std::size_t start = batch * batch_size;
-                nn::Matrix x_batch(train_x.rows(), batch_size);
-                nn::Matrix y_batch(train_y.rows(), batch_size);
-                for (std::size_t i = 0; i < batch_size; ++i)
+                std::size_t start = batch * cfg.batch_size;
+                nn::Matrix x_batch(train_x.rows(), cfg.batch_size);
+                nn::Matrix y_batch(train_y.rows(), cfg.batch_size);
+                for (std::size_t i = 0; i < cfg.batch_size; ++i)
                 {
                     for (std::size_t r = 0; r < train_x.rows(); ++r)
-                    {
                         x_batch.set_value_unchecked(r, i, train_x.at_unchecked(r, start + i));
-                    }
                     for (std::size_t r = 0; r < train_y.rows(); ++r)
-                    {
                         y_batch.set_value_unchecked(r, i, train_y.at_unchecked(r, start + i));
-                    }
                 }
 
-                // 前向 — Model 自动串联所有层
                 auto out = model.forward(x_batch);
                 double loss = ce_loss.forward(out, y_batch);
                 total_loss += loss;
 
-                // 反向 — Model 自动反向传播所有层
                 auto grad = ce_loss.backward();
                 model.backward(grad);
 
-                // 更新参数
                 optimizer.step();
                 optimizer.zero_grad();
+
+                // 进度显示
+                if ((batch + 1) % 100 == 0 || batch + 1 == num_batches)
+                {
+                    std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
+                              << "  batch " << batch + 1 << "/" << num_batches
+                              << "  loss: " << std::fixed << std::setprecision(4) << loss
+                              << "   " << std::flush;
+                }
             }
+
+            auto ep_end = std::chrono::steady_clock::now();
+            double ep_sec = std::chrono::duration<double>(ep_end - ep_start).count();
 
             double avg_loss = total_loss / num_batches;
             double train_acc = evaluate(model, train_x, train_y);
             double test_acc = evaluate(model, test_x, test_y);
-            std::cout << "Epoch " << epoch + 1 << "/" << epochs
-                      << "  loss = " << avg_loss
-                      << "  train acc = " << train_acc
-                      << "  test acc = " << test_acc << std::endl;
+
+            std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
+                      << "  loss=" << std::fixed << std::setprecision(4) << avg_loss
+                      << "  train_acc=" << std::setprecision(2) << train_acc * 100.0 << "%"
+                      << "  test_acc=" << test_acc * 100.0 << "%"
+                      << "  time=" << std::setprecision(1) << ep_sec << "s"
+                      << std::endl;
         }
 
-        // 训练结束后保存模型（Model 版本）
-        nn::save_model(model_path, model);
+        auto t_end = std::chrono::steady_clock::now();
+        double total_sec = std::chrono::duration<double>(t_end - t_start).count();
+
+        // ── 保存模型 ─────────────────────────────────────────────
+        nn::save_model(cfg.save_path, model);
+        std::cout << "\n训练完成! 总耗时: " << std::fixed << std::setprecision(1) << total_sec << "s" << std::endl;
+
         return 0;
     }
     catch (const std::exception &e)
     {
-        std::cerr << "\nFATAL ERROR: " << e.what() << std::endl;
-        return 1;
-    }
-    catch (...)
-    {
-        std::cerr << "\nFATAL ERROR: unknown exception" << std::endl;
+        std::cerr << "\n错误: " << e.what() << std::endl;
         return 1;
     }
 }
