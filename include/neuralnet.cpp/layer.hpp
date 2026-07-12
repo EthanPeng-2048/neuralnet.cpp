@@ -211,6 +211,83 @@ namespace nn
             return grad_input;
         }
     };
+
+    class GeLU final : public Layer
+    {
+    private:
+        Matrix input_cache_;
+        Matrix sigmoid_cache_;  // 缓存 sigmoid(1.702 * x) 用于反向传播
+        static constexpr double BETA = 1.702;
+
+    public:
+        GeLU() = default;
+
+        // QuickGeLU: x * sigmoid(1.702 * x)
+        Matrix forward(const Matrix &input) override
+        {
+            input_cache_ = input;
+            sigmoid_cache_ = Matrix(input.rows(), input.cols());
+
+            const double *in_ptr = input.data_ptr();
+            double *sig_ptr = sigmoid_cache_.data_ptr();
+            const auto n = static_cast<long long>(input.size());
+
+            Matrix result(input.rows(), input.cols());
+            double *out_ptr = result.data_ptr();
+
+            if (n >= SmartPolicy::PARALLEL_THRESHOLD) {
+                auto indices = std::views::iota(0LL, n);
+                SmartPolicy::for_each(indices.begin(), indices.end(),
+                    [in_ptr, out_ptr, sig_ptr](long long i) noexcept
+                    {
+                        double sigmoid_input = BETA * in_ptr[i];
+                        double sigmoid_val = 1.0 / (1.0 + std::exp(-sigmoid_input));
+                        sig_ptr[i] = sigmoid_val;
+                        out_ptr[i] = in_ptr[i] * sigmoid_val;
+                    });
+            } else {
+                for (long long i = 0; i < n; ++i) {
+                    double sigmoid_input = BETA * in_ptr[i];
+                    double sigmoid_val = 1.0 / (1.0 + std::exp(-sigmoid_input));
+                    sig_ptr[i] = sigmoid_val;
+                    out_ptr[i] = in_ptr[i] * sigmoid_val;
+                }
+            }
+            return result;
+        }
+
+        // d/dx [x * sigmoid(βx)] = sigmoid(βx) + x * β * sigmoid(βx) * (1 - sigmoid(βx))
+        //                        = sigmoid(βx) * [1 + βx * (1 - sigmoid(βx))]
+        Matrix backward(const Matrix &grad_output) override
+        {
+            if (input_cache_.rows() != grad_output.rows() || input_cache_.cols() != grad_output.cols())
+                throw std::invalid_argument("gelu backward shape mismatch");
+
+            const double *in_ptr = input_cache_.data_ptr();
+            const double *sig_ptr = sigmoid_cache_.data_ptr();
+            const double *go_ptr = grad_output.data_ptr();
+            const auto n = static_cast<long long>(grad_output.size());
+
+            Matrix grad_input(grad_output.rows(), grad_output.cols());
+            double *out_ptr = grad_input.data_ptr();
+
+            if (n >= SmartPolicy::PARALLEL_THRESHOLD) {
+                auto indices = std::views::iota(0LL, n);
+                SmartPolicy::for_each(indices.begin(), indices.end(),
+                    [in_ptr, sig_ptr, go_ptr, out_ptr](long long i) noexcept
+                    {
+                        double s = sig_ptr[i];
+                        out_ptr[i] = go_ptr[i] * s * (1.0 + BETA * in_ptr[i] * (1.0 - s));
+                    });
+            } else {
+                for (long long i = 0; i < n; ++i) {
+                    double s = sig_ptr[i];
+                    out_ptr[i] = go_ptr[i] * s * (1.0 + BETA * in_ptr[i] * (1.0 - s));
+                }
+            }
+            return grad_input;
+        }
+    };
 }
 
 #endif
