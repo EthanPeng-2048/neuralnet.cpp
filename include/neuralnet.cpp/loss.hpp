@@ -38,7 +38,7 @@ namespace nn
                 throw std::invalid_argument("mse loss cannot be computed on an empty matrix");
             }
 
-            grad_input_ = Matrix(pred.rows(), pred.cols());
+            grad_input_.resize(pred.rows(), pred.cols());
             const auto total = static_cast<double>(pred.size());
 
             const double sum_sq = SmartPolicy::transform_reduce(
@@ -95,9 +95,11 @@ namespace nn
                     if (val > max_val) max_val = val;
                 }
                 
-                // 预分配 exp_vals 避免重复分配
-                std::array<double, 128> exp_vals_storage{}; // 栈上分配，支持最多 128 类
-                double* exp_vals = exp_vals_storage.data();
+                // 栈上分配 exp_vals，支持最多 128 类
+                // 超过 128 类时改用 vector（非热路径，开销可接受）
+                std::array<double, 128> exp_vals_fixed{};
+                std::vector<double> exp_vals_heap;
+                double* exp_vals = (classes <= 128) ? exp_vals_fixed.data() : (exp_vals_heap.resize(classes), exp_vals_heap.data());
                 
                 double sum_exp = 0.0;
                 for (std::size_t c = 0; c < classes; ++c)

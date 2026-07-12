@@ -87,6 +87,7 @@ namespace nn
             auto &data = m.data();
             ifs.read(reinterpret_cast<char *>(data.data()),
                      data.size() * sizeof(double));
+            if (!ifs) throw std::runtime_error("Unexpected end of model file");
         };
 
         auto params1 = l1.parameters();
@@ -168,6 +169,7 @@ namespace nn
             auto &data = m.data();
             ifs.read(reinterpret_cast<char *>(data.data()),
                      data.size() * sizeof(double));
+            if (!ifs) throw std::runtime_error("Unexpected end of model file");
         };
 
         auto params = model.parameters();
