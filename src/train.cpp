@@ -92,11 +92,11 @@ TrainConfig parse_args(int argc, char *argv[])
         else if (arg == "--optimizer" && i + 1 < argc)
         {
             cfg.optimizer_name = argv[++i];
-            if (cfg.optimizer_name != "sgd" && cfg.optimizer_name != "momentum" &&
+            if (cfg.optimizer_name != "sgd" && cfg.optimizer_name != "sgd_w_momentum" &&
                 cfg.optimizer_name != "adam")
             {
                 std::cerr << "未知优化器: " << cfg.optimizer_name
-                          << "，可选: sgd, momentum, adam\n";
+                          << "，可选: sgd, sgd_w_momentum, adam\n";
                 std::exit(1);
             }
         }
@@ -266,7 +266,7 @@ int main(int argc, char *argv[])
         std::unique_ptr<nn::Optimizer> optimizer;
         if (cfg.optimizer_name == "sgd")
             optimizer = std::make_unique<nn::SGD>(model.parameters(), model.param_gradients(), cfg.lr);
-        else if (cfg.optimizer_name == "momentum")
+        else if (cfg.optimizer_name == "sgd_w_momentum")
             optimizer = std::make_unique<nn::SGD_w_Momentum>(model.parameters(), model.param_gradients(), cfg.lr);
         else
             optimizer = std::make_unique<nn::Adam>(model.parameters(), model.param_gradients(), cfg.lr);
