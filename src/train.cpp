@@ -15,9 +15,9 @@
 
 // ==================== 常量 ====================
 static constexpr std::size_t INPUT_DIM = 784;
-static constexpr std::size_t HIDDEN_DIM = 64;
 static constexpr std::size_t NUM_CLASSES = 10;
-static constexpr std::size_t NUM_HIDDEN_LAYERS = 3;
+// 网络架构：输入层 -> 隐藏层1 -> 隐藏层2 -> 隐藏层3 -> 输出层
+static const std::vector<std::size_t> LAYER_DIMS = {INPUT_DIM, 256, 128, 64, NUM_CLASSES};
 
 // ==================== 帮助信息 ====================
 void print_usage(const char *prog)
@@ -29,8 +29,8 @@ void print_usage(const char *prog)
         << "  --resume <path>    从已有模型恢复训练\n"
         << "  --save <path>      模型保存路径 (默认: mnist_model.bin)\n"
         << "  --dataset <path>   数据集目录 (默认: datasets/mnist_data)\n"
-        << "  --epochs <n>       训练轮数 (默认: 5)\n"
-        << "  --lr <lr>          学习率 (默认: 0.01)\n"
+        << "  --epochs <n>       训练轮数 (默认: 10)\n"
+        << "  --lr <lr>          学习率 (默认: 0.001)\n"
         << "  --batch-size <n>   批大小 (默认: 64)\n"
         << "  --optimizer <name> 优化器: sgd/momentum/adam (默认: adam)\n"
         << "  --help             显示此帮助信息\n";
@@ -43,8 +43,8 @@ struct TrainConfig
     std::string dataset_path = "datasets/mnist_data";
     std::string resume_path;
     std::string optimizer_name = "adam";
-    int epochs = 5;
-    double lr = 0.01;
+    int epochs = 10;  // 增加训练轮数
+    double lr = 0.001;  // 调整学习率
     std::size_t batch_size = 64;
     bool load_existing = false;
 };
@@ -208,14 +208,22 @@ double evaluate(nn::Model &model, const nn::Matrix &x, const nn::Matrix &y_oneho
 nn::Model build_model()
 {
     nn::Model model;
-    model.add<nn::Linear>(INPUT_DIM, HIDDEN_DIM)
-         .add<nn::ReLU>();
-    for (std::size_t i = 0; i < NUM_HIDDEN_LAYERS - 1; ++i)
+    // 根据 LAYER_DIMS 自动构建网络
+    for (std::size_t i = 0; i < LAYER_DIMS.size() - 1; ++i)
     {
-        model.add<nn::Linear>(HIDDEN_DIM, HIDDEN_DIM)
-             .add<nn::ReLU>();
+        std::size_t in_dim = LAYER_DIMS[i];
+        std::size_t out_dim = LAYER_DIMS[i + 1];
+        
+        // 添加线性层
+        model.add<nn::Linear>(in_dim, out_dim);
+        
+        // 如果不是最后一层（输出层），则添加 LayerNorm 和 GeLU 激活函数
+        if (i < LAYER_DIMS.size() - 2)
+        {
+            model.add<nn::LayerNorm>(out_dim)
+                 .add<nn::GeLU>();
+        }
     }
-    model.add<nn::Linear>(HIDDEN_DIM, NUM_CLASSES);
     return model;
 }
 
@@ -230,10 +238,17 @@ int main(int argc, char *argv[])
         std::cout << "========================================\n";
         std::cout << "  MNIST 手写数字训练\n";
         std::cout << "========================================\n";
-        std::cout << "  网络: " << INPUT_DIM;
-        for (std::size_t i = 0; i < NUM_HIDDEN_LAYERS; ++i)
-            std::cout << " -> " << HIDDEN_DIM << "(ReLU)";
-        std::cout << " -> " << NUM_CLASSES << "\n";
+        // 动态显示网络架构
+        std::cout << "  网络: ";
+        for (std::size_t i = 0; i < LAYER_DIMS.size(); ++i)
+        {
+            std::cout << LAYER_DIMS[i];
+            if (i < LAYER_DIMS.size() - 2)
+                std::cout << "(LayerNorm+GeLU)";
+            if (i < LAYER_DIMS.size() - 1)
+                std::cout << " -> ";
+        }
+        std::cout << "\n";
         std::cout << "  优化器: " << cfg.optimizer_name << "  学习率: " << cfg.lr << "\n";
         std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
         std::cout << "  模型: " << (cfg.load_existing ? cfg.resume_path : "(从头训练)")
