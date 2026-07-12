@@ -509,6 +509,7 @@ class NeuralNetGUI(tk.Tk):
             self._process = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+            assert self._process.stdout is not None
             for line in self._process.stdout:
                 self.after(0, lambda t=line: log_fn(t))
             self._process.wait()
