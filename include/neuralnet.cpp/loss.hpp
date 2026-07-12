@@ -38,7 +38,7 @@ namespace nn
                 throw std::invalid_argument("mse loss cannot be computed on an empty matrix");
             }
 
-            grad_input_ = Matrix(pred.rows(), pred.cols());
+            grad_input_.resize(pred.rows(), pred.cols());
             const auto total = static_cast<double>(pred.size());
 
             const double sum_sq = SmartPolicy::transform_reduce(
