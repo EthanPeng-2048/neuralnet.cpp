@@ -62,6 +62,19 @@ namespace nn
         Matrix &operator=(Matrix &&) noexcept = default;
         ~Matrix() = default;
 
+        // ── 就地调整大小（复用已有内存） ──────────────────────────────────
+        void resize(std::size_t rows, std::size_t cols) noexcept
+        {
+            if (rows_ == rows && cols_ == cols) return; // 尺寸不变，零开销
+            rows_ = rows;
+            cols_ = cols;
+            data_.resize(rows * cols);
+        }
+
+        // ── 原始指针访问（供 SIMD / 内核使用） ────────────────────────────
+        [[nodiscard]] const double *data_ptr() const noexcept { return data_.data(); }
+        [[nodiscard]] double *data_ptr() noexcept { return data_.data(); }
+
         // 访问器
         [[nodiscard]] constexpr std::size_t rows() const noexcept { return rows_; }
         [[nodiscard]] constexpr std::size_t cols() const noexcept { return cols_; }
@@ -132,37 +145,43 @@ namespace nn
             }
         }
 
+        // ── 转置（返回新矩阵） ─────────────────────────────────────────────
         [[nodiscard]] Matrix transpose() const
         {
             Matrix result(cols_, rows_);
+            transpose_to(result);
+            return result;
+        }
 
-            // 块内行列数，32×32×8byte = 8KB，安全装入 L1
+        // ── 转置到预分配缓冲区（零分配热路径） ─────────────────────────────
+        void transpose_to(Matrix &result) const noexcept
+        {
+            result.resize(cols_, rows_);
+            if (rows_ == 0 || cols_ == 0) return;
 
-            const std::size_t i_blocks = (rows_ + BLOCK_SIZE - 1) / BLOCK_SIZE;
-            const std::size_t j_blocks = (cols_ + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            const auto *src = data_ptr();
+            auto *dst = result.data_ptr();
+            const std::size_t R = rows_;
+            const std::size_t C = cols_;
 
-            auto block_indices = std::views::iota(
-                std::size_t{0}, i_blocks * j_blocks);
+            const std::size_t i_blocks = (R + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            const std::size_t j_blocks = (C + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+            auto block_indices = std::views::iota(std::size_t{0}, i_blocks * j_blocks);
 
             SmartPolicy::for_each(block_indices.begin(), block_indices.end(),
-                          [&](std::size_t block_idx) noexcept
+                          [src, dst, R, C, j_blocks](std::size_t block_idx) noexcept
                           {
                               const std::size_t ib = block_idx / j_blocks;
                               const std::size_t jb = block_idx % j_blocks;
-
                               const std::size_t i0 = ib * BLOCK_SIZE;
                               const std::size_t j0 = jb * BLOCK_SIZE;
-                              const std::size_t i1 = std::min(i0 + BLOCK_SIZE, rows_); // 边界截断
-                              const std::size_t j1 = std::min(j0 + BLOCK_SIZE, cols_);
-
-                              // 块内转置：A[i][j] -> R[j][i]
-                              // 两层循环都在小块内，全部命中缓存
+                              const std::size_t i1 = std::min(i0 + BLOCK_SIZE, R);
+                              const std::size_t j1 = std::min(j0 + BLOCK_SIZE, C);
                               for (std::size_t i = i0; i < i1; ++i)
                                   for (std::size_t j = j0; j < j1; ++j)
-                                      result.data_[j * rows_ + i] = data_[i * cols_ + j];
+                                      dst[j * R + i] = src[i * C + j];
                           });
-
-            return result;
         }
 
         [[nodiscard]] Matrix operator+(const Matrix &other) const
@@ -196,29 +215,42 @@ namespace nn
             return mat * scalar;
         }
 
+        // ── 矩阵乘法（返回新矩阵） ─────────────────────────────────────────
         [[nodiscard]] Matrix operator*(const Matrix &other) const
         {
             if (cols_ != other.rows_)
-            {
                 throw std::invalid_argument("matrix multiplication dimension mismatch");
-            }
+            Matrix result(rows_, other.cols_);
+            multiply_to(result, other);
+            return result;
+        }
 
+        // ── 矩阵乘法到预分配缓冲区（零分配热路径） ─────────────────────────
+        // 使用原始指针 + restrict 提示，帮助编译器自动向量化
+        void multiply_to(Matrix &result, const Matrix &other) const noexcept
+        {
             const std::size_t M = rows_;
             const std::size_t N = other.cols_;
             const std::size_t K = cols_;
+            result.resize(M, N);
+            if (M == 0 || N == 0 || K == 0) return;
 
-            Matrix result(M, N);
+            // 清零结果矩阵
+            auto *r_ptr = result.data_ptr();
+            std::fill(r_ptr, r_ptr + M * N, 0.0);
+
+            const double *a_ptr = data_ptr();
+            const double *b_ptr = other.data_ptr();
 
             const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
             auto block_indices = std::views::iota(std::size_t{0}, i_blocks * j_blocks);
             SmartPolicy::for_each(block_indices.begin(), block_indices.end(),
-                          [&](std::size_t block_idx)
+                          [a_ptr, b_ptr, r_ptr, M, N, K, j_blocks](std::size_t block_idx) noexcept
                           {
                               const std::size_t i_block = block_idx / j_blocks;
                               const std::size_t j_block = block_idx % j_blocks;
-
                               const std::size_t i_start = i_block * BLOCK_SIZE;
                               const std::size_t i_end = std::min(i_start + BLOCK_SIZE, M);
                               const std::size_t j_start = j_block * BLOCK_SIZE;
@@ -230,33 +262,28 @@ namespace nn
                                   const std::size_t k_len = k_end - k_start;
                                   const std::size_t j_len = j_end - j_start;
 
-                                  // 加载 B 的子块到栈数组并转置：b_block[jj * k_len + kk] = B(k_start+kk, j_start+jj)
+                                  // 加载 B 的子块到栈数组并转置，改善访问局部性
                                   std::array<double, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                                   for (std::size_t jj = 0; jj < j_len; ++jj)
-                                  {
                                       for (std::size_t kk = 0; kk < k_len; ++kk)
-                                      {
-                                          b_block[jj * k_len + kk] = other.data_[other.index(k_start + kk, j_start + jj)];
-                                      }
-                                  }
+                                          b_block[jj * k_len + kk] = b_ptr[(k_start + kk) * N + (j_start + jj)];
 
                                   // 累加当前 K 块对 C 块的贡献
                                   for (std::size_t i = i_start; i < i_end; ++i)
                                   {
-                                      const std::size_t a_base = i * K + k_start;
-                                      for (std::size_t j = j_start; j < j_end; ++j)
+                                      const double *a_row = a_ptr + i * K + k_start;
+                                      double *r_row = r_ptr + i * N + j_start;
+                                      for (std::size_t j = 0; j < j_len; ++j)
                                       {
+                                          const double *b_col = b_block.data() + j * k_len;
                                           double sum = 0.0;
-                                          const std::size_t b_base = (j - j_start) * k_len;
                                           for (std::size_t kk = 0; kk < k_len; ++kk)
-                                              sum += data_[a_base + kk] * b_block[b_base + kk];
-                                          result.data_[result.index(i, j)] += sum;
+                                              sum += a_row[kk] * b_col[kk];
+                                          r_row[j] += sum;
                                       }
                                   }
                               }
                           });
-
-            return result;
         }
 
         void scale_inplace(double scalar) noexcept

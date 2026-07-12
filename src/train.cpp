@@ -1,5 +1,6 @@
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/model_io.hpp>
+#include <cstring>     // for std::memcpy
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -246,6 +247,10 @@ int main(int argc, char *argv[])
         nn::CrossEntropyLoss ce_loss;
         const std::size_t num_batches = train_x.cols() / cfg.batch_size;
 
+        // ── 预分配 batch 缓冲区（避免每次迭代重复分配） ──────────
+        nn::Matrix x_batch(train_x.rows(), cfg.batch_size);
+        nn::Matrix y_batch(train_y.rows(), cfg.batch_size);
+
         auto t_start = std::chrono::steady_clock::now();
 
         for (int epoch = 0; epoch < cfg.epochs; ++epoch)
@@ -255,16 +260,17 @@ int main(int argc, char *argv[])
 
             for (std::size_t batch = 0; batch < num_batches; ++batch)
             {
-                std::size_t start = batch * cfg.batch_size;
-                nn::Matrix x_batch(train_x.rows(), cfg.batch_size);
-                nn::Matrix y_batch(train_y.rows(), cfg.batch_size);
-                for (std::size_t i = 0; i < cfg.batch_size; ++i)
-                {
-                    for (std::size_t r = 0; r < train_x.rows(); ++r)
-                        x_batch.set_value_unchecked(r, i, train_x.at_unchecked(r, start + i));
-                    for (std::size_t r = 0; r < train_y.rows(); ++r)
-                        y_batch.set_value_unchecked(r, i, train_y.at_unchecked(r, start + i));
-                }
+                const std::size_t start = batch * cfg.batch_size;
+
+                // ── 行优先 memcpy 提取 batch（比逐列复制更缓存友好） ─────
+                for (std::size_t r = 0; r < train_x.rows(); ++r)
+                    std::memcpy(x_batch.data_ptr() + r * cfg.batch_size,
+                                train_x.data_ptr() + r * train_x.cols() + start,
+                                cfg.batch_size * sizeof(double));
+                for (std::size_t r = 0; r < train_y.rows(); ++r)
+                    std::memcpy(y_batch.data_ptr() + r * cfg.batch_size,
+                                train_y.data_ptr() + r * train_y.cols() + start,
+                                cfg.batch_size * sizeof(double));
 
                 auto out = model.forward(x_batch);
                 double loss = ce_loss.forward(out, y_batch);
