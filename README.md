@@ -9,6 +9,7 @@ neuralnet.cpp/
 ├── .gitignore
 ├── CMakeLists.txt
 ├── README.md
+├── gui.py                  ← 图形化操作界面
 ├── csv_png.py
 ├── extract_digits.py
 ├── save_dataset.py
@@ -34,10 +35,11 @@ neuralnet.cpp/
 - **编译器**: LLVM Clang++ 22.1+（`C:/Program Files/LLVM/bin/clang++.exe`）
 - **C++ 标准**: C++26
 - **构建工具**: CMake 4.x Ninja
+- **GUI** (可选): Python 3.8+，tkinter（内置），Pillow（`pip install Pillow`）
 
 ## 构建与运行
 
-### build.cmake
+### 构建 C++ 项目
 
 ```powershell
 cmake -B build -G Ninja
@@ -63,6 +65,25 @@ python save_dataset.py
 # 指定保存路径
 ./build/mnist_train --save my_model.bin
 ```
+
+### 🖥️ 图形化界面 (GUI)
+
+提供了一个基于 tkinter 的图形化界面，方便进行训练、推理和图片查看操作。
+
+```bash
+# 启动 GUI
+python gui.py
+```
+
+> **前提**: 需要先构建 C++ 项目（`cmake -B build -G Ninja`），GUI 会调用 build 目录下的可执行文件。
+
+#### GUI 功能一览
+
+| Tab | 功能 |
+|-----|------|
+| 🏋️ **训练** | 配置数据集路径、模型保存路径、轮数、学习率、批大小、优化器，支持恢复训练；实时显示训练日志 |
+| 🔍 **推理** | 选择模型文件和图片 CSV 文件/目录，显示预测结果置信度条形图和手写数字图片预览 |
+| 🖼️ **图片查看** | 浏览单张 CSV 图片或批量加载目录，支持前后翻页导航 |
 
 ## 网络结构
 
