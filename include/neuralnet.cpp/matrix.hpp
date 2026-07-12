@@ -144,8 +144,7 @@ namespace nn
             auto block_indices = std::views::iota(
                 std::size_t{0}, i_blocks * j_blocks);
 
-            std::for_each(NN_EXEC_POLICY,
-                          block_indices.begin(), block_indices.end(),
+            SmartPolicy::for_each(block_indices.begin(), block_indices.end(),
                           [&](std::size_t block_idx) noexcept
                           {
                               const std::size_t ib = block_idx / j_blocks;
@@ -170,7 +169,7 @@ namespace nn
         {
             require_same_shape(*this, other, "addition dimension mismatch");
             Matrix result(rows_, cols_);
-            std::transform(NN_EXEC_POLICY, data_.begin(), data_.end(), other.data_.begin(),
+            SmartPolicy::transform(data_.begin(), data_.end(), other.data_.begin(),
                            result.data_.begin(), std::plus<>{});
             return result;
         }
@@ -179,7 +178,7 @@ namespace nn
         {
             require_same_shape(*this, other, "subtraction dimension mismatch");
             Matrix result(rows_, cols_);
-            std::transform(NN_EXEC_POLICY, data_.begin(), data_.end(), other.data_.begin(),
+            SmartPolicy::transform(data_.begin(), data_.end(), other.data_.begin(),
                            result.data_.begin(), std::minus<>{});
             return result;
         }
@@ -187,7 +186,7 @@ namespace nn
         [[nodiscard]] Matrix operator*(double scalar) const
         {
             Matrix result(rows_, cols_);
-            std::transform(NN_EXEC_POLICY, data_.begin(), data_.end(), result.data_.begin(),
+            SmartPolicy::transform(data_.begin(), data_.end(), result.data().begin(),
                            [scalar](double value) noexcept { return value * scalar; });
             return result;
         }
@@ -214,7 +213,7 @@ namespace nn
             const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
             auto block_indices = std::views::iota(std::size_t{0}, i_blocks * j_blocks);
-            std::for_each(NN_EXEC_POLICY, block_indices.begin(), block_indices.end(),
+            SmartPolicy::for_each(block_indices.begin(), block_indices.end(),
                           [&](std::size_t block_idx)
                           {
                               const std::size_t i_block = block_idx / j_blocks;
@@ -262,7 +261,7 @@ namespace nn
 
         void scale_inplace(double scalar) noexcept
         {
-            std::for_each(NN_EXEC_POLICY, data_.begin(), data_.end(),
+            SmartPolicy::for_each(data_.begin(), data_.end(),
                           [scalar](double &value) noexcept { value *= scalar; });
         }
 
@@ -270,7 +269,7 @@ namespace nn
         void add_inplace(const Matrix &other) noexcept
         {
             if (rows_ != other.rows_ || cols_ != other.cols_) return;
-            std::transform(NN_EXEC_POLICY, data_.begin(), data_.end(), other.data_.begin(),
+            SmartPolicy::transform(data_.begin(), data_.end(), other.data_.begin(),
                            data_.begin(), std::plus<>{});
         }
 
@@ -278,7 +277,7 @@ namespace nn
         void subtract_inplace(const Matrix &other) noexcept
         {
             if (rows_ != other.rows_ || cols_ != other.cols_) return;
-            std::transform(NN_EXEC_POLICY, data_.begin(), data_.end(), other.data_.begin(),
+            SmartPolicy::transform(data_.begin(), data_.end(), other.data_.begin(),
                            data_.begin(), std::minus<>{});
         }
 

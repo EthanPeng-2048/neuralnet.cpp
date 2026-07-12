@@ -82,7 +82,7 @@ namespace nn
 
             // 并行 bias 加法：使用 iota 生成索引，避免 std::transform 值类型混淆
             auto indices = std::views::iota(std::size_t{0}, product.size());
-            std::for_each(NN_EXEC_POLICY, indices.begin(), indices.end(),
+            SmartPolicy::for_each(indices.begin(), indices.end(),
                           [&](std::size_t idx) noexcept
                           {
                               const std::size_t row = idx / product.cols();
@@ -110,7 +110,7 @@ namespace nn
             // 计算 grad_input: dL/dx = W^T * dL/dy
             Matrix grad_input(in_feat, batch);
             auto grad_in_indices = std::views::iota(std::size_t{0}, in_feat * batch);
-            std::for_each(NN_EXEC_POLICY, grad_in_indices.begin(), grad_in_indices.end(),
+            SmartPolicy::for_each(grad_in_indices.begin(), grad_in_indices.end(),
                           [&, this](std::size_t idx) noexcept
                           {
                               const std::size_t input_feature = idx / batch;
@@ -126,7 +126,7 @@ namespace nn
 
             // 计算 grad_W: dL/dW = dL/dy * x^T
             auto grad_w_indices = std::views::iota(std::size_t{0}, out_feat * in_feat);
-            std::for_each(NN_EXEC_POLICY, grad_w_indices.begin(), grad_w_indices.end(),
+            SmartPolicy::for_each(grad_w_indices.begin(), grad_w_indices.end(),
                           [&, this](std::size_t idx) noexcept
                           {
                               const std::size_t out_feature = idx / in_feat;
@@ -143,7 +143,7 @@ namespace nn
 
             // 计算 grad_b: dL/db = sum(dL/dy, dim=batch)
             auto out_indices = std::views::iota(std::size_t{0}, out_feat);
-            std::for_each(NN_EXEC_POLICY, out_indices.begin(), out_indices.end(),
+            SmartPolicy::for_each(out_indices.begin(), out_indices.end(),
                           [&, this](std::size_t out_feature) noexcept
                           {
                               double sum = 0.0;
@@ -170,7 +170,7 @@ namespace nn
         {
             input_cache_ = input;
             Matrix result(input.rows(), input.cols());
-            std::transform(NN_EXEC_POLICY, input.data().begin(), input.data().end(),
+            SmartPolicy::transform(input.data().begin(), input.data().end(),
                            result.data().begin(), [](double value) noexcept
                            { return value > 0.0 ? value : 0.0; });
             return result;
@@ -184,8 +184,7 @@ namespace nn
             }
 
             Matrix grad_input(grad_output.rows(), grad_output.cols());
-            std::transform(NN_EXEC_POLICY,
-                           input_cache_.data().begin(), input_cache_.data().end(),
+            SmartPolicy::transform(input_cache_.data().begin(), input_cache_.data().end(),
                            grad_output.data().begin(),
                            grad_input.data().begin(),
                            [](double input_value, double grad_value) noexcept
