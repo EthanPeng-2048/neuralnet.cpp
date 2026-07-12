@@ -43,8 +43,7 @@ namespace nn
             {
                 auto &p = params_[i].get();
                 auto &g = grads_[i].get();
-                std::transform(NN_EXEC_POLICY,
-                               p.data().begin(), p.data().end(),
+                SmartPolicy::transform(p.data().begin(), p.data().end(),
                                g.data().begin(),
                                p.data().begin(),
                                [this](double p_val, double g_val)
@@ -108,8 +107,7 @@ namespace nn
                 auto zip_view = std::views::zip(p_vec, g_vec, v_vec);
 
                 // 并行处理，注意这里NN_EXEC_POLICY可能是par_unseq，要考虑乱序问题
-                std::for_each(NN_EXEC_POLICY,
-                              zip_view.begin(),
+                SmartPolicy::for_each(zip_view.begin(),
                               zip_view.end(),
                               [this](auto &&tuple)
                               {
@@ -189,8 +187,7 @@ namespace nn
 
                 auto zip_view = std::views::zip(p_vec, g_vec, m_vec, v_vec);
 
-                std::for_each(NN_EXEC_POLICY,
-                              zip_view.begin(),
+                SmartPolicy::for_each(zip_view.begin(),
                               zip_view.end(),
                               [this, bc1, bc2](auto &&tuple)
                               {
