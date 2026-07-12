@@ -19,8 +19,8 @@
 // 修改时需同步评估 b_block 栈占用（BLOCK_SIZE² × 8 字节）
 namespace nn
 {
-    inline constexpr std::size_t BLOCK_SIZE = 64;
-    
+    inline constexpr std::size_t BLOCK_SIZE = 64;    static_assert(BLOCK_SIZE * BLOCK_SIZE * sizeof(double) <= 65536,
+                  "BLOCK_SIZE too large: b_block would exceed 64KB stack budget");    
     // ── 数值常量 ─────────────────────────────────────────────────────────────
     // 使用 constexpr 避免运行时计算
     inline constexpr double EPSILON = 1e-8;

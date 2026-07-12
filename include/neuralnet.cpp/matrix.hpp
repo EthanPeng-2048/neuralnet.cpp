@@ -156,6 +156,7 @@ namespace nn
         // ── 转置到预分配缓冲区（零分配热路径） ─────────────────────────────
         void transpose_to(Matrix &result) const
         {
+            assert(&result != this && "transpose_to: self-referencing not supported");
             result.resize(cols_, rows_);
             if (rows_ == 0 || cols_ == 0) return;
 
@@ -229,6 +230,7 @@ namespace nn
         // 使用原始指针 + restrict 提示，帮助编译器自动向量化
         void multiply_to(Matrix &result, const Matrix &other) const
         {
+            assert(&result != this && "multiply_to: self-referencing not supported");
             const std::size_t M = rows_;
             const std::size_t N = other.cols_;
             const std::size_t K = cols_;
