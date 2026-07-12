@@ -14,7 +14,7 @@
 #endif
 
 // ── 缓存分块大小 ─────────────────────────────────────────────────────────────
-// 32×32×8 = 8 KB，安全装入大多数 CPU 的 L1 缓存
+// 64×64×8 = 32 KB，安全装入大多数 CPU 的 L1 缓存
 // 矩阵乘法、转置等所有分块操作共用此值
 // 修改时需同步评估 b_block 栈占用（BLOCK_SIZE² × 8 字节）
 namespace nn
@@ -29,7 +29,7 @@ namespace nn
     // 根据元素数量自动选择串行或使用全局线程池并行，避免小矩阵的线程池调度开销
     // 线程池在首次使用时懒初始化，训练期间常驻，避免反复创建/销毁
     struct SmartPolicy {
-        static constexpr long long PARALLEL_THRESHOLD = 100000; // 100K元素
+        static constexpr long long PARALLEL_THRESHOLD = 100000; // 100K元素（实测最优）
         
         // for_each 版本
         template<typename Iterator, typename Func>
@@ -70,9 +70,9 @@ namespace nn
         static T transform_reduce(InputIt first, InputIt last, T init, BinaryOp&& reduce_op, UnaryOp&& transform_op) {
             const auto n = static_cast<long long>(std::distance(first, last));
             if (n >= PARALLEL_THRESHOLD) {
-                // 使用标准库的并行版本（内部有线程池调度）
-                return std::transform_reduce(std::execution::par_unseq, first, last, init, 
-                                            std::forward<BinaryOp>(reduce_op), std::forward<UnaryOp>(transform_op));
+                return global_thread_pool().parallel_transform_reduce(
+                    first, last, first, init,
+                    std::forward<BinaryOp>(reduce_op), std::forward<UnaryOp>(transform_op));
             } else {
                 return std::transform_reduce(std::execution::seq, first, last, init, 
                                             std::forward<BinaryOp>(reduce_op), std::forward<UnaryOp>(transform_op));

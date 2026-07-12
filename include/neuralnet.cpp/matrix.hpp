@@ -63,7 +63,7 @@ namespace nn
         ~Matrix() = default;
 
         // ── 就地调整大小（复用已有内存） ──────────────────────────────────
-        void resize(std::size_t rows, std::size_t cols) noexcept
+        void resize(std::size_t rows, std::size_t cols)
         {
             if (rows_ == rows && cols_ == cols) return; // 尺寸不变，零开销
             rows_ = rows;
@@ -154,7 +154,7 @@ namespace nn
         }
 
         // ── 转置到预分配缓冲区（零分配热路径） ─────────────────────────────
-        void transpose_to(Matrix &result) const noexcept
+        void transpose_to(Matrix &result) const
         {
             result.resize(cols_, rows_);
             if (rows_ == 0 || cols_ == 0) return;
@@ -227,7 +227,7 @@ namespace nn
 
         // ── 矩阵乘法到预分配缓冲区（零分配热路径） ─────────────────────────
         // 使用原始指针 + restrict 提示，帮助编译器自动向量化
-        void multiply_to(Matrix &result, const Matrix &other) const noexcept
+        void multiply_to(Matrix &result, const Matrix &other) const
         {
             const std::size_t M = rows_;
             const std::size_t N = other.cols_;
@@ -293,17 +293,17 @@ namespace nn
         }
 
         // 逐元素加法 inplace
-        void add_inplace(const Matrix &other) noexcept
+        void add_inplace(const Matrix &other)
         {
-            if (rows_ != other.rows_ || cols_ != other.cols_) return;
+            require_same_shape(*this, other, "add_inplace dimension mismatch");
             SmartPolicy::transform(data_.begin(), data_.end(), other.data_.begin(),
                            data_.begin(), std::plus<>{});
         }
 
         // 逐元素减法 inplace
-        void subtract_inplace(const Matrix &other) noexcept
+        void subtract_inplace(const Matrix &other)
         {
-            if (rows_ != other.rows_ || cols_ != other.cols_) return;
+            require_same_shape(*this, other, "subtract_inplace dimension mismatch");
             SmartPolicy::transform(data_.begin(), data_.end(), other.data_.begin(),
                            data_.begin(), std::minus<>{});
         }

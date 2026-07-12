@@ -72,7 +72,9 @@ TrainConfig parse_args(int argc, char *argv[])
         }
         else if (arg == "--epochs" && i + 1 < argc)
         {
-            cfg.epochs = std::stoi(argv[++i]);
+            int val = std::stoi(argv[++i]);
+            if (val <= 0) { std::cerr << "--epochs 必须为正整数\n"; std::exit(1); }
+            cfg.epochs = val;
         }
         else if (arg == "--lr" && i + 1 < argc)
         {
@@ -80,7 +82,9 @@ TrainConfig parse_args(int argc, char *argv[])
         }
         else if (arg == "--batch-size" && i + 1 < argc)
         {
-            cfg.batch_size = std::stoi(argv[++i]);
+            int val = std::stoi(argv[++i]);
+            if (val <= 0) { std::cerr << "--batch-size 必须为正整数\n"; std::exit(1); }
+            cfg.batch_size = static_cast<std::size_t>(val);
         }
         else
         {
@@ -118,6 +122,8 @@ std::pair<nn::Matrix, nn::Matrix> load_csv(const std::string &filename, int max_
     }
 
     std::size_t N = labels.size();
+    if (N == 0)
+        throw std::runtime_error("CSV file is empty or malformed: " + filename);
     std::size_t feat_dim = features.size() / N; // 784
 
     if (max_samples > 0 && static_cast<std::size_t>(max_samples) < N)
