@@ -41,6 +41,12 @@ namespace nn
         Matrix grad_b_;
         Matrix input_cache_;
 
+        // ── 预分配缓冲区：避免 forward/backward 热路径反复分配内存 ──────
+        Matrix product_buf_;   // W * input 的中间结果
+        Matrix result_buf_;    // forward 输出（已融合 bias）
+        Matrix grad_input_buf_;  // backward: W^T * dL/dy
+        Matrix grad_WT_buf_;     // backward: W^T
+
         // 修复：使用 thread_local 保证多线程构造 Layer 时的线程安全
         inline static thread_local std::mt19937_64 rng_{std::random_device{}()};
 
@@ -48,9 +54,13 @@ namespace nn
         Linear(std::size_t in_features, std::size_t out_features)
             : W_(out_features, in_features),
               b_(out_features, 1),
-              grad_W_(out_features, in_features), // 添加
-              grad_b_(out_features, 1),           // 添加
-              input_cache_()
+              grad_W_(out_features, in_features),
+              grad_b_(out_features, 1),
+              input_cache_(),
+              product_buf_(out_features, 1),
+              result_buf_(out_features, 1),
+              grad_input_buf_(in_features, 1),
+              grad_WT_buf_(in_features, out_features)
         {
             // Xavier 均匀初始化：适合 tanh/sigmoid，对 ReLU 也可用
             const double limit = std::sqrt(6.0 / static_cast<double>(in_features + out_features));
@@ -72,89 +82,81 @@ namespace nn
         Matrix forward(const Matrix &input) override
         {
             if (input.rows() != W_.cols())
-            {
                 throw std::invalid_argument("linear forward input shape mismatch");
-            }
 
             input_cache_ = input;
-            const Matrix product = W_ * input;
-            Matrix result(product.rows(), product.cols());
 
-            // 并行 bias 加法：使用 iota 生成索引，避免 std::transform 值类型混淆
-            auto indices = std::views::iota(std::size_t{0}, product.size());
+            // 融合矩阵乘法 + bias 加法，减少一次临时矩阵分配和一次完整遍历
+            const std::size_t out_feat = W_.rows();
+            const std::size_t batch = input.cols();
+
+            // product = W * input（写入预分配缓冲区）
+            W_.multiply_to(product_buf_, input);
+
+            // result = product + bias（融合到同一个循环中）
+            result_buf_.resize(out_feat, batch);
+            const double *prod_ptr = product_buf_.data_ptr();
+            const double *bias_ptr = b_.data_ptr();
+            double *res_ptr = result_buf_.data_ptr();
+            const auto total = static_cast<std::size_t>(out_feat * batch);
+
+            auto indices = std::views::iota(std::size_t{0}, total);
             SmartPolicy::for_each(indices.begin(), indices.end(),
-                          [&](std::size_t idx) noexcept
+                          [prod_ptr, bias_ptr, res_ptr, batch](std::size_t idx) noexcept
                           {
-                              const std::size_t row = idx / product.cols();
-                              result.data()[idx] = product.data()[idx] + b_.at_unchecked(row, 0);
+                              res_ptr[idx] = prod_ptr[idx] + bias_ptr[idx / batch];
                           });
 
-            return result;
+            return result_buf_;
         }
 
         Matrix backward(const Matrix &grad_output) override
         {
             if (grad_output.rows() != W_.rows())
-            {
                 throw std::invalid_argument("linear backward grad_output shape mismatch");
-            }
             if (input_cache_.rows() != W_.cols() || input_cache_.cols() != grad_output.cols())
-            {
                 throw std::invalid_argument("linear backward cache/input shape mismatch");
-            }
 
             const std::size_t in_feat = W_.cols();
             const std::size_t out_feat = W_.rows();
             const std::size_t batch = grad_output.cols();
 
-            // 计算 grad_input: dL/dx = W^T * dL/dy
-            Matrix grad_input(in_feat, batch);
-            auto grad_in_indices = std::views::iota(std::size_t{0}, in_feat * batch);
-            SmartPolicy::for_each(grad_in_indices.begin(), grad_in_indices.end(),
-                          [&, this](std::size_t idx) noexcept
-                          {
-                              const std::size_t input_feature = idx / batch;
-                              const std::size_t batch_index = idx % batch;
-                              double sum = 0.0;
-                              for (std::size_t out_feature = 0; out_feature < out_feat; ++out_feature)
-                              {
-                                  sum += W_.at_unchecked(out_feature, input_feature) *
-                                         grad_output.at_unchecked(out_feature, batch_index);
-                              }
-                              grad_input.set_value_unchecked(input_feature, batch_index, sum);
-                          });
+            // grad_input = W^T * grad_output（使用预分配缓冲区）
+            W_.transpose_to(grad_WT_buf_);
+            grad_WT_buf_.multiply_to(grad_input_buf_, grad_output);
 
-            // 计算 grad_W: dL/dW = dL/dy * x^T
-            auto grad_w_indices = std::views::iota(std::size_t{0}, out_feat * in_feat);
-            SmartPolicy::for_each(grad_w_indices.begin(), grad_w_indices.end(),
-                          [&, this](std::size_t idx) noexcept
-                          {
-                              const std::size_t out_feature = idx / in_feat;
-                              const std::size_t input_feature = idx % in_feat;
-                              double sum = 0.0;
-                              for (std::size_t batch_index = 0; batch_index < batch; ++batch_index)
-                              {
-                                  sum += grad_output.at_unchecked(out_feature, batch_index) *
-                                         input_cache_.at_unchecked(input_feature, batch_index);
-                              }
-                              grad_W_.set_value_unchecked(out_feature, input_feature, 
-                                                          grad_W_.at_unchecked(out_feature, input_feature) + sum);
-                          });
+            // grad_W += grad_output * input_cache_^T（逐元素累加，避免临时矩阵）
+            // 手动计算：grad_W[i][j] += sum_k(grad_output[i][k] * input_cache_[j][k])
+            {
+                const double *go_ptr = grad_output.data_ptr();
+                const double *ic_ptr = input_cache_.data_ptr();
+                double *gw_ptr = grad_W_.data_ptr();
+                for (std::size_t of = 0; of < out_feat; ++of)
+                {
+                    for (std::size_t inf = 0; inf < in_feat; ++inf)
+                    {
+                        double sum = 0.0;
+                        for (std::size_t b = 0; b < batch; ++b)
+                            sum += go_ptr[of * batch + b] * ic_ptr[inf * batch + b];
+                        gw_ptr[of * in_feat + inf] += sum;
+                    }
+                }
+            }
 
-            // 计算 grad_b: dL/db = sum(dL/dy, dim=batch)
-            auto out_indices = std::views::iota(std::size_t{0}, out_feat);
-            SmartPolicy::for_each(out_indices.begin(), out_indices.end(),
-                          [&, this](std::size_t out_feature) noexcept
-                          {
-                              double sum = 0.0;
-                              for (std::size_t batch_index = 0; batch_index < batch; ++batch_index)
-                              {
-                                  sum += grad_output.at_unchecked(out_feature, batch_index);
-                              }
-                              grad_b_.set_value_unchecked(out_feature, 0,
-                                                          grad_b_.at_unchecked(out_feature, 0) + sum);
-                          });
-            return grad_input;
+            // grad_b += sum(grad_output, dim=batch)
+            {
+                const double *go_ptr = grad_output.data_ptr();
+                double *gb_ptr = grad_b_.data_ptr();
+                for (std::size_t of = 0; of < out_feat; ++of)
+                {
+                    double sum = 0.0;
+                    for (std::size_t b = 0; b < batch; ++b)
+                        sum += go_ptr[of * batch + b];
+                    gb_ptr[of] += sum;
+                }
+            }
+
+            return grad_input_buf_;
         }
     };
 
@@ -162,6 +164,8 @@ namespace nn
     {
     private:
         Matrix input_cache_;
+        Matrix result_buf_;      // forward 输出缓冲区
+        Matrix grad_input_buf_;  // backward 输出缓冲区
 
     public:
         ReLU() = default;
@@ -169,29 +173,46 @@ namespace nn
         Matrix forward(const Matrix &input) override
         {
             input_cache_ = input;
-            Matrix result(input.rows(), input.cols());
-            SmartPolicy::transform(input.data().begin(), input.data().end(),
-                           result.data().begin(), [](double value) noexcept
-                           { return value > 0.0 ? value : 0.0; });
-            return result;
+            result_buf_.resize(input.rows(), input.cols());
+
+            const double *in_ptr = input.data_ptr();
+            double *out_ptr = result_buf_.data_ptr();
+            const auto n = static_cast<long long>(input.size());
+
+            if (n >= SmartPolicy::PARALLEL_THRESHOLD) {
+                auto indices = std::views::iota(0LL, n);
+                SmartPolicy::for_each(indices.begin(), indices.end(),
+                    [in_ptr, out_ptr](long long i) noexcept
+                    { out_ptr[i] = in_ptr[i] > 0.0 ? in_ptr[i] : 0.0; });
+            } else {
+                for (long long i = 0; i < n; ++i)
+                    out_ptr[i] = in_ptr[i] > 0.0 ? in_ptr[i] : 0.0;
+            }
+            return result_buf_;
         }
 
         Matrix backward(const Matrix &grad_output) override
         {
             if (input_cache_.rows() != grad_output.rows() || input_cache_.cols() != grad_output.cols())
-            {
                 throw std::invalid_argument("relu backward shape mismatch");
-            }
 
-            Matrix grad_input(grad_output.rows(), grad_output.cols());
-            SmartPolicy::transform(input_cache_.data().begin(), input_cache_.data().end(),
-                           grad_output.data().begin(),
-                           grad_input.data().begin(),
-                           [](double input_value, double grad_value) noexcept
-                           {
-                               return input_value > 0.0 ? grad_value : 0.0;
-                           });
-            return grad_input;
+            grad_input_buf_.resize(grad_output.rows(), grad_output.cols());
+
+            const double *in_ptr = input_cache_.data_ptr();
+            const double *go_ptr = grad_output.data_ptr();
+            double *out_ptr = grad_input_buf_.data_ptr();
+            const auto n = static_cast<long long>(grad_output.size());
+
+            if (n >= SmartPolicy::PARALLEL_THRESHOLD) {
+                auto indices = std::views::iota(0LL, n);
+                SmartPolicy::for_each(indices.begin(), indices.end(),
+                    [in_ptr, go_ptr, out_ptr](long long i) noexcept
+                    { out_ptr[i] = in_ptr[i] > 0.0 ? go_ptr[i] : 0.0; });
+            } else {
+                for (long long i = 0; i < n; ++i)
+                    out_ptr[i] = in_ptr[i] > 0.0 ? go_ptr[i] : 0.0;
+            }
+            return grad_input_buf_;
         }
     };
 }
