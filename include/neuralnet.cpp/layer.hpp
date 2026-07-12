@@ -288,6 +288,257 @@ namespace nn
             return grad_input;
         }
     };
+
+    class LayerNorm final : public Layer
+    {
+    private:
+        std::size_t normalized_shape_;
+        double epsilon_;
+        
+        // 可学习参数
+        Matrix gamma_;      // 缩放参数 (normalized_shape_, 1)
+        Matrix beta_;       // 偏移参数 (normalized_shape_, 1)
+        Matrix grad_gamma_; // gamma 梯度
+        Matrix grad_beta_;  // beta 梯度
+        
+        // 缓存用于反向传播
+        Matrix input_cache_;
+        Matrix normalized_cache_;  // 归一化后的值
+        Matrix std_cache_;         // 标准差倒数 (1/sqrt(σ² + ε))
+        Matrix mean_cache_;        // 均值
+
+        // 数值稳定性
+        static constexpr double EPSILON = 1e-5;
+
+    public:
+        explicit LayerNorm(std::size_t normalized_shape, double epsilon = EPSILON)
+            : normalized_shape_(normalized_shape),
+              epsilon_(epsilon),
+              gamma_(normalized_shape, 1, 1.0),  // 初始化为1
+              beta_(normalized_shape, 1, 0.0),   // 初始化为0
+              grad_gamma_(normalized_shape, 1),
+              grad_beta_(normalized_shape, 1)
+        {
+            // 参数初始化已在构造函数中完成
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            return {std::ref(gamma_), std::ref(beta_)};
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            return {std::ref(grad_gamma_), std::ref(grad_beta_)};
+        }
+
+        Matrix forward(const Matrix &input) override
+        {
+            // 输入形状: (normalized_shape_, batch_size)
+            if (input.rows() != normalized_shape_)
+                throw std::invalid_argument("layer_norm forward input shape mismatch");
+
+            input_cache_ = input;
+            const std::size_t batch_size = input.cols();
+            const std::size_t features = input.rows();
+
+            // 缓存中间结果
+            mean_cache_ = Matrix(1, batch_size);
+            std_cache_ = Matrix(1, batch_size);
+            normalized_cache_ = Matrix(features, batch_size);
+
+            Matrix result(features, batch_size);
+
+            const double *in_ptr = input.data_ptr();
+            const double *gamma_ptr = gamma_.data_ptr();
+            const double *beta_ptr = beta_.data_ptr();
+            double *mean_ptr = mean_cache_.data_ptr();
+            double *std_ptr = std_cache_.data_ptr();
+            double *norm_ptr = normalized_cache_.data_ptr();
+            double *res_ptr = result.data_ptr();
+
+            // 对每个样本（列）独立处理
+            auto batch_indices = std::views::iota(std::size_t{0}, batch_size);
+            
+            if (batch_size >= SmartPolicy::PARALLEL_THRESHOLD) {
+                SmartPolicy::for_each(batch_indices.begin(), batch_indices.end(),
+                    [in_ptr, gamma_ptr, beta_ptr, mean_ptr, std_ptr, norm_ptr, res_ptr, 
+                     features, batch_size, epsilon = epsilon_](std::size_t b) noexcept
+                    {
+                        // 计算均值
+                        double sum = 0.0;
+                        for (std::size_t f = 0; f < features; ++f)
+                            sum += in_ptr[f * batch_size + b];
+                        double mean = sum / static_cast<double>(features);
+                        mean_ptr[b] = mean;
+
+                        // 计算方差
+                        double var_sum = 0.0;
+                        for (std::size_t f = 0; f < features; ++f) {
+                            double diff = in_ptr[f * batch_size + b] - mean;
+                            var_sum += diff * diff;
+                        }
+                        double variance = var_sum / static_cast<double>(features);
+                        double std_inv = 1.0 / std::sqrt(variance + epsilon);
+                        std_ptr[b] = std_inv;
+
+                        // 归一化和仿射变换
+                        for (std::size_t f = 0; f < features; ++f) {
+                            double normalized = (in_ptr[f * batch_size + b] - mean) * std_inv;
+                            norm_ptr[f * batch_size + b] = normalized;
+                            res_ptr[f * batch_size + b] = gamma_ptr[f] * normalized + beta_ptr[f];
+                        }
+                    });
+            } else {
+                for (std::size_t b = 0; b < batch_size; ++b) {
+                    // 计算均值
+                    double sum = 0.0;
+                    for (std::size_t f = 0; f < features; ++f)
+                        sum += in_ptr[f * batch_size + b];
+                    double mean = sum / static_cast<double>(features);
+                    mean_ptr[b] = mean;
+
+                    // 计算方差
+                    double var_sum = 0.0;
+                    for (std::size_t f = 0; f < features; ++f) {
+                        double diff = in_ptr[f * batch_size + b] - mean;
+                        var_sum += diff * diff;
+                    }
+                    double variance = var_sum / static_cast<double>(features);
+                    double std_inv = 1.0 / std::sqrt(variance + epsilon_);
+                    std_ptr[b] = std_inv;
+
+                    // 归一化和仿射变换
+                    for (std::size_t f = 0; f < features; ++f) {
+                        double normalized = (in_ptr[f * batch_size + b] - mean) * std_inv;
+                        norm_ptr[f * batch_size + b] = normalized;
+                        res_ptr[f * batch_size + b] = gamma_ptr[f] * normalized + beta_ptr[f];
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        Matrix backward(const Matrix &grad_output) override
+        {
+            if (grad_output.rows() != normalized_shape_)
+                throw std::invalid_argument("layer_norm backward shape mismatch");
+
+            const std::size_t features = normalized_shape_;
+            const std::size_t batch_size = grad_output.cols();
+
+            Matrix grad_input(features, batch_size);
+
+            const double *go_ptr = grad_output.data_ptr();
+            const double *norm_ptr = normalized_cache_.data_ptr();
+            const double *std_ptr = std_cache_.data_ptr();
+            const double *gamma_ptr = gamma_.data_ptr();
+            double *gi_ptr = grad_input.data_ptr();
+            double *gg_ptr = grad_gamma_.data_ptr();
+            double *gb_ptr = grad_beta_.data_ptr();
+
+            // 计算梯度
+            auto batch_indices = std::views::iota(std::size_t{0}, batch_size);
+            
+            if (batch_size >= SmartPolicy::PARALLEL_THRESHOLD) {
+                SmartPolicy::for_each(batch_indices.begin(), batch_indices.end(),
+                    [go_ptr, norm_ptr, std_ptr, gamma_ptr, gi_ptr, gg_ptr, gb_ptr,
+                     features, batch_size](std::size_t b) noexcept
+                    {
+                        double std_inv = std_ptr[b];
+                        
+                        // 计算 dL/dγ 和 dL/dβ
+                        for (std::size_t f = 0; f < features; ++f) {
+                            double grad_out = go_ptr[f * batch_size + b];
+                            gg_ptr[f] += grad_out * norm_ptr[f * batch_size + b];
+                            gb_ptr[f] += grad_out;
+                        }
+
+                        // 计算 dL/dx
+                        // 首先计算 dL/d(归一化值)
+                        for (std::size_t f = 0; f < features; ++f) {
+                            double grad_norm = go_ptr[f * batch_size + b] * gamma_ptr[f];
+                            
+                            // 使用简化公式：对于LayerNorm，反向传播可以简化为
+                            // dx = (1/N) * std_inv * (N * grad_out - sum(grad_out) - x_norm * sum(grad_out * x_norm))
+                            // 但这里我们使用更直接的方法
+                            
+                            // 计算该样本的统计量
+                            double sum_grad = 0.0;
+                            double sum_grad_norm = 0.0;
+                            for (std::size_t k = 0; k < features; ++k) {
+                                double g = go_ptr[k * batch_size + b] * gamma_ptr[k];
+                                sum_grad += g;
+                                sum_grad_norm += g * norm_ptr[k * batch_size + b];
+                            }
+
+                            // 计算梯度
+                            double grad_x = (grad_norm - sum_grad / static_cast<double>(features) - 
+                                           norm_ptr[f * batch_size + b] * sum_grad_norm / static_cast<double>(features)) * std_inv;
+                            
+                            gi_ptr[f * batch_size + b] = grad_x;
+                        }
+                    });
+            } else {
+                for (std::size_t b = 0; b < batch_size; ++b) {
+                    double std_inv = std_ptr[b];
+                    
+                    // 计算 dL/dγ 和 dL/dβ
+                    for (std::size_t f = 0; f < features; ++f) {
+                        double grad_out = go_ptr[f * batch_size + b];
+                        gg_ptr[f] += grad_out * norm_ptr[f * batch_size + b];
+                        gb_ptr[f] += grad_out;
+                    }
+
+                    // 计算 dL/dx
+                    for (std::size_t f = 0; f < features; ++f) {
+                        double grad_norm = go_ptr[f * batch_size + b] * gamma_ptr[f];
+                        
+                        // 计算该样本的统计量
+                        double sum_grad = 0.0;
+                        double sum_grad_norm = 0.0;
+                        for (std::size_t k = 0; k < features; ++k) {
+                            double g = go_ptr[k * batch_size + b] * gamma_ptr[k];
+                            sum_grad += g;
+                            sum_grad_norm += g * norm_ptr[k * batch_size + b];
+                        }
+
+                        // 计算梯度
+                        double grad_x = (grad_norm - sum_grad / static_cast<double>(features) - 
+                                       norm_ptr[f * batch_size + b] * sum_grad_norm / static_cast<double>(features)) * std_inv;
+                        
+                        gi_ptr[f * batch_size + b] = grad_x;
+                    }
+                }
+            }
+
+            return grad_input;
+        }
+
+        void update_params(double lr) noexcept override
+        {
+            const auto n = gamma_.size();
+            double *g_ptr = gamma_.data_ptr();
+            const double *gg_ptr = grad_gamma_.data_ptr();
+            double *b_ptr = beta_.data_ptr();
+            const double *gb_ptr = grad_beta_.data_ptr();
+
+            auto indices = std::views::iota(std::size_t{0}, n);
+            SmartPolicy::for_each(indices.begin(), indices.end(),
+                [g_ptr, gg_ptr, b_ptr, gb_ptr, lr](std::size_t i) noexcept
+                {
+                    g_ptr[i] -= lr * gg_ptr[i];
+                    b_ptr[i] -= lr * gb_ptr[i];
+                });
+        }
+
+        void zero_grad() noexcept override
+        {
+            std::fill(grad_gamma_.data_ptr(), grad_gamma_.data_ptr() + grad_gamma_.size(), 0.0);
+            std::fill(grad_beta_.data_ptr(), grad_beta_.data_ptr() + grad_beta_.size(), 0.0);
+        }
+    };
 }
 
 #endif

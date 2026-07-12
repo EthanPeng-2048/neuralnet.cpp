@@ -15,9 +15,9 @@ namespace fs = std::filesystem;
 
 // ==================== 常量 ====================
 static constexpr std::size_t INPUT_DIM = 784;
-static constexpr std::size_t HIDDEN_DIM = 64;
 static constexpr std::size_t NUM_CLASSES = 10;
-static constexpr std::size_t NUM_HIDDEN_LAYERS = 3;
+// 网络架构：必须与训练时一致
+static const std::vector<std::size_t> LAYER_DIMS = {INPUT_DIM, 256, 128, 64, NUM_CLASSES};
 
 // ==================== 帮助信息 ====================
 void print_usage(const char *prog)
@@ -93,14 +93,22 @@ InferConfig parse_args(int argc, char *argv[])
 nn::Model build_model()
 {
     nn::Model model;
-    model.add<nn::Linear>(INPUT_DIM, HIDDEN_DIM)
-         .add<nn::ReLU>();
-    for (std::size_t i = 0; i < NUM_HIDDEN_LAYERS - 1; ++i)
+    // 根据 LAYER_DIMS 自动构建网络（与训练时完全一致）
+    for (std::size_t i = 0; i < LAYER_DIMS.size() - 1; ++i)
     {
-        model.add<nn::Linear>(HIDDEN_DIM, HIDDEN_DIM)
-             .add<nn::ReLU>();
+        std::size_t in_dim = LAYER_DIMS[i];
+        std::size_t out_dim = LAYER_DIMS[i + 1];
+        
+        // 添加线性层
+        model.add<nn::Linear>(in_dim, out_dim);
+        
+        // 如果不是最后一层（输出层），则添加 LayerNorm 和 GeLU 激活函数
+        if (i < LAYER_DIMS.size() - 2)
+        {
+            model.add<nn::LayerNorm>(out_dim)
+                 .add<nn::GeLU>();
+        }
     }
-    model.add<nn::Linear>(HIDDEN_DIM, NUM_CLASSES);
     return model;
 }
 
