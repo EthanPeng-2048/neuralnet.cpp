@@ -1,5 +1,7 @@
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/model_io.hpp>
+#include <cstring>     // for std::memcpy
+#include <memory>     // for std::unique_ptr
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -30,6 +32,7 @@ void print_usage(const char *prog)
         << "  --epochs <n>       训练轮数 (默认: 5)\n"
         << "  --lr <lr>          学习率 (默认: 0.01)\n"
         << "  --batch-size <n>   批大小 (默认: 64)\n"
+        << "  --optimizer <name> 优化器: sgd/momentum/adam (默认: adam)\n"
         << "  --help             显示此帮助信息\n";
 }
 
@@ -39,6 +42,7 @@ struct TrainConfig
     std::string save_path = "mnist_model.bin";
     std::string dataset_path = "datasets/mnist_data";
     std::string resume_path;
+    std::string optimizer_name = "adam";
     int epochs = 5;
     double lr = 0.01;
     std::size_t batch_size = 64;
@@ -71,7 +75,9 @@ TrainConfig parse_args(int argc, char *argv[])
         }
         else if (arg == "--epochs" && i + 1 < argc)
         {
-            cfg.epochs = std::stoi(argv[++i]);
+            int val = std::stoi(argv[++i]);
+            if (val <= 0) { std::cerr << "--epochs 必须为正整数\n"; std::exit(1); }
+            cfg.epochs = val;
         }
         else if (arg == "--lr" && i + 1 < argc)
         {
@@ -79,7 +85,20 @@ TrainConfig parse_args(int argc, char *argv[])
         }
         else if (arg == "--batch-size" && i + 1 < argc)
         {
-            cfg.batch_size = std::stoi(argv[++i]);
+            int val = std::stoi(argv[++i]);
+            if (val <= 0) { std::cerr << "--batch-size 必须为正整数\n"; std::exit(1); }
+            cfg.batch_size = static_cast<std::size_t>(val);
+        }
+        else if (arg == "--optimizer" && i + 1 < argc)
+        {
+            cfg.optimizer_name = argv[++i];
+            if (cfg.optimizer_name != "sgd" && cfg.optimizer_name != "sgd_w_momentum" &&
+                cfg.optimizer_name != "adam")
+            {
+                std::cerr << "未知优化器: " << cfg.optimizer_name
+                          << "，可选: sgd, sgd_w_momentum, adam\n";
+                std::exit(1);
+            }
         }
         else
         {
@@ -117,6 +136,8 @@ std::pair<nn::Matrix, nn::Matrix> load_csv(const std::string &filename, int max_
     }
 
     std::size_t N = labels.size();
+    if (N == 0)
+        throw std::runtime_error("CSV file is empty or malformed: " + filename);
     std::size_t feat_dim = features.size() / N; // 784
 
     if (max_samples > 0 && static_cast<std::size_t>(max_samples) < N)
@@ -213,7 +234,7 @@ int main(int argc, char *argv[])
         for (std::size_t i = 0; i < NUM_HIDDEN_LAYERS; ++i)
             std::cout << " -> " << HIDDEN_DIM << "(ReLU)";
         std::cout << " -> " << NUM_CLASSES << "\n";
-        std::cout << "  优化器: SGD+Momentum  学习率: " << cfg.lr << "\n";
+        std::cout << "  优化器: " << cfg.optimizer_name << "  学习率: " << cfg.lr << "\n";
         std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
         std::cout << "  模型: " << (cfg.load_existing ? cfg.resume_path : "(从头训练)")
                   << " -> " << cfg.save_path << "\n";
@@ -242,9 +263,20 @@ int main(int argc, char *argv[])
         }
 
         // ── 训练 ─────────────────────────────────────────────────
-        nn::SGD_w_Momentum optimizer(model.parameters(), model.param_gradients(), cfg.lr);
+        std::unique_ptr<nn::Optimizer> optimizer;
+        if (cfg.optimizer_name == "sgd")
+            optimizer = std::make_unique<nn::SGD>(model.parameters(), model.param_gradients(), cfg.lr);
+        else if (cfg.optimizer_name == "sgd_w_momentum")
+            optimizer = std::make_unique<nn::SGD_w_Momentum>(model.parameters(), model.param_gradients(), cfg.lr);
+        else
+            optimizer = std::make_unique<nn::Adam>(model.parameters(), model.param_gradients(), cfg.lr);
+
         nn::CrossEntropyLoss ce_loss;
         const std::size_t num_batches = train_x.cols() / cfg.batch_size;
+
+        // ── 预分配 batch 缓冲区（避免每次迭代重复分配） ──────────
+        nn::Matrix x_batch(train_x.rows(), cfg.batch_size);
+        nn::Matrix y_batch(train_y.rows(), cfg.batch_size);
 
         auto t_start = std::chrono::steady_clock::now();
 
@@ -255,16 +287,17 @@ int main(int argc, char *argv[])
 
             for (std::size_t batch = 0; batch < num_batches; ++batch)
             {
-                std::size_t start = batch * cfg.batch_size;
-                nn::Matrix x_batch(train_x.rows(), cfg.batch_size);
-                nn::Matrix y_batch(train_y.rows(), cfg.batch_size);
-                for (std::size_t i = 0; i < cfg.batch_size; ++i)
-                {
-                    for (std::size_t r = 0; r < train_x.rows(); ++r)
-                        x_batch.set_value_unchecked(r, i, train_x.at_unchecked(r, start + i));
-                    for (std::size_t r = 0; r < train_y.rows(); ++r)
-                        y_batch.set_value_unchecked(r, i, train_y.at_unchecked(r, start + i));
-                }
+                const std::size_t start = batch * cfg.batch_size;
+
+                // ── 行优先 memcpy 提取 batch（比逐列复制更缓存友好） ─────
+                for (std::size_t r = 0; r < train_x.rows(); ++r)
+                    std::memcpy(x_batch.data_ptr() + r * cfg.batch_size,
+                                train_x.data_ptr() + r * train_x.cols() + start,
+                                cfg.batch_size * sizeof(double));
+                for (std::size_t r = 0; r < train_y.rows(); ++r)
+                    std::memcpy(y_batch.data_ptr() + r * cfg.batch_size,
+                                train_y.data_ptr() + r * train_y.cols() + start,
+                                cfg.batch_size * sizeof(double));
 
                 auto out = model.forward(x_batch);
                 double loss = ce_loss.forward(out, y_batch);
@@ -273,8 +306,8 @@ int main(int argc, char *argv[])
                 auto grad = ce_loss.backward();
                 model.backward(grad);
 
-                optimizer.step();
-                optimizer.zero_grad();
+                optimizer->step();
+                optimizer->zero_grad();
 
                 // 进度显示
                 if ((batch + 1) % 100 == 0 || batch + 1 == num_batches)

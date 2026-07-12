@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <execution>
 #include <iterator>  // for std::distance
+#include <thread>    // for std::thread::hardware_concurrency
+#include "thread_pool.hpp"
 
 // ── 执行策略 ────────────────────────────────────────────────────────────────
 // 默认并行+向量化；编译时可通过 -DNN_EXEC_POLICY=std::execution::seq 覆盖
@@ -12,30 +14,32 @@
 #endif
 
 // ── 缓存分块大小 ─────────────────────────────────────────────────────────────
-// 32×32×8 = 8 KB，安全装入大多数 CPU 的 L1 缓存
+// 64×64×8 = 32 KB，安全装入大多数 CPU 的 L1 缓存
 // 矩阵乘法、转置等所有分块操作共用此值
 // 修改时需同步评估 b_block 栈占用（BLOCK_SIZE² × 8 字节）
 namespace nn
 {
-    inline constexpr std::size_t BLOCK_SIZE = 64;
-    
+    inline constexpr std::size_t BLOCK_SIZE = 64;    static_assert(BLOCK_SIZE * BLOCK_SIZE * sizeof(double) <= 65536,
+                  "BLOCK_SIZE too large: b_block would exceed 64KB stack budget");    
     // ── 数值常量 ─────────────────────────────────────────────────────────────
     // 使用 constexpr 避免运行时计算
     inline constexpr double EPSILON = 1e-8;
     
     // ── 智能执行策略 ─────────────────────────────────────────────────────────
-    // 根据元素数量自动选择串行或并行策略，避免小矩阵的线程池调度开销
+    // 根据元素数量自动选择串行或使用全局线程池并行，避免小矩阵的线程池调度开销
+    // 线程池在首次使用时懒初始化，训练期间常驻，避免反复创建/销毁
     struct SmartPolicy {
-        static constexpr long long PARALLEL_THRESHOLD = 100000; // 100K元素
+        static constexpr long long PARALLEL_THRESHOLD = 100000; // 100K元素（实测最优）
         
         // for_each 版本
         template<typename Iterator, typename Func>
         static void for_each(Iterator first, Iterator last, Func&& func) {
             const auto n = static_cast<long long>(std::distance(first, last));
             if (n >= PARALLEL_THRESHOLD) {
-                std::for_each(std::execution::par_unseq, first, last, std::forward<Func>(func));
+                global_thread_pool().parallel_for_each(first, last, std::forward<Func>(func));
             } else {
-                std::for_each(std::execution::seq, first, last, std::forward<Func>(func));
+                for (auto it = first; it != last; ++it)
+                    func(*it);
             }
         }
         
@@ -44,9 +48,9 @@ namespace nn
         static void transform(InputIt first, InputIt last, OutputIt d_first, UnaryOp&& op) {
             const auto n = static_cast<long long>(std::distance(first, last));
             if (n >= PARALLEL_THRESHOLD) {
-                std::transform(std::execution::par_unseq, first, last, d_first, std::forward<UnaryOp>(op));
+                global_thread_pool().parallel_transform(first, last, d_first, std::forward<UnaryOp>(op));
             } else {
-                std::transform(std::execution::seq, first, last, d_first, std::forward<UnaryOp>(op));
+                std::transform(first, last, d_first, std::forward<UnaryOp>(op));
             }
         }
         
@@ -55,9 +59,9 @@ namespace nn
         static void transform(InputIt1 first1, InputIt1 last1, InputIt2 first2, OutputIt d_first, BinaryOp&& op) {
             const auto n = static_cast<long long>(std::distance(first1, last1));
             if (n >= PARALLEL_THRESHOLD) {
-                std::transform(std::execution::par_unseq, first1, last1, first2, d_first, std::forward<BinaryOp>(op));
+                global_thread_pool().parallel_transform(first1, last1, first2, d_first, std::forward<BinaryOp>(op));
             } else {
-                std::transform(std::execution::seq, first1, last1, first2, d_first, std::forward<BinaryOp>(op));
+                std::transform(first1, last1, first2, d_first, std::forward<BinaryOp>(op));
             }
         }
         
@@ -66,8 +70,9 @@ namespace nn
         static T transform_reduce(InputIt first, InputIt last, T init, BinaryOp&& reduce_op, UnaryOp&& transform_op) {
             const auto n = static_cast<long long>(std::distance(first, last));
             if (n >= PARALLEL_THRESHOLD) {
-                return std::transform_reduce(std::execution::par_unseq, first, last, init, 
-                                            std::forward<BinaryOp>(reduce_op), std::forward<UnaryOp>(transform_op));
+                return global_thread_pool().parallel_transform_reduce(
+                    first, last, first, init,
+                    std::forward<BinaryOp>(reduce_op), std::forward<UnaryOp>(transform_op));
             } else {
                 return std::transform_reduce(std::execution::seq, first, last, init, 
                                             std::forward<BinaryOp>(reduce_op), std::forward<UnaryOp>(transform_op));
@@ -79,11 +84,13 @@ namespace nn
         static T transform_reduce(InputIt1 first1, InputIt1 last1, InputIt2 first2, T init, BinaryOp&& reduce_op, UnaryOp&& transform_op) {
             const auto n = static_cast<long long>(std::distance(first1, last1));
             if (n >= PARALLEL_THRESHOLD) {
-                return std::transform_reduce(std::execution::par_unseq, first1, last1, first2, init, 
-                                            std::forward<BinaryOp>(reduce_op), std::forward<UnaryOp>(transform_op));
+                return global_thread_pool().parallel_transform_reduce(first1, last1, first2, init,
+                                                                    std::forward<BinaryOp>(reduce_op),
+                                                                    std::forward<UnaryOp>(transform_op));
             } else {
-                return std::transform_reduce(std::execution::seq, first1, last1, first2, init, 
-                                            std::forward<BinaryOp>(reduce_op), std::forward<UnaryOp>(transform_op));
+                return std::transform_reduce(std::execution::seq, first1, last1, first2, init,
+                                            std::forward<BinaryOp>(reduce_op),
+                                            std::forward<UnaryOp>(transform_op));
             }
         }
     };
