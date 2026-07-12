@@ -43,9 +43,7 @@ namespace nn
 
         // ── 预分配缓冲区：避免 forward/backward 热路径反复分配内存 ──────
         Matrix product_buf_;   // W * input 的中间结果
-        Matrix result_buf_;    // forward 输出（已融合 bias）
-        Matrix grad_input_buf_;  // backward: W^T * dL/dy
-        Matrix grad_WT_buf_;     // backward: W^T
+        Matrix grad_WT_buf_;   // backward: W^T
 
         // 修复：使用 thread_local 保证多线程构造 Layer 时的线程安全
         inline static thread_local std::mt19937_64 rng_{std::random_device{}()};
@@ -58,8 +56,6 @@ namespace nn
               grad_b_(out_features, 1),
               input_cache_(),
               product_buf_(out_features, 1),
-              result_buf_(out_features, 1),
-              grad_input_buf_(in_features, 1),
               grad_WT_buf_(in_features, out_features)
         {
             // Xavier 均匀初始化：适合 tanh/sigmoid，对 ReLU 也可用
@@ -86,18 +82,18 @@ namespace nn
 
             input_cache_ = input;
 
-            // 融合矩阵乘法 + bias 加法，减少一次临时矩阵分配和一次完整遍历
+            // 融合矩阵乘法 + bias 加法，减少一次完整遍历
             const std::size_t out_feat = W_.rows();
             const std::size_t batch = input.cols();
 
-            // product = W * input（写入预分配缓冲区）
+            // product = W * input（写入预分配缓冲区，避免分配）
             W_.multiply_to(product_buf_, input);
 
-            // result = product + bias（融合到同一个循环中）
-            result_buf_.resize(out_feat, batch);
+            // result = product + bias（返回新矩阵，NRVO 优化）
+            Matrix result(out_feat, batch);
             const double *prod_ptr = product_buf_.data_ptr();
             const double *bias_ptr = b_.data_ptr();
-            double *res_ptr = result_buf_.data_ptr();
+            double *res_ptr = result.data_ptr();
             const auto total = static_cast<std::size_t>(out_feat * batch);
 
             auto indices = std::views::iota(std::size_t{0}, total);
@@ -107,7 +103,7 @@ namespace nn
                               res_ptr[idx] = prod_ptr[idx] + bias_ptr[idx / batch];
                           });
 
-            return result_buf_;
+            return result;
         }
 
         Matrix backward(const Matrix &grad_output) override
@@ -121,9 +117,10 @@ namespace nn
             const std::size_t out_feat = W_.rows();
             const std::size_t batch = grad_output.cols();
 
-            // grad_input = W^T * grad_output（使用预分配缓冲区）
+            // grad_input = W^T * grad_output
             W_.transpose_to(grad_WT_buf_);
-            grad_WT_buf_.multiply_to(grad_input_buf_, grad_output);
+            Matrix grad_input(in_feat, batch);
+            grad_WT_buf_.multiply_to(grad_input, grad_output);
 
             // grad_W += grad_output * input_cache_^T（逐元素累加，避免临时矩阵）
             // 手动计算：grad_W[i][j] += sum_k(grad_output[i][k] * input_cache_[j][k])
@@ -156,7 +153,7 @@ namespace nn
                 }
             }
 
-            return grad_input_buf_;
+            return grad_input;
         }
     };
 
@@ -164,8 +161,6 @@ namespace nn
     {
     private:
         Matrix input_cache_;
-        Matrix result_buf_;      // forward 输出缓冲区
-        Matrix grad_input_buf_;  // backward 输出缓冲区
 
     public:
         ReLU() = default;
@@ -173,11 +168,12 @@ namespace nn
         Matrix forward(const Matrix &input) override
         {
             input_cache_ = input;
-            result_buf_.resize(input.rows(), input.cols());
 
             const double *in_ptr = input.data_ptr();
-            double *out_ptr = result_buf_.data_ptr();
             const auto n = static_cast<long long>(input.size());
+
+            Matrix result(input.rows(), input.cols());
+            double *out_ptr = result.data_ptr();
 
             if (n >= SmartPolicy::PARALLEL_THRESHOLD) {
                 auto indices = std::views::iota(0LL, n);
@@ -188,7 +184,7 @@ namespace nn
                 for (long long i = 0; i < n; ++i)
                     out_ptr[i] = in_ptr[i] > 0.0 ? in_ptr[i] : 0.0;
             }
-            return result_buf_;
+            return result;
         }
 
         Matrix backward(const Matrix &grad_output) override
@@ -196,12 +192,12 @@ namespace nn
             if (input_cache_.rows() != grad_output.rows() || input_cache_.cols() != grad_output.cols())
                 throw std::invalid_argument("relu backward shape mismatch");
 
-            grad_input_buf_.resize(grad_output.rows(), grad_output.cols());
-
             const double *in_ptr = input_cache_.data_ptr();
             const double *go_ptr = grad_output.data_ptr();
-            double *out_ptr = grad_input_buf_.data_ptr();
             const auto n = static_cast<long long>(grad_output.size());
+
+            Matrix grad_input(grad_output.rows(), grad_output.cols());
+            double *out_ptr = grad_input.data_ptr();
 
             if (n >= SmartPolicy::PARALLEL_THRESHOLD) {
                 auto indices = std::views::iota(0LL, n);
@@ -212,7 +208,7 @@ namespace nn
                 for (long long i = 0; i < n; ++i)
                     out_ptr[i] = in_ptr[i] > 0.0 ? go_ptr[i] : 0.0;
             }
-            return grad_input_buf_;
+            return grad_input;
         }
     };
 }

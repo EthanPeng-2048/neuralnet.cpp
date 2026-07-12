@@ -9,6 +9,7 @@
 #include <functional>
 #include <future>
 #include <atomic>
+#include <iterator>  // for std::distance
 #include <stdexcept>
 #include <type_traits>
 
