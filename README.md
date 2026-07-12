@@ -102,3 +102,24 @@ python gui.py
 | `CrossEntropyLoss` | 交叉熵损失（含数值稳定 Softmax，在 `train.cpp` 中定义） |
 | `nn::SGD` | 随机梯度下降优化器 |
 | `save_model` / `load_model` | 二进制模型序列化 |
+
+## 📐 开发规范
+
+本项目遵循严格的 C++ 开发规范，详见 [DEVELOPMENT_STANDARDS.md](DEVELOPMENT_STANDARDS.md)。
+
+### 核心原则
+
+1. **零手动内存管理** - 完全消除显式指针操作和手动内存管理
+2. **模块化设计** - 清晰的职责分离，简洁的接口设计
+3. **高性能优先** - 预分配、缓存友好、并行化
+4. **紧跟最新标准** - 始终使用最新的 C++ 标准（当前：C++26）
+
+### 快速参考
+
+| 规范 | 要求 |
+|------|------|
+| 内存管理 | 禁止 `new`/`delete`，使用 `std::vector`、`std::unique_ptr`、`std::span` |
+| 接口设计 | 流式 API、两级访问（安全 + 快速） |
+| 性能优化 | 预分配缓冲区、缓存友好分块算法、智能并行化 |
+| C++ 标准 | C++26，积极使用 ranges、concepts、std::print 等新特性 |
+| 命名规范 | 类名 CamelCase，函数/变量 snake_case，私有成员尾部下划线 |
