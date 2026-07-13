@@ -378,32 +378,16 @@ set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 ```
 
-### 2. 必须使用的 C++26 特性
-
-| 特性 | 用途 | 示例 |
-|------|------|------|
-| `std::generator` | 协程生成器 | 数据加载器 |
-| `std::print` / `std::println` | 格式化输出 | 调试信息 |
-| `std::expected` | 错误处理 | 返回值类型 |
-| `std::flat_map` | 高性能映射 | 配置管理 |
-| `std::mdspan` | 多维数组视图 | 矩阵操作 |
-| `std::stacktrace` | 调试堆栈跟踪 | 错误报告 |
-
-### 3. 积极使用的 C++23/20 特性
+### 2. 积极使用的 C++20/23 特性
 
 | 特性 | 标准 | 用途 |
 |------|------|------|
-| `std::ranges` | C++20 | 数据处理管道 |
-| `std::views` | C++20 | 延迟求值 |
-| `std::format` | C++20 | 字符串格式化 |
-| `std::span` | C++20 | 非拥有视图 |
-| `std::jthread` | C++20 | 自动连接线程 |
-| `std::source_location` | C++20 | 错误定位 |
-| `std::print` | C++23 | 格式化输出 |
-| `std::generator` | C++23 | 协程生成器 |
-| `std::mdspan` | C++23 | 多维数组 |
+| `std::ranges` | C++20 | 数据处理管道（如 `ranges::generate` Xavier 初始化） |
+| `std::views::iota` | C++20 | 延迟整数序列（并行索引生成） |
+| `std::views::zip` | C++20 | 多范围并行迭代（优化器参数更新） |
+| `std::execution::par_unseq` | C++17 | 并行执行策略（矩阵运算） |
 
-### 4. 标准跟进检查清单
+### 3. 标准跟进检查清单
 
 - [ ] 是否使用最新的 C++ 标准（C++26）？
 - [ ] 是否积极使用 C++20/23/26 新特性？
