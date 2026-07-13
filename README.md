@@ -30,6 +30,8 @@ neuralnet.cpp/
     └── train.cpp
 ```
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/EthanPeng-2048/neuralnet.cpp)
+
 ## 依赖
 
 - **编译器**: LLVM Clang++ 22.1+（`C:/Program Files/LLVM/bin/clang++.exe`）
