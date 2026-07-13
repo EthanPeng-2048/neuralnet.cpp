@@ -27,10 +27,6 @@ namespace nn
         virtual Matrix backward(const Matrix &grad_output) = 0;
         virtual std::vector<std::reference_wrapper<Matrix>> parameters() { return {}; }
         virtual std::vector<std::reference_wrapper<Matrix>> param_gradients() { return {}; }
-        
-        // 添加参数更新辅助方法，避免虚函数调用开销
-        virtual void update_params(double /*lr*/) noexcept {}
-        virtual void zero_grad() noexcept {}
     };
 
     class Linear final : public Layer
@@ -498,27 +494,376 @@ namespace nn
             return grad_input;
         }
 
-        void update_params(double lr) noexcept override
-        {
-            const auto n = gamma_.size();
-            double *g_ptr = gamma_.data_ptr();
-            const double *gg_ptr = grad_gamma_.data_ptr();
-            double *b_ptr = beta_.data_ptr();
-            const double *gb_ptr = grad_beta_.data_ptr();
+    };
 
-            auto indices = std::views::iota(std::size_t{0}, n);
-            SmartPolicy::for_each(indices.begin(), indices.end(),
-                [g_ptr, gg_ptr, b_ptr, gb_ptr, lr](std::size_t i) noexcept
+    // ── Softmax 激活层 ─────────────────────────────────────────────────────
+    // 对每一行独立应用 softmax：out[i][j] = exp(in[i][j]) / Σ_k exp(in[i][k])
+    // 输入形状: (rows, cols)，输出形状相同。
+    // 使用最大值减法保证数值稳定性。
+    // 反向传播: grad[i][j] = out[i][j] * (grad_out[i][j] - Σ_k out[i][k] * grad_out[i][k])
+    // ────────────────────────────────────────────────────────────────────────
+    class Softmax final : public Layer
+    {
+    private:
+        Matrix output_cache_;
+
+    public:
+        Softmax() = default;
+
+        Matrix forward(const Matrix &input) override
+        {
+            const std::size_t rows = input.rows();
+            const std::size_t cols = input.cols();
+            output_cache_.resize(rows, cols);
+
+            Matrix result(rows, cols);
+            const double *in_ptr = input.data_ptr();
+            double *out_ptr = result.data_ptr();
+            double *cache_ptr = output_cache_.data_ptr();
+
+            auto row_indices = std::views::iota(std::size_t{0}, rows);
+            const std::size_t total = rows * cols;
+
+            auto process_row = [in_ptr, out_ptr, cache_ptr, cols](std::size_t r) noexcept
+            {
+                const std::size_t offset = r * cols;
+                const double *row_in = in_ptr + offset;
+                double *row_out = out_ptr + offset;
+                double *row_cache = cache_ptr + offset;
+
+                // 数值稳定：减去行内最大值
+                double max_val = row_in[0];
+                for (std::size_t c = 1; c < cols; ++c)
+                    max_val = std::max(max_val, row_in[c]);
+
+                // 计算 exp 和求和
+                double sum = 0.0;
+                for (std::size_t c = 0; c < cols; ++c)
                 {
-                    g_ptr[i] -= lr * gg_ptr[i];
-                    b_ptr[i] -= lr * gb_ptr[i];
-                });
+                    double e = std::exp(row_in[c] - max_val);
+                    row_out[c] = e;
+                    row_cache[c] = e;
+                    sum += e;
+                }
+
+                // 归一化
+                const double inv_sum = 1.0 / sum;
+                for (std::size_t c = 0; c < cols; ++c)
+                {
+                    row_out[c] *= inv_sum;
+                    row_cache[c] *= inv_sum;
+                }
+            };
+
+            if (total >= SmartPolicy::PARALLEL_THRESHOLD)
+                SmartPolicy::for_each(row_indices.begin(), row_indices.end(), process_row);
+            else
+                for (std::size_t r = 0; r < rows; ++r)
+                    process_row(r);
+
+            return result;
         }
 
-        void zero_grad() noexcept override
+        Matrix backward(const Matrix &grad_output) override
         {
-            std::fill(grad_gamma_.data_ptr(), grad_gamma_.data_ptr() + grad_gamma_.size(), 0.0);
-            std::fill(grad_beta_.data_ptr(), grad_beta_.data_ptr() + grad_beta_.size(), 0.0);
+            const std::size_t rows = output_cache_.rows();
+            const std::size_t cols = output_cache_.cols();
+
+            if (grad_output.rows() != rows || grad_output.cols() != cols)
+                throw std::invalid_argument("softmax backward shape mismatch");
+
+            Matrix grad_input(rows, cols);
+
+            const double *go_ptr = grad_output.data_ptr();
+            const double *out_ptr = output_cache_.data_ptr();
+            double *gi_ptr = grad_input.data_ptr();
+
+            auto row_indices = std::views::iota(std::size_t{0}, rows);
+            const std::size_t total = rows * cols;
+
+            auto process_row = [go_ptr, out_ptr, gi_ptr, cols](std::size_t r) noexcept
+            {
+                const std::size_t offset = r * cols;
+                const double *row_go = go_ptr + offset;
+                const double *row_out = out_ptr + offset;
+                double *row_gi = gi_ptr + offset;
+
+                // dot = Σ_k out[k] * grad_out[k]
+                double dot = 0.0;
+                for (std::size_t c = 0; c < cols; ++c)
+                    dot += row_out[c] * row_go[c];
+
+                // grad = out * (grad_out - dot)
+                for (std::size_t c = 0; c < cols; ++c)
+                    row_gi[c] = row_out[c] * (row_go[c] - dot);
+            };
+
+            if (total >= SmartPolicy::PARALLEL_THRESHOLD)
+                SmartPolicy::for_each(row_indices.begin(), row_indices.end(), process_row);
+            else
+                for (std::size_t r = 0; r < rows; ++r)
+                    process_row(r);
+
+            return grad_input;
+        }
+    };
+
+    // ── 多头注意力层 ──────────────────────────────────────────────────────
+    // 来源: "Attention Is All You Need" (Vaswani et al., 2017)
+    //
+    //   MultiHead(Q, K, V) = Concat(head_1, ..., head_h) W^O
+    //   head_i = Attention(QW_i^Q, KW_i^K, VW_i^V)
+    //   Attention(Q, K, V) = softmax(QK^T / √d_k) V
+    //
+    // 输入形状: (d_model, seq_len)，输出形状: (d_model, seq_len)
+    // ─────────────────────────────────────────────────────────────────────
+    class MultiHeadAttention final : public Layer
+    {
+    private:
+        std::size_t d_model_;
+        std::size_t num_heads_;
+        std::size_t d_k_;
+        double scale_;  // 1.0 / sqrt(d_k)
+
+        // 投影层
+        Linear W_q_;
+        Linear W_k_;
+        Linear W_v_;
+        Linear W_o_;
+
+        // 前向传播缓存
+        Matrix Q_cache_;           // (d_model, seq_len)
+        Matrix K_cache_;           // (d_model, seq_len)
+        Matrix V_cache_;           // (d_model, seq_len)
+        std::vector<Matrix> attn_; // num_heads_ × (seq_len, seq_len) — softmax 输出
+
+        // Per-head 切片缓存（forward 提取，backward 使用）
+        std::vector<Matrix> Q_heads_;  // num_heads_ × (d_k_, seq_len)
+        std::vector<Matrix> K_heads_;
+        std::vector<Matrix> V_heads_;
+        std::vector<Matrix> O_heads_;  // num_heads_ × (d_k_, seq_len) — 前向输出缓存
+
+        // 辅助缓冲区（避免循环内重复分配）
+        Matrix grad_scores_buf_;  // (seq_len, seq_len)
+        Matrix grad_A_buf_;       // (seq_len, seq_len)
+        Matrix grad_O_h_buf_;     // (d_k_, seq_len) — backward 中复用
+        Softmax softmax_;         // 复用，避免每头构造/析构
+
+        // ── 从矩阵中提取行切片到 dst ────────────────────────────────────
+        static void extract_rows(const Matrix &src, std::size_t row_start,
+                                 std::size_t row_count, Matrix &dst)
+        {
+            const std::size_t cols = src.cols();
+            dst.resize(row_count, cols);
+            const double *src_ptr = src.data_ptr();
+            double *dst_ptr = dst.data_ptr();
+            for (std::size_t r = 0; r < row_count; ++r)
+                std::copy_n(src_ptr + (row_start + r) * cols, cols, dst_ptr + r * cols);
+        }
+
+        // ── 将 src 写入 dst 的指定行范围 ────────────────────────────────
+        static void insert_rows(Matrix &dst, std::size_t row_start,
+                                const Matrix &src)
+        {
+            const std::size_t row_count = src.rows();
+            const std::size_t cols = src.cols();
+            double *dst_ptr = dst.data_ptr();
+            const double *src_ptr = src.data_ptr();
+            for (std::size_t r = 0; r < row_count; ++r)
+                std::copy_n(src_ptr + r * cols, cols, dst_ptr + (row_start + r) * cols);
+        }
+
+        // ── 逐元素缩放 ──────────────────────────────────────────────────
+        static void scale_inplace(Matrix &m, double s)
+        {
+            double *ptr = m.data_ptr();
+            const auto n = static_cast<long long>(m.size());
+            if (n >= SmartPolicy::PARALLEL_THRESHOLD)
+            {
+                auto indices = std::views::iota(0LL, n);
+                SmartPolicy::for_each(indices.begin(), indices.end(),
+                    [ptr, s](long long i) noexcept { ptr[i] *= s; });
+            }
+            else
+            {
+                for (long long i = 0; i < n; ++i)
+                    ptr[i] *= s;
+            }
+        }
+
+    public:
+        MultiHeadAttention(std::size_t d_model, std::size_t num_heads)
+            : d_model_(d_model),
+              num_heads_(num_heads),
+              d_k_(d_model / num_heads),
+              scale_(1.0 / std::sqrt(static_cast<double>(d_model / num_heads))),
+              W_q_(d_model, d_model),
+              W_k_(d_model, d_model),
+              W_v_(d_model, d_model),
+              W_o_(d_model, d_model)
+        {
+            if (d_model % num_heads != 0)
+                throw std::invalid_argument("MultiHeadAttention: d_model must be divisible by num_heads");
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            auto params = W_q_.parameters();
+            auto wk = W_k_.parameters();
+            auto wv = W_v_.parameters();
+            auto wo = W_o_.parameters();
+            params.insert(params.end(), wk.begin(), wk.end());
+            params.insert(params.end(), wv.begin(), wv.end());
+            params.insert(params.end(), wo.begin(), wo.end());
+            return params;
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            auto grads = W_q_.param_gradients();
+            auto gk = W_k_.param_gradients();
+            auto gv = W_v_.param_gradients();
+            auto go = W_o_.param_gradients();
+            grads.insert(grads.end(), gk.begin(), gk.end());
+            grads.insert(grads.end(), gv.begin(), gv.end());
+            grads.insert(grads.end(), go.begin(), go.end());
+            return grads;
+        }
+
+        Matrix forward(const Matrix &input) override
+        {
+            if (input.rows() != d_model_)
+                throw std::invalid_argument("MultiHeadAttention forward input shape mismatch");
+
+            const std::size_t seq_len = input.cols();
+
+            // ── 1. 线性投影 Q, K, V ──────────────────────────────────────
+            Q_cache_ = W_q_.forward(input);
+            K_cache_ = W_k_.forward(input);
+            V_cache_ = W_v_.forward(input);
+
+            // ── 2. 分配 per-head 缓冲区 ──────────────────────────────────
+            Q_heads_.resize(num_heads_);
+            K_heads_.resize(num_heads_);
+            V_heads_.resize(num_heads_);
+            O_heads_.resize(num_heads_);
+            attn_.resize(num_heads_);
+
+            // ── 3. 逐头计算缩放点积注意力 ────────────────────────────────
+            for (std::size_t h = 0; h < num_heads_; ++h)
+            {
+                const std::size_t row_start = h * d_k_;
+
+                // 提取 Q_h, K_h, V_h → (d_k_, seq_len)
+                extract_rows(Q_cache_, row_start, d_k_, Q_heads_[h]);
+                extract_rows(K_cache_, row_start, d_k_, K_heads_[h]);
+                extract_rows(V_cache_, row_start, d_k_, V_heads_[h]);
+
+                // S_h = Q_h^T @ K_h → (seq_len, seq_len)
+                Matrix QhT = Q_heads_[h].transpose();
+                attn_[h].resize(seq_len, seq_len);
+                QhT.multiply_to(attn_[h], K_heads_[h]);
+
+                // S_h *= 1/√d_k
+                scale_inplace(attn_[h], scale_);
+
+                // A_h = softmax(S_h) — 按行 softmax（复用成员 softmax_）
+                attn_[h] = softmax_.forward(attn_[h]);
+
+                // O_h = V_h @ A_h → (d_k_, seq_len)，缓存到 O_heads_
+                O_heads_[h].resize(d_k_, seq_len);
+                V_heads_[h].multiply_to(O_heads_[h], attn_[h]);
+            }
+
+            // ── 4. 拼接所有头的输出并投影 ────────────────────────────────
+            Matrix output(d_model_, seq_len);
+            for (std::size_t h = 0; h < num_heads_; ++h)
+                insert_rows(output, h * d_k_, O_heads_[h]);
+
+            return W_o_.forward(output);
+        }
+
+        Matrix backward(const Matrix &grad_output) override
+        {
+            const std::size_t seq_len = grad_output.cols();
+
+            // ── 1. 输出投影反向 ──────────────────────────────────────────
+            Matrix grad_concat = W_o_.backward(grad_output);  // (d_model, seq_len)
+
+            // ── 2. 初始化各头梯度累加矩阵 ────────────────────────────────
+            Matrix grad_Q_all(d_model_, seq_len);
+            Matrix grad_K_all(d_model_, seq_len);
+            Matrix grad_V_all(d_model_, seq_len);
+            {
+                const auto n = static_cast<long long>(d_model_ * seq_len);
+                std::fill(grad_Q_all.data_ptr(), grad_Q_all.data_ptr() + n, 0.0);
+                std::fill(grad_K_all.data_ptr(), grad_K_all.data_ptr() + n, 0.0);
+                std::fill(grad_V_all.data_ptr(), grad_V_all.data_ptr() + n, 0.0);
+            }
+
+            // ── 3. 逐头计算注意力反向 ────────────────────────────────────
+            for (std::size_t h = 0; h < num_heads_; ++h)
+            {
+                const std::size_t row_start = h * d_k_;
+                const Matrix &Q_h = Q_heads_[h];    // (d_k_, seq_len)
+                const Matrix &K_h = K_heads_[h];    // (d_k_, seq_len)
+                const Matrix &V_h = V_heads_[h];    // (d_k_, seq_len)
+                const Matrix &A_h = attn_[h];       // (seq_len, seq_len)
+
+                // 提取 grad_O_h（复用成员缓冲区）
+                extract_rows(grad_concat, row_start, d_k_, grad_O_h_buf_);
+
+                // grad_V_h = grad_O_h @ A_h^T → (d_k_, seq_len)
+                Matrix AhT = A_h.transpose();
+                Matrix grad_V_h(d_k_, seq_len);
+                grad_O_h_buf_.multiply_to(grad_V_h, AhT);
+
+                // grad_A_h = V_h^T @ grad_O_h → (seq_len, seq_len)
+                Matrix VhT = V_h.transpose();
+                grad_A_buf_.resize(seq_len, seq_len);
+                VhT.multiply_to(grad_A_buf_, grad_O_h_buf_);
+
+                // grad_S_h = A_h ⊙ (grad_A_h - row_sum(A_h ⊙ grad_A_h))
+                grad_scores_buf_.resize(seq_len, seq_len);
+                {
+                    const double *a_ptr = A_h.data_ptr();
+                    const double *ga_ptr = grad_A_buf_.data_ptr();
+                    double *gs_ptr = grad_scores_buf_.data_ptr();
+
+                    for (std::size_t i = 0; i < seq_len; ++i)
+                    {
+                        double dot = 0.0;
+                        for (std::size_t j = 0; j < seq_len; ++j)
+                            dot += a_ptr[i * seq_len + j] * ga_ptr[i * seq_len + j];
+                        for (std::size_t j = 0; j < seq_len; ++j)
+                            gs_ptr[i * seq_len + j] =
+                                a_ptr[i * seq_len + j] * (ga_ptr[i * seq_len + j] - dot);
+                    }
+                }
+
+                // grad_Q_h = K_h @ grad_S_h^T * scale → (d_k_, seq_len)
+                Matrix gsT = grad_scores_buf_.transpose();
+                Matrix grad_Q_h(d_k_, seq_len);
+                K_h.multiply_to(grad_Q_h, gsT);
+                scale_inplace(grad_Q_h, scale_);
+
+                // grad_K_h = Q_h @ grad_S_h * scale → (d_k_, seq_len)
+                Matrix grad_K_h(d_k_, seq_len);
+                Q_h.multiply_to(grad_K_h, grad_scores_buf_);
+                scale_inplace(grad_K_h, scale_);
+
+                // 累加到全局梯度（每个头写入不同行，无重叠）
+                insert_rows(grad_Q_all, row_start, grad_Q_h);
+                insert_rows(grad_K_all, row_start, grad_K_h);
+                insert_rows(grad_V_all, row_start, grad_V_h);
+            }
+
+            // ── 4. 投影层反向，累加输入梯度 ──────────────────────────────
+            Matrix grad_input = W_q_.backward(grad_Q_all);
+            grad_input = grad_input + W_k_.backward(grad_K_all);
+            grad_input = grad_input + W_v_.backward(grad_V_all);
+
+            return grad_input;
         }
     };
 
@@ -538,7 +883,6 @@ namespace nn
         std::size_t d_model_;
         std::size_t max_len_;
         Matrix encoding_;   // (d_model, max_len) — 预计算的正弦波编码
-        Matrix input_cache_;
 
     public:
         PositionalEncoding(std::size_t d_model, std::size_t max_len = 5000)
@@ -580,7 +924,6 @@ namespace nn
             if (input.rows() != d_model_)
                 throw std::invalid_argument("positional encoding forward: d_model mismatch");
 
-            input_cache_ = input;
             const std::size_t seq_len = input.cols();
 
             if (seq_len > max_len_)
