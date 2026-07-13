@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <vector>
 
-#include <neuralnet.cpp/nn.hpp>
+#include "model.hpp"
 
 namespace nn {
 
