@@ -109,7 +109,7 @@ flowchart TD
     START(["🚀 程序启动"]) --> PARSE["解析命令行参数<br/>--epochs, --batch-size,<br/>--lr, --optimizer"]
     PARSE --> LOAD_DATA["加载 CSV 数据<br/>MNIST 784 维像素"]
     LOAD_DATA --> SPLIT["分割训练集/测试集"]
-    SPLIT --> BUILD["构建网络模型<br/>Linear(784→64)→ReLU<br/>× 3 层<br/>→ Linear(64→10)"]
+    SPLIT --> BUILD["构建网络模型<br/>Linear(784→512)→LayerNorm→GeLU<br/>→ Linear(512→256)→LayerNorm→GeLU<br/>→ Linear(256→128)→LayerNorm→GeLU<br/>→ Linear(128→64)→LayerNorm→GeLU<br/>→ Linear(64→10)"]
     BUILD --> LOAD_PREV{"有预训练模型?"}
     LOAD_PREV -->|"是"| LOAD_M["加载预训练权重"]
     LOAD_PREV -->|"否"| INIT["Xavier 初始化权重"]
@@ -117,7 +117,7 @@ flowchart TD
     INIT --> TRAIN_LOOP
 
     subgraph TRAIN_LOOP["🔁 训练循环 (per epoch)"]
-        BATCH["取一个 batch<br/>(默认 32 样本)"]
+        BATCH["取一个 batch<br/>(默认 64 样本)"]
         BATCH --> FORWARD["⚡ 前向传播<br/>model.forward(X)"]
         FORWARD --> LOSS["📊 计算损失<br/>CrossEntropyLoss"]
         LOSS --> BACKWARD["📉 反向传播<br/>model.backward(grad)"]
@@ -217,8 +217,37 @@ classDiagram
         +backward(grad_output) Matrix
     }
 
+    class GeLU {
+        -Matrix input_cache_
+        -Matrix sigmoid_cache_
+        -constexpr double BETA = 1.702
+        +forward(input) Matrix
+        +backward(grad_output) Matrix
+    }
+
+    class LayerNorm {
+        -size_t normalized_shape_
+        -double epsilon_
+        -Matrix gamma_
+        -Matrix beta_
+        -Matrix grad_gamma_
+        -Matrix grad_beta_
+        +forward(input) Matrix
+        +backward(grad_output) Matrix
+    }
+
+    class PositionalEncoding {
+        -size_t max_len_
+        -size_t d_model_
+        -Matrix pe_
+        +forward(input) Matrix
+    }
+
     Layer <|-- Linear
     Layer <|-- ReLU
+    Layer <|-- GeLU
+    Layer <|-- LayerNorm
+    Layer <|-- PositionalEncoding
 ```
 
 ### Model — 网络容器
@@ -311,13 +340,15 @@ flowchart LR
     end
 ```
 
-参数写入顺序（以 3 层隐藏层为例）：
-1. W₁ (64×784), b₁ (64×1)
-2. W₂ (64×64), b₂ (64×1)
-3. W₃ (64×64), b₃ (64×1)
-4. W₄ (10×64), b₄ (10×1)
+参数写入顺序（默认 4 层隐藏层架构）：
+1. W₁ (512×784), b₁ (512×1)
+2. W₂ (256×512), b₂ (256×1)
+3. W₃ (128×256), b₃ (128×1)
+4. W₄ (64×128),  b₄ (64×1)
+5. W₅ (10×64),   b₅ (10×1)
+6. γ₁~γ₄, β₁~β₄ (LayerNorm 参数)
 
-共 **8 个矩阵参数**。
+共 **10 个 Linear 参数矩阵 + 8 个 LayerNorm 参数矩阵**。
 
 ---
 
@@ -350,12 +381,9 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    CMAKE["CMakeLists.txt"] --> OPT1["benchmark_naive<br/>朴素矩阵乘法基准"]
-    CMAKE --> OPT2["benchmark_b32<br/>32 线程矩阵乘法基准"]
-    CMAKE --> OPT3["benchmark_b64<br/>64 线程矩阵乘法基准"]
-    CMAKE --> TARGET1["mnist_train<br/>训练可执行文件"]
+    CMAKE["CMakeLists.txt<br/>C++26, Clang++"] --> TARGET1["mnist_train<br/>训练可执行文件"]
     CMAKE --> TARGET2["mnist_infer<br/>推理可执行文件"]
-    CMAKE --> DEPS["依赖: OpenMP (可选)<br/>C++26 标准"]
+    CMAKE --> DEPS["编译选项: -O3 -ffast-math<br/>-fexperimental-library<br/>-Wall -Wextra -Wpedantic -Werror"]
 ```
 
 ---
@@ -388,22 +416,28 @@ flowchart LR
 
 ## 🎯 网络结构总结
 
+默认 MNIST 架构（定义在 `mnist_common.hpp` 的 `MNIST_LAYER_DIMS`）：
+
 ```
-┌─────────────────────────────────────────────┐
-│              MNIST 手写数字识别网络            │
-├─────────────────────────────────────────────┤
-│  Input:   784 (28×28 像素展平)               │
-│  ─────────────────────────────────────────  │
-│  Layer 1: Linear(784 → 64) + ReLU           │
-│  Layer 2: Linear(64  → 64) + ReLU           │
-│  Layer 3: Linear(64  → 64) + ReLU           │
-│  Layer 4: Linear(64  → 10)                  │
-│  ─────────────────────────────────────────  │
-│  Loss:    CrossEntropy (含 Softmax)          │
-│  Optimizer: Adam / SGD / SGD+Momentum        │
-│  输出:     10 维向量 → argmax → 数字 0-9     │
-└─────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                 MNIST 手写数字识别网络                      │
+├──────────────────────────────────────────────────────────┤
+│  Input:    784 (28×28 像素展平)                           │
+│  ────────────────────────────────────────────────────── │
+│  Layer 1:  Linear(784 → 512) + LayerNorm + GeLU          │
+│  Layer 2:  Linear(512 → 256) + LayerNorm + GeLU          │
+│  Layer 3:  Linear(256 → 128) + LayerNorm + GeLU          │
+│  Layer 4:  Linear(128 → 64)  + LayerNorm + GeLU          │
+│  Layer 5:  Linear(64  → 10)                              │
+│  ────────────────────────────────────────────────────── │
+│  Loss:     CrossEntropy (含数值稳定 Softmax)              │
+│  Optimizer: Adam / SGD / SGD+Momentum                    │
+│  输出:      10 维向量 → argmax → 数字 0-9                  │
+└──────────────────────────────────────────────────────────┘
 ```
+
+> 📝 网络架构由 `MNIST_LAYER_DIMS = {784, 512, 256, 128, 64, 10}` 驱动，
+> 自动在隐藏层之间插入 LayerNorm + GeLU 激活。
 
 ---
 
