@@ -168,21 +168,34 @@ namespace nn
             const std::size_t i_blocks = (R + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const std::size_t j_blocks = (C + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-            auto block_indices = std::views::iota(std::size_t{0}, i_blocks * j_blocks);
-
-            SmartPolicy::for_each(block_indices.begin(), block_indices.end(),
-                          [src, dst, R, C, j_blocks](std::size_t block_idx) noexcept
-                          {
-                              const std::size_t ib = block_idx / j_blocks;
-                              const std::size_t jb = block_idx % j_blocks;
-                              const std::size_t i0 = ib * BLOCK_SIZE;
-                              const std::size_t j0 = jb * BLOCK_SIZE;
-                              const std::size_t i1 = std::min(i0 + BLOCK_SIZE, R);
-                              const std::size_t j1 = std::min(j0 + BLOCK_SIZE, C);
-                              for (std::size_t i = i0; i < i1; ++i)
-                                  for (std::size_t j = j0; j < j1; ++j)
-                                      dst[j * R + i] = src[i * C + j];
-                          });
+            // 绕过 SmartPolicy：分块数很少（1~几十），但其内循环计算量大。
+            // SmartPolicy 按元素数判断会错误地将分块级别的并行退化为串行。
+            // 这里直接调用线程池（>1 块时并行），零分配 latch 设计开销极低。
+            const auto n_blocks = i_blocks * j_blocks;
+            if (n_blocks <= 1)
+            {
+                for (std::size_t i = 0; i < R; ++i)
+                    for (std::size_t j = 0; j < C; ++j)
+                        dst[j * R + i] = src[i * C + j];
+            }
+            else
+            {
+                auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
+                global_thread_pool().parallel_for_blocks(
+                    block_indices.begin(), block_indices.end(),
+                    [src, dst, R, C, j_blocks](std::size_t block_idx) noexcept
+                    {
+                        const std::size_t ib = block_idx / j_blocks;
+                        const std::size_t jb = block_idx % j_blocks;
+                        const std::size_t i0 = ib * BLOCK_SIZE;
+                        const std::size_t j0 = jb * BLOCK_SIZE;
+                        const std::size_t i1 = std::min(i0 + BLOCK_SIZE, R);
+                        const std::size_t j1 = std::min(j0 + BLOCK_SIZE, C);
+                        for (std::size_t i = i0; i < i1; ++i)
+                            for (std::size_t j = j0; j < j1; ++j)
+                                dst[j * R + i] = src[i * C + j];
+                    });
+            }
         }
 
         [[nodiscard]] Matrix operator+(const Matrix &other) const
@@ -237,55 +250,91 @@ namespace nn
             result.resize(M, N);
             if (M == 0 || N == 0 || K == 0) return;
 
-            // 清零结果矩阵
-            auto *r_ptr = result.data_ptr();
-            std::fill(r_ptr, r_ptr + M * N, 0.0);
+            // 清零结果矩阵（使用 RAII 封装的方法）
+            result.zero();
 
+            // 非拥有型原始指针：从 std::vector 借出，仅供热循环内指针运算。
+            // 所有权由 data_ 成员管理，生命周期由 multiply_to 调用栈保证。
             const double *a_ptr = data_ptr();
             const double *b_ptr = other.data_ptr();
+            double * const r_ptr = result.data_ptr();
 
             const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-            auto block_indices = std::views::iota(std::size_t{0}, i_blocks * j_blocks);
-            SmartPolicy::for_each(block_indices.begin(), block_indices.end(),
-                          [a_ptr, b_ptr, r_ptr, M, N, K, j_blocks](std::size_t block_idx) noexcept
-                          {
-                              const std::size_t i_block = block_idx / j_blocks;
-                              const std::size_t j_block = block_idx % j_blocks;
-                              const std::size_t i_start = i_block * BLOCK_SIZE;
-                              const std::size_t i_end = std::min(i_start + BLOCK_SIZE, M);
-                              const std::size_t j_start = j_block * BLOCK_SIZE;
-                              const std::size_t j_end = std::min(j_start + BLOCK_SIZE, N);
+            // 绕过 SmartPolicy：分块数可能很少但其内循环计算量巨大（三层循环 O(n³)）。
+            // 直接调用线程池，零分配 latch 开销极低。
+            const auto n_blocks = i_blocks * j_blocks;
+            if (n_blocks <= 1)
+            {
+                // 单块串行——与下方 lambda 逻辑相同，但避免不必要的线程池调用
+                const std::size_t i_start = 0, i_end = M;
+                const std::size_t j_start = 0, j_end = N;
+                for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE)
+                {
+                    const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
+                    const std::size_t k_len = k_end - k_start;
+                    const std::size_t j_len = j_end - j_start;
+                    std::array<double, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                    for (std::size_t jj = 0; jj < j_len; ++jj)
+                        for (std::size_t kk = 0; kk < k_len; ++kk)
+                            b_block[jj * k_len + kk] = b_ptr[(k_start + kk) * N + (j_start + jj)];
+                    for (std::size_t i = i_start; i < i_end; ++i)
+                    {
+                        const double *a_row = a_ptr + i * K + k_start;
+                        double *r_row = r_ptr + i * N + j_start;
+                        for (std::size_t j = 0; j < j_len; ++j)
+                        {
+                            const double *b_col = b_block.data() + j * k_len;
+                            double sum = 0.0;
+                            for (std::size_t kk = 0; kk < k_len; ++kk)
+                                sum += a_row[kk] * b_col[kk];
+                            r_row[j] += sum;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
+                global_thread_pool().parallel_for_blocks(
+                    block_indices.begin(), block_indices.end(),
+                    [a_ptr, b_ptr, r_ptr, M, N, K, j_blocks](std::size_t block_idx) noexcept
+                    {
+                        const std::size_t i_block = block_idx / j_blocks;
+                        const std::size_t j_block = block_idx % j_blocks;
+                        const std::size_t i_start = i_block * BLOCK_SIZE;
+                        const std::size_t i_end = std::min(i_start + BLOCK_SIZE, M);
+                        const std::size_t j_start = j_block * BLOCK_SIZE;
+                        const std::size_t j_end = std::min(j_start + BLOCK_SIZE, N);
 
-                              for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE)
-                              {
-                                  const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
-                                  const std::size_t k_len = k_end - k_start;
-                                  const std::size_t j_len = j_end - j_start;
+                        for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE)
+                        {
+                            const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
+                            const std::size_t k_len = k_end - k_start;
+                            const std::size_t j_len = j_end - j_start;
 
-                                  // 加载 B 的子块到栈数组并转置，改善访问局部性
-                                  std::array<double, BLOCK_SIZE * BLOCK_SIZE> b_block{};
-                                  for (std::size_t jj = 0; jj < j_len; ++jj)
-                                      for (std::size_t kk = 0; kk < k_len; ++kk)
-                                          b_block[jj * k_len + kk] = b_ptr[(k_start + kk) * N + (j_start + jj)];
+                            std::array<double, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                            for (std::size_t jj = 0; jj < j_len; ++jj)
+                                for (std::size_t kk = 0; kk < k_len; ++kk)
+                                    b_block[jj * k_len + kk] = b_ptr[(k_start + kk) * N + (j_start + jj)];
 
-                                  // 累加当前 K 块对 C 块的贡献
-                                  for (std::size_t i = i_start; i < i_end; ++i)
-                                  {
-                                      const double *a_row = a_ptr + i * K + k_start;
-                                      double *r_row = r_ptr + i * N + j_start;
-                                      for (std::size_t j = 0; j < j_len; ++j)
-                                      {
-                                          const double *b_col = b_block.data() + j * k_len;
-                                          double sum = 0.0;
-                                          for (std::size_t kk = 0; kk < k_len; ++kk)
-                                              sum += a_row[kk] * b_col[kk];
-                                          r_row[j] += sum;
-                                      }
-                                  }
-                              }
-                          });
+                            for (std::size_t i = i_start; i < i_end; ++i)
+                            {
+                                const double *a_row = a_ptr + i * K + k_start;
+                                double *r_row = r_ptr + i * N + j_start;
+                                for (std::size_t j = 0; j < j_len; ++j)
+                                {
+                                    const double *b_col = b_block.data() + j * k_len;
+                                    double sum = 0.0;
+                                    for (std::size_t kk = 0; kk < k_len; ++kk)
+                                        sum += a_row[kk] * b_col[kk];
+                                    r_row[j] += sum;
+                                }
+                            }
+                        }
+                    });
+            }
         }
 
         void scale_inplace(double scalar) noexcept

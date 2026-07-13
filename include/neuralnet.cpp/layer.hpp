@@ -125,16 +125,18 @@ namespace nn
                 const double *go_ptr = grad_output.data_ptr();
                 const double *ic_ptr = input_cache_.data_ptr();
                 double *gw_ptr = grad_W_.data_ptr();
-                for (std::size_t of = 0; of < out_feat; ++of)
-                {
-                    for (std::size_t inf = 0; inf < in_feat; ++inf)
+                const std::size_t gw_size = out_feat * in_feat;
+                auto gw_indices = std::views::iota(std::size_t{0}, gw_size);
+                SmartPolicy::for_each(gw_indices.begin(), gw_indices.end(),
+                    [go_ptr, ic_ptr, gw_ptr, in_feat, batch](std::size_t idx) noexcept
                     {
+                        const std::size_t of = idx / in_feat;
+                        const std::size_t inf = idx % in_feat;
                         double sum = 0.0;
                         for (std::size_t b = 0; b < batch; ++b)
                             sum += go_ptr[of * batch + b] * ic_ptr[inf * batch + b];
-                        gw_ptr[of * in_feat + inf] += sum;
-                    }
-                }
+                        gw_ptr[idx] += sum;
+                    });
             }
 
             // grad_b += sum(grad_output, dim=batch)
@@ -167,18 +169,18 @@ namespace nn
             input_cache_ = input;
 
             const double *in_ptr = input.data_ptr();
-            const auto n = static_cast<long long>(input.size());
+            const auto n = input.size();
 
             Matrix result(input.rows(), input.cols());
             double *out_ptr = result.data_ptr();
 
             if (n >= SmartPolicy::PARALLEL_THRESHOLD) {
-                auto indices = std::views::iota(0LL, n);
+                auto indices = std::views::iota(std::size_t{0}, n);
                 SmartPolicy::for_each(indices.begin(), indices.end(),
-                    [in_ptr, out_ptr](long long i) noexcept
+                    [in_ptr, out_ptr](std::size_t i) noexcept
                     { out_ptr[i] = in_ptr[i] > 0.0 ? in_ptr[i] : 0.0; });
             } else {
-                for (long long i = 0; i < n; ++i)
+                for (std::size_t i = 0; i < n; ++i)
                     out_ptr[i] = in_ptr[i] > 0.0 ? in_ptr[i] : 0.0;
             }
             return result;
@@ -191,18 +193,18 @@ namespace nn
 
             const double *in_ptr = input_cache_.data_ptr();
             const double *go_ptr = grad_output.data_ptr();
-            const auto n = static_cast<long long>(grad_output.size());
+            const auto n = grad_output.size();
 
             Matrix grad_input(grad_output.rows(), grad_output.cols());
             double *out_ptr = grad_input.data_ptr();
 
             if (n >= SmartPolicy::PARALLEL_THRESHOLD) {
-                auto indices = std::views::iota(0LL, n);
+                auto indices = std::views::iota(std::size_t{0}, n);
                 SmartPolicy::for_each(indices.begin(), indices.end(),
-                    [in_ptr, go_ptr, out_ptr](long long i) noexcept
+                    [in_ptr, go_ptr, out_ptr](std::size_t i) noexcept
                     { out_ptr[i] = in_ptr[i] > 0.0 ? go_ptr[i] : 0.0; });
             } else {
-                for (long long i = 0; i < n; ++i)
+                for (std::size_t i = 0; i < n; ++i)
                     out_ptr[i] = in_ptr[i] > 0.0 ? go_ptr[i] : 0.0;
             }
             return grad_input;
@@ -222,7 +224,7 @@ namespace nn
         // QuickGeLU: x * sigmoid(1.702 * x)
         Matrix forward(const Matrix &input) override
         {
-            const auto n = static_cast<long long>(input.size());
+            const auto n = input.size();
             input_cache_ = input;
             sigmoid_cache_.resize(input.rows(), input.cols());
 
@@ -233,9 +235,9 @@ namespace nn
             double *out_ptr = result.data_ptr();
 
             if (n >= SmartPolicy::PARALLEL_THRESHOLD) {
-                auto indices = std::views::iota(0LL, n);
+                auto indices = std::views::iota(std::size_t{0}, n);
                 SmartPolicy::for_each(indices.begin(), indices.end(),
-                    [in_ptr, out_ptr, sig_ptr](long long i) noexcept
+                    [in_ptr, out_ptr, sig_ptr](std::size_t i) noexcept
                     {
                         double sigmoid_input = BETA * in_ptr[i];
                         double sigmoid_val = 1.0 / (1.0 + std::exp(-sigmoid_input));
@@ -243,7 +245,7 @@ namespace nn
                         out_ptr[i] = in_ptr[i] * sigmoid_val;
                     });
             } else {
-                for (long long i = 0; i < n; ++i) {
+                for (std::size_t i = 0; i < n; ++i) {
                     double sigmoid_input = BETA * in_ptr[i];
                     double sigmoid_val = 1.0 / (1.0 + std::exp(-sigmoid_input));
                     sig_ptr[i] = sigmoid_val;
@@ -263,21 +265,21 @@ namespace nn
             const double *in_ptr = input_cache_.data_ptr();
             const double *sig_ptr = sigmoid_cache_.data_ptr();
             const double *go_ptr = grad_output.data_ptr();
-            const auto n = static_cast<long long>(grad_output.size());
+            const auto n = grad_output.size();
 
             Matrix grad_input(grad_output.rows(), grad_output.cols());
             double *out_ptr = grad_input.data_ptr();
 
             if (n >= SmartPolicy::PARALLEL_THRESHOLD) {
-                auto indices = std::views::iota(0LL, n);
+                auto indices = std::views::iota(std::size_t{0}, n);
                 SmartPolicy::for_each(indices.begin(), indices.end(),
-                    [in_ptr, sig_ptr, go_ptr, out_ptr](long long i) noexcept
+                    [in_ptr, sig_ptr, go_ptr, out_ptr](std::size_t i) noexcept
                     {
                         double s = sig_ptr[i];
                         out_ptr[i] = go_ptr[i] * s * (1.0 + BETA * in_ptr[i] * (1.0 - s));
                     });
             } else {
-                for (long long i = 0; i < n; ++i) {
+                for (std::size_t i = 0; i < n; ++i) {
                     double s = sig_ptr[i];
                     out_ptr[i] = go_ptr[i] * s * (1.0 + BETA * in_ptr[i] * (1.0 - s));
                 }
@@ -677,16 +679,16 @@ namespace nn
         static void scale_inplace(Matrix &m, double s)
         {
             double *ptr = m.data_ptr();
-            const auto n = static_cast<long long>(m.size());
+            const auto n = m.size();
             if (n >= SmartPolicy::PARALLEL_THRESHOLD)
             {
-                auto indices = std::views::iota(0LL, n);
+                auto indices = std::views::iota(std::size_t{0}, n);
                 SmartPolicy::for_each(indices.begin(), indices.end(),
-                    [ptr, s](long long i) noexcept { ptr[i] *= s; });
+                    [ptr, s](std::size_t i) noexcept { ptr[i] *= s; });
             }
             else
             {
-                for (long long i = 0; i < n; ++i)
+                for (std::size_t i = 0; i < n; ++i)
                     ptr[i] *= s;
             }
         }
@@ -952,6 +954,409 @@ namespace nn
 
         // 位置编码为固定值，梯度直接穿透
         Matrix backward(const Matrix &grad_output) override { return grad_output; }
+    };
+
+    // ── 前馈网络 (Feed-Forward Network) ────────────────────────────────
+    // FFN(x) = Linear(d_ff → d_model)(GeLU(Linear(d_model → d_ff)(x)))
+    // 输入/输出形状: (d_model, seq_len)
+    class FeedForward final : public Layer
+    {
+    private:
+        Linear fc1_;       // (d_ff, d_model)
+        Linear fc2_;       // (d_model, d_ff)
+        GeLU activation_;
+        Matrix input_cache_;
+
+    public:
+        FeedForward(std::size_t d_model, std::size_t d_ff)
+            : fc1_(d_model, d_ff), fc2_(d_ff, d_model)
+        {}
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            auto params = fc1_.parameters();
+            auto p2 = fc2_.parameters();
+            params.insert(params.end(), p2.begin(), p2.end());
+            return params;
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            auto grads = fc1_.param_gradients();
+            auto g2 = fc2_.param_gradients();
+            grads.insert(grads.end(), g2.begin(), g2.end());
+            return grads;
+        }
+
+        Matrix forward(const Matrix &input) override
+        {
+            input_cache_ = input;
+            auto x = activation_.forward(fc1_.forward(input));
+            return fc2_.forward(x);
+        }
+
+        Matrix backward(const Matrix &grad_output) override
+        {
+            auto grad = fc2_.backward(grad_output);
+            grad = activation_.backward(grad);
+            return fc1_.backward(grad);
+        }
+    };
+
+    // ── Transformer 编码器层 (Pre-Norm 架构) ──────────────────────────
+    //   x = x + SelfAttn(LayerNorm₁(x))    ← 残差连接
+    //   x = x + FFN(LayerNorm₂(x))         ← 残差连接
+    // 输入/输出形状: (d_model, seq_len)
+    class TransformerEncoderLayer final : public Layer
+    {
+    private:
+        MultiHeadAttention self_attn_;
+        LayerNorm norm1_;
+        FeedForward ff_;
+        LayerNorm norm2_;
+
+        // ── 反向传播缓存 ──
+        Matrix residual1_cache_;   // 第一个残差连接前的原始输入
+        Matrix residual2_cache_;   // 第二个残差连接前的输入 (= residual1)
+
+    public:
+        TransformerEncoderLayer(std::size_t d_model, std::size_t num_heads, std::size_t d_ff)
+            : self_attn_(d_model, num_heads),
+              norm1_(d_model),
+              ff_(d_model, d_ff),
+              norm2_(d_model)
+        {}
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            auto params = self_attn_.parameters();
+            auto n1 = norm1_.parameters();
+            auto f  = ff_.parameters();
+            auto n2 = norm2_.parameters();
+            params.insert(params.end(), n1.begin(), n1.end());
+            params.insert(params.end(), f.begin(), f.end());
+            params.insert(params.end(), n2.begin(), n2.end());
+            return params;
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            auto grads = self_attn_.param_gradients();
+            auto gn1 = norm1_.param_gradients();
+            auto gf  = ff_.param_gradients();
+            auto gn2 = norm2_.param_gradients();
+            grads.insert(grads.end(), gn1.begin(), gn1.end());
+            grads.insert(grads.end(), gf.begin(), gf.end());
+            grads.insert(grads.end(), gn2.begin(), gn2.end());
+            return grads;
+        }
+
+        Matrix forward(const Matrix &input) override
+        {
+            // 子层1: Self-Attention + 残差
+            residual1_cache_ = input;
+            auto norm1_out = norm1_.forward(input);
+            auto attn_out  = self_attn_.forward(norm1_out);
+            residual2_cache_ = input + attn_out;  // 残差连接
+
+            // 子层2: FFN + 残差
+            auto norm2_out = norm2_.forward(residual2_cache_);
+            auto ff_out    = ff_.forward(norm2_out);
+            return residual2_cache_ + ff_out;
+        }
+
+        Matrix backward(const Matrix &grad_output) override
+        {
+            // ── 反向传播第2个残差连接: grad_r2 = grad_output (分流到两条路径) ──
+            //   路径A: 直接流向 residual2 (= residual1)
+            //   路径B: 流向 FFN
+            Matrix grad_residual1 = grad_output;   // 路径A
+            Matrix grad_ff_out    = grad_output;   // 路径B
+
+            // 反向 FFN → LayerNorm₂
+            auto grad_norm2 = ff_.backward(grad_ff_out);
+            grad_residual1 = grad_residual1 + norm2_.backward(grad_norm2);
+
+            // ── 反向传播第1个残差连接 ──
+            //   路径A: 直接流向输入 x
+            //   路径B: 流向 Self-Attention
+            Matrix grad_input = grad_residual1;    // 路径A
+            Matrix grad_attn_out = grad_residual1; // 路径B
+
+            // 反向 Self-Attention → LayerNorm₁
+            auto grad_norm1 = self_attn_.backward(grad_attn_out);
+            grad_input = grad_input + norm1_.backward(grad_norm1);
+
+            return grad_input;
+        }
+    };
+
+    // ── Transformer 编码器 ──────────────────────────────────────────────
+    // 堆叠 N 个 TransformerEncoderLayer，内含位置编码 + 全局平均池化
+    // 输入: (d_model × num_patches, batch_size)  — PatchEmbedding 的输出
+    // 输出: (d_model, batch_size)                 — 池化后的序列表示
+    //
+    // 反向传播策略: 对每个样本 re-forward 以重建内部缓存 (checkpointing)
+    // ────────────────────────────────────────────────────────────────────
+    class TransformerEncoder final : public Layer
+    {
+    private:
+        std::size_t d_model_;
+        std::size_t num_patches_;
+
+        std::vector<TransformerEncoderLayer> layers_;
+        PositionalEncoding pos_encoding_;
+
+        // ── 反向传播缓存: 每个样本在每层的输入 ──
+        std::vector<std::vector<Matrix>> stored_inputs_;  // [sample][layer]
+        std::size_t batch_size_{0};
+
+    public:
+        TransformerEncoder(std::size_t d_model, std::size_t num_heads,
+                           std::size_t d_ff, std::size_t num_layers,
+                           std::size_t num_patches)
+            : d_model_(d_model), num_patches_(num_patches),
+              pos_encoding_(d_model, num_patches)
+        {
+            for (std::size_t i = 0; i < num_layers; ++i)
+                layers_.emplace_back(d_model, num_heads, d_ff);
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            std::vector<std::reference_wrapper<Matrix>> params;
+            for (auto &layer : layers_)
+            {
+                auto lp = layer.parameters();
+                params.insert(params.end(), lp.begin(), lp.end());
+            }
+            return params;
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            std::vector<std::reference_wrapper<Matrix>> grads;
+            for (auto &layer : layers_)
+            {
+                auto lg = layer.param_gradients();
+                grads.insert(grads.end(), lg.begin(), lg.end());
+            }
+            return grads;
+        }
+
+        // ── 前向传播 ────────────────────────────────────────────────────
+        Matrix forward(const Matrix &input) override
+        {
+            batch_size_ = input.cols();
+            stored_inputs_.resize(batch_size_);
+
+            Matrix output(d_model_, batch_size_);
+
+            for (std::size_t b = 0; b < batch_size_; ++b)
+            {
+                // 从展平向量中提取样本 b → (d_model, num_patches)
+                Matrix x(d_model_, num_patches_);
+                for (std::size_t r = 0; r < d_model_; ++r)
+                    for (std::size_t c = 0; c < num_patches_; ++c)
+                        x.set_value_unchecked(r, c,
+                            input.at_unchecked(r * num_patches_ + c, b));
+
+                // 添加位置编码
+                x = pos_encoding_.forward(x);
+
+                // 依次通过编码器层，缓存每层输入
+                stored_inputs_[b].resize(layers_.size());
+                for (std::size_t l = 0; l < layers_.size(); ++l)
+                {
+                    stored_inputs_[b][l] = x;
+                    x = layers_[l].forward(x);
+                }
+
+                // 全局平均池化: (d_model, num_patches) → (d_model,)
+                const double inv_n = 1.0 / static_cast<double>(num_patches_);
+                for (std::size_t r = 0; r < d_model_; ++r)
+                {
+                    double sum = 0.0;
+                    for (std::size_t c = 0; c < num_patches_; ++c)
+                        sum += x.at_unchecked(r, c);
+                    output.set_value_unchecked(r, b, sum * inv_n);
+                }
+            }
+            return output;
+        }
+
+        // ── 反向传播 ────────────────────────────────────────────────────
+        // 对每个样本: re-forward 重建缓存 → 反向传播 → 累加参数梯度
+        Matrix backward(const Matrix &grad_output) override
+        {
+            Matrix grad_input(d_model_ * num_patches_, batch_size_);
+            grad_input.zero();
+
+            for (std::size_t b = 0; b < batch_size_; ++b)
+            {
+                // ── Re-forward: 重建该样本的全部缓存 ──
+                Matrix x = stored_inputs_[b][0];   // PatchEmbedding 输出 + PE
+                x = pos_encoding_.forward(x);      // PE forward (固定值，缓存无关紧要)
+                for (std::size_t l = 0; l < layers_.size(); ++l)
+                    x = layers_[l].forward(x);    // 重建每层缓存
+
+                // ── 全局平均池化梯度: 展开 ──
+                const double inv_n = 1.0 / static_cast<double>(num_patches_);
+                Matrix grad(d_model_, num_patches_);
+                for (std::size_t r = 0; r < d_model_; ++r)
+                {
+                    double g = grad_output.at_unchecked(r, b) * inv_n;
+                    for (std::size_t c = 0; c < num_patches_; ++c)
+                        grad.set_value_unchecked(r, c, g);
+                }
+
+                // ── 反向传播编码器层 ──
+                for (int l = static_cast<int>(layers_.size()) - 1; l >= 0; --l)
+                    grad = layers_[l].backward(grad);
+
+                // ── 写入 grad_input ──
+                for (std::size_t r = 0; r < d_model_; ++r)
+                    for (std::size_t c = 0; c < num_patches_; ++c)
+                        grad_input.set_value_unchecked(r * num_patches_ + c, b,
+                            grad.at_unchecked(r, c));
+            }
+            return grad_input;
+        }
+    };
+
+    // ── Patch 嵌入层 ──────────────────────────────────────────────────
+    // 将展平的图像分割为不重叠的 patch 并投影到 d_model 维空间
+    // 输入: (img_size², batch_size)          — 展平的 28×28 图像
+    // 输出: (d_model × num_patches, batch_size) — 展平的 patch 序列
+    // ────────────────────────────────────────────────────────────────────
+    class PatchEmbedding final : public Layer
+    {
+    private:
+        std::size_t img_size_;
+        std::size_t patch_size_;
+        std::size_t grid_size_;      // img_size / patch_size
+        std::size_t num_patches_;    // grid_size²
+        std::size_t patch_dim_;      // patch_size²
+        std::size_t d_model_;
+        Linear projection_;          // (patch_dim, d_model)
+        Matrix input_cache_;
+
+    public:
+        PatchEmbedding(std::size_t img_size, std::size_t patch_size, std::size_t d_model)
+            : img_size_(img_size), patch_size_(patch_size),
+              grid_size_(img_size / patch_size),
+              num_patches_((img_size / patch_size) * (img_size / patch_size)),
+              patch_dim_(patch_size * patch_size),
+              d_model_(d_model),
+              projection_(patch_dim_, d_model)
+        {
+            if (img_size % patch_size != 0)
+                throw std::invalid_argument(
+                    "PatchEmbedding: img_size must be divisible by patch_size");
+        }
+
+        [[nodiscard]] std::size_t num_patches() const noexcept { return num_patches_; }
+        [[nodiscard]] std::size_t d_model()     const noexcept { return d_model_; }
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            return projection_.parameters();
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            return projection_.param_gradients();
+        }
+
+        // ── 前向传播 ────────────────────────────────────────────────────
+        // 批量提取 patch 并一次性投影
+        Matrix forward(const Matrix &input) override
+        {
+            input_cache_ = input;
+            const std::size_t batch = input.cols();
+
+            // Step 1: 提取所有 patch → (patch_dim, num_patches × batch)
+            // 布局: patch p 的 sample b 位于列 p × batch + b
+            Matrix all_patches(patch_dim_, num_patches_ * batch);
+
+            for (std::size_t b = 0; b < batch; ++b)
+            {
+                for (std::size_t p = 0; p < num_patches_; ++p)
+                {
+                    const std::size_t gr = (p / grid_size_) * patch_size_;
+                    const std::size_t gc = (p % grid_size_) * patch_size_;
+                    const std::size_t col_idx = p * batch + b;
+
+                    for (std::size_t pr = 0; pr < patch_size_; ++pr)
+                    {
+                        for (std::size_t pc = 0; pc < patch_size_; ++pc)
+                        {
+                            const std::size_t flat = pr * patch_size_ + pc;
+                            const std::size_t pix  = (gr + pr) * img_size_ + (gc + pc);
+                            all_patches.set_value_unchecked(flat, col_idx,
+                                input.at_unchecked(pix, b));
+                        }
+                    }
+                }
+            }
+
+            // Step 2: 投影 → (d_model, num_patches × batch)
+            Matrix projected = projection_.forward(all_patches);
+
+            // Step 3: 重排为 (d_model × num_patches, batch)
+            Matrix output(d_model_ * num_patches_, batch);
+            for (std::size_t r = 0; r < d_model_; ++r)
+                for (std::size_t p = 0; p < num_patches_; ++p)
+                    for (std::size_t b = 0; b < batch; ++b)
+                        output.set_value_unchecked(r * num_patches_ + p, b,
+                            projected.at_unchecked(r, p * batch + b));
+
+            return output;
+        }
+
+        // ── 反向传播 ────────────────────────────────────────────────────
+        Matrix backward(const Matrix &grad_output) override
+        {
+            const std::size_t batch = grad_output.cols();
+
+            // Step 1: 重排梯度 → (d_model, num_patches × batch)
+            Matrix grad_projected(d_model_, num_patches_ * batch);
+            for (std::size_t r = 0; r < d_model_; ++r)
+                for (std::size_t p = 0; p < num_patches_; ++p)
+                    for (std::size_t b = 0; b < batch; ++b)
+                        grad_projected.set_value_unchecked(r, p * batch + b,
+                            grad_output.at_unchecked(r * num_patches_ + p, b));
+
+            // Step 2: 投影层反向 → (patch_dim, num_patches × batch)
+            Matrix grad_patches = projection_.backward(grad_projected);
+
+            // Step 3: 散射梯度回输入 → (img_size², batch)
+            Matrix grad_input(img_size_ * img_size_, batch);
+            grad_input.zero();
+
+            for (std::size_t b = 0; b < batch; ++b)
+            {
+                for (std::size_t p = 0; p < num_patches_; ++p)
+                {
+                    const std::size_t gr = (p / grid_size_) * patch_size_;
+                    const std::size_t gc = (p % grid_size_) * patch_size_;
+                    const std::size_t col_idx = p * batch + b;
+
+                    for (std::size_t pr = 0; pr < patch_size_; ++pr)
+                    {
+                        for (std::size_t pc = 0; pc < patch_size_; ++pc)
+                        {
+                            const std::size_t flat = pr * patch_size_ + pc;
+                            const std::size_t pix  = (gr + pr) * img_size_ + (gc + pc);
+                            const double val = grad_input.at_unchecked(pix, b)
+                                             + grad_patches.at_unchecked(flat, col_idx);
+                            grad_input.set_value_unchecked(pix, b, val);
+                        }
+                    }
+                }
+            }
+            return grad_input;
+        }
     };
 }
 

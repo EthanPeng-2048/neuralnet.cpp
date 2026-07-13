@@ -26,16 +26,18 @@ void print_usage(const char *prog)
         << "  " << prog << " <image.csv> [选项]     推理单张图片\n"
         << "  " << prog << " <目录>   [选项]     批量推理目录下所有 CSV\n\n"
         << "选项:\n"
-        << "  --model <path>    模型文件路径 (默认: pretrained/model.bin)\n"
-        << "  --topk <n>        显示前 n 个预测结果 (默认: 3)\n"
-        << "  --show-pixels     显示像素矩阵 (调试用)\n"
-        << "  --help            显示此帮助信息\n";
+        << "  --model <path>     模型文件路径 (默认: pretrained/model.bin)\n"
+        << "  --model-type <t>   模型类型: mlp/transformer (默认: mlp)\n"
+        << "  --topk <n>         显示前 n 个预测结果 (默认: 3)\n"
+        << "  --show-pixels      显示像素矩阵 (调试用)\n"
+        << "  --help             显示此帮助信息\n";
 }
 
 // ==================== 命令行参数 ====================
 struct InferConfig
 {
     std::string model_path = "pretrained/model.bin";
+    std::string model_type = "mlp";
     std::string input_path;
     int topk = 3;
     bool show_pixels = false;
@@ -57,6 +59,16 @@ InferConfig parse_args(int argc, char *argv[])
         else if (arg == "--model" && i + 1 < argc)
         {
             cfg.model_path = argv[++i];
+        }
+        else if (arg == "--model-type" && i + 1 < argc)
+        {
+            cfg.model_type = argv[++i];
+            if (cfg.model_type != "mlp" && cfg.model_type != "transformer")
+            {
+                std::cerr << "未知模型类型: " << cfg.model_type
+                          << "，可选: mlp, transformer\n";
+                std::exit(1);
+            }
         }
         else if (arg == "--topk" && i + 1 < argc)
         {
@@ -206,7 +218,7 @@ int main(int argc, char *argv[])
         InferConfig cfg = parse_args(argc, argv);
 
         // 构建并加载模型
-        auto model = nn::build_mnist_model();
+        auto model = nn::build_mnist_model(cfg.model_type);
         nn::load_model(cfg.model_path, model);
         std::cout << "模型已加载: " << cfg.model_path << "\n" << std::endl;
 
