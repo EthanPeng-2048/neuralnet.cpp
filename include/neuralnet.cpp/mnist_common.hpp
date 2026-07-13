@@ -14,7 +14,7 @@ inline constexpr std::size_t MNIST_NUM_CLASSES = 10;
 
 // 默认网络架构：输入层 -> 隐藏层1 -> 隐藏层2 -> 隐藏层3 -> 输出层
 inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
-    MNIST_INPUT_DIM, 256, 128, 64, MNIST_NUM_CLASSES
+    MNIST_INPUT_DIM, 512, 256, 128, 64, MNIST_NUM_CLASSES
 };
 
 // ── 构建 MNIST 模型 ────────────────────────────────────────────────────────
