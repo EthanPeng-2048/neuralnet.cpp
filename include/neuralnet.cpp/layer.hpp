@@ -442,13 +442,13 @@ namespace nn
             auto batch_indices = std::views::iota(std::size_t{0}, batch_size);
             
             if (batch_size >= SmartPolicy::PARALLEL_THRESHOLD) {
+                // 先并行计算每个样本的 dL/dx（无竞争），
+                // 再串行累加 dL/dγ 和 dL/dβ（避免数据竞争）
                 SmartPolicy::for_each(batch_indices.begin(), batch_indices.end(),
-                    [go_span, norm_span, std_span, gamma_span, gi_span, gg_span, gb_span,
+                    [go_span, norm_span, std_span, gamma_span, gi_span,
                      features, batch_size](std::size_t b) noexcept
                     {
                         double std_inv = std_span[b];
-                        
-                        // 预计算统计量：O(N) 而非 O(N²)
                         double sum_grad = 0.0;
                         double sum_grad_norm = 0.0;
                         for (std::size_t f = 0; f < features; ++f) {
@@ -456,18 +456,22 @@ namespace nn
                             sum_grad += g;
                             sum_grad_norm += g * norm_span[f * batch_size + b];
                         }
-
-                        // 单次遍历：同时计算 dL/dγ、dL/dβ、dL/dx
                         const double inv_features = 1.0 / static_cast<double>(features);
                         for (std::size_t f = 0; f < features; ++f) {
                             double grad_out = go_span[f * batch_size + b];
                             double g = grad_out * gamma_span[f];
-                            gg_span[f] += grad_out * norm_span[f * batch_size + b];
-                            gb_span[f] += grad_out;
                             gi_span[f * batch_size + b] = (g - sum_grad * inv_features -
                                    norm_span[f * batch_size + b] * sum_grad_norm * inv_features) * std_inv;
                         }
                     });
+                // 串行累加 dL/dγ 和 dL/dβ
+                for (std::size_t b = 0; b < batch_size; ++b) {
+                    for (std::size_t f = 0; f < features; ++f) {
+                        double grad_out = go_span[f * batch_size + b];
+                        gg_span[f] += grad_out * norm_span[f * batch_size + b];
+                        gb_span[f] += grad_out;
+                    }
+                }
             } else {
                 for (std::size_t b = 0; b < batch_size; ++b) {
                     double std_inv = std_span[b];
@@ -912,7 +916,8 @@ namespace nn
                 // 奇数维度：最后一个特征仅使用 sin
                 if (d_model % 2 == 1)
                 {
-                    const double angle = pos_d * freqs[half];
+                    const double freq_last = 1.0 / std::pow(10000.0, static_cast<double>(2 * half) / d_model);
+                    const double angle = pos_d * freq_last;
                     e_span[(d_model - 1) * max_len + pos] = std::sin(angle);
                 }
             }
@@ -1107,8 +1112,8 @@ namespace nn
         std::vector<TransformerEncoderLayer> layers_;
         PositionalEncoding pos_encoding_;
 
-        // ── 反向传播缓存: 每个样本在每层的输入 ──
-        std::vector<std::vector<Matrix>> stored_inputs_;  // [sample][layer]
+        // ── 反向传播缓存: 每个样本在位置编码后的输入（供 re-forward 重建） ──
+        std::vector<Matrix> stored_inputs_;  // [sample] — 每个样本 PE 后的输入
         std::size_t batch_size_{0};
 
     public:
@@ -1164,13 +1169,12 @@ namespace nn
                 // 添加位置编码
                 x = pos_encoding_.forward(x);
 
-                // 依次通过编码器层，缓存每层输入
-                stored_inputs_[b].resize(layers_.size());
+                // 缓存 PE 后的输入，供 backward 中 re-forward 重建缓存
+                stored_inputs_[b] = x;
+
+                // 依次通过编码器层
                 for (std::size_t l = 0; l < layers_.size(); ++l)
-                {
-                    stored_inputs_[b][l] = x;
                     x = layers_[l].forward(x);
-                }
 
                 // 全局平均池化: (d_model, num_patches) → (d_model,)
                 const double inv_n = 1.0 / static_cast<double>(num_patches_);
@@ -1195,8 +1199,8 @@ namespace nn
             for (std::size_t b = 0; b < batch_size_; ++b)
             {
                 // ── Re-forward: 重建该样本的全部缓存 ──
-                Matrix x = stored_inputs_[b][0];   // PatchEmbedding 输出 + PE
-                x = pos_encoding_.forward(x);      // PE forward (固定值，缓存无关紧要)
+                // stored_inputs_[b] 已含位置编码，无需重复施加
+                Matrix x = stored_inputs_[b];
                 for (std::size_t l = 0; l < layers_.size(); ++l)
                     x = layers_[l].forward(x);    // 重建每层缓存
 
