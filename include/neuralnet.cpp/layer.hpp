@@ -10,6 +10,7 @@
 #include <numeric>
 #include <random>
 #include <ranges>
+#include <span>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -88,16 +89,16 @@ namespace nn
 
             // result = product + bias（返回新矩阵，NRVO 优化）
             Matrix result(out_feat, batch);
-            const double *prod_ptr = product_buf_.data_ptr();
-            const double *bias_ptr = b_.data_ptr();
-            double *res_ptr = result.data_ptr();
+            const auto prod_span = product_buf_.span();
+            const auto bias_span = b_.span();
+            auto res_span = result.span();
             const auto total = static_cast<std::size_t>(out_feat * batch);
 
             auto indices = std::views::iota(std::size_t{0}, total);
             SmartPolicy::for_each(indices.begin(), indices.end(),
-                          [prod_ptr, bias_ptr, res_ptr, batch](std::size_t idx) noexcept
+                          [prod_span, bias_span, res_span, batch](std::size_t idx) noexcept
                           {
-                              res_ptr[idx] = prod_ptr[idx] + bias_ptr[idx / batch];
+                              res_span[idx] = prod_span[idx] + bias_span[idx / batch];
                           });
 
             return result;
@@ -122,33 +123,33 @@ namespace nn
             // grad_W += grad_output * input_cache_^T（逐元素累加，避免临时矩阵）
             // 手动计算：grad_W[i][j] += sum_k(grad_output[i][k] * input_cache_[j][k])
             {
-                const double *go_ptr = grad_output.data_ptr();
-                const double *ic_ptr = input_cache_.data_ptr();
-                double *gw_ptr = grad_W_.data_ptr();
+                const auto go_span = grad_output.span();
+                const auto ic_span = input_cache_.span();
+                auto gw_span = grad_W_.span();
                 const std::size_t gw_size = out_feat * in_feat;
                 auto gw_indices = std::views::iota(std::size_t{0}, gw_size);
                 SmartPolicy::for_each(gw_indices.begin(), gw_indices.end(),
-                    [go_ptr, ic_ptr, gw_ptr, in_feat, batch](std::size_t idx) noexcept
+                    [go_span, ic_span, gw_span, in_feat, batch](std::size_t idx) noexcept
                     {
                         const std::size_t of = idx / in_feat;
                         const std::size_t inf = idx % in_feat;
                         double sum = 0.0;
                         for (std::size_t b = 0; b < batch; ++b)
-                            sum += go_ptr[of * batch + b] * ic_ptr[inf * batch + b];
-                        gw_ptr[idx] += sum;
+                            sum += go_span[of * batch + b] * ic_span[inf * batch + b];
+                        gw_span[idx] += sum;
                     });
             }
 
             // grad_b += sum(grad_output, dim=batch)
             {
-                const double *go_ptr = grad_output.data_ptr();
-                double *gb_ptr = grad_b_.data_ptr();
+                const auto go_span = grad_output.span();
+                auto gb_span = grad_b_.span();
                 for (std::size_t of = 0; of < out_feat; ++of)
                 {
                     double sum = 0.0;
                     for (std::size_t b = 0; b < batch; ++b)
-                        sum += go_ptr[of * batch + b];
-                    gb_ptr[of] += sum;
+                        sum += go_span[of * batch + b];
+                    gb_span[of] += sum;
                 }
             }
 
@@ -168,20 +169,20 @@ namespace nn
         {
             input_cache_ = input;
 
-            const double *in_ptr = input.data_ptr();
+            const auto in_span = input.span();
             const auto n = input.size();
 
             Matrix result(input.rows(), input.cols());
-            double *out_ptr = result.data_ptr();
+            auto out_span = result.span();
 
             if (n >= SmartPolicy::PARALLEL_THRESHOLD) {
                 auto indices = std::views::iota(std::size_t{0}, n);
                 SmartPolicy::for_each(indices.begin(), indices.end(),
-                    [in_ptr, out_ptr](std::size_t i) noexcept
-                    { out_ptr[i] = in_ptr[i] > 0.0 ? in_ptr[i] : 0.0; });
+                    [in_span, out_span](std::size_t i) noexcept
+                    { out_span[i] = in_span[i] > 0.0 ? in_span[i] : 0.0; });
             } else {
                 for (std::size_t i = 0; i < n; ++i)
-                    out_ptr[i] = in_ptr[i] > 0.0 ? in_ptr[i] : 0.0;
+                    out_span[i] = in_span[i] > 0.0 ? in_span[i] : 0.0;
             }
             return result;
         }
@@ -191,21 +192,21 @@ namespace nn
             if (input_cache_.rows() != grad_output.rows() || input_cache_.cols() != grad_output.cols())
                 throw std::invalid_argument("relu backward shape mismatch");
 
-            const double *in_ptr = input_cache_.data_ptr();
-            const double *go_ptr = grad_output.data_ptr();
+            const auto in_span = input_cache_.span();
+            const auto go_span = grad_output.span();
             const auto n = grad_output.size();
 
             Matrix grad_input(grad_output.rows(), grad_output.cols());
-            double *out_ptr = grad_input.data_ptr();
+            auto out_span = grad_input.span();
 
             if (n >= SmartPolicy::PARALLEL_THRESHOLD) {
                 auto indices = std::views::iota(std::size_t{0}, n);
                 SmartPolicy::for_each(indices.begin(), indices.end(),
-                    [in_ptr, go_ptr, out_ptr](std::size_t i) noexcept
-                    { out_ptr[i] = in_ptr[i] > 0.0 ? go_ptr[i] : 0.0; });
+                    [in_span, go_span, out_span](std::size_t i) noexcept
+                    { out_span[i] = in_span[i] > 0.0 ? go_span[i] : 0.0; });
             } else {
                 for (std::size_t i = 0; i < n; ++i)
-                    out_ptr[i] = in_ptr[i] > 0.0 ? go_ptr[i] : 0.0;
+                    out_span[i] = in_span[i] > 0.0 ? go_span[i] : 0.0;
             }
             return grad_input;
         }
@@ -228,28 +229,28 @@ namespace nn
             input_cache_ = input;
             sigmoid_cache_.resize(input.rows(), input.cols());
 
-            const double *in_ptr = input.data_ptr();
-            double *sig_ptr = sigmoid_cache_.data_ptr();
+            const auto in_span = input.span();
+            auto sig_span = sigmoid_cache_.span();
 
             Matrix result(input.rows(), input.cols());
-            double *out_ptr = result.data_ptr();
+            auto out_span = result.span();
 
             if (n >= SmartPolicy::PARALLEL_THRESHOLD) {
                 auto indices = std::views::iota(std::size_t{0}, n);
                 SmartPolicy::for_each(indices.begin(), indices.end(),
-                    [in_ptr, out_ptr, sig_ptr](std::size_t i) noexcept
+                    [in_span, out_span, sig_span](std::size_t i) noexcept
                     {
-                        double sigmoid_input = BETA * in_ptr[i];
+                        double sigmoid_input = BETA * in_span[i];
                         double sigmoid_val = 1.0 / (1.0 + std::exp(-sigmoid_input));
-                        sig_ptr[i] = sigmoid_val;
-                        out_ptr[i] = in_ptr[i] * sigmoid_val;
+                        sig_span[i] = sigmoid_val;
+                        out_span[i] = in_span[i] * sigmoid_val;
                     });
             } else {
                 for (std::size_t i = 0; i < n; ++i) {
-                    double sigmoid_input = BETA * in_ptr[i];
+                    double sigmoid_input = BETA * in_span[i];
                     double sigmoid_val = 1.0 / (1.0 + std::exp(-sigmoid_input));
-                    sig_ptr[i] = sigmoid_val;
-                    out_ptr[i] = in_ptr[i] * sigmoid_val;
+                    sig_span[i] = sigmoid_val;
+                    out_span[i] = in_span[i] * sigmoid_val;
                 }
             }
             return result;
@@ -262,26 +263,26 @@ namespace nn
             if (input_cache_.rows() != grad_output.rows() || input_cache_.cols() != grad_output.cols())
                 throw std::invalid_argument("gelu backward shape mismatch");
 
-            const double *in_ptr = input_cache_.data_ptr();
-            const double *sig_ptr = sigmoid_cache_.data_ptr();
-            const double *go_ptr = grad_output.data_ptr();
+            const auto in_span = input_cache_.span();
+            const auto sig_span = sigmoid_cache_.span();
+            const auto go_span = grad_output.span();
             const auto n = grad_output.size();
 
             Matrix grad_input(grad_output.rows(), grad_output.cols());
-            double *out_ptr = grad_input.data_ptr();
+            auto out_span = grad_input.span();
 
             if (n >= SmartPolicy::PARALLEL_THRESHOLD) {
                 auto indices = std::views::iota(std::size_t{0}, n);
                 SmartPolicy::for_each(indices.begin(), indices.end(),
-                    [in_ptr, sig_ptr, go_ptr, out_ptr](std::size_t i) noexcept
+                    [in_span, sig_span, go_span, out_span](std::size_t i) noexcept
                     {
-                        double s = sig_ptr[i];
-                        out_ptr[i] = go_ptr[i] * s * (1.0 + BETA * in_ptr[i] * (1.0 - s));
+                        double s = sig_span[i];
+                        out_span[i] = go_span[i] * s * (1.0 + BETA * in_span[i] * (1.0 - s));
                     });
             } else {
                 for (std::size_t i = 0; i < n; ++i) {
-                    double s = sig_ptr[i];
-                    out_ptr[i] = go_ptr[i] * s * (1.0 + BETA * in_ptr[i] * (1.0 - s));
+                    double s = sig_span[i];
+                    out_span[i] = go_span[i] * s * (1.0 + BETA * in_span[i] * (1.0 - s));
                 }
             }
             return grad_input;
@@ -348,44 +349,44 @@ namespace nn
 
             Matrix result(features, batch_size);
 
-            const double *in_ptr = input.data_ptr();
-            const double *gamma_ptr = gamma_.data_ptr();
-            const double *beta_ptr = beta_.data_ptr();
-            double *mean_ptr = mean_cache_.data_ptr();
-            double *std_ptr = std_cache_.data_ptr();
-            double *norm_ptr = normalized_cache_.data_ptr();
-            double *res_ptr = result.data_ptr();
+            const auto in_span = input.span();
+            const auto gamma_span = gamma_.span();
+            const auto beta_span = beta_.span();
+            auto mean_span = mean_cache_.span();
+            auto std_span = std_cache_.span();
+            auto norm_span = normalized_cache_.span();
+            auto res_span = result.span();
 
             // 对每个样本（列）独立处理
             auto batch_indices = std::views::iota(std::size_t{0}, batch_size);
             
             if (batch_size >= SmartPolicy::PARALLEL_THRESHOLD) {
                 SmartPolicy::for_each(batch_indices.begin(), batch_indices.end(),
-                    [in_ptr, gamma_ptr, beta_ptr, mean_ptr, std_ptr, norm_ptr, res_ptr, 
+                    [in_span, gamma_span, beta_span, mean_span, std_span, norm_span, res_span, 
                      features, batch_size, epsilon = epsilon_](std::size_t b) noexcept
                     {
                         // 计算均值
                         double sum = 0.0;
                         for (std::size_t f = 0; f < features; ++f)
-                            sum += in_ptr[f * batch_size + b];
+                            sum += in_span[f * batch_size + b];
                         double mean = sum / static_cast<double>(features);
-                        mean_ptr[b] = mean;
+                        mean_span[b] = mean;
 
                         // 计算方差
                         double var_sum = 0.0;
                         for (std::size_t f = 0; f < features; ++f) {
-                            double diff = in_ptr[f * batch_size + b] - mean;
+                            double diff = in_span[f * batch_size + b] - mean;
                             var_sum += diff * diff;
                         }
                         double variance = var_sum / static_cast<double>(features);
                         double std_inv = 1.0 / std::sqrt(variance + epsilon);
-                        std_ptr[b] = std_inv;
+                        std_span[b] = std_inv;
 
                         // 归一化和仿射变换
                         for (std::size_t f = 0; f < features; ++f) {
-                            double normalized = (in_ptr[f * batch_size + b] - mean) * std_inv;
-                            norm_ptr[f * batch_size + b] = normalized;
-                            res_ptr[f * batch_size + b] = gamma_ptr[f] * normalized + beta_ptr[f];
+                            double normalized = (in_span[f * batch_size + b] - mean) * std_inv;
+                            norm_span[f * batch_size + b] = normalized;
+                            res_span[f * batch_size + b] = gamma_span[f] * normalized + beta_span[f];
                         }
                     });
             } else {
@@ -393,25 +394,25 @@ namespace nn
                     // 计算均值
                     double sum = 0.0;
                     for (std::size_t f = 0; f < features; ++f)
-                        sum += in_ptr[f * batch_size + b];
+                        sum += in_span[f * batch_size + b];
                     double mean = sum / static_cast<double>(features);
-                    mean_ptr[b] = mean;
+                    mean_span[b] = mean;
 
                     // 计算方差
                     double var_sum = 0.0;
                     for (std::size_t f = 0; f < features; ++f) {
-                        double diff = in_ptr[f * batch_size + b] - mean;
+                        double diff = in_span[f * batch_size + b] - mean;
                         var_sum += diff * diff;
                     }
                     double variance = var_sum / static_cast<double>(features);
                     double std_inv = 1.0 / std::sqrt(variance + epsilon_);
-                    std_ptr[b] = std_inv;
+                    std_span[b] = std_inv;
 
                     // 归一化和仿射变换
                     for (std::size_t f = 0; f < features; ++f) {
-                        double normalized = (in_ptr[f * batch_size + b] - mean) * std_inv;
-                        norm_ptr[f * batch_size + b] = normalized;
-                        res_ptr[f * batch_size + b] = gamma_ptr[f] * normalized + beta_ptr[f];
+                        double normalized = (in_span[f * batch_size + b] - mean) * std_inv;
+                        norm_span[f * batch_size + b] = normalized;
+                        res_span[f * batch_size + b] = gamma_span[f] * normalized + beta_span[f];
                     }
                 }
             }
@@ -429,66 +430,66 @@ namespace nn
 
             Matrix grad_input(features, batch_size);
 
-            const double *go_ptr = grad_output.data_ptr();
-            const double *norm_ptr = normalized_cache_.data_ptr();
-            const double *std_ptr = std_cache_.data_ptr();
-            const double *gamma_ptr = gamma_.data_ptr();
-            double *gi_ptr = grad_input.data_ptr();
-            double *gg_ptr = grad_gamma_.data_ptr();
-            double *gb_ptr = grad_beta_.data_ptr();
+            const auto go_span = grad_output.span();
+            const auto norm_span = normalized_cache_.span();
+            const auto std_span = std_cache_.span();
+            const auto gamma_span = gamma_.span();
+            auto gi_span = grad_input.span();
+            auto gg_span = grad_gamma_.span();
+            auto gb_span = grad_beta_.span();
 
             // 计算梯度
             auto batch_indices = std::views::iota(std::size_t{0}, batch_size);
             
             if (batch_size >= SmartPolicy::PARALLEL_THRESHOLD) {
                 SmartPolicy::for_each(batch_indices.begin(), batch_indices.end(),
-                    [go_ptr, norm_ptr, std_ptr, gamma_ptr, gi_ptr, gg_ptr, gb_ptr,
+                    [go_span, norm_span, std_span, gamma_span, gi_span, gg_span, gb_span,
                      features, batch_size](std::size_t b) noexcept
                     {
-                        double std_inv = std_ptr[b];
+                        double std_inv = std_span[b];
                         
                         // 预计算统计量：O(N) 而非 O(N²)
                         double sum_grad = 0.0;
                         double sum_grad_norm = 0.0;
                         for (std::size_t f = 0; f < features; ++f) {
-                            double g = go_ptr[f * batch_size + b] * gamma_ptr[f];
+                            double g = go_span[f * batch_size + b] * gamma_span[f];
                             sum_grad += g;
-                            sum_grad_norm += g * norm_ptr[f * batch_size + b];
+                            sum_grad_norm += g * norm_span[f * batch_size + b];
                         }
 
                         // 单次遍历：同时计算 dL/dγ、dL/dβ、dL/dx
                         const double inv_features = 1.0 / static_cast<double>(features);
                         for (std::size_t f = 0; f < features; ++f) {
-                            double grad_out = go_ptr[f * batch_size + b];
-                            double g = grad_out * gamma_ptr[f];
-                            gg_ptr[f] += grad_out * norm_ptr[f * batch_size + b];
-                            gb_ptr[f] += grad_out;
-                            gi_ptr[f * batch_size + b] = (g - sum_grad * inv_features -
-                                   norm_ptr[f * batch_size + b] * sum_grad_norm * inv_features) * std_inv;
+                            double grad_out = go_span[f * batch_size + b];
+                            double g = grad_out * gamma_span[f];
+                            gg_span[f] += grad_out * norm_span[f * batch_size + b];
+                            gb_span[f] += grad_out;
+                            gi_span[f * batch_size + b] = (g - sum_grad * inv_features -
+                                   norm_span[f * batch_size + b] * sum_grad_norm * inv_features) * std_inv;
                         }
                     });
             } else {
                 for (std::size_t b = 0; b < batch_size; ++b) {
-                    double std_inv = std_ptr[b];
+                    double std_inv = std_span[b];
                     
                     // 预计算统计量：O(N) 而非 O(N²)
                     double sum_grad = 0.0;
                     double sum_grad_norm = 0.0;
                     for (std::size_t f = 0; f < features; ++f) {
-                        double g = go_ptr[f * batch_size + b] * gamma_ptr[f];
+                        double g = go_span[f * batch_size + b] * gamma_span[f];
                         sum_grad += g;
-                        sum_grad_norm += g * norm_ptr[f * batch_size + b];
+                        sum_grad_norm += g * norm_span[f * batch_size + b];
                     }
 
                     // 单次遍历：同时计算 dL/dγ、dL/dβ、dL/dx
                     const double inv_features = 1.0 / static_cast<double>(features);
                     for (std::size_t f = 0; f < features; ++f) {
-                        double grad_out = go_ptr[f * batch_size + b];
-                        double g = grad_out * gamma_ptr[f];
-                        gg_ptr[f] += grad_out * norm_ptr[f * batch_size + b];
-                        gb_ptr[f] += grad_out;
-                        gi_ptr[f * batch_size + b] = (g - sum_grad * inv_features -
-                               norm_ptr[f * batch_size + b] * sum_grad_norm * inv_features) * std_inv;
+                        double grad_out = go_span[f * batch_size + b];
+                        double g = grad_out * gamma_span[f];
+                        gg_span[f] += grad_out * norm_span[f * batch_size + b];
+                        gb_span[f] += grad_out;
+                        gi_span[f * batch_size + b] = (g - sum_grad * inv_features -
+                               norm_span[f * batch_size + b] * sum_grad_norm * inv_features) * std_inv;
                     }
                 }
             }
@@ -519,19 +520,19 @@ namespace nn
             output_cache_.resize(rows, cols);
 
             Matrix result(rows, cols);
-            const double *in_ptr = input.data_ptr();
-            double *out_ptr = result.data_ptr();
-            double *cache_ptr = output_cache_.data_ptr();
+            const auto in_span = input.span();
+            auto out_span = result.span();
+            auto cache_span = output_cache_.span();
 
             auto row_indices = std::views::iota(std::size_t{0}, rows);
             const std::size_t total = rows * cols;
 
-            auto process_row = [in_ptr, out_ptr, cache_ptr, cols](std::size_t r) noexcept
+            auto process_row = [in_span, out_span, cache_span, cols](std::size_t r) noexcept
             {
                 const std::size_t offset = r * cols;
-                const double *row_in = in_ptr + offset;
-                double *row_out = out_ptr + offset;
-                double *row_cache = cache_ptr + offset;
+                const auto row_in = in_span.subspan(offset, cols);
+                auto row_out = out_span.subspan(offset, cols);
+                auto row_cache = cache_span.subspan(offset, cols);
 
                 // 数值稳定：减去行内最大值
                 double max_val = row_in[0];
@@ -576,19 +577,19 @@ namespace nn
 
             Matrix grad_input(rows, cols);
 
-            const double *go_ptr = grad_output.data_ptr();
-            const double *out_ptr = output_cache_.data_ptr();
-            double *gi_ptr = grad_input.data_ptr();
+            const auto go_span = grad_output.span();
+            const auto out_span = output_cache_.span();
+            auto gi_span = grad_input.span();
 
             auto row_indices = std::views::iota(std::size_t{0}, rows);
             const std::size_t total = rows * cols;
 
-            auto process_row = [go_ptr, out_ptr, gi_ptr, cols](std::size_t r) noexcept
+            auto process_row = [go_span, out_span, gi_span, cols](std::size_t r) noexcept
             {
                 const std::size_t offset = r * cols;
-                const double *row_go = go_ptr + offset;
-                const double *row_out = out_ptr + offset;
-                double *row_gi = gi_ptr + offset;
+                const auto row_go = go_span.subspan(offset, cols);
+                const auto row_out = out_span.subspan(offset, cols);
+                auto row_gi = gi_span.subspan(offset, cols);
 
                 // dot = Σ_k out[k] * grad_out[k]
                 double dot = 0.0;
@@ -657,10 +658,10 @@ namespace nn
         {
             const std::size_t cols = src.cols();
             dst.resize(row_count, cols);
-            const double *src_ptr = src.data_ptr();
-            double *dst_ptr = dst.data_ptr();
+            const auto src_span = src.span();
+            auto dst_span = dst.span();
             for (std::size_t r = 0; r < row_count; ++r)
-                std::copy_n(src_ptr + (row_start + r) * cols, cols, dst_ptr + r * cols);
+                std::copy_n(src_span.begin() + (row_start + r) * cols, cols, dst_span.begin() + r * cols);
         }
 
         // ── 将 src 写入 dst 的指定行范围 ────────────────────────────────
@@ -669,27 +670,27 @@ namespace nn
         {
             const std::size_t row_count = src.rows();
             const std::size_t cols = src.cols();
-            double *dst_ptr = dst.data_ptr();
-            const double *src_ptr = src.data_ptr();
+            auto dst_span = dst.span();
+            const auto src_span = src.span();
             for (std::size_t r = 0; r < row_count; ++r)
-                std::copy_n(src_ptr + r * cols, cols, dst_ptr + (row_start + r) * cols);
+                std::copy_n(src_span.begin() + r * cols, cols, dst_span.begin() + (row_start + r) * cols);
         }
 
         // ── 逐元素缩放 ──────────────────────────────────────────────────
         static void scale_inplace(Matrix &m, double s)
         {
-            double *ptr = m.data_ptr();
+            auto m_span = m.span();
             const auto n = m.size();
             if (n >= SmartPolicy::PARALLEL_THRESHOLD)
             {
                 auto indices = std::views::iota(std::size_t{0}, n);
                 SmartPolicy::for_each(indices.begin(), indices.end(),
-                    [ptr, s](std::size_t i) noexcept { ptr[i] *= s; });
+                    [m_span, s](std::size_t i) noexcept { m_span[i] *= s; });
             }
             else
             {
                 for (std::size_t i = 0; i < n; ++i)
-                    ptr[i] *= s;
+                    m_span[i] *= s;
             }
         }
 
@@ -797,10 +798,9 @@ namespace nn
             Matrix grad_K_all(d_model_, seq_len);
             Matrix grad_V_all(d_model_, seq_len);
             {
-                const auto n = static_cast<long long>(d_model_ * seq_len);
-                std::fill(grad_Q_all.data_ptr(), grad_Q_all.data_ptr() + n, 0.0);
-                std::fill(grad_K_all.data_ptr(), grad_K_all.data_ptr() + n, 0.0);
-                std::fill(grad_V_all.data_ptr(), grad_V_all.data_ptr() + n, 0.0);
+                grad_Q_all.zero();
+                grad_K_all.zero();
+                grad_V_all.zero();
             }
 
             // ── 3. 逐头计算注意力反向 ────────────────────────────────────
@@ -828,18 +828,18 @@ namespace nn
                 // grad_S_h = A_h ⊙ (grad_A_h - row_sum(A_h ⊙ grad_A_h))
                 grad_scores_buf_.resize(seq_len, seq_len);
                 {
-                    const double *a_ptr = A_h.data_ptr();
-                    const double *ga_ptr = grad_A_buf_.data_ptr();
-                    double *gs_ptr = grad_scores_buf_.data_ptr();
+                    const auto a_span = A_h.span();
+                    const auto ga_span = grad_A_buf_.span();
+                    auto gs_span = grad_scores_buf_.span();
 
                     for (std::size_t i = 0; i < seq_len; ++i)
                     {
                         double dot = 0.0;
                         for (std::size_t j = 0; j < seq_len; ++j)
-                            dot += a_ptr[i * seq_len + j] * ga_ptr[i * seq_len + j];
+                            dot += a_span[i * seq_len + j] * ga_span[i * seq_len + j];
                         for (std::size_t j = 0; j < seq_len; ++j)
-                            gs_ptr[i * seq_len + j] =
-                                a_ptr[i * seq_len + j] * (ga_ptr[i * seq_len + j] - dot);
+                            gs_span[i * seq_len + j] =
+                                a_span[i * seq_len + j] * (ga_span[i * seq_len + j] - dot);
                     }
                 }
 
@@ -899,21 +899,21 @@ namespace nn
             for (std::size_t i = 0; i < half; ++i)
                 freqs[i] = 1.0 / std::pow(10000.0, static_cast<double>(2 * i) / d_model);
 
-            double *e_ptr = encoding_.data_ptr();
+            auto e_span = encoding_.span();
             for (std::size_t pos = 0; pos < max_len; ++pos)
             {
                 const double pos_d = static_cast<double>(pos);
                 for (std::size_t i = 0; i < half; ++i)
                 {
                     const double angle = pos_d * freqs[i];
-                    e_ptr[(2 * i)       * max_len + pos] = std::sin(angle);
-                    e_ptr[(2 * i + 1)   * max_len + pos] = std::cos(angle);
+                    e_span[(2 * i)       * max_len + pos] = std::sin(angle);
+                    e_span[(2 * i + 1)   * max_len + pos] = std::cos(angle);
                 }
                 // 奇数维度：最后一个特征仅使用 sin
                 if (d_model % 2 == 1)
                 {
                     const double angle = pos_d * freqs[half];
-                    e_ptr[(d_model - 1) * max_len + pos] = std::sin(angle);
+                    e_span[(d_model - 1) * max_len + pos] = std::sin(angle);
                 }
             }
         }
@@ -933,20 +933,20 @@ namespace nn
 
             // result = input + encoding[:, 0:seq_len]
             Matrix result(d_model_, seq_len);
-            const double *in_ptr = input.data_ptr();
-            const double *e_ptr = encoding_.data_ptr();
-            double *out_ptr = result.data_ptr();
+            const auto in_span = input.span();
+            const auto e_span = encoding_.span();
+            auto out_span = result.span();
 
             const auto total = static_cast<std::size_t>(d_model_ * seq_len);
             const std::size_t max_len = max_len_;
             auto indices = std::views::iota(std::size_t{0}, total);
             SmartPolicy::for_each(indices.begin(), indices.end(),
-                [in_ptr, e_ptr, out_ptr, seq_len, max_len](std::size_t idx) noexcept
+                [in_span, e_span, out_span, seq_len, max_len](std::size_t idx) noexcept
                 {
                     // idx = row * seq_len + col
                     const std::size_t row = idx / seq_len;
                     const std::size_t col = idx % seq_len;
-                    out_ptr[idx] = in_ptr[idx] + e_ptr[row * max_len + col];
+                    out_span[idx] = in_span[idx] + e_span[row * max_len + col];
                 });
 
             return result;

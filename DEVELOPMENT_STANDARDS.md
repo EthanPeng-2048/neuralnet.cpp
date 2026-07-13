@@ -100,7 +100,22 @@ void process(std::span<const double> data);
 void process(const double* data, std::size_t size);
 ```
 
-#### 2.4 预分配缓冲区模式
+#### 2.4 使用 std::span 访问矩阵数据
+```cpp
+// ✅ 推荐：使用 span() 访问矩阵数据（C++20 零开销抽象）
+auto data = matrix.span();          // std::span<double>
+auto cdata = const_matrix.span();   // std::span<const double>
+
+// 在 lambda 中捕获 span（类型安全，编译期大小检查）
+auto func = [data](std::size_t i) noexcept {
+    return data[i] * 2.0;
+};
+
+// ❌ 避免：使用已废弃的 data_ptr()
+double* ptr = matrix.data_ptr();  // [[deprecated]]
+```
+
+#### 2.5 预分配缓冲区模式
 ```cpp
 // ✅ 推荐：预分配并在就地操作
 void multiply_to(Matrix& result, const Matrix& other) const {
@@ -123,7 +138,7 @@ void multiply_to(Matrix& result, const Matrix& other) const {
 - [ ] 是否有 `new` / `delete` 操作？
 - [ ] 是否使用 `std::vector` 替代动态数组？
 - [ ] 是否使用 `std::unique_ptr` 管理多态对象？
-- [ ] 是否使用 `std::span` 传递只读连续数据？
+- [ ] 是否使用 `std::span` 替代裸指针访问连续数据？
 - [ ] 热路径中是否预分配缓冲区？
 
 ---
@@ -382,6 +397,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 | 特性 | 标准 | 用途 |
 |------|------|------|
+| `std::span` | C++20 | 非拥有型连续内存视图，替代裸指针 |
 | `std::ranges` | C++20 | 数据处理管道（如 `ranges::generate` Xavier 初始化） |
 | `std::views::iota` | C++20 | 延迟整数序列（并行索引生成） |
 | `std::views::zip` | C++20 | 多范围并行迭代（优化器参数更新） |
