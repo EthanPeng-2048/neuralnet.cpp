@@ -225,12 +225,12 @@ namespace nn
         // QuickGeLU: x * sigmoid(1.702 * x)
         Matrix forward(const Matrix &input) override
         {
+            const auto n = static_cast<long long>(input.size());
             input_cache_ = input;
-            sigmoid_cache_ = Matrix(input.rows(), input.cols());
+            sigmoid_cache_.resize(input.rows(), input.cols());
 
             const double *in_ptr = input.data_ptr();
             double *sig_ptr = sigmoid_cache_.data_ptr();
-            const auto n = static_cast<long long>(input.size());
 
             Matrix result(input.rows(), input.cols());
             double *out_ptr = result.data_ptr();
@@ -342,10 +342,10 @@ namespace nn
             const std::size_t batch_size = input.cols();
             const std::size_t features = input.rows();
 
-            // 缓存中间结果
-            mean_cache_ = Matrix(1, batch_size);
-            std_cache_ = Matrix(1, batch_size);
-            normalized_cache_ = Matrix(features, batch_size);
+            // 缓存中间结果（复用已有内存）
+            mean_cache_.resize(1, batch_size);
+            std_cache_.resize(1, batch_size);
+            normalized_cache_.resize(features, batch_size);
 
             Matrix result(features, batch_size);
 
@@ -448,67 +448,48 @@ namespace nn
                     {
                         double std_inv = std_ptr[b];
                         
-                        // 计算 dL/dγ 和 dL/dβ
+                        // 预计算统计量：O(N) 而非 O(N²)
+                        double sum_grad = 0.0;
+                        double sum_grad_norm = 0.0;
                         for (std::size_t f = 0; f < features; ++f) {
-                            double grad_out = go_ptr[f * batch_size + b];
-                            gg_ptr[f] += grad_out * norm_ptr[f * batch_size + b];
-                            gb_ptr[f] += grad_out;
+                            double g = go_ptr[f * batch_size + b] * gamma_ptr[f];
+                            sum_grad += g;
+                            sum_grad_norm += g * norm_ptr[f * batch_size + b];
                         }
 
-                        // 计算 dL/dx
-                        // 首先计算 dL/d(归一化值)
+                        // 单次遍历：同时计算 dL/dγ、dL/dβ、dL/dx
+                        const double inv_features = 1.0 / static_cast<double>(features);
                         for (std::size_t f = 0; f < features; ++f) {
-                            double grad_norm = go_ptr[f * batch_size + b] * gamma_ptr[f];
-                            
-                            // 使用简化公式：对于LayerNorm，反向传播可以简化为
-                            // dx = (1/N) * std_inv * (N * grad_out - sum(grad_out) - x_norm * sum(grad_out * x_norm))
-                            // 但这里我们使用更直接的方法
-                            
-                            // 计算该样本的统计量
-                            double sum_grad = 0.0;
-                            double sum_grad_norm = 0.0;
-                            for (std::size_t k = 0; k < features; ++k) {
-                                double g = go_ptr[k * batch_size + b] * gamma_ptr[k];
-                                sum_grad += g;
-                                sum_grad_norm += g * norm_ptr[k * batch_size + b];
-                            }
-
-                            // 计算梯度
-                            double grad_x = (grad_norm - sum_grad / static_cast<double>(features) - 
-                                           norm_ptr[f * batch_size + b] * sum_grad_norm / static_cast<double>(features)) * std_inv;
-                            
-                            gi_ptr[f * batch_size + b] = grad_x;
+                            double grad_out = go_ptr[f * batch_size + b];
+                            double g = grad_out * gamma_ptr[f];
+                            gg_ptr[f] += grad_out * norm_ptr[f * batch_size + b];
+                            gb_ptr[f] += grad_out;
+                            gi_ptr[f * batch_size + b] = (g - sum_grad * inv_features -
+                                   norm_ptr[f * batch_size + b] * sum_grad_norm * inv_features) * std_inv;
                         }
                     });
             } else {
                 for (std::size_t b = 0; b < batch_size; ++b) {
                     double std_inv = std_ptr[b];
                     
-                    // 计算 dL/dγ 和 dL/dβ
+                    // 预计算统计量：O(N) 而非 O(N²)
+                    double sum_grad = 0.0;
+                    double sum_grad_norm = 0.0;
                     for (std::size_t f = 0; f < features; ++f) {
-                        double grad_out = go_ptr[f * batch_size + b];
-                        gg_ptr[f] += grad_out * norm_ptr[f * batch_size + b];
-                        gb_ptr[f] += grad_out;
+                        double g = go_ptr[f * batch_size + b] * gamma_ptr[f];
+                        sum_grad += g;
+                        sum_grad_norm += g * norm_ptr[f * batch_size + b];
                     }
 
-                    // 计算 dL/dx
+                    // 单次遍历：同时计算 dL/dγ、dL/dβ、dL/dx
+                    const double inv_features = 1.0 / static_cast<double>(features);
                     for (std::size_t f = 0; f < features; ++f) {
-                        double grad_norm = go_ptr[f * batch_size + b] * gamma_ptr[f];
-                        
-                        // 计算该样本的统计量
-                        double sum_grad = 0.0;
-                        double sum_grad_norm = 0.0;
-                        for (std::size_t k = 0; k < features; ++k) {
-                            double g = go_ptr[k * batch_size + b] * gamma_ptr[k];
-                            sum_grad += g;
-                            sum_grad_norm += g * norm_ptr[k * batch_size + b];
-                        }
-
-                        // 计算梯度
-                        double grad_x = (grad_norm - sum_grad / static_cast<double>(features) - 
-                                       norm_ptr[f * batch_size + b] * sum_grad_norm / static_cast<double>(features)) * std_inv;
-                        
-                        gi_ptr[f * batch_size + b] = grad_x;
+                        double grad_out = go_ptr[f * batch_size + b];
+                        double g = grad_out * gamma_ptr[f];
+                        gg_ptr[f] += grad_out * norm_ptr[f * batch_size + b];
+                        gb_ptr[f] += grad_out;
+                        gi_ptr[f * batch_size + b] = (g - sum_grad * inv_features -
+                               norm_ptr[f * batch_size + b] * sum_grad_norm * inv_features) * std_inv;
                     }
                 }
             }
