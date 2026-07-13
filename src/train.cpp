@@ -365,12 +365,12 @@ int main(int argc, char *argv[])
 
                 // ── 行优先 memcpy 提取 batch（比逐列复制更缓存友好） ─────
                 for (std::size_t r = 0; r < train_x.rows(); ++r)
-                    std::memcpy(x_batch.data_ptr() + r * cfg.batch_size,
-                                train_x.data_ptr() + r * train_x.cols() + start,
+                    std::memcpy(x_batch.span().data() + r * cfg.batch_size,
+                                train_x.span().data() + r * train_x.cols() + start,
                                 cfg.batch_size * sizeof(double));
                 for (std::size_t r = 0; r < train_y.rows(); ++r)
-                    std::memcpy(y_batch.data_ptr() + r * cfg.batch_size,
-                                train_y.data_ptr() + r * train_y.cols() + start,
+                    std::memcpy(y_batch.span().data() + r * cfg.batch_size,
+                                train_y.span().data() + r * train_y.cols() + start,
                                 cfg.batch_size * sizeof(double));
 
                 auto out = model.forward(x_batch);

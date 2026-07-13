@@ -10,6 +10,7 @@
 #include <numeric>
 #include <random>
 #include <ranges>
+#include <span>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -71,8 +72,15 @@ namespace nn
             data_.resize(rows * cols);
         }
 
-        // ── 原始指针访问（供 SIMD / 内核使用） ────────────────────────────
+        // ── std::span 访问（C++20 现代接口，推荐使用） ────────────────────
+        // 零开销抽象：编译后等价于裸指针 + 大小，可替代所有 data_ptr() 场景
+        [[nodiscard]] std::span<const double> span() const noexcept { return {data_.data(), data_.size()}; }
+        [[nodiscard]] std::span<double> span() noexcept { return {data_.data(), data_.size()}; }
+
+        // ── 原始指针访问（仅供需要指针算术的分块算法内部使用） ────────────
+        [[deprecated("use span() instead for safer access")]]
         [[nodiscard]] const double *data_ptr() const noexcept { return data_.data(); }
+        [[deprecated("use span() instead for safer access")]]
         [[nodiscard]] double *data_ptr() noexcept { return data_.data(); }
 
         // 访问器
@@ -160,8 +168,8 @@ namespace nn
             result.resize(cols_, rows_);
             if (rows_ == 0 || cols_ == 0) return;
 
-            const auto *src = data_ptr();
-            auto *dst = result.data_ptr();
+            const auto src = span();
+            auto dst = result.span();
             const std::size_t R = rows_;
             const std::size_t C = cols_;
 
@@ -240,7 +248,7 @@ namespace nn
         }
 
         // ── 矩阵乘法到预分配缓冲区（零分配热路径） ─────────────────────────
-        // 使用原始指针 + restrict 提示，帮助编译器自动向量化
+        // 使用 std::span（C++20）提供类型安全的非拥有视图
         void multiply_to(Matrix &result, const Matrix &other) const
         {
             assert(&result != this && "multiply_to: self-referencing not supported");
@@ -253,11 +261,10 @@ namespace nn
             // 清零结果矩阵（使用 RAII 封装的方法）
             result.zero();
 
-            // 非拥有型原始指针：从 std::vector 借出，仅供热循环内指针运算。
-            // 所有权由 data_ 成员管理，生命周期由 multiply_to 调用栈保证。
-            const double *a_ptr = data_ptr();
-            const double *b_ptr = other.data_ptr();
-            double * const r_ptr = result.data_ptr();
+            // std::span 非拥有视图：从 std::vector 借出，生命周期由调用栈保证
+            const auto a = span();
+            const auto b = other.span();
+            auto r = result.span();
 
             const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -278,11 +285,11 @@ namespace nn
                     std::array<double, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                     for (std::size_t jj = 0; jj < j_len; ++jj)
                         for (std::size_t kk = 0; kk < k_len; ++kk)
-                            b_block[jj * k_len + kk] = b_ptr[(k_start + kk) * N + (j_start + jj)];
+                            b_block[jj * k_len + kk] = b[(k_start + kk) * N + (j_start + jj)];
                     for (std::size_t i = i_start; i < i_end; ++i)
                     {
-                        const double *a_row = a_ptr + i * K + k_start;
-                        double *r_row = r_ptr + i * N + j_start;
+                        const auto a_row = a.subspan(i * K + k_start);
+                        auto r_row = r.subspan(i * N + j_start);
                         for (std::size_t j = 0; j < j_len; ++j)
                         {
                             const double *b_col = b_block.data() + j * k_len;
@@ -299,7 +306,7 @@ namespace nn
                 auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
                 global_thread_pool().parallel_for_blocks(
                     block_indices.begin(), block_indices.end(),
-                    [a_ptr, b_ptr, r_ptr, M, N, K, j_blocks](std::size_t block_idx) noexcept
+                    [a, b, r, M, N, K, j_blocks](std::size_t block_idx) noexcept
                     {
                         const std::size_t i_block = block_idx / j_blocks;
                         const std::size_t j_block = block_idx % j_blocks;
@@ -317,12 +324,12 @@ namespace nn
                             std::array<double, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                             for (std::size_t jj = 0; jj < j_len; ++jj)
                                 for (std::size_t kk = 0; kk < k_len; ++kk)
-                                    b_block[jj * k_len + kk] = b_ptr[(k_start + kk) * N + (j_start + jj)];
+                                    b_block[jj * k_len + kk] = b[(k_start + kk) * N + (j_start + jj)];
 
                             for (std::size_t i = i_start; i < i_end; ++i)
                             {
-                                const double *a_row = a_ptr + i * K + k_start;
-                                double *r_row = r_ptr + i * N + j_start;
+                                const auto a_row = a.subspan(i * K + k_start);
+                                auto r_row = r.subspan(i * N + j_start);
                                 for (std::size_t j = 0; j < j_len; ++j)
                                 {
                                     const double *b_col = b_block.data() + j * k_len;
