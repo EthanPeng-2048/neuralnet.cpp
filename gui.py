@@ -144,6 +144,12 @@ class NeuralNetGUI(tk.Tk):
         opt_combo = ttk.Combobox(param_frame, textvariable=self.train_opt_var, width=14, state="readonly",
                                  values=["sgd", "sgd_w_momentum", "adam"])
         opt_combo.grid(row=1, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(param_frame, text="模型类型:").grid(row=1, column=2, sticky="w", pady=(6, 0))
+        self.train_model_type_var = tk.StringVar(value="mlp")
+        model_type_combo = ttk.Combobox(param_frame, textvariable=self.train_model_type_var, width=14, state="readonly",
+                                        values=["mlp", "transformer"])
+        model_type_combo.grid(row=1, column=3, sticky="w", pady=(6, 0))
         row += 1
 
         # 按钮
@@ -201,7 +207,8 @@ class NeuralNetGUI(tk.Tk):
                "--epochs", str(self.train_epochs_var.get()),
                "--lr", str(self.train_lr_var.get()),
                "--batch-size", str(self.train_batch_var.get()),
-               "--optimizer", self.train_opt_var.get()]
+               "--optimizer", self.train_opt_var.get(),
+               "--model-type", self.train_model_type_var.get()]
         if self.train_resume_var.get():
             cmd += ["--resume", self.train_resume_path_var.get()]
 
@@ -249,7 +256,7 @@ class NeuralNetGUI(tk.Tk):
         ttk.Button(f, text="浏览…", command=self._browse_input).grid(row=row, column=2)
         row += 1
 
-        # Top-K
+        # Top-K + 模型类型
         param_frame = ttk.Frame(f)
         param_frame.grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
         row += 1
@@ -257,6 +264,12 @@ class NeuralNetGUI(tk.Tk):
         self.infer_topk_var = tk.IntVar(value=3)
         ttk.Spinbox(param_frame, from_=1, to=10, width=4,
                      textvariable=self.infer_topk_var).pack(side="left", padx=4)
+        ttk.Label(param_frame, text="  模型类型:").pack(side="left")
+        self.infer_model_type_var = tk.StringVar(value="mlp")
+        infer_model_type_combo = ttk.Combobox(param_frame, textvariable=self.infer_model_type_var,
+                                               width=12, state="readonly",
+                                               values=["mlp", "transformer"])
+        infer_model_type_combo.pack(side="left", padx=4)
         row += 1
 
         # 按钮
@@ -421,6 +434,7 @@ class NeuralNetGUI(tk.Tk):
 
         cmd = [exe, tmp.name,
                "--model", self.infer_model_var.get(),
+               "--model-type", self.infer_model_type_var.get(),
                "--topk", str(self.infer_topk_var.get())]
 
         self._log_infer(f"[手写识别] $ {' '.join(cmd)}\n")
@@ -461,6 +475,7 @@ class NeuralNetGUI(tk.Tk):
 
         cmd = [exe, input_path,
                "--model", self.infer_model_var.get(),
+               "--model-type", self.infer_model_type_var.get(),
                "--topk", str(self.infer_topk_var.get())]
 
         self._log_infer(f"$ {' '.join(cmd)}\n")
