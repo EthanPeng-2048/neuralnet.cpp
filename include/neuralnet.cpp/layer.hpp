@@ -13,8 +13,8 @@
 #include <utility>
 #include <vector>
 
-#include <neuralnet.cpp/matrix.hpp>
-#include <neuralnet.cpp/nn_config.hpp>
+#include "matrix.hpp"
+#include "nn_config.hpp"
 
 namespace nn
 {

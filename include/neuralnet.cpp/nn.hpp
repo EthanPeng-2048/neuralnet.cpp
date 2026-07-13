@@ -5,11 +5,12 @@
 #include <stdexcept>
 #include <vector>
 
-#include <neuralnet.cpp/nn_config.hpp>
-#include <neuralnet.cpp/layer.hpp>
-#include <neuralnet.cpp/loss.hpp>
-#include <neuralnet.cpp/model.hpp>
-#include <neuralnet.cpp/optimizer.hpp>
+#include "nn_config.hpp"
+#include "layer.hpp"
+#include "loss.hpp"
+#include "model.hpp"
+#include "optimizer.hpp"
+#include "mnist_common.hpp"
 
 namespace nn
 {
