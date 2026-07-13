@@ -24,6 +24,7 @@ void print_usage(const char *prog)
         << "MNIST 手写数字训练程序\n\n"
         << "用法: " << prog << " [选项]\n\n"
         << "选项:\n"
+        << "  --model-type <t>  模型类型: mlp/transformer (默认: mlp)\n"
         << "  --resume <path>    从已有模型恢复训练\n"
         << "  --save <path>      模型保存路径 (默认: mnist_model.bin)\n"
         << "  --dataset <path>   数据集目录 (默认: datasets/mnist_data)\n"
@@ -41,6 +42,7 @@ struct TrainConfig
     std::string dataset_path = "datasets/mnist_data";
     std::string resume_path;
     std::string optimizer_name = "adam";
+    std::string model_type = "mlp";
     int epochs = 10;  // 增加训练轮数
     double lr = 0.001;  // 调整学习率
     std::size_t batch_size = 64;
@@ -98,6 +100,16 @@ TrainConfig parse_args(int argc, char *argv[])
                 std::exit(1);
             }
         }
+        else if (arg == "--model-type" && i + 1 < argc)
+        {
+            cfg.model_type = argv[++i];
+            if (cfg.model_type != "mlp" && cfg.model_type != "transformer")
+            {
+                std::cerr << "未知模型类型: " << cfg.model_type
+                          << "，可选: mlp, transformer\n";
+                std::exit(1);
+            }
+        }
         else
         {
             std::cerr << "未知参数: " << arg << "\n使用 --help 查看用法\n";
@@ -107,44 +119,101 @@ TrainConfig parse_args(int argc, char *argv[])
     return cfg;
 }
 
-// ==================== 数据加载 ====================
+// ==================== 数据加载（优化版） ====================
+// 优化策略：
+//   1. 整文件一次性读入内存，避免逐行 I/O 开销
+//   2. 使用 std::from_chars (C++17) 替代 std::stod，无临时 string 分配
+//   3. 向量预分配 reserve()，避免多次扩容拷贝
+//   4. 直接指针遍历 buffer，省去 std::stringstream 开销
 std::pair<nn::Matrix, nn::Matrix> load_csv(const std::string &filename, int max_samples = -1)
 {
-    std::ifstream file(filename);
+    // ── 1. 整文件读入 ──────────────────────────────────────────────
+    std::ifstream file(filename, std::ios::binary | std::ios::ate);
     if (!file.is_open())
         throw std::runtime_error("Cannot open file: " + filename);
 
-    std::vector<double> features;
-    std::vector<int> labels;
-    std::string line;
+    const auto file_size = file.tellg();
+    file.seekg(0);
 
-    while (std::getline(file, line))
-    {
-        std::stringstream ss(line);
-        std::string token;
-        int label;
-        std::getline(ss, token, ',');
-        label = std::stoi(token);
-        labels.push_back(label);
+    std::string buffer(static_cast<std::size_t>(file_size), '\0');
+    file.read(buffer.data(), file_size);
+    file.close();
 
-        while (std::getline(ss, token, ','))
-        {
-            features.push_back(std::stod(token)); // 数据已由 ToTensor() 归一化到 [0,1]
-        }
-    }
-
-    std::size_t N = labels.size();
-    if (N == 0)
+    // ── 2. 预扫描行数以预分配向量 ──────────────────────────────────
+    std::size_t row_count = 0;
+    for (char c : buffer)
+        if (c == '\n') ++row_count;
+    if (row_count == 0)
         throw std::runtime_error("CSV file is empty or malformed: " + filename);
-    std::size_t feat_dim = features.size() / N; // 784
 
-    if (max_samples > 0 && static_cast<std::size_t>(max_samples) < N)
+    if (max_samples > 0 && static_cast<std::size_t>(max_samples) < row_count)
+        row_count = static_cast<std::size_t>(max_samples);
+
+    // ── 3. 解析：使用 from_chars 直接从 buffer 读取数值 ───────────
+    const char *ptr = buffer.data();
+    const char *end = buffer.data() + buffer.size();
+
+    // 先解析第一行确定 feat_dim
+    int first_label = 0;
+    std::size_t feat_dim = 0;
     {
-        N = max_samples;
-        features.resize(N * feat_dim);
-        labels.resize(N);
+        // 跳过首行用于计数列数
+        const char *p = ptr;
+        auto [p1, ec1] = std::from_chars(p, end, first_label);
+        p = p1;
+        std::size_t cnt = 0;
+        while (p < end && *p != '\n' && *p != '\r')
+        {
+            if (*p == ',')
+            {
+                ++cnt;
+                double tmp;
+                auto [p2, ec2] = std::from_chars(p + 1, end, tmp);
+                p = p2;
+            }
+            else
+                ++p;
+        }
+        feat_dim = cnt;  // 标签后的逗号数 = 特征数
     }
 
+    std::vector<double> features(row_count * feat_dim);
+    std::vector<int>    labels(row_count);
+
+    std::size_t row = 0;
+    ptr = buffer.data();  // 重置指针
+
+    while (ptr < end && row < row_count)
+    {
+        // 解析标签
+        auto [p_label, ec_label] = std::from_chars(ptr, end, labels[row]);
+        if (ec_label != std::errc{})
+            throw std::runtime_error("Failed to parse label at row " + std::to_string(row));
+        ptr = p_label;
+
+        // 解析特征
+        for (std::size_t j = 0; j < feat_dim; ++j)
+        {
+            // 跳过逗号
+            if (ptr < end && *ptr == ',') ++ptr;
+
+            double val;
+            auto [p_feat, ec_feat] = std::from_chars(ptr, end, val);
+            if (ec_feat != std::errc{})
+                throw std::runtime_error("Failed to parse feature at row " + std::to_string(row));
+            features[row * feat_dim + j] = val;
+            ptr = p_feat;
+        }
+
+        // 跳过行尾 (\r\n 或 \n)
+        while (ptr < end && (*ptr == '\r' || *ptr == '\n')) ++ptr;
+        ++row;
+    }
+
+    // 实际读取的行数可能少于预扫描（例如文件末尾空行）
+    std::size_t N = row;
+
+    // ── 4. 直接写入矩阵（列优先，逐行填充） ──────────────────────
     // 特征矩阵：形状 (feat_dim, N)
     nn::Matrix feat_mat(feat_dim, N);
     for (std::size_t i = 0; i < N; ++i)
@@ -161,7 +230,7 @@ std::pair<nn::Matrix, nn::Matrix> load_csv(const std::string &filename, int max_
     {
         int lbl = labels[i];
         if (lbl < 0 || lbl >= 10)
-            throw std::out_of_range("Label out of range");
+            throw std::out_of_range("Label out of range: " + std::to_string(lbl));
         label_mat.set_value_unchecked(lbl, i, 1.0);
     }
 
@@ -216,17 +285,29 @@ int main(int argc, char *argv[])
         std::cout << "========================================\n";
         std::cout << "  MNIST 手写数字训练\n";
         std::cout << "========================================\n";
-        // 动态显示网络架构
-        std::cout << "  网络: ";
-        for (std::size_t i = 0; i < nn::MNIST_LAYER_DIMS.size(); ++i)
+        std::cout << "  模型类型: " << cfg.model_type << "\n";
+        if (cfg.model_type == "mlp")
         {
-            std::cout << nn::MNIST_LAYER_DIMS[i];
-            if (i < nn::MNIST_LAYER_DIMS.size() - 2)
-                std::cout << "(LayerNorm+GeLU)";
-            if (i < nn::MNIST_LAYER_DIMS.size() - 1)
-                std::cout << " -> ";
+            std::cout << "  网络: ";
+            for (std::size_t i = 0; i < nn::MNIST_LAYER_DIMS.size(); ++i)
+            {
+                std::cout << nn::MNIST_LAYER_DIMS[i];
+                if (i < nn::MNIST_LAYER_DIMS.size() - 2)
+                    std::cout << "(LayerNorm+GeLU)";
+                if (i < nn::MNIST_LAYER_DIMS.size() - 1)
+                    std::cout << " -> ";
+            }
+            std::cout << "\n";
         }
-        std::cout << "\n";
+        else
+        {
+            std::cout << "  网络: PatchEmbedding(7×7) -> TransformerEncoder("
+                      << nn::TRANSFORMER_NUM_LAYERS << "层, d="
+                      << nn::TRANSFORMER_D_MODEL << ", heads="
+                      << nn::TRANSFORMER_NUM_HEADS << ") -> Linear("
+                      << nn::TRANSFORMER_D_MODEL << "→"
+                      << nn::MNIST_NUM_CLASSES << ")\n";
+        }
         std::cout << "  优化器: " << cfg.optimizer_name << "  学习率: " << cfg.lr << "\n";
         std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
         std::cout << "  模型: " << (cfg.load_existing ? cfg.resume_path : "(从头训练)")
@@ -240,7 +321,7 @@ int main(int argc, char *argv[])
         std::cout << "训练集: " << train_x.cols() << " 样本, 测试集: " << test_x.cols() << " 样本\n" << std::endl;
 
         // ── 构建模型 ─────────────────────────────────────────────
-        auto model = nn::build_mnist_model();
+        auto model = nn::build_mnist_model(cfg.model_type);
 
         if (cfg.load_existing)
         {

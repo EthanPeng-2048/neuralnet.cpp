@@ -9,15 +9,18 @@
 #include <functional>
 #include <future>
 #include <atomic>
-#include <iterator>  // for std::distance
+#include <algorithm>  // for std::transform (serial fallback)
+#include <numeric>    // for std::transform_reduce (serial fallback)
+#include <iterator>   // for std::distance
 #include <stdexcept>
 #include <type_traits>
 
 namespace nn
 {
-    // ── 简易线程池 ─────────────────────────────────────────────────────────────
-    // 训练开始时创建固定数量线程，避免反复创建/销毁的调度开销
-    // 支持提交任意可调用对象，返回 std::future 以获取结果
+    // ── 简易线程池（latch 零分配设计）──────────────────────────────────────
+    // 核心改进：将原来的 "N 次 submit + N 个 future + N 次加锁" 替换为
+    //   "1 次批量入队 + 1 个原子计数器 + 调用者参与处理"
+    // 消除每分块一次 shared_ptr<packaged_task> 堆分配和 future 同步开销
     class ThreadPool
     {
     private:
@@ -29,7 +32,6 @@ namespace nn
         std::atomic<bool> stop_{false};
 
     public:
-        // 构造：启动指定数量的工作线程
         explicit ThreadPool(std::size_t num_threads = std::thread::hardware_concurrency())
         {
             if (num_threads == 0) num_threads = 1;
@@ -58,7 +60,7 @@ namespace nn
             }
         }
 
-        // 提交任务，返回 future
+        // ── 通用单任务提交（保留给非性能敏感路径） ──────────────────────
         template<typename F, typename... Args>
         [[nodiscard]] auto submit(F&& f, Args&&... args)
             -> std::future<std::invoke_result_t<F, Args...>>
@@ -74,102 +76,224 @@ namespace nn
                 std::unique_lock lock(queue_mutex_);
                 if (stop_.load(std::memory_order_acquire))
                     throw std::runtime_error("submit on stopped ThreadPool");
-                tasks_.emplace([task]()
-                {
-                    (*task)();
-                });
+                tasks_.emplace([task]() { (*task)(); });
             }
             condition_.notify_one();
             return result;
         }
 
-        // 并行 for_each：将 [first, last) 均匀分块，每块提交一个任务
+    private:
+        // ── 分块辅助：计算合理的分块数 ──────────────────────────────────
+        // 每分块至少 4096 个 double（32 KB），可装入 L1 缓存。
+        // 256→4096：旧值导致 8192 元素被切成 16 个微块，调度开销远超计算。
+        [[nodiscard]] std::size_t chunk_count(std::size_t total) const noexcept
+        {
+            constexpr std::size_t MIN_CHUNK = 4096;
+            const auto nw = workers_.size();
+            if (nw <= 1 || total < MIN_CHUNK * 2)
+                return 1;
+            auto n = std::min(nw, total / MIN_CHUNK);
+            return n < 1 ? 1 : n;
+        }
+
+        // ── work-stealing 等待：调用者不空转，帮忙处理队列任务 ─────────
+        void wait_for_latch(std::atomic<int>& latch)
+        {
+            while (latch.load(std::memory_order_acquire) > 0)
+            {
+                std::function<void()> task;
+                {
+                    std::lock_guard lock(queue_mutex_);
+                    if (!tasks_.empty())
+                    {
+                        task = std::move(tasks_.front());
+                        tasks_.pop();
+                    }
+                }
+                if (task)
+                    task();
+                else
+                    std::this_thread::yield();
+            }
+        }
+
+    public:
+        // ── 并行 for_each（latch + 调用者参与） ─────────────────────────
+        // 与旧版相比：零 future 分配、一次加锁入队、调用者不空等
         template<typename Iterator, typename Func>
         void parallel_for_each(Iterator first, Iterator last, Func&& func)
         {
             const auto total = static_cast<std::size_t>(std::distance(first, last));
             if (total == 0) return;
 
-            const auto num_threads = workers_.size();
-            if (num_threads <= 1 || total < num_threads)
+            const auto n_chunks = chunk_count(total);
+            if (n_chunks <= 1)
             {
-                // 串行回退
                 for (auto it = first; it != last; ++it)
                     func(*it);
                 return;
             }
 
-            const std::size_t chunk_size = total / num_threads;
-            std::vector<std::future<void>> futures;
-            futures.reserve(num_threads);
+            const std::size_t base = total / n_chunks;
+            const std::size_t rem  = total % n_chunks;
 
-            for (std::size_t t = 0; t < num_threads; ++t)
+            // 原子计数器：初始值 = n_chunks
+            std::atomic<int> latch{static_cast<int>(n_chunks)};
+
+            // 将前 n_chunks-1 个分块批量入队（仅一次加锁）
             {
-                auto chunk_start = first;
-                std::advance(chunk_start, static_cast<std::ptrdiff_t>(t * chunk_size));
-                auto chunk_end = (t == num_threads - 1) ? last : chunk_start;
-                if (t < num_threads - 1)
-                    std::advance(chunk_end, static_cast<std::ptrdiff_t>(chunk_size));
-
-                futures.push_back(submit([&func, chunk_start, chunk_end]()
+                std::lock_guard lock(queue_mutex_);
+                std::size_t off = 0;
+                for (std::size_t c = 0; c < n_chunks - 1; ++c)
                 {
-                    for (auto it = chunk_start; it != chunk_end; ++it)
-                        func(*it);
-                }));
+                    const std::size_t len = base + (c < rem ? 1 : 0);
+                    auto beg = first;
+                    std::advance(beg, static_cast<std::ptrdiff_t>(off));
+                    auto end = beg;
+                    std::advance(end, static_cast<std::ptrdiff_t>(len));
+                    off += len;
+
+                    tasks_.emplace([beg, end, &func, &latch]()
+                    {
+                        for (auto it = beg; it != end; ++it)
+                            func(*it);
+                        latch.fetch_sub(1, std::memory_order_release);
+                    });
+                }
+            }
+            condition_.notify_all();
+
+            // 调用者处理最后一个分块（不经过队列，零分配）
+            {
+                const std::size_t c = n_chunks - 1;
+                const std::size_t len = base + (c < rem ? 1 : 0);
+                const std::size_t off = total - len;
+                auto beg = first;
+                std::advance(beg, static_cast<std::ptrdiff_t>(off));
+                for (auto it = beg; it != last; ++it)
+                    func(*it);
+                latch.fetch_sub(1, std::memory_order_release);
             }
 
-            // 等待所有块完成
-            for (auto& fut : futures)
-                fut.get();
+            // work-stealing 等待：调用者帮忙处理队列任务而非空转
+            wait_for_latch(latch);
         }
 
-        // 并行 transform：将 [first1, last1) 均匀分块
+        // ── 块级并行 for_each（供矩阵乘法/转置的分块循环使用）─────────
+        // 与普通 parallel_for_each 不同：每个"元素"本身就是一次重量级计算
+        // （如 64×64×K 的矩阵乘法分块），因此不适用 MIN_CHUNK 保护。
+        // 直接按块数分给各线程，1 块 = 1 分片。
+        template<typename Iterator, typename Func>
+        void parallel_for_blocks(Iterator first, Iterator last, Func&& func)
+        {
+            const auto total = static_cast<std::size_t>(std::distance(first, last));
+            if (total <= 1)
+            {
+                for (auto it = first; it != last; ++it)
+                    func(*it);
+                return;
+            }
+
+            const auto n_chunks = std::min(workers_.size(), total);
+            const std::size_t base = total / n_chunks;
+            const std::size_t rem  = total % n_chunks;
+            std::atomic<int> latch{static_cast<int>(n_chunks)};
+
+            {
+                std::lock_guard lock(queue_mutex_);
+                std::size_t off = 0;
+                for (std::size_t c = 0; c < n_chunks - 1; ++c)
+                {
+                    const std::size_t len = base + (c < rem ? 1 : 0);
+                    auto beg = first;
+                    std::advance(beg, static_cast<std::ptrdiff_t>(off));
+                    auto end = beg;
+                    std::advance(end, static_cast<std::ptrdiff_t>(len));
+                    off += len;
+
+                    tasks_.emplace([beg, end, &func, &latch]()
+                    {
+                        for (auto it = beg; it != end; ++it)
+                            func(*it);
+                        latch.fetch_sub(1, std::memory_order_release);
+                    });
+                }
+            }
+            condition_.notify_all();
+
+            {
+                const std::size_t c = n_chunks - 1;
+                const std::size_t off = total - (base + (c < rem ? 1 : 0));
+                auto beg = first;
+                std::advance(beg, static_cast<std::ptrdiff_t>(off));
+                for (auto it = beg; it != last; ++it)
+                    func(*it);
+                latch.fetch_sub(1, std::memory_order_release);
+            }
+
+            wait_for_latch(latch);
+        }
+
+        // ── 并行 transform（一元）───────────────────────────────────────
         template<typename InputIt, typename OutputIt, typename UnaryOp>
         void parallel_transform(InputIt first, InputIt last, OutputIt d_first, UnaryOp&& op)
         {
             const auto total = static_cast<std::size_t>(std::distance(first, last));
             if (total == 0) return;
 
-            const auto num_threads = workers_.size();
-            if (num_threads <= 1 || total < num_threads)
+            const auto n_chunks = chunk_count(total);
+            if (n_chunks <= 1)
             {
                 std::transform(first, last, d_first, std::forward<UnaryOp>(op));
                 return;
             }
 
-            const std::size_t chunk_size = total / num_threads;
-            std::vector<std::future<void>> futures;
-            futures.reserve(num_threads);
+            const std::size_t base = total / n_chunks;
+            const std::size_t rem  = total % n_chunks;
+            std::atomic<int> latch{static_cast<int>(n_chunks)};
 
-            for (std::size_t t = 0; t < num_threads; ++t)
             {
-                auto chunk_start = first;
-                auto out_start = d_first;
-                std::advance(chunk_start, static_cast<std::ptrdiff_t>(t * chunk_size));
-                std::advance(out_start, static_cast<std::ptrdiff_t>(t * chunk_size));
-                
-                auto chunk_end = (t == num_threads - 1) ? last : chunk_start;
-                auto out_end = (t == num_threads - 1) ? d_first : out_start;
-                if (t < num_threads - 1)
+                std::lock_guard lock(queue_mutex_);
+                std::size_t off = 0;
+                for (std::size_t c = 0; c < n_chunks - 1; ++c)
                 {
-                    std::advance(chunk_end, static_cast<std::ptrdiff_t>(chunk_size));
-                    std::advance(out_end, static_cast<std::ptrdiff_t>(chunk_size));
-                }
+                    const std::size_t len = base + (c < rem ? 1 : 0);
+                    auto in_beg = first;
+                    auto out_beg = d_first;
+                    std::advance(in_beg,  static_cast<std::ptrdiff_t>(off));
+                    std::advance(out_beg, static_cast<std::ptrdiff_t>(off));
+                    auto in_end = in_beg;
+                    std::advance(in_end, static_cast<std::ptrdiff_t>(len));
+                    off += len;
 
-                futures.push_back(submit([&op, chunk_start, chunk_end, out_start]()
-                {
-                    auto in_it = chunk_start;
-                    auto out_it = out_start;
-                    for (; in_it != chunk_end; ++in_it, ++out_it)
-                        *out_it = op(*in_it);
-                }));
+                    tasks_.emplace([in_beg, in_end, out_beg, &op, &latch]()
+                    {
+                        auto in = in_beg;
+                        auto out = out_beg;
+                        for (; in != in_end; ++in, ++out)
+                            *out = op(*in);
+                        latch.fetch_sub(1, std::memory_order_release);
+                    });
+                }
+            }
+            condition_.notify_all();
+
+            {
+                const std::size_t c = n_chunks - 1;
+                const std::size_t off = total - (base + (c < rem ? 1 : 0));
+                auto in_beg = first;
+                auto out_beg = d_first;
+                std::advance(in_beg,  static_cast<std::ptrdiff_t>(off));
+                std::advance(out_beg, static_cast<std::ptrdiff_t>(off));
+                for (; in_beg != last; ++in_beg, ++out_beg)
+                    *out_beg = op(*in_beg);
+                latch.fetch_sub(1, std::memory_order_release);
             }
 
-            for (auto& fut : futures)
-                fut.get();
+            wait_for_latch(latch);
         }
 
-        // 并行 transform（二元版本）
+        // ── 并行 transform（二元）───────────────────────────────────────
         template<typename InputIt1, typename InputIt2, typename OutputIt, typename BinaryOp>
         void parallel_transform(InputIt1 first1, InputIt1 last1, InputIt2 first2,
                                 OutputIt d_first, BinaryOp&& op)
@@ -177,49 +301,131 @@ namespace nn
             const auto total = static_cast<std::size_t>(std::distance(first1, last1));
             if (total == 0) return;
 
-            const auto num_threads = workers_.size();
-            if (num_threads <= 1 || total < num_threads)
+            const auto n_chunks = chunk_count(total);
+            if (n_chunks <= 1)
             {
                 std::transform(first1, last1, first2, d_first, std::forward<BinaryOp>(op));
                 return;
             }
 
-            const std::size_t chunk_size = total / num_threads;
-            std::vector<std::future<void>> futures;
-            futures.reserve(num_threads);
+            const std::size_t base = total / n_chunks;
+            const std::size_t rem  = total % n_chunks;
+            std::atomic<int> latch{static_cast<int>(n_chunks)};
 
-            for (std::size_t t = 0; t < num_threads; ++t)
             {
-                auto in1_start = first1;
-                auto in2_start = first2;
-                auto out_start = d_first;
-                std::advance(in1_start, static_cast<std::ptrdiff_t>(t * chunk_size));
-                std::advance(in2_start, static_cast<std::ptrdiff_t>(t * chunk_size));
-                std::advance(out_start, static_cast<std::ptrdiff_t>(t * chunk_size));
-                
-                auto in1_end = (t == num_threads - 1) ? last1 : in1_start;
-                auto out_end = (t == num_threads - 1) ? d_first : out_start;
-                if (t < num_threads - 1)
+                std::lock_guard lock(queue_mutex_);
+                std::size_t off = 0;
+                for (std::size_t c = 0; c < n_chunks - 1; ++c)
                 {
-                    std::advance(in1_end, static_cast<std::ptrdiff_t>(chunk_size));
-                    std::advance(out_end, static_cast<std::ptrdiff_t>(chunk_size));
-                }
+                    const std::size_t len = base + (c < rem ? 1 : 0);
+                    auto i1 = first1;
+                    auto i2 = first2;
+                    auto o = d_first;
+                    std::advance(i1, static_cast<std::ptrdiff_t>(off));
+                    std::advance(i2, static_cast<std::ptrdiff_t>(off));
+                    std::advance(o,  static_cast<std::ptrdiff_t>(off));
+                    auto i1_end = i1;
+                    std::advance(i1_end, static_cast<std::ptrdiff_t>(len));
+                    off += len;
 
-                futures.push_back(submit([&op, in1_start, in1_end, in2_start, out_start]()
-                {
-                    auto it1 = in1_start;
-                    auto it2 = in2_start;
-                    auto out_it = out_start;
-                    for (; it1 != in1_end; ++it1, ++it2, ++out_it)
-                        *out_it = op(*it1, *it2);
-                }));
+                    tasks_.emplace([i1, i1_end, i2, o, &op, &latch]()
+                    {
+                        auto it1 = i1;
+                        auto it2 = i2;
+                        auto out = o;
+                        for (; it1 != i1_end; ++it1, ++it2, ++out)
+                            *out = op(*it1, *it2);
+                        latch.fetch_sub(1, std::memory_order_release);
+                    });
+                }
+            }
+            condition_.notify_all();
+
+            {
+                const std::size_t c = n_chunks - 1;
+                const std::size_t off = total - (base + (c < rem ? 1 : 0));
+                auto i1 = first1;
+                auto i2 = first2;
+                auto o = d_first;
+                std::advance(i1, static_cast<std::ptrdiff_t>(off));
+                std::advance(i2, static_cast<std::ptrdiff_t>(off));
+                std::advance(o,  static_cast<std::ptrdiff_t>(off));
+                for (; i1 != last1; ++i1, ++i2, ++o)
+                    *o = op(*i1, *i2);
+                latch.fetch_sub(1, std::memory_order_release);
             }
 
-            for (auto& fut : futures)
-                fut.get();
+            wait_for_latch(latch);
         }
 
-        // 并行 transform_reduce（二元输入范围）
+        // ── 并行 transform_reduce（一元 transform）──────────────────────
+        template<typename InputIt, typename T, typename BinaryOp, typename UnaryOp>
+        T parallel_transform_reduce(InputIt first, InputIt last, T init,
+                                    BinaryOp&& reduce_op, UnaryOp&& transform_op)
+        {
+            const auto total = static_cast<std::size_t>(std::distance(first, last));
+            if (total == 0) return init;
+
+            const auto n_chunks = chunk_count(total);
+            if (n_chunks <= 1)
+            {
+                return std::transform_reduce(first, last, init,
+                                            std::forward<BinaryOp>(reduce_op),
+                                            std::forward<UnaryOp>(transform_op));
+            }
+
+            const std::size_t base = total / n_chunks;
+            const std::size_t rem  = total % n_chunks;
+            std::atomic<int> latch{static_cast<int>(n_chunks)};
+
+            // 预分配结果数组（栈上小 vector），避免 future 堆分配
+            std::vector<T> partials(n_chunks);
+
+            {
+                std::lock_guard lock(queue_mutex_);
+                std::size_t off = 0;
+                for (std::size_t c = 0; c < n_chunks - 1; ++c)
+                {
+                    const std::size_t len = base + (c < rem ? 1 : 0);
+                    auto beg = first;
+                    std::advance(beg, static_cast<std::ptrdiff_t>(off));
+                    auto end = beg;
+                    std::advance(end, static_cast<std::ptrdiff_t>(len));
+                    off += len;
+
+                    tasks_.emplace([beg, end, &reduce_op, &transform_op, &partials, &latch, c]()
+                    {
+                        T local{};  // 要求 T{} 是 reduce_op 的单位元
+                        for (auto it = beg; it != end; ++it)
+                            local = reduce_op(local, transform_op(*it));
+                        partials[c] = std::move(local);
+                        latch.fetch_sub(1, std::memory_order_release);
+                    });
+                }
+            }
+            condition_.notify_all();
+
+            {
+                const std::size_t c = n_chunks - 1;
+                const std::size_t off = total - (base + (c < rem ? 1 : 0));
+                auto beg = first;
+                std::advance(beg, static_cast<std::ptrdiff_t>(off));
+                T local{};
+                for (auto it = beg; it != last; ++it)
+                    local = reduce_op(local, transform_op(*it));
+                partials[c] = std::move(local);
+                latch.fetch_sub(1, std::memory_order_release);
+            }
+
+            wait_for_latch(latch);
+
+            T result = init;
+            for (auto& p : partials)
+                result = reduce_op(result, p);
+            return result;
+        }
+
+        // ── 并行 transform_reduce（二元输入范围）────────────────────────
         template<typename InputIt1, typename InputIt2, typename T, typename BinaryOp, typename UnaryOp>
         T parallel_transform_reduce(InputIt1 first1, InputIt1 last1, InputIt2 first2,
                                     T init, BinaryOp&& reduce_op, UnaryOp&& transform_op)
@@ -227,48 +433,70 @@ namespace nn
             const auto total = static_cast<std::size_t>(std::distance(first1, last1));
             if (total == 0) return init;
 
-            const auto num_threads = workers_.size();
-            if (num_threads <= 1 || total < num_threads)
+            const auto n_chunks = chunk_count(total);
+            if (n_chunks <= 1)
             {
                 return std::transform_reduce(first1, last1, first2, init,
                                             std::forward<BinaryOp>(reduce_op),
                                             std::forward<UnaryOp>(transform_op));
             }
 
-            const std::size_t chunk_size = total / num_threads;
-            std::vector<std::future<T>> futures;
-            futures.reserve(num_threads);
+            const std::size_t base = total / n_chunks;
+            const std::size_t rem  = total % n_chunks;
+            std::atomic<int> latch{static_cast<int>(n_chunks)};
+            std::vector<T> partials(n_chunks);
 
-            for (std::size_t t = 0; t < num_threads; ++t)
             {
-                auto in1_start = first1;
-                auto in2_start = first2;
-                std::advance(in1_start, static_cast<std::ptrdiff_t>(t * chunk_size));
-                std::advance(in2_start, static_cast<std::ptrdiff_t>(t * chunk_size));
-                
-                auto in1_end = (t == num_threads - 1) ? last1 : in1_start;
-                if (t < num_threads - 1)
-                    std::advance(in1_end, static_cast<std::ptrdiff_t>(chunk_size));
-
-                futures.push_back(submit([&reduce_op, &transform_op, in1_start, in1_end, in2_start]()
+                std::lock_guard lock(queue_mutex_);
+                std::size_t off = 0;
+                for (std::size_t c = 0; c < n_chunks - 1; ++c)
                 {
-                    T local_sum{};
-                    auto it1 = in1_start;
-                    auto it2 = in2_start;
-                    for (; it1 != in1_end; ++it1, ++it2)
-                        local_sum = reduce_op(local_sum, transform_op(*it1, *it2));
-                    return local_sum;
-                }));
+                    const std::size_t len = base + (c < rem ? 1 : 0);
+                    auto i1 = first1;
+                    auto i2 = first2;
+                    std::advance(i1, static_cast<std::ptrdiff_t>(off));
+                    std::advance(i2, static_cast<std::ptrdiff_t>(off));
+                    auto i1_end = i1;
+                    std::advance(i1_end, static_cast<std::ptrdiff_t>(len));
+                    off += len;
+
+                    tasks_.emplace([i1, i1_end, i2, &reduce_op, &transform_op, &partials, &latch, c]()
+                    {
+                        T local{};
+                        auto it1 = i1;
+                        auto it2 = i2;
+                        for (; it1 != i1_end; ++it1, ++it2)
+                            local = reduce_op(local, transform_op(*it1, *it2));
+                        partials[c] = std::move(local);
+                        latch.fetch_sub(1, std::memory_order_release);
+                    });
+                }
+            }
+            condition_.notify_all();
+
+            {
+                const std::size_t c = n_chunks - 1;
+                const std::size_t off = total - (base + (c < rem ? 1 : 0));
+                auto i1 = first1;
+                auto i2 = first2;
+                std::advance(i1, static_cast<std::ptrdiff_t>(off));
+                std::advance(i2, static_cast<std::ptrdiff_t>(off));
+                T local{};
+                for (; i1 != last1; ++i1, ++i2)
+                    local = reduce_op(local, transform_op(*i1, *i2));
+                partials[c] = std::move(local);
+                latch.fetch_sub(1, std::memory_order_release);
             }
 
-            // 收集各块结果
+            wait_for_latch(latch);
+
             T result = init;
-            for (auto& fut : futures)
-                result = reduce_op(result, fut.get());
+            for (auto& p : partials)
+                result = reduce_op(result, p);
             return result;
         }
 
-        // 析构：等待所有任务完成后关闭线程
+        // ── 析构 ────────────────────────────────────────────────────────
         ~ThreadPool()
         {
             stop_.store(true, std::memory_order_release);
@@ -280,7 +508,6 @@ namespace nn
             }
         }
 
-        // 禁止拷贝/移动
         ThreadPool(const ThreadPool&) = delete;
         ThreadPool& operator=(const ThreadPool&) = delete;
         ThreadPool(ThreadPool&&) = delete;
@@ -289,8 +516,7 @@ namespace nn
         [[nodiscard]] std::size_t size() const noexcept { return workers_.size(); }
     };
 
-    // ── 全局线程池单例（懒初始化） ─────────────────────────────────────────────
-    // 训练开始时自动创建，程序结束时自动销毁，避免反复创建/销毁
+    // ── 全局线程池单例 ─────────────────────────────────────────────────────
     inline ThreadPool& global_thread_pool()
     {
         static ThreadPool pool{std::thread::hardware_concurrency()};
