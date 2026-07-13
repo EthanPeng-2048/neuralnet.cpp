@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <execution>
 #include <functional>
@@ -519,6 +520,95 @@ namespace nn
             std::fill(grad_gamma_.data_ptr(), grad_gamma_.data_ptr() + grad_gamma_.size(), 0.0);
             std::fill(grad_beta_.data_ptr(), grad_beta_.data_ptr() + grad_beta_.size(), 0.0);
         }
+    };
+
+    // ── 正弦波固定位置编码 ───────────────────────────────────────────────
+    // 来源: "Attention Is All You Need" (Vaswani et al., 2017)
+    //
+    //   PE(pos, 2i)   = sin(pos / 10000^(2i/d_model))
+    //   PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
+    //
+    // 输入形状: (d_model, seq_len)，输出形状相同。
+    // 编码矩阵在构造时一次性预计算，前向传播仅做逐元素加法。
+    // 反向传播直接穿透（编码不可学习）。
+    // ─────────────────────────────────────────────────────────────────────
+    class PositionalEncoding final : public Layer
+    {
+    private:
+        std::size_t d_model_;
+        std::size_t max_len_;
+        Matrix encoding_;   // (d_model, max_len) — 预计算的正弦波编码
+        Matrix input_cache_;
+
+    public:
+        PositionalEncoding(std::size_t d_model, std::size_t max_len = 5000)
+            : d_model_(d_model),
+              max_len_(max_len),
+              encoding_(d_model, max_len)
+        {
+            // ── 一次性预计算频率与编码 ──
+            // 先计算每个特征对的角频率（避免在 position 循环中重复 pow）
+            const std::size_t half = d_model / 2;
+            std::vector<double> freqs(half);
+            for (std::size_t i = 0; i < half; ++i)
+                freqs[i] = 1.0 / std::pow(10000.0, static_cast<double>(2 * i) / d_model);
+
+            double *e_ptr = encoding_.data_ptr();
+            for (std::size_t pos = 0; pos < max_len; ++pos)
+            {
+                const double pos_d = static_cast<double>(pos);
+                for (std::size_t i = 0; i < half; ++i)
+                {
+                    const double angle = pos_d * freqs[i];
+                    e_ptr[(2 * i)       * max_len + pos] = std::sin(angle);
+                    e_ptr[(2 * i + 1)   * max_len + pos] = std::cos(angle);
+                }
+                // 奇数维度：最后一个特征仅使用 sin
+                if (d_model % 2 == 1)
+                {
+                    const double angle = pos_d * freqs[half];
+                    e_ptr[(d_model - 1) * max_len + pos] = std::sin(angle);
+                }
+            }
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override { return {}; }
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override { return {}; }
+
+        Matrix forward(const Matrix &input) override
+        {
+            if (input.rows() != d_model_)
+                throw std::invalid_argument("positional encoding forward: d_model mismatch");
+
+            input_cache_ = input;
+            const std::size_t seq_len = input.cols();
+
+            if (seq_len > max_len_)
+                throw std::invalid_argument("positional encoding forward: sequence length exceeds max_len");
+
+            // result = input + encoding[:, 0:seq_len]
+            Matrix result(d_model_, seq_len);
+            const double *in_ptr = input.data_ptr();
+            const double *e_ptr = encoding_.data_ptr();
+            double *out_ptr = result.data_ptr();
+
+            const auto total = static_cast<std::size_t>(d_model_ * seq_len);
+            const std::size_t max_len = max_len_;
+            auto indices = std::views::iota(std::size_t{0}, total);
+            SmartPolicy::for_each(indices.begin(), indices.end(),
+                [in_ptr, e_ptr, out_ptr, seq_len, max_len](std::size_t idx) noexcept
+                {
+                    // idx = row * seq_len + col
+                    const std::size_t row = idx / seq_len;
+                    const std::size_t col = idx % seq_len;
+                    out_ptr[idx] = in_ptr[idx] + e_ptr[row * max_len + col];
+                });
+
+            return result;
+        }
+
+        // 位置编码为固定值，梯度直接穿透
+        Matrix backward(const Matrix &grad_output) override { return grad_output; }
     };
 }
 
