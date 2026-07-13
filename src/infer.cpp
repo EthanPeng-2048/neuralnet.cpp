@@ -1,5 +1,6 @@
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/model_io.hpp>
+#include <neuralnet.cpp/mnist_common.hpp>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -14,10 +15,7 @@
 namespace fs = std::filesystem;
 
 // ==================== 常量 ====================
-static constexpr std::size_t INPUT_DIM = 784;
-static constexpr std::size_t NUM_CLASSES = 10;
-// 网络架构：必须与训练时一致
-static const std::vector<std::size_t> LAYER_DIMS = {INPUT_DIM, 256, 128, 64, NUM_CLASSES};
+// 现在使用 nn::MNIST_INPUT_DIM, nn::MNIST_NUM_CLASSES, nn::MNIST_LAYER_DIMS
 
 // ==================== 帮助信息 ====================
 void print_usage(const char *prog)
@@ -90,27 +88,7 @@ InferConfig parse_args(int argc, char *argv[])
 }
 
 // ==================== 构建网络 ====================
-nn::Model build_model()
-{
-    nn::Model model;
-    // 根据 LAYER_DIMS 自动构建网络（与训练时完全一致）
-    for (std::size_t i = 0; i < LAYER_DIMS.size() - 1; ++i)
-    {
-        std::size_t in_dim = LAYER_DIMS[i];
-        std::size_t out_dim = LAYER_DIMS[i + 1];
-        
-        // 添加线性层
-        model.add<nn::Linear>(in_dim, out_dim);
-        
-        // 如果不是最后一层（输出层），则添加 LayerNorm 和 GeLU 激活函数
-        if (i < LAYER_DIMS.size() - 2)
-        {
-            model.add<nn::LayerNorm>(out_dim)
-                 .add<nn::GeLU>();
-        }
-    }
-    return model;
-}
+// build_model 函数已移至 neuralnet.cpp/mnist_common.hpp 中的 nn::build_mnist_model()
 
 // ==================== 数据读取 ====================
 nn::Matrix load_image_from_csv(const std::string &csv_line)
@@ -122,11 +100,11 @@ nn::Matrix load_image_from_csv(const std::string &csv_line)
     {
         pixels.push_back(std::stod(token));
     }
-    if (pixels.size() != INPUT_DIM)
-        throw std::runtime_error("CSV 必须包含恰好 " + std::to_string(INPUT_DIM) + " 个值，实际: " + std::to_string(pixels.size()));
+    if (pixels.size() != nn::MNIST_INPUT_DIM)
+        throw std::runtime_error("CSV 必须包含恰好 " + std::to_string(nn::MNIST_INPUT_DIM) + " 个值，实际: " + std::to_string(pixels.size()));
 
-    nn::Matrix img(INPUT_DIM, 1);
-    for (std::size_t i = 0; i < INPUT_DIM; ++i)
+    nn::Matrix img(nn::MNIST_INPUT_DIM, 1);
+    for (std::size_t i = 0; i < nn::MNIST_INPUT_DIM; ++i)
         img.set_value_unchecked(i, 0, pixels[i]);
     return img;
 }
@@ -144,12 +122,12 @@ std::vector<Prediction> predict_with_confidence(nn::Model &model, const nn::Matr
 
     // Softmax 计算概率
     double max_val = logits.at_unchecked(0, 0);
-    for (int c = 1; c < static_cast<int>(NUM_CLASSES); ++c)
+    for (int c = 1; c < static_cast<int>(nn::MNIST_NUM_CLASSES); ++c)
         max_val = std::max(max_val, logits.at_unchecked(c, 0));
 
     double sum_exp = 0.0;
-    std::vector<double> probs(NUM_CLASSES);
-    for (std::size_t c = 0; c < NUM_CLASSES; ++c)
+    std::vector<double> probs(nn::MNIST_NUM_CLASSES);
+    for (std::size_t c = 0; c < nn::MNIST_NUM_CLASSES; ++c)
     {
         probs[c] = std::exp(logits.at_unchecked(c, 0) - max_val);
         sum_exp += probs[c];
@@ -158,7 +136,7 @@ std::vector<Prediction> predict_with_confidence(nn::Model &model, const nn::Matr
         p /= sum_exp;
 
     // 按概率排序取 top-k
-    std::vector<int> indices(NUM_CLASSES);
+    std::vector<int> indices(nn::MNIST_NUM_CLASSES);
     std::iota(indices.begin(), indices.end(), 0);
     std::partial_sort(indices.begin(), indices.begin() + topk, indices.end(),
                       [&](int a, int b) { return probs[a] > probs[b]; });
@@ -228,7 +206,7 @@ int main(int argc, char *argv[])
         InferConfig cfg = parse_args(argc, argv);
 
         // 构建并加载模型
-        auto model = build_model();
+        auto model = nn::build_mnist_model();
         nn::load_model(cfg.model_path, model);
         std::cout << "模型已加载: " << cfg.model_path << "\n" << std::endl;
 

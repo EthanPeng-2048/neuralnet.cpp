@@ -12,8 +12,8 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
-#include "matrix.hpp"
 
+#include <neuralnet.cpp/matrix.hpp>
 #include <neuralnet.cpp/nn_config.hpp>
 
 namespace nn

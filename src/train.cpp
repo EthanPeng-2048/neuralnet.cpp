@@ -1,5 +1,6 @@
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/model_io.hpp>
+#include <neuralnet.cpp/mnist_common.hpp>
 #include <cstring>     // for std::memcpy
 #include <memory>     // for std::unique_ptr
 #include <iostream>
@@ -14,10 +15,7 @@
 #include <iomanip>
 
 // ==================== 常量 ====================
-static constexpr std::size_t INPUT_DIM = 784;
-static constexpr std::size_t NUM_CLASSES = 10;
-// 网络架构：输入层 -> 隐藏层1 -> 隐藏层2 -> 隐藏层3 -> 输出层
-static const std::vector<std::size_t> LAYER_DIMS = {INPUT_DIM, 256, 128, 64, NUM_CLASSES};
+// 现在使用 nn::MNIST_INPUT_DIM, nn::MNIST_NUM_CLASSES, nn::MNIST_LAYER_DIMS
 
 // ==================== 帮助信息 ====================
 void print_usage(const char *prog)
@@ -180,7 +178,7 @@ double evaluate(nn::Model &model, const nn::Matrix &x, const nn::Matrix &y_oneho
     {
         double max_val = out.at_unchecked(0, i);
         int pred = 0;
-        for (int j = 1; j < static_cast<int>(NUM_CLASSES); ++j)
+        for (int j = 1; j < static_cast<int>(nn::MNIST_NUM_CLASSES); ++j)
         {
             double val = out.at_unchecked(j, i);
             if (val > max_val)
@@ -190,7 +188,7 @@ double evaluate(nn::Model &model, const nn::Matrix &x, const nn::Matrix &y_oneho
             }
         }
         int true_label = -1;
-        for (int j = 0; j < static_cast<int>(NUM_CLASSES); ++j)
+        for (int j = 0; j < static_cast<int>(nn::MNIST_NUM_CLASSES); ++j)
         {
             if (y_onehot.at_unchecked(j, i) == 1.0)
             {
@@ -205,27 +203,7 @@ double evaluate(nn::Model &model, const nn::Matrix &x, const nn::Matrix &y_oneho
 }
 
 // -------------------- 构建网络 --------------------
-nn::Model build_model()
-{
-    nn::Model model;
-    // 根据 LAYER_DIMS 自动构建网络
-    for (std::size_t i = 0; i < LAYER_DIMS.size() - 1; ++i)
-    {
-        std::size_t in_dim = LAYER_DIMS[i];
-        std::size_t out_dim = LAYER_DIMS[i + 1];
-        
-        // 添加线性层
-        model.add<nn::Linear>(in_dim, out_dim);
-        
-        // 如果不是最后一层（输出层），则添加 LayerNorm 和 GeLU 激活函数
-        if (i < LAYER_DIMS.size() - 2)
-        {
-            model.add<nn::LayerNorm>(out_dim)
-                 .add<nn::GeLU>();
-        }
-    }
-    return model;
-}
+// build_model 函数已移至 neuralnet.cpp/mnist_common.hpp 中的 nn::build_mnist_model()
 
 // ==================== 主函数 ====================
 int main(int argc, char *argv[])
@@ -240,12 +218,12 @@ int main(int argc, char *argv[])
         std::cout << "========================================\n";
         // 动态显示网络架构
         std::cout << "  网络: ";
-        for (std::size_t i = 0; i < LAYER_DIMS.size(); ++i)
+        for (std::size_t i = 0; i < nn::MNIST_LAYER_DIMS.size(); ++i)
         {
-            std::cout << LAYER_DIMS[i];
-            if (i < LAYER_DIMS.size() - 2)
+            std::cout << nn::MNIST_LAYER_DIMS[i];
+            if (i < nn::MNIST_LAYER_DIMS.size() - 2)
                 std::cout << "(LayerNorm+GeLU)";
-            if (i < LAYER_DIMS.size() - 1)
+            if (i < nn::MNIST_LAYER_DIMS.size() - 1)
                 std::cout << " -> ";
         }
         std::cout << "\n";
@@ -262,7 +240,7 @@ int main(int argc, char *argv[])
         std::cout << "训练集: " << train_x.cols() << " 样本, 测试集: " << test_x.cols() << " 样本\n" << std::endl;
 
         // ── 构建模型 ─────────────────────────────────────────────
-        auto model = build_model();
+        auto model = nn::build_mnist_model();
 
         if (cfg.load_existing)
         {
