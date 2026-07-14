@@ -1,5 +1,6 @@
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/model_io.hpp>
+#include <neuralnet.cpp/mnist_common.hpp>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -14,10 +15,7 @@
 namespace fs = std::filesystem;
 
 // ==================== 常量 ====================
-static constexpr std::size_t INPUT_DIM = 784;
-static constexpr std::size_t HIDDEN_DIM = 64;
-static constexpr std::size_t NUM_CLASSES = 10;
-static constexpr std::size_t NUM_HIDDEN_LAYERS = 3;
+// 现在使用 nn::MNIST_INPUT_DIM, nn::MNIST_NUM_CLASSES, nn::MNIST_LAYER_DIMS
 
 // ==================== 帮助信息 ====================
 void print_usage(const char *prog)
@@ -28,16 +26,18 @@ void print_usage(const char *prog)
         << "  " << prog << " <image.csv> [选项]     推理单张图片\n"
         << "  " << prog << " <目录>   [选项]     批量推理目录下所有 CSV\n\n"
         << "选项:\n"
-        << "  --model <path>    模型文件路径 (默认: pretrained/model.bin)\n"
-        << "  --topk <n>        显示前 n 个预测结果 (默认: 3)\n"
-        << "  --show-pixels     显示像素矩阵 (调试用)\n"
-        << "  --help            显示此帮助信息\n";
+        << "  --model <path>     模型文件路径 (默认: pretrained/model.bin)\n"
+        << "  --model-type <t>   模型类型: mlp/transformer (默认: mlp)\n"
+        << "  --topk <n>         显示前 n 个预测结果 (默认: 3)\n"
+        << "  --show-pixels      显示像素矩阵 (调试用)\n"
+        << "  --help             显示此帮助信息\n";
 }
 
 // ==================== 命令行参数 ====================
 struct InferConfig
 {
     std::string model_path = "pretrained/model.bin";
+    std::string model_type = "mlp";
     std::string input_path;
     int topk = 3;
     bool show_pixels = false;
@@ -59,6 +59,16 @@ InferConfig parse_args(int argc, char *argv[])
         else if (arg == "--model" && i + 1 < argc)
         {
             cfg.model_path = argv[++i];
+        }
+        else if (arg == "--model-type" && i + 1 < argc)
+        {
+            cfg.model_type = argv[++i];
+            if (cfg.model_type != "mlp" && cfg.model_type != "transformer")
+            {
+                std::cerr << "未知模型类型: " << cfg.model_type
+                          << "，可选: mlp, transformer\n";
+                std::exit(1);
+            }
         }
         else if (arg == "--topk" && i + 1 < argc)
         {
@@ -90,19 +100,7 @@ InferConfig parse_args(int argc, char *argv[])
 }
 
 // ==================== 构建网络 ====================
-nn::Model build_model()
-{
-    nn::Model model;
-    model.add<nn::Linear>(INPUT_DIM, HIDDEN_DIM)
-         .add<nn::ReLU>();
-    for (std::size_t i = 0; i < NUM_HIDDEN_LAYERS - 1; ++i)
-    {
-        model.add<nn::Linear>(HIDDEN_DIM, HIDDEN_DIM)
-             .add<nn::ReLU>();
-    }
-    model.add<nn::Linear>(HIDDEN_DIM, NUM_CLASSES);
-    return model;
-}
+// build_model 函数已移至 neuralnet.cpp/mnist_common.hpp 中的 nn::build_mnist_model()
 
 // ==================== 数据读取 ====================
 nn::Matrix load_image_from_csv(const std::string &csv_line)
@@ -114,11 +112,11 @@ nn::Matrix load_image_from_csv(const std::string &csv_line)
     {
         pixels.push_back(std::stod(token));
     }
-    if (pixels.size() != INPUT_DIM)
-        throw std::runtime_error("CSV 必须包含恰好 " + std::to_string(INPUT_DIM) + " 个值，实际: " + std::to_string(pixels.size()));
+    if (pixels.size() != nn::MNIST_INPUT_DIM)
+        throw std::runtime_error("CSV 必须包含恰好 " + std::to_string(nn::MNIST_INPUT_DIM) + " 个值，实际: " + std::to_string(pixels.size()));
 
-    nn::Matrix img(INPUT_DIM, 1);
-    for (std::size_t i = 0; i < INPUT_DIM; ++i)
+    nn::Matrix img(nn::MNIST_INPUT_DIM, 1);
+    for (std::size_t i = 0; i < nn::MNIST_INPUT_DIM; ++i)
         img.set_value_unchecked(i, 0, pixels[i]);
     return img;
 }
@@ -136,12 +134,12 @@ std::vector<Prediction> predict_with_confidence(nn::Model &model, const nn::Matr
 
     // Softmax 计算概率
     double max_val = logits.at_unchecked(0, 0);
-    for (int c = 1; c < static_cast<int>(NUM_CLASSES); ++c)
+    for (int c = 1; c < static_cast<int>(nn::MNIST_NUM_CLASSES); ++c)
         max_val = std::max(max_val, logits.at_unchecked(c, 0));
 
     double sum_exp = 0.0;
-    std::vector<double> probs(NUM_CLASSES);
-    for (std::size_t c = 0; c < NUM_CLASSES; ++c)
+    std::vector<double> probs(nn::MNIST_NUM_CLASSES);
+    for (std::size_t c = 0; c < nn::MNIST_NUM_CLASSES; ++c)
     {
         probs[c] = std::exp(logits.at_unchecked(c, 0) - max_val);
         sum_exp += probs[c];
@@ -150,7 +148,7 @@ std::vector<Prediction> predict_with_confidence(nn::Model &model, const nn::Matr
         p /= sum_exp;
 
     // 按概率排序取 top-k
-    std::vector<int> indices(NUM_CLASSES);
+    std::vector<int> indices(nn::MNIST_NUM_CLASSES);
     std::iota(indices.begin(), indices.end(), 0);
     std::partial_sort(indices.begin(), indices.begin() + topk, indices.end(),
                       [&](int a, int b) { return probs[a] > probs[b]; });
@@ -220,7 +218,7 @@ int main(int argc, char *argv[])
         InferConfig cfg = parse_args(argc, argv);
 
         // 构建并加载模型
-        auto model = build_model();
+        auto model = nn::build_mnist_model(cfg.model_type);
         nn::load_model(cfg.model_path, model);
         std::cout << "模型已加载: " << cfg.model_path << "\n" << std::endl;
 

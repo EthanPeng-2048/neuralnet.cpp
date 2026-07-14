@@ -100,7 +100,22 @@ void process(std::span<const double> data);
 void process(const double* data, std::size_t size);
 ```
 
-#### 2.4 预分配缓冲区模式
+#### 2.4 使用 std::span 访问矩阵数据
+```cpp
+// ✅ 推荐：使用 span() 访问矩阵数据（C++20 零开销抽象）
+auto data = matrix.span();          // std::span<double>
+auto cdata = const_matrix.span();   // std::span<const double>
+
+// 在 lambda 中捕获 span（类型安全，编译期大小检查）
+auto func = [data](std::size_t i) noexcept {
+    return data[i] * 2.0;
+};
+
+// ❌ 避免：使用已废弃的 data_ptr()
+double* ptr = matrix.data_ptr();  // [[deprecated]]
+```
+
+#### 2.5 预分配缓冲区模式
 ```cpp
 // ✅ 推荐：预分配并在就地操作
 void multiply_to(Matrix& result, const Matrix& other) const {
@@ -123,7 +138,7 @@ void multiply_to(Matrix& result, const Matrix& other) const {
 - [ ] 是否有 `new` / `delete` 操作？
 - [ ] 是否使用 `std::vector` 替代动态数组？
 - [ ] 是否使用 `std::unique_ptr` 管理多态对象？
-- [ ] 是否使用 `std::span` 传递只读连续数据？
+- [ ] 是否使用 `std::span` 替代裸指针访问连续数据？
 - [ ] 热路径中是否预分配缓冲区？
 
 ---
@@ -378,32 +393,17 @@ set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 ```
 
-### 2. 必须使用的 C++26 特性
-
-| 特性 | 用途 | 示例 |
-|------|------|------|
-| `std::generator` | 协程生成器 | 数据加载器 |
-| `std::print` / `std::println` | 格式化输出 | 调试信息 |
-| `std::expected` | 错误处理 | 返回值类型 |
-| `std::flat_map` | 高性能映射 | 配置管理 |
-| `std::mdspan` | 多维数组视图 | 矩阵操作 |
-| `std::stacktrace` | 调试堆栈跟踪 | 错误报告 |
-
-### 3. 积极使用的 C++23/20 特性
+### 2. 积极使用的 C++20/23 特性
 
 | 特性 | 标准 | 用途 |
 |------|------|------|
-| `std::ranges` | C++20 | 数据处理管道 |
-| `std::views` | C++20 | 延迟求值 |
-| `std::format` | C++20 | 字符串格式化 |
-| `std::span` | C++20 | 非拥有视图 |
-| `std::jthread` | C++20 | 自动连接线程 |
-| `std::source_location` | C++20 | 错误定位 |
-| `std::print` | C++23 | 格式化输出 |
-| `std::generator` | C++23 | 协程生成器 |
-| `std::mdspan` | C++23 | 多维数组 |
+| `std::span` | C++20 | 非拥有型连续内存视图，替代裸指针 |
+| `std::ranges` | C++20 | 数据处理管道（如 `ranges::generate` Xavier 初始化） |
+| `std::views::iota` | C++20 | 延迟整数序列（并行索引生成） |
+| `std::views::zip` | C++20 | 多范围并行迭代（优化器参数更新） |
+| `std::execution::par_unseq` | C++17 | 并行执行策略（矩阵运算） |
 
-### 4. 标准跟进检查清单
+### 3. 标准跟进检查清单
 
 - [ ] 是否使用最新的 C++ 标准（C++26）？
 - [ ] 是否积极使用 C++20/23/26 新特性？

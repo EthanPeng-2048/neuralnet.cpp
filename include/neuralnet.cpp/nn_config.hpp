@@ -26,15 +26,19 @@ namespace nn
     inline constexpr double EPSILON = 1e-8;
     
     // ── 智能执行策略 ─────────────────────────────────────────────────────────
-    // 根据元素数量自动选择串行或使用全局线程池并行，避免小矩阵的线程池调度开销
-    // 线程池在首次使用时懒初始化，训练期间常驻，避免反复创建/销毁
+    // 根据元素数量自动选择串行或使用全局线程池并行。
+    // 线程池采用 latch + 调用者参与设计：一次批量入队 + 原子计数器，
+    // 消除了旧版 N×submit + N×future 的堆分配和同步开销。
     struct SmartPolicy {
-        static constexpr long long PARALLEL_THRESHOLD = 100000; // 100K元素（实测最优）
+        // 阈值 = 每核最小分块 × 2，确保至少有 2 个分块可并行。
+        // chunk_count() 已自动按核心数缩放（min(cores, total/4096)），
+        // 阈值只需设最低门槛，核心利用随数据量自然增长。
+        inline static const std::size_t PARALLEL_THRESHOLD = 4096 * 2;  // 8192
         
         // for_each 版本
         template<typename Iterator, typename Func>
         static void for_each(Iterator first, Iterator last, Func&& func) {
-            const auto n = static_cast<long long>(std::distance(first, last));
+            const auto n = static_cast<std::size_t>(std::distance(first, last));
             if (n >= PARALLEL_THRESHOLD) {
                 global_thread_pool().parallel_for_each(first, last, std::forward<Func>(func));
             } else {
@@ -46,7 +50,7 @@ namespace nn
         // transform 版本（一元）
         template<typename InputIt, typename OutputIt, typename UnaryOp>
         static void transform(InputIt first, InputIt last, OutputIt d_first, UnaryOp&& op) {
-            const auto n = static_cast<long long>(std::distance(first, last));
+            const auto n = static_cast<std::size_t>(std::distance(first, last));
             if (n >= PARALLEL_THRESHOLD) {
                 global_thread_pool().parallel_transform(first, last, d_first, std::forward<UnaryOp>(op));
             } else {
@@ -57,7 +61,7 @@ namespace nn
         // transform 版本（二元）
         template<typename InputIt1, typename InputIt2, typename OutputIt, typename BinaryOp>
         static void transform(InputIt1 first1, InputIt1 last1, InputIt2 first2, OutputIt d_first, BinaryOp&& op) {
-            const auto n = static_cast<long long>(std::distance(first1, last1));
+            const auto n = static_cast<std::size_t>(std::distance(first1, last1));
             if (n >= PARALLEL_THRESHOLD) {
                 global_thread_pool().parallel_transform(first1, last1, first2, d_first, std::forward<BinaryOp>(op));
             } else {
@@ -68,10 +72,10 @@ namespace nn
         // transform_reduce 版本（一元 transform）
         template<typename InputIt, typename T, typename BinaryOp, typename UnaryOp>
         static T transform_reduce(InputIt first, InputIt last, T init, BinaryOp&& reduce_op, UnaryOp&& transform_op) {
-            const auto n = static_cast<long long>(std::distance(first, last));
+            const auto n = static_cast<std::size_t>(std::distance(first, last));
             if (n >= PARALLEL_THRESHOLD) {
                 return global_thread_pool().parallel_transform_reduce(
-                    first, last, first, init,
+                    first, last, init,
                     std::forward<BinaryOp>(reduce_op), std::forward<UnaryOp>(transform_op));
             } else {
                 return std::transform_reduce(std::execution::seq, first, last, init, 
@@ -82,7 +86,7 @@ namespace nn
         // transform_reduce 版本（二元 transform，两个输入范围）
         template<typename InputIt1, typename InputIt2, typename T, typename BinaryOp, typename UnaryOp>
         static T transform_reduce(InputIt1 first1, InputIt1 last1, InputIt2 first2, T init, BinaryOp&& reduce_op, UnaryOp&& transform_op) {
-            const auto n = static_cast<long long>(std::distance(first1, last1));
+            const auto n = static_cast<std::size_t>(std::distance(first1, last1));
             if (n >= PARALLEL_THRESHOLD) {
                 return global_thread_pool().parallel_transform_reduce(first1, last1, first2, init,
                                                                     std::forward<BinaryOp>(reduce_op),

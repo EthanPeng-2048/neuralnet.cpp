@@ -8,27 +8,39 @@
 neuralnet.cpp/
 ├── .gitignore
 ├── CMakeLists.txt
+├── ARCHITECTURE.md          ← 架构文档
+├── DEVELOPMENT_STANDARDS.md ← 开发规范
 ├── README.md
-├── gui.py                  ← 图形化操作界面
-├── csv_png.py
-├── extract_digits.py
-├── save_dataset.py
-├── build/
-│   ├── mnist_infer.exe
+├── gui.py                   ← 图形化操作界面 (Tkinter)
+├── csv_png.py               ← CSV 转 PNG 图像
+├── extract_digits.py        ← 从 MNIST CSV 提取单个数字
+├── save_dataset.py          ← 下载 MNIST 数据集
+├── build/                   ← CMake 构建输出
 │   ├── mnist_train.exe
-│   └── mnist_data/
-│       ├── test.csv
-│       └── train.csv
+│   └── mnist_infer.exe
 ├── include/
 │   └── neuralnet.cpp/
-│       ├── layer.hpp
-│       ├── loss.hpp
-│       ├── matrix.hpp
-│       └── optimizer.hpp
-└── src/
-    ├── infer.cpp
-    └── train.cpp
+│       ├── nn.hpp              ← 统一入口头文件
+│       ├── nn_config.hpp       ← SmartPolicy、BLOCK_SIZE 等配置
+│       ├── thread_pool.hpp     ← 全局线程池
+│       ├── matrix.hpp          ← Matrix 类（列主序）
+│       ├── layer.hpp           ← Layer 基类 + Linear/ReLU/GeLU/LayerNorm/PositionalEncoding
+│       ├── loss.hpp            ← Loss 基类 + MSELoss/CrossEntropyLoss
+│       ├── optimizer.hpp       ← SGD / SGD_w_Momentum / Adam
+│       ├── model.hpp           ← Model 容器（链式 add<>）
+│       ├── model_io.hpp        ← 二进制模型序列化
+│       └── mnist_common.hpp    ← MNIST 常量与 build_mnist_model()
+├── src/
+│   ├── train.cpp
+│   └── infer.cpp
+├── datasets/
+│   ├── mnist_data/          ← MNIST CSV 数据
+│   └── test/                ← 按数字分类的测试图片
+└── pretrained/
+    └── mnist_model.bin      ← 预训练模型
 ```
+
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/EthanPeng-2048/neuralnet.cpp)
 
 ## 依赖
 
@@ -56,14 +68,17 @@ python save_dataset.py
 ### 运行训练
 
 ```bash
-# 从头开始训练
+# 从头开始训练（默认: 10轮, 学习率0.001, 批大小64, Adam优化器）
 ./build/mnist_train
 
 # 从已有模型恢复训练
-./build/mnist_train --load mnist_model.bin
+./build/mnist_train --resume pretrained/mnist_model.bin
 
-# 指定保存路径
-./build/mnist_train --save my_model.bin
+# 自定义参数
+./build/mnist_train --epochs 20 --lr 0.001 --batch-size 32 --optimizer adam --save my_model.bin
+
+# 支持的优化器: sgd / sgd_w_momentum / adam
+./build/mnist_train --optimizer sgd_w_momentum
 ```
 
 ### 🖥️ 图形化界面 (GUI)
@@ -87,21 +102,37 @@ python gui.py
 
 ## 网络结构
 
+默认 MNIST 架构（定义在 `mnist_common.hpp`）：
+
 ```
-输入 (784) → Linear(64) → ReLU → Linear(64) → ReLU → Linear(64) → ReLU → Linear(10)
+输入 (784)
+→ Linear(784 → 512) + LayerNorm + GeLU
+→ Linear(512 → 256) + LayerNorm + GeLU
+→ Linear(256 → 128) + LayerNorm + GeLU
+→ Linear(128 → 64)  + LayerNorm + GeLU
+→ Linear(64  → 10)
+→ CrossEntropy Loss (含 Softmax)
 ```
 
 ## 提供的组件
 
 | 组件 | 说明 |
 |------|------|
-| `nn::Matrix` | 列主序矩阵，支持并行加/减/乘/转置 |
-| `nn::Linear` | 全连接层（含 Xavier 初始化） |
+| `nn::Matrix` | 列主序矩阵，支持并行加/减/乘/转置、预分配缓冲区 |
+| `nn::Model` | 网络容器，支持链式 `add<LayerType>()` 构建 |
+| `nn::Linear` | 全连接层（含 Xavier 均匀初始化、融合 bias 计算） |
 | `nn::ReLU` | ReLU 激活函数 |
+| `nn::GeLU` | QuickGeLU 激活函数（`x · σ(1.702x)`） |
+| `nn::LayerNorm` | 层归一化（含可学习 γ/β 参数） |
+| `nn::PositionalEncoding` | 正弦/余弦位置编码（Transformer 用） |
 | `nn::MSELoss` | 均方误差损失 |
-| `CrossEntropyLoss` | 交叉熵损失（含数值稳定 Softmax，在 `train.cpp` 中定义） |
+| `nn::CrossEntropyLoss` | 交叉熵损失（含数值稳定 Softmax，`loss.hpp` 中定义） |
 | `nn::SGD` | 随机梯度下降优化器 |
-| `save_model` / `load_model` | 二进制模型序列化 |
+| `nn::SGD_w_Momentum` | 动量 SGD 优化器 |
+| `nn::Adam` | Adam 优化器（一阶/二阶矩估计） |
+| `nn::SmartPolicy` | 自适应并行策略：小矩阵串行，大矩阵线程池并行 |
+| `nn::ThreadPool` | 全局单例线程池（懒初始化） |
+| `nn::save_model` / `nn::load_model` | 二进制模型序列化 |
 
 ## 📐 开发规范
 
