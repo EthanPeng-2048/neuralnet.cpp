@@ -62,4 +62,5 @@ pretrained/
 # Datasets
 datasets/
 dataset.txt
+gpt_vocab.txt
 ```
