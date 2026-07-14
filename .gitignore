@@ -54,4 +54,8 @@ target/
 *.ear
 obj/
 bin/
+
+# Pretrained models
+*.bin
+pretrained/
 ```
