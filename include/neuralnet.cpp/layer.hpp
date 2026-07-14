@@ -1362,6 +1362,646 @@ namespace nn
             return grad_input;
         }
     };
+
+    // ── 因果自注意力层 (Causal Self-Attention) ──────────────────────────
+    // 用于 GPT 风格的自回归语言模型。
+    // 与 MultiHeadAttention 的区别：在 softmax 前施加上三角因果掩码，
+    // 保证位置 i 只能关注位置 ≤ i 的 token。
+    //
+    // 输入形状: (d_model, seq_len)，输出形状: (d_model, seq_len)
+    // ─────────────────────────────────────────────────────────────────────
+    class CausalSelfAttention final : public Layer
+    {
+    private:
+        std::size_t d_model_;
+        std::size_t num_heads_;
+        std::size_t d_k_;
+        double scale_;
+
+        // 投影层
+        Linear W_q_;
+        Linear W_k_;
+        Linear W_v_;
+        Linear W_o_;
+
+        // 前向传播缓存
+        Matrix Q_cache_;
+        Matrix K_cache_;
+        Matrix V_cache_;
+        std::vector<Matrix> attn_;           // num_heads_ × (seq_len, seq_len)
+        std::vector<Matrix> Q_heads_;
+        std::vector<Matrix> K_heads_;
+        std::vector<Matrix> V_heads_;
+        std::vector<Matrix> O_heads_;
+
+        // 因果掩码 (上三角为 -inf)
+        std::vector<double> mask_data_;     // max_len × max_len
+
+        // 辅助缓冲区
+        Matrix grad_scores_buf_;
+        Matrix grad_A_buf_;
+        Matrix grad_O_h_buf_;
+        Softmax softmax_;
+
+        static void extract_rows(const Matrix &src, std::size_t row_start,
+                                 std::size_t row_count, Matrix &dst)
+        {
+            const std::size_t cols = src.cols();
+            dst.resize(row_count, cols);
+            const auto src_span = src.span();
+            auto dst_span = dst.span();
+            for (std::size_t r = 0; r < row_count; ++r)
+                std::copy_n(src_span.begin() + (row_start + r) * cols, cols,
+                            dst_span.begin() + r * cols);
+        }
+
+        static void insert_rows(Matrix &dst, std::size_t row_start,
+                                const Matrix &src)
+        {
+            const std::size_t row_count = src.rows();
+            const std::size_t cols = src.cols();
+            auto dst_span = dst.span();
+            const auto src_span = src.span();
+            for (std::size_t r = 0; r < row_count; ++r)
+                std::copy_n(src_span.begin() + r * cols, cols,
+                            dst_span.begin() + (row_start + r) * cols);
+        }
+
+        static void scale_inplace(Matrix &m, double s)
+        {
+            auto m_span = m.span();
+            const auto n = m.size();
+            if (n >= SmartPolicy::PARALLEL_THRESHOLD)
+            {
+                auto indices = std::views::iota(std::size_t{0}, n);
+                SmartPolicy::for_each(indices.begin(), indices.end(),
+                    [m_span, s](std::size_t i) noexcept { m_span[i] *= s; });
+            }
+            else
+            {
+                for (std::size_t i = 0; i < n; ++i)
+                    m_span[i] *= s;
+            }
+        }
+
+    public:
+        CausalSelfAttention(std::size_t d_model, std::size_t num_heads,
+                            std::size_t max_len = 1024)
+            : d_model_(d_model),
+              num_heads_(num_heads),
+              d_k_(d_model / num_heads),
+              scale_(1.0 / std::sqrt(static_cast<double>(d_model / num_heads))),
+              W_q_(d_model, d_model),
+              W_k_(d_model, d_model),
+              W_v_(d_model, d_model),
+              W_o_(d_model, d_model),
+              mask_data_(max_len * max_len, 0.0)
+        {
+            if (d_model % num_heads != 0)
+                throw std::invalid_argument(
+                    "CausalSelfAttention: d_model must be divisible by num_heads");
+
+            // 预计算因果掩码: mask[i][j] = 0 if j <= i else -inf
+            const double neg_inf = -1e30;
+            for (std::size_t i = 0; i < max_len; ++i)
+                for (std::size_t j = 0; j < max_len; ++j)
+                    mask_data_[i * max_len + j] = (j <= i) ? 0.0 : neg_inf;
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            auto params = W_q_.parameters();
+            auto wk = W_k_.parameters();
+            auto wv = W_v_.parameters();
+            auto wo = W_o_.parameters();
+            params.insert(params.end(), wk.begin(), wk.end());
+            params.insert(params.end(), wv.begin(), wv.end());
+            params.insert(params.end(), wo.begin(), wo.end());
+            return params;
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            auto grads = W_q_.param_gradients();
+            auto gk = W_k_.param_gradients();
+            auto gv = W_v_.param_gradients();
+            auto go = W_o_.param_gradients();
+            grads.insert(grads.end(), gk.begin(), gk.end());
+            grads.insert(grads.end(), gv.begin(), gv.end());
+            grads.insert(grads.end(), go.begin(), go.end());
+            return grads;
+        }
+
+        Matrix forward(const Matrix &input) override
+        {
+            if (input.rows() != d_model_)
+                throw std::invalid_argument(
+                    "CausalSelfAttention forward input shape mismatch");
+
+            const std::size_t seq_len = input.cols();
+
+            // 1. 线性投影
+            Q_cache_ = W_q_.forward(input);
+            K_cache_ = W_k_.forward(input);
+            V_cache_ = W_v_.forward(input);
+
+            // 2. 分配 per-head 缓冲区
+            Q_heads_.resize(num_heads_);
+            K_heads_.resize(num_heads_);
+            V_heads_.resize(num_heads_);
+            O_heads_.resize(num_heads_);
+            attn_.resize(num_heads_);
+
+            // 3. 逐头计算因果自注意力
+            for (std::size_t h = 0; h < num_heads_; ++h)
+            {
+                const std::size_t row_start = h * d_k_;
+
+                extract_rows(Q_cache_, row_start, d_k_, Q_heads_[h]);
+                extract_rows(K_cache_, row_start, d_k_, K_heads_[h]);
+                extract_rows(V_cache_, row_start, d_k_, V_heads_[h]);
+
+                // S = Q_h^T @ K_h → (seq_len, seq_len)
+                Matrix QhT = Q_heads_[h].transpose();
+                attn_[h].resize(seq_len, seq_len);
+                QhT.multiply_to(attn_[h], K_heads_[h]);
+
+                // 施加因果掩码
+                {
+                    auto a_span = attn_[h].span();
+                    const auto m_span = mask_data_.data();
+                    const std::size_t s2 = seq_len * seq_len;
+                    for (std::size_t idx = 0; idx < s2; ++idx)
+                        a_span[idx] += m_span[idx];
+                }
+
+                // 缩放
+                scale_inplace(attn_[h], scale_);
+
+                // softmax
+                attn_[h] = softmax_.forward(attn_[h]);
+
+                // O_h = V_h @ A_h
+                O_heads_[h].resize(d_k_, seq_len);
+                V_heads_[h].multiply_to(O_heads_[h], attn_[h]);
+            }
+
+            // 4. 拼接 + 输出投影
+            Matrix output(d_model_, seq_len);
+            for (std::size_t h = 0; h < num_heads_; ++h)
+                insert_rows(output, h * d_k_, O_heads_[h]);
+
+            return W_o_.forward(output);
+        }
+
+        Matrix backward(const Matrix &grad_output) override
+        {
+            const std::size_t seq_len = grad_output.cols();
+
+            // 1. 输出投影反向
+            Matrix grad_concat = W_o_.backward(grad_output);
+
+            // 2. 初始化全局梯度
+            Matrix grad_Q_all(d_model_, seq_len);
+            Matrix grad_K_all(d_model_, seq_len);
+            Matrix grad_V_all(d_model_, seq_len);
+            grad_Q_all.zero();
+            grad_K_all.zero();
+            grad_V_all.zero();
+
+            // 3. 逐头反向
+            for (std::size_t h = 0; h < num_heads_; ++h)
+            {
+                const std::size_t row_start = h * d_k_;
+                const Matrix &Q_h = Q_heads_[h];
+                const Matrix &K_h = K_heads_[h];
+                const Matrix &V_h = V_heads_[h];
+                const Matrix &A_h = attn_[h];
+
+                extract_rows(grad_concat, row_start, d_k_, grad_O_h_buf_);
+
+                // grad_V_h = grad_O_h @ A_h^T
+                Matrix AhT = A_h.transpose();
+                Matrix grad_V_h(d_k_, seq_len);
+                grad_O_h_buf_.multiply_to(grad_V_h, AhT);
+
+                // grad_A_h = V_h^T @ grad_O_h
+                Matrix VhT = V_h.transpose();
+                grad_A_buf_.resize(seq_len, seq_len);
+                VhT.multiply_to(grad_A_buf_, grad_O_h_buf_);
+
+                // grad_S_h = A_h ⊙ (grad_A_h - row_sum(A_h ⊙ grad_A_h))
+                grad_scores_buf_.resize(seq_len, seq_len);
+                {
+                    const auto a_span = A_h.span();
+                    const auto ga_span = grad_A_buf_.span();
+                    auto gs_span = grad_scores_buf_.span();
+
+                    for (std::size_t i = 0; i < seq_len; ++i)
+                    {
+                        double dot = 0.0;
+                        for (std::size_t j = 0; j < seq_len; ++j)
+                            dot += a_span[i * seq_len + j] * ga_span[i * seq_len + j];
+                        for (std::size_t j = 0; j < seq_len; ++j)
+                            gs_span[i * seq_len + j] =
+                                a_span[i * seq_len + j] * (ga_span[i * seq_len + j] - dot);
+                    }
+                }
+
+                // grad_Q_h = K_h @ grad_S_h^T * scale
+                Matrix gsT = grad_scores_buf_.transpose();
+                Matrix grad_Q_h(d_k_, seq_len);
+                K_h.multiply_to(grad_Q_h, gsT);
+                scale_inplace(grad_Q_h, scale_);
+
+                // grad_K_h = Q_h @ grad_S_h * scale
+                Matrix grad_K_h(d_k_, seq_len);
+                Q_h.multiply_to(grad_K_h, grad_scores_buf_);
+                scale_inplace(grad_K_h, scale_);
+
+                insert_rows(grad_Q_all, row_start, grad_Q_h);
+                insert_rows(grad_K_all, row_start, grad_K_h);
+                insert_rows(grad_V_all, row_start, grad_V_h);
+            }
+
+            // 4. 投影层反向
+            Matrix grad_input = W_q_.backward(grad_Q_all);
+            grad_input = grad_input + W_k_.backward(grad_K_all);
+            grad_input = grad_input + W_v_.backward(grad_V_all);
+
+            return grad_input;
+        }
+    };
+
+    // ── GPT Transformer 块 (Pre-Norm Decoder Block) ──────────────────
+    //   x = x + CausalSelfAttn(LayerNorm₁(x))
+    //   x = x + FFN(LayerNorm₂(x))
+    // 输入/输出形状: (d_model, seq_len)
+    class GPTBlock final : public Layer
+    {
+    private:
+        CausalSelfAttention self_attn_;
+        LayerNorm norm1_;
+        FeedForward ff_;
+        LayerNorm norm2_;
+
+        Matrix residual1_cache_;
+        Matrix residual2_cache_;
+
+    public:
+        GPTBlock(std::size_t d_model, std::size_t num_heads, std::size_t d_ff,
+                 std::size_t max_len = 1024)
+            : self_attn_(d_model, num_heads, max_len),
+              norm1_(d_model),
+              ff_(d_model, d_ff),
+              norm2_(d_model)
+        {}
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            auto params = self_attn_.parameters();
+            auto n1 = norm1_.parameters();
+            auto f  = ff_.parameters();
+            auto n2 = norm2_.parameters();
+            params.insert(params.end(), n1.begin(), n1.end());
+            params.insert(params.end(), f.begin(), f.end());
+            params.insert(params.end(), n2.begin(), n2.end());
+            return params;
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            auto grads = self_attn_.param_gradients();
+            auto gn1 = norm1_.param_gradients();
+            auto gf  = ff_.param_gradients();
+            auto gn2 = norm2_.param_gradients();
+            grads.insert(grads.end(), gn1.begin(), gn1.end());
+            grads.insert(grads.end(), gf.begin(), gf.end());
+            grads.insert(grads.end(), gn2.begin(), gn2.end());
+            return grads;
+        }
+
+        Matrix forward(const Matrix &input) override
+        {
+            // 子层1: CausalSelfAttention + 残差
+            residual1_cache_ = input;
+            auto norm1_out = norm1_.forward(input);
+            auto attn_out  = self_attn_.forward(norm1_out);
+            residual2_cache_ = input + attn_out;
+
+            // 子层2: FFN + 残差
+            auto norm2_out = norm2_.forward(residual2_cache_);
+            auto ff_out    = ff_.forward(norm2_out);
+            return residual2_cache_ + ff_out;
+        }
+
+        Matrix backward(const Matrix &grad_output) override
+        {
+            Matrix grad_residual1 = grad_output;
+            Matrix grad_ff_out    = grad_output;
+
+            auto grad_norm2 = ff_.backward(grad_ff_out);
+            grad_residual1 = grad_residual1 + norm2_.backward(grad_norm2);
+
+            Matrix grad_input = grad_residual1;
+            Matrix grad_attn_out = grad_residual1;
+
+            auto grad_norm1 = self_attn_.backward(grad_attn_out);
+            grad_input = grad_input + norm1_.backward(grad_norm1);
+
+            return grad_input;
+        }
+    };
+
+    // ── GPT 语言模型 ─────────────────────────────────────────────────
+    // Decoder-only Transformer 用于自回归文本生成。
+    //
+    // 组件: TokenEmbedding + PositionalEncoding + N × GPTBlock + LayerNorm + LM Head
+    //
+    // 输入: (seq_len, batch_size) — token ID 矩阵（每列为一个序列）
+    // 输出: (vocab_size, seq_len × batch_size) — 每个位置的 logits
+    //
+    // 传播流程:
+    //   输入: (seq_len, batch) token IDs
+    //   → Embed: (d_model, seq_len × batch)
+    //   → + PE: (d_model, seq_len × batch)
+    //   → N × GPTBlock: (d_model, seq_len × batch)
+    //   → LayerNorm: (d_model, seq_len × batch)
+    //   → LM Head: (vocab_size, seq_len × batch)
+    // ────────────────────────────────────────────────────────────────────
+    class GPTModel final : public Layer
+    {
+    private:
+        std::size_t vocab_size_;
+        std::size_t d_model_;
+        std::size_t seq_len_;
+
+        // 嵌入层
+        Matrix token_emb_;      // (vocab_size, d_model) — 查找表
+        Matrix grad_token_emb_;
+
+        // 位置编码（可学习）
+        Matrix pos_emb_;        // (max_seq_len, d_model)
+        Matrix grad_pos_emb_;
+
+        // Transformer 块
+        std::vector<GPTBlock> blocks_;
+
+        // 最终 LayerNorm
+        LayerNorm ln_f_;
+
+        // LM Head（权重与 token_emb_ 共享或独立）
+        Linear lm_head_;        // (vocab_size, d_model)
+
+        // 反向传播缓存
+        std::vector<Matrix> stored_inputs_;   // 每个样本经 PE 后的输入
+        std::vector<std::vector<std::size_t>> stored_tokens_; // token IDs
+        std::size_t batch_size_{0};
+
+        static constexpr double EMB_INIT_STD = 0.02;
+
+    public:
+        GPTModel(std::size_t vocab_size, std::size_t d_model, std::size_t seq_len,
+                 std::size_t num_heads, std::size_t d_ff, std::size_t num_layers)
+            : vocab_size_(vocab_size), d_model_(d_model), seq_len_(seq_len),
+              token_emb_(vocab_size, d_model),
+              pos_emb_(seq_len, d_model),
+              ln_f_(d_model),
+              lm_head_(d_model, vocab_size)
+        {
+            // Xavier-like 初始化嵌入
+            {
+                const double limit = EMB_INIT_STD;
+                std::mt19937_64 rng{42};
+                std::normal_distribution<double> dist(0.0, limit);
+                for (auto &v : token_emb_.data())
+                    v = dist(rng);
+                for (auto &v : pos_emb_.data())
+                    v = dist(rng);
+            }
+
+            for (std::size_t i = 0; i < num_layers; ++i)
+                blocks_.emplace_back(d_model, num_heads, d_ff, seq_len);
+        }
+
+        // ── 可学习嵌入参数 ─────────────────────────────────────────
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            std::vector<std::reference_wrapper<Matrix>> params;
+            params.push_back(std::ref(token_emb_));
+            params.push_back(std::ref(pos_emb_));
+            for (auto &b : blocks_)
+            {
+                auto bp = b.parameters();
+                params.insert(params.end(), bp.begin(), bp.end());
+            }
+            auto lp = ln_f_.parameters();
+            params.insert(params.end(), lp.begin(), lp.end());
+            auto hp = lm_head_.parameters();
+            params.insert(params.end(), hp.begin(), hp.end());
+            return params;
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            std::vector<std::reference_wrapper<Matrix>> grads;
+            grads.push_back(std::ref(grad_token_emb_));
+            grads.push_back(std::ref(grad_pos_emb_));
+            for (auto &b : blocks_)
+            {
+                auto bg = b.param_gradients();
+                grads.insert(grads.end(), bg.begin(), bg.end());
+            }
+            auto lg = ln_f_.param_gradients();
+            grads.insert(grads.end(), lg.begin(), lg.end());
+            auto hg = lm_head_.param_gradients();
+            grads.insert(grads.end(), hg.begin(), hg.end());
+            return grads;
+        }
+
+        // ── 前向传播 ────────────────────────────────────────────────
+        // input: (seq_len, batch_size) — token IDs 作为 double
+        Matrix forward(const Matrix &input) override
+        {
+            const std::size_t seq_len = input.rows();
+            batch_size_ = input.cols();
+            stored_inputs_.resize(batch_size_);
+            stored_tokens_.resize(batch_size_);
+
+            // 输出: (vocab_size, seq_len × batch_size)
+            Matrix output(vocab_size_, seq_len * batch_size_);
+
+            for (std::size_t b = 0; b < batch_size_; ++b)
+            {
+                // 1. Token 嵌入 + 位置嵌入 → (d_model, seq_len)
+                Matrix x(d_model_, seq_len);
+                for (std::size_t t = 0; t < seq_len; ++t)
+                {
+                    auto token_id = static_cast<std::size_t>(input.at_unchecked(t, b));
+                    if (token_id >= vocab_size_)
+                        token_id = 0; // fallback to PAD
+                    stored_tokens_[b].push_back(token_id);
+
+                    const auto emb_span = token_emb_.span();
+                    const auto pos_span = pos_emb_.span();
+                    auto out_span = x.span();
+                    for (std::size_t d = 0; d < d_model_; ++d)
+                        out_span[d * seq_len + t] =
+                            emb_span[token_id * d_model_ + d] +
+                            pos_span[t * d_model_ + d];
+                }
+
+                stored_inputs_[b] = x;
+
+                // 2. 通过 Transformer 块
+                for (std::size_t l = 0; l < blocks_.size(); ++l)
+                    x = blocks_[l].forward(x);
+
+                // 3. 最终 LayerNorm
+                x = ln_f_.forward(x);
+
+                // 4. LM Head: (d_model, seq_len) → (vocab_size, seq_len)
+                Matrix logits = lm_head_.forward(x);
+
+                // 5. 写入输出 (vocab_size, seq_len × batch)
+                //    布局: 列 t * batch_size + b 对应样本 b 的位置 t
+                auto log_span = logits.span();
+                auto out_span = output.span();
+                for (std::size_t r = 0; r < vocab_size_; ++r)
+                    for (std::size_t t = 0; t < seq_len; ++t)
+                        out_span[r * (seq_len * batch_size_) + t * batch_size_ + b] =
+                            log_span[r * seq_len + t];
+            }
+
+            return output;
+        }
+
+        // ── 反向传播 ────────────────────────────────────────────────
+        // grad_output: (vocab_size, seq_len × batch_size)
+        Matrix backward(const Matrix &grad_output) override
+        {
+            const std::size_t seq_len = seq_len_;
+            grad_token_emb_.zero();
+            grad_pos_emb_.zero();
+
+            Matrix grad_input(seq_len, batch_size_);
+            grad_input.zero();
+
+            for (std::size_t b = 0; b < batch_size_; ++b)
+            {
+                // 提取该样本的梯度: (vocab_size, seq_len)
+                Matrix grad_logits(vocab_size_, seq_len);
+                auto go_span = grad_output.span();
+                auto gl_span = grad_logits.span();
+                for (std::size_t r = 0; r < vocab_size_; ++r)
+                    for (std::size_t t = 0; t < seq_len; ++t)
+                        gl_span[r * seq_len + t] =
+                            go_span[r * (seq_len * batch_size_) + t * batch_size_ + b];
+
+                // Re-forward 重建缓存
+                Matrix x = stored_inputs_[b];
+                for (std::size_t l = 0; l < blocks_.size(); ++l)
+                    x = blocks_[l].forward(x);
+                x = ln_f_.forward(x);
+
+                // LM Head 反向 → (d_model, seq_len)
+                Matrix grad_ln = lm_head_.backward(grad_logits);
+
+                // LayerNorm 反向
+                grad_ln = ln_f_.backward(grad_ln);
+
+                // 逐块反向
+                for (int l = static_cast<int>(blocks_.size()) - 1; l >= 0; --l)
+                    grad_ln = blocks_[l].backward(grad_ln);
+
+                // 累加嵌入梯度
+                const auto tokens = stored_tokens_[b];
+                for (std::size_t t = 0; t < seq_len; ++t)
+                {
+                    const std::size_t tid = tokens[t];
+                    // token embedding 梯度
+                    for (std::size_t d = 0; d < d_model_; ++d)
+                        grad_token_emb_.data()[tid * d_model_ + d] +=
+                            grad_ln.at_unchecked(d, t);
+                    // positional embedding 梯度
+                    for (std::size_t d = 0; d < d_model_; ++d)
+                        grad_pos_emb_.data()[t * d_model_ + d] +=
+                            grad_ln.at_unchecked(d, t);
+                    // grad_input (token IDs 无梯度，此处仅用于接口一致性)
+                    grad_input.set_value_unchecked(t, b, 0.0);
+                }
+            }
+
+            return grad_input;
+        }
+
+        // ── 采样生成（贪心） ────────────────────────────────────────
+        std::vector<std::size_t> generate(const std::vector<std::size_t> &prompt,
+                                          std::size_t max_new_tokens,
+                                          double temperature = 1.0)
+        {
+            std::vector<std::size_t> context(prompt);
+            std::vector<std::size_t> generated;
+
+            for (std::size_t step = 0; step < max_new_tokens; ++step)
+            {
+                // 截取最后 seq_len 个 token
+                std::size_t start = 0;
+                if (context.size() > seq_len_)
+                    start = context.size() - seq_len_;
+
+                std::size_t cur_len = context.size() - start;
+                Matrix input(cur_len, 1);
+                for (std::size_t t = 0; t < cur_len; ++t)
+                    input.set_value_unchecked(t, 0,
+                        static_cast<double>(context[start + t]));
+
+                auto logits = forward(input); // (vocab_size, cur_len)
+
+                // 取最后一个位置的 logits
+                std::vector<double> last_logits(vocab_size_);
+                for (std::size_t v = 0; v < vocab_size_; ++v)
+                    last_logits[v] = logits.at_unchecked(v, cur_len - 1);
+
+                // temperature
+                if (temperature != 1.0)
+                {
+                    for (auto &v : last_logits)
+                        v /= temperature;
+                }
+
+                // softmax
+                double max_val = last_logits[0];
+                for (std::size_t v = 1; v < vocab_size_; ++v)
+                    max_val = std::max(max_val, last_logits[v]);
+                double sum_exp = 0.0;
+                for (auto &v : last_logits)
+                {
+                    v = std::exp(v - max_val);
+                    sum_exp += v;
+                }
+                for (auto &v : last_logits)
+                    v /= sum_exp;
+
+                // 采样（这里用贪心，可扩展为 top-k）
+                std::size_t next_token = 0;
+                double best = last_logits[0];
+                for (std::size_t v = 1; v < vocab_size_; ++v)
+                {
+                    if (last_logits[v] > best)
+                    {
+                        best = last_logits[v];
+                        next_token = v;
+                    }
+                }
+
+                context.push_back(next_token);
+                generated.push_back(next_token);
+            }
+
+            return generated;
+        }
+    };
 }
 
 #endif
