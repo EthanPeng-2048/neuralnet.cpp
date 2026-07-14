@@ -5,8 +5,10 @@
 #include <string>
 #include <vector>
 #include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <algorithm>
+#include <unordered_map>
 
 #include "model.hpp"
 #include "layer.hpp"
