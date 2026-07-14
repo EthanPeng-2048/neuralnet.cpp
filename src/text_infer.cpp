@@ -103,10 +103,9 @@ std::vector<std::size_t> generate_text(
 }
 
 // ==================== 交互模式 ====================
-void interactive_mode(nn::Model &model, const InferConfig &cfg)
+void interactive_mode(nn::Model &model, const nn::WordTokenizer &tokenizer,
+                     const InferConfig &cfg)
 {
-    nn::CharTokenizer tokenizer;
-
     std::cout << "GPT 交互式生成 (输入 'quit' 退出)\n\n";
 
     while (true)
@@ -156,19 +155,22 @@ int main(int argc, char *argv[])
     try
     {
         InferConfig cfg = parse_args(argc, argv);
-        nn::CharTokenizer tokenizer;
 
-        // ── 加载模型 ─────────────────────────────────────────────
+        // ── 加载分词器与模型 ─────────────────────────────────────
+        nn::WordTokenizer tokenizer;
+        tokenizer.load_vocab("gpt_vocab.txt");
+        std::cout << "词表: " << tokenizer.vocab_size() << " 词" << std::endl;
+
         std::cout << "加载模型: " << cfg.model_path << " ..." << std::endl;
         auto model = nn::build_gpt_model(
-            nn::GPT_VOCAB_SIZE, cfg.d_model, cfg.seq_len,
+            tokenizer.vocab_size(), cfg.d_model, cfg.seq_len,
             cfg.num_heads, cfg.d_ff, cfg.num_layers);
         nn::load_model(cfg.model_path, model);
         std::cout << "模型已加载\n" << std::endl;
 
         if (cfg.interactive)
         {
-            interactive_mode(model, cfg);
+            interactive_mode(model, tokenizer, cfg);
             return 0;
         }
 
