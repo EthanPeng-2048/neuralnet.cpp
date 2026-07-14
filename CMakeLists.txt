@@ -7,10 +7,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # 为所有目标添加编译标志
 add_compile_options(-fexperimental-library -O3 -ffast-math -Wall -Wextra -Wpedantic -Werror)
 
-# 定义可执行文件
-add_executable(mnist_train src/train.cpp)
-add_executable(mnist_infer src/infer.cpp)
+# ── MNIST 目标 ──────────────────────────────────────────────────────────────
+add_executable(mnist_train src/mnist_train.cpp)
+add_executable(mnist_infer src/mnist_infer.cpp)
 
-# 为特定目标添加包含目录和链接库
 target_include_directories(mnist_train PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(mnist_infer PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
+# ── 文本生成目标 ────────────────────────────────────────────────────────────
+add_executable(text_train src/text_train.cpp)
+add_executable(text_infer src/text_infer.cpp)
+
+target_include_directories(text_train PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(text_infer PRIVATE ${CMAKE_SOURCE_DIR}/include)
