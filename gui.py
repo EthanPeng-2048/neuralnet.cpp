@@ -17,7 +17,10 @@ from pathlib import Path
 BUILD_DIR = Path(__file__).parent / "build"
 TRAIN_EXE = BUILD_DIR / "mnist_train.exe"
 INFER_EXE = BUILD_DIR / "mnist_infer.exe"
+TEXT_TRAIN_EXE = BUILD_DIR / "text_train.exe"
+TEXT_INFER_EXE = BUILD_DIR / "text_infer.exe"
 DEFAULT_MODEL = Path(__file__).parent / "pretrained" / "model.bin"
+DEFAULT_GPT_MODEL = Path(__file__).parent / "gpt_model.bin"
 DEFAULT_DATASET = Path(__file__).parent / "datasets" / "mnist_data"
 PIXEL_SIZE = 8          # 每像素的显示尺寸 (28×28 → 224×224 画布)
 IMG_DIM = 28
@@ -49,7 +52,7 @@ def draw_digit(canvas: tk.Canvas, pixels: list[float], offset_x=0, offset_y=0):
 class NeuralNetGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("neuralnet.cpp — MNIST 训练 & 推理")
+        self.title("neuralnet.cpp — MNIST & GPT 训练 & 推理")
         self.resizable(False, False)
 
         # 主题风格
@@ -78,6 +81,16 @@ class NeuralNetGUI(tk.Tk):
         self.viewer_frame = ttk.Frame(notebook, padding=8)
         notebook.add(self.viewer_frame, text="  🖼️ 图片查看  ")
         self._build_viewer_tab()
+
+        # ── GPT 训练 Tab ──
+        self.text_train_frame = ttk.Frame(notebook, padding=8)
+        notebook.add(self.text_train_frame, text="  📝 GPT 训练  ")
+        self._build_text_train_tab()
+
+        # ── GPT 推理 Tab ──
+        self.text_infer_frame = ttk.Frame(notebook, padding=8)
+        notebook.add(self.text_infer_frame, text="  💬 GPT 推理  ")
+        self._build_text_infer_tab()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -560,6 +573,332 @@ class NeuralNetGUI(tk.Tk):
             self.infer_log.insert("end", text)
             self.infer_log.see("end")
             self.infer_log.config(state="disabled")
+        self.after(0, _do)
+
+    # ============================================================
+    #  GPT 训练 Tab
+    # ============================================================
+    def _build_text_train_tab(self):
+        f = self.text_train_frame
+        row = 0
+
+        # 文本文件路径
+        ttk.Label(f, text="训练文本文件:").grid(row=row, column=0, sticky="w")
+        self.text_train_file_var = tk.StringVar()
+        ttk.Entry(f, textvariable=self.text_train_file_var, width=48).grid(row=row, column=1, padx=4)
+        ttk.Button(f, text="浏览…", command=self._browse_text_file).grid(row=row, column=2)
+        row += 1
+
+        # 保存路径
+        ttk.Label(f, text="模型保存路径:").grid(row=row, column=0, sticky="w")
+        self.text_train_save_var = tk.StringVar(value=str(DEFAULT_GPT_MODEL))
+        ttk.Entry(f, textvariable=self.text_train_save_var, width=48).grid(row=row, column=1, padx=4)
+        ttk.Button(f, text="浏览…", command=self._browse_text_save).grid(row=row, column=2)
+        row += 1
+
+        # 恢复训练
+        self.text_train_resume_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text="从已有模型恢复训练", variable=self.text_train_resume_var,
+                        command=self._toggle_text_resume).grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+
+        self.text_resume_frame = ttk.Frame(f)
+        self.text_resume_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 4))
+        ttk.Label(self.text_resume_frame, text="模型路径:").pack(side="left")
+        self.text_train_resume_path_var = tk.StringVar(value=str(DEFAULT_GPT_MODEL))
+        self.text_resume_entry = ttk.Entry(self.text_resume_frame, textvariable=self.text_train_resume_path_var, width=48)
+        self.text_resume_entry.pack(side="left", padx=4)
+        self.text_resume_btn = ttk.Button(self.text_resume_frame, text="浏览…", command=self._browse_text_resume)
+        self.text_resume_btn.pack(side="left")
+        self._toggle_text_resume()
+        row += 1
+
+        # 超参数
+        param_frame = ttk.LabelFrame(f, text="超参数", padding=6)
+        param_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+        row += 1
+
+        ttk.Label(param_frame, text="轮数:").grid(row=0, column=0, sticky="w")
+        self.text_train_epochs_var = tk.IntVar(value=10)
+        ttk.Spinbox(param_frame, from_=1, to=1000, width=6,
+                     textvariable=self.text_train_epochs_var).grid(row=0, column=1, padx=(0, 16))
+
+        ttk.Label(param_frame, text="学习率:").grid(row=0, column=2, sticky="w")
+        self.text_train_lr_var = tk.DoubleVar(value=0.001)
+        ttk.Spinbox(param_frame, from_=0.00001, to=1.0, increment=0.0001, width=8,
+                     textvariable=self.text_train_lr_var, format="%.5f").grid(row=0, column=3, padx=(0, 16))
+
+        ttk.Label(param_frame, text="批大小:").grid(row=0, column=4, sticky="w")
+        self.text_train_batch_var = tk.IntVar(value=32)
+        ttk.Spinbox(param_frame, from_=1, to=256, width=6,
+                     textvariable=self.text_train_batch_var).grid(row=0, column=5)
+
+        ttk.Label(param_frame, text="序列长度:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.text_train_seq_len_var = tk.IntVar(value=256)
+        ttk.Spinbox(param_frame, from_=16, to=1024, width=6,
+                     textvariable=self.text_train_seq_len_var).grid(row=1, column=1, pady=(6, 0))
+
+        ttk.Label(param_frame, text="优化器:").grid(row=1, column=2, sticky="w", pady=(6, 0))
+        self.text_train_opt_var = tk.StringVar(value="adam")
+        ttk.Combobox(param_frame, textvariable=self.text_train_opt_var, width=14, state="readonly",
+                     values=["sgd", "sgd_w_momentum", "adam"]).grid(row=1, column=3, sticky="w", pady=(6, 0))
+
+        # 模型架构参数
+        arch_frame = ttk.LabelFrame(f, text="模型架构", padding=6)
+        arch_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+        row += 1
+
+        ttk.Label(arch_frame, text="模型维度:").grid(row=0, column=0, sticky="w")
+        self.text_train_d_model_var = tk.IntVar(value=128)
+        ttk.Spinbox(arch_frame, from_=32, to=512, width=6,
+                     textvariable=self.text_train_d_model_var).grid(row=0, column=1, padx=(0, 16))
+
+        ttk.Label(arch_frame, text="注意力头:").grid(row=0, column=2, sticky="w")
+        self.text_train_num_heads_var = tk.IntVar(value=4)
+        ttk.Spinbox(arch_frame, from_=1, to=16, width=6,
+                     textvariable=self.text_train_num_heads_var).grid(row=0, column=3, padx=(0, 16))
+
+        ttk.Label(arch_frame, text="Transformer 层数:").grid(row=0, column=4, sticky="w")
+        self.text_train_num_layers_var = tk.IntVar(value=4)
+        ttk.Spinbox(arch_frame, from_=1, to=16, width=6,
+                     textvariable=self.text_train_num_layers_var).grid(row=0, column=5)
+
+        ttk.Label(arch_frame, text="FFN 维度:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.text_train_d_ff_var = tk.IntVar(value=512)
+        ttk.Spinbox(arch_frame, from_=64, to=2048, width=6,
+                     textvariable=self.text_train_d_ff_var).grid(row=1, column=1, pady=(6, 0))
+        row += 1
+
+        # 按钮
+        btn_frame = ttk.Frame(f)
+        btn_frame.grid(row=row, column=0, columnspan=3, pady=6)
+        row += 1
+
+        self.text_train_start_btn = ttk.Button(btn_frame, text="▶  开始训练", command=self._start_text_training)
+        self.text_train_start_btn.pack(side="left", padx=4)
+        self.text_train_stop_btn = ttk.Button(btn_frame, text="⏹  停止", command=self._stop_text_training, state="disabled")
+        self.text_train_stop_btn.pack(side="left", padx=4)
+        row += 1
+
+        # 日志输出
+        self.text_train_log = tk.Text(f, height=14, width=72, state="disabled",
+                                      font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4",
+                                      insertbackground="white")
+        self.text_train_log.grid(row=row, column=0, columnspan=3, sticky="ew")
+        scroll = ttk.Scrollbar(f, orient="vertical", command=self.text_train_log.yview)
+        scroll.grid(row=row, column=3, sticky="ns")
+        self.text_train_log["yscrollcommand"] = scroll.set
+
+    # ---- GPT 训练浏览 ----
+    def _browse_text_file(self):
+        path = filedialog.askopenfilename(title="选择训练文本文件",
+                                          filetypes=[("Text", "*.txt"), ("All", "*.*")])
+        if path:
+            self.text_train_file_var.set(path)
+
+    def _browse_text_save(self):
+        path = filedialog.asksaveasfilename(title="模型保存路径", defaultextension=".bin",
+                                            filetypes=[("Binary", "*.bin"), ("All", "*.*")])
+        if path:
+            self.text_train_save_var.set(path)
+
+    def _browse_text_resume(self):
+        path = filedialog.askopenfilename(title="选择恢复模型", filetypes=[("Binary", "*.bin"), ("All", "*.*")])
+        if path:
+            self.text_train_resume_path_var.set(path)
+
+    def _toggle_text_resume(self):
+        state = "normal" if self.text_train_resume_var.get() else "disabled"
+        self.text_resume_entry.config(state=state)
+        self.text_resume_btn.config(state=state)
+
+    # ---- GPT 训练 ----
+    def _start_text_training(self):
+        exe = str(TEXT_TRAIN_EXE)
+        if not Path(exe).exists():
+            messagebox.showerror("错误", f"找不到 text_train 可执行文件:\n{exe}\n请先构建项目")
+            return
+
+        text_file = self.text_train_file_var.get().strip()
+        if not text_file:
+            messagebox.showwarning("提示", "请选择训练文本文件")
+            return
+
+        cmd = [exe, text_file,
+               "--save", self.text_train_save_var.get(),
+               "--epochs", str(self.text_train_epochs_var.get()),
+               "--lr", str(self.text_train_lr_var.get()),
+               "--batch-size", str(self.text_train_batch_var.get()),
+               "--seq-len", str(self.text_train_seq_len_var.get()),
+               "--optimizer", self.text_train_opt_var.get(),
+               "--d-model", str(self.text_train_d_model_var.get()),
+               "--num-heads", str(self.text_train_num_heads_var.get()),
+               "--num-layers", str(self.text_train_num_layers_var.get()),
+               "--d-ff", str(self.text_train_d_ff_var.get())]
+        if self.text_train_resume_var.get():
+            cmd += ["--resume", self.text_train_resume_path_var.get()]
+
+        self._log_text_train(f"$ {' '.join(cmd)}\n")
+        self.text_train_start_btn.config(state="disabled")
+        self.text_train_stop_btn.config(state="normal")
+
+        threading.Thread(target=self._run_process, args=(cmd, self._log_text_train, self._text_train_done),
+                         daemon=True).start()
+
+    def _stop_text_training(self):
+        if self._process and self._process.poll() is None:
+            self._process.terminate()
+            self._log_text_train("\n[已终止]\n")
+        self._text_train_done()
+
+    def _text_train_done(self):
+        self.text_train_start_btn.config(state="normal")
+        self.text_train_stop_btn.config(state="disabled")
+
+    def _log_text_train(self, text: str):
+        self.text_train_log.config(state="normal")
+        self.text_train_log.insert("end", text)
+        self.text_train_log.see("end")
+        self.text_train_log.config(state="disabled")
+
+    # ============================================================
+    #  GPT 推理 Tab
+    # ============================================================
+    def _build_text_infer_tab(self):
+        f = self.text_infer_frame
+        row = 0
+
+        # 模型路径
+        ttk.Label(f, text="模型文件:").grid(row=row, column=0, sticky="w")
+        self.text_infer_model_var = tk.StringVar(value=str(DEFAULT_GPT_MODEL))
+        ttk.Entry(f, textvariable=self.text_infer_model_var, width=48).grid(row=row, column=1, padx=4)
+        ttk.Button(f, text="浏览…", command=self._browse_text_infer_model).grid(row=row, column=2)
+        row += 1
+
+        # 生成参数
+        param_frame = ttk.LabelFrame(f, text="生成参数", padding=6)
+        param_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+        row += 1
+
+        ttk.Label(param_frame, text="最大 token 数:").grid(row=0, column=0, sticky="w")
+        self.text_infer_max_tokens_var = tk.IntVar(value=200)
+        ttk.Spinbox(param_frame, from_=1, to=2048, width=6,
+                     textvariable=self.text_infer_max_tokens_var).grid(row=0, column=1, padx=(0, 16))
+
+        ttk.Label(param_frame, text="温度:").grid(row=0, column=2, sticky="w")
+        self.text_infer_temp_var = tk.DoubleVar(value=0.8)
+        ttk.Spinbox(param_frame, from_=0.1, to=2.0, increment=0.1, width=6,
+                     textvariable=self.text_infer_temp_var, format="%.1f").grid(row=0, column=3, padx=(0, 16))
+        row += 1
+
+        # 输入提示
+        ttk.Label(f, text="输入提示:").grid(row=row, column=0, sticky="w")
+        self.text_infer_prompt_var = tk.StringVar(value="Hello")
+        prompt_entry = ttk.Entry(f, textvariable=self.text_infer_prompt_var, width=48)
+        prompt_entry.grid(row=row, column=1, padx=4)
+        prompt_entry.bind("<Return>", lambda e: self._start_text_infer())
+        row += 1
+
+        # 按钮
+        btn_frame = ttk.Frame(f)
+        btn_frame.grid(row=row, column=0, columnspan=3, pady=4)
+        row += 1
+
+        self.text_infer_start_btn = ttk.Button(btn_frame, text="▶  生成文本", command=self._start_text_infer)
+        self.text_infer_start_btn.pack(side="left", padx=4)
+        row += 1
+
+        # 输出区域
+        output_frame = ttk.LabelFrame(f, text="生成结果", padding=6)
+        output_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+        row += 1
+
+        self.text_infer_output = tk.Text(output_frame, height=12, width=72, state="disabled",
+                                         font=("Consolas", 10), bg="#1e1e1e", fg="#d4d4d4",
+                                         wrap="word")
+        self.text_infer_output.pack(fill="both", expand=True)
+
+        # 日志
+        self.text_infer_log = tk.Text(f, height=6, width=72, state="disabled",
+                                      font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4")
+        self.text_infer_log.grid(row=row, column=0, columnspan=3, sticky="ew")
+        scroll = ttk.Scrollbar(f, orient="vertical", command=self.text_infer_log.yview)
+        scroll.grid(row=row, column=3, sticky="ns")
+        self.text_infer_log["yscrollcommand"] = scroll.set
+
+    def _browse_text_infer_model(self):
+        path = filedialog.askopenfilename(title="选择 GPT 模型文件",
+                                          filetypes=[("Binary", "*.bin"), ("All", "*.*")])
+        if path:
+            self.text_infer_model_var.set(path)
+
+    # ---- GPT 推理 ----
+    def _start_text_infer(self):
+        exe = str(TEXT_INFER_EXE)
+        if not Path(exe).exists():
+            messagebox.showerror("错误", f"找不到 text_infer 可执行文件:\n{exe}\n请先构建项目")
+            return
+
+        prompt = self.text_infer_prompt_var.get().strip()
+        if not prompt:
+            messagebox.showwarning("提示", "请输入提示文本")
+            return
+
+        cmd = [exe,
+               "--model", self.text_infer_model_var.get(),
+               "--prompt", prompt,
+               "--max-tokens", str(self.text_infer_max_tokens_var.get()),
+               "--temperature", str(self.text_infer_temp_var.get())]
+
+        self._log_text_infer(f"$ {' '.join(cmd)}\n")
+        self.text_infer_start_btn.config(state="disabled")
+
+        # 清空输出
+        self.text_infer_output.config(state="normal")
+        self.text_infer_output.delete("1.0", "end")
+        self.text_infer_output.config(state="disabled")
+
+        def _run():
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                self.after(0, lambda: self._log_text_infer(result.stdout))
+                if result.stderr:
+                    self.after(0, lambda: self._log_text_infer(result.stderr))
+                # 解析输出，提取生成的文本
+                self.after(0, lambda: self._show_text_output(result.stdout, prompt))
+            except FileNotFoundError:
+                self.after(0, lambda: self._log_text_infer("错误: 可执行文件未找到\n"))
+            except subprocess.TimeoutExpired:
+                self.after(0, lambda: self._log_text_infer("错误: 生成超时\n"))
+            except Exception as e:
+                self.after(0, lambda: self._log_text_infer(f"错误: {e}\n"))
+            finally:
+                self.after(0, lambda: self.text_infer_start_btn.config(state="normal"))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _show_text_output(self, output: str, prompt: str):
+        """解析 text_infer 输出并显示"""
+        # text_infer 输出格式: prompt + generated_text
+        lines = output.strip().split("\n")
+        # 找到生成的文本行（通常是第一行非空输出）
+        generated = ""
+        for line in lines:
+            if line.strip() and not line.startswith("[") and not line.startswith("加载"):
+                generated = line
+                break
+
+        self.text_infer_output.config(state="normal")
+        self.text_infer_output.delete("1.0", "end")
+        self.text_infer_output.insert("1.0", generated if generated else output)
+        self.text_infer_output.config(state="disabled")
+
+    def _log_text_infer(self, text: str):
+        def _do():
+            self.text_infer_log.config(state="normal")
+            self.text_infer_log.insert("end", text)
+            self.text_infer_log.see("end")
+            self.text_infer_log.config(state="disabled")
         self.after(0, _do)
 
     # ============================================================
