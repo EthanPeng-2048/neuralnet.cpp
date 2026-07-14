@@ -1,220 +1,132 @@
-#!/usr/bin/env python3
 """
-字节级 BPE 分词器训练脚本（纯 Python 标准库，零依赖）
-优化版：合并与统计同步进行，速度提升约一倍。
+训练 BPE 分词器，并输出与 token_bench 兼容的 JSON 格式。
+依赖：pip install tokenizers
+用法：python train_bpe.py dataset.txt --vocab-size 1000 --output bpe.json
 """
 
 import argparse
 import json
-import re
-import sys
-import time
-from collections import Counter
+import tempfile
 from pathlib import Path
+from tokenizers import Tokenizer
+from tokenizers.models import BPE
+from tokenizers.trainers import BpeTrainer
+from tokenizers.pre_tokenizers import ByteLevel
 
-# ── 预分词正则（GPT-2 风格）──────────────────────────────
-PAT = re.compile(
-    r"""'s|'t|'re|'ve|'m|'ll|'d| ?[a-zA-Z]+| ?[0-9]+|[^\s\w]+|\s+""",
-    re.IGNORECASE,
-)
-
-
-def pre_tokenize(text: str) -> list[str]:
-    """按正则将文本切成块"""
-    return PAT.findall(text)
+# 特殊 token 定义（与 ByteZip 保持一致）
+SPECIAL_TOKENS = ["<pad>", "<unk>", "<bos>", "<eos>"]
+BYTE_OFFSET = 4   # 仅用于输出时的 ID 偏移，但 BPE 自己的 ID 是连续分配的，不需要偏移
 
 
-def text_to_bytes_chunks(text: str) -> list[list[int]]:
-    """预分词后，每块转为 UTF-8 字节序列"""
-    chunks = []
-    for piece in pre_tokenize(text):
-        chunks.append(list(piece.encode("utf-8")))
-    return chunks
+def train_bpe(text_file: str, vocab_size: int) -> Tokenizer:
+    """训练 BPE 并返回 tokenizer 对象"""
+    tokenizer = Tokenizer(BPE(unk_token="<unk>"))
+    tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=True)
+
+    trainer = BpeTrainer(vocab_size=vocab_size, special_tokens=SPECIAL_TOKENS)
+    tokenizer.train(files=[text_file], trainer=trainer)
+    return tokenizer
 
 
-def train_bpe(text: str, vocab_size: int, verbose: int = 1):
+def extract_vocab_hex(tokenizer: Tokenizer) -> dict:
     """
-    训练字节级 BPE（优化版：合并与统计一次完成）。
-
-    返回:
-      vocab: {id: bytes}  — 词表（id → 字节序列）
-      merges: [(id_a, id_b, new_id), ...]  — 合并规则
+    从 tokenizer 提取词表，转换为 {id: hex_string} 格式。
+    注意：BPE 的 ID 从 0 开始，我们直接使用这些 ID。
     """
-    # 1. 预分词 + 转字节
-    chunks = text_to_bytes_chunks(text)
-    if verbose >= 1:
-        print(f"预分词后 {len(chunks)} 个块")
+    vocab_str_to_id = tokenizer.get_vocab()  # {token: id}
+    # 按 ID 排序得到列表
+    max_id = max(vocab_str_to_id.values())
+    vocab = [b""] * (max_id + 1)
+    for token_str, tid in vocab_str_to_id.items():
+        # 将 token 字符串转回字节（ByteLevel 的 token 已经是可打印字符串，但需要正确编码）
+        token_bytes = token_str.encode("utf-8")
+        vocab[tid] = token_bytes
+    # 构建 {id: hex}
+    hex_dict = {}
+    for tid, bs in enumerate(vocab):
+        if bs:
+            hex_dict[str(tid)] = bs.hex()
+    return hex_dict, len(vocab)
 
-    # 2. 初始词表：256 个字节，映射到 ID 4~259
-    vocab = {i + 4: bytes([i]) for i in range(256)}
+
+def extract_merges(tokenizer: Tokenizer) -> list[list[int]]:
+    """
+    提取合并规则，转换为三元组 [id1, id2, new_id]。
+    采用保存临时文件的方式以确保兼容性。
+    """
+    # 保存 tokenizer 到临时 JSON 文件
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        tokenizer.save(f.name)
+        temp_path = f.name
+
+    # 读取临时文件
+    with open(temp_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    # 提取 merges 原始数据
+    merges_raw = data.get('model', {}).get('merges', [])
+    
+    # 转换为统一的二元组列表 (token1, token2)
     merges = []
-
-    next_id = 260
-    num_merges = vocab_size - 4 - 256
-    if num_merges < 0:
-        raise ValueError(f"vocab_size ({vocab_size}) 太小，至少需要 260")
-
-    if verbose >= 1:
-        print(f"目标词表: {vocab_size} (4 特殊 + 256 字节 + {num_merges} 合并)")
-        print("构建初始 pair 频率...")
-
-    # 3. 初始化 pair 计数器
-    pair_counts = Counter()
-    for chunk in chunks:
-        for i in range(len(chunk) - 1):
-            pair_counts[(chunk[i], chunk[i + 1])] += 1
-
-    start_time = time.time()
-    for step in range(num_merges):
-        if not pair_counts:
-            if verbose >= 1:
-                print(f"第 {step} 步：没有 pair 可合并")
-            break
-
-        # 找最高频 pair
-        best_pair = max(pair_counts, key=pair_counts.get)
-        best_count = pair_counts[best_pair]
-        if best_count < 2:
-            if verbose >= 1:
-                print(f"第 {step} 步：最高频 pair 仅 {best_count} 次，停止")
-            break
-
-        a, b = best_pair
-
-        # 4. 合并 + 同时重建 pair_counts（一次遍历完成）
-        new_chunks = []
-        new_pair_counts = Counter()
-        for chunk in chunks:
-            new_chunk = []
-            i = 0
-            while i < len(chunk):
-                if i < len(chunk) - 1 and chunk[i] == a and chunk[i + 1] == b:
-                    new_chunk.append(next_id)
-                    i += 2
-                else:
-                    new_chunk.append(chunk[i])
-                    i += 1
-            # 统计新 chunk 的相邻 pair
-            for j in range(len(new_chunk) - 1):
-                new_pair_counts[(new_chunk[j], new_chunk[j + 1])] += 1
-            new_chunks.append(new_chunk)
-
-        chunks = new_chunks
-        pair_counts = new_pair_counts
-
-        # 记录合并规则
-        vocab[next_id] = vocab[a + 4] + vocab[b + 4] 
-        merges.append((a, b, next_id))
-
-        # 进度输出
-        if verbose >= 1 and (step % 50 == 0 or step < 10):
-            try:
-                preview = vocab[next_id].decode("utf-8")
-            except UnicodeDecodeError:
-                preview = repr(vocab[next_id])
-            elapsed = time.time() - start_time
-            if step > 0:
-                speed = step / elapsed
-                eta = (num_merges - step) / speed if speed > 0 else 0
-                eta_str = f"ETA {eta:.1f}s"
-            else:
-                eta_str = ""
-            sys.stdout.write(
-                f"\r  step {step:4d}/{num_merges}: ({a},{b}) → {next_id}  "
-                f"\"{preview}\"  ({best_count}次)  {eta_str}   "
-            )
-            sys.stdout.flush()
-
-        next_id += 1
-
-    if verbose >= 1:
-        print()  # 换行
-        print(f"训练完成: {len(vocab)} 个 token, {len(merges)} 条合并规则")
-    return vocab, merges
-
-
-def encode(text: str, merges: list[tuple[int, int, int]]) -> list[int]:
-    """用训练好的 merges 编码文本"""
-    chunks = text_to_bytes_chunks(text)
-
-    # 构建合并优先级表
-    merge_priority = {}
-    for idx, (a, b, new_id) in enumerate(merges):
-        merge_priority[(a, b)] = idx
-
-    all_ids = []
-    for chunk in chunks:
-        ids = chunk[:]
-        while len(ids) >= 2:
-            best_idx = None
-            best_priority = float("inf")
-            for i in range(len(ids) - 1):
-                pair = (ids[i], ids[i + 1])
-                if pair in merge_priority and merge_priority[pair] < best_priority:
-                    best_priority = merge_priority[pair]
-                    best_idx = i
-            if best_idx is None:
-                break
-            new_id = merges[best_priority][2]
-            ids = ids[:best_idx] + [new_id] + ids[best_idx + 2:]
-        all_ids.extend(ids)
-    return all_ids
-
-
-def decode(ids: list[int], vocab: dict[int, bytes]) -> str:
-    """将 token ids 解码为文本"""
-    raw = b""
-    for tid in ids:
-        if tid in vocab:
-            raw += vocab[tid]
+    for item in merges_raw:
+        if isinstance(item, str):
+            # 如果格式是 "Ġ t" 这样的字符串，按空格拆分为两个 token
+            parts = item.split()
+            if len(parts) == 2:
+                merges.append(tuple(parts))
+        elif isinstance(item, list) and len(item) == 2:
+            # 如果格式是 ["Ġ", "t"] 这样的列表
+            merges.append(tuple(item))
         else:
-            raw += b"\xef\xbf\xbd"  # 未知 token 替换为 �
-    return raw.decode("utf-8", errors="replace")
+            # 未知格式，跳过
+            continue
+
+    # 删除临时文件
+    Path(temp_path).unlink(missing_ok=True)
+
+    # 构建 token 字符串到 ID 的映射
+    vocab_str_to_id = tokenizer.get_vocab()
+    result = []
+    for t1, t2 in merges:
+        # 合并后的 token 字符串是 t1 + t2（ByteLevel 下如此）
+        merged_str = t1 + t2
+        if merged_str in vocab_str_to_id:
+            new_id = vocab_str_to_id[merged_str]
+            id1 = vocab_str_to_id[t1]
+            id2 = vocab_str_to_id[t2]
+            result.append([id1, id2, new_id])
+        else:
+            # 如果合并后的 token 不在词表中（理论上不应发生），跳过
+            continue
+    return result
 
 
-def save_bpe_json(vocab: dict, merges: list, path: str):
-    """保存为 JSON（符合您的格式要求）"""
-    vocab_json = {str(tid): bs.hex() for tid, bs in vocab.items()}
-    merges_json = [[a, b, nid] for a, b, nid in merges]
+def save_compatible_json(tokenizer: Tokenizer, path: str):
+    vocab_hex, vocab_size = extract_vocab_hex(tokenizer)
+    merges = extract_merges(tokenizer)
 
     data = {
-        "type": "freq_based_tokenizer",
-        "vocab": vocab_json,
-        "merges": merges_json,
-        "vocab_size": len(vocab) + 4,   # 含特殊 token
-        "byte_offset": 4,
-        "special_tokens": {"<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3},
+        "type": "bpe_tokenizer",   # 标识类型
+        "vocab": vocab_hex,
+        "vocab_size": vocab_size,
+        "merges": merges,          # 三元组列表，顺序即优先级
+        "special_tokens": {tok: idx for idx, tok in enumerate(SPECIAL_TOKENS)},
+        "byte_offset": 0,          # BPE 不使用偏移
     }
     Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
-    print(f"已保存: {path} ({len(vocab)} 字节/子词 + 4 特殊 = {len(vocab)+4} 总词表)")
+    print(f"BPE 词表已保存至: {path} (vocab_size={vocab_size}, merges={len(merges)})")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="字节级 BPE 训练（纯标准库，优化版）")
+    parser = argparse.ArgumentParser(description="训练 BPE 分词器并输出兼容格式")
     parser.add_argument("text_file", help="训练文本文件路径")
-    parser.add_argument("--vocab-size", type=int, default=10000, help="目标词表大小 (含特殊token，默认 10000)")
-    parser.add_argument("--output", default="gpt_bpe.json", help="输出 JSON 路径")
-    parser.add_argument("--verbose", type=int, default=1, choices=[0, 1, 2],
-                        help="0=静默, 1=每50步, 2=每10步（仅用于控制打印间隔，当前固定为每50步）")
+    parser.add_argument("--vocab-size", type=int, default=1000, help="目标词表大小")
+    parser.add_argument("--output", default="bpe_compatible.json", help="输出 JSON 路径")
     args = parser.parse_args()
 
-    text = Path(args.text_file).read_text(encoding="utf-8")
-    print(f"文本: {len(text):,} 字符, {len(text.encode('utf-8')):,} 字节")
-
-    # 训练
-    vocab, merges = train_bpe(text, args.vocab_size, verbose=args.verbose)
-
-    # 快速验证
-    test = "Alice was a very good girl, she said hello!"
-    ids = encode(test, merges)
-    decoded = decode(ids, vocab)
-    print(f"\n验证:")
-    print(f"  原文:  {test}")
-    print(f"  编码:  {ids}")
-    print(f"  解码:  {decoded}")
-    print(f"  匹配:  {decoded == test}")
-
-    save_bpe_json(vocab, merges, args.output)
+    print(f"读取文件: {args.text_file}")
+    tokenizer = train_bpe(args.text_file, args.vocab_size)
+    save_compatible_json(tokenizer, args.output)
 
 
 if __name__ == "__main__":
