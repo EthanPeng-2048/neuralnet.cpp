@@ -77,12 +77,6 @@ namespace nn
         [[nodiscard]] std::span<const double> span() const noexcept { return {data_.data(), data_.size()}; }
         [[nodiscard]] std::span<double> span() noexcept { return {data_.data(), data_.size()}; }
 
-        // ── 原始指针访问（仅供需要指针算术的分块算法内部使用） ────────────
-        [[deprecated("use span() instead for safer access")]]
-        [[nodiscard]] const double *data_ptr() const noexcept { return data_.data(); }
-        [[deprecated("use span() instead for safer access")]]
-        [[nodiscard]] double *data_ptr() noexcept { return data_.data(); }
-
         // 访问器
         [[nodiscard]] constexpr std::size_t rows() const noexcept { return rows_; }
         [[nodiscard]] constexpr std::size_t cols() const noexcept { return cols_; }
@@ -286,13 +280,14 @@ namespace nn
                     for (std::size_t jj = 0; jj < j_len; ++jj)
                         for (std::size_t kk = 0; kk < k_len; ++kk)
                             b_block[jj * k_len + kk] = b[(k_start + kk) * N + (j_start + jj)];
+                    const auto b_block_span = std::span<const double>(b_block.data(), k_len * j_len);
                     for (std::size_t i = i_start; i < i_end; ++i)
                     {
                         const auto a_row = a.subspan(i * K + k_start);
                         auto r_row = r.subspan(i * N + j_start);
                         for (std::size_t j = 0; j < j_len; ++j)
                         {
-                            const double *b_col = b_block.data() + j * k_len;
+                            const auto b_col = b_block_span.subspan(j * k_len, k_len);
                             double sum = 0.0;
                             for (std::size_t kk = 0; kk < k_len; ++kk)
                                 sum += a_row[kk] * b_col[kk];
@@ -325,6 +320,7 @@ namespace nn
                             for (std::size_t jj = 0; jj < j_len; ++jj)
                                 for (std::size_t kk = 0; kk < k_len; ++kk)
                                     b_block[jj * k_len + kk] = b[(k_start + kk) * N + (j_start + jj)];
+                            const auto b_block_span = std::span<const double>(b_block.data(), k_len * j_len);
 
                             for (std::size_t i = i_start; i < i_end; ++i)
                             {
@@ -332,7 +328,7 @@ namespace nn
                                 auto r_row = r.subspan(i * N + j_start);
                                 for (std::size_t j = 0; j < j_len; ++j)
                                 {
-                                    const double *b_col = b_block.data() + j * k_len;
+                                    const auto b_col = b_block_span.subspan(j * k_len, k_len);
                                     double sum = 0.0;
                                     for (std::size_t kk = 0; kk < k_len; ++kk)
                                         sum += a_row[kk] * b_col[kk];
