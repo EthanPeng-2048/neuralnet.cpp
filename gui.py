@@ -144,6 +144,12 @@ class NeuralNetGUI(tk.Tk):
         opt_combo = ttk.Combobox(param_frame, textvariable=self.train_opt_var, width=14, state="readonly",
                                  values=["sgd", "sgd_w_momentum", "adam"])
         opt_combo.grid(row=1, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(param_frame, text="模型类型:").grid(row=1, column=2, sticky="w", pady=(6, 0))
+        self.train_model_type_var = tk.StringVar(value="mlp")
+        model_type_combo = ttk.Combobox(param_frame, textvariable=self.train_model_type_var, width=14, state="readonly",
+                                        values=["mlp", "transformer"])
+        model_type_combo.grid(row=1, column=3, sticky="w", pady=(6, 0))
         row += 1
 
         # 按钮
@@ -201,7 +207,8 @@ class NeuralNetGUI(tk.Tk):
                "--epochs", str(self.train_epochs_var.get()),
                "--lr", str(self.train_lr_var.get()),
                "--batch-size", str(self.train_batch_var.get()),
-               "--optimizer", self.train_opt_var.get()]
+               "--optimizer", self.train_opt_var.get(),
+               "--model-type", self.train_model_type_var.get()]
         if self.train_resume_var.get():
             cmd += ["--resume", self.train_resume_path_var.get()]
 
@@ -249,7 +256,7 @@ class NeuralNetGUI(tk.Tk):
         ttk.Button(f, text="浏览…", command=self._browse_input).grid(row=row, column=2)
         row += 1
 
-        # Top-K
+        # Top-K + 模型类型
         param_frame = ttk.Frame(f)
         param_frame.grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
         row += 1
@@ -257,12 +264,54 @@ class NeuralNetGUI(tk.Tk):
         self.infer_topk_var = tk.IntVar(value=3)
         ttk.Spinbox(param_frame, from_=1, to=10, width=4,
                      textvariable=self.infer_topk_var).pack(side="left", padx=4)
+        ttk.Label(param_frame, text="  模型类型:").pack(side="left")
+        self.infer_model_type_var = tk.StringVar(value="mlp")
+        infer_model_type_combo = ttk.Combobox(param_frame, textvariable=self.infer_model_type_var,
+                                               width=12, state="readonly",
+                                               values=["mlp", "transformer"])
+        infer_model_type_combo.pack(side="left", padx=4)
         row += 1
 
         # 按钮
         ttk.Button(f, text="▶  开始推理", command=self._start_infer).grid(row=row, column=0, columnspan=3, pady=4)
         row += 1
+        # ── 手写板 ──────────────────────────────────────
+        self._handwriting_infer = False
+        DRAW_SCALE = 10
+        DRAW_SIZE = IMG_DIM * DRAW_SCALE  # 280
+        self._draw_size = DRAW_SIZE
+        self._draw_scale = DRAW_SCALE
+        self._brush_radius = 14
+        self._draw_pixels = [0.0] * (DRAW_SIZE * DRAW_SIZE)
+        self._drawing = False
 
+        draw_frame = ttk.LabelFrame(f, text="✍️ 手写识别", padding=6)
+        draw_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+
+        draw_left = ttk.Frame(draw_frame)
+        draw_left.pack(side="left", padx=(0, 12))
+
+        self._draw_canvas = tk.Canvas(draw_left, width=DRAW_SIZE, height=DRAW_SIZE,
+                                      bg="white", cursor="pencil", relief="sunken", bd=2)
+        self._draw_canvas.pack()
+        self._draw_canvas.bind("<Button-1>", self._on_draw_start)
+        self._draw_canvas.bind("<B1-Motion>", self._on_draw_move)
+        self._draw_canvas.bind("<ButtonRelease-1>", self._on_draw_end)
+
+        btn_row = ttk.Frame(draw_left)
+        btn_row.pack(fill="x", pady=4)
+        ttk.Button(btn_row, text="🗑️ 清除", command=self._clear_drawing).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="🔍 识别手写数字", command=self._recognize_drawing).pack(side="left", padx=4)
+
+        # 右侧：28×28 预览
+        draw_right = ttk.Frame(draw_frame)
+        draw_right.pack(side="left", fill="both", expand=True)
+        ttk.Label(draw_right, text="28×28 预览:", font=("Segoe UI", 9)).pack(anchor="w")
+        preview_size = IMG_DIM * PIXEL_SIZE
+        self._draw_preview = tk.Canvas(draw_right, width=preview_size, height=preview_size, bg="black")
+        self._draw_preview.pack(pady=4)
+
+        row += 1
         # 结果区域
         result_frame = ttk.Frame(f)
         result_frame.grid(row=row, column=0, columnspan=3, sticky="ew")
@@ -306,7 +355,114 @@ class NeuralNetGUI(tk.Tk):
         if path:
             self.infer_input_var.set(path)
 
+    # ---- 手写板事件 ----
+    def _on_draw_start(self, event):
+        self._drawing = True
+        self._paint_at(event.x, event.y)
+
+    def _on_draw_move(self, event):
+        if self._drawing:
+            self._paint_at(event.x, event.y)
+
+    def _on_draw_end(self, event):
+        self._drawing = False
+
+    def _paint_at(self, cx, cy):
+        """在画板 (cx, cy) 处绘制笔触"""
+        r = self._brush_radius
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                dist_sq = dx * dx + dy * dy
+                if dist_sq > r * r:
+                    continue
+                px, py = cx + dx, cy + dy
+                if 0 <= px < self._draw_size and 0 <= py < self._draw_size:
+                    dist = math.sqrt(dist_sq)
+                    sigma = r / 2.0
+                    intensity = math.exp(-dist_sq / (2 * sigma * sigma))
+                    idx = py * self._draw_size + px
+                    self._draw_pixels[idx] = max(self._draw_pixels[idx], intensity)
+        self._draw_canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                      fill="black", outline="")
+
+    def _clear_drawing(self):
+        """清除手写板"""
+        self._draw_pixels = [0.0] * (self._draw_size * self._draw_size)
+        self._draw_canvas.delete("all")
+        self._draw_preview.delete("all")
+
+    def _downsample_drawing(self) -> list[float]:
+        """将 280×280 画板下采样为 28×28 像素值"""
+        scale = self._draw_scale
+        pixels = []
+        for r in range(IMG_DIM):
+            for c in range(IMG_DIM):
+                total = 0.0
+                for dy in range(scale):
+                    for dx in range(scale):
+                        y = r * scale + dy
+                        x = c * scale + dx
+                        total += self._draw_pixels[y * self._draw_size + x]
+                avg = total / (scale * scale)
+                pixels.append(avg)
+        return pixels
+
+    def _recognize_drawing(self):
+        """识别手写板上的数字"""
+        exe = str(INFER_EXE)
+        if not Path(exe).exists():
+            messagebox.showerror("错误", f"找不到推理可执行文件:\n{exe}\n请先构建项目")
+            return
+
+        # 检查是否有内容
+        if max(self._draw_pixels) < 0.01:
+            messagebox.showwarning("提示", "请先在手写板上写一个数字")
+            return
+
+        pixels = self._downsample_drawing()
+
+        # 显示 28×28 预览
+        draw_digit(self._draw_preview, pixels)
+        draw_digit(self.infer_canvas, pixels)
+        self.infer_filename_label.config(text="手写输入")
+
+        # 写入临时 CSV
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, newline="")
+        tmp.write(",".join(f"{v:.6f}" for v in pixels))
+        tmp.close()
+
+        cmd = [exe, tmp.name,
+               "--model", self.infer_model_var.get(),
+               "--model-type", self.infer_model_type_var.get(),
+               "--topk", str(self.infer_topk_var.get())]
+
+        self._log_infer(f"[手写识别] $ {' '.join(cmd)}\n")
+        self._handwriting_infer = True
+
+        def _run():
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                self._log_infer(result.stdout)
+                if result.stderr:
+                    self._log_infer(result.stderr)
+                self._parse_and_display_infer(result.stdout)
+            except FileNotFoundError:
+                self._log_infer("错误: 可执行文件未找到\n")
+            except subprocess.TimeoutExpired:
+                self._log_infer("错误: 推理超时\n")
+            except Exception as e:
+                self._log_infer(f"错误: {e}\n")
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def _start_infer(self):
+        self._handwriting_infer = False
         exe = str(INFER_EXE)
         if not Path(exe).exists():
             messagebox.showerror("错误", f"找不到推理可执行文件:\n{exe}\n请先构建项目:\n  cmake -B build -G Ninja && ninja -C build")
@@ -319,6 +475,7 @@ class NeuralNetGUI(tk.Tk):
 
         cmd = [exe, input_path,
                "--model", self.infer_model_var.get(),
+               "--model-type", self.infer_model_type_var.get(),
                "--topk", str(self.infer_topk_var.get())]
 
         self._log_infer(f"$ {' '.join(cmd)}\n")
@@ -350,7 +507,10 @@ class NeuralNetGUI(tk.Tk):
                     predictions_str = parts[1].strip()
 
                     # 显示文件名
-                    self.after(0, lambda f=filename: self.infer_filename_label.config(text=f))
+                    if self._handwriting_infer:
+                        self.after(0, lambda: self.infer_filename_label.config(text="手写输入"))
+                    else:
+                        self.after(0, lambda f=filename: self.infer_filename_label.config(text=f))
 
                     # 解析预测结果
                     predictions = []
@@ -361,14 +521,15 @@ class NeuralNetGUI(tk.Tk):
                     # 显示结果条形图
                     self.after(0, lambda p=predictions: self._show_prediction_bars(p))
 
-                    # 尝试显示图片
-                    input_path = self.infer_input_var.get().strip()
-                    if os.path.isfile(input_path):
-                        self.after(0, lambda p=input_path: self._display_csv_image(p))
-                    elif os.path.isdir(input_path):
-                        img_path = os.path.join(input_path, filename)
-                        if os.path.isfile(img_path):
-                            self.after(0, lambda p=img_path: self._display_csv_image(p))
+                    # 尝试显示图片（手写模式跳过，已有预览）
+                    if not self._handwriting_infer:
+                        input_path = self.infer_input_var.get().strip()
+                        if os.path.isfile(input_path):
+                            self.after(0, lambda p=input_path: self._display_csv_image(p))
+                        elif os.path.isdir(input_path):
+                            img_path = os.path.join(input_path, filename)
+                            if os.path.isfile(img_path):
+                                self.after(0, lambda p=img_path: self._display_csv_image(p))
                 break
 
     def _show_prediction_bars(self, predictions: list[tuple[int, float]]):

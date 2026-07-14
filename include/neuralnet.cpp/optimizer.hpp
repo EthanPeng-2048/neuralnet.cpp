@@ -5,7 +5,7 @@
 #include <functional>
 #include <vector>
 
-#include <neuralnet.cpp/matrix.hpp>
+#include "matrix.hpp"
 
 namespace nn
 {
