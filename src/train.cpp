@@ -213,7 +213,7 @@ std::pair<nn::Matrix, nn::Matrix> load_csv(const std::string &filename, int max_
     // 实际读取的行数可能少于预扫描（例如文件末尾空行）
     std::size_t N = row;
 
-    // ── 4. 直接写入矩阵（列优先，逐行填充） ──────────────────────
+    // ── 4. 直接写入矩阵（行主序存储，逐列填充） ──────────────────
     // 特征矩阵：形状 (feat_dim, N)
     nn::Matrix feat_mat(feat_dim, N);
     for (std::size_t i = 0; i < N; ++i)

@@ -1,6 +1,6 @@
 # neuralnet.cpp
 
-一个轻量级 C++26 神经网络库，从头实现（无第三方深度学习框架依赖），**列主序矩阵**（column-major）存储，支持并行计算。
+一个轻量级 C++26 神经网络库，从头实现（无第三方深度学习框架依赖），支持并行计算。
 
 ## 项目结构
 
@@ -23,8 +23,8 @@ neuralnet.cpp/
 │       ├── nn.hpp              ← 统一入口头文件
 │       ├── nn_config.hpp       ← SmartPolicy、BLOCK_SIZE 等配置
 │       ├── thread_pool.hpp     ← 全局线程池
-│       ├── matrix.hpp          ← Matrix 类（列主序）
-│       ├── layer.hpp           ← Layer 基类 + Linear/ReLU/GeLU/LayerNorm/PositionalEncoding
+│       ├── matrix.hpp          ← Matrix 类
+│       ├── layer.hpp           ← Layer 基类 + Linear/ReLU/GeLU/LayerNorm/Softmax/MultiHeadAttention/PositionalEncoding
 │       ├── loss.hpp            ← Loss 基类 + MSELoss/CrossEntropyLoss
 │       ├── optimizer.hpp       ← SGD / SGD_w_Momentum / Adam
 │       ├── model.hpp           ← Model 容器（链式 add<>）
@@ -68,8 +68,11 @@ python save_dataset.py
 ### 运行训练
 
 ```bash
-# 从头开始训练（默认: 10轮, 学习率0.001, 批大小64, Adam优化器）
+# 从头开始训练 MLP（默认: 10轮, 学习率0.001, 批大小64, Adam优化器）
 ./build/mnist_train
+
+# 训练 Transformer 模型
+./build/mnist_train --model-type transformer --epochs 20
 
 # 从已有模型恢复训练
 ./build/mnist_train --resume pretrained/mnist_model.bin
@@ -79,6 +82,25 @@ python save_dataset.py
 
 # 支持的优化器: sgd / sgd_w_momentum / adam
 ./build/mnist_train --optimizer sgd_w_momentum
+```
+
+### 运行推理
+
+```bash
+# 推理单张图片
+./build/mnist_infer datasets/test/0/digit_0001.csv
+
+# 批量推理目录下所有 CSV
+./build/mnist_infer datasets/test/0/
+
+# 指定模型文件和类型
+./build/mnist_infer image.csv --model pretrained/model.bin --model-type transformer
+
+# 显示 Top-5 预测结果
+./build/mnist_infer image.csv --topk 5
+
+# 调试模式：显示像素矩阵
+./build/mnist_infer image.csv --show-pixels
 ```
 
 ### 🖥️ 图形化界面 (GUI)
@@ -96,13 +118,31 @@ python gui.py
 
 | Tab | 功能 |
 |-----|------|
-| 🏋️ **训练** | 配置数据集路径、模型保存路径、轮数、学习率、批大小、优化器，支持恢复训练；实时显示训练日志 |
-| 🔍 **推理** | 选择模型文件和图片 CSV 文件/目录，显示预测结果置信度条形图和手写数字图片预览 |
+| 🏋️ **训练** | 配置数据集路径、模型保存路径、轮数、学习率、批大小、优化器、模型类型（MLP/Transformer），支持恢复训练；实时显示训练日志 |
+| 🔍 **推理** | 选择模型文件和图片 CSV 文件/目录，支持 MLP/Transformer 模型类型切换，显示 Top-K 预测结果置信度条形图和手写数字图片预览；内置 ✍️ 手写板，可直接在画布上书写数字进行实时识别 |
 | 🖼️ **图片查看** | 浏览单张 CSV 图片或批量加载目录，支持前后翻页导航 |
+
+#### GUI 操作流程
+
+**训练模式：**
+1. 配置数据集路径、模型保存路径等参数
+2. 选择模型类型（`mlp` 或 `transformer`）和优化器
+3. 可选勾选"从已有模型恢复训练"并指定模型路径
+4. 点击"▶ 开始训练"，训练日志实时滚动输出
+5. 训练过程中可随时点击"⏹ 停止"终止训练
+
+**推理模式：**
+1. 选择模型文件（`.bin`）并指定模型类型（需与训练时一致）
+2. 通过文件选择或直接输入路径指定 CSV 图片文件/目录
+3. 设置 Top-K 值控制显示预测结果数量
+4. 点击"▶ 开始推理"，结果以置信度条形图 + 图片预览形式展示
+5. 也可使用内置手写板：在画布上书写数字 → 点击"🔍 识别手写数字" → 自动下采样为 28×28 并推理
 
 ## 网络结构
 
-默认 MNIST 架构（定义在 `mnist_common.hpp`）：
+支持两种模型架构（通过 `--model-type` 切换），定义在 `mnist_common.hpp`：
+
+### MLP（默认）
 
 ```
 输入 (784)
@@ -114,16 +154,32 @@ python gui.py
 → CrossEntropy Loss (含 Softmax)
 ```
 
+### Transformer（ViT-like）
+
+```
+输入 (784) — 展平的 28×28 图像
+→ PatchEmbedding: 28×28 → 16 个 7×7 patch → 投影到 d_model=64
+→ TransformerEncoder ×2 层:
+    ├── MultiHeadAttention(d_model=64, heads=4)
+    ├── LayerNorm + FeedForward(d_model=64 → d_ff=128 → 64)
+    └── 残差连接 + 位置编码
+→ 池化 (seq_len → 1)
+→ Linear(64 → 10)
+→ CrossEntropy Loss (含 Softmax)
+```
+
 ## 提供的组件
 
 | 组件 | 说明 |
 |------|------|
-| `nn::Matrix` | 列主序矩阵，支持并行加/减/乘/转置、预分配缓冲区 |
+| `nn::Matrix` | 行主序矩阵，支持并行加/减/乘/转置、预分配缓冲区、`std::span` 访问 |
 | `nn::Model` | 网络容器，支持链式 `add<LayerType>()` 构建 |
 | `nn::Linear` | 全连接层（含 Xavier 均匀初始化、融合 bias 计算） |
 | `nn::ReLU` | ReLU 激活函数 |
 | `nn::GeLU` | QuickGeLU 激活函数（`x · σ(1.702x)`） |
 | `nn::LayerNorm` | 层归一化（含可学习 γ/β 参数） |
+| `nn::Softmax` | Softmax 激活层（数值稳定，含反向传播） |
+| `nn::MultiHeadAttention` | 多头注意力层（Transformer 用，`d_model × seq_len` 输入输出） |
 | `nn::PositionalEncoding` | 正弦/余弦位置编码（Transformer 用） |
 | `nn::MSELoss` | 均方误差损失 |
 | `nn::CrossEntropyLoss` | 交叉熵损失（含数值稳定 Softmax，`loss.hpp` 中定义） |
