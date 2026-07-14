@@ -54,4 +54,12 @@ target/
 *.ear
 obj/
 bin/
+
+# Pretrained
+*.bin
+pretrained/
+
+# Datasets
+datasets/
+dataset.txt
 ```
