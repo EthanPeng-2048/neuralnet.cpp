@@ -150,13 +150,12 @@ int main(int argc, char *argv[])
             return 1;
         }
 
-        nn::WordTokenizer tokenizer;
-        tokenizer.build_from_text(text);
-        tokenizer.save_vocab("gpt_vocab.txt");
+        nn::BPETokenizer tokenizer;
+        tokenizer.load_vocab("gpt_bpe.json");
         auto all_tokens = tokenizer.encode(text);
         std::cout << "文本长度: " << text.size() << " 字符, "
                   << all_tokens.size() << " tokens, "
-                  << tokenizer.vocab_size() << " 词\n" << std::endl;
+                  << tokenizer.vocab_size() << " 词表\n" << std::endl;
 
         // ── 打印配置 ─────────────────────────────────────────────
         std::cout << "========================================\n";

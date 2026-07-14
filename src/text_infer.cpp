@@ -103,7 +103,7 @@ std::vector<std::size_t> generate_text(
 }
 
 // ==================== 交互模式 ====================
-void interactive_mode(nn::Model &model, const nn::WordTokenizer &tokenizer,
+void interactive_mode(nn::Model &model, const nn::BPETokenizer &tokenizer,
                      const InferConfig &cfg)
 {
     std::cout << "GPT 交互式生成 (输入 'quit' 退出)\n\n";
@@ -157,8 +157,8 @@ int main(int argc, char *argv[])
         InferConfig cfg = parse_args(argc, argv);
 
         // ── 加载分词器与模型 ─────────────────────────────────────
-        nn::WordTokenizer tokenizer;
-        tokenizer.load_vocab("gpt_vocab.txt");
+        nn::BPETokenizer tokenizer;
+        tokenizer.load_vocab("gpt_bpe.json");
         std::cout << "词表: " << tokenizer.vocab_size() << " 词" << std::endl;
 
         std::cout << "加载模型: " << cfg.model_path << " ..." << std::endl;
