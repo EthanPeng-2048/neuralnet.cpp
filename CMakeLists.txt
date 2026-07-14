@@ -20,3 +20,10 @@ add_executable(text_infer src/text_infer.cpp)
 
 target_include_directories(text_train PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(text_infer PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
+# ── 分词器目标 ──────────────────────────────────────────────────────────────
+add_executable(tokenizer_train src/tokenizer_train.cpp)
+add_executable(tokenizer_infer src/tokenizer_infer.cpp)
+
+target_include_directories(tokenizer_train PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(tokenizer_infer PRIVATE ${CMAKE_SOURCE_DIR}/include)
