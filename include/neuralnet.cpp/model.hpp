@@ -19,6 +19,14 @@ namespace nn
     public:
         Model() = default;
 
+        // 访问指定层（用于需要向下转型的场景，如 GPTModel::generate）
+        [[nodiscard]] Layer &layer_at(std::size_t index)
+        {
+            if (index >= layers_.size())
+                throw std::out_of_range("Model::layer_at index out of range");
+            return *layers_[index];
+        }
+
         // 不可拷贝（unique_ptr 语义），只能移动
         Model(const Model &) = delete;
         Model &operator=(const Model &) = delete;

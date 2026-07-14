@@ -654,7 +654,7 @@ namespace nn
         Matrix grad_scores_buf_;  // (seq_len, seq_len)
         Matrix grad_A_buf_;       // (seq_len, seq_len)
         Matrix grad_O_h_buf_;     // (d_k_, seq_len) — backward 中复用
-        Softmax softmax_;         // 复用，避免每头构造/析构
+        Softmax softmax_;         // 仅在 forward() 中调用 forward()，不调用 backward()（注意力反向手动计算）
 
         // ── 从矩阵中提取行切片到 dst ────────────────────────────────────
         static void extract_rows(const Matrix &src, std::size_t row_start,
@@ -1401,7 +1401,7 @@ namespace nn
         Matrix grad_scores_buf_;
         Matrix grad_A_buf_;
         Matrix grad_O_h_buf_;
-        Softmax softmax_;
+        Softmax softmax_;         // 仅在 forward() 中调用 forward()，不调用 backward()（注意力反向手动计算）
 
         static void extract_rows(const Matrix &src, std::size_t row_start,
                                  std::size_t row_count, Matrix &dst)
@@ -1529,7 +1529,7 @@ namespace nn
                 // 施加因果掩码
                 {
                     auto a_span = attn_[h].span();
-                    const auto m_span = mask_data_.data();
+                    const auto m_span = std::span<const double>(mask_data_);
                     const std::size_t s2 = seq_len * seq_len;
                     for (std::size_t idx = 0; idx < s2; ++idx)
                         a_span[idx] += m_span[idx];
@@ -1758,22 +1758,22 @@ namespace nn
         std::vector<std::vector<std::size_t>> stored_tokens_; // token IDs
         std::size_t batch_size_{0};
 
-        static constexpr double EMB_INIT_STD = 0.02;
-
     public:
         GPTModel(std::size_t vocab_size, std::size_t d_model, std::size_t seq_len,
                  std::size_t num_heads, std::size_t d_ff, std::size_t num_layers)
             : vocab_size_(vocab_size), d_model_(d_model), seq_len_(seq_len),
               token_emb_(vocab_size, d_model),
+              grad_token_emb_(vocab_size, d_model),
               pos_emb_(seq_len, d_model),
+              grad_pos_emb_(seq_len, d_model),
               ln_f_(d_model),
               lm_head_(d_model, vocab_size)
         {
             // Xavier-like 初始化嵌入
             {
-                const double limit = EMB_INIT_STD;
+                constexpr double emb_init_std = 0.02;
                 std::mt19937_64 rng{42};
-                std::normal_distribution<double> dist(0.0, limit);
+                std::normal_distribution<double> dist(0.0, emb_init_std);
                 for (auto &v : token_emb_.data())
                     v = dist(rng);
                 for (auto &v : pos_emb_.data())
@@ -1828,11 +1828,17 @@ namespace nn
             stored_inputs_.resize(batch_size_);
             stored_tokens_.resize(batch_size_);
 
+            // 清空缓存，防止跨 forward 累积
+            for (auto &v : stored_tokens_)
+                v.clear();
+
             // 输出: (vocab_size, seq_len × batch_size)
             Matrix output(vocab_size_, seq_len * batch_size_);
 
             for (std::size_t b = 0; b < batch_size_; ++b)
             {
+                stored_tokens_[b].reserve(seq_len);
+
                 // 1. Token 嵌入 + 位置嵌入 → (d_model, seq_len)
                 Matrix x(d_model_, seq_len);
                 for (std::size_t t = 0; t < seq_len; ++t)
@@ -1920,12 +1926,14 @@ namespace nn
                 {
                     const std::size_t tid = tokens[t];
                     // token embedding 梯度
+                    auto gte = grad_token_emb_.span();
                     for (std::size_t d = 0; d < d_model_; ++d)
-                        grad_token_emb_.data()[tid * d_model_ + d] +=
+                        gte[tid * d_model_ + d] +=
                             grad_ln.at_unchecked(d, t);
                     // positional embedding 梯度
+                    auto gpe = grad_pos_emb_.span();
                     for (std::size_t d = 0; d < d_model_; ++d)
-                        grad_pos_emb_.data()[t * d_model_ + d] +=
+                        gpe[t * d_model_ + d] +=
                             grad_ln.at_unchecked(d, t);
                     // grad_input (token IDs 无梯度，此处仅用于接口一致性)
                     grad_input.set_value_unchecked(t, b, 0.0);
@@ -1935,13 +1943,15 @@ namespace nn
             return grad_input;
         }
 
-        // ── 采样生成（贪心） ────────────────────────────────────────
+        // ── 采样生成（支持温度采样 + 贪心） ────────────────────────
         std::vector<std::size_t> generate(const std::vector<std::size_t> &prompt,
                                           std::size_t max_new_tokens,
                                           double temperature = 1.0)
         {
             std::vector<std::size_t> context(prompt);
             std::vector<std::size_t> generated;
+            std::mt19937_64 rng{std::random_device{}()};
+            std::uniform_real_distribution<double> dist(0.0, 1.0);
 
             for (std::size_t step = 0; step < max_new_tokens; ++step)
             {
@@ -1964,13 +1974,13 @@ namespace nn
                     last_logits[v] = logits.at_unchecked(v, cur_len - 1);
 
                 // temperature
-                if (temperature != 1.0)
+                if (temperature > 0.0 && temperature != 1.0)
                 {
                     for (auto &v : last_logits)
                         v /= temperature;
                 }
 
-                // softmax
+                // softmax（数值稳定）
                 double max_val = last_logits[0];
                 for (std::size_t v = 1; v < vocab_size_; ++v)
                     max_val = std::max(max_val, last_logits[v]);
@@ -1983,15 +1993,36 @@ namespace nn
                 for (auto &v : last_logits)
                     v /= sum_exp;
 
-                // 采样（这里用贪心，可扩展为 top-k）
-                std::size_t next_token = 0;
-                double best = last_logits[0];
-                for (std::size_t v = 1; v < vocab_size_; ++v)
+                // 采样
+                std::size_t next_token;
+                if (temperature > 0.0 && temperature != 1.0)
                 {
-                    if (last_logits[v] > best)
+                    // 概率采样
+                    double r = dist(rng);
+                    double cumulative = 0.0;
+                    next_token = vocab_size_ - 1;
+                    for (std::size_t v = 0; v < vocab_size_; ++v)
                     {
-                        best = last_logits[v];
-                        next_token = v;
+                        cumulative += last_logits[v];
+                        if (r <= cumulative)
+                        {
+                            next_token = v;
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    // 贪心
+                    next_token = 0;
+                    double best = last_logits[0];
+                    for (std::size_t v = 1; v < vocab_size_; ++v)
+                    {
+                        if (last_logits[v] > best)
+                        {
+                            best = last_logits[v];
+                            next_token = v;
+                        }
                     }
                 }
 
