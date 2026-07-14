@@ -791,6 +791,37 @@ class NeuralNetGUI(tk.Tk):
                      textvariable=self.text_infer_temp_var, format="%.1f").grid(row=0, column=3, padx=(0, 16))
         row += 1
 
+        # 模型架构（需与训练时一致）
+        arch_frame = ttk.LabelFrame(f, text="模型架构（需与训练时一致）", padding=6)
+        arch_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+        row += 1
+
+        ttk.Label(arch_frame, text="模型维度:").grid(row=0, column=0, sticky="w")
+        self.text_infer_d_model_var = tk.IntVar(value=128)
+        ttk.Spinbox(arch_frame, from_=32, to=512, width=6,
+                     textvariable=self.text_infer_d_model_var).grid(row=0, column=1, padx=(0, 16))
+
+        ttk.Label(arch_frame, text="注意力头:").grid(row=0, column=2, sticky="w")
+        self.text_infer_num_heads_var = tk.IntVar(value=4)
+        ttk.Spinbox(arch_frame, from_=1, to=16, width=6,
+                     textvariable=self.text_infer_num_heads_var).grid(row=0, column=3, padx=(0, 16))
+
+        ttk.Label(arch_frame, text="层数:").grid(row=0, column=4, sticky="w")
+        self.text_infer_num_layers_var = tk.IntVar(value=4)
+        ttk.Spinbox(arch_frame, from_=1, to=16, width=6,
+                     textvariable=self.text_infer_num_layers_var).grid(row=0, column=5)
+
+        ttk.Label(arch_frame, text="FFN 维度:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.text_infer_d_ff_var = tk.IntVar(value=512)
+        ttk.Spinbox(arch_frame, from_=64, to=2048, width=6,
+                     textvariable=self.text_infer_d_ff_var).grid(row=1, column=1, pady=(6, 0), padx=(0, 16))
+
+        ttk.Label(arch_frame, text="序列长度:").grid(row=1, column=2, sticky="w", pady=(6, 0))
+        self.text_infer_seq_len_var = tk.IntVar(value=256)
+        ttk.Spinbox(arch_frame, from_=16, to=1024, width=6,
+                     textvariable=self.text_infer_seq_len_var).grid(row=1, column=3, pady=(6, 0))
+        row += 1
+
         # 输入提示
         ttk.Label(f, text="输入提示:").grid(row=row, column=0, sticky="w")
         self.text_infer_prompt_var = tk.StringVar(value="Hello")
@@ -848,7 +879,12 @@ class NeuralNetGUI(tk.Tk):
                "--model", self.text_infer_model_var.get(),
                "--prompt", prompt,
                "--max-tokens", str(self.text_infer_max_tokens_var.get()),
-               "--temperature", str(self.text_infer_temp_var.get())]
+               "--temperature", str(self.text_infer_temp_var.get()),
+               "--d-model", str(self.text_infer_d_model_var.get()),
+               "--num-heads", str(self.text_infer_num_heads_var.get()),
+               "--num-layers", str(self.text_infer_num_layers_var.get()),
+               "--d-ff", str(self.text_infer_d_ff_var.get()),
+               "--seq-len", str(self.text_infer_seq_len_var.get())]
 
         self._log_text_infer(f"$ {' '.join(cmd)}\n")
         self.text_infer_start_btn.config(state="disabled")
