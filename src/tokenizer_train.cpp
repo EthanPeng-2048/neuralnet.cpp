@@ -192,7 +192,11 @@ int main(int argc, char *argv[])
     std::cout << "  完美还原: " << (decoded == test_sent ? "true" : "false") << "\n";
 
     // 保存词表
-    tokenizer.save(args.output);
+    if (auto save_result = tokenizer.save(args.output); !save_result)
+    {
+        std::cerr << "保存失败: " << save_result.error().message << '\n';
+        return 1;
+    }
     std::cout << "词表已保存至: " << args.output
               << " (" << tokenizer.vocab_size() << " tokens)\n";
 

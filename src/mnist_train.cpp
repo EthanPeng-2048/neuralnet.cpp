@@ -25,13 +25,21 @@ void print_usage(const char *prog)
         << "用法: " << prog << " [选项]\n\n"
         << "选项:\n"
         << "  --model-type <t>  模型类型: mlp/transformer (默认: mlp)\n"
-        << "  --resume <path>    从已有模型恢复训练\n"
+        << "  --resume <path>    从已有模型恢复训练 (自动读取模型规格)\n"
         << "  --save <path>      模型保存路径 (默认: mnist_model.bin)\n"
         << "  --dataset <path>   数据集目录 (默认: datasets/mnist_data)\n"
         << "  --epochs <n>       训练轮数 (默认: 10)\n"
         << "  --lr <lr>          学习率 (默认: 0.001)\n"
         << "  --batch-size <n>   批大小 (默认: 64)\n"
         << "  --optimizer <name> 优化器: sgd/momentum/adam (默认: adam)\n"
+        << "\n  MLP 选项:\n"
+        << "  --layer-dims <d1,d2,...>  MLP 各层维度，逗号分隔 (默认: 784,512,256,128,64,10)\n"
+        << "\n  Transformer 选项:\n"
+        << "  --d-model <n>      模型维度 (默认: 64)\n"
+        << "  --num-heads <n>    注意力头数 (默认: 4)\n"
+        << "  --d-ff <n>         FFN 中间维度 (默认: 128)\n"
+        << "  --num-layers <n>   Transformer 层数 (默认: 2)\n"
+        << "  --patch-size <n>   Patch 大小 (默认: 7)\n"
         << "  --help             显示此帮助信息\n";
 }
 
@@ -43,10 +51,18 @@ struct TrainConfig
     std::string resume_path;
     std::string optimizer_name = "adam";
     std::string model_type = "mlp";
-    int epochs = 10;  // 增加训练轮数
-    double lr = 0.001;  // 调整学习率
+    int epochs = 10;
+    double lr = 0.001;
     std::size_t batch_size = 64;
     bool load_existing = false;
+    // MLP 自定义层维度
+    std::vector<std::size_t> layer_dims;
+    // Transformer 自定义参数
+    std::size_t d_model    = nn::TRANSFORMER_D_MODEL;
+    std::size_t num_heads  = nn::TRANSFORMER_NUM_HEADS;
+    std::size_t d_ff       = nn::TRANSFORMER_D_FF;
+    std::size_t num_layers = nn::TRANSFORMER_NUM_LAYERS;
+    std::size_t patch_size = nn::TRANSFORMER_PATCH_SIZE;
 };
 
 TrainConfig parse_args(int argc, char *argv[])
@@ -110,6 +126,34 @@ TrainConfig parse_args(int argc, char *argv[])
                 std::exit(1);
             }
         }
+        else if (arg == "--layer-dims" && i + 1 < argc)
+        {
+            // 解析逗号分隔的层维度列表
+            std::string dims_str = argv[++i];
+            std::stringstream ss(dims_str);
+            std::string token;
+            while (std::getline(ss, token, ','))
+            {
+                std::size_t d = static_cast<std::size_t>(std::stoi(token));
+                if (d == 0) { std::cerr << "层维度不能为 0\n"; std::exit(1); }
+                cfg.layer_dims.push_back(d);
+            }
+            if (cfg.layer_dims.size() < 2)
+            {
+                std::cerr << "--layer-dims 至少需要 2 个维度\n";
+                std::exit(1);
+            }
+        }
+        else if (arg == "--d-model" && i + 1 < argc)
+            cfg.d_model = static_cast<std::size_t>(std::stoi(argv[++i]));
+        else if (arg == "--num-heads" && i + 1 < argc)
+            cfg.num_heads = static_cast<std::size_t>(std::stoi(argv[++i]));
+        else if (arg == "--d-ff" && i + 1 < argc)
+            cfg.d_ff = static_cast<std::size_t>(std::stoi(argv[++i]));
+        else if (arg == "--num-layers" && i + 1 < argc)
+            cfg.num_layers = static_cast<std::size_t>(std::stoi(argv[++i]));
+        else if (arg == "--patch-size" && i + 1 < argc)
+            cfg.patch_size = static_cast<std::size_t>(std::stoi(argv[++i]));
         else
         {
             std::cerr << "未知参数: " << arg << "\n使用 --help 查看用法\n";
@@ -125,12 +169,12 @@ TrainConfig parse_args(int argc, char *argv[])
 //   2. 使用 std::from_chars (C++17) 替代 std::stod，无临时 string 分配
 //   3. 向量预分配 reserve()，避免多次扩容拷贝
 //   4. 直接指针遍历 buffer，省去 std::stringstream 开销
-std::pair<nn::Matrix, nn::Matrix> load_csv(const std::string &filename, int max_samples = -1)
+nn::Result<std::pair<nn::Matrix, nn::Matrix>> load_csv(const std::string &filename, int max_samples = -1)
 {
     // ── 1. 整文件读入 ──────────────────────────────────────────────
     std::ifstream file(filename, std::ios::binary | std::ios::ate);
     if (!file.is_open())
-        throw std::runtime_error("Cannot open file: " + filename);
+        return std::unexpected(nn::Error{"Cannot open file: " + filename});
 
     const auto file_size = file.tellg();
     file.seekg(0);
@@ -144,7 +188,7 @@ std::pair<nn::Matrix, nn::Matrix> load_csv(const std::string &filename, int max_
     for (char c : buffer)
         if (c == '\n') ++row_count;
     if (row_count == 0)
-        throw std::runtime_error("CSV file is empty or malformed: " + filename);
+        return std::unexpected(nn::Error{"CSV file is empty or malformed: " + filename});
 
     if (max_samples > 0 && static_cast<std::size_t>(max_samples) < row_count)
         row_count = static_cast<std::size_t>(max_samples);
@@ -188,7 +232,7 @@ std::pair<nn::Matrix, nn::Matrix> load_csv(const std::string &filename, int max_
         // 解析标签
         auto [p_label, ec_label] = std::from_chars(ptr, end, labels[row]);
         if (ec_label != std::errc{})
-            throw std::runtime_error("Failed to parse label at row " + std::to_string(row));
+            return std::unexpected(nn::Error{"Failed to parse label at row " + std::to_string(row)});
         ptr = p_label;
 
         // 解析特征
@@ -200,7 +244,7 @@ std::pair<nn::Matrix, nn::Matrix> load_csv(const std::string &filename, int max_
             double val;
             auto [p_feat, ec_feat] = std::from_chars(ptr, end, val);
             if (ec_feat != std::errc{})
-                throw std::runtime_error("Failed to parse feature at row " + std::to_string(row));
+                return std::unexpected(nn::Error{"Failed to parse feature at row " + std::to_string(row)});
             features[row * feat_dim + j] = val;
             ptr = p_feat;
         }
@@ -230,18 +274,20 @@ std::pair<nn::Matrix, nn::Matrix> load_csv(const std::string &filename, int max_
     {
         int lbl = labels[i];
         if (lbl < 0 || lbl >= 10)
-            throw std::out_of_range("Label out of range: " + std::to_string(lbl));
+            return std::unexpected(nn::Error{"Label out of range: " + std::to_string(lbl)});
         label_mat.set_value_unchecked(lbl, i, 1.0);
     }
 
-    return {feat_mat, label_mat};
+    return std::pair{std::move(feat_mat), std::move(label_mat)};
 }
 
 // -------------------- 评估函数 --------------------
 double evaluate(nn::Model &model, const nn::Matrix &x, const nn::Matrix &y_onehot)
 {
     std::size_t N = x.cols();
-    auto out = model.forward(x);
+    auto out_result = model.forward(x);
+    if (!out_result) return 0.0;
+    auto out = std::move(*out_result);
     int correct = 0;
     for (std::size_t i = 0; i < N; ++i)
     {
@@ -281,31 +327,71 @@ int main(int argc, char *argv[])
     {
         TrainConfig cfg = parse_args(argc, argv);
 
+        // ── 构建规格 ─────────────────────────────────────────────
+        nn::ModelSpec spec;
+        if (cfg.model_type == "mlp")
+        {
+            spec.type = nn::ModelType::MLP;
+            spec.layer_dims = cfg.layer_dims.empty() ? nn::MNIST_LAYER_DIMS : cfg.layer_dims;
+        }
+        else
+        {
+            spec.type = nn::ModelType::Transformer;
+            spec.d_model = cfg.d_model;
+            spec.num_heads = cfg.num_heads;
+            spec.d_ff = cfg.d_ff;
+            spec.num_layers = cfg.num_layers;
+            spec.patch_size = cfg.patch_size;
+        }
+
+        // ── 如果 --resume，从文件读取规格覆盖 CLI 参数 ──────────
+        if (cfg.load_existing)
+        {
+            auto spec_result = nn::peek_model_spec(cfg.resume_path);
+            if (spec_result)
+            {
+                if (spec_result->type != nn::ModelType::Unknown)
+                {
+                    std::cout << "从模型文件读取规格\n";
+                    spec = std::move(*spec_result);
+                }
+                else
+                {
+                    std::cout << "旧格式模型文件 (V1)，使用命令行参数\n";
+                }
+            }
+            else
+            {
+                std::cerr << "读取模型规格失败: " << spec_result.error().message
+                          << "，使用命令行参数。\n";
+            }
+        }
+
         // ── 打印配置 ─────────────────────────────────────────────
         std::cout << "========================================\n";
         std::cout << "  MNIST 手写数字训练\n";
         std::cout << "========================================\n";
         std::cout << "  模型类型: " << cfg.model_type << "\n";
-        if (cfg.model_type == "mlp")
+        if (spec.is_mlp())
         {
             std::cout << "  网络: ";
-            for (std::size_t i = 0; i < nn::MNIST_LAYER_DIMS.size(); ++i)
+            for (std::size_t i = 0; i < spec.layer_dims.size(); ++i)
             {
-                std::cout << nn::MNIST_LAYER_DIMS[i];
-                if (i < nn::MNIST_LAYER_DIMS.size() - 2)
+                std::cout << spec.layer_dims[i];
+                if (i < spec.layer_dims.size() - 2)
                     std::cout << "(LayerNorm+GeLU)";
-                if (i < nn::MNIST_LAYER_DIMS.size() - 1)
+                if (i < spec.layer_dims.size() - 1)
                     std::cout << " -> ";
             }
             std::cout << "\n";
         }
         else
         {
-            std::cout << "  网络: PatchEmbedding(7×7) -> TransformerEncoder("
-                      << nn::TRANSFORMER_NUM_LAYERS << "层, d="
-                      << nn::TRANSFORMER_D_MODEL << ", heads="
-                      << nn::TRANSFORMER_NUM_HEADS << ") -> Linear("
-                      << nn::TRANSFORMER_D_MODEL << "→"
+            std::cout << "  网络: PatchEmbedding(" << spec.patch_size << "×" << spec.patch_size
+                      << ") -> TransformerEncoder(" << spec.num_layers << "层, d="
+                      << spec.d_model << ", heads=" << spec.num_heads
+                      << ", d_ff=" << spec.d_ff
+                      << ") -> Linear(" << spec.d_model << "→"
                       << nn::MNIST_NUM_CLASSES << ")\n";
         }
         std::cout << "  优化器: " << cfg.optimizer_name << "  学习率: " << cfg.lr << "\n";
@@ -316,23 +402,35 @@ int main(int argc, char *argv[])
 
         // ── 加载数据 ─────────────────────────────────────────────
         std::cout << "加载数据: " << cfg.dataset_path << " ..." << std::endl;
-        auto [train_x, train_y] = load_csv(cfg.dataset_path + "/train.csv");
-        auto [test_x, test_y] = load_csv(cfg.dataset_path + "/test.csv");
+        auto csv_train_result = load_csv(cfg.dataset_path + "/train.csv");
+        if (!csv_train_result) { std::cerr << "Error: " << csv_train_result.error().message << '\n'; return 1; }
+        auto [train_x, train_y] = std::move(*csv_train_result);
+
+        auto csv_test_result = load_csv(cfg.dataset_path + "/test.csv");
+        if (!csv_test_result) { std::cerr << "Error: " << csv_test_result.error().message << '\n'; return 1; }
+        auto [test_x, test_y] = std::move(*csv_test_result);
         std::cout << "训练集: " << train_x.cols() << " 样本, 测试集: " << test_x.cols() << " 样本\n" << std::endl;
 
         // ── 构建模型 ─────────────────────────────────────────────
-        auto model = nn::build_mnist_model(cfg.model_type);
+        auto model_result = nn::build_mnist_model_from_spec(spec);
+        if (!model_result)
+        {
+            std::cerr << "构建模型失败: " << model_result.error().message << '\n';
+            return 1;
+        }
+        auto model = std::move(*model_result);
 
         if (cfg.load_existing)
         {
-            try
+            auto load_result = nn::load_model(cfg.resume_path, model);
+            if (load_result)
             {
-                nn::load_model(cfg.resume_path, model);
                 std::cout << "已加载模型: " << cfg.resume_path << "\n" << std::endl;
             }
-            catch (const std::exception &e)
+            else
             {
-                std::cerr << "加载模型失败: " << e.what() << "，将从头训练。\n" << std::endl;
+                std::cerr << "加载模型失败: " << load_result.error().message
+                          << "，将从头训练。\n" << std::endl;
             }
         }
 
@@ -373,14 +471,30 @@ int main(int argc, char *argv[])
                                 train_y.span().data() + r * train_y.cols() + start,
                                 cfg.batch_size * sizeof(double));
 
-                auto out = model.forward(x_batch);
-                double loss = ce_loss.forward(out, y_batch);
+                auto out_fwd = model.forward(x_batch);
+                if (!out_fwd) {
+                    std::cerr << "\nForward pass failed: " << out_fwd.error().message << '\n';
+                    return 1;
+                }
+                auto out = std::move(*out_fwd);
+                auto loss_result = ce_loss.forward(out, y_batch);
+                if (!loss_result) {
+                    std::cerr << "\nLoss computation failed: " << loss_result.error().message << '\n';
+                    return 1;
+                }
+                double loss = *loss_result;
                 total_loss += loss;
 
                 auto grad = ce_loss.backward();
-                model.backward(grad);
+                auto bwd_result = model.backward(grad);
+                if (!bwd_result) { std::cerr << "Error: " << bwd_result.error().message << '\n'; return 1; }
 
-                optimizer->step();
+                auto step_result = optimizer->step();
+                if (!step_result)
+                {
+                    std::cerr << "\n优化器 step 失败: " << step_result.error().message << '\n';
+                    return 1;
+                }
                 optimizer->zero_grad();
 
                 // 进度显示
@@ -411,8 +525,13 @@ int main(int argc, char *argv[])
         auto t_end = std::chrono::steady_clock::now();
         double total_sec = std::chrono::duration<double>(t_end - t_start).count();
 
-        // ── 保存模型 ─────────────────────────────────────────────
-        nn::save_model(cfg.save_path, model);
+        // ── 保存模型（含规格） ─────────────────────────────────────
+        auto save_result = nn::save_model(cfg.save_path, model, spec);
+        if (!save_result)
+        {
+            std::cerr << "保存模型失败: " << save_result.error().message << '\n';
+            return 1;
+        }
         std::cout << "\n训练完成! 总耗时: " << std::fixed << std::setprecision(1) << total_sec << "s" << std::endl;
 
         return 0;

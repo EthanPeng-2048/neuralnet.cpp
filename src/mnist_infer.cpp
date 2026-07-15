@@ -27,7 +27,9 @@ void print_usage(const char *prog)
         << "  " << prog << " <目录>   [选项]     批量推理目录下所有 CSV\n\n"
         << "选项:\n"
         << "  --model <path>     模型文件路径 (默认: pretrained/model.bin)\n"
+        << "                       V2 格式模型文件自动读取模型规格，无需指定 --model-type\n"
         << "  --model-type <t>   模型类型: mlp/transformer (默认: mlp)\n"
+        << "                       仅在 V1 旧格式模型文件时需要手动指定\n"
         << "  --topk <n>         显示前 n 个预测结果 (默认: 3)\n"
         << "  --show-pixels      显示像素矩阵 (调试用)\n"
         << "  --help             显示此帮助信息\n";
@@ -37,7 +39,7 @@ void print_usage(const char *prog)
 struct InferConfig
 {
     std::string model_path = "pretrained/model.bin";
-    std::string model_type = "mlp";
+    std::string model_type = "mlp";   // 仅 V1 旧格式使用
     std::string input_path;
     int topk = 3;
     bool show_pixels = false;
@@ -103,7 +105,7 @@ InferConfig parse_args(int argc, char *argv[])
 // build_model 函数已移至 neuralnet.cpp/mnist_common.hpp 中的 nn::build_mnist_model()
 
 // ==================== 数据读取 ====================
-nn::Matrix load_image_from_csv(const std::string &csv_line)
+nn::Result<nn::Matrix> load_image_from_csv(const std::string &csv_line)
 {
     std::vector<double> pixels;
     std::stringstream ss(csv_line);
@@ -113,7 +115,7 @@ nn::Matrix load_image_from_csv(const std::string &csv_line)
         pixels.push_back(std::stod(token));
     }
     if (pixels.size() != nn::MNIST_INPUT_DIM)
-        throw std::runtime_error("CSV 必须包含恰好 " + std::to_string(nn::MNIST_INPUT_DIM) + " 个值，实际: " + std::to_string(pixels.size()));
+        return std::unexpected(nn::Error{"CSV 必须包含恰好 " + std::to_string(nn::MNIST_INPUT_DIM) + " 个值，实际: " + std::to_string(pixels.size())});
 
     nn::Matrix img(nn::MNIST_INPUT_DIM, 1);
     for (std::size_t i = 0; i < nn::MNIST_INPUT_DIM; ++i)
@@ -130,7 +132,9 @@ struct Prediction
 
 std::vector<Prediction> predict_with_confidence(nn::Model &model, const nn::Matrix &img, int topk)
 {
-    auto logits = model.forward(img);
+    auto logits_result = model.forward(img);
+    if (!logits_result) return {};  // 返回空 vector
+    auto logits = std::move(*logits_result);
 
     // Softmax 计算概率
     double max_val = logits.at_unchecked(0, 0);
@@ -181,15 +185,17 @@ void show_pixels(const nn::Matrix &img)
 }
 
 // ==================== 推理单张图片 ====================
-void infer_single(nn::Model &model, const std::string &filepath, const InferConfig &cfg)
+nn::Result<void> infer_single(nn::Model &model, const std::string &filepath, const InferConfig &cfg)
 {
     std::ifstream file(filepath);
     if (!file)
-        throw std::runtime_error("无法打开文件: " + filepath);
+        return std::unexpected(nn::Error{"无法打开文件: " + filepath});
 
     std::string line;
     std::getline(file, line);
-    auto img = load_image_from_csv(line);
+    auto img_result = load_image_from_csv(line);
+    if (!img_result) { std::cerr << "Error: " << img_result.error().message << '\n'; return {}; }
+    auto img = std::move(*img_result);
 
     if (cfg.show_pixels)
     {
@@ -207,8 +213,7 @@ void infer_single(nn::Model &model, const std::string &filepath, const InferConf
         std::cout << results[k].digit
                   << " (" << std::fixed << std::setprecision(1) << results[k].confidence * 100.0 << "%)";
     }
-    std::cout << std::endl;
-}
+    std::cout << std::endl;    return {};}
 
 // ==================== 主函数 ====================
 int main(int argc, char *argv[])
@@ -217,9 +222,47 @@ int main(int argc, char *argv[])
     {
         InferConfig cfg = parse_args(argc, argv);
 
-        // 构建并加载模型
-        auto model = nn::build_mnist_model(cfg.model_type);
-        nn::load_model(cfg.model_path, model);
+        // ── 从模型文件读取规格 ─────────────────────────────────
+        auto spec_result = nn::peek_model_spec(cfg.model_path);
+        if (!spec_result)
+        {
+            std::cerr << "读取模型文件失败: " << spec_result.error().message << std::endl;
+            return 1;
+        }
+        nn::ModelSpec spec = spec_result.value();
+
+        nn::Model model;
+        if (spec.type != nn::ModelType::Unknown)
+        {
+            // V2 格式：自动从规格构建模型
+            std::cout << "从模型文件读取规格 (V2 格式)\n";
+            auto build_result = nn::build_mnist_model_from_spec(spec);
+            if (!build_result)
+            {
+                std::cerr << "构建模型失败: " << build_result.error().message << std::endl;
+                return 1;
+            }
+            model = std::move(*build_result);
+        }
+        else
+        {
+            // V1 旧格式：使用 --model-type 参数
+            std::cout << "旧格式模型文件 (V1)，使用 --model-type 参数: " << cfg.model_type << "\n";
+            auto build_result = nn::build_mnist_model(cfg.model_type);
+            if (!build_result)
+            {
+                std::cerr << "构建模型失败: " << build_result.error().message << std::endl;
+                return 1;
+            }
+            model = std::move(*build_result);
+        }
+
+        auto load_result = nn::load_model(cfg.model_path, model);
+        if (!load_result)
+        {
+            std::cerr << "加载模型失败: " << load_result.error().message << std::endl;
+            return 1;
+        }
         std::cout << "模型已加载: " << cfg.model_path << "\n" << std::endl;
 
         fs::path input(cfg.input_path);
@@ -245,7 +288,8 @@ int main(int argc, char *argv[])
 
             for (auto &f : csv_files)
             {
-                infer_single(model, f.string(), cfg);
+                auto result = infer_single(model, f.string(), cfg);
+                if (!result) { std::cerr << "推理失败: " << f.filename().string() << ": " << result.error().message << '\n'; }
             }
 
             std::cout << "\n共推理 " << csv_files.size() << " 张图片" << std::endl;
@@ -253,7 +297,8 @@ int main(int argc, char *argv[])
         else if (fs::is_regular_file(input))
         {
             // 单张推理
-            infer_single(model, input.string(), cfg);
+            auto result = infer_single(model, input.string(), cfg);
+            if (!result) { std::cerr << "推理失败: " << result.error().message << '\n'; return 1; }
         }
         else
         {

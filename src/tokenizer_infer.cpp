@@ -341,7 +341,11 @@ int main(int argc, char *argv[])
     // 加载词表
     nn::ByteZipTokenizer tokenizer;
     std::cout << "加载词表: " << args.model_path << "\n";
-    tokenizer.load(args.model_path);
+    if (auto load_result = tokenizer.load(args.model_path); !load_result)
+    {
+        std::cerr << "加载失败: " << load_result.error().message << '\n';
+        return 1;
+    }
     std::cout << "词表大小: " << tokenizer.vocab_size() << " tokens\n\n";
 
     switch (args.mode)
