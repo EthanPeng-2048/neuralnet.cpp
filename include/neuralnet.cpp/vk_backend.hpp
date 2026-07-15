@@ -1,26 +1,10 @@
 #ifndef VK_BACKEND_HPP
 #define VK_BACKEND_HPP
-
-// ── Vulkan Compute Backend ─────────────────────────────────────────────────
-// 为 neuralnet.cpp 提供 GPU 加速的矩阵乘法。
-//
-// 设计原则：
-//   - 公共接口零裸指针（使用 std::span 传递数据）
-//   - 所有 Vulkan 句柄由 RAII 守卫管理（自动释放）
-//   - GPU 使用 float32 获得最大硬件兼容性，CPU double 自动转换
-//   - 单例模式：GpuBackend::instance() 获取全局后端
-//
-// 依赖：
-//   - Vulkan SDK（运行时）
-//   - Shader 使用 float32，无需任何可选设备特性
-//   - CMake 构建时编译 SPIR-V 着色器
-// ─────────────────────────────────────────────────────────────────────────
-
+// ── Vulkan Compute Backend (v3 - Optimized & Secure) ──────────────────────
 #ifdef NN_HAS_VULKAN
-
 #include <vulkan/vulkan.h>
-
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -30,378 +14,698 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <unordered_map>
 #include <tuple>
 #include <vector>
-
 #include "nn_config.hpp"
 
-// 尝试包含 CMake 生成的 SPIR-V 嵌入头文件
 #if __has_include("matmul_spv.hpp")
 #include "matmul_spv.hpp"
 #define NN_MATMUL_SPV_EMBEDDED
 #endif
 
+#if __has_include("matmul_tiled_spv.hpp")
+#include "matmul_tiled_spv.hpp"
+#define NN_MATMUL_TILED_SPV_EMBEDDED
+#endif
+
+#if __has_include("elementwise_spv.hpp")
+#include "elementwise_spv.hpp"
+#define NN_ELEMENTWISE_SPV_EMBEDDED
+#endif
+
 namespace nn
 {
-
-// ── 内部错误检查辅助 ─────────────────────────────────────────────────────
 namespace detail
 {
-    [[nodiscard]] inline Result<void> vk_check(VkResult res, const char* file, int line)
+[[nodiscard]] inline Result<void> vk_check(VkResult res, const char* file, int line)
+{
+    if (res != VK_SUCCESS)
     {
-        if (res != VK_SUCCESS)
+        return std::unexpected(Error{
+            "Vulkan error " + std::to_string(static_cast<int>(res)) +
+            " at " + std::string(file) + ":" + std::to_string(line)});
+    }
+    return {};
+}
+
+inline void convert_double_to_float(
+    std::span<const double> src, float* __restrict dst) noexcept
+{
+    std::transform(src.begin(), src.end(), dst,
+                   [](double v) { return static_cast<float>(v); });
+}
+
+inline void convert_float_to_double(
+    const float* __restrict src, std::span<double> dst) noexcept
+{
+    std::transform(src, src + dst.size(), dst.begin(),
+                   [](float v) { return static_cast<double>(v); });
+}
+} // namespace detail
+
+// ══════════════════════════════════════════════════════════════════════════
+// MemoryPool — 内存子分配器 (O(log n) 优化版)
+// ══════════════════════════════════════════════════════════════════════════
+class MemoryPool
+{
+public:
+    static constexpr VkDeviceSize DEFAULT_BLOCK_SIZE = 128ull * 1024 * 1024;
+
+    struct Allocation {
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+        VkDeviceSize size = 0;
+        VkMemoryPropertyFlags property_flags = 0;
+        [[nodiscard]] bool valid() const noexcept { return memory != VK_NULL_HANDLE; }
+    };
+
+private:
+    struct FreeRegion {
+        VkDeviceSize offset;
+        VkDeviceSize size;
+        bool operator<(const FreeRegion& o) const noexcept { return offset < o.offset; }
+    };
+
+    struct Block {
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkDeviceSize size = 0;
+        uint32_t memory_type_index = 0;
+        VkMemoryPropertyFlags property_flags = 0;
+        std::set<FreeRegion> free_regions; // 使用 set 保证 O(log n) 合并
+        std::size_t allocation_count = 0;
+        VkDevice owning_device = VK_NULL_HANDLE;
+
+        Block() = default;
+        Block(Block&& o) noexcept
+            : memory(o.memory), size(o.size), memory_type_index(o.memory_type_index),
+              property_flags(o.property_flags), free_regions(std::move(o.free_regions)),
+              allocation_count(o.allocation_count), owning_device(o.owning_device)
         {
-            return std::unexpected(Error{
-                "Vulkan error " + std::to_string(static_cast<int>(res)) +
-                " at " + std::string(file) + ":" + std::to_string(line)});
+            o.memory = VK_NULL_HANDLE; o.size = 0; o.allocation_count = 0; o.owning_device = VK_NULL_HANDLE;
+        }
+        // 禁用移动赋值，防止 vector 操作引发意外释放
+        Block& operator=(Block&&) = delete; 
+        
+        ~Block() {
+            if (memory != VK_NULL_HANDLE && owning_device != VK_NULL_HANDLE)
+                vkFreeMemory(owning_device, memory, nullptr);
+        }
+        Block(const Block&) = delete;
+        Block& operator=(const Block&) = delete;
+    };
+
+    struct SuballocKey {
+        VkDeviceMemory memory;
+        VkDeviceSize offset;
+        bool operator==(const SuballocKey& o) const noexcept { return memory == o.memory && offset == o.offset; }
+    };
+    struct SuballocKeyHash {
+        std::size_t operator()(const SuballocKey& k) const noexcept {
+            return std::hash<VkDeviceMemory>{}(k.memory) ^ (std::hash<VkDeviceSize>{}(k.offset) * 2654435761ULL);
+        }
+    };
+
+    VkDevice device_;
+    VkPhysicalDevice physical_device_;
+    VkDeviceSize block_size_;
+    VkPhysicalDeviceMemoryProperties mem_props_;
+    
+    // 【关键修复】使用 unique_ptr 避免 vector 扩容/删除时触发 Block 的移动和析构
+    std::vector<std::unique_ptr<Block>> blocks_; 
+    std::unordered_map<SuballocKey, VkDeviceSize, SuballocKeyHash> active_allocs_;
+    std::mutex mutex_;
+
+    [[nodiscard]] static std::optional<VkDeviceSize> find_free(
+        Block& block, VkDeviceSize alignment, VkDeviceSize size)
+    {
+        for (auto it = block.free_regions.begin(); it != block.free_regions.end(); ++it)
+        {
+            VkDeviceSize aligned = (it->offset + alignment - 1) & ~(alignment - 1);
+            VkDeviceSize padding = aligned - it->offset;
+            if (it->size >= padding + size)
+            {
+                VkDeviceSize result = aligned;
+                VkDeviceSize remaining = it->size - padding - size;
+                VkDeviceSize orig_offset = it->offset;
+                block.free_regions.erase(it);
+                if (padding > 0) block.free_regions.insert({orig_offset, padding});
+                if (remaining > 0) block.free_regions.insert({aligned + size, remaining});
+                return result;
+            }
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] Result<Block> create_block(uint32_t memory_type_index,
+                                             VkMemoryPropertyFlags flags, VkDeviceSize size = 0)
+    {
+        VkDeviceSize alloc_size = (size > 0) ? size : block_size_;
+        VkMemoryAllocateInfo alloc_info{};
+        alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        alloc_info.allocationSize = alloc_size;
+        alloc_info.memoryTypeIndex = memory_type_index;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        auto r = detail::vk_check(vkAllocateMemory(device_, &alloc_info, nullptr, &memory), __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
+
+        Block block;
+        block.owning_device = device_;
+        block.memory = memory;
+        block.size = alloc_size;
+        block.memory_type_index = memory_type_index;
+        block.property_flags = flags;
+        block.free_regions.insert({0, alloc_size});
+        return block;
+    }
+
+    [[nodiscard]] std::optional<uint32_t> find_memory_type(
+        uint32_t type_bits, VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags fallback = 0) const
+    {
+        std::optional<uint32_t> best, fb;
+        for (uint32_t i = 0; i < mem_props_.memoryTypeCount; ++i) {
+            if (!(type_bits & (1u << i))) continue;
+            auto flags = mem_props_.memoryTypes[i].propertyFlags;
+            if ((flags & preferred) == preferred && !best) best = i;
+            if (fallback && (flags & fallback) == fallback && !fb) fb = i;
+        }
+        return best ? best : fb;
+    }
+
+public:
+    MemoryPool(VkDevice device, VkPhysicalDevice physical_device, VkDeviceSize block_size = DEFAULT_BLOCK_SIZE)
+        : device_(device), physical_device_(physical_device), block_size_(block_size) 
+    {
+        vkGetPhysicalDeviceMemoryProperties(physical_device_, &mem_props_);
+    }
+    ~MemoryPool() { blocks_.clear(); }
+
+    [[nodiscard]] Result<Allocation> allocate(
+        VkMemoryRequirements requirements, VkMemoryPropertyFlags preferred_flags, VkMemoryPropertyFlags fallback_flags = 0)
+    {
+        std::lock_guard lock(mutex_);
+        auto mem_type = find_memory_type(requirements.memoryTypeBits, preferred_flags, fallback_flags);
+        if (!mem_type) return std::unexpected(Error{"No suitable GPU memory type found"});
+
+        VkDeviceSize alignment = requirements.alignment > 0 ? requirements.alignment : 1;
+        const VkDeviceSize alloc_size = requirements.size;
+        VkDeviceSize effective_block_size = (alloc_size > block_size_) ? alloc_size : block_size_;
+
+        for (auto& block_ptr : blocks_) {
+            auto& block = *block_ptr;
+            if (block.memory_type_index != *mem_type) continue;
+            auto offset = find_free(block, alignment, alloc_size);
+            if (offset) {
+                block.allocation_count++;
+                active_allocs_[{block.memory, *offset}] = alloc_size;
+                return Allocation{block.memory, *offset, alloc_size, block.property_flags};
+            }
+        }
+
+        auto block_result = create_block(*mem_type, preferred_flags, effective_block_size);
+        if (!block_result) return std::unexpected(block_result.error());
+        
+        auto new_block = std::make_unique<Block>(std::move(*block_result));
+        auto offset = find_free(*new_block, alignment, alloc_size);
+        if (!offset) return std::unexpected(Error{"Suballocation failed"});
+
+        VkDeviceMemory mem = new_block->memory;
+        VkMemoryPropertyFlags flags = new_block->property_flags;
+        new_block->allocation_count++;
+        active_allocs_[{mem, *offset}] = alloc_size;
+        blocks_.push_back(std::move(new_block));
+        return Allocation{mem, *offset, alloc_size, flags};
+    }
+
+    void free(const Allocation& alloc)
+    {
+        if (!alloc.valid()) return;
+        std::lock_guard lock(mutex_);
+        SuballocKey key{alloc.memory, alloc.offset};
+        auto active_it = active_allocs_.find(key);
+        if (active_it == active_allocs_.end()) return;
+
+        for (auto& block_ptr : blocks_) {
+            auto& block = *block_ptr;
+            if (block.memory != alloc.memory) continue;
+            
+            FreeRegion new_reg{alloc.offset, alloc.size};
+            auto ins_it = block.free_regions.insert(new_reg).first;
+            
+            // 向前合并
+            if (ins_it != block.free_regions.begin()) {
+                auto prev = std::prev(ins_it);
+                if (prev->offset + prev->size == ins_it->offset) {
+                    FreeRegion merged{prev->offset, prev->size + ins_it->size};
+                    block.free_regions.erase(prev);
+                    block.free_regions.erase(ins_it);
+                    ins_it = block.free_regions.insert(merged).first;
+                }
+            }
+            // 向后合并
+            auto next = std::next(ins_it);
+            if (next != block.free_regions.end()) {
+                if (ins_it->offset + ins_it->size == next->offset) {
+                    FreeRegion merged{ins_it->offset, ins_it->size + next->size};
+                    block.free_regions.erase(next);
+                    block.free_regions.erase(ins_it);
+                    block.free_regions.insert(merged);
+                }
+            }
+
+            block.allocation_count--;
+            active_allocs_.erase(active_it);
+            
+            // 【关键修复】：不要 erase block！
+            // 让 Block 留在池中复用，避免 vector 移动元素导致的 Double Free。
+            // 内存池的设计初衷就是保留大块内存，直到 MemoryPool 析构时统一释放。
+            return;
+        }
+    }
+};
+
+// ══════════════════════════════════════════════════════════════════════════
+// StagingRing — 全局 Staging 环形缓冲区 (线程安全 & 动态大小)
+// ══════════════════════════════════════════════════════════════════════════
+class StagingRing
+{
+public:
+    static constexpr std::size_t DEFAULT_REGION_SIZE = 256ull * 1024 * 1024;
+    static constexpr std::size_t DEFAULT_NUM_REGIONS = 4;
+
+    struct Region {
+        MemoryPool::Allocation alloc;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        void* mapped_ptr = nullptr;
+        VkFence fence = VK_NULL_HANDLE;
+        bool in_flight = false;
+    };
+
+private:
+    VkDevice device_ = VK_NULL_HANDLE;
+    VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
+    VkCommandPool cmd_pool_ = VK_NULL_HANDLE;
+    MemoryPool* pool_ = nullptr;
+    std::vector<Region> regions_;
+    std::size_t region_size_;
+    std::atomic<std::size_t> current_{0}; // 原子变量修复数据竞争
+
+public:
+    StagingRing() = default;
+
+    [[nodiscard]] Result<void> initialize(
+        VkDevice device, VkPhysicalDevice physical_device,
+        VkCommandPool cmd_pool, MemoryPool* pool,
+        std::size_t region_size = DEFAULT_REGION_SIZE,
+        std::size_t num_regions = DEFAULT_NUM_REGIONS)
+    {
+        device_ = device;
+        physical_device_ = physical_device;
+        cmd_pool_ = cmd_pool;
+        pool_ = pool;
+
+        // 动态计算合理的 Staging 大小，避免盲目占用 1GB HOST_VISIBLE 内存
+        VkPhysicalDeviceMemoryProperties mem_props;
+        vkGetPhysicalDeviceMemoryProperties(physical_device, &mem_props);
+        VkDeviceSize max_host_visible = 0;
+        for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
+            if (mem_props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+                uint32_t heap_idx = mem_props.memoryTypes[i].heapIndex;
+                if (mem_props.memoryHeaps[heap_idx].size > max_host_visible) {
+                    max_host_visible = mem_props.memoryHeaps[heap_idx].size;
+                }
+            }
+        }
+        VkDeviceSize calculated_size = max_host_visible / 8;
+        if (calculated_size < 64ull * 1024 * 1024) calculated_size = 64ull * 1024 * 1024;
+        if (calculated_size > 256ull * 1024 * 1024) calculated_size = 256ull * 1024 * 1024;
+        region_size_ = std::min(static_cast<VkDeviceSize>(region_size), calculated_size);
+
+        regions_.resize(num_regions);
+        for (std::size_t i = 0; i < num_regions; ++i)
+        {
+            auto& r = regions_[i];
+            VkBufferCreateInfo buf_info{};
+            buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            buf_info.size = region_size_;
+            buf_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            auto res = detail::vk_check(
+                vkCreateBuffer(device_, &buf_info, nullptr, &r.buffer), __FILE__, __LINE__);
+            if (!res) return res;
+
+            VkMemoryRequirements mem_reqs;
+            vkGetBufferMemoryRequirements(device_, r.buffer, &mem_reqs);
+            auto alloc_r = pool_->allocate(
+                mem_reqs,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            if (!alloc_r) return std::unexpected(alloc_r.error());
+            r.alloc = *alloc_r;
+
+            res = detail::vk_check(
+                vkBindBufferMemory(device_, r.buffer, r.alloc.memory, r.alloc.offset),
+                __FILE__, __LINE__);
+            if (!res) return res;
+
+            if (vkMapMemory(device_, r.alloc.memory, r.alloc.offset,
+                            r.alloc.size, 0, &r.mapped_ptr) != VK_SUCCESS)
+                return std::unexpected(Error{"Failed to map staging region " + std::to_string(i)});
+
+            VkFenceCreateInfo fence_info{};
+            fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+            res = detail::vk_check(
+                vkCreateFence(device_, &fence_info, nullptr, &r.fence), __FILE__, __LINE__);
+            if (!res) return res;
         }
         return {};
     }
-} // namespace detail
 
-// ── MappedMemoryGuard ─────────────────────────────────────────────────────
-// RAII 内存映射守卫：构造时 vkMapMemory，析构时自动 vkUnmapMemory。
-// 只暴露 std::span<std::byte>，不暴露 void*。
-// 提供 double↔float 安全转换的上传/下载方法。
-// ─────────────────────────────────────────────────────────────────────────
+    ~StagingRing()
+    {
+        if (device_ == VK_NULL_HANDLE) return;
+        for (auto& r : regions_)
+        {
+            if (r.fence != VK_NULL_HANDLE) vkDestroyFence(device_, r.fence, nullptr);
+            if (r.mapped_ptr) vkUnmapMemory(device_, r.alloc.memory);
+            if (r.buffer != VK_NULL_HANDLE) vkDestroyBuffer(device_, r.buffer, nullptr);
+            if (pool_ && r.alloc.valid()) pool_->free(r.alloc);
+        }
+    }
+
+    StagingRing(const StagingRing&) = delete;
+    StagingRing& operator=(const StagingRing&) = delete;
+
+    [[nodiscard]] std::size_t acquire()
+    {
+        std::size_t idx = current_.fetch_add(1, std::memory_order_relaxed) % regions_.size();
+        auto& r = regions_[idx];
+        if (r.in_flight)
+        {
+            vkWaitForFences(device_, 1, &r.fence, VK_TRUE, 10'000'000'000ULL);
+            vkResetFences(device_, 1, &r.fence);
+            r.in_flight = false;
+        }
+        return idx;
+    }
+
+    [[nodiscard]] Result<void> upload(std::size_t idx, std::span<const double> data,
+                                      VkDeviceSize byte_offset = 0)
+    {
+        if (byte_offset + data.size() * sizeof(float) > region_size_)
+            return std::unexpected(Error{"Staging upload out of bounds"});
+            
+        auto& r = regions_[idx];
+        if (!r.mapped_ptr) return std::unexpected(Error{"Staging region not mapped"});
+        auto* dst = reinterpret_cast<float*>(
+            static_cast<std::byte*>(r.mapped_ptr) + byte_offset);
+        detail::convert_double_to_float(data, dst);
+        return {};
+    }
+
+    [[nodiscard]] Result<void> download(std::size_t idx, std::span<double> dst,
+                                        VkDeviceSize byte_offset = 0)
+    {
+        if (byte_offset + dst.size() * sizeof(float) > region_size_)
+            return std::unexpected(Error{"Staging download out of bounds"});
+            
+        auto& r = regions_[idx];
+        if (!r.mapped_ptr) return std::unexpected(Error{"Staging region not mapped"});
+        const auto* src = reinterpret_cast<const float*>(
+            static_cast<const std::byte*>(r.mapped_ptr) + byte_offset);
+        detail::convert_float_to_double(src, dst);
+        return {};
+    }
+
+    [[nodiscard]] VkFence fence(std::size_t idx) const noexcept { return regions_[idx].fence; }
+    [[nodiscard]] VkBuffer buffer(std::size_t idx) const noexcept { return regions_[idx].buffer; }
+    void mark_in_flight(std::size_t idx) noexcept { regions_[idx].in_flight = true; }
+    [[nodiscard]] std::size_t region_size() const noexcept { return region_size_; }
+    [[nodiscard]] std::size_t num_regions() const noexcept { return regions_.size(); }
+};
+
+// ══════════════════════════════════════════════════════════════════════════
+// MappedMemoryGuard — RAII 内存映射守卫
+// ══════════════════════════════════════════════════════════════════════════
 class MappedMemoryGuard
 {
 private:
     VkDevice device_;
     VkDeviceMemory memory_;
+    VkDeviceSize offset_;
     void* ptr_;
     std::size_t byte_size_;
+    VkMemoryPropertyFlags property_flags_;
+    mutable bool dirty_;
 
 public:
-    MappedMemoryGuard(VkDevice device, VkDeviceMemory mem, std::size_t size)
-        : device_(device), memory_(mem), ptr_(nullptr), byte_size_(size)
+    MappedMemoryGuard(VkDevice device, VkDeviceMemory mem, VkDeviceSize offset,
+                      std::size_t size, VkMemoryPropertyFlags flags)
+        : device_(device), memory_(mem), offset_(offset),
+          ptr_(nullptr), byte_size_(size), property_flags_(flags), dirty_(false)
     {
-        if (vkMapMemory(device_, memory_, 0, byte_size_, 0, &ptr_) != VK_SUCCESS)
+        if (vkMapMemory(device_, memory_, offset_, byte_size_, 0, &ptr_) != VK_SUCCESS)
             ptr_ = nullptr;
     }
-
     ~MappedMemoryGuard()
     {
         if (ptr_ && device_ != VK_NULL_HANDLE && memory_ != VK_NULL_HANDLE)
+        {
+            if (dirty_ && !(property_flags_ & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+            {
+                VkMappedMemoryRange range{};
+                range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+                range.memory = memory_; range.offset = offset_; range.size = byte_size_;
+                vkFlushMappedMemoryRanges(device_, 1, &range);
+            }
             vkUnmapMemory(device_, memory_);
+        }
     }
-
     MappedMemoryGuard(const MappedMemoryGuard&) = delete;
     MappedMemoryGuard& operator=(const MappedMemoryGuard&) = delete;
-
-    MappedMemoryGuard(MappedMemoryGuard&& other) noexcept
-        : device_(other.device_), memory_(other.memory_),
-          ptr_(other.ptr_), byte_size_(other.byte_size_)
+    MappedMemoryGuard(MappedMemoryGuard&& o) noexcept
+        : device_(o.device_), memory_(o.memory_), offset_(o.offset_),
+          ptr_(o.ptr_), byte_size_(o.byte_size_),
+          property_flags_(o.property_flags_), dirty_(o.dirty_)
     {
-        other.ptr_ = nullptr;
-        other.device_ = VK_NULL_HANDLE;
-        other.memory_ = VK_NULL_HANDLE;
+        o.ptr_ = nullptr; o.device_ = VK_NULL_HANDLE; o.memory_ = VK_NULL_HANDLE;
     }
-
-    MappedMemoryGuard& operator=(MappedMemoryGuard&& other) noexcept
+    MappedMemoryGuard& operator=(MappedMemoryGuard&& o) noexcept
     {
-        if (this != &other)
+        if (this != &o)
         {
             if (ptr_ && device_ != VK_NULL_HANDLE && memory_ != VK_NULL_HANDLE)
+            {
+                if (dirty_ && !(property_flags_ & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+                {
+                    VkMappedMemoryRange range{};
+                    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+                    range.memory = memory_; range.offset = offset_; range.size = byte_size_;
+                    vkFlushMappedMemoryRanges(device_, 1, &range);
+                }
                 vkUnmapMemory(device_, memory_);
-            device_ = other.device_;
-            memory_ = other.memory_;
-            ptr_ = other.ptr_;
-            byte_size_ = other.byte_size_;
-            other.ptr_ = nullptr;
-            other.device_ = VK_NULL_HANDLE;
-            other.memory_ = VK_NULL_HANDLE;
+            }
+            device_ = o.device_; memory_ = o.memory_; offset_ = o.offset_;
+            ptr_ = o.ptr_; byte_size_ = o.byte_size_;
+            property_flags_ = o.property_flags_; dirty_ = o.dirty_;
+            o.ptr_ = nullptr; o.device_ = VK_NULL_HANDLE; o.memory_ = VK_NULL_HANDLE;
         }
         return *this;
     }
-
     [[nodiscard]] bool valid() const noexcept { return ptr_ != nullptr; }
-
-    // ── 类型安全的数据传输（double ↔ float 自动转换）────────────────────
-    // 上传：CPU double → GPU float
     void upload(std::span<const double> data) noexcept
     {
         if (!ptr_) return;
-        auto* dst = static_cast<float*>(ptr_);
-        for (std::size_t i = 0; i < data.size(); ++i)
-            dst[i] = static_cast<float>(data[i]);
+        detail::convert_double_to_float(data, static_cast<float*>(ptr_));
+        dirty_ = true;
     }
-
-    // 下载：GPU float → CPU double
     void download(std::span<double> dst) const noexcept
     {
         if (!ptr_) return;
-        const auto* src = static_cast<const float*>(ptr_);
-        for (std::size_t i = 0; i < dst.size(); ++i)
-            dst[i] = static_cast<double>(src[i]);
+        if (!(property_flags_ & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+        {
+            VkMappedMemoryRange range{};
+            range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+            range.memory = memory_; range.offset = offset_; range.size = byte_size_;
+            vkInvalidateMappedMemoryRanges(device_, 1, &range);
+        }
+        detail::convert_float_to_double(static_cast<const float*>(ptr_), dst);
     }
-
     [[nodiscard]] std::span<std::byte> bytes() noexcept
-    {
-        return {static_cast<std::byte*>(ptr_), byte_size_};
-    }
-
+    { return {static_cast<std::byte*>(ptr_), byte_size_}; }
     [[nodiscard]] std::span<const std::byte> bytes() const noexcept
-    {
-        return {static_cast<const std::byte*>(ptr_), byte_size_};
-    }
+    { return {static_cast<const std::byte*>(ptr_), byte_size_}; }
 };
 
-// ── VkBufferWrapper ───────────────────────────────────────────────────────
-// RAII 封装：VkBuffer + VkDeviceMemory。
-// 构造时创建缓冲区并分配绑定内存，析构时自动释放。
-// ─────────────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+// VkBufferWrapper — RAII 缓冲区封装
+// ══════════════════════════════════════════════════════════════════════════
 class VkBufferWrapper
 {
 private:
     VkDevice device_ = VK_NULL_HANDLE;
     VkBuffer buffer_ = VK_NULL_HANDLE;
-    VkDeviceMemory memory_ = VK_NULL_HANDLE;
-    std::size_t byte_size_ = 0;
+    MemoryPool::Allocation alloc_;
+    MemoryPool* pool_ = nullptr;
 
-    VkBufferWrapper(VkDevice dev, VkBuffer buf, VkDeviceMemory mem, std::size_t size)
-        : device_(dev), buffer_(buf), memory_(mem), byte_size_(size) {}
+    VkBufferWrapper(VkDevice dev, VkBuffer buf, MemoryPool::Allocation alloc, MemoryPool* pool)
+        : device_(dev), buffer_(buf), alloc_(alloc), pool_(pool) {}
 
 public:
     VkBufferWrapper() = default;
-
     ~VkBufferWrapper()
     {
         if (device_ != VK_NULL_HANDLE)
         {
-            if (buffer_ != VK_NULL_HANDLE)
-                vkDestroyBuffer(device_, buffer_, nullptr);
-            if (memory_ != VK_NULL_HANDLE)
-                vkFreeMemory(device_, memory_, nullptr);
+            if (buffer_ != VK_NULL_HANDLE) vkDestroyBuffer(device_, buffer_, nullptr);
+            if (pool_ && alloc_.valid()) pool_->free(alloc_);
         }
     }
-
     VkBufferWrapper(const VkBufferWrapper&) = delete;
     VkBufferWrapper& operator=(const VkBufferWrapper&) = delete;
-
-    VkBufferWrapper(VkBufferWrapper&& other) noexcept
-        : device_(other.device_), buffer_(other.buffer_),
-          memory_(other.memory_), byte_size_(other.byte_size_)
+    VkBufferWrapper(VkBufferWrapper&& o) noexcept
+        : device_(o.device_), buffer_(o.buffer_), alloc_(o.alloc_), pool_(o.pool_)
     {
-        other.buffer_ = VK_NULL_HANDLE;
-        other.memory_ = VK_NULL_HANDLE;
-        other.device_ = VK_NULL_HANDLE;
-        other.byte_size_ = 0;
+        o.buffer_ = VK_NULL_HANDLE; o.device_ = VK_NULL_HANDLE;
+        o.alloc_.memory = VK_NULL_HANDLE; o.pool_ = nullptr;
     }
-
-    VkBufferWrapper& operator=(VkBufferWrapper&& other) noexcept
+    VkBufferWrapper& operator=(VkBufferWrapper&& o) noexcept
     {
-        if (this != &other)
+        if (this != &o)
         {
             if (device_ != VK_NULL_HANDLE)
             {
                 if (buffer_ != VK_NULL_HANDLE) vkDestroyBuffer(device_, buffer_, nullptr);
-                if (memory_ != VK_NULL_HANDLE) vkFreeMemory(device_, memory_, nullptr);
+                if (pool_ && alloc_.valid()) pool_->free(alloc_);
             }
-            device_ = other.device_;
-            buffer_ = other.buffer_;
-            memory_ = other.memory_;
-            byte_size_ = other.byte_size_;
-            other.buffer_ = VK_NULL_HANDLE;
-            other.memory_ = VK_NULL_HANDLE;
-            other.device_ = VK_NULL_HANDLE;
-            other.byte_size_ = 0;
+            device_ = o.device_; buffer_ = o.buffer_; alloc_ = o.alloc_; pool_ = o.pool_;
+            o.buffer_ = VK_NULL_HANDLE; o.device_ = VK_NULL_HANDLE;
+            o.alloc_.memory = VK_NULL_HANDLE; o.pool_ = nullptr;
         }
         return *this;
     }
-
-    // ── 工厂方法：host-visible 暂存缓冲区 ─────────────────────────────
     [[nodiscard]] static Result<VkBufferWrapper> create(
-        VkDevice device, VkPhysicalDevice physical_device,
-        std::size_t element_count, VkBufferUsageFlags usage)
-    {
-        return create_internal(device, physical_device, element_count, usage, false);
-    }
-
-    // ── 工厂方法：device-local GPU 计算缓冲区 ────────────────────────
-    [[nodiscard]] static Result<VkBufferWrapper> create_device_local(
-        VkDevice device, VkPhysicalDevice physical_device,
-        std::size_t element_count, VkBufferUsageFlags usage)
-    {
-        return create_internal(device, physical_device, element_count, usage, true);
-    }
-
-private:
-    [[nodiscard]] static Result<VkBufferWrapper> create_internal(
-        VkDevice device, VkPhysicalDevice physical_device,
-        std::size_t element_count, VkBufferUsageFlags usage, bool prefer_device_local)
+        VkDevice device, MemoryPool& pool,
+        std::size_t element_count, VkBufferUsageFlags usage,
+        VkMemoryPropertyFlags preferred_flags,
+        VkMemoryPropertyFlags fallback_flags = 0)
     {
         const std::size_t buf_size = element_count * sizeof(float);
-
-        // 1. 创建缓冲区
         VkBufferCreateInfo buf_info{};
         buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         buf_info.size = buf_size;
         buf_info.usage = usage;
         buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
         VkBuffer buffer = VK_NULL_HANDLE;
-        auto r = detail::vk_check(vkCreateBuffer(device, &buf_info, nullptr, &buffer),
-                                   __FILE__, __LINE__);
+        auto r = detail::vk_check(
+            vkCreateBuffer(device, &buf_info, nullptr, &buffer), __FILE__, __LINE__);
         if (!r) return std::unexpected(r.error());
 
-        // 2. 查询内存需求
         VkMemoryRequirements mem_reqs;
         vkGetBufferMemoryRequirements(device, buffer, &mem_reqs);
-
-        // 3. 查找内存类型
-        VkPhysicalDeviceMemoryProperties mem_props;
-        vkGetPhysicalDeviceMemoryProperties(physical_device, &mem_props);
-
-        std::optional<uint32_t> best_index;       // 最优匹配
-        std::optional<uint32_t> fallback_index;   // 降级匹配
-
-        for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i)
-        {
-            const bool type_match = (mem_reqs.memoryTypeBits & (1u << i)) != 0;
-            if (!type_match) continue;
-
-            const auto flags = mem_props.memoryTypes[i].propertyFlags;
-            const bool host_visible = (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
-            const bool host_coherent = (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
-            const bool device_local = (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
-
-            if (prefer_device_local)
-            {
-                // 优先：DEVICE_LOCAL（GPU 本地显存，计算最快）
-                if (device_local && !best_index) { best_index = i; }
-                // 降级：任何匹配类型
-                if (!fallback_index) { fallback_index = i; }
-            }
-            else
-            {
-                // 优先：HOST_VISIBLE + HOST_COHERENT（CPU 可直接读写）
-                if (host_visible && host_coherent)
-                {
-                    if (device_local && !best_index) { best_index = i; break; }
-                    if (!best_index) { best_index = i; }
-                }
-            }
-        }
-
-        auto mem_type_index = best_index.value_or(
-            fallback_index.value_or(std::numeric_limits<uint32_t>::max()));
-
-        if (mem_type_index == std::numeric_limits<uint32_t>::max())
+        auto alloc_result = pool.allocate(mem_reqs, preferred_flags, fallback_flags);
+        if (!alloc_result)
         {
             vkDestroyBuffer(device, buffer, nullptr);
-            return std::unexpected(Error{"No suitable GPU memory type found"});
+            return std::unexpected(alloc_result.error());
         }
-
-        // 4. 分配内存
-        VkMemoryAllocateInfo alloc_info{};
-        alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        alloc_info.allocationSize = mem_reqs.size;
-        alloc_info.memoryTypeIndex = mem_type_index;
-
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-        r = detail::vk_check(vkAllocateMemory(device, &alloc_info, nullptr, &memory),
-                              __FILE__, __LINE__);
+        r = detail::vk_check(
+            vkBindBufferMemory(device, buffer, alloc_result->memory, alloc_result->offset),
+            __FILE__, __LINE__);
         if (!r)
         {
+            pool.free(*alloc_result);
             vkDestroyBuffer(device, buffer, nullptr);
             return std::unexpected(r.error());
         }
-
-        // 5. 绑定缓冲区和内存
-        r = detail::vk_check(vkBindBufferMemory(device, buffer, memory, 0),
-                              __FILE__, __LINE__);
-        if (!r)
-        {
-            vkFreeMemory(device, memory, nullptr);
-            vkDestroyBuffer(device, buffer, nullptr);
-            return std::unexpected(r.error());
-        }
-
-        return VkBufferWrapper(device, buffer, memory, buf_size);
+        return VkBufferWrapper(device, buffer, *alloc_result, &pool);
     }
-
-public:
     [[nodiscard]] VkBuffer handle() const noexcept { return buffer_; }
-    [[nodiscard]] VkDeviceMemory memory() const noexcept { return memory_; }
-    [[nodiscard]] std::size_t byte_size() const noexcept { return byte_size_; }
-
-    // 创建 RAII 内存映射
+    [[nodiscard]] VkDeviceMemory memory() const noexcept { return alloc_.memory; }
+    [[nodiscard]] VkDeviceSize memory_offset() const noexcept { return alloc_.offset; }
+    [[nodiscard]] std::size_t byte_size() const noexcept { return alloc_.size; }
     [[nodiscard]] MappedMemoryGuard map() noexcept
     {
-        return MappedMemoryGuard(device_, memory_, byte_size_);
+        return MappedMemoryGuard(device_, alloc_.memory, alloc_.offset,
+                                 alloc_.size, alloc_.property_flags);
     }
 };
 
-// ── GpuBuffer ─────────────────────────────────────────────────────────────
-// 公共 API 层的 GPU 缓冲区句柄。不暴露底层 Vulkan 类型。
-// ─────────────────────────────────────────────────────────────────────────
 class GpuBuffer
 {
 private:
     std::size_t element_count_ = 0;
     std::unique_ptr<VkBufferWrapper> impl_;
-
     explicit GpuBuffer(std::size_t count, std::unique_ptr<VkBufferWrapper> wrapper)
         : element_count_(count), impl_(std::move(wrapper)) {}
-
 public:
     GpuBuffer() = default;
-
     [[nodiscard]] static Result<GpuBuffer> create(
-        VkDevice device, VkPhysicalDevice physical_device,
-        std::size_t element_count, VkBufferUsageFlags usage)
+        VkDevice device, MemoryPool& pool, std::size_t element_count, VkBufferUsageFlags usage)
     {
-        auto wrapper_result = VkBufferWrapper::create(
-            device, physical_device, element_count, usage);
-        if (!wrapper_result) return std::unexpected(wrapper_result.error());
-
-        return GpuBuffer(element_count,
-                         std::make_unique<VkBufferWrapper>(std::move(*wrapper_result)));
+        auto w = VkBufferWrapper::create(device, pool, element_count, usage,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (!w) return std::unexpected(w.error());
+        return GpuBuffer(element_count, std::make_unique<VkBufferWrapper>(std::move(*w)));
     }
-
     [[nodiscard]] static Result<GpuBuffer> create_device_local(
-        VkDevice device, VkPhysicalDevice physical_device,
-        std::size_t element_count, VkBufferUsageFlags usage)
+        VkDevice device, MemoryPool& pool, std::size_t element_count, VkBufferUsageFlags usage)
     {
-        auto wrapper_result = VkBufferWrapper::create_device_local(
-            device, physical_device, element_count, usage);
-        if (!wrapper_result) return std::unexpected(wrapper_result.error());
-
-        return GpuBuffer(element_count,
-                         std::make_unique<VkBufferWrapper>(std::move(*wrapper_result)));
+        auto w = VkBufferWrapper::create(device, pool, element_count, usage,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+        if (!w) return std::unexpected(w.error());
+        return GpuBuffer(element_count, std::make_unique<VkBufferWrapper>(std::move(*w)));
     }
-
     [[nodiscard]] std::size_t element_count() const noexcept { return element_count_; }
-    [[nodiscard]] std::size_t byte_size() const noexcept
-    {
-        return impl_ ? impl_->byte_size() : 0;
-    }
-    [[nodiscard]] bool empty() const noexcept
-    {
-        return !impl_ || element_count_ == 0;
-    }
-
-    [[nodiscard]] VkBufferWrapper& impl()
-    {
-        assert(impl_ && "GpuBuffer: accessing null impl");
-        return *impl_;
-    }
-
-    [[nodiscard]] const VkBufferWrapper& impl() const
-    {
-        assert(impl_ && "GpuBuffer: accessing null impl");
-        return *impl_;
-    }
+    [[nodiscard]] std::size_t byte_size() const noexcept { return impl_ ? impl_->byte_size() : 0; }
+    [[nodiscard]] bool empty() const noexcept { return !impl_ || element_count_ == 0; }
+    [[nodiscard]] VkBufferWrapper& impl() { assert(impl_); return *impl_; }
+    [[nodiscard]] const VkBufferWrapper& impl() const { assert(impl_); return *impl_; }
 };
 
-// ── VulkanDevice ──────────────────────────────────────────────────────────
-// 管理 VkInstance、物理设备选择、逻辑设备和计算队列。
-// 优先选择独立显卡，fallback 到集成显卡。
-// ─────────────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+// GpuTensor — 显存常驻的张量载体（双轨制架构核心）
+// ══════════════════════════════════════════════════════════════════════════
+// CPU 端继续使用 Matrix (double) 做逻辑控制，GPU 端使用 GpuTensor (float)
+// 做计算。数据只在进入网络时 Upload 一次，输出时 Download 一次，
+// 中间所有矩阵乘法和激活函数全程在 GPU 显存中流转。
+class GpuBackend; // 前置声明
+class Matrix;     // 前置声明（完整定义在 matrix.hpp，实现文件在 gpu_tensor_impl.hpp）
+
+class GpuTensor
+{
+private:
+    std::shared_ptr<GpuBuffer> buffer_; // shared_ptr 支持权重共享和计算图分支
+    std::size_t rows_{0};
+    std::size_t cols_{0};
+
+    GpuTensor(std::shared_ptr<GpuBuffer> buf, std::size_t r, std::size_t c)
+        : buffer_(std::move(buf)), rows_(r), cols_(c) {}
+
+public:
+    GpuTensor() = default;
+
+    [[nodiscard]] constexpr std::size_t rows() const noexcept { return rows_; }
+    [[nodiscard]] constexpr std::size_t cols() const noexcept { return cols_; }
+    [[nodiscard]] bool valid() const noexcept { return buffer_ && !buffer_->empty(); }
+    [[nodiscard]] GpuBuffer& buffer() { return *buffer_; }
+    [[nodiscard]] const GpuBuffer& buffer() const { return *buffer_; }
+
+    // ── 工厂函数 1：从 CPU Matrix 上传（仅在输入层/权重加载时调用）──────
+    [[nodiscard]] static Result<GpuTensor> from_matrix(
+        const Matrix& cpu_mat, GpuBackend& backend);
+
+    // ── 工厂函数 2：分配未初始化的显存（用于接收计算结果）──────────────
+    [[nodiscard]] static Result<GpuTensor> create_empty(
+        std::size_t rows, std::size_t cols, GpuBackend& backend);
+
+    // ── 导出到 CPU Matrix（仅在输出层/Loss 计算时调用）────────────────
+    [[nodiscard]] Result<Matrix> to_matrix(GpuBackend& backend) const;
+};
+
 class VulkanDevice
 {
 private:
@@ -412,42 +716,30 @@ private:
     VkQueue compute_queue_ = VK_NULL_HANDLE;
     bool valid_ = false;
 
-    // 查找设备上的计算队列族
-    [[nodiscard]] static std::optional<uint32_t> find_compute_queue_family(
-        VkPhysicalDevice dev)
+    [[nodiscard]] static std::optional<uint32_t> find_compute_queue_family(VkPhysicalDevice dev)
     {
         uint32_t count = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(dev, &count, nullptr);
         std::vector<VkQueueFamilyProperties> families(count);
         vkGetPhysicalDeviceQueueFamilyProperties(dev, &count, families.data());
-
         for (uint32_t i = 0; i < count; ++i)
-        {
-            if (families[i].queueFlags & VK_QUEUE_COMPUTE_BIT)
-                return i;
-        }
+            if (families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) return i;
         return std::nullopt;
     }
 
 public:
     VulkanDevice() = default;
-
     ~VulkanDevice()
     {
-        if (device_ != VK_NULL_HANDLE)
-            vkDestroyDevice(device_, nullptr);
-        if (instance_ != VK_NULL_HANDLE)
-            vkDestroyInstance(instance_, nullptr);
+        if (device_ != VK_NULL_HANDLE) vkDestroyDevice(device_, nullptr);
+        if (instance_ != VK_NULL_HANDLE) vkDestroyInstance(instance_, nullptr);
     }
-
     VulkanDevice(const VulkanDevice&) = delete;
     VulkanDevice& operator=(const VulkanDevice&) = delete;
 
     [[nodiscard]] Result<void> initialize()
     {
         if (valid_) return {};
-
-        // ── 1. 创建 VkInstance ───────────────────────────────────────
         VkApplicationInfo app_info{};
         app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         app_info.pApplicationName = "neuralnet.cpp";
@@ -459,95 +751,45 @@ public:
         VkInstanceCreateInfo inst_info{};
         inst_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
         inst_info.pApplicationInfo = &app_info;
-
 #ifndef NDEBUG
-        // 检查校验层是否可用；不可用则静默跳过（用户未装 Vulkan SDK 时）
         uint32_t layer_count = 0;
         vkEnumerateInstanceLayerProperties(&layer_count, nullptr);
         std::vector<VkLayerProperties> avail_layers(layer_count);
         if (layer_count > 0)
             vkEnumerateInstanceLayerProperties(&layer_count, avail_layers.data());
-
         bool has_validation = false;
         for (uint32_t li = 0; li < layer_count; ++li)
-        {
-            if (std::strcmp(avail_layers[li].layerName,
-                            "VK_LAYER_KHRONOS_validation") == 0)
-            {
-                has_validation = true;
-                break;
-            }
-        }
-
+            if (std::strcmp(avail_layers[li].layerName, "VK_LAYER_KHRONOS_validation") == 0)
+            { has_validation = true; break; }
         static const char* validation_layer = "VK_LAYER_KHRONOS_validation";
-        if (has_validation)
-        {
-            inst_info.enabledLayerCount = 1;
-            inst_info.ppEnabledLayerNames = &validation_layer;
-        }
+        if (has_validation) { inst_info.enabledLayerCount = 1; inst_info.ppEnabledLayerNames = &validation_layer; }
 #endif
-
-        auto r = detail::vk_check(
-            vkCreateInstance(&inst_info, nullptr, &instance_), __FILE__, __LINE__);
+        auto r = detail::vk_check(vkCreateInstance(&inst_info, nullptr, &instance_), __FILE__, __LINE__);
         if (!r) return r;
 
-        // ── 2. 枚举物理设备 ─────────────────────────────────────────
         uint32_t device_count = 0;
         vkEnumeratePhysicalDevices(instance_, &device_count, nullptr);
-        if (device_count == 0)
-            return std::unexpected(Error{"No Vulkan-capable GPU found"});
-
+        if (device_count == 0) return std::unexpected(Error{"No Vulkan-capable GPU found"});
         std::vector<VkPhysicalDevice> devices(device_count);
         vkEnumeratePhysicalDevices(instance_, &device_count, devices.data());
 
-        // 优先选择独显，fallback 到集显
-        std::optional<VkPhysicalDevice> best_discrete;
-        std::optional<VkPhysicalDevice> best_integrated;
-        uint32_t best_discrete_queue = 0;
-        uint32_t best_integrated_queue = 0;
-
+        std::optional<VkPhysicalDevice> best_discrete, best_integrated;
+        uint32_t best_dq = 0, best_iq = 0;
         for (auto& dev : devices)
         {
             auto qf = find_compute_queue_family(dev);
             if (!qf) continue;
-
             VkPhysicalDeviceProperties props;
             vkGetPhysicalDeviceProperties(dev, &props);
+            if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU && !best_discrete)
+            { best_discrete = dev; best_dq = *qf; }
+            else if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && !best_integrated)
+            { best_integrated = dev; best_iq = *qf; }
+        }
+        if (best_discrete) { physical_device_ = *best_discrete; queue_family_index_ = best_dq; }
+        else if (best_integrated) { physical_device_ = *best_integrated; queue_family_index_ = best_iq; }
+        else return std::unexpected(Error{"No GPU with compute queue found"});
 
-            if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
-            {
-                if (!best_discrete)
-                {
-                    best_discrete = dev;
-                    best_discrete_queue = *qf;
-                }
-            }
-            else if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU)
-            {
-                if (!best_integrated)
-                {
-                    best_integrated = dev;
-                    best_integrated_queue = *qf;
-                }
-            }
-        }
-
-        if (best_discrete)
-        {
-            physical_device_ = *best_discrete;
-            queue_family_index_ = best_discrete_queue;
-        }
-        else if (best_integrated)
-        {
-            physical_device_ = *best_integrated;
-            queue_family_index_ = best_integrated_queue;
-        }
-        else
-        {
-            return std::unexpected(Error{"No GPU with compute queue found"});
-        }
-
-        // ── 3. 创建逻辑设备 ─────────────────────────────────────────
         float queue_priority = 1.0f;
         VkDeviceQueueCreateInfo queue_info{};
         queue_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -559,19 +801,13 @@ public:
         device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;
-
-        r = detail::vk_check(
-            vkCreateDevice(physical_device_, &device_info, nullptr, &device_),
-            __FILE__, __LINE__);
+        r = detail::vk_check(vkCreateDevice(physical_device_, &device_info, nullptr, &device_), __FILE__, __LINE__);
         if (!r) return r;
 
-        // ── 4. 获取计算队列句柄 ─────────────────────────────────────
         vkGetDeviceQueue(device_, queue_family_index_, 0, &compute_queue_);
-
         valid_ = true;
         return {};
     }
-
     [[nodiscard]] bool is_valid() const noexcept { return valid_; }
     [[nodiscard]] VkDevice device() const noexcept { return device_; }
     [[nodiscard]] VkPhysicalDevice physical_device() const noexcept { return physical_device_; }
@@ -579,9 +815,6 @@ public:
     [[nodiscard]] VkQueue compute_queue() const noexcept { return compute_queue_; }
 };
 
-// ── VulkanPipeline ────────────────────────────────────────────────────────
-// 管理计算着色器模块、描述符集布局和计算管线。
-// ─────────────────────────────────────────────────────────────────────────
 class VulkanPipeline
 {
 private:
@@ -593,87 +826,56 @@ private:
 
 public:
     VulkanPipeline() = default;
-
-    ~VulkanPipeline()
+    ~VulkanPipeline() { destroy(); }
+    void destroy()
     {
         if (device_ != VK_NULL_HANDLE)
         {
-            if (pipeline_ != VK_NULL_HANDLE)
-                vkDestroyPipeline(device_, pipeline_, nullptr);
-            if (pipeline_layout_ != VK_NULL_HANDLE)
-                vkDestroyPipelineLayout(device_, pipeline_layout_, nullptr);
-            if (descriptor_layout_ != VK_NULL_HANDLE)
-                vkDestroyDescriptorSetLayout(device_, descriptor_layout_, nullptr);
-            if (shader_module_ != VK_NULL_HANDLE)
-                vkDestroyShaderModule(device_, shader_module_, nullptr);
+            if (pipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(device_, pipeline_, nullptr);
+            if (pipeline_layout_ != VK_NULL_HANDLE) vkDestroyPipelineLayout(device_, pipeline_layout_, nullptr);
+            if (descriptor_layout_ != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device_, descriptor_layout_, nullptr);
+            if (shader_module_ != VK_NULL_HANDLE) vkDestroyShaderModule(device_, shader_module_, nullptr);
         }
+        device_ = VK_NULL_HANDLE; shader_module_ = VK_NULL_HANDLE;
+        descriptor_layout_ = VK_NULL_HANDLE; pipeline_layout_ = VK_NULL_HANDLE; pipeline_ = VK_NULL_HANDLE;
     }
-
     VulkanPipeline(const VulkanPipeline&) = delete;
     VulkanPipeline& operator=(const VulkanPipeline&) = delete;
-
-    VulkanPipeline(VulkanPipeline&& other) noexcept
-        : device_(other.device_), shader_module_(other.shader_module_),
-          descriptor_layout_(other.descriptor_layout_),
-          pipeline_layout_(other.pipeline_layout_), pipeline_(other.pipeline_)
+    VulkanPipeline(VulkanPipeline&& o) noexcept
+        : device_(o.device_), shader_module_(o.shader_module_),
+          descriptor_layout_(o.descriptor_layout_),
+          pipeline_layout_(o.pipeline_layout_), pipeline_(o.pipeline_)
     {
-        other.device_ = VK_NULL_HANDLE;
-        other.shader_module_ = VK_NULL_HANDLE;
-        other.descriptor_layout_ = VK_NULL_HANDLE;
-        other.pipeline_layout_ = VK_NULL_HANDLE;
-        other.pipeline_ = VK_NULL_HANDLE;
+        o.device_ = VK_NULL_HANDLE; o.shader_module_ = VK_NULL_HANDLE;
+        o.descriptor_layout_ = VK_NULL_HANDLE; o.pipeline_layout_ = VK_NULL_HANDLE;
+        o.pipeline_ = VK_NULL_HANDLE;
     }
-
-    VulkanPipeline& operator=(VulkanPipeline&& other) noexcept
+    VulkanPipeline& operator=(VulkanPipeline&& o) noexcept
     {
-        if (this != &other)
-        {
-            // 释放当前资源
-            if (device_ != VK_NULL_HANDLE)
-            {
-                if (pipeline_ != VK_NULL_HANDLE)
-                    vkDestroyPipeline(device_, pipeline_, nullptr);
-                if (pipeline_layout_ != VK_NULL_HANDLE)
-                    vkDestroyPipelineLayout(device_, pipeline_layout_, nullptr);
-                if (descriptor_layout_ != VK_NULL_HANDLE)
-                    vkDestroyDescriptorSetLayout(device_, descriptor_layout_, nullptr);
-                if (shader_module_ != VK_NULL_HANDLE)
-                    vkDestroyShaderModule(device_, shader_module_, nullptr);
-            }
-            // 转移所有权
-            device_ = other.device_;
-            shader_module_ = other.shader_module_;
-            descriptor_layout_ = other.descriptor_layout_;
-            pipeline_layout_ = other.pipeline_layout_;
-            pipeline_ = other.pipeline_;
-            other.device_ = VK_NULL_HANDLE;
-            other.shader_module_ = VK_NULL_HANDLE;
-            other.descriptor_layout_ = VK_NULL_HANDLE;
-            other.pipeline_layout_ = VK_NULL_HANDLE;
-            other.pipeline_ = VK_NULL_HANDLE;
+        if (this != &o) { 
+            destroy(); 
+            device_ = o.device_; shader_module_ = o.shader_module_;
+            descriptor_layout_ = o.descriptor_layout_; pipeline_layout_ = o.pipeline_layout_;
+            pipeline_ = o.pipeline_;
+            o.device_ = VK_NULL_HANDLE; o.shader_module_ = VK_NULL_HANDLE;
+            o.descriptor_layout_ = VK_NULL_HANDLE; o.pipeline_layout_ = VK_NULL_HANDLE;
+            o.pipeline_ = VK_NULL_HANDLE;
         }
         return *this;
     }
-
-    // ── 创建 matmul 计算管线 ─────────────────────────────────────────
     [[nodiscard]] static Result<VulkanPipeline> create_matmul(
         VkDevice device, std::span<const uint32_t> spirv_code)
     {
         VulkanPipeline pl;
         pl.device_ = device;
-
-        // 1. 创建 Shader Module
         VkShaderModuleCreateInfo module_info{};
         module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
         module_info.codeSize = spirv_code.size_bytes();
         module_info.pCode = spirv_code.data();
-
         auto r = detail::vk_check(
-            vkCreateShaderModule(device, &module_info, nullptr, &pl.shader_module_),
-            __FILE__, __LINE__);
+            vkCreateShaderModule(device, &module_info, nullptr, &pl.shader_module_), __FILE__, __LINE__);
         if (!r) return std::unexpected(r.error());
 
-        // 2. 描述符集布局：3 个 Storage Buffer（A, B, C）
         VkDescriptorSetLayoutBinding bindings[3]{};
         for (int i = 0; i < 3; ++i)
         {
@@ -682,38 +884,28 @@ public:
             bindings[i].descriptorCount = 1;
             bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         }
-
         VkDescriptorSetLayoutCreateInfo layout_info{};
         layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         layout_info.bindingCount = 3;
         layout_info.pBindings = bindings;
-
         r = detail::vk_check(
-            vkCreateDescriptorSetLayout(device, &layout_info, nullptr,
-                                         &pl.descriptor_layout_),
-            __FILE__, __LINE__);
+            vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &pl.descriptor_layout_), __FILE__, __LINE__);
         if (!r) return std::unexpected(r.error());
 
-        // 3. Pipeline Layout（含 push constants: M, N, K）
         VkPushConstantRange push_range{};
         push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         push_range.offset = 0;
         push_range.size = 3 * sizeof(uint32_t);
-
         VkPipelineLayoutCreateInfo pl_layout_info{};
         pl_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         pl_layout_info.setLayoutCount = 1;
         pl_layout_info.pSetLayouts = &pl.descriptor_layout_;
         pl_layout_info.pushConstantRangeCount = 1;
         pl_layout_info.pPushConstantRanges = &push_range;
-
         r = detail::vk_check(
-            vkCreatePipelineLayout(device, &pl_layout_info, nullptr,
-                                    &pl.pipeline_layout_),
-            __FILE__, __LINE__);
+            vkCreatePipelineLayout(device, &pl_layout_info, nullptr, &pl.pipeline_layout_), __FILE__, __LINE__);
         if (!r) return std::unexpected(r.error());
 
-        // 4. 创建计算管线
         VkComputePipelineCreateInfo pipeline_info{};
         pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
         pipeline_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -721,445 +913,216 @@ public:
         pipeline_info.stage.module = pl.shader_module_;
         pipeline_info.stage.pName = "main";
         pipeline_info.layout = pl.pipeline_layout_;
-
         r = detail::vk_check(
-            vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
-                                      nullptr, &pl.pipeline_),
-            __FILE__, __LINE__);
+            vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pl.pipeline_), __FILE__, __LINE__);
         if (!r) return std::unexpected(r.error());
-
         return pl;
     }
+    // ── 逐元素运算 Pipeline（ReLU / GeLU / BiasAdd，3 绑定 + 4 Push Constant）──
+    [[nodiscard]] static Result<VulkanPipeline> create_elementwise(
+        VkDevice device, std::span<const uint32_t> spirv_code)
+    {
+        VulkanPipeline pl;
+        pl.device_ = device;
+        VkShaderModuleCreateInfo module_info{};
+        module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        module_info.codeSize = spirv_code.size_bytes();
+        module_info.pCode = spirv_code.data();
+        auto r = detail::vk_check(
+            vkCreateShaderModule(device, &module_info, nullptr, &pl.shader_module_), __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
 
+        // binding 0 = primary input, binding 1 = secondary input (bias), binding 2 = output
+        VkDescriptorSetLayoutBinding bindings[3]{};
+        for (int i = 0; i < 3; ++i)
+        {
+            bindings[i].binding = static_cast<uint32_t>(i);
+            bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[i].descriptorCount = 1;
+            bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo layout_info{};
+        layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layout_info.bindingCount = 3;
+        layout_info.pBindings = bindings;
+        r = detail::vk_check(
+            vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &pl.descriptor_layout_), __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
+
+        // push constants: uint count, uint op, uint rows, uint cols
+        VkPushConstantRange push_range{};
+        push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        push_range.offset = 0;
+        push_range.size = 4 * sizeof(uint32_t);
+        VkPipelineLayoutCreateInfo pl_layout_info{};
+        pl_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pl_layout_info.setLayoutCount = 1;
+        pl_layout_info.pSetLayouts = &pl.descriptor_layout_;
+        pl_layout_info.pushConstantRangeCount = 1;
+        pl_layout_info.pPushConstantRanges = &push_range;
+        r = detail::vk_check(
+            vkCreatePipelineLayout(device, &pl_layout_info, nullptr, &pl.pipeline_layout_), __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
+
+        VkComputePipelineCreateInfo pipeline_info{};
+        pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        pipeline_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipeline_info.stage.module = pl.shader_module_;
+        pipeline_info.stage.pName = "main";
+        pipeline_info.layout = pl.pipeline_layout_;
+        r = detail::vk_check(
+            vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pl.pipeline_), __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
+        return pl;
+    }
     [[nodiscard]] VkPipeline handle() const noexcept { return pipeline_; }
     [[nodiscard]] VkPipelineLayout pipeline_layout() const noexcept { return pipeline_layout_; }
     [[nodiscard]] VkDescriptorSetLayout descriptor_layout() const noexcept { return descriptor_layout_; }
 };
 
-// ── VulkanCommandManager ──────────────────────────────────────────────────
-// 管理命令池和描述符池，执行 GPU 计算命令的录制与提交。
-// ─────────────────────────────────────────────────────────────────────────
-class VulkanCommandManager
-{
-private:
-    VkDevice device_ = VK_NULL_HANDLE;
-    VkCommandPool command_pool_ = VK_NULL_HANDLE;
-    VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
-
-public:
-    VulkanCommandManager() = default;
-
-    ~VulkanCommandManager()
-    {
-        if (device_ != VK_NULL_HANDLE)
-        {
-            if (descriptor_pool_ != VK_NULL_HANDLE)
-                vkDestroyDescriptorPool(device_, descriptor_pool_, nullptr);
-            if (command_pool_ != VK_NULL_HANDLE)
-                vkDestroyCommandPool(device_, command_pool_, nullptr);
-        }
-    }
-
-    VulkanCommandManager(const VulkanCommandManager&) = delete;
-    VulkanCommandManager& operator=(const VulkanCommandManager&) = delete;
-
-    VulkanCommandManager(VulkanCommandManager&& other) noexcept
-        : device_(other.device_), command_pool_(other.command_pool_),
-          descriptor_pool_(other.descriptor_pool_)
-    {
-        other.device_ = VK_NULL_HANDLE;
-        other.command_pool_ = VK_NULL_HANDLE;
-        other.descriptor_pool_ = VK_NULL_HANDLE;
-    }
-
-    VulkanCommandManager& operator=(VulkanCommandManager&& other) noexcept
-    {
-        if (this != &other)
-        {
-            if (device_ != VK_NULL_HANDLE)
-            {
-                if (descriptor_pool_ != VK_NULL_HANDLE)
-                    vkDestroyDescriptorPool(device_, descriptor_pool_, nullptr);
-                if (command_pool_ != VK_NULL_HANDLE)
-                    vkDestroyCommandPool(device_, command_pool_, nullptr);
-            }
-            device_ = other.device_;
-            command_pool_ = other.command_pool_;
-            descriptor_pool_ = other.descriptor_pool_;
-            other.device_ = VK_NULL_HANDLE;
-            other.command_pool_ = VK_NULL_HANDLE;
-            other.descriptor_pool_ = VK_NULL_HANDLE;
-        }
-        return *this;
-    }
-
-    [[nodiscard]] static Result<VulkanCommandManager> create(
-        VkDevice device, uint32_t queue_family_index)
-    {
-        VulkanCommandManager mgr;
-        mgr.device_ = device;
-
-        // 命令池（支持命令缓冲区重置）
-        VkCommandPoolCreateInfo pool_info{};
-        pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-        pool_info.queueFamilyIndex = queue_family_index;
-        pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-
-        auto r = detail::vk_check(
-            vkCreateCommandPool(device, &pool_info, nullptr, &mgr.command_pool_),
-            __FILE__, __LINE__);
-        if (!r) return std::unexpected(r.error());
-
-        // 描述符池（支持批量分配）
-        VkDescriptorPoolSize pool_size{};
-        pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        pool_size.descriptorCount = 3072;  // 3 × 1024
-
-        VkDescriptorPoolCreateInfo desc_pool_info{};
-        desc_pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        desc_pool_info.maxSets = 1024;
-        desc_pool_info.poolSizeCount = 1;
-        desc_pool_info.pPoolSizes = &pool_size;
-        desc_pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-
-        r = detail::vk_check(
-            vkCreateDescriptorPool(device, &desc_pool_info, nullptr,
-                                    &mgr.descriptor_pool_),
-            __FILE__, __LINE__);
-        if (!r) return std::unexpected(r.error());
-
-        return mgr;
-    }
-
-    [[nodiscard]] VkCommandPool command_pool() const noexcept { return command_pool_; }
-    [[nodiscard]] VkDescriptorPool descriptor_pool() const noexcept { return descriptor_pool_; }
-
-    // ── 执行一次矩阵乘法 ─────────────────────────────────────────────
-    //   C[M×N] = A[M×K] × B[K×N]
-    //   所有缓冲区使用 float32 格式
-    [[nodiscard]] Result<void> execute_matmul(
-        VkPipeline pipeline, VkPipelineLayout pipeline_layout,
-        VkDescriptorSetLayout descriptor_layout,
-        VkBuffer buf_a, VkBuffer buf_b, VkBuffer buf_c,
-        uint32_t M, uint32_t N, uint32_t K,
-        VkQueue compute_queue)
-    {
-        // ── 1. 分配描述符集 ─────────────────────────────────────────
-        VkDescriptorSetAllocateInfo desc_alloc{};
-        desc_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        desc_alloc.descriptorPool = descriptor_pool_;
-        desc_alloc.descriptorSetCount = 1;
-        desc_alloc.pSetLayouts = &descriptor_layout;
-
-        VkDescriptorSet descriptor_set;
-        auto r = detail::vk_check(
-            vkAllocateDescriptorSets(device_, &desc_alloc, &descriptor_set),
-            __FILE__, __LINE__);
-        if (!r) return r;
-
-        // ── 2. 更新描述符：绑定 A, B, C 缓冲区 ─────────────────────
-        VkDescriptorBufferInfo buf_infos[3]{};
-        buf_infos[0] = {buf_a, 0, VK_WHOLE_SIZE};
-        buf_infos[1] = {buf_b, 0, VK_WHOLE_SIZE};
-        buf_infos[2] = {buf_c, 0, VK_WHOLE_SIZE};
-
-        VkWriteDescriptorSet writes[3]{};
-        for (int i = 0; i < 3; ++i)
-        {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = descriptor_set;
-            writes[i].dstBinding = static_cast<uint32_t>(i);
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &buf_infos[i];
-        }
-        vkUpdateDescriptorSets(device_, 3, writes, 0, nullptr);
-
-        // ── 3. 分配命令缓冲区 ───────────────────────────────────────
-        VkCommandBufferAllocateInfo cmd_alloc{};
-        cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cmd_alloc.commandPool = command_pool_;
-        cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cmd_alloc.commandBufferCount = 1;
-
-        VkCommandBuffer cmd_buffer;
-        r = detail::vk_check(
-            vkAllocateCommandBuffers(device_, &cmd_alloc, &cmd_buffer),
-            __FILE__, __LINE__);
-        if (!r) return r;
-
-        // ── 4. 录制命令 ─────────────────────────────────────────────
-        VkCommandBufferBeginInfo begin_info{};
-        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-        r = detail::vk_check(vkBeginCommandBuffer(cmd_buffer, &begin_info), __FILE__, __LINE__);
-        if (!r)
-        {
-            vkFreeCommandBuffers(device_, command_pool_, 1, &cmd_buffer);
-            return r;
-        }
-
-        vkCmdBindPipeline(cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-        vkCmdBindDescriptorSets(cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                pipeline_layout, 0, 1, &descriptor_set, 0, nullptr);
-
-        // Push constants: M, N, K
-        const uint32_t push_data[3] = {M, N, K};
-        vkCmdPushConstants(cmd_buffer, pipeline_layout,
-                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
-
-        // Dispatch：每个 WorkGroup 处理 16×16 的输出分块
-        const uint32_t group_x = (N + 15u) / 16u;
-        const uint32_t group_y = (M + 15u) / 16u;
-        vkCmdDispatch(cmd_buffer, group_x, group_y, 1);
-
-        r = detail::vk_check(vkEndCommandBuffer(cmd_buffer), __FILE__, __LINE__);
-        if (!r)
-        {
-            vkFreeCommandBuffers(device_, command_pool_, 1, &cmd_buffer);
-            return r;
-        }
-
-        // ── 5. 提交并同步等待 ───────────────────────────────────────
-        VkFenceCreateInfo fence_info{};
-        fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-
-        VkFence fence;
-        r = detail::vk_check(
-            vkCreateFence(device_, &fence_info, nullptr, &fence), __FILE__, __LINE__);
-        if (!r)
-        {
-            vkFreeCommandBuffers(device_, command_pool_, 1, &cmd_buffer);
-            return r;
-        }
-
-        VkSubmitInfo submit_info{};
-        submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submit_info.commandBufferCount = 1;
-        submit_info.pCommandBuffers = &cmd_buffer;
-
-        r = detail::vk_check(vkQueueSubmit(compute_queue, 1, &submit_info, fence), __FILE__, __LINE__);
-        if (!r)
-        {
-            vkDestroyFence(device_, fence, nullptr);
-            vkFreeCommandBuffers(device_, command_pool_, 1, &cmd_buffer);
-            return r;
-        }
-
-        // 等待计算完成（10 秒超时）
-        r = detail::vk_check(
-            vkWaitForFences(device_, 1, &fence, VK_TRUE, 10'000'000'000ULL),
-            __FILE__, __LINE__);
-
-        // ── 6. 清理临时资源 ─────────────────────────────────────────
-        vkDestroyFence(device_, fence, nullptr);
-        vkFreeCommandBuffers(device_, command_pool_, 1, &cmd_buffer);
-        vkFreeDescriptorSets(device_, descriptor_pool_, 1, &descriptor_set);
-
-        return r;
-    }
-};
-
-// ── MatmulKey: 调度缓存键 ────────────────────────────────────────────────
 struct MatmulKey {
     uint32_t M, N, K;
-    bool operator==(const MatmulKey& o) const noexcept {
-        return M == o.M && N == o.N && K == o.K;
-    }
+    bool operator==(const MatmulKey& o) const noexcept { return M == o.M && N == o.N && K == o.K; }
 };
-
 struct MatmulKeyHash {
     std::size_t operator()(const MatmulKey& k) const noexcept {
-        return (static_cast<uint64_t>(k.M) << 32) ^
-               (static_cast<uint64_t>(k.N) << 16) ^
-               static_cast<uint64_t>(k.K);
+        std::size_t h = std::hash<uint32_t>{}(k.M);
+        h ^= std::hash<uint32_t>{}(k.N) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<uint32_t>{}(k.K) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
     }
 };
 
-// ── CachedDispatch: 预录制的 GPU 调度 ────────────────────────────────────
-// 使用 device-local 显存做计算 + host-visible staging 做传输。
-// 首次调用时创建全部资源并预录制命令缓冲（含拷贝+屏障+调度），
-// 后续相同维度调用直接复用，仅上传 staging → 提交 → 下载 staging。
-// ─────────────────────────────────────────────────────────────────────────
 struct CachedDispatch {
-    VkCommandBuffer cmd_buffer = VK_NULL_HANDLE;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
-    VkFence fence = VK_NULL_HANDLE;
-    // Device-local 计算缓冲区（GPU 本地显存，计算快）
-    GpuBuffer buf_a;
-    GpuBuffer buf_b;
-    GpuBuffer buf_c;
-    // Host-visible staging 缓冲区（CPU 可映射，用于上传/下载）
-    GpuBuffer staging_a;
-    GpuBuffer staging_b;
-    GpuBuffer staging_c;
+    GpuBuffer buf_a, buf_b, buf_c;
     VkDevice device = VK_NULL_HANDLE;
-    VkCommandPool cmd_pool = VK_NULL_HANDLE;
     VkDescriptorPool desc_pool = VK_NULL_HANDLE;
+    VkCommandPool cmd_pool = VK_NULL_HANDLE;
+    std::vector<VkCommandBuffer> pre_recorded_cmds; // 预录制命令缓冲
+    std::atomic<int> ref_count{0};
 
-    ~CachedDispatch()
-    {
-        if (device != VK_NULL_HANDLE)
-        {
-            if (fence != VK_NULL_HANDLE) vkDestroyFence(device, fence, nullptr);
-            if (cmd_buffer != VK_NULL_HANDLE)
-                vkFreeCommandBuffers(device, cmd_pool, 1, &cmd_buffer);
-            if (descriptor_set != VK_NULL_HANDLE)
-                vkFreeDescriptorSets(device, desc_pool, 1, &descriptor_set);
-        }
-    }
-
+    ~CachedDispatch() { reset(); }
     CachedDispatch() = default;
-
     CachedDispatch(CachedDispatch&& o) noexcept
-        : cmd_buffer(o.cmd_buffer), descriptor_set(o.descriptor_set),
-          fence(o.fence), buf_a(std::move(o.buf_a)), buf_b(std::move(o.buf_b)),
-          buf_c(std::move(o.buf_c)),
-          staging_a(std::move(o.staging_a)), staging_b(std::move(o.staging_b)),
-          staging_c(std::move(o.staging_c)),
-          device(o.device), cmd_pool(o.cmd_pool), desc_pool(o.desc_pool)
+        : descriptor_set(o.descriptor_set), buf_a(std::move(o.buf_a)),
+          buf_b(std::move(o.buf_b)), buf_c(std::move(o.buf_c)),
+          device(o.device), desc_pool(o.desc_pool), cmd_pool(o.cmd_pool),
+          pre_recorded_cmds(std::move(o.pre_recorded_cmds)),
+          ref_count(o.ref_count.load(std::memory_order_relaxed))
     {
-        o.cmd_buffer = VK_NULL_HANDLE;
-        o.descriptor_set = VK_NULL_HANDLE;
-        o.fence = VK_NULL_HANDLE;
-        o.device = VK_NULL_HANDLE;
+        o.descriptor_set = VK_NULL_HANDLE; o.device = VK_NULL_HANDLE; o.cmd_pool = VK_NULL_HANDLE;
+        o.ref_count.store(0, std::memory_order_relaxed);
     }
-
     CachedDispatch& operator=(CachedDispatch&& o) noexcept
     {
         if (this != &o)
         {
-            this->~CachedDispatch();
-            cmd_buffer = o.cmd_buffer; o.cmd_buffer = VK_NULL_HANDLE;
+            reset();
             descriptor_set = o.descriptor_set; o.descriptor_set = VK_NULL_HANDLE;
-            fence = o.fence; o.fence = VK_NULL_HANDLE;
-            buf_a = std::move(o.buf_a);
-            buf_b = std::move(o.buf_b);
-            buf_c = std::move(o.buf_c);
-            staging_a = std::move(o.staging_a);
-            staging_b = std::move(o.staging_b);
-            staging_c = std::move(o.staging_c);
+            buf_a = std::move(o.buf_a); buf_b = std::move(o.buf_b); buf_c = std::move(o.buf_c);
             device = o.device; o.device = VK_NULL_HANDLE;
-            cmd_pool = o.cmd_pool;
-            desc_pool = o.desc_pool;
+            desc_pool = o.desc_pool; cmd_pool = o.cmd_pool; o.cmd_pool = VK_NULL_HANDLE;
+            pre_recorded_cmds = std::move(o.pre_recorded_cmds);
+            ref_count.store(o.ref_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            o.ref_count.store(0, std::memory_order_relaxed);
         }
         return *this;
     }
-
     CachedDispatch(const CachedDispatch&) = delete;
     CachedDispatch& operator=(const CachedDispatch&) = delete;
+
+    void reset() noexcept
+    {
+        if (device != VK_NULL_HANDLE) {
+            if (!pre_recorded_cmds.empty() && cmd_pool != VK_NULL_HANDLE) {
+                vkFreeCommandBuffers(device, cmd_pool, 
+                    static_cast<uint32_t>(pre_recorded_cmds.size()), 
+                    pre_recorded_cmds.data());
+            }
+            if (descriptor_set != VK_NULL_HANDLE && desc_pool != VK_NULL_HANDLE) {
+                vkFreeDescriptorSets(device, desc_pool, 1, &descriptor_set);
+            }
+        }
+        pre_recorded_cmds.clear();
+        descriptor_set = VK_NULL_HANDLE;
+        buf_a = GpuBuffer{}; buf_b = GpuBuffer{}; buf_c = GpuBuffer{};
+        device = VK_NULL_HANDLE; desc_pool = VK_NULL_HANDLE; cmd_pool = VK_NULL_HANDLE;
+        ref_count.store(0, std::memory_order_relaxed);
+    }
 };
 
-// ── GpuBackend ────────────────────────────────────────────────────────────
-// 单例 GPU 计算后端。管理所有 Vulkan 资源的生命周期。
-//
-// 使用方法：
-//   auto& backend = GpuBackend::instance();
-//   auto r = backend.initialize();
-//   if (r) {
-//       auto mm = backend.matmul_direct(a_data, b_data, c_data, M, N, K);
-//       if (mm) { /* 成功 */ }
-//   }
-// ─────────────────────────────────────────────────────────────────────────
 class GpuBackend
 {
 private:
     VulkanDevice device_;
     VulkanPipeline matmul_pipeline_;
-    VulkanCommandManager cmd_manager_;
-    std::mutex mutex_;  // 保护 GPU 操作的线程安全
+    std::mutex init_mutex_;
+    std::mutex cache_mutex_;
+    std::mutex queue_mutex_;
     bool initialized_ = false;
-
-    // ── 调度专用描述符池：与 cmd_manager_ 的临时池隔离，避免争抢 ─
+    std::unique_ptr<MemoryPool> memory_pool_;
+    std::unique_ptr<StagingRing> staging_ring_;
+    VkCommandPool command_pool_ = VK_NULL_HANDLE;
     VkDescriptorPool dispatch_pool_ = VK_NULL_HANDLE;
-
-    // ── 缓冲区缓存：按元素数量索引，避免每次调用重新分配 ───────────
-    std::unordered_map<std::size_t, std::vector<GpuBuffer>> buffer_cache_;
-
-    // ── 调度缓存：按 (M,N,K) 维度索引，缓存预录制命令缓冲+描述符+围栏 ─
     static constexpr std::size_t MAX_CACHED_DISPATCHES = 256;
+    static constexpr std::size_t DESCRIPTORS_PER_DISPATCH = 3;
+    static constexpr uint32_t WORKGROUP_SIZE = 16;
+
     std::unordered_map<MatmulKey, CachedDispatch, MatmulKeyHash> dispatch_cache_;
-    std::list<MatmulKey> dispatch_lru_;  // front=最近使用, back=最久未使用
+    std::list<MatmulKey> dispatch_lru_;
+    std::unordered_map<MatmulKey, std::list<MatmulKey>::iterator, MatmulKeyHash> dispatch_lru_map_;
 
-    // 从缓存获取或创建缓冲区（调用时已持有 mutex_）
-    [[nodiscard]] Result<GpuBuffer> acquire_buffer(std::size_t element_count)
-    {
-        auto it = buffer_cache_.find(element_count);
-        if (it != buffer_cache_.end() && !it->second.empty())
-        {
-            auto buf = std::move(it->second.back());
-            it->second.pop_back();
-            return buf;
-        }
-        return GpuBuffer::create(device_.device(), device_.physical_device(),
-                                 element_count, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    }
+    // ── 双轨制架构：新增 Pipeline 和资源追踪 ─────────────────────────
+    VulkanPipeline matmul_tiled_pipeline_;   // 4×4 粗化分块矩阵乘法
+    VulkanPipeline elementwise_pipeline_;    // 逐元素运算（ReLU / GeLU）
+    VkDescriptorPool gpu_tensor_pool_ = VK_NULL_HANDLE;  // GpuTensor 专用描述符池
 
-    // 归还缓冲区到缓存（调用时已持有 mutex_）
-    void release_buffer(GpuBuffer&& buf)
-    {
-        if (!buf.empty())
-            buffer_cache_[buf.element_count()].push_back(std::move(buf));
-    }
+    // 非阻塞 GPU 操作的待清理资源
+    struct PendingGpuOps {
+        std::vector<VkCommandBuffer> cmd_buffers;
+        std::vector<VkDescriptorSet> desc_sets;
+        VkFence fence = VK_NULL_HANDLE;
+        bool has_fence = false;
+    };
+    PendingGpuOps pending_ops_;
+    static constexpr std::size_t TILED_WORKGROUP_SIZE = 16; // 16×16 = 256 线程/WorkGroup
+    static constexpr std::size_t TILE_MN = 64;              // 每 WorkGroup 计算 64×64 输出
 
-    // ── 创建预录制调度（调用时已持有 mutex_）────────────────────────
-    // 创建 device-local 计算缓冲区 + host-visible staging 缓冲区，
-    // 预录制包含拷贝、屏障、计算调度的完整命令缓冲。
     [[nodiscard]] Result<CachedDispatch> create_cached_dispatch(const MatmulKey& key)
     {
         CachedDispatch d;
         d.device = device_.device();
-        d.cmd_pool = cmd_manager_.command_pool();
-        d.desc_pool = dispatch_pool_;  // 使用调度专用池，不与临时操作争抢
-
+        d.desc_pool = dispatch_pool_;
+        d.cmd_pool = command_pool_;
         const auto a_elems = static_cast<std::size_t>(key.M) * key.K;
         const auto b_elems = static_cast<std::size_t>(key.K) * key.N;
         const auto c_elems = static_cast<std::size_t>(key.M) * key.N;
 
-        // 1. 创建 device-local 计算缓冲区（GPU 本地显存）
-        auto a_buf = GpuBuffer::create_device_local(d.device, device_.physical_device(),
-            a_elems, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        if (!a_buf) return std::unexpected(a_buf.error());
-        d.buf_a = std::move(*a_buf);
+        auto a = GpuBuffer::create_device_local(d.device, *memory_pool_, a_elems,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        if (!a) return std::unexpected(a.error());
+        d.buf_a = std::move(*a);
 
-        auto b_buf = GpuBuffer::create_device_local(d.device, device_.physical_device(),
-            b_elems, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        if (!b_buf) return std::unexpected(b_buf.error());
-        d.buf_b = std::move(*b_buf);
+        auto b = GpuBuffer::create_device_local(d.device, *memory_pool_, b_elems,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        if (!b) return std::unexpected(b.error());
+        d.buf_b = std::move(*b);
 
-        auto c_buf = GpuBuffer::create_device_local(d.device, device_.physical_device(),
-            c_elems, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-        if (!c_buf) return std::unexpected(c_buf.error());
-        d.buf_c = std::move(*c_buf);
+        auto c = GpuBuffer::create_device_local(d.device, *memory_pool_, c_elems,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        if (!c) return std::unexpected(c.error());
+        d.buf_c = std::move(*c);
 
-        // 2. 创建 host-visible staging 缓冲区（CPU 可直接映射）
-        auto sa_buf = GpuBuffer::create(d.device, device_.physical_device(),
-            a_elems, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-        if (!sa_buf) return std::unexpected(sa_buf.error());
-        d.staging_a = std::move(*sa_buf);
-
-        auto sb_buf = GpuBuffer::create(d.device, device_.physical_device(),
-            b_elems, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-        if (!sb_buf) return std::unexpected(sb_buf.error());
-        d.staging_b = std::move(*sb_buf);
-
-        auto sc_buf = GpuBuffer::create(d.device, device_.physical_device(),
-            c_elems, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        if (!sc_buf) return std::unexpected(sc_buf.error());
-        d.staging_c = std::move(*sc_buf);
-
-        // 3. 分配描述符集并绑定到 device-local 计算缓冲区
         VkDescriptorSetAllocateInfo desc_alloc{};
         desc_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         desc_alloc.descriptorPool = d.desc_pool;
         desc_alloc.descriptorSetCount = 1;
-        auto desc_layout = matmul_pipeline_.descriptor_layout();
-        desc_alloc.pSetLayouts = &desc_layout;
-
+        auto dl = matmul_pipeline_.descriptor_layout();
+        desc_alloc.pSetLayouts = &dl;
         auto r = detail::vk_check(
-            vkAllocateDescriptorSets(d.device, &desc_alloc, &d.descriptor_set),
-            __FILE__, __LINE__);
+            vkAllocateDescriptorSets(d.device, &desc_alloc, &d.descriptor_set), __FILE__, __LINE__);
         if (!r) return std::unexpected(r.error());
 
         VkDescriptorBufferInfo buf_infos[3]{
@@ -1167,7 +1130,6 @@ private:
             {d.buf_b.impl().handle(), 0, VK_WHOLE_SIZE},
             {d.buf_c.impl().handle(), 0, VK_WHOLE_SIZE},
         };
-
         VkWriteDescriptorSet writes[3]{};
         for (int i = 0; i < 3; ++i)
         {
@@ -1180,95 +1142,92 @@ private:
         }
         vkUpdateDescriptorSets(d.device, 3, writes, 0, nullptr);
 
-        // 4. 分配并预录制命令缓冲（含 staging→device 拷贝 + 屏障 + 计算）
-        VkCommandBufferAllocateInfo cmd_alloc{};
-        cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cmd_alloc.commandPool = d.cmd_pool;
-        cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cmd_alloc.commandBufferCount = 1;
+        // 预录制命令缓冲 (性能优化)
+        d.pre_recorded_cmds.resize(staging_ring_->num_regions());
+        for (std::size_t i = 0; i < staging_ring_->num_regions(); ++i) {
+            VkCommandBufferAllocateInfo cmd_alloc{};
+            cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cmd_alloc.commandPool = command_pool_;
+            cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cmd_alloc.commandBufferCount = 1;
+            
+            r = detail::vk_check(
+                vkAllocateCommandBuffers(d.device, &cmd_alloc, &d.pre_recorded_cmds[i]), __FILE__, __LINE__);
+            if (!r) return std::unexpected(r.error());
+            
+            VkCommandBufferBeginInfo begin_info{};
+            begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            begin_info.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+            r = detail::vk_check(vkBeginCommandBuffer(d.pre_recorded_cmds[i], &begin_info), __FILE__, __LINE__);
+            if (!r) return std::unexpected(r.error());
+            
+            auto staging_buf = staging_ring_->buffer(i);
+            VkBufferCopy cp_a{0, 0, a_elems * sizeof(float)};
+            VkBufferCopy cp_b{a_elems * sizeof(float), 0, b_elems * sizeof(float)};
+            vkCmdCopyBuffer(d.pre_recorded_cmds[i], staging_buf, d.buf_a.impl().handle(), 1, &cp_a);
+            vkCmdCopyBuffer(d.pre_recorded_cmds[i], staging_buf, d.buf_b.impl().handle(), 1, &cp_b);
 
-        r = detail::vk_check(
-            vkAllocateCommandBuffers(d.device, &cmd_alloc, &d.cmd_buffer),
-            __FILE__, __LINE__);
-        if (!r) return std::unexpected(r.error());
+            VkBufferMemoryBarrier barriers[2]{};
+            for (int j = 0; j < 2; ++j) {
+                barriers[j].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                barriers[j].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                barriers[j].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                barriers[j].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barriers[j].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barriers[j].offset = 0; barriers[j].size = VK_WHOLE_SIZE;
+            }
+            barriers[0].buffer = d.buf_a.impl().handle();
+            barriers[1].buffer = d.buf_b.impl().handle();
+            vkCmdPipelineBarrier(d.pre_recorded_cmds[i],
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 0, nullptr, 2, barriers, 0, nullptr);
 
-        VkCommandBufferBeginInfo begin_info{};
-        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            vkCmdBindPipeline(d.pre_recorded_cmds[i], VK_PIPELINE_BIND_POINT_COMPUTE, matmul_pipeline_.handle());
+            vkCmdBindDescriptorSets(d.pre_recorded_cmds[i], VK_PIPELINE_BIND_POINT_COMPUTE,
+                matmul_pipeline_.pipeline_layout(), 0, 1, &d.descriptor_set, 0, nullptr);
+            const uint32_t push_data[3] = {key.M, key.N, key.K};
+            vkCmdPushConstants(d.pre_recorded_cmds[i], matmul_pipeline_.pipeline_layout(),
+                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
+            vkCmdDispatch(d.pre_recorded_cmds[i], (key.N + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE, 
+                                        (key.M + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE, 1);
 
-        r = detail::vk_check(
-            vkBeginCommandBuffer(d.cmd_buffer, &begin_info), __FILE__, __LINE__);
-        if (!r) return std::unexpected(r.error());
+            VkBufferMemoryBarrier c_barrier{};
+            c_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            c_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            c_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            c_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            c_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            c_barrier.buffer = d.buf_c.impl().handle();
+            c_barrier.offset = 0; c_barrier.size = VK_WHOLE_SIZE;
+            vkCmdPipelineBarrier(d.pre_recorded_cmds[i],
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, nullptr, 1, &c_barrier, 0, nullptr);
 
-        // ── 阶段 1：staging → device 拷贝 ──────────────────────────
-        VkBufferCopy copy_a{};
-        copy_a.size = a_elems * sizeof(float);
-        vkCmdCopyBuffer(d.cmd_buffer, d.staging_a.impl().handle(),
-                        d.buf_a.impl().handle(), 1, &copy_a);
-
-        VkBufferCopy copy_b{};
-        copy_b.size = b_elems * sizeof(float);
-        vkCmdCopyBuffer(d.cmd_buffer, d.staging_b.impl().handle(),
-                        d.buf_b.impl().handle(), 1, &copy_b);
-
-        // ── 屏障：TRANSFER → COMPUTE ───────────────────────────────
-        VkMemoryBarrier transfer_to_compute{};
-        transfer_to_compute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        transfer_to_compute.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        transfer_to_compute.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(d.cmd_buffer,
-                             VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             0, 1, &transfer_to_compute, 0, nullptr, 0, nullptr);
-
-        // ── 阶段 2：矩阵乘法计算 ──────────────────────────────────
-        vkCmdBindPipeline(d.cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                          matmul_pipeline_.handle());
-        vkCmdBindDescriptorSets(d.cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                matmul_pipeline_.pipeline_layout(),
-                                0, 1, &d.descriptor_set, 0, nullptr);
-
-        const uint32_t push_data[3] = {key.M, key.N, key.K};
-        vkCmdPushConstants(d.cmd_buffer, matmul_pipeline_.pipeline_layout(),
-                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
-
-        const uint32_t group_x = (key.N + 15u) / 16u;
-        const uint32_t group_y = (key.M + 15u) / 16u;
-        vkCmdDispatch(d.cmd_buffer, group_x, group_y, 1);
-
-        // ── 屏障：COMPUTE → TRANSFER ───────────────────────────────
-        VkMemoryBarrier compute_to_transfer{};
-        compute_to_transfer.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        compute_to_transfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        compute_to_transfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        vkCmdPipelineBarrier(d.cmd_buffer,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             0, 1, &compute_to_transfer, 0, nullptr, 0, nullptr);
-
-        // ── 阶段 3：device → staging 拷贝（下载结果）───────────────
-        VkBufferCopy copy_c{};
-        copy_c.size = c_elems * sizeof(float);
-        vkCmdCopyBuffer(d.cmd_buffer, d.buf_c.impl().handle(),
-                        d.staging_c.impl().handle(), 1, &copy_c);
-
-        r = detail::vk_check(vkEndCommandBuffer(d.cmd_buffer), __FILE__, __LINE__);
-        if (!r) return std::unexpected(r.error());
-
-        // 5. 创建持久围栏
-        VkFenceCreateInfo fence_info{};
-        fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-
-        r = detail::vk_check(
-            vkCreateFence(d.device, &fence_info, nullptr, &d.fence),
-            __FILE__, __LINE__);
-        if (!r) return std::unexpected(r.error());
-
+            VkBufferCopy cp_c{0, (a_elems + b_elems) * sizeof(float), c_elems * sizeof(float)};
+            vkCmdCopyBuffer(d.pre_recorded_cmds[i], d.buf_c.impl().handle(), staging_buf, 1, &cp_c);
+            
+            r = detail::vk_check(vkEndCommandBuffer(d.pre_recorded_cmds[i]), __FILE__, __LINE__);
+            if (!r) return std::unexpected(r.error());
+        }
         return d;
     }
 
-    GpuBackend() = default;
+    void evict_oldest_dispatch()
+    {
+        for (auto rit = dispatch_lru_.rbegin(); rit != dispatch_lru_.rend(); ++rit)
+        {
+            auto cache_it = dispatch_cache_.find(*rit);
+            if (cache_it == dispatch_cache_.end()) continue;
+            if (cache_it->second.ref_count.load(std::memory_order_acquire) > 0) continue;
+            auto key = *rit;
+            dispatch_lru_map_.erase(key);
+            dispatch_cache_.erase(key);
+            dispatch_lru_.erase(std::next(rit).base());
+            return;
+        }
+    }
 
-    // 获取 matmul SPIR-V 字节码
+    GpuBackend() = default;
     [[nodiscard]] static const std::vector<uint32_t>& get_matmul_spirv()
     {
 #ifdef NN_MATMUL_SPV_EMBEDDED
@@ -1278,217 +1237,631 @@ private:
         return empty;
 #endif
     }
+    [[nodiscard]] static const std::vector<uint32_t>& get_matmul_tiled_spirv()
+    {
+#ifdef NN_MATMUL_TILED_SPV_EMBEDDED
+        return nn_matmul_tiled_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+    [[nodiscard]] static const std::vector<uint32_t>& get_elementwise_spirv()
+    {
+#ifdef NN_ELEMENTWISE_SPV_EMBEDDED
+        return nn_elementwise_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    // ── 清理待处理的非阻塞 GPU 操作 ─────────────────────────────────
+    void flush_pending_ops()
+    {
+        auto& p = pending_ops_;
+        if (!p.cmd_buffers.empty() || p.has_fence)
+        {
+            if (p.has_fence)
+            {
+                vkWaitForFences(device_.device(), 1, &p.fence, VK_TRUE, 10'000'000'000ULL);
+                vkDestroyFence(device_.device(), p.fence, nullptr);
+                p.fence = VK_NULL_HANDLE;
+                p.has_fence = false;
+            }
+            if (!p.cmd_buffers.empty())
+                vkFreeCommandBuffers(device_.device(), command_pool_,
+                    static_cast<uint32_t>(p.cmd_buffers.size()), p.cmd_buffers.data());
+            p.cmd_buffers.clear();
+            if (!p.desc_sets.empty() && gpu_tensor_pool_ != VK_NULL_HANDLE)
+                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_,
+                    static_cast<uint32_t>(p.desc_sets.size()), p.desc_sets.data());
+            p.desc_sets.clear();
+        }
+    }
 
 public:
-    // Meyer's singleton
     [[nodiscard]] static GpuBackend& instance()
     {
         static GpuBackend backend;
         return backend;
     }
-
     ~GpuBackend()
     {
-        // 先清空调度缓存（释放其中的描述符集回 dispatch_pool_），再销毁池
-        dispatch_lru_.clear();
-        dispatch_cache_.clear();
         if (device_.device() != VK_NULL_HANDLE)
         {
-            if (dispatch_pool_ != VK_NULL_HANDLE)
-                vkDestroyDescriptorPool(device_.device(), dispatch_pool_, nullptr);
+            vkDeviceWaitIdle(device_.device());
+            flush_pending_ops();
+            if (staging_ring_) {
+                for (std::size_t i = 0; i < staging_ring_->num_regions(); ++i) {
+                    auto f = staging_ring_->fence(i);
+                    if (f != VK_NULL_HANDLE)
+                        vkWaitForFences(device_.device(), 1, &f, VK_TRUE, 10'000'000'000ULL);
+                }
+            }
         }
+        dispatch_lru_map_.clear();
+        dispatch_lru_.clear();
+        dispatch_cache_.clear();
+        staging_ring_.reset();
+        if (device_.device() != VK_NULL_HANDLE) {
+            if (gpu_tensor_pool_ != VK_NULL_HANDLE) vkDestroyDescriptorPool(device_.device(), gpu_tensor_pool_, nullptr);
+            if (dispatch_pool_ != VK_NULL_HANDLE) vkDestroyDescriptorPool(device_.device(), dispatch_pool_, nullptr);
+            if (command_pool_ != VK_NULL_HANDLE) vkDestroyCommandPool(device_.device(), command_pool_, nullptr);
+        }
+        memory_pool_.reset();
     }
     GpuBackend(const GpuBackend&) = delete;
     GpuBackend& operator=(const GpuBackend&) = delete;
 
-    // ── 初始化 GPU 后端（惰性，可安全重复调用）──────────────────────
     [[nodiscard]] Result<void> initialize()
     {
-        std::lock_guard lock(mutex_);
+        std::lock_guard lock(init_mutex_);
         if (initialized_) return {};
-
         const auto& spirv = get_matmul_spirv();
         if (spirv.empty())
-            return std::unexpected(Error{
-                "matmul SPIR-V bytecode not embedded. "
-                "Run CMake build with Vulkan SDK to compile shaders."});
-
+            return std::unexpected(Error{"matmul SPIR-V bytecode not embedded."});
         auto dev_r = device_.initialize();
         if (!dev_r) return dev_r;
-
         auto pl_r = VulkanPipeline::create_matmul(device_.device(), spirv);
         if (!pl_r) return std::unexpected(pl_r.error());
         matmul_pipeline_ = std::move(*pl_r);
+        memory_pool_ = std::make_unique<MemoryPool>(device_.device(), device_.physical_device());
+        VkCommandPoolCreateInfo pool_info{};
+        pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pool_info.queueFamilyIndex = device_.queue_family_index();
+        pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        auto r = detail::vk_check(
+            vkCreateCommandPool(device_.device(), &pool_info, nullptr, &command_pool_), __FILE__, __LINE__);
+        if (!r) return r;
+        staging_ring_ = std::make_unique<StagingRing>();
+        auto st_r = staging_ring_->initialize(
+            device_.device(), device_.physical_device(), command_pool_, memory_pool_.get());
+        if (!st_r) return st_r;
 
-        auto cmd_r = VulkanCommandManager::create(
-            device_.device(), device_.queue_family_index());
-        if (!cmd_r) return std::unexpected(cmd_r.error());
-        cmd_manager_ = std::move(*cmd_r);
-
-        // 调度专用描述符池（大容量，供 CachedDispatch 持久使用）
+        constexpr std::size_t total_descriptors = MAX_CACHED_DISPATCHES * DESCRIPTORS_PER_DISPATCH;
         VkDescriptorPoolSize dispatch_pool_size{};
         dispatch_pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        dispatch_pool_size.descriptorCount = 49152;  // 3 × 16384
-
+        dispatch_pool_size.descriptorCount = static_cast<uint32_t>(total_descriptors);
         VkDescriptorPoolCreateInfo dispatch_pool_info{};
         dispatch_pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        dispatch_pool_info.maxSets = 16384;
+        dispatch_pool_info.maxSets = static_cast<uint32_t>(MAX_CACHED_DISPATCHES);
         dispatch_pool_info.poolSizeCount = 1;
         dispatch_pool_info.pPoolSizes = &dispatch_pool_size;
         dispatch_pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+        r = detail::vk_check(
+            vkCreateDescriptorPool(device_.device(), &dispatch_pool_info, nullptr, &dispatch_pool_), __FILE__, __LINE__);
+        if (!r) return r;
+        // ── GpuTensor 专用描述符池（供 matmul_gpu / elementwise_gpu 使用）──
+        constexpr std::size_t TENSOR_POOL_SETS = 1024;
+        constexpr std::size_t TENSOR_POOL_DESCS = TENSOR_POOL_SETS * 3; // 最多 3 绑定/集
+        VkDescriptorPoolSize tensor_pool_size{};
+        tensor_pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        tensor_pool_size.descriptorCount = static_cast<uint32_t>(TENSOR_POOL_DESCS);
+        VkDescriptorPoolCreateInfo tensor_pool_info{};
+        tensor_pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        tensor_pool_info.maxSets = static_cast<uint32_t>(TENSOR_POOL_SETS);
+        tensor_pool_info.poolSizeCount = 1;
+        tensor_pool_info.pPoolSizes = &tensor_pool_size;
+        tensor_pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+        r = detail::vk_check(
+            vkCreateDescriptorPool(device_.device(), &tensor_pool_info, nullptr, &gpu_tensor_pool_), __FILE__, __LINE__);
+        if (!r) return r;
 
-        auto dp_r = detail::vk_check(
-            vkCreateDescriptorPool(device_.device(), &dispatch_pool_info, nullptr,
-                                    &dispatch_pool_),
-            __FILE__, __LINE__);
-        if (!dp_r) return dp_r;
+        // ── 4×4 粗化分块矩阵乘法 Pipeline ──────────────────────────
+        const auto& tiled_spirv = get_matmul_tiled_spirv();
+        if (!tiled_spirv.empty())
+        {
+            auto tp_r = VulkanPipeline::create_matmul(device_.device(), tiled_spirv);
+            if (tp_r) matmul_tiled_pipeline_ = std::move(*tp_r);
+        }
+
+        // ── 逐元素运算 Pipeline ─────────────────────────────────────
+        const auto& elem_spirv = get_elementwise_spirv();
+        if (!elem_spirv.empty())
+        {
+            auto ep_r = VulkanPipeline::create_elementwise(device_.device(), elem_spirv);
+            if (ep_r) elementwise_pipeline_ = std::move(*ep_r);
+        }
 
         initialized_ = true;
         return {};
     }
-
     [[nodiscard]] bool is_initialized() const noexcept { return initialized_; }
+    [[nodiscard]] bool has_tiled_pipeline() const noexcept { return matmul_tiled_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_elementwise_pipeline() const noexcept { return elementwise_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] VulkanDevice& device() noexcept { return device_; }
+    [[nodiscard]] MemoryPool& memory_pool() noexcept { return *memory_pool_; }
+    [[nodiscard]] StagingRing& staging_ring() noexcept { return *staging_ring_; }
 
-    // ── 上传 CPU 数据到 GPU 缓冲区 ─────────────────────────────────
-    [[nodiscard]] Result<void> upload(std::span<const double> src, GpuBuffer& dst)
+    // ══════════════════════════════════════════════════════════════════════
+    // 双轨制架构：GpuTensor 纯 GPU 流水线 API
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── 阻塞式上传：CPU Matrix → GpuTensor（仅在输入层调用）──────────
+    [[nodiscard]] Result<void> upload_blocking(
+        GpuTensor& dst, std::span<const double> cpu_data)
     {
         if (!initialized_) return std::unexpected(Error{"GPU backend not initialized"});
-        if (dst.empty()) return std::unexpected(Error{"destination buffer is empty"});
-        if (src.size() != dst.element_count())
-            return std::unexpected(Error{"upload size mismatch"});
+        if (!dst.valid()) return std::unexpected(Error{"Invalid destination GpuTensor"});
+        const std::size_t elem_count = dst.rows() * dst.cols();
+        if (cpu_data.size() != elem_count)
+            return std::unexpected(Error{"Upload size mismatch"});
 
-        auto mapped = dst.impl().map();
-        if (!mapped.valid())
-            return std::unexpected(Error{"failed to map GPU buffer for upload"});
+        auto ri = staging_ring_->acquire();
+        auto r = staging_ring_->upload(ri, cpu_data, 0);
+        if (!r) return r;
 
-        mapped.upload(src);
-        return {};
+        // 录制 Copy 命令：Staging → Device Local
+        VkCommandBufferAllocateInfo cmd_alloc{};
+        cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cmd_alloc.commandPool = command_pool_;
+        cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cmd_alloc.commandBufferCount = 1;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        r = detail::vk_check(
+            vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &cmd), __FILE__, __LINE__);
+        if (!r) return r;
+
+        VkCommandBufferBeginInfo begin_info{};
+        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        r = detail::vk_check(vkBeginCommandBuffer(cmd, &begin_info), __FILE__, __LINE__);
+        if (!r) return r;
+
+        VkBufferCopy cp{0, 0, elem_count * sizeof(float)};
+        vkCmdCopyBuffer(cmd, staging_ring_->buffer(ri), dst.buffer().impl().handle(), 1, &cp);
+
+        r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
+        if (!r) return r;
+
+        auto fence = staging_ring_->fence(ri);
+        vkResetFences(device_.device(), 1, &fence);
+        {
+            std::lock_guard lock(queue_mutex_);
+            VkSubmitInfo submit_info{};
+            submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submit_info.commandBufferCount = 1;
+            submit_info.pCommandBuffers = &cmd;
+            r = detail::vk_check(
+                vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence), __FILE__, __LINE__);
+            if (!r) return r;
+        }
+        r = detail::vk_check(
+            vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, 10'000'000'000ULL), __FILE__, __LINE__);
+        vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
+        return r;
     }
 
-    // ── 下载 GPU 缓冲区到 CPU ───────────────────────────────────────
-    [[nodiscard]] Result<void> download(GpuBuffer& src, std::span<double> dst)
+    // ── 阻塞式下载：GpuTensor → CPU span（仅在输出层调用）──────────
+    [[nodiscard]] Result<void> download_blocking(
+        const GpuTensor& src, std::span<double> cpu_data)
     {
         if (!initialized_) return std::unexpected(Error{"GPU backend not initialized"});
-        if (src.empty()) return std::unexpected(Error{"source buffer is empty"});
-        if (src.element_count() != dst.size())
-            return std::unexpected(Error{"download size mismatch"});
+        if (!src.valid()) return std::unexpected(Error{"Invalid source GpuTensor"});
+        const std::size_t elem_count = src.rows() * src.cols();
+        if (cpu_data.size() != elem_count)
+            return std::unexpected(Error{"Download size mismatch"});
 
-        auto mapped = src.impl().map();
-        if (!mapped.valid())
-            return std::unexpected(Error{"failed to map GPU buffer for download"});
+        // 先 flush 所有待处理的 GPU 操作
+        flush_pending_ops();
 
-        mapped.download(dst);
-        return {};
+        auto ri = staging_ring_->acquire();
+
+        // 录制 Copy 命令：Device Local → Staging
+        VkCommandBufferAllocateInfo cmd_alloc{};
+        cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cmd_alloc.commandPool = command_pool_;
+        cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cmd_alloc.commandBufferCount = 1;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        auto r = detail::vk_check(
+            vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &cmd), __FILE__, __LINE__);
+        if (!r) return r;
+
+        VkCommandBufferBeginInfo begin_info{};
+        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        r = detail::vk_check(vkBeginCommandBuffer(cmd, &begin_info), __FILE__, __LINE__);
+        if (!r) return r;
+
+        VkBufferCopy cp{0, 0, elem_count * sizeof(float)};
+        vkCmdCopyBuffer(cmd, src.buffer().impl().handle(), staging_ring_->buffer(ri), 1, &cp);
+
+        r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
+        if (!r) return r;
+
+        auto fence = staging_ring_->fence(ri);
+        vkResetFences(device_.device(), 1, &fence);
+        {
+            std::lock_guard lock(queue_mutex_);
+            VkSubmitInfo submit_info{};
+            submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submit_info.commandBufferCount = 1;
+            submit_info.pCommandBuffers = &cmd;
+            r = detail::vk_check(
+                vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence), __FILE__, __LINE__);
+            if (!r) return r;
+        }
+        r = detail::vk_check(
+            vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, 10'000'000'000ULL), __FILE__, __LINE__);
+        if (!r) return r;
+
+        r = staging_ring_->download(ri, cpu_data, 0);
+        vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
+        return r;
     }
 
-    // ── GPU 矩阵乘法（底层接口）──────────────────────────────────────
-    //   C = A × B，M×K @ K×N → M×N
-    [[nodiscard]] Result<void> matmul(
-        GpuBuffer& a, GpuBuffer& b, GpuBuffer& c,
-        std::size_t M, std::size_t N, std::size_t K)
+    // ── 纯 GPU 矩阵乘法（零 PCIe 开销，提交后不等待）──────────────
+    // 使用 4×4 粗化分块 Shader（如可用），否则回退到原始 Shader
+    [[nodiscard]] Result<GpuTensor> matmul_gpu(const GpuTensor& A, const GpuTensor& B)
     {
         if (!initialized_) return std::unexpected(Error{"GPU backend not initialized"});
+        if (A.cols() != B.rows()) return std::unexpected(Error{"Dimension mismatch"});
 
-        std::lock_guard lock(mutex_);
-        return cmd_manager_.execute_matmul(
-            matmul_pipeline_.handle(),
-            matmul_pipeline_.pipeline_layout(),
-            matmul_pipeline_.descriptor_layout(),
-            a.impl().handle(), b.impl().handle(), c.impl().handle(),
-            static_cast<uint32_t>(M), static_cast<uint32_t>(N), static_cast<uint32_t>(K),
-            device_.compute_queue());
+        const auto M = static_cast<uint32_t>(A.rows());
+        const auto K = static_cast<uint32_t>(A.cols());
+        const auto N = static_cast<uint32_t>(B.cols());
+
+        // 1. 分配输出 Tensor
+        auto C_res = GpuTensor::create_empty(M, N, *this);
+        if (!C_res) return std::unexpected(C_res.error());
+        GpuTensor C = std::move(*C_res);
+
+        // 2. 选择 Pipeline（优先使用粗化分块版本）
+        const bool use_tiled = has_tiled_pipeline();
+        auto& pipeline = use_tiled ? matmul_tiled_pipeline_ : matmul_pipeline_;
+
+        // 3. 分配描述符集
+        VkDescriptorSet desc_set = VK_NULL_HANDLE;
+        VkDescriptorSetAllocateInfo desc_alloc{};
+        desc_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        desc_alloc.descriptorPool = gpu_tensor_pool_;
+        desc_alloc.descriptorSetCount = 1;
+        auto dl = pipeline.descriptor_layout();
+        desc_alloc.pSetLayouts = &dl;
+        auto r = detail::vk_check(
+            vkAllocateDescriptorSets(device_.device(), &desc_alloc, &desc_set), __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
+
+        // 4. 写入描述符集（绑定 A, B, C 的 Device Local Buffer）
+        VkDescriptorBufferInfo buf_infos[3]{
+            {A.buffer().impl().handle(), 0, VK_WHOLE_SIZE},
+            {B.buffer().impl().handle(), 0, VK_WHOLE_SIZE},
+            {C.buffer().impl().handle(), 0, VK_WHOLE_SIZE},
+        };
+        VkWriteDescriptorSet writes[3]{};
+        for (int i = 0; i < 3; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = desc_set;
+            writes[i].dstBinding = static_cast<uint32_t>(i);
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &buf_infos[i];
+        }
+        vkUpdateDescriptorSets(device_.device(), 3, writes, 0, nullptr);
+
+        // 5. 录制 Command Buffer
+        VkCommandBufferAllocateInfo cmd_alloc{};
+        cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cmd_alloc.commandPool = command_pool_;
+        cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cmd_alloc.commandBufferCount = 1;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        r = detail::vk_check(
+            vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &cmd), __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
+
+        VkCommandBufferBeginInfo begin_info{};
+        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        r = detail::vk_check(vkBeginCommandBuffer(cmd, &begin_info), __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
+
+        // 管线屏障：确保输入数据就绪
+        // A 可能来自上一层的 SHADER_WRITE 或初始的 TRANSFER_WRITE
+        // B（权重）来自最初的 TRANSFER_WRITE
+        VkBufferMemoryBarrier input_barriers[2]{};
+        for (int i = 0; i < 2; ++i)
+        {
+            input_barriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            input_barriers[i].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            input_barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            input_barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            input_barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            input_barriers[i].offset = 0;
+            input_barriers[i].size = VK_WHOLE_SIZE;
+        }
+        input_barriers[0].buffer = A.buffer().impl().handle();
+        input_barriers[1].buffer = B.buffer().impl().handle();
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, 2, input_barriers, 0, nullptr);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+        const uint32_t push_data[3] = {M, N, K};
+        vkCmdPushConstants(cmd, pipeline.pipeline_layout(),
+            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
+
+        // Dispatch 维度取决于使用哪个 Shader
+        if (use_tiled)
+            vkCmdDispatch(cmd, (N + TILE_MN - 1u) / TILE_MN, (M + TILE_MN - 1u) / TILE_MN, 1);
+        else
+            vkCmdDispatch(cmd, (N + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE,
+                              (M + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE, 1);
+
+        // 管线屏障：确保输出数据就绪（供下一层或下载使用）
+        VkBufferMemoryBarrier output_barrier{};
+        output_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        output_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        output_barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        output_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        output_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        output_barrier.buffer = C.buffer().impl().handle();
+        output_barrier.offset = 0;
+        output_barrier.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, 1, &output_barrier, 0, nullptr);
+
+        r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
+
+        // 6. 提交到 Compute Queue（不等待！CPU 立即返回）
+        {
+            std::lock_guard lock(queue_mutex_);
+            VkSubmitInfo submit_info{};
+            submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submit_info.commandBufferCount = 1;
+            submit_info.pCommandBuffers = &cmd;
+            r = detail::vk_check(
+                vkQueueSubmit(device_.compute_queue(), 1, &submit_info, VK_NULL_HANDLE), __FILE__, __LINE__);
+            if (!r) return std::unexpected(r.error());
+        }
+
+        // 7. 追踪待清理资源
+        pending_ops_.cmd_buffers.push_back(cmd);
+        pending_ops_.desc_sets.push_back(desc_set);
+
+        return C;
     }
 
-    // ── 端到端 GPU 矩阵乘法（高层接口）───────────────────────────────
-    //   首次调用：创建 device-local 计算缓冲 + staging 缓冲 + 预录制命令
-    //   后续调用：直接复用缓存，仅 上传staging → 提交 → 下载staging
-    //   LRU 淘汰：缓存超过 MAX_CACHED_DISPATCHES 时淘汰最久未使用的条目
+    // ── 纯 GPU 逐元素运算（ReLU / GeLU / BiasAdd，提交后不等待）──────
+    // op: 0=ReLU, 1=QuickGeLU, 2=BiasAdd
+    // 对于 op=2（BiasAdd）：primary 是 matmul 结果，secondary 是 bias 向量
+    [[nodiscard]] Result<GpuTensor> elementwise_gpu(
+        const GpuTensor& primary, const GpuTensor* secondary, uint32_t op,
+        uint32_t rows = 0, uint32_t cols = 0)
+    {
+        if (!initialized_) return std::unexpected(Error{"GPU backend not initialized"});
+        if (!has_elementwise_pipeline())
+            return std::unexpected(Error{"Elementwise pipeline not available"});
+
+        const auto elem_count = static_cast<uint32_t>(primary.rows() * primary.cols());
+
+        // 分配输出 Tensor
+        auto out_res = GpuTensor::create_empty(primary.rows(), primary.cols(), *this);
+        if (!out_res) return std::unexpected(out_res.error());
+        GpuTensor output = std::move(*out_res);
+
+        // secondary 为空时用 primary 自身（unary op 场景）
+        const GpuTensor& sec = secondary ? *secondary : primary;
+
+        // 分配描述符集
+        VkDescriptorSet desc_set = VK_NULL_HANDLE;
+        VkDescriptorSetAllocateInfo desc_alloc{};
+        desc_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        desc_alloc.descriptorPool = gpu_tensor_pool_;
+        desc_alloc.descriptorSetCount = 1;
+        auto dl = elementwise_pipeline_.descriptor_layout();
+        desc_alloc.pSetLayouts = &dl;
+        auto r = detail::vk_check(
+            vkAllocateDescriptorSets(device_.device(), &desc_alloc, &desc_set), __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
+
+        VkDescriptorBufferInfo buf_infos[3]{
+            {primary.buffer().impl().handle(), 0, VK_WHOLE_SIZE},
+            {sec.buffer().impl().handle(), 0, VK_WHOLE_SIZE},
+            {output.buffer().impl().handle(), 0, VK_WHOLE_SIZE},
+        };
+        VkWriteDescriptorSet writes[3]{};
+        for (int i = 0; i < 3; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = desc_set;
+            writes[i].dstBinding = static_cast<uint32_t>(i);
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &buf_infos[i];
+        }
+        vkUpdateDescriptorSets(device_.device(), 3, writes, 0, nullptr);
+
+        // 录制 Command Buffer
+        VkCommandBufferAllocateInfo cmd_alloc{};
+        cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cmd_alloc.commandPool = command_pool_;
+        cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cmd_alloc.commandBufferCount = 1;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        r = detail::vk_check(
+            vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &cmd), __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
+
+        VkCommandBufferBeginInfo begin_info{};
+        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        r = detail::vk_check(vkBeginCommandBuffer(cmd, &begin_info), __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
+
+        // 输入屏障（primary 和 secondary）
+        VkBufferMemoryBarrier in_barriers[2]{};
+        for (int i = 0; i < 2; ++i)
+        {
+            in_barriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            in_barriers[i].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            in_barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            in_barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            in_barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            in_barriers[i].offset = 0; in_barriers[i].size = VK_WHOLE_SIZE;
+        }
+        in_barriers[0].buffer = primary.buffer().impl().handle();
+        in_barriers[1].buffer = sec.buffer().impl().handle();
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, 2, in_barriers, 0, nullptr);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, elementwise_pipeline_.handle());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            elementwise_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+        const uint32_t push_data[4] = {elem_count, op, rows, cols};
+        vkCmdPushConstants(cmd, elementwise_pipeline_.pipeline_layout(),
+            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
+        vkCmdDispatch(cmd, (elem_count + 255u) / 256u, 1, 1);
+
+        // 输出屏障
+        VkBufferMemoryBarrier out_barrier{};
+        out_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        out_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        out_barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        out_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        out_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        out_barrier.buffer = output.buffer().impl().handle();
+        out_barrier.offset = 0; out_barrier.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, 1, &out_barrier, 0, nullptr);
+
+        r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
+
+        // 提交（不等待）
+        {
+            std::lock_guard lock(queue_mutex_);
+            VkSubmitInfo submit_info{};
+            submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submit_info.commandBufferCount = 1;
+            submit_info.pCommandBuffers = &cmd;
+            r = detail::vk_check(
+                vkQueueSubmit(device_.compute_queue(), 1, &submit_info, VK_NULL_HANDLE), __FILE__, __LINE__);
+            if (!r) return std::unexpected(r.error());
+        }
+
+        pending_ops_.cmd_buffers.push_back(cmd);
+        pending_ops_.desc_sets.push_back(desc_set);
+
+        return output;
+    }
+
     [[nodiscard]] Result<void> matmul_direct(
         std::span<const double> a_data,
         std::span<const double> b_data,
         std::span<double> c_data,
         std::size_t M, std::size_t N, std::size_t K)
     {
-        std::lock_guard lock(mutex_);
-        if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
-
+        if (!initialized_) return std::unexpected(Error{"GPU backend not initialized"});
         MatmulKey key{static_cast<uint32_t>(M), static_cast<uint32_t>(N), static_cast<uint32_t>(K)};
 
-        // 查找或创建缓存调度
-        auto it = dispatch_cache_.find(key);
-        if (it == dispatch_cache_.end())
+        CachedDispatch* dp = nullptr;
         {
-            // 缓存满时淘汰最久未使用的条目
-            if (dispatch_cache_.size() >= MAX_CACHED_DISPATCHES)
+            std::lock_guard lock(cache_mutex_);
+            auto it = dispatch_cache_.find(key);
+            if (it == dispatch_cache_.end())
             {
-                auto oldest = dispatch_lru_.back();
-                dispatch_lru_.pop_back();
-                dispatch_cache_.erase(oldest);
+                if (dispatch_cache_.size() >= MAX_CACHED_DISPATCHES) evict_oldest_dispatch();
+                auto result = create_cached_dispatch(key);
+                if (!result) return std::unexpected(result.error());
+                auto [inserted_it, _] = dispatch_cache_.emplace(key, std::move(*result));
+                it = inserted_it;
+                dispatch_lru_.push_front(key);
+                dispatch_lru_map_[key] = dispatch_lru_.begin();
             }
-
-            auto result = create_cached_dispatch(key);
-            if (!result) return std::unexpected(result.error());
-            it = dispatch_cache_.emplace(key, std::move(*result)).first;
-            dispatch_lru_.push_front(key);
-        }
-        else
-        {
-            // 命中：将 key 移到 LRU 最前端
-            dispatch_lru_.remove(key);
-            dispatch_lru_.push_front(key);
+            else
+            {
+                auto lru_it = dispatch_lru_map_[key];
+                dispatch_lru_.erase(lru_it);
+                dispatch_lru_.push_front(key);
+                dispatch_lru_map_[key] = dispatch_lru_.begin();
+            }
+            dp = &it->second;
+            dp->ref_count.fetch_add(1, std::memory_order_release);
         }
 
-        auto& d = it->second;
+        struct RefGuard {
+            CachedDispatch* d;
+            ~RefGuard() { if (d) d->ref_count.fetch_sub(1, std::memory_order_release); }
+        } ref_guard{dp};
+        CachedDispatch& d = *dp;
 
-        // 上传 A 到 staging（double→float 转换）
-        {
-            auto mapped = d.staging_a.impl().map();
-            if (!mapped.valid())
-                return std::unexpected(Error{"failed to map staging A for upload"});
-            mapped.upload(a_data);
-        }
+        const std::size_t a_sz = M * K;
+        const std::size_t b_sz = K * N;
+        const std::size_t c_sz = M * N;
+        const std::size_t total_bytes = (a_sz + b_sz + c_sz) * sizeof(float);
+        if (total_bytes > staging_ring_->region_size())
+            return std::unexpected(Error{"Matrix too large for staging region"});
 
-        // 上传 B 到 staging
-        {
-            auto mapped = d.staging_b.impl().map();
-            if (!mapped.valid())
-                return std::unexpected(Error{"failed to map staging B for upload"});
-            mapped.upload(b_data);
-        }
-
-        // 重置围栏，提交预录制命令缓冲
-        // （内部含 staging→device 拷贝 + 屏障 + 计算 + device→staging 拷贝）
-        vkResetFences(d.device, 1, &d.fence);
-
-        VkSubmitInfo submit_info{};
-        submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submit_info.commandBufferCount = 1;
-        submit_info.pCommandBuffers = &d.cmd_buffer;
-
-        auto r = detail::vk_check(
-            vkQueueSubmit(device_.compute_queue(), 1, &submit_info, d.fence),
-            __FILE__, __LINE__);
+        auto ri = staging_ring_->acquire();
+        auto r = staging_ring_->upload(ri, a_data, 0);
+        if (!r) return r;
+        r = staging_ring_->upload(ri, b_data, a_sz * sizeof(float));
         if (!r) return r;
 
+        auto cmd = d.pre_recorded_cmds[ri]; // 直接使用预录制命令
+        auto fence = staging_ring_->fence(ri);
+
+        vkResetFences(device_.device(), 1, &fence);
+        {
+            std::lock_guard lock(queue_mutex_);
+            VkSubmitInfo submit_info{};
+            submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submit_info.commandBufferCount = 1;
+            submit_info.pCommandBuffers = &cmd;
+            r = detail::vk_check(
+                vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
+                __FILE__, __LINE__);
+            if (!r) return r;
+        }
+        
+        staging_ring_->mark_in_flight(ri); // 修复：正确标记 in_flight
+        
         r = detail::vk_check(
-            vkWaitForFences(d.device, 1, &d.fence, VK_TRUE, 10'000'000'000ULL),
+            vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, 10'000'000'000ULL),
             __FILE__, __LINE__);
         if (!r) return r;
 
-        // 从 staging 下载结果
-        {
-            auto mapped = d.staging_c.impl().map();
-            if (!mapped.valid())
-                return std::unexpected(Error{"failed to map staging C for download"});
-            mapped.download(c_data);
-        }
-
+        r = staging_ring_->download(ri, c_data, (a_sz + b_sz) * sizeof(float));
+        if (!r) return r;
         return {};
     }
 };
 
+// GpuTensor 方法实现已移至 gpu_tensor_impl.hpp（在 matrix.hpp 末尾自动包含）
 } // namespace nn
-
 #endif // NN_HAS_VULKAN
 #endif // VK_BACKEND_HPP

@@ -1,0 +1,123 @@
+// ── matmul_tiled.comp ─────────────────────────────────────────────────────
+// 4×4 线程粗化分块矩阵乘法：C[M][N] = A[M][K] × B[K][N]
+//
+// 优化策略：
+//   - WorkGroup：16×16 线程，计算 64×64 输出块（每线程 4×4 元素）
+//   - 寄存器分块：每线程在寄存器中维护 4×4 累加和，大幅提升计算访存比
+//   - Shared Memory Padding：17/65 列宽避免 Bank Conflict
+//   - 向量化加载：每个线程每轮加载 4 个元素到共享内存
+//
+// 对比原始 matmul.comp：
+//   - 计算访存比：从 1 FMA/元素 提升到 4 FMA/元素（理论 4× 吞吐）
+//   - 线程利用率：从 1 元素/线程 提升到 16 元素/线程
+// ─────────────────────────────────────────────────────────────────────────
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer  BufferA { float A[]; };
+layout(std430, binding = 1) readonly buffer  BufferB { float B[]; };
+layout(std430, binding = 2) writeonly buffer BufferC { float C[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;  // A 的行数 / C 的行数
+    uint N;  // B 的列数 / C 的列数
+    uint K;  // A 的列数 / B 的行数
+};
+
+// 分块维度常量
+const uint BM = 64u;  // 输出块行数
+const uint BN = 64u;  // 输出块列数
+const uint BK = 16u;  // K 维度分块宽度
+
+// Shared Memory：Padding 避免 Bank Conflict
+//   tileA[64][17]：当多线程同时访问同一列不同行时，stride=17 避免冲突
+//   tileB[16][65]：同理
+shared float tileA[64][17];
+shared float tileB[16][65];
+
+void main()
+{
+    const uint tx = gl_LocalInvocationID.x;   // 0..15
+    const uint ty = gl_LocalInvocationID.y;   // 0..15
+    const uint tid = ty * 16u + tx;           // 线性线程 ID 0..255
+
+    // 当前 WorkGroup 负责的全局输出块起始坐标
+    const uint block_row = gl_WorkGroupID.y * BM;
+    const uint block_col = gl_WorkGroupID.x * BN;
+
+    // ── 寄存器分块：4×4 累加器 ──────────────────────────────────────
+    float acc[4][4];
+    for (uint i = 0u; i < 4u; ++i)
+        for (uint j = 0u; j < 4u; ++j)
+            acc[i][j] = 0.0;
+
+    const uint num_tiles = (K + BK - 1u) / BK;
+
+    for (uint t = 0u; t < num_tiles; ++t)
+    {
+        // ── 协作加载 tileA[64][16]：1024 元素，256 线程，每线程 4 元素 ──
+        {
+            const uint a_base_col = t * BK;
+            for (uint load = 0u; load < 4u; ++load)
+            {
+                const uint elem = tid * 4u + load;   // 0..1023
+                const uint r = elem / BK;             // 0..63
+                const uint c = elem % BK;             // 0..15
+                const uint gr = block_row + r;
+                const uint gc = a_base_col + c;
+                tileA[r][c] = (gr < M && gc < K) ? A[gr * K + gc] : 0.0;
+            }
+        }
+
+        // ── 协作加载 tileB[16][64]：1024 元素，256 线程，每线程 4 元素 ──
+        {
+            const uint b_base_row = t * BK;
+            for (uint load = 0u; load < 4u; ++load)
+            {
+                const uint elem = tid * 4u + load;
+                const uint r = elem / BN;             // 0..15
+                const uint c = elem % BN;             // 0..63
+                const uint gr = b_base_row + r;
+                const uint gc = block_col + c;
+                tileB[r][c] = (gr < K && gc < N) ? B[gr * N + gc] : 0.0;
+            }
+        }
+
+        barrier();
+
+        // ── 核心计算：外积累加，4×4 = 16 次 FMA ──────────────────────
+        for (uint k = 0u; k < BK; ++k)
+        {
+            // 从 Shared Memory 预取到寄存器
+            float a_vals[4];
+            float b_vals[4];
+
+            for (uint i = 0u; i < 4u; ++i)
+                a_vals[i] = tileA[ty * 4u + i][k];
+
+            for (uint j = 0u; j < 4u; ++j)
+                b_vals[j] = tileB[k][tx * 4u + j];
+
+            // 外积累加
+            for (uint i = 0u; i < 4u; ++i)
+                for (uint j = 0u; j < 4u; ++j)
+                    acc[i][j] += a_vals[i] * b_vals[j];
+        }
+
+        barrier();
+    }
+
+    // ── 写回结果（带边界检查） ──────────────────────────────────────
+    for (uint i = 0u; i < 4u; ++i)
+    {
+        for (uint j = 0u; j < 4u; ++j)
+        {
+            const uint r = block_row + ty * 4u + i;
+            const uint c = block_col + tx * 4u + j;
+            if (r < M && c < N)
+                C[r * N + c] = acc[i][j];
+        }
+    }
+}
