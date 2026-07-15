@@ -330,25 +330,37 @@ flowchart LR
 
 ## 📦 模型序列化格式 (model_io.hpp)
 
+### V2 格式（当前）
+
 ```mermaid
 flowchart LR
-    subgraph "二进制模型文件格式"
-        A["Magic: 0x4E4E4E4E<br/>(4 bytes)"] --> B["Version: 1<br/>(4 bytes)"]
-        B --> C["Param 1: rows(4B) + cols(4B) + data"]
-        C --> D["Param 2: rows(4B) + cols(4B) + data"]
-        D --> E["..."]
+    subgraph "V2 二进制模型文件"
+        A["Magic: 0x4E4E4E4E<br/>(uint32)"] --> B["Version: 2<br/>(uint32)"]
+        B --> C["ModelType<br/>(uint32)"]
+        C --> D["ModelSpec<br/>(架构参数)"]
+        D --> E["Matrix 0<br/>rows(u64)+cols(u64)+data"]
+        E --> F["Matrix 1 ..."]
+        F --> G["..."]
     end
 ```
 
-参数写入顺序（默认 4 层隐藏层架构）：
-1. W₁ (512×784), b₁ (512×1)
-2. W₂ (256×512), b₂ (256×1)
-3. W₃ (128×256), b₃ (128×1)
-4. W₄ (64×128),  b₄ (64×1)
-5. W₅ (10×64),   b₅ (10×1)
-6. γ₁~γ₄, β₁~β₄ (LayerNorm 参数)
+### ModelSpec 编码
 
-共 **10 个 Linear 参数矩阵 + 8 个 LayerNorm 参数矩阵**。
+| 模型类型 | 字段 |
+|----------|------|
+| MLP | `layer_dims`: num_dims(u32) + dim_0..dim_N(u64) |
+| Transformer | d_model, num_heads, d_ff, num_layers, patch_size (各 u64) |
+| GPT | vocab_size, d_model, seq_len, num_heads, d_ff, num_layers (各 u64) |
+
+### 公开 API
+
+| 函数 | 说明 |
+|------|------|
+| `save_model(path, model, spec)` | 保存 Model + ModelSpec 为 V2 格式 |
+| `load_model(path, model)` | 加载参数到已有 Model（兼容 V1/V2） |
+| `peek_model_spec(path)` | 只读文件头，返回 ModelSpec（V1 返回 Unknown） |
+
+所有函数失败时抛出 `ModelIOError`，无 `std::cout` 副作用。
 
 ---
 

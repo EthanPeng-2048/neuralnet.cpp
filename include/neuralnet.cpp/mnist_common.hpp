@@ -3,10 +3,11 @@
 
 #include <cstddef>
 #include <string>
-#include <stdexcept>
+#include <expected>
 #include <vector>
 
 #include "model.hpp"
+#include "model_io.hpp"  // ModelSpec
 
 namespace nn {
 
@@ -27,18 +28,22 @@ inline constexpr std::size_t TRANSFORMER_NUM_LAYERS = 2;
 inline constexpr std::size_t TRANSFORMER_PATCH_SIZE = 7;   // 28 / 7 = 4 → 4×4 = 16 patches
 
 // ── 构建 MLP 模型 ──────────────────────────────────────────────────────────
-// 根据 MNIST_LAYER_DIMS 自动构建网络 (Linear + LayerNorm + GeLU)
-[[nodiscard]] inline Model build_mnist_mlp_model()
+// 可指定自定义层维度，也可使用默认 MNIST_LAYER_DIMS
+[[nodiscard]] inline Result<Model> build_mnist_mlp_model(
+    const std::vector<std::size_t> &layer_dims = MNIST_LAYER_DIMS)
 {
+    if (layer_dims.size() < 2)
+        return std::unexpected(Error{"MLP layer_dims must have at least 2 elements"});
+
     Model model;
-    for (std::size_t i = 0; i < MNIST_LAYER_DIMS.size() - 1; ++i)
+    for (std::size_t i = 0; i < layer_dims.size() - 1; ++i)
     {
-        std::size_t in_dim = MNIST_LAYER_DIMS[i];
-        std::size_t out_dim = MNIST_LAYER_DIMS[i + 1];
-        
+        std::size_t in_dim  = layer_dims[i];
+        std::size_t out_dim = layer_dims[i + 1];
+
         model.add<Linear>(in_dim, out_dim);
-        
-        if (i < MNIST_LAYER_DIMS.size() - 2)
+
+        if (i < layer_dims.size() - 2)
         {
             model.add<LayerNorm>(out_dim)
                  .add<GeLU>();
@@ -48,23 +53,10 @@ inline constexpr std::size_t TRANSFORMER_PATCH_SIZE = 7;   // 28 / 7 = 4 → 4×
 }
 
 // ── 构建 Transformer 模型 (ViT-like) ──────────────────────────────────────
-// 架构: PatchEmbedding → TransformerEncoder → Linear(分类头)
-//
-// 输入: (784, batch) — 展平的 28×28 图像
-// PatchEmbedding: 28×28 → 16 个 7×7 patch → 投影到 d_model
-// TransformerEncoder: N 层 Self-Attention + FFN (Pre-Norm) + 位置编码 + 池化
-// 分类头: Linear(d_model → 10)
-//
-// 传播流程:
-//   (784, batch)
-//   → PatchEmbedding: (d_model×16, batch)
-//   → TransformerEncoder: (d_model, batch)
-//   → Linear: (10, batch)
-// ────────────────────────────────────────────────────────────────────────────
-[[nodiscard]] inline Model build_mnist_transformer_model(
-    std::size_t d_model   = TRANSFORMER_D_MODEL,
-    std::size_t num_heads = TRANSFORMER_NUM_HEADS,
-    std::size_t d_ff      = TRANSFORMER_D_FF,
+[[nodiscard]] inline Result<Model> build_mnist_transformer_model(
+    std::size_t d_model    = TRANSFORMER_D_MODEL,
+    std::size_t num_heads  = TRANSFORMER_NUM_HEADS,
+    std::size_t d_ff       = TRANSFORMER_D_FF,
     std::size_t num_layers = TRANSFORMER_NUM_LAYERS,
     std::size_t patch_size = TRANSFORMER_PATCH_SIZE)
 {
@@ -78,17 +70,37 @@ inline constexpr std::size_t TRANSFORMER_PATCH_SIZE = 7;   // 28 / 7 = 4 → 4×
     return model;
 }
 
-// ── 统一构建入口 ────────────────────────────────────────────────────────────
-// model_type: "mlp" 或 "transformer"
-[[nodiscard]] inline Model build_mnist_model(const std::string &model_type = "mlp")
+// ── 统一构建入口（字符串参数） ─────────────────────────────────────────────
+[[nodiscard]] inline Result<Model> build_mnist_model(const std::string &model_type = "mlp")
 {
     if (model_type == "mlp")
         return build_mnist_mlp_model();
     else if (model_type == "transformer")
         return build_mnist_transformer_model();
     else
-        throw std::invalid_argument("Unknown model type: " + model_type
-                                    + " (available: mlp, transformer)");
+        return std::unexpected(Error{"Unknown model type: " + model_type
+                                    + " (available: mlp, transformer)"});
+}
+
+// ── 从 ModelSpec 构建模型 ─────────────────────────────────────────────────
+// 用于从二进制文件加载时自动还原架构
+[[nodiscard]] inline Result<Model> build_mnist_model_from_spec(const ModelSpec &spec)
+{
+    if (spec.is_mlp())
+    {
+        return build_mnist_mlp_model(spec.layer_dims);
+    }
+    else if (spec.is_transformer())
+    {
+        return build_mnist_transformer_model(
+            spec.d_model, spec.num_heads, spec.d_ff,
+            spec.num_layers, spec.patch_size);
+    }
+    else
+    {
+        return std::unexpected(Error{
+            "Invalid ModelSpec type for MNIST: expected MLP or Transformer"});
+    }
 }
 
 } // namespace nn

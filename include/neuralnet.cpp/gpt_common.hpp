@@ -6,7 +6,7 @@
 #include <vector>
 #include <fstream>
 #include <sstream>
-#include <stdexcept>
+#include <expected>
 #include <algorithm>
 #include <unordered_map>
 #include <queue>
@@ -105,10 +105,10 @@ public:
     [[nodiscard]] const std::string &vocab_path() const noexcept { return vocab_path_; }
 
     // 加载词表 JSON（支持新格式: {"vocab": {"4": "hex", "5": "hex", ...}}）
-    void load_vocab(const std::string &path)
+    Result<void> load_vocab(const std::string &path)
     {
         std::ifstream ifs(path);
-        if (!ifs) throw std::runtime_error("Cannot read vocab file: " + path);
+        if (!ifs) return std::unexpected(Error{"Cannot read vocab file: " + path});
 
         std::string content((std::istreambuf_iterator<char>(ifs)),
                             std::istreambuf_iterator<char>());
@@ -119,11 +119,11 @@ public:
         // 找 "vocab" 对象
         auto vocab_pos = content.find("\"vocab\"");
         if (vocab_pos == std::string::npos)
-            throw std::runtime_error("Invalid vocab JSON: missing \"vocab\" key");
+            return std::unexpected(Error{"Invalid vocab JSON: missing \"vocab\" key"});
 
         auto brace_pos = content.find('{', vocab_pos);
         if (brace_pos == std::string::npos)
-            throw std::runtime_error("Invalid vocab JSON: missing opening brace");
+            return std::unexpected(Error{"Invalid vocab JSON: missing opening brace"});
 
         // 逐对解析
         std::size_t pos = brace_pos + 1;
@@ -227,6 +227,7 @@ public:
         }
 
         vocab_path_ = path;
+        return {};
     }
 
     // 编码：先按空格分词，逐词查表；未命中则逐字符兜底
@@ -294,11 +295,11 @@ public:
 };
 
 // ── 从文本文件加载语料 ────────────────────────────────────────────────────
-[[nodiscard]] inline std::string load_text_file(const std::string &path)
+[[nodiscard]] inline Result<std::string> load_text_file(const std::string &path)
 {
     std::ifstream ifs(path, std::ios::binary);
     if (!ifs)
-        throw std::runtime_error("Cannot open text file: " + path);
+        return std::unexpected(Error{"Cannot open text file: " + path});
     std::string content((std::istreambuf_iterator<char>(ifs)),
                         std::istreambuf_iterator<char>());
     return content;
@@ -317,6 +318,38 @@ public:
     Model model;
     model.add<GPTModel>(vocab_size, d_model, seq_len, num_heads, d_ff, num_layers);
     return model;
+}
+
+// ── 从 ModelSpec 构建 GPT 模型 ──────────────────────────────────────────
+// 用于从二进制文件加载时自动还原架构
+[[nodiscard]] inline Result<Model> build_gpt_model_from_spec(const ModelSpec &spec)
+{
+    if (!spec.is_gpt())
+        return std::unexpected(Error{"Invalid ModelSpec type for GPT: expected GPT"});
+
+    return build_gpt_model(
+        spec.vocab_size, spec.d_model, spec.seq_len,
+        spec.num_heads, spec.d_ff, spec.num_layers);
+}
+
+// ── 构造 GPT ModelSpec ──────────────────────────────────────────────────
+[[nodiscard]] inline ModelSpec make_gpt_spec(
+    std::size_t vocab_size,
+    std::size_t d_model,
+    std::size_t seq_len,
+    std::size_t num_heads,
+    std::size_t d_ff,
+    std::size_t num_layers)
+{
+    ModelSpec spec;
+    spec.type       = ModelType::GPT;
+    spec.vocab_size = vocab_size;
+    spec.d_model    = d_model;
+    spec.seq_len    = seq_len;
+    spec.num_heads  = num_heads;
+    spec.d_ff       = d_ff;
+    spec.num_layers = num_layers;
+    return spec;
 }
 
 } // namespace nn

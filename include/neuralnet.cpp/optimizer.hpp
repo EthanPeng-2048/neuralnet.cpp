@@ -2,7 +2,9 @@
 #define OPTIMIZER_HPP
 
 #include <cmath>
+#include <expected>
 #include <functional>
+#include <string>
 #include <vector>
 
 #include "matrix.hpp"
@@ -14,7 +16,7 @@ namespace nn
     {
     public:
         virtual ~Optimizer() = default;
-        virtual void step() = 0;
+        virtual Result<void> step() = 0;
         virtual void zero_grad() = 0;
     };
 
@@ -29,16 +31,14 @@ namespace nn
         SGD(std::vector<std::reference_wrapper<Matrix>> params,
             std::vector<std::reference_wrapper<Matrix>> grads,
             double lr)
-            : lr_(lr), params_(std::move(params)), grads_(std::move(grads))
+            : lr_(lr), params_(std::move(params)), grads_(std::move(grads)) {}
+
+        Result<void> step() override
         {
             if (params_.size() != grads_.size())
             {
-                throw std::invalid_argument("params and grads must have same size");
+                return std::unexpected(Error{"params and grads must have same size"});
             }
-        }
-
-        void step() override
-        {
             for (std::size_t i = 0; i < params_.size(); ++i)
             {
                 auto &p = params_[i].get();
@@ -51,6 +51,7 @@ namespace nn
                                    return p_val - lr_ * g_val;
                                });
             }
+            return {};
         }
 
         void zero_grad() override
@@ -78,10 +79,6 @@ namespace nn
                        double lr)
             : lr_(lr), params_(std::move(params)), grads_(std::move(grads))
         {
-            if (params_.size() != grads_.size())
-            {
-                throw std::invalid_argument("params and grads must have same size");
-            }
             velocities_.reserve(params_.size());
             for (const auto &p_ref : params_)
             {
@@ -90,8 +87,13 @@ namespace nn
             }
         }
 
-        void step() override
+        Result<void> step() override
         {
+            if (params_.size() != grads_.size())
+            {
+                return std::unexpected(Error{"params and grads must have same size"});
+            }
+
             for (std::size_t i = 0; i < params_.size(); ++i)
             {
                 auto &p = params_[i].get();
@@ -106,18 +108,20 @@ namespace nn
                 // 构造zip
                 auto zip_view = std::views::zip(p_vec, g_vec, v_vec);
 
-                // 并行处理，注意这里NN_EXEC_POLICY可能是par_unseq，要考虑乱序问题
+                // 并行处理：std::views::zip 将参数、梯度、速度打包为 tuple
+                // std::get<N> 按索引解包，顺序与 zip 传入顺序一致
                 SmartPolicy::for_each(zip_view.begin(),
                               zip_view.end(),
                               [this](auto &&tuple)
                               {
-                                  auto &p_val = std::get<0>(tuple);  // tuple是什么原理？
-                                  auto &g_val = std::get<1>(tuple);
-                                  auto &v_val = std::get<2>(tuple);
+                                  auto &p_val = std::get<0>(tuple);  // 参数
+                                  auto &g_val = std::get<1>(tuple);  // 梯度
+                                  auto &v_val = std::get<2>(tuple);  // 速度（动量）
                                   v_val = beta_ * v_val + (1 - beta_) * g_val;
                                   p_val = p_val - lr_ * v_val;
                               });
             }
+            return {};
         }
 
         void zero_grad() override
@@ -153,10 +157,6 @@ namespace nn
             : lr_(lr), params_(std::move(params)), grads_(std::move(grads)),
               beta1_(beta1), beta2_(beta2), eps_(eps), t_(0)
         {
-            if (params_.size() != grads_.size())
-            {
-                throw std::invalid_argument("params and grads must have same size");
-            }
             m_.reserve(params_.size());
             v_.reserve(params_.size());
             for (const auto &p_ref : params_)
@@ -167,8 +167,13 @@ namespace nn
             }
         }
 
-        void step() override
+        Result<void> step() override
         {
+            if (params_.size() != grads_.size())
+            {
+                return std::unexpected(Error{"params and grads must have same size"});
+            }
+
             ++t_;
             const double bc1 = 1.0 - std::pow(beta1_, static_cast<double>(t_)); // 偏差修正分母 (一阶)
             const double bc2 = 1.0 - std::pow(beta2_, static_cast<double>(t_)); // 偏差修正分母 (二阶)
@@ -209,6 +214,7 @@ namespace nn
                                   p_val = p_val - lr_ * m_hat / (std::sqrt(v_hat) + eps_);
                               });
             }
+            return {};
         }
 
         void zero_grad() override

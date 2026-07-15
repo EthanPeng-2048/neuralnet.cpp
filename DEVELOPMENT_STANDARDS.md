@@ -397,6 +397,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 | 特性 | 标准 | 用途 |
 |------|------|------|
+| `std::expected<T, E>` | C++23 | 所有 API 的错误传播，替代 throw/try/catch |
 | `std::span` | C++20 | 非拥有型连续内存视图，替代裸指针 |
 | `std::ranges` | C++20 | 数据处理管道（如 `ranges::generate` Xavier 初始化） |
 | `std::views::iota` | C++20 | 延迟整数序列（并行索引生成） |
@@ -469,24 +470,99 @@ const std::vector<int> &vec;  // ❌ 避免
 
 ## 🛡️ 错误处理规范
 
-### 1. 异常使用
+### 1. 使用 std::expected (C++23)
+
+**全项目禁止使用 throw/try/catch**，统一使用 C++23 的 `std::expected<T, E>` 进行错误传播。
+
+#### 基础类型定义（nn_config.hpp）
 
 ```cpp
-// ✅ 使用标准异常
-throw std::invalid_argument("Invalid matrix dimensions");
-throw std::out_of_range("Index out of bounds");
-throw std::runtime_error("Failed to open file");
-
-// ❌ 避免自定义异常类（除非有特殊需求）
+struct Error {
+    std::string message;
+};
+template <typename T>
+using Result = std::expected<T, Error>;
 ```
 
-### 2. 热路径中的异常
+#### 函数签名约定
 
 ```cpp
-// ✅ 热路径中标注 noexcept
+// ✅ 所有公共 API 使用 Result<T> 返回错误
+Result<Matrix> forward(const Matrix& input);
+Result<void> save_model(const std::string& path, Model& model);
+Result<ModelSpec> peek_model_spec(const std::string& path);
+
+// ❌ 禁止抛异常
+Matrix forward(const Matrix& input);  // 旧方式
+void save_model(...);                  // 旧方式
+```
+
+#### 错误返回模式
+
+```cpp
+// 返回错误
+return std::unexpected(Error{"Invalid matrix dimensions"});
+
+// 成功返回（隐式构造）
+return matrix;        // T 类型
+return {};            // void
+```
+
+#### 调用方检查模式
+
+```cpp
+// 模式 1：检查后使用
+auto result = model.forward(input);
+if (!result) {
+    std::cerr << "Error: " << result.error().message << '\n';
+    return 1;
+}
+auto output = *result;
+
+// 模式 2：链式传播（适用于中间层）
+auto r = layer.forward(input);
+if (!r) return std::unexpected(r.error());  // 向上传播
+return *r;
+```
+
+### 2. 构造函数中的验证
+
+构造函数不能返回 `std::expected`，使用以下策略：
+
+```cpp
+// 策略 1：工厂函数（推荐用于公共 API）
+class Layer {
+    [[nodiscard]] static Result<Layer> create(std::size_t in, std::size_t out) {
+        if (in == 0) return std::unexpected(Error{"in_features must be > 0"});
+        return Layer(in, out);
+    }
+};
+
+// 策略 2：延迟验证（适用于内部组件）
+class Optimizer {
+    Result<void> step(...) {
+        if (params_.size() != grads_.size())
+            return std::unexpected(Error{"params/grads size mismatch"});
+        // ... 实际更新逻辑
+        return {};
+    }
+};
+
+// 策略 3：assert（仅用于编程错误，debug 模式捕获）
+// 适用于运算符重载中不可能发生的维度不匹配
+assert(false && "matrix multiplication dimension mismatch");
+```
+
+### 3. 热路径中的错误处理
+
+```cpp
+// ✅ 热路径中标注 noexcept（不抛异常的函数）
 [[nodiscard]] double at_unchecked(std::size_t row, std::size_t col) const noexcept {
     return data_[index(row, col)];
 }
+
+// ✅ 使用 assert 检查编程错误（debug 模式有效，release 模式编译掉）
+assert(rows_ == other.rows() && "dimension mismatch");
 
 // ✅ 使用 if constexpr 在编译期分支
 if constexpr (std::is_same_v<Policy, SeqPolicy>) {
@@ -496,12 +572,14 @@ if constexpr (std::is_same_v<Policy, SeqPolicy>) {
 }
 ```
 
-### 3. 错误处理检查清单
+### 4. 错误处理检查清单
 
-- [ ] 是否使用标准异常类型？
+- [ ] 所有公共 API 是否使用 `Result<T>` 返回错误？
+- [ ] 是否禁止使用 throw/try/catch？
 - [ ] 热路径是否标注 noexcept？
-- [ ] 是否在适当位置进行参数验证？
-- [ ] 是否提供有意义的错误信息？
+- [ ] 构造函数验证是否使用工厂函数或延迟验证？
+- [ ] 错误信息是否清晰描述问题？
+- [ ] 调用方是否检查了 Result 返回值？
 
 ---
 
@@ -552,11 +630,12 @@ if constexpr (std::is_same_v<Policy, SeqPolicy>) {
 2. **模块化**：清晰的职责分离，简洁的接口设计
 3. **高性能**：预分配、缓存友好、并行化
 4. **现代化**：始终使用最新的 C++ 标准和特性
+5. **类型安全的错误处理**：使用 `std::expected<T, Error>` 替代异常，错误是类型签名的一部分
 
 遵循本规范将帮助团队构建高质量、可维护、高性能的 C++ 代码库。
 
 ---
 
-> 📅 最后更新：2026-07-12
+> 📅 最后更新：2026-07-15
 > 
 > 维护者：EthanPeng-2048 & AI

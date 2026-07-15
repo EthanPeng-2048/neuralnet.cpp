@@ -15,10 +15,11 @@ from pathlib import Path
 
 # ── 常量 ──────────────────────────────────────────────
 BUILD_DIR = Path(__file__).parent / "build"
-TRAIN_EXE = BUILD_DIR / "mnist_train.exe"
-INFER_EXE = BUILD_DIR / "mnist_infer.exe"
-TEXT_TRAIN_EXE = BUILD_DIR / "text_train.exe"
-TEXT_INFER_EXE = BUILD_DIR / "text_infer.exe"
+_EXE_SUFFIX = ".exe" if sys.platform == "win32" else ""
+TRAIN_EXE = BUILD_DIR / f"mnist_train{_EXE_SUFFIX}"
+INFER_EXE = BUILD_DIR / f"mnist_infer{_EXE_SUFFIX}"
+TEXT_TRAIN_EXE = BUILD_DIR / f"text_train{_EXE_SUFFIX}"
+TEXT_INFER_EXE = BUILD_DIR / f"text_infer{_EXE_SUFFIX}"
 DEFAULT_MODEL = Path(__file__).parent / "pretrained" / "model.bin"
 DEFAULT_GPT_MODEL = Path(__file__).parent / "gpt_model.bin"
 DEFAULT_DATASET = Path(__file__).parent / "datasets" / "mnist_data"

@@ -1,9 +1,11 @@
 #ifndef MODEL_HPP
 #define MODEL_HPP
 
+#include <cassert>
+#include <expected>
 #include <functional>
 #include <memory>
-#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "nn_config.hpp"
@@ -19,11 +21,11 @@ namespace nn
     public:
         Model() = default;
 
-        // 访问指定层（用于需要向下转型的场景，如 GPTModel::generate）
-        [[nodiscard]] Layer &layer_at(std::size_t index)
+        // 访问指定层（用于向下转型等场景）
+        // 使用 assert 保护边界，编程错误在 debug 模式捕获
+        [[nodiscard]] Layer &layer_at(std::size_t index) noexcept
         {
-            if (index >= layers_.size())
-                throw std::out_of_range("Model::layer_at index out of range");
+            assert(index < layers_.size() && "Model::layer_at index out of range");
             return *layers_[index];
         }
 
@@ -45,32 +47,40 @@ namespace nn
         [[nodiscard]] std::size_t num_layers() const noexcept { return layers_.size(); }
 
         // ── 前向传播 ────────────────────────────────────────────────────────
-        [[nodiscard]] Matrix forward(const Matrix &input)
+        [[nodiscard]] Result<Matrix> forward(const Matrix &input)
         {
             if (layers_.empty())
             {
-                throw std::runtime_error("Model has no layers");
+                return std::unexpected(Error{"Model has no layers"});
             }
-            Matrix out = layers_.front()->forward(input);
+            auto result = layers_.front()->forward(input);
+            if (!result) return std::unexpected(result.error());
+            Matrix out = std::move(*result);
             for (std::size_t i = 1; i < layers_.size(); ++i)
             {
-                out = layers_[i]->forward(out);
+                result = layers_[i]->forward(out);
+                if (!result) return std::unexpected(result.error());
+                out = std::move(*result);
             }
             return out;
         }
 
         // ── 反向传播 ────────────────────────────────────────────────────────
         // 传入 loss 对最后一层输出的梯度，返回对输入的梯度（通常不需要）
-        Matrix backward(const Matrix &grad_output)
+        [[nodiscard]] Result<Matrix> backward(const Matrix &grad_output)
         {
             if (layers_.empty())
             {
-                throw std::runtime_error("Model has no layers");
+                return std::unexpected(Error{"Model has no layers"});
             }
-            Matrix grad = layers_.back()->backward(grad_output);
+            auto result = layers_.back()->backward(grad_output);
+            if (!result) return std::unexpected(result.error());
+            Matrix grad = std::move(*result);
             for (std::size_t i = layers_.size() - 1; i-- > 0;)
             {
-                grad = layers_[i]->backward(grad);
+                result = layers_[i]->backward(grad);
+                if (!result) return std::unexpected(result.error());
+                grad = std::move(*result);
             }
             return grad;
         }

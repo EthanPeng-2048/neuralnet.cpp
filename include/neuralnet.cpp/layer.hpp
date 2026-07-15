@@ -11,7 +11,8 @@
 #include <random>
 #include <ranges>
 #include <span>
-#include <stdexcept>
+#include <expected>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -24,8 +25,8 @@ namespace nn
     {
     public:
         virtual ~Layer() = default;
-        virtual Matrix forward(const Matrix &input) = 0;
-        virtual Matrix backward(const Matrix &grad_output) = 0;
+        virtual Result<Matrix> forward(const Matrix &input) = 0;
+        virtual Result<Matrix> backward(const Matrix &grad_output) = 0;
         virtual std::vector<std::reference_wrapper<Matrix>> parameters() { return {}; }
         virtual std::vector<std::reference_wrapper<Matrix>> param_gradients() { return {}; }
     };
@@ -73,10 +74,10 @@ namespace nn
             return {std::ref(grad_W_), std::ref(grad_b_)};
         }
 
-        Matrix forward(const Matrix &input) override
+        Result<Matrix> forward(const Matrix &input) override
         {
             if (input.rows() != W_.cols())
-                throw std::invalid_argument("linear forward input shape mismatch");
+                return std::unexpected(Error{"linear forward input shape mismatch"});
 
             input_cache_ = input;
 
@@ -104,12 +105,12 @@ namespace nn
             return result;
         }
 
-        Matrix backward(const Matrix &grad_output) override
+        Result<Matrix> backward(const Matrix &grad_output) override
         {
             if (grad_output.rows() != W_.rows())
-                throw std::invalid_argument("linear backward grad_output shape mismatch");
+                return std::unexpected(Error{"linear backward grad_output shape mismatch"});
             if (input_cache_.rows() != W_.cols() || input_cache_.cols() != grad_output.cols())
-                throw std::invalid_argument("linear backward cache/input shape mismatch");
+                return std::unexpected(Error{"linear backward cache/input shape mismatch"});
 
             const std::size_t in_feat = W_.cols();
             const std::size_t out_feat = W_.rows();
@@ -165,7 +166,7 @@ namespace nn
     public:
         ReLU() = default;
 
-        Matrix forward(const Matrix &input) override
+        Result<Matrix> forward(const Matrix &input) override
         {
             input_cache_ = input;
 
@@ -187,10 +188,10 @@ namespace nn
             return result;
         }
 
-        Matrix backward(const Matrix &grad_output) override
+        Result<Matrix> backward(const Matrix &grad_output) override
         {
             if (input_cache_.rows() != grad_output.rows() || input_cache_.cols() != grad_output.cols())
-                throw std::invalid_argument("relu backward shape mismatch");
+                return std::unexpected(Error{"relu backward shape mismatch"});
 
             const auto in_span = input_cache_.span();
             const auto go_span = grad_output.span();
@@ -223,7 +224,7 @@ namespace nn
         GeLU() = default;
 
         // QuickGeLU: x * sigmoid(1.702 * x)
-        Matrix forward(const Matrix &input) override
+        Result<Matrix> forward(const Matrix &input) override
         {
             const auto n = input.size();
             input_cache_ = input;
@@ -258,10 +259,10 @@ namespace nn
 
         // d/dx [x * sigmoid(βx)] = sigmoid(βx) + x * β * sigmoid(βx) * (1 - sigmoid(βx))
         //                        = sigmoid(βx) * [1 + βx * (1 - sigmoid(βx))]
-        Matrix backward(const Matrix &grad_output) override
+        Result<Matrix> backward(const Matrix &grad_output) override
         {
             if (input_cache_.rows() != grad_output.rows() || input_cache_.cols() != grad_output.cols())
-                throw std::invalid_argument("gelu backward shape mismatch");
+                return std::unexpected(Error{"gelu backward shape mismatch"});
 
             const auto in_span = input_cache_.span();
             const auto sig_span = sigmoid_cache_.span();
@@ -332,11 +333,11 @@ namespace nn
             return {std::ref(grad_gamma_), std::ref(grad_beta_)};
         }
 
-        Matrix forward(const Matrix &input) override
+        Result<Matrix> forward(const Matrix &input) override
         {
             // 输入形状: (normalized_shape_, batch_size)
             if (input.rows() != normalized_shape_)
-                throw std::invalid_argument("layer_norm forward input shape mismatch");
+                return std::unexpected(Error{"layer_norm forward input shape mismatch"});
 
             input_cache_ = input;
             const std::size_t batch_size = input.cols();
@@ -420,10 +421,10 @@ namespace nn
             return result;
         }
 
-        Matrix backward(const Matrix &grad_output) override
+        Result<Matrix> backward(const Matrix &grad_output) override
         {
             if (grad_output.rows() != normalized_shape_)
-                throw std::invalid_argument("layer_norm backward shape mismatch");
+                return std::unexpected(Error{"layer_norm backward shape mismatch"});
 
             const std::size_t features = normalized_shape_;
             const std::size_t batch_size = grad_output.cols();
@@ -517,7 +518,7 @@ namespace nn
     public:
         Softmax() = default;
 
-        Matrix forward(const Matrix &input) override
+        Result<Matrix> forward(const Matrix &input) override
         {
             const std::size_t rows = input.rows();
             const std::size_t cols = input.cols();
@@ -571,13 +572,13 @@ namespace nn
             return result;
         }
 
-        Matrix backward(const Matrix &grad_output) override
+        Result<Matrix> backward(const Matrix &grad_output) override
         {
             const std::size_t rows = output_cache_.rows();
             const std::size_t cols = output_cache_.cols();
 
             if (grad_output.rows() != rows || grad_output.cols() != cols)
-                throw std::invalid_argument("softmax backward shape mismatch");
+                return std::unexpected(Error{"softmax backward shape mismatch"});
 
             Matrix grad_input(rows, cols);
 
@@ -710,7 +711,7 @@ namespace nn
               W_o_(d_model, d_model)
         {
             if (d_model % num_heads != 0)
-                throw std::invalid_argument("MultiHeadAttention: d_model must be divisible by num_heads");
+                assert(false && "MultiHeadAttention: d_model must be divisible by num_heads"); // NOLINT
         }
 
         std::vector<std::reference_wrapper<Matrix>> parameters() override
@@ -737,17 +738,23 @@ namespace nn
             return grads;
         }
 
-        Matrix forward(const Matrix &input) override
+        Result<Matrix> forward(const Matrix &input) override
         {
             if (input.rows() != d_model_)
-                throw std::invalid_argument("MultiHeadAttention forward input shape mismatch");
+                return std::unexpected(Error{"MultiHeadAttention forward input shape mismatch"});
 
             const std::size_t seq_len = input.cols();
 
             // ── 1. 线性投影 Q, K, V ──────────────────────────────────────
-            Q_cache_ = W_q_.forward(input);
-            K_cache_ = W_k_.forward(input);
-            V_cache_ = W_v_.forward(input);
+            auto q_res = W_q_.forward(input);
+            if (!q_res) return q_res;
+            Q_cache_ = *q_res;
+            auto k_res = W_k_.forward(input);
+            if (!k_res) return k_res;
+            K_cache_ = *k_res;
+            auto v_res = W_v_.forward(input);
+            if (!v_res) return v_res;
+            V_cache_ = *v_res;
 
             // ── 2. 分配 per-head 缓冲区 ──────────────────────────────────
             Q_heads_.resize(num_heads_);
@@ -775,7 +782,9 @@ namespace nn
                 scale_inplace(attn_[h], scale_);
 
                 // A_h = softmax(S_h) — 按行 softmax（复用成员 softmax_）
-                attn_[h] = softmax_.forward(attn_[h]);
+                auto sm_res = softmax_.forward(attn_[h]);
+                if (!sm_res) return sm_res;
+                attn_[h] = *sm_res;
 
                 // O_h = V_h @ A_h → (d_k_, seq_len)，缓存到 O_heads_
                 O_heads_[h].resize(d_k_, seq_len);
@@ -787,15 +796,19 @@ namespace nn
             for (std::size_t h = 0; h < num_heads_; ++h)
                 insert_rows(output, h * d_k_, O_heads_[h]);
 
-            return W_o_.forward(output);
+            auto wo_res = W_o_.forward(output);
+            if (!wo_res) return wo_res;
+            return *wo_res;
         }
 
-        Matrix backward(const Matrix &grad_output) override
+        Result<Matrix> backward(const Matrix &grad_output) override
         {
             const std::size_t seq_len = grad_output.cols();
 
             // ── 1. 输出投影反向 ──────────────────────────────────────────
-            Matrix grad_concat = W_o_.backward(grad_output);  // (d_model, seq_len)
+            auto gc_res = W_o_.backward(grad_output);
+            if (!gc_res) return gc_res;
+            Matrix grad_concat = *gc_res;  // (d_model, seq_len)
 
             // ── 2. 初始化各头梯度累加矩阵 ────────────────────────────────
             Matrix grad_Q_all(d_model_, seq_len);
@@ -865,9 +878,15 @@ namespace nn
             }
 
             // ── 4. 投影层反向，累加输入梯度 ──────────────────────────────
-            Matrix grad_input = W_q_.backward(grad_Q_all);
-            grad_input = grad_input + W_k_.backward(grad_K_all);
-            grad_input = grad_input + W_v_.backward(grad_V_all);
+            auto giq_res = W_q_.backward(grad_Q_all);
+            if (!giq_res) return giq_res;
+            Matrix grad_input = *giq_res;
+            auto gik_res = W_k_.backward(grad_K_all);
+            if (!gik_res) return gik_res;
+            grad_input = grad_input + *gik_res;
+            auto giv_res = W_v_.backward(grad_V_all);
+            if (!giv_res) return giv_res;
+            grad_input = grad_input + *giv_res;
 
             return grad_input;
         }
@@ -926,15 +945,15 @@ namespace nn
         std::vector<std::reference_wrapper<Matrix>> parameters() override { return {}; }
         std::vector<std::reference_wrapper<Matrix>> param_gradients() override { return {}; }
 
-        Matrix forward(const Matrix &input) override
+        Result<Matrix> forward(const Matrix &input) override
         {
             if (input.rows() != d_model_)
-                throw std::invalid_argument("positional encoding forward: d_model mismatch");
+                return std::unexpected(Error{"positional encoding forward: d_model mismatch"});
 
             const std::size_t seq_len = input.cols();
 
             if (seq_len > max_len_)
-                throw std::invalid_argument("positional encoding forward: sequence length exceeds max_len");
+                return std::unexpected(Error{"positional encoding forward: sequence length exceeds max_len"});
 
             // result = input + encoding[:, 0:seq_len]
             Matrix result(d_model_, seq_len);
@@ -958,7 +977,7 @@ namespace nn
         }
 
         // 位置编码为固定值，梯度直接穿透
-        Matrix backward(const Matrix &grad_output) override { return grad_output; }
+        Result<Matrix> backward(const Matrix &grad_output) override { return grad_output; }
     };
 
     // ── 前馈网络 (Feed-Forward Network) ────────────────────────────────
@@ -993,18 +1012,27 @@ namespace nn
             return grads;
         }
 
-        Matrix forward(const Matrix &input) override
+        Result<Matrix> forward(const Matrix &input) override
         {
             input_cache_ = input;
-            auto x = activation_.forward(fc1_.forward(input));
-            return fc2_.forward(x);
+            auto fc1_res = fc1_.forward(input);
+            if (!fc1_res) return fc1_res;
+            auto act_res = activation_.forward(*fc1_res);
+            if (!act_res) return act_res;
+            auto fc2_res = fc2_.forward(*act_res);
+            if (!fc2_res) return fc2_res;
+            return *fc2_res;
         }
 
-        Matrix backward(const Matrix &grad_output) override
+        Result<Matrix> backward(const Matrix &grad_output) override
         {
-            auto grad = fc2_.backward(grad_output);
-            grad = activation_.backward(grad);
-            return fc1_.backward(grad);
+            auto b_fc2 = fc2_.backward(grad_output);
+            if (!b_fc2) return b_fc2;
+            auto b_act = activation_.backward(*b_fc2);
+            if (!b_act) return b_act;
+            auto b_fc1 = fc1_.backward(*b_act);
+            if (!b_fc1) return b_fc1;
+            return *b_fc1;
         }
     };
 
@@ -1056,21 +1084,25 @@ namespace nn
             return grads;
         }
 
-        Matrix forward(const Matrix &input) override
+        Result<Matrix> forward(const Matrix &input) override
         {
             // 子层1: Self-Attention + 残差
             residual1_cache_ = input;
-            auto norm1_out = norm1_.forward(input);
-            auto attn_out  = self_attn_.forward(norm1_out);
-            residual2_cache_ = input + attn_out;  // 残差连接
+            auto n1_res = norm1_.forward(input);
+            if (!n1_res) return n1_res;
+            auto sa_res = self_attn_.forward(*n1_res);
+            if (!sa_res) return sa_res;
+            residual2_cache_ = input + *sa_res;  // 残差连接
 
             // 子层2: FFN + 残差
-            auto norm2_out = norm2_.forward(residual2_cache_);
-            auto ff_out    = ff_.forward(norm2_out);
-            return residual2_cache_ + ff_out;
+            auto n2_res = norm2_.forward(residual2_cache_);
+            if (!n2_res) return n2_res;
+            auto ff_res = ff_.forward(*n2_res);
+            if (!ff_res) return ff_res;
+            return residual2_cache_ + *ff_res;
         }
 
-        Matrix backward(const Matrix &grad_output) override
+        Result<Matrix> backward(const Matrix &grad_output) override
         {
             // ── 反向传播第2个残差连接: grad_r2 = grad_output (分流到两条路径) ──
             //   路径A: 直接流向 residual2 (= residual1)
@@ -1079,8 +1111,11 @@ namespace nn
             Matrix grad_ff_out    = grad_output;   // 路径B
 
             // 反向 FFN → LayerNorm₂
-            auto grad_norm2 = ff_.backward(grad_ff_out);
-            grad_residual1 = grad_residual1 + norm2_.backward(grad_norm2);
+            auto b_ff = ff_.backward(grad_ff_out);
+            if (!b_ff) return b_ff;
+            auto b_n2 = norm2_.backward(*b_ff);
+            if (!b_n2) return b_n2;
+            grad_residual1 = grad_residual1 + *b_n2;
 
             // ── 反向传播第1个残差连接 ──
             //   路径A: 直接流向输入 x
@@ -1089,8 +1124,11 @@ namespace nn
             Matrix grad_attn_out = grad_residual1; // 路径B
 
             // 反向 Self-Attention → LayerNorm₁
-            auto grad_norm1 = self_attn_.backward(grad_attn_out);
-            grad_input = grad_input + norm1_.backward(grad_norm1);
+            auto b_sa = self_attn_.backward(grad_attn_out);
+            if (!b_sa) return b_sa;
+            auto b_n1 = norm1_.backward(*b_sa);
+            if (!b_n1) return b_n1;
+            grad_input = grad_input + *b_n1;
 
             return grad_input;
         }
@@ -1150,7 +1188,7 @@ namespace nn
         }
 
         // ── 前向传播 ────────────────────────────────────────────────────
-        Matrix forward(const Matrix &input) override
+        Result<Matrix> forward(const Matrix &input) override
         {
             batch_size_ = input.cols();
             stored_inputs_.resize(batch_size_);
@@ -1167,14 +1205,20 @@ namespace nn
                             input.at_unchecked(r * num_patches_ + c, b));
 
                 // 添加位置编码
-                x = pos_encoding_.forward(x);
+                auto pe_res = pos_encoding_.forward(x);
+                if (!pe_res) return pe_res;
+                x = *pe_res;
 
                 // 缓存 PE 后的输入，供 backward 中 re-forward 重建缓存
                 stored_inputs_[b] = x;
 
                 // 依次通过编码器层
                 for (std::size_t l = 0; l < layers_.size(); ++l)
-                    x = layers_[l].forward(x);
+                {
+                    auto ly_res = layers_[l].forward(x);
+                    if (!ly_res) return ly_res;
+                    x = *ly_res;
+                }
 
                 // 全局平均池化: (d_model, num_patches) → (d_model,)
                 const double inv_n = 1.0 / static_cast<double>(num_patches_);
@@ -1191,7 +1235,7 @@ namespace nn
 
         // ── 反向传播 ────────────────────────────────────────────────────
         // 对每个样本: re-forward 重建缓存 → 反向传播 → 累加参数梯度
-        Matrix backward(const Matrix &grad_output) override
+        Result<Matrix> backward(const Matrix &grad_output) override
         {
             Matrix grad_input(d_model_ * num_patches_, batch_size_);
             grad_input.zero();
@@ -1202,7 +1246,11 @@ namespace nn
                 // stored_inputs_[b] 已含位置编码，无需重复施加
                 Matrix x = stored_inputs_[b];
                 for (std::size_t l = 0; l < layers_.size(); ++l)
-                    x = layers_[l].forward(x);    // 重建每层缓存
+                {
+                    auto ly_res = layers_[l].forward(x);    // 重建每层缓存
+                    if (!ly_res) return ly_res;
+                    x = *ly_res;
+                }
 
                 // ── 全局平均池化梯度: 展开 ──
                 const double inv_n = 1.0 / static_cast<double>(num_patches_);
@@ -1216,7 +1264,11 @@ namespace nn
 
                 // ── 反向传播编码器层 ──
                 for (int l = static_cast<int>(layers_.size()) - 1; l >= 0; --l)
-                    grad = layers_[l].backward(grad);
+                {
+                    auto bl_res = layers_[l].backward(grad);
+                    if (!bl_res) return bl_res;
+                    grad = *bl_res;
+                }
 
                 // ── 写入 grad_input ──
                 for (std::size_t r = 0; r < d_model_; ++r)
@@ -1255,8 +1307,7 @@ namespace nn
               projection_(patch_dim_, d_model)
         {
             if (img_size % patch_size != 0)
-                throw std::invalid_argument(
-                    "PatchEmbedding: img_size must be divisible by patch_size");
+                assert(false && "PatchEmbedding: img_size must be divisible by patch_size"); // NOLINT
         }
 
         [[nodiscard]] std::size_t num_patches() const noexcept { return num_patches_; }
@@ -1274,7 +1325,7 @@ namespace nn
 
         // ── 前向传播 ────────────────────────────────────────────────────
         // 批量提取 patch 并一次性投影
-        Matrix forward(const Matrix &input) override
+        Result<Matrix> forward(const Matrix &input) override
         {
             input_cache_ = input;
             const std::size_t batch = input.cols();
@@ -1305,7 +1356,9 @@ namespace nn
             }
 
             // Step 2: 投影 → (d_model, num_patches × batch)
-            Matrix projected = projection_.forward(all_patches);
+            auto proj_res = projection_.forward(all_patches);
+            if (!proj_res) return proj_res;
+            Matrix projected = *proj_res;
 
             // Step 3: 重排为 (d_model × num_patches, batch)
             Matrix output(d_model_ * num_patches_, batch);
@@ -1319,7 +1372,7 @@ namespace nn
         }
 
         // ── 反向传播 ────────────────────────────────────────────────────
-        Matrix backward(const Matrix &grad_output) override
+        Result<Matrix> backward(const Matrix &grad_output) override
         {
             const std::size_t batch = grad_output.cols();
 
@@ -1332,7 +1385,9 @@ namespace nn
                             grad_output.at_unchecked(r * num_patches_ + p, b));
 
             // Step 2: 投影层反向 → (patch_dim, num_patches × batch)
-            Matrix grad_patches = projection_.backward(grad_projected);
+            auto bp_res = projection_.backward(grad_projected);
+            if (!bp_res) return bp_res;
+            Matrix grad_patches = *bp_res;
 
             // Step 3: 散射梯度回输入 → (img_size², batch)
             Matrix grad_input(img_size_ * img_size_, batch);
@@ -1458,8 +1513,7 @@ namespace nn
               mask_data_(max_len * max_len, 0.0)
         {
             if (d_model % num_heads != 0)
-                throw std::invalid_argument(
-                    "CausalSelfAttention: d_model must be divisible by num_heads");
+                assert(false && "CausalSelfAttention: d_model must be divisible by num_heads"); // NOLINT
 
             // 预计算因果掩码: mask[i][j] = 0 if j <= i else -inf
             const double neg_inf = -1e30;
@@ -1492,18 +1546,23 @@ namespace nn
             return grads;
         }
 
-        Matrix forward(const Matrix &input) override
+        Result<Matrix> forward(const Matrix &input) override
         {
             if (input.rows() != d_model_)
-                throw std::invalid_argument(
-                    "CausalSelfAttention forward input shape mismatch");
+                return std::unexpected(Error{"CausalSelfAttention forward input shape mismatch"});
 
             const std::size_t seq_len = input.cols();
 
             // 1. 线性投影
-            Q_cache_ = W_q_.forward(input);
-            K_cache_ = W_k_.forward(input);
-            V_cache_ = W_v_.forward(input);
+            auto q_res = W_q_.forward(input);
+            if (!q_res) return q_res;
+            Q_cache_ = *q_res;
+            auto k_res = W_k_.forward(input);
+            if (!k_res) return k_res;
+            K_cache_ = *k_res;
+            auto v_res = W_v_.forward(input);
+            if (!v_res) return v_res;
+            V_cache_ = *v_res;
 
             // 2. 分配 per-head 缓冲区
             Q_heads_.resize(num_heads_);
@@ -1539,7 +1598,9 @@ namespace nn
                 scale_inplace(attn_[h], scale_);
 
                 // softmax
-                attn_[h] = softmax_.forward(attn_[h]);
+                auto sm_res = softmax_.forward(attn_[h]);
+                if (!sm_res) return sm_res;
+                attn_[h] = *sm_res;
 
                 // O_h = V_h @ A_h
                 O_heads_[h].resize(d_k_, seq_len);
@@ -1551,15 +1612,19 @@ namespace nn
             for (std::size_t h = 0; h < num_heads_; ++h)
                 insert_rows(output, h * d_k_, O_heads_[h]);
 
-            return W_o_.forward(output);
+            auto wo_res = W_o_.forward(output);
+            if (!wo_res) return wo_res;
+            return *wo_res;
         }
 
-        Matrix backward(const Matrix &grad_output) override
+        Result<Matrix> backward(const Matrix &grad_output) override
         {
             const std::size_t seq_len = grad_output.cols();
 
             // 1. 输出投影反向
-            Matrix grad_concat = W_o_.backward(grad_output);
+            auto gc_res = W_o_.backward(grad_output);
+            if (!gc_res) return gc_res;
+            Matrix grad_concat = *gc_res;
 
             // 2. 初始化全局梯度
             Matrix grad_Q_all(d_model_, seq_len);
@@ -1625,9 +1690,15 @@ namespace nn
             }
 
             // 4. 投影层反向
-            Matrix grad_input = W_q_.backward(grad_Q_all);
-            grad_input = grad_input + W_k_.backward(grad_K_all);
-            grad_input = grad_input + W_v_.backward(grad_V_all);
+            auto giq_res = W_q_.backward(grad_Q_all);
+            if (!giq_res) return giq_res;
+            Matrix grad_input = *giq_res;
+            auto gik_res = W_k_.backward(grad_K_all);
+            if (!gik_res) return gik_res;
+            grad_input = grad_input + *gik_res;
+            auto giv_res = W_v_.backward(grad_V_all);
+            if (!giv_res) return giv_res;
+            grad_input = grad_input + *giv_res;
 
             return grad_input;
         }
@@ -1681,33 +1752,43 @@ namespace nn
             return grads;
         }
 
-        Matrix forward(const Matrix &input) override
+        Result<Matrix> forward(const Matrix &input) override
         {
             // 子层1: CausalSelfAttention + 残差
             residual1_cache_ = input;
-            auto norm1_out = norm1_.forward(input);
-            auto attn_out  = self_attn_.forward(norm1_out);
-            residual2_cache_ = input + attn_out;
+            auto n1_res = norm1_.forward(input);
+            if (!n1_res) return n1_res;
+            auto sa_res = self_attn_.forward(*n1_res);
+            if (!sa_res) return sa_res;
+            residual2_cache_ = input + *sa_res;
 
             // 子层2: FFN + 残差
-            auto norm2_out = norm2_.forward(residual2_cache_);
-            auto ff_out    = ff_.forward(norm2_out);
-            return residual2_cache_ + ff_out;
+            auto n2_res = norm2_.forward(residual2_cache_);
+            if (!n2_res) return n2_res;
+            auto ff_res = ff_.forward(*n2_res);
+            if (!ff_res) return ff_res;
+            return residual2_cache_ + *ff_res;
         }
 
-        Matrix backward(const Matrix &grad_output) override
+        Result<Matrix> backward(const Matrix &grad_output) override
         {
             Matrix grad_residual1 = grad_output;
             Matrix grad_ff_out    = grad_output;
 
-            auto grad_norm2 = ff_.backward(grad_ff_out);
-            grad_residual1 = grad_residual1 + norm2_.backward(grad_norm2);
+            auto b_ff = ff_.backward(grad_ff_out);
+            if (!b_ff) return b_ff;
+            auto b_n2 = norm2_.backward(*b_ff);
+            if (!b_n2) return b_n2;
+            grad_residual1 = grad_residual1 + *b_n2;
 
             Matrix grad_input = grad_residual1;
             Matrix grad_attn_out = grad_residual1;
 
-            auto grad_norm1 = self_attn_.backward(grad_attn_out);
-            grad_input = grad_input + norm1_.backward(grad_norm1);
+            auto b_sa = self_attn_.backward(grad_attn_out);
+            if (!b_sa) return b_sa;
+            auto b_n1 = norm1_.backward(*b_sa);
+            if (!b_n1) return b_n1;
+            grad_input = grad_input + *b_n1;
 
             return grad_input;
         }
@@ -1821,7 +1902,7 @@ namespace nn
 
         // ── 前向传播 ────────────────────────────────────────────────
         // input: (seq_len, batch_size) — token IDs 作为 double
-        Matrix forward(const Matrix &input) override
+        Result<Matrix> forward(const Matrix &input) override
         {
             const std::size_t seq_len = input.rows();
             batch_size_ = input.cols();
@@ -1861,21 +1942,29 @@ namespace nn
 
                 // 2. 通过 Transformer 块
                 for (std::size_t l = 0; l < blocks_.size(); ++l)
-                    x = blocks_[l].forward(x);
+                {
+                    auto blk_res = blocks_[l].forward(x);
+                    if (!blk_res) return blk_res;
+                    x = *blk_res;
+                }
 
                 // 3. 最终 LayerNorm
-                x = ln_f_.forward(x);
+                auto ln_res = ln_f_.forward(x);
+                if (!ln_res) return ln_res;
+                x = *ln_res;
 
                 // 4. LM Head: (d_model, seq_len) → (vocab_size, seq_len)
-                Matrix logits = lm_head_.forward(x);
+                auto lm_res = lm_head_.forward(x);
+                if (!lm_res) return lm_res;
+                Matrix logits = *lm_res;
 
                 // 5. 写入输出 (vocab_size, seq_len × batch)
                 //    布局: 列 t * batch_size + b 对应样本 b 的位置 t
                 auto log_span = logits.span();
-                auto out_span = output.span();
+                auto out_span2 = output.span();
                 for (std::size_t r = 0; r < vocab_size_; ++r)
                     for (std::size_t t = 0; t < seq_len; ++t)
-                        out_span[r * (seq_len * batch_size_) + t * batch_size_ + b] =
+                        out_span2[r * (seq_len * batch_size_) + t * batch_size_ + b] =
                             log_span[r * seq_len + t];
             }
 
@@ -1884,7 +1973,7 @@ namespace nn
 
         // ── 反向传播 ────────────────────────────────────────────────
         // grad_output: (vocab_size, seq_len × batch_size)
-        Matrix backward(const Matrix &grad_output) override
+        Result<Matrix> backward(const Matrix &grad_output) override
         {
             const std::size_t seq_len = seq_len_;
             grad_token_emb_.zero();
@@ -1907,18 +1996,32 @@ namespace nn
                 // Re-forward 重建缓存
                 Matrix x = stored_inputs_[b];
                 for (std::size_t l = 0; l < blocks_.size(); ++l)
-                    x = blocks_[l].forward(x);
-                x = ln_f_.forward(x);
+                {
+                    auto blk_res = blocks_[l].forward(x);
+                    if (!blk_res) return blk_res;
+                    x = *blk_res;
+                }
+                auto ln_fwd = ln_f_.forward(x);
+                if (!ln_fwd) return ln_fwd;
+                x = *ln_fwd;
 
                 // LM Head 反向 → (d_model, seq_len)
-                Matrix grad_ln = lm_head_.backward(grad_logits);
+                auto b_lm = lm_head_.backward(grad_logits);
+                if (!b_lm) return b_lm;
+                Matrix grad_ln = *b_lm;
 
                 // LayerNorm 反向
-                grad_ln = ln_f_.backward(grad_ln);
+                auto b_ln = ln_f_.backward(grad_ln);
+                if (!b_ln) return b_ln;
+                grad_ln = *b_ln;
 
                 // 逐块反向
                 for (int l = static_cast<int>(blocks_.size()) - 1; l >= 0; --l)
-                    grad_ln = blocks_[l].backward(grad_ln);
+                {
+                    auto b_blk = blocks_[l].backward(grad_ln);
+                    if (!b_blk) return b_blk;
+                    grad_ln = *b_blk;
+                }
 
                 // 累加嵌入梯度
                 const auto tokens = stored_tokens_[b];
@@ -1966,7 +2069,9 @@ namespace nn
                     input.set_value_unchecked(t, 0,
                         static_cast<double>(context[start + t]));
 
-                auto logits = forward(input); // (vocab_size, cur_len)
+                auto logits_res = forward(input); // (vocab_size, cur_len)
+                if (!logits_res) break;  // 生成中出错则提前终止
+                auto logits = *logits_res;
 
                 // 取最后一个位置的 logits
                 std::vector<double> last_logits(vocab_size_);

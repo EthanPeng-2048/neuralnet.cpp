@@ -4,8 +4,9 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <expected>
 #include <span>
-#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "nn_config.hpp"
@@ -17,7 +18,7 @@ namespace nn
     {
     public:
         virtual ~Loss() = default;
-        virtual double forward(const Matrix &pred, const Matrix &target) = 0;
+        virtual std::expected<double, Error> forward(const Matrix &pred, const Matrix &target) = 0;
         virtual const Matrix &backward() const = 0;
     };
 
@@ -29,15 +30,15 @@ namespace nn
     public:
         MSELoss() = default;
 
-        [[nodiscard]] double forward(const Matrix &pred, const Matrix &target)
+        [[nodiscard]] std::expected<double, Error> forward(const Matrix &pred, const Matrix &target)
         {
             if (pred.rows() != target.rows() || pred.cols() != target.cols())
             {
-                throw std::invalid_argument("mse loss shape mismatch");
+                return std::unexpected(Error{"mse loss shape mismatch"});
             }
             if (pred.empty())
             {
-                throw std::invalid_argument("mse loss cannot be computed on an empty matrix");
+                return std::unexpected(Error{"mse loss cannot be computed on an empty matrix"});
             }
 
             grad_input_.resize(pred.rows(), pred.cols());
@@ -79,7 +80,7 @@ namespace nn
     public:
         CrossEntropyLoss() = default;
 
-        [[nodiscard]] double forward(const Matrix &logits, const Matrix &target_onehot)
+        [[nodiscard]] std::expected<double, Error> forward(const Matrix &logits, const Matrix &target_onehot)
         {
             const std::size_t classes = logits.rows();
             const std::size_t batch = logits.cols();
