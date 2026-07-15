@@ -36,6 +36,7 @@ void print_usage(const char *prog)
         << "  --num-heads <n>    注意力头数 (默认: 4)\n"
         << "  --num-layers <n>   Transformer 层数 (默认: 4)\n"
         << "  --d-ff <n>         FFN 中间维度 (默认: 512)\n"
+        << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
         << "  --help             显示此帮助信息\n";
 }
 
@@ -55,6 +56,7 @@ struct TrainConfig
     std::size_t num_layers = nn::GPT_NUM_LAYERS;
     std::size_t d_ff = nn::GPT_D_FF;
     bool load_existing = false;
+    bool gpu = false;
 };
 
 TrainConfig parse_args(int argc, char *argv[])
@@ -102,6 +104,8 @@ TrainConfig parse_args(int argc, char *argv[])
             cfg.num_layers = static_cast<std::size_t>(std::stoi(argv[++i]));
         else if (arg == "--d-ff" && i + 1 < argc)
             cfg.d_ff = static_cast<std::size_t>(std::stoi(argv[++i]));
+        else if (arg == "--gpu")
+            cfg.gpu = true;
         else if (!arg.starts_with("--"))
             cfg.text_path = arg;
         else
@@ -140,6 +144,21 @@ int main(int argc, char *argv[])
     try
     {
         TrainConfig cfg = parse_args(argc, argv);
+
+#ifdef NN_HAS_VULKAN
+        if (cfg.gpu)
+        {
+            auto& backend = nn::GpuBackend::instance();
+            auto init = backend.initialize();
+            if (init)
+            {
+                nn::SmartPolicy::gpu_enabled = true;
+                std::cout << "[GPU] 加速已启用 (Vulkan compute)\n";
+            }
+            else
+                std::cerr << "[GPU] 初始化失败: " << init.error().message << "，回退 CPU。\n";
+        }
+#endif
 
         // ── 加载文本 ─────────────────────────────────────────────
         std::cout << "加载文本: " << cfg.text_path << " ..." << std::endl;

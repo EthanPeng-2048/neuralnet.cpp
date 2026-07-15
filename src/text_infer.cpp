@@ -28,6 +28,7 @@ void print_usage(const char *prog)
         << "  --d-ff <n>         FFN 维度 (默认: 512)\n"
         << "  --seq-len <n>      序列长度 (默认: 256)\n"
         << "  --show-tokens      显示 token ID (调试用)\n"
+        << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
         << "  --help             显示此帮助信息\n";
 }
 
@@ -40,6 +41,7 @@ struct InferConfig
     double temperature = 1.0;
     bool interactive = false;
     bool show_tokens = false;
+    bool gpu = false;
     std::size_t d_model = nn::GPT_D_MODEL;
     std::size_t num_heads = nn::GPT_NUM_HEADS;
     std::size_t num_layers = nn::GPT_NUM_LAYERS;
@@ -70,6 +72,8 @@ InferConfig parse_args(int argc, char *argv[])
             cfg.temperature = std::stod(argv[++i]);
         else if (arg == "--show-tokens")
             cfg.show_tokens = true;
+        else if (arg == "--gpu")
+            cfg.gpu = true;
         else if (arg == "--d-model" && i + 1 < argc)
             cfg.d_model = static_cast<std::size_t>(std::stoi(argv[++i]));
         else if (arg == "--num-heads" && i + 1 < argc)
@@ -161,6 +165,21 @@ int main(int argc, char *argv[])
     try
     {
         InferConfig cfg = parse_args(argc, argv);
+
+#ifdef NN_HAS_VULKAN
+        if (cfg.gpu)
+        {
+            auto& backend = nn::GpuBackend::instance();
+            auto init = backend.initialize();
+            if (init)
+            {
+                nn::SmartPolicy::gpu_enabled = true;
+                std::cout << "[GPU] 加速已启用 (Vulkan compute)\n";
+            }
+            else
+                std::cerr << "[GPU] 初始化失败: " << init.error().message << "，回退 CPU。\n";
+        }
+#endif
 
         // ── 加载分词器与模型 ─────────────────────────────────────
         nn::BPETokenizer tokenizer;

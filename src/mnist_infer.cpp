@@ -32,6 +32,7 @@ void print_usage(const char *prog)
         << "                       仅在 V1 旧格式模型文件时需要手动指定\n"
         << "  --topk <n>         显示前 n 个预测结果 (默认: 3)\n"
         << "  --show-pixels      显示像素矩阵 (调试用)\n"
+        << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
         << "  --help             显示此帮助信息\n";
 }
 
@@ -43,6 +44,7 @@ struct InferConfig
     std::string input_path;
     int topk = 3;
     bool show_pixels = false;
+    bool gpu = false;
 };
 
 InferConfig parse_args(int argc, char *argv[])
@@ -221,6 +223,21 @@ int main(int argc, char *argv[])
     try
     {
         InferConfig cfg = parse_args(argc, argv);
+
+#ifdef NN_HAS_VULKAN
+        if (cfg.gpu)
+        {
+            auto& backend = nn::GpuBackend::instance();
+            auto init = backend.initialize();
+            if (init)
+            {
+                nn::SmartPolicy::gpu_enabled = true;
+                std::cout << "[GPU] 加速已启用 (Vulkan compute)\n";
+            }
+            else
+                std::cerr << "[GPU] 初始化失败: " << init.error().message << "，回退 CPU。\n";
+        }
+#endif
 
         // ── 从模型文件读取规格 ─────────────────────────────────
         auto spec_result = nn::peek_model_spec(cfg.model_path);
