@@ -544,6 +544,11 @@ int main(int argc, char *argv[])
         auto t_end = std::chrono::steady_clock::now();
         double total_sec = std::chrono::duration<double>(t_end - t_start).count();
 
+#ifdef NN_HAS_VULKAN
+        // ── 打印 GPU 调度统计 ──
+        nn::SmartPolicy::print_matmul_stats();
+#endif
+
         // ── 保存模型（含规格） ─────────────────────────────────────
         auto save_result = nn::save_model(cfg.save_path, model, spec);
         if (!save_result)
