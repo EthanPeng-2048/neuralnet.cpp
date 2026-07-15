@@ -82,6 +82,10 @@ InferConfig parse_args(int argc, char *argv[])
         {
             cfg.show_pixels = true;
         }
+        else if (arg == "--gpu")
+        {
+            cfg.gpu = true;
+        }
         else if (!arg.starts_with("--"))
         {
             cfg.input_path = arg;

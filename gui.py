@@ -748,6 +748,12 @@ class NeuralNetGUI(tk.Tk):
                      textvariable=self.text_train_d_ff_var).grid(row=1, column=1, pady=(6, 0))
         row += 1
 
+        # ── GPU 加速 ──
+        self.text_train_gpu_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text="启用 GPU 加速 (需要 Vulkan SDK)", variable=self.text_train_gpu_var).grid(
+            row=row, column=0, columnspan=3, sticky="w")
+        row += 1
+
         # 按钮
         btn_frame = ttk.Frame(f)
         btn_frame.grid(row=row, column=0, columnspan=3, pady=6)
@@ -816,6 +822,8 @@ class NeuralNetGUI(tk.Tk):
                "--d-ff", str(self.text_train_d_ff_var.get())]
         if self.text_train_resume_var.get():
             cmd += ["--resume", self.text_train_resume_path_var.get()]
+        if self.text_train_gpu_var.get():
+            cmd.append("--gpu")
 
         self._log_text_train(f"$ {' '.join(cmd)}\n")
         self.text_train_start_btn.config(state="disabled")
@@ -901,6 +909,12 @@ class NeuralNetGUI(tk.Tk):
                      textvariable=self.text_infer_seq_len_var).grid(row=1, column=3, pady=(6, 0))
         row += 1
 
+        # ── GPU 加速 ──
+        self.text_infer_gpu_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text="启用 GPU 加速 (需要 Vulkan SDK)", variable=self.text_infer_gpu_var).grid(
+            row=row, column=0, columnspan=3, sticky="w")
+        row += 1
+
         # 输入提示
         ttk.Label(f, text="输入提示:").grid(row=row, column=0, sticky="w")
         self.text_infer_prompt_var = tk.StringVar(value="Hello")
@@ -964,6 +978,8 @@ class NeuralNetGUI(tk.Tk):
                "--num-layers", str(self.text_infer_num_layers_var.get()),
                "--d-ff", str(self.text_infer_d_ff_var.get()),
                "--seq-len", str(self.text_infer_seq_len_var.get())]
+        if self.text_infer_gpu_var.get():
+            cmd.append("--gpu")
 
         self._log_text_infer(f"$ {' '.join(cmd)}\n")
         self.text_infer_start_btn.config(state="disabled")

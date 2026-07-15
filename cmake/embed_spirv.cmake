@@ -2,10 +2,10 @@
 # 将 SPIR-V 二进制文件转换为 C++ 头文件（constexpr 数组）。
 #
 # 用法（由 CMakeLists.txt 调用）：
-#   cmake -DSPV_INPUT=matmul.spv -DHPP_OUTPUT=matmul_spv.hpp -P embed_spirv.cmake
+#   cmake -DSPV_INPUT=xxx.spv -DHPP_OUTPUT=xxx_spv.hpp -DFUNC_NAME=nn_xxx_spirv_bytecode -P embed_spirv.cmake
 #
 # 输出的头文件定义了：
-#   nn::nn_matmul_spirv_bytecode() → const std::vector<uint32_t>&
+#   nn::FUNC_NAME() → const std::vector<uint32_t>&
 # ─────────────────────────────────────────────────────────────────────────
 
 file(READ "${SPV_INPUT}" HEX_CONTENT HEX)
@@ -52,7 +52,7 @@ file(WRITE "${HPP_OUTPUT}"
 "\n"
 "namespace nn {\n"
 "\n"
-"[[nodiscard]] inline const std::vector<uint32_t>& nn_matmul_spirv_bytecode()\n"
+"[[nodiscard]] inline const std::vector<uint32_t>& ${FUNC_NAME}()\n"
 "{\n"
 "    static const std::vector<uint32_t> spirv = {\n"
 "        ${ARRAY_INIT}\n"

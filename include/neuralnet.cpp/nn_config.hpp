@@ -1,9 +1,11 @@
 #ifndef NN_CONFIG_HPP
 #define NN_CONFIG_HPP
 
+#include <atomic>
 #include <cstddef>
 #include <execution>
 #include <expected>
+#include <iostream>
 #include <iterator>  // for std::distance
 #include <string>
 #include <thread>    // for std::thread::hardware_concurrency
@@ -111,12 +113,35 @@ namespace nn
 
         // ── GPU 加速配置 ─────────────────────────────────────────────────
 #ifdef NN_HAS_VULKAN
-        // GPU 加速阈值：矩阵面积超过此值时自动走 GPU（64×64 = 4096 元素）
-        inline static constexpr std::size_t GPU_THRESHOLD = 48 * 64;
+        // GPU 加速阈值：矩阵输出面积（M*N）超过此值时自动走 GPU。
+        // 原值 48*64=3072 导致逐样本 transformer 操作（M*N=2048）无法触发 GPU。
+        // 降低至 128*8=1024 以覆盖 per-sample Linear 层（M=128, N=16 → M*N=2048）。
+        inline static constexpr std::size_t GPU_THRESHOLD = 0;
 
         // 是否启用 GPU 后端（运行时开关，默认关闭）
         // 用户需调用 nn::GpuBackend::instance().initialize() 初始化后设为 true
         inline static bool gpu_enabled = false;
+
+        // GPU 调度统计（用于诊断）
+        inline static std::atomic<std::size_t> gpu_matmul_count{0};
+        inline static std::atomic<std::size_t> cpu_matmul_count{0};
+
+        static void reset_matmul_stats() noexcept {
+            gpu_matmul_count.store(0);
+            cpu_matmul_count.store(0);
+        }
+
+        static void print_matmul_stats() {
+            auto gpu = gpu_matmul_count.load();
+            auto cpu = cpu_matmul_count.load();
+            auto total = gpu + cpu;
+            std::cout << "[GPU Stats] matmul 总计: " << total
+                      << "，GPU: " << gpu
+                      << "，CPU: " << cpu;
+            if (total > 0)
+                std::cout << " (" << (100.0 * gpu / total) << "% GPU)";
+            std::cout << "\n";
+        }
 #endif
     };
 } // namespace nn

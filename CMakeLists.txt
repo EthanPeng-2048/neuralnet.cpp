@@ -41,47 +41,57 @@ if(Vulkan_FOUND)
     find_program(GLSLANG_VALIDATOR glslangValidator HINTS ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE})
     find_program(GLSLC glslc HINTS ${Vulkan_GLSLC_EXECUTABLE})
 
-    set(SHADER_SRC ${CMAKE_SOURCE_DIR}/shaders/matmul.comp)
-    set(SHADER_SPV ${CMAKE_BINARY_DIR}/matmul.spv)
-    set(SHADER_HPP ${CMAKE_BINARY_DIR}/generated/matmul_spv.hpp)
+    # 定义着色器列表：名称 → 源文件（无后缀）
+    set(GPU_SHADERS matmul matmul_tiled elementwise)
+    set(GPU_SHADER_SPVS "")
+    set(GPU_SHADER_HPPS "")
 
-    if(GLSLC)
-        message(STATUS "Found glslc: ${GLSLC}")
+    foreach(SHADER_NAME ${GPU_SHADERS})
+        set(SRC ${CMAKE_SOURCE_DIR}/shaders/${SHADER_NAME}.comp)
+        set(SPV ${CMAKE_BINARY_DIR}/${SHADER_NAME}.spv)
+        set(HPP ${CMAKE_BINARY_DIR}/generated/${SHADER_NAME}_spv.hpp)
+        set(FUNC "nn_${SHADER_NAME}_spirv_bytecode")
+        list(APPEND GPU_SHADER_SPVS ${SPV})
+        list(APPEND GPU_SHADER_HPPS ${HPP})
+
+        if(GLSLC)
+            add_custom_command(
+                OUTPUT ${SPV}
+                COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/generated
+                COMMAND ${GLSLC} -fshader-stage=compute ${SRC} -o ${SPV}
+                DEPENDS ${SRC}
+                COMMENT "[GPU] Compiling ${SHADER_NAME}.comp → SPIR-V"
+            )
+        elseif(GLSLANG_VALIDATOR)
+            add_custom_command(
+                OUTPUT ${SPV}
+                COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/generated
+                COMMAND ${GLSLANG_VALIDATOR} -V ${SRC} -o ${SPV}
+                DEPENDS ${SRC}
+                COMMENT "[GPU] Compiling ${SHADER_NAME}.comp → SPIR-V"
+            )
+        endif()
+
         add_custom_command(
-            OUTPUT ${SHADER_SPV}
-            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/generated
-            COMMAND ${GLSLC} -fshader-stage=compute ${SHADER_SRC} -o ${SHADER_SPV}
-            DEPENDS ${SHADER_SRC}
-            COMMENT "[GPU] Compiling matmul.comp → SPIR-V (glslc)"
+            OUTPUT ${HPP}
+            COMMAND ${CMAKE_COMMAND}
+                -DSPV_INPUT=${SPV}
+                -DHPP_OUTPUT=${HPP}
+                -DFUNC_NAME=${FUNC}
+                -P ${CMAKE_SOURCE_DIR}/cmake/embed_spirv.cmake
+            DEPENDS ${SPV} ${CMAKE_SOURCE_DIR}/cmake/embed_spirv.cmake
+            COMMENT "[GPU] Embedding ${SHADER_NAME} SPIR-V into C++ header"
         )
-    elseif(GLSLANG_VALIDATOR)
-        message(STATUS "Found glslangValidator: ${GLSLANG_VALIDATOR}")
-        add_custom_command(
-            OUTPUT ${SHADER_SPV}
-            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/generated
-            COMMAND ${GLSLANG_VALIDATOR} -V ${SHADER_SRC} -o ${SHADER_SPV}
-            DEPENDS ${SHADER_SRC}
-            COMMENT "[GPU] Compiling matmul.comp → SPIR-V (glslangValidator)"
-        )
-    else()
+    endforeach()
+
+    if(NOT GLSLC AND NOT GLSLANG_VALIDATOR)
         message(WARNING "No SPIR-V compiler found (glslc or glslangValidator). "
                         "GPU acceleration disabled. Install Vulkan SDK.")
         set(Vulkan_FOUND OFF)
     endif()
 
     if(Vulkan_FOUND)
-        # SPIR-V → C++ 头文件（嵌入为 constexpr 数组）
-        add_custom_command(
-            OUTPUT ${SHADER_HPP}
-            COMMAND ${CMAKE_COMMAND}
-                -DSPV_INPUT=${SHADER_SPV}
-                -DHPP_OUTPUT=${SHADER_HPP}
-                -P ${CMAKE_SOURCE_DIR}/cmake/embed_spirv.cmake
-            DEPENDS ${SHADER_SPV} ${CMAKE_SOURCE_DIR}/cmake/embed_spirv.cmake
-            COMMENT "[GPU] Embedding SPIR-V into C++ header"
-        )
-
-        add_custom_target(compile_gpu_shaders DEPENDS ${SHADER_HPP})
+        add_custom_target(compile_gpu_shaders DEPENDS ${GPU_SHADER_HPPS})
 
         # 为所有目标启用 Vulkan
         set(NN_GPU_SOURCES

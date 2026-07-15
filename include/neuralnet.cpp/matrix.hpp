@@ -273,10 +273,14 @@ namespace nn
                 {
                     auto mm = backend.matmul_direct(
                         span(), other.span(), result.span(), M, N, K);
-                    if (mm) return;  // GPU 成功，直接返回
+                    if (mm) {
+                        SmartPolicy::gpu_matmul_count.fetch_add(1, std::memory_order_relaxed);
+                        return;  // GPU 成功，直接返回
+                    }
                 }
                 // GPU 失败，静默 fallback 到 CPU 路径
             }
+            SmartPolicy::cpu_matmul_count.fetch_add(1, std::memory_order_relaxed);
 #endif
 
             // 清零结果矩阵（使用 RAII 封装的方法）
@@ -396,5 +400,10 @@ namespace nn
         }
     };
 }
+
+// ── GpuTensor 方法实现（需要 Matrix 完整定义） ──────────────────────────
+#ifdef NN_HAS_VULKAN
+#include "gpu_tensor_impl.hpp"
+#endif
 
 #endif

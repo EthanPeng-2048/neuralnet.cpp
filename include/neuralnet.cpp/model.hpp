@@ -47,12 +47,49 @@ namespace nn
         [[nodiscard]] std::size_t num_layers() const noexcept { return layers_.size(); }
 
         // ── 前向传播 ────────────────────────────────────────────────────────
+        // 当 GPU 启用且可用时，自动使用双轨制 GPU 流水线：
+        //   Input → Upload → [Layer1.forward_gpu → Layer2.forward_gpu → ...] → Download → Output
+        // 中间所有层的矩阵乘法和激活函数全程在 GPU 显存中流转，零 PCIe 中间传输。
         [[nodiscard]] Result<Matrix> forward(const Matrix &input)
         {
             if (layers_.empty())
             {
                 return std::unexpected(Error{"Model has no layers"});
             }
+
+#ifdef NN_HAS_VULKAN
+            // ── GPU 流水线路径 ─────────────────────────────────────────
+            if (SmartPolicy::gpu_enabled)
+            {
+                auto& backend = GpuBackend::instance();
+                if (backend.is_initialized() || backend.initialize())
+                {
+                    // 1. Upload 输入到 GPU（唯一一次 CPU→GPU 传输）
+                    auto gpu_in = GpuTensor::from_matrix(input, backend);
+                    if (gpu_in)
+                    {
+                        // 2. 逐层 forward_gpu（全程 GPU 显存流转）
+                        GpuTensor gpu_out = std::move(*gpu_in);
+                        bool gpu_ok = true;
+                        for (std::size_t i = 0; i < layers_.size(); ++i)
+                        {
+                            auto layer_res = layers_[i]->forward_gpu(gpu_out, backend);
+                            if (!layer_res) { gpu_ok = false; break; }
+                            gpu_out = std::move(*layer_res);
+                        }
+                        if (gpu_ok)
+                        {
+                            // 3. Download 输出到 CPU（唯一一次 GPU→CPU 传输）
+                            auto cpu_out = gpu_out.to_matrix(backend);
+                            if (cpu_out) return cpu_out;
+                        }
+                    }
+                    // GPU 路径失败，静默 fallback 到 CPU 路径
+                }
+            }
+#endif
+
+            // ── CPU 路径（原始逻辑）────────────────────────────────────
             auto result = layers_.front()->forward(input);
             if (!result) return std::unexpected(result.error());
             Matrix out = std::move(*result);
