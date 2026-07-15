@@ -40,6 +40,7 @@ void print_usage(const char *prog)
         << "  --d-ff <n>         FFN 中间维度 (默认: 128)\n"
         << "  --num-layers <n>   Transformer 层数 (默认: 2)\n"
         << "  --patch-size <n>   Patch 大小 (默认: 7)\n"
+        << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
         << "  --help             显示此帮助信息\n";
 }
 
@@ -55,6 +56,7 @@ struct TrainConfig
     double lr = 0.001;
     std::size_t batch_size = 64;
     bool load_existing = false;
+    bool gpu = false;
     // MLP 自定义层维度
     std::vector<std::size_t> layer_dims;
     // Transformer 自定义参数
@@ -154,6 +156,8 @@ TrainConfig parse_args(int argc, char *argv[])
             cfg.num_layers = static_cast<std::size_t>(std::stoi(argv[++i]));
         else if (arg == "--patch-size" && i + 1 < argc)
             cfg.patch_size = static_cast<std::size_t>(std::stoi(argv[++i]));
+        else if (arg == "--gpu")
+            cfg.gpu = true;
         else
         {
             std::cerr << "未知参数: " << arg << "\n使用 --help 查看用法\n";
@@ -326,6 +330,21 @@ int main(int argc, char *argv[])
     try
     {
         TrainConfig cfg = parse_args(argc, argv);
+
+#ifdef NN_HAS_VULKAN
+        if (cfg.gpu)
+        {
+            auto& backend = nn::GpuBackend::instance();
+            auto init = backend.initialize();
+            if (init)
+            {
+                nn::SmartPolicy::gpu_enabled = true;
+                std::cout << "[GPU] 加速已启用 (Vulkan compute)\n";
+            }
+            else
+                std::cerr << "[GPU] 初始化失败: " << init.error().message << "，回退 CPU。\n";
+        }
+#endif
 
         // ── 构建规格 ─────────────────────────────────────────────
         nn::ModelSpec spec;
