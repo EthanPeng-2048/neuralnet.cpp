@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <expected>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -17,6 +18,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#include "nn_config.hpp"
 
 namespace nn
 {
@@ -294,10 +297,10 @@ public:
     }
 
     // ── 保存 JSON ────────────────────────────────────────────────────
-    void save(const std::string &path) const
+    [[nodiscard]] Result<void> save(const std::string &path) const
     {
         std::ofstream ofs(path);
-        if (!ofs) throw std::runtime_error("Cannot write: " + path);
+        if (!ofs) return std::unexpected(Error{"Cannot write: " + path});
 
         ofs << "{\n  \"type\": \"freq_based_tokenizer\",\n  \"vocab\": {\n";
         bool first = true;
@@ -317,13 +320,14 @@ public:
             << ",\n  \"special_tokens\": {"
             << "\n    \"<pad>\": 0,\n    \"<unk>\": 1,"
             << "\n    \"<bos>\": 2,\n    \"<eos>\": 3\n  }\n}\n";
+        return {};
     }
 
     // ── 加载 JSON ────────────────────────────────────────────────────
-    void load(const std::string &path)
+    [[nodiscard]] Result<void> load(const std::string &path)
     {
         std::ifstream ifs(path);
-        if (!ifs) throw std::runtime_error("Cannot read: " + path);
+        if (!ifs) return std::unexpected(Error{"Cannot read: " + path});
         std::string content((std::istreambuf_iterator<char>(ifs)),
                              std::istreambuf_iterator<char>());
 
@@ -340,10 +344,10 @@ public:
 
         auto vp = content.find("\"vocab\"");
         if (vp == std::string::npos)
-            throw std::runtime_error("Invalid JSON: missing \"vocab\"");
+            return std::unexpected(Error{"Invalid JSON: missing \"vocab\""});
         auto br = content.find('{', vp);
         if (br == std::string::npos)
-            throw std::runtime_error("Invalid JSON: missing '{'");
+            return std::unexpected(Error{"Invalid JSON: missing '{'"});
 
         std::size_t pos = br + 1;
         while (pos < content.size())
@@ -385,6 +389,7 @@ public:
             }
 
         build_lookup();
+        return {};
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -396,9 +401,9 @@ public:
     [[nodiscard]] constexpr std::size_t byte_offset()     const noexcept { return BYTE_OFFSET; }
     [[nodiscard]] const std::vector<std::string> &vocab() const noexcept { return vocab_; }
 
-    [[nodiscard]] const std::string &token_bytes(std::size_t id) const
+    [[nodiscard]] Result<std::string> token_bytes(std::size_t id) const
     {
-        if (id >= vocab_.size()) throw std::out_of_range("Token ID out of range");
+        if (id >= vocab_.size()) return std::unexpected(Error{"Token ID out of range"});
         return vocab_[id];
     }
 

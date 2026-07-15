@@ -3,7 +3,9 @@
 
 #include <cstddef>
 #include <execution>
+#include <expected>
 #include <iterator>  // for std::distance
+#include <string>
 #include <thread>    // for std::thread::hardware_concurrency
 #include "thread_pool.hpp"
 
@@ -19,8 +21,17 @@
 // 修改时需同步评估 b_block 栈占用（BLOCK_SIZE² × 8 字节）
 namespace nn
 {
-    inline constexpr std::size_t BLOCK_SIZE = 64;    static_assert(BLOCK_SIZE * BLOCK_SIZE * sizeof(double) <= 65536,
-                  "BLOCK_SIZE too large: b_block would exceed 64KB stack budget");    
+    // ── 错误类型（C++23 std::expected）─────────────────────────────────────
+    // 所有公共 API 使用 Result<T> 返回错误，不抛异常。
+    struct Error {
+        std::string message;
+    };
+    template <typename T>
+    using Result = std::expected<T, Error>;
+
+    inline constexpr std::size_t BLOCK_SIZE = 64;
+    static_assert(BLOCK_SIZE * BLOCK_SIZE * sizeof(double) <= 65536,
+                  "BLOCK_SIZE too large: b_block would exceed 64KB stack budget");
     // ── 数值常量 ─────────────────────────────────────────────────────────────
     // 使用 constexpr 避免运行时计算
     inline constexpr double EPSILON = 1e-8;
@@ -33,7 +44,7 @@ namespace nn
         // 阈值 = 每核最小分块 × 2，确保至少有 2 个分块可并行。
         // chunk_count() 已自动按核心数缩放（min(cores, total/4096)），
         // 阈值只需设最低门槛，核心利用随数据量自然增长。
-        inline static const std::size_t PARALLEL_THRESHOLD = 4096 * 2;  // 8192
+        inline static constexpr std::size_t PARALLEL_THRESHOLD = 4096 * 2;  // 8192
         
         // for_each 版本
         template<typename Iterator, typename Func>

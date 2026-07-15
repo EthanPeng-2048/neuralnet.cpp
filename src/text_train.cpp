@@ -143,7 +143,12 @@ int main(int argc, char *argv[])
 
         // ── 加载文本 ─────────────────────────────────────────────
         std::cout << "加载文本: " << cfg.text_path << " ..." << std::endl;
-        std::string text = nn::load_text_file(cfg.text_path);
+        auto text_result = nn::load_text_file(cfg.text_path);
+        if (!text_result) {
+            std::cerr << "Error: " << text_result.error().message << '\n';
+            return 1;
+        }
+        std::string text = std::move(*text_result);
         if (text.empty())
         {
             std::cerr << "文本文件为空\n";
@@ -151,7 +156,13 @@ int main(int argc, char *argv[])
         }
 
         nn::BPETokenizer tokenizer;
-        tokenizer.load_vocab("gpt_bpe.json");
+        {
+            auto vocab_result = tokenizer.load_vocab("gpt_bpe.json");
+            if (!vocab_result) {
+                std::cerr << "Error: " << vocab_result.error().message << '\n';
+                return 1;
+            }
+        }
         auto all_tokens = tokenizer.encode(text);
         std::cout << "文本长度: " << text.size() << " 字符, "
                   << all_tokens.size() << " tokens, "
@@ -176,16 +187,48 @@ int main(int argc, char *argv[])
             tokenizer.vocab_size(), cfg.d_model, cfg.seq_len,
             cfg.num_heads, cfg.d_ff, cfg.num_layers);
 
+        // ── 构建规格（用于保存） ─────────────────────────────────
+        auto spec = nn::make_gpt_spec(
+            tokenizer.vocab_size(), cfg.d_model, cfg.seq_len,
+            cfg.num_heads, cfg.d_ff, cfg.num_layers);
+
         if (cfg.load_existing)
         {
-            try
+            // 尝试从文件读取规格（V2 格式）
+            auto spec_result = nn::peek_model_spec(cfg.resume_path);
+            if (!spec_result)
             {
-                nn::load_model(cfg.resume_path, model);
-                std::cout << "已加载模型: " << cfg.resume_path << "\n" << std::endl;
+                std::cerr << "加载模型失败: " << spec_result.error().message << "，将从头训练。\n" << std::endl;
             }
-            catch (const std::exception &e)
+            else
             {
-                std::cerr << "加载模型失败: " << e.what() << "，将从头训练。\n" << std::endl;
+                auto file_spec = std::move(*spec_result);
+                if (file_spec.is_gpt())
+                {
+                    std::cout << "从模型文件读取 GPT 规格 (V2 格式)\n";
+                    auto build_result = nn::build_gpt_model_from_spec(file_spec);
+                    if (!build_result)
+                    {
+                        std::cerr << "Error: " << build_result.error().message << '\n';
+                        return 1;
+                    }
+                    model = std::move(*build_result);
+                    spec = file_spec;
+                }
+                else
+                {
+                    std::cout << "旧格式模型文件，使用命令行参数\n";
+                }
+
+                auto load_result = nn::load_model(cfg.resume_path, model);
+                if (!load_result)
+                {
+                    std::cerr << "加载模型失败: " << load_result.error().message << "，将从头训练。\n" << std::endl;
+                }
+                else
+                {
+                    std::cout << "已加载模型: " << cfg.resume_path << "\n" << std::endl;
+                }
             }
         }
 
@@ -242,7 +285,9 @@ int main(int argc, char *argv[])
                 }
 
                 // ── 前向传播 ─────────────────────────────────────
-                auto logits = model.forward(x_tokens);
+                auto fwd_result = model.forward(x_tokens);
+                if (!fwd_result) { std::cerr << "Error: " << fwd_result.error().message << '\n'; return 1; }
+                auto logits = std::move(*fwd_result);
                 // logits: (vocab_size, seq_len × batch_size)
 
                 // ── 构造 one-hot 目标 ────────────────────────────
@@ -258,14 +303,23 @@ int main(int argc, char *argv[])
                 auto y_onehot = one_hot_labels(flat_targets, tokenizer.vocab_size());
 
                 // ── 损失 ─────────────────────────────────────────
-                double loss = ce_loss.forward(logits, y_onehot);
+                auto loss_result = ce_loss.forward(logits, y_onehot);
+                if (!loss_result) { std::cerr << "Error: " << loss_result.error().message << '\n'; return 1; }
+                double loss = *loss_result;
                 total_loss += loss;
 
                 // ── 反向传播 ─────────────────────────────────────
                 auto grad = ce_loss.backward();
-                model.backward(grad);
+                auto bwd_result = model.backward(grad);
+                if (!bwd_result) { std::cerr << "Error: " << bwd_result.error().message << '\n'; return 1; }
 
-                optimizer->step();
+                {
+                    auto step_result = optimizer->step();
+                    if (!step_result) {
+                        std::cerr << "Error: " << step_result.error().message << '\n';
+                        return 1;
+                    }
+                }
                 optimizer->zero_grad();
 
                 // 进度显示
@@ -291,8 +345,14 @@ int main(int argc, char *argv[])
         auto t_end = std::chrono::steady_clock::now();
         double total_sec = std::chrono::duration<double>(t_end - t_start).count();
 
-        // ── 保存模型 ─────────────────────────────────────────────
-        nn::save_model(cfg.save_path, model);
+        // ── 保存模型（含规格） ─────────────────────────────────────
+        {
+            auto save_result = nn::save_model(cfg.save_path, model, spec);
+            if (!save_result) {
+                std::cerr << "Error: " << save_result.error().message << '\n';
+                return 1;
+            }
+        }
         std::cout << "\n训练完成! 总耗时: " << std::fixed << std::setprecision(1)
                   << total_sec << "s" << std::endl;
 

@@ -11,7 +11,6 @@
 #include <random>
 #include <ranges>
 #include <span>
-#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -35,7 +34,7 @@ namespace nn
         {
             if (lhs.rows_ != rhs.rows_ || lhs.cols_ != rhs.cols_)
             {
-                throw std::invalid_argument(message);
+                assert(false && message); // NOLINT
             }
         }
 
@@ -50,7 +49,7 @@ namespace nn
         {
             if (data_.size() != rows_ * cols_)
             {
-                throw std::invalid_argument("data size mismatch");
+                assert(false && "data size mismatch"); // NOLINT
             }
         }
         
@@ -86,7 +85,7 @@ namespace nn
         {
             if (row >= rows_ || col >= cols_)
             {
-                throw std::out_of_range("Matrix index out of range");
+                assert(false && "Matrix index out of range");
             }
             return data_[index(row, col)];
         }
@@ -94,7 +93,7 @@ namespace nn
         {
             if (row >= rows_ || col >= cols_)
             {
-                throw std::out_of_range("Matrix index out of range");
+                assert(false && "Matrix index out of range");
             }
             data_[index(row, col)] = value;
         }
@@ -131,7 +130,7 @@ namespace nn
             {
                 if (row.size() != new_cols)
                 {
-                    throw std::invalid_argument("all rows must have the same number of columns");
+                    assert(false && "all rows must have the same number of columns"); // NOLINT
                 }
             }
 
@@ -235,7 +234,7 @@ namespace nn
         [[nodiscard]] Matrix operator*(const Matrix &other) const
         {
             if (cols_ != other.rows_)
-                throw std::invalid_argument("matrix multiplication dimension mismatch");
+                assert(false && "matrix multiplication dimension mismatch"); // NOLINT
             Matrix result(rows_, other.cols_);
             multiply_to(result, other);
             return result;
