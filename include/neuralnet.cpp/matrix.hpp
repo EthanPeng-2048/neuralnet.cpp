@@ -11,10 +11,16 @@
 #include <random>
 #include <ranges>
 #include <span>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include "nn_config.hpp"
+
+// GPU 加速支持（可选，由 CMake 的 NN_HAS_VULKAN 宏控制）
+#ifdef NN_HAS_VULKAN
+#include "vk_backend.hpp"
+#endif
 
 namespace nn
 {
@@ -30,13 +36,17 @@ namespace nn
             return row * cols_ + col;
         }
 
-        static void require_same_shape(const Matrix &lhs, const Matrix &rhs, const char *message)
+        static void require_same_shape(const Matrix &lhs, const Matrix &rhs, std::string_view message)
         {
             if (lhs.rows_ != rhs.rows_ || lhs.cols_ != rhs.cols_)
             {
-                assert(false && message); // NOLINT
+                assert(false && message.data()); // NOLINT
             }
         }
+
+        // 内部构造函数（无校验，由工厂函数 create() 保证前置条件）
+        Matrix(std::vector<double> data, std::size_t rows, std::size_t cols)
+            : data_(std::move(data)), rows_(rows), cols_(cols) {}
 
     public:
         Matrix() = default;
@@ -44,15 +54,14 @@ namespace nn
         explicit Matrix(std::size_t rows, std::size_t cols)
             : data_(rows * cols), rows_(rows), cols_(cols) {}
 
-        Matrix(std::vector<double> data, std::size_t rows, std::size_t cols)
-            : data_(std::move(data)), rows_(rows), cols_(cols)
+        // 工厂函数（策略1）：外部输入校验，返回 Result 而非 assert
+        [[nodiscard]] static Result<Matrix> create(std::vector<double> data, std::size_t rows, std::size_t cols)
         {
-            if (data_.size() != rows_ * cols_)
-            {
-                assert(false && "data size mismatch"); // NOLINT
-            }
+            if (data.size() != rows * cols)
+                return std::unexpected(Error{"data size mismatch"});
+            return Matrix(std::move(data), rows, cols);
         }
-        
+
         // 从标量值初始化矩阵
         Matrix(std::size_t rows, std::size_t cols, double value)
             : data_(rows * cols, value), rows_(rows), cols_(cols) {}
@@ -114,14 +123,15 @@ namespace nn
             return result;
         }
 
-        void set_data(const std::vector<std::vector<double>> &new_data)
+        // 工厂函数（策略1）：外部输入校验，返回 Result 而非 assert
+        [[nodiscard]] Result<void> set_data(const std::vector<std::vector<double>> &new_data)
         {
             if (new_data.empty())
             {
                 rows_ = 0;
                 cols_ = 0;
                 data_.clear();
-                return;
+                return {};
             }
 
             const std::size_t new_rows = new_data.size();
@@ -130,7 +140,7 @@ namespace nn
             {
                 if (row.size() != new_cols)
                 {
-                    assert(false && "all rows must have the same number of columns"); // NOLINT
+                    return std::unexpected(Error{"all rows must have the same number of columns"});
                 }
             }
 
@@ -144,6 +154,7 @@ namespace nn
                     data_[index(row, col)] = new_data[row][col];
                 }
             }
+            return {};
         }
 
         // ── 转置（返回新矩阵） ─────────────────────────────────────────────
@@ -225,7 +236,7 @@ namespace nn
             return result;
         }
 
-        friend Matrix operator*(double scalar, const Matrix &mat) noexcept
+        friend Matrix operator*(double scalar, const Matrix &mat)
         {
             return mat * scalar;
         }
@@ -250,6 +261,23 @@ namespace nn
             const std::size_t K = cols_;
             result.resize(M, N);
             if (M == 0 || N == 0 || K == 0) return;
+
+#ifdef NN_HAS_VULKAN
+            // ── GPU 加速路径 ─────────────────────────────────────────────
+            // 矩阵面积超过阈值时自动走 GPU，失败则静默 fallback 到 CPU
+            if (SmartPolicy::gpu_enabled && M * N >= SmartPolicy::GPU_THRESHOLD)
+            {
+                auto& backend = GpuBackend::instance();
+                // 快速路径：已初始化时跳过全局锁
+                if (backend.is_initialized() || backend.initialize())
+                {
+                    auto mm = backend.matmul_direct(
+                        span(), other.span(), result.span(), M, N, K);
+                    if (mm) return;  // GPU 成功，直接返回
+                }
+                // GPU 失败，静默 fallback 到 CPU 路径
+            }
+#endif
 
             // 清零结果矩阵（使用 RAII 封装的方法）
             result.zero();

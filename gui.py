@@ -164,6 +164,54 @@ class NeuralNetGUI(tk.Tk):
         model_type_combo = ttk.Combobox(param_frame, textvariable=self.train_model_type_var, width=14, state="readonly",
                                         values=["mlp", "transformer"])
         model_type_combo.grid(row=1, column=3, sticky="w", pady=(6, 0))
+        model_type_combo.bind("<<ComboboxSelected>>", lambda e: self._toggle_model_params())
+        row += 1
+
+        # ── 模型架构参数（根据模型类型动态切换） ──
+        self.model_params_frame = ttk.LabelFrame(f, text="模型架构", padding=6)
+        self.model_params_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+        row += 1
+
+        # MLP 参数
+        self.mlp_params = ttk.Frame(self.model_params_frame)
+        ttk.Label(self.mlp_params, text="层维度 (逗号分隔):").pack(side="left")
+        self.train_layer_dims_var = tk.StringVar(value="784,512,256,128,64,10")
+        ttk.Entry(self.mlp_params, textvariable=self.train_layer_dims_var, width=42).pack(side="left", padx=4)
+
+        # Transformer 参数
+        self.transformer_params = ttk.Frame(self.model_params_frame)
+        ttk.Label(self.transformer_params, text="模型维度:").grid(row=0, column=0, sticky="w")
+        self.train_d_model_var = tk.IntVar(value=64)
+        ttk.Spinbox(self.transformer_params, from_=16, to=512, width=6,
+                     textvariable=self.train_d_model_var).grid(row=0, column=1, padx=(0, 12))
+
+        ttk.Label(self.transformer_params, text="注意力头:").grid(row=0, column=2, sticky="w")
+        self.train_num_heads_var = tk.IntVar(value=4)
+        ttk.Spinbox(self.transformer_params, from_=1, to=16, width=6,
+                     textvariable=self.train_num_heads_var).grid(row=0, column=3, padx=(0, 12))
+
+        ttk.Label(self.transformer_params, text="FFN维度:").grid(row=0, column=4, sticky="w")
+        self.train_d_ff_var = tk.IntVar(value=128)
+        ttk.Spinbox(self.transformer_params, from_=32, to=2048, width=6,
+                     textvariable=self.train_d_ff_var).grid(row=0, column=5, padx=(0, 12))
+
+        ttk.Label(self.transformer_params, text="层数:").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.train_num_layers_var = tk.IntVar(value=2)
+        ttk.Spinbox(self.transformer_params, from_=1, to=16, width=6,
+                     textvariable=self.train_num_layers_var).grid(row=1, column=1, pady=(4, 0))
+
+        ttk.Label(self.transformer_params, text="Patch大小:").grid(row=1, column=2, sticky="w", pady=(4, 0))
+        self.train_patch_size_var = tk.IntVar(value=7)
+        ttk.Spinbox(self.transformer_params, from_=2, to=14, width=6,
+                     textvariable=self.train_patch_size_var).grid(row=1, column=3, pady=(4, 0))
+
+        self._toggle_model_params()  # 默认显示 MLP 参数
+        row += 1
+
+        # ── GPU 加速 ──
+        self.train_gpu_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text="启用 GPU 加速 (需要 Vulkan SDK)", variable=self.train_gpu_var).grid(
+            row=row, column=0, columnspan=3, sticky="w")
         row += 1
 
         # 按钮
@@ -208,6 +256,15 @@ class NeuralNetGUI(tk.Tk):
         self.resume_entry.config(state=state)
         self.resume_btn.config(state=state)
 
+    def _toggle_model_params(self):
+        """根据模型类型显示 MLP 或 Transformer 参数"""
+        if self.train_model_type_var.get() == "mlp":
+            self.transformer_params.pack_forget()
+            self.mlp_params.pack(fill="x")
+        else:
+            self.mlp_params.pack_forget()
+            self.transformer_params.pack(fill="x")
+
     # ---- 训练 ----
     def _start_training(self):
         exe = str(TRAIN_EXE)
@@ -225,6 +282,20 @@ class NeuralNetGUI(tk.Tk):
                "--model-type", self.train_model_type_var.get()]
         if self.train_resume_var.get():
             cmd += ["--resume", self.train_resume_path_var.get()]
+
+        # 模型架构参数
+        if self.train_model_type_var.get() == "mlp":
+            cmd += ["--layer-dims", self.train_layer_dims_var.get()]
+        else:
+            cmd += ["--d-model", str(self.train_d_model_var.get()),
+                    "--num-heads", str(self.train_num_heads_var.get()),
+                    "--d-ff", str(self.train_d_ff_var.get()),
+                    "--num-layers", str(self.train_num_layers_var.get()),
+                    "--patch-size", str(self.train_patch_size_var.get())]
+
+        # GPU 加速
+        if self.train_gpu_var.get():
+            cmd.append("--gpu")
 
         self._log_train(f"$ {' '.join(cmd)}\n")
         self.train_start_btn.config(state="disabled")
@@ -284,6 +355,9 @@ class NeuralNetGUI(tk.Tk):
                                                width=12, state="readonly",
                                                values=["mlp", "transformer"])
         infer_model_type_combo.pack(side="left", padx=4)
+        ttk.Label(param_frame, text="    ").pack(side="left")
+        self.infer_gpu_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(param_frame, text="GPU 加速", variable=self.infer_gpu_var).pack(side="left", padx=4)
         row += 1
 
         # 按钮
@@ -450,6 +524,8 @@ class NeuralNetGUI(tk.Tk):
                "--model", self.infer_model_var.get(),
                "--model-type", self.infer_model_type_var.get(),
                "--topk", str(self.infer_topk_var.get())]
+        if self.infer_gpu_var.get():
+            cmd.append("--gpu")
 
         self._log_infer(f"[手写识别] $ {' '.join(cmd)}\n")
         self._handwriting_infer = True
@@ -491,6 +567,8 @@ class NeuralNetGUI(tk.Tk):
                "--model", self.infer_model_var.get(),
                "--model-type", self.infer_model_type_var.get(),
                "--topk", str(self.infer_topk_var.get())]
+        if self.infer_gpu_var.get():
+            cmd.append("--gpu")
 
         self._log_infer(f"$ {' '.join(cmd)}\n")
         threading.Thread(target=self._run_infer_process, args=(cmd,), daemon=True).start()

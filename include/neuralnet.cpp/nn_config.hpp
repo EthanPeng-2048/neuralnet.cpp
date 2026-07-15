@@ -108,6 +108,16 @@ namespace nn
                                             std::forward<UnaryOp>(transform_op));
             }
         }
+
+        // ── GPU 加速配置 ─────────────────────────────────────────────────
+#ifdef NN_HAS_VULKAN
+        // GPU 加速阈值：矩阵面积超过此值时自动走 GPU（64×64 = 4096 元素）
+        inline static constexpr std::size_t GPU_THRESHOLD = 48 * 64;
+
+        // 是否启用 GPU 后端（运行时开关，默认关闭）
+        // 用户需调用 nn::GpuBackend::instance().initialize() 初始化后设为 true
+        inline static bool gpu_enabled = false;
+#endif
     };
 } // namespace nn
 
