@@ -7,12 +7,15 @@
 #include <cstdint>
 #include <cstdlib>
 #include <expected>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iomanip>
 #include <iostream>
-#include <random>
 #include <ranges>
+#include <regex>
+#include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -25,24 +28,56 @@ namespace nn
 {
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  ByteZip v2.2 分词器
+//  Tokenizer — 抽象基类
 // ═══════════════════════════════════════════════════════════════════════════
-//  基于频率统计 + 独立度去冗余 + 词缀保护 + V2 残差挖掘的子词分词器。
+
+class Tokenizer
+{
+public:
+    virtual ~Tokenizer() = default;
+
+    [[nodiscard]] virtual std::vector<std::size_t> encode(const std::string &text) const = 0;
+    [[nodiscard]] virtual std::string decode(std::span<const std::size_t> ids) const = 0;
+    [[nodiscard]] virtual std::size_t vocab_size() const noexcept = 0;
+    [[nodiscard]] virtual const std::vector<std::string> &vocab() const noexcept = 0;
+    [[nodiscard]] virtual Result<void> save(const std::string &path) const = 0;
+    [[nodiscard]] virtual Result<void> load(const std::string &path) = 0;
+
+    // ── 从 JSON 字符串加载（用于从模型文件中提取嵌入词表） ──────
+    [[nodiscard]] Result<void> load_json(const std::string &json_content)
+    {
+        // 写入临时文件后调用 load（各子类已实现 load）
+        const auto tmp_path = std::filesystem::temp_directory_path() / "nn_tokenizer_tmp.json";
+        {
+            std::ofstream ofs(tmp_path, std::ios::binary);
+            if (!ofs)
+                return std::unexpected(Error{"Cannot write tmp tokenizer file"});
+            ofs.write(json_content.data(), static_cast<std::streamsize>(json_content.size()));
+        }
+        auto result = load(tmp_path.string());
+        std::filesystem::remove(tmp_path);
+        return result;
+    }
+};
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  WordZip 词级分词器
+// ═══════════════════════════════════════════════════════════════════════════
+//  基于词频统计的词级分词器。
 //  Header-only，零外部依赖。
 //
 //  词表构成:
 //    ID 0~3    特殊 token (<pad>, <unk>, <bos>, <eos>)
-//    ID 4~259  256 个单字节
-//    ID 260+   V1 高频子词 + V2 超长短语
+//    ID 4~259  256 个单字节（用于未知字符回退）
+//    ID 260+   高频完整词
 //
-//  训练:
-//    V1 — 预分词 → 子串频率+上下文统计 → 词缀保护 → 独立度过滤填充
-//    V2 — 编码全文找残差 → ±8 字节上下文提取 → 长子串挖掘
-//  编码: 预分词 → 逐块贪心最长匹配 → Token ID 序列
-//  JSON 格式兼容 Python train_ByteZip.py。
+//  训练: 预分词 → 词频统计 → 按频次降序填充词表
+//  编码: 预分词 → 逐词查表 → 未知词逐字符回退到单字节 token
+//  JSON 格式与原 ByteZip 保持兼容。
 // ═══════════════════════════════════════════════════════════════════════════
 
-class ByteZipTokenizer
+class WordZipTokenizer : public Tokenizer
 {
 public:
     // ── 特殊 token ────────────────────────────────────────────────────
@@ -55,12 +90,7 @@ public:
     // ── 训练默认参数 ──────────────────────────────────────────────────
     static constexpr std::size_t   DEFAULT_VOCAB_SIZE   = 20000;
     static constexpr std::size_t   DEFAULT_V1_MAX_LEN   = 16;
-    static constexpr std::size_t   DEFAULT_V2_MAX_LEN   = 24;
     static constexpr std::uint32_t DEFAULT_MIN_FREQ     = 2;
-    static constexpr double        DEFAULT_SKIP_RATIO   = 1.2;
-    static constexpr double        DEFAULT_AFFIX_RATIO  = 0.4;
-    static constexpr std::size_t   DEFAULT_MAX_V2_BYTES = 300'000;
-    static constexpr std::size_t   SMALL_VOCAB_THRESHOLD = 1500;
 
     // ── 日志回调（默认 cout，nullptr 静默） ────────────────────────────
     using LogFn = std::function<void(std::string_view)>;
@@ -68,209 +98,115 @@ public:
     // ── 训练配置 ──────────────────────────────────────────────────────
     struct Config
     {
-        std::size_t   vocab_size          = DEFAULT_VOCAB_SIZE;
-        std::size_t   v1_max_len          = DEFAULT_V1_MAX_LEN;
-        std::size_t   v2_max_len          = DEFAULT_V2_MAX_LEN;
-        std::uint32_t min_freq            = DEFAULT_MIN_FREQ;
-        double        skip_ratio          = DEFAULT_SKIP_RATIO;
-        double        affix_protect_ratio = DEFAULT_AFFIX_RATIO;
-        std::size_t   v2_reserve          = 0;  // 0 = 自动分配
-        std::size_t   max_v2_scan_bytes   = DEFAULT_MAX_V2_BYTES;
-        LogFn         log                 = nullptr;
+        std::size_t   vocab_size = DEFAULT_VOCAB_SIZE;
+        std::uint32_t min_freq   = DEFAULT_MIN_FREQ;
+        LogFn         log        = nullptr;
+    };
+
+    // ── 词缀分析结果 ─────────────────────────────────────────────────
+    struct AffixInfo {
+        std::string affix;          // 词缀本身
+        std::size_t count;          // 包含此词缀的词数
+        std::size_t stem_found;     // 词根也在词表中的词数
+    };
+
+    struct WordSplit {
+        std::string word;           // 原词
+        std::string stem;           // 词根
+        std::string affix;          // 词缀
+        bool        is_suffix;      // true=后缀, false=前缀
     };
 
     // ══════════════════════════════════════════════════════════════════
     //  公开接口
     // ══════════════════════════════════════════════════════════════════
 
-    ByteZipTokenizer() = default;
+    WordZipTokenizer() = default;
 
     void train(const std::string &text) { train(text, Config{}); }
 
-    // ── 两阶段训练（V1 + V2） ─────────────────────────────────────────
+    // ── 词频训练 ──────────────────────────────────────────────────────
     void train(const std::string &text, const Config &config)
     {
         auto log = config.log
             ? config.log
             : LogFn{[](std::string_view m) { std::cout << m << '\n'; }};
 
-        max_v2_scan_bytes_ = config.max_v2_scan_bytes;
+        const auto min_freq = config.min_freq;
+        const auto target   = config.vocab_size;
 
-        const auto v1_max_len    = config.v1_max_len;
-        const auto v2_max_len    = config.v2_max_len;
-        const auto min_freq      = config.min_freq;
-        const auto skip_ratio    = config.skip_ratio;
-        const auto affix_ratio   = config.affix_protect_ratio;
-
-        // ── 智能槽位分配 ─────────────────────────────────────────────
-        std::size_t v1_target, v2_reserve;
-        if (config.vocab_size <= SMALL_VOCAB_THRESHOLD)
-        {
-            v2_reserve = 0;
-            v1_target  = config.vocab_size;
-            log("小词表模式 (<=1500): 跳过 V2，全部给 V1 (目标 "
-                + std::to_string(v1_target) + ")");
-        }
-        else
-        {
-            v2_reserve = config.v2_reserve != 0
-                ? config.v2_reserve
-                : std::min(std::size_t{1500},
-                           static_cast<std::size_t>(config.vocab_size * 0.12));
-            v1_target = config.vocab_size - v2_reserve;
-            if (v1_target < BYTE_OFFSET + 256)
-            {
-                v1_target  = BYTE_OFFSET + 256;
-                v2_reserve = config.vocab_size - v1_target;
-            }
-            log("大词表模式: V1 目标 " + std::to_string(v1_target)
-                + ", V2 预留 " + std::to_string(v2_reserve));
-        }
-
-        // ══════════════════════════════════════════════════════════════
-        //  V1: 频率 + 上下文统计 → 词缀保护填充
-        // ══════════════════════════════════════════════════════════════
-        log("\n[V1] 统计...");
+        // ── 预分词 → 词频统计 ────────────────────────────────────────
+        log("\n[训练] 预分词...");
         auto chunks = pre_tokenize(text);
 
         std::unordered_map<std::string, std::uint32_t> freq;
-        std::unordered_map<std::string, std::unordered_set<std::int32_t>> left_ctx, right_ctx;
-        freq.reserve(text.size() / 2);
-
+        freq.reserve(chunks.size());
         for (const auto &chunk : chunks)
-        {
-            const auto L = chunk.size();
-            if (L < 2) continue;
-            for (std::size_t s = 0; s < L; ++s)
-            {
-                const auto max_e = std::min(s + v1_max_len, L);
-                if (s + 2 > max_e) break;
-                for (auto e = s + 2; e <= max_e; ++e)
-                {
-                    auto sub = chunk.substr(s, e - s);
-                    ++freq[sub];
-                    left_ctx[sub].insert(s > 0
-                        ? static_cast<std::int32_t>(static_cast<unsigned char>(chunk[s - 1]))
-                        : -1);
-                    right_ctx[sub].insert(e < L
-                        ? static_cast<std::int32_t>(static_cast<unsigned char>(chunk[e]))
-                        : -1);
-                }
-            }
-        }
-        log("  不同子串数: " + std::to_string(freq.size()));
+            ++freq[chunk];
+        log("  不同词数: " + std::to_string(freq.size()));
 
-        // V1 排序
-        struct Entry { std::string sub; std::uint32_t cnt; std::size_t ben; std::size_t len; };
+        // 按频次降序排序
+        struct Entry { std::string word; std::uint32_t cnt; };
         std::vector<Entry> sorted;
         sorted.reserve(freq.size());
-        for (const auto &[s, c] : freq)
-        {
-            auto l = s.size();
-            sorted.push_back({s, c, static_cast<std::size_t>(c) * (l - 1), l});
-        }
+        for (const auto &[w, c] : freq)
+            sorted.push_back({w, c});
         std::ranges::sort(sorted, [](const Entry &a, const Entry &b)
-        { return a.ben != b.ben ? a.ben > b.ben : a.len > b.len; });
+        { return a.cnt > b.cnt; });
 
-        // 初始化词表
+        // 初始化词表：特殊 token + 256 单字节
         vocab_.clear();
         vocab_.resize(BYTE_OFFSET);
         for (std::size_t i = 0; i < 256; ++i)
             vocab_.emplace_back(1, static_cast<char>(i));
 
-        // 词缀检测 + 独立度过滤
-        std::unordered_set<std::string> skip;
-        skip.reserve(sorted.size() / 4);
+        // 按频次填充词表
         std::size_t added = 0;
-
         for (const auto &e : sorted)
         {
-            if (vocab_.size() >= v1_target) break;
+            if (vocab_.size() >= target) break;
             if (e.cnt < min_freq) break;
-            if (e.len <= 1 || skip.contains(e.sub)) continue;
-
-            // 词缀判断：使用上下文多样性
-            auto lit = left_ctx.find(e.sub);
-            auto rit = right_ctx.find(e.sub);
-            bool is_suffix = false, is_prefix = false;
-            if (lit != left_ctx.end() && rit != right_ctx.end())
-            {
-                auto len_l = lit->second.size();
-                auto len_r = rit->second.size();
-                is_suffix = (len_l >= 3 && len_l > len_r * 2.0);
-                is_prefix = (len_r >= 3 && len_r > len_l * 2.0);
-            }
-            const auto threshold = (is_suffix || is_prefix) ? affix_ratio : skip_ratio;
-
-            // 智能 skip
-            const auto sl = e.sub.size();
-            for (std::size_t i = 0; i < sl; ++i)
-                for (std::size_t j = i + 2; j <= sl; ++j)
-                {
-                    if (i == 0 && j == sl) continue;
-                    auto child = e.sub.substr(i, j - i);
-                    auto it = freq.find(child);
-                    if (it != freq.end() &&
-                        it->second <= static_cast<std::uint32_t>(e.cnt * threshold))
-                        skip.insert(std::move(child));
-                }
-
-            vocab_.push_back(e.sub);
+            if (e.word.size() <= 1) continue;   // 单字符已在单字节表中
+            vocab_.push_back(e.word);
             ++added;
             if (added % 1000 == 0)
-                log("  V1: 已添加 " + std::to_string(added) + " 个词条（总 "
+                log("  已添加 " + std::to_string(added) + " 个词条（总 "
                     + std::to_string(vocab_.size()) + "）");
-        }
-        log("V1 完成: " + std::to_string(vocab_.size()) + " 词条（新增 "
-            + std::to_string(added) + "）");
-
-        // ══════════════════════════════════════════════════════════════
-        //  V2: 残差挖掘（仅当预留 > 0）
-        // ══════════════════════════════════════════════════════════════
-        if (v2_reserve > 0)
-        {
-            log("\n[V2] 提取残差...");
-            // 构建 V1 查找表
-            LookupTable lookup_v1;
-            for (std::size_t tid = BYTE_OFFSET; tid < vocab_.size(); ++tid)
-                if (!vocab_[tid].empty() && vocab_[tid].size() <= v1_max_len)
-                    lookup_v1[vocab_[tid]] = tid;
-
-            // 编码全文找残差跨度
-            auto data = text;  // 保持 UTF-8
-            auto spans = get_residual_spans(data, lookup_v1, v1_max_len);
-            std::size_t total_bytes = 0;
-            for (const auto &sp : spans) total_bytes += sp.size();
-            log("  残差跨度: " + std::to_string(spans.size()) + ", 总字节: "
-                + std::to_string(total_bytes));
-
-            if (!spans.empty())
-            {
-                log("  挖掘超长短语（最多 " + std::to_string(v2_reserve) + " 个）...");
-                auto v2_words = build_v2_from_spans(spans, v2_max_len, v2_reserve);
-                std::unordered_set<std::string> existing(vocab_.begin(), vocab_.end());
-                for (const auto &w : v2_words)
-                {
-                    if (vocab_.size() >= config.vocab_size) break;
-                    if (!existing.contains(w))
-                    {
-                        vocab_.push_back(w);
-                        existing.insert(w);
-                    }
-                }
-                log("  V2 新增 " + std::to_string(vocab_.size() - (BYTE_OFFSET + 256 + added))
-                    + " 个");
-            }
-        }
-        else
-        {
-            log("\n[V2] 跳过（小词表或预留为 0）");
         }
 
         // ── 最终查找表 ───────────────────────────────────────────────
         log("\n最终词表: " + std::to_string(vocab_.size()));
-        max_subword_len_ = std::max(v1_max_len, v2_max_len);
+        max_subword_len_ = 0;
+        for (std::size_t i = BYTE_OFFSET; i < vocab_.size(); ++i)
+            if (vocab_[i].size() > max_subword_len_)
+                max_subword_len_ = vocab_[i].size();
         build_lookup();
+
+        // ── 词缀分析 + 词分解 ───────────────────────────────────────
+        analyze_affixes();
+        build_decomposition();
+
+        // ── 删除可分解词 ───────────────────────────────────────────
+        std::size_t removed = 0;
+        std::unordered_set<std::string> to_remove;
+        for (const auto &[word, parts] : decompose_map_)
+            to_remove.insert(word);
+
+        // 从 vocab_ 中移除可分解词（保留 ID 槽，置空）
+        for (std::size_t i = BYTE_OFFSET; i < vocab_.size(); ++i)
+        {
+            if (to_remove.contains(vocab_[i]))
+            {
+                vocab_[i].clear();
+                ++removed;
+            }
+        }
+
+        // 重建查找表（移除的词不再出现在 lookup_ 中）
+        build_lookup();
+
+        log("  已移除可分解词: " + std::to_string(removed) + " 个");
+        log("最终词表（有效）: " + std::to_string(vocab_.size() - removed));
     }
 
     // ── 编码 ──────────────────────────────────────────────────────────
@@ -302,7 +238,7 @@ public:
         std::ofstream ofs(path);
         if (!ofs) return std::unexpected(Error{"Cannot write: " + path});
 
-        ofs << "{\n  \"type\": \"freq_based_tokenizer\",\n  \"vocab\": {\n";
+        ofs << "{\n  \"type\": \"wordzip_tokenizer\",\n  \"vocab\": {\n";
         bool first = true;
         for (std::size_t tid = BYTE_OFFSET; tid < vocab_.size(); ++tid)
         {
@@ -317,7 +253,29 @@ public:
         ofs << "\n  },\n  \"vocab_size\": " << std::dec << vocab_.size()
             << ",\n  \"byte_offset\": " << BYTE_OFFSET
             << ",\n  \"max_subword_len\": " << max_subword_len_
-            << ",\n  \"special_tokens\": {"
+            << ",\n  \"decompose\": {";
+        {
+            bool f = true;
+            for (const auto &[word, parts] : decompose_map_)
+            {
+                ofs << (f ? "\n" : ",\n");
+                f = false;
+                ofs << "    \"";
+                for (unsigned char b : word)
+                    ofs << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(b);
+                ofs << "\": [";
+                for (std::size_t pi = 0; pi < parts.size(); ++pi)
+                {
+                    if (pi > 0) ofs << ", ";
+                    ofs << "\"";
+                    for (unsigned char b : parts[pi])
+                        ofs << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(b);
+                    ofs << "\"";
+                }
+                ofs << "]";
+            }
+        }
+        ofs << "\n  },\n  \"special_tokens\": {"
             << "\n    \"<pad>\": 0,\n    \"<unk>\": 1,"
             << "\n    \"<bos>\": 2,\n    \"<eos>\": 3\n  }\n}\n";
         return {};
@@ -389,6 +347,59 @@ public:
             }
 
         build_lookup();
+
+        // ── 加载分解规则 ──────────────────────────────────────────────
+        decompose_map_.clear();
+        if (auto dp = content.find("\"decompose\""); dp != std::string::npos)
+        {
+            auto dbr = content.find('{', dp);
+            if (dbr != std::string::npos)
+            {
+                std::size_t dpos = dbr + 1;
+                while (dpos < content.size())
+                {
+                    while (dpos < content.size() && (content[dpos]==' '||content[dpos]=='\n'||
+                           content[dpos]=='\r'||content[dpos]=='\t'||content[dpos]==',')) ++dpos;
+                    if (dpos >= content.size() || content[dpos] == '}') break;
+                    if (content[dpos] != '"') { ++dpos; continue; }
+                    ++dpos;
+                    std::string key_hex;
+                    while (dpos < content.size() && content[dpos] != '"') key_hex += content[dpos++];
+                    ++dpos;
+                    // skip to '['
+                    while (dpos < content.size() && content[dpos] != '[') ++dpos;
+                    ++dpos;
+                    // read array elements
+                    std::vector<std::string> parts;
+                    while (dpos < content.size())
+                    {
+                        while (dpos < content.size() && (content[dpos]==' '||content[dpos]=='\n'||
+                               content[dpos]=='\r'||content[dpos]=='\t'||content[dpos]==',')) ++dpos;
+                        if (dpos >= content.size() || content[dpos] == ']') break;
+                        if (content[dpos] == '"')
+                        {
+                            ++dpos;
+                            std::string hex;
+                            while (dpos < content.size() && content[dpos] != '"') hex += content[dpos++];
+                            ++dpos;
+                            std::string part;
+                            for (std::size_t h = 0; h+1 < hex.size(); h += 2)
+                            { unsigned b = 0; std::from_chars(hex.data()+h, hex.data()+h+2, b, 16); part += static_cast<char>(b); }
+                            parts.push_back(std::move(part));
+                        }
+                        else ++dpos;
+                    }
+                    ++dpos; // skip ']'
+                    std::string word;
+                    for (std::size_t h = 0; h+1 < key_hex.size(); h += 2)
+                    { unsigned b = 0; std::from_chars(key_hex.data()+h, key_hex.data()+h+2, b, 16); word += static_cast<char>(b); }
+                    if (!parts.empty())
+                        decompose_map_[std::move(word)] = std::move(parts);
+                }
+            }
+        }
+
+        analyze_affixes();
         return {};
     }
 
@@ -422,6 +433,268 @@ public:
         }
         return r;
     }
+
+    // ── 词缀分析（纯数据驱动，无硬编码词缀） ────────────────────────
+    void analyze_affixes()
+    {
+        suffixes_.clear();
+        prefixes_.clear();
+        splits_.clear();
+
+        // 构建词表集合（O(1) 查找）
+        std::unordered_set<std::string> vocab_set;
+        for (std::size_t i = BYTE_OFFSET; i < vocab_.size(); ++i)
+            if (!vocab_[i].empty() && vocab_[i].size() >= 2)
+                vocab_set.insert(vocab_[i]);
+
+        // ── 后缀检测 ────────────────────────────────────────────────
+        // 遍历每个词的所有可能后缀(长度2~5)，统计频率与词根覆盖率
+        std::unordered_map<std::string, std::pair<std::size_t, std::size_t>> suffix_stats;
+        for (const auto &word : vocab_)
+        {
+            if (word.size() < MIN_WORD_LEN) continue;
+            if (!std::ranges::all_of(word, is_alpha)) continue;
+
+            for (std::size_t slen = MIN_AFFIX_LEN;
+                 slen <= std::min(MAX_AFFIX_LEN, word.size() - MIN_AFFIX_LEN); ++slen)
+            {
+                auto stem   = word.substr(0, word.size() - slen);
+                auto suffix = word.substr(word.size() - slen);
+                auto &[count, stem_found] = suffix_stats[suffix];
+                ++count;
+                if (vocab_set.contains(stem))
+                    ++stem_found;
+            }
+        }
+
+        for (const auto &[suffix, stats] : suffix_stats)
+        {
+            auto [count, stem_found] = stats;
+            if (count >= MIN_AFFIX_COUNT &&
+                static_cast<double>(stem_found) / count >= MIN_COVERAGE)
+                suffixes_.push_back({suffix, count, stem_found});
+        }
+        std::ranges::sort(suffixes_, [](const AffixInfo &a, const AffixInfo &b)
+        { return a.count > b.count; });
+
+        // ── 前缀检测 ────────────────────────────────────────────────
+        // 同理统计词首 n-gram 的频率与词根覆盖率
+        std::unordered_map<std::string, std::pair<std::size_t, std::size_t>> prefix_stats;
+        for (const auto &word : vocab_)
+        {
+            if (word.size() < MIN_WORD_LEN) continue;
+            if (!std::ranges::all_of(word, is_alpha)) continue;
+
+            for (std::size_t plen = MIN_AFFIX_LEN;
+                 plen <= std::min(std::size_t{4}, word.size() - MIN_AFFIX_LEN); ++plen)
+            {
+                auto prefix = word.substr(0, plen);
+                auto stem   = word.substr(plen);
+                auto &[count, stem_found] = prefix_stats[prefix];
+                ++count;
+                if (vocab_set.contains(stem))
+                    ++stem_found;
+            }
+        }
+
+        for (const auto &[prefix, stats] : prefix_stats)
+        {
+            auto [count, stem_found] = stats;
+            if (count >= MIN_AFFIX_COUNT &&
+                static_cast<double>(stem_found) / count >= MIN_COVERAGE)
+                prefixes_.push_back({prefix, count, stem_found});
+        }
+        std::ranges::sort(prefixes_, [](const AffixInfo &a, const AffixInfo &b)
+        { return a.count > b.count; });
+
+        // ── 词拆分 ──────────────────────────────────────────────────
+        // 对每个词：优先匹配最长后缀 → 其次匹配最长前缀
+        for (const auto &word : vocab_)
+        {
+            if (word.size() < MIN_WORD_LEN) continue;
+            if (!std::ranges::all_of(word, is_alpha)) continue;
+
+            // 优先尝试后缀（从最长到最短）
+            bool found = false;
+            for (const auto &affix : suffixes_)
+            {
+                if (word.size() <= affix.affix.size()) continue;
+                if (word.ends_with(affix.affix))
+                {
+                    auto stem = word.substr(0, word.size() - affix.affix.size());
+                    if (stem.size() >= 2 && vocab_set.contains(stem))
+                    {
+                        splits_.push_back({word, stem, affix.affix, true});
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (found) continue;
+
+            // 尝试前缀
+            for (const auto &affix : prefixes_)
+            {
+                if (word.size() <= affix.affix.size()) continue;
+                if (word.starts_with(affix.affix))
+                {
+                    auto stem = word.substr(affix.affix.size());
+                    if (stem.size() >= 2 && vocab_set.contains(stem))
+                    {
+                        splits_.push_back({word, stem, affix.affix, false});
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 词分解：检测词表中可拆分为两个词表词的组合 ──────────────────
+    // 纯数据驱动：只要 A+B 都在词表中且长度合理，就记录为可分解
+    void build_decomposition()
+    {
+        decompose_map_.clear();
+
+        // 构建词表集合
+        std::unordered_set<std::string> vocab_set;
+        for (std::size_t i = BYTE_OFFSET; i < vocab_.size(); ++i)
+            if (!vocab_[i].empty())
+                vocab_set.insert(vocab_[i]);
+
+        for (const auto &word : vocab_)
+        {
+            if (word.size() < 4) continue;
+
+            // 剥离前导非字母（如空格），保留前缀字符串以便还原
+            std::string prefix;
+            std::string word_body;
+
+            if (!is_alpha(word.front()))
+            {
+                auto first_alpha = static_cast<std::size_t>(std::ranges::distance(
+                    word.begin(), std::ranges::find_if(word, is_alpha)));
+                if (first_alpha > 0 && first_alpha < word.size())
+                {
+                    prefix    = word.substr(0, first_alpha);
+                    word_body = word.substr(first_alpha);
+                }
+                else
+                {
+                    word_body = word;
+                }
+            }
+            else
+            {
+                word_body = word;
+            }
+
+            if (word_body.size() < 4 || !std::ranges::all_of(word_body, is_alpha))
+                continue;
+
+            // 找最优二分：偏好更长、更均衡的拆分
+            std::size_t best_min = 0;
+            std::vector<std::string> best_parts;
+
+            for (std::size_t pos = 1; pos < word_body.size(); ++pos)
+            {
+                auto a = word_body.substr(0, pos);
+                auto b = word_body.substr(pos);
+
+                if (vocab_set.contains(a) && vocab_set.contains(b))
+                {
+                    auto m = std::min(pos, word_body.size() - pos);
+                    if (m >= 2 && m > best_min)
+                    {
+                        best_min = m;
+                        // 还原：前缀附加到第一部分
+                        best_parts = {prefix + a, b};
+                    }
+                }
+            }
+
+            if (!best_parts.empty())
+                decompose_map_[word] = std::move(best_parts);
+        }
+    }
+
+    // ── 打印词缀分析报告 ──────────────────────────────────────────────
+    void print_affix_report(std::ostream &os = std::cout) const
+    {
+        os << "\n══════════════════════════════════════════════\n";
+        os << "  词缀分析报告\n";
+        os << "══════════════════════════════════════════════\n";
+
+        // ── 后缀表 ──────────────────────────────────────────────────
+        os << "\n后缀表 (共 " << suffixes_.size() << " 个):\n";
+        for (const auto &s : suffixes_)
+        {
+            std::string examples;
+            std::size_t n = 0;
+            for (const auto &sp : splits_)
+            {
+                if (sp.is_suffix && sp.affix == s.affix)
+                {
+                    if (n > 0) examples += ", ";
+                    examples += sp.stem + "+" + sp.affix;
+                    if (++n >= 3) break;
+                }
+            }
+            double cov = 100.0 * s.stem_found / s.count;
+            os << "  " << s.affix << "  ×" << s.count
+               << "  覆盖" << std::fixed << std::setprecision(1) << cov << "%"
+               << "  例: " << examples << "\n";
+        }
+
+        // ── 前缀表 ──────────────────────────────────────────────────
+        os << "\n前缀表 (共 " << prefixes_.size() << " 个):\n";
+        for (const auto &p : prefixes_)
+        {
+            std::string examples;
+            std::size_t n = 0;
+            for (const auto &sp : splits_)
+            {
+                if (!sp.is_suffix && sp.affix == p.affix)
+                {
+                    if (n > 0) examples += ", ";
+                    examples += p.affix + "+" + sp.stem;
+                    if (++n >= 3) break;
+                }
+            }
+            double cov = 100.0 * p.stem_found / p.count;
+            os << "  " << p.affix << "  ×" << p.count
+               << "  覆盖" << std::fixed << std::setprecision(1) << cov << "%"
+               << "  例: " << examples << "\n";
+        }
+
+        // ── 词拆分表 ────────────────────────────────────────────────
+        os << "\n词拆分表 (共 " << splits_.size() << " 个):\n";
+        for (const auto &sp : splits_)
+        {
+            os << "  " << sp.word << " → " << sp.stem
+               << " + " << (sp.is_suffix ? "" : "[前缀]") << sp.affix << "\n";
+        }
+
+        // ── 词分解规则 ────────────────────────────────────────────────
+        os << "\n词分解规则 (共 " << decompose_map_.size() << " 个):\n";
+        for (const auto &[word, parts] : decompose_map_)
+        {
+            os << "  " << word << " → ";
+            for (std::size_t i = 0; i < parts.size(); ++i)
+            {
+                if (i > 0) os << " + ";
+                os << parts[i];
+            }
+            os << "\n";
+        }
+
+        os << "\n══════════════════════════════════════════════\n";
+    }
+
+    // ── 访问器（词缀分析结果） ────────────────────────────────────────
+    [[nodiscard]] const std::vector<AffixInfo> &suffixes() const noexcept { return suffixes_; }
+    [[nodiscard]] const std::vector<AffixInfo> &prefixes() const noexcept { return prefixes_; }
+    [[nodiscard]] const std::vector<WordSplit> &splits()    const noexcept { return splits_; }
+    [[nodiscard]] const std::unordered_map<std::string, std::vector<std::string>> &decompose_map() const noexcept { return decompose_map_; }
 
     // ── 预分词（公开，供外部复用） ────────────────────────────────────
     [[nodiscard]] static std::vector<std::string> pre_tokenize(std::string_view text)
@@ -478,6 +751,18 @@ private:
     using LookupTable = std::unordered_map<std::string, std::size_t, TransparentHash, TransparentEqual>;
     LookupTable lookup_;
 
+    // ── 词缀分析参数与结果 ────────────────────────────────────────────
+    static constexpr std::size_t MIN_AFFIX_LEN   = 2;   // 最短词缀长度
+    static constexpr std::size_t MAX_AFFIX_LEN   = 5;   // 最长词缀长度
+    static constexpr std::size_t MIN_WORD_LEN    = 4;   // 词根至少 2 字符
+    static constexpr std::size_t MIN_AFFIX_COUNT = 3;   // 最少出现词数
+    static constexpr double      MIN_COVERAGE    = 0.5;  // 词根覆盖率阈值
+
+    std::vector<AffixInfo>  suffixes_;
+    std::vector<AffixInfo>  prefixes_;
+    std::vector<WordSplit>  splits_;
+    std::unordered_map<std::string, std::vector<std::string>> decompose_map_;
+
     // ── 字符分类 ──────────────────────────────────────────────────────
     [[nodiscard]] static constexpr bool is_alpha(char c)      noexcept { return (c>='a'&&c<='z')||(c>='A'&&c<='Z'); }
     [[nodiscard]] static constexpr bool is_digit(char c)      noexcept { return c>='0'&&c<='9'; }
@@ -495,143 +780,33 @@ private:
         return 0;
     }
 
-    // ── 编码（使用指定查找表，返回位置） ──────────────────────────────
-    struct EncodedChunk { std::vector<std::size_t> ids; std::vector<std::size_t> positions; };
-
-    [[nodiscard]] EncodedChunk encode_with_positions(
-        std::string_view data, const LookupTable &lut, std::size_t max_len) const
-    {
-        EncodedChunk result;
-        result.ids.reserve(data.size());
-        result.positions.reserve(data.size());
-        std::size_t pos = 0;
-        while (pos < data.size())
-        {
-            result.positions.push_back(pos);
-            auto best_id  = static_cast<std::size_t>(static_cast<unsigned char>(data[pos])) + BYTE_OFFSET;
-            auto best_len = std::size_t{1};
-            for (auto l = std::min(max_len, data.size() - pos); l > 1; --l)
-                if (auto it = lut.find(data.substr(pos, l)); it != lut.end())
-                { best_id = it->second; best_len = l; break; }
-            result.ids.push_back(best_id);
-            pos += best_len;
-        }
-        return result;
-    }
-
     // ── 编码（内部，用于 encode()） ───────────────────────────────────
+    // ── decompose_map → byte fallback → 整词查表
     [[nodiscard]] std::vector<std::size_t> encode_bytes(std::string_view data) const
     {
+        // 1. 优先查分解规则（被移除的可分解词走这里）
+        auto dec_it = decompose_map_.find(std::string(data));
+        if (dec_it != decompose_map_.end())
+        {
+            std::vector<std::size_t> ids;
+            for (const auto &part : dec_it->second)
+            {
+                auto part_ids = encode_bytes(part);
+                ids.insert(ids.end(), part_ids.begin(), part_ids.end());
+            }
+            return ids;
+        }
+
+        // 2. 整词匹配
+        if (auto it = lookup_.find(data); it != lookup_.end())
+            return {it->second};
+
+        // 3. 逐字符回退到单字节 token
         std::vector<std::size_t> ids;
         ids.reserve(data.size());
-        std::size_t pos = 0;
-        while (pos < data.size())
-        {
-            auto best_id  = static_cast<std::size_t>(static_cast<unsigned char>(data[pos])) + BYTE_OFFSET;
-            auto best_len = std::size_t{1};
-            for (auto l = std::min(max_subword_len_, data.size()-pos); l > 1; --l)
-                if (auto it = lookup_.find(data.substr(pos, l)); it != lookup_.end())
-                { best_id = it->second; best_len = l; break; }
-            ids.push_back(best_id);
-            pos += best_len;
-        }
+        for (unsigned char b : data)
+            ids.push_back(static_cast<std::size_t>(b) + BYTE_OFFSET);
         return ids;
-    }
-
-    // ── V2: 提取残差跨度 ──────────────────────────────────────────────
-    // 用 V1 查找表编码全文，找到单字节运行段，提取 ±8 上下文
-    [[nodiscard]] std::vector<std::string> get_residual_spans(
-        const std::string &text, const LookupTable &lut, std::size_t max_len) const
-    {
-        auto enc = encode_with_positions(text, lut, max_len);
-        const auto n_tokens = enc.ids.size();
-        const auto data_size = text.size();
-
-        std::vector<std::string> spans;
-        std::size_t i = 0;
-        while (i < n_tokens)
-        {
-            if (enc.ids[i] < BYTE_OFFSET + 256)
-            {
-                auto start_pos = enc.positions[i];
-                auto j = i;
-                while (j < n_tokens && enc.ids[j] < BYTE_OFFSET + 256)
-                    ++j;
-                auto end_pos = (j < n_tokens) ? enc.positions[j] : data_size;
-                auto ext_start = (start_pos >= 8) ? start_pos - 8 : 0;
-                auto ext_end   = std::min(data_size, end_pos + 8);
-                spans.emplace_back(text.substr(ext_start, ext_end - ext_start));
-                i = j;
-            }
-            else
-            {
-                ++i;
-            }
-        }
-        return spans;
-    }
-
-    // ── V2: 从残差跨度挖掘超长短语 ────────────────────────────────────
-    [[nodiscard]] std::vector<std::string> build_v2_from_spans(
-        std::vector<std::string> &spans, std::size_t max_len,
-        std::size_t max_items) const
-    {
-        std::size_t total_bytes = 0;
-        for (const auto &s : spans) total_bytes += s.size();
-        if (total_bytes == 0 || max_items == 0)
-            return {};
-
-        // 采样：如果超过上限，随机采样
-        if (total_bytes > max_v2_scan_bytes_)
-        {
-            // 简单采样：打乱后截取
-            std::ranges::shuffle(spans, rng_);
-            std::string sampled;
-            sampled.reserve(max_v2_scan_bytes_);
-            for (const auto &sp : spans)
-            {
-                if (sampled.size() >= max_v2_scan_bytes_) break;
-                auto remain = max_v2_scan_bytes_ - sampled.size();
-                sampled.append(sp, 0, remain);
-            }
-            spans = {std::move(sampled)};
-        }
-
-        // 统计子串频率（仅长度 16..max_len）
-        std::unordered_map<std::string, std::uint32_t> freq;
-        for (const auto &span : spans)
-        {
-            const auto L = span.size();
-            if (L < 16) continue;
-            for (std::size_t s = 0; s < L; ++s)
-            {
-                const auto max_e = std::min(s + max_len, L);
-                if (s + 16 > max_e) break;
-                for (auto e = s + 16; e <= max_e; ++e)
-                    ++freq[span.substr(s, e - s)];
-            }
-        }
-
-        // 按压缩收益排序，过滤 freq < 2
-        struct V2Entry { std::string sub; std::uint32_t cnt; std::size_t ben; };
-        std::vector<V2Entry> sorted;
-        sorted.reserve(freq.size());
-        for (const auto &[s, c] : freq)
-        {
-            if (c < 2) continue;
-            sorted.push_back({s, c, static_cast<std::size_t>(c) * (s.size() - 1)});
-        }
-        std::ranges::sort(sorted, [](const V2Entry &a, const V2Entry &b)
-        { return a.ben > b.ben; });
-
-        std::vector<std::string> result;
-        result.reserve(std::min(max_items, sorted.size()));
-        for (auto &e : sorted)
-        {
-            if (result.size() >= max_items) break;
-            result.push_back(std::move(e.sub));
-        }
-        return result;
     }
 
     // ── 构建查找表 ────────────────────────────────────────────────────
@@ -643,12 +818,541 @@ private:
             if (!vocab_[i].empty()) lookup_[vocab_[i]] = i;
     }
 
-    // ── 训练用 RNG ────────────────────────────────────────────────────
-    inline static thread_local std::mt19937_64 rng_{std::random_device{}()};
-
-    // ── V2 采样上限（从 config 传入） ──────────────────────────────────
-    std::size_t max_v2_scan_bytes_ = DEFAULT_MAX_V2_BYTES;
 };
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SpaceTokenizer — 基于空格的分词器
+// ═══════════════════════════════════════════════════════════════════════════
+//  训练：按空格分词 → 词频统计 → 截断 top-N 填充词表
+//  编码：空格分词 → 查词表 → 未命中则逐字符 ASCII 回退
+//  解码：多字节 token 空格分隔，单字节 token 直接拼接
+// ═══════════════════════════════════════════════════════════════════════════
+
+class SpaceTokenizer : public Tokenizer
+{
+public:
+    static constexpr std::size_t UNK_ID = 0;
+    static constexpr std::size_t PAD_ID = 1;
+    static constexpr std::size_t NUM_ID = 2;
+    static constexpr std::size_t ASCII_BASE = 3;
+    static constexpr std::size_t DEFAULT_VOCAB_SIZE = 10000;
+    static constexpr std::uint32_t DEFAULT_MIN_FREQ = 2;
+
+    using LogFn = std::function<void(std::string_view)>;
+
+    struct Config
+    {
+        std::size_t   vocab_size = DEFAULT_VOCAB_SIZE;
+        std::uint32_t min_freq   = DEFAULT_MIN_FREQ;
+        LogFn         log        = nullptr;
+    };
+
+    SpaceTokenizer() = default;
+
+    void train(const std::string &text) { train(text, Config{}); }
+
+    void train(const std::string &text, const Config &config)
+    {
+        auto log = config.log
+            ? config.log
+            : LogFn{[](std::string_view m) { std::cout << m << '\n'; }};
+
+        log("\n[Space 训练] 分词统计...");
+
+        std::unordered_map<std::string, std::uint32_t> freq;
+        {
+            std::istringstream iss(text);
+            std::string word;
+            while (iss >> word)
+                ++freq[word];
+        }
+        log("  不同词数: " + std::to_string(freq.size()));
+
+        struct Entry { std::string word; std::uint32_t cnt; };
+        std::vector<Entry> sorted;
+        sorted.reserve(freq.size());
+        for (const auto &[w, c] : freq)
+            sorted.push_back({w, c});
+        std::ranges::sort(sorted, [](const Entry &a, const Entry &b)
+        { return a.cnt > b.cnt; });
+
+        id_to_token_.clear();
+        id_to_token_.resize(ASCII_BASE);
+        for (std::size_t i = 0; i < 128; ++i)
+            id_to_token_.emplace_back(1, static_cast<char>(i));
+
+        std::size_t added = 0;
+        for (const auto &e : sorted)
+        {
+            if (id_to_token_.size() >= config.vocab_size) break;
+            if (e.cnt < config.min_freq) break;
+            if (e.word.size() <= 1) continue;
+            id_to_token_.push_back(e.word);
+            if (++added % 1000 == 0)
+                log("  已添加 " + std::to_string(added) + " 个词");
+        }
+
+        build_lookup();
+        log("最终词表: " + std::to_string(id_to_token_.size()));
+    }
+
+    [[nodiscard]] std::vector<std::size_t> encode(const std::string &text) const override
+    {
+        std::vector<std::size_t> tokens;
+        std::istringstream iss(text);
+        std::string word;
+
+        while (iss >> word)
+        {
+            if (is_numeric(word))
+            {
+                tokens.push_back(NUM_ID);
+            }
+            else if (auto it = token_to_id_.find(word); it != token_to_id_.end())
+            {
+                tokens.push_back(it->second);
+            }
+            else
+            {
+                for (char c : word)
+                {
+                    auto id = static_cast<std::size_t>(static_cast<unsigned char>(c)) + ASCII_BASE;
+                    tokens.push_back(id < id_to_token_.size() ? id : UNK_ID);
+                }
+            }
+        }
+        return tokens;
+    }
+
+    [[nodiscard]] std::string decode(std::span<const std::size_t> ids) const override
+    {
+        std::string result;
+        for (auto id : ids)
+        {
+            if (id < id_to_token_.size())
+            {
+                const auto &tok = id_to_token_[id];
+                if (tok.size() > 1) { if (!result.empty()) result += ' '; result += tok; }
+                else result += tok;
+            }
+            else { if (!result.empty()) result += ' '; result += "<unk>"; }
+        }
+        return result;
+    }
+
+    [[nodiscard]] Result<void> save(const std::string &path) const override
+    {
+        std::ofstream ofs(path);
+        if (!ofs) return std::unexpected(Error{"Cannot write: " + path});
+        ofs << "{\n  \"type\": \"space_tokenizer\",\n  \"vocab\": {\n";
+        bool first = true;
+        for (std::size_t tid = ASCII_BASE; tid < id_to_token_.size(); ++tid)
+        {
+            if (id_to_token_[tid].empty()) continue;
+            if (!first) ofs << ",\n";
+            first = false;
+            ofs << "    \"" << std::dec << tid << "\": \"";
+            for (unsigned char b : id_to_token_[tid])
+                ofs << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(b);
+            ofs << "\"" << std::dec;
+        }
+        ofs << "\n  },\n  \"vocab_size\": " << std::dec << id_to_token_.size()
+            << ",\n  \"special_tokens\": {"
+            << "\n    \"<unk>\": 0,\n    \"<pad>\": 1,\n    \"<num>\": 2\n  }\n}\n";
+        return {};
+    }
+
+    [[nodiscard]] Result<void> load(const std::string &path) override
+    {
+        std::ifstream ifs(path);
+        if (!ifs) return std::unexpected(Error{"Cannot read: " + path});
+        std::string content((std::istreambuf_iterator<char>(ifs)),
+                             std::istreambuf_iterator<char>());
+        id_to_token_.clear();
+        token_to_id_.clear();
+
+        if (auto p = content.find("\"vocab_size\""); p != std::string::npos)
+            if (auto c = content.find(':', p); c != std::string::npos)
+            {
+                ++c; while (c < content.size() && content[c] == ' ') ++c;
+                std::size_t v = 0;
+                if (auto [ptr, ec] = std::from_chars(content.data()+c, content.data()+content.size(), v); ec == std::errc{})
+                    id_to_token_.resize(v);
+            }
+
+        auto vp = content.find("\"vocab\"");
+        if (vp == std::string::npos)
+            return std::unexpected(Error{"Invalid JSON: missing \"vocab\""});
+        auto br = content.find('{', vp);
+        if (br == std::string::npos)
+            return std::unexpected(Error{"Invalid JSON: missing '{'"});
+
+        std::size_t pos = br + 1;
+        while (pos < content.size())
+        {
+            while (pos < content.size() && (content[pos]==' '||content[pos]=='\n'||
+                   content[pos]=='\r'||content[pos]=='\t'||content[pos]==',')) ++pos;
+            if (pos >= content.size() || content[pos] == '}') break;
+            if (content[pos] != '"') { ++pos; continue; }
+            ++pos; std::string key;
+            while (pos < content.size() && content[pos] != '"') key += content[pos++];
+            ++pos;
+            while (pos < content.size() && (content[pos]==' '||content[pos]==':')) ++pos;
+            if (pos < content.size() && content[pos] == '"')
+            {
+                ++pos; std::string hex;
+                while (pos < content.size() && content[pos] != '"') hex += content[pos++];
+                ++pos;
+                std::size_t id = 0;
+                std::from_chars(key.data(), key.data()+key.size(), id);
+                std::string tok;
+                for (std::size_t i = 0; i+1 < hex.size(); i += 2)
+                { unsigned b = 0; std::from_chars(hex.data()+i, hex.data()+i+2, b, 16); tok += static_cast<char>(b); }
+                if (id >= id_to_token_.size()) id_to_token_.resize(id+1);
+                id_to_token_[id] = std::move(tok);
+            }
+        }
+        build_lookup();
+        return {};
+    }
+
+    [[nodiscard]] std::size_t vocab_size() const noexcept override { return id_to_token_.size(); }
+    [[nodiscard]] const std::vector<std::string> &vocab() const noexcept override { return id_to_token_; }
+
+private:
+    std::vector<std::string> id_to_token_;
+    std::unordered_map<std::string, std::size_t> token_to_id_;
+
+    [[nodiscard]] static bool is_numeric(const std::string &s) noexcept
+    {
+        if (s.empty()) return false;
+        for (char c : s) if (c < '0' || c > '9') return false;
+        return true;
+    }
+
+    void build_lookup()
+    {
+        token_to_id_.clear();
+        token_to_id_.reserve(id_to_token_.size());
+        for (std::size_t i = 0; i < id_to_token_.size(); ++i)
+            if (!id_to_token_[i].empty())
+                token_to_id_[id_to_token_[i]] = i;
+    }
+};
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  BPETokenizer — 真正的 Byte-Pair Encoding 分词器
+// ═══════════════════════════════════════════════════════════════════════════
+//  训练：GPT-2 风格预分词 → 迭代 byte-pair 合并
+//  编码：预分词 → 按合并优先级对字节序列进行合并
+//  解码：直接拼接字节
+// ═══════════════════════════════════════════════════════════════════════════
+
+class BPETokenizer : public Tokenizer
+{
+public:
+    static constexpr std::size_t BYTE_BASE       = 256;
+    static constexpr std::size_t DEFAULT_VOCAB_SIZE = 5000;
+    static constexpr std::size_t DEFAULT_MIN_FREQ   = 2;
+
+    using LogFn = std::function<void(std::string_view)>;
+
+    struct Config
+    {
+        std::size_t   vocab_size = DEFAULT_VOCAB_SIZE;
+        std::uint32_t min_freq   = DEFAULT_MIN_FREQ;
+        LogFn         log        = nullptr;
+    };
+
+    static const std::regex &pre_pattern()
+    {
+        static const std::regex pat(
+            R"('s|'t|'re|'ve|'m|'ll|'d| ?[a-zA-Z]+| ?[0-9]+|[^\s\w]+|\s+)",
+            std::regex::optimize
+        );
+        return pat;
+    }
+
+    BPETokenizer() = default;
+
+    void train(const std::string &text) { train(text, Config{}); }
+
+    void train(const std::string &text, const Config &config)
+    {
+        auto log = config.log
+            ? config.log
+            : LogFn{[](std::string_view m) { std::cout << m << '\n'; }};
+
+        log("\n[BPE 训练] 预分词...");
+        auto chunks = pre_tokenize(text);
+        log("  预分词块数: " + std::to_string(chunks.size()));
+
+        std::vector<std::vector<std::size_t>> byte_chunks;
+        byte_chunks.reserve(chunks.size());
+        std::size_t total_bytes = 0;
+        for (const auto &chunk : chunks)
+        {
+            std::vector<std::size_t> ids;
+            ids.reserve(chunk.size());
+            for (unsigned char b : chunk)
+                ids.push_back(static_cast<std::size_t>(b));
+            total_bytes += ids.size();
+            byte_chunks.push_back(std::move(ids));
+        }
+        log("  总字节数: " + std::to_string(total_bytes));
+
+        vocab_.clear();
+        vocab_.reserve(config.vocab_size);
+        for (std::size_t i = 0; i < BYTE_BASE; ++i)
+            vocab_.emplace_back(1, static_cast<char>(i));
+
+        merges_.clear();
+        merges_.reserve(config.vocab_size - BYTE_BASE);
+
+        const std::size_t target_merges = config.vocab_size - BYTE_BASE;
+        log("  目标合并数: " + std::to_string(target_merges));
+
+        for (std::size_t round = 0; round < target_merges; ++round)
+        {
+            std::unordered_map<std::pair<std::size_t, std::size_t>, std::size_t, pair_hash> pair_freq;
+            for (const auto &chunk : byte_chunks)
+                for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
+                    ++pair_freq[{chunk[i], chunk[i + 1]}];
+
+            if (pair_freq.empty()) break;
+
+            auto best = std::ranges::max_element(pair_freq,
+                [](const auto &a, const auto &b) { return a.second < b.second; });
+
+            if (best->second < config.min_freq)
+            {
+                log("  无更多高频 pair，提前停止于第 " + std::to_string(round) + " 轮");
+                break;
+            }
+
+            auto [id_a, id_b] = best->first;
+            std::size_t new_id = vocab_.size();
+            vocab_.push_back(vocab_[id_a] + vocab_[id_b]);
+            merges_.push_back({id_a, id_b, new_id});
+
+            for (auto &chunk : byte_chunks)
+            {
+                for (std::size_t i = 0; i + 1 < chunk.size(); )
+                {
+                    if (chunk[i] == id_a && chunk[i + 1] == id_b)
+                    {
+                        chunk[i] = new_id;
+                        chunk.erase(chunk.begin() + static_cast<std::ptrdiff_t>(i + 1));
+                    }
+                    else ++i;
+                }
+            }
+
+            if ((round + 1) % 500 == 0)
+                log("  合并第 " + std::to_string(round + 1) + " 轮，词表: " + std::to_string(vocab_.size()));
+        }
+
+        log("最终词表: " + std::to_string(vocab_.size()));
+        log("合并规则: " + std::to_string(merges_.size()));
+    }
+
+    [[nodiscard]] std::vector<std::size_t> encode(const std::string &text) const override
+    {
+        auto chunks = pre_tokenize(text);
+        std::vector<std::size_t> all_ids;
+
+        for (const auto &chunk : chunks)
+        {
+            std::vector<std::size_t> ids;
+            ids.reserve(chunk.size());
+            for (unsigned char b : chunk)
+                ids.push_back(static_cast<std::size_t>(b));
+
+            bool merged = true;
+            while (merged)
+            {
+                merged = false;
+                std::size_t best_pos = 0;
+                std::size_t best_prio = merges_.size() + 1;
+
+                for (std::size_t i = 0; i + 1 < ids.size(); ++i)
+                {
+                    std::size_t prio = merge_priority(ids[i], ids[i + 1]);
+                    if (prio < best_prio) { best_prio = prio; best_pos = i; }
+                }
+
+                if (best_prio < merges_.size())
+                {
+                    ids[best_pos] = merges_[best_prio].new_id;
+                    ids.erase(ids.begin() + static_cast<std::ptrdiff_t>(best_pos + 1));
+                    merged = true;
+                }
+            }
+
+            all_ids.insert(all_ids.end(), ids.begin(), ids.end());
+        }
+        return all_ids;
+    }
+
+    [[nodiscard]] std::string decode(std::span<const std::size_t> ids) const override
+    {
+        std::string result;
+        result.reserve(ids.size());
+        for (auto id : ids)
+            result += id < vocab_.size() ? vocab_[id] : std::string{"\xef\xbf\xbd"};
+        return result;
+    }
+
+    [[nodiscard]] Result<void> save(const std::string &path) const override
+    {
+        std::ofstream ofs(path);
+        if (!ofs) return std::unexpected(Error{"Cannot write: " + path});
+        ofs << "{\n  \"type\": \"bpe_tokenizer\",\n  \"vocab\": {\n";
+        bool first = true;
+        for (std::size_t tid = 0; tid < vocab_.size(); ++tid)
+        {
+            if (vocab_[tid].empty()) continue;
+            if (!first) ofs << ",\n";
+            first = false;
+            ofs << "    \"" << std::dec << tid << "\": \"";
+            for (unsigned char b : vocab_[tid])
+                ofs << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(b);
+            ofs << "\"" << std::dec;
+        }
+        ofs << "\n  },\n  \"vocab_size\": " << std::dec << vocab_.size()
+            << ",\n  \"merges\": [";
+        for (std::size_t i = 0; i < merges_.size(); ++i)
+        {
+            if (i > 0) ofs << ",";
+            ofs << "\n    [" << merges_[i].id_a << ", " << merges_[i].id_b << ", " << merges_[i].new_id << "]";
+        }
+        ofs << "\n  ]\n}\n";
+        return {};
+    }
+
+    [[nodiscard]] Result<void> load(const std::string &path) override
+    {
+        std::ifstream ifs(path);
+        if (!ifs) return std::unexpected(Error{"Cannot read: " + path});
+        std::string content((std::istreambuf_iterator<char>(ifs)),
+                             std::istreambuf_iterator<char>());
+        vocab_.clear();
+        merges_.clear();
+
+        if (auto p = content.find("\"vocab_size\""); p != std::string::npos)
+            if (auto c = content.find(':', p); c != std::string::npos)
+            {
+                ++c; while (c < content.size() && content[c] == ' ') ++c;
+                std::size_t v = 0;
+                if (auto [ptr, ec] = std::from_chars(content.data()+c, content.data()+content.size(), v); ec == std::errc{})
+                    vocab_.resize(v);
+            }
+
+        auto vp = content.find("\"vocab\"");
+        if (vp != std::string::npos)
+        {
+            auto br = content.find('{', vp);
+            if (br != std::string::npos)
+            {
+                std::size_t pos = br + 1;
+                while (pos < content.size())
+                {
+                    while (pos < content.size() && (content[pos]==' '||content[pos]=='\n'||
+                           content[pos]=='\r'||content[pos]=='\t'||content[pos]==',')) ++pos;
+                    if (pos >= content.size() || content[pos] == '}') break;
+                    if (content[pos] != '"') { ++pos; continue; }
+                    ++pos; std::string key;
+                    while (pos < content.size() && content[pos] != '"') key += content[pos++];
+                    ++pos;
+                    while (pos < content.size() && (content[pos]==' '||content[pos]==':')) ++pos;
+                    if (pos < content.size() && content[pos] == '"')
+                    {
+                        ++pos; std::string hex;
+                        while (pos < content.size() && content[pos] != '"') hex += content[pos++];
+                        ++pos;
+                        std::size_t id = 0;
+                        std::from_chars(key.data(), key.data()+key.size(), id);
+                        std::string tok;
+                        for (std::size_t i = 0; i+1 < hex.size(); i += 2)
+                        { unsigned b = 0; std::from_chars(hex.data()+i, hex.data()+i+2, b, 16); tok += static_cast<char>(b); }
+                        if (id >= vocab_.size()) vocab_.resize(id+1);
+                        vocab_[id] = std::move(tok);
+                    }
+                }
+            }
+        }
+
+        auto mp = content.find("\"merges\"");
+        if (mp != std::string::npos)
+        {
+            auto mb = content.find('[', mp);
+            if (mb != std::string::npos)
+            {
+                std::size_t pos = mb + 1;
+                while (pos < content.size())
+                {
+                    while (pos < content.size() && (content[pos]==' '||content[pos]=='\n'||
+                           content[pos]=='\r'||content[pos]=='\t'||content[pos]==',')) ++pos;
+                    if (pos >= content.size() || content[pos] == ']') break;
+                    if (content[pos] != '[') { ++pos; continue; }
+                    ++pos;
+                    std::size_t nums[3]{};
+                    for (int n = 0; n < 3; ++n)
+                    {
+                        while (pos < content.size() && (content[pos]==' '||content[pos]=='\n'||
+                               content[pos]=='\r'||content[pos]=='\t'||content[pos]==',')) ++pos;
+                        std::string num_str;
+                        while (pos < content.size() && content[pos] >= '0' && content[pos] <= '9')
+                            num_str += content[pos++];
+                        if (!num_str.empty())
+                            nums[n] = static_cast<std::size_t>(std::stoull(num_str));
+                    }
+                    while (pos < content.size() && content[pos] != ']') ++pos;
+                    if (pos < content.size()) ++pos;
+                    merges_.push_back({nums[0], nums[1], nums[2]});
+                }
+            }
+        }
+        return {};
+    }
+
+    [[nodiscard]] std::size_t vocab_size() const noexcept override { return vocab_.size(); }
+    [[nodiscard]] const std::vector<std::string> &vocab() const noexcept override { return vocab_; }
+    [[nodiscard]] std::size_t merge_count() const noexcept { return merges_.size(); }
+
+    [[nodiscard]] static std::vector<std::string> pre_tokenize(std::string_view text)
+    {
+        std::vector<std::string> chunks;
+        std::string s(text);
+        auto begin = std::sregex_iterator(s.begin(), s.end(), pre_pattern());
+        auto end   = std::sregex_iterator();
+        for (auto it = begin; it != end; ++it)
+            chunks.push_back(it->str());
+        return chunks;
+    }
+
+private:
+    struct MergeRule { std::size_t id_a, id_b, new_id; };
+
+    struct pair_hash
+    {
+        [[nodiscard]] std::size_t operator()(const std::pair<std::size_t, std::size_t> &p) const noexcept
+        { return p.first * 31 + p.second; }
+    };
+
+    std::vector<std::string> vocab_;
+    std::vector<MergeRule> merges_;
+
+    [[nodiscard]] std::size_t merge_priority(std::size_t a, std::size_t b) const
+    {
+        for (std::size_t i = 0; i < merges_.size(); ++i)
+            if (merges_[i].id_a == a && merges_[i].id_b == b)
+                return i;
+        return merges_.size();
+    }
+};
+
 
 } // namespace nn
 

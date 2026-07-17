@@ -23,6 +23,9 @@
 // 修改时需同步评估 b_block 栈占用（BLOCK_SIZE² × 8 字节）
 namespace nn
 {
+    // ── 标量类型（float 加速 / double 精度） ─────────────────────────
+    using Scalar = float;
+
     // ── 错误类型（C++23 std::expected）─────────────────────────────────────
     // 所有公共 API 使用 Result<T> 返回错误，不抛异常。
     struct Error {
@@ -32,21 +35,21 @@ namespace nn
     using Result = std::expected<T, Error>;
 
     inline constexpr std::size_t BLOCK_SIZE = 64;
-    static_assert(BLOCK_SIZE * BLOCK_SIZE * sizeof(double) <= 65536,
+    static_assert(BLOCK_SIZE * BLOCK_SIZE * sizeof(Scalar) <= 65536,
                   "BLOCK_SIZE too large: b_block would exceed 64KB stack budget");
     // ── 数值常量 ─────────────────────────────────────────────────────────────
     // 使用 constexpr 避免运行时计算
-    inline constexpr double EPSILON = 1e-8;
+    inline constexpr Scalar EPSILON = 1e-6f;
     
     // ── 智能执行策略 ─────────────────────────────────────────────────────────
     // 根据元素数量自动选择串行或使用全局线程池并行。
     // 线程池采用 latch + 调用者参与设计：一次批量入队 + 原子计数器，
     // 消除了旧版 N×submit + N×future 的堆分配和同步开销。
     struct SmartPolicy {
-        // 阈值 = 每核最小分块 × 2，确保至少有 2 个分块可并行。
-        // chunk_count() 已自动按核心数缩放（min(cores, total/4096)），
+        // 阈值 = 1024 元素：即使 MNIST 小隐藏层（64×64=4096）也能触发并行。
+        // chunk_count() 已自动按核心数缩放（min(cores, total/1024)），
         // 阈值只需设最低门槛，核心利用随数据量自然增长。
-        inline static constexpr std::size_t PARALLEL_THRESHOLD = 4096 * 2;  // 8192
+        inline static constexpr std::size_t PARALLEL_THRESHOLD = 1024;
         
         // for_each 版本
         template<typename Iterator, typename Func>
@@ -108,6 +111,27 @@ namespace nn
                 return std::transform_reduce(std::execution::seq, first1, last1, first2, init,
                                             std::forward<BinaryOp>(reduce_op),
                                             std::forward<UnaryOp>(transform_op));
+            }
+        }
+
+        // ── 块级并行（供矩阵乘法/转置的分块循环使用）─────────────────
+        // 与 for_each 不同：每个"元素"本身就是重量级计算（如 64×64×K 矩阵乘），
+        // 因此不适用 PARALLEL_THRESHOLD 保护，直接按"块数"分发。
+        template<typename Iterator, typename Func>
+        static void parallel_for_blocks(Iterator first, Iterator last, Func&& func) {
+            global_thread_pool().parallel_for_blocks(first, last, std::forward<Func>(func));
+        }
+
+        // ── 样本级并行（供 batch 维度并行使用）─────────────────────────
+        // 每个"样本"包含完整的前向/反向传播子任务，样本间完全独立。
+        // 用于 GPT/Transformer 的 batch 循环并行化。
+        template<typename Func>
+        static void parallel_for_samples(std::size_t num_samples, Func&& func) {
+            if (num_samples <= 1) {
+                for (std::size_t i = 0; i < num_samples; ++i)
+                    func(i);
+            } else {
+                global_thread_pool().parallel_for_samples(num_samples, std::forward<Func>(func));
             }
         }
 

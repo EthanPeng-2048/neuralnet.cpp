@@ -5,6 +5,8 @@
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>
+
+using nn::Scalar;
 #include <iostream>
 #include <iomanip>
 #include <cmath>
@@ -21,6 +23,8 @@ int main()
 }
 #else
 #include <neuralnet.cpp/vk_backend.hpp>
+
+using nn::Scalar;
 
 void print_usage(const char* prog)
 {
@@ -68,7 +72,7 @@ int main(int argc, char* argv[])
     // ── 2. 生成随机测试数据 ────────────────────────────────────────
     std::cout << "[2/4] 生成 " << N << "×" << N << " 随机矩阵..." << std::flush;
     std::mt19937_64 rng(42);
-    std::uniform_real_distribution<double> dist(-1.0, 1.0);
+    std::uniform_real_distribution<Scalar> dist(-1.0, 1.0);
 
     nn::Matrix A(N, N), B(N, N);
     for (auto& v : A.data()) v = dist(rng);
@@ -89,17 +93,17 @@ int main(int argc, char* argv[])
     nn::SmartPolicy::gpu_enabled = false;
 
     // 计算最大绝对误差和相对误差
-    double max_abs_err = 0.0;
-    double max_rel_err = 0.0;
-    double sum_sq_err = 0.0;
-    double sum_sq_ref = 0.0;
+    Scalar max_abs_err = 0.0;
+    Scalar max_rel_err = 0.0;
+    Scalar sum_sq_err = 0.0;
+    Scalar sum_sq_ref = 0.0;
 
     for (std::size_t i = 0; i < N * N; ++i)
     {
-        double ref = C_cpu.span()[i];
-        double gpu = C_gpu.span()[i];
-        double abs_err = std::abs(ref - gpu);
-        double rel_err = (std::abs(ref) > 1e-12) ? abs_err / std::abs(ref) : 0.0;
+        Scalar ref = C_cpu.span()[i];
+        Scalar gpu = C_gpu.span()[i];
+        Scalar abs_err = std::abs(ref - gpu);
+        Scalar rel_err = (std::abs(ref) > 1e-12) ? abs_err / std::abs(ref) : 0.0;
 
         max_abs_err = std::max(max_abs_err, abs_err);
         max_rel_err = std::max(max_rel_err, rel_err);
@@ -107,8 +111,8 @@ int main(int argc, char* argv[])
         sum_sq_ref += ref * ref;
     }
 
-    double rmse = std::sqrt(sum_sq_err / static_cast<double>(N * N));
-    double nrmse = (sum_sq_ref > 0) ? rmse / std::sqrt(sum_sq_ref / static_cast<double>(N * N)) : 0.0;
+    Scalar rmse = std::sqrt(sum_sq_err / static_cast<Scalar>(N * N));
+    Scalar nrmse = (sum_sq_ref > 0) ? rmse / std::sqrt(sum_sq_ref / static_cast<Scalar>(N * N)) : 0.0;
 
     std::cout << "\n\n  正确性结果:\n"
               << "  ─────────────────────────────────\n"
@@ -135,7 +139,7 @@ int main(int argc, char* argv[])
     for (int i = 0; i < iters; ++i)
         A.multiply_to(C_cpu, B);
     auto t1 = std::chrono::steady_clock::now();
-    double cpu_sec = std::chrono::duration<double>(t1 - t0).count() / iters;
+    Scalar cpu_sec = std::chrono::duration<Scalar>(t1 - t0).count() / iters;
 
     // GPU 计时（含上传/下载）
     nn::SmartPolicy::gpu_enabled = true;
@@ -143,13 +147,13 @@ int main(int argc, char* argv[])
     for (int i = 0; i < iters; ++i)
         A.multiply_to(C_gpu, B);
     auto t3 = std::chrono::steady_clock::now();
-    double gpu_sec = std::chrono::duration<double>(t3 - t2).count() / iters;
+    Scalar gpu_sec = std::chrono::duration<Scalar>(t3 - t2).count() / iters;
     nn::SmartPolicy::gpu_enabled = false;
 
     // GFLOPS（矩阵乘法：2×N³ FLOPs）
-    double flops = 2.0 * static_cast<double>(N) * N * N;
-    double cpu_gflops = flops / cpu_sec / 1e9;
-    double gpu_gflops = flops / gpu_sec / 1e9;
+    Scalar flops = 2.0 * static_cast<Scalar>(N) * N * N;
+    Scalar cpu_gflops = flops / cpu_sec / 1e9;
+    Scalar gpu_gflops = flops / gpu_sec / 1e9;
 
     std::cout << std::fixed << std::setprecision(2);
     std::cout << "  性能结果:\n"

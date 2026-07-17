@@ -36,14 +36,20 @@ def strip_gutenberg(text: str) -> str:
         text = text[m_start.end():m_end.start()]
     elif m_start:
         text = text[m_start.end():]
-    return text.strip()
+    # 去掉制表符/回车，去掉所有空行
+    text = re.sub(r"[\t\r]+", " ", text)
+    text = re.sub(r"\n{2,}", "\n", text)
+    return text.strip().lower()
 
 def download_book(url: str, filename: str) -> str | None:
     filepath = os.path.join(RAW_DIR, filename)
     if os.path.exists(filepath):
         print(f"  [跳过] {filename} 已存在")
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-            return f.read()
+            text = f.read()
+        text = re.sub(r"[\t\r]+", " ", text)
+        text = re.sub(r"\n{2,}", "\n", text)
+        return text.strip().lower()
     print(f"  [下载] {filename} ...")
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})

@@ -1,6 +1,12 @@
 #include <neuralnet.cpp/nn.hpp>
+
+using nn::Scalar;
 #include <neuralnet.cpp/model_io.hpp>
+
+using nn::Scalar;
 #include <neuralnet.cpp/gpt_common.hpp>
+
+using nn::Scalar;
 #include <iostream>
 #include <string>
 #include <vector>
@@ -18,6 +24,7 @@ void print_usage(const char *prog)
         << "选项:\n"
         << "  --model <path>     模型文件路径 (默认: gpt_model.bin)\n"
         << "                       V2 格式模型自动读取规格，无需指定架构参数\n"
+        << "  --vocab <path>     词表 JSON 路径 (默认: gpt_bpe.json)\n"
         << "  --prompt <text>    输入提示文本\n"
         << "  --interactive      交互式生成模式\n"
         << "  --max-tokens <n>   最大生成 token 数 (默认: 200)\n"
@@ -36,9 +43,10 @@ void print_usage(const char *prog)
 struct InferConfig
 {
     std::string model_path = "gpt_model.bin";
+    std::string vocab_path = "gpt_bpe.json";
     std::string prompt = "Hello";
     int max_tokens = 200;
-    double temperature = 1.0;
+    Scalar temperature = 1.0;
     bool interactive = false;
     bool show_tokens = false;
     bool gpu = false;
@@ -62,6 +70,8 @@ InferConfig parse_args(int argc, char *argv[])
         }
         else if (arg == "--model" && i + 1 < argc)
             cfg.model_path = argv[++i];
+        else if (arg == "--vocab" && i + 1 < argc)
+            cfg.vocab_path = argv[++i];
         else if (arg == "--prompt" && i + 1 < argc)
             cfg.prompt = argv[++i];
         else if (arg == "--interactive")
@@ -99,7 +109,7 @@ InferConfig parse_args(int argc, char *argv[])
 // 使用 GPTModel 内置的 generate 方法（支持温度采样 + 贪心）
 nn::Result<std::vector<std::size_t>> generate_text(
     nn::Model &model, const std::vector<std::size_t> &prompt_tokens,
-    std::size_t max_new_tokens, double temperature,
+    std::size_t max_new_tokens, Scalar temperature,
     std::size_t /*seq_len*/)
 {
     // Model 容器唯一层即为 GPTModel，安全提取
@@ -111,7 +121,7 @@ nn::Result<std::vector<std::size_t>> generate_text(
 }
 
 // ==================== 交互模式 ====================
-void interactive_mode(nn::Model &model, const nn::BPETokenizer &tokenizer,
+void interactive_mode(nn::Model &model, const nn::SpaceTokenizer &tokenizer,
                      const InferConfig &cfg)
 {
     std::cout << "GPT 交互式生成 (输入 'quit' 退出)\n\n";
@@ -181,16 +191,6 @@ int main(int argc, char *argv[])
         }
 #endif
 
-        // ── 加载分词器与模型 ─────────────────────────────────────
-        nn::BPETokenizer tokenizer;
-        auto vocab_result = tokenizer.load_vocab("gpt_bpe.json");
-        if (!vocab_result)
-        {
-            std::cerr << "加载词表失败: " << vocab_result.error().message << std::endl;
-            return 1;
-        }
-        std::cout << "词表: " << tokenizer.vocab_size() << " 词" << std::endl;
-
         // ── 从模型文件读取规格 ─────────────────────────────────
         auto spec_result = nn::peek_model_spec(cfg.model_path);
         if (!spec_result)
@@ -203,8 +203,7 @@ int main(int argc, char *argv[])
         nn::Model model;
         if (spec.is_gpt())
         {
-            // V2 格式：自动从规格构建模型
-            std::cout << "从模型文件读取 GPT 规格 (V2 格式)\n";
+            std::cout << "从模型文件读取 GPT 规格 (V2+ 格式)\n";
             auto build_result = nn::build_gpt_model_from_spec(spec);
             if (!build_result)
             {
@@ -215,11 +214,8 @@ int main(int argc, char *argv[])
         }
         else
         {
-            // V1 旧格式：使用命令行参数
-            std::cout << "旧格式模型文件，使用命令行参数构建模型\n";
-            model = nn::build_gpt_model(
-                tokenizer.vocab_size(), cfg.d_model, cfg.seq_len,
-                cfg.num_heads, cfg.d_ff, cfg.num_layers);
+            std::cerr << "模型规格未知，请使用 V2+ 格式模型文件\n";
+            return 1;
         }
 
         std::cout << "加载模型: " << cfg.model_path << " ..." << std::endl;
@@ -229,7 +225,31 @@ int main(int argc, char *argv[])
             std::cerr << "加载模型失败: " << load_result.error().message << std::endl;
             return 1;
         }
-        std::cout << "模型已加载\n" << std::endl;
+        std::cout << "模型已加载\n";
+
+        // ── 加载 tokenizer（优先从模型文件中提取，否则用 --vocab） ──
+        nn::SpaceTokenizer tokenizer;
+        if (!load_result->empty())
+        {
+            // 模型文件嵌入了 tokenizer → 写入临时文件加载
+            std::cout << "从模型文件中提取词表 (" << load_result->size() << " 字节)\n";
+            auto tok_result = tokenizer.load_json(*load_result);
+            if (!tok_result)
+            {
+                std::cerr << "解析嵌入词表失败: " << tok_result.error().message << std::endl;
+                return 1;
+            }
+        }
+        else
+        {
+            auto vocab_result = tokenizer.load(cfg.vocab_path);
+            if (!vocab_result)
+            {
+                std::cerr << "加载词表失败: " << vocab_result.error().message << std::endl;
+                return 1;
+            }
+        }
+        std::cout << "词表: " << tokenizer.vocab_size() << " 词" << std::endl;
 
         if (cfg.interactive)
         {

@@ -52,18 +52,25 @@ namespace detail
     return {};
 }
 
-inline void convert_double_to_float(
-    std::span<const double> src, float* __restrict dst) noexcept
+// ── CPU Scalar ↔ GPU float 转换（GPU 固定使用 float） ─────────────────
+inline void convert_scalar_to_float(
+    std::span<const Scalar> src, float* __restrict dst) noexcept
 {
-    std::transform(src.begin(), src.end(), dst,
-                   [](double v) { return static_cast<float>(v); });
+    if constexpr (std::is_same_v<Scalar, float>)
+        std::memcpy(dst, src.data(), src.size() * sizeof(float));
+    else
+        std::transform(src.begin(), src.end(), dst,
+                       [](Scalar v) { return static_cast<float>(v); });
 }
 
-inline void convert_float_to_double(
-    const float* __restrict src, std::span<double> dst) noexcept
+inline void convert_float_to_scalar(
+    const float* __restrict src, std::span<Scalar> dst) noexcept
 {
-    std::transform(src, src + dst.size(), dst.begin(),
-                   [](float v) { return static_cast<double>(v); });
+    if constexpr (std::is_same_v<Scalar, float>)
+        std::memcpy(dst.data(), src, dst.size() * sizeof(float));
+    else
+        std::transform(src, src + dst.size(), dst.begin(),
+                       [](float v) { return static_cast<Scalar>(v); });
 }
 } // namespace detail
 
@@ -412,7 +419,7 @@ public:
         return idx;
     }
 
-    [[nodiscard]] Result<void> upload(std::size_t idx, std::span<const double> data,
+    [[nodiscard]] Result<void> upload(std::size_t idx, std::span<const Scalar> data,
                                       VkDeviceSize byte_offset = 0)
     {
         if (byte_offset + data.size() * sizeof(float) > region_size_)
@@ -422,11 +429,11 @@ public:
         if (!r.mapped_ptr) return std::unexpected(Error{"Staging region not mapped"});
         auto* dst = reinterpret_cast<float*>(
             static_cast<std::byte*>(r.mapped_ptr) + byte_offset);
-        detail::convert_double_to_float(data, dst);
+        detail::convert_scalar_to_float(data, dst);
         return {};
     }
 
-    [[nodiscard]] Result<void> download(std::size_t idx, std::span<double> dst,
+    [[nodiscard]] Result<void> download(std::size_t idx, std::span<Scalar> dst,
                                         VkDeviceSize byte_offset = 0)
     {
         if (byte_offset + dst.size() * sizeof(float) > region_size_)
@@ -436,7 +443,7 @@ public:
         if (!r.mapped_ptr) return std::unexpected(Error{"Staging region not mapped"});
         const auto* src = reinterpret_cast<const float*>(
             static_cast<const std::byte*>(r.mapped_ptr) + byte_offset);
-        detail::convert_float_to_double(src, dst);
+        detail::convert_float_to_scalar(src, dst);
         return {};
     }
 
@@ -516,13 +523,13 @@ public:
         return *this;
     }
     [[nodiscard]] bool valid() const noexcept { return ptr_ != nullptr; }
-    void upload(std::span<const double> data) noexcept
+    void upload(std::span<const Scalar> data) noexcept
     {
         if (!ptr_) return;
-        detail::convert_double_to_float(data, static_cast<float*>(ptr_));
+        detail::convert_scalar_to_float(data, static_cast<float*>(ptr_));
         dirty_ = true;
     }
-    void download(std::span<double> dst) const noexcept
+    void download(std::span<Scalar> dst) const noexcept
     {
         if (!ptr_) return;
         if (!(property_flags_ & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
@@ -532,7 +539,7 @@ public:
             range.memory = memory_; range.offset = offset_; range.size = byte_size_;
             vkInvalidateMappedMemoryRanges(device_, 1, &range);
         }
-        detail::convert_float_to_double(static_cast<const float*>(ptr_), dst);
+        detail::convert_float_to_scalar(static_cast<const float*>(ptr_), dst);
     }
     [[nodiscard]] std::span<std::byte> bytes() noexcept
     { return {static_cast<std::byte*>(ptr_), byte_size_}; }
@@ -1400,7 +1407,7 @@ public:
 
     // ── 阻塞式上传：CPU Matrix → GpuTensor（仅在输入层调用）──────────
     [[nodiscard]] Result<void> upload_blocking(
-        GpuTensor& dst, std::span<const double> cpu_data)
+        GpuTensor& dst, std::span<const Scalar> cpu_data)
     {
         if (!initialized_) return std::unexpected(Error{"GPU backend not initialized"});
         if (!dst.valid()) return std::unexpected(Error{"Invalid destination GpuTensor"});
@@ -1455,7 +1462,7 @@ public:
 
     // ── 阻塞式下载：GpuTensor → CPU span（仅在输出层调用）──────────
     [[nodiscard]] Result<void> download_blocking(
-        const GpuTensor& src, std::span<double> cpu_data)
+        const GpuTensor& src, std::span<Scalar> cpu_data)
     {
         if (!initialized_) return std::unexpected(Error{"GPU backend not initialized"});
         if (!src.valid()) return std::unexpected(Error{"Invalid source GpuTensor"});
@@ -1780,9 +1787,9 @@ public:
     }
 
     [[nodiscard]] Result<void> matmul_direct(
-        std::span<const double> a_data,
-        std::span<const double> b_data,
-        std::span<double> c_data,
+        std::span<const Scalar> a_data,
+        std::span<const Scalar> b_data,
+        std::span<Scalar> c_data,
         std::size_t M, std::size_t N, std::size_t K)
     {
         if (!initialized_) return std::unexpected(Error{"GPU backend not initialized"});

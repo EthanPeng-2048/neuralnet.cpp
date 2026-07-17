@@ -20,6 +20,8 @@ TRAIN_EXE = BUILD_DIR / f"mnist_train{_EXE_SUFFIX}"
 INFER_EXE = BUILD_DIR / f"mnist_infer{_EXE_SUFFIX}"
 TEXT_TRAIN_EXE = BUILD_DIR / f"text_train{_EXE_SUFFIX}"
 TEXT_INFER_EXE = BUILD_DIR / f"text_infer{_EXE_SUFFIX}"
+TOKENIZER_TRAIN_EXE = BUILD_DIR / f"tokenizer_train{_EXE_SUFFIX}"
+TOKENIZER_INFER_EXE = BUILD_DIR / f"tokenizer_infer{_EXE_SUFFIX}"
 DEFAULT_MODEL = Path(__file__).parent / "pretrained" / "model.bin"
 DEFAULT_GPT_MODEL = Path(__file__).parent / "gpt_model.bin"
 DEFAULT_DATASET = Path(__file__).parent / "datasets" / "mnist_data"
@@ -92,6 +94,16 @@ class NeuralNetGUI(tk.Tk):
         self.text_infer_frame = ttk.Frame(notebook, padding=8)
         notebook.add(self.text_infer_frame, text="  💬 GPT 推理  ")
         self._build_text_infer_tab()
+
+        # ── 分词器训练 Tab ──
+        self.tokenizer_train_frame = ttk.Frame(notebook, padding=8)
+        notebook.add(self.tokenizer_train_frame, text="  🔤 分词器训练  ")
+        self._build_tokenizer_train_tab()
+
+        # ── 分词器推理 Tab ──
+        self.tokenizer_infer_frame = ttk.Frame(notebook, padding=8)
+        notebook.add(self.tokenizer_infer_frame, text="  🔡 分词器推理  ")
+        self._build_tokenizer_infer_tab()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -675,6 +687,13 @@ class NeuralNetGUI(tk.Tk):
         ttk.Button(f, text="浏览…", command=self._browse_text_save).grid(row=row, column=2)
         row += 1
 
+        # 词表路径
+        ttk.Label(f, text="词表 JSON 路径:").grid(row=row, column=0, sticky="w")
+        self.text_train_vocab_var = tk.StringVar(value="gpt_bpe.json")
+        ttk.Entry(f, textvariable=self.text_train_vocab_var, width=48).grid(row=row, column=1, padx=4)
+        ttk.Button(f, text="浏览…", command=self._browse_text_train_vocab).grid(row=row, column=2)
+        row += 1
+
         # 恢复训练
         self.text_train_resume_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(f, text="从已有模型恢复训练", variable=self.text_train_resume_var,
@@ -787,6 +806,11 @@ class NeuralNetGUI(tk.Tk):
         if path:
             self.text_train_save_var.set(path)
 
+    def _browse_text_train_vocab(self):
+        path = filedialog.askopenfilename(title="选择词表 JSON", filetypes=[("JSON", "*.json"), ("All", "*.*")])
+        if path:
+            self.text_train_vocab_var.set(path)
+
     def _browse_text_resume(self):
         path = filedialog.askopenfilename(title="选择恢复模型", filetypes=[("Binary", "*.bin"), ("All", "*.*")])
         if path:
@@ -811,6 +835,7 @@ class NeuralNetGUI(tk.Tk):
 
         cmd = [exe, text_file,
                "--save", self.text_train_save_var.get(),
+               "--vocab", self.text_train_vocab_var.get(),
                "--epochs", str(self.text_train_epochs_var.get()),
                "--lr", str(self.text_train_lr_var.get()),
                "--batch-size", str(self.text_train_batch_var.get()),
@@ -860,6 +885,13 @@ class NeuralNetGUI(tk.Tk):
         self.text_infer_model_var = tk.StringVar(value=str(DEFAULT_GPT_MODEL))
         ttk.Entry(f, textvariable=self.text_infer_model_var, width=48).grid(row=row, column=1, padx=4)
         ttk.Button(f, text="浏览…", command=self._browse_text_infer_model).grid(row=row, column=2)
+        row += 1
+
+        # 词表路径
+        ttk.Label(f, text="词表 JSON 路径:").grid(row=row, column=0, sticky="w")
+        self.text_infer_vocab_var = tk.StringVar(value="gpt_bpe.json")
+        ttk.Entry(f, textvariable=self.text_infer_vocab_var, width=48).grid(row=row, column=1, padx=4)
+        ttk.Button(f, text="浏览…", command=self._browse_text_infer_vocab).grid(row=row, column=2)
         row += 1
 
         # 生成参数
@@ -915,6 +947,12 @@ class NeuralNetGUI(tk.Tk):
             row=row, column=0, columnspan=3, sticky="w")
         row += 1
 
+        # ── 显示 Token ID ──
+        self.text_infer_show_tokens_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text="显示 Token ID (调试用)", variable=self.text_infer_show_tokens_var).grid(
+            row=row, column=0, columnspan=3, sticky="w")
+        row += 1
+
         # 输入提示
         ttk.Label(f, text="输入提示:").grid(row=row, column=0, sticky="w")
         self.text_infer_prompt_var = tk.StringVar(value="Hello")
@@ -956,6 +994,11 @@ class NeuralNetGUI(tk.Tk):
         if path:
             self.text_infer_model_var.set(path)
 
+    def _browse_text_infer_vocab(self):
+        path = filedialog.askopenfilename(title="选择词表 JSON", filetypes=[("JSON", "*.json"), ("All", "*.*")])
+        if path:
+            self.text_infer_vocab_var.set(path)
+
     # ---- GPT 推理 ----
     def _start_text_infer(self):
         exe = str(TEXT_INFER_EXE)
@@ -970,6 +1013,7 @@ class NeuralNetGUI(tk.Tk):
 
         cmd = [exe,
                "--model", self.text_infer_model_var.get(),
+               "--vocab", self.text_infer_vocab_var.get(),
                "--prompt", prompt,
                "--max-tokens", str(self.text_infer_max_tokens_var.get()),
                "--temperature", str(self.text_infer_temp_var.get()),
@@ -978,6 +1022,8 @@ class NeuralNetGUI(tk.Tk):
                "--num-layers", str(self.text_infer_num_layers_var.get()),
                "--d-ff", str(self.text_infer_d_ff_var.get()),
                "--seq-len", str(self.text_infer_seq_len_var.get())]
+        if self.text_infer_show_tokens_var.get():
+            cmd.append("--show-tokens")
         if self.text_infer_gpu_var.get():
             cmd.append("--gpu")
 
@@ -1030,6 +1076,251 @@ class NeuralNetGUI(tk.Tk):
             self.text_infer_log.insert("end", text)
             self.text_infer_log.see("end")
             self.text_infer_log.config(state="disabled")
+        self.after(0, _do)
+
+    # ============================================================
+    #  分词器训练 Tab
+    # ============================================================
+    def _build_tokenizer_train_tab(self):
+        f = self.tokenizer_train_frame
+        row = 0
+
+        # 文本文件路径
+        ttk.Label(f, text="训练文本文件:").grid(row=row, column=0, sticky="w")
+        self.tokenizer_train_file_var = tk.StringVar()
+        ttk.Entry(f, textvariable=self.tokenizer_train_file_var, width=48).grid(row=row, column=1, padx=4)
+        ttk.Button(f, text="浏览…", command=self._browse_tokenizer_train_file).grid(row=row, column=2)
+        row += 1
+
+        # 输出路径
+        ttk.Label(f, text="输出 JSON 路径:").grid(row=row, column=0, sticky="w")
+        self.tokenizer_train_output_var = tk.StringVar(value="tokenizer.json")
+        ttk.Entry(f, textvariable=self.tokenizer_train_output_var, width=48).grid(row=row, column=1, padx=4)
+        ttk.Button(f, text="浏览…", command=self._browse_tokenizer_train_output).grid(row=row, column=2)
+        row += 1
+
+        # 参数
+        param_frame = ttk.LabelFrame(f, text="训练参数", padding=6)
+        param_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+        row += 1
+
+        ttk.Label(param_frame, text="分词器类型:").grid(row=0, column=0, sticky="w")
+        self.tokenizer_train_type_var = tk.StringVar(value="bpe")
+        ttk.Combobox(param_frame, textvariable=self.tokenizer_train_type_var, width=14, state="readonly",
+                     values=["wordzip", "space", "bpe"]).grid(row=0, column=1, sticky="w")
+
+        ttk.Label(param_frame, text="词表大小:").grid(row=0, column=2, sticky="w")
+        self.tokenizer_train_vocab_size_var = tk.IntVar(value=5000)
+        ttk.Spinbox(param_frame, from_=256, to=100000, width=8,
+                     textvariable=self.tokenizer_train_vocab_size_var).grid(row=0, column=3, padx=(0, 16))
+        row += 1
+
+        # 按钮
+        btn_frame = ttk.Frame(f)
+        btn_frame.grid(row=row, column=0, columnspan=3, pady=6)
+        row += 1
+
+        self.tokenizer_train_start_btn = ttk.Button(btn_frame, text="▶  开始训练", command=self._start_tokenizer_train)
+        self.tokenizer_train_start_btn.pack(side="left", padx=4)
+        self.tokenizer_train_stop_btn = ttk.Button(btn_frame, text="⏹  停止", command=self._stop_tokenizer_train, state="disabled")
+        self.tokenizer_train_stop_btn.pack(side="left", padx=4)
+        row += 1
+
+        # 日志输出
+        self.tokenizer_train_log = tk.Text(f, height=14, width=72, state="disabled",
+                                           font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4",
+                                           insertbackground="white")
+        self.tokenizer_train_log.grid(row=row, column=0, columnspan=3, sticky="ew")
+        scroll = ttk.Scrollbar(f, orient="vertical", command=self.tokenizer_train_log.yview)
+        scroll.grid(row=row, column=3, sticky="ns")
+        self.tokenizer_train_log["yscrollcommand"] = scroll.set
+
+    def _browse_tokenizer_train_file(self):
+        path = filedialog.askopenfilename(title="选择训练文本文件",
+                                          filetypes=[("Text", "*.txt"), ("All", "*.*")])
+        if path:
+            self.tokenizer_train_file_var.set(path)
+
+    def _browse_tokenizer_train_output(self):
+        path = filedialog.asksaveasfilename(title="输出 JSON 路径", defaultextension=".json",
+                                            filetypes=[("JSON", "*.json"), ("All", "*.*")])
+        if path:
+            self.tokenizer_train_output_var.set(path)
+
+    def _start_tokenizer_train(self):
+        exe = str(TOKENIZER_TRAIN_EXE)
+        if not Path(exe).exists():
+            messagebox.showerror("错误", f"找不到 tokenizer_train 可执行文件:\n{exe}\n请先构建项目")
+            return
+
+        text_file = self.tokenizer_train_file_var.get().strip()
+        if not text_file:
+            messagebox.showwarning("提示", "请选择训练文本文件")
+            return
+
+        cmd = [exe, text_file,
+               "--type", self.tokenizer_train_type_var.get(),
+               "--vocab-size", str(self.tokenizer_train_vocab_size_var.get()),
+               "--output", self.tokenizer_train_output_var.get()]
+
+        self._log_tokenizer_train(f"$ {' '.join(cmd)}\n")
+        self.tokenizer_train_start_btn.config(state="disabled")
+        self.tokenizer_train_stop_btn.config(state="normal")
+
+        threading.Thread(target=self._run_process, args=(cmd, self._log_tokenizer_train, self._tokenizer_train_done),
+                         daemon=True).start()
+
+    def _stop_tokenizer_train(self):
+        if self._process and self._process.poll() is None:
+            self._process.terminate()
+            self._log_tokenizer_train("\n[已终止]\n")
+        self._tokenizer_train_done()
+
+    def _tokenizer_train_done(self):
+        self.tokenizer_train_start_btn.config(state="normal")
+        self.tokenizer_train_stop_btn.config(state="disabled")
+
+    def _log_tokenizer_train(self, text: str):
+        self.tokenizer_train_log.config(state="normal")
+        self.tokenizer_train_log.insert("end", text)
+        self.tokenizer_train_log.see("end")
+        self.tokenizer_train_log.config(state="disabled")
+
+    # ============================================================
+    #  分词器推理 Tab
+    # ============================================================
+    def _build_tokenizer_infer_tab(self):
+        f = self.tokenizer_infer_frame
+        row = 0
+
+        # 模型路径
+        ttk.Label(f, text="词表 JSON 路径:").grid(row=row, column=0, sticky="w")
+        self.tokenizer_infer_model_var = tk.StringVar(value="tokenizer.json")
+        ttk.Entry(f, textvariable=self.tokenizer_infer_model_var, width=48).grid(row=row, column=1, padx=4)
+        ttk.Button(f, text="浏览…", command=self._browse_tokenizer_infer_model).grid(row=row, column=2)
+        row += 1
+
+        # 操作模式
+        param_frame = ttk.LabelFrame(f, text="操作", padding=6)
+        param_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+        row += 1
+
+        self.tokenizer_infer_mode_var = tk.StringVar(value="text")
+        ttk.Radiobutton(param_frame, text="编码+解码验证", variable=self.tokenizer_infer_mode_var,
+                        value="text").grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(param_frame, text="仅编码", variable=self.tokenizer_infer_mode_var,
+                        value="encode").grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Radiobutton(param_frame, text="仅解码", variable=self.tokenizer_infer_mode_var,
+                        value="decode").grid(row=0, column=2, sticky="w", padx=(8, 0))
+
+        self.tokenizer_infer_show_tokens_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(param_frame, text="显示 Token 详情",
+                        variable=self.tokenizer_infer_show_tokens_var).grid(row=0, column=3, sticky="w", padx=(16, 0))
+        row += 1
+
+        # 输入
+        ttk.Label(f, text="输入文本/ID列表:").grid(row=row, column=0, sticky="w")
+        self.tokenizer_infer_input_var = tk.StringVar()
+        input_entry = ttk.Entry(f, textvariable=self.tokenizer_infer_input_var, width=60)
+        input_entry.grid(row=row, column=1, columnspan=2, padx=4, sticky="ew")
+        input_entry.bind("<Return>", lambda e: self._start_tokenizer_infer())
+        row += 1
+
+        # 按钮
+        btn_frame = ttk.Frame(f)
+        btn_frame.grid(row=row, column=0, columnspan=3, pady=4)
+        row += 1
+
+        self.tokenizer_infer_start_btn = ttk.Button(btn_frame, text="▶  执行", command=self._start_tokenizer_infer)
+        self.tokenizer_infer_start_btn.pack(side="left", padx=4)
+        row += 1
+
+        # 输出区域
+        output_frame = ttk.LabelFrame(f, text="输出结果", padding=6)
+        output_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+        row += 1
+
+        self.tokenizer_infer_output = tk.Text(output_frame, height=12, width=72, state="disabled",
+                                              font=("Consolas", 10), bg="#1e1e1e", fg="#d4d4d4",
+                                              wrap="word")
+        self.tokenizer_infer_output.pack(fill="both", expand=True)
+
+        # 日志
+        self.tokenizer_infer_log = tk.Text(f, height=4, width=72, state="disabled",
+                                           font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4")
+        self.tokenizer_infer_log.grid(row=row, column=0, columnspan=3, sticky="ew")
+        scroll = ttk.Scrollbar(f, orient="vertical", command=self.tokenizer_infer_log.yview)
+        scroll.grid(row=row, column=3, sticky="ns")
+        self.tokenizer_infer_log["yscrollcommand"] = scroll.set
+
+    def _browse_tokenizer_infer_model(self):
+        path = filedialog.askopenfilename(title="选择词表 JSON 文件",
+                                          filetypes=[("JSON", "*.json"), ("All", "*.*")])
+        if path:
+            self.tokenizer_infer_model_var.set(path)
+
+    def _start_tokenizer_infer(self):
+        exe = str(TOKENIZER_INFER_EXE)
+        if not Path(exe).exists():
+            messagebox.showerror("错误", f"找不到 tokenizer_infer 可执行文件:\n{exe}\n请先构建项目")
+            return
+
+        input_text = self.tokenizer_infer_input_var.get().strip()
+        if not input_text:
+            messagebox.showwarning("提示", "请输入文本或 ID 列表")
+            return
+
+        mode = self.tokenizer_infer_mode_var.get()
+        cmd = [exe, "--model", self.tokenizer_infer_model_var.get()]
+        if mode == "text":
+            cmd += ["--text", input_text]
+        elif mode == "encode":
+            cmd += ["--encode", input_text]
+        elif mode == "decode":
+            cmd += ["--decode", input_text]
+
+        if self.tokenizer_infer_show_tokens_var.get():
+            cmd.append("--show-tokens")
+
+        self._log_tokenizer_infer(f"$ {' '.join(cmd)}\n")
+        self.tokenizer_infer_start_btn.config(state="disabled")
+
+        # 清空输出
+        self.tokenizer_infer_output.config(state="normal")
+        self.tokenizer_infer_output.delete("1.0", "end")
+        self.tokenizer_infer_output.config(state="disabled")
+
+        def _run():
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                output = result.stdout + result.stderr
+                self.after(0, lambda: self._log_tokenizer_infer(result.stdout))
+                if result.stderr:
+                    self.after(0, lambda: self._log_tokenizer_infer(result.stderr))
+                self.after(0, lambda o=output: self._show_tokenizer_output(o))
+            except FileNotFoundError:
+                self.after(0, lambda: self._log_tokenizer_infer("错误: 可执行文件未找到\n"))
+            except subprocess.TimeoutExpired:
+                self.after(0, lambda: self._log_tokenizer_infer("错误: 执行超时\n"))
+            except Exception as e:
+                self.after(0, lambda: self._log_tokenizer_infer(f"错误: {e}\n"))
+            finally:
+                self.after(0, lambda: self.tokenizer_infer_start_btn.config(state="normal"))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _show_tokenizer_output(self, output: str):
+        self.tokenizer_infer_output.config(state="normal")
+        self.tokenizer_infer_output.delete("1.0", "end")
+        self.tokenizer_infer_output.insert("1.0", output)
+        self.tokenizer_infer_output.config(state="disabled")
+
+    def _log_tokenizer_infer(self, text: str):
+        def _do():
+            self.tokenizer_infer_log.config(state="normal")
+            self.tokenizer_infer_log.insert("end", text)
+            self.tokenizer_infer_log.see("end")
+            self.tokenizer_infer_log.config(state="disabled")
         self.after(0, _do)
 
     # ============================================================

@@ -67,20 +67,30 @@ struct ModelSpec
 // ═══════════════════════════════════════════════════════════════════════════
 //  二进制文件格式
 //
-//  Version 1 (旧格式，仅参数):
-//    [magic 4B] [version=1 4B] [矩阵数据...]
+//  Version 3 (当前格式，含精度标记 + 可选 tokenizer):
+//    [magic 4B] [version=3 4B] [precision 1B] [model_type 4B]
+//    [spec data...]
+//    [param matrices...]
+//    [tokenizer_len 8B] [tokenizer_json...]     ← V3 新增
 //
-//  Version 2 (当前格式，含架构规格):
-//    [magic 4B] [version=2 4B] [model_type 4B] [规格数据...] [矩阵数据...]
+//  Version 2 (含架构规格):
+//    [magic 4B] [version=2 4B] [model_type 4B] [spec data...] [matrices...]
 //
-//  规格编码 (所有多字节整数均为小端序 uint64_t):
-//    MLP:         [num_dims 4B] [dim_0 8B] ... [dim_N 8B]
-//    Transformer: [d_model 8B] [num_heads 8B] [d_ff 8B] [num_layers 8B] [patch_size 8B]
-//    GPT:         [vocab_size 8B] [d_model 8B] [seq_len 8B] [num_heads 8B] [d_ff 8B] [num_layers 8B]
+//  Version 1 (仅参数):
+//    [magic 4B] [version=1 4B] [matrices...]
+//
+//  precision 字节: 0 = f32, 1 = f64（用于校验保存时与加载时的 Scalar 类型一致）
+//  tokenizer_len = 0 表示未嵌入分词器（向后兼容）
 // ═══════════════════════════════════════════════════════════════════════════
 
-inline constexpr uint32_t MODEL_MAGIC   = 0x4E4E4E4E;  // "NNNN"
-inline constexpr uint32_t MODEL_VERSION = 2;
+inline constexpr uint32_t MODEL_MAGIC    = 0x4E4E4E4E;  // "NNNN"
+inline constexpr uint32_t MODEL_VERSION  = 3;
+
+// ── 精度标记（写入文件头，加载时校验） ──────────────────────────────────
+// 0 = float (f32), 1 = double (f64)
+inline constexpr uint8_t PRECISION_TAG = sizeof(Scalar) == 4 ? 0 : 1;
+static_assert(sizeof(Scalar) == 4 || sizeof(Scalar) == 8,
+              "Scalar must be float (4 bytes) or double (8 bytes)");
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  detail — 内部读写工具
@@ -138,7 +148,7 @@ inline Result<void> write_matrix(std::ofstream &ofs, const Matrix &m)
         return std::unexpected(r.error());
     const auto &data = m.data();
     ofs.write(reinterpret_cast<const char *>(data.data()),
-              static_cast<std::streamsize>(data.size() * sizeof(double)));
+              static_cast<std::streamsize>(data.size() * sizeof(Scalar)));
     if (!ofs)
         return std::unexpected(Error{"Write error while writing matrix data"});
     return {};
@@ -163,7 +173,7 @@ inline Result<void> read_matrix(std::ifstream &ifs, Matrix &m)
 
     auto &data = m.data();
     ifs.read(reinterpret_cast<char *>(data.data()),
-             static_cast<std::streamsize>(data.size() * sizeof(double)));
+             static_cast<std::streamsize>(data.size() * sizeof(Scalar)));
     if (!ifs)
         return std::unexpected(Error{"Unexpected end of file while reading matrix data"});
     return {};
@@ -295,10 +305,13 @@ inline Result<void> write_header(std::ofstream &ofs)
         return std::unexpected(r.error());
     if (auto r = write_u32(ofs, MODEL_VERSION); !r)
         return std::unexpected(r.error());
+    ofs.write(reinterpret_cast<const char *>(&PRECISION_TAG), 1);
+    if (!ofs)
+        return std::unexpected(Error{"Write error while writing precision tag"});
     return {};
 }
 
-// 返回读到的 version (1 或 2)，同时校验 magic number
+// 返回读到的 version，同时校验 magic number 和精度
 [[nodiscard]] inline Result<uint32_t> read_and_validate_header(std::ifstream &ifs)
 {
     auto magic_r = read_u32(ifs);
@@ -313,7 +326,49 @@ inline Result<void> write_header(std::ofstream &ofs)
         return std::unexpected(Error{"Unsupported model file version: "
                            + std::to_string(*version_r)});
 
+    // V3: 读取并校验精度标记
+    if (*version_r >= 3)
+    {
+        uint8_t precision_tag;
+        ifs.read(reinterpret_cast<char *>(&precision_tag), 1);
+        if (!ifs)
+            return std::unexpected(Error{"Unexpected end: missing precision tag"});
+        if (precision_tag != PRECISION_TAG)
+            return std::unexpected(Error{
+                "Precision mismatch: file uses " + std::string(precision_tag == 0 ? "f32" : "f64")
+                + ", but build uses " + std::string(PRECISION_TAG == 0 ? "f32" : "f64")});
+    }
+
     return *version_r;
+}
+
+// ── Tokenizer JSON 读写（V3 新增） ──────────────────────────────────
+
+inline Result<void> write_tokenizer(std::ofstream &ofs, const std::string &json)
+{
+    if (auto r = write_u64(ofs, static_cast<uint64_t>(json.size())); !r)
+        return std::unexpected(r.error());
+    if (!json.empty())
+    {
+        ofs.write(json.data(), static_cast<std::streamsize>(json.size()));
+        if (!ofs)
+            return std::unexpected(Error{"Write error while writing tokenizer"});
+    }
+    return {};
+}
+
+[[nodiscard]] inline Result<std::string> read_tokenizer(std::ifstream &ifs)
+{
+    auto len_r = read_u64(ifs);
+    if (!len_r) return std::unexpected(len_r.error());
+    const auto len = static_cast<std::size_t>(*len_r);
+    if (len == 0) return std::string{};  // 未嵌入
+
+    std::string json(len, '\0');
+    ifs.read(json.data(), static_cast<std::streamsize>(len));
+    if (!ifs)
+        return std::unexpected(Error{"Unexpected end while reading tokenizer data"});
+    return json;
 }
 
 } // namespace detail
@@ -321,17 +376,16 @@ inline Result<void> write_header(std::ofstream &ofs)
 // ═══════════════════════════════════════════════════════════════════════════
 //  公开 API
 //
-//  save_model      — 保存 Model + ModelSpec 为 V2 格式二进制文件
-//  load_model      — 从文件加载参数到已有 Model（兼容 V1/V2）
-//  peek_model_spec — 只读文件头，返回 ModelSpec（不读参数，V1 返回 Unknown）
+//  save_model      — 保存 Model + ModelSpec（可选嵌入 tokenizer JSON）
+//  load_model      — 从文件加载参数，返回嵌入的 tokenizer JSON（如有）
+//  peek_model_spec — 只读文件头，返回 ModelSpec（不读参数）
 //
-//  所有函数在失败时返回 Result 错误，无 std::cout 副作用。
-//  调用方如需日志，可检查返回值并打印。
+//  向后兼容 V1/V2/V3 读取，写入统一为 V3。
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ── 保存模型 + 规格 ──────────────────────────────────────────────────────
-inline Result<void> save_model(const std::string &filename,
-                       Model &model, const ModelSpec &spec)
+// ── 保存模型（V3 格式，含精度标记 + 可选 tokenizer） ────────────────────
+[[nodiscard]] inline Result<void> save_model(const std::string &filename,
+    Model &model, const ModelSpec &spec, const std::string &tokenizer_json = {})
 {
     std::ofstream ofs(filename, std::ios::binary);
     if (!ofs)
@@ -349,12 +403,16 @@ inline Result<void> save_model(const std::string &filename,
             return std::unexpected(r.error());
     }
 
+    // V3: 写入 tokenizer JSON（长度前缀，0 表示无）
+    if (auto r = detail::write_tokenizer(ofs, tokenizer_json); !r)
+        return std::unexpected(r.error());
+
     if (!ofs)
         return std::unexpected(Error{"Write error while saving model to: " + filename});
     return {};
 }
 
-// ── 读取模型规格（只读头部，不读参数） ──────────────────────────────────
+// ── 读取模型规格（只读头部，不读参数/tokenizer） ──────────────────────────
 //    V1 文件返回 ModelType::Unknown
 [[nodiscard]] inline Result<ModelSpec> peek_model_spec(const std::string &filename)
 {
@@ -365,16 +423,17 @@ inline Result<void> save_model(const std::string &filename,
     auto version_r = detail::read_and_validate_header(ifs);
     if (!version_r) return std::unexpected(version_r.error());
 
-    if (*version_r == 2)
+    // V2/V3 有规格头
+    if (*version_r >= 2)
         return detail::read_spec(ifs);
 
     // V1 文件没有规格信息
     return ModelSpec{ModelType::Unknown, {}, 0, 0, 0, 0, 0, 0, 0};
 }
 
-// ── 加载参数到已有模型 ──────────────────────────────────────────────────
-//    兼容 V1 和 V2 文件（V2 会跳过规格头，只读参数）
-inline Result<void> load_model(const std::string &filename, Model &model)
+// ── 加载参数 + tokenizer（兼容 V1/V2/V3） ─────────────────────────────────
+//    返回嵌入的 tokenizer JSON 字符串（空串 = 未嵌入或旧格式）
+[[nodiscard]] inline Result<std::string> load_model(const std::string &filename, Model &model)
 {
     std::ifstream ifs(filename, std::ios::binary);
     if (!ifs)
@@ -382,9 +441,10 @@ inline Result<void> load_model(const std::string &filename, Model &model)
 
     auto version_r = detail::read_and_validate_header(ifs);
     if (!version_r) return std::unexpected(version_r.error());
+    const auto version = *version_r;
 
-    // V2 有规格头，跳过（规格已隐含在构建好的 model 中）
-    if (*version_r == 2)
+    // V2/V3: 跳过规格头（规格已隐含在构建好的 model 中）
+    if (version >= 2)
     {
         auto spec_r = detail::read_spec(ifs);
         if (!spec_r) return std::unexpected(spec_r.error());
@@ -397,9 +457,18 @@ inline Result<void> load_model(const std::string &filename, Model &model)
             return std::unexpected(r.error());
     }
 
+    // V3: 读取嵌入的 tokenizer JSON
+    std::string tokenizer_json;
+    if (version >= 3)
+    {
+        auto tok_r = detail::read_tokenizer(ifs);
+        if (!tok_r) return std::unexpected(tok_r.error());
+        tokenizer_json = std::move(*tok_r);
+    }
+
     if (!ifs)
         return std::unexpected(Error{"Read error while loading model from: " + filename});
-    return {};
+    return tokenizer_json;
 }
 
 } // namespace nn

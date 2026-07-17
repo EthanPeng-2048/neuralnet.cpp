@@ -18,7 +18,7 @@ namespace nn
     {
     public:
         virtual ~Loss() = default;
-        virtual std::expected<double, Error> forward(const Matrix &pred, const Matrix &target) = 0;
+        virtual std::expected<Scalar, Error> forward(const Matrix &pred, const Matrix &target) = 0;
         virtual const Matrix &backward() const = 0;
     };
 
@@ -30,41 +30,26 @@ namespace nn
     public:
         MSELoss() = default;
 
-        [[nodiscard]] std::expected<double, Error> forward(const Matrix &pred, const Matrix &target)
+        [[nodiscard]] std::expected<Scalar, Error> forward(const Matrix &pred, const Matrix &target)
         {
             if (pred.rows() != target.rows() || pred.cols() != target.cols())
-            {
                 return std::unexpected(Error{"mse loss shape mismatch"});
-            }
             if (pred.empty())
-            {
                 return std::unexpected(Error{"mse loss cannot be computed on an empty matrix"});
-            }
 
-            grad_input_.resize(pred.rows(), pred.cols());
-            const auto total = static_cast<double>(pred.size());
+            const auto total = static_cast<Scalar>(pred.size());
+            const Scalar factor = 2.0 / total;
 
-            const double sum_sq = SmartPolicy::transform_reduce(
-                pred.data().begin(), pred.data().end(),
-                target.data().begin(),
-                0.0,
-                std::plus<>{},
-                [](double prediction, double actual) noexcept
-                {
-                    const double diff = prediction - actual;
-                    return diff * diff;
-                });
+            // 梯度：通过 Matrix 语义接口计算，不穿透 .data()
+            grad_input_ = pred.binary_apply(target, [factor](Scalar p, Scalar t) noexcept {
+                return factor * (p - t);
+            });
 
-            const double loss = sum_sq / total;
-            const double factor = 2.0 / total;
-
-            SmartPolicy::transform(pred.data().begin(), pred.data().end(),
-                           target.data().begin(),
-                           grad_input_.data().begin(),
-                           [factor](double prediction, double actual) noexcept
-                           {
-                               return factor * (prediction - actual);
-                           });
+            // 损失：对梯度平方求和还原 MSE
+            // diff = grad * total/2, diff² = grad² * total²/4, loss = Σdiff² / total
+            const Scalar sum_gsq = grad_input_.reduce(Scalar{0}, std::plus<>{},
+                [](Scalar g) noexcept { return g * g; });
+            const Scalar loss = sum_gsq * total / Scalar{4};
 
             return loss;
         }
@@ -80,40 +65,39 @@ namespace nn
     public:
         CrossEntropyLoss() = default;
 
-        [[nodiscard]] std::expected<double, Error> forward(const Matrix &logits, const Matrix &target_onehot)
+        [[nodiscard]] std::expected<Scalar, Error> forward(const Matrix &logits, const Matrix &target_onehot)
         {
             const std::size_t classes = logits.rows();
             const std::size_t batch = logits.cols();
             grad_input_ = Matrix(classes, batch);
 
-            double total_loss = 0.0;
+            std::atomic<Scalar> total_loss{0.0};
 
-            for (std::size_t i = 0; i < batch; ++i)
-            {
+            // 逐样本并行：每个样本的 softmax 完全独立，无数据竞争
+            SmartPolicy::parallel_for_samples(batch, [&](std::size_t i) {
                 // 数值稳定的 softmax
-                double max_val = logits.at_unchecked(0, i);
+                Scalar max_val = logits.at_unchecked(0, i);
                 for (std::size_t c = 1; c < classes; ++c)
                 {
-                    const double val = logits.at_unchecked(c, i);
+                    const Scalar val = logits.at_unchecked(c, i);
                     if (val > max_val) max_val = val;
                 }
-                
-                // 栈上分配 exp_vals，支持最多 128 类
-                // 超过 128 类时改用 vector（非热路径，开销可接受）
-                std::array<double, 128> exp_vals_fixed{};
-                std::vector<double> exp_vals_heap;
-                std::span<double> exp_vals;
+
+                // 栈上分配，支持最多 128 类
+                std::array<Scalar, 128> exp_vals_fixed{};
+                std::vector<Scalar> exp_vals_heap;
+                std::span<Scalar> exp_vals;
                 if (classes <= 128) {
                     exp_vals = exp_vals_fixed;
                 } else {
                     exp_vals_heap.resize(classes);
                     exp_vals = exp_vals_heap;
                 }
-                
-                double sum_exp = 0.0;
+
+                Scalar sum_exp = 0.0;
                 for (std::size_t c = 0; c < classes; ++c)
                 {
-                    const double e = std::exp(logits.at_unchecked(c, i) - max_val);
+                    const Scalar e = std::exp(logits.at_unchecked(c, i) - max_val);
                     exp_vals[c] = e;
                     sum_exp += e;
                 }
@@ -130,19 +114,21 @@ namespace nn
                 }
 
                 // loss = -log(softmax[true_class])
-                const double prob_true = exp_vals[true_class] / sum_exp;
-                total_loss += -std::log(prob_true);
+                const Scalar prob_true = exp_vals[true_class] / sum_exp;
+                Scalar expected = total_loss.load(std::memory_order_relaxed);
+                while (!total_loss.compare_exchange_weak(expected, expected - std::log(prob_true),
+                                                          std::memory_order_relaxed)) {}
 
                 // 梯度：softmax - target
                 for (std::size_t c = 0; c < classes; ++c)
                 {
-                    const double softmax_c = exp_vals[c] / sum_exp;
+                    const Scalar softmax_c = exp_vals[c] / sum_exp;
                     grad_input_.set_value_unchecked(c, i,
-                                                    softmax_c - target_onehot.at_unchecked(c, i));
+                        softmax_c - target_onehot.at_unchecked(c, i));
                 }
-            }
+            });
 
-            return total_loss / static_cast<double>(batch);
+            return total_loss.load() / static_cast<Scalar>(batch);
         }
 
         [[nodiscard]] const Matrix &backward() const noexcept { return grad_input_; }

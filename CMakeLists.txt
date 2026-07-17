@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # 为所有目标添加编译标志
-add_compile_options(-fexperimental-library -O3 -ffast-math -Wall -Wextra -Wpedantic -Werror)
+add_compile_options(-fexperimental-library -O3 -ffast-math -march=native  -Wall -Wextra -Wpedantic -Werror)
 
 # ── MNIST 目标 ──────────────────────────────────────────────────────────────
 add_executable(mnist_train src/mnist_train.cpp)
@@ -27,6 +27,10 @@ add_executable(tokenizer_infer src/tokenizer_infer.cpp)
 
 target_include_directories(tokenizer_train PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(tokenizer_infer PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
+# ── 计算性能基准测试 ─────────────────────────────────────────────────────
+add_executable(compute_bench src/compute_bench.cpp)
+target_include_directories(compute_bench PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
 # ── GPU 测试目标 ──────────────────────────────────────────────────────────
 add_executable(gpu_test src/gpu_test.cpp)
@@ -98,7 +102,7 @@ if(Vulkan_FOUND)
             mnist_train mnist_infer
             text_train text_infer
             tokenizer_train tokenizer_infer
-            gpu_test
+            compute_bench gpu_test
         )
         foreach(TARGET ${NN_GPU_SOURCES})
             target_compile_definitions(${TARGET} PRIVATE NN_HAS_VULKAN)

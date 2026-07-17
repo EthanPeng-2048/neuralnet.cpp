@@ -80,8 +80,8 @@ namespace nn
               grad_WT_buf_(in_features, out_features)
         {
             // Xavier 均匀初始化：适合 tanh/sigmoid，对 ReLU 也可用
-            const double limit = std::sqrt(6.0 / static_cast<double>(in_features + out_features));
-            std::uniform_real_distribution<double> dist(-limit, limit);
+            const Scalar limit = std::sqrt(6.0 / static_cast<Scalar>(in_features + out_features));
+            std::uniform_real_distribution<Scalar> dist(-limit, limit);
             std::ranges::generate(W_.data(), [&]
                                   { return dist(rng_); });
         }
@@ -156,7 +156,7 @@ namespace nn
                     {
                         const std::size_t of = idx / in_feat;
                         const std::size_t inf = idx % in_feat;
-                        double sum = 0.0;
+                        Scalar sum = 0.0;
                         for (std::size_t b = 0; b < batch; ++b)
                             sum += go_span[of * batch + b] * ic_span[inf * batch + b];
                         gw_span[idx] += sum;
@@ -169,7 +169,7 @@ namespace nn
                 auto gb_span = grad_b_.span();
                 for (std::size_t of = 0; of < out_feat; ++of)
                 {
-                    double sum = 0.0;
+                    Scalar sum = 0.0;
                     for (std::size_t b = 0; b < batch; ++b)
                         sum += go_span[of * batch + b];
                     gb_span[of] += sum;
@@ -224,23 +224,7 @@ namespace nn
         Result<Matrix> forward(const Matrix &input) override
         {
             input_cache_ = input;
-
-            const auto in_span = input.span();
-            const auto n = input.size();
-
-            Matrix result(input.rows(), input.cols());
-            auto out_span = result.span();
-
-            if (n >= SmartPolicy::PARALLEL_THRESHOLD) {
-                auto indices = std::views::iota(std::size_t{0}, n);
-                SmartPolicy::for_each(indices.begin(), indices.end(),
-                    [in_span, out_span](std::size_t i) noexcept
-                    { out_span[i] = in_span[i] > 0.0 ? in_span[i] : 0.0; });
-            } else {
-                for (std::size_t i = 0; i < n; ++i)
-                    out_span[i] = in_span[i] > 0.0 ? in_span[i] : 0.0;
-            }
-            return result;
+            return input.apply([](Scalar x) noexcept { return x > 0.0 ? x : 0.0; });
         }
 
         Result<Matrix> backward(const Matrix &grad_output) override
@@ -248,23 +232,8 @@ namespace nn
             if (input_cache_.rows() != grad_output.rows() || input_cache_.cols() != grad_output.cols())
                 return std::unexpected(Error{"relu backward shape mismatch"});
 
-            const auto in_span = input_cache_.span();
-            const auto go_span = grad_output.span();
-            const auto n = grad_output.size();
-
-            Matrix grad_input(grad_output.rows(), grad_output.cols());
-            auto out_span = grad_input.span();
-
-            if (n >= SmartPolicy::PARALLEL_THRESHOLD) {
-                auto indices = std::views::iota(std::size_t{0}, n);
-                SmartPolicy::for_each(indices.begin(), indices.end(),
-                    [in_span, go_span, out_span](std::size_t i) noexcept
-                    { out_span[i] = in_span[i] > 0.0 ? go_span[i] : 0.0; });
-            } else {
-                for (std::size_t i = 0; i < n; ++i)
-                    out_span[i] = in_span[i] > 0.0 ? go_span[i] : 0.0;
-            }
-            return grad_input;
+            return input_cache_.binary_apply(grad_output,
+                [](Scalar x, Scalar go) noexcept { return x > 0.0 ? go : 0.0; });
         }
 
 #ifdef NN_HAS_VULKAN
@@ -280,8 +249,8 @@ namespace nn
     {
     private:
         Matrix input_cache_;
-        Matrix sigmoid_cache_;  // 缓存 sigmoid(1.702 * x) 用于反向传播
-        static constexpr double BETA = 1.702;
+        Matrix sigmoid_cache_;
+        static constexpr Scalar BETA = 1.702;
 
     public:
         GeLU() = default;
@@ -289,67 +258,31 @@ namespace nn
         // QuickGeLU: x * sigmoid(1.702 * x)
         Result<Matrix> forward(const Matrix &input) override
         {
-            const auto n = input.size();
             input_cache_ = input;
-            sigmoid_cache_.resize(input.rows(), input.cols());
 
-            const auto in_span = input.span();
-            auto sig_span = sigmoid_cache_.span();
-
-            Matrix result(input.rows(), input.cols());
-            auto out_span = result.span();
-
-            if (n >= SmartPolicy::PARALLEL_THRESHOLD) {
-                auto indices = std::views::iota(std::size_t{0}, n);
-                SmartPolicy::for_each(indices.begin(), indices.end(),
-                    [in_span, out_span, sig_span](std::size_t i) noexcept
-                    {
-                        double sigmoid_input = BETA * in_span[i];
-                        double sigmoid_val = 1.0 / (1.0 + std::exp(-sigmoid_input));
-                        sig_span[i] = sigmoid_val;
-                        out_span[i] = in_span[i] * sigmoid_val;
-                    });
-            } else {
-                for (std::size_t i = 0; i < n; ++i) {
-                    double sigmoid_input = BETA * in_span[i];
-                    double sigmoid_val = 1.0 / (1.0 + std::exp(-sigmoid_input));
-                    sig_span[i] = sigmoid_val;
-                    out_span[i] = in_span[i] * sigmoid_val;
-                }
-            }
-            return result;
+            // Pass 1: sigmoid_cache[i] = sigmoid(BETA * input[i])
+            sigmoid_cache_ = input.apply([](Scalar x) noexcept {
+                return 1.0 / (1.0 + std::exp(-BETA * x));
+            });
+            // Pass 2: result[i] = input[i] * sigmoid_cache[i]
+            return input.binary_apply(sigmoid_cache_,
+                [](Scalar x, Scalar s) noexcept { return x * s; });
         }
 
-        // d/dx [x * sigmoid(βx)] = sigmoid(βx) + x * β * sigmoid(βx) * (1 - sigmoid(βx))
-        //                        = sigmoid(βx) * [1 + βx * (1 - sigmoid(βx))]
+        // d/dx [x * sigmoid(βx)] = sigmoid(βx) * [1 + βx * (1 - sigmoid(βx))]
         Result<Matrix> backward(const Matrix &grad_output) override
         {
             if (input_cache_.rows() != grad_output.rows() || input_cache_.cols() != grad_output.cols())
                 return std::unexpected(Error{"gelu backward shape mismatch"});
 
-            const auto in_span = input_cache_.span();
-            const auto sig_span = sigmoid_cache_.span();
-            const auto go_span = grad_output.span();
-            const auto n = grad_output.size();
-
-            Matrix grad_input(grad_output.rows(), grad_output.cols());
-            auto out_span = grad_input.span();
-
-            if (n >= SmartPolicy::PARALLEL_THRESHOLD) {
-                auto indices = std::views::iota(std::size_t{0}, n);
-                SmartPolicy::for_each(indices.begin(), indices.end(),
-                    [in_span, sig_span, go_span, out_span](std::size_t i) noexcept
-                    {
-                        double s = sig_span[i];
-                        out_span[i] = go_span[i] * s * (1.0 + BETA * in_span[i] * (1.0 - s));
-                    });
-            } else {
-                for (std::size_t i = 0; i < n; ++i) {
-                    double s = sig_span[i];
-                    out_span[i] = go_span[i] * s * (1.0 + BETA * in_span[i] * (1.0 - s));
-                }
-            }
-            return grad_input;
+            // factor[i] = s[i] * (1 + BETA * x[i] * (1 - s[i]))
+            Matrix factor = input_cache_.binary_apply(sigmoid_cache_,
+                [](Scalar x, Scalar s) noexcept {
+                    return s * (1.0 + BETA * x * (1.0 - s));
+                });
+            // out[i] = go[i] * factor[i]
+            return grad_output.binary_apply(factor,
+                [](Scalar go, Scalar f) noexcept { return go * f; });
         }
 
 #ifdef NN_HAS_VULKAN
@@ -365,7 +298,7 @@ namespace nn
     {
     private:
         std::size_t normalized_shape_;
-        double epsilon_;
+        Scalar epsilon_;
         
         // 可学习参数
         Matrix gamma_;      // 缩放参数 (normalized_shape_, 1)
@@ -380,10 +313,10 @@ namespace nn
         Matrix mean_cache_;        // 均值
 
         // 数值稳定性
-        static constexpr double EPSILON = 1e-5;
+        static constexpr Scalar EPSILON = 1e-5;
 
     public:
-        explicit LayerNorm(std::size_t normalized_shape, double epsilon = EPSILON)
+        explicit LayerNorm(std::size_t normalized_shape, Scalar epsilon = EPSILON)
             : normalized_shape_(normalized_shape),
               epsilon_(epsilon),
               gamma_(normalized_shape, 1, 1.0),  // 初始化为1
@@ -438,25 +371,25 @@ namespace nn
                      features, batch_size, epsilon = epsilon_](std::size_t b) noexcept
                     {
                         // 计算均值
-                        double sum = 0.0;
+                        Scalar sum = 0.0;
                         for (std::size_t f = 0; f < features; ++f)
                             sum += in_span[f * batch_size + b];
-                        double mean = sum / static_cast<double>(features);
+                        Scalar mean = sum / static_cast<Scalar>(features);
                         mean_span[b] = mean;
 
                         // 计算方差
-                        double var_sum = 0.0;
+                        Scalar var_sum = 0.0;
                         for (std::size_t f = 0; f < features; ++f) {
-                            double diff = in_span[f * batch_size + b] - mean;
+                            Scalar diff = in_span[f * batch_size + b] - mean;
                             var_sum += diff * diff;
                         }
-                        double variance = var_sum / static_cast<double>(features);
-                        double std_inv = 1.0 / std::sqrt(variance + epsilon);
+                        Scalar variance = var_sum / static_cast<Scalar>(features);
+                        Scalar std_inv = 1.0 / std::sqrt(variance + epsilon);
                         std_span[b] = std_inv;
 
                         // 归一化和仿射变换
                         for (std::size_t f = 0; f < features; ++f) {
-                            double normalized = (in_span[f * batch_size + b] - mean) * std_inv;
+                            Scalar normalized = (in_span[f * batch_size + b] - mean) * std_inv;
                             norm_span[f * batch_size + b] = normalized;
                             res_span[f * batch_size + b] = gamma_span[f] * normalized + beta_span[f];
                         }
@@ -464,25 +397,25 @@ namespace nn
             } else {
                 for (std::size_t b = 0; b < batch_size; ++b) {
                     // 计算均值
-                    double sum = 0.0;
+                    Scalar sum = 0.0;
                     for (std::size_t f = 0; f < features; ++f)
                         sum += in_span[f * batch_size + b];
-                    double mean = sum / static_cast<double>(features);
+                    Scalar mean = sum / static_cast<Scalar>(features);
                     mean_span[b] = mean;
 
                     // 计算方差
-                    double var_sum = 0.0;
+                    Scalar var_sum = 0.0;
                     for (std::size_t f = 0; f < features; ++f) {
-                        double diff = in_span[f * batch_size + b] - mean;
+                        Scalar diff = in_span[f * batch_size + b] - mean;
                         var_sum += diff * diff;
                     }
-                    double variance = var_sum / static_cast<double>(features);
-                    double std_inv = 1.0 / std::sqrt(variance + epsilon_);
+                    Scalar variance = var_sum / static_cast<Scalar>(features);
+                    Scalar std_inv = 1.0 / std::sqrt(variance + epsilon_);
                     std_span[b] = std_inv;
 
                     // 归一化和仿射变换
                     for (std::size_t f = 0; f < features; ++f) {
-                        double normalized = (in_span[f * batch_size + b] - mean) * std_inv;
+                        Scalar normalized = (in_span[f * batch_size + b] - mean) * std_inv;
                         norm_span[f * batch_size + b] = normalized;
                         res_span[f * batch_size + b] = gamma_span[f] * normalized + beta_span[f];
                     }
@@ -520,18 +453,18 @@ namespace nn
                     [go_span, norm_span, std_span, gamma_span, gi_span,
                      features, batch_size](std::size_t b) noexcept
                     {
-                        double std_inv = std_span[b];
-                        double sum_grad = 0.0;
-                        double sum_grad_norm = 0.0;
+                        Scalar std_inv = std_span[b];
+                        Scalar sum_grad = 0.0;
+                        Scalar sum_grad_norm = 0.0;
                         for (std::size_t f = 0; f < features; ++f) {
-                            double g = go_span[f * batch_size + b] * gamma_span[f];
+                            Scalar g = go_span[f * batch_size + b] * gamma_span[f];
                             sum_grad += g;
                             sum_grad_norm += g * norm_span[f * batch_size + b];
                         }
-                        const double inv_features = 1.0 / static_cast<double>(features);
+                        const Scalar inv_features = 1.0 / static_cast<Scalar>(features);
                         for (std::size_t f = 0; f < features; ++f) {
-                            double grad_out = go_span[f * batch_size + b];
-                            double g = grad_out * gamma_span[f];
+                            Scalar grad_out = go_span[f * batch_size + b];
+                            Scalar g = grad_out * gamma_span[f];
                             gi_span[f * batch_size + b] = (g - sum_grad * inv_features -
                                    norm_span[f * batch_size + b] * sum_grad_norm * inv_features) * std_inv;
                         }
@@ -539,29 +472,29 @@ namespace nn
                 // 串行累加 dL/dγ 和 dL/dβ
                 for (std::size_t b = 0; b < batch_size; ++b) {
                     for (std::size_t f = 0; f < features; ++f) {
-                        double grad_out = go_span[f * batch_size + b];
+                        Scalar grad_out = go_span[f * batch_size + b];
                         gg_span[f] += grad_out * norm_span[f * batch_size + b];
                         gb_span[f] += grad_out;
                     }
                 }
             } else {
                 for (std::size_t b = 0; b < batch_size; ++b) {
-                    double std_inv = std_span[b];
+                    Scalar std_inv = std_span[b];
                     
                     // 预计算统计量：O(N) 而非 O(N²)
-                    double sum_grad = 0.0;
-                    double sum_grad_norm = 0.0;
+                    Scalar sum_grad = 0.0;
+                    Scalar sum_grad_norm = 0.0;
                     for (std::size_t f = 0; f < features; ++f) {
-                        double g = go_span[f * batch_size + b] * gamma_span[f];
+                        Scalar g = go_span[f * batch_size + b] * gamma_span[f];
                         sum_grad += g;
                         sum_grad_norm += g * norm_span[f * batch_size + b];
                     }
 
                     // 单次遍历：同时计算 dL/dγ、dL/dβ、dL/dx
-                    const double inv_features = 1.0 / static_cast<double>(features);
+                    const Scalar inv_features = 1.0 / static_cast<Scalar>(features);
                     for (std::size_t f = 0; f < features; ++f) {
-                        double grad_out = go_span[f * batch_size + b];
-                        double g = grad_out * gamma_span[f];
+                        Scalar grad_out = go_span[f * batch_size + b];
+                        Scalar g = grad_out * gamma_span[f];
                         gg_span[f] += grad_out * norm_span[f * batch_size + b];
                         gb_span[f] += grad_out;
                         gi_span[f * batch_size + b] = (g - sum_grad * inv_features -
@@ -611,22 +544,22 @@ namespace nn
                 auto row_cache = cache_span.subspan(offset, cols);
 
                 // 数值稳定：减去行内最大值
-                double max_val = row_in[0];
+                Scalar max_val = row_in[0];
                 for (std::size_t c = 1; c < cols; ++c)
                     max_val = std::max(max_val, row_in[c]);
 
                 // 计算 exp 和求和
-                double sum = 0.0;
+                Scalar sum = 0.0;
                 for (std::size_t c = 0; c < cols; ++c)
                 {
-                    double e = std::exp(row_in[c] - max_val);
+                    Scalar e = std::exp(row_in[c] - max_val);
                     row_out[c] = e;
                     row_cache[c] = e;
                     sum += e;
                 }
 
                 // 归一化
-                const double inv_sum = 1.0 / sum;
+                const Scalar inv_sum = 1.0 / sum;
                 for (std::size_t c = 0; c < cols; ++c)
                 {
                     row_out[c] *= inv_sum;
@@ -668,7 +601,7 @@ namespace nn
                 auto row_gi = gi_span.subspan(offset, cols);
 
                 // dot = Σ_k out[k] * grad_out[k]
-                double dot = 0.0;
+                Scalar dot = 0.0;
                 for (std::size_t c = 0; c < cols; ++c)
                     dot += row_out[c] * row_go[c];
 
@@ -702,7 +635,7 @@ namespace nn
         std::size_t d_model_;
         std::size_t num_heads_;
         std::size_t d_k_;
-        double scale_;  // 1.0 / sqrt(d_k)
+        Scalar scale_;  // 1.0 / sqrt(d_k)
 
         // 投影层
         Linear W_q_;
@@ -753,7 +686,7 @@ namespace nn
         }
 
         // ── 逐元素缩放 ──────────────────────────────────────────────────
-        static void scale_inplace(Matrix &m, double s)
+        static void scale_inplace(Matrix &m, Scalar s)
         {
             auto m_span = m.span();
             const auto n = m.size();
@@ -775,7 +708,7 @@ namespace nn
             : d_model_(d_model),
               num_heads_(num_heads),
               d_k_(d_model / num_heads),
-              scale_(1.0 / std::sqrt(static_cast<double>(d_model / num_heads))),
+              scale_(1.0 / std::sqrt(static_cast<Scalar>(d_model / num_heads))),
               W_q_(d_model, d_model),
               W_k_(d_model, d_model),
               W_v_(d_model, d_model),
@@ -922,7 +855,7 @@ namespace nn
 
                     for (std::size_t i = 0; i < seq_len; ++i)
                     {
-                        double dot = 0.0;
+                        Scalar dot = 0.0;
                         for (std::size_t j = 0; j < seq_len; ++j)
                             dot += a_span[i * seq_len + j] * ga_span[i * seq_len + j];
                         for (std::size_t j = 0; j < seq_len; ++j)
@@ -989,25 +922,25 @@ namespace nn
             // ── 一次性预计算频率与编码 ──
             // 先计算每个特征对的角频率（避免在 position 循环中重复 pow）
             const std::size_t half = d_model / 2;
-            std::vector<double> freqs(half);
+            std::vector<Scalar> freqs(half);
             for (std::size_t i = 0; i < half; ++i)
-                freqs[i] = 1.0 / std::pow(10000.0, static_cast<double>(2 * i) / d_model);
+                freqs[i] = 1.0 / std::pow(10000.0, static_cast<Scalar>(2 * i) / d_model);
 
             auto e_span = encoding_.span();
             for (std::size_t pos = 0; pos < max_len; ++pos)
             {
-                const double pos_d = static_cast<double>(pos);
+                const Scalar pos_d = static_cast<Scalar>(pos);
                 for (std::size_t i = 0; i < half; ++i)
                 {
-                    const double angle = pos_d * freqs[i];
+                    const Scalar angle = pos_d * freqs[i];
                     e_span[(2 * i)       * max_len + pos] = std::sin(angle);
                     e_span[(2 * i + 1)   * max_len + pos] = std::cos(angle);
                 }
                 // 奇数维度：最后一个特征仅使用 sin
                 if (d_model % 2 == 1)
                 {
-                    const double freq_last = 1.0 / std::pow(10000.0, static_cast<double>(2 * half) / d_model);
-                    const double angle = pos_d * freq_last;
+                    const Scalar freq_last = 1.0 / std::pow(10000.0, static_cast<Scalar>(2 * half) / d_model);
+                    const Scalar angle = pos_d * freq_last;
                     e_span[(d_model - 1) * max_len + pos] = std::sin(angle);
                 }
             }
@@ -1292,10 +1225,10 @@ namespace nn
                 }
 
                 // 全局平均池化: (d_model, num_patches) → (d_model,)
-                const double inv_n = 1.0 / static_cast<double>(num_patches_);
+                const Scalar inv_n = 1.0 / static_cast<Scalar>(num_patches_);
                 for (std::size_t r = 0; r < d_model_; ++r)
                 {
-                    double sum = 0.0;
+                    Scalar sum = 0.0;
                     for (std::size_t c = 0; c < num_patches_; ++c)
                         sum += x.at_unchecked(r, c);
                     output.set_value_unchecked(r, b, sum * inv_n);
@@ -1324,11 +1257,11 @@ namespace nn
                 }
 
                 // ── 全局平均池化梯度: 展开 ──
-                const double inv_n = 1.0 / static_cast<double>(num_patches_);
+                const Scalar inv_n = 1.0 / static_cast<Scalar>(num_patches_);
                 Matrix grad(d_model_, num_patches_);
                 for (std::size_t r = 0; r < d_model_; ++r)
                 {
-                    double g = grad_output.at_unchecked(r, b) * inv_n;
+                    Scalar g = grad_output.at_unchecked(r, b) * inv_n;
                     for (std::size_t c = 0; c < num_patches_; ++c)
                         grad.set_value_unchecked(r, c, g);
                 }
@@ -1478,7 +1411,7 @@ namespace nn
                         {
                             const std::size_t flat = pr * patch_size_ + pc;
                             const std::size_t pix  = (gr + pr) * img_size_ + (gc + pc);
-                            const double val = grad_input.at_unchecked(pix, b)
+                            const Scalar val = grad_input.at_unchecked(pix, b)
                                              + grad_patches.at_unchecked(flat, col_idx);
                             grad_input.set_value_unchecked(pix, b, val);
                         }
@@ -1502,7 +1435,7 @@ namespace nn
         std::size_t d_model_;
         std::size_t num_heads_;
         std::size_t d_k_;
-        double scale_;
+        Scalar scale_;
 
         // 投影层
         Linear W_q_;
@@ -1521,7 +1454,7 @@ namespace nn
         std::vector<Matrix> O_heads_;
 
         // 因果掩码 (上三角为 -inf)
-        std::vector<double> mask_data_;     // max_len × max_len
+        std::vector<Scalar> mask_data_;     // max_len × max_len
 
         // 辅助缓冲区
         Matrix grad_scores_buf_;
@@ -1553,7 +1486,7 @@ namespace nn
                             dst_span.begin() + (row_start + r) * cols);
         }
 
-        static void scale_inplace(Matrix &m, double s)
+        static void scale_inplace(Matrix &m, Scalar s)
         {
             auto m_span = m.span();
             const auto n = m.size();
@@ -1576,7 +1509,7 @@ namespace nn
             : d_model_(d_model),
               num_heads_(num_heads),
               d_k_(d_model / num_heads),
-              scale_(1.0 / std::sqrt(static_cast<double>(d_model / num_heads))),
+              scale_(1.0 / std::sqrt(static_cast<Scalar>(d_model / num_heads))),
               W_q_(d_model, d_model),
               W_k_(d_model, d_model),
               W_v_(d_model, d_model),
@@ -1587,7 +1520,7 @@ namespace nn
                 assert(false && "CausalSelfAttention: d_model must be divisible by num_heads"); // NOLINT
 
             // 预计算因果掩码: mask[i][j] = 0 if j <= i else -inf
-            const double neg_inf = -1e30;
+            const Scalar neg_inf = -1e30;
             for (std::size_t i = 0; i < max_len; ++i)
                 for (std::size_t j = 0; j < max_len; ++j)
                     mask_data_[i * max_len + j] = (j <= i) ? 0.0 : neg_inf;
@@ -1659,7 +1592,7 @@ namespace nn
                 // 施加因果掩码
                 {
                     auto a_span = attn_[h].span();
-                    const auto m_span = std::span<const double>(mask_data_);
+                    const auto m_span = std::span<const Scalar>(mask_data_);
                     const std::size_t s2 = seq_len * seq_len;
                     for (std::size_t idx = 0; idx < s2; ++idx)
                         a_span[idx] += m_span[idx];
@@ -1735,7 +1668,7 @@ namespace nn
 
                     for (std::size_t i = 0; i < seq_len; ++i)
                     {
-                        double dot = 0.0;
+                        Scalar dot = 0.0;
                         for (std::size_t j = 0; j < seq_len; ++j)
                             dot += a_span[i * seq_len + j] * ga_span[i * seq_len + j];
                         for (std::size_t j = 0; j < seq_len; ++j)
@@ -1923,9 +1856,9 @@ namespace nn
         {
             // Xavier-like 初始化嵌入
             {
-                constexpr double emb_init_std = 0.02;
+                constexpr Scalar emb_init_std = 0.02;
                 std::mt19937_64 rng{42};
-                std::normal_distribution<double> dist(0.0, emb_init_std);
+                std::normal_distribution<Scalar> dist(0.0, emb_init_std);
                 for (auto &v : token_emb_.data())
                     v = dist(rng);
                 for (auto &v : pos_emb_.data())
@@ -1972,7 +1905,7 @@ namespace nn
         }
 
         // ── 前向传播 ────────────────────────────────────────────────
-        // input: (seq_len, batch_size) — token IDs 作为 double
+        // input: (seq_len, batch_size) — token IDs 作为 Scalar
         Result<Matrix> forward(const Matrix &input) override
         {
             const std::size_t seq_len = input.rows();
@@ -2120,12 +2053,12 @@ namespace nn
         // ── 采样生成（支持温度采样 + 贪心） ────────────────────────
         std::vector<std::size_t> generate(const std::vector<std::size_t> &prompt,
                                           std::size_t max_new_tokens,
-                                          double temperature = 1.0)
+                                          Scalar temperature = 1.0)
         {
             std::vector<std::size_t> context(prompt);
             std::vector<std::size_t> generated;
             std::mt19937_64 rng{std::random_device{}()};
-            std::uniform_real_distribution<double> dist(0.0, 1.0);
+            std::uniform_real_distribution<Scalar> dist(0.0, 1.0);
 
             for (std::size_t step = 0; step < max_new_tokens; ++step)
             {
@@ -2138,14 +2071,14 @@ namespace nn
                 Matrix input(cur_len, 1);
                 for (std::size_t t = 0; t < cur_len; ++t)
                     input.set_value_unchecked(t, 0,
-                        static_cast<double>(context[start + t]));
+                        static_cast<Scalar>(context[start + t]));
 
                 auto logits_res = forward(input); // (vocab_size, cur_len)
                 if (!logits_res) break;  // 生成中出错则提前终止
                 auto logits = *logits_res;
 
                 // 取最后一个位置的 logits
-                std::vector<double> last_logits(vocab_size_);
+                std::vector<Scalar> last_logits(vocab_size_);
                 for (std::size_t v = 0; v < vocab_size_; ++v)
                     last_logits[v] = logits.at_unchecked(v, cur_len - 1);
 
@@ -2157,10 +2090,10 @@ namespace nn
                 }
 
                 // softmax（数值稳定）
-                double max_val = last_logits[0];
+                Scalar max_val = last_logits[0];
                 for (std::size_t v = 1; v < vocab_size_; ++v)
                     max_val = std::max(max_val, last_logits[v]);
-                double sum_exp = 0.0;
+                Scalar sum_exp = 0.0;
                 for (auto &v : last_logits)
                 {
                     v = std::exp(v - max_val);
@@ -2174,8 +2107,8 @@ namespace nn
                 if (temperature > 0.0 && temperature != 1.0)
                 {
                     // 概率采样
-                    double r = dist(rng);
-                    double cumulative = 0.0;
+                    Scalar r = dist(rng);
+                    Scalar cumulative = 0.0;
                     next_token = vocab_size_ - 1;
                     for (std::size_t v = 0; v < vocab_size_; ++v)
                     {
@@ -2191,7 +2124,7 @@ namespace nn
                 {
                     // 贪心
                     next_token = 0;
-                    double best = last_logits[0];
+                    Scalar best = last_logits[0];
                     for (std::size_t v = 1; v < vocab_size_; ++v)
                     {
                         if (last_logits[v] > best)
