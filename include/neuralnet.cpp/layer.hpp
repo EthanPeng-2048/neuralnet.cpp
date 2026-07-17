@@ -81,26 +81,12 @@ namespace nn
 
             input_cache_ = input;
 
-            // 融合矩阵乘法 + bias 加法，减少一次完整遍历
-            const std::size_t out_feat = W_.rows();
-            const std::size_t batch = input.cols();
-
             // product = W * input（写入预分配缓冲区，避免分配）
             W_.multiply_to(product_buf_, input);
 
-            // result = product + bias（返回新矩阵，NRVO 优化）
-            Matrix result(out_feat, batch);
-            const auto prod_span = product_buf_.span();
-            const auto bias_span = b_.span();
-            auto res_span = result.span();
-            const auto total = static_cast<std::size_t>(out_feat * batch);
-
-            auto indices = std::views::iota(std::size_t{0}, total);
-            SmartPolicy::for_each(indices.begin(), indices.end(),
-                          [prod_span, bias_span, res_span, batch](std::size_t idx) noexcept
-                          {
-                              res_span[idx] = prod_span[idx] + bias_span[idx / batch];
-                          });
+            // result = product + bias（通过 Matrix 语义方法完成 broadcast add）
+            Matrix result = product_buf_;
+            result.add_bias_broadcast_inplace(b_);
 
             return result;
         }
@@ -121,36 +107,23 @@ namespace nn
             Matrix grad_input(in_feat, batch);
             grad_WT_buf_.multiply_to(grad_input, grad_output);
 
-            // grad_W += grad_output * input_cache_^T（逐元素累加，避免临时矩阵）
-            // 手动计算：grad_W[i][j] += sum_k(grad_output[i][k] * input_cache_[j][k])
+            // grad_W += grad_output * input_cache_^T（通过 Matrix 语义方法）
             {
-                const auto go_span = grad_output.span();
-                const auto ic_span = input_cache_.span();
-                auto gw_span = grad_W_.span();
-                const std::size_t gw_size = out_feat * in_feat;
-                auto gw_indices = std::views::iota(std::size_t{0}, gw_size);
-                SmartPolicy::for_each(gw_indices.begin(), gw_indices.end(),
-                    [go_span, ic_span, gw_span, in_feat, batch](std::size_t idx) noexcept
-                    {
-                        const std::size_t of = idx / in_feat;
-                        const std::size_t inf = idx % in_feat;
-                        Scalar sum = 0.0;
-                        for (std::size_t b = 0; b < batch; ++b)
-                            sum += go_span[of * batch + b] * ic_span[inf * batch + b];
-                        gw_span[idx] += sum;
-                    });
+                Matrix input_T = input_cache_.transpose();
+                Matrix grad_W_accum(out_feat, in_feat);
+                grad_output.multiply_to(grad_W_accum, input_T);
+                grad_W_.add_inplace(grad_W_accum);
             }
 
             // grad_b += sum(grad_output, dim=batch)
             {
-                const auto go_span = grad_output.span();
-                auto gb_span = grad_b_.span();
                 for (std::size_t of = 0; of < out_feat; ++of)
                 {
                     Scalar sum = 0.0;
                     for (std::size_t b = 0; b < batch; ++b)
-                        sum += go_span[of * batch + b];
-                    gb_span[of] += sum;
+                        sum += grad_output.at_unchecked(of, b);
+                    grad_b_.set_value_unchecked(of, 0,
+                        grad_b_.at_unchecked(of, 0) + sum);
                 }
             }
 
@@ -277,80 +250,16 @@ namespace nn
             const std::size_t batch_size = input.cols();
             const std::size_t features = input.rows();
 
-            // 缓存中间结果（复用已有内存）
+            // 预分配缓存（复用已有内存）
             mean_cache_.resize(1, batch_size);
             std_cache_.resize(1, batch_size);
             normalized_cache_.resize(features, batch_size);
 
             Matrix result(features, batch_size);
 
-            const auto in_span = input.span();
-            const auto gamma_span = gamma_.span();
-            const auto beta_span = beta_.span();
-            auto mean_span = mean_cache_.span();
-            auto std_span = std_cache_.span();
-            auto norm_span = normalized_cache_.span();
-            auto res_span = result.span();
-
-            // 对每个样本（列）独立处理
-            auto batch_indices = std::views::iota(std::size_t{0}, batch_size);
-            
-            if (batch_size >= SmartPolicy::PARALLEL_THRESHOLD) {
-                SmartPolicy::for_each(batch_indices.begin(), batch_indices.end(),
-                    [in_span, gamma_span, beta_span, mean_span, std_span, norm_span, res_span, 
-                     features, batch_size, epsilon = epsilon_](std::size_t b) noexcept
-                    {
-                        // 计算均值
-                        Scalar sum = 0.0;
-                        for (std::size_t f = 0; f < features; ++f)
-                            sum += in_span[f * batch_size + b];
-                        Scalar mean = sum / static_cast<Scalar>(features);
-                        mean_span[b] = mean;
-
-                        // 计算方差
-                        Scalar var_sum = 0.0;
-                        for (std::size_t f = 0; f < features; ++f) {
-                            Scalar diff = in_span[f * batch_size + b] - mean;
-                            var_sum += diff * diff;
-                        }
-                        Scalar variance = var_sum / static_cast<Scalar>(features);
-                        Scalar std_inv = 1.0 / std::sqrt(variance + epsilon);
-                        std_span[b] = std_inv;
-
-                        // 归一化和仿射变换
-                        for (std::size_t f = 0; f < features; ++f) {
-                            Scalar normalized = (in_span[f * batch_size + b] - mean) * std_inv;
-                            norm_span[f * batch_size + b] = normalized;
-                            res_span[f * batch_size + b] = gamma_span[f] * normalized + beta_span[f];
-                        }
-                    });
-            } else {
-                for (std::size_t b = 0; b < batch_size; ++b) {
-                    // 计算均值
-                    Scalar sum = 0.0;
-                    for (std::size_t f = 0; f < features; ++f)
-                        sum += in_span[f * batch_size + b];
-                    Scalar mean = sum / static_cast<Scalar>(features);
-                    mean_span[b] = mean;
-
-                    // 计算方差
-                    Scalar var_sum = 0.0;
-                    for (std::size_t f = 0; f < features; ++f) {
-                        Scalar diff = in_span[f * batch_size + b] - mean;
-                        var_sum += diff * diff;
-                    }
-                    Scalar variance = var_sum / static_cast<Scalar>(features);
-                    Scalar std_inv = 1.0 / std::sqrt(variance + epsilon_);
-                    std_span[b] = std_inv;
-
-                    // 归一化和仿射变换
-                    for (std::size_t f = 0; f < features; ++f) {
-                        Scalar normalized = (in_span[f * batch_size + b] - mean) * std_inv;
-                        norm_span[f * batch_size + b] = normalized;
-                        res_span[f * batch_size + b] = gamma_span[f] * normalized + beta_span[f];
-                    }
-                }
-            }
+            // 委托 Matrix 语义方法完成 LayerNorm 前向传播
+            Matrix::layer_norm_forward(result, mean_cache_, std_cache_,
+                                       normalized_cache_, input, gamma_, beta_, epsilon_);
 
             return result;
         }
@@ -365,73 +274,10 @@ namespace nn
 
             Matrix grad_input(features, batch_size);
 
-            const auto go_span = grad_output.span();
-            const auto norm_span = normalized_cache_.span();
-            const auto std_span = std_cache_.span();
-            const auto gamma_span = gamma_.span();
-            auto gi_span = grad_input.span();
-            auto gg_span = grad_gamma_.span();
-            auto gb_span = grad_beta_.span();
-
-            // 计算梯度
-            auto batch_indices = std::views::iota(std::size_t{0}, batch_size);
-            
-            if (batch_size >= SmartPolicy::PARALLEL_THRESHOLD) {
-                // 先并行计算每个样本的 dL/dx（无竞争），
-                // 再串行累加 dL/dγ 和 dL/dβ（避免数据竞争）
-                SmartPolicy::for_each(batch_indices.begin(), batch_indices.end(),
-                    [go_span, norm_span, std_span, gamma_span, gi_span,
-                     features, batch_size](std::size_t b) noexcept
-                    {
-                        Scalar std_inv = std_span[b];
-                        Scalar sum_grad = 0.0;
-                        Scalar sum_grad_norm = 0.0;
-                        for (std::size_t f = 0; f < features; ++f) {
-                            Scalar g = go_span[f * batch_size + b] * gamma_span[f];
-                            sum_grad += g;
-                            sum_grad_norm += g * norm_span[f * batch_size + b];
-                        }
-                        const Scalar inv_features = 1.0 / static_cast<Scalar>(features);
-                        for (std::size_t f = 0; f < features; ++f) {
-                            Scalar grad_out = go_span[f * batch_size + b];
-                            Scalar g = grad_out * gamma_span[f];
-                            gi_span[f * batch_size + b] = (g - sum_grad * inv_features -
-                                   norm_span[f * batch_size + b] * sum_grad_norm * inv_features) * std_inv;
-                        }
-                    });
-                // 串行累加 dL/dγ 和 dL/dβ
-                for (std::size_t b = 0; b < batch_size; ++b) {
-                    for (std::size_t f = 0; f < features; ++f) {
-                        Scalar grad_out = go_span[f * batch_size + b];
-                        gg_span[f] += grad_out * norm_span[f * batch_size + b];
-                        gb_span[f] += grad_out;
-                    }
-                }
-            } else {
-                for (std::size_t b = 0; b < batch_size; ++b) {
-                    Scalar std_inv = std_span[b];
-                    
-                    // 预计算统计量：O(N) 而非 O(N²)
-                    Scalar sum_grad = 0.0;
-                    Scalar sum_grad_norm = 0.0;
-                    for (std::size_t f = 0; f < features; ++f) {
-                        Scalar g = go_span[f * batch_size + b] * gamma_span[f];
-                        sum_grad += g;
-                        sum_grad_norm += g * norm_span[f * batch_size + b];
-                    }
-
-                    // 单次遍历：同时计算 dL/dγ、dL/dβ、dL/dx
-                    const Scalar inv_features = 1.0 / static_cast<Scalar>(features);
-                    for (std::size_t f = 0; f < features; ++f) {
-                        Scalar grad_out = go_span[f * batch_size + b];
-                        Scalar g = grad_out * gamma_span[f];
-                        gg_span[f] += grad_out * norm_span[f * batch_size + b];
-                        gb_span[f] += grad_out;
-                        gi_span[f * batch_size + b] = (g - sum_grad * inv_features -
-                               norm_span[f * batch_size + b] * sum_grad_norm * inv_features) * std_inv;
-                    }
-                }
-            }
+            // 委托 Matrix 语义方法完成 LayerNorm 反向传播
+            Matrix::layer_norm_backward(grad_input, grad_gamma_, grad_beta_,
+                                        grad_output, normalized_cache_,
+                                        std_cache_, gamma_);
 
             return grad_input;
         }
@@ -459,49 +305,10 @@ namespace nn
             output_cache_.resize(rows, cols);
 
             Matrix result(rows, cols);
-            const auto in_span = input.span();
-            auto out_span = result.span();
-            auto cache_span = output_cache_.span();
 
-            auto row_indices = std::views::iota(std::size_t{0}, rows);
-            const std::size_t total = rows * cols;
-
-            auto process_row = [in_span, out_span, cache_span, cols](std::size_t r) noexcept
-            {
-                const std::size_t offset = r * cols;
-                const auto row_in = in_span.subspan(offset, cols);
-                auto row_out = out_span.subspan(offset, cols);
-                auto row_cache = cache_span.subspan(offset, cols);
-
-                // 数值稳定：减去行内最大值
-                Scalar max_val = row_in[0];
-                for (std::size_t c = 1; c < cols; ++c)
-                    max_val = std::max(max_val, row_in[c]);
-
-                // 计算 exp 和求和
-                Scalar sum = 0.0;
-                for (std::size_t c = 0; c < cols; ++c)
-                {
-                    Scalar e = std::exp(row_in[c] - max_val);
-                    row_out[c] = e;
-                    row_cache[c] = e;
-                    sum += e;
-                }
-
-                // 归一化
-                const Scalar inv_sum = 1.0 / sum;
-                for (std::size_t c = 0; c < cols; ++c)
-                {
-                    row_out[c] *= inv_sum;
-                    row_cache[c] *= inv_sum;
-                }
-            };
-
-            if (total >= SmartPolicy::PARALLEL_THRESHOLD)
-                SmartPolicy::for_each(row_indices.begin(), row_indices.end(), process_row);
-            else
-                for (std::size_t r = 0; r < rows; ++r)
-                    process_row(r);
+            // 委托 Matrix 语义方法完成按行 softmax
+            Matrix::softmax_rows(result, input);
+            output_cache_ = result;  // 缓存 softmax 输出供 backward 使用
 
             return result;
         }
@@ -516,35 +323,8 @@ namespace nn
 
             Matrix grad_input(rows, cols);
 
-            const auto go_span = grad_output.span();
-            const auto out_span = output_cache_.span();
-            auto gi_span = grad_input.span();
-
-            auto row_indices = std::views::iota(std::size_t{0}, rows);
-            const std::size_t total = rows * cols;
-
-            auto process_row = [go_span, out_span, gi_span, cols](std::size_t r) noexcept
-            {
-                const std::size_t offset = r * cols;
-                const auto row_go = go_span.subspan(offset, cols);
-                const auto row_out = out_span.subspan(offset, cols);
-                auto row_gi = gi_span.subspan(offset, cols);
-
-                // dot = Σ_k out[k] * grad_out[k]
-                Scalar dot = 0.0;
-                for (std::size_t c = 0; c < cols; ++c)
-                    dot += row_out[c] * row_go[c];
-
-                // grad = out * (grad_out - dot)
-                for (std::size_t c = 0; c < cols; ++c)
-                    row_gi[c] = row_out[c] * (row_go[c] - dot);
-            };
-
-            if (total >= SmartPolicy::PARALLEL_THRESHOLD)
-                SmartPolicy::for_each(row_indices.begin(), row_indices.end(), process_row);
-            else
-                for (std::size_t r = 0; r < rows; ++r)
-                    process_row(r);
+            // 委托 Matrix 语义方法完成按行 softmax 反向传播
+            Matrix::softmax_rows_backward(grad_input, grad_output, output_cache_);
 
             return grad_input;
         }
@@ -615,22 +395,10 @@ namespace nn
                 std::copy_n(src_span.begin() + r * cols, cols, dst_span.begin() + (row_start + r) * cols);
         }
 
-        // ── 逐元素缩放 ──────────────────────────────────────────────────
+        // ── 逐元素缩放（委托 Matrix 语义方法） ──────────────────────────
         static void scale_inplace(Matrix &m, Scalar s)
         {
-            auto m_span = m.span();
-            const auto n = m.size();
-            if (n >= SmartPolicy::PARALLEL_THRESHOLD)
-            {
-                auto indices = std::views::iota(std::size_t{0}, n);
-                SmartPolicy::for_each(indices.begin(), indices.end(),
-                    [m_span, s](std::size_t i) noexcept { m_span[i] *= s; });
-            }
-            else
-            {
-                for (std::size_t i = 0; i < n; ++i)
-                    m_span[i] *= s;
-            }
+            m.scale_inplace(s);
         }
 
     public:
@@ -889,25 +657,16 @@ namespace nn
             if (seq_len > max_len_)
                 return std::unexpected(Error{"positional encoding forward: sequence length exceeds max_len"});
 
-            // result = input + encoding[:, 0:seq_len]
-            Matrix result(d_model_, seq_len);
-            const auto in_span = input.span();
-            const auto e_span = encoding_.span();
-            auto out_span = result.span();
+            // 提取编码切片: encoding_ 形状为 (d_model_, max_len_)，
+            // 仅取前 seq_len 列
+            Matrix encoding_slice(d_model_, seq_len);
+            for (std::size_t r = 0; r < d_model_; ++r)
+                for (std::size_t c = 0; c < seq_len; ++c)
+                    encoding_slice.set_value_unchecked(r, c,
+                        encoding_.at_unchecked(r, c));
 
-            const auto total = static_cast<std::size_t>(d_model_ * seq_len);
-            const std::size_t max_len = max_len_;
-            auto indices = std::views::iota(std::size_t{0}, total);
-            SmartPolicy::for_each(indices.begin(), indices.end(),
-                [in_span, e_span, out_span, seq_len, max_len](std::size_t idx) noexcept
-                {
-                    // idx = row * seq_len + col
-                    const std::size_t row = idx / seq_len;
-                    const std::size_t col = idx % seq_len;
-                    out_span[idx] = in_span[idx] + e_span[row * max_len + col];
-                });
-
-            return result;
+            // result = input + encoding（通过 Matrix operator+，内部自动并行）
+            return input + encoding_slice;
         }
 
         // 位置编码为固定值，梯度直接穿透
@@ -1416,21 +1175,10 @@ namespace nn
                             dst_span.begin() + (row_start + r) * cols);
         }
 
+        // ── 逐元素缩放（委托 Matrix 语义方法） ──────────────────────────
         static void scale_inplace(Matrix &m, Scalar s)
         {
-            auto m_span = m.span();
-            const auto n = m.size();
-            if (n >= SmartPolicy::PARALLEL_THRESHOLD)
-            {
-                auto indices = std::views::iota(std::size_t{0}, n);
-                SmartPolicy::for_each(indices.begin(), indices.end(),
-                    [m_span, s](std::size_t i) noexcept { m_span[i] *= s; });
-            }
-            else
-            {
-                for (std::size_t i = 0; i < n; ++i)
-                    m_span[i] *= s;
-            }
+            m.scale_inplace(s);
         }
 
     public:

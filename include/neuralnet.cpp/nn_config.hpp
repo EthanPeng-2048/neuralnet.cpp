@@ -132,9 +132,9 @@ namespace nn
         // ── GPU 加速配置 ─────────────────────────────────────────────────
 #ifdef NN_HAS_VULKAN
         // GPU 加速阈值：矩阵输出面积（M*N）超过此值时自动走 GPU。
-        // 原值 48*64=3072 导致逐样本 transformer 操作（M*N=2048）无法触发 GPU。
-        // 降低至 128*8=1024 以覆盖 per-sample Linear 层（M=128, N=16 → M*N=2048）。
-        inline static constexpr std::size_t GPU_THRESHOLD = 0;
+        // 设为 1024（32×32）以覆盖 per-sample transformer 操作（M*N=2048），
+        // 同时过滤过小矩阵避免 GPU kernel 启动开销超过计算收益。
+        inline static constexpr std::size_t GPU_THRESHOLD = 1024;
 
         // 是否启用 GPU 后端（运行时开关，默认关闭）
         // 用户需调用 nn::GpuBackend::instance().initialize() 初始化后设为 true
