@@ -9,7 +9,9 @@
 #include <iterator>  // for std::distance
 #include <string>
 #include <thread>    // for std::thread::hardware_concurrency
-#include "thread_pool.hpp"
+
+#include "core/thread_pool.hpp"
+#include "core/errors.hpp"
 
 // ── 执行策略 ────────────────────────────────────────────────────────────────
 // 默认并行+向量化；编译时可通过 -DNN_EXEC_POLICY=std::execution::seq 覆盖

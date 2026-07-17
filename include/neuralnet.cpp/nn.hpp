@@ -1,17 +1,47 @@
 #ifndef NN_HPP
 #define NN_HPP
 
-#include <cstddef>
-#include <expected>
-#include <string>
-#include <vector>
+// ── neuralnet.cpp 统一入口 ────────────────────────────────────────────────
+// 包含所有核心模块，用户只需 #include "nn.hpp"
 
-#include "nn_config.hpp"
-#include "layer.hpp"
-#include "loss.hpp"
-#include "model.hpp"
-#include "optimizer.hpp"
-#include "mnist_common.hpp"
+// Core utilities
+#include "core/errors.hpp"
+#include "core/assert.hpp"
+#include "core/thread_pool.hpp"
+
+// Algebra layer (L1)
+#include "algebra/matrix.hpp"
+
+// Backend (L0) - optional Vulkan support
+#ifdef NN_HAS_VULKAN
+#include "backend/vk_backend.hpp"
+#endif
+
+// Computation layer (L2)
+#include "layers/layer_base.hpp"
+#include "layers/linear.hpp"
+#include "layers/activations.hpp"
+#include "layers/normalization.hpp"
+#include "layers/attention.hpp"
+#include "losses/loss_base.hpp"
+#include "losses/mse.hpp"
+#include "losses/cross_entropy.hpp"
+#include "optimizers/optimizer_base.hpp"
+#include "optimizers/sgd.hpp"
+#include "optimizers/adam.hpp"
+
+// Model layer (L3)
+#include "model/model_spec.hpp"
+#include "model/model.hpp"
+#include "model/model_io.hpp"
+
+// Builders (L4)
+#include "builders/mnist_builder.hpp"
+#include "builders/gpt_builder.hpp"
+
+// Utils
+#include "utils/tokenizer.hpp"
+#include "utils/random_engine.hpp"
 
 namespace nn
 {
