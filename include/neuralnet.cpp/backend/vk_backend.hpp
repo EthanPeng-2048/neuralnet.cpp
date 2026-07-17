@@ -994,9 +994,25 @@ struct MatmulKey {
 };
 struct MatmulKeyHash {
     std::size_t operator()(const MatmulKey& k) const noexcept {
-        std::size_t h = std::hash<uint32_t>{}(k.M);
-        h ^= std::hash<uint32_t>{}(k.N) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<uint32_t>{}(k.K) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        // FNV-1a style mixing — avoids collisions for (512,600,784) vs (128,600,256)
+        std::size_t h = 2166136261ULL;
+        h = (h ^ k.M) * 16777619ULL;
+        h = (h ^ k.N) * 16777619ULL;
+        h = (h ^ k.K) * 16777619ULL;
+        return h;
+    }
+};
+
+struct ElemKey {
+    uint32_t elem_count;
+    uint32_t op;
+    bool operator==(const ElemKey& o) const noexcept { return elem_count == o.elem_count && op == o.op; }
+};
+struct ElemKeyHash {
+    std::size_t operator()(const ElemKey& k) const noexcept {
+        std::size_t h = 2166136261ULL;
+        h = (h ^ k.elem_count) * 16777619ULL;
+        h = (h ^ k.op) * 16777619ULL;
         return h;
     }
 };
@@ -1081,6 +1097,12 @@ private:
     std::list<MatmulKey> dispatch_lru_;
     std::unordered_map<MatmulKey, std::list<MatmulKey>::iterator, MatmulKeyHash> dispatch_lru_map_;
 
+    // ── Elementwise dispatch cache（ReLU / GeLU 预录制命令缓冲）──────
+    static constexpr std::size_t MAX_CACHED_ELEM_DISPATCHES = 256;
+    std::unordered_map<ElemKey, CachedDispatch, ElemKeyHash> elem_dispatch_cache_;
+    std::list<ElemKey> elem_dispatch_lru_;
+    std::unordered_map<ElemKey, std::list<ElemKey>::iterator, ElemKeyHash> elem_dispatch_lru_map_;
+
     // ── 双轨制架构：新增 Pipeline 和资源追踪 ─────────────────────────
     VulkanPipeline matmul_tiled_pipeline_;   // 4×4 粗化分块矩阵乘法
     VulkanPipeline elementwise_pipeline_;    // 逐元素运算（ReLU / GeLU）
@@ -1150,6 +1172,13 @@ private:
         vkUpdateDescriptorSets(d.device, 3, writes, 0, nullptr);
 
         // 预录制命令缓冲 (性能优化)
+        // 先验证所有 copy region 是否在 staging buffer 范围内
+        const auto staging_buf_size = staging_ring_->region_size();
+        const auto total_staging = (a_elems + b_elems + c_elems) * sizeof(float);
+        if (total_staging > staging_buf_size)
+            return std::unexpected(Error{"Matmul staging layout exceeds buffer: " +
+                std::to_string(total_staging) + " > " + std::to_string(staging_buf_size)});
+
         d.pre_recorded_cmds.resize(staging_ring_->num_regions());
         for (std::size_t i = 0; i < staging_ring_->num_regions(); ++i) {
             VkCommandBufferAllocateInfo cmd_alloc{};
@@ -1234,6 +1263,138 @@ private:
         }
     }
 
+    void evict_oldest_elem_dispatch()
+    {
+        for (auto rit = elem_dispatch_lru_.rbegin(); rit != elem_dispatch_lru_.rend(); ++rit)
+        {
+            auto cache_it = elem_dispatch_cache_.find(*rit);
+            if (cache_it == elem_dispatch_cache_.end()) continue;
+            if (cache_it->second.ref_count.load(std::memory_order_acquire) > 0) continue;
+            auto key = *rit;
+            elem_dispatch_lru_map_.erase(key);
+            elem_dispatch_cache_.erase(key);
+            elem_dispatch_lru_.erase(std::next(rit).base());
+            return;
+        }
+    }
+
+    [[nodiscard]] Result<CachedDispatch> create_cached_elementwise_dispatch(const ElemKey& key)
+    {
+        CachedDispatch d;
+        d.device = device_.device();
+        d.desc_pool = dispatch_pool_;
+        d.cmd_pool = command_pool_;
+        const auto data_bytes = static_cast<std::size_t>(key.elem_count) * sizeof(float);
+
+        auto input = GpuBuffer::create_device_local(d.device, *memory_pool_, key.elem_count,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        if (!input) return std::unexpected(input.error());
+        d.buf_a = std::move(*input);
+
+        auto output = GpuBuffer::create_device_local(d.device, *memory_pool_, key.elem_count,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        if (!output) return std::unexpected(output.error());
+        d.buf_c = std::move(*output);
+
+        VkDescriptorSetAllocateInfo desc_alloc{};
+        desc_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        desc_alloc.descriptorPool = d.desc_pool;
+        desc_alloc.descriptorSetCount = 1;
+        auto dl = elementwise_pipeline_.descriptor_layout();
+        desc_alloc.pSetLayouts = &dl;
+        auto r = detail::vk_check(
+            vkAllocateDescriptorSets(d.device, &desc_alloc, &d.descriptor_set), __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
+
+        VkDescriptorBufferInfo buf_infos[3]{
+            {d.buf_a.impl().handle(), 0, VK_WHOLE_SIZE},
+            {d.buf_a.impl().handle(), 0, VK_WHOLE_SIZE},
+            {d.buf_c.impl().handle(), 0, VK_WHOLE_SIZE},
+        };
+        VkWriteDescriptorSet writes[3]{};
+        for (int i = 0; i < 3; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = d.descriptor_set;
+            writes[i].dstBinding = static_cast<uint32_t>(i);
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &buf_infos[i];
+        }
+        vkUpdateDescriptorSets(d.device, 3, writes, 0, nullptr);
+
+        // 先验证 staging buffer 容量
+        const auto staging_buf_size = staging_ring_->region_size();
+        const auto total_staging = 2 * data_bytes;
+        if (total_staging > staging_buf_size)
+            return std::unexpected(Error{"Elementwise staging layout exceeds buffer: " +
+                std::to_string(total_staging) + " > " + std::to_string(staging_buf_size)});
+
+        d.pre_recorded_cmds.resize(staging_ring_->num_regions());
+        for (std::size_t i = 0; i < staging_ring_->num_regions(); ++i)
+        {
+            VkCommandBufferAllocateInfo cmd_alloc_info{};
+            cmd_alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cmd_alloc_info.commandPool = command_pool_;
+            cmd_alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cmd_alloc_info.commandBufferCount = 1;
+
+            r = detail::vk_check(
+                vkAllocateCommandBuffers(d.device, &cmd_alloc_info, &d.pre_recorded_cmds[i]), __FILE__, __LINE__);
+            if (!r) return std::unexpected(r.error());
+
+            VkCommandBufferBeginInfo begin_info{};
+            begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            begin_info.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+            r = detail::vk_check(vkBeginCommandBuffer(d.pre_recorded_cmds[i], &begin_info), __FILE__, __LINE__);
+            if (!r) return std::unexpected(r.error());
+
+            auto staging_buf = staging_ring_->buffer(i);
+
+            VkBufferCopy cp_in{0, 0, data_bytes};
+            vkCmdCopyBuffer(d.pre_recorded_cmds[i], staging_buf, d.buf_a.impl().handle(), 1, &cp_in);
+
+            VkBufferMemoryBarrier in_barrier{};
+            in_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            in_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            in_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            in_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            in_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            in_barrier.buffer = d.buf_a.impl().handle();
+            in_barrier.offset = 0; in_barrier.size = VK_WHOLE_SIZE;
+            vkCmdPipelineBarrier(d.pre_recorded_cmds[i],
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 0, nullptr, 1, &in_barrier, 0, nullptr);
+
+            vkCmdBindPipeline(d.pre_recorded_cmds[i], VK_PIPELINE_BIND_POINT_COMPUTE, elementwise_pipeline_.handle());
+            vkCmdBindDescriptorSets(d.pre_recorded_cmds[i], VK_PIPELINE_BIND_POINT_COMPUTE,
+                elementwise_pipeline_.pipeline_layout(), 0, 1, &d.descriptor_set, 0, nullptr);
+            const uint32_t push_data[4] = {key.elem_count, key.op, 0, 0};
+            vkCmdPushConstants(d.pre_recorded_cmds[i], elementwise_pipeline_.pipeline_layout(),
+                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
+            vkCmdDispatch(d.pre_recorded_cmds[i], (key.elem_count + 255u) / 256u, 1, 1);
+
+            VkBufferMemoryBarrier out_barrier{};
+            out_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            out_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            out_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            out_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            out_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            out_barrier.buffer = d.buf_c.impl().handle();
+            out_barrier.offset = 0; out_barrier.size = VK_WHOLE_SIZE;
+            vkCmdPipelineBarrier(d.pre_recorded_cmds[i],
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, nullptr, 1, &out_barrier, 0, nullptr);
+
+            VkBufferCopy cp_out{0, data_bytes, data_bytes};
+            vkCmdCopyBuffer(d.pre_recorded_cmds[i], d.buf_c.impl().handle(), staging_buf, 1, &cp_out);
+
+            r = detail::vk_check(vkEndCommandBuffer(d.pre_recorded_cmds[i]), __FILE__, __LINE__);
+            if (!r) return std::unexpected(r.error());
+        }
+        return d;
+    }
+
     GpuBackend() = default;
     [[nodiscard]] static const std::vector<uint32_t>& get_matmul_spirv()
     {
@@ -1310,6 +1471,9 @@ public:
         dispatch_lru_map_.clear();
         dispatch_lru_.clear();
         dispatch_cache_.clear();
+        elem_dispatch_lru_map_.clear();
+        elem_dispatch_lru_.clear();
+        elem_dispatch_cache_.clear();
         staging_ring_.reset();
         if (device_.device() != VK_NULL_HANDLE) {
             if (gpu_tensor_pool_ != VK_NULL_HANDLE) vkDestroyDescriptorPool(device_.device(), gpu_tensor_pool_, nullptr);
@@ -1795,6 +1959,169 @@ public:
         if (!initialized_) return std::unexpected(Error{"GPU backend not initialized"});
         MatmulKey key{static_cast<uint32_t>(M), static_cast<uint32_t>(N), static_cast<uint32_t>(K)};
 
+        const std::size_t a_sz = M * K;
+        const std::size_t b_sz = K * N;
+        const std::size_t c_sz = M * N;
+        const std::size_t total_bytes = (a_sz + b_sz + c_sz) * sizeof(float);
+
+        // 大矩阵走分段路径（不使用 cached dispatch，每次临时分配 device buffer）
+        if (total_bytes > staging_ring_->region_size())
+        {
+            const std::size_t a_bytes = a_sz * sizeof(float);
+            const std::size_t b_bytes = b_sz * sizeof(float);
+            const std::size_t c_bytes = c_sz * sizeof(float);
+            const auto staging_size = staging_ring_->region_size();
+            if (a_bytes > staging_size || b_bytes > staging_size || c_bytes > staging_size)
+                return std::unexpected(Error{"Single matrix exceeds staging capacity"});
+
+            // 临时分配 device-local buffers
+            auto tmp_a = GpuBuffer::create_device_local(device_.device(), *memory_pool_, a_sz,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            if (!tmp_a) return std::unexpected(tmp_a.error());
+            auto tmp_b = GpuBuffer::create_device_local(device_.device(), *memory_pool_, b_sz,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            if (!tmp_b) return std::unexpected(tmp_b.error());
+            auto tmp_c = GpuBuffer::create_device_local(device_.device(), *memory_pool_, c_sz,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            if (!tmp_c) return std::unexpected(tmp_c.error());
+
+            // 临时 descriptor set
+            VkDescriptorSet tmp_desc = VK_NULL_HANDLE;
+            {
+                VkDescriptorSetAllocateInfo da{};
+                da.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+                da.descriptorPool = dispatch_pool_;
+                da.descriptorSetCount = 1;
+                auto dl = matmul_pipeline_.descriptor_layout();
+                da.pSetLayouts = &dl;
+                auto rr = detail::vk_check(
+                    vkAllocateDescriptorSets(device_.device(), &da, &tmp_desc), __FILE__, __LINE__);
+                if (!rr) return std::unexpected(rr.error());
+                VkDescriptorBufferInfo bi[3]{
+                    {tmp_a->impl().handle(), 0, VK_WHOLE_SIZE},
+                    {tmp_b->impl().handle(), 0, VK_WHOLE_SIZE},
+                    {tmp_c->impl().handle(), 0, VK_WHOLE_SIZE},
+                };
+                VkWriteDescriptorSet w[3]{};
+                for (int j = 0; j < 3; ++j) {
+                    w[j].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    w[j].dstSet = tmp_desc; w[j].dstBinding = j;
+                    w[j].descriptorCount = 1;
+                    w[j].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    w[j].pBufferInfo = &bi[j];
+                }
+                vkUpdateDescriptorSets(device_.device(), 3, w, 0, nullptr);
+            }
+
+            auto submit_and_wait = [&](VkCommandBuffer cb) -> Result<void> {
+                auto ri2 = staging_ring_->acquire();
+                auto f2 = staging_ring_->fence(ri2);
+                vkResetFences(device_.device(), 1, &f2);
+                {
+                    std::lock_guard lock(queue_mutex_);
+                    VkSubmitInfo si{};
+                    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                    si.commandBufferCount = 1;
+                    si.pCommandBuffers = &cb;
+                    auto rr = detail::vk_check(
+                        vkQueueSubmit(device_.compute_queue(), 1, &si, f2), __FILE__, __LINE__);
+                    if (!rr) return rr;
+                }
+                staging_ring_->mark_in_flight(ri2);
+                return detail::vk_check(
+                    vkWaitForFences(device_.device(), 1, &f2, VK_TRUE, 10'000'000'000ULL), __FILE__, __LINE__);
+            };
+
+            VkCommandBufferAllocateInfo cmd_alloc{};
+            cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cmd_alloc.commandPool = command_pool_;
+            cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cmd_alloc.commandBufferCount = 1;
+            VkCommandBuffer cmd = VK_NULL_HANDLE;
+            auto r = detail::vk_check(
+                vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &cmd), __FILE__, __LINE__);
+            if (!r) return r;
+
+            auto begin_cmd = [&]() -> Result<void> {
+                VkCommandBufferBeginInfo bi2{};
+                bi2.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+                bi2.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                return detail::vk_check(vkBeginCommandBuffer(cmd, &bi2), __FILE__, __LINE__);
+            };
+            auto cleanup = [&]() { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
+                                    vkFreeDescriptorSets(device_.device(), dispatch_pool_, 1, &tmp_desc); };
+
+            // 上传 A
+            {   auto ri = staging_ring_->acquire();
+                r = staging_ring_->upload(ri, a_data, 0);
+                if (!r) { cleanup(); return r; }
+                auto br = begin_cmd(); if (!br) { cleanup(); return std::unexpected(br.error()); }
+                VkBufferCopy cp{0, 0, a_bytes};
+                vkCmdCopyBuffer(cmd, staging_ring_->buffer(ri), tmp_a->impl().handle(), 1, &cp);
+                r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
+                if (!r) { cleanup(); return r; }
+                r = submit_and_wait(cmd); if (!r) { cleanup(); return r; } }
+            // 上传 B
+            {   auto ri = staging_ring_->acquire();
+                r = staging_ring_->upload(ri, b_data, 0);
+                if (!r) { cleanup(); return r; }
+                auto br = begin_cmd(); if (!br) { cleanup(); return std::unexpected(br.error()); }
+                VkBufferCopy cp{0, 0, b_bytes};
+                vkCmdCopyBuffer(cmd, staging_ring_->buffer(ri), tmp_b->impl().handle(), 1, &cp);
+                r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
+                if (!r) { cleanup(); return r; }
+                r = submit_and_wait(cmd); if (!r) { cleanup(); return r; } }
+            // Dispatch
+            {   auto br = begin_cmd(); if (!br) { cleanup(); return std::unexpected(br.error()); }
+                VkBufferMemoryBarrier barriers[2]{};
+                for (int j = 0; j < 2; ++j) {
+                    barriers[j].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                    barriers[j].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                    barriers[j].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                    barriers[j].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    barriers[j].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    barriers[j].offset = 0; barriers[j].size = VK_WHOLE_SIZE; }
+                barriers[0].buffer = tmp_a->impl().handle();
+                barriers[1].buffer = tmp_b->impl().handle();
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 2, barriers, 0, nullptr);
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, matmul_pipeline_.handle());
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    matmul_pipeline_.pipeline_layout(), 0, 1, &tmp_desc, 0, nullptr);
+                const uint32_t push[3] = {static_cast<uint32_t>(M), static_cast<uint32_t>(N), static_cast<uint32_t>(K)};
+                vkCmdPushConstants(cmd, matmul_pipeline_.pipeline_layout(),
+                    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
+                vkCmdDispatch(cmd, (N + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE,
+                                  (M + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE, 1);
+                VkBufferMemoryBarrier cb2{};
+                cb2.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                cb2.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                cb2.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                cb2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                cb2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                cb2.buffer = tmp_c->impl().handle();
+                cb2.offset = 0; cb2.size = VK_WHOLE_SIZE;
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &cb2, 0, nullptr);
+                r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
+                if (!r) { cleanup(); return r; }
+                r = submit_and_wait(cmd); if (!r) { cleanup(); return r; } }
+            // 下载 C
+            {   auto ri = staging_ring_->acquire();
+                auto br = begin_cmd(); if (!br) { cleanup(); return std::unexpected(br.error()); }
+                VkBufferCopy cp{0, 0, c_bytes};
+                vkCmdCopyBuffer(cmd, tmp_c->impl().handle(), staging_ring_->buffer(ri), 1, &cp);
+                r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
+                if (!r) { cleanup(); return r; }
+                r = submit_and_wait(cmd); if (!r) { cleanup(); return r; }
+                r = staging_ring_->download(ri, c_data, 0);
+                if (!r) { cleanup(); return r; } }
+
+            cleanup();
+            return {};
+        }
+
+        // ── 快速路径：单次 staging 传输（使用预录制命令）──────────────
         CachedDispatch* dp = nullptr;
         {
             std::lock_guard lock(cache_mutex_);
@@ -1826,20 +2153,13 @@ public:
         } ref_guard{dp};
         CachedDispatch& d = *dp;
 
-        const std::size_t a_sz = M * K;
-        const std::size_t b_sz = K * N;
-        const std::size_t c_sz = M * N;
-        const std::size_t total_bytes = (a_sz + b_sz + c_sz) * sizeof(float);
-        if (total_bytes > staging_ring_->region_size())
-            return std::unexpected(Error{"Matrix too large for staging region"});
-
         auto ri = staging_ring_->acquire();
         auto r = staging_ring_->upload(ri, a_data, 0);
         if (!r) return r;
         r = staging_ring_->upload(ri, b_data, a_sz * sizeof(float));
         if (!r) return r;
 
-        auto cmd = d.pre_recorded_cmds[ri]; // 直接使用预录制命令
+        auto cmd = d.pre_recorded_cmds[ri];
         auto fence = staging_ring_->fence(ri);
 
         vkResetFences(device_.device(), 1, &fence);
@@ -1850,21 +2170,99 @@ public:
             submit_info.commandBufferCount = 1;
             submit_info.pCommandBuffers = &cmd;
             r = detail::vk_check(
-                vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
-                __FILE__, __LINE__);
+                vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence), __FILE__, __LINE__);
             if (!r) return r;
         }
-        
-        staging_ring_->mark_in_flight(ri); // 修复：正确标记 in_flight
-        
+        staging_ring_->mark_in_flight(ri);
+
         r = detail::vk_check(
-            vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, 10'000'000'000ULL),
-            __FILE__, __LINE__);
+            vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, 10'000'000'000ULL), __FILE__, __LINE__);
         if (!r) return r;
 
         r = staging_ring_->download(ri, c_data, (a_sz + b_sz) * sizeof(float));
+        return r;
+    }
+
+    // ── 纯 CPU-staging 逐元素运算（ReLU / GeLU，预录制命令缓冲）──────
+    // op: 0=ReLU, 1=QuickGeLU
+    // data 既是输入也是输出（in-place），通过 staging ring 完成 CPU↔GPU 传输
+    [[nodiscard]] Result<void> elementwise_direct(
+        std::span<Scalar> data, uint32_t op, std::size_t elem_count)
+    {
+        if (!initialized_) return std::unexpected(Error{"GPU backend not initialized"});
+        if (!has_elementwise_pipeline())
+            return std::unexpected(Error{"Elementwise pipeline not available"});
+
+        ElemKey key{static_cast<uint32_t>(elem_count), op};
+
+        CachedDispatch* dp = nullptr;
+        {
+            std::lock_guard lock(cache_mutex_);
+            auto it = elem_dispatch_cache_.find(key);
+            if (it == elem_dispatch_cache_.end())
+            {
+                if (elem_dispatch_cache_.size() >= MAX_CACHED_ELEM_DISPATCHES)
+                    evict_oldest_elem_dispatch();
+                auto result = create_cached_elementwise_dispatch(key);
+                if (!result) return std::unexpected(result.error());
+                auto [inserted_it, _] = elem_dispatch_cache_.emplace(key, std::move(*result));
+                it = inserted_it;
+                elem_dispatch_lru_.push_front(key);
+                elem_dispatch_lru_map_[key] = elem_dispatch_lru_.begin();
+            }
+            else
+            {
+                auto lru_it = elem_dispatch_lru_map_[key];
+                elem_dispatch_lru_.erase(lru_it);
+                elem_dispatch_lru_.push_front(key);
+                elem_dispatch_lru_map_[key] = elem_dispatch_lru_.begin();
+            }
+            dp = &it->second;
+            dp->ref_count.fetch_add(1, std::memory_order_release);
+        }
+
+        struct RefGuard {
+            CachedDispatch* d;
+            ~RefGuard() { if (d) d->ref_count.fetch_sub(1, std::memory_order_release); }
+        } ref_guard{dp};
+        CachedDispatch& d = *dp;
+
+        const std::size_t data_bytes = elem_count * sizeof(float);
+        const std::size_t total_bytes = 2 * data_bytes;
+        if (total_bytes > staging_ring_->region_size())
+        {
+            return std::unexpected(Error{"Elementwise " + std::to_string(elem_count) +
+                " elements too large for staging (" + std::to_string(total_bytes / 1048576) +
+                "MB > " + std::to_string(staging_ring_->region_size() / 1048576) + "MB)"});
+        }
+
+        auto ri = staging_ring_->acquire();
+        auto r = staging_ring_->upload(ri, data, 0);
         if (!r) return r;
-        return {};
+
+        auto cmd = d.pre_recorded_cmds[ri];
+        auto fence = staging_ring_->fence(ri);
+
+        vkResetFences(device_.device(), 1, &fence);
+        {
+            std::lock_guard lock(queue_mutex_);
+            VkSubmitInfo submit_info{};
+            submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submit_info.commandBufferCount = 1;
+            submit_info.pCommandBuffers = &cmd;
+            r = detail::vk_check(
+                vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence), __FILE__, __LINE__);
+            if (!r) return r;
+        }
+
+        staging_ring_->mark_in_flight(ri);
+
+        r = detail::vk_check(
+            vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, 10'000'000'000ULL), __FILE__, __LINE__);
+        if (!r) return r;
+
+        r = staging_ring_->download(ri, data, data_bytes);
+        return r;
     }
 };
 

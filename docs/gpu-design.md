@@ -283,56 +283,102 @@ sequenceDiagram
 
 ## 🔗 与现有代码的集成
 
-### 集成点：`SmartPolicy` 扩展
+### 分层架构（严格遵守 DEVELOPMENT_STANDARDS.md）
 
-```cpp
-// nn_config.hpp 新增
-struct SmartPolicy {
-    // ... 现有代码 ...
-
-    // GPU 加速阈值：矩阵面积超过此值时自动走 GPU
-    inline static constexpr std::size_t GPU_THRESHOLD = 64 * 64;  // 4096 元素
-
-    // 是否启用 GPU 后端（运行时开关）
-    inline static bool gpu_enabled = false;
-};
+```
+L5 交互层  src/*.cpp         → 只调用 L4/L3 API
+L4 构建层  gpt_common.hpp    → 只调用 L3 Model API
+L3 实现层  model.hpp         → 只调用 L2 Layer::forward
+L2 计算层  layer.hpp         → 只调用 L1 Matrix 语义 API
+L1 代数层  matrix.hpp        → 内部调用 L0 GpuBackend（自动分派）
+L0 硬件层  vk_backend.hpp    → 最底层，无外部依赖
 ```
 
-### 集成点：`Matrix::multiply_to` 扩展
+**关键规则：** Layer(L2) **绝不**直接使用 `GpuTensor`、`GpuBackend` 或 `forward_gpu`。
+GPU 加速通过 Matrix 的语义方法（`multiply_to`、`apply_relu_inplace`、`apply_gelu_inplace`）自动分派。
+
+### 集成点：`Matrix` 语义方法扩展
 
 ```cpp
-void Matrix::multiply_to(Matrix& result, const Matrix& other) const {
-    // ... 维度检查 ...
+// algebra/matrix.hpp — GPU 分派对 Layer 完全透明
 
+void Matrix::multiply_to(Matrix& result, const Matrix& other) const {
 #ifdef NN_HAS_VULKAN
-    if (SmartPolicy::gpu_enabled && M * N >= SmartPolicy::GPU_THRESHOLD)
-    {
+    if (SmartPolicy::gpu_enabled && M * N >= SmartPolicy::GPU_THRESHOLD) {
         auto& backend = GpuBackend::instance();
-        // 快速路径：已初始化时跳过全局锁
-        if (backend.is_initialized() || backend.initialize())
-        {
-            // matmul_direct 内部处理 buffer 分配、上传、计算、下载
-            auto mm = backend.matmul_direct(
-                span(), other.span(), result.span(), M, N, K);
-            if (mm) return;  // GPU 成功，直接返回
+        if (backend.is_initialized() || backend.initialize()) {
+            auto mm = backend.matmul_direct(span(), other.span(), result.span(), M, N, K);
+            if (mm) return;  // GPU 成功
         }
-        // GPU 失败，静默 fallback 到 CPU 路径
     }
 #endif
+    // CPU fallback
+}
 
-    // 现有 CPU 路径（分块矩阵乘法）
-    // ...
+void Matrix::apply_relu_inplace() {
+#ifdef NN_HAS_VULKAN
+    if (SmartPolicy::gpu_enabled) {
+        auto& backend = GpuBackend::instance();
+        if (backend.is_initialized() || backend.initialize()) {
+            auto r = backend.elementwise_direct(span(), 0u, size());
+            if (r) return;
+        }
+    }
+#endif
+    // CPU fallback
 }
 ```
 
-> **注意：** 实际代码使用 `matmul_direct()` 一步完成 GPU 计算，它内部管理 buffer 生命周期、数据传输和同步。
-> 早期设计文档中的 `upload → matmul → download` 三步手动流程已被 `matmul_direct` 替代。
+### 集成点：`Layer` 只调用 Matrix API
+
+```cpp
+// layer.hpp — Layer 不感知 GPU 的存在
+
+Result<Matrix> ReLU::forward(const Matrix& input) override {
+    input_cache_ = input;
+    Matrix result = input;
+    result.apply_relu_inplace();  // GPU 自动分派
+    return result;
+}
+
+Result<Matrix> Linear::forward(const Matrix& input) override {
+    W_.multiply_to(product_buf_, input);  // GPU 自动分派
+    // bias add on CPU (O(n), negligible vs O(n³) matmul)
+    Matrix result(out_feat, batch);
+    // ... bias add loop ...
+    return result;
+}
+```
+
+### 集成点：`Model` 无需 GPU 路由
+
+```cpp
+// model.hpp — Model 不感知 GPU 的存在
+Result<Matrix> Model::forward(const Matrix& input) {
+    auto result = layers_.front()->forward(input);
+    Matrix out = std::move(*result);
+    for (std::size_t i = 1; i < layers_.size(); ++i) {
+        result = layers_[i]->forward(out);
+        out = std::move(*result);
+    }
+    return out;
+}
+```
+
+### GpuBackend 内部优化
+
+| 优化 | 说明 |
+|------|------|
+| **LRU dispatch cache** | MatmulKey / ElemKey → 预录制命令缓冲，零 per-call 分配 |
+| **Staging Ring** | 4×256MB 环形缓冲区，fence 同步 |
+| **Memory Pool** | 128MB 大块子分配器，O(log n) 合并 |
+| **Pre-recorded cmds** | 每个 cached dispatch 预录制所有 staging region 的命令缓冲 |
 
 ---
 
 ## 📅 分阶段路线图
 
-### Phase 1：基础框架 + 矩阵乘法（当前）
+### Phase 1：基础框架 + 矩阵乘法 ✅
 
 | 任务 | 文件 | 状态 |
 |------|------|------|
@@ -340,32 +386,35 @@ void Matrix::multiply_to(Matrix& result, const Matrix& other) const {
 | GPU 缓冲区抽象 | `vk_backend.hpp` | ✅ 完成 |
 | 内存映射守卫 | `vk_backend.hpp` | ✅ 完成 |
 | matmul 计算着色器 | `shaders/matmul.comp` | ✅ 完成 |
+| matmul_direct + LRU cache | `vk_backend.hpp` | ✅ 完成 |
 | CMake Vulkan 集成 | `CMakeLists.txt` | ✅ 完成 |
-| 编译验证 | - | ✅ 完成 |
 
-### Phase 2：逐元素操作
+### Phase 2：逐元素操作 ✅
 
-| 任务 | 文件 |
-|------|------|
-| elementwise 计算着色器 | `shaders/elementwise.comp` |
-| ReLU/GeLU forward/backward GPU 路径 | `layer.hpp` |
-| 优化器 step GPU 路径 | `optimizer.hpp` |
+| 任务 | 文件 | 状态 |
+|------|------|------|
+| elementwise 计算着色器 | `shaders/elementwise.comp` | ✅ 完成 |
+| elementwise_direct + LRU cache | `vk_backend.hpp` | ✅ 完成 |
+| Matrix::apply_relu_inplace | `algebra/matrix.hpp` | ✅ 完成 |
+| Matrix::apply_gelu_inplace | `algebra/matrix.hpp` | ✅ 完成 |
+| Layer 分层合规（无 forward_gpu） | `layer.hpp` | ✅ 完成 |
 
-### Phase 3：归约操作
+### Phase 3：归约操作（待实现）
 
 | 任务 | 文件 |
 |------|------|
 | layernorm 计算着色器 | `shaders/layernorm.comp` |
 | softmax 计算着色器 | `shaders/softmax.comp` |
-| LayerNorm/Softmax GPU 路径 | `layer.hpp` |
+| Matrix::layer_norm_inplace | `algebra/matrix.hpp` |
+| Matrix::softmax_inplace | `algebra/matrix.hpp` |
 
-### Phase 4：端到端集成
+### Phase 4：GPU 常驻优化（待实现）
 
 | 任务 | 文件 |
 |------|------|
-| GpuMatrix 封装（host/device 自动同步） | `gpu_matrix.hpp` |
-| 全链路 GPU 推理 | `src/text_infer.cpp` |
-| 性能基准对比 | `src/bench.cpp` |
+| Matrix 内部可选 GpuTensor 持有 | `algebra/matrix.hpp` |
+| 全链路 GPU 推理（零 PCIe 中间传输） | 内部实现 |
+| 性能基准对比 | `src/compute_bench.cpp` |
 
 ---
 
