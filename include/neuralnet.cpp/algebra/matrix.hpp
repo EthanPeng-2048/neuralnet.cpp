@@ -418,6 +418,45 @@ namespace nn
                 [&func](Scalar& v) noexcept { v = func(v); });
         }
 
+        // ── ReLU 就地变换（GPU 加速，自动 fallback CPU） ───────────────
+        void apply_relu_inplace()
+        {
+#ifdef NN_HAS_VULKAN
+            if (SmartPolicy::gpu_enabled)
+            {
+                auto& backend = GpuBackend::instance();
+                if (backend.is_initialized() || backend.initialize())
+                {
+                    auto r = backend.elementwise_direct(span(), 0u, size());
+                    if (r) return;
+                }
+            }
+#endif
+            SmartPolicy::for_each(data_.begin(), data_.end(),
+                [](Scalar& v) noexcept { v = v > 0.0 ? v : 0.0; });
+        }
+
+        // ── QuickGeLU 就地变换：x * sigmoid(1.702 * x)（GPU 加速） ──
+        void apply_gelu_inplace()
+        {
+#ifdef NN_HAS_VULKAN
+            if (SmartPolicy::gpu_enabled)
+            {
+                auto& backend = GpuBackend::instance();
+                if (backend.is_initialized() || backend.initialize())
+                {
+                    auto r = backend.elementwise_direct(span(), 1u, size());
+                    if (r) return;
+                }
+            }
+#endif
+            constexpr Scalar BETA = 1.702;
+            SmartPolicy::for_each(data_.begin(), data_.end(),
+                [](Scalar& v) noexcept {
+                    v = v * (1.0 / (1.0 + std::exp(-BETA * v)));
+                });
+        }
+
         // ── 逐元素二元变换（返回新矩阵） ────────────────────────────────
         // out[i] = func(a[i], b[i])
         template <typename F>
