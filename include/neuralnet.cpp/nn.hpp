@@ -18,7 +18,19 @@
 #endif
 
 // Computation layer (L2)
-#include "layers/layer_base.hpp"
+#include "layer.hpp"
+#include "loss.hpp"
+#include "optimizer.hpp"
+
+// Model layer (L3)
+#include "model.hpp"
+#include "model_io.hpp"
+#include "model_spec.hpp"
+
+// Domain-specific
+#include "mnist_common.hpp"
+#include "gpt_common.hpp"
+#include "tokenizer.hpp"
 
 namespace nn
 {
