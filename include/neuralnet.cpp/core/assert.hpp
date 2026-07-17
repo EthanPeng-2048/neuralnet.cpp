@@ -4,7 +4,7 @@
 #include <cstdio>
 #include <string>
 #include <expected>
-#include "core/errors.hpp"
+#include "../core/errors.hpp"
 
 namespace nn {
 
