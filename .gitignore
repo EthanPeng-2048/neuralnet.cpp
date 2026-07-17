@@ -1,33 +1,23 @@
-# Compiled and build artifacts
+```
+# Build artifacts
 *.o
 *.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+*.exe
 *.out
-build/
-dist/
-datasets/
-pretrained/
 
 # Dependencies
-__pycache__/
-*.pyc
-*.pyo
-.Python
-env/
 venv/
 .venv/
-.egg-info/
-*.egg
-
-# Logs and temp files
-*.log
-*.tmp
-*.swp
-*.swo
-
-# Environment
-.env
-.env.local
-.env.*
+__pycache__/
+*.egg-info/
+build/
+dist/
+target/
 
 # Editors
 .vscode/
@@ -35,31 +25,44 @@ venv/
 *.swp
 *.swo
 
-# OS generated files
+# Logs
+*.log
+
+# Temp files
+*.tmp
+*.temp
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# OS
 .DS_Store
 Thumbs.db
 
-# Coverage reports
-coverage/
-htmlcov/
-.coverage
-
-# Build systems
-target/
-.gradle/
-*.class
-*.jar
-*.war
-*.ear
-obj/
-bin/
-
-# Pretrained
-*.bin
-pretrained/
-
-# Datasets
-datasets/
-dataset.txt
-gpt_vocab.txt
+# Compression
+*.zip
+*.gz
+*.tar
+*.tgz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.zst
+*.lz4
+*.lzh
+*.cab
+*.arj
+*.rpm
+*.deb
+*.Z
+*.lz
+*.lzo
 ```
