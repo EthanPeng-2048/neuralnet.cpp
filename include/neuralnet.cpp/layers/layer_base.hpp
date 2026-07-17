@@ -1,5 +1,5 @@
-#ifndef LAYER_HPP
-#define LAYER_HPP
+#ifndef LAYER_BASE_HPP
+#define LAYER_BASE_HPP
 
 #include <algorithm>
 #include <cassert>
@@ -45,6 +45,8 @@ namespace nn
             return GpuTensor::from_matrix(*cpu_out_res, backend);
         }
 #endif
-
-#endif // LAYER_HPP
     };
+
+} // namespace nn
+
+#endif // LAYER_BASE_HPP
