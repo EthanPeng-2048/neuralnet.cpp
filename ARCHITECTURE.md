@@ -8,48 +8,70 @@
 
 ```mermaid
 graph TB
-    subgraph "🖥️ 用户入口层"
-        A["gui.py<br/>Python GUI 入口"]
-        B["src/train.cpp<br/>训练入口"]
-        C["src/infer.cpp<br/>推理入口"]
+    subgraph "🖥️ 用户入口层 (L5)"
+        A["gui.py<br/>Python GUI"]
+        B["src/text_train.cpp<br/>GPT 训练"]
+        C["src/text_infer.cpp<br/>GPT 推理"]
+        B2["src/mnist_train.cpp<br/>MNIST 训练"]
+        C2["src/mnist_infer.cpp<br/>MNIST 推理"]
     end
 
-    subgraph "🧩 核心库 (include/neuralnet.cpp/)"
-        D["nn.hpp<br/>统一头文件"]
-        E["model.hpp<br/>网络容器"]
+    subgraph "🧩 构建层 (L4)"
+        GPT["gpt_common.hpp<br/>GPT 模型工厂"]
+        MNIST["mnist_common.hpp<br/>MNIST 模型工厂"]
+    end
+
+    subgraph "🧩 实现层 (L3)"
+        E["model.hpp<br/>模型容器"]
+        J["model_io.hpp<br/>序列化"]
+        MS["model_spec.hpp<br/>架构描述"]
+    end
+
+    subgraph "🧩 计算层 (L2)"
         F["layer.hpp<br/>层定义"]
         G["loss.hpp<br/>损失函数"]
         H["optimizer.hpp<br/>优化器"]
+    end
+
+    subgraph "🧩 代数层 (L1)"
         I["matrix.hpp<br/>矩阵运算"]
-        J["model_io.hpp<br/>模型序列化"]
+    end
+
+    subgraph "🧩 硬件层 (L0)"
         K["nn_config.hpp<br/>配置策略"]
         L["thread_pool.hpp<br/>线程池"]
+        VK["vk_backend.hpp<br/>GPU 后端"]
     end
 
     subgraph "💾 数据层"
-        M["datasets/mnist_data/<br/>MNIST CSV 数据"]
+        M["datasets/<br/>训练数据"]
         N["pretrained/<br/>预训练模型"]
     end
 
-    A -->|"subprocess 调用"| B
-    A -->|"subprocess 调用"| C
-    B --> D
-    C --> D
-    D --> E
-    D --> F
-    D --> G
-    D --> H
-    E --> F
-    F --> I
-    G --> I
-    H --> I
-    I --> K
-    K --> L
+    A -->|"subprocess"| B & C
+    B --> GPT
+    C --> GPT
+    B2 --> MNIST
+    C2 --> MNIST
+    GPT -->|"Model API"| E
+    MNIST -->|"Model API"| E
+    GPT -->|"ModelSpec"| MS
+    MNIST -->|"ModelSpec"| MS
+    E -->|"Layer::forward"| F
     J --> E
+    J --> MS
+    F -->|"Matrix API"| I
+    G -->|"Matrix API"| I
+    H -->|"Matrix API"| I
+    I -->|"SmartPolicy"| K
+    I -->|"GpuBackend"| VK
+    K --> L
     B --> M
-    B -->|"save_model()"| N
-    C -->|"load_model()"| N
-    C --> M
+    B2 --> M
+    B -->|"save"| N
+    B2 -->|"save"| N
+    C -->|"load"| N
+    C2 -->|"load"| N
 ```
 
 ---
@@ -57,48 +79,59 @@ graph TB
 ## 🏗️ 分层架构详解
 
 ```mermaid
-graph LR
-    subgraph "应用层"
-        T["train.cpp<br/>训练流程"]
-        I["infer.cpp<br/>推理流程"]
-        P["gui.py<br/>图形界面"]
+graph TB
+    subgraph "L5 交互层"
+        SRC["src/*.cpp<br/>训练/推理入口"]
+        NN["nn.hpp<br/>统一聚合头文件"]
+    end
+    subgraph "L4 构建层"
+        GPT["gpt_common.hpp<br/>GPT 工厂 + 超参数"]
+        MNIST["mnist_common.hpp<br/>MNIST 工厂 + 超参数"]
+    end
+    subgraph "L3 实现层"
+        MDL["model.hpp<br/>Model 容器 + 非模板 API"]
+        IO["model_io.hpp<br/>二进制序列化"]
+        MS["model_spec.hpp<br/>ModelSpec 纯数据"]
+    end
+    subgraph "L2 计算层"
+        LAY["layer.hpp<br/>Linear/ReLU/GPT..."]
+        LOSS["loss.hpp<br/>MSE/CrossEntropy"]
+        OPT["optimizer.hpp<br/>SGD/Adam"]
+    end
+    subgraph "L1 代数层"
+        MAT["matrix.hpp<br/>矩阵运算 + GPU 分派"]
+    end
+    subgraph "L0 硬件层"
+        CFG["nn_config.hpp<br/>SmartPolicy"]
+        TP["thread_pool.hpp<br/>线程池"]
+        VK["vk_backend.hpp<br/>Vulkan GPU"]
     end
 
-    subgraph "接口层"
-        M["Model<br/>网络容器"]
-        IO["ModelIO<br/>模型持久化"]
-    end
-
-    subgraph "计算层"
-        L["Linear Layer<br/>全连接层"]
-        R["ReLU Layer<br/>激活层"]
-        CE["CrossEntropy<br/>交叉熵损失"]
-        OPT["Adam / SGD<br/>优化器"]
-    end
-
-    subgraph "基础层"
-        MX["Matrix<br/>矩阵运算"]
-        TP["ThreadPool<br/>并行执行"]
-        CFG["SmartPolicy<br/>自适应调度"]
-    end
-
-    T --> M
-    T --> IO
-    T --> CE
-    T --> OPT
-    I --> M
-    I --> IO
-    P --> T
-    P --> I
-    M --> L
-    M --> R
-    L --> MX
-    R --> MX
-    CE --> MX
-    OPT --> MX
-    MX --> CFG
+    SRC -->|"调用构建/Model API"| GPT & MNIST & MDL
+    NN -.->|"聚合"| SRC
+    GPT -->|"model.add_gpt_model()"| MDL
+    MNIST -->|"model.add_linear()"| MDL
+    GPT & MNIST -->|"ModelSpec"| MS
+    MDL -->|"Layer::forward()"| LAY
+    IO --> MDL & MS
+    LAY -->|"Matrix API"| MAT
+    LOSS -->|"Matrix API"| MAT
+    OPT -->|"Matrix API"| MAT
+    MAT -->|"SmartPolicy"| CFG
+    MAT -->|"GpuBackend"| VK
     CFG --> TP
 ```
+
+**调用规则**：L(N) 只能调用 L(N-1) 的 API，禁止同层调用和跨层调用。
+
+| 层级 | 职责 | 只能调用 |
+|------|------|----------|
+| **L5 交互层** | 用户入口，训练/推理流程 | L4 构建 API, L3 Model API |
+| **L4 构建层** | 模型工厂（组装层为模型） | L3 `Model::add_*()` 非模板 API |
+| **L3 实现层** | 模型容器 + 序列化 | L2 `Layer::forward/backward` |
+| **L2 计算层** | 层/损失/优化器定义 | L1 `Matrix` 语义化 API |
+| **L1 代数层** | 矩阵运算（内部自动 GPU） | L0 `SmartPolicy`, `GpuBackend` |
+| **L0 硬件层** | 并行策略 + GPU 后端 | 无（最底层） |
 
 ---
 
