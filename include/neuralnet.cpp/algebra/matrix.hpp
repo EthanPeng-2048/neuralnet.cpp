@@ -15,14 +15,14 @@
 #include <utility>
 #include <vector>
 
-#include "core/errors.hpp"
-#include "core/assert.hpp"
-#include "core/thread_pool.hpp"
-#include "nn_config.hpp"
+#include "../core/errors.hpp"
+#include "../core/assert.hpp"
+#include "../core/thread_pool.hpp"
+#include "../nn_config.hpp"
 
 // GPU 加速支持（可选，由 CMake 的 NN_HAS_VULKAN 宏控制）
 #ifdef NN_HAS_VULKAN
-#include "backend/vk_backend.hpp"
+#include "../backend/vk_backend.hpp"
 #endif
 
 namespace nn
@@ -511,7 +511,7 @@ namespace nn
 
 // ── GpuTensor 方法实现（需要 Matrix 完整定义） ──────────────────────────
 #ifdef NN_HAS_VULKAN
-#include "backend/gpu_tensor_impl.hpp"
+#include "../backend/gpu_tensor_impl.hpp"
 #endif
 
 #endif // NN_ALGEBRA_MATRIX_HPP
