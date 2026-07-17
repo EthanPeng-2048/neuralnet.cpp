@@ -27,7 +27,7 @@ namespace nn
     class Matrix
     {
     private:
-        std::vector<double> data_{};
+        std::vector<Scalar> data_{};
         std::size_t rows_{0};
         std::size_t cols_{0};
 
@@ -45,7 +45,7 @@ namespace nn
         }
 
         // 内部构造函数（无校验，由工厂函数 create() 保证前置条件）
-        Matrix(std::vector<double> data, std::size_t rows, std::size_t cols)
+        Matrix(std::vector<Scalar> data, std::size_t rows, std::size_t cols)
             : data_(std::move(data)), rows_(rows), cols_(cols) {}
 
     public:
@@ -55,7 +55,7 @@ namespace nn
             : data_(rows * cols), rows_(rows), cols_(cols) {}
 
         // 工厂函数（策略1）：外部输入校验，返回 Result 而非 assert
-        [[nodiscard]] static Result<Matrix> create(std::vector<double> data, std::size_t rows, std::size_t cols)
+        [[nodiscard]] static Result<Matrix> create(std::vector<Scalar> data, std::size_t rows, std::size_t cols)
         {
             if (data.size() != rows * cols)
                 return std::unexpected(Error{"data size mismatch"});
@@ -63,7 +63,7 @@ namespace nn
         }
 
         // 从标量值初始化矩阵
-        Matrix(std::size_t rows, std::size_t cols, double value)
+        Matrix(std::size_t rows, std::size_t cols, Scalar value)
             : data_(rows * cols, value), rows_(rows), cols_(cols) {}
         Matrix(const Matrix &) = default;
         Matrix(Matrix &&) noexcept = default;
@@ -82,15 +82,15 @@ namespace nn
 
         // ── std::span 访问（C++20 现代接口，推荐使用） ────────────────────
         // 零开销抽象：编译后等价于裸指针 + 大小，可替代所有 data_ptr() 场景
-        [[nodiscard]] std::span<const double> span() const noexcept { return {data_.data(), data_.size()}; }
-        [[nodiscard]] std::span<double> span() noexcept { return {data_.data(), data_.size()}; }
+        [[nodiscard]] std::span<const Scalar> span() const noexcept { return {data_.data(), data_.size()}; }
+        [[nodiscard]] std::span<Scalar> span() noexcept { return {data_.data(), data_.size()}; }
 
         // 访问器
         [[nodiscard]] constexpr std::size_t rows() const noexcept { return rows_; }
         [[nodiscard]] constexpr std::size_t cols() const noexcept { return cols_; }
         [[nodiscard]] constexpr std::size_t size() const noexcept { return data_.size(); }
         [[nodiscard]] constexpr bool empty() const noexcept { return data_.empty(); }
-        [[nodiscard]] double at(std::size_t row, std::size_t col) const
+        [[nodiscard]] Scalar at(std::size_t row, std::size_t col) const
         {
             if (row >= rows_ || col >= cols_)
             {
@@ -98,7 +98,7 @@ namespace nn
             }
             return data_[index(row, col)];
         }
-        void set_value(std::size_t row, std::size_t col, double value)
+        void set_value(std::size_t row, std::size_t col, Scalar value)
         {
             if (row >= rows_ || col >= cols_)
             {
@@ -106,13 +106,13 @@ namespace nn
             }
             data_[index(row, col)] = value;
         }
-        [[nodiscard]] constexpr double at_unchecked(std::size_t row, std::size_t col) const noexcept { return data_[index(row, col)]; } // 无校验
-        constexpr void set_value_unchecked(std::size_t row, std::size_t col, double value) noexcept { data_[index(row, col)] = value; } // 无校验
-        [[nodiscard]] const std::vector<double> &data() const noexcept { return data_; }
-        [[nodiscard]] std::vector<double> &data() noexcept { return data_; }
-        [[nodiscard]] std::vector<std::vector<double>> get_data() const
+        [[nodiscard]] constexpr Scalar at_unchecked(std::size_t row, std::size_t col) const noexcept { return data_[index(row, col)]; } // 无校验
+        constexpr void set_value_unchecked(std::size_t row, std::size_t col, Scalar value) noexcept { data_[index(row, col)] = value; } // 无校验
+        [[nodiscard]] const std::vector<Scalar> &data() const noexcept { return data_; }
+        [[nodiscard]] std::vector<Scalar> &data() noexcept { return data_; }
+        [[nodiscard]] std::vector<std::vector<Scalar>> get_data() const
         {
-            std::vector<std::vector<double>> result(rows_, std::vector<double>(cols_, 0.0));
+            std::vector<std::vector<Scalar>> result(rows_, std::vector<Scalar>(cols_, 0.0));
             for (std::size_t row = 0; row < rows_; ++row)
             {
                 for (std::size_t col = 0; col < cols_; ++col)
@@ -124,7 +124,7 @@ namespace nn
         }
 
         // 工厂函数（策略1）：外部输入校验，返回 Result 而非 assert
-        [[nodiscard]] Result<void> set_data(const std::vector<std::vector<double>> &new_data)
+        [[nodiscard]] Result<void> set_data(const std::vector<std::vector<Scalar>> &new_data)
         {
             if (new_data.empty())
             {
@@ -180,9 +180,7 @@ namespace nn
             const std::size_t i_blocks = (R + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const std::size_t j_blocks = (C + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-            // 绕过 SmartPolicy：分块数很少（1~几十），但其内循环计算量大。
-            // SmartPolicy 按元素数判断会错误地将分块级别的并行退化为串行。
-            // 这里直接调用线程池（>1 块时并行），零分配 latch 设计开销极低。
+            // 通过 SmartPolicy 分发块级并行：分块数很少（1~几十），但其内循环计算量大。
             const auto n_blocks = i_blocks * j_blocks;
             if (n_blocks <= 1)
             {
@@ -193,7 +191,7 @@ namespace nn
             else
             {
                 auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
-                global_thread_pool().parallel_for_blocks(
+                SmartPolicy::parallel_for_blocks(
                     block_indices.begin(), block_indices.end(),
                     [src, dst, R, C, j_blocks](std::size_t block_idx) noexcept
                     {
@@ -228,15 +226,15 @@ namespace nn
             return result;
         }
 
-        [[nodiscard]] Matrix operator*(double scalar) const
+        [[nodiscard]] Matrix operator*(Scalar scalar) const
         {
             Matrix result(rows_, cols_);
             SmartPolicy::transform(data_.begin(), data_.end(), result.data().begin(),
-                           [scalar](double value) noexcept { return value * scalar; });
+                           [scalar](Scalar value) noexcept { return value * scalar; });
             return result;
         }
 
-        friend Matrix operator*(double scalar, const Matrix &mat)
+        friend Matrix operator*(Scalar scalar, const Matrix &mat)
         {
             return mat * scalar;
         }
@@ -294,8 +292,7 @@ namespace nn
             const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-            // 绕过 SmartPolicy：分块数可能很少但其内循环计算量巨大（三层循环 O(n³)）。
-            // 直接调用线程池，零分配 latch 开销极低。
+            // 通过 SmartPolicy 分发块级并行：分块数可能很少但其内循环计算量巨大（三层循环 O(n³)）。
             const auto n_blocks = i_blocks * j_blocks;
             if (n_blocks <= 1)
             {
@@ -307,11 +304,11 @@ namespace nn
                     const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
                     const std::size_t k_len = k_end - k_start;
                     const std::size_t j_len = j_end - j_start;
-                    std::array<double, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                    std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                     for (std::size_t jj = 0; jj < j_len; ++jj)
                         for (std::size_t kk = 0; kk < k_len; ++kk)
                             b_block[jj * k_len + kk] = b[(k_start + kk) * N + (j_start + jj)];
-                    const auto b_block_span = std::span<const double>(b_block.data(), k_len * j_len);
+                    const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
                     for (std::size_t i = i_start; i < i_end; ++i)
                     {
                         const auto a_row = a.subspan(i * K + k_start);
@@ -319,7 +316,7 @@ namespace nn
                         for (std::size_t j = 0; j < j_len; ++j)
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                            double sum = 0.0;
+                            Scalar sum = 0.0;
                             for (std::size_t kk = 0; kk < k_len; ++kk)
                                 sum += a_row[kk] * b_col[kk];
                             r_row[j] += sum;
@@ -330,7 +327,7 @@ namespace nn
             else
             {
                 auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
-                global_thread_pool().parallel_for_blocks(
+                SmartPolicy::parallel_for_blocks(
                     block_indices.begin(), block_indices.end(),
                     [a, b, r, M, N, K, j_blocks](std::size_t block_idx) noexcept
                     {
@@ -347,11 +344,11 @@ namespace nn
                             const std::size_t k_len = k_end - k_start;
                             const std::size_t j_len = j_end - j_start;
 
-                            std::array<double, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                            std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                             for (std::size_t jj = 0; jj < j_len; ++jj)
                                 for (std::size_t kk = 0; kk < k_len; ++kk)
                                     b_block[jj * k_len + kk] = b[(k_start + kk) * N + (j_start + jj)];
-                            const auto b_block_span = std::span<const double>(b_block.data(), k_len * j_len);
+                            const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
 
                             for (std::size_t i = i_start; i < i_end; ++i)
                             {
@@ -360,7 +357,7 @@ namespace nn
                                 for (std::size_t j = 0; j < j_len; ++j)
                                 {
                                     const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                                    double sum = 0.0;
+                                    Scalar sum = 0.0;
                                     for (std::size_t kk = 0; kk < k_len; ++kk)
                                         sum += a_row[kk] * b_col[kk];
                                     r_row[j] += sum;
@@ -371,10 +368,10 @@ namespace nn
             }
         }
 
-        void scale_inplace(double scalar) noexcept
+        void scale_inplace(Scalar scalar) noexcept
         {
             SmartPolicy::for_each(data_.begin(), data_.end(),
-                          [scalar](double &value) noexcept { value *= scalar; });
+                           [scalar](Scalar &value) noexcept { value *= scalar; });
         }
 
         // 逐元素加法 inplace
@@ -397,6 +394,114 @@ namespace nn
         void zero() noexcept
         {
             std::fill(data_.begin(), data_.end(), 0.0);
+        }
+
+        // ── 逐元素一元变换（返回新矩阵） ────────────────────────────────
+        // out[i] = func(in[i])，内部自动选择串行/并行。
+        template <typename F>
+        [[nodiscard]] Matrix apply(F&& func) const
+        {
+            Matrix result(rows_, cols_);
+            SmartPolicy::transform(data_.begin(), data_.end(),
+                           result.data_.begin(), std::forward<F>(func));
+            return result;
+        }
+
+        // ── 逐元素一元变换（就地修改） ──────────────────────────────────
+        template <typename F>
+        void apply_inplace(F&& func)
+        {
+            SmartPolicy::for_each(data_.begin(), data_.end(),
+                [&func](Scalar& v) noexcept { v = func(v); });
+        }
+
+        // ── 逐元素二元变换（返回新矩阵） ────────────────────────────────
+        // out[i] = func(a[i], b[i])
+        template <typename F>
+        [[nodiscard]] Matrix binary_apply(const Matrix& other, F&& func) const
+        {
+            require_same_shape(*this, other, "binary_apply dimension mismatch");
+            Matrix result(rows_, cols_);
+            SmartPolicy::transform(data_.begin(), data_.end(),
+                           other.data_.begin(), result.data_.begin(),
+                           std::forward<F>(func));
+            return result;
+        }
+
+        // ── 逐元素二元变换（就地修改） ──────────────────────────────────
+        template <typename F>
+        void binary_apply_inplace(const Matrix& other, F&& func)
+        {
+            require_same_shape(*this, other, "binary_apply_inplace dimension mismatch");
+            SmartPolicy::transform(data_.begin(), data_.end(),
+                           other.data_.begin(), data_.begin(),
+                           std::forward<F>(func));
+        }
+
+        // ── 归约操作 ────────────────────────────────────────────────────
+        // result = reduce_op(init, transform_op(data[0]), transform_op(data[1]), ...)
+        template <typename T, typename ReduceOp, typename TransformOp>
+        [[nodiscard]] T reduce(T init, ReduceOp&& reduce_op, TransformOp&& transform_op) const
+        {
+            return SmartPolicy::transform_reduce(data_.begin(), data_.end(), init,
+                std::forward<ReduceOp>(reduce_op), std::forward<TransformOp>(transform_op));
+        }
+
+        // ── 批量 SGD 更新（供 Optimizer 使用） ──────────────────────────
+        // params[i] -= lr * grads[i]，逐矩阵串行、矩阵内部并行
+        static void batch_sgd_update(
+            std::span<std::reference_wrapper<Matrix>> params,
+            std::span<std::reference_wrapper<Matrix>> grads,
+            Scalar lr)
+        {
+            for (std::size_t i = 0; i < params.size(); ++i)
+            {
+                auto& p = params[i].get();
+                auto& g = grads[i].get();
+                p.binary_apply_inplace(g,
+                    [lr](Scalar pv, Scalar gv) noexcept { return pv - lr * gv; });
+            }
+        }
+
+        // ── 批量 Adam 更新（供 Optimizer 使用） ─────────────────────────
+        static void batch_adam_update(
+            std::span<std::reference_wrapper<Matrix>> params,
+            std::span<std::reference_wrapper<Matrix>> grads,
+            std::span<std::reference_wrapper<Matrix>> m_bufs,
+            std::span<std::reference_wrapper<Matrix>> v_bufs,
+            Scalar lr, Scalar beta1, Scalar beta2, Scalar eps, Scalar bc1, Scalar bc2)
+        {
+            for (std::size_t i = 0; i < params.size(); ++i)
+            {
+                auto& p = params[i].get();
+                auto& g = grads[i].get();
+                auto& m = m_bufs[i].get();
+                auto& v = v_bufs[i].get();
+
+                const auto total = p.size();
+                auto idx = std::views::iota(std::size_t{0}, total);
+                SmartPolicy::for_each(idx.begin(), idx.end(),
+                    [&p, &g, &m, &v, lr, beta1, beta2, eps, bc1, bc2](std::size_t j) noexcept {
+                        auto& pv = p.data_[j];
+                        auto  gv = g.data_[j];
+                        auto& mv = m.data_[j];
+                        auto& vv = v.data_[j];
+
+                        mv = beta1 * mv + (1.0 - beta1) * gv;
+                        vv = beta2 * vv + (1.0 - beta2) * gv * gv;
+                        pv -= lr * (mv / bc1) / (std::sqrt(vv / bc2) + eps);
+                    });
+            }
+        }
+
+        // ── 批量梯度清零 ────────────────────────────────────────────────
+        static void batch_zero_grad(std::span<std::reference_wrapper<Matrix>> grads)
+        {
+            for (auto& g_ref : grads)
+            {
+                auto& g = g_ref.get();
+                std::fill(g.data_.begin(), g.data_.end(), Scalar{0});
+            }
         }
     };
 }

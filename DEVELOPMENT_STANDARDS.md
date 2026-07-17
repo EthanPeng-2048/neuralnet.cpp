@@ -8,12 +8,13 @@
 
 1. [核心原则](#-核心原则)
 2. [内存管理规范](#-内存管理规范)
-3. [模块化设计规范](#-模块化设计规范)
-4. [高性能编程规范](#-高性能编程规范)
-5. [C++ 标准跟进规范](#-c-标准跟进规范)
-6. [代码风格规范](#-代码风格规范)
-7. [错误处理规范](#-错误处理规范)
-8. [文档与注释规范](#-文档与注释规范)
+3. [模块隔离规范](#-模块隔离规范)
+4. [模块化设计规范](#-模块化设计规范)
+5. [高性能编程规范](#-高性能编程规范)
+6. [C++ 标准跟进规范](#-c-标准跟进规范)
+7. [代码风格规范](#-代码风格规范)
+8. [错误处理规范](#-错误处理规范)
+9. [文档与注释规范](#-文档与注释规范)
 
 ---
 
@@ -49,6 +50,31 @@ model.train(dataset, config);
 
 ### 4. 紧跟最新标准
 **目标：** 始终使用最新的 C++ 标准（当前：C++26）。
+
+### 5. 模块隔离与最小化依赖
+**目标：** 每个模块只通过简洁的公有接口对外提供服务。修改某个模块的内部实现（如 Matrix 的存储格式、ThreadPool 的调度策略）不应引发其他模块的连锁修改。即**改一个模块只需改一个头文件**。
+
+```cpp
+// ❌ 违反隔离：上层模块直接穿透接口、访问底层数据结构
+// layer.hpp 中：
+auto m_span = matrix.span();            // 泄露了内部 std::span 视图
+matrix.data().begin();                  // 泄露了内部 std::vector&
+SmartPolicy::for_each(...);             // 上层模块直接调用并行策略
+
+// ✅ 遵循隔离：上层模块只调用 Matrix 暴露的语义化操作
+matrix.apply_relu();                    // Matrix 自己封装逐元素操作
+matrix.add_inplace(other);              // Matrix 自己封装算术操作
+// 并行策略由 Matrix 内部决定，上层不感知
+```
+
+**核心规则：**
+
+| 规则 | 说明 |
+|------|------|
+| **不穿透接口** | 上层模块不应直接访问下层模块的底层数据结构（如 `.data()`, `.span()`） |
+| **不跨层调用** | Layer/Optimizer 不应直接调用 `SmartPolicy` 或 `global_thread_pool()` |
+| **不假设实现** | 上层模块不应依赖下层模块的内部类型（如假定数据存储在 `std::vector` 中） |
+| **自包含修改** | 修改模块内部实现（如换存储格式、换并行策略），只需修改该模块的头文件 |
 
 ---
 
@@ -140,6 +166,153 @@ void multiply_to(Matrix& result, const Matrix& other) const {
 - [ ] 是否使用 `std::unique_ptr` 管理多态对象？
 - [ ] 是否使用 `std::span` 替代裸指针访问连续数据？
 - [ ] 热路径中是否预分配缓冲区？
+
+---
+
+## 🔒 模块隔离规范
+
+> 本章节是「核心原则 5. 模块隔离与最小化依赖」的具体化规则，**必须严格遵守**。
+
+### 1. 隔离总则
+
+```mermaid
+graph TB
+    subgraph "✅ 正确的依赖方向"
+        A["应用层 (train/infer)"] --> B["模型层 (Model)"]
+        B --> C["计算层 (Layer/Loss/Optimizer)"]
+        C --> D["基础层 (Matrix)"]
+        D --> E["并行层 (SmartPolicy/ThreadPool)"]
+    end
+```
+
+**规则：依赖只能从上往下，禁止从下往上，禁止跨层调用。**
+
+- 应用层 → 可以调用 Model 的所有公有接口
+- 计算层 → 可以调用 Matrix 的**语义化公有接口**（如 `multiply_to`, `add_inplace`, `apply_relu`）
+- 计算层 → **禁止**直接调用 `SmartPolicy::for_each`、`global_thread_pool()`、`Matrix::data()`、`Matrix::span()`
+- 基础层 → **禁止**依赖计算层或应用层的任何类型
+
+### 2. 禁止的反模式
+
+#### 2.1 上层直接操作底层数据结构
+
+```cpp
+// ❌ 禁止：Layer 直接获取 Matrix 的底层 vector 并迭代
+// optimizer.hpp 当前写法：
+auto &p_vec = p.data();       // 泄露 std::vector<Scalar>&！
+auto &g_vec = g.data();
+SmartPolicy::for_each(zip_view.begin(), zip_view.end(), [...]);
+
+// ✅ 正确：Matrix 自己提供语义化操作，内部自行决定串行/并行
+//    Optimizer 只调用：
+matrix.axpy(-lr, grad);       // p = p - lr * g
+//    或更抽象的：
+optimizer->apply_update(param, grad);  // 内部调用 matrix 的批量操作
+```
+
+#### 2.2 上层直接调用并行策略
+
+```cpp
+// ❌ 禁止：Layer 中直接判断阈值并调用 SmartPolicy
+// layer.hpp 当前写法（ReLU）：
+if (n >= SmartPolicy::PARALLEL_THRESHOLD) {
+    SmartPolicy::for_each(indices.begin(), indices.end(), [...]);
+} else {
+    for (std::size_t i = 0; i < n; ++i) [...]
+}
+
+// ✅ 正确：Matrix 封装逐元素操作，内部处理并行/串行决策
+Matrix result = input.apply([](Scalar x) noexcept { return std::max(x, 0.0); });
+```
+
+#### 2.3 跨层直接访问全局线程池
+
+```cpp
+// ❌ 禁止：Matrix 内部绕过 SmartPolicy 直接调 global_thread_pool()
+// matrix.hpp 当前写法（multiply_to、transpose_to 中）：
+global_thread_pool().parallel_for_blocks(...);
+
+// ✅ 正确：通过 SmartPolicy 间接调用，SmartPolicy 是并行策略的唯一入口
+//    如果将来换用 TBB/OpenMP，只改 SmartPolicy 和 ThreadPool 即可
+SmartPolicy::parallel_for_blocks(...);
+```
+
+### 3. 正确的接口分层设计
+
+#### 3.1 Matrix 应暴露的语义化操作（而非裸数据访问）
+
+```cpp
+class Matrix {
+public:
+    // ── 逐元素变换（替代上层手动 for_each + span） ──
+    template <typename F>
+    [[nodiscard]] Matrix apply(F&& func) const;        // out[i] = func(in[i])
+    
+    template <typename F>
+    void apply_inplace(F&& func);                      // in[i] = func(in[i])
+    
+    template <typename F>
+    [[nodiscard]] Matrix binary_apply(const Matrix& other, F&& func) const;  // out[i] = func(a[i], b[i])
+    
+    template <typename F>
+    void binary_apply_inplace(const Matrix& other, F&& func);
+
+    // ── 归约操作（替代上层手动 transform_reduce） ──
+    template <typename F, typename T>
+    [[nodiscard]] T reduce(T init, F&& func) const;   // 对标 transform_reduce
+
+    // ── 批量线性代数操作（替代上层手动遍历参数矩阵） ──
+    static void batch_axpy(Scalar alpha,
+                           std::span<std::reference_wrapper<Matrix>> params,
+                           std::span<std::reference_wrapper<Matrix>> grads);
+};
+```
+
+#### 3.2 Layer 应该通过 Matrix 语义接口实现
+
+```cpp
+// ✅ Layer 只需调用 Matrix 的语义操作，不感知底层存储和并行策略
+Result<Matrix> ReLU::forward(const Matrix& input) override {
+    input_cache_ = input;
+    return input.apply([](Scalar x) noexcept { return x > 0 ? x : 0; });
+}
+```
+
+#### 3.3 Optimizer 应该调用 Matrix 的批量操作
+
+```cpp
+// ✅ Optimizer 不再逐个参数矩阵手动迭代 .data()
+Result<void> Adam::step() override {
+    ++t_;
+    // 批量操作：一次调用处理所有参数矩阵，内部并行
+    Matrix::batch_adam_update(params_, grads_, m_, v_, lr_, beta1_, beta2_, eps_, t_);
+    return {};
+}
+```
+
+### 4. 隔离性自检清单
+
+修改以下模块时，受影响的文件应**不超过 2 个**：
+
+| 修改场景 | ✅ 预期只改 | ❌ 当前实际需要改 |
+|----------|-------------|------------------|
+| Matrix 换存储格式（如 `vector` → 自定义 allocator） | `matrix.hpp` | `matrix.hpp` + `layer.hpp` + `optimizer.hpp` + `loss.hpp` + `model_io.hpp` |
+| SmartPolicy 换并行策略（如线程池 → TBB） | `nn_config.hpp` | `nn_config.hpp` + `layer.hpp` + `optimizer.hpp` + `loss.hpp` + `matrix.hpp` |
+| ThreadPool 换调度算法 | `thread_pool.hpp` | `thread_pool.hpp` + `matrix.hpp`（直接调了 `parallel_for_blocks`） |
+| Layer 新增一种激活函数 | `layer.hpp` | `layer.hpp` ✅ 已满足 |
+| Optimizer 新增一种优化器 | `optimizer.hpp` | `optimizer.hpp` ✅ 已满足 |
+
+### 5. 迁移路线图
+
+当前项目存在大量跨层穿透调用，需逐步重构：
+
+| 阶段 | 内容 | 影响范围 |
+|------|------|----------|
+| **Phase 1** | Matrix 新增 `apply()` / `apply_inplace()` / `binary_apply()` 等语义化方法 | `matrix.hpp` |
+| **Phase 2** | Layer（ReLU/GeLU/LayerNorm/Softmax）改用 Matrix 语义方法，删除直接 SmartPolicy 调用 | `layer.hpp` |
+| **Phase 3** | Optimizer（SGD/Adam）改用 Matrix 批量操作，删除 `.data()` 穿透 | `optimizer.hpp` |
+| **Phase 4** | Loss（MSELoss/CrossEntropyLoss）改用 Matrix 语义方法 | `loss.hpp` |
+| **Phase 5** | Matrix 内部不再直接调 `global_thread_pool()`，统一经 SmartPolicy | `matrix.hpp` |
 
 ---
 

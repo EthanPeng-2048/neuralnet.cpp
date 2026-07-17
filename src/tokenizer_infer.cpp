@@ -1,5 +1,5 @@
 /**
- * ByteZip 分词器推理程序
+ * WordZip 分词器推理程序
  *
  * 用法:
  *   tokenizer_infer --model <json> --text <string>      编码+解码
@@ -23,7 +23,7 @@
 void print_usage(const char *prog)
 {
     std::cout
-        << "ByteZip 分词器推理程序\n\n"
+        << "WordZip 分词器推理程序\n\n"
         << "用法:\n"
         << "  " << prog << " --model <json> --text <string>        编码并解码\n"
         << "  " << prog << " --model <json> --encode <string>      仅编码\n"
@@ -162,7 +162,7 @@ std::string read_text_file(const std::string &path)
 }
 
 // ── 展示编码结果 ────────────────────────────────────────────────────────
-void show_encoding(const nn::ByteZipTokenizer &tokenizer,
+void show_encoding(const nn::WordZipTokenizer &tokenizer,
                    const std::string &text,
                    const std::vector<std::size_t> &ids,
                    bool show_detail)
@@ -191,7 +191,7 @@ void show_encoding(const nn::ByteZipTokenizer &tokenizer,
 }
 
 // ── 模式：编码+解码验证 ─────────────────────────────────────────────────
-void mode_text(const nn::ByteZipTokenizer &tokenizer,
+void mode_text(const nn::WordZipTokenizer &tokenizer,
                const std::string &text, bool show_detail)
 {
     auto ids = tokenizer.encode(text);
@@ -204,7 +204,7 @@ void mode_text(const nn::ByteZipTokenizer &tokenizer,
 }
 
 // ── 模式：仅编码 ────────────────────────────────────────────────────────
-void mode_encode(const nn::ByteZipTokenizer &tokenizer,
+void mode_encode(const nn::WordZipTokenizer &tokenizer,
                  const std::string &text, bool show_detail)
 {
     auto ids = tokenizer.encode(text);
@@ -221,7 +221,7 @@ void mode_encode(const nn::ByteZipTokenizer &tokenizer,
 }
 
 // ── 模式：仅解码 ────────────────────────────────────────────────────────
-void mode_decode(const nn::ByteZipTokenizer &tokenizer,
+void mode_decode(const nn::WordZipTokenizer &tokenizer,
                  const std::string &id_str, bool show_detail)
 {
     auto ids = parse_ids(id_str);
@@ -243,7 +243,7 @@ void mode_decode(const nn::ByteZipTokenizer &tokenizer,
 }
 
 // ── 模式：性能测试 ──────────────────────────────────────────────────────
-void mode_benchmark(const nn::ByteZipTokenizer &tokenizer,
+void mode_benchmark(const nn::WordZipTokenizer &tokenizer,
                     const std::string &file_path, bool show_detail)
 {
     std::cout << "读取文件: " << file_path << "\n";
@@ -298,9 +298,9 @@ void mode_benchmark(const nn::ByteZipTokenizer &tokenizer,
 }
 
 // ── 模式：交互 ──────────────────────────────────────────────────────────
-void mode_interactive(const nn::ByteZipTokenizer &tokenizer, bool show_detail)
+void mode_interactive(const nn::WordZipTokenizer &tokenizer, bool show_detail)
 {
-    std::cout << "ByteZip 分词器交互模式（输入 q 退出）\n\n";
+    std::cout << "WordZip 分词器交互模式（输入 q 退出）\n\n";
 
     std::string line;
     while (true)
@@ -339,7 +339,7 @@ int main(int argc, char *argv[])
     auto args = parse_args(argc, argv);
 
     // 加载词表
-    nn::ByteZipTokenizer tokenizer;
+    nn::WordZipTokenizer tokenizer;
     std::cout << "加载词表: " << args.model_path << "\n";
     if (auto load_result = tokenizer.load(args.model_path); !load_result)
     {

@@ -1,6 +1,12 @@
 #include <neuralnet.cpp/nn.hpp>
+
+using nn::Scalar;
 #include <neuralnet.cpp/model_io.hpp>
+
+using nn::Scalar;
 #include <neuralnet.cpp/mnist_common.hpp>
+
+using nn::Scalar;
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -113,7 +119,7 @@ InferConfig parse_args(int argc, char *argv[])
 // ==================== 数据读取 ====================
 nn::Result<nn::Matrix> load_image_from_csv(const std::string &csv_line)
 {
-    std::vector<double> pixels;
+    std::vector<Scalar> pixels;
     std::stringstream ss(csv_line);
     std::string token;
     while (std::getline(ss, token, ','))
@@ -133,7 +139,7 @@ nn::Result<nn::Matrix> load_image_from_csv(const std::string &csv_line)
 struct Prediction
 {
     int digit;
-    double confidence;
+    Scalar confidence;
 };
 
 std::vector<Prediction> predict_with_confidence(nn::Model &model, const nn::Matrix &img, int topk)
@@ -143,12 +149,12 @@ std::vector<Prediction> predict_with_confidence(nn::Model &model, const nn::Matr
     auto logits = std::move(*logits_result);
 
     // Softmax 计算概率
-    double max_val = logits.at_unchecked(0, 0);
+    Scalar max_val = logits.at_unchecked(0, 0);
     for (int c = 1; c < static_cast<int>(nn::MNIST_NUM_CLASSES); ++c)
         max_val = std::max(max_val, logits.at_unchecked(c, 0));
 
-    double sum_exp = 0.0;
-    std::vector<double> probs(nn::MNIST_NUM_CLASSES);
+    Scalar sum_exp = 0.0;
+    std::vector<Scalar> probs(nn::MNIST_NUM_CLASSES);
     for (std::size_t c = 0; c < nn::MNIST_NUM_CLASSES; ++c)
     {
         probs[c] = std::exp(logits.at_unchecked(c, 0) - max_val);
@@ -178,7 +184,7 @@ void show_pixels(const nn::Matrix &img)
         std::cout << "  ";
         for (int c = 0; c < 28; ++c)
         {
-            double val = img.at_unchecked(r * 28 + c, 0);
+            Scalar val = img.at_unchecked(r * 28 + c, 0);
             if (val > 0.5)
                 std::cout << "##";
             else if (val > 0.1)

@@ -83,11 +83,11 @@ namespace nn
 
     private:
         // ── 分块辅助：计算合理的分块数 ──────────────────────────────────
-        // 每分块至少 4096 个 double（32 KB），可装入 L1 缓存。
-        // 256→4096：旧值导致 8192 元素被切成 16 个微块，调度开销远超计算。
+        // 每分块至少 1024 个元素（Scalar=float 时约 4 KB），可装入 L1 缓存。
+        // 4096→1024：降低阈值使 MNIST 小隐藏层（64×batch）也能触发多核并行。
         [[nodiscard]] std::size_t chunk_count(std::size_t total) const noexcept
         {
-            constexpr std::size_t MIN_CHUNK = 4096;
+            constexpr std::size_t MIN_CHUNK = 1024;
             const auto nw = workers_.size();
             if (nw <= 1 || total < MIN_CHUNK * 2)
                 return 1;
@@ -227,6 +227,57 @@ namespace nn
                 std::advance(beg, static_cast<std::ptrdiff_t>(off));
                 for (auto it = beg; it != last; ++it)
                     func(*it);
+                latch.fetch_sub(1, std::memory_order_release);
+            }
+
+            wait_for_latch(latch);
+        }
+
+        // ── 并行 for_samples（独立样本级并行）───────────────────────────
+        // 与 for_each（按元素分块）不同：每个"样本"包含一个完整的计算子任务
+        // （如矩阵乘法、前向传播），样本间完全独立、无数据竞争。
+        // 用于 GPT/Transformer batch 维度的并行：1 样本 = 1 分片。
+        template<typename Func>
+        void parallel_for_samples(std::size_t num_samples, Func&& func)
+        {
+            if (num_samples <= 1)
+            {
+                for (std::size_t i = 0; i < num_samples; ++i)
+                    func(i);
+                return;
+            }
+
+            const auto n_chunks = std::min(workers_.size(), num_samples);
+            const std::size_t base = num_samples / n_chunks;
+            const std::size_t rem  = num_samples % n_chunks;
+            std::atomic<int> latch{static_cast<int>(n_chunks)};
+
+            {
+                std::lock_guard lock(queue_mutex_);
+                std::size_t off = 0;
+                for (std::size_t c = 0; c < n_chunks - 1; ++c)
+                {
+                    const std::size_t len = base + (c < rem ? 1 : 0);
+                    const std::size_t start = off;
+                    const std::size_t end   = off + len;
+                    off += len;
+
+                    tasks_.emplace([start, end, &func, &latch]()
+                    {
+                        for (std::size_t i = start; i < end; ++i)
+                            func(i);
+                        latch.fetch_sub(1, std::memory_order_release);
+                    });
+                }
+            }
+            condition_.notify_all();
+
+            // 调用者处理最后一个分片
+            {
+                const std::size_t c = n_chunks - 1;
+                const std::size_t start = num_samples - (base + (c < rem ? 1 : 0));
+                for (std::size_t i = start; i < num_samples; ++i)
+                    func(i);
                 latch.fetch_sub(1, std::memory_order_release);
             }
 

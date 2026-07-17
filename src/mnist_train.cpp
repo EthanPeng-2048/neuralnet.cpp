@@ -1,6 +1,12 @@
 #include <neuralnet.cpp/nn.hpp>
+
+using nn::Scalar;
 #include <neuralnet.cpp/model_io.hpp>
+
+using nn::Scalar;
 #include <neuralnet.cpp/mnist_common.hpp>
+
+using nn::Scalar;
 #include <cstring>     // for std::memcpy
 #include <memory>     // for std::unique_ptr
 #include <iostream>
@@ -53,7 +59,7 @@ struct TrainConfig
     std::string optimizer_name = "adam";
     std::string model_type = "mlp";
     int epochs = 10;
-    double lr = 0.001;
+    Scalar lr = 0.001;
     std::size_t batch_size = 64;
     bool load_existing = false;
     bool gpu = false;
@@ -215,7 +221,7 @@ nn::Result<std::pair<nn::Matrix, nn::Matrix>> load_csv(const std::string &filena
             if (*p == ',')
             {
                 ++cnt;
-                double tmp;
+                Scalar tmp;
                 auto [p2, ec2] = std::from_chars(p + 1, end, tmp);
                 p = p2;
             }
@@ -225,7 +231,7 @@ nn::Result<std::pair<nn::Matrix, nn::Matrix>> load_csv(const std::string &filena
         feat_dim = cnt;  // 标签后的逗号数 = 特征数
     }
 
-    std::vector<double> features(row_count * feat_dim);
+    std::vector<Scalar> features(row_count * feat_dim);
     std::vector<int>    labels(row_count);
 
     std::size_t row = 0;
@@ -245,7 +251,7 @@ nn::Result<std::pair<nn::Matrix, nn::Matrix>> load_csv(const std::string &filena
             // 跳过逗号
             if (ptr < end && *ptr == ',') ++ptr;
 
-            double val;
+            Scalar val;
             auto [p_feat, ec_feat] = std::from_chars(ptr, end, val);
             if (ec_feat != std::errc{})
                 return std::unexpected(nn::Error{"Failed to parse feature at row " + std::to_string(row)});
@@ -286,7 +292,7 @@ nn::Result<std::pair<nn::Matrix, nn::Matrix>> load_csv(const std::string &filena
 }
 
 // -------------------- 评估函数 --------------------
-double evaluate(nn::Model &model, const nn::Matrix &x, const nn::Matrix &y_onehot)
+Scalar evaluate(nn::Model &model, const nn::Matrix &x, const nn::Matrix &y_onehot)
 {
     std::size_t N = x.cols();
     auto out_result = model.forward(x);
@@ -295,11 +301,11 @@ double evaluate(nn::Model &model, const nn::Matrix &x, const nn::Matrix &y_oneho
     int correct = 0;
     for (std::size_t i = 0; i < N; ++i)
     {
-        double max_val = out.at_unchecked(0, i);
+        Scalar max_val = out.at_unchecked(0, i);
         int pred = 0;
         for (int j = 1; j < static_cast<int>(nn::MNIST_NUM_CLASSES); ++j)
         {
-            double val = out.at_unchecked(j, i);
+            Scalar val = out.at_unchecked(j, i);
             if (val > max_val)
             {
                 max_val = val;
@@ -318,7 +324,7 @@ double evaluate(nn::Model &model, const nn::Matrix &x, const nn::Matrix &y_oneho
         if (pred == true_label)
             ++correct;
     }
-    return static_cast<double>(correct) / N;
+    return static_cast<Scalar>(correct) / N;
 }
 
 // -------------------- 构建网络 --------------------
@@ -474,7 +480,7 @@ int main(int argc, char *argv[])
         for (int epoch = 0; epoch < cfg.epochs; ++epoch)
         {
             auto ep_start = std::chrono::steady_clock::now();
-            double total_loss = 0.0;
+            Scalar total_loss = 0.0;
 
             for (std::size_t batch = 0; batch < num_batches; ++batch)
             {
@@ -484,11 +490,11 @@ int main(int argc, char *argv[])
                 for (std::size_t r = 0; r < train_x.rows(); ++r)
                     std::memcpy(x_batch.span().data() + r * cfg.batch_size,
                                 train_x.span().data() + r * train_x.cols() + start,
-                                cfg.batch_size * sizeof(double));
+                                cfg.batch_size * sizeof(Scalar));
                 for (std::size_t r = 0; r < train_y.rows(); ++r)
                     std::memcpy(y_batch.span().data() + r * cfg.batch_size,
                                 train_y.span().data() + r * train_y.cols() + start,
-                                cfg.batch_size * sizeof(double));
+                                cfg.batch_size * sizeof(Scalar));
 
                 auto out_fwd = model.forward(x_batch);
                 if (!out_fwd) {
@@ -501,7 +507,7 @@ int main(int argc, char *argv[])
                     std::cerr << "\nLoss computation failed: " << loss_result.error().message << '\n';
                     return 1;
                 }
-                double loss = *loss_result;
+                Scalar loss = *loss_result;
                 total_loss += loss;
 
                 auto grad = ce_loss.backward();
@@ -527,11 +533,11 @@ int main(int argc, char *argv[])
             }
 
             auto ep_end = std::chrono::steady_clock::now();
-            double ep_sec = std::chrono::duration<double>(ep_end - ep_start).count();
+            Scalar ep_sec = std::chrono::duration<Scalar>(ep_end - ep_start).count();
 
-            double avg_loss = total_loss / num_batches;
-            double train_acc = evaluate(model, train_x, train_y);
-            double test_acc = evaluate(model, test_x, test_y);
+            Scalar avg_loss = total_loss / num_batches;
+            Scalar train_acc = evaluate(model, train_x, train_y);
+            Scalar test_acc = evaluate(model, test_x, test_y);
 
             std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
                       << "  loss=" << std::fixed << std::setprecision(4) << avg_loss
@@ -542,7 +548,7 @@ int main(int argc, char *argv[])
         }
 
         auto t_end = std::chrono::steady_clock::now();
-        double total_sec = std::chrono::duration<double>(t_end - t_start).count();
+        Scalar total_sec = std::chrono::duration<Scalar>(t_end - t_start).count();
 
 #ifdef NN_HAS_VULKAN
         // ── 打印 GPU 调度统计 ──
