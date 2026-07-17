@@ -29,22 +29,6 @@ namespace nn
         virtual Result<Matrix> backward(const Matrix &grad_output) = 0;
         virtual std::vector<std::reference_wrapper<Matrix>> parameters() { return {}; }
         virtual std::vector<std::reference_wrapper<Matrix>> param_gradients() { return {}; }
-
-#ifdef NN_HAS_VULKAN
-        // ── GPU 路径：默认实现 Fallback 到 CPU ───────────────────────
-        // 子类可覆盖以提供纯 GPU 实现（如 Linear）
-        virtual Result<GpuTensor> forward_gpu(const GpuTensor& input, GpuBackend& backend)
-        {
-            // Fallback：Download → CPU 计算 → Upload
-            auto cpu_in_res = input.to_matrix(backend);
-            if (!cpu_in_res) return std::unexpected(cpu_in_res.error());
-
-            auto cpu_out_res = forward(*cpu_in_res);
-            if (!cpu_out_res) return std::unexpected(cpu_out_res.error());
-
-            return GpuTensor::from_matrix(*cpu_out_res, backend);
-        }
-#endif
     };
 
     class Linear final : public Layer
@@ -62,12 +46,6 @@ namespace nn
 
         // 修复：使用 thread_local 保证多线程构造 Layer 时的线程安全
         inline static thread_local std::mt19937_64 rng_{std::random_device{}()};
-
-#ifdef NN_HAS_VULKAN
-        // ── GPU 权重缓存（懒加载，首次 forward_gpu 时上传，之后常驻显存）──
-        std::optional<GpuTensor> gpu_weights_;
-        std::optional<GpuTensor> gpu_bias_;
-#endif
 
     public:
         Linear(std::size_t in_features, std::size_t out_features)
@@ -178,39 +156,6 @@ namespace nn
 
             return grad_input;
         }
-
-#ifdef NN_HAS_VULKAN
-        // ── GPU 路径：纯 GPU 矩阵乘法 + Bias Add，零 PCIe 中间传输 ──
-        Result<GpuTensor> forward_gpu(const GpuTensor& input, GpuBackend& backend) override
-        {
-            // 1. 懒加载权重到 GPU（只在第一次调用时上传，之后常驻显存）
-            if (!gpu_weights_)
-            {
-                auto w_res = GpuTensor::from_matrix(W_, backend);
-                if (!w_res) return std::unexpected(w_res.error());
-                gpu_weights_ = std::move(*w_res);
-            }
-            if (!gpu_bias_)
-            {
-                auto b_res = GpuTensor::from_matrix(b_, backend);
-                if (!b_res) return std::unexpected(b_res.error());
-                gpu_bias_ = std::move(*b_res);
-            }
-
-            // 2. 纯 GPU 矩阵乘法（无 PCIe 传输，无 CPU 等待）
-            auto mm_res = backend.matmul_gpu(input, *gpu_weights_);
-            if (!mm_res) return std::unexpected(mm_res.error());
-
-            // 3. GPU 端 Bias Add（无 PCIe 传输）
-            auto ba_res = backend.elementwise_gpu(
-                *mm_res, &*gpu_bias_, 2u,
-                static_cast<uint32_t>(W_.rows()),   // features
-                static_cast<uint32_t>(input.cols())); // batch
-            if (!ba_res) return std::unexpected(ba_res.error());
-
-            return ba_res;
-        }
-#endif
     };
 
     class ReLU final : public Layer
@@ -224,7 +169,9 @@ namespace nn
         Result<Matrix> forward(const Matrix &input) override
         {
             input_cache_ = input;
-            return input.apply([](Scalar x) noexcept { return x > 0.0 ? x : 0.0; });
+            Matrix result = input;
+            result.apply_relu_inplace();
+            return result;
         }
 
         Result<Matrix> backward(const Matrix &grad_output) override
@@ -235,14 +182,6 @@ namespace nn
             return input_cache_.binary_apply(grad_output,
                 [](Scalar x, Scalar go) noexcept { return x > 0.0 ? go : 0.0; });
         }
-
-#ifdef NN_HAS_VULKAN
-        // ── GPU 路径：ReLU 通过 GPU 逐元素运算，避免 PCIe 传输 ──
-        Result<GpuTensor> forward_gpu(const GpuTensor& input, GpuBackend& backend) override
-        {
-            return backend.elementwise_gpu(input, nullptr, 0u);
-        }
-#endif
     };
 
     class GeLU final : public Layer
@@ -259,14 +198,13 @@ namespace nn
         Result<Matrix> forward(const Matrix &input) override
         {
             input_cache_ = input;
-
-            // Pass 1: sigmoid_cache[i] = sigmoid(BETA * input[i])
+            // 为 backward 缓存 sigmoid 值
             sigmoid_cache_ = input.apply([](Scalar x) noexcept {
                 return 1.0 / (1.0 + std::exp(-BETA * x));
             });
-            // Pass 2: result[i] = input[i] * sigmoid_cache[i]
-            return input.binary_apply(sigmoid_cache_,
-                [](Scalar x, Scalar s) noexcept { return x * s; });
+            Matrix result = input;
+            result.apply_gelu_inplace();
+            return result;
         }
 
         // d/dx [x * sigmoid(βx)] = sigmoid(βx) * [1 + βx * (1 - sigmoid(βx))]
@@ -284,14 +222,6 @@ namespace nn
             return grad_output.binary_apply(factor,
                 [](Scalar go, Scalar f) noexcept { return go * f; });
         }
-
-#ifdef NN_HAS_VULKAN
-        // ── GPU 路径：QuickGeLU 通过 GPU 逐元素运算 ──
-        Result<GpuTensor> forward_gpu(const GpuTensor& input, GpuBackend& backend) override
-        {
-            return backend.elementwise_gpu(input, nullptr, 1u);
-        }
-#endif
     };
 
     class LayerNorm final : public Layer
