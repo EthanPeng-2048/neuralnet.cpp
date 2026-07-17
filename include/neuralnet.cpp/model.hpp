@@ -35,14 +35,28 @@ namespace nn
         Model(Model &&) noexcept = default;
         Model &operator=(Model &&) noexcept = default;
 
-        // ── 构建网络 ────────────────────────────────────────────────────────
-        // 用法：model.add<nn::Linear>(784, 64).add<nn::ReLU>()...
+        // ── 构建网络（模板接口，仅供 L3 内部使用）──────────────────────
         template <typename LayerType, typename... Args>
         Model &add(Args &&...args)
         {
             layers_.emplace_back(std::make_unique<LayerType>(std::forward<Args>(args)...));
             return *this;
         }
+
+        // ── L4 构建层接口（非模板，L4 无需知道 Layer 类型）──────────────
+        // L4 通过这些方法组装模型，不直接接触 L2 的层类型。
+        Model &add_linear(std::size_t in_features, std::size_t out_features);
+        Model &add_relu();
+        Model &add_gelu();
+        Model &add_layer_norm(std::size_t normalized_shape, Scalar epsilon = 1e-5);
+        Model &add_softmax();
+        Model &add_patch_embedding(std::size_t img_size, std::size_t patch_size, std::size_t d_model);
+        Model &add_transformer_encoder(std::size_t d_model, std::size_t num_heads,
+                                       std::size_t d_ff, std::size_t num_layers,
+                                       std::size_t num_patches);
+        Model &add_gpt_model(std::size_t vocab_size, std::size_t d_model,
+                             std::size_t seq_len, std::size_t num_heads,
+                             std::size_t d_ff, std::size_t num_layers);
 
         [[nodiscard]] std::size_t num_layers() const noexcept { return layers_.size(); }
 
@@ -150,6 +164,55 @@ namespace nn
             return result;
         }
     };
+
+    // ════════════════════════════════════════════════════════════════════════
+    // L4 构建层接口实现（inline，L4 只调用这些方法，不接触 Layer 类型）
+    // ════════════════════════════════════════════════════════════════════════
+
+    inline Model &Model::add_linear(std::size_t in_features, std::size_t out_features)
+    {
+        return add<Linear>(in_features, out_features);
+    }
+
+    inline Model &Model::add_relu()
+    {
+        return add<ReLU>();
+    }
+
+    inline Model &Model::add_gelu()
+    {
+        return add<GeLU>();
+    }
+
+    inline Model &Model::add_layer_norm(std::size_t normalized_shape, Scalar epsilon)
+    {
+        return add<LayerNorm>(normalized_shape, epsilon);
+    }
+
+    inline Model &Model::add_softmax()
+    {
+        return add<Softmax>();
+    }
+
+    inline Model &Model::add_patch_embedding(std::size_t img_size, std::size_t patch_size,
+                                              std::size_t d_model)
+    {
+        return add<PatchEmbedding>(img_size, patch_size, d_model);
+    }
+
+    inline Model &Model::add_transformer_encoder(std::size_t d_model, std::size_t num_heads,
+                                                  std::size_t d_ff, std::size_t num_layers,
+                                                  std::size_t num_patches)
+    {
+        return add<TransformerEncoder>(d_model, num_heads, d_ff, num_layers, num_patches);
+    }
+
+    inline Model &Model::add_gpt_model(std::size_t vocab_size, std::size_t d_model,
+                                        std::size_t seq_len, std::size_t num_heads,
+                                        std::size_t d_ff, std::size_t num_layers)
+    {
+        return add<GPTModel>(vocab_size, d_model, seq_len, num_heads, d_ff, num_layers);
+    }
 
 } // namespace nn
 
