@@ -572,6 +572,7 @@ namespace nn
         static ThreadPool pool{std::thread::hardware_concurrency()};
         return pool;
     }
+
 } // namespace nn
 
-#endif // THREAD_POOL_HPP
+#endif // NN_CORE_THREAD_POOL_HPP
