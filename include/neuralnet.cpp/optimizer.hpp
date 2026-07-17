@@ -77,22 +77,13 @@ namespace nn
             if (params_.size() != grads_.size())
                 return std::unexpected(Error{"params and grads must have same size"});
 
-            const auto n = params_.size();
-            // 逐参数矩阵并行：各矩阵独立，无数据竞争
-            SmartPolicy::parallel_for_samples(n, [this](std::size_t i) {
-                auto &p = params_[i].get();
-                auto &g = grads_[i].get();
-                auto &v = velocities_[i];
+            // 构建 velocities 的 span 引用包装
+            std::vector<std::reference_wrapper<Matrix>> v_refs(velocities_.begin(), velocities_.end());
 
-                // v = beta * v + (1-beta) * g
-                v.binary_apply_inplace(g, [beta = beta_](Scalar vv, Scalar gv) noexcept {
-                    return beta * vv + (1.0 - beta) * gv;
-                });
-                // p = p - lr * v
-                p.binary_apply_inplace(v, [lr = lr_](Scalar pv, Scalar vv) noexcept {
-                    return pv - lr * vv;
-                });
-            });
+            // 委托 Matrix 批量方法完成 SGD+Momentum 更新
+            Matrix::batch_sgd_momentum_update(
+                std::span{params_}, std::span{grads_},
+                std::span{v_refs}, lr_, beta_);
             return {};
         }
 

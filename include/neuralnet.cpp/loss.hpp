@@ -69,66 +69,17 @@ namespace nn
         {
             const std::size_t classes = logits.rows();
             const std::size_t batch = logits.cols();
+
+            if (target_onehot.rows() != classes || target_onehot.cols() != batch)
+                return std::unexpected(Error{"cross_entropy loss shape mismatch"});
+
             grad_input_ = Matrix(classes, batch);
 
-            std::atomic<Scalar> total_loss{0.0};
+            // 委托 Matrix 语义方法完成交叉熵前向传播
+            Scalar loss = Matrix::cross_entropy_forward(
+                grad_input_, logits, target_onehot);
 
-            // 逐样本并行：每个样本的 softmax 完全独立，无数据竞争
-            SmartPolicy::parallel_for_samples(batch, [&](std::size_t i) {
-                // 数值稳定的 softmax
-                Scalar max_val = logits.at_unchecked(0, i);
-                for (std::size_t c = 1; c < classes; ++c)
-                {
-                    const Scalar val = logits.at_unchecked(c, i);
-                    if (val > max_val) max_val = val;
-                }
-
-                // 栈上分配，支持最多 128 类
-                std::array<Scalar, 128> exp_vals_fixed{};
-                std::vector<Scalar> exp_vals_heap;
-                std::span<Scalar> exp_vals;
-                if (classes <= 128) {
-                    exp_vals = exp_vals_fixed;
-                } else {
-                    exp_vals_heap.resize(classes);
-                    exp_vals = exp_vals_heap;
-                }
-
-                Scalar sum_exp = 0.0;
-                for (std::size_t c = 0; c < classes; ++c)
-                {
-                    const Scalar e = std::exp(logits.at_unchecked(c, i) - max_val);
-                    exp_vals[c] = e;
-                    sum_exp += e;
-                }
-
-                // 找到真实类别
-                std::size_t true_class = 0;
-                for (std::size_t c = 0; c < classes; ++c)
-                {
-                    if (target_onehot.at_unchecked(c, i) > 0.5)
-                    {
-                        true_class = c;
-                        break;
-                    }
-                }
-
-                // loss = -log(softmax[true_class])
-                const Scalar prob_true = exp_vals[true_class] / sum_exp;
-                Scalar expected = total_loss.load(std::memory_order_relaxed);
-                while (!total_loss.compare_exchange_weak(expected, expected - std::log(prob_true),
-                                                          std::memory_order_relaxed)) {}
-
-                // 梯度：softmax - target
-                for (std::size_t c = 0; c < classes; ++c)
-                {
-                    const Scalar softmax_c = exp_vals[c] / sum_exp;
-                    grad_input_.set_value_unchecked(c, i,
-                        softmax_c - target_onehot.at_unchecked(c, i));
-                }
-            });
-
-            return total_loss.load() / static_cast<Scalar>(batch);
+            return loss;
         }
 
         [[nodiscard]] const Matrix &backward() const noexcept { return grad_input_; }
