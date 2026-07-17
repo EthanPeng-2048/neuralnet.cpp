@@ -1,6 +1,12 @@
 #include <neuralnet.cpp/nn.hpp>
+
+using nn::Scalar;
 #include <neuralnet.cpp/model_io.hpp>
+
+using nn::Scalar;
 #include <neuralnet.cpp/gpt_common.hpp>
+
+using nn::Scalar;
 #include <cstring>
 #include <memory>
 #include <iostream>
@@ -27,6 +33,7 @@ void print_usage(const char *prog)
         << "选项:\n"
         << "  --save <path>      模型保存路径 (默认: gpt_model.bin)\n"
         << "  --resume <path>    从已有模型恢复训练\n"
+        << "  --vocab <path>      词表 JSON 路径 (默认: gpt_bpe.json)\n"
         << "  --epochs <n>       训练轮数 (默认: 10)\n"
         << "  --lr <lr>          学习率 (默认: 0.001)\n"
         << "  --batch-size <n>   批大小 (默认: 32)\n"
@@ -36,6 +43,7 @@ void print_usage(const char *prog)
         << "  --num-heads <n>    注意力头数 (默认: 4)\n"
         << "  --num-layers <n>   Transformer 层数 (默认: 4)\n"
         << "  --d-ff <n>         FFN 中间维度 (默认: 512)\n"
+        << "  --log-interval <n> 每隔多少 step 显示进度 (默认: 50)\n"
         << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
         << "  --help             显示此帮助信息\n";
 }
@@ -45,16 +53,18 @@ struct TrainConfig
 {
     std::string text_path;
     std::string save_path = "gpt_model.bin";
+    std::string vocab_path = "gpt_bpe.json";
     std::string resume_path;
     std::string optimizer_name = "adam";
     int epochs = 10;
-    double lr = 0.001;
+    Scalar lr = 0.001;
     std::size_t batch_size = 32;
     std::size_t seq_len = 256;
     std::size_t d_model = nn::GPT_D_MODEL;
     std::size_t num_heads = nn::GPT_NUM_HEADS;
     std::size_t num_layers = nn::GPT_NUM_LAYERS;
     std::size_t d_ff = nn::GPT_D_FF;
+    std::size_t log_interval = 50;
     bool load_existing = false;
     bool gpu = false;
 };
@@ -77,6 +87,8 @@ TrainConfig parse_args(int argc, char *argv[])
             cfg.resume_path = argv[++i];
             cfg.load_existing = true;
         }
+        else if (arg == "--vocab" && i + 1 < argc)
+            cfg.vocab_path = argv[++i];
         else if (arg == "--epochs" && i + 1 < argc)
             cfg.epochs = std::stoi(argv[++i]);
         else if (arg == "--lr" && i + 1 < argc)
@@ -104,6 +116,8 @@ TrainConfig parse_args(int argc, char *argv[])
             cfg.num_layers = static_cast<std::size_t>(std::stoi(argv[++i]));
         else if (arg == "--d-ff" && i + 1 < argc)
             cfg.d_ff = static_cast<std::size_t>(std::stoi(argv[++i]));
+        else if (arg == "--log-interval" && i + 1 < argc)
+            cfg.log_interval = static_cast<std::size_t>(std::stoi(argv[++i]));
         else if (arg == "--gpu")
             cfg.gpu = true;
         else if (!arg.starts_with("--"))
@@ -174,9 +188,9 @@ int main(int argc, char *argv[])
             return 1;
         }
 
-        nn::BPETokenizer tokenizer;
+        nn::SpaceTokenizer tokenizer;
         {
-            auto vocab_result = tokenizer.load_vocab("gpt_bpe.json");
+            auto vocab_result = tokenizer.load(cfg.vocab_path);
             if (!vocab_result) {
                 std::cerr << "Error: " << vocab_result.error().message << '\n';
                 return 1;
@@ -246,7 +260,10 @@ int main(int argc, char *argv[])
                 }
                 else
                 {
-                    std::cout << "已加载模型: " << cfg.resume_path << "\n" << std::endl;
+                    std::cout << "已加载模型: " << cfg.resume_path;
+                    if (!load_result->empty())
+                        std::cout << " (含嵌入词表 " << load_result->size() << " 字节)";
+                    std::cout << "\n" << std::endl;
                 }
             }
         }
@@ -281,7 +298,7 @@ int main(int argc, char *argv[])
         for (int epoch = 0; epoch < cfg.epochs; ++epoch)
         {
             auto ep_start = std::chrono::steady_clock::now();
-            double total_loss = 0.0;
+            Scalar total_loss = 0.0;
 
             for (std::size_t step = 0; step < steps_per_epoch; ++step)
             {
@@ -297,9 +314,9 @@ int main(int argc, char *argv[])
                     for (std::size_t t = 0; t < cfg.seq_len; ++t)
                     {
                         x_tokens.set_value_unchecked(t, b,
-                            static_cast<double>(all_tokens[start + t]));
+                            static_cast<Scalar>(all_tokens[start + t]));
                         y_tokens.set_value_unchecked(t, b,
-                            static_cast<double>(all_tokens[start + t + 1]));
+                            static_cast<Scalar>(all_tokens[start + t + 1]));
                     }
                 }
 
@@ -324,7 +341,7 @@ int main(int argc, char *argv[])
                 // ── 损失 ─────────────────────────────────────────
                 auto loss_result = ce_loss.forward(logits, y_onehot);
                 if (!loss_result) { std::cerr << "Error: " << loss_result.error().message << '\n'; return 1; }
-                double loss = *loss_result;
+                Scalar loss = *loss_result;
                 total_loss += loss;
 
                 // ── 反向传播 ─────────────────────────────────────
@@ -342,7 +359,7 @@ int main(int argc, char *argv[])
                 optimizer->zero_grad();
 
                 // 进度显示
-                if ((step + 1) % 50 == 0 || step + 1 == steps_per_epoch)
+                if ((step + 1) % cfg.log_interval == 0 || step + 1 == steps_per_epoch)
                 {
                     std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
                               << "  step " << step + 1 << "/" << steps_per_epoch
@@ -352,8 +369,8 @@ int main(int argc, char *argv[])
             }
 
             auto ep_end = std::chrono::steady_clock::now();
-            double ep_sec = std::chrono::duration<double>(ep_end - ep_start).count();
-            double avg_loss = total_loss / steps_per_epoch;
+            Scalar ep_sec = std::chrono::duration<Scalar>(ep_end - ep_start).count();
+            Scalar avg_loss = total_loss / steps_per_epoch;
 
             std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
                       << "  avg_loss=" << std::fixed << std::setprecision(4) << avg_loss
@@ -362,18 +379,31 @@ int main(int argc, char *argv[])
         }
 
         auto t_end = std::chrono::steady_clock::now();
-        double total_sec = std::chrono::duration<double>(t_end - t_start).count();
+        Scalar total_sec = std::chrono::duration<Scalar>(t_end - t_start).count();
 
-        // ── 保存模型（含规格） ─────────────────────────────────────
+        // ── 读取 tokenizer JSON 以便嵌入模型 ─────────────────────
+        std::string tokenizer_json;
         {
-            auto save_result = nn::save_model(cfg.save_path, model, spec);
+            std::ifstream tfs(cfg.vocab_path, std::ios::binary);
+            if (tfs)
+            {
+                std::ostringstream oss;
+                oss << tfs.rdbuf();
+                tokenizer_json = oss.str();
+            }
+        }
+
+        // ── 保存模型（含规格 + 嵌入 tokenizer） ──────────────────
+        {
+            auto save_result = nn::save_model(cfg.save_path, model, spec, tokenizer_json);
             if (!save_result) {
                 std::cerr << "Error: " << save_result.error().message << '\n';
                 return 1;
             }
         }
         std::cout << "\n训练完成! 总耗时: " << std::fixed << std::setprecision(1)
-                  << total_sec << "s" << std::endl;
+                  << total_sec << "s"
+                  << "  词表已嵌入模型文件" << std::endl;
 
         return 0;
     }

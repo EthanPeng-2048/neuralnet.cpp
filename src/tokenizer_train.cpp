@@ -1,11 +1,18 @@
 /**
- * ByteZip 分词器训练程序
+ * 分词器训练程序
+ *
+ * 支持三种分词器：
+ *   wordzip — WordZip 词级分词器（基于词频统计）
+ *   space   — Space  空格分词器（空格切分 + 词表查表）
+ *   bpe     — BPE    Byte-Pair Encoding（迭代字节对合并）
  *
  * 用法:
  *   tokenizer_train <text_file> [选项]
  *
  * 示例:
- *   tokenizer_train dataset.txt --vocab-size 10000 --output tokenizer.json
+ *   tokenizer_train dataset.txt --type bpe --vocab-size 5000 --output bpe.json
+ *   tokenizer_train dataset.txt --type wordzip --vocab-size 20000
+ *   tokenizer_train dataset.txt --type space --vocab-size 10000
  */
 
 #include <neuralnet.cpp/tokenizer.hpp>
@@ -21,32 +28,30 @@
 void print_usage(const char *prog)
 {
     std::cout
-        << "ByteZip v2.2 分词器训练程序\n\n"
+        << "分词器训练程序 v3.0\n\n"
         << "用法: " << prog << " <text-file> [选项]\n\n"
         << "参数:\n"
         << "  <text-file>              训练文本文件路径 (必需)\n\n"
         << "选项:\n"
-        << "  --vocab-size <n>         目标词表大小 (默认: 20000)\n"
+        << "  --type <name>            分词器类型 (默认: wordzip)\n"
+        << "                             wordzip - WordZip 词级分词器\n"
+        << "                             space   - 空格分词器\n"
+        << "                             bpe     - Byte-Pair Encoding\n"
+        << "  --vocab-size <n>         目标词表大小\n"
+        << "                             (wordzip 默认: 20000, space 默认: 10000, bpe 默认: 5000)\n"
         << "  --output <path>          输出 JSON 路径 (默认: tokenizer.json)\n"
-        << "  --v1-len <n>             V1 最大子词长度 (默认: 16)\n"
-        << "  --v2-len <n>             V2 最大子词长度 (默认: 24)\n"
-        << "  --v2-reserve <n>         V2 预留槽位 (默认: 0=自动)\n"
-        << "  --skip-ratio <f>         独立度阈值 α (默认: 1.2)\n"
-        << "  --affix-ratio <f>        词缀保护阈值 (默认: 0.4)\n"
         << "  --help                   显示此帮助信息\n";
 }
 
 // ── 命令行参数 ──────────────────────────────────────────────────────────
+enum class TokenizerType { WordZip, Space, BPE };
+
 struct TrainArgs
 {
-    std::string text_file;
-    std::string output = "tokenizer.json";
-    std::size_t vocab_size = nn::ByteZipTokenizer::DEFAULT_VOCAB_SIZE;
-    std::size_t v1_len = nn::ByteZipTokenizer::DEFAULT_V1_MAX_LEN;
-    std::size_t v2_len = nn::ByteZipTokenizer::DEFAULT_V2_MAX_LEN;
-    std::size_t v2_reserve = 0;
-    double skip_ratio = nn::ByteZipTokenizer::DEFAULT_SKIP_RATIO;
-    double affix_ratio = nn::ByteZipTokenizer::DEFAULT_AFFIX_RATIO;
+    std::string    text_file;
+    std::string    output     = "tokenizer.json";
+    TokenizerType  type       = TokenizerType::WordZip;
+    std::size_t    vocab_size = 0;  // 0 = use type default
 };
 
 TrainArgs parse_args(int argc, char *argv[])
@@ -68,20 +73,21 @@ TrainArgs parse_args(int argc, char *argv[])
             print_usage(argv[0]);
             std::exit(0);
         }
+        else if (arg == "--type" && i + 1 < argc)
+        {
+            std::string t = argv[++i];
+            if (t == "wordzip")      args.type = TokenizerType::WordZip;
+            else if (t == "space")   args.type = TokenizerType::Space;
+            else if (t == "bpe")     args.type = TokenizerType::BPE;
+            else {
+                std::cerr << "未知分词器类型: " << t << "\n可选: wordzip, space, bpe\n";
+                std::exit(1);
+            }
+        }
         else if (arg == "--vocab-size" && i + 1 < argc)
             args.vocab_size = static_cast<std::size_t>(std::stoul(argv[++i]));
         else if (arg == "--output" && i + 1 < argc)
             args.output = argv[++i];
-        else if (arg == "--v1-len" && i + 1 < argc)
-            args.v1_len = static_cast<std::size_t>(std::stoul(argv[++i]));
-        else if (arg == "--v2-len" && i + 1 < argc)
-            args.v2_len = static_cast<std::size_t>(std::stoul(argv[++i]));
-        else if (arg == "--v2-reserve" && i + 1 < argc)
-            args.v2_reserve = static_cast<std::size_t>(std::stoul(argv[++i]));
-        else if (arg == "--skip-ratio" && i + 1 < argc)
-            args.skip_ratio = std::stod(argv[++i]);
-        else if (arg == "--affix-ratio" && i + 1 < argc)
-            args.affix_ratio = std::stod(argv[++i]);
         else if (!arg.starts_with("--"))
             args.text_file = arg;
         else
@@ -111,7 +117,6 @@ std::string read_text_file(const std::string &path)
         std::exit(1);
     }
 
-    // 获取文件大小
     ifs.seekg(0, std::ios::end);
     const auto size = ifs.tellg();
     ifs.seekg(0, std::ios::beg);
@@ -120,6 +125,164 @@ std::string read_text_file(const std::string &path)
     ifs.read(content.data(), size);
 
     return content;
+}
+
+// ── 公共验证函数 ────────────────────────────────────────────────────────
+template<typename T>
+void verify_tokenizer(const T &tokenizer, const std::string &test_sent)
+{
+    auto ids     = tokenizer.encode(test_sent);
+    auto decoded = tokenizer.decode(ids);
+
+    std::cout << "\n🧪 验证:\n";
+    std::cout << "  原文: " << test_sent << "\n";
+    std::cout << "  Token数: " << ids.size() << "\n";
+    std::cout << "  解码: " << decoded << "\n";
+    std::cout << "  完美还原: " << (decoded == test_sent ? "true" : "false") << "\n";
+}
+
+// ── WordZip 训练 ────────────────────────────────────────────────────────
+void train_wordzip(const std::string &text, const TrainArgs &args)
+{
+    nn::WordZipTokenizer tokenizer;
+    nn::WordZipTokenizer::Config config;
+    config.vocab_size = args.vocab_size > 0 ? args.vocab_size : nn::WordZipTokenizer::DEFAULT_VOCAB_SIZE;
+
+    std::cout << "分词器类型: WordZip (词级分词)\n";
+    std::cout << "目标词表大小: " << config.vocab_size << "\n";
+
+    auto t0 = std::chrono::steady_clock::now();
+    tokenizer.train(text, config);
+    auto t1 = std::chrono::steady_clock::now();
+
+    std::cout << "总耗时: " << std::fixed << std::setprecision(1)
+              << std::chrono::duration<double>(t1 - t0).count() << " 秒\n";
+
+    // 展示前 20 个高频词
+    std::cout << "\n✅ 高频词展示（前 20 个）:\n";
+    std::size_t shown = 0;
+    const auto &vocab = tokenizer.vocab();
+    for (std::size_t tid = nn::WordZipTokenizer::BYTE_OFFSET;
+         tid < vocab.size() && shown < 20; ++tid)
+    {
+        const auto &bytes = vocab[tid];
+        if (bytes.size() >= 2)
+        {
+            bool printable = true;
+            for (unsigned char c : bytes)
+                if (c < 32 && c != '\n' && c != '\t') { printable = false; break; }
+            if (printable)
+            {
+                std::cout << "  ID " << tid << ": \"" << tokenizer.try_decode_token(tid) << "\"\n";
+                ++shown;
+            }
+        }
+    }
+
+    verify_tokenizer(tokenizer, "Alice was a very good girl, she said hello!");
+
+    tokenizer.print_affix_report();
+
+    if (auto save_result = tokenizer.save(args.output); !save_result)
+    {
+        std::cerr << "保存失败: " << save_result.error().message << '\n';
+        std::exit(1);
+    }
+    std::cout << "词表已保存至: " << args.output
+              << " (" << tokenizer.vocab_size() << " tokens)\n";
+}
+
+// ── Space 训练 ──────────────────────────────────────────────────────────
+void train_space(const std::string &text, const TrainArgs &args)
+{
+    nn::SpaceTokenizer tokenizer;
+    nn::SpaceTokenizer::Config config;
+    config.vocab_size = args.vocab_size > 0 ? args.vocab_size : nn::SpaceTokenizer::DEFAULT_VOCAB_SIZE;
+
+    std::cout << "分词器类型: Space (空格分词)\n";
+    std::cout << "目标词表大小: " << config.vocab_size << "\n";
+
+    auto t0 = std::chrono::steady_clock::now();
+    tokenizer.train(text, config);
+    auto t1 = std::chrono::steady_clock::now();
+
+    std::cout << "总耗时: " << std::fixed << std::setprecision(1)
+              << std::chrono::duration<double>(t1 - t0).count() << " 秒\n";
+
+    // 展示前 20 个高频词
+    std::cout << "\n✅ 高频词展示（前 20 个）:\n";
+    std::size_t shown = 0;
+    const auto &vocab = tokenizer.vocab();
+    for (std::size_t tid = nn::SpaceTokenizer::ASCII_BASE;
+         tid < vocab.size() && shown < 20; ++tid)
+    {
+        const auto &word = vocab[tid];
+        if (word.size() >= 2)
+        {
+            std::cout << "  ID " << tid << ": \"" << word << "\"\n";
+            ++shown;
+        }
+    }
+
+    verify_tokenizer(tokenizer, "Alice was a very good girl, she said hello!");
+
+    if (auto save_result = tokenizer.save(args.output); !save_result)
+    {
+        std::cerr << "保存失败: " << save_result.error().message << '\n';
+        std::exit(1);
+    }
+    std::cout << "词表已保存至: " << args.output
+              << " (" << tokenizer.vocab_size() << " tokens)\n";
+}
+
+// ── BPE 训练 ────────────────────────────────────────────────────────────
+void train_bpe(const std::string &text, const TrainArgs &args)
+{
+    nn::BPETokenizer tokenizer;
+    nn::BPETokenizer::Config config;
+    config.vocab_size = args.vocab_size > 0 ? args.vocab_size : nn::BPETokenizer::DEFAULT_VOCAB_SIZE;
+
+    std::cout << "分词器类型: BPE (Byte-Pair Encoding)\n";
+    std::cout << "目标词表大小: " << config.vocab_size << "\n";
+
+    auto t0 = std::chrono::steady_clock::now();
+    tokenizer.train(text, config);
+    auto t1 = std::chrono::steady_clock::now();
+
+    std::cout << "总耗时: " << std::fixed << std::setprecision(1)
+              << std::chrono::duration<double>(t1 - t0).count() << " 秒\n";
+
+    // 展示前 20 个 token
+    std::cout << "\n✅ Token 展示（前 20 个）:\n";
+    std::size_t shown = 0;
+    const auto &vocab = tokenizer.vocab();
+    for (std::size_t tid = 0; tid < vocab.size() && shown < 20; ++tid)
+    {
+        const auto &bytes = vocab[tid];
+        if (bytes.size() >= 2)
+        {
+            bool printable = true;
+            for (unsigned char c : bytes)
+                if (c < 32 && c != '\n' && c != '\t') { printable = false; break; }
+            if (printable)
+            {
+                std::cout << "  ID " << tid << ": \"" << bytes << "\"\n";
+                ++shown;
+            }
+        }
+    }
+
+    std::cout << "\n合并规则数: " << tokenizer.merge_count() << "\n";
+
+    verify_tokenizer(tokenizer, "Alice was a very good girl, she said hello!");
+
+    if (auto save_result = tokenizer.save(args.output); !save_result)
+    {
+        std::cerr << "保存失败: " << save_result.error().message << '\n';
+        std::exit(1);
+    }
+    std::cout << "词表已保存至: " << args.output
+              << " (" << tokenizer.vocab_size() << " tokens)\n";
 }
 
 // ── 主函数 ──────────────────────────────────────────────────────────────
@@ -132,73 +295,12 @@ int main(int argc, char *argv[])
     auto text = read_text_file(args.text_file);
     std::cout << "文本字符数: " << text.size() << "\n";
 
-    // 训练
-    nn::ByteZipTokenizer tokenizer;
-    nn::ByteZipTokenizer::Config config;
-    config.vocab_size          = args.vocab_size;
-    config.v1_max_len          = args.v1_len;
-    config.v2_max_len          = args.v2_len;
-    config.v2_reserve          = args.v2_reserve;
-    config.skip_ratio          = args.skip_ratio;
-    config.affix_protect_ratio = args.affix_ratio;
-
-    auto t0 = std::chrono::steady_clock::now();
-    tokenizer.train(text, config);
-    auto t1 = std::chrono::steady_clock::now();
-
-    const auto elapsed = std::chrono::duration<double>(t1 - t0).count();
-    std::cout << "总耗时: " << std::fixed << std::setprecision(1)
-              << elapsed << " 秒\n";
-
-    // 展示前 20 个高频子词
-    std::cout << "\n✅ 高频子词展示（前 20 个）:\n";
-    std::size_t shown = 0;
-    const auto &vocab = tokenizer.vocab();
-    for (std::size_t tid = nn::ByteZipTokenizer::BYTE_OFFSET;
-         tid < vocab.size() && shown < 20; ++tid)
+    switch (args.type)
     {
-        const auto &bytes = vocab[tid];
-        if (bytes.size() >= 2)
-        {
-            // 尝试作为 UTF-8 解码显示
-            bool printable = true;
-            for (unsigned char c : bytes)
-            {
-                if (c < 32 && c != '\n' && c != '\t')
-                {
-                    printable = false;
-                    break;
-                }
-            }
-
-            if (printable)
-            {
-                std::cout << "  ID " << tid << ": \""
-                          << tokenizer.try_decode_token(tid) << "\"\n";
-                ++shown;
-            }
-        }
+        case TokenizerType::WordZip: train_wordzip(text, args); break;
+        case TokenizerType::Space:   train_space(text, args);   break;
+        case TokenizerType::BPE:     train_bpe(text, args);     break;
     }
-
-    // 编码/解码冒烟测试
-    const std::string test_sent = "Alice was a very good girl, she said hello!";
-    auto ids = tokenizer.encode(test_sent);
-    auto decoded = tokenizer.decode(ids);
-
-    std::cout << "\n🧪 验证:\n";
-    std::cout << "  原文: " << test_sent << "\n";
-    std::cout << "  Token数: " << ids.size() << "\n";
-    std::cout << "  解码: " << decoded << "\n";
-    std::cout << "  完美还原: " << (decoded == test_sent ? "true" : "false") << "\n";
-
-    // 保存词表
-    if (auto save_result = tokenizer.save(args.output); !save_result)
-    {
-        std::cerr << "保存失败: " << save_result.error().message << '\n';
-        return 1;
-    }
-    std::cout << "词表已保存至: " << args.output
-              << " (" << tokenizer.vocab_size() << " tokens)\n";
 
     return 0;
 }
