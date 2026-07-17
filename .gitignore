@@ -1,5 +1,6 @@
 ```
-# Build artifacts
+# ==================== Build ====================
+build/
 *.o
 *.obj
 *.a
@@ -9,60 +10,74 @@
 *.dylib
 *.exe
 *.out
+compile_commands.json
 
-# Dependencies
+# ==================== CMake ====================
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+CMakeUserPresets.json
+
+# ==================== SPIR-V ====================
+*.spv
+
+# ==================== Model binaries (训练产物) ====================
+*.bin
+*.pt
+*.pth
+*.onnx
+pretrained/
+
+# ==================== Tokenizer / 词表 (训练产物) ====================
+gpt_bpe.json
+gpt_Bytezip.json
+wordzip.json
+tokenizer.json
+vocab_bpe.txt
+vocab_bytezip.txt
+vocab_word.txt
+
+# ==================== Dataset (下载 / 生成) ====================
+dataset.txt
+datasets/
+texts/
+
+# ==================== Python ====================
 venv/
 .venv/
 __pycache__/
+*.pyc
+*.pyo
 *.egg-info/
-build/
 dist/
-target/
+*.egg
 
-# Editors
+# ==================== Editors ====================
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 
-# Logs
+# ==================== Logs ====================
 *.log
 
-# Temp files
+# ==================== Temp ====================
 *.tmp
 *.temp
 
-# Coverage
+# ==================== Coverage ====================
 .coverage
 coverage/
 htmlcov/
 
-# Environment
+# ==================== Environment ====================
 .env
 .env.local
 *.env.*
 
-# OS
+# ==================== OS ====================
 .DS_Store
 Thumbs.db
-
-# Compression
-*.zip
-*.gz
-*.tar
-*.tgz
-*.bz2
-*.xz
-*.7z
-*.rar
-*.zst
-*.lz4
-*.lzh
-*.cab
-*.arj
-*.rpm
-*.deb
-*.Z
-*.lz
-*.lzo
+desktop.ini
 ```
