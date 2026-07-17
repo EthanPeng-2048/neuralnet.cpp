@@ -22,7 +22,7 @@ int main()
     return 0;
 }
 #else
-#include <neuralnet.cpp/vk_backend.hpp>
+#include <neuralnet.cpp/backend/vk_backend.hpp>
 
 using nn::Scalar;
 
