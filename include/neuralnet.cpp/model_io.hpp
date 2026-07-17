@@ -19,50 +19,12 @@
 #include <vector>
 
 #include "nn_config.hpp"
+#include "model_spec.hpp"
 #include "layer.hpp"
 #include "model.hpp"
 
 namespace nn
 {
-
-
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  ModelSpec — 模型架构描述，嵌入到 V2 文件头部
-//
-//  加载时可先调用 peek_model_spec() 读取规格，再据此构建模型。
-// ═══════════════════════════════════════════════════════════════════════════
-
-enum class ModelType : uint32_t
-{
-    Unknown     = 0,
-    MLP         = 1,
-    Transformer = 2,
-    GPT         = 3,
-};
-
-struct ModelSpec
-{
-    ModelType type = ModelType::Unknown;
-
-    // ── MLP ──
-    std::vector<std::size_t> layer_dims;
-
-    // ── Transformer (MNIST ViT) ──
-    std::size_t d_model    = 0;
-    std::size_t num_heads  = 0;
-    std::size_t d_ff       = 0;
-    std::size_t num_layers = 0;
-    std::size_t patch_size = 0;
-
-    // ── GPT ──
-    std::size_t vocab_size = 0;
-    std::size_t seq_len    = 0;
-
-    [[nodiscard]] bool is_mlp()         const noexcept { return type == ModelType::MLP; }
-    [[nodiscard]] bool is_transformer() const noexcept { return type == ModelType::Transformer; }
-    [[nodiscard]] bool is_gpt()         const noexcept { return type == ModelType::GPT; }
-};
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  二进制文件格式

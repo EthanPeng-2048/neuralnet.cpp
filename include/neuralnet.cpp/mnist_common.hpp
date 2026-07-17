@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "model.hpp"
-#include "model_io.hpp"  // ModelSpec
+#include "model_spec.hpp"
 
 namespace nn {
 
@@ -41,12 +41,12 @@ inline constexpr std::size_t TRANSFORMER_PATCH_SIZE = 7;   // 28 / 7 = 4 → 4×
         std::size_t in_dim  = layer_dims[i];
         std::size_t out_dim = layer_dims[i + 1];
 
-        model.add<Linear>(in_dim, out_dim);
+        model.add_linear(in_dim, out_dim);
 
         if (i < layer_dims.size() - 2)
         {
-            model.add<LayerNorm>(out_dim)
-                 .add<GeLU>();
+            model.add_layer_norm(out_dim)
+                 .add_gelu();
         }
     }
     return model;
@@ -64,9 +64,9 @@ inline constexpr std::size_t TRANSFORMER_PATCH_SIZE = 7;   // 28 / 7 = 4 → 4×
     const std::size_t num_patches = (img_size / patch_size) * (img_size / patch_size);
 
     Model model;
-    model.add<PatchEmbedding>(img_size, patch_size, d_model)
-         .add<TransformerEncoder>(d_model, num_heads, d_ff, num_layers, num_patches)
-         .add<Linear>(d_model, MNIST_NUM_CLASSES);
+    model.add_patch_embedding(img_size, patch_size, d_model)
+         .add_transformer_encoder(d_model, num_heads, d_ff, num_layers, num_patches)
+         .add_linear(d_model, MNIST_NUM_CLASSES);
     return model;
 }
 

@@ -8,7 +8,7 @@
 #include <expected>
 
 #include "model.hpp"
-#include "layer.hpp"
+#include "model_spec.hpp"
 #include "tokenizer.hpp"
 
 namespace nn {
@@ -43,7 +43,7 @@ inline constexpr std::size_t GPT_SEQ_LEN       = 256;
 {
     // GPTModel 是一个单一 Layer，作为 Model 的唯一层
     Model model;
-    model.add<GPTModel>(vocab_size, d_model, seq_len, num_heads, d_ff, num_layers);
+    model.add_gpt_model(vocab_size, d_model, seq_len, num_heads, d_ff, num_layers);
     return model;
 }
 

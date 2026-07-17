@@ -177,20 +177,56 @@ void multiply_to(Matrix& result, const Matrix& other) const {
 
 ```mermaid
 graph TB
-    subgraph "✅ 正确的依赖方向"
-        A["应用层 (train/infer)"] --> B["模型层 (Model)"]
-        B --> C["计算层 (Layer/Loss/Optimizer)"]
-        C --> D["基础层 (Matrix)"]
-        D --> E["并行层 (SmartPolicy/ThreadPool)"]
+    subgraph "L5 交互层"
+        SRC["src/*.cpp"]
     end
+    subgraph "L4 构建层"
+        GPT["gpt_common.hpp"]
+        MNIST["mnist_common.hpp"]
+    end
+    subgraph "L3 实现层"
+        MDL["model.hpp"]
+        MS["model_spec.hpp"]
+        IO["model_io.hpp"]
+    end
+    subgraph "L2 计算层"
+        LAY["layer.hpp"]
+        LOSS["loss.hpp"]
+        OPT["optimizer.hpp"]
+    end
+    subgraph "L1 代数层"
+        MAT["matrix.hpp"]
+    end
+    subgraph "L0 硬件层"
+        CFG["nn_config.hpp"]
+        TP["thread_pool.hpp"]
+        VK["vk_backend.hpp"]
+    end
+
+    SRC -->|"构建/训练/推理"| GPT & MNIST
+    SRC -->|"直接使用 Model"| MDL
+    GPT & MNIST -->|"model.add_gpt_model()"| MDL
+    GPT & MNIST -->|"ModelSpec"| MS
+    MDL -->|"Layer::forward()"| LAY
+    IO --> MDL & MS
+    LAY -->|"Matrix API"| MAT
+    LOSS -->|"Matrix API"| MAT
+    OPT -->|"Matrix API"| MAT
+    MAT -->|"SmartPolicy"| CFG
+    MAT -->|"GpuBackend"| VK
+    CFG --> TP
 ```
 
-**规则：依赖只能从上往下，禁止从下往上，禁止跨层调用。**
+**规则：L(N) 只能调用 L(N-1) 的 API，禁止同层调用和跨层调用。**
 
-- 应用层 → 可以调用 Model 的所有公有接口
-- 计算层 → 可以调用 Matrix 的**语义化公有接口**（如 `multiply_to`, `add_inplace`, `apply_relu`）
-- 计算层 → **禁止**直接调用 `SmartPolicy::for_each`、`global_thread_pool()`、`Matrix::data()`、`Matrix::span()`
-- 基础层 → **禁止**依赖计算层或应用层的任何类型
+| 层级 | 文件 | 职责 | 只能调用 |
+|------|------|------|----------|
+| **L5 交互层** | `src/*.cpp` | 用户入口 | L4 构建 API, L3 Model API |
+| **L4 构建层** | `gpt_common.hpp`, `mnist_common.hpp` | 模型工厂（组装层为模型） | L3 `Model::add_*()` 非模板 API |
+| **L3 实现层** | `model.hpp`, `model_spec.hpp`, `model_io.hpp` | 模型容器 + 序列化 | L2 Layer::forward/backward |
+| **L2 计算层** | `layer.hpp`, `loss.hpp`, `optimizer.hpp` | 层/损失/优化器定义 | L1 Matrix 语义化 API |
+| **L1 代数层** | `matrix.hpp` | 矩阵运算（内部自动 GPU 分派） | L0 SmartPolicy, GpuBackend |
+| **L0 硬件层** | `nn_config.hpp`, `thread_pool.hpp`, `vk_backend.hpp` | 并行策略 + GPU 后端 | 无（最底层） |
 
 ### 2. 禁止的反模式
 
@@ -299,8 +335,12 @@ Result<void> Adam::step() override {
 | Matrix 换存储格式（如 `vector` → 自定义 allocator） | `matrix.hpp` | `matrix.hpp` + `layer.hpp` + `optimizer.hpp` + `loss.hpp` + `model_io.hpp` |
 | SmartPolicy 换并行策略（如线程池 → TBB） | `nn_config.hpp` | `nn_config.hpp` + `layer.hpp` + `optimizer.hpp` + `loss.hpp` + `matrix.hpp` |
 | ThreadPool 换调度算法 | `thread_pool.hpp` | `thread_pool.hpp` + `matrix.hpp`（直接调了 `parallel_for_blocks`） |
+| Vulkan → OpenCL 换 GPU 后端 | `vk_backend.hpp` | `vk_backend.hpp` + `matrix.hpp`（通过 GpuBackend 接口） |
 | Layer 新增一种激活函数 | `layer.hpp` | `layer.hpp` ✅ 已满足 |
 | Optimizer 新增一种优化器 | `optimizer.hpp` | `optimizer.hpp` ✅ 已满足 |
+| 新增一种模型架构（如 LLaMA） | 新增 `llama_common.hpp` (L4) | 新增一个文件 ✅ |
+| 修改 GPT 超参数默认值 | `gpt_common.hpp` | `gpt_common.hpp` ✅ |
+| 修改 MNIST 数据集路径 | `mnist_common.hpp` | `mnist_common.hpp` ✅ |
 
 ### 5. 迁移路线图
 
@@ -308,11 +348,13 @@ Result<void> Adam::step() override {
 
 | 阶段 | 内容 | 影响范围 |
 |------|------|----------|
-| **Phase 1** | Matrix 新增 `apply()` / `apply_inplace()` / `binary_apply()` 等语义化方法 | `matrix.hpp` |
+| **Phase 1** | Matrix 新增 `apply()` / `apply_inplace()` / `binary_apply()` 等语义化方法 | `matrix.hpp` ✅ 已完成 |
 | **Phase 2** | Layer（ReLU/GeLU/LayerNorm/Softmax）改用 Matrix 语义方法，删除直接 SmartPolicy 调用 | `layer.hpp` |
 | **Phase 3** | Optimizer（SGD/Adam）改用 Matrix 批量操作，删除 `.data()` 穿透 | `optimizer.hpp` |
 | **Phase 4** | Loss（MSELoss/CrossEntropyLoss）改用 Matrix 语义方法 | `loss.hpp` |
 | **Phase 5** | Matrix 内部不再直接调 `global_thread_pool()`，统一经 SmartPolicy | `matrix.hpp` |
+| **Phase 6** | GPU 后端隔离：vk_backend.hpp 自包含，Matrix 内部管理 GPU 驻留，上层无感 | `vk_backend.hpp`, `matrix.hpp` |
+| **Phase 7** | 构建层分离：gpt_common/mnist_common 明确为 L4 构建层，文档更新 | `DEVELOPMENT_STANDARDS.md`, `ARCHITECTURE.md` ✅ |
 
 ---
 
@@ -322,15 +364,32 @@ Result<void> Adam::step() override {
 
 ```
 include/neuralnet.cpp/
-├── nn_config.hpp      # 全局配置和常量
+│
+│  ┌─ L0 硬件层 ──────────────────────────────────────┐
+├── nn_config.hpp      # 全局配置、Scalar 类型、SmartPolicy（仅 CPU）
 ├── thread_pool.hpp    # 线程池实现
-├── matrix.hpp         # 核心矩阵类
-├── layer.hpp          # 层基类和实现
-├── loss.hpp           # 损失函数
-├── optimizer.hpp      # 优化器
-├── model.hpp          # 模型容器
-├── model_io.hpp       # 模型序列化
-└── nn.hpp             # 统一入口头文件
+├── vk_backend.hpp     # Vulkan GPU 后端（纯 float 接口，不依赖上层）
+│
+│  ┌─ L1 代数层 ──────────────────────────────────────┐
+├── matrix.hpp         # 矩阵运算（内部自动 GPU 分派，上层无感）
+│
+│  ┌─ L2 计算层 ──────────────────────────────────────┐
+├── layer.hpp          # 层基类和实现（Linear/ReLU/GeLU/GPT...）
+├── loss.hpp           # 损失函数（MSE/CrossEntropy）
+├── optimizer.hpp      # 优化器（SGD/Adam）
+│
+│  ┌─ L3 实现层 ──────────────────────────────────────┐
+├── model.hpp          # 模型容器（Layer 序列 + 前后传播 + 非模板工厂 API）
+├── model_spec.hpp     # 模型架构描述（ModelSpec 纯数据，无 L2 依赖）
+├── model_io.hpp       # 模型二进制序列化
+├── tokenizer.hpp      # 分词器
+│
+│  ┌─ L4 构建层 ──────────────────────────────────────┐
+├── gpt_common.hpp     # GPT 模型工厂（构建函数 + 超参数常量）
+├── mnist_common.hpp   # MNIST 模型工厂（构建函数 + 超参数常量）
+│
+│  ┌─ 统一入口 ──────────────────────────────────────┐
+└── nn.hpp             # 统一入口头文件（聚合所有公共 API）
 ```
 
 ### 2. 头文件设计原则
