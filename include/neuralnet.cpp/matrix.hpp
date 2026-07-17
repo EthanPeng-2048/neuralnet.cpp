@@ -19,7 +19,7 @@
 
 // GPU 加速支持（可选，由 CMake 的 NN_HAS_VULKAN 宏控制）
 #ifdef NN_HAS_VULKAN
-#include "vk_backend.hpp"
+#include "backend/vk_backend.hpp"
 #endif
 
 namespace nn
@@ -508,7 +508,7 @@ namespace nn
 
 // ── GpuTensor 方法实现（需要 Matrix 完整定义） ──────────────────────────
 #ifdef NN_HAS_VULKAN
-#include "gpu_tensor_impl.hpp"
+#include "backend/gpu_tensor_impl.hpp"
 #endif
 
 #endif

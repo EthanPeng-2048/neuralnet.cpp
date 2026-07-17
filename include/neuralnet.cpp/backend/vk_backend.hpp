@@ -20,7 +20,7 @@
 #include <unordered_map>
 #include <tuple>
 #include <vector>
-#include "nn_config.hpp"
+#include "../nn_config.hpp"
 
 #if __has_include("matmul_spv.hpp")
 #include "matmul_spv.hpp"

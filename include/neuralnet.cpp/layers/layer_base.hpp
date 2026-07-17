@@ -16,8 +16,8 @@
 #include <utility>
 #include <vector>
 
-#include "matrix.hpp"
-#include "nn_config.hpp"
+#include "../algebra/matrix.hpp"
+#include "../nn_config.hpp"
 
 namespace nn
 {
@@ -45,4 +45,6 @@ namespace nn
             return GpuTensor::from_matrix(*cpu_out_res, backend);
         }
 #endif
+
+#endif // LAYER_HPP
     };

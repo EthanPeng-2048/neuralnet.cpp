@@ -19,29 +19,6 @@
 
 // Computation layer (L2)
 #include "layers/layer_base.hpp"
-#include "layers/linear.hpp"
-#include "layers/activations.hpp"
-#include "layers/normalization.hpp"
-#include "layers/attention.hpp"
-#include "losses/loss_base.hpp"
-#include "losses/mse.hpp"
-#include "losses/cross_entropy.hpp"
-#include "optimizers/optimizer_base.hpp"
-#include "optimizers/sgd.hpp"
-#include "optimizers/adam.hpp"
-
-// Model layer (L3)
-#include "model/model_spec.hpp"
-#include "model/model.hpp"
-#include "model/model_io.hpp"
-
-// Builders (L4)
-#include "builders/mnist_builder.hpp"
-#include "builders/gpt_builder.hpp"
-
-// Utils
-#include "utils/tokenizer.hpp"
-#include "utils/random_engine.hpp"
 
 namespace nn
 {

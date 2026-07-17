@@ -28,14 +28,6 @@ namespace nn
     // ── 标量类型（float 加速 / double 精度） ─────────────────────────
     using Scalar = float;
 
-    // ── 错误类型（C++23 std::expected）─────────────────────────────────────
-    // 所有公共 API 使用 Result<T> 返回错误，不抛异常。
-    struct Error {
-        std::string message;
-    };
-    template <typename T>
-    using Result = std::expected<T, Error>;
-
     inline constexpr std::size_t BLOCK_SIZE = 64;
     static_assert(BLOCK_SIZE * BLOCK_SIZE * sizeof(Scalar) <= 65536,
                   "BLOCK_SIZE too large: b_block would exceed 64KB stack budget");
