@@ -72,9 +72,11 @@ namespace nn
             input_cache_ = input;
 
             // product = W * input（写入预分配缓冲区，避免分配）
+            // multiply_to 内部自动分派 GPU 常驻路径，结果常驻 VRAM
             W_.multiply_to(product_buf_, input);
 
-            // result = product + bias（通过 Matrix 语义方法完成 broadcast add）
+            // result = product + bias
+            // add_bias_broadcast_inplace 内部自动分派 GPU BiasAdd shader
             Matrix result = product_buf_;
             result.add_bias_broadcast_inplace(b_);
 
@@ -87,6 +89,8 @@ namespace nn
                 return std::unexpected(Error{"linear backward grad_output shape mismatch"});
             if (input_cache_.rows() != W_.cols() || input_cache_.cols() != grad_output.cols())
                 return std::unexpected(Error{"linear backward cache/input shape mismatch"});
+
+            input_cache_.flush_gpu_to_cpu();  // 反向传播前同步 GPU 数据到 CPU
 
             const std::size_t in_feat = W_.cols();
             const std::size_t out_feat = W_.rows();
@@ -133,9 +137,7 @@ namespace nn
         {
             input_cache_ = input;
             Matrix result = input;
-            // 使用表达式模板：ReLU = max(x, 0)
-            Span x = result.span();
-            compute::apply(x, max(x, Scalar{0}));
+            result.elementwise_inplace(0);  // op=0: ReLU
             return result;
         }
 
@@ -144,6 +146,7 @@ namespace nn
             if (input_cache_.rows() != grad_output.rows() || input_cache_.cols() != grad_output.cols())
                 return std::unexpected(Error{"relu backward shape mismatch"});
 
+            input_cache_.flush_gpu_to_cpu();  // 反向传播前同步 GPU 数据到 CPU
             return input_cache_.binary_apply(grad_output,
                 [](Scalar x, Scalar go) noexcept { return x > 0.0 ? go : 0.0; });
         }
@@ -163,14 +166,12 @@ namespace nn
         Result<Matrix> forward(const Matrix &input) override
         {
             input_cache_ = input;
-            // 为 backward 缓存 sigmoid 值
-            sigmoid_cache_ = input.apply([](Scalar x) noexcept {
+            // sigmoid_cache_ 需要 CPU 数据（backward 使用），通过 span() 自动触发 GPU→CPU 同步
+            sigmoid_cache_ = input_cache_.apply([](Scalar x) noexcept {
                 return 1.0 / (1.0 + std::exp(-BETA * x));
             });
             Matrix result = input;
-            // 使用表达式模板：GeLU = x * sigmoid(β * x)
-            Span x = result.span();
-            compute::apply(x, x * (Scalar{1} / (Scalar{1} + exp(-BETA * x))));
+            result.elementwise_inplace(1);  // op=1: QuickGeLU（优先走 GPU 常驻路径）
             return result;
         }
 
@@ -180,6 +181,7 @@ namespace nn
             if (input_cache_.rows() != grad_output.rows() || input_cache_.cols() != grad_output.cols())
                 return std::unexpected(Error{"gelu backward shape mismatch"});
 
+            input_cache_.flush_gpu_to_cpu();
             // factor[i] = s[i] * (1 + BETA * x[i] * (1 - s[i]))
             Matrix factor = input_cache_.binary_apply(sigmoid_cache_,
                 [](Scalar x, Scalar s) noexcept {

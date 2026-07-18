@@ -21,6 +21,8 @@
 #include "../core/assert.hpp"
 #include "../core/thread_pool.hpp"
 #include "../nn_config.hpp"
+#include "span.hpp"
+#include "compute_dispatch.hpp"
 
 // GPU 加速支持（可选，由 CMake 的 NN_HAS_VULKAN 宏控制）
 #ifdef NN_HAS_VULKAN
@@ -32,9 +34,20 @@ namespace nn
     class Matrix
     {
     private:
+#ifdef NN_HAS_VULKAN
+        mutable std::vector<Scalar> data_{};  // mutable：const span() 可触发 GPU→CPU 同步
+#else
         std::vector<Scalar> data_{};
+#endif
         std::size_t rows_{0};
         std::size_t cols_{0};
+
+#ifdef NN_HAS_VULKAN
+        // GPU 影子：可选的显存常驻副本，用于 GPU-resident 流水线
+        // 消除层间 PCIe 传输：中间结果常驻显存，仅在网络入口/出口做一次 CPU↔GPU 传输
+        mutable std::shared_ptr<GpuTensor> gpu_shadow_;
+        mutable bool cpu_dirty_ = false;  // true = GPU 有最新数据，CPU 需同步后再访问
+#endif
 
         [[nodiscard]] constexpr std::size_t index(std::size_t row, std::size_t col) const noexcept
         {
@@ -48,6 +61,13 @@ namespace nn
                 assert(false && message.data()); // NOLINT
             }
         }
+
+#ifdef NN_HAS_VULKAN
+        // GPU 影子管理方法声明（实现在文件末尾 gpu_tensor_impl.hpp 之后）
+        void ensure_gpu_impl() const;              // 上传 CPU 数据到 GPU，创建/刷新影子
+        void ensure_cpu_impl() const;              // 从 GPU 下载数据到 CPU（修改 mutable data_）
+        void set_gpu_result_impl(GpuTensor&& t) const;  // 设置 GPU 操作结果为影子
+#endif
 
         // 内部构造函数（无校验，由工厂函数 create() 保证前置条件）
         Matrix(std::vector<Scalar> data, std::size_t rows, std::size_t cols)
@@ -70,10 +90,50 @@ namespace nn
         // 从标量值初始化矩阵
         Matrix(std::size_t rows, std::size_t cols, Scalar value)
             : data_(rows * cols, value), rows_(rows), cols_(cols) {}
-        Matrix(const Matrix &) = default;
-        Matrix(Matrix &&) noexcept = default;
-        Matrix &operator=(const Matrix &) = default;
-        Matrix &operator=(Matrix &&) noexcept = default;
+        Matrix(const Matrix &other)
+            : data_(other.data_), rows_(other.rows_), cols_(other.cols_)
+        {
+#ifdef NN_HAS_VULKAN
+            gpu_shadow_ = other.gpu_shadow_;
+            cpu_dirty_ = other.cpu_dirty_;
+#endif
+        }
+        Matrix(Matrix &&other) noexcept
+            : data_(std::move(other.data_)), rows_(other.rows_), cols_(other.cols_)
+        {
+#ifdef NN_HAS_VULKAN
+            gpu_shadow_ = std::move(other.gpu_shadow_);
+            cpu_dirty_ = other.cpu_dirty_;
+            other.cpu_dirty_ = false;
+#endif
+        }
+        Matrix &operator=(const Matrix &other)
+        {
+            if (this != &other) {
+                data_ = other.data_;
+                rows_ = other.rows_;
+                cols_ = other.cols_;
+#ifdef NN_HAS_VULKAN
+                gpu_shadow_ = other.gpu_shadow_;
+                cpu_dirty_ = other.cpu_dirty_;
+#endif
+            }
+            return *this;
+        }
+        Matrix &operator=(Matrix &&other) noexcept
+        {
+            if (this != &other) {
+                data_ = std::move(other.data_);
+                rows_ = other.rows_;
+                cols_ = other.cols_;
+#ifdef NN_HAS_VULKAN
+                gpu_shadow_ = std::move(other.gpu_shadow_);
+                cpu_dirty_ = other.cpu_dirty_;
+                other.cpu_dirty_ = false;
+#endif
+            }
+            return *this;
+        }
         ~Matrix() = default;
 
         // ── 就地调整大小（复用已有内存） ──────────────────────────────────
@@ -83,11 +143,22 @@ namespace nn
             rows_ = rows;
             cols_ = cols;
             data_.resize(rows * cols);
+#ifdef NN_HAS_VULKAN
+            gpu_shadow_.reset();  // 尺寸变化，GPU 影子失效
+            cpu_dirty_ = false;
+#endif
         }
 
         // ── std::span 访问（C++20 现代接口，推荐使用） ────────────────────
         // 零开销抽象：编译后等价于裸指针 + 大小，可替代所有 data_ptr() 场景
-        [[nodiscard]] std::span<const Scalar> span() const noexcept { return {data_.data(), data_.size()}; }
+        // const span() 自动同步 GPU→CPU，确保 CPU-only 运算（LayerNorm/Softmax）读到最新数据
+        [[nodiscard]] std::span<const Scalar> span() const
+        {
+#ifdef NN_HAS_VULKAN
+            if (cpu_dirty_ && gpu_shadow_) ensure_cpu_impl();
+#endif
+            return {data_.data(), data_.size()};
+        }
         [[nodiscard]] std::span<Scalar> span() noexcept { return {data_.data(), data_.size()}; }
 
         // 访问器
@@ -211,13 +282,18 @@ namespace nn
                                 dst[j * R + i] = src[i * C + j];
                     });
             }
+#ifdef NN_HAS_VULKAN
+            result.invalidate_gpu();  // CPU 数据已通过 span() 直接写入，GPU 影子失效
+#endif
         }
 
         [[nodiscard]] Matrix operator+(const Matrix &other) const
         {
             require_same_shape(*this, other, "addition dimension mismatch");
             Matrix result(rows_, cols_);
-            SmartPolicy::transform(data_.begin(), data_.end(), other.data_.begin(),
+            auto s = span();          // const span() 自动 GPU→CPU 同步
+            auto o = other.span();    // const span() 自动 GPU→CPU 同步
+            SmartPolicy::transform(s.begin(), s.end(), o.begin(),
                            result.data_.begin(), std::plus<>{});
             return result;
         }
@@ -226,7 +302,9 @@ namespace nn
         {
             require_same_shape(*this, other, "subtraction dimension mismatch");
             Matrix result(rows_, cols_);
-            SmartPolicy::transform(data_.begin(), data_.end(), other.data_.begin(),
+            auto s = span();
+            auto o = other.span();
+            SmartPolicy::transform(s.begin(), s.end(), o.begin(),
                            result.data_.begin(), std::minus<>{});
             return result;
         }
@@ -234,7 +312,8 @@ namespace nn
         [[nodiscard]] Matrix operator*(Scalar scalar) const
         {
             Matrix result(rows_, cols_);
-            SmartPolicy::transform(data_.begin(), data_.end(), result.data().begin(),
+            auto s = span();
+            SmartPolicy::transform(s.begin(), s.end(), result.data().begin(),
                            [scalar](Scalar value) noexcept { return value * scalar; });
             return result;
         }
@@ -266,22 +345,41 @@ namespace nn
             if (M == 0 || N == 0 || K == 0) return;
 
 #ifdef NN_HAS_VULKAN
-            // ── GPU 加速路径 ─────────────────────────────────────────────
-            // 矩阵面积超过阈值时自动走 GPU，失败则静默 fallback 到 CPU
+            // ── 自动确保 GPU 影子可用（懒上传，L1 层职责：上层不感知）──
+            if (SmartPolicy::gpu_enabled && M * N >= SmartPolicy::GPU_THRESHOLD)
+            {
+                ensure_gpu();        // 确保 this（权重/输入）在 GPU 上
+                other.ensure_gpu();  // 确保 other（输入/中间结果）在 GPU 上
+            }
+            // ── GPU 常驻路径（零 PCIe 中间传输：A.device × B.device → C.device）──
+            if (SmartPolicy::gpu_enabled && M * N >= SmartPolicy::GPU_THRESHOLD &&
+                has_gpu_shadow() && other.has_gpu_shadow())
+            {
+                auto& backend = GpuBackend::instance();
+                if (backend.is_initialized() || backend.initialize())
+                {
+                    auto gpu_result = backend.matmul_gpu_resident(
+                        *gpu_shadow_, *other.gpu_shadow_);
+                    if (gpu_result) {
+                        result.set_gpu_result_impl(std::move(*gpu_result));
+                        SmartPolicy::gpu_matmul_count.fetch_add(1, std::memory_order_relaxed);
+                        return;
+                    }
+                }
+            }
+            // ── GPU staging 回退路径（CPU span → staging → GPU → staging → CPU）──
             if (SmartPolicy::gpu_enabled && M * N >= SmartPolicy::GPU_THRESHOLD)
             {
                 auto& backend = GpuBackend::instance();
-                // 快速路径：已初始化时跳过全局锁
                 if (backend.is_initialized() || backend.initialize())
                 {
                     auto mm = backend.matmul_direct(
                         span(), other.span(), result.span(), M, N, K);
                     if (mm) {
                         SmartPolicy::gpu_matmul_count.fetch_add(1, std::memory_order_relaxed);
-                        return;  // GPU 成功，直接返回
+                        return;
                     }
                 }
-                // GPU 失败，静默 fallback 到 CPU 路径
             }
             SmartPolicy::cpu_matmul_count.fetch_add(1, std::memory_order_relaxed);
 #endif
@@ -377,21 +475,50 @@ namespace nn
         {
             SmartPolicy::for_each(data_.begin(), data_.end(),
                            [scalar](Scalar &value) noexcept { value *= scalar; });
+#ifdef NN_HAS_VULKAN
+            gpu_shadow_.reset();  // CPU 数据被修改，GPU 影子失效
+            cpu_dirty_ = false;
+#endif
         }
 
         // 逐元素加法 inplace
         void add_inplace(const Matrix &other)
         {
             require_same_shape(*this, other, "add_inplace dimension mismatch");
-            SmartPolicy::transform(data_.begin(), data_.end(), other.data_.begin(),
+            auto o = other.span();    // const span() 自动 GPU→CPU 同步
+            SmartPolicy::transform(data_.begin(), data_.end(), o.begin(),
                            data_.begin(), std::plus<>{});
+#ifdef NN_HAS_VULKAN
+            gpu_shadow_.reset();  // CPU 数据被修改，GPU 影子失效
+            cpu_dirty_ = false;
+#endif
         }
 
         // 填充零
         void zero() noexcept
         {
             std::fill(data_.begin(), data_.end(), 0.0);
+#ifdef NN_HAS_VULKAN
+            gpu_shadow_.reset();  // CPU 数据被修改，GPU 影子失效
+            cpu_dirty_ = false;
+#endif
         }
+
+#ifdef NN_HAS_VULKAN
+        // ── GPU 影子公共接口 ─────────────────────────────────────────
+        [[nodiscard]] bool has_gpu_shadow() const noexcept { return gpu_shadow_ && gpu_shadow_->valid(); }
+        [[nodiscard]] const GpuTensor& gpu_tensor() const { assert(gpu_shadow_); return *gpu_shadow_; }
+
+        // 确保 GPU 影子可用（懒上传：仅当无影子时上传）
+        // Optimizer 更新 CPU 权重后调用 invalidate_gpu()，下次 ensure_gpu() 会重新上传
+        void ensure_gpu() const { if (!gpu_shadow_) ensure_gpu_impl(); }
+
+        // 将 GPU 数据同步到 CPU（在 backward pass 前显式调用）
+        void flush_gpu_to_cpu() const { if (cpu_dirty_ && gpu_shadow_) ensure_cpu_impl(); }
+
+        // 使 GPU 影子失效（CPU 数据被外部修改后调用）
+        void invalidate_gpu() noexcept { gpu_shadow_.reset(); cpu_dirty_ = false; }
+#endif
 
         // ── 逐元素一元变换（返回新矩阵） ────────────────────────────────
         // out[i] = func(in[i])，内部自动选择串行/并行。
@@ -399,7 +526,8 @@ namespace nn
         [[nodiscard]] Matrix apply(F&& func) const
         {
             Matrix result(rows_, cols_);
-            SmartPolicy::transform(data_.begin(), data_.end(),
+            auto s = span();  // const span() 自动 GPU→CPU 同步
+            SmartPolicy::transform(s.begin(), s.end(),
                            result.data_.begin(), std::forward<F>(func));
             return result;
         }
@@ -411,8 +539,10 @@ namespace nn
         {
             require_same_shape(*this, other, "binary_apply dimension mismatch");
             Matrix result(rows_, cols_);
-            SmartPolicy::transform(data_.begin(), data_.end(),
-                           other.data_.begin(), result.data_.begin(),
+            auto s = span();         // const span() 自动 GPU→CPU 同步
+            auto o = other.span();   // const span() 自动 GPU→CPU 同步
+            SmartPolicy::transform(s.begin(), s.end(),
+                           o.begin(), result.data_.begin(),
                            std::forward<F>(func));
             return result;
         }
@@ -422,9 +552,14 @@ namespace nn
         void binary_apply_inplace(const Matrix& other, F&& func)
         {
             require_same_shape(*this, other, "binary_apply_inplace dimension mismatch");
+            auto o = other.span();  // const span() 自动 GPU→CPU 同步
             SmartPolicy::transform(data_.begin(), data_.end(),
-                           other.data_.begin(), data_.begin(),
+                           o.begin(), data_.begin(),
                            std::forward<F>(func));
+#ifdef NN_HAS_VULKAN
+            gpu_shadow_.reset();  // CPU 数据被修改，GPU 影子失效
+            cpu_dirty_ = false;
+#endif
         }
 
         // ── 归约操作 ────────────────────────────────────────────────────
@@ -449,6 +584,9 @@ namespace nn
                 auto& g = grads[i].get();
                 p.binary_apply_inplace(g,
                     [lr](Scalar pv, Scalar gv) noexcept { return pv - lr * gv; });
+#ifdef NN_HAS_VULKAN
+                p.invalidate_gpu();
+#endif
             }
         }
 
@@ -480,6 +618,9 @@ namespace nn
                         vv = beta2 * vv + (1.0 - beta2) * gv * gv;
                         pv -= lr * (mv / bc1) / (std::sqrt(vv / bc2) + eps);
                     });
+#ifdef NN_HAS_VULKAN
+                p.invalidate_gpu();  // CPU 权重已更新，GPU 影子失效
+#endif
             }
         }
 
@@ -493,17 +634,83 @@ namespace nn
             }
         }
 
+        // ── 通用逐元素就地变换（GPU/CPU 自动分派）────────────────────
+        // op: 0=ReLU, 1=QuickGeLU（与 elementwise.comp shader 操作码一致）
+        void elementwise_inplace(uint32_t op)
+        {
+#ifdef NN_HAS_VULKAN
+            if (SmartPolicy::gpu_enabled && size() >= SmartPolicy::GPU_THRESHOLD)
+            {
+                auto& backend = GpuBackend::instance();
+                if (backend.is_initialized() || backend.initialize())
+                {
+                    if (backend.has_elementwise_pipeline())
+                    {
+                        // GPU 常驻路径：直接在现有 GPU buffer 上操作，零 PCIe 传输
+                        if (has_gpu_shadow())
+                        {
+                            auto r = backend.elementwise_inplace_gpu(*gpu_shadow_, op);
+                            if (r) {
+                                cpu_dirty_ = true;  // GPU 有最新数据，CPU 需同步
+                                return;
+                            }
+                        }
+                        // Staging 回退路径
+                        auto r = backend.elementwise_direct(span(), op, rows_ * cols_);
+                        if (r) return;
+                    }
+                }
+            }
+#endif
+            // CPU 回退：按操作码分派
+            Span x = span();
+            if (op == 0)       // ReLU
+                compute::apply(x, max(x, Scalar{0}));
+            else if (op == 1)  // QuickGeLU
+                compute::apply(x, x * (Scalar{1} / (Scalar{1} + exp(-Scalar{1.702} * x))));
+        }
+
         // ── Broadcast bias 加法（in-place） ───────────────────────────
         // this[i][j] += bias[i][0]，bias 形状必须为 (rows_, 1)
+        // GPU 常驻路径：通过 elementwise shader (op=2 BiasAdd) 在显存中完成，
+        // 结果常驻 VRAM，零 PCIe 传输。
         void add_bias_broadcast_inplace(const Matrix& bias)
         {
             assert(bias.rows_ == rows_ && bias.cols_ == 1 && "bias broadcast dimension mismatch");
+#ifdef NN_HAS_VULKAN
+            // ── GPU 常驻路径：BiasAdd 留在显存 ──
+            if (SmartPolicy::gpu_enabled && has_gpu_shadow())
+            {
+                bias.ensure_gpu();  // L1 职责：自动确保 bias 在 GPU 上
+                if (bias.has_gpu_shadow())
+                {
+                    auto& backend = GpuBackend::instance();
+                    if (backend.is_initialized() || backend.initialize())
+                    {
+                        auto r = backend.elementwise_gpu(
+                            *gpu_shadow_, &bias.gpu_tensor(), 2,
+                            static_cast<uint32_t>(rows_), static_cast<uint32_t>(cols_));
+                        if (r)
+                        {
+                            set_gpu_result_impl(std::move(*r));
+                            return;
+                        }
+                    }
+                }
+            }
+#endif
+            // CPU 回退路径
             const std::size_t batch = cols_;
-            SmartPolicy::for_each(data_.begin(), data_.end(),
-                [&bias, batch, i = std::size_t{0}](Scalar& v) mutable noexcept {
-                    v += bias.data_[i / batch];
-                    ++i;
+            auto b = bias.span();  // const span() 自动 GPU→CPU 同步
+            auto idx = std::views::iota(std::size_t{0}, data_.size());
+            SmartPolicy::for_each(idx.begin(), idx.end(),
+                [d = data_.data(), &b, batch](std::size_t i) noexcept {
+                    d[i] += b[i / batch];
                 });
+#ifdef NN_HAS_VULKAN
+            gpu_shadow_.reset();  // CPU 数据被修改，GPU 影子失效
+            cpu_dirty_ = false;
+#endif
         }
 
         // ── SGD+Momentum 批量更新 ─────────────────────────────────────
@@ -525,6 +732,9 @@ namespace nn
                     [beta](Scalar vv, Scalar gv) noexcept { return beta * vv + (1.0 - beta) * gv; });
                 p.binary_apply_inplace(v,
                     [lr](Scalar pv, Scalar vv) noexcept { return pv - lr * vv; });
+#ifdef NN_HAS_VULKAN
+                p.invalidate_gpu();
+#endif
             }
         }
 
@@ -821,6 +1031,45 @@ namespace nn
 // ── GpuTensor 方法实现（需要 Matrix 完整定义） ──────────────────────────
 #ifdef NN_HAS_VULKAN
 #include "../backend/gpu_tensor_impl.hpp"
+
+// ── Matrix GPU 影子方法实现（需要 GpuBackend 和 GpuTensor 完整定义）────
+namespace nn
+{
+
+inline void Matrix::ensure_gpu_impl() const
+{
+    if (!SmartPolicy::gpu_enabled) return;
+    auto& backend = GpuBackend::instance();
+    if (!backend.is_initialized() && !backend.initialize()) return;
+    if (rows_ == 0 || cols_ == 0) return;
+
+    auto t = GpuTensor::from_matrix(*this, backend);
+    if (t) {
+        gpu_shadow_ = std::make_shared<GpuTensor>(std::move(*t));
+        cpu_dirty_ = false;  // CPU 和 GPU 数据一致
+    }
+}
+
+inline void Matrix::ensure_cpu_impl() const
+{
+    if (!gpu_shadow_ || !cpu_dirty_) return;
+    auto& backend = GpuBackend::instance();
+    if (!backend.is_initialized()) return;
+
+    // 确保所有 pending GPU 操作（如 elementwise_inplace_gpu）完成后再下载
+    backend.wait_pending_ops();
+
+    auto r = backend.download_blocking(*gpu_shadow_, std::span<Scalar>(data_.data(), data_.size()));
+    if (r) cpu_dirty_ = false;
+}
+
+inline void Matrix::set_gpu_result_impl(GpuTensor&& tensor) const
+{
+    gpu_shadow_ = std::make_shared<GpuTensor>(std::move(tensor));
+    cpu_dirty_ = true;  // GPU 有最新数据，CPU 需同步后再访问
+}
+
+} // namespace nn
 #endif
 
 #endif // NN_ALGEBRA_MATRIX_HPP
