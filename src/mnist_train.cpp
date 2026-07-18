@@ -298,6 +298,9 @@ Scalar evaluate(nn::Model &model, const nn::Matrix &x, const nn::Matrix &y_oneho
     auto out_result = model.forward(x);
     if (!out_result) return 0.0;
     auto out = std::move(*out_result);
+#ifdef NN_HAS_VULKAN
+    out.flush_gpu_to_cpu();  // 同步 GPU→CPU，确保输出数据可被 CPU 读取
+#endif
     int correct = 0;
     for (std::size_t i = 0; i < N; ++i)
     {
@@ -495,6 +498,9 @@ int main(int argc, char *argv[])
                     std::memcpy(y_batch.span().data() + r * cfg.batch_size,
                                 train_y.span().data() + r * train_y.cols() + start,
                                 cfg.batch_size * sizeof(Scalar));
+#ifdef NN_HAS_VULKAN
+                x_batch.invalidate_gpu();  // memcpy 绕过了 Matrix API，需手动失效 GPU 影子
+#endif
 
                 auto out_fwd = model.forward(x_batch);
                 if (!out_fwd) {
@@ -536,6 +542,13 @@ int main(int argc, char *argv[])
             Scalar ep_sec = std::chrono::duration<Scalar>(ep_end - ep_start).count();
 
             Scalar avg_loss = total_loss / num_batches;
+#ifdef NN_HAS_VULKAN
+            // ── 评估前确保权重 GPU shadow 可用（optimizer 已 invalidate） ──
+            if (nn::SmartPolicy::gpu_enabled) {
+                for (auto& p_ref : model.parameters())
+                    p_ref.get().ensure_gpu();
+            }
+#endif
             Scalar train_acc = evaluate(model, train_x, train_y);
             Scalar test_acc = evaluate(model, test_x, test_y);
 

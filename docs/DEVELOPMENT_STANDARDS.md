@@ -76,6 +76,40 @@ matrix.add_inplace(other);              // Matrix 自己封装算术操作
 | **不假设实现** | 上层模块不应依赖下层模块的内部类型（如假定数据存储在 `std::vector` 中） |
 | **自包含修改** | 修改模块内部实现（如换存储格式、换并行策略），只需修改该模块的头文件 |
 
+### 6. 分层职责单一
+**目标：** 每一层只做自己该做的事，严禁职责越界。
+
+> **核心口号：每层只能负责每层的事，Matrix 不能写算法，Layer 不能写底层计算。**
+
+```cpp
+// ── L1 代数层（matrix.hpp）的职责边界 ──
+// ✅ Matrix 负责：数学运算（矩阵乘、逐元素变换、broadcast add）、GPU 自动分派
+// ❌ Matrix 禁止：定义神经网络算法逻辑（如 forward/backward 流程、损失函数、梯度更新策略）
+
+// ── L2 计算层（layer.hpp）的职责边界 ──
+// ✅ Layer 负责：神经网络算法逻辑（forward/backward 公式、参数管理、缓存中间结果）
+// ❌ Layer 禁止：直接操作 GPU/线程池/内存（如 flush_gpu_to_cpu、SmartPolicy::for_each、
+//              ensure_gpu、data().begin() 等底层操作）
+
+// ── 正确示例：Layer 只调用 Matrix 语义 API ──
+// layer.hpp 中：
+Matrix result = product_buf_;
+result.add_bias_broadcast_inplace(b_);  // ✅ Matrix 内部自动处理 GPU/CPU 分派
+
+// ── 错误示例：Layer 越界操作底层 ──
+// layer.hpp 中：
+product_buf_.flush_gpu_to_cpu();        // ❌ Layer 不应感知 GPU 同步
+product_buf_.ensure_gpu();              // ❌ Layer 不应管理 GPU 资源
+SmartPolicy::for_each(data.begin(), ...); // ❌ Layer 不应直接调用并行策略
+```
+
+| 规则 | 说明 |
+|------|------|
+| **Matrix 不写算法** | Matrix 提供纯数学运算原语，不包含神经网络的前向/反向传播逻辑 |
+| **Layer 不写底层计算** | Layer 通过 Matrix 语义 API 表达算法，不直接操作 GPU、内存、并行策略 |
+| **GPU 对上层透明** | GPU 加速是 L1 层的内部实现细节，L2+ 层通过 Matrix API 间接享受加速 |
+| **自动资源管理** | GPU 上传/下载/同步由 Matrix 内部自动完成（如 `ensure_gpu()`、`const span()`），上层无需手动调用 |
+
 ---
 
 ## 🧠 内存管理规范

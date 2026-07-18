@@ -73,9 +73,11 @@ namespace nn
             if (target_onehot.rows() != classes || target_onehot.cols() != batch)
                 return std::unexpected(Error{"cross_entropy loss shape mismatch"});
 
-            grad_input_ = Matrix(classes, batch);
+#ifdef NN_HAS_VULKAN
+            logits.flush_gpu_to_cpu();  // 同步 GPU→CPU，确保 logits 数据是最新的
+#endif
 
-            // 委托 Matrix 语义方法完成交叉熵前向传播
+            grad_input_ = Matrix(classes, batch);
             Scalar loss = Matrix::cross_entropy_forward(
                 grad_input_, logits, target_onehot);
 

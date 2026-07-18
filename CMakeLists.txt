@@ -36,6 +36,14 @@ target_include_directories(compute_bench PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_executable(gpu_test src/gpu_test.cpp)
 target_include_directories(gpu_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
+# ── GPU 常驻路径调试目标 ─────────────────────────────────────────────────
+add_executable(gpu_debug src/gpu_debug.cpp)
+target_include_directories(gpu_debug PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_executable(gpu_debug3 src/gpu_debug3.cpp)
+target_include_directories(gpu_debug3 PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_executable(cpu_bias_test src/cpu_bias_test.cpp)
+target_include_directories(cpu_bias_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
 # ── Vulkan GPU 加速（可选） ────────────────────────────────────────────────
 find_package(Vulkan QUIET)
 if(Vulkan_FOUND)
@@ -102,7 +110,7 @@ if(Vulkan_FOUND)
             mnist_train mnist_infer
             text_train text_infer
             tokenizer_train tokenizer_infer
-            compute_bench gpu_test
+            compute_bench gpu_test gpu_debug gpu_debug3 cpu_bias_test
         )
         foreach(TARGET ${NN_GPU_SOURCES})
             target_compile_definitions(${TARGET} PRIVATE NN_HAS_VULKAN)

@@ -15,7 +15,9 @@ inline Result<GpuTensor> GpuTensor::from_matrix(const Matrix& cpu_mat, GpuBacken
 
     auto buf_res = GpuBuffer::create_device_local(
         backend.device().device(), backend.memory_pool(),
-        cpu_mat.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        cpu_mat.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                        VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     if (!buf_res) return std::unexpected(buf_res.error());
 
     auto tensor = GpuTensor(std::make_shared<GpuBuffer>(std::move(*buf_res)), cpu_mat.rows(), cpu_mat.cols());
@@ -30,7 +32,9 @@ inline Result<GpuTensor> GpuTensor::create_empty(std::size_t rows, std::size_t c
 {
     auto buf_res = GpuBuffer::create_device_local(
         backend.device().device(), backend.memory_pool(),
-        rows * cols, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        rows * cols, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     if (!buf_res) return std::unexpected(buf_res.error());
     return GpuTensor(std::make_shared<GpuBuffer>(std::move(*buf_res)), rows, cols);
 }
