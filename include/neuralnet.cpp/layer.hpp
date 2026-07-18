@@ -1,23 +1,13 @@
 #ifndef LAYER_HPP
 #define LAYER_HPP
 
-#include <algorithm>
-#include <cassert>
-#include <cmath>
-#include <cstddef>
-#include <execution>
 #include <functional>
-#include <numeric>
 #include <random>
-#include <ranges>
-#include <span>
-#include <expected>
-#include <string>
-#include <utility>
-#include <vector>
 
 #include "matrix.hpp"
 #include "nn_config.hpp"
+#include "algebra/span.hpp"
+#include "algebra/compute_dispatch.hpp"
 
 namespace nn
 {
@@ -143,7 +133,9 @@ namespace nn
         {
             input_cache_ = input;
             Matrix result = input;
-            result.apply_relu_inplace();
+            // 使用表达式模板：ReLU = max(x, 0)
+            Span x = result.span();
+            compute::apply(x, max(x, Scalar{0}));
             return result;
         }
 
@@ -176,7 +168,9 @@ namespace nn
                 return 1.0 / (1.0 + std::exp(-BETA * x));
             });
             Matrix result = input;
-            result.apply_gelu_inplace();
+            // 使用表达式模板：GeLU = x * sigmoid(β * x)
+            Span x = result.span();
+            compute::apply(x, x * (Scalar{1} / (Scalar{1} + exp(-BETA * x))));
             return result;
         }
 

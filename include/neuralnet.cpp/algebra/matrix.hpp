@@ -387,14 +387,6 @@ namespace nn
                            data_.begin(), std::plus<>{});
         }
 
-        // 逐元素减法 inplace
-        void subtract_inplace(const Matrix &other)
-        {
-            require_same_shape(*this, other, "subtract_inplace dimension mismatch");
-            SmartPolicy::transform(data_.begin(), data_.end(), other.data_.begin(),
-                           data_.begin(), std::minus<>{});
-        }
-
         // 填充零
         void zero() noexcept
         {
@@ -410,53 +402,6 @@ namespace nn
             SmartPolicy::transform(data_.begin(), data_.end(),
                            result.data_.begin(), std::forward<F>(func));
             return result;
-        }
-
-        // ── 逐元素一元变换（就地修改） ──────────────────────────────────
-        template <typename F>
-        void apply_inplace(F&& func)
-        {
-            SmartPolicy::for_each(data_.begin(), data_.end(),
-                [&func](Scalar& v) noexcept { v = func(v); });
-        }
-
-        // ── ReLU 就地变换（GPU 加速，自动 fallback CPU） ───────────────
-        void apply_relu_inplace()
-        {
-#ifdef NN_HAS_VULKAN
-            if (SmartPolicy::gpu_enabled)
-            {
-                auto& backend = GpuBackend::instance();
-                if (backend.is_initialized() || backend.initialize())
-                {
-                    auto r = backend.elementwise_direct(span(), 0u, size());
-                    if (r) return;
-                }
-            }
-#endif
-            SmartPolicy::for_each(data_.begin(), data_.end(),
-                [](Scalar& v) noexcept { v = v > 0.0 ? v : 0.0; });
-        }
-
-        // ── QuickGeLU 就地变换：x * sigmoid(1.702 * x)（GPU 加速） ──
-        void apply_gelu_inplace()
-        {
-#ifdef NN_HAS_VULKAN
-            if (SmartPolicy::gpu_enabled)
-            {
-                auto& backend = GpuBackend::instance();
-                if (backend.is_initialized() || backend.initialize())
-                {
-                    auto r = backend.elementwise_direct(span(), 1u, size());
-                    if (r) return;
-                }
-            }
-#endif
-            constexpr Scalar BETA = 1.702;
-            SmartPolicy::for_each(data_.begin(), data_.end(),
-                [](Scalar& v) noexcept {
-                    v = v * (1.0 / (1.0 + std::exp(-BETA * v)));
-                });
         }
 
         // ── 逐元素二元变换（返回新矩阵） ────────────────────────────────
