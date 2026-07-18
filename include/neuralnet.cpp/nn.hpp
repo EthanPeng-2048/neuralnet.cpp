@@ -11,6 +11,10 @@
 
 // Algebra layer (L1)
 #include "algebra/matrix.hpp"
+#include "algebra/ops.hpp"
+#include "algebra/expr.hpp"
+#include "algebra/span.hpp"
+#include "algebra/compute_dispatch.hpp"
 
 // Backend (L0) - optional Vulkan support
 #ifdef NN_HAS_VULKAN
