@@ -62,6 +62,17 @@ struct Log
     [[nodiscard]] static Scalar apply(Scalar a) noexcept { return std::log(a); }
 };
 
+struct Sqrt
+{
+    [[nodiscard]] static Scalar apply(Scalar a) noexcept { return std::sqrt(a); }
+};
+
+struct Rsqrt
+{
+    /// 1/sqrt(x) —— LayerNorm 标准差倒数专用，单次调用避免除法
+    [[nodiscard]] static Scalar apply(Scalar a) noexcept { return Scalar{1} / std::sqrt(a); }
+};
+
 struct Sigmoid
 {
     [[nodiscard]] static Scalar apply(Scalar a) noexcept { return Scalar{1} / (Scalar{1} + std::exp(-a)); }

@@ -107,17 +107,12 @@ namespace nn
                 grad_w_.add_inplace(grad_w_accum);
             }
 
-            // grad_b += sum(grad_output, dim=batch)
-            {
-                for (std::size_t of = 0; of < out_feat; ++of)
-                {
-                    Scalar sum = 0.0;
-                    for (std::size_t b = 0; b < batch; ++b)
-                        sum += grad_output.at_unchecked(of, b);
-                    grad_b_.set_value_unchecked(of, 0,
-                        grad_b_.at_unchecked(of, 0) + sum);
-                }
-            }
+            // grad_b += sum(grad_output, dim=batch) —— 按行归约后再累加
+            // grad_b_accum[of][0] = Σ_b grad_output[of][b]
+            Matrix grad_b_accum = grad_output.row_reduce(Scalar{0},
+                [](Scalar a, Scalar b) noexcept { return a + b; },
+                [](Scalar x) noexcept { return x; });
+            grad_b_.add_inplace(grad_b_accum);
 
             return grad_input;
         }
@@ -132,23 +127,30 @@ namespace nn
         ReLU() = default;
 
         // forward: out = max(x, 0)
-        // 通过 Matrix::apply 通用接口表达 ReLU 算法，不调用底层并行策略
+        // 通过 AST 入口 compute::apply 表达 ReLU 算法，底层自动并行
         Result<Matrix> forward(const Matrix &input) override
         {
             input_cache_ = input;
-            return input.apply([](Scalar x) noexcept {
-                return std::max(x, Scalar{0});
-            });
+            Matrix result(input.rows(), input.cols());
+            ConstSpan in = input.span();
+            Span out = result.span();
+            compute::apply(out, max(in, Scalar{0}));
+            return result;
         }
 
         // backward: out = (x > 0) ? grad_output : 0
+        // 通过 AST select() 表达条件选择
         Result<Matrix> backward(const Matrix &grad_output) override
         {
             if (input_cache_.rows() != grad_output.rows() || input_cache_.cols() != grad_output.cols())
                 return std::unexpected(Error{"relu backward shape mismatch"});
 
-            return input_cache_.binary_apply(grad_output,
-                [](Scalar x, Scalar go) noexcept { return x > 0.0 ? go : 0.0; });
+            Matrix result(grad_output.rows(), grad_output.cols());
+            Span x = input_cache_.span();
+            ConstSpan go = grad_output.span();
+            Span out = result.span();
+            compute::apply(out, select(x > Scalar{0}, go, Scalar{0}));
+            return result;
         }
     };
 
@@ -163,33 +165,46 @@ namespace nn
         GeLU() = default;
 
         // QuickGeLU: out = x * sigmoid(β * x)
-        // 通过 Matrix::apply 通用接口表达 QuickGeLU 算法
+        // 通过 AST 表达 QuickGeLU 算法：sigmoid(βx) 与 x*sigmoid(βx) 均由 AST 求值
         Result<Matrix> forward(const Matrix &input) override
         {
             input_cache_ = input;
             // sigmoid_cache_[i] = 1 / (1 + exp(-β * x[i]))
-            sigmoid_cache_ = input.apply([](Scalar x) noexcept {
-                return Scalar{1} / (Scalar{1} + std::exp(-BETA * x));
-            });
+            sigmoid_cache_.resize(input.rows(), input.cols());
+            ConstSpan x_in = input.span();
+            Span s_out = sigmoid_cache_.span();
+            compute::apply(s_out, sigmoid(BETA * x_in));
+
             // out[i] = x[i] * sigmoid_cache_[i]
-            return input_cache_.binary_apply(sigmoid_cache_,
-                [](Scalar x, Scalar s) noexcept { return x * s; });
+            Matrix result(input.rows(), input.cols());
+            Span x = input_cache_.span();
+            Span s = sigmoid_cache_.span();
+            Span out = result.span();
+            compute::apply(out, x * s);
+            return result;
         }
 
         // d/dx [x * sigmoid(βx)] = sigmoid(βx) * [1 + βx * (1 - sigmoid(βx))]
+        // factor = s * (1 + βx * (1 - s));  out = go * factor
         Result<Matrix> backward(const Matrix &grad_output) override
         {
             if (input_cache_.rows() != grad_output.rows() || input_cache_.cols() != grad_output.cols())
                 return std::unexpected(Error{"gelu backward shape mismatch"});
 
             // factor[i] = s[i] * (1 + BETA * x[i] * (1 - s[i]))
-            Matrix factor = input_cache_.binary_apply(sigmoid_cache_,
-                [](Scalar x, Scalar s) noexcept {
-                    return s * (Scalar{1} + BETA * x * (Scalar{1} - s));
-                });
+            Matrix factor(input_cache_.rows(), input_cache_.cols());
+            Span x = input_cache_.span();
+            Span s = sigmoid_cache_.span();
+            Span f_out = factor.span();
+            compute::apply(f_out, s * (Scalar{1} + BETA * x * (Scalar{1} - s)));
+
             // out[i] = go[i] * factor[i]
-            return grad_output.binary_apply(factor,
-                [](Scalar go, Scalar f) noexcept { return go * f; });
+            Matrix result(grad_output.rows(), grad_output.cols());
+            ConstSpan go = grad_output.span();
+            Span f_in = factor.span();
+            Span r_out = result.span();
+            compute::apply(r_out, go * f_in);
+            return result;
         }
     };
 
@@ -248,63 +263,53 @@ namespace nn
             input_cache_ = input;
             const std::size_t features = input.rows();
             const std::size_t batch_size = input.cols();
+            const Scalar inv_features = Scalar{1} / static_cast<Scalar>(features);
 
             mean_cache_.resize(1, batch_size);
             std_cache_.resize(1, batch_size);
             normalized_cache_.resize(features, batch_size);
 
-            // mean[b] = (1/features) * Σ_f input[f][b]
+            // mean[b] = (1/features) * Σ_f input[f][b]  （按列归约）
             mean_cache_ = input.col_reduce(Scalar{0},
                 [](Scalar a, Scalar b) noexcept { return a + b; },
                 [](Scalar x) noexcept { return x; });
-            mean_cache_.scale_inplace(Scalar{1} / static_cast<Scalar>(features));
+            mean_cache_.scale_inplace(inv_features);
 
-            // var[b] = (1/features) * Σ_f (input[f][b] - mean[b])²
-            // 先复制 mean 到 (features, batch_size) 形状，再用 binary_apply 算 (x - mean)²
-            Matrix mean_broadcast(features, batch_size);
-            for (std::size_t f = 0; f < features; ++f)
-                for (std::size_t b = 0; b < batch_size; ++b)
-                    mean_broadcast.set_value_unchecked(f, b, mean_cache_.at_unchecked(0, b));
+            // diff = input - mean（按列广播减法，复用 Matrix 通用原语）
+            Matrix diff = input;
+            diff.broadcast_col_inplace(mean_cache_,
+                [](Scalar x, Scalar m) noexcept { return x - m; });
 
-            Matrix diff_sq = input.binary_apply(mean_broadcast,
-                [](Scalar x, Scalar m) noexcept { Scalar d = x - m; return d * d; });
+            // diff_sq = diff²  (AST 逐元素平方)
+            Matrix diff_sq(features, batch_size);
+            Span d_in = diff.span();
+            Span ds_out = diff_sq.span();
+            compute::apply(ds_out, d_in * d_in);
+
+            // var[b] = (1/features) * Σ_f diff_sq[f][b]  （按列归约）
             Matrix var = diff_sq.col_reduce(Scalar{0},
                 [](Scalar a, Scalar b) noexcept { return a + b; },
                 [](Scalar x) noexcept { return x; });
-            var.scale_inplace(Scalar{1} / static_cast<Scalar>(features));
+            var.scale_inplace(inv_features);
 
-            // std_inv[b] = 1 / sqrt(var[b] + ε)
-            std_cache_ = var.apply([this](Scalar v) noexcept {
-                return Scalar{1} / std::sqrt(v + epsilon_);
-            });
+            // std_inv[b] = 1 / sqrt(var[b] + ε)  (AST: rsqrt(var + ε))
+            const Scalar eps = epsilon_;
+            Span v_in = var.span();
+            Span s_out = std_cache_.span();
+            compute::apply(s_out, rsqrt(v_in + eps));
 
-            // normalized[f][b] = (input[f][b] - mean[b]) * std_inv[b]
-            // output[f][b] = gamma[f] * normalized[f][b] + beta[f]
-            Matrix std_inv_broadcast(features, batch_size);
-            for (std::size_t f = 0; f < features; ++f)
-                for (std::size_t b = 0; b < batch_size; ++b)
-                    std_inv_broadcast.set_value_unchecked(f, b, std_cache_.at_unchecked(0, b));
+            // normalized = diff * std_inv（按列广播乘法）
+            normalized_cache_ = diff;
+            normalized_cache_.broadcast_col_inplace(std_cache_,
+                [](Scalar d, Scalar s) noexcept { return d * s; });
 
-            normalized_cache_ = input.binary_apply(mean_broadcast,
-                [](Scalar x, Scalar m) noexcept { return x - m; });
-            normalized_cache_ = normalized_cache_.binary_apply(std_inv_broadcast,
-                [](Scalar n, Scalar s) noexcept { return n * s; });
-
-            // output = gamma * normalized + beta（gamma/beta 形状 (features, 1)，按列广播）
-            Matrix gamma_broadcast(features, batch_size);
-            Matrix beta_broadcast(features, batch_size);
-            for (std::size_t f = 0; f < features; ++f) {
-                const Scalar g = gamma_.at_unchecked(f, 0);
-                const Scalar bt = beta_.at_unchecked(f, 0);
-                for (std::size_t b = 0; b < batch_size; ++b) {
-                    gamma_broadcast.set_value_unchecked(f, b, g);
-                    beta_broadcast.set_value_unchecked(f, b, bt);
-                }
-            }
-            Matrix scaled = normalized_cache_.binary_apply(gamma_broadcast,
+            // output = gamma * normalized + beta（按行广播：gamma/beta 形状 (features, 1)）
+            Matrix output = normalized_cache_;
+            output.broadcast_row_inplace(gamma_,
                 [](Scalar n, Scalar g) noexcept { return n * g; });
-            return scaled.binary_apply(beta_broadcast,
-                [](Scalar s, Scalar b) noexcept { return s + b; });
+            output.broadcast_row_inplace(beta_,
+                [](Scalar o, Scalar b) noexcept { return o + b; });
+            return output;
         }
 
         // ── 反向传播 ──
@@ -320,21 +325,22 @@ namespace nn
 
             const std::size_t features = normalized_shape_;
             const std::size_t batch_size = grad_output.cols();
+            const Scalar inv_features = Scalar{1} / static_cast<Scalar>(features);
 
-            // gy_gamma[f][b] = grad_output[f][b] * gamma[f]
-            Matrix gamma_broadcast(features, batch_size);
-            for (std::size_t f = 0; f < features; ++f) {
-                const Scalar g = gamma_.at_unchecked(f, 0);
-                for (std::size_t b = 0; b < batch_size; ++b)
-                    gamma_broadcast.set_value_unchecked(f, b, g);
-            }
-            Matrix gy_gamma = grad_output.binary_apply(gamma_broadcast,
+            // gy_gamma[f][b] = grad_output[f][b] * gamma[f]（按行广播乘法）
+            Matrix gy_gamma = grad_output;
+            gy_gamma.broadcast_row_inplace(gamma_,
                 [](Scalar gy, Scalar g) noexcept { return gy * g; });
 
-            // grad_gamma[f] = Σ_b gy_gamma[f][b] * normalized[f][b]  （按行归约）
-            Matrix gg = gy_gamma.binary_apply(normalized_cache_,
-                [](Scalar gy, Scalar n) noexcept { return gy * n; });
-            Matrix grad_gamma_row = gg.row_reduce(Scalar{0},
+            // gy_gamma_norm = gy_gamma ⊙ normalized  (AST 逐元素乘)
+            Matrix gy_gamma_norm(features, batch_size);
+            Span gy = gy_gamma.span();
+            Span n = normalized_cache_.span();
+            Span gn_out = gy_gamma_norm.span();
+            compute::apply(gn_out, gy * n);
+
+            // grad_gamma[f] = Σ_b gy_gamma_norm[f][b]  （按行归约）
+            Matrix grad_gamma_row = gy_gamma_norm.row_reduce(Scalar{0},
                 [](Scalar a, Scalar b) noexcept { return a + b; },
                 [](Scalar x) noexcept { return x; });
 
@@ -343,7 +349,6 @@ namespace nn
                 [](Scalar a, Scalar b) noexcept { return a + b; },
                 [](Scalar x) noexcept { return x; });
 
-            // 累加到 grad_gamma_ / grad_beta_
             grad_gamma_.add_inplace(grad_gamma_row);
             grad_beta_.add_inplace(grad_beta_row);
 
@@ -351,36 +356,37 @@ namespace nn
             Matrix mean_g = gy_gamma.col_reduce(Scalar{0},
                 [](Scalar a, Scalar b) noexcept { return a + b; },
                 [](Scalar x) noexcept { return x; });
-            mean_g.scale_inplace(Scalar{1} / static_cast<Scalar>(features));
+            mean_g.scale_inplace(inv_features);
 
-            // mean_gn[b] = (1/features) * Σ_f gy_gamma[f][b] * normalized[f][b]  （按列归约）
-            Matrix mean_gn = gy_gamma.binary_apply(normalized_cache_,
-                [](Scalar gy, Scalar n) noexcept { return gy * n; }).col_reduce(Scalar{0},
+            // mean_gn[b] = (1/features) * Σ_f gy_gamma_norm[f][b]  （按列归约）
+            Matrix mean_gn = gy_gamma_norm.col_reduce(Scalar{0},
                 [](Scalar a, Scalar b) noexcept { return a + b; },
                 [](Scalar x) noexcept { return x; });
-            mean_gn.scale_inplace(Scalar{1} / static_cast<Scalar>(features));
-
-            // 广播 mean_g, mean_gn 到 (features, batch_size)
-            Matrix mean_g_bc(features, batch_size);
-            Matrix mean_gn_bc(features, batch_size);
-            Matrix std_inv_bc(features, batch_size);
-            for (std::size_t f = 0; f < features; ++f) {
-                for (std::size_t b = 0; b < batch_size; ++b) {
-                    mean_g_bc.set_value_unchecked(f, b, mean_g.at_unchecked(0, b));
-                    mean_gn_bc.set_value_unchecked(f, b, mean_gn.at_unchecked(0, b));
-                    std_inv_bc.set_value_unchecked(f, b, std_cache_.at_unchecked(0, b));
-                }
-            }
+            mean_gn.scale_inplace(inv_features);
 
             // grad_input[f][b] = (gy_gamma[f][b] - mean_g[b] - normalized[f][b] * mean_gn[b]) * std_inv[b]
-            Matrix t1 = gy_gamma.binary_apply(mean_g_bc,
+            // 步骤1: t1 = gy_gamma - mean_g（按列广播减法）
+            Matrix t1 = gy_gamma;
+            t1.broadcast_col_inplace(mean_g,
                 [](Scalar gy, Scalar m) noexcept { return gy - m; });
-            Matrix t2 = normalized_cache_.binary_apply(mean_gn_bc,
+
+            // 步骤2: t2 = normalized * mean_gn（按列广播乘法）
+            Matrix t2 = normalized_cache_;
+            t2.broadcast_col_inplace(mean_gn,
                 [](Scalar n, Scalar m) noexcept { return n * m; });
-            Matrix diff = t1.binary_apply(t2,
-                [](Scalar a, Scalar b) noexcept { return a - b; });
-            return diff.binary_apply(std_inv_bc,
+
+            // 步骤3: diff = t1 - t2  (AST 逐元素减)
+            Matrix diff(features, batch_size);
+            Span t1_s = t1.span();
+            Span t2_s = t2.span();
+            Span d_out = diff.span();
+            compute::apply(d_out, t1_s - t2_s);
+
+            // 步骤4: grad_input = diff * std_inv（按列广播乘法）
+            Matrix grad_input = diff;
+            grad_input.broadcast_col_inplace(std_cache_,
                 [](Scalar d, Scalar s) noexcept { return d * s; });
+            return grad_input;
         }
     };
 
@@ -402,7 +408,7 @@ namespace nn
         // 算法步骤：
         //   1. row_max[r] = max_c input[r][c]               （按行归约）
         //   2. shifted[r][c] = input[r][c] - row_max[r]      （按行广播减法）
-        //   3. exp_shifted[r][c] = exp(shifted[r][c])        （逐元素 apply）
+        //   3. exp_shifted[r][c] = exp(shifted[r][c])        （AST: exp(span)）
         //   4. row_sum[r] = sum_c exp_shifted[r][c]          （按行归约）
         //   5. output[r][c] = exp_shifted[r][c] / row_sum[r] （按行广播除法）
         Result<Matrix> forward(const Matrix &input) override
@@ -418,9 +424,11 @@ namespace nn
             shifted.broadcast_row_inplace(row_max,
                 [](Scalar x, Scalar m) noexcept { return x - m; });
 
-            // 3. exp_shifted = exp(shifted)
-            Matrix exp_shifted = shifted.apply(
-                [](Scalar x) noexcept { return std::exp(x); });
+            // 3. exp_shifted = exp(shifted)  (AST 逐元素 exp)
+            Matrix exp_shifted(shifted.rows(), shifted.cols());
+            Span sh = shifted.span();
+            Span es_out = exp_shifted.span();
+            compute::apply(es_out, exp(sh));
 
             // 4. 求每行 exp 之和
             Matrix row_sum = exp_shifted.row_reduce(Scalar{0},
@@ -446,9 +454,14 @@ namespace nn
             if (grad_output.rows() != rows || grad_output.cols() != cols)
                 return std::unexpected(Error{"softmax backward shape mismatch"});
 
-            // dot[r] = Σ_c out[r][c] * grad_output[r][c]
-            Matrix elementwise_product = output_cache_.binary_apply(grad_output,
-                [](Scalar o, Scalar g) noexcept { return o * g; });
+            // elementwise_product = out ⊙ grad_output  (AST 逐元素乘)
+            Matrix elementwise_product(rows, cols);
+            Span o = output_cache_.span();
+            ConstSpan g = grad_output.span();
+            Span ep_out = elementwise_product.span();
+            compute::apply(ep_out, o * g);
+
+            // dot[r] = Σ_c elementwise_product[r][c]
             Matrix dot = elementwise_product.row_reduce(Scalar{0},
                 [](Scalar a, Scalar b) noexcept { return a + b; },
                 [](Scalar x) noexcept { return x; });
@@ -458,8 +471,14 @@ namespace nn
             Matrix go_minus_dot = grad_output;
             go_minus_dot.broadcast_row_inplace(dot,
                 [](Scalar g, Scalar d) noexcept { return g - d; });
-            return output_cache_.binary_apply(go_minus_dot,
-                [](Scalar o, Scalar g) noexcept { return o * g; });
+
+            // grad_input = out ⊙ go_minus_dot  (AST 逐元素乘)
+            Matrix grad_input(rows, cols);
+            Span o2 = output_cache_.span();
+            Span gmd = go_minus_dot.span();
+            Span gi_out = grad_input.span();
+            compute::apply(gi_out, o2 * gmd);
+            return grad_input;
         }
     };
 
@@ -546,7 +565,7 @@ namespace nn
               w_o_(d_model, d_model)
         {
             if (d_model % num_heads != 0)
-                assert(false && "MultiHeadAttention: d_model must be divisible by num_heads"); // NOLINT
+                NN_ASSERT(false, "MultiHeadAttention: d_model must be divisible by num_heads");
         }
 
         std::vector<std::reference_wrapper<Matrix>> parameters() override
@@ -678,22 +697,29 @@ namespace nn
                 VhT.multiply_to(grad_A_buf_, grad_O_h_buf_);
 
                 // grad_S_h = A_h ⊙ (grad_A_h - row_sum(A_h ⊙ grad_A_h))
+                // 通过 AST + Matrix 原语表达：
+                //   1. ep = A ⊙ grad_A                (AST 逐元素乘)
+                //   2. dot[r] = Σ_c ep[r][c]          (按行归约)
+                //   3. gmd = grad_A - dot             (按行广播减)
+                //   4. grad_S = A ⊙ gmd              (AST 逐元素乘)
                 grad_scores_buf_.resize(seq_len, seq_len);
-                {
-                    const auto a_span = A_h.span();
-                    const auto ga_span = grad_A_buf_.span();
-                    auto gs_span = grad_scores_buf_.span();
+                Matrix ep(seq_len, seq_len);
+                ConstSpan a_s = A_h.span();
+                Span ga_s = grad_A_buf_.span();
+                Span ep_s = ep.span();
+                compute::apply(ep_s, a_s * ga_s);
 
-                    for (std::size_t i = 0; i < seq_len; ++i)
-                    {
-                        Scalar dot = 0.0;
-                        for (std::size_t j = 0; j < seq_len; ++j)
-                            dot += a_span[i * seq_len + j] * ga_span[i * seq_len + j];
-                        for (std::size_t j = 0; j < seq_len; ++j)
-                            gs_span[i * seq_len + j] =
-                                a_span[i * seq_len + j] * (ga_span[i * seq_len + j] - dot);
-                    }
-                }
+                Matrix dot = ep.row_reduce(Scalar{0},
+                    [](Scalar x, Scalar y) noexcept { return x + y; },
+                    [](Scalar x) noexcept { return x; });
+
+                Matrix gmd = grad_A_buf_;
+                gmd.broadcast_row_inplace(dot,
+                    [](Scalar ga, Scalar d) noexcept { return ga - d; });
+
+                Span gmd_s = gmd.span();
+                Span gs_s = grad_scores_buf_.span();
+                compute::apply(gs_s, a_s * gmd_s);
 
                 // grad_Q_h = K_h @ grad_S_h^T * scale → (d_k_, seq_len)
                 Matrix gsT = grad_scores_buf_.transpose();
@@ -1133,7 +1159,7 @@ namespace nn
               projection_(patch_dim_, d_model)
         {
             if (img_size % patch_size != 0)
-                assert(false && "PatchEmbedding: img_size must be divisible by patch_size"); // NOLINT
+                NN_ASSERT(false, "PatchEmbedding: img_size must be divisible by patch_size");
         }
 
         [[nodiscard]] std::size_t num_patches() const noexcept { return num_patches_; }
@@ -1328,7 +1354,7 @@ namespace nn
               mask_data_(max_len * max_len, 0.0)
         {
             if (d_model % num_heads != 0)
-                assert(false && "CausalSelfAttention: d_model must be divisible by num_heads"); // NOLINT
+                NN_ASSERT(false, "CausalSelfAttention: d_model must be divisible by num_heads");
 
             // 预计算因果掩码: mask[i][j] = 0 if j <= i else -inf
             const Scalar neg_inf = -1e30;
@@ -1400,13 +1426,11 @@ namespace nn
                 attn_[h].resize(seq_len, seq_len);
                 QhT.multiply_to(attn_[h], K_heads_[h]);
 
-                // 施加因果掩码
+                // 施加因果掩码 (AST 逐元素加: a += m)
                 {
-                    auto a_span = attn_[h].span();
-                    const auto m_span = std::span<const Scalar>(mask_data_);
-                    const std::size_t s2 = seq_len * seq_len;
-                    for (std::size_t idx = 0; idx < s2; ++idx)
-                        a_span[idx] += m_span[idx];
+                    Span a_s = attn_[h].span();
+                    Span m_s(mask_data_.data(), seq_len * seq_len);
+                    compute::apply(a_s, a_s + m_s);
                 }
 
                 // 缩放
@@ -1471,22 +1495,29 @@ namespace nn
                 VhT.multiply_to(grad_A_buf_, grad_O_h_buf_);
 
                 // grad_S_h = A_h ⊙ (grad_A_h - row_sum(A_h ⊙ grad_A_h))
+                // 通过 AST + Matrix 原语表达（与 MHA.backward 相同算法）：
+                //   1. ep = A ⊙ grad_A                (AST 逐元素乘)
+                //   2. dot[r] = Σ_c ep[r][c]          (按行归约)
+                //   3. gmd = grad_A - dot             (按行广播减)
+                //   4. grad_S = A ⊙ gmd              (AST 逐元素乘)
                 grad_scores_buf_.resize(seq_len, seq_len);
-                {
-                    const auto a_span = A_h.span();
-                    const auto ga_span = grad_A_buf_.span();
-                    auto gs_span = grad_scores_buf_.span();
+                Matrix ep(seq_len, seq_len);
+                ConstSpan a_s = A_h.span();
+                Span ga_s = grad_A_buf_.span();
+                Span ep_s = ep.span();
+                compute::apply(ep_s, a_s * ga_s);
 
-                    for (std::size_t i = 0; i < seq_len; ++i)
-                    {
-                        Scalar dot = 0.0;
-                        for (std::size_t j = 0; j < seq_len; ++j)
-                            dot += a_span[i * seq_len + j] * ga_span[i * seq_len + j];
-                        for (std::size_t j = 0; j < seq_len; ++j)
-                            gs_span[i * seq_len + j] =
-                                a_span[i * seq_len + j] * (ga_span[i * seq_len + j] - dot);
-                    }
-                }
+                Matrix dot = ep.row_reduce(Scalar{0},
+                    [](Scalar x, Scalar y) noexcept { return x + y; },
+                    [](Scalar x) noexcept { return x; });
+
+                Matrix gmd = grad_A_buf_;
+                gmd.broadcast_row_inplace(dot,
+                    [](Scalar ga, Scalar d) noexcept { return ga - d; });
+
+                Span gmd_s = gmd.span();
+                Span gs_s = grad_scores_buf_.span();
+                compute::apply(gs_s, a_s * gmd_s);
 
                 // grad_Q_h = K_h @ grad_S_h^T * scale
                 Matrix gsT = grad_scores_buf_.transpose();

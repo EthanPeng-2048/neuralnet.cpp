@@ -8,6 +8,9 @@
 #include <vector>
 
 #include "algebra/matrix.hpp"
+#include "algebra/span.hpp"
+#include "algebra/expr.hpp"
+#include "algebra/compute_dispatch.hpp"
 
 namespace nn
 {
@@ -21,7 +24,7 @@ namespace nn
     };
 
     // ── SGD: p -= lr * g ───────────────────────────────────────────────
-    // 用 Matrix::binary_apply_inplace 通用接口表达更新公式
+    // 通过 AST 入口 compute::apply 表达更新公式，底层自动并行
     class SGD : public Optimizer
     {
     private:
@@ -45,8 +48,10 @@ namespace nn
             {
                 Matrix &p = params_[i].get();
                 const Matrix &g = grads_[i].get();
-                p.binary_apply_inplace(g,
-                    [lr](Scalar pv, Scalar gv) noexcept { return pv - lr * gv; });
+                // p -= lr * g  (AST 逐元素表达式)
+                Span p_s = p.span();
+                ConstSpan g_s = g.span();
+                compute::apply(p_s, p_s - lr * g_s);
             }
             return {};
         }
@@ -61,6 +66,7 @@ namespace nn
     // ── SGD+Momentum ──────────────────────────────────────────────────
     //   v = β * v + (1 - β) * g
     //   p -= lr * v
+    // 通过 AST 入口 compute::apply 表达更新公式
     class SGDWithMomentum : public Optimizer
     {
     private:
@@ -97,14 +103,17 @@ namespace nn
                 Matrix &p = params_[i].get();
                 const Matrix &g = grads_[i].get();
                 Matrix &v = velocities_[i];
-                // v = β * v + (1 - β) * g
-                v.binary_apply_inplace(g,
-                    [beta, one_minus_beta](Scalar vv, Scalar gv) noexcept {
-                        return beta * vv + one_minus_beta * gv;
-                    });
-                // p -= lr * v
-                p.binary_apply_inplace(v,
-                    [lr](Scalar pv, Scalar vv) noexcept { return pv - lr * vv; });
+
+                // v = β * v + (1 - β) * g  (AST 逐元素表达式)
+                Span v_s = v.span();
+                ConstSpan g_s = g.span();
+                compute::apply(v_s, beta * v_s + one_minus_beta * g_s);
+
+                // p -= lr * v  (AST 逐元素表达式)
+                // 注：v_s 在上一步 compute::apply 后已写入最新值，
+                //     在本表达式中作为只读 AST 叶子参与求值（就地操作语义安全）。
+                Span p_s = p.span();
+                compute::apply(p_s, p_s - lr * v_s);
             }
             return {};
         }
@@ -121,7 +130,10 @@ namespace nn
     //   v = β₂ * v + (1 - β₂) * g²
     //   p -= lr * (m / (1 - β₁ᵗ)) / (sqrt(v / (1 - β₂ᵗ)) + ε)
     //
-    // 仅使用 Matrix 通用接口（apply / binary_apply_inplace）
+    // 通过 AST 入口 compute::apply 表达更新公式：
+    //   - m/v 用 AST 就地更新（两个 compute::apply）
+    //   - 参数更新将 m_hat/v_hat/denom/update 四步合一为单一 AST 表达式
+    //     （消除 3 次中间 Matrix 临时对象分配）
     class Adam : public Optimizer
     {
     private:
@@ -177,32 +189,23 @@ namespace nn
                 Matrix &m = m_[i];
                 Matrix &v = v_[i];
 
-                // m = β₁ * m + (1 - β₁) * g
-                m.binary_apply_inplace(g,
-                    [beta1, one_minus_beta1](Scalar mv, Scalar gv) noexcept {
-                        return beta1 * mv + one_minus_beta1 * gv;
-                    });
+                // m = β₁ * m + (1 - β₁) * g  (AST 逐元素表达式)
+                Span m_s = m.span();
+                ConstSpan g_s = g.span();
+                compute::apply(m_s, beta1 * m_s + one_minus_beta1 * g_s);
 
-                // v = β₂ * v + (1 - β₂) * g²
-                v.binary_apply_inplace(g,
-                    [beta2, one_minus_beta2](Scalar vv, Scalar gv) noexcept {
-                        return beta2 * vv + one_minus_beta2 * gv * gv;
-                    });
+                // v = β₂ * v + (1 - β₂) * g²  (AST 逐元素表达式)
+                Span v_s = v.span();
+                compute::apply(v_s, beta2 * v_s + one_minus_beta2 * g_s * g_s);
 
                 // p -= lr * (m / bc1) / (sqrt(v / bc2) + eps)
-                //   = lr * m_hat / (sqrt(v_hat) + eps)
-                // 拆成三步用 Matrix 通用接口表达（binary_apply_inplace 只能同时访问两个矩阵）：
-                //   step1: m_hat = m / bc1
-                //   step2: v_hat = v / bc2; denom = sqrt(v_hat) + eps
-                //   step3: update = lr * m_hat / denom;  p -= update
-                Matrix m_hat = m.apply([bc1](Scalar mv) noexcept { return mv / bc1; });
-                Matrix denom = v.apply([bc2, eps](Scalar vv) noexcept {
-                    return std::sqrt(vv / bc2) + eps;
-                });
-                Matrix update = m_hat.binary_apply(denom,
-                    [lr](Scalar m_val, Scalar d) noexcept { return lr * m_val / d; });
-                p.binary_apply_inplace(update,
-                    [](Scalar pv, Scalar u) noexcept { return pv - u; });
+                // 通过单一 AST 表达式合并 m_hat / v_hat / denom / update 四步，
+                // 消除中间 Matrix 临时对象分配。
+                // 注：m_s/v_s 在上一步 compute::apply 后已写入最新值，
+                //     在本表达式中作为只读 AST 叶子参与求值（就地操作语义安全）。
+                Span p_s = p.span();
+                compute::apply(p_s,
+                    p_s - lr * (m_s / bc1) / (sqrt(v_s / bc2) + eps));
             }
             return {};
         }
