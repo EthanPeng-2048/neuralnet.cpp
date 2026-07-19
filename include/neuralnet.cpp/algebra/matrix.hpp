@@ -42,7 +42,7 @@ namespace nn
         {
             if (lhs.rows_ != rhs.rows_ || lhs.cols_ != rhs.cols_)
             {
-                assert(false && message.data()); // NOLINT
+                NN_ASSERT(false, message.data());
             }
         }
 
@@ -122,7 +122,7 @@ namespace nn
         {
             if (row >= rows_ || col >= cols_)
             {
-                assert(false && "Matrix index out of range");
+                NN_ASSERT(false, "Matrix index out of range");
             }
             return data_[index(row, col)];
         }
@@ -130,7 +130,7 @@ namespace nn
         {
             if (row >= rows_ || col >= cols_)
             {
-                assert(false && "Matrix index out of range");
+                NN_ASSERT(false, "Matrix index out of range");
             }
             data_[index(row, col)] = value;
         }
@@ -276,7 +276,7 @@ namespace nn
         [[nodiscard]] Matrix operator*(const Matrix &other) const
         {
             if (cols_ != other.rows_)
-                assert(false && "matrix multiplication dimension mismatch"); // NOLINT
+                NN_ASSERT(false, "matrix multiplication dimension mismatch");
             Matrix result(rows_, other.cols_);
             multiply_to(result, other);
             return result;

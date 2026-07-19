@@ -124,6 +124,20 @@ template <Expression Expr>
     return UnaryExpr<Expr, ops::Log>{expr};
 }
 
+/// 平方根：√x
+template <Expression Expr>
+[[nodiscard]] auto sqrt(const Expr &expr)
+{
+    return UnaryExpr<Expr, ops::Sqrt>{expr};
+}
+
+/// 平方根倒数：1/√x —— LayerNorm 标准差倒数专用
+template <Expression Expr>
+[[nodiscard]] auto rsqrt(const Expr &expr)
+{
+    return UnaryExpr<Expr, ops::Rsqrt>{expr};
+}
+
 /// Sigmoid：1 / (1 + e^(-x))
 template <Expression Expr>
 [[nodiscard]] auto sigmoid(const Expr &expr)
@@ -197,6 +211,28 @@ template <BoolExpression Cond, Expression Then, Expression Else>
 [[nodiscard]] constexpr auto select(const Cond &cond, const Then &then_expr, const Else &else_expr)
 {
     return TernaryExpr<Cond, Then, Else>{cond, then_expr, else_expr};
+}
+
+/// select 重载：else 分支为标量
+/// 用法：select(x > Scalar{0}, go, Scalar{0})  // ReLU 反向
+template <BoolExpression Cond, Expression Then>
+[[nodiscard]] constexpr auto select(const Cond &cond, const Then &then_expr, Scalar else_val)
+{
+    return TernaryExpr<Cond, Then, Val>{cond, then_expr, Val{else_val}};
+}
+
+/// select 重载：then 分支为标量
+template <BoolExpression Cond, Expression Else>
+[[nodiscard]] constexpr auto select(const Cond &cond, Scalar then_val, const Else &else_expr)
+{
+    return TernaryExpr<Cond, Val, Else>{cond, Val{then_val}, else_expr};
+}
+
+/// select 重载：then/else 均为标量
+template <BoolExpression Cond>
+[[nodiscard]] constexpr auto select(const Cond &cond, Scalar then_val, Scalar else_val)
+{
+    return TernaryExpr<Cond, Val, Val>{cond, Val{then_val}, Val{else_val}};
 }
 
 // ══════════════════════════════════════════════════════════════════════════
