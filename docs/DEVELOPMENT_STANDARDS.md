@@ -59,7 +59,6 @@ model.train(dataset, config);
 // layer.hpp 中：
 auto m_span = matrix.span();            // 泄露了内部 std::span 视图
 matrix.data().begin();                  // 泄露了内部 std::vector&
-SmartPolicy::for_each(...);             // 上层模块直接调用并行策略
 
 // ✅ 遵循隔离：上层模块只调用 Matrix 暴露的语义化操作
 matrix.apply_relu();                    // Matrix 自己封装逐元素操作
@@ -72,7 +71,6 @@ matrix.add_inplace(other);              // Matrix 自己封装算术操作
 | 规则 | 说明 |
 |------|------|
 | **不穿透接口** | 上层模块不应直接访问下层模块的底层数据结构（如 `.data()`, `.span()`） |
-| **不跨层调用** | Layer/Optimizer 不应直接调用 `SmartPolicy` 或 `global_thread_pool()` |
 | **不假设实现** | 上层模块不应依赖下层模块的内部类型（如假定数据存储在 `std::vector` 中） |
 | **自包含修改** | 修改模块内部实现（如换存储格式、换并行策略），只需修改该模块的头文件 |
 
@@ -83,32 +81,31 @@ matrix.add_inplace(other);              // Matrix 自己封装算术操作
 
 ```cpp
 // ── L1 代数层（matrix.hpp）的职责边界 ──
-// ✅ Matrix 负责：数学运算（矩阵乘、逐元素变换、broadcast add）、GPU 自动分派
-// ❌ Matrix 禁止：定义神经网络算法逻辑（如 forward/backward 流程、损失函数、梯度更新策略）
+// ✅ Matrix 负责：数学运算原语（矩阵乘、逐元素变换、broadcast add、归约）、SmartPolicy 自动并行分派
+// ❌ Matrix 禁止：定义神经网络算法逻辑（如 forward/backward 流程、损失函数、梯度更新策略、
+//                 ReLU/GeLU/Softmax/LayerNorm/CrossEntropy/Adam/SGD 等具体算法）
 
-// ── L2 计算层（layer.hpp）的职责边界 ──
+// ── L2 计算层（layer.hpp / loss.hpp / optimizer.hpp）的职责边界 ──
 // ✅ Layer 负责：神经网络算法逻辑（forward/backward 公式、参数管理、缓存中间结果）
-// ❌ Layer 禁止：直接操作 GPU/线程池/内存（如 flush_gpu_to_cpu、SmartPolicy::for_each、
-//              ensure_gpu、data().begin() 等底层操作）
+// ✅ Layer 可以：组合使用其他 Layer（如 MultiHeadAttention 内部使用 Softmax、FeedForward 内部使用 Linear+GeLU）
+// ✅ Layer 可以：通过 Matrix::span() 取得 Span 后调用 compute::apply(span, expr) 表达逐元素算法
 
-// ── 正确示例：Layer 只调用 Matrix 语义 API ──
-// layer.hpp 中：
-Matrix result = product_buf_;
-result.add_bias_broadcast_inplace(b_);  // ✅ Matrix 内部自动处理 GPU/CPU 分派
+// ── 正确示例：Layer 通过 AST 表达逐元素算法 ──
+// layer.hpp 中 ReLU::forward：
+Span x = result.span();
+compute::apply(x, max(x, Scalar{0}));   // ✅ 直接调用 AST 入口，底层自动并行
 
-// ── 错误示例：Layer 越界操作底层 ──
-// layer.hpp 中：
-product_buf_.flush_gpu_to_cpu();        // ❌ Layer 不应感知 GPU 同步
-product_buf_.ensure_gpu();              // ❌ Layer 不应管理 GPU 资源
-SmartPolicy::for_each(data.begin(), ...); // ❌ Layer 不应直接调用并行策略
+// ── 正确示例：Layer 之间组合 ──
+// layer.hpp 中 MultiHeadAttention::forward：
+auto sm_res = softmax_.forward(attn_[h]);  // ✅ Layer 调用 Layer
 ```
 
 | 规则 | 说明 |
 |------|------|
-| **Matrix 不写算法** | Matrix 提供纯数学运算原语，不包含神经网络的前向/反向传播逻辑 |
-| **Layer 不写底层计算** | Layer 通过 Matrix 语义 API 表达算法，不直接操作 GPU、内存、并行策略 |
-| **GPU 对上层透明** | GPU 加速是 L1 层的内部实现细节，L2+ 层通过 Matrix API 间接享受加速 |
-| **自动资源管理** | GPU 上传/下载/同步由 Matrix 内部自动完成（如 `ensure_gpu()`、`const span()`），上层无需手动调用 |
+| **Matrix 不写算法** | Matrix 提供纯数学运算原语，不包含神经网络的前向/反向传播逻辑、激活函数、损失函数、优化器等具体算法 |
+| **Layer 表达算法** | Layer 通过 Matrix 语义 API 或 `compute::apply(span, expr)` 表达算法 |
+| **Layer 可组合** | Layer 可以包含并调用其他 Layer（如 Attention 内部使用 Softmax） |
+| **并行对上层透明** | 并行策略是 SmartPolicy 的内部实现细节，上层通过 Matrix API 或 compute::apply 间接享受并行加速 |
 
 ---
 
@@ -207,7 +204,7 @@ void multiply_to(Matrix& result, const Matrix& other) const {
 
 > 本章节是「核心原则 5. 模块隔离与最小化依赖」的具体化规则，**必须严格遵守**。
 
-### 1. 隔离总则
+### 1. 模块架构
 
 ```mermaid
 graph TB
@@ -230,11 +227,11 @@ graph TB
     end
     subgraph "L1 代数层"
         MAT["matrix.hpp"]
+        ALG["algebra/ (expr/ops/span/compute_dispatch)"]
     end
     subgraph "L0 硬件层"
         CFG["nn_config.hpp"]
         TP["thread_pool.hpp"]
-        VK["vk_backend.hpp"]
     end
 
     SRC -->|"构建/训练/推理"| GPT & MNIST
@@ -243,152 +240,143 @@ graph TB
     GPT & MNIST -->|"ModelSpec"| MS
     MDL -->|"Layer::forward()"| LAY
     IO --> MDL & MS
-    LAY -->|"Matrix API"| MAT
+    LAY -->|"Matrix API / compute::apply"| MAT & ALG
     LOSS -->|"Matrix API"| MAT
     OPT -->|"Matrix API"| MAT
     MAT -->|"SmartPolicy"| CFG
-    MAT -->|"GpuBackend"| VK
+    ALG -->|"SmartPolicy::for_each"| CFG
     CFG --> TP
 ```
 
-**规则：L(N) 只能调用 L(N-1) 的 API，禁止同层调用和跨层调用。**
+| 层级 | 文件 | 职责 |
+|------|------|------|
+| **L5 交互层** | `src/*.cpp` | 用户入口 |
+| **L4 构建层** | `gpt_common.hpp`, `mnist_common.hpp` | 模型工厂（组装层为模型） |
+| **L3 实现层** | `model.hpp`, `model_spec.hpp`, `model_io.hpp` | 模型容器 + 序列化 |
+| **L2 计算层** | `layer.hpp`, `loss.hpp`, `optimizer.hpp` | 层/损失/优化器定义（**算法所在层**） |
+| **L1 代数层** | `matrix.hpp`, `algebra/*` | 矩阵运算原语 + AST 表达式模板（**不含任何算法**） |
+| **L0 硬件层** | `nn_config.hpp`, `thread_pool.hpp` | 并行策略 |
 
-| 层级 | 文件 | 职责 | 只能调用 |
-|------|------|------|----------|
-| **L5 交互层** | `src/*.cpp` | 用户入口 | L4 构建 API, L3 Model API |
-| **L4 构建层** | `gpt_common.hpp`, `mnist_common.hpp` | 模型工厂（组装层为模型） | L3 `Model::add_*()` 非模板 API |
-| **L3 实现层** | `model.hpp`, `model_spec.hpp`, `model_io.hpp` | 模型容器 + 序列化 | L2 Layer::forward/backward |
-| **L2 计算层** | `layer.hpp`, `loss.hpp`, `optimizer.hpp` | 层/损失/优化器定义 | L1 Matrix 语义化 API |
-| **L1 代数层** | `matrix.hpp` | 矩阵运算（内部自动 GPU 分派） | L0 SmartPolicy, GpuBackend |
-| **L0 硬件层** | `nn_config.hpp`, `thread_pool.hpp`, `vk_backend.hpp` | 并行策略 + GPU 后端 | 无（最底层） |
+> 层级仅供参考，不强制限制调用方向。**唯一硬约束：Matrix 不得包含任何神经网络算法**（ReLU/GeLU/Softmax/LayerNorm/CrossEntropy/Adam/SGD 等必须放在 L2 计算层）。
 
 ### 2. 禁止的反模式
 
 #### 2.1 上层直接操作底层数据结构
 
 ```cpp
-// ❌ 禁止：Layer 直接获取 Matrix 的底层 vector 并迭代
-// optimizer.hpp 当前写法：
+// ❌ 禁止：Optimizer 直接获取 Matrix 的底层 vector 并迭代
 auto &p_vec = p.data();       // 泄露 std::vector<Scalar>&！
 auto &g_vec = g.data();
 SmartPolicy::for_each(zip_view.begin(), zip_view.end(), [...]);
 
-// ✅ 正确：Matrix 自己提供语义化操作，内部自行决定串行/并行
-//    Optimizer 只调用：
-matrix.axpy(-lr, grad);       // p = p - lr * g
-//    或更抽象的：
-optimizer->apply_update(param, grad);  // 内部调用 matrix 的批量操作
+// ✅ 正确：通过 Matrix 语义化操作（apply / binary_apply_inplace）表达算法
+p.binary_apply_inplace(g,
+    [lr](Scalar pv, Scalar gv) noexcept { return pv - lr * gv; });
 ```
 
-#### 2.2 上层直接调用并行策略
+#### 2.2 Matrix 中写入神经网络算法
 
 ```cpp
-// ❌ 禁止：Layer 中直接判断阈值并调用 SmartPolicy
-// layer.hpp 当前写法（ReLU）：
-if (n >= SmartPolicy::PARALLEL_THRESHOLD) {
-    SmartPolicy::for_each(indices.begin(), indices.end(), [...]);
-} else {
-    for (std::size_t i = 0; i < n; ++i) [...]
-}
+// ❌ 禁止：Matrix 内部定义 ReLU/GeLU/Softmax 等算法
+class Matrix {
+    void relu_inplace() { /* ... */ }              // 算法不应在 Matrix
+    void adam_update(/*...*/) { /* ... */ }        // 算法不应在 Matrix
+    static void softmax_rows(/*...*/) { /* ... */ } // 算法不应在 Matrix
+};
 
-// ✅ 正确：Matrix 封装逐元素操作，内部处理并行/串行决策
-Matrix result = input.apply([](Scalar x) noexcept { return std::max(x, 0.0); });
+// ✅ 正确：Matrix 只提供通用数学原语，算法在 Layer / Optimizer / Loss 中表达
+// layer.hpp 中 ReLU::forward：
+Span x = result.span();
+compute::apply(x, max(x, Scalar{0}));
+
+// optimizer.hpp 中 SGD::step：
+p.binary_apply_inplace(g,
+    [lr](Scalar pv, Scalar gv) noexcept { return pv - lr * gv; });
 ```
 
-#### 2.3 跨层直接访问全局线程池
+### 3. 推荐的接口设计
 
-```cpp
-// ❌ 禁止：Matrix 内部绕过 SmartPolicy 直接调 global_thread_pool()
-// matrix.hpp 当前写法（multiply_to、transpose_to 中）：
-global_thread_pool().parallel_for_blocks(...);
-
-// ✅ 正确：通过 SmartPolicy 间接调用，SmartPolicy 是并行策略的唯一入口
-//    如果将来换用 TBB/OpenMP，只改 SmartPolicy 和 ThreadPool 即可
-SmartPolicy::parallel_for_blocks(...);
-```
-
-### 3. 正确的接口分层设计
-
-#### 3.1 Matrix 应暴露的语义化操作（而非裸数据访问）
+#### 3.1 Matrix 暴露的通用数学原语
 
 ```cpp
 class Matrix {
 public:
-    // ── 逐元素变换（替代上层手动 for_each + span） ──
-    template <typename F>
-    [[nodiscard]] Matrix apply(F&& func) const;        // out[i] = func(in[i])
-    
-    template <typename F>
-    void apply_inplace(F&& func);                      // in[i] = func(in[i])
-    
-    template <typename F>
-    [[nodiscard]] Matrix binary_apply(const Matrix& other, F&& func) const;  // out[i] = func(a[i], b[i])
-    
-    template <typename F>
-    void binary_apply_inplace(const Matrix& other, F&& func);
+    // ── 逐元素变换 ──
+    template <typename F> [[nodiscard]] Matrix apply(F&& func) const;
+    template <typename F> [[nodiscard]] Matrix binary_apply(const Matrix& other, F&& func) const;
+    template <typename F> void binary_apply_inplace(const Matrix& other, F&& func);
 
-    // ── 归约操作（替代上层手动 transform_reduce） ──
-    template <typename F, typename T>
-    [[nodiscard]] T reduce(T init, F&& func) const;   // 对标 transform_reduce
+    // ── 归约原语 ──
+    template <typename T, typename R, typename F> [[nodiscard]] T reduce(T init, R&&, F&&) const;
+    template <typename T, typename R, typename F> [[nodiscard]] Matrix row_reduce(T init, R&&, F&&) const;
+    template <typename T, typename R, typename F> [[nodiscard]] Matrix col_reduce(T init, R&&, F&&) const;
 
-    // ── 批量线性代数操作（替代上层手动遍历参数矩阵） ──
-    static void batch_axpy(Scalar alpha,
-                           std::span<std::reference_wrapper<Matrix>> params,
-                           std::span<std::reference_wrapper<Matrix>> grads);
+    // ── 广播原语 ──
+    template <typename F> void broadcast_row_inplace(const Matrix& row_vec, F&& op);
+    template <typename F> void broadcast_col_inplace(const Matrix& col_vec, F&& op);
+    void add_bias_broadcast_inplace(const Matrix& bias);
+
+    // ── Span 视图（供 compute::apply 使用） ──
+    std::span<Scalar> span() noexcept;
+    std::span<const Scalar> span() const;
 };
 ```
 
-#### 3.2 Layer 应该通过 Matrix 语义接口实现
+#### 3.2 Layer 通过 AST 表达逐元素算法
 
 ```cpp
-// ✅ Layer 只需调用 Matrix 的语义操作，不感知底层存储和并行策略
+// ✅ ReLU::forward 通过 AST 入口
 Result<Matrix> ReLU::forward(const Matrix& input) override {
     input_cache_ = input;
-    return input.apply([](Scalar x) noexcept { return x > 0 ? x : 0; });
+    Matrix result = input;
+    Span x = result.span();
+    compute::apply(x, max(x, Scalar{0}));
+    return result;
 }
 ```
 
-#### 3.3 Optimizer 应该调用 Matrix 的批量操作
+#### 3.3 Layer 之间可自由组合
 
 ```cpp
-// ✅ Optimizer 不再逐个参数矩阵手动迭代 .data()
-Result<void> Adam::step() override {
-    ++t_;
-    // 批量操作：一次调用处理所有参数矩阵，内部并行
-    Matrix::batch_adam_update(params_, grads_, m_, v_, lr_, beta1_, beta2_, eps_, t_);
-    return {};
-}
+// ✅ MultiHeadAttention 内部使用 Softmax Layer
+class MultiHeadAttention : public Layer {
+    Softmax softmax_;  // 组合其他 Layer
+    // ...
+    auto sm_res = softmax_.forward(attn_[h]);
+};
+
+// ✅ FeedForward 组合 Linear + GeLU
+class FeedForward : public Layer {
+    Linear fc1_;
+    Linear fc2_;
+    GeLU  activation_;
+    // ...
+};
 ```
 
-### 4. 隔离性自检清单
+#### 3.4 Optimizer 通过 Matrix 通用接口表达更新公式
+
+```cpp
+// ✅ Adam::step 通过 binary_apply_inplace 表达
+m.binary_apply_inplace(g,
+    [beta1, one_minus_beta1](Scalar mv, Scalar gv) noexcept {
+        return beta1 * mv + one_minus_beta1 * gv;
+    });
+```
+
+### 4. 模块化自检清单
 
 修改以下模块时，受影响的文件应**不超过 2 个**：
 
-| 修改场景 | ✅ 预期只改 | ❌ 当前实际需要改 |
-|----------|-------------|------------------|
-| Matrix 换存储格式（如 `vector` → 自定义 allocator） | `matrix.hpp` | `matrix.hpp` + `layer.hpp` + `optimizer.hpp` + `loss.hpp` + `model_io.hpp` |
-| SmartPolicy 换并行策略（如线程池 → TBB） | `nn_config.hpp` | `nn_config.hpp` + `layer.hpp` + `optimizer.hpp` + `loss.hpp` + `matrix.hpp` |
-| ThreadPool 换调度算法 | `thread_pool.hpp` | `thread_pool.hpp` + `matrix.hpp`（直接调了 `parallel_for_blocks`） |
-| Vulkan → OpenCL 换 GPU 后端 | `vk_backend.hpp` | `vk_backend.hpp` + `matrix.hpp`（通过 GpuBackend 接口） |
-| Layer 新增一种激活函数 | `layer.hpp` | `layer.hpp` ✅ 已满足 |
-| Optimizer 新增一种优化器 | `optimizer.hpp` | `optimizer.hpp` ✅ 已满足 |
-| 新增一种模型架构（如 LLaMA） | 新增 `llama_common.hpp` (L4) | 新增一个文件 ✅ |
-| 修改 GPT 超参数默认值 | `gpt_common.hpp` | `gpt_common.hpp` ✅ |
-| 修改 MNIST 数据集路径 | `mnist_common.hpp` | `mnist_common.hpp` ✅ |
-
-### 5. 迁移路线图
-
-当前项目存在大量跨层穿透调用，需逐步重构：
-
-| 阶段 | 内容 | 影响范围 |
-|------|------|----------|
-| **Phase 1** | Matrix 新增 `apply()` / `apply_inplace()` / `binary_apply()` 等语义化方法 | `matrix.hpp` ✅ 已完成 |
-| **Phase 2** | Layer（ReLU/GeLU/LayerNorm/Softmax）改用 Matrix 语义方法，删除直接 SmartPolicy 调用 | `layer.hpp` |
-| **Phase 3** | Optimizer（SGD/Adam）改用 Matrix 批量操作，删除 `.data()` 穿透 | `optimizer.hpp` |
-| **Phase 4** | Loss（MSELoss/CrossEntropyLoss）改用 Matrix 语义方法 | `loss.hpp` |
-| **Phase 5** | Matrix 内部不再直接调 `global_thread_pool()`，统一经 SmartPolicy | `matrix.hpp` |
-| **Phase 6** | GPU 后端隔离：vk_backend.hpp 自包含，Matrix 内部管理 GPU 驻留，上层无感 | `vk_backend.hpp`, `matrix.hpp` |
-| **Phase 7** | 构建层分离：gpt_common/mnist_common 明确为 L4 构建层，文档更新 | `DEVELOPMENT_STANDARDS.md`, `ARCHITECTURE.md` ✅ |
+| 修改场景 | 预期只改 | 当前状态 |
+|----------|----------|----------|
+| Matrix 换存储格式（如 `vector` → 自定义 allocator） | `matrix.hpp` | ✅ 已满足（上层只通过 `span()` / 语义 API 访问） |
+| SmartPolicy 换并行策略（如线程池 → TBB） | `nn_config.hpp` | ✅ 已满足（上层不直接调 SmartPolicy） |
+| Layer 新增一种激活函数 | `layer.hpp` | ✅ 已满足 |
+| Optimizer 新增一种优化器 | `optimizer.hpp` | ✅ 已满足 |
+| 新增一种模型架构 | 新增 `xxx_common.hpp` (L4) | ✅ 已满足 |
+| 修改 GPT 超参数默认值 | `gpt_common.hpp` | ✅ 已满足 |
+| 修改 MNIST 数据集路径 | `mnist_common.hpp` | ✅ 已满足 |
 
 ---
 
@@ -401,11 +389,16 @@ include/neuralnet.cpp/
 │
 │  ┌─ L0 硬件层 ──────────────────────────────────────┐
 ├── nn_config.hpp      # 全局配置、Scalar 类型、SmartPolicy（仅 CPU）
-├── thread_pool.hpp    # 线程池实现
-├── vk_backend.hpp     # Vulkan GPU 后端（纯 float 接口，不依赖上层）
+├── core/thread_pool.hpp    # 线程池实现
+├── core/errors.hpp    # Result<T> = std::expected<T, Error>
+├── core/assert.hpp    # 断言宏
 │
 │  ┌─ L1 代数层 ──────────────────────────────────────┐
-├── matrix.hpp         # 矩阵运算（内部自动 GPU 分派，上层无感）
+├── algebra/matrix.hpp     # 矩阵运算（内部自动并行分派，上层无感）
+├── algebra/expr.hpp       # 表达式模板
+├── algebra/ops.hpp        # 逐元素算子（ReLU/GeLU）
+├── algebra/span.hpp       # Span 抽象
+├── algebra/compute_dispatch.hpp  # 计算分派
 │
 │  ┌─ L2 计算层 ──────────────────────────────────────┐
 ├── layer.hpp          # 层基类和实现（Linear/ReLU/GeLU/GPT...）

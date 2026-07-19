@@ -17,13 +17,17 @@
 // Layer 中：用普通运算符写算法
 Span x = result.span();
 
-compute::apply(x, x > 0);                                    // ReLU
-compute::apply(x, x * (1.0f / (1.0f + exp(-1.702f * x)))); // GeLU
-compute::apply(x, max(x, Scalar{0}));                        // ReLU（另一种写法）
-compute::apply(x, x > 0 ? x : x * 0.01f);                   // LeakyReLU
-compute::apply(x, abs(x));                                    // abs
-compute::apply(x, x * 2.0f + 1.0f);                          // 线性变换
+compute::apply(x, max(x, Scalar{0}));                              // ReLU
+compute::apply(x, x * (Scalar{1} / (Scalar{1} + exp(-Scalar{1.702} * x)))); // QuickGeLU
+compute::apply(x, select(x > Scalar{0}, x, x * Scalar{0.01}));     // LeakyReLU
+compute::apply(x, abs(x));                                          // abs
+compute::apply(x, x * Scalar{2} + Scalar{1});                       // 线性变换
 ```
+
+> ⚠️ `Scalar` 是 [nn_config.hpp](../include/neuralnet.cpp/nn_config.hpp) 定义的标量类型别名（当前为 `float`）。
+> 由于 `compute::apply` 接受 `const Expr&` 形参，字面量必须显式标 `Scalar{...}` 以触发模板运算符重载，
+> 否则 `x > 0` 中的 `0`（int）会与 `Span::operator>(Scalar)` 的重载不匹配。
+> 三元条件需用 `select()`，C++ 无法重载 `?:`。
 
 上层**完全不知道**底下是 CPU 还是 GPU。运算符重载在幕后构建 AST。
 
@@ -200,79 +204,92 @@ inline auto Span::operator*(const Span& other) const {
 
 ## 七、compute::apply — 统一入口
 
+> 注：当前实现位于 [compute_dispatch.hpp](../include/neuralnet.cpp/algebra/compute_dispatch.hpp)，
+> 为自由函数 `nn::compute::apply(Span, const Expr&)`。下面是设计目标（含 GPU 分支预览）。
+
 ```cpp
 // compute_dispatch.hpp
 
-struct ComputeDispatch {
+template <typename Expr>
+void apply(Span x, const Expr &expr) {
+    const auto n = x.size();
+    if (n == 0) return;
 
-    // ── 核心：apply(span, expr) ─────────────────────────────
-    // 编译期判断 expr 是否可转译为 GPU
-    template<typename Expr>
-    static void apply(Span x, Expr expr) {
 #ifdef NN_HAS_VULKAN
-        if constexpr (Expr::has_spv) {        // 编译期：此表达式能生成 SPIR-V？
-            if (SmartPolicy::gpu_enabled) {
-                auto& backend = GpuBackend::instance();
-                if (backend.is_initialized() || backend.initialize()) {
-                    // 编译期生成 SPIR-V，运行时零开销加载
-                    constexpr auto spv = expr.to_spv_module();
-                    auto r = backend.elementwise_from_spv(x, spv);
-                    if (r) return;
-                }
+    if constexpr (Expr::has_spv) {        // 编译期：此表达式能生成 SPIR-V？
+        if (SmartPolicy::gpu_enabled) {
+            auto& backend = GpuBackend::instance();
+            if (backend.is_initialized() || backend.initialize()) {
+                // 编译期生成 SPIR-V，运行时零开销加载
+                consteval auto spv = expr.to_spv_module();
+                if (backend.elementwise_from_spv(x, spv)) return;
             }
         }
-#endif
-        // CPU 路径：直接递归求值
-        SmartPolicy::for_each(x.data(), x.data() + x.size(),
-            [&expr](Scalar& v) mutable {
-                v = expr.eval(&v - x.data());  // 编译器内联，等价手写循环
-            });
     }
-};
+#endif
+
+    // CPU 路径：按索引分发（小数据串行，大数据并行），编译器内联等价手写循环
+    if (n >= SmartPolicy::PARALLEL_THRESHOLD) {
+        auto indices = std::views::iota(std::size_t{0}, n);
+        SmartPolicy::for_each(indices.begin(), indices.end(),
+            [&x, &expr](std::size_t i) noexcept {
+                x[i] = static_cast<Scalar>(expr.eval(i));
+            });
+    } else {
+        for (std::size_t i = 0; i < n; ++i)
+            x[i] = static_cast<Scalar>(expr.eval(i));
+    }
+}
 ```
 
 ## 八、完整的 AST 构建示例
 
-上层写 `x * (1.0 / (1.0 + exp(-1.702 * x)))` 时，编译器构建的类型：
+上层写 `x * (Scalar{1} / (Scalar{1} + exp(Scalar{-1.702} * x)))` 时，编译器构建的类型：
 
 ```
 BinaryExpr<
     Span,                                          // x
     BinaryExpr<
-        Val,                                        // 1.0
+        Val{1.0},                                  // 1.0
         BinaryExpr<
-            Val,                                    // 1.0
+            Val{1.0},                              // 1.0
             UnaryExpr<
-                BinaryExpr<                         // -1.702 * x
-                    Val,                            // -1.702
-                    Span,                           // x
+                BinaryExpr<                        // -1.702 * x
+                    Val{-1.702},                   // -1.702
+                    Span,                          // x
                     ops::Mul
                 >,
-                ops::Neg                            // exp(-1.702 * x)
+                ops::Exp                           // exp(-1.702 * x)
             >,
-            ops::Add                                // 1.0 + exp(...)
+            ops::Add                               // 1.0 + exp(...)
         >,
-        ops::Div                                    // 1.0 / (1.0 + exp(...))
+        ops::Div                                   // 1.0 / (1.0 + exp(...))
     >,
-    ops::Mul                                        // x * (1.0 / (...))
+    ops::Mul                                       // x * (1.0 / (...))
 >
 ```
 
-运行时调用 `expr.to_glsl("data[idx]")` 生成：
-```glsl
-(data[idx] * (1.000000 / (1.000000 + exp(-(data[idx] * -1.702000)))))
-```
-
-编译器优化后等价于：
-```glsl
-(data[idx] * (1.0 / (1.0 + exp(-1.702 * data[idx])))))
-```
-
-## 九、条件表达式（三元运算符）
+运行时调用 `expr.eval(i)` 对每个索引 `i` 求值，编译期内联后等价于：
 
 ```cpp
-// LeakyReLU: x > 0 ? x : x * 0.01
-compute::apply(x, x > 0 ? x : x * 0.01f);
+// 编译器展开后等价的手写循环
+for (std::size_t i = 0; i < n; ++i) {
+    Scalar xv = x[i];
+    data[i] = xv * (1.0f / (1.0f + std::exp(-(-1.702f * xv))));
+}
+```
+
+> ⚠️ 注意：C++ 无法重载 `operator?:`，因此三元条件表达式**不能**直接写成
+> `x > 0 ? x : x * 0.01f`。需要使用 `select()` 自由函数（见 [expr.hpp](../include/neuralnet.cpp/algebra/expr.hpp)）。
+
+## 九、条件表达式（三元选择）
+
+> C++ 不允许重载 `operator?:`，因此 LeakyReLU 不能直接写成 `x > 0 ? x : x * 0.01f`。
+> 提供 `select(cond, then, else)` 自由函数替代（见 [expr.hpp](../include/neuralnet.cpp/algebra/expr.hpp)）。
+
+```cpp
+// LeakyReLU: x > 0 ? x : x * 0.01  —— 用 select() 表达
+compute::apply(x, select(x > Scalar{0}, x, x * 0.01f));
 
 // 编译器构建：
 TernaryExpr<
@@ -281,8 +298,8 @@ TernaryExpr<
     BinaryExpr<Span, Val, ops::Mul>     // x * 0.01
 >
 
-// 生成 GLSL：
-// (data[idx] > 0.0 ? data[idx] : (data[idx] * 0.010000))
+// CPU 求值（编译期内联）：
+// for (i=0..n) data[i] = (data[i] > 0) ? data[i] : (data[i] * 0.01f);
 ```
 
 ## 十、CPU 路径的求值策略
@@ -307,7 +324,7 @@ Layer: compute::apply(span, expr)
   ↓
 ComputeDispatch: Expr::has_spv == true（编译期检查）
   ↓
-constexpr auto spv = expr.to_spv_module()   // 编译期：AST → SPIR-V 二进制
+consteval auto spv = expr.to_spv_module()   // 编译期：AST → SPIR-V 二进制
   ↓
 GpuBackend: vkCreateShaderModule(spv_bytes)  // 运行时：加载二进制，零编译
   ↓
@@ -336,30 +353,24 @@ vkCmdDispatch → GPU 执行
 | 缓存需求 | 需要（避免重复编译） | 不需要 |
 | 首次开销 | ~2ms | 微秒级 |
 
-## 十二、扩展新操作
+## 十三、扩展新操作
 
 ### 添加 exp()
 
-**步骤 1**：在 `ops.hpp` 中定义 Op
+**步骤 1**：在 [ops.hpp](../include/neuralnet.cpp/algebra/ops.hpp) 中定义 Op（CPU `apply` + 可选 SPIR-V 指令）
 ```cpp
 struct Exp {
-    static Scalar apply(Scalar a) { return std::exp(a); }
-    static std::string glsl(const std::string& a) {
-        return "exp(" + a + ")";
-    }
+    [[nodiscard]] static Scalar apply(Scalar a) noexcept { return std::exp(a); }
+    // GPU 路径启用后再添加：
+    // static consteval SpvId spv_op(SpvBuilder& spv, SpvId a) { return spv.glsl_std450_exp(a); }
 };
 ```
 
-**步骤 2**：在 `expr.hpp` 中添加 Span 的成员或自由函数
+**步骤 2**：在 [expr.hpp](../include/neuralnet.cpp/algebra/expr.hpp) 中添加自由函数（与现有 `exp`/`log`/`sigmoid` 等保持一致）
 ```cpp
-// 方式 A：Span 成员函数
-auto exp() const {
-    return UnaryExpr<Span, ops::Exp>{*this};
-}
-
-// 方式 B：自由函数（更自然）
-inline auto exp(Span x) {
-    return UnaryExpr<Span, ops::Exp>{x};
+template <Expression Expr>
+[[nodiscard]] auto exp(const Expr &expr) {
+    return UnaryExpr<Expr, ops::Exp>{expr};
 }
 ```
 
@@ -368,23 +379,25 @@ inline auto exp(Span x) {
 compute::apply(x, exp(x));
 ```
 
-**不需要修改 ComputeDispatch、GpuBackend 或任何底层代码。**
+**不需要修改 `compute_dispatch.hpp` 或 `Matrix`。**
 
-## 十三、局限性
+## 十四、局限性
 
 | 特性 | CPU | GPU |
 |------|-----|-----|
-| 算术运算 (+, -, *, /) | ✅ | ✅ |
-| 比较 (>, <, ==) | ✅ | ✅ |
-| 三元条件 (?:) | ✅ | ✅ |
-| 数学函数 (exp, abs, max, min) | ✅ 需定义 Op | ✅ 需定义 Op 的 SPIR-V 指令 |
+| 算术运算 (+, -, *, /) | ✅ | ✅（待实现） |
+| 比较 (>, <, ==) | ✅ | ✅（待实现） |
+| 三元选择 `select()` | ✅ | ✅（待实现） |
+| 数学函数 (exp, abs, max, min) | ✅ 已定义 Op | ✅ 需补 Op 的 SPIR-V 指令 |
 | 循环/分支逻辑 | ❌ AST 不支持 | ❌ |
 | 函数调用（非数学函数） | ❌ | ❌ |
 | 任意 C++ lambda | ❌ | ❌ |
 
+> ⚠️ C++ 无法重载 `operator?:`，因此"三元条件"通过 `select()` 自由函数实现，不是语言原生运算符。
+
 **神经网络覆盖率**：ReLU, GeLU, SiLU, Softmax(部分), LayerNorm(部分) 等常见激活函数均可表达。覆盖率约 **85-90%** 的逐元素操作。
 
-## 十四、跨平台支持
+## 十五、跨平台支持
 
 SPIR-V 是 Khronos 组织定义的 **GPU 中间表示**，一次生成，到处执行。
 
@@ -399,18 +412,19 @@ SPIR-V 是 Khronos 组织定义的 **GPU 中间表示**，一次生成，到处�
 SPIR-V 二进制在三个平台间**完全共享**，零改动。GPU 驱动直接消费 SPIR-V，
 无需任何平台特定的 shader 编译器。
 
-## 十五、与现有代码的关系
+## 十六、与现有代码的关系
+
+> 本表反映设计目标。当前实现状态：CPU 路径已落地（[algebra/](../include/neuralnet.cpp/algebra/) 下的 `expr.hpp` / `ops.hpp` / `span.hpp` / `compute_dispatch.hpp`），GPU 路径尚未开始。
 
 | 现有组件 | 改动 |
 |---------|------|
-| `nn_config.hpp` (SmartPolicy) | 不变，CPU 并行基础设施复用 |
-| `matrix.hpp` (Matrix) | 不变，数据容器 |
-| `layer.hpp` (Layer) | 改用 `compute::apply(span, expr)` |
-| `compute_dispatch.hpp` | 重写：模板化 `apply(span, Expr)`，SPIR-V 直出 |
-| `vk_backend.hpp` (GpuBackend) | 新增 `elementwise_from_spv(span, spv_bytes)` |
-| `elementwise.comp` | 保留（已知 op 的预编译快速路径） |
-| **新增** `spv_builder.hpp` | SPIR-V 二进制生成器（consteval，编译期） |
-| **新增** `ops.hpp` | Op 策略定义（CPU apply + SPIR-V 指令） |
-| **新增** `expr.hpp` | AST 节点类型系统 |
+| [nn_config.hpp](../include/neuralnet.cpp/nn_config.hpp) (SmartPolicy) | 不变，CPU 并行基础设施复用 |
+| [matrix.hpp](../include/neuralnet.cpp/algebra/matrix.hpp) (Matrix) | 不变，纯数据容器；通过 `span()` 暴露给 AST 入口 |
+| [layer.hpp](../include/neuralnet.cpp/layer.hpp) (Layer) | 直接调用 `compute::apply(span, expr)` 表达 ReLU/GeLU 等逐元素算法 |
+| [compute_dispatch.hpp](../include/neuralnet.cpp/algebra/compute_dispatch.hpp) | 已模板化 `apply(Span, Expr)`；GPU 分支待补 |
+| `vk_backend.hpp` (GpuBackend) | 待新增：`elementwise_from_spv(span, spv_bytes)` |
+| **待新增** `spv_builder.hpp` | SPIR-V 二进制生成器（consteval，编译期） |
+| [ops.hpp](../include/neuralnet.cpp/algebra/ops.hpp) | 已存在：CPU `apply`；待补每个 Op 的 `spv_op` |
+| [expr.hpp](../include/neuralnet.cpp/algebra/expr.hpp) | 已存在：AST 节点类型系统；待补 `to_spv()` / `has_spv` |
 
-预编译 .spv 和动态 GLSL 编译共存，互不干扰。
+> 旧设计中提到的 `elementwise.comp` 预编译快速路径已废弃，统一由 AST → SPIR-V 直出。

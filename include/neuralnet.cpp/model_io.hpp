@@ -108,9 +108,9 @@ inline Result<void> write_matrix(std::ofstream &ofs, const Matrix &m)
         return std::unexpected(r.error());
     if (auto r = write_u64(ofs, static_cast<uint64_t>(m.cols())); !r)
         return std::unexpected(r.error());
-    const auto &data = m.data();
-    ofs.write(reinterpret_cast<const char *>(data.data()),
-              static_cast<std::streamsize>(data.size() * sizeof(Scalar)));
+    const auto s = m.span();
+    ofs.write(reinterpret_cast<const char *>(s.data()),
+              static_cast<std::streamsize>(s.size() * sizeof(Scalar)));
     if (!ofs)
         return std::unexpected(Error{"Write error while writing matrix data"});
     return {};
@@ -133,9 +133,9 @@ inline Result<void> read_matrix(std::ifstream &ifs, Matrix &m)
             + std::to_string(rows) + ", " + std::to_string(cols) + ")"});
     }
 
-    auto &data = m.data();
-    ifs.read(reinterpret_cast<char *>(data.data()),
-             static_cast<std::streamsize>(data.size() * sizeof(Scalar)));
+    auto s = m.span();
+    ifs.read(reinterpret_cast<char *>(s.data()),
+             static_cast<std::streamsize>(s.size() * sizeof(Scalar)));
     if (!ifs)
         return std::unexpected(Error{"Unexpected end of file while reading matrix data"});
     return {};

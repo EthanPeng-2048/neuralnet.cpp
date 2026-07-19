@@ -22,17 +22,33 @@ neuralnet.cpp/
 │   └── neuralnet.cpp/
 │       ├── nn.hpp              ← 统一入口头文件
 │       ├── nn_config.hpp       ← SmartPolicy、BLOCK_SIZE 等配置
-│       ├── thread_pool.hpp     ← 全局线程池
-│       ├── matrix.hpp          ← Matrix 类
-│       ├── layer.hpp           ← Layer 基类 + Linear/ReLU/GeLU/LayerNorm/Softmax/MultiHeadAttention/PositionalEncoding
+│       ├── layer.hpp           ← Layer 基类 + Linear/ReLU/GeLU/LayerNorm/Softmax/MultiHeadAttention/CausalSelfAttention/GPTModel
 │       ├── loss.hpp            ← Loss 基类 + MSELoss/CrossEntropyLoss
-│       ├── optimizer.hpp       ← SGD / SGD_w_Momentum / Adam
+│       ├── optimizer.hpp       ← SGD / SGDWithMomentum / Adam
 │       ├── model.hpp           ← Model 容器（链式 add<>）
 │       ├── model_io.hpp        ← 二进制模型序列化
-│       └── mnist_common.hpp    ← MNIST 常量与 build_mnist_model()
+│       ├── model_spec.hpp      ← ModelSpec 纯数据描述
+│       ├── mnist_common.hpp    ← MNIST 常量与 build_mnist_model()
+│       ├── gpt_common.hpp      ← GPT 工厂与超参数
+│       ├── tokenizer.hpp       ← BPE/Space 分词器
+│       ├── algebra/            ← L1 代数层
+│       │   ├── matrix.hpp      ← Matrix 类 + 块并行 matmul
+│       │   ├── expr.hpp        ← 表达式模板
+│       │   ├── ops.hpp         ← ReLU/GeLU 等逐元素算子
+│       │   ├── span.hpp        ← Span 抽象
+│       │   └── compute_dispatch.hpp ← 计算分派
+│       └── core/               ← L0 硬件层
+│           ├── thread_pool.hpp ← 全局线程池
+│           ├── errors.hpp      ← Result<T> = std::expected<T, Error>
+│           └── assert.hpp      ← 断言宏
 ├── src/
-│   ├── train.cpp
-│   └── infer.cpp
+│   ├── mnist_train.cpp         ← MNIST 训练
+│   ├── mnist_infer.cpp         ← MNIST 推理
+│   ├── text_train.cpp          ← GPT 文本训练
+│   ├── text_infer.cpp          ← GPT 文本推理
+│   ├── tokenizer_train.cpp     ← BPE 分词器训练
+│   ├── tokenizer_infer.cpp     ← BPE 分词器推理
+│   └── compute_bench.cpp       ← 计算性能基准测试
 ├── datasets/
 │   ├── mnist_data/          ← MNIST CSV 数据
 │   └── test/                ← 按数字分类的测试图片
@@ -80,8 +96,8 @@ python save_dataset.py
 # 自定义参数
 ./build/mnist_train --epochs 20 --lr 0.001 --batch-size 32 --optimizer adam --save my_model.bin
 
-# 支持的优化器: sgd / sgd_w_momentum / adam
-./build/mnist_train --optimizer sgd_w_momentum
+# 支持的优化器: sgd / sgd_momentum / adam
+./build/mnist_train --optimizer sgd_momentum
 ```
 
 ### 运行推理
@@ -184,7 +200,7 @@ python gui.py
 | `nn::MSELoss` | 均方误差损失 |
 | `nn::CrossEntropyLoss` | 交叉熵损失（含数值稳定 Softmax，`loss.hpp` 中定义） |
 | `nn::SGD` | 随机梯度下降优化器 |
-| `nn::SGD_w_Momentum` | 动量 SGD 优化器 |
+| `nn::SGDWithMomentum` | 动量 SGD 优化器 |
 | `nn::Adam` | Adam 优化器（一阶/二阶矩估计） |
 | `nn::SmartPolicy` | 自适应并行策略：小矩阵串行，大矩阵线程池并行 |
 | `nn::ThreadPool` | 全局单例线程池（懒初始化） |

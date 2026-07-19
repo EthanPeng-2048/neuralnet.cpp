@@ -12,7 +12,6 @@
 #include <algorithm>  // for std::transform (serial fallback)
 #include <numeric>    // for std::transform_reduce (serial fallback)
 #include <iterator>   // for std::distance
-#include <stdexcept>
 #include <type_traits>
 
 namespace nn

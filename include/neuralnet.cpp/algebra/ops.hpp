@@ -2,8 +2,8 @@
 #define NN_ALGEBRA_OPS_HPP
 
 // ── ops.hpp — 表达式模板操作策略定义 ──────────────────────────────────────
-// 每个 Op 同时定义 CPU 行为（apply），未来可扩展 SPIR-V 指令（spv_op）。
-// 用于构建编译期 AST，实现零开销抽象的逐元素运算。
+// 每个 Op 定义 CPU 行为（apply），用于构建编译期 AST，
+// 实现零开销抽象的逐元素运算。
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <algorithm>
@@ -72,7 +72,7 @@ struct Tanh
     [[nodiscard]] static Scalar apply(Scalar a) noexcept { return std::tanh(a); }
 };
 
-struct Relu
+struct ReLU
 {
     [[nodiscard]] static constexpr Scalar apply(Scalar a) noexcept { return a > Scalar{0} ? a : Scalar{0}; }
 };

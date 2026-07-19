@@ -16,11 +16,6 @@
 #include "algebra/span.hpp"
 #include "algebra/compute_dispatch.hpp"
 
-// Backend (L0) - optional Vulkan support
-#ifdef NN_HAS_VULKAN
-#include "backend/vk_backend.hpp"
-#endif
-
 // Computation layer (L2)
 #include "layer.hpp"
 #include "loss.hpp"

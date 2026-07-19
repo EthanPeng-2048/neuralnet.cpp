@@ -1,26 +1,22 @@
 #include <neuralnet.cpp/nn.hpp>
-
-using nn::Scalar;
 #include <neuralnet.cpp/model_io.hpp>
-
-using nn::Scalar;
 #include <neuralnet.cpp/gpt_common.hpp>
 
-using nn::Scalar;
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <cstring>
-#include <memory>
-#include <iostream>
 #include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <memory>
+#include <random>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
-#include <cmath>
-#include <algorithm>
-#include <cstdint>
-#include <chrono>
-#include <iomanip>
-#include <random>
-#include <numeric>
+
+using nn::Scalar;
 
 // ==================== 帮助信息 ====================
 void print_usage(const char *prog)
@@ -38,13 +34,12 @@ void print_usage(const char *prog)
         << "  --lr <lr>          学习率 (默认: 0.001)\n"
         << "  --batch-size <n>   批大小 (默认: 32)\n"
         << "  --seq-len <n>      序列长度 (默认: 256)\n"
-        << "  --optimizer <name> 优化器: sgd/sgd_w_momentum/adam (默认: adam)\n"
+        << "  --optimizer <name> 优化器: sgd/sgd_momentum/adam (默认: adam)\n"
         << "  --d-model <n>      模型维度 (默认: 128)\n"
         << "  --num-heads <n>    注意力头数 (默认: 4)\n"
         << "  --num-layers <n>   Transformer 层数 (默认: 4)\n"
         << "  --d-ff <n>         FFN 中间维度 (默认: 512)\n"
         << "  --log-interval <n> 每隔多少 step 显示进度 (默认: 50)\n"
-        << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
         << "  --help             显示此帮助信息\n";
 }
 
@@ -66,7 +61,6 @@ struct TrainConfig
     std::size_t d_ff = nn::GPT_D_FF;
     std::size_t log_interval = 50;
     bool load_existing = false;
-    bool gpu = false;
 };
 
 TrainConfig parse_args(int argc, char *argv[])
@@ -100,11 +94,11 @@ TrainConfig parse_args(int argc, char *argv[])
         else if (arg == "--optimizer" && i + 1 < argc)
         {
             cfg.optimizer_name = argv[++i];
-            if (cfg.optimizer_name != "sgd" && cfg.optimizer_name != "sgd_w_momentum" &&
+            if (cfg.optimizer_name != "sgd" && cfg.optimizer_name != "sgd_momentum" &&
                 cfg.optimizer_name != "adam")
             {
                 std::cerr << "未知优化器: " << cfg.optimizer_name
-                          << "，可选: sgd, sgd_w_momentum, adam\n";
+                          << "，可选: sgd, sgd_momentum, adam\n";
                 std::exit(1);
             }
         }
@@ -118,8 +112,6 @@ TrainConfig parse_args(int argc, char *argv[])
             cfg.d_ff = static_cast<std::size_t>(std::stoi(argv[++i]));
         else if (arg == "--log-interval" && i + 1 < argc)
             cfg.log_interval = static_cast<std::size_t>(std::stoi(argv[++i]));
-        else if (arg == "--gpu")
-            cfg.gpu = true;
         else if (!arg.starts_with("--"))
             cfg.text_path = arg;
         else
@@ -155,261 +147,243 @@ nn::Matrix one_hot_labels(const std::vector<std::size_t> &tokens, std::size_t vo
 // ==================== 主函数 ====================
 int main(int argc, char *argv[])
 {
-    try
-    {
-        TrainConfig cfg = parse_args(argc, argv);
+    TrainConfig cfg = parse_args(argc, argv);
 
-#ifdef NN_HAS_VULKAN
-        if (cfg.gpu)
-        {
-            auto& backend = nn::GpuBackend::instance();
-            auto init = backend.initialize();
-            if (init)
-            {
-                nn::SmartPolicy::gpu_enabled = true;
-                std::cout << "[GPU] 加速已启用 (Vulkan compute)\n";
-            }
-            else
-                std::cerr << "[GPU] 初始化失败: " << init.error().message << "，回退 CPU。\n";
-        }
-#endif
-
-        // ── 加载文本 ─────────────────────────────────────────────
-        std::cout << "加载文本: " << cfg.text_path << " ..." << std::endl;
-        auto text_result = nn::load_text_file(cfg.text_path);
-        if (!text_result) {
-            std::cerr << "Error: " << text_result.error().message << '\n';
-            return 1;
-        }
-        std::string text = std::move(*text_result);
-        if (text.empty())
-        {
-            std::cerr << "文本文件为空\n";
-            return 1;
-        }
-
-        nn::SpaceTokenizer tokenizer;
-        {
-            auto vocab_result = tokenizer.load(cfg.vocab_path);
-            if (!vocab_result) {
-                std::cerr << "Error: " << vocab_result.error().message << '\n';
-                return 1;
-            }
-        }
-        auto all_tokens = tokenizer.encode(text);
-        std::cout << "文本长度: " << text.size() << " 字符, "
-                  << all_tokens.size() << " tokens, "
-                  << tokenizer.vocab_size() << " 词表\n" << std::endl;
-
-        // ── 打印配置 ─────────────────────────────────────────────
-        std::cout << "========================================\n";
-        std::cout << "  GPT 文本生成训练\n";
-        std::cout << "========================================\n";
-        std::cout << "  词表大小: " << tokenizer.vocab_size() << "\n";
-        std::cout << "  模型维度: " << cfg.d_model << "\n";
-        std::cout << "  注意力头: " << cfg.num_heads << "\n";
-        std::cout << "  Transformer 层数: " << cfg.num_layers << "\n";
-        std::cout << "  FFN 维度: " << cfg.d_ff << "\n";
-        std::cout << "  序列长度: " << cfg.seq_len << "\n";
-        std::cout << "  优化器: " << cfg.optimizer_name << "  学习率: " << cfg.lr << "\n";
-        std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
-        std::cout << "========================================\n\n";
-
-        // ── 构建模型 ─────────────────────────────────────────────
-        auto model = nn::build_gpt_model(
-            tokenizer.vocab_size(), cfg.d_model, cfg.seq_len,
-            cfg.num_heads, cfg.d_ff, cfg.num_layers);
-
-        // ── 构建规格（用于保存） ─────────────────────────────────
-        auto spec = nn::make_gpt_spec(
-            tokenizer.vocab_size(), cfg.d_model, cfg.seq_len,
-            cfg.num_heads, cfg.d_ff, cfg.num_layers);
-
-        if (cfg.load_existing)
-        {
-            // 尝试从文件读取规格（V2 格式）
-            auto spec_result = nn::peek_model_spec(cfg.resume_path);
-            if (!spec_result)
-            {
-                std::cerr << "加载模型失败: " << spec_result.error().message << "，将从头训练。\n" << std::endl;
-            }
-            else
-            {
-                auto file_spec = std::move(*spec_result);
-                if (file_spec.is_gpt())
-                {
-                    std::cout << "从模型文件读取 GPT 规格 (V2 格式)\n";
-                    auto build_result = nn::build_gpt_model_from_spec(file_spec);
-                    if (!build_result)
-                    {
-                        std::cerr << "Error: " << build_result.error().message << '\n';
-                        return 1;
-                    }
-                    model = std::move(*build_result);
-                    spec = file_spec;
-                }
-                else
-                {
-                    std::cout << "旧格式模型文件，使用命令行参数\n";
-                }
-
-                auto load_result = nn::load_model(cfg.resume_path, model);
-                if (!load_result)
-                {
-                    std::cerr << "加载模型失败: " << load_result.error().message << "，将从头训练。\n" << std::endl;
-                }
-                else
-                {
-                    std::cout << "已加载模型: " << cfg.resume_path;
-                    if (!load_result->empty())
-                        std::cout << " (含嵌入词表 " << load_result->size() << " 字节)";
-                    std::cout << "\n" << std::endl;
-                }
-            }
-        }
-
-        // ── 优化器 ─────────────────────────────────────────────
-        std::unique_ptr<nn::Optimizer> optimizer;
-        if (cfg.optimizer_name == "sgd")
-            optimizer = std::make_unique<nn::SGD>(model.parameters(), model.param_gradients(), cfg.lr);
-        else if (cfg.optimizer_name == "sgd_w_momentum")
-            optimizer = std::make_unique<nn::SGD_w_Momentum>(model.parameters(), model.param_gradients(), cfg.lr);
-        else
-            optimizer = std::make_unique<nn::Adam>(model.parameters(), model.param_gradients(), cfg.lr);
-
-        nn::CrossEntropyLoss ce_loss;
-
-        // ── 训练循环 ─────────────────────────────────────────────
-        // 可用的 token 数量（需要 seq_len + 1 作为 input + target）
-        const std::size_t max_start = all_tokens.size() - cfg.seq_len - 1;
-        if (max_start == 0)
-        {
-            std::cerr << "文本太短，至少需要 " << (cfg.seq_len + 2) << " 个 token\n";
-            return 1;
-        }
-
-        const std::size_t steps_per_epoch = std::min(max_start / cfg.batch_size,
-                                                      std::size_t{1000});
-
-        std::mt19937_64 rng{42};
-
-        auto t_start = std::chrono::steady_clock::now();
-
-        for (int epoch = 0; epoch < cfg.epochs; ++epoch)
-        {
-            auto ep_start = std::chrono::steady_clock::now();
-            Scalar total_loss = 0.0;
-
-            for (std::size_t step = 0; step < steps_per_epoch; ++step)
-            {
-                // ── 采样 batch ───────────────────────────────────
-                nn::Matrix x_tokens(cfg.seq_len, cfg.batch_size);
-                nn::Matrix y_tokens(cfg.seq_len, cfg.batch_size);
-
-                for (std::size_t b = 0; b < cfg.batch_size; ++b)
-                {
-                    std::uniform_int_distribution<std::size_t> dist(0, max_start);
-                    std::size_t start = dist(rng);
-
-                    for (std::size_t t = 0; t < cfg.seq_len; ++t)
-                    {
-                        x_tokens.set_value_unchecked(t, b,
-                            static_cast<Scalar>(all_tokens[start + t]));
-                        y_tokens.set_value_unchecked(t, b,
-                            static_cast<Scalar>(all_tokens[start + t + 1]));
-                    }
-                }
-
-                // ── 前向传播 ─────────────────────────────────────
-                auto fwd_result = model.forward(x_tokens);
-                if (!fwd_result) { std::cerr << "Error: " << fwd_result.error().message << '\n'; return 1; }
-                auto logits = std::move(*fwd_result);
-                // logits: (vocab_size, seq_len × batch_size)
-
-                // ── 构造 one-hot 目标 ────────────────────────────
-                // 展平 y_tokens: seq_len × batch_size 个 token ID
-                const std::size_t total_tokens = cfg.seq_len * cfg.batch_size;
-                std::vector<std::size_t> flat_targets(total_tokens);
-                auto y_span = y_tokens.span();
-                for (std::size_t t = 0; t < cfg.seq_len; ++t)
-                    for (std::size_t b = 0; b < cfg.batch_size; ++b)
-                        flat_targets[t * cfg.batch_size + b] =
-                            static_cast<std::size_t>(y_span[t * cfg.batch_size + b]);
-
-                auto y_onehot = one_hot_labels(flat_targets, tokenizer.vocab_size());
-
-                // ── 损失 ─────────────────────────────────────────
-                auto loss_result = ce_loss.forward(logits, y_onehot);
-                if (!loss_result) { std::cerr << "Error: " << loss_result.error().message << '\n'; return 1; }
-                Scalar loss = *loss_result;
-                total_loss += loss;
-
-                // ── 反向传播 ─────────────────────────────────────
-                auto grad = ce_loss.backward();
-                auto bwd_result = model.backward(grad);
-                if (!bwd_result) { std::cerr << "Error: " << bwd_result.error().message << '\n'; return 1; }
-
-                {
-                    auto step_result = optimizer->step();
-                    if (!step_result) {
-                        std::cerr << "Error: " << step_result.error().message << '\n';
-                        return 1;
-                    }
-                }
-                optimizer->zero_grad();
-
-                // 进度显示
-                if ((step + 1) % cfg.log_interval == 0 || step + 1 == steps_per_epoch)
-                {
-                    std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
-                              << "  step " << step + 1 << "/" << steps_per_epoch
-                              << "  loss: " << std::fixed << std::setprecision(4) << loss
-                              << "   " << std::flush;
-                }
-            }
-
-            auto ep_end = std::chrono::steady_clock::now();
-            Scalar ep_sec = std::chrono::duration<Scalar>(ep_end - ep_start).count();
-            Scalar avg_loss = total_loss / steps_per_epoch;
-
-            std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
-                      << "  avg_loss=" << std::fixed << std::setprecision(4) << avg_loss
-                      << "  time=" << std::setprecision(1) << ep_sec << "s"
-                      << std::endl;
-        }
-
-        auto t_end = std::chrono::steady_clock::now();
-        Scalar total_sec = std::chrono::duration<Scalar>(t_end - t_start).count();
-
-        // ── 读取 tokenizer JSON 以便嵌入模型 ─────────────────────
-        std::string tokenizer_json;
-        {
-            std::ifstream tfs(cfg.vocab_path, std::ios::binary);
-            if (tfs)
-            {
-                std::ostringstream oss;
-                oss << tfs.rdbuf();
-                tokenizer_json = oss.str();
-            }
-        }
-
-        // ── 保存模型（含规格 + 嵌入 tokenizer） ──────────────────
-        {
-            auto save_result = nn::save_model(cfg.save_path, model, spec, tokenizer_json);
-            if (!save_result) {
-                std::cerr << "Error: " << save_result.error().message << '\n';
-                return 1;
-            }
-        }
-        std::cout << "\n训练完成! 总耗时: " << std::fixed << std::setprecision(1)
-                  << total_sec << "s"
-                  << "  词表已嵌入模型文件" << std::endl;
-
-        return 0;
-    }
-    catch (const std::exception &e)
-    {
-        std::cerr << "\n错误: " << e.what() << std::endl;
+    // ── 加载文本 ─────────────────────────────────────────────
+    std::cout << "加载文本: " << cfg.text_path << " ..." << std::endl;
+    auto text_result = nn::load_text_file(cfg.text_path);
+    if (!text_result) {
+        std::cerr << "Error: " << text_result.error().message << '\n';
         return 1;
     }
+    std::string text = std::move(*text_result);
+    if (text.empty())
+    {
+        std::cerr << "文本文件为空\n";
+        return 1;
+    }
+
+    nn::SpaceTokenizer tokenizer;
+    {
+        auto vocab_result = tokenizer.load(cfg.vocab_path);
+        if (!vocab_result) {
+            std::cerr << "Error: " << vocab_result.error().message << '\n';
+            return 1;
+        }
+    }
+    auto all_tokens = tokenizer.encode(text);
+    std::cout << "文本长度: " << text.size() << " 字符, "
+              << all_tokens.size() << " tokens, "
+              << tokenizer.vocab_size() << " 词表\n" << std::endl;
+
+    // ── 打印配置 ─────────────────────────────────────────────
+    std::cout << "========================================\n";
+    std::cout << "  GPT 文本生成训练\n";
+    std::cout << "========================================\n";
+    std::cout << "  词表大小: " << tokenizer.vocab_size() << "\n";
+    std::cout << "  模型维度: " << cfg.d_model << "\n";
+    std::cout << "  注意力头: " << cfg.num_heads << "\n";
+    std::cout << "  Transformer 层数: " << cfg.num_layers << "\n";
+    std::cout << "  FFN 维度: " << cfg.d_ff << "\n";
+    std::cout << "  序列长度: " << cfg.seq_len << "\n";
+    std::cout << "  优化器: " << cfg.optimizer_name << "  学习率: " << cfg.lr << "\n";
+    std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
+    std::cout << "========================================\n\n";
+
+    // ── 构建模型 ─────────────────────────────────────────────
+    auto model_build = nn::build_gpt_model(
+        tokenizer.vocab_size(), cfg.d_model, cfg.seq_len,
+        cfg.num_heads, cfg.d_ff, cfg.num_layers);
+    if (!model_build) {
+        std::cerr << "构建模型失败: " << model_build.error().message << '\n';
+        return 1;
+    }
+    auto model = std::move(*model_build);
+
+    // ── 构建规格（用于保存） ─────────────────────────────────
+    auto spec = nn::make_gpt_spec(
+        tokenizer.vocab_size(), cfg.d_model, cfg.seq_len,
+        cfg.num_heads, cfg.d_ff, cfg.num_layers);
+
+    if (cfg.load_existing)
+    {
+        // 尝试从文件读取规格（V2 格式）
+        auto spec_result = nn::peek_model_spec(cfg.resume_path);
+        if (!spec_result)
+        {
+            std::cerr << "加载模型失败: " << spec_result.error().message << "，将从头训练。\n" << std::endl;
+        }
+        else
+        {
+            auto file_spec = std::move(*spec_result);
+            if (file_spec.is_gpt())
+            {
+                std::cout << "从模型文件读取 GPT 规格 (V2 格式)\n";
+                auto build_result = nn::build_gpt_model_from_spec(file_spec);
+                if (!build_result)
+                {
+                    std::cerr << "Error: " << build_result.error().message << '\n';
+                    return 1;
+                }
+                model = std::move(*build_result);
+                spec = file_spec;
+            }
+            else
+            {
+                std::cout << "旧格式模型文件，使用命令行参数\n";
+            }
+
+            auto load_result = nn::load_model(cfg.resume_path, model);
+            if (!load_result)
+            {
+                std::cerr << "加载模型失败: " << load_result.error().message << "，将从头训练。\n" << std::endl;
+            }
+            else
+            {
+                std::cout << "已加载模型: " << cfg.resume_path;
+                if (!load_result->empty())
+                    std::cout << " (含嵌入词表 " << load_result->size() << " 字节)";
+                std::cout << "\n" << std::endl;
+            }
+        }
+    }
+
+    // ── 优化器 ─────────────────────────────────────────────
+    std::unique_ptr<nn::Optimizer> optimizer;
+    if (cfg.optimizer_name == "sgd")
+        optimizer = std::make_unique<nn::SGD>(model.parameters(), model.param_gradients(), cfg.lr);
+    else if (cfg.optimizer_name == "sgd_momentum")
+        optimizer = std::make_unique<nn::SGDWithMomentum>(model.parameters(), model.param_gradients(), cfg.lr);
+    else
+        optimizer = std::make_unique<nn::Adam>(model.parameters(), model.param_gradients(), cfg.lr);
+
+    nn::CrossEntropyLoss ce_loss;
+
+    // ── 训练循环 ─────────────────────────────────────────────
+    // 可用的 token 数量（需要 seq_len + 1 作为 input + target）
+    const std::size_t max_start = all_tokens.size() - cfg.seq_len - 1;
+    if (max_start == 0)
+    {
+        std::cerr << "文本太短，至少需要 " << (cfg.seq_len + 2) << " 个 token\n";
+        return 1;
+    }
+
+    const std::size_t steps_per_epoch = std::min(max_start / cfg.batch_size,
+                                                  std::size_t{1000});
+
+    std::mt19937_64 rng{42};
+
+    auto t_start = std::chrono::steady_clock::now();
+
+    for (int epoch = 0; epoch < cfg.epochs; ++epoch)
+    {
+        auto ep_start = std::chrono::steady_clock::now();
+        Scalar total_loss = 0.0;
+
+        for (std::size_t step = 0; step < steps_per_epoch; ++step)
+        {
+            // ── 采样 batch ───────────────────────────────────
+            nn::Matrix x_tokens(cfg.seq_len, cfg.batch_size);
+            nn::Matrix y_tokens(cfg.seq_len, cfg.batch_size);
+
+            for (std::size_t b = 0; b < cfg.batch_size; ++b)
+            {
+                std::uniform_int_distribution<std::size_t> dist(0, max_start);
+                std::size_t start = dist(rng);
+
+                for (std::size_t t = 0; t < cfg.seq_len; ++t)
+                {
+                    x_tokens.set_value_unchecked(t, b,
+                        static_cast<Scalar>(all_tokens[start + t]));
+                    y_tokens.set_value_unchecked(t, b,
+                        static_cast<Scalar>(all_tokens[start + t + 1]));
+                }
+            }
+
+            // ── 前向传播 ─────────────────────────────────────
+            auto fwd_result = model.forward(x_tokens);
+            if (!fwd_result) { std::cerr << "Error: " << fwd_result.error().message << '\n'; return 1; }
+            auto logits = std::move(*fwd_result);
+            // logits: (vocab_size, seq_len × batch_size)
+
+            // ── 构造 one-hot 目标 ────────────────────────────
+            // 展平 y_tokens: seq_len × batch_size 个 token ID
+            const std::size_t total_tokens = cfg.seq_len * cfg.batch_size;
+            std::vector<std::size_t> flat_targets(total_tokens);
+            auto y_span = y_tokens.span();
+            for (std::size_t t = 0; t < cfg.seq_len; ++t)
+                for (std::size_t b = 0; b < cfg.batch_size; ++b)
+                    flat_targets[t * cfg.batch_size + b] =
+                        static_cast<std::size_t>(y_span[t * cfg.batch_size + b]);
+
+            auto y_onehot = one_hot_labels(flat_targets, tokenizer.vocab_size());
+
+            // ── 损失 ─────────────────────────────────────────
+            auto loss_result = ce_loss.forward(logits, y_onehot);
+            if (!loss_result) { std::cerr << "Error: " << loss_result.error().message << '\n'; return 1; }
+            Scalar loss = *loss_result;
+            total_loss += loss;
+
+            // ── 反向传播 ─────────────────────────────────────
+            auto grad = ce_loss.backward();
+            auto bwd_result = model.backward(grad);
+            if (!bwd_result) { std::cerr << "Error: " << bwd_result.error().message << '\n'; return 1; }
+
+            {
+                auto step_result = optimizer->step();
+                if (!step_result) {
+                    std::cerr << "Error: " << step_result.error().message << '\n';
+                    return 1;
+                }
+            }
+            optimizer->zero_grad();
+
+            // 进度显示
+            if ((step + 1) % cfg.log_interval == 0 || step + 1 == steps_per_epoch)
+            {
+                std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
+                          << "  step " << step + 1 << "/" << steps_per_epoch
+                          << "  loss: " << std::fixed << std::setprecision(4) << loss
+                          << "   " << std::flush;
+            }
+        }
+
+        auto ep_end = std::chrono::steady_clock::now();
+        Scalar ep_sec = std::chrono::duration<Scalar>(ep_end - ep_start).count();
+        Scalar avg_loss = total_loss / steps_per_epoch;
+
+        std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
+                  << "  avg_loss=" << std::fixed << std::setprecision(4) << avg_loss
+                  << "  time=" << std::setprecision(1) << ep_sec << "s"
+                  << std::endl;
+    }
+
+    auto t_end = std::chrono::steady_clock::now();
+    Scalar total_sec = std::chrono::duration<Scalar>(t_end - t_start).count();
+
+    // ── 读取 tokenizer JSON 以便嵌入模型 ─────────────────────
+    std::string tokenizer_json;
+    {
+        std::ifstream tfs(cfg.vocab_path, std::ios::binary);
+        if (tfs)
+        {
+            std::ostringstream oss;
+            oss << tfs.rdbuf();
+            tokenizer_json = oss.str();
+        }
+    }
+
+    // ── 保存模型（含规格 + 嵌入 tokenizer） ──────────────────
+    {
+        auto save_result = nn::save_model(cfg.save_path, model, spec, tokenizer_json);
+        if (!save_result) {
+            std::cerr << "Error: " << save_result.error().message << '\n';
+            return 1;
+        }
+    }
+    std::cout << "\n训练完成! 总耗时: " << std::fixed << std::setprecision(1)
+              << total_sec << "s"
+              << "  词表已嵌入模型文件" << std::endl;
+
+    return 0;
 }

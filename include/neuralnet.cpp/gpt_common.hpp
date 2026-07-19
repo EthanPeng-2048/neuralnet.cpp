@@ -2,10 +2,10 @@
 #define GPT_COMMON_HPP
 
 #include <cstddef>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
-#include <fstream>
-#include <expected>
 
 #include "model.hpp"
 #include "model_spec.hpp"
@@ -33,7 +33,7 @@ inline constexpr std::size_t GPT_SEQ_LEN       = 256;
 }
 
 // ── 构建 GPT 模型 ────────────────────────────────────────────────────────
-[[nodiscard]] inline Model build_gpt_model(
+[[nodiscard]] inline Result<Model> build_gpt_model(
     std::size_t vocab_size  = GPT_VOCAB_SIZE,
     std::size_t d_model     = GPT_D_MODEL,
     std::size_t seq_len     = GPT_SEQ_LEN,
@@ -41,6 +41,11 @@ inline constexpr std::size_t GPT_SEQ_LEN       = 256;
     std::size_t d_ff        = GPT_D_FF,
     std::size_t num_layers  = GPT_NUM_LAYERS)
 {
+    if (d_model == 0 || num_heads == 0 || seq_len == 0 || vocab_size == 0)
+        return std::unexpected(Error{"GPT model parameters must be positive"});
+    if (d_model % num_heads != 0)
+        return std::unexpected(Error{"GPT d_model must be divisible by num_heads"});
+
     // GPTModel 是一个单一 Layer，作为 Model 的唯一层
     Model model;
     model.add_gpt_model(vocab_size, d_model, seq_len, num_heads, d_ff, num_layers);

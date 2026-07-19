@@ -20,7 +20,6 @@
 
 using nn::Matrix;
 using nn::Scalar;
-using nn::SmartPolicy;
 
 // ── 计时工具 ──────────────────────────────────────────────────────────────
 using Clock = std::chrono::high_resolution_clock;
@@ -140,9 +139,6 @@ int main(int argc, char* argv[])
         }
     }
 
-    // 强制关闭 GPU，纯测 CPU 算力
-    SmartPolicy::gpu_enabled = false;
-
     std::cout << "========================================\n"
               << "  计算库 f32 性能基准测试\n"
               << "========================================\n"
@@ -160,7 +156,8 @@ int main(int argc, char* argv[])
 
     auto rand_matrix = [&](std::size_t rows, std::size_t cols) {
         Matrix m(rows, cols);
-        for (auto& v : m.data())
+        auto s = m.span();
+        for (auto& v : s)
             v = dist(rng);
         return m;
     };
