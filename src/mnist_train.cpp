@@ -1,27 +1,21 @@
 #include <neuralnet.cpp/nn.hpp>
-
-using nn::Scalar;
 #include <neuralnet.cpp/model_io.hpp>
-
-using nn::Scalar;
 #include <neuralnet.cpp/mnist_common.hpp>
 
-using nn::Scalar;
-#include <cstring>     // for std::memcpy
-#include <memory>     // for std::unique_ptr
-#include <iostream>
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
-#include <cmath>
-#include <algorithm>
-#include <cstdint>
-#include <chrono>
-#include <iomanip>
 
-// ==================== 常量 ====================
-// 现在使用 nn::MNIST_INPUT_DIM, nn::MNIST_NUM_CLASSES, nn::MNIST_LAYER_DIMS
+using nn::Scalar;
 
 // ==================== 帮助信息 ====================
 void print_usage(const char *prog)
@@ -37,7 +31,7 @@ void print_usage(const char *prog)
         << "  --epochs <n>       训练轮数 (默认: 10)\n"
         << "  --lr <lr>          学习率 (默认: 0.001)\n"
         << "  --batch-size <n>   批大小 (默认: 64)\n"
-        << "  --optimizer <name> 优化器: sgd/momentum/adam (默认: adam)\n"
+        << "  --optimizer <name> 优化器: sgd/sgd_momentum/adam (默认: adam)\n"
         << "\n  MLP 选项:\n"
         << "  --layer-dims <d1,d2,...>  MLP 各层维度，逗号分隔 (默认: 784,512,256,128,64,10)\n"
         << "\n  Transformer 选项:\n"
@@ -46,7 +40,6 @@ void print_usage(const char *prog)
         << "  --d-ff <n>         FFN 中间维度 (默认: 128)\n"
         << "  --num-layers <n>   Transformer 层数 (默认: 2)\n"
         << "  --patch-size <n>   Patch 大小 (默认: 7)\n"
-        << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
         << "  --help             显示此帮助信息\n";
 }
 
@@ -62,7 +55,6 @@ struct TrainConfig
     Scalar lr = 0.001;
     std::size_t batch_size = 64;
     bool load_existing = false;
-    bool gpu = false;
     // MLP 自定义层维度
     std::vector<std::size_t> layer_dims;
     // Transformer 自定义参数
@@ -116,11 +108,11 @@ TrainConfig parse_args(int argc, char *argv[])
         else if (arg == "--optimizer" && i + 1 < argc)
         {
             cfg.optimizer_name = argv[++i];
-            if (cfg.optimizer_name != "sgd" && cfg.optimizer_name != "sgd_w_momentum" &&
+            if (cfg.optimizer_name != "sgd" && cfg.optimizer_name != "sgd_momentum" &&
                 cfg.optimizer_name != "adam")
             {
                 std::cerr << "未知优化器: " << cfg.optimizer_name
-                          << "，可选: sgd, sgd_w_momentum, adam\n";
+                          << "，可选: sgd, sgd_momentum, adam\n";
                 std::exit(1);
             }
         }
@@ -162,8 +154,6 @@ TrainConfig parse_args(int argc, char *argv[])
             cfg.num_layers = static_cast<std::size_t>(std::stoi(argv[++i]));
         else if (arg == "--patch-size" && i + 1 < argc)
             cfg.patch_size = static_cast<std::size_t>(std::stoi(argv[++i]));
-        else if (arg == "--gpu")
-            cfg.gpu = true;
         else
         {
             std::cerr << "未知参数: " << arg << "\n使用 --help 查看用法\n";
@@ -298,9 +288,7 @@ Scalar evaluate(nn::Model &model, const nn::Matrix &x, const nn::Matrix &y_oneho
     auto out_result = model.forward(x);
     if (!out_result) return 0.0;
     auto out = std::move(*out_result);
-#ifdef NN_HAS_VULKAN
-    out.flush_gpu_to_cpu();  // 同步 GPU→CPU，确保输出数据可被 CPU 读取
-#endif
+
     int correct = 0;
     for (std::size_t i = 0; i < N; ++i)
     {
@@ -330,258 +318,217 @@ Scalar evaluate(nn::Model &model, const nn::Matrix &x, const nn::Matrix &y_oneho
     return static_cast<Scalar>(correct) / N;
 }
 
-// -------------------- 构建网络 --------------------
-// build_model 函数已移至 neuralnet.cpp/mnist_common.hpp 中的 nn::build_mnist_model()
-
 // ==================== 主函数 ====================
 int main(int argc, char *argv[])
 {
-    try
+    TrainConfig cfg = parse_args(argc, argv);
+
+    // ── 构建规格 ─────────────────────────────────────────────
+    nn::ModelSpec spec;
+    if (cfg.model_type == "mlp")
     {
-        TrainConfig cfg = parse_args(argc, argv);
-
-#ifdef NN_HAS_VULKAN
-        if (cfg.gpu)
-        {
-            auto& backend = nn::GpuBackend::instance();
-            auto init = backend.initialize();
-            if (init)
-            {
-                nn::SmartPolicy::gpu_enabled = true;
-                std::cout << "[GPU] 加速已启用 (Vulkan compute)\n";
-            }
-            else
-                std::cerr << "[GPU] 初始化失败: " << init.error().message << "，回退 CPU。\n";
-        }
-#endif
-
-        // ── 构建规格 ─────────────────────────────────────────────
-        nn::ModelSpec spec;
-        if (cfg.model_type == "mlp")
-        {
-            spec.type = nn::ModelType::MLP;
-            spec.layer_dims = cfg.layer_dims.empty() ? nn::MNIST_LAYER_DIMS : cfg.layer_dims;
-        }
-        else
-        {
-            spec.type = nn::ModelType::Transformer;
-            spec.d_model = cfg.d_model;
-            spec.num_heads = cfg.num_heads;
-            spec.d_ff = cfg.d_ff;
-            spec.num_layers = cfg.num_layers;
-            spec.patch_size = cfg.patch_size;
-        }
-
-        // ── 如果 --resume，从文件读取规格覆盖 CLI 参数 ──────────
-        if (cfg.load_existing)
-        {
-            auto spec_result = nn::peek_model_spec(cfg.resume_path);
-            if (spec_result)
-            {
-                if (spec_result->type != nn::ModelType::Unknown)
-                {
-                    std::cout << "从模型文件读取规格\n";
-                    spec = std::move(*spec_result);
-                }
-                else
-                {
-                    std::cout << "旧格式模型文件 (V1)，使用命令行参数\n";
-                }
-            }
-            else
-            {
-                std::cerr << "读取模型规格失败: " << spec_result.error().message
-                          << "，使用命令行参数。\n";
-            }
-        }
-
-        // ── 打印配置 ─────────────────────────────────────────────
-        std::cout << "========================================\n";
-        std::cout << "  MNIST 手写数字训练\n";
-        std::cout << "========================================\n";
-        std::cout << "  模型类型: " << cfg.model_type << "\n";
-        if (spec.is_mlp())
-        {
-            std::cout << "  网络: ";
-            for (std::size_t i = 0; i < spec.layer_dims.size(); ++i)
-            {
-                std::cout << spec.layer_dims[i];
-                if (i < spec.layer_dims.size() - 2)
-                    std::cout << "(LayerNorm+GeLU)";
-                if (i < spec.layer_dims.size() - 1)
-                    std::cout << " -> ";
-            }
-            std::cout << "\n";
-        }
-        else
-        {
-            std::cout << "  网络: PatchEmbedding(" << spec.patch_size << "×" << spec.patch_size
-                      << ") -> TransformerEncoder(" << spec.num_layers << "层, d="
-                      << spec.d_model << ", heads=" << spec.num_heads
-                      << ", d_ff=" << spec.d_ff
-                      << ") -> Linear(" << spec.d_model << "→"
-                      << nn::MNIST_NUM_CLASSES << ")\n";
-        }
-        std::cout << "  优化器: " << cfg.optimizer_name << "  学习率: " << cfg.lr << "\n";
-        std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
-        std::cout << "  模型: " << (cfg.load_existing ? cfg.resume_path : "(从头训练)")
-                  << " -> " << cfg.save_path << "\n";
-        std::cout << "========================================\n\n";
-
-        // ── 加载数据 ─────────────────────────────────────────────
-        std::cout << "加载数据: " << cfg.dataset_path << " ..." << std::endl;
-        auto csv_train_result = load_csv(cfg.dataset_path + "/train.csv");
-        if (!csv_train_result) { std::cerr << "Error: " << csv_train_result.error().message << '\n'; return 1; }
-        auto [train_x, train_y] = std::move(*csv_train_result);
-
-        auto csv_test_result = load_csv(cfg.dataset_path + "/test.csv");
-        if (!csv_test_result) { std::cerr << "Error: " << csv_test_result.error().message << '\n'; return 1; }
-        auto [test_x, test_y] = std::move(*csv_test_result);
-        std::cout << "训练集: " << train_x.cols() << " 样本, 测试集: " << test_x.cols() << " 样本\n" << std::endl;
-
-        // ── 构建模型 ─────────────────────────────────────────────
-        auto model_result = nn::build_mnist_model_from_spec(spec);
-        if (!model_result)
-        {
-            std::cerr << "构建模型失败: " << model_result.error().message << '\n';
-            return 1;
-        }
-        auto model = std::move(*model_result);
-
-        if (cfg.load_existing)
-        {
-            auto load_result = nn::load_model(cfg.resume_path, model);
-            if (load_result)
-            {
-                std::cout << "已加载模型: " << cfg.resume_path << "\n" << std::endl;
-            }
-            else
-            {
-                std::cerr << "加载模型失败: " << load_result.error().message
-                          << "，将从头训练。\n" << std::endl;
-            }
-        }
-
-        // ── 训练 ─────────────────────────────────────────────────
-        std::unique_ptr<nn::Optimizer> optimizer;
-        if (cfg.optimizer_name == "sgd")
-            optimizer = std::make_unique<nn::SGD>(model.parameters(), model.param_gradients(), cfg.lr);
-        else if (cfg.optimizer_name == "sgd_w_momentum")
-            optimizer = std::make_unique<nn::SGD_w_Momentum>(model.parameters(), model.param_gradients(), cfg.lr);
-        else
-            optimizer = std::make_unique<nn::Adam>(model.parameters(), model.param_gradients(), cfg.lr);
-
-        nn::CrossEntropyLoss ce_loss;
-        const std::size_t num_batches = train_x.cols() / cfg.batch_size;
-
-        // ── 预分配 batch 缓冲区（避免每次迭代重复分配） ──────────
-        nn::Matrix x_batch(train_x.rows(), cfg.batch_size);
-        nn::Matrix y_batch(train_y.rows(), cfg.batch_size);
-
-        auto t_start = std::chrono::steady_clock::now();
-
-        for (int epoch = 0; epoch < cfg.epochs; ++epoch)
-        {
-            auto ep_start = std::chrono::steady_clock::now();
-            Scalar total_loss = 0.0;
-
-            for (std::size_t batch = 0; batch < num_batches; ++batch)
-            {
-                const std::size_t start = batch * cfg.batch_size;
-
-                // ── 行优先 memcpy 提取 batch（比逐列复制更缓存友好） ─────
-                for (std::size_t r = 0; r < train_x.rows(); ++r)
-                    std::memcpy(x_batch.span().data() + r * cfg.batch_size,
-                                train_x.span().data() + r * train_x.cols() + start,
-                                cfg.batch_size * sizeof(Scalar));
-                for (std::size_t r = 0; r < train_y.rows(); ++r)
-                    std::memcpy(y_batch.span().data() + r * cfg.batch_size,
-                                train_y.span().data() + r * train_y.cols() + start,
-                                cfg.batch_size * sizeof(Scalar));
-#ifdef NN_HAS_VULKAN
-                x_batch.invalidate_gpu();  // memcpy 绕过了 Matrix API，需手动失效 GPU 影子
-#endif
-
-                auto out_fwd = model.forward(x_batch);
-                if (!out_fwd) {
-                    std::cerr << "\nForward pass failed: " << out_fwd.error().message << '\n';
-                    return 1;
-                }
-                auto out = std::move(*out_fwd);
-                auto loss_result = ce_loss.forward(out, y_batch);
-                if (!loss_result) {
-                    std::cerr << "\nLoss computation failed: " << loss_result.error().message << '\n';
-                    return 1;
-                }
-                Scalar loss = *loss_result;
-                total_loss += loss;
-
-                auto grad = ce_loss.backward();
-                auto bwd_result = model.backward(grad);
-                if (!bwd_result) { std::cerr << "Error: " << bwd_result.error().message << '\n'; return 1; }
-
-                auto step_result = optimizer->step();
-                if (!step_result)
-                {
-                    std::cerr << "\n优化器 step 失败: " << step_result.error().message << '\n';
-                    return 1;
-                }
-                optimizer->zero_grad();
-
-                // 进度显示
-                if ((batch + 1) % 100 == 0 || batch + 1 == num_batches)
-                {
-                    std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
-                              << "  batch " << batch + 1 << "/" << num_batches
-                              << "  loss: " << std::fixed << std::setprecision(4) << loss
-                              << "   " << std::flush;
-                }
-            }
-
-            auto ep_end = std::chrono::steady_clock::now();
-            Scalar ep_sec = std::chrono::duration<Scalar>(ep_end - ep_start).count();
-
-            Scalar avg_loss = total_loss / num_batches;
-#ifdef NN_HAS_VULKAN
-            // ── 评估前确保权重 GPU shadow 可用（optimizer 已 invalidate） ──
-            if (nn::SmartPolicy::gpu_enabled) {
-                for (auto& p_ref : model.parameters())
-                    p_ref.get().ensure_gpu();
-            }
-#endif
-            Scalar train_acc = evaluate(model, train_x, train_y);
-            Scalar test_acc = evaluate(model, test_x, test_y);
-
-            std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
-                      << "  loss=" << std::fixed << std::setprecision(4) << avg_loss
-                      << "  train_acc=" << std::setprecision(2) << train_acc * 100.0 << "%"
-                      << "  test_acc=" << test_acc * 100.0 << "%"
-                      << "  time=" << std::setprecision(1) << ep_sec << "s"
-                      << std::endl;
-        }
-
-        auto t_end = std::chrono::steady_clock::now();
-        Scalar total_sec = std::chrono::duration<Scalar>(t_end - t_start).count();
-
-#ifdef NN_HAS_VULKAN
-        // ── 打印 GPU 调度统计 ──
-        nn::SmartPolicy::print_matmul_stats();
-#endif
-
-        // ── 保存模型（含规格） ─────────────────────────────────────
-        auto save_result = nn::save_model(cfg.save_path, model, spec);
-        if (!save_result)
-        {
-            std::cerr << "保存模型失败: " << save_result.error().message << '\n';
-            return 1;
-        }
-        std::cout << "\n训练完成! 总耗时: " << std::fixed << std::setprecision(1) << total_sec << "s" << std::endl;
-
-        return 0;
+        spec.type = nn::ModelType::MLP;
+        spec.layer_dims = cfg.layer_dims.empty() ? nn::MNIST_LAYER_DIMS : cfg.layer_dims;
     }
-    catch (const std::exception &e)
+    else
     {
-        std::cerr << "\n错误: " << e.what() << std::endl;
+        spec.type = nn::ModelType::Transformer;
+        spec.d_model = cfg.d_model;
+        spec.num_heads = cfg.num_heads;
+        spec.d_ff = cfg.d_ff;
+        spec.num_layers = cfg.num_layers;
+        spec.patch_size = cfg.patch_size;
+    }
+
+    // ── 如果 --resume，从文件读取规格覆盖 CLI 参数 ──────────
+    if (cfg.load_existing)
+    {
+        auto spec_result = nn::peek_model_spec(cfg.resume_path);
+        if (spec_result)
+        {
+            if (spec_result->type != nn::ModelType::Unknown)
+            {
+                std::cout << "从模型文件读取规格\n";
+                spec = std::move(*spec_result);
+            }
+            else
+            {
+                std::cout << "旧格式模型文件 (V1)，使用命令行参数\n";
+            }
+        }
+        else
+        {
+            std::cerr << "读取模型规格失败: " << spec_result.error().message
+                      << "，使用命令行参数。\n";
+        }
+    }
+
+    // ── 打印配置 ─────────────────────────────────────────────
+    std::cout << "========================================\n";
+    std::cout << "  MNIST 手写数字训练\n";
+    std::cout << "========================================\n";
+    std::cout << "  模型类型: " << cfg.model_type << "\n";
+    if (spec.is_mlp())
+    {
+        std::cout << "  网络: ";
+        for (std::size_t i = 0; i < spec.layer_dims.size(); ++i)
+        {
+            std::cout << spec.layer_dims[i];
+            if (i < spec.layer_dims.size() - 2)
+                std::cout << "(LayerNorm+GeLU)";
+            if (i < spec.layer_dims.size() - 1)
+                std::cout << " -> ";
+        }
+        std::cout << "\n";
+    }
+    else
+    {
+        std::cout << "  网络: PatchEmbedding(" << spec.patch_size << "×" << spec.patch_size
+                  << ") -> TransformerEncoder(" << spec.num_layers << "层, d="
+                  << spec.d_model << ", heads=" << spec.num_heads
+                  << ", d_ff=" << spec.d_ff
+                  << ") -> Linear(" << spec.d_model << "→"
+                  << nn::MNIST_NUM_CLASSES << ")\n";
+    }
+    std::cout << "  优化器: " << cfg.optimizer_name << "  学习率: " << cfg.lr << "\n";
+    std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
+    std::cout << "  模型: " << (cfg.load_existing ? cfg.resume_path : "(从头训练)")
+              << " -> " << cfg.save_path << "\n";
+    std::cout << "========================================\n\n";
+
+    // ── 加载数据 ─────────────────────────────────────────────
+    std::cout << "加载数据: " << cfg.dataset_path << " ..." << std::endl;
+    auto csv_train_result = load_csv(cfg.dataset_path + "/train.csv");
+    if (!csv_train_result) { std::cerr << "Error: " << csv_train_result.error().message << '\n'; return 1; }
+    auto [train_x, train_y] = std::move(*csv_train_result);
+
+    auto csv_test_result = load_csv(cfg.dataset_path + "/test.csv");
+    if (!csv_test_result) { std::cerr << "Error: " << csv_test_result.error().message << '\n'; return 1; }
+    auto [test_x, test_y] = std::move(*csv_test_result);
+    std::cout << "训练集: " << train_x.cols() << " 样本, 测试集: " << test_x.cols() << " 样本\n" << std::endl;
+
+    // ── 构建模型 ─────────────────────────────────────────────
+    auto model_result = nn::build_mnist_model_from_spec(spec);
+    if (!model_result)
+    {
+        std::cerr << "构建模型失败: " << model_result.error().message << '\n';
         return 1;
     }
+    auto model = std::move(*model_result);
+
+    if (cfg.load_existing)
+    {
+        auto load_result = nn::load_model(cfg.resume_path, model);
+        if (load_result)
+        {
+            std::cout << "已加载模型: " << cfg.resume_path << "\n" << std::endl;
+        }
+        else
+        {
+            std::cerr << "加载模型失败: " << load_result.error().message
+                      << "，将从头训练。\n" << std::endl;
+        }
+    }
+
+    // ── 训练 ─────────────────────────────────────────────────
+    std::unique_ptr<nn::Optimizer> optimizer;
+    if (cfg.optimizer_name == "sgd")
+        optimizer = std::make_unique<nn::SGD>(model.parameters(), model.param_gradients(), cfg.lr);
+    else if (cfg.optimizer_name == "sgd_momentum")
+        optimizer = std::make_unique<nn::SGDWithMomentum>(model.parameters(), model.param_gradients(), cfg.lr);
+    else
+        optimizer = std::make_unique<nn::Adam>(model.parameters(), model.param_gradients(), cfg.lr);
+
+    nn::CrossEntropyLoss ce_loss;
+    const std::size_t num_batches = train_x.cols() / cfg.batch_size;
+
+    // ── 预分配 batch 缓冲区（避免每次迭代重复分配） ──────────
+    nn::Matrix x_batch(train_x.rows(), cfg.batch_size);
+    nn::Matrix y_batch(train_y.rows(), cfg.batch_size);
+
+    auto t_start = std::chrono::steady_clock::now();
+
+    for (int epoch = 0; epoch < cfg.epochs; ++epoch)
+    {
+        auto ep_start = std::chrono::steady_clock::now();
+        Scalar total_loss = 0.0;
+
+        for (std::size_t batch = 0; batch < num_batches; ++batch)
+        {
+            const std::size_t start = batch * cfg.batch_size;
+
+            // ── 行优先 memcpy 提取 batch（比逐列复制更缓存友好） ─────
+            for (std::size_t r = 0; r < train_x.rows(); ++r)
+                std::memcpy(x_batch.span().data() + r * cfg.batch_size,
+                            train_x.span().data() + r * train_x.cols() + start,
+                            cfg.batch_size * sizeof(Scalar));
+            for (std::size_t r = 0; r < train_y.rows(); ++r)
+                std::memcpy(y_batch.span().data() + r * cfg.batch_size,
+                            train_y.span().data() + r * train_y.cols() + start,
+                            cfg.batch_size * sizeof(Scalar));
+
+            auto out_fwd = model.forward(x_batch);
+            if (!out_fwd) {
+                std::cerr << "\nForward pass failed: " << out_fwd.error().message << '\n';
+                return 1;
+            }
+            auto out = std::move(*out_fwd);
+            auto loss_result = ce_loss.forward(out, y_batch);
+            if (!loss_result) {
+                std::cerr << "\nLoss computation failed: " << loss_result.error().message << '\n';
+                return 1;
+            }
+            Scalar loss = *loss_result;
+            total_loss += loss;
+
+            auto grad = ce_loss.backward();
+            auto bwd_result = model.backward(grad);
+            if (!bwd_result) { std::cerr << "Error: " << bwd_result.error().message << '\n'; return 1; }
+
+            auto step_result = optimizer->step();
+            if (!step_result)
+            {
+                std::cerr << "\n优化器 step 失败: " << step_result.error().message << '\n';
+                return 1;
+            }
+            optimizer->zero_grad();
+
+            // 进度显示
+            if ((batch + 1) % 100 == 0 || batch + 1 == num_batches)
+            {
+                std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
+                          << "  batch " << batch + 1 << "/" << num_batches
+                          << "  loss: " << std::fixed << std::setprecision(4) << loss
+                          << "   " << std::flush;
+            }
+        }
+
+        auto ep_end = std::chrono::steady_clock::now();
+        Scalar ep_sec = std::chrono::duration<Scalar>(ep_end - ep_start).count();
+
+        Scalar avg_loss = total_loss / num_batches;
+        Scalar train_acc = evaluate(model, train_x, train_y);
+        Scalar test_acc = evaluate(model, test_x, test_y);
+
+        std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
+                  << "  loss=" << std::fixed << std::setprecision(4) << avg_loss
+                  << "  train_acc=" << std::setprecision(2) << train_acc * 100.0 << "%"
+                  << "  test_acc=" << test_acc * 100.0 << "%"
+                  << "  time=" << std::setprecision(1) << ep_sec << "s"
+                  << std::endl;
+    }
+
+    auto t_end = std::chrono::steady_clock::now();
+    Scalar total_sec = std::chrono::duration<Scalar>(t_end - t_start).count();
+
+    // ── 保存模型（含规格） ─────────────────────────────────────
+    auto save_result = nn::save_model(cfg.save_path, model, spec);
+    if (!save_result)
+    {
+        std::cerr << "保存模型失败: " << save_result.error().message << '\n';
+        return 1;
+    }
+    std::cout << "\n训练完成! 总耗时: " << std::fixed << std::setprecision(1) << total_sec << "s" << std::endl;
+
+    return 0;
 }

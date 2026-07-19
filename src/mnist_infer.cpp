@@ -1,27 +1,22 @@
 #include <neuralnet.cpp/nn.hpp>
-
-using nn::Scalar;
 #include <neuralnet.cpp/model_io.hpp>
-
-using nn::Scalar;
 #include <neuralnet.cpp/mnist_common.hpp>
 
-using nn::Scalar;
-#include <iostream>
+#include <algorithm>
+#include <cstdint>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <numeric>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
-#include <algorithm>
-#include <numeric>
-#include <cstdint>
-#include <iomanip>
-#include <filesystem>
 
 namespace fs = std::filesystem;
 
-// ==================== 常量 ====================
-// 现在使用 nn::MNIST_INPUT_DIM, nn::MNIST_NUM_CLASSES, nn::MNIST_LAYER_DIMS
+using nn::Scalar;
 
 // ==================== 帮助信息 ====================
 void print_usage(const char *prog)
@@ -38,7 +33,6 @@ void print_usage(const char *prog)
         << "                       仅在 V1 旧格式模型文件时需要手动指定\n"
         << "  --topk <n>         显示前 n 个预测结果 (默认: 3)\n"
         << "  --show-pixels      显示像素矩阵 (调试用)\n"
-        << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
         << "  --help             显示此帮助信息\n";
 }
 
@@ -50,7 +44,6 @@ struct InferConfig
     std::string input_path;
     int topk = 3;
     bool show_pixels = false;
-    bool gpu = false;
 };
 
 InferConfig parse_args(int argc, char *argv[])
@@ -88,10 +81,6 @@ InferConfig parse_args(int argc, char *argv[])
         {
             cfg.show_pixels = true;
         }
-        else if (arg == "--gpu")
-        {
-            cfg.gpu = true;
-        }
         else if (!arg.starts_with("--"))
         {
             cfg.input_path = arg;
@@ -112,9 +101,6 @@ InferConfig parse_args(int argc, char *argv[])
 
     return cfg;
 }
-
-// ==================== 构建网络 ====================
-// build_model 函数已移至 neuralnet.cpp/mnist_common.hpp 中的 nn::build_mnist_model()
 
 // ==================== 数据读取 ====================
 nn::Result<nn::Matrix> load_image_from_csv(const std::string &csv_line)
@@ -225,119 +211,98 @@ nn::Result<void> infer_single(nn::Model &model, const std::string &filepath, con
         std::cout << results[k].digit
                   << " (" << std::fixed << std::setprecision(1) << results[k].confidence * 100.0 << "%)";
     }
-    std::cout << std::endl;    return {};}
+    std::cout << std::endl;
+    return {};
+}
 
 // ==================== 主函数 ====================
 int main(int argc, char *argv[])
 {
-    try
+    InferConfig cfg = parse_args(argc, argv);
+
+    // ── 从模型文件读取规格 ─────────────────────────────────
+    auto spec_result = nn::peek_model_spec(cfg.model_path);
+    if (!spec_result)
     {
-        InferConfig cfg = parse_args(argc, argv);
-
-#ifdef NN_HAS_VULKAN
-        if (cfg.gpu)
-        {
-            auto& backend = nn::GpuBackend::instance();
-            auto init = backend.initialize();
-            if (init)
-            {
-                nn::SmartPolicy::gpu_enabled = true;
-                std::cout << "[GPU] 加速已启用 (Vulkan compute)\n";
-            }
-            else
-                std::cerr << "[GPU] 初始化失败: " << init.error().message << "，回退 CPU。\n";
-        }
-#endif
-
-        // ── 从模型文件读取规格 ─────────────────────────────────
-        auto spec_result = nn::peek_model_spec(cfg.model_path);
-        if (!spec_result)
-        {
-            std::cerr << "读取模型文件失败: " << spec_result.error().message << std::endl;
-            return 1;
-        }
-        nn::ModelSpec spec = spec_result.value();
-
-        nn::Model model;
-        if (spec.type != nn::ModelType::Unknown)
-        {
-            // V2 格式：自动从规格构建模型
-            std::cout << "从模型文件读取规格 (V2 格式)\n";
-            auto build_result = nn::build_mnist_model_from_spec(spec);
-            if (!build_result)
-            {
-                std::cerr << "构建模型失败: " << build_result.error().message << std::endl;
-                return 1;
-            }
-            model = std::move(*build_result);
-        }
-        else
-        {
-            // V1 旧格式：使用 --model-type 参数
-            std::cout << "旧格式模型文件 (V1)，使用 --model-type 参数: " << cfg.model_type << "\n";
-            auto build_result = nn::build_mnist_model(cfg.model_type);
-            if (!build_result)
-            {
-                std::cerr << "构建模型失败: " << build_result.error().message << std::endl;
-                return 1;
-            }
-            model = std::move(*build_result);
-        }
-
-        auto load_result = nn::load_model(cfg.model_path, model);
-        if (!load_result)
-        {
-            std::cerr << "加载模型失败: " << load_result.error().message << std::endl;
-            return 1;
-        }
-        std::cout << "模型已加载: " << cfg.model_path << "\n" << std::endl;
-
-        fs::path input(cfg.input_path);
-
-        if (fs::is_directory(input))
-        {
-            // 批量推理
-            std::vector<fs::path> csv_files;
-            for (auto &entry : fs::directory_iterator(input))
-            {
-                if (entry.path().extension() == ".csv")
-                    csv_files.push_back(entry.path());
-            }
-            std::sort(csv_files.begin(), csv_files.end());
-
-            if (csv_files.empty())
-            {
-                std::cerr << "目录中没有 CSV 文件: " << cfg.input_path << std::endl;
-                return 1;
-            }
-
-            std::cout << "找到 " << csv_files.size() << " 个文件\n" << std::endl;
-
-            for (auto &f : csv_files)
-            {
-                auto result = infer_single(model, f.string(), cfg);
-                if (!result) { std::cerr << "推理失败: " << f.filename().string() << ": " << result.error().message << '\n'; }
-            }
-
-            std::cout << "\n共推理 " << csv_files.size() << " 张图片" << std::endl;
-        }
-        else if (fs::is_regular_file(input))
-        {
-            // 单张推理
-            auto result = infer_single(model, input.string(), cfg);
-            if (!result) { std::cerr << "推理失败: " << result.error().message << '\n'; return 1; }
-        }
-        else
-        {
-            std::cerr << "输入路径不存在: " << cfg.input_path << std::endl;
-            return 1;
-        }
-
-        return 0;
-    }
-    catch (const std::exception &e)
-    {
-        std::cerr << "错误: " << e.what() << std::endl;
+        std::cerr << "读取模型文件失败: " << spec_result.error().message << std::endl;
         return 1;
     }
+    nn::ModelSpec spec = spec_result.value();
+
+    nn::Model model;
+    if (spec.type != nn::ModelType::Unknown)
+    {
+        // V2 格式：自动从规格构建模型
+        std::cout << "从模型文件读取规格 (V2 格式)\n";
+        auto build_result = nn::build_mnist_model_from_spec(spec);
+        if (!build_result)
+        {
+            std::cerr << "构建模型失败: " << build_result.error().message << std::endl;
+            return 1;
+        }
+        model = std::move(*build_result);
+    }
+    else
+    {
+        // V1 旧格式：使用 --model-type 参数
+        std::cout << "旧格式模型文件 (V1)，使用 --model-type 参数: " << cfg.model_type << "\n";
+        auto build_result = nn::build_mnist_model(cfg.model_type);
+        if (!build_result)
+        {
+            std::cerr << "构建模型失败: " << build_result.error().message << std::endl;
+            return 1;
+        }
+        model = std::move(*build_result);
+    }
+
+    auto load_result = nn::load_model(cfg.model_path, model);
+    if (!load_result)
+    {
+        std::cerr << "加载模型失败: " << load_result.error().message << std::endl;
+        return 1;
+    }
+    std::cout << "模型已加载: " << cfg.model_path << "\n" << std::endl;
+
+    fs::path input(cfg.input_path);
+
+    if (fs::is_directory(input))
+    {
+        // 批量推理
+        std::vector<fs::path> csv_files;
+        for (auto &entry : fs::directory_iterator(input))
+        {
+            if (entry.path().extension() == ".csv")
+                csv_files.push_back(entry.path());
+        }
+        std::sort(csv_files.begin(), csv_files.end());
+
+        if (csv_files.empty())
+        {
+            std::cerr << "目录中没有 CSV 文件: " << cfg.input_path << std::endl;
+            return 1;
+        }
+
+        std::cout << "找到 " << csv_files.size() << " 个文件\n" << std::endl;
+
+        for (auto &f : csv_files)
+        {
+            auto result = infer_single(model, f.string(), cfg);
+            if (!result) { std::cerr << "推理失败: " << f.filename().string() << ": " << result.error().message << '\n'; }
+        }
+
+        std::cout << "\n共推理 " << csv_files.size() << " 张图片" << std::endl;
+    }
+    else if (fs::is_regular_file(input))
+    {
+        // 单张推理
+        auto result = infer_single(model, input.string(), cfg);
+        if (!result) { std::cerr << "推理失败: " << result.error().message << '\n'; return 1; }
+    }
+    else
+    {
+        std::cerr << "输入路径不存在: " << cfg.input_path << std::endl;
+        return 1;
+    }
+
+    return 0;
 }

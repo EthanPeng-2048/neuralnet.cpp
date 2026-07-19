@@ -168,7 +168,7 @@ class NeuralNetGUI(tk.Tk):
         ttk.Label(param_frame, text="优化器:").grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.train_opt_var = tk.StringVar(value="adam")
         opt_combo = ttk.Combobox(param_frame, textvariable=self.train_opt_var, width=14, state="readonly",
-                                 values=["sgd", "sgd_w_momentum", "adam"])
+                                 values=["sgd", "sgd_momentum", "adam"])
         opt_combo.grid(row=1, column=1, sticky="w", pady=(6, 0))
 
         ttk.Label(param_frame, text="模型类型:").grid(row=1, column=2, sticky="w", pady=(6, 0))
@@ -739,7 +739,7 @@ class NeuralNetGUI(tk.Tk):
         ttk.Label(param_frame, text="优化器:").grid(row=1, column=2, sticky="w", pady=(6, 0))
         self.text_train_opt_var = tk.StringVar(value="adam")
         ttk.Combobox(param_frame, textvariable=self.text_train_opt_var, width=14, state="readonly",
-                     values=["sgd", "sgd_w_momentum", "adam"]).grid(row=1, column=3, sticky="w", pady=(6, 0))
+                     values=["sgd", "sgd_momentum", "adam"]).grid(row=1, column=3, sticky="w", pady=(6, 0))
 
         # 模型架构参数
         arch_frame = ttk.LabelFrame(f, text="模型架构", padding=6)

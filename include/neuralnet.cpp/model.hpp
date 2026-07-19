@@ -2,10 +2,9 @@
 #define MODEL_HPP
 
 #include <cassert>
-#include <expected>
 #include <functional>
 #include <memory>
-#include <string>
+#include <utility>
 #include <vector>
 
 #include "nn_config.hpp"
@@ -61,8 +60,8 @@ namespace nn
         [[nodiscard]] std::size_t num_layers() const noexcept { return layers_.size(); }
 
         // ── 前向传播 ────────────────────────────────────────────────────────
-        // GPU 加速通过 Matrix 语义方法（multiply_to）和表达式模板（compute::apply）自动分派，
-        // 上层代码无需感知 GPU 的存在，完全符合 L(N)→L(N-1) 分层调用规则。
+        // 通过 Matrix 语义方法（multiply_to）和表达式模板（compute::apply）自动分派，
+        // 上层代码完全符合 L(N)→L(N-1) 分层调用规则。
         [[nodiscard]] Result<Matrix> forward(const Matrix &input)
         {
             if (layers_.empty())

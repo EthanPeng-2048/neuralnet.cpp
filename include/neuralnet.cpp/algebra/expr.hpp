@@ -4,7 +4,6 @@
 // ── expr.hpp — 表达式模板核心：编译期 AST 节点类型系统 ───────────────────
 // 上层用普通 C++ 运算符写表达式，编译器自动构建编译期 AST。
 // CPU 路径：递归求值 AST（零开销，和手写循环等价）。
-// GPU 路径：AST → SPIR-V 二进制（未来扩展）。
 //
 // 算法永远在上层，计算永远在底层，中间靠 AST 传递。
 // ─────────────────────────────────────────────────────────────────────────
@@ -143,7 +142,7 @@ template <Expression Expr>
 template <Expression Expr>
 [[nodiscard]] auto relu(const Expr &expr)
 {
-    return UnaryExpr<Expr, ops::Relu>{expr};
+    return UnaryExpr<Expr, ops::ReLU>{expr};
 }
 
 // ══════════════════════════════════════════════════════════════════════════

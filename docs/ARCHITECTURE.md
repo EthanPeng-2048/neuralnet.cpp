@@ -40,7 +40,6 @@ graph TB
     subgraph "🧩 硬件层 (L0)"
         K["nn_config.hpp<br/>配置策略"]
         L["thread_pool.hpp<br/>线程池"]
-        VK["vk_backend.hpp<br/>GPU 后端"]
     end
 
     subgraph "💾 数据层"
@@ -64,7 +63,6 @@ graph TB
     G -->|"Matrix API"| I
     H -->|"Matrix API"| I
     I -->|"SmartPolicy"| K
-    I -->|"GpuBackend"| VK
     K --> L
     B --> M
     B2 --> M
@@ -99,12 +97,11 @@ graph TB
         OPT["optimizer.hpp<br/>SGD/Adam"]
     end
     subgraph "L1 代数层"
-        MAT["matrix.hpp<br/>矩阵运算 + GPU 分派"]
+        MAT["matrix.hpp<br/>矩阵运算"]
     end
     subgraph "L0 硬件层"
         CFG["nn_config.hpp<br/>SmartPolicy"]
         TP["thread_pool.hpp<br/>线程池"]
-        VK["vk_backend.hpp<br/>Vulkan GPU"]
     end
 
     SRC -->|"调用构建/Model API"| GPT & MNIST & MDL
@@ -118,7 +115,6 @@ graph TB
     LOSS -->|"Matrix API"| MAT
     OPT -->|"Matrix API"| MAT
     MAT -->|"SmartPolicy"| CFG
-    MAT -->|"GpuBackend"| VK
     CFG --> TP
 ```
 
@@ -130,12 +126,12 @@ graph TB
 | **L4 构建层** | 模型工厂（组装层为模型） | L3 `Model::add_*()` 非模板 API |
 | **L3 实现层** | 模型容器 + 序列化 | L2 `Layer::forward/backward` |
 | **L2 计算层** | 层/损失/优化器定义 | L1 `Matrix` 语义化 API |
-| **L1 代数层** | 矩阵运算（内部自动 GPU） | L0 `SmartPolicy`, `GpuBackend` |
-| **L0 硬件层** | 并行策略 + GPU 后端 | 无（最底层） |
+| **L1 代数层** | 矩阵运算 | L0 `SmartPolicy` |
+| **L0 硬件层** | 并行策略 | 无（最底层） |
 
 ---
 
-## 🔄 训练流程 (train.cpp)
+## 🔄 训练流程 (mnist_train.cpp)
 
 ```mermaid
 flowchart TD
@@ -314,7 +310,7 @@ classDiagram
         +step(params, grads)
     }
 
-    class SGD_w_Momentum {
+    class SGDWithMomentum {
         -double learning_rate
         -double momentum
         -vector~Matrix~ velocities
@@ -332,7 +328,7 @@ classDiagram
     }
 
     Optimizer <|-- SGD
-    Optimizer <|-- SGD_w_Momentum
+    Optimizer <|-- SGDWithMomentum
     Optimizer <|-- Adam
 ```
 
@@ -401,8 +397,8 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    GUI["gui.py<br/>Tkinter GUI"] -->|"训练模式<br/>subprocess.run()"| TRAIN["train.cpp"]
-    GUI -->|"推理模式<br/>subprocess.run()"| INFER["infer.cpp"]
+    GUI["gui.py<br/>Tkinter GUI"] -->|"训练模式<br/>subprocess.run()"| TRAIN["mnist_train.cpp"]
+    GUI -->|"推理模式<br/>subprocess.run()"| INFER["mnist_infer.cpp"]
 
     GUI -->|"画布绘制"| CANVAS["28×28 画布"]
     CANVAS -->|"鼠标事件"| DRAW["捕获笔画"]

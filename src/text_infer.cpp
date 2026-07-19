@@ -1,17 +1,14 @@
 #include <neuralnet.cpp/nn.hpp>
-
-using nn::Scalar;
 #include <neuralnet.cpp/model_io.hpp>
-
-using nn::Scalar;
 #include <neuralnet.cpp/gpt_common.hpp>
 
-using nn::Scalar;
+#include <cstdlib>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
-#include <cstdlib>
-#include <ctime>
+
+using nn::Scalar;
 
 // ==================== 帮助信息 ====================
 void print_usage(const char *prog)
@@ -35,7 +32,6 @@ void print_usage(const char *prog)
         << "  --d-ff <n>         FFN 维度 (默认: 512)\n"
         << "  --seq-len <n>      序列长度 (默认: 256)\n"
         << "  --show-tokens      显示 token ID (调试用)\n"
-        << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
         << "  --help             显示此帮助信息\n";
 }
 
@@ -49,7 +45,6 @@ struct InferConfig
     Scalar temperature = 1.0;
     bool interactive = false;
     bool show_tokens = false;
-    bool gpu = false;
     std::size_t d_model = nn::GPT_D_MODEL;
     std::size_t num_heads = nn::GPT_NUM_HEADS;
     std::size_t num_layers = nn::GPT_NUM_LAYERS;
@@ -82,8 +77,6 @@ InferConfig parse_args(int argc, char *argv[])
             cfg.temperature = std::stod(argv[++i]);
         else if (arg == "--show-tokens")
             cfg.show_tokens = true;
-        else if (arg == "--gpu")
-            cfg.gpu = true;
         else if (arg == "--d-model" && i + 1 < argc)
             cfg.d_model = static_cast<std::size_t>(std::stoi(argv[++i]));
         else if (arg == "--num-heads" && i + 1 < argc)
@@ -172,125 +165,102 @@ void interactive_mode(nn::Model &model, const nn::SpaceTokenizer &tokenizer,
 // ==================== 主函数 ====================
 int main(int argc, char *argv[])
 {
-    try
+    InferConfig cfg = parse_args(argc, argv);
+
+    // ── 从模型文件读取规格 ─────────────────────────────────
+    auto spec_result = nn::peek_model_spec(cfg.model_path);
+    if (!spec_result)
     {
-        InferConfig cfg = parse_args(argc, argv);
-
-#ifdef NN_HAS_VULKAN
-        if (cfg.gpu)
-        {
-            auto& backend = nn::GpuBackend::instance();
-            auto init = backend.initialize();
-            if (init)
-            {
-                nn::SmartPolicy::gpu_enabled = true;
-                std::cout << "[GPU] 加速已启用 (Vulkan compute)\n";
-            }
-            else
-                std::cerr << "[GPU] 初始化失败: " << init.error().message << "，回退 CPU。\n";
-        }
-#endif
-
-        // ── 从模型文件读取规格 ─────────────────────────────────
-        auto spec_result = nn::peek_model_spec(cfg.model_path);
-        if (!spec_result)
-        {
-            std::cerr << "读取模型文件失败: " << spec_result.error().message << std::endl;
-            return 1;
-        }
-        nn::ModelSpec spec = spec_result.value();
-
-        nn::Model model;
-        if (spec.is_gpt())
-        {
-            std::cout << "从模型文件读取 GPT 规格 (V2+ 格式)\n";
-            auto build_result = nn::build_gpt_model_from_spec(spec);
-            if (!build_result)
-            {
-                std::cerr << "构建模型失败: " << build_result.error().message << std::endl;
-                return 1;
-            }
-            model = std::move(build_result.value());
-        }
-        else
-        {
-            std::cerr << "模型规格未知，请使用 V2+ 格式模型文件\n";
-            return 1;
-        }
-
-        std::cout << "加载模型: " << cfg.model_path << " ..." << std::endl;
-        auto load_result = nn::load_model(cfg.model_path, model);
-        if (!load_result)
-        {
-            std::cerr << "加载模型失败: " << load_result.error().message << std::endl;
-            return 1;
-        }
-        std::cout << "模型已加载\n";
-
-        // ── 加载 tokenizer（优先从模型文件中提取，否则用 --vocab） ──
-        nn::SpaceTokenizer tokenizer;
-        if (!load_result->empty())
-        {
-            // 模型文件嵌入了 tokenizer → 写入临时文件加载
-            std::cout << "从模型文件中提取词表 (" << load_result->size() << " 字节)\n";
-            auto tok_result = tokenizer.load_json(*load_result);
-            if (!tok_result)
-            {
-                std::cerr << "解析嵌入词表失败: " << tok_result.error().message << std::endl;
-                return 1;
-            }
-        }
-        else
-        {
-            auto vocab_result = tokenizer.load(cfg.vocab_path);
-            if (!vocab_result)
-            {
-                std::cerr << "加载词表失败: " << vocab_result.error().message << std::endl;
-                return 1;
-            }
-        }
-        std::cout << "词表: " << tokenizer.vocab_size() << " 词" << std::endl;
-
-        if (cfg.interactive)
-        {
-            interactive_mode(model, tokenizer, cfg);
-            return 0;
-        }
-
-        // ── 单次生成 ─────────────────────────────────────────────
-        auto prompt_tokens = tokenizer.encode(cfg.prompt);
-
-        std::cout << "提示: \"" << cfg.prompt << "\"\n";
-        std::cout << "生成 " << cfg.max_tokens << " 个 token"
-                  << " (temperature=" << cfg.temperature << ")\n";
-        std::cout << "----------------------------------------\n";
-
-        auto gen_result = generate_text(model, prompt_tokens,
-                                       cfg.max_tokens, cfg.temperature,
-                                       cfg.seq_len);
-        if (!gen_result) { std::cerr << "Error: " << gen_result.error().message << '\n'; return 1; }
-        auto generated = std::move(*gen_result);
-
-        std::cout << cfg.prompt << tokenizer.decode(generated) << std::endl;
-
-        if (cfg.show_tokens)
-        {
-            std::cout << "\n[Tokens: ";
-            for (std::size_t i = 0; i < generated.size(); ++i)
-            {
-                if (i > 0) std::cout << ", ";
-                std::cout << generated[i];
-            }
-            std::cout << "]\n";
-        }
-
-        std::cout << "\n----------------------------------------" << std::endl;
-
-        return 0;
-    }
-    catch (const std::exception &e)
-    {
-        std::cerr << "错误: " << e.what() << std::endl;
+        std::cerr << "读取模型文件失败: " << spec_result.error().message << std::endl;
         return 1;
     }
+    nn::ModelSpec spec = spec_result.value();
+
+    nn::Model model;
+    if (spec.is_gpt())
+    {
+        std::cout << "从模型文件读取 GPT 规格 (V2+ 格式)\n";
+        auto build_result = nn::build_gpt_model_from_spec(spec);
+        if (!build_result)
+        {
+            std::cerr << "构建模型失败: " << build_result.error().message << std::endl;
+            return 1;
+        }
+        model = std::move(build_result.value());
+    }
+    else
+    {
+        std::cerr << "模型规格未知，请使用 V2+ 格式模型文件\n";
+        return 1;
+    }
+
+    std::cout << "加载模型: " << cfg.model_path << " ..." << std::endl;
+    auto load_result = nn::load_model(cfg.model_path, model);
+    if (!load_result)
+    {
+        std::cerr << "加载模型失败: " << load_result.error().message << std::endl;
+        return 1;
+    }
+    std::cout << "模型已加载\n";
+
+    // ── 加载 tokenizer（优先从模型文件中提取，否则用 --vocab） ──
+    nn::SpaceTokenizer tokenizer;
+    if (!load_result->empty())
+    {
+        // 模型文件嵌入了 tokenizer → 写入临时文件加载
+        std::cout << "从模型文件中提取词表 (" << load_result->size() << " 字节)\n";
+        auto tok_result = tokenizer.load_json(*load_result);
+        if (!tok_result)
+        {
+            std::cerr << "解析嵌入词表失败: " << tok_result.error().message << std::endl;
+            return 1;
+        }
+    }
+    else
+    {
+        auto vocab_result = tokenizer.load(cfg.vocab_path);
+        if (!vocab_result)
+        {
+            std::cerr << "加载词表失败: " << vocab_result.error().message << std::endl;
+            return 1;
+        }
+    }
+    std::cout << "词表: " << tokenizer.vocab_size() << " 词" << std::endl;
+
+    if (cfg.interactive)
+    {
+        interactive_mode(model, tokenizer, cfg);
+        return 0;
+    }
+
+    // ── 单次生成 ─────────────────────────────────────────────
+    auto prompt_tokens = tokenizer.encode(cfg.prompt);
+
+    std::cout << "提示: \"" << cfg.prompt << "\"\n";
+    std::cout << "生成 " << cfg.max_tokens << " 个 token"
+              << " (temperature=" << cfg.temperature << ")\n";
+    std::cout << "----------------------------------------\n";
+
+    auto gen_result = generate_text(model, prompt_tokens,
+                                   cfg.max_tokens, cfg.temperature,
+                                   cfg.seq_len);
+    if (!gen_result) { std::cerr << "Error: " << gen_result.error().message << '\n'; return 1; }
+    auto generated = std::move(*gen_result);
+
+    std::cout << cfg.prompt << tokenizer.decode(generated) << std::endl;
+
+    if (cfg.show_tokens)
+    {
+        std::cout << "\n[Tokens: ";
+        for (std::size_t i = 0; i < generated.size(); ++i)
+        {
+            if (i > 0) std::cout << ", ";
+            std::cout << generated[i];
+        }
+        std::cout << "]\n";
+    }
+
+    std::cout << "\n----------------------------------------" << std::endl;
+
+    return 0;
 }
