@@ -1,5 +1,5 @@
-#ifndef TOKENIZER_HPP
-#define TOKENIZER_HPP
+#ifndef NN_DOMAIN_TOKENIZER_HPP
+#define NN_DOMAIN_TOKENIZER_HPP
 
 #include <algorithm>
 #include <charconv>
@@ -12,17 +12,19 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <random>
 #include <ranges>
 #include <regex>
 #include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
-#include "nn_config.hpp"
+#include "config.hpp"
 
 namespace nn
 {
@@ -43,20 +45,15 @@ public:
     [[nodiscard]] virtual Result<void> save(const std::string &path) const = 0;
     [[nodiscard]] virtual Result<void> load(const std::string &path) = 0;
 
-    // ── 从 JSON 字符串加载（用于从模型文件中提取嵌入词表） ──────
+    // ── 从 JSON 字符串加载（纯内存解析，零磁盘 I/O） ──────────────
+    // 子类重写此方法以支持从 JSON 字符串直接加载词表。
+    // 默认实现：先写临时文件再调用 load(path)，子类应直接解析字符串。
+    [[nodiscard]] virtual Result<void> load_from_string(const std::string &json_content) = 0;
+
+    // ── 从 JSON 字符串加载（公共入口，委托给虚方法） ──────────────
     [[nodiscard]] Result<void> load_json(const std::string &json_content)
     {
-        // 写入临时文件后调用 load（各子类已实现 load）
-        const auto tmp_path = std::filesystem::temp_directory_path() / "nn_tokenizer_tmp.json";
-        {
-            std::ofstream ofs(tmp_path, std::ios::binary);
-            if (!ofs)
-                return std::unexpected(Error{"Cannot write tmp tokenizer file"});
-            ofs.write(json_content.data(), static_cast<std::streamsize>(json_content.size()));
-        }
-        auto result = load(tmp_path.string());
-        std::filesystem::remove(tmp_path);
-        return result;
+        return load_from_string(json_content);
     }
 };
 
@@ -123,14 +120,14 @@ public:
 
     WordZipTokenizer() = default;
 
-    void train(const std::string &text) { train(text, Config{}); }
+    Result<void> train(const std::string &text) { return train(text, Config{}); }
 
     // ── 词频训练 ──────────────────────────────────────────────────────
-    void train(const std::string &text, const Config &config)
+    Result<void> train(const std::string &text, const Config &config)
     {
         auto log = config.log
             ? config.log
-            : LogFn{[](std::string_view m) { std::cout << m << '\n'; }};
+            : LogFn{[](std::string_view) { /* 静默 */ }};
 
         const auto min_freq = config.min_freq;
         const auto target   = config.vocab_size;
@@ -207,10 +204,11 @@ public:
 
         log("  已移除可分解词: " + std::to_string(removed) + " 个");
         log("最终词表（有效）: " + std::to_string(vocab_.size() - removed));
+        return {};
     }
 
     // ── 编码 ──────────────────────────────────────────────────────────
-    [[nodiscard]] std::vector<std::size_t> encode(const std::string &text) const
+    [[nodiscard]] std::vector<std::size_t> encode(const std::string &text) const override
     {
         std::vector<std::size_t> all;
         all.reserve(text.size() / 2);
@@ -223,7 +221,7 @@ public:
     }
 
     // ── 解码 ──────────────────────────────────────────────────────────
-    [[nodiscard]] std::string decode(std::span<const std::size_t> ids) const
+    [[nodiscard]] std::string decode(std::span<const std::size_t> ids) const override
     {
         std::string raw;
         raw.reserve(ids.size() * 2);
@@ -233,7 +231,7 @@ public:
     }
 
     // ── 保存 JSON ────────────────────────────────────────────────────
-    [[nodiscard]] Result<void> save(const std::string &path) const
+    [[nodiscard]] Result<void> save(const std::string &path) const override
     {
         std::ofstream ofs(path);
         if (!ofs) return std::unexpected(Error{"Cannot write: " + path});
@@ -282,13 +280,17 @@ public:
     }
 
     // ── 加载 JSON ────────────────────────────────────────────────────
-    [[nodiscard]] Result<void> load(const std::string &path)
+    [[nodiscard]] Result<void> load(const std::string &path) override
     {
         std::ifstream ifs(path);
         if (!ifs) return std::unexpected(Error{"Cannot read: " + path});
         std::string content((std::istreambuf_iterator<char>(ifs)),
                              std::istreambuf_iterator<char>());
+        return load_from_string(content);
+    }
 
+    [[nodiscard]] Result<void> load_from_string(const std::string &content) override
+    {
         vocab_.clear();
 
         if (auto p = content.find("\"vocab_size\""); p != std::string::npos)
@@ -407,10 +409,10 @@ public:
     //  访问器
     // ══════════════════════════════════════════════════════════════════
 
-    [[nodiscard]] constexpr std::size_t vocab_size()      const noexcept { return vocab_.size(); }
+    [[nodiscard]] constexpr std::size_t vocab_size()      const noexcept override { return vocab_.size(); }
     [[nodiscard]] constexpr std::size_t max_subword_len() const noexcept { return max_subword_len_; }
     [[nodiscard]] constexpr std::size_t byte_offset()     const noexcept { return BYTE_OFFSET; }
-    [[nodiscard]] const std::vector<std::string> &vocab() const noexcept { return vocab_; }
+    [[nodiscard]] const std::vector<std::string> &vocab() const noexcept override { return vocab_; }
 
     [[nodiscard]] Result<std::string> token_bytes(std::size_t id) const
     {
@@ -849,13 +851,13 @@ public:
 
     SpaceTokenizer() = default;
 
-    void train(const std::string &text) { train(text, Config{}); }
+    Result<void> train(const std::string &text) { return train(text, Config{}); }
 
-    void train(const std::string &text, const Config &config)
+    Result<void> train(const std::string &text, const Config &config)
     {
         auto log = config.log
             ? config.log
-            : LogFn{[](std::string_view m) { std::cout << m << '\n'; }};
+            : LogFn{[](std::string_view) { /* 静默 */ }};
 
         log("\n[Space 训练] 分词统计...");
 
@@ -878,8 +880,12 @@ public:
 
         id_to_token_.clear();
         id_to_token_.resize(ASCII_BASE);
-        for (std::size_t i = 0; i < 128; ++i)
-            id_to_token_.emplace_back(1, static_cast<char>(i));
+        // 修复：原代码只添加 128 个 ASCII 字符，导致非 ASCII 字节（如中文 UTF-8）
+        // 在 encode() 中 id >= ASCII_BASE+128 超出词表，全部回退到 UNK_ID，
+        // 丢失原文信息。改为添加全部 256 个单字节，使任意 UTF-8 字节都能
+        // 映射到唯一 token ID（与 WordZipTokenizer 的字节回退设计一致）。
+        for (std::size_t i = 0; i < 256; ++i)
+            id_to_token_.emplace_back(1, static_cast<char>(static_cast<unsigned char>(i)));
 
         std::size_t added = 0;
         for (const auto &e : sorted)
@@ -894,6 +900,7 @@ public:
 
         build_lookup();
         log("最终词表: " + std::to_string(id_to_token_.size()));
+        return {};
     }
 
     [[nodiscard]] std::vector<std::size_t> encode(const std::string &text) const override
@@ -968,6 +975,11 @@ public:
         if (!ifs) return std::unexpected(Error{"Cannot read: " + path});
         std::string content((std::istreambuf_iterator<char>(ifs)),
                              std::istreambuf_iterator<char>());
+        return load_from_string(content);
+    }
+
+    [[nodiscard]] Result<void> load_from_string(const std::string &content) override
+    {
         id_to_token_.clear();
         token_to_id_.clear();
 
@@ -1076,13 +1088,13 @@ public:
 
     BPETokenizer() = default;
 
-    void train(const std::string &text) { train(text, Config{}); }
+    Result<void> train(const std::string &text) { return train(text, Config{}); }
 
-    void train(const std::string &text, const Config &config)
+    Result<void> train(const std::string &text, const Config &config)
     {
         auto log = config.log
             ? config.log
-            : LogFn{[](std::string_view m) { std::cout << m << '\n'; }};
+            : LogFn{[](std::string_view) { /* 静默 */ }};
 
         log("\n[BPE 训练] 预分词...");
         auto chunks = pre_tokenize(text);
@@ -1138,23 +1150,32 @@ public:
 
             for (auto &chunk : byte_chunks)
             {
-                for (std::size_t i = 0; i + 1 < chunk.size(); )
+                // 原地压缩：避免 vector::erase 的 O(n) 移动
+                std::size_t write = 0;
+                std::size_t read = 0;
+                while (read < chunk.size())
                 {
-                    if (chunk[i] == id_a && chunk[i + 1] == id_b)
+                    if (read + 1 < chunk.size() && chunk[read] == id_a && chunk[read + 1] == id_b)
                     {
-                        chunk[i] = new_id;
-                        chunk.erase(chunk.begin() + static_cast<std::ptrdiff_t>(i + 1));
+                        chunk[write++] = new_id;
+                        read += 2;
                     }
-                    else ++i;
+                    else
+                    {
+                        chunk[write++] = chunk[read++];
+                    }
                 }
+                chunk.resize(write);
             }
 
             if ((round + 1) % 500 == 0)
                 log("  合并第 " + std::to_string(round + 1) + " 轮，词表: " + std::to_string(vocab_.size()));
         }
 
+        rebuild_merge_map();
         log("最终词表: " + std::to_string(vocab_.size()));
         log("合并规则: " + std::to_string(merges_.size()));
+        return {};
     }
 
     [[nodiscard]] std::vector<std::size_t> encode(const std::string &text) const override
@@ -1185,7 +1206,10 @@ public:
                 if (best_prio < merges_.size())
                 {
                     ids[best_pos] = merges_[best_prio].new_id;
-                    ids.erase(ids.begin() + static_cast<std::ptrdiff_t>(best_pos + 1));
+                    // 原地压缩：将 best_pos+1 之后所有元素前移一位（替代 O(n) 的 vector::erase）
+                    for (std::size_t i = best_pos + 1; i + 1 < ids.size(); ++i)
+                        ids[i] = ids[i + 1];
+                    ids.pop_back();
                     merged = true;
                 }
             }
@@ -1237,6 +1261,11 @@ public:
         if (!ifs) return std::unexpected(Error{"Cannot read: " + path});
         std::string content((std::istreambuf_iterator<char>(ifs)),
                              std::istreambuf_iterator<char>());
+        return load_from_string(content);
+    }
+
+    [[nodiscard]] Result<void> load_from_string(const std::string &content) override
+    {
         vocab_.clear();
         merges_.clear();
 
@@ -1302,11 +1331,13 @@ public:
                     {
                         while (pos < content.size() && (content[pos]==' '||content[pos]=='\n'||
                                content[pos]=='\r'||content[pos]=='\t'||content[pos]==',')) ++pos;
-                        std::string num_str;
+                        std::size_t digit_start = pos;
                         while (pos < content.size() && content[pos] >= '0' && content[pos] <= '9')
-                            num_str += content[pos++];
-                        if (!num_str.empty())
-                            nums[n] = static_cast<std::size_t>(std::stoull(num_str));
+                            ++pos;
+                        if (pos > digit_start)
+                            std::from_chars(content.data() + digit_start,
+                                            content.data() + pos,
+                                            nums[n]);
                     }
                     while (pos < content.size() && content[pos] != ']') ++pos;
                     if (pos < content.size()) ++pos;
@@ -1314,6 +1345,7 @@ public:
                 }
             }
         }
+        rebuild_merge_map();
         return {};
     }
 
@@ -1343,17 +1375,28 @@ private:
 
     std::vector<std::string> vocab_;
     std::vector<MergeRule> merges_;
+    // ── 合并优先级 hash 表：O(1) 查找替代线性扫描 ─────────────────────
+    // 在 train()/load() 结束时由 rebuild_merge_map() 重建
+    std::unordered_map<std::pair<std::size_t, std::size_t>, std::size_t, pair_hash> merge_map_;
 
-    [[nodiscard]] std::size_t merge_priority(std::size_t a, std::size_t b) const
+    // 重建 merge_map_，需要在 merges_ 改变后调用
+    void rebuild_merge_map()
     {
+        merge_map_.clear();
+        merge_map_.reserve(merges_.size());
         for (std::size_t i = 0; i < merges_.size(); ++i)
-            if (merges_[i].id_a == a && merges_[i].id_b == b)
-                return i;
-        return merges_.size();
+            merge_map_[{merges_[i].id_a, merges_[i].id_b}] = i;
+    }
+
+    // O(1) 查找：(a, b) → 优先级（merges_ 中的索引），不存在返回 merges_.size()
+    [[nodiscard]] std::size_t merge_priority(std::size_t a, std::size_t b) const noexcept
+    {
+        auto it = merge_map_.find({a, b});
+        return it != merge_map_.end() ? it->second : merges_.size();
     }
 };
 
 
 } // namespace nn
 
-#endif // TOKENIZER_HPP
+#endif // NN_DOMAIN_TOKENIZER_HPP

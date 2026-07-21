@@ -1,14 +1,14 @@
-#ifndef MODEL_HPP
-#define MODEL_HPP
+#ifndef NN_MODEL_CONTAINER_HPP
+#define NN_MODEL_CONTAINER_HPP
 
-#include <cassert>
 #include <functional>
 #include <memory>
 #include <utility>
 #include <vector>
 
-#include "nn_config.hpp"
-#include "layer.hpp"
+#include "core_assert.hpp"
+#include "config.hpp"
+#include "compute_layer.hpp"
 
 namespace nn
 {
@@ -21,10 +21,10 @@ namespace nn
         Model() = default;
 
         // 访问指定层（用于向下转型等场景）
-        // 使用 assert 保护边界，编程错误在 debug 模式捕获
+        // 使用 NN_ASSERT 保护边界，编程错误在 debug 模式捕获
         [[nodiscard]] Layer &layer_at(std::size_t index) noexcept
         {
-            assert(index < layers_.size() && "Model::layer_at index out of range");
+            NN_ASSERT(index < layers_.size(), "Model::layer_at index out of range");
             return *layers_[index];
         }
 
@@ -58,6 +58,19 @@ namespace nn
                              std::size_t d_ff, std::size_t num_layers);
 
         [[nodiscard]] std::size_t num_layers() const noexcept { return layers_.size(); }
+
+        // ── 序列生成（仅对包含 GPTModel 等自回归层的模型有效） ─────────
+        // 通过 Layer 虚函数 dispatch 调用，避免 L5 层使用 dynamic_cast。
+        // 委托给模型的第一层（GPT 通常是容器内唯一层）。
+        [[nodiscard]] Result<std::vector<std::size_t>>
+        generate(const std::vector<std::size_t> &prompt,
+                 std::size_t max_new_tokens,
+                 Scalar temperature = 1.0)
+        {
+            if (layers_.empty())
+                return std::unexpected(Error{"Model has no layers"});
+            return layers_.front()->generate(prompt, max_new_tokens, temperature);
+        }
 
         // ── 前向传播 ────────────────────────────────────────────────────────
         // 通过 Matrix 语义方法（multiply_to）和表达式模板（compute::apply）自动分派，
@@ -181,4 +194,4 @@ namespace nn
 
 } // namespace nn
 
-#endif // MODEL_HPP
+#endif // NN_MODEL_CONTAINER_HPP

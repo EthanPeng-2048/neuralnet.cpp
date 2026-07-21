@@ -1,6 +1,6 @@
 #include <neuralnet.cpp/nn.hpp>
-#include <neuralnet.cpp/model_io.hpp>
-#include <neuralnet.cpp/mnist_common.hpp>
+#include <neuralnet.cpp/model_serialization.hpp>
+#include <neuralnet.cpp/domain_mnist.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -46,7 +46,7 @@ struct InferConfig
     bool show_pixels = false;
 };
 
-InferConfig parse_args(int argc, char *argv[])
+nn::Result<InferConfig> parse_args(int argc, char *argv[])
 {
     InferConfig cfg;
     bool has_input = false;
@@ -67,15 +67,16 @@ InferConfig parse_args(int argc, char *argv[])
         {
             cfg.model_type = argv[++i];
             if (cfg.model_type != "mlp" && cfg.model_type != "transformer")
-            {
-                std::cerr << "未知模型类型: " << cfg.model_type
-                          << "，可选: mlp, transformer\n";
-                std::exit(1);
-            }
+                return std::unexpected(nn::Error{"未知模型类型: " + cfg.model_type +
+                                                 "，可选: mlp, transformer"});
         }
         else if (arg == "--topk" && i + 1 < argc)
         {
-            cfg.topk = std::stoi(argv[++i]);
+            auto v = nn::parse_number<int>(argv[++i]);
+            if (!v) return std::unexpected(std::move(v).error());
+            if (*v <= 0)
+                return std::unexpected(nn::Error{"--topk 必须为正整数"});
+            cfg.topk = *v;
         }
         else if (arg == "--show-pixels")
         {
@@ -88,37 +89,21 @@ InferConfig parse_args(int argc, char *argv[])
         }
         else
         {
-            std::cerr << "未知参数: " << arg << "\n使用 --help 查看用法\n";
-            std::exit(1);
+            return std::unexpected(nn::Error{"未知参数: " + arg + "，使用 --help 查看用法"});
         }
     }
 
     if (!has_input)
-    {
-        std::cerr << "请指定图片文件或目录\n使用 --help 查看用法\n";
-        std::exit(1);
-    }
+        return std::unexpected(nn::Error{"请指定图片文件或目录，使用 --help 查看用法"});
 
     return cfg;
 }
 
 // ==================== 数据读取 ====================
+// 委托给 mnist_common.hpp 的共享工具，消除 mnist_train / mnist_infer 重复实现
 nn::Result<nn::Matrix> load_image_from_csv(const std::string &csv_line)
 {
-    std::vector<Scalar> pixels;
-    std::stringstream ss(csv_line);
-    std::string token;
-    while (std::getline(ss, token, ','))
-    {
-        pixels.push_back(std::stod(token));
-    }
-    if (pixels.size() != nn::MNIST_INPUT_DIM)
-        return std::unexpected(nn::Error{"CSV 必须包含恰好 " + std::to_string(nn::MNIST_INPUT_DIM) + " 个值，实际: " + std::to_string(pixels.size())});
-
-    nn::Matrix img(nn::MNIST_INPUT_DIM, 1);
-    for (std::size_t i = 0; i < nn::MNIST_INPUT_DIM; ++i)
-        img.set_value_unchecked(i, 0, pixels[i]);
-    return img;
+    return nn::load_image_from_csv_line(csv_line);
 }
 
 // ==================== 推理 + 置信度 ====================
@@ -128,10 +113,11 @@ struct Prediction
     Scalar confidence;
 };
 
-std::vector<Prediction> predict_with_confidence(nn::Model &model, const nn::Matrix &img, int topk)
+nn::Result<std::vector<Prediction>> predict_with_confidence(nn::Model &model, const nn::Matrix &img, int topk)
 {
     auto logits_result = model.forward(img);
-    if (!logits_result) return {};  // 返回空 vector
+    if (!logits_result)
+        return std::unexpected(std::move(logits_result).error());
     auto logits = std::move(*logits_result);
 
     // Softmax 计算概率
@@ -192,7 +178,8 @@ nn::Result<void> infer_single(nn::Model &model, const std::string &filepath, con
     std::string line;
     std::getline(file, line);
     auto img_result = load_image_from_csv(line);
-    if (!img_result) { std::cerr << "Error: " << img_result.error().message << '\n'; return {}; }
+    if (!img_result)
+        return std::unexpected(std::move(img_result).error());
     auto img = std::move(*img_result);
 
     if (cfg.show_pixels)
@@ -203,13 +190,15 @@ nn::Result<void> infer_single(nn::Model &model, const std::string &filepath, con
     }
 
     auto results = predict_with_confidence(model, img, cfg.topk);
+    if (!results)
+        return std::unexpected(std::move(results).error());
 
     std::cout << fs::path(filepath).filename().string() << " -> ";
-    for (std::size_t k = 0; k < results.size(); ++k)
+    for (std::size_t k = 0; k < results->size(); ++k)
     {
         if (k > 0) std::cout << "  ";
-        std::cout << results[k].digit
-                  << " (" << std::fixed << std::setprecision(1) << results[k].confidence * 100.0 << "%)";
+        std::cout << (*results)[k].digit
+                  << " (" << std::fixed << std::setprecision(1) << (*results)[k].confidence * 100.0 << "%)";
     }
     std::cout << std::endl;
     return {};
@@ -218,7 +207,13 @@ nn::Result<void> infer_single(nn::Model &model, const std::string &filepath, con
 // ==================== 主函数 ====================
 int main(int argc, char *argv[])
 {
-    InferConfig cfg = parse_args(argc, argv);
+    auto cfg_result = parse_args(argc, argv);
+    if (!cfg_result)
+    {
+        std::cerr << "参数错误: " << cfg_result.error().message << std::endl;
+        return 1;
+    }
+    InferConfig cfg = std::move(*cfg_result);
 
     // ── 从模型文件读取规格 ─────────────────────────────────
     auto spec_result = nn::peek_model_spec(cfg.model_path);

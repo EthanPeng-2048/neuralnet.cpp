@@ -1,5 +1,5 @@
-#ifndef THREAD_POOL_HPP
-#define THREAD_POOL_HPP
+#ifndef NN_CORE_THREAD_POOL_HPP
+#define NN_CORE_THREAD_POOL_HPP
 
 #include <vector>
 #include <queue>
@@ -13,6 +13,8 @@
 #include <numeric>    // for std::transform_reduce (serial fallback)
 #include <iterator>   // for std::distance
 #include <type_traits>
+
+#include "core_assert.hpp"
 
 namespace nn
 {

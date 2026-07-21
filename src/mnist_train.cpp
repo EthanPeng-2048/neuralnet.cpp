@@ -1,6 +1,6 @@
 #include <neuralnet.cpp/nn.hpp>
-#include <neuralnet.cpp/model_io.hpp>
-#include <neuralnet.cpp/mnist_common.hpp>
+#include <neuralnet.cpp/model_serialization.hpp>
+#include <neuralnet.cpp/domain_mnist.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <random>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -91,19 +92,23 @@ TrainConfig parse_args(int argc, char *argv[])
         }
         else if (arg == "--epochs" && i + 1 < argc)
         {
-            int val = std::stoi(argv[++i]);
-            if (val <= 0) { std::cerr << "--epochs 必须为正整数\n"; std::exit(1); }
-            cfg.epochs = val;
+            auto v = nn::parse_number<int>(argv[++i]);
+            if (!v) { std::cerr << "无效 --epochs: " << v.error().message << "\n"; std::exit(1); }
+            if (*v <= 0) { std::cerr << "--epochs 必须为正整数\n"; std::exit(1); }
+            cfg.epochs = *v;
         }
         else if (arg == "--lr" && i + 1 < argc)
         {
-            cfg.lr = std::stod(argv[++i]);
+            auto v = nn::parse_number<double>(argv[++i]);
+            if (!v) { std::cerr << "无效 --lr: " << v.error().message << "\n"; std::exit(1); }
+            cfg.lr = *v;
         }
         else if (arg == "--batch-size" && i + 1 < argc)
         {
-            int val = std::stoi(argv[++i]);
-            if (val <= 0) { std::cerr << "--batch-size 必须为正整数\n"; std::exit(1); }
-            cfg.batch_size = static_cast<std::size_t>(val);
+            auto v = nn::parse_number<int>(argv[++i]);
+            if (!v) { std::cerr << "无效 --batch-size: " << v.error().message << "\n"; std::exit(1); }
+            if (*v <= 0) { std::cerr << "--batch-size 必须为正整数\n"; std::exit(1); }
+            cfg.batch_size = static_cast<std::size_t>(*v);
         }
         else if (arg == "--optimizer" && i + 1 < argc)
         {
@@ -134,9 +139,10 @@ TrainConfig parse_args(int argc, char *argv[])
             std::string token;
             while (std::getline(ss, token, ','))
             {
-                std::size_t d = static_cast<std::size_t>(std::stoi(token));
-                if (d == 0) { std::cerr << "层维度不能为 0\n"; std::exit(1); }
-                cfg.layer_dims.push_back(d);
+                auto v = nn::parse_number<std::size_t>(token);
+                if (!v) { std::cerr << "无效层维度: " << v.error().message << "\n"; std::exit(1); }
+                if (*v == 0) { std::cerr << "层维度不能为 0\n"; std::exit(1); }
+                cfg.layer_dims.push_back(*v);
             }
             if (cfg.layer_dims.size() < 2)
             {
@@ -145,15 +151,35 @@ TrainConfig parse_args(int argc, char *argv[])
             }
         }
         else if (arg == "--d-model" && i + 1 < argc)
-            cfg.d_model = static_cast<std::size_t>(std::stoi(argv[++i]));
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --d-model: " << v.error().message << "\n"; std::exit(1); }
+            cfg.d_model = *v;
+        }
         else if (arg == "--num-heads" && i + 1 < argc)
-            cfg.num_heads = static_cast<std::size_t>(std::stoi(argv[++i]));
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --num-heads: " << v.error().message << "\n"; std::exit(1); }
+            cfg.num_heads = *v;
+        }
         else if (arg == "--d-ff" && i + 1 < argc)
-            cfg.d_ff = static_cast<std::size_t>(std::stoi(argv[++i]));
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --d-ff: " << v.error().message << "\n"; std::exit(1); }
+            cfg.d_ff = *v;
+        }
         else if (arg == "--num-layers" && i + 1 < argc)
-            cfg.num_layers = static_cast<std::size_t>(std::stoi(argv[++i]));
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --num-layers: " << v.error().message << "\n"; std::exit(1); }
+            cfg.num_layers = *v;
+        }
         else if (arg == "--patch-size" && i + 1 < argc)
-            cfg.patch_size = static_cast<std::size_t>(std::stoi(argv[++i]));
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --patch-size: " << v.error().message << "\n"; std::exit(1); }
+            cfg.patch_size = *v;
+        }
         else
         {
             std::cerr << "未知参数: " << arg << "\n使用 --help 查看用法\n";
@@ -282,11 +308,12 @@ nn::Result<std::pair<nn::Matrix, nn::Matrix>> load_csv(const std::string &filena
 }
 
 // -------------------- 评估函数 --------------------
-Scalar evaluate(nn::Model &model, const nn::Matrix &x, const nn::Matrix &y_onehot)
+nn::Result<Scalar> evaluate(nn::Model &model, const nn::Matrix &x, const nn::Matrix &y_onehot)
 {
     std::size_t N = x.cols();
     auto out_result = model.forward(x);
-    if (!out_result) return 0.0;
+    if (!out_result)
+        return std::unexpected(std::move(out_result).error());
     auto out = std::move(*out_result);
 
     int correct = 0;
@@ -315,7 +342,7 @@ Scalar evaluate(nn::Model &model, const nn::Matrix &x, const nn::Matrix &y_oneho
         if (pred == true_label)
             ++correct;
     }
-    return static_cast<Scalar>(correct) / N;
+    return static_cast<Scalar>(correct) / static_cast<Scalar>(N);
 }
 
 // ==================== 主函数 ====================
@@ -446,6 +473,13 @@ int main(int argc, char *argv[])
     nn::Matrix x_batch(train_x.rows(), cfg.batch_size);
     nn::Matrix y_batch(train_y.rows(), cfg.batch_size);
 
+    // ── 样本索引数组：每 epoch 重新 shuffle 以打破顺序相关性 ─────
+    // SGD 收敛速度和最终精度依赖训练数据的随机性
+    std::vector<std::size_t> sample_indices(train_x.cols());
+    for (std::size_t i = 0; i < sample_indices.size(); ++i)
+        sample_indices[i] = i;
+    std::mt19937_64 shuffle_rng{std::random_device{}()};
+
     auto t_start = std::chrono::steady_clock::now();
 
     for (int epoch = 0; epoch < cfg.epochs; ++epoch)
@@ -453,19 +487,30 @@ int main(int argc, char *argv[])
         auto ep_start = std::chrono::steady_clock::now();
         Scalar total_loss = 0.0;
 
+        // 每个 epoch 开始时打乱样本顺序
+        std::shuffle(sample_indices.begin(), sample_indices.end(), shuffle_rng);
+
         for (std::size_t batch = 0; batch < num_batches; ++batch)
         {
             const std::size_t start = batch * cfg.batch_size;
 
-            // ── 行优先 memcpy 提取 batch（比逐列复制更缓存友好） ─────
-            for (std::size_t r = 0; r < train_x.rows(); ++r)
-                std::memcpy(x_batch.span().data() + r * cfg.batch_size,
-                            train_x.span().data() + r * train_x.cols() + start,
-                            cfg.batch_size * sizeof(Scalar));
-            for (std::size_t r = 0; r < train_y.rows(); ++r)
-                std::memcpy(y_batch.span().data() + r * cfg.batch_size,
-                            train_y.span().data() + r * train_y.cols() + start,
-                            cfg.batch_size * sizeof(Scalar));
+            // ── 按 shuffle 顺序提取 batch（逐列拷贝打乱后的样本索引） ──
+            // 顺序 memcpy 因 shuffle 不可行；改为逐列索引拷贝
+            const std::size_t R_x = train_x.rows();
+            const std::size_t R_y = train_y.rows();
+            const std::size_t C_train = train_x.cols();
+            const auto x_src = train_x.span().data();
+            const auto y_src = train_y.span().data();
+            auto x_dst = x_batch.span().data();
+            auto y_dst = y_batch.span().data();
+            for (std::size_t b = 0; b < cfg.batch_size; ++b)
+            {
+                const std::size_t src_col = sample_indices[start + b];
+                for (std::size_t r = 0; r < R_x; ++r)
+                    x_dst[r * cfg.batch_size + b] = x_src[r * C_train + src_col];
+                for (std::size_t r = 0; r < R_y; ++r)
+                    y_dst[r * cfg.batch_size + b] = y_src[r * C_train + src_col];
+            }
 
             auto out_fwd = model.forward(x_batch);
             if (!out_fwd) {
@@ -481,8 +526,9 @@ int main(int argc, char *argv[])
             Scalar loss = *loss_result;
             total_loss += loss;
 
-            auto grad = ce_loss.backward();
-            auto bwd_result = model.backward(grad);
+            auto grad_result = ce_loss.backward();
+            if (!grad_result) { std::cerr << "\nLoss backward failed: " << grad_result.error().message << '\n'; return 1; }
+            auto bwd_result = model.backward(*grad_result);
             if (!bwd_result) { std::cerr << "Error: " << bwd_result.error().message << '\n'; return 1; }
 
             auto step_result = optimizer->step();
@@ -491,7 +537,12 @@ int main(int argc, char *argv[])
                 std::cerr << "\n优化器 step 失败: " << step_result.error().message << '\n';
                 return 1;
             }
-            optimizer->zero_grad();
+            auto zero_result = optimizer->zero_grad();
+            if (!zero_result)
+            {
+                std::cerr << "\n优化器 zero_grad 失败: " << zero_result.error().message << '\n';
+                return 1;
+            }
 
             // 进度显示
             if ((batch + 1) % 100 == 0 || batch + 1 == num_batches)
@@ -507,8 +558,16 @@ int main(int argc, char *argv[])
         Scalar ep_sec = std::chrono::duration<Scalar>(ep_end - ep_start).count();
 
         Scalar avg_loss = total_loss / num_batches;
-        Scalar train_acc = evaluate(model, train_x, train_y);
-        Scalar test_acc = evaluate(model, test_x, test_y);
+        auto train_acc_r = evaluate(model, train_x, train_y);
+        auto test_acc_r  = evaluate(model, test_x, test_y);
+        if (!train_acc_r || !test_acc_r)
+        {
+            const auto &err = !train_acc_r ? train_acc_r.error() : test_acc_r.error();
+            std::cerr << "\n  评估失败: " << err.message << std::endl;
+            return 1;
+        }
+        Scalar train_acc = *train_acc_r;
+        Scalar test_acc  = *test_acc_r;
 
         std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
                   << "  loss=" << std::fixed << std::setprecision(4) << avg_loss

@@ -12,8 +12,8 @@
 #include <cstddef>
 #include <ranges>
 
-#include "../nn_config.hpp"
-#include "span.hpp"
+#include "config.hpp"
+#include "algebra_span.hpp"
 
 namespace nn::compute
 {

@@ -9,7 +9,7 @@
 #include <algorithm>
 #include <cmath>
 
-#include "../nn_config.hpp"
+#include "config.hpp"
 
 namespace nn::ops
 {
@@ -75,7 +75,22 @@ struct Rsqrt
 
 struct Sigmoid
 {
-    [[nodiscard]] static Scalar apply(Scalar a) noexcept { return Scalar{1} / (Scalar{1} + std::exp(-a)); }
+    // ── 数值稳定实现：大正数直接返回 1，大负数返回 0，避免 exp 上溢 ──
+    // 原 1/(1+exp(-a)) 在 a 为大负数时 exp(-a) 会溢出为 inf → 结果为 0
+    // 但 NaN/Inf 可能传播；此处分支保证全区间有界且无 NaN。
+    [[nodiscard]] static Scalar apply(Scalar a) noexcept
+    {
+        if (a >= Scalar{0})
+        {
+            const Scalar z = std::exp(-a);
+            return Scalar{1} / (Scalar{1} + z);
+        }
+        else
+        {
+            const Scalar z = std::exp(a);
+            return z / (Scalar{1} + z);
+        }
+    }
 };
 
 struct Tanh
@@ -115,6 +130,11 @@ struct Le
 struct Eq
 {
     [[nodiscard]] static constexpr bool apply(Scalar a, Scalar b) noexcept { return a == b; }
+};
+
+struct Ne
+{
+    [[nodiscard]] static constexpr bool apply(Scalar a, Scalar b) noexcept { return a != b; }
 };
 
 // ══════════════════════════════════════════════════════════════════════════

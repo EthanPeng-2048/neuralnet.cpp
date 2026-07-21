@@ -1,5 +1,5 @@
-#ifndef MODEL_IO_HPP
-#define MODEL_IO_HPP
+#ifndef NN_MODEL_SERIALIZATION_HPP
+#define NN_MODEL_SERIALIZATION_HPP
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  model_io.hpp — 模型二进制序列化
@@ -18,10 +18,10 @@
 #include <string>
 #include <vector>
 
-#include "nn_config.hpp"
+#include "config.hpp"
 #include "model_spec.hpp"
-#include "layer.hpp"
-#include "model.hpp"
+#include "compute_layer.hpp"
+#include "model_container.hpp"
 
 namespace nn
 {
@@ -435,4 +435,4 @@ inline Result<void> write_tokenizer(std::ofstream &ofs, const std::string &json)
 
 } // namespace nn
 
-#endif // MODEL_IO_HPP
+#endif // NN_MODEL_SERIALIZATION_HPP

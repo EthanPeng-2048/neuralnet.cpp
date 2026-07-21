@@ -1,12 +1,14 @@
-#ifndef MNIST_COMMON_HPP
-#define MNIST_COMMON_HPP
+#ifndef NN_DOMAIN_MNIST_HPP
+#define NN_DOMAIN_MNIST_HPP
 
 #include <cstddef>
 #include <string>
 #include <expected>
+#include <sstream>
 #include <vector>
 
-#include "model.hpp"
+#include "core_errors.hpp"
+#include "model_container.hpp"
 #include "model_spec.hpp"
 
 namespace nn {
@@ -14,6 +16,45 @@ namespace nn {
 // ── MNIST 常量 ──────────────────────────────────────────────────────────────
 inline constexpr std::size_t MNIST_INPUT_DIM = 784;
 inline constexpr std::size_t MNIST_NUM_CLASSES = 10;
+
+// ── 共享 CSV 行解析工具 ────────────────────────────────────────────────────
+// 解析单行 CSV（逗号分隔的浮点数）为 std::vector<Scalar>
+// 异常安全：使用 nn::parse_number（基于 std::from_chars），不抛异常。
+// mnist_train 与 mnist_infer 共用此工具，消除重复实现。
+[[nodiscard]] inline Result<std::vector<Scalar>>
+parse_csv_line(const std::string &line)
+{
+    std::vector<Scalar> values;
+    std::stringstream ss(line);
+    std::string token;
+    while (std::getline(ss, token, ','))
+    {
+        auto v = parse_number<Scalar>(token);
+        if (!v)
+            return std::unexpected(Error{"CSV 含无效数字 '" + token + "': " + v.error().message});
+        values.push_back(*v);
+    }
+    return values;
+}
+
+// ── 从 CSV 行加载单张 MNIST 图片 ───────────────────────────────────────────
+// 输入：784 个逗号分隔的像素值（0~255 或归一化后的 0~1）
+// 输出：(784, 1) 列向量 Matrix
+[[nodiscard]] inline Result<Matrix>
+load_image_from_csv_line(const std::string &csv_line)
+{
+    auto values = parse_csv_line(csv_line);
+    if (!values)
+        return std::unexpected(std::move(values).error());
+    if (values->size() != MNIST_INPUT_DIM)
+        return std::unexpected(Error{"CSV 必须包含恰好 " + std::to_string(MNIST_INPUT_DIM) +
+                                    " 个值，实际: " + std::to_string(values->size())});
+
+    Matrix img(MNIST_INPUT_DIM, 1);
+    for (std::size_t i = 0; i < MNIST_INPUT_DIM; ++i)
+        img.set_value_unchecked(i, 0, (*values)[i]);
+    return img;
+}
 
 // 默认 MLP 网络架构：输入层 -> 隐藏层1 -> 隐藏层2 -> 隐藏层3 -> 输出层
 inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
@@ -61,6 +102,26 @@ inline constexpr std::size_t TRANSFORMER_PATCH_SIZE = 7;   // 28 / 7 = 4 → 4×
     std::size_t patch_size = TRANSFORMER_PATCH_SIZE)
 {
     constexpr std::size_t img_size = 28;
+
+    // ── 参数校验 ───────────────────────────────────────────────────────
+    if (patch_size == 0)
+        return std::unexpected(Error{"patch_size must be > 0"});
+    if (img_size % patch_size != 0)
+        return std::unexpected(Error{"img_size (28) must be divisible by patch_size (" +
+                                    std::to_string(patch_size) + ")"});
+    if (d_model == 0)
+        return std::unexpected(Error{"d_model must be > 0"});
+    if (num_heads == 0)
+        return std::unexpected(Error{"num_heads must be > 0"});
+    if (d_model % num_heads != 0)
+        return std::unexpected(Error{"d_model (" + std::to_string(d_model) +
+                                    ") must be divisible by num_heads (" +
+                                    std::to_string(num_heads) + ")"});
+    if (d_ff == 0)
+        return std::unexpected(Error{"d_ff must be > 0"});
+    if (num_layers == 0)
+        return std::unexpected(Error{"num_layers must be > 0"});
+
     const std::size_t num_patches = (img_size / patch_size) * (img_size / patch_size);
 
     Model model;
@@ -105,4 +166,4 @@ inline constexpr std::size_t TRANSFORMER_PATCH_SIZE = 7;   // 28 / 7 = 4 → 4×
 
 } // namespace nn
 
-#endif // MNIST_COMMON_HPP
+#endif // NN_DOMAIN_MNIST_HPP
