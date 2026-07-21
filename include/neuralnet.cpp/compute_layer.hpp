@@ -1,14 +1,14 @@
-#ifndef LAYER_HPP
-#define LAYER_HPP
+#ifndef NN_COMPUTE_LAYER_HPP
+#define NN_COMPUTE_LAYER_HPP
 
 #include <functional>
 #include <limits>
 #include <random>
 
-#include "algebra/matrix.hpp"
-#include "nn_config.hpp"
-#include "algebra/span.hpp"
-#include "algebra/compute_dispatch.hpp"
+#include "algebra_matrix.hpp"
+#include "config.hpp"
+#include "algebra_span.hpp"
+#include "algebra_compute.hpp"
 
 namespace nn
 {
@@ -20,6 +20,17 @@ namespace nn
         virtual Result<Matrix> backward(const Matrix &grad_output) = 0;
         virtual std::vector<std::reference_wrapper<Matrix>> parameters() { return {}; }
         virtual std::vector<std::reference_wrapper<Matrix>> param_gradients() { return {}; }
+
+        // ── 序列生成（仅 GPTModel 等自回归模型实现） ─────────────────────
+        // 默认实现返回错误，避免 L5 层使用 dynamic_cast 向下转型。
+        // L5 层应通过 Model::generate() 调用此方法。
+        [[nodiscard]] virtual Result<std::vector<std::size_t>>
+        generate(const std::vector<std::size_t> & /*prompt*/,
+                 std::size_t /*max_new_tokens*/,
+                 Scalar /*temperature*/)
+        {
+            return std::unexpected(Error{"Layer::generate not supported by this layer type"});
+        }
     };
 
     class Linear final : public Layer
@@ -1085,7 +1096,7 @@ namespace nn
             return output;
         }
 
-        // ── 反向传播 ────────────────────────────────────────────────────
+        // ── 反向传播 ──
         // 对每个样本: re-forward 重建缓存 → 反向传播 → 累加参数梯度
         Result<Matrix> backward(const Matrix &grad_output) override
         {
@@ -1302,13 +1313,43 @@ namespace nn
         std::vector<Matrix> O_heads_;
 
         // 因果掩码 (上三角为 -inf)
-        std::vector<Scalar> mask_data_;     // max_len × max_len
+        // mask_data_ 以 max_len_ 为行间距存储 (i * max_len_ + j)。
+        // 直接用 Span(mask_data_.data(), seq_len * seq_len) 读取会越界错位，
+        // 故提供 mask_buf_ 作为按当前 seq_len 重建的连续缓冲区。
+        std::vector<Scalar> mask_data_;     // max_len_ × max_len_
+        std::size_t   max_len_ = 0;
+        Matrix        mask_buf_;            // 连续的 seq_len × seq_len 掩码
+        std::size_t   mask_buf_seq_len_ = 0; // mask_buf_ 当前对应的 seq_len
 
         // 辅助缓冲区
         Matrix grad_scores_buf_;
         Matrix grad_A_buf_;
         Matrix grad_O_h_buf_;
         Softmax softmax_;         // 仅在 forward() 中调用 forward()，不调用 backward()（注意力反向手动计算）
+
+        // ── 按需构建连续 seq_len × seq_len 掩码缓冲区 ────────────────────
+        // 修复：原代码以 max_len_ 行间距存储 mask，但读取时按连续 seq_len×seq_len
+        // 解释，导致 seq_len < max_len_ 时掩码完全错位（因果性失效）。
+        // 此处当 seq_len 变化时重建连续缓冲区，后续即可安全使用 AST apply。
+        Span ensure_mask_buf(std::size_t seq_len)
+        {
+            if (mask_buf_seq_len_ != seq_len)
+            {
+                mask_buf_.resize(seq_len, seq_len);
+                auto dst = mask_buf_.span();
+                const std::size_t ml = max_len_;
+                const Scalar *src = mask_data_.data();
+                for (std::size_t i = 0; i < seq_len; ++i)
+                {
+                    const Scalar *src_row = src + i * ml;
+                    Scalar *dst_row = dst.data() + i * seq_len;
+                    for (std::size_t j = 0; j < seq_len; ++j)
+                        dst_row[j] = src_row[j];
+                }
+                mask_buf_seq_len_ = seq_len;
+            }
+            return Span{mask_buf_.span()};
+        }
 
         static void extract_rows(const Matrix &src, std::size_t row_start,
                                  std::size_t row_count, Matrix &dst)
@@ -1351,13 +1392,15 @@ namespace nn
               w_k_(d_model, d_model),
               w_v_(d_model, d_model),
               w_o_(d_model, d_model),
-              mask_data_(max_len * max_len, 0.0)
+              mask_data_(max_len * max_len, 0.0),
+              max_len_(max_len)
         {
             if (d_model % num_heads != 0)
                 NN_ASSERT(false, "CausalSelfAttention: d_model must be divisible by num_heads");
 
             // 预计算因果掩码: mask[i][j] = 0 if j <= i else -inf
-            const Scalar neg_inf = -1e30;
+            // 使用 -infinity() 而非 -1e30，确保 softmax 后未来位置权重严格为 0。
+            const Scalar neg_inf = -std::numeric_limits<Scalar>::infinity();
             for (std::size_t i = 0; i < max_len; ++i)
                 for (std::size_t j = 0; j < max_len; ++j)
                     mask_data_[i * max_len + j] = (j <= i) ? 0.0 : neg_inf;
@@ -1427,9 +1470,11 @@ namespace nn
                 QhT.multiply_to(attn_[h], K_heads_[h]);
 
                 // 施加因果掩码 (AST 逐元素加: a += m)
+                // 修复 stride bug：使用按当前 seq_len 重建的连续 mask_buf_，
+                // 而非错误的 Span(mask_data_.data(), seq_len*seq_len)。
                 {
                     Span a_s = attn_[h].span();
-                    Span m_s(mask_data_.data(), seq_len * seq_len);
+                    Span m_s = ensure_mask_buf(seq_len);
                     compute::apply(a_s, a_s + m_s);
                 }
 
@@ -1774,7 +1819,10 @@ namespace nn
                 {
                     auto token_id = static_cast<std::size_t>(input.at_unchecked(t, b));
                     if (token_id >= vocab_size_)
-                        token_id = 0; // fallback to PAD
+                        return std::unexpected(Error{
+                            "GPTModel::forward token id out of range: " +
+                            std::to_string(token_id) +
+                            " (vocab_size=" + std::to_string(vocab_size_) + ")"});
                     stored_tokens_[b].push_back(token_id);
 
                     const auto emb_span = token_emb_.span();
@@ -1895,9 +1943,10 @@ namespace nn
         }
 
         // ── 采样生成（支持温度采样 + 贪心） ────────────────────────
-        std::vector<std::size_t> generate(const std::vector<std::size_t> &prompt,
-                                          std::size_t max_new_tokens,
-                                          Scalar temperature = 1.0)
+        [[nodiscard]] Result<std::vector<std::size_t>>
+        generate(const std::vector<std::size_t> &prompt,
+                 std::size_t max_new_tokens,
+                 Scalar temperature = 1.0) override
         {
             std::vector<std::size_t> context(prompt);
             std::vector<std::size_t> generated;
@@ -1918,7 +1967,8 @@ namespace nn
                         static_cast<Scalar>(context[start + t]));
 
                 auto logits_res = forward(input); // (vocab_size, cur_len)
-                if (!logits_res) break;  // 生成中出错则提前终止
+                if (!logits_res)
+                    return std::unexpected(std::move(logits_res).error());
                 auto logits = *logits_res;
 
                 // 取最后一个位置的 logits
@@ -1988,4 +2038,4 @@ namespace nn
     };
 }
 
-#endif
+#endif // NN_COMPUTE_LAYER_HPP

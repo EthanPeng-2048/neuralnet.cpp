@@ -3,33 +3,35 @@
 
 // ── neuralnet.cpp 统一入口 ────────────────────────────────────────────────
 // 包含所有核心模块，用户只需 #include "nn.hpp"
+//
+// 包含顺序按依赖关系排列：L0 → L1 → L2 → L3 → L4
+// 注意：algebra_matrix.hpp 已传递包含 algebra_span/ops/expr/compute.hpp，
+//       config.hpp 已传递包含 core_errors.hpp，
+//       此处显式列出所有头文件是为了清晰展示模块结构。
 
-// Core utilities
-#include "core/errors.hpp"
-#include "core/assert.hpp"
-#include "core/thread_pool.hpp"
+// L0 硬件层
+#include "core_errors.hpp"
+#include "core_assert.hpp"
+#include "core_threadpool.hpp"
+#include "config.hpp"
 
-// Algebra layer (L1)
-#include "algebra/matrix.hpp"
-#include "algebra/ops.hpp"
-#include "algebra/expr.hpp"
-#include "algebra/span.hpp"
-#include "algebra/compute_dispatch.hpp"
+// L1 代数层（algebra_matrix.hpp 已传递包含其余代数头文件）
+#include "algebra_matrix.hpp"
 
-// Computation layer (L2)
-#include "layer.hpp"
-#include "loss.hpp"
-#include "optimizer.hpp"
+// L2 计算层
+#include "compute_layer.hpp"
+#include "compute_loss.hpp"
+#include "compute_optimizer.hpp"
 
-// Model layer (L3)
-#include "model.hpp"
-#include "model_io.hpp"
+// L3 实现层
+#include "model_container.hpp"
 #include "model_spec.hpp"
+#include "model_serialization.hpp"
 
-// Domain-specific
-#include "mnist_common.hpp"
-#include "gpt_common.hpp"
-#include "tokenizer.hpp"
+// L4 构建层
+#include "domain_mnist.hpp"
+#include "domain_gpt.hpp"
+#include "domain_tokenizer.hpp"
 
 namespace nn
 {

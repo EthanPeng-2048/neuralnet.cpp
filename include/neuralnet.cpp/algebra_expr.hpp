@@ -11,8 +11,8 @@
 #include <cstddef>
 #include <type_traits>
 
-#include "../nn_config.hpp"
-#include "ops.hpp"
+#include "config.hpp"
+#include "algebra_ops.hpp"
 
 namespace nn
 {
@@ -283,6 +283,34 @@ template <Expression Expr>
     return BinaryExpr<Val, Expr, ops::Lt>{Val{s}, expr};
 }
 
+// ── Scalar >= Expression → bool 表达式 ───────────────────────────────────
+template <Expression Expr>
+[[nodiscard]] constexpr auto operator>=(Scalar s, const Expr &expr)
+{
+    return BinaryExpr<Val, Expr, ops::Ge>{Val{s}, expr};
+}
+
+// ── Scalar <= Expression → bool 表达式 ───────────────────────────────────
+template <Expression Expr>
+[[nodiscard]] constexpr auto operator<=(Scalar s, const Expr &expr)
+{
+    return BinaryExpr<Val, Expr, ops::Le>{Val{s}, expr};
+}
+
+// ── Scalar == Expression → bool 表达式 ───────────────────────────────────
+template <Expression Expr>
+[[nodiscard]] constexpr auto operator==(Scalar s, const Expr &expr)
+{
+    return BinaryExpr<Val, Expr, ops::Eq>{Val{s}, expr};
+}
+
+// ── Scalar != Expression → bool 表达式 ───────────────────────────────────
+template <Expression Expr>
+[[nodiscard]] constexpr auto operator!=(Scalar s, const Expr &expr)
+{
+    return BinaryExpr<Val, Expr, ops::Ne>{Val{s}, expr};
+}
+
 // ── Expression + Scalar ──────────────────────────────────────────────────
 template <Expression Expr>
 [[nodiscard]] constexpr auto operator+(const Expr &expr, Scalar s)
@@ -367,11 +395,44 @@ template <Expression L, Expression R>
     return BinaryExpr<L, R, ops::Div>{l, r};
 }
 
-// ── 一元取反（Expression）────────────────────────────────────────────────
-template <Expression Expr>
-[[nodiscard]] constexpr auto operator-(const Expr &expr)
+// ═══════════════════════════════════════════════════════════════════════════
+// Expression 与 Expression 的比较运算（返回 bool 表达式 AST）
+// ═══════════════════════════════════════════════════════════════════════════
+
+template <Expression L, Expression R>
+[[nodiscard]] constexpr auto operator>(const L &l, const R &r)
 {
-    return UnaryExpr<Expr, ops::Neg>{expr};
+    return BinaryExpr<L, R, ops::Gt>{l, r};
+}
+
+template <Expression L, Expression R>
+[[nodiscard]] constexpr auto operator<(const L &l, const R &r)
+{
+    return BinaryExpr<L, R, ops::Lt>{l, r};
+}
+
+template <Expression L, Expression R>
+[[nodiscard]] constexpr auto operator>=(const L &l, const R &r)
+{
+    return BinaryExpr<L, R, ops::Ge>{l, r};
+}
+
+template <Expression L, Expression R>
+[[nodiscard]] constexpr auto operator<=(const L &l, const R &r)
+{
+    return BinaryExpr<L, R, ops::Le>{l, r};
+}
+
+template <Expression L, Expression R>
+[[nodiscard]] constexpr auto operator==(const L &l, const R &r)
+{
+    return BinaryExpr<L, R, ops::Eq>{l, r};
+}
+
+template <Expression L, Expression R>
+[[nodiscard]] constexpr auto operator!=(const L &l, const R &r)
+{
+    return BinaryExpr<L, R, ops::Ne>{l, r};
 }
 
 } // namespace nn

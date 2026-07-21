@@ -1,5 +1,5 @@
-#ifndef OPTIMIZER_HPP
-#define OPTIMIZER_HPP
+#ifndef NN_COMPUTE_OPTIMIZER_HPP
+#define NN_COMPUTE_OPTIMIZER_HPP
 
 #include <cmath>
 #include <functional>
@@ -7,10 +7,10 @@
 #include <string>
 #include <vector>
 
-#include "algebra/matrix.hpp"
-#include "algebra/span.hpp"
-#include "algebra/expr.hpp"
-#include "algebra/compute_dispatch.hpp"
+#include "algebra_matrix.hpp"
+#include "algebra_span.hpp"
+#include "algebra_expr.hpp"
+#include "algebra_compute.hpp"
 
 namespace nn
 {
@@ -20,7 +20,7 @@ namespace nn
     public:
         virtual ~Optimizer() = default;
         virtual Result<void> step() = 0;
-        virtual void zero_grad() = 0;
+        virtual Result<void> zero_grad() = 0;
     };
 
     // ── SGD: p -= lr * g ───────────────────────────────────────────────
@@ -56,10 +56,11 @@ namespace nn
             return {};
         }
 
-        void zero_grad() override
+        Result<void> zero_grad() override
         {
             for (auto &g_ref : grads_)
                 g_ref.get().zero();
+            return {};
         }
     };
 
@@ -118,10 +119,11 @@ namespace nn
             return {};
         }
 
-        void zero_grad() override
+        Result<void> zero_grad() override
         {
             for (auto &g_ref : grads_)
                 g_ref.get().zero();
+            return {};
         }
     };
 
@@ -210,12 +212,13 @@ namespace nn
             return {};
         }
 
-        void zero_grad() override
+        Result<void> zero_grad() override
         {
             for (auto &g_ref : grads_)
                 g_ref.get().zero();
+            return {};
         }
     };
 } // namespace nn
 
-#endif // OPTIMIZER_HPP
+#endif // NN_COMPUTE_OPTIMIZER_HPP

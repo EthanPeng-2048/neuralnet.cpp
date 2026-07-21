@@ -1,5 +1,7 @@
 /**
- * WordZip 分词器推理程序
+ * 分词器推理程序
+ *
+ * 支持 WordZip / Space / BPE 三种分词器，根据 JSON 文件中的 "type" 字段自动选择。
  *
  * 用法:
  *   tokenizer_infer --model <json> --text <string>      编码+解码
@@ -9,21 +11,26 @@
  *   tokenizer_infer --model <json> --interactive         交互模式
  */
 
-#include <neuralnet.cpp/tokenizer.hpp>
+#include <neuralnet.cpp/domain_tokenizer.hpp>
 
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
+#include <memory>
 #include <sstream>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 // ── 帮助信息 ────────────────────────────────────────────────────────────
 void print_usage(const char *prog)
 {
     std::cout
-        << "WordZip 分词器推理程序\n\n"
+        << "分词器推理程序 (WordZip / Space / BPE 自动识别)\n\n"
         << "用法:\n"
         << "  " << prog << " --model <json> --text <string>        编码并解码\n"
         << "  " << prog << " --model <json> --encode <string>      仅编码\n"
@@ -128,7 +135,8 @@ InferArgs parse_args(int argc, char *argv[])
 }
 
 // ── 解析逗号分隔的 ID 列表 ─────────────────────────────────────────────
-std::vector<std::size_t> parse_ids(const std::string &s)
+// 修复：原代码使用 std::stoul，违反"禁止异常"规范。改用 nn::parse_number。
+nn::Result<std::vector<std::size_t>> parse_ids(const std::string &s)
 {
     std::vector<std::size_t> ids;
     std::istringstream iss(s);
@@ -139,30 +147,49 @@ std::vector<std::size_t> parse_ids(const std::string &s)
         auto start = token.find_first_not_of(" \t");
         if (start == std::string::npos)
             continue;
-        ids.push_back(static_cast<std::size_t>(std::stoul(token.substr(start))));
+        auto v = nn::parse_number<std::size_t>(
+            std::string_view{token}.substr(start));
+        if (!v)
+            return std::unexpected(std::move(v.error()));
+        ids.push_back(*v);
     }
     return ids;
 }
 
 // ── 读取文本文件 ────────────────────────────────────────────────────────
-std::string read_text_file(const std::string &path)
+// 修复：原代码 ifs.tellg() 失败时返回 -1，转为 size_t 后变为巨大值，
+// 随后 std::string content(size, '\0') 会触发 std::bad_alloc。
+// 改为使用 istreambuf_iterator 读取，避免 tellg 风险。
+nn::Result<std::string> read_text_file(const std::string &path)
 {
     std::ifstream ifs(path, std::ios::binary);
     if (!ifs)
+        return std::unexpected(nn::Error{"无法打开文件: " + path});
+    return std::string{std::istreambuf_iterator<char>(ifs),
+                       std::istreambuf_iterator<char>()};
+}
+
+// ── 通用 token 调试输出（替代原 WordZipTokenizer::try_decode_token） ──
+// 通过 Tokenizer 基类的 vocab() 虚函数获取，对三种分词器都适用。
+std::string format_token(const nn::Tokenizer &tokenizer, std::size_t id)
+{
+    const auto &vocab = tokenizer.vocab();
+    if (id >= vocab.size()) return "<invalid>";
+    std::string r;
+    for (char c : vocab[id])
     {
-        std::cerr << "错误：无法打开文件 " << path << "\n";
-        std::exit(1);
+        if      (c >= 32 && c < 127) r += c;
+        else if (c == '\n')          r += "\\n";
+        else if (c == '\t')          r += "\\t";
+        else if (c == ' ')           r += "␣";
+        else { r += "\\x"; r += "0123456789abcdef"[(static_cast<unsigned char>(c)>>4)&0xF];
+                              r += "0123456789abcdef"[ static_cast<unsigned char>(c)   &0xF]; }
     }
-    ifs.seekg(0, std::ios::end);
-    const auto size = ifs.tellg();
-    ifs.seekg(0, std::ios::beg);
-    std::string content(static_cast<std::size_t>(size), '\0');
-    ifs.read(content.data(), size);
-    return content;
+    return r;
 }
 
 // ── 展示编码结果 ────────────────────────────────────────────────────────
-void show_encoding(const nn::WordZipTokenizer &tokenizer,
+void show_encoding(const nn::Tokenizer &tokenizer,
                    const std::string &text,
                    const std::vector<std::size_t> &ids,
                    bool show_detail)
@@ -185,13 +212,13 @@ void show_encoding(const nn::WordZipTokenizer &tokenizer,
         for (std::size_t i = 0; i < ids.size(); ++i)
         {
             std::cout << "    [" << ids[i] << "] \""
-                      << tokenizer.try_decode_token(ids[i]) << "\"\n";
+                      << format_token(tokenizer, ids[i]) << "\"\n";
         }
     }
 }
 
 // ── 模式：编码+解码验证 ─────────────────────────────────────────────────
-void mode_text(const nn::WordZipTokenizer &tokenizer,
+void mode_text(const nn::Tokenizer &tokenizer,
                const std::string &text, bool show_detail)
 {
     auto ids = tokenizer.encode(text);
@@ -204,7 +231,7 @@ void mode_text(const nn::WordZipTokenizer &tokenizer,
 }
 
 // ── 模式：仅编码 ────────────────────────────────────────────────────────
-void mode_encode(const nn::WordZipTokenizer &tokenizer,
+void mode_encode(const nn::Tokenizer &tokenizer,
                  const std::string &text, bool show_detail)
 {
     auto ids = tokenizer.encode(text);
@@ -221,10 +248,16 @@ void mode_encode(const nn::WordZipTokenizer &tokenizer,
 }
 
 // ── 模式：仅解码 ────────────────────────────────────────────────────────
-void mode_decode(const nn::WordZipTokenizer &tokenizer,
+void mode_decode(const nn::Tokenizer &tokenizer,
                  const std::string &id_str, bool show_detail)
 {
-    auto ids = parse_ids(id_str);
+    auto ids_result = parse_ids(id_str);
+    if (!ids_result)
+    {
+        std::cerr << "解析 ID 列表失败: " << ids_result.error().message << "\n";
+        return;
+    }
+    const auto &ids = *ids_result;
 
     if (show_detail)
     {
@@ -243,11 +276,17 @@ void mode_decode(const nn::WordZipTokenizer &tokenizer,
 }
 
 // ── 模式：性能测试 ──────────────────────────────────────────────────────
-void mode_benchmark(const nn::WordZipTokenizer &tokenizer,
+void mode_benchmark(const nn::Tokenizer &tokenizer,
                     const std::string &file_path, bool show_detail)
 {
     std::cout << "读取文件: " << file_path << "\n";
-    auto text = read_text_file(file_path);
+    auto text_result = read_text_file(file_path);
+    if (!text_result)
+    {
+        std::cerr << "错误: " << text_result.error().message << "\n";
+        return;
+    }
+    const auto &text = *text_result;
     std::cout << "文件大小: " << text.size() << " 字节\n";
 
     // 预热
@@ -298,9 +337,9 @@ void mode_benchmark(const nn::WordZipTokenizer &tokenizer,
 }
 
 // ── 模式：交互 ──────────────────────────────────────────────────────────
-void mode_interactive(const nn::WordZipTokenizer &tokenizer, bool show_detail)
+void mode_interactive(const nn::Tokenizer &tokenizer, bool show_detail)
 {
-    std::cout << "WordZip 分词器交互模式（输入 q 退出）\n\n";
+    std::cout << "分词器交互模式（输入 q 退出）\n\n";
 
     std::string line;
     while (true)
@@ -333,19 +372,65 @@ void mode_interactive(const nn::WordZipTokenizer &tokenizer, bool show_detail)
     }
 }
 
+// ── 分词器工厂：根据 JSON 文件的 "type" 字段构造对应的分词器 ──────────
+// 修复：原代码硬编码 nn::WordZipTokenizer，无法加载 Space/BPE 词表。
+// 现读取文件头部 "type" 字段后选择对应类型构造。
+nn::Result<std::unique_ptr<nn::Tokenizer>> load_tokenizer_by_type(const std::string &path)
+{
+    // 先读 JSON 内容以检测 "type" 字段
+    std::ifstream ifs(path);
+    if (!ifs)
+        return std::unexpected(nn::Error{"无法打开文件: " + path});
+    std::string content{std::istreambuf_iterator<char>(ifs),
+                        std::istreambuf_iterator<char>()};
+
+    // 检测 "type" 字段
+    auto detect_type = [&]() -> std::string {
+        auto p = content.find("\"type\"");
+        if (p == std::string::npos) return "wordzip"; // 兼容旧文件
+        auto c = content.find(':', p);
+        if (c == std::string::npos) return "wordzip";
+        ++c;
+        while (c < content.size() && (content[c] == ' ' || content[c] == '\t')) ++c;
+        if (c >= content.size() || content[c] != '"') return "wordzip";
+        ++c;
+        std::string t;
+        while (c < content.size() && content[c] != '"') t += content[c++];
+        return t;
+    };
+
+    const auto type = detect_type();
+    std::unique_ptr<nn::Tokenizer> tk;
+
+    if (type == "space_tokenizer" || type == "space")
+        tk = std::make_unique<nn::SpaceTokenizer>();
+    else if (type == "bpe_tokenizer" || type == "bpe")
+        tk = std::make_unique<nn::BPETokenizer>();
+    else
+        tk = std::make_unique<nn::WordZipTokenizer>(); // 默认/兼容
+
+    auto load_result = tk->load(path);
+    if (!load_result)
+        return std::unexpected(std::move(load_result.error()));
+
+    return tk;
+}
+
 // ── 主函数 ──────────────────────────────────────────────────────────────
 int main(int argc, char *argv[])
 {
     auto args = parse_args(argc, argv);
 
-    // 加载词表
-    nn::WordZipTokenizer tokenizer;
+    // 通过工厂模式加载分词器（根据 JSON "type" 字段自动选择类型）
     std::cout << "加载词表: " << args.model_path << "\n";
-    if (auto load_result = tokenizer.load(args.model_path); !load_result)
+    auto tk_result = load_tokenizer_by_type(args.model_path);
+    if (!tk_result)
     {
-        std::cerr << "加载失败: " << load_result.error().message << '\n';
+        std::cerr << "加载失败: " << tk_result.error().message << '\n';
         return 1;
     }
+    // tk_result 是 Result<unique_ptr<Tokenizer>>，需要双重解引用得到 Tokenizer&
+    const auto &tokenizer = **tk_result;
     std::cout << "词表大小: " << tokenizer.vocab_size() << " tokens\n\n";
 
     switch (args.mode)

@@ -1,6 +1,6 @@
 #include <neuralnet.cpp/nn.hpp>
-#include <neuralnet.cpp/model_io.hpp>
-#include <neuralnet.cpp/gpt_common.hpp>
+#include <neuralnet.cpp/model_serialization.hpp>
+#include <neuralnet.cpp/domain_gpt.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -84,13 +84,29 @@ TrainConfig parse_args(int argc, char *argv[])
         else if (arg == "--vocab" && i + 1 < argc)
             cfg.vocab_path = argv[++i];
         else if (arg == "--epochs" && i + 1 < argc)
-            cfg.epochs = std::stoi(argv[++i]);
+        {
+            auto v = nn::parse_number<int>(argv[++i]);
+            if (!v) { std::cerr << "无效 --epochs: " << v.error().message << "\n"; std::exit(1); }
+            cfg.epochs = *v;
+        }
         else if (arg == "--lr" && i + 1 < argc)
-            cfg.lr = std::stod(argv[++i]);
+        {
+            auto v = nn::parse_number<Scalar>(argv[++i]);
+            if (!v) { std::cerr << "无效 --lr: " << v.error().message << "\n"; std::exit(1); }
+            cfg.lr = *v;
+        }
         else if (arg == "--batch-size" && i + 1 < argc)
-            cfg.batch_size = static_cast<std::size_t>(std::stoi(argv[++i]));
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --batch-size: " << v.error().message << "\n"; std::exit(1); }
+            cfg.batch_size = *v;
+        }
         else if (arg == "--seq-len" && i + 1 < argc)
-            cfg.seq_len = static_cast<std::size_t>(std::stoi(argv[++i]));
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --seq-len: " << v.error().message << "\n"; std::exit(1); }
+            cfg.seq_len = *v;
+        }
         else if (arg == "--optimizer" && i + 1 < argc)
         {
             cfg.optimizer_name = argv[++i];
@@ -103,15 +119,35 @@ TrainConfig parse_args(int argc, char *argv[])
             }
         }
         else if (arg == "--d-model" && i + 1 < argc)
-            cfg.d_model = static_cast<std::size_t>(std::stoi(argv[++i]));
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --d-model: " << v.error().message << "\n"; std::exit(1); }
+            cfg.d_model = *v;
+        }
         else if (arg == "--num-heads" && i + 1 < argc)
-            cfg.num_heads = static_cast<std::size_t>(std::stoi(argv[++i]));
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --num-heads: " << v.error().message << "\n"; std::exit(1); }
+            cfg.num_heads = *v;
+        }
         else if (arg == "--num-layers" && i + 1 < argc)
-            cfg.num_layers = static_cast<std::size_t>(std::stoi(argv[++i]));
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --num-layers: " << v.error().message << "\n"; std::exit(1); }
+            cfg.num_layers = *v;
+        }
         else if (arg == "--d-ff" && i + 1 < argc)
-            cfg.d_ff = static_cast<std::size_t>(std::stoi(argv[++i]));
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --d-ff: " << v.error().message << "\n"; std::exit(1); }
+            cfg.d_ff = *v;
+        }
         else if (arg == "--log-interval" && i + 1 < argc)
-            cfg.log_interval = static_cast<std::size_t>(std::stoi(argv[++i]));
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --log-interval: " << v.error().message << "\n"; std::exit(1); }
+            cfg.log_interval = *v;
+        }
         else if (!arg.starts_with("--"))
             cfg.text_path = arg;
         else
@@ -261,6 +297,15 @@ int main(int argc, char *argv[])
 
     // ── 训练循环 ─────────────────────────────────────────────
     // 可用的 token 数量（需要 seq_len + 1 作为 input + target）
+    // 修复：原代码 all_tokens.size() - cfg.seq_len - 1 在 size_t 域中
+    // 当 size <= seq_len+1 时下溢为巨大值，后续 max_start==0 检查只能
+    // 精确捕获 size==seq_len+1 的情况。改为先比较再相减。
+    if (all_tokens.size() <= cfg.seq_len + 1)
+    {
+        std::cerr << "文本太短 (" << all_tokens.size() << " tokens)，至少需要 "
+                  << (cfg.seq_len + 2) << " 个 token\n";
+        return 1;
+    }
     const std::size_t max_start = all_tokens.size() - cfg.seq_len - 1;
     if (max_start == 0)
     {
@@ -273,6 +318,16 @@ int main(int argc, char *argv[])
 
     std::mt19937_64 rng{42};
 
+    // ── 预分配 batch 缓冲区 ───────────────────────────────────
+    // 修复：原代码每个 step 重新分配 x_tokens/y_tokens/flat_targets/y_onehot，
+    // 其中 y_onehot 在 vocab_size=10000、seq_len=256、batch=32 时约 650MB，
+    // 每 step 一次的分配/释放是显著的开销。预分配后仅在尺寸变化时重建。
+    nn::Matrix x_tokens(cfg.seq_len, cfg.batch_size);
+    nn::Matrix y_tokens(cfg.seq_len, cfg.batch_size);
+    const std::size_t total_tokens = cfg.seq_len * cfg.batch_size;
+    std::vector<std::size_t> flat_targets(total_tokens);
+    nn::Matrix y_onehot = one_hot_labels(flat_targets, tokenizer.vocab_size());
+
     auto t_start = std::chrono::steady_clock::now();
 
     for (int epoch = 0; epoch < cfg.epochs; ++epoch)
@@ -282,10 +337,7 @@ int main(int argc, char *argv[])
 
         for (std::size_t step = 0; step < steps_per_epoch; ++step)
         {
-            // ── 采样 batch ───────────────────────────────────
-            nn::Matrix x_tokens(cfg.seq_len, cfg.batch_size);
-            nn::Matrix y_tokens(cfg.seq_len, cfg.batch_size);
-
+            // ── 采样 batch（复用预分配缓冲区） ────────────────
             for (std::size_t b = 0; b < cfg.batch_size; ++b)
             {
                 std::uniform_int_distribution<std::size_t> dist(0, max_start);
@@ -308,15 +360,19 @@ int main(int argc, char *argv[])
 
             // ── 构造 one-hot 目标 ────────────────────────────
             // 展平 y_tokens: seq_len × batch_size 个 token ID
-            const std::size_t total_tokens = cfg.seq_len * cfg.batch_size;
-            std::vector<std::size_t> flat_targets(total_tokens);
             auto y_span = y_tokens.span();
             for (std::size_t t = 0; t < cfg.seq_len; ++t)
                 for (std::size_t b = 0; b < cfg.batch_size; ++b)
                     flat_targets[t * cfg.batch_size + b] =
                         static_cast<std::size_t>(y_span[t * cfg.batch_size + b]);
 
-            auto y_onehot = one_hot_labels(flat_targets, tokenizer.vocab_size());
+            // 复用 y_onehot：清零后仅设置 true_class 位置
+            y_onehot.zero();
+            for (std::size_t i = 0; i < total_tokens; ++i)
+            {
+                if (flat_targets[i] < tokenizer.vocab_size())
+                    y_onehot.set_value_unchecked(flat_targets[i], i, 1.0);
+            }
 
             // ── 损失 ─────────────────────────────────────────
             auto loss_result = ce_loss.forward(logits, y_onehot);
@@ -325,8 +381,9 @@ int main(int argc, char *argv[])
             total_loss += loss;
 
             // ── 反向传播 ─────────────────────────────────────
-            auto grad = ce_loss.backward();
-            auto bwd_result = model.backward(grad);
+            auto grad_result = ce_loss.backward();
+            if (!grad_result) { std::cerr << "\nLoss backward failed: " << grad_result.error().message << '\n'; return 1; }
+            auto bwd_result = model.backward(*grad_result);
             if (!bwd_result) { std::cerr << "Error: " << bwd_result.error().message << '\n'; return 1; }
 
             {
@@ -336,7 +393,11 @@ int main(int argc, char *argv[])
                     return 1;
                 }
             }
-            optimizer->zero_grad();
+            auto zero_result = optimizer->zero_grad();
+            if (!zero_result) {
+                std::cerr << "\n优化器 zero_grad 失败: " << zero_result.error().message << '\n';
+                return 1;
+            }
 
             // 进度显示
             if ((step + 1) % cfg.log_interval == 0 || step + 1 == steps_per_epoch)

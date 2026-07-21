@@ -15,14 +15,16 @@
  *   tokenizer_train dataset.txt --type space --vocab-size 10000
  */
 
-#include <neuralnet.cpp/tokenizer.hpp>
+#include <neuralnet.cpp/domain_tokenizer.hpp>
 
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <string>
+#include <utility>
 
 // ── 帮助信息 ────────────────────────────────────────────────────────────
 void print_usage(const char *prog)
@@ -85,7 +87,11 @@ TrainArgs parse_args(int argc, char *argv[])
             }
         }
         else if (arg == "--vocab-size" && i + 1 < argc)
-            args.vocab_size = static_cast<std::size_t>(std::stoul(argv[++i]));
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --vocab-size: " << v.error().message << "\n"; std::exit(1); }
+            args.vocab_size = *v;
+        }
         else if (arg == "--output" && i + 1 < argc)
             args.output = argv[++i];
         else if (!arg.starts_with("--"))
@@ -108,23 +114,19 @@ TrainArgs parse_args(int argc, char *argv[])
 }
 
 // ── 读取文本文件（UTF-8） ──────────────────────────────────────────────
-std::string read_text_file(const std::string &path)
+// 修复：原代码 ifs.tellg() 失败时返回 -1，转为 size_t 后变为巨大值，
+// 随后 std::string content(size, '\0') 会触发 std::bad_alloc。
+// 改为显式检查 tellg() 返回值，并改用 std::stringstream 读全部内容
+// 以避免巨型预分配。
+nn::Result<std::string> read_text_file(const std::string &path)
 {
     std::ifstream ifs(path, std::ios::binary);
     if (!ifs)
-    {
-        std::cerr << "错误：无法打开文件 " << path << "\n";
-        std::exit(1);
-    }
+        return std::unexpected(nn::Error{"无法打开文件: " + path});
 
-    ifs.seekg(0, std::ios::end);
-    const auto size = ifs.tellg();
-    ifs.seekg(0, std::ios::beg);
-
-    std::string content(static_cast<std::size_t>(size), '\0');
-    ifs.read(content.data(), size);
-
-    return content;
+    // 使用 istreambuf_iterator 读取全部内容，无需 tellg，避免失败场景
+    return std::string{std::istreambuf_iterator<char>(ifs),
+                       std::istreambuf_iterator<char>()};
 }
 
 // ── 公共验证函数 ────────────────────────────────────────────────────────
@@ -152,8 +154,13 @@ void train_wordzip(const std::string &text, const TrainArgs &args)
     std::cout << "目标词表大小: " << config.vocab_size << "\n";
 
     auto t0 = std::chrono::steady_clock::now();
-    tokenizer.train(text, config);
+    auto train_result = tokenizer.train(text, config);
     auto t1 = std::chrono::steady_clock::now();
+
+    if (!train_result) {
+        std::cerr << "训练失败: " << train_result.error().message << '\n';
+        return;
+    }
 
     std::cout << "总耗时: " << std::fixed << std::setprecision(1)
               << std::chrono::duration<double>(t1 - t0).count() << " 秒\n";
@@ -203,8 +210,13 @@ void train_space(const std::string &text, const TrainArgs &args)
     std::cout << "目标词表大小: " << config.vocab_size << "\n";
 
     auto t0 = std::chrono::steady_clock::now();
-    tokenizer.train(text, config);
+    auto train_result = tokenizer.train(text, config);
     auto t1 = std::chrono::steady_clock::now();
+
+    if (!train_result) {
+        std::cerr << "训练失败: " << train_result.error().message << '\n';
+        return;
+    }
 
     std::cout << "总耗时: " << std::fixed << std::setprecision(1)
               << std::chrono::duration<double>(t1 - t0).count() << " 秒\n";
@@ -246,8 +258,13 @@ void train_bpe(const std::string &text, const TrainArgs &args)
     std::cout << "目标词表大小: " << config.vocab_size << "\n";
 
     auto t0 = std::chrono::steady_clock::now();
-    tokenizer.train(text, config);
+    auto train_result = tokenizer.train(text, config);
     auto t1 = std::chrono::steady_clock::now();
+
+    if (!train_result) {
+        std::cerr << "训练失败: " << train_result.error().message << '\n';
+        return;
+    }
 
     std::cout << "总耗时: " << std::fixed << std::setprecision(1)
               << std::chrono::duration<double>(t1 - t0).count() << " 秒\n";
@@ -292,7 +309,13 @@ int main(int argc, char *argv[])
 
     // 读取文件
     std::cout << "读取文件: " << args.text_file << "\n";
-    auto text = read_text_file(args.text_file);
+    auto text_result = read_text_file(args.text_file);
+    if (!text_result)
+    {
+        std::cerr << "错误: " << text_result.error().message << "\n";
+        return 1;
+    }
+    auto text = std::move(*text_result);
     std::cout << "文本字符数: " << text.size() << "\n";
 
     switch (args.type)

@@ -17,29 +17,29 @@ graph TB
     end
 
     subgraph "🧩 构建层 (L4)"
-        GPT["gpt_common.hpp<br/>GPT 模型工厂"]
-        MNIST["mnist_common.hpp<br/>MNIST 模型工厂"]
+        GPT["domain_gpt.hpp<br/>GPT 模型工厂"]
+        MNIST["domain_mnist.hpp<br/>MNIST 模型工厂"]
     end
 
     subgraph "🧩 实现层 (L3)"
-        E["model.hpp<br/>模型容器"]
-        J["model_io.hpp<br/>序列化"]
+        E["model_container.hpp<br/>模型容器"]
+        J["model_serialization.hpp<br/>序列化"]
         MS["model_spec.hpp<br/>架构描述"]
     end
 
     subgraph "🧩 计算层 (L2)"
-        F["layer.hpp<br/>层定义"]
-        G["loss.hpp<br/>损失函数"]
-        H["optimizer.hpp<br/>优化器"]
+        F["compute_layer.hpp<br/>层定义"]
+        G["compute_loss.hpp<br/>损失函数"]
+        H["compute_optimizer.hpp<br/>优化器"]
     end
 
     subgraph "🧩 代数层 (L1)"
-        I["matrix.hpp<br/>矩阵运算"]
+        I["algebra_matrix.hpp<br/>矩阵运算"]
     end
 
     subgraph "🧩 硬件层 (L0)"
-        K["nn_config.hpp<br/>配置策略"]
-        L["thread_pool.hpp<br/>线程池"]
+        K["config.hpp<br/>配置策略"]
+        L["core_threadpool.hpp<br/>线程池"]
     end
 
     subgraph "💾 数据层"
@@ -83,25 +83,25 @@ graph TB
         NN["nn.hpp<br/>统一聚合头文件"]
     end
     subgraph "L4 构建层"
-        GPT["gpt_common.hpp<br/>GPT 工厂 + 超参数"]
-        MNIST["mnist_common.hpp<br/>MNIST 工厂 + 超参数"]
+        GPT["domain_gpt.hpp<br/>GPT 工厂 + 超参数"]
+        MNIST["domain_mnist.hpp<br/>MNIST 工厂 + 超参数"]
     end
     subgraph "L3 实现层"
-        MDL["model.hpp<br/>Model 容器 + 非模板 API"]
-        IO["model_io.hpp<br/>二进制序列化"]
+        MDL["model_container.hpp<br/>Model 容器 + 非模板 API"]
+        IO["model_serialization.hpp<br/>二进制序列化"]
         MS["model_spec.hpp<br/>ModelSpec 纯数据"]
     end
     subgraph "L2 计算层"
-        LAY["layer.hpp<br/>Linear/ReLU/GPT..."]
-        LOSS["loss.hpp<br/>MSE/CrossEntropy"]
-        OPT["optimizer.hpp<br/>SGD/Adam"]
+        LAY["compute_layer.hpp<br/>Linear/ReLU/GPT..."]
+        LOSS["compute_loss.hpp<br/>MSE/CrossEntropy"]
+        OPT["compute_optimizer.hpp<br/>SGD/Adam"]
     end
     subgraph "L1 代数层"
-        MAT["matrix.hpp<br/>矩阵运算"]
+        MAT["algebra_matrix.hpp<br/>矩阵运算"]
     end
     subgraph "L0 硬件层"
-        CFG["nn_config.hpp<br/>SmartPolicy"]
-        TP["thread_pool.hpp<br/>线程池"]
+        CFG["config.hpp<br/>SmartPolicy"]
+        TP["core_threadpool.hpp<br/>线程池"]
     end
 
     SRC -->|"调用构建/Model API"| GPT & MNIST & MDL

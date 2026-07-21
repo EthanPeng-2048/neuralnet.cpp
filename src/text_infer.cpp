@@ -1,6 +1,6 @@
 #include <neuralnet.cpp/nn.hpp>
-#include <neuralnet.cpp/model_io.hpp>
-#include <neuralnet.cpp/gpt_common.hpp>
+#include <neuralnet.cpp/model_serialization.hpp>
+#include <neuralnet.cpp/domain_gpt.hpp>
 
 #include <cstdlib>
 #include <iostream>
@@ -72,21 +72,49 @@ InferConfig parse_args(int argc, char *argv[])
         else if (arg == "--interactive")
             cfg.interactive = true;
         else if (arg == "--max-tokens" && i + 1 < argc)
-            cfg.max_tokens = std::stoi(argv[++i]);
+        {
+            auto v = nn::parse_number<int>(argv[++i]);
+            if (!v) { std::cerr << "无效 --max-tokens: " << v.error().message << "\n"; std::exit(1); }
+            cfg.max_tokens = *v;
+        }
         else if (arg == "--temperature" && i + 1 < argc)
-            cfg.temperature = std::stod(argv[++i]);
+        {
+            auto v = nn::parse_number<Scalar>(argv[++i]);
+            if (!v) { std::cerr << "无效 --temperature: " << v.error().message << "\n"; std::exit(1); }
+            cfg.temperature = *v;
+        }
         else if (arg == "--show-tokens")
             cfg.show_tokens = true;
         else if (arg == "--d-model" && i + 1 < argc)
-            cfg.d_model = static_cast<std::size_t>(std::stoi(argv[++i]));
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --d-model: " << v.error().message << "\n"; std::exit(1); }
+            cfg.d_model = *v;
+        }
         else if (arg == "--num-heads" && i + 1 < argc)
-            cfg.num_heads = static_cast<std::size_t>(std::stoi(argv[++i]));
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --num-heads: " << v.error().message << "\n"; std::exit(1); }
+            cfg.num_heads = *v;
+        }
         else if (arg == "--num-layers" && i + 1 < argc)
-            cfg.num_layers = static_cast<std::size_t>(std::stoi(argv[++i]));
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --num-layers: " << v.error().message << "\n"; std::exit(1); }
+            cfg.num_layers = *v;
+        }
         else if (arg == "--d-ff" && i + 1 < argc)
-            cfg.d_ff = static_cast<std::size_t>(std::stoi(argv[++i]));
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --d-ff: " << v.error().message << "\n"; std::exit(1); }
+            cfg.d_ff = *v;
+        }
         else if (arg == "--seq-len" && i + 1 < argc)
-            cfg.seq_len = static_cast<std::size_t>(std::stoi(argv[++i]));
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --seq-len: " << v.error().message << "\n"; std::exit(1); }
+            cfg.seq_len = *v;
+        }
         else if (!arg.starts_with("--"))
             cfg.prompt = arg;
         else
@@ -99,18 +127,13 @@ InferConfig parse_args(int argc, char *argv[])
 }
 
 // ==================== 从 GPTModel 提取采样结果 ====================
-// 使用 GPTModel 内置的 generate 方法（支持温度采样 + 贪心）
+// 使用 Model::generate 公有 API（虚函数分派到 GPTModel），无需向下转型
 nn::Result<std::vector<std::size_t>> generate_text(
     nn::Model &model, const std::vector<std::size_t> &prompt_tokens,
     std::size_t max_new_tokens, Scalar temperature,
     std::size_t /*seq_len*/)
 {
-    // Model 容器唯一层即为 GPTModel，安全提取
-    auto &layer_ref = model.layer_at(0);
-    auto *gpt_ptr = dynamic_cast<nn::GPTModel *>(&layer_ref);
-    if (!gpt_ptr)
-        return std::unexpected(nn::Error{"Model does not contain a GPTModel layer"});
-    return gpt_ptr->generate(prompt_tokens, max_new_tokens, temperature);
+    return model.generate(prompt_tokens, max_new_tokens, temperature);
 }
 
 // ==================== 交互模式 ====================

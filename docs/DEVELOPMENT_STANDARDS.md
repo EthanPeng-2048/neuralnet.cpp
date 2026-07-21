@@ -212,26 +212,26 @@ graph TB
         SRC["src/*.cpp"]
     end
     subgraph "L4 构建层"
-        GPT["gpt_common.hpp"]
-        MNIST["mnist_common.hpp"]
+        GPT["domain_gpt.hpp"]
+        MNIST["domain_mnist.hpp"]
     end
     subgraph "L3 实现层"
-        MDL["model.hpp"]
+        MDL["model_container.hpp"]
         MS["model_spec.hpp"]
-        IO["model_io.hpp"]
+        IO["model_serialization.hpp"]
     end
     subgraph "L2 计算层"
-        LAY["layer.hpp"]
-        LOSS["loss.hpp"]
-        OPT["optimizer.hpp"]
+        LAY["compute_layer.hpp"]
+        LOSS["compute_loss.hpp"]
+        OPT["compute_optimizer.hpp"]
     end
     subgraph "L1 代数层"
-        MAT["matrix.hpp"]
-        ALG["algebra/ (expr/ops/span/compute_dispatch)"]
+        MAT["algebra_matrix.hpp"]
+        ALG["algebra_expr/ops/span/compute.hpp"]
     end
     subgraph "L0 硬件层"
-        CFG["nn_config.hpp"]
-        TP["thread_pool.hpp"]
+        CFG["config.hpp"]
+        TP["core_threadpool.hpp"]
     end
 
     SRC -->|"构建/训练/推理"| GPT & MNIST
@@ -251,11 +251,11 @@ graph TB
 | 层级 | 文件 | 职责 |
 |------|------|------|
 | **L5 交互层** | `src/*.cpp` | 用户入口 |
-| **L4 构建层** | `gpt_common.hpp`, `mnist_common.hpp` | 模型工厂（组装层为模型） |
-| **L3 实现层** | `model.hpp`, `model_spec.hpp`, `model_io.hpp` | 模型容器 + 序列化 |
-| **L2 计算层** | `layer.hpp`, `loss.hpp`, `optimizer.hpp` | 层/损失/优化器定义（**算法所在层**） |
-| **L1 代数层** | `matrix.hpp`, `algebra/*` | 矩阵运算原语 + AST 表达式模板（**不含任何算法**） |
-| **L0 硬件层** | `nn_config.hpp`, `thread_pool.hpp` | 并行策略 |
+| **L4 构建层** | `domain_gpt.hpp`, `domain_mnist.hpp` | 模型工厂（组装层为模型） |
+| **L3 实现层** | `model_container.hpp`, `model_spec.hpp`, `model_serialization.hpp` | 模型容器 + 序列化 |
+| **L2 计算层** | `compute_layer.hpp`, `compute_loss.hpp`, `compute_optimizer.hpp` | 层/损失/优化器定义（**算法所在层**） |
+| **L1 代数层** | `algebra_matrix.hpp`, `algebra_*.hpp` | 矩阵运算原语 + AST 表达式模板（**不含任何算法**） |
+| **L0 硬件层** | `config.hpp`, `core_threadpool.hpp` | 并行策略 |
 
 > 层级仅供参考，不强制限制调用方向。**唯一硬约束：Matrix 不得包含任何神经网络算法**（ReLU/GeLU/Softmax/LayerNorm/CrossEntropy/Adam/SGD 等必须放在 L2 计算层）。
 
@@ -370,54 +370,57 @@ m.binary_apply_inplace(g,
 
 | 修改场景 | 预期只改 | 当前状态 |
 |----------|----------|----------|
-| Matrix 换存储格式（如 `vector` → 自定义 allocator） | `matrix.hpp` | ✅ 已满足（上层只通过 `span()` / 语义 API 访问） |
-| SmartPolicy 换并行策略（如线程池 → TBB） | `nn_config.hpp` | ✅ 已满足（上层不直接调 SmartPolicy） |
-| Layer 新增一种激活函数 | `layer.hpp` | ✅ 已满足 |
-| Optimizer 新增一种优化器 | `optimizer.hpp` | ✅ 已满足 |
-| 新增一种模型架构 | 新增 `xxx_common.hpp` (L4) | ✅ 已满足 |
-| 修改 GPT 超参数默认值 | `gpt_common.hpp` | ✅ 已满足 |
-| 修改 MNIST 数据集路径 | `mnist_common.hpp` | ✅ 已满足 |
+| Matrix 换存储格式（如 `vector` → 自定义 allocator） | `algebra_matrix.hpp` | ✅ 已满足（上层只通过 `span()` / 语义 API 访问） |
+| SmartPolicy 换并行策略（如线程池 → TBB） | `config.hpp` | ✅ 已满足（上层不直接调 SmartPolicy） |
+| Layer 新增一种激活函数 | `compute_layer.hpp` | ✅ 已满足 |
+| Optimizer 新增一种优化器 | `compute_optimizer.hpp` | ✅ 已满足 |
+| 新增一种模型架构 | 新增 `domain_xxx.hpp` (L4) | ✅ 已满足 |
+| 修改 GPT 超参数默认值 | `domain_gpt.hpp` | ✅ 已满足 |
+| 修改 MNIST 数据集路径 | `domain_mnist.hpp` | ✅ 已满足 |
 
 ---
 
 ## 🏗️ 模块化设计规范
 
-### 1. 目录结构
+### 1. 目录结构（扁平化）
 
 ```
 include/neuralnet.cpp/
 │
 │  ┌─ L0 硬件层 ──────────────────────────────────────┐
-├── nn_config.hpp      # 全局配置、Scalar 类型、SmartPolicy（仅 CPU）
-├── core/thread_pool.hpp    # 线程池实现
-├── core/errors.hpp    # Result<T> = std::expected<T, Error>
-├── core/assert.hpp    # 断言宏
+├── config.hpp           # 全局配置、Scalar 类型、SmartPolicy（仅 CPU）
+├── core_threadpool.hpp  # 线程池实现
+├── core_errors.hpp      # Result<T> = std::expected<T, Error>
+├── core_assert.hpp      # 断言宏
 │
 │  ┌─ L1 代数层 ──────────────────────────────────────┐
-├── algebra/matrix.hpp     # 矩阵运算（内部自动并行分派，上层无感）
-├── algebra/expr.hpp       # 表达式模板
-├── algebra/ops.hpp        # 逐元素算子（ReLU/GeLU）
-├── algebra/span.hpp       # Span 抽象
-├── algebra/compute_dispatch.hpp  # 计算分派
+├── algebra_matrix.hpp       # 矩阵运算（内部自动并行分派，上层无感）
+├── algebra_expr.hpp         # 表达式模板
+├── algebra_ops.hpp          # 逐元素算子
+├── algebra_span.hpp         # Span 抽象
+├── algebra_compute.hpp      # 计算分派（compute::apply 统一入口）
 │
 │  ┌─ L2 计算层 ──────────────────────────────────────┐
-├── layer.hpp          # 层基类和实现（Linear/ReLU/GeLU/GPT...）
-├── loss.hpp           # 损失函数（MSE/CrossEntropy）
-├── optimizer.hpp      # 优化器（SGD/Adam）
+├── compute_layer.hpp      # 层基类和实现（Linear/ReLU/GeLU/GPT...）
+├── compute_loss.hpp       # 损失函数（MSE/CrossEntropy）
+├── compute_optimizer.hpp  # 优化器（SGD/Adam）
 │
 │  ┌─ L3 实现层 ──────────────────────────────────────┐
-├── model.hpp          # 模型容器（Layer 序列 + 前后传播 + 非模板工厂 API）
-├── model_spec.hpp     # 模型架构描述（ModelSpec 纯数据，无 L2 依赖）
-├── model_io.hpp       # 模型二进制序列化
-├── tokenizer.hpp      # 分词器
+├── model_container.hpp    # 模型容器（Layer 序列 + 前后传播 + 非模板工厂 API）
+├── model_spec.hpp         # 模型架构描述（ModelSpec 纯数据，无 L2 依赖）
+├── model_serialization.hpp # 模型二进制序列化
 │
 │  ┌─ L4 构建层 ──────────────────────────────────────┐
-├── gpt_common.hpp     # GPT 模型工厂（构建函数 + 超参数常量）
-├── mnist_common.hpp   # MNIST 模型工厂（构建函数 + 超参数常量）
+├── domain_mnist.hpp       # MNIST 模型工厂（构建函数 + 超参数常量）
+├── domain_gpt.hpp         # GPT 模型工厂（构建函数 + 超参数常量）
+├── domain_tokenizer.hpp   # 分词器（WordZip/BPE/ByteZip）
 │
 │  ┌─ 统一入口 ──────────────────────────────────────┐
-└── nn.hpp             # 统一入口头文件（聚合所有公共 API）
+└── nn.hpp                 # 统一入口头文件（聚合所有公共 API）
 ```
+
+> **扁平化设计**：所有头文件放在同一目录，使用前缀命名（`core_`, `algebra_`, `compute_`, `domain_`, `model_`）区分层级。
+> 避免子目录带来的包含路径复杂性，同时保持清晰的层级划分。
 
 ### 2. 头文件设计原则
 

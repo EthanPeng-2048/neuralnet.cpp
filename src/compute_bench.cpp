@@ -128,11 +128,17 @@ int main(int argc, char* argv[])
                       << "  --help      显示此帮助信息\n";
             return 0;
         } else if (arg == "--size" && i + 1 < argc) {
-            base_size = static_cast<std::size_t>(std::stoi(argv[++i]));
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --size: " << v.error().message << "\n"; return 1; }
+            base_size = *v;
         } else if (arg == "--iters" && i + 1 < argc) {
-            iters = std::stoi(argv[++i]);
+            auto v = nn::parse_number<int>(argv[++i]);
+            if (!v) { std::cerr << "无效 --iters: " << v.error().message << "\n"; return 1; }
+            iters = *v;
         } else if (arg == "--warmup" && i + 1 < argc) {
-            warmup = std::stoi(argv[++i]);
+            auto v = nn::parse_number<int>(argv[++i]);
+            if (!v) { std::cerr << "无效 --warmup: " << v.error().message << "\n"; return 1; }
+            warmup = *v;
         } else {
             std::cerr << "未知参数: " << arg << "\n";
             return 1;
@@ -319,6 +325,12 @@ int main(int argc, char* argv[])
 
             // Forward: C = W * input + b → FLOPs = 2·out·in·batch + out·batch
             double fwd_flops = matmul_flops(out, batch, in) + elem_flops(out * batch);
+            // 首次调用校验结果，后续 benchmark 内部重复调用假设成功
+            auto first_fwd = layer.forward(input);
+            if (!first_fwd) {
+                std::cerr << "Linear forward 失败: " << first_fwd.error().message << "\n";
+                return 1;
+            }
             auto res_fwd = bench([&] { auto r = layer.forward(input); (void)r; }, warmup, iters);
 
             char spec[64];
@@ -329,7 +341,11 @@ int main(int argc, char* argv[])
             // FLOPs ≈ 2·out·in·batch (W^T * grad_out) + out·in·batch (outer product) + out·batch (bias)
             double bwd_flops = matmul_flops(in, batch, out) + elem_flops(out * in * batch) + elem_flops(out * batch);
             auto grad_out = rand_matrix(out, batch);
-            auto r_fwd = layer.forward(input);
+            auto first_bwd = layer.backward(grad_out);
+            if (!first_bwd) {
+                std::cerr << "Linear backward 失败: " << first_bwd.error().message << "\n";
+                return 1;
+            }
             auto res_bwd = bench([&] { auto r = layer.backward(grad_out); (void)r; }, warmup, iters);
             print_row("Linear bwd", spec, bwd_flops, res_bwd.avg_ms, res_bwd.min_ms);
         }

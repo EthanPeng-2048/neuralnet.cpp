@@ -1,5 +1,5 @@
-#ifndef GPT_COMMON_HPP
-#define GPT_COMMON_HPP
+#ifndef NN_DOMAIN_GPT_HPP
+#define NN_DOMAIN_GPT_HPP
 
 #include <cstddef>
 #include <fstream>
@@ -7,9 +7,9 @@
 #include <string>
 #include <vector>
 
-#include "model.hpp"
+#include "model_container.hpp"
 #include "model_spec.hpp"
-#include "tokenizer.hpp"
+#include "domain_tokenizer.hpp"
 
 namespace nn {
 
@@ -43,6 +43,8 @@ inline constexpr std::size_t GPT_SEQ_LEN       = 256;
 {
     if (d_model == 0 || num_heads == 0 || seq_len == 0 || vocab_size == 0)
         return std::unexpected(Error{"GPT model parameters must be positive"});
+    if (d_ff == 0 || num_layers == 0)
+        return std::unexpected(Error{"GPT d_ff and num_layers must be positive"});
     if (d_model % num_heads != 0)
         return std::unexpected(Error{"GPT d_model must be divisible by num_heads"});
 
@@ -86,4 +88,4 @@ inline constexpr std::size_t GPT_SEQ_LEN       = 256;
 
 } // namespace nn
 
-#endif // GPT_COMMON_HPP
+#endif // NN_DOMAIN_GPT_HPP

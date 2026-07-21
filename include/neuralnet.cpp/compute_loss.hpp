@@ -1,5 +1,5 @@
-#ifndef LOSS_HPP
-#define LOSS_HPP
+#ifndef NN_COMPUTE_LOSS_HPP
+#define NN_COMPUTE_LOSS_HPP
 
 #include <algorithm>
 #include <array>
@@ -10,11 +10,11 @@
 #include <string>
 #include <vector>
 
-#include "nn_config.hpp"
-#include "algebra/matrix.hpp"
-#include "algebra/span.hpp"
-#include "algebra/expr.hpp"
-#include "algebra/compute_dispatch.hpp"
+#include "config.hpp"
+#include "algebra_matrix.hpp"
+#include "algebra_span.hpp"
+#include "algebra_expr.hpp"
+#include "algebra_compute.hpp"
 
 namespace nn
 {
@@ -23,7 +23,7 @@ namespace nn
     public:
         virtual ~Loss() = default;
         virtual Result<Scalar> forward(const Matrix &pred, const Matrix &target) = 0;
-        virtual const Matrix &backward() const = 0;
+        virtual Result<Matrix> backward() const = 0;
     };
 
     class MSELoss : public Loss
@@ -60,7 +60,7 @@ namespace nn
             return loss;
         }
 
-        [[nodiscard]] const Matrix &backward() const noexcept override { return grad_input_; }
+        [[nodiscard]] Result<Matrix> backward() const noexcept override { return grad_input_; }
     };
 
     // ── CrossEntropyLoss（带 softmax） ───────────────────────────────────
@@ -149,8 +149,8 @@ namespace nn
             return loss;
         }
 
-        [[nodiscard]] const Matrix &backward() const noexcept override { return grad_input_; }
+        [[nodiscard]] Result<Matrix> backward() const noexcept override { return grad_input_; }
     };
 } // namespace nn
 
-#endif // LOSS_HPP
+#endif // NN_COMPUTE_LOSS_HPP

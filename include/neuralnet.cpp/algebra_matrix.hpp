@@ -4,7 +4,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <execution>
@@ -17,12 +16,12 @@
 #include <utility>
 #include <vector>
 
-#include "../core/errors.hpp"
-#include "../core/assert.hpp"
-#include "../core/thread_pool.hpp"
-#include "../nn_config.hpp"
-#include "span.hpp"
-#include "compute_dispatch.hpp"
+#include "core_errors.hpp"
+#include "core_assert.hpp"
+#include "core_threadpool.hpp"
+#include "config.hpp"
+#include "algebra_span.hpp"
+#include "algebra_compute.hpp"
 
 namespace nn
 {
@@ -136,8 +135,8 @@ namespace nn
         }
         [[nodiscard]] constexpr Scalar at_unchecked(std::size_t row, std::size_t col) const noexcept { return data_[index(row, col)]; } // 无校验
         constexpr void set_value_unchecked(std::size_t row, std::size_t col, Scalar value) noexcept { data_[index(row, col)] = value; } // 无校验
-        [[nodiscard]] const std::vector<Scalar> &data() const noexcept { return data_; }
-        [[nodiscard]] std::vector<Scalar> &data() noexcept { return data_; }
+        // 注：原 data() 方法已移除——它返回 std::vector<Scalar>& 泄露内部存储类型，
+        // 违反"不穿透接口"规范。所有外部访问应通过 span() 获取视图。
         [[nodiscard]] std::vector<std::vector<Scalar>> get_data() const
         {
             std::vector<std::vector<Scalar>> result(rows_, std::vector<Scalar>(cols_, 0.0));
@@ -196,7 +195,7 @@ namespace nn
         // ── 转置到预分配缓冲区（零分配热路径） ─────────────────────────────
         void transpose_to(Matrix &result) const
         {
-            assert(&result != this && "transpose_to: self-referencing not supported");
+            NN_ASSERT(&result != this, "transpose_to: self-referencing not supported");
             result.resize(cols_, rows_);
             if (rows_ == 0 || cols_ == 0) return;
 
@@ -242,8 +241,9 @@ namespace nn
             Matrix result(rows_, cols_);
             auto s = span();
             auto o = other.span();
+            auto r = result.span();
             SmartPolicy::transform(s.begin(), s.end(), o.begin(),
-                           result.data_.begin(), std::plus<>{});
+                           r.begin(), std::plus<>{});
             return result;
         }
 
@@ -253,8 +253,9 @@ namespace nn
             Matrix result(rows_, cols_);
             auto s = span();
             auto o = other.span();
+            auto r = result.span();
             SmartPolicy::transform(s.begin(), s.end(), o.begin(),
-                           result.data_.begin(), std::minus<>{});
+                           r.begin(), std::minus<>{});
             return result;
         }
 
@@ -262,7 +263,8 @@ namespace nn
         {
             Matrix result(rows_, cols_);
             auto s = span();
-            SmartPolicy::transform(s.begin(), s.end(), result.data().begin(),
+            auto r = result.span();
+            SmartPolicy::transform(s.begin(), s.end(), r.begin(),
                            [scalar](Scalar value) noexcept { return value * scalar; });
             return result;
         }
@@ -286,7 +288,7 @@ namespace nn
         // 使用 std::span（C++20）提供类型安全的非拥有视图
         void multiply_to(Matrix &result, const Matrix &other) const
         {
-            assert(&result != this && "multiply_to: self-referencing not supported");
+            NN_ASSERT(&result != this, "multiply_to: self-referencing not supported");
             const std::size_t M = rows_;
             const std::size_t N = other.cols_;
             const std::size_t K = cols_;
@@ -383,7 +385,8 @@ namespace nn
 
         void scale_inplace(Scalar scalar) noexcept
         {
-            SmartPolicy::for_each(data_.begin(), data_.end(),
+            auto s = span();
+            SmartPolicy::for_each(s.begin(), s.end(),
                            [scalar](Scalar &value) noexcept { value *= scalar; });
         }
 
@@ -391,15 +394,16 @@ namespace nn
         void add_inplace(const Matrix &other)
         {
             require_same_shape(*this, other, "add_inplace dimension mismatch");
+            auto s = span();
             auto o = other.span();
-            SmartPolicy::transform(data_.begin(), data_.end(), o.begin(),
-                           data_.begin(), std::plus<>{});
+            SmartPolicy::transform(s.begin(), s.end(), o.begin(),
+                           s.begin(), std::plus<>{});
         }
 
         // 填充零
         void zero() noexcept
         {
-            std::fill(data_.begin(), data_.end(), 0.0);
+            std::fill(span().begin(), span().end(), 0.0);
         }
 
 
@@ -410,8 +414,9 @@ namespace nn
         {
             Matrix result(rows_, cols_);
             auto s = span();
+            auto r = result.span();
             SmartPolicy::transform(s.begin(), s.end(),
-                           result.data_.begin(), std::forward<F>(func));
+                           r.begin(), std::forward<F>(func));
             return result;
         }
 
@@ -424,8 +429,9 @@ namespace nn
             Matrix result(rows_, cols_);
             auto s = span();
             auto o = other.span();
+            auto r = result.span();
             SmartPolicy::transform(s.begin(), s.end(),
-                           o.begin(), result.data_.begin(),
+                           o.begin(), r.begin(),
                            std::forward<F>(func));
             return result;
         }
@@ -435,9 +441,10 @@ namespace nn
         void binary_apply_inplace(const Matrix& other, F&& func)
         {
             require_same_shape(*this, other, "binary_apply_inplace dimension mismatch");
+            auto s = span();
             auto o = other.span();
-            SmartPolicy::transform(data_.begin(), data_.end(),
-                           o.begin(), data_.begin(),
+            SmartPolicy::transform(s.begin(), s.end(),
+                           o.begin(), s.begin(),
                            std::forward<F>(func));
         }
 
@@ -446,7 +453,8 @@ namespace nn
         template <typename T, typename ReduceOp, typename TransformOp>
         [[nodiscard]] T reduce(T init, ReduceOp&& reduce_op, TransformOp&& transform_op) const
         {
-            return SmartPolicy::transform_reduce(data_.begin(), data_.end(), init,
+            auto s = span();
+            return SmartPolicy::transform_reduce(s.begin(), s.end(), init,
                 std::forward<ReduceOp>(reduce_op), std::forward<TransformOp>(transform_op));
         }
 
@@ -489,6 +497,7 @@ namespace nn
         // 对每一列独立归约，返回 (1, cols) 矩阵。
         //   result[0][c] = reduce_op(init, transform_op(this[0][c]), ..., transform_op(this[rows-1][c]))
         // 上层可基于此表达 LayerNorm 列均值/列方差等算法。
+        // 并行实现：列间无数据依赖，使用 SmartPolicy 并行处理各列。
         template <typename T, typename ReduceOp, typename TransformOp>
         [[nodiscard]] Matrix col_reduce(T init, ReduceOp&& reduce_op, TransformOp&& transform_op) const
         {
@@ -499,15 +508,29 @@ namespace nn
             auto out = result.span();
             const std::size_t R = rows_;
             const std::size_t C = cols_;
+            const std::size_t total = R * C;
 
-            // 先归约到标量数组，再写回 result
-            std::vector<T> accs(C, init);
-            for (std::size_t r = 0; r < R; ++r) {
-                for (std::size_t c = 0; c < C; ++c)
-                    accs[c] = reduce_op(accs[c], transform_op(self[r * C + c]));
+            auto process_col = [self, out, R, C, init,
+                                reduce_op = std::forward<ReduceOp>(reduce_op),
+                                transform_op = std::forward<TransformOp>(transform_op)](std::size_t c) noexcept {
+                T acc = init;
+                // 列主序访问：跨行步长为 C，cache 不友好但每列独立
+                for (std::size_t r = 0; r < R; ++r)
+                    acc = reduce_op(acc, transform_op(self[r * C + c]));
+                out[c] = static_cast<Scalar>(acc);
+            };
+
+            // 大矩阵启用并行（按列分派）；小矩阵串行避免线程调度开销
+            if (total >= SmartPolicy::PARALLEL_THRESHOLD)
+            {
+                auto col_indices = std::views::iota(std::size_t{0}, C);
+                SmartPolicy::for_each(col_indices.begin(), col_indices.end(), process_col);
             }
-            for (std::size_t c = 0; c < C; ++c)
-                out[c] = static_cast<Scalar>(accs[c]);
+            else
+            {
+                for (std::size_t c = 0; c < C; ++c)
+                    process_col(c);
+            }
             return result;
         }
 
@@ -517,12 +540,13 @@ namespace nn
         template <typename F>
         void broadcast_row_inplace(const Matrix& row_vec, F&& op)
         {
-            assert(row_vec.rows_ == rows_ && row_vec.cols_ == 1 && "row_vec shape mismatch");
+            NN_ASSERT(row_vec.rows_ == rows_ && row_vec.cols_ == 1, "row_vec shape mismatch");
             const auto v = row_vec.span();
             const std::size_t C = cols_;
-            auto idx = std::views::iota(std::size_t{0}, data_.size());
+            auto d = span();
+            auto idx = std::views::iota(std::size_t{0}, d.size());
             SmartPolicy::for_each(idx.begin(), idx.end(),
-                [d = data_.data(), &v, C, op = std::forward<F>(op)](std::size_t i) noexcept {
+                [&d, &v, C, op = std::forward<F>(op)](std::size_t i) noexcept {
                     d[i] = static_cast<Scalar>(op(d[i], v[i / C]));
                 });
         }
@@ -533,12 +557,13 @@ namespace nn
         template <typename F>
         void broadcast_col_inplace(const Matrix& col_vec, F&& op)
         {
-            assert(col_vec.rows_ == 1 && col_vec.cols_ == cols_ && "col_vec shape mismatch");
+            NN_ASSERT(col_vec.rows_ == 1 && col_vec.cols_ == cols_, "col_vec shape mismatch");
             const auto v = col_vec.span();
             const std::size_t C = cols_;
-            auto idx = std::views::iota(std::size_t{0}, data_.size());
+            auto d = span();
+            auto idx = std::views::iota(std::size_t{0}, d.size());
             SmartPolicy::for_each(idx.begin(), idx.end(),
-                [d = data_.data(), &v, C, op = std::forward<F>(op)](std::size_t i) noexcept {
+                [&d, &v, C, op = std::forward<F>(op)](std::size_t i) noexcept {
                     d[i] = static_cast<Scalar>(op(d[i], v[i % C]));
                 });
         }
@@ -548,12 +573,13 @@ namespace nn
         // 这是通用数学原语（按行广播加法），不是算法。
         void add_bias_broadcast_inplace(const Matrix& bias)
         {
-            assert(bias.rows_ == rows_ && bias.cols_ == 1 && "bias broadcast dimension mismatch");
+            NN_ASSERT(bias.rows_ == rows_ && bias.cols_ == 1, "bias broadcast dimension mismatch");
             const std::size_t batch = cols_;
             auto b = bias.span();
-            auto idx = std::views::iota(std::size_t{0}, data_.size());
+            auto d = span();
+            auto idx = std::views::iota(std::size_t{0}, d.size());
             SmartPolicy::for_each(idx.begin(), idx.end(),
-                [d = data_.data(), &b, batch](std::size_t i) noexcept {
+                [&d, &b, batch](std::size_t i) noexcept {
                     d[i] += b[i / batch];
                 });
         }
