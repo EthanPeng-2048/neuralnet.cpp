@@ -89,7 +89,7 @@ if(Vulkan_FOUND)
     find_program(GLSLC glslc HINTS ${Vulkan_GLSLC_EXECUTABLE})
 
     # 定义着色器列表
-    set(GPU_SHADERS matmul matmul_tiled elementwise layernorm)
+    set(GPU_SHADERS matmul matmul_tiled elementwise layernorm layernorm_backward)
     set(GPU_SHADER_HPPS "")
 
     foreach(SHADER_NAME ${GPU_SHADERS})

@@ -368,6 +368,7 @@ namespace nn
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
                             Scalar sum = 0.0;
+#pragma clang loop vectorize(assume_safety)
                             for (std::size_t kk = 0; kk < k_len; ++kk)
                                 sum += a_row[kk] * b_col[kk];
                             r_row[j] += sum;
@@ -399,6 +400,318 @@ namespace nn
                             for (std::size_t jj = 0; jj < j_len; ++jj)
                                 for (std::size_t kk = 0; kk < k_len; ++kk)
                                     b_block[jj * k_len + kk] = b[(k_start + kk) * N + (j_start + jj)];
+                            const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
+
+                            for (std::size_t i = i_start; i < i_end; ++i)
+                            {
+                                const auto a_row = a.subspan(i * K + k_start);
+                                auto r_row = r.subspan(i * N + j_start);
+                                for (std::size_t j = 0; j < j_len; ++j)
+                                {
+                                    const auto b_col = b_block_span.subspan(j * k_len, k_len);
+                                    Scalar sum = 0.0;
+#pragma clang loop vectorize(assume_safety)
+                                    for (std::size_t kk = 0; kk < k_len; ++kk)
+                                        sum += a_row[kk] * b_col[kk];
+                                    r_row[j] += sum;
+                                }
+                            }
+                        }
+                    });
+            }
+        }
+
+        // ── 矩阵乘法（B 转置）到预分配缓冲区 ─────────────────────────
+        // 计算 result = this * B^T，其中 B 存储为 (N, K) 行主序
+        // 无需实际转置 B，直接从 B 的行读取列（节省 O(N*K) 的拷贝）
+        // 
+        // 维度要求：this=(M,K), b_trans=(N,K) → result=(M,N)
+        // 即 C[m][n] = Σ_k A[m][k] * B[n][k]
+        void multiply_transposed_to(Matrix &result, const Matrix &b_trans) const
+        {
+            NN_ASSERT(&result != this && &result != &b_trans, "multiply_transposed_to: self-referencing not supported");
+            NN_ASSERT(cols_ == b_trans.cols_, "multiply_transposed_to: inner dimensions mismatch");
+            const std::size_t M = rows_;
+            const std::size_t K = cols_;
+            const std::size_t N = b_trans.rows_;
+            result.resize(M, N);
+            if (M == 0 || N == 0 || K == 0) return;
+
+            result.zero();
+
+            const auto a = span();
+            const auto bt = b_trans.span();
+            auto r = result.span();
+
+            const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            const auto n_blocks = i_blocks * j_blocks;
+
+            if (n_blocks <= 1)
+            {
+                const std::size_t i_start = 0, i_end = M;
+                const std::size_t j_start = 0, j_end = N;
+                for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE)
+                {
+                    const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
+                    const std::size_t k_len = k_end - k_start;
+                    const std::size_t j_len = j_end - j_start;
+                    // B^T 块加载：B[n][k] 从 bt[n * K + k] 读取
+                    std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                    for (std::size_t jj = 0; jj < j_len; ++jj)
+                        for (std::size_t kk = 0; kk < k_len; ++kk)
+                            b_block[jj * k_len + kk] = bt[(j_start + jj) * K + (k_start + kk)];
+                    const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
+                    for (std::size_t i = i_start; i < i_end; ++i)
+                    {
+                        const auto a_row = a.subspan(i * K + k_start);
+                        auto r_row = r.subspan(i * N + j_start);
+                        for (std::size_t j = 0; j < j_len; ++j)
+                        {
+                            const auto b_col = b_block_span.subspan(j * k_len, k_len);
+                            Scalar sum = 0.0;
+                            for (std::size_t kk = 0; kk < k_len; ++kk)
+                                sum += a_row[kk] * b_col[kk];
+                            r_row[j] += sum;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
+                SmartPolicy::parallel_for_blocks(
+                    block_indices.begin(), block_indices.end(),
+                    [a, bt, r, M, N, K, j_blocks](std::size_t block_idx) noexcept
+                    {
+                        const std::size_t i_block = block_idx / j_blocks;
+                        const std::size_t j_block = block_idx % j_blocks;
+                        const std::size_t i_start = i_block * BLOCK_SIZE;
+                        const std::size_t i_end = std::min(i_start + BLOCK_SIZE, M);
+                        const std::size_t j_start = j_block * BLOCK_SIZE;
+                        const std::size_t j_end = std::min(j_start + BLOCK_SIZE, N);
+
+                        for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE)
+                        {
+                            const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
+                            const std::size_t k_len = k_end - k_start;
+                            const std::size_t j_len = j_end - j_start;
+
+                            std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                            for (std::size_t jj = 0; jj < j_len; ++jj)
+                                for (std::size_t kk = 0; kk < k_len; ++kk)
+                                    b_block[jj * k_len + kk] = bt[(j_start + jj) * K + (k_start + kk)];
+                            const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
+
+                            for (std::size_t i = i_start; i < i_end; ++i)
+                            {
+                                const auto a_row = a.subspan(i * K + k_start);
+                                auto r_row = r.subspan(i * N + j_start);
+                                for (std::size_t j = 0; j < j_len; ++j)
+                                {
+                                    const auto b_col = b_block_span.subspan(j * k_len, k_len);
+                                    Scalar sum = 0.0;
+                                    for (std::size_t kk = 0; kk < k_len; ++kk)
+                                        sum += a_row[kk] * b_col[kk];
+                                    r_row[j] += sum;
+                                }
+                            }
+                        }
+                    });
+            }
+        }
+
+        // ── 矩阵乘法（A 转置）到预分配缓冲区 ─────────────────────────
+        // 计算 result = this^T * B，其中 this 存储为 (K, M) 行主序
+        // 无需实际转置 this，直接从 this 的列读取行（节省 O(K*M) 的拷贝）
+        //
+        // 维度要求：this=(K,M), b=(K,N) → result=(M,N)
+        // 即 C[m][n] = Σ_k A[k][m] * B[k][n]
+        void transpose_multiply_to(Matrix &result, const Matrix &b) const
+        {
+            NN_ASSERT(&result != this && &result != &b, "transpose_multiply_to: self-referencing not supported");
+            NN_ASSERT(rows_ == b.rows_, "transpose_multiply_to: inner dimensions mismatch");
+            const std::size_t K = rows_;  // this is (K, M)
+            const std::size_t M = cols_;
+            const std::size_t N = b.cols_;
+            result.resize(M, N);
+            if (M == 0 || N == 0 || K == 0) return;
+
+            result.zero();
+
+            const auto a = span();  // this stored as (K, M)
+            const auto b_data = b.span();  // b stored as (K, N)
+            auto r = result.span();
+
+            const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            const auto n_blocks = i_blocks * j_blocks;
+
+            if (n_blocks <= 1)
+            {
+                const std::size_t i_start = 0, i_end = M;
+                const std::size_t j_start = 0, j_end = N;
+                for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE)
+                {
+                    const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
+                    const std::size_t k_len = k_end - k_start;
+                    const std::size_t j_len = j_end - j_start;
+                    const std::size_t i_len = i_end - i_start;
+
+                    // A^T 块加载：A^T[m][k] = A[k][m] 从 a[k * M + m] 读取
+                    std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> a_block{};
+                    for (std::size_t ii = 0; ii < i_len; ++ii)
+                        for (std::size_t kk = 0; kk < k_len; ++kk)
+                            a_block[ii * k_len + kk] = a[(k_start + kk) * M + (i_start + ii)];
+
+                    // B 块加载：B[k][n] 从 b_data[k * N + n] 读取
+                    std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                    for (std::size_t jj = 0; jj < j_len; ++jj)
+                        for (std::size_t kk = 0; kk < k_len; ++kk)
+                            b_block[jj * k_len + kk] = b_data[(k_start + kk) * N + (j_start + jj)];
+                    const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
+
+                    for (std::size_t i = 0; i < i_len; ++i)
+                    {
+                        const auto a_row = std::span<const Scalar>(a_block.data() + i * k_len, k_len);
+                        auto r_row = r.subspan((i_start + i) * N + j_start);
+                        for (std::size_t j = 0; j < j_len; ++j)
+                        {
+                            const auto b_col = b_block_span.subspan(j * k_len, k_len);
+                            Scalar sum = 0.0;
+                            for (std::size_t kk = 0; kk < k_len; ++kk)
+                                sum += a_row[kk] * b_col[kk];
+                            r_row[j] += sum;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
+                SmartPolicy::parallel_for_blocks(
+                    block_indices.begin(), block_indices.end(),
+                    [a, b_data, r, M, N, K, j_blocks](std::size_t block_idx) noexcept
+                    {
+                        const std::size_t i_block = block_idx / j_blocks;
+                        const std::size_t j_block = block_idx % j_blocks;
+                        const std::size_t i_start = i_block * BLOCK_SIZE;
+                        const std::size_t i_end = std::min(i_start + BLOCK_SIZE, M);
+                        const std::size_t j_start = j_block * BLOCK_SIZE;
+                        const std::size_t j_end = std::min(j_start + BLOCK_SIZE, N);
+                        const std::size_t i_len = i_end - i_start;
+
+                        for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE)
+                        {
+                            const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
+                            const std::size_t k_len = k_end - k_start;
+                            const std::size_t j_len = j_end - j_start;
+
+                            // A^T 块加载
+                            std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> a_block{};
+                            for (std::size_t ii = 0; ii < i_len; ++ii)
+                                for (std::size_t kk = 0; kk < k_len; ++kk)
+                                    a_block[ii * k_len + kk] = a[(k_start + kk) * M + (i_start + ii)];
+
+                            // B 块加载
+                            std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                            for (std::size_t jj = 0; jj < j_len; ++jj)
+                                for (std::size_t kk = 0; kk < k_len; ++kk)
+                                    b_block[jj * k_len + kk] = b_data[(k_start + kk) * N + (j_start + jj)];
+                            const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
+
+                            for (std::size_t i = 0; i < i_len; ++i)
+                            {
+                                const auto a_row = std::span<const Scalar>(a_block.data() + i * k_len, k_len);
+                                auto r_row = r.subspan((i_start + i) * N + j_start);
+                                for (std::size_t j = 0; j < j_len; ++j)
+                                {
+                                    const auto b_col = b_block_span.subspan(j * k_len, k_len);
+                                    Scalar sum = 0.0;
+                                    for (std::size_t kk = 0; kk < k_len; ++kk)
+                                        sum += a_row[kk] * b_col[kk];
+                                    r_row[j] += sum;
+                                }
+                            }
+                        }
+                    });
+            }
+        }
+
+        // ── 累加矩阵乘法（A * B^T，结果累加到 result） ─────────────
+        // 计算 result += this * B^T
+        // 用于梯度累加：grad_w += grad_output * input^T
+        void multiply_transposed_add_to(Matrix &result, const Matrix &b_trans) const
+        {
+            NN_ASSERT(&result != this && &result != &b_trans, "multiply_transposed_add_to: self-referencing");
+            NN_ASSERT(cols_ == b_trans.cols_, "multiply_transposed_add_to: inner dimensions mismatch");
+            NN_ASSERT(result.rows() == rows_ && result.cols() == b_trans.rows_, "multiply_transposed_add_to: result shape mismatch");
+            const std::size_t M = rows_;
+            const std::size_t K = cols_;
+            const std::size_t N = b_trans.rows_;
+            if (M == 0 || N == 0 || K == 0) return;
+
+            const auto a = span();
+            const auto bt = b_trans.span();
+            auto r = result.span();
+
+            const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            const auto n_blocks = i_blocks * j_blocks;
+
+            if (n_blocks <= 1)
+            {
+                const std::size_t i_start = 0, i_end = M;
+                const std::size_t j_start = 0, j_end = N;
+                for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE)
+                {
+                    const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
+                    const std::size_t k_len = k_end - k_start;
+                    const std::size_t j_len = j_end - j_start;
+                    std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                    for (std::size_t jj = 0; jj < j_len; ++jj)
+                        for (std::size_t kk = 0; kk < k_len; ++kk)
+                            b_block[jj * k_len + kk] = bt[(j_start + jj) * K + (k_start + kk)];
+                    const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
+                    for (std::size_t i = i_start; i < i_end; ++i)
+                    {
+                        const auto a_row = a.subspan(i * K + k_start);
+                        auto r_row = r.subspan(i * N + j_start);
+                        for (std::size_t j = 0; j < j_len; ++j)
+                        {
+                            const auto b_col = b_block_span.subspan(j * k_len, k_len);
+                            Scalar sum = 0.0;
+                            for (std::size_t kk = 0; kk < k_len; ++kk)
+                                sum += a_row[kk] * b_col[kk];
+                            r_row[j] += sum;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
+                SmartPolicy::parallel_for_blocks(
+                    block_indices.begin(), block_indices.end(),
+                    [a, bt, r, M, N, K, j_blocks](std::size_t block_idx) noexcept
+                    {
+                        const std::size_t i_block = block_idx / j_blocks;
+                        const std::size_t j_block = block_idx % j_blocks;
+                        const std::size_t i_start = i_block * BLOCK_SIZE;
+                        const std::size_t i_end = std::min(i_start + BLOCK_SIZE, M);
+                        const std::size_t j_start = j_block * BLOCK_SIZE;
+                        const std::size_t j_end = std::min(j_start + BLOCK_SIZE, N);
+
+                        for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE)
+                        {
+                            const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
+                            const std::size_t k_len = k_end - k_start;
+                            const std::size_t j_len = j_end - j_start;
+
+                            std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                            for (std::size_t jj = 0; jj < j_len; ++jj)
+                                for (std::size_t kk = 0; kk < k_len; ++kk)
+                                    b_block[jj * k_len + kk] = bt[(j_start + jj) * K + (k_start + kk)];
                             const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
 
                             for (std::size_t i = i_start; i < i_end; ++i)

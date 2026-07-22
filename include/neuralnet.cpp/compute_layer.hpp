@@ -45,6 +45,33 @@ namespace nn
             return GpuTensor::from_matrix(*cpu_out, backend);
         }
 
+        // ── GPU-resident 反向传播 ───────────────────────────────────────────
+        // 默认实现：Download grad_output → CPU backward → Upload grad_input
+        // 子类可覆盖以提供纯 GPU 实现（如 Linear、ReLU、GeLU）
+        // 返回 grad_input（GpuTensor，供上一层使用）
+        [[nodiscard]] virtual Result<GpuTensor> backward_gpu(
+            const GpuTensor &grad_output, const GpuTensor & /*input*/, GpuBackend &backend)
+        {
+            // Fallback: Download → CPU backward → Upload
+            auto cpu_grad = grad_output.to_matrix(backend);
+            if (!cpu_grad) return std::unexpected(cpu_grad.error());
+
+            auto cpu_grad_in = backward(*cpu_grad);
+            if (!cpu_grad_in) return std::unexpected(cpu_grad_in.error());
+
+            return GpuTensor::from_matrix(*cpu_grad_in, backend);
+        }
+
+        // ── 在 batch 提交后下载 GPU 结果以填充 backward 缓存 ───────────
+        // 默认实现：下载 GPU 输出并调用 CPU forward 填充所有缓存
+        // 子类可覆盖以提供更高效的实现（如直接下载特定中间结果）
+        virtual void populate_cache_from_gpu(
+            const GpuTensor &input, const GpuTensor & /*output*/, GpuBackend &backend)
+        {
+            auto cpu_in = input.to_matrix(backend);
+            if (cpu_in) (void)forward(*cpu_in);  // 填充 CPU 缓存
+        }
+
         // ── 使 GPU 权重缓存失效（训练时 optimizer.step() 后调用）──────
         // 默认实现为空（大多数层没有可学习参数）
         virtual void invalidate_gpu_cache() {}
@@ -72,8 +99,11 @@ namespace nn
         Matrix input_cache_;
 
         // ── 预分配缓冲区：避免 forward/backward 热路径反复分配内存 ──────
-        Matrix product_buf_;   // w * input 的中间结果
-        Matrix grad_wt_buf_;   // backward: w^T
+        Matrix forward_buf_;      // forward: W*x+b 结果缓冲区
+        Matrix grad_wt_buf_;      // backward: W^T (in_feat × out_feat)
+        Matrix grad_input_buf_;   // backward: grad_input (in_feat × batch)
+        Matrix input_T_buf_;      // backward: input_cache_^T (batch × in_feat)
+        Matrix grad_w_temp_buf_;  // backward: grad_output * input_T (out_feat × in_feat)
 
         // 使用 thread_local 保证多线程构造 Layer 时的线程安全
         inline static thread_local std::mt19937_64 rng_{std::random_device{}()};
@@ -82,7 +112,7 @@ namespace nn
         // ── GPU 权重缓存（懒加载，首次 forward_gpu 时上传）──────────────
         std::optional<GpuTensor> gpu_weights_;
         std::optional<GpuTensor> gpu_bias_;
-        bool gpu_cache_dirty_ = true;  // 权重是否需要重新上传
+        bool gpu_cache_dirty_ = true;
 #endif
 
     public:
@@ -92,8 +122,11 @@ namespace nn
               grad_w_(out_features, in_features),
               grad_b_(out_features, 1),
               input_cache_(),
-              product_buf_(out_features, 1),
-              grad_wt_buf_(in_features, out_features)
+              forward_buf_(out_features, 1),
+              grad_wt_buf_(in_features, out_features),
+              grad_input_buf_(in_features, 1),
+              input_T_buf_(1, in_features),
+              grad_w_temp_buf_(out_features, in_features)
         {
             // Xavier 均匀初始化：适合 tanh/sigmoid，对 ReLU 也可用
             const Scalar limit = std::sqrt(6.0 / static_cast<Scalar>(in_features + out_features));
@@ -120,42 +153,48 @@ namespace nn
 
             input_cache_ = input;
 
-            // product = w * input（写入预分配缓冲区，避免分配）
-            w_.multiply_to(product_buf_, input);
+            // W*x 直接写入 forward_buf_（预分配，零分配）
+            w_.multiply_to(forward_buf_, input);
 
-            // result = product + bias
-            Matrix result = product_buf_;
-            result.add_bias_broadcast_inplace(b_);
+            // result = forward_buf_ + bias（就地加法，无需额外拷贝）
+            forward_buf_.add_bias_broadcast_inplace(b_);
 
-            return result;
+            return forward_buf_;
         }
 
 #ifdef NN_HAS_VULKAN
-        // ── GPU-resident 前向传播 ───────────────────────────────────────
-        // 纯 GPU 矩阵乘法 + Bias Add，零 PCIe 中间传输
-        // 使用权重缓存：推理时只上传一次，训练时每步重新上传
+        // ── GPU-resident 前向传播：录制 matmul + bias add 到 batch ───
+        // 零 PCIe 中间传输，只在 populate_cache_from_gpu 时下载
         [[nodiscard]] Result<GpuTensor> forward_gpu(
             const GpuTensor &input, GpuBackend &backend) override
         {
             // 1. 上传权重到 GPU（懒加载 + dirty flag）
             if (gpu_cache_dirty_ || !gpu_weights_)
             {
-                auto w_res = GpuTensor::from_matrix(w_, backend);
-                if (!w_res) return std::unexpected(w_res.error());
-                gpu_weights_ = std::move(*w_res);
-
-                auto b_res = GpuTensor::from_matrix(b_, backend);
-                if (!b_res) return std::unexpected(b_res.error());
-                gpu_bias_ = std::move(*b_res);
-
+                if (!gpu_weights_)
+                {
+                    auto w_res = GpuTensor::from_matrix(w_, backend);
+                    if (!w_res) return std::unexpected(w_res.error());
+                    gpu_weights_ = std::move(*w_res);
+                    auto b_res = GpuTensor::from_matrix(b_, backend);
+                    if (!b_res) return std::unexpected(b_res.error());
+                    gpu_bias_ = std::move(*b_res);
+                }
+                else
+                {
+                    auto u1 = backend.upload_blocking(*gpu_weights_, w_.span());
+                    if (!u1) return std::unexpected(u1.error());
+                    auto u2 = backend.upload_blocking(*gpu_bias_, b_.span());
+                    if (!u2) return std::unexpected(u2.error());
+                }
                 gpu_cache_dirty_ = false;
             }
 
-            // 2. 纯 GPU 矩阵乘法（阻塞等待完成）
-            auto mm_res = backend.matmul_gpu(input, *gpu_weights_);
+            // 2. 录制 matmul: output = W * input
+            auto mm_res = backend.matmul_gpu(*gpu_weights_, input);
             if (!mm_res) return std::unexpected(mm_res.error());
 
-            // 3. GPU 端 Bias Add（阻塞等待完成）
+            // 3. 录制 bias add: output += bias
             auto ba_res = backend.elementwise_gpu(
                 *mm_res, &*gpu_bias_, 2u,
                 static_cast<uint32_t>(w_.rows()),
@@ -165,8 +204,69 @@ namespace nn
             return ba_res;
         }
 
-        // ── 使 GPU 权重缓存失效（训练时 optimizer.step() 后调用）──────
+        // ── batch 提交后填充 backward 缓存 ───────────────────────────
+        void populate_cache_from_gpu(
+            const GpuTensor &input, const GpuTensor & /*output*/, GpuBackend &backend) override
+        {
+            // 下载输入到 CPU 以填充 input_cache_（backward 需要）
+            auto cpu_in = input.to_matrix(backend);
+            if (cpu_in) input_cache_ = std::move(*cpu_in);
+        }
+
         void invalidate_gpu_cache() override { gpu_cache_dirty_ = true; }
+
+        // ── GPU-resident 反向传播 ───────────────────────────────────────
+        // grad_input = W^T * grad_output（GPU matmul with transA=1）
+        // grad_w = grad_output * input^T（GPU matmul with transB=1）
+        // grad_b = sum(grad_output)（CPU reduction）
+        [[nodiscard]] Result<GpuTensor> backward_gpu(
+            const GpuTensor &grad_output, const GpuTensor &input, GpuBackend &backend) override
+        {
+            // 1. 确保权重在 GPU 上
+            if (gpu_cache_dirty_ || !gpu_weights_)
+            {
+                if (!gpu_weights_)
+                {
+                    auto w_res = GpuTensor::from_matrix(w_, backend);
+                    if (!w_res) return std::unexpected(w_res.error());
+                    gpu_weights_ = std::move(*w_res);
+                }
+                else
+                {
+                    auto u = backend.upload_blocking(*gpu_weights_, w_.span());
+                    if (!u) return std::unexpected(u.error());
+                }
+                gpu_cache_dirty_ = false;
+            }
+
+            // 2. grad_input = W^T * grad_output（transA=1）
+            auto gi_res = backend.matmul_gpu(*gpu_weights_, grad_output, 1u, 0u);
+            if (!gi_res) return std::unexpected(gi_res.error());
+
+            // 3. grad_w = grad_output * input^T（transB=1）
+            auto gw_res = backend.matmul_gpu(grad_output, input, 0u, 1u);
+            if (!gw_res) return std::unexpected(gw_res.error());
+
+            // 4. 下载 grad_w 并累加到 CPU 端 grad_w_
+            auto gw_cpu = gw_res->to_matrix(backend);
+            if (gw_cpu) grad_w_.add_inplace(*gw_cpu);
+
+            // 5. 下载 grad_output 用于 grad_b reduction（CPU 端）
+            auto go_cpu = grad_output.to_matrix(backend);
+            if (go_cpu)
+            {
+                Matrix grad_b_accum = go_cpu->row_reduce(Scalar{0},
+                    [](Scalar a, Scalar b) noexcept { return a + b; },
+                    [](Scalar x) noexcept { return x; });
+                grad_b_.add_inplace(grad_b_accum);
+            }
+
+            // 6. 同时填充 input_cache_ 供 CPU backward fallback 使用
+            auto cpu_in = input.to_matrix(backend);
+            if (cpu_in) input_cache_ = std::move(*cpu_in);
+
+            return gi_res;
+        }
 #endif
 
         Result<Matrix> backward(const Matrix &grad_output) override
@@ -176,31 +276,22 @@ namespace nn
             if (input_cache_.rows() != w_.cols() || input_cache_.cols() != grad_output.cols())
                 return std::unexpected(Error{"linear backward cache/input shape mismatch"});
 
-            const std::size_t in_feat = w_.cols();
-            const std::size_t out_feat = w_.rows();
-            const std::size_t batch = grad_output.cols();
-
-            // grad_input = w^T * grad_output
+            // grad_input = W^T * grad_output（转置到预分配缓冲区，标准 matmul 保证缓存友好）
             w_.transpose_to(grad_wt_buf_);
-            Matrix grad_input(in_feat, batch);
-            grad_wt_buf_.multiply_to(grad_input, grad_output);
+            grad_wt_buf_.multiply_to(grad_input_buf_, grad_output);
 
-            // grad_w += grad_output * input_cache_^T（通过 Matrix 语义方法）
-            {
-                Matrix input_T = input_cache_.transpose();
-                Matrix grad_w_accum(out_feat, in_feat);
-                grad_output.multiply_to(grad_w_accum, input_T);
-                grad_w_.add_inplace(grad_w_accum);
-            }
+            // grad_w += grad_output * input_cache_^T（转置到预分配缓冲区，标准 matmul）
+            input_cache_.transpose_to(input_T_buf_);
+            grad_output.multiply_to(grad_w_temp_buf_, input_T_buf_);
+            grad_w_.add_inplace(grad_w_temp_buf_);
 
             // grad_b += sum(grad_output, dim=batch) —— 按行归约后再累加
-            // grad_b_accum[of][0] = Σ_b grad_output[of][b]
             Matrix grad_b_accum = grad_output.row_reduce(Scalar{0},
                 [](Scalar a, Scalar b) noexcept { return a + b; },
                 [](Scalar x) noexcept { return x; });
             grad_b_.add_inplace(grad_b_accum);
 
-            return grad_input;
+            return grad_input_buf_;
         }
     };
 
@@ -225,11 +316,28 @@ namespace nn
         }
 
 #ifdef NN_HAS_VULKAN
-        // ── GPU-resident 前向传播：ReLU 通过 GPU 逐元素运算 ───────────
+        // ── GPU-resident 前向传播：录制 ReLU 到 batch ───────────
         [[nodiscard]] Result<GpuTensor> forward_gpu(
             const GpuTensor &input, GpuBackend &backend) override
         {
             return backend.elementwise_gpu(input, nullptr, 0u); // op=0: ReLU
+        }
+
+        // ── batch 提交后填充 backward 缓存 ───────────────────────────
+        void populate_cache_from_gpu(
+            const GpuTensor &input, const GpuTensor & /*output*/, GpuBackend &backend) override
+        {
+            auto cpu_in = input.to_matrix(backend);
+            if (cpu_in) input_cache_ = std::move(*cpu_in);
+        }
+
+        // ── GPU-resident 反向传播：ReLU backward on GPU ─────────────
+        // grad_input = (input > 0) ? grad_output : 0
+        [[nodiscard]] Result<GpuTensor> backward_gpu(
+            const GpuTensor &grad_output, const GpuTensor &input, GpuBackend &backend) override
+        {
+            // op=3: ReLU Backward — buf_a=grad_output, buf_b=input
+            return backend.elementwise_gpu(grad_output, &input, 3u);
         }
 #endif
 
@@ -256,6 +364,10 @@ namespace nn
         Matrix sigmoid_cache_;
         static constexpr Scalar BETA = 1.702;
 
+        // ── 预分配缓冲区：避免 backward 热路径反复分配内存 ──────
+        Matrix factor_buf_;  // backward: factor (features × batch)
+        Matrix result_buf_;  // backward: grad_input (features × batch)
+
     public:
         GeLU() = default;
 
@@ -280,11 +392,30 @@ namespace nn
         }
 
 #ifdef NN_HAS_VULKAN
-        // ── GPU-resident 前向传播：QuickGeLU 通过 GPU 逐元素运算 ──────
+        // ── GPU-resident 前向传播：录制 QuickGeLU 到 batch ─────
         [[nodiscard]] Result<GpuTensor> forward_gpu(
             const GpuTensor &input, GpuBackend &backend) override
         {
             return backend.elementwise_gpu(input, nullptr, 1u); // op=1: QuickGeLU
+        }
+
+        // ── batch 提交后填充 backward 缓存 ───────────────────────────
+        void populate_cache_from_gpu(
+            const GpuTensor &input, const GpuTensor & /*output*/, GpuBackend &backend) override
+        {
+            // GPU backward 不需要 CPU 缓存（shader 直接从 input 重算 sigmoid）
+            // 仅在 CPU fallback 时填充
+            (void)input; (void)backend;
+        }
+
+        // ── GPU-resident 反向传播：op=5 GeLU Backward ─────────────
+        // factor = s * (1 + βx(1-s)),  s = sigmoid(βx)
+        // grad_input = grad_output * factor
+        [[nodiscard]] Result<GpuTensor> backward_gpu(
+            const GpuTensor &grad_output, const GpuTensor &input, GpuBackend &backend) override
+        {
+            // op=5: GeLU Backward — buf_a=grad_output, buf_b=input
+            return backend.elementwise_gpu(grad_output, &input, 5u);
         }
 #endif
 
@@ -295,20 +426,27 @@ namespace nn
             if (input_cache_.rows() != grad_output.rows() || input_cache_.cols() != grad_output.cols())
                 return std::unexpected(Error{"gelu backward shape mismatch"});
 
+            const std::size_t rows = input_cache_.rows();
+            const std::size_t cols = input_cache_.cols();
+            factor_buf_.resize(rows, cols);
+            result_buf_.resize(rows, cols);
+
             // factor[i] = s[i] * (1 + BETA * x[i] * (1 - s[i]))
-            Matrix factor(input_cache_.rows(), input_cache_.cols());
-            Span x = input_cache_.span();
-            Span s = sigmoid_cache_.span();
-            Span f_out = factor.span();
-            compute::apply(f_out, s * (Scalar{1} + BETA * x * (Scalar{1} - s)));
+            {
+                Span x = input_cache_.span();
+                Span s = sigmoid_cache_.span();
+                Span f_out = factor_buf_.span();
+                compute::apply(f_out, s * (Scalar{1} + BETA * x * (Scalar{1} - s)));
+            }
 
             // out[i] = go[i] * factor[i]
-            Matrix result(grad_output.rows(), grad_output.cols());
-            ConstSpan go = grad_output.span();
-            Span f_in = factor.span();
-            Span r_out = result.span();
-            compute::apply(r_out, go * f_in);
-            return result;
+            {
+                ConstSpan go = grad_output.span();
+                Span f_in = factor_buf_.span();
+                Span r_out = result_buf_.span();
+                compute::apply(r_out, go * f_in);
+            }
+            return result_buf_;
         }
     };
 
@@ -330,11 +468,23 @@ namespace nn
         Matrix std_cache_;         // 标准差倒数 (1/sqrt(σ² + ε))
         Matrix mean_cache_;        // 均值
 
+        // ── 预分配缓冲区：避免 backward 热路径反复分配内存 ──────
+        Matrix gy_gamma_buf_;       // (features, batch_size)
+        Matrix gy_gamma_norm_buf_;  // (features, batch_size)
+        Matrix t1_buf_;             // (features, batch_size)
+        Matrix t2_buf_;             // (features, batch_size)
+        Matrix diff_buf_;           // (features, batch_size)
+        Matrix grad_input_buf_;     // (features, batch_size)
+
 #ifdef NN_HAS_VULKAN
-        // ── GPU 权重缓存（懒加载，首次 forward_gpu 时上传）──────────────
+        // ── GPU 参数缓存（懒加载，首次 forward_gpu 时上传）──────────────
         std::optional<GpuTensor> gpu_gamma_;
         std::optional<GpuTensor> gpu_beta_;
         bool gpu_cache_dirty_ = true;
+
+        // ── GPU backward 缓存（populate_cache_from_gpu 时上传）────────
+        std::optional<GpuTensor> gpu_normalized_;
+        std::optional<GpuTensor> gpu_std_inv_;
 #endif
 
         // 数值稳定性
@@ -424,32 +574,35 @@ namespace nn
         }
 
 #ifdef NN_HAS_VULKAN
-        // ── GPU-resident 前向传播：纯 GPU LayerNorm，零 PCIe 中间传输 ──
+        // ── GPU-resident 前向传播：录制 LayerNorm 到 batch ──
         [[nodiscard]] Result<GpuTensor> forward_gpu(
             const GpuTensor &input, GpuBackend &backend) override
         {
-            // 检查 layernorm pipeline 是否可用
             if (!backend.has_layernorm_pipeline())
-            {
-                std::cerr << "[LayerNorm::forward_gpu] layernorm pipeline not available, falling back to CPU\n";
                 return Layer::forward_gpu(input, backend);
-            }
 
-            // 1. 上传 gamma 和 beta（懒加载 + dirty flag）
+            // 上传 gamma/beta（懒加载 + dirty flag）
             if (gpu_cache_dirty_ || !gpu_gamma_)
             {
-                auto g_res = GpuTensor::from_matrix(gamma_, backend);
-                if (!g_res) return std::unexpected(g_res.error());
-                gpu_gamma_ = std::move(*g_res);
-
-                auto b_res = GpuTensor::from_matrix(beta_, backend);
-                if (!b_res) return std::unexpected(b_res.error());
-                gpu_beta_ = std::move(*b_res);
-
+                if (!gpu_gamma_)
+                {
+                    auto g_res = GpuTensor::from_matrix(gamma_, backend);
+                    if (!g_res) return std::unexpected(g_res.error());
+                    gpu_gamma_ = std::move(*g_res);
+                    auto b_res = GpuTensor::from_matrix(beta_, backend);
+                    if (!b_res) return std::unexpected(b_res.error());
+                    gpu_beta_ = std::move(*b_res);
+                }
+                else
+                {
+                    auto u1 = backend.upload_blocking(*gpu_gamma_, gamma_.span());
+                    if (!u1) return std::unexpected(u1.error());
+                    auto u2 = backend.upload_blocking(*gpu_beta_, beta_.span());
+                    if (!u2) return std::unexpected(u2.error());
+                }
                 gpu_cache_dirty_ = false;
             }
 
-            // 2. 纯 GPU LayerNorm
             return backend.layernorm_gpu(
                 input, *gpu_gamma_, *gpu_beta_,
                 static_cast<uint32_t>(normalized_shape_),
@@ -457,10 +610,111 @@ namespace nn
                 epsilon_);
         }
 
+        // ── batch 提交后填充 backward 缓存 ───────────────────────────
+        void populate_cache_from_gpu(
+            const GpuTensor &input, const GpuTensor & /*output*/, GpuBackend &backend) override
+        {
+            // 运行 CPU forward 以填充所有 backward 缓存（normalized_cache_, std_cache_）
+            auto cpu_in = input.to_matrix(backend);
+            if (cpu_in) (void)forward(*cpu_in);
+
+            // 上传 normalized 和 std_inv 到 GPU（backward 需要）
+            if (backend.has_layernorm_backward_pipeline())
+            {
+                auto n_res = GpuTensor::from_matrix(normalized_cache_, backend);
+                if (n_res) gpu_normalized_ = std::move(*n_res);
+                auto s_res = GpuTensor::from_matrix(std_cache_, backend);
+                if (s_res) gpu_std_inv_ = std::move(*s_res);
+            }
+        }
+
         void invalidate_gpu_cache() override { gpu_cache_dirty_ = true; }
+
+        // ── GPU-resident 反向传播 ──────────────────────────────────────
+        // grad_input 由 GPU kernel 计算，grad_gamma/grad_beta 在 CPU 端累加
+        [[nodiscard]] Result<GpuTensor> backward_gpu(
+            const GpuTensor &grad_output, const GpuTensor &input, GpuBackend &backend) override
+        {
+            // 1. 确保 gamma 在 GPU 上
+            if (gpu_cache_dirty_ || !gpu_gamma_)
+            {
+                if (!gpu_gamma_)
+                {
+                    auto g_res = GpuTensor::from_matrix(gamma_, backend);
+                    if (!g_res) return std::unexpected(g_res.error());
+                    gpu_gamma_ = std::move(*g_res);
+                }
+                else
+                {
+                    auto u = backend.upload_blocking(*gpu_gamma_, gamma_.span());
+                    if (!u) return std::unexpected(u.error());
+                }
+                gpu_cache_dirty_ = false;
+            }
+
+            // 2. GPU kernel 计算 grad_input
+            if (gpu_normalized_ && gpu_std_inv_ && backend.has_layernorm_backward_pipeline())
+            {
+                auto gi_res = backend.layernorm_backward_gpu(
+                    grad_output, *gpu_gamma_, *gpu_normalized_, *gpu_std_inv_,
+                    static_cast<uint32_t>(normalized_shape_),
+                    static_cast<uint32_t>(grad_output.cols()));
+                if (!gi_res) return std::unexpected(gi_res.error());
+
+                // 3. CPU 端计算 grad_gamma 和 grad_beta（需要 normalized_cache_）
+                auto go_cpu = grad_output.to_matrix(backend);
+                if (go_cpu)
+                {
+                    // 确保 CPU 缓存有效
+                    auto cpu_in = input.to_matrix(backend);
+                    if (cpu_in) (void)forward(*cpu_in);
+
+                    const std::size_t features = normalized_shape_;
+                    const std::size_t batch_size = go_cpu->cols();
+
+                    // gy_gamma = grad_output * gamma（按行广播）
+                    Matrix gy_gamma = *go_cpu;
+                    gy_gamma.broadcast_row_inplace(gamma_,
+                        [](Scalar gy, Scalar g) noexcept { return gy * g; });
+
+                    // grad_gamma[f] += Σ_b gy_gamma[f][b] * normalized[f][b]
+                    Matrix gy_gamma_norm(features, batch_size);
+                    {
+                        Span gy = gy_gamma.span();
+                        Span n = normalized_cache_.span();
+                        Span gn_out = gy_gamma_norm.span();
+                        compute::apply(gn_out, gy * n);
+                    }
+                    Matrix grad_gamma_row = gy_gamma_norm.row_reduce(Scalar{0},
+                        [](Scalar a, Scalar b) noexcept { return a + b; },
+                        [](Scalar x) noexcept { return x; });
+                    grad_gamma_.add_inplace(grad_gamma_row);
+
+                    // grad_beta[f] += Σ_b grad_output[f][b]
+                    Matrix grad_beta_row = go_cpu->row_reduce(Scalar{0},
+                        [](Scalar a, Scalar b) noexcept { return a + b; },
+                        [](Scalar x) noexcept { return x; });
+                    grad_beta_.add_inplace(grad_beta_row);
+                }
+
+                return gi_res;
+            }
+
+            // fallback：CPU 路径
+            auto cpu_in = input.to_matrix(backend);
+            if (cpu_in) (void)forward(*cpu_in);
+
+            auto cpu_grad = grad_output.to_matrix(backend);
+            if (!cpu_grad) return std::unexpected(cpu_grad.error());
+
+            auto cpu_grad_in = backward(*cpu_grad);
+            if (!cpu_grad_in) return std::unexpected(cpu_grad_in.error());
+
+            return GpuTensor::from_matrix(*cpu_grad_in, backend);
+        }
 #endif
 
-        // ── 反向传播 ──
+        // ── 反向传播（预分配缓冲区，零热路径分配） ──
         // dL/dγ[f] = Σ_b dL/dy[f][b] * normalized[f][b]
         // dL/dβ[f] = Σ_b dL/dy[f][b]
         // dL/dx[f][b] = (dL/dy[f][b] * γ[f] - mean_g - normalized[f][b] * mean_gn) * std_inv[b]
@@ -475,20 +729,29 @@ namespace nn
             const std::size_t batch_size = grad_output.cols();
             const Scalar inv_features = Scalar{1} / static_cast<Scalar>(features);
 
+            // 预分配缓冲区（resize 复用已有内存，仅在尺寸增大时才分配）
+            gy_gamma_buf_.resize(features, batch_size);
+            gy_gamma_norm_buf_.resize(features, batch_size);
+            t1_buf_.resize(features, batch_size);
+            t2_buf_.resize(features, batch_size);
+            diff_buf_.resize(features, batch_size);
+            grad_input_buf_.resize(features, batch_size);
+
             // gy_gamma[f][b] = grad_output[f][b] * gamma[f]（按行广播乘法）
-            Matrix gy_gamma = grad_output;
-            gy_gamma.broadcast_row_inplace(gamma_,
+            gy_gamma_buf_ = grad_output;
+            gy_gamma_buf_.broadcast_row_inplace(gamma_,
                 [](Scalar gy, Scalar g) noexcept { return gy * g; });
 
             // gy_gamma_norm = gy_gamma ⊙ normalized  (AST 逐元素乘)
-            Matrix gy_gamma_norm(features, batch_size);
-            Span gy = gy_gamma.span();
-            Span n = normalized_cache_.span();
-            Span gn_out = gy_gamma_norm.span();
-            compute::apply(gn_out, gy * n);
+            {
+                Span gy = gy_gamma_buf_.span();
+                Span n = normalized_cache_.span();
+                Span gn_out = gy_gamma_norm_buf_.span();
+                compute::apply(gn_out, gy * n);
+            }
 
             // grad_gamma[f] = Σ_b gy_gamma_norm[f][b]  （按行归约）
-            Matrix grad_gamma_row = gy_gamma_norm.row_reduce(Scalar{0},
+            Matrix grad_gamma_row = gy_gamma_norm_buf_.row_reduce(Scalar{0},
                 [](Scalar a, Scalar b) noexcept { return a + b; },
                 [](Scalar x) noexcept { return x; });
 
@@ -501,40 +764,40 @@ namespace nn
             grad_beta_.add_inplace(grad_beta_row);
 
             // mean_g[b] = (1/features) * Σ_f gy_gamma[f][b]  （按列归约）
-            Matrix mean_g = gy_gamma.col_reduce(Scalar{0},
+            Matrix mean_g = gy_gamma_buf_.col_reduce(Scalar{0},
                 [](Scalar a, Scalar b) noexcept { return a + b; },
                 [](Scalar x) noexcept { return x; });
             mean_g.scale_inplace(inv_features);
 
             // mean_gn[b] = (1/features) * Σ_f gy_gamma_norm[f][b]  （按列归约）
-            Matrix mean_gn = gy_gamma_norm.col_reduce(Scalar{0},
+            Matrix mean_gn = gy_gamma_norm_buf_.col_reduce(Scalar{0},
                 [](Scalar a, Scalar b) noexcept { return a + b; },
                 [](Scalar x) noexcept { return x; });
             mean_gn.scale_inplace(inv_features);
 
-            // grad_input[f][b] = (gy_gamma[f][b] - mean_g[b] - normalized[f][b] * mean_gn[b]) * std_inv[b]
             // 步骤1: t1 = gy_gamma - mean_g（按列广播减法）
-            Matrix t1 = gy_gamma;
-            t1.broadcast_col_inplace(mean_g,
+            t1_buf_ = gy_gamma_buf_;
+            t1_buf_.broadcast_col_inplace(mean_g,
                 [](Scalar gy, Scalar m) noexcept { return gy - m; });
 
             // 步骤2: t2 = normalized * mean_gn（按列广播乘法）
-            Matrix t2 = normalized_cache_;
-            t2.broadcast_col_inplace(mean_gn,
+            t2_buf_ = normalized_cache_;
+            t2_buf_.broadcast_col_inplace(mean_gn,
                 [](Scalar n, Scalar m) noexcept { return n * m; });
 
             // 步骤3: diff = t1 - t2  (AST 逐元素减)
-            Matrix diff(features, batch_size);
-            Span t1_s = t1.span();
-            Span t2_s = t2.span();
-            Span d_out = diff.span();
-            compute::apply(d_out, t1_s - t2_s);
+            {
+                Span t1_s = t1_buf_.span();
+                Span t2_s = t2_buf_.span();
+                Span d_out = diff_buf_.span();
+                compute::apply(d_out, t1_s - t2_s);
+            }
 
             // 步骤4: grad_input = diff * std_inv（按列广播乘法）
-            Matrix grad_input = diff;
-            grad_input.broadcast_col_inplace(std_cache_,
+            grad_input_buf_ = diff_buf_;
+            grad_input_buf_.broadcast_col_inplace(std_cache_,
                 [](Scalar d, Scalar s) noexcept { return d * s; });
-            return grad_input;
+            return grad_input_buf_;
         }
     };
 
