@@ -137,6 +137,80 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    // ── 3b. 转置 matmul 测试 ──────────────────────────────────────
+    std::cout << "[3b] 转置 matmul 测试 (A^T * B)..." << std::flush;
+    {
+        // A^T * B：A 存储为 (N,N)，按 A^T 使用 → C = A^T * B
+        // CPU 参考：C_ref = A^T * B
+        Matrix A_T(N, N);
+        for (std::size_t i = 0; i < N; ++i)
+            for (std::size_t j = 0; j < N; ++j)
+                A_T.set_value_unchecked(j, i, A.at_unchecked(i, j));
+        Matrix C_ref(N, N);
+        A_T.multiply_to(C_ref, B);
+
+        // GPU: matmul_gpu(A, B, transA=1)
+        auto gpu_a = GpuTensor::from_matrix(A, backend);
+        auto gpu_b = GpuTensor::from_matrix(B, backend);
+        if (gpu_a && gpu_b)
+        {
+            auto gpu_c = backend.matmul_gpu(*gpu_a, *gpu_b, 1u, 0u);
+            if (gpu_c)
+            {
+                auto c_res = gpu_c->to_matrix(backend);
+                if (c_res)
+                {
+                    Scalar max_err = 0.0f;
+                    auto rs = c_res->span();
+                    auto cs = C_ref.span();
+                    for (std::size_t i = 0; i < N * N; ++i)
+                    {
+                        Scalar diff = std::abs(rs[i] - cs[i]);
+                        if (diff > max_err) max_err = diff;
+                    }
+                    std::cout << "\n  A^T * B 最大误差: " << std::scientific << std::setprecision(4) << max_err
+                              << (max_err < 1e-2f ? " ✅" : " ❌") << "\n";
+                }
+                else std::cout << "\n  ❌ download failed\n";
+            }
+            else std::cout << "\n  ❌ matmul_gpu failed\n";
+        }
+        else std::cout << "\n  ❌ upload failed\n";
+
+        // A * B^T
+        Matrix B_T(N, N);
+        for (std::size_t i = 0; i < N; ++i)
+            for (std::size_t j = 0; j < N; ++j)
+                B_T.set_value_unchecked(j, i, B.at_unchecked(i, j));
+        Matrix C_ref2(N, N);
+        A.multiply_to(C_ref2, B_T);
+
+        auto gpu_b2 = GpuTensor::from_matrix(B, backend);
+        if (gpu_a && gpu_b2)
+        {
+            auto gpu_c2 = backend.matmul_gpu(*gpu_a, *gpu_b2, 0u, 1u);
+            if (gpu_c2)
+            {
+                auto c_res2 = gpu_c2->to_matrix(backend);
+                if (c_res2)
+                {
+                    Scalar max_err = 0.0f;
+                    auto rs = c_res2->span();
+                    auto cs = C_ref2.span();
+                    for (std::size_t i = 0; i < N * N; ++i)
+                    {
+                        Scalar diff = std::abs(rs[i] - cs[i]);
+                        if (diff > max_err) max_err = diff;
+                    }
+                    std::cout << "  A * B^T 最大误差: " << std::scientific << std::setprecision(4) << max_err
+                              << (max_err < 1e-2f ? " ✅" : " ❌") << "\n";
+                }
+                else std::cout << "  ❌ download failed\n";
+            }
+            else std::cout << "  ❌ matmul_gpu failed\n";
+        }
+    }
+
     // ── 4. 性能测试 ───────────────────────────────────────────────
     std::cout << "[4/4] 性能测试 (" << iters << " 次迭代)...\n";
 
@@ -170,21 +244,41 @@ int main(int argc, char* argv[])
     // ── 5. GPU-resident 路径测试 ──────────────────────────────────
     std::cout << "[5/5] GPU-resident 路径测试...\n";
     {
-        // 上传 A, B 到 GPU
+        // 5a. 纯 upload→download roundtrip 测试
         auto gpu_a = GpuTensor::from_matrix(A, backend);
-        auto gpu_b = GpuTensor::from_matrix(B, backend);
+        if (gpu_a)
+        {
+            auto a_back = gpu_a->to_matrix(backend);
+            if (a_back)
+            {
+                Scalar max_err = 0.0f;
+                auto as = A.span();
+                auto bs = a_back->span();
+                for (std::size_t i = 0; i < N * N; ++i)
+                {
+                    Scalar diff = std::abs(as[i] - bs[i]);
+                    if (diff > max_err) max_err = diff;
+                }
+                std::cout << "  Upload→Download roundtrip 最大误差: "
+                          << std::scientific << std::setprecision(4) << max_err
+                          << (max_err == 0.0f ? " ✅" : " ❌") << "\n";
+            }
+            else
+                std::cout << "  ❌ roundtrip download 失败: " << a_back.error().message << "\n";
+        }
+        else
+            std::cout << "  ❌ roundtrip upload 失败\n";
 
+        // 5b. 单次 matmul GPU-resident
+        auto gpu_b = GpuTensor::from_matrix(B, backend);
         if (gpu_a && gpu_b)
         {
-            // 在 GPU 上计算
             auto gpu_c = backend.matmul_gpu(*gpu_a, *gpu_b);
             if (gpu_c)
             {
-                // 下载结果
                 auto c_res = gpu_c->to_matrix(backend);
                 if (c_res)
                 {
-                    // 验证
                     Scalar max_err = 0.0f;
                     auto c_span = c_res->span();
                     for (std::size_t i = 0; i < N * N; ++i)
@@ -192,8 +286,8 @@ int main(int argc, char* argv[])
                         Scalar diff = std::abs(cpu_span[i] - c_span[i]);
                         if (diff > max_err) max_err = diff;
                     }
-                    std::cout << "  最大绝对误差: " << std::scientific << std::setprecision(4) << max_err << "\n";
-                    std::cout << "  结果: " << (max_err < 1e-2f ? "✅ 通过" : "❌ 失败") << "\n";
+                    std::cout << "  单次 matmul 最大误差: " << std::scientific << std::setprecision(4) << max_err
+                              << (max_err < 1e-2f ? " ✅" : " ❌") << "\n";
                 }
                 else
                     std::cout << "  ❌ 下载失败: " << c_res.error().message << "\n";
@@ -201,28 +295,115 @@ int main(int argc, char* argv[])
             else
                 std::cout << "  ❌ matmul_gpu 失败: " << gpu_c.error().message << "\n";
         }
-        else
-            std::cout << "  ❌ 上传失败\n";
     }
 
     // ── 6. 多层链式测试 ──────────────────────────────────────────
     std::cout << "\n[6/6] 多层链式 GPU-resident 测试...\n";
     {
-        // 构建 2 层网络: Linear(256→128) → ReLU → Linear(128→64)
+        // 6a. 测试 batch mode + 真实 GPU 操作（非 fallback）
+        {
+            auto gpu_a = GpuTensor::from_matrix(A, backend);
+            auto gpu_b = GpuTensor::from_matrix(B, backend);
+            if (gpu_a && gpu_b)
+            {
+                auto batch_r = backend.begin_batch();
+                if (batch_r)
+                {
+                    auto gpu_c = backend.matmul_gpu(*gpu_a, *gpu_b);
+                    if (gpu_c)
+                    {
+                        auto end_r = backend.end_batch();
+                        if (end_r)
+                        {
+                            auto c_res = gpu_c->to_matrix(backend);
+                            if (c_res)
+                            {
+                                Scalar max_err = 0.0f;
+                                auto cs = c_res->span();
+                                for (std::size_t i = 0; i < N * N; ++i)
+                                {
+                                    Scalar diff = std::abs(cpu_span[i] - cs[i]);
+                                    if (diff > max_err) max_err = diff;
+                                }
+                                std::cout << "  Batch+matmul_gpu 最大误差: "
+                                          << std::scientific << std::setprecision(4) << max_err
+                                          << (max_err < 1e-2f ? " ✅" : " ❌") << "\n";
+                            }
+                            else std::cout << "  ❌ download failed: " << c_res.error().message << "\n";
+                        }
+                        else std::cout << "  ❌ end_batch failed: " << end_r.error().message << "\n";
+                    }
+                    else std::cout << "  ❌ matmul_gpu failed: " << gpu_c.error().message << "\n";
+                }
+                else std::cout << "  ❌ begin_batch failed: " << batch_r.error().message << "\n";
+            }
+        }
+
+        // 6b. 测试 batch mode + 链式 matmul + elementwise
+        {
+            // A(256×256) * B(256×128) = C(256×128), then ReLU(C)
+            Matrix B2(N, N/2);
+            for (auto& v : B2.span()) v = dist(rng);
+            Matrix C_cpu_ref(N, N/2);
+            A.multiply_to(C_cpu_ref, B2);
+            // ReLU
+            for (auto& v : C_cpu_ref.span()) v = std::max(v, 0.0f);
+
+            auto gpu_a = GpuTensor::from_matrix(A, backend);
+            auto gpu_b2 = GpuTensor::from_matrix(B2, backend);
+            if (gpu_a && gpu_b2)
+            {
+                auto batch_r = backend.begin_batch();
+                if (batch_r)
+                {
+                    auto gpu_c = backend.matmul_gpu(*gpu_a, *gpu_b2);
+                    if (gpu_c)
+                    {
+                        auto gpu_relu = backend.elementwise_gpu(*gpu_c, nullptr, 0u);
+                        if (gpu_relu)
+                        {
+                            auto end_r = backend.end_batch();
+                            if (end_r)
+                            {
+                                auto r_res = gpu_relu->to_matrix(backend);
+                                if (r_res)
+                                {
+                                    Scalar max_err = 0.0f;
+                                    auto cs = C_cpu_ref.span();
+                                    auto rs = r_res->span();
+                                    for (std::size_t i = 0; i < cs.size(); ++i)
+                                    {
+                                        Scalar diff = std::abs(cs[i] - rs[i]);
+                                        if (diff > max_err) max_err = diff;
+                                    }
+                                    std::cout << "  Batch matmul+ReLU 最大误差: "
+                                              << std::scientific << std::setprecision(4) << max_err
+                                              << (max_err < 1e-2f ? " ✅" : " ❌") << "\n";
+                                }
+                                else std::cout << "  ❌ download failed\n";
+                            }
+                            else std::cout << "  ❌ end_batch failed\n";
+                        }
+                        else std::cout << "  ❌ elementwise failed\n";
+                    }
+                    else std::cout << "  ❌ matmul_gpu failed\n";
+                }
+                else std::cout << "  ❌ begin_batch failed\n";
+            }
+        }
+
+        // 6c. Model::forward 多层链式
         nn::Model model;
         model.add<nn::Linear>(256, 128);
         model.add<nn::ReLU>();
         model.add<nn::Linear>(128, 64);
 
-        // 随机输入
-        Matrix input(256, 32);  // 256 features, 32 batch
+        Matrix input(256, 32);
         for (auto& v : input.span()) v = dist(rng);
 
-        // CPU 前向
         SmartPolicy::gpu_enabled = false;
         auto cpu_out = model.forward(input);
 
-        // GPU-resident 前向
         SmartPolicy::gpu_enabled = true;
         auto gpu_out = model.forward(input);
         SmartPolicy::gpu_enabled = false;
@@ -237,14 +418,9 @@ int main(int argc, char* argv[])
                 Scalar diff = std::abs(cs[i] - gs[i]);
                 if (diff > max_err) max_err = diff;
             }
-            std::cout << "  输出维度: " << gpu_out->rows() << "×" << gpu_out->cols() << "\n";
-            std::cout << "  最大绝对误差: " << std::scientific << std::setprecision(4) << max_err << "\n";
-            std::cout << "  结果: " << (max_err < 1e-1f ? "✅ 通过" : "❌ 失败") << "\n";
-        }
-        else
-        {
-            if (!cpu_out) std::cout << "  ❌ CPU 前向失败: " << cpu_out.error().message << "\n";
-            if (!gpu_out) std::cout << "  ❌ GPU 前向失败: " << gpu_out.error().message << "\n";
+            std::cout << "  Model::forward 多层 最大误差: "
+                      << std::scientific << std::setprecision(4) << max_err
+                      << (max_err < 1e-1f ? " ✅" : " ❌") << "\n";
         }
     }
 

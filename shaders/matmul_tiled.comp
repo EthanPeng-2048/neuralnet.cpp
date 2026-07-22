@@ -1,5 +1,11 @@
 // ── matmul_tiled.comp ─────────────────────────────────────────────────────
-// 4×4 线程粗化分块矩阵乘法：C[M][N] = A[M][K] × B[K][N]
+// 4×4 线程粗化分块矩阵乘法：C[M][N] = A × B
+//
+// 支持转置（同 matmul.comp）：
+//   - transA=0, transB=0: C[M][N] = A[M][K] × B[K][N]
+//   - transA=1, transB=0: C[M][N] = A^T[K,M] × B[K][N]
+//   - transA=0, transB=1: C[M][N] = A[M][K] × B^T[N,K]
+//   - transA=1, transB=1: C[M][N] = A^T[K,M] × B^T[N,K]
 //
 // 优化策略：
 //   - WorkGroup：16×16 线程，计算 64×64 输出块（每线程 4×4 元素）
@@ -17,9 +23,11 @@ layout(std430, binding = 1) readonly buffer  BufferB { float B[]; };
 layout(std430, binding = 2) writeonly buffer BufferC { float C[]; };
 
 layout(push_constant) uniform PushConstants {
-    uint M;  // A 的行数 / C 的行数
-    uint N;  // B 的列数 / C 的列数
-    uint K;  // A 的列数 / B 的行数
+    uint M;      // C 的行数
+    uint N;      // C 的列数
+    uint K;      // 求和维度
+    uint transA; // 1 = A 存储为 (K,M)，按 A^T 使用
+    uint transB; // 1 = B 存储为 (N,K)，按 B^T 使用
 };
 
 // 分块维度常量
@@ -30,6 +38,20 @@ const uint BK = 16u;  // K 维度分块宽度
 // Shared Memory：Padding 避免 Bank Conflict
 shared float tileA[64][17];
 shared float tileB[16][65];
+
+// ── 访问 A 元素（转置感知）─────────────────────────────────────────────
+// transA=0: A[m][k] = A[m * K + k]  （标准行主序 (M,K)）
+// transA=1: A[m][k] = A[k * M + m]  （转置存储 (K,M)）
+float getA(uint m, uint k) {
+    return (transA != 0u) ? A[k * M + m] : A[m * K + k];
+}
+
+// ── 访问 B 元素（转置感知）─────────────────────────────────────────────
+// transB=0: B[k][n] = B[k * N + n]  （标准行主序 (K,N)）
+// transB=1: B[k][n] = B[n * K + k]  （转置存储 (N,K)）
+float getB(uint k, uint n) {
+    return (transB != 0u) ? B[n * K + k] : B[k * N + n];
+}
 
 void main()
 {
@@ -61,7 +83,7 @@ void main()
                 const uint c = elem % BK;             // 0..15
                 const uint gr = block_row + r;
                 const uint gc = a_base_col + c;
-                tileA[r][c] = (gr < M && gc < K) ? A[gr * K + gc] : 0.0;
+                tileA[r][c] = (gr < M && gc < K) ? getA(gr, gc) : 0.0;
             }
         }
 
@@ -75,7 +97,7 @@ void main()
                 const uint c = elem % BN;             // 0..63
                 const uint gr = b_base_row + r;
                 const uint gc = block_col + c;
-                tileB[r][c] = (gr < K && gc < N) ? B[gr * N + gc] : 0.0;
+                tileB[r][c] = (gr < K && gc < N) ? getB(gr, gc) : 0.0;
             }
         }
 

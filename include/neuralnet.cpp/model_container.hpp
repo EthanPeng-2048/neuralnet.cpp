@@ -22,6 +22,13 @@ namespace nn
     private:
         std::vector<std::unique_ptr<Layer>> layers_;
 
+#ifdef NN_HAS_VULKAN
+        // ── GPU 中间结果缓存（延迟下载：backward 时按需下载）────────────
+        // forward 时保留所有中间 GpuTensor，backward 时按需下载每层输入
+        mutable std::vector<GpuTensor> gpu_intermediates_;
+        mutable GpuBackend *gpu_backend_ = nullptr;
+#endif
+
     public:
         Model() = default;
 
@@ -106,17 +113,22 @@ namespace nn
                         auto batch_r = backend.begin_batch();
                         if (batch_r)
                         {
-                            GpuTensor gpu_out = std::move(*gpu_in);
+                            // 保留所有中间 GpuTensor 的所有权
+                            gpu_intermediates_.clear();
+                            gpu_intermediates_.reserve(layers_.size() + 1);
+                            gpu_intermediates_.push_back(std::move(*gpu_in));
+
                             bool gpu_ok = true;
                             for (std::size_t i = 0; i < layers_.size(); ++i)
                             {
-                                auto layer_res = layers_[i]->forward_gpu(gpu_out, backend);
+                                auto layer_res = layers_[i]->forward_gpu(
+                                    gpu_intermediates_.back(), backend);
                                 if (!layer_res)
                                 {
                                     gpu_ok = false;
                                     break;
                                 }
-                                gpu_out = std::move(*layer_res);
+                                gpu_intermediates_.push_back(std::move(*layer_res));
                             }
                             if (gpu_ok)
                             {
@@ -124,19 +136,22 @@ namespace nn
                                 auto end_r = backend.end_batch();
                                 if (end_r)
                                 {
-                                    // 4. Download 输出到 CPU（唯一一次 GPU→CPU 传输）
-                                    auto cpu_out = gpu_out.to_matrix(backend);
+                                    // 4. 保存 backend 指针供 backward 使用
+                                    gpu_backend_ = &backend;
+
+                                    // 5. Download 最终输出到 CPU（唯一一次 GPU→CPU 传输）
+                                    auto cpu_out = gpu_intermediates_.back().to_matrix(backend);
                                     if (cpu_out) return cpu_out;
                                 }
                             }
                             else
                             {
-                                // batch 录制失败，丢弃
                                 (void)backend.end_batch();
                             }
                         }
                     }
                     // GPU 路径失败，静默 fallback 到 CPU 路径
+                    gpu_intermediates_.clear();
                 }
             }
 #endif
@@ -157,13 +172,61 @@ namespace nn
         // ── 反向传播 ────────────────────────────────────────────────────────
         // 传入 loss 对最后一层输出的梯度，返回对输入的梯度（通常不需要）
         //
-        // 注意: 同 forward，backward 不能标记 const（Layer 内部缓存是 mutable 语义）。
+        // 当 GPU 中间结果可用时，使用 GPU-resident backward：
+        //   - Linear: 两次 matmul 在 GPU（transA/transB），仅下载 grad_w/grad_b
+        //   - ReLU: elementwise 在 GPU
+        //   - 其他层: fallback 到 CPU
         [[nodiscard]] Result<Matrix> backward(const Matrix &grad_output)
         {
             if (layers_.empty())
             {
                 return std::unexpected(Error{"Model has no layers"});
             }
+
+#ifdef NN_HAS_VULKAN
+            // ── GPU-resident backward 路径 ────────────────────────────────
+            if (!gpu_intermediates_.empty() && gpu_backend_ &&
+                gpu_intermediates_.size() == layers_.size() + 1)
+            {
+                auto &backend = *gpu_backend_;
+
+                // 1. Upload grad_output 到 GPU
+                auto gpu_grad = GpuTensor::from_matrix(grad_output, backend);
+                if (gpu_grad)
+                {
+                    // 2. 逐层 backward_gpu（从最后一层到第一层）
+                    GpuTensor grad = std::move(*gpu_grad);
+                    bool gpu_ok = true;
+                    for (std::size_t i = layers_.size(); i-- > 0;)
+                    {
+                        auto res = layers_[i]->backward_gpu(
+                            grad, gpu_intermediates_[i], backend);
+                        if (!res)
+                        {
+                            gpu_ok = false;
+                            break;
+                        }
+                        grad = std::move(*res);
+                    }
+
+                    // 3. 清理 GPU 中间结果
+                    gpu_intermediates_.clear();
+                    gpu_backend_ = nullptr;
+
+                    if (gpu_ok)
+                    {
+                        // 4. 下载最终 grad_input（通常不需要，但保持接口一致）
+                        auto cpu_grad = grad.to_matrix(backend);
+                        if (cpu_grad) return cpu_grad;
+                    }
+                }
+                // GPU 路径失败，fallback 到 CPU
+                gpu_intermediates_.clear();
+                gpu_backend_ = nullptr;
+            }
+#endif
+
+            // ── CPU 路径 ───────────────────────────────────────────────────
             auto result = layers_.back()->backward(grad_output);
             if (!result) return std::unexpected(result.error());
             Matrix grad = std::move(*result);
@@ -203,6 +266,17 @@ namespace nn
             }
             return result;
         }
+
+#ifdef NN_HAS_VULKAN
+        // ── 使所有层的 GPU 权重缓存失效 ──────────────────────────────────
+        // 训练时，在 optimizer.step() 更新 CPU 端权重后调用，
+        // 确保下一次 forward_gpu 重新上传最新权重到 GPU。
+        void invalidate_gpu_caches()
+        {
+            for (auto &layer : layers_)
+                layer->invalidate_gpu_cache();
+        }
+#endif
     };
 
     // ════════════════════════════════════════════════════════════════════════

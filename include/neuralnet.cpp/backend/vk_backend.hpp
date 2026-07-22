@@ -65,6 +65,11 @@
 #define NN_LAYERNORM_SPV_EMBEDDED
 #endif
 
+#if __has_include("layernorm_backward_spv.hpp")
+#include "layernorm_backward_spv.hpp"
+#define NN_LAYERNORM_BACKWARD_SPV_EMBEDDED
+#endif
+
 namespace nn
 {
 
@@ -332,11 +337,11 @@ public:
         if (!r)
             return std::unexpected(r.error());
 
-        // 创建 pipeline layout（push constants: M, N, K）
+        // 创建 pipeline layout（push constants: M, N, K, transA, transB）
         VkPushConstantRange push_range{};
         push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         push_range.offset = 0;
-        push_range.size = 3 * sizeof(uint32_t);
+        push_range.size = 5 * sizeof(uint32_t);
 
         VkPipelineLayoutCreateInfo pl_layout_info{};
         pl_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -523,6 +528,83 @@ public:
         return pl;
     }
 
+    // 创建 layernorm backward pipeline（5 个 storage buffer）
+    [[nodiscard]] static Result<VulkanPipeline> create_layernorm_backward(
+        VkDevice device, std::span<const uint32_t> spirv_code)
+    {
+        VulkanPipeline pl;
+        pl.device_ = device;
+
+        // 创建 shader module
+        VkShaderModuleCreateInfo module_info{};
+        module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        module_info.codeSize = spirv_code.size_bytes();
+        module_info.pCode = spirv_code.data();
+
+        auto r = detail::vk_check(
+            vkCreateShaderModule(device, &module_info, nullptr, &pl.shader_module_),
+            __FILE__, __LINE__);
+        if (!r)
+            return std::unexpected(r.error());
+
+        // 创建 descriptor set layout（5 个 storage buffer）
+        VkDescriptorSetLayoutBinding bindings[5]{};
+        for (int i = 0; i < 5; ++i)
+        {
+            bindings[i].binding = static_cast<uint32_t>(i);
+            bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[i].descriptorCount = 1;
+            bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+
+        VkDescriptorSetLayoutCreateInfo layout_info{};
+        layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layout_info.bindingCount = 5;
+        layout_info.pBindings = bindings;
+
+        r = detail::vk_check(
+            vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &pl.descriptor_layout_),
+            __FILE__, __LINE__);
+        if (!r)
+            return std::unexpected(r.error());
+
+        // 创建 pipeline layout（push constants: rows, cols）
+        VkPushConstantRange push_range{};
+        push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        push_range.offset = 0;
+        push_range.size = 2 * sizeof(uint32_t);
+
+        VkPipelineLayoutCreateInfo pl_layout_info{};
+        pl_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pl_layout_info.setLayoutCount = 1;
+        pl_layout_info.pSetLayouts = &pl.descriptor_layout_;
+        pl_layout_info.pushConstantRangeCount = 1;
+        pl_layout_info.pPushConstantRanges = &push_range;
+
+        r = detail::vk_check(
+            vkCreatePipelineLayout(device, &pl_layout_info, nullptr, &pl.pipeline_layout_),
+            __FILE__, __LINE__);
+        if (!r)
+            return std::unexpected(r.error());
+
+        // 创建 compute pipeline
+        VkComputePipelineCreateInfo pipeline_info{};
+        pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        pipeline_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipeline_info.stage.module = pl.shader_module_;
+        pipeline_info.stage.pName = "main";
+        pipeline_info.layout = pl.pipeline_layout_;
+
+        r = detail::vk_check(
+            vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pl.pipeline_),
+            __FILE__, __LINE__);
+        if (!r)
+            return std::unexpected(r.error());
+
+        return pl;
+    }
+
     [[nodiscard]] VkPipeline handle() const noexcept { return pipeline_; }
     [[nodiscard]] VkPipelineLayout pipeline_layout() const noexcept { return pipeline_layout_; }
     [[nodiscard]] VkDescriptorSetLayout descriptor_layout() const noexcept { return descriptor_layout_; }
@@ -670,6 +752,7 @@ private:
     VulkanPipeline matmul_tiled_pipeline_;
     VulkanPipeline elementwise_pipeline_;
     VulkanPipeline layernorm_pipeline_;
+    VulkanPipeline layernorm_backward_pipeline_;
 
     std::unique_ptr<MemoryPool> memory_pool_;
     std::unique_ptr<StagingRing> staging_ring_;
@@ -728,6 +811,16 @@ private:
     {
 #ifdef NN_LAYERNORM_SPV_EMBEDDED
         return nn_layernorm_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_layernorm_backward_spirv()
+    {
+#ifdef NN_LAYERNORM_BACKWARD_SPV_EMBEDDED
+        return nn_layernorm_backward_spirv_bytecode();
 #else
         static const std::vector<uint32_t> empty;
         return empty;
@@ -883,6 +976,15 @@ public:
                 layernorm_pipeline_ = std::move(*lp_r);
         }
 
+        // 12. 创建 layernorm backward pipeline（可选）
+        const auto& lnb_spirv = get_layernorm_backward_spirv();
+        if (!lnb_spirv.empty())
+        {
+            auto lnb_r = VulkanPipeline::create_layernorm_backward(device_.device(), lnb_spirv);
+            if (lnb_r)
+                layernorm_backward_pipeline_ = std::move(*lnb_r);
+        }
+
         initialized_ = true;
         return {};
     }
@@ -892,6 +994,7 @@ public:
     [[nodiscard]] bool has_tiled_pipeline() const noexcept { return matmul_tiled_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_elementwise_pipeline() const noexcept { return elementwise_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_layernorm_pipeline() const noexcept { return layernorm_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_layernorm_backward_pipeline() const noexcept { return layernorm_backward_pipeline_.handle() != VK_NULL_HANDLE; }
 
     [[nodiscard]] VulkanDevice& device() noexcept { return device_; }
     [[nodiscard]] MemoryPool& memory_pool() noexcept { return *memory_pool_; }
@@ -1173,16 +1276,22 @@ public:
 
     // ── 纯 GPU 矩阵乘法（阻塞等待完成）──────────────────────────────
     // batch_mode_ 时：录制到 batch_cmd_，不提交不等待
-    [[nodiscard]] Result<GpuTensor> matmul_gpu(const GpuTensor& A, const GpuTensor& B)
+    // transA: A 存储为 (K,M)，按 A^T 使用
+    // transB: B 存储为 (N,K)，按 B^T 使用
+    [[nodiscard]] Result<GpuTensor> matmul_gpu(
+        const GpuTensor& A, const GpuTensor& B,
+        uint32_t transA = 0, uint32_t transB = 0)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
-        if (A.cols() != B.rows())
-            return std::unexpected(Error{"Dimension mismatch"});
 
-        const auto M = static_cast<uint32_t>(A.rows());
-        const auto K = static_cast<uint32_t>(A.cols());
-        const auto N = static_cast<uint32_t>(B.cols());
+        // 计算有效维度（考虑转置）
+        const auto M = static_cast<uint32_t>(transA ? A.cols() : A.rows());
+        const auto K = static_cast<uint32_t>(transA ? A.rows() : A.cols());
+        const auto N = static_cast<uint32_t>(transB ? B.rows() : B.cols());
+        const auto K_B = static_cast<uint32_t>(transB ? B.cols() : B.rows());
+        if (K != K_B)
+            return std::unexpected(Error{"Dimension mismatch"});
 
         // 1. 分配输出 Tensor
         auto C_res = GpuTensor::create_empty(M, N, *this);
@@ -1294,8 +1403,8 @@ public:
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             pipeline.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
 
-        // 推送常量
-        const uint32_t push_data[3] = {M, N, K};
+        // 推送常量（M, N, K, transA, transB）
+        const uint32_t push_data[5] = {M, N, K, transA, transB};
         vkCmdPushConstants(cmd, pipeline.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
 
@@ -1774,15 +1883,214 @@ public:
         return output;
     }
 
+    // ── 纯 GPU LayerNorm Backward（阻塞等待完成）──────────────────────
+    // grad_input[f][b] = (grad_out[f][b]*gamma[f] - mean_g[b] - normalized[f][b]*mean_gn[b]) * std_inv[b]
+    [[nodiscard]] Result<GpuTensor> layernorm_backward_gpu(
+        const GpuTensor& grad_output, const GpuTensor& gamma,
+        const GpuTensor& normalized, const GpuTensor& std_inv,
+        uint32_t rows, uint32_t cols)
+    {
+        if (!initialized_)
+            return std::unexpected(Error{"GPU backend not initialized"});
+        if (!has_layernorm_backward_pipeline())
+            return std::unexpected(Error{"LayerNorm backward pipeline not available"});
+
+        // 1. 分配输出 Tensor
+        auto output_res = GpuTensor::create_empty(rows, cols, *this);
+        if (!output_res)
+            return std::unexpected(output_res.error());
+        GpuTensor output = std::move(*output_res);
+
+        // 2. 分配描述符集（5 个 storage buffer）
+        VkDescriptorSet desc_set = VK_NULL_HANDLE;
+        VkDescriptorSetAllocateInfo desc_alloc{};
+        desc_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        desc_alloc.descriptorPool = gpu_tensor_pool_;
+        desc_alloc.descriptorSetCount = 1;
+        auto dl = layernorm_backward_pipeline_.descriptor_layout();
+        desc_alloc.pSetLayouts = &dl;
+
+        auto r = detail::vk_check(
+            vkAllocateDescriptorSets(device_.device(), &desc_alloc, &desc_set),
+            __FILE__, __LINE__);
+        if (!r)
+            return std::unexpected(r.error());
+        if (batch_mode_) batch_desc_sets_.push_back(desc_set);
+
+        // 3. 写入描述符集
+        VkDescriptorBufferInfo buf_infos[5]{
+            {grad_output.buffer().impl(), 0, VK_WHOLE_SIZE},
+            {gamma.buffer().impl(), 0, VK_WHOLE_SIZE},
+            {normalized.buffer().impl(), 0, VK_WHOLE_SIZE},
+            {std_inv.buffer().impl(), 0, VK_WHOLE_SIZE},
+            {output.buffer().impl(), 0, VK_WHOLE_SIZE},
+        };
+
+        VkWriteDescriptorSet writes[5]{};
+        for (int i = 0; i < 5; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = desc_set;
+            writes[i].dstBinding = static_cast<uint32_t>(i);
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &buf_infos[i];
+        }
+        vkUpdateDescriptorSets(device_.device(), 5, writes, 0, nullptr);
+
+        // 4. 获取 command buffer（batch 或独立）
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        bool owns_cmd = false;
+
+        if (batch_mode_)
+        {
+            cmd = batch_cmd_;
+        }
+        else
+        {
+            VkCommandBufferAllocateInfo cmd_alloc{};
+            cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cmd_alloc.commandPool = command_pool_;
+            cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cmd_alloc.commandBufferCount = 1;
+
+            r = detail::vk_check(
+                vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &cmd),
+                __FILE__, __LINE__);
+            if (!r)
+            {
+                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+                return std::unexpected(r.error());
+            }
+            owns_cmd = true;
+
+            VkCommandBufferBeginInfo begin_info{};
+            begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            r = detail::vk_check(vkBeginCommandBuffer(cmd, &begin_info), __FILE__, __LINE__);
+            if (!r)
+            {
+                vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
+                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+                return std::unexpected(r.error());
+            }
+        }
+
+        // 5. 录制命令
+        VkBufferMemoryBarrier input_barriers[4]{};
+        for (int i = 0; i < 4; ++i)
+        {
+            input_barriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            input_barriers[i].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            input_barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            input_barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            input_barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            input_barriers[i].offset = 0;
+            input_barriers[i].size = VK_WHOLE_SIZE;
+        }
+        input_barriers[0].buffer = grad_output.buffer().impl();
+        input_barriers[1].buffer = gamma.buffer().impl();
+        input_barriers[2].buffer = normalized.buffer().impl();
+        input_barriers[3].buffer = std_inv.buffer().impl();
+
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, 4, input_barriers, 0, nullptr);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layernorm_backward_pipeline_.handle());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            layernorm_backward_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+
+        const uint32_t push_data[2] = {rows, cols};
+        vkCmdPushConstants(cmd, layernorm_backward_pipeline_.pipeline_layout(),
+            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
+
+        vkCmdDispatch(cmd, cols, 1, 1);
+
+        VkBufferMemoryBarrier output_barrier{};
+        output_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        output_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        output_barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+        output_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        output_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        output_barrier.buffer = output.buffer().impl();
+        output_barrier.offset = 0;
+        output_barrier.size = VK_WHOLE_SIZE;
+
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 1, &output_barrier, 0, nullptr);
+
+        // 6. 独立模式：结束 → 提交 → 等待 → 清理
+        if (owns_cmd)
+        {
+            r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
+            if (!r)
+            {
+                vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
+                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+                return std::unexpected(r.error());
+            }
+
+            VkFenceCreateInfo fence_info{};
+            fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            VkFence fence = VK_NULL_HANDLE;
+            r = detail::vk_check(
+                vkCreateFence(device_.device(), &fence_info, nullptr, &fence),
+                __FILE__, __LINE__);
+            if (!r)
+            {
+                vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
+                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+                return std::unexpected(r.error());
+            }
+
+            {
+                std::lock_guard lock(queue_mutex_);
+                VkSubmitInfo submit_info{};
+                submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                submit_info.commandBufferCount = 1;
+                submit_info.pCommandBuffers = &cmd;
+
+                r = detail::vk_check(
+                    vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
+                    __FILE__, __LINE__);
+                if (!r)
+                {
+                    vkDestroyFence(device_.device(), fence, nullptr);
+                    vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
+                    vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+                    return std::unexpected(r.error());
+                }
+            }
+
+            r = detail::vk_check(
+                vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, UINT64_MAX),
+                __FILE__, __LINE__);
+
+            vkDestroyFence(device_.device(), fence, nullptr);
+            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
+            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+
+            if (!r)
+                return std::unexpected(r.error());
+        }
+
+        return output;
+    }
+
     // ── Staging Path：CPU span → GPU → 计算 → GPU → CPU span ─────────
     [[nodiscard]] Result<void> matmul_direct(
         std::span<const Scalar> a, std::span<const Scalar> b,
-        std::span<Scalar> c, std::size_t M, std::size_t N, std::size_t K)
+        std::span<Scalar> c, std::size_t M, std::size_t N, std::size_t K,
+        uint32_t transA = 0, uint32_t transB = 0)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
 
-        // 1. 创建临时 GPU buffers（A 和 B 用于上传输入）
+        // 1. 创建临时 GPU buffers
         auto a_buf = GpuBuffer::create_device_local(
             device_.device(), *memory_pool_, M * K,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -1807,12 +2115,12 @@ public:
         if (!r)
             return r;
 
-        // 3. 执行 matmul（matmul_gpu 内部分配输出 buffer）
-        auto c_tensor_res = matmul_gpu(a_tensor, b_tensor);
+        // 3. 执行 matmul
+        auto c_tensor_res = matmul_gpu(a_tensor, b_tensor, transA, transB);
         if (!c_tensor_res)
             return std::unexpected(c_tensor_res.error());
 
-        // 4. 下载结果（从 matmul_gpu 返回的 tensor，不是 c_buf）
+        // 4. 下载结果
         r = download_blocking(*c_tensor_res, c);
         if (!r)
             return r;

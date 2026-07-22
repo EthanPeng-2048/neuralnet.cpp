@@ -419,6 +419,11 @@ int main(int argc, char *argv[])
                 return 1;
             }
 
+#ifdef NN_HAS_VULKAN
+            // optimizer.step() 更新了 CPU 端权重，需要使 GPU 缓存失效
+            model.invalidate_gpu_caches();
+#endif
+
             // 进度显示
             if ((step + 1) % cfg.log_interval == 0 || step + 1 == steps_per_epoch)
             {

@@ -502,6 +502,8 @@ int main(int argc, char *argv[])
 
     auto t_start = std::chrono::steady_clock::now();
 
+    std::cerr << "[DEBUG] Starting training loop...\n";
+
     for (int epoch = 0; epoch < cfg.epochs; ++epoch)
     {
         auto ep_start = std::chrono::steady_clock::now();
@@ -538,6 +540,10 @@ int main(int argc, char *argv[])
                 return 1;
             }
             auto out = std::move(*out_fwd);
+
+            if (batch == 0)
+                std::cerr << "[DEBUG] First batch forward completed\n";
+
             auto loss_result = ce_loss.forward(out, y_batch);
             if (!loss_result) {
                 std::cerr << "\nLoss computation failed: " << loss_result.error().message << '\n';
@@ -546,10 +552,17 @@ int main(int argc, char *argv[])
             Scalar loss = *loss_result;
             total_loss += loss;
 
+            if (batch == 0) std::cerr << "[DEBUG] Loss computed\n";
+
             auto grad_result = ce_loss.backward();
             if (!grad_result) { std::cerr << "\nLoss backward failed: " << grad_result.error().message << '\n'; return 1; }
+
+            if (batch == 0) std::cerr << "[DEBUG] Loss backward done\n";
+
             auto bwd_result = model.backward(*grad_result);
-            if (!bwd_result) { std::cerr << "Error: " << bwd_result.error().message << '\n'; return 1; }
+            if (!bwd_result) { std::cerr << "\nModel backward failed: " << bwd_result.error().message << '\n'; return 1; }
+
+            if (batch == 0) std::cerr << "[DEBUG] Model backward done\n";
 
             auto step_result = optimizer->step();
             if (!step_result)
@@ -557,6 +570,9 @@ int main(int argc, char *argv[])
                 std::cerr << "\n优化器 step 失败: " << step_result.error().message << '\n';
                 return 1;
             }
+
+            if (batch == 0) std::cerr << "[DEBUG] Optimizer step done\n";
+
             auto zero_result = optimizer->zero_grad();
             if (!zero_result)
             {
@@ -564,12 +580,24 @@ int main(int argc, char *argv[])
                 return 1;
             }
 
-            // 进度显示
-            if ((batch + 1) % 100 == 0 || batch + 1 == num_batches)
+            if (batch == 0) std::cerr << "[DEBUG] Zero grad done\n";
+
+#ifdef NN_HAS_VULKAN
+            // optimizer.step() 更新了 CPU 端权重，需要使 GPU 缓存失效
+            // 确保下一次 forward_gpu 使用最新权重
+            if (nn::SmartPolicy::gpu_enabled)
+                model.invalidate_gpu_caches();
+#endif
+
+            // 进度显示（每个 batch 都显示，用于调试）
+            if ((batch + 1) % 10 == 0 || batch + 1 == num_batches)
             {
+                auto batch_now = std::chrono::steady_clock::now();
+                Scalar batch_ms = std::chrono::duration<Scalar, std::milli>(batch_now - ep_start).count();
                 std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
                           << "  batch " << batch + 1 << "/" << num_batches
                           << "  loss: " << std::fixed << std::setprecision(4) << loss
+                          << "  time: " << std::setprecision(0) << batch_ms << "ms"
                           << "   " << std::flush;
             }
         }
