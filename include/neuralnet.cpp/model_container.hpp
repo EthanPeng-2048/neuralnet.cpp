@@ -75,6 +75,10 @@ namespace nn
         // ── 前向传播 ────────────────────────────────────────────────────────
         // 通过 Matrix 语义方法（multiply_to）和表达式模板（compute::apply）自动分派，
         // 上层代码完全符合 L(N)→L(N-1) 分层调用规则。
+        //
+        // 注意: forward/backward 不能标记 const，因为 Layer 的 forward/backward 虚函数
+        // 是非 const 的（Layer 内部有可变缓存，如 input_cache_/product_buf_ 等）。
+        // 若要实现 const 版本，需要将 Layer 中的缓存标记为 mutable。
         [[nodiscard]] Result<Matrix> forward(const Matrix &input)
         {
             if (layers_.empty())
@@ -96,6 +100,8 @@ namespace nn
 
         // ── 反向传播 ────────────────────────────────────────────────────────
         // 传入 loss 对最后一层输出的梯度，返回对输入的梯度（通常不需要）
+        //
+        // 注意: 同 forward，backward 不能标记 const（Layer 内部缓存是 mutable 语义）。
         [[nodiscard]] Result<Matrix> backward(const Matrix &grad_output)
         {
             if (layers_.empty())

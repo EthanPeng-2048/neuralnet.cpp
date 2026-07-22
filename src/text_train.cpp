@@ -285,13 +285,8 @@ int main(int argc, char *argv[])
     }
 
     // ── 优化器 ─────────────────────────────────────────────
-    std::unique_ptr<nn::Optimizer> optimizer;
-    if (cfg.optimizer_name == "sgd")
-        optimizer = std::make_unique<nn::SGD>(model.parameters(), model.param_gradients(), cfg.lr);
-    else if (cfg.optimizer_name == "sgd_momentum")
-        optimizer = std::make_unique<nn::SGDWithMomentum>(model.parameters(), model.param_gradients(), cfg.lr);
-    else
-        optimizer = std::make_unique<nn::Adam>(model.parameters(), model.param_gradients(), cfg.lr);
+    auto optimizer = nn::create_optimizer(
+        cfg.optimizer_name, model.parameters(), model.param_gradients(), cfg.lr);
 
     nn::CrossEntropyLoss ce_loss;
 

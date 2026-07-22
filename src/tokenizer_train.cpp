@@ -16,6 +16,7 @@
  */
 
 #include <neuralnet.cpp/domain_tokenizer.hpp>
+#include <neuralnet.cpp/core_file.hpp>
 
 #include <chrono>
 #include <cstdlib>
@@ -111,22 +112,6 @@ TrainArgs parse_args(int argc, char *argv[])
     }
 
     return args;
-}
-
-// ── 读取文本文件（UTF-8） ──────────────────────────────────────────────
-// 修复：原代码 ifs.tellg() 失败时返回 -1，转为 size_t 后变为巨大值，
-// 随后 std::string content(size, '\0') 会触发 std::bad_alloc。
-// 改为显式检查 tellg() 返回值，并改用 std::stringstream 读全部内容
-// 以避免巨型预分配。
-nn::Result<std::string> read_text_file(const std::string &path)
-{
-    std::ifstream ifs(path, std::ios::binary);
-    if (!ifs)
-        return std::unexpected(nn::Error{"无法打开文件: " + path});
-
-    // 使用 istreambuf_iterator 读取全部内容，无需 tellg，避免失败场景
-    return std::string{std::istreambuf_iterator<char>(ifs),
-                       std::istreambuf_iterator<char>()};
 }
 
 // ── 公共验证函数 ────────────────────────────────────────────────────────
@@ -309,7 +294,7 @@ int main(int argc, char *argv[])
 
     // 读取文件
     std::cout << "读取文件: " << args.text_file << "\n";
-    auto text_result = read_text_file(args.text_file);
+    auto text_result = nn::load_text_file(args.text_file);
     if (!text_result)
     {
         std::cerr << "错误: " << text_result.error().message << "\n";

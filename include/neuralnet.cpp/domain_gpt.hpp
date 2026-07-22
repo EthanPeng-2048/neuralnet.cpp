@@ -2,14 +2,13 @@
 #define NN_DOMAIN_GPT_HPP
 
 #include <cstddef>
-#include <fstream>
-#include <iterator>
 #include <string>
 #include <vector>
 
 #include "model_container.hpp"
 #include "model_spec.hpp"
 #include "domain_tokenizer.hpp"
+#include "core_file.hpp"
 
 namespace nn {
 
@@ -20,17 +19,6 @@ inline constexpr std::size_t GPT_NUM_HEADS     = 4;
 inline constexpr std::size_t GPT_D_FF          = 512;
 inline constexpr std::size_t GPT_NUM_LAYERS    = 4;
 inline constexpr std::size_t GPT_SEQ_LEN       = 256;
-
-// ── 从文本文件加载语料 ────────────────────────────────────────────────────
-[[nodiscard]] inline Result<std::string> load_text_file(const std::string &path)
-{
-    std::ifstream ifs(path, std::ios::binary);
-    if (!ifs)
-        return std::unexpected(Error{"Cannot open text file: " + path});
-    std::string content((std::istreambuf_iterator<char>(ifs)),
-                        std::istreambuf_iterator<char>());
-    return content;
-}
 
 // ── 构建 GPT 模型 ────────────────────────────────────────────────────────
 [[nodiscard]] inline Result<Model> build_gpt_model(
