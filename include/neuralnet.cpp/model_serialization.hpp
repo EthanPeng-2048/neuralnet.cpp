@@ -66,7 +66,7 @@ namespace detail
 
 // ── 基础类型读写 ──────────────────────────────────────────────────────
 
-inline Result<void> write_u32(std::ofstream &ofs, uint32_t v)
+[[nodiscard]] inline Result<void> write_u32(std::ofstream &ofs, uint32_t v)
 {
     ofs.write(reinterpret_cast<const char *>(&v), sizeof(v));
     if (!ofs)
@@ -83,7 +83,7 @@ inline Result<void> write_u32(std::ofstream &ofs, uint32_t v)
     return v;
 }
 
-inline Result<void> write_u64(std::ofstream &ofs, uint64_t v)
+[[nodiscard]] inline Result<void> write_u64(std::ofstream &ofs, uint64_t v)
 {
     ofs.write(reinterpret_cast<const char *>(&v), sizeof(v));
     if (!ofs)
@@ -102,7 +102,7 @@ inline Result<void> write_u64(std::ofstream &ofs, uint64_t v)
 
 // ── 矩阵读写 ──────────────────────────────────────────────────────────
 
-inline Result<void> write_matrix(std::ofstream &ofs, const Matrix &m)
+[[nodiscard]] inline Result<void> write_matrix(std::ofstream &ofs, const Matrix &m)
 {
     if (auto r = write_u64(ofs, static_cast<uint64_t>(m.rows())); !r)
         return std::unexpected(r.error());
@@ -116,7 +116,7 @@ inline Result<void> write_matrix(std::ofstream &ofs, const Matrix &m)
     return {};
 }
 
-inline Result<void> read_matrix(std::ifstream &ifs, Matrix &m)
+[[nodiscard]] inline Result<void> read_matrix(std::ifstream &ifs, Matrix &m)
 {
     auto rows_r = read_u64(ifs);
     if (!rows_r) return std::unexpected(rows_r.error());
@@ -143,7 +143,7 @@ inline Result<void> read_matrix(std::ifstream &ifs, Matrix &m)
 
 // ── ModelSpec 序列化 ──────────────────────────────────────────────────
 
-inline Result<void> write_spec(std::ofstream &ofs, const ModelSpec &spec)
+[[nodiscard]] inline Result<void> write_spec(std::ofstream &ofs, const ModelSpec &spec)
 {
     if (auto r = write_u32(ofs, static_cast<uint32_t>(spec.type)); !r)
         return std::unexpected(r.error());
@@ -261,7 +261,7 @@ inline Result<void> write_spec(std::ofstream &ofs, const ModelSpec &spec)
 
 // ── 文件头读写 ──────────────────────────────────────────────────────
 
-inline Result<void> write_header(std::ofstream &ofs)
+[[nodiscard]] inline Result<void> write_header(std::ofstream &ofs)
 {
     if (auto r = write_u32(ofs, MODEL_MAGIC); !r)
         return std::unexpected(r.error());
@@ -306,7 +306,7 @@ inline Result<void> write_header(std::ofstream &ofs)
 
 // ── Tokenizer JSON 读写（V3 新增） ──────────────────────────────────
 
-inline Result<void> write_tokenizer(std::ofstream &ofs, const std::string &json)
+[[nodiscard]] inline Result<void> write_tokenizer(std::ofstream &ofs, const std::string &json)
 {
     if (auto r = write_u64(ofs, static_cast<uint64_t>(json.size())); !r)
         return std::unexpected(r.error());

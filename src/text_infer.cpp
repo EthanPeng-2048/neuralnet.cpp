@@ -130,8 +130,7 @@ InferConfig parse_args(int argc, char *argv[])
 // 使用 Model::generate 公有 API（虚函数分派到 GPTModel），无需向下转型
 nn::Result<std::vector<std::size_t>> generate_text(
     nn::Model &model, const std::vector<std::size_t> &prompt_tokens,
-    std::size_t max_new_tokens, Scalar temperature,
-    std::size_t /*seq_len*/)
+    std::size_t max_new_tokens, Scalar temperature)
 {
     return model.generate(prompt_tokens, max_new_tokens, temperature);
 }
@@ -159,8 +158,7 @@ void interactive_mode(nn::Model &model, const nn::SpaceTokenizer &tokenizer,
 
         std::cout << "生成中...\n";
         auto gen_result = generate_text(model, prompt_tokens,
-                                       cfg.max_tokens, cfg.temperature,
-                                       cfg.seq_len);
+                                       cfg.max_tokens, cfg.temperature);
         if (!gen_result) { std::cerr << "Error: " << gen_result.error().message << '\n'; continue; }
         auto generated = std::move(*gen_result);
 
@@ -265,8 +263,7 @@ int main(int argc, char *argv[])
     std::cout << "----------------------------------------\n";
 
     auto gen_result = generate_text(model, prompt_tokens,
-                                   cfg.max_tokens, cfg.temperature,
-                                   cfg.seq_len);
+                                   cfg.max_tokens, cfg.temperature);
     if (!gen_result) { std::cerr << "Error: " << gen_result.error().message << '\n'; return 1; }
     auto generated = std::move(*gen_result);
 

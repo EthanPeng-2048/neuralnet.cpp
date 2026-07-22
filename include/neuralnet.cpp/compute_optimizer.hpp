@@ -219,6 +219,22 @@ namespace nn
             return {};
         }
     };
+
+    // ── 优化器工厂函数 ────────────────────────────────────────────────
+    // 根据名称创建对应优化器，消除 train 程序中的 if-else 重复。
+    // 支持: "sgd", "sgd_momentum", "adam"（默认 Adam）。
+    [[nodiscard]] inline std::unique_ptr<Optimizer> create_optimizer(
+        std::string_view name,
+        std::vector<std::reference_wrapper<Matrix>> params,
+        std::vector<std::reference_wrapper<Matrix>> grads,
+        Scalar lr)
+    {
+        if (name == "sgd")
+            return std::make_unique<SGD>(std::move(params), std::move(grads), lr);
+        if (name == "sgd_momentum")
+            return std::make_unique<SGDWithMomentum>(std::move(params), std::move(grads), lr);
+        return std::make_unique<Adam>(std::move(params), std::move(grads), lr);
+    }
 } // namespace nn
 
 #endif // NN_COMPUTE_OPTIMIZER_HPP

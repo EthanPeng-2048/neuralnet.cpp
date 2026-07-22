@@ -12,6 +12,7 @@
  */
 
 #include <neuralnet.cpp/domain_tokenizer.hpp>
+#include <neuralnet.cpp/core_file.hpp>
 
 #include <chrono>
 #include <cstdlib>
@@ -156,19 +157,6 @@ nn::Result<std::vector<std::size_t>> parse_ids(const std::string &s)
     return ids;
 }
 
-// ── 读取文本文件 ────────────────────────────────────────────────────────
-// 修复：原代码 ifs.tellg() 失败时返回 -1，转为 size_t 后变为巨大值，
-// 随后 std::string content(size, '\0') 会触发 std::bad_alloc。
-// 改为使用 istreambuf_iterator 读取，避免 tellg 风险。
-nn::Result<std::string> read_text_file(const std::string &path)
-{
-    std::ifstream ifs(path, std::ios::binary);
-    if (!ifs)
-        return std::unexpected(nn::Error{"无法打开文件: " + path});
-    return std::string{std::istreambuf_iterator<char>(ifs),
-                       std::istreambuf_iterator<char>()};
-}
-
 // ── 通用 token 调试输出（替代原 WordZipTokenizer::try_decode_token） ──
 // 通过 Tokenizer 基类的 vocab() 虚函数获取，对三种分词器都适用。
 std::string format_token(const nn::Tokenizer &tokenizer, std::size_t id)
@@ -280,7 +268,7 @@ void mode_benchmark(const nn::Tokenizer &tokenizer,
                     const std::string &file_path, bool show_detail)
 {
     std::cout << "读取文件: " << file_path << "\n";
-    auto text_result = read_text_file(file_path);
+    auto text_result = nn::load_text_file(file_path);
     if (!text_result)
     {
         std::cerr << "错误: " << text_result.error().message << "\n";

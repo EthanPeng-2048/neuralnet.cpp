@@ -13,6 +13,7 @@
 #include "core_errors.hpp"
 #include "core_assert.hpp"
 #include "core_threadpool.hpp"
+#include "core_file.hpp"
 #include "config.hpp"
 
 // L1 代数层（algebra_matrix.hpp 已传递包含其余代数头文件）
