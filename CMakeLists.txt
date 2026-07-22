@@ -33,6 +33,12 @@ add_compile_options(
     "$<$<CONFIG:Debug>:${DEBUG_FLAGS}>"
 )
 
+# -ffast-math 会禁用 NaN/Infinity 支持，Clang 会对此产生警告
+# 项目代码依赖 infinity()（如 Softmax 的数值稳定化），需要抑制此警告
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+    add_compile_options(-Wno-nan-infinity-disabled)
+endif()
+
 # -march=native 仅在显式开启时使用（生成不可移植二进制）
 option(NN_USE_NATIVE_ARCH "Use -march=native for maximum performance on this machine" OFF)
 if(NN_USE_NATIVE_ARCH)
@@ -58,6 +64,7 @@ endfunction()
 # ── MNIST 目标 ──────────────────────────────────────────────────────────────
 nn_add_executable(mnist_train src/mnist_train.cpp)
 nn_add_executable(mnist_infer src/mnist_infer.cpp)
+nn_add_executable(mnist_bench src/mnist_bench.cpp)
 
 # ── 文本生成目标 ────────────────────────────────────────────────────────────
 nn_add_executable(text_train src/text_train.cpp)
@@ -69,6 +76,79 @@ nn_add_executable(tokenizer_infer src/tokenizer_infer.cpp)
 
 # ── 计算性能基准测试 ─────────────────────────────────────────────────────
 nn_add_executable(compute_bench src/compute_bench.cpp)
+
+# ── GPU 测试（需要 Vulkan） ──────────────────────────────────────────────
+nn_add_executable(gpu_test src/gpu_test.cpp)
+
+# ── Vulkan GPU 加速（可选） ────────────────────────────────────────────────
+find_package(Vulkan QUIET)
+if(Vulkan_FOUND)
+    message(STATUS "Vulkan found: ${Vulkan_LIBRARY}")
+
+    # 查找 SPIR-V 编译器（Vulkan SDK 自带）
+    find_program(GLSLC glslc HINTS ${Vulkan_GLSLC_EXECUTABLE})
+
+    # 定义着色器列表
+    set(GPU_SHADERS matmul matmul_tiled elementwise layernorm)
+    set(GPU_SHADER_HPPS "")
+
+    foreach(SHADER_NAME ${GPU_SHADERS})
+        set(SRC ${CMAKE_SOURCE_DIR}/shaders/${SHADER_NAME}.comp)
+        set(SPV ${CMAKE_BINARY_DIR}/${SHADER_NAME}.spv)
+        set(HPP ${CMAKE_BINARY_DIR}/generated/${SHADER_NAME}_spv.hpp)
+        set(FUNC "nn_${SHADER_NAME}_spirv_bytecode")
+        list(APPEND GPU_SHADER_SPVS ${SPV})
+        list(APPEND GPU_SHADER_HPPS ${HPP})
+
+        # 编译 GLSL → SPIR-V
+        add_custom_command(
+            OUTPUT ${SPV}
+            COMMAND ${GLSLC} -o ${SPV} ${SRC}
+            DEPENDS ${SRC}
+            COMMENT "[GPU] Compiling ${SHADER_NAME}.comp → ${SHADER_NAME}.spv"
+        )
+
+        # 嵌入 SPIR-V → C++ 头文件
+        add_custom_command(
+            OUTPUT ${HPP}
+            COMMAND ${CMAKE_COMMAND}
+                -DSPV_INPUT=${SPV}
+                -DHPP_OUTPUT=${HPP}
+                -DFUNC_NAME=${FUNC}
+                -P ${CMAKE_SOURCE_DIR}/cmake/embed_spirv.cmake
+            DEPENDS ${SPV} ${CMAKE_SOURCE_DIR}/cmake/embed_spirv.cmake
+            COMMENT "[GPU] Embedding ${SHADER_NAME} SPIR-V into C++ header"
+        )
+    endforeach()
+
+    if(NOT GLSLC)
+        message(WARNING "No SPIR-V compiler found (glslc). "
+                        "GPU acceleration disabled. Install Vulkan SDK.")
+        set(Vulkan_FOUND OFF)
+    endif()
+
+    if(Vulkan_FOUND)
+        add_custom_target(compile_gpu_shaders DEPENDS ${GPU_SHADER_HPPS})
+
+        # 为所有目标启用 Vulkan
+        set(NN_GPU_TARGETS
+            mnist_train mnist_infer mnist_bench
+            text_train text_infer
+            compute_bench gpu_test
+        )
+
+        foreach(TARGET ${NN_GPU_TARGETS})
+            target_compile_definitions(${TARGET} PRIVATE NN_HAS_VULKAN)
+            target_include_directories(${TARGET} PRIVATE ${CMAKE_BINARY_DIR}/generated)
+            target_link_libraries(${TARGET} PRIVATE Vulkan::Vulkan)
+            add_dependencies(${TARGET} compile_gpu_shaders)
+        endforeach()
+
+        message(STATUS "GPU acceleration enabled (Vulkan compute)")
+    endif()
+else()
+    message(STATUS "Vulkan not found. GPU acceleration disabled.")
+endif()
 
 # ── 测试目标 ─────────────────────────────────────────────────────────────
 # 启用测试（默认 OFF，可通过 -DNN_BUILD_TESTS=ON 开启）

@@ -33,6 +33,7 @@ void print_usage(const char *prog)
         << "  --lr <lr>          学习率 (默认: 0.001)\n"
         << "  --batch-size <n>   批大小 (默认: 64)\n"
         << "  --optimizer <name> 优化器: sgd/sgd_momentum/adam (默认: adam)\n"
+        << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
         << "\n  MLP 选项:\n"
         << "  --layer-dims <d1,d2,...>  MLP 各层维度，逗号分隔 (默认: 784,512,256,128,64,10)\n"
         << "\n  Transformer 选项:\n"
@@ -64,6 +65,7 @@ struct TrainConfig
     std::size_t d_ff       = nn::TRANSFORMER_D_FF;
     std::size_t num_layers = nn::TRANSFORMER_NUM_LAYERS;
     std::size_t patch_size = nn::TRANSFORMER_PATCH_SIZE;
+    bool gpu_enabled = false;
 };
 
 TrainConfig parse_args(int argc, char *argv[])
@@ -179,6 +181,10 @@ TrainConfig parse_args(int argc, char *argv[])
             auto v = nn::parse_number<std::size_t>(argv[++i]);
             if (!v) { std::cerr << "无效 --patch-size: " << v.error().message << "\n"; std::exit(1); }
             cfg.patch_size = *v;
+        }
+        else if (arg == "--gpu")
+        {
+            cfg.gpu_enabled = true;
         }
         else
         {
@@ -419,9 +425,28 @@ int main(int argc, char *argv[])
     }
     std::cout << "  优化器: " << cfg.optimizer_name << "  学习率: " << cfg.lr << "\n";
     std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
+    std::cout << "  GPU: " << (cfg.gpu_enabled ? "启用" : "禁用") << "\n";
     std::cout << "  模型: " << (cfg.load_existing ? cfg.resume_path : "(从头训练)")
               << " -> " << cfg.save_path << "\n";
     std::cout << "========================================\n\n";
+
+#ifdef NN_HAS_VULKAN
+    if (cfg.gpu_enabled)
+    {
+        auto &backend = nn::GpuBackend::instance();
+        auto init_result = backend.initialize();
+        if (init_result)
+        {
+            nn::SmartPolicy::gpu_enabled = true;
+            std::cout << "GPU 加速已启用 (Vulkan)\n\n";
+        }
+        else
+        {
+            std::cerr << "GPU 初始化失败: " << init_result.error().message << "\n";
+            std::cerr << "回退到 CPU 模式\n\n";
+        }
+    }
+#endif
 
     // ── 加载数据 ─────────────────────────────────────────────
     std::cout << "加载数据: " << cfg.dataset_path << " ..." << std::endl;

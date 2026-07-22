@@ -33,6 +33,7 @@ void print_usage(const char *prog)
         << "                       仅在 V1 旧格式模型文件时需要手动指定\n"
         << "  --topk <n>         显示前 n 个预测结果 (默认: 3)\n"
         << "  --show-pixels      显示像素矩阵 (调试用)\n"
+        << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
         << "  --help             显示此帮助信息\n";
 }
 
@@ -44,6 +45,7 @@ struct InferConfig
     std::string input_path;
     int topk = 3;
     bool show_pixels = false;
+    bool gpu_enabled = false;
 };
 
 nn::Result<InferConfig> parse_args(int argc, char *argv[])
@@ -81,6 +83,10 @@ nn::Result<InferConfig> parse_args(int argc, char *argv[])
         else if (arg == "--show-pixels")
         {
             cfg.show_pixels = true;
+        }
+        else if (arg == "--gpu")
+        {
+            cfg.gpu_enabled = true;
         }
         else if (!arg.starts_with("--"))
         {
@@ -257,6 +263,24 @@ int main(int argc, char *argv[])
         return 1;
     }
     std::cout << "模型已加载: " << cfg.model_path << "\n" << std::endl;
+
+#ifdef NN_HAS_VULKAN
+    if (cfg.gpu_enabled)
+    {
+        auto &backend = nn::GpuBackend::instance();
+        auto init_result = backend.initialize();
+        if (init_result)
+        {
+            nn::SmartPolicy::gpu_enabled = true;
+            std::cout << "GPU 加速已启用 (Vulkan)\n\n";
+        }
+        else
+        {
+            std::cerr << "GPU 初始化失败: " << init_result.error().message << "\n";
+            std::cerr << "回退到 CPU 模式\n\n";
+        }
+    }
+#endif
 
     fs::path input(cfg.input_path);
 

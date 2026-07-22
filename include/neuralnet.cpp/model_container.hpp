@@ -10,6 +10,11 @@
 #include "config.hpp"
 #include "compute_layer.hpp"
 
+// GPU 加速支持（可选）
+#ifdef NN_HAS_VULKAN
+#include "backend/vk_backend.hpp"
+#endif
+
 namespace nn
 {
     class Model
@@ -76,9 +81,9 @@ namespace nn
         // 通过 Matrix 语义方法（multiply_to）和表达式模板（compute::apply）自动分派，
         // 上层代码完全符合 L(N)→L(N-1) 分层调用规则。
         //
-        // 注意: forward/backward 不能标记 const，因为 Layer 的 forward/backward 虚函数
-        // 是非 const 的（Layer 内部有可变缓存，如 input_cache_/product_buf_ 等）。
-        // 若要实现 const 版本，需要将 Layer 中的缓存标记为 mutable。
+        // 当 GPU 启用且可用时，自动使用 GPU-resident 流水线：
+        //   Input → Upload → [Layer1.forward_gpu → Layer2.forward_gpu → ...] → Download → Output
+        // 中间所有层的矩阵乘法和激活函数全程在 GPU 显存中流转，零 PCIe 中间传输。
         [[nodiscard]] Result<Matrix> forward(const Matrix &input)
         {
             if (layers_.empty())
@@ -86,6 +91,57 @@ namespace nn
                 return std::unexpected(Error{"Model has no layers"});
             }
 
+#ifdef NN_HAS_VULKAN
+            // ── GPU-resident 流水线路径 ─────────────────────────────────────
+            if (SmartPolicy::gpu_enabled)
+            {
+                auto &backend = GpuBackend::instance();
+                if (backend.is_initialized() || backend.initialize())
+                {
+                    // 1. Upload 输入到 GPU（唯一一次 CPU→GPU 传输）
+                    auto gpu_in = GpuTensor::from_matrix(input, backend);
+                    if (gpu_in)
+                    {
+                        // 2. 开始 batch 模式：所有层录制到同一个 command buffer
+                        auto batch_r = backend.begin_batch();
+                        if (batch_r)
+                        {
+                            GpuTensor gpu_out = std::move(*gpu_in);
+                            bool gpu_ok = true;
+                            for (std::size_t i = 0; i < layers_.size(); ++i)
+                            {
+                                auto layer_res = layers_[i]->forward_gpu(gpu_out, backend);
+                                if (!layer_res)
+                                {
+                                    gpu_ok = false;
+                                    break;
+                                }
+                                gpu_out = std::move(*layer_res);
+                            }
+                            if (gpu_ok)
+                            {
+                                // 3. 提交 batch（一次提交、一次 fence wait）
+                                auto end_r = backend.end_batch();
+                                if (end_r)
+                                {
+                                    // 4. Download 输出到 CPU（唯一一次 GPU→CPU 传输）
+                                    auto cpu_out = gpu_out.to_matrix(backend);
+                                    if (cpu_out) return cpu_out;
+                                }
+                            }
+                            else
+                            {
+                                // batch 录制失败，丢弃
+                                (void)backend.end_batch();
+                            }
+                        }
+                    }
+                    // GPU 路径失败，静默 fallback 到 CPU 路径
+                }
+            }
+#endif
+
+            // ── CPU 路径（原始逻辑）──────────────────────────────────────
             auto result = layers_.front()->forward(input);
             if (!result) return std::unexpected(result.error());
             Matrix out = std::move(*result);
