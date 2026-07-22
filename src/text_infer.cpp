@@ -32,6 +32,7 @@ void print_usage(const char *prog)
         << "  --d-ff <n>         FFN 维度 (默认: 512)\n"
         << "  --seq-len <n>      序列长度 (默认: 256)\n"
         << "  --show-tokens      显示 token ID (调试用)\n"
+        << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
         << "  --help             显示此帮助信息\n";
 }
 
@@ -45,6 +46,7 @@ struct InferConfig
     Scalar temperature = 1.0;
     bool interactive = false;
     bool show_tokens = false;
+    bool gpu_enabled = false;
     std::size_t d_model = nn::GPT_D_MODEL;
     std::size_t num_heads = nn::GPT_NUM_HEADS;
     std::size_t num_layers = nn::GPT_NUM_LAYERS;
@@ -85,6 +87,8 @@ InferConfig parse_args(int argc, char *argv[])
         }
         else if (arg == "--show-tokens")
             cfg.show_tokens = true;
+        else if (arg == "--gpu")
+            cfg.gpu_enabled = true;
         else if (arg == "--d-model" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
@@ -247,6 +251,24 @@ int main(int argc, char *argv[])
         }
     }
     std::cout << "词表: " << tokenizer.vocab_size() << " 词" << std::endl;
+
+#ifdef NN_HAS_VULKAN
+    if (cfg.gpu_enabled)
+    {
+        auto &backend = nn::GpuBackend::instance();
+        auto init_result = backend.initialize();
+        if (init_result)
+        {
+            nn::SmartPolicy::gpu_enabled = true;
+            std::cout << "GPU 加速已启用 (Vulkan)\n";
+        }
+        else
+        {
+            std::cerr << "GPU 初始化失败: " << init_result.error().message << "\n";
+            std::cerr << "回退到 CPU 模式\n";
+        }
+    }
+#endif
 
     if (cfg.interactive)
     {

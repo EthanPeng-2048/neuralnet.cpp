@@ -41,6 +41,17 @@ namespace nn
         // 阈值只需设最低门槛，核心利用随数据量自然增长。
         inline static constexpr std::size_t PARALLEL_THRESHOLD = 1024;
         
+        // ── GPU 加速配置 ─────────────────────────────────────────────────
+        // GPU 加速阈值：矩阵面积超过此值时自动走 GPU（默认 64×64 = 4096 元素）
+        inline static constexpr std::size_t GPU_THRESHOLD = 64 * 64;
+        
+        // 是否启用 GPU 后端（运行时开关，默认关闭）
+        inline static bool gpu_enabled = false;
+        
+        // GPU 操作计数（性能统计）
+        inline static std::atomic<uint64_t> gpu_matmul_count{0};
+        inline static std::atomic<uint64_t> cpu_matmul_count{0};
+        
         // for_each 版本
         template<typename Iterator, typename Func>
         static void for_each(Iterator first, Iterator last, Func&& func) {

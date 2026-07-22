@@ -40,6 +40,7 @@ void print_usage(const char *prog)
         << "  --num-layers <n>   Transformer 层数 (默认: 4)\n"
         << "  --d-ff <n>         FFN 中间维度 (默认: 512)\n"
         << "  --log-interval <n> 每隔多少 step 显示进度 (默认: 50)\n"
+        << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
         << "  --help             显示此帮助信息\n";
 }
 
@@ -61,6 +62,7 @@ struct TrainConfig
     std::size_t d_ff = nn::GPT_D_FF;
     std::size_t log_interval = 50;
     bool load_existing = false;
+    bool gpu_enabled = false;
 };
 
 TrainConfig parse_args(int argc, char *argv[])
@@ -148,6 +150,10 @@ TrainConfig parse_args(int argc, char *argv[])
             if (!v) { std::cerr << "无效 --log-interval: " << v.error().message << "\n"; std::exit(1); }
             cfg.log_interval = *v;
         }
+        else if (arg == "--gpu")
+        {
+            cfg.gpu_enabled = true;
+        }
         else if (!arg.starts_with("--"))
             cfg.text_path = arg;
         else
@@ -224,7 +230,26 @@ int main(int argc, char *argv[])
     std::cout << "  序列长度: " << cfg.seq_len << "\n";
     std::cout << "  优化器: " << cfg.optimizer_name << "  学习率: " << cfg.lr << "\n";
     std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
+    std::cout << "  GPU: " << (cfg.gpu_enabled ? "启用" : "禁用") << "\n";
     std::cout << "========================================\n\n";
+
+#ifdef NN_HAS_VULKAN
+    if (cfg.gpu_enabled)
+    {
+        auto &backend = nn::GpuBackend::instance();
+        auto init_result = backend.initialize();
+        if (init_result)
+        {
+            nn::SmartPolicy::gpu_enabled = true;
+            std::cout << "GPU 加速已启用 (Vulkan)\n\n";
+        }
+        else
+        {
+            std::cerr << "GPU 初始化失败: " << init_result.error().message << "\n";
+            std::cerr << "回退到 CPU 模式\n\n";
+        }
+    }
+#endif
 
     // ── 构建模型 ─────────────────────────────────────────────
     auto model_build = nn::build_gpt_model(

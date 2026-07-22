@@ -2,13 +2,20 @@
 #define NN_COMPUTE_LAYER_HPP
 
 #include <functional>
+#include <iostream>
 #include <limits>
+#include <optional>
 #include <random>
 
 #include "algebra_matrix.hpp"
 #include "config.hpp"
 #include "algebra_span.hpp"
 #include "algebra_compute.hpp"
+
+// GPU 加速支持（可选）
+#ifdef NN_HAS_VULKAN
+#include "backend/vk_backend.hpp"
+#endif
 
 namespace nn
 {
@@ -20,6 +27,28 @@ namespace nn
         virtual Result<Matrix> backward(const Matrix &grad_output) = 0;
         virtual std::vector<std::reference_wrapper<Matrix>> parameters() { return {}; }
         virtual std::vector<std::reference_wrapper<Matrix>> param_gradients() { return {}; }
+
+#ifdef NN_HAS_VULKAN
+        // ── GPU-resident 前向传播 ───────────────────────────────────────────
+        // 默认实现：Download → CPU 计算 → Upload（fallback）
+        // 子类可覆盖以提供纯 GPU 实现（如 Linear、ReLU、GeLU）
+        [[nodiscard]] virtual Result<GpuTensor> forward_gpu(
+            const GpuTensor &input, GpuBackend &backend)
+        {
+            // Fallback: Download → CPU forward → Upload
+            auto cpu_in = input.to_matrix(backend);
+            if (!cpu_in) return std::unexpected(cpu_in.error());
+
+            auto cpu_out = forward(*cpu_in);
+            if (!cpu_out) return std::unexpected(cpu_out.error());
+
+            return GpuTensor::from_matrix(*cpu_out, backend);
+        }
+
+        // ── 使 GPU 权重缓存失效（训练时 optimizer.step() 后调用）──────
+        // 默认实现为空（大多数层没有可学习参数）
+        virtual void invalidate_gpu_cache() {}
+#endif
 
         // ── 序列生成（仅 GPTModel 等自回归模型实现） ─────────────────────
         // 默认实现返回错误，避免 L5 层使用 dynamic_cast 向下转型。
@@ -48,6 +77,13 @@ namespace nn
 
         // 使用 thread_local 保证多线程构造 Layer 时的线程安全
         inline static thread_local std::mt19937_64 rng_{std::random_device{}()};
+
+#ifdef NN_HAS_VULKAN
+        // ── GPU 权重缓存（懒加载，首次 forward_gpu 时上传）──────────────
+        std::optional<GpuTensor> gpu_weights_;
+        std::optional<GpuTensor> gpu_bias_;
+        bool gpu_cache_dirty_ = true;  // 权重是否需要重新上传
+#endif
 
     public:
         Linear(std::size_t in_features, std::size_t out_features)
@@ -93,6 +129,45 @@ namespace nn
 
             return result;
         }
+
+#ifdef NN_HAS_VULKAN
+        // ── GPU-resident 前向传播 ───────────────────────────────────────
+        // 纯 GPU 矩阵乘法 + Bias Add，零 PCIe 中间传输
+        // 使用权重缓存：推理时只上传一次，训练时每步重新上传
+        [[nodiscard]] Result<GpuTensor> forward_gpu(
+            const GpuTensor &input, GpuBackend &backend) override
+        {
+            // 1. 上传权重到 GPU（懒加载 + dirty flag）
+            if (gpu_cache_dirty_ || !gpu_weights_)
+            {
+                auto w_res = GpuTensor::from_matrix(w_, backend);
+                if (!w_res) return std::unexpected(w_res.error());
+                gpu_weights_ = std::move(*w_res);
+
+                auto b_res = GpuTensor::from_matrix(b_, backend);
+                if (!b_res) return std::unexpected(b_res.error());
+                gpu_bias_ = std::move(*b_res);
+
+                gpu_cache_dirty_ = false;
+            }
+
+            // 2. 纯 GPU 矩阵乘法（阻塞等待完成）
+            auto mm_res = backend.matmul_gpu(input, *gpu_weights_);
+            if (!mm_res) return std::unexpected(mm_res.error());
+
+            // 3. GPU 端 Bias Add（阻塞等待完成）
+            auto ba_res = backend.elementwise_gpu(
+                *mm_res, &*gpu_bias_, 2u,
+                static_cast<uint32_t>(w_.rows()),
+                static_cast<uint32_t>(input.cols()));
+            if (!ba_res) return std::unexpected(ba_res.error());
+
+            return ba_res;
+        }
+
+        // ── 使 GPU 权重缓存失效（训练时 optimizer.step() 后调用）──────
+        void invalidate_gpu_cache() override { gpu_cache_dirty_ = true; }
+#endif
 
         Result<Matrix> backward(const Matrix &grad_output) override
         {
@@ -149,6 +224,15 @@ namespace nn
             return result;
         }
 
+#ifdef NN_HAS_VULKAN
+        // ── GPU-resident 前向传播：ReLU 通过 GPU 逐元素运算 ───────────
+        [[nodiscard]] Result<GpuTensor> forward_gpu(
+            const GpuTensor &input, GpuBackend &backend) override
+        {
+            return backend.elementwise_gpu(input, nullptr, 0u); // op=0: ReLU
+        }
+#endif
+
         // backward: out = (x > 0) ? grad_output : 0
         // 通过 AST select() 表达条件选择
         Result<Matrix> backward(const Matrix &grad_output) override
@@ -195,6 +279,15 @@ namespace nn
             return result;
         }
 
+#ifdef NN_HAS_VULKAN
+        // ── GPU-resident 前向传播：QuickGeLU 通过 GPU 逐元素运算 ──────
+        [[nodiscard]] Result<GpuTensor> forward_gpu(
+            const GpuTensor &input, GpuBackend &backend) override
+        {
+            return backend.elementwise_gpu(input, nullptr, 1u); // op=1: QuickGeLU
+        }
+#endif
+
         // d/dx [x * sigmoid(βx)] = sigmoid(βx) * [1 + βx * (1 - sigmoid(βx))]
         // factor = s * (1 + βx * (1 - s));  out = go * factor
         Result<Matrix> backward(const Matrix &grad_output) override
@@ -236,6 +329,13 @@ namespace nn
         Matrix normalized_cache_;  // 归一化后的值
         Matrix std_cache_;         // 标准差倒数 (1/sqrt(σ² + ε))
         Matrix mean_cache_;        // 均值
+
+#ifdef NN_HAS_VULKAN
+        // ── GPU 权重缓存（懒加载，首次 forward_gpu 时上传）──────────────
+        std::optional<GpuTensor> gpu_gamma_;
+        std::optional<GpuTensor> gpu_beta_;
+        bool gpu_cache_dirty_ = true;
+#endif
 
         // 数值稳定性
         static constexpr Scalar EPSILON = 1e-5;
@@ -322,6 +422,43 @@ namespace nn
                 [](Scalar o, Scalar b) noexcept { return o + b; });
             return output;
         }
+
+#ifdef NN_HAS_VULKAN
+        // ── GPU-resident 前向传播：纯 GPU LayerNorm，零 PCIe 中间传输 ──
+        [[nodiscard]] Result<GpuTensor> forward_gpu(
+            const GpuTensor &input, GpuBackend &backend) override
+        {
+            // 检查 layernorm pipeline 是否可用
+            if (!backend.has_layernorm_pipeline())
+            {
+                std::cerr << "[LayerNorm::forward_gpu] layernorm pipeline not available, falling back to CPU\n";
+                return Layer::forward_gpu(input, backend);
+            }
+
+            // 1. 上传 gamma 和 beta（懒加载 + dirty flag）
+            if (gpu_cache_dirty_ || !gpu_gamma_)
+            {
+                auto g_res = GpuTensor::from_matrix(gamma_, backend);
+                if (!g_res) return std::unexpected(g_res.error());
+                gpu_gamma_ = std::move(*g_res);
+
+                auto b_res = GpuTensor::from_matrix(beta_, backend);
+                if (!b_res) return std::unexpected(b_res.error());
+                gpu_beta_ = std::move(*b_res);
+
+                gpu_cache_dirty_ = false;
+            }
+
+            // 2. 纯 GPU LayerNorm
+            return backend.layernorm_gpu(
+                input, *gpu_gamma_, *gpu_beta_,
+                static_cast<uint32_t>(normalized_shape_),
+                static_cast<uint32_t>(input.cols()),
+                epsilon_);
+        }
+
+        void invalidate_gpu_cache() override { gpu_cache_dirty_ = true; }
+#endif
 
         // ── 反向传播 ──
         // dL/dγ[f] = Σ_b dL/dy[f][b] * normalized[f][b]

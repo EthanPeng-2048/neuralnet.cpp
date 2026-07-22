@@ -23,6 +23,11 @@
 #include "algebra_span.hpp"
 #include "algebra_compute.hpp"
 
+// GPU 加速支持（可选，由 CMake 的 NN_HAS_VULKAN 宏控制）
+#ifdef NN_HAS_VULKAN
+#include "backend/vk_backend.hpp"
+#endif
+
 namespace nn
 {
     // ═══════════════════════════════════════════════════════════════════════
@@ -47,7 +52,7 @@ namespace nn
             return row * cols_ + col;
         }
 
-        static void require_same_shape(const Matrix &lhs, const Matrix &rhs, std::string_view message)
+        static void require_same_shape(const Matrix &lhs, const Matrix &rhs, [[maybe_unused]] std::string_view message)
         {
             if (lhs.rows_ != rhs.rows_ || lhs.cols_ != rhs.cols_)
             {
@@ -305,6 +310,27 @@ namespace nn
             result.resize(M, N);
             if (M == 0 || N == 0 || K == 0) return;
 
+#ifdef NN_HAS_VULKAN
+            // ── GPU 加速路径 ─────────────────────────────────────────────────
+            // 矩阵面积超过阈值时自动走 GPU，失败则静默 fallback 到 CPU
+            if (SmartPolicy::gpu_enabled && M * N >= SmartPolicy::GPU_THRESHOLD)
+            {
+                auto& backend = GpuBackend::instance();
+                // 快速路径：已初始化时跳过全局锁
+                if (backend.is_initialized() || backend.initialize())
+                {
+                    auto mm = backend.matmul_direct(
+                        span(), other.span(), result.span(), M, N, K);
+                    if (mm)
+                    {
+                        SmartPolicy::gpu_matmul_count.fetch_add(1, std::memory_order_relaxed);
+                        return;  // GPU 成功，直接返回
+                    }
+                }
+                // GPU 失败，静默 fallback 到 CPU 路径
+            }
+            SmartPolicy::cpu_matmul_count.fetch_add(1, std::memory_order_relaxed);
+#endif
 
             // 清零结果矩阵（使用 RAII 封装的方法）
             result.zero();
@@ -596,5 +622,9 @@ namespace nn
     };
 } // namespace nn
 
+// ── GpuTensor 方法实现（需要 Matrix 和 GpuBackend 的完整定义）──────────
+#ifdef NN_HAS_VULKAN
+#include "backend/gpu_tensor_impl.hpp"
+#endif
 
 #endif // NN_ALGEBRA_MATRIX_HPP
