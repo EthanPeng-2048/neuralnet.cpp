@@ -307,9 +307,11 @@ int main(int argc, char* argv[])
     }
 
     // ─═════════════════════════════════════════════════════════════════
-    //  5. 线性层（Linear forward / backward）
+    //  5. 线性层（Linear forward / backward）— 新引擎化架构
     // ─═════════════════════════════════════════════════════════════════
     {
+        nn::CpuEngine engine;
+
         struct LinearCase { std::size_t in, out, batch; };
         std::vector<LinearCase> cases = {
             {768, 768, 128},    // Transformer 标准隐藏层
@@ -320,18 +322,23 @@ int main(int argc, char* argv[])
         };
 
         for (auto [in, out, batch] : cases) {
-            nn::Linear layer(in, out);
+            nn::Linear layer(engine, in, out);
             auto input = rand_matrix(in, batch);
+            auto input_t = engine.from_matrix(input);
+            if (!input_t) {
+                std::cerr << "from_matrix(input) 失败: " << input_t.error().message << "\n";
+                return 1;
+            }
 
             // Forward: C = W * input + b → FLOPs = 2·out·in·batch + out·batch
             double fwd_flops = matmul_flops(out, batch, in) + elem_flops(out * batch);
             // 首次调用校验结果，后续 benchmark 内部重复调用假设成功
-            auto first_fwd = layer.forward(input);
+            auto first_fwd = layer.forward(engine, *input_t);
             if (!first_fwd) {
                 std::cerr << "Linear forward 失败: " << first_fwd.error().message << "\n";
                 return 1;
             }
-            auto res_fwd = bench([&] { auto r = layer.forward(input); (void)r; }, warmup, iters);
+            auto res_fwd = bench([&] { auto r = layer.forward(engine, *input_t); (void)r; }, warmup, iters);
 
             char spec[64];
             std::snprintf(spec, sizeof(spec), "W=%zux%zu b=%zu", out, in, batch);
@@ -341,12 +348,17 @@ int main(int argc, char* argv[])
             // FLOPs ≈ 2·out·in·batch (W^T * grad_out) + out·in·batch (outer product) + out·batch (bias)
             double bwd_flops = matmul_flops(in, batch, out) + elem_flops(out * in * batch) + elem_flops(out * batch);
             auto grad_out = rand_matrix(out, batch);
-            auto first_bwd = layer.backward(grad_out);
+            auto grad_out_t = engine.from_matrix(grad_out);
+            if (!grad_out_t) {
+                std::cerr << "from_matrix(grad_out) 失败: " << grad_out_t.error().message << "\n";
+                return 1;
+            }
+            auto first_bwd = layer.backward(engine, *grad_out_t);
             if (!first_bwd) {
                 std::cerr << "Linear backward 失败: " << first_bwd.error().message << "\n";
                 return 1;
             }
-            auto res_bwd = bench([&] { auto r = layer.backward(grad_out); (void)r; }, warmup, iters);
+            auto res_bwd = bench([&] { auto r = layer.backward(engine, *grad_out_t); (void)r; }, warmup, iters);
             print_row("Linear bwd", spec, bwd_flops, res_bwd.avg_ms, res_bwd.min_ms);
         }
         print_separator();

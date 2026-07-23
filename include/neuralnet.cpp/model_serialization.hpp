@@ -346,6 +346,7 @@ namespace detail
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ── 保存模型（V3 格式，含精度标记 + 可选 tokenizer） ────────────────────
+// 新架构：参数为 Tensor*，通过 engine.to_matrix 下载到 CPU Matrix 后写入。
 [[nodiscard]] inline Result<void> save_model(const std::string &filename,
     Model &model, const ModelSpec &spec, const std::string &tokenizer_json = {})
 {
@@ -358,10 +359,13 @@ namespace detail
     if (auto r = detail::write_spec(ofs, spec); !r)
         return std::unexpected(r.error());
 
+    auto& engine = model.engine();
     auto params = model.parameters();
-    for (auto &p_ref : params)
+    for (auto *p_tensor : params)
     {
-        if (auto r = detail::write_matrix(ofs, p_ref.get()); !r)
+        auto m = engine.to_matrix(*p_tensor);
+        if (!m) return std::unexpected(m.error());
+        if (auto r = detail::write_matrix(ofs, *m); !r)
             return std::unexpected(r.error());
     }
 
@@ -395,6 +399,8 @@ namespace detail
 
 // ── 加载参数 + tokenizer（兼容 V1/V2/V3） ─────────────────────────────────
 //    返回嵌入的 tokenizer JSON 字符串（空串 = 未嵌入或旧格式）
+// 新架构：先 read_matrix 读入临时 CPU Matrix，再通过 engine.copy_from
+// 上传到参数 Tensor（CPU 拷贝 / GPU 上传由引擎实现决定）。
 [[nodiscard]] inline Result<std::string> load_model(const std::string &filename, Model &model)
 {
     std::ifstream ifs(filename, std::ios::binary);
@@ -412,10 +418,16 @@ namespace detail
         if (!spec_r) return std::unexpected(spec_r.error());
     }
 
+    auto& engine = model.engine();
     auto params = model.parameters();
-    for (auto &p_ref : params)
+    for (auto *p_tensor : params)
     {
-        if (auto r = detail::read_matrix(ifs, p_ref.get()); !r)
+        // 先读入临时 Matrix（按参数 Tensor 的形状）
+        Matrix tmp(p_tensor->rows(), p_tensor->cols());
+        if (auto r = detail::read_matrix(ifs, tmp); !r)
+            return std::unexpected(r.error());
+        // 通过 engine 上传到参数 Tensor
+        if (auto r = engine.copy_from(*p_tensor, tmp); !r)
             return std::unexpected(r.error());
     }
 

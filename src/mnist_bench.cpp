@@ -1,9 +1,10 @@
-// ── MNIST MLP CPU vs GPU 对比基准测试 ──────────────────────────────────────
-// 用法：mnist_bench [--epochs N] [--batch-size N] [--dataset <path>]
-//                   [--warmup N] [--infer-iters N] [--help]
+// ── MNIST MLP CPU vs GPU 对比基准测试（新引擎化架构） ──────────────────────
 //
-// 在相同数据集、相同模型上分别用 CPU 和 GPU 跑训练和推理，
+// 在相同数据集、相同模型上分别用 CpuEngine 和 GpuEngine 跑训练和推理，
 // 输出逐 epoch 时间、总时间、准确率及推理吞吐量对比。
+//
+// 新架构下每个 Model 绑定一个 ComputeEngine；CPU/GPU 对比需要分别构建
+// 独立的 engine + model 实例。
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>
@@ -18,6 +19,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <sstream>
@@ -55,7 +57,7 @@ struct BenchConfig {
 void print_usage(const char* prog)
 {
     std::cout
-        << "MNIST MLP CPU vs GPU 对比基准测试\n\n"
+        << "MNIST MLP CPU vs GPU 对比基准测试 (引擎化架构)\n\n"
         << "用法: " << prog << " [选项]\n\n"
         << "选项:\n"
         << "  --epochs <n>        训练轮数 (默认: 5)\n"
@@ -92,7 +94,7 @@ BenchConfig parse_args(int argc, char* argv[])
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  数据加载（复用 mnist_train.cpp 优化版）
+//  数据加载
 // ═══════════════════════════════════════════════════════════════════════════
 nn::Result<std::pair<nn::Matrix, nn::Matrix>> load_csv(const std::string& filename)
 {
@@ -115,7 +117,6 @@ nn::Result<std::pair<nn::Matrix, nn::Matrix>> load_csv(const std::string& filena
     const char* ptr = buffer.data();
     const char* end = buffer.data() + buffer.size();
 
-    // 预扫描列数
     int first_label = 0;
     std::size_t feat_dim = 0;
     {
@@ -169,14 +170,23 @@ nn::Result<std::pair<nn::Matrix, nn::Matrix>> load_csv(const std::string& filena
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  评估准确率
+//  评估准确率（全量前向后下载到 CPU 做 argmax）
 // ═══════════════════════════════════════════════════════════════════════════
-Scalar evaluate(nn::Model& model, const nn::Matrix& x, const nn::Matrix& y_onehot)
+nn::Result<Scalar> evaluate(nn::Model& model, nn::ComputeEngine& engine,
+                             const nn::Matrix& x, const nn::Matrix& y_onehot)
 {
-    auto out_result = model.forward(x);
-    if (!out_result) return -1.0;
-    auto out = std::move(*out_result);
     std::size_t N = x.cols();
+
+    auto x_tensor_r = engine.from_matrix(x);
+    if (!x_tensor_r) return std::unexpected(std::move(x_tensor_r).error());
+
+    auto out_tensor_r = model.forward(*x_tensor_r);
+    if (!out_tensor_r) return std::unexpected(std::move(out_tensor_r).error());
+
+    auto out_r = engine.to_matrix(*out_tensor_r);
+    if (!out_r) return std::unexpected(std::move(out_r).error());
+    const auto& out = *out_r;
+
     int correct = 0;
     for (std::size_t i = 0; i < N; ++i)
     {
@@ -196,7 +206,7 @@ Scalar evaluate(nn::Model& model, const nn::Matrix& x, const nn::Matrix& y_oneho
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  单轮训练（返回 epoch 耗时毫秒 + 平均 loss）
+//  单轮训练（返回 epoch 耗时毫秒 + 平均 loss + 训练/测试准确率）
 // ═══════════════════════════════════════════════════════════════════════════
 struct EpochResult {
     double time_ms;
@@ -205,8 +215,9 @@ struct EpochResult {
     Scalar test_acc;
 };
 
-EpochResult train_one_epoch(
-    nn::Model& model, nn::Optimizer& optimizer, nn::CrossEntropyLoss& ce_loss,
+nn::Result<EpochResult> train_one_epoch(
+    nn::Model& model, nn::ComputeEngine& engine,
+    nn::Optimizer& optimizer, nn::CrossEntropyLoss& ce_loss,
     const nn::Matrix& train_x, const nn::Matrix& train_y,
     const nn::Matrix& test_x, const nn::Matrix& test_y,
     std::size_t batch_size, std::mt19937_64& rng)
@@ -242,17 +253,24 @@ EpochResult train_one_epoch(
                 y_dst[r * batch_size + k] = y_src[r * N + src_col];
         }
 
-        auto out_fwd = model.forward(x_batch);
-        if (!out_fwd) { std::cerr << "Forward failed\n"; std::exit(1); }
-        auto out = std::move(*out_fwd);
-        auto loss_result = ce_loss.forward(out, y_batch);
-        if (!loss_result) { std::cerr << "Loss failed\n"; std::exit(1); }
-        total_loss += *loss_result;
+        // Matrix → Tensor（上传到引擎设备）
+        auto x_tensor_r = engine.from_matrix(x_batch);
+        if (!x_tensor_r) return std::unexpected(std::move(x_tensor_r).error());
+        auto y_tensor_r = engine.from_matrix(y_batch);
+        if (!y_tensor_r) return std::unexpected(std::move(y_tensor_r).error());
 
-        auto grad_result = ce_loss.backward();
-        if (!grad_result) { std::cerr << "Loss bw failed\n"; std::exit(1); }
-        auto bwd_result = model.backward(*grad_result);
-        if (!bwd_result) { std::cerr << "Backward failed\n"; std::exit(1); }
+        // 前向 + 损失
+        auto out_r = model.forward(*x_tensor_r);
+        if (!out_r) return std::unexpected(std::move(out_r).error());
+        auto loss_r = ce_loss.forward(engine, *out_r, *y_tensor_r);
+        if (!loss_r) return std::unexpected(std::move(loss_r).error());
+        total_loss += *loss_r;
+
+        // 反向 + 优化
+        auto grad_r = ce_loss.backward();
+        if (!grad_r) return std::unexpected(std::move(grad_r).error());
+        auto bwd_r = model.backward(*grad_r);
+        if (!bwd_r) return std::unexpected(std::move(bwd_r).error());
         (void)optimizer.step();
         (void)optimizer.zero_grad();
     }
@@ -260,10 +278,12 @@ EpochResult train_one_epoch(
 
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     Scalar avg_loss = total_loss / static_cast<Scalar>(num_batches);
-    Scalar train_acc = evaluate(model, train_x, train_y);
-    Scalar test_acc  = evaluate(model, test_x, test_y);
+    auto train_acc_r = evaluate(model, engine, train_x, train_y);
+    auto test_acc_r  = evaluate(model, engine, test_x, test_y);
+    if (!train_acc_r || !test_acc_r)
+        return std::unexpected(!train_acc_r ? train_acc_r.error() : test_acc_r.error());
 
-    return {ms, avg_loss, train_acc, test_acc};
+    return EpochResult{ms, avg_loss, *train_acc_r, *test_acc_r};
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -274,32 +294,122 @@ struct InferResult {
     double throughput;  // images/sec
 };
 
-InferResult bench_inference(
-    nn::Model& model, const nn::Matrix& single_image,
-    int warmup, int iters)
+nn::Result<InferResult> bench_inference(
+    nn::Model& model, nn::ComputeEngine& engine,
+    const nn::Matrix& single_image, int warmup, int iters)
 {
     // 预热
     for (int i = 0; i < warmup; ++i)
-        (void)model.forward(single_image);
+    {
+        auto x_r = engine.from_matrix(single_image);
+        if (!x_r) return std::unexpected(std::move(x_r).error());
+        auto out_r = model.forward(*x_r);
+        if (!out_r) return std::unexpected(std::move(out_r).error());
+    }
 
     // 计时
     auto t0 = Clock::now();
     for (int i = 0; i < iters; ++i)
-        (void)model.forward(single_image);
+    {
+        auto x_r = engine.from_matrix(single_image);
+        if (!x_r) return std::unexpected(std::move(x_r).error());
+        auto out_r = model.forward(*x_r);
+        if (!out_r) return std::unexpected(std::move(out_r).error());
+    }
     auto t1 = Clock::now();
 
     double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     double avg_ms = total_ms / iters;
     double throughput = (avg_ms > 0) ? 1000.0 / avg_ms : 0;
-    return {avg_ms, throughput};
+    return InferResult{avg_ms, throughput};
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  分隔线
+//  分隔线 + 表头
 // ═══════════════════════════════════════════════════════════════════════════
 void print_separator()
 {
     std::cout << "══════════════════════════════════════════════════════════════\n";
+}
+
+void print_epoch_header(const char* title)
+{
+    std::cout << "\n  " << title << "\n\n";
+    std::cout << std::left
+              << std::setw(8)  << "Epoch"
+              << std::setw(12) << "Loss"
+              << std::setw(12) << "Train Acc"
+              << std::setw(12) << "Test Acc"
+              << std::setw(12) << "Time(ms)"
+              << "\n";
+    std::cout << std::string(56, '-') << "\n";
+}
+
+void print_epoch_row(const EpochResult& ep, int epoch)
+{
+    std::cout << std::left
+              << std::setw(8)  << (epoch + 1)
+              << std::setw(12) << std::fixed << std::setprecision(4) << ep.avg_loss
+              << std::setw(12) << std::setprecision(2) << (ep.train_acc * 100.0) << "%"
+              << std::setw(12) << (ep.test_acc * 100.0) << "%"
+              << std::setw(12) << std::setprecision(1) << ep.time_ms
+              << "\n";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  单设备训练 + 推理基准（返回 TimingStats + InferResult）
+// ═══════════════════════════════════════════════════════════════════════════
+struct DeviceBenchResult {
+    TimingStats train_stats;
+    InferResult infer;
+};
+
+nn::Result<DeviceBenchResult> bench_device(
+    nn::ComputeEngine& engine,
+    const BenchConfig& cfg,
+    const nn::Matrix& train_x, const nn::Matrix& train_y,
+    const nn::Matrix& test_x,  const nn::Matrix& test_y,
+    const nn::Matrix& single_img,
+    std::uint64_t rng_seed, const char* device_name)
+{
+    auto model_r = nn::build_mnist_mlp_model(engine);
+    if (!model_r) return std::unexpected(std::move(model_r).error());
+    auto model = std::move(*model_r);
+
+    auto optimizer = nn::create_optimizer(
+        "adam", engine, model.parameters(), model.param_gradients(), cfg.lr);
+    nn::CrossEntropyLoss ce_loss;
+
+    std::mt19937_64 rng{rng_seed};
+    TimingStats stats;
+
+    print_epoch_header(device_name);
+
+    for (int epoch = 0; epoch < cfg.epochs; ++epoch)
+    {
+        auto ep_r = train_one_epoch(model, engine, *optimizer, ce_loss,
+                                    train_x, train_y, test_x, test_y,
+                                    cfg.batch_size, rng);
+        if (!ep_r) return std::unexpected(std::move(ep_r).error());
+        auto ep = *ep_r;
+
+        stats.total_ms += ep.time_ms;
+        stats.min_ms = std::min(stats.min_ms, ep.time_ms);
+        stats.max_ms = std::max(stats.max_ms, ep.time_ms);
+        stats.per_epoch.push_back(ep.time_ms);
+
+        print_epoch_row(ep, epoch);
+    }
+
+    // 推理基准
+    std::cout << "\n  " << device_name << " 推理基准 ("
+              << cfg.infer_iters << " 次迭代, 预热 " << cfg.warmup << " 轮)...\n";
+    auto infer_r = bench_inference(model, engine, single_img, cfg.warmup, cfg.infer_iters);
+    if (!infer_r) return std::unexpected(std::move(infer_r).error());
+    std::cout << "  平均延迟: " << std::fixed << std::setprecision(3) << infer_r->avg_ms << " ms\n";
+    std::cout << "  吞吐量:   " << std::setprecision(1) << infer_r->throughput << " images/s\n";
+
+    return DeviceBenchResult{stats, *infer_r};
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -310,7 +420,7 @@ int main(int argc, char* argv[])
     BenchConfig cfg = parse_args(argc, argv);
 
     print_separator();
-    std::cout << "  MNIST MLP  CPU vs GPU 对比基准测试\n";
+    std::cout << "  MNIST MLP  CPU vs GPU 对比基准测试 (引擎化架构)\n";
     print_separator();
     std::cout << "  模型:     784→512→256→128→64→10 (LayerNorm+GeLU)\n";
     std::cout << "  训练轮数: " << cfg.epochs << "\n";
@@ -332,7 +442,7 @@ int main(int argc, char* argv[])
 
     std::cout << "  训练集: " << train_x.cols() << " 样本\n";
     std::cout << "  测试集: " << test_x.cols() << " 样本\n";
-    std::cout << "  特征维度: " << train_x.rows() << "\n\n";
+    std::cout << "  特征维度: " << train_x.rows() << "\n";
 
     // 取一张测试图片用于推理基准
     nn::Matrix single_img(train_x.rows(), 1);
@@ -340,65 +450,31 @@ int main(int argc, char* argv[])
         single_img.set_value_unchecked(r, 0, test_x.at_unchecked(r, 0));
 
     // ════════════════════════════════════════════════════════════════════════
-    //  Phase 1: CPU 训练
+    //  Phase 1: CPU 训练 + 推理基准
     // ════════════════════════════════════════════════════════════════════════
     print_separator();
-    std::cout << "  Phase 1: CPU 训练\n";
+    std::cout << "  Phase 1: CPU 训练 (CpuEngine)\n";
     print_separator();
 
-    nn::SmartPolicy::gpu_enabled = false;
-
-    auto model_cpu_result = nn::build_mnist_mlp_model();
-    if (!model_cpu_result) { std::cerr << "构建模型失败\n"; return 1; }
-    auto model_cpu = std::move(*model_cpu_result);
-
-    auto optimizer_cpu = nn::create_optimizer(
-        "adam", model_cpu.parameters(), model_cpu.param_gradients(), cfg.lr);
-    nn::CrossEntropyLoss ce_loss_cpu;
-
-    std::mt19937_64 rng_cpu{42};
-    TimingStats cpu_train_stats;
-
-    std::cout << std::left
-              << std::setw(8)  << "Epoch"
-              << std::setw(12) << "Loss"
-              << std::setw(12) << "Train Acc"
-              << std::setw(12) << "Test Acc"
-              << std::setw(12) << "Time(ms)"
-              << "\n";
-    std::cout << std::string(56, '-') << "\n";
-
-    for (int epoch = 0; epoch < cfg.epochs; ++epoch)
+    auto cpu_engine = std::make_unique<nn::CpuEngine>();
+    auto cpu_bench_r = bench_device(*cpu_engine, cfg,
+                                    train_x, train_y, test_x, test_y,
+                                    single_img, 42, "CPU");
+    if (!cpu_bench_r)
     {
-        auto ep = train_one_epoch(model_cpu, *optimizer_cpu, ce_loss_cpu,
-                                  train_x, train_y, test_x, test_y,
-                                  cfg.batch_size, rng_cpu);
-        cpu_train_stats.total_ms += ep.time_ms;
-        cpu_train_stats.min_ms = std::min(cpu_train_stats.min_ms, ep.time_ms);
-        cpu_train_stats.max_ms = std::max(cpu_train_stats.max_ms, ep.time_ms);
-        cpu_train_stats.per_epoch.push_back(ep.time_ms);
-
-        std::cout << std::left
-                  << std::setw(8)  << (epoch + 1)
-                  << std::setw(12) << std::fixed << std::setprecision(4) << ep.avg_loss
-                  << std::setw(12) << std::setprecision(2) << (ep.train_acc * 100.0) << "%"
-                  << std::setw(12) << (ep.test_acc * 100.0) << "%"
-                  << std::setw(12) << std::setprecision(1) << ep.time_ms
-                  << "\n";
+        std::cerr << "CPU 基准测试失败: " << cpu_bench_r.error().message << "\n";
+        return 1;
     }
-
-    // CPU 推理基准
-    std::cout << "\n  CPU 推理基准 (" << cfg.infer_iters << " 次迭代, 预热 " << cfg.warmup << " 轮)...\n";
-    auto cpu_infer = bench_inference(model_cpu, single_img, cfg.warmup, cfg.infer_iters);
-    std::cout << "  平均延迟: " << std::fixed << std::setprecision(3) << cpu_infer.avg_ms << " ms\n";
-    std::cout << "  吞吐量:   " << std::setprecision(1) << cpu_infer.throughput << " images/s\n\n";
+    auto cpu_bench = *cpu_bench_r;
+    const auto& cpu_train_stats = cpu_bench.train_stats;
+    const auto& cpu_infer = cpu_bench.infer;
 
     // ════════════════════════════════════════════════════════════════════════
-    //  Phase 2: GPU 训练
+    //  Phase 2: GPU 训练 + 推理基准（需要 Vulkan）
     // ════════════════════════════════════════════════════════════════════════
 #ifdef NN_HAS_VULKAN
     print_separator();
-    std::cout << "  Phase 2: GPU 训练 (Vulkan)\n";
+    std::cout << "  Phase 2: GPU 训练 (GpuEngine / Vulkan)\n";
     print_separator();
 
     auto& backend = nn::GpuBackend::instance();
@@ -407,122 +483,77 @@ int main(int argc, char* argv[])
     {
         std::cerr << "\n  GPU 初始化失败: " << init_result.error().message << "\n";
         std::cerr << "  跳过 GPU 测试，仅报告 CPU 结果。\n\n";
-        goto report;
     }
-    nn::SmartPolicy::gpu_enabled = true;
-    std::cout << "  GPU: Vulkan 加速已启用\n\n";
-
+    else
     {
-        auto model_gpu_result = nn::build_mnist_mlp_model();
-        if (!model_gpu_result) { std::cerr << "构建模型失败\n"; return 1; }
-        auto model_gpu = std::move(*model_gpu_result);
-
-        auto optimizer_gpu = nn::create_optimizer(
-            "adam", model_gpu.parameters(), model_gpu.param_gradients(), cfg.lr);
-        nn::CrossEntropyLoss ce_loss_gpu;
-
-        std::mt19937_64 rng_gpu{42};
-        TimingStats gpu_train_stats;
-
-        std::cout << std::left
-                  << std::setw(8)  << "Epoch"
-                  << std::setw(12) << "Loss"
-                  << std::setw(12) << "Train Acc"
-                  << std::setw(12) << "Test Acc"
-                  << std::setw(12) << "Time(ms)"
-                  << "\n";
-        std::cout << std::string(56, '-') << "\n";
-
-        for (int epoch = 0; epoch < cfg.epochs; ++epoch)
+        auto gpu_engine = std::make_unique<nn::GpuEngine>(backend);
+        auto gpu_bench_r = bench_device(*gpu_engine, cfg,
+                                        train_x, train_y, test_x, test_y,
+                                        single_img, 42, "GPU");
+        if (!gpu_bench_r)
         {
-            auto ep = train_one_epoch(model_gpu, *optimizer_gpu, ce_loss_gpu,
-                                      train_x, train_y, test_x, test_y,
-                                      cfg.batch_size, rng_gpu);
-            gpu_train_stats.total_ms += ep.time_ms;
-            gpu_train_stats.min_ms = std::min(gpu_train_stats.min_ms, ep.time_ms);
-            gpu_train_stats.max_ms = std::max(gpu_train_stats.max_ms, ep.time_ms);
-            gpu_train_stats.per_epoch.push_back(ep.time_ms);
+            std::cerr << "GPU 基准测试失败: " << gpu_bench_r.error().message << "\n";
+        }
+        else
+        {
+            auto gpu_bench = *gpu_bench_r;
+            const auto& gpu_train_stats = gpu_bench.train_stats;
+            const auto& gpu_infer = gpu_bench.infer;
+
+            // ── 汇总对比 ──────────────────────────────────────────────
+            print_separator();
+            std::cout << "  汇总对比\n";
+            print_separator();
+
+            double avg_cpu_epoch = cpu_train_stats.total_ms / cfg.epochs;
+            double avg_gpu_epoch = gpu_train_stats.total_ms / cfg.epochs;
+            double train_speedup = avg_cpu_epoch / avg_gpu_epoch;
+            double infer_speedup = cpu_infer.avg_ms / gpu_infer.avg_ms;
 
             std::cout << std::left
-                      << std::setw(8)  << (epoch + 1)
-                      << std::setw(12) << std::fixed << std::setprecision(4) << ep.avg_loss
-                      << std::setw(12) << std::setprecision(2) << (ep.train_acc * 100.0) << "%"
-                      << std::setw(12) << (ep.test_acc * 100.0) << "%"
-                      << std::setw(12) << std::setprecision(1) << ep.time_ms
+                      << std::setw(24) << "指标"
+                      << std::setw(16) << "CPU"
+                      << std::setw(16) << "GPU"
+                      << std::setw(12) << "加速比"
                       << "\n";
+            std::cout << std::string(68, '-') << "\n";
+
+            std::cout << std::left
+                      << std::setw(24) << "训练总时间 (ms)"
+                      << std::setw(16) << std::fixed << std::setprecision(1) << cpu_train_stats.total_ms
+                      << std::setw(16) << gpu_train_stats.total_ms
+                      << std::setw(12) << std::setprecision(2) << (cpu_train_stats.total_ms / gpu_train_stats.total_ms) << "x"
+                      << "\n";
+
+            std::cout << std::left
+                      << std::setw(24) << "平均 Epoch 时间 (ms)"
+                      << std::setw(16) << std::fixed << std::setprecision(1) << avg_cpu_epoch
+                      << std::setw(16) << avg_gpu_epoch
+                      << std::setw(12) << std::setprecision(2) << train_speedup << "x"
+                      << "\n";
+
+            std::cout << std::left
+                      << std::setw(24) << "推理延迟 (ms/img)"
+                      << std::setw(16) << std::fixed << std::setprecision(3) << cpu_infer.avg_ms
+                      << std::setw(16) << gpu_infer.avg_ms
+                      << std::setw(12) << std::setprecision(2) << infer_speedup << "x"
+                      << "\n";
+
+            std::cout << std::left
+                      << std::setw(24) << "推理吞吐量 (img/s)"
+                      << std::setw(16) << std::fixed << std::setprecision(1) << cpu_infer.throughput
+                      << std::setw(16) << gpu_infer.throughput
+                      << std::setw(12) << std::setprecision(2) << infer_speedup << "x"
+                      << "\n\n";
+
+            print_separator();
+            std::cout << "  完成\n";
+            print_separator();
+            return 0;
         }
-
-        // GPU 推理基准
-        nn::SmartPolicy::gpu_enabled = true;
-        std::cout << "\n  GPU 推理基准 (" << cfg.infer_iters << " 次迭代, 预热 " << cfg.warmup << " 轮)...\n";
-        auto gpu_infer = bench_inference(model_gpu, single_img, cfg.warmup, cfg.infer_iters);
-        std::cout << "  平均延迟: " << std::fixed << std::setprecision(3) << gpu_infer.avg_ms << " ms\n";
-        std::cout << "  吞吐量:   " << std::setprecision(1) << gpu_infer.throughput << " images/s\n\n";
-
-        // ── 汇总对比 ──────────────────────────────────────────────
-        nn::SmartPolicy::gpu_enabled = false;
-
-        print_separator();
-        std::cout << "  汇总对比\n";
-        print_separator();
-
-        double avg_cpu_epoch = cpu_train_stats.total_ms / cfg.epochs;
-        double avg_gpu_epoch = gpu_train_stats.total_ms / cfg.epochs;
-        double train_speedup = avg_cpu_epoch / avg_gpu_epoch;
-        double infer_speedup = cpu_infer.avg_ms / gpu_infer.avg_ms;
-
-        std::cout << std::left
-                  << std::setw(24) << "指标"
-                  << std::setw(16) << "CPU"
-                  << std::setw(16) << "GPU"
-                  << std::setw(12) << "加速比"
-                  << "\n";
-        std::cout << std::string(68, '-') << "\n";
-
-        std::cout << std::left
-                  << std::setw(24) << "训练总时间 (ms)"
-                  << std::setw(16) << std::fixed << std::setprecision(1) << cpu_train_stats.total_ms
-                  << std::setw(16) << gpu_train_stats.total_ms
-                  << std::setw(12) << std::setprecision(2) << (cpu_train_stats.total_ms / gpu_train_stats.total_ms) << "x"
-                  << "\n";
-
-        std::cout << std::left
-                  << std::setw(24) << "平均 Epoch 时间 (ms)"
-                  << std::setw(16) << std::fixed << std::setprecision(1) << avg_cpu_epoch
-                  << std::setw(16) << avg_gpu_epoch
-                  << std::setw(12) << std::setprecision(2) << train_speedup << "x"
-                  << "\n";
-
-        std::cout << std::left
-                  << std::setw(24) << "推理延迟 (ms/img)"
-                  << std::setw(16) << std::fixed << std::setprecision(3) << cpu_infer.avg_ms
-                  << std::setw(16) << gpu_infer.avg_ms
-                  << std::setw(12) << std::setprecision(2) << infer_speedup << "x"
-                  << "\n";
-
-        std::cout << std::left
-                  << std::setw(24) << "推理吞吐量 (img/s)"
-                  << std::setw(16) << std::fixed << std::setprecision(1) << cpu_infer.throughput
-                  << std::setw(16) << gpu_infer.throughput
-                  << std::setw(12) << std::setprecision(2) << infer_speedup << "x"
-                  << "\n";
-
-        // GPU 统计
-        uint64_t gpu_ops = nn::SmartPolicy::gpu_matmul_count.load();
-        uint64_t cpu_ops = nn::SmartPolicy::cpu_matmul_count.load();
-        std::cout << "\n  GPU 矩阵乘法次数: " << gpu_ops << "\n";
-        std::cout << "  CPU 矩阵乘法次数: " << cpu_ops << "\n";
-        std::cout << "  GPU 利用率: " << std::fixed << std::setprecision(1)
-                  << (gpu_ops + cpu_ops > 0 ? 100.0 * gpu_ops / (gpu_ops + cpu_ops) : 0.0) << "%\n\n";
-
-        print_separator();
-        std::cout << "  完成\n";
-        print_separator();
     }
-    return 0;
-
-report:
 #endif
+
     // 无 Vulkan 时的 CPU-only 汇总
     print_separator();
     std::cout << "  CPU Only 汇总\n";
