@@ -55,19 +55,19 @@
 #define NN_MATMUL_TILED_SPV_EMBEDDED
 #endif
 
-#if __has_include("elementwise_spv.hpp")
-#include "elementwise_spv.hpp"
-#define NN_ELEMENTWISE_SPV_EMBEDDED
+#if __has_include("elementwise_v2_spv.hpp")
+#include "elementwise_v2_spv.hpp"
+#define NN_ELEMENTWISE_V2_SPV_EMBEDDED
 #endif
 
-#if __has_include("layernorm_spv.hpp")
-#include "layernorm_spv.hpp"
-#define NN_LAYERNORM_SPV_EMBEDDED
+#if __has_include("reduce_spv.hpp")
+#include "reduce_spv.hpp"
+#define NN_REDUCE_SPV_EMBEDDED
 #endif
 
-#if __has_include("layernorm_backward_spv.hpp")
-#include "layernorm_backward_spv.hpp"
-#define NN_LAYERNORM_BACKWARD_SPV_EMBEDDED
+#if __has_include("broadcast_spv.hpp")
+#include "broadcast_spv.hpp"
+#define NN_BROADCAST_SPV_EMBEDDED
 #endif
 
 namespace nn
@@ -374,9 +374,11 @@ public:
         return pl;
     }
 
-    // 创建 elementwise pipeline
-    [[nodiscard]] static Result<VulkanPipeline> create_elementwise(
-        VkDevice device, std::span<const uint32_t> spirv_code)
+    // 创建通用 pipeline（可变 binding 数和 push constant 大小）
+    // 用于 elementwise_v2 / reduce / broadcast 等纯原语着色器
+    [[nodiscard]] static Result<VulkanPipeline> create_generic(
+        VkDevice device, std::span<const uint32_t> spirv_code,
+        uint32_t num_bindings, uint32_t push_constant_size)
     {
         VulkanPipeline pl;
         pl.device_ = device;
@@ -393,11 +395,11 @@ public:
         if (!r)
             return std::unexpected(r.error());
 
-        // 创建 descriptor set layout（3 个 storage buffer）
-        VkDescriptorSetLayoutBinding bindings[3]{};
-        for (int i = 0; i < 3; ++i)
+        // 创建 descriptor set layout（num_bindings 个 storage buffer）
+        std::vector<VkDescriptorSetLayoutBinding> bindings(num_bindings);
+        for (uint32_t i = 0; i < num_bindings; ++i)
         {
-            bindings[i].binding = static_cast<uint32_t>(i);
+            bindings[i].binding = i;
             bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             bindings[i].descriptorCount = 1;
             bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -405,8 +407,8 @@ public:
 
         VkDescriptorSetLayoutCreateInfo layout_info{};
         layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        layout_info.bindingCount = 3;
-        layout_info.pBindings = bindings;
+        layout_info.bindingCount = num_bindings;
+        layout_info.pBindings = bindings.data();
 
         r = detail::vk_check(
             vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &pl.descriptor_layout_),
@@ -414,171 +416,17 @@ public:
         if (!r)
             return std::unexpected(r.error());
 
-        // 创建 pipeline layout（push constants: count, op, rows, cols）
+        // 创建 pipeline layout（push constants）
         VkPushConstantRange push_range{};
         push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         push_range.offset = 0;
-        push_range.size = 4 * sizeof(uint32_t);
+        push_range.size = push_constant_size;
 
         VkPipelineLayoutCreateInfo pl_layout_info{};
         pl_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         pl_layout_info.setLayoutCount = 1;
         pl_layout_info.pSetLayouts = &pl.descriptor_layout_;
-        pl_layout_info.pushConstantRangeCount = 1;
-        pl_layout_info.pPushConstantRanges = &push_range;
-
-        r = detail::vk_check(
-            vkCreatePipelineLayout(device, &pl_layout_info, nullptr, &pl.pipeline_layout_),
-            __FILE__, __LINE__);
-        if (!r)
-            return std::unexpected(r.error());
-
-        // 创建 compute pipeline
-        VkComputePipelineCreateInfo pipeline_info{};
-        pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        pipeline_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        pipeline_info.stage.module = pl.shader_module_;
-        pipeline_info.stage.pName = "main";
-        pipeline_info.layout = pl.pipeline_layout_;
-
-        r = detail::vk_check(
-            vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pl.pipeline_),
-            __FILE__, __LINE__);
-        if (!r)
-            return std::unexpected(r.error());
-
-        return pl;
-    }
-
-    // 创建 layernorm pipeline（4 个 storage buffer: input, gamma, beta, output）
-    [[nodiscard]] static Result<VulkanPipeline> create_layernorm(
-        VkDevice device, std::span<const uint32_t> spirv_code)
-    {
-        VulkanPipeline pl;
-        pl.device_ = device;
-
-        // 创建 shader module
-        VkShaderModuleCreateInfo module_info{};
-        module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        module_info.codeSize = spirv_code.size_bytes();
-        module_info.pCode = spirv_code.data();
-
-        auto r = detail::vk_check(
-            vkCreateShaderModule(device, &module_info, nullptr, &pl.shader_module_),
-            __FILE__, __LINE__);
-        if (!r)
-            return std::unexpected(r.error());
-
-        // 创建 descriptor set layout（4 个 storage buffer）
-        VkDescriptorSetLayoutBinding bindings[4]{};
-        for (int i = 0; i < 4; ++i)
-        {
-            bindings[i].binding = static_cast<uint32_t>(i);
-            bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            bindings[i].descriptorCount = 1;
-            bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        }
-
-        VkDescriptorSetLayoutCreateInfo layout_info{};
-        layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        layout_info.bindingCount = 4;
-        layout_info.pBindings = bindings;
-
-        r = detail::vk_check(
-            vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &pl.descriptor_layout_),
-            __FILE__, __LINE__);
-        if (!r)
-            return std::unexpected(r.error());
-
-        // 创建 pipeline layout（push constants: rows, cols, eps_bits）
-        VkPushConstantRange push_range{};
-        push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        push_range.offset = 0;
-        push_range.size = 3 * sizeof(uint32_t);
-
-        VkPipelineLayoutCreateInfo pl_layout_info{};
-        pl_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pl_layout_info.setLayoutCount = 1;
-        pl_layout_info.pSetLayouts = &pl.descriptor_layout_;
-        pl_layout_info.pushConstantRangeCount = 1;
-        pl_layout_info.pPushConstantRanges = &push_range;
-
-        r = detail::vk_check(
-            vkCreatePipelineLayout(device, &pl_layout_info, nullptr, &pl.pipeline_layout_),
-            __FILE__, __LINE__);
-        if (!r)
-            return std::unexpected(r.error());
-
-        // 创建 compute pipeline
-        VkComputePipelineCreateInfo pipeline_info{};
-        pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        pipeline_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        pipeline_info.stage.module = pl.shader_module_;
-        pipeline_info.stage.pName = "main";
-        pipeline_info.layout = pl.pipeline_layout_;
-
-        r = detail::vk_check(
-            vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pl.pipeline_),
-            __FILE__, __LINE__);
-        if (!r)
-            return std::unexpected(r.error());
-
-        return pl;
-    }
-
-    // 创建 layernorm backward pipeline（5 个 storage buffer）
-    [[nodiscard]] static Result<VulkanPipeline> create_layernorm_backward(
-        VkDevice device, std::span<const uint32_t> spirv_code)
-    {
-        VulkanPipeline pl;
-        pl.device_ = device;
-
-        // 创建 shader module
-        VkShaderModuleCreateInfo module_info{};
-        module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        module_info.codeSize = spirv_code.size_bytes();
-        module_info.pCode = spirv_code.data();
-
-        auto r = detail::vk_check(
-            vkCreateShaderModule(device, &module_info, nullptr, &pl.shader_module_),
-            __FILE__, __LINE__);
-        if (!r)
-            return std::unexpected(r.error());
-
-        // 创建 descriptor set layout（5 个 storage buffer）
-        VkDescriptorSetLayoutBinding bindings[5]{};
-        for (int i = 0; i < 5; ++i)
-        {
-            bindings[i].binding = static_cast<uint32_t>(i);
-            bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            bindings[i].descriptorCount = 1;
-            bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        }
-
-        VkDescriptorSetLayoutCreateInfo layout_info{};
-        layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        layout_info.bindingCount = 5;
-        layout_info.pBindings = bindings;
-
-        r = detail::vk_check(
-            vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &pl.descriptor_layout_),
-            __FILE__, __LINE__);
-        if (!r)
-            return std::unexpected(r.error());
-
-        // 创建 pipeline layout（push constants: rows, cols）
-        VkPushConstantRange push_range{};
-        push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        push_range.offset = 0;
-        push_range.size = 2 * sizeof(uint32_t);
-
-        VkPipelineLayoutCreateInfo pl_layout_info{};
-        pl_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pl_layout_info.setLayoutCount = 1;
-        pl_layout_info.pSetLayouts = &pl.descriptor_layout_;
-        pl_layout_info.pushConstantRangeCount = 1;
+        pl_layout_info.pushConstantRangeCount = (push_constant_size > 0) ? 1u : 0u;
         pl_layout_info.pPushConstantRanges = &push_range;
 
         r = detail::vk_check(
@@ -750,9 +598,9 @@ private:
     VulkanDevice device_;
     VulkanPipeline matmul_pipeline_;
     VulkanPipeline matmul_tiled_pipeline_;
-    VulkanPipeline elementwise_pipeline_;
-    VulkanPipeline layernorm_pipeline_;
-    VulkanPipeline layernorm_backward_pipeline_;
+    VulkanPipeline elementwise_v2_pipeline_;
+    VulkanPipeline reduce_pipeline_;
+    VulkanPipeline broadcast_pipeline_;
 
     std::unique_ptr<MemoryPool> memory_pool_;
     std::unique_ptr<StagingRing> staging_ring_;
@@ -797,30 +645,30 @@ private:
 #endif
     }
 
-    [[nodiscard]] static const std::vector<uint32_t>& get_elementwise_spirv()
+    [[nodiscard]] static const std::vector<uint32_t>& get_elementwise_v2_spirv()
     {
-#ifdef NN_ELEMENTWISE_SPV_EMBEDDED
-        return nn_elementwise_spirv_bytecode();
+#ifdef NN_ELEMENTWISE_V2_SPV_EMBEDDED
+        return nn_elementwise_v2_spirv_bytecode();
 #else
         static const std::vector<uint32_t> empty;
         return empty;
 #endif
     }
 
-    [[nodiscard]] static const std::vector<uint32_t>& get_layernorm_spirv()
+    [[nodiscard]] static const std::vector<uint32_t>& get_reduce_spirv()
     {
-#ifdef NN_LAYERNORM_SPV_EMBEDDED
-        return nn_layernorm_spirv_bytecode();
+#ifdef NN_REDUCE_SPV_EMBEDDED
+        return nn_reduce_spirv_bytecode();
 #else
         static const std::vector<uint32_t> empty;
         return empty;
 #endif
     }
 
-    [[nodiscard]] static const std::vector<uint32_t>& get_layernorm_backward_spirv()
+    [[nodiscard]] static const std::vector<uint32_t>& get_broadcast_spirv()
     {
-#ifdef NN_LAYERNORM_BACKWARD_SPV_EMBEDDED
-        return nn_layernorm_backward_spirv_bytecode();
+#ifdef NN_BROADCAST_SPV_EMBEDDED
+        return nn_broadcast_spirv_bytecode();
 #else
         static const std::vector<uint32_t> empty;
         return empty;
@@ -928,9 +776,9 @@ public:
             return r;
 
         // 8. 创建 descriptor pool for GPU-resident path
-        // layernorm 需要 4 个描述符/次，其他操作需要 3 个，按最大值计算
-        constexpr std::size_t TENSOR_POOL_SETS = 1024;
-        constexpr std::size_t TENSOR_POOL_DESCS = TENSOR_POOL_SETS * 4;  // layernorm 需要 4
+        // elementwise_v2 需要 4 个描述符/次，按最大值计算
+        constexpr std::size_t TENSOR_POOL_SETS = 4096;
+        constexpr std::size_t TENSOR_POOL_DESCS = TENSOR_POOL_SETS * 4;  // elementwise_v2 需要 4
 
         VkDescriptorPoolSize tensor_pool_size{};
         tensor_pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -958,31 +806,34 @@ public:
                 matmul_tiled_pipeline_ = std::move(*tp_r);
         }
 
-        // 10. 创建 elementwise pipeline（可选）
-        const auto& elem_spirv = get_elementwise_spirv();
-        if (!elem_spirv.empty())
+        // 10. 创建 elementwise_v2 pipeline（4 bindings, 32B push constants）
+        const auto& elem_v2_spirv = get_elementwise_v2_spirv();
+        if (!elem_v2_spirv.empty())
         {
-            auto ep_r = VulkanPipeline::create_elementwise(device_.device(), elem_spirv);
+            auto ep_r = VulkanPipeline::create_generic(
+                device_.device(), elem_v2_spirv, 4, 8 * sizeof(uint32_t));
             if (ep_r)
-                elementwise_pipeline_ = std::move(*ep_r);
+                elementwise_v2_pipeline_ = std::move(*ep_r);
         }
 
-        // 11. 创建 layernorm pipeline（可选）
-        const auto& ln_spirv = get_layernorm_spirv();
-        if (!ln_spirv.empty())
+        // 11. 创建 reduce pipeline（2 bindings, 16B push constants）
+        const auto& reduce_spirv = get_reduce_spirv();
+        if (!reduce_spirv.empty())
         {
-            auto lp_r = VulkanPipeline::create_layernorm(device_.device(), ln_spirv);
-            if (lp_r)
-                layernorm_pipeline_ = std::move(*lp_r);
+            auto rp_r = VulkanPipeline::create_generic(
+                device_.device(), reduce_spirv, 2, 4 * sizeof(uint32_t));
+            if (rp_r)
+                reduce_pipeline_ = std::move(*rp_r);
         }
 
-        // 12. 创建 layernorm backward pipeline（可选）
-        const auto& lnb_spirv = get_layernorm_backward_spirv();
-        if (!lnb_spirv.empty())
+        // 12. 创建 broadcast pipeline（3 bindings, 16B push constants）
+        const auto& broadcast_spirv = get_broadcast_spirv();
+        if (!broadcast_spirv.empty())
         {
-            auto lnb_r = VulkanPipeline::create_layernorm_backward(device_.device(), lnb_spirv);
-            if (lnb_r)
-                layernorm_backward_pipeline_ = std::move(*lnb_r);
+            auto bp_r = VulkanPipeline::create_generic(
+                device_.device(), broadcast_spirv, 3, 4 * sizeof(uint32_t));
+            if (bp_r)
+                broadcast_pipeline_ = std::move(*bp_r);
         }
 
         initialized_ = true;
@@ -992,9 +843,9 @@ public:
     [[nodiscard]] bool is_initialized() const noexcept { return initialized_; }
     [[nodiscard]] bool gpu_available() const noexcept { return initialized_; }
     [[nodiscard]] bool has_tiled_pipeline() const noexcept { return matmul_tiled_pipeline_.handle() != VK_NULL_HANDLE; }
-    [[nodiscard]] bool has_elementwise_pipeline() const noexcept { return elementwise_pipeline_.handle() != VK_NULL_HANDLE; }
-    [[nodiscard]] bool has_layernorm_pipeline() const noexcept { return layernorm_pipeline_.handle() != VK_NULL_HANDLE; }
-    [[nodiscard]] bool has_layernorm_backward_pipeline() const noexcept { return layernorm_backward_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_elementwise_v2_pipeline() const noexcept { return elementwise_v2_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_reduce_pipeline() const noexcept { return reduce_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_broadcast_pipeline() const noexcept { return broadcast_pipeline_.handle() != VK_NULL_HANDLE; }
 
     [[nodiscard]] VulkanDevice& device() noexcept { return device_; }
     [[nodiscard]] MemoryPool& memory_pool() noexcept { return *memory_pool_; }
@@ -1489,244 +1340,207 @@ public:
         return C;
     }
 
-    // ── 纯 GPU 逐元素运算（阻塞等待完成）──────────────────────────────
-    // op: 0=ReLU, 1=QuickGeLU, 2=BiasAdd
-    [[nodiscard]] Result<GpuTensor> elementwise_gpu(
-        const GpuTensor& primary, const GpuTensor* secondary, uint32_t op,
-        uint32_t rows = 0, uint32_t cols = 0)
+    // ══════════════════════════════════════════════════════════════════
+    // 纯 GPU 原语方法（纯 GPU 架构核心）
+    //
+    // 所有方法遵循同一模式：
+    //   1. 分配输出 Tensor（如有输出）
+    //   2. 分配描述符集，写入 binding
+    //   3. 获取 command buffer（batch 共享 / 独立分配）
+    //   4. 录制：输入屏障 → bind pipeline → push constants → dispatch → 输出屏障
+    //   5. 独立模式：end → submit → wait → cleanup
+    // ══════════════════════════════════════════════════════════════════
+
+    // ── 辅助：分配描述符集 ──────────────────────────────────────────────
+    [[nodiscard]] Result<VkDescriptorSet> alloc_desc_set(VkDescriptorSetLayout layout)
+    {
+        VkDescriptorSet desc_set = VK_NULL_HANDLE;
+        VkDescriptorSetAllocateInfo desc_alloc{};
+        desc_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        desc_alloc.descriptorPool = gpu_tensor_pool_;
+        desc_alloc.descriptorSetCount = 1;
+        desc_alloc.pSetLayouts = &layout;
+
+        auto r = detail::vk_check(
+            vkAllocateDescriptorSets(device_.device(), &desc_alloc, &desc_set),
+            __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
+        if (batch_mode_) batch_desc_sets_.push_back(desc_set);
+        return desc_set;
+    }
+
+    // ── 辅助：获取 command buffer（batch 或独立）──────────────────────
+    // 返回 (cmd, owns_cmd)。owns_cmd=true 时调用方需 submit_and_wait。
+    [[nodiscard]] Result<std::pair<VkCommandBuffer, bool>> acquire_cmd()
+    {
+        if (batch_mode_)
+            return std::make_pair(batch_cmd_, false);
+
+        VkCommandBufferAllocateInfo cmd_alloc{};
+        cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cmd_alloc.commandPool = command_pool_;
+        cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cmd_alloc.commandBufferCount = 1;
+
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        auto r = detail::vk_check(
+            vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &cmd),
+            __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
+
+        VkCommandBufferBeginInfo begin_info{};
+        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        r = detail::vk_check(vkBeginCommandBuffer(cmd, &begin_info), __FILE__, __LINE__);
+        if (!r)
+        {
+            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
+            return std::unexpected(r.error());
+        }
+        return std::make_pair(cmd, true);
+    }
+
+    // ── 辅助：独立模式提交+等待+清理 ──────────────────────────────────
+    // owns_cmd=true 时调用：end → submit → wait → free cmd + desc_set
+    // desc_set 可为 VK_NULL_HANDLE（fill_zero/copy_buffer 无描述符集）
+    [[nodiscard]] Result<void> submit_and_wait(
+        VkCommandBuffer cmd, VkDescriptorSet desc_set)
+    {
+        auto r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
+        if (!r)
+        {
+            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
+            if (desc_set != VK_NULL_HANDLE)
+                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            return std::unexpected(r.error());
+        }
+
+        VkFenceCreateInfo fence_info{};
+        fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        VkFence fence = VK_NULL_HANDLE;
+        r = detail::vk_check(
+            vkCreateFence(device_.device(), &fence_info, nullptr, &fence),
+            __FILE__, __LINE__);
+        if (!r)
+        {
+            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
+            if (desc_set != VK_NULL_HANDLE)
+                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            return std::unexpected(r.error());
+        }
+
+        {
+            std::lock_guard lock(queue_mutex_);
+            VkSubmitInfo submit_info{};
+            submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submit_info.commandBufferCount = 1;
+            submit_info.pCommandBuffers = &cmd;
+            r = detail::vk_check(
+                vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
+                __FILE__, __LINE__);
+            if (!r)
+            {
+                vkDestroyFence(device_.device(), fence, nullptr);
+                vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
+                if (desc_set != VK_NULL_HANDLE)
+                    vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+                return std::unexpected(r.error());
+            }
+        }
+
+        r = detail::vk_check(
+            vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, UINT64_MAX),
+            __FILE__, __LINE__);
+
+        vkDestroyFence(device_.device(), fence, nullptr);
+        vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
+        if (desc_set != VK_NULL_HANDLE)
+            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+        return r;
+    }
+
+    // ── 辅助：录制输入屏障（多个输入 buffer）──────────────────────────
+    void record_input_barriers(VkCommandBuffer cmd,
+                                std::initializer_list<VkBuffer> buffers)
+    {
+        std::vector<VkBufferMemoryBarrier> barriers;
+        barriers.reserve(buffers.size());
+        for (auto buf : buffers)
+        {
+            VkBufferMemoryBarrier b{};
+            b.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.buffer = buf;
+            b.offset = 0;
+            b.size = VK_WHOLE_SIZE;
+            barriers.push_back(b);
+        }
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr,
+            static_cast<uint32_t>(barriers.size()), barriers.data(),
+            0, nullptr);
+    }
+
+    // ── 辅助：录制输出屏障 ─────────────────────────────────────────────
+    void record_output_barrier(VkCommandBuffer cmd, VkBuffer output_buf)
+    {
+        VkBufferMemoryBarrier b{};
+        b.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.buffer = output_buf;
+        b.offset = 0;
+        b.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 1, &b, 0, nullptr);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // elementwise_v2_gpu — 逐元素原语（unary/binary/select）
+    //
+    // Push Constants (32 bytes):
+    //   count, mode, op, cmp_op, flags, scalar_b, scalar_then, scalar_else
+    // Bindings: A(0), B(1), C(2), OUT(3)
+    //
+    // 对未使用的 binding（如 unary 模式的 B/C），绑定 A 的 buffer（无害占位）。
+    // ══════════════════════════════════════════════════════════════════
+    [[nodiscard]] Result<GpuTensor> elementwise_v2_gpu(
+        const GpuTensor& A, const GpuTensor* B, const GpuTensor* C,
+        uint32_t count, uint32_t mode, uint32_t op, uint32_t cmp_op,
+        uint32_t flags, float scalar_b, float scalar_then, float scalar_else)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
-        if (!has_elementwise_pipeline())
-            return std::unexpected(Error{"Elementwise pipeline not available"});
-
-        const auto elem_count = static_cast<uint32_t>(primary.rows() * primary.cols());
+        if (!has_elementwise_v2_pipeline())
+            return std::unexpected(Error{"elementwise_v2 pipeline not available"});
 
         // 1. 分配输出 Tensor
-        auto output_res = GpuTensor::create_empty(primary.rows(), primary.cols(), *this);
-        if (!output_res)
-            return std::unexpected(output_res.error());
+        auto output_res = GpuTensor::create_empty(A.rows(), A.cols(), *this);
+        if (!output_res) return std::unexpected(output_res.error());
         GpuTensor output = std::move(*output_res);
 
         // 2. 分配描述符集
-        VkDescriptorSet desc_set = VK_NULL_HANDLE;
-        VkDescriptorSetAllocateInfo desc_alloc{};
-        desc_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        desc_alloc.descriptorPool = gpu_tensor_pool_;
-        desc_alloc.descriptorSetCount = 1;
-        auto dl = elementwise_pipeline_.descriptor_layout();
-        desc_alloc.pSetLayouts = &dl;
+        auto ds_r = alloc_desc_set(elementwise_v2_pipeline_.descriptor_layout());
+        if (!ds_r) return std::unexpected(ds_r.error());
+        VkDescriptorSet desc_set = *ds_r;
 
-        auto r = detail::vk_check(
-            vkAllocateDescriptorSets(device_.device(), &desc_alloc, &desc_set),
-            __FILE__, __LINE__);
-        if (!r)
-            return std::unexpected(r.error());
-        if (batch_mode_) batch_desc_sets_.push_back(desc_set);
-
-        // 3. 写入描述符集
-        VkDescriptorBufferInfo buf_infos[3]{
-            {primary.buffer().impl(), 0, VK_WHOLE_SIZE},
-            {secondary ? secondary->buffer().impl() : primary.buffer().impl(), 0, VK_WHOLE_SIZE},
-            {output.buffer().impl(), 0, VK_WHOLE_SIZE},
-        };
-
-        VkWriteDescriptorSet writes[3]{};
-        for (int i = 0; i < 3; ++i)
-        {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = desc_set;
-            writes[i].dstBinding = static_cast<uint32_t>(i);
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &buf_infos[i];
-        }
-        vkUpdateDescriptorSets(device_.device(), 3, writes, 0, nullptr);
-
-        // 4. 获取 command buffer（batch 或独立）
-        VkCommandBuffer cmd = VK_NULL_HANDLE;
-        bool owns_cmd = false;
-
-        if (batch_mode_)
-        {
-            cmd = batch_cmd_;
-        }
-        else
-        {
-            VkCommandBufferAllocateInfo cmd_alloc{};
-            cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-            cmd_alloc.commandPool = command_pool_;
-            cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cmd_alloc.commandBufferCount = 1;
-
-            r = detail::vk_check(
-                vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &cmd),
-                __FILE__, __LINE__);
-            if (!r)
-            {
-                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-                return std::unexpected(r.error());
-            }
-            owns_cmd = true;
-
-            VkCommandBufferBeginInfo begin_info{};
-            begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            r = detail::vk_check(vkBeginCommandBuffer(cmd, &begin_info), __FILE__, __LINE__);
-            if (!r)
-            {
-                vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
-                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-                return std::unexpected(r.error());
-            }
-        }
-
-        // 5. 录制命令
-        // 管线屏障
-        VkBufferMemoryBarrier input_barrier{};
-        input_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        input_barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-        input_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        input_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        input_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        input_barrier.buffer = primary.buffer().impl();
-        input_barrier.offset = 0;
-        input_barrier.size = VK_WHOLE_SIZE;
-
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 0, nullptr, 1, &input_barrier, 0, nullptr);
-
-        // 绑定 pipeline 和描述符集
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, elementwise_pipeline_.handle());
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            elementwise_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
-
-        // 推送常量
-        const uint32_t push_data[4] = {elem_count, op, rows, cols};
-        vkCmdPushConstants(cmd, elementwise_pipeline_.pipeline_layout(),
-            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
-
-        // Dispatch
-        const uint32_t wg_count = (elem_count + 255) / 256;
-        vkCmdDispatch(cmd, wg_count, 1, 1);
-
-        // 输出屏障
-        VkBufferMemoryBarrier output_barrier{};
-        output_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        output_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        output_barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-        output_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        output_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        output_barrier.buffer = output.buffer().impl();
-        output_barrier.offset = 0;
-        output_barrier.size = VK_WHOLE_SIZE;
-
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-            0, 0, nullptr, 1, &output_barrier, 0, nullptr);
-
-        // 6. 独立模式：结束 → 提交 → 等待 → 清理
-        if (owns_cmd)
-        {
-            r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
-            if (!r)
-            {
-                vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
-                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-                return std::unexpected(r.error());
-            }
-
-            VkFenceCreateInfo fence_info{};
-            fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-            VkFence fence = VK_NULL_HANDLE;
-            r = detail::vk_check(
-                vkCreateFence(device_.device(), &fence_info, nullptr, &fence),
-                __FILE__, __LINE__);
-            if (!r)
-            {
-                vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
-                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-                return std::unexpected(r.error());
-            }
-
-            {
-                std::lock_guard lock(queue_mutex_);
-                VkSubmitInfo submit_info{};
-                submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-                submit_info.commandBufferCount = 1;
-                submit_info.pCommandBuffers = &cmd;
-
-                r = detail::vk_check(
-                    vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
-                    __FILE__, __LINE__);
-                if (!r)
-                {
-                    vkDestroyFence(device_.device(), fence, nullptr);
-                    vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
-                    vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-                    return std::unexpected(r.error());
-                }
-            }
-
-            r = detail::vk_check(
-                vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, UINT64_MAX),
-                __FILE__, __LINE__);
-
-            vkDestroyFence(device_.device(), fence, nullptr);
-            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
-            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-
-            if (!r)
-                return std::unexpected(r.error());
-        }
-
-        return output;
-    }
-
-    // ── 纯 GPU LayerNorm（阻塞等待完成）──────────────────────────────
-    // output[f][b] = gamma[f] * (input[f][b] - mean[b]) / sqrt(var[b] + eps) + beta[f]
-    [[nodiscard]] Result<GpuTensor> layernorm_gpu(
-        const GpuTensor& input, const GpuTensor& gamma, const GpuTensor& beta,
-        uint32_t rows, uint32_t cols, float epsilon)
-    {
-        if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
-        if (!has_layernorm_pipeline())
-            return std::unexpected(Error{"LayerNorm pipeline not available"});
-
-        // 1. 分配输出 Tensor
-        auto output_res = GpuTensor::create_empty(rows, cols, *this);
-        if (!output_res)
-            return std::unexpected(output_res.error());
-        GpuTensor output = std::move(*output_res);
-
-        // 2. 分配描述符集（4 个 storage buffer）
-        VkDescriptorSet desc_set = VK_NULL_HANDLE;
-        VkDescriptorSetAllocateInfo desc_alloc{};
-        desc_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        desc_alloc.descriptorPool = gpu_tensor_pool_;
-        desc_alloc.descriptorSetCount = 1;
-        auto dl = layernorm_pipeline_.descriptor_layout();
-        desc_alloc.pSetLayouts = &dl;
-
-        auto r = detail::vk_check(
-            vkAllocateDescriptorSets(device_.device(), &desc_alloc, &desc_set),
-            __FILE__, __LINE__);
-        if (!r)
-            return std::unexpected(r.error());
-        if (batch_mode_) batch_desc_sets_.push_back(desc_set);
-
-        // 3. 写入描述符集
+        // 3. 写入描述符集（未使用的 binding 绑定 A 作为占位）
+        VkBuffer a_buf = A.buffer().impl();
         VkDescriptorBufferInfo buf_infos[4]{
-            {input.buffer().impl(), 0, VK_WHOLE_SIZE},
-            {gamma.buffer().impl(), 0, VK_WHOLE_SIZE},
-            {beta.buffer().impl(), 0, VK_WHOLE_SIZE},
+            {a_buf, 0, VK_WHOLE_SIZE},
+            {B ? B->buffer().impl() : a_buf, 0, VK_WHOLE_SIZE},
+            {C ? C->buffer().impl() : a_buf, 0, VK_WHOLE_SIZE},
             {output.buffer().impl(), 0, VK_WHOLE_SIZE},
         };
-
         VkWriteDescriptorSet writes[4]{};
         for (int i = 0; i < 4; ++i)
         {
@@ -1739,195 +1553,81 @@ public:
         }
         vkUpdateDescriptorSets(device_.device(), 4, writes, 0, nullptr);
 
-        // 4. 获取 command buffer（batch 或独立）
-        VkCommandBuffer cmd = VK_NULL_HANDLE;
-        bool owns_cmd = false;
-
-        if (batch_mode_)
+        // 4. 获取 command buffer
+        auto cmd_r = acquire_cmd();
+        if (!cmd_r)
         {
-            cmd = batch_cmd_;
+            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            return std::unexpected(cmd_r.error());
         }
-        else
-        {
-            VkCommandBufferAllocateInfo cmd_alloc{};
-            cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-            cmd_alloc.commandPool = command_pool_;
-            cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cmd_alloc.commandBufferCount = 1;
+        auto [cmd, owns_cmd] = *cmd_r;
 
-            r = detail::vk_check(
-                vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &cmd),
-                __FILE__, __LINE__);
-            if (!r)
-            {
-                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-                return std::unexpected(r.error());
-            }
-            owns_cmd = true;
-
-            VkCommandBufferBeginInfo begin_info{};
-            begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            r = detail::vk_check(vkBeginCommandBuffer(cmd, &begin_info), __FILE__, __LINE__);
-            if (!r)
-            {
-                vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
-                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-                return std::unexpected(r.error());
-            }
-        }
-
-        // 5. 录制命令
-        VkBufferMemoryBarrier input_barriers[3]{};
-        for (int i = 0; i < 3; ++i)
-        {
-            input_barriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-            input_barriers[i].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-            input_barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            input_barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            input_barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            input_barriers[i].offset = 0;
-            input_barriers[i].size = VK_WHOLE_SIZE;
-        }
-        input_barriers[0].buffer = input.buffer().impl();
-        input_barriers[1].buffer = gamma.buffer().impl();
-        input_barriers[2].buffer = beta.buffer().impl();
-
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 0, nullptr, 3, input_barriers, 0, nullptr);
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layernorm_pipeline_.handle());
+        // 5. 录制
+        record_input_barriers(cmd, {a_buf});
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            elementwise_v2_pipeline_.handle());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            layernorm_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+            elementwise_v2_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
 
-        uint32_t eps_bits = 0;
-        std::memcpy(&eps_bits, &epsilon, sizeof(float));
-        const uint32_t push_data[3] = {rows, cols, eps_bits};
-        vkCmdPushConstants(cmd, layernorm_pipeline_.pipeline_layout(),
-            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
+        // Push constants: count, mode, op, cmp_op, flags (5×uint32) + scalar_b, scalar_then, scalar_else (3×float)
+        struct PushData {
+            uint32_t count, mode, op, cmp_op, flags;
+            float scalar_b, scalar_then, scalar_else;
+        } push{count, mode, op, cmp_op, flags, scalar_b, scalar_then, scalar_else};
+        vkCmdPushConstants(cmd, elementwise_v2_pipeline_.pipeline_layout(),
+            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
 
-        vkCmdDispatch(cmd, cols, 1, 1);
+        const uint32_t wg_count = (count + 255) / 256;
+        vkCmdDispatch(cmd, wg_count, 1, 1);
+        record_output_barrier(cmd, output.buffer().impl());
 
-        VkBufferMemoryBarrier output_barrier{};
-        output_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        output_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        output_barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-        output_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        output_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        output_barrier.buffer = output.buffer().impl();
-        output_barrier.offset = 0;
-        output_barrier.size = VK_WHOLE_SIZE;
-
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-            0, 0, nullptr, 1, &output_barrier, 0, nullptr);
-
-        // 6. 独立模式：结束 → 提交 → 等待 → 清理
+        // 6. 独立模式提交
         if (owns_cmd)
         {
-            r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
-            if (!r)
-            {
-                vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
-                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-                return std::unexpected(r.error());
-            }
-
-            VkFenceCreateInfo fence_info{};
-            fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-            VkFence fence = VK_NULL_HANDLE;
-            r = detail::vk_check(
-                vkCreateFence(device_.device(), &fence_info, nullptr, &fence),
-                __FILE__, __LINE__);
-            if (!r)
-            {
-                vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
-                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-                return std::unexpected(r.error());
-            }
-
-            {
-                std::lock_guard lock(queue_mutex_);
-                VkSubmitInfo submit_info{};
-                submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-                submit_info.commandBufferCount = 1;
-                submit_info.pCommandBuffers = &cmd;
-
-                r = detail::vk_check(
-                    vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
-                    __FILE__, __LINE__);
-                if (!r)
-                {
-                    vkDestroyFence(device_.device(), fence, nullptr);
-                    vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
-                    vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-                    return std::unexpected(r.error());
-                }
-            }
-
-            r = detail::vk_check(
-                vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, UINT64_MAX),
-                __FILE__, __LINE__);
-
-            vkDestroyFence(device_.device(), fence, nullptr);
-            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
-            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-
-            if (!r)
-                return std::unexpected(r.error());
+            auto r = submit_and_wait(cmd, desc_set);
+            if (!r) return std::unexpected(r.error());
         }
-
         return output;
     }
 
-    // ── 纯 GPU LayerNorm Backward（阻塞等待完成）──────────────────────
-    // grad_input[f][b] = (grad_out[f][b]*gamma[f] - mean_g[b] - normalized[f][b]*mean_gn[b]) * std_inv[b]
-    [[nodiscard]] Result<GpuTensor> layernorm_backward_gpu(
-        const GpuTensor& grad_output, const GpuTensor& gamma,
-        const GpuTensor& normalized, const GpuTensor& std_inv,
-        uint32_t rows, uint32_t cols)
+    // ══════════════════════════════════════════════════════════════════
+    // reduce_gpu — 行/列归约原语（sum/max）
+    //
+    // Push Constants (16 bytes): rows, cols, mode, reduce_op
+    // Bindings: In(0), Out(1)
+    // mode: 0=row_reduce → out(rows,1), 1=col_reduce → out(1,cols)
+    // reduce_op: 0=sum, 1=max
+    // ══════════════════════════════════════════════════════════════════
+    [[nodiscard]] Result<GpuTensor> reduce_gpu(
+        const GpuTensor& input, uint32_t mode, uint32_t reduce_op)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
-        if (!has_layernorm_backward_pipeline())
-            return std::unexpected(Error{"LayerNorm backward pipeline not available"});
+        if (!has_reduce_pipeline())
+            return std::unexpected(Error{"reduce pipeline not available"});
+
+        const uint32_t rows = static_cast<uint32_t>(input.rows());
+        const uint32_t cols = static_cast<uint32_t>(input.cols());
 
         // 1. 分配输出 Tensor
-        auto output_res = GpuTensor::create_empty(rows, cols, *this);
-        if (!output_res)
-            return std::unexpected(output_res.error());
+        std::size_t out_rows = (mode == 0) ? rows : 1;
+        std::size_t out_cols = (mode == 0) ? 1 : cols;
+        auto output_res = GpuTensor::create_empty(out_rows, out_cols, *this);
+        if (!output_res) return std::unexpected(output_res.error());
         GpuTensor output = std::move(*output_res);
 
-        // 2. 分配描述符集（5 个 storage buffer）
-        VkDescriptorSet desc_set = VK_NULL_HANDLE;
-        VkDescriptorSetAllocateInfo desc_alloc{};
-        desc_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        desc_alloc.descriptorPool = gpu_tensor_pool_;
-        desc_alloc.descriptorSetCount = 1;
-        auto dl = layernorm_backward_pipeline_.descriptor_layout();
-        desc_alloc.pSetLayouts = &dl;
-
-        auto r = detail::vk_check(
-            vkAllocateDescriptorSets(device_.device(), &desc_alloc, &desc_set),
-            __FILE__, __LINE__);
-        if (!r)
-            return std::unexpected(r.error());
-        if (batch_mode_) batch_desc_sets_.push_back(desc_set);
+        // 2. 分配描述符集
+        auto ds_r = alloc_desc_set(reduce_pipeline_.descriptor_layout());
+        if (!ds_r) return std::unexpected(ds_r.error());
+        VkDescriptorSet desc_set = *ds_r;
 
         // 3. 写入描述符集
-        VkDescriptorBufferInfo buf_infos[5]{
-            {grad_output.buffer().impl(), 0, VK_WHOLE_SIZE},
-            {gamma.buffer().impl(), 0, VK_WHOLE_SIZE},
-            {normalized.buffer().impl(), 0, VK_WHOLE_SIZE},
-            {std_inv.buffer().impl(), 0, VK_WHOLE_SIZE},
+        VkDescriptorBufferInfo buf_infos[2]{
+            {input.buffer().impl(), 0, VK_WHOLE_SIZE},
             {output.buffer().impl(), 0, VK_WHOLE_SIZE},
         };
-
-        VkWriteDescriptorSet writes[5]{};
-        for (int i = 0; i < 5; ++i)
+        VkWriteDescriptorSet writes[2]{};
+        for (int i = 0; i < 2; ++i)
         {
             writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[i].dstSet = desc_set;
@@ -1936,149 +1636,221 @@ public:
             writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             writes[i].pBufferInfo = &buf_infos[i];
         }
-        vkUpdateDescriptorSets(device_.device(), 5, writes, 0, nullptr);
+        vkUpdateDescriptorSets(device_.device(), 2, writes, 0, nullptr);
 
-        // 4. 获取 command buffer（batch 或独立）
-        VkCommandBuffer cmd = VK_NULL_HANDLE;
-        bool owns_cmd = false;
-
-        if (batch_mode_)
+        // 4. 获取 command buffer
+        auto cmd_r = acquire_cmd();
+        if (!cmd_r)
         {
-            cmd = batch_cmd_;
+            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            return std::unexpected(cmd_r.error());
         }
-        else
-        {
-            VkCommandBufferAllocateInfo cmd_alloc{};
-            cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-            cmd_alloc.commandPool = command_pool_;
-            cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cmd_alloc.commandBufferCount = 1;
+        auto [cmd, owns_cmd] = *cmd_r;
 
-            r = detail::vk_check(
-                vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &cmd),
-                __FILE__, __LINE__);
-            if (!r)
-            {
-                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-                return std::unexpected(r.error());
-            }
-            owns_cmd = true;
-
-            VkCommandBufferBeginInfo begin_info{};
-            begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            r = detail::vk_check(vkBeginCommandBuffer(cmd, &begin_info), __FILE__, __LINE__);
-            if (!r)
-            {
-                vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
-                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-                return std::unexpected(r.error());
-            }
-        }
-
-        // 5. 录制命令
-        VkBufferMemoryBarrier input_barriers[4]{};
-        for (int i = 0; i < 4; ++i)
-        {
-            input_barriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-            input_barriers[i].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-            input_barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            input_barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            input_barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            input_barriers[i].offset = 0;
-            input_barriers[i].size = VK_WHOLE_SIZE;
-        }
-        input_barriers[0].buffer = grad_output.buffer().impl();
-        input_barriers[1].buffer = gamma.buffer().impl();
-        input_barriers[2].buffer = normalized.buffer().impl();
-        input_barriers[3].buffer = std_inv.buffer().impl();
-
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 0, nullptr, 4, input_barriers, 0, nullptr);
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layernorm_backward_pipeline_.handle());
+        // 5. 录制
+        record_input_barriers(cmd, {input.buffer().impl()});
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            reduce_pipeline_.handle());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            layernorm_backward_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+            reduce_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
 
-        const uint32_t push_data[2] = {rows, cols};
-        vkCmdPushConstants(cmd, layernorm_backward_pipeline_.pipeline_layout(),
+        const uint32_t push_data[4] = {rows, cols, mode, reduce_op};
+        vkCmdPushConstants(cmd, reduce_pipeline_.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
 
-        vkCmdDispatch(cmd, cols, 1, 1);
+        // 每线程处理一行/一列，dispatch 足够线程
+        const uint32_t max_dim = (mode == 0) ? rows : cols;
+        const uint32_t wg_count = (max_dim + 255) / 256;
+        vkCmdDispatch(cmd, wg_count, 1, 1);
+        record_output_barrier(cmd, output.buffer().impl());
 
-        VkBufferMemoryBarrier output_barrier{};
-        output_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        output_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        output_barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-        output_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        output_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        output_barrier.buffer = output.buffer().impl();
-        output_barrier.offset = 0;
-        output_barrier.size = VK_WHOLE_SIZE;
-
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-            0, 0, nullptr, 1, &output_barrier, 0, nullptr);
-
-        // 6. 独立模式：结束 → 提交 → 等待 → 清理
+        // 6. 独立模式提交
         if (owns_cmd)
         {
-            r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
-            if (!r)
-            {
-                vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
-                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-                return std::unexpected(r.error());
-            }
-
-            VkFenceCreateInfo fence_info{};
-            fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-            VkFence fence = VK_NULL_HANDLE;
-            r = detail::vk_check(
-                vkCreateFence(device_.device(), &fence_info, nullptr, &fence),
-                __FILE__, __LINE__);
-            if (!r)
-            {
-                vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
-                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-                return std::unexpected(r.error());
-            }
-
-            {
-                std::lock_guard lock(queue_mutex_);
-                VkSubmitInfo submit_info{};
-                submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-                submit_info.commandBufferCount = 1;
-                submit_info.pCommandBuffers = &cmd;
-
-                r = detail::vk_check(
-                    vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
-                    __FILE__, __LINE__);
-                if (!r)
-                {
-                    vkDestroyFence(device_.device(), fence, nullptr);
-                    vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
-                    vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-                    return std::unexpected(r.error());
-                }
-            }
-
-            r = detail::vk_check(
-                vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, UINT64_MAX),
-                __FILE__, __LINE__);
-
-            vkDestroyFence(device_.device(), fence, nullptr);
-            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
-            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-
-            if (!r)
-                return std::unexpected(r.error());
+            auto r = submit_and_wait(cmd, desc_set);
+            if (!r) return std::unexpected(r.error());
         }
-
         return output;
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // broadcast_gpu — 行/列广播原语
+    //
+    // Push Constants (16 bytes): rows, cols, mode, op
+    // Bindings: A(0), Vec(1), Out(2)
+    // mode: 0=row_broadcast (vec indexed by row), 1=col_broadcast (vec indexed by col)
+    // op: 0=Add, 1=Sub, 2=Mul, 3=Div, 4=Max, 5=Min
+    // ══════════════════════════════════════════════════════════════════
+    [[nodiscard]] Result<GpuTensor> broadcast_gpu(
+        const GpuTensor& A, const GpuTensor& vec,
+        uint32_t mode, uint32_t op)
+    {
+        if (!initialized_)
+            return std::unexpected(Error{"GPU backend not initialized"});
+        if (!has_broadcast_pipeline())
+            return std::unexpected(Error{"broadcast pipeline not available"});
+
+        const uint32_t rows = static_cast<uint32_t>(A.rows());
+        const uint32_t cols = static_cast<uint32_t>(A.cols());
+
+        // 1. 分配输出 Tensor
+        auto output_res = GpuTensor::create_empty(A.rows(), A.cols(), *this);
+        if (!output_res) return std::unexpected(output_res.error());
+        GpuTensor output = std::move(*output_res);
+
+        // 2. 分配描述符集
+        auto ds_r = alloc_desc_set(broadcast_pipeline_.descriptor_layout());
+        if (!ds_r) return std::unexpected(ds_r.error());
+        VkDescriptorSet desc_set = *ds_r;
+
+        // 3. 写入描述符集
+        VkDescriptorBufferInfo buf_infos[3]{
+            {A.buffer().impl(), 0, VK_WHOLE_SIZE},
+            {vec.buffer().impl(), 0, VK_WHOLE_SIZE},
+            {output.buffer().impl(), 0, VK_WHOLE_SIZE},
+        };
+        VkWriteDescriptorSet writes[3]{};
+        for (int i = 0; i < 3; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = desc_set;
+            writes[i].dstBinding = static_cast<uint32_t>(i);
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &buf_infos[i];
+        }
+        vkUpdateDescriptorSets(device_.device(), 3, writes, 0, nullptr);
+
+        // 4. 获取 command buffer
+        auto cmd_r = acquire_cmd();
+        if (!cmd_r)
+        {
+            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            return std::unexpected(cmd_r.error());
+        }
+        auto [cmd, owns_cmd] = *cmd_r;
+
+        // 5. 录制
+        record_input_barriers(cmd, {A.buffer().impl(), vec.buffer().impl()});
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            broadcast_pipeline_.handle());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            broadcast_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+
+        const uint32_t push_data[4] = {rows, cols, mode, op};
+        vkCmdPushConstants(cmd, broadcast_pipeline_.pipeline_layout(),
+            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
+
+        const uint32_t total = rows * cols;
+        const uint32_t wg_count = (total + 255) / 256;
+        vkCmdDispatch(cmd, wg_count, 1, 1);
+        record_output_barrier(cmd, output.buffer().impl());
+
+        // 6. 独立模式提交
+        if (owns_cmd)
+        {
+            auto r = submit_and_wait(cmd, desc_set);
+            if (!r) return std::unexpected(r.error());
+        }
+        return output;
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // fill_zero_gpu — 清零 GPU buffer（使用 vkCmdFillBuffer）
+    // ══════════════════════════════════════════════════════════════════
+    [[nodiscard]] Result<void> fill_zero_gpu(GpuTensor& tensor)
+    {
+        if (!initialized_)
+            return std::unexpected(Error{"GPU backend not initialized"});
+
+        auto cmd_r = acquire_cmd();
+        if (!cmd_r) return std::unexpected(cmd_r.error());
+        auto [cmd, owns_cmd] = *cmd_r;
+
+        vkCmdFillBuffer(cmd, tensor.buffer().impl(), 0, VK_WHOLE_SIZE, 0);
+
+        // 屏障确保 fill 完成后可见
+        VkBufferMemoryBarrier b{};
+        b.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.buffer = tensor.buffer().impl();
+        b.offset = 0;
+        b.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 1, &b, 0, nullptr);
+
+        if (owns_cmd)
+        {
+            // fill_zero 不使用描述符集，传 VK_NULL_HANDLE 跳过释放
+            auto r = submit_and_wait(cmd, VK_NULL_HANDLE);
+            if (!r) return std::unexpected(r.error());
+        }
+        return {};
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // copy_buffer_gpu — GPU 内 buffer 拷贝（使用 vkCmdCopyBuffer）
+    // ══════════════════════════════════════════════════════════════════
+    [[nodiscard]] Result<void> copy_buffer_gpu(
+        VkBuffer src, VkBuffer dst, VkDeviceSize size)
+    {
+        if (!initialized_)
+            return std::unexpected(Error{"GPU backend not initialized"});
+
+        auto cmd_r = acquire_cmd();
+        if (!cmd_r) return std::unexpected(cmd_r.error());
+        auto [cmd, owns_cmd] = *cmd_r;
+
+        VkBufferCopy cp{0, 0, size};
+        vkCmdCopyBuffer(cmd, src, dst, 1, &cp);
+
+        VkBufferMemoryBarrier b{};
+        b.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.buffer = dst;
+        b.offset = 0;
+        b.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 1, &b, 0, nullptr);
+
+        if (owns_cmd)
+        {
+            auto r = submit_and_wait(cmd, VK_NULL_HANDLE);
+            if (!r) return std::unexpected(r.error());
+        }
+        return {};
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // clone_gpu — GPU 内深拷贝（分配新 buffer + copy，无 PCIe 传输）
+    // ══════════════════════════════════════════════════════════════════
+    [[nodiscard]] Result<GpuTensor> clone_gpu(const GpuTensor& src)
+    {
+        if (!initialized_)
+            return std::unexpected(Error{"GPU backend not initialized"});
+
+        // 1. 分配同形状的新 buffer
+        auto dst_res = GpuTensor::create_empty(src.rows(), src.cols(), *this);
+        if (!dst_res) return std::unexpected(dst_res.error());
+        GpuTensor dst = std::move(*dst_res);
+
+        // 2. GPU 内拷贝
+        const VkDeviceSize size = static_cast<VkDeviceSize>(
+            src.rows() * src.cols() * sizeof(float));
+        auto r = copy_buffer_gpu(src.buffer().impl(), dst.buffer().impl(), size);
+        if (!r) return std::unexpected(r.error());
+
+        return dst;
     }
 
     // ── Staging Path：CPU span → GPU → 计算 → GPU → CPU span ─────────

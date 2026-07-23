@@ -111,9 +111,22 @@ namespace nn
                     }
                 }
                 if (task)
+                {
                     task();
+                }
                 else
+                {
+                    // 队列为空：在原子 latch 上自旋等待，避免反复加锁
+                    for (int spin = 0; spin < 64; ++spin)
+                    {
+                        if (latch.load(std::memory_order_acquire) == 0)
+                            return;
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+                        __builtin_ia32_pause();
+#endif
+                    }
                     std::this_thread::yield();
+                }
             }
         }
 

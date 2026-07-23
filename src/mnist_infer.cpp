@@ -1,3 +1,13 @@
+// ── MNIST 手写数字推理程序（新引擎化架构） ─────────────────────────────────
+//
+// 数据流：
+//   CSV 行 → Matrix(784, 1) → engine.from_matrix → Tensor[device]
+//     → model.forward(Tensor) → Tensor
+//     → engine.to_matrix → CPU softmax + top-k 展示
+//
+// 引擎选择：--gpu 启用 GpuEngine（需要 Vulkan），否则 CpuEngine。
+// ─────────────────────────────────────────────────────────────────────────
+
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/model_serialization.hpp>
 #include <neuralnet.cpp/domain_mnist.hpp>
@@ -8,8 +18,8 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <numeric>
-#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -22,15 +32,12 @@ using nn::Scalar;
 void print_usage(const char *prog)
 {
     std::cout
-        << "MNIST 手写数字推理程序\n\n"
+        << "MNIST 手写数字推理程序 (引擎化架构)\n\n"
         << "用法:\n"
         << "  " << prog << " <image.csv> [选项]     推理单张图片\n"
         << "  " << prog << " <目录>   [选项]     批量推理目录下所有 CSV\n\n"
         << "选项:\n"
         << "  --model <path>     模型文件路径 (默认: pretrained/model.bin)\n"
-        << "                       V2 格式模型文件自动读取模型规格，无需指定 --model-type\n"
-        << "  --model-type <t>   模型类型: mlp/transformer (默认: mlp)\n"
-        << "                       仅在 V1 旧格式模型文件时需要手动指定\n"
         << "  --topk <n>         显示前 n 个预测结果 (默认: 3)\n"
         << "  --show-pixels      显示像素矩阵 (调试用)\n"
         << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
@@ -41,7 +48,6 @@ void print_usage(const char *prog)
 struct InferConfig
 {
     std::string model_path = "pretrained/model.bin";
-    std::string model_type = "mlp";   // 仅 V1 旧格式使用
     std::string input_path;
     int topk = 3;
     bool show_pixels = false;
@@ -64,13 +70,6 @@ nn::Result<InferConfig> parse_args(int argc, char *argv[])
         else if (arg == "--model" && i + 1 < argc)
         {
             cfg.model_path = argv[++i];
-        }
-        else if (arg == "--model-type" && i + 1 < argc)
-        {
-            cfg.model_type = argv[++i];
-            if (cfg.model_type != "mlp" && cfg.model_type != "transformer")
-                return std::unexpected(nn::Error{"未知模型类型: " + cfg.model_type +
-                                                 "，可选: mlp, transformer"});
         }
         else if (arg == "--topk" && i + 1 < argc)
         {
@@ -105,13 +104,6 @@ nn::Result<InferConfig> parse_args(int argc, char *argv[])
     return cfg;
 }
 
-// ==================== 数据读取 ====================
-// 委托给 mnist_common.hpp 的共享工具，消除 mnist_train / mnist_infer 重复实现
-nn::Result<nn::Matrix> load_image_from_csv(const std::string &csv_line)
-{
-    return nn::load_image_from_csv_line(csv_line);
-}
-
 // ==================== 推理 + 置信度 ====================
 struct Prediction
 {
@@ -119,12 +111,24 @@ struct Prediction
     Scalar confidence;
 };
 
-nn::Result<std::vector<Prediction>> predict_with_confidence(nn::Model &model, const nn::Matrix &img, int topk)
+// 前向：Matrix → engine.from_matrix → model.forward → engine.to_matrix
+// 后续 softmax / top-k 在 CPU 上完成（单张图片，开销可忽略）
+nn::Result<std::vector<Prediction>> predict_with_confidence(
+    nn::Model &model, nn::ComputeEngine &engine,
+    const nn::Matrix &img, int topk)
 {
-    auto logits_result = model.forward(img);
-    if (!logits_result)
-        return std::unexpected(std::move(logits_result).error());
-    auto logits = std::move(*logits_result);
+    auto x_tensor_r = engine.from_matrix(img);
+    if (!x_tensor_r)
+        return std::unexpected(std::move(x_tensor_r).error());
+
+    auto logits_tensor_r = model.forward(*x_tensor_r);
+    if (!logits_tensor_r)
+        return std::unexpected(std::move(logits_tensor_r).error());
+
+    auto logits_r = engine.to_matrix(*logits_tensor_r);
+    if (!logits_r)
+        return std::unexpected(std::move(logits_r).error());
+    const auto &logits = *logits_r;
 
     // Softmax 计算概率
     Scalar max_val = logits.at_unchecked(0, 0);
@@ -175,7 +179,9 @@ void show_pixels(const nn::Matrix &img)
 }
 
 // ==================== 推理单张图片 ====================
-nn::Result<void> infer_single(nn::Model &model, const std::string &filepath, const InferConfig &cfg)
+nn::Result<void> infer_single(
+    nn::Model &model, nn::ComputeEngine &engine,
+    const std::string &filepath, const InferConfig &cfg)
 {
     std::ifstream file(filepath);
     if (!file)
@@ -183,7 +189,7 @@ nn::Result<void> infer_single(nn::Model &model, const std::string &filepath, con
 
     std::string line;
     std::getline(file, line);
-    auto img_result = load_image_from_csv(line);
+    auto img_result = nn::load_image_from_csv_line(line);
     if (!img_result)
         return std::unexpected(std::move(img_result).error());
     auto img = std::move(*img_result);
@@ -195,7 +201,7 @@ nn::Result<void> infer_single(nn::Model &model, const std::string &filepath, con
         std::cout << "\n";
     }
 
-    auto results = predict_with_confidence(model, img, cfg.topk);
+    auto results = predict_with_confidence(model, engine, img, cfg.topk);
     if (!results)
         return std::unexpected(std::move(results).error());
 
@@ -230,31 +236,66 @@ int main(int argc, char *argv[])
     }
     nn::ModelSpec spec = spec_result.value();
 
-    nn::Model model;
-    if (spec.type != nn::ModelType::Unknown)
+    if (spec.type != nn::ModelType::MLP && spec.type != nn::ModelType::Unknown)
     {
-        // V2 格式：自动从规格构建模型
-        std::cout << "从模型文件读取规格 (V2 格式)\n";
-        auto build_result = nn::build_mnist_model_from_spec(spec);
-        if (!build_result)
-        {
-            std::cerr << "构建模型失败: " << build_result.error().message << std::endl;
-            return 1;
-        }
-        model = std::move(*build_result);
+        std::cerr << "模型文件类型不是 MLP (type="
+                  << static_cast<uint32_t>(spec.type)
+                  << ")，新架构仅支持 MLP。\n";
+        return 1;
+    }
+    if (spec.type == nn::ModelType::Unknown)
+    {
+        std::cout << "旧格式模型文件 (V1)，使用默认 MLP 架构\n";
+        spec.type = nn::ModelType::MLP;
+        spec.layer_dims = nn::MNIST_LAYER_DIMS;
     }
     else
     {
-        // V1 旧格式：使用 --model-type 参数
-        std::cout << "旧格式模型文件 (V1)，使用 --model-type 参数: " << cfg.model_type << "\n";
-        auto build_result = nn::build_mnist_model(cfg.model_type);
-        if (!build_result)
-        {
-            std::cerr << "构建模型失败: " << build_result.error().message << std::endl;
-            return 1;
-        }
-        model = std::move(*build_result);
+        std::cout << "从模型文件读取规格 (V2 格式)\n";
     }
+
+    // ── 创建计算引擎 ─────────────────────────────────────────
+    // 引擎必须先于 model 构造并晚于 model 析构（model 持有 engine 的非拥有指针）
+    std::unique_ptr<nn::ComputeEngine> engine;
+
+#ifdef NN_HAS_VULKAN
+    nn::GpuBackend *gpu_backend = nullptr;
+#endif
+    if (cfg.gpu_enabled)
+    {
+#ifdef NN_HAS_VULKAN
+        auto &backend = nn::GpuBackend::instance();
+        auto init_result = backend.initialize();
+        if (init_result)
+        {
+            gpu_backend = &backend;
+            engine = std::make_unique<nn::GpuEngine>(*gpu_backend);
+            std::cout << "GPU 加速已启用 (Vulkan GpuEngine)\n";
+        }
+        else
+        {
+            std::cerr << "GPU 初始化失败: " << init_result.error().message << "\n";
+            std::cerr << "回退到 CPU 模式\n";
+            engine = std::make_unique<nn::CpuEngine>();
+        }
+#else
+        std::cerr << "未编译 Vulkan 支持，使用 CPU 模式\n";
+        engine = std::make_unique<nn::CpuEngine>();
+#endif
+    }
+    else
+    {
+        engine = std::make_unique<nn::CpuEngine>();
+    }
+
+    // ── 构建模型（绑定引擎） ─────────────────────────────────
+    auto build_result = nn::build_mnist_model_from_spec(*engine, spec);
+    if (!build_result)
+    {
+        std::cerr << "构建模型失败: " << build_result.error().message << std::endl;
+        return 1;
+    }
+    auto model = std::move(*build_result);
 
     auto load_result = nn::load_model(cfg.model_path, model);
     if (!load_result)
@@ -263,24 +304,6 @@ int main(int argc, char *argv[])
         return 1;
     }
     std::cout << "模型已加载: " << cfg.model_path << "\n" << std::endl;
-
-#ifdef NN_HAS_VULKAN
-    if (cfg.gpu_enabled)
-    {
-        auto &backend = nn::GpuBackend::instance();
-        auto init_result = backend.initialize();
-        if (init_result)
-        {
-            nn::SmartPolicy::gpu_enabled = true;
-            std::cout << "GPU 加速已启用 (Vulkan)\n\n";
-        }
-        else
-        {
-            std::cerr << "GPU 初始化失败: " << init_result.error().message << "\n";
-            std::cerr << "回退到 CPU 模式\n\n";
-        }
-    }
-#endif
 
     fs::path input(cfg.input_path);
 
@@ -305,7 +328,7 @@ int main(int argc, char *argv[])
 
         for (auto &f : csv_files)
         {
-            auto result = infer_single(model, f.string(), cfg);
+            auto result = infer_single(model, *engine, f.string(), cfg);
             if (!result) { std::cerr << "推理失败: " << f.filename().string() << ": " << result.error().message << '\n'; }
         }
 
@@ -314,7 +337,7 @@ int main(int argc, char *argv[])
     else if (fs::is_regular_file(input))
     {
         // 单张推理
-        auto result = infer_single(model, input.string(), cfg);
+        auto result = infer_single(model, *engine, input.string(), cfg);
         if (!result) { std::cerr << "推理失败: " << result.error().message << '\n'; return 1; }
     }
     else

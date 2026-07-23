@@ -8,6 +8,10 @@
 // 注意：algebra_matrix.hpp 已传递包含 algebra_span/ops/expr/compute.hpp，
 //       config.hpp 已传递包含 core_errors.hpp，
 //       此处显式列出所有头文件是为了清晰展示模块结构。
+//
+// 新架构（引擎化）：
+//   ComputeEngine 抽象硬件接触，Layer/Loss/Optimizer 通过组合原语表达算法，
+//   forward/backward 单套实现适配 CPU/GPU。
 
 // L0 硬件层
 #include "core_errors.hpp"
@@ -19,7 +23,13 @@
 // L1 代数层（algebra_matrix.hpp 已传递包含其余代数头文件）
 #include "algebra_matrix.hpp"
 
-// L2 计算层
+// L2 计算层 — 引擎化
+#include "tensor.hpp"
+#include "compute_engine.hpp"
+#include "cpu_engine.hpp"
+#ifdef NN_HAS_VULKAN
+#include "gpu_engine.hpp"
+#endif
 #include "compute_layer.hpp"
 #include "compute_loss.hpp"
 #include "compute_optimizer.hpp"
@@ -29,13 +39,12 @@
 #include "model_spec.hpp"
 #include "model_serialization.hpp"
 
-// L4 构建层
+// L4 构建层（仅 MNIST MLP；GPT/Tokenizer 已移除）
 #include "domain_mnist.hpp"
-#include "domain_gpt.hpp"
-#include "domain_tokenizer.hpp"
 
 namespace nn
 {
+    // one_hot 工具：将类别索引向量转为 one-hot 矩阵（列主序，每列一个样本）
     [[nodiscard]] inline Result<Matrix> one_hot(const std::vector<std::size_t> &true_i, std::size_t mat_size)
     {
         const std::size_t batch_size = true_i.size();

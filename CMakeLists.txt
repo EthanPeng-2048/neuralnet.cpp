@@ -66,14 +66,6 @@ nn_add_executable(mnist_train src/mnist_train.cpp)
 nn_add_executable(mnist_infer src/mnist_infer.cpp)
 nn_add_executable(mnist_bench src/mnist_bench.cpp)
 
-# ── 文本生成目标 ────────────────────────────────────────────────────────────
-nn_add_executable(text_train src/text_train.cpp)
-nn_add_executable(text_infer src/text_infer.cpp)
-
-# ── 分词器目标 ──────────────────────────────────────────────────────────────
-nn_add_executable(tokenizer_train src/tokenizer_train.cpp)
-nn_add_executable(tokenizer_infer src/tokenizer_infer.cpp)
-
 # ── 计算性能基准测试 ─────────────────────────────────────────────────────
 nn_add_executable(compute_bench src/compute_bench.cpp)
 
@@ -88,8 +80,20 @@ if(Vulkan_FOUND)
     # 查找 SPIR-V 编译器（Vulkan SDK 自带）
     find_program(GLSLC glslc HINTS ${Vulkan_GLSLC_EXECUTABLE})
 
-    # 定义着色器列表
-    set(GPU_SHADERS matmul matmul_tiled elementwise layernorm layernorm_backward)
+    # 定义着色器列表（仅保留纯原语着色器，不含任何算法）
+    # - matmul / matmul_tiled: 矩阵乘法原语
+    # - elementwise_v2: 逐元素原语（unary/binary/select）— 纯 GPU 架构核心
+    # - reduce: 行/列归约原语（sum/max）— LayerNorm、CrossEntropy 等
+    # - broadcast: 行/列广播原语（add/sub/mul/div/max/min）— Linear 偏置、
+    #   LayerNorm 缩放、Softmax 归一化等
+    # 旧的 elementwise / layernorm / layernorm_backward 着色器（含算法语义）
+    # 已随旧架构删除。
+    set(GPU_SHADERS
+        matmul
+        matmul_tiled
+        elementwise_v2
+        reduce
+        broadcast)
     set(GPU_SHADER_HPPS "")
 
     foreach(SHADER_NAME ${GPU_SHADERS})
@@ -133,7 +137,6 @@ if(Vulkan_FOUND)
         # 为所有目标启用 Vulkan
         set(NN_GPU_TARGETS
             mnist_train mnist_infer mnist_bench
-            text_train text_infer
             compute_bench gpu_test
         )
 

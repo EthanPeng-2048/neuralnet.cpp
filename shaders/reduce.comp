@@ -1,0 +1,76 @@
+// ── reduce.comp ───────────────────────────────────────────────────────────
+// 归约原语着色器（不含任何算法）
+//
+// 只提供求和/最大值归约原语，供 Layer 组合表达 mean、var、grad_b 等。
+//
+// 模式：
+//   mode=0: row_reduce — output[r] = reduce_op(A[r*cols + c]) over c
+//           输入 (rows, cols) → 输出 (rows, 1)
+//   mode=1: col_reduce — output[c] = reduce_op(A[r*cols + c]) over r
+//           输入 (rows, cols) → 输出 (1, cols)
+//
+// 归约算子：
+//   reduce_op=0: sum
+//   reduce_op=1: max
+//
+// 绑定布局：
+//   binding 0: 输入 A (readonly)
+//   binding 1: 输出 OUT (writeonly)
+//
+// Push Constants：
+//   uint rows      — 输入行数
+//   uint cols      — 输入列数
+//   uint mode      — 0=row_reduce, 1=col_reduce
+//   uint reduce_op — 0=sum, 1=max
+//
+// 注：此实现为朴素归约（每线程扫描整行/整列），正确性优先，性能优化留待后期。
+// ─────────────────────────────────────────────────────────────────────────
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer  BufIn  { float data[]; };
+layout(std430, binding = 1) writeonly buffer BufOut { float result[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint cols;
+    uint mode;
+    uint reduce_op;
+};
+
+void main()
+{
+    const uint tid = gl_GlobalInvocationID.x;
+
+    // ── 行归约：每线程计算一行的归约值 ──
+    if (mode == 0u)
+    {
+        if (tid >= rows) return;
+        float acc = (reduce_op == 0u) ? 0.0 : uintBitsToFloat(0xff800000u); // sum=0, max=-Inf
+        for (uint c = 0u; c < cols; ++c)
+        {
+            float v = data[tid * cols + c];
+            if (reduce_op == 0u) acc += v;
+            else acc = max(acc, v);
+        }
+        result[tid] = acc;
+        return;
+    }
+
+    // ── 列归约：每线程计算一列的归约值 ──
+    if (mode == 1u)
+    {
+        if (tid >= cols) return;
+        float acc = (reduce_op == 0u) ? 0.0 : uintBitsToFloat(0xff800000u); // sum=0, max=-Inf
+        for (uint r = 0u; r < rows; ++r)
+        {
+            float v = data[r * cols + tid];
+            if (reduce_op == 0u) acc += v;
+            else acc = max(acc, v);
+        }
+        result[tid] = acc;
+        return;
+    }
+}

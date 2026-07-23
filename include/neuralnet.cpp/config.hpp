@@ -36,10 +36,11 @@ namespace nn
     // 线程池采用 latch + 调用者参与设计：一次批量入队 + 原子计数器，
     // 消除了旧版 N×submit + N×future 的堆分配和同步开销。
     struct SmartPolicy {
-        // 阈值 = 1024 元素：即使 MNIST 小隐藏层（64×64=4096）也能触发并行。
-        // chunk_count() 已自动按核心数缩放（min(cores, total/1024)），
-        // 阈值只需设最低门槛，核心利用随数据量自然增长。
-        inline static constexpr std::size_t PARALLEL_THRESHOLD = 1024;
+        // 阈值 = 131072 元素：线程池调度开销约 50-200μs（Windows mutex+cv），
+        // 仅当元素数足够多（简单逐元素运算 ~130μs 串行）时并行才有收益。
+        // MNIST 模型张量：307200/153600→并行 ✅，76800/38400/6000→串行（避免调度开销）。
+        // chunk_count() 仍按核心数缩放，大张量自然利用全部核心。
+        inline static constexpr std::size_t PARALLEL_THRESHOLD = 131072;
         
         // ── GPU 加速配置 ─────────────────────────────────────────────────
         // GPU 加速阈值：矩阵面积超过此值时自动走 GPU（默认 64×64 = 4096 元素）

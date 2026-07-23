@@ -1,156 +1,205 @@
 #ifndef NN_COMPUTE_LOSS_HPP
 #define NN_COMPUTE_LOSS_HPP
 
-#include <algorithm>
-#include <array>
-#include <cmath>
-#include <functional>
-#include <limits>
-#include <span>
-#include <string>
-#include <vector>
+// ── compute_loss.hpp — 引擎化损失函数 ──────────────────────────────────────
+//
+// 架构铁律：
+//   1. Loss 的 forward/backward 只写一次，通过 ComputeEngine 参数自动适配
+//      CPU/GPU 设备。
+//   2. 算法只在 Loss（通过组合 engine 原语表达），绝不在 Engine/Shader 中。
+//   3. Softmax/CrossEntropy 算法由本文件通过 col_reduce_max + exp + col_reduce_sum
+//      + broadcast_col + elementwise 组合表达，Engine 不知道 "softmax" 是什么。
+//
+// 算法表达示例：
+//   MSELoss forward:  grad = (2/N) * (pred - target);  loss = (1/N) * Σ diff²
+//   CrossEntropy forward (with softmax):
+//     col_max   = col_reduce_max(logits)             // 数值稳定
+//     shifted   = logits - col_max                   (broadcast_col Sub)
+//     exp_shift = exp(shifted)                       (unary Exp)
+//     col_sum   = col_reduce_sum(exp_shift)
+//     softmax   = exp_shift / col_sum                (broadcast_col Div)
+//     grad      = softmax - target                   (elementwise Sub)
+//     log_sm    = shifted - log(col_sum)             (broadcast_col Sub)
+//     loss      = -(1/batch) * Σ target * log_sm
+//   CrossEntropy backward: grad = softmax - target_onehot
+// ─────────────────────────────────────────────────────────────────────────
 
-#include "config.hpp"
-#include "algebra_matrix.hpp"
-#include "algebra_span.hpp"
-#include "algebra_expr.hpp"
-#include "algebra_compute.hpp"
+#include "compute_engine.hpp"
+#include "compute_layer.hpp"  // clone_tensor
+#include "tensor.hpp"
 
 namespace nn
 {
-    class Loss
+
+// ══════════════════════════════════════════════════════════════════════════
+// Loss — 引擎化损失函数基类
+// ══════════════════════════════════════════════════════════════════════════
+class Loss
+{
+public:
+    virtual ~Loss() = default;
+
+    // forward 计算损失标量，并缓存 backward 所需中间结果
+    [[nodiscard]] virtual Result<Scalar> forward(
+        ComputeEngine& engine, const Tensor& pred, const Tensor& target) = 0;
+
+    // backward 返回对 pred 的梯度
+    [[nodiscard]] virtual Result<Tensor> backward() = 0;
+};
+
+// ══════════════════════════════════════════════════════════════════════════
+// MSELoss — 均方误差损失
+//
+// 算法（只在此处，不在 Engine/Shader）：
+//   diff = pred - target
+//   grad = (2/N) * diff
+//   loss = (1/N) * Σ diff²
+// ══════════════════════════════════════════════════════════════════════════
+class MSELoss final : public Loss
+{
+private:
+    Tensor grad_input_;
+
+public:
+    MSELoss() = default;
+
+    [[nodiscard]] Result<Scalar> forward(
+        ComputeEngine& engine, const Tensor& pred, const Tensor& target) override
     {
-    public:
-        virtual ~Loss() = default;
-        virtual Result<Scalar> forward(const Matrix &pred, const Matrix &target) = 0;
-        virtual Result<Matrix> backward() const = 0;
-    };
+        if (pred.rows() != target.rows() || pred.cols() != target.cols())
+            return std::unexpected(Error{"mse loss: shape mismatch"});
+        if (pred.size() == 0)
+            return std::unexpected(Error{"mse loss: empty input"});
 
-    class MSELoss : public Loss
+        const Scalar total = static_cast<Scalar>(pred.size());
+        const Scalar scale = Scalar{2} / total;
+
+        // diff = pred - target
+        auto diff = engine.elementwise_binary(BinaryOp::Sub, pred, target);
+        if (!diff) return std::unexpected(diff.error());
+
+        // grad = diff * (2/N) — 深拷贝后 scale
+        grad_input_ = *diff;
+        auto r = engine.scale_inplace(grad_input_, scale);
+        if (!r) return std::unexpected(r.error());
+
+        // diff_sq = diff * diff
+        auto diff_sq = engine.elementwise_binary(BinaryOp::Mul, *diff, *diff);
+        if (!diff_sq) return std::unexpected(diff_sq.error());
+
+        // 全局求和：先按列归约 (1, cols)，再按行归约 (1, 1)
+        auto col_sum = engine.col_reduce_sum(*diff_sq);
+        if (!col_sum) return std::unexpected(col_sum.error());
+        auto total_t = engine.row_reduce_sum(*col_sum);
+        if (!total_t) return std::unexpected(total_t.error());
+
+        // 下载标量
+        auto m = engine.to_matrix(*total_t);
+        if (!m) return std::unexpected(m.error());
+
+        return m->at_unchecked(0, 0) / total;
+    }
+
+    [[nodiscard]] Result<Tensor> backward() override
     {
-    private:
-        Matrix grad_input_;
+        return grad_input_;
+    }
+};
 
-    public:
-        MSELoss() = default;
+// ══════════════════════════════════════════════════════════════════════════
+// CrossEntropyLoss — 带 softmax 的交叉熵损失
+//
+// 算法（只在此处，不在 Engine/Shader）：
+//   对每列（batch 样本）独立做 softmax + cross entropy：
+//     col_max   = max_c logits[c][i]                  (col_reduce_max)
+//     shifted   = logits - col_max                    (broadcast_col Sub)
+//     exp_shift = exp(shifted)                        (unary Exp)
+//     col_sum   = Σ_c exp_shift[c][i]                 (col_reduce_sum)
+//     softmax   = exp_shift / col_sum                 (broadcast_col Div)
+//     grad      = softmax - target_onehot             (elementwise Sub)
+//     log_sm    = shifted - log(col_sum)              (broadcast_col Sub)
+//     loss      = -(1/batch) * Σ target * log_sm
+// ══════════════════════════════════════════════════════════════════════════
+class CrossEntropyLoss final : public Loss
+{
+private:
+    Tensor grad_input_;
 
-        [[nodiscard]] Result<Scalar> forward(const Matrix &pred, const Matrix &target) override
-        {
-            if (pred.rows() != target.rows() || pred.cols() != target.cols())
-                return std::unexpected(Error{"mse loss shape mismatch"});
-            if (pred.empty())
-                return std::unexpected(Error{"mse loss cannot be computed on an empty matrix"});
+public:
+    CrossEntropyLoss() = default;
 
-            const auto total = static_cast<Scalar>(pred.size());
-            const Scalar factor = 2.0 / total;
-
-            // 梯度：grad = (2/N) * (pred - target)  (AST 逐元素表达式)
-            grad_input_.resize(pred.rows(), pred.cols());
-            ConstSpan p_s = pred.span();
-            ConstSpan t_s = target.span();
-            Span g_s = grad_input_.span();
-            compute::apply(g_s, factor * (p_s - t_s));
-
-            // 损失：对梯度平方求和还原 MSE
-            // diff = grad * total/2, diff² = grad² * total²/4, loss = Σdiff² / total
-            const Scalar sum_gsq = grad_input_.reduce(Scalar{0}, std::plus<>{},
-                [](Scalar g) noexcept { return g * g; });
-            const Scalar loss = sum_gsq * total / Scalar{4};
-
-            return loss;
-        }
-
-        [[nodiscard]] Result<Matrix> backward() const noexcept override { return grad_input_; }
-    };
-
-    // ── CrossEntropyLoss（带 softmax） ───────────────────────────────────
-    // 输入: logits (classes, batch)，target_onehot (classes, batch)
-    // 算法：对每列（每个 batch 样本）独立做 softmax + cross entropy
-    //   loss = -(1/batch) * Σ_i log(softmax(logits[:, i])[true_class_i])
-    //   grad_input = softmax - target_onehot
-    // 通过 AST 入口 compute::apply 表达逐元素算法（exp/log/乘/减），
-    // 通过 Matrix 语义原语 col_reduce/broadcast_col_inplace 表达归约与广播。
-    class CrossEntropyLoss : public Loss
+    [[nodiscard]] Result<Scalar> forward(
+        ComputeEngine& engine, const Tensor& logits, const Tensor& target) override
     {
-    private:
-        Matrix grad_input_;
+        const std::size_t classes = logits.rows();
+        const std::size_t batch   = logits.cols();
 
-    public:
-        CrossEntropyLoss() = default;
+        if (target.rows() != classes || target.cols() != batch)
+            return std::unexpected(Error{"cross_entropy loss: shape mismatch"});
+        if (classes == 0 || batch == 0)
+            return std::unexpected(Error{"cross_entropy loss: empty input"});
 
-        [[nodiscard]] Result<Scalar> forward(const Matrix &logits, const Matrix &target_onehot) override
-        {
-            const std::size_t classes = logits.rows();
-            const std::size_t batch = logits.cols();
+        // 1. col_max = max per column (数值稳定)
+        auto col_max = engine.col_reduce_max(logits);
+        if (!col_max) return std::unexpected(col_max.error());
 
-            if (target_onehot.rows() != classes || target_onehot.cols() != batch)
-                return std::unexpected(Error{"cross_entropy loss shape mismatch"});
+        // 2. shifted = logits - col_max (broadcast_col Sub) — 深拷贝 logits
+        auto shifted = clone_tensor(engine, logits);
+        if (!shifted) return std::unexpected(shifted.error());
+        auto r = engine.broadcast_col_inplace(*shifted, *col_max, BinaryOp::Sub);
+        if (!r) return std::unexpected(r.error());
 
-            // 1. 对每列求最大值（数值稳定）—— 按列归约
-            Matrix col_max = logits.col_reduce(
-                std::numeric_limits<Scalar>::lowest(),
-                [](Scalar a, Scalar b) noexcept { return std::max(a, b); },
-                [](Scalar x) noexcept { return x; });  // shape: (1, batch)
+        // 3. exp_shift = exp(shifted)
+        auto exp_shift = engine.elementwise_unary(UnaryOp::Exp, *shifted);
+        if (!exp_shift) return std::unexpected(exp_shift.error());
 
-            // 2. shifted = logits - col_max（按列广播减法）
-            Matrix shifted = logits;
-            shifted.broadcast_col_inplace(col_max,
-                [](Scalar x, Scalar m) noexcept { return x - m; });
+        // 4. col_sum = Σ_c exp_shift[c][i]
+        auto col_sum = engine.col_reduce_sum(*exp_shift);
+        if (!col_sum) return std::unexpected(col_sum.error());
 
-            // 3. exp_shifted = exp(shifted)  (AST 逐元素 exp)
-            Matrix exp_shifted(shifted.rows(), shifted.cols());
-            ConstSpan sh_s = shifted.span();
-            Span es_s = exp_shifted.span();
-            compute::apply(es_s, exp(sh_s));
+        // 5. softmax = exp_shift / col_sum (broadcast_col Div) — 深拷贝 exp_shift
+        auto softmax = clone_tensor(engine, *exp_shift);
+        if (!softmax) return std::unexpected(softmax.error());
+        r = engine.broadcast_col_inplace(*softmax, *col_sum, BinaryOp::Div);
+        if (!r) return std::unexpected(r.error());
 
-            // 4. col_sum[i] = Σ_c exp_shifted[c][i]  —— 按列归约
-            Matrix col_sum = exp_shifted.col_reduce(Scalar{0},
-                [](Scalar a, Scalar b) noexcept { return a + b; },
-                [](Scalar x) noexcept { return x; });  // shape: (1, batch)
+        // 6. grad = softmax - target (elementwise Sub)
+        auto grad = engine.elementwise_binary(BinaryOp::Sub, *softmax, target);
+        if (!grad) return std::unexpected(grad.error());
+        grad_input_ = *grad;
 
-            // 5. softmax[c][i] = exp_shifted[c][i] / col_sum[i]  —— 按列广播除法
-            Matrix softmax = exp_shifted;
-            softmax.broadcast_col_inplace(col_sum,
-                [](Scalar e, Scalar s) noexcept { return e / s; });
+        // 7. log_softmax = shifted - log(col_sum)
+        auto log_col_sum = engine.elementwise_unary(UnaryOp::Log, *col_sum);
+        if (!log_col_sum) return std::unexpected(log_col_sum.error());
 
-            // 6. 梯度 = softmax - target_onehot  (AST 逐元素减)
-            grad_input_.resize(softmax.rows(), softmax.cols());
-            ConstSpan sm_s = softmax.span();
-            ConstSpan to_s = target_onehot.span();
-            Span gi_s = grad_input_.span();
-            compute::apply(gi_s, sm_s - to_s);
+        auto log_softmax = clone_tensor(engine, *shifted);
+        if (!log_softmax) return std::unexpected(log_softmax.error());
+        r = engine.broadcast_col_inplace(*log_softmax, *log_col_sum, BinaryOp::Sub);
+        if (!r) return std::unexpected(r.error());
 
-            // 7. 损失 = -(1/batch) * Σ_i log(softmax[true_class_i, i])
-            //    等价实现：loss = -(1/batch) * Σ_{c,i} target[c][i] * log(softmax[c][i])
-            //    （因为 target 是 one-hot，求和只对 true_class 非零）
-            //    数值稳定：log(softmax) = log(exp_shifted) - log(col_sum)
-            //                              = shifted - log(col_sum)
-            Matrix log_softmax = shifted;
-            Matrix log_col_sum(col_sum.rows(), col_sum.cols());
-            ConstSpan cs_s = col_sum.span();
-            Span lcs_s = log_col_sum.span();
-            compute::apply(lcs_s, log(cs_s));
+        // 8. target_dot_log = target * log_softmax
+        auto target_dot_log = engine.elementwise_binary(BinaryOp::Mul, target, *log_softmax);
+        if (!target_dot_log) return std::unexpected(target_dot_log.error());
 
-            log_softmax.broadcast_col_inplace(log_col_sum,
-                [](Scalar a, Scalar b) noexcept { return a - b; });
+        // 9. Σ target * log_softmax (先列归约再行归约 → (1,1))
+        auto col_s = engine.col_reduce_sum(*target_dot_log);
+        if (!col_s) return std::unexpected(col_s.error());
+        auto total_t = engine.row_reduce_sum(*col_s);
+        if (!total_t) return std::unexpected(total_t.error());
 
-            // dot = Σ target * log_softmax  (AST 逐元素乘)
-            Matrix target_dot_log(target_onehot.rows(), target_onehot.cols());
-            ConstSpan to2_s = target_onehot.span();
-            ConstSpan ls_s = log_softmax.span();
-            Span tdl_s = target_dot_log.span();
-            compute::apply(tdl_s, to2_s * ls_s);
+        // 10. loss = -total / batch — 下载标量
+        auto m = engine.to_matrix(*total_t);
+        if (!m) return std::unexpected(m.error());
 
-            const Scalar sum_nll = target_dot_log.reduce(Scalar{0},
-                [](Scalar a, Scalar b) noexcept { return a + b; },
-                [](Scalar x) noexcept { return x; });
+        return -m->at_unchecked(0, 0) / static_cast<Scalar>(batch);
+    }
 
-            const Scalar loss = -sum_nll / static_cast<Scalar>(batch);
-            return loss;
-        }
+    [[nodiscard]] Result<Tensor> backward() override
+    {
+        return grad_input_;
+    }
+};
 
-        [[nodiscard]] Result<Matrix> backward() const noexcept override { return grad_input_; }
-    };
 } // namespace nn
 
 #endif // NN_COMPUTE_LOSS_HPP
