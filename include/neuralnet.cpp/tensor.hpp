@@ -89,7 +89,9 @@ public:
     [[nodiscard]] bool is_gpu() const noexcept { return device_ == Device::GPU; }
     [[nodiscard]] bool valid() const noexcept
     {
-        return device_ == Device::CPU ? static_cast<bool>(cpu_data_) : true;
+        return device_ == Device::CPU
+            ? static_cast<bool>(cpu_data_)
+            : static_cast<bool>(gpu_data_);
     }
 
     // ── CPU 存储访问 ──────────────────────────────────────────────────────

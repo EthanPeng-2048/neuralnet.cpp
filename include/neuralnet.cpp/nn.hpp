@@ -39,8 +39,10 @@
 #include "model_spec.hpp"
 #include "model_serialization.hpp"
 
-// L4 构建层（仅 MNIST MLP；GPT/Tokenizer 已移除）
+// L4 构建层
 #include "domain_mnist.hpp"
+#include "domain_gpt.hpp"
+#include "domain_tokenizer.hpp"
 
 namespace nn
 {

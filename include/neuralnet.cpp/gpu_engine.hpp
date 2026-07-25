@@ -49,9 +49,21 @@ public:
 
     [[nodiscard]] Device device() const noexcept override { return Device::GPU; }
 
-    // ── 批处理：当前为 no-op（同步模式） ──────────────────────────────────
-    [[nodiscard]] Result<void> begin_batch() override { return {}; }
-    [[nodiscard]] Result<void> end_batch() override { return {}; }
+    // ── 批处理：激活 GpuBackend 的 command buffer 录制模式 ──────────────
+    // begin_batch 后，所有原语录制到共享 batch_cmd_，直到 end_batch 一次提交+等待。
+    // 这消除了 per-primitive 的 vkQueueSubmit+vkWaitForFences 开销。
+    [[nodiscard]] Result<void> begin_batch() override
+    {
+        return backend_.begin_batch();
+    }
+
+    [[nodiscard]] Result<void> end_batch() override
+    {
+        return backend_.end_batch();
+    }
+
+    // batch 模式查询（内部使用，to_matrix/from_matrix 需检查）
+    [[nodiscard]] bool in_batch() const noexcept { return backend_.in_batch(); }
 
     // ══════════════════════════════════════════════════════════════════════
     // 张量工厂（纯 GPU：全部创建/上传为 GPU Tensor）
@@ -82,6 +94,15 @@ public:
     {
         if (t.is_cpu())
             return Matrix(t.cpu_matrix());
+        // batch 模式下必须先 flush（提交并等待），否则 GPU 计算未执行，读到旧数据
+        // flush 后自动重新 begin_batch，保持 batch 上下文不断裂
+        if (in_batch())
+        {
+            auto r = end_batch();
+            if (!r) return std::unexpected(r.error());
+            auto rb = begin_batch();
+            if (!rb) return std::unexpected(rb.error());
+        }
         return t.gpu_tensor().to_matrix(backend_);
     }
 
@@ -111,6 +132,81 @@ public:
         return Tensor::from_gpu(std::move(*r));
     }
 
+    // ── 行切片：GPU 内拷贝连续行区间 ──
+    [[nodiscard]] Result<Tensor> slice_rows(
+        const Tensor& src, std::size_t start_row, std::size_t count) override
+    {
+        auto src_gpu = ensure_gpu(src);
+        if (!src_gpu) return std::unexpected(src_gpu.error());
+        auto r = backend_.slice_rows_gpu(src_gpu->gpu_tensor(), start_row, count);
+        if (!r) return std::unexpected(r.error());
+        return Tensor::from_gpu(std::move(*r));
+    }
+
+    // ── 行插入：GPU 内就地写入连续行区间 ──
+    // 注意：若 dst 为 CPU（防御性路径），回退到上传-拷贝-替换流程。
+    // 正常路径下 dst 已是 GPU Tensor，直接就地修改 buffer。
+    [[nodiscard]] Result<void> insert_rows(
+        Tensor& dst, std::size_t dst_start_row, const Tensor& src) override
+    {
+        if (dst.is_cpu())
+        {
+            // 防御性路径：dst 为 CPU，先确保 src 也在 CPU（下载）
+            if (!src.is_cpu())
+            {
+                auto sm = to_matrix(src);
+                if (!sm) return std::unexpected(sm.error());
+                Tensor src_cpu = Tensor::from_matrix(Matrix(*sm));
+                return insert_rows_cpu_fallback(dst, dst_start_row, src_cpu);
+            }
+            return insert_rows_cpu_fallback(dst, dst_start_row, src);
+        }
+        auto src_gpu = ensure_gpu(src);
+        if (!src_gpu) return std::unexpected(src_gpu.error());
+        return backend_.insert_rows_gpu(dst.gpu_tensor(), dst_start_row, src_gpu->gpu_tensor());
+    }
+
+private:
+    // CPU 路径回退（dst 为 CPU Tensor 时使用）
+    [[nodiscard]] Result<void> insert_rows_cpu_fallback(
+        Tensor& dst, std::size_t dst_start_row, const Tensor& src)
+    {
+        Matrix& d = dst.cpu_matrix();
+        const Matrix& s = src.cpu_matrix();
+        if (d.cols() != s.cols())
+            return std::unexpected(Error{"insert_rows: column count mismatch"});
+        if (dst_start_row + s.rows() > d.rows())
+            return std::unexpected(Error{"insert_rows: range out of bounds"});
+        const auto dst_span = d.span();
+        const auto src_span = s.span();
+        const std::size_t cols = d.cols();
+        for (std::size_t r = 0; r < s.rows(); ++r)
+            std::copy_n(src_span.begin() + r * cols, cols,
+                        dst_span.begin() + (dst_start_row + r) * cols);
+        return {};
+    }
+
+public:
+
+    // ── 3D 维度转置：(M, B, N) ↔ (B, M, N) ──
+    [[nodiscard]] Result<Tensor> rearrange_3d(
+        const Tensor& x, std::size_t M, std::size_t B, std::size_t N,
+        bool inverse) override
+    {
+        auto x_gpu = ensure_gpu(x);
+        if (!x_gpu) return std::unexpected(x_gpu.error());
+
+        auto r = backend_.rearrange_3d_gpu(
+            x_gpu->gpu_tensor(),
+            static_cast<uint32_t>(M),
+            static_cast<uint32_t>(B),
+            static_cast<uint32_t>(N),
+            inverse ? 1u : 0u);
+        if (!r)
+            return std::unexpected(r.error());
+        return Tensor::from_gpu(std::move(*r));
+    }
+
     // ══════════════════════════════════════════════════════════════════════
     // 矩阵级原语
     // ══════════════════════════════════════════════════════════════════════
@@ -127,6 +223,26 @@ public:
 
         auto r = backend_.matmul_gpu(
             a_gpu->gpu_tensor(), b_gpu->gpu_tensor(),
+            transA ? 1u : 0u, transB ? 1u : 0u);
+        if (!r)
+            return std::unexpected(r.error());
+        return Tensor::from_gpu(std::move(*r));
+    }
+
+    // ── 批量矩阵乘法：按 batch 切分行块，单次 dispatch 处理所有 batch ──
+    [[nodiscard]] Result<Tensor> batched_matmul(
+        const Tensor& A, const Tensor& B,
+        std::size_t batch,
+        bool transA, bool transB) override
+    {
+        auto a_gpu = ensure_gpu(A);
+        if (!a_gpu) return std::unexpected(a_gpu.error());
+        auto b_gpu = ensure_gpu(B);
+        if (!b_gpu) return std::unexpected(b_gpu.error());
+
+        auto r = backend_.batched_matmul_gpu(
+            a_gpu->gpu_tensor(), b_gpu->gpu_tensor(),
+            static_cast<uint32_t>(batch),
             transA ? 1u : 0u, transB ? 1u : 0u);
         if (!r)
             return std::unexpected(r.error());

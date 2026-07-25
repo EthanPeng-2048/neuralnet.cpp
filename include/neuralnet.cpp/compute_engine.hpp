@@ -13,7 +13,7 @@
 //      CPU/GPU 由引擎实现自动分发。
 //
 // 原语分类：
-//   - 矩阵级：matmul, transpose, add_inplace, scale_inplace, zero
+//   - 矩阵级：matmul, batched_matmul, transpose, add_inplace, scale_inplace, zero
 //   - 归约级：row_reduce_sum, col_reduce_sum
 //   - 广播级：broadcast_row_inplace, broadcast_col_inplace
 //   - 逐元素：elementwise_unary, elementwise_binary, elementwise_binary_scalar
@@ -101,6 +101,29 @@ public:
     // 用于需要修改中间结果但不影响原 Tensor 的场景
     [[nodiscard]] virtual Result<Tensor> clone(const Tensor& src) = 0;
 
+    // ── 行切片原语（op-level 数据操作，不含算法语义） ──────────────────
+    // 返回 src 的行 [start_row, start_row + count) 的连续拷贝。
+    // 用于多头注意力中 per-head Q/K/V 切片等场景。
+    [[nodiscard]] virtual Result<Tensor> slice_rows(
+        const Tensor& src, std::size_t start_row, std::size_t count) = 0;
+
+    // 将 src 的所有行写入 dst 的行 [dst_start_row, dst_start_row + src.rows())。
+    // 真·就地修改（GPU 用 vkCmdCopyBuffer with dstOffset）。
+    // 用于多头注意力中 per-head 输出拼接等场景。
+    [[nodiscard]] virtual Result<void> insert_rows(
+        Tensor& dst, std::size_t dst_start_row, const Tensor& src) = 0;
+
+    // 3D 维度转置：(M, B, N) ↔ (B, M, N)
+    //   inverse=false: 输入 (M, B*N) → 输出 (B*M, N)
+    //     out[b*M + m, n] = in[m, b*N + n]
+    //   inverse=true:  输入 (B*M, N) → 输出 (M, B*N)
+    //     out[m, b*N + n] = in[b*M + m, n]
+    // 典型用途：MHA 批量化时把 (H*d_k, batch*seq) 重排为 (batch*H*d_k, seq)，
+    //   使 batched_matmul 能按 batch*H 切分行块。
+    [[nodiscard]] virtual Result<Tensor> rearrange_3d(
+        const Tensor& x, std::size_t M, std::size_t B, std::size_t N,
+        bool inverse = false) = 0;
+
     // ══════════════════════════════════════════════════════════════════════
     // 矩阵级原语
     // ══════════════════════════════════════════════════════════════════════
@@ -109,6 +132,18 @@ public:
     // transA: 使用 A^T，transB: 使用 B^T
     [[nodiscard]] virtual Result<Tensor> matmul(
         const Tensor& A, const Tensor& B,
+        bool transA = false, bool transB = false) = 0;
+
+    // 批量矩阵乘法：对每个 batch b 计算 C_b = op(A_b, B_b)，结果垂直堆叠
+    // A: (batch * A_rows_per_batch, A_cols) — 按 batch 切分为连续行块
+    // B: (batch * B_rows_per_batch, B_cols)
+    // 输出: (batch * M, N)，M/N 为每个 batch 的逻辑输出维度
+    //   transA=0: A_b 为 (M, K)，transA=1: A_b 存储为 (K, M) 按 A_b^T 使用
+    //   transB=0: B_b 为 (K, N)，transB=1: B_b 存储为 (N, K) 按 B_b^T 使用
+    // 典型用途：多头注意力的 Q^T×K 和 V×A 批量化（消除 per-head 循环）
+    [[nodiscard]] virtual Result<Tensor> batched_matmul(
+        const Tensor& A, const Tensor& B,
+        std::size_t batch,
         bool transA = false, bool transB = false) = 0;
 
     // A += B（逐元素，同形状）

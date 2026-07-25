@@ -1,4 +1,4 @@
-// ── MNIST 手写数字训练程序（新引擎化架构） ─────────────────────────────────
+// ── MNIST 手写数字训练程序（引擎化架构，支持 MLP 与 Transformer） ────────
 //
 // 数据流：
 //   CSV → Matrix(feat_dim, N) + Matrix(10, N)
@@ -11,6 +11,7 @@
 //   evaluate：forward → engine.to_matrix → CPU argmax
 //
 // 引擎选择：--gpu 启用 GpuEngine（需要 Vulkan），否则 CpuEngine。
+// 架构选择：--arch mlp|transformer（默认 mlp，从已保存模型 resume 时自动识别）
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>
@@ -18,6 +19,7 @@
 #include <neuralnet.cpp/domain_mnist.hpp>
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -33,38 +35,66 @@
 
 using nn::Scalar;
 
+enum class ArchType { MLP, Transformer };
+
 // ==================== 帮助信息 ====================
 void print_usage(const char *prog)
 {
     std::cout
-        << "MNIST 手写数字训练程序 (引擎化架构)\n\n"
+        << "MNIST 手写数字训练程序 (引擎化架构，支持 MLP/Transformer)\n\n"
         << "用法: " << prog << " [选项]\n\n"
         << "选项:\n"
-        << "  --resume <path>    从已有模型恢复训练 (自动读取模型规格)\n"
+        << "  --arch <name>      模型架构: mlp/transformer (默认: mlp)\n"
+        << "  --resume <path>    从已有模型恢复训练 (自动读取模型规格与架构)\n"
         << "  --save <path>      模型保存路径 (默认: mnist_model.bin)\n"
         << "  --dataset <path>   数据集目录 (默认: datasets/mnist_data)\n"
         << "  --epochs <n>       训练轮数 (默认: 10)\n"
         << "  --lr <lr>          学习率 (默认: 0.001)\n"
         << "  --batch-size <n>   批大小 (默认: 64)\n"
-        << "  --optimizer <name> 优化器: sgd/sgd_momentum/adam (默认: adam)\n"
+        << "  --optimizer <name> 优化器: sgd/sgd_momentum/adam/adamw/muon (默认: adam)\n"
+        << "  --weight-decay <w> AdamW 权重衰减系数 (默认: 0.01)\n"
         << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
-        << "  --layer-dims <d1,d2,...>  MLP 各层维度，逗号分隔 (默认: 784,512,256,128,64,10)\n"
+        << "  --max-samples <n>  限制训练样本数 (用于快速测试, 默认: 全部)\n"
+        << "\n"
+        << "MLP 专用:\n"
+        << "  --layer-dims <d1,d2,...>  各层维度，逗号分隔 (默认: 784,512,256,128,64,10)\n"
+        << "\n"
+        << "Transformer 专用:\n"
+        << "  --d-model <n>      模型维度 (默认: 64)\n"
+        << "  --num-heads <n>    注意力头数 (默认: 4)\n"
+        << "  --num-layers <n>   Transformer 层数 (默认: 2)\n"
+        << "  --d-ff <n>         FFN 中间维度 (默认: 128)\n"
+        << "  --patch-size <n>   patch 大小 (默认: 7, 28/7=4 → 16 patches)\n"
+        << "  --eval-samples <n> 评估样本数 (默认: 200，避免评估过慢)\n"
         << "  --help             显示此帮助信息\n";
 }
 
 // ==================== 命令行参数 ====================
 struct TrainConfig
 {
+    ArchType arch = ArchType::MLP;
     std::string save_path = "mnist_model.bin";
     std::string dataset_path = "datasets/mnist_data";
     std::string resume_path;
     std::string optimizer_name = "adam";
     int epochs = 10;
     Scalar lr = 0.001;
+    Scalar weight_decay = 0.01f;  // AdamW 权重衰减系数
     std::size_t batch_size = 64;
     bool load_existing = false;
-    std::vector<std::size_t> layer_dims;
     bool gpu_enabled = false;
+    int max_train_samples = -1;  // -1 表示使用全部
+
+    // MLP 参数
+    std::vector<std::size_t> layer_dims;
+
+    // Transformer 参数
+    std::size_t d_model = nn::MNIST_TF_D_MODEL;
+    std::size_t num_heads = nn::MNIST_TF_NUM_HEADS;
+    std::size_t d_ff = nn::MNIST_TF_D_FF;
+    std::size_t num_layers = nn::MNIST_TF_NUM_LAYERS;
+    std::size_t patch_size = nn::MNIST_PATCH_SIZE;
+    std::size_t eval_samples = 200;  // Transformer 评估样本上限
 };
 
 TrainConfig parse_args(int argc, char *argv[])
@@ -77,6 +107,19 @@ TrainConfig parse_args(int argc, char *argv[])
         {
             print_usage(argv[0]);
             std::exit(0);
+        }
+        else if (arg == "--arch" && i + 1 < argc)
+        {
+            std::string v = argv[++i];
+            if (v == "mlp")
+                cfg.arch = ArchType::MLP;
+            else if (v == "transformer" || v == "tf")
+                cfg.arch = ArchType::Transformer;
+            else
+            {
+                std::cerr << "未知 --arch: " << v << "，可选: mlp, transformer\n";
+                std::exit(1);
+            }
         }
         else if (arg == "--resume" && i + 1 < argc)
         {
@@ -115,12 +158,19 @@ TrainConfig parse_args(int argc, char *argv[])
         {
             cfg.optimizer_name = argv[++i];
             if (cfg.optimizer_name != "sgd" && cfg.optimizer_name != "sgd_momentum" &&
-                cfg.optimizer_name != "adam")
+                cfg.optimizer_name != "adam" && cfg.optimizer_name != "adamw" &&
+                cfg.optimizer_name != "muon")
             {
                 std::cerr << "未知优化器: " << cfg.optimizer_name
-                          << "，可选: sgd, sgd_momentum, adam\n";
+                          << "，可选: sgd, sgd_momentum, adam, adamw, muon\n";
                 std::exit(1);
             }
+        }
+        else if (arg == "--weight-decay" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<Scalar>(argv[++i]);
+            if (!v) { std::cerr << "无效 --weight-decay: " << v.error().message << "\n"; std::exit(1); }
+            cfg.weight_decay = *v;
         }
         else if (arg == "--layer-dims" && i + 1 < argc)
         {
@@ -139,6 +189,48 @@ TrainConfig parse_args(int argc, char *argv[])
                 std::cerr << "--layer-dims 至少需要 2 个维度\n";
                 std::exit(1);
             }
+        }
+        else if (arg == "--d-model" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --d-model: " << v.error().message << "\n"; std::exit(1); }
+            cfg.d_model = *v;
+        }
+        else if (arg == "--num-heads" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --num-heads: " << v.error().message << "\n"; std::exit(1); }
+            cfg.num_heads = *v;
+        }
+        else if (arg == "--num-layers" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --num-layers: " << v.error().message << "\n"; std::exit(1); }
+            cfg.num_layers = *v;
+        }
+        else if (arg == "--d-ff" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --d-ff: " << v.error().message << "\n"; std::exit(1); }
+            cfg.d_ff = *v;
+        }
+        else if (arg == "--patch-size" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --patch-size: " << v.error().message << "\n"; std::exit(1); }
+            cfg.patch_size = *v;
+        }
+        else if (arg == "--max-samples" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<int>(argv[++i]);
+            if (!v) { std::cerr << "无效 --max-samples: " << v.error().message << "\n"; std::exit(1); }
+            cfg.max_train_samples = *v;
+        }
+        else if (arg == "--eval-samples" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --eval-samples: " << v.error().message << "\n"; std::exit(1); }
+            cfg.eval_samples = *v;
         }
         else if (arg == "--gpu")
         {
@@ -249,18 +341,46 @@ nn::Result<std::pair<nn::Matrix, nn::Matrix>> load_csv(const std::string &filena
 }
 
 // -------------------- 评估函数 --------------------
-// 全量前向后下载到 CPU 做 argmax，计算准确率
+// 全量前向后下载到 CPU 做 argmax，计算准确率。
+// eval_samples > 0 时只评估前 N 个样本（Transformer 评估成本较高）。
 nn::Result<Scalar> evaluate(nn::Model &model, nn::ComputeEngine &engine,
-                             const nn::Matrix &x, const nn::Matrix &y_onehot)
+                             const nn::Matrix &x, const nn::Matrix &y_onehot,
+                             std::size_t eval_samples = 0)
 {
-    std::size_t N = x.cols();
+    const std::size_t N = (eval_samples > 0) ? std::min(x.cols(), eval_samples) : x.cols();
 
-    // Matrix → Tensor（一次性上传全量数据）
-    auto x_tensor_r = engine.from_matrix(x);
+    // 若截取子集，则拷贝前 N 列
+    nn::Matrix x_sub, y_sub;
+    if (N < x.cols())
+    {
+        x_sub = nn::Matrix(x.rows(), N);
+        y_sub = nn::Matrix(y_onehot.rows(), N);
+        for (std::size_t i = 0; i < N; ++i)
+        {
+            for (std::size_t r = 0; r < x.rows(); ++r)
+                x_sub.set_value_unchecked(r, i, x.at_unchecked(r, i));
+            for (std::size_t r = 0; r < y_onehot.rows(); ++r)
+                y_sub.set_value_unchecked(r, i, y_onehot.at_unchecked(r, i));
+        }
+    }
+    else
+    {
+        x_sub = nn::Matrix(x);  // 拷贝
+        y_sub = nn::Matrix(y_onehot);
+    }
+
+    auto x_tensor_r = engine.from_matrix(x_sub);
     if (!x_tensor_r) return std::unexpected(std::move(x_tensor_r).error());
+
+    // batch 模式加速 forward（GPU 下消除 per-primitive 提交开销）
+    auto bb = engine.begin_batch();
+    if (!bb) return std::unexpected(bb.error());
 
     auto out_tensor_r = model.forward(*x_tensor_r);
     if (!out_tensor_r) return std::unexpected(std::move(out_tensor_r).error());
+
+    auto eb = engine.end_batch();
+    if (!eb) return std::unexpected(eb.error());
 
     auto out_r = engine.to_matrix(*out_tensor_r);
     if (!out_r) return std::unexpected(std::move(out_r).error());
@@ -295,15 +415,29 @@ nn::Result<Scalar> evaluate(nn::Model &model, nn::ComputeEngine &engine,
     return static_cast<Scalar>(correct) / static_cast<Scalar>(N);
 }
 
+// ==================== 构建模型规格 ====================
+nn::ModelSpec build_spec(const TrainConfig &cfg)
+{
+    if (cfg.arch == ArchType::Transformer)
+    {
+        return nn::make_mnist_transformer_spec(
+            nn::MNIST_IMG_SIZE, cfg.patch_size,
+            cfg.d_model, cfg.num_heads, cfg.d_ff, cfg.num_layers);
+    }
+    // MLP
+    nn::ModelSpec spec;
+    spec.type = nn::ModelType::MLP;
+    spec.layer_dims = cfg.layer_dims.empty() ? nn::MNIST_LAYER_DIMS : cfg.layer_dims;
+    return spec;
+}
+
 // ==================== 主函数 ====================
 int main(int argc, char *argv[])
 {
     TrainConfig cfg = parse_args(argc, argv);
 
     // ── 构建规格 ─────────────────────────────────────────────
-    nn::ModelSpec spec;
-    spec.type = nn::ModelType::MLP;
-    spec.layer_dims = cfg.layer_dims.empty() ? nn::MNIST_LAYER_DIMS : cfg.layer_dims;
+    nn::ModelSpec spec = build_spec(cfg);
 
     // ── 如果 --resume，从文件读取规格覆盖 CLI 参数 ──────────
     if (cfg.load_existing)
@@ -313,19 +447,30 @@ int main(int argc, char *argv[])
         {
             if (spec_result->type == nn::ModelType::MLP)
             {
-                std::cout << "从模型文件读取规格\n";
+                std::cout << "从模型文件读取 MLP 规格\n";
                 spec = std::move(*spec_result);
+                cfg.arch = ArchType::MLP;
             }
-            else if (spec_result->type != nn::ModelType::Unknown)
+            else if (spec_result->is_transformer())
             {
-                std::cerr << "模型文件类型不是 MLP (type="
-                          << static_cast<uint32_t>(spec_result->type)
-                          << ")，新架构仅支持 MLP。\n";
-                return 1;
+                std::cout << "从模型文件读取 Transformer 规格\n";
+                spec = std::move(*spec_result);
+                cfg.arch = ArchType::Transformer;
+                cfg.patch_size = spec.patch_size != 0 ? spec.patch_size : nn::MNIST_PATCH_SIZE;
+                cfg.d_model = spec.d_model;
+                cfg.num_heads = spec.num_heads;
+                cfg.d_ff = spec.d_ff;
+                cfg.num_layers = spec.num_layers;
+            }
+            else if (spec_result->type == nn::ModelType::Unknown)
+            {
+                std::cout << "旧格式模型文件 (V1)，使用命令行参数 (--arch)\n";
             }
             else
             {
-                std::cout << "旧格式模型文件 (V1)，使用命令行参数\n";
+                std::cerr << "模型文件类型不支持 (type="
+                          << static_cast<uint32_t>(spec_result->type) << ")\n";
+                return 1;
             }
         }
         else
@@ -339,16 +484,34 @@ int main(int argc, char *argv[])
     std::cout << "========================================\n";
     std::cout << "  MNIST 手写数字训练 (引擎化架构)\n";
     std::cout << "========================================\n";
-    std::cout << "  网络: ";
-    for (std::size_t i = 0; i < spec.layer_dims.size(); ++i)
+    std::cout << "  架构: " << (cfg.arch == ArchType::Transformer ? "Transformer (ViT)" : "MLP") << "\n";
+
+    if (cfg.arch == ArchType::Transformer)
     {
-        std::cout << spec.layer_dims[i];
-        if (i < spec.layer_dims.size() - 2)
-            std::cout << "(LayerNorm+GeLU)";
-        if (i < spec.layer_dims.size() - 1)
-            std::cout << " -> ";
+        const std::size_t grid = nn::MNIST_IMG_SIZE / cfg.patch_size;
+        const std::size_t num_patches = grid * grid;
+        std::cout << "  Patch: " << nn::MNIST_IMG_SIZE << "/" << cfg.patch_size
+                  << " → " << grid << "×" << grid << "=" << num_patches << " patches\n";
+        std::cout << "  d_model: " << cfg.d_model
+                  << "  heads: " << cfg.num_heads
+                  << "  layers: " << cfg.num_layers
+                  << "  d_ff: " << cfg.d_ff << "\n";
     }
-    std::cout << "\n";
+    else
+    {
+        const auto &dims = spec.is_mlp() ? spec.layer_dims : nn::MNIST_LAYER_DIMS;
+        std::cout << "  网络: ";
+        for (std::size_t i = 0; i < dims.size(); ++i)
+        {
+            std::cout << dims[i];
+            if (i < dims.size() - 2)
+                std::cout << "(LayerNorm+GeLU)";
+            if (i < dims.size() - 1)
+                std::cout << " -> ";
+        }
+        std::cout << "\n";
+    }
+
     std::cout << "  优化器: " << cfg.optimizer_name << "  学习率: " << cfg.lr << "\n";
     std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
     std::cout << "  GPU: " << (cfg.gpu_enabled ? "启用" : "禁用") << "\n";
@@ -392,7 +555,7 @@ int main(int argc, char *argv[])
 
     // ── 加载数据 ─────────────────────────────────────────────
     std::cout << "加载数据: " << cfg.dataset_path << " ..." << std::endl;
-    auto csv_train_result = load_csv(cfg.dataset_path + "/train.csv");
+    auto csv_train_result = load_csv(cfg.dataset_path + "/train.csv", cfg.max_train_samples);
     if (!csv_train_result) { std::cerr << "Error: " << csv_train_result.error().message << '\n'; return 1; }
     auto [train_x, train_y] = std::move(*csv_train_result);
 
@@ -427,7 +590,8 @@ int main(int argc, char *argv[])
     // ── 训练 ─────────────────────────────────────────────────
     auto optimizer = nn::create_optimizer(
         cfg.optimizer_name, *engine,
-        model.parameters(), model.param_gradients(), cfg.lr);
+        model.parameters(), model.param_gradients(), cfg.lr,
+        cfg.weight_decay);
 
     nn::CrossEntropyLoss ce_loss;
     const std::size_t num_batches = train_x.cols() / cfg.batch_size;
@@ -483,6 +647,10 @@ int main(int argc, char *argv[])
                 return 1;
             }
 
+            // ── 批量录制：forward + loss + backward 录制到单一 command buffer ──
+            auto bb = engine->begin_batch();
+            if (!bb) { std::cerr << "\nbegin_batch failed: " << bb.error().message << '\n'; return 1; }
+
             // ── 前向 ──
             auto out_r = model.forward(*x_tensor_r);
             if (!out_r) {
@@ -505,6 +673,10 @@ int main(int argc, char *argv[])
 
             auto bwd_r = model.backward(*grad_r);
             if (!bwd_r) { std::cerr << "\nModel backward failed: " << bwd_r.error().message << '\n'; return 1; }
+
+            // ── 提交并等待所有录制的命令 ──
+            auto eb = engine->end_batch();
+            if (!eb) { std::cerr << "\nend_batch failed: " << eb.error().message << '\n'; return 1; }
 
             // ── 优化器 step + 梯度清零 ──
             auto step_result = optimizer->step();
@@ -536,8 +708,10 @@ int main(int argc, char *argv[])
         Scalar ep_sec = std::chrono::duration<Scalar>(ep_end - ep_start).count();
 
         Scalar avg_loss = total_loss / num_batches;
-        auto train_acc_r = evaluate(model, *engine, train_x, train_y);
-        auto test_acc_r  = evaluate(model, *engine, test_x, test_y);
+        // MLP 全量评估，Transformer 截取前 eval_samples 个样本评估
+        const std::size_t eval_n = (cfg.arch == ArchType::Transformer) ? cfg.eval_samples : 0;
+        auto train_acc_r = evaluate(model, *engine, train_x, train_y, eval_n);
+        auto test_acc_r  = evaluate(model, *engine, test_x, test_y, eval_n);
         if (!train_acc_r || !test_acc_r)
         {
             const auto &err = !train_acc_r ? train_acc_r.error() : test_acc_r.error();

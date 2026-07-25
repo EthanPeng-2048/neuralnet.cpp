@@ -3,9 +3,9 @@
 
 // ── domain_mnist.hpp — MNIST 领域构建层 ────────────────────────────────────
 //
-// 仅保留 MLP 构建（基于新引擎化架构）。
-// Transformer / GPT 等其他模型类型已移除（新架构仅提供 Linear/ReLU/GeLU/
-// LayerNorm 原语层，不支持 PatchEmbedding/TransformerEncoder/GPTModel）。
+// 基于（引擎化架构）提供两种模型构建：
+//   1. MLP           —— build_mnist_mlp_model
+//   2. Transformer   —— build_mnist_transformer_model（ViT 风格）
 //
 // 依赖：Model + ComputeEngine（model_container.hpp / compute_engine.hpp）
 // ─────────────────────────────────────────────────────────────────────────
@@ -25,6 +25,15 @@ namespace nn {
 // ── MNIST 常量 ──────────────────────────────────────────────────────────────
 inline constexpr std::size_t MNIST_INPUT_DIM = 784;
 inline constexpr std::size_t MNIST_NUM_CLASSES = 10;
+
+// ── MNIST Transformer (ViT) 默认超参数 ──────────────────────────────────────
+// 图像 28×28，patch_size=7 → 4×4=16 个 patch，patch_dim=49
+inline constexpr std::size_t MNIST_IMG_SIZE    = 28;
+inline constexpr std::size_t MNIST_PATCH_SIZE  = 7;
+inline constexpr std::size_t MNIST_TF_D_MODEL  = 64;
+inline constexpr std::size_t MNIST_TF_NUM_HEADS = 4;
+inline constexpr std::size_t MNIST_TF_D_FF     = 128;
+inline constexpr std::size_t MNIST_TF_NUM_LAYERS = 2;
 
 // ── 共享 CSV 行解析工具 ────────────────────────────────────────────────────
 // 解析单行 CSV（逗号分隔的浮点数）为 std::vector<Scalar>
@@ -95,17 +104,76 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
     return model;
 }
 
+// ── 构建 MNIST Transformer (ViT 风格) 模型 ──────────────────────────────────
+// 结构：PatchEmbedding → TransformerEncoder → Linear(分类头)
+//   PatchEmbedding: img 28×28 → 16 个 7×7 patch → Linear(49, d_model) 投影
+//   TransformerEncoder: PE + N×EncoderLayer + 全局平均池化
+//   Linear: d_model → 10（分类头）
+[[nodiscard]] inline Result<Model> build_mnist_transformer_model(
+    ComputeEngine& engine,
+    std::size_t img_size   = MNIST_IMG_SIZE,
+    std::size_t patch_size = MNIST_PATCH_SIZE,
+    std::size_t d_model    = MNIST_TF_D_MODEL,
+    std::size_t num_heads  = MNIST_TF_NUM_HEADS,
+    std::size_t d_ff       = MNIST_TF_D_FF,
+    std::size_t num_layers = MNIST_TF_NUM_LAYERS)
+{
+    if (img_size % patch_size != 0)
+        return std::unexpected(Error{"MNIST Transformer: img_size must be divisible by patch_size"});
+    if (d_model == 0 || num_heads == 0 || d_ff == 0 || num_layers == 0)
+        return std::unexpected(Error{"MNIST Transformer: parameters must be positive"});
+    if (d_model % num_heads != 0)
+        return std::unexpected(Error{"MNIST Transformer: d_model must be divisible by num_heads"});
+
+    const std::size_t grid_size  = img_size / patch_size;
+    const std::size_t num_patches = grid_size * grid_size;
+
+    Model model(engine);
+    model.add_patch_embedding(img_size, patch_size, d_model);
+    model.add_transformer_encoder(d_model, num_heads, d_ff, num_layers, num_patches);
+    model.add_linear(d_model, MNIST_NUM_CLASSES);
+    return model;
+}
+
+// ── 构造 MNIST Transformer ModelSpec ───────────────────────────────────────
+[[nodiscard]] inline ModelSpec make_mnist_transformer_spec(
+    std::size_t img_size   = MNIST_IMG_SIZE,
+    std::size_t patch_size = MNIST_PATCH_SIZE,
+    std::size_t d_model    = MNIST_TF_D_MODEL,
+    std::size_t num_heads  = MNIST_TF_NUM_HEADS,
+    std::size_t d_ff       = MNIST_TF_D_FF,
+    std::size_t num_layers = MNIST_TF_NUM_LAYERS)
+{
+    (void)img_size;  // img_size 固定为 MNIST_IMG_SIZE，不写入 spec
+    ModelSpec spec;
+    spec.type       = ModelType::Transformer;
+    spec.d_model    = d_model;
+    spec.num_heads  = num_heads;
+    spec.d_ff       = d_ff;
+    spec.num_layers = num_layers;
+    spec.patch_size = patch_size;
+    // vocab_size / seq_len 不用于 Transformer (MNIST ViT)
+    return spec;
+}
+
 // ── 从 ModelSpec 构建模型 ─────────────────────────────────────────────────
-// 用于从二进制文件加载时自动还原架构（仅支持 MLP）
+// 用于从二进制文件加载时自动还原架构（支持 MLP 和 Transformer）
 [[nodiscard]] inline Result<Model> build_mnist_model_from_spec(
     ComputeEngine& engine, const ModelSpec &spec)
 {
     if (spec.is_mlp())
         return build_mnist_mlp_model(engine, spec.layer_dims);
 
+    if (spec.is_transformer())
+    {
+        const std::size_t patch_size = spec.patch_size != 0 ? spec.patch_size : MNIST_PATCH_SIZE;
+        return build_mnist_transformer_model(
+            engine, MNIST_IMG_SIZE, patch_size,
+            spec.d_model, spec.num_heads, spec.d_ff, spec.num_layers);
+    }
+
     return std::unexpected(Error{
-        "Invalid ModelSpec type for MNIST: expected MLP "
-        "(Transformer/GPT not supported by engine-based architecture)"});
+        "Invalid ModelSpec type for MNIST: expected MLP or Transformer"});
 }
 
 } // namespace nn
