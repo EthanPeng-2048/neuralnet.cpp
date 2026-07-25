@@ -1307,18 +1307,23 @@ public:
         input_cache_ = input;
         const std::size_t batch = input.cols();
 
-        // Step 1: CPU 端提取 patches → (patch_dim, num_patches × batch)
+        // Step 1: CPU 端提取 patches，直接生成 batch-major 列布局
+        //   all_patches[flat, b * num_patches + p] = image_b[pixel(flat, p)]
+        //   样本 b 占连续列块 [b*num_patches, (b+1)*num_patches)，
+        //   便于下游 MHA 的 rearrange_3d 按 batch 切分列块。
+        // （patch 提取是 PatchEmbedding 的算法职责，无对应 op-level 原语；
+        //  此处为 batch 边界的合法 CPU 预处理，与 GPTModel 的 gather_rows 同性质）
         auto in_m = engine.to_matrix(input);
         if (!in_m) return std::unexpected(in_m.error());
 
-        Matrix all_patches(patch_dim_, num_patches_ * batch);
+        Matrix all_patches(patch_dim_, batch * num_patches_);
         for (std::size_t b = 0; b < batch; ++b)
         {
             for (std::size_t p = 0; p < num_patches_; ++p)
             {
                 const std::size_t gr = (p / grid_size_) * patch_size_;
                 const std::size_t gc = (p % grid_size_) * patch_size_;
-                const std::size_t col_idx = p * batch + b;
+                const std::size_t col_idx = b * num_patches_ + p;  // batch-major
                 for (std::size_t pr = 0; pr < patch_size_; ++pr)
                     for (std::size_t pc = 0; pc < patch_size_; ++pc)
                     {
@@ -1333,53 +1338,21 @@ public:
         auto ap_t = engine.from_matrix(all_patches);
         if (!ap_t) return std::unexpected(ap_t.error());
 
-        // Step 2: 投影 → (d_model, num_patches × batch)
-        auto proj = projection_.forward(engine, *ap_t);
-        if (!proj) return proj;
-
-        // Step 3: 重排为 (d_model, batch * num_patches) — batch-major 列布局
-        //   output[r, b * num_patches + p] = proj[r, p * batch + b]
-        //   样本 b 占连续列块 [b*num_patches, (b+1)*num_patches)，
-        //   便于下游 MHA 的 rearrange_3d 按 batch 切分列块。
-        auto proj_m = engine.to_matrix(*proj);
-        if (!proj_m) return std::unexpected(proj_m.error());
-
-        Matrix output(d_model_, batch * num_patches_);
-        for (std::size_t b = 0; b < batch; ++b)
-            for (std::size_t p = 0; p < num_patches_; ++p)
-                for (std::size_t r = 0; r < d_model_; ++r)
-                    output.set_value_unchecked(r, b * num_patches_ + p,
-                        proj_m->at_unchecked(r, p * batch + b));
-
-        return engine.from_matrix(output);
+        // Step 2: 投影 → (d_model, batch * num_patches) — 已是 batch-major，无需重排
+        return projection_.forward(engine, *ap_t);
     }
 
     [[nodiscard]] Result<Tensor> backward(
         ComputeEngine& engine, const Tensor& grad_output) override
     {
-        // grad_output: (d_model, batch * num_patches)
+        // grad_output: (d_model, batch * num_patches) — batch-major
         const std::size_t batch = grad_output.cols() / num_patches_;
 
-        // Step 1: 重排梯度 → (d_model, num_patches × batch)
-        //   grad_projected[r, p * batch + b] = grad_output[r, b * num_patches + p]
-        auto go_m = engine.to_matrix(grad_output);
-        if (!go_m) return std::unexpected(go_m.error());
-
-        Matrix grad_projected(d_model_, num_patches_ * batch);
-        for (std::size_t b = 0; b < batch; ++b)
-            for (std::size_t p = 0; p < num_patches_; ++p)
-                for (std::size_t r = 0; r < d_model_; ++r)
-                    grad_projected.set_value_unchecked(r, p * batch + b,
-                        go_m->at_unchecked(r, b * num_patches_ + p));
-
-        auto gp_t = engine.from_matrix(grad_projected);
-        if (!gp_t) return std::unexpected(gp_t.error());
-
-        // Step 2: 投影层反向 → (patch_dim, num_patches × batch)
-        auto bp = projection_.backward(engine, *gp_t);
+        // Step 1: 投影层反向 → (patch_dim, batch * num_patches) — batch-major
+        auto bp = projection_.backward(engine, grad_output);
         if (!bp) return bp;
 
-        // Step 3: 散射梯度回输入 → (img_size², batch)
+        // Step 2: 散射梯度回输入 → (img_size², batch)
         auto gp_m = engine.to_matrix(*bp);
         if (!gp_m) return std::unexpected(gp_m.error());
 
@@ -1390,7 +1363,7 @@ public:
             {
                 const std::size_t gr = (p / grid_size_) * patch_size_;
                 const std::size_t gc = (p % grid_size_) * patch_size_;
-                const std::size_t col_idx = p * batch + b;
+                const std::size_t col_idx = b * num_patches_ + p;  // batch-major
                 for (std::size_t pr = 0; pr < patch_size_; ++pr)
                     for (std::size_t pc = 0; pc < patch_size_; ++pc)
                     {
@@ -1407,19 +1380,33 @@ public:
 };
 
 // ══════════════════════════════════════════════════════════════════════════
-// CausalSelfAttention — 因果自注意力（batched_matmul 消除 per-head 循环）
+// CausalSelfAttention — 因果自注意力（全批量化：消除 per-head 和 per-sample 循环）
 //
 // 算法（只在此处，不在 Engine/Shader）：
-//   与 MultiHeadAttention 相同（batched_matmul 批量化），但在 softmax 前施加
-//   上三角 -inf 掩码：mask[i][j] = 0 if j<=i, -inf if j>i
-//   掩码按 head 平铺为 (H*seq, seq) 以匹配堆叠的 scores 布局。
-//   反向与 MHA 相同（掩码为常数，梯度直接穿透）。
+//   与 MultiHeadAttention 相同的批量化策略（rearrange_3d + batched_matmul），
+//   但在 softmax 前施加上三角 -inf 因果掩码：mask[i][j] = 0 if j<=i, -inf if j>i
+//
+//   输入: (d_model, batch * seq_len) — batch-major 列布局
+//   Q/K/V: (H*d_k, batch*seq) — 头维度在行方向，batch 在列方向
+//   Q_re = rearrange_3d(Q, H*d_k, batch, seq) → (batch*H*d_k, seq)
+//   S = batched_matmul(Q_re, K_re, batch*H, transA=true) → (batch*H*seq, seq)
+//   S *= scale
+//   S += mask (batch*H*seq, seq) — 因果掩码按 batch*H 平铺
+//   A = softmax(S)
+//   O_re = batched_matmul(V_re, A, batch*H) → (batch*H*d_k, seq)
+//   O = rearrange_3d(O_re, H*d_k, batch, seq, inverse=true) → (H*d_k, batch*seq)
+//   out = W_o × O
+//
+//   seq_len 由构造函数指定，batch = input.cols() / seq_len 在 forward 时推断。
+//   seq_len=0 表示单样本模式（cols 即 seq），保持向后兼容。
 // ══════════════════════════════════════════════════════════════════════════
 class CausalSelfAttention final : public Layer
 {
 private:
     std::size_t d_model_;
     std::size_t num_heads_;
+    std::size_t d_k_;
+    std::size_t seq_len_;   // 单样本序列长度（0 = 单样本，cols 即 seq）
     Scalar scale_;
 
     Linear w_q_;
@@ -1428,21 +1415,25 @@ private:
     Linear w_o_;
     Softmax softmax_;
 
-    Tensor Q_cache_, K_cache_, V_cache_;
-    Tensor attn_cache_;  // softmax 输出 A: (H*seq, seq)
+    // forward 缓存（rearranged 版本，供 backward 直接使用）
+    Tensor Q_cache_, K_cache_, V_cache_;  // (batch*H*d_k, seq) rearranged
+    Tensor attn_cache_;                    // (batch*H*seq, seq)
 
-    // 因果掩码（平铺为 H*seq × seq 以匹配堆叠 scores 布局）
+    // 因果掩码（平铺为 batch*H*seq × seq 以匹配堆叠 scores 布局）
     Tensor mask_cache_;
-    std::size_t mask_cached_seq_len_ = 0;
+    std::size_t mask_cached_key_ = 0;  // 编码 (batch << 16) | seq_len
 
-    void ensure_mask(ComputeEngine& engine, std::size_t seq_len)
+    void ensure_mask(ComputeEngine& engine, std::size_t batch, std::size_t seq_len)
     {
-        if (mask_cached_seq_len_ == seq_len) return;
+        // 用 (batch, seq_len) 组合作为缓存键
+        const std::size_t key = (batch << 16) | seq_len;
+        if (mask_cached_key_ == key) return;
 
         const Scalar neg_inf = -std::numeric_limits<Scalar>::infinity();
-        // 平铺掩码: (num_heads * seq_len, seq_len)，每个 head 一份相同的 (seq, seq) 掩码
-        Matrix mask(num_heads_ * seq_len, seq_len);
-        for (std::size_t h = 0; h < num_heads_; ++h)
+        const std::size_t BH = batch * num_heads_;
+        // 平铺掩码: (BH * seq_len, seq_len)，每个 head 一份相同的 (seq, seq) 掩码
+        Matrix mask(BH * seq_len, seq_len);
+        for (std::size_t h = 0; h < BH; ++h)
             for (std::size_t i = 0; i < seq_len; ++i)
                 for (std::size_t j = 0; j < seq_len; ++j)
                     mask.set_value_unchecked(h * seq_len + i, j,
@@ -1450,14 +1441,17 @@ private:
         auto r = engine.from_matrix(mask);
         NN_ASSERT(r, r ? "" : r.error().message.c_str());
         mask_cache_ = std::move(*r);
-        mask_cached_seq_len_ = seq_len;
+        mask_cached_key_ = key;
     }
 
 public:
     CausalSelfAttention(ComputeEngine& engine,
                        std::size_t d_model, std::size_t num_heads,
-                       std::size_t /*max_len*/ = 1024)
+                       std::size_t /*max_len*/ = 1024,
+                       std::size_t seq_len = 0)
         : d_model_(d_model), num_heads_(num_heads),
+          d_k_(d_model / num_heads),
+          seq_len_(seq_len),
           scale_(Scalar{1} / std::sqrt(static_cast<Scalar>(d_model / num_heads))),
           w_q_(engine, d_model, d_model),
           w_k_(engine, d_model, d_model),
@@ -1498,94 +1492,173 @@ public:
         if (input.rows() != d_model_)
             return std::unexpected(Error{"CausalSelfAttention forward: input shape mismatch"});
 
-        const std::size_t seq_len = input.cols();
-        ensure_mask(engine, seq_len);
+        const std::size_t total_seq = input.cols();
+        const std::size_t seq   = (seq_len_ > 0) ? seq_len_ : total_seq;
+        const std::size_t batch = (seq_len_ > 0) ? (total_seq / seq_len_) : 1;
+        if (total_seq != batch * seq)
+            return std::unexpected(Error{"CausalSelfAttention forward: cols not divisible by seq_len"});
 
-        // 1. 线性投影 → Q/K/V: (d_model, seq) = (H*d_k, seq)
+        ensure_mask(engine, batch, seq);
+
+        // 1. 线性投影 → Q/K/V: (H*d_k, batch*seq)
         auto q_res = w_q_.forward(engine, input);
         if (!q_res) return q_res;
-        Q_cache_ = *q_res;
         auto k_res = w_k_.forward(engine, input);
         if (!k_res) return k_res;
-        K_cache_ = *k_res;
         auto v_res = w_v_.forward(engine, input);
         if (!v_res) return v_res;
-        V_cache_ = *v_res;
 
-        // 2. S = batched_matmul(Q, K, H, transA=true, transB=false) → (H*seq, seq)
+        // 2. rearrange: (H*d_k, batch*seq) → (batch*H*d_k, seq)
+        //    使 batched_matmul 能按 batch*H 切分行块
+        const std::size_t H_dk = num_heads_ * d_k_;
+        if (batch > 1)
+        {
+            auto qr = engine.rearrange_3d(*q_res, H_dk, batch, seq, false);
+            if (!qr) return std::unexpected(qr.error());
+            Q_cache_ = std::move(*qr);
+            auto kr = engine.rearrange_3d(*k_res, H_dk, batch, seq, false);
+            if (!kr) return std::unexpected(kr.error());
+            K_cache_ = std::move(*kr);
+            auto vr = engine.rearrange_3d(*v_res, H_dk, batch, seq, false);
+            if (!vr) return std::unexpected(vr.error());
+            V_cache_ = std::move(*vr);
+        }
+        else
+        {
+            // batch=1: rearrange 是恒等拷贝，跳过
+            Q_cache_ = std::move(*q_res);
+            K_cache_ = std::move(*k_res);
+            V_cache_ = std::move(*v_res);
+        }
+
+        // 3. S = batched_matmul(Q_re, K_re, batch*H, transA=true) → (batch*H*seq, seq)
+        const std::size_t BH = batch * num_heads_;
         auto scores = engine.batched_matmul(
-            Q_cache_, K_cache_, num_heads_, true, false);
+            Q_cache_, K_cache_, BH, true, false);
         if (!scores) return std::unexpected(scores.error());
 
-        // 3. S *= scale（掩码值为 0/-inf，缩放不影响）
+        // 4. S *= scale（掩码值为 0/-inf，缩放不影响）
         auto r = engine.scale_inplace(*scores, scale_);
         if (!r) return std::unexpected(r.error());
 
-        // 4. 施加因果掩码 S += mask（平铺为 H*seq × seq）
+        // 5. 施加因果掩码 S += mask (batch*H*seq, seq)
         auto masked = engine.elementwise_binary(BinaryOp::Add, *scores, mask_cache_);
         if (!masked) return std::unexpected(masked.error());
 
-        // 5. A = softmax(S_masked)
+        // 6. A = softmax(S_masked)
         auto attn = softmax_.forward(engine, *masked);
         if (!attn) return std::unexpected(attn.error());
         attn_cache_ = *attn;
 
-        // 6. O = batched_matmul(V, A, H, false, false) → (H*d_k, seq)
+        // 7. O_re = batched_matmul(V_re, A, batch*H) → (batch*H*d_k, seq)
         auto concat_out = engine.batched_matmul(
-            V_cache_, attn_cache_, num_heads_, false, false);
+            V_cache_, attn_cache_, BH, false, false);
         if (!concat_out) return std::unexpected(concat_out.error());
 
-        // 7. 输出投影
-        return w_o_.forward(engine, *concat_out);
+        // 8. rearrange back: (batch*H*d_k, seq) → (H*d_k, batch*seq)
+        Tensor concat;
+        if (batch > 1)
+        {
+            auto cb = engine.rearrange_3d(*concat_out, H_dk, batch, seq, true);
+            if (!cb) return std::unexpected(cb.error());
+            concat = std::move(*cb);
+        }
+        else
+        {
+            concat = std::move(*concat_out);
+        }
+
+        // 9. 输出投影
+        return w_o_.forward(engine, concat);
     }
 
     [[nodiscard]] Result<Tensor> backward(
         ComputeEngine& engine, const Tensor& grad_output) override
     {
-        // 1. 输出投影反向 → grad_concat: (d_model, seq) = (H*d_k, seq)
+        // 推断 batch/seq（与 forward 一致）
+        const std::size_t total_seq = grad_output.cols();
+        const std::size_t seq   = (seq_len_ > 0) ? seq_len_ : total_seq;
+        const std::size_t batch = (seq_len_ > 0) ? (total_seq / seq_len_) : 1;
+        const std::size_t H_dk = num_heads_ * d_k_;
+        const std::size_t BH = batch * num_heads_;
+
+        // 1. 输出投影反向 → grad_concat: (H*d_k, batch*seq)
         auto gc = w_o_.backward(engine, grad_output);
         if (!gc) return gc;
-        const Tensor& grad_concat = *gc;
 
-        // 2. grad_V_all = batched_matmul(grad_concat, A, H, false, true) → (H*d_k, seq)
-        auto grad_V_all = engine.batched_matmul(
-            grad_concat, attn_cache_, num_heads_, false, true);
-        if (!grad_V_all) return std::unexpected(grad_V_all.error());
+        // 2. rearrange grad_concat → (batch*H*d_k, seq)
+        Tensor grad_concat_re;
+        if (batch > 1)
+        {
+            auto gcr = engine.rearrange_3d(*gc, H_dk, batch, seq, false);
+            if (!gcr) return std::unexpected(gcr.error());
+            grad_concat_re = std::move(*gcr);
+        }
+        else
+        {
+            grad_concat_re = std::move(*gc);
+        }
 
-        // 3. grad_A = batched_matmul(V, grad_concat, H, true, false) → (H*seq, seq)
+        // 3. grad_V_re = batched_matmul(grad_concat, A, BH, false, true)
+        auto grad_V_re = engine.batched_matmul(
+            grad_concat_re, attn_cache_, BH, false, true);
+        if (!grad_V_re) return std::unexpected(grad_V_re.error());
+
+        // 4. grad_A = batched_matmul(V, grad_concat, BH, true, false)
         auto grad_A = engine.batched_matmul(
-            V_cache_, grad_concat, num_heads_, true, false);
+            V_cache_, grad_concat_re, BH, true, false);
         if (!grad_A) return std::unexpected(grad_A.error());
 
-        // 4. grad_S = softmax.backward(grad_A) — 掩码为常数，梯度直接穿透
+        // 5. grad_S = softmax.backward(grad_A) — 掩码为常数，梯度直接穿透
         auto grad_S = softmax_.backward(engine, *grad_A);
         if (!grad_S) return std::unexpected(grad_S.error());
 
-        // 5. grad_Q_all = batched_matmul(K, grad_S, H, false, true) × scale
-        auto grad_Q_all = engine.batched_matmul(
-            K_cache_, *grad_S, num_heads_, false, true);
-        if (!grad_Q_all) return std::unexpected(grad_Q_all.error());
-        auto rq = engine.scale_inplace(*grad_Q_all, scale_);
+        // 6. grad_Q_re = batched_matmul(K, grad_S, BH, false, true) × scale
+        auto grad_Q_re = engine.batched_matmul(
+            K_cache_, *grad_S, BH, false, true);
+        if (!grad_Q_re) return std::unexpected(grad_Q_re.error());
+        auto rq = engine.scale_inplace(*grad_Q_re, scale_);
         if (!rq) return std::unexpected(rq.error());
 
-        // 6. grad_K_all = batched_matmul(Q, grad_S, H, false, false) × scale
-        auto grad_K_all = engine.batched_matmul(
-            Q_cache_, *grad_S, num_heads_, false, false);
-        if (!grad_K_all) return std::unexpected(grad_K_all.error());
-        auto rk = engine.scale_inplace(*grad_K_all, scale_);
+        // 7. grad_K_re = batched_matmul(Q, grad_S, BH, false, false) × scale
+        auto grad_K_re = engine.batched_matmul(
+            Q_cache_, *grad_S, BH, false, false);
+        if (!grad_K_re) return std::unexpected(grad_K_re.error());
+        auto rk = engine.scale_inplace(*grad_K_re, scale_);
         if (!rk) return std::unexpected(rk.error());
 
-        // 7. 投影层反向 + 累加输入梯度
-        auto giq = w_q_.backward(engine, *grad_Q_all);
+        // 8. rearrange back: (batch*H*d_k, seq) → (H*d_k, batch*seq)
+        Tensor grad_Q, grad_K, grad_V;
+        if (batch > 1)
+        {
+            auto gq = engine.rearrange_3d(*grad_Q_re, H_dk, batch, seq, true);
+            if (!gq) return std::unexpected(gq.error());
+            grad_Q = std::move(*gq);
+            auto gk = engine.rearrange_3d(*grad_K_re, H_dk, batch, seq, true);
+            if (!gk) return std::unexpected(gk.error());
+            grad_K = std::move(*gk);
+            auto gv = engine.rearrange_3d(*grad_V_re, H_dk, batch, seq, true);
+            if (!gv) return std::unexpected(gv.error());
+            grad_V = std::move(*gv);
+        }
+        else
+        {
+            grad_Q = std::move(*grad_Q_re);
+            grad_K = std::move(*grad_K_re);
+            grad_V = std::move(*grad_V_re);
+        }
+
+        // 9. 投影层反向 + 累加输入梯度
+        auto giq = w_q_.backward(engine, grad_Q);
         if (!giq) return giq;
         Tensor grad_input = std::move(*giq);
 
-        auto gik = w_k_.backward(engine, *grad_K_all);
+        auto gik = w_k_.backward(engine, grad_K);
         if (!gik) return gik;
         auto r1 = engine.add_inplace(grad_input, *gik);
         if (!r1) return std::unexpected(r1.error());
 
-        auto giv = w_v_.backward(engine, *grad_V_all);
+        auto giv = w_v_.backward(engine, grad_V);
         if (!giv) return giv;
         auto r2 = engine.add_inplace(grad_input, *giv);
         if (!r2) return std::unexpected(r2.error());
@@ -1615,8 +1688,9 @@ private:
 public:
     GPTBlock(ComputeEngine& engine,
              std::size_t d_model, std::size_t num_heads,
-             std::size_t d_ff, std::size_t max_len = 1024)
-        : self_attn_(engine, d_model, num_heads, max_len),
+             std::size_t d_ff, std::size_t max_len = 1024,
+             std::size_t seq_len = 0)
+        : self_attn_(engine, d_model, num_heads, max_len, seq_len),
           norm1_(engine, d_model),
           ff_(engine, d_model, d_ff),
           norm2_(engine, d_model) {}
@@ -1719,8 +1793,8 @@ private:
     Linear lm_head_;
 
     // 反向缓存
-    std::vector<Tensor> stored_inputs_;
-    std::vector<std::vector<std::size_t>> stored_tokens_;
+    Tensor stored_x_;                      // forward 输入 (d_model, seq*batch)
+    std::vector<std::size_t> stored_tokens_flat_;  // 所有 token IDs (seq*batch)
     std::size_t batch_size_ = 0;
 
 public:
@@ -1754,8 +1828,9 @@ public:
         { auto r1 = engine.zero(grad_token_emb_); NN_ASSERT(r1, r1 ? "" : r1.error().message.c_str()); }
         { auto r2 = engine.zero(grad_pos_emb_);    NN_ASSERT(r2, r2 ? "" : r2.error().message.c_str()); }
 
+        // GPTBlock 传入 seq_len，启用 CausalSelfAttention 批量化路径
         for (std::size_t i = 0; i < num_layers; ++i)
-            blocks_.emplace_back(engine, d_model, num_heads, d_ff, seq_len);
+            blocks_.emplace_back(engine, d_model, num_heads, d_ff, seq_len, seq_len);
     }
 
     std::vector<Tensor*> parameters() override
@@ -1797,165 +1872,144 @@ public:
     {
         const std::size_t seq_len = input.rows();
         batch_size_ = input.cols();
-        stored_inputs_.assign(batch_size_, Tensor{});
-        stored_tokens_.assign(batch_size_, {});
+        const std::size_t total = seq_len * batch_size_;
 
-        // 下载 input 以读取 token IDs
+        // ── 1. gather 所有 token 的 embedding ──
+        // input: (seq, batch) 标量 token IDs（row-major: i = t * batch + b）
+        // gather_rows(token_emb_, input) → (seq*batch, d_model)
+        //   row i = token_emb[input[i]], i 是 input 的 row-major 索引
+        auto all_emb = engine.gather_rows(token_emb_, input);
+        if (!all_emb) return std::unexpected(all_emb.error());
+
+        // ── 2. 下载 input 记录 token IDs（供 backward 的 scatter_add_rows） ──
         auto in_m = engine.to_matrix(input);
         if (!in_m) return std::unexpected(in_m.error());
+        const auto in_span = in_m->span();
+        stored_tokens_flat_.resize(total);
+        for (std::size_t i = 0; i < total; ++i)
+        {
+            auto tid = static_cast<std::size_t>(in_span[i]);
+            if (tid >= vocab_size_)
+                return std::unexpected(Error{
+                    "GPTModel::forward token id out of range: " +
+                    std::to_string(tid)});
+            stored_tokens_flat_[i] = tid;
+        }
 
-        // 下载嵌入矩阵
-        auto te_m = engine.to_matrix(token_emb_);
-        if (!te_m) return std::unexpected(te_m.error());
+        // ── 3. 构造 x: (d_model, seq*batch) batch-major 列布局 ──
+        //   x[d, t*batch+b] = all_emb[t*batch+b, d] + pos_emb[t, d]
+        //   （batch 边界 CPU 预处理：gather_rows 输出 row-major，需转置为列布局
+        //    并加上 pos_emb；与 PatchEmbedding 的 patch 提取同性质）
+        auto all_m = engine.to_matrix(*all_emb);
+        if (!all_m) return std::unexpected(all_m.error());
         auto pe_m = engine.to_matrix(pos_emb_);
         if (!pe_m) return std::unexpected(pe_m.error());
 
-        // 输出: (vocab_size, seq_len × batch)
-        Matrix output(vocab_size_, seq_len * batch_size_);
-
-        for (std::size_t b = 0; b < batch_size_; ++b)
-        {
-            stored_tokens_[b].reserve(seq_len);
-
-            // 1. Token 嵌入 + 位置嵌入 → (d_model, seq_len)
-            Matrix x(d_model_, seq_len);
-            for (std::size_t t = 0; t < seq_len; ++t)
+        Matrix x_cpu(d_model_, total);
+        for (std::size_t t = 0; t < seq_len; ++t)
+            for (std::size_t b = 0; b < batch_size_; ++b)
             {
-                auto tid = static_cast<std::size_t>(in_m->at_unchecked(t, b));
-                if (tid >= vocab_size_)
-                    return std::unexpected(Error{
-                        "GPTModel::forward token id out of range: " +
-                        std::to_string(tid)});
-                stored_tokens_[b].push_back(tid);
-
+                const std::size_t idx = t * batch_size_ + b;  // 同时是 all_emb 行和 x 列
                 for (std::size_t d = 0; d < d_model_; ++d)
-                    x.set_value_unchecked(d, t,
-                        te_m->at_unchecked(tid, d) +
+                    x_cpu.set_value_unchecked(d, idx,
+                        all_m->at_unchecked(idx, d) +
                         pe_m->at_unchecked(t, d));
             }
 
-            auto x_t = engine.from_matrix(x);
-            if (!x_t) return std::unexpected(x_t.error());
-            Tensor xt = std::move(*x_t);
-            stored_inputs_[b] = xt;
+        auto x_t = engine.from_matrix(x_cpu);
+        if (!x_t) return std::unexpected(x_t.error());
+        stored_x_ = *x_t;  // 缓存供 backward（GPTBlock 内部也有自己的缓存）
 
-            // 2. 通过 Transformer 块
-            for (auto& blk : blocks_)
-            {
-                auto r = blk.forward(engine, xt);
-                if (!r) return r;
-                xt = std::move(*r);
-            }
-
-            // 3. 最终 LayerNorm
-            auto ln = ln_f_.forward(engine, xt);
-            if (!ln) return ln;
-            xt = std::move(*ln);
-
-            // 4. LM Head → (vocab_size, seq_len)
-            auto lm = lm_head_.forward(engine, xt);
-            if (!lm) return lm;
-
-            // 5. 写入输出列 [t * batch + b]
-            auto lm_m = engine.to_matrix(*lm);
-            if (!lm_m) return std::unexpected(lm_m.error());
-            for (std::size_t r = 0; r < vocab_size_; ++r)
-                for (std::size_t t = 0; t < seq_len; ++t)
-                    output.set_value_unchecked(r, t * batch_size_ + b,
-                        lm_m->at_unchecked(r, t));
+        // ── 4. 通过 Transformer 块（全批量化，无 per-sample 循环） ──
+        Tensor x = std::move(*x_t);
+        for (auto& blk : blocks_)
+        {
+            auto r = blk.forward(engine, x);
+            if (!r) return r;
+            x = std::move(*r);
         }
 
-        return engine.from_matrix(output);
+        // ── 5. 最终 LayerNorm ──
+        auto ln = ln_f_.forward(engine, x);
+        if (!ln) return ln;
+        x = std::move(*ln);
+
+        // ── 6. LM Head → (vocab_size, seq*batch) batch-major ──
+        return lm_head_.forward(engine, x);
     }
 
     [[nodiscard]] Result<Tensor> backward(
         ComputeEngine& engine, const Tensor& grad_output) override
     {
         const std::size_t seq_len = seq_len_;
+        const std::size_t total = batch_size_ * seq_len;
+
         (void)engine.zero(grad_token_emb_);
         (void)engine.zero(grad_pos_emb_);
 
-        // 下载 grad_output, token_emb_, pos_emb_ 梯度矩阵到 CPU
-        auto go_m = engine.to_matrix(grad_output);
-        if (!go_m) return std::unexpected(go_m.error());
-        auto gte_m = engine.to_matrix(grad_token_emb_);
-        if (!gte_m) return std::unexpected(gte_m.error());
-        auto gpe_m = engine.to_matrix(grad_pos_emb_);
-        if (!gpe_m) return std::unexpected(gpe_m.error());
+        // ── 1. LM Head 反向 → (d_model, seq*batch) ──
+        auto b_lm = lm_head_.backward(engine, grad_output);
+        if (!b_lm) return b_lm;
+        Tensor grad_x = std::move(*b_lm);
 
-        // grad_input (token IDs 无梯度，仅用于接口一致性)
-        Matrix grad_input(seq_len, batch_size_);
+        // ── 2. LayerNorm 反向 ──
+        auto b_ln = ln_f_.backward(engine, grad_x);
+        if (!b_ln) return b_ln;
+        grad_x = std::move(*b_ln);
 
-        for (std::size_t b = 0; b < batch_size_; ++b)
+        // ── 3. 逐块反向（全批量化） ──
+        for (auto it = blocks_.rbegin(); it != blocks_.rend(); ++it)
         {
-            // 提取该样本的梯度: (vocab_size, seq_len)
-            Matrix grad_logits(vocab_size_, seq_len);
-            for (std::size_t r = 0; r < vocab_size_; ++r)
-                for (std::size_t t = 0; t < seq_len; ++t)
-                    grad_logits.set_value_unchecked(r, t,
-                        go_m->at_unchecked(r, t * batch_size_ + b));
-
-            auto gl_t = engine.from_matrix(grad_logits);
-            if (!gl_t) return std::unexpected(gl_t.error());
-            Tensor grad_l = std::move(*gl_t);
-
-            // Re-forward 重建缓存
-            Tensor x = stored_inputs_[b];
-            for (auto& blk : blocks_)
-            {
-                auto r = blk.forward(engine, x);
-                if (!r) return r;
-                x = std::move(*r);
-            }
-            auto ln = ln_f_.forward(engine, x);
-            if (!ln) return ln;
-            x = std::move(*ln);
-
-            // LM Head 反向 → (d_model, seq_len)
-            auto b_lm = lm_head_.backward(engine, grad_l);
-            if (!b_lm) return b_lm;
-            Tensor grad_ln = std::move(*b_lm);
-
-            // LayerNorm 反向
-            auto b_ln = ln_f_.backward(engine, grad_ln);
-            if (!b_ln) return b_ln;
-            grad_ln = std::move(*b_ln);
-
-            // 逐块反向
-            for (auto it = blocks_.rbegin(); it != blocks_.rend(); ++it)
-            {
-                auto br = it->backward(engine, grad_ln);
-                if (!br) return br;
-                grad_ln = std::move(*br);
-            }
-
-            // 下载 grad_ln 到 CPU 以累加嵌入梯度
-            auto gl_m = engine.to_matrix(grad_ln);
-            if (!gl_m) return std::unexpected(gl_m.error());
-
-            const auto& tokens = stored_tokens_[b];
-            for (std::size_t t = 0; t < seq_len; ++t)
-            {
-                const std::size_t tid = tokens[t];
-                for (std::size_t d = 0; d < d_model_; ++d)
-                {
-                    gte_m->set_value_unchecked(tid, d,
-                        gte_m->at_unchecked(tid, d) + gl_m->at_unchecked(d, t));
-                    gpe_m->set_value_unchecked(t, d,
-                        gpe_m->at_unchecked(t, d) + gl_m->at_unchecked(d, t));
-                }
-                grad_input.set_value_unchecked(t, b, Scalar{0});
-            }
+            auto br = it->backward(engine, grad_x);
+            if (!br) return br;
+            grad_x = std::move(*br);
         }
 
-        // 上传嵌入梯度回 GPU
-        auto gte_t = engine.from_matrix(*gte_m);
-        if (!gte_t) return std::unexpected(gte_t.error());
-        grad_token_emb_ = std::move(*gte_t);
-        auto gpe_t = engine.from_matrix(*gpe_m);
-        if (!gpe_t) return std::unexpected(gpe_t.error());
-        grad_pos_emb_ = std::move(*gpe_t);
+        // ── 4. 提取 grad_x 并准备 scatter_add_rows ──
+        //   grad_x: (d_model, seq*batch) — col t*batch+b = grad w.r.t. x[:, t*batch+b]
+        //   需要:
+        //     indices_flat: (total, 1) — 所有 token IDs（与 forward 顺序一致）
+        //     grad_flat: (total, d_model) — row i = grad_x[:, i]
+        //     pos_grad: (seq, d_model) — pos_grad[t, d] = Σ_b grad_x[d, t*batch+b]
+        auto gx_m = engine.to_matrix(grad_x);
+        if (!gx_m) return std::unexpected(gx_m.error());
 
+        Matrix indices_flat(total, 1);
+        Matrix grad_flat(total, d_model_);
+        Matrix pos_grad(seq_len, d_model_);
+
+        for (std::size_t t = 0; t < seq_len; ++t)
+            for (std::size_t b = 0; b < batch_size_; ++b)
+            {
+                const std::size_t idx = t * batch_size_ + b;  // 与 forward 一致
+                indices_flat.set_value_unchecked(idx, 0,
+                    static_cast<Scalar>(stored_tokens_flat_[idx]));
+                for (std::size_t d = 0; d < d_model_; ++d)
+                {
+                    const Scalar v = gx_m->at_unchecked(d, idx);
+                    grad_flat.set_value_unchecked(idx, d, v);
+                    // pos_emb 梯度：所有 batch 共享同一个 pos_emb[t]
+                    pos_grad.set_value_unchecked(t, d,
+                        pos_grad.at_unchecked(t, d) + v);
+                }
+            }
+
+        // ── 5. scatter_add_rows: grad_token_emb_[tokens] += grad_x ──
+        auto idx_t = engine.from_matrix(indices_flat);
+        if (!idx_t) return std::unexpected(idx_t.error());
+        auto grad_t = engine.from_matrix(grad_flat);
+        if (!grad_t) return std::unexpected(grad_t.error());
+        auto sr = engine.scatter_add_rows(grad_token_emb_, *idx_t, *grad_t);
+        if (!sr) return std::unexpected(sr.error());
+
+        // ── 6. add pos_grad ──
+        auto pg_t = engine.from_matrix(pos_grad);
+        if (!pg_t) return std::unexpected(pg_t.error());
+        auto ar = engine.add_inplace(grad_pos_emb_, *pg_t);
+        if (!ar) return std::unexpected(ar.error());
+
+        // grad_input: token IDs 无梯度，返回零张量（仅用于接口一致性）
+        Matrix grad_input(seq_len, batch_size_, Scalar{0});
         return engine.from_matrix(grad_input);
     }
 

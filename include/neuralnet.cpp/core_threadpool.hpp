@@ -13,6 +13,7 @@
 #include <numeric>    // for std::transform_reduce (serial fallback)
 #include <iterator>   // for std::distance
 #include <type_traits>
+#include <chrono>
 
 #include "core_assert.hpp"
 
@@ -97,13 +98,32 @@ namespace nn
         }
 
         // ── work-stealing 等待：调用者不空转，帮忙处理队列任务 ─────────
+        // 优化（依据性能审查报告）：
+        //   - 旧实现：spin 64 次 + yield，64 次 spin 中反复原子读取消耗电量
+        //     CPU 占用率显示 100% 但实际有效计算比例低（调用者空转）
+        //   - 新实现：
+        //     1) 短自旋（16 次 pause）快速检测 latch 归零——典型情况无 yield 开销
+        //     2) 自旋失败后 try_work_steal：尝试从队列取任务执行（参与计算）
+        //     3) 队列为空时进入 condition_variable 等待，避免 CPU 空转
+        //        （cv.wait_until 短超时 100μs，确保不睡过太久）
         void wait_for_latch(std::atomic<int>& latch)
         {
+            // 阶段 1：短自旋（16 次 pause）——应对 latch 即将归零的快路径
+            for (int spin = 0; spin < 16; ++spin)
+            {
+                if (latch.load(std::memory_order_acquire) == 0)
+                    return;
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+                __builtin_ia32_pause();
+#endif
+            }
+
+            // 阶段 2：work-stealing + cv 等待
             while (latch.load(std::memory_order_acquire) > 0)
             {
                 std::function<void()> task;
                 {
-                    std::lock_guard lock(queue_mutex_);
+                    std::unique_lock lock(queue_mutex_);
                     if (!tasks_.empty())
                     {
                         task = std::move(tasks_.front());
@@ -113,11 +133,8 @@ namespace nn
                 if (task)
                 {
                     task();
-                }
-                else
-                {
-                    // 队列为空：在原子 latch 上自旋等待，避免反复加锁
-                    for (int spin = 0; spin < 64; ++spin)
+                    // 执行完一个任务后回到阶段 1 短自旋
+                    for (int spin = 0; spin < 16; ++spin)
                     {
                         if (latch.load(std::memory_order_acquire) == 0)
                             return;
@@ -125,7 +142,16 @@ namespace nn
                         __builtin_ia32_pause();
 #endif
                     }
-                    std::this_thread::yield();
+                }
+                else
+                {
+                    // 队列为空：用 cv.wait_for 短超时等待，避免纯 yield 反复调度
+                    // 100μs 超时确保即使没任务也能及时唤醒检查 latch
+                    std::unique_lock lock(queue_mutex_);
+                    condition_.wait_for(lock, std::chrono::microseconds(100),
+                        [&latch]() {
+                            return latch.load(std::memory_order_acquire) == 0;
+                        });
                 }
             }
         }

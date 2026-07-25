@@ -46,15 +46,16 @@ protected:
     std::vector<Tensor*> params_;
     std::vector<Tensor*> grads_;
 
-    // 辅助方法：dst += scalar * src（clone + scale + add 三步原语组合）
+    // 辅助方法：dst += scalar * src（融合 axpy：单次 dispatch 替代 clone+scale+add 三步）
     // 用于 SGD / Momentum / Adam 等优化器中常见的 axpy 操作
+    //
+    // 性能改进（依据性能审查报告）：
+    //   - 旧实现：clone_tensor + scale_inplace + add_inplace = 3 个 GPU 原语 + 3 个临时 buffer
+    //   - 新实现：axpy_inplace = 1 个 GPU 原语 + 1 个临时 buffer
+    //   - 100 个参数 × 每 step 调用 ~3 次 = 减少 600 次 GPU buffer 分配/step
     [[nodiscard]] Result<void> scale_add_(Tensor& dst, Scalar scalar, const Tensor& src)
     {
-        auto tmp = clone_tensor(*engine_, src);
-        if (!tmp) return std::unexpected(tmp.error());
-        auto r = engine_->scale_inplace(*tmp, scalar);
-        if (!r) return std::unexpected(r.error());
-        return engine_->add_inplace(dst, *tmp);
+        return engine_->axpy_inplace(dst, scalar, src);
     }
 
 public:
@@ -364,109 +365,33 @@ public:
     constexpr Scalar b = -4.7750f;
     constexpr Scalar c = 2.0315f;
 
-    // 计算 Frobenius 范数：||G||_F = sqrt(Σ g_ij²)
-    auto g_sq = engine.elementwise_binary(BinaryOp::Mul, G, G);
-    if (!g_sq) return std::unexpected(g_sq.error());
-    auto row_sums = engine.row_reduce_sum(*g_sq);
-    if (!row_sums) return std::unexpected(row_sums.error());
-    auto total_sum = engine.col_reduce_sum(*row_sums);
-    if (!total_sum) return std::unexpected(total_sum.error());
-    auto frob_norm = engine.elementwise_unary(UnaryOp::Sqrt, *total_sum);
-    if (!frob_norm) return std::unexpected(frob_norm.error());
-
-    // X = G / (||G||_F + eps)  →  先计算 1/(||G||_F + eps)，再 scale
-    auto inv_norm_plus_eps = engine.elementwise_binary_scalar(BinaryOp::Add, *frob_norm, eps);
-    if (!inv_norm_plus_eps) return std::unexpected(inv_norm_plus_eps.error());
-    // inv_norm_plus_eps 是 (1,1) 张量，需要提取标量值
-    // 用 Rsqrt: 1/sqrt(x) → 对 total_sum 直接用 Rsqrt
-    auto inv_frob = engine.elementwise_unary(UnaryOp::Rsqrt,
-        *engine.elementwise_binary_scalar(BinaryOp::Add, *total_sum, eps * eps));
-    // 更简洁的方式：直接用标量运算
-    // ||G||_F² = total_sum[0,0]，所以 1/||G||_F = 1/sqrt(total_sum)
-
-    // 重新设计：避免从 Tensor 提取标量的复杂性
-    // 策略：先 scale G 使 Frobenius 范数 ≤ 1，再做 NS 迭代
-
-    // Step 1: 归一化 G 使其 Frobenius 范数 ≈ 1
-    //   X = G * (1 / (||G||_F + eps))
-    //   用 Rsqrt(||G||_F²) = 1/||G||_F 实现
+    // 计算 Frobenius 范数的平方：||G||_F² = Σ g_ij²
+    // 通过 elementwise(Mul) → row_reduce_sum → col_reduce_sum 三步原语得到 (1,1) 张量
     auto norm_sq = engine.elementwise_binary(BinaryOp::Mul, G, G);
     if (!norm_sq) return std::unexpected(norm_sq.error());
     auto row_sum_norm = engine.row_reduce_sum(*norm_sq);
     if (!row_sum_norm) return std::unexpected(row_sum_norm.error());
     auto total_norm_sq = engine.col_reduce_sum(*row_sum_norm);
     if (!total_norm_sq) return std::unexpected(total_norm_sq.error());
-    // total_norm_sq 是 (1,1) 张量，值为 ||G||_F²
-    // 1/sqrt(||G||_F² + eps²) 可以通过 Rsqrt 实现
-    auto inv_norm_sq = engine.elementwise_binary_scalar(BinaryOp::Add, *total_norm_sq, eps * eps);
-    if (!inv_norm_sq) return std::unexpected(inv_norm_sq.error());
-    auto inv_norm = engine.elementwise_unary(UnaryOp::Rsqrt, *inv_norm_sq);
-    if (!inv_norm) return std::unexpected(inv_norm.error());
 
-    // X = G * inv_norm  (inv_norm 是 (1,1) 张量，需要广播)
-    auto X = clone_tensor(engine, G);
-    if (!X) return std::unexpected(X.error());
-    // 用 broadcast_col_inplace 将 (1,1) 标量广播到整个矩阵
-    // 但 broadcast_col_inplace 需要 (1, cols) 的向量
-    // 这里 inv_norm 是 (1,1)，可以用 scale_inplace 的标量版本
-    // 但我们需要先提取标量值... 这在纯引擎接口下不可行
-
-    // 备选方案：用 matmul 实现标量乘法
-    // X = G * s  等价于  X = G @ (s * I)，但太复杂
-
-    // 最简方案：利用 elementwise_binary_scalar 逐元素操作
-    // 但 inv_norm 不是标量，是 (1,1) 张量
-
-    // 最终方案：重新设计归一化流程
-    // 1. 计算 G 的 Frobenius 范数的平方（标量，存在 (1,1) 张量中）
-    // 2. 用 elementwise_unary(Rsqrt) 得到 1/||G||_F
-    // 3. 用 broadcast 乘以 G
-
-    // 实际上，我们可以用一个更聪明的方法：
-    // 先计算 G² 的行和，得到每行的平方和向量
-    // 再用 broadcast_row_inplace 将每行除以该行的范数
-    // 但这不是 Frobenius 范数归一化，而是行范数归一化
-
-    // 最简洁方案：直接用 engine 的标量操作
-    // 问题：我们需要从 (1,1) Tensor 中提取标量值
-    // 解决：用 engine->to_matrix() 提取
-
-    // 重新实现，使用 to_matrix 提取标量
+    // 从 (1,1) Tensor 提取标量值
+    // 使用 to_matrix 拉到 CPU 后取值（一次 PCIe 下载，可接受）
     auto total_norm_sq_mat = engine.to_matrix(*total_norm_sq);
     if (!total_norm_sq_mat) return std::unexpected(total_norm_sq_mat.error());
     Scalar norm_sq_val = total_norm_sq_mat->at(0, 0);
     Scalar inv_norm_scalar = Scalar{1} / std::sqrt(norm_sq_val + eps * eps);
 
-    // X = G * inv_norm_scalar
-    auto X2 = clone_tensor(engine, G);
-    if (!X2) return std::unexpected(X2.error());
-    auto r = engine.scale_inplace(*X2, inv_norm_scalar);
+    // X = G * inv_norm_scalar（一次标量乘法归一化）
+    auto X = clone_tensor(engine, G);
+    if (!X) return std::unexpected(X.error());
+    auto r = engine.scale_inplace(*X, inv_norm_scalar);
     if (!r) return std::unexpected(r.error());
 
-    // 如果 rows < cols，转置以确保 X 是"瘦"矩阵（rows ≥ cols）
-    // 这样 X @ X^T 是较小的方阵，减少计算量
-    bool transposed = (G.rows() < G.cols());
-    if (transposed)
-    {
-        // X = X^T  →  用 matmul 实现转置太浪费，用 engine 的 clone + reshape
-        // 但 ComputeEngine 没有直接的 transpose 操作
-        // 解决：用 matmul(X^T, I) 或直接在 NS 迭代中处理
-        // 实际上，对于 NS 迭代，我们只需要 X @ X^T
-        // 如果 rows < cols，我们可以计算 X^T @ X（更小的方阵）
-        // 然后在最后转置回来
-
-        // 简化：假设参数是 2D 且 rows ≥ cols（大多数权重矩阵如此）
-        // 如果 rows < cols，我们仍然可以工作，只是 X @ X^T 更大
-        // 在实际神经网络中，权重矩阵通常是 (out_features, in_features)
-        // 对于线性层，通常 out_features ≤ in_features 或 vice versa
-        // 我们不做转置优化，直接计算
-    }
-
-    // Newton-Schulz 迭代
+    // Newton-Schulz 迭代：X_new = a*X + (b*A + c*A²) @ X，其中 A = X @ X^T
     for (std::size_t t = 0; t < steps; ++t)
     {
         // A = X @ X^T
-        auto A = engine.matmul(*X2, *X2, false, true);
+        auto A = engine.matmul(*X, *X, false, true);
         if (!A) return std::unexpected(A.error());
 
         // A_sq = A @ A
@@ -486,22 +411,22 @@ public:
         if (!r) return std::unexpected(r.error());
 
         // X_new = a*X + B @ X
-        auto aX = clone_tensor(engine, *X2);
+        auto aX = clone_tensor(engine, *X);
         if (!aX) return std::unexpected(aX.error());
         r = engine.scale_inplace(*aX, a);
         if (!r) return std::unexpected(r.error());
 
-        auto BX = engine.matmul(*B, *X2);
+        auto BX = engine.matmul(*B, *X);
         if (!BX) return std::unexpected(BX.error());
 
         r = engine.add_inplace(*aX, *BX);
         if (!r) return std::unexpected(r.error());
 
         // X = X_new
-        X2 = std::move(*aX);
+        X = std::move(*aX);
     }
 
-    return *X2;
+    return *X;
 }
 
 // ══════════════════════════════════════════════════════════════════════════

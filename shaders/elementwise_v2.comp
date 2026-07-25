@@ -36,6 +36,8 @@
 //                    b = (flags & 1) ? scalar_b : B[idx]
 //                    then_val = (flags & 2) ? scalar_then : B[idx]
 //                    else_val = (flags & 4) ? scalar_else : C[idx]
+//   3 = AXPY:     out = A[idx] + scalar_b * B[idx]   (融合 axpy：1 次 dispatch 替代 3 次)
+//                  用于 Optimizer 的 scale_add_(dst, scalar, src) 操作
 //
 // 一元算子（op）：
 //   0=Neg, 1=Exp, 2=Log, 3=Sqrt, 4=Rsqrt, 5=Abs, 6=Tanh
@@ -137,6 +139,14 @@ void main()
         const float then_v = ((flags & 2u) != 0u) ? scalar_then   : buf_b[idx];
         const float else_v = ((flags & 4u) != 0u) ? scalar_else   : buf_c[idx];
         buf_out[idx] = apply_compare(cmp_op, a, b) ? then_v : else_v;
+        return;
+    }
+
+    // ── 模式 3：AXPY（融合 axpy：out = a + scalar_b * b）──
+    if (mode == 3u)
+    {
+        const float b = buf_b[idx];
+        buf_out[idx] = a + scalar_b * b;
         return;
     }
 }

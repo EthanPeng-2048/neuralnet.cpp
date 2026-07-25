@@ -113,6 +113,24 @@ public:
     [[nodiscard]] virtual Result<void> insert_rows(
         Tensor& dst, std::size_t dst_start_row, const Tensor& src) = 0;
 
+    // ── 行 gather / scatter-add 原语（op-level 数据操作） ────────────────
+    // gather_rows: 按 indices 从 table 中按行查表，等价于 tf.gather / torch.index_select
+    //   table: (vocab, D)
+    //   indices: (num_indices,) — 行索引；越界索引返回零行（防御性，不抛错）
+    //   输出: (num_indices, D)，out[i] = table[indices[i]]
+    // 典型用途：Token embedding 查表（避免 Layer 内手动 to_matrix + at_unchecked）
+    [[nodiscard]] virtual Result<Tensor> gather_rows(
+        const Tensor& table, const Tensor& indices) = 0;
+
+    // scatter_add_rows: 按 indices 把 grad 的行原子累加到 dst 的对应行
+    //   dst: (vocab, D)，原地修改
+    //   indices: (num_indices,)
+    //   grad: (num_indices, D)
+    //   语义: dst[indices[i]] += grad[i]  (重复 indices 会被多次累加)
+    // 典型用途：Embedding 反向梯度按 token ID 累加（替代 Layer 内手动循环）
+    [[nodiscard]] virtual Result<void> scatter_add_rows(
+        Tensor& dst, const Tensor& indices, const Tensor& grad) = 0;
+
     // 3D 维度转置：(M, B, N) ↔ (B, M, N)
     //   inverse=false: 输入 (M, B*N) → 输出 (B*M, N)
     //     out[b*M + m, n] = in[m, b*N + n]
@@ -151,6 +169,10 @@ public:
 
     // A *= scalar
     [[nodiscard]] virtual Result<void> scale_inplace(Tensor& A, Scalar s) = 0;
+
+    // A += scalar * B（融合 axpy：单次 dispatch 替代 clone+scale+add 三步）
+    // 用于 Optimizer 的 scale_add_ 辅助方法，减少 2 个临时 GPU buffer 分配
+    [[nodiscard]] virtual Result<void> axpy_inplace(Tensor& A, Scalar scalar, const Tensor& B) = 0;
 
     // A = 0
     [[nodiscard]] virtual Result<void> zero(Tensor& A) = 0;

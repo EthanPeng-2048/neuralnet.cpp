@@ -34,7 +34,21 @@ namespace nn
     // ── 并行阈值 ─────────────────────────────────────────────────────────────
     // 元素数 >= 此值时启用线程池并行；低于则串行执行（避免调度开销）。
     // 线程池调度开销约 50-200μs（Windows mutex+cv），仅当计算量足够时并行才有收益。
-    inline constexpr std::size_t PARALLEL_THRESHOLD = 131072;
+    //
+    // bench_thresholds 实测结果（32 核 CPU, Release -O3, 2026-07-25）：
+    //   元素数   串行μs  并行μs  加速比   建议
+    //   16384     9.6    9.8     0.98x   无差别
+    //   32768    18.8   19.9     0.94x   无差别
+    //   65536    38.7  121.7     0.32x   串行优（调度开销显现）
+    //   131072   76.4  182.8     0.42x   串行优
+    //   262144  151.6  196.0     0.77x   串行优
+    //   524288  308.7  201.5     1.53x   ← 首次稳定 > 1.5x
+    //   1048576 620.3  186.7     3.32x   并行优（稳定）
+    //   2097152 1239.5 217.3     5.70x   并行优
+    //   4194304 2657.3 340.6     7.80x   并行优
+    // 取 524288 (512K) 作为阈值：在加速比首次稳定 > 1.5x 的位置。
+    // 注：1024-4096 元素数测出的高加速比是亚微秒级测量噪声，不可靠。
+    inline constexpr std::size_t PARALLEL_THRESHOLD = 524288;
 
     // ── 顶层并行算法函数 ─────────────────────────────────────────────────────
     // 用法与 std::for_each / std::transform 完全一致，内部自动选择串行/并行。
@@ -164,8 +178,19 @@ namespace nn
         // 阈值（与顶层 PARALLEL_THRESHOLD 保持一致，供旧代码读取）
         inline static constexpr std::size_t PARALLEL_THRESHOLD = nn::PARALLEL_THRESHOLD;
 
-        // GPU 加速阈值：矩阵面积超过此值时自动走 GPU（默认 64×64 = 4096 元素）
-        inline static constexpr std::size_t GPU_THRESHOLD = 64 * 64;
+        // GPU 加速阈值：Matrix::multiply_to 中 M*N 超过此值时尝试走 GPU。
+        //
+        // bench_thresholds 实测结果（AMD/RTX GPU, Release -O3, 2026-07-25）：
+        //   M×N×K          CPUμs     GPUμs     加速比
+        //   64×64×64        24.6      490.0     0.05x
+        //   128×128×128    240.4      617.6     0.39x
+        //   512×512×512   1518.4     3574.8     0.42x
+        //   1K×1K×1K      9924.5    16724.8     0.59x
+        // 所有尺寸 GPU 路径都比 CPU 慢——原因：每次 matmul_direct 都伴随
+        // PCIe 上传 A/B + 下载 C，传输开销完全抵消 GPU 算力优势。
+        // 设置为 SIZE_MAX 实质禁用此路径；GPU 加速应通过 GpuEngine/GpuTensor
+        // 全程驻留 GPU 显存来实现（参见 gpu_engine.hpp）。
+        inline static constexpr std::size_t GPU_THRESHOLD = SIZE_MAX;
 
         // 是否启用 GPU 后端（运行时开关，默认关闭）
         inline static bool gpu_enabled = false;
