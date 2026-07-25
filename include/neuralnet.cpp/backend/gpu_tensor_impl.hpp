@@ -37,10 +37,12 @@ inline Result<GpuTensor> GpuTensor::from_matrix(const Matrix& cpu_mat, GpuBacken
 inline Result<GpuTensor> GpuTensor::create_empty(
     std::size_t rows, std::size_t cols, GpuBackend& backend)
 {
+    // TRANSFER_DST_BIT: 允许 vkCmdFillBuffer (zero) 和 vkCmdCopyBuffer (insert_rows) 写入
+    // TRANSFER_SRC_BIT: 允许 vkCmdCopyBuffer (clone/slice_rows) 读取
     auto buf_res = GpuBuffer::create_device_local(
         backend.device().device(), backend.memory_pool(),
         rows * cols,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     if (!buf_res)
         return std::unexpected(buf_res.error());
 

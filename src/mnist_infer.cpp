@@ -236,22 +236,26 @@ int main(int argc, char *argv[])
     }
     nn::ModelSpec spec = spec_result.value();
 
-    if (spec.type != nn::ModelType::MLP && spec.type != nn::ModelType::Unknown)
-    {
-        std::cerr << "模型文件类型不是 MLP (type="
-                  << static_cast<uint32_t>(spec.type)
-                  << ")，新架构仅支持 MLP。\n";
-        return 1;
-    }
+    // 支持的模型类型：MLP、Transformer（ViT）
     if (spec.type == nn::ModelType::Unknown)
     {
         std::cout << "旧格式模型文件 (V1)，使用默认 MLP 架构\n";
         spec.type = nn::ModelType::MLP;
         spec.layer_dims = nn::MNIST_LAYER_DIMS;
     }
+    else if (spec.type == nn::ModelType::MLP)
+    {
+        std::cout << "从模型文件读取规格: MLP\n";
+    }
+    else if (spec.is_transformer())
+    {
+        std::cout << "从模型文件读取规格: Transformer (ViT)\n";
+    }
     else
     {
-        std::cout << "从模型文件读取规格 (V2 格式)\n";
+        std::cerr << "不支持的模型类型 (type="
+                  << static_cast<uint32_t>(spec.type) << ")\n";
+        return 1;
     }
 
     // ── 创建计算引擎 ─────────────────────────────────────────

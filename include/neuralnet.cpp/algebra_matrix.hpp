@@ -233,7 +233,7 @@ namespace nn
             else
             {
                 auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
-                SmartPolicy::parallel_for_blocks(
+                nn::parallel_for_blocks(
                     block_indices.begin(), block_indices.end(),
                     [src, dst, R, C, j_blocks](std::size_t block_idx) noexcept
                     {
@@ -257,7 +257,7 @@ namespace nn
             auto s = span();
             auto o = other.span();
             auto r = result.span();
-            SmartPolicy::transform(s.begin(), s.end(), o.begin(),
+            nn::transform(s.begin(), s.end(), o.begin(),
                            r.begin(), std::plus<>{});
             return result;
         }
@@ -269,7 +269,7 @@ namespace nn
             auto s = span();
             auto o = other.span();
             auto r = result.span();
-            SmartPolicy::transform(s.begin(), s.end(), o.begin(),
+            nn::transform(s.begin(), s.end(), o.begin(),
                            r.begin(), std::minus<>{});
             return result;
         }
@@ -279,7 +279,7 @@ namespace nn
             Matrix result(rows_, cols_);
             auto s = span();
             auto r = result.span();
-            SmartPolicy::transform(s.begin(), s.end(), r.begin(),
+            nn::transform(s.begin(), s.end(), r.begin(),
                            [scalar](Scalar value) noexcept { return value * scalar; });
             return result;
         }
@@ -297,6 +297,184 @@ namespace nn
             Matrix result(rows_, other.cols_);
             multiply_to(result, other);
             return result;
+        }
+
+        // ── 基于 span 的矩阵乘法（零拷贝，供 batched_matmul 等场景使用） ──
+        // 从 a/b 的子区间直接计算，无需构造临时 Matrix 拷贝
+        static void multiply_to_span(
+            std::span<Scalar> r, std::size_t M, std::size_t N,
+            std::span<const Scalar> a, std::size_t /*a_rows*/, std::size_t a_cols,
+            std::span<const Scalar> b, std::size_t b_rows, std::size_t b_cols)
+        {
+            NN_ASSERT(a_cols == b_rows, "multiply_to_span: inner dimension mismatch");
+            const std::size_t K = a_cols;
+            if (M == 0 || N == 0 || K == 0) return;
+
+            // 直接复用 blocked matmul 内核
+            const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            const auto n_blocks = i_blocks * j_blocks;
+
+            auto kernel = [a, b, r, M, N, K, a_cols, b_cols, j_blocks](std::size_t block_idx) noexcept
+            {
+                const std::size_t i_block = block_idx / j_blocks;
+                const std::size_t j_block = block_idx % j_blocks;
+                const std::size_t i_start = i_block * BLOCK_SIZE;
+                const std::size_t i_end = std::min(i_start + BLOCK_SIZE, M);
+                const std::size_t j_start = j_block * BLOCK_SIZE;
+                const std::size_t j_end = std::min(j_start + BLOCK_SIZE, N);
+                for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE)
+                {
+                    const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
+                    const std::size_t k_len = k_end - k_start;
+                    const std::size_t j_len = j_end - j_start;
+                    std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                    for (std::size_t jj = 0; jj < j_len; ++jj)
+                        for (std::size_t kk = 0; kk < k_len; ++kk)
+                            b_block[jj * k_len + kk] = b[(k_start + kk) * b_cols + (j_start + jj)];
+                    const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
+                    for (std::size_t i = i_start; i < i_end; ++i)
+                    {
+                        const auto a_row = a.subspan(i * a_cols + k_start);
+                        auto r_row = r.subspan(i * N + j_start);
+                        for (std::size_t j = 0; j < j_len; ++j)
+                        {
+                            const auto b_col = b_block_span.subspan(j * k_len, k_len);
+                            Scalar sum = 0.0;
+                            for (std::size_t kk = 0; kk < k_len; ++kk)
+                                sum += a_row[kk] * b_col[kk];
+                            r_row[j] += sum;
+                        }
+                    }
+                }
+            };
+
+            if (n_blocks <= 1)
+                kernel(0);
+            else
+            {
+                auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
+                nn::parallel_for_blocks(block_indices.begin(), block_indices.end(), kernel);
+            }
+        }
+
+        // ── 基于 span 的矩阵乘法（B 转置，零拷贝） ─────────────────────────
+        static void multiply_transposed_to_span(
+            std::span<Scalar> r, std::size_t M, std::size_t N,
+            std::span<const Scalar> a, std::size_t /*a_rows*/, std::size_t a_cols,
+            std::span<const Scalar> bt, std::size_t /*bt_rows*/, std::size_t bt_cols)
+        {
+            NN_ASSERT(a_cols == bt_cols, "multiply_transposed_to_span: inner dimension mismatch");
+            const std::size_t K = a_cols;
+            if (M == 0 || N == 0 || K == 0) return;
+
+            const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            const auto n_blocks = i_blocks * j_blocks;
+
+            auto kernel = [a, bt, r, M, N, K, j_blocks](std::size_t block_idx) noexcept
+            {
+                const std::size_t i_block = block_idx / j_blocks;
+                const std::size_t j_block = block_idx % j_blocks;
+                const std::size_t i_start = i_block * BLOCK_SIZE;
+                const std::size_t i_end = std::min(i_start + BLOCK_SIZE, M);
+                const std::size_t j_start = j_block * BLOCK_SIZE;
+                const std::size_t j_end = std::min(j_start + BLOCK_SIZE, N);
+                for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE)
+                {
+                    const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
+                    const std::size_t k_len = k_end - k_start;
+                    const std::size_t j_len = j_end - j_start;
+                    std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                    for (std::size_t jj = 0; jj < j_len; ++jj)
+                        for (std::size_t kk = 0; kk < k_len; ++kk)
+                            b_block[jj * k_len + kk] = bt[(j_start + jj) * K + (k_start + kk)];
+                    const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
+                    for (std::size_t i = i_start; i < i_end; ++i)
+                    {
+                        const auto a_row = a.subspan(i * K + k_start);
+                        auto r_row = r.subspan(i * N + j_start);
+                        for (std::size_t j = 0; j < j_len; ++j)
+                        {
+                            const auto b_col = b_block_span.subspan(j * k_len, k_len);
+                            Scalar sum = 0.0;
+                            for (std::size_t kk = 0; kk < k_len; ++kk)
+                                sum += a_row[kk] * b_col[kk];
+                            r_row[j] += sum;
+                        }
+                    }
+                }
+            };
+
+            if (n_blocks <= 1)
+                kernel(0);
+            else
+            {
+                auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
+                nn::parallel_for_blocks(block_indices.begin(), block_indices.end(), kernel);
+            }
+        }
+
+        // ── 基于 span 的矩阵乘法（A 转置，零拷贝） ─────────────────────────
+        static void transpose_multiply_to_span(
+            std::span<Scalar> r, std::size_t M, std::size_t N,
+            std::span<const Scalar> a, std::size_t a_rows, std::size_t a_cols,
+            std::span<const Scalar> b, std::size_t b_rows, std::size_t b_cols)
+        {
+            NN_ASSERT(a_rows == b_rows, "transpose_multiply_to_span: inner dimension mismatch");
+            const std::size_t K = a_rows;  // a is (K, M) stored
+            if (M == 0 || N == 0 || K == 0) return;
+
+            const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            const auto n_blocks = i_blocks * j_blocks;
+
+            auto kernel = [a, b, r, M, N, K, a_cols, b_cols, j_blocks](std::size_t block_idx) noexcept
+            {
+                const std::size_t i_block = block_idx / j_blocks;
+                const std::size_t j_block = block_idx % j_blocks;
+                const std::size_t i_start = i_block * BLOCK_SIZE;
+                const std::size_t i_end = std::min(i_start + BLOCK_SIZE, M);
+                const std::size_t j_start = j_block * BLOCK_SIZE;
+                const std::size_t j_end = std::min(j_start + BLOCK_SIZE, N);
+                for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE)
+                {
+                    const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
+                    const std::size_t k_len = k_end - k_start;
+                    const std::size_t j_len = j_end - j_start;
+                    const std::size_t i_len = i_end - i_start;
+                    std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> a_block{};
+                    for (std::size_t ii = 0; ii < i_len; ++ii)
+                        for (std::size_t kk = 0; kk < k_len; ++kk)
+                            a_block[ii * k_len + kk] = a[(k_start + kk) * a_cols + (i_start + ii)];
+                    std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                    for (std::size_t jj = 0; jj < j_len; ++jj)
+                        for (std::size_t kk = 0; kk < k_len; ++kk)
+                            b_block[jj * k_len + kk] = b[(k_start + kk) * b_cols + (j_start + jj)];
+                    const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
+                    for (std::size_t i = 0; i < i_len; ++i)
+                    {
+                        const auto a_row = std::span<const Scalar>(a_block.data() + i * k_len, k_len);
+                        auto r_row = r.subspan((i_start + i) * N + j_start);
+                        for (std::size_t j = 0; j < j_len; ++j)
+                        {
+                            const auto b_col = b_block_span.subspan(j * k_len, k_len);
+                            Scalar sum = 0.0;
+                            for (std::size_t kk = 0; kk < k_len; ++kk)
+                                sum += a_row[kk] * b_col[kk];
+                            r_row[j] += sum;
+                        }
+                    }
+                }
+            };
+
+            if (n_blocks <= 1)
+                kernel(0);
+            else
+            {
+                auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
+                nn::parallel_for_blocks(block_indices.begin(), block_indices.end(), kernel);
+            }
         }
 
         // ── 矩阵乘法到预分配缓冲区（零分配热路径） ─────────────────────────
@@ -379,7 +557,7 @@ namespace nn
             else
             {
                 auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
-                SmartPolicy::parallel_for_blocks(
+                nn::parallel_for_blocks(
                     block_indices.begin(), block_indices.end(),
                     [a, b, r, M, N, K, j_blocks](std::size_t block_idx) noexcept
                     {
@@ -480,7 +658,7 @@ namespace nn
             else
             {
                 auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
-                SmartPolicy::parallel_for_blocks(
+                nn::parallel_for_blocks(
                     block_indices.begin(), block_indices.end(),
                     [a, bt, r, M, N, K, j_blocks](std::size_t block_idx) noexcept
                     {
@@ -589,7 +767,7 @@ namespace nn
             else
             {
                 auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
-                SmartPolicy::parallel_for_blocks(
+                nn::parallel_for_blocks(
                     block_indices.begin(), block_indices.end(),
                     [a, b_data, r, M, N, K, j_blocks](std::size_t block_idx) noexcept
                     {
@@ -691,7 +869,7 @@ namespace nn
             else
             {
                 auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
-                SmartPolicy::parallel_for_blocks(
+                nn::parallel_for_blocks(
                     block_indices.begin(), block_indices.end(),
                     [a, bt, r, M, N, K, j_blocks](std::size_t block_idx) noexcept
                     {
@@ -735,7 +913,7 @@ namespace nn
         void scale_inplace(Scalar scalar) noexcept
         {
             auto s = span();
-            SmartPolicy::for_each(s.begin(), s.end(),
+            nn::for_each(s.begin(), s.end(),
                            [scalar](Scalar &value) noexcept { value *= scalar; });
         }
 
@@ -745,7 +923,7 @@ namespace nn
             require_same_shape(*this, other, "add_inplace dimension mismatch");
             auto s = span();
             auto o = other.span();
-            SmartPolicy::transform(s.begin(), s.end(), o.begin(),
+            nn::transform(s.begin(), s.end(), o.begin(),
                            s.begin(), std::plus<>{});
         }
 
@@ -764,7 +942,7 @@ namespace nn
             Matrix result(rows_, cols_);
             auto s = span();
             auto r = result.span();
-            SmartPolicy::transform(s.begin(), s.end(),
+            nn::transform(s.begin(), s.end(),
                            r.begin(), std::forward<F>(func));
             return result;
         }
@@ -779,7 +957,7 @@ namespace nn
             auto s = span();
             auto o = other.span();
             auto r = result.span();
-            SmartPolicy::transform(s.begin(), s.end(),
+            nn::transform(s.begin(), s.end(),
                            o.begin(), r.begin(),
                            std::forward<F>(func));
             return result;
@@ -792,7 +970,7 @@ namespace nn
             require_same_shape(*this, other, "binary_apply_inplace dimension mismatch");
             auto s = span();
             auto o = other.span();
-            SmartPolicy::transform(s.begin(), s.end(),
+            nn::transform(s.begin(), s.end(),
                            o.begin(), s.begin(),
                            std::forward<F>(func));
         }
@@ -803,7 +981,7 @@ namespace nn
         [[nodiscard]] T reduce(T init, ReduceOp&& reduce_op, TransformOp&& transform_op) const
         {
             auto s = span();
-            return SmartPolicy::transform_reduce(s.begin(), s.end(), init,
+            return nn::transform_reduce(s.begin(), s.end(), init,
                 std::forward<ReduceOp>(reduce_op), std::forward<TransformOp>(transform_op));
         }
 
@@ -822,7 +1000,6 @@ namespace nn
             const std::size_t C = cols_;
 
             auto row_indices = std::views::iota(std::size_t{0}, rows_);
-            const std::size_t total = rows_ * cols_;
 
             auto process_row = [self, out, C, init,
                                 reduce_op = std::forward<ReduceOp>(reduce_op),
@@ -834,11 +1011,7 @@ namespace nn
                 out[r] = static_cast<Scalar>(acc);
             };
 
-            if (total >= SmartPolicy::PARALLEL_THRESHOLD)
-                SmartPolicy::for_each(row_indices.begin(), row_indices.end(), process_row);
-            else
-                for (std::size_t r = 0; r < rows_; ++r)
-                    process_row(r);
+            nn::for_each(row_indices.begin(), row_indices.end(), process_row);
             return result;
         }
 
@@ -857,7 +1030,6 @@ namespace nn
             auto out = result.span();
             const std::size_t R = rows_;
             const std::size_t C = cols_;
-            const std::size_t total = R * C;
 
             auto process_col = [self, out, R, C, init,
                                 reduce_op = std::forward<ReduceOp>(reduce_op),
@@ -870,15 +1042,9 @@ namespace nn
             };
 
             // 大矩阵启用并行（按列分派）；小矩阵串行避免线程调度开销
-            if (total >= SmartPolicy::PARALLEL_THRESHOLD)
             {
                 auto col_indices = std::views::iota(std::size_t{0}, C);
-                SmartPolicy::for_each(col_indices.begin(), col_indices.end(), process_col);
-            }
-            else
-            {
-                for (std::size_t c = 0; c < C; ++c)
-                    process_col(c);
+                nn::for_each(col_indices.begin(), col_indices.end(), process_col);
             }
             return result;
         }
@@ -894,7 +1060,7 @@ namespace nn
             const std::size_t C = cols_;
             auto d = span();
             auto idx = std::views::iota(std::size_t{0}, d.size());
-            SmartPolicy::for_each(idx.begin(), idx.end(),
+            nn::for_each(idx.begin(), idx.end(),
                 [&d, &v, C, op = std::forward<F>(op)](std::size_t i) noexcept {
                     d[i] = static_cast<Scalar>(op(d[i], v[i / C]));
                 });
@@ -911,7 +1077,7 @@ namespace nn
             const std::size_t C = cols_;
             auto d = span();
             auto idx = std::views::iota(std::size_t{0}, d.size());
-            SmartPolicy::for_each(idx.begin(), idx.end(),
+            nn::for_each(idx.begin(), idx.end(),
                 [&d, &v, C, op = std::forward<F>(op)](std::size_t i) noexcept {
                     d[i] = static_cast<Scalar>(op(d[i], v[i % C]));
                 });
@@ -927,7 +1093,7 @@ namespace nn
             auto b = bias.span();
             auto d = span();
             auto idx = std::views::iota(std::size_t{0}, d.size());
-            SmartPolicy::for_each(idx.begin(), idx.end(),
+            nn::for_each(idx.begin(), idx.end(),
                 [&d, &b, batch](std::size_t i) noexcept {
                     d[i] += b[i / batch];
                 });

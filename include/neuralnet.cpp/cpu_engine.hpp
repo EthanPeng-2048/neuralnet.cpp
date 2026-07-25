@@ -66,6 +66,99 @@ public:
         return Tensor::from_matrix(Matrix(src.cpu_matrix()));  // 深拷贝
     }
 
+    // ── 行切片：拷贝 src 的行 [start_row, start_row + count) 到新 Tensor ──
+    [[nodiscard]] Result<Tensor> slice_rows(
+        const Tensor& src, std::size_t start_row, std::size_t count) override
+    {
+        if (!src.is_cpu())
+            return std::unexpected(Error{"slice_rows: src tensor is not CPU"});
+        const Matrix& m = src.cpu_matrix();
+        if (start_row + count > m.rows())
+            return std::unexpected(Error{"slice_rows: range out of bounds"});
+
+        Matrix result(count, m.cols());
+        const auto src_span = m.span();
+        auto dst_span = result.span();
+        const std::size_t cols = m.cols();
+        for (std::size_t r = 0; r < count; ++r)
+            std::copy_n(src_span.begin() + (start_row + r) * cols, cols,
+                        dst_span.begin() + r * cols);
+        return Tensor::from_matrix(std::move(result));
+    }
+
+    // ── 行插入：将 src 的所有行写入 dst 的行 [dst_start_row, ...) ──
+    [[nodiscard]] Result<void> insert_rows(
+        Tensor& dst, std::size_t dst_start_row, const Tensor& src) override
+    {
+        if (!dst.is_cpu() || !src.is_cpu())
+            return std::unexpected(Error{"insert_rows: tensors are not CPU"});
+        if (dst.cols() != src.cols())
+            return std::unexpected(Error{"insert_rows: column count mismatch"});
+        if (dst_start_row + src.rows() > dst.rows())
+            return std::unexpected(Error{"insert_rows: range out of bounds"});
+
+        Matrix& d = dst.cpu_matrix();
+        const Matrix& s = src.cpu_matrix();
+        const auto dst_span = d.span();
+        const auto src_span = s.span();
+        const std::size_t cols = d.cols();
+        for (std::size_t r = 0; r < s.rows(); ++r)
+            std::copy_n(src_span.begin() + r * cols, cols,
+                        dst_span.begin() + (dst_start_row + r) * cols);
+        return {};
+    }
+
+    // ── 3D 维度转置：(M, B, N) ↔ (B, M, N) ──
+    //   inverse=false: (M, B*N) → (B*M, N), out[b*M+m, n] = in[m, b*N+n]
+    //   inverse=true:  (B*M, N) → (M, B*N), out[m, b*N+n] = in[b*M+m, n]
+    [[nodiscard]] Result<Tensor> rearrange_3d(
+        const Tensor& x, std::size_t M, std::size_t B, std::size_t N,
+        bool inverse) override
+    {
+        if (x.is_gpu())
+            return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+
+        const Matrix& m = x.cpu_matrix();
+        const std::size_t total = M * B * N;
+        if (m.size() != total)
+            return std::unexpected(Error{"rearrange_3d: element count mismatch"});
+
+        Matrix out(inverse ? M : (B * M), inverse ? (B * N) : N);
+
+        if (!inverse)
+        {
+            // in (M, B*N) → out (B*M, N)
+            // out[b*M + m, n] = in[m, b*N + n]
+            const auto src = m.span();
+            const auto dst = out.span();
+            for (std::size_t b = 0; b < B; ++b)
+                for (std::size_t mi = 0; mi < M; ++mi)
+                {
+                    const std::size_t dst_off = (b * M + mi) * N;
+                    const std::size_t src_off = mi * (B * N) + b * N;
+                    std::copy_n(src.begin() + src_off, N,
+                                dst.begin() + dst_off);
+                }
+        }
+        else
+        {
+            // in (B*M, N) → out (M, B*N)
+            // out[m, b*N + n] = in[b*M + m, n]
+            const auto src = m.span();
+            const auto dst = out.span();
+            for (std::size_t b = 0; b < B; ++b)
+                for (std::size_t mi = 0; mi < M; ++mi)
+                {
+                    const std::size_t src_off = (b * M + mi) * N;
+                    const std::size_t dst_off = mi * (B * N) + b * N;
+                    std::copy_n(src.begin() + src_off, N,
+                                dst.begin() + dst_off);
+                }
+        }
+
+        return Tensor::from_matrix(std::move(out));
+    }
+
     // ══════════════════════════════════════════════════════════════════════
     // 矩阵级原语
     // ══════════════════════════════════════════════════════════════════════
@@ -87,7 +180,12 @@ public:
         const std::size_t K2 = transB ? b.cols() : b.rows();
         const std::size_t N  = transB ? b.rows() : b.cols();
         if (K != K2)
-            return std::unexpected(Error{"matmul: dimension mismatch"});
+            return std::unexpected(Error{"matmul: dimension mismatch A=" +
+                std::to_string(a.rows()) + "x" + std::to_string(a.cols()) +
+                " transA=" + (transA ? "1" : "0") +
+                " B=" + std::to_string(b.rows()) + "x" + std::to_string(b.cols()) +
+                " transB=" + (transB ? "1" : "0") +
+                " K=" + std::to_string(K) + " K2=" + std::to_string(K2)});
 
         Matrix result(M, N);
         // 使用 Matrix 原生转置 matmul 方法，零额外拷贝
@@ -102,6 +200,84 @@ public:
             Matrix a_t = a.transpose();
             a_t.multiply_transposed_to(result, b);
         }
+        return Tensor::from_matrix(std::move(result));
+    }
+
+    // ── 批量矩阵乘法：按 batch 切分行块，逐 batch 矩阵乘 ──
+    [[nodiscard]] Result<Tensor> batched_matmul(
+        const Tensor& A, const Tensor& B,
+        std::size_t batch,
+        bool transA, bool transB) override
+    {
+        if (A.is_gpu() || B.is_gpu())
+            return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+        if (batch == 0)
+            return std::unexpected(Error{"batched_matmul: batch must be > 0"});
+
+        const Matrix& a = A.cpu_matrix();
+        const Matrix& b = B.cpu_matrix();
+
+        // 每个 batch 的行数
+        if (a.rows() % batch != 0 || b.rows() % batch != 0)
+            return std::unexpected(Error{"batched_matmul: rows not divisible by batch"});
+
+        const std::size_t a_rows_per = a.rows() / batch;
+        const std::size_t b_rows_per = b.rows() / batch;
+
+        // 逻辑维度（基于转置标志）
+        //   transA=false: A_b 视为 (a_rows_per, a.cols())，M=a_rows_per, K=a.cols()
+        //   transA=true:  A_b 视为 (a.cols(), a_rows_per)（按 A_b^T 使用），M=a.cols(), K=a_rows_per
+        //   transB=false: B_b 视为 (b_rows_per, b.cols())，K2=b_rows_per, N=b.cols()
+        //   transB=true:  B_b 视为 (b.cols(), b_rows_per)（按 B_b^T 使用），K2=b.cols(), N=b_rows_per
+        const std::size_t M  = transA ? a.cols() : a_rows_per;
+        const std::size_t K  = transA ? a_rows_per : a.cols();
+        const std::size_t K2 = transB ? b.cols() : b_rows_per;
+        const std::size_t N  = transB ? b_rows_per : b.cols();
+        if (K != K2)
+            return std::unexpected(Error{"batched_matmul: K dimension mismatch"});
+
+        Matrix result(batch * M, N);
+        auto result_span = result.span();
+        const auto a_span = a.span();
+        const auto b_span = b.span();
+
+        for (std::size_t bi = 0; bi < batch; ++bi)
+        {
+            // 零拷贝：通过 span 子区间直接引用原始数据，无需临时 Matrix 拷贝
+            const std::size_t a_off = bi * a_rows_per * a.cols();
+            const std::size_t b_off = bi * b_rows_per * b.cols();
+            auto a_sub = std::span<const Scalar>(a_span.data() + a_off, a_rows_per * a.cols());
+            auto b_sub = std::span<const Scalar>(b_span.data() + b_off, b_rows_per * b.cols());
+            auto c_sub = std::span<Scalar>(result_span.data() + bi * M * N, M * N);
+
+            if (!transA && !transB) {
+                Matrix::multiply_to_span(c_sub, M, N,
+                    a_sub, a_rows_per, a.cols(),
+                    b_sub, b_rows_per, b.cols());
+            } else if (!transA && transB) {
+                Matrix::multiply_transposed_to_span(c_sub, M, N,
+                    a_sub, a_rows_per, a.cols(),
+                    b_sub, b_rows_per, b.cols());
+            } else if (transA && !transB) {
+                Matrix::transpose_multiply_to_span(c_sub, M, N,
+                    a_sub, a_rows_per, a.cols(),
+                    b_sub, b_rows_per, b.cols());
+            } else {
+                // 双转置：先转置 A 子块，再做 A^T × B^T
+                // 等价于 (B × A)^T，用 span 暂不支持，fallback 到临时矩阵
+                Matrix a_view(a_rows_per, a.cols());
+                auto dst_a = a_view.span();
+                std::copy_n(a_sub.begin(), a_sub.size(), dst_a.begin());
+                Matrix a_t = a_view.transpose();
+                Matrix b_view(b_rows_per, b.cols());
+                auto dst_b = b_view.span();
+                std::copy_n(b_sub.begin(), b_sub.size(), dst_b.begin());
+                Matrix c_part(M, N);
+                a_t.multiply_transposed_to(c_part, b_view);
+                std::copy_n(c_part.span().begin(), M * N, c_sub.begin());
+            }
+        }
+
         return Tensor::from_matrix(std::move(result));
     }
 

@@ -1,0 +1,151 @@
+========================================================
+ MNIST Transformer Optimizer Benchmark
+========================================================
+ Model: d_model=32, heads=2, layers=1, d_ff=64
+ Data:  5000 train, 100 eval | 5 epochs, batch=128
+========================================================
+
+[SGD]
+    Epoch 1/5  batch 10/39  loss: nan  time: 2976ms   
+    Epoch 1/5  batch 20/39  loss: nan  time: 5942ms   
+    Epoch 1/5  batch 30/39  loss: nan  time: 8905ms   
+    Epoch 1/5  batch 39/39  loss: nan  time: 11576ms   
+    Epoch 1/5  loss=nan  train_acc=13.00%  test_acc=8.00%  time=11.6s
+    Epoch 2/5  batch 10/39  loss: nan  time: 2971ms   
+    Epoch 2/5  batch 20/39  loss: nan  time: 5953ms   
+    Epoch 2/5  batch 30/39  loss: nan  time: 8919ms   
+    Epoch 2/5  batch 39/39  loss: nan  time: 11583ms   
+    Epoch 2/5  loss=nan  train_acc=13.00%  test_acc=8.00%  time=11.6s
+    Epoch 3/5  batch 10/39  loss: nan  time: 2944ms   
+    Epoch 3/5  batch 20/39  loss: nan  time: 5876ms   
+    Epoch 3/5  batch 30/39  loss: nan  time: 8794ms   
+    Epoch 3/5  batch 39/39  loss: nan  time: 11421ms   
+    Epoch 3/5  loss=nan  train_acc=13.00%  test_acc=8.00%  time=11.4s
+    Epoch 4/5  batch 10/39  loss: nan  time: 2914ms   
+    Epoch 4/5  batch 20/39  loss: nan  time: 5793ms   
+    Epoch 4/5  batch 30/39  loss: nan  time: 8668ms   
+    Epoch 4/5  batch 39/39  loss: nan  time: 11251ms   
+    Epoch 4/5  loss=nan  train_acc=13.00%  test_acc=8.00%  time=11.3s
+    Epoch 5/5  batch 10/39  loss: nan  time: 2884ms   
+    Epoch 5/5  batch 20/39  loss: nan  time: 5757ms   
+    Epoch 5/5  batch 30/39  loss: nan  time: 8623ms   
+    Epoch 5/5  batch 39/39  loss: nan  time: 11193ms   
+    Epoch 5/5  loss=nan  train_acc=13.00%  test_acc=8.00%  time=11.2s
+
+[SGD+Momentum]
+    Epoch 1/5  batch 10/39  loss: 2.4855  time: 2967ms   
+    Epoch 1/5  batch 20/39  loss: 2.0368  time: 5933ms   
+    Epoch 1/5  batch 30/39  loss: 1.6872  time: 8910ms   
+    Epoch 1/5  batch 39/39  loss: 1.3213  time: 11577ms   
+    Epoch 1/5  loss=2.0916  train_acc=54.00%  test_acc=58.00%  time=11.6s
+    Epoch 2/5  batch 10/39  loss: 1.6389  time: 2971ms   
+    Epoch 2/5  batch 20/39  loss: 1.2923  time: 5925ms   
+    Epoch 2/5  batch 30/39  loss: 1.1192  time: 8865ms   
+    Epoch 2/5  batch 39/39  loss: 1.0517  time: 11519ms   
+    Epoch 2/5  loss=1.3593  train_acc=68.00%  test_acc=67.00%  time=11.5s
+    Epoch 3/5  batch 10/39  loss: 1.6730  time: 2936ms   
+    Epoch 3/5  batch 20/39  loss: 1.5073  time: 5867ms   
+    Epoch 3/5  batch 30/39  loss: 1.1973  time: 8781ms   
+    Epoch 3/5  batch 39/39  loss: 0.9878  time: 11399ms   
+    Epoch 3/5  loss=1.3163  train_acc=71.00%  test_acc=74.00%  time=11.4s
+    Epoch 4/5  batch 10/39  loss: 1.3115  time: 2886ms   
+    Epoch 4/5  batch 20/39  loss: 1.0414  time: 5742ms   
+    Epoch 4/5  batch 30/39  loss: 1.0015  time: 8607ms   
+    Epoch 4/5  batch 39/39  loss: 0.8491  time: 11182ms   
+    Epoch 4/5  loss=0.9553  train_acc=73.00%  test_acc=74.00%  time=11.2s
+    Epoch 5/5  batch 10/39  loss: 0.5475  time: 2861ms   
+    Epoch 5/5  batch 20/39  loss: 0.6674  time: 5729ms   
+    Epoch 5/5  batch 30/39  loss: 0.7147  time: 8591ms   
+    Epoch 5/5  batch 39/39  loss: 0.4577  time: 11166ms   
+    Epoch 5/5  loss=0.7006  train_acc=82.00%  test_acc=85.00%  time=11.2s
+
+[Adam]
+    Epoch 1/5  batch 10/39  loss: 2.3263  time: 2974ms   
+    Epoch 1/5  batch 20/39  loss: 2.2626  time: 5944ms   
+    Epoch 1/5  batch 30/39  loss: 2.1479  time: 8919ms   
+    Epoch 1/5  batch 39/39  loss: 2.0224  time: 11596ms   
+    Epoch 1/5  loss=2.2584  train_acc=46.00%  test_acc=38.00%  time=11.6s
+    Epoch 2/5  batch 10/39  loss: 1.9447  time: 2977ms   
+    Epoch 2/5  batch 20/39  loss: 1.8218  time: 5942ms   
+    Epoch 2/5  batch 30/39  loss: 1.8610  time: 8920ms   
+    Epoch 2/5  batch 39/39  loss: 1.7176  time: 11573ms   
+    Epoch 2/5  loss=1.8737  train_acc=42.00%  test_acc=47.00%  time=11.6s
+    Epoch 3/5  batch 10/39  loss: 1.6328  time: 2938ms   
+    Epoch 3/5  batch 20/39  loss: 1.5205  time: 5870ms   
+    Epoch 3/5  batch 30/39  loss: 1.5351  time: 8797ms   
+    Epoch 3/5  batch 39/39  loss: 1.4803  time: 11411ms   
+    Epoch 3/5  loss=1.5446  train_acc=61.00%  test_acc=60.00%  time=11.4s
+    Epoch 4/5  batch 10/39  loss: 1.4628  time: 2904ms   
+    Epoch 4/5  batch 20/39  loss: 1.2159  time: 5790ms   
+    Epoch 4/5  batch 30/39  loss: 1.3181  time: 8669ms   
+    Epoch 4/5  batch 39/39  loss: 1.3268  time: 11259ms   
+    Epoch 4/5  loss=1.3022  train_acc=70.00%  test_acc=59.00%  time=11.3s
+    Epoch 5/5  batch 10/39  loss: 1.2816  time: 2874ms   
+    Epoch 5/5  batch 20/39  loss: 1.1197  time: 5773ms   
+    Epoch 5/5  batch 30/39  loss: 1.1139  time: 8662ms   
+    Epoch 5/5  batch 39/39  loss: 0.8868  time: 11250ms   
+    Epoch 5/5  loss=1.1232  train_acc=69.00%  test_acc=59.00%  time=11.3s
+
+[AdamW]
+    Epoch 1/5  batch 10/39  loss: 2.3271  time: 2971ms   
+    Epoch 1/5  batch 20/39  loss: 2.2766  time: 5955ms   
+    Epoch 1/5  batch 30/39  loss: 2.2070  time: 8929ms   
+    Epoch 1/5  batch 39/39  loss: 2.1328  time: 11627ms   
+    Epoch 1/5  loss=2.3367  train_acc=28.00%  test_acc=34.00%  time=11.6s
+    Epoch 2/5  batch 10/39  loss: 2.0832  time: 2977ms   
+    Epoch 2/5  batch 20/39  loss: 2.0539  time: 5941ms   
+    Epoch 2/5  batch 30/39  loss: 1.8449  time: 8912ms   
+    Epoch 2/5  batch 39/39  loss: 1.8927  time: 11569ms   
+    Epoch 2/5  loss=2.0105  train_acc=48.00%  test_acc=40.00%  time=11.6s
+    Epoch 3/5  batch 10/39  loss: 1.7343  time: 2934ms   
+    Epoch 3/5  batch 20/39  loss: 1.6806  time: 5855ms   
+    Epoch 3/5  batch 30/39  loss: 1.7051  time: 8787ms   
+    Epoch 3/5  batch 39/39  loss: 1.4989  time: 11409ms   
+    Epoch 3/5  loss=1.6558  train_acc=59.00%  test_acc=51.00%  time=11.4s
+    Epoch 4/5  batch 10/39  loss: 1.2391  time: 2881ms   
+    Epoch 4/5  batch 20/39  loss: 1.4065  time: 5760ms   
+    Epoch 4/5  batch 30/39  loss: 1.3292  time: 8639ms   
+    Epoch 4/5  batch 39/39  loss: 1.1044  time: 11234ms   
+    Epoch 4/5  loss=1.3402  train_acc=59.00%  test_acc=55.00%  time=11.2s
+    Epoch 5/5  batch 10/39  loss: 1.1376  time: 2881ms   
+    Epoch 5/5  batch 20/39  loss: 1.0745  time: 5764ms   
+    Epoch 5/5  batch 30/39  loss: 1.0309  time: 8637ms   
+    Epoch 5/5  batch 39/39  loss: 1.1884  time: 11228ms   
+    Epoch 5/5  loss=1.1429  train_acc=68.00%  test_acc=65.00%  time=11.2s
+
+[Muon]
+    Epoch 1/5  batch 10/39  loss: 597.6368  time: 3472ms   
+    Epoch 1/5  batch 20/39  loss: nan  time: 6870ms   
+    Epoch 1/5  batch 30/39  loss: nan  time: 10265ms   
+    Epoch 1/5  batch 39/39  loss: nan  time: 13314ms   
+    Epoch 1/5  loss=nan  train_acc=13.00%  test_acc=8.00%  time=13.3s
+    Epoch 2/5  batch 10/39  loss: nan  time: 3375ms   
+    Epoch 2/5  batch 20/39  loss: nan  time: 6743ms   
+    Epoch 2/5  batch 30/39  loss: nan  time: 10096ms   
+    Epoch 2/5  batch 39/39  loss: nan  time: 13101ms   
+    Epoch 2/5  loss=nan  train_acc=13.00%  test_acc=8.00%  time=13.1s
+    Epoch 3/5  batch 10/39  loss: nan  time: 3445ms   
+    Epoch 3/5  batch 20/39  loss: nan  time: 6807ms   
+    Epoch 3/5  batch 30/39  loss: nan  time: 10172ms   
+    Epoch 3/5  batch 39/39  loss: nan  time: 13196ms   
+    Epoch 3/5  loss=nan  train_acc=13.00%  test_acc=8.00%  time=13.2s
+    Epoch 4/5  batch 10/39  loss: nan  time: 3349ms   
+    Epoch 4/5  batch 20/39  loss: nan  time: 6652ms   
+    Epoch 4/5  batch 30/39  loss: nan  time: 9980ms   
+    Epoch 4/5  batch 39/39  loss: nan  time: 12970ms   
+    Epoch 4/5  loss=nan  train_acc=13.00%  test_acc=8.00%  time=13.0s
+    Epoch 5/5  batch 10/39  loss: nan  time: 3288ms   
+    Epoch 5/5  batch 20/39  loss: nan  time: 6580ms   
+    Epoch 5/5  batch 30/39  loss: nan  time: 9865ms   
+    Epoch 5/5  batch 39/39  loss: nan  time: 12823ms   
+    Epoch 5/5  loss=nan  train_acc=13.00%  test_acc=8.00%  time=12.8s
+
+========================================================
+ RESULTS
+========================================================
+  SGD+Momentum     58.00%  █████████████████████████████
+  Adam             38.00%  ███████████████████
+  AdamW            34.00%  █████████████████
+  Muon              8.00%  ████
+  SGD               8.00%  ████
+

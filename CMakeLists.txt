@@ -23,9 +23,9 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "App
 endif()
 
 # ── 按构建类型设置优化标志 ───────────────────────────────────────────────
-# Release: -O3 -ffast-math -march=native（性能优先）
+# Release: -O3 -ffast-math -funroll-loops（性能优先）
 # Debug:   -O0 -g（调试优先，禁用 -march=native 保证可移植性）
-set(RELEASE_FLAGS -O3 -ffast-math)
+set(RELEASE_FLAGS -O3 -ffast-math -funroll-loops)
 set(DEBUG_FLAGS -O0 -g)
 
 add_compile_options(
@@ -66,6 +66,12 @@ nn_add_executable(mnist_train src/mnist_train.cpp)
 nn_add_executable(mnist_infer src/mnist_infer.cpp)
 nn_add_executable(mnist_bench src/mnist_bench.cpp)
 
+# ── 文本目标（GPT 训练/推理 + BPE 分词器训练/推理） ───────────────────
+nn_add_executable(text_train src/text_train.cpp)
+nn_add_executable(text_infer src/text_infer.cpp)
+nn_add_executable(tokenizer_train src/tokenizer_train.cpp)
+nn_add_executable(tokenizer_infer src/tokenizer_infer.cpp)
+
 # ── 计算性能基准测试 ─────────────────────────────────────────────────────
 nn_add_executable(compute_bench src/compute_bench.cpp)
 
@@ -82,6 +88,7 @@ if(Vulkan_FOUND)
 
     # 定义着色器列表（仅保留纯原语着色器，不含任何算法）
     # - matmul / matmul_tiled: 矩阵乘法原语
+    # - batched_matmul: 批量矩阵乘法原语（Z 维度索引 batch，消除 per-head 循环）
     # - elementwise_v2: 逐元素原语（unary/binary/select）— 纯 GPU 架构核心
     # - reduce: 行/列归约原语（sum/max）— LayerNorm、CrossEntropy 等
     # - broadcast: 行/列广播原语（add/sub/mul/div/max/min）— Linear 偏置、
@@ -91,6 +98,8 @@ if(Vulkan_FOUND)
     set(GPU_SHADERS
         matmul
         matmul_tiled
+        batched_matmul
+        rearrange_3d
         elementwise_v2
         reduce
         broadcast)
@@ -137,6 +146,8 @@ if(Vulkan_FOUND)
         # 为所有目标启用 Vulkan
         set(NN_GPU_TARGETS
             mnist_train mnist_infer mnist_bench
+            text_train text_infer
+            tokenizer_train tokenizer_infer
             compute_bench gpu_test
         )
 

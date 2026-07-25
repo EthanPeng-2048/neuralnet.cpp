@@ -79,6 +79,81 @@ public:
         return *this;
     }
 
+    // ── 构建网络（Transformer 专用） ──────────────────────────────────────
+    // 注意：MultiHeadAttention 的构造函数是 protected（设计为基类，
+    //       由 TransformerEncoderLayer / CausalSelfAttention 内部组合），
+    //       因此不提供 add_multi_head_attention。
+
+    Model& add_softmax()
+    {
+        layers_.emplace_back(std::make_unique<Softmax>());
+        return *this;
+    }
+
+    Model& add_positional_encoding(std::size_t d_model, std::size_t max_len = 5000)
+    {
+        layers_.emplace_back(std::make_unique<PositionalEncoding>(*engine_, d_model, max_len));
+        return *this;
+    }
+
+    Model& add_feed_forward(std::size_t d_model, std::size_t d_ff)
+    {
+        layers_.emplace_back(std::make_unique<FeedForward>(*engine_, d_model, d_ff));
+        return *this;
+    }
+
+    Model& add_transformer_encoder_layer(
+        std::size_t d_model, std::size_t num_heads, std::size_t d_ff,
+        std::size_t seq_len = 0)
+    {
+        layers_.emplace_back(std::make_unique<TransformerEncoderLayer>(
+            *engine_, d_model, num_heads, d_ff, seq_len));
+        return *this;
+    }
+
+    Model& add_transformer_encoder(
+        std::size_t d_model, std::size_t num_heads, std::size_t d_ff,
+        std::size_t num_layers, std::size_t num_patches)
+    {
+        layers_.emplace_back(std::make_unique<TransformerEncoder>(
+            *engine_, d_model, num_heads, d_ff, num_layers, num_patches));
+        return *this;
+    }
+
+    Model& add_patch_embedding(
+        std::size_t img_size, std::size_t patch_size, std::size_t d_model)
+    {
+        layers_.emplace_back(std::make_unique<PatchEmbedding>(
+            *engine_, img_size, patch_size, d_model));
+        return *this;
+    }
+
+    Model& add_causal_self_attention(
+        std::size_t d_model, std::size_t num_heads, std::size_t max_len = 1024)
+    {
+        layers_.emplace_back(std::make_unique<CausalSelfAttention>(
+            *engine_, d_model, num_heads, max_len));
+        return *this;
+    }
+
+    Model& add_gpt_block(
+        std::size_t d_model, std::size_t num_heads, std::size_t d_ff,
+        std::size_t max_len = 1024)
+    {
+        layers_.emplace_back(std::make_unique<GPTBlock>(
+            *engine_, d_model, num_heads, d_ff, max_len));
+        return *this;
+    }
+
+    Model& add_gpt_model(
+        std::size_t vocab_size, std::size_t d_model, std::size_t seq_len,
+        std::size_t num_heads, std::size_t d_ff, std::size_t num_layers)
+    {
+        layers_.emplace_back(std::make_unique<GPTModel>(
+            *engine_, vocab_size, d_model, seq_len, num_heads, d_ff, num_layers));
+        return *this;
+    }
+
     // 通用模板接口（供 gpu_test 等内部测试使用）
     template <typename LayerType, typename... Args>
     Model& add(Args&&... args)
@@ -156,10 +231,14 @@ public:
     }
 
     // ── 梯度清零（每个训练 step 开头调用） ────────────────────────────────
-    void zero_grad()
+    [[nodiscard]] Result<void> zero_grad()
     {
         for (auto& layer : layers_)
-            layer->zero_grad(*engine_);
+        {
+            auto r = layer->zero_grad(*engine_);
+            if (!r) return r;
+        }
+        return {};
     }
 };
 

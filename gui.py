@@ -291,7 +291,7 @@ class NeuralNetGUI(tk.Tk):
                "--lr", str(self.train_lr_var.get()),
                "--batch-size", str(self.train_batch_var.get()),
                "--optimizer", self.train_opt_var.get(),
-               "--model-type", self.train_model_type_var.get()]
+               "--arch", self.train_model_type_var.get()]
         if self.train_resume_var.get():
             cmd += ["--resume", self.train_resume_path_var.get()]
 
@@ -361,12 +361,7 @@ class NeuralNetGUI(tk.Tk):
         self.infer_topk_var = tk.IntVar(value=3)
         ttk.Spinbox(param_frame, from_=1, to=10, width=4,
                      textvariable=self.infer_topk_var).pack(side="left", padx=4)
-        ttk.Label(param_frame, text="  模型类型:").pack(side="left")
-        self.infer_model_type_var = tk.StringVar(value="mlp")
-        infer_model_type_combo = ttk.Combobox(param_frame, textvariable=self.infer_model_type_var,
-                                               width=12, state="readonly",
-                                               values=["mlp", "transformer"])
-        infer_model_type_combo.pack(side="left", padx=4)
+        ttk.Label(param_frame, text="  架构: 自动识别").pack(side="left")
         ttk.Label(param_frame, text="    ").pack(side="left")
         self.infer_gpu_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(param_frame, text="GPU 加速", variable=self.infer_gpu_var).pack(side="left", padx=4)
@@ -534,7 +529,6 @@ class NeuralNetGUI(tk.Tk):
 
         cmd = [exe, tmp.name,
                "--model", self.infer_model_var.get(),
-               "--model-type", self.infer_model_type_var.get(),
                "--topk", str(self.infer_topk_var.get())]
         if self.infer_gpu_var.get():
             cmd.append("--gpu")
@@ -577,7 +571,6 @@ class NeuralNetGUI(tk.Tk):
 
         cmd = [exe, input_path,
                "--model", self.infer_model_var.get(),
-               "--model-type", self.infer_model_type_var.get(),
                "--topk", str(self.infer_topk_var.get())]
         if self.infer_gpu_var.get():
             cmd.append("--gpu")
@@ -689,7 +682,7 @@ class NeuralNetGUI(tk.Tk):
 
         # 词表路径
         ttk.Label(f, text="词表 JSON 路径:").grid(row=row, column=0, sticky="w")
-        self.text_train_vocab_var = tk.StringVar(value="gpt_bpe.json")
+        self.text_train_vocab_var = tk.StringVar(value="bpe_vocab.json")
         ttk.Entry(f, textvariable=self.text_train_vocab_var, width=48).grid(row=row, column=1, padx=4)
         ttk.Button(f, text="浏览…", command=self._browse_text_train_vocab).grid(row=row, column=2)
         row += 1
@@ -889,7 +882,7 @@ class NeuralNetGUI(tk.Tk):
 
         # 词表路径
         ttk.Label(f, text="词表 JSON 路径:").grid(row=row, column=0, sticky="w")
-        self.text_infer_vocab_var = tk.StringVar(value="gpt_bpe.json")
+        self.text_infer_vocab_var = tk.StringVar(value="bpe_vocab.json")
         ttk.Entry(f, textvariable=self.text_infer_vocab_var, width=48).grid(row=row, column=1, padx=4)
         ttk.Button(f, text="浏览…", command=self._browse_text_infer_vocab).grid(row=row, column=2)
         row += 1
@@ -906,39 +899,8 @@ class NeuralNetGUI(tk.Tk):
 
         ttk.Label(param_frame, text="温度:").grid(row=0, column=2, sticky="w")
         self.text_infer_temp_var = tk.DoubleVar(value=0.8)
-        ttk.Spinbox(param_frame, from_=0.1, to=2.0, increment=0.1, width=6,
+        ttk.Spinbox(param_frame, from_=0.0, to=2.0, increment=0.1, width=6,
                      textvariable=self.text_infer_temp_var, format="%.1f").grid(row=0, column=3, padx=(0, 16))
-        row += 1
-
-        # 模型架构（需与训练时一致）
-        arch_frame = ttk.LabelFrame(f, text="模型架构（需与训练时一致）", padding=6)
-        arch_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
-        row += 1
-
-        ttk.Label(arch_frame, text="模型维度:").grid(row=0, column=0, sticky="w")
-        self.text_infer_d_model_var = tk.IntVar(value=128)
-        ttk.Spinbox(arch_frame, from_=32, to=512, width=6,
-                     textvariable=self.text_infer_d_model_var).grid(row=0, column=1, padx=(0, 16))
-
-        ttk.Label(arch_frame, text="注意力头:").grid(row=0, column=2, sticky="w")
-        self.text_infer_num_heads_var = tk.IntVar(value=4)
-        ttk.Spinbox(arch_frame, from_=1, to=16, width=6,
-                     textvariable=self.text_infer_num_heads_var).grid(row=0, column=3, padx=(0, 16))
-
-        ttk.Label(arch_frame, text="层数:").grid(row=0, column=4, sticky="w")
-        self.text_infer_num_layers_var = tk.IntVar(value=4)
-        ttk.Spinbox(arch_frame, from_=1, to=16, width=6,
-                     textvariable=self.text_infer_num_layers_var).grid(row=0, column=5)
-
-        ttk.Label(arch_frame, text="FFN 维度:").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self.text_infer_d_ff_var = tk.IntVar(value=512)
-        ttk.Spinbox(arch_frame, from_=64, to=2048, width=6,
-                     textvariable=self.text_infer_d_ff_var).grid(row=1, column=1, pady=(6, 0), padx=(0, 16))
-
-        ttk.Label(arch_frame, text="序列长度:").grid(row=1, column=2, sticky="w", pady=(6, 0))
-        self.text_infer_seq_len_var = tk.IntVar(value=256)
-        ttk.Spinbox(arch_frame, from_=16, to=1024, width=6,
-                     textvariable=self.text_infer_seq_len_var).grid(row=1, column=3, pady=(6, 0))
         row += 1
 
         # ── GPU 加速 ──
@@ -1016,12 +978,7 @@ class NeuralNetGUI(tk.Tk):
                "--vocab", self.text_infer_vocab_var.get(),
                "--prompt", prompt,
                "--max-tokens", str(self.text_infer_max_tokens_var.get()),
-               "--temperature", str(self.text_infer_temp_var.get()),
-               "--d-model", str(self.text_infer_d_model_var.get()),
-               "--num-heads", str(self.text_infer_num_heads_var.get()),
-               "--num-layers", str(self.text_infer_num_layers_var.get()),
-               "--d-ff", str(self.text_infer_d_ff_var.get()),
-               "--seq-len", str(self.text_infer_seq_len_var.get())]
+               "--temperature", str(self.text_infer_temp_var.get())]
         if self.text_infer_show_tokens_var.get():
             cmd.append("--show-tokens")
         if self.text_infer_gpu_var.get():
@@ -1094,7 +1051,7 @@ class NeuralNetGUI(tk.Tk):
 
         # 输出路径
         ttk.Label(f, text="输出 JSON 路径:").grid(row=row, column=0, sticky="w")
-        self.tokenizer_train_output_var = tk.StringVar(value="tokenizer.json")
+        self.tokenizer_train_output_var = tk.StringVar(value="bpe_vocab.json")
         ttk.Entry(f, textvariable=self.tokenizer_train_output_var, width=48).grid(row=row, column=1, padx=4)
         ttk.Button(f, text="浏览…", command=self._browse_tokenizer_train_output).grid(row=row, column=2)
         row += 1
@@ -1104,10 +1061,7 @@ class NeuralNetGUI(tk.Tk):
         param_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
         row += 1
 
-        ttk.Label(param_frame, text="分词器类型:").grid(row=0, column=0, sticky="w")
-        self.tokenizer_train_type_var = tk.StringVar(value="bpe")
-        ttk.Combobox(param_frame, textvariable=self.tokenizer_train_type_var, width=14, state="readonly",
-                     values=["wordzip", "space", "bpe"]).grid(row=0, column=1, sticky="w")
+        ttk.Label(param_frame, text="分词器: BPE (字节级, 支持 UTF-8)").grid(row=0, column=0, sticky="w", columnspan=2)
 
         ttk.Label(param_frame, text="词表大小:").grid(row=0, column=2, sticky="w")
         self.tokenizer_train_vocab_size_var = tk.IntVar(value=5000)
@@ -1159,7 +1113,6 @@ class NeuralNetGUI(tk.Tk):
             return
 
         cmd = [exe, text_file,
-               "--type", self.tokenizer_train_type_var.get(),
                "--vocab-size", str(self.tokenizer_train_vocab_size_var.get()),
                "--output", self.tokenizer_train_output_var.get()]
 
@@ -1195,7 +1148,7 @@ class NeuralNetGUI(tk.Tk):
 
         # 模型路径
         ttk.Label(f, text="词表 JSON 路径:").grid(row=row, column=0, sticky="w")
-        self.tokenizer_infer_model_var = tk.StringVar(value="tokenizer.json")
+        self.tokenizer_infer_model_var = tk.StringVar(value="bpe_vocab.json")
         ttk.Entry(f, textvariable=self.tokenizer_infer_model_var, width=48).grid(row=row, column=1, padx=4)
         ttk.Button(f, text="浏览…", command=self._browse_tokenizer_infer_model).grid(row=row, column=2)
         row += 1
@@ -1271,16 +1224,16 @@ class NeuralNetGUI(tk.Tk):
             return
 
         mode = self.tokenizer_infer_mode_var.get()
-        cmd = [exe, "--model", self.tokenizer_infer_model_var.get()]
+        cmd = [exe, "--vocab", self.tokenizer_infer_model_var.get()]
         if mode == "text":
-            cmd += ["--text", input_text]
+            cmd += ["--encode", input_text]
         elif mode == "encode":
             cmd += ["--encode", input_text]
         elif mode == "decode":
             cmd += ["--decode", input_text]
 
         if self.tokenizer_infer_show_tokens_var.get():
-            cmd.append("--show-tokens")
+            cmd.append("--show-bytes")
 
         self._log_tokenizer_infer(f"$ {' '.join(cmd)}\n")
         self.tokenizer_infer_start_btn.config(state="disabled")

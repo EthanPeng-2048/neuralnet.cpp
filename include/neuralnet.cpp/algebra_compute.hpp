@@ -41,23 +41,12 @@ void apply(Span x, const Expr &expr)
     const auto n = x.size();
     if (n == 0) return;
 
-    // 通过 SmartPolicy 自动选择串行/并行执行
-    // 使用 iota 视图生成索引序列，for_each 按索引分发
-    if (n >= SmartPolicy::PARALLEL_THRESHOLD)
-    {
-        auto indices = std::views::iota(std::size_t{0}, n);
-        SmartPolicy::for_each(indices.begin(), indices.end(),
-            [&x, &expr](std::size_t i) noexcept
-            {
-                x[i] = static_cast<Scalar>(expr.eval(i));
-            });
-    }
-    else
-    {
-        // 小数据量：串行执行，避免线程池开销
-        for (std::size_t i = 0; i < n; ++i)
+    auto indices = std::views::iota(std::size_t{0}, n);
+    nn::for_each(indices.begin(), indices.end(),
+        [&x, &expr](std::size_t i) noexcept
+        {
             x[i] = static_cast<Scalar>(expr.eval(i));
-    }
+        });
 }
 
 } // namespace nn::compute
