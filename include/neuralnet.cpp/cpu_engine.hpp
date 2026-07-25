@@ -109,7 +109,8 @@ public:
     }
 
     // ── gather_rows: 按 indices 从 table 中按行查表 ──
-    //   table: (vocab, D), indices: (num_indices,), 输出: (num_indices, D)
+    //   table: (vocab, D), indices: 任意形状，按 flat 遍历所有元素
+    //   输出: (num_indices, D)，out[i] = table[flat_indices[i]]
     //   越界索引返回零行（防御性，不抛错）
     //
     // 并行策略：每个输出行独立，按行切分到线程。
@@ -126,7 +127,7 @@ public:
         const Matrix& idx = indices.cpu_matrix();
         const std::size_t vocab = tbl.rows();
         const std::size_t D = tbl.cols();
-        const std::size_t num = idx.rows();  // indices 视为 (num, 1) 形状
+        const std::size_t num = idx.size();  // 遍历 indices 所有元素（支持任意形状）
 
         Matrix result(num, D);
         auto dst_span = result.span();
@@ -173,8 +174,8 @@ public:
     }
 
     // ── scatter_add_rows: 按 indices 把 grad 的行原子累加到 dst ──
-    //   dst: (vocab, D) 原地修改, indices: (num_indices,), grad: (num_indices, D)
-    //   语义: dst[indices[i]] += grad[i]
+    //   dst: (vocab, D) 原地修改, indices: 任意形状（按 flat 遍历）, grad: (num_indices, D)
+    //   语义: dst[flat_indices[i]] += grad[i]
     [[nodiscard]] Result<void> scatter_add_rows(
         Tensor& dst, const Tensor& indices, const Tensor& grad) override
     {
@@ -188,7 +189,7 @@ public:
         const Matrix& g = grad.cpu_matrix();
         const std::size_t vocab = d.rows();
         const std::size_t D = d.cols();
-        const std::size_t num = idx.rows();
+        const std::size_t num = idx.size();  // 遍历 indices 所有元素（支持任意形状）
 
         auto dst_span = d.span();
         const auto idx_span = idx.span();
@@ -270,6 +271,14 @@ public:
         }
 
         return Tensor::from_matrix(std::move(out));
+    }
+
+    // ── 矩阵转置：A (R, C) → out (C, R) ──
+    [[nodiscard]] Result<Tensor> transpose(const Tensor& A) override
+    {
+        if (A.is_gpu())
+            return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+        return Tensor::from_matrix(A.cpu_matrix().transpose());
     }
 
     // ══════════════════════════════════════════════════════════════════════

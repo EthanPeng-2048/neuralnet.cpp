@@ -169,6 +169,7 @@ public:
     // ── gather_rows: 按 indices 从 table 中按行查表 ──
     // 当前实现为 GPU→CPU 下载 + CPU 查表 + CPU→GPU 上传（fallback）。
     // 后续可优化为专门 gather shader 直接在 GPU 端执行。
+    // indices 支持任意形状，按 flat 遍历所有元素。
     [[nodiscard]] Result<Tensor> gather_rows(
         const Tensor& table, const Tensor& indices) override
     {
@@ -180,7 +181,7 @@ public:
 
         const std::size_t vocab = tbl_m->rows();
         const std::size_t D = tbl_m->cols();
-        const std::size_t num = idx_m->rows();
+        const std::size_t num = idx_m->size();  // 遍历 indices 所有元素（支持任意形状）
 
         Matrix result(num, D);
         const auto tbl_span = tbl_m->span();
@@ -219,7 +220,7 @@ public:
 
         const std::size_t vocab = dst_m->rows();
         const std::size_t D = dst_m->cols();
-        const std::size_t num = idx_m->rows();
+        const std::size_t num = idx_m->size();  // 遍历 indices 所有元素（支持任意形状）
 
         auto dst_span = dst_m->span();  // 注意：这是 to_matrix 的拷贝
         const auto idx_span = idx_m->span();
@@ -283,6 +284,12 @@ public:
         if (!r)
             return std::unexpected(r.error());
         return Tensor::from_gpu(std::move(*r));
+    }
+
+    // ── 矩阵转置：GPU 端尚未实现 ──
+    [[nodiscard]] Result<Tensor> transpose(const Tensor& /*A*/) override
+    {
+        return std::unexpected(Error{"GpuEngine::transpose not yet implemented"});
     }
 
     // ══════════════════════════════════════════════════════════════════════

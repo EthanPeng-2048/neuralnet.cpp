@@ -141,7 +141,9 @@ public:
     [[nodiscard]] virtual Result<Tensor> rearrange_3d(
         const Tensor& x, std::size_t M, std::size_t B, std::size_t N,
         bool inverse = false) = 0;
-
+    // ── 矩阵转置：A (R, C) → out (C, R) ──
+    // 纯 layout 操作，零算法语义。用于 embedding 列布局转换等场景。
+    [[nodiscard]] virtual Result<Tensor> transpose(const Tensor& A) = 0;
     // ══════════════════════════════════════════════════════════════════════
     // 矩阵级原语
     // ══════════════════════════════════════════════════════════════════════

@@ -1795,7 +1795,12 @@ private:
     // 反向缓存
     Tensor stored_x_;                      // forward 输入 (d_model, seq*batch)
     std::vector<std::size_t> stored_tokens_flat_;  // 所有 token IDs (seq*batch)
+    Tensor stored_tokens_tensor_;          // token IDs 的 Tensor 版本 (total, 1)
     std::size_t batch_size_ = 0;
+
+    // pos_indices 缓存（避免每 step 重建）
+    Tensor pos_indices_cache_;             // (total, 1) 值为 [0,0,..,1,1,..,...,seq-1,..]
+    std::size_t pos_indices_key_ = 0;      // 缓存键: (batch_size << 16) | seq_len
 
 public:
     GPTModel(ComputeEngine& engine,
@@ -1882,10 +1887,12 @@ public:
         if (!all_emb) return std::unexpected(all_emb.error());
 
         // ── 2. 下载 input 记录 token IDs（供 backward 的 scatter_add_rows） ──
+        // 同时构造 Tensor 版本，避免 backward 时再次 from_matrix
         auto in_m = engine.to_matrix(input);
         if (!in_m) return std::unexpected(in_m.error());
         const auto in_span = in_m->span();
         stored_tokens_flat_.resize(total);
+        Matrix st_m(total, 1);
         for (std::size_t i = 0; i < total; ++i)
         {
             auto tid = static_cast<std::size_t>(in_span[i]);
@@ -1894,34 +1901,46 @@ public:
                     "GPTModel::forward token id out of range: " +
                     std::to_string(tid)});
             stored_tokens_flat_[i] = tid;
+            st_m.set_value_unchecked(i, 0, static_cast<Scalar>(tid));
+        }
+        auto st_t = engine.from_matrix(st_m);
+        if (!st_t) return std::unexpected(st_t.error());
+        stored_tokens_tensor_ = std::move(*st_t);
+
+        // ── 2.5 确保 pos_indices 缓存有效 ──
+        {
+            const std::size_t key = (batch_size_ << 16) | seq_len;
+            if (pos_indices_key_ != key)
+            {
+                Matrix pidx_m(total, 1);
+                for (std::size_t t = 0; t < seq_len; ++t)
+                    for (std::size_t b = 0; b < batch_size_; ++b)
+                        pidx_m.set_value_unchecked(t * batch_size_ + b, 0,
+                            static_cast<Scalar>(t));
+                auto pidx_t = engine.from_matrix(pidx_m);
+                if (!pidx_t) return std::unexpected(pidx_t.error());
+                pos_indices_cache_ = std::move(*pidx_t);
+                pos_indices_key_ = key;
+            }
         }
 
-        // ── 3. 构造 x: (d_model, seq*batch) batch-major 列布局 ──
-        //   x[d, t*batch+b] = all_emb[t*batch+b, d] + pos_emb[t, d]
-        //   （batch 边界 CPU 预处理：gather_rows 输出 row-major，需转置为列布局
-        //    并加上 pos_emb；与 PatchEmbedding 的 patch 提取同性质）
-        auto all_m = engine.to_matrix(*all_emb);
-        if (!all_m) return std::unexpected(all_m.error());
-        auto pe_m = engine.to_matrix(pos_emb_);
-        if (!pe_m) return std::unexpected(pe_m.error());
+        // ── 3. 构造 x: (d_model, seq*batch) 用原语组合 ──
+        //   x = transpose(gather(token_emb, input)) + transpose(gather(pos_emb, pos_idx))
+        auto all_T = engine.transpose(*all_emb);
+        if (!all_T) return std::unexpected(all_T.error());
 
-        Matrix x_cpu(d_model_, total);
-        for (std::size_t t = 0; t < seq_len; ++t)
-            for (std::size_t b = 0; b < batch_size_; ++b)
-            {
-                const std::size_t idx = t * batch_size_ + b;  // 同时是 all_emb 行和 x 列
-                for (std::size_t d = 0; d < d_model_; ++d)
-                    x_cpu.set_value_unchecked(d, idx,
-                        all_m->at_unchecked(idx, d) +
-                        pe_m->at_unchecked(t, d));
-            }
+        auto pos_gathered = engine.gather_rows(pos_emb_, pos_indices_cache_);
+        if (!pos_gathered) return std::unexpected(pos_gathered.error());
 
-        auto x_t = engine.from_matrix(x_cpu);
-        if (!x_t) return std::unexpected(x_t.error());
-        stored_x_ = *x_t;  // 缓存供 backward（GPTBlock 内部也有自己的缓存）
+        auto pos_T = engine.transpose(*pos_gathered);
+        if (!pos_T) return std::unexpected(pos_T.error());
+
+        auto x_result = engine.elementwise_binary(BinaryOp::Add, *all_T, *pos_T);
+        if (!x_result) return std::unexpected(x_result.error());
+        stored_x_ = *x_result;  // 缓存供 backward（GPTBlock 内部也有自己的缓存）
 
         // ── 4. 通过 Transformer 块（全批量化，无 per-sample 循环） ──
-        Tensor x = std::move(*x_t);
+        Tensor x = std::move(*x_result);
         for (auto& blk : blocks_)
         {
             auto r = blk.forward(engine, x);
@@ -1942,7 +1961,6 @@ public:
         ComputeEngine& engine, const Tensor& grad_output) override
     {
         const std::size_t seq_len = seq_len_;
-        const std::size_t total = batch_size_ * seq_len;
 
         (void)engine.zero(grad_token_emb_);
         (void)engine.zero(grad_pos_emb_);
@@ -1965,41 +1983,25 @@ public:
             grad_x = std::move(*br);
         }
 
-        // ── 4. 提取 grad_x 并准备 scatter_add_rows ──
-        //   grad_x: (d_model, seq*batch) — col t*batch+b = grad w.r.t. x[:, t*batch+b]
-        //   需要:
-        //     indices_flat: (total, 1) — 所有 token IDs（与 forward 顺序一致）
-        //     grad_flat: (total, d_model) — row i = grad_x[:, i]
-        //     pos_grad: (seq, d_model) — pos_grad[t, d] = Σ_b grad_x[d, t*batch+b]
+        // ── 4. 转置 grad_x + pos_grad CPU 辅助 ──
+        //   grad_x: (d_model, seq*batch)
+        //   grad_T = transpose(grad_x) → (total, d_model) — 用于 scatter_add_rows
+        //   pos_grad[t, d] = Σ_b grad_x[d, t*batch+b] — 数据量小，CPU 辅助
+        auto grad_T = engine.transpose(grad_x);
+        if (!grad_T) return std::unexpected(grad_T.error());
+
         auto gx_m = engine.to_matrix(grad_x);
         if (!gx_m) return std::unexpected(gx_m.error());
-
-        Matrix indices_flat(total, 1);
-        Matrix grad_flat(total, d_model_);
         Matrix pos_grad(seq_len, d_model_);
-
         for (std::size_t t = 0; t < seq_len; ++t)
             for (std::size_t b = 0; b < batch_size_; ++b)
-            {
-                const std::size_t idx = t * batch_size_ + b;  // 与 forward 一致
-                indices_flat.set_value_unchecked(idx, 0,
-                    static_cast<Scalar>(stored_tokens_flat_[idx]));
                 for (std::size_t d = 0; d < d_model_; ++d)
-                {
-                    const Scalar v = gx_m->at_unchecked(d, idx);
-                    grad_flat.set_value_unchecked(idx, d, v);
-                    // pos_emb 梯度：所有 batch 共享同一个 pos_emb[t]
                     pos_grad.set_value_unchecked(t, d,
-                        pos_grad.at_unchecked(t, d) + v);
-                }
-            }
+                        pos_grad.at_unchecked(t, d) +
+                        gx_m->at_unchecked(d, t * batch_size_ + b));
 
-        // ── 5. scatter_add_rows: grad_token_emb_[tokens] += grad_x ──
-        auto idx_t = engine.from_matrix(indices_flat);
-        if (!idx_t) return std::unexpected(idx_t.error());
-        auto grad_t = engine.from_matrix(grad_flat);
-        if (!grad_t) return std::unexpected(grad_t.error());
-        auto sr = engine.scatter_add_rows(grad_token_emb_, *idx_t, *grad_t);
+        // ── 5. scatter_add_rows: grad_token_emb_[tokens] += grad_T ──
+        auto sr = engine.scatter_add_rows(grad_token_emb_, stored_tokens_tensor_, *grad_T);
         if (!sr) return std::unexpected(sr.error());
 
         // ── 6. add pos_grad ──

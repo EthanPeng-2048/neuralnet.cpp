@@ -168,14 +168,19 @@ class NeuralNetGUI(tk.Tk):
         ttk.Label(param_frame, text="优化器:").grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.train_opt_var = tk.StringVar(value="adam")
         opt_combo = ttk.Combobox(param_frame, textvariable=self.train_opt_var, width=14, state="readonly",
-                                 values=["sgd", "sgd_momentum", "adam"])
+                                 values=["sgd", "sgd_momentum", "adam", "adamw", "muon"])
         opt_combo.grid(row=1, column=1, sticky="w", pady=(6, 0))
 
-        ttk.Label(param_frame, text="模型类型:").grid(row=1, column=2, sticky="w", pady=(6, 0))
+        ttk.Label(param_frame, text="权重衰减:").grid(row=1, column=2, sticky="w", pady=(6, 0))
+        self.train_weight_decay_var = tk.DoubleVar(value=0.01)
+        ttk.Spinbox(param_frame, from_=0.0, to=1.0, increment=0.001, width=8,
+                     textvariable=self.train_weight_decay_var, format="%.3f").grid(row=1, column=3, padx=(0, 16), pady=(6, 0))
+
+        ttk.Label(param_frame, text="模型类型:").grid(row=2, column=0, sticky="w", pady=(6, 0))
         self.train_model_type_var = tk.StringVar(value="mlp")
         model_type_combo = ttk.Combobox(param_frame, textvariable=self.train_model_type_var, width=14, state="readonly",
                                         values=["mlp", "transformer"])
-        model_type_combo.grid(row=1, column=3, sticky="w", pady=(6, 0))
+        model_type_combo.grid(row=2, column=1, sticky="w", pady=(6, 0))
         model_type_combo.bind("<<ComboboxSelected>>", lambda e: self._toggle_model_params())
         row += 1
 
@@ -224,6 +229,22 @@ class NeuralNetGUI(tk.Tk):
         self.train_gpu_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(f, text="启用 GPU 加速 (需要 Vulkan SDK)", variable=self.train_gpu_var).grid(
             row=row, column=0, columnspan=3, sticky="w")
+        row += 1
+
+        # ── 打乱 batch 顺序 ──
+        self.train_shuffle_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f, text="每 epoch 打乱 batch 顺序 (--shuffle-steps)", variable=self.train_shuffle_var).grid(
+            row=row, column=0, columnspan=3, sticky="w")
+        row += 1
+
+        # ── 最大训练样本数 ──
+        max_samples_frame = ttk.Frame(f)
+        max_samples_frame.grid(row=row, column=0, columnspan=3, sticky="w")
+        ttk.Label(max_samples_frame, text="最大训练样本数:").pack(side="left")
+        self.train_max_samples_var = tk.IntVar(value=0)
+        ttk.Spinbox(max_samples_frame, from_=0, to=100000, width=8,
+                     textvariable=self.train_max_samples_var).pack(side="left", padx=4)
+        ttk.Label(max_samples_frame, text="(0=全部)").pack(side="left")
         row += 1
 
         # 按钮
@@ -291,9 +312,17 @@ class NeuralNetGUI(tk.Tk):
                "--lr", str(self.train_lr_var.get()),
                "--batch-size", str(self.train_batch_var.get()),
                "--optimizer", self.train_opt_var.get(),
+               "--weight-decay", str(self.train_weight_decay_var.get()),
                "--arch", self.train_model_type_var.get()]
         if self.train_resume_var.get():
             cmd += ["--resume", self.train_resume_path_var.get()]
+
+        # 最大训练样本数
+        if self.train_max_samples_var.get() > 0:
+            cmd += ["--max-samples", str(self.train_max_samples_var.get())]
+
+        # 打乱 batch 顺序
+        cmd += ["--shuffle-steps", str(self.train_shuffle_var.get()).lower()]
 
         # 模型架构参数
         if self.train_model_type_var.get() == "mlp":
@@ -365,6 +394,8 @@ class NeuralNetGUI(tk.Tk):
         ttk.Label(param_frame, text="    ").pack(side="left")
         self.infer_gpu_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(param_frame, text="GPU 加速", variable=self.infer_gpu_var).pack(side="left", padx=4)
+        self.infer_show_pixels_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(param_frame, text="显示像素", variable=self.infer_show_pixels_var).pack(side="left", padx=4)
         row += 1
 
         # 按钮
@@ -530,6 +561,8 @@ class NeuralNetGUI(tk.Tk):
         cmd = [exe, tmp.name,
                "--model", self.infer_model_var.get(),
                "--topk", str(self.infer_topk_var.get())]
+        if self.infer_show_pixels_var.get():
+            cmd.append("--show-pixels")
         if self.infer_gpu_var.get():
             cmd.append("--gpu")
 
@@ -572,6 +605,8 @@ class NeuralNetGUI(tk.Tk):
         cmd = [exe, input_path,
                "--model", self.infer_model_var.get(),
                "--topk", str(self.infer_topk_var.get())]
+        if self.infer_show_pixels_var.get():
+            cmd.append("--show-pixels")
         if self.infer_gpu_var.get():
             cmd.append("--gpu")
 
@@ -732,7 +767,17 @@ class NeuralNetGUI(tk.Tk):
         ttk.Label(param_frame, text="优化器:").grid(row=1, column=2, sticky="w", pady=(6, 0))
         self.text_train_opt_var = tk.StringVar(value="adam")
         ttk.Combobox(param_frame, textvariable=self.text_train_opt_var, width=14, state="readonly",
-                     values=["sgd", "sgd_momentum", "adam"]).grid(row=1, column=3, sticky="w", pady=(6, 0))
+                     values=["sgd", "sgd_momentum", "adam", "adamw", "muon"]).grid(row=1, column=3, sticky="w", pady=(6, 0))
+
+        ttk.Label(param_frame, text="权重衰减:").grid(row=1, column=4, sticky="w", pady=(6, 0))
+        self.text_train_weight_decay_var = tk.DoubleVar(value=0.01)
+        ttk.Spinbox(param_frame, from_=0.0, to=1.0, increment=0.001, width=8,
+                     textvariable=self.text_train_weight_decay_var, format="%.3f").grid(row=1, column=5, pady=(6, 0))
+
+        ttk.Label(param_frame, text="日志间隔:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.text_train_log_interval_var = tk.IntVar(value=50)
+        ttk.Spinbox(param_frame, from_=1, to=1000, width=6,
+                     textvariable=self.text_train_log_interval_var).grid(row=2, column=1, pady=(6, 0))
 
         # 模型架构参数
         arch_frame = ttk.LabelFrame(f, text="模型架构", padding=6)
@@ -834,10 +879,12 @@ class NeuralNetGUI(tk.Tk):
                "--batch-size", str(self.text_train_batch_var.get()),
                "--seq-len", str(self.text_train_seq_len_var.get()),
                "--optimizer", self.text_train_opt_var.get(),
+               "--weight-decay", str(self.text_train_weight_decay_var.get()),
                "--d-model", str(self.text_train_d_model_var.get()),
                "--num-heads", str(self.text_train_num_heads_var.get()),
                "--num-layers", str(self.text_train_num_layers_var.get()),
-               "--d-ff", str(self.text_train_d_ff_var.get())]
+               "--d-ff", str(self.text_train_d_ff_var.get()),
+               "--log-interval", str(self.text_train_log_interval_var.get())]
         if self.text_train_resume_var.get():
             cmd += ["--resume", self.text_train_resume_path_var.get()]
         if self.text_train_gpu_var.get():
@@ -923,6 +970,12 @@ class NeuralNetGUI(tk.Tk):
         prompt_entry.bind("<Return>", lambda e: self._start_text_infer())
         row += 1
 
+        # ── 交互模式 ──
+        self.text_infer_interactive_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text="交互式生成模式 (interactive)", variable=self.text_infer_interactive_var).grid(
+            row=row, column=0, columnspan=3, sticky="w")
+        row += 1
+
         # 按钮
         btn_frame = ttk.Frame(f)
         btn_frame.grid(row=row, column=0, columnspan=3, pady=4)
@@ -976,9 +1029,12 @@ class NeuralNetGUI(tk.Tk):
         cmd = [exe,
                "--model", self.text_infer_model_var.get(),
                "--vocab", self.text_infer_vocab_var.get(),
-               "--prompt", prompt,
                "--max-tokens", str(self.text_infer_max_tokens_var.get()),
                "--temperature", str(self.text_infer_temp_var.get())]
+        if self.text_infer_interactive_var.get():
+            cmd.append("--interactive")
+        else:
+            cmd += ["--prompt", prompt]
         if self.text_infer_show_tokens_var.get():
             cmd.append("--show-tokens")
         if self.text_infer_gpu_var.get():
@@ -992,24 +1048,50 @@ class NeuralNetGUI(tk.Tk):
         self.text_infer_output.delete("1.0", "end")
         self.text_infer_output.config(state="disabled")
 
-        def _run():
-            try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-                self.after(0, lambda: self._log_text_infer(result.stdout))
-                if result.stderr:
-                    self.after(0, lambda: self._log_text_infer(result.stderr))
-                # 解析输出，提取生成的文本
-                self.after(0, lambda: self._show_text_output(result.stdout, prompt))
-            except FileNotFoundError:
-                self.after(0, lambda: self._log_text_infer("错误: 可执行文件未找到\n"))
-            except subprocess.TimeoutExpired:
-                self.after(0, lambda: self._log_text_infer("错误: 生成超时\n"))
-            except Exception as e:
-                self.after(0, lambda: self._log_text_infer(f"错误: {e}\n"))
-            finally:
-                self.after(0, lambda: self.text_infer_start_btn.config(state="normal"))
-
-        threading.Thread(target=_run, daemon=True).start()
+        if self.text_infer_interactive_var.get():
+            # 交互模式：通过 stdin 发送 prompt，然后发送 quit 退出
+            def _run_interactive():
+                try:
+                    proc = subprocess.Popen(
+                        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True, bufsize=1,
+                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                    # 发送 prompt + quit
+                    proc.stdin.write(prompt + "\n")
+                    proc.stdin.write("quit\n")
+                    proc.stdin.flush()
+                    proc.stdin.close()
+                    output, _ = proc.communicate(timeout=120)
+                    self.after(0, lambda: self._log_text_infer(output))
+                    self.after(0, lambda: self._show_text_output(output, prompt))
+                except FileNotFoundError:
+                    self.after(0, lambda: self._log_text_infer("错误: 可执行文件未找到\n"))
+                except subprocess.TimeoutExpired:
+                    self.after(0, lambda: self._log_text_infer("错误: 生成超时\n"))
+                    proc.kill()
+                except Exception as e:
+                    self.after(0, lambda: self._log_text_infer(f"错误: {e}\n"))
+                finally:
+                    self.after(0, lambda: self.text_infer_start_btn.config(state="normal"))
+            threading.Thread(target=_run_interactive, daemon=True).start()
+        else:
+            # 单次推理模式
+            def _run():
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                    self.after(0, lambda: self._log_text_infer(result.stdout))
+                    if result.stderr:
+                        self.after(0, lambda: self._log_text_infer(result.stderr))
+                    self.after(0, lambda: self._show_text_output(result.stdout, prompt))
+                except FileNotFoundError:
+                    self.after(0, lambda: self._log_text_infer("错误: 可执行文件未找到\n"))
+                except subprocess.TimeoutExpired:
+                    self.after(0, lambda: self._log_text_infer("错误: 生成超时\n"))
+                except Exception as e:
+                    self.after(0, lambda: self._log_text_infer(f"错误: {e}\n"))
+                finally:
+                    self.after(0, lambda: self.text_infer_start_btn.config(state="normal"))
+            threading.Thread(target=_run, daemon=True).start()
 
     def _show_text_output(self, output: str, prompt: str):
         """解析 text_infer 输出并显示"""
@@ -1061,12 +1143,21 @@ class NeuralNetGUI(tk.Tk):
         param_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
         row += 1
 
-        ttk.Label(param_frame, text="分词器: BPE (字节级, 支持 UTF-8)").grid(row=0, column=0, sticky="w", columnspan=2)
+        ttk.Label(param_frame, text="分词器类型:").grid(row=0, column=0, sticky="w")
+        self.tokenizer_train_type_var = tk.StringVar(value="bpe")
+        ttk.Combobox(param_frame, textvariable=self.tokenizer_train_type_var, width=14, state="readonly",
+                     values=["bpe", "charbpe"]).grid(row=0, column=1, sticky="w")
+        ttk.Label(param_frame, text="(bpe=字节级, charbpe=字符级, 中文推荐)").grid(row=0, column=2, sticky="w", columnspan=2)
 
-        ttk.Label(param_frame, text="词表大小:").grid(row=0, column=2, sticky="w")
+        ttk.Label(param_frame, text="词表大小:").grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.tokenizer_train_vocab_size_var = tk.IntVar(value=5000)
         ttk.Spinbox(param_frame, from_=256, to=100000, width=8,
-                     textvariable=self.tokenizer_train_vocab_size_var).grid(row=0, column=3, padx=(0, 16))
+                     textvariable=self.tokenizer_train_vocab_size_var).grid(row=1, column=1, padx=(0, 16), pady=(6, 0))
+
+        ttk.Label(param_frame, text="最小合并频率:").grid(row=1, column=2, sticky="w", pady=(6, 0))
+        self.tokenizer_train_min_freq_var = tk.IntVar(value=2)
+        ttk.Spinbox(param_frame, from_=1, to=100, width=6,
+                     textvariable=self.tokenizer_train_min_freq_var).grid(row=1, column=3, pady=(6, 0))
         row += 1
 
         # 按钮
@@ -1113,7 +1204,9 @@ class NeuralNetGUI(tk.Tk):
             return
 
         cmd = [exe, text_file,
+               "--tokenizer", self.tokenizer_train_type_var.get(),
                "--vocab-size", str(self.tokenizer_train_vocab_size_var.get()),
+               "--min-freq", str(self.tokenizer_train_min_freq_var.get()),
                "--output", self.tokenizer_train_output_var.get()]
 
         self._log_tokenizer_train(f"$ {' '.join(cmd)}\n")
@@ -1169,6 +1262,19 @@ class NeuralNetGUI(tk.Tk):
         self.tokenizer_infer_show_tokens_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(param_frame, text="显示 Token 详情",
                         variable=self.tokenizer_infer_show_tokens_var).grid(row=0, column=3, sticky="w", padx=(16, 0))
+
+        # 编码文件
+        self.tokenizer_infer_encode_file_var = tk.StringVar(value="")
+        ttk.Label(param_frame, text="").grid(row=0, column=4)  # spacer
+        row += 1
+
+        # 编码文件路径
+        encode_file_frame = ttk.Frame(f)
+        encode_file_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+        ttk.Label(encode_file_frame, text="或编码文件:").pack(side="left")
+        self.tokenizer_infer_file_var = tk.StringVar()
+        ttk.Entry(encode_file_frame, textvariable=self.tokenizer_infer_file_var, width=38).pack(side="left", padx=4)
+        ttk.Button(encode_file_frame, text="浏览…", command=self._browse_tokenizer_infer_file).pack(side="left")
         row += 1
 
         # 输入
@@ -1224,10 +1330,12 @@ class NeuralNetGUI(tk.Tk):
             return
 
         mode = self.tokenizer_infer_mode_var.get()
+        encode_file = self.tokenizer_infer_file_var.get().strip()
         cmd = [exe, "--vocab", self.tokenizer_infer_model_var.get()]
-        if mode == "text":
-            cmd += ["--encode", input_text]
-        elif mode == "encode":
+        if encode_file:
+            # 如果指定了文件路径，使用 --encode-file
+            cmd += ["--encode-file", encode_file]
+        elif mode == "text" or mode == "encode":
             cmd += ["--encode", input_text]
         elif mode == "decode":
             cmd += ["--decode", input_text]
@@ -1267,6 +1375,12 @@ class NeuralNetGUI(tk.Tk):
         self.tokenizer_infer_output.delete("1.0", "end")
         self.tokenizer_infer_output.insert("1.0", output)
         self.tokenizer_infer_output.config(state="disabled")
+
+    def _browse_tokenizer_infer_file(self):
+        path = filedialog.askopenfilename(title="选择要编码的文本文件",
+                                          filetypes=[("Text", "*.txt"), ("All", "*.*")])
+        if path:
+            self.tokenizer_infer_file_var.set(path)
 
     def _log_tokenizer_infer(self, text: str):
         def _do():
