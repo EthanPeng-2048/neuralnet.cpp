@@ -1,59 +1,69 @@
 # neuralnet.cpp
 
-一个轻量级 C++26 神经网络库，从头实现（无第三方深度学习框架依赖），支持并行计算。
+一个从零实现的 C++26 神经网络库，支持 CPU/GPU 双后端、多层 Transformer、GPT 语言模型训练与推理。
+
+## 📚 文档
+
+| 文档 | 说明 |
+|------|------|
+| [架构设计](docs/01-architecture.md) | 项目分层架构、引擎化设计、数据流、模块详解 |
+| [性能优化](docs/02-performance.md) | SmartPolicy、线程池、缓存分块、GPU 加速、算子融合等 |
+| [快速上手：构建模型](docs/03-quickstart-model.md) | ComputeEngine/Layer/Model 三件套使用教程 |
+| [快速上手：训练与推理](docs/04-quickstart-train-infer.md) | MNIST/GPT 训练推理命令行 + C++ API 示例 |
+| [算法解析](docs/05-algorithm-reference.md) | 每个 Layer/Loss/Optimizer 的数学原理与原语分解 |
+| [开发规范](docs/DEVELOPMENT_STANDARDS.md) | C++ 编码规范、模块隔离、内存管理 |
 
 ## 项目结构
 
 ```
 neuralnet.cpp/
-├── .gitignore
 ├── CMakeLists.txt
-├── ARCHITECTURE.md          ← 架构文档
-├── DEVELOPMENT_STANDARDS.md ← 开发规范
 ├── README.md
-├── gui.py                   ← 图形化操作界面 (Tkinter)
-├── csv_png.py               ← CSV 转 PNG 图像
-├── extract_digits.py        ← 从 MNIST CSV 提取单个数字
-├── save_dataset.py          ← 下载 MNIST 数据集
-├── build/                   ← CMake 构建输出
-│   ├── mnist_train.exe
-│   └── mnist_infer.exe
-├── include/
-│   └── neuralnet.cpp/
-│       ├── nn.hpp              ← 统一入口头文件
-│       ├── nn_config.hpp       ← SmartPolicy、BLOCK_SIZE 等配置
-│       ├── layer.hpp           ← Layer 基类 + Linear/ReLU/GeLU/LayerNorm/Softmax/MultiHeadAttention/CausalSelfAttention/GPTModel
-│       ├── loss.hpp            ← Loss 基类 + MSELoss/CrossEntropyLoss
-│       ├── optimizer.hpp       ← SGD / SGDWithMomentum / Adam
-│       ├── model.hpp           ← Model 容器（链式 add<>）
-│       ├── model_io.hpp        ← 二进制模型序列化
-│       ├── model_spec.hpp      ← ModelSpec 纯数据描述
-│       ├── mnist_common.hpp    ← MNIST 常量与 build_mnist_model()
-│       ├── gpt_common.hpp      ← GPT 工厂与超参数
-│       ├── tokenizer.hpp       ← BPE/Space 分词器
-│       ├── algebra/            ← L1 代数层
-│       │   ├── matrix.hpp      ← Matrix 类 + 块并行 matmul
-│       │   ├── expr.hpp        ← 表达式模板
-│       │   ├── ops.hpp         ← ReLU/GeLU 等逐元素算子
-│       │   ├── span.hpp        ← Span 抽象
-│       │   └── compute_dispatch.hpp ← 计算分派
-│       └── core/               ← L0 硬件层
-│           ├── thread_pool.hpp ← 全局线程池
-│           ├── errors.hpp      ← Result<T> = std::expected<T, Error>
-│           └── assert.hpp      ← 断言宏
+├── docs/
+│   ├── 01-architecture.md       ← 架构设计文档
+│   ├── 02-performance.md        ← 性能优化文档
+│   ├── 03-quickstart-model.md   ← 模型构建教程
+│   ├── 04-quickstart-train-infer.md ← 训练推理教程
+│   ├── 05-algorithm-reference.md    ← 算法解析参考
+│   ├── DEVELOPMENT_STANDARDS.md ← 开发规范
+│   └── GPU_DESIGN_V2.md         ← GPU 后端设计
+├── gui.py                       ← 图形化操作界面 (Tkinter)
+├── include/neuralnet.cpp/
+│   ├── nn.hpp                   ← 统一入口头文件
+│   ├── config.hpp               ← SmartPolicy、BLOCK_SIZE
+│   ├── tensor.hpp               ← 统一跨设备张量
+│   ├── compute_engine.hpp       ← 引擎抽象接口
+│   ├── cpu_engine.hpp           ← CPU 引擎
+│   ├── gpu_engine.hpp           ← GPU 引擎 (Vulkan)
+│   ├── compute_layer.hpp        ← Layer 基类 + 所有层
+│   ├── compute_loss.hpp         ← 损失函数
+│   ├── compute_optimizer.hpp    ← 优化器 (SGD/Adam/AdamW/Muon)
+│   ├── model_container.hpp      ← Model 容器
+│   ├── model_spec.hpp           ← 架构描述
+│   ├── model_serialization.hpp  ← 二进制序列化
+│   ├── domain_mnist.hpp         ← MNIST 模型工厂
+│   ├── domain_gpt.hpp           ← GPT 模型工厂
+│   ├── domain_tokenizer.hpp     ← 分词器
+│   ├── algebra_matrix.hpp       ← 矩阵类
+│   ├── algebra_expr.hpp         ← 表达式模板
+│   ├── algebra_ops.hpp          ← 逐元素算子
+│   ├── algebra_span.hpp         ← Span 抽象
+│   ├── algebra_compute.hpp      ← 计算分派
+│   ├── core_threadpool.hpp      ← 全局线程池
+│   ├── core_errors.hpp          ← Result<T>
+│   ├── core_assert.hpp          ← 断言宏
+│   └── core_file.hpp            ← 文件工具
 ├── src/
-│   ├── mnist_train.cpp         ← MNIST 训练
-│   ├── mnist_infer.cpp         ← MNIST 推理
-│   ├── text_train.cpp          ← GPT 文本训练
-│   ├── text_infer.cpp          ← GPT 文本推理
-│   ├── tokenizer_train.cpp     ← BPE 分词器训练
-│   ├── tokenizer_infer.cpp     ← BPE 分词器推理
-│   └── compute_bench.cpp       ← 计算性能基准测试
-├── datasets/
-│   ├── mnist_data/          ← MNIST CSV 数据
-│   └── test/                ← 按数字分类的测试图片
-└── pretrained/
-    └── mnist_model.bin      ← 预训练模型
+│   ├── mnist_train.cpp          ← MNIST 训练
+│   ├── mnist_infer.cpp          ← MNIST 推理
+│   ├── text_train.cpp           ← GPT 文本训练
+│   ├── text_infer.cpp           ← GPT 文本推理
+│   ├── tokenizer_train.cpp      ← 分词器训练
+│   ├── tokenizer_infer.cpp      ← 分词器推理
+│   └── compute_bench.cpp        ← 性能基准测试
+├── datasets/                    ← 训练数据
+├── pretrained/                  ← 预训练模型
+└── shaders/                     ← GPU Compute Shader
 ```
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/EthanPeng-2048/neuralnet.cpp)
