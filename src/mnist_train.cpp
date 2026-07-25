@@ -55,6 +55,7 @@ void print_usage(const char *prog)
         << "  --weight-decay <w> AdamW 权重衰减系数 (默认: 0.01)\n"
         << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
         << "  --max-samples <n>  限制训练样本数 (用于快速测试, 默认: 全部)\n"
+        << "  --shuffle-steps <true|false>  每 epoch 打乱 batch 顺序 (默认: true)\n"
         << "\n"
         << "MLP 专用:\n"
         << "  --layer-dims <d1,d2,...>  各层维度，逗号分隔 (默认: 784,512,256,128,64,10)\n"
@@ -84,6 +85,7 @@ struct TrainConfig
     bool load_existing = false;
     bool gpu_enabled = false;
     int max_train_samples = -1;  // -1 表示使用全部
+    bool shuffle_steps = true;   // 每 epoch 打乱 batch 顺序
 
     // MLP 参数
     std::vector<std::size_t> layer_dims;
@@ -235,6 +237,19 @@ TrainConfig parse_args(int argc, char *argv[])
         else if (arg == "--gpu")
         {
             cfg.gpu_enabled = true;
+        }
+        else if (arg == "--shuffle-steps" && i + 1 < argc)
+        {
+            std::string v = argv[++i];
+            if (v == "true" || v == "1")
+                cfg.shuffle_steps = true;
+            else if (v == "false" || v == "0")
+                cfg.shuffle_steps = false;
+            else
+            {
+                std::cerr << "无效 --shuffle-steps: " << v << "，可选: true, false\n";
+                std::exit(1);
+            }
         }
         else
         {
@@ -514,7 +529,8 @@ int main(int argc, char *argv[])
 
     std::cout << "  优化器: " << cfg.optimizer_name << "  学习率: " << cfg.lr << "\n";
     std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
-    std::cout << "  GPU: " << (cfg.gpu_enabled ? "启用" : "禁用") << "\n";
+    std::cout << "  GPU: " << (cfg.gpu_enabled ? "启用" : "禁用")
+              << "  打乱: " << (cfg.shuffle_steps ? "启用" : "禁用") << "\n";
     std::cout << "  模型: " << (cfg.load_existing ? cfg.resume_path : "(从头训练)")
               << " -> " << cfg.save_path << "\n";
     std::cout << "========================================\n\n";
@@ -612,7 +628,8 @@ int main(int argc, char *argv[])
         auto ep_start = std::chrono::steady_clock::now();
         Scalar total_loss = 0.0;
 
-        std::shuffle(sample_indices.begin(), sample_indices.end(), shuffle_rng);
+        if (cfg.shuffle_steps)
+            std::shuffle(sample_indices.begin(), sample_indices.end(), shuffle_rng);
 
         for (std::size_t batch = 0; batch < num_batches; ++batch)
         {

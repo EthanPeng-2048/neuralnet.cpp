@@ -23,9 +23,9 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "App
 endif()
 
 # ── 按构建类型设置优化标志 ───────────────────────────────────────────────
-# Release: -O3 -ffast-math -funroll-loops（性能优先）
-# Debug:   -O0 -g（调试优先，禁用 -march=native 保证可移植性）
-set(RELEASE_FLAGS -O3 -ffast-math -funroll-loops)
+# Release: -O3 -ffast-math -funroll-loops -march=native（最大性能）
+# Debug:   -O0 -g（调试优先）
+set(RELEASE_FLAGS -O3 -ffast-math -funroll-loops -march=native)
 set(DEBUG_FLAGS -O0 -g)
 
 add_compile_options(
@@ -37,12 +37,6 @@ add_compile_options(
 # 项目代码依赖 infinity()（如 Softmax 的数值稳定化），需要抑制此警告
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
     add_compile_options(-Wno-nan-infinity-disabled)
-endif()
-
-# -march=native 仅在显式开启时使用（生成不可移植二进制）
-option(NN_USE_NATIVE_ARCH "Use -march=native for maximum performance on this machine" OFF)
-if(NN_USE_NATIVE_ARCH)
-    add_compile_options(-march=native)
 endif()
 
 # ── 线程库（Linux 需要 pthread） ─────────────────────────────────────────
