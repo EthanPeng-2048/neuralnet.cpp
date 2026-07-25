@@ -108,9 +108,115 @@ public:
         return {};
     }
 
+    // ── gather_rows: 按 indices 从 table 中按行查表 ──
+    //   table: (vocab, D), indices: (num_indices,), 输出: (num_indices, D)
+    //   越界索引返回零行（防御性，不抛错）
+    //
+    // 并行策略：每个输出行独立，按行切分到线程。
+    //   - num * D >= PARALLEL_THRESHOLD 时启用行块并行
+    //   - 否则串行（小批量查表的 D 通常较小，并行调度开销不划算）
+    //   - 行块并行避免跨行数据竞争（每行独立写入）
+    [[nodiscard]] Result<Tensor> gather_rows(
+        const Tensor& table, const Tensor& indices) override
+    {
+        if (!table.is_cpu() || !indices.is_cpu())
+            return std::unexpected(Error{"gather_rows: tensors are not CPU"});
+
+        const Matrix& tbl = table.cpu_matrix();
+        const Matrix& idx = indices.cpu_matrix();
+        const std::size_t vocab = tbl.rows();
+        const std::size_t D = tbl.cols();
+        const std::size_t num = idx.rows();  // indices 视为 (num, 1) 形状
+
+        Matrix result(num, D);
+        auto dst_span = result.span();
+        const auto tbl_span = tbl.span();
+        const auto idx_span = idx.span();
+
+        const std::size_t total = num * D;
+        if (total >= PARALLEL_THRESHOLD && num > 1)
+        {
+            // 行块并行：每行独立查表，无数据竞争
+            auto row_indices = std::views::iota(std::size_t{0}, num);
+            nn::for_each(row_indices.begin(), row_indices.end(),
+                [dst_span, tbl_span, idx_span, vocab, D](std::size_t i) noexcept {
+                    const auto row_idx = static_cast<std::size_t>(idx_span[i]);
+                    if (row_idx < vocab)
+                    {
+                        std::copy_n(tbl_span.begin() + row_idx * D, D,
+                                    dst_span.begin() + i * D);
+                    }
+                    else
+                    {
+                        std::fill_n(dst_span.begin() + i * D, D, Scalar{0});
+                    }
+                });
+        }
+        else
+        {
+            // 串行路径
+            for (std::size_t i = 0; i < num; ++i)
+            {
+                const auto row_idx = static_cast<std::size_t>(idx_span[i]);
+                if (row_idx < vocab)
+                {
+                    std::copy_n(tbl_span.begin() + row_idx * D, D,
+                                dst_span.begin() + i * D);
+                }
+                else
+                {
+                    std::fill_n(dst_span.begin() + i * D, D, Scalar{0});
+                }
+            }
+        }
+        return Tensor::from_matrix(std::move(result));
+    }
+
+    // ── scatter_add_rows: 按 indices 把 grad 的行原子累加到 dst ──
+    //   dst: (vocab, D) 原地修改, indices: (num_indices,), grad: (num_indices, D)
+    //   语义: dst[indices[i]] += grad[i]
+    [[nodiscard]] Result<void> scatter_add_rows(
+        Tensor& dst, const Tensor& indices, const Tensor& grad) override
+    {
+        if (!dst.is_cpu() || !indices.is_cpu() || !grad.is_cpu())
+            return std::unexpected(Error{"scatter_add_rows: tensors are not CPU"});
+        if (dst.cols() != grad.cols())
+            return std::unexpected(Error{"scatter_add_rows: column count mismatch"});
+
+        Matrix& d = dst.cpu_matrix();
+        const Matrix& idx = indices.cpu_matrix();
+        const Matrix& g = grad.cpu_matrix();
+        const std::size_t vocab = d.rows();
+        const std::size_t D = d.cols();
+        const std::size_t num = idx.rows();
+
+        auto dst_span = d.span();
+        const auto idx_span = idx.span();
+        const auto grad_span = g.span();
+
+        for (std::size_t i = 0; i < num; ++i)
+        {
+            const auto row_idx = static_cast<std::size_t>(idx_span[i]);
+            if (row_idx < vocab)
+            {
+                Scalar* dst_row = dst_span.data() + row_idx * D;
+                const Scalar* grad_row = grad_span.data() + i * D;
+                for (std::size_t c = 0; c < D; ++c)
+                    dst_row[c] += grad_row[c];
+            }
+            // 越界索引忽略
+        }
+        return {};
+    }
+
     // ── 3D 维度转置：(M, B, N) ↔ (B, M, N) ──
     //   inverse=false: (M, B*N) → (B*M, N), out[b*M+m, n] = in[m, b*N+n]
     //   inverse=true:  (B*M, N) → (M, B*N), out[m, b*N+n] = in[b*M+m, n]
+    //
+    // 并行策略：按 (b, m) 二维块切分，每块独立 N 元素拷贝，无数据竞争。
+    //   - total >= PARALLEL_THRESHOLD 时启用块级并行
+    //   - 每块仅一次 std::copy_n(N)，cache 友好
+    //   - 典型场景：MHA 中 d_model=128, batch=32, seq=256 → 1M 元素，明显受益
     [[nodiscard]] Result<Tensor> rearrange_3d(
         const Tensor& x, std::size_t M, std::size_t B, std::size_t N,
         bool inverse) override
@@ -124,36 +230,43 @@ public:
             return std::unexpected(Error{"rearrange_3d: element count mismatch"});
 
         Matrix out(inverse ? M : (B * M), inverse ? (B * N) : N);
+        const auto src = m.span();
+        const auto dst = out.span();
 
-        if (!inverse)
+        // (b, m) 组合索引：bm_idx = b * M + m，总块数 = B * M
+        // 每块独立处理 N 个元素
+        const std::size_t n_blocks = B * M;
+        auto block_kernel = [src, dst, M, B, N, inverse](std::size_t bm_idx) noexcept {
+            const std::size_t b = bm_idx / M;
+            const std::size_t mi = bm_idx % M;
+            if (!inverse)
+            {
+                // out[b*M + m, n] = in[m, b*N + n]
+                const std::size_t dst_off = (b * M + mi) * N;
+                const std::size_t src_off = mi * (B * N) + b * N;
+                std::copy_n(src.begin() + src_off, N,
+                            dst.begin() + dst_off);
+            }
+            else
+            {
+                // out[m, b*N + n] = in[b*M + m, n]
+                const std::size_t src_off = (b * M + mi) * N;
+                const std::size_t dst_off = mi * (B * N) + b * N;
+                std::copy_n(src.begin() + src_off, N,
+                            dst.begin() + dst_off);
+            }
+        };
+
+        if (total >= PARALLEL_THRESHOLD && n_blocks > 1)
         {
-            // in (M, B*N) → out (B*M, N)
-            // out[b*M + m, n] = in[m, b*N + n]
-            const auto src = m.span();
-            const auto dst = out.span();
-            for (std::size_t b = 0; b < B; ++b)
-                for (std::size_t mi = 0; mi < M; ++mi)
-                {
-                    const std::size_t dst_off = (b * M + mi) * N;
-                    const std::size_t src_off = mi * (B * N) + b * N;
-                    std::copy_n(src.begin() + src_off, N,
-                                dst.begin() + dst_off);
-                }
+            auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
+            nn::parallel_for_blocks(block_indices.begin(), block_indices.end(),
+                                       block_kernel);
         }
         else
         {
-            // in (B*M, N) → out (M, B*N)
-            // out[m, b*N + n] = in[b*M + m, n]
-            const auto src = m.span();
-            const auto dst = out.span();
-            for (std::size_t b = 0; b < B; ++b)
-                for (std::size_t mi = 0; mi < M; ++mi)
-                {
-                    const std::size_t src_off = (b * M + mi) * N;
-                    const std::size_t dst_off = mi * (B * N) + b * N;
-                    std::copy_n(src.begin() + src_off, N,
-                                dst.begin() + dst_off);
-                }
+            for (std::size_t bm = 0; bm < n_blocks; ++bm)
+                block_kernel(bm);
         }
 
         return Tensor::from_matrix(std::move(out));
@@ -292,6 +405,24 @@ public:
     [[nodiscard]] Result<void> scale_inplace(Tensor& A, Scalar s) override
     {
         A.cpu_matrix().scale_inplace(s);
+        return {};
+    }
+
+    // 融合 axpy：A += scalar * B（单次循环，避免 clone+scale+add 三步）
+    // 使用 nn::transform 二元并行版本，与 add_inplace/scale_inplace 一致：
+    //   - n >= PARALLEL_THRESHOLD 时自动并行，否则串行
+    //   - 单次循环 + 内联 lambda，零开销抽象
+    [[nodiscard]] Result<void> axpy_inplace(Tensor& A, Scalar scalar, const Tensor& B) override
+    {
+        if (A.rows() != B.rows() || A.cols() != B.cols())
+            return std::unexpected(Error{"axpy_inplace: shape mismatch"});
+        auto& a = A.cpu_matrix();
+        const auto& b = B.cpu_matrix();
+        auto a_span = a.span();
+        const auto b_span = b.span();
+        nn::transform(a_span.begin(), a_span.end(), b_span.begin(),
+                       a_span.begin(),
+                       [scalar](Scalar x, Scalar y) noexcept { return x + scalar * y; });
         return {};
     }
 

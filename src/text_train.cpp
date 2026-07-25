@@ -462,12 +462,6 @@ int main(int argc, char *argv[])
                 return 1;
             }
 
-            // ── 前向传播 ─────────────────────────────────────
-            auto fwd_result = model.forward(*x_tensor_r);
-            if (!fwd_result) { std::cerr << "Error: " << fwd_result.error().message << '\n'; return 1; }
-            auto logits = std::move(*fwd_result);
-            // logits: (vocab_size, seq_len × batch_size)
-
             // ── 构造 one-hot 目标 ────────────────────────────
             auto y_span = y_tokens.span();
             for (std::size_t t = 0; t < cfg.seq_len; ++t)
@@ -487,6 +481,22 @@ int main(int argc, char *argv[])
                 std::cerr << "\nfrom_matrix(y_onehot) failed: " << y_tensor_r.error().message << '\n';
                 return 1;
             }
+
+            // ── 启用 GPU batch 录制 ─────────────────────────
+            // 整个 forward + backward + optimizer step 录制到一个 command buffer，
+            // end_batch 时一次 vkQueueSubmit + vkWaitForFences，消除 per-primitive 同步开销。
+            // CPU 引擎 begin_batch/end_batch 为 no-op，所以两套引擎都安全。
+            auto begin_r = engine->begin_batch();
+            if (!begin_r) {
+                std::cerr << "begin_batch failed: " << begin_r.error().message << '\n';
+                return 1;
+            }
+
+            // ── 前向传播 ─────────────────────────────────────
+            auto fwd_result = model.forward(*x_tensor_r);
+            if (!fwd_result) { std::cerr << "Error: " << fwd_result.error().message << '\n'; return 1; }
+            auto logits = std::move(*fwd_result);
+            // logits: (vocab_size, seq_len × batch_size)
 
             // ── 损失 ─────────────────────────────────────────
             auto loss_result = ce_loss.forward(*engine, logits, *y_tensor_r);
@@ -509,6 +519,13 @@ int main(int argc, char *argv[])
             auto zero_result = optimizer->zero_grad();
             if (!zero_result) {
                 std::cerr << "\n优化器 zero_grad 失败: " << zero_result.error().message << '\n';
+                return 1;
+            }
+
+            // ── 提交 batch：一次 vkQueueSubmit + vkWaitForFences ──
+            auto end_r = engine->end_batch();
+            if (!end_r) {
+                std::cerr << "end_batch failed: " << end_r.error().message << '\n';
                 return 1;
             }
 

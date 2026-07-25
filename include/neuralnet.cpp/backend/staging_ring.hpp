@@ -6,11 +6,11 @@
 //   - 环形分配，避免频繁创建/销毁
 //   - Fence 同步确保数据安全
 //
-// 设计：
-//   - 预分配 N 个 region（默认 4 个，每个 256MB）
-//   - 每个 region 有独立的 VkBuffer、VkFence
-//   - acquire() 返回下一个可用 region 的索引
-//   - upload/download 通过 memcpy 操作
+// 设计（依据性能审查报告优化）：
+//   - 预分配 N 个 region（默认 2 个，每个 64MB → 总 128MB）
+//   - 旧默认 4×256MB=1GB 预分配过大；实际训练单次 PCIe 传输量
+//     通常 << 64MB（最大 token_emb 上传约 5MB）
+//   - 内存预算上限保留 max_host_visible / 16，避免在小显存机器上过度分配
 // ─────────────────────────────────────────────────────────────────────────
 
 #ifndef NN_STAGING_RING_HPP
@@ -34,8 +34,10 @@ namespace nn
 class StagingRing
 {
 public:
-    static constexpr std::size_t DEFAULT_REGION_SIZE = 256ull * 1024 * 1024; // 256MB
-    static constexpr std::size_t DEFAULT_NUM_REGIONS = 4;
+    // 默认 64MB × 2 region = 128MB 总预分配
+    // （依据性能审查报告：旧默认 256MB × 4 = 1GB 过大）
+    static constexpr std::size_t DEFAULT_REGION_SIZE = 64ull * 1024 * 1024; // 64MB
+    static constexpr std::size_t DEFAULT_NUM_REGIONS = 2;
 
     struct Region
     {
@@ -83,11 +85,11 @@ public:
             }
         }
 
-        VkDeviceSize calculated_size = max_host_visible / 8;
-        if (calculated_size < 64ull * 1024 * 1024)
+        VkDeviceSize calculated_size = max_host_visible / 16;
+        if (calculated_size < 32ull * 1024 * 1024)
+            calculated_size = 32ull * 1024 * 1024;
+        if (calculated_size > 64ull * 1024 * 1024)
             calculated_size = 64ull * 1024 * 1024;
-        if (calculated_size > 256ull * 1024 * 1024)
-            calculated_size = 256ull * 1024 * 1024;
         region_size_ = std::min(static_cast<VkDeviceSize>(region_size), calculated_size);
 
         regions_.resize(num_regions);

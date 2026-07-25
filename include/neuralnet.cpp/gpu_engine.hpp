@@ -166,6 +166,84 @@ public:
         return backend_.insert_rows_gpu(dst.gpu_tensor(), dst_start_row, src_gpu->gpu_tensor());
     }
 
+    // ── gather_rows: 按 indices 从 table 中按行查表 ──
+    // 当前实现为 GPU→CPU 下载 + CPU 查表 + CPU→GPU 上传（fallback）。
+    // 后续可优化为专门 gather shader 直接在 GPU 端执行。
+    [[nodiscard]] Result<Tensor> gather_rows(
+        const Tensor& table, const Tensor& indices) override
+    {
+        // 下载到 CPU
+        auto tbl_m = to_matrix(table);
+        if (!tbl_m) return std::unexpected(tbl_m.error());
+        auto idx_m = to_matrix(indices);
+        if (!idx_m) return std::unexpected(idx_m.error());
+
+        const std::size_t vocab = tbl_m->rows();
+        const std::size_t D = tbl_m->cols();
+        const std::size_t num = idx_m->rows();
+
+        Matrix result(num, D);
+        const auto tbl_span = tbl_m->span();
+        const auto idx_span = idx_m->span();
+        auto dst_span = result.span();
+
+        for (std::size_t i = 0; i < num; ++i)
+        {
+            const auto row_idx = static_cast<std::size_t>(idx_span[i]);
+            if (row_idx < vocab)
+                std::copy_n(tbl_span.begin() + row_idx * D, D,
+                            dst_span.begin() + i * D);
+            else
+                std::fill_n(dst_span.begin() + i * D, D, Scalar{0});
+        }
+
+        // 上传回 GPU
+        auto r = from_matrix(result);
+        if (!r) return std::unexpected(r.error());
+        return *r;
+    }
+
+    // ── scatter_add_rows: 按 indices 把 grad 的行原子累加到 dst ──
+    // 当前实现为 GPU→CPU 下载 + CPU 累加 + CPU→GPU 上传（fallback）。
+    // 后续可优化为专门 scatter_add shader（使用 atomicAdd）。
+    [[nodiscard]] Result<void> scatter_add_rows(
+        Tensor& dst, const Tensor& indices, const Tensor& grad) override
+    {
+        // 下载到 CPU
+        auto dst_m = to_matrix(dst);
+        if (!dst_m) return std::unexpected(dst_m.error());
+        auto idx_m = to_matrix(indices);
+        if (!idx_m) return std::unexpected(idx_m.error());
+        auto grad_m = to_matrix(grad);
+        if (!grad_m) return std::unexpected(grad_m.error());
+
+        const std::size_t vocab = dst_m->rows();
+        const std::size_t D = dst_m->cols();
+        const std::size_t num = idx_m->rows();
+
+        auto dst_span = dst_m->span();  // 注意：这是 to_matrix 的拷贝
+        const auto idx_span = idx_m->span();
+        const auto grad_span = grad_m->span();
+
+        for (std::size_t i = 0; i < num; ++i)
+        {
+            const auto row_idx = static_cast<std::size_t>(idx_span[i]);
+            if (row_idx < vocab)
+            {
+                Scalar* dst_row = dst_span.data() + row_idx * D;
+                const Scalar* grad_row = grad_span.data() + i * D;
+                for (std::size_t c = 0; c < D; ++c)
+                    dst_row[c] += grad_row[c];
+            }
+        }
+
+        // 上传回 GPU（替换 dst）
+        auto r = from_matrix(*dst_m);
+        if (!r) return std::unexpected(r.error());
+        dst = std::move(*r);
+        return {};
+    }
+
 private:
     // CPU 路径回退（dst 为 CPU Tensor 时使用）
     [[nodiscard]] Result<void> insert_rows_cpu_fallback(
@@ -281,6 +359,29 @@ public:
         auto r = backend_.elementwise_v2_gpu(
             a_gpu->gpu_tensor(), nullptr, nullptr,
             count, 1u, 2u, 0u, 1u, static_cast<float>(s), 0.0f, 0.0f);
+        if (!r)
+            return std::unexpected(r.error());
+        A = Tensor::from_gpu(std::move(*r));
+        return {};
+    }
+
+    // 融合 axpy：A += scalar * B（mode=3，单次 dispatch 替代 clone+scale+add 三步）
+    // 分配新 buffer 计算 A + scalar*B，替换 A（遵循 GpuEngine copy-on-write 语义）
+    [[nodiscard]] Result<void> axpy_inplace(Tensor& A, Scalar scalar, const Tensor& B) override
+    {
+        if (A.rows() != B.rows() || A.cols() != B.cols())
+            return std::unexpected(Error{"axpy_inplace: shape mismatch"});
+
+        auto a_gpu = ensure_gpu(A);
+        if (!a_gpu) return std::unexpected(a_gpu.error());
+        auto b_gpu = ensure_gpu(B);
+        if (!b_gpu) return std::unexpected(b_gpu.error());
+
+        const uint32_t count = static_cast<uint32_t>(A.rows() * A.cols());
+        // AXPY 模式 (mode=3): out = A + scalar_b * B
+        auto r = backend_.elementwise_v2_gpu(
+            a_gpu->gpu_tensor(), &b_gpu->gpu_tensor(), nullptr,
+            count, 3u, 0u, 0u, 0u, static_cast<float>(scalar), 0.0f, 0.0f);
         if (!r)
             return std::unexpected(r.error());
         A = Tensor::from_gpu(std::move(*r));

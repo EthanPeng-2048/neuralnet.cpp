@@ -74,6 +74,7 @@ nn_add_executable(tokenizer_infer src/tokenizer_infer.cpp)
 
 # ── 计算性能基准测试 ─────────────────────────────────────────────────────
 nn_add_executable(compute_bench src/compute_bench.cpp)
+nn_add_executable(bench_thresholds src/bench_thresholds.cpp)
 
 # ── GPU 测试（需要 Vulkan） ──────────────────────────────────────────────
 nn_add_executable(gpu_test src/gpu_test.cpp)
@@ -148,7 +149,7 @@ if(Vulkan_FOUND)
             mnist_train mnist_infer mnist_bench
             text_train text_infer
             tokenizer_train tokenizer_infer
-            compute_bench gpu_test
+            compute_bench bench_thresholds gpu_test
         )
 
         foreach(TARGET ${NN_GPU_TARGETS})
