@@ -16,6 +16,7 @@
 // L0 硬件层
 #include "core_errors.hpp"
 #include "core_assert.hpp"
+#include "core_observer_ptr.hpp"
 #include "core_threadpool.hpp"
 #include "core_file.hpp"
 #include "config.hpp"

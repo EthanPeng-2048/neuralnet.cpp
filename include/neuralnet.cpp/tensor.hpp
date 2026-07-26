@@ -12,6 +12,7 @@
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 
 #include "config.hpp"
@@ -133,6 +134,11 @@ public:
              + (device_ == Device::CPU ? "[CPU]" : "[GPU]");
     }
 };
+
+// ── 非拥有型引用包装器（替代裸指针） ─────────────────────────────────────
+// 使用 std::reference_wrapper 替代 T*，明确表达 "引用但不拥有" 语义。
+// 用于 Optimizer 持有的 params_/grads_ 和 Layer::parameters() 返回值。
+using TensorRef = std::reference_wrapper<Tensor>;
 
 } // namespace nn
 

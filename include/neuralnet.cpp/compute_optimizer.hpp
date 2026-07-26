@@ -42,9 +42,9 @@ namespace nn
 class Optimizer
 {
 protected:
-    ComputeEngine* engine_;
-    std::vector<Tensor*> params_;
-    std::vector<Tensor*> grads_;
+    ComputeEngine& engine_;              // 非拥有引用（永不为空）
+    std::vector<TensorRef> params_;      // 非拥有引用（永不为空）
+    std::vector<TensorRef> grads_;       // 非拥有引用（永不为空）
 
     // 辅助方法：dst += scalar * src（融合 axpy：单次 dispatch 替代 clone+scale+add 三步）
     // 用于 SGD / Momentum / Adam 等优化器中常见的 axpy 操作
@@ -55,27 +55,30 @@ protected:
     //   - 100 个参数 × 每 step 调用 ~3 次 = 减少 600 次 GPU buffer 分配/step
     [[nodiscard]] Result<void> scale_add_(Tensor& dst, Scalar scalar, const Tensor& src)
     {
-        return engine_->axpy_inplace(dst, scalar, src);
+        return engine_.axpy_inplace(dst, scalar, src);
     }
 
 public:
     Optimizer(ComputeEngine& engine,
-              std::vector<Tensor*> params,
-              std::vector<Tensor*> grads)
-        : engine_(&engine),
+              std::vector<TensorRef> params,
+              std::vector<TensorRef> grads)
+        : engine_(engine),
           params_(std::move(params)),
           grads_(std::move(grads)) {}
 
     virtual ~Optimizer() = default;
+
+    // 动态调整学习率（供 OscillationGuard 等自适应调度器使用）
+    virtual void set_lr(Scalar lr) = 0;
 
     [[nodiscard]] virtual Result<void> step() = 0;
 
     // 默认实现：将所有梯度清零（所有子类行为一致）
     [[nodiscard]] virtual Result<void> zero_grad()
     {
-        for (auto* g : grads_)
+        for (auto& g : grads_)
         {
-            auto r = engine_->zero(*g);
+            auto r = engine_.zero(g);
             if (!r) return std::unexpected(r.error());
         }
         return {};
@@ -94,10 +97,12 @@ class SGD : public Optimizer
 
 public:
     SGD(ComputeEngine& engine,
-        std::vector<Tensor*> params,
-        std::vector<Tensor*> grads,
+        std::vector<TensorRef> params,
+        std::vector<TensorRef> grads,
         Scalar lr)
         : Optimizer(engine, std::move(params), std::move(grads)), lr_(lr) {}
+
+    void set_lr(Scalar lr) override { lr_ = lr; }
 
     [[nodiscard]] Result<void> step() override
     {
@@ -106,7 +111,7 @@ public:
 
         for (std::size_t i = 0; i < params_.size(); ++i)
         {
-            auto r = scale_add_(*params_[i], -lr_, *grads_[i]);
+            auto r = scale_add_(params_[i], -lr_, grads_[i]);
             if (!r) return std::unexpected(r.error());
         }
         return {};
@@ -127,20 +132,22 @@ class SGDWithMomentum : public Optimizer
 
 public:
     SGDWithMomentum(ComputeEngine& engine,
-                     std::vector<Tensor*> params,
-                     std::vector<Tensor*> grads,
+                     std::vector<TensorRef> params,
+                     std::vector<TensorRef> grads,
                      Scalar lr, Scalar beta = 0.9)
         : Optimizer(engine, std::move(params), std::move(grads)),
           lr_(lr), beta_(beta)
     {
         velocities_.reserve(params_.size());
-        for (auto* p : params_)
+        for (auto& p : params_)
         {
-            auto v = engine_->create_tensor(p->rows(), p->cols());
-            { auto r = engine_->zero(v); NN_ASSERT(r, r ? "" : r.error().message.c_str()); }
+            auto v = engine_.create_tensor(p.get().rows(), p.get().cols());
+            { auto r = engine_.zero(v); NN_ASSERT(r, r ? "" : r.error().message.c_str()); }
             velocities_.push_back(std::move(v));
         }
     }
+
+    void set_lr(Scalar lr) override { lr_ = lr; }
 
     [[nodiscard]] Result<void> step() override
     {
@@ -152,13 +159,13 @@ public:
         for (std::size_t i = 0; i < params_.size(); ++i)
         {
             // v = β*v + (1-β)*g
-            auto r = engine_->scale_inplace(velocities_[i], beta_);
+            auto r = engine_.scale_inplace(velocities_[i], beta_);
             if (!r) return std::unexpected(r.error());
-            r = scale_add_(velocities_[i], one_minus_beta, *grads_[i]);
+            r = scale_add_(velocities_[i], one_minus_beta, grads_[i]);
             if (!r) return std::unexpected(r.error());
 
             // p -= lr * v
-            r = scale_add_(*params_[i], -lr_, velocities_[i]);
+            r = scale_add_(params_[i], -lr_, velocities_[i]);
             if (!r) return std::unexpected(r.error());
         }
         return {};
@@ -194,64 +201,64 @@ protected:
         const Scalar one_minus_beta1 = Scalar{1} - beta1_;
         const Scalar one_minus_beta2 = Scalar{1} - beta2_;
 
-        const Tensor& g = *grads_[i];
+        const Tensor& g = grads_[i];
 
         // m = β1*m + (1-β1)*g
-        auto r = engine_->scale_inplace(m_[i], beta1_);
+        auto r = engine_.scale_inplace(m_[i], beta1_);
         if (!r) return std::unexpected(r.error());
         r = scale_add_(m_[i], one_minus_beta1, g);
         if (!r) return std::unexpected(r.error());
 
         // v = β2*v + (1-β2)*g²
-        r = engine_->scale_inplace(v_[i], beta2_);
+        r = engine_.scale_inplace(v_[i], beta2_);
         if (!r) return std::unexpected(r.error());
-        auto g_sq = engine_->elementwise_binary(BinaryOp::Mul, g, g);
+        auto g_sq = engine_.elementwise_binary(BinaryOp::Mul, g, g);
         if (!g_sq) return std::unexpected(g_sq.error());
-        r = engine_->scale_inplace(*g_sq, one_minus_beta2);
+        r = engine_.scale_inplace(*g_sq, one_minus_beta2);
         if (!r) return std::unexpected(r.error());
-        r = engine_->add_inplace(v_[i], *g_sq);
+        r = engine_.add_inplace(v_[i], *g_sq);
         if (!r) return std::unexpected(r.error());
 
         // m_hat = m / bc1
-        auto m_hat = clone_tensor(*engine_, m_[i]);
+        auto m_hat = clone_tensor(engine_, m_[i]);
         if (!m_hat) return std::unexpected(m_hat.error());
-        r = engine_->scale_inplace(*m_hat, inv_bc1);
+        r = engine_.scale_inplace(*m_hat, inv_bc1);
         if (!r) return std::unexpected(r.error());
 
         // v_hat = v / bc2
-        auto v_hat = clone_tensor(*engine_, v_[i]);
+        auto v_hat = clone_tensor(engine_, v_[i]);
         if (!v_hat) return std::unexpected(v_hat.error());
-        r = engine_->scale_inplace(*v_hat, inv_bc2);
+        r = engine_.scale_inplace(*v_hat, inv_bc2);
         if (!r) return std::unexpected(r.error());
 
         // sqrt_v = sqrt(v_hat)
-        auto sqrt_v = engine_->elementwise_unary(UnaryOp::Sqrt, *v_hat);
+        auto sqrt_v = engine_.elementwise_unary(UnaryOp::Sqrt, *v_hat);
         if (!sqrt_v) return std::unexpected(sqrt_v.error());
 
         // denom = sqrt_v + eps
-        auto denom = engine_->elementwise_binary_scalar(BinaryOp::Add, *sqrt_v, eps_);
+        auto denom = engine_.elementwise_binary_scalar(BinaryOp::Add, *sqrt_v, eps_);
         if (!denom) return std::unexpected(denom.error());
 
         // ratio = m_hat / denom
-        auto ratio = engine_->elementwise_binary(BinaryOp::Div, *m_hat, *denom);
+        auto ratio = engine_.elementwise_binary(BinaryOp::Div, *m_hat, *denom);
         if (!ratio) return std::unexpected(ratio.error());
 
         // p -= lr * ratio
-        r = engine_->scale_inplace(*ratio, -lr_);
+        r = engine_.scale_inplace(*ratio, -lr_);
         if (!r) return std::unexpected(r.error());
-        return engine_->add_inplace(*params_[i], *ratio);
+        return engine_.add_inplace(params_[i], *ratio);
     }
 
     void init_moments_()
     {
         m_.reserve(params_.size());
         v_.reserve(params_.size());
-        for (auto* p : params_)
+        for (auto& p : params_)
         {
-            auto mt = engine_->create_tensor(p->rows(), p->cols());
-            auto vt = engine_->create_tensor(p->rows(), p->cols());
-            { auto r1 = engine_->zero(mt); NN_ASSERT(r1, r1 ? "" : r1.error().message.c_str()); }
-            { auto r2 = engine_->zero(vt); NN_ASSERT(r2, r2 ? "" : r2.error().message.c_str()); }
+            auto mt = engine_.create_tensor(p.get().rows(), p.get().cols());
+            auto vt = engine_.create_tensor(p.get().rows(), p.get().cols());
+            { auto r1 = engine_.zero(mt); NN_ASSERT(r1, r1 ? "" : r1.error().message.c_str()); }
+            { auto r2 = engine_.zero(vt); NN_ASSERT(r2, r2 ? "" : r2.error().message.c_str()); }
             m_.push_back(std::move(mt));
             v_.push_back(std::move(vt));
         }
@@ -259,8 +266,8 @@ protected:
 
 public:
     Adam(ComputeEngine& engine,
-         std::vector<Tensor*> params,
-         std::vector<Tensor*> grads,
+         std::vector<TensorRef> params,
+         std::vector<TensorRef> grads,
          Scalar lr,
          Scalar beta1 = 0.9,
          Scalar beta2 = 0.999,
@@ -270,6 +277,8 @@ public:
     {
         init_moments_();
     }
+
+    void set_lr(Scalar lr) override { lr_ = lr; }
 
     [[nodiscard]] Result<void> step() override
     {
@@ -306,8 +315,8 @@ class AdamW : public Adam
 
 public:
     AdamW(ComputeEngine& engine,
-          std::vector<Tensor*> params,
-          std::vector<Tensor*> grads,
+          std::vector<TensorRef> params,
+          std::vector<TensorRef> grads,
           Scalar lr,
           Scalar beta1 = 0.9,
           Scalar beta2 = 0.999,
@@ -316,6 +325,8 @@ public:
         : Adam(engine, std::move(params), std::move(grads),
                lr, beta1, beta2, eps),
           wd_(weight_decay) {}
+
+    void set_lr(Scalar lr) override { lr_ = lr; }
 
     [[nodiscard]] Result<void> step() override
     {
@@ -330,7 +341,7 @@ public:
             // 权重衰减解耦：p = (1 - lr*wd) * p
             if (wd_ != Scalar{0})
             {
-                auto r = engine_->scale_inplace(*params_[i], decay_factor);
+                auto r = engine_.scale_inplace(params_[i], decay_factor);
                 if (!r) return std::unexpected(r.error());
             }
 
@@ -454,8 +465,8 @@ class Muon : public Optimizer
 
 public:
     Muon(ComputeEngine& engine,
-         std::vector<Tensor*> params,
-         std::vector<Tensor*> grads,
+         std::vector<TensorRef> params,
+         std::vector<TensorRef> grads,
          Scalar lr,
          Scalar momentum = 0.95f,
          bool nesterov = true,
@@ -466,13 +477,15 @@ public:
           ns_steps_(ns_steps), ns_eps_(ns_eps)
     {
         velocities_.reserve(params_.size());
-        for (auto* p : params_)
+        for (auto& p : params_)
         {
-            auto v = engine_->create_tensor(p->rows(), p->cols());
-            { auto r = engine_->zero(v); NN_ASSERT(r, r ? "" : r.error().message.c_str()); }
+            auto v = engine_.create_tensor(p.get().rows(), p.get().cols());
+            { auto r = engine_.zero(v); NN_ASSERT(r, r ? "" : r.error().message.c_str()); }
             velocities_.push_back(std::move(v));
         }
     }
+
+    void set_lr(Scalar lr) override { lr_ = lr; }
 
     [[nodiscard]] Result<void> step() override
     {
@@ -481,12 +494,12 @@ public:
 
         for (std::size_t i = 0; i < params_.size(); ++i)
         {
-            const Tensor& g = *grads_[i];
+            const Tensor& g = grads_[i];
 
             // 1. SGD-Momentum: v = μ*v + g
-            auto r = engine_->scale_inplace(velocities_[i], momentum_);
+            auto r = engine_.scale_inplace(velocities_[i], momentum_);
             if (!r) return std::unexpected(r.error());
-            r = engine_->add_inplace(velocities_[i], g);
+            r = engine_.add_inplace(velocities_[i], g);
             if (!r) return std::unexpected(r.error());
 
             // 确定用于正交化的更新方向
@@ -496,9 +509,9 @@ public:
             {
                 // Nesterov: update = g + μ*v
                 // 优化：clone g 一次，用 axpy_inplace 就地添加 μ*v（原实现需要 2 次 clone + scale + add）
-                auto buf = clone_tensor(*engine_, g);
+                auto buf = clone_tensor(engine_, g);
                 if (!buf) return std::unexpected(buf.error());
-                r = engine_->axpy_inplace(*buf, momentum_, velocities_[i]);
+                r = engine_.axpy_inplace(*buf, momentum_, velocities_[i]);
                 if (!r) return std::unexpected(r.error());
                 nesterov_buf = std::move(*buf);
                 update_ptr = &*nesterov_buf;
@@ -509,20 +522,20 @@ public:
             }
 
             // 2. Newton-Schulz 正交化（仅对 ≥2D 参数，即 rows > 1 且 cols > 1）
-            if (params_[i]->rows() > 1 && params_[i]->cols() > 1)
+            if (params_[i].get().rows() > 1 && params_[i].get().cols() > 1)
             {
                 auto ortho_update = newton_schulz_orthogonalize(
-                    *engine_, *update_ptr, ns_steps_, ns_eps_);
+                    engine_, *update_ptr, ns_steps_, ns_eps_);
                 if (!ortho_update) return std::unexpected(ortho_update.error());
 
                 // 3. 参数更新: p -= lr * ortho_update（用 axpy_inplace 融合 scale+add）
-                r = engine_->axpy_inplace(*params_[i], -lr_, *ortho_update);
+                r = engine_.axpy_inplace(params_[i], -lr_, *ortho_update);
                 if (!r) return std::unexpected(r.error());
             }
             else
             {
                 // 非 2D 参数（bias 等）：标准 SGD 更新（用 axpy_inplace 融合 scale+add）
-                r = engine_->axpy_inplace(*params_[i], -lr_, *update_ptr);
+                r = engine_.axpy_inplace(params_[i], -lr_, *update_ptr);
                 if (!r) return std::unexpected(r.error());
             }
         }
@@ -535,8 +548,8 @@ public:
 [[nodiscard]] inline std::unique_ptr<Optimizer> create_optimizer(
     std::string_view name,
     ComputeEngine& engine,
-    std::vector<Tensor*> params,
-    std::vector<Tensor*> grads,
+    std::vector<TensorRef> params,
+    std::vector<TensorRef> grads,
     Scalar lr,
     Scalar weight_decay = 0)
 {

@@ -144,22 +144,27 @@ int main(int argc, char *argv[])
     std::cout << "========================================\n" << std::endl;
 
     // 根据分词器类型调用对应训练接口（BPE 和 CharBPE 接口签名一致）
-    auto train_impl = [&](auto *tok) -> nn::Result<void>
-    {
-        using TokType = std::remove_pointer_t<decltype(tok)>;
-        typename TokType::Config tcfg;
-        tcfg.vocab_size = cfg.vocab_size;
-        tcfg.min_freq = cfg.min_freq;
-        tcfg.log = [](std::string_view msg) { std::cout << msg << '\n'; };
-        return tok->train(text, tcfg);
-    };
-
+    // 使用 if constexpr 避免 static_cast 向下转型，每个类型路径独立实例化
     auto t_start = std::chrono::steady_clock::now();
     nn::Result<void> train_result;
     if (cfg.tokenizer_type == "charbpe")
-        train_result = train_impl(static_cast<nn::CharBPETokenizer *>(tokenizer.get()));
+    {
+        auto& tok = static_cast<nn::CharBPETokenizer&>(*tokenizer);
+        nn::CharBPETokenizer::Config tcfg;
+        tcfg.vocab_size = cfg.vocab_size;
+        tcfg.min_freq = cfg.min_freq;
+        tcfg.log = [](std::string_view msg) { std::cout << msg << '\n'; };
+        train_result = tok.train(text, tcfg);
+    }
     else
-        train_result = train_impl(static_cast<nn::BPETokenizer *>(tokenizer.get()));
+    {
+        auto& tok = static_cast<nn::BPETokenizer&>(*tokenizer);
+        nn::BPETokenizer::Config tcfg;
+        tcfg.vocab_size = cfg.vocab_size;
+        tcfg.min_freq = cfg.min_freq;
+        tcfg.log = [](std::string_view msg) { std::cout << msg << '\n'; };
+        train_result = tok.train(text, tcfg);
+    }
 
     if (!train_result)
     {

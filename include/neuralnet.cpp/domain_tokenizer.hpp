@@ -1508,6 +1508,9 @@ public:
     static constexpr std::size_t DEFAULT_VOCAB_SIZE = 5000;
     static constexpr std::uint32_t DEFAULT_MIN_FREQ = 2;
 
+    static_assert(MIN_VOCAB_SIZE == CHAR_BASE, "MIN_VOCAB_SIZE must equal CHAR_BASE");
+    static_assert(CHAR_BASE == BYTE_BASE + 256, "CHAR_BASE must be BYTE_BASE + 256");
+
     using LogFn = std::function<void(std::string_view)>;
 
     struct Config
@@ -1619,10 +1622,11 @@ public:
         log("  目标合并数: " + std::to_string(target_merges));
 
         // ── 增量 pair 频次统计（避免每轮重扫全部 chunk） ──────
-        std::unordered_map<std::pair<std::size_t, std::size_t>, std::size_t, pair_hash> pair_freq;
+        // 用 64 位编码 pair：(a << 32) | b，消除 pair_hash 开销
+        std::unordered_map<std::uint64_t, std::size_t> pair_freq;
         for (const auto &chunk : char_chunks)
             for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
-                ++pair_freq[{chunk[i], chunk[i + 1]}];
+                ++pair_freq[pair_key(chunk[i], chunk[i + 1])];
 
         for (std::size_t round = 0; round < target_merges; ++round)
         {
@@ -1638,8 +1642,9 @@ public:
             }
 
             const std::size_t new_id = vocab_.size();
-            const std::size_t id_a = best->first.first;
-            const std::size_t id_b = best->first.second;
+            const std::uint64_t best_key = best->first;
+            const std::size_t id_a = static_cast<std::size_t>(best_key >> 32);
+            const std::size_t id_b = static_cast<std::size_t>(best_key & 0xFFFFFFFF);
             vocab_.push_back(vocab_[id_a] + vocab_[id_b]);
             merges_.push_back({id_a, id_b, new_id});
 
@@ -1655,7 +1660,7 @@ public:
                 // 减去旧 pair 频次
                 for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
                 {
-                    auto key = std::make_pair(chunk[i], chunk[i + 1]);
+                    auto key = pair_key(chunk[i], chunk[i + 1]);
                     auto it = pair_freq.find(key);
                     if (it != pair_freq.end() && --it->second == 0)
                         pair_freq.erase(it);
@@ -1678,7 +1683,7 @@ public:
 
                 // 加上新 pair 频次
                 for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
-                    ++pair_freq[{chunk[i], chunk[i + 1]}];
+                    ++pair_freq[pair_key(chunk[i], chunk[i + 1])];
             }
 
             if ((round + 1) % 500 == 0)
@@ -1849,7 +1854,7 @@ public:
                 ll_prev[j] = (j == 0) ? n : j - 1;
                 ll_next[j] = (j + 1 == n) ? n : j + 1;
             }
-            std::vector<bool> alive(n, true);
+            std::vector<std::uint8_t> alive(n, 1);
 
             using HeapEntry = std::pair<std::size_t, std::size_t>;
             std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
@@ -1878,7 +1883,7 @@ public:
                 if (merge_priority(ids[pos], ids[nxt]) != prio) continue;
 
                 ids[pos] = merges_[prio].new_id;
-                alive[nxt] = false;
+                alive[nxt] = 0;
 
                 std::size_t prev = ll_prev[pos];
                 std::size_t after = ll_next[nxt];
@@ -2067,42 +2072,36 @@ public:
             }
         }
 
-        // 重建 char_to_id_（加载时 vocab 已填充）
-        // 从 BYTE_BASE(4) 开始，含 ASCII 兜底 + 字符 + 合并 token
-        for (std::size_t i = BYTE_BASE; i < vocab_.size(); ++i)
-            if (!vocab_[i].empty())
-                char_to_id_[vocab_[i]] = i;
-
         rebuild_merge_map();
         return {};
     }
 
 private:
     struct MergeRule { std::size_t id_a, id_b, new_id; };
-    struct pair_hash
+
+    // 64 位编码 pair：将 (a, b) 映射为单个 uint64_t，消除 pair_hash 开销
+    // 要求 a, b < 2^32（vocab 大小不会超过此限制）
+    [[nodiscard]] static constexpr std::uint64_t pair_key(std::size_t a, std::size_t b) noexcept
     {
-        std::size_t operator()(const std::pair<std::size_t, std::size_t> &p) const noexcept
-        {
-            return p.first * 31 + p.second;
-        }
-    };
+        return (static_cast<std::uint64_t>(a) << 32) | static_cast<std::uint64_t>(b);
+    }
 
     std::vector<std::string> vocab_;
     std::vector<MergeRule> merges_;
     std::unordered_map<std::string, std::size_t> char_to_id_;
-    std::unordered_map<std::pair<std::size_t, std::size_t>, std::size_t, pair_hash> merge_map_;
+    std::unordered_map<std::uint64_t, std::size_t> merge_map_;
 
     void rebuild_merge_map()
     {
         merge_map_.clear();
         merge_map_.reserve(merges_.size());
         for (std::size_t i = 0; i < merges_.size(); ++i)
-            merge_map_[{merges_[i].id_a, merges_[i].id_b}] = i;
+            merge_map_[pair_key(merges_[i].id_a, merges_[i].id_b)] = i;
     }
 
     [[nodiscard]] std::size_t merge_priority(std::size_t a, std::size_t b) const noexcept
     {
-        auto it = merge_map_.find({a, b});
+        auto it = merge_map_.find(pair_key(a, b));
         return it != merge_map_.end() ? it->second : merges_.size();
     }
 };

@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "../core_errors.hpp"
+#include "../core_observer_ptr.hpp"
 #include "../config.hpp"
 #include "memory_pool.hpp"
 
@@ -34,8 +35,8 @@ namespace nn
 class StagingRing
 {
 public:
-    // 默认 64MB × 2 region = 128MB 总预分配
-    // （依据性能审查报告：旧默认 256MB × 4 = 1GB 过大）
+    // 默认 64MB × 2 region（实际分配大小由 initialize() 动态计算，
+    // 会根据 host-visible 显存大小自动扩容，此值仅作为下限参考）
     static constexpr std::size_t DEFAULT_REGION_SIZE = 64ull * 1024 * 1024; // 64MB
     static constexpr std::size_t DEFAULT_NUM_REGIONS = 2;
 
@@ -52,7 +53,7 @@ private:
     VkDevice device_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
     VkCommandPool cmd_pool_ = VK_NULL_HANDLE;
-    MemoryPool* pool_ = nullptr;
+    observer_ptr<MemoryPool> pool_;
     std::vector<Region> regions_;
     std::size_t region_size_;
     std::atomic<std::size_t> current_{0};
@@ -62,16 +63,17 @@ public:
 
     [[nodiscard]] Result<void> initialize(
         VkDevice device, VkPhysicalDevice physical_device,
-        VkCommandPool cmd_pool, MemoryPool* pool,
+        VkCommandPool cmd_pool, MemoryPool& pool,
         std::size_t region_size = DEFAULT_REGION_SIZE,
         std::size_t num_regions = DEFAULT_NUM_REGIONS)
     {
         device_ = device;
         physical_device_ = physical_device;
         cmd_pool_ = cmd_pool;
-        pool_ = pool;
+        pool_.reset(&pool);
 
-        // 动态计算合理的 Staging 大小
+        // 动态计算 Staging 大小：取 host-visible 显存的 1/16，下限 32MB
+        // 用户传入的 region_size 作为额外参考（取两者中较大值）。
         VkPhysicalDeviceMemoryProperties mem_props;
         vkGetPhysicalDeviceMemoryProperties(physical_device, &mem_props);
         VkDeviceSize max_host_visible = 0;
@@ -88,9 +90,11 @@ public:
         VkDeviceSize calculated_size = max_host_visible / 16;
         if (calculated_size < 32ull * 1024 * 1024)
             calculated_size = 32ull * 1024 * 1024;
-        if (calculated_size > 64ull * 1024 * 1024)
-            calculated_size = 64ull * 1024 * 1024;
-        region_size_ = std::min(static_cast<VkDeviceSize>(region_size), calculated_size);
+
+        // 最终取 用户请求值 与 动态计算值 的较大者
+        // （不再人为封顶 64MB，避免大 batch / 大 vocab 时上传失败）
+        region_size_ = std::max(
+            static_cast<VkDeviceSize>(region_size), calculated_size);
 
         regions_.resize(num_regions);
         for (std::size_t i = 0; i < num_regions; ++i)

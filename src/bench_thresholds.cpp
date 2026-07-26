@@ -191,7 +191,7 @@ static void bench_col_reduce(int warmup, int iters)
                 std::size_t r_end = std::min(r0 + block, R);
                 for (std::size_t r = r0; r < r_end; ++r)
                 {
-                    const Scalar* row = self.data() + r * C;
+                    const auto row = self.subspan(r * C, C);
                     for (std::size_t c = 0; c < C; ++c)
                         out[c] += row[c];
                 }
@@ -269,7 +269,7 @@ static void bench_col_reduce_parallel(int warmup, int iters)
             for (std::size_t c = 0; c < C; ++c) out[c] = Scalar{0};
             for (std::size_t r = 0; r < R; ++r)
             {
-                const Scalar* row = self.data() + r * C;
+                const auto row = self.subspan(r * C, C);
                 for (std::size_t c = 0; c < C; ++c)
                     out[c] += row[c];
             }
@@ -303,10 +303,10 @@ static void bench_col_reduce_parallel(int warmup, int iters)
                 [self, &local_acc, C, base, rem](std::size_t t) noexcept {
                     const std::size_t r0 = t * base + std::min(t, rem);
                     const std::size_t r_end = (t + 1) * base + std::min(t + 1, rem);
-                    auto* acc = local_acc.data() + t * C;
+                    auto acc = std::span<Scalar>(local_acc).subspan(t * C, C);
                     for (std::size_t r = r0; r < r_end; ++r)
                     {
-                        const Scalar* row = self.data() + r * C;
+                        const auto row = self.subspan(r * C, C);
                         for (std::size_t c = 0; c < C; ++c)
                             acc[c] += row[c];
                     }
@@ -317,7 +317,7 @@ static void bench_col_reduce_parallel(int warmup, int iters)
                 out[c] = local_acc[c];
             for (std::size_t t = 1; t < n_threads; ++t)
             {
-                const auto* acc = local_acc.data() + t * C;
+                const auto acc = std::span<const Scalar>(local_acc).subspan(t * C, C);
                 for (std::size_t c = 0; c < C; ++c)
                     out[c] += acc[c];
             }

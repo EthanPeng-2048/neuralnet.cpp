@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "../core_errors.hpp"
+#include "../core_observer_ptr.hpp"
 #include "../config.hpp"
 #include "memory_pool.hpp"
 #include "staging_ring.hpp"
@@ -499,12 +500,12 @@ private:
     VkDevice device_ = VK_NULL_HANDLE;
     VkBuffer buffer_ = VK_NULL_HANDLE;
     MemoryPool::Allocation alloc_;
-    MemoryPool* pool_ = nullptr;
+    observer_ptr<MemoryPool> pool_;
 
 public:
     GpuBuffer() = default;
 
-    GpuBuffer(VkDevice device, VkBuffer buffer, const MemoryPool::Allocation& alloc, MemoryPool* pool)
+    GpuBuffer(VkDevice device, VkBuffer buffer, const MemoryPool::Allocation& alloc, MemoryPool& pool)
         : device_(device), buffer_(buffer), alloc_(alloc), pool_(pool) {}
 
     ~GpuBuffer()
@@ -522,7 +523,7 @@ public:
         o.device_ = VK_NULL_HANDLE;
         o.buffer_ = VK_NULL_HANDLE;
         o.alloc_ = {};
-        o.pool_ = nullptr;
+        o.pool_.reset();
     }
 
     GpuBuffer& operator=(GpuBuffer&& o) noexcept
@@ -532,7 +533,7 @@ public:
             std::swap(device_, o.device_);
             std::swap(buffer_, o.buffer_);
             std::swap(alloc_, o.alloc_);
-            std::swap(pool_, o.pool_);
+            pool_.swap(o.pool_);
         }
         return *this;
     }
@@ -576,7 +577,7 @@ public:
             return std::unexpected(Error{"vkBindBufferMemory failed: " + std::to_string(res)});
         }
 
-        return GpuBuffer(device, buffer, *alloc_r, &pool);
+        return GpuBuffer(device, buffer, *alloc_r, pool);
     }
 
     [[nodiscard]] VkBuffer impl() const noexcept { return buffer_; }
@@ -840,7 +841,7 @@ public:
         // 6. 创建 staging ring
         staging_ring_ = std::make_unique<StagingRing>();
         auto st_r = staging_ring_->initialize(
-            device_.device(), device_.physical_device(), command_pool_, memory_pool_.get());
+            device_.device(), device_.physical_device(), command_pool_, *memory_pool_);
         if (!st_r)
             return st_r;
 
