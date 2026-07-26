@@ -28,6 +28,7 @@
 
 #include "compute_engine.hpp"
 #include "tensor.hpp"
+#include "model_spec.hpp"
 
 namespace nn
 {
@@ -1668,6 +1669,338 @@ public:
 };
 
 // ══════════════════════════════════════════════════════════════════════════
+// ALiBiCausalSelfAttention — 带线性偏置的因果自注意力
+//
+// ALiBi (Attention with Linear Biases) 原理：
+//   不使用位置嵌入，而是在注意力分数上添加线性偏置：
+//   attention_score = Q*K^T + bias
+//   其中 bias[i][j] = -m_h * (i - j) for j <= i
+//   斜率 m_h = 2^(-8h/H)，h 是头索引，H 是总头数
+//
+// 优点：
+//   1. 无需位置嵌入，减少参数
+//   2. 天然支持长度外推（训练短序列，推理长序列）
+//   3. 计算开销极小（仅添加预计算的偏置）
+//
+// 算法（只在此处，不在 Engine/Shader）：
+//   Q/K/V: (H*d_k, batch*seq) — 头维度在行方向，batch 在列方向
+//   Q_re = rearrange_3d(Q, H*d_k, batch, seq) → (batch*H*d_k, seq)
+//   S = batched_matmul(Q_re, K_re, batch*H, transA=true) → (batch*H*seq, seq)
+//   S *= scale
+//   S += alibi_bias (batch*H*seq, seq) — ALiBi 偏置按 batch*H 平铺
+//   A = softmax(S)
+//   O_re = batched_matmul(V_re, A, batch*H) → (batch*H*d_k, seq)
+//   O = rearrange_3d(O_re, H*d_k, batch, seq, inverse=true) → (H*d_k, batch*seq)
+//   out = W_o × O
+// ══════════════════════════════════════════════════════════════════════════
+class ALiBiCausalSelfAttention final : public Layer
+{
+private:
+    std::size_t d_model_;
+    std::size_t num_heads_;
+    std::size_t d_k_;
+    std::size_t seq_len_;
+    Scalar scale_;
+
+    Linear w_q_;
+    Linear w_k_;
+    Linear w_v_;
+    Linear w_o_;
+    Softmax softmax_;
+
+    // forward 缓存
+    Tensor Q_cache_, K_cache_, V_cache_;
+    Tensor attn_cache_;
+
+    // ALiBi 偏置缓存（合并因果掩码 + 线性偏置）
+    Tensor alibi_bias_cache_;
+    std::size_t alibi_bias_cached_key_ = 0;
+
+    // ALiBi 斜率：m_h = 2^(-8h/H)
+    std::vector<Scalar> slopes_;
+
+    void init_slopes()
+    {
+        slopes_.resize(num_heads_);
+        for (std::size_t h = 0; h < num_heads_; ++h)
+        {
+            // m_h = 2^(-8h/H)
+            slopes_[h] = std::pow(Scalar{2}, -Scalar{8} * h / num_heads_);
+        }
+    }
+
+    void ensure_alibi_bias(ComputeEngine& engine, std::size_t batch, std::size_t seq_len)
+    {
+        const std::size_t key = (batch << 16) | seq_len;
+        if (alibi_bias_cached_key_ == key) return;
+
+        const Scalar neg_inf = -std::numeric_limits<Scalar>::infinity();
+        const std::size_t BH = batch * num_heads_;
+
+        // ALiBi 偏置: (BH * seq_len, seq_len)
+        // 对于每个头 h，偏置矩阵为：
+        //   bias[i][j] = -m_h * (i - j) if j <= i
+        //   bias[i][j] = -inf if j > i (因果掩码)
+        Matrix bias(BH * seq_len, seq_len);
+        for (std::size_t b = 0; b < batch; ++b)
+        {
+            for (std::size_t h = 0; h < num_heads_; ++h)
+            {
+                const std::size_t head_idx = b * num_heads_ + h;
+                const Scalar slope = slopes_[h];
+
+                for (std::size_t i = 0; i < seq_len; ++i)
+                {
+                    for (std::size_t j = 0; j < seq_len; ++j)
+                    {
+                        if (j <= i)
+                        {
+                            // ALiBi 线性偏置：-m_h * (i - j)
+                            bias.set_value_unchecked(
+                                head_idx * seq_len + i, j,
+                                -slope * static_cast<Scalar>(i - j));
+                        }
+                        else
+                        {
+                            // 因果掩码：未来位置为 -inf
+                            bias.set_value_unchecked(
+                                head_idx * seq_len + i, j,
+                                neg_inf);
+                        }
+                    }
+                }
+            }
+        }
+
+        auto r = engine.from_matrix(bias);
+        NN_ASSERT(r, r ? "" : r.error().message.c_str());
+        alibi_bias_cache_ = std::move(*r);
+        alibi_bias_cached_key_ = key;
+    }
+
+public:
+    ALiBiCausalSelfAttention(ComputeEngine& engine,
+                             std::size_t d_model, std::size_t num_heads,
+                             std::size_t /*max_len*/ = 1024,
+                             std::size_t seq_len = 0)
+        : d_model_(d_model), num_heads_(num_heads),
+          d_k_(d_model / num_heads),
+          seq_len_(seq_len),
+          scale_(Scalar{1} / std::sqrt(static_cast<Scalar>(d_model / num_heads))),
+          w_q_(engine, d_model, d_model),
+          w_k_(engine, d_model, d_model),
+          w_v_(engine, d_model, d_model),
+          w_o_(engine, d_model, d_model)
+    {
+        NN_ASSERT(d_model % num_heads == 0,
+                  "ALiBiCausalSelfAttention: d_model must be divisible by num_heads");
+        init_slopes();
+    }
+
+    std::vector<Tensor*> parameters() override
+    {
+        auto p = w_q_.parameters();
+        auto k = w_k_.parameters();
+        auto v = w_v_.parameters();
+        auto o = w_o_.parameters();
+        p.insert(p.end(), k.begin(), k.end());
+        p.insert(p.end(), v.begin(), v.end());
+        p.insert(p.end(), o.begin(), o.end());
+        return p;
+    }
+
+    std::vector<Tensor*> param_gradients() override
+    {
+        auto g = w_q_.param_gradients();
+        auto k = w_k_.param_gradients();
+        auto v = w_v_.param_gradients();
+        auto o = w_o_.param_gradients();
+        g.insert(g.end(), k.begin(), k.end());
+        g.insert(g.end(), v.begin(), v.end());
+        g.insert(g.end(), o.begin(), o.end());
+        return g;
+    }
+
+    [[nodiscard]] Result<Tensor> forward(
+        ComputeEngine& engine, const Tensor& input) override
+    {
+        if (input.rows() != d_model_)
+            return std::unexpected(Error{"ALiBiCausalSelfAttention forward: input shape mismatch"});
+
+        const std::size_t total_seq = input.cols();
+        const std::size_t seq   = (seq_len_ > 0) ? seq_len_ : total_seq;
+        const std::size_t batch = (seq_len_ > 0) ? (total_seq / seq_len_) : 1;
+        if (total_seq != batch * seq)
+            return std::unexpected(Error{"ALiBiCausalSelfAttention forward: cols not divisible by seq_len"});
+
+        ensure_alibi_bias(engine, batch, seq);
+
+        // 1. 线性投影 → Q/K/V: (H*d_k, batch*seq)
+        auto q_res = w_q_.forward(engine, input);
+        if (!q_res) return q_res;
+        auto k_res = w_k_.forward(engine, input);
+        if (!k_res) return k_res;
+        auto v_res = w_v_.forward(engine, input);
+        if (!v_res) return v_res;
+
+        // 2. rearrange: (H*d_k, batch*seq) → (batch*H*d_k, seq)
+        const std::size_t H_dk = num_heads_ * d_k_;
+        if (batch > 1)
+        {
+            auto qr = engine.rearrange_3d(*q_res, H_dk, batch, seq, false);
+            if (!qr) return std::unexpected(qr.error());
+            Q_cache_ = std::move(*qr);
+            auto kr = engine.rearrange_3d(*k_res, H_dk, batch, seq, false);
+            if (!kr) return std::unexpected(kr.error());
+            K_cache_ = std::move(*kr);
+            auto vr = engine.rearrange_3d(*v_res, H_dk, batch, seq, false);
+            if (!vr) return std::unexpected(vr.error());
+            V_cache_ = std::move(*vr);
+        }
+        else
+        {
+            Q_cache_ = std::move(*q_res);
+            K_cache_ = std::move(*k_res);
+            V_cache_ = std::move(*v_res);
+        }
+
+        // 3. S = batched_matmul(Q_re, K_re, batch*H, transA=true) → (batch*H*seq, seq)
+        const std::size_t BH = batch * num_heads_;
+        auto scores = engine.batched_matmul(
+            Q_cache_, K_cache_, BH, true, false);
+        if (!scores) return std::unexpected(scores.error());
+
+        // 4. S *= scale
+        auto r = engine.scale_inplace(*scores, scale_);
+        if (!r) return std::unexpected(r.error());
+
+        // 5. 施加 ALiBi 偏置 S += alibi_bias (batch*H*seq, seq)
+        auto biased = engine.elementwise_binary(BinaryOp::Add, *scores, alibi_bias_cache_);
+        if (!biased) return std::unexpected(biased.error());
+
+        // 6. A = softmax(S_biased)
+        auto attn = softmax_.forward(engine, *biased);
+        if (!attn) return std::unexpected(attn.error());
+        attn_cache_ = *attn;
+
+        // 7. O_re = batched_matmul(V_re, A, batch*H) → (batch*H*d_k, seq)
+        auto concat_out = engine.batched_matmul(
+            V_cache_, attn_cache_, BH, false, false);
+        if (!concat_out) return std::unexpected(concat_out.error());
+
+        // 8. rearrange back: (batch*H*d_k, seq) → (H*d_k, batch*seq)
+        Tensor concat;
+        if (batch > 1)
+        {
+            auto cb = engine.rearrange_3d(*concat_out, H_dk, batch, seq, true);
+            if (!cb) return std::unexpected(cb.error());
+            concat = std::move(*cb);
+        }
+        else
+        {
+            concat = std::move(*concat_out);
+        }
+
+        // 9. 输出投影
+        return w_o_.forward(engine, concat);
+    }
+
+    [[nodiscard]] Result<Tensor> backward(
+        ComputeEngine& engine, const Tensor& grad_output) override
+    {
+        // 推断 batch/seq（与 forward 一致）
+        const std::size_t total_seq = grad_output.cols();
+        const std::size_t seq   = (seq_len_ > 0) ? seq_len_ : total_seq;
+        const std::size_t batch = (seq_len_ > 0) ? (total_seq / seq_len_) : 1;
+        const std::size_t H_dk = num_heads_ * d_k_;
+        const std::size_t BH = batch * num_heads_;
+
+        // 1. 输出投影反向 → grad_concat: (H*d_k, batch*seq)
+        auto gc = w_o_.backward(engine, grad_output);
+        if (!gc) return gc;
+
+        // 2. rearrange grad_concat → (batch*H*d_k, seq)
+        Tensor grad_concat_re;
+        if (batch > 1)
+        {
+            auto gcr = engine.rearrange_3d(*gc, H_dk, batch, seq, false);
+            if (!gcr) return std::unexpected(gcr.error());
+            grad_concat_re = std::move(*gcr);
+        }
+        else
+        {
+            grad_concat_re = std::move(*gc);
+        }
+
+        // 3. grad_V_re = batched_matmul(grad_concat, A, BH, false, true)
+        auto grad_V_re = engine.batched_matmul(
+            grad_concat_re, attn_cache_, BH, false, true);
+        if (!grad_V_re) return std::unexpected(grad_V_re.error());
+
+        // 4. grad_A = batched_matmul(V, grad_concat, BH, true, false)
+        auto grad_A = engine.batched_matmul(
+            V_cache_, grad_concat_re, BH, true, false);
+        if (!grad_A) return std::unexpected(grad_A.error());
+
+        // 5. grad_S = softmax.backward(grad_A) — ALiBi 偏置为常数，梯度直接穿透
+        auto grad_S = softmax_.backward(engine, *grad_A);
+        if (!grad_S) return std::unexpected(grad_S.error());
+
+        // 6. grad_Q_re = batched_matmul(K, grad_S, BH, false, true) × scale
+        auto grad_Q_re = engine.batched_matmul(
+            K_cache_, *grad_S, BH, false, true);
+        if (!grad_Q_re) return std::unexpected(grad_Q_re.error());
+        auto rq = engine.scale_inplace(*grad_Q_re, scale_);
+        if (!rq) return std::unexpected(rq.error());
+
+        // 7. grad_K_re = batched_matmul(Q, grad_S, BH, false, false) × scale
+        auto grad_K_re = engine.batched_matmul(
+            Q_cache_, *grad_S, BH, false, false);
+        if (!grad_K_re) return std::unexpected(grad_K_re.error());
+        auto rk = engine.scale_inplace(*grad_K_re, scale_);
+        if (!rk) return std::unexpected(rk.error());
+
+        // 8. rearrange back: (batch*H*d_k, seq) → (H*d_k, batch*seq)
+        Tensor grad_Q, grad_K, grad_V;
+        if (batch > 1)
+        {
+            auto gq = engine.rearrange_3d(*grad_Q_re, H_dk, batch, seq, true);
+            if (!gq) return std::unexpected(gq.error());
+            grad_Q = std::move(*gq);
+            auto gk = engine.rearrange_3d(*grad_K_re, H_dk, batch, seq, true);
+            if (!gk) return std::unexpected(gk.error());
+            grad_K = std::move(*gk);
+            auto gv = engine.rearrange_3d(*grad_V_re, H_dk, batch, seq, true);
+            if (!gv) return std::unexpected(gv.error());
+            grad_V = std::move(*gv);
+        }
+        else
+        {
+            grad_Q = std::move(*grad_Q_re);
+            grad_K = std::move(*grad_K_re);
+            grad_V = std::move(*grad_V_re);
+        }
+
+        // 9. 投影层反向 + 累加输入梯度
+        auto giq = w_q_.backward(engine, grad_Q);
+        if (!giq) return giq;
+        Tensor grad_input = std::move(*giq);
+
+        auto gik = w_k_.backward(engine, grad_K);
+        if (!gik) return gik;
+        auto r1 = engine.add_inplace(grad_input, *gik);
+        if (!r1) return std::unexpected(r1.error());
+
+        auto giv = w_v_.backward(engine, grad_V);
+        if (!giv) return giv;
+        auto r2 = engine.add_inplace(grad_input, *giv);
+        if (!r2) return std::unexpected(r2.error());
+
+        return grad_input;
+    }
+};
+
+// ══════════════════════════════════════════════════════════════════════════
 // GPTBlock — Pre-Norm 解码器块
 //
 // 算法（只在此处，不在 Engine/Shader）：
@@ -1764,6 +2097,102 @@ public:
 };
 
 // ══════════════════════════════════════════════════════════════════════════
+// ALiBiGPTBlock — 使用 ALiBi 的 Pre-Norm 解码器块
+//
+// 算法（只在此处，不在 Engine/Shader）：
+//   x = x + ALiBiCausalSelfAttn(LN₁(x))
+//   x = x + FFN(LN₂(x))
+// ══════════════════════════════════════════════════════════════════════════
+class ALiBiGPTBlock final : public Layer
+{
+private:
+    ALiBiCausalSelfAttention self_attn_;
+    LayerNorm norm1_;
+    FeedForward ff_;
+    LayerNorm norm2_;
+
+    Tensor residual1_cache_;
+    Tensor residual2_cache_;
+
+public:
+    ALiBiGPTBlock(ComputeEngine& engine,
+                  std::size_t d_model, std::size_t num_heads,
+                  std::size_t d_ff, std::size_t max_len = 1024,
+                  std::size_t seq_len = 0)
+        : self_attn_(engine, d_model, num_heads, max_len, seq_len),
+          norm1_(engine, d_model),
+          ff_(engine, d_model, d_ff),
+          norm2_(engine, d_model) {}
+
+    std::vector<Tensor*> parameters() override
+    {
+        auto p = self_attn_.parameters();
+        auto n1 = norm1_.parameters();
+        auto f  = ff_.parameters();
+        auto n2 = norm2_.parameters();
+        p.insert(p.end(), n1.begin(), n1.end());
+        p.insert(p.end(), f.begin(), f.end());
+        p.insert(p.end(), n2.begin(), n2.end());
+        return p;
+    }
+
+    std::vector<Tensor*> param_gradients() override
+    {
+        auto g = self_attn_.param_gradients();
+        auto gn1 = norm1_.param_gradients();
+        auto gf  = ff_.param_gradients();
+        auto gn2 = norm2_.param_gradients();
+        g.insert(g.end(), gn1.begin(), gn1.end());
+        g.insert(g.end(), gf.begin(), gf.end());
+        g.insert(g.end(), gn2.begin(), gn2.end());
+        return g;
+    }
+
+    [[nodiscard]] Result<Tensor> forward(
+        ComputeEngine& engine, const Tensor& input) override
+    {
+        residual1_cache_ = input;
+
+        auto n1 = norm1_.forward(engine, input);
+        if (!n1) return n1;
+
+        auto a = self_attn_.forward(engine, *n1);
+        if (!a) return a;
+
+        auto r2 = engine.elementwise_binary(BinaryOp::Add, input, *a);
+        if (!r2) return std::unexpected(r2.error());
+        residual2_cache_ = *r2;
+
+        auto n2 = norm2_.forward(engine, residual2_cache_);
+        if (!n2) return n2;
+
+        auto f = ff_.forward(engine, *n2);
+        if (!f) return f;
+
+        return engine.elementwise_binary(BinaryOp::Add, residual2_cache_, *f);
+    }
+
+    [[nodiscard]] Result<Tensor> backward(
+        ComputeEngine& engine, const Tensor& grad_output) override
+    {
+        auto grad_ff = ff_.backward(engine, grad_output);
+        if (!grad_ff) return grad_ff;
+        auto b_n2 = norm2_.backward(engine, *grad_ff);
+        if (!b_n2) return b_n2;
+
+        auto grad_r1 = engine.elementwise_binary(BinaryOp::Add, grad_output, *b_n2);
+        if (!grad_r1) return std::unexpected(grad_r1.error());
+
+        auto b_sa = self_attn_.backward(engine, *grad_r1);
+        if (!b_sa) return b_sa;
+        auto b_n1 = norm1_.backward(engine, *b_sa);
+        if (!b_n1) return b_n1;
+
+        return engine.elementwise_binary(BinaryOp::Add, *grad_r1, *b_n1);
+    }
+};
+
+// ══════════════════════════════════════════════════════════════════════════
 // GPTModel — Decoder-only Transformer 语言模型
 //
 // 算法（只在此处，不在 Engine/Shader）：
@@ -1781,8 +2210,9 @@ private:
     std::size_t vocab_size_;
     std::size_t d_model_;
     std::size_t seq_len_;
+    bool pos_emb_learnable_;  // true=learned, false=sinusoidal(冻结)
 
-    // 可学习嵌入
+    // 嵌入
     Tensor token_emb_;       // (vocab_size, d_model)
     Tensor grad_token_emb_;
     Tensor pos_emb_;         // (seq_len, d_model)
@@ -1805,8 +2235,10 @@ private:
 public:
     GPTModel(ComputeEngine& engine,
              std::size_t vocab_size, std::size_t d_model, std::size_t seq_len,
-             std::size_t num_heads, std::size_t d_ff, std::size_t num_layers)
+             std::size_t num_heads, std::size_t d_ff, std::size_t num_layers,
+             PosEncodingType pos_enc_type = PosEncodingType::Learned)
         : vocab_size_(vocab_size), d_model_(d_model), seq_len_(seq_len),
+          pos_emb_learnable_(pos_enc_type == PosEncodingType::Learned),
           ln_f_(engine, d_model),
           lm_head_(engine, d_model, vocab_size)
     {
@@ -1818,8 +2250,26 @@ public:
         std::normal_distribution<Scalar> dist(0.0, emb_init_std);
         auto te_s = te.span();
         for (std::size_t i = 0; i < te.size(); ++i) te_s[i] = dist(rng);
-        auto pe_s = pe.span();
-        for (std::size_t i = 0; i < pe.size(); ++i) pe_s[i] = dist(rng);
+
+        // 位置编码初始化
+        if (pos_enc_type == PosEncodingType::Sinusoidal)
+        {
+            // 正弦波固定位置编码: PE(pos, 2i) = sin(pos/10000^(2i/d)), PE(pos, 2i+1) = cos(...)
+            auto pe_s = pe.span();
+            for (std::size_t pos = 0; pos < seq_len; ++pos)
+                for (std::size_t i = 0; i < d_model; ++i)
+                {
+                    Scalar angle = static_cast<Scalar>(pos) /
+                        std::pow(Scalar{10000}, static_cast<Scalar>(2 * (i / 2)) / static_cast<Scalar>(d_model));
+                    pe_s[pos * d_model + i] = (i % 2 == 0) ? std::sin(angle) : std::cos(angle);
+                }
+        }
+        else
+        {
+            // 可学习位置编码: N(0, 0.02) 随机初始化
+            auto pe_s = pe.span();
+            for (std::size_t i = 0; i < pe.size(); ++i) pe_s[i] = dist(rng);
+        }
 
         auto te_r = engine.from_matrix(te);
         NN_ASSERT(te_r, te_r ? "" : te_r.error().message.c_str());
@@ -1842,7 +2292,8 @@ public:
     {
         std::vector<Tensor*> p;
         p.push_back(&token_emb_);
-        p.push_back(&pos_emb_);
+        if (pos_emb_learnable_)
+            p.push_back(&pos_emb_);
         for (auto& b : blocks_)
         {
             auto bp = b.parameters();
@@ -1859,7 +2310,8 @@ public:
     {
         std::vector<Tensor*> g;
         g.push_back(&grad_token_emb_);
-        g.push_back(&grad_pos_emb_);
+        if (pos_emb_learnable_)
+            g.push_back(&grad_pos_emb_);
         for (auto& b : blocks_)
         {
             auto bg = b.param_gradients();
@@ -1886,24 +2338,9 @@ public:
         auto all_emb = engine.gather_rows(token_emb_, input);
         if (!all_emb) return std::unexpected(all_emb.error());
 
-        // ── 2. 下载 input 记录 token IDs（供 backward 的 scatter_add_rows） ──
-        // 同时构造 Tensor 版本，避免 backward 时再次 from_matrix
-        auto in_m = engine.to_matrix(input);
-        if (!in_m) return std::unexpected(in_m.error());
-        const auto in_span = in_m->span();
-        stored_tokens_flat_.resize(total);
-        Matrix st_m(total, 1);
-        for (std::size_t i = 0; i < total; ++i)
-        {
-            auto tid = static_cast<std::size_t>(in_span[i]);
-            if (tid >= vocab_size_)
-                return std::unexpected(Error{
-                    "GPTModel::forward token id out of range: " +
-                    std::to_string(tid)});
-            stored_tokens_flat_[i] = tid;
-            st_m.set_value_unchecked(i, 0, static_cast<Scalar>(tid));
-        }
-        auto st_t = engine.from_matrix(st_m);
+        // ── 2. 保存 token IDs 的 Tensor 拷贝（供 backward 的 scatter_add_rows） ──
+        // 全程 GPU：clone 在 GPU 内执行，无 PCIe 传输
+        auto st_t = engine.clone(input);
         if (!st_t) return std::unexpected(st_t.error());
         stored_tokens_tensor_ = std::move(*st_t);
 
@@ -1963,7 +2400,8 @@ public:
         const std::size_t seq_len = seq_len_;
 
         (void)engine.zero(grad_token_emb_);
-        (void)engine.zero(grad_pos_emb_);
+        if (pos_emb_learnable_)
+            (void)engine.zero(grad_pos_emb_);
 
         // ── 1. LM Head 反向 → (d_model, seq*batch) ──
         auto b_lm = lm_head_.backward(engine, grad_output);
@@ -1983,32 +2421,50 @@ public:
             grad_x = std::move(*br);
         }
 
-        // ── 4. 转置 grad_x + pos_grad CPU 辅助 ──
+        // ── 4. 转置 grad_x + pos_grad GPU 计算 ──
         //   grad_x: (d_model, seq*batch)
         //   grad_T = transpose(grad_x) → (total, d_model) — 用于 scatter_add_rows
-        //   pos_grad[t, d] = Σ_b grad_x[d, t*batch+b] — 数据量小，CPU 辅助
+        //   pos_grad = rearrange_3d(grad_x) + reduce → 全 GPU，无 PCIe 传输
         auto grad_T = engine.transpose(grad_x);
         if (!grad_T) return std::unexpected(grad_T.error());
 
-        auto gx_m = engine.to_matrix(grad_x);
-        if (!gx_m) return std::unexpected(gx_m.error());
-        Matrix pos_grad(seq_len, d_model_);
-        for (std::size_t t = 0; t < seq_len; ++t)
-            for (std::size_t b = 0; b < batch_size_; ++b)
-                for (std::size_t d = 0; d < d_model_; ++d)
-                    pos_grad.set_value_unchecked(t, d,
-                        pos_grad.at_unchecked(t, d) +
-                        gx_m->at_unchecked(d, t * batch_size_ + b));
+        if (pos_emb_learnable_)
+        {
+            // rearrange_3d(grad_x, d_model, seq, batch) → (seq*d_model, batch)
+            // 然后 row_reduce_sum → (seq*d_model, 1) = pos_grad 扁平化
+            auto rearranged = engine.rearrange_3d(
+                grad_x, d_model_, seq_len, batch_size_, false);
+            if (!rearranged) return std::unexpected(rearranged.error());
+
+            auto reduced = engine.row_reduce_sum(*rearranged);
+            if (!reduced) return std::unexpected(reduced.error());
+
+            // reduced 是 (seq*d_model, 1)，数据布局为 pos_grad[t*d_model+d]
+            // reshape 为 (seq, d_model)
+            Tensor pos_grad_t;
+            if (reduced->is_gpu())
+            {
+                // GPU 路径：零拷贝 reshape（共享底层 buffer）
+                auto reshaped_gt = reduced->gpu_tensor().with_shape(seq_len, d_model_);
+                pos_grad_t = Tensor::from_gpu(std::move(reshaped_gt));
+            }
+            else
+            {
+                // CPU 路径：数据布局已正确，重新解释形状
+                const auto& src = reduced->cpu_matrix();
+                Matrix dst(seq_len, d_model_, Scalar{0});
+                std::memcpy(dst.span().data(), src.span().data(),
+                            seq_len * d_model_ * sizeof(Scalar));
+                pos_grad_t = Tensor::from_matrix(std::move(dst));
+            }
+
+            auto ar = engine.add_inplace(grad_pos_emb_, pos_grad_t);
+            if (!ar) return std::unexpected(ar.error());
+        }
 
         // ── 5. scatter_add_rows: grad_token_emb_[tokens] += grad_T ──
         auto sr = engine.scatter_add_rows(grad_token_emb_, stored_tokens_tensor_, *grad_T);
         if (!sr) return std::unexpected(sr.error());
-
-        // ── 6. add pos_grad ──
-        auto pg_t = engine.from_matrix(pos_grad);
-        if (!pg_t) return std::unexpected(pg_t.error());
-        auto ar = engine.add_inplace(grad_pos_emb_, *pg_t);
-        if (!ar) return std::unexpected(ar.error());
 
         // grad_input: token IDs 无梯度，返回零张量（仅用于接口一致性）
         Matrix grad_input(seq_len, batch_size_, Scalar{0});
@@ -2038,7 +2494,9 @@ public:
                 start = context.size() - seq_len_;
 
             const std::size_t cur_len = context.size() - start;
-            Matrix input(cur_len, 1);
+            // 始终 pad 到 seq_len_，确保 CausalSelfAttention 中 total_seq % seq_len_ == 0
+            Matrix input(seq_len_, 1);
+            input.zero();
             for (std::size_t t = 0; t < cur_len; ++t)
                 input.set_value_unchecked(t, 0,
                     static_cast<Scalar>(context[start + t]));
@@ -2073,8 +2531,10 @@ public:
             for (auto& v : last_logits) v /= sum_exp;
 
             // 采样
+            // temperature > 0: 随机采样（temperature 仅影响缩放，1.0 = 不缩放但仍然采样）
+            // temperature == 0: 贪心解码（argmax）
             std::size_t next_token;
-            if (temperature > 0.0 && temperature != 1.0)
+            if (temperature > 0.0)
             {
                 Scalar r = dist(rng);
                 Scalar cumulative = 0.0;
@@ -2097,6 +2557,269 @@ public:
 
             // 遇到 EOS 停止生成（不将 EOS 加入输出）
             // 但前 min_new_tokens 个 token 内不检查，避免模型一上来就输出 EOS
+            if (step >= min_new_tokens && next_token == eos_token_id)
+                break;
+
+            generated.push_back(next_token);
+        }
+        return generated;
+    }
+};
+
+// ══════════════════════════════════════════════════════════════════════════
+// ALiBiGPTModel — 使用 ALiBi 的 Decoder-only Transformer 语言模型
+//
+// 算法（只在此处，不在 Engine/Shader）：
+//   组件: TokenEmb + N × ALiBiGPTBlock + LayerNorm + LM Head
+//   输入: (seq_len, batch_size) — token ID 矩阵（每列为一个序列）
+//   输出: (vocab_size, seq_len × batch_size) — 每个位置的 logits
+//
+// 与 GPTModel 的区别：
+//   1. 不使用位置嵌入，通过 ALiBi 在注意力分数上添加线性偏置
+//   2. 支持长度外推（训练短序列，推理长序列）
+//   3. 参数更少（无 pos_emb_）
+// ══════════════════════════════════════════════════════════════════════════
+class ALiBiGPTModel final : public Layer
+{
+private:
+    std::size_t vocab_size_;
+    std::size_t seq_len_;
+
+    // 可学习嵌入（仅 token，无位置嵌入）
+    Tensor token_emb_;       // (vocab_size, d_model)
+    Tensor grad_token_emb_;
+
+    std::vector<ALiBiGPTBlock> blocks_;
+    LayerNorm ln_f_;
+    Linear lm_head_;
+
+    // 反向缓存
+    Tensor stored_x_;                      // forward 输入 (d_model, seq*batch)
+    Tensor stored_tokens_tensor_;          // token IDs 的 Tensor 版本 (GPU clone)
+    std::size_t batch_size_ = 0;
+
+public:
+    ALiBiGPTModel(ComputeEngine& engine,
+                  std::size_t vocab_size, std::size_t d_model, std::size_t seq_len,
+                  std::size_t num_heads, std::size_t d_ff, std::size_t num_layers)
+        : vocab_size_(vocab_size), seq_len_(seq_len),
+          ln_f_(engine, d_model),
+          lm_head_(engine, d_model, vocab_size)
+    {
+        // 初始化 token_emb_（无位置嵌入）
+        Matrix te(vocab_size, d_model);
+        constexpr Scalar emb_init_std = 0.02;
+        std::mt19937_64 rng{42};
+        std::normal_distribution<Scalar> dist(0.0, emb_init_std);
+        auto te_s = te.span();
+        for (std::size_t i = 0; i < te.size(); ++i) te_s[i] = dist(rng);
+
+        auto te_r = engine.from_matrix(te);
+        NN_ASSERT(te_r, te_r ? "" : te_r.error().message.c_str());
+        token_emb_ = std::move(*te_r);
+
+        grad_token_emb_ = engine.create_tensor(vocab_size, d_model);
+        { auto r1 = engine.zero(grad_token_emb_); NN_ASSERT(r1, r1 ? "" : r1.error().message.c_str()); }
+
+        // ALiBiGPTBlock 传入 seq_len，启用批量化路径
+        for (std::size_t i = 0; i < num_layers; ++i)
+            blocks_.emplace_back(engine, d_model, num_heads, d_ff, seq_len, seq_len);
+    }
+
+    std::vector<Tensor*> parameters() override
+    {
+        std::vector<Tensor*> p;
+        p.push_back(&token_emb_);
+        for (auto& b : blocks_)
+        {
+            auto bp = b.parameters();
+            p.insert(p.end(), bp.begin(), bp.end());
+        }
+        auto lp = ln_f_.parameters();
+        p.insert(p.end(), lp.begin(), lp.end());
+        auto hp = lm_head_.parameters();
+        p.insert(p.end(), hp.begin(), hp.end());
+        return p;
+    }
+
+    std::vector<Tensor*> param_gradients() override
+    {
+        std::vector<Tensor*> g;
+        g.push_back(&grad_token_emb_);
+        for (auto& b : blocks_)
+        {
+            auto bg = b.param_gradients();
+            g.insert(g.end(), bg.begin(), bg.end());
+        }
+        auto lg = ln_f_.param_gradients();
+        g.insert(g.end(), lg.begin(), lg.end());
+        auto hg = lm_head_.param_gradients();
+        g.insert(g.end(), hg.begin(), hg.end());
+        return g;
+    }
+
+    [[nodiscard]] Result<Tensor> forward(
+        ComputeEngine& engine, const Tensor& input) override
+    {
+        batch_size_ = input.cols();
+
+        // ── 1. gather 所有 token 的 embedding ──
+        // input: (seq, batch) 标量 token IDs（row-major: i = t * batch + b）
+        // gather_rows(token_emb_, input) → (seq*batch, d_model)
+        auto all_emb = engine.gather_rows(token_emb_, input);
+        if (!all_emb) return std::unexpected(all_emb.error());
+
+        // ── 2. 保存 token IDs 的 Tensor 拷贝（供 backward 的 scatter_add_rows） ──
+        // 全程 GPU：clone 在 GPU 内执行，无 PCIe 传输
+        auto st_t = engine.clone(input);
+        if (!st_t) return std::unexpected(st_t.error());
+        stored_tokens_tensor_ = std::move(*st_t);
+
+        // ── 3. 构造 x: (d_model, seq*batch) ──
+        //   ALiBi 不需要位置嵌入，直接使用 token embedding
+        auto x_result = engine.transpose(*all_emb);
+        if (!x_result) return std::unexpected(x_result.error());
+        stored_x_ = *x_result;
+
+        // ── 4. 通过 Transformer 块（全批量化，无 per-sample 循环） ──
+        Tensor x = std::move(*x_result);
+        for (auto& blk : blocks_)
+        {
+            auto r = blk.forward(engine, x);
+            if (!r) return r;
+            x = std::move(*r);
+        }
+
+        // ── 5. 最终 LayerNorm ──
+        auto ln = ln_f_.forward(engine, x);
+        if (!ln) return ln;
+        x = std::move(*ln);
+
+        // ── 6. LM Head → (vocab_size, seq*batch) batch-major ──
+        return lm_head_.forward(engine, x);
+    }
+
+    [[nodiscard]] Result<Tensor> backward(
+        ComputeEngine& engine, const Tensor& grad_output) override
+    {
+        const std::size_t seq_len = seq_len_;
+
+        (void)engine.zero(grad_token_emb_);
+
+        // ── 1. LM Head 反向 → (d_model, seq*batch) ──
+        auto b_lm = lm_head_.backward(engine, grad_output);
+        if (!b_lm) return b_lm;
+        Tensor grad_x = std::move(*b_lm);
+
+        // ── 2. LayerNorm 反向 ──
+        auto b_ln = ln_f_.backward(engine, grad_x);
+        if (!b_ln) return b_ln;
+        grad_x = std::move(*b_ln);
+
+        // ── 3. 逐块反向（全批量化） ──
+        for (auto it = blocks_.rbegin(); it != blocks_.rend(); ++it)
+        {
+            auto br = it->backward(engine, grad_x);
+            if (!br) return br;
+            grad_x = std::move(*br);
+        }
+
+        // ── 4. 转置 grad_x + CPU 辅助 ──
+        //   grad_x: (d_model, seq*batch)
+        //   grad_T = transpose(grad_x) → (total, d_model) — 用于 scatter_add_rows
+        auto grad_T = engine.transpose(grad_x);
+        if (!grad_T) return std::unexpected(grad_T.error());
+
+        // ── 5. scatter_add_rows: grad_token_emb_[tokens] += grad_T ──
+        auto sr = engine.scatter_add_rows(grad_token_emb_, stored_tokens_tensor_, *grad_T);
+        if (!sr) return std::unexpected(sr.error());
+
+        // grad_input: token IDs 无梯度，返回零张量（仅用于接口一致性）
+        Matrix grad_input(seq_len, batch_size_, Scalar{0});
+        return engine.from_matrix(grad_input);
+    }
+
+    // ── 采样生成（支持温度采样 + 贪心） ────────────────────────────
+    [[nodiscard]] Result<std::vector<std::size_t>>
+    generate(ComputeEngine& engine,
+              const std::vector<std::size_t>& prompt,
+              std::size_t max_new_tokens,
+              Scalar temperature = 1.0,
+              std::size_t eos_token_id = static_cast<std::size_t>(-1),
+              std::size_t min_new_tokens = 0)
+    {
+        std::vector<std::size_t> context(prompt);
+        std::vector<std::size_t> generated;
+        std::mt19937_64 rng{std::random_device{}()};
+        std::uniform_real_distribution<Scalar> dist(0.0, 1.0);
+
+        for (std::size_t step = 0; step < max_new_tokens; ++step)
+        {
+            std::size_t start = 0;
+            if (context.size() > seq_len_)
+                start = context.size() - seq_len_;
+
+            const std::size_t cur_len = context.size() - start;
+            Matrix input(seq_len_, 1);
+            input.zero();
+            for (std::size_t t = 0; t < cur_len; ++t)
+                input.set_value_unchecked(t, 0,
+                    static_cast<Scalar>(context[start + t]));
+
+            auto in_t = engine.from_matrix(input);
+            if (!in_t) return std::unexpected(in_t.error());
+            auto logits_res = forward(engine, *in_t);
+            if (!logits_res) return std::unexpected(logits_res.error());
+
+            auto logits_m = engine.to_matrix(*logits_res);
+            if (!logits_m) return std::unexpected(logits_m.error());
+
+            // 取最后一个位置的 logits
+            std::vector<Scalar> last_logits(vocab_size_);
+            for (std::size_t v = 0; v < vocab_size_; ++v)
+                last_logits[v] = logits_m->at_unchecked(v, cur_len - 1);
+
+            // temperature
+            if (temperature > 0.0 && temperature != 1.0)
+                for (auto& v : last_logits) v /= temperature;
+
+            // softmax（数值稳定）
+            Scalar max_val = last_logits[0];
+            for (std::size_t v = 1; v < vocab_size_; ++v)
+                max_val = std::max(max_val, last_logits[v]);
+            Scalar sum_exp = 0.0;
+            for (auto& v : last_logits)
+            {
+                v = std::exp(v - max_val);
+                sum_exp += v;
+            }
+            for (auto& v : last_logits) v /= sum_exp;
+
+            // 采样
+            // temperature > 0: 随机采样（temperature 仅影响缩放，1.0 = 不缩放但仍然采样）
+            // temperature == 0: 贪心解码（argmax）
+            std::size_t next_token;
+            if (temperature > 0.0)
+            {
+                Scalar r = dist(rng);
+                Scalar cumulative = 0.0;
+                next_token = vocab_size_ - 1;
+                for (std::size_t v = 0; v < vocab_size_; ++v)
+                {
+                    cumulative += last_logits[v];
+                    if (r <= cumulative) { next_token = v; break; }
+                }
+            }
+            else
+            {
+                next_token = 0;
+                Scalar best = last_logits[0];
+                for (std::size_t v = 1; v < vocab_size_; ++v)
+                    if (last_logits[v] > best) { best = last_logits[v]; next_token = v; }
+            }
+
+            context.push_back(next_token);
+
             if (step >= min_new_tokens && next_token == eos_token_id)
                 break;
 

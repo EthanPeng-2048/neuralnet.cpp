@@ -97,7 +97,10 @@ if(Vulkan_FOUND)
         rearrange_3d
         elementwise_v2
         reduce
-        broadcast)
+        broadcast
+        transpose
+        gather
+        scatter_add)
     set(GPU_SHADER_HPPS "")
 
     foreach(SHADER_NAME ${GPU_SHADERS})

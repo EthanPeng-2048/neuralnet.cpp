@@ -80,6 +80,21 @@
 #define NN_BROADCAST_SPV_EMBEDDED
 #endif
 
+#if __has_include("transpose_spv.hpp")
+#include "transpose_spv.hpp"
+#define NN_TRANSPOSE_SPV_EMBEDDED
+#endif
+
+#if __has_include("gather_spv.hpp")
+#include "gather_spv.hpp"
+#define NN_GATHER_SPV_EMBEDDED
+#endif
+
+#if __has_include("scatter_add_spv.hpp")
+#include "scatter_add_spv.hpp"
+#define NN_SCATTER_ADD_SPV_EMBEDDED
+#endif
+
 namespace nn
 {
 
@@ -601,6 +616,12 @@ public:
     [[nodiscard]] std::size_t cols() const noexcept { return cols_; }
     [[nodiscard]] bool valid() const noexcept { return buffer_ && buffer_->valid(); }
     [[nodiscard]] const GpuBuffer& buffer() const noexcept { return *buffer_; }
+
+    // 零拷贝 reshape：共享底层 buffer，只改变形状元数据
+    [[nodiscard]] GpuTensor with_shape(std::size_t new_rows, std::size_t new_cols) const
+    {
+        return GpuTensor(buffer_, new_rows, new_cols);
+    }
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -618,6 +639,9 @@ private:
     VulkanPipeline reduce_pipeline_;
     VulkanPipeline broadcast_pipeline_;
     VulkanPipeline rearrange_3d_pipeline_;
+    VulkanPipeline transpose_pipeline_;
+    VulkanPipeline gather_pipeline_;
+    VulkanPipeline scatter_add_pipeline_;
 
     std::unique_ptr<MemoryPool> memory_pool_;
     std::unique_ptr<StagingRing> staging_ring_;
@@ -706,6 +730,36 @@ private:
     {
 #ifdef NN_BROADCAST_SPV_EMBEDDED
         return nn_broadcast_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_transpose_spirv()
+    {
+#ifdef NN_TRANSPOSE_SPV_EMBEDDED
+        return nn_transpose_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_gather_spirv()
+    {
+#ifdef NN_GATHER_SPV_EMBEDDED
+        return nn_gather_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_scatter_add_spirv()
+    {
+#ifdef NN_SCATTER_ADD_SPV_EMBEDDED
+        return nn_scatter_add_spirv_bytecode();
 #else
         static const std::vector<uint32_t> empty;
         return empty;
@@ -896,6 +950,36 @@ public:
                 broadcast_pipeline_ = std::move(*bp_r);
         }
 
+        // 13. 创建 transpose pipeline（2 bindings, 8B push constants）
+        const auto& transpose_spirv = get_transpose_spirv();
+        if (!transpose_spirv.empty())
+        {
+            auto tp_r = VulkanPipeline::create_generic(
+                device_.device(), transpose_spirv, 2, 2 * sizeof(uint32_t));
+            if (tp_r)
+                transpose_pipeline_ = std::move(*tp_r);
+        }
+
+        // 14. 创建 gather pipeline（3 bindings, 12B push constants）
+        const auto& gather_spirv = get_gather_spirv();
+        if (!gather_spirv.empty())
+        {
+            auto gp_r = VulkanPipeline::create_generic(
+                device_.device(), gather_spirv, 3, 3 * sizeof(uint32_t));
+            if (gp_r)
+                gather_pipeline_ = std::move(*gp_r);
+        }
+
+        // 15. 创建 scatter_add pipeline（3 bindings, 12B push constants）
+        const auto& scatter_add_spirv = get_scatter_add_spirv();
+        if (!scatter_add_spirv.empty())
+        {
+            auto sp_r = VulkanPipeline::create_generic(
+                device_.device(), scatter_add_spirv, 3, 3 * sizeof(uint32_t));
+            if (sp_r)
+                scatter_add_pipeline_ = std::move(*sp_r);
+        }
+
         initialized_ = true;
         return {};
     }
@@ -908,6 +992,9 @@ public:
     [[nodiscard]] bool has_elementwise_v2_pipeline() const noexcept { return elementwise_v2_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_reduce_pipeline() const noexcept { return reduce_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_broadcast_pipeline() const noexcept { return broadcast_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_transpose_pipeline() const noexcept { return transpose_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_gather_pipeline() const noexcept { return gather_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_scatter_add_pipeline() const noexcept { return scatter_add_pipeline_.handle() != VK_NULL_HANDLE; }
 
     [[nodiscard]] VulkanDevice& device() noexcept { return device_; }
     [[nodiscard]] MemoryPool& memory_pool() noexcept { return *memory_pool_; }
@@ -2369,6 +2456,284 @@ public:
         if (!r)
             return r;
 
+        return {};
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // transpose_gpu — 矩阵转置 (R, C) → (C, R)
+    //
+    // Push Constants (8 bytes): rows, cols
+    // Bindings: In(0), Out(1)
+    // ══════════════════════════════════════════════════════════════════
+    [[nodiscard]] Result<GpuTensor> transpose_gpu(const GpuTensor& A)
+    {
+        if (!initialized_)
+            return std::unexpected(Error{"GPU backend not initialized"});
+        if (!has_transpose_pipeline())
+            return std::unexpected(Error{"transpose pipeline not available"});
+
+        const uint32_t R = static_cast<uint32_t>(A.rows());
+        const uint32_t C = static_cast<uint32_t>(A.cols());
+
+        // 输出 (C, R)
+        auto out_res = GpuTensor::create_empty(C, R, *this);
+        if (!out_res) return std::unexpected(out_res.error());
+        GpuTensor output = std::move(*out_res);
+
+        // 分配描述符集
+        auto ds_r = alloc_desc_set(transpose_pipeline_.descriptor_layout());
+        if (!ds_r) return std::unexpected(ds_r.error());
+        VkDescriptorSet desc_set = *ds_r;
+
+        // 写入描述符集
+        VkDescriptorBufferInfo buf_infos[2]{
+            {A.buffer().impl(), 0, VK_WHOLE_SIZE},
+            {output.buffer().impl(), 0, VK_WHOLE_SIZE},
+        };
+        VkWriteDescriptorSet writes[2]{};
+        for (int i = 0; i < 2; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = desc_set;
+            writes[i].dstBinding = static_cast<uint32_t>(i);
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &buf_infos[i];
+        }
+        vkUpdateDescriptorSets(device_.device(), 2, writes, 0, nullptr);
+
+        // 获取 command buffer
+        auto cmd_r = acquire_cmd();
+        if (!cmd_r)
+        {
+            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            return std::unexpected(cmd_r.error());
+        }
+        auto [cmd, owns_cmd] = *cmd_r;
+
+        // 录制
+        record_input_barriers(cmd, {A.buffer().impl()});
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            transpose_pipeline_.handle());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            transpose_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+
+        const uint32_t push_data[2] = {R, C};
+        vkCmdPushConstants(cmd, transpose_pipeline_.pipeline_layout(),
+            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
+
+        const uint32_t total = R * C;
+        const uint32_t wg_count = (total + 255) / 256;
+        vkCmdDispatch(cmd, wg_count, 1, 1);
+        record_output_barrier(cmd, output.buffer().impl());
+
+        if (owns_cmd)
+        {
+            auto r = submit_and_wait(cmd, desc_set);
+            if (!r) return std::unexpected(r.error());
+        }
+        return output;
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // gather_gpu — 按行索引查表 (GPU-native)
+    //
+    // table: (vocab, D), indices: (num,) → output: (num, D)
+    // output[i] = table[indices[i]]，越界索引返回零行
+    //
+    // Push Constants (12 bytes): vocab, D, num
+    // Bindings: Table(0), Indices(1), Output(2)
+    // ══════════════════════════════════════════════════════════════════
+    [[nodiscard]] Result<GpuTensor> gather_gpu(
+        const GpuTensor& table, const GpuTensor& indices)
+    {
+        if (!initialized_)
+            return std::unexpected(Error{"GPU backend not initialized"});
+        if (!has_gather_pipeline())
+            return std::unexpected(Error{"gather pipeline not available"});
+
+        const uint32_t vocab = static_cast<uint32_t>(table.rows());
+        const uint32_t D = static_cast<uint32_t>(table.cols());
+        const uint32_t num = static_cast<uint32_t>(indices.rows() * indices.cols());
+
+        // 输出 (num, D)
+        auto out_res = GpuTensor::create_empty(num, D, *this);
+        if (!out_res) return std::unexpected(out_res.error());
+        GpuTensor output = std::move(*out_res);
+
+        // 分配描述符集
+        auto ds_r = alloc_desc_set(gather_pipeline_.descriptor_layout());
+        if (!ds_r) return std::unexpected(ds_r.error());
+        VkDescriptorSet desc_set = *ds_r;
+
+        // 写入描述符集
+        VkDescriptorBufferInfo buf_infos[3]{
+            {table.buffer().impl(), 0, VK_WHOLE_SIZE},
+            {indices.buffer().impl(), 0, VK_WHOLE_SIZE},
+            {output.buffer().impl(), 0, VK_WHOLE_SIZE},
+        };
+        VkWriteDescriptorSet writes[3]{};
+        for (int i = 0; i < 3; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = desc_set;
+            writes[i].dstBinding = static_cast<uint32_t>(i);
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &buf_infos[i];
+        }
+        vkUpdateDescriptorSets(device_.device(), 3, writes, 0, nullptr);
+
+        // 获取 command buffer
+        auto cmd_r = acquire_cmd();
+        if (!cmd_r)
+        {
+            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            return std::unexpected(cmd_r.error());
+        }
+        auto [cmd, owns_cmd] = *cmd_r;
+
+        // 录制
+        record_input_barriers(cmd, {table.buffer().impl(), indices.buffer().impl()});
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            gather_pipeline_.handle());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            gather_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+
+        const uint32_t push_data[3] = {vocab, D, num};
+        vkCmdPushConstants(cmd, gather_pipeline_.pipeline_layout(),
+            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
+
+        const uint32_t total = num * D;
+        const uint32_t wg_count = (total + 255) / 256;
+        vkCmdDispatch(cmd, wg_count, 1, 1);
+        record_output_barrier(cmd, output.buffer().impl());
+
+        if (owns_cmd)
+        {
+            auto r = submit_and_wait(cmd, desc_set);
+            if (!r) return std::unexpected(r.error());
+        }
+        return output;
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // scatter_add_gpu — 按行索引原子累加梯度 (GPU-native)
+    //
+    // dst: (vocab, D) 原地修改，indices: (num,), grad: (num, D)
+    // dst[indices[i]][d] += grad[i][d]
+    // 使用 CAS 循环实现 float atomicAdd
+    //
+    // Push Constants (12 bytes): vocab, D, num
+    // Bindings: Dst(0), Indices(1), Grad(2)
+    //
+    // 注意：dst buffer 内容以 uint 视角访问用于 atomicCompSwap。
+    // dst 初始值必须为合法 float 位模式（如 0x00000000 = 0.0f）。
+    // ══════════════════════════════════════════════════════════════════
+    [[nodiscard]] Result<void> scatter_add_gpu(
+        GpuTensor& dst, const GpuTensor& indices, const GpuTensor& grad)
+    {
+        if (!initialized_)
+            return std::unexpected(Error{"GPU backend not initialized"});
+        if (!has_scatter_add_pipeline())
+            return std::unexpected(Error{"scatter_add pipeline not available"});
+
+        const uint32_t vocab = static_cast<uint32_t>(dst.rows());
+        const uint32_t D = static_cast<uint32_t>(dst.cols());
+        const uint32_t num = static_cast<uint32_t>(indices.rows() * indices.cols());
+
+        // 分配描述符集
+        auto ds_r = alloc_desc_set(scatter_add_pipeline_.descriptor_layout());
+        if (!ds_r) return std::unexpected(ds_r.error());
+        VkDescriptorSet desc_set = *ds_r;
+
+        // 写入描述符集（dst 使用 uint 视图用于原子操作）
+        VkDescriptorBufferInfo buf_infos[3]{
+            {dst.buffer().impl(), 0, VK_WHOLE_SIZE},
+            {indices.buffer().impl(), 0, VK_WHOLE_SIZE},
+            {grad.buffer().impl(), 0, VK_WHOLE_SIZE},
+        };
+        VkWriteDescriptorSet writes[3]{};
+        for (int i = 0; i < 3; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = desc_set;
+            writes[i].dstBinding = static_cast<uint32_t>(i);
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &buf_infos[i];
+        }
+        vkUpdateDescriptorSets(device_.device(), 3, writes, 0, nullptr);
+
+        // 获取 command buffer
+        auto cmd_r = acquire_cmd();
+        if (!cmd_r)
+        {
+            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            return std::unexpected(cmd_r.error());
+        }
+        auto [cmd, owns_cmd] = *cmd_r;
+
+        // 录制（dst 需要读+写屏障）
+        {
+            std::vector<VkBufferMemoryBarrier> barriers;
+            VkBufferMemoryBarrier b{};
+            b.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            b.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.offset = 0;
+            b.size = VK_WHOLE_SIZE;
+            b.buffer = dst.buffer().impl();
+            barriers.push_back(b);
+            b.buffer = indices.buffer().impl();
+            barriers.push_back(b);
+            b.buffer = grad.buffer().impl();
+            barriers.push_back(b);
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 0, nullptr,
+                static_cast<uint32_t>(barriers.size()), barriers.data(),
+                0, nullptr);
+        }
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            scatter_add_pipeline_.handle());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            scatter_add_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+
+        const uint32_t push_data[3] = {vocab, D, num};
+        vkCmdPushConstants(cmd, scatter_add_pipeline_.pipeline_layout(),
+            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
+
+        const uint32_t total = num * D;
+        const uint32_t wg_count = (total + 255) / 256;
+        vkCmdDispatch(cmd, wg_count, 1, 1);
+
+        // 输出屏障（dst 被修改，需要 memory barrier）
+        {
+            VkBufferMemoryBarrier b{};
+            b.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.buffer = dst.buffer().impl();
+            b.offset = 0;
+            b.size = VK_WHOLE_SIZE;
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, nullptr, 1, &b, 0, nullptr);
+        }
+
+        if (owns_cmd)
+        {
+            auto r = submit_and_wait(cmd, desc_set);
+            if (!r) return std::unexpected(r.error());
+        }
         return {};
     }
 };

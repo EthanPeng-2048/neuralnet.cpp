@@ -1,0 +1,51 @@
+// ── gather.comp ───────────────────────────────────────────────────────────
+// 纯原语：按行索引从表中查表（gather_rows）
+//
+// 语义：
+//   table: (vocab, D) — 行主序存储
+//   indices: (num,)   — 行索引（float 编码的整数）
+//   output: (num, D)  — output[i] = table[indices[i]]
+//
+// 越界索引返回零行（防御性，与 CPU fallback 行为一致）。
+//
+// 绑定布局：
+//   binding 0: table (readonly)
+//   binding 1: indices (readonly)
+//   binding 2: output (writeonly)
+//
+// Push Constants（12 bytes）：
+//   uint vocab — table 行数
+//   uint D     — 列宽（每行元素数）
+//   uint num   — indices 元素个数
+// ─────────────────────────────────────────────────────────────────────────
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer  BufTable   { float table[];   };
+layout(std430, binding = 1) readonly buffer  BufIndices { float indices[]; };
+layout(std430, binding = 2) writeonly buffer BufOut     { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint vocab;
+    uint D;
+    uint num;
+};
+
+void main()
+{
+    const uint flat_idx = gl_GlobalInvocationID.x;
+    const uint total = num * D;
+    if (flat_idx >= total) return;
+
+    const uint i = flat_idx / D;  // 第 i 个索引
+    const uint d = flat_idx % D;  // 第 d 列
+
+    const uint row_idx = uint(indices[i]);
+
+    if (row_idx < vocab)
+        out_data[flat_idx] = table[row_idx * D + d];
+    else
+        out_data[flat_idx] = 0.0;  // 越界返回零
+}

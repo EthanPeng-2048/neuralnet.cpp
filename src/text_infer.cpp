@@ -112,7 +112,15 @@ nn::Result<std::vector<std::size_t>> generate_text(
     auto &layer_ref = model.layer_at(0);
     auto *gpt_ptr = dynamic_cast<nn::GPTModel *>(&layer_ref);
     if (!gpt_ptr)
-        return std::unexpected(nn::Error{"Model does not contain a GPTModel layer"});
+    {
+        // 回退：尝试 ALiBiGPTModel（旧格式模型）
+        auto *alibi_ptr = dynamic_cast<nn::ALiBiGPTModel *>(&layer_ref);
+        if (!alibi_ptr)
+            return std::unexpected(nn::Error{"Model does not contain a GPTModel or ALiBiGPTModel layer"});
+        const std::size_t min_new = max_new_tokens / 2;
+        return alibi_ptr->generate(engine, prompt_tokens, max_new_tokens, temperature,
+                                   eos_token_id, min_new);
+    }
     // 传入 EOS_ID，生成遇到 EOS 自动停止
     // min_new_tokens = max_new_tokens/2，至少生成一半 token 才允许 EOS 停止，
     // 避免模型因训练偏置一上来就输出 EOS 导致无输出。
@@ -228,9 +236,20 @@ int main(int argc, char *argv[])
               << " heads=" << spec.num_heads
               << " layers=" << spec.num_layers
               << " d_ff=" << spec.d_ff
-              << " seq_len=" << spec.seq_len << "\n";
+              << " seq_len=" << spec.seq_len;
+    if (spec.is_alibi_gpt() || spec.pos_encoding == nn::PosEncodingType::ALiBi)
+        std::cout << " [ALiBi]";
+    else if (spec.pos_encoding == nn::PosEncodingType::Sinusoidal)
+        std::cout << " [Sinusoidal]";
+    else
+        std::cout << " [Learned]";
+    std::cout << "\n";
 
-    auto model_result = nn::build_gpt_model_from_spec(*engine, spec);
+    nn::Result<nn::Model> model_result;
+    if (spec.is_alibi_gpt())
+        model_result = nn::build_alibi_gpt_model_from_spec(*engine, spec);
+    else
+        model_result = nn::build_gpt_model_from_spec(*engine, spec);
     if (!model_result)
     {
         std::cerr << "构建模型失败: " << model_result.error().message << std::endl;

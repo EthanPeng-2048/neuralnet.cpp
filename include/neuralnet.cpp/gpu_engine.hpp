@@ -167,82 +167,36 @@ public:
     }
 
     // ── gather_rows: 按 indices 从 table 中按行查表 ──
-    // 当前实现为 GPU→CPU 下载 + CPU 查表 + CPU→GPU 上传（fallback）。
-    // 后续可优化为专门 gather shader 直接在 GPU 端执行。
+    // GPU-native 实现：全程在 GPU 执行，无 PCIe 传输。
     // indices 支持任意形状，按 flat 遍历所有元素。
     [[nodiscard]] Result<Tensor> gather_rows(
         const Tensor& table, const Tensor& indices) override
     {
-        // 下载到 CPU
-        auto tbl_m = to_matrix(table);
-        if (!tbl_m) return std::unexpected(tbl_m.error());
-        auto idx_m = to_matrix(indices);
-        if (!idx_m) return std::unexpected(idx_m.error());
+        auto tbl_gpu = ensure_gpu(table);
+        if (!tbl_gpu) return std::unexpected(tbl_gpu.error());
+        auto idx_gpu = ensure_gpu(indices);
+        if (!idx_gpu) return std::unexpected(idx_gpu.error());
 
-        const std::size_t vocab = tbl_m->rows();
-        const std::size_t D = tbl_m->cols();
-        const std::size_t num = idx_m->size();  // 遍历 indices 所有元素（支持任意形状）
-
-        Matrix result(num, D);
-        const auto tbl_span = tbl_m->span();
-        const auto idx_span = idx_m->span();
-        auto dst_span = result.span();
-
-        for (std::size_t i = 0; i < num; ++i)
-        {
-            const auto row_idx = static_cast<std::size_t>(idx_span[i]);
-            if (row_idx < vocab)
-                std::copy_n(tbl_span.begin() + row_idx * D, D,
-                            dst_span.begin() + i * D);
-            else
-                std::fill_n(dst_span.begin() + i * D, D, Scalar{0});
-        }
-
-        // 上传回 GPU
-        auto r = from_matrix(result);
+        auto r = backend_.gather_gpu(tbl_gpu->gpu_tensor(), idx_gpu->gpu_tensor());
         if (!r) return std::unexpected(r.error());
-        return *r;
+        return Tensor::from_gpu(std::move(*r));
     }
 
     // ── scatter_add_rows: 按 indices 把 grad 的行原子累加到 dst ──
-    // 当前实现为 GPU→CPU 下载 + CPU 累加 + CPU→GPU 上传（fallback）。
-    // 后续可优化为专门 scatter_add shader（使用 atomicAdd）。
+    // GPU-native 实现：使用 CAS 循环实现 float atomicAdd，无 PCIe 传输。
     [[nodiscard]] Result<void> scatter_add_rows(
         Tensor& dst, const Tensor& indices, const Tensor& grad) override
     {
-        // 下载到 CPU
-        auto dst_m = to_matrix(dst);
-        if (!dst_m) return std::unexpected(dst_m.error());
-        auto idx_m = to_matrix(indices);
-        if (!idx_m) return std::unexpected(idx_m.error());
-        auto grad_m = to_matrix(grad);
-        if (!grad_m) return std::unexpected(grad_m.error());
+        if (!dst.is_gpu())
+            return std::unexpected(Error{"scatter_add_rows: dst must be GPU tensor"});
 
-        const std::size_t vocab = dst_m->rows();
-        const std::size_t D = dst_m->cols();
-        const std::size_t num = idx_m->size();  // 遍历 indices 所有元素（支持任意形状）
+        auto idx_gpu = ensure_gpu(indices);
+        if (!idx_gpu) return std::unexpected(idx_gpu.error());
+        auto grad_gpu = ensure_gpu(grad);
+        if (!grad_gpu) return std::unexpected(grad_gpu.error());
 
-        auto dst_span = dst_m->span();  // 注意：这是 to_matrix 的拷贝
-        const auto idx_span = idx_m->span();
-        const auto grad_span = grad_m->span();
-
-        for (std::size_t i = 0; i < num; ++i)
-        {
-            const auto row_idx = static_cast<std::size_t>(idx_span[i]);
-            if (row_idx < vocab)
-            {
-                Scalar* dst_row = dst_span.data() + row_idx * D;
-                const Scalar* grad_row = grad_span.data() + i * D;
-                for (std::size_t c = 0; c < D; ++c)
-                    dst_row[c] += grad_row[c];
-            }
-        }
-
-        // 上传回 GPU（替换 dst）
-        auto r = from_matrix(*dst_m);
-        if (!r) return std::unexpected(r.error());
-        dst = std::move(*r);
-        return {};
+        return backend_.scatter_add_gpu(
+            dst.gpu_tensor(), idx_gpu->gpu_tensor(), grad_gpu->gpu_tensor());
     }
 
 private:
@@ -286,10 +240,14 @@ public:
         return Tensor::from_gpu(std::move(*r));
     }
 
-    // ── 矩阵转置：GPU 端尚未实现 ──
-    [[nodiscard]] Result<Tensor> transpose(const Tensor& /*A*/) override
+    // ── 矩阵转置：A (R, C) → out (C, R) ──
+    [[nodiscard]] Result<Tensor> transpose(const Tensor& A) override
     {
-        return std::unexpected(Error{"GpuEngine::transpose not yet implemented"});
+        auto a_gpu = ensure_gpu(A);
+        if (!a_gpu) return std::unexpected(a_gpu.error());
+        auto r = backend_.transpose_gpu(a_gpu->gpu_tensor());
+        if (!r) return std::unexpected(r.error());
+        return Tensor::from_gpu(std::move(*r));
     }
 
     // ══════════════════════════════════════════════════════════════════════

@@ -186,6 +186,9 @@ namespace detail
             return std::unexpected(r.error());
         if (auto r = write_u64(ofs, static_cast<uint64_t>(spec.num_layers)); !r)
             return std::unexpected(r.error());
+        // V4+: pos_encoding (向后兼容：旧文件无此字段，默认 Learned)
+        if (auto r = write_u32(ofs, static_cast<uint32_t>(spec.pos_encoding)); !r)
+            return std::unexpected(r.error());
         break;
 
     default:
@@ -248,6 +251,11 @@ namespace detail
         spec.d_ff       = static_cast<std::size_t>(*v);
         v = read_u64(ifs); if (!v) return std::unexpected(v.error());
         spec.num_layers = static_cast<std::size_t>(*v);
+        // V4+: pos_encoding（向后兼容：旧文件读到 EOF 时保持默认 Learned）
+        auto pe = read_u32(ifs);
+        if (pe)
+            spec.pos_encoding = static_cast<PosEncodingType>(*pe);
+        // else: 旧文件无此字段，spec.pos_encoding 已默认 Learned
         break;
     }
 

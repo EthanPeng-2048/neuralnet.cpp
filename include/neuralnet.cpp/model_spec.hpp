@@ -20,6 +20,14 @@
 namespace nn
 {
 
+// ── 位置编码类型 ─────────────────────────────────────────────────────────
+enum class PosEncodingType : uint32_t
+{
+    Learned    = 0,  // 可学习位置嵌入（GPT 默认）
+    Sinusoidal = 1,  // 正弦波固定位置编码
+    ALiBi      = 2,  // 线性偏置注意力（无位置嵌入）
+};
+
 // ── 模型类型枚举 ─────────────────────────────────────────────────────────
 enum class ModelType : uint32_t
 {
@@ -27,6 +35,7 @@ enum class ModelType : uint32_t
     MLP         = 1,
     Transformer = 2,
     GPT         = 3,
+    ALiBi_GPT   = 4,  // 使用 ALiBi 的 GPT 模型（向后兼容）
 };
 
 // ── 模型架构描述 ─────────────────────────────────────────────────────────
@@ -48,10 +57,12 @@ struct ModelSpec
     // ── GPT ──
     std::size_t vocab_size = 0;
     std::size_t seq_len    = 0;
+    PosEncodingType pos_encoding = PosEncodingType::Learned;  // 位置编码类型
 
     [[nodiscard]] bool is_mlp()         const noexcept { return type == ModelType::MLP; }
     [[nodiscard]] bool is_transformer() const noexcept { return type == ModelType::Transformer; }
     [[nodiscard]] bool is_gpt()         const noexcept { return type == ModelType::GPT; }
+    [[nodiscard]] bool is_alibi_gpt()   const noexcept { return type == ModelType::ALiBi_GPT || (type == ModelType::GPT && pos_encoding == PosEncodingType::ALiBi); }
 };
 
 } // namespace nn
