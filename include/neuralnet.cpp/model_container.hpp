@@ -147,9 +147,19 @@ public:
 
     Model& add_gpt_model(
         std::size_t vocab_size, std::size_t d_model, std::size_t seq_len,
-        std::size_t num_heads, std::size_t d_ff, std::size_t num_layers)
+        std::size_t num_heads, std::size_t d_ff, std::size_t num_layers,
+        PosEncodingType pos_enc_type = PosEncodingType::Learned)
     {
         layers_.emplace_back(std::make_unique<GPTModel>(
+            *engine_, vocab_size, d_model, seq_len, num_heads, d_ff, num_layers, pos_enc_type));
+        return *this;
+    }
+
+    Model& add_alibi_gpt_model(
+        std::size_t vocab_size, std::size_t d_model, std::size_t seq_len,
+        std::size_t num_heads, std::size_t d_ff, std::size_t num_layers)
+    {
+        layers_.emplace_back(std::make_unique<ALiBiGPTModel>(
             *engine_, vocab_size, d_model, seq_len, num_heads, d_ff, num_layers));
         return *this;
     }

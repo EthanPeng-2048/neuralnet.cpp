@@ -388,42 +388,38 @@ public:
     if (!r) return std::unexpected(r.error());
 
     // Newton-Schulz 迭代：X_new = a*X + (b*A + c*A²) @ X，其中 A = X @ X^T
+    //
+    // 性能优化：通过就地复用 matmul 输出缓冲区，消除每步 3 个 clone_tensor 调用：
+    //   - A 缓冲区就地修改为 B = b*A + c*A²（A 在计算 B 后不再需要）
+    //   - BX 缓冲区就地添加 a*X 得到 X_new（BX 在 aX 加法后不再需要）
+    //   - 原实现每步 6 个临时 buffer → 优化后 0 个额外 clone
     for (std::size_t t = 0; t < steps; ++t)
     {
-        // A = X @ X^T
+        // A = X @ X^T（matmul 返回新 tensor，无分配开销）
         auto A = engine.matmul(*X, *X, false, true);
         if (!A) return std::unexpected(A.error());
 
-        // A_sq = A @ A
+        // A_sq = A @ A（matmul 返回新 tensor）
         auto A_sq = engine.matmul(*A, *A);
         if (!A_sq) return std::unexpected(A_sq.error());
 
-        // B = b*A + c*A_sq
-        auto B = clone_tensor(engine, *A);
-        if (!B) return std::unexpected(B.error());
-        r = engine.scale_inplace(*B, b);
+        // B = b*A + c*A²
+        // 就地复用：A_sq 不再需要后修改为 c*A²，A 不再需要后修改为 b*A
+        r = engine.scale_inplace(*A_sq, c);
         if (!r) return std::unexpected(r.error());
-        auto c_A_sq = clone_tensor(engine, *A_sq);
-        if (!c_A_sq) return std::unexpected(c_A_sq.error());
-        r = engine.scale_inplace(*c_A_sq, c);
+        r = engine.scale_inplace(*A, b);
         if (!r) return std::unexpected(r.error());
-        r = engine.add_inplace(*B, *c_A_sq);
+        r = engine.add_inplace(*A, *A_sq);  // A 现在是 B = b*A + c*A²
         if (!r) return std::unexpected(r.error());
 
         // X_new = a*X + B @ X
-        auto aX = clone_tensor(engine, *X);
-        if (!aX) return std::unexpected(aX.error());
-        r = engine.scale_inplace(*aX, a);
-        if (!r) return std::unexpected(r.error());
-
-        auto BX = engine.matmul(*B, *X);
+        // 就地复用：BX 是 matmul 新输出，axpy_inplace 就地添加 a*X
+        auto BX = engine.matmul(*A, *X);
         if (!BX) return std::unexpected(BX.error());
-
-        r = engine.add_inplace(*aX, *BX);
+        r = engine.axpy_inplace(*BX, a, *X);  // BX += a*X → (B + aI)*X
         if (!r) return std::unexpected(r.error());
 
-        // X = X_new
-        X = std::move(*aX);
+        X = std::move(*BX);
     }
 
     return *X;
@@ -499,15 +495,12 @@ public:
             if (nesterov_)
             {
                 // Nesterov: update = g + μ*v
-                auto nesterov_result = clone_tensor(*engine_, g);
-                if (!nesterov_result) return std::unexpected(nesterov_result.error());
-                nesterov_buf = std::move(*nesterov_result);
-                auto mu_v = clone_tensor(*engine_, velocities_[i]);
-                if (!mu_v) return std::unexpected(mu_v.error());
-                r = engine_->scale_inplace(*mu_v, momentum_);
+                // 优化：clone g 一次，用 axpy_inplace 就地添加 μ*v（原实现需要 2 次 clone + scale + add）
+                auto buf = clone_tensor(*engine_, g);
+                if (!buf) return std::unexpected(buf.error());
+                r = engine_->axpy_inplace(*buf, momentum_, velocities_[i]);
                 if (!r) return std::unexpected(r.error());
-                r = engine_->add_inplace(*nesterov_buf, *mu_v);
-                if (!r) return std::unexpected(r.error());
+                nesterov_buf = std::move(*buf);
                 update_ptr = &*nesterov_buf;
             }
             else
@@ -522,20 +515,14 @@ public:
                     *engine_, *update_ptr, ns_steps_, ns_eps_);
                 if (!ortho_update) return std::unexpected(ortho_update.error());
 
-                // 3. 参数更新: p -= lr * ortho_update
-                r = engine_->scale_inplace(*ortho_update, -lr_);
-                if (!r) return std::unexpected(r.error());
-                r = engine_->add_inplace(*params_[i], *ortho_update);
+                // 3. 参数更新: p -= lr * ortho_update（用 axpy_inplace 融合 scale+add）
+                r = engine_->axpy_inplace(*params_[i], -lr_, *ortho_update);
                 if (!r) return std::unexpected(r.error());
             }
             else
             {
-                // 非 2D 参数（bias 等）：标准 SGD 更新
-                auto step = clone_tensor(*engine_, *update_ptr);
-                if (!step) return std::unexpected(step.error());
-                r = engine_->scale_inplace(*step, -lr_);
-                if (!r) return std::unexpected(r.error());
-                r = engine_->add_inplace(*params_[i], *step);
+                // 非 2D 参数（bias 等）：标准 SGD 更新（用 axpy_inplace 融合 scale+add）
+                r = engine_->axpy_inplace(*params_[i], -lr_, *update_ptr);
                 if (!r) return std::unexpected(r.error());
             }
         }

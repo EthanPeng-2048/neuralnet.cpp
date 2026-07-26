@@ -805,9 +805,25 @@ class NeuralNetGUI(tk.Tk):
                      textvariable=self.text_train_d_ff_var).grid(row=1, column=1, pady=(6, 0))
         row += 1
 
+        # ── 位置编码 ──
+        pe_frame = ttk.Frame(f)
+        pe_frame.grid(row=row, column=0, columnspan=3, sticky="w")
+        ttk.Label(pe_frame, text="位置编码:").pack(side="left")
+        self.text_train_pos_enc_var = tk.StringVar(value="learned")
+        ttk.Combobox(pe_frame, textvariable=self.text_train_pos_enc_var, width=14, state="readonly",
+                     values=["learned", "sinusoidal", "alibi"]).pack(side="left", padx=4)
+        ttk.Label(pe_frame, text="(learned=可学习, sinusoidal=正弦波, alibi=线性偏置)").pack(side="left")
+        row += 1
+
         # ── GPU 加速 ──
         self.text_train_gpu_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(f, text="启用 GPU 加速 (需要 Vulkan SDK)", variable=self.text_train_gpu_var).grid(
+            row=row, column=0, columnspan=3, sticky="w")
+        row += 1
+
+        # ── 梯度日志 ──
+        self.text_train_grad_log_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text="显示梯度统计 (范数/最大值/均值)", variable=self.text_train_grad_log_var).grid(
             row=row, column=0, columnspan=3, sticky="w")
         row += 1
 
@@ -887,8 +903,11 @@ class NeuralNetGUI(tk.Tk):
                "--log-interval", str(self.text_train_log_interval_var.get())]
         if self.text_train_resume_var.get():
             cmd += ["--resume", self.text_train_resume_path_var.get()]
+        cmd += ["--positional-encoding", self.text_train_pos_enc_var.get()]
         if self.text_train_gpu_var.get():
             cmd.append("--gpu")
+        if self.text_train_grad_log_var.get():
+            cmd.append("--grad-log")
 
         self._log_text_train(f"$ {' '.join(cmd)}\n")
         self.text_train_start_btn.config(state="disabled")

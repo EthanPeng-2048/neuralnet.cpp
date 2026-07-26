@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <iostream>
 #include <random>
+#include <queue>
 #include <ranges>
 #include <regex>
 #include <span>
@@ -1145,13 +1146,14 @@ public:
         const std::size_t target_merges = config.vocab_size - BYTE_BASE - 2;
         log("  目标合并数: " + std::to_string(target_merges));
 
+        // ── 增量 pair 频次统计（避免每轮重扫全部 chunk） ──────
+        std::unordered_map<std::pair<std::size_t, std::size_t>, std::size_t, pair_hash> pair_freq;
+        for (const auto &chunk : byte_chunks)
+            for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
+                ++pair_freq[{chunk[i], chunk[i + 1]}];
+
         for (std::size_t round = 0; round < target_merges; ++round)
         {
-            std::unordered_map<std::pair<std::size_t, std::size_t>, std::size_t, pair_hash> pair_freq;
-            for (const auto &chunk : byte_chunks)
-                for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
-                    ++pair_freq[{chunk[i], chunk[i + 1]}];
-
             if (pair_freq.empty()) break;
 
             auto best = std::ranges::max_element(pair_freq,
@@ -1168,9 +1170,25 @@ public:
             vocab_.push_back(vocab_[id_a] + vocab_[id_b]);
             merges_.push_back({id_a, id_b, new_id});
 
+            // 应用合并到所有 chunk（增量更新 pair_freq）
             for (auto &chunk : byte_chunks)
             {
-                // 原地压缩：避免 vector::erase 的 O(n) 移动
+                // 检测本 chunk 是否包含合并 pair
+                bool has_merge = false;
+                for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
+                    if (chunk[i] == id_a && chunk[i + 1] == id_b) { has_merge = true; break; }
+                if (!has_merge) continue;
+
+                // 减去旧 pair 频次
+                for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
+                {
+                    auto key = std::make_pair(chunk[i], chunk[i + 1]);
+                    auto it = pair_freq.find(key);
+                    if (it != pair_freq.end() && --it->second == 0)
+                        pair_freq.erase(it);
+                }
+
+                // 原地压缩
                 std::size_t write = 0;
                 std::size_t read = 0;
                 while (read < chunk.size())
@@ -1181,11 +1199,13 @@ public:
                         read += 2;
                     }
                     else
-                    {
                         chunk[write++] = chunk[read++];
-                    }
                 }
                 chunk.resize(write);
+
+                // 加上新 pair 频次
+                for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
+                    ++pair_freq[{chunk[i], chunk[i + 1]}];
             }
 
             if ((round + 1) % 500 == 0)
@@ -1210,31 +1230,67 @@ public:
             for (unsigned char b : chunk)
                 ids.push_back(static_cast<std::size_t>(b));
 
-            bool merged = true;
-            while (merged)
+            if (ids.size() <= 1)
             {
-                merged = false;
-                std::size_t best_pos = 0;
-                std::size_t best_prio = merges_.size() + 1;
-
-                for (std::size_t i = 0; i + 1 < ids.size(); ++i)
-                {
-                    std::size_t prio = merge_priority(ids[i], ids[i + 1]);
-                    if (prio < best_prio) { best_prio = prio; best_pos = i; }
-                }
-
-                if (best_prio < merges_.size())
-                {
-                    ids[best_pos] = merges_[best_prio].new_id;
-                    // 原地压缩：将 best_pos+1 之后所有元素前移一位（替代 O(n) 的 vector::erase）
-                    for (std::size_t i = best_pos + 1; i + 1 < ids.size(); ++i)
-                        ids[i] = ids[i + 1];
-                    ids.pop_back();
-                    merged = true;
-                }
+                all_ids.insert(all_ids.end(), ids.begin(), ids.end());
+                continue;
             }
 
-            all_ids.insert(all_ids.end(), ids.begin(), ids.end());
+            // ── 优先队列驱动的 BPE 合并 — O(n log n) ─────────
+            const std::size_t n = ids.size();
+            std::vector<std::size_t> ll_prev(n), ll_next(n);
+            for (std::size_t j = 0; j < n; ++j)
+            {
+                ll_prev[j] = (j == 0) ? n : j - 1;
+                ll_next[j] = (j + 1 == n) ? n : j + 1;
+            }
+            std::vector<bool> alive(n, true);
+
+            using HeapEntry = std::pair<std::size_t, std::size_t>;
+            std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
+
+            auto push_pair = [&](std::size_t pos) {
+                std::size_t nxt = ll_next[pos];
+                if (nxt < n && alive[pos] && alive[nxt])
+                {
+                    std::size_t prio = merge_priority(ids[pos], ids[nxt]);
+                    if (prio < merges_.size())
+                        heap.push({prio, pos});
+                }
+            };
+
+            for (std::size_t j = 0; j + 1 < n; ++j)
+                push_pair(j);
+
+            while (!heap.empty())
+            {
+                auto [prio, pos] = heap.top();
+                heap.pop();
+
+                if (!alive[pos]) continue;
+                std::size_t nxt = ll_next[pos];
+                if (nxt >= n || !alive[nxt]) continue;
+                if (merge_priority(ids[pos], ids[nxt]) != prio) continue;
+
+                ids[pos] = merges_[prio].new_id;
+                alive[nxt] = false;
+
+                std::size_t prev = ll_prev[pos];
+                std::size_t after = ll_next[nxt];
+                ll_next[pos] = after;
+                if (after < n) ll_prev[after] = pos;
+
+                if (prev < n && alive[prev])
+                    push_pair(prev);
+                push_pair(pos);
+            }
+
+            // 按链表顺序收集结果
+            std::size_t cur = 0;
+            do {
+                all_ids.push_back(ids[cur]);
+                cur = ll_next[cur];
+            } while (cur < n);
         }
         return all_ids;
     }
@@ -1562,13 +1618,14 @@ public:
                 : 0;
         log("  目标合并数: " + std::to_string(target_merges));
 
+        // ── 增量 pair 频次统计（避免每轮重扫全部 chunk） ──────
+        std::unordered_map<std::pair<std::size_t, std::size_t>, std::size_t, pair_hash> pair_freq;
+        for (const auto &chunk : char_chunks)
+            for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
+                ++pair_freq[{chunk[i], chunk[i + 1]}];
+
         for (std::size_t round = 0; round < target_merges; ++round)
         {
-            std::unordered_map<std::pair<std::size_t, std::size_t>, std::size_t, pair_hash> pair_freq;
-            for (const auto &chunk : char_chunks)
-                for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
-                    ++pair_freq[{chunk[i], chunk[i + 1]}];
-
             if (pair_freq.empty()) break;
 
             auto best = std::ranges::max_element(pair_freq,
@@ -1586,21 +1643,42 @@ public:
             vocab_.push_back(vocab_[id_a] + vocab_[id_b]);
             merges_.push_back({id_a, id_b, new_id});
 
-            // 应用合并到所有 chunk
+            // 应用合并到所有 chunk（原地压缩 + 增量更新 pair_freq）
             for (auto &chunk : char_chunks)
             {
-                for (std::size_t i = 0; i + 1 < chunk.size(); )
+                // 检测本 chunk 是否包含合并 pair
+                bool has_merge = false;
+                for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
+                    if (chunk[i] == id_a && chunk[i + 1] == id_b) { has_merge = true; break; }
+                if (!has_merge) continue;
+
+                // 减去旧 pair 频次
+                for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
                 {
-                    if (chunk[i] == id_a && chunk[i + 1] == id_b)
+                    auto key = std::make_pair(chunk[i], chunk[i + 1]);
+                    auto it = pair_freq.find(key);
+                    if (it != pair_freq.end() && --it->second == 0)
+                        pair_freq.erase(it);
+                }
+
+                // 原地压缩
+                std::size_t write = 0;
+                std::size_t read = 0;
+                while (read < chunk.size())
+                {
+                    if (read + 1 < chunk.size() && chunk[read] == id_a && chunk[read + 1] == id_b)
                     {
-                        chunk[i] = new_id;
-                        for (std::size_t j = i + 1; j + 1 < chunk.size(); ++j)
-                            chunk[j] = chunk[j + 1];
-                        chunk.pop_back();
+                        chunk[write++] = new_id;
+                        read += 2;
                     }
                     else
-                        ++i;
+                        chunk[write++] = chunk[read++];
                 }
+                chunk.resize(write);
+
+                // 加上新 pair 频次
+                for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
+                    ++pair_freq[{chunk[i], chunk[i + 1]}];
             }
 
             if ((round + 1) % 500 == 0)
@@ -1736,41 +1814,88 @@ public:
 
         for (const auto &chunk : chunks)
         {
+            // Phase 1: 预分词 → token ID（ASCII 快速路径）
             std::vector<std::size_t> ids;
+            ids.reserve(chunk.size());
             std::size_t i = 0;
             while (i < chunk.size())
             {
-                auto [cp, len] = decode_utf8(chunk, i);
-                std::string ch = chunk.substr(i, len);
-                auto it = char_to_id_.find(ch);
-                ids.push_back(it != char_to_id_.end() ? it->second : UNK_ID);
-                i += len;
+                if (static_cast<unsigned char>(chunk[i]) < 0x80)
+                {
+                    ids.push_back(BYTE_BASE + static_cast<unsigned char>(chunk[i]));
+                    i += 1;
+                }
+                else
+                {
+                    auto [cp, len] = decode_utf8(chunk, i);
+                    std::string ch = chunk.substr(i, len);
+                    auto it = char_to_id_.find(ch);
+                    ids.push_back(it != char_to_id_.end() ? it->second : UNK_ID);
+                    i += len;
+                }
             }
 
-            // 按合并优先级合并
-            bool merged = true;
-            while (merged)
+            if (ids.size() <= 1)
             {
-                merged = false;
-                std::size_t best_pos = 0;
-                std::size_t best_prio = merges_.size() + 1;
-
-                for (std::size_t k = 0; k + 1 < ids.size(); ++k)
-                {
-                    std::size_t prio = merge_priority(ids[k], ids[k + 1]);
-                    if (prio < best_prio) { best_prio = prio; best_pos = k; }
-                }
-
-                if (best_prio < merges_.size())
-                {
-                    ids[best_pos] = merges_[best_prio].new_id;
-                    for (std::size_t k = best_pos + 1; k + 1 < ids.size(); ++k)
-                        ids[k] = ids[k + 1];
-                    ids.pop_back();
-                    merged = true;
-                }
+                all_ids.insert(all_ids.end(), ids.begin(), ids.end());
+                continue;
             }
-            all_ids.insert(all_ids.end(), ids.begin(), ids.end());
+
+            // Phase 2: 优先队列驱动的 BPE 合并 — O(n log n)
+            const std::size_t n = ids.size();
+            std::vector<std::size_t> ll_prev(n), ll_next(n);
+            for (std::size_t j = 0; j < n; ++j)
+            {
+                ll_prev[j] = (j == 0) ? n : j - 1;
+                ll_next[j] = (j + 1 == n) ? n : j + 1;
+            }
+            std::vector<bool> alive(n, true);
+
+            using HeapEntry = std::pair<std::size_t, std::size_t>;
+            std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
+
+            auto push_pair = [&](std::size_t pos) {
+                std::size_t nxt = ll_next[pos];
+                if (nxt < n && alive[pos] && alive[nxt])
+                {
+                    std::size_t prio = merge_priority(ids[pos], ids[nxt]);
+                    if (prio < merges_.size())
+                        heap.push({prio, pos});
+                }
+            };
+
+            for (std::size_t j = 0; j + 1 < n; ++j)
+                push_pair(j);
+
+            while (!heap.empty())
+            {
+                auto [prio, pos] = heap.top();
+                heap.pop();
+
+                if (!alive[pos]) continue;
+                std::size_t nxt = ll_next[pos];
+                if (nxt >= n || !alive[nxt]) continue;
+                if (merge_priority(ids[pos], ids[nxt]) != prio) continue;
+
+                ids[pos] = merges_[prio].new_id;
+                alive[nxt] = false;
+
+                std::size_t prev = ll_prev[pos];
+                std::size_t after = ll_next[nxt];
+                ll_next[pos] = after;
+                if (after < n) ll_prev[after] = pos;
+
+                if (prev < n && alive[prev])
+                    push_pair(prev);
+                push_pair(pos);
+            }
+
+            // Phase 3: 按链表顺序收集结果
+            std::size_t cur = 0;
+            do {
+                all_ids.push_back(ids[cur]);
+                cur = ll_next[cur];
+            } while (cur < n);
         }
         return all_ids;
     }

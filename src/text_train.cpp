@@ -56,7 +56,13 @@ void print_usage(const char *prog)
         << "  --num-layers <n>   Transformer 层数 (默认: 4)\n"
         << "  --d-ff <n>         FFN 中间维度 (默认: 512)\n"
         << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
+        << "  --positional-encoding <type>\n"
+        << "                     位置编码类型: learned(默认)/sinusoidal/alibi\n"
+        << "                     learned: 可学习位置嵌入（默认，GPT 原版）\n"
+        << "                     sinusoidal: 正弦波固定位置编码（不参与训练）\n"
+        << "                     alibi: 线性偏置注意力（无位置嵌入，支持长度外推）\n"
         << "  --log-interval <n> 每隔多少 step 显示进度 (默认: 50)\n"
+        << "  --grad-log         显示梯度统计（范数/最大值/均值）\n"
         << "  --help             显示此帮助信息\n";
 }
 
@@ -80,6 +86,8 @@ struct TrainConfig
     std::size_t log_interval = 50;
     bool load_existing = false;
     bool gpu_enabled = false;
+    bool grad_log = false;          // 显示梯度统计
+    nn::PosEncodingType pos_encoding = nn::PosEncodingType::Learned;
 };
 
 TrainConfig parse_args(int argc, char *argv[])
@@ -176,6 +184,24 @@ TrainConfig parse_args(int argc, char *argv[])
         }
         else if (arg == "--gpu")
             cfg.gpu_enabled = true;
+        else if (arg == "--grad-log")
+            cfg.grad_log = true;
+        else if (arg == "--positional-encoding" && i + 1 < argc)
+        {
+            std::string v = argv[++i];
+            if (v == "learned")
+                cfg.pos_encoding = nn::PosEncodingType::Learned;
+            else if (v == "sinusoidal")
+                cfg.pos_encoding = nn::PosEncodingType::Sinusoidal;
+            else if (v == "alibi")
+                cfg.pos_encoding = nn::PosEncodingType::ALiBi;
+            else
+            {
+                std::cerr << "未知位置编码类型: " << v
+                          << "，可选: learned, sinusoidal, alibi\n";
+                std::exit(1);
+            }
+        }
         else if (!arg.starts_with("--"))
             cfg.text_path = arg;
         else
@@ -206,6 +232,69 @@ nn::Matrix one_hot_labels(const std::vector<std::size_t> &tokens, std::size_t vo
             result.set_value_unchecked(tokens[i], i, 1.0);
     }
     return result;
+}
+
+// ==================== 梯度统计 ====================
+// 计算并打印全局梯度统计：L2 范数、绝对值最大值、均值。
+// GPU 模式下自动通过 engine.to_matrix() 下载张量到 CPU。
+void log_gradient_stats(nn::ComputeEngine &engine, const std::vector<nn::Tensor *> &grads)
+{
+    Scalar global_sum_sq = 0.0;
+    Scalar global_abs_max = 0.0;
+    Scalar global_abs_sum = 0.0;
+    std::size_t global_count = 0;
+    std::size_t tensor_idx = 0;
+
+    for (auto *grad : grads)
+    {
+        // GPU 张量需要下载到 CPU
+        nn::Matrix mat;
+        if (grad->device() == nn::Device::GPU)
+        {
+            auto m = engine.to_matrix(*grad);
+            if (!m) continue;
+            mat = std::move(*m);
+        }
+        else
+        {
+            mat = grad->cpu_matrix();
+        }
+
+        const Scalar sum_sq = mat.reduce(Scalar{0}, std::plus<>{},
+            [](Scalar x) { return x * x; });
+        const Scalar abs_max = mat.reduce(Scalar{0},
+            [](Scalar a, Scalar b) { return std::max(a, b); },
+            [](Scalar x) { return std::abs(x); });
+        const Scalar abs_sum = mat.reduce(Scalar{0}, std::plus<>{},
+            [](Scalar x) { return std::abs(x); });
+        const std::size_t n = mat.size();
+
+        global_sum_sq += sum_sq;
+        global_abs_max = std::max(global_abs_max, abs_max);
+        global_abs_sum += abs_sum;
+        global_count += n;
+
+        // 逐张量输出（仅在张量数量 <= 30 时显示详情，避免刷屏）
+        if (grads.size() <= 30)
+        {
+            std::cout << "    [" << tensor_idx << "] "
+                      << "(" << mat.rows() << "x" << mat.cols() << ") "
+                      << "norm=" << std::scientific << std::setprecision(4)
+                      << std::sqrt(sum_sq) << "  max|g|=" << abs_max
+                      << "  mean|g|=" << (n > 0 ? abs_sum / n : Scalar{0})
+                      << std::endl;
+        }
+        ++tensor_idx;
+    }
+
+    const Scalar global_norm = std::sqrt(global_sum_sq);
+    const Scalar global_mean = global_count > 0 ? global_abs_sum / global_count : Scalar{0};
+    std::cout << "    >> grad_norm=" << std::scientific << std::setprecision(4) << global_norm
+              << "  max|g|=" << global_abs_max
+              << "  mean|g|=" << global_mean
+              << "  params=" << global_count
+              << "  tensors=" << grads.size()
+              << std::endl;
 }
 
 // ==================== 主函数 ====================
@@ -287,6 +376,7 @@ int main(int argc, char *argv[])
     std::cout << "  优化器: " << cfg.optimizer_name << "  学习率: " << cfg.lr << "\n";
     std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
     std::cout << "  GPU: " << (cfg.gpu_enabled ? "启用" : "禁用") << "\n";
+    std::cout << "  梯度日志: " << (cfg.grad_log ? "启用" : "禁用") << "\n";
     std::cout << "========================================\n\n";
 
     // ── 创建计算引擎 ─────────────────────────────────────────
@@ -323,7 +413,8 @@ int main(int argc, char *argv[])
     auto model_build = nn::build_gpt_model(
         *engine,
         tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
-        cfg.num_heads, cfg.d_ff, cfg.num_layers);
+        cfg.num_heads, cfg.d_ff, cfg.num_layers,
+        cfg.pos_encoding);
     if (!model_build) {
         std::cerr << "构建模型失败: " << model_build.error().message << '\n';
         return 1;
@@ -333,7 +424,8 @@ int main(int argc, char *argv[])
     // ── 构建规格（用于保存） ─────────────────────────────────
     auto spec = nn::make_gpt_spec(
         tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
-        cfg.num_heads, cfg.d_ff, cfg.num_layers);
+        cfg.num_heads, cfg.d_ff, cfg.num_layers,
+        cfg.pos_encoding);
 
     if (cfg.load_existing)
     {
@@ -349,6 +441,18 @@ int main(int argc, char *argv[])
             {
                 std::cout << "从模型文件读取 GPT 规格\n";
                 auto build_result = nn::build_gpt_model_from_spec(*engine, file_spec);
+                if (!build_result)
+                {
+                    std::cerr << "Error: " << build_result.error().message << '\n';
+                    return 1;
+                }
+                model = std::move(*build_result);
+                spec = file_spec;
+            }
+            else if (file_spec.is_alibi_gpt())
+            {
+                std::cout << "从模型文件读取 ALiBi GPT 规格\n";
+                auto build_result = nn::build_alibi_gpt_model_from_spec(*engine, file_spec);
                 if (!build_result)
                 {
                     std::cerr << "Error: " << build_result.error().message << '\n';
@@ -516,6 +620,14 @@ int main(int argc, char *argv[])
                 std::cerr << "Error: " << step_result.error().message << '\n';
                 return 1;
             }
+
+            // ── 梯度统计（step 后、zero_grad 前） ──
+            if (cfg.grad_log && ((step + 1) % cfg.log_interval == 0 || step + 1 == steps_per_epoch))
+            {
+                std::cout << "\n  [grad] step " << step + 1 << ":" << std::endl;
+                log_gradient_stats(*engine, model.param_gradients());
+            }
+
             auto zero_result = optimizer->zero_grad();
             if (!zero_result) {
                 std::cerr << "\n优化器 zero_grad 失败: " << zero_result.error().message << '\n';
