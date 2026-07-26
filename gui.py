@@ -51,12 +51,155 @@ def draw_digit(canvas: tk.Canvas, pixels: list[float], offset_x=0, offset_y=0):
                                     fill=color, outline="")
 
 
+# ── LiveChart: 纯 tkinter 实时训练曲线组件 ──────────
+class LiveChart:
+    """支持定时刷新的实时图表，避免频繁重绘造成卡顿"""
+    COLORS = ["#4ec9b0", "#dcdcaa", "#569cd6", "#ce9178", "#c586c0"]
+
+    def __init__(self, parent: tk.Widget, width: int = 640, height: int = 220,
+                 update_interval_ms: int = 200, max_points: int = 800):
+        self.canvas = tk.Canvas(parent, width=width, height=height,
+                                bg="#1e1e1e", highlightthickness=1,
+                                highlightbackground="#333")
+        self.W = width
+        self.H = height
+        self.margin_left = 60
+        self.margin_right = 20
+        self.margin_top = 30
+        self.margin_bottom = 36
+        self.series: dict[str, list[tuple[float, float]]] = {}
+        self.color_map: dict[str, str] = {}
+        self._next_color = 0
+        self.max_points = max_points          # 每个系列最多保留点数
+        self._pending_update = False          # 标记是否有待刷新
+        self._update_interval = update_interval_ms  # 刷新间隔（毫秒）
+        self._after_id = None                 # after 回调 ID
+
+    def add_point(self, series: str, x: float, y: float):
+        if series not in self.series:
+            self.series[series] = []
+            self.color_map[series] = self.COLORS[self._next_color % len(self.COLORS)]
+            self._next_color += 1
+        pts = self.series[series]
+        pts.append((x, y))
+        # 限制点数，防止数据过多导致绘制变慢
+        if len(pts) > self.max_points:
+            pts[:] = pts[-self.max_points:]   # 保留最新 max_points 个点
+        # 请求刷新（合并多次调用）
+        self._schedule_redraw()
+
+    def _schedule_redraw(self):
+        if self._pending_update:
+            return
+        self._pending_update = True
+        # 取消之前的 after 回调（如果有）
+        if self._after_id is not None:
+            self.canvas.after_cancel(self._after_id)
+            self._after_id = None
+        # 在 update_interval 毫秒后执行 redraw
+        self._after_id = self.canvas.after(self._update_interval, self._do_redraw)
+
+    def _do_redraw(self):
+        self._pending_update = False
+        self._after_id = None
+        self.redraw()
+
+    def clear(self):
+        self.series.clear()
+        self.color_map.clear()
+        self._next_color = 0
+        self.canvas.delete("all")
+        if self._after_id is not None:
+            self.canvas.after_cancel(self._after_id)
+            self._after_id = None
+        self._pending_update = False
+
+    def redraw(self):
+        self.canvas.delete("all")
+        if not self.series:
+            return
+        # 收集全部点
+        all_x: list[float] = []
+        all_y: list[float] = []
+        for pts in self.series.values():
+            for px, py in pts:
+                all_x.append(px)
+                all_y.append(py)
+        if not all_x:
+            return
+        x_min, x_max = min(all_x), max(all_x)
+        y_min, y_max = min(all_y), max(all_y)
+        if x_max == x_min:
+            x_max = x_min + 1
+        if y_max == y_min:
+            y_max = y_min + 1
+        y_range = y_max - y_min
+        y_min -= y_range * 0.05
+        y_max += y_range * 0.05
+        if y_max == y_min:
+            y_max = y_min + 1
+
+        L, R = self.margin_left, self.W - self.margin_right
+        T, B = self.margin_top, self.H - self.margin_bottom
+        pw = R - L
+        ph = B - T
+
+        def tx(v):
+            return L + (v - x_min) / (x_max - x_min) * pw
+
+        def ty(v):
+            return B - (v - y_min) / (y_max - y_min) * ph
+
+        # 网格线
+        n_grid_y = 5
+        for i in range(n_grid_y + 1):
+            yy = T + ph * i / n_grid_y
+            self.canvas.create_line(L, yy, R, yy, fill="#333", dash=(2, 4))
+            val = y_max - (y_max - y_min) * i / n_grid_y
+            self.canvas.create_text(L - 4, yy, anchor="e", text=f"{val:.3g}",
+                                    fill="#888", font=("Consolas", 8))
+        n_grid_x = min(8, max(1, int(x_max - x_min)))
+        for i in range(n_grid_x + 1):
+            xx = L + pw * i / n_grid_x
+            self.canvas.create_line(xx, T, xx, B, fill="#333", dash=(2, 4))
+            val = x_min + (x_max - x_min) * i / n_grid_x
+            self.canvas.create_text(xx, B + 12, anchor="n", text=f"{val:.0f}",
+                                    fill="#888", font=("Consolas", 8))
+
+        # 绘制各系列
+        for name, pts in self.series.items():
+            if len(pts) < 2:
+                continue
+            color = self.color_map[name]
+            coords = []
+            for px, py in pts:
+                coords.extend([tx(px), ty(py)])
+            self.canvas.create_line(*coords, fill=color, width=2, smooth=True)
+            # 末端圆点
+            lx, ly = tx(pts[-1][0]), ty(pts[-1][1])
+            self.canvas.create_oval(lx - 3, ly - 3, lx + 3, ly + 3,
+                                    fill=color, outline="")
+
+        # 图例
+        legend_x = L + 8
+        legend_y = T + 4
+        for i, (name, _) in enumerate(self.series.items()):
+            color = self.color_map[name]
+            self.canvas.create_rectangle(legend_x, legend_y + i * 16,
+                                         legend_x + 10, legend_y + 10 + i * 16,
+                                         fill=color, outline="")
+            self.canvas.create_text(legend_x + 14, legend_y + 5 + i * 16,
+                                    anchor="w", text=name, fill="#ccc",
+                                    font=("Consolas", 8))
+
+
 # ── GUI 主类 ─────────────────────────────────────────
 class NeuralNetGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("neuralnet.cpp — MNIST & GPT 训练 & 推理")
-        self.resizable(False, False)
+        self.resizable(True, True)
+        self.minsize(700, 600)
 
         # 主题风格
         style = ttk.Style(self)
@@ -157,8 +300,9 @@ class NeuralNetGUI(tk.Tk):
 
         ttk.Label(param_frame, text="学习率:").grid(row=0, column=2, sticky="w")
         self.train_lr_var = tk.DoubleVar(value=0.01)
-        ttk.Spinbox(param_frame, from_=0.0001, to=1.0, increment=0.001, width=8,
-                     textvariable=self.train_lr_var, format="%.4f").grid(row=0, column=3, padx=(0, 16))
+        self.train_lr_sp = ttk.Spinbox(param_frame, from_=0.0001, to=1.0, increment=0.001, width=8,
+                     textvariable=self.train_lr_var, format="%.4f")
+        self.train_lr_sp.grid(row=0, column=3, padx=(0, 16))
 
         ttk.Label(param_frame, text="批大小:").grid(row=0, column=4, sticky="w")
         self.train_batch_var = tk.IntVar(value=64)
@@ -225,6 +369,68 @@ class NeuralNetGUI(tk.Tk):
         self._toggle_model_params()  # 默认显示 MLP 参数
         row += 1
 
+        # ── 学习率调度 ──
+        lr_sched_frame = ttk.LabelFrame(f, text="学习率调度", padding=6)
+        lr_sched_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+        row += 1
+
+        ttk.Label(lr_sched_frame, text="调度模式:").grid(row=0, column=0, sticky="w")
+        self.train_lr_schedule_var = tk.StringVar(value="fixed")
+        lr_sched_combo = ttk.Combobox(lr_sched_frame, textvariable=self.train_lr_schedule_var, width=10, state="readonly",
+                                      values=["fixed", "cosine"])
+        lr_sched_combo.grid(row=0, column=1, sticky="w", padx=(0, 16))
+        lr_sched_combo.bind("<<ComboboxSelected>>", lambda e: self._toggle_lr_schedule())
+
+        ttk.Label(lr_sched_frame, text="预热轮数:").grid(row=0, column=2, sticky="w")
+        self.train_warmup_epochs_var = tk.IntVar(value=0)
+        self.train_warmup_epochs_sp = ttk.Spinbox(lr_sched_frame, from_=0, to=100, width=6,
+                                                   textvariable=self.train_warmup_epochs_var)
+        self.train_warmup_epochs_sp.grid(row=0, column=3, padx=(0, 16))
+
+        ttk.Label(lr_sched_frame, text="最低学习率:").grid(row=0, column=4, sticky="w")
+        self.train_min_lr_var = tk.DoubleVar(value=1e-6)
+        self.train_min_lr_sp = ttk.Spinbox(lr_sched_frame, from_=0.0, to=1.0, increment=0.0001, width=10,
+                                            textvariable=self.train_min_lr_var, format="%.6f")
+        self.train_min_lr_sp.grid(row=0, column=5)
+
+        # 手动每轮 lr
+        self.train_lr_manual_var = tk.BooleanVar(value=False)
+        self.train_lr_manual_cb = ttk.Checkbutton(lr_sched_frame, text="手动指定每轮 lr",
+                                                   variable=self.train_lr_manual_var,
+                                                   command=self._toggle_lr_schedule)
+        self.train_lr_manual_cb.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        self.train_lr_per_epoch_var = tk.StringVar(value="")
+        self.train_lr_per_epoch_entry = ttk.Entry(lr_sched_frame, textvariable=self.train_lr_per_epoch_var, width=48,
+                                                   state="disabled")
+        self.train_lr_per_epoch_entry.grid(row=1, column=2, columnspan=4, sticky="ew", padx=(0, 4), pady=(4, 0))
+        ttk.Label(lr_sched_frame, text="(逗号分隔，如 0.01,0.005,0.001)").grid(row=2, column=2, columnspan=4, sticky="w")
+        self._toggle_lr_schedule()
+        row += 1
+
+        # ── 振荡抑制 ──
+        osc_frame = ttk.LabelFrame(f, text="振荡抑制", padding=6)
+        osc_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+        row += 1
+
+        self.train_osc_guard_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(osc_frame, text="启用振荡检测 (自动降 lr)", variable=self.train_osc_guard_var,
+                        command=self._toggle_osc_guard).grid(row=0, column=0, columnspan=5, sticky="w")
+
+        ttk.Label(osc_frame, text="窗口大小:").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.train_osc_window_var = tk.IntVar(value=20)
+        self.train_osc_window_sp = ttk.Spinbox(osc_frame, from_=5, to=200, width=6,
+                                              textvariable=self.train_osc_window_var)
+        self.train_osc_window_sp.grid(row=1, column=1, padx=(0, 16), pady=(4, 0))
+
+        ttk.Label(osc_frame, text="反转率阈值:").grid(row=1, column=2, sticky="w", pady=(4, 0))
+        self.train_osc_threshold_var = tk.DoubleVar(value=0.55)
+        self.train_osc_threshold_sp = ttk.Spinbox(osc_frame, from_=0.1, to=1.0, increment=0.05, width=6,
+                                                  textvariable=self.train_osc_threshold_var, format="%.2f")
+        self.train_osc_threshold_sp.grid(row=1, column=3, padx=(0, 16), pady=(4, 0))
+        self._toggle_osc_guard()  # 初始状态：启用，控件可编辑
+        row += 1
+
         # ── GPU 加速 ──
         self.train_gpu_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(f, text="启用 GPU 加速 (需要 Vulkan SDK)", variable=self.train_gpu_var).grid(
@@ -259,13 +465,21 @@ class NeuralNetGUI(tk.Tk):
         row += 1
 
         # 日志输出
-        self.train_log = tk.Text(f, height=14, width=72, state="disabled",
+        self.train_log = tk.Text(f, height=10, width=72, state="disabled",
                                  font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4",
                                  insertbackground="white")
         self.train_log.grid(row=row, column=0, columnspan=3, sticky="ew")
         scroll = ttk.Scrollbar(f, orient="vertical", command=self.train_log.yview)
         scroll.grid(row=row, column=3, sticky="ns")
         self.train_log["yscrollcommand"] = scroll.set
+        row += 1
+
+        # ── 训练曲线 ──
+        chart_frame = ttk.LabelFrame(f, text="📊 训练曲线", padding=4)
+        chart_frame.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+        self.train_chart = LiveChart(chart_frame, width=640, height=220)
+        self.train_chart.canvas.pack(fill="both", expand=True)
+        self._train_step_x = 0
 
     # ---- 浏览按钮 ----
     def _browse_dataset(self):
@@ -298,12 +512,32 @@ class NeuralNetGUI(tk.Tk):
             self.mlp_params.pack_forget()
             self.transformer_params.pack(fill="x")
 
+    def _toggle_osc_guard(self):
+        """振荡抑制开关：关闭时禁用窗口/阈值输入"""
+        state = "normal" if self.train_osc_guard_var.get() else "disabled"
+        self.train_osc_window_sp.config(state=state)
+        self.train_osc_threshold_sp.config(state=state)
+
+    def _toggle_lr_schedule(self):
+        """学习率调度：cosine 时启用预热/min-lr，手动模式启用每轮 lr 输入；非 fixed 时禁用固定 lr"""
+        schedule = self.train_lr_schedule_var.get()
+        is_cosine = schedule == "cosine"
+        is_manual = self.train_lr_manual_var.get()
+        self.train_warmup_epochs_sp.config(state="normal" if is_cosine else "disabled")
+        self.train_min_lr_sp.config(state="normal" if is_cosine else "disabled")
+        self.train_lr_per_epoch_entry.config(state="normal" if is_manual else "disabled")
+        # 调度模式下固定学习率由调度器控制，禁用手动输入
+        self.train_lr_sp.config(state="disabled" if is_cosine or is_manual else "normal")
+
     # ---- 训练 ----
     def _start_training(self):
         exe = str(TRAIN_EXE)
         if not Path(exe).exists():
             messagebox.showerror("错误", f"找不到训练可执行文件:\n{exe}\n请先构建项目:\n  cmake -B build -G Ninja && ninja -C build")
             return
+
+        self.train_chart.clear()
+        self._train_step_x = 0
 
         cmd = [exe,
                "--dataset", self.train_dataset_var.get(),
@@ -338,6 +572,27 @@ class NeuralNetGUI(tk.Tk):
         if self.train_gpu_var.get():
             cmd.append("--gpu")
 
+        # 振荡抑制
+        cmd += ["--osc-guard", "on" if self.train_osc_guard_var.get() else "off"]
+        if self.train_osc_guard_var.get():
+            if self.train_osc_window_var.get() != 20:
+                cmd += ["--osc-window", str(self.train_osc_window_var.get())]
+            if abs(self.train_osc_threshold_var.get() - 0.55) > 0.001:
+                cmd += ["--osc-threshold", str(self.train_osc_threshold_var.get())]
+
+        # 学习率调度
+        lr_schedule = self.train_lr_schedule_var.get()
+        if self.train_lr_manual_var.get():
+            per_epoch_str = self.train_lr_per_epoch_var.get().strip()
+            if per_epoch_str:
+                cmd += ["--lr-per-epoch", per_epoch_str]
+        elif lr_schedule == "cosine":
+            cmd += ["--lr-schedule", "cosine"]
+            if self.train_warmup_epochs_var.get() > 0:
+                cmd += ["--warmup-epochs", str(self.train_warmup_epochs_var.get())]
+            if abs(self.train_min_lr_var.get() - 1e-6) > 1e-8:
+                cmd += ["--min-lr", str(self.train_min_lr_var.get())]
+
         self._log_train(f"$ {' '.join(cmd)}\n")
         self.train_start_btn.config(state="disabled")
         self.train_stop_btn.config(state="normal")
@@ -360,6 +615,33 @@ class NeuralNetGUI(tk.Tk):
         self.train_log.insert("end", text)
         self.train_log.see("end")
         self.train_log.config(state="disabled")
+        self._parse_train_metrics(text)
+
+    def _parse_train_metrics(self, text: str):
+        """解析 MNIST 训练输出并更新图表。"""
+        import re as _re
+        # step 级 loss:  "  Epoch 1/5  batch 10/937  loss: 2.3045"
+        m = _re.search(r"loss:\s*(\d+\.\d+)", text)
+        if m and "=" not in text:
+            loss = float(m.group(1))
+            self._train_step_x += 1
+            self.train_chart.add_point("step_loss", self._train_step_x, loss)
+            self.train_chart.redraw()
+        # epoch 级: "lr=1.0000e-02  loss=0.4523  train_acc=90.12%  test_acc=88.56%"
+        m_lr = _re.search(r"lr=([0-9.e\-+]+)", text)
+        m_epoch = _re.search(r"loss=(\d+\.\d+)", text)
+        m_train = _re.search(r"train_acc=(\d+\.\d+)%", text)
+        m_test = _re.search(r"test_acc=(\d+\.\d+)%", text)
+        if m_lr:
+            self.train_chart.add_point("lr", self._train_step_x, float(m_lr.group(1)))
+        if m_epoch:
+            self.train_chart.add_point("epoch_loss", self._train_step_x, float(m_epoch.group(1)))
+        if m_train:
+            self.train_chart.add_point("train_acc", self._train_step_x, float(m_train.group(1)) / 100.0)
+        if m_test:
+            self.train_chart.add_point("test_acc", self._train_step_x, float(m_test.group(1)) / 100.0)
+        if m_epoch or m_train or m_test:
+            self.train_chart.redraw()
 
     # ============================================================
     #  推理 Tab
@@ -751,8 +1033,9 @@ class NeuralNetGUI(tk.Tk):
 
         ttk.Label(param_frame, text="学习率:").grid(row=0, column=2, sticky="w")
         self.text_train_lr_var = tk.DoubleVar(value=0.001)
-        ttk.Spinbox(param_frame, from_=0.00001, to=1.0, increment=0.0001, width=8,
-                     textvariable=self.text_train_lr_var, format="%.5f").grid(row=0, column=3, padx=(0, 16))
+        self.text_train_lr_sp = ttk.Spinbox(param_frame, from_=0.00001, to=1.0, increment=0.0001, width=8,
+                     textvariable=self.text_train_lr_var, format="%.5f")
+        self.text_train_lr_sp.grid(row=0, column=3, padx=(0, 16))
 
         ttk.Label(param_frame, text="批大小:").grid(row=0, column=4, sticky="w")
         self.text_train_batch_var = tk.IntVar(value=32)
@@ -815,6 +1098,68 @@ class NeuralNetGUI(tk.Tk):
         ttk.Label(pe_frame, text="(learned=可学习, sinusoidal=正弦波, alibi=线性偏置)").pack(side="left")
         row += 1
 
+        # ── 学习率调度 ──
+        lr_sched_frame = ttk.LabelFrame(f, text="学习率调度", padding=6)
+        lr_sched_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+        row += 1
+
+        ttk.Label(lr_sched_frame, text="调度模式:").grid(row=0, column=0, sticky="w")
+        self.text_train_lr_schedule_var = tk.StringVar(value="fixed")
+        lr_sched_combo = ttk.Combobox(lr_sched_frame, textvariable=self.text_train_lr_schedule_var, width=10, state="readonly",
+                                      values=["fixed", "cosine"])
+        lr_sched_combo.grid(row=0, column=1, sticky="w", padx=(0, 16))
+        lr_sched_combo.bind("<<ComboboxSelected>>", lambda e: self._toggle_text_lr_schedule())
+
+        ttk.Label(lr_sched_frame, text="预热轮数:").grid(row=0, column=2, sticky="w")
+        self.text_train_warmup_epochs_var = tk.IntVar(value=0)
+        self.text_train_warmup_epochs_sp = ttk.Spinbox(lr_sched_frame, from_=0, to=100, width=6,
+                                                        textvariable=self.text_train_warmup_epochs_var)
+        self.text_train_warmup_epochs_sp.grid(row=0, column=3, padx=(0, 16))
+
+        ttk.Label(lr_sched_frame, text="最低学习率:").grid(row=0, column=4, sticky="w")
+        self.text_train_min_lr_var = tk.DoubleVar(value=1e-6)
+        self.text_train_min_lr_sp = ttk.Spinbox(lr_sched_frame, from_=0.0, to=1.0, increment=0.0001, width=10,
+                                                 textvariable=self.text_train_min_lr_var, format="%.6f")
+        self.text_train_min_lr_sp.grid(row=0, column=5)
+
+        # 手动每轮 lr
+        self.text_train_lr_manual_var = tk.BooleanVar(value=False)
+        self.text_train_lr_manual_cb = ttk.Checkbutton(lr_sched_frame, text="手动指定每轮 lr",
+                                                        variable=self.text_train_lr_manual_var,
+                                                        command=self._toggle_text_lr_schedule)
+        self.text_train_lr_manual_cb.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        self.text_train_lr_per_epoch_var = tk.StringVar(value="")
+        self.text_train_lr_per_epoch_entry = ttk.Entry(lr_sched_frame, textvariable=self.text_train_lr_per_epoch_var, width=48,
+                                                        state="disabled")
+        self.text_train_lr_per_epoch_entry.grid(row=1, column=2, columnspan=4, sticky="ew", padx=(0, 4), pady=(4, 0))
+        ttk.Label(lr_sched_frame, text="(逗号分隔，如 0.001,0.0005,0.0001)").grid(row=2, column=2, columnspan=4, sticky="w")
+        self._toggle_text_lr_schedule()
+        row += 1
+
+        # ── 振荡抑制 ──
+        osc_frame = ttk.LabelFrame(f, text="振荡抑制", padding=6)
+        osc_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+        row += 1
+
+        self.text_train_osc_guard_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(osc_frame, text="启用振荡检测 (自动降 lr)", variable=self.text_train_osc_guard_var,
+                        command=self._toggle_text_osc_guard).grid(row=0, column=0, columnspan=5, sticky="w")
+
+        ttk.Label(osc_frame, text="窗口大小:").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.text_train_osc_window_var = tk.IntVar(value=20)
+        self.text_train_osc_window_sp = ttk.Spinbox(osc_frame, from_=5, to=200, width=6,
+                                                   textvariable=self.text_train_osc_window_var)
+        self.text_train_osc_window_sp.grid(row=1, column=1, padx=(0, 16), pady=(4, 0))
+
+        ttk.Label(osc_frame, text="反转率阈值:").grid(row=1, column=2, sticky="w", pady=(4, 0))
+        self.text_train_osc_threshold_var = tk.DoubleVar(value=0.55)
+        self.text_train_osc_threshold_sp = ttk.Spinbox(osc_frame, from_=0.1, to=1.0, increment=0.05, width=6,
+                                                       textvariable=self.text_train_osc_threshold_var, format="%.2f")
+        self.text_train_osc_threshold_sp.grid(row=1, column=3, padx=(0, 16), pady=(4, 0))
+        self._toggle_text_osc_guard()  # 初始状态：启用，控件可编辑
+        row += 1
+
         # ── GPU 加速 ──
         self.text_train_gpu_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(f, text="启用 GPU 加速 (需要 Vulkan SDK)", variable=self.text_train_gpu_var).grid(
@@ -839,13 +1184,21 @@ class NeuralNetGUI(tk.Tk):
         row += 1
 
         # 日志输出
-        self.text_train_log = tk.Text(f, height=14, width=72, state="disabled",
+        self.text_train_log = tk.Text(f, height=10, width=72, state="disabled",
                                       font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4",
                                       insertbackground="white")
         self.text_train_log.grid(row=row, column=0, columnspan=3, sticky="ew")
         scroll = ttk.Scrollbar(f, orient="vertical", command=self.text_train_log.yview)
         scroll.grid(row=row, column=3, sticky="ns")
         self.text_train_log["yscrollcommand"] = scroll.set
+        row += 1
+
+        # ── GPT 训练曲线 ──
+        chart_frame = ttk.LabelFrame(f, text="📊 训练曲线", padding=4)
+        chart_frame.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+        self.text_train_chart = LiveChart(chart_frame, width=640, height=220)
+        self.text_train_chart.canvas.pack(fill="both", expand=True)
+        self._text_train_step_x = 0
 
     # ---- GPT 训练浏览 ----
     def _browse_text_file(self):
@@ -875,6 +1228,23 @@ class NeuralNetGUI(tk.Tk):
         self.text_resume_entry.config(state=state)
         self.text_resume_btn.config(state=state)
 
+    def _toggle_text_osc_guard(self):
+        """振荡抑制开关：关闭时禁用窗口/阈值输入"""
+        state = "normal" if self.text_train_osc_guard_var.get() else "disabled"
+        self.text_train_osc_window_sp.config(state=state)
+        self.text_train_osc_threshold_sp.config(state=state)
+
+    def _toggle_text_lr_schedule(self):
+        """学习率调度：cosine 时启用预热/min-lr，手动模式启用每轮 lr 输入；非 fixed 时禁用固定 lr"""
+        schedule = self.text_train_lr_schedule_var.get()
+        is_cosine = schedule == "cosine"
+        is_manual = self.text_train_lr_manual_var.get()
+        self.text_train_warmup_epochs_sp.config(state="normal" if is_cosine else "disabled")
+        self.text_train_min_lr_sp.config(state="normal" if is_cosine else "disabled")
+        self.text_train_lr_per_epoch_entry.config(state="normal" if is_manual else "disabled")
+        # 调度模式下固定学习率由调度器控制，禁用手动输入
+        self.text_train_lr_sp.config(state="disabled" if is_cosine or is_manual else "normal")
+
     # ---- GPT 训练 ----
     def _start_text_training(self):
         exe = str(TEXT_TRAIN_EXE)
@@ -886,6 +1256,9 @@ class NeuralNetGUI(tk.Tk):
         if not text_file:
             messagebox.showwarning("提示", "请选择训练文本文件")
             return
+
+        self.text_train_chart.clear()
+        self._text_train_step_x = 0
 
         cmd = [exe, text_file,
                "--save", self.text_train_save_var.get(),
@@ -909,6 +1282,27 @@ class NeuralNetGUI(tk.Tk):
         if self.text_train_grad_log_var.get():
             cmd.append("--grad-log")
 
+        # 振荡抑制
+        cmd += ["--osc-guard", "on" if self.text_train_osc_guard_var.get() else "off"]
+        if self.text_train_osc_guard_var.get():
+            if self.text_train_osc_window_var.get() != 20:
+                cmd += ["--osc-window", str(self.text_train_osc_window_var.get())]
+            if abs(self.text_train_osc_threshold_var.get() - 0.55) > 0.001:
+                cmd += ["--osc-threshold", str(self.text_train_osc_threshold_var.get())]
+
+        # 学习率调度
+        lr_schedule = self.text_train_lr_schedule_var.get()
+        if self.text_train_lr_manual_var.get():
+            per_epoch_str = self.text_train_lr_per_epoch_var.get().strip()
+            if per_epoch_str:
+                cmd += ["--lr-per-epoch", per_epoch_str]
+        elif lr_schedule == "cosine":
+            cmd += ["--lr-schedule", "cosine"]
+            if self.text_train_warmup_epochs_var.get() > 0:
+                cmd += ["--warmup-epochs", str(self.text_train_warmup_epochs_var.get())]
+            if abs(self.text_train_min_lr_var.get() - 1e-6) > 1e-8:
+                cmd += ["--min-lr", str(self.text_train_min_lr_var.get())]
+
         self._log_text_train(f"$ {' '.join(cmd)}\n")
         self.text_train_start_btn.config(state="disabled")
         self.text_train_stop_btn.config(state="normal")
@@ -931,6 +1325,26 @@ class NeuralNetGUI(tk.Tk):
         self.text_train_log.insert("end", text)
         self.text_train_log.see("end")
         self.text_train_log.config(state="disabled")
+        self._parse_text_train_metrics(text)
+
+    def _parse_text_train_metrics(self, text: str):
+        """解析 GPT 训练输出并更新图表。"""
+        import re as _re
+        # step 级: "  Epoch 1/10  step 50/200  loss: 3.4567"
+        m = _re.search(r"loss:\s*(\d+\.\d+)", text)
+        if m and "=" not in text:
+            loss = float(m.group(1))
+            self._text_train_step_x += 1
+            self.text_train_chart.add_point("step_loss", self._text_train_step_x, loss)
+            self.text_train_chart.redraw()
+        # epoch 级: "lr=1.0000e-03  avg_loss=3.1234"
+        m_lr = _re.search(r"lr=([0-9.e\-+]+)", text)
+        m_epoch = _re.search(r"avg_loss=(\d+\.\d+)", text)
+        if m_lr:
+            self.text_train_chart.add_point("lr", self._text_train_step_x, float(m_lr.group(1)))
+        if m_epoch:
+            self.text_train_chart.add_point("epoch_loss", self._text_train_step_x, float(m_epoch.group(1)))
+            self.text_train_chart.redraw()
 
     # ============================================================
     #  GPT 推理 Tab

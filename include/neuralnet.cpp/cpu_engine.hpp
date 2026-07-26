@@ -200,8 +200,8 @@ public:
             const auto row_idx = static_cast<std::size_t>(idx_span[i]);
             if (row_idx < vocab)
             {
-                Scalar* dst_row = dst_span.data() + row_idx * D;
-                const Scalar* grad_row = grad_span.data() + i * D;
+                auto dst_row = dst_span.subspan(row_idx * D, D);
+                const auto grad_row = grad_span.subspan(i * D, D);
                 for (std::size_t c = 0; c < D; ++c)
                     dst_row[c] += grad_row[c];
             }

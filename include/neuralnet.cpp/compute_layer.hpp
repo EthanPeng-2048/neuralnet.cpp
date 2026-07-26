@@ -49,16 +49,16 @@ public:
     [[nodiscard]] virtual Result<Tensor> backward(
         ComputeEngine& engine, const Tensor& grad_output) = 0;
 
-    // 参数访问（供 optimizer 使用）
-    [[nodiscard]] virtual std::vector<Tensor*> parameters() { return {}; }
-    [[nodiscard]] virtual std::vector<Tensor*> param_gradients() { return {}; }
+    // 参数访问（供 optimizer 使用）— 使用 reference_wrapper 替代裸指针，明确表达非拥有语义
+    [[nodiscard]] virtual std::vector<TensorRef> parameters() { return {}; }
+    [[nodiscard]] virtual std::vector<TensorRef> param_gradients() { return {}; }
 
     // 梯度清零（每个训练 step 开始前调用）
     [[nodiscard]] virtual Result<void> zero_grad(ComputeEngine& engine)
     {
-        for (auto* grad : param_gradients())
+        for (auto& grad : param_gradients())
         {
-            auto r = engine.zero(*grad);
+            auto r = engine.zero(grad);
             if (!r) return r;
         }
         return {};
@@ -123,14 +123,14 @@ public:
         { auto r2 = engine.zero(grad_b_); NN_ASSERT(r2, r2 ? "" : r2.error().message.c_str()); }
     }
 
-    [[nodiscard]] std::vector<Tensor*> parameters() override
+    [[nodiscard]] std::vector<TensorRef> parameters() override
     {
-        return {&w_, &b_};
+        return {w_, b_};
     }
 
-    [[nodiscard]] std::vector<Tensor*> param_gradients() override
+    [[nodiscard]] std::vector<TensorRef> param_gradients() override
     {
-        return {&grad_w_, &grad_b_};
+        return {grad_w_, grad_b_};
     }
 
     // ── forward: out = W × x + b ──────────────────────────────────────────
@@ -384,14 +384,14 @@ public:
         { auto r2 = engine.zero(grad_beta_);  NN_ASSERT(r2, r2 ? "" : r2.error().message.c_str()); }
     }
 
-    [[nodiscard]] std::vector<Tensor*> parameters() override
+    [[nodiscard]] std::vector<TensorRef> parameters() override
     {
-        return {&gamma_, &beta_};
+        return {gamma_, beta_};
     }
 
-    [[nodiscard]] std::vector<Tensor*> param_gradients() override
+    [[nodiscard]] std::vector<TensorRef> param_gradients() override
     {
-        return {&grad_gamma_, &grad_beta_};
+        return {grad_gamma_, grad_beta_};
     }
 
     // ── forward ───────────────────────────────────────────────────────────
@@ -653,7 +653,7 @@ public:
                   "MHA: d_model must be divisible by num_heads");
     }
 
-    std::vector<Tensor*> parameters() override
+    std::vector<TensorRef> parameters() override
     {
         auto p = w_q_.parameters();
         auto k = w_k_.parameters();
@@ -665,7 +665,7 @@ public:
         return p;
     }
 
-    std::vector<Tensor*> param_gradients() override
+    std::vector<TensorRef> param_gradients() override
     {
         auto g = w_q_.param_gradients();
         auto k = w_k_.param_gradients();
@@ -961,7 +961,7 @@ public:
                 std::size_t d_model, std::size_t d_ff)
         : fc1_(engine, d_model, d_ff), fc2_(engine, d_ff, d_model) {}
 
-    std::vector<Tensor*> parameters() override
+    std::vector<TensorRef> parameters() override
     {
         auto p = fc1_.parameters();
         auto p2 = fc2_.parameters();
@@ -969,7 +969,7 @@ public:
         return p;
     }
 
-    std::vector<Tensor*> param_gradients() override
+    std::vector<TensorRef> param_gradients() override
     {
         auto g = fc1_.param_gradients();
         auto g2 = fc2_.param_gradients();
@@ -1028,7 +1028,7 @@ public:
           ff_(engine, d_model, d_ff),
           norm2_(engine, d_model) {}
 
-    std::vector<Tensor*> parameters() override
+    std::vector<TensorRef> parameters() override
     {
         auto p = self_attn_.parameters();
         auto n1 = norm1_.parameters();
@@ -1040,7 +1040,7 @@ public:
         return p;
     }
 
-    std::vector<Tensor*> param_gradients() override
+    std::vector<TensorRef> param_gradients() override
     {
         auto g = self_attn_.param_gradients();
         auto gn1 = norm1_.param_gradients();
@@ -1155,9 +1155,9 @@ public:
         ones_row_ = std::move(*or_t);
     }
 
-    std::vector<Tensor*> parameters() override
+    std::vector<TensorRef> parameters() override
     {
-        std::vector<Tensor*> p;
+        std::vector<TensorRef> p;
         for (auto& l : layers_)
         {
             auto lp = l.parameters();
@@ -1166,9 +1166,9 @@ public:
         return p;
     }
 
-    std::vector<Tensor*> param_gradients() override
+    std::vector<TensorRef> param_gradients() override
     {
-        std::vector<Tensor*> g;
+        std::vector<TensorRef> g;
         for (auto& l : layers_)
         {
             auto lg = l.param_gradients();
@@ -1296,10 +1296,10 @@ public:
     [[nodiscard]] std::size_t num_patches() const noexcept { return num_patches_; }
     [[nodiscard]] std::size_t d_model()     const noexcept { return d_model_; }
 
-    std::vector<Tensor*> parameters() override
+    std::vector<TensorRef> parameters() override
     { return projection_.parameters(); }
 
-    std::vector<Tensor*> param_gradients() override
+    std::vector<TensorRef> param_gradients() override
     { return projection_.param_gradients(); }
 
     [[nodiscard]] Result<Tensor> forward(
@@ -1463,7 +1463,7 @@ public:
                   "CausalSelfAttention: d_model must be divisible by num_heads");
     }
 
-    std::vector<Tensor*> parameters() override
+    std::vector<TensorRef> parameters() override
     {
         auto p = w_q_.parameters();
         auto k = w_k_.parameters();
@@ -1475,7 +1475,7 @@ public:
         return p;
     }
 
-    std::vector<Tensor*> param_gradients() override
+    std::vector<TensorRef> param_gradients() override
     {
         auto g = w_q_.param_gradients();
         auto k = w_k_.param_gradients();
@@ -1797,7 +1797,7 @@ public:
         init_slopes();
     }
 
-    std::vector<Tensor*> parameters() override
+    std::vector<TensorRef> parameters() override
     {
         auto p = w_q_.parameters();
         auto k = w_k_.parameters();
@@ -1809,7 +1809,7 @@ public:
         return p;
     }
 
-    std::vector<Tensor*> param_gradients() override
+    std::vector<TensorRef> param_gradients() override
     {
         auto g = w_q_.param_gradients();
         auto k = w_k_.param_gradients();
@@ -2028,7 +2028,7 @@ public:
           ff_(engine, d_model, d_ff),
           norm2_(engine, d_model) {}
 
-    std::vector<Tensor*> parameters() override
+    std::vector<TensorRef> parameters() override
     {
         auto p = self_attn_.parameters();
         auto n1 = norm1_.parameters();
@@ -2040,7 +2040,7 @@ public:
         return p;
     }
 
-    std::vector<Tensor*> param_gradients() override
+    std::vector<TensorRef> param_gradients() override
     {
         auto g = self_attn_.param_gradients();
         auto gn1 = norm1_.param_gradients();
@@ -2124,7 +2124,7 @@ public:
           ff_(engine, d_model, d_ff),
           norm2_(engine, d_model) {}
 
-    std::vector<Tensor*> parameters() override
+    std::vector<TensorRef> parameters() override
     {
         auto p = self_attn_.parameters();
         auto n1 = norm1_.parameters();
@@ -2136,7 +2136,7 @@ public:
         return p;
     }
 
-    std::vector<Tensor*> param_gradients() override
+    std::vector<TensorRef> param_gradients() override
     {
         auto g = self_attn_.param_gradients();
         auto gn1 = norm1_.param_gradients();
@@ -2288,12 +2288,12 @@ public:
             blocks_.emplace_back(engine, d_model, num_heads, d_ff, seq_len, seq_len);
     }
 
-    std::vector<Tensor*> parameters() override
+    std::vector<TensorRef> parameters() override
     {
-        std::vector<Tensor*> p;
-        p.push_back(&token_emb_);
+        std::vector<TensorRef> p;
+        p.push_back(token_emb_);
         if (pos_emb_learnable_)
-            p.push_back(&pos_emb_);
+            p.push_back(pos_emb_);
         for (auto& b : blocks_)
         {
             auto bp = b.parameters();
@@ -2306,12 +2306,12 @@ public:
         return p;
     }
 
-    std::vector<Tensor*> param_gradients() override
+    std::vector<TensorRef> param_gradients() override
     {
-        std::vector<Tensor*> g;
-        g.push_back(&grad_token_emb_);
+        std::vector<TensorRef> g;
+        g.push_back(grad_token_emb_);
         if (pos_emb_learnable_)
-            g.push_back(&grad_pos_emb_);
+            g.push_back(grad_pos_emb_);
         for (auto& b : blocks_)
         {
             auto bg = b.param_gradients();
@@ -2626,10 +2626,10 @@ public:
             blocks_.emplace_back(engine, d_model, num_heads, d_ff, seq_len, seq_len);
     }
 
-    std::vector<Tensor*> parameters() override
+    std::vector<TensorRef> parameters() override
     {
-        std::vector<Tensor*> p;
-        p.push_back(&token_emb_);
+        std::vector<TensorRef> p;
+        p.push_back(token_emb_);
         for (auto& b : blocks_)
         {
             auto bp = b.parameters();
@@ -2642,10 +2642,10 @@ public:
         return p;
     }
 
-    std::vector<Tensor*> param_gradients() override
+    std::vector<TensorRef> param_gradients() override
     {
-        std::vector<Tensor*> g;
-        g.push_back(&grad_token_emb_);
+        std::vector<TensorRef> g;
+        g.push_back(grad_token_emb_);
         for (auto& b : blocks_)
         {
             auto bg = b.param_gradients();

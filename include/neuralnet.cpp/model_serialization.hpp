@@ -15,7 +15,9 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <span>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "config.hpp"
@@ -64,40 +66,65 @@ static_assert(sizeof(Scalar) == 4 || sizeof(Scalar) == 8,
 namespace detail
 {
 
+// ── 安全二进制 I/O 辅助（替代 reinterpret_cast）─────────────────────
+// 使用 std::as_bytes(std::span) 实现类型安全的二进制读写，
+// 避免直接 reinterpret_cast<char*>。
+
+template <typename T>
+    requires std::is_trivially_copyable_v<T>
+[[nodiscard]] inline Result<void> write_bytes(std::ofstream &ofs, const T &v)
+{
+    auto bytes = std::as_bytes(std::span(&v, 1));
+    ofs.write(reinterpret_cast<const char *>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size_bytes()));
+    if (!ofs)
+        return std::unexpected(Error{"Write error"});
+    return {};
+}
+
+template <typename T>
+    requires std::is_trivially_copyable_v<T>
+[[nodiscard]] inline Result<T> read_bytes(std::ifstream &ifs)
+{
+    T v{};
+    auto bytes = std::as_writable_bytes(std::span(&v, 1));
+    ifs.read(reinterpret_cast<char *>(bytes.data()),
+             static_cast<std::streamsize>(bytes.size_bytes()));
+    if (!ifs)
+        return std::unexpected(Error{"Unexpected end of file"});
+    return v;
+}
+
 // ── 基础类型读写 ──────────────────────────────────────────────────────
 
 [[nodiscard]] inline Result<void> write_u32(std::ofstream &ofs, uint32_t v)
 {
-    ofs.write(reinterpret_cast<const char *>(&v), sizeof(v));
-    if (!ofs)
+    if (auto r = write_bytes(ofs, v); !r)
         return std::unexpected(Error{"Write error while writing u32"});
     return {};
 }
 
 [[nodiscard]] inline Result<uint32_t> read_u32(std::ifstream &ifs)
 {
-    uint32_t v;
-    ifs.read(reinterpret_cast<char *>(&v), sizeof(v));
-    if (!ifs)
+    auto r = read_bytes<uint32_t>(ifs);
+    if (!r)
         return std::unexpected(Error{"Unexpected end of file while reading u32"});
-    return v;
+    return *r;
 }
 
 [[nodiscard]] inline Result<void> write_u64(std::ofstream &ofs, uint64_t v)
 {
-    ofs.write(reinterpret_cast<const char *>(&v), sizeof(v));
-    if (!ofs)
+    if (auto r = write_bytes(ofs, v); !r)
         return std::unexpected(Error{"Write error while writing u64"});
     return {};
 }
 
 [[nodiscard]] inline Result<uint64_t> read_u64(std::ifstream &ifs)
 {
-    uint64_t v;
-    ifs.read(reinterpret_cast<char *>(&v), sizeof(v));
-    if (!ifs)
+    auto r = read_bytes<uint64_t>(ifs);
+    if (!r)
         return std::unexpected(Error{"Unexpected end of file while reading u64"});
-    return v;
+    return *r;
 }
 
 // ── 矩阵读写 ──────────────────────────────────────────────────────────
@@ -110,7 +137,7 @@ namespace detail
         return std::unexpected(r.error());
     const auto s = m.span();
     ofs.write(reinterpret_cast<const char *>(s.data()),
-              static_cast<std::streamsize>(s.size() * sizeof(Scalar)));
+              static_cast<std::streamsize>(s.size_bytes()));
     if (!ofs)
         return std::unexpected(Error{"Write error while writing matrix data"});
     return {};
@@ -135,7 +162,7 @@ namespace detail
 
     auto s = m.span();
     ifs.read(reinterpret_cast<char *>(s.data()),
-             static_cast<std::streamsize>(s.size() * sizeof(Scalar)));
+             static_cast<std::streamsize>(s.size_bytes()));
     if (!ifs)
         return std::unexpected(Error{"Unexpected end of file while reading matrix data"});
     return {};
@@ -275,7 +302,8 @@ namespace detail
         return std::unexpected(r.error());
     if (auto r = write_u32(ofs, MODEL_VERSION); !r)
         return std::unexpected(r.error());
-    ofs.write(reinterpret_cast<const char *>(&PRECISION_TAG), 1);
+    if (auto r = write_bytes(ofs, PRECISION_TAG); !r)
+        return std::unexpected(Error{"Write error while writing precision tag"});
     if (!ofs)
         return std::unexpected(Error{"Write error while writing precision tag"});
     return {};
@@ -299,10 +327,10 @@ namespace detail
     // V3: 读取并校验精度标记
     if (*version_r >= 3)
     {
-        uint8_t precision_tag;
-        ifs.read(reinterpret_cast<char *>(&precision_tag), 1);
-        if (!ifs)
+        auto pt_result = read_bytes<uint8_t>(ifs);
+        if (!pt_result)
             return std::unexpected(Error{"Unexpected end: missing precision tag"});
+        uint8_t precision_tag = *pt_result;
         if (precision_tag != PRECISION_TAG)
             return std::unexpected(Error{
                 "Precision mismatch: file uses " + std::string(precision_tag == 0 ? "f32" : "f64")
@@ -369,9 +397,9 @@ namespace detail
 
     auto& engine = model.engine();
     auto params = model.parameters();
-    for (auto *p_tensor : params)
+    for (auto& p_tensor : params)
     {
-        auto m = engine.to_matrix(*p_tensor);
+        auto m = engine.to_matrix(p_tensor);
         if (!m) return std::unexpected(m.error());
         if (auto r = detail::write_matrix(ofs, *m); !r)
             return std::unexpected(r.error());
@@ -428,14 +456,14 @@ namespace detail
 
     auto& engine = model.engine();
     auto params = model.parameters();
-    for (auto *p_tensor : params)
+    for (auto& p_tensor : params)
     {
         // 先读入临时 Matrix（按参数 Tensor 的形状）
-        Matrix tmp(p_tensor->rows(), p_tensor->cols());
+        Matrix tmp(p_tensor.get().rows(), p_tensor.get().cols());
         if (auto r = detail::read_matrix(ifs, tmp); !r)
             return std::unexpected(r.error());
         // 通过 engine 上传到参数 Tensor
-        if (auto r = engine.copy_from(*p_tensor, tmp); !r)
+        if (auto r = engine.copy_from(p_tensor, tmp); !r)
             return std::unexpected(r.error());
     }
 

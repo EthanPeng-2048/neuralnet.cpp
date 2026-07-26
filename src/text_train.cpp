@@ -15,6 +15,7 @@
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/model_serialization.hpp>
 #include <neuralnet.cpp/domain_gpt.hpp>
+#include <neuralnet.cpp/oscillation_guard.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -63,6 +64,16 @@ void print_usage(const char *prog)
         << "                     alibi: 线性偏置注意力（无位置嵌入，支持长度外推）\n"
         << "  --log-interval <n> 每隔多少 step 显示进度 (默认: 50)\n"
         << "  --grad-log         显示梯度统计（范数/最大值/均值）\n"
+        << "  --osc-guard <on|off>  振荡检测自动降 lr (默认: on)\n"
+        << "  --osc-window <n>   振荡检测窗口大小 (默认: 20)\n"
+        << "  --osc-threshold <f> 振荡反转率阈值 (默认: 0.55)\n"
+        << "\n"
+        << "学习率调度:\n"
+        << "  --lr-schedule <type> 学习率调度: fixed/cosine (默认: fixed)\n"
+        << "                   cosine: 余弦退火，lr 从初始值衰减到 min-lr\n"
+        << "  --warmup-epochs <n> 线性预热轮数 (默认: 0, 即不预热)\n"
+        << "  --min-lr <lr>     余弦退火最低学习率 (默认: 1e-6)\n"
+        << "  --lr-per-epoch <v1,v2,...>  手动指定每轮学习率 (逗号分隔，优先级最高)\n"
         << "  --help             显示此帮助信息\n";
 }
 
@@ -88,6 +99,15 @@ struct TrainConfig
     bool gpu_enabled = false;
     bool grad_log = false;          // 显示梯度统计
     nn::PosEncodingType pos_encoding = nn::PosEncodingType::Learned;
+    bool oscillation_guard = true;   // 振荡检测自动降 lr
+    std::size_t osc_window = 20;     // 振荡检测窗口
+    Scalar osc_threshold = 0.55f;    // 振荡反转率阈值
+
+    // 学习率调度
+    std::string lr_schedule = "fixed";  // fixed / cosine
+    int warmup_epochs = 0;              // 线性预热轮数
+    Scalar min_lr = 1e-6f;              // 余弦退火最低 lr
+    std::vector<Scalar> lr_per_epoch;   // 手动指定每轮 lr（为空则自动计算）
 };
 
 TrainConfig parse_args(int argc, char *argv[])
@@ -186,6 +206,65 @@ TrainConfig parse_args(int argc, char *argv[])
             cfg.gpu_enabled = true;
         else if (arg == "--grad-log")
             cfg.grad_log = true;
+        else if (arg == "--osc-guard" && i + 1 < argc)
+        {
+            std::string v = argv[++i];
+            if (v == "on" || v == "1" || v == "true")
+                cfg.oscillation_guard = true;
+            else if (v == "off" || v == "0" || v == "false")
+                cfg.oscillation_guard = false;
+            else
+            {
+                std::cerr << "无效 --osc-guard: " << v << "，可选: on, off\n";
+                std::exit(1);
+            }
+        }
+        else if (arg == "--osc-window" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --osc-window: " << v.error().message << "\n"; std::exit(1); }
+            cfg.osc_window = *v;
+        }
+        else if (arg == "--osc-threshold" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<Scalar>(argv[++i]);
+            if (!v) { std::cerr << "无效 --osc-threshold: " << v.error().message << "\n"; std::exit(1); }
+            cfg.osc_threshold = *v;
+        }
+        else if (arg == "--lr-schedule" && i + 1 < argc)
+        {
+            cfg.lr_schedule = argv[++i];
+            if (cfg.lr_schedule != "fixed" && cfg.lr_schedule != "cosine")
+            {
+                std::cerr << "未知 --lr-schedule: " << cfg.lr_schedule
+                          << "，可选: fixed, cosine\n";
+                std::exit(1);
+            }
+        }
+        else if (arg == "--warmup-epochs" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<int>(argv[++i]);
+            if (!v) { std::cerr << "无效 --warmup-epochs: " << v.error().message << "\n"; std::exit(1); }
+            cfg.warmup_epochs = *v;
+        }
+        else if (arg == "--min-lr" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<Scalar>(argv[++i]);
+            if (!v) { std::cerr << "无效 --min-lr: " << v.error().message << "\n"; std::exit(1); }
+            cfg.min_lr = *v;
+        }
+        else if (arg == "--lr-per-epoch" && i + 1 < argc)
+        {
+            std::string dims_str = argv[++i];
+            std::stringstream ss(dims_str);
+            std::string token;
+            while (std::getline(ss, token, ','))
+            {
+                auto v = nn::parse_number<Scalar>(token);
+                if (!v) { std::cerr << "无效 --lr-per-epoch 值: " << v.error().message << "\n"; std::exit(1); }
+                cfg.lr_per_epoch.push_back(*v);
+            }
+        }
         else if (arg == "--positional-encoding" && i + 1 < argc)
         {
             std::string v = argv[++i];
@@ -237,7 +316,7 @@ nn::Matrix one_hot_labels(const std::vector<std::size_t> &tokens, std::size_t vo
 // ==================== 梯度统计 ====================
 // 计算并打印全局梯度统计：L2 范数、绝对值最大值、均值。
 // GPU 模式下自动通过 engine.to_matrix() 下载张量到 CPU。
-void log_gradient_stats(nn::ComputeEngine &engine, const std::vector<nn::Tensor *> &grads)
+void log_gradient_stats(nn::ComputeEngine &engine, const std::vector<nn::TensorRef> &grads)
 {
     Scalar global_sum_sq = 0.0;
     Scalar global_abs_max = 0.0;
@@ -245,19 +324,20 @@ void log_gradient_stats(nn::ComputeEngine &engine, const std::vector<nn::Tensor 
     std::size_t global_count = 0;
     std::size_t tensor_idx = 0;
 
-    for (auto *grad : grads)
+    for (auto& grad_ref : grads)
     {
+        const auto& grad = grad_ref.get();
         // GPU 张量需要下载到 CPU
         nn::Matrix mat;
-        if (grad->device() == nn::Device::GPU)
+        if (grad.device() == nn::Device::GPU)
         {
-            auto m = engine.to_matrix(*grad);
+            auto m = engine.to_matrix(grad);
             if (!m) continue;
             mat = std::move(*m);
         }
         else
         {
-            mat = grad->cpu_matrix();
+            mat = grad.cpu_matrix();
         }
 
         const Scalar sum_sq = mat.reduce(Scalar{0}, std::plus<>{},
@@ -377,6 +457,7 @@ int main(int argc, char *argv[])
     std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
     std::cout << "  GPU: " << (cfg.gpu_enabled ? "启用" : "禁用") << "\n";
     std::cout << "  梯度日志: " << (cfg.grad_log ? "启用" : "禁用") << "\n";
+    std::cout << "  振荡抑制: " << (cfg.oscillation_guard ? "启用" : "禁用") << "\n";
     std::cout << "========================================\n\n";
 
     // ── 创建计算引擎 ─────────────────────────────────────────
@@ -483,6 +564,47 @@ int main(int argc, char *argv[])
         model.parameters(), model.param_gradients(), cfg.lr,
         cfg.weight_decay);
 
+    // ── 振荡抑制器 ───────────────────────────────────────────
+    std::optional<nn::OscillationGuard> osc_guard;
+    if (cfg.oscillation_guard)
+    {
+        nn::OscillationGuard::Config oc;
+        oc.window_size = cfg.osc_window;
+        oc.threshold = cfg.osc_threshold;
+        osc_guard.emplace(cfg.lr, std::move(oc));
+    }
+    Scalar optimizer_current_lr = cfg.lr;
+
+    // ── 计算每 epoch 的学习率调度 ──
+    auto compute_epoch_lr = [&](int epoch) -> Scalar {
+        // 手动指定优先
+        if (!cfg.lr_per_epoch.empty())
+        {
+            if (epoch < static_cast<int>(cfg.lr_per_epoch.size()))
+                return cfg.lr_per_epoch[epoch];
+            return cfg.lr_per_epoch.back();  // 超出部分用最后一个
+        }
+        if (cfg.lr_schedule == "cosine")
+        {
+            Scalar max_lr = cfg.lr;
+            Scalar lr_min = cfg.min_lr;
+            if (cfg.warmup_epochs > 0 && epoch < cfg.warmup_epochs)
+            {
+                // 线性预热
+                return max_lr * static_cast<Scalar>(epoch + 1) / static_cast<Scalar>(cfg.warmup_epochs);
+            }
+            else
+            {
+                // 余弦退火
+                int cosine_epochs = cfg.epochs - cfg.warmup_epochs;
+                if (cosine_epochs <= 0) return max_lr;
+                Scalar progress = static_cast<Scalar>(epoch - cfg.warmup_epochs) / static_cast<Scalar>(cosine_epochs);
+                return lr_min + 0.5f * (max_lr - lr_min) * (1.0f + std::cos(3.14159265358979323846f * progress));
+            }
+        }
+        return cfg.lr;  // fixed
+    };
+
     nn::CrossEntropyLoss ce_loss;
 
     // ── 训练循环 ─────────────────────────────────────────────
@@ -530,6 +652,16 @@ int main(int argc, char *argv[])
 
     for (int epoch = 0; epoch < cfg.epochs; ++epoch)
     {
+        // ── 学习率调度：每 epoch 开始时调整 ──
+        Scalar epoch_lr = compute_epoch_lr(epoch);
+        if (epoch_lr != optimizer_current_lr)
+        {
+            optimizer->set_lr(epoch_lr);
+            optimizer_current_lr = epoch_lr;
+            if (osc_guard)
+                osc_guard->set_lr(epoch_lr);
+        }
+
         auto ep_start = std::chrono::steady_clock::now();
         Scalar total_loss = 0.0;
 
@@ -621,6 +753,18 @@ int main(int argc, char *argv[])
                 return 1;
             }
 
+            // ── 振荡检测：检查 loss 是否震荡并自动降 lr ──
+            if (osc_guard)
+            {
+                osc_guard->update(loss);
+                Scalar eff_lr = osc_guard->current_lr();
+                if (eff_lr != optimizer_current_lr)
+                {
+                    optimizer->set_lr(eff_lr);
+                    optimizer_current_lr = eff_lr;
+                }
+            }
+
             // ── 梯度统计（step 后、zero_grad 前） ──
             if (cfg.grad_log && ((step + 1) % cfg.log_interval == 0 || step + 1 == steps_per_epoch))
             {
@@ -656,6 +800,7 @@ int main(int argc, char *argv[])
         Scalar avg_loss = total_loss / steps_per_epoch;
 
         std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
+                  << "  lr=" << std::scientific << std::setprecision(4) << optimizer_current_lr
                   << "  avg_loss=" << std::fixed << std::setprecision(4) << avg_loss
                   << "  time=" << std::setprecision(1) << ep_sec << "s"
                   << std::endl;

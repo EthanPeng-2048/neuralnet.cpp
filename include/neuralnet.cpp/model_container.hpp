@@ -4,7 +4,7 @@
 // ── model_container.hpp — 引擎化模型容器 ───────────────────────────────────
 //
 // 架构铁律：
-//   1. Model 持有 ComputeEngine*（非拥有），所有 forward/backward 委托给
+//   1. Model 持有 observer_ptr<ComputeEngine>（非拥有），所有 forward/backward 委托给
 //      Layer::forward(engine, Tensor) / Layer::backward(engine, Tensor)。
 //   2. Model 不包含任何 GPU-resident 中间结果缓存或 forward_gpu/backward_gpu
 //      路径 —— 设备分发完全由 ComputeEngine 实现负责。
@@ -31,12 +31,12 @@ namespace nn
 class Model
 {
 private:
-    ComputeEngine* engine_ = nullptr;
+    observer_ptr<ComputeEngine> engine_;
     std::vector<std::unique_ptr<Layer>> layers_;
 
 public:
     Model() = default;
-    explicit Model(ComputeEngine& engine) : engine_(&engine) {}
+    explicit Model(ComputeEngine& engine) : engine_(engine) {}
 
     // 不可拷贝（unique_ptr 语义），可移动
     Model(const Model&) = delete;
@@ -45,12 +45,10 @@ public:
     Model& operator=(Model&&) noexcept = default;
 
     // ── 引擎绑定 ─────────────────────────────────────────────────────────
-    // Model 必须在 add_* 之前绑定引擎（Linear/LayerNorm 构造需要 engine
-    // 来创建同设备权重张量）。
-    void set_engine(ComputeEngine& engine) { engine_ = &engine; }
+    void set_engine(ComputeEngine& engine) { engine_.reset(&engine); }
     [[nodiscard]] ComputeEngine& engine() const noexcept
     {
-        NN_ASSERT(engine_ != nullptr, "Model: engine not bound");
+        NN_ASSERT(engine_, "Model: engine not bound");
         return *engine_;
     }
 
@@ -217,10 +215,10 @@ public:
         return g;
     }
 
-    // ── 参数收集：返回 Tensor* 供 Optimizer 使用 ──────────────────────────
-    [[nodiscard]] std::vector<Tensor*> parameters()
+    // ── 参数收集：返回 TensorRef 供 Optimizer 使用 ──────────────────────────
+    [[nodiscard]] std::vector<TensorRef> parameters()
     {
-        std::vector<Tensor*> result;
+        std::vector<TensorRef> result;
         for (auto& layer : layers_)
         {
             auto layer_params = layer->parameters();
@@ -229,9 +227,9 @@ public:
         return result;
     }
 
-    [[nodiscard]] std::vector<Tensor*> param_gradients()
+    [[nodiscard]] std::vector<TensorRef> param_gradients()
     {
-        std::vector<Tensor*> result;
+        std::vector<TensorRef> result;
         for (auto& layer : layers_)
         {
             auto layer_grads = layer->param_gradients();
