@@ -9,7 +9,7 @@
 | [架构设计](docs/01-architecture.md) | 项目分层架构、引擎化设计、数据流、模块详解 |
 | [性能优化](docs/02-performance.md) | SmartPolicy、线程池、缓存分块、GPU 加速、算子融合等 |
 | [快速上手：构建模型](docs/03-quickstart-model.md) | ComputeEngine/Layer/Model 三件套使用教程 |
-| [快速上手：训练与推理](docs/04-quickstart-train-infer.md) | MNIST/GPT 训练推理命令行 + C++ API 示例 |
+| [快速上手：训练与推理](docs/04-quickstart-train-infer.md) | MNIST/GPT 训练推理命令行 + C++ API 示例 + GUI 操作指南 |
 | [算法解析](docs/05-algorithm-reference.md) | 每个 Layer/Loss/Optimizer 的数学原理与原语分解 |
 | [开发规范](docs/DEVELOPMENT_STANDARDS.md) | C++ 编码规范、模块隔离、内存管理 |
 
@@ -41,9 +41,11 @@ neuralnet.cpp/
 │   ├── model_container.hpp      ← Model 容器
 │   ├── model_spec.hpp           ← 架构描述
 │   ├── model_serialization.hpp  ← 二进制序列化
+│   ├── oscillation_guard.hpp    ← 振荡检测 + 自动降 lr
 │   ├── domain_mnist.hpp         ← MNIST 模型工厂
 │   ├── domain_gpt.hpp           ← GPT 模型工厂
 │   ├── domain_tokenizer.hpp     ← 分词器
+│   ├── tensor.hpp               ← 统一跨设备张量
 │   ├── algebra_matrix.hpp       ← 矩阵类
 │   ├── algebra_expr.hpp         ← 表达式模板
 │   ├── algebra_ops.hpp          ← 逐元素算子
@@ -52,7 +54,9 @@ neuralnet.cpp/
 │   ├── core_threadpool.hpp      ← 全局线程池
 │   ├── core_errors.hpp          ← Result<T>
 │   ├── core_assert.hpp          ← 断言宏
-│   └── core_file.hpp            ← 文件工具
+│   ├── core_file.hpp            ← 文件工具
+│   ├── core_observer_ptr.hpp    ← 观察者指针
+│   └── backend/                 ← GPU 后端 (Vulkan)
 ├── src/
 │   ├── mnist_train.cpp          ← MNIST 训练
 │   ├── mnist_infer.cpp          ← MNIST 推理
@@ -60,10 +64,14 @@ neuralnet.cpp/
 │   ├── text_infer.cpp           ← GPT 文本推理
 │   ├── tokenizer_train.cpp      ← 分词器训练
 │   ├── tokenizer_infer.cpp      ← 分词器推理
-│   └── compute_bench.cpp        ← 性能基准测试
+│   ├── compute_bench.cpp        ← 性能基准测试
+│   ├── bench_thresholds.cpp     ← 并行阈值测试
+│   └── gpu_test.cpp             ← GPU 后端测试
 ├── datasets/                    ← 训练数据
 ├── pretrained/                  ← 预训练模型
-└── shaders/                     ← GPU Compute Shader
+├── scripts/                     ← 数据处理/训练辅助脚本
+├── shaders/                     ← GPU Compute Shader
+└── compare_with_torch/          ← PyTorch 对比实现
 ```
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/EthanPeng-2048/neuralnet.cpp)
@@ -131,38 +139,56 @@ python save_dataset.py
 
 ### 🖥️ 图形化界面 (GUI)
 
-提供了一个基于 tkinter 的图形化界面，方便进行训练、推理和图片查看操作。
+基于 tkinter 的全功能图形化界面，覆盖 MNIST 训练/推理、GPT 训练/推理、分词器训练/推理，无需记忆命令行参数。
 
 ```bash
 # 启动 GUI
 python gui.py
 ```
 
-> **前提**: 需要先构建 C++ 项目（`cmake -B build -G Ninja`），GUI 会调用 build 目录下的可执行文件。
+> **前提**: 需要先构建 C++ 项目（`cmake -B build -G Ninja`），GUI 会调用 `build/` 目录下的可执行文件。
 
 #### GUI 功能一览
 
 | Tab | 功能 |
 |-----|------|
-| 🏋️ **训练** | 配置数据集路径、模型保存路径、轮数、学习率、批大小、优化器、模型类型（MLP/Transformer），支持恢复训练；实时显示训练日志 |
-| 🔍 **推理** | 选择模型文件和图片 CSV 文件/目录，支持 MLP/Transformer 模型类型切换，显示 Top-K 预测结果置信度条形图和手写数字图片预览；内置 ✍️ 手写板，可直接在画布上书写数字进行实时识别 |
-| 🖼️ **图片查看** | 浏览单张 CSV 图片或批量加载目录，支持前后翻页导航 |
+| 🏋️ **训练** | MNIST 模型训练：支持 MLP / Transformer 架构、超参数调节、恢复训练、学习率调度（fixed / cosine）、振荡抑制、GPU 加速；实时训练曲线 |
+| 🔍 **推理** | MNIST 图片推理：Top-K 预测 + 置信度条形图 + 图片预览；内置 ✍️ **手写板**，鼠标书写数字即刻识别 |
+| 🖼️ **图片查看** | 浏览 CSV 格式手写数字图片，前后翻页导航 |
+| 📝 **GPT 训练** | GPT 语言模型训练：架构参数、位置编码（learned / sinusoidal / alibi）、学习率调度、振荡抑制；实时 loss 曲线 |
+| 💬 **GPT 推理** | GPT 文本生成：温度调节、交互模式、Token ID 调试输出 |
+| 🔤 **分词器训练** | 训练 BPE / CharBPE 分词器，配置词表大小和最小合并频率 |
+| 🔡 **分词器推理** | 分词器编码/解码测试，支持文本编码、ID 解码、文件编码 |
 
 #### GUI 操作流程
 
-**训练模式：**
-1. 配置数据集路径、模型保存路径等参数
-2. 选择模型类型（`mlp` 或 `transformer`）和优化器
-3. 可选勾选"从已有模型恢复训练"并指定模型路径
-4. 点击"▶ 开始训练"，训练日志实时滚动输出
-5. 训练过程中可随时点击"⏹ 停止"终止训练
+**MNIST 训练：**
+1. 选择数据集目录（默认 `datasets/mnist_data`）和模型保存路径
+2. 配置超参数：轮数、学习率、批大小、优化器（`sgd`/`adam`/`adamw`/`muon`）
+3. 选择模型类型：`mlp`（自定义层维度）或 `transformer`（模型维度/头数/层数/FFN/Patch）
+4. 可选：恢复训练、GPU 加速、学习率调度、振荡抑制
+5. 点击 **"▶ 开始训练"**，日志面板实时输出，下方曲线图绘制 loss / accuracy
+6. 训练中可随时点击 **"⏹ 停止"** 终止
 
-**推理模式：**
-1. 选择模型文件（`.bin`）并指定模型类型（需与训练时一致）
-2. 通过文件选择或直接输入路径指定 CSV 图片文件/目录
-3. 设置 Top-K 值控制显示预测结果数量
-4. 点击"▶ 开始推理"，结果以置信度条形图 + 图片预览形式展示
-5. 也可使用内置手写板：在画布上书写数字 → 点击"🔍 识别手写数字" → 自动下采样为 28×28 并推理
+**MNIST 推理：**
+1. 选择训练好的模型文件（`.bin`）
+2. 输入 CSV 图片路径或目录，设置 Top-K
+3. 点击 **"▶ 开始推理"**，左侧显示图片预览，右侧显示置信度条形图
+4. **手写板模式**：在白色画布上书写数字 → 右侧 28×28 预览实时显示 → 点击 **"🔍 识别手写数字"**
+
+**GPT 训练：**
+1. 选择训练文本文件（`.txt`）和词表 JSON
+2. 配置模型架构（维度/头数/层数/FFN）和位置编码
+3. 点击 **"▶ 开始训练"**，实时显示 loss 曲线
+
+**GPT 推理：**
+1. 选择模型文件和词表，设置温度和最大 token 数
+2. 输入提示文本，点击 **"▶ 生成文本"**
+3. 支持勾选"交互式生成模式"进行多轮生成
+
+**分词器训练/推理：**
+- 训练：选择文本文件 → 设置类型（`bpe`/`charbpe`）和词表大小 → 点击训练
+- 推理：选择词表 → 输入文本或 ID → 选择编码/解码 → 点击执行
 
 ## 网络结构
 
