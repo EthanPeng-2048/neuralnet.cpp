@@ -88,6 +88,7 @@ void print_usage(const char *prog)
         << "  --resume <path>    从已有模型恢复训练\n"
         << "  --vocab <path>     词表 JSON 路径 (默认: gpt_bpe.json)\n"
         << "                     自动识别分词器类型（bpe / charbpe / wordzip / space）\n"
+        << "  --test-file <path> 测试集文件路径（可选，每 epoch 结束后评估 test loss）\n"
         << "  --epochs <n>       训练轮数 (默认: 10)\n"
         << "  --lr <lr>          学习率 (默认: 0.001)\n"
         << "  --batch-size <n>   批大小 (默认: 32)\n"
@@ -145,6 +146,7 @@ void print_usage(const char *prog)
 struct TrainConfig
 {
     std::string text_path;
+    std::string test_path;   // 测试集文件路径（可选，用于每 epoch 结束后评估）
     std::string save_path = "gpt_model.bin";
     std::string vocab_path = "gpt_bpe.json";
     std::string resume_path;
@@ -434,6 +436,8 @@ TrainConfig parse_args(int argc, char *argv[])
             if (!v) { std::cerr << "无效 --flush-interval: " << v.error().message << "\n"; std::exit(1); }
             cfg.flush_interval = *v;
         }
+        else if (arg == "--test-file" && i + 1 < argc)
+            cfg.test_path = argv[++i];
         else if (!arg.starts_with("--"))
             cfg.text_path = arg;
         else
@@ -818,6 +822,47 @@ int main(int argc, char *argv[])
     }
     std::cout << "有效样本数: " << valid_samples.size()
               << " (长度 >= 2)\n" << std::endl;
+
+    // ── 加载测试集（可选） ─────────────────────────────────────
+    std::vector<const std::vector<std::size_t> *> test_samples;
+    if (!cfg.test_path.empty())
+    {
+        auto test_text_result = nn::load_text_file(cfg.test_path);
+        if (!test_text_result)
+        {
+            std::cerr << "加载测试集失败: " << test_text_result.error().message << '\n';
+            return 1;
+        }
+        std::string test_text = std::move(*test_text_result);
+        std::vector<std::vector<std::size_t>> test_line_samples;
+        std::size_t test_token_count = 0;
+        {
+            std::istringstream tiss(test_text);
+            std::string tline;
+            while (std::getline(tiss, tline))
+            {
+                auto tlpos = tline.find_first_not_of(" \t\r\n");
+                if (tlpos == std::string::npos) continue;
+                tline = tline.substr(tlpos, tline.find_last_not_of(" \t\r\n") - tlpos + 1);
+                if (tline.empty()) continue;
+
+                auto tl_tokens = tokenizer->encode(tline);
+                std::vector<std::size_t> tsample;
+                tsample.reserve(tl_tokens.size() + 2);
+                if (bos_id != nn::Tokenizer::npos)
+                    tsample.push_back(bos_id);
+                tsample.insert(tsample.end(), tl_tokens.begin(), tl_tokens.end());
+                if (eos_id != nn::Tokenizer::npos)
+                    tsample.push_back(eos_id);
+                test_token_count += tsample.size();
+                test_line_samples.push_back(std::move(tsample));
+            }
+        }
+        for (const auto &s : test_line_samples)
+            if (s.size() >= 2) test_samples.push_back(&s);
+        std::cout << "测试集: " << cfg.test_path << "  样本数: " << test_samples.size()
+                  << "  tokens: " << test_token_count << std::endl;
+    }
 
     std::size_t steps_per_epoch = std::min(
         valid_samples.size() / cfg.batch_size, std::size_t{1000});
@@ -1262,8 +1307,117 @@ int main(int argc, char *argv[])
         std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
                   << "  lr=" << std::scientific << std::setprecision(4) << optimizer_current_lr
                   << "  avg_loss=" << std::fixed << std::setprecision(4) << avg_loss
-                  << "  time=" << std::setprecision(1) << ep_sec << "s"
-                  << std::endl;
+                  << "  time=" << std::setprecision(1) << ep_sec << "s";
+
+        // ── 测试集评估（可选） ─────────────────────────────────
+        if (!test_samples.empty())
+        {
+            Scalar test_total_loss = 0.0;
+            std::size_t test_steps = 0;
+            const std::size_t test_bs = std::min(cfg.batch_size, test_samples.size());
+            const std::size_t test_steps_per_epoch = (test_samples.size() + test_bs - 1) / test_bs;
+
+            for (std::size_t tstep = 0; tstep < test_steps_per_epoch; ++tstep)
+            {
+                const std::size_t offset = tstep * test_bs;
+                const std::size_t this_bs = std::min(test_bs, test_samples.size() - offset);
+
+                // 填充 batch
+                for (std::size_t b = 0; b < this_bs; ++b)
+                {
+                    const auto &toks = *test_samples[offset + b];
+                    std::size_t copy_len = std::min(toks.size(), cfg.seq_len);
+
+                    for (std::size_t t = 0; t < cfg.seq_len; ++t)
+                    {
+                        if (t < copy_len)
+                        {
+                            x_tokens.set_value(t, b, static_cast<Scalar>(toks[t]));
+                            y_tokens.set_value(t, b, (t + 1 < copy_len)
+                                ? static_cast<Scalar>(toks[t + 1]) : static_cast<Scalar>(pad_id));
+                        }
+                        else
+                        {
+                            x_tokens.set_value(t, b, static_cast<Scalar>(pad_id));
+                            y_tokens.set_value(t, b, static_cast<Scalar>(pad_id));
+                        }
+                    }
+                }
+                // 未使用的列清零
+                for (std::size_t b = this_bs; b < cfg.batch_size; ++b)
+                    for (std::size_t t = 0; t < cfg.seq_len; ++t)
+                    {
+                        x_tokens.set_value(t, b, static_cast<Scalar>(pad_id));
+                        y_tokens.set_value(t, b, static_cast<Scalar>(pad_id));
+                    }
+
+                // 对话 loss mask（测试时同样处理）
+                if (has_dialogue)
+                {
+                    for (std::size_t b = 0; b < cfg.batch_size; ++b)
+                    {
+                        std::size_t resp_start = 0;
+                        if (b < this_bs && assistant_mid != nn::Tokenizer::npos)
+                        {
+                            const auto &toks = *test_samples[offset + b];
+                            std::size_t copy_len = std::min(toks.size(), cfg.seq_len);
+                            for (std::size_t t = 0; t < copy_len; ++t)
+                            {
+                                if (toks[t] == assistant_mid) { resp_start = t + 1; break; }
+                            }
+                        }
+                        for (std::size_t t = 0; t < cfg.seq_len; ++t)
+                        {
+                            const bool is_response = (resp_start == 0 || t + 1 >= resp_start);
+                            const bool has_target = (b < this_bs && t + 1 < std::min((*test_samples[offset + b]).size(), cfg.seq_len));
+                            loss_mask.set_value(t, b, (is_response && has_target) ? 1.0f : 0.0f);
+                        }
+                    }
+                }
+                else
+                {
+                    for (std::size_t b = 0; b < cfg.batch_size; ++b)
+                        for (std::size_t t = 0; t < cfg.seq_len; ++t)
+                            loss_mask.set_value(t, b, 1.0f);
+                }
+
+                // Forward pass only（不 backward）
+                auto x_tensor_r = engine->from_matrix(x_tokens);
+                if (!x_tensor_r) { std::cerr << "  测试 from_matrix 失败: " << x_tensor_r.error().message << '\n'; break; }
+
+                // 构建 flat_targets
+                auto y_span = y_tokens.span();
+                for (std::size_t t = 0; t < cfg.seq_len; ++t)
+                    for (std::size_t b = 0; b < cfg.batch_size; ++b)
+                        flat_targets[t * cfg.batch_size + b] =
+                            static_cast<std::size_t>(y_span[t * cfg.batch_size + b]);
+
+                auto begin_r = engine->begin_batch();
+                if (!begin_r) { std::cerr << "  测试 begin_batch 失败: " << begin_r.error().message << '\n'; break; }
+
+                auto fwd_result = model.forward(*x_tensor_r);
+                if (!fwd_result) { std::cerr << "  测试前向传播出错: " << fwd_result.error().message << '\n'; break; }
+                auto test_mask_span = has_dialogue ? std::span<const Scalar>(loss_mask.span()) : std::span<const Scalar>{};
+                auto loss_result = ce_loss.forward_sparse(
+                    *engine, *fwd_result, flat_targets, test_mask_span, tokenizer->vocab_size());
+
+                auto end_r = engine->end_batch();
+                if (!end_r) { std::cerr << "  测试 end_batch 失败: " << end_r.error().message << '\n'; break; }
+
+                if (!loss_result) { std::cerr << "  测试评估出错: " << loss_result.error().message << '\n'; break; }
+                Scalar batch_loss = *loss_result;
+
+                // 加权平均：最后一个 batch 可能不满
+                Scalar weight = static_cast<Scalar>(this_bs) / static_cast<Scalar>(test_bs);
+                test_total_loss += batch_loss * weight;
+                ++test_steps;
+            }
+
+            Scalar test_avg_loss = (test_steps > 0) ? test_total_loss / test_steps : 0.0;
+            std::cout << "  test_loss=" << std::fixed << std::setprecision(4) << test_avg_loss;
+        }
+
+        std::cout << std::endl;
     }
 
     auto t_end = std::chrono::steady_clock::now();
