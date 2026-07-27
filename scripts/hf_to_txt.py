@@ -20,6 +20,8 @@ import os
 import re
 import sys
 
+import markdown as md
+
 # 对话标记（与分词器中定义一致）
 SYSTEM_TAG    = "<system>"
 USER_TAG      = "<user>"
@@ -27,10 +29,109 @@ ASSISTANT_TAG = "<assistant>"
 END_PREFIX    = "</"
 
 
-def clean_text(text: str) -> str:
-    """清洗文本：移除换行、多余空白。"""
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+# 在块级 Markdown 标记前插入换行，让 markdown 库正确识别
+_BLOCK_RE = re.compile(
+    r"(?<=\S)"           # 前面有非空白字符（不是行首）
+    r"(?=---(?!\w))"     # --- 分隔线
+    r"|"
+    r"(?<=\S)"
+    r"(?=#{1,6}\s)"      # # 标题
+    r"|"
+    r"(?<=\s)"
+    r"(?=-\s)"           # - 列表
+    r"|"
+    r"(?<=\s)"
+    r"(?=\d+\.\s)"       # 1. 有序列表
+)
+
+
+def _protect_latex(text: str) -> tuple[str, list[tuple[str, str]]]:
+    """提取 LaTeX 数学片段并用占位符替换，防止被清理过程破坏。
+
+    处理: \\boxed{...} \\text{...} \\[...\\] \\(...\\) $...$
+    返回 (处理后文本, [(占位符, 原文)] )。
+    """
+    blocks: list[tuple[str, str]] = []
+    counter = [0]
+
+    def _save(s: str) -> str:
+        tag = f"\x00L{counter[0]}\x00"
+        counter[0] += 1
+        blocks.append((tag, s))
+        return tag
+
+    # 1) 简化 \boxed{...} \text{...} → 保留花括号内容
+    text = re.sub(r"\\boxed\{([^}]+)\}", r"\1", text)
+    text = re.sub(r"\\text\{([^}]+)\}", r"\1", text)
+
+    # 2) 字符扫描提取 \[...\] 和 \(...\)，只保留内容，丢弃定界符
+    result: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] == "\\" and i + 1 < len(text) and text[i + 1] in ("[", "("):
+            open_ch = text[i + 1]
+            close_ch = "]" if open_ch == "[" else ")"
+            j = i + 2
+            while j < len(text):
+                if text[j] == "\\" and j + 1 < len(text) and text[j + 1] == close_ch:
+                    break
+                j += 1
+            # 提取 \[ 和 \] 之间的内容（不含定界符）
+            inner = text[i + 2 : j]
+            result.append(_save(inner))
+            i = j + 2  # 跳过 \]
+        else:
+            result.append(text[i])
+            i += 1
+    text = "".join(result)
+
+    # 3) 行内 $...$（排除 $$ 块级）
+    text = re.sub(r"(?<!\$)\$(?!\$)[^$]+?\$(?!\$)",
+                  lambda m: _save(m.group(0)), text)
+
+    # 4) 块级 $$...$$
+    text = re.sub(r"\$\$.+?\$\$",
+                  lambda m: _save(m.group(0)), text)
+
+    return text, blocks
+
+
+def strip_markdown(text: str) -> str:
+    """清理 Markdown 格式标记，保留纯文本内容。
+
+    使用 markdown 库将 Markdown 转为 HTML，再剥离 HTML 标签。
+    额外处理 LaTeX 定界符和 \\boxed / \\text 等 LaTeX 命令。
+    """
     if not text:
         return ""
+
+    # --- 预处理 LaTeX：提取并保护 LaTeX 片段 ---
+    text, latex_blocks = _protect_latex(text)
+
+    # --- 恢复块级结构，让 markdown 库正确解析 ---
+    text = _BLOCK_RE.sub("\n", text)
+
+    # --- markdown → HTML → 纯文本 ---
+    html = md.markdown(text, extensions=["extra"])
+    clean = _HTML_TAG_RE.sub(" ", html)
+
+    # 还原 LaTeX 片段
+    for tag, original in latex_blocks:
+        clean = clean.replace(tag, original)
+
+    return clean
+
+
+def clean_text(text: str) -> str:
+    """清洗文本：移除 Markdown 格式、换行、多余空白。"""
+    if not text:
+        return ""
+    # 先清理 Markdown 格式
+    text = strip_markdown(text)
+    # 移除残留的水平分隔线标记
+    text = re.sub(r"(?:---|\*\*\*|___)+", " ", text)
     # 移除所有换行和回车
     text = text.replace("\r", "").replace("\n", "")
     # 合并连续空格
