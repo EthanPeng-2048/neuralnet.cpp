@@ -11,6 +11,7 @@
 | [快速上手：构建模型](docs/03-quickstart-model.md) | ComputeEngine/Layer/Model 三件套使用教程 |
 | [快速上手：训练与推理](docs/04-quickstart-train-infer.md) | MNIST/GPT 训练推理命令行 + C++ API 示例 + GUI 操作指南 |
 | [算法解析](docs/05-algorithm-reference.md) | 每个 Layer/Loss/Optimizer 的数学原理与原语分解 |
+| [CUDA 后端](docs/06-cuda-backend.md) | CUDA GPU 加速后端设计、构建方法、编译器兼容性 |
 | [开发规范](docs/DEVELOPMENT_STANDARDS.md) | C++ 编码规范、模块隔离、内存管理 |
 
 ## 项目结构
@@ -26,7 +27,8 @@ neuralnet.cpp/
 │   ├── 04-quickstart-train-infer.md ← 训练推理教程
 │   ├── 05-algorithm-reference.md    ← 算法解析参考
 │   ├── DEVELOPMENT_STANDARDS.md ← 开发规范
-│   └── GPU_DESIGN_V2.md         ← GPU 后端设计
+│   ├── GPU_DESIGN_V2.md         ← GPU 后端设计 (Vulkan)
+│   └── 06-cuda-backend.md       ← CUDA 后端设计
 ├── gui.py                       ← 图形化操作界面 (Tkinter)
 ├── include/neuralnet.cpp/
 │   ├── nn.hpp                   ← 统一入口头文件
@@ -35,6 +37,7 @@ neuralnet.cpp/
 │   ├── compute_engine.hpp       ← 引擎抽象接口
 │   ├── cpu_engine.hpp           ← CPU 引擎
 │   ├── gpu_engine.hpp           ← GPU 引擎 (Vulkan)
+│   ├── cuda_engine.hpp          ← GPU 引擎 (CUDA)
 │   ├── compute_layer.hpp        ← Layer 基类 + 所有层
 │   ├── compute_loss.hpp         ← 损失函数
 │   ├── compute_optimizer.hpp    ← 优化器 (SGD/Adam/AdamW/Muon)

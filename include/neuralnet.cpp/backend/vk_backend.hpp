@@ -787,6 +787,10 @@ public:
         memory_pool_.reset();
     }
 
+    // 设备丢失状态
+    bool device_lost_ = false;
+    [[nodiscard]] bool is_device_lost() const noexcept { return device_lost_; }
+
     // 禁止拷贝和移动
     GpuBackend(const GpuBackend&) = delete;
     GpuBackend& operator=(const GpuBackend&) = delete;
@@ -1105,10 +1109,46 @@ public:
             }
         }
 
-        // 3. 等待完成
-        r = detail::vk_check(
-            vkWaitForFences(device_.device(), 1, &batch_fence_, VK_TRUE, UINT64_MAX),
-            __FILE__, __LINE__);
+        // 3. 等待完成（60 秒超时，避免 TDR 导致无限挂起）
+        constexpr uint64_t kBatchTimeoutNs = 60'000'000'000ULL;  // 60s
+        VkResult wait_result = vkWaitForFences(
+            device_.device(), 1, &batch_fence_, VK_TRUE, kBatchTimeoutNs);
+        if (wait_result == VK_ERROR_DEVICE_LOST)
+        {
+            // ── 设备丢失（TDR 触发）：GPU 已死亡，无法恢复 ──
+            vkDestroyFence(device_.device(), batch_fence_, nullptr);
+            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
+            if (!batch_desc_sets_.empty())
+                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_,
+                    static_cast<uint32_t>(batch_desc_sets_.size()), batch_desc_sets_.data());
+            batch_desc_sets_.clear();
+            batch_cmd_ = VK_NULL_HANDLE;
+            batch_fence_ = VK_NULL_HANDLE;
+            batch_mode_ = false;
+            device_lost_ = true;
+            return std::unexpected(Error{
+                "GPU 设备丢失 (VK_ERROR_DEVICE_LOST): Windows TDR 已重置 GPU 驱动。"
+                "\n模型已自动保存，请使用 --resume <save-path> --batch-size <较小值> 重启训练。"
+                "\n建议：减小 --batch-size 或 --seq-len，或增大 Windows TDR 超时"
+                " (注册表 TdrDelay)"});
+        }
+        else if (wait_result != VK_SUCCESS)
+        {
+            // 其他错误（含 VK_TIMEOUT）
+            vkDestroyFence(device_.device(), batch_fence_, nullptr);
+            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
+            if (!batch_desc_sets_.empty())
+                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_,
+                    static_cast<uint32_t>(batch_desc_sets_.size()), batch_desc_sets_.data());
+            batch_desc_sets_.clear();
+            batch_cmd_ = VK_NULL_HANDLE;
+            batch_fence_ = VK_NULL_HANDLE;
+            batch_mode_ = false;
+            return std::unexpected(Error{
+                std::string("GPU batch 等待失败: Vulkan error ") + std::to_string(static_cast<int>(wait_result)) +
+                "\n建议：减小 --batch-size 或 --seq-len，或增大 Windows TDR 超时"
+                " (注册表 TdrDelay)"});
+        }
 
         // 4. 清理
         vkDestroyFence(device_.device(), batch_fence_, nullptr);
@@ -1125,7 +1165,148 @@ public:
         return r;
     }
 
-    // ── 阻塞式上传：CPU → GPU ─────────────────────────────────────────
+    // ── 批处理中点刷新（防 TDR） ─────────────────────────────────────────
+    // 提交当前 command buffer 并等待完成，然后自动开始新的录制。
+    // 用于拆分大 batch（如 forward 与 backward 之间），避免单次提交时间
+    // 过长触发 Windows TDR。调用后仍处于 batch 模式。
+    [[nodiscard]] Result<void> flush_batch()
+    {
+        if (!batch_mode_)
+            return {};  // 非 batch 模式时 no-op
+
+        // 1. 结束当前录制
+        auto r = detail::vk_check(vkEndCommandBuffer(batch_cmd_), __FILE__, __LINE__);
+        if (!r)
+        {
+            vkDestroyFence(device_.device(), batch_fence_, nullptr);
+            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
+            batch_cmd_ = VK_NULL_HANDLE;
+            batch_fence_ = VK_NULL_HANDLE;
+            batch_mode_ = false;
+            return std::unexpected(r.error());
+        }
+
+        // 2. 提交并等待完成（超时保护）
+        vkResetFences(device_.device(), 1, &batch_fence_);
+        {
+            std::lock_guard lock(queue_mutex_);
+            VkSubmitInfo submit_info{};
+            submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submit_info.commandBufferCount = 1;
+            submit_info.pCommandBuffers = &batch_cmd_;
+            r = detail::vk_check(
+                vkQueueSubmit(device_.compute_queue(), 1, &submit_info, batch_fence_),
+                __FILE__, __LINE__);
+            if (!r)
+            {
+                vkDestroyFence(device_.device(), batch_fence_, nullptr);
+                vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
+                batch_cmd_ = VK_NULL_HANDLE;
+                batch_fence_ = VK_NULL_HANDLE;
+                batch_mode_ = false;
+                return std::unexpected(r.error());
+            }
+        }
+
+        constexpr uint64_t kFlushTimeoutNs = 60'000'000'000ULL;  // 60s
+        VkResult flush_wait = vkWaitForFences(
+            device_.device(), 1, &batch_fence_, VK_TRUE, kFlushTimeoutNs);
+        if (flush_wait == VK_ERROR_DEVICE_LOST)
+        {
+            // 设备丢失：GPU 已死亡
+            vkDestroyFence(device_.device(), batch_fence_, nullptr);
+            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
+            if (!batch_desc_sets_.empty())
+                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_,
+                    static_cast<uint32_t>(batch_desc_sets_.size()), batch_desc_sets_.data());
+            batch_desc_sets_.clear();
+            batch_cmd_ = VK_NULL_HANDLE;
+            batch_fence_ = VK_NULL_HANDLE;
+            batch_mode_ = false;
+            device_lost_ = true;
+            return std::unexpected(Error{
+                std::string("GPU flush 期间设备丢失 (VK_ERROR_DEVICE_LOST), Vulkan error ")
+                + std::to_string(static_cast<int>(flush_wait))});
+        }
+        else if (flush_wait != VK_SUCCESS)
+        {
+            vkDestroyFence(device_.device(), batch_fence_, nullptr);
+            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
+            if (!batch_desc_sets_.empty())
+                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_,
+                    static_cast<uint32_t>(batch_desc_sets_.size()), batch_desc_sets_.data());
+            batch_desc_sets_.clear();
+            batch_cmd_ = VK_NULL_HANDLE;
+            batch_fence_ = VK_NULL_HANDLE;
+            batch_mode_ = false;
+            return std::unexpected(Error{
+                std::string("GPU flush_batch 等待失败: Vulkan error ")
+                + std::to_string(static_cast<int>(flush_wait))});
+        }
+
+        // 3. 释放已提交的描述符集
+        if (!batch_desc_sets_.empty())
+            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_,
+                static_cast<uint32_t>(batch_desc_sets_.size()), batch_desc_sets_.data());
+        batch_desc_sets_.clear();
+
+        // 4. 销毁旧 command buffer 和 fence
+        vkDestroyFence(device_.device(), batch_fence_, nullptr);
+        vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
+
+        // 5. 分配新的 command buffer（继续录制）
+        VkCommandBufferAllocateInfo cmd_alloc{};
+        cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cmd_alloc.commandPool = command_pool_;
+        cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cmd_alloc.commandBufferCount = 1;
+        r = detail::vk_check(
+            vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &batch_cmd_),
+            __FILE__, __LINE__);
+        if (!r)
+        {
+            batch_cmd_ = VK_NULL_HANDLE;
+            batch_fence_ = VK_NULL_HANDLE;
+            batch_mode_ = false;
+            return std::unexpected(r.error());
+        }
+
+        VkCommandBufferBeginInfo begin_info{};
+        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        r = detail::vk_check(vkBeginCommandBuffer(batch_cmd_, &begin_info), __FILE__, __LINE__);
+        if (!r)
+        {
+            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
+            batch_cmd_ = VK_NULL_HANDLE;
+            batch_fence_ = VK_NULL_HANDLE;
+            batch_mode_ = false;
+            return std::unexpected(r.error());
+        }
+
+        // 6. 创建新的 fence
+        VkFenceCreateInfo fence_info{};
+        fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        r = detail::vk_check(
+            vkCreateFence(device_.device(), &fence_info, nullptr, &batch_fence_),
+            __FILE__, __LINE__);
+        if (!r)
+        {
+            vkEndCommandBuffer(batch_cmd_);
+            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
+            batch_cmd_ = VK_NULL_HANDLE;
+            batch_fence_ = VK_NULL_HANDLE;
+            batch_mode_ = false;
+            return std::unexpected(r.error());
+        }
+
+        // 仍处于 batch 模式，只是提交了一段并开始新的录制
+        return {};
+    }
+
+    // ── 阻塞式上传：CPU → GPU（支持分块传输大矩阵）─────────────────────
+    // 当数据超过 staging region 大小时，自动分块上传。
+    // 每块大小不超过 staging region，通过多次 memcpy + vkCmdCopyBuffer 完成。
     [[nodiscard]] Result<void> upload_blocking(
         GpuTensor& dst, std::span<const Scalar> cpu_data)
     {
@@ -1138,70 +1319,142 @@ public:
         if (cpu_data.size() != elem_count)
             return std::unexpected(Error{"Upload size mismatch"});
 
-        // 1. 获取 staging region
-        auto ri = staging_ring_->acquire();
+        const std::size_t total_bytes = elem_count * sizeof(Scalar);
+        const std::size_t staging_cap = staging_ring_->region_size();
 
-        // 2. 上传数据到 staging
-        auto r = staging_ring_->upload(ri, cpu_data, 0);
-        if (!r)
-            return r;
-
-        // 3. 录制 copy 命令
-        VkCommandBufferAllocateInfo cmd_alloc{};
-        cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cmd_alloc.commandPool = command_pool_;
-        cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cmd_alloc.commandBufferCount = 1;
-
-        VkCommandBuffer cmd = VK_NULL_HANDLE;
-        r = detail::vk_check(
-            vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &cmd),
-            __FILE__, __LINE__);
-        if (!r)
-            return r;
-
-        VkCommandBufferBeginInfo begin_info{};
-        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-        r = detail::vk_check(vkBeginCommandBuffer(cmd, &begin_info), __FILE__, __LINE__);
-        if (!r)
-            return r;
-
-        VkBufferCopy cp{0, 0, elem_count * sizeof(float)};
-        vkCmdCopyBuffer(cmd, staging_ring_->buffer(ri), dst.buffer().impl(), 1, &cp);
-
-        r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
-        if (!r)
-            return r;
-
-        // 4. 提交并等待
-        auto fence = staging_ring_->fence(ri);
-        vkResetFences(device_.device(), 1, &fence);
-
+        // ── 小矩阵快速路径：单次传输 ──────────────────────────────────
+        if (total_bytes <= staging_cap)
         {
-            std::lock_guard lock(queue_mutex_);
-            VkSubmitInfo submit_info{};
-            submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            submit_info.commandBufferCount = 1;
-            submit_info.pCommandBuffers = &cmd;
+            auto ri = staging_ring_->acquire();
+
+            auto r = staging_ring_->upload(ri, cpu_data, 0);
+            if (!r) return r;
+
+            VkCommandBufferAllocateInfo cmd_alloc{};
+            cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cmd_alloc.commandPool = command_pool_;
+            cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cmd_alloc.commandBufferCount = 1;
+
+            VkCommandBuffer cmd = VK_NULL_HANDLE;
+            r = detail::vk_check(
+                vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &cmd),
+                __FILE__, __LINE__);
+            if (!r) return r;
+
+            VkCommandBufferBeginInfo begin_info{};
+            begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+            r = detail::vk_check(vkBeginCommandBuffer(cmd, &begin_info), __FILE__, __LINE__);
+            if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
+
+            VkBufferCopy cp{0, 0, total_bytes};
+            vkCmdCopyBuffer(cmd, staging_ring_->buffer(ri), dst.buffer().impl(), 1, &cp);
+
+            r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
+            if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
+
+            auto fence = staging_ring_->fence(ri);
+            vkResetFences(device_.device(), 1, &fence);
+
+            {
+                std::lock_guard lock(queue_mutex_);
+                VkSubmitInfo submit_info{};
+                submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                submit_info.commandBufferCount = 1;
+                submit_info.pCommandBuffers = &cmd;
+
+                r = detail::vk_check(
+                    vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
+                    __FILE__, __LINE__);
+                if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
+            }
 
             r = detail::vk_check(
-                vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
+                vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, 10'000'000'000ULL),
                 __FILE__, __LINE__);
-            if (!r)
-                return r;
+
+            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
+            return r;
         }
 
-        r = detail::vk_check(
-            vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, 10'000'000'000ULL),
-            __FILE__, __LINE__);
+        // ── 大矩阵分块上传 ───────────────────────────────────────────
+        // 每块大小对齐到 sizeof(Scalar)，确保元素边界对齐
+        const std::size_t chunk_bytes = (staging_cap / sizeof(Scalar)) * sizeof(Scalar);
+        std::size_t dst_offset = 0;
 
-        vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
-        return r;
+        while (dst_offset < total_bytes)
+        {
+            const std::size_t this_chunk = std::min(chunk_bytes, total_bytes - dst_offset);
+            const std::size_t this_elems = this_chunk / sizeof(Scalar);
+            const std::size_t src_elem_offset = dst_offset / sizeof(Scalar);
+
+            // 1. 获取 staging region 并上传当前块
+            auto ri = staging_ring_->acquire();
+            auto r = staging_ring_->upload(
+                ri,
+                std::span<const Scalar>(cpu_data.data() + src_elem_offset, this_elems),
+                0);
+            if (!r) return r;
+
+            // 2. 录制 copy 命令
+            VkCommandBufferAllocateInfo cmd_alloc{};
+            cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cmd_alloc.commandPool = command_pool_;
+            cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cmd_alloc.commandBufferCount = 1;
+
+            VkCommandBuffer cmd = VK_NULL_HANDLE;
+            r = detail::vk_check(
+                vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &cmd),
+                __FILE__, __LINE__);
+            if (!r) return r;
+
+            VkCommandBufferBeginInfo begin_info{};
+            begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+            r = detail::vk_check(vkBeginCommandBuffer(cmd, &begin_info), __FILE__, __LINE__);
+            if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
+
+            VkBufferCopy cp{0, dst_offset, this_chunk};
+            vkCmdCopyBuffer(cmd, staging_ring_->buffer(ri), dst.buffer().impl(), 1, &cp);
+
+            r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
+            if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
+
+            // 3. 提交并等待
+            auto fence = staging_ring_->fence(ri);
+            vkResetFences(device_.device(), 1, &fence);
+
+            {
+                std::lock_guard lock(queue_mutex_);
+                VkSubmitInfo submit_info{};
+                submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                submit_info.commandBufferCount = 1;
+                submit_info.pCommandBuffers = &cmd;
+
+                r = detail::vk_check(
+                    vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
+                    __FILE__, __LINE__);
+                if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
+            }
+
+            r = detail::vk_check(
+                vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, 10'000'000'000ULL),
+                __FILE__, __LINE__);
+            if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
+
+            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
+            dst_offset += this_chunk;
+        }
+
+        return {};
     }
 
-    // ── 阻塞式下载：GPU → CPU ─────────────────────────────────────────
+    // ── 阻塞式下载：GPU → CPU（支持分块传输大矩阵）─────────────────────
+    // 当数据超过 staging region 大小时，自动分块下载。
     [[nodiscard]] Result<void> download_blocking(
         const GpuTensor& src, std::span<Scalar> cpu_data)
     {
@@ -1214,67 +1467,139 @@ public:
         if (cpu_data.size() != elem_count)
             return std::unexpected(Error{"Download size mismatch"});
 
-        // 1. 获取 staging region
-        auto ri = staging_ring_->acquire();
+        const std::size_t total_bytes = elem_count * sizeof(Scalar);
+        const std::size_t staging_cap = staging_ring_->region_size();
 
-        // 2. 录制 copy 命令
-        VkCommandBufferAllocateInfo cmd_alloc{};
-        cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cmd_alloc.commandPool = command_pool_;
-        cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cmd_alloc.commandBufferCount = 1;
-
-        VkCommandBuffer cmd = VK_NULL_HANDLE;
-        auto r = detail::vk_check(
-            vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &cmd),
-            __FILE__, __LINE__);
-        if (!r)
-            return r;
-
-        VkCommandBufferBeginInfo begin_info{};
-        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-        r = detail::vk_check(vkBeginCommandBuffer(cmd, &begin_info), __FILE__, __LINE__);
-        if (!r)
-            return r;
-
-        VkBufferCopy cp{0, 0, elem_count * sizeof(float)};
-        vkCmdCopyBuffer(cmd, src.buffer().impl(), staging_ring_->buffer(ri), 1, &cp);
-
-        r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
-        if (!r)
-            return r;
-
-        // 3. 提交并等待
-        auto fence = staging_ring_->fence(ri);
-        vkResetFences(device_.device(), 1, &fence);
-
+        // ── 小矩阵快速路径：单次传输 ──────────────────────────────────
+        if (total_bytes <= staging_cap)
         {
-            std::lock_guard lock(queue_mutex_);
-            VkSubmitInfo submit_info{};
-            submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            submit_info.commandBufferCount = 1;
-            submit_info.pCommandBuffers = &cmd;
+            auto ri = staging_ring_->acquire();
+
+            VkCommandBufferAllocateInfo cmd_alloc{};
+            cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cmd_alloc.commandPool = command_pool_;
+            cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cmd_alloc.commandBufferCount = 1;
+
+            VkCommandBuffer cmd = VK_NULL_HANDLE;
+            auto r = detail::vk_check(
+                vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &cmd),
+                __FILE__, __LINE__);
+            if (!r) return r;
+
+            VkCommandBufferBeginInfo begin_info{};
+            begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+            r = detail::vk_check(vkBeginCommandBuffer(cmd, &begin_info), __FILE__, __LINE__);
+            if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
+
+            VkBufferCopy cp{0, 0, total_bytes};
+            vkCmdCopyBuffer(cmd, src.buffer().impl(), staging_ring_->buffer(ri), 1, &cp);
+
+            r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
+            if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
+
+            auto fence = staging_ring_->fence(ri);
+            vkResetFences(device_.device(), 1, &fence);
+
+            {
+                std::lock_guard lock(queue_mutex_);
+                VkSubmitInfo submit_info{};
+                submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                submit_info.commandBufferCount = 1;
+                submit_info.pCommandBuffers = &cmd;
+
+                r = detail::vk_check(
+                    vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
+                    __FILE__, __LINE__);
+                if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
+            }
 
             r = detail::vk_check(
-                vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
+                vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, 10'000'000'000ULL),
                 __FILE__, __LINE__);
-            if (!r)
-                return r;
+            if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
+
+            r = staging_ring_->download(ri, cpu_data, 0);
+
+            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
+            return r;
         }
 
-        r = detail::vk_check(
-            vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, 10'000'000'000ULL),
-            __FILE__, __LINE__);
-        if (!r)
-            return r;
+        // ── 大矩阵分块下载 ───────────────────────────────────────────
+        const std::size_t chunk_bytes = (staging_cap / sizeof(Scalar)) * sizeof(Scalar);
+        std::size_t src_offset = 0;
 
-        // 4. 下载数据
-        r = staging_ring_->download(ri, cpu_data, 0);
+        while (src_offset < total_bytes)
+        {
+            const std::size_t this_chunk = std::min(chunk_bytes, total_bytes - src_offset);
+            const std::size_t this_elems = this_chunk / sizeof(Scalar);
+            const std::size_t dst_elem_offset = src_offset / sizeof(Scalar);
 
-        vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
-        return r;
+            // 1. 获取 staging region
+            auto ri = staging_ring_->acquire();
+
+            // 2. 录制 copy 命令：GPU → staging
+            VkCommandBufferAllocateInfo cmd_alloc{};
+            cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cmd_alloc.commandPool = command_pool_;
+            cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cmd_alloc.commandBufferCount = 1;
+
+            VkCommandBuffer cmd = VK_NULL_HANDLE;
+            auto r = detail::vk_check(
+                vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &cmd),
+                __FILE__, __LINE__);
+            if (!r) return r;
+
+            VkCommandBufferBeginInfo begin_info{};
+            begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+            r = detail::vk_check(vkBeginCommandBuffer(cmd, &begin_info), __FILE__, __LINE__);
+            if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
+
+            VkBufferCopy cp{src_offset, 0, this_chunk};
+            vkCmdCopyBuffer(cmd, src.buffer().impl(), staging_ring_->buffer(ri), 1, &cp);
+
+            r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
+            if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
+
+            // 3. 提交并等待
+            auto fence = staging_ring_->fence(ri);
+            vkResetFences(device_.device(), 1, &fence);
+
+            {
+                std::lock_guard lock(queue_mutex_);
+                VkSubmitInfo submit_info{};
+                submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                submit_info.commandBufferCount = 1;
+                submit_info.pCommandBuffers = &cmd;
+
+                r = detail::vk_check(
+                    vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
+                    __FILE__, __LINE__);
+                if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
+            }
+
+            r = detail::vk_check(
+                vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, 10'000'000'000ULL),
+                __FILE__, __LINE__);
+            if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
+
+            // 4. 从 staging 下载当前块到 CPU
+            r = staging_ring_->download(
+                ri,
+                std::span<Scalar>(cpu_data.data() + dst_elem_offset, this_elems),
+                0);
+            if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
+
+            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
+            src_offset += this_chunk;
+        }
+
+        return {};
     }
 
     // ── 纯 GPU 矩阵乘法（阻塞等待完成）──────────────────────────────
@@ -1474,8 +1799,9 @@ public:
                 }
             }
 
+            constexpr uint64_t kTransferTimeoutNs = 30'000'000'000ULL;
             r = detail::vk_check(
-                vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, UINT64_MAX),
+                vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, kTransferTimeoutNs),
                 __FILE__, __LINE__);
 
             vkDestroyFence(device_.device(), fence, nullptr);
@@ -1696,8 +2022,9 @@ public:
                 }
             }
 
+            constexpr uint64_t kTransferTimeoutNs = 30'000'000'000ULL;
             r = detail::vk_check(
-                vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, UINT64_MAX),
+                vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, kTransferTimeoutNs),
                 __FILE__, __LINE__);
 
             vkDestroyFence(device_.device(), fence, nullptr);
@@ -1819,8 +2146,10 @@ public:
             }
         }
 
+        // 30 秒超时（单个原语，比 batch 短）
+        constexpr uint64_t kSingleOpTimeoutNs = 30'000'000'000ULL;
         r = detail::vk_check(
-            vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, UINT64_MAX),
+            vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, kSingleOpTimeoutNs),
             __FILE__, __LINE__);
 
         vkDestroyFence(device_.device(), fence, nullptr);
@@ -2029,10 +2358,9 @@ public:
         vkCmdPushConstants(cmd, reduce_pipeline_.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
 
-        // 每线程处理一行/一列，dispatch 足够线程
-        const uint32_t max_dim = (mode == 0) ? rows : cols;
-        const uint32_t wg_count = (max_dim + 255) / 256;
-        vkCmdDispatch(cmd, wg_count, 1, 1);
+        // 每个工作组 256 线程协作归约一行/一列
+        const uint32_t workgroups = (mode == 0) ? rows : cols;
+        vkCmdDispatch(cmd, workgroups, 1, 1);
         record_output_barrier(cmd, output.buffer().impl());
 
         // 6. 独立模式提交

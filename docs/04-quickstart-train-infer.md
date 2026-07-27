@@ -33,8 +33,11 @@ cmake --build build --parallel
 # Transformer (ViT) 架构
 ./build/mnist_train --arch transformer --epochs 20 --lr 0.001
 
-# 使用 GPU 加速
+# 使用 Vulkan GPU 加速
 ./build/mnist_train --gpu --epochs 10
+
+# 使用 CUDA GPU 加速
+./build/mnist_train --cuda --epochs 10
 
 # 恢复训练
 ./build/mnist_train --resume mnist_model.bin --epochs 5
@@ -55,7 +58,8 @@ cmake --build build --parallel
 | `--lr <lr>` | `0.001` | 学习率 |
 | `--batch-size <n>` | `64` | 批大小 |
 | `--optimizer <name>` | `adam` | 优化器：`sgd`/`sgd_momentum`/`adam`/`adamw`/`muon` |
-| `--gpu` | 禁用 | 启用 GPU 加速 |
+| `--gpu` | 禁用 | 启用 Vulkan GPU 加速 |
+| `--cuda` | 禁用 | 启用 CUDA GPU 加速（优先于 --gpu） |
 | `--max-samples <n>` | 全部 | 限制训练样本数 |
 
 ### 推理
@@ -111,7 +115,8 @@ cmake --build build --parallel
 | `--num-heads <n>` | `4` | 注意力头数 |
 | `--num-layers <n>` | `4` | Transformer 层数 |
 | `--d-ff <n>` | `512` | FFN 中间维度 |
-| `--gpu` | 禁用 | 启用 GPU 加速 |
+| `--gpu` | 禁用 | 启用 Vulkan GPU 加速 |
+| `--cuda` | 禁用 | 启用 CUDA GPU 加速（优先于 --gpu） |
 | `--log-interval <n>` | `50` | 日志间隔 |
 
 ### 推理
@@ -140,7 +145,8 @@ cmake --build build --parallel
 | `--interactive` | 禁用 | 交互式生成模式 |
 | `--max-tokens <n>` | `200` | 最大生成 token 数 |
 | `--temperature <t>` | `1.0` | 温度参数（0=贪心） |
-| `--gpu` | 禁用 | 启用 GPU 加速 |
+| `--gpu` | 禁用 | 启用 Vulkan GPU 加速 |
+| `--cuda` | 禁用 | 启用 CUDA GPU 加速 |
 | `--show-tokens` | 禁用 | 显示 token ID（调试） |
 
 ---
@@ -503,7 +509,7 @@ python gui.py
    - `transformer`：可配置模型维度、注意力头数、FFN 维度、层数、Patch 大小
 5. **可选功能**：
    - ✅ 恢复训练 — 从已有模型继续训练
-   - ✅ GPU 加速 — 需要 Vulkan SDK
+   - ✅ GPU 加速 — 支持 Vulkan / CUDA（下拉选择）
    - ✅ 振荡抑制 — 自动检测 loss 震荡并降低学习率（可调窗口大小和阈值）
    - ✅ 学习率调度 — 支持 cosine 衰减（含预热）和手动指定每轮 lr
 6. **点击 "▶ 开始训练"** — 日志面板实时输出训练进度，下方曲线图实时绘制 step_loss、epoch_loss、train_acc、test_acc、lr
@@ -597,7 +603,7 @@ python gui.py
 │  │ 同 MNIST 训练 Tab                             │   │
 │  └─────────────────────────────────────────────┘   │
 │                                                    │
-│  ☑ GPU 加速  ☑ 显示梯度统计                        │
+│  ☑ GPU 加速（下拉: None / Vulkan / CUDA）  ☑ 显示梯度统计                        │
 │                                                    │
 │  [▶ 开始训练]  [⏹ 停止]                            │
 │                                                    │
@@ -633,7 +639,7 @@ python gui.py
 **可选项：**
 - ✅ **交互式生成模式** — 启用后通过 stdin 进行多轮对话式生成
 - ✅ **显示 Token ID** — 调试用，显示每个 token 的 ID
-- ✅ **GPU 加速** — 需要 Vulkan SDK
+- ✅ **GPU 加速** — 支持 Vulkan / CUDA（下拉选择）
 
 ---
 

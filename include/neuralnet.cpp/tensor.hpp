@@ -23,6 +23,10 @@
 #include "backend/vk_backend.hpp"
 #endif
 
+#ifdef NN_HAS_CUDA
+#include "backend/cuda_backend.hpp"
+#endif
+
 namespace nn
 {
 
@@ -49,6 +53,11 @@ private:
 #ifdef NN_HAS_VULKAN
     // GPU 存储（device_ == GPU 时有效）
     std::shared_ptr<GpuTensor> gpu_data_;
+#endif
+
+#ifdef NN_HAS_CUDA
+    // CUDA 存储（device_ == GPU 时有效）
+    std::shared_ptr<CudaTensor> cuda_data_;
 #endif
 
 public:
@@ -81,6 +90,17 @@ public:
     }
 #endif
 
+#ifdef NN_HAS_CUDA
+    // ── CUDA 构造 ─────────────────────────────────────────────────────────
+    explicit Tensor(std::shared_ptr<CudaTensor> t)
+        : device_(Device::GPU), rows_(t->rows()), cols_(t->cols()), cuda_data_(std::move(t)) {}
+
+    static Tensor from_cuda(CudaTensor t)
+    {
+        return Tensor(std::make_shared<CudaTensor>(std::move(t)));
+    }
+#endif
+
     // ── 访问器 ────────────────────────────────────────────────────────────
     [[nodiscard]] Device device() const noexcept { return device_; }
     [[nodiscard]] std::size_t rows() const noexcept { return rows_; }
@@ -90,9 +110,17 @@ public:
     [[nodiscard]] bool is_gpu() const noexcept { return device_ == Device::GPU; }
     [[nodiscard]] bool valid() const noexcept
     {
-        return device_ == Device::CPU
-            ? static_cast<bool>(cpu_data_)
-            : static_cast<bool>(gpu_data_);
+        if (device_ == Device::CPU)
+            return static_cast<bool>(cpu_data_);
+#ifdef NN_HAS_CUDA
+        if (cuda_data_)
+            return static_cast<bool>(cuda_data_);
+#endif
+#ifdef NN_HAS_VULKAN
+        return static_cast<bool>(gpu_data_);
+#else
+        return false;
+#endif
     }
 
     // ── CPU 存储访问 ──────────────────────────────────────────────────────
@@ -125,6 +153,23 @@ public:
     }
 
     [[nodiscard]] std::shared_ptr<GpuTensor> gpu_shared() const noexcept { return gpu_data_; }
+#endif
+
+#ifdef NN_HAS_CUDA
+    // ── CUDA 存储访问 ─────────────────────────────────────────────────────
+    [[nodiscard]] CudaTensor& cuda_tensor()
+    {
+        NN_ASSERT(device_ == Device::GPU && cuda_data_, "cuda_tensor() on non-CUDA tensor");
+        return *cuda_data_;
+    }
+
+    [[nodiscard]] const CudaTensor& cuda_tensor() const
+    {
+        NN_ASSERT(device_ == Device::GPU && cuda_data_, "cuda_tensor() on non-CUDA tensor");
+        return *cuda_data_;
+    }
+
+    [[nodiscard]] std::shared_ptr<CudaTensor> cuda_shared() const noexcept { return cuda_data_; }
 #endif
 
     // ── 形状描述（调试用） ────────────────────────────────────────────────

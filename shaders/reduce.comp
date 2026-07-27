@@ -1,5 +1,5 @@
 // ── reduce.comp ───────────────────────────────────────────────────────────
-// 归约原语着色器（不含任何算法）
+// 归约原语着色器（工作组级并行归约）
 //
 // 只提供求和/最大值归约原语，供 Layer 组合表达 mean、var、grad_b 等。
 //
@@ -23,7 +23,14 @@
 //   uint mode      — 0=row_reduce, 1=col_reduce
 //   uint reduce_op — 0=sum, 1=max
 //
-// 注：此实现为朴素归约（每线程扫描整行/整列），正确性优先，性能优化留待后期。
+// Dispatch：
+//   row_reduce: (rows, 1, 1) — 每个工作组（256线程）协作归约一行
+//   col_reduce: (cols, 1, 1) — 每个工作组（256线程）协作归约一列
+//
+// 优化：工作组级共享内存并行归约。
+//   旧实现每线程串行扫描整行/整列（O(cols) 或 O(rows)），大矩阵严重超时。
+//   新实现每工作组 256 线程 strided loop + shared memory tree reduce，
+//   每线程工作量降至 O(cols/256)，避免 TDR 超时。
 // ─────────────────────────────────────────────────────────────────────────
 
 #version 450
@@ -40,37 +47,73 @@ layout(push_constant) uniform PushConstants {
     uint reduce_op;
 };
 
+shared float sdata[256];
+
 void main()
 {
-    const uint tid = gl_GlobalInvocationID.x;
+    const uint tid = gl_LocalInvocationID.x;
 
-    // ── 行归约：每线程计算一行的归约值 ──
+    // ── 行归约：工作组 ID = 行索引，256 线程协作归约一行 ──
     if (mode == 0u)
     {
-        if (tid >= rows) return;
+        const uint row = gl_WorkGroupID.x;
+        if (row >= rows) return;
+
+        // strided loop：每个线程累加 cols/256 个元素
         float acc = (reduce_op == 0u) ? 0.0 : uintBitsToFloat(0xff800000u); // sum=0, max=-Inf
-        for (uint c = 0u; c < cols; ++c)
+        const uint base = row * cols;
+        for (uint c = tid; c < cols; c += 256u)
         {
-            float v = data[tid * cols + c];
+            float v = data[base + c];
             if (reduce_op == 0u) acc += v;
             else acc = max(acc, v);
         }
-        result[tid] = acc;
+        sdata[tid] = acc;
+        barrier();
+
+        // 共享内存树形归约
+        for (uint s = 128u; s > 0u; s >>= 1u)
+        {
+            if (tid < s)
+            {
+                if (reduce_op == 0u) sdata[tid] += sdata[tid + s];
+                else sdata[tid] = max(sdata[tid], sdata[tid + s]);
+            }
+            barrier();
+        }
+
+        if (tid == 0u) result[row] = sdata[0];
         return;
     }
 
-    // ── 列归约：每线程计算一列的归约值 ──
+    // ── 列归约：工作组 ID = 列索引，256 线程协作归约一列 ──
     if (mode == 1u)
     {
-        if (tid >= cols) return;
-        float acc = (reduce_op == 0u) ? 0.0 : uintBitsToFloat(0xff800000u); // sum=0, max=-Inf
-        for (uint r = 0u; r < rows; ++r)
+        const uint col = gl_WorkGroupID.x;
+        if (col >= cols) return;
+
+        // strided loop：每个线程累加 rows/256 个元素
+        float acc = (reduce_op == 0u) ? 0.0 : uintBitsToFloat(0xff800000u);
+        for (uint r = tid; r < rows; r += 256u)
         {
-            float v = data[r * cols + tid];
+            float v = data[r * cols + col];
             if (reduce_op == 0u) acc += v;
             else acc = max(acc, v);
         }
-        result[tid] = acc;
+        sdata[tid] = acc;
+        barrier();
+
+        for (uint s = 128u; s > 0u; s >>= 1u)
+        {
+            if (tid < s)
+            {
+                if (reduce_op == 0u) sdata[tid] += sdata[tid + s];
+                else sdata[tid] = max(sdata[tid], sdata[tid + s]);
+            }
+            barrier();
+        }
+
+        if (tid == 0u) result[col] = sdata[0];
         return;
     }
 }

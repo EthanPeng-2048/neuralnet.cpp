@@ -41,6 +41,7 @@ void print_usage(const char *prog)
         << "  --topk <n>         显示前 n 个预测结果 (默认: 3)\n"
         << "  --show-pixels      显示像素矩阵 (调试用)\n"
         << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
+        << "  --cuda             启用 CUDA GPU 加速 (需要 CUDA Toolkit)\n"
         << "  --help             显示此帮助信息\n";
 }
 
@@ -52,6 +53,7 @@ struct InferConfig
     int topk = 3;
     bool show_pixels = false;
     bool gpu_enabled = false;
+    bool cuda_enabled = false;
 };
 
 nn::Result<InferConfig> parse_args(int argc, char *argv[])
@@ -86,6 +88,10 @@ nn::Result<InferConfig> parse_args(int argc, char *argv[])
         else if (arg == "--gpu")
         {
             cfg.gpu_enabled = true;
+        }
+        else if (arg == "--cuda")
+        {
+            cfg.cuda_enabled = true;
         }
         else if (!arg.starts_with("--"))
         {
@@ -265,7 +271,29 @@ int main(int argc, char *argv[])
 #ifdef NN_HAS_VULKAN
     nn::GpuBackend *gpu_backend = nullptr;
 #endif
-    if (cfg.gpu_enabled)
+    if (cfg.cuda_enabled)
+    {
+#ifdef NN_HAS_CUDA
+        auto &cuda_backend = nn::CudaBackend::instance();
+        auto cuda_init = cuda_backend.initialize();
+        if (cuda_init)
+        {
+            engine = std::make_unique<nn::CudaEngine>(cuda_backend);
+            const auto& props = cuda_backend.device_props();
+            std::cout << "CUDA GPU 加速已启用 (" << props.name << ")\n";
+        }
+        else
+        {
+            std::cerr << "CUDA 初始化失败: " << cuda_init.error().message << "\n";
+            std::cerr << "回退到 CPU 模式\n";
+            engine = std::make_unique<nn::CpuEngine>();
+        }
+#else
+        std::cerr << "未编译 CUDA 支持，使用 CPU 模式\n";
+        engine = std::make_unique<nn::CpuEngine>();
+#endif
+    }
+    else if (cfg.gpu_enabled)
     {
 #ifdef NN_HAS_VULKAN
         auto &backend = nn::GpuBackend::instance();

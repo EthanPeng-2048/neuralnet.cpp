@@ -432,9 +432,12 @@ class NeuralNetGUI(tk.Tk):
         row += 1
 
         # ── GPU 加速 ──
-        self.train_gpu_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(f, text="启用 GPU 加速 (需要 Vulkan SDK)", variable=self.train_gpu_var).grid(
-            row=row, column=0, columnspan=3, sticky="w")
+        self.train_gpu_var = tk.StringVar(value="None")
+        gpu_frame = ttk.Frame(f)
+        gpu_frame.grid(row=row, column=0, columnspan=3, sticky="w")
+        ttk.Label(gpu_frame, text="GPU 加速:").pack(side="left")
+        ttk.Combobox(gpu_frame, textvariable=self.train_gpu_var, values=["None", "Vulkan", "CUDA"],
+                     state="readonly", width=8).pack(side="left", padx=4)
         row += 1
 
         # ── 打乱 batch 顺序 ──
@@ -569,7 +572,10 @@ class NeuralNetGUI(tk.Tk):
                     "--patch-size", str(self.train_patch_size_var.get())]
 
         # GPU 加速
-        if self.train_gpu_var.get():
+        gpu_backend = self.train_gpu_var.get()
+        if gpu_backend == "CUDA":
+            cmd.append("--cuda")
+        elif gpu_backend == "Vulkan":
             cmd.append("--gpu")
 
         # 振荡抑制
@@ -674,8 +680,10 @@ class NeuralNetGUI(tk.Tk):
                      textvariable=self.infer_topk_var).pack(side="left", padx=4)
         ttk.Label(param_frame, text="  架构: 自动识别").pack(side="left")
         ttk.Label(param_frame, text="    ").pack(side="left")
-        self.infer_gpu_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(param_frame, text="GPU 加速", variable=self.infer_gpu_var).pack(side="left", padx=4)
+        self.infer_gpu_var = tk.StringVar(value="None")
+        ttk.Label(param_frame, text="GPU:").pack(side="left")
+        ttk.Combobox(param_frame, textvariable=self.infer_gpu_var, values=["None", "Vulkan", "CUDA"],
+                     state="readonly", width=7).pack(side="left", padx=4)
         self.infer_show_pixels_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(param_frame, text="显示像素", variable=self.infer_show_pixels_var).pack(side="left", padx=4)
         row += 1
@@ -845,7 +853,10 @@ class NeuralNetGUI(tk.Tk):
                "--topk", str(self.infer_topk_var.get())]
         if self.infer_show_pixels_var.get():
             cmd.append("--show-pixels")
-        if self.infer_gpu_var.get():
+        gpu_backend = self.infer_gpu_var.get()
+        if gpu_backend == "CUDA":
+            cmd.append("--cuda")
+        elif gpu_backend == "Vulkan":
             cmd.append("--gpu")
 
         self._log_infer(f"[手写识别] $ {' '.join(cmd)}\n")
@@ -1062,6 +1073,11 @@ class NeuralNetGUI(tk.Tk):
         ttk.Spinbox(param_frame, from_=1, to=1000, width=6,
                      textvariable=self.text_train_log_interval_var).grid(row=2, column=1, pady=(6, 0))
 
+        ttk.Label(param_frame, text="保存间隔:").grid(row=2, column=2, sticky="w", pady=(6, 0))
+        self.text_train_save_interval_var = tk.IntVar(value=100)
+        ttk.Spinbox(param_frame, from_=1, to=10000, width=6,
+                     textvariable=self.text_train_save_interval_var).grid(row=2, column=3, pady=(6, 0))
+
         # 模型架构参数
         arch_frame = ttk.LabelFrame(f, text="模型架构", padding=6)
         arch_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
@@ -1161,10 +1177,65 @@ class NeuralNetGUI(tk.Tk):
         row += 1
 
         # ── GPU 加速 ──
-        self.text_train_gpu_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(f, text="启用 GPU 加速 (需要 Vulkan SDK)", variable=self.text_train_gpu_var).grid(
-            row=row, column=0, columnspan=3, sticky="w")
+        self.text_train_gpu_var = tk.StringVar(value="None")
+        gpu_frame = ttk.Frame(f)
+        gpu_frame.grid(row=row, column=0, columnspan=3, sticky="w")
+        ttk.Label(gpu_frame, text="GPU 加速:").pack(side="left")
+        ttk.Combobox(gpu_frame, textvariable=self.text_train_gpu_var, values=["None", "Vulkan", "CUDA"],
+                     state="readonly", width=8).pack(side="left", padx=4)
         row += 1
+
+        # ── TDR 防护 ──
+        tdr_frame = ttk.LabelFrame(f, text="TDR 防护 (GPU 超时自动处理)", padding=6)
+        tdr_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+        row += 1
+
+        # 第一行：Batch 探测
+        self.text_train_batch_probe_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(tdr_frame, text="Batch 探测 (训练前测速找安全 batch)",
+                        variable=self.text_train_batch_probe_var,
+                        command=self._toggle_text_tdr).grid(row=0, column=0, columnspan=3, sticky="w")
+
+        ttk.Label(tdr_frame, text="探测步数:").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.text_train_probe_steps_var = tk.IntVar(value=3)
+        self.text_train_probe_steps_sp = ttk.Spinbox(tdr_frame, from_=1, to=20, width=6,
+                                                      textvariable=self.text_train_probe_steps_var)
+        self.text_train_probe_steps_sp.grid(row=1, column=1, padx=(0, 16), pady=(4, 0))
+
+        ttk.Label(tdr_frame, text="探测耗时上限 (秒):").grid(row=1, column=2, sticky="w", pady=(4, 0))
+        self.text_train_probe_time_limit_var = tk.DoubleVar(value=1.5)
+        self.text_train_probe_time_limit_sp = ttk.Spinbox(tdr_frame, from_=0.5, to=5.0, increment=0.1, width=6,
+                                                           textvariable=self.text_train_probe_time_limit_var, format="%.1f")
+        self.text_train_probe_time_limit_sp.grid(row=1, column=3, padx=(0, 16), pady=(4, 0))
+
+        # 第二行：TDR 自动重试
+        self.text_train_tdr_retry_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(tdr_frame, text="启用 TDR 自动重试 (batch 减半)",
+                        variable=self.text_train_tdr_retry_var,
+                        command=self._toggle_text_tdr).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        ttk.Label(tdr_frame, text="最大重试次数:").grid(row=3, column=0, sticky="w", pady=(4, 0))
+        self.text_train_tdr_retries_var = tk.IntVar(value=4)
+        self.text_train_tdr_retries_sp = ttk.Spinbox(tdr_frame, from_=1, to=10, width=6,
+                                                      textvariable=self.text_train_tdr_retries_var)
+        self.text_train_tdr_retries_sp.grid(row=3, column=1, padx=(0, 16), pady=(4, 0))
+
+        ttk.Label(tdr_frame, text="设备丢失时自动保存 checkpoint 并提示 --resume 重启").grid(
+            row=3, column=2, columnspan=2, sticky="w", pady=(4, 0))
+
+        # 第三行：自动调优
+        self.text_train_auto_tune_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(tdr_frame, text="自动调优 (运行中监测 step 耗时，超限自动降 batch)",
+                        variable=self.text_train_auto_tune_var,
+                        command=self._toggle_text_tdr).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        ttk.Label(tdr_frame, text="耗时上限 (秒):").grid(row=5, column=0, sticky="w", pady=(4, 0))
+        self.text_train_step_time_limit_var = tk.DoubleVar(value=1.5)
+        self.text_train_step_time_limit_sp = ttk.Spinbox(tdr_frame, from_=0.5, to=5.0, increment=0.1, width=6,
+                                                          textvariable=self.text_train_step_time_limit_var, format="%.1f")
+        self.text_train_step_time_limit_sp.grid(row=5, column=1, padx=(0, 16), pady=(4, 0))
+
+        self._toggle_text_tdr()
 
         # ── 梯度日志 ──
         self.text_train_grad_log_var = tk.BooleanVar(value=False)
@@ -1234,6 +1305,16 @@ class NeuralNetGUI(tk.Tk):
         self.text_train_osc_window_sp.config(state=state)
         self.text_train_osc_threshold_sp.config(state=state)
 
+    def _toggle_text_tdr(self):
+        """TDR 防护开关：控制各子选项的启用/禁用"""
+        probe_state = "normal" if self.text_train_batch_probe_var.get() else "disabled"
+        self.text_train_probe_steps_sp.config(state=probe_state)
+        self.text_train_probe_time_limit_sp.config(state=probe_state)
+        tdr_state = "normal" if self.text_train_tdr_retry_var.get() else "disabled"
+        self.text_train_tdr_retries_sp.config(state=tdr_state)
+        tune_state = "normal" if self.text_train_auto_tune_var.get() else "disabled"
+        self.text_train_step_time_limit_sp.config(state=tune_state)
+
     def _toggle_text_lr_schedule(self):
         """学习率调度：cosine 时启用预热/min-lr，手动模式启用每轮 lr 输入；非 fixed 时禁用固定 lr"""
         schedule = self.text_train_lr_schedule_var.get()
@@ -1273,11 +1354,15 @@ class NeuralNetGUI(tk.Tk):
                "--num-heads", str(self.text_train_num_heads_var.get()),
                "--num-layers", str(self.text_train_num_layers_var.get()),
                "--d-ff", str(self.text_train_d_ff_var.get()),
-               "--log-interval", str(self.text_train_log_interval_var.get())]
+               "--log-interval", str(self.text_train_log_interval_var.get()),
+               "--save-interval", str(self.text_train_save_interval_var.get())]
         if self.text_train_resume_var.get():
             cmd += ["--resume", self.text_train_resume_path_var.get()]
         cmd += ["--positional-encoding", self.text_train_pos_enc_var.get()]
-        if self.text_train_gpu_var.get():
+        gpu_backend = self.text_train_gpu_var.get()
+        if gpu_backend == "CUDA":
+            cmd.append("--cuda")
+        elif gpu_backend == "Vulkan":
             cmd.append("--gpu")
         if self.text_train_grad_log_var.get():
             cmd.append("--grad-log")
@@ -1289,6 +1374,27 @@ class NeuralNetGUI(tk.Tk):
                 cmd += ["--osc-window", str(self.text_train_osc_window_var.get())]
             if abs(self.text_train_osc_threshold_var.get() - 0.55) > 0.001:
                 cmd += ["--osc-threshold", str(self.text_train_osc_threshold_var.get())]
+
+        # TDR 防护
+        cmd += ["--tdr-retry", "on" if self.text_train_tdr_retry_var.get() else "off"]
+        if self.text_train_tdr_retry_var.get() and self.text_train_tdr_retries_var.get() != 4:
+            cmd += ["--max-tdr-retries", str(self.text_train_tdr_retries_var.get())]
+
+        # Batch 探测
+        if self.text_train_batch_probe_var.get():
+            cmd.append("--batch-probe")
+            if self.text_train_probe_steps_var.get() != 3:
+                cmd += ["--probe-steps", str(self.text_train_probe_steps_var.get())]
+            if abs(self.text_train_probe_time_limit_var.get() - 1.5) > 0.05:
+                cmd += ["--probe-time-limit", str(self.text_train_probe_time_limit_var.get())]
+        else:
+            cmd.append("--no-batch-probe")
+
+        # 自动调优
+        if self.text_train_auto_tune_var.get():
+            cmd.append("--auto-tune")
+            if abs(self.text_train_step_time_limit_var.get() - 1.5) > 0.05:
+                cmd += ["--step-time-limit", str(self.text_train_step_time_limit_var.get())]
 
         # 学习率调度
         lr_schedule = self.text_train_lr_schedule_var.get()
@@ -1384,9 +1490,12 @@ class NeuralNetGUI(tk.Tk):
         row += 1
 
         # ── GPU 加速 ──
-        self.text_infer_gpu_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(f, text="启用 GPU 加速 (需要 Vulkan SDK)", variable=self.text_infer_gpu_var).grid(
-            row=row, column=0, columnspan=3, sticky="w")
+        self.text_infer_gpu_var = tk.StringVar(value="None")
+        gpu_frame = ttk.Frame(f)
+        gpu_frame.grid(row=row, column=0, columnspan=3, sticky="w")
+        ttk.Label(gpu_frame, text="GPU 加速:").pack(side="left")
+        ttk.Combobox(gpu_frame, textvariable=self.text_infer_gpu_var, values=["None", "Vulkan", "CUDA"],
+                     state="readonly", width=8).pack(side="left", padx=4)
         row += 1
 
         # ── 显示 Token ID ──
@@ -1470,7 +1579,10 @@ class NeuralNetGUI(tk.Tk):
             cmd += ["--prompt", prompt]
         if self.text_infer_show_tokens_var.get():
             cmd.append("--show-tokens")
-        if self.text_infer_gpu_var.get():
+        gpu_backend = self.text_infer_gpu_var.get()
+        if gpu_backend == "CUDA":
+            cmd.append("--cuda")
+        elif gpu_backend == "Vulkan":
             cmd.append("--gpu")
 
         self._log_text_infer(f"$ {' '.join(cmd)}\n")

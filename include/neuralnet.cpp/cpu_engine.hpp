@@ -30,6 +30,7 @@ public:
     // ── 批处理：CPU 为 no-op（同步执行） ──────────────────────────────────
     [[nodiscard]] Result<void> begin_batch() override { return {}; }
     [[nodiscard]] Result<void> end_batch() override { return {}; }
+    [[nodiscard]] Result<void> flush_batch() override { return {}; }
 
     // ── 张量工厂 ──────────────────────────────────────────────────────────
     [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols) override

@@ -2232,6 +2232,10 @@ private:
     Tensor pos_indices_cache_;             // (total, 1) 值为 [0,0,..,1,1,..,...,seq-1,..]
     std::size_t pos_indices_key_ = 0;      // 缓存键: (batch_size << 16) | seq_len
 
+    // batch 录制粒度：每隔 flush_interval_ 个 Transformer block 提交一次
+    // 0 = 不在 block 间 flush（默认），>0 = 每 N 个 block flush 一次
+    std::size_t flush_interval_ = 0;
+
 public:
     GPTModel(ComputeEngine& engine,
              std::size_t vocab_size, std::size_t d_model, std::size_t seq_len,
@@ -2378,11 +2382,17 @@ public:
 
         // ── 4. 通过 Transformer 块（全批量化，无 per-sample 循环） ──
         Tensor x = std::move(*x_result);
-        for (auto& blk : blocks_)
+        for (std::size_t bi = 0; bi < blocks_.size(); ++bi)
         {
-            auto r = blk.forward(engine, x);
+            auto r = blocks_[bi].forward(engine, x);
             if (!r) return r;
             x = std::move(*r);
+            // 按间隔 flush，将大录制拆分为多个小提交（防 TDR）
+            if (flush_interval_ > 0 && (bi + 1) % flush_interval_ == 0 && bi + 1 < blocks_.size())
+            {
+                auto fr = engine.flush_batch();
+                if (!fr) return std::unexpected(fr.error());
+            }
         }
 
         // ── 5. 最终 LayerNorm ──
@@ -2414,11 +2424,19 @@ public:
         grad_x = std::move(*b_ln);
 
         // ── 3. 逐块反向（全批量化） ──
-        for (auto it = blocks_.rbegin(); it != blocks_.rend(); ++it)
         {
-            auto br = it->backward(engine, grad_x);
-            if (!br) return br;
-            grad_x = std::move(*br);
+            const std::size_t n = blocks_.size();
+            for (std::size_t bi = 0; bi < n; ++bi)
+            {
+                auto br = blocks_[n - 1 - bi].backward(engine, grad_x);
+                if (!br) return br;
+                grad_x = std::move(*br);
+                if (flush_interval_ > 0 && (bi + 1) % flush_interval_ == 0 && bi + 1 < n)
+                {
+                    auto fr = engine.flush_batch();
+                    if (!fr) return std::unexpected(fr.error());
+                }
+            }
         }
 
         // ── 4. 转置 grad_x + pos_grad GPU 计算 ──
@@ -2470,6 +2488,10 @@ public:
         Matrix grad_input(seq_len, batch_size_, Scalar{0});
         return engine.from_matrix(grad_input);
     }
+
+    // ── batch 录制粒度控制 ──
+    void set_flush_interval(std::size_t interval) { flush_interval_ = interval; }
+    [[nodiscard]] std::size_t flush_interval() const noexcept { return flush_interval_; }
 
     // ── 采样生成（支持温度采样 + 贪心） ────────────────────────────
     // 注意: 此方法需要在 CPU 端采样，因此 forward 后会下载 logits。
@@ -2598,6 +2620,9 @@ private:
     Tensor stored_tokens_tensor_;          // token IDs 的 Tensor 版本 (GPU clone)
     std::size_t batch_size_ = 0;
 
+    // batch 录制粒度：每隔 flush_interval_ 个 Transformer block 提交一次
+    std::size_t flush_interval_ = 0;
+
 public:
     ALiBiGPTModel(ComputeEngine& engine,
                   std::size_t vocab_size, std::size_t d_model, std::size_t seq_len,
@@ -2683,11 +2708,16 @@ public:
 
         // ── 4. 通过 Transformer 块（全批量化，无 per-sample 循环） ──
         Tensor x = std::move(*x_result);
-        for (auto& blk : blocks_)
+        for (std::size_t bi = 0; bi < blocks_.size(); ++bi)
         {
-            auto r = blk.forward(engine, x);
+            auto r = blocks_[bi].forward(engine, x);
             if (!r) return r;
             x = std::move(*r);
+            if (flush_interval_ > 0 && (bi + 1) % flush_interval_ == 0 && bi + 1 < blocks_.size())
+            {
+                auto fr = engine.flush_batch();
+                if (!fr) return std::unexpected(fr.error());
+            }
         }
 
         // ── 5. 最终 LayerNorm ──
@@ -2717,11 +2747,19 @@ public:
         grad_x = std::move(*b_ln);
 
         // ── 3. 逐块反向（全批量化） ──
-        for (auto it = blocks_.rbegin(); it != blocks_.rend(); ++it)
         {
-            auto br = it->backward(engine, grad_x);
-            if (!br) return br;
-            grad_x = std::move(*br);
+            const std::size_t n = blocks_.size();
+            for (std::size_t bi = 0; bi < n; ++bi)
+            {
+                auto br = blocks_[n - 1 - bi].backward(engine, grad_x);
+                if (!br) return br;
+                grad_x = std::move(*br);
+                if (flush_interval_ > 0 && (bi + 1) % flush_interval_ == 0 && bi + 1 < n)
+                {
+                    auto fr = engine.flush_batch();
+                    if (!fr) return std::unexpected(fr.error());
+                }
+            }
         }
 
         // ── 4. 转置 grad_x + CPU 辅助 ──
@@ -2738,6 +2776,10 @@ public:
         Matrix grad_input(seq_len, batch_size_, Scalar{0});
         return engine.from_matrix(grad_input);
     }
+
+    // ── batch 录制粒度控制 ──
+    void set_flush_interval(std::size_t interval) { flush_interval_ = interval; }
+    [[nodiscard]] std::size_t flush_interval() const noexcept { return flush_interval_; }
 
     // ── 采样生成（支持温度采样 + 贪心） ────────────────────────────
     [[nodiscard]] Result<std::vector<std::size_t>>

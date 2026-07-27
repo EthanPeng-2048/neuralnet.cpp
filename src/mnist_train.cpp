@@ -55,6 +55,7 @@ void print_usage(const char *prog)
         << "  --optimizer <name> 优化器: sgd/sgd_momentum/adam/adamw/muon (默认: adam)\n"
         << "  --weight-decay <w> AdamW 权重衰减系数 (默认: 0.01)\n"
         << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
+        << "  --cuda             启用 CUDA GPU 加速 (需要 CUDA Toolkit)\n"
         << "  --max-samples <n>  限制训练样本数 (用于快速测试, 默认: 全部)\n"
         << "  --shuffle-steps <true|false>  每 epoch 打乱 batch 顺序 (默认: true)\n"
         << "\n"
@@ -95,6 +96,7 @@ struct TrainConfig
     std::size_t batch_size = 64;
     bool load_existing = false;
     bool gpu_enabled = false;
+    bool cuda_enabled = false;
     int max_train_samples = -1;  // -1 表示使用全部
     bool shuffle_steps = true;   // 每 epoch 打乱 batch 顺序
 
@@ -257,6 +259,10 @@ TrainConfig parse_args(int argc, char *argv[])
         else if (arg == "--gpu")
         {
             cfg.gpu_enabled = true;
+        }
+        else if (arg == "--cuda")
+        {
+            cfg.cuda_enabled = true;
         }
         else if (arg == "--shuffle-steps" && i + 1 < argc)
         {
@@ -622,7 +628,29 @@ int main(int argc, char *argv[])
 #ifdef NN_HAS_VULKAN
     nn::GpuBackend *gpu_backend = nullptr;
 #endif
-    if (cfg.gpu_enabled)
+    if (cfg.cuda_enabled)
+    {
+#ifdef NN_HAS_CUDA
+        auto &cuda_backend = nn::CudaBackend::instance();
+        auto cuda_init = cuda_backend.initialize();
+        if (cuda_init)
+        {
+            engine = std::make_unique<nn::CudaEngine>(cuda_backend);
+            const auto& props = cuda_backend.device_props();
+            std::cout << "CUDA GPU 加速已启用 (" << props.name << ")\n\n";
+        }
+        else
+        {
+            std::cerr << "CUDA 初始化失败: " << cuda_init.error().message << "\n";
+            std::cerr << "回退到 CPU 模式\n\n";
+            engine = std::make_unique<nn::CpuEngine>();
+        }
+#else
+        std::cerr << "未编译 CUDA 支持，使用 CPU 模式\n\n";
+        engine = std::make_unique<nn::CpuEngine>();
+#endif
+    }
+    else if (cfg.gpu_enabled)
     {
 #ifdef NN_HAS_VULKAN
         auto &backend = nn::GpuBackend::instance();

@@ -31,6 +31,9 @@
 #ifdef NN_HAS_VULKAN
 #include "gpu_engine.hpp"
 #endif
+#ifdef NN_HAS_CUDA
+#include "cuda_engine.hpp"
+#endif
 #include "compute_layer.hpp"
 #include "compute_loss.hpp"
 #include "compute_optimizer.hpp"
