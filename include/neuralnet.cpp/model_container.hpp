@@ -179,6 +179,19 @@ public:
         return *layers_[index];
     }
 
+    // ── batch 录制粒度：在 Transformer block 间按间隔 flush ──
+    // 对 GPTModel / ALiBiGPTModel 有效，其他层类型静默忽略。
+    void set_flush_interval(std::size_t interval)
+    {
+        for (auto& layer : layers_)
+        {
+            if (auto* gpt = dynamic_cast<GPTModel*>(layer.get()))
+                gpt->set_flush_interval(interval);
+            else if (auto* alibi = dynamic_cast<ALiBiGPTModel*>(layer.get()))
+                alibi->set_flush_interval(interval);
+        }
+    }
+
     // ── 前向传播：Tensor → Tensor（全程不离开 engine 设备） ───────────────
     [[nodiscard]] Result<Tensor> forward(const Tensor& input)
     {

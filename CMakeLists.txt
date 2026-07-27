@@ -172,3 +172,46 @@ if(NN_BUILD_TESTS)
         add_test(NAME test_const_span COMMAND test_const_span)
     endif()
 endif()
+
+# ── CUDA GPU 加速（可选）──────────────────────────────────────────────────
+# CUDA 内核由 nvcc 编译为独立静态库，通过 C-linkage 接口链接到 Clang 主程序。
+# 在 Windows 上 nvcc 使用 MSVC 作为 host 编译器，与 LLVM/Clang 通过 C ABI 兼容。
+option(NN_ENABLE_CUDA "Enable CUDA GPU acceleration" OFF)
+if(NN_ENABLE_CUDA)
+    find_package(CUDAToolkit QUIET)
+    if(NOT CUDAToolkit_FOUND)
+        message(WARNING "CUDA Toolkit not found. GPU acceleration disabled.")
+    else()
+        add_subdirectory(cuda)
+        if(NN_CUDA_FOUND)
+        set(NN_CUDA_TARGETS
+            mnist_train mnist_infer mnist_bench
+            text_train text_infer
+            tokenizer_train tokenizer_infer
+            compute_bench bench_thresholds gpu_test
+        )
+
+        foreach(TARGET ${NN_CUDA_TARGETS})
+            target_compile_definitions(${TARGET} PRIVATE NN_HAS_CUDA)
+                target_include_directories(${TARGET} PRIVATE
+                    ${NN_CUDA_INCLUDE_DIR}
+                    ${CUDAToolkit_INCLUDE_DIRS}
+                )
+                # nvcc 编译的 .obj + CUDA 运行时 + cuBLAS + nvrtc
+                target_link_libraries(${TARGET} PRIVATE
+                    ${NN_CUDA_KERNELS_OBJ}
+                    CUDA::cudart
+                    CUDA::cuda_driver
+                    CUDA::nvrtc
+                )
+                add_dependencies(${TARGET} compile_cuda_kernels)
+            endforeach()
+
+            message(STATUS "CUDA GPU acceleration enabled (nvcc → obj → link)")
+        else()
+            message(WARNING "CUDA not built. GPU acceleration disabled.")
+        endif()
+    endif()
+else()
+    message(STATUS "CUDA disabled. Use -DNN_ENABLE_CUDA=ON to enable.")
+endif()

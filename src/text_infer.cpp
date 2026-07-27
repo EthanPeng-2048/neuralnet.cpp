@@ -39,6 +39,7 @@ void print_usage(const char *prog)
         << "  --max-tokens <n>     最大生成 token 数 (默认: 200)\n"
         << "  --temperature <t>    温度参数 (默认: 1.0, 0=贪心)\n"
         << "  --gpu                启用 GPU 加速 (需要 Vulkan SDK)\n"
+        << "  --cuda               启用 CUDA GPU 加速 (需要 CUDA Toolkit)\n"
         << "  --show-tokens        显示 token ID (调试用)\n"
         << "  --help               显示此帮助信息\n";
 }
@@ -54,6 +55,7 @@ struct InferConfig
     bool interactive = false;
     bool show_tokens = false;
     bool gpu_enabled = false;
+    bool cuda_enabled = false;
 };
 
 InferConfig parse_args(int argc, char *argv[])
@@ -89,6 +91,8 @@ InferConfig parse_args(int argc, char *argv[])
         }
         else if (arg == "--gpu")
             cfg.gpu_enabled = true;
+        else if (arg == "--cuda")
+            cfg.cuda_enabled = true;
         else if (arg == "--show-tokens")
             cfg.show_tokens = true;
         else if (!arg.starts_with("--"))
@@ -135,7 +139,12 @@ void interactive_mode(nn::Model &model, nn::ComputeEngine &engine,
 {
     const std::size_t bos_id = tokenizer.bos_id();
     const std::size_t eos_id = tokenizer.eos_id();
-    std::cout << "GPT 交互式生成 (输入 'quit' 退出)\n\n";
+    const bool has_dialogue = tokenizer.has_dialogue_markers();
+
+    if (has_dialogue)
+        std::cout << "GPT 交互式对话 (输入 'quit' 退出)\n\n";
+    else
+        std::cout << "GPT 交互式生成 (输入 'quit' 退出)\n\n";
 
     while (true)
     {
@@ -148,10 +157,36 @@ void interactive_mode(nn::Model &model, nn::ComputeEngine &engine,
         if (prompt.empty())
             prompt = " ";
 
-        auto prompt_tokens = tokenizer.encode(prompt);
-        // 添加 BOS 前缀，使推理输入格式与训练时一致（训练时每行以 BOS 开头）
+        // 构建 prompt tokens
+        std::vector<std::size_t> prompt_tokens;
         if (bos_id != nn::Tokenizer::npos)
-            prompt_tokens.insert(prompt_tokens.begin(), bos_id);
+            prompt_tokens.push_back(bos_id);
+
+        if (has_dialogue)
+        {
+            // 对话模式：包裹 <system>/<user>/<assistant> 标记，与训练时格式一致
+            // 训练格式: [BOS]<system>...</system><user>...</user><assistant>...
+            const std::string system_tag    = "<system>";
+            const std::string end_sys_tag   = "</system>";
+            const std::string user_tag      = "<user>";
+            const std::string end_user_tag  = "</user>";
+            const std::string asst_tag      = "<assistant>";
+
+            const std::string system_prompt = "你是一个有用的AI助手。";
+            auto sys_tokens  = tokenizer.encode(system_tag + system_prompt + end_sys_tag);
+            auto user_tokens = tokenizer.encode(user_tag + prompt + end_user_tag);
+            auto asst_tokens = tokenizer.encode(asst_tag);
+
+            prompt_tokens.insert(prompt_tokens.end(), sys_tokens.begin(), sys_tokens.end());
+            prompt_tokens.insert(prompt_tokens.end(), user_tokens.begin(), user_tokens.end());
+            prompt_tokens.insert(prompt_tokens.end(), asst_tokens.begin(), asst_tokens.end());
+        }
+        else
+        {
+            // 普通模式：仅 BOS + 编码文本（与训练时每行格式一致）
+            auto text_tokens = tokenizer.encode(prompt);
+            prompt_tokens.insert(prompt_tokens.end(), text_tokens.begin(), text_tokens.end());
+        }
 
         std::cout << "生成中...\n";
         auto gen_result = generate_text(model, engine, prompt_tokens,
@@ -159,17 +194,30 @@ void interactive_mode(nn::Model &model, nn::ComputeEngine &engine,
         if (!gen_result) { std::cerr << "Error: " << gen_result.error().message << '\n'; continue; }
         auto generated = std::move(*gen_result);
 
-        std::cout << "\n" << prompt << tokenizer.decode(generated) << "\n\n";
+        // 过滤尾部的 </assistant> 标记（避免显示在输出中）
+        if (has_dialogue)
+        {
+            const std::string end_asst = "</assistant>";
+            auto decoded = tokenizer.decode(generated);
+            auto pos = decoded.find(end_asst);
+            if (pos != std::string::npos)
+                decoded = decoded.substr(0, pos);
+            std::cout << "\n" << decoded << "\n\n";
+        }
+        else
+        {
+            std::cout << "\n" << tokenizer.decode(generated) << "\n\n";
+        }
 
         if (cfg.show_tokens)
         {
-            std::cout << "Tokens: [";
+            std::cout << "Prompt tokens: [";
             for (std::size_t i = 0; i < prompt_tokens.size(); ++i)
             {
                 if (i > 0) std::cout << ", ";
                 std::cout << prompt_tokens[i];
             }
-            std::cout << " -> ";
+            std::cout << "]\nGenerated tokens: [";
             for (std::size_t i = 0; i < generated.size(); ++i)
             {
                 if (i > 0) std::cout << ", ";
@@ -205,7 +253,29 @@ int main(int argc, char *argv[])
 #ifdef NN_HAS_VULKAN
     nn::GpuBackend *gpu_backend = nullptr;
 #endif
-    if (cfg.gpu_enabled)
+    if (cfg.cuda_enabled)
+    {
+#ifdef NN_HAS_CUDA
+        auto &cuda_backend = nn::CudaBackend::instance();
+        auto cuda_init = cuda_backend.initialize();
+        if (cuda_init)
+        {
+            engine = std::make_unique<nn::CudaEngine>(cuda_backend);
+            const auto& props = cuda_backend.device_props();
+            std::cout << "CUDA GPU 加速已启用 (" << props.name << ")\n";
+        }
+        else
+        {
+            std::cerr << "CUDA 初始化失败: " << cuda_init.error().message
+                      << "\n回退到 CPU 模式\n";
+            engine = std::make_unique<nn::CpuEngine>();
+        }
+#else
+        std::cerr << "未编译 CUDA 支持，使用 CPU 模式\n";
+        engine = std::make_unique<nn::CpuEngine>();
+#endif
+    }
+    else if (cfg.gpu_enabled)
     {
 #ifdef NN_HAS_VULKAN
         auto &backend = nn::GpuBackend::instance();

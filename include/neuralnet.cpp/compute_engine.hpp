@@ -88,6 +88,13 @@ public:
     [[nodiscard]] virtual Result<void> begin_batch() = 0;
     [[nodiscard]] virtual Result<void> end_batch() = 0;
 
+    // ── 批处理中点刷新（防 TDR） ─────────────────────────────────────────
+    // GPU 引擎：提交当前 command buffer 并等待完成，然后自动开始新的录制。
+    // 可在 forward 与 backward 之间调用，将一次大提交拆分为多次小提交，
+    // 避免单次提交时间过长触发 Windows TDR。
+    // CPU 引擎：no-op。
+    [[nodiscard]] virtual Result<void> flush_batch() { return {}; }
+
     // ── 张量工厂 ──────────────────────────────────────────────────────────
     [[nodiscard]] virtual Tensor create_tensor(std::size_t rows, std::size_t cols) = 0;
     [[nodiscard]] virtual Result<Tensor> from_matrix(const Matrix& m) = 0;

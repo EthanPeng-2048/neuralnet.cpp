@@ -62,6 +62,13 @@ public:
         return backend_.end_batch();
     }
 
+    // ── 中点刷新：提交当前 command buffer 并开始新的录制 ──
+    // 用于拆分大 batch（如 forward 与 backward 之间），防 TDR。
+    [[nodiscard]] Result<void> flush_batch() override
+    {
+        return backend_.flush_batch();
+    }
+
     // batch 模式查询（内部使用，to_matrix/from_matrix 需检查）
     [[nodiscard]] bool in_batch() const noexcept { return backend_.in_batch(); }
 

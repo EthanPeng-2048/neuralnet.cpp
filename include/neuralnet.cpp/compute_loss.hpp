@@ -198,6 +198,114 @@ public:
     {
         return grad_input_;
     }
+
+    // ── 稀疏标签版 forward：接受整数标签而非 one-hot 矩阵 ──────────
+    //
+    // 解决大词表（vocab_size≈25k）+ 大 batch 时 one-hot 矩阵
+    // (vocab_size, total_tokens) 爆显存的问题。
+    //
+    // 算法：
+    //   1. 在 GPU 上计算 softmax（与 dense 版相同）
+    //   2. 下载 softmax 到 CPU（唯一的大数据传输）
+    //   3. 在 CPU 上用整数标签计算 loss 和 gradient
+    //      loss = -(1/N) * Σ log(softmax[labels[i], i])
+    //      grad = softmax;  grad[labels[i]][i] -= 1.0（对有效位置）
+    //   4. 将 gradient 上传回 GPU
+    //
+    // 参数：
+    //   labels     — 平坦标签数组，大小 = logits.cols()，值域 [0, vocab_size)
+    //   loss_mask  — 可选，平坦 mask 数组，>0.5 表示参与 loss，否则清零梯度
+    //   vocab_size — 词表大小，用于越界检查
+    [[nodiscard]] Result<Scalar> forward_sparse(
+        ComputeEngine& engine, const Tensor& logits,
+        std::span<const std::size_t> labels,
+        std::span<const Scalar> loss_mask = {},
+        std::size_t vocab_size = 0)
+    {
+        const std::size_t classes = logits.rows();
+        const std::size_t total   = logits.cols();
+
+        if (vocab_size == 0) vocab_size = classes;
+        if (labels.size() != total)
+            return std::unexpected(Error{"sparse CE: labels size mismatch"});
+        if (!loss_mask.empty() && loss_mask.size() != total)
+            return std::unexpected(Error{"sparse CE: mask size mismatch"});
+        if (classes == 0 || total == 0)
+            return std::unexpected(Error{"sparse CE: empty input"});
+
+        // ── 1. GPU 上计算 softmax（复用原 dense forward 的逻辑） ────
+        auto col_max = engine.col_reduce_max(logits);
+        if (!col_max) return std::unexpected(col_max.error());
+
+        auto shifted = clone_tensor(engine, logits);
+        if (!shifted) return std::unexpected(shifted.error());
+        auto r = engine.broadcast_col_inplace(*shifted, *col_max, BinaryOp::Sub);
+        if (!r) return std::unexpected(r.error());
+
+        auto exp_shift = engine.elementwise_unary(UnaryOp::Exp, *shifted);
+        if (!exp_shift) return std::unexpected(exp_shift.error());
+
+        auto col_sum = engine.col_reduce_sum(*exp_shift);
+        if (!col_sum) return std::unexpected(col_sum.error());
+
+        // softmax in-place 于 exp_shift 上，省一次 (vocab, total) 分配
+        r = engine.broadcast_col_inplace(*exp_shift, *col_sum, BinaryOp::Div);
+        if (!r) return std::unexpected(r.error());
+
+        // ── 2. 下载 softmax 到 CPU ────────────────────────────────
+        auto softmax_cpu = engine.to_matrix(*exp_shift);
+        if (!softmax_cpu) return std::unexpected(softmax_cpu.error());
+
+        // exp_shift (即 softmax) 现在可以释放
+        exp_shift = Tensor();
+
+        // ── 3. CPU 上计算 loss 和 gradient ────────────────────────
+        const std::size_t rows = softmax_cpu->rows();
+        const std::size_t cols = softmax_cpu->cols();
+
+        // gradient 拷贝 softmax（后面只修改稀疏位置）
+        Matrix grad_cpu(*softmax_cpu);
+
+        Scalar loss_sum = 0.0;
+        const bool use_mask = !loss_mask.empty();
+
+        for (std::size_t i = 0; i < cols; ++i)
+        {
+            // mask 检查
+            if (use_mask && loss_mask[i] < Scalar{0.5})
+            {
+                // 被 mask 的位置：gradient 整列清零
+                for (std::size_t c = 0; c < rows; ++c)
+                    grad_cpu.set_value_unchecked(c, i, 0.0);
+                continue;
+            }
+
+            const std::size_t lbl = labels[i];
+            if (lbl >= vocab_size)
+            {
+                // 越界标签：跳过 loss，gradient 整列清零
+                for (std::size_t c = 0; c < rows; ++c)
+                    grad_cpu.set_value_unchecked(c, i, 0.0);
+                continue;
+            }
+
+            // loss += log(softmax[lbl, i])
+            const Scalar sm_val = softmax_cpu->at_unchecked(lbl, i);
+            loss_sum += std::log(std::max(sm_val, Scalar{1e-20}));
+
+            // gradient: softmax[lbl, i] -= 1.0（softmax - one_hot 的稀疏等价）
+            grad_cpu.set_value_unchecked(lbl, i, sm_val - Scalar{1});
+        }
+
+        const Scalar loss = -loss_sum / static_cast<Scalar>(total);
+
+        // ── 4. 上传 gradient 到 GPU ──────────────────────────────
+        auto grad_tensor_r = engine.from_matrix(grad_cpu);
+        if (!grad_tensor_r) return std::unexpected(grad_tensor_r.error());
+
+        grad_input_ = std::move(*grad_tensor_r);
+        return loss;
+    }
 };
 
 } // namespace nn
