@@ -19,8 +19,9 @@
 //   除 batch 边界外，无 PCIe 传输。
 //
 // 同步模型：
-//   当前不使用 batch 录制模式（每次操作同步完成），以保证正确性。
-//   begin_batch/end_batch 为 no-op。
+//   batch 录制模式已启用：begin_batch 后所有原语录制到共享 command buffer，
+//   end_batch 一次 vkQueueSubmit + vkWaitForFences，消除 per-primitive 同步开销。
+//   to_matrix/from_matrix 会打断 batch（flush 后自动重新 begin_batch）。
 //
 // 原地操作语义：
 //   add_inplace / scale_inplace / broadcast_*_inplace 采用"分配新 buffer +
@@ -69,9 +70,6 @@ public:
         return backend_.flush_batch();
     }
 
-    // batch 模式查询（内部使用，to_matrix/from_matrix 需检查）
-    [[nodiscard]] bool in_batch() const noexcept { return backend_.in_batch(); }
-
     // ══════════════════════════════════════════════════════════════════════
     // 张量工厂（纯 GPU：全部创建/上传为 GPU Tensor）
     // ══════════════════════════════════════════════════════════════════════
@@ -90,6 +88,16 @@ public:
 
     [[nodiscard]] Result<Tensor> from_matrix(const Matrix& m) override
     {
+        // batch 模式下必须先 flush（提交并等待），否则 upload_blocking 会
+        // 独立提交 command buffer 到队列，与正在录制的 batch 产生竞争。
+        // flush 后自动重新 begin_batch，保持 batch 上下文不断裂。
+        if (in_batch())
+        {
+            auto r = end_batch();
+            if (!r) return std::unexpected(r.error());
+            auto rb = begin_batch();
+            if (!rb) return std::unexpected(rb.error());
+        }
         // 上传 CPU Matrix → GPU Tensor（PCIe 上传，唯一的上传点）
         auto r = GpuTensor::from_matrix(m, backend_);
         if (!r)
@@ -123,6 +131,14 @@ public:
             dst = Tensor::from_matrix(Matrix(src));
             return {};
         }
+        // batch 模式下必须先 flush（与 from_matrix 同理，upload_blocking 独立提交）
+        if (in_batch())
+        {
+            auto r = end_batch();
+            if (!r) return std::unexpected(r.error());
+            auto rb = begin_batch();
+            if (!rb) return std::unexpected(rb.error());
+        }
         return backend_.upload_blocking(dst.gpu_tensor(), src.span());
     }
 
@@ -151,23 +167,12 @@ public:
     }
 
     // ── 行插入：GPU 内就地写入连续行区间 ──
-    // 注意：若 dst 为 CPU（防御性路径），回退到上传-拷贝-替换流程。
-    // 正常路径下 dst 已是 GPU Tensor，直接就地修改 buffer。
+    // 纯 GPU 架构：dst 必须为 GPU Tensor，不再回退 CPU 路径（原 cpu_fallback 已删除）。
     [[nodiscard]] Result<void> insert_rows(
         Tensor& dst, std::size_t dst_start_row, const Tensor& src) override
     {
         if (dst.is_cpu())
-        {
-            // 防御性路径：dst 为 CPU，先确保 src 也在 CPU（下载）
-            if (!src.is_cpu())
-            {
-                auto sm = to_matrix(src);
-                if (!sm) return std::unexpected(sm.error());
-                Tensor src_cpu = Tensor::from_matrix(Matrix(*sm));
-                return insert_rows_cpu_fallback(dst, dst_start_row, src_cpu);
-            }
-            return insert_rows_cpu_fallback(dst, dst_start_row, src);
-        }
+            return std::unexpected(Error{"insert_rows: dst must be GPU tensor in pure-GPU architecture"});
         auto src_gpu = ensure_gpu(src);
         if (!src_gpu) return std::unexpected(src_gpu.error());
         return backend_.insert_rows_gpu(dst.gpu_tensor(), dst_start_row, src_gpu->gpu_tensor());
@@ -207,24 +212,8 @@ public:
     }
 
 private:
-    // CPU 路径回退（dst 为 CPU Tensor 时使用）
-    [[nodiscard]] Result<void> insert_rows_cpu_fallback(
-        Tensor& dst, std::size_t dst_start_row, const Tensor& src)
-    {
-        Matrix& d = dst.cpu_matrix();
-        const Matrix& s = src.cpu_matrix();
-        if (d.cols() != s.cols())
-            return std::unexpected(Error{"insert_rows: column count mismatch"});
-        if (dst_start_row + s.rows() > d.rows())
-            return std::unexpected(Error{"insert_rows: range out of bounds"});
-        const auto dst_span = d.span();
-        const auto src_span = s.span();
-        const std::size_t cols = d.cols();
-        for (std::size_t r = 0; r < s.rows(); ++r)
-            std::copy_n(src_span.begin() + r * cols, cols,
-                        dst_span.begin() + (dst_start_row + r) * cols);
-        return {};
-    }
+    // batch 模式查询（内部使用，to_matrix/from_matrix 需检查）
+    [[nodiscard]] bool in_batch() const noexcept { return backend_.in_batch(); }
 
 public:
 

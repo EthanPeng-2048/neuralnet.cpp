@@ -144,7 +144,8 @@ int main(int argc, char *argv[])
     std::cout << "========================================\n" << std::endl;
 
     // 根据分词器类型调用对应训练接口（BPE 和 CharBPE 接口签名一致）
-    // 使用 if constexpr 避免 static_cast 向下转型，每个类型路径独立实例化
+    // 使用 static_cast 向下转型以调用各子类特有的 train(text, Config) 重载，
+    // 避免在基类 Tokenizer 中暴露子类专属的 Config 参数。
     auto t_start = std::chrono::steady_clock::now();
     nn::Result<void> train_result;
     if (cfg.tokenizer_type == "charbpe")

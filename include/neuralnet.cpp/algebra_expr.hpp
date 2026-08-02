@@ -239,6 +239,11 @@ template <BoolExpression Cond>
 // 模板运算符：Scalar op Expression / Expression op Scalar
 // 用于复合表达式中的标量与任意表达式类型的运算
 // 例如：1.0f + exp(x) → BinaryExpr<Val, UnaryExpr<...>, ops::Add>
+//
+// 注：C++ 模板推导要求 Scalar/Expr 左右位置分别定义，无法合并。
+// 模板实参推导不会自动尝试 (Scalar, Expr) ↔ (Expr, Scalar) 的对称转换，
+// 因此 operator+(Scalar, Expr) 和 operator+(Expr, Scalar) 必须分别定义。
+// 下面 22 个运算符重载按 Scalar op Expr、Expr op Scalar、Expr op Expr 三组排列。
 // ══════════════════════════════════════════════════════════════════════════
 
 // ── Scalar + Expression ──────────────────────────────────────────────────

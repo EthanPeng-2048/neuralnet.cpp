@@ -110,8 +110,10 @@ private:
     {
         std::size_t operator()(const SuballocKey& k) const noexcept
         {
+            // Knuth 黄金比例散列常数（64-bit），用于打散相邻 key 的散列值
+            constexpr std::size_t KNUTH_GOLDEN = 0x9E3779B97F4A7C15ULL;
             return std::hash<VkDeviceMemory>{}(k.memory) ^
-                   (std::hash<VkDeviceSize>{}(k.offset) * 2654435761ULL);
+                   (std::hash<VkDeviceSize>{}(k.offset) * KNUTH_GOLDEN);
         }
     };
 
@@ -148,6 +150,9 @@ private:
         return std::nullopt;
     }
 
+    // 注：Block 的移动赋值被 delete（防止 vector 操作引发意外释放），
+    // 但移动构造可用。此处 `return block;` 经由移动构造构造 std::expected<Block, Error>，
+    // 不触发移动赋值，故可正常编译。
     [[nodiscard]] Result<Block> create_block(
         uint32_t memory_type_index, VkMemoryPropertyFlags flags, VkDeviceSize size = 0)
     {

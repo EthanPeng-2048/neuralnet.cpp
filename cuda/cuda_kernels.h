@@ -31,6 +31,16 @@ int cuda_matmul(
     int transA, int transB,
     void* stream);
 
+// 带预创建 cuBLAS 句柄的 matmul（避免每次调用创建/销毁句柄的开销）
+// handle_ptr: cuBLAS 句柄指针（由 CudaBackend 创建并复用），nullptr 时退化为 cuda_matmul
+// 注：当未启用 NN_HAS_CUBLAS 时，本函数退化为自定义内核（忽略 handle_ptr）
+int cuda_matmul_with_handle(
+    const float* A, const float* B, float* C,
+    std::size_t A_rows, std::size_t A_cols,
+    std::size_t B_rows, std::size_t B_cols,
+    int transA, int transB,
+    void* handle_ptr);
+
 // 批量矩阵乘法：对每个 batch 计算 C_b = op(A_b, B_b)，结果垂直堆叠
 // A: (batch * a_rows_per, A_cols), B: (batch * b_rows_per, B_cols)
 // C: (batch * M, N)

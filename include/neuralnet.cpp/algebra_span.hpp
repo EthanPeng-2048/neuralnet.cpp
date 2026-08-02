@@ -62,82 +62,9 @@ public:
         return Span{data_ + offset, size_ - offset};
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    // 运算符重载：Span OP Scalar → BinaryExpr
-    // ══════════════════════════════════════════════════════════════════════
-
-    [[nodiscard]] constexpr auto operator+(Scalar s) const
-    {
-        return BinaryExpr<Span, Val, ops::Add>{*this, Val{s}};
-    }
-
-    [[nodiscard]] constexpr auto operator-(Scalar s) const
-    {
-        return BinaryExpr<Span, Val, ops::Sub>{*this, Val{s}};
-    }
-
-    [[nodiscard]] constexpr auto operator*(Scalar s) const
-    {
-        return BinaryExpr<Span, Val, ops::Mul>{*this, Val{s}};
-    }
-
-    [[nodiscard]] constexpr auto operator/(Scalar s) const
-    {
-        return BinaryExpr<Span, Val, ops::Div>{*this, Val{s}};
-    }
-
-    [[nodiscard]] constexpr auto operator>(Scalar s) const
-    {
-        return BinaryExpr<Span, Val, ops::Gt>{*this, Val{s}};
-    }
-
-    [[nodiscard]] constexpr auto operator<(Scalar s) const
-    {
-        return BinaryExpr<Span, Val, ops::Lt>{*this, Val{s}};
-    }
-
-    [[nodiscard]] constexpr auto operator>=(Scalar s) const
-    {
-        return BinaryExpr<Span, Val, ops::Ge>{*this, Val{s}};
-    }
-
-    [[nodiscard]] constexpr auto operator<=(Scalar s) const
-    {
-        return BinaryExpr<Span, Val, ops::Le>{*this, Val{s}};
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 运算符重载：Span OP Span → BinaryExpr
-    // ══════════════════════════════════════════════════════════════════════
-
-    [[nodiscard]] constexpr auto operator+(const Span &other) const
-    {
-        return BinaryExpr<Span, Span, ops::Add>{*this, other};
-    }
-
-    [[nodiscard]] constexpr auto operator-(const Span &other) const
-    {
-        return BinaryExpr<Span, Span, ops::Sub>{*this, other};
-    }
-
-    [[nodiscard]] constexpr auto operator*(const Span &other) const
-    {
-        return BinaryExpr<Span, Span, ops::Mul>{*this, other};
-    }
-
-    [[nodiscard]] constexpr auto operator/(const Span &other) const
-    {
-        return BinaryExpr<Span, Span, ops::Div>{*this, other};
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // 一元运算符
-    // ══════════════════════════════════════════════════════════════════════════
-
-    [[nodiscard]] constexpr auto operator-() const
-    {
-        return UnaryExpr<Span, ops::Neg>{*this};
-    }
+    // 注：Span 不定义成员运算符，所有 AST 构造由 expr.hpp 中的
+    // 自由函数模板 operator+/-/*/>/< 等（基于 Expression 概念）统一处理。
+    // 这保证 Span 与 ConstSpan/Val/任意 Expression 都能自然组合。
 };
 
 // ══════════════════════════════════════════════════════════════════════════

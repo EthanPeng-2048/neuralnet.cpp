@@ -6,6 +6,7 @@
 //   2. 使用 float 类型（Scalar = float）
 //   3. 所有内核接受 CUDA stream 参数以支持异步执行
 //   4. 使用 cuBLAS 加速 matmul（通过 NN_HAS_CUBLAS 宏控制）
+//   5. cuBLAS 句柄由调用方（CudaBackend）管理并复用，避免每次调用创建/销毁
 // ─────────────────────────────────────────────────────────────────────────
 
 #include "cuda_kernels.h"
@@ -39,6 +40,19 @@
             return;                                                            \
         }                                                                       \
     } while (0)
+
+#ifdef NN_HAS_CUBLAS
+// cuBLAS 错误检查宏（将 cublasStatus_t 转为负数返回值）
+#define CUBLAS_CHECK(call)                                                     \
+    do {                                                                        \
+        cublasStatus_t st = (call);                                            \
+        if (st != CUBLAS_STATUS_SUCCESS) {                                     \
+            fprintf(stderr, "cuBLAS error at %s:%d: %d\n",                     \
+                    __FILE__, __LINE__, static_cast<int>(st));                 \
+            return static_cast<int>(-st);                                      \
+        }                                                                       \
+    } while (0)
+#endif
 
 // ══════════════════════════════════════════════════════════════════════════
 // 矩阵乘法内核
@@ -308,30 +322,58 @@ __global__ void reduce_row_max_kernel(
         out[r] = sdata[0];
 }
 
+// 列归约（每个 block 处理一列，shared memory tree reduction）
+// 与 reduce_row_*_kernel 对称：blockIdx.x = c（列号），线程协作归约所有行。
+// 行主序矩阵 A[r * cols + c]：同一列的元素在内存中 stride=cols，
+// 不连续访问，但通过线程级并行 + shared memory 树形归约仍优于单线程串行。
 __global__ void reduce_col_sum_kernel(
     const float* __restrict__ A, float* __restrict__ out,
     unsigned int rows, unsigned int cols)
 {
-    const unsigned int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int c = blockIdx.x;
     if (c >= cols) return;
 
+    extern __shared__ float sdata[];
     float sum = 0.0f;
-    for (unsigned int r = 0; r < rows; ++r)
+    for (unsigned int r = threadIdx.x; r < rows; r += blockDim.x)
         sum += A[r * cols + c];
-    out[c] = sum;
+
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s)
+            sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0)
+        out[c] = sdata[0];
 }
 
 __global__ void reduce_col_max_kernel(
     const float* __restrict__ A, float* __restrict__ out,
     unsigned int rows, unsigned int cols)
 {
-    const unsigned int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int c = blockIdx.x;
     if (c >= cols) return;
 
+    extern __shared__ float sdata[];
     float val = -FLT_MAX;
-    for (unsigned int r = 0; r < rows; ++r)
+    for (unsigned int r = threadIdx.x; r < rows; r += blockDim.x)
         val = fmaxf(val, A[r * cols + c]);
-    out[c] = val;
+
+    sdata[threadIdx.x] = val;
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s)
+            sdata[threadIdx.x] = fmaxf(sdata[threadIdx.x], sdata[threadIdx.x + s]);
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0)
+        out[c] = sdata[0];
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -477,12 +519,17 @@ static cudaStream_t to_stream(void* s)
 
 // ── 矩阵乘法 ─────────────────────────────────────────────────────────────
 
-extern "C" int cuda_matmul(
+// 内部辅助：使用预创建的 cuBLAS 句柄执行 Sgemm（行主序 → 列主序转换）
+// 行主序矩阵 A(A_rows × A_cols) 在内存中按行存储，行步长 = A_cols。
+// cuBLAS 按列主序读取时，看到的是 (A_cols × A_rows) 的矩阵，leading dim = A_cols。
+// 关键：leading dim 是内存布局属性，与 transA/transB（逻辑转置）无关，始终等于行步长。
+#ifdef NN_HAS_CUBLAS
+static int cublas_matmul_impl(
+    cublasHandle_t handle,
     const float* A, const float* B, float* C,
     std::size_t A_rows, std::size_t A_cols,
     std::size_t B_rows, std::size_t B_cols,
-    int transA, int transB,
-    void* stream)
+    int transA, int transB)
 {
     const int M = static_cast<int>(transA ? A_cols : A_rows);
     const int K = static_cast<int>(transA ? A_rows : A_cols);
@@ -491,51 +538,87 @@ extern "C" int cuda_matmul(
 
     if (K != K2) return -1;
 
-#ifdef NN_HAS_CUBLAS
-    // 使用 cuBLAS（列主序视角：C^T = B^T × A^T）
-    cublasHandle_t handle;
-    cublasCreate(&handle);
-    cublasSetStream(handle, to_stream(stream));
-
+    // cuBLAS 列主序：行主序 C = A × B ⟺ 列主序 C^T = B^T × A^T
+    // 调用形式：cublasSgemm(handle, opB, opA, N, M, K, ..., B, ldb, A, lda, ..., C, ldc)
+    //   第一操作数 = B（行主序 B），其列主序 leading dim = B_cols（行步长）
+    //   第二操作数 = A（行主序 A），其列主序 leading dim = A_cols（行步长）
+    //   结果 C（行主序 M×N），其列主序 leading dim = N（行步长）
     const float alpha = 1.0f, beta = 0.0f;
-    // cuBLAS 使用列主序：计算 C^T(N×M) = op_B(B^T) × op_A(A^T)
-    // cuBLAS op: CUBLAS_OP_N → 不转置（列主序下的原始矩阵）
-    //           CUBLAS_OP_T → 转置
-    // 行主序 C = A × B ⟺ 列主序 C^T = B^T × A^T
-    const int lda = transA ? static_cast<int>(A_rows) : static_cast<int>(A_cols);
-    const int ldb = transB ? static_cast<int>(B_rows) : static_cast<int>(B_cols);
-    const int ldc = N;
+    const int lda = static_cast<int>(A_cols);  // 行主序 A 的行步长（固定，与 transA 无关）
+    const int ldb = static_cast<int>(B_cols);  // 行主序 B 的行步长（固定，与 transB 无关）
+    const int ldc = N;                          // 行主序 C 的行步长
 
     cublasOperation_t opA = transA ? CUBLAS_OP_T : CUBLAS_OP_N;
     cublasOperation_t opB = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
 
-    // 在列主序视角下：
-    //   A_colmajor = A^T (A_rows × A_cols) → lda = A_rows
-    //   B_colmajor = B^T (B_rows × B_cols) → ldb = B_rows
-    //   C_colmajor = C^T (N × M)
-    // cuBLAS: C_col = op(B_col) × op(A_col)
-    //   B_col 是 (B_cols × B_rows) 的列主序矩阵 → ldb = B_cols
-    //   A_col 是 (A_cols × A_rows) 的列主序矩阵 → lda = A_cols
-    cublasSgemm(handle,
-        opB,              // op for B_col
-        opA,              // op for A_col
-        N, M, K,          // N, M, K
+    CUBLAS_CHECK(cublasSgemm(handle,
+        opB, opA,
+        N, M, K,
         &alpha,
-        B, transB ? static_cast<int>(B_rows) : static_cast<int>(B_cols),  // ldb for B in col-major
-        A, transA ? static_cast<int>(A_rows) : static_cast<int>(A_cols),  // lda for A in col-major
+        B, ldb,
+        A, lda,
         &beta,
-        C, ldc);
+        C, ldc));
+    return 0;
+}
+#endif
+
+extern "C" int cuda_matmul(
+    const float* A, const float* B, float* C,
+    std::size_t A_rows, std::size_t A_cols,
+    std::size_t B_rows, std::size_t B_cols,
+    int transA, int transB,
+    void* stream)
+{
+    const int K = static_cast<int>(transA ? A_rows : A_cols);
+    const int K2 = static_cast<int>(transB ? B_cols : B_rows);
+
+    if (K != K2) return -1;
+
+#ifdef NN_HAS_CUBLAS
+    // 兼容路径：无外部句柄时创建临时句柄（推荐使用 cuda_matmul_with_handle 复用句柄）
+    cublasHandle_t handle;
+    cublasStatus_t st = cublasCreate(&handle);
+    if (st != CUBLAS_STATUS_SUCCESS) return static_cast<int>(-st);
+    cublasSetStream(handle, to_stream(stream));
+
+    int ret = cublas_matmul_impl(handle, A, B, C,
+                                 A_rows, A_cols, B_rows, B_cols, transA, transB);
 
     cublasDestroy(handle);
-    return 0;
+    return ret;
 #else
     // 自定义内核
+    const int M = static_cast<int>(transA ? A_cols : A_rows);
+    const int N = static_cast<int>(transB ? B_rows : B_cols);
     dim3 threads(TILE, TILE);
     dim3 blocks((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
     matmul_kernel<<<blocks, threads, 0, to_stream(stream)>>>(
         A, B, C, M, N, K, transA, transB);
     CUDA_CHECK(cudaGetLastError());
     return 0;
+#endif
+}
+
+// 带预创建 cuBLAS 句柄的 matmul（避免每次调用创建/销毁句柄的开销）
+// handle_ptr 为 nullptr 时退化为 cuda_matmul
+extern "C" int cuda_matmul_with_handle(
+    const float* A, const float* B, float* C,
+    std::size_t A_rows, std::size_t A_cols,
+    std::size_t B_rows, std::size_t B_cols,
+    int transA, int transB,
+    void* handle_ptr)
+{
+#ifdef NN_HAS_CUBLAS
+    if (!handle_ptr)
+        return cuda_matmul(A, B, C, A_rows, A_cols, B_rows, B_cols, transA, transB, nullptr);
+
+    cublasHandle_t handle = static_cast<cublasHandle_t>(handle_ptr);
+    return cublas_matmul_impl(handle, A, B, C,
+                              A_rows, A_cols, B_rows, B_cols, transA, transB);
+#else
+    // 无 cuBLAS 时退化为自定义内核（忽略 handle_ptr）
+    return cuda_matmul(A, B, C, A_rows, A_cols, B_rows, B_cols, transA, transB, nullptr);
 #endif
 }
 
@@ -655,14 +738,16 @@ extern "C" int cuda_reduce_col(
     unsigned int rows, unsigned int cols, unsigned int mode,
     void* stream)
 {
+    // 新版 col_reduce：每个 block 处理一列，线程协作归约所有行（shared memory tree reduction）
+    // grid = (cols,)，每个 block threads 个线程协作
     const int threads = 256;
-    const int blocks = (cols + threads - 1) / threads;
+    const size_t shared_mem = threads * sizeof(float);
 
     if (mode == 0)
-        reduce_col_sum_kernel<<<blocks, threads, 0, to_stream(stream)>>>(
+        reduce_col_sum_kernel<<<cols, threads, shared_mem, to_stream(stream)>>>(
             A, out, rows, cols);
     else
-        reduce_col_max_kernel<<<blocks, threads, 0, to_stream(stream)>>>(
+        reduce_col_max_kernel<<<cols, threads, shared_mem, to_stream(stream)>>>(
             A, out, rows, cols);
 
     CUDA_CHECK(cudaGetLastError());

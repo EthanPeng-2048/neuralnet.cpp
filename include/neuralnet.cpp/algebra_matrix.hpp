@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <execution>
@@ -60,54 +59,21 @@ namespace nn
             }
         }
 
-
-        // 内部构造函数（无校验，由工厂函数 create() 保证前置条件）
-        Matrix(std::vector<Scalar> data, std::size_t rows, std::size_t cols)
-            : data_(std::move(data)), rows_(rows), cols_(cols) {}
-
     public:
         Matrix() = default;
 
         explicit Matrix(std::size_t rows, std::size_t cols)
             : data_(rows * cols), rows_(rows), cols_(cols) {}
 
-        // 工厂函数（策略1）：外部输入校验，返回 Result 而非 assert
-        [[nodiscard]] static Result<Matrix> create(std::vector<Scalar> data, std::size_t rows, std::size_t cols)
-        {
-            if (data.size() != rows * cols)
-                return std::unexpected(Error{"data size mismatch"});
-            return Matrix(std::move(data), rows, cols);
-        }
-
         // 从标量值初始化矩阵
         Matrix(std::size_t rows, std::size_t cols, Scalar value)
             : data_(rows * cols, value), rows_(rows), cols_(cols) {}
-        Matrix(const Matrix &other)
-            : data_(other.data_), rows_(other.rows_), cols_(other.cols_)
-        {
-        }
-        Matrix(Matrix &&other) noexcept
-            : data_(std::move(other.data_)), rows_(other.rows_), cols_(other.cols_)
-        {
-        }
-        Matrix &operator=(const Matrix &other)
-        {
-            if (this != &other) {
-                data_ = other.data_;
-                rows_ = other.rows_;
-                cols_ = other.cols_;
-            }
-            return *this;
-        }
-        Matrix &operator=(Matrix &&other) noexcept
-        {
-            if (this != &other) {
-                data_ = std::move(other.data_);
-                rows_ = other.rows_;
-                cols_ = other.cols_;
-            }
-            return *this;
-        }
+
+        // 拷贝/移动构造与赋值：使用默认实现（vector 已提供强异常安全保证）
+        Matrix(const Matrix &other) = default;
+        Matrix(Matrix &&other) noexcept = default;
+        Matrix &operator=(const Matrix &other) = default;
+        Matrix &operator=(Matrix &&other) noexcept = default;
         ~Matrix() = default;
 
         // ── 就地调整大小（复用已有内存） ──────────────────────────────────
@@ -150,54 +116,6 @@ namespace nn
         }
         [[nodiscard]] constexpr Scalar at_unchecked(std::size_t row, std::size_t col) const noexcept { return data_[index(row, col)]; } // 无校验
         constexpr void set_value_unchecked(std::size_t row, std::size_t col, Scalar value) noexcept { data_[index(row, col)] = value; } // 无校验
-        // 注：原 data() 方法已移除——它返回 std::vector<Scalar>& 泄露内部存储类型，
-        // 违反"不穿透接口"规范。所有外部访问应通过 span() 获取视图。
-        [[nodiscard]] std::vector<std::vector<Scalar>> get_data() const
-        {
-            std::vector<std::vector<Scalar>> result(rows_, std::vector<Scalar>(cols_, 0.0));
-            for (std::size_t row = 0; row < rows_; ++row)
-            {
-                for (std::size_t col = 0; col < cols_; ++col)
-                {
-                    result[row][col] = data_[index(row, col)];
-                }
-            }
-            return result;
-        }
-
-        // 工厂函数（策略1）：外部输入校验，返回 Result 而非 assert
-        [[nodiscard]] Result<void> set_data(const std::vector<std::vector<Scalar>> &new_data)
-        {
-            if (new_data.empty())
-            {
-                rows_ = 0;
-                cols_ = 0;
-                data_.clear();
-                return {};
-            }
-
-            const std::size_t new_rows = new_data.size();
-            const std::size_t new_cols = new_data.front().size();
-            for (const auto &row : new_data)
-            {
-                if (row.size() != new_cols)
-                {
-                    return std::unexpected(Error{"all rows must have the same number of columns"});
-                }
-            }
-
-            rows_ = new_rows;
-            cols_ = new_cols;
-            data_.resize(rows_ * cols_);
-            for (std::size_t row = 0; row < rows_; ++row)
-            {
-                for (std::size_t col = 0; col < cols_; ++col)
-                {
-                    data_[index(row, col)] = new_data[row][col];
-                }
-            }
-            return {};
-        }
 
         // ── 转置（返回新矩阵） ─────────────────────────────────────────────
         [[nodiscard]] Matrix transpose() const
@@ -222,7 +140,7 @@ namespace nn
             const std::size_t i_blocks = (R + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const std::size_t j_blocks = (C + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-            // 通过 SmartPolicy 分发块级并行：分块数很少（1~几十），但其内循环计算量大。
+            // 通过 nn::parallel_for_blocks 分发块级并行：分块数很少（1~几十），但其内循环计算量大。
             const auto n_blocks = i_blocks * j_blocks;
             if (n_blocks <= 1)
             {
@@ -248,55 +166,6 @@ namespace nn
                                 dst[j * R + i] = src[i * C + j];
                     });
             }
-        }
-
-        [[nodiscard]] Matrix operator+(const Matrix &other) const
-        {
-            require_same_shape(*this, other, "addition dimension mismatch");
-            Matrix result(rows_, cols_);
-            auto s = span();
-            auto o = other.span();
-            auto r = result.span();
-            nn::transform(s.begin(), s.end(), o.begin(),
-                           r.begin(), std::plus<>{});
-            return result;
-        }
-
-        [[nodiscard]] Matrix operator-(const Matrix &other) const
-        {
-            require_same_shape(*this, other, "subtraction dimension mismatch");
-            Matrix result(rows_, cols_);
-            auto s = span();
-            auto o = other.span();
-            auto r = result.span();
-            nn::transform(s.begin(), s.end(), o.begin(),
-                           r.begin(), std::minus<>{});
-            return result;
-        }
-
-        [[nodiscard]] Matrix operator*(Scalar scalar) const
-        {
-            Matrix result(rows_, cols_);
-            auto s = span();
-            auto r = result.span();
-            nn::transform(s.begin(), s.end(), r.begin(),
-                           [scalar](Scalar value) noexcept { return value * scalar; });
-            return result;
-        }
-
-        friend Matrix operator*(Scalar scalar, const Matrix &mat)
-        {
-            return mat * scalar;
-        }
-
-        // ── 矩阵乘法（返回新矩阵） ─────────────────────────────────────────
-        [[nodiscard]] Matrix operator*(const Matrix &other) const
-        {
-            if (cols_ != other.rows_)
-                NN_ASSERT(false, "matrix multiplication dimension mismatch");
-            Matrix result(rows_, other.cols_);
-            multiply_to(result, other);
-            return result;
         }
 
         // ── 基于 span 的矩阵乘法（零拷贝，供 batched_matmul 等场景使用） ──
@@ -491,28 +360,6 @@ namespace nn
             result.resize(M, N);
             if (M == 0 || N == 0 || K == 0) return;
 
-#ifdef NN_HAS_VULKAN
-            // ── GPU 加速路径 ─────────────────────────────────────────────────
-            // 矩阵面积超过阈值时自动走 GPU，失败则静默 fallback 到 CPU
-            if (SmartPolicy::gpu_enabled && M * N >= SmartPolicy::GPU_THRESHOLD)
-            {
-                auto& backend = GpuBackend::instance();
-                // 快速路径：已初始化时跳过全局锁
-                if (backend.is_initialized() || backend.initialize())
-                {
-                    auto mm = backend.matmul_direct(
-                        span(), other.span(), result.span(), M, N, K);
-                    if (mm)
-                    {
-                        SmartPolicy::gpu_matmul_count.fetch_add(1, std::memory_order_relaxed);
-                        return;  // GPU 成功，直接返回
-                    }
-                }
-                // GPU 失败，静默 fallback 到 CPU 路径
-            }
-            SmartPolicy::cpu_matmul_count.fetch_add(1, std::memory_order_relaxed);
-#endif
-
             // 清零结果矩阵（使用 RAII 封装的方法）
             result.zero();
 
@@ -524,7 +371,7 @@ namespace nn
             const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-            // 通过 SmartPolicy 分发块级并行：分块数可能很少但其内循环计算量巨大（三层循环 O(n³)）。
+            // 通过 nn::parallel_for_blocks 分发块级并行：分块数可能很少但其内循环计算量巨大（三层循环 O(n³)）。
             const auto n_blocks = i_blocks * j_blocks;
             if (n_blocks <= 1)
             {
@@ -936,48 +783,6 @@ namespace nn
             std::fill(span().begin(), span().end(), 0.0);
         }
 
-
-        // ── 逐元素一元变换（返回新矩阵） ────────────────────────────────
-        // out[i] = func(in[i])，内部自动选择串行/并行。
-        template <typename F>
-        [[nodiscard]] Matrix apply(F&& func) const
-        {
-            Matrix result(rows_, cols_);
-            auto s = span();
-            auto r = result.span();
-            nn::transform(s.begin(), s.end(),
-                           r.begin(), std::forward<F>(func));
-            return result;
-        }
-
-        // ── 逐元素二元变换（返回新矩阵） ────────────────────────────────
-        // out[i] = func(a[i], b[i])
-        template <typename F>
-        [[nodiscard]] Matrix binary_apply(const Matrix& other, F&& func) const
-        {
-            require_same_shape(*this, other, "binary_apply dimension mismatch");
-            Matrix result(rows_, cols_);
-            auto s = span();
-            auto o = other.span();
-            auto r = result.span();
-            nn::transform(s.begin(), s.end(),
-                           o.begin(), r.begin(),
-                           std::forward<F>(func));
-            return result;
-        }
-
-        // ── 逐元素二元变换（就地修改） ──────────────────────────────────
-        template <typename F>
-        void binary_apply_inplace(const Matrix& other, F&& func)
-        {
-            require_same_shape(*this, other, "binary_apply_inplace dimension mismatch");
-            auto s = span();
-            auto o = other.span();
-            nn::transform(s.begin(), s.end(),
-                           o.begin(), s.begin(),
-                           std::forward<F>(func));
-        }
-
         // ── 归约操作 ────────────────────────────────────────────────────
         // result = reduce_op(init, transform_op(data[0]), transform_op(data[1]), ...)
         template <typename T, typename ReduceOp, typename TransformOp>
@@ -1023,36 +828,10 @@ namespace nn
         //   result[0][c] = reduce_op(init, transform_op(this[0][c]), ..., transform_op(this[rows-1][c]))
         // 上层可基于此表达 LayerNorm 列均值/列方差等算法。
         //
-        // 实现策略（cache-friendly blocked + 行块并行）：
-        //   - 旧实现按列扫描，跨行 stride=C 访问，cache miss 率 ~100%
-        //   - 单线程行主序扫描：每行的 C 个元素累加到 out[c]，cache 友好
-        //   - 行块并行：R 足够大且 C 不至于让累加器溢出 L2 时，按行分块并行
-        //
-        // bench_thresholds 单线程 vs 按列并行实测（32 核 CPU, Release -O3, 2026-07-25）：
-        //   形状        naiveμs   blockedμs   加速比
-        //   32×128        1.8        0.3       6.00x
-        //   128×128      12.7        1.3       9.77x
-        //   1K×1K       2328.9      141.4      16.47x
-        //   4K×4K      208753.7    4827.7      43.24x
-        //   32×10K      151.7       51.9       2.92x   (naive SIMD 优势最小)
-        //   1K×10K    48048.4     2203.6      21.80x
-        //   64×64K    47890.8     1287.6      37.19x
-        //   8K×64      1248.9       75.6      16.52x
-        //   64×8K      1089.6       83.1      13.11x
-        //   结论：所有形状下 blocked 全面胜出。
-        //
-        // 按列并行测试结果（cache miss 严重，仅 128×10K 受益）：
-        //   形状        串行μs    并行μs    加速比
-        //   1K×1K       592.8    2326.6    0.25x   ← stride=C 跨行访问
-        //   4K×4K     11039.1   54651.3    0.20x   ← 同上
-        //   128×10K     719.8     273.5    2.63x   ← 唯一按列并行受益场景
-        //
-        // 行块并行策略（本实现）：
-        //   - 按行分块：T 个行块，每线程处理 [r0, r_end) 区间，本地累加器累加该区间所有行
-        //   - 每线程内部仍是行主序扫描，cache 行为与单线程版完全一致
-        //   - 归并阶段：串行 O(T*C) 合并各线程累加器到 out[c]
-        //   - 启用条件：R >= COL_REDUCE_PARALLEL_ROWS 且 C*T*sizeof(Scalar) <= L2_BUDGET
-        //   - 否则回退到单线程行主序扫描
+        // 实现策略：cache-friendly blocked + 行块并行。
+        // bench_thresholds 实测：blocked 全面优于 naive（按列跨行扫描），
+        // 行块并行仅在 R >= 1024 且 R*C >= PARALLEL_THRESHOLD 时启用，
+        // 详见 bench_thresholds.cpp 测试 2/3。
         template <typename T, typename ReduceOp, typename TransformOp>
         [[nodiscard]] Matrix col_reduce(T init, ReduceOp&& reduce_op, TransformOp&& transform_op) const
         {
@@ -1077,23 +856,9 @@ namespace nn
                 return result;
             }
 
-            // 行块并行启用条件：
-            //   1. R 足够大（保证每线程分到足够行块摊销同步开销）
-            //   2. R * C >= PARALLEL_THRESHOLD（与全局并行阈值一致）
-            //
-            // bench_thresholds 实测（32 核 CPU, Release -O3, 2026-07-25）：
-            //   形状         串行μs   行块并μs  加速比
-            //   1K×1K         592.3    229.3     2.58x
-            //   1K×10K       6598.7   1671.9     3.95x
-            //   4K×4K       11347.5   1497.4     7.58x
-            //   8K×128        662.1    335.7     1.97x
-            //   64K×64       2881.7    759.5     3.79x
-            //   4K×512       1239.8    398.9     3.11x
-            //   128×128       10.1     40.1     0.25x   ← R<1024，同步开销主导
-            //   64×8K        300.3    937.6     0.32x   ← R<1024
-            //   128×10K      719.0   1085.3     0.66x   ← R<1024，归并成本主导
-            //   结论：R >= 1024 是行块并行有效性的硬门槛；C 的上限不严
-            //         （累加器 1K×10K*32*4=1.28MB 溢出 L2 进 L3，但 cache 行为仍优于单线程串行扫描）
+            // 行块并行启用条件：R >= COL_REDUCE_PARALLEL_ROWS 且 R*C >= PARALLEL_THRESHOLD。
+            // bench_thresholds 实测：R >= 1024 是行块并行的硬门槛（R<1024 时同步开销主导），
+            // 详见 bench_thresholds.cpp 测试 3。
             constexpr std::size_t COL_REDUCE_PARALLEL_ROWS = 1024;     // 行数门槛
             const std::size_t hw_threads = std::thread::hardware_concurrency();
             const std::size_t n_threads = (hw_threads == 0) ? 1 : hw_threads;
@@ -1193,23 +958,59 @@ namespace nn
                     d[i] = static_cast<Scalar>(op(d[i], v[i % C]));
                 });
         }
-
-        // ── Broadcast bias 加法（in-place） ───────────────────────────
-        // 通用广播原语：this[i][j] += bias[i][0]，bias 形状必须为 (rows_, 1)
-        // 这是通用数学原语（按行广播加法），不是算法。
-        void add_bias_broadcast_inplace(const Matrix& bias)
-        {
-            NN_ASSERT(bias.rows_ == rows_ && bias.cols_ == 1, "bias broadcast dimension mismatch");
-            const std::size_t batch = cols_;
-            auto b = bias.span();
-            auto d = span();
-            auto idx = std::views::iota(std::size_t{0}, d.size());
-            nn::for_each(idx.begin(), idx.end(),
-                [&d, &b, batch](std::size_t i) noexcept {
-                    d[i] += b[i / batch];
-                });
-        }
     };
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // detail 命名空间：逐元素变换的自由函数（原 Matrix 成员方法）
+    //
+    // 这些函数仅是 nn::transform 的薄包装，放在 detail 命名空间而非 Matrix 类内，
+    // 避免 Matrix 接口膨胀。compute_bench 等基准测试直接调用。
+    // ═══════════════════════════════════════════════════════════════════════
+    namespace detail
+    {
+        // ── 逐元素一元变换（返回新矩阵） ────────────────────────────────
+        // out[i] = func(in[i])，内部自动选择串行/并行。
+        template <typename F>
+        [[nodiscard]] Matrix apply(const Matrix& mat, F&& func)
+        {
+            Matrix result(mat.rows(), mat.cols());
+            auto s = mat.span();
+            auto r = result.span();
+            nn::transform(s.begin(), s.end(),
+                           r.begin(), std::forward<F>(func));
+            return result;
+        }
+
+        // ── 逐元素二元变换（返回新矩阵） ────────────────────────────────
+        // out[i] = func(a[i], b[i])
+        template <typename F>
+        [[nodiscard]] Matrix binary_apply(const Matrix& a, const Matrix& b, F&& func)
+        {
+            NN_ASSERT(a.rows() == b.rows() && a.cols() == b.cols(),
+                       "binary_apply dimension mismatch");
+            Matrix result(a.rows(), a.cols());
+            auto s = a.span();
+            auto o = b.span();
+            auto r = result.span();
+            nn::transform(s.begin(), s.end(),
+                           o.begin(), r.begin(),
+                           std::forward<F>(func));
+            return result;
+        }
+
+        // ── 逐元素二元变换（就地修改） ──────────────────────────────────
+        template <typename F>
+        void binary_apply_inplace(Matrix& a, const Matrix& b, F&& func)
+        {
+            NN_ASSERT(a.rows() == b.rows() && a.cols() == b.cols(),
+                       "binary_apply_inplace dimension mismatch");
+            auto s = a.span();
+            auto o = b.span();
+            nn::transform(s.begin(), s.end(),
+                           o.begin(), s.begin(),
+                           std::forward<F>(func));
+        }
+    } // namespace detail
 } // namespace nn
 
 // ── GpuTensor 方法实现（需要 Matrix 和 GpuBackend 的完整定义）──────────

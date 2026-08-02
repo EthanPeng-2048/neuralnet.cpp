@@ -90,6 +90,7 @@ public:
     }
 
     // ── 每 step 调用：传入当前 loss，返回是否触发了 lr 调整 ──
+    // 编排：冷却/warmup → 计算反转率 → 检测+降低 → 尝试恢复
     bool update(Scalar loss)
     {
         ++global_step_;
@@ -114,66 +115,15 @@ public:
         if (loss_window_.size() < cfg_.window_size)
             return false;
 
-        // ── 核心：计算方向反转率 ──
+        // 核心：计算方向反转率
         Scalar reversal_ratio = compute_reversal_ratio_();
 
-        if (reversal_ratio > cfg_.threshold && reduction_count_ < cfg_.max_reductions)
-        {
-            // 检测到振荡，降低 lr
-            current_lr_ = std::max(current_lr_ * cfg_.decay_factor, cfg_.min_lr);
-            cooldown_left_ = cfg_.cooldown;
-            ++reduction_count_;
-            was_reduced_ = true;
-            stable_steps_ = 0;  // 重置稳定计数
-
-            if (cfg_.verbose)
-            {
-                std::cout << "\n  ⚠ 振荡检测 [step " << global_step_
-                          << "] reversal=" << std::fixed << std::setprecision(2)
-                          << reversal_ratio * 100.0 << "%"
-                          << "  lr: " << current_lr_ / cfg_.decay_factor
-                          << " → " << current_lr_
-                          << "  (第 " << reduction_count_ << "/" << cfg_.max_reductions << " 次衰减)"
-                          << std::flush;
-            }
-
-            // 缩小窗口（衰减后用更短的历史判断，避免旧数据干扰）
-            shrink_window_();
+        // 振荡检测 + lr 降低
+        if (detect_and_reduce_(reversal_ratio))
             return true;
-        }
 
-        // ── lr 恢复逻辑：振荡停止后逐步恢复 ──
-        if (was_reduced_ && current_lr_ < base_lr_)
-        {
-            if (reversal_ratio < cfg_.recovery_threshold)
-            {
-                ++stable_steps_;
-                if (stable_steps_ >= cfg_.recovery_stable_steps)
-                {
-                    Scalar old_lr = current_lr_;
-                    current_lr_ = std::min(current_lr_ * cfg_.recovery_factor, base_lr_);
-                    stable_steps_ = 0;
-
-                    if (cfg_.verbose && current_lr_ != old_lr)
-                    {
-                        std::cout << "\n  ✓ lr 恢复 [step " << global_step_
-                                  << "]  " << old_lr << " → " << current_lr_
-                                  << std::flush;
-                    }
-
-                    // 恢复到 base_lr 后停止恢复
-                    if (current_lr_ >= base_lr_)
-                    {
-                        current_lr_ = base_lr_;
-                        was_reduced_ = false;
-                    }
-                }
-            }
-            else
-            {
-                stable_steps_ = 0;  // 不够稳定，重置计数
-            }
-        }
+        // lr 恢复逻辑
+        try_recover_(reversal_ratio);
 
         return false;
     }
@@ -184,13 +134,11 @@ public:
     [[nodiscard]] std::size_t reduction_count() const { return reduction_count_; }
     [[nodiscard]] std::size_t global_step()   const { return global_step_; }
 
-    // 手动重置（用于新 epoch 如果需要重新计数，通常不需要）
-    void reset_step_counter() { global_step_ = 0; }
-
     // ── 外部 LR 调度器设置新 base lr ──
     // 用于 per-epoch LR 调度（如 cosine annealing + warmup），
     // 重置内部状态以匹配新的 base lr，同时保留已有的冷却/衰减记忆。
-    void set_lr(Scalar new_base_lr)
+    // 注意：此方法会重置状态（was_reduced_/reduction_count_ 等），并非单纯设置 lr。
+    void rebase_lr(Scalar new_base_lr)
     {
         base_lr_ = new_base_lr;
         current_lr_ = new_base_lr;
@@ -218,6 +166,74 @@ public:
     }
 
 private:
+    // 振荡检测 + lr 降低，返回 true 表示触发了降 lr
+    bool detect_and_reduce_(Scalar ratio)
+    {
+        if (!(ratio > cfg_.threshold && reduction_count_ < cfg_.max_reductions))
+            return false;
+
+        current_lr_ = std::max(current_lr_ * cfg_.decay_factor, cfg_.min_lr);
+        cooldown_left_ = cfg_.cooldown;
+        ++reduction_count_;
+        was_reduced_ = true;
+        stable_steps_ = 0;  // 重置稳定计数
+
+        log_reduction_(ratio);
+
+        // 缩小窗口（衰减后用更短的历史判断，避免旧数据干扰）
+        shrink_window_();
+        return true;
+    }
+
+    // lr 恢复逻辑：振荡停止后逐步恢复
+    void try_recover_(Scalar ratio)
+    {
+        if (!was_reduced_ || current_lr_ >= base_lr_)
+            return;
+
+        if (ratio < cfg_.recovery_threshold)
+        {
+            ++stable_steps_;
+            if (stable_steps_ >= cfg_.recovery_stable_steps)
+            {
+                Scalar old_lr = current_lr_;
+                current_lr_ = std::min(current_lr_ * cfg_.recovery_factor, base_lr_);
+                stable_steps_ = 0;
+
+                if (cfg_.verbose && current_lr_ != old_lr)
+                {
+                    std::cout << "\n  ✓ lr 恢复 [step " << global_step_
+                              << "]  " << old_lr << " → " << current_lr_
+                              << std::flush;
+                }
+
+                // 恢复到 base_lr 后停止恢复
+                if (current_lr_ >= base_lr_)
+                {
+                    current_lr_ = base_lr_;
+                    was_reduced_ = false;
+                }
+            }
+        }
+        else
+        {
+            stable_steps_ = 0;  // 不够稳定，重置计数
+        }
+    }
+
+    // verbose 打印降 lr 信息
+    void log_reduction_(Scalar ratio)
+    {
+        if (!cfg_.verbose) return;
+        std::cout << "\n  ⚠ 振荡检测 [step " << global_step_
+                  << "] reversal=" << std::fixed << std::setprecision(2)
+                  << ratio * 100.0 << "%"
+                  << "  lr: " << current_lr_ / cfg_.decay_factor
+                  << " → " << current_lr_
+                  << "  (第 " << reduction_count_ << "/" << cfg_.max_reductions << " 次衰减)"
+                  << std::flush;
+    }
+
     void push_loss_(Scalar loss)
     {
         if (loss_window_.size() >= cfg_.window_size)

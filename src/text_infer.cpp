@@ -10,6 +10,7 @@
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/model_serialization.hpp>
 #include <neuralnet.cpp/domain_gpt.hpp>
+#include <neuralnet.cpp/cli/engine_factory.hpp>
 
 #include <chrono>
 #include <iomanip>
@@ -116,15 +117,8 @@ nn::Result<std::vector<std::size_t>> generate_text(
     auto &layer_ref = model.layer_at(0);
     auto *gpt_ptr = dynamic_cast<nn::GPTModel *>(&layer_ref);
     if (!gpt_ptr)
-    {
-        // 回退：尝试 ALiBiGPTModel（旧格式模型）
-        auto *alibi_ptr = dynamic_cast<nn::ALiBiGPTModel *>(&layer_ref);
-        if (!alibi_ptr)
-            return std::unexpected(nn::Error{"Model does not contain a GPTModel or ALiBiGPTModel layer"});
-        const std::size_t min_new = max_new_tokens / 2;
-        return alibi_ptr->generate(engine, prompt_tokens, max_new_tokens, temperature,
-                                   eos_token_id, min_new);
-    }
+        return std::unexpected(nn::Error{"Model does not contain a GPTModel layer"});
+
     // 传入 EOS_ID，生成遇到 EOS 自动停止
     // min_new_tokens = max_new_tokens/2，至少生成一半 token 才允许 EOS 停止，
     // 避免模型因训练偏置一上来就输出 EOS 导致无输出。
@@ -249,56 +243,10 @@ int main(int argc, char *argv[])
     }
 
     // ── 创建计算引擎 ─────────────────────────────────────────
-    std::unique_ptr<nn::ComputeEngine> engine;
-#ifdef NN_HAS_VULKAN
-    nn::GpuBackend *gpu_backend = nullptr;
-#endif
-    if (cfg.cuda_enabled)
-    {
-#ifdef NN_HAS_CUDA
-        auto &cuda_backend = nn::CudaBackend::instance();
-        auto cuda_init = cuda_backend.initialize();
-        if (cuda_init)
-        {
-            engine = std::make_unique<nn::CudaEngine>(cuda_backend);
-            const auto& props = cuda_backend.device_props();
-            std::cout << "CUDA GPU 加速已启用 (" << props.name << ")\n";
-        }
-        else
-        {
-            std::cerr << "CUDA 初始化失败: " << cuda_init.error().message
-                      << "\n回退到 CPU 模式\n";
-            engine = std::make_unique<nn::CpuEngine>();
-        }
-#else
-        std::cerr << "未编译 CUDA 支持，使用 CPU 模式\n";
-        engine = std::make_unique<nn::CpuEngine>();
-#endif
-    }
-    else if (cfg.gpu_enabled)
-    {
-#ifdef NN_HAS_VULKAN
-        auto &backend = nn::GpuBackend::instance();
-        auto init_result = backend.initialize();
-        if (init_result)
-        {
-            gpu_backend = &backend;
-            engine = std::make_unique<nn::GpuEngine>(*gpu_backend);
-            std::cout << "GPU 加速已启用 (Vulkan GpuEngine)\n";
-        }
-        else
-        {
-            std::cerr << "GPU 初始化失败: " << init_result.error().message
-                      << "\n回退到 CPU 模式\n";
-            engine = std::make_unique<nn::CpuEngine>();
-        }
-#else
-        std::cerr << "未编译 Vulkan 支持，使用 CPU 模式\n";
-        engine = std::make_unique<nn::CpuEngine>();
-#endif
-    }
-    else
-        engine = std::make_unique<nn::CpuEngine>();
+    nn::cli::EngineConfig eng_cfg;
+    eng_cfg.use_gpu = cfg.gpu_enabled;
+    eng_cfg.use_cuda = cfg.cuda_enabled;
+    auto engine = nn::cli::create_engine(eng_cfg, std::cout);
 
     // ── 构建 GPT 模型 ────────────────────────────────────────
     std::cout << "模型规格: vocab=" << spec.vocab_size
@@ -316,10 +264,9 @@ int main(int argc, char *argv[])
     std::cout << "\n";
 
     nn::Result<nn::Model> model_result;
-    if (spec.is_alibi_gpt())
-        model_result = nn::build_alibi_gpt_model_from_spec(*engine, spec);
-    else
-        model_result = nn::build_gpt_model_from_spec(*engine, spec);
+    // 统一的 GPTModel 通过 pos_encoding 区分 Learned/Sinusoidal/ALiBi，
+    // GPT 和旧格式 ALiBi_GPT 文件都走同一条构建路径。
+    model_result = nn::build_gpt_model_from_spec(*engine, spec);
     if (!model_result)
     {
         std::cerr << "构建模型失败: " << model_result.error().message << std::endl;

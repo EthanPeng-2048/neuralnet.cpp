@@ -178,6 +178,26 @@ public:
         return "(" + std::to_string(rows_) + "x" + std::to_string(cols_) + ")"
              + (device_ == Device::CPU ? "[CPU]" : "[GPU]");
     }
+
+    // ── 零拷贝 reshape（共享底层 buffer，仅改变形状元数据）────────────────
+    // 后端无关：CPU/Vulkan/CUDA 均适用，避免上层代码直接访问 gpu_tensor()/cuda_tensor()
+    [[nodiscard]] Tensor reshape(std::size_t new_rows, std::size_t new_cols) const
+    {
+        NN_ASSERT(rows_ * cols_ == new_rows * new_cols,
+                  "reshape: element count mismatch");
+        Tensor t;
+        t.device_ = device_;
+        t.rows_ = new_rows;
+        t.cols_ = new_cols;
+        t.cpu_data_ = cpu_data_;
+#ifdef NN_HAS_VULKAN
+        t.gpu_data_ = gpu_data_;
+#endif
+#ifdef NN_HAS_CUDA
+        t.cuda_data_ = cuda_data_;
+#endif
+        return t;
+    }
 };
 
 // ── 非拥有型引用包装器（替代裸指针） ─────────────────────────────────────

@@ -11,6 +11,7 @@
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/model_serialization.hpp>
 #include <neuralnet.cpp/domain_mnist.hpp>
+#include <neuralnet.cpp/cli/engine_factory.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -266,59 +267,10 @@ int main(int argc, char *argv[])
 
     // ── 创建计算引擎 ─────────────────────────────────────────
     // 引擎必须先于 model 构造并晚于 model 析构（model 持有 engine 的非拥有指针）
-    std::unique_ptr<nn::ComputeEngine> engine;
-
-#ifdef NN_HAS_VULKAN
-    nn::GpuBackend *gpu_backend = nullptr;
-#endif
-    if (cfg.cuda_enabled)
-    {
-#ifdef NN_HAS_CUDA
-        auto &cuda_backend = nn::CudaBackend::instance();
-        auto cuda_init = cuda_backend.initialize();
-        if (cuda_init)
-        {
-            engine = std::make_unique<nn::CudaEngine>(cuda_backend);
-            const auto& props = cuda_backend.device_props();
-            std::cout << "CUDA GPU 加速已启用 (" << props.name << ")\n";
-        }
-        else
-        {
-            std::cerr << "CUDA 初始化失败: " << cuda_init.error().message << "\n";
-            std::cerr << "回退到 CPU 模式\n";
-            engine = std::make_unique<nn::CpuEngine>();
-        }
-#else
-        std::cerr << "未编译 CUDA 支持，使用 CPU 模式\n";
-        engine = std::make_unique<nn::CpuEngine>();
-#endif
-    }
-    else if (cfg.gpu_enabled)
-    {
-#ifdef NN_HAS_VULKAN
-        auto &backend = nn::GpuBackend::instance();
-        auto init_result = backend.initialize();
-        if (init_result)
-        {
-            gpu_backend = &backend;
-            engine = std::make_unique<nn::GpuEngine>(*gpu_backend);
-            std::cout << "GPU 加速已启用 (Vulkan GpuEngine)\n";
-        }
-        else
-        {
-            std::cerr << "GPU 初始化失败: " << init_result.error().message << "\n";
-            std::cerr << "回退到 CPU 模式\n";
-            engine = std::make_unique<nn::CpuEngine>();
-        }
-#else
-        std::cerr << "未编译 Vulkan 支持，使用 CPU 模式\n";
-        engine = std::make_unique<nn::CpuEngine>();
-#endif
-    }
-    else
-    {
-        engine = std::make_unique<nn::CpuEngine>();
-    }
+    nn::cli::EngineConfig eng_cfg;
+    eng_cfg.use_gpu = cfg.gpu_enabled;
+    eng_cfg.use_cuda = cfg.cuda_enabled;
+    auto engine = nn::cli::create_engine(eng_cfg, std::cout);
 
     // ── 构建模型（绑定引擎） ─────────────────────────────────
     auto build_result = nn::build_mnist_model_from_spec(*engine, spec);

@@ -7,8 +7,10 @@
 //   cuda_kernels.cu（nvcc 编译）→ 实现 CUDA 内核
 //
 // 同步模型：
-//   默认使用 CUDA 默认流（同步执行）。
-//   begin_batch/end_batch 预留用于流式批处理（当前为 no-op）。
+//   默认使用非默认 CUDA 流 + cuBLAS 句柄绑定该流。
+//   begin_batch / end_batch 使用流级隐式同步（仅在 end_batch 调用
+//   cudaStreamSynchronize）。所有 op 级函数不再调用 cudaDeviceSynchronize，
+//   实现真正异步的流水线执行。
 // ─────────────────────────────────────────────────────────────────────────
 
 #ifndef NN_CUDA_BACKEND_HPP
@@ -27,7 +29,7 @@
 #include "../core_errors.hpp"
 #include "../config.hpp"
 
-// cuBLAS（可选，用于 matmul 加速）
+// cuBLAS（matmul 加速，由 cmake -DNN_HAS_CUBLAS 启用）
 #ifdef NN_HAS_CUBLAS
 #include <cublas_v2.h>
 #endif
@@ -172,10 +174,29 @@ private:
     bool initialized_ = false;
     std::mutex init_mutex_;
 
+    // CUDA 流（非默认流，支持异步执行 + 与 cuBLAS 句柄绑定）
+    cudaStream_t stream_ = nullptr;
+
+    // cuBLAS 句柄（初始化时创建一次，整个生命周期复用）
+#ifdef NN_HAS_CUBLAS
+    cublasHandle_t cublas_handle_ = nullptr;
+#endif
+
+    // 批处理状态（true 表示在 begin_batch/end_batch 之间，不主动同步）
+    bool in_batch_ = false;
+
     CudaBackend() = default;
 
 public:
-    ~CudaBackend() = default;
+    ~CudaBackend()
+    {
+#ifdef NN_HAS_CUBLAS
+        if (cublas_handle_)
+            cublasDestroy(cublas_handle_);
+#endif
+        if (stream_)
+            cudaStreamDestroy(stream_);
+    }
 
     // 禁止拷贝和移动
     CudaBackend(const CudaBackend&) = delete;
@@ -209,6 +230,21 @@ public:
         if (err != cudaSuccess)
             return std::unexpected(Error{"cudaGetDeviceProperties failed"});
 
+        // 创建非默认流（支持异步执行 + 与默认流解耦）
+        err = cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
+        if (err != cudaSuccess)
+            return std::unexpected(Error{"cudaStreamCreate failed"});
+
+#ifdef NN_HAS_CUBLAS
+        // 创建 cuBLAS 句柄并绑定到 stream_
+        cublasStatus_t cb_err = cublasCreate(&cublas_handle_);
+        if (cb_err != CUBLAS_STATUS_SUCCESS)
+            return std::unexpected(Error{"cublasCreate failed"});
+        cb_err = cublasSetStream(cublas_handle_, stream_);
+        if (cb_err != CUBLAS_STATUS_SUCCESS)
+            return std::unexpected(Error{"cublasSetStream failed"});
+#endif
+
         initialized_ = true;
         return {};
     }
@@ -219,12 +255,52 @@ public:
     [[nodiscard]] const cudaDeviceProp& device_props() const noexcept { return device_props_; }
     [[nodiscard]] int device_id() const noexcept { return device_id_; }
 
-    // ── 批处理控制（当前为 no-op，预留 CUDA 流支持）─────────────────────
-    [[nodiscard]] Result<void> begin_batch() { return {}; }
-    [[nodiscard]] Result<void> end_batch() { return {}; }
-    [[nodiscard]] bool in_batch() const noexcept { return false; }
+    // 当前流指针（供 C 接口内核调用使用，nullptr 表示默认流）
+    [[nodiscard]] void* stream_ptr() const noexcept
+    {
+        return static_cast<void*>(stream_);
+    }
 
-    // ── 上传/下载 ─────────────────────────────────────────────────────────
+#ifdef NN_HAS_CUBLAS
+    [[nodiscard]] cublasHandle_t cublas_handle() const noexcept { return cublas_handle_; }
+#endif
+
+    // ── 批处理控制 ────────────────────────────────────────────────────────
+    // begin_batch：标记进入批处理模式，期间所有 op 不主动同步。
+    // end_batch：同步流，确保所有排队的内核执行完成。
+    [[nodiscard]] Result<void> begin_batch()
+    {
+        in_batch_ = true;
+        return {};
+    }
+
+    [[nodiscard]] Result<void> end_batch()
+    {
+        in_batch_ = false;
+        if (stream_)
+        {
+            auto err = cudaStreamSynchronize(stream_);
+            return NN_CUDA_CHECK(err);
+        }
+        auto err = cudaDeviceSynchronize();
+        return NN_CUDA_CHECK(err);
+    }
+
+    [[nodiscard]] bool in_batch() const noexcept { return in_batch_; }
+
+    // ── 流同步（供 flush_batch 或显式同步点捕获异步 CUDA 错误）────────
+    [[nodiscard]] Result<void> sync_stream()
+    {
+        if (stream_)
+        {
+            auto err = cudaStreamSynchronize(stream_);
+            return NN_CUDA_CHECK(err);
+        }
+        auto err = cudaDeviceSynchronize();
+        return NN_CUDA_CHECK(err);
+    }
+
+    // ── 上传/下载（批处理模式下使用异步传输）──────────────────────────────
     [[nodiscard]] Result<void> upload_blocking(CudaTensor& dst, std::span<const Scalar> cpu_data)
     {
         if (!dst.valid())
@@ -232,8 +308,14 @@ public:
         if (cpu_data.size() != dst.rows() * dst.cols())
             return std::unexpected(Error{"Upload size mismatch"});
 
-        auto err = cudaMemcpy(dst.data(), cpu_data.data(),
-                              cpu_data.size_bytes(), cudaMemcpyHostToDevice);
+        auto err = cudaMemcpyAsync(dst.data(), cpu_data.data(),
+                                   cpu_data.size_bytes(), cudaMemcpyHostToDevice, stream_);
+        if (!in_batch_)
+        {
+            auto sync_err = cudaStreamSynchronize(stream_);
+            if (sync_err != cudaSuccess)
+                return NN_CUDA_CHECK(sync_err);
+        }
         return NN_CUDA_CHECK(err);
     }
 
@@ -244,9 +326,13 @@ public:
         if (cpu_data.size() != src.rows() * src.cols())
             return std::unexpected(Error{"Download size mismatch"});
 
-        auto err = cudaMemcpy(cpu_data.data(), src.data(),
-                              cpu_data.size_bytes(), cudaMemcpyDeviceToHost);
-        return NN_CUDA_CHECK(err);
+        // 下载必须同步，确保数据可用
+        auto err = cudaMemcpyAsync(cpu_data.data(), src.data(),
+                                   cpu_data.size_bytes(), cudaMemcpyDeviceToHost, stream_);
+        if (err != cudaSuccess)
+            return NN_CUDA_CHECK(err);
+        auto sync_err = cudaStreamSynchronize(stream_);
+        return NN_CUDA_CHECK(sync_err);
     }
 
     // ── 纯 GPU 矩阵乘法 ──────────────────────────────────────────────────
@@ -264,14 +350,21 @@ public:
         auto C_res = CudaTensor::create_empty(M, N, *this);
         if (!C_res) return std::unexpected(C_res.error());
 
+        // 优先使用 cuBLAS 句柄复用路径（避免每次调用创建/销毁句柄）
+#ifdef NN_HAS_CUBLAS
+        int err = cuda_matmul_with_handle(
+            A.data(), B.data(), C_res->data(),
+            A.rows(), A.cols(), B.rows(), B.cols(),
+            transA, transB, cublas_handle());
+#else
         int err = cuda_matmul(
             A.data(), B.data(), C_res->data(),
             A.rows(), A.cols(), B.rows(), B.cols(),
-            transA, transB, nullptr);
+            transA, transB, stream_ptr());
+#endif
         if (err != 0)
             return std::unexpected(Error{"cuda_matmul failed: " + std::to_string(err)});
 
-        cudaDeviceSynchronize();
         return std::move(*C_res);
     }
 
@@ -301,11 +394,10 @@ public:
         int err = cuda_batched_matmul(
             A.data(), B.data(), C_res->data(),
             A.rows(), A.cols(), B.rows(), B.cols(),
-            batch, transA, transB, nullptr);
+            batch, transA, transB, stream_ptr());
         if (err != 0)
             return std::unexpected(Error{"cuda_batched_matmul failed"});
 
-        cudaDeviceSynchronize();
         return std::move(*C_res);
     }
 
@@ -317,10 +409,9 @@ public:
         if (!out_res) return std::unexpected(out_res.error());
 
         const auto count = static_cast<uint32_t>(A.rows() * A.cols());
-        int err = cuda_elementwise_unary(A.data(), out_res->data(), count, op, nullptr);
+        int err = cuda_elementwise_unary(A.data(), out_res->data(), count, op, stream_ptr());
         if (err != 0) return std::unexpected(Error{"cuda_elementwise_unary failed"});
 
-        cudaDeviceSynchronize();
         return std::move(*out_res);
     }
 
@@ -331,10 +422,9 @@ public:
         if (!out_res) return std::unexpected(out_res.error());
 
         const auto count = static_cast<uint32_t>(A.rows() * A.cols());
-        int err = cuda_elementwise_binary(A.data(), B.data(), out_res->data(), count, op, nullptr);
+        int err = cuda_elementwise_binary(A.data(), B.data(), out_res->data(), count, op, stream_ptr());
         if (err != 0) return std::unexpected(Error{"cuda_elementwise_binary failed"});
 
-        cudaDeviceSynchronize();
         return std::move(*out_res);
     }
 
@@ -346,10 +436,9 @@ public:
 
         const auto count = static_cast<uint32_t>(A.rows() * A.cols());
         int err = cuda_elementwise_binary_scalar(
-            A.data(), out_res->data(), count, op, scalar, scalar_first ? 1 : 0, nullptr);
+            A.data(), out_res->data(), count, op, scalar, scalar_first ? 1 : 0, stream_ptr());
         if (err != 0) return std::unexpected(Error{"cuda_elementwise_binary_scalar failed"});
 
-        cudaDeviceSynchronize();
         return std::move(*out_res);
     }
 
@@ -360,10 +449,9 @@ public:
         if (!out_res) return std::unexpected(out_res.error());
 
         const auto count = static_cast<uint32_t>(A.rows() * A.cols());
-        int err = cuda_axpy(A.data(), B.data(), out_res->data(), count, scalar, nullptr);
+        int err = cuda_axpy(A.data(), B.data(), out_res->data(), count, scalar, stream_ptr());
         if (err != 0) return std::unexpected(Error{"cuda_axpy failed"});
 
-        cudaDeviceSynchronize();
         return std::move(*out_res);
     }
 
@@ -376,10 +464,9 @@ public:
 
         const auto count = static_cast<uint32_t>(A.rows() * A.cols());
         int err = cuda_elementwise_select_scalar_cond(
-            A.data(), then_t.data(), out_res->data(), count, cmp, scalar_b, scalar_else, nullptr);
+            A.data(), then_t.data(), out_res->data(), count, cmp, scalar_b, scalar_else, stream_ptr());
         if (err != 0) return std::unexpected(Error{"cuda_select_scalar_cond failed"});
 
-        cudaDeviceSynchronize();
         return std::move(*out_res);
     }
 
@@ -397,13 +484,12 @@ public:
 
         int err;
         if (mode == 0)
-            err = cuda_reduce_row(input.data(), out_res->data(), rows, cols, reduce_op, nullptr);
+            err = cuda_reduce_row(input.data(), out_res->data(), rows, cols, reduce_op, stream_ptr());
         else
-            err = cuda_reduce_col(input.data(), out_res->data(), rows, cols, reduce_op, nullptr);
+            err = cuda_reduce_col(input.data(), out_res->data(), rows, cols, reduce_op, stream_ptr());
 
         if (err != 0) return std::unexpected(Error{"cuda_reduce failed"});
 
-        cudaDeviceSynchronize();
         return std::move(*out_res);
     }
 
@@ -420,13 +506,12 @@ public:
 
         int err;
         if (mode == 0)
-            err = cuda_broadcast_row(A.data(), vec.data(), out_res->data(), rows, cols, op, nullptr);
+            err = cuda_broadcast_row(A.data(), vec.data(), out_res->data(), rows, cols, op, stream_ptr());
         else
-            err = cuda_broadcast_col(A.data(), vec.data(), out_res->data(), rows, cols, op, nullptr);
+            err = cuda_broadcast_col(A.data(), vec.data(), out_res->data(), rows, cols, op, stream_ptr());
 
         if (err != 0) return std::unexpected(Error{"cuda_broadcast failed"});
 
-        cudaDeviceSynchronize();
         return std::move(*out_res);
     }
 
@@ -439,10 +524,9 @@ public:
         auto out_res = CudaTensor::create_empty(C, R, *this);
         if (!out_res) return std::unexpected(out_res.error());
 
-        int err = cuda_transpose(A.data(), out_res->data(), R, C, nullptr);
+        int err = cuda_transpose(A.data(), out_res->data(), R, C, stream_ptr());
         if (err != 0) return std::unexpected(Error{"cuda_transpose failed"});
 
-        cudaDeviceSynchronize();
         return std::move(*out_res);
     }
 
@@ -460,17 +544,17 @@ public:
         auto out_res = CudaTensor::create_empty(out_rows, out_cols, *this);
         if (!out_res) return std::unexpected(out_res.error());
 
-        int err = cuda_rearrange_3d(input.data(), out_res->data(), M, B, N, inverse, nullptr);
+        int err = cuda_rearrange_3d(input.data(), out_res->data(), M, B, N, inverse, stream_ptr());
         if (err != 0) return std::unexpected(Error{"cuda_rearrange_3d failed"});
 
-        cudaDeviceSynchronize();
         return std::move(*out_res);
     }
 
     // ── Fill zero ─────────────────────────────────────────────────────────
     [[nodiscard]] Result<void> fill_zero_gpu(CudaTensor& tensor)
     {
-        auto err = cudaMemset(tensor.data(), 0, tensor.rows() * tensor.cols() * sizeof(float));
+        auto err = cudaMemsetAsync(tensor.data(), 0,
+                                   tensor.rows() * tensor.cols() * sizeof(float), stream_);
         return NN_CUDA_CHECK(err);
     }
 
@@ -480,9 +564,9 @@ public:
         auto dst_res = CudaTensor::create_empty(src.rows(), src.cols(), *this);
         if (!dst_res) return std::unexpected(dst_res.error());
 
-        auto err = cudaMemcpy(dst_res->data(), src.data(),
-                              src.rows() * src.cols() * sizeof(float),
-                              cudaMemcpyDeviceToDevice);
+        auto err = cudaMemcpyAsync(dst_res->data(), src.data(),
+                                   src.rows() * src.cols() * sizeof(float),
+                                   cudaMemcpyDeviceToDevice, stream_);
         if (err != cudaSuccess)
             return std::unexpected(Error{"cudaMemcpy D2D failed"});
 
@@ -502,9 +586,9 @@ public:
         const std::size_t bytes = count * src.cols() * sizeof(float);
         const std::size_t src_offset = start_row * src.cols() * sizeof(float);
 
-        auto err = cudaMemcpy(dst_res->data(),
-                              static_cast<const char*>(src.buffer().ptr()) + src_offset,
-                              bytes, cudaMemcpyDeviceToDevice);
+        auto err = cudaMemcpyAsync(dst_res->data(),
+                                   static_cast<const char*>(src.buffer().ptr()) + src_offset,
+                                   bytes, cudaMemcpyDeviceToDevice, stream_);
         if (err != cudaSuccess)
             return std::unexpected(Error{"slice_rows cudaMemcpy failed"});
 
@@ -523,8 +607,8 @@ public:
         const std::size_t bytes = src.rows() * src.cols() * sizeof(float);
         const std::size_t dst_offset = dst_start_row * dst.cols() * sizeof(float);
 
-        auto err = cudaMemcpy(static_cast<char*>(dst.buffer().ptr()) + dst_offset,
-                              src.data(), bytes, cudaMemcpyDeviceToDevice);
+        auto err = cudaMemcpyAsync(static_cast<char*>(dst.buffer().ptr()) + dst_offset,
+                                   src.data(), bytes, cudaMemcpyDeviceToDevice, stream_);
         return NN_CUDA_CHECK(err);
     }
 
@@ -541,10 +625,9 @@ public:
 
         int err = cuda_gather(
             table.data(), indices.data(),
-            out_res->data(), vocab, D, num, nullptr);
+            out_res->data(), vocab, D, num, stream_ptr());
         if (err != 0) return std::unexpected(Error{"cuda_gather failed"});
 
-        cudaDeviceSynchronize();
         return std::move(*out_res);
     }
 
@@ -558,10 +641,9 @@ public:
 
         int err = cuda_scatter_add(
             dst.data(), indices.data(),
-            grad.data(), vocab, D, num, nullptr);
+            grad.data(), vocab, D, num, stream_ptr());
         if (err != 0) return std::unexpected(Error{"cuda_scatter_add failed"});
 
-        cudaDeviceSynchronize();
         return {};
     }
 };

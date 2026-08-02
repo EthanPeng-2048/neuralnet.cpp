@@ -73,6 +73,9 @@ nn_add_executable(bench_thresholds src/bench_thresholds.cpp)
 # ── GPU 测试（需要 Vulkan） ──────────────────────────────────────────────
 nn_add_executable(gpu_test src/gpu_test.cpp)
 
+# ── Attention 一致性验证（forward vs forward_step）──────────────────────
+nn_add_executable(attn_consistency_test src/attn_consistency_test.cpp)
+
 # ── Vulkan GPU 加速（可选） ────────────────────────────────────────────────
 find_package(Vulkan QUIET)
 if(Vulkan_FOUND)
@@ -147,6 +150,7 @@ if(Vulkan_FOUND)
             text_train text_infer
             tokenizer_train tokenizer_infer
             compute_bench bench_thresholds gpu_test
+            attn_consistency_test
         )
 
         foreach(TARGET ${NN_GPU_TARGETS})
@@ -184,30 +188,31 @@ if(NN_ENABLE_CUDA)
     else()
         add_subdirectory(cuda)
         if(NN_CUDA_FOUND)
-        set(NN_CUDA_TARGETS
-            mnist_train mnist_infer mnist_bench
-            text_train text_infer
-            tokenizer_train tokenizer_infer
-            compute_bench bench_thresholds gpu_test
-        )
+            set(NN_CUDA_TARGETS
+                mnist_train mnist_infer mnist_bench
+                text_train text_infer
+                tokenizer_train tokenizer_infer
+                compute_bench bench_thresholds gpu_test
+                attn_consistency_test
+            )
 
-        foreach(TARGET ${NN_CUDA_TARGETS})
-            target_compile_definitions(${TARGET} PRIVATE NN_HAS_CUDA)
+            foreach(TARGET ${NN_CUDA_TARGETS})
+                target_compile_definitions(${TARGET} PRIVATE NN_HAS_CUDA NN_HAS_CUBLAS)
                 target_include_directories(${TARGET} PRIVATE
                     ${NN_CUDA_INCLUDE_DIR}
                     ${CUDAToolkit_INCLUDE_DIRS}
                 )
-                # nvcc 编译的 .obj + CUDA 运行时 + cuBLAS + nvrtc
+                # nvcc 编译的 .obj + CUDA 运行时 + cuBLAS（matmul 加速）
                 target_link_libraries(${TARGET} PRIVATE
                     ${NN_CUDA_KERNELS_OBJ}
                     CUDA::cudart
-                    CUDA::cuda_driver
-                    CUDA::nvrtc
+                    CUDA::cublas
+                    CUDA::cublasLt
                 )
                 add_dependencies(${TARGET} compile_cuda_kernels)
             endforeach()
 
-            message(STATUS "CUDA GPU acceleration enabled (nvcc → obj → link)")
+            message(STATUS "CUDA GPU acceleration enabled (nvcc → obj → link, cuBLAS enabled)")
         else()
             message(WARNING "CUDA not built. GPU acceleration disabled.")
         endif()

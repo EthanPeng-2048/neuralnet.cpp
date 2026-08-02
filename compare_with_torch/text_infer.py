@@ -20,7 +20,13 @@ import torch
 # 确保能 import 同目录下的模块
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from tokenizer import TokenizerAdapter, load_tokenizer_from_file, load_tokenizer_from_string
+from tokenizer import (
+    TokenizerAdapter,
+    CharBPEAdapter,
+    load_tokenizer_from_file,
+    load_tokenizer_from_string,
+    load_charbpe_from_string,
+)
 from model import GPTModel
 
 
@@ -85,24 +91,33 @@ def load_model_and_tokenizer(cfg):
     print(f"加载模型: {cfg.model}")
 
     # 加载 tokenizer
-    tokenizer: TokenizerAdapter | None = None
+    tokenizer: TokenizerAdapter | CharBPEAdapter | None = None
     embedded_json = ckpt.get("tokenizer_json", "")
     if embedded_json:
-        tokenizer = load_tokenizer_from_string(embedded_json)
-        if tokenizer is None:
-            print("解析嵌入 tokenizer 失败（非 tokenizers 库标准格式）", file=sys.stderr)
-            sys.exit(1)
-        print("已从模型文件加载嵌入 tokenizer")
+        # 先尝试 CharBPE 格式，再回退到 tokenizers 库格式
+        tokenizer = load_charbpe_from_string(embedded_json)
+        if tokenizer is not None:
+            print("已从模型文件加载嵌入 CharBPE tokenizer")
+        else:
+            tokenizer = load_tokenizer_from_string(embedded_json)
+            if tokenizer is None:
+                print("解析嵌入 tokenizer 失败", file=sys.stderr)
+                sys.exit(1)
+            print("已从模型文件加载嵌入 tokenizer")
     else:
-        tokenizer = load_tokenizer_from_file(cfg.vocab)
-        if tokenizer is None:
-            print(
-                f"加载词表失败（非 tokenizers 库标准格式）: {cfg.vocab}\n"
-                "请使用 --vocab 指定词表路径，或使用嵌入 tokenizer 的模型",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        print(f"已从外部文件加载 tokenizer: {cfg.vocab}")
+        tokenizer = load_charbpe_from_file(cfg.vocab)
+        if tokenizer is not None:
+            print(f"已从外部文件加载 CharBPE tokenizer: {cfg.vocab}")
+        else:
+            tokenizer = load_tokenizer_from_file(cfg.vocab)
+            if tokenizer is None:
+                print(
+                    f"加载词表失败: {cfg.vocab}\n"
+                    "请使用 --vocab 指定词表路径，或使用嵌入 tokenizer 的模型",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            print(f"已从外部文件加载 tokenizer: {cfg.vocab}")
 
     print(f"词表大小: {tokenizer.vocab_size()}\n")
     return model, tokenizer, device

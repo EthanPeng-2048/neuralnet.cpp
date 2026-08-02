@@ -56,6 +56,8 @@ parse_csv_line(const std::string &line)
 // ── 从 CSV 行加载单张 MNIST 图片 ───────────────────────────────────────────
 // 输入：784 个逗号分隔的像素值（0~255 或归一化后的 0~1）
 // 输出：(784, 1) 列向量 Matrix
+// 保留作为底层解析实现；新代码应优先使用 load_image_tensor_from_csv_line
+// （上层统一用 Tensor）。
 [[nodiscard]] inline Result<Matrix>
 load_image_from_csv_line(const std::string &csv_line)
 {
@@ -70,6 +72,18 @@ load_image_from_csv_line(const std::string &csv_line)
     for (std::size_t i = 0; i < MNIST_INPUT_DIM; ++i)
         img.set_value_unchecked(i, 0, (*values)[i]);
     return img;
+}
+
+// ── 从 CSV 行加载单张 MNIST 图片为 Tensor ────────────────────────────────
+// 上层统一使用 Tensor：内部调用 load_image_from_csv_line 得到 Matrix 后，
+// 通过 engine.from_matrix 上传至对应设备。
+[[nodiscard]] inline Result<Tensor>
+load_image_tensor_from_csv_line(const std::string &csv_line, ComputeEngine& engine)
+{
+    auto mat_r = load_image_from_csv_line(csv_line);
+    if (!mat_r)
+        return std::unexpected(std::move(mat_r).error());
+    return engine.from_matrix(*mat_r);
 }
 
 // 默认 MLP 网络架构：输入层 → 隐藏层1 → 隐藏层2 → 隐藏层3 → 输出层
@@ -93,12 +107,12 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
         std::size_t in_dim  = layer_dims[i];
         std::size_t out_dim = layer_dims[i + 1];
 
-        model.add_linear(in_dim, out_dim);
+        model.add<Linear>(engine, in_dim, out_dim);
 
         if (i < layer_dims.size() - 2)
         {
-            model.add_layer_norm(out_dim)
-                 .add_gelu();
+            model.add<LayerNorm>(engine, out_dim)
+                 .add<GeLU>();
         }
     }
     return model;
@@ -129,22 +143,21 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
     const std::size_t num_patches = grid_size * grid_size;
 
     Model model(engine);
-    model.add_patch_embedding(img_size, patch_size, d_model);
-    model.add_transformer_encoder(d_model, num_heads, d_ff, num_layers, num_patches);
-    model.add_linear(d_model, MNIST_NUM_CLASSES);
+    model.add<PatchEmbedding>(engine, img_size, patch_size, d_model);
+    model.add<TransformerEncoder>(engine, d_model, num_heads, d_ff, num_layers, num_patches);
+    model.add<Linear>(engine, d_model, MNIST_NUM_CLASSES);
     return model;
 }
 
 // ── 构造 MNIST Transformer ModelSpec ───────────────────────────────────────
+// img_size 固定为 MNIST_IMG_SIZE（28×28），故不入参、不写入 spec。
 [[nodiscard]] inline ModelSpec make_mnist_transformer_spec(
-    std::size_t img_size   = MNIST_IMG_SIZE,
     std::size_t patch_size = MNIST_PATCH_SIZE,
     std::size_t d_model    = MNIST_TF_D_MODEL,
     std::size_t num_heads  = MNIST_TF_NUM_HEADS,
     std::size_t d_ff       = MNIST_TF_D_FF,
     std::size_t num_layers = MNIST_TF_NUM_LAYERS)
 {
-    (void)img_size;  // img_size 固定为 MNIST_IMG_SIZE，不写入 spec
     ModelSpec spec;
     spec.type       = ModelType::Transformer;
     spec.d_model    = d_model;

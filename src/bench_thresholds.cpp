@@ -387,8 +387,6 @@ static void bench_gpu_threshold(int warmup, int iters)
     };
 
     std::cout << std::fixed << std::setprecision(2);
-    bool old_gpu_enabled = nn::SmartPolicy::gpu_enabled;
-    nn::SmartPolicy::gpu_enabled = false;  // 先测 CPU 路径
 
     for (auto [M, K, N, label] : cases)
     {
@@ -396,14 +394,11 @@ static void bench_gpu_threshold(int warmup, int iters)
         auto B = rand_matrix(K, N);
         Matrix C(M, N);
 
-        // CPU 路径
-        nn::SmartPolicy::gpu_enabled = false;
+        // CPU 路径（multiply_to 现已无 GPU 分支，直接测 CPU 实现）
         auto t_cpu = bench_us([&] { A.multiply_to(C, B); }, warmup, iters);
 
-        // GPU 路径（通过 matmul_direct）
-        nn::SmartPolicy::gpu_enabled = true;
+        // GPU 路径（通过 matmul_direct 直接调用，不经过 multiply_to）
         auto t_gpu = bench_us([&] {
-            // 直接调用 backend.matmul_direct（绕过 SmartPolicy 阈值检查）
             auto r = backend.matmul_direct(A.span(), B.span(), C.span(), M, N, K);
             (void)r;
         }, warmup, iters);
@@ -424,7 +419,6 @@ static void bench_gpu_threshold(int warmup, int iters)
                   << "  │\n";
     }
     std::cout << "└─────────────┴──────────┴──────────┴──────────┴──────────┴────────┘\n";
-    nn::SmartPolicy::gpu_enabled = old_gpu_enabled;
 }
 #endif  // NN_HAS_VULKAN
 

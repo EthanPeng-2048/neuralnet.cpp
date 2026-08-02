@@ -62,7 +62,7 @@ struct ModelSpec
     [[nodiscard]] bool is_mlp()         const noexcept { return type == ModelType::MLP; }
     [[nodiscard]] bool is_transformer() const noexcept { return type == ModelType::Transformer; }
     [[nodiscard]] bool is_gpt()         const noexcept { return type == ModelType::GPT; }
-    [[nodiscard]] bool is_alibi_gpt()   const noexcept { return type == ModelType::ALiBi_GPT || (type == ModelType::GPT && pos_encoding == PosEncodingType::ALiBi); }
+    [[nodiscard]] bool is_alibi_gpt()   const noexcept { return pos_encoding == PosEncodingType::ALiBi; }
 };
 
 } // namespace nn

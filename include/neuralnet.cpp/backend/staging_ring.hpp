@@ -39,7 +39,13 @@ public:
     // 会根据 host-visible 显存大小自动扩容，此值仅作为下限参考）
     static constexpr std::size_t DEFAULT_REGION_SIZE = 64ull * 1024 * 1024; // 64MB
     static constexpr std::size_t DEFAULT_NUM_REGIONS = 2;
+    // host-visible 显存预算占比的倒数（实际取 1/HOST_VISIBLE_FRACTION）
+    static constexpr VkDeviceSize HOST_VISIBLE_FRACTION = 16;
+    // 动态计算 staging 大小的下限，避免小显存机器分配过小
+    static constexpr VkDeviceSize MIN_REGION_SIZE = 32ull * 1024 * 1024;
 
+private:
+    // Staging region 内部结构（外部通过索引访问，无需直接使用此类型）
     struct Region
     {
         MemoryPool::Allocation alloc;
@@ -49,7 +55,6 @@ public:
         bool in_flight = false;
     };
 
-private:
     VkDevice device_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
     VkCommandPool cmd_pool_ = VK_NULL_HANDLE;
@@ -87,9 +92,9 @@ public:
             }
         }
 
-        VkDeviceSize calculated_size = max_host_visible / 16;
-        if (calculated_size < 32ull * 1024 * 1024)
-            calculated_size = 32ull * 1024 * 1024;
+        VkDeviceSize calculated_size = max_host_visible / HOST_VISIBLE_FRACTION;
+        if (calculated_size < MIN_REGION_SIZE)
+            calculated_size = MIN_REGION_SIZE;
 
         // 最终取 用户请求值 与 动态计算值 的较大者
         // （不再人为封顶 64MB，避免大 batch / 大 vocab 时上传失败）
