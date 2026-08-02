@@ -54,8 +54,9 @@ def parse_args():
     parser.add_argument(
         "--optimizer",
         default="adam",
-        choices=["sgd", "sgd_momentum", "adam"],
+        choices=["sgd", "sgd_momentum", "adam", "adamw"],
     )
+    parser.add_argument("--weight-decay", type=float, default=0.0, help="权重衰减 (AdamW)")
     parser.add_argument("--d-model", type=int, default=GPT_D_MODEL)
     parser.add_argument("--num-heads", type=int, default=GPT_NUM_HEADS)
     parser.add_argument("--num-layers", type=int, default=GPT_NUM_LAYERS)
@@ -101,7 +102,7 @@ def prepare_samples(text: str, tokenizer: TokenizerAdapter) -> list[list[int]]:
     return samples
 
 
-def build_optimizer(name: str, model: nn.Module, lr: float):
+def build_optimizer(name: str, model: nn.Module, lr: float, weight_decay: float = 0.0):
     """创建优化器（与 C++ create_optimizer 对应）。"""
     if name == "sgd":
         return optim.SGD(model.parameters(), lr=lr)
@@ -110,6 +111,12 @@ def build_optimizer(name: str, model: nn.Module, lr: float):
     if name == "adam":
         # C++ Adam 默认: beta1=0.9, beta2=0.999, eps=1e-8（与 PyTorch 默认一致）
         return optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.999), eps=1e-8)
+    if name == "adamw":
+        # AdamW: 解耦权重衰减（与 C++ AdamW 一致）
+        return optim.AdamW(
+            model.parameters(), lr=lr, betas=(0.9, 0.999), eps=1e-8,
+            weight_decay=weight_decay,
+        )
     raise ValueError(f"未知优化器: {name}")
 
 
@@ -216,7 +223,7 @@ def main():
     print(f"  Transformer 层数: {cfg.num_layers}")
     print(f"  FFN 维度: {cfg.d_ff}")
     print(f"  序列长度: {cfg.seq_len}")
-    print(f"  优化器: {cfg.optimizer}  学习率: {cfg.lr}")
+    print(f"  优化器: {cfg.optimizer}  学习率: {cfg.lr}  权重衰减: {cfg.weight_decay}")
     print(f"  轮数: {cfg.epochs}  批大小: {cfg.batch_size}")
     print(f"  设备: {device}")
     print("========================================\n")
@@ -232,7 +239,7 @@ def main():
     ).to(device)
 
     # ── 优化器 ───────────────────────────────────────────────
-    optimizer = build_optimizer(cfg.optimizer, model, cfg.lr)
+    optimizer = build_optimizer(cfg.optimizer, model, cfg.lr, cfg.weight_decay)
 
     # ── 恢复训练 ─────────────────────────────────────────────
     start_epoch = 0

@@ -77,6 +77,19 @@ nn::Result<Matrix> engine_matmul(
     return engine.to_matrix(*c_t);
 }
 
+// 数字解析辅助：解析失败时打印错误并退出（替代会抛异常的 std::stoi/stod）
+template <typename T>
+T parse_num_or_die(const char* s, const char* opt)
+{
+    auto v = nn::parse_number<T>(s);
+    if (!v)
+    {
+        std::cerr << "无效的 " << opt << " 值: " << v.error().message << "\n";
+        std::exit(1);
+    }
+    return *v;
+}
+
 int main(int argc, char* argv[])
 {
     std::size_t N = 256;
@@ -86,8 +99,8 @@ int main(int argc, char* argv[])
     {
         std::string arg = argv[i];
         if (arg == "--help") { print_usage(argv[0]); return 0; }
-        else if (arg == "--size" && i + 1 < argc) N = static_cast<std::size_t>(std::stoi(argv[++i]));
-        else if (arg == "--iters" && i + 1 < argc) iters = std::stoi(argv[++i]);
+        else if (arg == "--size" && i + 1 < argc) N = static_cast<std::size_t>(parse_num_or_die<int>(argv[++i], "--size"));
+        else if (arg == "--iters" && i + 1 < argc) iters = parse_num_or_die<int>(argv[++i], "--iters");
         else { std::cerr << "未知参数: " << arg << "\n"; return 1; }
     }
 

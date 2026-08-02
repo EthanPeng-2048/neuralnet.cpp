@@ -55,29 +55,31 @@ public:
 
     static constexpr std::size_t npos = static_cast<std::size_t>(-1);
 
+    // UTF-8 替换字符 U+FFFD（解码未知 ID 时的回退）
+    static constexpr std::string_view REPLACEMENT_CHAR = "\xef\xbf\xbd";
+
     // ── 从 JSON 字符串加载（纯内存解析，零磁盘 I/O） ──────────────
     // 子类重写此方法以支持从 JSON 字符串直接加载词表。
-    // 默认实现：先写临时文件再调用 load(path)，子类应直接解析字符串。
     [[nodiscard]] virtual Result<void> load_from_string(const std::string &json_content) = 0;
 
-    // ── 从 JSON 字符串加载（公共入口，委托给虚方法） ──────────────
-    [[nodiscard]] Result<void> load_json(const std::string &json_content)
-    {
-        return load_from_string(json_content);
-    }
+    // ── 对话标记集合（基类持有，子类直接复用，无需各自重定义） ──────
+    struct DialogueMarkers {
+        std::size_t system = npos, user = npos, assistant = npos;
+        std::size_t system_end = npos, user_end = npos, assistant_end = npos;
+    };
 
-    // ── 对话标记 token（默认未定义，子类重写以启用） ──────────────
-    [[nodiscard]] virtual std::size_t system_marker_id()    const noexcept { return npos; }
-    [[nodiscard]] virtual std::size_t user_marker_id()      const noexcept { return npos; }
-    [[nodiscard]] virtual std::size_t assistant_marker_id() const noexcept { return npos; }
-    [[nodiscard]] virtual std::size_t end_system_marker_id()    const noexcept { return npos; }
-    [[nodiscard]] virtual std::size_t end_user_marker_id()      const noexcept { return npos; }
-    [[nodiscard]] virtual std::size_t end_assistant_marker_id() const noexcept { return npos; }
+    // ── 对话标记 token（默认从 markers_ 读取，子类一般无需重写） ─────
+    [[nodiscard]] virtual std::size_t system_marker_id()        const noexcept { return markers_.system; }
+    [[nodiscard]] virtual std::size_t user_marker_id()          const noexcept { return markers_.user; }
+    [[nodiscard]] virtual std::size_t assistant_marker_id()    const noexcept { return markers_.assistant; }
+    [[nodiscard]] virtual std::size_t end_system_marker_id()   const noexcept { return markers_.system_end; }
+    [[nodiscard]] virtual std::size_t end_user_marker_id()      const noexcept { return markers_.user_end; }
+    [[nodiscard]] virtual std::size_t end_assistant_marker_id() const noexcept { return markers_.assistant_end; }
 
     // ── 是否包含对话标记 ──────────────────────────────────────
     [[nodiscard]] bool has_dialogue_markers() const noexcept
     {
-        return system_marker_id() != npos;
+        return markers_.system != npos;
     }
 
     // ── 从词表中恢复对话标记 ID（加载后调用） ─────────────────
@@ -109,16 +111,38 @@ public:
                 { ids[i] = vocab.size(); vocab.emplace_back(marker_strs[i]); }
             }
         }
-        // 通过虚方法设置子类的 marker_ 字段
+        // 通过虚方法设置 markers_（基类默认实现赋值 markers_）
         set_dialogue_marker_ids(ids[0], ids[1], ids[2], ids[3], ids[4], ids[5]);
     }
 
 protected:
-    virtual void set_dialogue_marker_ids(
-        std::size_t, std::size_t,
-        std::size_t, std::size_t,
-        std::size_t, std::size_t) {}
+    // 对话标记 ID 集合（子类直接读取，无需各自定义 6 个字段）
+    DialogueMarkers markers_;
 
+    // 默认实现：将参数赋值到 markers_（子类一般无需重写）
+    virtual void set_dialogue_marker_ids(
+        std::size_t system, std::size_t end_system,
+        std::size_t user, std::size_t end_user,
+        std::size_t assistant, std::size_t end_assistant)
+    {
+        markers_.system        = system;
+        markers_.system_end    = end_system;
+        markers_.user          = user;
+        markers_.user_end      = end_user;
+        markers_.assistant      = assistant;
+        markers_.assistant_end = end_assistant;
+    }
+
+    // 添加 6 个对话标记到词表末尾，并绑定 ID 到 markers_
+    void add_dialogue_markers_to_vocab_(std::vector<std::string> &vocab)
+    {
+        markers_.system        = vocab.size(); vocab.emplace_back("<system>");
+        markers_.system_end    = vocab.size(); vocab.emplace_back("</system>");
+        markers_.user          = vocab.size(); vocab.emplace_back("<user>");
+        markers_.user_end      = vocab.size(); vocab.emplace_back("</user>");
+        markers_.assistant      = vocab.size(); vocab.emplace_back("<assistant>");
+        markers_.assistant_end = vocab.size(); vocab.emplace_back("</assistant>");
+    }
 
     // ── 辅助：尝试匹配对话标记，返回 (token_id, 匹配字节数)，不匹配返回 (npos, 0) ──
     [[nodiscard]] std::pair<std::size_t, std::size_t>
@@ -132,16 +156,294 @@ protected:
             if (pos + m.size() <= text.size() && text.substr(pos, m.size()) == m)
             {
                 std::size_t id = npos;
-                if (m == "<system>")         id = system_marker_id();
-                else if (m == "</system>")    id = end_system_marker_id();
-                else if (m == "<user>")       id = user_marker_id();
-                else if (m == "</user>")      id = end_user_marker_id();
-                else if (m == "<assistant>")   id = assistant_marker_id();
-                else if (m == "</assistant>")  id = end_assistant_marker_id();
+                if      (m == "<system>")     id = markers_.system;
+                else if (m == "</system>")    id = markers_.system_end;
+                else if (m == "<user>")       id = markers_.user;
+                else if (m == "</user>")      id = markers_.user_end;
+                else if (m == "<assistant>")  id = markers_.assistant;
+                else if (m == "</assistant>") id = markers_.assistant_end;
                 if (id != npos) return {id, m.size()};
             }
         }
         return {npos, 0};
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  BPE 共享构件（供 BPETokenizer / CharBPETokenizer 复用）
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // BPE 合并规则（基类共享，子类直接复用，无需各自定义）
+    struct MergeRule { std::size_t id_a, id_b, new_id; };
+
+    // 64 位编码 pair：(a, b) → 单个 uint64_t，消除自定义 hash 开销
+    // 要求 a, b < 2^32（词表大小不会超过此限制）
+    [[nodiscard]] static constexpr std::uint64_t pair_key(std::size_t a, std::size_t b) noexcept
+    {
+        return (static_cast<std::uint64_t>(a) << 32) | static_cast<std::uint64_t>(b);
+    }
+
+    // 共享 BPE 训练：在已初始化的词表和 ID 序列上执行合并循环。
+    // vocab 由子类传入（子类的 vocab_），merges_ / merge_map_ 为基类成员。
+    // 训练结束后由调用方负责 rebuild_merge_map() 和 add_dialogue_markers_to_vocab_()。
+    void bpe_train_impl_(
+        std::vector<std::string> &vocab,
+        std::vector<std::vector<std::size_t>> &chunks,
+        std::size_t target_merges,
+        std::uint32_t min_freq,
+        const std::function<void(std::string_view)> &log)
+    {
+        // ── 增量 pair 频次统计（避免每轮重扫全部 chunk） ──────
+        // 用 64 位编码 pair：(a << 32) | b，消除 pair_hash 开销
+        std::unordered_map<std::uint64_t, std::size_t> pair_freq;
+        for (const auto &chunk : chunks)
+            for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
+                ++pair_freq[pair_key(chunk[i], chunk[i + 1])];
+
+        for (std::size_t round = 0; round < target_merges; ++round)
+        {
+            if (pair_freq.empty()) break;
+
+            auto best = std::ranges::max_element(pair_freq,
+                [](const auto &a, const auto &b) { return a.second < b.second; });
+
+            if (best->second < min_freq)
+            {
+                log("  无更多高频 pair，提前停止于第 " + std::to_string(round) + " 轮");
+                break;
+            }
+
+            const std::uint64_t best_key = best->first;
+            const std::size_t id_a = static_cast<std::size_t>(best_key >> 32);
+            const std::size_t id_b = static_cast<std::size_t>(best_key & 0xFFFFFFFF);
+            const std::size_t new_id = vocab.size();
+            vocab.push_back(vocab[id_a] + vocab[id_b]);
+            merges_.push_back({id_a, id_b, new_id});
+
+            // 应用合并到所有 chunk（原地压缩 + 增量更新 pair_freq）
+            for (auto &chunk : chunks)
+            {
+                // 检测本 chunk 是否包含合并 pair
+                bool has_merge = false;
+                for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
+                    if (chunk[i] == id_a && chunk[i + 1] == id_b) { has_merge = true; break; }
+                if (!has_merge) continue;
+
+                // 减去旧 pair 频次
+                for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
+                {
+                    auto key = pair_key(chunk[i], chunk[i + 1]);
+                    auto it = pair_freq.find(key);
+                    if (it != pair_freq.end() && --it->second == 0)
+                        pair_freq.erase(it);
+                }
+
+                // 原地压缩
+                std::size_t write = 0;
+                std::size_t read = 0;
+                while (read < chunk.size())
+                {
+                    if (read + 1 < chunk.size() && chunk[read] == id_a && chunk[read + 1] == id_b)
+                    {
+                        chunk[write++] = new_id;
+                        read += 2;
+                    }
+                    else
+                        chunk[write++] = chunk[read++];
+                }
+                chunk.resize(write);
+
+                // 加上新 pair 频次
+                for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
+                    ++pair_freq[pair_key(chunk[i], chunk[i + 1])];
+            }
+
+            if ((round + 1) % 500 == 0)
+                log("  合并第 " + std::to_string(round + 1) + " 轮，词表: " +
+                    std::to_string(vocab.size()));
+        }
+    }
+
+    // 共享 BPE 合并：对单个 ID 序列应用合并规则（优先队列驱动，O(n log n)）。
+    // 使用基类的 merges_ 与 merge_priority_。
+    [[nodiscard]] std::vector<std::size_t>
+    bpe_merge_impl_(std::vector<std::size_t> ids) const
+    {
+        if (ids.size() <= 1) return ids;
+
+        const std::size_t n = ids.size();
+        std::vector<std::size_t> ll_prev(n), ll_next(n);
+        for (std::size_t j = 0; j < n; ++j)
+        {
+            ll_prev[j] = (j == 0) ? n : j - 1;
+            ll_next[j] = (j + 1 == n) ? n : j + 1;
+        }
+        std::vector<bool> alive(n, true);
+
+        using HeapEntry = std::pair<std::size_t, std::size_t>;
+        std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
+
+        auto push_pair = [&](std::size_t pos) {
+            std::size_t nxt = ll_next[pos];
+            if (nxt < n && alive[pos] && alive[nxt])
+            {
+                std::size_t prio = merge_priority_(ids[pos], ids[nxt]);
+                if (prio < merges_.size())
+                    heap.push({prio, pos});
+            }
+        };
+
+        for (std::size_t j = 0; j + 1 < n; ++j)
+            push_pair(j);
+
+        while (!heap.empty())
+        {
+            auto [prio, pos] = heap.top();
+            heap.pop();
+
+            if (!alive[pos]) continue;
+            std::size_t nxt = ll_next[pos];
+            if (nxt >= n || !alive[nxt]) continue;
+            if (merge_priority_(ids[pos], ids[nxt]) != prio) continue;
+
+            ids[pos] = merges_[prio].new_id;
+            alive[nxt] = false;
+
+            std::size_t prev = ll_prev[pos];
+            std::size_t after = ll_next[nxt];
+            ll_next[pos] = after;
+            if (after < n) ll_prev[after] = pos;
+
+            if (prev < n && alive[prev])
+                push_pair(prev);
+            push_pair(pos);
+        }
+
+        // 按链表顺序收集结果
+        std::vector<std::size_t> result;
+        std::size_t cur = 0;
+        do {
+            result.push_back(ids[cur]);
+            cur = ll_next[cur];
+        } while (cur < n);
+        return result;
+    }
+
+    // BPE 子类共享的合并规则表与查找表（BPE/CharBPE 使用，其他子类不访问）
+    std::vector<MergeRule> merges_;
+    std::unordered_map<std::uint64_t, std::size_t> merge_map_;
+
+    // 重建 merge_map_，需要在 merges_ 改变后调用
+    void rebuild_merge_map_()
+    {
+        merge_map_.clear();
+        merge_map_.reserve(merges_.size());
+        for (std::size_t i = 0; i < merges_.size(); ++i)
+            merge_map_[pair_key(merges_[i].id_a, merges_[i].id_b)] = i;
+    }
+
+    // O(1) 查找：(a, b) → 优先级（merges_ 中的索引），不存在返回 merges_.size()
+    [[nodiscard]] std::size_t merge_priority_(std::size_t a, std::size_t b) const noexcept
+    {
+        auto it = merge_map_.find(pair_key(a, b));
+        return it != merge_map_.end() ? it->second : merges_.size();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  JSON save/load 共享构件
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // 写入 JSON 头部 + vocab 段 + vocab_size 字段。
+    // 子类继续追加差异段（merges / special_tokens / decompose 等）并以 "\n}\n" 结尾。
+    // start_id: 起始写入的 token ID（用于跳过特殊 token 槽位）。
+    void save_vocab_json_(std::ofstream &ofs, std::string_view type_str, std::size_t start_id) const
+    {
+        const auto &v = vocab();
+        ofs << "{\n  \"type\": \"" << type_str << "\",\n  \"vocab\": {\n";
+        bool first = true;
+        for (std::size_t tid = start_id; tid < v.size(); ++tid)
+        {
+            if (v[tid].empty()) continue;
+            if (!first) ofs << ",\n";
+            first = false;
+            ofs << "    \"" << std::dec << tid << "\": \"";
+            write_vocab_entry_(ofs, v[tid], tid);
+            ofs << "\"" << std::dec;
+        }
+        ofs << "\n  },\n  \"vocab_size\": " << std::dec << v.size();
+    }
+
+    // 钩子：默认 hex 编码所有字节。
+    // CharBPETokenizer 重写以对前 4 个特殊 token (<pad>/<unk>/<bos>/<eos>) 用纯文本。
+    virtual void write_vocab_entry_(std::ofstream &ofs, const std::string &tok, std::size_t /*tid*/) const
+    {
+        for (unsigned char b : tok)
+            ofs << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(b);
+    }
+
+    // 从 JSON 内容解析 vocab 段，返回按 ID 索引的词表向量。
+    // 调用 decode_vocab_entry_(raw, tid) 解码每个条目（默认 hex，CharBPE 重写）。
+    std::vector<std::string> parse_vocab_json_(const std::string &content) const
+    {
+        std::vector<std::string> vocab;
+        if (auto p = content.find("\"vocab_size\""); p != std::string::npos)
+            if (auto c = content.find(':', p); c != std::string::npos)
+            {
+                ++c; while (c < content.size() && content[c] == ' ') ++c;
+                std::size_t v = 0;
+                if (auto [ptr, ec] = std::from_chars(content.data() + c, content.data() + content.size(), v); ec == std::errc{})
+                    vocab.resize(v);
+            }
+
+        auto vp = content.find("\"vocab\"");
+        if (vp == std::string::npos) return vocab;
+        auto br = content.find('{', vp);
+        if (br == std::string::npos) return vocab;
+
+        std::size_t pos = br + 1;
+        while (pos < content.size())
+        {
+            while (pos < content.size() && (content[pos] == ' ' || content[pos] == '\n' ||
+                   content[pos] == '\r' || content[pos] == '\t' || content[pos] == ',')) ++pos;
+            if (pos >= content.size() || content[pos] == '}') break;
+            if (content[pos] != '"') { ++pos; continue; }
+            ++pos;
+            std::string key;
+            while (pos < content.size() && content[pos] != '"') key += content[pos++];
+            ++pos;
+            while (pos < content.size() && (content[pos] == ' ' || content[pos] == ':')) ++pos;
+            if (pos < content.size() && content[pos] == '"')
+            {
+                ++pos;
+                std::string raw;
+                while (pos < content.size() && content[pos] != '"')
+                {
+                    if (content[pos] == '\\' && pos + 1 < content.size()) ++pos;
+                    raw += content[pos++];
+                }
+                ++pos;
+                std::size_t id = 0;
+                std::from_chars(key.data(), key.data() + key.size(), id);
+                std::string tok = decode_vocab_entry_(raw, id);
+                if (id >= vocab.size()) vocab.resize(id + 1);
+                vocab[id] = std::move(tok);
+            }
+        }
+        return vocab;
+    }
+
+    // 钩子：默认将 hex 字符串解码为字节序列。
+    // CharBPETokenizer 重写以对前 4 个特殊 token 用纯文本。
+    virtual std::string decode_vocab_entry_(const std::string &raw, std::size_t /*tid*/) const
+    {
+        std::string tok;
+        tok.reserve(raw.size() / 2);
+        for (std::size_t i = 0; i + 1 < raw.size(); i += 2)
+        {
+            unsigned b = 0;
+            std::from_chars(raw.data() + i, raw.data() + i + 2, b, 16);
+            tok += static_cast<char>(b);
+        }
+        return tok;
     }
 };
 
@@ -177,14 +479,6 @@ public:
     static constexpr std::size_t   DEFAULT_V1_MAX_LEN   = 16;
     static constexpr std::uint32_t DEFAULT_MIN_FREQ     = 2;
 
-    // ── 对话标记 token ID ──────────────────────────────────────────────
-    std::size_t marker_system_    = Tokenizer::npos;
-    std::size_t marker_ussystem_  = Tokenizer::npos;
-    std::size_t marker_user_      = Tokenizer::npos;
-    std::size_t marker_euser_     = Tokenizer::npos;
-    std::size_t marker_assistant_ = Tokenizer::npos;
-    std::size_t marker_eassistant_= Tokenizer::npos;
-
     // ── 日志回调（默认 cout，nullptr 静默） ────────────────────────────
     using LogFn = std::function<void(std::string_view)>;
 
@@ -218,24 +512,6 @@ public:
 
     [[nodiscard]] std::size_t bos_id() const noexcept override { return BOS_ID; }
     [[nodiscard]] std::size_t eos_id() const noexcept override { return EOS_ID; }
-
-    [[nodiscard]] std::size_t system_marker_id()    const noexcept override { return marker_system_; }
-    [[nodiscard]] std::size_t end_system_marker_id()    const noexcept override { return marker_ussystem_; }
-    [[nodiscard]] std::size_t user_marker_id()      const noexcept override { return marker_user_; }
-    [[nodiscard]] std::size_t end_user_marker_id()      const noexcept override { return marker_euser_; }
-    [[nodiscard]] std::size_t assistant_marker_id() const noexcept override { return marker_assistant_; }
-    [[nodiscard]] std::size_t end_assistant_marker_id() const noexcept override { return marker_eassistant_; }
-
-protected:
-    void set_dialogue_marker_ids(
-        std::size_t system, std::size_t end_system,
-        std::size_t user, std::size_t end_user,
-        std::size_t assistant, std::size_t end_assistant) override
-    {
-        marker_system_ = system; marker_ussystem_ = end_system;
-        marker_user_ = user; marker_euser_ = end_user;
-        marker_assistant_ = assistant; marker_eassistant_ = end_assistant;
-    }
 
 public:
     Result<void> train(const std::string &text) { return train(text, Config{}); }
@@ -290,12 +566,7 @@ public:
         }
 
         // ── 添加对话标记 token ──────────────────────────────────────
-        marker_system_    = vocab_.size(); vocab_.emplace_back("<system>");
-        marker_ussystem_  = vocab_.size(); vocab_.emplace_back("</system>");
-        marker_user_      = vocab_.size(); vocab_.emplace_back("<user>");
-        marker_euser_     = vocab_.size(); vocab_.emplace_back("</user>");
-        marker_assistant_ = vocab_.size(); vocab_.emplace_back("<assistant>");
-        marker_eassistant_= vocab_.size(); vocab_.emplace_back("</assistant>");
+        add_dialogue_markers_to_vocab_(vocab_);
 
         // ── 最终查找表 ───────────────────────────────────────────────
         log("\n最终词表: " + std::to_string(vocab_.size()));
@@ -342,7 +613,7 @@ public:
         while (pos < text.size())
         {
             // 对话标记优先匹配
-            if (marker_system_ != Tokenizer::npos)
+            if (has_dialogue_markers())
             {
                 auto [mid, mlen] = try_match_marker(text, pos);
                 if (mid != Tokenizer::npos)
@@ -354,7 +625,7 @@ public:
             auto s = pos;
             while (pos < text.size())
             {
-                if (marker_system_ != Tokenizer::npos)
+                if (has_dialogue_markers())
                 { auto [mid, mlen] = try_match_marker(text, pos); if (mid != Tokenizer::npos) break; }
                 if (WordZipTokenizer::try_contraction(text, pos) > 0 && pos > s) break;
                 ++pos;
@@ -376,13 +647,13 @@ public:
         for (auto tid : ids)
         {
             // 对话标记 → 原始文本
-            if (tid == marker_system_)     { raw += "<system>";     continue; }
-            if (tid == marker_ussystem_)   { raw += "</system>";    continue; }
-            if (tid == marker_user_)       { raw += "<user>";       continue; }
-            if (tid == marker_euser_)      { raw += "</user>";      continue; }
-            if (tid == marker_assistant_)  { raw += "<assistant>";  continue; }
-            if (tid == marker_eassistant_) { raw += "</assistant>"; continue; }
-            raw += tid < vocab_.size() ? vocab_[tid] : std::string{"\xef\xbf\xbd"};
+            if (tid == markers_.system)        { raw += "<system>";     continue; }
+            if (tid == markers_.system_end)    { raw += "</system>";    continue; }
+            if (tid == markers_.user)          { raw += "<user>";       continue; }
+            if (tid == markers_.user_end)      { raw += "</user>";      continue; }
+            if (tid == markers_.assistant)     { raw += "<assistant>";  continue; }
+            if (tid == markers_.assistant_end) { raw += "</assistant>"; continue; }
+            raw += tid < vocab_.size() ? vocab_[tid] : std::string{REPLACEMENT_CHAR};
         }
         return raw;
     }
@@ -983,6 +1254,7 @@ private:
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  SpaceTokenizer — 基于空格的分词器
+//  注：未在生产线使用，仅保留作对比实现（与 WordZip/BPE 对照分词效果）。
 // ═══════════════════════════════════════════════════════════════════════════
 //  训练：按空格分词 → 词频统计 → 截断 top-N 填充词表
 //  编码：空格分词 → 查词表 → 未命中则逐字符 ASCII 回退
@@ -999,33 +1271,6 @@ public:
     static constexpr std::size_t DEFAULT_VOCAB_SIZE = 10000;
     static constexpr std::uint32_t DEFAULT_MIN_FREQ = 2;
 
-    // ── 对话标记 token ID ──────────────────────────────────────────────
-    std::size_t marker_system_    = Tokenizer::npos;
-    std::size_t marker_ussystem_  = Tokenizer::npos;
-    std::size_t marker_user_      = Tokenizer::npos;
-    std::size_t marker_euser_     = Tokenizer::npos;
-    std::size_t marker_assistant_ = Tokenizer::npos;
-    std::size_t marker_eassistant_= Tokenizer::npos;
-
-    [[nodiscard]] std::size_t system_marker_id()    const noexcept override { return marker_system_; }
-    [[nodiscard]] std::size_t end_system_marker_id()    const noexcept override { return marker_ussystem_; }
-    [[nodiscard]] std::size_t user_marker_id()      const noexcept override { return marker_user_; }
-    [[nodiscard]] std::size_t end_user_marker_id()      const noexcept override { return marker_euser_; }
-    [[nodiscard]] std::size_t assistant_marker_id() const noexcept override { return marker_assistant_; }
-    [[nodiscard]] std::size_t end_assistant_marker_id() const noexcept override { return marker_eassistant_; }
-
-protected:
-    void set_dialogue_marker_ids(
-        std::size_t system, std::size_t end_system,
-        std::size_t user, std::size_t end_user,
-        std::size_t assistant, std::size_t end_assistant) override
-    {
-        marker_system_ = system; marker_ussystem_ = end_system;
-        marker_user_ = user; marker_euser_ = end_user;
-        marker_assistant_ = assistant; marker_eassistant_ = end_assistant;
-    }
-
-public:
     using LogFn = std::function<void(std::string_view)>;
 
     struct Config
@@ -1085,12 +1330,7 @@ public:
         }
 
         // ── 添加对话标记 token ──────────────────────────────────────
-        marker_system_    = id_to_token_.size(); id_to_token_.emplace_back("<system>");
-        marker_ussystem_  = id_to_token_.size(); id_to_token_.emplace_back("</system>");
-        marker_user_      = id_to_token_.size(); id_to_token_.emplace_back("<user>");
-        marker_euser_     = id_to_token_.size(); id_to_token_.emplace_back("</user>");
-        marker_assistant_ = id_to_token_.size(); id_to_token_.emplace_back("<assistant>");
-        marker_eassistant_= id_to_token_.size(); id_to_token_.emplace_back("</assistant>");
+        add_dialogue_markers_to_vocab_(id_to_token_);
         build_lookup();
         log("最终词表: " + std::to_string(id_to_token_.size()));
         return {};
@@ -1103,7 +1343,7 @@ public:
         while (pos < text.size())
         {
             // 对话标记优先匹配
-            if (marker_system_ != Tokenizer::npos)
+            if (has_dialogue_markers())
             {
                 auto [mid, mlen] = try_match_marker(text, pos);
                 if (mid != Tokenizer::npos)
@@ -1117,7 +1357,7 @@ public:
             while (pos < text.size() && text[pos] != ' ' && text[pos] != '\t' &&
                    text[pos] != '\n' && text[pos] != '\r')
             {
-                if (marker_system_ != Tokenizer::npos)
+                if (has_dialogue_markers())
                 { auto [mid, mlen] = try_match_marker(text, pos); if (mid != Tokenizer::npos) break; }
                 ++pos;
             }
@@ -1143,12 +1383,12 @@ public:
         for (auto id : ids)
         {
             // 对话标记 → 原始文本
-            if (id == marker_system_)     { result += "<system>";     continue; }
-            if (id == marker_ussystem_)   { result += "</system>";    continue; }
-            if (id == marker_user_)       { result += "<user>";       continue; }
-            if (id == marker_euser_)      { result += "</user>";      continue; }
-            if (id == marker_assistant_)  { result += "<assistant>";  continue; }
-            if (id == marker_eassistant_) { result += "</assistant>"; continue; }
+            if (id == markers_.system)        { result += "<system>";     continue; }
+            if (id == markers_.system_end)    { result += "</system>";    continue; }
+            if (id == markers_.user)          { result += "<user>";       continue; }
+            if (id == markers_.user_end)      { result += "</user>";      continue; }
+            if (id == markers_.assistant)     { result += "<assistant>";  continue; }
+            if (id == markers_.assistant_end) { result += "</assistant>"; continue; }
             if (id < id_to_token_.size())
             {
                 const auto &tok = id_to_token_[id];
@@ -1284,14 +1524,6 @@ public:
     static constexpr std::size_t DEFAULT_VOCAB_SIZE = 5000;
     static constexpr std::size_t DEFAULT_MIN_FREQ   = 2;
 
-    // ── 对话标记 token ID ──────────────────────────────────────────────
-    std::size_t marker_system_    = Tokenizer::npos;
-    std::size_t marker_ussystem_  = Tokenizer::npos;
-    std::size_t marker_user_      = Tokenizer::npos;
-    std::size_t marker_euser_     = Tokenizer::npos;
-    std::size_t marker_assistant_ = Tokenizer::npos;
-    std::size_t marker_eassistant_= Tokenizer::npos;
-
     using LogFn = std::function<void(std::string_view)>;
 
     struct Config
@@ -1315,25 +1547,6 @@ public:
     [[nodiscard]] std::size_t bos_id() const noexcept override { return BOS_ID; }
     [[nodiscard]] std::size_t eos_id() const noexcept override { return EOS_ID; }
 
-    [[nodiscard]] std::size_t system_marker_id()    const noexcept override { return marker_system_; }
-    [[nodiscard]] std::size_t end_system_marker_id()    const noexcept override { return marker_ussystem_; }
-    [[nodiscard]] std::size_t user_marker_id()      const noexcept override { return marker_user_; }
-    [[nodiscard]] std::size_t end_user_marker_id()      const noexcept override { return marker_euser_; }
-    [[nodiscard]] std::size_t assistant_marker_id() const noexcept override { return marker_assistant_; }
-    [[nodiscard]] std::size_t end_assistant_marker_id() const noexcept override { return marker_eassistant_; }
-
-protected:
-    void set_dialogue_marker_ids(
-        std::size_t system, std::size_t end_system,
-        std::size_t user, std::size_t end_user,
-        std::size_t assistant, std::size_t end_assistant) override
-    {
-        marker_system_ = system; marker_ussystem_ = end_system;
-        marker_user_ = user; marker_euser_ = end_user;
-        marker_assistant_ = assistant; marker_eassistant_ = end_assistant;
-    }
-
-public:
     Result<void> train(const std::string &text) { return train(text, Config{}); }
 
     Result<void> train(const std::string &text, const Config &config)
@@ -1374,80 +1587,12 @@ public:
         const std::size_t target_merges = config.vocab_size - BYTE_BASE - 2;
         log("  目标合并数: " + std::to_string(target_merges));
 
-        // ── 增量 pair 频次统计（避免每轮重扫全部 chunk） ──────
-        std::unordered_map<std::pair<std::size_t, std::size_t>, std::size_t, pair_hash> pair_freq;
-        for (const auto &chunk : byte_chunks)
-            for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
-                ++pair_freq[{chunk[i], chunk[i + 1]}];
+        // ── 共享 BPE 训练算法（基类 bpe_train_impl_） ──────────────
+        bpe_train_impl_(vocab_, byte_chunks, target_merges, config.min_freq, log);
 
-        for (std::size_t round = 0; round < target_merges; ++round)
-        {
-            if (pair_freq.empty()) break;
-
-            auto best = std::ranges::max_element(pair_freq,
-                [](const auto &a, const auto &b) { return a.second < b.second; });
-
-            if (best->second < config.min_freq)
-            {
-                log("  无更多高频 pair，提前停止于第 " + std::to_string(round) + " 轮");
-                break;
-            }
-
-            auto [id_a, id_b] = best->first;
-            std::size_t new_id = vocab_.size();
-            vocab_.push_back(vocab_[id_a] + vocab_[id_b]);
-            merges_.push_back({id_a, id_b, new_id});
-
-            // 应用合并到所有 chunk（增量更新 pair_freq）
-            for (auto &chunk : byte_chunks)
-            {
-                // 检测本 chunk 是否包含合并 pair
-                bool has_merge = false;
-                for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
-                    if (chunk[i] == id_a && chunk[i + 1] == id_b) { has_merge = true; break; }
-                if (!has_merge) continue;
-
-                // 减去旧 pair 频次
-                for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
-                {
-                    auto key = std::make_pair(chunk[i], chunk[i + 1]);
-                    auto it = pair_freq.find(key);
-                    if (it != pair_freq.end() && --it->second == 0)
-                        pair_freq.erase(it);
-                }
-
-                // 原地压缩
-                std::size_t write = 0;
-                std::size_t read = 0;
-                while (read < chunk.size())
-                {
-                    if (read + 1 < chunk.size() && chunk[read] == id_a && chunk[read + 1] == id_b)
-                    {
-                        chunk[write++] = new_id;
-                        read += 2;
-                    }
-                    else
-                        chunk[write++] = chunk[read++];
-                }
-                chunk.resize(write);
-
-                // 加上新 pair 频次
-                for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
-                    ++pair_freq[{chunk[i], chunk[i + 1]}];
-            }
-
-            if ((round + 1) % 500 == 0)
-                log("  合并第 " + std::to_string(round + 1) + " 轮，词表: " + std::to_string(vocab_.size()));
-        }
-
-        rebuild_merge_map();
+        rebuild_merge_map_();
         // ── 添加对话标记 token ──────────────────────────────────────
-        marker_system_    = vocab_.size(); vocab_.emplace_back("<system>");
-        marker_ussystem_  = vocab_.size(); vocab_.emplace_back("</system>");
-        marker_user_      = vocab_.size(); vocab_.emplace_back("<user>");
-        marker_euser_     = vocab_.size(); vocab_.emplace_back("</user>");
-        marker_assistant_ = vocab_.size(); vocab_.emplace_back("<assistant>");
-        marker_eassistant_= vocab_.size(); vocab_.emplace_back("</assistant>");
+        add_dialogue_markers_to_vocab_(vocab_);
         log("最终词表: " + std::to_string(vocab_.size()));
         log("合并规则: " + std::to_string(merges_.size()));
         return {};
@@ -1460,7 +1605,7 @@ public:
         while (pos < text.size())
         {
             // 对话标记优先匹配
-            if (marker_system_ != Tokenizer::npos)
+            if (has_dialogue_markers())
             {
                 auto [mid, mlen] = try_match_marker(text, pos);
                 if (mid != Tokenizer::npos)
@@ -1470,7 +1615,7 @@ public:
             auto seg_start = pos;
             while (pos < text.size())
             {
-                if (marker_system_ != Tokenizer::npos)
+                if (has_dialogue_markers())
                 { auto [mid, mlen] = try_match_marker(text, pos); if (mid != Tokenizer::npos) break; }
                 ++pos;
             }
@@ -1484,67 +1629,9 @@ public:
                 for (unsigned char b : chunk)
                     ids.push_back(static_cast<std::size_t>(b));
 
-            if (ids.size() <= 1)
-            {
-                all_ids.insert(all_ids.end(), ids.begin(), ids.end());
-                continue;
-            }
-
-            // ── 优先队列驱动的 BPE 合并 — O(n log n) ─────────
-            const std::size_t n = ids.size();
-            std::vector<std::size_t> ll_prev(n), ll_next(n);
-            for (std::size_t j = 0; j < n; ++j)
-            {
-                ll_prev[j] = (j == 0) ? n : j - 1;
-                ll_next[j] = (j + 1 == n) ? n : j + 1;
-            }
-            std::vector<bool> alive(n, true);
-
-            using HeapEntry = std::pair<std::size_t, std::size_t>;
-            std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
-
-            auto push_pair = [&](std::size_t pos) {
-                std::size_t nxt = ll_next[pos];
-                if (nxt < n && alive[pos] && alive[nxt])
-                {
-                    std::size_t prio = merge_priority(ids[pos], ids[nxt]);
-                    if (prio < merges_.size())
-                        heap.push({prio, pos});
-                }
-            };
-
-            for (std::size_t j = 0; j + 1 < n; ++j)
-                push_pair(j);
-
-            while (!heap.empty())
-            {
-                auto [prio, pos] = heap.top();
-                heap.pop();
-
-                if (!alive[pos]) continue;
-                std::size_t nxt = ll_next[pos];
-                if (nxt >= n || !alive[nxt]) continue;
-                if (merge_priority(ids[pos], ids[nxt]) != prio) continue;
-
-                ids[pos] = merges_[prio].new_id;
-                alive[nxt] = false;
-
-                std::size_t prev = ll_prev[pos];
-                std::size_t after = ll_next[nxt];
-                ll_next[pos] = after;
-                if (after < n) ll_prev[after] = pos;
-
-                if (prev < n && alive[prev])
-                    push_pair(prev);
-                push_pair(pos);
-            }
-
-                // 按链表顺序收集结果
-                std::size_t cur = 0;
-                do {
-                    all_ids.push_back(ids[cur]);
-                    cur = ll_next[cur];
-                } while (cur < n);
+                // 共享 BPE 合并算法（基类 bpe_merge_impl_）
+                auto merged = bpe_merge_impl_(std::move(ids));
+                all_ids.insert(all_ids.end(), merged.begin(), merged.end());
             }
         }
         return all_ids;
@@ -1557,13 +1644,13 @@ public:
         for (auto id : ids)
         {
             // 对话标记 → 原始文本
-            if (id == marker_system_)     { result += "<system>";     continue; }
-            if (id == marker_ussystem_)   { result += "</system>";    continue; }
-            if (id == marker_user_)       { result += "<user>";       continue; }
-            if (id == marker_euser_)      { result += "</user>";      continue; }
-            if (id == marker_assistant_)  { result += "<assistant>";  continue; }
-            if (id == marker_eassistant_) { result += "</assistant>"; continue; }
-            result += id < vocab_.size() ? vocab_[id] : std::string{"\xef\xbf\xbd"};
+            if (id == markers_.system)        { result += "<system>";     continue; }
+            if (id == markers_.system_end)    { result += "</system>";    continue; }
+            if (id == markers_.user)          { result += "<user>";       continue; }
+            if (id == markers_.user_end)      { result += "</user>";      continue; }
+            if (id == markers_.assistant)     { result += "<assistant>";  continue; }
+            if (id == markers_.assistant_end) { result += "</assistant>"; continue; }
+            result += id < vocab_.size() ? vocab_[id] : std::string{REPLACEMENT_CHAR};
         }
         return result;
     }
@@ -1572,20 +1659,9 @@ public:
     {
         std::ofstream ofs(path);
         if (!ofs) return std::unexpected(Error{"Cannot write: " + path});
-        ofs << "{\n  \"type\": \"bpe_tokenizer\",\n  \"vocab\": {\n";
-        bool first = true;
-        for (std::size_t tid = 0; tid < vocab_.size(); ++tid)
-        {
-            if (vocab_[tid].empty()) continue;
-            if (!first) ofs << ",\n";
-            first = false;
-            ofs << "    \"" << std::dec << tid << "\": \"";
-            for (unsigned char b : vocab_[tid])
-                ofs << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(b);
-            ofs << "\"" << std::dec;
-        }
-        ofs << "\n  },\n  \"vocab_size\": " << std::dec << vocab_.size()
-            << ",\n  \"merges\": [";
+        // 共享 JSON 头部 + vocab 段（基类 save_vocab_json_）
+        save_vocab_json_(ofs, "bpe_tokenizer", 0);
+        ofs << ",\n  \"merges\": [";
         for (std::size_t i = 0; i < merges_.size(); ++i)
         {
             if (i > 0) ofs << ",";
@@ -1609,48 +1685,8 @@ public:
         vocab_.clear();
         merges_.clear();
 
-        if (auto p = content.find("\"vocab_size\""); p != std::string::npos)
-            if (auto c = content.find(':', p); c != std::string::npos)
-            {
-                ++c; while (c < content.size() && content[c] == ' ') ++c;
-                std::size_t v = 0;
-                if (auto [ptr, ec] = std::from_chars(content.data()+c, content.data()+content.size(), v); ec == std::errc{})
-                    vocab_.resize(v);
-            }
-
-        auto vp = content.find("\"vocab\"");
-        if (vp != std::string::npos)
-        {
-            auto br = content.find('{', vp);
-            if (br != std::string::npos)
-            {
-                std::size_t pos = br + 1;
-                while (pos < content.size())
-                {
-                    while (pos < content.size() && (content[pos]==' '||content[pos]=='\n'||
-                           content[pos]=='\r'||content[pos]=='\t'||content[pos]==',')) ++pos;
-                    if (pos >= content.size() || content[pos] == '}') break;
-                    if (content[pos] != '"') { ++pos; continue; }
-                    ++pos; std::string key;
-                    while (pos < content.size() && content[pos] != '"') key += content[pos++];
-                    ++pos;
-                    while (pos < content.size() && (content[pos]==' '||content[pos]==':')) ++pos;
-                    if (pos < content.size() && content[pos] == '"')
-                    {
-                        ++pos; std::string hex;
-                        while (pos < content.size() && content[pos] != '"') hex += content[pos++];
-                        ++pos;
-                        std::size_t id = 0;
-                        std::from_chars(key.data(), key.data()+key.size(), id);
-                        std::string tok;
-                        for (std::size_t i = 0; i+1 < hex.size(); i += 2)
-                        { unsigned b = 0; std::from_chars(hex.data()+i, hex.data()+i+2, b, 16); tok += static_cast<char>(b); }
-                        if (id >= vocab_.size()) vocab_.resize(id+1);
-                        vocab_[id] = std::move(tok);
-                    }
-                }
-            }
-        }
+        // 共享 JSON vocab 解析（基类 parse_vocab_json_）
+        vocab_ = parse_vocab_json_(content);
 
         auto mp = content.find("\"merges\"");
         if (mp != std::string::npos)
@@ -1687,7 +1723,7 @@ public:
         }
         // ── 恢复对话标记 ID（从已有词表检测或追加） ─────────────
         restore_dialogue_markers(vocab_);
-        rebuild_merge_map();
+        rebuild_merge_map_();
         return {};
     }
 
@@ -1707,35 +1743,7 @@ public:
     }
 
 private:
-    struct MergeRule { std::size_t id_a, id_b, new_id; };
-
-    struct pair_hash
-    {
-        [[nodiscard]] std::size_t operator()(const std::pair<std::size_t, std::size_t> &p) const noexcept
-        { return p.first * 31 + p.second; }
-    };
-
     std::vector<std::string> vocab_;
-    std::vector<MergeRule> merges_;
-    // ── 合并优先级 hash 表：O(1) 查找替代线性扫描 ─────────────────────
-    // 在 train()/load() 结束时由 rebuild_merge_map() 重建
-    std::unordered_map<std::pair<std::size_t, std::size_t>, std::size_t, pair_hash> merge_map_;
-
-    // 重建 merge_map_，需要在 merges_ 改变后调用
-    void rebuild_merge_map()
-    {
-        merge_map_.clear();
-        merge_map_.reserve(merges_.size());
-        for (std::size_t i = 0; i < merges_.size(); ++i)
-            merge_map_[{merges_[i].id_a, merges_[i].id_b}] = i;
-    }
-
-    // O(1) 查找：(a, b) → 优先级（merges_ 中的索引），不存在返回 merges_.size()
-    [[nodiscard]] std::size_t merge_priority(std::size_t a, std::size_t b) const noexcept
-    {
-        auto it = merge_map_.find({a, b});
-        return it != merge_map_.end() ? it->second : merges_.size();
-    }
 };
 
 
@@ -1786,38 +1794,39 @@ public:
         LogFn         log        = nullptr;
     };
 
-    // ── 对话标记 token ID ──────────────────────────────────────────────
-    std::size_t marker_system_    = Tokenizer::npos;
-    std::size_t marker_ussystem_  = Tokenizer::npos;
-    std::size_t marker_user_      = Tokenizer::npos;
-    std::size_t marker_euser_     = Tokenizer::npos;
-    std::size_t marker_assistant_ = Tokenizer::npos;
-    std::size_t marker_eassistant_= Tokenizer::npos;
-
     CharBPETokenizer() = default;
 
     [[nodiscard]] std::size_t bos_id() const noexcept override { return BOS_ID; }
     [[nodiscard]] std::size_t eos_id() const noexcept override { return EOS_ID; }
 
-    [[nodiscard]] std::size_t system_marker_id()    const noexcept override { return marker_system_; }
-    [[nodiscard]] std::size_t end_system_marker_id()    const noexcept override { return marker_ussystem_; }
-    [[nodiscard]] std::size_t user_marker_id()      const noexcept override { return marker_user_; }
-    [[nodiscard]] std::size_t end_user_marker_id()      const noexcept override { return marker_euser_; }
-    [[nodiscard]] std::size_t assistant_marker_id() const noexcept override { return marker_assistant_; }
-    [[nodiscard]] std::size_t end_assistant_marker_id() const noexcept override { return marker_eassistant_; }
-
-protected:
-    void set_dialogue_marker_ids(
-        std::size_t system, std::size_t end_system,
-        std::size_t user, std::size_t end_user,
-        std::size_t assistant, std::size_t end_assistant) override
+    // ── write_vocab_entry_ 钩子：前 4 个特殊 token 用纯文本，其余 hex ──
+    // 基类 save_vocab_json_ 在写入每个词表条目时回调此虚方法。
+    void write_vocab_entry_(std::ofstream &ofs, const std::string &tok, std::size_t tid) const override
     {
-        marker_system_ = system; marker_ussystem_ = end_system;
-        marker_user_ = user; marker_euser_ = end_user;
-        marker_assistant_ = assistant; marker_eassistant_ = end_assistant;
+        if (tid < 4)
+            ofs << tok;
+        else
+            for (unsigned char b : tok)
+                ofs << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(b);
     }
 
-public:
+    // ── decode_vocab_entry_ 钩子：前 4 个特殊 token 纯文本，其余 hex ──
+    // 基类 parse_vocab_json_ 在解析每个词表条目时回调此虚方法。
+    [[nodiscard]] std::string decode_vocab_entry_(const std::string &raw, std::size_t tid) const override
+    {
+        if (tid < 4)
+            return raw;
+        std::string tok;
+        tok.reserve(raw.size() / 2);
+        for (std::size_t i = 0; i + 1 < raw.size(); i += 2)
+        {
+            unsigned b = 0;
+            std::from_chars(raw.data() + i, raw.data() + i + 2, b, 16);
+            tok += static_cast<char>(b);
+        }
+        return tok;
+    }
+
     Result<void> train(const std::string &text) { return train(text, Config{}); }
 
     Result<void> train(const std::string &text, const Config &config)
@@ -1914,84 +1923,12 @@ public:
                 : 0;
         log("  目标合并数: " + std::to_string(target_merges));
 
-        // ── 增量 pair 频次统计（避免每轮重扫全部 chunk） ──────
-        // 用 64 位编码 pair：(a << 32) | b，消除 pair_hash 开销
-        std::unordered_map<std::uint64_t, std::size_t> pair_freq;
-        for (const auto &chunk : char_chunks)
-            for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
-                ++pair_freq[pair_key(chunk[i], chunk[i + 1])];
+        // ── 共享 BPE 训练算法（基类 bpe_train_impl_） ──────────────
+        bpe_train_impl_(vocab_, char_chunks, target_merges, config.min_freq, log);
 
-        for (std::size_t round = 0; round < target_merges; ++round)
-        {
-            if (pair_freq.empty()) break;
-
-            auto best = std::ranges::max_element(pair_freq,
-                [](const auto &a, const auto &b) { return a.second < b.second; });
-
-            if (best->second < config.min_freq)
-            {
-                log("  无更多高频 pair，提前停止于第 " + std::to_string(round) + " 轮");
-                break;
-            }
-
-            const std::size_t new_id = vocab_.size();
-            const std::uint64_t best_key = best->first;
-            const std::size_t id_a = static_cast<std::size_t>(best_key >> 32);
-            const std::size_t id_b = static_cast<std::size_t>(best_key & 0xFFFFFFFF);
-            vocab_.push_back(vocab_[id_a] + vocab_[id_b]);
-            merges_.push_back({id_a, id_b, new_id});
-
-            // 应用合并到所有 chunk（原地压缩 + 增量更新 pair_freq）
-            for (auto &chunk : char_chunks)
-            {
-                // 检测本 chunk 是否包含合并 pair
-                bool has_merge = false;
-                for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
-                    if (chunk[i] == id_a && chunk[i + 1] == id_b) { has_merge = true; break; }
-                if (!has_merge) continue;
-
-                // 减去旧 pair 频次
-                for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
-                {
-                    auto key = pair_key(chunk[i], chunk[i + 1]);
-                    auto it = pair_freq.find(key);
-                    if (it != pair_freq.end() && --it->second == 0)
-                        pair_freq.erase(it);
-                }
-
-                // 原地压缩
-                std::size_t write = 0;
-                std::size_t read = 0;
-                while (read < chunk.size())
-                {
-                    if (read + 1 < chunk.size() && chunk[read] == id_a && chunk[read + 1] == id_b)
-                    {
-                        chunk[write++] = new_id;
-                        read += 2;
-                    }
-                    else
-                        chunk[write++] = chunk[read++];
-                }
-                chunk.resize(write);
-
-                // 加上新 pair 频次
-                for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
-                    ++pair_freq[pair_key(chunk[i], chunk[i + 1])];
-            }
-
-            if ((round + 1) % 500 == 0)
-                log("  合并第 " + std::to_string(round + 1) + " 轮，词表: " +
-                    std::to_string(vocab_.size()));
-        }
-
-        rebuild_merge_map();
+        rebuild_merge_map_();
         // ── 添加对话标记 token ──────────────────────────────────────
-        marker_system_    = vocab_.size(); vocab_.emplace_back("<system>");
-        marker_ussystem_  = vocab_.size(); vocab_.emplace_back("</system>");
-        marker_user_      = vocab_.size(); vocab_.emplace_back("<user>");
-        marker_euser_     = vocab_.size(); vocab_.emplace_back("</user>");
-        marker_assistant_ = vocab_.size(); vocab_.emplace_back("<assistant>");
-        marker_eassistant_= vocab_.size(); vocab_.emplace_back("</assistant>");
+        add_dialogue_markers_to_vocab_(vocab_);
         log("最终词表: " + std::to_string(vocab_.size()));
         log("合并规则: " + std::to_string(merges_.size()));
         return {};
@@ -2119,7 +2056,7 @@ public:
         while (pos < text.size())
         {
             // 对话标记优先匹配
-            if (marker_system_ != Tokenizer::npos)
+            if (has_dialogue_markers())
             {
                 auto [mid, mlen] = try_match_marker(text, pos);
                 if (mid != Tokenizer::npos)
@@ -2129,7 +2066,7 @@ public:
             auto seg_start = pos;
             while (pos < text.size())
             {
-                if (marker_system_ != Tokenizer::npos)
+                if (has_dialogue_markers())
                 { auto [mid, mlen] = try_match_marker(text, pos); if (mid != Tokenizer::npos) break; }
                 ++pos;
             }
@@ -2158,67 +2095,9 @@ public:
                     }
                 }
 
-                if (ids.size() <= 1)
-                {
-                    all_ids.insert(all_ids.end(), ids.begin(), ids.end());
-                    continue;
-                }
-
-                // Phase 2: 优先队列驱动的 BPE 合并 — O(n log n)
-                const std::size_t n = ids.size();
-                std::vector<std::size_t> ll_prev(n), ll_next(n);
-                for (std::size_t j = 0; j < n; ++j)
-                {
-                    ll_prev[j] = (j == 0) ? n : j - 1;
-                    ll_next[j] = (j + 1 == n) ? n : j + 1;
-                }
-                std::vector<std::uint8_t> alive(n, 1);
-
-                using HeapEntry = std::pair<std::size_t, std::size_t>;
-                std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
-
-                auto push_pair = [&](std::size_t pos) {
-                    std::size_t nxt = ll_next[pos];
-                    if (nxt < n && alive[pos] && alive[nxt])
-                    {
-                        std::size_t prio = merge_priority(ids[pos], ids[nxt]);
-                        if (prio < merges_.size())
-                            heap.push({prio, pos});
-                    }
-                };
-
-                for (std::size_t j = 0; j + 1 < n; ++j)
-                    push_pair(j);
-
-                while (!heap.empty())
-                {
-                    auto [prio, pos] = heap.top();
-                    heap.pop();
-
-                    if (!alive[pos]) continue;
-                    std::size_t nxt = ll_next[pos];
-                    if (nxt >= n || !alive[nxt]) continue;
-                    if (merge_priority(ids[pos], ids[nxt]) != prio) continue;
-
-                    ids[pos] = merges_[prio].new_id;
-                    alive[nxt] = 0;
-
-                    std::size_t prev = ll_prev[pos];
-                    std::size_t after = ll_next[nxt];
-                    ll_next[pos] = after;
-                    if (after < n) ll_prev[after] = pos;
-
-                    if (prev < n && alive[prev])
-                        push_pair(prev);
-                    push_pair(pos);
-                }
-
-                // Phase 3: 按链表顺序收集结果
-                std::size_t cur = 0;
-                do {
-                    all_ids.push_back(ids[cur]);
-                    cur = ll_next[cur];
-                } while (cur < n);
+                // 共享 BPE 合并算法（基类 bpe_merge_impl_）
+                auto merged = bpe_merge_impl_(std::move(ids));
+                all_ids.insert(all_ids.end(), merged.begin(), merged.end());
             } // end for(chunk)
         } // end while(pos)
         return all_ids;
@@ -2247,25 +2126,10 @@ public:
     {
         std::ofstream ofs(path);
         if (!ofs) return std::unexpected(Error{"Cannot write: " + path});
-        ofs << "{\n  \"type\": \"char_bpe_tokenizer\",\n  \"vocab\": {\n";
-        bool first = true;
-        for (std::size_t tid = 0; tid < vocab_.size(); ++tid)
-        {
-            if (vocab_[tid].empty()) continue;
-            if (!first) ofs << ",\n";
-            first = false;
-            ofs << "    \"" << std::dec << tid << "\": \"";
-            // 仅 4 个特殊 token (<pad>/<unk>/<bos>/<eos>) 用纯文本，
-            // 其余（含 ASCII 兜底、字符、合并）一律 hex 编码字节，避免破坏 JSON
-            if (tid < 4)
-                ofs << vocab_[tid];
-            else
-                for (unsigned char b : vocab_[tid])
-                    ofs << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(b);
-            ofs << "\"" << std::dec;
-        }
-        ofs << "\n  },\n  \"vocab_size\": " << std::dec << vocab_.size()
-            << ",\n  \"merges\": [";
+        // 共享 JSON 头部 + vocab 段（基类 save_vocab_json_ + write_vocab_entry_ 钩子）
+        // 起始 ID = 0：保留前 4 个特殊 token + ASCII 兜底，全部写入。
+        save_vocab_json_(ofs, "char_bpe_tokenizer", 0);
+        ofs << ",\n  \"merges\": [";
         for (std::size_t i = 0; i < merges_.size(); ++i)
         {
             if (i > 0) ofs << ",";
@@ -2291,80 +2155,18 @@ public:
         merges_.clear();
         char_to_id_.clear();
 
-        // 读取 vocab_size
-        std::size_t vs = 0;
-        if (auto p = content.find("\"vocab_size\""); p != std::string::npos)
-            if (auto c = content.find(':', p); c != std::string::npos)
-            {
-                ++c; while (c < content.size() && content[c] == ' ') ++c;
-                std::from_chars(content.data()+c, content.data()+content.size(), vs);
-            }
-        if (vs == 0) vs = CHAR_BASE;
-        vocab_.resize(vs);
-
-        // 解析 vocab 对象
-        auto vp = content.find("\"vocab\"");
-        if (vp == std::string::npos)
-            return std::unexpected(Error{"CharBPE: missing vocab"});
-        auto br = content.find('{', vp);
-        if (br == std::string::npos)
-            return std::unexpected(Error{"CharBPE: malformed vocab"});
-        std::size_t pos = br + 1;
-        while (pos < content.size())
+        // 共享 JSON vocab 解析（基类 parse_vocab_json_ + decode_vocab_entry_ 钩子）
+        vocab_ = parse_vocab_json_(content);
+        if (vocab_.empty())
         {
-            while (pos < content.size() && (content[pos]==' '||content[pos]=='\n'||
-                   content[pos]=='\r'||content[pos]=='\t')) ++pos;
-            if (pos >= content.size() || content[pos] == '}') break;
-            if (content[pos] == ',') { ++pos; continue; }
-
-            // 读取 key (ID)
-            if (content[pos] != '"') { ++pos; continue; }
-            ++pos;
-            std::size_t id = 0;
-            auto [ptr, ec] = std::from_chars(content.data()+pos, content.data()+content.size(), id);
-            if (ec != std::errc{}) { ++pos; continue; }
-            pos = static_cast<std::size_t>(ptr - content.data());
-
-            // 跳过空白到 ':'
-            while (pos < content.size() && content[pos] != ':') ++pos;
-            ++pos;
-            while (pos < content.size() && content[pos]==' ') ++pos;
-            if (pos >= content.size() || content[pos] != '"') continue;
-            ++pos;
-
-            // 读取 value
-            std::string val;
-            if (id < 4)
-            {
-                // 4 个特殊 token：纯文本
-                while (pos < content.size() && content[pos] != '"')
-                {
-                    if (content[pos] == '\\' && pos+1 < content.size()) ++pos;
-                    val += content[pos++];
-                }
-            }
-            else
-            {
-                // hex 编码（含 ASCII 兜底、字符、合并）
-                std::string hex;
-                while (pos < content.size() && content[pos] != '"')
-                    hex += content[pos++];
-                for (std::size_t k = 0; k + 1 < hex.size(); k += 2)
-                {
-                    unsigned byte = 0;
-                    auto [p2, e2] = std::from_chars(hex.data()+k, hex.data()+k+2, byte, 16);
-                    if (e2 == std::errc{}) val += static_cast<char>(byte);
-                }
-            }
-            if (pos < content.size() && content[pos] == '"') ++pos;
-
-            if (id < vocab_.size())
-            {
-                vocab_[id] = val;
-                if (id >= BYTE_BASE)
-                    char_to_id_[val] = id;
-            }
+            // parse_vocab_json_ 未能解析 vocab_size 时回退到 CHAR_BASE
+            vocab_.resize(CHAR_BASE);
         }
+
+        // 重建 char_to_id_（BYTE_BASE 及以上均为字符 token）
+        for (std::size_t id = BYTE_BASE; id < vocab_.size(); ++id)
+            if (!vocab_[id].empty())
+                char_to_id_[vocab_[id]] = id;
 
         // 解析 merges 数组
         auto mp = content.find("\"merges\"");
@@ -2393,38 +2195,13 @@ public:
 
         // ── 恢复对话标记 ID（从已有词表检测或追加） ─────────────
         restore_dialogue_markers(vocab_);
-        rebuild_merge_map();
+        rebuild_merge_map_();
         return {};
     }
 
 private:
-    struct MergeRule { std::size_t id_a, id_b, new_id; };
-
-    // 64 位编码 pair：将 (a, b) 映射为单个 uint64_t，消除 pair_hash 开销
-    // 要求 a, b < 2^32（vocab 大小不会超过此限制）
-    [[nodiscard]] static constexpr std::uint64_t pair_key(std::size_t a, std::size_t b) noexcept
-    {
-        return (static_cast<std::uint64_t>(a) << 32) | static_cast<std::uint64_t>(b);
-    }
-
     std::vector<std::string> vocab_;
-    std::vector<MergeRule> merges_;
     std::unordered_map<std::string, std::size_t> char_to_id_;
-    std::unordered_map<std::uint64_t, std::size_t> merge_map_;
-
-    void rebuild_merge_map()
-    {
-        merge_map_.clear();
-        merge_map_.reserve(merges_.size());
-        for (std::size_t i = 0; i < merges_.size(); ++i)
-            merge_map_[pair_key(merges_[i].id_a, merges_[i].id_b)] = i;
-    }
-
-    [[nodiscard]] std::size_t merge_priority(std::size_t a, std::size_t b) const noexcept
-    {
-        auto it = merge_map_.find(pair_key(a, b));
-        return it != merge_map_.end() ? it->second : merges_.size();
-    }
 };
 
 

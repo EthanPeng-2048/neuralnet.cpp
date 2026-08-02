@@ -104,6 +104,20 @@ std::vector<std::size_t> parse_ids(const std::string &s)
     return ids;
 }
 
+// ==================== 统一输出 token IDs ====================
+// 辅助函数：以 "Tokens (<n>): [id0, id1, ...]" 格式输出 ID 列表，
+// 消除交互模式 / 命令行模式 / 默认编码路径中的重复打印代码。
+void print_token_ids(const std::vector<std::size_t> &ids, std::ostream &os = std::cout)
+{
+    os << "  Tokens (" << ids.size() << "): [";
+    for (std::size_t i = 0; i < ids.size(); ++i)
+    {
+        if (i > 0) os << ", ";
+        os << ids[i];
+    }
+    os << "]\n";
+}
+
 // ==================== 交互模式 ====================
 void interactive_mode(const nn::Tokenizer &tokenizer, bool show_bytes)
 {
@@ -126,13 +140,7 @@ void interactive_mode(const nn::Tokenizer &tokenizer, bool show_bytes)
         {
             std::string text = line.substr(7);
             auto ids = tokenizer.encode(text);
-            std::cout << "  Tokens (" << ids.size() << "): [";
-            for (std::size_t i = 0; i < ids.size(); ++i)
-            {
-                if (i > 0) std::cout << ", ";
-                std::cout << ids[i];
-            }
-            std::cout << "]\n";
+            print_token_ids(ids);
             if (show_bytes)
             {
                 const auto &v = tokenizer.vocab();
@@ -160,13 +168,7 @@ void interactive_mode(const nn::Tokenizer &tokenizer, bool show_bytes)
         {
             // 默认编码
             auto ids = tokenizer.encode(line);
-            std::cout << "  Tokens (" << ids.size() << "): [";
-            for (std::size_t i = 0; i < ids.size(); ++i)
-            {
-                if (i > 0) std::cout << ", ";
-                std::cout << ids[i];
-            }
-            std::cout << "]\n";
+            print_token_ids(ids);
             auto decoded = tokenizer.decode(ids);
             std::cout << "  Decode: \"" << decoded << "\"\n";
         }
@@ -199,13 +201,7 @@ int main(int argc, char *argv[])
     if (!cfg.encode_text.empty())
     {
         auto ids = tokenizer->encode(cfg.encode_text);
-        std::cout << "Tokens (" << ids.size() << "): [";
-        for (std::size_t i = 0; i < ids.size(); ++i)
-        {
-            if (i > 0) std::cout << ", ";
-            std::cout << ids[i];
-        }
-        std::cout << "]\n";
+        print_token_ids(ids);
         auto decoded = tokenizer->decode(ids);
         std::cout << "Decode: \"" << decoded << "\"\n";
         return 0;

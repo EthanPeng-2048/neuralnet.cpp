@@ -18,13 +18,15 @@
 #include <neuralnet.cpp/model_serialization.hpp>
 #include <neuralnet.cpp/domain_mnist.hpp>
 #include <neuralnet.cpp/oscillation_guard.hpp>
+#include <neuralnet.cpp/cli/engine_factory.hpp>
+#include <neuralnet.cpp/cli/lr_scheduler.hpp>
+#include <neuralnet.cpp/cli/mnist_io.hpp>
+#include <neuralnet.cpp/cli/train_common.hpp>
 
 #include <algorithm>
-#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -124,6 +126,15 @@ struct TrainConfig
 TrainConfig parse_args(int argc, char *argv[])
 {
     TrainConfig cfg;
+    nn::cli::TrainCommonArgs common;
+    // 程序专属默认值（覆盖 TrainCommonArgs 的默认值）
+    common.batch_size = 64;
+    common.weight_decay = 0.01f;
+    common.min_lr = 1e-6f;
+    common.lr_schedule = "fixed";
+    common.osc_guard = true;
+    common.osc_threshold = 0.55f;
+
     for (int i = 1; i < argc; ++i)
     {
         std::string arg = argv[i];
@@ -131,6 +142,11 @@ TrainConfig parse_args(int argc, char *argv[])
         {
             print_usage(argv[0]);
             std::exit(0);
+        }
+        // 通用训练参数委托给 nn::cli::parse_train_common_args
+        else if (nn::cli::parse_train_common_args(argc, argv, i, common))
+        {
+            continue;
         }
         else if (arg == "--arch" && i + 1 < argc)
         {
@@ -157,44 +173,6 @@ TrainConfig parse_args(int argc, char *argv[])
         else if (arg == "--dataset" && i + 1 < argc)
         {
             cfg.dataset_path = argv[++i];
-        }
-        else if (arg == "--epochs" && i + 1 < argc)
-        {
-            auto v = nn::parse_number<int>(argv[++i]);
-            if (!v) { std::cerr << "无效 --epochs: " << v.error().message << "\n"; std::exit(1); }
-            if (*v <= 0) { std::cerr << "--epochs 必须为正整数\n"; std::exit(1); }
-            cfg.epochs = *v;
-        }
-        else if (arg == "--lr" && i + 1 < argc)
-        {
-            auto v = nn::parse_number<double>(argv[++i]);
-            if (!v) { std::cerr << "无效 --lr: " << v.error().message << "\n"; std::exit(1); }
-            cfg.lr = *v;
-        }
-        else if (arg == "--batch-size" && i + 1 < argc)
-        {
-            auto v = nn::parse_number<int>(argv[++i]);
-            if (!v) { std::cerr << "无效 --batch-size: " << v.error().message << "\n"; std::exit(1); }
-            if (*v <= 0) { std::cerr << "--batch-size 必须为正整数\n"; std::exit(1); }
-            cfg.batch_size = static_cast<std::size_t>(*v);
-        }
-        else if (arg == "--optimizer" && i + 1 < argc)
-        {
-            cfg.optimizer_name = argv[++i];
-            if (cfg.optimizer_name != "sgd" && cfg.optimizer_name != "sgd_momentum" &&
-                cfg.optimizer_name != "adam" && cfg.optimizer_name != "adamw" &&
-                cfg.optimizer_name != "muon")
-            {
-                std::cerr << "未知优化器: " << cfg.optimizer_name
-                          << "，可选: sgd, sgd_momentum, adam, adamw, muon\n";
-                std::exit(1);
-            }
-        }
-        else if (arg == "--weight-decay" && i + 1 < argc)
-        {
-            auto v = nn::parse_number<Scalar>(argv[++i]);
-            if (!v) { std::cerr << "无效 --weight-decay: " << v.error().message << "\n"; std::exit(1); }
-            cfg.weight_decay = *v;
         }
         else if (arg == "--layer-dims" && i + 1 < argc)
         {
@@ -256,14 +234,6 @@ TrainConfig parse_args(int argc, char *argv[])
             if (!v) { std::cerr << "无效 --eval-samples: " << v.error().message << "\n"; std::exit(1); }
             cfg.eval_samples = *v;
         }
-        else if (arg == "--gpu")
-        {
-            cfg.gpu_enabled = true;
-        }
-        else if (arg == "--cuda")
-        {
-            cfg.cuda_enabled = true;
-        }
         else if (arg == "--shuffle-steps" && i + 1 < argc)
         {
             std::string v = argv[++i];
@@ -277,242 +247,30 @@ TrainConfig parse_args(int argc, char *argv[])
                 std::exit(1);
             }
         }
-        else if (arg == "--osc-guard" && i + 1 < argc)
-        {
-            std::string v = argv[++i];
-            if (v == "on" || v == "1" || v == "true")
-                cfg.oscillation_guard = true;
-            else if (v == "off" || v == "0" || v == "false")
-                cfg.oscillation_guard = false;
-            else
-            {
-                std::cerr << "无效 --osc-guard: " << v << "，可选: on, off\n";
-                std::exit(1);
-            }
-        }
-        else if (arg == "--osc-window" && i + 1 < argc)
-        {
-            auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --osc-window: " << v.error().message << "\n"; std::exit(1); }
-            cfg.osc_window = *v;
-        }
-        else if (arg == "--osc-threshold" && i + 1 < argc)
-        {
-            auto v = nn::parse_number<Scalar>(argv[++i]);
-            if (!v) { std::cerr << "无效 --osc-threshold: " << v.error().message << "\n"; std::exit(1); }
-            cfg.osc_threshold = *v;
-        }
-        else if (arg == "--lr-schedule" && i + 1 < argc)
-        {
-            cfg.lr_schedule = argv[++i];
-            if (cfg.lr_schedule != "fixed" && cfg.lr_schedule != "cosine")
-            {
-                std::cerr << "未知 --lr-schedule: " << cfg.lr_schedule
-                          << "，可选: fixed, cosine\n";
-                std::exit(1);
-            }
-        }
-        else if (arg == "--warmup-epochs" && i + 1 < argc)
-        {
-            auto v = nn::parse_number<int>(argv[++i]);
-            if (!v) { std::cerr << "无效 --warmup-epochs: " << v.error().message << "\n"; std::exit(1); }
-            cfg.warmup_epochs = *v;
-        }
-        else if (arg == "--min-lr" && i + 1 < argc)
-        {
-            auto v = nn::parse_number<Scalar>(argv[++i]);
-            if (!v) { std::cerr << "无效 --min-lr: " << v.error().message << "\n"; std::exit(1); }
-            cfg.min_lr = *v;
-        }
-        else if (arg == "--lr-per-epoch" && i + 1 < argc)
-        {
-            std::string dims_str = argv[++i];
-            std::stringstream ss(dims_str);
-            std::string token;
-            while (std::getline(ss, token, ','))
-            {
-                auto v = nn::parse_number<Scalar>(token);
-                if (!v) { std::cerr << "无效 --lr-per-epoch 值: " << v.error().message << "\n"; std::exit(1); }
-                cfg.lr_per_epoch.push_back(*v);
-            }
-        }
         else
         {
             std::cerr << "未知参数: " << arg << "\n使用 --help 查看用法\n";
             std::exit(1);
         }
     }
+
+    // 从通用参数回填到程序专属配置
+    cfg.epochs = common.epochs;
+    cfg.lr = common.lr;
+    cfg.batch_size = common.batch_size;
+    cfg.optimizer_name = common.optimizer;
+    cfg.weight_decay = common.weight_decay;
+    cfg.gpu_enabled = common.use_gpu;
+    cfg.cuda_enabled = common.use_cuda;
+    cfg.lr_schedule = common.lr_schedule;
+    cfg.warmup_epochs = common.warmup_epochs;
+    cfg.min_lr = common.min_lr;
+    cfg.lr_per_epoch = std::move(common.lr_per_epoch);
+    cfg.oscillation_guard = common.osc_guard;
+    cfg.osc_window = static_cast<std::size_t>(common.osc_window);
+    cfg.osc_threshold = common.osc_threshold;
+
     return cfg;
-}
-
-// ==================== 数据加载（优化版） ====================
-nn::Result<std::pair<nn::Matrix, nn::Matrix>> load_csv(const std::string &filename, int max_samples = -1)
-{
-    std::ifstream file(filename, std::ios::binary | std::ios::ate);
-    if (!file.is_open())
-        return std::unexpected(nn::Error{"Cannot open file: " + filename});
-
-    const auto file_size = file.tellg();
-    file.seekg(0);
-
-    std::string buffer(static_cast<std::size_t>(file_size), '\0');
-    file.read(buffer.data(), file_size);
-    file.close();
-
-    std::size_t row_count = 0;
-    for (char c : buffer)
-        if (c == '\n') ++row_count;
-    if (row_count == 0)
-        return std::unexpected(nn::Error{"CSV file is empty or malformed: " + filename});
-
-    if (max_samples > 0 && static_cast<std::size_t>(max_samples) < row_count)
-        row_count = static_cast<std::size_t>(max_samples);
-
-    const char *ptr = buffer.data();
-    const char *end = buffer.data() + buffer.size();
-
-    int first_label = 0;
-    std::size_t feat_dim = 0;
-    {
-        const char *p = ptr;
-        auto [p1, ec1] = std::from_chars(p, end, first_label);
-        p = p1;
-        std::size_t cnt = 0;
-        while (p < end && *p != '\n' && *p != '\r')
-        {
-            if (*p == ',')
-            {
-                ++cnt;
-                Scalar tmp;
-                auto [p2, ec2] = std::from_chars(p + 1, end, tmp);
-                p = p2;
-            }
-            else
-                ++p;
-        }
-        feat_dim = cnt;
-    }
-
-    std::vector<Scalar> features(row_count * feat_dim);
-    std::vector<int>    labels(row_count);
-
-    std::size_t row = 0;
-    ptr = buffer.data();
-
-    while (ptr < end && row < row_count)
-    {
-        auto [p_label, ec_label] = std::from_chars(ptr, end, labels[row]);
-        if (ec_label != std::errc{})
-            return std::unexpected(nn::Error{"Failed to parse label at row " + std::to_string(row)});
-        ptr = p_label;
-
-        for (std::size_t j = 0; j < feat_dim; ++j)
-        {
-            if (ptr < end && *ptr == ',') ++ptr;
-            Scalar val;
-            auto [p_feat, ec_feat] = std::from_chars(ptr, end, val);
-            if (ec_feat != std::errc{})
-                return std::unexpected(nn::Error{"Failed to parse feature at row " + std::to_string(row)});
-            features[row * feat_dim + j] = val;
-            ptr = p_feat;
-        }
-
-        while (ptr < end && (*ptr == '\r' || *ptr == '\n')) ++ptr;
-        ++row;
-    }
-
-    std::size_t N = row;
-
-    nn::Matrix feat_mat(feat_dim, N);
-    for (std::size_t i = 0; i < N; ++i)
-        for (std::size_t j = 0; j < feat_dim; ++j)
-            feat_mat.set_value_unchecked(j, i, features[i * feat_dim + j]);
-
-    nn::Matrix label_mat(10, N);
-    for (std::size_t i = 0; i < N; ++i)
-    {
-        int lbl = labels[i];
-        if (lbl < 0 || lbl >= 10)
-            return std::unexpected(nn::Error{"Label out of range: " + std::to_string(lbl)});
-        label_mat.set_value_unchecked(lbl, i, 1.0);
-    }
-
-    return std::pair{std::move(feat_mat), std::move(label_mat)};
-}
-
-// -------------------- 评估函数 --------------------
-// 全量前向后下载到 CPU 做 argmax，计算准确率。
-// eval_samples > 0 时只评估前 N 个样本（Transformer 评估成本较高）。
-nn::Result<Scalar> evaluate(nn::Model &model, nn::ComputeEngine &engine,
-                             const nn::Matrix &x, const nn::Matrix &y_onehot,
-                             std::size_t eval_samples = 0)
-{
-    const std::size_t N = (eval_samples > 0) ? std::min(x.cols(), eval_samples) : x.cols();
-
-    // 若截取子集，则拷贝前 N 列
-    nn::Matrix x_sub, y_sub;
-    if (N < x.cols())
-    {
-        x_sub = nn::Matrix(x.rows(), N);
-        y_sub = nn::Matrix(y_onehot.rows(), N);
-        for (std::size_t i = 0; i < N; ++i)
-        {
-            for (std::size_t r = 0; r < x.rows(); ++r)
-                x_sub.set_value_unchecked(r, i, x.at_unchecked(r, i));
-            for (std::size_t r = 0; r < y_onehot.rows(); ++r)
-                y_sub.set_value_unchecked(r, i, y_onehot.at_unchecked(r, i));
-        }
-    }
-    else
-    {
-        x_sub = nn::Matrix(x);  // 拷贝
-        y_sub = nn::Matrix(y_onehot);
-    }
-
-    auto x_tensor_r = engine.from_matrix(x_sub);
-    if (!x_tensor_r) return std::unexpected(std::move(x_tensor_r).error());
-
-    // batch 模式加速 forward（GPU 下消除 per-primitive 提交开销）
-    auto bb = engine.begin_batch();
-    if (!bb) return std::unexpected(bb.error());
-
-    auto out_tensor_r = model.forward(*x_tensor_r);
-    if (!out_tensor_r) return std::unexpected(std::move(out_tensor_r).error());
-
-    auto eb = engine.end_batch();
-    if (!eb) return std::unexpected(eb.error());
-
-    auto out_r = engine.to_matrix(*out_tensor_r);
-    if (!out_r) return std::unexpected(std::move(out_r).error());
-    const auto &out = *out_r;
-
-    int correct = 0;
-    for (std::size_t i = 0; i < N; ++i)
-    {
-        Scalar max_val = out.at_unchecked(0, i);
-        int pred = 0;
-        for (int j = 1; j < static_cast<int>(nn::MNIST_NUM_CLASSES); ++j)
-        {
-            Scalar val = out.at_unchecked(j, i);
-            if (val > max_val)
-            {
-                max_val = val;
-                pred = j;
-            }
-        }
-        int true_label = -1;
-        for (int j = 0; j < static_cast<int>(nn::MNIST_NUM_CLASSES); ++j)
-        {
-            if (y_onehot.at_unchecked(j, i) == 1.0)
-            {
-                true_label = j;
-                break;
-            }
-        }
-        if (pred == true_label)
-            ++correct;
-    }
-    return static_cast<Scalar>(correct) / static_cast<Scalar>(N);
 }
 
 // ==================== 构建模型规格 ====================
@@ -521,7 +279,7 @@ nn::ModelSpec build_spec(const TrainConfig &cfg)
     if (cfg.arch == ArchType::Transformer)
     {
         return nn::make_mnist_transformer_spec(
-            nn::MNIST_IMG_SIZE, cfg.patch_size,
+            cfg.patch_size,
             cfg.d_model, cfg.num_heads, cfg.d_ff, cfg.num_layers);
     }
     // MLP
@@ -623,67 +381,20 @@ int main(int argc, char *argv[])
 
     // ── 创建计算引擎 ─────────────────────────────────────────
     // 引擎必须先于 model 构造并晚于 model 析构（model 持有 engine 的非拥有指针）
-    std::unique_ptr<nn::ComputeEngine> engine;
-
-#ifdef NN_HAS_VULKAN
-    nn::GpuBackend *gpu_backend = nullptr;
-#endif
-    if (cfg.cuda_enabled)
-    {
-#ifdef NN_HAS_CUDA
-        auto &cuda_backend = nn::CudaBackend::instance();
-        auto cuda_init = cuda_backend.initialize();
-        if (cuda_init)
-        {
-            engine = std::make_unique<nn::CudaEngine>(cuda_backend);
-            const auto& props = cuda_backend.device_props();
-            std::cout << "CUDA GPU 加速已启用 (" << props.name << ")\n\n";
-        }
-        else
-        {
-            std::cerr << "CUDA 初始化失败: " << cuda_init.error().message << "\n";
-            std::cerr << "回退到 CPU 模式\n\n";
-            engine = std::make_unique<nn::CpuEngine>();
-        }
-#else
-        std::cerr << "未编译 CUDA 支持，使用 CPU 模式\n\n";
-        engine = std::make_unique<nn::CpuEngine>();
-#endif
-    }
-    else if (cfg.gpu_enabled)
-    {
-#ifdef NN_HAS_VULKAN
-        auto &backend = nn::GpuBackend::instance();
-        auto init_result = backend.initialize();
-        if (init_result)
-        {
-            gpu_backend = &backend;
-            engine = std::make_unique<nn::GpuEngine>(*gpu_backend);
-            std::cout << "GPU 加速已启用 (Vulkan GpuEngine)\n\n";
-        }
-        else
-        {
-            std::cerr << "GPU 初始化失败: " << init_result.error().message << "\n";
-            std::cerr << "回退到 CPU 模式\n\n";
-            engine = std::make_unique<nn::CpuEngine>();
-        }
-#else
-        std::cerr << "未编译 Vulkan 支持，使用 CPU 模式\n\n";
-        engine = std::make_unique<nn::CpuEngine>();
-#endif
-    }
-    else
-    {
-        engine = std::make_unique<nn::CpuEngine>();
-    }
+    nn::cli::EngineConfig eng_cfg;
+    eng_cfg.use_gpu = cfg.gpu_enabled;
+    eng_cfg.use_cuda = cfg.cuda_enabled;
+    auto engine = nn::cli::create_engine(eng_cfg, std::cout);
 
     // ── 加载数据 ─────────────────────────────────────────────
     std::cout << "加载数据: " << cfg.dataset_path << " ..." << std::endl;
-    auto csv_train_result = load_csv(cfg.dataset_path + "/train.csv", cfg.max_train_samples);
+    const std::size_t train_max =
+        (cfg.max_train_samples > 0) ? static_cast<std::size_t>(cfg.max_train_samples) : 0;
+    auto csv_train_result = nn::cli::load_mnist_csv(cfg.dataset_path + "/train.csv", train_max);
     if (!csv_train_result) { std::cerr << "Error: " << csv_train_result.error().message << '\n'; return 1; }
     auto [train_x, train_y] = std::move(*csv_train_result);
 
-    auto csv_test_result = load_csv(cfg.dataset_path + "/test.csv");
+    auto csv_test_result = nn::cli::load_mnist_csv(cfg.dataset_path + "/test.csv");
     if (!csv_test_result) { std::cerr << "Error: " << csv_test_result.error().message << '\n'; return 1; }
     auto [test_x, test_y] = std::move(*csv_test_result);
     std::cout << "训练集: " << train_x.cols() << " 样本, 测试集: " << test_x.cols() << " 样本\n" << std::endl;
@@ -716,6 +427,11 @@ int main(int argc, char *argv[])
         cfg.optimizer_name, *engine,
         model.parameters(), model.param_gradients(), cfg.lr,
         cfg.weight_decay);
+    if (!optimizer)
+    {
+        std::cerr << "错误：未知优化器名称: " << cfg.optimizer_name << "\n";
+        return 1;
+    }
 
     // ── 振荡抑制器 ───────────────────────────────────────────
     std::optional<nn::OscillationGuard> osc_guard;
@@ -728,35 +444,14 @@ int main(int argc, char *argv[])
     }
     Scalar optimizer_current_lr = cfg.lr;
 
-    // ── 计算每 epoch 的学习率调度 ──
-    auto compute_epoch_lr = [&](int epoch) -> Scalar {
-        // 手动指定优先
-        if (!cfg.lr_per_epoch.empty())
-        {
-            if (epoch < static_cast<int>(cfg.lr_per_epoch.size()))
-                return cfg.lr_per_epoch[epoch];
-            return cfg.lr_per_epoch.back();  // 超出部分用最后一个
-        }
-        if (cfg.lr_schedule == "cosine")
-        {
-            Scalar max_lr = cfg.lr;
-            Scalar lr_min = cfg.min_lr;
-            if (cfg.warmup_epochs > 0 && epoch < cfg.warmup_epochs)
-            {
-                // 线性预热
-                return max_lr * static_cast<Scalar>(epoch + 1) / static_cast<Scalar>(cfg.warmup_epochs);
-            }
-            else
-            {
-                // 余弦退火
-                int cosine_epochs = cfg.epochs - cfg.warmup_epochs;
-                if (cosine_epochs <= 0) return max_lr;
-                Scalar progress = static_cast<Scalar>(epoch - cfg.warmup_epochs) / static_cast<Scalar>(cosine_epochs);
-                return lr_min + 0.5f * (max_lr - lr_min) * (1.0f + std::cos(3.14159265358979323846f * progress));
-            }
-        }
-        return cfg.lr;  // fixed
-    };
+    // ── 学习率调度配置（委托给 nn::cli::compute_epoch_lr） ──
+    nn::cli::LrScheduleConfig lr_sched_cfg;
+    lr_sched_cfg.base_lr = cfg.lr;
+    lr_sched_cfg.min_lr = cfg.min_lr;
+    lr_sched_cfg.warmup_epochs = cfg.warmup_epochs;
+    lr_sched_cfg.total_epochs = cfg.epochs;
+    lr_sched_cfg.schedule = cfg.lr_schedule;
+    lr_sched_cfg.lr_per_epoch = cfg.lr_per_epoch;
 
     nn::CrossEntropyLoss ce_loss;
     const std::size_t num_batches = train_x.cols() / cfg.batch_size;
@@ -775,13 +470,13 @@ int main(int argc, char *argv[])
     for (int epoch = 0; epoch < cfg.epochs; ++epoch)
     {
         // ── 学习率调度：每 epoch 开始时调整 ──
-        Scalar epoch_lr = compute_epoch_lr(epoch);
+        Scalar epoch_lr = nn::cli::compute_epoch_lr(lr_sched_cfg, epoch);
         if (epoch_lr != optimizer_current_lr)
         {
             optimizer->set_lr(epoch_lr);
             optimizer_current_lr = epoch_lr;
             if (osc_guard)
-                osc_guard->set_lr(epoch_lr);
+                osc_guard->rebase_lr(epoch_lr);
         }
 
         auto ep_start = std::chrono::steady_clock::now();
@@ -898,8 +593,8 @@ int main(int argc, char *argv[])
         Scalar avg_loss = total_loss / num_batches;
         // MLP 全量评估，Transformer 截取前 eval_samples 个样本评估
         const std::size_t eval_n = (cfg.arch == ArchType::Transformer) ? cfg.eval_samples : 0;
-        auto train_acc_r = evaluate(model, *engine, train_x, train_y, eval_n);
-        auto test_acc_r  = evaluate(model, *engine, test_x, test_y, eval_n);
+        auto train_acc_r = nn::cli::evaluate_mnist(model, *engine, train_x, train_y, eval_n);
+        auto test_acc_r  = nn::cli::evaluate_mnist(model, *engine, test_x, test_y, eval_n);
         if (!train_acc_r || !test_acc_r)
         {
             const auto &err = !train_acc_r ? train_acc_r.error() : test_acc_r.error();

@@ -10,6 +10,7 @@
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/domain_mnist.hpp>
 #include <neuralnet.cpp/model_serialization.hpp>
+#include <neuralnet.cpp/cli/mnist_io.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -69,6 +70,19 @@ void print_usage(const char* prog)
         << "  --help              显示此帮助信息\n";
 }
 
+// 数字解析辅助：解析失败时打印错误并退出（替代会抛异常的 std::stoi/stod）
+template <typename T>
+T parse_num_or_die(const char* s, const char* opt)
+{
+    auto v = nn::parse_number<T>(s);
+    if (!v)
+    {
+        std::cerr << "无效的 " << opt << " 值: " << v.error().message << "\n";
+        std::exit(1);
+    }
+    return *v;
+}
+
 BenchConfig parse_args(int argc, char* argv[])
 {
     BenchConfig cfg;
@@ -77,132 +91,20 @@ BenchConfig parse_args(int argc, char* argv[])
         std::string arg = argv[i];
         if (arg == "--help") { print_usage(argv[0]); std::exit(0); }
         else if (arg == "--epochs" && i + 1 < argc)
-            cfg.epochs = std::stoi(argv[++i]);
+            cfg.epochs = parse_num_or_die<int>(argv[++i], "--epochs");
         else if (arg == "--batch-size" && i + 1 < argc)
-            cfg.batch_size = static_cast<std::size_t>(std::stoi(argv[++i]));
+            cfg.batch_size = static_cast<std::size_t>(parse_num_or_die<int>(argv[++i], "--batch-size"));
         else if (arg == "--dataset" && i + 1 < argc)
             cfg.dataset_path = argv[++i];
         else if (arg == "--warmup" && i + 1 < argc)
-            cfg.warmup = std::stoi(argv[++i]);
+            cfg.warmup = parse_num_or_die<int>(argv[++i], "--warmup");
         else if (arg == "--infer-iters" && i + 1 < argc)
-            cfg.infer_iters = std::stoi(argv[++i]);
+            cfg.infer_iters = parse_num_or_die<int>(argv[++i], "--infer-iters");
         else if (arg == "--lr" && i + 1 < argc)
-            cfg.lr = static_cast<Scalar>(std::stod(argv[++i]));
+            cfg.lr = parse_num_or_die<Scalar>(argv[++i], "--lr");
         else { std::cerr << "未知参数: " << arg << "\n"; std::exit(1); }
     }
     return cfg;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  数据加载
-// ═══════════════════════════════════════════════════════════════════════════
-nn::Result<std::pair<nn::Matrix, nn::Matrix>> load_csv(const std::string& filename)
-{
-    std::ifstream file(filename, std::ios::binary | std::ios::ate);
-    if (!file.is_open())
-        return std::unexpected(nn::Error{"Cannot open: " + filename});
-
-    const auto file_size = file.tellg();
-    file.seekg(0);
-    std::string buffer(static_cast<std::size_t>(file_size), '\0');
-    file.read(buffer.data(), file_size);
-    file.close();
-
-    std::size_t row_count = 0;
-    for (char c : buffer)
-        if (c == '\n') ++row_count;
-    if (row_count == 0)
-        return std::unexpected(nn::Error{"CSV empty: " + filename});
-
-    const char* ptr = buffer.data();
-    const char* end = buffer.data() + buffer.size();
-
-    int first_label = 0;
-    std::size_t feat_dim = 0;
-    {
-        const char* p = ptr;
-        auto [p1, ec1] = std::from_chars(p, end, first_label);
-        p = p1;
-        std::size_t cnt = 0;
-        while (p < end && *p != '\n' && *p != '\r')
-        {
-            if (*p == ',') { ++cnt; Scalar tmp; auto [p2, ec2] = std::from_chars(p + 1, end, tmp); p = p2; }
-            else ++p;
-        }
-        feat_dim = cnt;
-    }
-
-    std::vector<Scalar> features(row_count * feat_dim);
-    std::vector<int>    labels(row_count);
-    std::size_t row = 0;
-    ptr = buffer.data();
-
-    while (ptr < end && row < row_count)
-    {
-        auto [p_label, ec_label] = std::from_chars(ptr, end, labels[row]);
-        if (ec_label != std::errc{}) break;
-        ptr = p_label;
-        for (std::size_t j = 0; j < feat_dim; ++j)
-        {
-            if (ptr < end && *ptr == ',') ++ptr;
-            Scalar val;
-            auto [p_feat, ec_feat] = std::from_chars(ptr, end, val);
-            if (ec_feat != std::errc{}) break;
-            features[row * feat_dim + j] = val;
-            ptr = p_feat;
-        }
-        while (ptr < end && (*ptr == '\r' || *ptr == '\n')) ++ptr;
-        ++row;
-    }
-
-    std::size_t N = row;
-    nn::Matrix feat_mat(feat_dim, N);
-    for (std::size_t i = 0; i < N; ++i)
-        for (std::size_t j = 0; j < feat_dim; ++j)
-            feat_mat.set_value_unchecked(j, i, features[i * feat_dim + j]);
-
-    nn::Matrix label_mat(10, N);
-    for (std::size_t i = 0; i < N; ++i)
-        if (labels[i] >= 0 && labels[i] < 10)
-            label_mat.set_value_unchecked(labels[i], i, 1.0);
-
-    return std::pair{std::move(feat_mat), std::move(label_mat)};
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  评估准确率（全量前向后下载到 CPU 做 argmax）
-// ═══════════════════════════════════════════════════════════════════════════
-nn::Result<Scalar> evaluate(nn::Model& model, nn::ComputeEngine& engine,
-                             const nn::Matrix& x, const nn::Matrix& y_onehot)
-{
-    std::size_t N = x.cols();
-
-    auto x_tensor_r = engine.from_matrix(x);
-    if (!x_tensor_r) return std::unexpected(std::move(x_tensor_r).error());
-
-    auto out_tensor_r = model.forward(*x_tensor_r);
-    if (!out_tensor_r) return std::unexpected(std::move(out_tensor_r).error());
-
-    auto out_r = engine.to_matrix(*out_tensor_r);
-    if (!out_r) return std::unexpected(std::move(out_r).error());
-    const auto& out = *out_r;
-
-    int correct = 0;
-    for (std::size_t i = 0; i < N; ++i)
-    {
-        Scalar max_val = out.at_unchecked(0, i);
-        int pred = 0;
-        for (int j = 1; j < static_cast<int>(nn::MNIST_NUM_CLASSES); ++j)
-        {
-            Scalar val = out.at_unchecked(j, i);
-            if (val > max_val) { max_val = val; pred = j; }
-        }
-        int true_label = -1;
-        for (int j = 0; j < static_cast<int>(nn::MNIST_NUM_CLASSES); ++j)
-            if (y_onehot.at_unchecked(j, i) == 1.0) { true_label = j; break; }
-        if (pred == true_label) ++correct;
-    }
-    return static_cast<Scalar>(correct) / static_cast<Scalar>(N);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -278,8 +180,8 @@ nn::Result<EpochResult> train_one_epoch(
 
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     Scalar avg_loss = total_loss / static_cast<Scalar>(num_batches);
-    auto train_acc_r = evaluate(model, engine, train_x, train_y);
-    auto test_acc_r  = evaluate(model, engine, test_x, test_y);
+    auto train_acc_r = nn::cli::evaluate_mnist(model, engine, train_x, train_y);
+    auto test_acc_r  = nn::cli::evaluate_mnist(model, engine, test_x, test_y);
     if (!train_acc_r || !test_acc_r)
         return std::unexpected(!train_acc_r ? train_acc_r.error() : test_acc_r.error());
 
@@ -378,6 +280,8 @@ nn::Result<DeviceBenchResult> bench_device(
 
     auto optimizer = nn::create_optimizer(
         "adam", engine, model.parameters(), model.param_gradients(), cfg.lr);
+    if (!optimizer)
+        return std::unexpected(nn::Error{"bench_device: failed to create optimizer"});
     nn::CrossEntropyLoss ce_loss;
 
     std::mt19937_64 rng{rng_seed};
@@ -432,11 +336,11 @@ int main(int argc, char* argv[])
 
     // ── 加载数据 ─────────────────────────────────────────────
     std::cout << "\n加载数据集...\n";
-    auto train_result = load_csv(cfg.dataset_path + "/train.csv");
+    auto train_result = nn::cli::load_mnist_csv(cfg.dataset_path + "/train.csv");
     if (!train_result) { std::cerr << "加载训练集失败: " << train_result.error().message << "\n"; return 1; }
     auto [train_x, train_y] = std::move(*train_result);
 
-    auto test_result = load_csv(cfg.dataset_path + "/test.csv");
+    auto test_result = nn::cli::load_mnist_csv(cfg.dataset_path + "/test.csv");
     if (!test_result) { std::cerr << "加载测试集失败: " << test_result.error().message << "\n"; return 1; }
     auto [test_x, test_y] = std::move(*test_result);
 

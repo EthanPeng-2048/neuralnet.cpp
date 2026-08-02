@@ -17,6 +17,7 @@
 #include <fstream>
 #include <span>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
@@ -96,44 +97,65 @@ template <typename T>
 }
 
 // ── 基础类型读写 ──────────────────────────────────────────────────────
+// 直接使用 write_bytes<T> / read_bytes<T>，不再提供 write_u32/u64 等冗余包装。
 
-[[nodiscard]] inline Result<void> write_u32(std::ofstream &ofs, uint32_t v)
+// variadic 字段批量写入：依次写入每个字段，遇错即停
+template <typename... Ts>
+[[nodiscard]] inline Result<void> write_fields(std::ofstream &ofs, const Ts &...fields)
 {
-    if (auto r = write_bytes(ofs, v); !r)
-        return std::unexpected(Error{"Write error while writing u32"});
+    Result<void> result = {};
+    bool stop = false;
+    auto write_one = [&](const auto &field) {
+        if (stop) return;
+        result = write_bytes(ofs, field);
+        if (!result) stop = true;
+    };
+    (write_one(fields), ...);
+    return result;
+}
+
+// variadic 字段批量读取：依次读出每个字段，遇错即停
+// 注意：实现使用递归模板逐个读取，避免 std::apply 在 MSVC 上的推导问题。
+namespace detail_read
+{
+// 递归终止：所有字段已读取
+template <typename Tuple>
+[[nodiscard]] inline Result<void> read_fields_rec(
+    std::ifstream & /*ifs*/, Tuple & /*values*/, std::index_sequence<>)
+{
     return {};
 }
 
-[[nodiscard]] inline Result<uint32_t> read_u32(std::ifstream &ifs)
+// 递归读取第 I 个字段，然后读取剩余字段
+template <typename Tuple, std::size_t I, std::size_t... Rest>
+[[nodiscard]] inline Result<void> read_fields_rec(
+    std::ifstream &ifs, Tuple &values, std::index_sequence<I, Rest...>)
 {
-    auto r = read_bytes<uint32_t>(ifs);
-    if (!r)
-        return std::unexpected(Error{"Unexpected end of file while reading u32"});
-    return *r;
+    using T = std::tuple_element_t<I, Tuple>;
+    auto r = read_bytes<T>(ifs);
+    if (!r) return std::unexpected(r.error());
+    std::get<I>(values) = *r;
+    return read_fields_rec(ifs, values, std::index_sequence<Rest...>{});
 }
+}  // namespace detail_read
 
-[[nodiscard]] inline Result<void> write_u64(std::ofstream &ofs, uint64_t v)
+template <typename... Ts>
+[[nodiscard]] inline Result<std::tuple<Ts...>> read_fields(std::ifstream &ifs)
 {
-    if (auto r = write_bytes(ofs, v); !r)
-        return std::unexpected(Error{"Write error while writing u64"});
-    return {};
-}
-
-[[nodiscard]] inline Result<uint64_t> read_u64(std::ifstream &ifs)
-{
-    auto r = read_bytes<uint64_t>(ifs);
-    if (!r)
-        return std::unexpected(Error{"Unexpected end of file while reading u64"});
-    return *r;
+    std::tuple<Ts...> values{};
+    auto result = detail_read::read_fields_rec<std::tuple<Ts...>>(
+        ifs, values, std::index_sequence_for<Ts...>{});
+    if (!result) return std::unexpected(result.error());
+    return values;
 }
 
 // ── 矩阵读写 ──────────────────────────────────────────────────────────
 
 [[nodiscard]] inline Result<void> write_matrix(std::ofstream &ofs, const Matrix &m)
 {
-    if (auto r = write_u64(ofs, static_cast<uint64_t>(m.rows())); !r)
+    if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.rows())); !r)
         return std::unexpected(r.error());
-    if (auto r = write_u64(ofs, static_cast<uint64_t>(m.cols())); !r)
+    if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.cols())); !r)
         return std::unexpected(r.error());
     const auto s = m.span();
     ofs.write(reinterpret_cast<const char *>(s.data()),
@@ -145,9 +167,9 @@ template <typename T>
 
 [[nodiscard]] inline Result<void> read_matrix(std::ifstream &ifs, Matrix &m)
 {
-    auto rows_r = read_u64(ifs);
+    auto rows_r = read_bytes<uint64_t>(ifs);
     if (!rows_r) return std::unexpected(rows_r.error());
-    auto cols_r = read_u64(ifs);
+    auto cols_r = read_bytes<uint64_t>(ifs);
     if (!cols_r) return std::unexpected(cols_r.error());
     const auto rows = static_cast<std::size_t>(*rows_r);
     const auto cols = static_cast<std::size_t>(*cols_r);
@@ -172,51 +194,40 @@ template <typename T>
 
 [[nodiscard]] inline Result<void> write_spec(std::ofstream &ofs, const ModelSpec &spec)
 {
-    if (auto r = write_u32(ofs, static_cast<uint32_t>(spec.type)); !r)
+    if (auto r = write_bytes<uint32_t>(ofs, static_cast<uint32_t>(spec.type)); !r)
         return std::unexpected(r.error());
 
     switch (spec.type)
     {
     case ModelType::MLP:
     {
-        if (auto r = write_u32(ofs, static_cast<uint32_t>(spec.layer_dims.size())); !r)
+        if (auto r = write_bytes<uint32_t>(ofs, static_cast<uint32_t>(spec.layer_dims.size())); !r)
             return std::unexpected(r.error());
         for (auto d : spec.layer_dims)
-            if (auto r = write_u64(ofs, static_cast<uint64_t>(d)); !r)
+            if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(d)); !r)
                 return std::unexpected(r.error());
         break;
     }
 
     case ModelType::Transformer:
-        if (auto r = write_u64(ofs, static_cast<uint64_t>(spec.d_model)); !r)
-            return std::unexpected(r.error());
-        if (auto r = write_u64(ofs, static_cast<uint64_t>(spec.num_heads)); !r)
-            return std::unexpected(r.error());
-        if (auto r = write_u64(ofs, static_cast<uint64_t>(spec.d_ff)); !r)
-            return std::unexpected(r.error());
-        if (auto r = write_u64(ofs, static_cast<uint64_t>(spec.num_layers)); !r)
-            return std::unexpected(r.error());
-        if (auto r = write_u64(ofs, static_cast<uint64_t>(spec.patch_size)); !r)
-            return std::unexpected(r.error());
-        break;
+        return write_fields(ofs,
+            static_cast<uint64_t>(spec.d_model),
+            static_cast<uint64_t>(spec.num_heads),
+            static_cast<uint64_t>(spec.d_ff),
+            static_cast<uint64_t>(spec.num_layers),
+            static_cast<uint64_t>(spec.patch_size));
 
     case ModelType::GPT:
-        if (auto r = write_u64(ofs, static_cast<uint64_t>(spec.vocab_size)); !r)
-            return std::unexpected(r.error());
-        if (auto r = write_u64(ofs, static_cast<uint64_t>(spec.d_model)); !r)
-            return std::unexpected(r.error());
-        if (auto r = write_u64(ofs, static_cast<uint64_t>(spec.seq_len)); !r)
-            return std::unexpected(r.error());
-        if (auto r = write_u64(ofs, static_cast<uint64_t>(spec.num_heads)); !r)
-            return std::unexpected(r.error());
-        if (auto r = write_u64(ofs, static_cast<uint64_t>(spec.d_ff)); !r)
-            return std::unexpected(r.error());
-        if (auto r = write_u64(ofs, static_cast<uint64_t>(spec.num_layers)); !r)
+        if (auto r = write_fields(ofs,
+                static_cast<uint64_t>(spec.vocab_size),
+                static_cast<uint64_t>(spec.d_model),
+                static_cast<uint64_t>(spec.seq_len),
+                static_cast<uint64_t>(spec.num_heads),
+                static_cast<uint64_t>(spec.d_ff),
+                static_cast<uint64_t>(spec.num_layers)); !r)
             return std::unexpected(r.error());
         // V4+: pos_encoding (向后兼容：旧文件无此字段，默认 Learned)
-        if (auto r = write_u32(ofs, static_cast<uint32_t>(spec.pos_encoding)); !r)
-            return std::unexpected(r.error());
-        break;
+        return write_bytes<uint32_t>(ofs, static_cast<uint32_t>(spec.pos_encoding));
 
     default:
         return std::unexpected(Error{"Cannot write unknown ModelType: "
@@ -228,7 +239,7 @@ template <typename T>
 [[nodiscard]] inline Result<ModelSpec> read_spec(std::ifstream &ifs)
 {
     ModelSpec spec;
-    auto type_r = read_u32(ifs);
+    auto type_r = read_bytes<uint32_t>(ifs);
     if (!type_r) return std::unexpected(type_r.error());
     spec.type = static_cast<ModelType>(*type_r);
 
@@ -236,13 +247,13 @@ template <typename T>
     {
     case ModelType::MLP:
     {
-        auto nd_r = read_u32(ifs);
+        auto nd_r = read_bytes<uint32_t>(ifs);
         if (!nd_r) return std::unexpected(nd_r.error());
         const auto nd = *nd_r;
         spec.layer_dims.resize(nd);
         for (uint32_t i = 0; i < nd; ++i)
         {
-            auto d_r = read_u64(ifs);
+            auto d_r = read_bytes<uint64_t>(ifs);
             if (!d_r) return std::unexpected(d_r.error());
             spec.layer_dims[i] = static_cast<std::size_t>(*d_r);
         }
@@ -251,35 +262,30 @@ template <typename T>
 
     case ModelType::Transformer:
     {
-        auto v = read_u64(ifs); if (!v) return std::unexpected(v.error());
-        spec.d_model    = static_cast<std::size_t>(*v);
-        v = read_u64(ifs); if (!v) return std::unexpected(v.error());
-        spec.num_heads  = static_cast<std::size_t>(*v);
-        v = read_u64(ifs); if (!v) return std::unexpected(v.error());
-        spec.d_ff       = static_cast<std::size_t>(*v);
-        v = read_u64(ifs); if (!v) return std::unexpected(v.error());
-        spec.num_layers = static_cast<std::size_t>(*v);
-        v = read_u64(ifs); if (!v) return std::unexpected(v.error());
-        spec.patch_size = static_cast<std::size_t>(*v);
+        auto v = read_fields<uint64_t, uint64_t, uint64_t, uint64_t, uint64_t>(ifs);
+        if (!v) return std::unexpected(v.error());
+        auto& [dm, nh, df, nl, ps] = *v;
+        spec.d_model    = static_cast<std::size_t>(dm);
+        spec.num_heads  = static_cast<std::size_t>(nh);
+        spec.d_ff       = static_cast<std::size_t>(df);
+        spec.num_layers = static_cast<std::size_t>(nl);
+        spec.patch_size = static_cast<std::size_t>(ps);
         break;
     }
 
     case ModelType::GPT:
     {
-        auto v = read_u64(ifs); if (!v) return std::unexpected(v.error());
-        spec.vocab_size = static_cast<std::size_t>(*v);
-        v = read_u64(ifs); if (!v) return std::unexpected(v.error());
-        spec.d_model    = static_cast<std::size_t>(*v);
-        v = read_u64(ifs); if (!v) return std::unexpected(v.error());
-        spec.seq_len    = static_cast<std::size_t>(*v);
-        v = read_u64(ifs); if (!v) return std::unexpected(v.error());
-        spec.num_heads  = static_cast<std::size_t>(*v);
-        v = read_u64(ifs); if (!v) return std::unexpected(v.error());
-        spec.d_ff       = static_cast<std::size_t>(*v);
-        v = read_u64(ifs); if (!v) return std::unexpected(v.error());
-        spec.num_layers = static_cast<std::size_t>(*v);
+        auto v = read_fields<uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t>(ifs);
+        if (!v) return std::unexpected(v.error());
+        auto& [vs, dm, sl, nh, df, nl] = *v;
+        spec.vocab_size = static_cast<std::size_t>(vs);
+        spec.d_model    = static_cast<std::size_t>(dm);
+        spec.seq_len    = static_cast<std::size_t>(sl);
+        spec.num_heads  = static_cast<std::size_t>(nh);
+        spec.d_ff       = static_cast<std::size_t>(df);
+        spec.num_layers = static_cast<std::size_t>(nl);
         // V4+: pos_encoding（向后兼容：旧文件读到 EOF 时保持默认 Learned）
-        auto pe = read_u32(ifs);
+        auto pe = read_bytes<uint32_t>(ifs);
         if (pe)
             spec.pos_encoding = static_cast<PosEncodingType>(*pe);
         // else: 旧文件无此字段，spec.pos_encoding 已默认 Learned
@@ -298,27 +304,25 @@ template <typename T>
 
 [[nodiscard]] inline Result<void> write_header(std::ofstream &ofs)
 {
-    if (auto r = write_u32(ofs, MODEL_MAGIC); !r)
+    if (auto r = write_bytes<uint32_t>(ofs, MODEL_MAGIC); !r)
         return std::unexpected(r.error());
-    if (auto r = write_u32(ofs, MODEL_VERSION); !r)
+    if (auto r = write_bytes<uint32_t>(ofs, MODEL_VERSION); !r)
         return std::unexpected(r.error());
-    if (auto r = write_bytes(ofs, PRECISION_TAG); !r)
-        return std::unexpected(Error{"Write error while writing precision tag"});
-    if (!ofs)
-        return std::unexpected(Error{"Write error while writing precision tag"});
+    if (auto r = write_bytes<uint8_t>(ofs, PRECISION_TAG); !r)
+        return std::unexpected(r.error());
     return {};
 }
 
 // 返回读到的 version，同时校验 magic number 和精度
 [[nodiscard]] inline Result<uint32_t> read_and_validate_header(std::ifstream &ifs)
 {
-    auto magic_r = read_u32(ifs);
+    auto magic_r = read_bytes<uint32_t>(ifs);
     if (!magic_r) return std::unexpected(magic_r.error());
     if (*magic_r != MODEL_MAGIC)
         return std::unexpected(Error{"Invalid model file: bad magic number (0x"
                            + std::to_string(*magic_r) + ")"});
 
-    auto version_r = read_u32(ifs);
+    auto version_r = read_bytes<uint32_t>(ifs);
     if (!version_r) return std::unexpected(version_r.error());
     if (*version_r == 0 || *version_r > MODEL_VERSION)
         return std::unexpected(Error{"Unsupported model file version: "
@@ -344,7 +348,7 @@ template <typename T>
 
 [[nodiscard]] inline Result<void> write_tokenizer(std::ofstream &ofs, const std::string &json)
 {
-    if (auto r = write_u64(ofs, static_cast<uint64_t>(json.size())); !r)
+    if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(json.size())); !r)
         return std::unexpected(r.error());
     if (!json.empty())
     {
@@ -357,7 +361,7 @@ template <typename T>
 
 [[nodiscard]] inline Result<std::string> read_tokenizer(std::ifstream &ifs)
 {
-    auto len_r = read_u64(ifs);
+    auto len_r = read_bytes<uint64_t>(ifs);
     if (!len_r) return std::unexpected(len_r.error());
     const auto len = static_cast<std::size_t>(*len_r);
     if (len == 0) return std::string{};  // 未嵌入
@@ -447,7 +451,9 @@ template <typename T>
     if (!version_r) return std::unexpected(version_r.error());
     const auto version = *version_r;
 
-    // V2/V3: 跳过规格头（规格已隐含在构建好的 model 中）
+    // V2/V3: 读取并跳过规格头（规格已隐含在构建好的 model 中）
+    // TODO: 此处读完 spec 即丢弃，未与 model 自身的架构校验。
+    //       完整校验需要 Layer 基类支持 spec() 方法，改动较大，暂留待后续实现。
     if (version >= 2)
     {
         auto spec_r = detail::read_spec(ifs);

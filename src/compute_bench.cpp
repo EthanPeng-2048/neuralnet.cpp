@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
@@ -242,18 +243,18 @@ int main(int argc, char* argv[])
         Matrix C(N, N);
 
         // 加法
-        auto res_add = bench([&] { C = A + B; }, warmup, iters);
+        auto res_add = bench([&] { C = nn::detail::binary_apply(A, B, std::plus<>{}); }, warmup, iters);
         print_row("elem add", std::to_string(N).c_str(), elem_flops(total),
                   res_add.avg_ms, res_add.min_ms, 3.0 * total * sizeof(Scalar));
 
         // 减法
-        auto res_sub = bench([&] { C = A - B; }, warmup, iters);
+        auto res_sub = bench([&] { C = nn::detail::binary_apply(A, B, std::minus<>{}); }, warmup, iters);
         print_row("elem sub", std::to_string(N).c_str(), elem_flops(total),
                   res_sub.avg_ms, res_sub.min_ms, 3.0 * total * sizeof(Scalar));
 
         // 标量乘法
         Scalar s = 2.5f;
-        auto res_mul = bench([&] { C = A * s; }, warmup, iters);
+        auto res_mul = bench([&] { C = nn::detail::apply(A, [s](Scalar v) { return v * s; }); }, warmup, iters);
         print_row("scalar mul", std::to_string(N).c_str(), elem_flops(total),
                   res_mul.avg_ms, res_mul.min_ms, 2.0 * total * sizeof(Scalar));
 
@@ -281,14 +282,14 @@ int main(int argc, char* argv[])
         Matrix C(N, N);
 
         // ReLU: max(0, x)  — 约 1 FLOP/element
-        auto res_relu = bench([&] { C = A.apply([](Scalar v) { return std::max(Scalar{0}, v); }); },
+        auto res_relu = bench([&] { C = nn::detail::apply(A, [](Scalar v) { return std::max(Scalar{0}, v); }); },
                               warmup, iters);
         print_row("ReLU (apply)", std::to_string(N).c_str(), elem_flops(total),
                   res_relu.avg_ms, res_relu.min_ms, 2.0 * total * sizeof(Scalar));
 
         // GeLU 近似: x * σ(1.702x)  — 约 5 FLOPs/element
         auto res_gelu = bench([&] {
-            C = A.apply([](Scalar v) {
+            C = nn::detail::apply(A, [](Scalar v) {
                 Scalar sig = 1.0f / (1.0f + std::exp(-1.702f * v));
                 return v * sig;
             });
@@ -298,7 +299,7 @@ int main(int argc, char* argv[])
 
         // 逐元素乘法: A ⊙ B  — 1 FLOP/element
         auto res_emul = bench([&] {
-            C = A.binary_apply(B, [](Scalar a, Scalar b) { return a * b; });
+            C = nn::detail::binary_apply(A, B, [](Scalar a, Scalar b) { return a * b; });
         }, warmup, iters);
         print_row("elem multiply", std::to_string(N).c_str(), elem_flops(total),
                   res_emul.avg_ms, res_emul.min_ms, 3.0 * total * sizeof(Scalar));

@@ -11,6 +11,13 @@
 namespace nn
 {
 
+// 张量 buffer 的标准 usage 标志：
+//   STORAGE_BUFFER: 绑定到 shader 进行 GPU 计算
+//   TRANSFER_DST:   允许 vkCmdFillBuffer(zero) / vkCmdCopyBuffer(insert_rows) 写入
+//   TRANSFER_SRC:   允许 vkCmdCopyBuffer(clone / slice_rows) 读取
+static constexpr VkBufferUsageFlags TENSOR_BUFFER_USAGE =
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+
 inline Result<GpuTensor> GpuTensor::from_matrix(const Matrix& cpu_mat, GpuBackend& backend)
 {
     if (cpu_mat.empty())
@@ -19,7 +26,7 @@ inline Result<GpuTensor> GpuTensor::from_matrix(const Matrix& cpu_mat, GpuBacken
     auto buf_res = GpuBuffer::create_device_local(
         backend.device().device(), backend.memory_pool(),
         cpu_mat.size(),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        TENSOR_BUFFER_USAGE);
     if (!buf_res)
         return std::unexpected(buf_res.error());
 
@@ -42,7 +49,7 @@ inline Result<GpuTensor> GpuTensor::create_empty(
     auto buf_res = GpuBuffer::create_device_local(
         backend.device().device(), backend.memory_pool(),
         rows * cols,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        TENSOR_BUFFER_USAGE);
     if (!buf_res)
         return std::unexpected(buf_res.error());
 

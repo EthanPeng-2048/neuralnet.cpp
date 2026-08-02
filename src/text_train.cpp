@@ -16,6 +16,8 @@
 #include <neuralnet.cpp/model_serialization.hpp>
 #include <neuralnet.cpp/domain_gpt.hpp>
 #include <neuralnet.cpp/oscillation_guard.hpp>
+#include <neuralnet.cpp/cli/engine_factory.hpp>
+#include <neuralnet.cpp/cli/lr_scheduler.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -139,6 +141,7 @@ void print_usage(const char *prog)
         << "  --warmup-epochs <n> 线性预热轮数 (默认: 0, 即不预热)\n"
         << "  --min-lr <lr>     余弦退火最低学习率 (默认: 1e-6)\n"
         << "  --lr-per-epoch <v1,v2,...>  手动指定每轮学习率 (逗号分隔，优先级最高)\n"
+        << "  --max-norm <f>    梯度裁剪最大全局 L2 范数 (默认: 0=不裁剪)\n"
         << "  --help             显示此帮助信息\n";
 }
 
@@ -194,6 +197,9 @@ struct TrainConfig
     int warmup_epochs = 0;              // 线性预热轮数
     Scalar min_lr = 1e-6f;              // 余弦退火最低 lr
     std::vector<Scalar> lr_per_epoch;   // 手动指定每轮 lr（为空则自动计算）
+
+    // 梯度裁剪
+    Scalar max_norm = 0.0f;             // 0 = 不裁剪
 };
 
 TrainConfig parse_args(int argc, char *argv[])
@@ -358,6 +364,12 @@ TrainConfig parse_args(int argc, char *argv[])
                 if (!v) { std::cerr << "无效 --lr-per-epoch 值: " << v.error().message << "\n"; std::exit(1); }
                 cfg.lr_per_epoch.push_back(*v);
             }
+        }
+        else if (arg == "--max-norm" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<Scalar>(argv[++i]);
+            if (!v) { std::cerr << "无效 --max-norm: " << v.error().message << "\n"; std::exit(1); }
+            cfg.max_norm = *v;
         }
         else if (arg == "--positional-encoding" && i + 1 < argc)
         {
@@ -631,56 +643,10 @@ int main(int argc, char *argv[])
     }
 
     // ── 创建计算引擎 ─────────────────────────────────────────
-    std::unique_ptr<nn::ComputeEngine> engine;
-#ifdef NN_HAS_VULKAN
-    nn::GpuBackend *gpu_backend = nullptr;
-#endif
-    if (cfg.cuda_enabled)
-    {
-#ifdef NN_HAS_CUDA
-        auto &backend = nn::CudaBackend::instance();
-        auto init_result = backend.initialize();
-        if (init_result)
-        {
-            engine = std::make_unique<nn::CudaEngine>(backend);
-            const auto& props = backend.device_props();
-            std::cout << "CUDA GPU 加速已启用 (" << props.name << ")\n\n";
-        }
-        else
-        {
-            std::cerr << "CUDA 初始化失败: " << init_result.error().message << "\n";
-            std::cerr << "回退到 CPU 模式\n\n";
-            engine = std::make_unique<nn::CpuEngine>();
-        }
-#else
-        std::cerr << "未编译 CUDA 支持，使用 CPU 模式\n\n";
-        engine = std::make_unique<nn::CpuEngine>();
-#endif
-    }
-    else if (cfg.gpu_enabled)
-    {
-#ifdef NN_HAS_VULKAN
-        auto &backend = nn::GpuBackend::instance();
-        auto init_result = backend.initialize();
-        if (init_result)
-        {
-            gpu_backend = &backend;
-            engine = std::make_unique<nn::GpuEngine>(*gpu_backend);
-            std::cout << "GPU 加速已启用 (Vulkan GpuEngine)\n\n";
-        }
-        else
-        {
-            std::cerr << "GPU 初始化失败: " << init_result.error().message << "\n";
-            std::cerr << "回退到 CPU 模式\n\n";
-            engine = std::make_unique<nn::CpuEngine>();
-        }
-#else
-        std::cerr << "未编译 Vulkan 支持，使用 CPU 模式\n\n";
-        engine = std::make_unique<nn::CpuEngine>();
-#endif
-    }
-    else
-        engine = std::make_unique<nn::CpuEngine>();
+    nn::cli::EngineConfig eng_cfg;
+    eng_cfg.use_gpu = cfg.gpu_enabled;
+    eng_cfg.use_cuda = cfg.cuda_enabled;
+    auto engine = nn::cli::create_engine(eng_cfg, std::cout);
 
     // ── 构建模型（绑定引擎） ─────────────────────────────────
     auto model_build = nn::build_gpt_model(
@@ -713,22 +679,15 @@ int main(int argc, char *argv[])
         else
         {
             auto file_spec = std::move(*spec_result);
-            if (file_spec.is_gpt())
+            // 统一的 GPTModel 通过 pos_encoding 区分 Learned/Sinusoidal/ALiBi，
+            // 因此 GPT 和旧格式 ALiBi_GPT 文件都走同一条构建路径。
+            if (file_spec.is_gpt() || file_spec.is_alibi_gpt())
             {
-                std::cout << "从模型文件读取 GPT 规格\n";
+                if (file_spec.pos_encoding == nn::PosEncodingType::ALiBi)
+                    std::cout << "从模型文件读取 ALiBi GPT 规格\n";
+                else
+                    std::cout << "从模型文件读取 GPT 规格\n";
                 auto build_result = nn::build_gpt_model_from_spec(*engine, file_spec);
-                if (!build_result)
-                {
-                    std::cerr << "Error: " << build_result.error().message << '\n';
-                    return 1;
-                }
-                model = std::move(*build_result);
-                spec = file_spec;
-            }
-            else if (file_spec.is_alibi_gpt())
-            {
-                std::cout << "从模型文件读取 ALiBi GPT 规格\n";
-                auto build_result = nn::build_alibi_gpt_model_from_spec(*engine, file_spec);
                 if (!build_result)
                 {
                     std::cerr << "Error: " << build_result.error().message << '\n';
@@ -758,6 +717,11 @@ int main(int argc, char *argv[])
         cfg.optimizer_name, *engine,
         model.parameters(), model.param_gradients(), cfg.lr,
         cfg.weight_decay);
+    if (!optimizer)
+    {
+        std::cerr << "错误：未知优化器名称: " << cfg.optimizer_name << "\n";
+        return 1;
+    }
 
     // ── 振荡抑制器 ───────────────────────────────────────────
     std::optional<nn::OscillationGuard> osc_guard;
@@ -770,35 +734,14 @@ int main(int argc, char *argv[])
     }
     Scalar optimizer_current_lr = cfg.lr;
 
-    // ── 计算每 epoch 的学习率调度 ──
-    auto compute_epoch_lr = [&](int epoch) -> Scalar {
-        // 手动指定优先
-        if (!cfg.lr_per_epoch.empty())
-        {
-            if (epoch < static_cast<int>(cfg.lr_per_epoch.size()))
-                return cfg.lr_per_epoch[epoch];
-            return cfg.lr_per_epoch.back();  // 超出部分用最后一个
-        }
-        if (cfg.lr_schedule == "cosine")
-        {
-            Scalar max_lr = cfg.lr;
-            Scalar lr_min = cfg.min_lr;
-            if (cfg.warmup_epochs > 0 && epoch < cfg.warmup_epochs)
-            {
-                // 线性预热
-                return max_lr * static_cast<Scalar>(epoch + 1) / static_cast<Scalar>(cfg.warmup_epochs);
-            }
-            else
-            {
-                // 余弦退火
-                int cosine_epochs = cfg.epochs - cfg.warmup_epochs;
-                if (cosine_epochs <= 0) return max_lr;
-                Scalar progress = static_cast<Scalar>(epoch - cfg.warmup_epochs) / static_cast<Scalar>(cosine_epochs);
-                return lr_min + 0.5f * (max_lr - lr_min) * (1.0f + std::cos(3.14159265358979323846f * progress));
-            }
-        }
-        return cfg.lr;  // fixed
-    };
+    // ── 学习率调度配置（委托给 nn::cli::compute_epoch_lr） ──
+    nn::cli::LrScheduleConfig lr_sched_cfg;
+    lr_sched_cfg.base_lr = cfg.lr;
+    lr_sched_cfg.min_lr = cfg.min_lr;
+    lr_sched_cfg.warmup_epochs = cfg.warmup_epochs;
+    lr_sched_cfg.total_epochs = cfg.epochs;
+    lr_sched_cfg.schedule = cfg.lr_schedule;
+    lr_sched_cfg.lr_per_epoch = cfg.lr_per_epoch;
 
     nn::CrossEntropyLoss ce_loss;
 
@@ -864,8 +807,7 @@ int main(int argc, char *argv[])
                   << "  tokens: " << test_token_count << std::endl;
     }
 
-    std::size_t steps_per_epoch = std::min(
-        valid_samples.size() / cfg.batch_size, std::size_t{1000});
+    std::size_t steps_per_epoch = valid_samples.size() / cfg.batch_size;
 
     // 改造：每 epoch 开始前 shuffle 样本索引队列，每 step 顺序切片。
     // 不再每 step 独立随机采样，保证每个样本每 epoch 被访问一次。
@@ -1044,13 +986,13 @@ int main(int argc, char *argv[])
     for (int epoch = 0; epoch < cfg.epochs; ++epoch)
     {
         // ── 学习率调度：每 epoch 开始时调整 ──
-        Scalar epoch_lr = compute_epoch_lr(epoch);
+        Scalar epoch_lr = nn::cli::compute_epoch_lr(lr_sched_cfg, epoch);
         if (epoch_lr != optimizer_current_lr)
         {
             optimizer->set_lr(epoch_lr);
             optimizer_current_lr = epoch_lr;
             if (osc_guard)
-                osc_guard->set_lr(epoch_lr);
+                osc_guard->rebase_lr(epoch_lr);
         }
 
         auto ep_start = std::chrono::steady_clock::now();
@@ -1168,7 +1110,6 @@ int main(int argc, char *argv[])
                 }
                 return 1;
             }
-
             // ── 反向传播（梯度已含 mask，无需额外处理） ────────
             auto grad_result = ce_loss.backward();
             if (!grad_result) { std::cerr << "\nLoss backward failed: " << grad_result.error().message << '\n'; return 1; }
@@ -1191,6 +1132,16 @@ int main(int argc, char *argv[])
                 }
                 std::cerr << '\n';
                 return 1;
+            }
+
+            // ── 梯度裁剪（在 step() 之前，backward() 之后） ──
+            if (cfg.max_norm > 0)
+            {
+                auto clip_r = optimizer->clip_grad_norm(cfg.max_norm);
+                if (!clip_r) {
+                    std::cerr << "\n梯度裁剪失败: " << clip_r.error().message << '\n';
+                    return 1;
+                }
             }
 
             auto opt_begin = engine->begin_batch();
@@ -1281,8 +1232,7 @@ int main(int argc, char *argv[])
                             y_tokens = nn::Matrix(cfg.seq_len, cfg.batch_size);
                             loss_mask = nn::Matrix(cfg.seq_len, cfg.batch_size);
                             flat_targets.resize(cfg.seq_len * cfg.batch_size);
-                            steps_per_epoch = std::min(
-                                valid_samples.size() / cfg.batch_size, std::size_t{1000});
+                            steps_per_epoch = valid_samples.size() / cfg.batch_size;
                             --step;
                             continue;
                         }

@@ -37,7 +37,7 @@ namespace nn
 // 职责：
 //   - 持有 engine / params / grads 三元组（所有子类共享）
 //   - 提供 zero_grad() 默认实现
-//   - 提供 scale_add_() 辅助方法（axpy: dst += scalar * src），消除子类重复模板
+//   - 提供 validate_sizes_() / create_zero_buffers_() 公共辅助方法
 // ══════════════════════════════════════════════════════════════════════════
 class Optimizer
 {
@@ -46,16 +46,26 @@ protected:
     std::vector<TensorRef> params_;      // 非拥有引用（永不为空）
     std::vector<TensorRef> grads_;       // 非拥有引用（永不为空）
 
-    // 辅助方法：dst += scalar * src（融合 axpy：单次 dispatch 替代 clone+scale+add 三步）
-    // 用于 SGD / Momentum / Adam 等优化器中常见的 axpy 操作
-    //
-    // 性能改进（依据性能审查报告）：
-    //   - 旧实现：clone_tensor + scale_inplace + add_inplace = 3 个 GPU 原语 + 3 个临时 buffer
-    //   - 新实现：axpy_inplace = 1 个 GPU 原语 + 1 个临时 buffer
-    //   - 100 个参数 × 每 step 调用 ~3 次 = 减少 600 次 GPU buffer 分配/step
-    [[nodiscard]] Result<void> scale_add_(Tensor& dst, Scalar scalar, const Tensor& src)
+    // 校验 params/grads 数量一致（各子类 step() 开头调用）
+    [[nodiscard]] Result<void> validate_sizes_() const
     {
-        return engine_.axpy_inplace(dst, scalar, src);
+        if (params_.size() != grads_.size())
+            return std::unexpected(Error{"Optimizer: params/grads size mismatch"});
+        return {};
+    }
+
+    // 为每个参数创建同形状的零初始化 Tensor（供 Momentum/Adam/Muon 复用）
+    std::vector<Tensor> create_zero_buffers_() const
+    {
+        std::vector<Tensor> buffers;
+        buffers.reserve(params_.size());
+        for (auto& p : params_)
+        {
+            auto buf = engine_.create_tensor(p.get().rows(), p.get().cols());
+            { auto r = engine_.zero(buf); NN_ASSERT(r, r ? "" : r.error().message.c_str()); }
+            buffers.push_back(std::move(buf));
+        }
+        return buffers;
     }
 
 public:
@@ -73,6 +83,48 @@ public:
 
     [[nodiscard]] virtual Result<void> step() = 0;
 
+    // ── 梯度裁剪（max_norm）：全局 L2 范数裁剪 ─────────────────────
+    // 计算所有梯度张量的全局 L2 范数，若超过 max_norm 则等比例缩放。
+    // 在 step() 之前调用： backward() → clip_grad_norm(max_norm) → step().
+    [[nodiscard]] Result<void> clip_grad_norm(Scalar max_norm)
+    {
+        if (max_norm <= 0 || grads_.empty())
+            return {};
+
+        // 计算全局梯度平方和
+        Scalar total_sq = 0;
+        for (auto& g_ref : grads_)
+        {
+            auto& g = g_ref.get();
+            // g² = g * g（逐元素乘法）
+            auto g_sq_r = engine_.elementwise_binary(BinaryOp::Mul, g, g);
+            if (!g_sq_r) return std::unexpected(g_sq_r.error());
+            // 按行求和 → (rows, 1)
+            auto row_sums_r = engine_.row_reduce_sum(*g_sq_r);
+            if (!row_sums_r) return std::unexpected(row_sums_r.error());
+            // 按列求和 → (1, 1) 标量张量
+            auto col_sum_r = engine_.col_reduce_sum(*row_sums_r);
+            if (!col_sum_r) return std::unexpected(col_sum_r.error());
+            // 下载到 CPU 获取标量值
+            auto m_r = engine_.to_matrix(*col_sum_r);
+            if (!m_r) return std::unexpected(m_r.error());
+            total_sq += m_r->at(0, 0);
+        }
+
+        Scalar norm = std::sqrt(total_sq);
+        if (norm <= max_norm)
+            return {};
+
+        // 等比例缩放所有梯度
+        Scalar scale = max_norm / norm;
+        for (auto& g_ref : grads_)
+        {
+            auto r = engine_.scale_inplace(g_ref.get(), scale);
+            if (!r) return std::unexpected(r.error());
+        }
+        return {};
+    }
+
     // 默认实现：将所有梯度清零（所有子类行为一致）
     [[nodiscard]] virtual Result<void> zero_grad()
     {
@@ -89,7 +141,7 @@ public:
 // SGD — 随机梯度下降
 //
 // 算法：p -= lr * g
-// 原语：scale_add_(p, -lr, g)
+// 原语：axpy_inplace(p, -lr, g)
 // ══════════════════════════════════════════════════════════════════════════
 class SGD : public Optimizer
 {
@@ -106,12 +158,11 @@ public:
 
     [[nodiscard]] Result<void> step() override
     {
-        if (params_.size() != grads_.size())
-            return std::unexpected(Error{"SGD: params/grads size mismatch"});
+        if (auto r = validate_sizes_(); !r) return std::unexpected(r.error());
 
         for (std::size_t i = 0; i < params_.size(); ++i)
         {
-            auto r = scale_add_(params_[i], -lr_, grads_[i]);
+            auto r = engine_.axpy_inplace(params_[i], -lr_, grads_[i]);
             if (!r) return std::unexpected(r.error());
         }
         return {};
@@ -122,7 +173,7 @@ public:
 // SGDWithMomentum — 带动量的 SGD
 //
 // 算法：v = β*v + (1-β)*g;  p -= lr*v
-// 原语：scale_add_(v, 1-β, g)  →  scale_add_(p, -lr, v)
+// 原语：axpy_inplace(v, 1-β, g)  →  axpy_inplace(p, -lr, v)
 // ══════════════════════════════════════════════════════════════════════════
 class SGDWithMomentum : public Optimizer
 {
@@ -136,23 +187,14 @@ public:
                      std::vector<TensorRef> grads,
                      Scalar lr, Scalar beta = 0.9)
         : Optimizer(engine, std::move(params), std::move(grads)),
-          lr_(lr), beta_(beta)
-    {
-        velocities_.reserve(params_.size());
-        for (auto& p : params_)
-        {
-            auto v = engine_.create_tensor(p.get().rows(), p.get().cols());
-            { auto r = engine_.zero(v); NN_ASSERT(r, r ? "" : r.error().message.c_str()); }
-            velocities_.push_back(std::move(v));
-        }
-    }
+          lr_(lr), beta_(beta),
+          velocities_(create_zero_buffers_()) {}
 
     void set_lr(Scalar lr) override { lr_ = lr; }
 
     [[nodiscard]] Result<void> step() override
     {
-        if (params_.size() != grads_.size())
-            return std::unexpected(Error{"Momentum: params/grads size mismatch"});
+        if (auto r = validate_sizes_(); !r) return std::unexpected(r.error());
 
         const Scalar one_minus_beta = Scalar{1} - beta_;
 
@@ -161,11 +203,11 @@ public:
             // v = β*v + (1-β)*g
             auto r = engine_.scale_inplace(velocities_[i], beta_);
             if (!r) return std::unexpected(r.error());
-            r = scale_add_(velocities_[i], one_minus_beta, grads_[i]);
+            r = engine_.axpy_inplace(velocities_[i], one_minus_beta, grads_[i]);
             if (!r) return std::unexpected(r.error());
 
             // p -= lr * v
-            r = scale_add_(params_[i], -lr_, velocities_[i]);
+            r = engine_.axpy_inplace(params_[i], -lr_, velocities_[i]);
             if (!r) return std::unexpected(r.error());
         }
         return {};
@@ -206,7 +248,7 @@ protected:
         // m = β1*m + (1-β1)*g
         auto r = engine_.scale_inplace(m_[i], beta1_);
         if (!r) return std::unexpected(r.error());
-        r = scale_add_(m_[i], one_minus_beta1, g);
+        r = engine_.axpy_inplace(m_[i], one_minus_beta1, g);
         if (!r) return std::unexpected(r.error());
 
         // v = β2*v + (1-β2)*g²
@@ -251,17 +293,8 @@ protected:
 
     void init_moments_()
     {
-        m_.reserve(params_.size());
-        v_.reserve(params_.size());
-        for (auto& p : params_)
-        {
-            auto mt = engine_.create_tensor(p.get().rows(), p.get().cols());
-            auto vt = engine_.create_tensor(p.get().rows(), p.get().cols());
-            { auto r1 = engine_.zero(mt); NN_ASSERT(r1, r1 ? "" : r1.error().message.c_str()); }
-            { auto r2 = engine_.zero(vt); NN_ASSERT(r2, r2 ? "" : r2.error().message.c_str()); }
-            m_.push_back(std::move(mt));
-            v_.push_back(std::move(vt));
-        }
+        m_ = create_zero_buffers_();
+        v_ = create_zero_buffers_();
     }
 
 public:
@@ -282,8 +315,7 @@ public:
 
     [[nodiscard]] Result<void> step() override
     {
-        if (params_.size() != grads_.size())
-            return std::unexpected(Error{"Adam: params/grads size mismatch"});
+        if (auto r = validate_sizes_(); !r) return std::unexpected(r.error());
 
         ++t_;
         for (std::size_t i = 0; i < params_.size(); ++i)
@@ -326,12 +358,11 @@ public:
                lr, beta1, beta2, eps),
           wd_(weight_decay) {}
 
-    void set_lr(Scalar lr) override { lr_ = lr; }
+    // set_lr 复用 Adam::set_lr（lr_ 为 protected，无需 override）
 
     [[nodiscard]] Result<void> step() override
     {
-        if (params_.size() != grads_.size())
-            return std::unexpected(Error{"AdamW: params/grads size mismatch"});
+        if (auto r = validate_sizes_(); !r) return std::unexpected(r.error());
 
         ++t_;
         const Scalar decay_factor = Scalar{1} - lr_ * wd_;
@@ -400,10 +431,11 @@ public:
 
     // Newton-Schulz 迭代：X_new = a*X + (b*A + c*A²) @ X，其中 A = X @ X^T
     //
-    // 性能优化：通过就地复用 matmul 输出缓冲区，消除每步 3 个 clone_tensor 调用：
+    // 性能优化：通过就地复用 matmul 输出缓冲区，减少 clone_tensor 调用：
     //   - A 缓冲区就地修改为 B = b*A + c*A²（A 在计算 B 后不再需要）
     //   - BX 缓冲区就地添加 a*X 得到 X_new（BX 在 aX 加法后不再需要）
-    //   - 原实现每步 6 个临时 buffer → 优化后 0 个额外 clone
+    // 注意：每步仍创建 3 个新 Tensor（A、A_sq、BX，均为 matmul 返回值），
+    //       但消除了额外的 clone_tensor 步骤。
     for (std::size_t t = 0; t < steps; ++t)
     {
         // A = X @ X^T（matmul 返回新 tensor，无分配开销）
@@ -411,7 +443,7 @@ public:
         if (!A) return std::unexpected(A.error());
 
         // A_sq = A @ A（matmul 返回新 tensor）
-        auto A_sq = engine.matmul(*A, *A);
+        auto A_sq = engine.matmul(*A, *A, false, false);
         if (!A_sq) return std::unexpected(A_sq.error());
 
         // B = b*A + c*A²
@@ -425,7 +457,7 @@ public:
 
         // X_new = a*X + B @ X
         // 就地复用：BX 是 matmul 新输出，axpy_inplace 就地添加 a*X
-        auto BX = engine.matmul(*A, *X);
+        auto BX = engine.matmul(*A, *X, false, false);
         if (!BX) return std::unexpected(BX.error());
         r = engine.axpy_inplace(*BX, a, *X);  // BX += a*X → (B + aI)*X
         if (!r) return std::unexpected(r.error());
@@ -474,23 +506,14 @@ public:
          Scalar ns_eps = 1e-7f)
         : Optimizer(engine, std::move(params), std::move(grads)),
           lr_(lr), momentum_(momentum), nesterov_(nesterov),
-          ns_steps_(ns_steps), ns_eps_(ns_eps)
-    {
-        velocities_.reserve(params_.size());
-        for (auto& p : params_)
-        {
-            auto v = engine_.create_tensor(p.get().rows(), p.get().cols());
-            { auto r = engine_.zero(v); NN_ASSERT(r, r ? "" : r.error().message.c_str()); }
-            velocities_.push_back(std::move(v));
-        }
-    }
+          ns_steps_(ns_steps), ns_eps_(ns_eps),
+          velocities_(create_zero_buffers_()) {}
 
     void set_lr(Scalar lr) override { lr_ = lr; }
 
     [[nodiscard]] Result<void> step() override
     {
-        if (params_.size() != grads_.size())
-            return std::unexpected(Error{"Muon: params/grads size mismatch"});
+        if (auto r = validate_sizes_(); !r) return std::unexpected(r.error());
 
         for (std::size_t i = 0; i < params_.size(); ++i)
         {
@@ -544,7 +567,8 @@ public:
 };
 
 // ── 优化器工厂函数 ────────────────────────────────────────────────────────
-// 根据名称创建对应优化器，支持: "sgd", "sgd_momentum", "adam", "adamw", "muon"（默认 Adam）。
+// 根据名称创建对应优化器，支持: "sgd", "sgd_momentum", "adam", "adamw", "muon"。
+// 未知名称返回 nullptr，由调用方处理。
 [[nodiscard]] inline std::unique_ptr<Optimizer> create_optimizer(
     std::string_view name,
     ComputeEngine& engine,
@@ -557,12 +581,14 @@ public:
         return std::make_unique<SGD>(engine, std::move(params), std::move(grads), lr);
     if (name == "sgd_momentum")
         return std::make_unique<SGDWithMomentum>(engine, std::move(params), std::move(grads), lr);
+    if (name == "adam")
+        return std::make_unique<Adam>(engine, std::move(params), std::move(grads), lr);
     if (name == "adamw")
         return std::make_unique<AdamW>(engine, std::move(params), std::move(grads), lr,
                                        0.9, 0.999, 1e-8, weight_decay);
     if (name == "muon")
         return std::make_unique<Muon>(engine, std::move(params), std::move(grads), lr);
-    return std::make_unique<Adam>(engine, std::move(params), std::move(grads), lr);
+    return nullptr;  // 未知名称，调用方应处理
 }
 
 } // namespace nn
