@@ -267,6 +267,7 @@ public:
         Matrix grad_cpu(*softmax_cpu);
 
         Scalar loss_sum = 0.0;
+        std::size_t num_valid = 0;
         const bool use_mask = !loss_mask.empty();
 
         for (std::size_t i = 0; i < cols; ++i)
@@ -292,12 +293,16 @@ public:
             // loss += log(softmax[lbl, i])
             const Scalar sm_val = softmax_cpu->at_unchecked(lbl, i);
             loss_sum += std::log(std::max(sm_val, Scalar{1e-20}));
+            ++num_valid;
 
             // gradient: softmax[lbl, i] -= 1.0（softmax - one_hot 的稀疏等价）
             grad_cpu.set_value_unchecked(lbl, i, sm_val - Scalar{1});
         }
 
-        const Scalar loss = -loss_sum / static_cast<Scalar>(total);
+        // 除以有效 token 数（而非 total），避免 padding 拉低 loss 报告值
+        const Scalar loss = (num_valid > 0)
+            ? -loss_sum / static_cast<Scalar>(num_valid)
+            : Scalar{0};
 
         // ── 4. 上传 gradient 到 GPU ──────────────────────────────
         auto grad_tensor_r = engine.from_matrix(grad_cpu);

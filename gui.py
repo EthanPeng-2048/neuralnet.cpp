@@ -408,29 +408,6 @@ class NeuralNetGUI(tk.Tk):
         self._toggle_lr_schedule()
         row += 1
 
-        # ── 振荡抑制 ──
-        osc_frame = ttk.LabelFrame(f, text="振荡抑制", padding=6)
-        osc_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
-        row += 1
-
-        self.train_osc_guard_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(osc_frame, text="启用振荡检测 (自动降 lr)", variable=self.train_osc_guard_var,
-                        command=self._toggle_osc_guard).grid(row=0, column=0, columnspan=5, sticky="w")
-
-        ttk.Label(osc_frame, text="窗口大小:").grid(row=1, column=0, sticky="w", pady=(4, 0))
-        self.train_osc_window_var = tk.IntVar(value=20)
-        self.train_osc_window_sp = ttk.Spinbox(osc_frame, from_=5, to=200, width=6,
-                                              textvariable=self.train_osc_window_var)
-        self.train_osc_window_sp.grid(row=1, column=1, padx=(0, 16), pady=(4, 0))
-
-        ttk.Label(osc_frame, text="反转率阈值:").grid(row=1, column=2, sticky="w", pady=(4, 0))
-        self.train_osc_threshold_var = tk.DoubleVar(value=0.55)
-        self.train_osc_threshold_sp = ttk.Spinbox(osc_frame, from_=0.1, to=1.0, increment=0.05, width=6,
-                                                  textvariable=self.train_osc_threshold_var, format="%.2f")
-        self.train_osc_threshold_sp.grid(row=1, column=3, padx=(0, 16), pady=(4, 0))
-        self._toggle_osc_guard()  # 初始状态：启用，控件可编辑
-        row += 1
-
         # ── GPU 加速 ──
         self.train_gpu_var = tk.StringVar(value="None")
         gpu_frame = ttk.Frame(f)
@@ -515,12 +492,6 @@ class NeuralNetGUI(tk.Tk):
             self.mlp_params.pack_forget()
             self.transformer_params.pack(fill="x")
 
-    def _toggle_osc_guard(self):
-        """振荡抑制开关：关闭时禁用窗口/阈值输入"""
-        state = "normal" if self.train_osc_guard_var.get() else "disabled"
-        self.train_osc_window_sp.config(state=state)
-        self.train_osc_threshold_sp.config(state=state)
-
     def _toggle_lr_schedule(self):
         """学习率调度：cosine 时启用预热/min-lr，手动模式启用每轮 lr 输入；非 fixed 时禁用固定 lr"""
         schedule = self.train_lr_schedule_var.get()
@@ -577,14 +548,6 @@ class NeuralNetGUI(tk.Tk):
             cmd.append("--cuda")
         elif gpu_backend == "Vulkan":
             cmd.append("--gpu")
-
-        # 振荡抑制
-        cmd += ["--osc-guard", "on" if self.train_osc_guard_var.get() else "off"]
-        if self.train_osc_guard_var.get():
-            if self.train_osc_window_var.get() != 20:
-                cmd += ["--osc-window", str(self.train_osc_window_var.get())]
-            if abs(self.train_osc_threshold_var.get() - 0.55) > 0.001:
-                cmd += ["--osc-threshold", str(self.train_osc_threshold_var.get())]
 
         # 学习率调度
         lr_schedule = self.train_lr_schedule_var.get()
@@ -1153,29 +1116,6 @@ class NeuralNetGUI(tk.Tk):
         self._toggle_text_lr_schedule()
         row += 1
 
-        # ── 振荡抑制 ──
-        osc_frame = ttk.LabelFrame(f, text="振荡抑制", padding=6)
-        osc_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
-        row += 1
-
-        self.text_train_osc_guard_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(osc_frame, text="启用振荡检测 (自动降 lr)", variable=self.text_train_osc_guard_var,
-                        command=self._toggle_text_osc_guard).grid(row=0, column=0, columnspan=5, sticky="w")
-
-        ttk.Label(osc_frame, text="窗口大小:").grid(row=1, column=0, sticky="w", pady=(4, 0))
-        self.text_train_osc_window_var = tk.IntVar(value=20)
-        self.text_train_osc_window_sp = ttk.Spinbox(osc_frame, from_=5, to=200, width=6,
-                                                   textvariable=self.text_train_osc_window_var)
-        self.text_train_osc_window_sp.grid(row=1, column=1, padx=(0, 16), pady=(4, 0))
-
-        ttk.Label(osc_frame, text="反转率阈值:").grid(row=1, column=2, sticky="w", pady=(4, 0))
-        self.text_train_osc_threshold_var = tk.DoubleVar(value=0.55)
-        self.text_train_osc_threshold_sp = ttk.Spinbox(osc_frame, from_=0.1, to=1.0, increment=0.05, width=6,
-                                                       textvariable=self.text_train_osc_threshold_var, format="%.2f")
-        self.text_train_osc_threshold_sp.grid(row=1, column=3, padx=(0, 16), pady=(4, 0))
-        self._toggle_text_osc_guard()  # 初始状态：启用，控件可编辑
-        row += 1
-
         # ── GPU 加速 ──
         self.text_train_gpu_var = tk.StringVar(value="None")
         gpu_frame = ttk.Frame(f)
@@ -1299,12 +1239,6 @@ class NeuralNetGUI(tk.Tk):
         self.text_resume_entry.config(state=state)
         self.text_resume_btn.config(state=state)
 
-    def _toggle_text_osc_guard(self):
-        """振荡抑制开关：关闭时禁用窗口/阈值输入"""
-        state = "normal" if self.text_train_osc_guard_var.get() else "disabled"
-        self.text_train_osc_window_sp.config(state=state)
-        self.text_train_osc_threshold_sp.config(state=state)
-
     def _toggle_text_tdr(self):
         """TDR 防护开关：控制各子选项的启用/禁用"""
         probe_state = "normal" if self.text_train_batch_probe_var.get() else "disabled"
@@ -1366,14 +1300,6 @@ class NeuralNetGUI(tk.Tk):
             cmd.append("--gpu")
         if self.text_train_grad_log_var.get():
             cmd.append("--grad-log")
-
-        # 振荡抑制
-        cmd += ["--osc-guard", "on" if self.text_train_osc_guard_var.get() else "off"]
-        if self.text_train_osc_guard_var.get():
-            if self.text_train_osc_window_var.get() != 20:
-                cmd += ["--osc-window", str(self.text_train_osc_window_var.get())]
-            if abs(self.text_train_osc_threshold_var.get() - 0.55) > 0.001:
-                cmd += ["--osc-threshold", str(self.text_train_osc_threshold_var.get())]
 
         # TDR 防护
         cmd += ["--tdr-retry", "on" if self.text_train_tdr_retry_var.get() else "off"]

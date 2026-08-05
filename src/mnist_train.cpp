@@ -17,7 +17,6 @@
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/model_serialization.hpp>
 #include <neuralnet.cpp/domain_mnist.hpp>
-#include <neuralnet.cpp/oscillation_guard.hpp>
 #include <neuralnet.cpp/cli/engine_factory.hpp>
 #include <neuralnet.cpp/cli/lr_scheduler.hpp>
 #include <neuralnet.cpp/cli/mnist_io.hpp>
@@ -112,9 +111,6 @@ struct TrainConfig
     std::size_t num_layers = nn::MNIST_TF_NUM_LAYERS;
     std::size_t patch_size = nn::MNIST_PATCH_SIZE;
     std::size_t eval_samples = 200;  // Transformer 评估样本上限
-    bool oscillation_guard = true;   // 振荡检测自动降 lr
-    std::size_t osc_window = 20;     // 振荡检测窗口
-    Scalar osc_threshold = 0.55f;    // 振荡反转率阈值
 
     // 学习率调度
     std::string lr_schedule = "fixed";  // fixed / cosine
@@ -132,8 +128,6 @@ TrainConfig parse_args(int argc, char *argv[])
     common.weight_decay = 0.01f;
     common.min_lr = 1e-6f;
     common.lr_schedule = "fixed";
-    common.osc_guard = true;
-    common.osc_threshold = 0.55f;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -266,9 +260,6 @@ TrainConfig parse_args(int argc, char *argv[])
     cfg.warmup_epochs = common.warmup_epochs;
     cfg.min_lr = common.min_lr;
     cfg.lr_per_epoch = std::move(common.lr_per_epoch);
-    cfg.oscillation_guard = common.osc_guard;
-    cfg.osc_window = static_cast<std::size_t>(common.osc_window);
-    cfg.osc_threshold = common.osc_threshold;
 
     return cfg;
 }
@@ -374,7 +365,6 @@ int main(int argc, char *argv[])
     std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
     std::cout << "  GPU: " << (cfg.gpu_enabled ? "启用" : "禁用")
               << "  打乱: " << (cfg.shuffle_steps ? "启用" : "禁用") << "\n";
-    std::cout << "  振荡抑制: " << (cfg.oscillation_guard ? "启用" : "禁用") << "\n";
     std::cout << "  模型: " << (cfg.load_existing ? cfg.resume_path : "(从头训练)")
               << " -> " << cfg.save_path << "\n";
     std::cout << "========================================\n\n";
@@ -433,15 +423,6 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // ── 振荡抑制器 ───────────────────────────────────────────
-    std::optional<nn::OscillationGuard> osc_guard;
-    if (cfg.oscillation_guard)
-    {
-        nn::OscillationGuard::Config oc;
-        oc.window_size = cfg.osc_window;
-        oc.threshold = cfg.osc_threshold;
-        osc_guard.emplace(cfg.lr, std::move(oc));
-    }
     Scalar optimizer_current_lr = cfg.lr;
 
     // ── 学习率调度配置（委托给 nn::cli::compute_epoch_lr） ──
@@ -475,8 +456,6 @@ int main(int argc, char *argv[])
         {
             optimizer->set_lr(epoch_lr);
             optimizer_current_lr = epoch_lr;
-            if (osc_guard)
-                osc_guard->rebase_lr(epoch_lr);
         }
 
         auto ep_start = std::chrono::steady_clock::now();
@@ -554,18 +533,6 @@ int main(int argc, char *argv[])
             if (!step_result) {
                 std::cerr << "\n优化器 step 失败: " << step_result.error().message << '\n';
                 return 1;
-            }
-
-            // ── 振荡检测：检查 loss 是否震荡并自动降 lr ──
-            if (osc_guard)
-            {
-                osc_guard->update(loss);
-                Scalar eff_lr = osc_guard->current_lr();
-                if (eff_lr != optimizer_current_lr)
-                {
-                    optimizer->set_lr(eff_lr);
-                    optimizer_current_lr = eff_lr;
-                }
             }
 
             auto zero_result = optimizer->zero_grad();
