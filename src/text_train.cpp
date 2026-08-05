@@ -15,7 +15,6 @@
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/model_serialization.hpp>
 #include <neuralnet.cpp/domain_gpt.hpp>
-#include <neuralnet.cpp/oscillation_guard.hpp>
 #include <neuralnet.cpp/cli/engine_factory.hpp>
 #include <neuralnet.cpp/cli/lr_scheduler.hpp>
 
@@ -111,9 +110,6 @@ void print_usage(const char *prog)
         << "  --log-interval <n> 每隔多少 step 显示进度 (默认: 50)\n"
         << "  --save-interval <n> 每隔多少 step 保存 checkpoint (默认: 100)\n"
         << "  --grad-log         显示梯度统计（范数/最大值/均值）\n"
-        << "  --osc-guard <on|off>  振荡检测自动降 lr (默认: on)\n"
-        << "  --osc-window <n>   振荡检测窗口大小 (默认: 20)\n"
-        << "  --osc-threshold <f> 振荡反转率阈值 (默认: 0.55)\n"
         << "\n"
         << "TDR 防护:\n"
         << "  --tdr-retry <on|off>  GPU 超时自动减小 batch 重试 (默认: on)\n"
@@ -122,12 +118,6 @@ void print_usage(const char *prog)
         << "  --step-time-limit <f> 单步耗时上限秒数，超过则减半 batch (默认: 1.5)\n"
         << "  --tune-warmup <n>    自动调优预热步数，之后才开始预测 (默认: 3)\n"
         << "  --tune-decay <f>     自动调优 EMA 衰减系数 (默认: 0.7)\n"
-        << "\n"
-        << "Batch 探测:\n"
-        << "  --batch-probe        训练前探测安全 batch_size (默认: on)\n"
-        << "  --no-batch-probe     禁用训练前探测\n"
-        << "  --probe-steps <n>    探测步数 (默认: 3)\n"
-        << "  --probe-time-limit <f> 探测单步耗时上限秒数 (默认: 1.5)\n"
         << "\n"
         << "Batch 录制粒度:\n"
         << "  --flush-interval <n>  每 N 个 Transformer block flush 一次 (默认: 0=不间断)\n"
@@ -170,9 +160,6 @@ struct TrainConfig
     bool cuda_enabled = false;
     bool grad_log = false;          // 显示梯度统计
     nn::PosEncodingType pos_encoding = nn::PosEncodingType::Learned;
-    bool oscillation_guard = true;   // 振荡检测自动降 lr
-    std::size_t osc_window = 20;     // 振荡检测窗口
-    Scalar osc_threshold = 0.55f;    // 振荡反转率阈值
 
     // TDR 自动重试
     bool auto_tdr_retry = true;              // 遇到 TDR 超时自动减小 batch 重试
@@ -183,11 +170,6 @@ struct TrainConfig
     Scalar step_time_limit = 1.5f;           // 单步耗时上限（秒），超过则减半 batch
     std::size_t tune_warmup_steps = 3;       // 预热步数，之后才开始预测
     Scalar tune_ema_decay = 0.7f;            // 指数移动平均衰减系数
-
-    // Batch 探测：训练前先跑几步测速，找到安全 batch_size
-    bool batch_probe = true;                 // 启用 batch 探测（仅 GPU 时有意义）
-    std::size_t probe_steps = 3;             // 探测步数
-    Scalar probe_time_limit = 1.5f;          // 探测单步耗时上限（秒）
 
     // batch 录制粒度：在 Transformer block 间按间隔 flush，拆分大提交
     std::size_t flush_interval = 0;          // 0=不间断（默认），>0=每 N 个 block flush
@@ -306,31 +288,6 @@ TrainConfig parse_args(int argc, char *argv[])
             cfg.cuda_enabled = true;
         else if (arg == "--grad-log")
             cfg.grad_log = true;
-        else if (arg == "--osc-guard" && i + 1 < argc)
-        {
-            std::string v = argv[++i];
-            if (v == "on" || v == "1" || v == "true")
-                cfg.oscillation_guard = true;
-            else if (v == "off" || v == "0" || v == "false")
-                cfg.oscillation_guard = false;
-            else
-            {
-                std::cerr << "无效 --osc-guard: " << v << "，可选: on, off\n";
-                std::exit(1);
-            }
-        }
-        else if (arg == "--osc-window" && i + 1 < argc)
-        {
-            auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --osc-window: " << v.error().message << "\n"; std::exit(1); }
-            cfg.osc_window = *v;
-        }
-        else if (arg == "--osc-threshold" && i + 1 < argc)
-        {
-            auto v = nn::parse_number<Scalar>(argv[++i]);
-            if (!v) { std::cerr << "无效 --osc-threshold: " << v.error().message << "\n"; std::exit(1); }
-            cfg.osc_threshold = *v;
-        }
         else if (arg == "--lr-schedule" && i + 1 < argc)
         {
             cfg.lr_schedule = argv[++i];
@@ -425,22 +382,6 @@ TrainConfig parse_args(int argc, char *argv[])
             auto v = nn::parse_number<Scalar>(argv[++i]);
             if (!v) { std::cerr << "无效 --tune-decay: " << v.error().message << "\n"; std::exit(1); }
             cfg.tune_ema_decay = *v;
-        }
-        else if (arg == "--batch-probe")
-            cfg.batch_probe = true;
-        else if (arg == "--no-batch-probe")
-            cfg.batch_probe = false;
-        else if (arg == "--probe-steps" && i + 1 < argc)
-        {
-            auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --probe-steps: " << v.error().message << "\n"; std::exit(1); }
-            cfg.probe_steps = *v;
-        }
-        else if (arg == "--probe-time-limit" && i + 1 < argc)
-        {
-            auto v = nn::parse_number<Scalar>(argv[++i]);
-            if (!v) { std::cerr << "无效 --probe-time-limit: " << v.error().message << "\n"; std::exit(1); }
-            cfg.probe_time_limit = *v;
         }
         else if (arg == "--flush-interval" && i + 1 < argc)
         {
@@ -627,7 +568,6 @@ int main(int argc, char *argv[])
     std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
     std::cout << "  GPU: " << (cfg.gpu_enabled ? "启用" : "禁用") << "\n";
     std::cout << "  梯度日志: " << (cfg.grad_log ? "启用" : "禁用") << "\n";
-    std::cout << "  振荡抑制: " << (cfg.oscillation_guard ? "启用" : "禁用") << "\n";
     std::cout << "========================================\n\n";
 
     // ── 读取 tokenizer JSON 以便嵌入模型 ─────────────────────
@@ -723,15 +663,6 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // ── 振荡抑制器 ───────────────────────────────────────────
-    std::optional<nn::OscillationGuard> osc_guard;
-    if (cfg.oscillation_guard)
-    {
-        nn::OscillationGuard::Config oc;
-        oc.window_size = cfg.osc_window;
-        oc.threshold = cfg.osc_threshold;
-        osc_guard.emplace(cfg.lr, std::move(oc));
-    }
     Scalar optimizer_current_lr = cfg.lr;
 
     // ── 学习率调度配置（委托给 nn::cli::compute_epoch_lr） ──
@@ -836,151 +767,6 @@ int main(int argc, char *argv[])
     Scalar avg_time_per_sample = 0;   // 指数移动平均：每样本耗时（秒）
     std::size_t tune_step_count = 0;  // 已完成的 step 计数（用于预热判断）
 
-    // ── Batch 探测：训练前跑几步测速，找到安全 batch_size ──────
-    // 在 GPU 模式下，跑几个 forward+backward 步骤测量实际耗时，
-    // 如果超过 probe_time_limit 就减半 batch_size 重试，直到安全为止。
-    if (cfg.batch_probe && engine->device() == nn::Device::GPU && cfg.batch_size > 1)
-    {
-        std::cout << "\n[batch-probe] 探测安全 batch_size (当前: " << cfg.batch_size
-                  << ", 限制: " << cfg.probe_time_limit << "s, 步数: " << cfg.probe_steps << ")...\n";
-
-        std::size_t probe_bs = cfg.batch_size;
-        bool probe_ok = false;
-
-        while (probe_bs > 0)
-        {
-            // 重新分配探测缓冲区
-            nn::Matrix probe_x(cfg.seq_len, probe_bs);
-            nn::Matrix probe_y(cfg.seq_len, probe_bs);
-            nn::Matrix probe_mask(cfg.seq_len, probe_bs);
-            std::vector<std::size_t> probe_targets(cfg.seq_len * probe_bs);
-            std::vector<Scalar> probe_loss_mask(cfg.seq_len * probe_bs, 1.0f);
-
-            // 填充探测数据（用第一行样本）
-            const auto &first_sample = *valid_samples[0];
-            for (std::size_t b = 0; b < probe_bs; ++b)
-            {
-                for (std::size_t t = 0; t < cfg.seq_len; ++t)
-                {
-                    const std::size_t x_id = (t < first_sample.size()) ? first_sample[t] : pad_id;
-                    const std::size_t y_id = (t + 1 < first_sample.size()) ? first_sample[t + 1] : pad_id;
-                    probe_x.set_value_unchecked(t, b, static_cast<Scalar>(x_id));
-                    probe_y.set_value_unchecked(t, b, static_cast<Scalar>(y_id));
-                }
-            }
-            auto y_span = probe_y.span();
-            for (std::size_t t = 0; t < cfg.seq_len; ++t)
-                for (std::size_t b = 0; b < probe_bs; ++b)
-                    probe_targets[t * probe_bs + b] =
-                        static_cast<std::size_t>(y_span[t * probe_bs + b]);
-
-            // 跑 probe_steps 步测速
-            Scalar total_probe_time = 0;
-            bool probe_failed = false;
-            for (std::size_t ps = 0; ps < cfg.probe_steps && !probe_failed; ++ps)
-            {
-                auto px_r = engine->from_matrix(probe_x);
-                if (!px_r) { probe_failed = true; break; }
-
-                auto br = engine->begin_batch();
-                if (!br) { probe_failed = true; break; }
-
-                auto t0 = std::chrono::steady_clock::now();
-
-                auto fwd = model.forward(*px_r);
-                if (!fwd) { probe_failed = true; break; }
-
-                auto loss_r = ce_loss.forward_sparse(
-                    *engine, *fwd, probe_targets,
-                    std::span<const Scalar>(probe_loss_mask), tokenizer->vocab_size());
-                if (!loss_r) { probe_failed = true; break; }
-
-                // 中点刷新（模拟实际训练的 split 提交）
-                auto fr = engine->flush_batch();
-                if (!fr) { probe_failed = true; break; }
-
-                auto grad_r = ce_loss.backward();
-                if (!grad_r) { probe_failed = true; break; }
-
-                auto bwd = model.backward(*grad_r);
-                if (!bwd) { probe_failed = true; break; }
-
-                auto end_r = engine->end_batch();
-                auto t1 = std::chrono::steady_clock::now();
-
-                if (!end_r)
-                {
-                    std::string err_msg = end_r.error().message;
-                    if (err_msg.find("VK_ERROR_DEVICE_LOST") != std::string::npos)
-                    {
-                        std::cerr << "  [batch-probe] batch_size=" << probe_bs
-                                  << " → 设备丢失，减半重试\n";
-                        if (probe_bs <= 1) { probe_failed = true; break; }
-                        probe_bs /= 2;
-                        continue;
-                    }
-                    probe_failed = true;
-                    break;
-                }
-
-                total_probe_time += std::chrono::duration<Scalar>(t1 - t0).count();
-
-                // 优化器也需要走一遍（否则 gradient 累积会干扰）
-                auto opt_br = engine->begin_batch();
-                if (!opt_br) { probe_failed = true; break; }
-                auto step_r = optimizer->step();
-                if (!step_r) { probe_failed = true; break; }
-                auto zr = optimizer->zero_grad();
-                if (!zr) { probe_failed = true; break; }
-                auto opt_er = engine->end_batch();
-                if (!opt_er) { probe_failed = true; break; }
-            }
-
-            if (probe_failed)
-            {
-                std::cerr << "  [batch-probe] batch_size=" << probe_bs << " 探测失败";
-                if (probe_bs <= 1) break;
-                std::cerr << "，减半重试\n";
-                probe_bs /= 2;
-                continue;
-            }
-
-            Scalar avg_step = total_probe_time / static_cast<Scalar>(cfg.probe_steps);
-            Scalar avg_per_sample = avg_step / static_cast<Scalar>(probe_bs);
-
-            if (avg_step <= cfg.probe_time_limit)
-            {
-                probe_ok = true;
-                std::cout << "  [batch-probe] batch_size=" << probe_bs
-                          << "  平均 " << std::fixed << std::setprecision(2) << avg_step << "s/step"
-                          << "  (" << std::setprecision(4) << avg_per_sample << "s/sample)"
-                          << "  ✓ 安全\n";
-                break;
-            }
-            else
-            {
-                std::cout << "  [batch-probe] batch_size=" << probe_bs
-                          << "  平均 " << std::fixed << std::setprecision(2) << avg_step << "s/step"
-                          << " > " << cfg.probe_time_limit << "s 限制"
-                          << " → 减半重试\n";
-                if (probe_bs <= 1) break;
-                probe_bs /= 2;
-            }
-        }
-
-        if (probe_ok && probe_bs != cfg.batch_size)
-        {
-            std::cout << "  [batch-probe] batch_size: " << cfg.batch_size << " → " << probe_bs << "\n";
-            cfg.batch_size = probe_bs;
-        }
-        else if (!probe_ok)
-        {
-            cfg.batch_size = 1;
-            std::cout << "  [batch-probe] 所有 batch_size 均超限，使用 batch_size=1\n";
-        }
-        std::cout << std::endl;
-    }
-
     auto t_start = std::chrono::steady_clock::now();
 
     for (int epoch = 0; epoch < cfg.epochs; ++epoch)
@@ -991,8 +777,6 @@ int main(int argc, char *argv[])
         {
             optimizer->set_lr(epoch_lr);
             optimizer_current_lr = epoch_lr;
-            if (osc_guard)
-                osc_guard->rebase_lr(epoch_lr);
         }
 
         auto ep_start = std::chrono::steady_clock::now();
@@ -1027,7 +811,7 @@ int main(int argc, char *argv[])
 
                 // ── 对话 loss mask：找到 assistant 标记位置 ──────
                 // 对于对话样本，只有 assistant 标记之后的 response 部分参与 loss
-                // 对于非对话样本（纯文本），所有位置都参与 loss
+                // 对于非对话样本（纯文本），只对真实 token 位置计算 loss，屏蔽 padding
                 if (has_dialogue)
                 {
                     std::size_t resp_start = 0;  // 0 = 整个样本都参与（非对话模式）
@@ -1051,6 +835,15 @@ int main(int argc, char *argv[])
                         const bool has_target = (t + 1 < sample_len);
                         loss_mask.set_value_unchecked(t, b,
                             (is_response && has_target) ? 1.0f : 0.0f);
+                    }
+                }
+                else
+                {
+                    // 非对话模式：屏蔽 padding 位置，只对真实 token 计算 loss
+                    for (std::size_t t = 0; t < cfg.seq_len; ++t)
+                    {
+                        loss_mask.set_value_unchecked(t, b,
+                            (t + 1 < sample_len) ? 1.0f : 0.0f);
                     }
                 }
             }
@@ -1086,7 +879,7 @@ int main(int argc, char *argv[])
             // logits: (vocab_size, seq_len × batch_size)
 
             // ── 损失（稀疏标签，避免 one-hot 爆显存） ────────
-            auto mask_span = has_dialogue ? std::span<const Scalar>(loss_mask.span()) : std::span<const Scalar>{};
+            auto mask_span = std::span<const Scalar>(loss_mask.span());
             auto loss_result = ce_loss.forward_sparse(
                 *engine, logits, flat_targets, mask_span, tokenizer->vocab_size());
             if (!loss_result) { std::cerr << "Error: " << loss_result.error().message << '\n'; return 1; }
@@ -1155,18 +948,6 @@ int main(int argc, char *argv[])
             if (!step_result) {
                 std::cerr << "Error: " << step_result.error().message << '\n';
                 return 1;
-            }
-
-            // ── 振荡检测：检查 loss 是否震荡并自动降 lr ──
-            if (osc_guard)
-            {
-                osc_guard->update(loss);
-                Scalar eff_lr = osc_guard->current_lr();
-                if (eff_lr != optimizer_current_lr)
-                {
-                    optimizer->set_lr(eff_lr);
-                    optimizer_current_lr = eff_lr;
-                }
             }
 
             // ── 梯度统计（step 后、zero_grad 前） ──
@@ -1327,8 +1108,13 @@ int main(int argc, char *argv[])
                 else
                 {
                     for (std::size_t b = 0; b < cfg.batch_size; ++b)
+                    {
+                        const std::size_t sample_len = (b < this_bs)
+                            ? std::min((*test_samples[offset + b]).size(), cfg.seq_len + 1)
+                            : 0;
                         for (std::size_t t = 0; t < cfg.seq_len; ++t)
-                            loss_mask.set_value(t, b, 1.0f);
+                            loss_mask.set_value(t, b, (t + 1 < sample_len) ? 1.0f : 0.0f);
+                    }
                 }
 
                 // Forward pass only（不 backward）
@@ -1347,7 +1133,7 @@ int main(int argc, char *argv[])
 
                 auto fwd_result = model.forward(*x_tensor_r);
                 if (!fwd_result) { std::cerr << "  测试前向传播出错: " << fwd_result.error().message << '\n'; break; }
-                auto test_mask_span = has_dialogue ? std::span<const Scalar>(loss_mask.span()) : std::span<const Scalar>{};
+                auto test_mask_span = std::span<const Scalar>(loss_mask.span());
                 auto loss_result = ce_loss.forward_sparse(
                     *engine, *fwd_result, flat_targets, test_mask_span, tokenizer->vocab_size());
 

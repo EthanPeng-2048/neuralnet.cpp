@@ -44,7 +44,6 @@ neuralnet.cpp/
 │   ├── model_container.hpp      ← Model 容器
 │   ├── model_spec.hpp           ← 架构描述
 │   ├── model_serialization.hpp  ← 二进制序列化
-│   ├── oscillation_guard.hpp    ← 振荡检测 + 自动降 lr
 │   ├── domain_mnist.hpp         ← MNIST 模型工厂
 │   ├── domain_gpt.hpp           ← GPT 模型工厂
 │   ├── domain_tokenizer.hpp     ← 分词器

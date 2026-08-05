@@ -11,9 +11,6 @@
 //   --warmup-epochs <n>     线性预热轮数
 //   --lr-per-epoch <v1,...> 手动指定每轮学习率（逗号分隔）
 //   --lr-schedule <type>    学习率调度：fixed/constant/cosine
-//   --osc-guard <on|off>    振荡检测自动降 lr
-//   --osc-window <n>        振荡检测窗口大小
-//   --osc-threshold <f>     振荡反转率阈值
 //   --gpu                   启用 Vulkan GPU 加速
 //   --cuda                  启用 CUDA GPU 加速
 //
@@ -57,9 +54,6 @@ namespace nn::cli
         int warmup_epochs = 0;
         std::string lr_schedule = "constant";  // "fixed"/"constant" 等价，"cosine" 退火
         std::vector<nn::Scalar> lr_per_epoch;
-        bool osc_guard = false;
-        int osc_window = 20;
-        nn::Scalar osc_threshold = 2.0f;
         bool use_gpu = false;
         bool use_cuda = false;
     };
@@ -156,34 +150,6 @@ namespace nn::cli
                           << "，可选: fixed, constant, cosine\n";
                 std::exit(1);
             }
-            return true;
-        }
-        if (arg == "--osc-guard" && i + 1 < argc)
-        {
-            std::string v = argv[++i];
-            if (v == "on" || v == "1" || v == "true")
-                cfg.osc_guard = true;
-            else if (v == "off" || v == "0" || v == "false")
-                cfg.osc_guard = false;
-            else
-            {
-                std::cerr << "无效 --osc-guard: " << v << "，可选: on, off\n";
-                std::exit(1);
-            }
-            return true;
-        }
-        if (arg == "--osc-window" && i + 1 < argc)
-        {
-            auto v = nn::parse_number<int>(argv[++i]);
-            if (!v) { std::cerr << "无效 --osc-window: " << v.error().message << "\n"; std::exit(1); }
-            cfg.osc_window = *v;
-            return true;
-        }
-        if (arg == "--osc-threshold" && i + 1 < argc)
-        {
-            auto v = nn::parse_number<nn::Scalar>(argv[++i]);
-            if (!v) { std::cerr << "无效 --osc-threshold: " << v.error().message << "\n"; std::exit(1); }
-            cfg.osc_threshold = *v;
             return true;
         }
         if (arg == "--gpu")
