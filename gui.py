@@ -13,6 +13,10 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 
+# 围棋棋盘组件
+sys.path.insert(0, str(Path(__file__).parent))
+from go_board import GoGamePanel
+
 # ── 常量 ──────────────────────────────────────────────
 BUILD_DIR = Path(__file__).parent / "build"
 _EXE_SUFFIX = ".exe" if sys.platform == "win32" else ""
@@ -213,42 +217,64 @@ class NeuralNetGUI(tk.Tk):
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True, padx=8, pady=8)
 
-        # ── 训练 Tab ──
-        self.train_frame = ttk.Frame(notebook, padding=8)
-        notebook.add(self.train_frame, text="  🏋️ 训练  ")
+        # ── 围棋 Tab ──
+        self.go_frame = ttk.Frame(notebook, padding=0)
+        notebook.add(self.go_frame, text="  ♟️ 围棋  ")
+        self._build_go_tab()
+
+        # ── MNIST Tab (训练+推理+图片查看) ──
+        mnist_frame = ttk.Frame(notebook, padding=0)
+        notebook.add(mnist_frame, text="  🧠 MNIST  ")
+        mnist_sub = ttk.Notebook(mnist_frame)
+        mnist_sub.pack(fill="both", expand=True, padx=4, pady=4)
+
+        self.train_frame = ttk.Frame(mnist_sub, padding=8)
+        mnist_sub.add(self.train_frame, text=" 训练 ")
         self._build_train_tab()
 
-        # ── 推理 Tab ──
-        self.infer_frame = ttk.Frame(notebook, padding=8)
-        notebook.add(self.infer_frame, text="  🔍 推理  ")
+        self.infer_frame = ttk.Frame(mnist_sub, padding=8)
+        mnist_sub.add(self.infer_frame, text=" 推理 ")
         self._build_infer_tab()
 
-        # ── 图片查看 Tab ──
-        self.viewer_frame = ttk.Frame(notebook, padding=8)
-        notebook.add(self.viewer_frame, text="  🖼️ 图片查看  ")
+        self.viewer_frame = ttk.Frame(mnist_sub, padding=8)
+        mnist_sub.add(self.viewer_frame, text=" 图片查看 ")
         self._build_viewer_tab()
 
-        # ── GPT 训练 Tab ──
-        self.text_train_frame = ttk.Frame(notebook, padding=8)
-        notebook.add(self.text_train_frame, text="  📝 GPT 训练  ")
+        # ── GPT Tab (训练+推理) ──
+        gpt_frame = ttk.Frame(notebook, padding=0)
+        notebook.add(gpt_frame, text="  📝 GPT  ")
+        gpt_sub = ttk.Notebook(gpt_frame)
+        gpt_sub.pack(fill="both", expand=True, padx=4, pady=4)
+
+        self.text_train_frame = ttk.Frame(gpt_sub, padding=8)
+        gpt_sub.add(self.text_train_frame, text=" 训练 ")
         self._build_text_train_tab()
 
-        # ── GPT 推理 Tab ──
-        self.text_infer_frame = ttk.Frame(notebook, padding=8)
-        notebook.add(self.text_infer_frame, text="  💬 GPT 推理  ")
+        self.text_infer_frame = ttk.Frame(gpt_sub, padding=8)
+        gpt_sub.add(self.text_infer_frame, text=" 推理 ")
         self._build_text_infer_tab()
 
-        # ── 分词器训练 Tab ──
-        self.tokenizer_train_frame = ttk.Frame(notebook, padding=8)
-        notebook.add(self.tokenizer_train_frame, text="  🔤 分词器训练  ")
+        # ── 工具 Tab (分词器) ──
+        tools_frame = ttk.Frame(notebook, padding=0)
+        notebook.add(tools_frame, text="  🔧 工具  ")
+        tools_sub = ttk.Notebook(tools_frame)
+        tools_sub.pack(fill="both", expand=True, padx=4, pady=4)
+
+        self.tokenizer_train_frame = ttk.Frame(tools_sub, padding=8)
+        tools_sub.add(self.tokenizer_train_frame, text=" 分词器训练 ")
         self._build_tokenizer_train_tab()
 
-        # ── 分词器推理 Tab ──
-        self.tokenizer_infer_frame = ttk.Frame(notebook, padding=8)
-        notebook.add(self.tokenizer_infer_frame, text="  🔡 分词器推理  ")
+        self.tokenizer_infer_frame = ttk.Frame(tools_sub, padding=8)
+        tools_sub.add(self.tokenizer_infer_frame, text=" 分词器推理 ")
         self._build_tokenizer_infer_tab()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ============================================================
+    #  围棋 Tab
+    # ============================================================
+    def _build_go_tab(self):
+        GoGamePanel(self.go_frame)
 
     # ============================================================
     #  训练 Tab
@@ -957,257 +983,235 @@ class NeuralNetGUI(tk.Tk):
         f = self.text_train_frame
         row = 0
 
-        # 文本文件路径
-        ttk.Label(f, text="训练文本文件:").grid(row=row, column=0, sticky="w")
+        # ── 文件路径（紧凑排列）──
+        file_frame = ttk.LabelFrame(f, text="文件", padding=4)
+        file_frame.grid(row=row, column=0, columnspan=4, sticky="ew", pady=2)
+        row += 1
+        # 第一行：训练文件 + 保存路径
+        ttk.Label(file_frame, text="训练文件:").grid(row=0, column=0, sticky="w")
         self.text_train_file_var = tk.StringVar()
-        ttk.Entry(f, textvariable=self.text_train_file_var, width=48).grid(row=row, column=1, padx=4)
-        ttk.Button(f, text="浏览…", command=self._browse_text_file).grid(row=row, column=2)
-        row += 1
-
-        # 保存路径
-        ttk.Label(f, text="模型保存路径:").grid(row=row, column=0, sticky="w")
+        ttk.Entry(file_frame, textvariable=self.text_train_file_var, width=36).grid(row=0, column=1, padx=2)
+        ttk.Button(file_frame, text="…", width=3, command=self._browse_text_file).grid(row=0, column=2)
+        ttk.Label(file_frame, text="保存:").grid(row=0, column=3, sticky="w", padx=(10, 0))
         self.text_train_save_var = tk.StringVar(value=str(DEFAULT_GPT_MODEL))
-        ttk.Entry(f, textvariable=self.text_train_save_var, width=48).grid(row=row, column=1, padx=4)
-        ttk.Button(f, text="浏览…", command=self._browse_text_save).grid(row=row, column=2)
-        row += 1
-
-        # 词表路径
-        ttk.Label(f, text="词表 JSON 路径:").grid(row=row, column=0, sticky="w")
+        ttk.Entry(file_frame, textvariable=self.text_train_save_var, width=30).grid(row=0, column=4, padx=2)
+        ttk.Button(file_frame, text="…", width=3, command=self._browse_text_save).grid(row=0, column=5)
+        # 第二行：词表 + 恢复
+        ttk.Label(file_frame, text="词表:").grid(row=1, column=0, sticky="w")
         self.text_train_vocab_var = tk.StringVar(value="bpe_vocab.json")
-        ttk.Entry(f, textvariable=self.text_train_vocab_var, width=48).grid(row=row, column=1, padx=4)
-        ttk.Button(f, text="浏览…", command=self._browse_text_train_vocab).grid(row=row, column=2)
-        row += 1
-
-        # 恢复训练
+        ttk.Entry(file_frame, textvariable=self.text_train_vocab_var, width=36).grid(row=1, column=1, padx=2)
+        ttk.Button(file_frame, text="…", width=3, command=self._browse_text_train_vocab).grid(row=1, column=2)
         self.text_train_resume_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(f, text="从已有模型恢复训练", variable=self.text_train_resume_var,
-                        command=self._toggle_text_resume).grid(row=row, column=0, columnspan=2, sticky="w")
-        row += 1
-
-        self.text_resume_frame = ttk.Frame(f)
-        self.text_resume_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 4))
-        ttk.Label(self.text_resume_frame, text="模型路径:").pack(side="left")
+        ttk.Checkbutton(file_frame, text="恢复训练:", variable=self.text_train_resume_var,
+                        command=self._toggle_text_resume).grid(row=1, column=3, sticky="w", padx=(10, 0))
         self.text_train_resume_path_var = tk.StringVar(value=str(DEFAULT_GPT_MODEL))
-        self.text_resume_entry = ttk.Entry(self.text_resume_frame, textvariable=self.text_train_resume_path_var, width=48)
-        self.text_resume_entry.pack(side="left", padx=4)
-        self.text_resume_btn = ttk.Button(self.text_resume_frame, text="浏览…", command=self._browse_text_resume)
-        self.text_resume_btn.pack(side="left")
+        self.text_resume_entry = ttk.Entry(file_frame, textvariable=self.text_train_resume_path_var, width=30)
+        self.text_resume_entry.grid(row=1, column=4, padx=2)
+        self.text_resume_btn = ttk.Button(file_frame, text="…", width=3, command=self._browse_text_resume)
+        self.text_resume_btn.grid(row=1, column=5)
         self._toggle_text_resume()
-        row += 1
 
-        # 超参数
-        param_frame = ttk.LabelFrame(f, text="超参数", padding=6)
-        param_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+        # ── 核心参数（一行搞定）──
+        param_frame = ttk.LabelFrame(f, text="参数", padding=4)
+        param_frame.grid(row=row, column=0, columnspan=4, sticky="ew", pady=2)
         row += 1
 
         ttk.Label(param_frame, text="轮数:").grid(row=0, column=0, sticky="w")
         self.text_train_epochs_var = tk.IntVar(value=10)
-        ttk.Spinbox(param_frame, from_=1, to=1000, width=6,
-                     textvariable=self.text_train_epochs_var).grid(row=0, column=1, padx=(0, 16))
+        ttk.Spinbox(param_frame, from_=1, to=1000, width=5,
+                     textvariable=self.text_train_epochs_var).grid(row=0, column=1, padx=(0, 8))
 
-        ttk.Label(param_frame, text="学习率:").grid(row=0, column=2, sticky="w")
+        ttk.Label(param_frame, text="lr:").grid(row=0, column=2, sticky="w")
         self.text_train_lr_var = tk.DoubleVar(value=0.001)
-        self.text_train_lr_sp = ttk.Spinbox(param_frame, from_=0.00001, to=1.0, increment=0.0001, width=8,
+        self.text_train_lr_sp = ttk.Spinbox(param_frame, from_=0.00001, to=1.0, increment=0.0001, width=7,
                      textvariable=self.text_train_lr_var, format="%.5f")
-        self.text_train_lr_sp.grid(row=0, column=3, padx=(0, 16))
+        self.text_train_lr_sp.grid(row=0, column=3, padx=(0, 8))
 
-        ttk.Label(param_frame, text="批大小:").grid(row=0, column=4, sticky="w")
+        ttk.Label(param_frame, text="batch:").grid(row=0, column=4, sticky="w")
         self.text_train_batch_var = tk.IntVar(value=32)
-        ttk.Spinbox(param_frame, from_=1, to=256, width=6,
-                     textvariable=self.text_train_batch_var).grid(row=0, column=5)
+        ttk.Spinbox(param_frame, from_=1, to=256, width=5,
+                     textvariable=self.text_train_batch_var).grid(row=0, column=5, padx=(0, 8))
 
-        ttk.Label(param_frame, text="序列长度:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(param_frame, text="seq-len:").grid(row=0, column=6, sticky="w")
         self.text_train_seq_len_var = tk.IntVar(value=256)
-        ttk.Spinbox(param_frame, from_=16, to=1024, width=6,
-                     textvariable=self.text_train_seq_len_var).grid(row=1, column=1, pady=(6, 0))
+        ttk.Spinbox(param_frame, from_=16, to=1024, width=5,
+                     textvariable=self.text_train_seq_len_var).grid(row=0, column=7)
 
-        ttk.Label(param_frame, text="优化器:").grid(row=1, column=2, sticky="w", pady=(6, 0))
+        ttk.Label(param_frame, text="优化器:").grid(row=1, column=0, sticky="w", pady=(4, 0))
         self.text_train_opt_var = tk.StringVar(value="adam")
-        ttk.Combobox(param_frame, textvariable=self.text_train_opt_var, width=14, state="readonly",
-                     values=["sgd", "sgd_momentum", "adam", "adamw", "muon"]).grid(row=1, column=3, sticky="w", pady=(6, 0))
+        ttk.Combobox(param_frame, textvariable=self.text_train_opt_var, width=10, state="readonly",
+                     values=["sgd", "sgd_momentum", "adam", "adamw", "muon"]).grid(row=1, column=1, sticky="w", pady=(4, 0))
 
-        ttk.Label(param_frame, text="权重衰减:").grid(row=1, column=4, sticky="w", pady=(6, 0))
+        ttk.Label(param_frame, text="权重衰减:").grid(row=1, column=2, sticky="w", pady=(4, 0))
         self.text_train_weight_decay_var = tk.DoubleVar(value=0.01)
-        ttk.Spinbox(param_frame, from_=0.0, to=1.0, increment=0.001, width=8,
-                     textvariable=self.text_train_weight_decay_var, format="%.3f").grid(row=1, column=5, pady=(6, 0))
+        ttk.Spinbox(param_frame, from_=0.0, to=1.0, increment=0.001, width=6,
+                     textvariable=self.text_train_weight_decay_var, format="%.3f").grid(row=1, column=3, pady=(4, 0))
 
-        ttk.Label(param_frame, text="日志间隔:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(param_frame, text="日志间隔:").grid(row=1, column=4, sticky="w", pady=(4, 0))
         self.text_train_log_interval_var = tk.IntVar(value=50)
-        ttk.Spinbox(param_frame, from_=1, to=1000, width=6,
-                     textvariable=self.text_train_log_interval_var).grid(row=2, column=1, pady=(6, 0))
+        ttk.Spinbox(param_frame, from_=1, to=1000, width=5,
+                     textvariable=self.text_train_log_interval_var).grid(row=1, column=5, pady=(4, 0))
 
-        ttk.Label(param_frame, text="保存间隔:").grid(row=2, column=2, sticky="w", pady=(6, 0))
+        ttk.Label(param_frame, text="保存间隔:").grid(row=1, column=6, sticky="w", pady=(4, 0))
         self.text_train_save_interval_var = tk.IntVar(value=100)
-        ttk.Spinbox(param_frame, from_=1, to=10000, width=6,
-                     textvariable=self.text_train_save_interval_var).grid(row=2, column=3, pady=(6, 0))
+        ttk.Spinbox(param_frame, from_=1, to=10000, width=5,
+                     textvariable=self.text_train_save_interval_var).grid(row=1, column=7, pady=(4, 0))
 
-        # 模型架构参数
-        arch_frame = ttk.LabelFrame(f, text="模型架构", padding=6)
-        arch_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+        # ── 模型架构 + 位置编码 + GPU（一行）──
+        arch_frame = ttk.LabelFrame(f, text="模型", padding=4)
+        arch_frame.grid(row=row, column=0, columnspan=4, sticky="ew", pady=2)
         row += 1
 
-        ttk.Label(arch_frame, text="模型维度:").grid(row=0, column=0, sticky="w")
+        ttk.Label(arch_frame, text="d_model:").grid(row=0, column=0, sticky="w")
         self.text_train_d_model_var = tk.IntVar(value=128)
-        ttk.Spinbox(arch_frame, from_=32, to=512, width=6,
-                     textvariable=self.text_train_d_model_var).grid(row=0, column=1, padx=(0, 16))
+        ttk.Spinbox(arch_frame, from_=32, to=512, width=5,
+                     textvariable=self.text_train_d_model_var).grid(row=0, column=1, padx=(0, 8))
 
-        ttk.Label(arch_frame, text="注意力头:").grid(row=0, column=2, sticky="w")
+        ttk.Label(arch_frame, text="heads:").grid(row=0, column=2, sticky="w")
         self.text_train_num_heads_var = tk.IntVar(value=4)
-        ttk.Spinbox(arch_frame, from_=1, to=16, width=6,
-                     textvariable=self.text_train_num_heads_var).grid(row=0, column=3, padx=(0, 16))
+        ttk.Spinbox(arch_frame, from_=1, to=16, width=4,
+                     textvariable=self.text_train_num_heads_var).grid(row=0, column=3, padx=(0, 8))
 
-        ttk.Label(arch_frame, text="Transformer 层数:").grid(row=0, column=4, sticky="w")
+        ttk.Label(arch_frame, text="layers:").grid(row=0, column=4, sticky="w")
         self.text_train_num_layers_var = tk.IntVar(value=4)
-        ttk.Spinbox(arch_frame, from_=1, to=16, width=6,
-                     textvariable=self.text_train_num_layers_var).grid(row=0, column=5)
+        ttk.Spinbox(arch_frame, from_=1, to=16, width=4,
+                     textvariable=self.text_train_num_layers_var).grid(row=0, column=5, padx=(0, 8))
 
-        ttk.Label(arch_frame, text="FFN 维度:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(arch_frame, text="d_ff:").grid(row=0, column=6, sticky="w")
         self.text_train_d_ff_var = tk.IntVar(value=512)
-        ttk.Spinbox(arch_frame, from_=64, to=2048, width=6,
-                     textvariable=self.text_train_d_ff_var).grid(row=1, column=1, pady=(6, 0))
-        row += 1
+        ttk.Spinbox(arch_frame, from_=64, to=2048, width=5,
+                     textvariable=self.text_train_d_ff_var).grid(row=0, column=7, padx=(0, 8))
 
-        # ── 位置编码 ──
-        pe_frame = ttk.Frame(f)
-        pe_frame.grid(row=row, column=0, columnspan=3, sticky="w")
-        ttk.Label(pe_frame, text="位置编码:").pack(side="left")
+        ttk.Label(arch_frame, text="位置编码:").grid(row=0, column=8, sticky="w")
         self.text_train_pos_enc_var = tk.StringVar(value="learned")
-        ttk.Combobox(pe_frame, textvariable=self.text_train_pos_enc_var, width=14, state="readonly",
-                     values=["learned", "sinusoidal", "alibi"]).pack(side="left", padx=4)
-        ttk.Label(pe_frame, text="(learned=可学习, sinusoidal=正弦波, alibi=线性偏置)").pack(side="left")
-        row += 1
+        ttk.Combobox(arch_frame, textvariable=self.text_train_pos_enc_var, width=10, state="readonly",
+                     values=["learned", "sinusoidal", "alibi"]).grid(row=0, column=9, padx=(0, 8))
 
-        # ── 学习率调度 ──
-        lr_sched_frame = ttk.LabelFrame(f, text="学习率调度", padding=6)
-        lr_sched_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
-        row += 1
-
-        ttk.Label(lr_sched_frame, text="调度模式:").grid(row=0, column=0, sticky="w")
-        self.text_train_lr_schedule_var = tk.StringVar(value="fixed")
-        lr_sched_combo = ttk.Combobox(lr_sched_frame, textvariable=self.text_train_lr_schedule_var, width=10, state="readonly",
-                                      values=["fixed", "cosine"])
-        lr_sched_combo.grid(row=0, column=1, sticky="w", padx=(0, 16))
-        lr_sched_combo.bind("<<ComboboxSelected>>", lambda e: self._toggle_text_lr_schedule())
-
-        ttk.Label(lr_sched_frame, text="预热轮数:").grid(row=0, column=2, sticky="w")
-        self.text_train_warmup_epochs_var = tk.IntVar(value=0)
-        self.text_train_warmup_epochs_sp = ttk.Spinbox(lr_sched_frame, from_=0, to=100, width=6,
-                                                        textvariable=self.text_train_warmup_epochs_var)
-        self.text_train_warmup_epochs_sp.grid(row=0, column=3, padx=(0, 16))
-
-        ttk.Label(lr_sched_frame, text="最低学习率:").grid(row=0, column=4, sticky="w")
-        self.text_train_min_lr_var = tk.DoubleVar(value=1e-6)
-        self.text_train_min_lr_sp = ttk.Spinbox(lr_sched_frame, from_=0.0, to=1.0, increment=0.0001, width=10,
-                                                 textvariable=self.text_train_min_lr_var, format="%.6f")
-        self.text_train_min_lr_sp.grid(row=0, column=5)
-
-        # 手动每轮 lr
-        self.text_train_lr_manual_var = tk.BooleanVar(value=False)
-        self.text_train_lr_manual_cb = ttk.Checkbutton(lr_sched_frame, text="手动指定每轮 lr",
-                                                        variable=self.text_train_lr_manual_var,
-                                                        command=self._toggle_text_lr_schedule)
-        self.text_train_lr_manual_cb.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
-
-        self.text_train_lr_per_epoch_var = tk.StringVar(value="")
-        self.text_train_lr_per_epoch_entry = ttk.Entry(lr_sched_frame, textvariable=self.text_train_lr_per_epoch_var, width=48,
-                                                        state="disabled")
-        self.text_train_lr_per_epoch_entry.grid(row=1, column=2, columnspan=4, sticky="ew", padx=(0, 4), pady=(4, 0))
-        ttk.Label(lr_sched_frame, text="(逗号分隔，如 0.001,0.0005,0.0001)").grid(row=2, column=2, columnspan=4, sticky="w")
-        self._toggle_text_lr_schedule()
-        row += 1
-
-        # ── GPU 加速 ──
+        ttk.Label(arch_frame, text="GPU:").grid(row=0, column=10, sticky="w")
         self.text_train_gpu_var = tk.StringVar(value="None")
-        gpu_frame = ttk.Frame(f)
-        gpu_frame.grid(row=row, column=0, columnspan=3, sticky="w")
-        ttk.Label(gpu_frame, text="GPU 加速:").pack(side="left")
-        ttk.Combobox(gpu_frame, textvariable=self.text_train_gpu_var, values=["None", "Vulkan", "CUDA"],
-                     state="readonly", width=8).pack(side="left", padx=4)
+        ttk.Combobox(arch_frame, textvariable=self.text_train_gpu_var, values=["None", "Vulkan", "CUDA"],
+                     state="readonly", width=6).grid(row=0, column=11)
+
+        # ── 高级选项（可折叠）──
+        self._text_advanced_visible = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text="▶ 高级选项（学习率调度 / TDR 防护 / 梯度日志）",
+                        variable=self._text_advanced_visible,
+                        command=self._toggle_text_advanced).grid(row=row, column=0, columnspan=4, sticky="w", pady=2)
         row += 1
 
-        # ── TDR 防护 ──
-        tdr_frame = ttk.LabelFrame(f, text="TDR 防护 (GPU 超时自动处理)", padding=6)
-        tdr_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+        self._text_advanced_frame = ttk.Frame(f)
+        self._text_advanced_frame.grid(row=row, column=0, columnspan=4, sticky="ew")
         row += 1
+        # 默认隐藏
+        self._text_advanced_frame.grid_remove()
 
-        # 第一行：Batch 探测
+        adv = self._text_advanced_frame
+        adv_row = 0
+
+        # 学习率调度
+        lr_frame = ttk.LabelFrame(adv, text="学习率调度", padding=4)
+        lr_frame.grid(row=adv_row, column=0, columnspan=4, sticky="ew", pady=2)
+        adv_row += 1
+
+        ttk.Label(lr_frame, text="模式:").grid(row=0, column=0, sticky="w")
+        self.text_train_lr_schedule_var = tk.StringVar(value="fixed")
+        lr_combo = ttk.Combobox(lr_frame, textvariable=self.text_train_lr_schedule_var, width=8, state="readonly",
+                                values=["fixed", "cosine"])
+        lr_combo.grid(row=0, column=1, padx=(0, 8))
+        lr_combo.bind("<<ComboboxSelected>>", lambda e: self._toggle_text_lr_schedule())
+
+        ttk.Label(lr_frame, text="预热轮数:").grid(row=0, column=2, sticky="w")
+        self.text_train_warmup_epochs_var = tk.IntVar(value=0)
+        self.text_train_warmup_epochs_sp = ttk.Spinbox(lr_frame, from_=0, to=100, width=5,
+                                                        textvariable=self.text_train_warmup_epochs_var)
+        self.text_train_warmup_epochs_sp.grid(row=0, column=3, padx=(0, 8))
+
+        ttk.Label(lr_frame, text="最低lr:").grid(row=0, column=4, sticky="w")
+        self.text_train_min_lr_var = tk.DoubleVar(value=1e-6)
+        self.text_train_min_lr_sp = ttk.Spinbox(lr_frame, from_=0.0, to=1.0, increment=0.0001, width=8,
+                                                 textvariable=self.text_train_min_lr_var, format="%.6f")
+        self.text_train_min_lr_sp.grid(row=0, column=5, padx=(0, 8))
+
+        self.text_train_lr_manual_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(lr_frame, text="手动每轮lr:", variable=self.text_train_lr_manual_var,
+                        command=self._toggle_text_lr_schedule).grid(row=0, column=6, sticky="w")
+        self.text_train_lr_per_epoch_var = tk.StringVar(value="")
+        self.text_train_lr_per_epoch_entry = ttk.Entry(lr_frame, textvariable=self.text_train_lr_per_epoch_var, width=24,
+                                                        state="disabled")
+        self.text_train_lr_per_epoch_entry.grid(row=0, column=7, sticky="ew")
+
+        # TDR 防护
+        tdr_frame = ttk.LabelFrame(adv, text="TDR 防护", padding=4)
+        tdr_frame.grid(row=adv_row, column=0, columnspan=4, sticky="ew", pady=2)
+        adv_row += 1
+
         self.text_train_batch_probe_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(tdr_frame, text="Batch 探测 (训练前测速找安全 batch)",
-                        variable=self.text_train_batch_probe_var,
-                        command=self._toggle_text_tdr).grid(row=0, column=0, columnspan=3, sticky="w")
-
-        ttk.Label(tdr_frame, text="探测步数:").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(tdr_frame, text="Batch探测", variable=self.text_train_batch_probe_var,
+                        command=self._toggle_text_tdr).grid(row=0, column=0, sticky="w")
+        ttk.Label(tdr_frame, text="步数:").grid(row=0, column=1, sticky="w")
         self.text_train_probe_steps_var = tk.IntVar(value=3)
-        self.text_train_probe_steps_sp = ttk.Spinbox(tdr_frame, from_=1, to=20, width=6,
+        self.text_train_probe_steps_sp = ttk.Spinbox(tdr_frame, from_=1, to=20, width=4,
                                                       textvariable=self.text_train_probe_steps_var)
-        self.text_train_probe_steps_sp.grid(row=1, column=1, padx=(0, 16), pady=(4, 0))
-
-        ttk.Label(tdr_frame, text="探测耗时上限 (秒):").grid(row=1, column=2, sticky="w", pady=(4, 0))
+        self.text_train_probe_steps_sp.grid(row=0, column=2, padx=(0, 8))
+        ttk.Label(tdr_frame, text="耗时上限:").grid(row=0, column=3, sticky="w")
         self.text_train_probe_time_limit_var = tk.DoubleVar(value=1.5)
-        self.text_train_probe_time_limit_sp = ttk.Spinbox(tdr_frame, from_=0.5, to=5.0, increment=0.1, width=6,
+        self.text_train_probe_time_limit_sp = ttk.Spinbox(tdr_frame, from_=0.5, to=5.0, increment=0.1, width=5,
                                                            textvariable=self.text_train_probe_time_limit_var, format="%.1f")
-        self.text_train_probe_time_limit_sp.grid(row=1, column=3, padx=(0, 16), pady=(4, 0))
+        self.text_train_probe_time_limit_sp.grid(row=0, column=4, padx=(0, 8))
 
-        # 第二行：TDR 自动重试
         self.text_train_tdr_retry_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(tdr_frame, text="启用 TDR 自动重试 (batch 减半)",
-                        variable=self.text_train_tdr_retry_var,
-                        command=self._toggle_text_tdr).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
-
-        ttk.Label(tdr_frame, text="最大重试次数:").grid(row=3, column=0, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(tdr_frame, text="TDR重试", variable=self.text_train_tdr_retry_var,
+                        command=self._toggle_text_tdr).grid(row=0, column=5, sticky="w")
+        ttk.Label(tdr_frame, text="次数:").grid(row=0, column=6, sticky="w")
         self.text_train_tdr_retries_var = tk.IntVar(value=4)
-        self.text_train_tdr_retries_sp = ttk.Spinbox(tdr_frame, from_=1, to=10, width=6,
+        self.text_train_tdr_retries_sp = ttk.Spinbox(tdr_frame, from_=1, to=10, width=4,
                                                       textvariable=self.text_train_tdr_retries_var)
-        self.text_train_tdr_retries_sp.grid(row=3, column=1, padx=(0, 16), pady=(4, 0))
+        self.text_train_tdr_retries_sp.grid(row=0, column=7, padx=(0, 8))
 
-        ttk.Label(tdr_frame, text="设备丢失时自动保存 checkpoint 并提示 --resume 重启").grid(
-            row=3, column=2, columnspan=2, sticky="w", pady=(4, 0))
-
-        # 第三行：自动调优
         self.text_train_auto_tune_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(tdr_frame, text="自动调优 (运行中监测 step 耗时，超限自动降 batch)",
-                        variable=self.text_train_auto_tune_var,
-                        command=self._toggle_text_tdr).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
-
-        ttk.Label(tdr_frame, text="耗时上限 (秒):").grid(row=5, column=0, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(tdr_frame, text="自动调优", variable=self.text_train_auto_tune_var,
+                        command=self._toggle_text_tdr).grid(row=0, column=8, sticky="w")
+        ttk.Label(tdr_frame, text="耗时上限:").grid(row=0, column=9, sticky="w")
         self.text_train_step_time_limit_var = tk.DoubleVar(value=1.5)
-        self.text_train_step_time_limit_sp = ttk.Spinbox(tdr_frame, from_=0.5, to=5.0, increment=0.1, width=6,
+        self.text_train_step_time_limit_sp = ttk.Spinbox(tdr_frame, from_=0.5, to=5.0, increment=0.1, width=5,
                                                           textvariable=self.text_train_step_time_limit_var, format="%.1f")
-        self.text_train_step_time_limit_sp.grid(row=5, column=1, padx=(0, 16), pady=(4, 0))
-
+        self.text_train_step_time_limit_sp.grid(row=0, column=10)
         self._toggle_text_tdr()
 
-        # ── 梯度日志 ──
+        # 梯度日志
+        grad_frame = ttk.Frame(adv)
+        grad_frame.grid(row=adv_row, column=0, columnspan=4, sticky="w", pady=2)
+        adv_row += 1
         self.text_train_grad_log_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(f, text="显示梯度统计 (范数/最大值/均值)", variable=self.text_train_grad_log_var).grid(
-            row=row, column=0, columnspan=3, sticky="w")
-        row += 1
+        ttk.Checkbutton(grad_frame, text="显示梯度统计", variable=self.text_train_grad_log_var).pack(side="left")
 
-        # 按钮
+        self._toggle_text_advanced()
+        self._toggle_text_lr_schedule()
+
+        # ── 按钮 + 日志 + 曲线 ──
         btn_frame = ttk.Frame(f)
-        btn_frame.grid(row=row, column=0, columnspan=3, pady=6)
+        btn_frame.grid(row=row, column=0, columnspan=4, pady=4)
         row += 1
 
-        self.text_train_start_btn = ttk.Button(btn_frame, text="▶  开始训练", command=self._start_text_training)
+        self.text_train_start_btn = ttk.Button(btn_frame, text="▶ 开始训练", command=self._start_text_training)
         self.text_train_start_btn.pack(side="left", padx=4)
-        self.text_train_stop_btn = ttk.Button(btn_frame, text="⏹  停止", command=self._stop_text_training, state="disabled")
+        self.text_train_stop_btn = ttk.Button(btn_frame, text="⏹ 停止", command=self._stop_text_training, state="disabled")
         self.text_train_stop_btn.pack(side="left", padx=4)
-        row += 1
 
         # 日志输出
-        self.text_train_log = tk.Text(f, height=10, width=72, state="disabled",
+        self.text_train_log = tk.Text(f, height=6, width=72, state="disabled",
                                       font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4",
                                       insertbackground="white")
-        self.text_train_log.grid(row=row, column=0, columnspan=3, sticky="ew")
+        self.text_train_log.grid(row=row, column=0, columnspan=4, sticky="ew")
         scroll = ttk.Scrollbar(f, orient="vertical", command=self.text_train_log.yview)
-        scroll.grid(row=row, column=3, sticky="ns")
+        scroll.grid(row=row, column=4, sticky="ns")
         self.text_train_log["yscrollcommand"] = scroll.set
         row += 1
 
-        # ── GPT 训练曲线 ──
+        # 训练曲线
         chart_frame = ttk.LabelFrame(f, text="📊 训练曲线", padding=4)
-        chart_frame.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(4, 0))
-        self.text_train_chart = LiveChart(chart_frame, width=640, height=220)
+        chart_frame.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(2, 0))
+        self.text_train_chart = LiveChart(chart_frame, width=640, height=160)
         self.text_train_chart.canvas.pack(fill="both", expand=True)
         self._text_train_step_x = 0
 
@@ -1248,6 +1252,13 @@ class NeuralNetGUI(tk.Tk):
         self.text_train_tdr_retries_sp.config(state=tdr_state)
         tune_state = "normal" if self.text_train_auto_tune_var.get() else "disabled"
         self.text_train_step_time_limit_sp.config(state=tune_state)
+
+    def _toggle_text_advanced(self):
+        """高级选项折叠/展开"""
+        if self._text_advanced_visible.get():
+            self._text_advanced_frame.grid()
+        else:
+            self._text_advanced_frame.grid_remove()
 
     def _toggle_text_lr_schedule(self):
         """学习率调度：cosine 时启用预热/min-lr，手动模式启用每轮 lr 输入；非 fixed 时禁用固定 lr"""

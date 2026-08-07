@@ -304,6 +304,25 @@ public:
             ? -loss_sum / static_cast<Scalar>(num_valid)
             : Scalar{0};
 
+        // ── 3.5 梯度归一化：与 PyTorch 一致，grad = (softmax - one_hot) / num_valid ──
+        // 之前缺少 1/num_valid 缩放，导致梯度被整体放大 num_valid 倍。
+        // 由于 loss = -Σ log_softmax / num_valid，故
+        //   d(loss)/d(logits) = (softmax - one_hot) / num_valid（有效位置），
+        //   mask 位置/越界标签位置梯度为 0（缩放 0 仍为 0，安全）。
+        // 对 Adam 而言，梯度常数缩放会被二阶矩归一化抵消（曲线不变），
+        // 但对 SGD/动量、梯度裁剪 --max-norm 以及 --grad-log 统计，
+        // 缺少该缩放会导致与 PyTorch 行为不一致。
+        if (num_valid > 0)
+        {
+            const Scalar inv_num_valid = Scalar{1} / static_cast<Scalar>(num_valid);
+            for (std::size_t c = 0; c < rows; ++c)
+                for (std::size_t i = 0; i < cols; ++i)
+                {
+                    const Scalar g = grad_cpu.at_unchecked(c, i) * inv_num_valid;
+                    grad_cpu.set_value_unchecked(c, i, g);
+                }
+        }
+
         // ── 4. 上传 gradient 到 GPU ──────────────────────────────
         auto grad_tensor_r = engine.from_matrix(grad_cpu);
         if (!grad_tensor_r) return std::unexpected(grad_tensor_r.error());

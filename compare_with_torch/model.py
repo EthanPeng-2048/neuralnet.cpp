@@ -202,12 +202,16 @@ class GPTModel(nn.Module):
         self,
         tokens: torch.Tensor,
         targets: torch.Tensor | None = None,
+        loss_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """前向传播。
 
         Args:
-            tokens:  (batch, seq) LongTensor
-            targets: (batch, seq) LongTensor 或 None。若提供则计算交叉熵损失。
+            tokens:   (batch, seq) LongTensor
+            targets:  (batch, seq) LongTensor 或 None。若提供则计算交叉熵损失。
+            loss_mask: (batch, seq) FloatTensor 或 None。1.0=参与 loss, 0.0=忽略。
+                       与 C++ forward_sparse 的 loss_mask 语义一致：
+                       只对 mask>0.5 的位置计算 loss 和梯度。
 
         Returns:
             (logits, loss)
@@ -230,13 +234,26 @@ class GPTModel(nn.Module):
 
         loss = None
         if targets is not None:
-            # 与 C++ CrossEntropyLoss 一致：
-            #   对每个位置独立 softmax + cross entropy，求平均（不忽略 PAD）
-            loss = F.cross_entropy(
-                logits.view(-1, self.vocab_size),
-                targets.view(-1),
-                reduction="mean",
-            )
+            if loss_mask is not None:
+                # 与 C++ forward_sparse 一致：
+                #   只对 mask>0.5 的位置计算 loss，loss = -sum(log_softmax) / num_valid
+                #   梯度在 mask=0 的位置清零
+                per_token_loss = F.cross_entropy(
+                    logits.view(-1, self.vocab_size),
+                    targets.view(-1),
+                    reduction="none",
+                )  # (B*T,)
+                mask_flat = loss_mask.view(-1)  # (B*T,)
+                masked_loss = per_token_loss * mask_flat
+                num_valid = mask_flat.sum().clamp(min=1.0)
+                loss = masked_loss.sum() / num_valid
+            else:
+                # 无 mask：对所有位置计算 loss（旧行为）
+                loss = F.cross_entropy(
+                    logits.view(-1, self.vocab_size),
+                    targets.view(-1),
+                    reduction="mean",
+                )
 
         return logits, loss
 

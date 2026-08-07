@@ -36,7 +36,7 @@ set(NN_CUDA_COMPILE_SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/compile_cuda_kernels.bat
 file(WRITE "${NN_CUDA_COMPILE_SCRIPT}"
     "@echo off\r\n"
     "call \"${NN_CUDA_HOST_VCVARS}\" >nul 2>&1\r\n"
-    "\"${CUDAToolkit_BIN_DIR}/nvcc.exe\" -c -O2 --use_fast_math -allow-unsupported-compiler"
+    "\"${CUDAToolkit_BIN_DIR}/nvcc.exe\" -c -O3 --use_fast_math -allow-unsupported-compiler"
     " -Xcompiler ${NN_CUDA_CRT_FLAG}"
     " -arch=sm_${NN_CUDA_ARCH} -DNN_HAS_CUBLAS"
     " -I\"${CMAKE_CURRENT_SOURCE_DIR}/../include\""
