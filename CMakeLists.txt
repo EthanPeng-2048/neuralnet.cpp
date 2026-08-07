@@ -23,21 +23,16 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "App
 endif()
 
 # ── 按构建类型设置优化标志 ───────────────────────────────────────────────
-# Release: -O3 -ffast-math -funroll-loops -march=native（最大性能）
+# Release: -O3 -funroll-loops -march=native（最大性能）
 # Debug:   -O0 -g（调试优先）
-set(RELEASE_FLAGS -O3 -ffast-math -funroll-loops -march=native)
+# 注意：不使用 -ffast-math，因为它会禁用 NaN/Infinity 支持，影响训练稳定性
+set(RELEASE_FLAGS -O3 -fno-math-errno -fno-trapping-math -funroll-loops -march=native)
 set(DEBUG_FLAGS -O0 -g)
 
 add_compile_options(
     "$<$<CONFIG:Release>:${RELEASE_FLAGS}>"
     "$<$<CONFIG:Debug>:${DEBUG_FLAGS}>"
 )
-
-# -ffast-math 会禁用 NaN/Infinity 支持，Clang 会对此产生警告
-# 项目代码依赖 infinity()（如 Softmax 的数值稳定化），需要抑制此警告
-if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
-    add_compile_options(-Wno-nan-infinity-disabled)
-endif()
 
 # ── 线程库（Linux 需要 pthread） ─────────────────────────────────────────
 set(THREADS_PREFER_PTHREAD_FLAG ON)

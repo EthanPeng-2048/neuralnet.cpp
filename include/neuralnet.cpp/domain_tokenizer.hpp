@@ -49,9 +49,10 @@ public:
     // ── 特殊 token ID 统一接口 ────────────────────────────────────────
     // 默认返回 npos（表示该 tokenizer 无此特殊 token）。
     // 子类根据自身词表布局重写。
-    // 训练/推理入口通过这两个接口获取 BOS/EOS，无需硬编码常量。
+    // 训练/推理入口通过这些接口获取 BOS/EOS/PAD，无需硬编码常量。
     [[nodiscard]] virtual std::size_t bos_id() const noexcept { return npos; }
     [[nodiscard]] virtual std::size_t eos_id() const noexcept { return npos; }
+    [[nodiscard]] virtual std::size_t pad_id() const noexcept { return 0; }
 
     static constexpr std::size_t npos = static_cast<std::size_t>(-1);
 
@@ -1272,6 +1273,8 @@ public:
     static constexpr std::uint32_t DEFAULT_MIN_FREQ = 2;
 
     using LogFn = std::function<void(std::string_view)>;
+
+    [[nodiscard]] std::size_t pad_id() const noexcept override { return PAD_ID; }
 
     struct Config
     {

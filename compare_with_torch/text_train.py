@@ -66,6 +66,12 @@ def parse_args():
         default="cuda",
         help="cuda / cpu / cuda:0（默认 cuda，不可用自动回退 cpu）",
     )
+    parser.add_argument(
+        "--max-norm",
+        type=float,
+        default=0.0,
+        help="梯度裁剪最大全局 L2 范数 (默认 0=不裁剪，与 C++ --max-norm 一致)",
+    )
     parser.add_argument("--log-interval", type=int, default=50)
     return parser.parse_args()
 
@@ -224,6 +230,8 @@ def main():
     print(f"  FFN 维度: {cfg.d_ff}")
     print(f"  序列长度: {cfg.seq_len}")
     print(f"  优化器: {cfg.optimizer}  学习率: {cfg.lr}  权重衰减: {cfg.weight_decay}")
+    print(f"  梯度裁剪 max_norm: {cfg.max_norm}  (0=不裁剪)")
+    print(f"  Loss mask: 启用 (屏蔽 padding 位置，与 C++ forward_sparse 一致)")
     print(f"  轮数: {cfg.epochs}  批大小: {cfg.batch_size}")
     print(f"  设备: {device}")
     print("========================================\n")
@@ -261,10 +269,8 @@ def main():
 
     n_samples = len(valid_samples)
     # 一个 epoch 的 step 数 = 全部样本 / batch_size（向下取整，丢弃末尾不足一个 batch 的样本）
+    # 与 C++ 一致：无上限
     steps_per_epoch = n_samples // cfg.batch_size
-    # 与 C++ 一致：上限 1000
-    if steps_per_epoch > 1000:
-        steps_per_epoch = 1000
     if steps_per_epoch == 0:
         steps_per_epoch = 1
 
@@ -294,10 +300,30 @@ def main():
                 device,
             )
 
-            logits, loss = model(x, targets=y)
+            # 构建 loss_mask（与 C++ forward_sparse 一致）
+            # 非对话模式：屏蔽 padding 位置，只对真实 token 计算 loss
+            # mask[t][b] = 1.0 当 t+1 < sample_len（即目标不是 padding）
+            loss_mask = torch.zeros(
+                cfg.batch_size, cfg.seq_len, device=device
+            )
+            for b in range(cfg.batch_size):
+                sample = valid_samples[batch_indices[b]]
+                sample_len = len(sample)
+                for t in range(cfg.seq_len):
+                    if t + 1 < sample_len:
+                        loss_mask[b, t] = 1.0
+
+            logits, loss = model(x, targets=y, loss_mask=loss_mask)
 
             optimizer.zero_grad()
             loss.backward()
+
+            # 梯度裁剪（与 C++ --max-norm 一致，在 step 之前）
+            if cfg.max_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), cfg.max_norm
+                )
+
             optimizer.step()
 
             total_loss += loss.item()

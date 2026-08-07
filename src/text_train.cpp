@@ -522,8 +522,7 @@ int main(int argc, char *argv[])
     // 关键：一行 = 一个训练样本。batch 内包含多行，每行独立 PAD/截断到 seq_len。
     // 这样模型在行尾学到 EOS（结束信号），行内只看到正常 token，
     // 不会因序列中间出现 EOS 而学到"随时输出 EOS"的错误偏置。
-    // 所有分词器的 PAD_ID 都是 0（特殊 token 布局统一：0=pad,1=unk,2=bos,3=eos）
-    const std::size_t pad_id = 0;
+    const std::size_t pad_id = tokenizer->pad_id();
     std::vector<std::vector<std::size_t>> line_samples;
     std::size_t total_token_count = 0;
     {
@@ -750,7 +749,7 @@ int main(int argc, char *argv[])
     // ── 预分配 batch 缓冲区 ───────────────────────────────────
     // x_tokens: (seq_len, batch_size) 输入 token IDs
     // y_tokens: (seq_len, batch_size) 目标 token IDs（x 左移一位）
-    // 短行用 pad_id 填充，目标对应位置也用 pad_id（loss 对 PAD 位置无意义但无害）
+    // 短行用 pad_id 填充，目标对应位置也用 pad_id
     nn::Matrix x_tokens(cfg.seq_len, cfg.batch_size);
     nn::Matrix y_tokens(cfg.seq_len, cfg.batch_size);
     const std::size_t total_tokens = cfg.seq_len * cfg.batch_size;
