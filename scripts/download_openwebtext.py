@@ -3,11 +3,12 @@
 OpenWebText 是 Reddit 高赞链接抓取的网页文本，英文为主，适合作为
 GPT base 模型的预训练数据。
 
-项目训练格式（参考 src/text_train.cpp）：
-  - 每行一个独立样本
-  - 纯文本模式（无 <assistant> 等对话标记），所有位置参与 loss
-  - 行内不能含换行符，否则会被当作多个样本
-  - 训练时每行自动加 [BOS] 头 / [EOS] 尾
+项目训练格式（参考 src/text_train.cpp，滑动窗口）：
+  - 每行 = 一个完整文档（长度不限），行内不能含换行符
+  - 纯文本模式（无对话标记），所有位置参与 loss
+  - 训练端把每行编码为 [BOS]+tokens+[EOS] 后拼成连续 token 流，
+    再按 seq_len 滑动切窗——因此超长文档无需截断，会被自动切成
+    多个窗口，短文档也会被窗口切分/拼接利用
 
 本脚本以 streaming 模式遍历 OpenWebText，逐条抽取 text 字段，清洗后写为
 单行，累计到目标字节数后停止。streaming 模式不会把整个数据集下载
@@ -16,7 +17,7 @@ GPT base 模型的预训练数据。
 用法:
   python scripts/download_openwebtext.py
   python scripts/download_openwebtext.py --target_mb 200
-  python scripts/download_openwebtext.py --min_len 256 --max_len 384
+  python scripts/download_openwebtext.py --min_len 256
 
 依赖: pip install datasets
 """
@@ -33,16 +34,16 @@ OUT_DIR = os.path.join(SCRIPT_DIR, "datasets")
 DEFAULT_DATASET = "Skylion007/openwebtext"
 DEFAULT_TARGET_MB = 100
 
-# 单条样本长度上下限（字符数）
-# 用户要求 256-384，这是较短的样本，适合 seq_len=256 的训练
+# 最短文档长度（字符数）：过短视为噪声丢弃
+# 超长文档不设截断——训练端滑动窗口会自动切分；max_len 仅作防御性上限
 DEFAULT_MIN_LEN = 256
-DEFAULT_MAX_LEN = 384
+DEFAULT_MAX_LEN = 100000
 
 # 触发进度打印的间隔（字节数）
 PROGRESS_INTERVAL_BYTES = 5 * 1024 * 1024
 
 
-# 简单的清洗：去 HTML 残留、合并空白、去掉换行（项目要求每行一个样本）
+# 简单的清洗：去 HTML 残留、合并空白、去掉换行（项目要求每行一个文档）
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _MULTI_WS_RE = re.compile(r"\s+")
 
@@ -56,27 +57,6 @@ def clean_doc(text: str) -> str:
     # 把所有空白（含换行）合并为单个空格
     text = _MULTI_WS_RE.sub(" ", text).strip()
     return text
-
-
-def truncate_at_sentence(text: str, max_len: int) -> str:
-    """在句子边界截断文档，避免从单词中间切断。
-    
-    优先在最后一个句号（.）处截断，保证语义完整性。
-    如果找不到句号，回退到直接截断。
-    """
-    if len(text) <= max_len:
-        return text
-    
-    # 在 max_len 范围内找最后一个句号
-    truncated = text[:max_len]
-    last_period = truncated.rfind(".")
-    
-    if last_period > 0:
-        # 在句号处截断（保留句号）
-        return text[:last_period + 1]
-    else:
-        # 找不到句号，回退到直接截断
-        return truncated
 
 
 def is_english_doc(text: str) -> bool:
@@ -152,17 +132,14 @@ def download(dataset_name: str, target_bytes: int, min_len: int, max_len: int, o
             text = sample.get("text", "") or ""
             cleaned = clean_doc(text)
 
-            # 长度过滤
+            # 长度过滤：过短视为噪声；超长文档保留整篇（训练端滑动窗口切分）
             if len(cleaned) < min_len:
                 skipped_short += 1
                 continue
             if len(cleaned) > max_len:
-                # 超长文档在句子边界截断，避免从单词中间切断
-                cleaned = truncate_at_sentence(cleaned, max_len)
-                # 截断后可能变得太短，再检查一次
-                if len(cleaned) < min_len:
-                    skipped_short += 1
-                    continue
+                # 仅防御极端异常（默认上限很大，正常文档不会触发）
+                skipped_long += 1
+                continue
 
             # 语言过滤：仅保留英文
             if not is_english_doc(cleaned):

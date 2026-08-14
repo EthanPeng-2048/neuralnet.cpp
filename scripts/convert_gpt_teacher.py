@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-将 GPT_teacher-3.37M-cn 数据集转换为 neuralnet.cpp 对话训练格式。
+将 GPT_teacher-3.37M-cn 数据集转换为 neuralnet.cpp 对话格式。
+
+注意：训练端 (src/text_train.cpp) 当前为纯文本滑动窗口模式，
+已移除对话 loss mask 训练。本脚本产出的 <user>/<assistant> 对话
+格式数据暂时不用于训练，仅保留转换工具备用。
 
 源数据格式 (JSONL):
   {"prompt": "...", "completion": "..."}
   {"prompt": "...", "completion": "..."}
 
-目标格式 (纯文本，每行一个样本):
+目标格式 (每行一段对话):
   <user>prompt</user><assistant>completion</assistant>
 """
 
