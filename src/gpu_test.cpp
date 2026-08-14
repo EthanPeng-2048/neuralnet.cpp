@@ -99,8 +99,17 @@ int main(int argc, char* argv[])
     {
         std::string arg = argv[i];
         if (arg == "--help") { print_usage(argv[0]); return 0; }
-        else if (arg == "--size" && i + 1 < argc) N = static_cast<std::size_t>(parse_num_or_die<int>(argv[++i], "--size"));
-        else if (arg == "--iters" && i + 1 < argc) iters = parse_num_or_die<int>(argv[++i], "--iters");
+        else if (arg == "--size" && i + 1 < argc)
+        {
+            int v = parse_num_or_die<int>(argv[++i], "--size");
+            if (v <= 0) { std::cerr << "--size 必须为正整数\n"; return 1; }
+            N = static_cast<std::size_t>(v);
+        }
+        else if (arg == "--iters" && i + 1 < argc)
+        {
+            iters = parse_num_or_die<int>(argv[++i], "--iters");
+            if (iters <= 0) { std::cerr << "--iters 必须为正整数\n"; return 1; }
+        }
         else { std::cerr << "未知参数: " << arg << "\n"; return 1; }
     }
 
@@ -318,8 +327,9 @@ int main(int argc, char* argv[])
     auto t_gpu_end = std::chrono::high_resolution_clock::now();
     double gpu_ms = std::chrono::duration<double, std::milli>(t_gpu_end - t_gpu_start).count() / iters;
 
-    double speedup = cpu_ms / gpu_ms;
-    double gflops = (2.0 * N * N * N) / (gpu_ms * 1e6);  // 2*N^3 FLOPs
+    // 防御：计时为 0 时（极小矩阵/低精度时钟）避免除零输出 inf
+    const double speedup = (gpu_ms > 0.0) ? cpu_ms / gpu_ms : 0.0;
+    const double gflops = (gpu_ms > 0.0) ? (2.0 * N * N * N) / (gpu_ms * 1e6) : 0.0;
 
     std::cout << "\n";
     std::cout << "  CPU 时间 (含上传/下载):  " << std::fixed << std::setprecision(2) << cpu_ms << " ms\n";

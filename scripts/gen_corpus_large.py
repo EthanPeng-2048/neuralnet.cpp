@@ -14,7 +14,12 @@ from openai import OpenAI
 
 # ── 配置 ──────────────────────────────────────────────────
 BASE_URL = "http://localhost:18080/v1"
-API_KEY = "Ethan_2048"
+
+API_KEY = os.environ.get("LLM_API_KEY", "")
+if not API_KEY:
+    print("错误: 未设置 LLM_API_KEY 环境变量（禁止在代码库中硬编码密钥）",
+          file=sys.stderr)
+    sys.exit(1)
 MODEL = "local-model"  # llama-server 忽略具体值，但 openai 库要求必填
 OUTPUT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),

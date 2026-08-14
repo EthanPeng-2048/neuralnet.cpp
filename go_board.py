@@ -154,60 +154,76 @@ class GoBoard:
         self.ko_pos = None
 
     def undo(self) -> bool:
-        """悔棋"""
+        """悔棋：从空棋盘完整重放历史，正确恢复提子/劫位/连续过手状态"""
         if not self.history:
             return False
-        r, c, color = self.history.pop()
-        if r >= 0:
-            self.board[r][c] = EMPTY
-        self.current_color = color
-        # 恢复前一手的棋盘状态（简化：重放历史）
-        self.board = [[EMPTY] * self.size for _ in range(self.size)]
-        self.ko_pos = None
-        for hr, hc, hc_color in self.history:
-            if hr >= 0:
-                self.board[hr][hc] = hc_color
-        # 重算当前手颜色
-        if self.history:
-            last_color = self.history[-1][2]
-            self.current_color = WHITE if last_color == BLACK else BLACK
-        else:
-            self.current_color = BLACK
+        self.history.pop()
+        self._replay_history()
         return True
 
+    def _replay_history(self):
+        """从空棋盘按历史完整重放（无合法性校验，仅恢复棋理状态）"""
+        self.board = [[EMPTY] * self.size for _ in range(self.size)]
+        self.ko_pos = None
+        self.pass_count = 0
+        self.current_color = BLACK
+        for _i, (r, c, color) in enumerate(self.history):
+            if r < 0:
+                self.pass_count += 1
+                self.ko_pos = None
+            else:
+                self.pass_count = 0
+                opponent = WHITE if color == BLACK else BLACK
+                captured = set()
+                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nr, nc = r + dr, c + dc
+                    if self.is_on_board(nr, nc) and self.board[nr][nc] == opponent:
+                        group, liberties = self._find_group(nr, nc)
+                        if liberties == 0:
+                            captured |= group
+                for cr, cc in captured:
+                    self.board[cr][cc] = EMPTY
+                self.board[r][c] = color
+                self.ko_pos = None
+                if len(captured) == 1:
+                    cr, cc = next(iter(captured))
+                    _, my_lib = self._find_group(r, c)
+                    if my_lib == 1:
+                        self.ko_pos = (cr, cc)
+            self.current_color = WHITE if color == BLACK else BLACK
+
     def get_moves_text(self) -> str:
-        """获取当前棋谱的文本表示（用于 AI 推理）"""
+        """获取当前棋谱的文本表示（用于 AI 推理）
+
+        每个坐标拆为 2 个 token：列 + 行（如 pd → p d），
+        便于模型分别学习列/行规律。
+        """
         tokens = []
         for i, (r, c, _) in enumerate(self.history):
             if r < 0:
-                coord = 'tt'  # PASS
+                tokens.append('tt')  # PASS
             else:
-                coord = COL_LABELS[c] + COL_LABELS[r]
-            tokens.append(coord)
+                tokens.append(COL_LABELS[c])  # 列
+                tokens.append(COL_LABELS[r])  # 行
         return ' '.join(tokens)
 
     def get_perspective_text(self, ai_is_first: bool) -> str:
         """
         获取带视角标记的完整棋谱序列（与训练格式一致）。
 
-        训练格式: "<me> coord <enemy> coord <me> coord ..."
+        训练格式: "<me> p d <enemy> d q <me> f r ..."
+        每个坐标拆为列+行两个 token。
         AI 固定作为 <me>（赢家视角），人类作为 <enemy>。
-
-        ai_is_first=True  → AI 执黑先手（第0,2,4手是AI=me）
-        ai_is_first=False → AI 执白后手（第1,3,5手是AI=me）
-
-        返回序列不包含结尾标记，由调用方追加。
         """
         tokens = []
         for i, (r, c, _) in enumerate(self.history):
-            if r < 0:
-                coord = 'tt'
-            else:
-                coord = COL_LABELS[c] + COL_LABELS[r]
-            is_first = (i % 2 == 0)          # 第0,2,4...手是先手
+            is_first = (i % 2 == 0)
             is_ai_move = is_first == ai_is_first
             tag = '<me>' if is_ai_move else '<enemy>'
-            tokens.append(f"{tag} {coord}")
+            if r < 0:
+                tokens.append(f"{tag} tt")
+            else:
+                tokens.append(f"{tag} {COL_LABELS[c]} {COL_LABELS[r]}")
         return ' '.join(tokens)
 
     def get_legal_moves(self) -> list[tuple[int, int]]:
@@ -615,13 +631,21 @@ class GoGamePanel:
 
     @staticmethod
     def _first_go_token(text: str) -> Optional[str]:
-        """从文本中提取第一个合法的围棋坐标 token"""
-        for token in text.split():
-            token = token.strip('()')
-            if token == 'tt':
+        """从文本中提取第一个合法的围棋坐标。
+
+        新格式：坐标由列 + 行两个单字符 token 组成（如 p d）。
+        兼容旧格式：两字符坐标 token（如 pd）。
+        """
+        toks = [t.strip('()') for t in text.split()]
+        for i, tok in enumerate(toks):
+            if tok == 'tt':
                 return 'tt'
-            if len(token) == 2 and token[0] in COL_LABELS and token[1] in COL_LABELS:
-                return token
+            # 新格式：列 + 行两个独立 token
+            if tok in COL_LABELS and i + 1 < len(toks) and toks[i + 1] in COL_LABELS:
+                return tok + toks[i + 1]
+            # 兼容旧格式：合并两字符坐标
+            if len(tok) == 2 and tok[0] in COL_LABELS and tok[1] in COL_LABELS:
+                return tok
         return None
 
     def _parse_infer_output(self, output: str, prompt: str = '') -> Optional[str]:
@@ -661,8 +685,12 @@ class GoGamePanel:
                             return tok
                     break
 
-        # 2) 回退：从所有内容行中找第一个合法坐标
+        # 2) 回退：从内容行中找第一个合法坐标，
+        #    但排除“无新增生成”的行（整行就是 prompt 本身，
+        #    其中的坐标是已下过的旧着法，返回会导致非法落子→自动 Pass）
         for line in content_lines:
+            if prompt and line == prompt.strip():
+                continue
             tok = self._first_go_token(line)
             if tok:
                 return tok
@@ -674,7 +702,7 @@ class GoGamePanel:
             self.board.pass_turn()
         else:
             col = COL_LABELS.index(coord[0])
-            row = BOARD_SIZE - 1 - COL_LABELS.index(coord[1])
+            row = COL_LABELS.index(coord[1])  # 与编码一致：r=0 为顶行，无镜像
             if not self.board.try_move(row, col):
                 # AI 返回了非法着法（如已有子/自杀/劫），提示并 Pass
                 self.status_var.set(f"⚠️ AI 非法着法 {coord}，自动 Pass")

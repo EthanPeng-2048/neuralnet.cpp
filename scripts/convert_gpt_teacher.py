@@ -23,10 +23,10 @@ FILES = {
 }
 
 
-def download_file(url: str) -> str:
-    """下载文件内容并返回字符串。"""
+def download_file(url: str, timeout: float = 60.0) -> str:
+    """下载文件内容并返回字符串（带超时，避免网络异常时无限阻塞）。"""
     print(f"  下载: {url}")
-    with urllib.request.urlopen(url) as resp:
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
         return resp.read().decode("utf-8")
 
 

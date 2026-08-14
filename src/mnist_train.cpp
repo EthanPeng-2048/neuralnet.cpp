@@ -436,6 +436,12 @@ int main(int argc, char *argv[])
 
     nn::CrossEntropyLoss ce_loss;
     const std::size_t num_batches = train_x.cols() / cfg.batch_size;
+    if (num_batches == 0)
+    {
+        std::cerr << "训练样本数 (" << train_x.cols() << ") 小于 batch_size ("
+                  << cfg.batch_size << ")，请减小 --batch-size 或增大 --max-samples\n";
+        return 1;
+    }
 
     // ── 预分配 batch 缓冲区 ──────────────────────────────────
     nn::Matrix x_batch(train_x.rows(), cfg.batch_size);

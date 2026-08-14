@@ -271,7 +271,7 @@ class GPTModel(nn.Module):
         Args:
             prompt:          prompt token ID 列表
             max_new_tokens:  最大生成 token 数
-            temperature:     0 = 贪心, >0 且 !=1.0 = 采样, 1.0 = 贪心（与 C++ 一致）
+            temperature:     0 = 贪心, >0 = 采样（1.0 不缩放但仍采样，与 C++ 一致）
             eos_token_id:    遇到此 token 停止（min_new_tokens 之后才检查）
             min_new_tokens:  前这么多个 token 内不检查 EOS
 
@@ -303,9 +303,13 @@ class GPTModel(nn.Module):
             # 数值稳定 softmax
             probs = F.softmax(last_logits, dim=-1)
 
-            # 采样 or 贪心（与 C++ 分支一致）
-            if temperature > 0.0 and temperature != 1.0:
-                next_token = torch.multinomial(probs, num_samples=1).item()
+            # 采样 or 贪心（与 C++ 分支一致：temperature > 0 采样，0 贪心）
+            if temperature > 0.0:
+                # 防御：probs 含 NaN（logits 为 -inf 时 softmax 可能 NaN）则回退贪心
+                if torch.isnan(probs).any():
+                    next_token = torch.argmax(last_logits).item()
+                else:
+                    next_token = torch.multinomial(probs, num_samples=1).item()
             else:
                 next_token = torch.argmax(probs).item()
 

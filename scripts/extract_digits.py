@@ -39,7 +39,13 @@ def extract_digits(test_csv_path, output_dir):
     # 打印统计信息
     total = sum(label_counts.values())
     print(f"提取完成！共 {total} 张图片")
-    for label in sorted(label_counts.keys(), key=int):
+    # 防御：标签非纯数字时退化为字符串排序，避免 ValueError
+    def _sort_key(lbl: str):
+        try:
+            return (0, int(lbl), "")
+        except ValueError:
+            return (1, 0, lbl)
+    for label in sorted(label_counts.keys(), key=_sort_key):
         print(f"  标签 {label}: {label_counts[label]} 张")
 
 

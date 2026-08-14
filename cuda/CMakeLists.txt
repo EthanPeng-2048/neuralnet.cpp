@@ -26,10 +26,14 @@ endif()
 # 由于 CMake 的 add_custom_command 无法直接设置 vcvars 环境，
 # 生成一个临时 .bat 脚本来包装编译命令。
 # Debug 模式使用 /MDd（动态调试 CRT），Release 模式使用 /MD（动态发布 CRT）
+# 同时对齐 _ITERATOR_DEBUG_LEVEL（主程序 Debug 为 2，Release 为 0），
+# 否则 lld-link 会报 /failifmismatch。
 if(CMAKE_BUILD_TYPE STREQUAL "Debug" OR (DEFINED CMAKE_CONFIGURATION_TYPES AND CMAKE_BUILD_TYPE MATCHES "Debug"))
     set(NN_CUDA_CRT_FLAG "/MDd")
+    set(NN_CUDA_ITDL "2")
 else()
     set(NN_CUDA_CRT_FLAG "/MD")
+    set(NN_CUDA_ITDL "0")
 endif()
 set(NN_CUDA_COMPILE_SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/compile_cuda_kernels.bat")
 # 启用 cuBLAS：定义 NN_HAS_CUBLAS 宏，链接 cublas
@@ -38,6 +42,7 @@ file(WRITE "${NN_CUDA_COMPILE_SCRIPT}"
     "call \"${NN_CUDA_HOST_VCVARS}\" >nul 2>&1\r\n"
     "\"${CUDAToolkit_BIN_DIR}/nvcc.exe\" -c -O3 --use_fast_math -allow-unsupported-compiler"
     " -Xcompiler ${NN_CUDA_CRT_FLAG}"
+    " -Xcompiler /D_ITERATOR_DEBUG_LEVEL=${NN_CUDA_ITDL}"
     " -arch=sm_${NN_CUDA_ARCH} -DNN_HAS_CUBLAS"
     " -I\"${CMAKE_CURRENT_SOURCE_DIR}/../include\""
     " -I\"${CUDAToolkit_INCLUDE_DIRS}\""

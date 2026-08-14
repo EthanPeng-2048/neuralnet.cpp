@@ -738,6 +738,12 @@ int main(int argc, char *argv[])
     }
 
     std::size_t steps_per_epoch = valid_samples.size() / cfg.batch_size;
+    if (steps_per_epoch == 0)
+    {
+        std::cerr << "有效样本数 (" << valid_samples.size() << ") 小于 batch_size ("
+                  << cfg.batch_size << ")，请减小 --batch-size 或增大训练语料\n";
+        return 1;
+    }
 
     // 改造：每 epoch 开始前 shuffle 样本索引队列，每 step 顺序切片。
     // 不再每 step 独立随机采样，保证每个样本每 epoch 被访问一次。

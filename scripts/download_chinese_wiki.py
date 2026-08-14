@@ -11,6 +11,7 @@ import re
 import time
 import sys
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 REST_URL = "https://zh.wikipedia.org/api/rest_v1/page/random/summary"
@@ -82,6 +83,7 @@ def worker() -> list[str]:
 def main():
     os.makedirs(os.path.dirname(OUT_FILE), exist_ok=True)
     seen: set[str] = set()
+    seen_lock = threading.Lock()  # 保护 seen 集合的 check-then-add
     total = 0
     requests_made = 0
     start = time.time()
@@ -97,7 +99,13 @@ def main():
                     pending.add(pool.submit(worker))
                 # 取完成的
                 done = set()
-                for fut in as_completed(pending, timeout=30):
+                try:
+                    completed = as_completed(pending, timeout=30)
+                except TimeoutError:
+                    # 30 秒内没有任何请求完成：继续循环补充任务（单个请求
+                    # 含重试+退避可达 ~70s，不能因超时直接崩溃）
+                    continue
+                for fut in completed:
                     done.add(fut)
                     requests_made += 1
                     try:
@@ -106,9 +114,10 @@ def main():
                         sents = []
                     for s in sents:
                         key = s[:40]
-                        if key in seen:
-                            continue
-                        seen.add(key)
+                        with seen_lock:
+                            if key in seen:
+                                continue
+                            seen.add(key)
                         f.write(s + "\n")
                         total += 1
                         if total >= TARGET_LINES:

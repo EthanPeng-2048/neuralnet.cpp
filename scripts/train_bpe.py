@@ -12,6 +12,7 @@ from tokenizers import Tokenizer
 from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
 from tokenizers.pre_tokenizers import ByteLevel
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 
 # 特殊 token 定义（与 ByteZip 保持一致）
 SPECIAL_TOKENS = ["<pad>", "<unk>", "<bos>", "<eos>"]
@@ -22,6 +23,9 @@ def train_bpe(text_file: str, vocab_size: int) -> Tokenizer:
     """训练 BPE 并返回 tokenizer 对象"""
     tokenizer = Tokenizer(BPE(unk_token="<unk>"))
     tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=True)
+    # 必须设置 ByteLevel decoder，否则保存的 JSON 缺 decoder，
+    # 解码时会输出带 Ġ 前缀/丢失空格的文本
+    tokenizer.decoder = ByteLevelDecoder()
 
     trainer = BpeTrainer(vocab_size=vocab_size, special_tokens=SPECIAL_TOKENS)
     tokenizer.train(files=[text_file], trainer=trainer)
