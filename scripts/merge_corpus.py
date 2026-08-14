@@ -10,7 +10,15 @@
   7. datasets/charbpe_mini.json      — charbpe 小语料
 
 输出：
-  datasets/training_corpus_final.txt — 最终训练语料（每行一句）
+  datasets/training_corpus_final.txt — 最终训练语料（每行一段/一篇，长度不限）
+
+滑动窗口说明：
+  训练端 (src/text_train.cpp) 会把每行当作一个文档，编码为
+  [BOS]+tokens+[EOS] 后拼接成连续 token 流，再按 seq_len 滑动切窗。
+  因此：
+    - 每行应保留完整段落/文档，不要按句号切碎（切碎会丢失跨句上下文）
+    - 超长文档无需截断，训练端会自动切成多个窗口
+    - 仅过滤过短噪声（< --min-len）和极端异常超长（> --max-len）
 
 用法：
   python scripts/merge_corpus.py [--min-len 8] [--max-len 300]
@@ -42,11 +50,9 @@ JSON_CORPUS_FILES = [
     "charbpe_mini.json",
 ]
 
-SENT_SPLIT = re.compile(r"[。！？；]")
-
 
 def load_txt_corpus(path: str) -> list[str]:
-    """加载 txt 格式语料（每行一句）。"""
+    """加载 txt 格式语料（每行一段/一篇）。"""
     lines = []
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -90,10 +96,9 @@ def is_chinese_dominant(text: str) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(description="合并所有中文语料来源")
-    parser.add_argument("--min-len", type=int, default=8, help="最短句子长度")
-    parser.add_argument("--max-len", type=int, default=300, help="最长句子长度")
-    parser.add_argument("--split-long", action="store_true",
-                        help="超长句子按句号拆分而非丢弃")
+    parser.add_argument("--min-len", type=int, default=8, help="最短段落长度（过短视为噪声丢弃）")
+    parser.add_argument("--max-len", type=int, default=4096,
+                        help="最长段落长度（防御性上限，超过视为异常丢弃；滑动窗口会自动切分长文）")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -126,31 +131,18 @@ def main():
 
     print(f"\n📊 原始总量: {len(all_lines)} 行")
 
-    # 过滤 + 去重
+    # 过滤 + 去重（保留完整段落，长度过滤仅用于剔除噪声/异常）
     seen = set()
     filtered = []
-    split_count = 0
     for line in all_lines:
         line = line.strip()
         if not line:
             continue
 
-        # 长度过滤
+        # 长度过滤：过短视为噪声，过长视为异常（滑动窗口会自动切分长文）
         if len(line) < args.min_len:
             continue
-
-        # 超长句子处理
         if len(line) > args.max_len:
-            if args.split_long:
-                parts = SENT_SPLIT.split(line)
-                for part in parts:
-                    part = part.strip()
-                    if args.min_len <= len(part) <= args.max_len and is_chinese_dominant(part):
-                        key = part[:40]
-                        if key not in seen:
-                            seen.add(key)
-                            filtered.append(part)
-                            split_count += 1
             continue
 
         # 中文比例检查
@@ -165,8 +157,6 @@ def main():
         filtered.append(line)
 
     print(f"📊 去重+过滤后: {len(filtered)} 行")
-    if split_count > 0:
-        print(f"  (其中 {split_count} 条来自超长句拆分)")
 
     # 统计
     total_chars = sum(len(line) for line in filtered)

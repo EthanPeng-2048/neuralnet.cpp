@@ -1,10 +1,12 @@
 // ── GPT 文本生成训练程序（引擎化架构） ──────────────────────────────────────
 //
-// 数据流：
-//   文本 → Tokenizer.encode → token IDs
-//   每 batch：token IDs → Matrix(seq_len, batch) → engine.from_matrix → Tensor
+// 数据流（滑动窗口，GPT 预训练标准做法）：
+//   文本 → 逐行 Tokenizer.encode → 每行编码为 [BOS]+tokens+[EOS] 后拼接成连续
+//     token 流（行边界通过 EOS 编码进流，窗口可跨行，上下文连续）
+//   按 stride 对 token 流滑动切 seq_len 窗口 → 每窗口 = 一个训练样本
+//   每 batch：窗口 → Matrix(seq_len, batch) → engine.from_matrix → Tensor
 //     → GPTModel.forward(Tensor) → Tensor(vocab_size, seq_len×batch)
-//     → ce_loss.forward(engine, logits, onehot) → Scalar
+//     → ce_loss.forward_sparse(engine, logits, flat_labels, loss_mask) → Scalar
 //     → ce_loss.backward() → Tensor
 //     → model.backward(Tensor) → (丢弃)
 //     → optimizer.step() / zero_grad()
@@ -93,7 +95,11 @@ void print_usage(const char *prog)
         << "  --epochs <n>       训练轮数 (默认: 10)\n"
         << "  --lr <lr>          学习率 (默认: 0.001)\n"
         << "  --batch-size <n>   批大小 (默认: 32)\n"
+        << "  --accum-steps <n>  梯度累积步数 (默认: 1)。每 n 步 forward/backward\n"
+        << "                     累加梯度后再更新参数，等效放大 batch_size×n\n"
         << "  --seq-len <n>      序列长度 (默认: 256)\n"
+        << "  --stride <n>       滑动窗口步长 (默认: 等于 --seq-len，即不重叠)\n"
+        << "                     设小可产生重叠窗口，增加训练样本数\n"
         << "  --optimizer <name> 优化器: sgd/sgd_momentum/adam/adamw/muon (默认: adam)\n"
         << "  --weight-decay <w> AdamW 权重衰减系数 (默认: 0.01)\n"
         << "  --d-model <n>      模型维度 (默认: 128)\n"
@@ -107,6 +113,12 @@ void print_usage(const char *prog)
         << "                     learned: 可学习位置嵌入（默认，GPT 原版）\n"
         << "                     sinusoidal: 正弦波固定位置编码（不参与训练）\n"
         << "                     alibi: 线性偏置注意力（无位置嵌入，支持长度外推）\n"
+        << "  --activation <type>  FFN 激活: gelu(默认)/swiglu\n"
+        << "                     gelu: QuickGeLU（GPT-2 风格）\n"
+        << "                     swiglu: SwiGLU（LLaMA/Mistral 风格，每参数效率更高）\n"
+        << "  --norm <type>      归一化层: layernorm(默认)/rmsnorm\n"
+        << "                     layernorm: LayerNorm（GPT-2 风格）\n"
+        << "                     rmsnorm: RMSNorm（LLaMA/Mistral 风格，更快更稳）\n"
         << "  --log-interval <n> 每隔多少 step 显示进度 (默认: 50)\n"
         << "  --save-interval <n> 每隔多少 step 保存 checkpoint (默认: 100)\n"
         << "  --grad-log         显示梯度统计（范数/最大值/均值）\n"
@@ -114,10 +126,6 @@ void print_usage(const char *prog)
         << "TDR 防护:\n"
         << "  --tdr-retry <on|off>  GPU 超时自动减小 batch 重试 (默认: on)\n"
         << "  --max-tdr-retries <n> 最大重试次数，每次 batch 减半 (默认: 4)\n"
-        << "  --auto-tune          自动监测 step 耗时，超限自动降 batch (默认: off)\n"
-        << "  --step-time-limit <f> 单步耗时上限秒数，超过则减半 batch (默认: 1.5)\n"
-        << "  --tune-warmup <n>    自动调优预热步数，之后才开始预测 (默认: 3)\n"
-        << "  --tune-decay <f>     自动调优 EMA 衰减系数 (默认: 0.7)\n"
         << "\n"
         << "Batch 录制粒度:\n"
         << "  --flush-interval <n>  每 N 个 Transformer block flush 一次 (默认: 0=不间断)\n"
@@ -126,9 +134,12 @@ void print_usage(const char *prog)
         << "  可用 --resume 恢复训练。\n"
         << "\n"
         << "学习率调度:\n"
-        << "  --lr-schedule <type> 学习率调度: fixed/cosine (默认: fixed)\n"
-        << "                   cosine: 余弦退火，lr 从初始值衰减到 min-lr\n"
-        << "  --warmup-epochs <n> 线性预热轮数 (默认: 0, 即不预热)\n"
+        << "  --lr-schedule <type> 学习率调度: fixed/cosine/step_cosine (默认: fixed)\n"
+        << "                   cosine: 余弦退火（epoch 级），lr 从初始值衰减到 min-lr\n"
+        << "                   step_cosine: 余弦退火（step 级），按单个训练步预热+退火，\n"
+        << "                   适合每 epoch 步数很多的场景（如大语料）\n"
+        << "  --warmup-epochs <n> 线性预热轮数 (默认: 0, 仅 cosine)\n"
+        << "  --warmup-steps <n>  线性预热步数 (默认: 0, 仅 step_cosine)\n"
         << "  --min-lr <lr>     余弦退火最低学习率 (默认: 1e-6)\n"
         << "  --lr-per-epoch <v1,v2,...>  手动指定每轮学习率 (逗号分隔，优先级最高)\n"
         << "  --max-norm <f>    梯度裁剪最大全局 L2 范数 (默认: 0=不裁剪)\n"
@@ -148,7 +159,9 @@ struct TrainConfig
     Scalar lr = 0.001;
     Scalar weight_decay = 0.01f;  // AdamW 权重衰减系数
     std::size_t batch_size = 32;
+    std::size_t accum_steps = 1;    // 梯度累积步数（1 = 不累积）
     std::size_t seq_len = nn::GPT_SEQ_LEN;
+    std::size_t stride = 0;   // 滑动窗口步长，0 = 默认等于 seq_len（不重叠）
     std::size_t d_model = nn::GPT_D_MODEL;
     std::size_t num_heads = nn::GPT_NUM_HEADS;
     std::size_t num_layers = nn::GPT_NUM_LAYERS;
@@ -160,23 +173,20 @@ struct TrainConfig
     bool cuda_enabled = false;
     bool grad_log = false;          // 显示梯度统计
     nn::PosEncodingType pos_encoding = nn::PosEncodingType::Learned;
+    nn::ActivationType activation = nn::ActivationType::GeLU;  // FFN 激活
+    nn::NormType norm_type = nn::NormType::LayerNorm;           // 归一化层类型
 
     // TDR 自动重试
     bool auto_tdr_retry = true;              // 遇到 TDR 超时自动减小 batch 重试
     std::size_t max_tdr_retries = 4;         // 最大重试次数（每次 batch 减半）
 
-    // 自动调优：主动监测 step 耗时，超限自动降 batch（预防 TDR）
-    bool auto_tune = false;                  // 启用自动调优（仅 GPU 时有意义）
-    Scalar step_time_limit = 1.5f;           // 单步耗时上限（秒），超过则减半 batch
-    std::size_t tune_warmup_steps = 3;       // 预热步数，之后才开始预测
-    Scalar tune_ema_decay = 0.7f;            // 指数移动平均衰减系数
-
     // batch 录制粒度：在 Transformer block 间按间隔 flush，拆分大提交
     std::size_t flush_interval = 0;          // 0=不间断（默认），>0=每 N 个 block flush
 
     // 学习率调度
-    std::string lr_schedule = "fixed";  // fixed / cosine
-    int warmup_epochs = 0;              // 线性预热轮数
+    std::string lr_schedule = "fixed";  // fixed / cosine / step_cosine
+    int warmup_epochs = 0;              // 线性预热轮数（epoch 级）
+    std::size_t warmup_steps = 0;       // 线性预热步数（step 级）
     Scalar min_lr = 1e-6f;              // 余弦退火最低 lr
     std::vector<Scalar> lr_per_epoch;   // 手动指定每轮 lr（为空则自动计算）
 
@@ -222,11 +232,24 @@ TrainConfig parse_args(int argc, char *argv[])
             if (!v) { std::cerr << "无效 --batch-size: " << v.error().message << "\n"; std::exit(1); }
             cfg.batch_size = *v;
         }
+        else if (arg == "--accum-steps" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --accum-steps: " << v.error().message << "\n"; std::exit(1); }
+            if (*v == 0) { std::cerr << "--accum-steps 必须 >= 1\n"; std::exit(1); }
+            cfg.accum_steps = *v;
+        }
         else if (arg == "--seq-len" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
             if (!v) { std::cerr << "无效 --seq-len: " << v.error().message << "\n"; std::exit(1); }
             cfg.seq_len = *v;
+        }
+        else if (arg == "--stride" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --stride: " << v.error().message << "\n"; std::exit(1); }
+            cfg.stride = *v;
         }
         else if (arg == "--optimizer" && i + 1 < argc)
         {
@@ -291,10 +314,11 @@ TrainConfig parse_args(int argc, char *argv[])
         else if (arg == "--lr-schedule" && i + 1 < argc)
         {
             cfg.lr_schedule = argv[++i];
-            if (cfg.lr_schedule != "fixed" && cfg.lr_schedule != "cosine")
+            if (cfg.lr_schedule != "fixed" && cfg.lr_schedule != "cosine" &&
+                cfg.lr_schedule != "step_cosine")
             {
                 std::cerr << "未知 --lr-schedule: " << cfg.lr_schedule
-                          << "，可选: fixed, cosine\n";
+                          << "，可选: fixed, cosine, step_cosine\n";
                 std::exit(1);
             }
         }
@@ -303,6 +327,12 @@ TrainConfig parse_args(int argc, char *argv[])
             auto v = nn::parse_number<int>(argv[++i]);
             if (!v) { std::cerr << "无效 --warmup-epochs: " << v.error().message << "\n"; std::exit(1); }
             cfg.warmup_epochs = *v;
+        }
+        else if (arg == "--warmup-steps" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --warmup-steps: " << v.error().message << "\n"; std::exit(1); }
+            cfg.warmup_steps = *v;
         }
         else if (arg == "--min-lr" && i + 1 < argc)
         {
@@ -344,6 +374,34 @@ TrainConfig parse_args(int argc, char *argv[])
                 std::exit(1);
             }
         }
+        else if (arg == "--activation" && i + 1 < argc)
+        {
+            std::string v = argv[++i];
+            if (v == "gelu")
+                cfg.activation = nn::ActivationType::GeLU;
+            else if (v == "swiglu")
+                cfg.activation = nn::ActivationType::SwiGLU;
+            else
+            {
+                std::cerr << "未知激活类型: " << v
+                          << "，可选: gelu, swiglu\n";
+                std::exit(1);
+            }
+        }
+        else if (arg == "--norm" && i + 1 < argc)
+        {
+            std::string v = argv[++i];
+            if (v == "layernorm")
+                cfg.norm_type = nn::NormType::LayerNorm;
+            else if (v == "rmsnorm")
+                cfg.norm_type = nn::NormType::RMSNorm;
+            else
+            {
+                std::cerr << "未知归一化层类型: " << v
+                          << "，可选: layernorm, rmsnorm\n";
+                std::exit(1);
+            }
+        }
         else if (arg == "--tdr-retry" && i + 1 < argc)
         {
             std::string v = argv[++i];
@@ -362,26 +420,6 @@ TrainConfig parse_args(int argc, char *argv[])
             auto v = nn::parse_number<std::size_t>(argv[++i]);
             if (!v) { std::cerr << "无效 --max-tdr-retries: " << v.error().message << "\n"; std::exit(1); }
             cfg.max_tdr_retries = *v;
-        }
-        else if (arg == "--auto-tune")
-            cfg.auto_tune = true;
-        else if (arg == "--step-time-limit" && i + 1 < argc)
-        {
-            auto v = nn::parse_number<Scalar>(argv[++i]);
-            if (!v) { std::cerr << "无效 --step-time-limit: " << v.error().message << "\n"; std::exit(1); }
-            cfg.step_time_limit = *v;
-        }
-        else if (arg == "--tune-warmup" && i + 1 < argc)
-        {
-            auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --tune-warmup: " << v.error().message << "\n"; std::exit(1); }
-            cfg.tune_warmup_steps = *v;
-        }
-        else if (arg == "--tune-decay" && i + 1 < argc)
-        {
-            auto v = nn::parse_number<Scalar>(argv[++i]);
-            if (!v) { std::cerr << "无效 --tune-decay: " << v.error().message << "\n"; std::exit(1); }
-            cfg.tune_ema_decay = *v;
         }
         else if (arg == "--flush-interval" && i + 1 < argc)
         {
@@ -518,13 +556,17 @@ int main(int argc, char *argv[])
     const std::size_t bos_id = tokenizer->bos_id();
     const std::size_t eos_id = tokenizer->eos_id();
 
-    // ── 按行编码：每行独立存储为 [BOS] + tokens + [EOS] ──────────
-    // 关键：一行 = 一个训练样本。batch 内包含多行，每行独立 PAD/截断到 seq_len。
-    // 这样模型在行尾学到 EOS（结束信号），行内只看到正常 token，
-    // 不会因序列中间出现 EOS 而学到"随时输出 EOS"的错误偏置。
+    // ── 滑动窗口数据组织（GPT 预训练标准做法）────────────────────────
+    // 每行 = 一个文档，编码为 [BOS] + tokens + [EOS]，然后拼接成一条连续
+    // token 流（行边界通过 EOS 编码进流，窗口可跨行，上下文连续）。
+    // 训练样本 = 对 token 流按 stride 滑动切出的 seq_len 窗口：
+    //   - 不再"每行一个样本"：长行不再被截断丢弃、短行不再大量 PAD，
+    //     语料被 100% 利用；
+    //   - 窗口可跨行，模型能学到跨行/跨段依赖；
+    //   - 仅最后一个窗口不足 seq_len 时 PAD，且 loss 屏蔽 PAD 位置。
     const std::size_t pad_id = tokenizer->pad_id();
-    std::vector<std::vector<std::size_t>> line_samples;
-    std::size_t total_token_count = 0;
+    const std::size_t stride = (cfg.stride == 0) ? cfg.seq_len : cfg.stride;
+    std::vector<std::size_t> token_flow;      // 全量 token 流（含 BOS/EOS）
     {
         std::istringstream iss(text);
         std::string line;
@@ -537,21 +579,23 @@ int main(int argc, char *argv[])
             if (line.empty()) continue;
 
             auto line_tokens = tokenizer->encode(line);
-            // 构造样本：[BOS] + tokens + [EOS]
-            std::vector<std::size_t> sample;
-            sample.reserve(line_tokens.size() + 2);
+            if (line_tokens.empty()) continue;
             if (bos_id != nn::Tokenizer::npos)
-                sample.push_back(bos_id);
-            sample.insert(sample.end(), line_tokens.begin(), line_tokens.end());
+                token_flow.push_back(bos_id);
+            token_flow.insert(token_flow.end(), line_tokens.begin(), line_tokens.end());
             if (eos_id != nn::Tokenizer::npos)
-                sample.push_back(eos_id);
-            total_token_count += sample.size();
-            line_samples.push_back(std::move(sample));
+                token_flow.push_back(eos_id);
         }
     }
-    std::cout << "文本行数: " << line_samples.size() << ", "
-              << total_token_count << " tokens (含 BOS/EOS), "
-              << tokenizer->vocab_size() << " 词表\n" << std::endl;
+    // 切窗口：每个窗口 = 一个训练样本（长度 seq_len，末窗不足则 PAD）
+    std::vector<std::size_t> window_offsets;  // 每个窗口在 token_flow 中的起始偏移
+    window_offsets.reserve(token_flow.size() / stride + 1);
+    for (std::size_t pos = 0; pos < token_flow.size(); pos += stride)
+        window_offsets.push_back(pos);
+    std::cout << "文本 token 流: " << token_flow.size() << " tokens (含 BOS/EOS), "
+              << tokenizer->vocab_size() << " 词表\n"
+              << "滑动窗口: seq_len=" << cfg.seq_len << " stride=" << stride
+              << " 样本数=" << window_offsets.size() << "\n" << std::endl;
 
     // ── 打印配置 ─────────────────────────────────────────────
     std::cout << "========================================\n";
@@ -592,7 +636,7 @@ int main(int argc, char *argv[])
         *engine,
         tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
         cfg.num_heads, cfg.d_ff, cfg.num_layers,
-        cfg.pos_encoding);
+        cfg.pos_encoding, cfg.activation, cfg.norm_type);
     if (!model_build) {
         std::cerr << "构建模型失败: " << model_build.error().message << '\n';
         return 1;
@@ -606,7 +650,7 @@ int main(int argc, char *argv[])
     auto spec = nn::make_gpt_spec(
         tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
         cfg.num_heads, cfg.d_ff, cfg.num_layers,
-        cfg.pos_encoding);
+        cfg.pos_encoding, cfg.activation, cfg.norm_type);
 
     if (cfg.load_existing)
     {
@@ -676,28 +720,17 @@ int main(int argc, char *argv[])
     nn::CrossEntropyLoss ce_loss;
 
     // ── 训练循环 ─────────────────────────────────────────────
-    // 每行 = 一个样本。batch 内 batch_size 个样本独立采样。
-    // 每样本截断/PAD 到 seq_len，目标 = 输入左移一位（next-token prediction）。
-    if (line_samples.empty())
+    // 每样本 = 一个 seq_len 滑动窗口（可能跨行），目标 = 输入左移一位。
+    if (window_offsets.empty())
     {
-        std::cerr << "无有效训练样本\n";
+        std::cerr << "无有效训练样本（文本 token 流为空）\n";
         return 1;
     }
-    // 过滤掉长度 < 2 的样本（无法构造 x/y 对）
-    std::vector<const std::vector<std::size_t> *> valid_samples;
-    valid_samples.reserve(line_samples.size());
-    for (const auto &s : line_samples)
-        if (s.size() >= 2) valid_samples.push_back(&s);
-    if (valid_samples.empty())
-    {
-        std::cerr << "无长度 >= 2 的训练样本\n";
-        return 1;
-    }
-    std::cout << "有效样本数: " << valid_samples.size()
-              << " (长度 >= 2)\n" << std::endl;
+    std::cout << "训练窗口样本数: " << window_offsets.size() << "\n" << std::endl;
 
-    // ── 加载测试集（可选） ─────────────────────────────────────
-    std::vector<const std::vector<std::size_t> *> test_samples;
+    // ── 加载测试集（可选，与训练一致的滑动窗口处理） ─────────────
+    std::vector<std::size_t> test_window_offsets;
+    std::vector<std::size_t> test_flow;
     if (!cfg.test_path.empty())
     {
         auto test_text_result = nn::load_text_file(cfg.test_path);
@@ -707,7 +740,6 @@ int main(int argc, char *argv[])
             return 1;
         }
         std::string test_text = std::move(*test_text_result);
-        std::vector<std::vector<std::size_t>> test_line_samples;
         std::size_t test_token_count = 0;
         {
             std::istringstream tiss(test_text);
@@ -720,136 +752,129 @@ int main(int argc, char *argv[])
                 if (tline.empty()) continue;
 
                 auto tl_tokens = tokenizer->encode(tline);
-                std::vector<std::size_t> tsample;
-                tsample.reserve(tl_tokens.size() + 2);
+                if (tl_tokens.empty()) continue;
                 if (bos_id != nn::Tokenizer::npos)
-                    tsample.push_back(bos_id);
-                tsample.insert(tsample.end(), tl_tokens.begin(), tl_tokens.end());
+                    test_flow.push_back(bos_id);
+                test_flow.insert(test_flow.end(), tl_tokens.begin(), tl_tokens.end());
                 if (eos_id != nn::Tokenizer::npos)
-                    tsample.push_back(eos_id);
-                test_token_count += tsample.size();
-                test_line_samples.push_back(std::move(tsample));
+                    test_flow.push_back(eos_id);
+                test_token_count += tl_tokens.size() + 2;
             }
         }
-        for (const auto &s : test_line_samples)
-            if (s.size() >= 2) test_samples.push_back(&s);
-        std::cout << "测试集: " << cfg.test_path << "  样本数: " << test_samples.size()
+        for (std::size_t pos = 0; pos < test_flow.size(); pos += stride)
+            test_window_offsets.push_back(pos);
+        std::cout << "测试集: " << cfg.test_path << "  样本数: " << test_window_offsets.size()
                   << "  tokens: " << test_token_count << std::endl;
     }
 
-    std::size_t steps_per_epoch = valid_samples.size() / cfg.batch_size;
+    // ── 步数与采样：每 epoch 每样本恰好访问一次 ──────────────
+    // steps_per_epoch = ceil(样本数 / batch_size)：最后一个 batch 不满时
+    // 以实际 this_bs 参与训练。由于 loss 已按有效 token 归一化，不满 batch
+    // 的梯度与满 batch 同尺度（每 epoch 仅一个不满 batch，影响可忽略）。
+    std::size_t steps_per_epoch =
+        (window_offsets.size() + cfg.batch_size - 1) / cfg.batch_size;
     if (steps_per_epoch == 0)
     {
-        std::cerr << "有效样本数 (" << valid_samples.size() << ") 小于 batch_size ("
+        std::cerr << "样本数 (" << window_offsets.size() << ") 小于 batch_size ("
                   << cfg.batch_size << ")，请减小 --batch-size 或增大训练语料\n";
         return 1;
     }
 
-    // 改造：每 epoch 开始前 shuffle 样本索引队列，每 step 顺序切片。
-    // 不再每 step 独立随机采样，保证每个样本每 epoch 被访问一次。
+    // ── Step 级学习率配置（step_cosine 模式） ──
+    nn::cli::StepLrScheduleConfig step_lr_cfg;
+    step_lr_cfg.base_lr = cfg.lr;
+    step_lr_cfg.min_lr = cfg.min_lr;
+    step_lr_cfg.warmup_steps = static_cast<int>(cfg.warmup_steps);
+    step_lr_cfg.total_steps =
+        static_cast<int>(steps_per_epoch * static_cast<std::size_t>(cfg.epochs));
+    step_lr_cfg.cosine = true;
+
     std::mt19937_64 rng{42};
-    std::vector<std::size_t> sample_indices(valid_samples.size());
+    std::vector<std::size_t> sample_indices(window_offsets.size());
     for (std::size_t i = 0; i < sample_indices.size(); ++i)
         sample_indices[i] = i;
 
-    // ── 预分配 batch 缓冲区 ───────────────────────────────────
-    // x_tokens: (seq_len, batch_size) 输入 token IDs
-    // y_tokens: (seq_len, batch_size) 目标 token IDs（x 左移一位）
-    // 短行用 pad_id 填充，目标对应位置也用 pad_id
+    // ── 预分配 batch 缓冲区（末批不满时 resize 到实际 this_bs） ──
+    // x_tokens: (seq_len, batch) 输入 token IDs（每窗口一列）
+    // y_tokens: (seq_len, batch) 目标 token IDs（x 左移一位）
+    // 最后一个窗口不足 seq_len 时用 pad_id 填充，目标对应位置也用 pad_id
     nn::Matrix x_tokens(cfg.seq_len, cfg.batch_size);
     nn::Matrix y_tokens(cfg.seq_len, cfg.batch_size);
-    const std::size_t total_tokens = cfg.seq_len * cfg.batch_size;
-    std::vector<std::size_t> flat_targets(total_tokens);
-
-    // ── 对话 loss mask：对话样本中只对 response 部分计算 loss ──────
-    // 与 y_onehot 同维度 (vocab_size, seq_len × batch_size)
-    // 值为 1.0 表示该位置参与 loss，0.0 表示忽略（prompt 部分）
     nn::Matrix loss_mask(cfg.seq_len, cfg.batch_size);
-    const bool has_dialogue = tokenizer->has_dialogue_markers();
-    const std::size_t assistant_mid = has_dialogue ? tokenizer->assistant_marker_id() : nn::Tokenizer::npos;
-
-    // ── 自动调优状态：基于 EMA 预测每步耗时 ──────────────────
-    Scalar avg_time_per_sample = 0;   // 指数移动平均：每样本耗时（秒）
-    std::size_t tune_step_count = 0;  // 已完成的 step 计数（用于预热判断）
+    std::vector<std::size_t> flat_targets(cfg.seq_len * cfg.batch_size);
 
     auto t_start = std::chrono::steady_clock::now();
 
     for (int epoch = 0; epoch < cfg.epochs; ++epoch)
     {
-        // ── 学习率调度：每 epoch 开始时调整 ──
-        Scalar epoch_lr = nn::cli::compute_epoch_lr(lr_sched_cfg, epoch);
-        if (epoch_lr != optimizer_current_lr)
+        // ── 学习率调度：每 epoch 开始时调整（step_cosine 由 step 级调度接管） ──
+        if (cfg.lr_schedule != "step_cosine")
         {
-            optimizer->set_lr(epoch_lr);
-            optimizer_current_lr = epoch_lr;
+            Scalar epoch_lr = nn::cli::compute_epoch_lr(lr_sched_cfg, epoch);
+            if (epoch_lr != optimizer_current_lr)
+            {
+                optimizer->set_lr(epoch_lr);
+                optimizer_current_lr = epoch_lr;
+            }
         }
 
         auto ep_start = std::chrono::steady_clock::now();
-        Scalar total_loss = 0.0;
+        Scalar total_weighted = 0.0;  // Σ(loss × 有效token)，用于按 token 加权平均
+        std::size_t total_valid = 0;  // 累计有效 token 数
 
         // 每个 epoch 开始前 shuffle 样本索引队列
         std::shuffle(sample_indices.begin(), sample_indices.end(), rng);
 
+        // 梯度累积：距上次参数更新的步数（每 accum_steps 步更新一次）
+        std::size_t steps_since_update = 0;
+
         for (std::size_t step = 0; step < steps_per_epoch; ++step)
         {
-            auto step_start = std::chrono::steady_clock::now();
-
-            // ── 采样 batch：每样本是一行 ─────────────────────
-            // 改造：按 shuffle 后的顺序切片取 batch_size 个样本，
-            // 不再独立随机采样，保证每 epoch 样本不重复访问
-            for (std::size_t b = 0; b < cfg.batch_size; ++b)
+            // ── step 级学习率：每个训练步更新（step_cosine 模式） ──
+            if (cfg.lr_schedule == "step_cosine")
             {
-                const auto &sample = *valid_samples[sample_indices[step * cfg.batch_size + b]];
-                const std::size_t sample_len = sample.size();
+                const int global_step =
+                    static_cast<int>(epoch) * static_cast<int>(steps_per_epoch) +
+                    static_cast<int>(step);
+                Scalar step_lr = nn::cli::compute_step_lr(step_lr_cfg, global_step);
+                if (step_lr != optimizer_current_lr)
+                {
+                    optimizer->set_lr(step_lr);
+                    optimizer_current_lr = step_lr;
+                }
+            }
 
-                // 填充 x_tokens 和 y_tokens
-                // x[t] = sample[t], y[t] = sample[t+1]（next-token prediction）
-                // 样本长度 > seq_len+1: 截断到 seq_len+1（取前 seq_len+1 个 token）
-                // 样本长度 <= seq_len:  不足部分用 pad_id 填充
+            // ── 采样 batch：每样本 = 一个滑动窗口 ─────────────
+            // 按 shuffle 后的顺序切片取 this_bs 个窗口（末批可能不满）。
+            // 每 epoch 每样本恰好访问一次。
+            const std::size_t offset = step * cfg.batch_size;
+            const std::size_t this_bs = std::min(cfg.batch_size, window_offsets.size() - offset);
+            if (x_tokens.cols() != this_bs)
+            {
+                x_tokens.resize(cfg.seq_len, this_bs);
+                y_tokens.resize(cfg.seq_len, this_bs);
+                loss_mask.resize(cfg.seq_len, this_bs);
+                flat_targets.resize(cfg.seq_len * this_bs);
+            }
+            std::size_t step_valid = 0;  // 本 step 参与 loss 的有效 token 数
+
+            for (std::size_t b = 0; b < this_bs; ++b)
+            {
+                const std::size_t win_pos = window_offsets[sample_indices[offset + b]];
+                // 窗口有效长度：不超过 token_flow 末尾时为 seq_len，
+                // 否则为剩余 token 数（最后一个窗口，PAD 位置被屏蔽）
+                const std::size_t win_len = std::min(cfg.seq_len, token_flow.size() - win_pos);
+
+                // 填充 x/y/mask：x[t] = flow[win_pos+t], y[t] = flow[win_pos+t+1]
                 for (std::size_t t = 0; t < cfg.seq_len; ++t)
                 {
-                    const std::size_t x_id = (t < sample_len) ? sample[t] : pad_id;
-                    const std::size_t y_id = (t + 1 < sample_len) ? sample[t + 1] : pad_id;
+                    const std::size_t x_id = (t < win_len) ? token_flow[win_pos + t] : pad_id;
+                    const std::size_t y_id = (t + 1 < win_len) ? token_flow[win_pos + t + 1] : pad_id;
                     x_tokens.set_value_unchecked(t, b, static_cast<Scalar>(x_id));
                     y_tokens.set_value_unchecked(t, b, static_cast<Scalar>(y_id));
-                }
-
-                // ── 对话 loss mask：找到 assistant 标记位置 ──────
-                // 对于对话样本，只有 assistant 标记之后的 response 部分参与 loss
-                // 对于非对话样本（纯文本），只对真实 token 位置计算 loss，屏蔽 padding
-                if (has_dialogue)
-                {
-                    std::size_t resp_start = 0;  // 0 = 整个样本都参与（非对话模式）
-                    if (assistant_mid != nn::Tokenizer::npos)
-                    {
-                        // 在样本中找 assistant 标记
-                        for (std::size_t t = 0; t < sample_len; ++t)
-                        {
-                            if (sample[t] == assistant_mid)
-                            {
-                                resp_start = t + 1;  // assistant 标记之后的 token 才是 response
-                                break;
-                            }
-                        }
-                    }
-                    for (std::size_t t = 0; t < cfg.seq_len; ++t)
-                    {
-                        // y[t] = sample[t+1]，只有当 t+1 >= resp_start 时才参与 loss
-                        // 即 t >= resp_start - 1（当 resp_start > 0 时）
-                        const bool is_response = (resp_start == 0 || t + 1 >= resp_start);
-                        const bool has_target = (t + 1 < sample_len);
-                        loss_mask.set_value_unchecked(t, b,
-                            (is_response && has_target) ? 1.0f : 0.0f);
-                    }
-                }
-                else
-                {
-                    // 非对话模式：屏蔽 padding 位置，只对真实 token 计算 loss
-                    for (std::size_t t = 0; t < cfg.seq_len; ++t)
-                    {
-                        loss_mask.set_value_unchecked(t, b,
-                            (t + 1 < sample_len) ? 1.0f : 0.0f);
-                    }
+                    const bool participate = (t + 1 < win_len);
+                    loss_mask.set_value_unchecked(t, b, participate ? 1.0f : 0.0f);
+                    if (participate) ++step_valid;
                 }
             }
 
@@ -860,12 +885,12 @@ int main(int argc, char *argv[])
                 return 1;
             }
 
-            // ── 构造平坦标签 ────────────────────────────────
+            // ── 构造平坦标签（与 logits 列序一致：t×batch + b） ──
             auto y_span = y_tokens.span();
             for (std::size_t t = 0; t < cfg.seq_len; ++t)
-                for (std::size_t b = 0; b < cfg.batch_size; ++b)
-                    flat_targets[t * cfg.batch_size + b] =
-                        static_cast<std::size_t>(y_span[t * cfg.batch_size + b]);
+                for (std::size_t b = 0; b < this_bs; ++b)
+                    flat_targets[t * this_bs + b] =
+                        static_cast<std::size_t>(y_span[t * this_bs + b]);
 
             // ── 启用 GPU batch 录制 ─────────────────────────
             // 整个 forward + backward + optimizer step 录制到一个 command buffer，
@@ -889,7 +914,8 @@ int main(int argc, char *argv[])
                 *engine, logits, flat_targets, mask_span, tokenizer->vocab_size());
             if (!loss_result) { std::cerr << "Error: " << loss_result.error().message << '\n'; return 1; }
             Scalar loss = *loss_result;
-            total_loss += loss;
+            total_weighted += loss * step_valid;        // 按有效 token 加权
+            total_valid += step_valid;
 
             // ── 中点刷新：提交 forward+loss，拆分为两次 GPU 提交 ──
             // 大词表 + 长序列时 forward+backward 单次提交可能触发 TDR 超时。
@@ -932,47 +958,59 @@ int main(int argc, char *argv[])
                 return 1;
             }
 
-            // ── 梯度裁剪（在 step() 之前，backward() 之后） ──
-            if (cfg.max_norm > 0)
+            // ── 梯度累积：每 accum_steps 步才更新一次参数 ──
+            // forward+backward 每步都执行（梯度累加到参数梯度），
+            // 梯度裁剪/step/zero_grad 仅在累积到 accum_steps 或 epoch 末尾执行。
+            ++steps_since_update;
+            const bool do_update =
+                (steps_since_update >= cfg.accum_steps) || (step + 1 == steps_per_epoch);
+
+            if (do_update)
             {
-                auto clip_r = optimizer->clip_grad_norm(cfg.max_norm);
-                if (!clip_r) {
-                    std::cerr << "\n梯度裁剪失败: " << clip_r.error().message << '\n';
+                // ── 梯度裁剪（在 step() 之前，backward() 之后） ──
+                if (cfg.max_norm > 0)
+                {
+                    auto clip_r = optimizer->clip_grad_norm(cfg.max_norm);
+                    if (!clip_r) {
+                        std::cerr << "\n梯度裁剪失败: " << clip_r.error().message << '\n';
+                        return 1;
+                    }
+                }
+
+                auto opt_begin = engine->begin_batch();
+                if (!opt_begin) {
+                    std::cerr << "begin_batch (optimizer) failed: " << opt_begin.error().message << '\n';
                     return 1;
                 }
-            }
 
-            auto opt_begin = engine->begin_batch();
-            if (!opt_begin) {
-                std::cerr << "begin_batch (optimizer) failed: " << opt_begin.error().message << '\n';
-                return 1;
-            }
+                // ── 优化器 step + 梯度清零 ──
+                auto step_result = optimizer->step();
+                if (!step_result) {
+                    std::cerr << "Error: " << step_result.error().message << '\n';
+                    return 1;
+                }
 
-            // ── 优化器 step + 梯度清零 ──
-            auto step_result = optimizer->step();
-            if (!step_result) {
-                std::cerr << "Error: " << step_result.error().message << '\n';
-                return 1;
-            }
+                // ── 梯度统计（step 后、zero_grad 前） ──
+                if (cfg.grad_log && ((step + 1) % cfg.log_interval == 0 || step + 1 == steps_per_epoch))
+                {
+                    std::cout << "\n  [grad] step " << step + 1 << ":" << std::endl;
+                    log_gradient_stats(*engine, model.param_gradients());
+                }
 
-            // ── 梯度统计（step 后、zero_grad 前） ──
-            if (cfg.grad_log && ((step + 1) % cfg.log_interval == 0 || step + 1 == steps_per_epoch))
-            {
-                std::cout << "\n  [grad] step " << step + 1 << ":" << std::endl;
-                log_gradient_stats(*engine, model.param_gradients());
-            }
+                auto zero_result = optimizer->zero_grad();
+                if (!zero_result) {
+                    std::cerr << "\n优化器 zero_grad 失败: " << zero_result.error().message << '\n';
+                    return 1;
+                }
 
-            auto zero_result = optimizer->zero_grad();
-            if (!zero_result) {
-                std::cerr << "\n优化器 zero_grad 失败: " << zero_result.error().message << '\n';
-                return 1;
-            }
+                // ── 提交 batch：一次 vkQueueSubmit + vkWaitForFences ──
+                auto end_r = engine->end_batch();
+                if (!end_r) {
+                    std::cerr << "end_batch (optimizer) failed: " << end_r.error().message << '\n';
+                    return 1;
+                }
 
-            // ── 提交 batch：一次 vkQueueSubmit + vkWaitForFences ──
-            auto end_r = engine->end_batch();
-            if (!end_r) {
-                std::cerr << "end_batch (optimizer) failed: " << end_r.error().message << '\n';
-                return 1;
+                steps_since_update = 0;
             }
 
             // ── 定期保存 checkpoint（独立于 log_interval） ──
@@ -983,50 +1021,7 @@ int main(int argc, char *argv[])
                     std::cerr << "\n  [ckpt] 保存失败: " << save_r.error().message << "\n";
             }
 
-            // ── 自动调优：基于 EMA 预测耗时，主动降 batch ──
-            auto step_end = std::chrono::steady_clock::now();
-            Scalar step_sec = std::chrono::duration<Scalar>(step_end - step_start).count();
-            if (cfg.auto_tune && step_sec > 0 && cfg.batch_size > 1)
-            {
-                // 更新每样本耗时的指数移动平均
-                Scalar time_per_sample = step_sec / static_cast<Scalar>(cfg.batch_size);
-                if (tune_step_count == 0)
-                    avg_time_per_sample = time_per_sample;
-                else
-                    avg_time_per_sample = cfg.tune_ema_decay * avg_time_per_sample
-                                        + (1 - cfg.tune_ema_decay) * time_per_sample;
-                ++tune_step_count;
-
-                // 预热期结束后，预测下一步是否超限并主动降 batch
-                if (tune_step_count >= cfg.tune_warmup_steps)
-                {
-                    Scalar predicted = avg_time_per_sample * static_cast<Scalar>(cfg.batch_size);
-                    // 留 20% 安全余量
-                    Scalar safe_limit = cfg.step_time_limit * 0.8f;
-                    if (predicted > safe_limit && cfg.batch_size > 1)
-                    {
-                        auto new_bs = std::max<std::size_t>(1, cfg.batch_size / 2);
-                        if (new_bs < cfg.batch_size)
-                        {
-                            cfg.batch_size = new_bs;
-                            std::cout << "\n  [auto-tune] 预测 step 耗时 "
-                                      << std::fixed << std::setprecision(2) << predicted
-                                      << "s > " << safe_limit << "s (限 " << cfg.step_time_limit
-                                      << "s), batch_size → " << cfg.batch_size
-                                      << "  (每样本 " << std::setprecision(4) << avg_time_per_sample << "s)\n";
-                            x_tokens = nn::Matrix(cfg.seq_len, cfg.batch_size);
-                            y_tokens = nn::Matrix(cfg.seq_len, cfg.batch_size);
-                            loss_mask = nn::Matrix(cfg.seq_len, cfg.batch_size);
-                            flat_targets.resize(cfg.seq_len * cfg.batch_size);
-                            steps_per_epoch = valid_samples.size() / cfg.batch_size;
-                            --step;
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            // 进度显示
+            // ── 进度显示
             if ((step + 1) % cfg.log_interval == 0 || step + 1 == steps_per_epoch)
             {
                 std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
@@ -1038,87 +1033,53 @@ int main(int argc, char *argv[])
 
         auto ep_end = std::chrono::steady_clock::now();
         Scalar ep_sec = std::chrono::duration<Scalar>(ep_end - ep_start).count();
-        Scalar avg_loss = total_loss / steps_per_epoch;
+        // 按有效 token 加权平均（等价于全局 per-token 平均），
+        // 避免"有效 token 少的 batch"拉偏 epoch loss 报告
+        Scalar avg_loss = (total_valid > 0)
+            ? total_weighted / static_cast<Scalar>(total_valid)
+            : Scalar{0};
 
         std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
                   << "  lr=" << std::scientific << std::setprecision(4) << optimizer_current_lr
                   << "  avg_loss=" << std::fixed << std::setprecision(4) << avg_loss
                   << "  time=" << std::setprecision(1) << ep_sec << "s";
 
-        // ── 测试集评估（可选） ─────────────────────────────────
-        if (!test_samples.empty())
+        // ── 测试集评估（可选，与训练一致的滑动窗口） ─────────────
+        if (!test_window_offsets.empty())
         {
-            Scalar test_total_loss = 0.0;
-            std::size_t test_steps = 0;
-            const std::size_t test_bs = std::min(cfg.batch_size, test_samples.size());
-            const std::size_t test_steps_per_epoch = (test_samples.size() + test_bs - 1) / test_bs;
+            Scalar test_total_weighted = 0.0;
+            std::size_t test_total_valid = 0;
+            const std::size_t test_bs = std::min(cfg.batch_size, test_window_offsets.size());
+            const std::size_t test_steps_per_epoch =
+                (test_window_offsets.size() + test_bs - 1) / test_bs;
 
             for (std::size_t tstep = 0; tstep < test_steps_per_epoch; ++tstep)
             {
-                const std::size_t offset = tstep * test_bs;
-                const std::size_t this_bs = std::min(test_bs, test_samples.size() - offset);
+                const std::size_t toffset = tstep * test_bs;
+                const std::size_t this_bs = std::min(test_bs, test_window_offsets.size() - toffset);
+                if (x_tokens.cols() != this_bs)
+                {
+                    x_tokens.resize(cfg.seq_len, this_bs);
+                    y_tokens.resize(cfg.seq_len, this_bs);
+                    loss_mask.resize(cfg.seq_len, this_bs);
+                    flat_targets.resize(cfg.seq_len * this_bs);
+                }
 
-                // 填充 batch
+                // 填充 batch（与训练一致：末窗不足时 PAD 并屏蔽）
+                std::size_t test_valid = 0;
                 for (std::size_t b = 0; b < this_bs; ++b)
                 {
-                    const auto &toks = *test_samples[offset + b];
-                    std::size_t copy_len = std::min(toks.size(), cfg.seq_len);
-
+                    const std::size_t win_pos = test_window_offsets[toffset + b];
+                    const std::size_t win_len = std::min(cfg.seq_len, test_flow.size() - win_pos);
                     for (std::size_t t = 0; t < cfg.seq_len; ++t)
                     {
-                        if (t < copy_len)
-                        {
-                            x_tokens.set_value(t, b, static_cast<Scalar>(toks[t]));
-                            y_tokens.set_value(t, b, (t + 1 < copy_len)
-                                ? static_cast<Scalar>(toks[t + 1]) : static_cast<Scalar>(pad_id));
-                        }
-                        else
-                        {
-                            x_tokens.set_value(t, b, static_cast<Scalar>(pad_id));
-                            y_tokens.set_value(t, b, static_cast<Scalar>(pad_id));
-                        }
-                    }
-                }
-                // 未使用的列清零
-                for (std::size_t b = this_bs; b < cfg.batch_size; ++b)
-                    for (std::size_t t = 0; t < cfg.seq_len; ++t)
-                    {
-                        x_tokens.set_value(t, b, static_cast<Scalar>(pad_id));
-                        y_tokens.set_value(t, b, static_cast<Scalar>(pad_id));
-                    }
-
-                // 对话 loss mask（测试时同样处理）
-                if (has_dialogue)
-                {
-                    for (std::size_t b = 0; b < cfg.batch_size; ++b)
-                    {
-                        std::size_t resp_start = 0;
-                        if (b < this_bs && assistant_mid != nn::Tokenizer::npos)
-                        {
-                            const auto &toks = *test_samples[offset + b];
-                            std::size_t copy_len = std::min(toks.size(), cfg.seq_len);
-                            for (std::size_t t = 0; t < copy_len; ++t)
-                            {
-                                if (toks[t] == assistant_mid) { resp_start = t + 1; break; }
-                            }
-                        }
-                        for (std::size_t t = 0; t < cfg.seq_len; ++t)
-                        {
-                            const bool is_response = (resp_start == 0 || t + 1 >= resp_start);
-                            const bool has_target = (b < this_bs && t + 1 < std::min((*test_samples[offset + b]).size(), cfg.seq_len));
-                            loss_mask.set_value(t, b, (is_response && has_target) ? 1.0f : 0.0f);
-                        }
-                    }
-                }
-                else
-                {
-                    for (std::size_t b = 0; b < cfg.batch_size; ++b)
-                    {
-                        const std::size_t sample_len = (b < this_bs)
-                            ? std::min((*test_samples[offset + b]).size(), cfg.seq_len + 1)
-                            : 0;
-                        for (std::size_t t = 0; t < cfg.seq_len; ++t)
-                            loss_mask.set_value(t, b, (t + 1 < sample_len) ? 1.0f : 0.0f);
+                        const std::size_t x_id = (t < win_len) ? test_flow[win_pos + t] : pad_id;
+                        const std::size_t y_id = (t + 1 < win_len) ? test_flow[win_pos + t + 1] : pad_id;
+                        x_tokens.set_value(t, b, static_cast<Scalar>(x_id));
+                        y_tokens.set_value(t, b, static_cast<Scalar>(y_id));
+                        const bool participate = (t + 1 < win_len);
+                        loss_mask.set_value(t, b, participate ? 1.0f : 0.0f);
+                        if (participate) ++test_valid;
                     }
                 }
 
@@ -1126,12 +1087,12 @@ int main(int argc, char *argv[])
                 auto x_tensor_r = engine->from_matrix(x_tokens);
                 if (!x_tensor_r) { std::cerr << "  测试 from_matrix 失败: " << x_tensor_r.error().message << '\n'; break; }
 
-                // 构建 flat_targets
+                // 构建 flat_targets（与 logits 列序一致：t×batch + b）
                 auto y_span = y_tokens.span();
                 for (std::size_t t = 0; t < cfg.seq_len; ++t)
-                    for (std::size_t b = 0; b < cfg.batch_size; ++b)
-                        flat_targets[t * cfg.batch_size + b] =
-                            static_cast<std::size_t>(y_span[t * cfg.batch_size + b]);
+                    for (std::size_t b = 0; b < this_bs; ++b)
+                        flat_targets[t * this_bs + b] =
+                            static_cast<std::size_t>(y_span[t * this_bs + b]);
 
                 auto begin_r = engine->begin_batch();
                 if (!begin_r) { std::cerr << "  测试 begin_batch 失败: " << begin_r.error().message << '\n'; break; }
@@ -1148,13 +1109,14 @@ int main(int argc, char *argv[])
                 if (!loss_result) { std::cerr << "  测试评估出错: " << loss_result.error().message << '\n'; break; }
                 Scalar batch_loss = *loss_result;
 
-                // 加权平均：最后一个 batch 可能不满
-                Scalar weight = static_cast<Scalar>(this_bs) / static_cast<Scalar>(test_bs);
-                test_total_loss += batch_loss * weight;
-                ++test_steps;
+                // 按有效 token 加权（与训练端 per-token 平均一致）
+                test_total_weighted += batch_loss * static_cast<Scalar>(test_valid);
+                test_total_valid += test_valid;
             }
 
-            Scalar test_avg_loss = (test_steps > 0) ? test_total_loss / test_steps : 0.0;
+            Scalar test_avg_loss = (test_total_valid > 0)
+                ? test_total_weighted / static_cast<Scalar>(test_total_valid)
+                : Scalar{0};
             std::cout << "  test_loss=" << std::fixed << std::setprecision(4) << test_avg_loss;
         }
 

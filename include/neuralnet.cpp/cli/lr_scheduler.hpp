@@ -67,4 +67,50 @@ namespace nn::cli
 
         return cfg.base_lr;  // fixed / constant
     }
+
+    // ── Step 级学习率调度配置 ────────────────────────────────────────────
+    // 与 epoch 级调度互补：epoch 级在大量步数（如 TinyStories 60MB 每 epoch
+    // 数千步）下粒度太粗，step 级可按单个训练步做 warmup + 余弦退火。
+    struct StepLrScheduleConfig
+    {
+        nn::Scalar base_lr = 0.001f;   // 峰值学习率
+        nn::Scalar min_lr = 0.0f;      // 余弦退火最低学习率
+        int warmup_steps = 0;          // 线性预热步数（0 = 不预热）
+        int total_steps = 1;           // 总训练步数（用于 cosine 进度）
+        bool cosine = false;           // true: 预热后余弦退火到 min_lr；
+                                       // false: 预热后保持 base_lr
+    };
+
+    // ── 计算第 step 步的学习率（step 为 0-based 全局步号） ──────────────
+    // 预热阶段：base_lr * (step+1)/warmup_steps（线性上升）
+    // 预热后：
+    //   cosine=true → 标准余弦退火到 min_lr
+    //   cosine=false → 保持 base_lr
+    [[nodiscard]] inline nn::Scalar compute_step_lr(const StepLrScheduleConfig &cfg, int step)
+    {
+        const nn::Scalar max_lr = cfg.base_lr;
+
+        // 线性预热
+        if (cfg.warmup_steps > 0 && step < cfg.warmup_steps)
+        {
+            return max_lr * static_cast<nn::Scalar>(step + 1) /
+                   static_cast<nn::Scalar>(cfg.warmup_steps);
+        }
+
+        // 余弦退火（标准形式 0.5*(1+cos(π*progress))）
+        if (cfg.cosine)
+        {
+            const int cosine_steps = cfg.total_steps - cfg.warmup_steps;
+            if (cosine_steps <= 0) return max_lr;
+            const nn::Scalar progress =
+                static_cast<nn::Scalar>(step - cfg.warmup_steps) /
+                static_cast<nn::Scalar>(cosine_steps);
+            const nn::Scalar p =
+                progress < 0 ? nn::Scalar{0} : (progress > 1 ? nn::Scalar{1} : progress);
+            return cfg.min_lr + 0.5f * (max_lr - cfg.min_lr) *
+                                    (1.0f + std::cos(3.14159265358979323846f * p));
+        }
+
+        return max_lr;  // 预热后恒定
+    }
 } // namespace nn::cli

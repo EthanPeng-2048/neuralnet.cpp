@@ -37,6 +37,8 @@ struct GptConfig {
     std::size_t d_ff        = GPT_D_FF;
     std::size_t num_layers  = GPT_NUM_LAYERS;
     PosEncodingType pos_enc = PosEncodingType::Learned;
+    ActivationType activation = ActivationType::GeLU;
+    NormType norm_type = NormType::LayerNorm;
 };
 
 // ── 构建 GPT 模型（GptConfig 版本，推荐使用） ────────────────────────────
@@ -55,7 +57,8 @@ struct GptConfig {
 
     Model model(engine);
     model.add<GPTModel>(engine, cfg.vocab_size, cfg.d_model, cfg.seq_len,
-                        cfg.num_heads, cfg.d_ff, cfg.num_layers, cfg.pos_enc);
+                        cfg.num_heads, cfg.d_ff, cfg.num_layers, cfg.pos_enc,
+                        cfg.activation, cfg.norm_type);
     return model;
 }
 
@@ -68,10 +71,13 @@ struct GptConfig {
     std::size_t num_heads   = GPT_NUM_HEADS,
     std::size_t d_ff        = GPT_D_FF,
     std::size_t num_layers  = GPT_NUM_LAYERS,
-    PosEncodingType pos_enc_type = PosEncodingType::Learned)
+    PosEncodingType pos_enc_type = PosEncodingType::Learned,
+    ActivationType activation = ActivationType::GeLU,
+    NormType norm_type = NormType::LayerNorm)
 {
     return build_gpt_model(engine, GptConfig{
-        vocab_size, d_model, seq_len, num_heads, d_ff, num_layers, pos_enc_type});
+        vocab_size, d_model, seq_len, num_heads, d_ff, num_layers,
+        pos_enc_type, activation, norm_type});
 }
 
 // ── 从 ModelSpec 构建 GPT 模型 ──────────────────────────────────────────
@@ -89,7 +95,7 @@ struct GptConfig {
         engine,
         spec.vocab_size, spec.d_model, spec.seq_len,
         spec.num_heads, spec.d_ff, spec.num_layers,
-        spec.pos_encoding);
+        spec.pos_encoding, spec.activation, spec.norm_type);
 }
 
 // ── 构造 GPT ModelSpec ──────────────────────────────────────────────────
@@ -100,7 +106,9 @@ struct GptConfig {
     std::size_t num_heads,
     std::size_t d_ff,
     std::size_t num_layers,
-    PosEncodingType pos_encoding = PosEncodingType::Learned)
+    PosEncodingType pos_encoding = PosEncodingType::Learned,
+    ActivationType activation = ActivationType::GeLU,
+    NormType norm_type = NormType::LayerNorm)
 {
     ModelSpec spec;
     spec.type         = ModelType::GPT;
@@ -111,6 +119,8 @@ struct GptConfig {
     spec.d_ff         = d_ff;
     spec.num_layers   = num_layers;
     spec.pos_encoding = pos_encoding;
+    spec.activation   = activation;
+    spec.norm_type    = norm_type;
     return spec;
 }
 

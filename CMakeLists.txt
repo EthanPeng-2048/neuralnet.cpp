@@ -71,6 +71,12 @@ nn_add_executable(gpu_test src/gpu_test.cpp)
 # ── Attention 一致性验证（forward vs forward_step）──────────────────────
 nn_add_executable(attn_consistency_test src/attn_consistency_test.cpp)
 
+# ── SwiGLU 数值梯度检查（gradcheck，验证 split/merge 反向正确性）──────────
+nn_add_executable(swiglu_gradcheck src/swiglu_gradcheck.cpp)
+
+# ── RMSNorm 数值梯度检查（gradcheck，验证 gamma/输入梯度） ───────────────
+nn_add_executable(rmsnorm_gradcheck src/rmsnorm_gradcheck.cpp)
+
 # ── Vulkan GPU 加速（可选） ────────────────────────────────────────────────
 find_package(Vulkan QUIET)
 if(Vulkan_FOUND)
@@ -146,6 +152,8 @@ if(Vulkan_FOUND)
             tokenizer_train tokenizer_infer
             compute_bench bench_thresholds gpu_test
             attn_consistency_test
+            swiglu_gradcheck
+            rmsnorm_gradcheck
         )
 
         foreach(TARGET ${NN_GPU_TARGETS})
@@ -189,6 +197,8 @@ if(NN_ENABLE_CUDA)
                 tokenizer_train tokenizer_infer
                 compute_bench bench_thresholds gpu_test
                 attn_consistency_test
+                swiglu_gradcheck
+                rmsnorm_gradcheck
             )
 
             foreach(TARGET ${NN_CUDA_TARGETS})

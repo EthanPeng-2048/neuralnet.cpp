@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <random>
 #include <vector>
 
@@ -328,6 +329,112 @@ public:
 };
 
 // ══════════════════════════════════════════════════════════════════════════
+// SwiGLU — Swish-Gated Linear Unit（LLaMA/Mistral 风格 FFN 激活）
+//
+// 算法（只在此处，不在 Engine/Shader）：
+//   forward:  输入 (2*d_ff, batch)，前 d_ff 行为 gate，后 d_ff 行为 up
+//             gate = slice_rows(x, 0, d_ff)
+//             up   = slice_rows(x, d_ff, d_ff)
+//             sw = SiLU(gate) = gate * sigmoid(gate)
+//             out = sw ⊙ up                       → (d_ff, batch)
+//   backward: grad_up   = grad_out ⊙ sw
+//             grad_sw   = grad_out ⊙ up
+//             grad_gate = grad_sw * (σ(g) + g*σ(g)*(1-σ(g)))
+//             grad_input 把 grad_gate 写回行 [0, d_ff)、grad_up 写回 [d_ff, 2*d_ff)
+//
+// 原语分解（Engine/Shader 只知道标量原语）：
+//   SiLU forward:  Neg → Exp → Add(1) → Div(1/x) → Mul(x*s)
+//   SiLU backward: Sub → Mul → Mul → Add → Mul
+//   split/merge 用 slice_rows / insert_rows
+// ══════════════════════════════════════════════════════════════════════════
+class SwiGLU final : public Layer
+{
+private:
+    std::size_t d_ff_ = 0;
+    Tensor gate_cache_;    // (d_ff, batch)
+    Tensor sigmoid_cache_; // σ(gate) (d_ff, batch)
+    Tensor up_cache_;      // (d_ff, batch)
+
+public:
+    SwiGLU() = default;
+    explicit SwiGLU(std::size_t d_ff) : d_ff_(d_ff) {}
+
+    // ── forward: out = SiLU(gate) ⊙ up ────────────────────────────────────
+    [[nodiscard]] Result<Tensor> forward(
+        ComputeEngine& engine, const Tensor& input) override
+    {
+        // gate = 前 d_ff 行，up = 后 d_ff 行
+        auto gate = engine.slice_rows(input, 0, d_ff_);
+        if (!gate) return std::unexpected(gate.error());
+        auto up = engine.slice_rows(input, d_ff_, d_ff_);
+        if (!up) return std::unexpected(up.error());
+
+        // s = sigmoid(gate) = 1 / (1 + exp(-gate))
+        auto t1 = engine.elementwise_unary(UnaryOp::Neg, *gate);
+        if (!t1) return std::unexpected(t1.error());
+        auto t2 = engine.elementwise_unary(UnaryOp::Exp, *t1);
+        if (!t2) return std::unexpected(t2.error());
+        auto t3 = engine.elementwise_binary_scalar(BinaryOp::Add, *t2, Scalar{1});
+        if (!t3) return std::unexpected(t3.error());
+        auto s = engine.elementwise_binary_scalar(BinaryOp::Div, *t3, Scalar{1}, true);
+        if (!s) return std::unexpected(s.error());
+
+        gate_cache_ = *gate;
+        sigmoid_cache_ = *s;
+        up_cache_ = *up;
+
+        // sw = gate * s，out = sw ⊙ up
+        auto sw = engine.elementwise_binary(BinaryOp::Mul, *gate, *s);
+        if (!sw) return std::unexpected(sw.error());
+        return engine.elementwise_binary(BinaryOp::Mul, *sw, *up);
+    }
+
+    // ── backward: 分解出 grad_gate / grad_up 并合并回 (2*d_ff, batch) ──────
+    [[nodiscard]] Result<Tensor> backward(
+        ComputeEngine& engine, const Tensor& grad_output) override
+    {
+        // grad_up = grad_out ⊙ sw，其中 sw = gate*s
+        auto sw = engine.elementwise_binary(BinaryOp::Mul, gate_cache_, sigmoid_cache_);
+        if (!sw) return std::unexpected(sw.error());
+        auto grad_up = engine.elementwise_binary(BinaryOp::Mul, grad_output, *sw);
+        if (!grad_up) return std::unexpected(grad_up.error());
+
+        // grad_sw = grad_out ⊙ up
+        auto grad_sw = engine.elementwise_binary(BinaryOp::Mul, grad_output, up_cache_);
+        if (!grad_sw) return std::unexpected(grad_sw.error());
+
+        // grad_gate = grad_sw * (σ(g) + g*σ(g)*(1-σ(g)))
+        //   one_minus_s = 1 - s
+        auto one_minus_s = engine.elementwise_binary_scalar(
+            BinaryOp::Sub, sigmoid_cache_, Scalar{1}, true);
+        if (!one_minus_s) return std::unexpected(one_minus_s.error());
+        //   g_oms = gate * (1-s)
+        auto g_oms = engine.elementwise_binary(BinaryOp::Mul, gate_cache_, *one_minus_s);
+        if (!g_oms) return std::unexpected(g_oms.error());
+        //   s_goms = s * g_oms
+        auto s_goms = engine.elementwise_binary(BinaryOp::Mul, sigmoid_cache_, *g_oms);
+        if (!s_goms) return std::unexpected(s_goms.error());
+        //   factor = s + s_goms
+        auto factor = engine.elementwise_binary(BinaryOp::Add, sigmoid_cache_, *s_goms);
+        if (!factor) return std::unexpected(factor.error());
+        //   grad_gate = grad_sw * factor
+        auto grad_gate = engine.elementwise_binary(BinaryOp::Mul, *grad_sw, *factor);
+        if (!grad_gate) return std::unexpected(grad_gate.error());
+
+        // 合并：grad_input = (grad_gate; grad_up) → (2*d_ff, batch)
+        auto grad_input = engine.create_tensor(2 * d_ff_, grad_output.cols());
+        auto r1 = engine.zero(grad_input);
+        if (!r1) return std::unexpected(r1.error());
+        auto r2 = engine.insert_rows(grad_input, 0, *grad_gate);
+        if (!r2) return std::unexpected(r2.error());
+        auto r3 = engine.insert_rows(grad_input, d_ff_, *grad_up);
+        if (!r3) return std::unexpected(r3.error());
+
+        return grad_input;
+    }
+};
+
+// ══════════════════════════════════════════════════════════════════════════
 // LayerNorm — 层归一化
 //
 // 算法（只在此处，不在 Engine/Shader）：
@@ -525,6 +632,166 @@ public:
         return t2_neg;
     }
 };
+
+// ══════════════════════════════════════════════════════════════════════════
+// RMSNorm — Root Mean Square 归一化（LLaMA/Mistral 风格）
+//
+// 与 LayerNorm 的差异：不减去均值、无 beta 偏置，只按均方根归一化。
+// 每层少 2 次列归约 + 1 次广播，计算量更小，训练更稳。
+//
+// 算法（只在此处，不在 Engine/Shader）：
+//   forward:  mean_sq = (1/F) * Σ_f x²             (elementwise Mul + col_reduce_sum + scale)
+//             rms_inv = 1 / sqrt(mean_sq + eps)    (binary_scalar Add + unary Rsqrt)
+//             normed  = x * rms_inv                (broadcast_col Mul)
+//             out     = normed * gamma             (broadcast_row Mul)
+//   backward: gy       = grad_out * gamma          (broadcast_row Mul)
+//             gy_norm  = gy ⊙ normed               (elementwise Mul)
+//             m        = (1/F) * Σ_f gy_norm       (col_reduce_sum + scale)
+//             grad_x   = (gy - m*normed) * rms_inv (broadcast_col Mul + Sub + Mul)
+//             grad_gamma += row_reduce_sum(gy_norm) (row_reduce_sum)
+// ══════════════════════════════════════════════════════════════════════════
+class RMSNorm final : public Layer
+{
+private:
+    std::size_t normalized_shape_;
+    Scalar epsilon_;
+
+    Tensor gamma_;        // (normalized_shape, 1)
+    Tensor grad_gamma_;
+
+    // backward 缓存
+    Tensor normed_cache_;   // (features, batch)
+    Tensor rms_inv_cache_;  // (1, batch)
+
+    static constexpr Scalar EPSILON = 1e-5;
+
+public:
+    explicit RMSNorm(ComputeEngine& engine,
+                     std::size_t normalized_shape, Scalar epsilon = EPSILON)
+        : normalized_shape_(normalized_shape), epsilon_(epsilon)
+    {
+        // gamma 初始化为 1（无 beta）
+        Matrix gamma_cpu(normalized_shape, 1, Scalar{1});
+        auto g = engine.from_matrix(gamma_cpu);
+        NN_ASSERT(g, g ? "" : g.error().message.c_str());
+        gamma_ = std::move(*g);
+
+        grad_gamma_ = engine.create_tensor(normalized_shape, 1);
+        { auto r1 = engine.zero(grad_gamma_); NN_ASSERT(r1, r1 ? "" : r1.error().message.c_str()); }
+    }
+
+    [[nodiscard]] std::vector<TensorRef> parameters() override
+    {
+        return {gamma_};
+    }
+
+    [[nodiscard]] std::vector<TensorRef> param_gradients() override
+    {
+        return {grad_gamma_};
+    }
+
+    // ── forward ───────────────────────────────────────────────────────────
+    [[nodiscard]] Result<Tensor> forward(
+        ComputeEngine& engine, const Tensor& input) override
+    {
+        if (input.rows() != normalized_shape_)
+            return std::unexpected(Error{"rmsnorm forward: input shape mismatch"});
+
+        const Scalar inv_features = Scalar{1} / static_cast<Scalar>(normalized_shape_);
+
+        // x_sq = x * x
+        auto x_sq = engine.elementwise_binary(BinaryOp::Mul, input, input);
+        if (!x_sq) return std::unexpected(x_sq.error());
+
+        // mean_sq = col_reduce_sum(x_sq) * inv_features → (1, batch)
+        auto mean_sq = engine.col_reduce_sum(*x_sq);
+        if (!mean_sq) return std::unexpected(mean_sq.error());
+        auto r = engine.scale_inplace(*mean_sq, inv_features);
+        if (!r) return std::unexpected(r.error());
+
+        // rms_inv = rsqrt(mean_sq + eps) → (1, batch)
+        auto var_eps = engine.elementwise_binary_scalar(BinaryOp::Add, *mean_sq, epsilon_);
+        if (!var_eps) return std::unexpected(var_eps.error());
+        auto rms_inv = engine.elementwise_unary(UnaryOp::Rsqrt, *var_eps);
+        if (!rms_inv) return std::unexpected(rms_inv.error());
+
+        // normed = x * rms_inv (broadcast_col Mul) — 就地修改 x 副本
+        auto normed = clone_tensor(engine, input);
+        if (!normed) return std::unexpected(normed.error());
+        r = engine.broadcast_col_inplace(*normed, *rms_inv, BinaryOp::Mul);
+        if (!r) return std::unexpected(r.error());
+
+        // 缓存 normed 和 rms_inv 供 backward 使用
+        normed_cache_ = *normed;
+        rms_inv_cache_ = *rms_inv;
+
+        // output = normed * gamma (broadcast_row Mul)
+        auto output = clone_tensor(engine, *normed);
+        if (!output) return std::unexpected(output.error());
+        r = engine.broadcast_row_inplace(*output, gamma_, BinaryOp::Mul);
+        if (!r) return std::unexpected(r.error());
+
+        return output;
+    }
+
+    // ── backward ──────────────────────────────────────────────────────────
+    // grad_x = (gy - m*normed) * rms_inv
+    // gy = grad_out * gamma
+    // m  = mean(gy ⊙ normed)
+    // grad_gamma += row_sum(gy ⊙ normed)
+    [[nodiscard]] Result<Tensor> backward(
+        ComputeEngine& engine, const Tensor& grad_output) override
+    {
+        const Scalar inv_features = Scalar{1} / static_cast<Scalar>(normalized_shape_);
+
+        // gy = grad_out * gamma (broadcast_row Mul)
+        auto gy = clone_tensor(engine, grad_output);
+        if (!gy) return std::unexpected(gy.error());
+        auto r = engine.broadcast_row_inplace(*gy, gamma_, BinaryOp::Mul);
+        if (!r) return std::unexpected(r.error());
+
+        // gy_norm = gy ⊙ normed
+        auto gy_norm = engine.elementwise_binary(BinaryOp::Mul, *gy, normed_cache_);
+        if (!gy_norm) return std::unexpected(gy_norm.error());
+
+        // m = col_reduce_sum(gy_norm) * inv_features → (1, batch)
+        auto m = engine.col_reduce_sum(*gy_norm);
+        if (!m) return std::unexpected(m.error());
+        r = engine.scale_inplace(*m, inv_features);
+        if (!r) return std::unexpected(r.error());
+
+        // m_normed = normed * m (broadcast_col Mul)
+        auto m_normed = clone_tensor(engine, normed_cache_);
+        if (!m_normed) return std::unexpected(m_normed.error());
+        r = engine.broadcast_col_inplace(*m_normed, *m, BinaryOp::Mul);
+        if (!r) return std::unexpected(r.error());
+
+        // t = gy - m_normed
+        auto t = engine.elementwise_binary(BinaryOp::Sub, *gy, *m_normed);
+        if (!t) return std::unexpected(t.error());
+
+        // grad_x = t * rms_inv (broadcast_col Mul) — 就地修改 t
+        r = engine.broadcast_col_inplace(*t, rms_inv_cache_, BinaryOp::Mul);
+        if (!r) return std::unexpected(r.error());
+
+        // grad_gamma += row_reduce_sum(gy_norm) → (features, 1)
+        auto gg = engine.row_reduce_sum(*gy_norm);
+        if (!gg) return std::unexpected(gg.error());
+        r = engine.add_inplace(grad_gamma_, *gg);
+        if (!r) return std::unexpected(r.error());
+
+        return t;
+    }
+};
+
+// ── 归一化层工厂：按 NormType 创建 LayerNorm 或 RMSNorm ──────────────────
+[[nodiscard]] inline std::unique_ptr<Layer> make_norm_layer(
+    ComputeEngine& engine, std::size_t d_model, NormType norm_type)
+{
+    if (norm_type == NormType::RMSNorm)
+        return std::make_unique<RMSNorm>(engine, d_model);
+    return std::make_unique<LayerNorm>(engine, d_model);
+}
 
 // ══════════════════════════════════════════════════════════════════════════
 // Softmax — 按行 softmax（用于注意力权重）
@@ -1096,14 +1363,21 @@ public:
 class FeedForward final : public Layer
 {
 private:
-    Linear fc1_;  // (d_model → d_ff)
-    Linear fc2_;  // (d_ff → d_model)
+    Linear fc1_;   // GeLU: (d_model → d_ff); SwiGLU: (d_model → 2*d_ff)
+    Linear fc2_;   // (d_ff → d_model)
     GeLU  gelu_;
+    SwiGLU swiglu_;  // SwiGLU 激活（含 split/merge）
+    bool use_swiglu_ = false;
 
 public:
     FeedForward(ComputeEngine& engine,
-                std::size_t d_model, std::size_t d_ff)
-        : fc1_(engine, d_model, d_ff), fc2_(engine, d_ff, d_model) {}
+                std::size_t d_model, std::size_t d_ff,
+                ActivationType activation = ActivationType::GeLU)
+        : fc1_(engine, d_model,
+               activation == ActivationType::SwiGLU ? 2 * d_ff : d_ff),
+          fc2_(engine, d_ff, d_model),
+          swiglu_(d_ff),
+          use_swiglu_(activation == ActivationType::SwiGLU) {}
 
     std::vector<TensorRef> parameters() override
     {
@@ -1126,6 +1400,12 @@ public:
     {
         auto h1 = fc1_.forward(engine, input);
         if (!h1) return h1;
+        if (use_swiglu_)
+        {
+            auto h2 = swiglu_.forward(engine, *h1);
+            if (!h2) return h2;
+            return fc2_.forward(engine, *h2);
+        }
         auto h2 = gelu_.forward(engine, *h1);
         if (!h2) return h2;
         return fc2_.forward(engine, *h2);
@@ -1136,6 +1416,12 @@ public:
     {
         auto b2 = fc2_.backward(engine, grad_output);
         if (!b2) return b2;
+        if (use_swiglu_)
+        {
+            auto bg = swiglu_.backward(engine, *b2);
+            if (!bg) return bg;
+            return fc1_.backward(engine, *bg);
+        }
         auto bg = gelu_.backward(engine, *b2);
         if (!bg) return bg;
         return fc1_.backward(engine, *bg);
@@ -1686,9 +1972,9 @@ class GPTBlock final : public Layer
 {
 private:
     CausalSelfAttention self_attn_;
-    LayerNorm norm1_;
+    std::unique_ptr<Layer> norm1_;
     FeedForward ff_;
-    LayerNorm norm2_;
+    std::unique_ptr<Layer> norm2_;
 
     Tensor residual1_cache_;
     Tensor residual2_cache_;
@@ -1698,18 +1984,20 @@ public:
              std::size_t d_model, std::size_t num_heads,
              std::size_t d_ff, std::size_t max_len = 1024,
              std::size_t seq_len = 0,
-             PosEncodingType pos_enc = PosEncodingType::Learned)
+             PosEncodingType pos_enc = PosEncodingType::Learned,
+             ActivationType activation = ActivationType::GeLU,
+             NormType norm_type = NormType::LayerNorm)
         : self_attn_(engine, d_model, num_heads, max_len, seq_len, pos_enc),
-          norm1_(engine, d_model),
-          ff_(engine, d_model, d_ff),
-          norm2_(engine, d_model) {}
+          norm1_(make_norm_layer(engine, d_model, norm_type)),
+          ff_(engine, d_model, d_ff, activation),
+          norm2_(make_norm_layer(engine, d_model, norm_type)) {}
 
     std::vector<TensorRef> parameters() override
     {
         auto p = self_attn_.parameters();
-        auto n1 = norm1_.parameters();
+        auto n1 = norm1_->parameters();
         auto f  = ff_.parameters();
-        auto n2 = norm2_.parameters();
+        auto n2 = norm2_->parameters();
         p.insert(p.end(), n1.begin(), n1.end());
         p.insert(p.end(), f.begin(), f.end());
         p.insert(p.end(), n2.begin(), n2.end());
@@ -1719,9 +2007,9 @@ public:
     std::vector<TensorRef> param_gradients() override
     {
         auto g = self_attn_.param_gradients();
-        auto gn1 = norm1_.param_gradients();
+        auto gn1 = norm1_->param_gradients();
         auto gf  = ff_.param_gradients();
-        auto gn2 = norm2_.param_gradients();
+        auto gn2 = norm2_->param_gradients();
         g.insert(g.end(), gn1.begin(), gn1.end());
         g.insert(g.end(), gf.begin(), gf.end());
         g.insert(g.end(), gn2.begin(), gn2.end());
@@ -1733,7 +2021,7 @@ public:
     {
         residual1_cache_ = input;
 
-        auto n1 = norm1_.forward(engine, input);
+        auto n1 = norm1_->forward(engine, input);
         if (!n1) return n1;
 
         auto a = self_attn_.forward(engine, *n1);
@@ -1743,7 +2031,7 @@ public:
         if (!r2) return std::unexpected(r2.error());
         residual2_cache_ = *r2;
 
-        auto n2 = norm2_.forward(engine, residual2_cache_);
+        auto n2 = norm2_->forward(engine, residual2_cache_);
         if (!n2) return n2;
 
         auto f = ff_.forward(engine, *n2);
@@ -1757,7 +2045,7 @@ public:
     {
         auto grad_ff = ff_.backward(engine, grad_output);
         if (!grad_ff) return grad_ff;
-        auto b_n2 = norm2_.backward(engine, *grad_ff);
+        auto b_n2 = norm2_->backward(engine, *grad_ff);
         if (!b_n2) return b_n2;
 
         auto grad_r1 = engine.elementwise_binary(BinaryOp::Add, grad_output, *b_n2);
@@ -1765,7 +2053,7 @@ public:
 
         auto b_sa = self_attn_.backward(engine, *grad_r1);
         if (!b_sa) return b_sa;
-        auto b_n1 = norm1_.backward(engine, *b_sa);
+        auto b_n1 = norm1_->backward(engine, *b_sa);
         if (!b_n1) return b_n1;
 
         return engine.elementwise_binary(BinaryOp::Add, *grad_r1, *b_n1);
@@ -1784,7 +2072,7 @@ public:
         Tensor& v_cache,
         std::size_t cur_len)
     {
-        auto n1 = norm1_.forward(engine, x_new);
+        auto n1 = norm1_->forward(engine, x_new);
         if (!n1) return n1;
 
         auto a = self_attn_.forward_step(engine, *n1, k_cache, v_cache, cur_len);
@@ -1793,7 +2081,7 @@ public:
         auto r2 = engine.elementwise_binary(BinaryOp::Add, x_new, *a);
         if (!r2) return std::unexpected(r2.error());
 
-        auto n2 = norm2_.forward(engine, *r2);
+        auto n2 = norm2_->forward(engine, *r2);
         if (!n2) return n2;
 
         auto f = ff_.forward(engine, *n2);
@@ -1836,7 +2124,7 @@ private:
     Tensor grad_pos_emb_;    // 同上
 
     std::vector<GPTBlock> blocks_;
-    LayerNorm ln_f_;
+    std::unique_ptr<Layer> ln_f_;
     Linear lm_head_;
 
     // 反向缓存
@@ -1858,11 +2146,13 @@ public:
     GPTModel(ComputeEngine& engine,
              std::size_t vocab_size, std::size_t d_model, std::size_t seq_len,
              std::size_t num_heads, std::size_t d_ff, std::size_t num_layers,
-             PosEncodingType pos_enc_type = PosEncodingType::Learned)
+             PosEncodingType pos_enc_type = PosEncodingType::Learned,
+             ActivationType activation = ActivationType::GeLU,
+             NormType norm_type = NormType::LayerNorm)
         : vocab_size_(vocab_size), d_model_(d_model), seq_len_(seq_len),
           use_pos_emb_(pos_enc_type != PosEncodingType::ALiBi),
           pos_emb_learnable_(pos_enc_type == PosEncodingType::Learned),
-          ln_f_(engine, d_model),
+          ln_f_(make_norm_layer(engine, d_model, norm_type)),
           lm_head_(engine, d_model, vocab_size)
     {
         // 初始化 token_emb_
@@ -1911,9 +2201,10 @@ public:
             { auto r2 = engine.zero(grad_pos_emb_); NN_ASSERT(r2, r2 ? "" : r2.error().message.c_str()); }
         }
 
-        // GPTBlock 传入 seq_len 和 pos_enc_type，启用 CausalSelfAttention 批量化路径
+        // GPTBlock 传入 seq_len、pos_enc_type 和 activation
         for (std::size_t i = 0; i < num_layers; ++i)
-            blocks_.emplace_back(engine, d_model, num_heads, d_ff, seq_len, seq_len, pos_enc_type);
+            blocks_.emplace_back(engine, d_model, num_heads, d_ff, seq_len, seq_len,
+                                 pos_enc_type, activation);
     }
 
     std::vector<TensorRef> parameters() override
@@ -1927,7 +2218,7 @@ public:
             auto bp = b.parameters();
             p.insert(p.end(), bp.begin(), bp.end());
         }
-        auto lp = ln_f_.parameters();
+        auto lp = ln_f_->parameters();
         p.insert(p.end(), lp.begin(), lp.end());
         auto hp = lm_head_.parameters();
         p.insert(p.end(), hp.begin(), hp.end());
@@ -1945,7 +2236,7 @@ public:
             auto bg = b.param_gradients();
             g.insert(g.end(), bg.begin(), bg.end());
         }
-        auto lg = ln_f_.param_gradients();
+        auto lg = ln_f_->param_gradients();
         g.insert(g.end(), lg.begin(), lg.end());
         auto hg = lm_head_.param_gradients();
         g.insert(g.end(), hg.begin(), hg.end());
@@ -2029,8 +2320,8 @@ public:
             }
         }
 
-        // ── 5. 最终 LayerNorm ──
-        auto ln = ln_f_.forward(engine, x);
+        // ── 5. 最终 LayerNorm/RMSNorm ──
+        auto ln = ln_f_->forward(engine, x);
         if (!ln) return ln;
         x = std::move(*ln);
 
@@ -2053,8 +2344,8 @@ public:
         if (!b_lm) return b_lm;
         Tensor grad_x = std::move(*b_lm);
 
-        // ── 2. LayerNorm 反向 ──
-        auto b_ln = ln_f_.backward(engine, grad_x);
+        // ── 2. LayerNorm/RMSNorm 反向 ──
+        auto b_ln = ln_f_->backward(engine, grad_x);
         if (!b_ln) return b_ln;
         grad_x = std::move(*b_ln);
 
@@ -2169,7 +2460,7 @@ public:
         }
 
         // 4. 最终 LayerNorm + LM Head → (vocab_size, 1)
-        auto ln = ln_f_.forward(engine, x);
+        auto ln = ln_f_->forward(engine, x);
         if (!ln) return ln;
         return lm_head_.forward(engine, *ln);
     }

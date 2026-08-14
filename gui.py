@@ -1173,14 +1173,6 @@ class NeuralNetGUI(tk.Tk):
                                                       textvariable=self.text_train_tdr_retries_var)
         self.text_train_tdr_retries_sp.grid(row=0, column=7, padx=(0, 8))
 
-        self.text_train_auto_tune_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(tdr_frame, text="自动调优", variable=self.text_train_auto_tune_var,
-                        command=self._toggle_text_tdr).grid(row=0, column=8, sticky="w")
-        ttk.Label(tdr_frame, text="耗时上限:").grid(row=0, column=9, sticky="w")
-        self.text_train_step_time_limit_var = tk.DoubleVar(value=1.5)
-        self.text_train_step_time_limit_sp = ttk.Spinbox(tdr_frame, from_=0.5, to=5.0, increment=0.1, width=5,
-                                                          textvariable=self.text_train_step_time_limit_var, format="%.1f")
-        self.text_train_step_time_limit_sp.grid(row=0, column=10)
         self._toggle_text_tdr()
 
         # 梯度日志
@@ -1255,8 +1247,6 @@ class NeuralNetGUI(tk.Tk):
         # self.text_train_probe_time_limit_sp.config(state=probe_state)
         tdr_state = "normal" if self.text_train_tdr_retry_var.get() else "disabled"
         self.text_train_tdr_retries_sp.config(state=tdr_state)
-        tune_state = "normal" if self.text_train_auto_tune_var.get() else "disabled"
-        self.text_train_step_time_limit_sp.config(state=tune_state)
 
     def _toggle_text_advanced(self):
         """高级选项折叠/展开"""
@@ -1331,12 +1321,6 @@ class NeuralNetGUI(tk.Tk):
         #         cmd += ["--probe-time-limit", str(self.text_train_probe_time_limit_var.get())]
         # else:
         #     cmd.append("--no-batch-probe")
-
-        # 自动调优
-        if self.text_train_auto_tune_var.get():
-            cmd.append("--auto-tune")
-            if abs(self.text_train_step_time_limit_var.get() - 1.5) > 0.05:
-                cmd += ["--step-time-limit", str(self.text_train_step_time_limit_var.get())]
 
         # 学习率调度
         lr_schedule = self.text_train_lr_schedule_var.get()

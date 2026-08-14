@@ -226,8 +226,12 @@ template <typename... Ts>
                 static_cast<uint64_t>(spec.d_ff),
                 static_cast<uint64_t>(spec.num_layers)); !r)
             return std::unexpected(r.error());
-        // V4+: pos_encoding (向后兼容：旧文件无此字段，默认 Learned)
-        return write_bytes<uint32_t>(ofs, static_cast<uint32_t>(spec.pos_encoding));
+        // V5+: pos_encoding + activation + norm_type (向后兼容：旧文件无此字段，默认)
+        if (auto r = write_bytes<uint32_t>(ofs, static_cast<uint32_t>(spec.pos_encoding)); !r)
+            return std::unexpected(r.error());
+        if (auto r = write_bytes<uint32_t>(ofs, static_cast<uint32_t>(spec.activation)); !r)
+            return std::unexpected(r.error());
+        return write_bytes<uint32_t>(ofs, static_cast<uint32_t>(spec.norm_type));
 
     default:
         return std::unexpected(Error{"Cannot write unknown ModelType: "
@@ -284,11 +288,19 @@ template <typename... Ts>
         spec.num_heads  = static_cast<std::size_t>(nh);
         spec.d_ff       = static_cast<std::size_t>(df);
         spec.num_layers = static_cast<std::size_t>(nl);
-        // V4+: pos_encoding（向后兼容：旧文件读到 EOF 时保持默认 Learned）
+        // V5+: pos_encoding + activation（向后兼容：旧文件读到 EOF 时保持默认）
         auto pe = read_bytes<uint32_t>(ifs);
         if (pe)
             spec.pos_encoding = static_cast<PosEncodingType>(*pe);
         // else: 旧文件无此字段，spec.pos_encoding 已默认 Learned
+        auto act = read_bytes<uint32_t>(ifs);
+        if (act)
+            spec.activation = static_cast<ActivationType>(*act);
+        // else: 旧文件无此字段，spec.activation 已默认 GeLU
+        auto nt = read_bytes<uint32_t>(ifs);
+        if (nt)
+            spec.norm_type = static_cast<NormType>(*nt);
+        // else: 旧文件无此字段，spec.norm_type 已默认 LayerNorm
         break;
     }
 

@@ -28,6 +28,20 @@ enum class PosEncodingType : uint32_t
     ALiBi      = 2,  // 线性偏置注意力（无位置嵌入）
 };
 
+// ── FFN 激活类型 ─────────────────────────────────────────────────────────
+enum class ActivationType : uint32_t
+{
+    GeLU   = 0,  // QuickGeLU（GPT-2 风格，默认）
+    SwiGLU = 1,  // SwiGLU（LLaMA/Mistral 风格，每参数效率更高）
+};
+
+// ── 归一化层类型 ─────────────────────────────────────────────────────────
+enum class NormType : uint32_t
+{
+    LayerNorm = 0,  // LayerNorm（GPT-2 风格，默认）
+    RMSNorm   = 1,  // RMSNorm（LLaMA/Mistral 风格，更快更稳）
+};
+
 // ── 模型类型枚举 ─────────────────────────────────────────────────────────
 enum class ModelType : uint32_t
 {
@@ -58,6 +72,8 @@ struct ModelSpec
     std::size_t vocab_size = 0;
     std::size_t seq_len    = 0;
     PosEncodingType pos_encoding = PosEncodingType::Learned;  // 位置编码类型
+    ActivationType activation = ActivationType::GeLU;         // FFN 激活类型
+    NormType norm_type = NormType::LayerNorm;                 // 归一化层类型
 
     [[nodiscard]] bool is_mlp()         const noexcept { return type == ModelType::MLP; }
     [[nodiscard]] bool is_transformer() const noexcept { return type == ModelType::Transformer; }
