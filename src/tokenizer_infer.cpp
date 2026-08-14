@@ -228,6 +228,11 @@ int main(int argc, char *argv[])
         auto ids = tokenizer->encode(*text_result);
         std::cout << "文件大小: " << text_result->size() << " 字节\n";
         std::cout << "Token 数: " << ids.size() << "\n";
+        if (ids.empty())
+        {
+            std::cout << "压缩率: N/A (空输入)\n";
+            return 0;
+        }
         std::cout << "压缩率: " << std::fixed << std::setprecision(2)
                   << static_cast<double>(text_result->size()) / ids.size()
                   << " bytes/token\n";

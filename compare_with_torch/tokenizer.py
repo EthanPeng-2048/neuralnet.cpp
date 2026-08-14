@@ -169,7 +169,11 @@ class CharBPEAdapter:
         raw = b""
         for tid in ids:
             if tid >= self.BYTE_BASE and tid < self._vocab_size:
-                raw += self._vocab[tid]
+                # 防御：稀疏/缺失 ID 时跳过而非 KeyError
+                tok = self._vocab.get(tid) if isinstance(self._vocab, dict) else None
+                if tok is None:
+                    continue
+                raw += tok
         return raw.decode("utf-8", errors="replace")
 
     def vocab_size(self) -> int:

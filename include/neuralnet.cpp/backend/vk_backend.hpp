@@ -508,13 +508,9 @@ public:
     GpuBuffer(VkDevice device, VkBuffer buffer, const MemoryPool::Allocation& alloc, MemoryPool& pool)
         : device_(device), buffer_(buffer), alloc_(alloc), pool_(pool) {}
 
-    ~GpuBuffer()
-    {
-        if (buffer_ != VK_NULL_HANDLE)
-            vkDestroyBuffer(device_, buffer_, nullptr);
-        if (pool_ && alloc_.valid())
-            pool_->free(alloc_);
-    }
+    // 析构定义在 GpuBackend 之后：batch 录制期间已录制的 descriptor 仍引用
+    // 本 buffer，需延迟到 end_batch 提交完成后再销毁（见 defer_buffer_destroy）。
+    ~GpuBuffer();
 
     // 移动语义
     GpuBuffer(GpuBuffer&& o) noexcept
@@ -662,6 +658,19 @@ private:
     std::mutex queue_mutex_;
     bool initialized_ = false;
 
+    // ── 延迟销毁：batch 录制期间 copy-on-write 替换旧 buffer 时，旧 buffer
+    // 仍被已录制的 descriptor set 引用，不能立即 vkDestroyBuffer。
+    // end_batch/flush_batch 提交完成并释放 descriptor sets 后统一销毁。
+    struct PendingDestroy
+    {
+        VkDevice device = VK_NULL_HANDLE;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        MemoryPool::Allocation alloc;
+        observer_ptr<MemoryPool> pool;
+    };
+    std::mutex pending_mutex_;
+    std::vector<PendingDestroy> pending_destroys_;
+
     static constexpr uint32_t WORKGROUP_SIZE = 16;
 
     GpuBackend() = default;
@@ -774,6 +783,8 @@ public:
         {
             vkDeviceWaitIdle(device_.device());
 
+            flush_pending_destroys();
+
             staging_ring_.reset();
 
             if (gpu_tensor_pool_ != VK_NULL_HANDLE)
@@ -799,8 +810,34 @@ public:
 
     [[nodiscard]] static GpuBackend& instance()
     {
-        static GpuBackend backend;
-        return backend;
+        // 故意泄漏（进程退出时由 OS 回收）：避免静态析构顺序问题——
+        // 全局 GpuTensor 的析构可能晚于 backend，届时访问 instance() 会 UB。
+        static GpuBackend* backend = new GpuBackend();
+        return *backend;
+    }
+
+    // ── 延迟销毁入口（GpuBuffer 析构时调用）──────────────────────────
+    // batch 模式下不立即销毁，等待提交完成；否则立即销毁。
+    void defer_buffer_destroy(VkDevice device, VkBuffer buffer,
+                              const MemoryPool::Allocation& alloc,
+                              observer_ptr<MemoryPool> pool)
+    {
+        std::lock_guard lock(pending_mutex_);
+        pending_destroys_.push_back({device, buffer, alloc, pool});
+    }
+
+    // ── 统一执行延迟销毁（必须在 batch descriptor sets 释放之后调用）──
+    void flush_pending_destroys()
+    {
+        std::lock_guard lock(pending_mutex_);
+        for (auto& pd : pending_destroys_)
+        {
+            if (pd.buffer != VK_NULL_HANDLE && pd.device != VK_NULL_HANDLE)
+                vkDestroyBuffer(pd.device, pd.buffer, nullptr);
+            if (pd.pool && pd.alloc.valid())
+                pd.pool->free(pd.alloc);
+        }
+        pending_destroys_.clear();
     }
 
     // 初始化
@@ -1126,6 +1163,7 @@ public:
             batch_fence_ = VK_NULL_HANDLE;
             batch_mode_ = false;
             device_lost_ = true;
+            flush_pending_destroys();
             return std::unexpected(Error{
                 "GPU 设备丢失 (VK_ERROR_DEVICE_LOST): Windows TDR 已重置 GPU 驱动。"
                 "\n模型已自动保存，请使用 --resume <save-path> --batch-size <较小值> 重启训练。"
@@ -1144,6 +1182,7 @@ public:
             batch_cmd_ = VK_NULL_HANDLE;
             batch_fence_ = VK_NULL_HANDLE;
             batch_mode_ = false;
+            flush_pending_destroys();
             return std::unexpected(Error{
                 std::string("GPU batch 等待失败: Vulkan error ") + std::to_string(static_cast<int>(wait_result)) +
                 "\n建议：减小 --batch-size 或 --seq-len，或增大 Windows TDR 超时"
@@ -1161,6 +1200,9 @@ public:
         batch_cmd_ = VK_NULL_HANDLE;
         batch_fence_ = VK_NULL_HANDLE;
         batch_mode_ = false;
+
+        // 提交已完成且描述符集已释放，可安全销毁延迟的旧 buffer
+        flush_pending_destroys();
 
         return r;
     }
@@ -1224,6 +1266,7 @@ public:
             batch_fence_ = VK_NULL_HANDLE;
             batch_mode_ = false;
             device_lost_ = true;
+            flush_pending_destroys();
             return std::unexpected(Error{
                 std::string("GPU flush 期间设备丢失 (VK_ERROR_DEVICE_LOST), Vulkan error ")
                 + std::to_string(static_cast<int>(flush_wait))});
@@ -1239,6 +1282,7 @@ public:
             batch_cmd_ = VK_NULL_HANDLE;
             batch_fence_ = VK_NULL_HANDLE;
             batch_mode_ = false;
+            flush_pending_destroys();
             return std::unexpected(Error{
                 std::string("GPU flush_batch 等待失败: Vulkan error ")
                 + std::to_string(static_cast<int>(flush_wait))});
@@ -1249,6 +1293,9 @@ public:
             vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_,
                 static_cast<uint32_t>(batch_desc_sets_.size()), batch_desc_sets_.data());
         batch_desc_sets_.clear();
+
+        // 提交已完成，可安全销毁延迟的旧 buffer
+        flush_pending_destroys();
 
         // 4. 销毁旧 command buffer 和 fence
         vkDestroyFence(device_.device(), batch_fence_, nullptr);
@@ -3065,7 +3112,35 @@ public:
         }
         return {};
     }
-};
+};  // GpuBackend
+
+// ══════════════════════════════════════════════════════════════════════
+// GpuBuffer 析构（类外定义）：batch 录制期间延迟销毁，避免已录制的
+// descriptor 引用已销毁的 buffer（VUID-vkDestroyBuffer-buffer-00922）。
+// ══════════════════════════════════════════════════════════════════════
+GpuBuffer::~GpuBuffer()
+{
+    if (buffer_ == VK_NULL_HANDLE)
+        return;
+
+    auto& backend = GpuBackend::instance();
+    if (backend.is_initialized() && backend.in_batch())
+    {
+        // batch 模式：copy-on-write 替换产生的旧 buffer 仍被已录制的
+        // descriptor 引用，延迟到 end_batch/flush_batch 后统一销毁。
+        backend.defer_buffer_destroy(device_, buffer_, alloc_, pool_);
+    }
+    else
+    {
+        vkDestroyBuffer(device_, buffer_, nullptr);
+        if (pool_ && alloc_.valid())
+            pool_->free(alloc_);
+    }
+
+    buffer_ = VK_NULL_HANDLE;
+    alloc_ = {};
+    pool_.reset();
+}
 
 } // namespace nn
 

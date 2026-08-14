@@ -255,7 +255,9 @@ def main():
         if not os.path.exists(cfg.resume):
             print(f"模型文件不存在: {cfg.resume}，将从头训练\n")
         else:
-            ckpt = torch.load(cfg.resume, map_location=device, weights_only=False)
+            # checkpoint 仅含 state_dict 等安全类型，weights_only=True
+            # 防止加载不可信 pickle 时执行任意代码
+            ckpt = torch.load(cfg.resume, map_location=device, weights_only=True)
             model.load_state_dict(ckpt["model_state_dict"])
             if "optimizer_state_dict" in ckpt:
                 optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -288,13 +290,15 @@ def main():
         rng_epoch.shuffle(indices)
 
         for step in range(steps_per_epoch):
-            # 取本 step 的 batch_size 个索引（顺序切片，不再独立采样）
+            # 取本 step 的样本索引（顺序切片，不再独立采样）
             batch_indices = indices[step * cfg.batch_size : (step + 1) * cfg.batch_size]
+            # 末尾不足一个 batch 时按实际样本数构建（避免索引越界）
+            this_bs = len(batch_indices)
 
             x, y = build_batch(
                 valid_samples,
                 batch_indices,
-                cfg.batch_size,
+                this_bs,
                 cfg.seq_len,
                 pad_id,
                 device,
@@ -304,9 +308,9 @@ def main():
             # 非对话模式：屏蔽 padding 位置，只对真实 token 计算 loss
             # mask[t][b] = 1.0 当 t+1 < sample_len（即目标不是 padding）
             loss_mask = torch.zeros(
-                cfg.batch_size, cfg.seq_len, device=device
+                this_bs, cfg.seq_len, device=device
             )
-            for b in range(cfg.batch_size):
+            for b in range(this_bs):
                 sample = valid_samples[batch_indices[b]]
                 sample_len = len(sample)
                 for t in range(cfg.seq_len):

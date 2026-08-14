@@ -80,6 +80,9 @@ nn::Result<InferConfig> parse_args(int argc, char *argv[])
             if (!v) return std::unexpected(std::move(v).error());
             if (*v <= 0)
                 return std::unexpected(nn::Error{"--topk 必须为正整数"});
+            if (*v > static_cast<int>(nn::MNIST_NUM_CLASSES))
+                return std::unexpected(nn::Error{
+                    "--topk 不能超过类别数 " + std::to_string(nn::MNIST_NUM_CLASSES)});
             cfg.topk = *v;
         }
         else if (arg == "--show-pixels")
@@ -149,8 +152,17 @@ nn::Result<std::vector<Prediction>> predict_with_confidence(
         probs[c] = std::exp(logits.at_unchecked(c, 0) - max_val);
         sum_exp += probs[c];
     }
-    for (auto &p : probs)
-        p /= sum_exp;
+    // 防御：logits 全为 -inf 时 sum_exp == 0，回退为均匀分布避免 NaN
+    if (!(sum_exp > 0.0) || !std::isfinite(sum_exp))
+    {
+        for (auto &p : probs)
+            p = Scalar{1} / static_cast<Scalar>(nn::MNIST_NUM_CLASSES);
+    }
+    else
+    {
+        for (auto &p : probs)
+            p /= sum_exp;
+    }
 
     // 按概率排序取 top-k
     std::vector<int> indices(nn::MNIST_NUM_CLASSES);

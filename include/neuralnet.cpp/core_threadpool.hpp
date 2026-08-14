@@ -483,9 +483,9 @@ namespace nn
                     std::advance(end, static_cast<std::ptrdiff_t>(len));
                     off += len;
 
-                    tasks_.emplace([beg, end, &reduce_op, &transform_op, &partials, &latch, c]()
+                    tasks_.emplace([beg, end, &reduce_op, &transform_op, &partials, &latch, c, init]()
                     {
-                        T local{};  // 要求 T{} 是 reduce_op 的单位元
+                        T local = init;  // 以调用者 init 为单位元（不能用 T{}）
                         for (auto it = beg; it != end; ++it)
                             local = reduce_op(local, transform_op(*it));
                         partials[c] = std::move(local);
@@ -500,7 +500,7 @@ namespace nn
                 const std::size_t off = total - (base + (c < rem ? 1 : 0));
                 auto beg = first;
                 std::advance(beg, static_cast<std::ptrdiff_t>(off));
-                T local{};
+                T local = init;  // 以调用者 init 为单位元（不能用 T{}）
                 for (auto it = beg; it != last; ++it)
                     local = reduce_op(local, transform_op(*it));
                 partials[c] = std::move(local);
@@ -550,9 +550,9 @@ namespace nn
                     std::advance(i1_end, static_cast<std::ptrdiff_t>(len));
                     off += len;
 
-                    tasks_.emplace([i1, i1_end, i2, &reduce_op, &transform_op, &partials, &latch, c]()
+                    tasks_.emplace([i1, i1_end, i2, &reduce_op, &transform_op, &partials, &latch, c, init]()
                     {
-                        T local{};
+                        T local = init;  // 以调用者 init 为单位元（不能用 T{}）
                         auto it1 = i1;
                         auto it2 = i2;
                         for (; it1 != i1_end; ++it1, ++it2)
@@ -571,7 +571,7 @@ namespace nn
                 auto i2 = first2;
                 std::advance(i1, static_cast<std::ptrdiff_t>(off));
                 std::advance(i2, static_cast<std::ptrdiff_t>(off));
-                T local{};
+                T local = init;  // 以调用者 init 为单位元（不能用 T{}）
                 for (; i1 != last1; ++i1, ++i2)
                     local = reduce_op(local, transform_op(*i1, *i2));
                 partials[c] = std::move(local);

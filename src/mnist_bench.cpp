@@ -91,15 +91,28 @@ BenchConfig parse_args(int argc, char* argv[])
         std::string arg = argv[i];
         if (arg == "--help") { print_usage(argv[0]); std::exit(0); }
         else if (arg == "--epochs" && i + 1 < argc)
+        {
             cfg.epochs = parse_num_or_die<int>(argv[++i], "--epochs");
+            if (cfg.epochs <= 0) { std::cerr << "--epochs 必须为正整数\n"; std::exit(1); }
+        }
         else if (arg == "--batch-size" && i + 1 < argc)
-            cfg.batch_size = static_cast<std::size_t>(parse_num_or_die<int>(argv[++i], "--batch-size"));
+        {
+            int bs = parse_num_or_die<int>(argv[++i], "--batch-size");
+            if (bs <= 0) { std::cerr << "--batch-size 必须为正整数\n"; std::exit(1); }
+            cfg.batch_size = static_cast<std::size_t>(bs);
+        }
         else if (arg == "--dataset" && i + 1 < argc)
             cfg.dataset_path = argv[++i];
         else if (arg == "--warmup" && i + 1 < argc)
+        {
             cfg.warmup = parse_num_or_die<int>(argv[++i], "--warmup");
+            if (cfg.warmup < 0) { std::cerr << "--warmup 必须为非负整数\n"; std::exit(1); }
+        }
         else if (arg == "--infer-iters" && i + 1 < argc)
+        {
             cfg.infer_iters = parse_num_or_die<int>(argv[++i], "--infer-iters");
+            if (cfg.infer_iters <= 0) { std::cerr << "--infer-iters 必须为正整数\n"; std::exit(1); }
+        }
         else if (arg == "--lr" && i + 1 < argc)
             cfg.lr = parse_num_or_die<Scalar>(argv[++i], "--lr");
         else { std::cerr << "未知参数: " << arg << "\n"; std::exit(1); }
@@ -126,6 +139,9 @@ nn::Result<EpochResult> train_one_epoch(
 {
     const std::size_t N = train_x.cols();
     const std::size_t num_batches = N / batch_size;
+    if (num_batches == 0)
+        return std::unexpected(nn::Error{
+            "train_one_epoch: 样本数小于 batch_size，无法构成训练批次"});
 
     nn::Matrix x_batch(train_x.rows(), batch_size);
     nn::Matrix y_batch(train_y.rows(), batch_size);
@@ -200,6 +216,8 @@ nn::Result<InferResult> bench_inference(
     nn::Model& model, nn::ComputeEngine& engine,
     const nn::Matrix& single_image, int warmup, int iters)
 {
+    if (iters <= 0)
+        return std::unexpected(nn::Error{"bench_inference: iters 必须为正整数"});
     // 预热
     for (int i = 0; i < warmup; ++i)
     {

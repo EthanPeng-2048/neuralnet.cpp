@@ -47,7 +47,8 @@ def draw_digit(canvas: tk.Canvas, pixels: list[float], offset_x=0, offset_y=0):
     for r in range(IMG_DIM):
         for c in range(IMG_DIM):
             v = pixels[r * IMG_DIM + c]
-            gray = int(v * 255)
+            # 兼容 0~1 与 0~255 两种输入，clamp 防止非法颜色值
+            gray = max(0, min(255, int(round(v * 255)) if v <= 1.0 else int(round(v))))
             color = f"#{gray:02x}{gray:02x}{gray:02x}"
             x1 = offset_x + c * PIXEL_SIZE
             y1 = offset_y + r * PIXEL_SIZE
@@ -616,12 +617,13 @@ class NeuralNetGUI(tk.Tk):
         """解析 MNIST 训练输出并更新图表。"""
         import re as _re
         # step 级 loss:  "  Epoch 1/5  batch 10/937  loss: 2.3045"
-        m = _re.search(r"loss:\s*(\d+\.\d+)", text)
+        # 支持整数与科学计数法，避免漏掉小 loss 值
+        m = _re.search(r"loss:\s*([0-9.eE\-+]+)", text)
         if m and "=" not in text:
             loss = float(m.group(1))
             self._train_step_x += 1
+            # add_point 自带合并刷新，无需每次 redraw（高频日志下避免重复全量重绘）
             self.train_chart.add_point("step_loss", self._train_step_x, loss)
-            self.train_chart.redraw()
         # epoch 级: "lr=1.0000e-02  loss=0.4523  train_acc=90.12%  test_acc=88.56%"
         m_lr = _re.search(r"lr=([0-9.e\-+]+)", text)
         m_epoch = _re.search(r"loss=(\d+\.\d+)", text)
@@ -889,7 +891,10 @@ class NeuralNetGUI(tk.Tk):
                "--topk", str(self.infer_topk_var.get())]
         if self.infer_show_pixels_var.get():
             cmd.append("--show-pixels")
-        if self.infer_gpu_var.get():
+        gpu_backend = self.infer_gpu_var.get()
+        if gpu_backend == "CUDA":
+            cmd.append("--cuda")
+        elif gpu_backend == "Vulkan":
             cmd.append("--gpu")
 
         self._log_infer(f"$ {' '.join(cmd)}\n")
@@ -1145,19 +1150,19 @@ class NeuralNetGUI(tk.Tk):
         tdr_frame.grid(row=adv_row, column=0, columnspan=4, sticky="ew", pady=2)
         adv_row += 1
 
-        self.text_train_batch_probe_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(tdr_frame, text="Batch探测", variable=self.text_train_batch_probe_var,
-                        command=self._toggle_text_tdr).grid(row=0, column=0, sticky="w")
-        ttk.Label(tdr_frame, text="步数:").grid(row=0, column=1, sticky="w")
-        self.text_train_probe_steps_var = tk.IntVar(value=3)
-        self.text_train_probe_steps_sp = ttk.Spinbox(tdr_frame, from_=1, to=20, width=4,
-                                                      textvariable=self.text_train_probe_steps_var)
-        self.text_train_probe_steps_sp.grid(row=0, column=2, padx=(0, 8))
-        ttk.Label(tdr_frame, text="耗时上限:").grid(row=0, column=3, sticky="w")
-        self.text_train_probe_time_limit_var = tk.DoubleVar(value=1.5)
-        self.text_train_probe_time_limit_sp = ttk.Spinbox(tdr_frame, from_=0.5, to=5.0, increment=0.1, width=5,
-                                                           textvariable=self.text_train_probe_time_limit_var, format="%.1f")
-        self.text_train_probe_time_limit_sp.grid(row=0, column=4, padx=(0, 8))
+        # self.text_train_batch_probe_var = tk.BooleanVar(value=True)
+        # ttk.Checkbutton(tdr_frame, text="Batch探测", variable=self.text_train_batch_probe_var,
+        #                 command=self._toggle_text_tdr).grid(row=0, column=0, sticky="w")
+        # ttk.Label(tdr_frame, text="步数:").grid(row=0, column=1, sticky="w")
+        # self.text_train_probe_steps_var = tk.IntVar(value=3)
+        # self.text_train_probe_steps_sp = ttk.Spinbox(tdr_frame, from_=1, to=20, width=4,
+        #                                               textvariable=self.text_train_probe_steps_var)
+        # self.text_train_probe_steps_sp.grid(row=0, column=2, padx=(0, 8))
+        # ttk.Label(tdr_frame, text="耗时上限:").grid(row=0, column=3, sticky="w")
+        # self.text_train_probe_time_limit_var = tk.DoubleVar(value=1.5)
+        # self.text_train_probe_time_limit_sp = ttk.Spinbox(tdr_frame, from_=0.5, to=5.0, increment=0.1, width=5,
+        #                                                    textvariable=self.text_train_probe_time_limit_var, format="%.1f")
+        # self.text_train_probe_time_limit_sp.grid(row=0, column=4, padx=(0, 8))
 
         self.text_train_tdr_retry_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(tdr_frame, text="TDR重试", variable=self.text_train_tdr_retry_var,
@@ -1245,9 +1250,9 @@ class NeuralNetGUI(tk.Tk):
 
     def _toggle_text_tdr(self):
         """TDR 防护开关：控制各子选项的启用/禁用"""
-        probe_state = "normal" if self.text_train_batch_probe_var.get() else "disabled"
-        self.text_train_probe_steps_sp.config(state=probe_state)
-        self.text_train_probe_time_limit_sp.config(state=probe_state)
+        # probe_state = "normal" if self.text_train_batch_probe_var.get() else "disabled"
+        # self.text_train_probe_steps_sp.config(state=probe_state)
+        # self.text_train_probe_time_limit_sp.config(state=probe_state)
         tdr_state = "normal" if self.text_train_tdr_retry_var.get() else "disabled"
         self.text_train_tdr_retries_sp.config(state=tdr_state)
         tune_state = "normal" if self.text_train_auto_tune_var.get() else "disabled"
@@ -1318,14 +1323,14 @@ class NeuralNetGUI(tk.Tk):
             cmd += ["--max-tdr-retries", str(self.text_train_tdr_retries_var.get())]
 
         # Batch 探测
-        if self.text_train_batch_probe_var.get():
-            cmd.append("--batch-probe")
-            if self.text_train_probe_steps_var.get() != 3:
-                cmd += ["--probe-steps", str(self.text_train_probe_steps_var.get())]
-            if abs(self.text_train_probe_time_limit_var.get() - 1.5) > 0.05:
-                cmd += ["--probe-time-limit", str(self.text_train_probe_time_limit_var.get())]
-        else:
-            cmd.append("--no-batch-probe")
+        # if self.text_train_batch_probe_var.get():
+        #     cmd.append("--batch-probe")
+        #     if self.text_train_probe_steps_var.get() != 3:
+        #         cmd += ["--probe-steps", str(self.text_train_probe_steps_var.get())]
+        #     if abs(self.text_train_probe_time_limit_var.get() - 1.5) > 0.05:
+        #         cmd += ["--probe-time-limit", str(self.text_train_probe_time_limit_var.get())]
+        # else:
+        #     cmd.append("--no-batch-probe")
 
         # 自动调优
         if self.text_train_auto_tune_var.get():

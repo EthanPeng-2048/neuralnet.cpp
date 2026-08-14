@@ -1558,7 +1558,8 @@ private:
     // 掩码缓存（平铺为 batch*H*seq × seq 以匹配堆叠 scores 布局）
     // ALiBi 模式下包含因果掩码 + 线性偏置；普通模式下仅因果掩码
     Tensor mask_cache_;
-    std::size_t mask_cached_key_ = 0;  // 编码 (batch << 16) | seq_len
+    std::size_t mask_cached_batch_ = 0;  // 缓存键：batch（独立字段，避免位打包溢出）
+    std::size_t mask_cached_seq_ = 0;    // 缓存键：seq_len
 
     // ALiBi 斜率：m_h = 2^(-8h/H)（仅 use_alibi_ = true 时使用）
     std::vector<Scalar> slopes_;
@@ -1575,9 +1576,9 @@ private:
 
     void ensure_mask_(ComputeEngine& engine, std::size_t batch, std::size_t seq_len)
     {
-        // 用 (batch, seq_len) 组合作为缓存键
-        const std::size_t key = (batch << 16) | seq_len;
-        if (mask_cached_key_ == key) return;
+        // 用 (batch, seq_len) 作为缓存键
+        if (mask_cached_batch_ == batch && mask_cached_seq_ == seq_len)
+            return;
 
         const Scalar neg_inf = -std::numeric_limits<Scalar>::infinity();
         const std::size_t BH = batch * num_heads_;
@@ -1616,7 +1617,8 @@ private:
         auto r = engine.from_matrix(mask);
         NN_ASSERT(r, r ? "" : r.error().message.c_str());
         mask_cache_ = std::move(*r);
-        mask_cached_key_ = key;
+        mask_cached_batch_ = batch;
+        mask_cached_seq_ = seq_len;
     }
 
 protected:
@@ -1845,7 +1847,8 @@ private:
 
     // pos_indices 缓存（避免每 step 重建）— 仅 use_pos_emb_ = true 时使用
     Tensor pos_indices_cache_;             // (total, 1) 值为 [0,0,..,1,1,..,...,seq-1,..]
-    std::size_t pos_indices_key_ = 0;      // 缓存键: (batch_size << 16) | seq_len
+    std::size_t pos_indices_batch_ = 0;    // 缓存键：batch_size（独立字段，避免位打包溢出）
+    std::size_t pos_indices_seq_ = 0;      // 缓存键：seq_len
 
     // batch 录制粒度：每隔 flush_interval_ 个 Transformer block 提交一次
     // 0 = 不在 block 间 flush（默认），>0 = 每 N 个 block flush 一次
@@ -1978,8 +1981,7 @@ public:
         {
             // ── 3a. 确保 pos_indices 缓存有效 ──
             {
-                const std::size_t key = (batch_size_ << 16) | seq_len;
-                if (pos_indices_key_ != key)
+                if (pos_indices_batch_ != batch_size_ || pos_indices_seq_ != seq_len)
                 {
                     Matrix pidx_m(total, 1);
                     for (std::size_t t = 0; t < seq_len; ++t)
@@ -1989,7 +1991,8 @@ public:
                     auto pidx_t = engine.from_matrix(pidx_m);
                     if (!pidx_t) return std::unexpected(pidx_t.error());
                     pos_indices_cache_ = std::move(*pidx_t);
-                    pos_indices_key_ = key;
+                    pos_indices_batch_ = batch_size_;
+                    pos_indices_seq_ = seq_len;
                 }
             }
 

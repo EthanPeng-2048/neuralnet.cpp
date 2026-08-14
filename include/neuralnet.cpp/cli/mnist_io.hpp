@@ -56,6 +56,9 @@ namespace nn::cli
         std::size_t row_count = 0;
         for (char c : buffer)
             if (c == '\n') ++row_count;
+        // 末行无换行符时也要计入（否则最后一行样本被静默丢弃）
+        if (!buffer.empty() && buffer.back() != '\n')
+            ++row_count;
         if (row_count == 0)
             return std::unexpected(nn::Error{"CSV file is empty or malformed: " + path});
 
@@ -152,9 +155,13 @@ namespace nn::cli
     {
         const std::size_t N =
             (eval_samples > 0) ? std::min(x.cols(), eval_samples) : x.cols();
+        if (N == 0)
+            return std::unexpected(nn::Error{"evaluate_mnist: empty dataset"});
 
-        // 若截取子集，则拷贝前 N 列
+        // 若截取子集，则拷贝前 N 列；全量评估直接引用原矩阵（避免无谓拷贝）
         nn::Matrix x_sub, y_sub;
+        const nn::Matrix *xp = &x;
+        const nn::Matrix *yp = &y_onehot;
         if (N < x.cols())
         {
             x_sub = nn::Matrix(x.rows(), N);
@@ -166,14 +173,11 @@ namespace nn::cli
                 for (std::size_t r = 0; r < y_onehot.rows(); ++r)
                     y_sub.set_value_unchecked(r, i, y_onehot.at_unchecked(r, i));
             }
-        }
-        else
-        {
-            x_sub = nn::Matrix(x);  // 拷贝
-            y_sub = nn::Matrix(y_onehot);
+            xp = &x_sub;
+            yp = &y_sub;
         }
 
-        auto x_tensor_r = engine.from_matrix(x_sub);
+        auto x_tensor_r = engine.from_matrix(*xp);
         if (!x_tensor_r) return std::unexpected(std::move(x_tensor_r).error());
 
         // batch 模式加速 forward（GPU 下消除 per-primitive 提交开销）
@@ -207,7 +211,7 @@ namespace nn::cli
             int true_label = -1;
             for (int j = 0; j < static_cast<int>(nn::MNIST_NUM_CLASSES); ++j)
             {
-                if (y_onehot.at_unchecked(j, i) == 1.0)
+                if (yp->at_unchecked(j, i) == 1.0)
                 {
                     true_label = j;
                     break;

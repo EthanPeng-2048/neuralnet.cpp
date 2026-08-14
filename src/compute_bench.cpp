@@ -131,14 +131,17 @@ int main(int argc, char* argv[])
         } else if (arg == "--size" && i + 1 < argc) {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
             if (!v) { std::cerr << "无效 --size: " << v.error().message << "\n"; return 1; }
+            if (*v == 0) { std::cerr << "--size 必须为正整数\n"; return 1; }
             base_size = *v;
         } else if (arg == "--iters" && i + 1 < argc) {
             auto v = nn::parse_number<int>(argv[++i]);
             if (!v) { std::cerr << "无效 --iters: " << v.error().message << "\n"; return 1; }
+            if (*v <= 0) { std::cerr << "--iters 必须为正整数\n"; return 1; }
             iters = *v;
         } else if (arg == "--warmup" && i + 1 < argc) {
             auto v = nn::parse_number<int>(argv[++i]);
             if (!v) { std::cerr << "无效 --warmup: " << v.error().message << "\n"; return 1; }
+            if (*v < 0) { std::cerr << "--warmup 必须为非负整数\n"; return 1; }
             warmup = *v;
         } else {
             std::cerr << "未知参数: " << arg << "\n";

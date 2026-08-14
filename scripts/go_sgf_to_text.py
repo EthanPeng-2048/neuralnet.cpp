@@ -90,6 +90,59 @@ def convert_coord_system(moves: list[str]) -> list[str]:
     return [c.translate(trans) for c in moves]
 
 
+def _extract_sgf_blocks(text: str) -> list[str]:
+    """提取顶层 ( ... ) 块，正确处理变例嵌套括号。"""
+    blocks = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == '(':
+            start = i
+            depth = 0
+            while i < n:
+                if text[i] == '(':
+                    depth += 1
+                elif text[i] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        i += 1
+                        break
+                i += 1
+            else:
+                break  # 未闭合括号：忽略剩余文本
+            blocks.append(text[start:i])
+        else:
+            i += 1
+    return blocks
+
+
+def _extract_mainline_moves(block: str) -> list[str]:
+    """
+    仅提取主变（第一层括号内、未嵌套于变例中）的着法。
+    嵌套括号 depth >= 2 的 ';B[...]' 是变例分支，跳过。
+    """
+    moves = []
+    depth = 0
+    pos = 0
+    n = len(block)
+    while pos < n:
+        ch = block[pos]
+        if ch == '(':
+            depth += 1
+            pos += 1
+            continue
+        if ch == ')':
+            depth = max(0, depth - 1)
+            pos += 1
+            continue
+        if ch == ';' and depth == 1:
+            m = re.match(r';([BW])\[([a-z]{2}|tt)\]', block[pos:])
+            if m:
+                moves.append(m.group(2))
+        pos += 1
+    return moves
+
+
 def parse_sgf_games(sgf_text: str) -> list[tuple[list[str], str | None]]:
     """
     从 SGF 文本中提取所有对局的落子序列和结果。
@@ -102,7 +155,7 @@ def parse_sgf_games(sgf_text: str) -> list[tuple[list[str], str | None]]:
     """
     results = []
 
-    game_blocks = re.findall(r'\((.*?)\)', sgf_text, re.DOTALL)
+    game_blocks = _extract_sgf_blocks(sgf_text)
     if not game_blocks:
         game_blocks = [sgf_text]
 
@@ -114,10 +167,8 @@ def parse_sgf_games(sgf_text: str) -> list[tuple[list[str], str | None]]:
             if sz != 19:
                 continue
 
-        moves = []
-        # 先宽松提取坐标（a-z，含 tt=PASS），再统一坐标体系
-        for m in re.finditer(r';([BW])\[([a-z]{2}|tt)\]', block):
-            moves.append(m.group(2))
+        # 只提取主变着法（变例分支不混入主线）
+        moves = _extract_mainline_moves(block)
 
         if not moves:
             continue
@@ -146,7 +197,7 @@ def game_to_winner_perspective(moves: list[str], winner: str | None) -> str | No
     winner="W": 白方是 <me>，黑方是 <enemy>
     winner=None: 返回 None（无结果，跳过）
 
-    返回: "<me> pd <enemy> dp <me> pp ..." 或 None
+    返回: "<me> p d <enemy> d p <me> p p ..." 或 None
     """
     if winner is None:
         return None
@@ -156,7 +207,11 @@ def game_to_winner_perspective(moves: list[str], winner: str | None) -> str | No
         is_me = (i % 2 == 0 and winner == 'B') or \
                 (i % 2 == 1 and winner == 'W')
         prefix = "<me>" if is_me else "<enemy>"
-        tokens.append(f"{prefix} {coord}")
+        # 坐标拆为列+行两个 token（如 pd → p d）
+        if coord == 'tt':
+            tokens.append(f"{prefix} tt")
+        else:
+            tokens.append(f"{prefix} {coord[0]} {coord[1]}")
 
     return ' '.join(tokens)
 
@@ -169,42 +224,41 @@ def generate_go_tokenizer(output_path: str) -> int:
     """
     生成围棋专用的 SpaceTokenizer JSON（含 <me>/<enemy> 视角 token）。
 
+    坐标不再使用合并的双字符 token（如 "pd"），而是拆为列+行
+    两个独立字符 token（如 "p" "d"），由 SpaceTokenizer 的
+    ASCII 字节回退自动编码。词表只包含必要的多字符 token。
+
     词表布局：
       ID 0     = <unk>
       ID 1     = <pad>
       ID 2     = <num>
-      ID 3-258 = 256 个字节 token
-      ID 259-620 = 362 个围棋坐标
-      ID 621   = <me>
-      ID 622   = <enemy>
-      总词表大小 = 623
+      ID 3-258 = 256 个字节 token（覆盖 a-z 等单字符）
+      ID 259   = tt（PASS）
+      ID 260   = <me>
+      ID 261   = <enemy>
+      总词表大小 = 262
     """
     vocab = {}
-    idx = 259
 
-    # 361 个棋盘坐标
-    for row in range(19):
-        for col in range(19):
-            coord = chr(ord('a') + col) + chr(ord('a') + row)
-            hex_val = ''.join(f'{ord(c):02x}' for c in coord)
-            vocab[str(idx)] = hex_val
-            idx += 1
+    # 256 个字节 token（确保 id_to_token_ 完整，解码不会丢失字符）
+    for i in range(256):
+        hex_val = f'{i:02x}'
+        vocab[str(3 + i)] = hex_val
 
-    # PASS
+    # PASS（tt）
     hex_val = ''.join(f'{ord(c):02x}' for c in 'tt')
-    vocab[str(idx)] = hex_val
-    idx += 1
+    vocab['259'] = hex_val
 
     # 视角 token
-    for tag in ['<me>', '<enemy>']:
-        hex_val = ''.join(f'{ord(c):02x}' for c in tag)
-        vocab[str(idx)] = hex_val
-        idx += 1
+    hex_val = ''.join(f'{ord(c):02x}' for c in '<me>')
+    vocab['260'] = hex_val
+    hex_val = ''.join(f'{ord(c):02x}' for c in '<enemy>')
+    vocab['261'] = hex_val
 
     tokenizer = {
         "type": "space_tokenizer",
         "vocab": vocab,
-        "vocab_size": idx,
+        "vocab_size": 262,
         "special_tokens": {
             "<unk>": 0,
             "<pad>": 1,
@@ -215,7 +269,7 @@ def generate_go_tokenizer(output_path: str) -> int:
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(tokenizer, f, indent=2, ensure_ascii=False)
 
-    return idx
+    return 262
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -225,7 +279,11 @@ def generate_go_tokenizer(output_path: str) -> int:
 def sgf_to_rc(coord: str) -> tuple[int, int]:
     if coord == 'tt':
         return (-1, -1)
-    return (ord(coord[1]) - ord('a'), ord(coord[0]) - ord('a'))
+    # SGF 标准坐标跳过 'i'：j 及以后的字母需要减 1
+    def _axis(ch: str) -> int:
+        v = ord(ch) - ord('a')
+        return v - 1 if v > 8 else v  # 'i' = 8，之后跳 1
+    return (_axis(coord[1]), _axis(coord[0]))
 
 
 def print_board(moves: list[str], last_n: int = 5):
@@ -243,7 +301,7 @@ def print_board(moves: list[str], last_n: int = 5):
     last_colors = {(r, c): (1 if i % 2 == 0 else 2)
                    for r, c, i in last_positions[-last_n:]}
 
-    col_labels = '   ' + ' '.join('abcdefghjklmnopqrs')
+    col_labels = '   ' + ' '.join('abcdefghjklmnopqrst')
     print(col_labels)
     print('  +' + '-' * 37 + '+')
     for r in range(19):
@@ -306,8 +364,7 @@ def verify_tokenizer(tokenizer_path: str, sample_text: str):
     print(f"  解码:  {decoded}")
     print(f"  往返一致: {'✅' if decoded == sample_text else '❌ 不一致!'}")
     print(f"  词表大小: {tok_data['vocab_size']}")
-    print(f"  Go token: 362 (ID 259~620)")
-    print(f"  视角 token: <me>=621, <enemy>=622")
+    print(f"  特殊 token: tt=259, <me>=260, <enemy>=261")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

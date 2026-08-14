@@ -91,8 +91,9 @@ public:
         if (max_norm <= 0 || grads_.empty())
             return {};
 
-        // 计算全局梯度平方和
-        Scalar total_sq = 0;
+        // 计算全局梯度平方和：每个梯度张量归约到 (1,1) 标量后在设备端累加，
+        // 最后仅下载一次（而非每张量一次 PCIe 往返）。
+        Tensor acc;
         for (auto& g_ref : grads_)
         {
             auto& g = g_ref.get();
@@ -105,11 +106,23 @@ public:
             // 按列求和 → (1, 1) 标量张量
             auto col_sum_r = engine_.col_reduce_sum(*row_sums_r);
             if (!col_sum_r) return std::unexpected(col_sum_r.error());
-            // 下载到 CPU 获取标量值
-            auto m_r = engine_.to_matrix(*col_sum_r);
-            if (!m_r) return std::unexpected(m_r.error());
-            total_sq += m_r->at(0, 0);
+
+            if (acc.valid())
+            {
+                auto sum_r = engine_.elementwise_binary(BinaryOp::Add, acc, *col_sum_r);
+                if (!sum_r) return std::unexpected(sum_r.error());
+                acc = std::move(*sum_r);
+            }
+            else
+            {
+                acc = std::move(*col_sum_r);
+            }
         }
+
+        // 仅一次下载获取全局平方和
+        auto m_r = engine_.to_matrix(acc);
+        if (!m_r) return std::unexpected(m_r.error());
+        const Scalar total_sq = m_r->at(0, 0);
 
         Scalar norm = std::sqrt(total_sq);
         if (norm <= max_norm)
@@ -234,12 +247,10 @@ protected:
     std::vector<Tensor> v_;  // 二阶矩
 
     // Adam 核心更新（提取为 protected，AdamW 复用）
-    [[nodiscard]] Result<void> adam_update_(std::size_t i)
+    // inv_bc1/inv_bc2 由 step() 提前计算（每步仅一次 pow），失败时不推进 t。
+    [[nodiscard]] Result<void> adam_update_(
+        std::size_t i, Scalar inv_bc1, Scalar inv_bc2)
     {
-        const Scalar bc1 = Scalar{1} - std::pow(beta1_, static_cast<Scalar>(t_));
-        const Scalar bc2 = Scalar{1} - std::pow(beta2_, static_cast<Scalar>(t_));
-        const Scalar inv_bc1 = Scalar{1} / bc1;
-        const Scalar inv_bc2 = Scalar{1} / bc2;
         const Scalar one_minus_beta1 = Scalar{1} - beta1_;
         const Scalar one_minus_beta2 = Scalar{1} - beta2_;
 
@@ -317,12 +328,19 @@ public:
     {
         if (auto r = validate_sizes_(); !r) return std::unexpected(r.error());
 
-        ++t_;
+        // 偏差修正：每步只计算一次（而非每参数重复 pow）
+        const std::size_t t_next = t_ + 1;
+        const Scalar bc1 = Scalar{1} - std::pow(beta1_, static_cast<Scalar>(t_next));
+        const Scalar bc2 = Scalar{1} - std::pow(beta2_, static_cast<Scalar>(t_next));
+        const Scalar inv_bc1 = Scalar{1} / bc1;
+        const Scalar inv_bc2 = Scalar{1} / bc2;
+
         for (std::size_t i = 0; i < params_.size(); ++i)
         {
-            auto r = adam_update_(i);
+            auto r = adam_update_(i, inv_bc1, inv_bc2);
             if (!r) return std::unexpected(r.error());
         }
+        t_ = t_next;  // 全部参数成功才推进步数（失败时不推进）
         return {};
     }
 };
@@ -364,7 +382,12 @@ public:
     {
         if (auto r = validate_sizes_(); !r) return std::unexpected(r.error());
 
-        ++t_;
+        // 偏差修正：每步只计算一次（而非每参数重复 pow）
+        const std::size_t t_next = t_ + 1;
+        const Scalar bc1 = Scalar{1} - std::pow(beta1_, static_cast<Scalar>(t_next));
+        const Scalar bc2 = Scalar{1} - std::pow(beta2_, static_cast<Scalar>(t_next));
+        const Scalar inv_bc1 = Scalar{1} / bc1;
+        const Scalar inv_bc2 = Scalar{1} / bc2;
         const Scalar decay_factor = Scalar{1} - lr_ * wd_;
 
         for (std::size_t i = 0; i < params_.size(); ++i)
@@ -377,9 +400,10 @@ public:
             }
 
             // Adam 更新
-            auto r = adam_update_(i);
+            auto r = adam_update_(i, inv_bc1, inv_bc2);
             if (!r) return std::unexpected(r.error());
         }
+        t_ = t_next;  // 全部参数成功才推进步数（失败时不推进）
         return {};
     }
 };

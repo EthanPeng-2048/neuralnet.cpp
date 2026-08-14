@@ -54,11 +54,11 @@ static double bench_us(Func&& fn, int warmup, int iters)
 // ══════════════════════════════════════════════════════════════════════════
 static void bench_parallel_threshold(int warmup, int iters)
 {
-    std::cout << "\n┌──────────────────────────────────────────────────────────────────┐\n"
-              << "│ 测试 1: PARALLEL_THRESHOLD 探测 (y[i] = 2*x[i] + 1)            │\n"
-              << "├──────────┬──────────┬──────────┬──────────┬──────────┬──────────┤\n"
-              << "│ 元素数   │ 串行(μs) │ 并行(μs) │ 加速比   │ 调度(μs) │ 建议     │\n"
-              << "├──────────┼──────────┼──────────┼──────────┼──────────┼──────────┤\n";
+    std::cout << "\n┌─────────────────────────────────────────────────────────────┐\n"
+              << "│ 测试 1: PARALLEL_THRESHOLD 探测 (y[i] = 2*x[i] + 1)        │\n"
+              << "├──────────┬──────────┬──────────┬──────────┬───────────────┤\n"
+              << "│ 元素数   │ 串行(μs) │ 并行(μs) │ 加速比   │ 建议          │\n"
+              << "├──────────┼──────────┼──────────┼──────────┼───────────────┤\n";
 
     std::mt19937_64 rng(42);
     std::uniform_real_distribution<Scalar> dist(-1.0f, 1.0f);
@@ -89,8 +89,7 @@ static void bench_parallel_threshold(int warmup, int iters)
                 [](Scalar v) { return Scalar{2} * v + Scalar{1}; });
         }, warmup, iters);
 
-        // 调度开销估算（用最小元素数 1024 测一次，作为常数）
-        // 对每个 n 直接给出加速比
+        // 对每个 n 直接给出加速比（原“调度(μs)”列恒为 0，已移除）
         double speedup = t_serial / t_parallel;
         const char* advice;
         if (speedup < 0.9)       advice = "串行优";
@@ -101,11 +100,10 @@ static void bench_parallel_threshold(int warmup, int iters)
                   << " │ " << std::setw(8) << t_serial
                   << " │ " << std::setw(8) << t_parallel
                   << " │ " << std::setw(7) << speedup << "x"
-                  << " │ " << std::setw(8) << (t_parallel - t_serial / std::max(1.0, speedup))
-                  << " │ " << std::setw(8) << advice
+                  << " │ " << std::setw(13) << advice
                   << "  │\n";
     }
-    std::cout << "└──────────┴──────────┴──────────┴──────────┴──────────┴──────────┘\n";
+    std::cout << "└──────────┴──────────┴──────────┴──────────┴───────────────┘\n";
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -294,7 +292,8 @@ static void bench_col_reduce_parallel(int warmup, int iters)
             const auto self = m.span();
             auto out = out_par_row.span();
 
-            const std::size_t n_threads = std::thread::hardware_concurrency();
+            const std::size_t n_threads = std::max<std::size_t>(
+                std::thread::hardware_concurrency(), 1);
             std::vector<Scalar> local_acc(n_threads * C, Scalar{0});
             const std::size_t base = R / n_threads;
             const std::size_t rem = R % n_threads;
@@ -445,12 +444,14 @@ int main(int argc, char* argv[])
         {
             auto v = nn::parse_number<int>(argv[++i]);
             if (!v) { std::cerr << "无效 --iters\n"; return 1; }
+            if (*v <= 0) { std::cerr << "--iters 必须为正整数\n"; return 1; }
             iters = *v;
         }
         else if (arg == "--warmup" && i + 1 < argc)
         {
             auto v = nn::parse_number<int>(argv[++i]);
             if (!v) { std::cerr << "无效 --warmup\n"; return 1; }
+            if (*v < 0) { std::cerr << "--warmup 必须为非负整数\n"; return 1; }
             warmup = *v;
         }
     }

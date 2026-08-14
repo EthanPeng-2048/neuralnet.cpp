@@ -66,7 +66,9 @@ def load_model_and_tokenizer(cfg):
     else:
         device = torch.device(cfg.device)
 
-    ckpt = torch.load(cfg.model, map_location=device, weights_only=False)
+    # checkpoint 仅含 config/state_dict 等安全类型，weights_only=True
+    # 防止加载不可信 pickle 时执行任意代码
+    ckpt = torch.load(cfg.model, map_location=device, weights_only=True)
     config = ckpt["config"]
 
     print(

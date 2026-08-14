@@ -155,8 +155,8 @@ def fetch_wiki(target: int, seen: set[str]) -> list[str]:
             if elapsed > 600:  # 10 分钟超时
                 print(f"\n  ⏱ 达到时间上限，已收集 {len(sentences)} 条")
                 break
-            if not futures:
-                time.sleep(0.5)
+            # 避免忙轮询空转 CPU：无论是否有任务在跑都短睡后再检查
+            time.sleep(0.2)
     print(f"\n  ✅ 维基百科: 共 {len(sentences)} 条")
     return sentences[:target]
 
