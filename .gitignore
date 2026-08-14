@@ -1,6 +1,7 @@
 ```
 # ==================== Build ====================
 build/
+build_rel/
 *.o
 *.obj
 *.a
@@ -30,17 +31,24 @@ pretrained/
 
 # ==================== Tokenizer / 词表 (训练产物) ====================
 gpt_bpe.json
+gpt_bpe_torch.json
 gpt_Bytezip.json
 wordzip.json
 tokenizer.json
+bpe_vocab.json
+charbpe_fast.json
+go_tokenizer.json
 vocab_bpe.txt
 vocab_bytezip.txt
 vocab_word.txt
 
 # ==================== Dataset (下载 / 生成) ====================
 dataset.txt
+go_games.txt
 datasets/
 texts/
+scripts/datasets/
+scripts/tokenizers/
 
 # ==================== Python ====================
 venv/
