@@ -29,7 +29,7 @@ neuralnet.cpp/
 │   ├── DEVELOPMENT_STANDARDS.md ← 开发规范
 │   ├── GPU_DESIGN_V2.md         ← GPU 后端设计 (Vulkan)
 │   └── 06-cuda-backend.md       ← CUDA 后端设计
-├── gui.py                       ← 图形化操作界面 (Tkinter)
+├── gui.py                       ← 图形化操作界面 (CustomTkinter)
 ├── include/neuralnet.cpp/
 │   ├── nn.hpp                   ← 统一入口头文件
 │   ├── config.hpp               ← SmartPolicy、BLOCK_SIZE
@@ -83,7 +83,7 @@ neuralnet.cpp/
 - **编译器**: LLVM Clang++ 22.1+（`C:/Program Files/LLVM/bin/clang++.exe`）
 - **C++ 标准**: C++26
 - **构建工具**: CMake 4.x Ninja
-- **GUI** (可选): Python 3.8+，tkinter（内置），Pillow（`pip install Pillow`）
+- **GUI** (可选): Python 3.10+，customtkinter（`pip install customtkinter`），Pillow（`pip install Pillow`）
 
 ## 构建与运行
 
@@ -141,7 +141,7 @@ python save_dataset.py
 
 ### 🖥️ 图形化界面 (GUI)
 
-基于 tkinter 的全功能图形化界面，覆盖 MNIST 训练/推理、GPT 训练/推理、分词器训练/推理，无需记忆命令行参数。
+基于 CustomTkinter 的全功能图形化界面，覆盖 MNIST 训练/推理、GPT 训练/推理、分词器训练/推理，无需记忆命令行参数。
 
 ```bash
 # 启动 GUI
@@ -154,10 +154,9 @@ python gui.py
 
 | Tab | 功能 |
 |-----|------|
-| 🏋️ **训练** | MNIST 模型训练：支持 MLP / Transformer 架构、超参数调节、恢复训练、学习率调度（fixed / cosine）、振荡抑制、GPU 加速；实时训练曲线 |
-| 🔍 **推理** | MNIST 图片推理：Top-K 预测 + 置信度条形图 + 图片预览；内置 ✍️ **手写板**，鼠标书写数字即刻识别 |
-| 🖼️ **图片查看** | 浏览 CSV 格式手写数字图片，前后翻页导航 |
-| 📝 **GPT 训练** | GPT 语言模型训练：架构参数、位置编码（learned / sinusoidal / alibi）、学习率调度、振荡抑制；实时 loss 曲线 |
+| 🏋️ **MNIST 训练** | MNIST 模型训练：MLP / Transformer 架构、超参数调节、恢复训练、学习率调度（fixed / cosine）、GPU 加速、评估样本数；实时 loss / acc 曲线 |
+| 🔍 **MNIST 推理** | MNIST 图片推理 + 图片查看：推理某张图片自动显示该图、Top-K 置信度条形图、目录翻页导航；内置 ✍️ **手写板**，鼠标书写数字即刻识别 |
+| 📝 **GPT 训练** | GPT 语言模型训练：位置编码（learned / sinusoidal / alibi）、激活（GeLU / SwiGLU）、归一化（LayerNorm / RMSNorm）、梯度累积、滑动窗口 stride、学习率调度（fixed / cosine / step_cosine）、TDR 防护、梯度裁剪；实时 loss 曲线 |
 | 💬 **GPT 推理** | GPT 文本生成：温度调节、交互模式、Token ID 调试输出 |
 | 🔤 **分词器训练** | 训练 BPE / CharBPE 分词器，配置词表大小和最小合并频率 |
 | 🔡 **分词器推理** | 分词器编码/解码测试，支持文本编码、ID 解码、文件编码 |
@@ -173,10 +172,11 @@ python gui.py
 6. 训练中可随时点击 **"⏹ 停止"** 终止
 
 **MNIST 推理：**
-1. 选择训练好的模型文件（`.bin`）
-2. 输入 CSV 图片路径或目录，设置 Top-K
-3. 点击 **"▶ 开始推理"**，左侧显示图片预览，右侧显示置信度条形图
-4. **手写板模式**：在白色画布上书写数字 → 右侧 28×28 预览实时显示 → 点击 **"🔍 识别手写数字"**
+1. 选择训练好的模型文件（`.bin`），设置 Top-K 与 GPU
+2. 选择单张 CSV 图片或包含多张图片的目录
+3. 点击 **"🔍 推理当前图片"** → 自动显示该图片 + Top-K 置信度条形图；目录模式可用 **上一张 / 下一张** 翻页浏览（已推理过的图片会缓存预测）
+4. 点击 **"▶ 推理整个目录"** 可批量推理并逐个自动显示
+5. **手写板模式**：在白色画布上书写数字 → 点击 **"🔍 识别手写数字"**，即刻得到预测
 
 **GPT 训练：**
 1. 选择训练文本文件（`.txt`）和词表 JSON

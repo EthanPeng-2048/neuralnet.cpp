@@ -426,7 +426,7 @@ int main() {
 
 ## 🖥️ 图形化界面 (GUI) 操作指南
 
-项目提供基于 tkinter 的全功能 GUI（`gui.py`），覆盖全部训练/推理/分词器操作，无需记忆命令行参数。
+项目提供基于 CustomTkinter 的全功能 GUI（`gui.py`），覆盖全部训练/推理/分词器操作，无需记忆命令行参数。
 
 ```bash
 # 启动 GUI
@@ -434,15 +434,14 @@ python gui.py
 ```
 
 > **前提**: 需要先构建 C++ 项目（`cmake -B build -G Ninja`），GUI 会调用 `build/` 目录下的可执行文件。
-> **依赖**: Python 3.8+，tkinter（Python 内置），Pillow（`pip install Pillow`，用于手写板功能）。
+> **依赖**: Python 3.10+，customtkinter（`pip install customtkinter`），Pillow（`pip install Pillow`，用于手写板功能）。
 
 ### GUI 功能一览
 
 | Tab | 功能 |
 |-----|------|
-| 🏋️ **训练** | MNIST 模型训练：支持 MLP / Transformer 架构切换、超参数调节、恢复训练、学习率调度（fixed / cosine）、GPU 加速、评估样本数；实时训练曲线 |
-| 🔍 **推理** | MNIST 图片推理：Top-K 预测 + 置信度条形图 + 图片预览；内置 ✍️ **手写板**，鼠标书写数字即刻识别 |
-| 🖼️ **图片查看** | 浏览 CSV 格式手写数字图片，前后翻页导航 |
+| 🏋️ **MNIST 训练** | MNIST 模型训练：支持 MLP / Transformer 架构切换、超参数调节、恢复训练、学习率调度（fixed / cosine）、GPU 加速、评估样本数；实时 loss / acc 曲线 |
+| 🔍 **MNIST 推理** | MNIST 图片推理 + 图片查看：推理某张图片自动显示该图、Top-K 置信度条形图、目录翻页导航；内置 ✍️ **手写板**，鼠标书写数字即刻识别 |
 | 📝 **GPT 训练** | GPT 语言模型训练：位置编码（learned / sinusoidal / alibi）、激活（GeLU / SwiGLU）、归一化（LayerNorm / RMSNorm）、梯度累积、滑动窗口 stride、学习率调度（fixed / cosine / step_cosine）、TDR 防护、梯度裁剪；实时 loss 曲线 |
 | 💬 **GPT 推理** | GPT 文本生成：温度调节、交互模式、Token ID 调试输出 |
 | 🔤 **分词器训练** | 训练 BPE / CharBPE 分词器，配置词表大小和最小合并频率 |
@@ -563,13 +562,14 @@ python gui.py
 
 ---
 
-### 🖼️ 图片查看 Tab
+### 🖼️ 图片查看（并入 MNIST 推理 Tab）
 
-浏览 CSV 格式的手写数字图片：
+图片查看与推理合并：选择单张 CSV 或目录后，**推理某张图片会自动显示该图**。
 
 1. 选择单张 CSV 图片文件或包含多张图片的目录
-2. 使用 **上一张 / 下一张** 按钮翻页导航
-3. 左侧显示 28×28 灰度图片预览
+2. 使用 **上一张 / 下一张** 按钮翻页导航（已推理过的图片会缓存预测结果）
+3. 左侧显示 28×28 灰度图片预览，右侧显示该图的 Top-K 置信度条形图
+4. 点击 **"🔍 推理当前图片"** 推理当前图并自动刷新预览与预测；**"▶ 推理整个目录"** 可批量推理并逐个自动显示
 
 ---
 
