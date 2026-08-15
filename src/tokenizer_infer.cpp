@@ -1,371 +1,245 @@
-/**
- * ByteZip 分词器推理程序
- *
- * 用法:
- *   tokenizer_infer --model <json> --text <string>      编码+解码
- *   tokenizer_infer --model <json> --encode <string>     仅编码
- *   tokenizer_infer --model <json> --decode <id,id,...>   仅解码
- *   tokenizer_infer --model <json> --benchmark <file>    性能测试
- *   tokenizer_infer --model <json> --interactive         交互模式
- */
+// ── BPE 分词器推理程序（编码/解码） ──────────────────────────────────────
+//
+// 加载词表 JSON → 编码文本为 token IDs / 解码 token IDs 为文本
+//
+// 自动根据 JSON 的 "type" 字段识别分词器类型：
+//   - bpe_tokenizer      → 字节级 BPE（BBPE）
+//   - char_bpe_tokenizer  → 字符级 BPE（支持中文）
+//   - wordzip_tokenizer   → WordZip 词级分词器
+//   - space_tokenizer     → 空白分词器
+//
+// 支持交互模式和命令行模式。
+// ─────────────────────────────────────────────────────────────────────────
 
-#include <neuralnet.cpp/tokenizer.hpp>
+#include <neuralnet.cpp/nn.hpp>
 
-#include <chrono>
-#include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <vector>
 
-// ── 帮助信息 ────────────────────────────────────────────────────────────
+// ==================== 帮助信息 ====================
 void print_usage(const char *prog)
 {
     std::cout
-        << "ByteZip 分词器推理程序\n\n"
+        << "BPE 分词器推理程序 (编码/解码)\n\n"
         << "用法:\n"
-        << "  " << prog << " --model <json> --text <string>        编码并解码\n"
-        << "  " << prog << " --model <json> --encode <string>      仅编码\n"
-        << "  " << prog << " --model <json> --decode <id,id,...>    仅解码\n"
-        << "  " << prog << " --model <json> --benchmark <file>     性能测试\n"
-        << "  " << prog << " --model <json> --interactive           交互模式\n\n"
+        << "  " << prog << " --vocab <path> --encode \"text\"    编码文本\n"
+        << "  " << prog << " --vocab <path> --decode \"ids\"      解码 token IDs\n"
+        << "  " << prog << " --vocab <path> --interactive         交互模式\n"
+        << "  " << prog << " --vocab <path> --encode-file <file>  编码文件\n\n"
         << "选项:\n"
-        << "  --model <path>       词表 JSON 路径 (必需)\n"
-        << "  --text <string>      输入文本（编码+解码并验证）\n"
-        << "  --encode <string>    仅编码\n"
-        << "  --decode <ids>       仅解码（逗号分隔的 ID 列表）\n"
-        << "  --benchmark <file>   对文件进行编码性能测试\n"
-        << "  --interactive        交互式编码/解码\n"
-        << "  --show-tokens        显示每个 token 的详细信息\n"
+        << "  --vocab <path>       词表 JSON 路径 (默认: bpe_vocab.json)\n"
+        << "                       自动识别分词器类型（bpe / charbpe / wordzip / space）\n"
+        << "  --encode <text>      编码文本为 token IDs\n"
+        << "  --decode <ids>       解码 token IDs (逗号分隔) 为文本\n"
+        << "  --encode-file <path> 编码整个文件\n"
+        << "  --interactive        交互模式 (输入 'quit' 退出)\n"
+        << "  --show-bytes         显示原始字节 (调试用)\n"
         << "  --help               显示此帮助信息\n";
 }
 
-// ── 命令行参数 ──────────────────────────────────────────────────────────
-enum class Mode
+// ==================== 命令行参数 ====================
+struct Config
 {
-    Text,        // 编码 + 解码验证
-    Encode,      // 仅编码
-    Decode,      // 仅解码
-    Benchmark,   // 性能测试
-    Interactive  // 交互模式
+    std::string vocab_path = "bpe_vocab.json";
+    std::string encode_text;
+    std::string decode_ids;
+    std::string encode_file;
+    bool interactive = false;
+    bool show_bytes = false;
 };
 
-struct InferArgs
+Config parse_args(int argc, char *argv[])
 {
-    std::string model_path;
-    std::string input;
-    Mode mode = Mode::Text;
-    bool show_tokens = false;
-};
-
-InferArgs parse_args(int argc, char *argv[])
-{
-    InferArgs args;
-
-    if (argc < 2)
-    {
-        print_usage(argv[0]);
-        std::exit(1);
-    }
-
+    Config cfg;
     for (int i = 1; i < argc; ++i)
     {
         std::string arg = argv[i];
-
         if (arg == "--help")
         {
             print_usage(argv[0]);
             std::exit(0);
         }
-        else if (arg == "--model" && i + 1 < argc)
-        {
-            args.model_path = argv[++i];
-        }
-        else if (arg == "--text" && i + 1 < argc)
-        {
-            args.input = argv[++i];
-            args.mode = Mode::Text;
-        }
+        else if (arg == "--vocab" && i + 1 < argc)
+            cfg.vocab_path = argv[++i];
         else if (arg == "--encode" && i + 1 < argc)
-        {
-            args.input = argv[++i];
-            args.mode = Mode::Encode;
-        }
+            cfg.encode_text = argv[++i];
         else if (arg == "--decode" && i + 1 < argc)
-        {
-            args.input = argv[++i];
-            args.mode = Mode::Decode;
-        }
-        else if (arg == "--benchmark" && i + 1 < argc)
-        {
-            args.input = argv[++i];
-            args.mode = Mode::Benchmark;
-        }
+            cfg.decode_ids = argv[++i];
+        else if (arg == "--encode-file" && i + 1 < argc)
+            cfg.encode_file = argv[++i];
         else if (arg == "--interactive")
-        {
-            args.mode = Mode::Interactive;
-        }
-        else if (arg == "--show-tokens")
-        {
-            args.show_tokens = true;
-        }
+            cfg.interactive = true;
+        else if (arg == "--show-bytes")
+            cfg.show_bytes = true;
         else
         {
             std::cerr << "未知参数: " << arg << "\n使用 --help 查看用法\n";
             std::exit(1);
         }
     }
-
-    if (args.model_path.empty())
-    {
-        std::cerr << "错误：必须指定 --model 路径\n";
-        print_usage(argv[0]);
-        std::exit(1);
-    }
-
-    return args;
+    return cfg;
 }
 
-// ── 解析逗号分隔的 ID 列表 ─────────────────────────────────────────────
+// ==================== 解析 token IDs 字符串 ====================
 std::vector<std::size_t> parse_ids(const std::string &s)
 {
     std::vector<std::size_t> ids;
-    std::istringstream iss(s);
+    std::stringstream ss(s);
     std::string token;
-    while (std::getline(iss, token, ','))
+    while (std::getline(ss, token, ','))
     {
         // 去除空白
-        auto start = token.find_first_not_of(" \t");
-        if (start == std::string::npos)
-            continue;
-        ids.push_back(static_cast<std::size_t>(std::stoul(token.substr(start))));
+        while (!token.empty() && (token.front() == ' ' || token.front() == '['))
+            token.erase(0, 1);
+        while (!token.empty() && (token.back() == ' ' || token.back() == ']'))
+            token.pop_back();
+        if (token.empty()) continue;
+        auto v = nn::parse_number<std::size_t>(token);
+        if (v) ids.push_back(*v);
     }
     return ids;
 }
 
-// ── 读取文本文件 ────────────────────────────────────────────────────────
-std::string read_text_file(const std::string &path)
+// ==================== 统一输出 token IDs ====================
+// 辅助函数：以 "Tokens (<n>): [id0, id1, ...]" 格式输出 ID 列表，
+// 消除交互模式 / 命令行模式 / 默认编码路径中的重复打印代码。
+void print_token_ids(const std::vector<std::size_t> &ids, std::ostream &os = std::cout)
 {
-    std::ifstream ifs(path, std::ios::binary);
-    if (!ifs)
-    {
-        std::cerr << "错误：无法打开文件 " << path << "\n";
-        std::exit(1);
-    }
-    ifs.seekg(0, std::ios::end);
-    const auto size = ifs.tellg();
-    ifs.seekg(0, std::ios::beg);
-    std::string content(static_cast<std::size_t>(size), '\0');
-    ifs.read(content.data(), size);
-    return content;
-}
-
-// ── 展示编码结果 ────────────────────────────────────────────────────────
-void show_encoding(const nn::ByteZipTokenizer &tokenizer,
-                   const std::string &text,
-                   const std::vector<std::size_t> &ids,
-                   bool show_detail)
-{
-    std::cout << "  原文: " << text << "\n";
-    std::cout << "  Token数: " << ids.size() << "\n";
-
-    if (show_detail)
-    {
-        std::cout << "  Token序列: [";
-        for (std::size_t i = 0; i < ids.size(); ++i)
-        {
-            if (i > 0)
-                std::cout << ", ";
-            std::cout << ids[i];
-        }
-        std::cout << "]\n";
-
-        std::cout << "  Token详情:\n";
-        for (std::size_t i = 0; i < ids.size(); ++i)
-        {
-            std::cout << "    [" << ids[i] << "] \""
-                      << tokenizer.try_decode_token(ids[i]) << "\"\n";
-        }
-    }
-}
-
-// ── 模式：编码+解码验证 ─────────────────────────────────────────────────
-void mode_text(const nn::ByteZipTokenizer &tokenizer,
-               const std::string &text, bool show_detail)
-{
-    auto ids = tokenizer.encode(text);
-    auto decoded = tokenizer.decode(ids);
-
-    show_encoding(tokenizer, text, ids, show_detail);
-
-    std::cout << "  解码: " << decoded << "\n";
-    std::cout << "  完美还原: " << (decoded == text ? "true" : "false") << "\n";
-}
-
-// ── 模式：仅编码 ────────────────────────────────────────────────────────
-void mode_encode(const nn::ByteZipTokenizer &tokenizer,
-                 const std::string &text, bool show_detail)
-{
-    auto ids = tokenizer.encode(text);
-    show_encoding(tokenizer, text, ids, show_detail);
-
-    std::cout << "  IDs: [";
+    os << "  Tokens (" << ids.size() << "): [";
     for (std::size_t i = 0; i < ids.size(); ++i)
     {
-        if (i > 0)
-            std::cout << ", ";
-        std::cout << ids[i];
+        if (i > 0) os << ", ";
+        os << ids[i];
     }
-    std::cout << "]\n";
+    os << "]\n";
 }
 
-// ── 模式：仅解码 ────────────────────────────────────────────────────────
-void mode_decode(const nn::ByteZipTokenizer &tokenizer,
-                 const std::string &id_str, bool show_detail)
+// ==================== 交互模式 ====================
+void interactive_mode(const nn::Tokenizer &tokenizer, bool show_bytes)
 {
-    auto ids = parse_ids(id_str);
+    std::cout << "Tokenizer 交互模式 (输入 'quit' 退出)\n";
+    std::cout << "  encode <text>  → 编码文本\n";
+    std::cout << "  decode <ids>   → 解码 token IDs (逗号分隔)\n\n";
 
-    if (show_detail)
-    {
-        std::cout << "  输入 IDs: [";
-        for (std::size_t i = 0; i < ids.size(); ++i)
-        {
-            if (i > 0)
-                std::cout << ", ";
-            std::cout << ids[i];
-        }
-        std::cout << "]\n";
-    }
-
-    auto decoded = tokenizer.decode(ids);
-    std::cout << "  解码: " << decoded << "\n";
-}
-
-// ── 模式：性能测试 ──────────────────────────────────────────────────────
-void mode_benchmark(const nn::ByteZipTokenizer &tokenizer,
-                    const std::string &file_path, bool show_detail)
-{
-    std::cout << "读取文件: " << file_path << "\n";
-    auto text = read_text_file(file_path);
-    std::cout << "文件大小: " << text.size() << " 字节\n";
-
-    // 预热
-    std::cout << "预热中...\n";
-    {
-        auto warmup = text.substr(0, std::min(text.size(), static_cast<std::size_t>(1000)));
-        (void)tokenizer.encode(warmup);
-    }
-
-    // 正式测试
-    const int rounds = 5;
-    std::cout << "编码测试 (" << rounds << " 轮)...\n";
-
-    std::vector<std::size_t> ids;
-    auto t0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < rounds; ++i)
-    {
-        ids = tokenizer.encode(text);
-    }
-    auto t1 = std::chrono::steady_clock::now();
-
-    const auto elapsed = std::chrono::duration<double>(t1 - t0).count();
-    const auto avg_ms = elapsed / rounds * 1000.0;
-    const auto throughput = static_cast<double>(text.size() * rounds) / elapsed / (1024.0 * 1024.0);
-
-    std::cout << std::fixed << std::setprecision(2);
-    std::cout << "\n📊 性能结果:\n";
-    std::cout << "  总耗时: " << elapsed << " 秒\n";
-    std::cout << "  平均: " << avg_ms << " 毫秒/轮\n";
-    std::cout << "  吞吐量: " << throughput << " MB/s\n";
-    std::cout << "  Token数: " << ids.size() << "\n";
-    std::cout << "  压缩率: " << std::setprecision(1)
-              << (static_cast<double>(text.size()) / static_cast<double>(ids.size()))
-              << " 字节/token\n";
-
-    if (show_detail)
-    {
-        // 解码验证
-        auto t2 = std::chrono::steady_clock::now();
-        auto decoded = tokenizer.decode(ids);
-        auto t3 = std::chrono::steady_clock::now();
-
-        std::cout << "  解码耗时: " << std::setprecision(2)
-                  << std::chrono::duration<double>(t3 - t2).count() * 1000.0
-                  << " 毫秒\n";
-        std::cout << "  完美还原: " << (decoded == text ? "true" : "false") << "\n";
-    }
-}
-
-// ── 模式：交互 ──────────────────────────────────────────────────────────
-void mode_interactive(const nn::ByteZipTokenizer &tokenizer, bool show_detail)
-{
-    std::cout << "ByteZip 分词器交互模式（输入 q 退出）\n\n";
-
-    std::string line;
     while (true)
     {
-        std::cout << "> ";
+        std::cout << ">>> ";
+        std::string line;
         if (!std::getline(std::cin, line))
             break;
-        if (line == "q" || line == "quit" || line == "exit")
+        if (line == "quit" || line == "exit")
             break;
         if (line.empty())
             continue;
 
-        auto ids = tokenizer.encode(line);
-        auto decoded = tokenizer.decode(ids);
-
-        std::cout << "  Token数: " << ids.size() << "\n";
-        if (show_detail)
+        if (line.starts_with("encode "))
         {
-            std::cout << "  IDs: [";
-            for (std::size_t i = 0; i < ids.size(); ++i)
+            std::string text = line.substr(7);
+            auto ids = tokenizer.encode(text);
+            print_token_ids(ids);
+            if (show_bytes)
             {
-                if (i > 0)
-                    std::cout << ", ";
-                std::cout << ids[i];
+                const auto &v = tokenizer.vocab();
+                std::cout << "  Bytes: ";
+                for (auto id : ids)
+                {
+                    if (id < v.size())
+                    {
+                        std::cout << "{";
+                        for (unsigned char b : v[id])
+                            std::cout << std::hex << static_cast<unsigned>(b) << " ";
+                        std::cout << std::dec << "}";
+                    }
+                }
+                std::cout << "\n";
             }
-            std::cout << "]\n";
         }
-        std::cout << "  解码: " << decoded << "\n";
-        std::cout << "  还原: " << (decoded == line ? "✓" : "✗") << "\n\n";
+        else if (line.starts_with("decode "))
+        {
+            auto ids = parse_ids(line.substr(7));
+            auto text = tokenizer.decode(ids);
+            std::cout << "  Text: \"" << text << "\"\n";
+        }
+        else
+        {
+            // 默认编码
+            auto ids = tokenizer.encode(line);
+            print_token_ids(ids);
+            auto decoded = tokenizer.decode(ids);
+            std::cout << "  Decode: \"" << decoded << "\"\n";
+        }
     }
 }
 
-// ── 主函数 ──────────────────────────────────────────────────────────────
+// ==================== 主函数 ====================
 int main(int argc, char *argv[])
 {
-    auto args = parse_args(argc, argv);
+    Config cfg = parse_args(argc, argv);
 
-    // 加载词表
-    nn::ByteZipTokenizer tokenizer;
-    std::cout << "加载词表: " << args.model_path << "\n";
-    if (auto load_result = tokenizer.load(args.model_path); !load_result)
+    // ── 加载词表（自动识别分词器类型） ─────────────────────
+    auto tokenizer = nn::load_tokenizer_from_file(cfg.vocab_path);
+    if (!tokenizer)
     {
-        std::cerr << "加载失败: " << load_result.error().message << '\n';
+        std::cerr << "加载词表失败或无法识别分词器类型: " << cfg.vocab_path << '\n'
+                  << "请检查 JSON 文件是否包含有效的 \"type\" 字段" << std::endl;
         return 1;
     }
-    std::cout << "词表大小: " << tokenizer.vocab_size() << " tokens\n\n";
+    std::cout << "词表已加载: " << tokenizer->vocab_size() << " 词" << std::endl;
 
-    switch (args.mode)
+    // ── 交互模式 ─────────────────────────────────────────────
+    if (cfg.interactive)
     {
-        case Mode::Text:
-            mode_text(tokenizer, args.input, args.show_tokens);
-            break;
-        case Mode::Encode:
-            mode_encode(tokenizer, args.input, args.show_tokens);
-            break;
-        case Mode::Decode:
-            mode_decode(tokenizer, args.input, args.show_tokens);
-            break;
-        case Mode::Benchmark:
-            mode_benchmark(tokenizer, args.input, args.show_tokens);
-            break;
-        case Mode::Interactive:
-            mode_interactive(tokenizer, args.show_tokens);
-            break;
+        interactive_mode(*tokenizer, cfg.show_bytes);
+        return 0;
     }
 
+    // ── 编码文本 ─────────────────────────────────────────────
+    if (!cfg.encode_text.empty())
+    {
+        auto ids = tokenizer->encode(cfg.encode_text);
+        print_token_ids(ids);
+        auto decoded = tokenizer->decode(ids);
+        std::cout << "Decode: \"" << decoded << "\"\n";
+        return 0;
+    }
+
+    // ── 解码 IDs ─────────────────────────────────────────────
+    if (!cfg.decode_ids.empty())
+    {
+        auto ids = parse_ids(cfg.decode_ids);
+        auto text = tokenizer->decode(ids);
+        std::cout << "Text: \"" << text << "\"\n";
+        return 0;
+    }
+
+    // ── 编码文件 ─────────────────────────────────────────────
+    if (!cfg.encode_file.empty())
+    {
+        auto text_result = nn::load_text_file(cfg.encode_file);
+        if (!text_result)
+        {
+            std::cerr << "读取文件失败: " << text_result.error().message << '\n';
+            return 1;
+        }
+        auto ids = tokenizer->encode(*text_result);
+        std::cout << "文件大小: " << text_result->size() << " 字节\n";
+        std::cout << "Token 数: " << ids.size() << "\n";
+        if (ids.empty())
+        {
+            std::cout << "压缩率: N/A (空输入)\n";
+            return 0;
+        }
+        std::cout << "压缩率: " << std::fixed << std::setprecision(2)
+                  << static_cast<double>(text_result->size()) / ids.size()
+                  << " bytes/token\n";
+        return 0;
+    }
+
+    // 无参数 → 交互模式
+    interactive_mode(*tokenizer, cfg.show_bytes);
     return 0;
 }
