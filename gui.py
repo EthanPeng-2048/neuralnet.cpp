@@ -154,15 +154,80 @@ class ScrollableFrame(ttk.Frame):
         self._canvas.yview_scroll(int(-event.delta / 120), "units")
 
 class LiveChart:
-    # ... (此处保留您原代码中的 LiveChart 完整实现，为节省篇幅省略，直接复用原代码即可) ...
-    def __init__(self, parent, height=200):
-        self.canvas = tk.Canvas(parent, height=height, bg="#1e1e1e")
+    """实时训练曲线图（Canvas 绘制，无需 matplotlib）"""
+    def __init__(self, parent, height=200, bg="#1e1e1e"):
+        self.canvas = tk.Canvas(parent, height=height, bg=bg, highlightthickness=1, highlightbackground="#333")
         self.canvas.pack(fill="both", expand=True)
-        self.series = {}
-    def add_point(self, s, x, y): 
-        self.series.setdefault(s, []).append((x,y))
-        # 实际使用时请补全原代码的 redraw 逻辑
-    def clear(self): self.series.clear()
+        self.series = {}  # {name: [(x,y), ...]}
+        self.colors = {"loss": "#ff6b6b", "acc": "#4ecdc4", "val_loss": "#ffd93d", "val_acc": "#6bcb77"}
+        self.x_min, self.x_max = 0, 100
+        self.y_min, self.y_max = 0, 1
+        
+    def clear(self):
+        self.series.clear()
+        self.canvas.delete("all")
+        
+    def add_point(self, series_name, x, y):
+        if series_name not in self.series:
+            self.series[series_name] = []
+        self.series[series_name].append((x, y))
+        self._redraw()
+        
+    def _redraw(self):
+        self.canvas.delete("plot")
+        if not self.series:
+            return
+            
+        # 自动调整 Y 轴范围
+        all_y = [y for pts in self.series.values() for _, y in pts]
+        if all_y:
+            self.y_min, self.y_max = min(all_y) * 0.95, max(all_y) * 1.05
+            if self.y_min == self.y_max:
+                self.y_min -= 0.1
+                self.y_max += 0.1
+                
+        # 自动调整 X 轴范围
+        all_x = [x for pts in self.series.values() for x, _ in pts]
+        if all_x:
+            self.x_max = max(all_x) + 5
+            
+        width = int(self.canvas.cget("width")) or 400
+        height = int(self.canvas.cget("height")) or 200
+        pad_left, pad_right = 50, 20
+        pad_top, pad_bot = 20, 30
+        plot_w = width - pad_left - pad_right
+        plot_h = height - pad_top - pad_bot
+        
+        # 绘制坐标轴
+        self.canvas.create_line(pad_left, pad_top, pad_left, height - pad_bot, fill="#555", width=1, tags="plot")
+        self.canvas.create_line(pad_left, height - pad_bot, width - pad_right, height - pad_bot, fill="#555", width=1, tags="plot")
+        
+        # 绘制网格和标签
+        for i in range(5):
+            y_pos = pad_top + i * plot_h / 4
+            val = self.y_max - i * (self.y_max - self.y_min) / 4
+            self.canvas.create_line(pad_left, y_pos, width - pad_right, y_pos, dash=(2, 2), fill="#333", tags="plot")
+            self.canvas.create_text(pad_left - 5, y_pos, text=f"{val:.2f}", anchor="e", fill="#888", font=("Consolas", 7), tags="plot")
+            
+        # 绘制各条曲线
+        for name, points in self.series.items():
+            color = self.colors.get(name, "#fff")
+            if len(points) < 2:
+                continue
+            coords = []
+            for x, y in points:
+                px = pad_left + (x - self.x_min) / (self.x_max - self.x_min + 1e-6) * plot_w
+                py = pad_top + (self.y_max - y) / (self.y_max - self.y_min + 1e-6) * plot_h
+                coords.extend([px, py])
+            self.canvas.create_line(coords, fill=color, width=2, tags="plot")
+            
+        # 图例
+        legend_x = width - pad_right - 80
+        legend_y = pad_top + 10
+        for i, (name, color) in enumerate(self.colors.items()):
+            if name in self.series:
+                self.canvas.create_line(legend_x, legend_y + i * 15, legend_x + 20, legend_y + i * 15, fill=color, width=2, tags="plot")
+                self.canvas.create_text(legend_x + 25, legend_y + i * 15, text=name, anchor="w", fill="#ccc", font=("Consolas", 8), tags="plot")
 
 # ═══════════════════════════════════════════════════════
 #  3. 主 GUI 类 (利用组件大幅瘦身)
