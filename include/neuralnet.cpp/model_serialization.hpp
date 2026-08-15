@@ -1,0 +1,504 @@
+#ifndef NN_MODEL_SERIALIZATION_HPP
+#define NN_MODEL_SERIALIZATION_HPP
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  model_io.hpp — 模型二进制序列化
+//
+//  职责：将 Model + ModelSpec 保存为二进制文件，或从文件加载参数。
+//  设计：
+//    - 使用固定宽度整数 (uint64_t) 保证跨平台/跨位宽兼容性
+//    - 纯库函数，无 I/O 副作用（调用方自行决定是否打印日志）
+//    - 向后兼容 V1 格式读取，新文件统一写入 V2 格式
+//    - 使用 Result<T> 返回错误，不抛异常
+// ═══════════════════════════════════════════════════════════════════════════
+
+#include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <span>
+#include <string>
+#include <tuple>
+#include <type_traits>
+#include <vector>
+
+#include "config.hpp"
+#include "model_spec.hpp"
+#include "compute_layer.hpp"
+#include "model_container.hpp"
+
+namespace nn
+{
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  二进制文件格式
+//
+//  Version 3 (当前格式，含精度标记 + 可选 tokenizer):
+//    [magic 4B] [version=3 4B] [precision 1B] [model_type 4B]
+//    [spec data...]
+//    [param matrices...]
+//    [tokenizer_len 8B] [tokenizer_json...]     ← V3 新增
+//
+//  Version 2 (含架构规格):
+//    [magic 4B] [version=2 4B] [model_type 4B] [spec data...] [matrices...]
+//
+//  Version 1 (仅参数):
+//    [magic 4B] [version=1 4B] [matrices...]
+//
+//  precision 字节: 0 = f32, 1 = f64（用于校验保存时与加载时的 Scalar 类型一致）
+//  tokenizer_len = 0 表示未嵌入分词器（向后兼容）
+// ═══════════════════════════════════════════════════════════════════════════
+
+inline constexpr uint32_t MODEL_MAGIC    = 0x4E4E4E4E;  // "NNNN"
+inline constexpr uint32_t MODEL_VERSION  = 3;
+
+// ── 精度标记（写入文件头，加载时校验） ──────────────────────────────────
+// 0 = float (f32), 1 = double (f64)
+inline constexpr uint8_t PRECISION_TAG = sizeof(Scalar) == 4 ? 0 : 1;
+static_assert(sizeof(Scalar) == 4 || sizeof(Scalar) == 8,
+              "Scalar must be float (4 bytes) or double (8 bytes)");
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  detail — 内部读写工具
+//
+//  所有函数使用固定宽度整数 (uint64_t) 替代 std::size_t，保证跨平台兼容。
+//  所有函数返回 Result<T>，失败时返回 Error 错误信息。
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace detail
+{
+
+// ── 安全二进制 I/O 辅助（替代 reinterpret_cast）─────────────────────
+// 使用 std::as_bytes(std::span) 实现类型安全的二进制读写，
+// 避免直接 reinterpret_cast<char*>。
+
+template <typename T>
+    requires std::is_trivially_copyable_v<T>
+[[nodiscard]] inline Result<void> write_bytes(std::ofstream &ofs, const T &v)
+{
+    auto bytes = std::as_bytes(std::span(&v, 1));
+    ofs.write(reinterpret_cast<const char *>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size_bytes()));
+    if (!ofs)
+        return std::unexpected(Error{"Write error"});
+    return {};
+}
+
+template <typename T>
+    requires std::is_trivially_copyable_v<T>
+[[nodiscard]] inline Result<T> read_bytes(std::ifstream &ifs)
+{
+    T v{};
+    auto bytes = std::as_writable_bytes(std::span(&v, 1));
+    ifs.read(reinterpret_cast<char *>(bytes.data()),
+             static_cast<std::streamsize>(bytes.size_bytes()));
+    if (!ifs)
+        return std::unexpected(Error{"Unexpected end of file"});
+    return v;
+}
+
+// ── 基础类型读写 ──────────────────────────────────────────────────────
+// 直接使用 write_bytes<T> / read_bytes<T>，不再提供 write_u32/u64 等冗余包装。
+
+// variadic 字段批量写入：依次写入每个字段，遇错即停
+template <typename... Ts>
+[[nodiscard]] inline Result<void> write_fields(std::ofstream &ofs, const Ts &...fields)
+{
+    Result<void> result = {};
+    bool stop = false;
+    auto write_one = [&](const auto &field) {
+        if (stop) return;
+        result = write_bytes(ofs, field);
+        if (!result) stop = true;
+    };
+    (write_one(fields), ...);
+    return result;
+}
+
+// variadic 字段批量读取：依次读出每个字段，遇错即停
+// 注意：实现使用递归模板逐个读取，避免 std::apply 在 MSVC 上的推导问题。
+namespace detail_read
+{
+// 递归终止：所有字段已读取
+template <typename Tuple>
+[[nodiscard]] inline Result<void> read_fields_rec(
+    std::ifstream & /*ifs*/, Tuple & /*values*/, std::index_sequence<>)
+{
+    return {};
+}
+
+// 递归读取第 I 个字段，然后读取剩余字段
+template <typename Tuple, std::size_t I, std::size_t... Rest>
+[[nodiscard]] inline Result<void> read_fields_rec(
+    std::ifstream &ifs, Tuple &values, std::index_sequence<I, Rest...>)
+{
+    using T = std::tuple_element_t<I, Tuple>;
+    auto r = read_bytes<T>(ifs);
+    if (!r) return std::unexpected(r.error());
+    std::get<I>(values) = *r;
+    return read_fields_rec(ifs, values, std::index_sequence<Rest...>{});
+}
+}  // namespace detail_read
+
+template <typename... Ts>
+[[nodiscard]] inline Result<std::tuple<Ts...>> read_fields(std::ifstream &ifs)
+{
+    std::tuple<Ts...> values{};
+    auto result = detail_read::read_fields_rec<std::tuple<Ts...>>(
+        ifs, values, std::index_sequence_for<Ts...>{});
+    if (!result) return std::unexpected(result.error());
+    return values;
+}
+
+// ── 矩阵读写 ──────────────────────────────────────────────────────────
+
+[[nodiscard]] inline Result<void> write_matrix(std::ofstream &ofs, const Matrix &m)
+{
+    if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.rows())); !r)
+        return std::unexpected(r.error());
+    if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.cols())); !r)
+        return std::unexpected(r.error());
+    const auto s = m.span();
+    ofs.write(reinterpret_cast<const char *>(s.data()),
+              static_cast<std::streamsize>(s.size_bytes()));
+    if (!ofs)
+        return std::unexpected(Error{"Write error while writing matrix data"});
+    return {};
+}
+
+[[nodiscard]] inline Result<void> read_matrix(std::ifstream &ifs, Matrix &m)
+{
+    auto rows_r = read_bytes<uint64_t>(ifs);
+    if (!rows_r) return std::unexpected(rows_r.error());
+    auto cols_r = read_bytes<uint64_t>(ifs);
+    if (!cols_r) return std::unexpected(cols_r.error());
+    const auto rows = static_cast<std::size_t>(*rows_r);
+    const auto cols = static_cast<std::size_t>(*cols_r);
+
+    if (rows != m.rows() || cols != m.cols())
+    {
+        return std::unexpected(Error{
+            "Matrix shape mismatch: expected (" + std::to_string(m.rows())
+            + ", " + std::to_string(m.cols()) + "), got ("
+            + std::to_string(rows) + ", " + std::to_string(cols) + ")"});
+    }
+
+    auto s = m.span();
+    ifs.read(reinterpret_cast<char *>(s.data()),
+             static_cast<std::streamsize>(s.size_bytes()));
+    if (!ifs)
+        return std::unexpected(Error{"Unexpected end of file while reading matrix data"});
+    return {};
+}
+
+// ── ModelSpec 序列化 ──────────────────────────────────────────────────
+
+[[nodiscard]] inline Result<void> write_spec(std::ofstream &ofs, const ModelSpec &spec)
+{
+    if (auto r = write_bytes<uint32_t>(ofs, static_cast<uint32_t>(spec.type)); !r)
+        return std::unexpected(r.error());
+
+    switch (spec.type)
+    {
+    case ModelType::MLP:
+    {
+        if (auto r = write_bytes<uint32_t>(ofs, static_cast<uint32_t>(spec.layer_dims.size())); !r)
+            return std::unexpected(r.error());
+        for (auto d : spec.layer_dims)
+            if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(d)); !r)
+                return std::unexpected(r.error());
+        break;
+    }
+
+    case ModelType::Transformer:
+        return write_fields(ofs,
+            static_cast<uint64_t>(spec.d_model),
+            static_cast<uint64_t>(spec.num_heads),
+            static_cast<uint64_t>(spec.d_ff),
+            static_cast<uint64_t>(spec.num_layers),
+            static_cast<uint64_t>(spec.patch_size));
+
+    case ModelType::GPT:
+        if (auto r = write_fields(ofs,
+                static_cast<uint64_t>(spec.vocab_size),
+                static_cast<uint64_t>(spec.d_model),
+                static_cast<uint64_t>(spec.seq_len),
+                static_cast<uint64_t>(spec.num_heads),
+                static_cast<uint64_t>(spec.d_ff),
+                static_cast<uint64_t>(spec.num_layers)); !r)
+            return std::unexpected(r.error());
+        // V5+: pos_encoding + activation + norm_type (向后兼容：旧文件无此字段，默认)
+        if (auto r = write_bytes<uint32_t>(ofs, static_cast<uint32_t>(spec.pos_encoding)); !r)
+            return std::unexpected(r.error());
+        if (auto r = write_bytes<uint32_t>(ofs, static_cast<uint32_t>(spec.activation)); !r)
+            return std::unexpected(r.error());
+        return write_bytes<uint32_t>(ofs, static_cast<uint32_t>(spec.norm_type));
+
+    default:
+        return std::unexpected(Error{"Cannot write unknown ModelType: "
+                           + std::to_string(static_cast<uint32_t>(spec.type))});
+    }
+    return {};
+}
+
+[[nodiscard]] inline Result<ModelSpec> read_spec(std::ifstream &ifs)
+{
+    ModelSpec spec;
+    auto type_r = read_bytes<uint32_t>(ifs);
+    if (!type_r) return std::unexpected(type_r.error());
+    spec.type = static_cast<ModelType>(*type_r);
+
+    switch (spec.type)
+    {
+    case ModelType::MLP:
+    {
+        auto nd_r = read_bytes<uint32_t>(ifs);
+        if (!nd_r) return std::unexpected(nd_r.error());
+        const auto nd = *nd_r;
+        spec.layer_dims.resize(nd);
+        for (uint32_t i = 0; i < nd; ++i)
+        {
+            auto d_r = read_bytes<uint64_t>(ifs);
+            if (!d_r) return std::unexpected(d_r.error());
+            spec.layer_dims[i] = static_cast<std::size_t>(*d_r);
+        }
+        break;
+    }
+
+    case ModelType::Transformer:
+    {
+        auto v = read_fields<uint64_t, uint64_t, uint64_t, uint64_t, uint64_t>(ifs);
+        if (!v) return std::unexpected(v.error());
+        auto& [dm, nh, df, nl, ps] = *v;
+        spec.d_model    = static_cast<std::size_t>(dm);
+        spec.num_heads  = static_cast<std::size_t>(nh);
+        spec.d_ff       = static_cast<std::size_t>(df);
+        spec.num_layers = static_cast<std::size_t>(nl);
+        spec.patch_size = static_cast<std::size_t>(ps);
+        break;
+    }
+
+    case ModelType::GPT:
+    {
+        auto v = read_fields<uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t>(ifs);
+        if (!v) return std::unexpected(v.error());
+        auto& [vs, dm, sl, nh, df, nl] = *v;
+        spec.vocab_size = static_cast<std::size_t>(vs);
+        spec.d_model    = static_cast<std::size_t>(dm);
+        spec.seq_len    = static_cast<std::size_t>(sl);
+        spec.num_heads  = static_cast<std::size_t>(nh);
+        spec.d_ff       = static_cast<std::size_t>(df);
+        spec.num_layers = static_cast<std::size_t>(nl);
+        // V5+: pos_encoding + activation（向后兼容：旧文件读到 EOF 时保持默认）
+        auto pe = read_bytes<uint32_t>(ifs);
+        if (pe)
+            spec.pos_encoding = static_cast<PosEncodingType>(*pe);
+        // else: 旧文件无此字段，spec.pos_encoding 已默认 Learned
+        auto act = read_bytes<uint32_t>(ifs);
+        if (act)
+            spec.activation = static_cast<ActivationType>(*act);
+        // else: 旧文件无此字段，spec.activation 已默认 GeLU
+        auto nt = read_bytes<uint32_t>(ifs);
+        if (nt)
+            spec.norm_type = static_cast<NormType>(*nt);
+        // else: 旧文件无此字段，spec.norm_type 已默认 LayerNorm
+        break;
+    }
+
+    default:
+        return std::unexpected(Error{"Unknown ModelType in file: "
+                           + std::to_string(static_cast<uint32_t>(spec.type))});
+    }
+
+    return spec;
+}
+
+// ── 文件头读写 ──────────────────────────────────────────────────────
+
+[[nodiscard]] inline Result<void> write_header(std::ofstream &ofs)
+{
+    if (auto r = write_bytes<uint32_t>(ofs, MODEL_MAGIC); !r)
+        return std::unexpected(r.error());
+    if (auto r = write_bytes<uint32_t>(ofs, MODEL_VERSION); !r)
+        return std::unexpected(r.error());
+    if (auto r = write_bytes<uint8_t>(ofs, PRECISION_TAG); !r)
+        return std::unexpected(r.error());
+    return {};
+}
+
+// 返回读到的 version，同时校验 magic number 和精度
+[[nodiscard]] inline Result<uint32_t> read_and_validate_header(std::ifstream &ifs)
+{
+    auto magic_r = read_bytes<uint32_t>(ifs);
+    if (!magic_r) return std::unexpected(magic_r.error());
+    if (*magic_r != MODEL_MAGIC)
+        return std::unexpected(Error{"Invalid model file: bad magic number (0x"
+                           + std::to_string(*magic_r) + ")"});
+
+    auto version_r = read_bytes<uint32_t>(ifs);
+    if (!version_r) return std::unexpected(version_r.error());
+    if (*version_r == 0 || *version_r > MODEL_VERSION)
+        return std::unexpected(Error{"Unsupported model file version: "
+                           + std::to_string(*version_r)});
+
+    // V3: 读取并校验精度标记
+    if (*version_r >= 3)
+    {
+        auto pt_result = read_bytes<uint8_t>(ifs);
+        if (!pt_result)
+            return std::unexpected(Error{"Unexpected end: missing precision tag"});
+        uint8_t precision_tag = *pt_result;
+        if (precision_tag != PRECISION_TAG)
+            return std::unexpected(Error{
+                "Precision mismatch: file uses " + std::string(precision_tag == 0 ? "f32" : "f64")
+                + ", but build uses " + std::string(PRECISION_TAG == 0 ? "f32" : "f64")});
+    }
+
+    return *version_r;
+}
+
+// ── Tokenizer JSON 读写（V3 新增） ──────────────────────────────────
+
+[[nodiscard]] inline Result<void> write_tokenizer(std::ofstream &ofs, const std::string &json)
+{
+    if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(json.size())); !r)
+        return std::unexpected(r.error());
+    if (!json.empty())
+    {
+        ofs.write(json.data(), static_cast<std::streamsize>(json.size()));
+        if (!ofs)
+            return std::unexpected(Error{"Write error while writing tokenizer"});
+    }
+    return {};
+}
+
+[[nodiscard]] inline Result<std::string> read_tokenizer(std::ifstream &ifs)
+{
+    auto len_r = read_bytes<uint64_t>(ifs);
+    if (!len_r) return std::unexpected(len_r.error());
+    const auto len = static_cast<std::size_t>(*len_r);
+    if (len == 0) return std::string{};  // 未嵌入
+
+    std::string json(len, '\0');
+    ifs.read(json.data(), static_cast<std::streamsize>(len));
+    if (!ifs)
+        return std::unexpected(Error{"Unexpected end while reading tokenizer data"});
+    return json;
+}
+
+} // namespace detail
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  公开 API
+//
+//  save_model      — 保存 Model + ModelSpec（可选嵌入 tokenizer JSON）
+//  load_model      — 从文件加载参数，返回嵌入的 tokenizer JSON（如有）
+//  peek_model_spec — 只读文件头，返回 ModelSpec（不读参数）
+//
+//  向后兼容 V1/V2/V3 读取，写入统一为 V3。
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── 保存模型（V3 格式，含精度标记 + 可选 tokenizer） ────────────────────
+// 新架构：参数为 Tensor*，通过 engine.to_matrix 下载到 CPU Matrix 后写入。
+[[nodiscard]] inline Result<void> save_model(const std::string &filename,
+    Model &model, const ModelSpec &spec, const std::string &tokenizer_json = {})
+{
+    std::ofstream ofs(filename, std::ios::binary);
+    if (!ofs)
+        return std::unexpected(Error{"Cannot open file for writing: " + filename});
+
+    if (auto r = detail::write_header(ofs); !r)
+        return std::unexpected(r.error());
+    if (auto r = detail::write_spec(ofs, spec); !r)
+        return std::unexpected(r.error());
+
+    auto& engine = model.engine();
+    auto params = model.parameters();
+    for (auto& p_tensor : params)
+    {
+        auto m = engine.to_matrix(p_tensor);
+        if (!m) return std::unexpected(m.error());
+        if (auto r = detail::write_matrix(ofs, *m); !r)
+            return std::unexpected(r.error());
+    }
+
+    // V3: 写入 tokenizer JSON（长度前缀，0 表示无）
+    if (auto r = detail::write_tokenizer(ofs, tokenizer_json); !r)
+        return std::unexpected(r.error());
+
+    if (!ofs)
+        return std::unexpected(Error{"Write error while saving model to: " + filename});
+    return {};
+}
+
+// ── 读取模型规格（只读头部，不读参数/tokenizer） ──────────────────────────
+//    V1 文件返回 ModelType::Unknown
+[[nodiscard]] inline Result<ModelSpec> peek_model_spec(const std::string &filename)
+{
+    std::ifstream ifs(filename, std::ios::binary);
+    if (!ifs)
+        return std::unexpected(Error{"Cannot open file for reading: " + filename});
+
+    auto version_r = detail::read_and_validate_header(ifs);
+    if (!version_r) return std::unexpected(version_r.error());
+
+    // V2/V3 有规格头
+    if (*version_r >= 2)
+        return detail::read_spec(ifs);
+
+    // V1 文件没有规格信息
+    return ModelSpec{ModelType::Unknown, {}, 0, 0, 0, 0, 0, 0, 0};
+}
+
+// ── 加载参数 + tokenizer（兼容 V1/V2/V3） ─────────────────────────────────
+//    返回嵌入的 tokenizer JSON 字符串（空串 = 未嵌入或旧格式）
+// 新架构：先 read_matrix 读入临时 CPU Matrix，再通过 engine.copy_from
+// 上传到参数 Tensor（CPU 拷贝 / GPU 上传由引擎实现决定）。
+[[nodiscard]] inline Result<std::string> load_model(const std::string &filename, Model &model)
+{
+    std::ifstream ifs(filename, std::ios::binary);
+    if (!ifs)
+        return std::unexpected(Error{"Cannot open file for reading: " + filename});
+
+    auto version_r = detail::read_and_validate_header(ifs);
+    if (!version_r) return std::unexpected(version_r.error());
+    const auto version = *version_r;
+
+    // V2/V3: 读取并跳过规格头（规格已隐含在构建好的 model 中）
+    // TODO: 此处读完 spec 即丢弃，未与 model 自身的架构校验。
+    //       完整校验需要 Layer 基类支持 spec() 方法，改动较大，暂留待后续实现。
+    if (version >= 2)
+    {
+        auto spec_r = detail::read_spec(ifs);
+        if (!spec_r) return std::unexpected(spec_r.error());
+    }
+
+    auto& engine = model.engine();
+    auto params = model.parameters();
+    for (auto& p_tensor : params)
+    {
+        // 先读入临时 Matrix（按参数 Tensor 的形状）
+        Matrix tmp(p_tensor.get().rows(), p_tensor.get().cols());
+        if (auto r = detail::read_matrix(ifs, tmp); !r)
+            return std::unexpected(r.error());
+        // 通过 engine 上传到参数 Tensor
+        if (auto r = engine.copy_from(p_tensor, tmp); !r)
+            return std::unexpected(r.error());
+    }
+
+    // V3: 读取嵌入的 tokenizer JSON
+    std::string tokenizer_json;
+    if (version >= 3)
+    {
+        auto tok_r = detail::read_tokenizer(ifs);
+        if (!tok_r) return std::unexpected(tok_r.error());
+        tokenizer_json = std::move(*tok_r);
+    }
+
+    if (!ifs)
+        return std::unexpected(Error{"Read error while loading model from: " + filename});
+    return tokenizer_json;
+}
+
+} // namespace nn
+
+#endif // NN_MODEL_SERIALIZATION_HPP

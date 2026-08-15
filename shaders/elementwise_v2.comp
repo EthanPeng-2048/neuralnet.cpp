@@ -1,0 +1,152 @@
+// ── elementwise_v2.comp ───────────────────────────────────────────────────
+// 纯原语逐元素运算着色器（不含任何算法）
+//
+// 设计原则：本着色器只提供 op-level 原语（加减乘除、exp、sqrt、max、min、
+// select 等），绝不包含 ReLU、GeLU、Softmax、LayerNorm 等算法。
+// 算法由 Layer 层通过组合原语表达。
+//
+// 绑定布局：
+//   binding 0: 输入 A（条件操作数 1 / 主操作数）
+//   binding 1: 输入 B（条件操作数 2 / then 张量 / 次操作数）
+//   binding 2: 输入 C（else 张量，仅 SELECT 模式使用）
+//   binding 3: 输出 OUT
+//
+// Push Constants：
+//   uint  count       — 元素总数
+//   uint  mode        — 运算模式（见下）
+//   uint  op          — 一元/二元算子编号（mode 0/1 使用）
+//   uint  cmp_op      — 比较算子编号（mode 2 SELECT 使用）
+//   uint  flags       — 位标志：
+//                         bit0: B 为标量（用 scalar_b 替代 B[idx]）
+//                         bit1: then 为标量（用 scalar_then 替代 B[idx]）
+//                         bit2: else 为标量（用 scalar_else 替代 C[idx]）
+//                         bit3: 二元运算标量在前（scalar op A，仅 mode 1）
+//   float scalar_b    — 标量 B / 条件操作数 2 标量
+//   float scalar_then — then 标量值
+//   float scalar_else — else 标量值
+//
+// 运算模式（mode）：
+//   0 = UNARY:    out = unary_op(A[idx])
+//   1 = BINARY:   out = binary_op(a, b)
+//                    a = A[idx]
+//                    b = (flags & 1) ? scalar_b : B[idx]
+//                    若 flags & 8: out = binary_op(b, a)  [标量在前]
+//   2 = SELECT:   out = compare_op(a, b) ? then_val : else_val
+//                    a = A[idx]
+//                    b = (flags & 1) ? scalar_b : B[idx]
+//                    then_val = (flags & 2) ? scalar_then : B[idx]
+//                    else_val = (flags & 4) ? scalar_else : C[idx]
+//   3 = AXPY:     out = A[idx] + scalar_b * B[idx]   (融合 axpy：1 次 dispatch 替代 3 次)
+//                  用于 Optimizer 的 scale_add_(dst, scalar, src) 操作
+//
+// 一元算子（op）：
+//   0=Neg, 1=Exp, 2=Log, 3=Sqrt, 4=Rsqrt, 5=Abs, 6=Tanh
+//
+// 二元算子（op）：
+//   0=Add, 1=Sub, 2=Mul, 3=Div, 4=Max, 5=Min
+//
+// 比较算子（cmp_op）：
+//   0=Lt, 1=Le, 2=Gt, 3=Ge, 4=Eq, 5=Ne
+//
+// ─────────────────────────────────────────────────────────────────────────
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer  BufA   { float buf_a[]; };
+layout(std430, binding = 1) readonly buffer  BufB   { float buf_b[]; };
+layout(std430, binding = 2) readonly buffer  BufC   { float buf_c[]; };
+layout(std430, binding = 3) writeonly buffer BufOut { float buf_out[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint  count;
+    uint  mode;
+    uint  op;
+    uint  cmp_op;
+    uint  flags;
+    float scalar_b;
+    float scalar_then;
+    float scalar_else;
+};
+
+// ── 一元运算 ──────────────────────────────────────────────────────────────
+float apply_unary(uint op, float x)
+{
+    if (op == 0u) return -x;                          // Neg
+    if (op == 1u) return exp(x);                      // Exp
+    if (op == 2u) return log(x);                      // Log
+    if (op == 3u) return sqrt(x);                     // Sqrt
+    if (op == 4u) return 1.0 / sqrt(x);               // Rsqrt
+    if (op == 5u) return abs(x);                      // Abs
+    if (op == 6u) return tanh(x);                     // Tanh
+    return 0.0;
+}
+
+// ── 二元运算 ──────────────────────────────────────────────────────────────
+float apply_binary(uint op, float a, float b)
+{
+    if (op == 0u) return a + b;                       // Add
+    if (op == 1u) return a - b;                       // Sub
+    if (op == 2u) return a * b;                       // Mul
+    if (op == 3u) return a / b;                       // Div
+    if (op == 4u) return max(a, b);                   // Max
+    if (op == 5u) return min(a, b);                   // Min
+    return 0.0;
+}
+
+// ── 比较运算 ──────────────────────────────────────────────────────────────
+bool apply_compare(uint op, float a, float b)
+{
+    if (op == 0u) return a <  b;                      // Lt
+    if (op == 1u) return a <= b;                      // Le
+    if (op == 2u) return a >  b;                      // Gt
+    if (op == 3u) return a >= b;                      // Ge
+    if (op == 4u) return a == b;                      // Eq
+    if (op == 5u) return a != b;                      // Ne
+    return false;
+}
+
+void main()
+{
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= count) return;
+
+    const float a = buf_a[idx];
+
+    // ── 模式 0：一元运算 ──
+    if (mode == 0u)
+    {
+        buf_out[idx] = apply_unary(op, a);
+        return;
+    }
+
+    // ── 模式 1：二元运算 ──
+    if (mode == 1u)
+    {
+        const float b = ((flags & 1u) != 0u) ? scalar_b : buf_b[idx];
+        if ((flags & 8u) != 0u)
+            buf_out[idx] = apply_binary(op, b, a);   // 标量在前
+        else
+            buf_out[idx] = apply_binary(op, a, b);   // 张量在前
+        return;
+    }
+
+    // ── 模式 2：条件选择 ──
+    if (mode == 2u)
+    {
+        const float b      = ((flags & 1u) != 0u) ? scalar_b      : buf_b[idx];
+        const float then_v = ((flags & 2u) != 0u) ? scalar_then   : buf_b[idx];
+        const float else_v = ((flags & 4u) != 0u) ? scalar_else   : buf_c[idx];
+        buf_out[idx] = apply_compare(cmp_op, a, b) ? then_v : else_v;
+        return;
+    }
+
+    // ── 模式 3：AXPY（融合 axpy：out = a + scalar_b * b）──
+    if (mode == 3u)
+    {
+        const float b = buf_b[idx];
+        buf_out[idx] = a + scalar_b * b;
+        return;
+    }
+}
