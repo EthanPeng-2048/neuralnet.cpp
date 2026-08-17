@@ -36,6 +36,29 @@ class QuickGeLU(nn.Module):
         return x * torch.sigmoid(self.BETA * x)
 
 
+class RMSNorm(nn.Module):
+    """RMSNorm（LLaMA 风格，仅权重 gamma，无偏置）。
+
+    复制自 C++ include/neuralnet.cpp/compute_layer.hpp 中的 RMSNorm：
+      out = x / sqrt(mean(x²) + eps) * gamma
+    C++ 的布局为 (features, batch)，torch 为 (batch, features)，数学等价。
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, seq, dim)
+        x_f = x.float()
+        rms = x_f.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+        return (x_f * rms).to(x.dtype) * self.weight
+
+    def extra_repr(self) -> str:
+        return f"dim={self.weight.shape[0]}, eps={self.eps}"
+
+
 class CausalSelfAttention(nn.Module):
     """因果多头自注意力（复制自 C++ CausalSelfAttention）。
 
@@ -128,12 +151,17 @@ class GPTBlock(nn.Module):
         x = x + FFN(LN2(x))
     """
 
-    def __init__(self, d_model: int, num_heads: int, d_ff: int, max_len: int = 1024):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int,
+                 max_len: int = 1024, block_norm_type: int = 0):
         super().__init__()
         self.self_attn = CausalSelfAttention(d_model, num_heads, max_len)
-        self.norm1 = nn.LayerNorm(d_model, eps=1e-5)
+        if block_norm_type == 1:  # RMSNorm
+            self.norm1 = RMSNorm(d_model)
+            self.norm2 = RMSNorm(d_model)
+        else:                     # LayerNorm（默认）
+            self.norm1 = nn.LayerNorm(d_model, eps=1e-5)
+            self.norm2 = nn.LayerNorm(d_model, eps=1e-5)
         self.ff = FeedForward(d_model, d_ff)
-        self.norm2 = nn.LayerNorm(d_model, eps=1e-5)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.self_attn(self.norm1(x))
@@ -162,6 +190,8 @@ class GPTModel(nn.Module):
         num_heads: int,
         d_ff: int,
         num_layers: int,
+        block_norm_type: int = 0,
+        final_norm_type: int = 0,
     ):
         super().__init__()
         if d_model % num_heads != 0:
@@ -180,11 +210,16 @@ class GPTModel(nn.Module):
 
         self.blocks = nn.ModuleList(
             [
-                GPTBlock(d_model, num_heads, d_ff, max_len=seq_len)
+                GPTBlock(d_model, num_heads, d_ff, max_len=seq_len,
+                         block_norm_type=block_norm_type)
                 for _ in range(num_layers)
             ]
         )
-        self.ln_f = nn.LayerNorm(d_model, eps=1e-5)
+        # ln_f 类型独立于 block（gpt_model.bin 中 block=LayerNorm、ln_f=RMSNorm）
+        if final_norm_type == 1:
+            self.ln_f = RMSNorm(d_model)
+        else:
+            self.ln_f = nn.LayerNorm(d_model, eps=1e-5)
         # LM Head: Linear(d_model → vocab_size)，不与 token_emb 共享权重（与 C++ 一致）
         self.lm_head = nn.Linear(d_model, vocab_size)
 

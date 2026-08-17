@@ -2,6 +2,7 @@
 #define NN_DOMAIN_TOKENIZER_HPP
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
@@ -186,82 +187,124 @@ protected:
     // 共享 BPE 训练：在已初始化的词表和 ID 序列上执行合并循环。
     // vocab 由子类传入（子类的 vocab_），merges_ / merge_map_ 为基类成员。
     // 训练结束后由调用方负责 rebuild_merge_map() 和 add_dialogue_markers_to_vocab_()。
+    //
+    // 优化：
+    //   1. 输入已去重（chunk + weight 对），调用方负责去重（见各 tokenizer train）
+    //   2. 增量 pair 频次更新：只更新 merge 邻域 pair（最多 5 个）
+    //   3. 每轮线性扫描 pair_freq 找 max + 扫描 dedup chunks 找 affected
     void bpe_train_impl_(
         std::vector<std::string> &vocab,
-        std::vector<std::vector<std::size_t>> &chunks,
+        std::vector<std::pair<std::vector<std::size_t>, std::size_t>> &chunks,
         std::size_t target_merges,
         std::uint32_t min_freq,
-        const std::function<void(std::string_view)> &log)
+        const std::function<void(std::string_view)> &log,
+        bool show_progress = false)
     {
-        // ── 增量 pair 频次统计（避免每轮重扫全部 chunk） ──────
-        // 用 64 位编码 pair：(a << 32) | b，消除 pair_hash 开销
-        std::unordered_map<std::uint64_t, std::size_t> pair_freq;
-        for (const auto &chunk : chunks)
-            for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
-                ++pair_freq[pair_key(chunk[i], chunk[i + 1])];
+        const std::size_t num_dedup = chunks.size();
+        log("  去重后 chunk 数: " + std::to_string(num_dedup));
 
+        // ── pair 频次表 ───────────────────────────────────────
+        std::unordered_map<std::uint64_t, std::size_t> pair_freq;
+        for (const auto &[chunk, w] : chunks)
+            for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
+                pair_freq[pair_key(chunk[i], chunk[i + 1])] += w;
+
+        // ── 合并循环 ───────────────────────────────────────────
+        std::size_t last_pct = static_cast<std::size_t>(-1);
         for (std::size_t round = 0; round < target_merges; ++round)
         {
-            if (pair_freq.empty()) break;
+            // 进度条：每变化 1% 刷新一次
+            if (show_progress)
+            {
+                const auto pct = round * 100 / std::max<std::size_t>(target_merges, 1);
+                if (pct != last_pct)
+                {
+                    last_pct = pct;
+                    render_progress_("合并", round, target_merges,
+                        "词表 " + std::to_string(vocab.size()));
+                }
+            }
 
-            auto best = std::ranges::max_element(pair_freq,
-                [](const auto &a, const auto &b) { return a.second < b.second; });
+            // 线性扫描找最优 pair。
+            // 频次相同时按 pair_key 打破平局（与 unordered_map 迭代顺序无关），
+            // 保证顺序执行与并行预分词训练结果完全一致。
+            std::uint64_t best_key = 0;
+            std::size_t best_freq = 0;
+            for (const auto &[key, freq] : pair_freq)
+                if (freq > best_freq ||
+                    (freq == best_freq && key < best_key))
+                { best_freq = freq; best_key = key; }
 
-            if (best->second < min_freq)
+            if (best_freq < min_freq)
             {
                 log("  无更多高频 pair，提前停止于第 " + std::to_string(round) + " 轮");
                 break;
             }
 
-            const std::uint64_t best_key = best->first;
             const std::size_t id_a = static_cast<std::size_t>(best_key >> 32);
             const std::size_t id_b = static_cast<std::size_t>(best_key & 0xFFFFFFFF);
             const std::size_t new_id = vocab.size();
             vocab.push_back(vocab[id_a] + vocab[id_b]);
             merges_.push_back({id_a, id_b, new_id});
 
-            // 应用合并到所有 chunk（原地压缩 + 增量更新 pair_freq）
-            for (auto &chunk : chunks)
+            // 扫描去重 chunk，处理包含目标 pair 的 chunk
+            for (auto &[chunk, weight] : chunks)
             {
-                // 检测本 chunk 是否包含合并 pair
                 bool has_merge = false;
                 for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
                     if (chunk[i] == id_a && chunk[i + 1] == id_b) { has_merge = true; break; }
                 if (!has_merge) continue;
 
-                // 减去旧 pair 频次
-                for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
-                {
-                    auto key = pair_key(chunk[i], chunk[i + 1]);
-                    auto it = pair_freq.find(key);
-                    if (it != pair_freq.end() && --it->second == 0)
-                        pair_freq.erase(it);
-                }
-
-                // 原地压缩
+                // 增量更新：原地压缩 + 更新 pair_freq
                 std::size_t write = 0;
                 std::size_t read = 0;
                 while (read < chunk.size())
                 {
-                    if (read + 1 < chunk.size() && chunk[read] == id_a && chunk[read + 1] == id_b)
+                    bool is_match = (read + 1 < chunk.size() &&
+                                    chunk[read] == id_a && chunk[read + 1] == id_b);
+                    if (is_match)
                     {
-                        chunk[write++] = new_id;
+                        auto w = static_cast<std::ptrdiff_t>(weight);
+                        auto dec = [&](std::uint64_t k) {
+                            auto it = pair_freq.find(k);
+                            if (it != pair_freq.end())
+                            {
+                                if (it->second <= static_cast<std::size_t>(w))
+                                    pair_freq.erase(it);
+                                else
+                                    it->second -= static_cast<std::size_t>(w);
+                            }
+                        };
+                        auto inc = [&](std::uint64_t k) { pair_freq[k] += static_cast<std::size_t>(w); };
+
+                        dec(pair_key(chunk[read], chunk[read + 1]));
+                        if (write > 0)
+                        {
+                            dec(pair_key(chunk[write - 1], chunk[read]));
+                            inc(pair_key(chunk[write - 1], new_id));
+                        }
+                        if (read + 2 < chunk.size())
+                        {
+                            dec(pair_key(chunk[read + 1], chunk[read + 2]));
+                            inc(pair_key(new_id, chunk[read + 2]));
+                        }
+                        chunk[write] = new_id;
+                        ++write;
                         read += 2;
                     }
                     else
-                        chunk[write++] = chunk[read++];
+                    {
+                        if (read != write) chunk[write] = chunk[read];
+                        ++write;
+                        ++read;
+                    }
                 }
                 chunk.resize(write);
-
-                // 加上新 pair 频次
-                for (std::size_t i = 0; i + 1 < chunk.size(); ++i)
-                    ++pair_freq[pair_key(chunk[i], chunk[i + 1])];
             }
-
-            if ((round + 1) % 500 == 0)
-                log("  合并第 " + std::to_string(round + 1) + " 轮，词表: " +
-                    std::to_string(vocab.size()));
         }
+
+        if (show_progress)
+            finish_progress_("合并");
     }
 
     // 共享 BPE 合并：对单个 ID 序列应用合并规则（优先队列驱动，O(n log n)）。
@@ -347,6 +390,35 @@ protected:
     {
         auto it = merge_map_.find(pair_key(a, b));
         return it != merge_map_.end() ? it->second : merges_.size();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  控制台进度条共享构件
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 使用 \r 原地刷新当前行。子类在 show_progress 时调用。
+    // render_progress_ 渲染进度；finish_progress_ 结束并换行。
+
+    // 渲染进度条：\r[label] [####----] 45% tail
+    static void render_progress_(std::string_view label,
+                                 std::size_t cur, std::size_t total,
+                                 std::string_view tail = {})
+    {
+        constexpr std::size_t BAR_W = 40;
+        const auto denom = std::max<std::size_t>(total, 1);
+        const std::size_t filled = (total == 0) ? BAR_W
+            : std::min(BAR_W, cur * BAR_W / denom);
+        std::cout << '\r' << label << " [";
+        for (std::size_t i = 0; i < BAR_W; ++i)
+            std::cout << (i < filled ? '#' : '-');
+        const int pct = (total == 0) ? 100
+            : static_cast<int>(std::min<std::size_t>(100, cur * 100 / denom));
+        std::cout << "] " << pct << "% " << tail << std::flush;
+    }
+
+    // 结束进度条：覆盖为 "[label] 完成" 并换行
+    static void finish_progress_(std::string_view label)
+    {
+        std::cout << '\r' << label << " 完成" << std::string(48, ' ') << '\n' << std::flush;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -445,6 +517,152 @@ protected:
             tok += static_cast<char>(b);
         }
         return tok;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  并行预分词共享构件（BPETokenizer / CharBPETokenizer 训练复用）
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  预分词（文本 → 去重 chunk 频次表）是训练中耗时步骤之一，天然可并行：
+    //    1. 在"安全切分点"处把文本分成若干段（段与段互不重叠，且不切断任何词）
+    //    2. 每段通过全局线程池（global_thread_pool）在独立任务中执行预分词，
+    //       各自生成局部频次表（map）
+    //    3. 顺序归并为全局频次表（reduce）——结果与单线程完全一致
+    //
+    //  安全切分点：pos 处是空白、pos-1 处非空白（即"空白串起点"）。
+    //  因为 BPE/CharBPE 都是"空白作为下一个词的前缀"（GPT-2 风格），
+    //  任何词都不会以空白结尾，因此在空白串起点处切分绝不破坏任何词。
+
+    // 与 BPE 正则 \s / CharBPE is_space_byte 一致的空白判定（ASCII 空白集）
+    [[nodiscard]] static constexpr bool is_space_char(char c) noexcept
+    {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+    }
+
+    // 查找安全切分点：把 [0, text.size()) 分为约 target_segments 段。
+    // 返回升序切分点数组，均满足 is_space_char(text[pos]) && !is_space_char(text[pos-1])。
+    // 文本空白过少时返回较少切分点（调用方回退到更少并行任务）。
+    [[nodiscard]] static std::vector<std::size_t>
+    find_safe_splits(std::string_view text, std::size_t target_segments)
+    {
+        std::vector<std::size_t> splits;
+        if (target_segments <= 1 || text.size() < 2) return splits;
+
+        // 收集全部安全切分点（空白串起点）
+        std::vector<std::size_t> safe;
+        safe.reserve(text.size() / 16);
+        for (std::size_t i = 1; i < text.size(); ++i)
+            if (is_space_char(text[i]) && !is_space_char(text[i - 1]))
+                safe.push_back(i);
+        if (safe.empty()) return splits;
+
+        // 贪心选取最接近理想均匀位置的切分点
+        const std::size_t n_seg = std::min(target_segments, safe.size() + 1);
+        splits.reserve(n_seg - 1);
+        for (std::size_t k = 1; k < n_seg; ++k)
+        {
+            const std::size_t ideal = text.size() * k / n_seg;
+            auto it = std::lower_bound(safe.begin(), safe.end(), ideal);
+            std::size_t best = 0;
+            if (it == safe.end())
+                best = safe.back();
+            else if (it == safe.begin())
+                best = *it;
+            else
+            {
+                auto prev = it - 1;
+                best = (ideal - *prev <= *it - ideal) ? *prev : *it;
+            }
+            if (splits.empty() || best > splits.back())
+                splits.push_back(best);
+        }
+        return splits;
+    }
+
+    // 并行预分词框架（map-reduce，复用项目全局线程池）：
+    //   worker(begin, end, local, progress) 对 [begin,end) 执行预分词，
+    //     将 chunk 频次累加到 local；progress(pos) 可周期报告已处理偏移。
+    //   threads: 0=自动(线程池全部核心), 1=顺序, >1=指定并行度（上限=线程池大小）。
+    //   找不到安全切分点时自动回退顺序执行，结果与并行完全一致。
+    //   返回合并后的全局频次表。
+    static std::unordered_map<std::string, std::size_t>
+    parallel_pretokenize(
+        const std::string &text,
+        std::size_t threads,
+        std::string_view label,
+        bool show_progress,
+        const std::function<void(std::size_t, std::size_t,
+                                 std::unordered_map<std::string, std::size_t> &,
+                                 const std::function<void(std::size_t)> &)> &worker)
+    {
+        std::unordered_map<std::string, std::size_t> global;
+
+        // 顺序回退：进度直接按字节偏移渲染
+        auto run_sequential = [&] {
+            const std::function<void(std::size_t)> progress =
+                [&](std::size_t pos) {
+                    if (show_progress) render_progress_(label, pos, text.size());
+                };
+            worker(0, text.size(), global, progress);
+        };
+
+        if (text.size() < 2 || threads == 1) { run_sequential(); return global; }
+
+        auto &pool = global_thread_pool();
+        if (threads == 0)
+            threads = pool.size();                     // 自动：线程池全部核心
+        else if (threads > 1)
+            threads = std::min(threads, pool.size());  // 指定并行度，收敛到池大小
+        if (threads <= 1) { run_sequential(); return global; }
+
+        const auto splits = find_safe_splits(text, threads);
+        if (splits.size() + 1 < 2) { run_sequential(); return global; }
+
+        // 段边界（互不重叠，覆盖整个文本）
+        std::vector<std::pair<std::size_t, std::size_t>> ranges;
+        ranges.reserve(splits.size() + 1);
+        std::size_t begin = 0;
+        for (auto sp : splits) { ranges.emplace_back(begin, sp); begin = sp; }
+        ranges.emplace_back(begin, text.size());
+
+        // 进度：原子字节计数 + 进度线程（并行任务运行期间轮询渲染）
+        std::atomic<std::size_t> bytes_done{0};
+        std::thread progress_thr;
+        if (show_progress)
+            progress_thr = std::thread([&] {
+                std::size_t last = static_cast<std::size_t>(-1);
+                while (true)
+                {
+                    const auto d = bytes_done.load(std::memory_order_relaxed);
+                    if (d != last)
+                    {
+                        last = d;
+                        render_progress_(label, d, text.size());
+                    }
+                    if (d >= text.size()) break;
+                    std::this_thread::yield();
+                }
+            });
+
+        // 每段一个局部频次表（无共享写，天然无竞争），通过全局线程池并行执行
+        const std::size_t n = ranges.size();
+        std::vector<std::unordered_map<std::string, std::size_t>> locals(n);
+        pool.parallel_for_samples(n, [&](std::size_t k) {
+            const std::function<void(std::size_t)> noop = [](std::size_t) {};
+            worker(ranges[k].first, ranges[k].second, locals[k], noop);
+            bytes_done.fetch_add(ranges[k].second - ranges[k].first,
+                                 std::memory_order_relaxed);
+        });
+
+        if (progress_thr.joinable()) progress_thr.join();
+
+        // 归并局部频次表 → 全局
+        std::size_t total = 0;
+        for (const auto &m : locals) total += m.size();
+        global.reserve(total);
+        for (const auto &m : locals)
+            for (const auto &[w, c] : m)
+                global[w] += c;
+        return global;
     }
 };
 
@@ -1534,6 +1752,8 @@ public:
         std::size_t   vocab_size = DEFAULT_VOCAB_SIZE;
         std::uint32_t min_freq   = DEFAULT_MIN_FREQ;
         LogFn         log        = nullptr;
+        bool          show_progress = false;   // 训练时显示控制台进度条
+        std::uint32_t threads    = 0;   // 预分词并行: 0=自动(线程池全部核心), 1=顺序, >1=指定并行度
     };
 
     static const std::regex &pre_pattern()
@@ -1559,21 +1779,69 @@ public:
             : LogFn{[](std::string_view) { /* 静默 */ }};
 
         log("\n[BPE 训练] 预分词...");
-        auto chunks = pre_tokenize(text);
-        log("  预分词块数: " + std::to_string(chunks.size()));
+        const bool show_p = config.show_progress;
 
-        std::vector<std::vector<std::size_t>> byte_chunks;
-        byte_chunks.reserve(chunks.size());
+        // ── 预分词 + 字符串层去重计数（可并行，map-reduce） ──────
+        // 边按 regex 切分边填 word_freq，不产生全部 chunk 列表：
+        //   1) 内存：不再持有数亿个 string chunk（节省数 GB）
+        //   2) 性能：经全局线程池在安全切分点并行，结果与单线程完全一致
+        std::unordered_map<std::string, std::size_t> word_freq;
+        {
+            const std::string s(text);
+            auto worker = [&](std::size_t b, std::size_t e,
+                              std::unordered_map<std::string, std::size_t> &local,
+                              const std::function<void(std::size_t)> &progress)
+            {
+                const std::string seg(s.data() + b, e - b);
+                auto begin = std::sregex_iterator(seg.begin(), seg.end(), pre_pattern());
+                auto end   = std::sregex_iterator();
+                std::size_t last_mb = static_cast<std::size_t>(-1);
+                for (auto it = begin; it != end; ++it)
+                {
+                    ++local[it->str()];
+                    // 绝对偏移 = 段起点 + 段内偏移
+                    const auto pos = b + static_cast<std::size_t>(it->position()) + it->length();
+                    const auto mb  = pos / (1u << 20);
+                    if (mb != last_mb)
+                    {
+                        last_mb = mb;
+                        progress(pos);
+                    }
+                }
+            };
+            word_freq = parallel_pretokenize(s, config.threads, "预分词", show_p, worker);
+        }
+        log("  去重后 chunk 数: " + std::to_string(word_freq.size()));
+
+        // 只对 unique chunks 转字节向量 + 计数
+        std::vector<std::pair<std::vector<std::size_t>, std::size_t>> byte_chunks;
+        byte_chunks.reserve(word_freq.size());
         std::size_t total_bytes = 0;
-        for (const auto &chunk : chunks)
+        std::size_t enc_i = 0;
+        std::size_t last_pct = static_cast<std::size_t>(-1);
+        const std::size_t wf_size = word_freq.size();
+        for (auto &[w, cnt] : word_freq)
         {
             std::vector<std::size_t> ids;
-            ids.reserve(chunk.size());
-            for (unsigned char b : chunk)
+            ids.reserve(w.size());
+            for (unsigned char b : w)
                 ids.push_back(static_cast<std::size_t>(b));
             total_bytes += ids.size();
-            byte_chunks.push_back(std::move(ids));
+            byte_chunks.emplace_back(std::move(ids), cnt);
+            if (show_p)
+            {
+                ++enc_i;
+                const auto pct = enc_i * 100 / std::max<std::size_t>(wf_size, 1);
+                if (pct != last_pct)
+                {
+                    last_pct = pct;
+                    render_progress_("编码词条", enc_i, wf_size);
+                }
+            }
         }
+        word_freq.clear();
+        if (show_p)
+            finish_progress_("预分词");
         log("  总字节数: " + std::to_string(total_bytes));
 
         vocab_.clear();
@@ -1591,7 +1859,7 @@ public:
         log("  目标合并数: " + std::to_string(target_merges));
 
         // ── 共享 BPE 训练算法（基类 bpe_train_impl_） ──────────────
-        bpe_train_impl_(vocab_, byte_chunks, target_merges, config.min_freq, log);
+        bpe_train_impl_(vocab_, byte_chunks, target_merges, config.min_freq, log, show_p);
 
         rebuild_merge_map_();
         // ── 添加对话标记 token ──────────────────────────────────────
@@ -1795,6 +2063,8 @@ public:
         std::size_t   vocab_size = DEFAULT_VOCAB_SIZE;
         std::uint32_t min_freq   = DEFAULT_MIN_FREQ;
         LogFn         log        = nullptr;
+        bool          show_progress = false;   // 训练时显示控制台进度条
+        std::uint32_t threads    = 0;   // 预分词并行: 0=自动(线程池全部核心), 1=顺序, >1=指定并行度
     };
 
     CharBPETokenizer() = default;
@@ -1839,8 +2109,72 @@ public:
             : LogFn{[](std::string_view) { /* 静默 */ }};
 
         log("\n[CharBPE 训练] 预分词...");
-        auto chunks = pre_tokenize(text);
-        log("  预分词块数: " + std::to_string(chunks.size()));
+        const bool show_p = config.show_progress;
+
+        // ── 预分词 + 字符串层去重计数（可并行，map-reduce） ──────
+        // 边按 UTF-8 字符切分边填 word_freq，不产生全部 chunk 列表；
+        // 经全局线程池在安全切分点并行，结果与单线程完全一致。
+        std::unordered_map<std::string, std::size_t> word_freq;
+        {
+            auto worker = [&](std::size_t b, std::size_t e,
+                              std::unordered_map<std::string, std::size_t> &local,
+                              const std::function<void(std::size_t)> &progress)
+            {
+                std::size_t i = b;
+                std::size_t last_mb = static_cast<std::size_t>(-1);
+                while (i < e)
+                {
+                    // 捕获前导空白（附加到下一个非空字符前，GPT-2 风格）
+                    std::string prefix;
+                    while (i < e && is_space_byte(text[i]))
+                    {
+                        prefix += text[i++];
+                    }
+                    if (i >= e) break;
+
+                    // 读取一个"词"：连续同类字符
+                    std::string word = std::move(prefix);
+                    auto [cp, len] = decode_utf8(text, i);
+
+                    if (is_cjk(cp))
+                    {
+                        // CJK 字符：连续读取，遇到非 CJK 或 CJK 标点停止
+                        do {
+                            word.append(text, i, len);
+                            i += len;
+                            if (i >= e) break;
+                            std::tie(cp, len) = decode_utf8(text, i);
+                        } while (is_cjk(cp) && !is_cjk_punct(cp));
+                    }
+                    else if (is_alnum(cp))
+                    {
+                        do {
+                            word.append(text, i, len);
+                            i += len;
+                            if (i >= e) break;
+                            std::tie(cp, len) = decode_utf8(text, i);
+                        } while (is_alnum(cp));
+                    }
+                    else
+                    {
+                        // 其他字符（标点等）：单个字符
+                        word.append(text, i, len);
+                        i += len;
+                    }
+                    if (!word.empty())
+                        ++local[std::move(word)];
+
+                    const auto mb = i / (1u << 20);
+                    if (mb != last_mb)
+                    {
+                        last_mb = mb;
+                        progress(i);
+                    }
+                }
+            };
+            word_freq = parallel_pretokenize(text, config.threads, "预分词", show_p, worker);
+        }
+        log("  去重后 chunk 数: " + std::to_string(word_freq.size()));
 
         // ── 0. 校验最小词表大小（4 特殊 + 256 ASCII 兜底） ──────
         if (config.vocab_size < MIN_VOCAB_SIZE)
@@ -1870,49 +2204,88 @@ public:
         }
         // assert: vocab_.size() == CHAR_BASE == 260
 
-        // ── 2. 收集非 ASCII 字符，建立 char_to_id ──────────────
-        // ASCII 字符已在兜底表中，只收集非 ASCII（如中文汉字）。
-        std::vector<std::vector<std::size_t>> char_chunks;
-        char_chunks.reserve(chunks.size());
+        // ── 3. 收集非 ASCII 字符，建立 char_to_id ──────────────
+        // 遍历 unique chunks 收集字符。为保证并行预分词与顺序执行结果一致，
+        // 先收集去重字符、再按码点排序后分配 ID——不依赖 unordered_map 的
+        // 迭代顺序，结果确定且与线程数无关。
+        const std::size_t wf_size = word_freq.size();
+        std::unordered_set<std::string> char_set;
+        {
+            std::size_t cc_i = 0;
+            std::size_t cc_last_pct = static_cast<std::size_t>(-1);
+            for (const auto &[chunk, _] : word_freq)
+            {
+                std::size_t i = 0;
+                while (i < chunk.size())
+                {
+                    auto [cp, len] = decode_utf8(chunk, i);
+                    if (static_cast<unsigned char>(chunk[i]) >= 0x80) // 非 ASCII
+                        char_set.insert(chunk.substr(i, len));
+                    i += len;
+                }
+                if (show_p)
+                {
+                    ++cc_i;
+                    const auto pct = cc_i * 100 / std::max<std::size_t>(wf_size, 1);
+                    if (pct != cc_last_pct)
+                    {
+                        cc_last_pct = pct;
+                        render_progress_("收集字符", cc_i, wf_size);
+                    }
+                }
+            }
+        }
 
-        for (const auto &chunk : chunks)
+        // 按码点排序（UTF-8 字节序 = 码点序），依次分配 ID
+        std::vector<std::string> sorted_chars(char_set.begin(), char_set.end());
+        std::ranges::sort(sorted_chars);
+        for (const auto &ch : sorted_chars)
+        {
+            if (vocab_.size() >= config.vocab_size)
+                break; // 词表已满，后续字符回退 UNK
+            char_to_id_[ch] = vocab_.size();
+            vocab_.push_back(ch);
+        }
+
+        log("  非 ASCII 字符数: " + std::to_string(vocab_.size() - CHAR_BASE));
+
+        // ── 4. 只对 unique chunks 转字符 ID 向量 ──────────────
+        std::vector<std::pair<std::vector<std::size_t>, std::size_t>> char_chunks;
+        char_chunks.reserve(word_freq.size());
+        std::size_t total_chars = 0;
+        std::size_t enc_i = 0;
+        std::size_t enc_last_pct = static_cast<std::size_t>(-1);
+        for (const auto &[chunk, cnt] : word_freq)
         {
             std::vector<std::size_t> ids;
+            ids.reserve(chunk.size());
             std::size_t i = 0;
             while (i < chunk.size())
             {
                 auto [cp, len] = decode_utf8(chunk, i);
                 std::string ch = chunk.substr(i, len);
                 auto it = char_to_id_.find(ch);
-                std::size_t id;
-                if (it == char_to_id_.end())
-                {
-                    // 新字符：仅当词表未满时才添加
-                    if (vocab_.size() >= config.vocab_size)
-                    {
-                        // 词表已满，未知字符回退到 UNK
-                        id = UNK_ID;
-                    }
-                    else
-                    {
-                        id = vocab_.size();
-                        vocab_.push_back(ch);
-                        char_to_id_[ch] = id;
-                    }
-                }
-                else
-                    id = it->second;
-                ids.push_back(id);
+                ids.push_back(it != char_to_id_.end() ? it->second : UNK_ID);
                 i += len;
             }
+            total_chars += ids.size();
             if (!ids.empty())
-                char_chunks.push_back(std::move(ids));
+                char_chunks.emplace_back(std::move(ids), cnt);
+            if (show_p)
+            {
+                ++enc_i;
+                const auto pct = enc_i * 100 / std::max<std::size_t>(wf_size, 1);
+                if (pct != enc_last_pct)
+                {
+                    enc_last_pct = pct;
+                    render_progress_("编码词条", enc_i, wf_size);
+                }
+            }
         }
-
-        log("  非 ASCII 字符数: " + std::to_string(vocab_.size() - CHAR_BASE));
-        log("  总字符数: " + std::to_string(
-            std::accumulate(char_chunks.begin(), char_chunks.end(), std::size_t{0},
-                [](std::size_t s, const auto &c) { return s + c.size(); })));
+        word_freq.clear();
+        if (show_p)
+            finish_progress_("预分词");
+        log("  总字符数: " + std::to_string(total_chars));
 
         // ── 3. BPE 合并训练 ──
         merges_.clear();
@@ -1927,7 +2300,7 @@ public:
         log("  目标合并数: " + std::to_string(target_merges));
 
         // ── 共享 BPE 训练算法（基类 bpe_train_impl_） ──────────────
-        bpe_train_impl_(vocab_, char_chunks, target_merges, config.min_freq, log);
+        bpe_train_impl_(vocab_, char_chunks, target_merges, config.min_freq, log, show_p);
 
         rebuild_merge_map_();
         // ── 添加对话标记 token ──────────────────────────────────────

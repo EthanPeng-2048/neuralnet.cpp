@@ -32,6 +32,7 @@ void print_usage(const char *prog)
         << "  --output <path>      词表输出路径 (默认: bpe_vocab.json)\n"
         << "  --vocab-size <n>     目标词表大小 (默认: 5000)\n"
         << "  --min-freq <n>       最小合并频率 (默认: 2)\n"
+        << "  --threads <n>        预分词并行线程数 (默认: 0=自动使用全部核心, 1=顺序)\n"
         << "  --help               显示此帮助信息\n\n"
         << "说明:\n"
         << "  bpe     字节级 BPE（BBPE）：兼容性最好，任意字节均可编码；\n"
@@ -48,6 +49,7 @@ struct Config
     std::string tokenizer_type = "bpe";  // "bpe" 或 "charbpe"
     std::size_t vocab_size = nn::BPETokenizer::DEFAULT_VOCAB_SIZE;
     std::uint32_t min_freq = nn::BPETokenizer::DEFAULT_MIN_FREQ;
+    std::uint32_t threads = 0;   // 预分词并行: 0=自动, 1=顺序, >1=指定
 };
 
 Config parse_args(int argc, char *argv[])
@@ -84,6 +86,12 @@ Config parse_args(int argc, char *argv[])
             auto v = nn::parse_number<std::uint32_t>(argv[++i]);
             if (!v) { std::cerr << "无效 --min-freq: " << v.error().message << "\n"; std::exit(1); }
             cfg.min_freq = *v;
+        }
+        else if (arg == "--threads" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<std::uint32_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --threads: " << v.error().message << "\n"; std::exit(1); }
+            cfg.threads = *v;
         }
         else if (!arg.starts_with("--"))
             cfg.text_path = arg;
@@ -141,6 +149,8 @@ int main(int argc, char *argv[])
     std::cout << "========================================\n";
     std::cout << "  目标词表: " << cfg.vocab_size << "\n";
     std::cout << "  最小频率: " << cfg.min_freq << "\n";
+    std::cout << "  预分词线程: " << cfg.threads
+              << (cfg.threads == 0 ? " (自动)" : "") << "\n";
     std::cout << "========================================\n" << std::endl;
 
     // 根据分词器类型调用对应训练接口（BPE 和 CharBPE 接口签名一致）
@@ -154,6 +164,8 @@ int main(int argc, char *argv[])
         nn::CharBPETokenizer::Config tcfg;
         tcfg.vocab_size = cfg.vocab_size;
         tcfg.min_freq = cfg.min_freq;
+        tcfg.threads = cfg.threads;
+        tcfg.show_progress = true;
         tcfg.log = [](std::string_view msg) { std::cout << msg << '\n'; };
         train_result = tok.train(text, tcfg);
     }
@@ -163,6 +175,8 @@ int main(int argc, char *argv[])
         nn::BPETokenizer::Config tcfg;
         tcfg.vocab_size = cfg.vocab_size;
         tcfg.min_freq = cfg.min_freq;
+        tcfg.threads = cfg.threads;
+        tcfg.show_progress = true;
         tcfg.log = [](std::string_view msg) { std::cout << msg << '\n'; };
         train_result = tok.train(text, tcfg);
     }

@@ -34,8 +34,187 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <filesystem>
+#include <future>
+#include <optional>
 
 using nn::Scalar;
+
+namespace fs = std::filesystem;
+
+// ── 流式文件读取：返回原始 buffer + 行引用，避免逐行拷贝 ─────────
+struct LineRef {
+    const char* data;
+    std::size_t len;
+};
+
+struct FileContent {
+    std::string buffer;
+    std::vector<LineRef> lines;
+};
+
+[[nodiscard]] nn::Result<FileContent> read_file_lines(const std::string& path)
+{
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs)
+        return std::unexpected(nn::Error{"无法打开文件: " + path});
+
+    FileContent fc;
+    fc.buffer.assign(std::istreambuf_iterator<char>(ifs), {});
+    if (fc.buffer.empty())
+        return fc;
+
+    // 逐行提取引用（仅记录偏移，不拷贝字符串）
+    const char* buf = fc.buffer.data();
+    const std::size_t total = fc.buffer.size();
+    std::size_t pos = 0;
+    while (pos < total)
+    {
+        std::size_t line_start = pos;
+        while (pos < total && buf[pos] != '\n') ++pos;
+        std::size_t line_end = pos;
+        if (pos < total) ++pos;  // skip '\n'
+        // 去除 \r 和首尾空白
+        while (line_start < line_end &&
+               (buf[line_start] == ' ' || buf[line_start] == '\t' || buf[line_start] == '\r'))
+            ++line_start;
+        while (line_end > line_start &&
+               (buf[line_end - 1] == ' ' || buf[line_end - 1] == '\t' || buf[line_end - 1] == '\r'))
+            --line_end;
+        if (line_start < line_end)
+            fc.lines.push_back({buf + line_start, line_end - line_start});
+    }
+    return fc;
+}
+
+// ── 并行 tokenize：多线程 encode + BOS/EOS 拼接 ────────────────
+[[nodiscard]] std::vector<std::size_t> parallel_tokenize(
+    const nn::Tokenizer& tokenizer,
+    const std::vector<LineRef>& lines,
+    std::size_t bos_id, std::size_t eos_id)
+{
+    const std::size_t n = lines.size();
+    if (n == 0) return {};
+
+    const unsigned hw = std::thread::hardware_concurrency();
+    const std::size_t n_threads = std::max(hw, 1u);
+
+    // 行数太少时单线程（避免线程开销超过收益）
+    if (n < n_threads * 64 || n_threads <= 1)
+    {
+        std::vector<std::size_t> result;
+        result.reserve(n * 8);
+        for (const auto& lr : lines)
+        {
+            auto toks = tokenizer.encode(std::string(lr.data, lr.len));
+            if (toks.empty()) continue;
+            if (bos_id != nn::Tokenizer::npos) result.push_back(bos_id);
+            result.insert(result.end(), toks.begin(), toks.end());
+            if (eos_id != nn::Tokenizer::npos) result.push_back(eos_id);
+        }
+        return result;
+    }
+
+    // 分块并行
+    const std::size_t chunk = (n + n_threads - 1) / n_threads;
+    auto worker = [&](std::size_t begin, std::size_t end) -> std::vector<std::size_t> {
+        std::vector<std::size_t> local;
+        local.reserve((end - begin) * 8);
+        for (std::size_t i = begin; i < end; ++i)
+        {
+            auto toks = tokenizer.encode(std::string(lines[i].data, lines[i].len));
+            if (toks.empty()) continue;
+            if (bos_id != nn::Tokenizer::npos) local.push_back(bos_id);
+            local.insert(local.end(), toks.begin(), toks.end());
+            if (eos_id != nn::Tokenizer::npos) local.push_back(eos_id);
+        }
+        return local;
+    };
+
+    std::vector<std::future<std::vector<std::size_t>>> futures;
+    for (std::size_t t = 0; t < n_threads; ++t)
+    {
+        std::size_t begin = t * chunk;
+        std::size_t end = std::min(begin + chunk, n);
+        if (begin >= end) break;
+        futures.push_back(std::async(std::launch::async, worker, begin, end));
+    }
+
+    // 汇总各线程结果
+    std::size_t total = 0;
+    std::vector<std::vector<std::size_t>> parts;
+    parts.reserve(futures.size());
+    for (auto& f : futures)
+    {
+        parts.push_back(f.get());
+        total += parts.back().size();
+    }
+    std::vector<std::size_t> result;
+    result.reserve(total);
+    for (auto& p : parts)
+        result.insert(result.end(), p.begin(), p.end());
+    return result;
+}
+
+// ── Tokenize 二进制缓存 ─────────────────────────────────────
+static constexpr char TOKCACHE_MAGIC[4] = {'T','K','C','H'};
+static constexpr std::uint32_t TOKCACHE_VERSION = 1;
+
+struct TokCacheHeader {
+    char           magic[4];
+    std::uint32_t  version;
+    std::uint32_t  sizeof_size_t;   // 平台 sizeof(size_t)，防止跨平台混用
+    std::uint64_t  text_size;       // 原始文本文件大小（失效判断）
+    std::uint64_t  vocab_size;      // 词表文件大小（失效判断）
+    std::uint64_t  token_count;     // token_flow 长度
+};
+
+[[nodiscard]] std::optional<std::vector<std::size_t>> load_tokenize_cache(
+    const std::string& cache_path,
+    std::uint64_t text_file_size,
+    std::uint64_t vocab_file_size)
+{
+    std::ifstream ifs(cache_path, std::ios::binary);
+    if (!ifs) return std::nullopt;
+
+    TokCacheHeader hdr{};
+    ifs.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
+    if (!ifs) return std::nullopt;
+    if (std::memcmp(hdr.magic, TOKCACHE_MAGIC, 4) != 0) return std::nullopt;
+    if (hdr.version != TOKCACHE_VERSION) return std::nullopt;
+    if (hdr.sizeof_size_t != sizeof(std::size_t)) return std::nullopt;
+    if (hdr.text_size != text_file_size) return std::nullopt;
+    if (hdr.vocab_size != vocab_file_size) return std::nullopt;
+
+    std::vector<std::size_t> tokens(hdr.token_count);
+    ifs.read(reinterpret_cast<char*>(tokens.data()),
+             static_cast<std::streamsize>(hdr.token_count * sizeof(std::size_t)));
+    if (!ifs) return std::nullopt;
+    return tokens;
+}
+
+bool save_tokenize_cache(
+    const std::string& cache_path,
+    std::uint64_t text_file_size,
+    std::uint64_t vocab_file_size,
+    const std::vector<std::size_t>& token_flow)
+{
+    std::ofstream ofs(cache_path, std::ios::binary);
+    if (!ofs) return false;
+
+    TokCacheHeader hdr{};
+    std::memcpy(hdr.magic, TOKCACHE_MAGIC, 4);
+    hdr.version = TOKCACHE_VERSION;
+    hdr.sizeof_size_t = static_cast<std::uint32_t>(sizeof(std::size_t));
+    hdr.text_size = text_file_size;
+    hdr.vocab_size = vocab_file_size;
+    hdr.token_count = token_flow.size();
+
+    ofs.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+    ofs.write(reinterpret_cast<const char*>(token_flow.data()),
+              static_cast<std::streamsize>(token_flow.size() * sizeof(std::size_t)));
+    return ofs.good();
+}
 
 // ── 设备丢失自动重启：保存 checkpoint → 等待 GPU 驱动恢复 → 重新启动进程 ──
 // Windows TDR 重置 GPU 驱动后，需要重新创建 VkDevice 才能继续使用 GPU。
@@ -50,7 +229,9 @@ using nn::Scalar;
     const std::string& text_path,
     std::size_t new_flush_interval,
     bool gpu_enabled,
-    bool cuda_enabled)
+    bool cuda_enabled,
+    int current_epoch,          // 0-based，设备丢失时正在进行的 epoch
+    std::size_t current_step)   // 0-based，本 epoch 内正在进行的 step
 {
     std::cerr << "\n  [TDR] GPU 设备已丢失 (VK_ERROR_DEVICE_LOST)\n";
     std::cerr << "  [TDR] 尝试保存 checkpoint...\n";
@@ -60,11 +241,15 @@ using nn::Scalar;
     else
         std::cerr << "  [TDR] 保存失败: " << save_r.error().message << "\n";
 
-    // 重建命令行：加入 --resume 和增大 flush_interval（不降 batch_size）
+    // 重建命令行：加入 --resume、保留当前 epoch/step 进度（避免重启后
+    // 从 Epoch 1 从头重放日志，导致 GUI 图表出现"loss 片段重复"），
+    // 并增大 flush_interval（不降 batch_size）。
     std::ostringstream oss;
     oss << "\"" << program_name << "\" \"" << text_path
         << "\" --resume \"" << save_path
-        << "\" --flush-interval " << new_flush_interval;
+        << "\" --resume-epoch " << current_epoch
+        << " --resume-step " << current_step
+        << " --flush-interval " << new_flush_interval;
     if (gpu_enabled) oss << " --gpu";
     if (cuda_enabled) oss << " --cuda";
 
@@ -89,6 +274,9 @@ void print_usage(const char *prog)
         << "选项:\n"
         << "  --save <path>      模型保存路径 (默认: gpt_model.bin)\n"
         << "  --resume <path>    从已有模型恢复训练\n"
+        << "  --resume-epoch <n>  从第 n 个 epoch 继续（0-based，需配合 --resume；默认 0）\n"
+        << "  --resume-step <n>   从本 epoch 内第 n 步继续（0-based，需配合 --resume；默认 0）\n"
+        << "                       TDR 自动重启时会自行带上这两个参数续训\n"
         << "  --vocab <path>     词表 JSON 路径 (默认: gpt_bpe.json)\n"
         << "                     自动识别分词器类型（bpe / charbpe / wordzip / space）\n"
         << "  --test-file <path> 测试集文件路径（可选，每 epoch 结束后评估 test loss）\n"
@@ -122,6 +310,7 @@ void print_usage(const char *prog)
         << "  --log-interval <n> 每隔多少 step 显示进度 (默认: 50)\n"
         << "  --save-interval <n> 每隔多少 step 保存 checkpoint (默认: 100)\n"
         << "  --grad-log         显示梯度统计（范数/最大值/均值）\n"
+        << "  --no-cache         禁用 tokenize 缓存（默认自动缓存到 .tokcache 文件）\n"
         << "\n"
         << "TDR 防护:\n"
         << "  --tdr-retry <on|off>  GPU 超时自动减小 batch 重试 (默认: on)\n"
@@ -156,6 +345,8 @@ struct TrainConfig
     std::string resume_path;
     std::string optimizer_name = "adam";
     int epochs = 10;
+    int start_epoch = 0;          // resume 后从第几个 epoch 继续（0-based，默认从头）
+    std::size_t start_step = 0;   // resume 后本 epoch 内从第几步继续（0-based）
     Scalar lr = 0.001;
     Scalar weight_decay = 0.01f;  // AdamW 权重衰减系数
     std::size_t batch_size = 32;
@@ -172,6 +363,7 @@ struct TrainConfig
     bool gpu_enabled = false;
     bool cuda_enabled = false;
     bool grad_log = false;          // 显示梯度统计
+    bool no_cache = false;          // 禁用 tokenize 缓存
     nn::PosEncodingType pos_encoding = nn::PosEncodingType::Learned;
     nn::ActivationType activation = nn::ActivationType::GeLU;  // FFN 激活
     nn::NormType norm_type = nn::NormType::LayerNorm;           // 归一化层类型
@@ -211,6 +403,18 @@ TrainConfig parse_args(int argc, char *argv[])
         {
             cfg.resume_path = argv[++i];
             cfg.load_existing = true;
+        }
+        else if (arg == "--resume-epoch" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<int>(argv[++i]);
+            if (!v || *v < 0) { std::cerr << "无效 --resume-epoch: " << argv[i] << "\n"; std::exit(1); }
+            cfg.start_epoch = *v;
+        }
+        else if (arg == "--resume-step" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --resume-step: " << argv[i] << "\n"; std::exit(1); }
+            cfg.start_step = *v;
         }
         else if (arg == "--vocab" && i + 1 < argc)
             cfg.vocab_path = argv[++i];
@@ -311,6 +515,8 @@ TrainConfig parse_args(int argc, char *argv[])
             cfg.cuda_enabled = true;
         else if (arg == "--grad-log")
             cfg.grad_log = true;
+        else if (arg == "--no-cache")
+            cfg.no_cache = true;
         else if (arg == "--lr-schedule" && i + 1 < argc)
         {
             cfg.lr_schedule = argv[++i];
@@ -531,20 +737,6 @@ int main(int argc, char *argv[])
     const std::string program_name = argv[0];
     TrainConfig cfg = parse_args(argc, argv);
 
-    // ── 加载文本 ─────────────────────────────────────────────
-    std::cout << "加载文本: " << cfg.text_path << " ..." << std::endl;
-    auto text_result = nn::load_text_file(cfg.text_path);
-    if (!text_result) {
-        std::cerr << "Error: " << text_result.error().message << '\n';
-        return 1;
-    }
-    std::string text = std::move(*text_result);
-    if (text.empty())
-    {
-        std::cerr << "文本文件为空\n";
-        return 1;
-    }
-
     // ── 加载分词器（自动识别类型：BPE/CharBPE/WordZip/Space） ───
     auto tokenizer = nn::load_tokenizer_from_file(cfg.vocab_path);
     if (!tokenizer)
@@ -555,46 +747,71 @@ int main(int argc, char *argv[])
     }
     const std::size_t bos_id = tokenizer->bos_id();
     const std::size_t eos_id = tokenizer->eos_id();
-
-    // ── 滑动窗口数据组织（GPT 预训练标准做法）────────────────────────
-    // 每行 = 一个文档，编码为 [BOS] + tokens + [EOS]，然后拼接成一条连续
-    // token 流（行边界通过 EOS 编码进流，窗口可跨行，上下文连续）。
-    // 训练样本 = 对 token 流按 stride 滑动切出的 seq_len 窗口：
-    //   - 不再"每行一个样本"：长行不再被截断丢弃、短行不再大量 PAD，
-    //     语料被 100% 利用；
-    //   - 窗口可跨行，模型能学到跨行/跨段依赖；
-    //   - 仅最后一个窗口不足 seq_len 时 PAD，且 loss 屏蔽 PAD 位置。
     const std::size_t pad_id = tokenizer->pad_id();
-    const std::size_t stride = (cfg.stride == 0) ? cfg.seq_len : cfg.stride;
-    std::vector<std::size_t> token_flow;      // 全量 token 流（含 BOS/EOS）
-    {
-        std::istringstream iss(text);
-        std::string line;
-        while (std::getline(iss, line))
-        {
-            // 去除行首尾空白
-            auto lpos = line.find_first_not_of(" \t\r\n");
-            if (lpos == std::string::npos) continue;  // 空行跳过
-            line = line.substr(lpos, line.find_last_not_of(" \t\r\n") - lpos + 1);
-            if (line.empty()) continue;
 
-            auto line_tokens = tokenizer->encode(line);
-            if (line_tokens.empty()) continue;
-            if (bos_id != nn::Tokenizer::npos)
-                token_flow.push_back(bos_id);
-            token_flow.insert(token_flow.end(), line_tokens.begin(), line_tokens.end());
-            if (eos_id != nn::Tokenizer::npos)
-                token_flow.push_back(eos_id);
+    // ── Tokenize（并行 + 缓存） ─────────────────────────────
+    // 流式读取文件 → 多线程并行 tokenize → 释放原始文本 → 仅保留 token_flow。
+    // 首次运行自动保存 .tokcache 二进制缓存，后续加载秒开。
+    const std::size_t stride = (cfg.stride == 0) ? cfg.seq_len : cfg.stride;
+    std::vector<std::size_t> token_flow;
+    {
+        std::error_code ec_text, ec_vocab;
+        auto text_fsize = static_cast<std::uint64_t>(fs::file_size(cfg.text_path, ec_text));
+        auto vocab_fsize = static_cast<std::uint64_t>(fs::file_size(cfg.vocab_path, ec_vocab));
+        const std::string cache_path = cfg.text_path + ".tokcache";
+
+        // 1) 尝试从缓存加载
+        if (!cfg.no_cache && !ec_text && !ec_vocab)
+        {
+            auto cached = load_tokenize_cache(cache_path, text_fsize, vocab_fsize);
+            if (cached)
+            {
+                token_flow = std::move(*cached);
+                std::cout << "从缓存加载 token流: " << cache_path
+                          << " (" << token_flow.size() << " tokens)\n";
+            }
+        }
+
+        // 2) 缓存未命中 → 流式读取 + 并行 tokenize
+        if (token_flow.empty())
+        {
+            std::cout << "加载文本: " << cfg.text_path << " ..." << std::endl;
+            auto fc_result = read_file_lines(cfg.text_path);
+            if (!fc_result) {
+                std::cerr << "Error: " << fc_result.error().message << '\n';
+                return 1;
+            }
+            auto fc = std::move(*fc_result);
+            if (fc.lines.empty())
+            {
+                std::cerr << "文本文件为空\n";
+                return 1;
+            }
+
+            auto t_tok = std::chrono::steady_clock::now();
+            token_flow = parallel_tokenize(*tokenizer, fc.lines, bos_id, eos_id);
+            auto t_tok_end = std::chrono::steady_clock::now();
+            // fc 在此作用域末尾析构 → 释放原始文本 buffer
+            // 此后仅 token_flow 占用内存
+            std::cout << "Tokenize 完成: " << token_flow.size() << " tokens, 耗时 "
+                      << std::fixed << std::setprecision(1)
+                      << std::chrono::duration<double>(t_tok_end - t_tok).count() << "s\n";
+
+            // 3) 保存缓存（下次秒开）
+            if (!cfg.no_cache && !ec_text && !ec_vocab)
+            {
+                if (save_tokenize_cache(cache_path, text_fsize, vocab_fsize, token_flow))
+                    std::cout << "Token 缓存已保存: " << cache_path << "\n";
+            }
         }
     }
+
     // 切窗口：每个窗口 = 一个训练样本（长度 seq_len，末窗不足则 PAD）
     std::vector<std::size_t> window_offsets;  // 每个窗口在 token_flow 中的起始偏移
     window_offsets.reserve(token_flow.size() / stride + 1);
     for (std::size_t pos = 0; pos < token_flow.size(); pos += stride)
         window_offsets.push_back(pos);
-    std::cout << "文本 token 流: " << token_flow.size() << " tokens (含 BOS/EOS), "
-              << tokenizer->vocab_size() << " 词表\n"
-              << "滑动窗口: seq_len=" << cfg.seq_len << " stride=" << stride
+    std::cout << "滑动窗口: seq_len=" << cfg.seq_len << " stride=" << stride
               << " 样本数=" << window_offsets.size() << "\n" << std::endl;
 
     // ── 打印配置 ─────────────────────────────────────────────
@@ -728,43 +945,41 @@ int main(int argc, char *argv[])
     }
     std::cout << "训练窗口样本数: " << window_offsets.size() << "\n" << std::endl;
 
-    // ── 加载测试集（可选，与训练一致的滑动窗口处理） ─────────────
+    // ── 加载测试集（可选，并行 + 缓存） ─────────────────────
     std::vector<std::size_t> test_window_offsets;
     std::vector<std::size_t> test_flow;
     if (!cfg.test_path.empty())
     {
-        auto test_text_result = nn::load_text_file(cfg.test_path);
-        if (!test_text_result)
-        {
-            std::cerr << "加载测试集失败: " << test_text_result.error().message << '\n';
-            return 1;
-        }
-        std::string test_text = std::move(*test_text_result);
-        std::size_t test_token_count = 0;
-        {
-            std::istringstream tiss(test_text);
-            std::string tline;
-            while (std::getline(tiss, tline))
-            {
-                auto tlpos = tline.find_first_not_of(" \t\r\n");
-                if (tlpos == std::string::npos) continue;
-                tline = tline.substr(tlpos, tline.find_last_not_of(" \t\r\n") - tlpos + 1);
-                if (tline.empty()) continue;
+        std::error_code ec_test, ec_vocab2;
+        auto test_fsize = static_cast<std::uint64_t>(fs::file_size(cfg.test_path, ec_test));
+        auto vocab_fsize2 = static_cast<std::uint64_t>(fs::file_size(cfg.vocab_path, ec_vocab2));
+        const std::string test_cache_path = cfg.test_path + ".tokcache";
 
-                auto tl_tokens = tokenizer->encode(tline);
-                if (tl_tokens.empty()) continue;
-                if (bos_id != nn::Tokenizer::npos)
-                    test_flow.push_back(bos_id);
-                test_flow.insert(test_flow.end(), tl_tokens.begin(), tl_tokens.end());
-                if (eos_id != nn::Tokenizer::npos)
-                    test_flow.push_back(eos_id);
-                test_token_count += tl_tokens.size() + 2;
-            }
+        if (!cfg.no_cache && !ec_test && !ec_vocab2)
+        {
+            auto cached = load_tokenize_cache(test_cache_path, test_fsize, vocab_fsize2);
+            if (cached)
+                test_flow = std::move(*cached);
         }
+
+        if (test_flow.empty())
+        {
+            auto fc_result = read_file_lines(cfg.test_path);
+            if (!fc_result) {
+                std::cerr << "加载测试集失败: " << fc_result.error().message << '\n';
+                return 1;
+            }
+            auto fc = std::move(*fc_result);
+            test_flow = parallel_tokenize(*tokenizer, fc.lines, bos_id, eos_id);
+
+            if (!cfg.no_cache && !ec_test && !ec_vocab2)
+                save_tokenize_cache(test_cache_path, test_fsize, vocab_fsize2, test_flow);
+        }
+
         for (std::size_t pos = 0; pos < test_flow.size(); pos += stride)
             test_window_offsets.push_back(pos);
         std::cout << "测试集: " << cfg.test_path << "  样本数: " << test_window_offsets.size()
-                  << "  tokens: " << test_token_count << std::endl;
+                  << "  tokens: " << test_flow.size() << std::endl;
     }
 
     // ── 步数与采样：每 epoch 每样本恰好访问一次 ──────────────
@@ -789,7 +1004,9 @@ int main(int argc, char *argv[])
         static_cast<int>(steps_per_epoch * static_cast<std::size_t>(cfg.epochs));
     step_lr_cfg.cosine = true;
 
-    std::mt19937_64 rng{42};
+    // 随机种子：每次训练/每次 TDR 重启后的样本顺序都不同，避免跨进程
+    // 数据顺序完全一致导致 GUI 图表上出现"loss 片段重复"（与 mnist_train 一致）。
+    std::mt19937_64 rng{std::random_device{}()};
     std::vector<std::size_t> sample_indices(window_offsets.size());
     for (std::size_t i = 0; i < sample_indices.size(); ++i)
         sample_indices[i] = i;
@@ -805,7 +1022,7 @@ int main(int argc, char *argv[])
 
     auto t_start = std::chrono::steady_clock::now();
 
-    for (int epoch = 0; epoch < cfg.epochs; ++epoch)
+    for (int epoch = cfg.start_epoch; epoch < cfg.epochs; ++epoch)
     {
         // ── 学习率调度：每 epoch 开始时调整（step_cosine 由 step 级调度接管） ──
         if (cfg.lr_schedule != "step_cosine")
@@ -825,10 +1042,15 @@ int main(int argc, char *argv[])
         // 每个 epoch 开始前 shuffle 样本索引队列
         std::shuffle(sample_indices.begin(), sample_indices.end(), rng);
 
+        // TDR 重启续训：resume 时本 epoch 内跳过已完成的前 start_step 步，
+        // 避免重启后从 epoch 开头重跑、GUI 图表出现重复 loss 片段。
+        const std::size_t epoch_first_step =
+            (epoch == cfg.start_epoch) ? cfg.start_step : 0;
+
         // 梯度累积：距上次参数更新的步数（每 accum_steps 步更新一次）
         std::size_t steps_since_update = 0;
 
-        for (std::size_t step = 0; step < steps_per_epoch; ++step)
+        for (std::size_t step = epoch_first_step; step < steps_per_epoch; ++step)
         {
             // ── step 级学习率：每个训练步更新（step_cosine 模式） ──
             if (cfg.lr_schedule == "step_cosine")
@@ -930,7 +1152,8 @@ int main(int argc, char *argv[])
                     restart_on_device_lost(program_name, model, spec, tokenizer_json,
                         cfg.save_path, cfg.text_path,
                         cfg.flush_interval == 0 ? std::size_t{1} : cfg.flush_interval * 2,
-                        cfg.gpu_enabled, cfg.cuda_enabled);
+                        cfg.gpu_enabled, cfg.cuda_enabled,
+                        epoch, step);
                 }
                 return 1;
             }
@@ -952,7 +1175,8 @@ int main(int argc, char *argv[])
                     restart_on_device_lost(program_name, model, spec, tokenizer_json,
                         cfg.save_path, cfg.text_path,
                         cfg.flush_interval == 0 ? std::size_t{1} : cfg.flush_interval * 2,
-                        cfg.gpu_enabled, cfg.cuda_enabled);
+                        cfg.gpu_enabled, cfg.cuda_enabled,
+                        epoch, step);
                 }
                 std::cerr << '\n';
                 return 1;

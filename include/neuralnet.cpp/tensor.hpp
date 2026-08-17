@@ -11,6 +11,7 @@
 //   - 跨设备传输由 ComputeEngine 负责，Tensor 本身不主动迁移
 // ─────────────────────────────────────────────────────────────────────────
 
+#include <algorithm>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -189,13 +190,29 @@ public:
         t.device_ = device_;
         t.rows_ = new_rows;
         t.cols_ = new_cols;
-        t.cpu_data_ = cpu_data_;
 #ifdef NN_HAS_VULKAN
         t.gpu_data_ = gpu_data_;
 #endif
 #ifdef NN_HAS_CUDA
         t.cuda_data_ = cuda_data_;
 #endif
+        if (device_ == Device::CPU)
+        {
+            // CPU 的 Matrix 无“零拷贝视图”能力：reshape 只改 Tensor 元数据
+            // 会让 cpu_matrix() 仍持有旧形状，导致 add_inplace/scale_inplace
+            // 等按 Tensor 逻辑形状匹配、却按 Matrix 实际形状运算的调用维度
+            // 不一致而断言失败。这里复制数据到新形状的 Matrix（GPU/CUDA
+            // 保持共享 buffer 的零拷贝语义）。
+            auto m = std::make_shared<Matrix>(new_rows, new_cols);
+            const auto src = cpu_data_->span();
+            auto dst = m->span();
+            std::copy(src.begin(), src.end(), dst.begin());
+            t.cpu_data_ = std::move(m);
+        }
+        else
+        {
+            t.cpu_data_ = cpu_data_;
+        }
         return t;
     }
 };
