@@ -156,12 +156,17 @@ cmake --build build --parallel
 ### 训练分词器
 
 ```bash
-# 训练 BPE 分词器
-./build/tokenizer_train --input datasets/llm_corpus.txt --vocab-size 10000 --output my_bpe.json
+# 训练 BPE 分词器（预分词默认自动并行，可使用全部核心）
+./build/tokenizer_train datasets/llm_corpus.txt --vocab-size 10000 --output my_bpe.json
 
-# 训练 ByteZip 分词器
-./build/tokenizer_train --type bytezip --input datasets/llm_corpus.txt --output my_bytezip.json
+# 训练 CharBPE 分词器（字符级，适合中文）
+./build/tokenizer_train datasets/llm_corpus.txt --tokenizer charbpe --vocab-size 10000 --output my_charbpe.json
+
+# 强制顺序预分词（--threads 1）或指定并行度（--threads 4）
+./build/tokenizer_train datasets/llm_corpus.txt --threads 1 --output seq.json
 ```
+
+`--threads`：预分词并行线程数，`0`=自动（默认，使用线程池全部核心），`1`=顺序，`>1`=指定并行度（上限为线程池大小）。并行预分词与顺序执行结果完全一致（词表逐字节相同）。
 
 ### 分词器推理
 

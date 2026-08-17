@@ -13,11 +13,15 @@
 
 #include <neuralnet.cpp/nn.hpp>
 
+#include <algorithm>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <queue>
 #include <sstream>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 // ==================== 帮助信息 ====================
@@ -29,13 +33,16 @@ void print_usage(const char *prog)
         << "  " << prog << " --vocab <path> --encode \"text\"    编码文本\n"
         << "  " << prog << " --vocab <path> --decode \"ids\"      解码 token IDs\n"
         << "  " << prog << " --vocab <path> --interactive         交互模式\n"
-        << "  " << prog << " --vocab <path> --encode-file <file>  编码文件\n\n"
+        << "  " << prog << " --vocab <path> --encode-file <file>  编码文件\n"
+        << "  " << prog << " --vocab <path> <text-file>           统计文本文件每行 token 数\n\n"
         << "选项:\n"
         << "  --vocab <path>       词表 JSON 路径 (默认: bpe_vocab.json)\n"
         << "                       自动识别分词器类型（bpe / charbpe / wordzip / space）\n"
         << "  --encode <text>      编码文本为 token IDs\n"
         << "  --decode <ids>       解码 token IDs (逗号分隔) 为文本\n"
-        << "  --encode-file <path> 编码整个文件\n"
+        << "  --encode-file <path> 编码整个文件（同时自动统计最长行 token 数）\n"
+        << "  <text-file>          位置参数：直接给文本文件即自动统计最长行 token 数\n"
+        << "  --top <n>            最长行排行榜行数 (默认: 10)\n"
         << "  --interactive        交互模式 (输入 'quit' 退出)\n"
         << "  --show-bytes         显示原始字节 (调试用)\n"
         << "  --help               显示此帮助信息\n";
@@ -48,6 +55,8 @@ struct Config
     std::string encode_text;
     std::string decode_ids;
     std::string encode_file;
+    std::string text_path;   // 位置参数：文本文件 → 自动统计最长行
+    std::size_t top = 10;    // 最长行排行榜行数
     bool interactive = false;
     bool show_bytes = false;
 };
@@ -75,6 +84,18 @@ Config parse_args(int argc, char *argv[])
             cfg.interactive = true;
         else if (arg == "--show-bytes")
             cfg.show_bytes = true;
+        else if (arg == "--top" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v || *v == 0)
+            {
+                std::cerr << "无效 --top: " << argv[i] << "\n";
+                std::exit(1);
+            }
+            cfg.top = *v;
+        }
+        else if (!arg.starts_with("--"))
+            cfg.text_path = arg;
         else
         {
             std::cerr << "未知参数: " << arg << "\n使用 --help 查看用法\n";
@@ -175,6 +196,146 @@ void interactive_mode(const nn::Tokenizer &tokenizer, bool show_bytes)
     }
 }
 
+// ==================== 最长行 token 统计（趣味功能，给文件即自动激活） ====================
+// 逐行编码文本，找出 token 数最多的行，并输出 Top-N 排行榜。
+// 无需额外开关：位置参数传入文本文件、或 --encode-file 都会自动执行。
+
+namespace {
+
+// 统计 UTF-8 字符串的字符数（跳过连续字节）
+std::size_t utf8_char_count(std::string_view s) noexcept
+{
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < s.size(); ++i)
+        if ((static_cast<unsigned char>(s[i]) & 0xC0) != 0x80)  // 非连续字节 → 一个字符
+            ++n;
+    return n;
+}
+
+} // namespace
+
+void longest_lines_mode(const nn::Tokenizer &tokenizer, const std::string &path, std::size_t top_n)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+    {
+        std::cerr << "打开文件失败: " << path << '\n';
+        std::exit(1);
+    }
+
+    struct LineStat {
+        std::size_t line_no = 0;
+        std::size_t tokens = 0;
+        std::size_t bytes = 0;
+        std::size_t chars = 0;
+        std::string text;
+    };
+
+    // 小顶堆：始终保留 token 数最大的 top_n 行（堆顶 = 当前第 top_n 大）。
+    // 每行只需 O(log top_n) 的堆操作，而不是对整表 std::sort（O(top_n log top_n)）。
+    struct MinHeap {
+        bool operator()(const LineStat &a, const LineStat &b) const noexcept
+        {
+            return a.tokens > b.tokens;  // 小顶堆：tokens 越小越靠堆顶
+        }
+    };
+    std::priority_queue<LineStat, std::vector<LineStat>, MinHeap> best;
+
+    std::size_t line_no = 0;
+    std::size_t total_tokens = 0;
+    std::size_t nonempty_lines = 0;
+
+    std::string line;
+    while (std::getline(in, line))
+    {
+        ++line_no;
+        if (!line.empty() && line.back() == '\r')  // 兼容 Windows CRLF
+            line.pop_back();
+
+        auto ids = tokenizer.encode(line);
+        total_tokens += ids.size();
+        if (!line.empty())
+            ++nonempty_lines;
+        if (ids.empty() && line.empty())
+            continue;  // 空行不参与排行榜
+
+        LineStat st{line_no, ids.size(), line.size(), utf8_char_count(line), line};
+
+        if (best.size() < top_n)
+        {
+            best.push(std::move(st));
+        }
+        else if (st.tokens > best.top().tokens)
+        {
+            best.pop();               // 踢掉当前第 top_n 大
+            best.push(std::move(st));
+        }
+    }
+
+    if (line_no == 0)
+    {
+        std::cout << "文件为空: " << path << '\n';
+        return;
+    }
+
+    // 堆弹出顺序是升序 → 反转成降序排行榜
+    std::vector<LineStat> top;
+    top.reserve(best.size());
+    while (!best.empty())
+    {
+        top.push_back(best.top());
+        best.pop();
+    }
+    std::reverse(top.begin(), top.end());
+
+    // ── 汇总 ──
+    std::cout << "══════ 最长行 Token 统计 ══════\n";
+    std::cout << "文本文件 : " << path << '\n';
+    std::cout << "总行数   : " << line_no << " (非空: " << nonempty_lines << ")\n";
+    std::cout << "总 Token : " << total_tokens << '\n';
+    if (nonempty_lines > 0)
+        std::cout << "平均     : " << std::fixed << std::setprecision(2)
+                  << static_cast<double>(total_tokens) / nonempty_lines << " tokens/行\n";
+    if (!top.empty())
+    {
+        std::cout << "最长行   : " << top.front().tokens << " tokens (第 "
+                  << top.front().line_no << " 行, "
+                  << top.front().bytes << " 字节, "
+                  << top.front().chars << " 字符)\n";
+    }
+    std::cout << "\n── 最长行 Top " << top.size() << " ──\n";
+    for (std::size_t i = 0; i < top.size(); ++i)
+    {
+        const auto &s = top[i];
+        std::cout << "#" << (i + 1)
+                  << "  第 " << s.line_no << " 行 | " << s.tokens << " tokens | "
+                  << s.bytes << " 字节 | " << s.chars << " 字符\n";
+        const std::size_t preview_limit = 80;
+        std::string_view preview = s.text;
+        const bool truncated = preview.size() > preview_limit;
+        if (truncated)
+        {
+            // 截断到完整 UTF-8 字符边界，避免把多字节字符切碎
+            std::size_t i = 0, end = 0;
+            while (i < s.text.size() && i < preview_limit)
+            {
+                const auto c = static_cast<unsigned char>(s.text[i]);
+                std::size_t width = 1;
+                if ((c & 0xE0) == 0xC0)      width = 2;   // 2 字节字符
+                else if ((c & 0xF0) == 0xE0) width = 3;   // 3 字节字符（中文等）
+                else if ((c & 0xF8) == 0xF0) width = 4;   // 4 字节字符
+                if (i + width > preview_limit)
+                    break;  // 放不下一个完整字符
+                i += width;
+                end = i;
+            }
+            preview = preview.substr(0, end);
+        }
+        std::cout << "   文本: \"" << preview << (truncated ? "...\"" : "\"") << '\n';
+    }
+    std::cout << std::flush;
+}
+
 // ==================== 主函数 ====================
 int main(int argc, char *argv[])
 {
@@ -216,6 +377,13 @@ int main(int argc, char *argv[])
         return 0;
     }
 
+    // ── 文本文件（位置参数）→ 自动统计最长行 token 数 ──────────
+    if (!cfg.text_path.empty())
+    {
+        longest_lines_mode(*tokenizer, cfg.text_path, cfg.top);
+        return 0;
+    }
+
     // ── 编码文件 ─────────────────────────────────────────────
     if (!cfg.encode_file.empty())
     {
@@ -236,6 +404,9 @@ int main(int argc, char *argv[])
         std::cout << "压缩率: " << std::fixed << std::setprecision(2)
                   << static_cast<double>(text_result->size()) / ids.size()
                   << " bytes/token\n";
+        std::cout << '\n';
+        // 自动附加最长行 token 统计
+        longest_lines_mode(*tokenizer, cfg.encode_file, cfg.top);
         return 0;
     }
 

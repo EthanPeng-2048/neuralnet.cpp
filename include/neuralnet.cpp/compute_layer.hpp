@@ -2201,10 +2201,10 @@ public:
             { auto r2 = engine.zero(grad_pos_emb_); NN_ASSERT(r2, r2 ? "" : r2.error().message.c_str()); }
         }
 
-        // GPTBlock 传入 seq_len、pos_enc_type 和 activation
+        // GPTBlock 传入 seq_len、pos_enc_type、activation 和 norm_type
         for (std::size_t i = 0; i < num_layers; ++i)
             blocks_.emplace_back(engine, d_model, num_heads, d_ff, seq_len, seq_len,
-                                 pos_enc_type, activation);
+                                 pos_enc_type, activation, norm_type);
     }
 
     std::vector<TensorRef> parameters() override

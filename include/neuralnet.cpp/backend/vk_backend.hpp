@@ -661,12 +661,12 @@ private:
     // ── 延迟销毁：batch 录制期间 copy-on-write 替换旧 buffer 时，旧 buffer
     // 仍被已录制的 descriptor set 引用，不能立即 vkDestroyBuffer。
     // end_batch/flush_batch 提交完成并释放 descriptor sets 后统一销毁。
+    // 注意：内存已通过 pool_->free() 立即归还池（可被新分配复用），
+    // 此处仅延迟 vkDestroyBuffer 调用以满足 Vulkan 规范。
     struct PendingDestroy
     {
         VkDevice device = VK_NULL_HANDLE;
         VkBuffer buffer = VK_NULL_HANDLE;
-        MemoryPool::Allocation alloc;
-        observer_ptr<MemoryPool> pool;
     };
     std::mutex pending_mutex_;
     std::vector<PendingDestroy> pending_destroys_;
@@ -817,16 +817,16 @@ public:
     }
 
     // ── 延迟销毁入口（GpuBuffer 析构时调用）──────────────────────────
-    // batch 模式下不立即销毁，等待提交完成；否则立即销毁。
-    void defer_buffer_destroy(VkDevice device, VkBuffer buffer,
-                              const MemoryPool::Allocation& alloc,
-                              observer_ptr<MemoryPool> pool)
+    // batch 模式下不立即销毁 VkBuffer，等待提交完成；否则立即销毁。
+    // 注意：调用方应在调用此函数前已通过 pool_->free() 归还内存。
+    void defer_buffer_destroy(VkDevice device, VkBuffer buffer)
     {
         std::lock_guard lock(pending_mutex_);
-        pending_destroys_.push_back({device, buffer, alloc, pool});
+        pending_destroys_.push_back({device, buffer});
     }
 
     // ── 统一执行延迟销毁（必须在 batch descriptor sets 释放之后调用）──
+    // 仅销毁 VkBuffer 对象；内存已通过 pool_->free() 提前归还池。
     void flush_pending_destroys()
     {
         std::lock_guard lock(pending_mutex_);
@@ -834,8 +834,6 @@ public:
         {
             if (pd.buffer != VK_NULL_HANDLE && pd.device != VK_NULL_HANDLE)
                 vkDestroyBuffer(pd.device, pd.buffer, nullptr);
-            if (pd.pool && pd.alloc.valid())
-                pd.pool->free(pd.alloc);
         }
         pending_destroys_.clear();
     }
@@ -3126,9 +3124,12 @@ GpuBuffer::~GpuBuffer()
     auto& backend = GpuBackend::instance();
     if (backend.is_initialized() && backend.in_batch())
     {
-        // batch 模式：copy-on-write 替换产生的旧 buffer 仍被已录制的
-        // descriptor 引用，延迟到 end_batch/flush_batch 后统一销毁。
-        backend.defer_buffer_destroy(device_, buffer_, alloc_, pool_);
+        // batch 模式：立即归还内存到池（可被新分配复用），
+        // 仅延迟 vkDestroyBuffer（Vulkan 规范要求 buffer 在引用它的命令
+        // 提交完成前不能被销毁）。
+        if (pool_ && alloc_.valid())
+            pool_->free(alloc_);
+        backend.defer_buffer_destroy(device_, buffer_);
     }
     else
     {
