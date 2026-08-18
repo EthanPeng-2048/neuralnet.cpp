@@ -77,6 +77,21 @@ nn_add_executable(swiglu_gradcheck src/swiglu_gradcheck.cpp)
 # ── RMSNorm 数值梯度检查（gradcheck，验证 gamma/输入梯度） ───────────────
 nn_add_executable(rmsnorm_gradcheck src/rmsnorm_gradcheck.cpp)
 
+# ── GPTModel 整链数值梯度检查（gradcheck，验证多层堆叠全部参数梯度） ──────
+nn_add_executable(gpt_gradcheck src/gpt_gradcheck.cpp)
+
+# ── CausalSelfAttention 数值梯度检查（gradcheck，验证 attention 内部反向） ──
+nn_add_executable(attn_gradcheck src/attn_gradcheck.cpp)
+
+# ── Softmax 数值梯度检查（gradcheck，验证 softmax 反向） ───────────────────
+nn_add_executable(softmax_gradcheck src/softmax_gradcheck.cpp)
+
+# ── 注意力反向逐级调试探针（对比暴力 Matrix 参考与引擎原语） ────────────
+nn_add_executable(attn_debug src/attn_debug.cpp)
+
+# ── batched_matmul 原语探针（四种转置组合 vs 手工参考） ───────────────────
+nn_add_executable(matmul_probe src/matmul_probe.cpp)
+
 # ── Vulkan GPU 加速（可选） ────────────────────────────────────────────────
 find_package(Vulkan QUIET)
 if(Vulkan_FOUND)
@@ -154,6 +169,11 @@ if(Vulkan_FOUND)
             attn_consistency_test
             swiglu_gradcheck
             rmsnorm_gradcheck
+            gpt_gradcheck
+            attn_gradcheck
+            softmax_gradcheck
+            attn_debug
+            matmul_probe
         )
 
         foreach(TARGET ${NN_GPU_TARGETS})
@@ -199,6 +219,9 @@ if(NN_ENABLE_CUDA)
                 attn_consistency_test
                 swiglu_gradcheck
                 rmsnorm_gradcheck
+                gpt_gradcheck
+                attn_gradcheck
+                softmax_gradcheck
             )
 
             foreach(TARGET ${NN_CUDA_TARGETS})
