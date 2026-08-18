@@ -8,7 +8,7 @@
 //  设计：
 //    - 使用固定宽度整数 (uint64_t) 保证跨平台/跨位宽兼容性
 //    - 纯库函数，无 I/O 副作用（调用方自行决定是否打印日志）
-//    - 向后兼容 V1 格式读取，新文件统一写入 V2 格式
+//    - 规格头为自描述 KeyValueRecord（长度前缀，无偏移量假设）
 //    - 使用 Result<T> 返回错误，不抛异常
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -23,6 +23,7 @@
 
 #include "config.hpp"
 #include "model_spec.hpp"
+#include "keyvalue_record.hpp"
 #include "compute_layer.hpp"
 #include "model_container.hpp"
 
@@ -30,26 +31,25 @@ namespace nn
 {
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  二进制文件格式
+//  二进制文件格式（v4，自描述规格头）
 //
-//  Version 3 (当前格式，含精度标记 + 可选 tokenizer):
-//    [magic 4B] [version=3 4B] [precision 1B] [model_type 4B]
-//    [spec data...]
-//    [param matrices...]
-//    [tokenizer_len 8B] [tokenizer_json...]     ← V3 新增
+//    [magic 4B]                 "NNNN" —— 标识「nn.cpp 的模型文件」
+//    [version 4B]               模型格式版本号（v[x]；>=4 为自描述格式）
+//    [precision 1B]             f32/f64 精度标记
+//    [spec_len 8B]              规格头长度前缀（解决内容大小不确定问题）
+//    [spec: KeyValueRecord]     字段记录模型信息（自描述，无偏移量假设）
+//    [param matrices...]        模型权重
+//    [extra state matrices...]  非可学习状态（如 BatchNorm running 统计）
+//    [tokenizer_len 8B]         0 = 未嵌入
+//    [tokenizer data...]        分词表数据
 //
-//  Version 2 (含架构规格):
-//    [magic 4B] [version=2 4B] [model_type 4B] [spec data...] [matrices...]
-//
-//  Version 1 (仅参数):
-//    [magic 4B] [version=1 4B] [matrices...]
+//  v1/v2/v3 为旧的偏移量定长格式，已移除支持（无有意义的旧模型）。
 //
 //  precision 字节: 0 = f32, 1 = f64（用于校验保存时与加载时的 Scalar 类型一致）
-//  tokenizer_len = 0 表示未嵌入分词器（向后兼容）
 // ═══════════════════════════════════════════════════════════════════════════
 
 inline constexpr uint32_t MODEL_MAGIC    = 0x4E4E4E4E;  // "NNNN"
-inline constexpr uint32_t MODEL_VERSION  = 3;
+inline constexpr uint32_t MODEL_VERSION  = 4;            // 自描述格式起始版本
 
 // ── 精度标记（写入文件头，加载时校验） ──────────────────────────────────
 // 0 = float (f32), 1 = double (f64)
@@ -190,126 +190,113 @@ template <typename... Ts>
     return {};
 }
 
-// ── ModelSpec 序列化 ──────────────────────────────────────────────────
+// ── ModelSpec ↔ KeyValueRecord（自描述规格头） ─────────────────────────
 
-[[nodiscard]] inline Result<void> write_spec(std::ofstream &ofs, const ModelSpec &spec)
+[[nodiscard]] inline KeyValueRecord spec_to_kv(const ModelSpec &spec)
 {
-    if (auto r = write_bytes<uint32_t>(ofs, static_cast<uint32_t>(spec.type)); !r)
-        return std::unexpected(r.error());
+    KeyValueRecord kv;
+    kv.set("type", static_cast<uint64_t>(spec.type));
 
-    switch (spec.type)
+    std::vector<uint64_t> dims;
+    dims.reserve(spec.layer_dims.size());
+    for (auto d : spec.layer_dims)
+        dims.push_back(static_cast<uint64_t>(d));
+    kv.set("layer_dims", dims);
+
+    kv.set("d_model",      static_cast<uint64_t>(spec.d_model));
+    kv.set("num_heads",    static_cast<uint64_t>(spec.num_heads));
+    kv.set("d_ff",         static_cast<uint64_t>(spec.d_ff));
+    kv.set("num_layers",   static_cast<uint64_t>(spec.num_layers));
+    kv.set("patch_size",   static_cast<uint64_t>(spec.patch_size));
+    kv.set("vocab_size",   static_cast<uint64_t>(spec.vocab_size));
+    kv.set("seq_len",      static_cast<uint64_t>(spec.seq_len));
+    kv.set("pos_encoding", static_cast<uint64_t>(spec.pos_encoding));
+    kv.set("activation",   static_cast<uint64_t>(spec.activation));
+    kv.set("norm_type",    static_cast<uint64_t>(spec.norm_type));
+    return kv;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 版本默认值表 —— 新增字段的唯一维护点
+//
+// 约定：文件版本号更新（v[x]）意味着规格字段可能新增/缺失。读取时，
+// 早于「字段引入版本」的文件缺失该字段，在此按默认值回落，保证永久兼容。
+// 未来新增字段只需：
+//   1. spec_to_kv 中写入；
+//   2. 此处追加一行（引入版本 + 缺失默认值）。
+// ══════════════════════════════════════════════════════════════════════
+inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
+{
+    // norm_type 于 v4 引入；更早版本缺失时默认 LayerNorm。
+    // 注：v1/v2/v3 旧偏移量格式已在 read_and_validate_header 拒绝，此处为语义兜底。
+    if (version < 4 && !kv.has("norm_type"))
+        kv.set("norm_type", static_cast<uint64_t>(NormType::LayerNorm));
+    // ── 未来字段在此追加，例如：
+    // if (version < 5 && !kv.has("max_norm")) kv.set("max_norm", 0);
+}
+
+[[nodiscard]] inline Result<ModelSpec> spec_from_kv(const KeyValueRecord &kv)
+{
+    ModelSpec spec;  // 缺失字段保持 ModelSpec 默认值（即版本默认值）
+    uint64_t v = 0;
+    std::vector<uint64_t> dims;
+
+    if (kv.get("type", v))        spec.type         = static_cast<ModelType>(v);
+    if (kv.get("layer_dims", dims))
     {
-    case ModelType::MLP:
-    {
-        if (auto r = write_bytes<uint32_t>(ofs, static_cast<uint32_t>(spec.layer_dims.size())); !r)
-            return std::unexpected(r.error());
-        for (auto d : spec.layer_dims)
-            if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(d)); !r)
-                return std::unexpected(r.error());
-        break;
+        spec.layer_dims.clear();
+        spec.layer_dims.reserve(dims.size());
+        for (auto d : dims)
+            spec.layer_dims.push_back(static_cast<std::size_t>(d));
     }
+    if (kv.get("d_model", v))     spec.d_model      = static_cast<std::size_t>(v);
+    if (kv.get("num_heads", v))   spec.num_heads    = static_cast<std::size_t>(v);
+    if (kv.get("d_ff", v))        spec.d_ff         = static_cast<std::size_t>(v);
+    if (kv.get("num_layers", v))  spec.num_layers   = static_cast<std::size_t>(v);
+    if (kv.get("patch_size", v))  spec.patch_size   = static_cast<std::size_t>(v);
+    if (kv.get("vocab_size", v))  spec.vocab_size   = static_cast<std::size_t>(v);
+    if (kv.get("seq_len", v))     spec.seq_len      = static_cast<std::size_t>(v);
+    if (kv.get("pos_encoding", v)) spec.pos_encoding = static_cast<PosEncodingType>(v);
+    if (kv.get("activation", v))  spec.activation   = static_cast<ActivationType>(v);
+    if (kv.get("norm_type", v))   spec.norm_type    = static_cast<NormType>(v);
 
-    case ModelType::Transformer:
-        return write_fields(ofs,
-            static_cast<uint64_t>(spec.d_model),
-            static_cast<uint64_t>(spec.num_heads),
-            static_cast<uint64_t>(spec.d_ff),
-            static_cast<uint64_t>(spec.num_layers),
-            static_cast<uint64_t>(spec.patch_size));
+    if (spec.type == ModelType::Unknown)
+        return std::unexpected(Error{"模型文件规格缺少有效的 type 字段"});
+    return spec;
+}
 
-    case ModelType::GPT:
-        if (auto r = write_fields(ofs,
-                static_cast<uint64_t>(spec.vocab_size),
-                static_cast<uint64_t>(spec.d_model),
-                static_cast<uint64_t>(spec.seq_len),
-                static_cast<uint64_t>(spec.num_heads),
-                static_cast<uint64_t>(spec.d_ff),
-                static_cast<uint64_t>(spec.num_layers)); !r)
-            return std::unexpected(r.error());
-        // V5+: pos_encoding + activation + norm_type (向后兼容：旧文件无此字段，默认)
-        if (auto r = write_bytes<uint32_t>(ofs, static_cast<uint32_t>(spec.pos_encoding)); !r)
-            return std::unexpected(r.error());
-        if (auto r = write_bytes<uint32_t>(ofs, static_cast<uint32_t>(spec.activation)); !r)
-            return std::unexpected(r.error());
-        return write_bytes<uint32_t>(ofs, static_cast<uint32_t>(spec.norm_type));
+// ── 规格头读写：长度前缀 + KeyValueRecord（无偏移量假设） ────────────────
 
-    default:
-        return std::unexpected(Error{"Cannot write unknown ModelType: "
-                           + std::to_string(static_cast<uint32_t>(spec.type))});
+[[nodiscard]] inline Result<void> write_spec_header(std::ofstream &ofs, const ModelSpec &spec)
+{
+    auto bytes = spec_to_kv(spec).serialize();
+    if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(bytes.size())); !r)
+        return std::unexpected(r.error());
+    if (!bytes.empty())
+    {
+        ofs.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        if (!ofs)
+            return std::unexpected(Error{"Write error while writing spec header"});
     }
     return {};
 }
 
-[[nodiscard]] inline Result<ModelSpec> read_spec(std::ifstream &ifs)
+[[nodiscard]] inline Result<ModelSpec> read_spec_header(std::ifstream &ifs, uint32_t version)
 {
-    ModelSpec spec;
-    auto type_r = read_bytes<uint32_t>(ifs);
-    if (!type_r) return std::unexpected(type_r.error());
-    spec.type = static_cast<ModelType>(*type_r);
-
-    switch (spec.type)
+    auto len_r = read_bytes<uint64_t>(ifs);
+    if (!len_r) return std::unexpected(len_r.error());
+    const auto len = static_cast<std::size_t>(*len_r);
+    std::string bytes(len, '\0');
+    if (len > 0)
     {
-    case ModelType::MLP:
-    {
-        auto nd_r = read_bytes<uint32_t>(ifs);
-        if (!nd_r) return std::unexpected(nd_r.error());
-        const auto nd = *nd_r;
-        spec.layer_dims.resize(nd);
-        for (uint32_t i = 0; i < nd; ++i)
-        {
-            auto d_r = read_bytes<uint64_t>(ifs);
-            if (!d_r) return std::unexpected(d_r.error());
-            spec.layer_dims[i] = static_cast<std::size_t>(*d_r);
-        }
-        break;
+        ifs.read(bytes.data(), static_cast<std::streamsize>(len));
+        if (!ifs)
+            return std::unexpected(Error{"Unexpected end while reading spec header"});
     }
-
-    case ModelType::Transformer:
-    {
-        auto v = read_fields<uint64_t, uint64_t, uint64_t, uint64_t, uint64_t>(ifs);
-        if (!v) return std::unexpected(v.error());
-        auto& [dm, nh, df, nl, ps] = *v;
-        spec.d_model    = static_cast<std::size_t>(dm);
-        spec.num_heads  = static_cast<std::size_t>(nh);
-        spec.d_ff       = static_cast<std::size_t>(df);
-        spec.num_layers = static_cast<std::size_t>(nl);
-        spec.patch_size = static_cast<std::size_t>(ps);
-        break;
-    }
-
-    case ModelType::GPT:
-    {
-        auto v = read_fields<uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t>(ifs);
-        if (!v) return std::unexpected(v.error());
-        auto& [vs, dm, sl, nh, df, nl] = *v;
-        spec.vocab_size = static_cast<std::size_t>(vs);
-        spec.d_model    = static_cast<std::size_t>(dm);
-        spec.seq_len    = static_cast<std::size_t>(sl);
-        spec.num_heads  = static_cast<std::size_t>(nh);
-        spec.d_ff       = static_cast<std::size_t>(df);
-        spec.num_layers = static_cast<std::size_t>(nl);
-        // V5+: pos_encoding + activation（向后兼容：旧文件读到 EOF 时保持默认）
-        auto pe = read_bytes<uint32_t>(ifs);
-        if (pe)
-            spec.pos_encoding = static_cast<PosEncodingType>(*pe);
-        // else: 旧文件无此字段，spec.pos_encoding 已默认 Learned
-        auto act = read_bytes<uint32_t>(ifs);
-        if (act)
-            spec.activation = static_cast<ActivationType>(*act);
-        // else: 旧文件无此字段，spec.activation 已默认 GeLU
-        auto nt = read_bytes<uint32_t>(ifs);
-        if (nt)
-            spec.norm_type = static_cast<NormType>(*nt);
-        // else: 旧文件无此字段，spec.norm_type 已默认 LayerNorm
-        break;
-    }
-
-    default:
-        return std::unexpected(Error{"Unknown ModelType in file: "
-                           + std::to_string(static_cast<uint32_t>(spec.type))});
-    }
-
-    return spec;
+    auto kv_r = KeyValueRecord::parse(bytes);
+    if (!kv_r) return std::unexpected(kv_r.error());
+    apply_spec_version_defaults(*kv_r, version);
+    return spec_from_kv(*kv_r);
 }
 
 // ── 文件头读写 ──────────────────────────────────────────────────────
@@ -325,7 +312,8 @@ template <typename... Ts>
     return {};
 }
 
-// 返回读到的 version，同时校验 magic number 和精度
+// 返回读到的 version，同时校验 magic number、格式版本和精度
+// v1/v2/v3 为旧的偏移量定长格式（已移除支持），仅接受自描述格式 v4+。
 [[nodiscard]] inline Result<uint32_t> read_and_validate_header(std::ifstream &ifs)
 {
     auto magic_r = read_bytes<uint32_t>(ifs);
@@ -336,24 +324,25 @@ template <typename... Ts>
 
     auto version_r = read_bytes<uint32_t>(ifs);
     if (!version_r) return std::unexpected(version_r.error());
-    if (*version_r == 0 || *version_r > MODEL_VERSION)
-        return std::unexpected(Error{"Unsupported model file version: "
-                           + std::to_string(*version_r)});
+    const auto version = *version_r;
+    if (version < MODEL_VERSION)
+        return std::unexpected(Error{"模型文件为旧格式 (v" + std::to_string(version)
+                           + ")，已不再支持；请用当前版本重新训练/保存。"});
+    if (version > MODEL_VERSION)
+        return std::unexpected(Error{"模型文件版本过新 (v" + std::to_string(version)
+                           + " > v" + std::to_string(MODEL_VERSION) + ")，请升级程序。"});
 
-    // V3: 读取并校验精度标记
-    if (*version_r >= 3)
-    {
-        auto pt_result = read_bytes<uint8_t>(ifs);
-        if (!pt_result)
-            return std::unexpected(Error{"Unexpected end: missing precision tag"});
-        uint8_t precision_tag = *pt_result;
-        if (precision_tag != PRECISION_TAG)
-            return std::unexpected(Error{
-                "Precision mismatch: file uses " + std::string(precision_tag == 0 ? "f32" : "f64")
-                + ", but build uses " + std::string(PRECISION_TAG == 0 ? "f32" : "f64")});
-    }
+    // 读取并校验精度标记
+    auto pt_result = read_bytes<uint8_t>(ifs);
+    if (!pt_result)
+        return std::unexpected(Error{"Unexpected end: missing precision tag"});
+    uint8_t precision_tag = *pt_result;
+    if (precision_tag != PRECISION_TAG)
+        return std::unexpected(Error{
+            "Precision mismatch: file uses " + std::string(precision_tag == 0 ? "f32" : "f64")
+            + ", but build uses " + std::string(PRECISION_TAG == 0 ? "f32" : "f64")});
 
-    return *version_r;
+    return version;
 }
 
 // ── Tokenizer JSON 读写（V3 新增） ──────────────────────────────────
@@ -390,15 +379,13 @@ template <typename... Ts>
 // ═══════════════════════════════════════════════════════════════════════════
 //  公开 API
 //
-//  save_model      — 保存 Model + ModelSpec（可选嵌入 tokenizer JSON）
-//  load_model      — 从文件加载参数，返回嵌入的 tokenizer JSON（如有）
+//  save_model      — 保存 Model + ModelSpec（可选嵌入 tokenizer 数据）
+//  load_model      — 从文件加载参数，返回嵌入的 tokenizer 数据（如有）
 //  peek_model_spec — 只读文件头，返回 ModelSpec（不读参数）
-//
-//  向后兼容 V1/V2/V3 读取，写入统一为 V3。
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ── 保存模型（V3 格式，含精度标记 + 可选 tokenizer） ────────────────────
-// 新架构：参数为 Tensor*，通过 engine.to_matrix 下载到 CPU Matrix 后写入。
+// ── 保存模型（v4 自描述格式） ───────────────────────────────────────────
+// 参数为 Tensor*，通过 engine.to_matrix 下载到 CPU Matrix 后写入。
 [[nodiscard]] inline Result<void> save_model(const std::string &filename,
     Model &model, const ModelSpec &spec, const std::string &tokenizer_json = {})
 {
@@ -408,7 +395,7 @@ template <typename... Ts>
 
     if (auto r = detail::write_header(ofs); !r)
         return std::unexpected(r.error());
-    if (auto r = detail::write_spec(ofs, spec); !r)
+    if (auto r = detail::write_spec_header(ofs, spec); !r)
         return std::unexpected(r.error());
 
     auto& engine = model.engine();
@@ -416,6 +403,16 @@ template <typename... Ts>
     for (auto& p_tensor : params)
     {
         auto m = engine.to_matrix(p_tensor);
+        if (!m) return std::unexpected(m.error());
+        if (auto r = detail::write_matrix(ofs, *m); !r)
+            return std::unexpected(r.error());
+    }
+
+    // 非可学习状态（如 BatchNorm 的 running_mean/running_var），紧跟在参数之后
+    auto extras = model.extra_state();
+    for (auto& e_tensor : extras)
+    {
+        auto m = engine.to_matrix(e_tensor);
         if (!m) return std::unexpected(m.error());
         if (auto r = detail::write_matrix(ofs, *m); !r)
             return std::unexpected(r.error());
@@ -431,7 +428,6 @@ template <typename... Ts>
 }
 
 // ── 读取模型规格（只读头部，不读参数/tokenizer） ──────────────────────────
-//    V1 文件返回 ModelType::Unknown
 [[nodiscard]] inline Result<ModelSpec> peek_model_spec(const std::string &filename)
 {
     std::ifstream ifs(filename, std::ios::binary);
@@ -441,16 +437,11 @@ template <typename... Ts>
     auto version_r = detail::read_and_validate_header(ifs);
     if (!version_r) return std::unexpected(version_r.error());
 
-    // V2/V3 有规格头
-    if (*version_r >= 2)
-        return detail::read_spec(ifs);
-
-    // V1 文件没有规格信息
-    return ModelSpec{ModelType::Unknown, {}, 0, 0, 0, 0, 0, 0, 0};
+    return detail::read_spec_header(ifs, *version_r);
 }
 
-// ── 加载参数 + tokenizer（兼容 V1/V2/V3） ─────────────────────────────────
-//    返回嵌入的 tokenizer JSON 字符串（空串 = 未嵌入或旧格式）
+// ── 加载参数 + tokenizer ───────────────────────────────────────────────
+//    返回嵌入的 tokenizer 数据字符串（空串 = 未嵌入）
 // 新架构：先 read_matrix 读入临时 CPU Matrix，再通过 engine.copy_from
 // 上传到参数 Tensor（CPU 拷贝 / GPU 上传由引擎实现决定）。
 [[nodiscard]] inline Result<std::string> load_model(const std::string &filename, Model &model)
@@ -461,16 +452,12 @@ template <typename... Ts>
 
     auto version_r = detail::read_and_validate_header(ifs);
     if (!version_r) return std::unexpected(version_r.error());
-    const auto version = *version_r;
 
-    // V2/V3: 读取并跳过规格头（规格已隐含在构建好的 model 中）
+    // 读取并跳过规格头（规格已隐含在构建好的 model 中）
     // TODO: 此处读完 spec 即丢弃，未与 model 自身的架构校验。
     //       完整校验需要 Layer 基类支持 spec() 方法，改动较大，暂留待后续实现。
-    if (version >= 2)
-    {
-        auto spec_r = detail::read_spec(ifs);
-        if (!spec_r) return std::unexpected(spec_r.error());
-    }
+    auto spec_r = detail::read_spec_header(ifs, *version_r);
+    if (!spec_r) return std::unexpected(spec_r.error());
 
     auto& engine = model.engine();
     auto params = model.parameters();
@@ -485,9 +472,22 @@ template <typename... Ts>
             return std::unexpected(r.error());
     }
 
-    // V3: 读取嵌入的 tokenizer JSON
+    // 非可学习状态（如 BatchNorm 的 running_mean/running_var），紧跟在参数之后。
+    // 旧文件（无额外状态）读到 EOF 时保持默认（running_mean=0, running_var=1）。
+    auto extras = model.extra_state();
+    for (auto& e_tensor : extras)
+    {
+        // 先读入临时 Matrix（按状态 Tensor 的形状）
+        Matrix tmp(e_tensor.get().rows(), e_tensor.get().cols());
+        auto mr = detail::read_matrix(ifs, tmp);
+        if (!mr)
+            return std::unexpected(mr.error());
+        if (auto r = engine.copy_from(e_tensor, tmp); !r)
+            return std::unexpected(r.error());
+    }
+
+    // 读取嵌入的 tokenizer 数据
     std::string tokenizer_json;
-    if (version >= 3)
     {
         auto tok_r = detail::read_tokenizer(ifs);
         if (!tok_r) return std::unexpected(tok_r.error());

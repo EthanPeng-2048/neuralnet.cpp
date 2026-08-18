@@ -447,6 +447,9 @@ class MnistTrainController(CLIController):
         # MLP专用参数
         if "layer_dims" in kwargs:
             args.extend(["--layer-dims", self._format_arg_value(kwargs["layer_dims"])])
+
+        if "norm" in kwargs:
+            args.extend(["--norm", self._format_arg_value(kwargs["norm"])])
         
         # Transformer专用参数
         if "d_model" in kwargs:

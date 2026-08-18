@@ -12,6 +12,7 @@
 | [快速上手：训练与推理](docs/04-quickstart-train-infer.md) | MNIST/GPT 训练推理命令行 + C++ API 示例 + GUI 操作指南 |
 | [算法解析](docs/05-algorithm-reference.md) | 每个 Layer/Loss/Optimizer 的数学原理与原语分解 |
 | [CUDA 后端](docs/06-cuda-backend.md) | CUDA GPU 加速后端设计、构建方法、编译器兼容性 |
+| [训练包](docs/07-train-package.md) | 用 `.nnpkg` 打包超参+训练集，跨设备一键复现训练 |
 | [开发规范](docs/DEVELOPMENT_STANDARDS.md) | C++ 编码规范、模块隔离、内存管理 |
 
 ## 项目结构
@@ -198,15 +199,21 @@ python gui.py
 
 ### MLP（默认）
 
+归一化层可通过 `--norm layernorm|rmsnorm|batchnorm` 切换（默认 LayerNorm）：
+
 ```
 输入 (784)
-→ Linear(784 → 512) + LayerNorm + GeLU
-→ Linear(512 → 256) + LayerNorm + GeLU
-→ Linear(256 → 128) + LayerNorm + GeLU
-→ Linear(128 → 64)  + LayerNorm + GeLU
+→ Linear(784 → 512) + Norm + GeLU
+→ Linear(512 → 256) + Norm + GeLU
+→ Linear(256 → 128) + Norm + GeLU
+→ Linear(128 → 64)  + Norm + GeLU
 → Linear(64  → 10)
 → CrossEntropy Loss (含 Softmax)
 ```
+
+- `LayerNorm`：按特征维归一化（GPT-2 风格，默认）
+- `RMSNorm`：无均值、更轻量（LLaMA 风格）
+- `BatchNorm`：按 batch 维归一化，训练时更新 running 统计、推理时使用（MLP 专用）
 
 ### Transformer（ViT-like）
 

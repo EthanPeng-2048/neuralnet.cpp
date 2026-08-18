@@ -40,6 +40,7 @@ enum class NormType : uint32_t
 {
     LayerNorm = 0,  // LayerNorm（GPT-2 风格，默认）
     RMSNorm   = 1,  // RMSNorm（LLaMA/Mistral 风格，更快更稳）
+    BatchNorm = 2,  // BatchNorm（沿 batch 维归一化，仅用于 MLP 类模型）
 };
 
 // ── 模型类型枚举 ─────────────────────────────────────────────────────────

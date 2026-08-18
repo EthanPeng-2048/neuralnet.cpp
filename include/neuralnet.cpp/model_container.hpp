@@ -64,6 +64,13 @@ public:
         return *this;
     }
 
+    // 添加已由工厂构造的 Layer（如 make_norm_layer 按 NormType 创建归一化层）
+    Model& add_layer(std::unique_ptr<Layer> layer)
+    {
+        layers_.emplace_back(std::move(layer));
+        return *this;
+    }
+
     // ── 访问 ─────────────────────────────────────────────────────────────
     [[nodiscard]] std::size_t num_layers() const noexcept { return layers_.size(); }
 
@@ -80,6 +87,13 @@ public:
     {
         for (auto& layer : layers_)
             layer->set_flush_interval(interval);
+    }
+
+    // ── 训练/推理模式切换：转发给各 Layer（BatchNorm 等需要区分） ──
+    void set_training(bool training)
+    {
+        for (auto& layer : layers_)
+            layer->set_training(training);
     }
 
     // ── 前向传播：Tensor → Tensor（全程不离开 engine 设备） ───────────────
@@ -126,6 +140,18 @@ public:
         {
             auto layer_params = layer->parameters();
             result.insert(result.end(), layer_params.begin(), layer_params.end());
+        }
+        return result;
+    }
+
+    // ── 非可学习状态收集（如 BatchNorm 的 running 统计量，供序列化） ────────
+    [[nodiscard]] std::vector<TensorRef> extra_state()
+    {
+        std::vector<TensorRef> result;
+        for (auto& layer : layers_)
+        {
+            auto layer_extra = layer->extra_state();
+            result.insert(result.end(), layer_extra.begin(), layer_extra.end());
         }
         return result;
     }
