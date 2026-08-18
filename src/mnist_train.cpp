@@ -62,6 +62,10 @@ void print_usage(const char *prog)
         << "\n"
         << "MLP 专用:\n"
         << "  --layer-dims <d1,d2,...>  各层维度，逗号分隔 (默认: 784,512,256,128,64,10)\n"
+        << "  --norm <type>      归一化层: layernorm(默认)/rmsnorm/batchnorm\n"
+        << "                     layernorm: LayerNorm（按特征维归一化）\n"
+        << "                     rmsnorm: RMSNorm（无均值、更轻量）\n"
+        << "                     batchnorm: BatchNorm（按 batch 维归一化，MLP 专用）\n"
         << "\n"
         << "Transformer 专用:\n"
         << "  --d-model <n>      模型维度 (默认: 64)\n"
@@ -103,6 +107,7 @@ struct TrainConfig
 
     // MLP 参数
     std::vector<std::size_t> layer_dims;
+    nn::NormType norm_type = nn::NormType::LayerNorm;  // 归一化层类型
 
     // Transformer 参数
     std::size_t d_model = nn::MNIST_TF_D_MODEL;
@@ -183,6 +188,21 @@ TrainConfig parse_args(int argc, char *argv[])
             if (cfg.layer_dims.size() < 2)
             {
                 std::cerr << "--layer-dims 至少需要 2 个维度\n";
+                std::exit(1);
+            }
+        }
+        else if (arg == "--norm" && i + 1 < argc)
+        {
+            std::string v = argv[++i];
+            if (v == "layernorm")
+                cfg.norm_type = nn::NormType::LayerNorm;
+            else if (v == "rmsnorm")
+                cfg.norm_type = nn::NormType::RMSNorm;
+            else if (v == "batchnorm")
+                cfg.norm_type = nn::NormType::BatchNorm;
+            else
+            {
+                std::cerr << "无效 --norm: " << v << "，可选: layernorm, rmsnorm, batchnorm\n";
                 std::exit(1);
             }
         }
@@ -277,6 +297,7 @@ nn::ModelSpec build_spec(const TrainConfig &cfg)
     nn::ModelSpec spec;
     spec.type = nn::ModelType::MLP;
     spec.layer_dims = cfg.layer_dims.empty() ? nn::MNIST_LAYER_DIMS : cfg.layer_dims;
+    spec.norm_type = cfg.norm_type;
     return spec;
 }
 
@@ -310,10 +331,6 @@ int main(int argc, char *argv[])
                 cfg.num_heads = spec.num_heads;
                 cfg.d_ff = spec.d_ff;
                 cfg.num_layers = spec.num_layers;
-            }
-            else if (spec_result->type == nn::ModelType::Unknown)
-            {
-                std::cout << "旧格式模型文件 (V1)，使用命令行参数 (--arch)\n";
             }
             else
             {
@@ -349,18 +366,25 @@ int main(int argc, char *argv[])
     else
     {
         const auto &dims = spec.is_mlp() ? spec.layer_dims : nn::MNIST_LAYER_DIMS;
+        const char *norm_name =
+            (spec.norm_type == nn::NormType::RMSNorm) ? "RMSNorm" :
+            (spec.norm_type == nn::NormType::BatchNorm) ? "BatchNorm" : "LayerNorm";
         std::cout << "  网络: ";
         for (std::size_t i = 0; i < dims.size(); ++i)
         {
             std::cout << dims[i];
             if (i < dims.size() - 2)
-                std::cout << "(LayerNorm+GeLU)";
+                std::cout << "(" << norm_name << "+GeLU)";
             if (i < dims.size() - 1)
                 std::cout << " -> ";
         }
         std::cout << "\n";
     }
 
+    std::cout << "  归一化: "
+              << ((spec.norm_type == nn::NormType::RMSNorm) ? "RMSNorm" :
+                  (spec.norm_type == nn::NormType::BatchNorm) ? "BatchNorm" : "LayerNorm")
+              << "\n";
     std::cout << "  优化器: " << cfg.optimizer_name << "  学习率: " << cfg.lr << "\n";
     std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
     std::cout << "  GPU: " << (cfg.gpu_enabled ? "启用" : "禁用")
@@ -397,6 +421,7 @@ int main(int argc, char *argv[])
         return 1;
     }
     auto model = std::move(*model_result);
+    model.set_training(true);  // 训练模式：BatchNorm 使用 batch 统计量并更新 running 统计
 
     if (cfg.load_existing)
     {

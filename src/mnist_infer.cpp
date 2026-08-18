@@ -256,13 +256,7 @@ int main(int argc, char *argv[])
     nn::ModelSpec spec = spec_result.value();
 
     // 支持的模型类型：MLP、Transformer（ViT）
-    if (spec.type == nn::ModelType::Unknown)
-    {
-        std::cout << "旧格式模型文件 (V1)，使用默认 MLP 架构\n";
-        spec.type = nn::ModelType::MLP;
-        spec.layer_dims = nn::MNIST_LAYER_DIMS;
-    }
-    else if (spec.type == nn::ModelType::MLP)
+    if (spec.type == nn::ModelType::MLP)
     {
         std::cout << "从模型文件读取规格: MLP\n";
     }
@@ -300,6 +294,9 @@ int main(int argc, char *argv[])
         return 1;
     }
     std::cout << "模型已加载: " << cfg.model_path << "\n" << std::endl;
+
+    // 推理模式：BatchNorm 使用保存的 running 统计量（batch 可能为 1，不能算 batch 统计）
+    model.set_training(false);
 
     fs::path input(cfg.input_path);
 

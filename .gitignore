@@ -50,6 +50,11 @@ texts/
 scripts/datasets/
 scripts/tokenizers/
 
+# ==================== 训练包 (train_pkg.py) ====================
+*.nnpkg
+runs/
+*.nnpkg.d/
+
 # ==================== Python ====================
 venv/
 .venv/

@@ -359,35 +359,43 @@ flowchart LR
 
 ## 📦 模型序列化格式 (model_io.hpp)
 
-### V2 格式（当前）
+### V4 格式（当前，自描述规格头）
 
 ```mermaid
 flowchart LR
-    subgraph "V2 二进制模型文件"
-        A["Magic: 0x4E4E4E4E<br/>(uint32)"] --> B["Version: 2<br/>(uint32)"]
-        B --> C["ModelType<br/>(uint32)"]
-        C --> D["ModelSpec<br/>(架构参数)"]
+    subgraph "V4 二进制模型文件"
+        A["Magic: 0x4E4E4E4E<br/>(uint32)"] --> B["Version: 4<br/>(uint32)"]
+        B --> B2["Precision<br/>(f32/f64)"]
+        B2 --> C["spec_len<br/>(u64 长度前缀)"]
+        C --> D["spec: KeyValueRecord<br/>(自描述字段)"]
         D --> E["Matrix 0<br/>rows(u64)+cols(u64)+data"]
         E --> F["Matrix 1 ..."]
-        F --> G["..."]
+        F --> G["extra state matrices..."]
+        G --> H["tokenizer_len + tokenizer"]
     end
 ```
 
-### ModelSpec 编码
+### ModelSpec 编码（KeyValueRecord 自描述字段）
 
-| 模型类型 | 字段 |
-|----------|------|
-| MLP | `layer_dims`: num_dims(u32) + dim_0..dim_N(u64) |
-| Transformer | d_model, num_heads, d_ff, num_layers, patch_size (各 u64) |
-| GPT | vocab_size, d_model, seq_len, num_heads, d_ff, num_layers (各 u64) |
+| key | 类型 | 说明 |
+|-----|------|------|
+| `type` | UInt | ModelType 枚举 |
+| `layer_dims` | UIntArray | MLP 各层维度 |
+| `d_model / num_heads / d_ff / num_layers / patch_size` | UInt | Transformer/GPT |
+| `vocab_size / seq_len` | UInt | GPT |
+| `pos_encoding / activation / norm_type` | UInt | 架构细节 |
+
+- 规格头为长度前缀的 KeyValueRecord，无偏移量假设，未知字段可跳过。
+- 版本默认值表（`apply_spec_version_defaults`）：字段缺失时按引入版本回落默认值。
+  v1/v2/v3 旧偏移量格式已移除支持。
 
 ### 公开 API
 
 | 函数 | 说明 |
 |------|------|
-| `save_model(path, model, spec)` | 保存 Model + ModelSpec 为 V2 格式 |
-| `load_model(path, model)` | 加载参数到已有 Model（兼容 V1/V2） |
-| `peek_model_spec(path)` | 只读文件头，返回 ModelSpec（V1 返回 Unknown） |
+| `save_model(path, model, spec)` | 保存 Model + ModelSpec 为 v4 格式 |
+| `load_model(path, model)` | 加载参数到已有 Model（仅 v4） |
+| `peek_model_spec(path)` | 只读文件头，返回 ModelSpec |
 
 所有函数失败时抛出 `ModelIOError`，无 `std::cout` 副作用。
 

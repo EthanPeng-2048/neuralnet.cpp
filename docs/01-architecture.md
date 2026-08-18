@@ -176,7 +176,7 @@ class Tensor {
 |------|------|
 | `model_container.hpp` | `Model` 容器：持有 `vector<unique_ptr<Layer>>` + `ComputeEngine*`，链式构建，`forward`/`backward` 委托 |
 | `model_spec.hpp` | `ModelSpec` 纯数据结构：`ModelType` 枚举 + MLP/Transformer/GPT 参数 |
-| `model_serialization.hpp` | 二进制序列化 V1/V2/V3 格式，`save_model` / `load_model` / `peek_model_spec` |
+| `model_serialization.hpp` | 二进制序列化 v4 自描述格式（KeyValueRecord 规格头），`save_model` / `load_model` / `peek_model_spec` |
 
 ### L4 领域构建层
 

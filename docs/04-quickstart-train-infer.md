@@ -187,7 +187,7 @@ cmake --build build --parallel
 | WordZip | `"wordzip"` | 词频统计分词 |
 | Space | `"space"` | 空格分词 |
 
-V3 格式模型文件会自动嵌入分词器，推理时无需单独指定 `--vocab`。
+V4 格式模型文件会自动嵌入分词器，推理时无需单独指定 `--vocab`。
 
 ---
 
@@ -351,7 +351,7 @@ int main() {
 int main() {
     nn::CpuEngine engine;
 
-    // 1. 加载模型（V3 格式自动读取规格 + 嵌入词表）
+    // 1. 加载模型（v4 格式自动读取规格 + 嵌入词表）
     auto load_result = nn::load_model_with_spec("gpt_model.bin", engine);
     auto& [model, spec, tokenizer] = *load_result;
 
@@ -419,13 +419,14 @@ int main() {
 
 | 版本 | 格式 | 说明 |
 |------|------|------|
-| V1 | `[magic][version][matrices...]` | 仅参数 |
-| V2 | `[magic][version][model_type][spec][matrices...]` | 含架构规格 |
-| V3 | `[magic][version][precision][model_type][spec][matrices...][tokenizer]` | 含精度标记 + 嵌入词表 |
+| V4 | `[magic][version][precision][spec_len][spec: KeyValueRecord][matrices...][extra state][tokenizer]` | 当前自描述格式 |
+| V1/V2/V3 | 旧偏移量定长格式 | 已移除支持 |
 
-- `load_model` 同时支持 V1/V2/V3 读取
-- `save_model` 统一写入 V3 格式
-- V3 模型推理时无需单独指定 `--vocab` 参数
+- `load_model` 仅支持 v4 自描述格式（v1/v2/v3 旧文件会提示重新训练保存）
+- `save_model` 统一写入 v4 格式
+- 规格头为长度前缀 KeyValueRecord（自描述、无偏移量假设）；
+  版本默认值表保证字段缺失时回落默认（如 norm_type 缺失 → LayerNorm）
+- v4 模型推理时无需单独指定 `--vocab` 参数（嵌入词表随模型保存）
 
 ---
 

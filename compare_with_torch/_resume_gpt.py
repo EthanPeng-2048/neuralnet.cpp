@@ -28,7 +28,7 @@ from model import GPTModel, QuickGeLU
 
 PAD_ID = 0
 
-# ── 读取 C++ V3 序列化模型 ──────────────────────────────────────────────
+# ── 读取 C++ v4 自描述序列化模型 ──────────────────────────────────────
 def read_u64(f):
     return struct.unpack("<Q", f.read(8))[0]
 
@@ -45,28 +45,71 @@ def read_f32_matrix(f):
     return rows, cols, list(data)
 
 
+def read_kv(f):
+    """读取一个 KeyValueRecord（长度前缀在文件层已读出）→ dict。"""
+    pos = [0]
+
+    def u32():
+        v = struct.unpack_from("<I", buf, pos[0])[0]
+        pos[0] += 4
+        return v
+
+    def u64():
+        v = struct.unpack_from("<Q", buf, pos[0])[0]
+        pos[0] += 8
+        return v
+
+    count = u32()
+    out = {}
+    for _ in range(count):
+        key_len = u32()
+        key = buf[pos[0]:pos[0] + key_len].decode()
+        pos[0] += key_len
+        typ = buf[pos[0]]
+        pos[0] += 1
+        value_len = u32()
+        value = buf[pos[0]:pos[0] + value_len]
+        pos[0] += value_len
+        if typ == 0:
+            out[key] = u64()
+        elif typ == 1:
+            out[key] = value.decode(errors="replace")
+        elif typ == 2:
+            out[key] = [u64() for _ in range(len(value) // 8)]
+    return out
+
+
 def load_bin_weights(path: str):
     """返回按 C++ parameters() 顺序排列的 (rows, cols, row-major data) 列表。"""
+    global buf
     mats = []
     with open(path, "rb") as f:
-        # header: magic u32 | version u32 | precision u8 | model_type u32
+        # header: magic u32 | version u32 | precision u8 | spec_len u64 | spec KeyValueRecord
         magic = read_u32(f)
         version = read_u32(f)
         precision = f.read(1)[0]
-        mtype = read_u32(f)
         assert magic == 0x4E4E4E4E, f"bad magic {magic:#x}"
-        assert version == 3, f"unexpected version {version}"
+        assert version == 4, f"unexpected version {version}（仅支持 v4 自描述格式）"
         assert precision == 0, f"expected f32 (precision={precision})"
 
-        if mtype == 3 or mtype == 4:
-            vs, dm, sl, nh, df, nl = struct.unpack("<QQQQQQ", f.read(48))
-            pe, act, nt = struct.unpack("<III", f.read(12))
-            spec = dict(vocab=vs, d_model=dm, seq_len=sl, num_heads=nh,
-                        d_ff=df, num_layers=nl, pos_enc=pe, activation=act, norm=nt)
+        spec_len = read_u64(f)
+        buf = f.read(spec_len)
+        kv = read_kv(f)
+        mtype = kv.get("type", 0)
+        if mtype == 3 or mtype == 4:  # GPT / ALiBi_GPT
+            spec = dict(vocab=kv.get("vocab_size", 0),
+                        d_model=kv.get("d_model", 0),
+                        seq_len=kv.get("seq_len", 0),
+                        num_heads=kv.get("num_heads", 0),
+                        d_ff=kv.get("d_ff", 0),
+                        num_layers=kv.get("num_layers", 0),
+                        pos_enc=kv.get("pos_encoding", 0),
+                        activation=kv.get("activation", 0),
+                        norm=kv.get("norm_type", 0))
         else:
             raise ValueError(f"unsupported model_type {mtype}")
 
-        # 参数矩阵（直到 tokenizer JSON 前）。期望数量（gpt_model.bin 实测 197）：
+        # 参数矩阵（直到 tokenizer 数据前）。期望数量（gpt_model.bin 实测 197）：
         #   token_emb(1) + pos_emb(1) + num_layers*16(块=LayerNorm, norm1+norm2 各 2)
         #   + ln_f(1, RMSNorm) + lm_head(2) = 2 + 12*16 + 1 + 2 = 197
         expected = 2 + spec["num_layers"] * 16 + 3

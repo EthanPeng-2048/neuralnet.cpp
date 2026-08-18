@@ -34,6 +34,7 @@ from cli_controllers import (
     RunState,
     Metric,
 )
+from train_pkg import pack, PKG_EXT
 
 # ---------- 主题 ----------
 ctk.set_appearance_mode("dark")
@@ -54,7 +55,8 @@ GPT_LR_SCHEDULE_OPTIONS = ["fixed", "cosine", "step_cosine"]
 TOKENIZER_OPTIONS = ["bpe", "charbpe"]
 POSITIONAL_ENCODING_OPTIONS = ["learned", "sinusoidal", "alibi"]
 ACTIVATION_OPTIONS = ["gelu", "swiglu"]
-NORM_OPTIONS = ["layernorm", "rmsnorm"]
+NORM_OPTIONS = ["layernorm", "rmsnorm", "batchnorm"]
+GPT_NORM_OPTIONS = ["layernorm", "rmsnorm"]  # GPT 仅支持 LayerNorm/RMSNorm
 
 
 # ---------- 工具函数 ----------
@@ -77,6 +79,7 @@ def _make_option_row(parent, label_text, row, options, default=None, width=200):
     var = ctk.StringVar(value=default or options[0])
     menu = ctk.CTkOptionMenu(parent, variable=var, values=options, width=width)
     menu.grid(row=row, column=1, sticky="w", padx=(0, 4), pady=3)
+    var.widget = menu  # 便于显隐切换时拿到真正的控件
     return var
 
 
@@ -511,6 +514,7 @@ class TabBase(ctk.CTkFrame):
         # --- 底部控制栏 ---
         ctrl = ctk.CTkFrame(self, fg_color="transparent")
         ctrl.grid(row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8))
+        self.ctrl = ctrl
         self.run_btn = ctk.CTkButton(ctrl, text="▶ 运行", width=120,
                                       fg_color="#2563eb",
                                       hover_color="#1d4ed8",
@@ -604,6 +608,48 @@ class TabBase(ctk.CTkFrame):
         self.stop_btn.configure(state="disabled")
         self._running = False
 
+    # 训练包导出 ------------------------------------------------
+    def _add_export_button(self):
+        """在底部控制栏添加"导出训练包"按钮（训练标签页调用）"""
+        self.export_btn = ctk.CTkButton(
+            self.ctrl, text="📦 导出训练包", width=130,
+            fg_color="#7c3aed", hover_color="#6d28d9",
+            command=self._on_export)
+        self.export_btn.pack(side="left", padx=(0, 8))
+
+    def build_pack_config(self) -> Dict[str, Any]:
+        """子类实现：把当前 UI 参数构造成训练包配置 dict"""
+        raise NotImplementedError
+
+    def _on_export(self):
+        """把当前训练配置 + 训练集打包成 .nnpkg，便于跨设备复现训练"""
+        try:
+            cfg = self.build_pack_config()
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+            return
+        if not (cfg.get("data") or {}).get("train"):
+            messagebox.showwarning("导出训练包", "未设置训练数据路径，无法导出")
+            return
+        out = filedialog.asksaveasfilename(
+            defaultextension=PKG_EXT,
+            initialfile=f"{cfg.get('name', 'run')}{PKG_EXT}",
+            filetypes=[("训练包", f"*{PKG_EXT}"), ("所有文件", "*.*")],
+        )
+        if not out:
+            return
+        try:
+            manifest = pack(cfg, out, base_dir=PROJECT_DIR)
+            n = len(manifest["package"]["data"])
+            messagebox.showinfo(
+                "导出成功",
+                f"已生成训练包:\n{out}\n\n"
+                f"数据文件: {n} 个\n压缩: {manifest['package']['compress']}\n"
+                f"包大小: {Path(out).stat().st_size:,} bytes",
+            )
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+
 
 # ================================================================
 #  Tab 1: MNIST 训练
@@ -646,7 +692,8 @@ class MnistTrainTab(TabBase):
         # --- MLP 专用参数 ---
         self.mlp_sep_label = _make_label(p, "── MLP 参数 ──", r); r += 1
         self.layer_dims = _make_entry_row(p, "layer_dims", r, "784,512,256,128,64,10"); r += 1
-        self._mlp_widgets = [self.mlp_sep_label, self.layer_dims]
+        self.norm = _make_option_row(p, "归一化层", r, NORM_OPTIONS, "layernorm"); r += 1
+        self._mlp_widgets = [self.mlp_sep_label, self.layer_dims, self.norm]
 
         # --- Transformer 专用参数 ---
         self.tf_sep_label = _make_label(p, "── Transformer 参数 ──", r); r += 1
@@ -668,18 +715,38 @@ class MnistTrainTab(TabBase):
         self._on_arch_change()
         self._on_lr_schedule_change()
 
+        self._add_export_button()
+
+    def build_pack_config(self):
+        """把当前 MNIST 训练 UI 参数打包为训练包配置"""
+        args = self.collect_args()
+        data = {}
+        if args.get("dataset"):
+            data["train"] = args.pop("dataset")
+        dev = "cpu"
+        if args.pop("gpu", False):
+            dev = "gpu"
+        if args.pop("cuda", False):
+            dev = "cuda"
+        name = Path(args.get("save", "mnist_model.bin")).stem or "mnist_run"
+        return {"format_version": 1, "name": name, "task": "mnist",
+                "device": dev, "data": data, "hyperparameters": args}
+
     def _on_arch_change(self, *args):
         """根据架构选择显示 MLP 或 Transformer 参数"""
         is_mlp = self.arch.get() == "mlp"
         for w in self._mlp_widgets:
+            w = getattr(w, "widget", w)
             w.grid() if is_mlp else w.grid_remove()
         for w in self._tf_widgets:
+            w = getattr(w, "widget", w)
             w.grid() if not is_mlp else w.grid_remove()
 
     def _on_lr_schedule_change(self, *args):
         """fixed 调度下隐藏 min_lr / warmup"""
         is_fixed = self.lr_schedule.get() == "fixed"
         for w in self._lr_schedule_widgets:
+            w = getattr(w, "widget", w)
             if is_fixed:
                 w.grid_remove()
             else:
@@ -707,6 +774,7 @@ class MnistTrainTab(TabBase):
         # 架构特定参数
         if self.arch.get() == "mlp":
             if self.layer_dims.get(): args["layer_dims"] = self.layer_dims.get()
+            args["norm"] = self.norm.get()
         else:
             if self.d_model.get(): args["d_model"] = int(self.d_model.get())
             if self.num_heads.get(): args["num_heads"] = int(self.num_heads.get())
@@ -1168,7 +1236,7 @@ class GptTrainTab(TabBase):
         self.activation = _make_option_row(p, "FFN 激活", r,
                                             ACTIVATION_OPTIONS, "gelu"); r += 1
         self.norm_type = _make_option_row(p, "归一化层", r,
-                                           NORM_OPTIONS, "layernorm"); r += 1
+                                           GPT_NORM_OPTIONS, "layernorm"); r += 1
 
         # --- GPU 保护 ---
         _make_label(p, "── GPU 保护 ──", r); r += 1
@@ -1183,12 +1251,31 @@ class GptTrainTab(TabBase):
         self.save_interval = _make_entry_row(p, "保存间隔 (steps)", r, "100"); r += 1
         self.grad_log_var = _make_checkbox_row(p, "梯度日志", r); r += 1
 
+        self._add_export_button()
+
+    def build_pack_config(self):
+        """把当前 GPT 训练 UI 参数打包为训练包配置"""
+        args = self.collect_args()
+        data = {}
+        for k, role in (("text_file", "train"), ("test_file", "test"), ("vocab", "vocab")):
+            if args.get(k):
+                data[role] = args.pop(k)
+        dev = "cpu"
+        if args.pop("gpu", False):
+            dev = "gpu"
+        if args.pop("cuda", False):
+            dev = "cuda"
+        name = Path(args.get("save", "gpt_model.bin")).stem or "gpt_run"
+        return {"format_version": 1, "name": name, "task": "gpt",
+                "device": dev, "data": data, "hyperparameters": args}
+
     def _on_lr_schedule_change(self, *args):
         """fixed 调度下隐藏 min_lr / warmup / grad_clip"""
         sched = self.lr_schedule.get()
         is_fixed = sched == "fixed"
         is_cosine = sched in ("cosine", "step_cosine")
         for w in self._lr_schedule_widgets:
+            w = getattr(w, "widget", w)
             if is_fixed:
                 w.grid_remove()
             else:

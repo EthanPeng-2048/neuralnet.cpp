@@ -93,10 +93,12 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
 
 // ── 构建 MLP 模型 ──────────────────────────────────────────────────────────
 // 通过指定 ComputeEngine 创建同设备的权重张量；可指定自定义层维度。
-// 结构：Linear → LayerNorm → GeLU × (N-1) + Linear（最后一层）
+// 结构：Linear → Norm → GeLU × (N-1) + Linear（最后一层）
+// norm_type 决定归一化层：LayerNorm / RMSNorm / BatchNorm。
 [[nodiscard]] inline Result<Model> build_mnist_mlp_model(
     ComputeEngine& engine,
-    const std::vector<std::size_t> &layer_dims = MNIST_LAYER_DIMS)
+    const std::vector<std::size_t> &layer_dims = MNIST_LAYER_DIMS,
+    NormType norm_type = NormType::LayerNorm)
 {
     if (layer_dims.size() < 2)
         return std::unexpected(Error{"MLP layer_dims must have at least 2 elements"});
@@ -111,7 +113,7 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
 
         if (i < layer_dims.size() - 2)
         {
-            model.add<LayerNorm>(engine, out_dim)
+            model.add_layer(make_norm_layer(engine, out_dim, norm_type))
                  .add<GeLU>();
         }
     }
@@ -175,7 +177,7 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
     ComputeEngine& engine, const ModelSpec &spec)
 {
     if (spec.is_mlp())
-        return build_mnist_mlp_model(engine, spec.layer_dims);
+        return build_mnist_mlp_model(engine, spec.layer_dims, spec.norm_type);
 
     if (spec.is_transformer())
     {

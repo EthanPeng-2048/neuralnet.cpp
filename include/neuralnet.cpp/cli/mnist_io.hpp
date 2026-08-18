@@ -180,6 +180,10 @@ namespace nn::cli
         auto x_tensor_r = engine.from_matrix(*xp);
         if (!x_tensor_r) return std::unexpected(std::move(x_tensor_r).error());
 
+        // 评估一律用推理模式：BatchNorm 使用 running 统计量而非 batch 统计量。
+        // 评估结束后恢复训练模式（调用方默认为训练场景）。
+        model.set_training(false);
+
         // batch 模式加速 forward（GPU 下消除 per-primitive 提交开销）
         auto bb = engine.begin_batch();
         if (!bb) return std::unexpected(bb.error());
@@ -189,6 +193,8 @@ namespace nn::cli
 
         auto eb = engine.end_batch();
         if (!eb) return std::unexpected(eb.error());
+
+        model.set_training(true);
 
         auto out_r = engine.to_matrix(*out_tensor_r);
         if (!out_r) return std::unexpected(std::move(out_r).error());
