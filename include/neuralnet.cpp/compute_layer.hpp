@@ -1104,9 +1104,10 @@ public:
             grad_concat_re, attn_cache_, BH, false, false);
         if (!grad_V_re) return std::unexpected(grad_V_re.error());
 
-        // 4. grad_A = batched_matmul(V, grad_concat, BH, true, false)
+        // 4. grad_A = batched_matmul(grad_concat^T, V, BH, true, false)
+        //    forward: O = V × A^T → grad_A = grad_O^T × V
         auto grad_A = engine.batched_matmul(
-            V_cache_, grad_concat_re, BH, true, false);
+            grad_concat_re, V_cache_, BH, true, false);
         if (!grad_A) return std::unexpected(grad_A.error());
 
         // 5. grad_S = softmax.backward(grad_A) — 掩码/偏置为常数，梯度直接穿透
@@ -2348,9 +2349,13 @@ public:
     {
         const std::size_t seq_len = seq_len_;
 
-        (void)engine.zero(grad_token_emb_);
-        if (use_pos_emb_ && pos_emb_learnable_)
-            (void)engine.zero(grad_pos_emb_);
+        // ⚠ 注意：不用在这里 zero grad_token_emb_！
+        //   grad_token_emb_ 已注册到优化器的 param_gradients() 中，
+        //   由优化器的 zero_grad() 统一清零。这里如果额外清零会破坏
+        //   梯度积累（accum_steps > 1 时前几轮的梯度信号全部丢失）。
+        // (void)engine.zero(grad_token_emb_);
+        // if (use_pos_emb_ && pos_emb_learnable_)
+        //     (void)engine.zero(grad_pos_emb_);
 
         // ── 1. LM Head 反向 → (d_model, seq*batch) ──
         auto b_lm = lm_head_.backward(engine, grad_output);

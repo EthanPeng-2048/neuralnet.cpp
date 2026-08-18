@@ -1169,6 +1169,17 @@ int main(int argc, char *argv[])
             auto grad_result = ce_loss.backward();
             if (!grad_result) { std::cerr << "\nLoss backward failed: " << grad_result.error().message << '\n'; return 1; }
 
+            // 梯度积累缩放：每步梯度除以 accum_steps
+            //   forward_sparse 的梯度为 (softmax-one_hot)/num_valid（单步平均），
+            //   积累后需除以 accum_steps 才能等价于有效 batch 的平均梯度。
+            //   否则梯度是正确值的 accum_steps 倍，Adam 虽近似抵消但非精确。
+            if (cfg.accum_steps > 1)
+            {
+                auto scale_r = engine->scale_inplace(*grad_result,
+                    Scalar{1} / static_cast<Scalar>(cfg.accum_steps));
+                if (!scale_r) { std::cerr << "\n梯度缩放失败: " << scale_r.error().message << '\n'; return 1; }
+            }
+
             auto bwd_result = model.backward(*grad_result);
             if (!bwd_result) { std::cerr << "Error: " << bwd_result.error().message << '\n'; return 1; }
 
