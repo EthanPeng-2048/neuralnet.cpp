@@ -1107,12 +1107,20 @@ int main(int argc, char *argv[])
                 return 1;
             }
 
-            // ── 构造平坦标签（与 logits 列序一致：t×batch + b） ──
+            // ── 构造平坦标签（与 logits 列序一致：batch-major，i = b*seq + t） ──
+            // GPTModel forward 对输入 transpose 后按 batch-major 列序输出 logits，
+            // 因此 flat_targets / flat_mask 必须与之一一对应（b 外层、t 内层）。
             auto y_span = y_tokens.span();
-            for (std::size_t t = 0; t < cfg.seq_len; ++t)
-                for (std::size_t b = 0; b < this_bs; ++b)
-                    flat_targets[t * this_bs + b] =
-                        static_cast<std::size_t>(y_span[t * this_bs + b]);
+            auto m_span = loss_mask.span();
+            std::vector<Scalar> flat_mask(cfg.seq_len * this_bs);
+            for (std::size_t b = 0; b < this_bs; ++b)
+                for (std::size_t t = 0; t < cfg.seq_len; ++t)
+                {
+                    const std::size_t pm = t * this_bs + b;  // 源的 position-major 索引
+                    const std::size_t bm = b * cfg.seq_len + t;  // 目标的 batch-major 索引
+                    flat_targets[bm] = static_cast<std::size_t>(y_span[pm]);
+                    flat_mask[bm] = m_span[pm];
+                }
 
             // ── 启用 GPU batch 录制 ─────────────────────────
             // 整个 forward + backward + optimizer step 录制到一个 command buffer，
@@ -1131,7 +1139,7 @@ int main(int argc, char *argv[])
             // logits: (vocab_size, seq_len × batch_size)
 
             // ── 损失（稀疏标签，避免 one-hot 爆显存） ────────
-            auto mask_span = std::span<const Scalar>(loss_mask.span());
+            auto mask_span = std::span<const Scalar>(flat_mask);
             auto loss_result = ce_loss.forward_sparse(
                 *engine, logits, flat_targets, mask_span, tokenizer->vocab_size());
             if (!loss_result) { std::cerr << "Error: " << loss_result.error().message << '\n'; return 1; }
@@ -1311,19 +1319,25 @@ int main(int argc, char *argv[])
                 auto x_tensor_r = engine->from_matrix(x_tokens);
                 if (!x_tensor_r) { std::cerr << "  测试 from_matrix 失败: " << x_tensor_r.error().message << '\n'; break; }
 
-                // 构建 flat_targets（与 logits 列序一致：t×batch + b）
+                // 构建 flat_targets / flat_mask（与 logits 列序一致：batch-major，i = b*seq + t）
                 auto y_span = y_tokens.span();
-                for (std::size_t t = 0; t < cfg.seq_len; ++t)
-                    for (std::size_t b = 0; b < this_bs; ++b)
-                        flat_targets[t * this_bs + b] =
-                            static_cast<std::size_t>(y_span[t * this_bs + b]);
+                auto mm_span = loss_mask.span();
+                std::vector<Scalar> tmask(cfg.seq_len * this_bs);
+                for (std::size_t b = 0; b < this_bs; ++b)
+                    for (std::size_t t = 0; t < cfg.seq_len; ++t)
+                    {
+                        const std::size_t pm = t * this_bs + b;   // 源 position-major 索引
+                        const std::size_t bm = b * cfg.seq_len + t;  // 目标 batch-major 索引
+                        flat_targets[bm] = static_cast<std::size_t>(y_span[pm]);
+                        tmask[bm] = mm_span[pm];
+                    }
 
                 auto begin_r = engine->begin_batch();
                 if (!begin_r) { std::cerr << "  测试 begin_batch 失败: " << begin_r.error().message << '\n'; break; }
 
                 auto fwd_result = model.forward(*x_tensor_r);
                 if (!fwd_result) { std::cerr << "  测试前向传播出错: " << fwd_result.error().message << '\n'; break; }
-                auto test_mask_span = std::span<const Scalar>(loss_mask.span());
+                auto test_mask_span = std::span<const Scalar>(tmask);
                 auto loss_result = ce_loss.forward_sparse(
                     *engine, *fwd_result, flat_targets, test_mask_span, tokenizer->vocab_size());
 
