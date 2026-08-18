@@ -67,6 +67,12 @@ public:
 
     // batch 录制粒度控制（默认 no-op，仅 GPTModel override）
     virtual void set_flush_interval(std::size_t /*interval*/) {}
+
+    // 训练/推理模式切换（默认 no-op，BatchNorm 等需要 override）
+    virtual void set_training(bool /*training*/) {}
+
+    // 非可学习状态收集（默认空，BatchNorm 的 running 统计量等需要 override）
+    [[nodiscard]] virtual std::vector<TensorRef> extra_state() { return {}; }
 };
 
 // ── 辅助：深拷贝 Tensor（通过 engine.clone()，无 PCIe 传输） ──────────────
@@ -2250,20 +2256,26 @@ public:
         batch_size_ = input.cols();
         const std::size_t total = seq_len * batch_size_;
 
-        // ── 1. gather 所有 token 的 embedding ──
-        // input: (seq, batch) 标量 token IDs（row-major: i = t * batch + b）
-        // gather_rows(token_emb_, input) → (seq*batch, d_model)
-        //   row i = token_emb[input[i]], i 是 input 的 row-major 索引
-        auto all_emb = engine.gather_rows(token_emb_, input);
+        // ── 1. gather 所有 token 的 embedding（统一采用 batch-major 列序） ──
+        // 下方注意力（AttentionBase::forward 的 rearrange_3d + batched_matmul + 因果掩码）
+        // 假定扁平列为 batch-major（b*seq + t）。因此先把输入 (seq, batch) 转置为
+        // (batch, seq)，使 gather_rows 的 flat 序即为 batch-major：i = b*seq + t。
+        auto input_T = engine.transpose(input);   // (batch, seq)，flat 索引 = b*seq+t
+        if (!input_T) return std::unexpected(input_T.error());
+
+        // gather_rows(token_emb_, input_T) → (batch*seq, d_model)
+        //   row i = token_emb[input_T[i]], i 是 batch-major 索引 b*seq+t
+        auto all_emb = engine.gather_rows(token_emb_, *input_T);
         if (!all_emb) return std::unexpected(all_emb.error());
 
         // ── 2. 保存 token IDs 的 Tensor 拷贝（供 backward 的 scatter_add_rows） ──
+        // 用 batch-major 序的 input_T，使 scatter 行号与 grad_T（transpose(grad_x)）对齐。
         // 全程 GPU：clone 在 GPU 内执行，无 PCIe 传输
-        auto st_t = engine.clone(input);
+        auto st_t = engine.clone(*input_T);
         if (!st_t) return std::unexpected(st_t.error());
         stored_tokens_tensor_ = std::move(*st_t);
 
-        // ── 3. 构造 x: (d_model, seq*batch) ──
+        // ── 3. 构造 x: (d_model, batch*seq)（batch-major 列序） ──
         auto all_T = engine.transpose(*all_emb);
         if (!all_T) return std::unexpected(all_T.error());
 
@@ -2274,10 +2286,11 @@ public:
             {
                 if (pos_indices_batch_ != batch_size_ || pos_indices_seq_ != seq_len)
                 {
+                    // 位置缓存按 batch-major（i = b*seq + t）存放 position=t
                     Matrix pidx_m(total, 1);
-                    for (std::size_t t = 0; t < seq_len; ++t)
-                        for (std::size_t b = 0; b < batch_size_; ++b)
-                            pidx_m.set_value_unchecked(t * batch_size_ + b, 0,
+                    for (std::size_t b = 0; b < batch_size_; ++b)
+                        for (std::size_t t = 0; t < seq_len; ++t)
+                            pidx_m.set_value_unchecked(b * seq_len + t, 0,
                                 static_cast<Scalar>(t));
                     auto pidx_t = engine.from_matrix(pidx_m);
                     if (!pidx_t) return std::unexpected(pidx_t.error());
@@ -2366,29 +2379,20 @@ public:
         }
 
         // ── 4. 转置 grad_x + pos_grad GPU 计算 ──
-        //   grad_x: (d_model, seq*batch)
+        //   grad_x: (d_model, batch*seq)（batch-major 列序）
         //   grad_T = transpose(grad_x) → (total, d_model) — 用于 scatter_add_rows
-        //   pos_grad = rearrange_3d(grad_x) + reduce → 全 GPU，无 PCIe 传输（仅 use_pos_emb_ 时）
         auto grad_T = engine.transpose(grad_x);
         if (!grad_T) return std::unexpected(grad_T.error());
 
         if (use_pos_emb_ && pos_emb_learnable_)
         {
-            // rearrange_3d(grad_x, d_model, seq, batch) → (seq*d_model, batch)
-            // 然后 row_reduce_sum → (seq*d_model, 1) = pos_grad 扁平化
-            auto rearranged = engine.rearrange_3d(
-                grad_x, d_model_, seq_len, batch_size_, false);
-            if (!rearranged) return std::unexpected(rearranged.error());
-
-            auto reduced = engine.row_reduce_sum(*rearranged);
-            if (!reduced) return std::unexpected(reduced.error());
-
-            // reduced 是 (seq*d_model, 1)，数据布局为 pos_grad[t*d_model+d]
-            // reshape 为 (seq, d_model) — 后端无关零拷贝 reshape
-            Tensor pos_grad_t = reduced->reshape(seq_len, d_model_);
-
-            auto ar = engine.add_inplace(grad_pos_emb_, pos_grad_t);
-            if (!ar) return std::unexpected(ar.error());
+            // grad_T: (total, d_model)，行序 = batch-major（i = b*seq + t）。
+            // pos_indices_cache_[i] = t（同一 t 在多个 batch 出现）。
+            // scatter_add_rows 将所有同 t 的批次梯度贡献累加到 grad_pos_emb_[t]，
+            // 即 pos_grad[t][d] = Σ_b grad_x[d][b*seq + t] —— batch-major 下的位置归约。
+            auto pr = engine.scatter_add_rows(
+                grad_pos_emb_, pos_indices_cache_, *grad_T);
+            if (!pr) return std::unexpected(pr.error());
         }
 
         // ── 5. scatter_add_rows: grad_token_emb_[tokens] += grad_T ──
