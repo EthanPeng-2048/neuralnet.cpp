@@ -96,6 +96,14 @@ public:
             layer->set_training(training);
     }
 
+    // ── 文档感知：设置当前 step 每样本文档 id（转发给各 Layer） ─────────
+    // GPTModel override 生效；其他层默认 no-op。
+    void set_doc_ids(std::span<const std::size_t> ids)
+    {
+        for (auto& layer : layers_)
+            layer->set_doc_ids(ids);
+    }
+
     // ── 前向传播：Tensor → Tensor（全程不离开 engine 设备） ───────────────
     [[nodiscard]] Result<Tensor> forward(const Tensor& input)
     {

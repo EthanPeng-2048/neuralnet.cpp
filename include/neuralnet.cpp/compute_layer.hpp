@@ -68,6 +68,9 @@ public:
     // batch 录制粒度控制（默认 no-op，仅 GPTModel override）
     virtual void set_flush_interval(std::size_t /*interval*/) {}
 
+    // 文档感知：设置当前 step 每样本文档 id（默认 no-op，GPTModel override）
+    virtual void set_doc_ids(std::span<const std::size_t> /*ids*/) {}
+
     // 训练/推理模式切换（默认 no-op，BatchNorm 等需要 override）
     virtual void set_training(bool /*training*/) {}
 
@@ -1817,6 +1820,61 @@ public:
     }
 };
 
+// ── 扁平化注意力掩码构建（纯函数，可独立单测） ─────────────────────────
+//
+// 返回 (BH*seq, seq) 的掩码，其中 BH = batch*num_heads。
+// 行 (b, h, t) 位于 (b*num_heads + h)*seq + t，列 j = key 位置（0..seq-1）。
+//
+// doc_ids（可选，batch-major：b*seq+t → 文档 id）非空时启用块对角文档感知：
+//   - 跨文档位置禁止相互注意（值 = -inf）
+//   - 同文档内仍施加因果掩码（未来位置 j>i 为 -inf）
+// doc_ids 为空时退化为纯因果掩码（与现有行为一致）。
+//
+// use_alibi 时，在允许注意的位置叠加 ALiBi 线性偏置 -m_h*(i-j)。
+[[nodiscard]] Matrix build_attention_mask(
+    std::size_t batch, std::size_t seq_len, std::size_t num_heads,
+    bool use_alibi, const std::vector<Scalar>& slopes,
+    const std::vector<std::size_t>* doc_ids)
+{
+    const Scalar neg_inf = -std::numeric_limits<Scalar>::infinity();
+    const std::size_t BH = batch * num_heads;
+    Matrix mask(BH * seq_len, seq_len);
+    for (std::size_t b = 0; b < batch; ++b)
+    {
+        for (std::size_t h = 0; h < num_heads; ++h)
+        {
+            const std::size_t head_idx = b * num_heads + h;
+            const Scalar slope = use_alibi ? slopes[h] : Scalar{0};
+
+            for (std::size_t i = 0; i < seq_len; ++i)
+            {
+                for (std::size_t j = 0; j < seq_len; ++j)
+                {
+                    bool allowed = (j <= i);
+                    if (allowed && doc_ids != nullptr)
+                    {
+                        // 块对角文档感知：仅同文档内的因果位置可注意
+                        allowed = (doc_ids->at(b * seq_len + i)
+                                   == doc_ids->at(b * seq_len + j));
+                    }
+                    if (allowed)
+                    {
+                        const Scalar bias = use_alibi
+                            ? -slope * static_cast<Scalar>(i - j)
+                            : Scalar{0};
+                        mask.set_value_unchecked(head_idx * seq_len + i, j, bias);
+                    }
+                    else
+                    {
+                        mask.set_value_unchecked(head_idx * seq_len + i, j, neg_inf);
+                    }
+                }
+            }
+        }
+    }
+    return mask;
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // CausalSelfAttention — 因果自注意力（继承 AttentionBase，仅重写掩码钩子）
 //
@@ -1857,6 +1915,11 @@ private:
     // ALiBi 斜率：m_h = 2^(-8h/H)（仅 use_alibi_ = true 时使用）
     std::vector<Scalar> slopes_;
 
+    // 文档感知掩码：当前 step 每样本的文档 id（batch-major b*seq+t → doc id）
+    // 非空时启用块对角文档感知（跨文档禁止注意），每步重建（不缓存）。
+    std::vector<std::size_t> doc_ids_;
+    bool has_doc_ids_ = false;
+
     void init_slopes_()
     {
         slopes_.resize(num_heads_);
@@ -1873,45 +1936,29 @@ private:
         if (mask_cached_batch_ == batch && mask_cached_seq_ == seq_len)
             return;
 
-        const Scalar neg_inf = -std::numeric_limits<Scalar>::infinity();
-        const std::size_t BH = batch * num_heads_;
-        // 平铺掩码: (BH * seq_len, seq_len)
-        //   普通模式: mask[i][j] = 0 if j<=i, -inf if j>i
-        //   ALiBi 模式: mask[i][j] = -m_h*(i-j) if j<=i, -inf if j>i
-        Matrix mask(BH * seq_len, seq_len);
-        for (std::size_t b = 0; b < batch; ++b)
-        {
-            for (std::size_t h = 0; h < num_heads_; ++h)
-            {
-                const std::size_t head_idx = b * num_heads_ + h;
-                const Scalar slope = use_alibi_ ? slopes_[h] : Scalar{0};
-
-                for (std::size_t i = 0; i < seq_len; ++i)
-                {
-                    for (std::size_t j = 0; j < seq_len; ++j)
-                    {
-                        if (j <= i)
-                        {
-                            // 因果允许位置：ALiBi 模式下添加线性偏置 -m_h*(i-j)，否则为 0
-                            const Scalar bias = use_alibi_
-                                ? -slope * static_cast<Scalar>(i - j)
-                                : Scalar{0};
-                            mask.set_value_unchecked(head_idx * seq_len + i, j, bias);
-                        }
-                        else
-                        {
-                            // 因果掩码：未来位置为 -inf
-                            mask.set_value_unchecked(head_idx * seq_len + i, j, neg_inf);
-                        }
-                    }
-                }
-            }
-        }
+        // 纯因果掩码：委托 build_attention_mask（doc_ids = nullptr）
+        auto mask = build_attention_mask(batch, seq_len, num_heads_,
+                                         use_alibi_, slopes_, nullptr);
         auto r = engine.from_matrix(mask);
         NN_ASSERT(r, r ? "" : r.error().message.c_str());
         mask_cache_ = std::move(*r);
         mask_cached_batch_ = batch;
         mask_cached_seq_ = seq_len;
+    }
+
+public:
+    // 设置当前 step 的每样本文档 id（batch-major b*seq+t → doc id）。
+    // 传入空 span 会清除文档感知，退化为纯因果掩码。
+    void set_doc_ids(std::span<const std::size_t> ids) override
+    {
+        if (ids.empty())
+        {
+            doc_ids_.clear();
+            has_doc_ids_ = false;
+            return;
+        }
+        doc_ids_.assign(ids.begin(), ids.end());
+        has_doc_ids_ = true;
     }
 
 protected:
@@ -1920,6 +1967,16 @@ protected:
         ComputeEngine& engine, Tensor&& scores,
         std::size_t batch, std::size_t seq) override
     {
+        if (has_doc_ids_)
+        {
+            // 文档感知：doc_ids_ 每 batch 变化，掩码不可缓存，每步重建
+            // 块对角（跨文档 -inf）∧ 因果（同文档内未来 -inf）
+            auto m = build_attention_mask(batch, seq, num_heads_,
+                                          use_alibi_, slopes_, &doc_ids_);
+            auto mt = engine.from_matrix(m);
+            if (!mt) return std::unexpected(mt.error());
+            return engine.elementwise_binary(BinaryOp::Add, scores, *mt);
+        }
         ensure_mask_(engine, batch, seq);
         return engine.elementwise_binary(BinaryOp::Add, scores, mask_cache_);
     }
@@ -2009,6 +2066,12 @@ public:
         p.insert(p.end(), f.begin(), f.end());
         p.insert(p.end(), n2.begin(), n2.end());
         return p;
+    }
+
+    // 文档感知：把每样本文档 id 转发给内部自注意力（用于块对角掩码）
+    void set_doc_ids(std::span<const std::size_t> ids) override
+    {
+        self_attn_.set_doc_ids(ids);
     }
 
     std::vector<TensorRef> param_gradients() override
@@ -2145,6 +2208,10 @@ private:
     std::size_t pos_indices_batch_ = 0;    // 缓存键：batch_size（独立字段，避免位打包溢出）
     std::size_t pos_indices_seq_ = 0;      // 缓存键：seq_len
 
+    // 文档感知：当前 step 每样本文档 id（batch-major b*seq+t → doc id），
+    // 由调用方在 forward 前 set_doc_ids 设置，转发给各 GPTBlock。
+    std::vector<std::size_t> doc_ids_;
+
     // batch 录制粒度：每隔 flush_interval_ 个 Transformer block 提交一次
     // 0 = 不在 block 间 flush（默认），>0 = 每 N 个 block flush 一次
     std::size_t flush_interval_ = 0;
@@ -2250,14 +2317,20 @@ public:
         return g;
     }
 
+    // 文档感知：设置当前 step 每样本文档 id（batch-major b*seq+t → doc id）。
+    // 传入空 span 清除文档感知（退化为纯因果）。在 forward 前调用。
+    void set_doc_ids(std::span<const std::size_t> ids) override
+    {
+        if (ids.empty()) { doc_ids_.clear(); return; }
+        doc_ids_.assign(ids.begin(), ids.end());
+    }
+
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
         const std::size_t seq_len = input.rows();
         batch_size_ = input.cols();
-        const std::size_t total = seq_len * batch_size_;
-
-        // ── 1. gather 所有 token 的 embedding（统一采用 batch-major 列序） ──
+        const std::size_t total = seq_len * batch_size_;        // ── 1. gather 所有 token 的 embedding（统一采用 batch-major 列序） ──
         // 下方注意力（AttentionBase::forward 的 rearrange_3d + batched_matmul + 因果掩码）
         // 假定扁平列为 batch-major（b*seq + t）。因此先把输入 (seq, batch) 转置为
         // (batch, seq)，使 gather_rows 的 flat 序即为 batch-major：i = b*seq + t。
@@ -2323,6 +2396,8 @@ public:
         Tensor x = std::move(x_result);
         for (std::size_t bi = 0; bi < blocks_.size(); ++bi)
         {
+            // 文档感知：把本 step 每样本文档 id 传给各 block 的注意力
+            blocks_[bi].set_doc_ids(doc_ids_);
             auto r = blocks_[bi].forward(engine, x);
             if (!r) return r;
             x = std::move(*r);
