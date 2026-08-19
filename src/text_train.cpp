@@ -154,13 +154,20 @@ void parallel_tokenize(
     }
 
     // 汇总各线程结果（按 chunk 顺序拼接，doc_ids 保持单调递增）
+    // 注意：每个 future 只能 get() 一次（get() 会消费共享状态），
+    // 先全部取回存到 parts，再合并，避免二次 get() 的未定义行为。
+    std::vector<Chunk> parts;
+    parts.reserve(futures.size());
     std::size_t total = 0;
-    for (auto& f : futures) total += f.get().toks.size();
-    token_flow.reserve(total);
-    doc_ids.reserve(total);
     for (auto& f : futures)
     {
-        auto c = f.get();
+        parts.push_back(f.get());
+        total += parts.back().toks.size();
+    }
+    token_flow.reserve(total);
+    doc_ids.reserve(total);
+    for (auto& c : parts)
+    {
         token_flow.insert(token_flow.end(), c.toks.begin(), c.toks.end());
         doc_ids.insert(doc_ids.end(), c.doc.begin(), c.doc.end());
     }
