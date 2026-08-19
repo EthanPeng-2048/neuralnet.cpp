@@ -80,6 +80,12 @@ nn_add_executable(rmsnorm_gradcheck src/rmsnorm_gradcheck.cpp)
 # ── GPTModel 整链数值梯度检查（gradcheck，验证多层堆叠全部参数梯度） ──────
 nn_add_executable(gpt_gradcheck src/gpt_gradcheck.cpp)
 
+# ── 文档感知注意力掩码构建单测（验证块对角∧因果∧ALiBi 组合） ───────────
+nn_add_executable(doc_mask_test src/doc_mask_test.cpp)
+
+# ── 文档感知掩码端到端正确性测试（不变性验证：跨文档屏蔽） ───────────────
+nn_add_executable(doc_attn_test src/doc_attn_test.cpp)
+
 # ── CausalSelfAttention 数值梯度检查（gradcheck，验证 attention 内部反向） ──
 nn_add_executable(attn_gradcheck src/attn_gradcheck.cpp)
 
@@ -174,6 +180,7 @@ if(Vulkan_FOUND)
             softmax_gradcheck
             attn_debug
             matmul_probe
+            doc_attn_test
         )
 
         foreach(TARGET ${NN_GPU_TARGETS})
@@ -222,6 +229,7 @@ if(NN_ENABLE_CUDA)
                 gpt_gradcheck
                 attn_gradcheck
                 softmax_gradcheck
+                doc_attn_test
             )
 
             foreach(TARGET ${NN_CUDA_TARGETS})

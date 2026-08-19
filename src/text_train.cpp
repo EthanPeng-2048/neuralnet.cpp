@@ -87,14 +87,20 @@ struct FileContent {
     return fc;
 }
 
-// ── 并行 tokenize：多线程 encode + BOS/EOS 拼接 ────────────────
-[[nodiscard]] std::vector<std::size_t> parallel_tokenize(
+// ── 并行 tokenize + 文档 id：每行 = 一篇文档 ───────────────────────
+// 不再插入 BOS/EOS（base 模式纯拼接，行间无分隔符）。
+// 输出 token_flow 与等长的 doc_ids：每 token 的文档 id = 所在行号 + 1
+//（1 起，0 保留给 PAD/无效位置，便于块对角掩码隔离）。
+void parallel_tokenize(
     const nn::Tokenizer& tokenizer,
     const std::vector<LineRef>& lines,
-    std::size_t bos_id, std::size_t eos_id)
+    std::vector<std::size_t>& token_flow,
+    std::vector<std::size_t>& doc_ids)
 {
+    token_flow.clear();
+    doc_ids.clear();
     const std::size_t n = lines.size();
-    if (n == 0) return {};
+    if (n == 0) return;
 
     const unsigned hw = std::thread::hardware_concurrency();
     const std::size_t n_threads = std::max(hw, 1u);
@@ -102,36 +108,43 @@ struct FileContent {
     // 行数太少时单线程（避免线程开销超过收益）
     if (n < n_threads * 64 || n_threads <= 1)
     {
-        std::vector<std::size_t> result;
-        result.reserve(n * 8);
-        for (const auto& lr : lines)
+        token_flow.reserve(n * 8);
+        for (std::size_t li = 0; li < n; ++li)
         {
-            auto toks = tokenizer.encode(std::string(lr.data, lr.len));
+            auto toks = tokenizer.encode(std::string(lines[li].data, lines[li].len));
             if (toks.empty()) continue;
-            if (bos_id != nn::Tokenizer::npos) result.push_back(bos_id);
-            result.insert(result.end(), toks.begin(), toks.end());
-            if (eos_id != nn::Tokenizer::npos) result.push_back(eos_id);
+            const std::size_t doc = li + 1;   // 文档 id（1 起）
+            for (const auto tk : toks)
+            {
+                token_flow.push_back(tk);
+                doc_ids.push_back(doc);
+            }
         }
-        return result;
+        return;
     }
 
-    // 分块并行
+    // 分块并行：每 chunk 返回 (tokens, doc_ids) 对
+    struct Chunk { std::vector<std::size_t> toks; std::vector<std::size_t> doc; };
     const std::size_t chunk = (n + n_threads - 1) / n_threads;
-    auto worker = [&](std::size_t begin, std::size_t end) -> std::vector<std::size_t> {
-        std::vector<std::size_t> local;
-        local.reserve((end - begin) * 8);
+    auto worker = [&](std::size_t begin, std::size_t end) -> Chunk {
+        Chunk c;
+        c.toks.reserve((end - begin) * 8);
+        c.doc.reserve((end - begin) * 8);
         for (std::size_t i = begin; i < end; ++i)
         {
             auto toks = tokenizer.encode(std::string(lines[i].data, lines[i].len));
             if (toks.empty()) continue;
-            if (bos_id != nn::Tokenizer::npos) local.push_back(bos_id);
-            local.insert(local.end(), toks.begin(), toks.end());
-            if (eos_id != nn::Tokenizer::npos) local.push_back(eos_id);
+            const std::size_t doc = i + 1;   // 文档 id（1 起，全局行号）
+            for (const auto tk : toks)
+            {
+                c.toks.push_back(tk);
+                c.doc.push_back(doc);
+            }
         }
-        return local;
+        return c;
     };
 
-    std::vector<std::future<std::vector<std::size_t>>> futures;
+    std::vector<std::future<Chunk>> futures;
     for (std::size_t t = 0; t < n_threads; ++t)
     {
         std::size_t begin = t * chunk;
@@ -140,25 +153,22 @@ struct FileContent {
         futures.push_back(std::async(std::launch::async, worker, begin, end));
     }
 
-    // 汇总各线程结果
+    // 汇总各线程结果（按 chunk 顺序拼接，doc_ids 保持单调递增）
     std::size_t total = 0;
-    std::vector<std::vector<std::size_t>> parts;
-    parts.reserve(futures.size());
+    for (auto& f : futures) total += f.get().toks.size();
+    token_flow.reserve(total);
+    doc_ids.reserve(total);
     for (auto& f : futures)
     {
-        parts.push_back(f.get());
-        total += parts.back().size();
+        auto c = f.get();
+        token_flow.insert(token_flow.end(), c.toks.begin(), c.toks.end());
+        doc_ids.insert(doc_ids.end(), c.doc.begin(), c.doc.end());
     }
-    std::vector<std::size_t> result;
-    result.reserve(total);
-    for (auto& p : parts)
-        result.insert(result.end(), p.begin(), p.end());
-    return result;
 }
 
 // ── Tokenize 二进制缓存 ─────────────────────────────────────
 static constexpr char TOKCACHE_MAGIC[4] = {'T','K','C','H'};
-static constexpr std::uint32_t TOKCACHE_VERSION = 1;
+static constexpr std::uint32_t TOKCACHE_VERSION = 2;
 
 struct TokCacheHeader {
     char           magic[4];
@@ -166,10 +176,16 @@ struct TokCacheHeader {
     std::uint32_t  sizeof_size_t;   // 平台 sizeof(size_t)，防止跨平台混用
     std::uint64_t  text_size;       // 原始文本文件大小（失效判断）
     std::uint64_t  vocab_size;      // 词表文件大小（失效判断）
-    std::uint64_t  token_count;     // token_flow 长度
+    std::uint64_t  token_count;     // token_flow 长度（= doc_ids 长度）
 };
 
-[[nodiscard]] std::optional<std::vector<std::size_t>> load_tokenize_cache(
+// Tokenize 缓存的数据（token_flow + 等长 doc_ids）
+struct TokenizedData {
+    std::vector<std::size_t> flow;
+    std::vector<std::size_t> doc_ids;
+};
+
+[[nodiscard]] std::optional<TokenizedData> load_tokenize_cache(
     const std::string& cache_path,
     std::uint64_t text_file_size,
     std::uint64_t vocab_file_size)
@@ -186,18 +202,24 @@ struct TokCacheHeader {
     if (hdr.text_size != text_file_size) return std::nullopt;
     if (hdr.vocab_size != vocab_file_size) return std::nullopt;
 
-    std::vector<std::size_t> tokens(hdr.token_count);
-    ifs.read(reinterpret_cast<char*>(tokens.data()),
+    TokenizedData data;
+    data.flow.resize(hdr.token_count);
+    data.doc_ids.resize(hdr.token_count);
+    ifs.read(reinterpret_cast<char*>(data.flow.data()),
              static_cast<std::streamsize>(hdr.token_count * sizeof(std::size_t)));
     if (!ifs) return std::nullopt;
-    return tokens;
+    ifs.read(reinterpret_cast<char*>(data.doc_ids.data()),
+             static_cast<std::streamsize>(hdr.token_count * sizeof(std::size_t)));
+    if (!ifs) return std::nullopt;
+    return data;
 }
 
 bool save_tokenize_cache(
     const std::string& cache_path,
     std::uint64_t text_file_size,
     std::uint64_t vocab_file_size,
-    const std::vector<std::size_t>& token_flow)
+    const std::vector<std::size_t>& token_flow,
+    const std::vector<std::size_t>& doc_ids)
 {
     std::ofstream ofs(cache_path, std::ios::binary);
     if (!ofs) return false;
@@ -213,6 +235,8 @@ bool save_tokenize_cache(
     ofs.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
     ofs.write(reinterpret_cast<const char*>(token_flow.data()),
               static_cast<std::streamsize>(token_flow.size() * sizeof(std::size_t)));
+    ofs.write(reinterpret_cast<const char*>(doc_ids.data()),
+              static_cast<std::streamsize>(doc_ids.size() * sizeof(std::size_t)));
     return ofs.good();
 }
 
@@ -745,15 +769,16 @@ int main(int argc, char *argv[])
                   << "请检查 JSON 文件是否包含有效的 \"type\" 字段" << std::endl;
         return 1;
     }
-    const std::size_t bos_id = tokenizer->bos_id();
-    const std::size_t eos_id = tokenizer->eos_id();
+    // 注意：base 模式已删除 BOS/EOS 插入（纯拼接，行间无分隔符），
+    // 文档边界由 parallel_tokenize 产出的 doc_ids 表示（每行 = 一篇文档）。
     const std::size_t pad_id = tokenizer->pad_id();
 
     // ── Tokenize（并行 + 缓存） ─────────────────────────────
-    // 流式读取文件 → 多线程并行 tokenize → 释放原始文本 → 仅保留 token_flow。
+    // 流式读取文件 → 多线程并行 tokenize → 释放原始文本 → 保留 token_flow + doc_ids。
     // 首次运行自动保存 .tokcache 二进制缓存，后续加载秒开。
     const std::size_t stride = (cfg.stride == 0) ? cfg.seq_len : cfg.stride;
     std::vector<std::size_t> token_flow;
+    std::vector<std::size_t> flow_doc_ids;
     {
         std::error_code ec_text, ec_vocab;
         auto text_fsize = static_cast<std::uint64_t>(fs::file_size(cfg.text_path, ec_text));
@@ -766,7 +791,8 @@ int main(int argc, char *argv[])
             auto cached = load_tokenize_cache(cache_path, text_fsize, vocab_fsize);
             if (cached)
             {
-                token_flow = std::move(*cached);
+                token_flow = std::move(cached->flow);
+                flow_doc_ids = std::move(cached->doc_ids);
                 std::cout << "从缓存加载 token流: " << cache_path
                           << " (" << token_flow.size() << " tokens)\n";
             }
@@ -789,10 +815,10 @@ int main(int argc, char *argv[])
             }
 
             auto t_tok = std::chrono::steady_clock::now();
-            token_flow = parallel_tokenize(*tokenizer, fc.lines, bos_id, eos_id);
+            parallel_tokenize(*tokenizer, fc.lines, token_flow, flow_doc_ids);
             auto t_tok_end = std::chrono::steady_clock::now();
             // fc 在此作用域末尾析构 → 释放原始文本 buffer
-            // 此后仅 token_flow 占用内存
+            // 此后仅 token_flow / flow_doc_ids 占用内存
             std::cout << "Tokenize 完成: " << token_flow.size() << " tokens, 耗时 "
                       << std::fixed << std::setprecision(1)
                       << std::chrono::duration<double>(t_tok_end - t_tok).count() << "s\n";
@@ -800,11 +826,17 @@ int main(int argc, char *argv[])
             // 3) 保存缓存（下次秒开）
             if (!cfg.no_cache && !ec_text && !ec_vocab)
             {
-                if (save_tokenize_cache(cache_path, text_fsize, vocab_fsize, token_flow))
+                if (save_tokenize_cache(cache_path, text_fsize, vocab_fsize,
+                                        token_flow, flow_doc_ids))
                     std::cout << "Token 缓存已保存: " << cache_path << "\n";
             }
         }
     }
+
+    // 文档感知：doc_ids 非空（每行 = 一篇文档）即启用块对角掩码。
+    if (!flow_doc_ids.empty())
+        std::cout << "文档感知掩码已启用（每行 = 一篇文档，"
+                  << flow_doc_ids.back() << " 篇文档，已删除 BOS/EOS）\n";
 
     // 切窗口：每个窗口 = 一个训练样本（长度 seq_len，末窗不足则 PAD）
     std::vector<std::size_t> window_offsets;  // 每个窗口在 token_flow 中的起始偏移
@@ -948,6 +980,7 @@ int main(int argc, char *argv[])
     // ── 加载测试集（可选，并行 + 缓存） ─────────────────────
     std::vector<std::size_t> test_window_offsets;
     std::vector<std::size_t> test_flow;
+    std::vector<std::size_t> test_flow_doc_ids;
     if (!cfg.test_path.empty())
     {
         std::error_code ec_test, ec_vocab2;
@@ -959,7 +992,10 @@ int main(int argc, char *argv[])
         {
             auto cached = load_tokenize_cache(test_cache_path, test_fsize, vocab_fsize2);
             if (cached)
-                test_flow = std::move(*cached);
+            {
+                test_flow = std::move(cached->flow);
+                test_flow_doc_ids = std::move(cached->doc_ids);
+            }
         }
 
         if (test_flow.empty())
@@ -970,10 +1006,11 @@ int main(int argc, char *argv[])
                 return 1;
             }
             auto fc = std::move(*fc_result);
-            test_flow = parallel_tokenize(*tokenizer, fc.lines, bos_id, eos_id);
+            parallel_tokenize(*tokenizer, fc.lines, test_flow, test_flow_doc_ids);
 
             if (!cfg.no_cache && !ec_test && !ec_vocab2)
-                save_tokenize_cache(test_cache_path, test_fsize, vocab_fsize2, test_flow);
+                save_tokenize_cache(test_cache_path, test_fsize, vocab_fsize2,
+                                    test_flow, test_flow_doc_ids);
         }
 
         for (std::size_t pos = 0; pos < test_flow.size(); pos += stride)
@@ -981,7 +1018,6 @@ int main(int argc, char *argv[])
         std::cout << "测试集: " << cfg.test_path << "  样本数: " << test_window_offsets.size()
                   << "  tokens: " << test_flow.size() << std::endl;
     }
-
     // ── 步数与采样：每 epoch 每样本恰好访问一次 ──────────────
     // steps_per_epoch = ceil(样本数 / batch_size)：最后一个 batch 不满时
     // 以实际 this_bs 参与训练。由于 loss 已按有效 token 归一化，不满 batch
@@ -1098,6 +1134,29 @@ int main(int argc, char *argv[])
                     loss_mask.set_value_unchecked(t, b, participate ? 1.0f : 0.0f);
                     if (participate) ++step_valid;
                 }
+            }
+
+            // ── 文档感知：每窗口 doc_ids（batch-major b*seq+t） ──────
+            // 行边界即文档边界（每行 = 一篇文档，见 build_flow_doc_ids）。
+            // PAD 位置 doc=0（区别于真实文档，从 1 起），块对角上互相隔离。
+            // flow_doc_ids 为空（无 BOS）时 doc_ids 为空 → set_doc_ids 退化为纯因果。
+            std::vector<std::size_t> doc_ids(cfg.seq_len * this_bs, 0);
+            if (!flow_doc_ids.empty())
+            {
+                for (std::size_t b = 0; b < this_bs; ++b)
+                {
+                    const std::size_t win_pos = window_offsets[sample_indices[offset + b]];
+                    const std::size_t win_len =
+                        std::min(cfg.seq_len, token_flow.size() - win_pos);
+                    for (std::size_t t = 0; t < cfg.seq_len; ++t)
+                        if (t < win_len)
+                            doc_ids[b * cfg.seq_len + t] = flow_doc_ids[win_pos + t];
+                }
+                model.set_doc_ids(doc_ids);
+            }
+            else
+            {
+                model.set_doc_ids({});
             }
 
             // ── Matrix → Tensor（上传到引擎设备） ──────────────
@@ -1329,6 +1388,25 @@ int main(int argc, char *argv[])
                 // Forward pass only（不 backward）
                 auto x_tensor_r = engine->from_matrix(x_tokens);
                 if (!x_tensor_r) { std::cerr << "  测试 from_matrix 失败: " << x_tensor_r.error().message << '\n'; break; }
+
+                // 文档感知：与训练一致，为测试 batch 设置每窗口 doc_ids
+                {
+                    std::vector<std::size_t> test_doc_ids(cfg.seq_len * this_bs, 0);
+                    if (!test_flow_doc_ids.empty())
+                    {
+                        for (std::size_t b = 0; b < this_bs; ++b)
+                        {
+                            const std::size_t win_pos = test_window_offsets[toffset + b];
+                            const std::size_t win_len =
+                                std::min(cfg.seq_len, test_flow.size() - win_pos);
+                            for (std::size_t t = 0; t < cfg.seq_len; ++t)
+                                if (t < win_len)
+                                    test_doc_ids[b * cfg.seq_len + t] =
+                                        test_flow_doc_ids[win_pos + t];
+                        }
+                    }
+                    model.set_doc_ids(test_doc_ids);
+                }
 
                 // 构建 flat_targets / flat_mask（与 logits 列序一致：batch-major，i = b*seq + t）
                 auto y_span = y_tokens.span();
