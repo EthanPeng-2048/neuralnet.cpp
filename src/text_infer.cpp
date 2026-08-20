@@ -158,22 +158,27 @@ void interactive_mode(nn::Model &model, nn::ComputeEngine &engine,
 
         if (has_dialogue)
         {
-            // 对话模式：包裹 <system>/<user>/<assistant> 标记，与训练时格式一致
-            // 训练格式: [BOS]<system>...</system><user>...</user><assistant>...
-            const std::string system_tag    = "<system>";
-            const std::string end_sys_tag   = "</system>";
-            const std::string user_tag      = "<user>";
-            const std::string end_user_tag  = "</user>";
-            const std::string asst_tag      = "<assistant>";
+            // 对话模式：直接用 tokenizer 暴露的标记 ID 构建（不硬编码字符串，
+            // 以后改标记只需改 domain_tokenizer.hpp）。
+            // 训练格式:
+            //   [BOS]<|system|>...</|end_of_system|><|user|>...</|end_of_user|><|assistant|>...
+            const auto push_marker = [&](std::size_t id) {
+                if (id != nn::Tokenizer::npos) prompt_tokens.push_back(id);
+            };
 
             const std::string system_prompt = "你是一个有用的AI助手。";
-            auto sys_tokens  = tokenizer.encode(system_tag + system_prompt + end_sys_tag);
-            auto user_tokens = tokenizer.encode(user_tag + prompt + end_user_tag);
-            auto asst_tokens = tokenizer.encode(asst_tag);
 
+            push_marker(tokenizer.system_marker_id());
+            auto sys_tokens  = tokenizer.encode(system_prompt);
             prompt_tokens.insert(prompt_tokens.end(), sys_tokens.begin(), sys_tokens.end());
+            push_marker(tokenizer.end_system_marker_id());
+
+            push_marker(tokenizer.user_marker_id());
+            auto user_tokens = tokenizer.encode(prompt);
             prompt_tokens.insert(prompt_tokens.end(), user_tokens.begin(), user_tokens.end());
-            prompt_tokens.insert(prompt_tokens.end(), asst_tokens.begin(), asst_tokens.end());
+            push_marker(tokenizer.end_user_marker_id());
+
+            push_marker(tokenizer.assistant_marker_id());
         }
         else
         {
@@ -188,15 +193,15 @@ void interactive_mode(nn::Model &model, nn::ComputeEngine &engine,
         if (!gen_result) { std::cerr << "Error: " << gen_result.error().message << '\n'; continue; }
         auto generated = std::move(*gen_result);
 
-        // 过滤尾部的 </assistant> 标记（避免显示在输出中）
+        // 对话模式：按 assistant 结束标记 ID 截断（避免显示在输出中）
         if (has_dialogue)
         {
-            const std::string end_asst = "</assistant>";
-            auto decoded = tokenizer.decode(generated);
-            auto pos = decoded.find(end_asst);
-            if (pos != std::string::npos)
-                decoded = decoded.substr(0, pos);
-            std::cout << "\n" << decoded << "\n\n";
+            const std::size_t end_asst = tokenizer.end_assistant_marker_id();
+            std::vector<std::size_t> gen_trunc = generated;
+            if (end_asst != nn::Tokenizer::npos)
+                for (std::size_t i = 0; i < generated.size(); ++i)
+                    if (generated[i] == end_asst) { gen_trunc.resize(i); break; }
+            std::cout << "\n" << tokenizer.decode(gen_trunc) << "\n\n";
         }
         else
         {

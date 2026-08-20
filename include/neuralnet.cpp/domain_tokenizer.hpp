@@ -85,12 +85,13 @@ public:
     }
 
     // ── 从词表中恢复对话标记 ID（加载后调用） ─────────────────
-    // 扫描词表查找 <system> 等标记字符串，若已存在则绑定已有 ID，
-    // 若不存在则追加到词表末尾。
+    // 扫描词表查找 <|system|> 等标记字符串，若已存在则绑定已有 ID，
+    // 若不存在则追加到词表末尾。随后追加额外保留特殊 token。
     void restore_dialogue_markers(std::vector<std::string> &vocab)
     {
         static constexpr std::string_view marker_strs[] = {
-            "<system>", "</system>", "<user>", "</user>", "<assistant>", "</assistant>"
+            "<|system|>", "<|end_of_system|>", "<|user|>", "<|end_of_user|>",
+            "<|assistant|>", "<|end_of_assistant|>"
         };
         std::size_t ids[6];
         bool all_found = true;
@@ -113,6 +114,8 @@ public:
                 { ids[i] = vocab.size(); vocab.emplace_back(marker_strs[i]); }
             }
         }
+        // 追加额外保留特殊 token（回合结束/SEP/工具/多模态/文件）
+        append_reserved_extras_(vocab);
         // 通过虚方法设置 markers_（基类默认实现赋值 markers_）
         set_dialogue_marker_ids(ids[0], ids[1], ids[2], ids[3], ids[4], ids[5]);
     }
@@ -120,6 +123,9 @@ public:
 protected:
     // 对话标记 ID 集合（子类直接读取，无需各自定义 6 个字段）
     DialogueMarkers markers_;
+
+    // 额外保留 token → id 查找表（按字符串长度降序，供 try_match_marker 最长匹配）
+    std::vector<std::pair<std::string, std::size_t>> reserved_ids_;
 
     // 默认实现：将参数赋值到 markers_（子类一般无需重写）
     virtual void set_dialogue_marker_ids(
@@ -135,37 +141,70 @@ protected:
         markers_.assistant_end = end_assistant;
     }
 
-    // 添加 6 个对话标记到词表末尾，并绑定 ID 到 markers_
+    // 添加 6 个对话标记到词表末尾，并绑定 ID 到 markers_；随后追加额外保留 token
     void add_dialogue_markers_to_vocab_(std::vector<std::string> &vocab)
     {
-        markers_.system        = vocab.size(); vocab.emplace_back("<system>");
-        markers_.system_end    = vocab.size(); vocab.emplace_back("</system>");
-        markers_.user          = vocab.size(); vocab.emplace_back("<user>");
-        markers_.user_end      = vocab.size(); vocab.emplace_back("</user>");
-        markers_.assistant      = vocab.size(); vocab.emplace_back("<assistant>");
-        markers_.assistant_end = vocab.size(); vocab.emplace_back("</assistant>");
+        markers_.system        = vocab.size(); vocab.emplace_back("<|system|>");
+        markers_.system_end    = vocab.size(); vocab.emplace_back("<|end_of_system|>");
+        markers_.user          = vocab.size(); vocab.emplace_back("<|user|>");
+        markers_.user_end      = vocab.size(); vocab.emplace_back("<|end_of_user|>");
+        markers_.assistant      = vocab.size(); vocab.emplace_back("<|assistant|>");
+        markers_.assistant_end = vocab.size(); vocab.emplace_back("<|end_of_assistant|>");
+        append_reserved_extras_(vocab);
+    }
+
+    // ── 追加额外的保留特殊 token（供未来 SFT/工具/多模态/文件/SEP 使用） ──
+    // 仅作为词表保留 id，并登记到 reserved_ids_ 供编码时匹配为单 token；
+    // 幂等（已存在则不重复追加）。
+    void append_reserved_extras_(std::vector<std::string> &vocab)
+    {
+        static constexpr std::string_view extras[] = {
+            "<|end_of_turn|>", "<|sep|>", "<|tool|>", "<|tool_result|>",
+            "<|image|>", "<|audio|>", "<|video|>", "<|file|>"
+        };
+        reserved_ids_.clear();
+        for (const auto ex : extras)
+        {
+            std::size_t id = npos;
+            for (std::size_t j = 0; j < vocab.size(); ++j)
+                if (vocab[j] == ex) { id = j; break; }
+            if (id == npos) { id = vocab.size(); vocab.emplace_back(ex); }
+            reserved_ids_.emplace_back(std::string(ex), id);
+        }
+        // 按长度降序，保证 try_match_marker 最长匹配优先（如 <|tool|> vs <|tool_result|>）
+        std::sort(reserved_ids_.begin(), reserved_ids_.end(),
+                  [](const auto &a, const auto &b) { return a.first.size() > b.first.size(); });
     }
 
     // ── 辅助：尝试匹配对话标记，返回 (token_id, 匹配字节数)，不匹配返回 (npos, 0) ──
+    // 先匹配 6 个对话标记，再匹配额外保留 token（按长度降序，最长优先）。
     [[nodiscard]] std::pair<std::size_t, std::size_t>
     try_match_marker(std::string_view text, std::size_t pos) const noexcept
     {
         static constexpr std::string_view markers[] = {
-            "<system>", "</system>", "<user>", "</user>", "<assistant>", "</assistant>"
+            "<|system|>", "<|end_of_system|>", "<|user|>", "<|end_of_user|>",
+            "<|assistant|>", "<|end_of_assistant|>"
         };
         for (const auto &m : markers)
         {
             if (pos + m.size() <= text.size() && text.substr(pos, m.size()) == m)
             {
                 std::size_t id = npos;
-                if      (m == "<system>")     id = markers_.system;
-                else if (m == "</system>")    id = markers_.system_end;
-                else if (m == "<user>")       id = markers_.user;
-                else if (m == "</user>")      id = markers_.user_end;
-                else if (m == "<assistant>")  id = markers_.assistant;
-                else if (m == "</assistant>") id = markers_.assistant_end;
+                if      (m == "<|system|>")            id = markers_.system;
+                else if (m == "<|end_of_system|>")    id = markers_.system_end;
+                else if (m == "<|user|>")             id = markers_.user;
+                else if (m == "<|end_of_user|>")      id = markers_.user_end;
+                else if (m == "<|assistant|>")        id = markers_.assistant;
+                else if (m == "<|end_of_assistant|>") id = markers_.assistant_end;
                 if (id != npos) return {id, m.size()};
             }
+        }
+        // 额外保留 token：reserved_ids_ 已按长度降序，首个命中即最长匹配
+        for (const auto &[tok, id] : reserved_ids_)
+        {
+            if (id != npos && pos + tok.size() <= text.size()
+                && text.substr(pos, tok.size()) == tok)
+                return {id, tok.size()};
         }
         return {npos, 0};
     }
@@ -866,12 +905,12 @@ public:
         for (auto tid : ids)
         {
             // 对话标记 → 原始文本
-            if (tid == markers_.system)        { raw += "<system>";     continue; }
-            if (tid == markers_.system_end)    { raw += "</system>";    continue; }
-            if (tid == markers_.user)          { raw += "<user>";       continue; }
-            if (tid == markers_.user_end)      { raw += "</user>";      continue; }
-            if (tid == markers_.assistant)     { raw += "<assistant>";  continue; }
-            if (tid == markers_.assistant_end) { raw += "</assistant>"; continue; }
+            if (tid == markers_.system)        { raw += "<|system|>";          continue; }
+            if (tid == markers_.system_end)    { raw += "<|end_of_system|>";   continue; }
+            if (tid == markers_.user)          { raw += "<|user|>";            continue; }
+            if (tid == markers_.user_end)      { raw += "<|end_of_user|>";     continue; }
+            if (tid == markers_.assistant)     { raw += "<|assistant|>";       continue; }
+            if (tid == markers_.assistant_end) { raw += "<|end_of_assistant|>";continue; }
             raw += tid < vocab_.size() ? vocab_[tid] : std::string{REPLACEMENT_CHAR};
         }
         return raw;
@@ -1604,12 +1643,12 @@ public:
         for (auto id : ids)
         {
             // 对话标记 → 原始文本
-            if (id == markers_.system)        { result += "<system>";     continue; }
-            if (id == markers_.system_end)    { result += "</system>";    continue; }
-            if (id == markers_.user)          { result += "<user>";       continue; }
-            if (id == markers_.user_end)      { result += "</user>";      continue; }
-            if (id == markers_.assistant)     { result += "<assistant>";  continue; }
-            if (id == markers_.assistant_end) { result += "</assistant>"; continue; }
+            if (id == markers_.system)        { result += "<|system|>";          continue; }
+            if (id == markers_.system_end)    { result += "<|end_of_system|>";   continue; }
+            if (id == markers_.user)          { result += "<|user|>";            continue; }
+            if (id == markers_.user_end)      { result += "<|end_of_user|>";     continue; }
+            if (id == markers_.assistant)     { result += "<|assistant|>";       continue; }
+            if (id == markers_.assistant_end) { result += "<|end_of_assistant|>";continue; }
             if (id < id_to_token_.size())
             {
                 const auto &tok = id_to_token_[id];
@@ -1793,14 +1832,17 @@ public:
                               const std::function<void(std::size_t)> &progress)
             {
                 const std::string seg(s.data() + b, e - b);
-                auto begin = std::sregex_iterator(seg.begin(), seg.end(), pre_pattern());
-                auto end   = std::sregex_iterator();
+                // 用保护标记的 pre_tokenize：保留特殊 token 作为独立 chunk，
+                // 不与其前后文本/标点合并（避免 "?<|"、".<|" 等垃圾 token）。
+                auto chunks = pre_tokenize(seg);
                 std::size_t last_mb = static_cast<std::size_t>(-1);
-                for (auto it = begin; it != end; ++it)
+                std::size_t off = 0;
+                for (const auto &ch : chunks)
                 {
-                    ++local[it->str()];
+                    ++local[ch];
+                    off += ch.size();
                     // 绝对偏移 = 段起点 + 段内偏移
-                    const auto pos = b + static_cast<std::size_t>(it->position()) + it->length();
+                    const auto pos = b + off;
                     const auto mb  = pos / (1u << 20);
                     if (mb != last_mb)
                     {
@@ -1915,12 +1957,12 @@ public:
         for (auto id : ids)
         {
             // 对话标记 → 原始文本
-            if (id == markers_.system)        { result += "<system>";     continue; }
-            if (id == markers_.system_end)    { result += "</system>";    continue; }
-            if (id == markers_.user)          { result += "<user>";       continue; }
-            if (id == markers_.user_end)      { result += "</user>";      continue; }
-            if (id == markers_.assistant)     { result += "<assistant>";  continue; }
-            if (id == markers_.assistant_end) { result += "</assistant>"; continue; }
+            if (id == markers_.system)        { result += "<|system|>";          continue; }
+            if (id == markers_.system_end)    { result += "<|end_of_system|>";   continue; }
+            if (id == markers_.user)          { result += "<|user|>";            continue; }
+            if (id == markers_.user_end)      { result += "<|end_of_user|>";     continue; }
+            if (id == markers_.assistant)     { result += "<|assistant|>";       continue; }
+            if (id == markers_.assistant_end) { result += "<|end_of_assistant|>";continue; }
             result += id < vocab_.size() ? vocab_[id] : std::string{REPLACEMENT_CHAR};
         }
         return result;
@@ -2004,12 +2046,53 @@ public:
 
     [[nodiscard]] static std::vector<std::string> pre_tokenize(std::string_view text)
     {
+        // 保留特殊标记（按长度降序，最长匹配优先，如 <|tool_result|> 优先于 <|tool|>）
+        static const std::vector<std::string> markers = [] {
+            std::vector<std::string> m = {
+                "<|system|>", "<|end_of_system|>", "<|user|>", "<|end_of_user|>",
+                "<|assistant|>", "<|end_of_assistant|>", "<|end_of_turn|>", "<|sep|>",
+                "<|tool|>", "<|tool_result|>", "<|image|>", "<|audio|>",
+                "<|video|>", "<|file|>"
+            };
+            std::sort(m.begin(), m.end(),
+                      [](const auto &a, const auto &b) { return a.size() > b.size(); });
+            return m;
+        }();
+
+        // 保护标记：标记串作为独立 chunk（内部可合并成单 token），
+        // 不与相邻文本/标点合并，避免 BPE 产出 "?<|"、".<|" 这类垃圾 token。
+        // 合并只在 chunk 内部发生，因此标记与邻居被天然隔离。
         std::vector<std::string> chunks;
-        std::string s(text);
-        auto begin = std::sregex_iterator(s.begin(), s.end(), pre_pattern());
-        auto end   = std::sregex_iterator();
-        for (auto it = begin; it != end; ++it)
-            chunks.push_back(it->str());
+        chunks.reserve(text.size() / 4);
+        std::string plain;  // 累积标记之间的普通文本
+        auto flush_plain = [&]() {
+            if (plain.empty()) return;
+            std::string s = std::move(plain); plain.clear();
+            auto begin = std::sregex_iterator(s.begin(), s.end(), pre_pattern());
+            auto end   = std::sregex_iterator();
+            for (auto it = begin; it != end; ++it) chunks.push_back(it->str());
+        };
+
+        std::size_t pos = 0;
+        while (pos < text.size())
+        {
+            std::size_t mlen = 0;
+            for (const auto &mk : markers)
+                if (pos + mk.size() <= text.size() && text.substr(pos, mk.size()) == mk)
+                { mlen = mk.size(); break; }
+            if (mlen > 0)
+            {
+                flush_plain();
+                chunks.push_back(std::string(text.substr(pos, mlen)));  // 标记独立 chunk
+                pos += mlen;
+            }
+            else
+            {
+                plain.push_back(text[pos]);
+                ++pos;
+            }
+        }
+        flush_plain();
         return chunks;
     }
 
