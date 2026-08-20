@@ -208,8 +208,9 @@ if(NN_BUILD_TESTS)
 endif()
 
 # ── CUDA GPU 加速（可选）──────────────────────────────────────────────────
-# CUDA 内核由 nvcc 编译为独立静态库，通过 C-linkage 接口链接到 Clang 主程序。
-# 在 Windows 上 nvcc 使用 MSVC 作为 host 编译器，与 LLVM/Clang 通过 C ABI 兼容。
+# CUDA 内核由 nvcc 编译为独立目标文件，通过 C-linkage 接口链接到主程序。
+# - Windows：nvcc 以 MSVC 为 host 编译器，与 LLVM/Clang 通过 C ABI 兼容。
+# - Linux：  nvcc 以 GCC/Clang 为 host 编译器，同样通过 C ABI 链接。
 option(NN_ENABLE_CUDA "Enable CUDA GPU acceleration" OFF)
 if(NN_ENABLE_CUDA)
     find_package(CUDAToolkit QUIET)
