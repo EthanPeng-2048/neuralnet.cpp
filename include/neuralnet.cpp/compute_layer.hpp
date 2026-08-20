@@ -30,6 +30,7 @@
 #include "compute_engine.hpp"
 #include "tensor.hpp"
 #include "model_spec.hpp"
+#include "fused_exprs.hpp"
 
 namespace nn
 {
@@ -983,24 +984,9 @@ private:
     }
 
     // 构造 RoPE 表达式（forward 用 Add 结尾，backward 用 Sub 结尾）
-    [[nodiscard]] ExprSpec make_expr(bool backward) const
-    {
-        ExprSpec spec;
-        spec.views = {
-            expr::linear(),
-            expr::rotate_half(static_cast<std::uint32_t>(d_k_), true),
-            expr::row_mod(static_cast<std::uint32_t>(d_k_)),
-            expr::row_mod(static_cast<std::uint32_t>(d_k_)),
-        };
-        spec.num_regs = 3;
-        ExprInstr i0, i1, i2;
-        i0.op = static_cast<uint8_t>(ExprOp::Mul); i0.dst = 0; i0.a = expr::input(0); i0.b = expr::input(2);
-        i1.op = static_cast<uint8_t>(ExprOp::Mul); i1.dst = 1; i1.a = expr::input(1); i1.b = expr::input(3);
-        i2.op = static_cast<uint8_t>(backward ? ExprOp::Sub : ExprOp::Add);
-        i2.dst = 2; i2.a = expr::reg(0); i2.b = expr::reg(1);
-        spec.instrs = {i0, i1, i2};
-        return spec;
-    }
+    // 单一事实来源：定义见 fused_exprs.hpp（nn::fused::make_rope），
+    // 运行时与构建期生成器（tools/gen_fused）共用同一份 C++ 定义。
+    // [[nodiscard]] ExprSpec make_expr(bool backward) const  ← 已移除，复用 fused
 
 public:
     RotaryEmbedding() = default;
@@ -1021,7 +1007,9 @@ public:
         if (seq != seq_cached_)
             rebuild(engine, seq);
         std::vector<Tensor> inputs = {q, q, cos_cache_, sin_cache_};
-        return engine.eval_expr(make_expr(backward), inputs, q.rows(), q.cols());
+        return engine.eval_expr(
+            nn::fused::make_rope(static_cast<std::uint32_t>(d_k_), backward),
+            inputs, q.rows(), q.cols());
     }
 
     // 增量推理：q 为 (H*d_k, 1)，位置 = pos（cur_len）
@@ -1050,7 +1038,9 @@ public:
         auto sr = engine.from_matrix(s);
         if (!sr) return std::unexpected(sr.error());
         std::vector<Tensor> inputs = {q, q, *cr, *sr};
-        return engine.eval_expr(make_expr(backward), inputs, q.rows(), q.cols());
+        return engine.eval_expr(
+            nn::fused::make_rope(static_cast<std::uint32_t>(d_k_), backward),
+            inputs, q.rows(), q.cols());
     }
 };
 
