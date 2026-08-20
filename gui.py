@@ -180,13 +180,15 @@ class ChartWidget(ctk.CTkFrame):
     策略：
     - 最近 _RECENT 个点全精度保留
     - 更早的点压缩到 _BUCKETS 个桶（每桶取偏离最大的点，保留尖峰/谷底）
-    - 降采样结果缓存，每 _CACHE_DIRTY 个新点才重算
+    - 降采样结果按原始长度做 memo（原始数据变长即失效，避免 resize 重复计算）
+      注意：不做"尾部追加 + 攒点重算"的增量优化——那会让显示点数在
+      _BUCKETS+_RECENT .. +_CACHE_DIRTY 之间锯齿抖动，X 轴映射 i/(n-1)
+      随点数变化，导致缩放比漂移、曲线跳变重复。
     - PIL 离屏画图，Canvas 只贴一张 PhotoImage（零 Canvas 对象膨胀）
     """
 
     _RECENT = 200           # 最近 N 个点全精度
     _BUCKETS = 120          # 历史数据压缩到 M 个桶
-    _CACHE_DIRTY = 50       # 攒够多少新点才重新降采样
     _RENDER_MS = 250        # 渲染节流间隔
 
     def __init__(self, master, title="", **kw):
@@ -202,9 +204,8 @@ class ChartWidget(ctk.CTkFrame):
         self._render_id: Optional[str] = None
         self._photo: Optional[ImageTk.PhotoImage] = None   # 防 GC
 
-        # 降采样缓存: series_name -> (downsampled_list, raw_len_at_cache)
-        self._ds_cache: Dict[str, Tuple[List[float], int]] = {}
-        self._pending = 0       # 自上次缓存以来的新点计数
+        # 降采样 memo: series_name -> (raw_len_at_cache, downsampled_list)
+        self._ds_cache: Dict[str, Tuple[int, List[float]]] = {}
 
         # Y 范围缓存
         self._cached_y: Optional[Tuple[float, float]] = None
@@ -281,18 +282,21 @@ class ChartWidget(ctk.CTkFrame):
         return compressed + list(recent)
 
     def _get_downsampled(self, name: str) -> List[float]:
-        """带缓存的降采样：只在新点攒够 _CACHE_DIRTY 时重算"""
+        """降采样（带 memo）：始终返回与 _downsample_tail 一致的结果。
+
+        历史压缩后长度必须恒定为 _BUCKETS + _RECENT（数据超过预算时），
+        X 轴按 i/(n-1) 映射才不会随新点加入而缩放漂移。
+        因此这里不做增量追加缓存——那会让长度在预算内锯齿抖动，
+        造成曲线前后缩放比不一致、重采样时出现重复跳变。
+        原始数据是只追加的，用其长度作为 memo 键即可安全命中。
+        """
         raw = self._series[name]
         raw_len = len(raw)
         cached = self._ds_cache.get(name)
-        if cached is not None:
-            ds_list, cached_len = cached
-            if raw_len - cached_len < self._CACHE_DIRTY:
-                # 追加新点到尾部（全精度区），避免重算
-                return ds_list + raw[cached_len:raw_len]
-        # 重算
+        if cached is not None and cached[0] == raw_len:
+            return cached[1]
         ds = self._downsample_tail(raw)
-        self._ds_cache[name] = (ds, raw_len)
+        self._ds_cache[name] = (raw_len, ds)
         return ds
 
     # ------------------------------------------------------------------
@@ -303,7 +307,6 @@ class ChartWidget(ctk.CTkFrame):
 
     def _force_redraw(self):
         self._dirty = False
-        self._pending = 0
         self._render_data()
 
     def _schedule_render(self):
@@ -402,7 +405,6 @@ class ChartWidget(ctk.CTkFrame):
             self._series[series_name] = []
         self._series[series_name].append(value)
         self._y_dirty = True
-        self._pending += 1
         self._schedule_render()
 
     def clear_data(self):
@@ -415,7 +417,6 @@ class ChartWidget(ctk.CTkFrame):
         self._cached_y = None
         self._y_dirty = True
         self._dirty = False
-        self._pending = 0
         self._photo = None
         self._canvas.delete("all")
 
