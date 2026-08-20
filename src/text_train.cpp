@@ -328,10 +328,11 @@ void print_usage(const char *prog)
         << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
         << "  --cuda             启用 CUDA GPU 加速 (需要 CUDA Toolkit)\n"
         << "  --positional-encoding <type>\n"
-        << "                     位置编码类型: learned(默认)/sinusoidal/alibi\n"
+        << "                     位置编码类型: learned(默认)/sinusoidal/alibi/rope\n"
         << "                     learned: 可学习位置嵌入（默认，GPT 原版）\n"
         << "                     sinusoidal: 正弦波固定位置编码（不参与训练）\n"
         << "                     alibi: 线性偏置注意力（无位置嵌入，支持长度外推）\n"
+        << "                     rope: 旋转位置编码（现代方案，在注意力 Q/K 上施加）\n"
         << "  --activation <type>  FFN 激活: gelu(默认)/swiglu\n"
         << "                     gelu: QuickGeLU（GPT-2 风格）\n"
         << "                     swiglu: SwiGLU（LLaMA/Mistral 风格，每参数效率更高）\n"
@@ -604,10 +605,12 @@ TrainConfig parse_args(int argc, char *argv[])
                 cfg.pos_encoding = nn::PosEncodingType::Sinusoidal;
             else if (v == "alibi")
                 cfg.pos_encoding = nn::PosEncodingType::ALiBi;
+            else if (v == "rope")
+                cfg.pos_encoding = nn::PosEncodingType::RoPE;
             else
             {
                 std::cerr << "未知位置编码类型: " << v
-                          << "，可选: learned, sinusoidal, alibi\n";
+                          << "，可选: learned, sinusoidal, alibi, rope\n";
                 std::exit(1);
             }
         }
@@ -924,6 +927,8 @@ int main(int argc, char *argv[])
             {
                 if (file_spec.pos_encoding == nn::PosEncodingType::ALiBi)
                     std::cout << "从模型文件读取 ALiBi GPT 规格\n";
+                else if (file_spec.pos_encoding == nn::PosEncodingType::RoPE)
+                    std::cout << "从模型文件读取 RoPE GPT 规格\n";
                 else
                     std::cout << "从模型文件读取 GPT 规格\n";
                 auto build_result = nn::build_gpt_model_from_spec(*engine, file_spec);

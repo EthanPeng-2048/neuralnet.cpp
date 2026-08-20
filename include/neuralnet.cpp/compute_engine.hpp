@@ -25,10 +25,12 @@
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <cstddef>
+#include <span>
 
 #include "config.hpp"
 #include "core_errors.hpp"
 #include "tensor.hpp"
+#include "expr_spec.hpp"
 
 namespace nn
 {
@@ -247,6 +249,23 @@ public:
     [[nodiscard]] virtual Result<Tensor> elementwise_select_scalar_cond(
         CompareOp cmp, const Tensor& A, Scalar scalar_b,
         const Tensor& then_t, Scalar scalar_else) = 0;
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 表达式求值（逐元素融合的统一入口）
+    // ══════════════════════════════════════════════════════════════════════
+
+    // 对一个逐元素表达式求值，输出 (rows, cols)。所有输入同形状。
+    //
+    // 这是"函数式逐元素原语"的表达式升级：单行内多次计算（如 RoPE 的
+    // q*cos + rotate(q)*sin、残差、激活）可合并为一次调用，减少临时 Tensor。
+    // 执行策略由后端决定（CPU 融合解释器；Vulkan/CUDA v1 为 eager lowering），
+    // Layer 侧无需关心——表达式是唯一逐元素编程模型。
+    //
+    // 语义与上限见 expr_spec.hpp（ExprSpec）。输出 = 最后一条指令的目标寄存器。
+    [[nodiscard]] virtual Result<Tensor> eval_expr(
+        const ExprSpec& spec,
+        std::span<const Tensor> inputs,
+        std::size_t rows, std::size_t cols) = 0;
 };
 
 } // namespace nn

@@ -9,6 +9,7 @@
 #ifdef NN_HAS_CUDA
 
 #include "compute_engine.hpp"
+#include "expr_eval.hpp"
 #include "backend/cuda_backend.hpp"
 
 namespace nn
@@ -407,6 +408,21 @@ public:
             static_cast<float>(scalar_b), static_cast<float>(scalar_else));
         if (!r) return std::unexpected(r.error());
         return Tensor::from_cuda(std::move(*r));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 表达式求值（v1：统一 eager lowering）
+    //
+    // 复用跨后端共享执行器 run_expr_eager：把 ExprSpec 拆分为现有原语
+    // 调用（正确优先）。未来替换为统一 VM / JIT 时只改本函数内部。
+    // ══════════════════════════════════════════════════════════════════════
+
+    [[nodiscard]] Result<Tensor> eval_expr(
+        const ExprSpec& spec,
+        std::span<const Tensor> inputs,
+        std::size_t rows, std::size_t cols) override
+    {
+        return run_expr_eager(*this, spec, inputs, rows, cols);
     }
 
 private:

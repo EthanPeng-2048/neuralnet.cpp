@@ -664,6 +664,141 @@ public:
         return Tensor::from_matrix(std::move(result));
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    // 表达式求值（融合解释器）
+    //
+    // 对 ExprSpec 一次遍历求值：每个输出元素按指令序列计算，中间结果存
+    // 寄存器数组，**不产生任何临时 Tensor**。视图（RotateHalf/RowMod）为
+    // 纯索引映射，无物化。性能与等价手写循环一致。
+    // ══════════════════════════════════════════════════════════════════════
+
+    [[nodiscard]] Result<Tensor> eval_expr(
+        const ExprSpec& spec,
+        std::span<const Tensor> inputs,
+        std::size_t rows, std::size_t cols) override
+    {
+        if (auto v = validate_expr_spec(spec, inputs.size()); !v)
+            return std::unexpected(v.error());
+
+        std::vector<ConstSpan> spans;
+        spans.reserve(inputs.size());
+        for (std::size_t k = 0; k < inputs.size(); ++k)
+        {
+            const Tensor& t = inputs[k];
+            if (!t.is_cpu())
+                return std::unexpected(Error{"eval_expr: input not CPU"});
+            // 列数必须一致；行数由视图语义决定（RowMod 允许短表、RotateHalf 允许长表）
+            if (t.cols() != cols)
+                return std::unexpected(Error{"eval_expr: input cols mismatch"});
+            const ExprView& v = spec.views[k];
+            switch (v.kind)
+            {
+            default:
+            case static_cast<uint8_t>(ExprViewKind::Linear):
+                if (t.rows() != rows)
+                    return std::unexpected(Error{"eval_expr: Linear input rows mismatch"});
+                break;
+            case static_cast<uint8_t>(ExprViewKind::RotateHalf):
+                if (t.rows() != rows || v.param == 0 || rows % v.param != 0 || v.param % 2 != 0)
+                    return std::unexpected(Error{"eval_expr: RotateHalf shape/param invalid"});
+                break;
+            case static_cast<uint8_t>(ExprViewKind::RowMod):
+                if (t.rows() != v.param || v.param == 0 || rows % v.param != 0)
+                    return std::unexpected(Error{"eval_expr: RowMod shape/param invalid"});
+                break;
+            }
+            spans.push_back(t.cpu_matrix().span());
+        }
+
+        Matrix result(rows, cols);
+        Span out = result.span();
+        const std::size_t n = out.size();
+        if (n == 0)
+            return Tensor::from_matrix(std::move(result));
+
+        // 视图求值：按 (row, col) 映射到输入 span 的元素
+        auto read_input = [&](std::size_t k, std::size_t r, std::size_t c) -> Scalar
+        {
+            const ExprView& v = spec.views[k];
+            const ConstSpan& s = spans[k];
+            switch (v.kind)
+            {
+            default:
+            case static_cast<uint8_t>(ExprViewKind::Linear):
+                return s[r * cols + c];
+            case static_cast<uint8_t>(ExprViewKind::RotateHalf):
+            {
+                const std::size_t block = v.param;
+                const std::size_t rl = r % block;
+                const std::size_t rr = (r / block) * block
+                    + ((rl < block / 2) ? (rl + block / 2) : (rl - block / 2));
+                Scalar val = s[rr * cols + c];
+                if (v.negate_first_half && rl < block / 2)
+                    return -val;
+                return val;
+            }
+            case static_cast<uint8_t>(ExprViewKind::RowMod):
+                return s[(r % v.param) * cols + c];
+            }
+        };
+
+        // 逐元素解释执行
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const std::size_t r = i / cols;
+            const std::size_t c = i % cols;
+
+            Scalar regs[EXPR_MAX_REGS] = {};
+            const auto eval_op = [&](const ExprOperand& op) -> Scalar
+            {
+                switch (op.kind)
+                {
+                default:
+                case static_cast<uint8_t>(ExprOperandKind::Reg):
+                case static_cast<uint8_t>(ExprOperandKind::Fanout): return regs[op.idx];
+                case static_cast<uint8_t>(ExprOperandKind::Const): return spec.consts[op.idx];
+                case static_cast<uint8_t>(ExprOperandKind::Input): return read_input(op.idx, r, c);
+                }
+            };
+
+            for (const auto& ins : spec.instrs)
+            {
+                const Scalar va = eval_op(ins.a);
+                const ExprOp op = static_cast<ExprOp>(ins.op);
+                switch (op)
+                {
+                // 一元
+                case ExprOp::Neg:   regs[ins.dst] = -va; break;
+                case ExprOp::Exp:   regs[ins.dst] = std::exp(va); break;
+                case ExprOp::Log:   regs[ins.dst] = std::log(va); break;
+                case ExprOp::Sqrt:  regs[ins.dst] = std::sqrt(va); break;
+                case ExprOp::Rsqrt: regs[ins.dst] = Scalar{1} / std::sqrt(va); break;
+                case ExprOp::Abs:   regs[ins.dst] = std::abs(va); break;
+                case ExprOp::Tanh:  regs[ins.dst] = std::tanh(va); break;
+                // 二元
+                case ExprOp::Add:   regs[ins.dst] = va + eval_op(ins.b); break;
+                case ExprOp::Sub:   regs[ins.dst] = va - eval_op(ins.b); break;
+                case ExprOp::Mul:   regs[ins.dst] = va * eval_op(ins.b); break;
+                case ExprOp::Div:   regs[ins.dst] = va / eval_op(ins.b); break;
+                case ExprOp::Max:   regs[ins.dst] = std::max(va, eval_op(ins.b)); break;
+                case ExprOp::Min:   regs[ins.dst] = std::min(va, eval_op(ins.b)); break;
+                // 比较（输出 1.0 / 0.0）
+                case ExprOp::Lt:    regs[ins.dst] = (va <  eval_op(ins.b)) ? Scalar{1} : Scalar{0}; break;
+                case ExprOp::Le:    regs[ins.dst] = (va <= eval_op(ins.b)) ? Scalar{1} : Scalar{0}; break;
+                case ExprOp::Gt:    regs[ins.dst] = (va >  eval_op(ins.b)) ? Scalar{1} : Scalar{0}; break;
+                case ExprOp::Ge:    regs[ins.dst] = (va >= eval_op(ins.b)) ? Scalar{1} : Scalar{0}; break;
+                case ExprOp::Eq:    regs[ins.dst] = (va == eval_op(ins.b)) ? Scalar{1} : Scalar{0}; break;
+                case ExprOp::Ne:    regs[ins.dst] = (va != eval_op(ins.b)) ? Scalar{1} : Scalar{0}; break;
+                // 选择
+                case ExprOp::Select: regs[ins.dst] = (va != Scalar{0}) ? eval_op(ins.b) : eval_op(ins.c); break;
+                }
+            }
+            out[i] = regs[spec.instrs.back().dst];
+        }
+
+        return Tensor::from_matrix(std::move(result));
+    }
+
 };
 
 } // namespace nn
