@@ -32,6 +32,7 @@
 #ifdef NN_HAS_VULKAN
 
 #include "compute_engine.hpp"
+#include "expr_eval.hpp"
 #include "backend/vk_backend.hpp"
 
 namespace nn
@@ -531,6 +532,22 @@ public:
             static_cast<float>(scalar_else));  // SELECT
         if (!r) return std::unexpected(r.error());
         return Tensor::from_gpu(std::move(*r));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 表达式求值（v1：统一 eager lowering）
+    //
+    // 复用跨后端共享执行器 run_expr_eager：把 ExprSpec 拆分为现有原语
+    // 调用（正确优先）。未来替换为统一 VM / 运行时 JIT 生成 shader 时，
+    // 只改本函数内部实现，DSL / Layer / 接口不变。
+    // ══════════════════════════════════════════════════════════════════════
+
+    [[nodiscard]] Result<Tensor> eval_expr(
+        const ExprSpec& spec,
+        std::span<const Tensor> inputs,
+        std::size_t rows, std::size_t cols) override
+    {
+        return run_expr_eager(*this, spec, inputs, rows, cols);
     }
 
 private:

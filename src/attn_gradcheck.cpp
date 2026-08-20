@@ -106,17 +106,19 @@ int main(int argc, char* argv[])
     bool use_gpu = false;
     std::size_t batch = 2;
     std::size_t seq = 8;
+    std::string pos_enc_name = "learned";
     for (int i = 1; i < argc; ++i)
     {
         std::string a = argv[i];
         if (a == "--tol" && i + 1 < argc) tol = static_cast<Scalar>(std::atof(argv[++i]));
         else if (a == "--batch" && i + 1 < argc) batch = static_cast<std::size_t>(std::atoi(argv[++i]));
         else if (a == "--seq" && i + 1 < argc) seq = static_cast<std::size_t>(std::atoi(argv[++i]));
+        else if (a == "--pos-enc" && i + 1 < argc) pos_enc_name = argv[++i];
         else if (a == "--cuda") use_cuda = true;
         else if (a == "--gpu") use_gpu = true;
         else if (a == "--help")
         {
-            std::cout << "用法: attn_gradcheck [--cuda|--gpu] [--batch N] [--seq N] [--tol <f>]\n";
+            std::cout << "用法: attn_gradcheck [--cuda|--gpu] [--batch N] [--seq N] [--tol <f>] [--pos-enc learned|sinusoidal|alibi|rope]\n";
             return 0;
         }
     }
@@ -131,13 +133,19 @@ int main(int argc, char* argv[])
     const std::size_t d_model = 16;
     const std::size_t num_heads = 2;   // d_k = 8
 
+    PosEncodingType pos_enc = PosEncodingType::Learned;
+    if (pos_enc_name == "rope") pos_enc = PosEncodingType::RoPE;
+    else if (pos_enc_name == "sinusoidal") pos_enc = PosEncodingType::Sinusoidal;
+    else if (pos_enc_name == "alibi") pos_enc = PosEncodingType::ALiBi;
+
     std::cout << "========================================\n";
     std::cout << "  CausalSelfAttention 数值梯度检查 (gradcheck)\n";
     std::cout << "========================================\n";
     std::cout << "  d_model=" << d_model << " heads=" << num_heads
-              << " seq=" << seq << " batch=" << batch << " tol=" << tol << "\n";
+              << " seq=" << seq << " batch=" << batch << " tol=" << tol
+              << " pos_enc=" << pos_enc_name << "\n";
 
-    CausalSelfAttention attn(eng, d_model, num_heads, seq, seq, PosEncodingType::Learned);
+    CausalSelfAttention attn(eng, d_model, num_heads, seq, seq, pos_enc);
 
     std::mt19937_64 rng(123);
     std::uniform_real_distribution<Scalar> dist(-1, 1);

@@ -128,6 +128,7 @@ int main(int argc, char* argv[])
     bool use_gpu = false;
     std::size_t num_layers = 2;
     std::size_t batch = 2;
+    std::string pos_enc_name = "learned";
     for (int i = 1; i < argc; ++i)
     {
         std::string a = argv[i];
@@ -137,13 +138,15 @@ int main(int argc, char* argv[])
             num_layers = static_cast<std::size_t>(std::atoi(argv[++i]));
         else if (a == "--batch" && i + 1 < argc)
             batch = static_cast<std::size_t>(std::atoi(argv[++i]));
+        else if (a == "--pos-enc" && i + 1 < argc)
+            pos_enc_name = argv[++i];
         else if (a == "--cuda")
             use_cuda = true;
         else if (a == "--gpu")
             use_gpu = true;
         else if (a == "--help")
         {
-            std::cout << "用法: gpt_gradcheck [--cuda|--gpu] [--layers N] [--batch N] [--tol <f>]\n";
+            std::cout << "用法: gpt_gradcheck [--cuda|--gpu] [--layers N] [--batch N] [--tol <f>] [--pos-enc learned|sinusoidal|alibi|rope]\n";
             return 0;
         }
     }
@@ -155,13 +158,18 @@ int main(int argc, char* argv[])
     if (!engine) { std::cerr << "引擎创建失败\n"; return 1; }
     ComputeEngine& eng = *engine;
 
-    // 小规模，加速测试。配置与用户实际使用一致：swiglu + rmsnorm + learned
+    // 小规模，加速测试。配置与用户实际使用一致：swiglu + rmsnorm + pos_enc
     const std::size_t vocab = 32;
     const std::size_t d_model = 16;
     const std::size_t seq_len = 8;
     const std::size_t num_heads = 2;
     const std::size_t d_ff = 32;
     // batch 由命令行控制，默认 2（验证 rearrange_3d batch 路径）
+
+    PosEncodingType pos_enc = PosEncodingType::Learned;
+    if (pos_enc_name == "rope") pos_enc = PosEncodingType::RoPE;
+    else if (pos_enc_name == "sinusoidal") pos_enc = PosEncodingType::Sinusoidal;
+    else if (pos_enc_name == "alibi") pos_enc = PosEncodingType::ALiBi;
 
     std::cout << "========================================\n";
     std::cout << "  GPTModel 整链数值梯度检查 (gradcheck)\n";
@@ -170,11 +178,11 @@ int main(int argc, char* argv[])
               << " seq=" << seq_len << " batch=" << batch
               << " heads=" << num_heads << " d_ff=" << d_ff
               << " layers=" << num_layers << "\n";
-    std::cout << "  activation=SwiGLU norm=RMSNorm pos=Learned\n";
+    std::cout << "  activation=SwiGLU norm=RMSNorm pos=" << pos_enc_name << "\n";
     std::cout << "  tol=" << tol << "\n";
 
     GPTModel model(eng, vocab, d_model, seq_len, num_heads, d_ff, num_layers,
-                   PosEncodingType::Learned,
+                   pos_enc,
                    ActivationType::SwiGLU,
                    NormType::RMSNorm);
 

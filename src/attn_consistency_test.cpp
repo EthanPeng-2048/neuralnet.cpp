@@ -337,6 +337,12 @@ int main(int argc, char* argv[])
         seq_len, num_layers,
         PosEncodingType::ALiBi, "ALiBi", use_batch);
 
+    // 测试 4: RoPE（旋转位置编码，Q/K 上施加）
+    all_pass &= test_consistency(
+        *engine, use_gpu ? "GPU" : "CPU",
+        seq_len, num_layers,
+        PosEncodingType::RoPE, "RoPE", use_batch);
+
     std::cout << "\n════════════════════════════════════════\n";
     std::cout << "  总体结果: " << (all_pass ? "✅ 全部通过" : "❌ 存在失败");
     std::cout << "\n════════════════════════════════════════\n";

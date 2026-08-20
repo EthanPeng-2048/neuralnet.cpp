@@ -398,46 +398,95 @@ public:
         return engine.elementwise_binary(BinaryOp::Mul, *sw, *up);
     }
 
-    // ── backward: 分解出 grad_gate / grad_up 并合并回 (2*d_ff, batch) ──────
+    // ── backward: 用 eval_expr（表达式 DSL）融合逐元素计算 ──────────────────
+    //
+    // 数学：
+    //   sw   = gate ⊙ sigmoid
+    //   grad_up   = grad_out ⊙ sw = grad_out ⊙ gate ⊙ sigmoid
+    //   factor    = sigmoid ⊙ (1 + gate ⊙ (1 − sigmoid))
+    //             = sigmoid + sigmoid ⊙ gate ⊙ (1 − sigmoid)
+    //   grad_gate = grad_out ⊙ up ⊙ factor
+    //
+    // 两条 eval_expr（CPU 一次遍历融合、无中间 Tensor）：
+    //   expr1: grad_gate（6 regs, 6 instrs）
+    //     inputs=[grad_out, s, gate, up], consts=[1.0]
+    //     r0 = 1 − s          (Sub, cst(0), input(1))
+    //     r1 = gate * (1−s)   (Mul, input(2), fanout(0))
+    //     r2 = 1 + r1         (Add, cst(0), fanout(1))
+    //     r3 = s * r2         (Mul, input(1), fanout(2))                  // factor
+    //     r4 = up * r3        (Mul, input(3), fanout(3))
+    //     r5 = grad * r4      (Mul, input(0), fanout(4))                  // grad_gate
+    //
+    //   expr2: grad_up（2 regs, 2 instrs）
+    //     inputs=[grad_out, sigmoid, gate]
+    //     i0: r0 = grad * gate    (Mul, input(0), input(2))
+    //     i1: r1 = r0 * sigmoid   (Mul, fanout(0), input(1))               // grad_up
+    //
     [[nodiscard]] Result<Tensor> backward(
         ComputeEngine& engine, const Tensor& grad_output) override
     {
-        // grad_up = grad_out ⊙ sw，其中 sw = gate*s
-        auto sw = engine.elementwise_binary(BinaryOp::Mul, gate_cache_, sigmoid_cache_);
-        if (!sw) return std::unexpected(sw.error());
-        auto grad_up = engine.elementwise_binary(BinaryOp::Mul, grad_output, *sw);
-        if (!grad_up) return std::unexpected(grad_up.error());
+        const std::size_t rows = d_ff_;
+        const std::size_t cols = grad_output.cols();
 
-        // grad_sw = grad_out ⊙ up
-        auto grad_sw = engine.elementwise_binary(BinaryOp::Mul, grad_output, up_cache_);
-        if (!grad_sw) return std::unexpected(grad_sw.error());
+        // ── expr1: grad_gate = grad_out ⊙ up ⊙ factor ──
+        ExprSpec spec1;
+        spec1.views = {expr::linear(), expr::linear(), expr::linear(), expr::linear()};
+        spec1.num_regs = 6;
+        spec1.consts = {Scalar{1}};
 
-        // grad_gate = grad_sw * (σ(g) + g*σ(g)*(1-σ(g)))
-        //   one_minus_s = 1 - s
-        auto one_minus_s = engine.elementwise_binary_scalar(
-            BinaryOp::Sub, sigmoid_cache_, Scalar{1}, true);
-        if (!one_minus_s) return std::unexpected(one_minus_s.error());
-        //   g_oms = gate * (1-s)
-        auto g_oms = engine.elementwise_binary(BinaryOp::Mul, gate_cache_, *one_minus_s);
-        if (!g_oms) return std::unexpected(g_oms.error());
-        //   s_goms = s * g_oms
-        auto s_goms = engine.elementwise_binary(BinaryOp::Mul, sigmoid_cache_, *g_oms);
-        if (!s_goms) return std::unexpected(s_goms.error());
-        //   factor = s + s_goms
-        auto factor = engine.elementwise_binary(BinaryOp::Add, sigmoid_cache_, *s_goms);
-        if (!factor) return std::unexpected(factor.error());
-        //   grad_gate = grad_sw * factor
-        auto grad_gate = engine.elementwise_binary(BinaryOp::Mul, *grad_sw, *factor);
+        ExprInstr j0, j1, j2, j3, j4, j5;
+        // r0 = 1 − s
+        j0.op = static_cast<uint8_t>(ExprOp::Sub);
+        j0.dst = 0; j0.a = expr::cst(0); j0.b = expr::input(1);
+        // r1 = gate * (1−s)
+        j1.op = static_cast<uint8_t>(ExprOp::Mul);
+        j1.dst = 1; j1.a = expr::input(2); j1.b = expr::fanout(0);
+        // r2 = 1 + r1
+        j2.op = static_cast<uint8_t>(ExprOp::Add);
+        j2.dst = 2; j2.a = expr::cst(0); j2.b = expr::fanout(1);
+        // r3 = s * r2 = factor
+        j3.op = static_cast<uint8_t>(ExprOp::Mul);
+        j3.dst = 3; j3.a = expr::input(1); j3.b = expr::fanout(2);
+        // r4 = up * factor
+        j4.op = static_cast<uint8_t>(ExprOp::Mul);
+        j4.dst = 4; j4.a = expr::input(3); j4.b = expr::fanout(3);
+        // r5 = grad_out * (up * factor) = grad_gate
+        j5.op = static_cast<uint8_t>(ExprOp::Mul);
+        j5.dst = 5; j5.a = expr::input(0); j5.b = expr::fanout(4);
+
+        spec1.instrs = {j0, j1, j2, j3, j4, j5};
+
+        std::vector<Tensor> inputs1 = {grad_output, sigmoid_cache_, gate_cache_, up_cache_};
+        auto grad_gate = engine.eval_expr(spec1, inputs1, rows, cols);
         if (!grad_gate) return std::unexpected(grad_gate.error());
 
+        // ── expr2: grad_up = grad_out ⊙ gate ⊙ sigmoid ──
+        ExprSpec spec2;
+        spec2.views = {expr::linear(), expr::linear(), expr::linear()};
+        spec2.num_regs = 2;
+
+        ExprInstr k0, k1;
+        // r0 = grad_out * gate
+        k0.op = static_cast<uint8_t>(ExprOp::Mul);
+        k0.dst = 0; k0.a = expr::input(0); k0.b = expr::input(2);
+        // r1 = r0 * sigmoid = grad_up
+        k1.op = static_cast<uint8_t>(ExprOp::Mul);
+        k1.dst = 1; k1.a = expr::fanout(0); k1.b = expr::input(1);
+
+        spec2.instrs = {k0, k1};
+
+        std::vector<Tensor> inputs2 = {grad_output, sigmoid_cache_, gate_cache_};
+        auto grad_up = engine.eval_expr(spec2, inputs2, rows, cols);
+        if (!grad_up) return std::unexpected(grad_up.error());
+
         // 合并：grad_input = (grad_gate; grad_up) → (2*d_ff, batch)
-        auto grad_input = engine.create_tensor(2 * d_ff_, grad_output.cols());
-        auto r1 = engine.zero(grad_input);
-        if (!r1) return std::unexpected(r1.error());
-        auto r2 = engine.insert_rows(grad_input, 0, *grad_gate);
-        if (!r2) return std::unexpected(r2.error());
-        auto r3 = engine.insert_rows(grad_input, d_ff_, *grad_up);
-        if (!r3) return std::unexpected(r3.error());
+        auto grad_input = engine.create_tensor(2 * d_ff_, cols);
+        auto rz = engine.zero(grad_input);
+        if (!rz) return std::unexpected(rz.error());
+        auto ri0 = engine.insert_rows(grad_input, 0, *grad_gate);
+        if (!ri0) return std::unexpected(ri0.error());
+        auto ri1 = engine.insert_rows(grad_input, d_ff_, *grad_up);
+        if (!ri1) return std::unexpected(ri1.error());
 
         return grad_input;
     }
@@ -876,6 +925,136 @@ public:
 };
 
 // ══════════════════════════════════════════════════════════════════════════
+// RotaryEmbedding — 旋转位置编码（RoPE）缓存与应用
+//
+// 约定（LLaMA/Mistral/DeepSeek half-swap 风格，便于与参考实现交叉验证）：
+//   q_rot = q·cos + rotate_half(q)·sin
+//   rotate_half(x) = [-x_后半, x_前半]   —— 维度对 (j, j+d_k/2) 的 2×2 旋转块
+//   cos/sin 表 (d_k, seq)：cos[j]=cos[j+d_k/2]=cos(t·θ_j)，
+//     即沿 d 维 = cat(freqs, freqs)（前后半相同，LLaMA 约定），θ_j = t / 10000^(2j/d_k)
+//
+// 施加方式（统一表达式 DSL，见 expr_spec.hpp）：
+//   inputs: [q, q, cos, sin]
+//   views:  [Linear, RotateHalf(block=d_k, 前半取负), RowMod(d_k), RowMod(d_k)]
+//   forward: r0=q*cos; r1=rot(q)*sin; out=r0+r1
+//   backward（旋转正交，逆=反角）: out=r0−r1
+//   —— 单次 eval_expr 完成，CPU 一次遍历、无中间 Tensor。
+//
+// 位置约定：应用点在 Q/K 完成 rearrange 之后（列=position），
+//   Q/K 形状 (batch*H*d_k, seq)，cos/sin 短表 (d_k, seq) 按 RowMod 平铺。
+// ══════════════════════════════════════════════════════════════════════════
+class RotaryEmbedding
+{
+private:
+    std::size_t d_k_ = 0;
+    std::size_t seq_cached_ = 0;   // 缓存表的列数（全表应用）
+    Tensor cos_cache_;             // (d_k, seq_cached_)
+    Tensor sin_cache_;             // (d_k, seq_cached_)
+
+    // 重建全表 (d_k, seq)：cos/sin 按维度对交错重复
+    void rebuild(ComputeEngine& engine, std::size_t seq)
+    {
+        Matrix c(d_k_, seq), s(d_k_, seq);
+        const std::size_t half = d_k_ / 2;
+        for (std::size_t pos = 0; pos < seq; ++pos)
+        {
+            const Scalar pd = static_cast<Scalar>(pos);
+            for (std::size_t j = 0; j < half; ++j)
+            {
+                const Scalar theta = pd / std::pow(Scalar{10000},
+                    static_cast<Scalar>(2 * j) / static_cast<Scalar>(d_k_));
+                const Scalar cv = std::cos(theta);
+                const Scalar sv = std::sin(theta);
+                // LLaMA 式：cos 沿 d 维 = cat(freqs, freqs)（前后半相同），
+                // 配合 rotate_half（前后半交换+前半取负）构成 2×2 旋转块。
+                c.set_value_unchecked(j,        pos, cv);
+                c.set_value_unchecked(half + j, pos, cv);
+                s.set_value_unchecked(j,        pos, sv);
+                s.set_value_unchecked(half + j, pos, sv);
+            }
+        }
+        auto cr = engine.from_matrix(c);
+        NN_ASSERT(cr, cr ? "" : cr.error().message.c_str());
+        cos_cache_ = std::move(*cr);
+        auto sr = engine.from_matrix(s);
+        NN_ASSERT(sr, sr ? "" : sr.error().message.c_str());
+        sin_cache_ = std::move(*sr);
+        seq_cached_ = seq;
+    }
+
+    // 构造 RoPE 表达式（forward 用 Add 结尾，backward 用 Sub 结尾）
+    [[nodiscard]] ExprSpec make_expr(bool backward) const
+    {
+        ExprSpec spec;
+        spec.views = {
+            expr::linear(),
+            expr::rotate_half(static_cast<std::uint32_t>(d_k_), true),
+            expr::row_mod(static_cast<std::uint32_t>(d_k_)),
+            expr::row_mod(static_cast<std::uint32_t>(d_k_)),
+        };
+        spec.num_regs = 3;
+        ExprInstr i0, i1, i2;
+        i0.op = static_cast<uint8_t>(ExprOp::Mul); i0.dst = 0; i0.a = expr::input(0); i0.b = expr::input(2);
+        i1.op = static_cast<uint8_t>(ExprOp::Mul); i1.dst = 1; i1.a = expr::input(1); i1.b = expr::input(3);
+        i2.op = static_cast<uint8_t>(backward ? ExprOp::Sub : ExprOp::Add);
+        i2.dst = 2; i2.a = expr::reg(0); i2.b = expr::reg(1);
+        spec.instrs = {i0, i1, i2};
+        return spec;
+    }
+
+public:
+    RotaryEmbedding() = default;
+    RotaryEmbedding(ComputeEngine& /*engine*/, std::size_t d_k)
+        : d_k_(d_k)
+    {
+    }
+
+    [[nodiscard]] std::size_t d_k() const noexcept { return d_k_; }
+
+    // 全表应用：q 为 (batch*H*d_k, seq)，cos/sin 为 (d_k, seq) 短表
+    [[nodiscard]] Result<Tensor> apply(
+        ComputeEngine& engine, const Tensor& q,
+        std::size_t seq, bool backward)
+    {
+        if (d_k_ == 0 || d_k_ % 2 != 0)
+            return std::unexpected(Error{"RotaryEmbedding::apply: d_k must be positive and even"});
+        if (seq != seq_cached_)
+            rebuild(engine, seq);
+        std::vector<Tensor> inputs = {q, q, cos_cache_, sin_cache_};
+        return engine.eval_expr(make_expr(backward), inputs, q.rows(), q.cols());
+    }
+
+    // 增量推理：q 为 (H*d_k, 1)，位置 = pos（cur_len）
+    // 直接生成 (d_k,1) 位置表，避免对全表切片取列。
+    [[nodiscard]] Result<Tensor> apply_step(
+        ComputeEngine& engine, const Tensor& q, std::size_t pos, bool backward)
+    {
+        if (d_k_ == 0 || d_k_ % 2 != 0)
+            return std::unexpected(Error{"RotaryEmbedding::apply_step: d_k must be positive and even"});
+        Matrix c(d_k_, 1), s(d_k_, 1);
+        const std::size_t half = d_k_ / 2;
+        const Scalar pd = static_cast<Scalar>(pos);
+        for (std::size_t j = 0; j < half; ++j)
+        {
+            const Scalar theta = pd / std::pow(Scalar{10000},
+                static_cast<Scalar>(2 * j) / static_cast<Scalar>(d_k_));
+            const Scalar cv = std::cos(theta);
+            const Scalar sv = std::sin(theta);
+            c.set_value_unchecked(j,        0, cv);
+            c.set_value_unchecked(half + j, 0, cv);
+            s.set_value_unchecked(j,        0, sv);
+            s.set_value_unchecked(half + j, 0, sv);
+        }
+        auto cr = engine.from_matrix(c);
+        if (!cr) return std::unexpected(cr.error());
+        auto sr = engine.from_matrix(s);
+        if (!sr) return std::unexpected(sr.error());
+        std::vector<Tensor> inputs = {q, q, *cr, *sr};
+        return engine.eval_expr(make_expr(backward), inputs, q.rows(), q.cols());
+    }
+};
+
+// ══════════════════════════════════════════════════════════════════════════
 // AttentionBase — 多头注意力基类（批量化：消除 per-head 和 per-sample 循环）
 //
 // 提取 MultiHeadAttention 与 CausalSelfAttention 的公共逻辑：
@@ -916,6 +1095,11 @@ protected:
     Linear w_o_;
     Softmax softmax_;
 
+    // RoPE（pos_enc == RoPE 时启用）：作用在 Q/K 的 d_k 维（每头），
+    // 施加点在 Q/K 完成 rearrange 之后（列=position）。
+    bool use_rope_ = false;
+    RotaryEmbedding rope_;
+
     // forward 缓存（rearranged 版本，供 backward 直接使用）
     Tensor Q_cache_, K_cache_, V_cache_;  // (batch*H*d_k, seq) rearranged
     Tensor attn_cache_;                    // (batch*H*seq, seq)
@@ -950,7 +1134,8 @@ protected:
 public:
     AttentionBase(ComputeEngine& engine,
                   std::size_t d_model, std::size_t num_heads,
-                  std::size_t seq_len = 0)
+                  std::size_t seq_len = 0,
+                  PosEncodingType pos_enc = PosEncodingType::Learned)
         : d_model_(d_model), num_heads_(num_heads),
           d_k_(d_model / num_heads),
           seq_len_(seq_len),
@@ -958,7 +1143,9 @@ public:
           w_q_(engine, d_model, d_model),
           w_k_(engine, d_model, d_model),
           w_v_(engine, d_model, d_model),
-          w_o_(engine, d_model, d_model)
+          w_o_(engine, d_model, d_model),
+          use_rope_(pos_enc == PosEncodingType::RoPE),
+          rope_(engine, d_model / num_heads)
     {
         NN_ASSERT(d_model % num_heads == 0,
                   "AttentionBase: d_model must be divisible by num_heads");
@@ -1029,6 +1216,18 @@ public:
             Q_cache_ = std::move(*q_res);
             K_cache_ = std::move(*k_res);
             V_cache_ = std::move(*v_res);
+        }
+
+        // 2.5 RoPE：对 Q/K 施加旋转位置编码（rearrange 后列=position，
+        //    每 d_k 行一个头，cos/sin 短表按 RowMod 平铺）
+        if (use_rope_)
+        {
+            auto qr2 = rope_.apply(engine, Q_cache_, seq, /*backward=*/false);
+            if (!qr2) return std::unexpected(qr2.error());
+            Q_cache_ = std::move(*qr2);
+            auto kr2 = rope_.apply(engine, K_cache_, seq, /*backward=*/false);
+            if (!kr2) return std::unexpected(kr2.error());
+            K_cache_ = std::move(*kr2);
         }
 
         // 3. S = batched_matmul(Q_re, K_re, batch*H, transA=true) → (batch*H*seq, seq)
@@ -1131,6 +1330,18 @@ public:
         auto rk = engine.scale_inplace(*grad_K_re, scale_);
         if (!rk) return std::unexpected(rk.error());
 
+        // 7.5 RoPE backward：对 Q/K 梯度施加反角旋转
+        //    （forward 的旋转矩阵正交，逆 = 转置 = 反角：grad*cos − rot(grad)*sin）
+        if (use_rope_)
+        {
+            auto gq2 = rope_.apply(engine, *grad_Q_re, seq, /*backward=*/true);
+            if (!gq2) return std::unexpected(gq2.error());
+            grad_Q_re = std::move(*gq2);
+            auto gk2 = rope_.apply(engine, *grad_K_re, seq, /*backward=*/true);
+            if (!gk2) return std::unexpected(gk2.error());
+            grad_K_re = std::move(*gk2);
+        }
+
         // 8. rearrange back: (batch*H*d_k, seq) → (H*d_k, batch*seq)
         Tensor grad_Q, grad_K, grad_V;
         if (batch > 1)
@@ -1199,6 +1410,18 @@ public:
         if (!k_new) return k_new;
         auto v_new = w_v_.forward(engine, x_new);
         if (!v_new) return v_new;
+
+        // 1.5 RoPE：对 Q/K 施加当前位置 (cur_len) 的旋转后写入 KV cache
+        //    （cache 中的历史 K 已在各自 step 旋转过，相对位置自然成立）
+        if (use_rope_)
+        {
+            auto qr = rope_.apply_step(engine, *q_res, cur_len, /*backward=*/false);
+            if (!qr) return std::unexpected(qr.error());
+            q_res = std::move(*qr);
+            auto kr = rope_.apply_step(engine, *k_new, cur_len, /*backward=*/false);
+            if (!kr) return std::unexpected(kr.error());
+            k_new = std::move(*kr);
+        }
 
         // 2. transpose → (1, H*d_k)，匹配 cache 的行布局
         auto k_new_T = engine.transpose(*k_new);
@@ -2017,7 +2240,7 @@ public:
                        std::size_t /*max_len*/ = 1024,
                        std::size_t seq_len = 0,
                        PosEncodingType pos_enc = PosEncodingType::Learned)
-        : AttentionBase(engine, d_model, num_heads, seq_len),
+        : AttentionBase(engine, d_model, num_heads, seq_len, pos_enc),
           use_alibi_(pos_enc == PosEncodingType::ALiBi)
     {
         if (use_alibi_)
@@ -2224,7 +2447,8 @@ public:
              ActivationType activation = ActivationType::GeLU,
              NormType norm_type = NormType::LayerNorm)
         : vocab_size_(vocab_size), d_model_(d_model), seq_len_(seq_len),
-          use_pos_emb_(pos_enc_type != PosEncodingType::ALiBi),
+          use_pos_emb_(pos_enc_type != PosEncodingType::ALiBi &&
+                       pos_enc_type != PosEncodingType::RoPE),
           pos_emb_learnable_(pos_enc_type == PosEncodingType::Learned),
           ln_f_(make_norm_layer(engine, d_model, norm_type)),
           lm_head_(engine, d_model, vocab_size)

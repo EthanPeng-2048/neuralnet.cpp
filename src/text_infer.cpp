@@ -264,6 +264,8 @@ int main(int argc, char *argv[])
         std::cout << " [ALiBi]";
     else if (spec.pos_encoding == nn::PosEncodingType::Sinusoidal)
         std::cout << " [Sinusoidal]";
+    else if (spec.pos_encoding == nn::PosEncodingType::RoPE)
+        std::cout << " [RoPE]";
     else
         std::cout << " [Learned]";
     std::cout << "\n";
