@@ -13,6 +13,7 @@ neuralnet.cpp GUI - 基于CustomTkinter的图形界面
 """
 
 import customtkinter as ctk
+import queue
 import threading
 import time
 import os
@@ -174,42 +175,69 @@ def _make_label(parent, text, row, font_size=12, bold=True):
 # ================================================================
 #  OutputPanel - 统一的输出面板组件
 # ================================================================
+class _SeriesState:
+    """单系列的后台降采样状态（仅 worker 线程访问）"""
+    __slots__ = ("raw", "recent", "hist", "compressed",
+                 "min_v", "max_v", "last", "last_merge")
+
+    def __init__(self):
+        self.raw: List[float] = []           # 全量原始点（append-only）
+        self.recent: List[float] = []        # 最近 _RECENT 个点（滑动窗口）
+        self.hist: List[float] = []          # 从 recent 挤出、待归并的点
+        self.compressed: List[float] = []    # 历史区间压缩成的 _BUCKETS 个代表点
+        self.min_v: Optional[float] = None
+        self.max_v: Optional[float] = None
+        self.last: Optional[float] = None
+        self.last_merge: float = 0.0
+
+
 class ChartWidget(ctk.CTkFrame):
-    """高性能实时图表——PIL 离屏渲染 + 尾部全精度/历史压缩
+    """高性能实时图表——PIL 离屏渲染 + 后台线程增量降采样
 
     策略：
-    - 最近 _RECENT 个点全精度保留
+    - 最近 _RECENT 个点全精度保留（滑动窗口，O(1) 追加）
     - 更早的点压缩到 _BUCKETS 个桶（每桶取偏离最大的点，保留尖峰/谷底）
-    - 降采样结果按原始长度做 memo（原始数据变长即失效，避免 resize 重复计算）
-      注意：不做"尾部追加 + 攒点重算"的增量优化——那会让显示点数在
-      _BUCKETS+_RECENT .. +_CACHE_DIRTY 之间锯齿抖动，X 轴映射 i/(n-1)
-      随点数变化，导致缩放比漂移、曲线跳变重复。
-    - PIL 离屏画图，Canvas 只贴一张 PhotoImage（零 Canvas 对象膨胀）
+    - 历史桶攒够 _REBUCKET 个溢出点（或超 _MERGE_AGE 秒）才归并一次，
+      归并 = 对历史区间做一次全量桶采样，故归并后输出与全量重采样精确一致、
+      无累积漂移；输出长度恒为 _BUCKETS + _RECENT，X 轴缩放稳定。
+    - 全部降采样/归并在独立 worker 线程执行，GUI 线程只做 O(320) 离屏绘制，
+      高开销计算不阻塞界面。
+    - 快照为不可变引用：worker 只整体替换、不就地修改，读侧线程安全。
     """
 
     _RECENT = 200           # 最近 N 个点全精度
     _BUCKETS = 120          # 历史数据压缩到 M 个桶
+    _REBUCKET = 32          # 历史桶攒够多少溢出点归并一次
+    _MERGE_AGE = 0.5        # 距上次归并超过该秒数也归并（稀疏数据）
     _RENDER_MS = 250        # 渲染节流间隔
 
     def __init__(self, master, title="", **kw):
         super().__init__(master, **kw)
         self.grid_propagate(False)
         self._title = title
-        self._series: Dict[str, List[float]] = {}
         self._colors = ["#3b82f6", "#ef4444", "#22c55e", "#f59e0b", "#8b5cf6",
                         "#ec4899", "#06b6d4", "#84cc16"]
 
-        # 渲染状态
+        # 渲染状态（GUI 线程）
         self._dirty = False
-        self._render_id: Optional[str] = None
+        self._timer_id: Optional[str] = None
         self._photo: Optional[ImageTk.PhotoImage] = None   # 防 GC
 
-        # 降采样 memo: series_name -> (raw_len_at_cache, downsampled_list)
-        self._ds_cache: Dict[str, Tuple[int, List[float]]] = {}
-
-        # Y 范围缓存
-        self._cached_y: Optional[Tuple[float, float]] = None
-        self._y_dirty = True
+        # 后台降采样状态（worker 线程独占；GUI 线程只读快照）
+        self._states: Dict[str, _SeriesState] = {}
+        self._inbox = queue.Queue()
+        self._lock = threading.Lock()
+        self._snapshot: Optional[Tuple[Dict[str, List[float]],
+                                       Tuple[float, float],
+                                       Dict[str, float]]] = None
+        self._closed = False
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            name=f"chart-{title or id(self)}",
+            daemon=True)
+        self._worker.start()
+        # 主线程持续节拍器驱动渲染（add_point 可在任意线程安全入队）
+        self._timer_id = self.after(self._RENDER_MS, self._tick_render)
 
         # 字体（带 fallback）
         try:
@@ -229,75 +257,119 @@ class ChartWidget(ctk.CTkFrame):
         self._canvas.bind("<Configure>", lambda e: self._on_resize(e))
 
     # ------------------------------------------------------------------
-    #  Y 范围缓存
-    # ------------------------------------------------------------------
-    def _calc_y_range(self) -> Tuple[float, float]:
-        if not self._y_dirty and self._cached_y is not None:
-            return self._cached_y
-        lo, hi = float("inf"), float("-inf")
-        for vals in self._series.values():
-            if vals:
-                lo = min(lo, min(vals))
-                hi = max(hi, max(vals))
-        if lo == float("inf"):
-            result = (0.0, 1.0)
-        else:
-            margin = (hi - lo) * 0.05 or 0.1
-            result = (lo - margin, hi + margin)
-        self._cached_y = result
-        self._y_dirty = False
-        return result
-
-    # ------------------------------------------------------------------
-    #  降采样：尾部全精度 + 历史压缩（桶偏离法保留尖峰）
+    #  后台 worker：增量降采样（recent 滑动 + 历史周期性归并）
     # ------------------------------------------------------------------
     @classmethod
-    def _downsample_tail(cls, values: List[float]) -> List[float]:
-        """最近 _RECENT 个点原样，更早的点压缩到 _BUCKETS 个桶"""
+    def _bucket_sample(cls, values: List[float], n_buckets: int) -> List[float]:
+        """桶偏离采样：每桶取与上一保留点偏差最大的点（保尖峰/谷底）"""
         n = len(values)
-        total_budget = cls._RECENT + cls._BUCKETS
-        if n <= total_budget:
-            return values
-
-        old_n = n - cls._RECENT
-        old = values[:old_n]
-        recent = values[old_n:]
-
-        # 旧数据：桶偏离采样
-        bucket_sz = old_n / cls._BUCKETS
-        compressed: List[float] = []
-        for i in range(cls._BUCKETS):
+        if n == 0:
+            return []
+        if n <= n_buckets:
+            return list(values)
+        bucket_sz = n / n_buckets
+        out: List[float] = []
+        for i in range(n_buckets):
             lo = int(i * bucket_sz)
-            hi = min(int((i + 1) * bucket_sz), old_n)
-            ref = compressed[-1] if compressed else old[lo]
-            best = old[lo]
+            hi = min(int((i + 1) * bucket_sz), n)
+            ref = out[-1] if out else values[lo]
+            best = values[lo]
             best_d = abs(best - ref)
             for j in range(lo + 1, hi):
-                d = abs(old[j] - ref)
+                d = abs(values[j] - ref)
                 if d > best_d:
                     best_d = d
-                    best = old[j]
-            compressed.append(best)
+                    best = values[j]
+            out.append(best)
+        return out
 
-        return compressed + list(recent)
+    def _append(self, st: _SeriesState, value: float) -> None:
+        """O(1) 追加一个点：滑动 recent 窗口，溢出点进入待归并池"""
+        st.raw.append(value)
+        st.last = value
+        if st.min_v is None:
+            st.min_v = st.max_v = value
+        else:
+            if value < st.min_v:
+                st.min_v = value
+            if value > st.max_v:
+                st.max_v = value
+        st.recent.append(value)
+        if len(st.recent) > self._RECENT:
+            st.hist.append(st.recent.pop(0))
 
-    def _get_downsampled(self, name: str) -> List[float]:
-        """降采样（带 memo）：始终返回与 _downsample_tail 一致的结果。
+    def _rebucket(self, st: _SeriesState) -> None:
+        """历史区间全量桶采样（精确，无累积漂移；输出长度恒 _BUCKETS+_RECENT）"""
+        h = len(st.raw) - self._RECENT
+        st.compressed = self._bucket_sample(st.raw[:h], self._BUCKETS) if h > 0 else []
+        st.hist = []
+        st.last_merge = time.monotonic()
 
-        历史压缩后长度必须恒定为 _BUCKETS + _RECENT（数据超过预算时），
-        X 轴按 i/(n-1) 映射才不会随新点加入而缩放漂移。
-        因此这里不做增量追加缓存——那会让长度在预算内锯齿抖动，
-        造成曲线前后缩放比不一致、重采样时出现重复跳变。
-        原始数据是只追加的，用其长度作为 memo 键即可安全命中。
-        """
-        raw = self._series[name]
-        raw_len = len(raw)
-        cached = self._ds_cache.get(name)
-        if cached is not None and cached[0] == raw_len:
-            return cached[1]
-        ds = self._downsample_tail(raw)
-        self._ds_cache[name] = (raw_len, ds)
-        return ds
+    def _maybe_merge(self, st: _SeriesState) -> None:
+        if not st.hist:
+            return
+        if (len(st.hist) >= self._REBUCKET
+                or time.monotonic() - st.last_merge >= self._MERGE_AGE):
+            self._rebucket(st)
+
+    def _publish(self) -> None:
+        """把当前状态打包成不可变快照（只替换引用，不就地修改，读侧安全）"""
+        series: Dict[str, List[float]] = {}
+        last_vals: Dict[str, float] = {}
+        lo, hi = float("inf"), float("-inf")
+        for name, st in self._states.items():
+            out = st.compressed + st.recent
+            if out:
+                series[name] = out
+            if st.last is not None:
+                last_vals[name] = st.last
+            if st.min_v is not None:
+                lo = min(lo, st.min_v)
+                hi = max(hi, st.max_v)
+        if lo == float("inf"):
+            y_range = (0.0, 1.0)
+        else:
+            margin = (hi - lo) * 0.05 or 0.1
+            y_range = (lo - margin, hi + margin)
+        with self._lock:
+            self._snapshot = (series, y_range, last_vals)
+
+    def _handle(self, item):
+        if item is None:
+            self._closed = True
+            return
+        if isinstance(item, tuple) and item and item[0] == "__reset__":
+            self._states.clear()
+            with self._lock:
+                self._snapshot = None
+            return
+        name, value = item
+        st = self._states.get(name)
+        if st is None:
+            st = _SeriesState()
+            self._states[name] = st
+        self._append(st, value)
+
+    def _worker_loop(self):
+        while not self._closed:
+            try:
+                item = self._inbox.get(timeout=self._MERGE_AGE)
+            except queue.Empty:
+                # 无新数据也检查时间触发的归并（兜底）
+                for st in self._states.values():
+                    self._maybe_merge(st)
+                continue
+            self._handle(item)
+            # 批量消费积压，减少发布/唤醒次数
+            while True:
+                try:
+                    nxt = self._inbox.get_nowait()
+                except queue.Empty:
+                    break
+                self._handle(nxt)
+            for st in self._states.values():
+                self._maybe_merge(st)
+            self._publish()
 
     # ------------------------------------------------------------------
     #  渲染核心 —— PIL 离屏绘制
@@ -309,17 +381,12 @@ class ChartWidget(ctk.CTkFrame):
         self._dirty = False
         self._render_data()
 
-    def _schedule_render(self):
-        self._dirty = True
-        if self._render_id is None:
-            self._render_id = self.after(self._RENDER_MS, self._tick_render)
-
     def _tick_render(self):
-        self._render_id = None
-        if not self._dirty:
-            return
-        self._dirty = False
-        self._render_data()
+        """主线程持续节拍器：每 _RENDER_MS 检查是否有新数据并渲染"""
+        self._timer_id = self.after(self._RENDER_MS, self._tick_render)
+        if self._dirty:
+            self._dirty = False
+            self._render_data()
 
     def _render_data(self):
         c = self._canvas
@@ -328,7 +395,14 @@ class ChartWidget(ctk.CTkFrame):
         ml, mr, mt, mb = 50, 10, 24, 22
         pw, ph = w - ml - mr, h - mt - mb
 
-        y_min, y_max = self._calc_y_range()
+        # 取最新快照（只复制引用，O(1)）
+        with self._lock:
+            snap = self._snapshot
+        if snap is None:
+            series, y_range, last_vals = {}, (0.0, 1.0), {}
+        else:
+            series, y_range, last_vals = snap
+        y_min, y_max = y_range
         span = y_max - y_min or 1.0
 
         # --- PIL 绘制 ---
@@ -357,9 +431,9 @@ class ChartWidget(ctk.CTkFrame):
         draw.line([(ml, mt + ph), (w - mr, mt + ph)], fill="#333333", width=1)
 
         # 逐系列绘制
-        series_keys = list(self._series.keys())
+        series_keys = list(series.keys())
         for idx, name in enumerate(series_keys):
-            vals = self._get_downsampled(name)
+            vals = series[name]
             if len(vals) < 2:
                 continue
             color = self._colors[idx % len(self._colors)]
@@ -381,12 +455,12 @@ class ChartWidget(ctk.CTkFrame):
         lx = w - mr - 4
         ly = mt + 4
         for idx, name in enumerate(series_keys):
-            raw = self._series[name]
-            if not raw:
+            last = last_vals.get(name)
+            if last is None:
                 continue
             color = self._colors[idx % len(self._colors)]
             draw.line([(lx - 28, ly), (lx - 12, ly)], fill=color, width=2)
-            label = f"{name}={raw[-1]:.4g}"
+            label = f"{name}={last:.4g}"
             draw.text((lx - 10, ly - 5), label,
                       fill=color, font=self._font_sm, anchor="ra")
             ly += 14
@@ -400,25 +474,32 @@ class ChartWidget(ctk.CTkFrame):
     #  公开接口
     # ------------------------------------------------------------------
     def add_point(self, series_name: str, value: float):
-        """O(1) 追加数据，不触发任何绘制"""
-        if series_name not in self._series:
-            self._series[series_name] = []
-        self._series[series_name].append(value)
-        self._y_dirty = True
-        self._schedule_render()
+        """O(1) 入队（可在任意线程调用）；渲染由主线程节拍器驱动"""
+        self._inbox.put((series_name, value))
+        self._dirty = True
 
     def clear_data(self):
-        """清空所有数据"""
-        if self._render_id is not None:
-            self.after_cancel(self._render_id)
-            self._render_id = None
-        self._series.clear()
-        self._ds_cache.clear()
-        self._cached_y = None
-        self._y_dirty = True
+        """清空所有数据（GUI 立即清显示，worker 异步重置状态）"""
         self._dirty = False
+        with self._lock:
+            self._snapshot = None
         self._photo = None
         self._canvas.delete("all")
+        self._inbox.put(("__reset__",))
+
+    def destroy(self):
+        """销毁时停掉节拍器并通知后台线程退出（不依赖 <Destroy> 事件）"""
+        self._closed = True
+        if self._timer_id is not None:
+            try:
+                self.after_cancel(self._timer_id)
+            except Exception:
+                pass
+        try:
+            self._inbox.put(None)
+        except Exception:
+            pass
+        super().destroy()
 
 
 class OutputPanel(ctk.CTkFrame):
