@@ -76,7 +76,7 @@ namespace nn
             std::future<return_type> result = task->get_future();
             {
                 std::unique_lock lock(queue_mutex_);
-                assert(!stop_.load(std::memory_order_acquire) && "submit on stopped ThreadPool");
+                NN_ASSERT(!stop_.load(std::memory_order_acquire), "submit on stopped ThreadPool");
                 tasks_.emplace([task]() { (*task)(); });
             }
             condition_.notify_one();
