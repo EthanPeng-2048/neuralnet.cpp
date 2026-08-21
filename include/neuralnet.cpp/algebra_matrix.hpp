@@ -168,26 +168,6 @@ namespace nn
             }
         }
 
-        // ── 行微内核：r[j0:j0+VN] += Σ_k a[k]·b[k][j0:j0+VN] ──
-        // b 为 k 主序（b[k*b_stride + j]，j 连续）→ 内层沿 j 连续，
-        // 编译器自动 AVX2/FMA；acc[VN] 即 VN 路独立累加器，打破 FMA 延迟链；
-        // a[k] 单次加载、跨 VN 列复用。所有 matmul 变体共用 → 单一事实来源。
-        // 与旧实现在 -ffast-math 允许的浮点重排上可能有 ±ulp 级差异。
-        static void mm_row(Scalar* r, const Scalar* a, const Scalar* b,
-                           std::size_t K, std::size_t b_stride, int VN) noexcept
-        {
-            Scalar acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-            for (std::size_t k = 0; k < K; ++k)
-            {
-                const Scalar ak = a[k];
-                const Scalar* bk = b + k * b_stride;
-                for (int j = 0; j < VN; ++j)
-                    acc[j] += ak * bk[j];
-            }
-            for (int j = 0; j < VN; ++j)
-                r[j] += acc[j];
-        }
-
         // ── 基于 span 的矩阵乘法（零拷贝，供 batched_matmul 等场景使用） ──
         // 从 a/b 的子区间直接计算，无需构造临时 Matrix 拷贝
         static void multiply_to_span(
@@ -221,15 +201,20 @@ namespace nn
                     std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                     for (std::size_t jj = 0; jj < j_len; ++jj)
                         for (std::size_t kk = 0; kk < k_len; ++kk)
-                            b_block[kk * j_len + jj] = b[(k_start + kk) * b_cols + (j_start + jj)];
+                            b_block[jj * k_len + kk] = b[(k_start + kk) * b_cols + (j_start + jj)];
+                    const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
                     for (std::size_t i = i_start; i < i_end; ++i)
                     {
                         const auto a_row = a.subspan(i * a_cols + k_start);
                         auto r_row = r.subspan(i * N + j_start);
-            for (std::size_t j0 = 0; j0 < j_len; j0 += 8)
-                mm_row(r_row.data() + j0, a_row.data(), b_block.data() + j0,
-                       k_len, j_len, static_cast<int>((j0 + 8 <= j_len) ? 8 : (j_len - j0)));
-
+                        for (std::size_t j = 0; j < j_len; ++j)
+                        {
+                            const auto b_col = b_block_span.subspan(j * k_len, k_len);
+                            Scalar sum = 0.0;
+                            for (std::size_t kk = 0; kk < k_len; ++kk)
+                                sum += a_row[kk] * b_col[kk];
+                            r_row[j] += sum;
+                        }
                     }
                 }
             };
@@ -274,15 +259,20 @@ namespace nn
                     std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                     for (std::size_t jj = 0; jj < j_len; ++jj)
                         for (std::size_t kk = 0; kk < k_len; ++kk)
-                            b_block[kk * j_len + jj] = bt[(j_start + jj) * K + (k_start + kk)];
+                            b_block[jj * k_len + kk] = bt[(j_start + jj) * K + (k_start + kk)];
+                    const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
                     for (std::size_t i = i_start; i < i_end; ++i)
                     {
                         const auto a_row = a.subspan(i * K + k_start);
                         auto r_row = r.subspan(i * N + j_start);
-            for (std::size_t j0 = 0; j0 < j_len; j0 += 8)
-                mm_row(r_row.data() + j0, a_row.data(), b_block.data() + j0,
-                       k_len, j_len, static_cast<int>((j0 + 8 <= j_len) ? 8 : (j_len - j0)));
-
+                        for (std::size_t j = 0; j < j_len; ++j)
+                        {
+                            const auto b_col = b_block_span.subspan(j * k_len, k_len);
+                            Scalar sum = 0.0;
+                            for (std::size_t kk = 0; kk < k_len; ++kk)
+                                sum += a_row[kk] * b_col[kk];
+                            r_row[j] += sum;
+                        }
                     }
                 }
             };
@@ -332,15 +322,20 @@ namespace nn
                     std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                     for (std::size_t jj = 0; jj < j_len; ++jj)
                         for (std::size_t kk = 0; kk < k_len; ++kk)
-                            b_block[kk * j_len + jj] = b[(k_start + kk) * b_cols + (j_start + jj)];
+                            b_block[jj * k_len + kk] = b[(k_start + kk) * b_cols + (j_start + jj)];
+                    const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
                     for (std::size_t i = 0; i < i_len; ++i)
                     {
                         const auto a_row = std::span<const Scalar>(a_block.data() + i * k_len, k_len);
                         auto r_row = r.subspan((i_start + i) * N + j_start);
-            for (std::size_t j0 = 0; j0 < j_len; j0 += 8)
-                mm_row(r_row.data() + j0, a_row.data(), b_block.data() + j0,
-                       k_len, j_len, static_cast<int>((j0 + 8 <= j_len) ? 8 : (j_len - j0)));
-
+                        for (std::size_t j = 0; j < j_len; ++j)
+                        {
+                            const auto b_col = b_block_span.subspan(j * k_len, k_len);
+                            Scalar sum = 0.0;
+                            for (std::size_t kk = 0; kk < k_len; ++kk)
+                                sum += a_row[kk] * b_col[kk];
+                            r_row[j] += sum;
+                        }
                     }
                 }
             };
@@ -391,15 +386,21 @@ namespace nn
                     std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                     for (std::size_t jj = 0; jj < j_len; ++jj)
                         for (std::size_t kk = 0; kk < k_len; ++kk)
-                            b_block[kk * j_len + jj] = b[(k_start + kk) * N + (j_start + jj)];
+                            b_block[jj * k_len + kk] = b[(k_start + kk) * N + (j_start + jj)];
+                    const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
                     for (std::size_t i = i_start; i < i_end; ++i)
                     {
                         const auto a_row = a.subspan(i * K + k_start);
                         auto r_row = r.subspan(i * N + j_start);
-            for (std::size_t j0 = 0; j0 < j_len; j0 += 8)
-                mm_row(r_row.data() + j0, a_row.data(), b_block.data() + j0,
-                       k_len, j_len, static_cast<int>((j0 + 8 <= j_len) ? 8 : (j_len - j0)));
-
+                        for (std::size_t j = 0; j < j_len; ++j)
+                        {
+                            const auto b_col = b_block_span.subspan(j * k_len, k_len);
+                            Scalar sum = 0.0;
+#pragma clang loop vectorize(assume_safety)
+                            for (std::size_t kk = 0; kk < k_len; ++kk)
+                                sum += a_row[kk] * b_col[kk];
+                            r_row[j] += sum;
+                        }
                     }
                 }
             }
@@ -426,16 +427,22 @@ namespace nn
                             std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                             for (std::size_t jj = 0; jj < j_len; ++jj)
                                 for (std::size_t kk = 0; kk < k_len; ++kk)
-                                    b_block[kk * j_len + jj] = b[(k_start + kk) * N + (j_start + jj)];
+                                    b_block[jj * k_len + kk] = b[(k_start + kk) * N + (j_start + jj)];
+                            const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
 
                             for (std::size_t i = i_start; i < i_end; ++i)
                             {
                                 const auto a_row = a.subspan(i * K + k_start);
                                 auto r_row = r.subspan(i * N + j_start);
-            for (std::size_t j0 = 0; j0 < j_len; j0 += 8)
-                mm_row(r_row.data() + j0, a_row.data(), b_block.data() + j0,
-                       k_len, j_len, static_cast<int>((j0 + 8 <= j_len) ? 8 : (j_len - j0)));
-
+                                for (std::size_t j = 0; j < j_len; ++j)
+                                {
+                                    const auto b_col = b_block_span.subspan(j * k_len, k_len);
+                                    Scalar sum = 0.0;
+#pragma clang loop vectorize(assume_safety)
+                                    for (std::size_t kk = 0; kk < k_len; ++kk)
+                                        sum += a_row[kk] * b_col[kk];
+                                    r_row[j] += sum;
+                                }
                             }
                         }
                     });
@@ -481,15 +488,20 @@ namespace nn
                     std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                     for (std::size_t jj = 0; jj < j_len; ++jj)
                         for (std::size_t kk = 0; kk < k_len; ++kk)
-                            b_block[kk * j_len + jj] = bt[(j_start + jj) * K + (k_start + kk)];
+                            b_block[jj * k_len + kk] = bt[(j_start + jj) * K + (k_start + kk)];
+                    const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
                     for (std::size_t i = i_start; i < i_end; ++i)
                     {
                         const auto a_row = a.subspan(i * K + k_start);
                         auto r_row = r.subspan(i * N + j_start);
-            for (std::size_t j0 = 0; j0 < j_len; j0 += 8)
-                mm_row(r_row.data() + j0, a_row.data(), b_block.data() + j0,
-                       k_len, j_len, static_cast<int>((j0 + 8 <= j_len) ? 8 : (j_len - j0)));
-
+                        for (std::size_t j = 0; j < j_len; ++j)
+                        {
+                            const auto b_col = b_block_span.subspan(j * k_len, k_len);
+                            Scalar sum = 0.0;
+                            for (std::size_t kk = 0; kk < k_len; ++kk)
+                                sum += a_row[kk] * b_col[kk];
+                            r_row[j] += sum;
+                        }
                     }
                 }
             }
@@ -516,16 +528,21 @@ namespace nn
                             std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                             for (std::size_t jj = 0; jj < j_len; ++jj)
                                 for (std::size_t kk = 0; kk < k_len; ++kk)
-                                    b_block[kk * j_len + jj] = bt[(j_start + jj) * K + (k_start + kk)];
+                                    b_block[jj * k_len + kk] = bt[(j_start + jj) * K + (k_start + kk)];
+                            const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
 
                             for (std::size_t i = i_start; i < i_end; ++i)
                             {
                                 const auto a_row = a.subspan(i * K + k_start);
                                 auto r_row = r.subspan(i * N + j_start);
-            for (std::size_t j0 = 0; j0 < j_len; j0 += 8)
-                mm_row(r_row.data() + j0, a_row.data(), b_block.data() + j0,
-                       k_len, j_len, static_cast<int>((j0 + 8 <= j_len) ? 8 : (j_len - j0)));
-
+                                for (std::size_t j = 0; j < j_len; ++j)
+                                {
+                                    const auto b_col = b_block_span.subspan(j * k_len, k_len);
+                                    Scalar sum = 0.0;
+                                    for (std::size_t kk = 0; kk < k_len; ++kk)
+                                        sum += a_row[kk] * b_col[kk];
+                                    r_row[j] += sum;
+                                }
                             }
                         }
                     });
@@ -579,16 +596,21 @@ namespace nn
                     std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                     for (std::size_t jj = 0; jj < j_len; ++jj)
                         for (std::size_t kk = 0; kk < k_len; ++kk)
-                            b_block[kk * j_len + jj] = b_data[(k_start + kk) * N + (j_start + jj)];
+                            b_block[jj * k_len + kk] = b_data[(k_start + kk) * N + (j_start + jj)];
+                    const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
 
                     for (std::size_t i = 0; i < i_len; ++i)
                     {
                         const auto a_row = std::span<const Scalar>(a_block.data() + i * k_len, k_len);
                         auto r_row = r.subspan((i_start + i) * N + j_start);
-            for (std::size_t j0 = 0; j0 < j_len; j0 += 8)
-                mm_row(r_row.data() + j0, a_row.data(), b_block.data() + j0,
-                       k_len, j_len, static_cast<int>((j0 + 8 <= j_len) ? 8 : (j_len - j0)));
-
+                        for (std::size_t j = 0; j < j_len; ++j)
+                        {
+                            const auto b_col = b_block_span.subspan(j * k_len, k_len);
+                            Scalar sum = 0.0;
+                            for (std::size_t kk = 0; kk < k_len; ++kk)
+                                sum += a_row[kk] * b_col[kk];
+                            r_row[j] += sum;
+                        }
                     }
                 }
             }
@@ -623,16 +645,21 @@ namespace nn
                             std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                             for (std::size_t jj = 0; jj < j_len; ++jj)
                                 for (std::size_t kk = 0; kk < k_len; ++kk)
-                                    b_block[kk * j_len + jj] = b_data[(k_start + kk) * N + (j_start + jj)];
+                                    b_block[jj * k_len + kk] = b_data[(k_start + kk) * N + (j_start + jj)];
+                            const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
 
                             for (std::size_t i = 0; i < i_len; ++i)
                             {
                                 const auto a_row = std::span<const Scalar>(a_block.data() + i * k_len, k_len);
                                 auto r_row = r.subspan((i_start + i) * N + j_start);
-            for (std::size_t j0 = 0; j0 < j_len; j0 += 8)
-                mm_row(r_row.data() + j0, a_row.data(), b_block.data() + j0,
-                       k_len, j_len, static_cast<int>((j0 + 8 <= j_len) ? 8 : (j_len - j0)));
-
+                                for (std::size_t j = 0; j < j_len; ++j)
+                                {
+                                    const auto b_col = b_block_span.subspan(j * k_len, k_len);
+                                    Scalar sum = 0.0;
+                                    for (std::size_t kk = 0; kk < k_len; ++kk)
+                                        sum += a_row[kk] * b_col[kk];
+                                    r_row[j] += sum;
+                                }
                             }
                         }
                     });
@@ -672,15 +699,20 @@ namespace nn
                     std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                     for (std::size_t jj = 0; jj < j_len; ++jj)
                         for (std::size_t kk = 0; kk < k_len; ++kk)
-                            b_block[kk * j_len + jj] = bt[(j_start + jj) * K + (k_start + kk)];
+                            b_block[jj * k_len + kk] = bt[(j_start + jj) * K + (k_start + kk)];
+                    const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
                     for (std::size_t i = i_start; i < i_end; ++i)
                     {
                         const auto a_row = a.subspan(i * K + k_start);
                         auto r_row = r.subspan(i * N + j_start);
-            for (std::size_t j0 = 0; j0 < j_len; j0 += 8)
-                mm_row(r_row.data() + j0, a_row.data(), b_block.data() + j0,
-                       k_len, j_len, static_cast<int>((j0 + 8 <= j_len) ? 8 : (j_len - j0)));
-
+                        for (std::size_t j = 0; j < j_len; ++j)
+                        {
+                            const auto b_col = b_block_span.subspan(j * k_len, k_len);
+                            Scalar sum = 0.0;
+                            for (std::size_t kk = 0; kk < k_len; ++kk)
+                                sum += a_row[kk] * b_col[kk];
+                            r_row[j] += sum;
+                        }
                     }
                 }
             }
@@ -707,16 +739,21 @@ namespace nn
                             std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                             for (std::size_t jj = 0; jj < j_len; ++jj)
                                 for (std::size_t kk = 0; kk < k_len; ++kk)
-                                    b_block[kk * j_len + jj] = bt[(j_start + jj) * K + (k_start + kk)];
+                                    b_block[jj * k_len + kk] = bt[(j_start + jj) * K + (k_start + kk)];
+                            const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
 
                             for (std::size_t i = i_start; i < i_end; ++i)
                             {
                                 const auto a_row = a.subspan(i * K + k_start);
                                 auto r_row = r.subspan(i * N + j_start);
-            for (std::size_t j0 = 0; j0 < j_len; j0 += 8)
-                mm_row(r_row.data() + j0, a_row.data(), b_block.data() + j0,
-                       k_len, j_len, static_cast<int>((j0 + 8 <= j_len) ? 8 : (j_len - j0)));
-
+                                for (std::size_t j = 0; j < j_len; ++j)
+                                {
+                                    const auto b_col = b_block_span.subspan(j * k_len, k_len);
+                                    Scalar sum = 0.0;
+                                    for (std::size_t kk = 0; kk < k_len; ++kk)
+                                        sum += a_row[kk] * b_col[kk];
+                                    r_row[j] += sum;
+                                }
                             }
                         }
                     });
