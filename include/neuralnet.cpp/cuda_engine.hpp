@@ -430,6 +430,7 @@ public:
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols) override
     {
+        (void)spec; (void)inputs; (void)rows; (void)cols;
         return std::unexpected(Error{
             "CudaEngine::eval_expr: 闭合世界无 CUDA AOT 融合 shader；请用 Vulkan"});
     }
