@@ -168,6 +168,26 @@ namespace nn
             }
         }
 
+        // ── 点积微内核：8 路独立累加器（纯可移植，编译器自动 AVX2/FMA） ──
+        // 打破"单累加器归约"的串行 FMA 依赖链（延迟受限），提升 ILP。
+        // 与旧实现仅在 -ffast-math 允许的浮点重排上可能有 ±ulp 级差异。
+        // 所有 matmul 变体共用本函数 → 单一事实来源，避免多份内核对齐漂移。
+        static Scalar dot_kernel(const Scalar* a, const Scalar* b, std::size_t n) noexcept
+        {
+            Scalar s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+            Scalar s4 = 0, s5 = 0, s6 = 0, s7 = 0;
+            std::size_t k = 0;
+            for (; k + 8 <= n; k += 8)
+            {
+                s0 += a[k + 0] * b[k + 0]; s1 += a[k + 1] * b[k + 1];
+                s2 += a[k + 2] * b[k + 2]; s3 += a[k + 3] * b[k + 3];
+                s4 += a[k + 4] * b[k + 4]; s5 += a[k + 5] * b[k + 5];
+                s6 += a[k + 6] * b[k + 6]; s7 += a[k + 7] * b[k + 7];
+            }
+            for (; k < n; ++k) s0 += a[k] * b[k];
+            return (s0 + s1) + (s2 + s3) + (s4 + s5) + (s6 + s7);
+        }
+
         // ── 基于 span 的矩阵乘法（零拷贝，供 batched_matmul 等场景使用） ──
         // 从 a/b 的子区间直接计算，无需构造临时 Matrix 拷贝
         static void multiply_to_span(
@@ -210,10 +230,7 @@ namespace nn
                         for (std::size_t j = 0; j < j_len; ++j)
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                            Scalar sum = 0.0;
-                            for (std::size_t kk = 0; kk < k_len; ++kk)
-                                sum += a_row[kk] * b_col[kk];
-                            r_row[j] += sum;
+                            r_row[j] += dot_kernel(a_row.data(), b_col.data(), k_len);
                         }
                     }
                 }
@@ -268,10 +285,7 @@ namespace nn
                         for (std::size_t j = 0; j < j_len; ++j)
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                            Scalar sum = 0.0;
-                            for (std::size_t kk = 0; kk < k_len; ++kk)
-                                sum += a_row[kk] * b_col[kk];
-                            r_row[j] += sum;
+                            r_row[j] += dot_kernel(a_row.data(), b_col.data(), k_len);
                         }
                     }
                 }
@@ -331,10 +345,7 @@ namespace nn
                         for (std::size_t j = 0; j < j_len; ++j)
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                            Scalar sum = 0.0;
-                            for (std::size_t kk = 0; kk < k_len; ++kk)
-                                sum += a_row[kk] * b_col[kk];
-                            r_row[j] += sum;
+                            r_row[j] += dot_kernel(a_row.data(), b_col.data(), k_len);
                         }
                     }
                 }
@@ -395,11 +406,7 @@ namespace nn
                         for (std::size_t j = 0; j < j_len; ++j)
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                            Scalar sum = 0.0;
-#pragma clang loop vectorize(assume_safety)
-                            for (std::size_t kk = 0; kk < k_len; ++kk)
-                                sum += a_row[kk] * b_col[kk];
-                            r_row[j] += sum;
+                            r_row[j] += dot_kernel(a_row.data(), b_col.data(), k_len);
                         }
                     }
                 }
@@ -437,11 +444,7 @@ namespace nn
                                 for (std::size_t j = 0; j < j_len; ++j)
                                 {
                                     const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                                    Scalar sum = 0.0;
-#pragma clang loop vectorize(assume_safety)
-                                    for (std::size_t kk = 0; kk < k_len; ++kk)
-                                        sum += a_row[kk] * b_col[kk];
-                                    r_row[j] += sum;
+                                    r_row[j] += dot_kernel(a_row.data(), b_col.data(), k_len);
                                 }
                             }
                         }
@@ -497,10 +500,7 @@ namespace nn
                         for (std::size_t j = 0; j < j_len; ++j)
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                            Scalar sum = 0.0;
-                            for (std::size_t kk = 0; kk < k_len; ++kk)
-                                sum += a_row[kk] * b_col[kk];
-                            r_row[j] += sum;
+                            r_row[j] += dot_kernel(a_row.data(), b_col.data(), k_len);
                         }
                     }
                 }
@@ -538,10 +538,7 @@ namespace nn
                                 for (std::size_t j = 0; j < j_len; ++j)
                                 {
                                     const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                                    Scalar sum = 0.0;
-                                    for (std::size_t kk = 0; kk < k_len; ++kk)
-                                        sum += a_row[kk] * b_col[kk];
-                                    r_row[j] += sum;
+                                    r_row[j] += dot_kernel(a_row.data(), b_col.data(), k_len);
                                 }
                             }
                         }
@@ -606,10 +603,7 @@ namespace nn
                         for (std::size_t j = 0; j < j_len; ++j)
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                            Scalar sum = 0.0;
-                            for (std::size_t kk = 0; kk < k_len; ++kk)
-                                sum += a_row[kk] * b_col[kk];
-                            r_row[j] += sum;
+                            r_row[j] += dot_kernel(a_row.data(), b_col.data(), k_len);
                         }
                     }
                 }
@@ -655,10 +649,7 @@ namespace nn
                                 for (std::size_t j = 0; j < j_len; ++j)
                                 {
                                     const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                                    Scalar sum = 0.0;
-                                    for (std::size_t kk = 0; kk < k_len; ++kk)
-                                        sum += a_row[kk] * b_col[kk];
-                                    r_row[j] += sum;
+                                    r_row[j] += dot_kernel(a_row.data(), b_col.data(), k_len);
                                 }
                             }
                         }
@@ -708,10 +699,7 @@ namespace nn
                         for (std::size_t j = 0; j < j_len; ++j)
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                            Scalar sum = 0.0;
-                            for (std::size_t kk = 0; kk < k_len; ++kk)
-                                sum += a_row[kk] * b_col[kk];
-                            r_row[j] += sum;
+                            r_row[j] += dot_kernel(a_row.data(), b_col.data(), k_len);
                         }
                     }
                 }
@@ -749,10 +737,7 @@ namespace nn
                                 for (std::size_t j = 0; j < j_len; ++j)
                                 {
                                     const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                                    Scalar sum = 0.0;
-                                    for (std::size_t kk = 0; kk < k_len; ++kk)
-                                        sum += a_row[kk] * b_col[kk];
-                                    r_row[j] += sum;
+                                    r_row[j] += dot_kernel(a_row.data(), b_col.data(), k_len);
                                 }
                             }
                         }
