@@ -8,7 +8,10 @@
 //   transA=true 表示使用 A 块的转置，transB=true 表示使用 B 块的转置。
 //   块内维度须匹配：所有四种转置组合都要求块为方阵（a_rows_per == a.cols()）。
 //
-// 用法：matmul_probe
+// 用法：matmul_probe [--gpu|--cuda]
+//   --gpu   使用 Vulkan GpuEngine（验证 tiled batched_matmul shader）
+//   --cuda  使用 CUDA CudaEngine
+//   默认    CpuEngine
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>
@@ -17,6 +20,7 @@
 #include <cmath>
 #include <iostream>
 #include <random>
+#include <string_view>
 
 using nn::Scalar;
 using nn::Matrix;
@@ -94,9 +98,16 @@ void dump_diff(const std::string& name, const Matrix& got, const Matrix& ref)
 
 } // namespace
 
-int main()
+int main(int argc, char* argv[])
 {
     nn::cli::EngineConfig ecfg;
+    for (int i = 1; i < argc; ++i)
+    {
+        const std::string_view arg{argv[i]};
+        if (arg == "--gpu") ecfg.use_gpu = true;
+        else if (arg == "--cuda") ecfg.use_cuda = true;
+        else { std::cerr << "未知参数: " << arg << "\n"; return 1; }
+    }
     auto engine = nn::cli::create_engine(ecfg, std::cout);
     if (!engine) { std::cerr << "引擎创建失败\n"; return 1; }
     ComputeEngine& eng = *engine;
@@ -156,6 +167,42 @@ int main()
         if (!got) { std::cerr << "  (T,T) to_matrix failed\n"; return 1; }
         const Matrix ref = ref_batched(Am, Bm, H, true, true);
         dump_diff("(T,T) A^T*B^T", *got, ref);
+    }
+
+    // ── 大尺寸 + alpha：K=100 不被 BK=16 整除（边界填零路径），M=N=100
+    //    超过 64×64 tile（多 WorkGroup 分块路径），H=8 模拟 batch*num_heads。
+    //    alpha=0.176777 模拟 attention 的 1/sqrt(d_k) 折叠。
+    {
+        const std::size_t K2 = 100;
+        const std::size_t H2 = 8;
+        const Scalar alpha{0.176777f};
+
+        Matrix Am2(H2 * K2, K2), Bm2(H2 * K2, K2);
+        for (std::size_t i = 0; i < Am2.size(); ++i) Am2.span()[i] = dist(rng);
+        for (std::size_t i = 0; i < Bm2.size(); ++i) Bm2.span()[i] = dist(rng);
+
+        auto A2 = eng.from_matrix(Am2);
+        auto B2 = eng.from_matrix(Bm2);
+        if (!A2 || !B2) { std::cerr << "from_matrix (large) failed\n"; return 1; }
+
+        struct Case { const char* name; bool tA; bool tB; };
+        for (const Case cs : {Case{"(F,F)", false, false}, Case{"(T,F)", true, false},
+                              Case{"(F,T)", false, true},  Case{"(T,T)", true, true}})
+        {
+            auto out = eng.batched_matmul(*A2, *B2, H2, cs.tA, cs.tB, alpha);
+            if (!out) { std::cerr << "  large " << cs.name << " error: "
+                                  << out.error().message << "\n"; return 1; }
+            auto got = eng.to_matrix(*out);
+            if (!got) { std::cerr << "  large " << cs.name << " to_matrix failed\n"; return 1; }
+            const Matrix ref = ref_batched(Am2, Bm2, H2, cs.tA, cs.tB);
+
+            // ref 乘 alpha 后对比（参考实现不含 alpha）
+            Matrix ref_s = ref;
+            for (std::size_t i = 0; i < ref_s.size(); ++i)
+                ref_s.span()[i] *= alpha;
+            std::string label = std::string("large ") + cs.name + " alpha";
+            dump_diff(label.c_str(), *got, ref_s);
+        }
     }
 
     std::cout << "----------------------------------------\n";

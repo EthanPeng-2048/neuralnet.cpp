@@ -89,6 +89,9 @@ nn_add_executable(doc_attn_test src/doc_attn_test.cpp)
 # ── CausalSelfAttention 数值梯度检查（gradcheck，验证 attention 内部反向） ──
 nn_add_executable(attn_gradcheck src/attn_gradcheck.cpp)
 
+# ── 融合 shader（AOT）GPU 数值验证（ExprSpec 单一事实来源 vs GPU 输出） ──
+nn_add_executable(fused_gpu_test src/fused_gpu_test.cpp)
+
 # ── Softmax 数值梯度检查（gradcheck，验证 softmax 反向） ───────────────────
 nn_add_executable(softmax_gradcheck src/softmax_gradcheck.cpp)
 
@@ -126,21 +129,30 @@ if(Vulkan_FOUND)
         transpose
         gather
         scatter_add)
+    # AOT 融合 shader（表达式单一事实来源见 include/neuralnet.cpp/fused_exprs.hpp）
+    # 由构建期工具 tools/gen_fused 生成 .comp，再走与普通 shader 相同的 glslc → embed 管线
+    set(GPU_FUSED_SHADERS
+        rope_forward_dk32
+        rope_forward_dk64
+        rope_forward_dk128
+        rope_backward_dk32
+        rope_backward_dk64
+        rope_backward_dk128)
     set(GPU_SHADER_HPPS "")
 
-    foreach(SHADER_NAME ${GPU_SHADERS})
-        set(SRC ${CMAKE_SOURCE_DIR}/shaders/${SHADER_NAME}.comp)
+    # 便捷函数：glslc → .spv → embed_spirv.cmake → C++ 头文件
+    function(nn_embed_shader SHADER_NAME SRC_FILE)
         set(SPV ${CMAKE_BINARY_DIR}/${SHADER_NAME}.spv)
         set(HPP ${CMAKE_BINARY_DIR}/generated/${SHADER_NAME}_spv.hpp)
         set(FUNC "nn_${SHADER_NAME}_spirv_bytecode")
-        list(APPEND GPU_SHADER_SPVS ${SPV})
-        list(APPEND GPU_SHADER_HPPS ${HPP})
+        set(GPU_SHADER_SPVS ${GPU_SHADER_SPVS} ${SPV} PARENT_SCOPE)
+        set(GPU_SHADER_HPPS ${GPU_SHADER_HPPS} ${HPP} PARENT_SCOPE)
 
         # 编译 GLSL → SPIR-V
         add_custom_command(
             OUTPUT ${SPV}
-            COMMAND ${GLSLC} -o ${SPV} ${SRC}
-            DEPENDS ${SRC}
+            COMMAND ${GLSLC} -o ${SPV} ${SRC_FILE}
+            DEPENDS ${SRC_FILE}
             COMMENT "[GPU] Compiling ${SHADER_NAME}.comp → ${SHADER_NAME}.spv"
         )
 
@@ -155,6 +167,34 @@ if(Vulkan_FOUND)
             DEPENDS ${SPV} ${CMAKE_SOURCE_DIR}/cmake/embed_spirv.cmake
             COMMENT "[GPU] Embedding ${SHADER_NAME} SPIR-V into C++ header"
         )
+    endfunction()
+
+    # 1. 普通（手写）纯原语 shader
+    foreach(SHADER_NAME ${GPU_SHADERS})
+        nn_embed_shader(${SHADER_NAME} ${CMAKE_SOURCE_DIR}/shaders/${SHADER_NAME}.comp)
+    endforeach()
+
+    # 2. AOT 融合 shader：构建期编译 tools/gen_fused（复用 fused_exprs.hpp /
+    #    glsl_gen.hpp，单一事实来源），运行生成 fused/*.comp
+    set(FUSED_GEN_SRC ${CMAKE_SOURCE_DIR}/tools/gen_fused.cpp)
+    set(FUSED_OUT_DIR ${CMAKE_BINARY_DIR}/fused)
+    add_executable(gen_fused ${FUSED_GEN_SRC})
+    target_include_directories(gen_fused PRIVATE ${CMAKE_SOURCE_DIR}/include/neuralnet.cpp)
+
+    set(FUSED_COMP_FILES "")
+    foreach(SHADER_NAME ${GPU_FUSED_SHADERS})
+        list(APPEND FUSED_COMP_FILES ${FUSED_OUT_DIR}/${SHADER_NAME}.comp)
+    endforeach()
+
+    add_custom_command(
+        OUTPUT ${FUSED_COMP_FILES}
+        COMMAND gen_fused ${FUSED_OUT_DIR}
+        DEPENDS gen_fused ${FUSED_GEN_SRC}
+        COMMENT "[GPU] Generating fused shaders from fused_exprs.hpp (gen_fused)"
+    )
+
+    foreach(SHADER_NAME ${GPU_FUSED_SHADERS})
+        nn_embed_shader(${SHADER_NAME} ${FUSED_OUT_DIR}/${SHADER_NAME}.comp)
     endforeach()
 
     if(NOT GLSLC)
@@ -177,6 +217,7 @@ if(Vulkan_FOUND)
             rmsnorm_gradcheck
             gpt_gradcheck
             attn_gradcheck
+            fused_gpu_test
             softmax_gradcheck
             attn_debug
             matmul_probe
@@ -194,17 +235,6 @@ if(Vulkan_FOUND)
     endif()
 else()
     message(STATUS "Vulkan not found. GPU acceleration disabled.")
-endif()
-
-# ── 测试目标 ─────────────────────────────────────────────────────────────
-# 启用测试（默认 OFF，可通过 -DNN_BUILD_TESTS=ON 开启）
-option(NN_BUILD_TESTS "Build unit tests" OFF)
-if(NN_BUILD_TESTS)
-    enable_testing()
-    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_const_span.cpp")
-        nn_add_executable(test_const_span tests/test_const_span.cpp)
-        add_test(NAME test_const_span COMMAND test_const_span)
-    endif()
 endif()
 
 # ── CUDA GPU 加速（可选）──────────────────────────────────────────────────

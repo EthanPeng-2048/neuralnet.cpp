@@ -33,6 +33,7 @@
 
 #include "compute_engine.hpp"
 #include "expr_eval.hpp"
+#include "fused_exprs.hpp"
 #include "backend/vk_backend.hpp"
 
 namespace nn
@@ -270,10 +271,12 @@ public:
     }
 
     // ── 批量矩阵乘法：按 batch 切分行块，单次 dispatch 处理所有 batch ──
+    // alpha 在 shader 写出时一次完成（如注意力 1/sqrt(d_k) 缩放）
     [[nodiscard]] Result<Tensor> batched_matmul(
         const Tensor& A, const Tensor& B,
         std::size_t batch,
-        bool transA, bool transB) override
+        bool transA, bool transB,
+        Scalar alpha) override
     {
         auto a_gpu = ensure_gpu(A);
         if (!a_gpu) return std::unexpected(a_gpu.error());
@@ -283,13 +286,16 @@ public:
         auto r = backend_.batched_matmul_gpu(
             a_gpu->gpu_tensor(), b_gpu->gpu_tensor(),
             static_cast<uint32_t>(batch),
-            transA ? 1u : 0u, transB ? 1u : 0u);
+            transA ? 1u : 0u, transB ? 1u : 0u,
+            static_cast<float>(alpha));
         if (!r)
             return std::unexpected(r.error());
         return Tensor::from_gpu(std::move(*r));
     }
 
-    // A += B：分配新 buffer 计算 A+B，替换 A
+    // A += B：真原地，直接写回 A 的 buffer（与 CpuEngine 语义一致）
+    // 逐元素 kernel 每线程只读写自己下标一次，read-before-write 天然成立。
+    // 免去新 buffer 分配 + 全量写出，消除优化器/梯度累积路径的分配风暴。
     [[nodiscard]] Result<void> add_inplace(Tensor& A, const Tensor& B) override
     {
         if (A.rows() != B.rows() || A.cols() != B.cols())
@@ -303,14 +309,17 @@ public:
         const uint32_t count = static_cast<uint32_t>(A.rows() * A.cols());
         auto r = backend_.elementwise_v2_gpu(
             a_gpu->gpu_tensor(), &b_gpu->gpu_tensor(), nullptr,
-            count, 1u, 0u, 0u, 0u, 0.0f, 0.0f, 0.0f);  // BINARY, Add
+            count, 1u, 0u, 0u, 0u, 0.0f, 0.0f, 0.0f,
+            &a_gpu->gpu_tensor());  // BINARY, Add, 原地写回 A
         if (!r)
             return std::unexpected(r.error());
-        A = Tensor::from_gpu(std::move(*r));
+        // 原地模式下 A 的 buffer 已被更新；若 ensure_gpu 上传了新 Tensor（防御路径），替换 A
+        if (A.is_cpu())
+            A = std::move(*a_gpu);
         return {};
     }
 
-    // A *= s：分配新 buffer 计算 A*s，替换 A
+    // A *= s：真原地，直接写回 A 的 buffer（与 CpuEngine 语义一致）
     [[nodiscard]] Result<void> scale_inplace(Tensor& A, Scalar s) override
     {
         auto a_gpu = ensure_gpu(A);
@@ -320,15 +329,17 @@ public:
         // BINARY, Mul, flags=1 (B is scalar), scalar_b = s
         auto r = backend_.elementwise_v2_gpu(
             a_gpu->gpu_tensor(), nullptr, nullptr,
-            count, 1u, 2u, 0u, 1u, static_cast<float>(s), 0.0f, 0.0f);
+            count, 1u, 2u, 0u, 1u, static_cast<float>(s), 0.0f, 0.0f,
+            &a_gpu->gpu_tensor());  // 原地写回 A
         if (!r)
             return std::unexpected(r.error());
-        A = Tensor::from_gpu(std::move(*r));
+        if (A.is_cpu())
+            A = std::move(*a_gpu);
         return {};
     }
 
     // 融合 axpy：A += scalar * B（mode=3，单次 dispatch 替代 clone+scale+add 三步）
-    // 分配新 buffer 计算 A + scalar*B，替换 A（遵循 GpuEngine copy-on-write 语义）
+    // 真原地，直接写回 A 的 buffer（与 CpuEngine 语义一致）
     [[nodiscard]] Result<void> axpy_inplace(Tensor& A, Scalar scalar, const Tensor& B) override
     {
         if (A.rows() != B.rows() || A.cols() != B.cols())
@@ -340,13 +351,15 @@ public:
         if (!b_gpu) return std::unexpected(b_gpu.error());
 
         const uint32_t count = static_cast<uint32_t>(A.rows() * A.cols());
-        // AXPY 模式 (mode=3): out = A + scalar_b * B
+        // AXPY 模式 (mode=3): out = A + scalar_b * B，原地写回 A
         auto r = backend_.elementwise_v2_gpu(
             a_gpu->gpu_tensor(), &b_gpu->gpu_tensor(), nullptr,
-            count, 3u, 0u, 0u, 0u, static_cast<float>(scalar), 0.0f, 0.0f);
+            count, 3u, 0u, 0u, 0u, static_cast<float>(scalar), 0.0f, 0.0f,
+            &a_gpu->gpu_tensor());
         if (!r)
             return std::unexpected(r.error());
-        A = Tensor::from_gpu(std::move(*r));
+        if (A.is_cpu())
+            A = std::move(*a_gpu);
         return {};
     }
 
@@ -409,7 +422,7 @@ public:
     // 广播原语
     // ══════════════════════════════════════════════════════════════════════
 
-    // A[r][c] = op(A[r][c], row_vec[r])：分配新 buffer，替换 A
+    // A[r][c] = op(A[r][c], row_vec[r])：真原地，直接写回 A 的 buffer
     [[nodiscard]] Result<void> broadcast_row_inplace(
         Tensor& A, const Tensor& row_vec, BinaryOp op) override
     {
@@ -420,13 +433,15 @@ public:
 
         auto r = backend_.broadcast_gpu(
             a_gpu->gpu_tensor(), rv_gpu->gpu_tensor(),
-            0u, static_cast<uint32_t>(op));  // row_broadcast
+            0u, static_cast<uint32_t>(op),
+            &a_gpu->gpu_tensor());  // row_broadcast，原地写回 A
         if (!r) return std::unexpected(r.error());
-        A = Tensor::from_gpu(std::move(*r));
+        if (A.is_cpu())
+            A = std::move(*a_gpu);
         return {};
     }
 
-    // A[r][c] = op(A[r][c], col_vec[c])：分配新 buffer，替换 A
+    // A[r][c] = op(A[r][c], col_vec[c])：真原地，直接写回 A 的 buffer
     [[nodiscard]] Result<void> broadcast_col_inplace(
         Tensor& A, const Tensor& col_vec, BinaryOp op) override
     {
@@ -437,9 +452,11 @@ public:
 
         auto r = backend_.broadcast_gpu(
             a_gpu->gpu_tensor(), cv_gpu->gpu_tensor(),
-            1u, static_cast<uint32_t>(op));  // col_broadcast
+            1u, static_cast<uint32_t>(op),
+            &a_gpu->gpu_tensor());  // col_broadcast，原地写回 A
         if (!r) return std::unexpected(r.error());
-        A = Tensor::from_gpu(std::move(*r));
+        if (A.is_cpu())
+            A = std::move(*a_gpu);
         return {};
     }
 
@@ -540,6 +557,10 @@ public:
     // 复用跨后端共享执行器 run_expr_eager：把 ExprSpec 拆分为现有原语
     // 调用（正确优先）。未来替换为统一 VM / 运行时 JIT 生成 shader 时，
     // 只改本函数内部实现，DSL / Layer / 接口不变。
+    //
+    // AOT 融合加速：先与 fused_exprs.hpp 的预生成实例表逐一比对
+    // （expr_spec_equal），命中则直接 dispatch 单个融合 shader；
+    // 未命中回退 eager lowering。
     // ══════════════════════════════════════════════════════════════════════
 
     [[nodiscard]] Result<Tensor> eval_expr(
@@ -547,6 +568,31 @@ public:
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols) override
     {
+        // ── AOT 匹配：查找与 spec 完全一致的预生成融合 shader ──────────
+        for (const auto& inst : nn::fused::kGenInstances)
+        {
+            if (!backend_.has_fused_shader(inst.name))
+                continue;  // 未嵌入/未注册：跳过
+            if (!expr_spec_equal(spec, nn::fused::make_fused(inst)))
+                continue;
+
+            // 命中：收集 GPU 输入（同一 buffer 可重复绑定，如 RoPE 的 q×2）
+            // GpuTensor 内部为 shared_ptr<GpuBuffer>，拷贝即共享，零成本
+            std::vector<GpuTensor> gpu_inputs;
+            gpu_inputs.reserve(inputs.size());
+            for (const auto& t : inputs)
+            {
+                auto g = ensure_gpu(t);
+                if (!g) return std::unexpected(g.error());
+                gpu_inputs.push_back(g->gpu_tensor());
+            }
+            auto out = backend_.run_fused_gpu(
+                inst.name, gpu_inputs, spec.consts, rows, cols);
+            if (!out) return std::unexpected(out.error());
+            return Tensor::from_gpu(std::move(*out));
+        }
+
+        // ── 未命中：回退 eager lowering（拆分为原语调用） ──────────────
         return run_expr_eager(*this, spec, inputs, rows, cols);
     }
 

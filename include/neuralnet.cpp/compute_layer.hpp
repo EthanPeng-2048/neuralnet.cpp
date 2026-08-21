@@ -952,28 +952,32 @@ private:
     Tensor cos_cache_;             // (d_k, seq_cached_)
     Tensor sin_cache_;             // (d_k, seq_cached_)
 
+    // 把单个位置 pos 的 cos/sin 写入指定列（rebuild/apply_step 共用）。
+    // LLaMA 式：cos 沿 d 维 = cat(freqs, freqs)（前后半相同），
+    // 配合 rotate_half（前后半交换+前半取负）构成 2×2 旋转块。
+    void fill_pos_column_(Matrix& c, Matrix& s, std::size_t pos, std::size_t col) const
+    {
+        const std::size_t half = d_k_ / 2;
+        const Scalar pd = static_cast<Scalar>(pos);
+        for (std::size_t j = 0; j < half; ++j)
+        {
+            const Scalar theta = pd / std::pow(Scalar{10000},
+                static_cast<Scalar>(2 * j) / static_cast<Scalar>(d_k_));
+            const Scalar cv = std::cos(theta);
+            const Scalar sv = std::sin(theta);
+            c.set_value_unchecked(j,        col, cv);
+            c.set_value_unchecked(half + j, col, cv);
+            s.set_value_unchecked(j,        col, sv);
+            s.set_value_unchecked(half + j, col, sv);
+        }
+    }
+
     // 重建全表 (d_k, seq)：cos/sin 按维度对交错重复
     void rebuild(ComputeEngine& engine, std::size_t seq)
     {
         Matrix c(d_k_, seq), s(d_k_, seq);
-        const std::size_t half = d_k_ / 2;
         for (std::size_t pos = 0; pos < seq; ++pos)
-        {
-            const Scalar pd = static_cast<Scalar>(pos);
-            for (std::size_t j = 0; j < half; ++j)
-            {
-                const Scalar theta = pd / std::pow(Scalar{10000},
-                    static_cast<Scalar>(2 * j) / static_cast<Scalar>(d_k_));
-                const Scalar cv = std::cos(theta);
-                const Scalar sv = std::sin(theta);
-                // LLaMA 式：cos 沿 d 维 = cat(freqs, freqs)（前后半相同），
-                // 配合 rotate_half（前后半交换+前半取负）构成 2×2 旋转块。
-                c.set_value_unchecked(j,        pos, cv);
-                c.set_value_unchecked(half + j, pos, cv);
-                s.set_value_unchecked(j,        pos, sv);
-                s.set_value_unchecked(half + j, pos, sv);
-            }
-        }
+            fill_pos_column_(c, s, pos, pos);
         auto cr = engine.from_matrix(c);
         NN_ASSERT(cr, cr ? "" : cr.error().message.c_str());
         cos_cache_ = std::move(*cr);
@@ -1020,19 +1024,7 @@ public:
         if (d_k_ == 0 || d_k_ % 2 != 0)
             return std::unexpected(Error{"RotaryEmbedding::apply_step: d_k must be positive and even"});
         Matrix c(d_k_, 1), s(d_k_, 1);
-        const std::size_t half = d_k_ / 2;
-        const Scalar pd = static_cast<Scalar>(pos);
-        for (std::size_t j = 0; j < half; ++j)
-        {
-            const Scalar theta = pd / std::pow(Scalar{10000},
-                static_cast<Scalar>(2 * j) / static_cast<Scalar>(d_k_));
-            const Scalar cv = std::cos(theta);
-            const Scalar sv = std::sin(theta);
-            c.set_value_unchecked(j,        0, cv);
-            c.set_value_unchecked(half + j, 0, cv);
-            s.set_value_unchecked(j,        0, sv);
-            s.set_value_unchecked(half + j, 0, sv);
-        }
+        fill_pos_column_(c, s, pos, 0);
         auto cr = engine.from_matrix(c);
         if (!cr) return std::unexpected(cr.error());
         auto sr = engine.from_matrix(s);
@@ -1049,7 +1041,7 @@ public:
 //
 // 提取 MultiHeadAttention 与 CausalSelfAttention 的公共逻辑：
 //   - 完全相同的成员变量、参数/梯度接口
-//   - forward/backward 仅在「scale 之后、softmax 之前」是否施加掩码上有差异
+//   - forward/backward 仅在「scores 之后、softmax 之前」是否施加掩码上有差异
 //
 // 算法（只在此处，不在 Engine/Shader）：
 //   Q = W_q × x, K = W_k × x, V = W_v × x  (三个 Linear 投影)
@@ -1059,8 +1051,8 @@ public:
 //   使 batched_matmul 能按 batch*H 切分行块，单次 dispatch 处理所有样本和所有头。
 //
 //   Q_re = rearrange_3d(Q, H*d_k, batch, seq) → (batch*H*d_k, seq)
-//   S = batched_matmul(Q_re, K_re, batch*H, transA=true) → (batch*H*seq, seq)
-//   S *= scale
+//   S = batched_matmul(Q_re, K_re, batch*H, transA=true, alpha=scale) → (batch*H*seq, seq)
+//     （scale = 1/sqrt(d_k) 通过 matmul 的 alpha 系数折进写出，省去独立 scale pass）
 //   S = apply_mask_(S)         ← 子类钩子（默认 no-op = MHA 行为）
 //   A = softmax(S)  — 行级归一化，堆叠布局下天然正确
 //   O_re = batched_matmul(V_re, A, batch*H) → (batch*H*d_k, seq)
@@ -1095,7 +1087,7 @@ protected:
     Tensor attn_cache_;                    // (batch*H*seq, seq)
 
     // 掩码钩子：子类重写以施加掩码，默认 no-op（MHA 行为）
-    // 在 forward 中 scale 之后、softmax 之前调用
+    // 在 forward 中 scores（已含 alpha=scale 缩放）之后、softmax 之前调用
     [[nodiscard]] virtual Result<Tensor> apply_mask_(
         ComputeEngine& engine, Tensor&& scores,
         std::size_t batch, std::size_t seq)
@@ -1221,16 +1213,14 @@ public:
         }
 
         // 3. S = batched_matmul(Q_re, K_re, batch*H, transA=true) → (batch*H*seq, seq)
+        //    scale (1/sqrt(d_k)) 通过 alpha 系数折进 matmul 写出（cuBLAS sgemm 语义），
+        //    省去一次全矩阵 scale pass + 额外 barrier
         const std::size_t BH = batch * num_heads_;
         auto scores = engine.batched_matmul(
-            Q_cache_, K_cache_, BH, true, false);
+            Q_cache_, K_cache_, BH, true, false, scale_);
         if (!scores) return std::unexpected(scores.error());
 
-        // 4. S *= scale
-        auto r = engine.scale_inplace(*scores, scale_);
-        if (!r) return std::unexpected(r.error());
-
-        // 5. 施加掩码（钩子：MHA 默认 no-op，CSA 施加因果/ALiBi 掩码）
+        // 4. 施加掩码（钩子：MHA 默认 no-op，CSA 施加因果/ALiBi 掩码）
         auto masked = apply_mask_(engine, std::move(*scores), batch, seq);
         if (!masked) return std::unexpected(masked.error());
 
@@ -1307,18 +1297,17 @@ public:
         if (!grad_S) return std::unexpected(grad_S.error());
 
         // 6. grad_Q_re = batched_matmul(K, grad_S, BH, false, true) × scale
+        //    前向 S = scale·Q^T·K → ∂L/∂Q = scale·K·grad_S^T，
+        //    scale 通过 alpha 折进 matmul 写出（省去两次全矩阵 scale pass）
         auto grad_Q_re = engine.batched_matmul(
-            K_cache_, *grad_S, BH, false, true);
+            K_cache_, *grad_S, BH, false, true, scale_);
         if (!grad_Q_re) return std::unexpected(grad_Q_re.error());
-        auto rq = engine.scale_inplace(*grad_Q_re, scale_);
-        if (!rq) return std::unexpected(rq.error());
 
         // 7. grad_K_re = batched_matmul(Q, grad_S, BH, false, false) × scale
+        //    ∂L/∂K = scale·Q·grad_S，同样折进 alpha
         auto grad_K_re = engine.batched_matmul(
-            Q_cache_, *grad_S, BH, false, false);
+            Q_cache_, *grad_S, BH, false, false, scale_);
         if (!grad_K_re) return std::unexpected(grad_K_re.error());
-        auto rk = engine.scale_inplace(*grad_K_re, scale_);
-        if (!rk) return std::unexpected(rk.error());
 
         // 7.5 RoPE backward：对 Q/K 梯度施加反角旋转
         //    （forward 的旋转矩阵正交，逆 = 转置 = 反角：grad*cos − rot(grad)*sin）
@@ -1444,15 +1433,12 @@ public:
         //    K_T: (H*d_k, new_len) — 每头 (d_k, new_len)，transB=F，N=new_len
         //    每头: (1, d_k) × (d_k, new_len) = (1, new_len)
         //    堆叠: (H, new_len)
+        //    scale (1/sqrt(d_k)) 通过 alpha 折进 matmul 写出
         auto scores = engine.batched_matmul(
-            *q_res, *K_T, num_heads_, true, false);
+            *q_res, *K_T, num_heads_, true, false, scale_);
         if (!scores) return std::unexpected(scores.error());
 
-        // 6. scores *= scale
-        auto rs = engine.scale_inplace(*scores, scale_);
-        if (!rs) return std::unexpected(rs.error());
-
-        // 6.5 施加增量推理掩码钩子（默认 no-op；ALiBi 施加线性偏置）
+        // 6. 施加增量推理掩码钩子（默认 no-op；ALiBi 施加线性偏置）
         auto masked = apply_mask_step_(engine, std::move(*scores), cur_len);
         if (!masked) return std::unexpected(masked.error());
 
@@ -1669,7 +1655,6 @@ private:
     FeedForward ff_;
     LayerNorm norm2_;
 
-    Tensor residual1_cache_;
     Tensor residual2_cache_;
 
 public:
@@ -1708,8 +1693,6 @@ public:
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
-        residual1_cache_ = input;
-
         // x1 = LN₁(input)
         auto n1 = norm1_.forward(engine, input);
         if (!n1) return n1;
@@ -2046,9 +2029,14 @@ public:
 // use_alibi 时，在允许注意的位置叠加 ALiBi 线性偏置 -m_h*(i-j)。
 [[nodiscard]] Matrix build_attention_mask(
     std::size_t batch, std::size_t seq_len, std::size_t num_heads,
-    bool use_alibi, const std::vector<Scalar>& slopes,
-    const std::vector<std::size_t>* doc_ids)
+    bool use_alibi, std::span<const Scalar> slopes,
+    std::span<const std::size_t> doc_ids = {})
 {
+    NN_ASSERT(!use_alibi || slopes.size() >= num_heads,
+              "build_attention_mask: slopes too small for num_heads");
+    NN_ASSERT(doc_ids.empty() || doc_ids.size() >= batch * seq_len,
+              "build_attention_mask: doc_ids too small for batch*seq_len");
+
     const Scalar neg_inf = -std::numeric_limits<Scalar>::infinity();
     const std::size_t BH = batch * num_heads;
     Matrix mask(BH * seq_len, seq_len);
@@ -2064,11 +2052,11 @@ public:
                 for (std::size_t j = 0; j < seq_len; ++j)
                 {
                     bool allowed = (j <= i);
-                    if (allowed && doc_ids != nullptr)
+                    if (allowed && !doc_ids.empty())
                     {
                         // 块对角文档感知：仅同文档内的因果位置可注意
-                        allowed = (doc_ids->at(b * seq_len + i)
-                                   == doc_ids->at(b * seq_len + j));
+                        allowed = (doc_ids[b * seq_len + i]
+                                   == doc_ids[b * seq_len + j]);
                     }
                     if (allowed)
                     {
@@ -2149,9 +2137,9 @@ private:
         if (mask_cached_batch_ == batch && mask_cached_seq_ == seq_len)
             return;
 
-        // 纯因果掩码：委托 build_attention_mask（doc_ids = nullptr）
+        // 纯因果掩码：委托 build_attention_mask（doc_ids 为空）
         auto mask = build_attention_mask(batch, seq_len, num_heads_,
-                                         use_alibi_, slopes_, nullptr);
+                                         use_alibi_, slopes_);
         auto r = engine.from_matrix(mask);
         NN_ASSERT(r, r ? "" : r.error().message.c_str());
         mask_cache_ = std::move(*r);
@@ -2185,7 +2173,7 @@ protected:
             // 文档感知：doc_ids_ 每 batch 变化，掩码不可缓存，每步重建
             // 块对角（跨文档 -inf）∧ 因果（同文档内未来 -inf）
             auto m = build_attention_mask(batch, seq, num_heads_,
-                                          use_alibi_, slopes_, &doc_ids_);
+                                          use_alibi_, slopes_, doc_ids_);
             auto mt = engine.from_matrix(m);
             if (!mt) return std::unexpected(mt.error());
             return engine.elementwise_binary(BinaryOp::Add, scores, *mt);
@@ -2253,7 +2241,6 @@ private:
     FeedForward ff_;
     std::unique_ptr<Layer> norm2_;
 
-    Tensor residual1_cache_;
     Tensor residual2_cache_;
 
 public:
@@ -2302,8 +2289,6 @@ public:
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
-        residual1_cache_ = input;
-
         auto n1 = norm1_->forward(engine, input);
         if (!n1) return n1;
 
@@ -2411,8 +2396,6 @@ private:
     Linear lm_head_;
 
     // 反向缓存
-    Tensor stored_x_;                      // forward 输入 (d_model, seq*batch)
-    std::vector<std::size_t> stored_tokens_flat_;  // 所有 token IDs (seq*batch)
     Tensor stored_tokens_tensor_;          // token IDs 的 Tensor 版本 (total, 1)
     std::size_t batch_size_ = 0;
 
@@ -2604,8 +2587,6 @@ public:
             // ALiBi 模式：不使用位置嵌入，直接使用 token embedding
             x_result = std::move(*all_T);
         }
-        stored_x_ = x_result;  // 缓存供 backward（GPTBlock 内部也有自己的缓存）
-
         // ── 4. 通过 Transformer 块（全批量化，无 per-sample 循环） ──
         Tensor x = std::move(x_result);
         for (std::size_t bi = 0; bi < blocks_.size(); ++bi)
@@ -2797,20 +2778,31 @@ public:
             v_caches.push_back(engine.create_tensor(seq_len_, d_model_));
         }
 
-        // ── prefill: 逐 token 填充 KV cache，保留最后 logits ──────────
-        // 截断到 seq_len_ 长度（滑动窗口初始）
+        // ── prefill: 截断到 seq_len_ 长度（滑动窗口初始） ──────────────
         std::size_t start_init = 0;
         if (context.size() > seq_len_)
             start_init = context.size() - seq_len_;
         std::size_t cur_len = 0;
         Tensor last_logits_t;
-        for (std::size_t i = start_init; i < context.size(); ++i)
+
+        // ── 逐 token 填充 KV cache（prefill 与滑动窗口重建共用） ──────
+        // 从 context[start..end) 逐个 forward_step，更新 cur_len 与 last_logits_t
+        auto fill_cache_ = [&](std::size_t start) -> Result<void>
         {
-            auto r = forward_step(engine, context[i], cur_len,
-                                  k_caches, v_caches, cur_len);
+            for (std::size_t i = start; i < context.size(); ++i)
+            {
+                auto r = forward_step(engine, context[i], cur_len,
+                                      k_caches, v_caches, cur_len);
+                if (!r) return std::unexpected(r.error());
+                last_logits_t = *r;
+                ++cur_len;
+            }
+            return {};
+        };
+
+        {
+            auto r = fill_cache_(start_init);
             if (!r) return std::unexpected(r.error());
-            last_logits_t = *r;
-            ++cur_len;
         }
 
         for (std::size_t step = 0; step < max_new_tokens; ++step)
@@ -2821,16 +2813,10 @@ public:
                 for (auto& kc : k_caches) { auto r = engine.zero(kc); if (!r) return std::unexpected(r.error()); }
                 for (auto& vc : v_caches) { auto r = engine.zero(vc); if (!r) return std::unexpected(r.error()); }
                 cur_len = 0;
-                std::size_t keep = seq_len_ - 1;
-                std::size_t start_new = (context.size() > keep) ? (context.size() - keep) : 0;
-                for (std::size_t i = start_new; i < context.size(); ++i)
-                {
-                    auto r = forward_step(engine, context[i], cur_len,
-                                          k_caches, v_caches, cur_len);
-                    if (!r) return std::unexpected(r.error());
-                    last_logits_t = *r;
-                    ++cur_len;
-                }
+                const std::size_t keep = seq_len_ - 1;
+                const std::size_t start_new = (context.size() > keep) ? (context.size() - keep) : 0;
+                auto r = fill_cache_(start_new);
+                if (!r) return std::unexpected(r.error());
             }
 
             // Sample from last_logits_t (from prefill or previous step)

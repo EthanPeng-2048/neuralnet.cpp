@@ -327,10 +327,12 @@ public:
     }
 
     // ── 批量矩阵乘法：按 batch 切分行块，逐 batch 矩阵乘 ──
+    // C_b = alpha * op(A_b, B_b)（alpha 为 cuBLAS sgemm 语义的输出缩放系数）
     [[nodiscard]] Result<Tensor> batched_matmul(
         const Tensor& A, const Tensor& B,
         std::size_t batch,
-        bool transA, bool transB) override
+        bool transA, bool transB,
+        Scalar alpha) override
     {
         if (A.is_gpu() || B.is_gpu())
             return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
@@ -399,6 +401,14 @@ public:
                 a_t.multiply_transposed_to(c_part, b_view);
                 std::copy_n(c_part.span().begin(), M * N, c_sub.begin());
             }
+        }
+
+        // 输出缩放：C_b = alpha * op(A_b, B_b)（alpha==1 时零开销跳过）
+        if (alpha != Scalar{1})
+        {
+            auto dst = result.span();
+            for (std::size_t i = 0; i < dst.size(); ++i)
+                dst[i] *= alpha;
         }
 
         return Tensor::from_matrix(std::move(result));

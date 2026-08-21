@@ -206,7 +206,8 @@ public:
     [[nodiscard]] Result<Tensor> batched_matmul(
         const Tensor& A, const Tensor& B,
         std::size_t batch,
-        bool transA, bool transB) override
+        bool transA, bool transB,
+        Scalar alpha) override
     {
         auto a_gpu = ensure_cuda(A);
         if (!a_gpu) return std::unexpected(a_gpu.error());
@@ -217,7 +218,14 @@ public:
             static_cast<uint32_t>(batch),
             transA ? 1u : 0u, transB ? 1u : 0u);
         if (!r) return std::unexpected(r.error());
-        return Tensor::from_cuda(std::move(*r));
+        Tensor out = Tensor::from_cuda(std::move(*r));
+        // CUDA kernel 暂无 alpha 参数：alpha != 1 时原地后缩放
+        if (alpha != Scalar{1})
+        {
+            auto s = scale_inplace(out, alpha);
+            if (!s) return std::unexpected(s.error());
+        }
+        return out;
     }
 
     // A += B

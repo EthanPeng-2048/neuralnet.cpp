@@ -125,6 +125,32 @@ class CrossEntropyLoss final : public Loss
 private:
     Tensor grad_input_;
 
+    // ── 按列 softmax（dense/sparse forward 共用）──────────────────────
+    // col_max → shifted = logits - col_max → exp → col_sum → softmax
+    // 返回 (classes, batch) 的 softmax 张量
+    [[nodiscard]] static Result<Tensor> softmax_cols_(
+        ComputeEngine& engine, const Tensor& logits)
+    {
+        auto col_max = engine.col_reduce_max(logits);
+        if (!col_max) return std::unexpected(col_max.error());
+
+        auto shifted = clone_tensor(engine, logits);
+        if (!shifted) return std::unexpected(shifted.error());
+        auto r = engine.broadcast_col_inplace(*shifted, *col_max, BinaryOp::Sub);
+        if (!r) return std::unexpected(r.error());
+
+        auto exp_shift = engine.elementwise_unary(UnaryOp::Exp, *shifted);
+        if (!exp_shift) return std::unexpected(exp_shift.error());
+
+        auto col_sum = engine.col_reduce_sum(*exp_shift);
+        if (!col_sum) return std::unexpected(col_sum.error());
+
+        // softmax 就地于 exp_shift 上，省一次 (classes, batch) 分配
+        r = engine.broadcast_col_inplace(*exp_shift, *col_sum, BinaryOp::Div);
+        if (!r) return std::unexpected(r.error());
+        return exp_shift;
+    }
+
 public:
     CrossEntropyLoss() = default;
 
@@ -139,55 +165,37 @@ public:
         if (classes == 0 || batch == 0)
             return std::unexpected(Error{"cross_entropy loss: empty input"});
 
-        // 1. col_max = max per column (数值稳定)
-        auto col_max = engine.col_reduce_max(logits);
-        if (!col_max) return std::unexpected(col_max.error());
-
-        // 2. shifted = logits - col_max (broadcast_col Sub) — 深拷贝 logits
-        auto shifted = clone_tensor(engine, logits);
-        if (!shifted) return std::unexpected(shifted.error());
-        auto r = engine.broadcast_col_inplace(*shifted, *col_max, BinaryOp::Sub);
-        if (!r) return std::unexpected(r.error());
-
-        // 3. exp_shift = exp(shifted)
-        auto exp_shift = engine.elementwise_unary(UnaryOp::Exp, *shifted);
-        if (!exp_shift) return std::unexpected(exp_shift.error());
-
-        // 4. col_sum = Σ_c exp_shift[c][i]
-        auto col_sum = engine.col_reduce_sum(*exp_shift);
-        if (!col_sum) return std::unexpected(col_sum.error());
-
-        // 5. softmax = exp_shift / col_sum (broadcast_col Div) — 深拷贝 exp_shift
-        auto softmax = clone_tensor(engine, *exp_shift);
+        // 1. softmax = softmax_cols(logits)（与 sparse 路径共用）
+        auto softmax = softmax_cols_(engine, logits);
         if (!softmax) return std::unexpected(softmax.error());
-        r = engine.broadcast_col_inplace(*softmax, *col_sum, BinaryOp::Div);
-        if (!r) return std::unexpected(r.error());
 
-        // 6. grad = softmax - target (elementwise Sub)
+        // 2. grad = (softmax - target) / batch (elementwise Sub + scale)
+        //    loss = -(1/batch) * Σ target * log_softmax，故
+        //    d(loss)/d(logits) = (softmax - one_hot) / batch。
+        //    缺少 1/batch 缩放会使 SGD/动量、梯度裁剪与 PyTorch 不一致
+        //    （Adam 的二阶矩会抵消常数缩放，但其他优化器不会）。
         auto grad = engine.elementwise_binary(BinaryOp::Sub, *softmax, target);
         if (!grad) return std::unexpected(grad.error());
+        auto rg = engine.scale_inplace(*grad, Scalar{1} / static_cast<Scalar>(batch));
+        if (!rg) return std::unexpected(rg.error());
         grad_input_ = *grad;
 
-        // 7. log_softmax = shifted - log(col_sum)
-        auto log_col_sum = engine.elementwise_unary(UnaryOp::Log, *col_sum);
-        if (!log_col_sum) return std::unexpected(log_col_sum.error());
-
-        auto log_softmax = clone_tensor(engine, *shifted);
+        // 3. log_softmax = log(softmax)
+        //    数学上等价于 shifted - log(col_sum)，少一次 clone + broadcast
+        auto log_softmax = engine.elementwise_unary(UnaryOp::Log, *softmax);
         if (!log_softmax) return std::unexpected(log_softmax.error());
-        r = engine.broadcast_col_inplace(*log_softmax, *log_col_sum, BinaryOp::Sub);
-        if (!r) return std::unexpected(r.error());
 
-        // 8. target_dot_log = target * log_softmax
+        // 4. target_dot_log = target * log_softmax
         auto target_dot_log = engine.elementwise_binary(BinaryOp::Mul, target, *log_softmax);
         if (!target_dot_log) return std::unexpected(target_dot_log.error());
 
-        // 9. Σ target * log_softmax (先列归约再行归约 → (1,1))
+        // 5. Σ target * log_softmax (先列归约再行归约 → (1,1))
         auto col_s = engine.col_reduce_sum(*target_dot_log);
         if (!col_s) return std::unexpected(col_s.error());
         auto total_t = engine.row_reduce_sum(*col_s);
         if (!total_t) return std::unexpected(total_t.error());
 
-        // 10. loss = -total / batch — 下载标量
+        // 6. loss = -total / batch — 下载标量
         auto m = engine.to_matrix(*total_t);
         if (!m) return std::unexpected(m.error());
 
@@ -233,31 +241,16 @@ public:
         if (classes == 0 || total == 0)
             return std::unexpected(Error{"sparse CE: empty input"});
 
-        // ── 1. GPU 上计算 softmax（复用原 dense forward 的逻辑） ────
-        auto col_max = engine.col_reduce_max(logits);
-        if (!col_max) return std::unexpected(col_max.error());
-
-        auto shifted = clone_tensor(engine, logits);
-        if (!shifted) return std::unexpected(shifted.error());
-        auto r = engine.broadcast_col_inplace(*shifted, *col_max, BinaryOp::Sub);
-        if (!r) return std::unexpected(r.error());
-
-        auto exp_shift = engine.elementwise_unary(UnaryOp::Exp, *shifted);
-        if (!exp_shift) return std::unexpected(exp_shift.error());
-
-        auto col_sum = engine.col_reduce_sum(*exp_shift);
-        if (!col_sum) return std::unexpected(col_sum.error());
-
-        // softmax in-place 于 exp_shift 上，省一次 (vocab, total) 分配
-        r = engine.broadcast_col_inplace(*exp_shift, *col_sum, BinaryOp::Div);
-        if (!r) return std::unexpected(r.error());
+        // ── 1. GPU 上计算 softmax（与 dense forward 共用 softmax_cols_） ──
+        auto softmax_t = softmax_cols_(engine, logits);
+        if (!softmax_t) return std::unexpected(softmax_t.error());
 
         // ── 2. 下载 softmax 到 CPU ────────────────────────────────
-        auto softmax_cpu = engine.to_matrix(*exp_shift);
+        auto softmax_cpu = engine.to_matrix(*softmax_t);
         if (!softmax_cpu) return std::unexpected(softmax_cpu.error());
 
-        // exp_shift (即 softmax) 现在可以释放
-        exp_shift = Tensor();
+        // softmax_t 现在可以释放
+        softmax_t = Tensor();
 
         // ── 3. CPU 上计算 loss 和 gradient ────────────────────────
         const std::size_t rows = softmax_cpu->rows();
@@ -315,12 +308,8 @@ public:
         if (num_valid > 0)
         {
             const Scalar inv_num_valid = Scalar{1} / static_cast<Scalar>(num_valid);
-            for (std::size_t c = 0; c < rows; ++c)
-                for (std::size_t i = 0; i < cols; ++i)
-                {
-                    const Scalar g = grad_cpu.at_unchecked(c, i) * inv_num_valid;
-                    grad_cpu.set_value_unchecked(c, i, g);
-                }
+            auto grad_span = grad_cpu.span();
+            for (auto& val : grad_span) val *= inv_num_valid;
         }
 
         // ── 4. 上传 gradient 到 GPU ──────────────────────────────
