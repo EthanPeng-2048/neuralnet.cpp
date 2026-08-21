@@ -31,6 +31,7 @@
 #include "tensor.hpp"
 #include "model_spec.hpp"
 #include "fused_exprs.hpp"
+#include "expr_dsl.hpp"
 
 namespace nn
 {
@@ -429,55 +430,14 @@ public:
         const std::size_t rows = d_ff_;
         const std::size_t cols = grad_output.cols();
 
-        // ── expr1: grad_gate = grad_out ⊙ up ⊙ factor ──
-        ExprSpec spec1;
-        spec1.views = {expr::linear(), expr::linear(), expr::linear(), expr::linear()};
-        spec1.num_regs = 6;
-        spec1.consts = {Scalar{1}};
-
-        ExprInstr j0, j1, j2, j3, j4, j5;
-        // r0 = 1 − s
-        j0.op = static_cast<uint8_t>(ExprOp::Sub);
-        j0.dst = 0; j0.a = expr::cst(0); j0.b = expr::input(1);
-        // r1 = gate * (1−s)
-        j1.op = static_cast<uint8_t>(ExprOp::Mul);
-        j1.dst = 1; j1.a = expr::input(2); j1.b = expr::fanout(0);
-        // r2 = 1 + r1
-        j2.op = static_cast<uint8_t>(ExprOp::Add);
-        j2.dst = 2; j2.a = expr::cst(0); j2.b = expr::fanout(1);
-        // r3 = s * r2 = factor
-        j3.op = static_cast<uint8_t>(ExprOp::Mul);
-        j3.dst = 3; j3.a = expr::input(1); j3.b = expr::fanout(2);
-        // r4 = up * factor
-        j4.op = static_cast<uint8_t>(ExprOp::Mul);
-        j4.dst = 4; j4.a = expr::input(3); j4.b = expr::fanout(3);
-        // r5 = grad_out * (up * factor) = grad_gate
-        j5.op = static_cast<uint8_t>(ExprOp::Mul);
-        j5.dst = 5; j5.a = expr::input(0); j5.b = expr::fanout(4);
-
-        spec1.instrs = {j0, j1, j2, j3, j4, j5};
-
-        std::vector<Tensor> inputs1 = {grad_output, sigmoid_cache_, gate_cache_, up_cache_};
-        auto grad_gate = engine.eval_expr(spec1, inputs1, rows, cols);
+        // ── 统一表达式 DSL（编译期融合；CPU 单次遍历 + SIMD）──
+        //   grad_gate = grad_out ⊙ up ⊙ s ⊙ (1 + gate ⊙ (1 − s))
+        //   grad_up   = grad_out ⊙ gate ⊙ s
+        auto grad_gate = dsl::compute(engine, dsl::make_swiglu_grad_gate(
+            grad_output, sigmoid_cache_, gate_cache_, up_cache_), rows, cols);
         if (!grad_gate) return std::unexpected(grad_gate.error());
-
-        // ── expr2: grad_up = grad_out ⊙ gate ⊙ sigmoid ──
-        ExprSpec spec2;
-        spec2.views = {expr::linear(), expr::linear(), expr::linear()};
-        spec2.num_regs = 2;
-
-        ExprInstr k0, k1;
-        // r0 = grad_out * gate
-        k0.op = static_cast<uint8_t>(ExprOp::Mul);
-        k0.dst = 0; k0.a = expr::input(0); k0.b = expr::input(2);
-        // r1 = r0 * sigmoid = grad_up
-        k1.op = static_cast<uint8_t>(ExprOp::Mul);
-        k1.dst = 1; k1.a = expr::fanout(0); k1.b = expr::input(1);
-
-        spec2.instrs = {k0, k1};
-
-        std::vector<Tensor> inputs2 = {grad_output, sigmoid_cache_, gate_cache_};
-        auto grad_up = engine.eval_expr(spec2, inputs2, rows, cols);
+        auto grad_up = dsl::compute(engine, dsl::make_swiglu_grad_up(
+            grad_output, sigmoid_cache_, gate_cache_), rows, cols);
         if (!grad_up) return std::unexpected(grad_up.error());
 
         // 合并：grad_input = (grad_gate; grad_up) → (2*d_ff, batch)
@@ -1010,10 +970,10 @@ public:
             return std::unexpected(Error{"RotaryEmbedding::apply: d_k must be positive and even"});
         if (seq != seq_cached_)
             rebuild(engine, seq);
-        std::vector<Tensor> inputs = {q, q, cos_cache_, sin_cache_};
-        return engine.eval_expr(
-            nn::fused::make_rope(static_cast<std::uint32_t>(d_k_), backward),
-            inputs, q.rows(), q.cols());
+        const std::uint32_t dk = static_cast<std::uint32_t>(d_k_);
+        if (backward)
+            return dsl::compute(engine, dsl::make_rope<true>(q, cos_cache_, sin_cache_, dk), q.rows(), q.cols());
+        return dsl::compute(engine, dsl::make_rope<false>(q, cos_cache_, sin_cache_, dk), q.rows(), q.cols());
     }
 
     // 增量推理：q 为 (H*d_k, 1)，位置 = pos（cur_len）
@@ -1029,10 +989,10 @@ public:
         if (!cr) return std::unexpected(cr.error());
         auto sr = engine.from_matrix(s);
         if (!sr) return std::unexpected(sr.error());
-        std::vector<Tensor> inputs = {q, q, *cr, *sr};
-        return engine.eval_expr(
-            nn::fused::make_rope(static_cast<std::uint32_t>(d_k_), backward),
-            inputs, q.rows(), q.cols());
+        const std::uint32_t dk = static_cast<std::uint32_t>(d_k_);
+        if (backward)
+            return dsl::compute(engine, dsl::make_rope<true>(q, *cr, *sr, dk), q.rows(), q.cols());
+        return dsl::compute(engine, dsl::make_rope<false>(q, *cr, *sr, dk), q.rows(), q.cols());
     }
 };
 

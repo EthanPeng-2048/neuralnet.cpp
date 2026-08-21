@@ -121,6 +121,14 @@
 #include "rope_backward_dk128_spv.hpp"
 #define NN_ROPE_BACKWARD_DK128_SPV_EMBEDDED
 #endif
+#if __has_include("swiglu_grad_gate_spv.hpp")
+#include "swiglu_grad_gate_spv.hpp"
+#define NN_SWIGLU_GRAD_GATE_SPV_EMBEDDED
+#endif
+#if __has_include("swiglu_grad_up_spv.hpp")
+#include "swiglu_grad_up_spv.hpp"
+#define NN_SWIGLU_GRAD_UP_SPV_EMBEDDED
+#endif
 
 #include "../fused_exprs.hpp"
 
@@ -828,6 +836,12 @@ private:
 #endif
 #ifdef NN_ROPE_BACKWARD_DK128_SPV_EMBEDDED
         if (name == "rope_backward_dk128") return nn_rope_backward_dk128_spirv_bytecode();
+#endif
+#ifdef NN_SWIGLU_GRAD_GATE_SPV_EMBEDDED
+        if (name == "swiglu_grad_gate") return nn_swiglu_grad_gate_spirv_bytecode();
+#endif
+#ifdef NN_SWIGLU_GRAD_UP_SPV_EMBEDDED
+        if (name == "swiglu_grad_up") return nn_swiglu_grad_up_spirv_bytecode();
 #endif
         static const std::vector<uint32_t> empty;
         return empty;
@@ -2469,6 +2483,11 @@ public:
         if (consts.size() > EXPR_MAX_CONSTS)
             return std::unexpected(Error{"run_fused_gpu: too many constants"});
 
+        // count 以 uint32 传入 shader（gl_GlobalInvocationID / push constant），
+        // 必须保证 rows*cols 不溢出 uint32，否则分派与索引会静默截断。
+        if (rows > 0 && cols > UINT32_MAX / rows)
+            return std::unexpected(Error{
+                "run_fused_gpu: rows*cols exceeds uint32 range"});
         const std::uint32_t count = static_cast<std::uint32_t>(rows * cols);
 
         // 1. 分配输出 Tensor

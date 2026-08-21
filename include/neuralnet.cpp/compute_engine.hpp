@@ -261,7 +261,7 @@ public:
     //
     // 这是"函数式逐元素原语"的表达式升级：单行内多次计算（如 RoPE 的
     // q*cos + rotate(q)*sin、残差、激活）可合并为一次调用，减少临时 Tensor。
-    // 执行策略由后端决定（CPU 融合解释器；Vulkan/CUDA v1 为 eager lowering），
+    // 执行策略由后端决定（CPU 编译期模板求值；Vulkan AOT 融合 shader，闭合世界），
     // Layer 侧无需关心——表达式是唯一逐元素编程模型。
     //
     // 语义与上限见 expr_spec.hpp（ExprSpec）。输出 = 最后一条指令的目标寄存器。

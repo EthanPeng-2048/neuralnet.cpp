@@ -28,7 +28,7 @@
 #include "tensor.hpp"
 #include "expr_spec.hpp"
 #include "compute_engine.hpp"
-#include "expr_eval.hpp"
+#include "expr_dsl.hpp"
 #include "cpu_engine.hpp"
 #ifdef NN_HAS_VULKAN
 #include "gpu_engine.hpp"

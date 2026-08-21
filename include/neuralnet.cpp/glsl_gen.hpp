@@ -150,6 +150,7 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
         case static_cast<uint8_t>(ExprOperandKind::Input):
             return "v" + std::to_string(op.idx);
         case static_cast<uint8_t>(ExprOperandKind::Reg):
+        case static_cast<uint8_t>(ExprOperandKind::Fanout):  // Fanout 语义同 Reg
             return "r" + std::to_string(op.idx);
         case static_cast<uint8_t>(ExprOperandKind::Const):
             return "c" + std::to_string(op.idx);

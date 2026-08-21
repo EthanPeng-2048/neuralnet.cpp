@@ -10,6 +10,7 @@
 #include <cmath>
 
 #include "config.hpp"
+#include "expr_spec.hpp"  // ExprOp（单一算子来源：ops 是唯一事实来源）
 
 namespace nn::ops
 {
@@ -21,21 +22,25 @@ namespace nn::ops
 struct Add
 {
     [[nodiscard]] static constexpr Scalar apply(Scalar a, Scalar b) noexcept { return a + b; }
+    static constexpr ExprOp op_id() noexcept { return ExprOp::Add; }
 };
 
 struct Sub
 {
     [[nodiscard]] static constexpr Scalar apply(Scalar a, Scalar b) noexcept { return a - b; }
+    static constexpr ExprOp op_id() noexcept { return ExprOp::Sub; }
 };
 
 struct Mul
 {
     [[nodiscard]] static constexpr Scalar apply(Scalar a, Scalar b) noexcept { return a * b; }
+    static constexpr ExprOp op_id() noexcept { return ExprOp::Mul; }
 };
 
 struct Div
 {
     [[nodiscard]] static constexpr Scalar apply(Scalar a, Scalar b) noexcept { return a / b; }
+    static constexpr ExprOp op_id() noexcept { return ExprOp::Div; }
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -45,32 +50,38 @@ struct Div
 struct Neg
 {
     [[nodiscard]] static constexpr Scalar apply(Scalar a) noexcept { return -a; }
+    static constexpr ExprOp op_id() noexcept { return ExprOp::Neg; }
 };
 
 struct Abs
 {
     [[nodiscard]] static Scalar apply(Scalar a) noexcept { return std::abs(a); }
+    static constexpr ExprOp op_id() noexcept { return ExprOp::Abs; }
 };
 
 struct Exp
 {
     [[nodiscard]] static Scalar apply(Scalar a) noexcept { return std::exp(a); }
+    static constexpr ExprOp op_id() noexcept { return ExprOp::Exp; }
 };
 
 struct Log
 {
     [[nodiscard]] static Scalar apply(Scalar a) noexcept { return std::log(a); }
+    static constexpr ExprOp op_id() noexcept { return ExprOp::Log; }
 };
 
 struct Sqrt
 {
     [[nodiscard]] static Scalar apply(Scalar a) noexcept { return std::sqrt(a); }
+    static constexpr ExprOp op_id() noexcept { return ExprOp::Sqrt; }
 };
 
 struct Rsqrt
 {
     /// 1/sqrt(x) —— LayerNorm 标准差倒数专用，单次调用避免除法
     [[nodiscard]] static Scalar apply(Scalar a) noexcept { return Scalar{1} / std::sqrt(a); }
+    static constexpr ExprOp op_id() noexcept { return ExprOp::Rsqrt; }
 };
 
 struct Sigmoid
@@ -96,6 +107,7 @@ struct Sigmoid
 struct Tanh
 {
     [[nodiscard]] static Scalar apply(Scalar a) noexcept { return std::tanh(a); }
+    static constexpr ExprOp op_id() noexcept { return ExprOp::Tanh; }
 };
 
 struct ReLU
@@ -110,31 +122,37 @@ struct ReLU
 struct Gt
 {
     [[nodiscard]] static constexpr bool apply(Scalar a, Scalar b) noexcept { return a > b; }
+    static constexpr ExprOp op_id() noexcept { return ExprOp::Gt; }
 };
 
 struct Lt
 {
     [[nodiscard]] static constexpr bool apply(Scalar a, Scalar b) noexcept { return a < b; }
+    static constexpr ExprOp op_id() noexcept { return ExprOp::Lt; }
 };
 
 struct Ge
 {
     [[nodiscard]] static constexpr bool apply(Scalar a, Scalar b) noexcept { return a >= b; }
+    static constexpr ExprOp op_id() noexcept { return ExprOp::Ge; }
 };
 
 struct Le
 {
     [[nodiscard]] static constexpr bool apply(Scalar a, Scalar b) noexcept { return a <= b; }
+    static constexpr ExprOp op_id() noexcept { return ExprOp::Le; }
 };
 
 struct Eq
 {
     [[nodiscard]] static constexpr bool apply(Scalar a, Scalar b) noexcept { return a == b; }
+    static constexpr ExprOp op_id() noexcept { return ExprOp::Eq; }
 };
 
 struct Ne
 {
     [[nodiscard]] static constexpr bool apply(Scalar a, Scalar b) noexcept { return a != b; }
+    static constexpr ExprOp op_id() noexcept { return ExprOp::Ne; }
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -144,11 +162,13 @@ struct Ne
 struct Max
 {
     [[nodiscard]] static constexpr Scalar apply(Scalar a, Scalar b) noexcept { return std::max(a, b); }
+    static constexpr ExprOp op_id() noexcept { return ExprOp::Max; }
 };
 
 struct Min
 {
     [[nodiscard]] static constexpr Scalar apply(Scalar a, Scalar b) noexcept { return std::min(a, b); }
+    static constexpr ExprOp op_id() noexcept { return ExprOp::Min; }
 };
 
 } // namespace nn::ops
