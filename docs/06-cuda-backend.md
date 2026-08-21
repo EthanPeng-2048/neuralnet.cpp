@@ -61,7 +61,7 @@ include/.../cuda_backend.hpp  (extern "C")     ◀──┘
 # 配置（启用 CUDA）
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNN_ENABLE_CUDA=ON
 
-# 可选：指定 SM 架构（默认 70 = V100）
+# 可选：指定 SM 架构（默认 50 = GTX 850M；V100 = 70）
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNN_ENABLE_CUDA=ON -DNN_CUDA_ARCH=80
 
 # 构建
@@ -73,7 +73,7 @@ cmake --build build --parallel
 | 选项 | 默认值 | 说明 |
 |------|--------|------|
 | `NN_ENABLE_CUDA` | `OFF` | 启用 CUDA GPU 加速 |
-| `NN_CUDA_ARCH` | `70` | SM 架构版本（70=V100, 80=A100, 86=RTX30xx, 89=RTX40xx） |
+| `NN_CUDA_ARCH` | `50` | SM 架构版本（50=GTX850M/Maxwell, 70=V100, 80=A100, 86=RTX30xx, 89=RTX40xx） |
 
 ---
 

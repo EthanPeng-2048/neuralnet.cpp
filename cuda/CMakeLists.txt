@@ -15,9 +15,10 @@
 # 查找 CUDA Toolkit
 find_package(CUDAToolkit REQUIRED)
 
-# 设置 SM 目标架构（V100 = sm_70）
+# 设置 SM 目标架构（当前开发机 GTX 850M = sm_50；V100 = sm_70）
+# 注意：Maxwell (GTX850M) 必须用 sm_50，sm_70 的 SASS 无法在其上运行。
 if(NOT DEFINED NN_CUDA_ARCH)
-    set(NN_CUDA_ARCH "70" CACHE STRING "CUDA SM architecture (e.g. 70, 80, 86, 89)")
+    set(NN_CUDA_ARCH "50" CACHE STRING "CUDA SM architecture (e.g. 50, 70, 80, 86, 89)")
 endif()
 
 if(WIN32)
