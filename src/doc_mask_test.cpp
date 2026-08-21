@@ -46,7 +46,7 @@ void check_row(const Matrix& m, std::size_t row,
 void test_causal()
 {
     const std::size_t B = 2, S = 4, H = 2;
-    auto m = nn::build_attention_mask(B, S, H, false, {}, nullptr);
+    auto m = nn::build_attention_mask(B, S, H, false, {});
     const Scalar neg_inf = -std::numeric_limits<Scalar>::infinity();
     for (std::size_t b = 0; b < B; ++b)
         for (std::size_t h = 0; h < H; ++h)
@@ -65,7 +65,7 @@ void test_block_diag()
 {
     const std::size_t S = 6;
     const std::vector<std::size_t> doc{0, 0, 1, 1, 1, 2};  // 3 篇文档
-    auto m = nn::build_attention_mask(1, S, 1, false, {}, &doc);
+    auto m = nn::build_attention_mask(1, S, 1, false, {}, doc);
     const Scalar neg_inf = -std::numeric_limits<Scalar>::infinity();
     for (std::size_t i = 0; i < S; ++i)
     {
@@ -82,7 +82,7 @@ void test_alibi()
 {
     const std::size_t S = 3;
     const std::vector<Scalar> slopes{1.0, 0.5};
-    auto m = nn::build_attention_mask(1, S, 2, true, slopes, nullptr);
+    auto m = nn::build_attention_mask(1, S, 2, true, slopes);
     const Scalar neg_inf = -std::numeric_limits<Scalar>::infinity();
     for (std::size_t h = 0; h < 2; ++h)
         for (std::size_t i = 0; i < S; ++i)
@@ -101,7 +101,7 @@ void test_block_diag_alibi()
     const std::size_t S = 4;
     const std::vector<std::size_t> doc{0, 0, 1, 1};
     const std::vector<Scalar> slopes{0.25};
-    auto m = nn::build_attention_mask(1, S, 1, true, slopes, &doc);
+    auto m = nn::build_attention_mask(1, S, 1, true, slopes, doc);
     const Scalar neg_inf = -std::numeric_limits<Scalar>::infinity();
     for (std::size_t i = 0; i < S; ++i)
     {

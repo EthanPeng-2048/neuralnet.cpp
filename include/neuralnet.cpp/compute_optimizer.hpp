@@ -22,6 +22,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "compute_engine.hpp"
@@ -308,6 +309,15 @@ protected:
         v_ = create_zero_buffers_();
     }
 
+    // 偏差修正系数（Adam/AdamW 共用）：给定下一步步数 t_next，
+    // 返回 {inv_bc1, inv_bc2}，其中 bc = 1 - β^t_next。
+    [[nodiscard]] std::pair<Scalar, Scalar> bias_correction_(std::size_t t_next) const
+    {
+        const Scalar bc1 = Scalar{1} - std::pow(beta1_, static_cast<Scalar>(t_next));
+        const Scalar bc2 = Scalar{1} - std::pow(beta2_, static_cast<Scalar>(t_next));
+        return {Scalar{1} / bc1, Scalar{1} / bc2};
+    }
+
 public:
     Adam(ComputeEngine& engine,
          std::vector<TensorRef> params,
@@ -330,10 +340,7 @@ public:
 
         // 偏差修正：每步只计算一次（而非每参数重复 pow）
         const std::size_t t_next = t_ + 1;
-        const Scalar bc1 = Scalar{1} - std::pow(beta1_, static_cast<Scalar>(t_next));
-        const Scalar bc2 = Scalar{1} - std::pow(beta2_, static_cast<Scalar>(t_next));
-        const Scalar inv_bc1 = Scalar{1} / bc1;
-        const Scalar inv_bc2 = Scalar{1} / bc2;
+        const auto [inv_bc1, inv_bc2] = bias_correction_(t_next);
 
         for (std::size_t i = 0; i < params_.size(); ++i)
         {
@@ -384,10 +391,7 @@ public:
 
         // 偏差修正：每步只计算一次（而非每参数重复 pow）
         const std::size_t t_next = t_ + 1;
-        const Scalar bc1 = Scalar{1} - std::pow(beta1_, static_cast<Scalar>(t_next));
-        const Scalar bc2 = Scalar{1} - std::pow(beta2_, static_cast<Scalar>(t_next));
-        const Scalar inv_bc1 = Scalar{1} / bc1;
-        const Scalar inv_bc2 = Scalar{1} / bc2;
+        const auto [inv_bc1, inv_bc2] = bias_correction_(t_next);
         const Scalar decay_factor = Scalar{1} - lr_ * wd_;
 
         for (std::size_t i = 0; i < params_.size(); ++i)
@@ -549,8 +553,7 @@ public:
             r = engine_.add_inplace(velocities_[i], g);
             if (!r) return std::unexpected(r.error());
 
-            // 确定用于正交化的更新方向
-            Tensor* update_ptr = nullptr;
+            // 确定用于正交化的更新方向（Nesterov 时需临时缓冲，否则直接用 v）
             std::optional<Tensor> nesterov_buf;
             if (nesterov_)
             {
@@ -561,18 +564,14 @@ public:
                 r = engine_.axpy_inplace(*buf, momentum_, velocities_[i]);
                 if (!r) return std::unexpected(r.error());
                 nesterov_buf = std::move(*buf);
-                update_ptr = &*nesterov_buf;
             }
-            else
-            {
-                update_ptr = &velocities_[i];
-            }
+            const Tensor& update = nesterov_buf ? *nesterov_buf : velocities_[i];
 
             // 2. Newton-Schulz 正交化（仅对 ≥2D 参数，即 rows > 1 且 cols > 1）
             if (params_[i].get().rows() > 1 && params_[i].get().cols() > 1)
             {
                 auto ortho_update = newton_schulz_orthogonalize(
-                    engine_, *update_ptr, ns_steps_, ns_eps_);
+                    engine_, update, ns_steps_, ns_eps_);
                 if (!ortho_update) return std::unexpected(ortho_update.error());
 
                 // 3. 参数更新: p -= lr * ortho_update（用 axpy_inplace 融合 scale+add）
@@ -582,7 +581,7 @@ public:
             else
             {
                 // 非 2D 参数（bias 等）：标准 SGD 更新（用 axpy_inplace 融合 scale+add）
-                r = engine_.axpy_inplace(params_[i], -lr_, *update_ptr);
+                r = engine_.axpy_inplace(params_[i], -lr_, update);
                 if (!r) return std::unexpected(r.error());
             }
         }

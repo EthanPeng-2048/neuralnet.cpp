@@ -163,17 +163,20 @@ public:
         const Tensor& A, const Tensor& B,
         bool transA = false, bool transB = false) = 0;
 
-    // 批量矩阵乘法：对每个 batch b 计算 C_b = op(A_b, B_b)，结果垂直堆叠
+    // 批量矩阵乘法：对每个 batch b 计算 C_b = alpha * op(A_b, B_b)，结果垂直堆叠
     // A: (batch * A_rows_per_batch, A_cols) — 按 batch 切分为连续行块
     // B: (batch * B_rows_per_batch, B_cols)
     // 输出: (batch * M, N)，M/N 为每个 batch 的逻辑输出维度
     //   transA=0: A_b 为 (M, K)，transA=1: A_b 存储为 (K, M) 按 A_b^T 使用
     //   transB=0: B_b 为 (K, N)，transB=1: B_b 存储为 (N, K) 按 B_b^T 使用
+    // alpha: 输出缩放系数（cuBLAS sgemm 语义），GPU 在 shader 写出时一次完成，
+    //   供上层折叠 1/sqrt(d_k) 等系数，省去额外全矩阵 scale pass
     // 典型用途：多头注意力的 Q^T×K 和 V×A 批量化（消除 per-head 循环）
     [[nodiscard]] virtual Result<Tensor> batched_matmul(
         const Tensor& A, const Tensor& B,
         std::size_t batch,
-        bool transA = false, bool transB = false) = 0;
+        bool transA = false, bool transB = false,
+        Scalar alpha = Scalar{1}) = 0;
 
     // A += B（逐元素，同形状）
     [[nodiscard]] virtual Result<void> add_inplace(Tensor& A, const Tensor& B) = 0;

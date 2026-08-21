@@ -67,6 +67,8 @@ struct ExprOperand
 {
     uint8_t kind = 0;  // ExprOperandKind
     uint8_t idx  = 0;  // 寄存器号 / 输入下标 / 常量池下标
+
+    friend bool operator==(const ExprOperand&, const ExprOperand&) = default;
 };
 
 // ── 输入视图（索引映射）────────────────────────────────────────────────────
@@ -88,6 +90,8 @@ struct ExprView
     uint8_t kind = 0;                 // ExprViewKind
     uint8_t negate_first_half = 0;    // 仅 RotateHalf 有效
     uint32_t param = 0;               // RotateHalf: block_rows；RowMod: modulo
+
+    friend bool operator==(const ExprView&, const ExprView&) = default;
 };
 
 // ── 指令 ───────────────────────────────────────────────────────────────────
@@ -98,6 +102,8 @@ struct ExprInstr
     ExprOperand a;     // 源操作数 1
     ExprOperand b;     // 源操作数 2
     ExprOperand c;     // 仅 Select 使用
+
+    friend bool operator==(const ExprInstr&, const ExprInstr&) = default;
 };
 
 // ── 表达式规格（运行时可序列化，跨后端）─────────────────────────────────
@@ -114,6 +120,15 @@ struct ExprSpec
     std::vector<Scalar>         consts;
     std::uint32_t               num_regs = 0;
 };
+
+// ── 表达式规格相等比较（GPU AOT 匹配用）────────────────────────────────
+// 两个 ExprSpec 相等 ⟺ 指令序列、输入视图、常量池、寄存器数全部一致。
+// 用于运行时 eval_expr 判断"该表达式是否有预生成融合 shader"。
+[[nodiscard]] inline bool expr_spec_equal(const ExprSpec& a, const ExprSpec& b)
+{
+    return a.instrs == b.instrs && a.views == b.views &&
+           a.consts == b.consts && a.num_regs == b.num_regs;
+}
 
 // ── 上限（GPU 资源 / 校验共用）───────────────────────────────────────────
 inline constexpr std::size_t EXPR_MAX_INPUTS = 8;

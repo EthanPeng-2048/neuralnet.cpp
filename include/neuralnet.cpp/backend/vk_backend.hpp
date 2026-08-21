@@ -96,6 +96,34 @@
 #define NN_SCATTER_ADD_SPV_EMBEDDED
 #endif
 
+// AOT 融合 shader（由 tools/gen_fused 生成，单一事实来源见 fused_exprs.hpp）
+#if __has_include("rope_forward_dk32_spv.hpp")
+#include "rope_forward_dk32_spv.hpp"
+#define NN_ROPE_FORWARD_DK32_SPV_EMBEDDED
+#endif
+#if __has_include("rope_forward_dk64_spv.hpp")
+#include "rope_forward_dk64_spv.hpp"
+#define NN_ROPE_FORWARD_DK64_SPV_EMBEDDED
+#endif
+#if __has_include("rope_forward_dk128_spv.hpp")
+#include "rope_forward_dk128_spv.hpp"
+#define NN_ROPE_FORWARD_DK128_SPV_EMBEDDED
+#endif
+#if __has_include("rope_backward_dk32_spv.hpp")
+#include "rope_backward_dk32_spv.hpp"
+#define NN_ROPE_BACKWARD_DK32_SPV_EMBEDDED
+#endif
+#if __has_include("rope_backward_dk64_spv.hpp")
+#include "rope_backward_dk64_spv.hpp"
+#define NN_ROPE_BACKWARD_DK64_SPV_EMBEDDED
+#endif
+#if __has_include("rope_backward_dk128_spv.hpp")
+#include "rope_backward_dk128_spv.hpp"
+#define NN_ROPE_BACKWARD_DK128_SPV_EMBEDDED
+#endif
+
+#include "../fused_exprs.hpp"
+
 namespace nn
 {
 
@@ -640,6 +668,10 @@ private:
     VulkanPipeline gather_pipeline_;
     VulkanPipeline scatter_add_pipeline_;
 
+    // AOT 融合 shader pipelines（名字 → pipeline，与 fused_exprs.hpp 的
+    // kGenInstances 一一对应；运行时按 ExprSpec 匹配后直接 dispatch）
+    std::unordered_map<std::string, VulkanPipeline> fused_pipelines_;
+
     std::unique_ptr<MemoryPool> memory_pool_;
     std::unique_ptr<StagingRing> staging_ring_;
 
@@ -774,6 +806,31 @@ private:
         static const std::vector<uint32_t> empty;
         return empty;
 #endif
+    }
+
+    // ── AOT 融合 shader SPIR-V getter（名字与 kGenInstances 一致）────────
+    [[nodiscard]] static const std::vector<uint32_t>& get_fused_spirv(const std::string& name)
+    {
+#ifdef NN_ROPE_FORWARD_DK32_SPV_EMBEDDED
+        if (name == "rope_forward_dk32") return nn_rope_forward_dk32_spirv_bytecode();
+#endif
+#ifdef NN_ROPE_FORWARD_DK64_SPV_EMBEDDED
+        if (name == "rope_forward_dk64") return nn_rope_forward_dk64_spirv_bytecode();
+#endif
+#ifdef NN_ROPE_FORWARD_DK128_SPV_EMBEDDED
+        if (name == "rope_forward_dk128") return nn_rope_forward_dk128_spirv_bytecode();
+#endif
+#ifdef NN_ROPE_BACKWARD_DK32_SPV_EMBEDDED
+        if (name == "rope_backward_dk32") return nn_rope_backward_dk32_spirv_bytecode();
+#endif
+#ifdef NN_ROPE_BACKWARD_DK64_SPV_EMBEDDED
+        if (name == "rope_backward_dk64") return nn_rope_backward_dk64_spirv_bytecode();
+#endif
+#ifdef NN_ROPE_BACKWARD_DK128_SPV_EMBEDDED
+        if (name == "rope_backward_dk128") return nn_rope_backward_dk128_spirv_bytecode();
+#endif
+        static const std::vector<uint32_t> empty;
+        return empty;
     }
 
 public:
@@ -940,12 +997,13 @@ public:
                 matmul_tiled_pipeline_ = std::move(*tp_r);
         }
 
-        // 9b. 创建 batched matmul pipeline（3 bindings, 5*4=20B push constants）
-        // 与 matmul 相同的 descriptor/push-constant 布局，可复用 create_matmul
+        // 9b. 创建 batched matmul pipeline（3 bindings, 6*4=24B push constants）
+        // push constants: M, N, K, transA, transB, alpha（比 matmul 多一个输出缩放系数）
         const auto& batched_spirv = get_batched_matmul_spirv();
         if (!batched_spirv.empty())
         {
-            auto bp_r = VulkanPipeline::create_matmul(device_.device(), batched_spirv);
+            auto bp_r = VulkanPipeline::create_generic(
+                device_.device(), batched_spirv, 3, 6 * sizeof(uint32_t));
             if (bp_r)
                 batched_matmul_pipeline_ = std::move(*bp_r);
         }
@@ -1018,6 +1076,25 @@ public:
                 device_.device(), scatter_add_spirv, 3, 3 * sizeof(uint32_t));
             if (sp_r)
                 scatter_add_pipeline_ = std::move(*sp_r);
+        }
+
+        // 16. 注册 AOT 融合 shader pipelines（单一事实来源：fused_exprs.hpp）
+        // 每个实例：N 输入 + 1 输出 binding；push constants = count + cols + 常量池
+        for (const auto& inst : nn::fused::kGenInstances)
+        {
+            const auto& spirv = get_fused_spirv(inst.name);
+            if (spirv.empty())
+                continue;  // 未嵌入（构建配置缺失）：跳过，运行时回退 eager
+            const auto spec = nn::fused::make_fused(inst);
+            const std::uint32_t num_bindings =
+                static_cast<std::uint32_t>(spec.views.size()) + 1;  // 输入 + 输出
+            const std::uint32_t pc_size =
+                static_cast<std::uint32_t>(sizeof(std::uint32_t) * 2 +
+                                           sizeof(Scalar) * spec.consts.size());
+            auto fp_r = VulkanPipeline::create_generic(
+                device_.device(), spirv, num_bindings, pc_size);
+            if (fp_r)
+                fused_pipelines_.emplace(inst.name, std::move(*fp_r));
         }
 
         initialized_ = true;
@@ -1864,13 +1941,15 @@ public:
     }
 
     // ── 纯 GPU 批量矩阵乘法 ──────────────────────────────────────────
-    // 对每个 batch b 计算 C_b = op(A_b, B_b)，结果垂直堆叠为 (batch*M, N)
+    // 对每个 batch b 计算 C_b = alpha * op(A_b, B_b)，结果垂直堆叠为 (batch*M, N)
     // A: (batch * A_rows_per_batch, A_cols)，B: (batch * B_rows_per_batch, B_cols)
     // batch 步长由 shader 从 M*K / K*N / M*N 推导，无需额外传入
+    // alpha: 输出缩放系数（cuBLAS sgemm 语义），在 shader 写出时一次完成
     [[nodiscard]] Result<GpuTensor> batched_matmul_gpu(
         const GpuTensor& A, const GpuTensor& B,
         uint32_t batch,
-        uint32_t transA = 0, uint32_t transB = 0)
+        uint32_t transA = 0, uint32_t transB = 0,
+        float alpha = 1.0f)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
@@ -1999,14 +2078,20 @@ public:
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             pipeline.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
 
-        // Push constants: M, N, K, transA, transB（与 matmul 相同布局）
-        const uint32_t push_data[5] = {M, N, K, transA, transB};
+        // Push constants: M, N, K, transA, transB, alpha（24B，含输出缩放系数）
+        // shader 采用 64×64 寄存器分块（与 matmul_tiled 相同），
+        // 每个 WorkGroup 计算 64×64 输出块，Z 维度索引 batch
+        struct PushDataBmm {
+            uint32_t M, N, K, transA, transB;
+            float alpha;
+        } push{M, N, K, transA, transB, alpha};
         vkCmdPushConstants(cmd, pipeline.pipeline_layout(),
-            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
+            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
 
-        // Dispatch: Z 维度 = batch（每个 batch 一个 workgroup 层）
-        const uint32_t wg_x = (N + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
-        const uint32_t wg_y = (M + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+        // Dispatch: X/Y 覆盖 64×64 输出块，Z 维度 = batch
+        constexpr uint32_t BM = 64, BN = 64;
+        const uint32_t wg_x = (N + BN - 1) / BN;
+        const uint32_t wg_y = (M + BM - 1) / BM;
         vkCmdDispatch(cmd, wg_x, wg_y, batch);
 
         // 输出屏障
@@ -2208,6 +2293,13 @@ public:
     void record_input_barriers(VkCommandBuffer cmd,
                                 std::initializer_list<VkBuffer> buffers)
     {
+        record_input_barriers(cmd,
+            std::span<const VkBuffer>(buffers.begin(), buffers.size()));
+    }
+
+    void record_input_barriers(VkCommandBuffer cmd,
+                                std::span<const VkBuffer> buffers)
+    {
         std::vector<VkBufferMemoryBarrier> barriers;
         barriers.reserve(buffers.size());
         for (auto buf : buffers)
@@ -2250,28 +2342,41 @@ public:
     }
 
     // ══════════════════════════════════════════════════════════════════
-    // elementwise_v2_gpu — 逐元素原语（unary/binary/select）
+    // elementwise_v2_gpu — 逐元素原语（unary/binary/select/axpy）
     //
     // Push Constants (32 bytes):
     //   count, mode, op, cmp_op, flags, scalar_b, scalar_then, scalar_else
     // Bindings: A(0), B(1), C(2), OUT(3)
     //
     // 对未使用的 binding（如 unary 模式的 B/C），绑定 A 的 buffer（无害占位）。
+    //
+    // out != nullptr 时为原地模式：OUT 直接绑定 out 的 buffer（通常即 A），
+    // 免分配 + 免全量写出。逐元素 kernel 每线程只读写自己下标一次，
+    // read-before-write 天然成立，别名安全。
     // ══════════════════════════════════════════════════════════════════
     [[nodiscard]] Result<GpuTensor> elementwise_v2_gpu(
         const GpuTensor& A, const GpuTensor* B, const GpuTensor* C,
         uint32_t count, uint32_t mode, uint32_t op, uint32_t cmp_op,
-        uint32_t flags, float scalar_b, float scalar_then, float scalar_else)
+        uint32_t flags, float scalar_b, float scalar_then, float scalar_else,
+        const GpuTensor* out = nullptr)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
         if (!has_elementwise_v2_pipeline())
             return std::unexpected(Error{"elementwise_v2 pipeline not available"});
 
-        // 1. 分配输出 Tensor
-        auto output_res = GpuTensor::create_empty(A.rows(), A.cols(), *this);
-        if (!output_res) return std::unexpected(output_res.error());
-        GpuTensor output = std::move(*output_res);
+        // 1. 输出 Tensor：原地模式直接复用 out 的 buffer，否则新分配
+        GpuTensor output;
+        if (out)
+        {
+            output = GpuTensor(*out);
+        }
+        else
+        {
+            auto output_res = GpuTensor::create_empty(A.rows(), A.cols(), *this);
+            if (!output_res) return std::unexpected(output_res.error());
+            output = std::move(*output_res);
+        }
 
         // 2. 分配描述符集
         auto ds_r = alloc_desc_set(elementwise_v2_pipeline_.descriptor_layout());
@@ -2333,6 +2438,115 @@ public:
             if (!r) return std::unexpected(r.error());
         }
         return output;
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // run_fused_gpu — AOT 融合 shader 通用执行入口
+    //
+    // 与 glsl_gen.hpp 生成的 shader 布局严格对应：
+    //   Bindings: 输入 0..N-1，输出 N（全部 storage buffer）
+    //   Push Constants: uint count, uint cols, float c0..（常量池）
+    //   local_size_x = 256
+    //
+    // shader_name 必须是已注册的融合实例名（见 fused_exprs.hpp kGenInstances）。
+    // 所有输入同形状 (rows, cols)；同一 buffer 可绑定到多个输入（RoPE 的 q×2）。
+    // ══════════════════════════════════════════════════════════════════
+    [[nodiscard]] Result<GpuTensor> run_fused_gpu(
+        const std::string& shader_name,
+        std::span<const GpuTensor> inputs,
+        std::span<const Scalar> consts,
+        std::size_t rows, std::size_t cols)
+    {
+        if (!initialized_)
+            return std::unexpected(Error{"GPU backend not initialized"});
+        const auto it = fused_pipelines_.find(shader_name);
+        if (it == fused_pipelines_.end())
+            return std::unexpected(Error{"fused shader not registered: " + shader_name});
+        const VulkanPipeline& pipeline = it->second;
+
+        if (inputs.size() + 1 > EXPR_MAX_INPUTS + 1)
+            return std::unexpected(Error{"run_fused_gpu: too many inputs"});
+        if (consts.size() > EXPR_MAX_CONSTS)
+            return std::unexpected(Error{"run_fused_gpu: too many constants"});
+
+        const std::uint32_t count = static_cast<std::uint32_t>(rows * cols);
+
+        // 1. 分配输出 Tensor
+        auto output_res = GpuTensor::create_empty(rows, cols, *this);
+        if (!output_res) return std::unexpected(output_res.error());
+        GpuTensor output = std::move(*output_res);
+
+        // 2. 分配描述符集（N 输入 + 1 输出）
+        auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
+        if (!ds_r) return std::unexpected(ds_r.error());
+        VkDescriptorSet desc_set = *ds_r;
+
+        const std::size_t n_bindings = inputs.size() + 1;
+        std::vector<VkDescriptorBufferInfo> buf_infos(n_bindings);
+        std::vector<VkWriteDescriptorSet> writes(n_bindings);
+        for (std::size_t i = 0; i < inputs.size(); ++i)
+            buf_infos[i] = {inputs[i].buffer().impl(), 0, VK_WHOLE_SIZE};
+        buf_infos[inputs.size()] = {output.buffer().impl(), 0, VK_WHOLE_SIZE};
+        for (std::size_t i = 0; i < n_bindings; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = desc_set;
+            writes[i].dstBinding = static_cast<std::uint32_t>(i);
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &buf_infos[i];
+        }
+        vkUpdateDescriptorSets(device_.device(),
+            static_cast<std::uint32_t>(n_bindings), writes.data(), 0, nullptr);
+
+        // 3. 获取 command buffer
+        auto cmd_r = acquire_cmd();
+        if (!cmd_r)
+        {
+            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            return std::unexpected(cmd_r.error());
+        }
+        auto [cmd, owns_cmd] = *cmd_r;
+
+        // 4. 录制：输入屏障 → bind → push constants → dispatch → 输出屏障
+        std::vector<VkBuffer> in_bufs;
+        in_bufs.reserve(inputs.size());
+        for (const auto& t : inputs)
+            in_bufs.push_back(t.buffer().impl());
+        record_input_barriers(cmd, in_bufs);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+
+        // Push constants 布局与 glsl_gen.hpp 一致：count, cols, c0..
+        std::vector<std::uint8_t> pc(sizeof(std::uint32_t) * 2 + sizeof(Scalar) * consts.size());
+        std::memcpy(pc.data(), &count, sizeof(std::uint32_t));
+        const std::uint32_t cols32 = static_cast<std::uint32_t>(cols);
+        std::memcpy(pc.data() + sizeof(std::uint32_t), &cols32, sizeof(std::uint32_t));
+        if (!consts.empty())
+            std::memcpy(pc.data() + sizeof(std::uint32_t) * 2, consts.data(),
+                        sizeof(Scalar) * consts.size());
+        vkCmdPushConstants(cmd, pipeline.pipeline_layout(),
+            VK_SHADER_STAGE_COMPUTE_BIT, 0, static_cast<std::uint32_t>(pc.size()), pc.data());
+
+        const std::uint32_t wg_count = (count + 255) / 256;
+        vkCmdDispatch(cmd, wg_count, 1, 1);
+        record_output_barrier(cmd, output.buffer().impl());
+
+        // 5. 独立模式提交
+        if (owns_cmd)
+        {
+            auto r = submit_and_wait(cmd, desc_set);
+            if (!r) return std::unexpected(r.error());
+        }
+        return output;
+    }
+
+    // 查询融合 shader 是否已注册（GpuEngine AOT 匹配前置判断）
+    [[nodiscard]] bool has_fused_shader(const std::string& shader_name) const noexcept
+    {
+        return fused_pipelines_.find(shader_name) != fused_pipelines_.end();
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -2424,10 +2638,14 @@ public:
     // Bindings: A(0), Vec(1), Out(2)
     // mode: 0=row_broadcast (vec indexed by row), 1=col_broadcast (vec indexed by col)
     // op: 0=Add, 1=Sub, 2=Mul, 3=Div, 4=Max, 5=Min
+    //
+    // out != nullptr 时为原地模式：Out 直接绑定 out 的 buffer（通常即 A），
+    // 每线程只读写自己下标一次，别名安全。
     // ══════════════════════════════════════════════════════════════════
     [[nodiscard]] Result<GpuTensor> broadcast_gpu(
         const GpuTensor& A, const GpuTensor& vec,
-        uint32_t mode, uint32_t op)
+        uint32_t mode, uint32_t op,
+        const GpuTensor* out = nullptr)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
@@ -2437,10 +2655,18 @@ public:
         const uint32_t rows = static_cast<uint32_t>(A.rows());
         const uint32_t cols = static_cast<uint32_t>(A.cols());
 
-        // 1. 分配输出 Tensor
-        auto output_res = GpuTensor::create_empty(A.rows(), A.cols(), *this);
-        if (!output_res) return std::unexpected(output_res.error());
-        GpuTensor output = std::move(*output_res);
+        // 1. 输出 Tensor：原地模式直接复用 out 的 buffer，否则新分配
+        GpuTensor output;
+        if (out)
+        {
+            output = GpuTensor(*out);
+        }
+        else
+        {
+            auto output_res = GpuTensor::create_empty(A.rows(), A.cols(), *this);
+            if (!output_res) return std::unexpected(output_res.error());
+            output = std::move(*output_res);
+        }
 
         // 2. 分配描述符集
         auto ds_r = alloc_desc_set(broadcast_pipeline_.descriptor_layout());
