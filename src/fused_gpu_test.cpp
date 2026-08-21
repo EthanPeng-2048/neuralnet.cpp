@@ -77,6 +77,7 @@ int main()
     // ── 对每个 RoPE 实例做数值验证 ────────────────────────────────────────
     for (const auto& inst : nn::fused::kGenInstances)
     {
+        if (inst.kind != nn::fused::FusedKind::RoPE) continue;  // SwiGLU 单独测试
         const std::uint32_t d_k = inst.d_k;
         const char* dir = inst.backward ? "backward" : "forward";
 
@@ -95,8 +96,8 @@ int main()
 
         // CPU 参考（融合解释器）
         std::vector<Tensor> cpu_inputs = {
-            Tensor::from_matrix(Matrix(q)), Tensor::from_matrix(Matrix(q)),
-            Tensor::from_matrix(Matrix(cos_m)), Tensor::from_matrix(Matrix(sin_m)),
+            Tensor::from_matrix(Matrix(q)), Tensor::from_matrix(Matrix(cos_m)),
+            Tensor::from_matrix(Matrix(q)), Tensor::from_matrix(Matrix(sin_m)),
         };
         auto cpu_r = cpu_engine->eval_expr(spec, cpu_inputs, rows, cols);
         if (!cpu_r)
@@ -116,7 +117,7 @@ int main()
         }
         std::vector<nn::GpuTensor> gpu_inputs;
         bool upload_ok = true;
-        for (const auto& m : {q, q, cos_m, sin_m})
+        for (const auto& m : {q, cos_m, q, sin_m})
         {
             auto g = nn::GpuTensor::from_matrix(m, backend);
             if (!g) { upload_ok = false; break; }
@@ -155,7 +156,7 @@ int main()
             continue;
         }
         std::vector<Tensor> gpu_t_inputs;
-        for (const auto& m : {q, q, cos_m, sin_m})
+        for (const auto& m : {q, cos_m, q, sin_m})
         {
             auto t = gpu_engine->from_matrix(m);
             if (!t) { upload_ok = false; break; }
@@ -186,7 +187,56 @@ int main()
         if (!ok) ++fail;
     }
 
-    // ── 测试 C：未命中实例表 → eager 回退仍正确 ───────────────────────────
+    // ── 测试 B2：SwiGLU backward 融合 shader（grad_gate / grad_up）──────
+    {
+        const std::size_t rows = 4, cols = 7;
+        std::mt19937 rng3(999);
+        Matrix g(rows, cols), up(rows, cols), s(rows, cols), gate(rows, cols);
+        for (auto& v : g.span()) v = dist(rng3);
+        for (auto& v : up.span()) v = dist(rng3);
+        for (auto& v : s.span()) v = dist(rng3);
+        for (auto& v : gate.span()) v = dist(rng3);
+
+        const nn::fused::GenInstance insts[] = {
+            {"swiglu_grad_gate", nn::fused::FusedKind::SwiGLUGradGate, 0, false},
+            {"swiglu_grad_up",   nn::fused::FusedKind::SwiGLUGradUp,   0, false},
+        };
+        for (const auto& inst : insts)
+        {
+            const ExprSpec spec = nn::fused::make_fused(inst);
+            // grad_gate 输入序 [g, up, s, gate, s]；grad_up [g, gate, s]
+            const Matrix* srcs_gate[] = {&g, &up, &s, &gate, &s};
+            const Matrix* srcs_up[]   = {&g, &gate, &s};
+            const int n = (inst.kind == nn::fused::FusedKind::SwiGLUGradGate) ? 5 : 3;
+            const Matrix* const* srcs =
+                (inst.kind == nn::fused::FusedKind::SwiGLUGradGate) ? srcs_gate : srcs_up;
+
+            std::vector<Tensor> cpu_inputs, gpu_inputs_t;
+            bool up_ok = true;
+            for (int k = 0; k < n; ++k)
+            {
+                auto gt = gpu_engine->from_matrix(*srcs[k]);
+                if (!gt) { up_ok = false; break; }
+                gpu_inputs_t.push_back(std::move(*gt));
+                cpu_inputs.push_back(Tensor::from_matrix(Matrix(*srcs[k])));
+            }
+            if (!up_ok) { std::cerr << "[FAIL] " << inst.name << ": 上传失败\n"; ++fail; continue; }
+
+            auto cpu_r = cpu_engine->eval_expr(spec, cpu_inputs, rows, cols);
+            if (!cpu_r) { std::cerr << "[FAIL] " << inst.name << ": CPU 参考失败\n"; ++fail; continue; }
+            auto integ_r = gpu_engine->eval_expr(spec, gpu_inputs_t, rows, cols);
+            if (!integ_r) { std::cerr << "[FAIL] " << inst.name << ": GpuEngine.eval_expr 失败\n"; ++fail; continue; }
+            auto integ_m = gpu_engine->to_matrix(*integ_r);
+            if (!integ_m) { std::cerr << "[FAIL] " << inst.name << ": 下载失败\n"; ++fail; continue; }
+            const Scalar err = max_abs_diff(cpu_r->cpu_matrix(), *integ_m);
+            const bool ok = err < kTol;
+            std::cout << "[" << (ok ? "PASS" : "FAIL") << "] " << inst.name
+                      << "  eval_expr=" << std::scientific << std::setprecision(2) << err << "\n";
+            if (!ok) ++fail;
+        }
+    }
+
+    // ── 测试 C：闭合世界——未命中 AOT 实例表的 spec，GPU 必须硬报错 ────
     {
         const std::uint32_t d_k = 32;
         const std::size_t rows = 2 * d_k;
@@ -198,43 +248,31 @@ int main()
         for (auto& v : cos_m.span()) v = dist(rng2);
         for (auto& v : sin_m.span()) v = dist(rng2);
 
-        // 篡改一条指令（Add → Sub），使 spec 与所有实例都不匹配
+        // 篡改第一条指令（Mul → Sub），使 spec 与所有实例都不匹配（[Sub,Mul,Add]）
         ExprSpec spec = nn::fused::make_rope(d_k, /*backward=*/false);
-        spec.instrs.back().op = static_cast<std::uint8_t>(nn::ExprOp::Sub);
+        spec.instrs[0].op = static_cast<std::uint8_t>(nn::ExprOp::Sub);
 
+        // CPU 解释器（参考）仍能求值该任意 spec
         std::vector<Tensor> cpu_inputs = {
-            Tensor::from_matrix(Matrix(q)), Tensor::from_matrix(Matrix(q)),
-            Tensor::from_matrix(Matrix(cos_m)), Tensor::from_matrix(Matrix(sin_m)),
+            Tensor::from_matrix(Matrix(q)), Tensor::from_matrix(Matrix(cos_m)),
+            Tensor::from_matrix(Matrix(q)), Tensor::from_matrix(Matrix(sin_m)),
         };
         auto cpu_r = cpu_engine->eval_expr(spec, cpu_inputs, rows, cols);
+        if (!cpu_r) { std::cerr << "[FAIL] 闭合世界: CPU 参考失败\n"; ++fail; }
 
+        // GPU 闭合世界：未命中任何 AOT 融合 shader → 必须硬报错（无 eager 回退）
         std::vector<Tensor> gpu_inputs;
-        for (const auto& m : {q, q, cos_m, sin_m})
+        for (const auto& m : {q, cos_m, q, sin_m})
         {
             auto t = gpu_engine->from_matrix(m);
-            if (!t) { std::cerr << "[FAIL] eager 回退: 上传失败\n"; ++fail; break; }
+            if (!t) { std::cerr << "[FAIL] 闭合世界: 上传失败\n"; ++fail; break; }
             gpu_inputs.push_back(std::move(*t));
         }
         auto gpu_r = gpu_engine->eval_expr(spec, gpu_inputs, rows, cols);
-        if (cpu_r && gpu_r)
-        {
-            auto gpu_m = gpu_engine->to_matrix(*gpu_r);
-            if (gpu_m)
-            {
-                const Scalar err = max_abs_diff(cpu_r->cpu_matrix(), *gpu_m);
-                const bool ok = err < kTol;
-                std::cout << "[" << (ok ? "PASS" : "FAIL") << "] eager 回退"
-                          << "  err=" << std::scientific << std::setprecision(2)
-                          << err << "\n";
-                if (!ok) ++fail;
-            }
-            else { std::cerr << "[FAIL] eager 回退: 下载失败\n"; ++fail; }
-        }
-        else
-        {
-            std::cerr << "[FAIL] eager 回退: eval_expr 失败\n";
-            ++fail;
-        }
+        const bool closed_world_ok = !gpu_r;  // 期待报错（闭合世界，无 eager）
+        std::cout << "[" << (closed_world_ok ? "PASS" : "FAIL")
+                  << "] 闭合世界: 未命中 AOT → GPU 硬报错\n";
+        if (!closed_world_ok) ++fail;
     }
 
     std::cout << "========================================\n"

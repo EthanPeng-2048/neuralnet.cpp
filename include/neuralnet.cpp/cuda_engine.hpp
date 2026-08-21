@@ -9,7 +9,6 @@
 #ifdef NN_HAS_CUDA
 
 #include "compute_engine.hpp"
-#include "expr_eval.hpp"
 #include "backend/cuda_backend.hpp"
 
 namespace nn
@@ -419,10 +418,11 @@ public:
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 表达式求值（v1：统一 eager lowering）
+    // 表达式求值（闭合世界 AOT）
     //
-    // 复用跨后端共享执行器 run_expr_eager：把 ExprSpec 拆分为现有原语
-    // 调用（正确优先）。未来替换为统一 VM / JIT 时只改本函数内部。
+    // CUDA 目前没有 AOT 融合 shader（闭合世界约束下无 eager、无运行时生成），
+    // 因此任何表达式都直接报错。如需 GPU 融合请用 Vulkan 后端，或为 CUDA
+    // 实现 AOT shader 生成后加入 fused_exprs.hpp。
     // ══════════════════════════════════════════════════════════════════════
 
     [[nodiscard]] Result<Tensor> eval_expr(
@@ -430,7 +430,8 @@ public:
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols) override
     {
-        return run_expr_eager(*this, spec, inputs, rows, cols);
+        return std::unexpected(Error{
+            "CudaEngine::eval_expr: 闭合世界无 CUDA AOT 融合 shader；请用 Vulkan"});
     }
 
 private:

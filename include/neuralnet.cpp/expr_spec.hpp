@@ -6,7 +6,7 @@
 //
 //  纯数据结构，无引擎/执行器依赖（仅 <cstdint>/<vector> 与 config.hpp）。
 //  ComputeEngine 接口（compute_engine.hpp）依赖本头声明 eval_expr；
-//  执行器（expr_eval.hpp）依赖本头 + ComputeEngine 原语。
+//  表达式求值入口（expr_dsl.hpp 的 dsl::compute / 各引擎 eval_expr）依赖本头。
 //
 //  动机：将"函数式逐元素原语"升级为统一的表达式描述，使单行内多次计算
 //  （如 RoPE 的 q*cos + rotate(q)*sin）只遍历一次、少产生中间 Tensor。

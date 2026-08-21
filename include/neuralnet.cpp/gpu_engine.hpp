@@ -32,7 +32,6 @@
 #ifdef NN_HAS_VULKAN
 
 #include "compute_engine.hpp"
-#include "expr_eval.hpp"
 #include "fused_exprs.hpp"
 #include "backend/vk_backend.hpp"
 
@@ -552,15 +551,11 @@ public:
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 表达式求值（v1：统一 eager lowering）
+    // 表达式求值（闭合世界 AOT）
     //
-    // 复用跨后端共享执行器 run_expr_eager：把 ExprSpec 拆分为现有原语
-    // 调用（正确优先）。未来替换为统一 VM / 运行时 JIT 生成 shader 时，
-    // 只改本函数内部实现，DSL / Layer / 接口不变。
-    //
-    // AOT 融合加速：先与 fused_exprs.hpp 的预生成实例表逐一比对
-    // （expr_spec_equal），命中则直接 dispatch 单个融合 shader；
-    // 未命中回退 eager lowering。
+    // 与 fused_exprs.hpp 预生成实例表逐一比对（expr_spec_equal），命中则
+    // dispatch 单个融合 shader；未命中**硬报错**（无 eager、无运行时生成）。
+    // 新增 GPU 表达式必须加入 kGenInstances 并生成 AOT shader。
     // ══════════════════════════════════════════════════════════════════════
 
     [[nodiscard]] Result<Tensor> eval_expr(
@@ -592,8 +587,10 @@ public:
             return Tensor::from_gpu(std::move(*out));
         }
 
-        // ── 未命中：回退 eager lowering（拆分为原语调用） ──────────────
-        return run_expr_eager(*this, spec, inputs, rows, cols);
+        // ── 闭合世界：未命中任何 AOT 融合 shader → 硬报错 ──────────────
+        return std::unexpected(Error{
+            "GpuEngine::eval_expr: 未找到匹配的 AOT 融合 shader（闭合世界）；"
+            "请将表达式加入 fused_exprs.hpp kGenInstances"});
     }
 
 private:

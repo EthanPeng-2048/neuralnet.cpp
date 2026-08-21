@@ -170,6 +170,16 @@ class Tensor {
 | 数据操作 | `slice_rows`, `insert_rows`, `gather_rows`, `scatter_add_rows`, `rearrange_3d`, `clone` |
 | 批控制 | `begin_batch` / `end_batch`（CPU: no-op; GPU: command buffer） |
 
+**表达式统一入口：**
+
+| 文件 | 职责 |
+|------|------|
+| `expr_spec.hpp` | `ExprSpec` 逐元素表达式扁平 IR（纯数据结构，跨后端可序列化，GPU AOT 契约） |
+| `expr_dsl.hpp` | 统一表达式 DSL（`nn::dsl`）：编译期模板，普通数学写法；CPU 直接求值（内联+SIMD），GPU 经 `to_expr_spec` 折叠匹配 AOT shader |
+| `fused_exprs.hpp` | AOT 融合 shader 单一事实来源（`kGenInstances` 实例表 + `make_fused`），与 `dsl` 折叠结果一致（防漂移由 `expr_dsl_test` 断言） |
+| `eval_expr` | `ComputeEngine` 虚接口：CPU 编译期模板求值（经 `dsl::compute`）；Vulkan AOT 融合 shader（闭合世界，未命中硬报错，无 eager） |
+| `dsl::compute(engine, expr, rows, cols)` | 统一求值入口：CPU 走编译期模板；GPU 折叠成 `ExprSpec` 后走 `eval_expr` AOT 分发 |
+
 ### L3 实现层
 
 | 文件 | 职责 |

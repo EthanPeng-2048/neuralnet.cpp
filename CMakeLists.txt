@@ -92,6 +92,12 @@ nn_add_executable(attn_gradcheck src/attn_gradcheck.cpp)
 # ── 融合 shader（AOT）GPU 数值验证（ExprSpec 单一事实来源 vs GPU 输出） ──
 nn_add_executable(fused_gpu_test src/fused_gpu_test.cpp)
 
+# ── engine.compute(Mat_A + Mat_B) 表达式求值测试（CPU/GPU/CUDA 统一入口） ──
+nn_add_executable(tensor_expr_test src/tensor_expr_test.cpp)
+
+# ── 统一表达式 DSL 单元测试（编译期融合 + AOT 折叠 + 防漂移断言，纯 CPU） ──
+nn_add_executable(expr_dsl_test src/expr_dsl_test.cpp)
+
 # ── Softmax 数值梯度检查（gradcheck，验证 softmax 反向） ───────────────────
 nn_add_executable(softmax_gradcheck src/softmax_gradcheck.cpp)
 
@@ -109,15 +115,10 @@ if(Vulkan_FOUND)
     # 查找 SPIR-V 编译器（Vulkan SDK 自带）
     find_program(GLSLC glslc HINTS ${Vulkan_GLSLC_EXECUTABLE})
 
-    # 定义着色器列表（仅保留纯原语着色器，不含任何算法）
-    # - matmul / matmul_tiled: 矩阵乘法原语
-    # - batched_matmul: 批量矩阵乘法原语（Z 维度索引 batch，消除 per-head 循环）
-    # - elementwise_v2: 逐元素原语（unary/binary/select）— 纯 GPU 架构核心
-    # - reduce: 行/列归约原语（sum/max）— LayerNorm、CrossEntropy 等
-    # - broadcast: 行/列广播原语（add/sub/mul/div/max/min）— Linear 偏置、
-    #   LayerNorm 缩放、Softmax 归一化等
-    # 旧的 elementwise / layernorm / layernorm_backward 着色器（含算法语义）
-    # 已随旧架构删除。
+    # ── 铁律：原语 shader 永不含任何算法 ──────────────────────────────
+    # 原语 shader 只做 op-level 计算（矩阵乘、逐元素、归约、广播、搬移）。
+    # ReLU/GeLU/Softmax/LayerNorm/Attention/RoPE/SwiGLU 等算法一律来自
+    # Layer（组合原语）或 DSL（nn::dsl，见下），绝不写进原语 shader。
     set(GPU_SHADERS
         matmul
         matmul_tiled
@@ -129,15 +130,22 @@ if(Vulkan_FOUND)
         transpose
         gather
         scatter_add)
-    # AOT 融合 shader（表达式单一事实来源见 include/neuralnet.cpp/fused_exprs.hpp）
-    # 由构建期工具 tools/gen_fused 生成 .comp，再走与普通 shader 相同的 glslc → embed 管线
+    # ── 融合 shader：算法在 C++（单一事实来源），构建期降级成 GPU ─────
+    # GPU_FUSED_SHADERS 的每个条目都来自 include/neuralnet.cpp/fused_exprs.hpp
+    # 的 kGenInstances：构建期 tools/gen_fused 用 dsl 折叠同一段表达式生成
+    # .comp，再走 glslc → embed 管线。**算法唯一事实来源在 C++ 源码**，
+    # 融合 shader 是自动生成的产物（请勿手写算法 GLSL）。
+    # 一个算法允许拆成多个融合 kernel（如 SwiGLU backward = grad_gate +
+    # grad_up 两个）；不强制"每算法单 kernel"。性能让位于清晰/可维护。
     set(GPU_FUSED_SHADERS
         rope_forward_dk32
         rope_forward_dk64
         rope_forward_dk128
         rope_backward_dk32
         rope_backward_dk64
-        rope_backward_dk128)
+        rope_backward_dk128
+        swiglu_grad_gate
+        swiglu_grad_up)
     set(GPU_SHADER_HPPS "")
 
     # 便捷函数：glslc → .spv → embed_spirv.cmake → C++ 头文件
@@ -218,6 +226,7 @@ if(Vulkan_FOUND)
             gpt_gradcheck
             attn_gradcheck
             fused_gpu_test
+            tensor_expr_test
             softmax_gradcheck
             attn_debug
             matmul_probe
