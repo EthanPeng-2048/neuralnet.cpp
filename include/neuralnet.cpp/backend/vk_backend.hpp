@@ -111,6 +111,26 @@
 #define NN_BMM_APPLY_SPV_EMBEDDED
 #endif
 
+#if __has_include("bmm_q_backward_spv.hpp")
+#include "bmm_q_backward_spv.hpp"
+#define NN_BMM_Q_BACKWARD_SPV_EMBEDDED
+#endif
+
+#if __has_include("bmm_kv_backward_spv.hpp")
+#include "bmm_kv_backward_spv.hpp"
+#define NN_BMM_KV_BACKWARD_SPV_EMBEDDED
+#endif
+
+#if __has_include("col_softmax_denom_spv.hpp")
+#include "col_softmax_denom_spv.hpp"
+#define NN_COL_SOFTMAX_DENOM_SPV_EMBEDDED
+#endif
+
+#if __has_include("col_softmax_sparse_forward_spv.hpp")
+#include "col_softmax_sparse_forward_spv.hpp"
+#define NN_COL_SOFTMAX_SPARSE_FORWARD_SPV_EMBEDDED
+#endif
+
 // AOT 融合 shader 注册表（构建期 scan_exprs 收集 + gen_fused 合成；表达式
 // 只出现在 Layer，本表是折叠后的派生物）。运行时按 expr_spec_key 匹配 dispatch。
 #if __has_include("fused_registry.hpp")
@@ -664,6 +684,12 @@ private:
     VulkanPipeline bmm_reduce_pipeline_;
     VulkanPipeline bmm_denom_pipeline_;
     VulkanPipeline bmm_apply_pipeline_;
+    // M6 两趟式注意力反向融合原语 pipelines（bmm_q_backward/bmm_kv_backward）
+    VulkanPipeline bmm_q_backward_pipeline_;
+    VulkanPipeline bmm_kv_backward_pipeline_;
+    // M5 列式 softmax 融合原语 pipelines（col_softmax_denom/col_softmax_sparse_forward）
+    VulkanPipeline col_softmax_denom_pipeline_;
+    VulkanPipeline col_softmax_sparse_forward_pipeline_;
 
     // AOT 融合 shader pipelines（key = expr_spec_key → pipeline；由构建期
     // fused_registry.hpp 注册，运行时按 key 匹配后直接 dispatch）
@@ -831,6 +857,46 @@ private:
     {
 #ifdef NN_BMM_APPLY_SPV_EMBEDDED
         return nn_bmm_apply_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_bmm_q_backward_spirv()
+    {
+#ifdef NN_BMM_Q_BACKWARD_SPV_EMBEDDED
+        return nn_bmm_q_backward_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_bmm_kv_backward_spirv()
+    {
+#ifdef NN_BMM_KV_BACKWARD_SPV_EMBEDDED
+        return nn_bmm_kv_backward_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_col_softmax_denom_spirv()
+    {
+#ifdef NN_COL_SOFTMAX_DENOM_SPV_EMBEDDED
+        return nn_col_softmax_denom_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_col_softmax_sparse_forward_spirv()
+    {
+#ifdef NN_COL_SOFTMAX_SPARSE_FORWARD_SPV_EMBEDDED
+        return nn_col_softmax_sparse_forward_spirv_bytecode();
 #else
         static const std::vector<uint32_t> empty;
         return empty;
@@ -1040,6 +1106,42 @@ public:
                 device_.device(), bmm_apply_spirv, 7, 6 * sizeof(uint32_t));
             if (pr) bmm_apply_pipeline_ = std::move(*pr);
         }
+        // M6 反向融合：bmm_q_backward 8 bindings (A,B,Mask,RowMax,Denom,P,OutR,OutGQ),
+        // PC M,N,K,flags,alpha = 20B
+        const auto& bmm_q_backward_spirv = get_bmm_q_backward_spirv();
+        if (!bmm_q_backward_spirv.empty())
+        {
+            auto pr = VulkanPipeline::create_generic(
+                device_.device(), bmm_q_backward_spirv, 8, 5 * sizeof(uint32_t));
+            if (pr) bmm_q_backward_pipeline_ = std::move(*pr);
+        }
+        // bmm_kv_backward: 10 bindings (A,B,Mask,RowMax,Denom,P,G,R,OutK,OutV),
+        // PC M,N,K,D,flags,alpha = 24B
+        const auto& bmm_kv_backward_spirv = get_bmm_kv_backward_spirv();
+        if (!bmm_kv_backward_spirv.empty())
+        {
+            auto pr = VulkanPipeline::create_generic(
+                device_.device(), bmm_kv_backward_spirv, 10, 6 * sizeof(uint32_t));
+            if (pr) bmm_kv_backward_pipeline_ = std::move(*pr);
+        }
+        // M5 列式 softmax 融合：col_softmax_denom 3 bindings (Logits,ColMax,Out),
+        // PC C,N = 8B
+        const auto& col_denom_spirv = get_col_softmax_denom_spirv();
+        if (!col_denom_spirv.empty())
+        {
+            auto pr = VulkanPipeline::create_generic(
+                device_.device(), col_denom_spirv, 3, 2 * sizeof(uint32_t));
+            if (pr) col_softmax_denom_pipeline_ = std::move(*pr);
+        }
+        // col_softmax_sparse_forward: 5 bindings (Logits,Labels,Mask,LossVec,Grad),
+        // PC C,N,vocab_size,flags,inv_num_valid = 20B
+        const auto& col_sparse_spirv = get_col_softmax_sparse_forward_spirv();
+        if (!col_sparse_spirv.empty())
+        {
+            auto pr = VulkanPipeline::create_generic(
+                device_.device(), col_sparse_spirv, 5, 5 * sizeof(uint32_t));
+            if (pr) col_softmax_sparse_forward_pipeline_ = std::move(*pr);
+        }
 
         // 9c. 创建 rearrange_3d pipeline（2 bindings, 5*4=20B push constants）
         const auto& rearrange_spirv = get_rearrange_3d_spirv();
@@ -1155,6 +1257,10 @@ public:
     [[nodiscard]] bool has_bmm_reduce_pipeline() const noexcept { return bmm_reduce_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_bmm_denom_pipeline() const noexcept { return bmm_denom_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_bmm_apply_pipeline() const noexcept { return bmm_apply_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_bmm_q_backward_pipeline() const noexcept { return bmm_q_backward_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_bmm_kv_backward_pipeline() const noexcept { return bmm_kv_backward_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_col_softmax_denom_pipeline() const noexcept { return col_softmax_denom_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_col_softmax_sparse_forward_pipeline() const noexcept { return col_softmax_sparse_forward_pipeline_.handle() != VK_NULL_HANDLE; }
 
     // ══════════════════════════════════════════════════════════════════
     // M4 matmul 融合原语（bmm_reduce / bmm_denom / bmm_apply）
@@ -1321,6 +1427,150 @@ public:
         auto r = dispatch_bmm_generic(bmm_apply_pipeline_, inputs, *out, pc,
             static_cast<std::uint32_t>(batch * M));
         if (!r) return std::unexpected(r.error());
+        return out;
+    }
+
+    // bmm_q_backward：R 与 grad_Q（两趟式注意力反向 Pass 1）
+    //   R[b*M+i] = Σ_j W_ij·P[b*M+i][j]                        → r_out (batch*M, 1)
+    //   grad_Q[b*K+k][i] = alpha·Σ_j W_ij·(P[b*M+i][j]-R)·B_b[k][j] → (batch*K, M)
+    // 输出两个张量：返回 grad_Q，R 经 r_out 传出。
+    [[nodiscard]] Result<GpuTensor> bmm_q_backward_gpu(
+        const GpuTensor& A, const GpuTensor& B, const GpuTensor* mask,
+        const GpuTensor& row_max, const GpuTensor& denom, const GpuTensor& P,
+        std::size_t M, std::size_t N, std::size_t K, std::size_t batch,
+        bool transA, bool transB, Scalar alpha, GpuTensor* r_out)
+    {
+        if (!has_bmm_q_backward_pipeline())
+            return std::unexpected(Error{"bmm_q_backward_gpu: pipeline not available"});
+        if (N > 4096u)
+            return std::unexpected(Error{"bmm_q_backward_gpu: N exceeds 4096 (shared memory limit)"});
+        auto out = GpuTensor::create_empty(batch * K, M, *this);
+        if (!out) return std::unexpected(out.error());
+        auto rout = GpuTensor::create_empty(batch * M, 1, *this);
+        if (!rout) return std::unexpected(rout.error());
+
+        std::vector<GpuTensor> inputs{A, B, mask ? *mask : A, row_max, denom, P};
+        const std::uint32_t flags =
+            (transA ? 1u : 0u) | (transB ? 2u : 0u) | (mask ? 4u : 0u);
+        std::vector<std::uint8_t> pc(5 * sizeof(std::uint32_t));
+        const auto put32 = [&](std::size_t off, std::uint32_t v)
+        { std::memcpy(pc.data() + off, &v, sizeof(std::uint32_t)); };
+        put32(0, static_cast<std::uint32_t>(M));
+        put32(4, static_cast<std::uint32_t>(N));
+        put32(8, static_cast<std::uint32_t>(K));
+        put32(12, flags);
+        const float af = static_cast<float>(alpha);
+        std::memcpy(pc.data() + 16, &af, sizeof(float));
+
+        // bindings：A(0),B(1),Mask(2),RowMax(3),Denom(4),P(5),OutR(6),OutGQ(7)
+        inputs.push_back(*rout);
+        auto r = dispatch_bmm_generic(bmm_q_backward_pipeline_, inputs, *out, pc,
+            static_cast<std::uint32_t>(batch * M));
+        if (!r) return std::unexpected(r.error());
+        *r_out = std::move(*rout);
+        return out;
+    }
+
+    // bmm_kv_backward：grad_K 与 grad_V（两趟式注意力反向 Pass 2）
+    //   grad_K[b*K+k][j] = alpha·Σ_i W_ij·(P[b*M+i][j]-R[b*M+i])·A_b[k][i]
+    //   grad_V[b*K+k][j] = Σ_i W_ij·G[b*M+i][k]
+    // 输出两个张量：返回 grad_K，grad_V 经 gv_out 传出。
+    [[nodiscard]] Result<GpuTensor> bmm_kv_backward_gpu(
+        const GpuTensor& A, const GpuTensor& B, const GpuTensor* mask,
+        const GpuTensor& row_max, const GpuTensor& denom, const GpuTensor& P,
+        const GpuTensor& G, const GpuTensor& R,
+        std::size_t M, std::size_t N, std::size_t K, std::size_t D,
+        std::size_t batch, bool transA, bool transB, Scalar alpha,
+        GpuTensor* gv_out)
+    {
+        if (!has_bmm_kv_backward_pipeline())
+            return std::unexpected(Error{"bmm_kv_backward_gpu: pipeline not available"});
+        if (M > 4096u)
+            return std::unexpected(Error{"bmm_kv_backward_gpu: M exceeds 4096 (shared memory limit)"});
+        auto out = GpuTensor::create_empty(batch * K, N, *this);
+        if (!out) return std::unexpected(out.error());
+        auto gvout = GpuTensor::create_empty(batch * K, N, *this);
+        if (!gvout) return std::unexpected(gvout.error());
+
+        std::vector<GpuTensor> inputs{A, B, mask ? *mask : A, row_max, denom, P, G, R};
+        const std::uint32_t flags =
+            (transA ? 1u : 0u) | (transB ? 2u : 0u) | (mask ? 4u : 0u);
+        std::vector<std::uint8_t> pc(6 * sizeof(std::uint32_t));
+        const auto put32 = [&](std::size_t off, std::uint32_t v)
+        { std::memcpy(pc.data() + off, &v, sizeof(std::uint32_t)); };
+        put32(0, static_cast<std::uint32_t>(M));
+        put32(4, static_cast<std::uint32_t>(N));
+        put32(8, static_cast<std::uint32_t>(K));
+        put32(12, static_cast<std::uint32_t>(D));
+        put32(16, flags);
+        const float af = static_cast<float>(alpha);
+        std::memcpy(pc.data() + 20, &af, sizeof(float));
+
+        // bindings：A(0),B(1),Mask(2),RowMax(3),Denom(4),P(5),G(6),R(7),OutK(8),OutV(9)
+        inputs.push_back(*gvout);
+        auto r = dispatch_bmm_generic(bmm_kv_backward_pipeline_, inputs, *out, pc,
+            static_cast<std::uint32_t>(batch * N));
+        if (!r) return std::unexpected(r.error());
+        *gv_out = std::move(*gvout);
+        return out;
+    }
+
+    // col_softmax_denom：denom[c] = Σ_r exp(logits[r][c] - col_max[c])
+    // logits (C, N)，col_max (1, N)；输出 (1, N)；dispatch N 个工作组
+    [[nodiscard]] Result<GpuTensor> col_softmax_denom_gpu(
+        const GpuTensor& logits, const GpuTensor& col_max,
+        std::size_t C, std::size_t N)
+    {
+        if (!has_col_softmax_denom_pipeline())
+            return std::unexpected(Error{"col_softmax_denom_gpu: pipeline not available"});
+        auto out = GpuTensor::create_empty(1, N, *this);
+        if (!out) return std::unexpected(out.error());
+
+        std::vector<GpuTensor> inputs{logits, col_max};
+        std::vector<std::uint8_t> pc(2 * sizeof(std::uint32_t));
+        const auto put32 = [&](std::size_t off, std::uint32_t v)
+        { std::memcpy(pc.data() + off, &v, sizeof(std::uint32_t)); };
+        put32(0, static_cast<std::uint32_t>(C));
+        put32(4, static_cast<std::uint32_t>(N));
+
+        auto r = dispatch_bmm_generic(col_softmax_denom_pipeline_, inputs, *out, pc,
+            static_cast<std::uint32_t>(N));
+        if (!r) return std::unexpected(r.error());
+        return out;
+    }
+
+    // col_softmax_sparse_forward：grad 与 loss_vec（两趟式稀疏交叉熵）
+    // 返回 grad (C, N)；loss_vec 经 lv_out 传出 (1, N)
+    [[nodiscard]] Result<GpuTensor> col_softmax_sparse_forward_gpu(
+        const GpuTensor& logits, const GpuTensor& labels, const GpuTensor* mask,
+        std::size_t C, std::size_t N, std::size_t vocab_size,
+        Scalar inv_num_valid, GpuTensor* lv_out)
+    {
+        if (!has_col_softmax_sparse_forward_pipeline())
+            return std::unexpected(Error{"col_softmax_sparse_forward_gpu: pipeline not available"});
+        auto out = GpuTensor::create_empty(C, N, *this);
+        if (!out) return std::unexpected(out.error());
+        auto lv = GpuTensor::create_empty(1, N, *this);
+        if (!lv) return std::unexpected(lv.error());
+
+        std::vector<GpuTensor> inputs{logits, labels, mask ? *mask : labels};
+        const std::uint32_t flags = (mask ? 1u : 0u);
+        std::vector<std::uint8_t> pc(5 * sizeof(std::uint32_t));
+        const auto put32 = [&](std::size_t off, std::uint32_t v)
+        { std::memcpy(pc.data() + off, &v, sizeof(std::uint32_t)); };
+        put32(0, static_cast<std::uint32_t>(C));
+        put32(4, static_cast<std::uint32_t>(N));
+        put32(8, static_cast<std::uint32_t>(vocab_size));
+        put32(12, flags);
+        const float iv = static_cast<float>(inv_num_valid);
+        std::memcpy(pc.data() + 16, &iv, sizeof(float));
+
+        // bindings：Logits(0),Labels(1),Mask(2),LossVec(3),Grad(4)
+        inputs.push_back(*lv);
+        auto r = dispatch_bmm_generic(col_softmax_sparse_forward_pipeline_, inputs, *out, pc,
+            static_cast<std::uint32_t>(N));
+        if (!r) return std::unexpected(r.error());
+        *lv_out = std::move(*lv);
         return out;
     }
 

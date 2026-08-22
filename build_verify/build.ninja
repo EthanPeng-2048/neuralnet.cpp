@@ -1435,6 +1435,62 @@ build matmul_fusion_test.exe: CXX_EXECUTABLE_LINKER__matmul_fusion_test_Debug CM
   TARGET_SUPPORT_DIR = CMakeFiles\matmul_fusion_test.dir
 
 # =============================================================================
+# Object build statements for EXECUTABLE target ce_fusion_test
+
+
+#############################################
+# Order-only phony target for ce_fusion_test
+
+build cmake_object_order_depends_target_ce_fusion_test: phony || compile_gpu_shaders
+
+build CMakeFiles/ce_fusion_test.dir/src/ce_fusion_test.cpp.obj.ddi: CXX_SCAN__ce_fusion_test_Debug D$:/Codes/neuralnet.cpp/src/ce_fusion_test.cpp || cmake_object_order_depends_target_ce_fusion_test
+  DEFINES = -DNN_HAS_VULKAN
+  DEP_FILE = CMakeFiles\ce_fusion_test.dir\src\ce_fusion_test.cpp.obj.ddi.d
+  DYNDEP_INTERMEDIATE_FILE = CMakeFiles\ce_fusion_test.dir\src\ce_fusion_test.cpp.obj.ddi
+  FLAGS = -O0 -std=c++26 -D_DEBUG -D_DLL -D_MT -Xclang --dependent-lib=msvcrtd -g -Xclang -gcodeview -fno-exceptions -Wall -Wextra -Wpedantic -Werror -fexperimental-library -O0 -g
+  INCLUDES = -ID:/Codes/neuralnet.cpp/build_verify/generated -ID:/Codes/neuralnet.cpp/include -isystem C:/VulkanSDK/1.4.350.0/include
+  OBJ_FILE = CMakeFiles\ce_fusion_test.dir\src\ce_fusion_test.cpp.obj
+  PREPROCESSED_OUTPUT_FILE = CMakeFiles\ce_fusion_test.dir\src\ce_fusion_test.cpp.obj.ddi.i
+
+build CMakeFiles/ce_fusion_test.dir/src/ce_fusion_test.cpp.obj: CXX_COMPILER__ce_fusion_test_scanned_Debug D$:/Codes/neuralnet.cpp/src/ce_fusion_test.cpp | CMakeFiles/ce_fusion_test.dir/src/ce_fusion_test.cpp.obj.modmap || cmake_object_order_depends_target_ce_fusion_test CMakeFiles/ce_fusion_test.dir/CXX.dd
+  CONFIG = Debug
+  DEFINES = -DNN_HAS_VULKAN
+  DEP_FILE = CMakeFiles\ce_fusion_test.dir\src\ce_fusion_test.cpp.obj.d
+  DYNDEP_MODULE_MAP_FILE = CMakeFiles\ce_fusion_test.dir\src\ce_fusion_test.cpp.obj.modmap
+  FLAGS = -O0 -std=c++26 -D_DEBUG -D_DLL -D_MT -Xclang --dependent-lib=msvcrtd -g -Xclang -gcodeview -fno-exceptions -Wall -Wextra -Wpedantic -Werror -fexperimental-library -O0 -g
+  INCLUDES = -ID:/Codes/neuralnet.cpp/build_verify/generated -ID:/Codes/neuralnet.cpp/include -isystem C:/VulkanSDK/1.4.350.0/include
+  OBJECT_DIR = CMakeFiles\ce_fusion_test.dir
+  OBJECT_FILE_DIR = CMakeFiles\ce_fusion_test.dir\src
+  TARGET_COMPILE_PDB = CMakeFiles\ce_fusion_test.dir\
+  TARGET_PDB = ce_fusion_test.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\ce_fusion_test.dir
+  dyndep = CMakeFiles/ce_fusion_test.dir/CXX.dd
+
+build CMakeFiles/ce_fusion_test.dir/CXX.dd | CMakeFiles/ce_fusion_test.dir/CXXModules.json CMakeFiles/ce_fusion_test.dir/src/ce_fusion_test.cpp.obj.modmap: CXX_DYNDEP__ce_fusion_test_Debug CMakeFiles/ce_fusion_test.dir/src/ce_fusion_test.cpp.obj.ddi | D$:/Codes/neuralnet.cpp/build_verify/CMakeFiles/ce_fusion_test.dir/CXXDependInfo.json
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ce_fusion_test
+
+
+#############################################
+# Link the executable ce_fusion_test.exe
+
+build ce_fusion_test.exe: CXX_EXECUTABLE_LINKER__ce_fusion_test_Debug CMakeFiles/ce_fusion_test.dir/src/ce_fusion_test.cpp.obj | C$:/VulkanSDK/1.4.350.0/Lib/vulkan-1.lib || compile_gpu_shaders
+  CONFIG = Debug
+  FLAGS = -O0 -D_DEBUG -D_DLL -D_MT -Xclang --dependent-lib=msvcrtd -g -Xclang -gcodeview
+  LINK_FLAGS = -Xlinker /subsystem:console -fuse-ld=lld-link
+  LINK_LIBRARIES = C:/VulkanSDK/1.4.350.0/Lib/vulkan-1.lib  -lkernel32 -luser32 -lgdi32 -lwinspool -lshell32 -lole32 -loleaut32 -luuid -lcomdlg32 -ladvapi32 -loldnames
+  OBJECT_DIR = CMakeFiles\ce_fusion_test.dir
+  POST_BUILD = cd .
+  PRE_LINK = cd .
+  TARGET_COMPILE_PDB = CMakeFiles\ce_fusion_test.dir\
+  TARGET_FILE = ce_fusion_test.exe
+  TARGET_IMPLIB = ce_fusion_test.lib
+  TARGET_PDB = ce_fusion_test.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\ce_fusion_test.dir
+
+# =============================================================================
 # Object build statements for EXECUTABLE target scan_exprs
 
 
@@ -1546,7 +1602,7 @@ build gen_fused.exe: CXX_EXECUTABLE_LINKER__gen_fused_Debug CMakeFiles/gen_fused
 #############################################
 # Utility command for compile_gpu_shaders
 
-build compile_gpu_shaders: phony CMakeFiles/compile_gpu_shaders generated/batched_matmul_spv.hpp generated/bmm_apply_spv.hpp generated/bmm_denom_spv.hpp generated/bmm_reduce_spv.hpp generated/broadcast_spv.hpp generated/elementwise_v2_spv.hpp generated/fused_registry.hpp generated/gather_spv.hpp generated/matmul_spv.hpp generated/matmul_tiled_spv.hpp generated/rearrange_3d_spv.hpp generated/reduce_spv.hpp generated/scatter_add_spv.hpp generated/transpose_spv.hpp batched_matmul.spv bmm_apply.spv bmm_denom.spv bmm_reduce.spv broadcast.spv elementwise_v2.spv generated/expr_specs.bin gather.spv matmul.spv matmul_tiled.spv rearrange_3d.spv reduce.spv scatter_add.spv transpose.spv gen_fused.exe scan_exprs.exe
+build compile_gpu_shaders: phony CMakeFiles/compile_gpu_shaders generated/batched_matmul_spv.hpp generated/bmm_apply_spv.hpp generated/bmm_denom_spv.hpp generated/bmm_kv_backward_spv.hpp generated/bmm_q_backward_spv.hpp generated/bmm_reduce_spv.hpp generated/broadcast_spv.hpp generated/col_softmax_denom_spv.hpp generated/col_softmax_sparse_forward_spv.hpp generated/elementwise_v2_spv.hpp generated/fused_registry.hpp generated/gather_spv.hpp generated/matmul_spv.hpp generated/matmul_tiled_spv.hpp generated/rearrange_3d_spv.hpp generated/reduce_spv.hpp generated/scatter_add_spv.hpp generated/transpose_spv.hpp batched_matmul.spv bmm_apply.spv bmm_denom.spv bmm_kv_backward.spv bmm_q_backward.spv bmm_reduce.spv broadcast.spv col_softmax_denom.spv col_softmax_sparse_forward.spv elementwise_v2.spv generated/expr_specs.bin gather.spv matmul.spv matmul_tiled.spv rearrange_3d.spv reduce.spv scatter_add.spv transpose.spv gen_fused.exe scan_exprs.exe
 
 
 #############################################
@@ -1576,7 +1632,7 @@ build rebuild_cache: phony CMakeFiles/rebuild_cache.util
 #############################################
 # Phony custom command for CMakeFiles\compile_gpu_shaders
 
-build CMakeFiles/compile_gpu_shaders | ${cmake_ninja_workdir}CMakeFiles/compile_gpu_shaders: phony generated/matmul_spv.hpp generated/matmul_tiled_spv.hpp generated/batched_matmul_spv.hpp generated/rearrange_3d_spv.hpp generated/elementwise_v2_spv.hpp generated/reduce_spv.hpp generated/broadcast_spv.hpp generated/transpose_spv.hpp generated/gather_spv.hpp generated/scatter_add_spv.hpp generated/bmm_reduce_spv.hpp generated/bmm_denom_spv.hpp generated/bmm_apply_spv.hpp generated/fused_registry.hpp || gen_fused.exe scan_exprs.exe
+build CMakeFiles/compile_gpu_shaders | ${cmake_ninja_workdir}CMakeFiles/compile_gpu_shaders: phony generated/matmul_spv.hpp generated/matmul_tiled_spv.hpp generated/batched_matmul_spv.hpp generated/rearrange_3d_spv.hpp generated/elementwise_v2_spv.hpp generated/reduce_spv.hpp generated/broadcast_spv.hpp generated/transpose_spv.hpp generated/gather_spv.hpp generated/scatter_add_spv.hpp generated/bmm_reduce_spv.hpp generated/bmm_denom_spv.hpp generated/bmm_apply_spv.hpp generated/bmm_q_backward_spv.hpp generated/bmm_kv_backward_spv.hpp generated/col_softmax_denom_spv.hpp generated/col_softmax_sparse_forward_spv.hpp generated/fused_registry.hpp || gen_fused.exe scan_exprs.exe
 
 
 #############################################
@@ -1607,6 +1663,24 @@ build generated/bmm_denom_spv.hpp | ${cmake_ninja_workdir}generated/bmm_denom_sp
 
 
 #############################################
+# Custom command for generated\bmm_kv_backward_spv.hpp
+
+build generated/bmm_kv_backward_spv.hpp | ${cmake_ninja_workdir}generated/bmm_kv_backward_spv.hpp: CUSTOM_COMMAND bmm_kv_backward.spv D$:/Codes/neuralnet.cpp/cmake/embed_spirv.cmake || gen_fused.exe scan_exprs.exe
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D D:\Codes\neuralnet.cpp\build_verify && "C:\Program Files\CMake\bin\cmake.exe" -DSPV_INPUT=D:/Codes/neuralnet.cpp/build_verify/bmm_kv_backward.spv -DHPP_OUTPUT=D:/Codes/neuralnet.cpp/build_verify/generated/bmm_kv_backward_spv.hpp -DFUNC_NAME=nn_bmm_kv_backward_spirv_bytecode -P D:/Codes/neuralnet.cpp/cmake/embed_spirv.cmake"
+  DESC = [GPU] Embedding bmm_kv_backward SPIR-V into C++ header
+  restat = 1
+
+
+#############################################
+# Custom command for generated\bmm_q_backward_spv.hpp
+
+build generated/bmm_q_backward_spv.hpp | ${cmake_ninja_workdir}generated/bmm_q_backward_spv.hpp: CUSTOM_COMMAND bmm_q_backward.spv D$:/Codes/neuralnet.cpp/cmake/embed_spirv.cmake || gen_fused.exe scan_exprs.exe
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D D:\Codes\neuralnet.cpp\build_verify && "C:\Program Files\CMake\bin\cmake.exe" -DSPV_INPUT=D:/Codes/neuralnet.cpp/build_verify/bmm_q_backward.spv -DHPP_OUTPUT=D:/Codes/neuralnet.cpp/build_verify/generated/bmm_q_backward_spv.hpp -DFUNC_NAME=nn_bmm_q_backward_spirv_bytecode -P D:/Codes/neuralnet.cpp/cmake/embed_spirv.cmake"
+  DESC = [GPU] Embedding bmm_q_backward SPIR-V into C++ header
+  restat = 1
+
+
+#############################################
 # Custom command for generated\bmm_reduce_spv.hpp
 
 build generated/bmm_reduce_spv.hpp | ${cmake_ninja_workdir}generated/bmm_reduce_spv.hpp: CUSTOM_COMMAND bmm_reduce.spv D$:/Codes/neuralnet.cpp/cmake/embed_spirv.cmake || gen_fused.exe scan_exprs.exe
@@ -1621,6 +1695,24 @@ build generated/bmm_reduce_spv.hpp | ${cmake_ninja_workdir}generated/bmm_reduce_
 build generated/broadcast_spv.hpp | ${cmake_ninja_workdir}generated/broadcast_spv.hpp: CUSTOM_COMMAND broadcast.spv D$:/Codes/neuralnet.cpp/cmake/embed_spirv.cmake || gen_fused.exe scan_exprs.exe
   COMMAND = C:\Windows\system32\cmd.exe /C "cd /D D:\Codes\neuralnet.cpp\build_verify && "C:\Program Files\CMake\bin\cmake.exe" -DSPV_INPUT=D:/Codes/neuralnet.cpp/build_verify/broadcast.spv -DHPP_OUTPUT=D:/Codes/neuralnet.cpp/build_verify/generated/broadcast_spv.hpp -DFUNC_NAME=nn_broadcast_spirv_bytecode -P D:/Codes/neuralnet.cpp/cmake/embed_spirv.cmake"
   DESC = [GPU] Embedding broadcast SPIR-V into C++ header
+  restat = 1
+
+
+#############################################
+# Custom command for generated\col_softmax_denom_spv.hpp
+
+build generated/col_softmax_denom_spv.hpp | ${cmake_ninja_workdir}generated/col_softmax_denom_spv.hpp: CUSTOM_COMMAND col_softmax_denom.spv D$:/Codes/neuralnet.cpp/cmake/embed_spirv.cmake || gen_fused.exe scan_exprs.exe
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D D:\Codes\neuralnet.cpp\build_verify && "C:\Program Files\CMake\bin\cmake.exe" -DSPV_INPUT=D:/Codes/neuralnet.cpp/build_verify/col_softmax_denom.spv -DHPP_OUTPUT=D:/Codes/neuralnet.cpp/build_verify/generated/col_softmax_denom_spv.hpp -DFUNC_NAME=nn_col_softmax_denom_spirv_bytecode -P D:/Codes/neuralnet.cpp/cmake/embed_spirv.cmake"
+  DESC = [GPU] Embedding col_softmax_denom SPIR-V into C++ header
+  restat = 1
+
+
+#############################################
+# Custom command for generated\col_softmax_sparse_forward_spv.hpp
+
+build generated/col_softmax_sparse_forward_spv.hpp | ${cmake_ninja_workdir}generated/col_softmax_sparse_forward_spv.hpp: CUSTOM_COMMAND col_softmax_sparse_forward.spv D$:/Codes/neuralnet.cpp/cmake/embed_spirv.cmake || gen_fused.exe scan_exprs.exe
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D D:\Codes\neuralnet.cpp\build_verify && "C:\Program Files\CMake\bin\cmake.exe" -DSPV_INPUT=D:/Codes/neuralnet.cpp/build_verify/col_softmax_sparse_forward.spv -DHPP_OUTPUT=D:/Codes/neuralnet.cpp/build_verify/generated/col_softmax_sparse_forward_spv.hpp -DFUNC_NAME=nn_col_softmax_sparse_forward_spirv_bytecode -P D:/Codes/neuralnet.cpp/cmake/embed_spirv.cmake"
+  DESC = [GPU] Embedding col_softmax_sparse_forward SPIR-V into C++ header
   restat = 1
 
 
@@ -1733,6 +1825,24 @@ build bmm_denom.spv | ${cmake_ninja_workdir}bmm_denom.spv: CUSTOM_COMMAND D$:/Co
 
 
 #############################################
+# Custom command for bmm_kv_backward.spv
+
+build bmm_kv_backward.spv | ${cmake_ninja_workdir}bmm_kv_backward.spv: CUSTOM_COMMAND D$:/Codes/neuralnet.cpp/shaders/bmm_kv_backward.comp || gen_fused.exe scan_exprs.exe
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D D:\Codes\neuralnet.cpp\build_verify && C:\VulkanSDK\1.4.350.0\Bin\glslc.exe -o D:/Codes/neuralnet.cpp/build_verify/bmm_kv_backward.spv D:/Codes/neuralnet.cpp/shaders/bmm_kv_backward.comp"
+  DESC = [GPU] Compiling bmm_kv_backward.comp → bmm_kv_backward.spv
+  restat = 1
+
+
+#############################################
+# Custom command for bmm_q_backward.spv
+
+build bmm_q_backward.spv | ${cmake_ninja_workdir}bmm_q_backward.spv: CUSTOM_COMMAND D$:/Codes/neuralnet.cpp/shaders/bmm_q_backward.comp || gen_fused.exe scan_exprs.exe
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D D:\Codes\neuralnet.cpp\build_verify && C:\VulkanSDK\1.4.350.0\Bin\glslc.exe -o D:/Codes/neuralnet.cpp/build_verify/bmm_q_backward.spv D:/Codes/neuralnet.cpp/shaders/bmm_q_backward.comp"
+  DESC = [GPU] Compiling bmm_q_backward.comp → bmm_q_backward.spv
+  restat = 1
+
+
+#############################################
 # Custom command for bmm_reduce.spv
 
 build bmm_reduce.spv | ${cmake_ninja_workdir}bmm_reduce.spv: CUSTOM_COMMAND D$:/Codes/neuralnet.cpp/shaders/bmm_reduce.comp || gen_fused.exe scan_exprs.exe
@@ -1747,6 +1857,24 @@ build bmm_reduce.spv | ${cmake_ninja_workdir}bmm_reduce.spv: CUSTOM_COMMAND D$:/
 build broadcast.spv | ${cmake_ninja_workdir}broadcast.spv: CUSTOM_COMMAND D$:/Codes/neuralnet.cpp/shaders/broadcast.comp || gen_fused.exe scan_exprs.exe
   COMMAND = C:\Windows\system32\cmd.exe /C "cd /D D:\Codes\neuralnet.cpp\build_verify && C:\VulkanSDK\1.4.350.0\Bin\glslc.exe -o D:/Codes/neuralnet.cpp/build_verify/broadcast.spv D:/Codes/neuralnet.cpp/shaders/broadcast.comp"
   DESC = [GPU] Compiling broadcast.comp → broadcast.spv
+  restat = 1
+
+
+#############################################
+# Custom command for col_softmax_denom.spv
+
+build col_softmax_denom.spv | ${cmake_ninja_workdir}col_softmax_denom.spv: CUSTOM_COMMAND D$:/Codes/neuralnet.cpp/shaders/col_softmax_denom.comp || gen_fused.exe scan_exprs.exe
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D D:\Codes\neuralnet.cpp\build_verify && C:\VulkanSDK\1.4.350.0\Bin\glslc.exe -o D:/Codes/neuralnet.cpp/build_verify/col_softmax_denom.spv D:/Codes/neuralnet.cpp/shaders/col_softmax_denom.comp"
+  DESC = [GPU] Compiling col_softmax_denom.comp → col_softmax_denom.spv
+  restat = 1
+
+
+#############################################
+# Custom command for col_softmax_sparse_forward.spv
+
+build col_softmax_sparse_forward.spv | ${cmake_ninja_workdir}col_softmax_sparse_forward.spv: CUSTOM_COMMAND D$:/Codes/neuralnet.cpp/shaders/col_softmax_sparse_forward.comp || gen_fused.exe scan_exprs.exe
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D D:\Codes\neuralnet.cpp\build_verify && C:\VulkanSDK\1.4.350.0\Bin\glslc.exe -o D:/Codes/neuralnet.cpp/build_verify/col_softmax_sparse_forward.spv D:/Codes/neuralnet.cpp/shaders/col_softmax_sparse_forward.comp"
+  DESC = [GPU] Compiling col_softmax_sparse_forward.comp → col_softmax_sparse_forward.spv
   restat = 1
 
 
@@ -1841,6 +1969,8 @@ build attn_gradcheck: phony attn_gradcheck.exe
 
 build bench_thresholds: phony bench_thresholds.exe
 
+build ce_fusion_test: phony ce_fusion_test.exe
+
 build compute_bench: phony compute_bench.exe
 
 build doc_attn_test: phony doc_attn_test.exe
@@ -1895,7 +2025,7 @@ build tokenizer_train: phony tokenizer_train.exe
 #############################################
 # Folder: D:/Codes/neuralnet.cpp/build_verify
 
-build all: phony mnist_train.exe mnist_infer.exe mnist_bench.exe text_train.exe text_infer.exe tokenizer_train.exe tokenizer_infer.exe compute_bench.exe bench_thresholds.exe gpu_test.exe attn_consistency_test.exe swiglu_gradcheck.exe rmsnorm_gradcheck.exe gpt_gradcheck.exe doc_mask_test.exe doc_attn_test.exe attn_gradcheck.exe fused_gpu_test.exe tensor_expr_test.exe expr_dsl_test.exe expr_reduce_test.exe softmax_gradcheck.exe attn_debug.exe matmul_probe.exe matmul_fusion_test.exe scan_exprs.exe gen_fused.exe
+build all: phony mnist_train.exe mnist_infer.exe mnist_bench.exe text_train.exe text_infer.exe tokenizer_train.exe tokenizer_infer.exe compute_bench.exe bench_thresholds.exe gpu_test.exe attn_consistency_test.exe swiglu_gradcheck.exe rmsnorm_gradcheck.exe gpt_gradcheck.exe doc_mask_test.exe doc_attn_test.exe attn_gradcheck.exe fused_gpu_test.exe tensor_expr_test.exe expr_dsl_test.exe expr_reduce_test.exe softmax_gradcheck.exe attn_debug.exe matmul_probe.exe matmul_fusion_test.exe ce_fusion_test.exe scan_exprs.exe gen_fused.exe
 
 # =============================================================================
 # Built-in targets
@@ -1904,14 +2034,14 @@ build all: phony mnist_train.exe mnist_infer.exe mnist_bench.exe text_train.exe 
 #############################################
 # Re-run CMake if any of its inputs changed.
 
-build build.ninja D$:/Codes/neuralnet.cpp/build_verify/cmake_install.cmake: RERUN_CMAKE | C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeCXXCompiler.cmake.in C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeCXXCompilerABI.cpp C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeCXXInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeCommonLanguageInclude.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeCompilerIdDetection.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeDetermineCXXCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeDetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeDetermineCompilerABI.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeDetermineCompilerId.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeDetermineCompilerSupport.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeDetermineRCCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeDetermineSystem.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeFindBinUtils.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeGenericSystem.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeInitializeConfigs.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeLanguageInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeNinjaFindMake.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeParseImplicitIncludeInfo.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeParseImplicitLinkInfo.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeParseLibraryArchitecture.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeRCCompiler.cmake.in C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeRCInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeSystem.cmake.in C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeSystemSpecificInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeSystemSpecificInitialize.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeTestCXXCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeTestCompilerCommon.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeTestRCCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CheckCXXSourceCompiles.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CheckIncludeFileCXX.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CheckLibraryExists.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/ADSP-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/ARMCC-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/ARMClang-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/AppleClang-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Borland-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/CMakeCommonCompilerMacros.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Clang-CXX-CXXImportStd.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Clang-CXX-FeatureTests.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Clang-CXX-TestableFeatures.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Clang-CXX.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Clang-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Clang-DetermineCompilerInternal.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Clang-FindBinUtils.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Clang.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Compaq-CXX-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Cray-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/CrayClang-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Diab-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Embarcadero-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Fujitsu-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/FujitsuClang-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/GHS-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/GNU-CXX-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/HP-CXX-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/IAR-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/IBMCPP-CXX-DetermineVersionInternal.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/IBMClang-CXX-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Intel-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/IntelLLVM-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/LCC-CXX-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/MSVC-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/NVHPC-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/NVIDIA-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/OpenWatcom-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/OrangeC-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/PGI-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/PathScale-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Renesas-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/SCO-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/SunPro-CXX-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/TI-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/TIClang-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Tasking-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/VisualAge-CXX-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Watcom-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/XL-CXX-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/XLClang-CXX-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/zOS-CXX-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/FindPackageHandleStandardArgs.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/FindPackageMessage.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/FindThreads.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/FindVulkan.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Internal/CMakeCXXLinkerInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Internal/CMakeCommonLinkerInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Internal/CMakeDetermineLinkerId.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Internal/CMakeInspectCXXLinker.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Internal/CheckSourceCompiles.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Internal/FeatureTesting.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Linker/LLD-CXX.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Linker/LLD.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Linker/MSVC.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Linker/Windows-LLD-CXX.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Linker/Windows-LLD.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Linker/Windows-MSVC.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Windows-Clang-CXX.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Windows-Clang.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Windows-Determine-CXX.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Windows-Initialize.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Windows.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/WindowsPaths.cmake CMakeCache.txt CMakeFiles/4.3.3/CMakeCXXCompiler.cmake CMakeFiles/4.3.3/CMakeRCCompiler.cmake CMakeFiles/4.3.3/CMakeSystem.cmake D$:/Codes/neuralnet.cpp/CMakeLists.txt
+build build.ninja D$:/Codes/neuralnet.cpp/build_verify/cmake_install.cmake: RERUN_CMAKE | C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeCXXInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeCommonLanguageInclude.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeGenericSystem.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeInitializeConfigs.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeLanguageInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeRCInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeSystemSpecificInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeSystemSpecificInitialize.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CheckCXXSourceCompiles.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CheckIncludeFileCXX.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CheckLibraryExists.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/CMakeCommonCompilerMacros.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Clang-CXX.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Clang.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/FindPackageHandleStandardArgs.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/FindPackageMessage.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/FindThreads.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/FindVulkan.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Internal/CMakeCXXLinkerInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Internal/CMakeCommonLinkerInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Internal/CheckSourceCompiles.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Linker/LLD-CXX.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Linker/LLD.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Linker/MSVC.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Linker/Windows-LLD-CXX.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Linker/Windows-LLD.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Linker/Windows-MSVC.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Windows-Clang-CXX.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Windows-Clang.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Windows-Initialize.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Windows.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/WindowsPaths.cmake CMakeCache.txt CMakeFiles/4.3.3/CMakeCXXCompiler.cmake CMakeFiles/4.3.3/CMakeRCCompiler.cmake CMakeFiles/4.3.3/CMakeSystem.cmake D$:/Codes/neuralnet.cpp/CMakeLists.txt
   pool = console
 
 
 #############################################
 # A missing CMake input file is not an error.
 
-build C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeCXXCompiler.cmake.in C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeCXXCompilerABI.cpp C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeCXXInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeCommonLanguageInclude.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeCompilerIdDetection.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeDetermineCXXCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeDetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeDetermineCompilerABI.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeDetermineCompilerId.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeDetermineCompilerSupport.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeDetermineRCCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeDetermineSystem.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeFindBinUtils.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeGenericSystem.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeInitializeConfigs.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeLanguageInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeNinjaFindMake.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeParseImplicitIncludeInfo.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeParseImplicitLinkInfo.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeParseLibraryArchitecture.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeRCCompiler.cmake.in C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeRCInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeSystem.cmake.in C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeSystemSpecificInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeSystemSpecificInitialize.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeTestCXXCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeTestCompilerCommon.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeTestRCCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CheckCXXSourceCompiles.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CheckIncludeFileCXX.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CheckLibraryExists.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/ADSP-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/ARMCC-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/ARMClang-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/AppleClang-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Borland-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/CMakeCommonCompilerMacros.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Clang-CXX-CXXImportStd.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Clang-CXX-FeatureTests.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Clang-CXX-TestableFeatures.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Clang-CXX.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Clang-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Clang-DetermineCompilerInternal.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Clang-FindBinUtils.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Clang.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Compaq-CXX-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Cray-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/CrayClang-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Diab-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Embarcadero-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Fujitsu-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/FujitsuClang-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/GHS-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/GNU-CXX-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/HP-CXX-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/IAR-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/IBMCPP-CXX-DetermineVersionInternal.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/IBMClang-CXX-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Intel-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/IntelLLVM-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/LCC-CXX-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/MSVC-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/NVHPC-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/NVIDIA-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/OpenWatcom-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/OrangeC-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/PGI-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/PathScale-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Renesas-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/SCO-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/SunPro-CXX-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/TI-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/TIClang-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Tasking-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/VisualAge-CXX-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Watcom-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/XL-CXX-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/XLClang-CXX-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/zOS-CXX-DetermineCompiler.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/FindPackageHandleStandardArgs.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/FindPackageMessage.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/FindThreads.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/FindVulkan.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Internal/CMakeCXXLinkerInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Internal/CMakeCommonLinkerInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Internal/CMakeDetermineLinkerId.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Internal/CMakeInspectCXXLinker.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Internal/CheckSourceCompiles.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Internal/FeatureTesting.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Linker/LLD-CXX.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Linker/LLD.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Linker/MSVC.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Linker/Windows-LLD-CXX.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Linker/Windows-LLD.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Linker/Windows-MSVC.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Windows-Clang-CXX.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Windows-Clang.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Windows-Determine-CXX.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Windows-Initialize.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Windows.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/WindowsPaths.cmake CMakeCache.txt CMakeFiles/4.3.3/CMakeCXXCompiler.cmake CMakeFiles/4.3.3/CMakeRCCompiler.cmake CMakeFiles/4.3.3/CMakeSystem.cmake D$:/Codes/neuralnet.cpp/CMakeLists.txt: phony
+build C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeCXXInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeCommonLanguageInclude.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeGenericSystem.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeInitializeConfigs.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeLanguageInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeRCInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeSystemSpecificInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CMakeSystemSpecificInitialize.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CheckCXXSourceCompiles.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CheckIncludeFileCXX.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/CheckLibraryExists.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/CMakeCommonCompilerMacros.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Clang-CXX.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Compiler/Clang.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/FindPackageHandleStandardArgs.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/FindPackageMessage.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/FindThreads.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/FindVulkan.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Internal/CMakeCXXLinkerInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Internal/CMakeCommonLinkerInformation.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Internal/CheckSourceCompiles.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Linker/LLD-CXX.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Linker/LLD.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Linker/MSVC.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Linker/Windows-LLD-CXX.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Linker/Windows-LLD.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Linker/Windows-MSVC.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Windows-Clang-CXX.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Windows-Clang.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Windows-Initialize.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/Windows.cmake C$:/Program$ Files/CMake/share/cmake-4.3/Modules/Platform/WindowsPaths.cmake CMakeCache.txt CMakeFiles/4.3.3/CMakeCXXCompiler.cmake CMakeFiles/4.3.3/CMakeRCCompiler.cmake CMakeFiles/4.3.3/CMakeSystem.cmake D$:/Codes/neuralnet.cpp/CMakeLists.txt: phony
 
 
 #############################################

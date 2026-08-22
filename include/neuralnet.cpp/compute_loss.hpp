@@ -126,13 +126,18 @@ private:
     Tensor grad_input_;
 
     // ── 按列 softmax（dense/sparse forward 共用）──────────────────────
-    // col_max → shifted = logits - col_max → exp → col_sum → softmax
+    // col_max → col_sum = col_softmax_denom（M5 融合，不物化 exp 中间张量）
+    //         → softmax = exp(logits - col_max) / col_sum
     // 返回 (classes, batch) 的 softmax 张量
     [[nodiscard]] static Result<Tensor> softmax_cols_(
         ComputeEngine& engine, const Tensor& logits)
     {
         auto col_max = engine.col_reduce_max(logits);
         if (!col_max) return std::unexpected(col_max.error());
+
+        // M5：列式稳定 exp 和（单 kernel 融合，读 logits 一遍，不物化 exp 张量）
+        auto col_sum = engine.col_softmax_denom(logits, *col_max);
+        if (!col_sum) return std::unexpected(col_sum.error());
 
         auto shifted = clone_tensor(engine, logits);
         if (!shifted) return std::unexpected(shifted.error());
@@ -141,9 +146,6 @@ private:
 
         auto exp_shift = engine.elementwise_unary(UnaryOp::Exp, *shifted);
         if (!exp_shift) return std::unexpected(exp_shift.error());
-
-        auto col_sum = engine.col_reduce_sum(*exp_shift);
-        if (!col_sum) return std::unexpected(col_sum.error());
 
         // softmax 就地于 exp_shift 上，省一次 (classes, batch) 分配
         r = engine.broadcast_col_inplace(*exp_shift, *col_sum, BinaryOp::Div);
@@ -212,13 +214,14 @@ public:
     // 解决大词表（vocab_size≈25k）+ 大 batch 时 one-hot 矩阵
     // (vocab_size, total_tokens) 爆显存的问题。
     //
-    // 算法：
-    //   1. 在 GPU 上计算 softmax（与 dense 版相同）
-    //   2. 下载 softmax 到 CPU（唯一的大数据传输）
-    //   3. 在 CPU 上用整数标签计算 loss 和 gradient
-    //      loss = -(1/N) * Σ log(softmax[labels[i], i])
-    //      grad = softmax;  grad[labels[i]][i] -= 1.0（对有效位置）
-    //   4. 将 gradient 上传回 GPU
+    // M5 融合路径（默认）：
+    //   1. 上传 labels / loss_mask 为 (1, total) 浮点张量（小传输）
+    //   2. col_softmax_sparse_forward 单 kernel：列内 max + denom + 稠密梯度
+    //      + 标签位置 log_softmax（loss_vec）——不物化 (classes, total) 全 softmax
+    //   3. loss = -(1/num_valid)·Σ loss_vec（下载标量）
+    // 正确性回退（保留旧路径）：GPU 上算 softmax → 下载 CPU → CPU 算 loss/grad
+    //   → 上传。当融合原语不可用（如 vocab_size>2^24 浮点标签不可精确表示）
+    //   时自动回退，保证数值一致。
     //
     // 参数：
     //   labels     — 平坦标签数组，大小 = logits.cols()，值域 [0, vocab_size)
@@ -241,6 +244,81 @@ public:
         if (classes == 0 || total == 0)
             return std::unexpected(Error{"sparse CE: empty input"});
 
+        // ── M5 融合路径（默认；不物化全 softmax） ──
+        auto fused = fused_forward_sparse_(engine, logits, labels, loss_mask, vocab_size);
+        if (fused) return *fused;
+        // 融合不可用 → 回退旧路径（下载 softmax 到 CPU，正确性安全网）
+        return fallback_forward_sparse_(engine, logits, labels, loss_mask, vocab_size);
+    }
+
+    // ── M5 融合路径实现（单 kernel：col_max + denom + 稠密梯度 + loss_vec） ──
+    [[nodiscard]] Result<Scalar> fused_forward_sparse_(
+        ComputeEngine& engine, const Tensor& logits,
+        std::span<const std::size_t> labels,
+        std::span<const Scalar> loss_mask,
+        std::size_t vocab_size)
+    {
+        const std::size_t total = logits.cols();
+
+        // 1. 上传 labels（(1, total) 浮点打包；vocab_size ≤ 2^24 时可精确表示）
+        Matrix labels_m(1, total);
+        {
+            auto sp = labels_m.span();
+            for (std::size_t i = 0; i < total; ++i)
+                sp[i] = static_cast<Scalar>(labels[i]);
+        }
+        auto labels_t = engine.from_matrix(labels_m);
+        if (!labels_t) return std::unexpected(labels_t.error());
+
+        // 2. 上传 mask（可选，(1, total) 0/1）
+        std::optional<Tensor> mask_t;
+        const Tensor* mask_ptr = nullptr;
+        if (!loss_mask.empty())
+        {
+            Matrix mask_m(1, total);
+            auto sp = mask_m.span();
+            for (std::size_t i = 0; i < total; ++i)
+                sp[i] = (loss_mask[i] >= Scalar{0.5}) ? Scalar{1} : Scalar{0};
+            auto mt = engine.from_matrix(mask_m);
+            if (!mt) return std::unexpected(mt.error());
+            mask_t = std::move(*mt);
+            mask_ptr = &*mask_t;
+        }
+
+        // 3. num_valid（CPU 直接统计 labels/mask；kernel 内部同样判定）
+        std::size_t num_valid = 0;
+        for (std::size_t i = 0; i < total; ++i)
+        {
+            const bool masked = !loss_mask.empty() && loss_mask[i] < Scalar{0.5};
+            if (!masked && labels[i] < vocab_size) ++num_valid;
+        }
+        const Scalar inv_num_valid = (num_valid > 0)
+            ? Scalar{1} / static_cast<Scalar>(num_valid) : Scalar{0};
+
+        // 4. 融合 kernel：grad（稠密）+ loss_vec（标签位置 log_softmax）
+        Tensor loss_vec;
+        auto grad = engine.col_softmax_sparse_forward(
+            logits, *labels_t, mask_ptr, vocab_size, inv_num_valid, loss_vec);
+        if (!grad) return std::unexpected(grad.error());
+        grad_input_ = std::move(*grad);
+
+        // 5. loss = -(1/num_valid)·Σ loss_vec（无效列 kernel 已置 0）
+        auto total_t = engine.row_reduce_sum(loss_vec);   // (1, total) → (1, 1)
+        if (!total_t) return std::unexpected(total_t.error());
+        auto m = engine.to_matrix(*total_t);
+        if (!m) return std::unexpected(m.error());
+        return (num_valid > 0)
+            ? -m->at_unchecked(0, 0) / static_cast<Scalar>(num_valid)
+            : Scalar{0};
+    }
+
+    // ── 旧路径（正确性回退）：GPU softmax → 下载 CPU → CPU loss/grad → 上传 ──
+    [[nodiscard]] Result<Scalar> fallback_forward_sparse_(
+        ComputeEngine& engine, const Tensor& logits,
+        std::span<const std::size_t> labels,
+        std::span<const Scalar> loss_mask,
+        std::size_t vocab_size)
+    {
         // ── 1. GPU 上计算 softmax（与 dense forward 共用 softmax_cols_） ──
         auto softmax_t = softmax_cols_(engine, logits);
         if (!softmax_t) return std::unexpected(softmax_t.error());

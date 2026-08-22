@@ -111,7 +111,12 @@ nn_add_executable(attn_debug src/attn_debug.cpp)
 nn_add_executable(matmul_probe src/matmul_probe.cpp)
 
 # ── M4 matmul 融合原语测试（bmm_reduce/bmm_denom/bmm_apply，CPU+GPU） ──
+# ── M6 两趟式注意力反向原语测试（bmm_q_backward/bmm_kv_backward，CPU+GPU）
+# ── M5 列式 softmax 融合原语测试（col_softmax_denom/col_softmax_sparse_forward）
 nn_add_executable(matmul_fusion_test src/matmul_fusion_test.cpp)
+
+# ── M5 稀疏交叉熵融合测试（loss/grad vs 参考，CPU+GPU） ──
+nn_add_executable(ce_fusion_test src/ce_fusion_test.cpp)
 
 # ── Vulkan GPU 加速（可选） ────────────────────────────────────────────────
 find_package(Vulkan QUIET)
@@ -138,7 +143,11 @@ if(Vulkan_FOUND)
         scatter_add
         bmm_reduce
         bmm_denom
-        bmm_apply)
+        bmm_apply
+        bmm_q_backward
+        bmm_kv_backward
+        col_softmax_denom
+        col_softmax_sparse_forward)
     # ── 融合 shader：构建期从 Layer 内联表达式自动合成 ───────────────
     # 表达式**文本只出现在 Layer**（compute / start_expr..end_expr）。
     # 构建期两步：
@@ -239,6 +248,7 @@ if(Vulkan_FOUND)
             attn_debug
             matmul_probe
             matmul_fusion_test
+            ce_fusion_test
             doc_attn_test
         )
 

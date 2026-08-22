@@ -440,6 +440,166 @@ public:
         return Tensor::from_gpu(std::move(*r));
     }
 
+    // 两趟式注意力反向 Pass 1：R 与 grad_Q（GPU 融合 kernel，不物化得分矩阵）
+    [[nodiscard]] Result<Tensor> batched_matmul_softmax_backward_q(
+        const Tensor& A, const Tensor& B, const Tensor& P,
+        const Tensor& row_max, const Tensor& denom,
+        std::size_t batch, bool transA, bool transB, Scalar alpha,
+        Tensor& r_out, const Tensor* mask) override
+    {
+        if (batch == 0)
+            return std::unexpected(Error{"batched_matmul_softmax_backward_q: batch must be > 0"});
+        if (A.rows() % batch != 0 || B.rows() % batch != 0 || P.rows() % batch != 0)
+            return std::unexpected(Error{"batched_matmul_softmax_backward_q: rows not divisible by batch"});
+        const std::size_t a_rpb = A.rows() / batch;
+        const std::size_t b_rpb = B.rows() / batch;
+        const std::size_t M = transA ? A.cols() : a_rpb;
+        const std::size_t K = transA ? a_rpb : A.cols();
+        const std::size_t K2 = transB ? B.cols() : b_rpb;
+        const std::size_t N = transB ? b_rpb : B.cols();
+        if (K != K2)
+            return std::unexpected(Error{"batched_matmul_softmax_backward_q: K dimension mismatch"});
+
+        auto a_gpu = ensure_gpu(A);
+        if (!a_gpu) return std::unexpected(a_gpu.error());
+        auto b_gpu = ensure_gpu(B);
+        if (!b_gpu) return std::unexpected(b_gpu.error());
+        auto p_gpu = ensure_gpu(P);
+        if (!p_gpu) return std::unexpected(p_gpu.error());
+        auto m_gpu = ensure_gpu(row_max);
+        if (!m_gpu) return std::unexpected(m_gpu.error());
+        auto l_gpu = ensure_gpu(denom);
+        if (!l_gpu) return std::unexpected(l_gpu.error());
+        std::optional<GpuTensor> mask_gpu;
+        GpuTensor* mask_ptr = nullptr;
+        if (mask)
+        {
+            auto mg = ensure_gpu(*mask);
+            if (!mg) return std::unexpected(mg.error());
+            mask_gpu = mg->gpu_tensor();
+            mask_ptr = &*mask_gpu;
+        }
+        GpuTensor r_gpu;
+        auto r = backend_.bmm_q_backward_gpu(
+            a_gpu->gpu_tensor(), b_gpu->gpu_tensor(), mask_ptr,
+            m_gpu->gpu_tensor(), l_gpu->gpu_tensor(), p_gpu->gpu_tensor(),
+            M, N, K, batch, transA, transB, alpha, &r_gpu);
+        if (!r) return std::unexpected(r.error());
+        r_out = Tensor::from_gpu(std::move(r_gpu));
+        return Tensor::from_gpu(std::move(*r));
+    }
+
+    // 两趟式注意力反向 Pass 2：grad_K 与 grad_V（GPU 融合 kernel）
+    [[nodiscard]] Result<Tensor> batched_matmul_softmax_backward_kv(
+        const Tensor& A, const Tensor& B, const Tensor& P,
+        const Tensor& G, const Tensor& R,
+        const Tensor& row_max, const Tensor& denom,
+        std::size_t batch, bool transA, bool transB, Scalar alpha,
+        Tensor& grad_v_out, const Tensor* mask) override
+    {
+        if (batch == 0)
+            return std::unexpected(Error{"batched_matmul_softmax_backward_kv: batch must be > 0"});
+        if (A.rows() % batch != 0 || B.rows() % batch != 0 || P.rows() % batch != 0
+            || G.rows() % batch != 0)
+            return std::unexpected(Error{"batched_matmul_softmax_backward_kv: rows not divisible by batch"});
+        const std::size_t a_rpb = A.rows() / batch;
+        const std::size_t b_rpb = B.rows() / batch;
+        const std::size_t M = transA ? A.cols() : a_rpb;
+        const std::size_t K = transA ? a_rpb : A.cols();
+        const std::size_t K2 = transB ? B.cols() : b_rpb;
+        const std::size_t N = transB ? b_rpb : B.cols();
+        const std::size_t D = G.cols();
+        if (K != K2)
+            return std::unexpected(Error{"batched_matmul_softmax_backward_kv: K dimension mismatch"});
+        if (G.rows() != batch * M)
+            return std::unexpected(Error{"batched_matmul_softmax_backward_kv: G rows != batch*M"});
+
+        auto a_gpu = ensure_gpu(A);
+        if (!a_gpu) return std::unexpected(a_gpu.error());
+        auto b_gpu = ensure_gpu(B);
+        if (!b_gpu) return std::unexpected(b_gpu.error());
+        auto p_gpu = ensure_gpu(P);
+        if (!p_gpu) return std::unexpected(p_gpu.error());
+        auto g_gpu = ensure_gpu(G);
+        if (!g_gpu) return std::unexpected(g_gpu.error());
+        auto r_gpu = ensure_gpu(R);
+        if (!r_gpu) return std::unexpected(r_gpu.error());
+        auto m_gpu = ensure_gpu(row_max);
+        if (!m_gpu) return std::unexpected(m_gpu.error());
+        auto l_gpu = ensure_gpu(denom);
+        if (!l_gpu) return std::unexpected(l_gpu.error());
+        std::optional<GpuTensor> mask_gpu;
+        GpuTensor* mask_ptr = nullptr;
+        if (mask)
+        {
+            auto mg = ensure_gpu(*mask);
+            if (!mg) return std::unexpected(mg.error());
+            mask_gpu = mg->gpu_tensor();
+            mask_ptr = &*mask_gpu;
+        }
+        GpuTensor gv_gpu;
+        auto r = backend_.bmm_kv_backward_gpu(
+            a_gpu->gpu_tensor(), b_gpu->gpu_tensor(), mask_ptr,
+            m_gpu->gpu_tensor(), l_gpu->gpu_tensor(), p_gpu->gpu_tensor(),
+            g_gpu->gpu_tensor(), r_gpu->gpu_tensor(),
+            M, N, K, D, batch, transA, transB, alpha, &gv_gpu);
+        if (!r) return std::unexpected(r.error());
+        grad_v_out = Tensor::from_gpu(std::move(gv_gpu));
+        return Tensor::from_gpu(std::move(*r));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 列式 softmax 融合原语（M5；GPU 融合 shader 不物化 (C, N) exp/softmax）
+    // ══════════════════════════════════════════════════════════════════════
+
+    [[nodiscard]] Result<Tensor> col_softmax_denom(
+        const Tensor& logits, const Tensor& col_max) override
+    {
+        const std::size_t C = logits.rows(), N = logits.cols();
+        auto l_gpu = ensure_gpu(logits);
+        if (!l_gpu) return std::unexpected(l_gpu.error());
+        auto m_gpu = ensure_gpu(col_max);
+        if (!m_gpu) return std::unexpected(m_gpu.error());
+        auto r = backend_.col_softmax_denom_gpu(
+            l_gpu->gpu_tensor(), m_gpu->gpu_tensor(), C, N);
+        if (!r) return std::unexpected(r.error());
+        return Tensor::from_gpu(std::move(*r));
+    }
+
+    [[nodiscard]] Result<Tensor> col_softmax_sparse_forward(
+        const Tensor& logits, const Tensor& labels, const Tensor* mask,
+        std::size_t vocab_size, Scalar inv_num_valid,
+        Tensor& loss_vec_out) override
+    {
+        if (vocab_size > (std::size_t{1} << 24))
+            return std::unexpected(Error{
+                "col_softmax_sparse_forward: vocab_size exceeds 2^24 "
+                "(float labels not exactly representable)"});
+        const std::size_t C = logits.rows(), N = logits.cols();
+        if (vocab_size > C)
+            return std::unexpected(Error{"col_softmax_sparse_forward: vocab_size > classes"});
+        auto l_gpu = ensure_gpu(logits);
+        if (!l_gpu) return std::unexpected(l_gpu.error());
+        auto lb_gpu = ensure_gpu(labels);
+        if (!lb_gpu) return std::unexpected(lb_gpu.error());
+        std::optional<GpuTensor> mask_gpu;
+        GpuTensor* mask_ptr = nullptr;
+        if (mask)
+        {
+            auto mg = ensure_gpu(*mask);
+            if (!mg) return std::unexpected(mg.error());
+            mask_gpu = mg->gpu_tensor();
+            mask_ptr = &*mask_gpu;
+        }
+        GpuTensor lv_gpu;
+        auto r = backend_.col_softmax_sparse_forward_gpu(
+            l_gpu->gpu_tensor(), lb_gpu->gpu_tensor(), mask_ptr,
+            C, N, vocab_size, inv_num_valid, &lv_gpu);
+        if (!r) return std::unexpected(r.error());
+        loss_vec_out = Tensor::from_gpu(std::move(lv_gpu));
+        return Tensor::from_gpu(std::move(*r));
+    }
+
     // A += B：真原地，直接写回 A 的 buffer（与 CpuEngine 语义一致）
     // 逐元素 kernel 每线程只读写自己下标一次，read-before-write 天然成立。
     // 免去新 buffer 分配 + 全量写出，消除优化器/梯度累积路径的分配风暴。
