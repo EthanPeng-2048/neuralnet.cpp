@@ -96,41 +96,11 @@
 #define NN_SCATTER_ADD_SPV_EMBEDDED
 #endif
 
-// AOT 融合 shader（由 tools/gen_fused 生成，单一事实来源见 fused_exprs.hpp）
-#if __has_include("rope_forward_dk32_spv.hpp")
-#include "rope_forward_dk32_spv.hpp"
-#define NN_ROPE_FORWARD_DK32_SPV_EMBEDDED
+// AOT 融合 shader 注册表（构建期 scan_exprs 收集 + gen_fused 合成；表达式
+// 只出现在 Layer，本表是折叠后的派生物）。运行时按 expr_spec_key 匹配 dispatch。
+#if __has_include("fused_registry.hpp")
+#include "fused_registry.hpp"
 #endif
-#if __has_include("rope_forward_dk64_spv.hpp")
-#include "rope_forward_dk64_spv.hpp"
-#define NN_ROPE_FORWARD_DK64_SPV_EMBEDDED
-#endif
-#if __has_include("rope_forward_dk128_spv.hpp")
-#include "rope_forward_dk128_spv.hpp"
-#define NN_ROPE_FORWARD_DK128_SPV_EMBEDDED
-#endif
-#if __has_include("rope_backward_dk32_spv.hpp")
-#include "rope_backward_dk32_spv.hpp"
-#define NN_ROPE_BACKWARD_DK32_SPV_EMBEDDED
-#endif
-#if __has_include("rope_backward_dk64_spv.hpp")
-#include "rope_backward_dk64_spv.hpp"
-#define NN_ROPE_BACKWARD_DK64_SPV_EMBEDDED
-#endif
-#if __has_include("rope_backward_dk128_spv.hpp")
-#include "rope_backward_dk128_spv.hpp"
-#define NN_ROPE_BACKWARD_DK128_SPV_EMBEDDED
-#endif
-#if __has_include("swiglu_grad_gate_spv.hpp")
-#include "swiglu_grad_gate_spv.hpp"
-#define NN_SWIGLU_GRAD_GATE_SPV_EMBEDDED
-#endif
-#if __has_include("swiglu_grad_up_spv.hpp")
-#include "swiglu_grad_up_spv.hpp"
-#define NN_SWIGLU_GRAD_UP_SPV_EMBEDDED
-#endif
-
-#include "../fused_exprs.hpp"
 
 namespace nn
 {
@@ -676,8 +646,8 @@ private:
     VulkanPipeline gather_pipeline_;
     VulkanPipeline scatter_add_pipeline_;
 
-    // AOT 融合 shader pipelines（名字 → pipeline，与 fused_exprs.hpp 的
-    // kGenInstances 一一对应；运行时按 ExprSpec 匹配后直接 dispatch）
+    // AOT 融合 shader pipelines（key = expr_spec_key → pipeline；由构建期
+    // fused_registry.hpp 注册，运行时按 key 匹配后直接 dispatch）
     std::unordered_map<std::string, VulkanPipeline> fused_pipelines_;
 
     std::unique_ptr<MemoryPool> memory_pool_;
@@ -816,36 +786,8 @@ private:
 #endif
     }
 
-    // ── AOT 融合 shader SPIR-V getter（名字与 kGenInstances 一致）────────
-    [[nodiscard]] static const std::vector<uint32_t>& get_fused_spirv(const std::string& name)
-    {
-#ifdef NN_ROPE_FORWARD_DK32_SPV_EMBEDDED
-        if (name == "rope_forward_dk32") return nn_rope_forward_dk32_spirv_bytecode();
-#endif
-#ifdef NN_ROPE_FORWARD_DK64_SPV_EMBEDDED
-        if (name == "rope_forward_dk64") return nn_rope_forward_dk64_spirv_bytecode();
-#endif
-#ifdef NN_ROPE_FORWARD_DK128_SPV_EMBEDDED
-        if (name == "rope_forward_dk128") return nn_rope_forward_dk128_spirv_bytecode();
-#endif
-#ifdef NN_ROPE_BACKWARD_DK32_SPV_EMBEDDED
-        if (name == "rope_backward_dk32") return nn_rope_backward_dk32_spirv_bytecode();
-#endif
-#ifdef NN_ROPE_BACKWARD_DK64_SPV_EMBEDDED
-        if (name == "rope_backward_dk64") return nn_rope_backward_dk64_spirv_bytecode();
-#endif
-#ifdef NN_ROPE_BACKWARD_DK128_SPV_EMBEDDED
-        if (name == "rope_backward_dk128") return nn_rope_backward_dk128_spirv_bytecode();
-#endif
-#ifdef NN_SWIGLU_GRAD_GATE_SPV_EMBEDDED
-        if (name == "swiglu_grad_gate") return nn_swiglu_grad_gate_spirv_bytecode();
-#endif
-#ifdef NN_SWIGLU_GRAD_UP_SPV_EMBEDDED
-        if (name == "swiglu_grad_up") return nn_swiglu_grad_up_spirv_bytecode();
-#endif
-        static const std::vector<uint32_t> empty;
-        return empty;
-    }
+    // ── AOT 融合 shader SPIR-V 来自构建期生成的 fused_registry.hpp ────────
+    // （FusedShader 直接携带内联 SPIR-V，无需按名 getter；注册在 init 时遍历）
 
 public:
     ~GpuBackend()
@@ -1092,24 +1034,26 @@ public:
                 scatter_add_pipeline_ = std::move(*sp_r);
         }
 
-        // 16. 注册 AOT 融合 shader pipelines（单一事实来源：fused_exprs.hpp）
-        // 每个实例：N 输入 + 1 输出 binding；push constants = count + cols + 常量池
-        for (const auto& inst : nn::fused::kGenInstances)
+#ifdef NN_FUSED_REGISTRY_EMBEDDED
+        // 16. 注册 AOT 融合 shader pipelines（构建期 scan_exprs 收集 +
+        //     gen_fused 合成；每个条目：N 输入 + 1 输出 binding；
+        //     push constants = count + cols + 常量池；key = expr_spec_key）
+        for (const auto& fs : nn::fused::kFusedShaders)
         {
-            const auto& spirv = get_fused_spirv(inst.name);
-            if (spirv.empty())
-                continue;  // 未嵌入（构建配置缺失）：跳过，运行时回退 eager
-            const auto spec = nn::fused::make_fused(inst);
+            if (!fs.spirv || fs.spirv_words == 0)
+                continue;  // 空 SPIR-V：跳过（构建配置缺失）
             const std::uint32_t num_bindings =
-                static_cast<std::uint32_t>(spec.views.size()) + 1;  // 输入 + 输出
+                static_cast<std::uint32_t>(fs.spec.views.size()) + 1;  // 输入 + 输出
             const std::uint32_t pc_size =
                 static_cast<std::uint32_t>(sizeof(std::uint32_t) * 2 +
-                                           sizeof(Scalar) * spec.consts.size());
+                                           sizeof(Scalar) * fs.spec.consts.size());
             auto fp_r = VulkanPipeline::create_generic(
-                device_.device(), spirv, num_bindings, pc_size);
+                device_.device(), std::span<const std::uint32_t>(fs.spirv, fs.spirv_words),
+                num_bindings, pc_size);
             if (fp_r)
-                fused_pipelines_.emplace(inst.name, std::move(*fp_r));
+                fused_pipelines_.emplace(fs.key, std::move(*fp_r));
         }
+#endif
 
         initialized_ = true;
         return {};
@@ -2462,7 +2406,8 @@ public:
     //   Push Constants: uint count, uint cols, float c0..（常量池）
     //   local_size_x = 256
     //
-    // shader_name 必须是已注册的融合实例名（见 fused_exprs.hpp kGenInstances）。
+    // shader_name 必须是已注册的融合 shader 的 key（= expr_spec_key，见
+    // 构建期 fused_registry.hpp）。
     // 所有输入同形状 (rows, cols)；同一 buffer 可绑定到多个输入（RoPE 的 q×2）。
     // ══════════════════════════════════════════════════════════════════
     [[nodiscard]] Result<GpuTensor> run_fused_gpu(

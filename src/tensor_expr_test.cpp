@@ -6,8 +6,9 @@
 // 逐元素在 CPU 走编译期模板（内联 + SIMD 融合）；matmul 是原语边界，
 // 先用 engine.matmul 计算，再并入逐元素表达式。
 //
-// 注意（闭合世界）：GPU 只执行 fused_exprs.hpp kGenInstances 里预生成的
-// AOT 融合 shader；本测试的任意表达式未预生成，故只在 CPU 上验证。
+// 注意（闭合世界）：GPU 只执行构建期 scan_exprs 收集 + gen_fused 合成的
+// AOT 融合 shader（按 expr_spec_key 匹配）；本测试的任意表达式未必被扫描
+// 覆盖，故只在 CPU 上验证。
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>

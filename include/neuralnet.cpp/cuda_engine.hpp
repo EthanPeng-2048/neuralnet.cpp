@@ -33,6 +33,10 @@ public:
     [[nodiscard]] Result<void> end_batch() override { return backend_.end_batch(); }
     [[nodiscard]] Result<void> flush_batch() override { return {}; }
 
+    // ── 表达式录制（M2 框架）：当前为 no-op（各原语独立 dispatch） ──────
+    [[nodiscard]] Result<void> begin_expr() override { return {}; }
+    [[nodiscard]] Result<void> end_expr() override { return {}; }
+
     // ══════════════════════════════════════════════════════════════════════
     // 张量工厂
     // ══════════════════════════════════════════════════════════════════════
@@ -422,7 +426,7 @@ public:
     //
     // CUDA 目前没有 AOT 融合 shader（闭合世界约束下无 eager、无运行时生成），
     // 因此任何表达式都直接报错。如需 GPU 融合请用 Vulkan 后端，或为 CUDA
-    // 实现 AOT shader 生成后加入 fused_exprs.hpp。
+    // 走与 Vulkan 相同的构建期 scan_exprs + gen_fused 合成流水线。
     // ══════════════════════════════════════════════════════════════════════
 
     [[nodiscard]] Result<Tensor> eval_expr(

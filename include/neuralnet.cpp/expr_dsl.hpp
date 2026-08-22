@@ -32,6 +32,7 @@
 #include "tensor.hpp"
 #include "compute_engine.hpp"
 #include "expr_spec.hpp"
+#include "expr_registry.hpp"
 #include "algebra_expr.hpp"   // nn::Expression / nn::BoolExpression 概念
 #include "algebra_ops.hpp"    // nn::ops（唯一算子来源，含 op_id()）
 #include "algebra_matrix.hpp" // Matrix
@@ -69,6 +70,27 @@ struct SpecBuilder
         spec.views.push_back(expr::row_mod(mod));
         inputs.push_back(t);
         return expr::input(static_cast<std::uint8_t>(inputs.size() - 1));
+    }
+    // 归约视图输入：该输入被归约为每行/每列一个标量（(rows,1)/(1,cols)），
+    // 求值期自动广播——参与算术时按当前 (r,c) 读取对应标量。
+    ExprOperand add_reduce_input(const Tensor& t, ExprViewKind kind)
+    {
+        ExprView v;
+        v.kind = static_cast<std::uint8_t>(kind);
+        spec.views.push_back(v);
+        inputs.push_back(t);
+        return expr::input(static_cast<std::uint8_t>(inputs.size() - 1));
+    }
+    // 归约指令：对某表达式结果（操作数 a）归约 → 隐式"每行/每列一个标量"
+    // 的归约向量，后续指令经 Reduce 操作数按行/列广播访问。
+    ExprOperand add_reduce_instr(ExprOp op, ExprOperand a)
+    {
+        ExprInstr in;
+        in.op = static_cast<std::uint8_t>(op);
+        in.dst = static_cast<std::uint8_t>(spec.num_regs++);
+        in.a = a;
+        spec.instrs.push_back(in);
+        return expr::reduce(in.dst);
     }
     ExprOperand add_instr(ExprOp op, ExprOperand a, ExprOperand b = {}, ExprOperand c = {})
     {
@@ -138,6 +160,46 @@ struct RowModRef
 };
 
 // ══════════════════════════════════════════════════════════════════════════
+// 归约叶子：把"按行/按列归约出标量向量"接入表达式
+//
+// 两类（对应 expr_spec.hpp 的归约视图与归约指令两种机制）：
+//   1. ReduceViewRef<Kind>：对输入 Tensor 直接归约 → 归约**视图**。
+//      求值期代表一个 (rows,1)/(1,cols) 的广播向量，参与算术时自动广播。
+//   2. ReduceRef<E, Rop>：对子表达式结果归约 → 归约**指令**，
+//      用于 exp(x) 求和这类"表达式内部归约"（见 DslExpr 概念定义之后）。
+//
+// 含归约的表达式**不实例化**模板 CPU 求值路径（has_reduction_v 把 dsl::compute
+// 分流到引擎 eval_expr，由引擎实现归约视图/指令语义），故 eval 仅需满足
+// nn::Expression 概念约束，返回占位值。
+// ══════════════════════════════════════════════════════════════════════════
+template <ExprViewKind Kind>
+struct ReduceViewRef
+{
+    Tensor t;
+
+    [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
+    ExprOperand to_spec(SpecBuilder& b) const { return b.add_reduce_input(t, Kind); }
+};
+
+using RowReduceSumRef = ReduceViewRef<ExprViewKind::RowReduceSum>;
+using RowReduceMaxRef = ReduceViewRef<ExprViewKind::RowReduceMax>;
+using ColReduceSumRef = ReduceViewRef<ExprViewKind::ColReduceSum>;
+using ColReduceMaxRef = ReduceViewRef<ExprViewKind::ColReduceMax>;
+
+// ══════════════════════════════════════════════════════════════════════════
+// DSL 表达式概念（比 nn::Expression 更严格：额外要求可折叠成 ExprSpec）
+//
+// 用于让 DSL 运算符在约束偏序上严格优先于旧代数 nn::operator* 等，从而
+// 在 namespace nn（Layer）里**直接写内联数学表达式**时消除重载歧义（旧
+// 代数与 DSL 共用 nn::Expression；若不区分二者，二者对 DSL 叶子同为候选）。
+// ══════════════════════════════════════════════════════════════════════════
+template <typename T>
+concept DslExpr = nn::Expression<T> && requires(SpecBuilder& b, const T& t)
+{
+    { t.to_spec(b) } -> std::convertible_to<ExprOperand>;
+};
+
+// ══════════════════════════════════════════════════════════════════════════
 // 节点模板（每个都同时支持 CPU 求值 eval(i) 与 GPU 折叠 to_spec）
 // ══════════════════════════════════════════════════════════════════════════
 
@@ -158,7 +220,15 @@ struct Binary
     L l; R r;
     [[nodiscard]] auto eval(std::size_t i) const { return Op::apply(l.eval(i), r.eval(i)); }
     ExprOperand to_spec(SpecBuilder& b) const
-    { return b.add_instr(Op::op_id(), l.to_spec(b), r.to_spec(b)); }
+    {
+        // 显式固定操作数折叠顺序（l 先 r 后）：C++ 函数实参求值顺序未指定，
+        // 直接 b.add_instr(.., l.to_spec(b), r.to_spec(b)) 会让 views/inputs 的
+        // 登记顺序随编译器（MSVC 左到右 / Clang 右到左）漂移 → expr_spec_key
+        // 跨编译器不稳定，破坏 AOT 匹配。先求值到局部变量以固定顺序。
+        const ExprOperand lo = l.to_spec(b);
+        const ExprOperand ro = r.to_spec(b);
+        return b.add_instr(Op::op_id(), lo, ro);
+    }
 };
 
 // select(cond, then, else) —— cond 为 BoolExpression，then/else 为值表达式
@@ -169,8 +239,47 @@ struct Select
     [[nodiscard]] Scalar eval(std::size_t i) const
     { return cond.eval(i) ? then_e.eval(i) : else_e.eval(i); }
     ExprOperand to_spec(SpecBuilder& b) const
-    { return b.add_instr(ExprOp::Select, cond.to_spec(b), then_e.to_spec(b), else_e.to_spec(b)); }
+    {
+        // 同 Binary：显式固定折叠顺序（cond → then → else），保证跨编译器确定。
+        const ExprOperand co = cond.to_spec(b);
+        const ExprOperand to = then_e.to_spec(b);
+        const ExprOperand eo = else_e.to_spec(b);
+        return b.add_instr(ExprOp::Select, co, to, eo);
+    }
 };
+
+// 归约节点：对子表达式结果做归约（归约**指令**）→ 隐式标量向量（Reduce 操作数）。
+//   row_reduce_sum(exp(x)) 这类"表达式内部归约"；对输入 Tensor 直接归约请用
+//   ReduceViewRef（归约视图，GPU 融合更友好）。
+template <nn::dsl::DslExpr E, ExprOp Rop>
+struct ReduceRef
+{
+    E child;
+
+    [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
+    ExprOperand to_spec(SpecBuilder& b) const { return b.add_reduce_instr(Rop, child.to_spec(b)); }
+};
+
+// ══════════════════════════════════════════════════════════════════════════
+// has_reduction_v：表达式树是否含归约（视图叶子或归约指令节点）
+//
+// 用于 dsl::compute 的 CPU 路径分流：含归约的表达式无法按"逐元素模板求值"
+// （归约需要全行/全列信息），折叠成 ExprSpec 走引擎 eval_expr（CPU 扩展语义
+// 处理归约视图/指令）；不含归约的表达式保持原编译期模板求值（零开销）。
+// ══════════════════════════════════════════════════════════════════════════
+template <typename T> inline constexpr bool has_reduction_v = false;
+
+template <ExprViewKind K>
+inline constexpr bool has_reduction_v<ReduceViewRef<K>> = true;
+template <nn::dsl::DslExpr E, ExprOp Rop>
+inline constexpr bool has_reduction_v<ReduceRef<E, Rop>> = true;
+template <typename Op, nn::Expression C>
+inline constexpr bool has_reduction_v<Unary<Op, C>> = has_reduction_v<C>;
+template <typename Op, nn::Expression L, nn::Expression R>
+inline constexpr bool has_reduction_v<Binary<Op, L, R>> = has_reduction_v<L> || has_reduction_v<R>;
+template <nn::BoolExpression C, nn::Expression T, nn::Expression E>
+inline constexpr bool has_reduction_v<Select<C, T, E>>
+    = has_reduction_v<C> || has_reduction_v<T> || has_reduction_v<E>;
 
 // ══════════════════════════════════════════════════════════════════════════
 // 叶子构造（普通写法入口）
@@ -184,36 +293,51 @@ struct Select
 { return RowModRef{std::move(t), mod}; }
 
 // ══════════════════════════════════════════════════════════════════════════
+// 归约自由函数：对输入 Tensor 直接归约 → 归约**视图**（GPU 融合更友好）；
+// 对表达式结果归约 → 归约**指令**（重载按参数类型自动选择，见 ReduceRef）。
+// 返回的归约叶子参与算术时自动按行/按列广播。
+// ══════════════════════════════════════════════════════════════════════════
+[[nodiscard]] inline RowReduceSumRef row_reduce_sum(Tensor t) { return {std::move(t)}; }
+[[nodiscard]] inline RowReduceMaxRef row_reduce_max(Tensor t) { return {std::move(t)}; }
+[[nodiscard]] inline ColReduceSumRef col_reduce_sum(Tensor t) { return {std::move(t)}; }
+[[nodiscard]] inline ColReduceMaxRef col_reduce_max(Tensor t) { return {std::move(t)}; }
+
+template <nn::dsl::DslExpr E> [[nodiscard]] auto row_reduce_sum(const E& e) { return ReduceRef<E, ExprOp::RowSum>{e}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] auto row_reduce_max(const E& e) { return ReduceRef<E, ExprOp::RowMax>{e}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] auto col_reduce_sum(const E& e) { return ReduceRef<E, ExprOp::ColSum>{e}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] auto col_reduce_max(const E& e) { return ReduceRef<E, ExprOp::ColMax>{e}; }
+
+// ══════════════════════════════════════════════════════════════════════════
 // 一元函数（普通数学写法）
 // ══════════════════════════════════════════════════════════════════════════
-template <nn::Expression E> [[nodiscard]] constexpr auto neg(const E& e) { return Unary<ops::Neg, E>{e}; }
-template <nn::Expression E> [[nodiscard]] auto abs(const E& e)   { return Unary<ops::Abs, E>{e}; }
-template <nn::Expression E> [[nodiscard]] auto exp(const E& e)   { return Unary<ops::Exp, E>{e}; }
-template <nn::Expression E> [[nodiscard]] auto log(const E& e)   { return Unary<ops::Log, E>{e}; }
-template <nn::Expression E> [[nodiscard]] auto sqrt(const E& e)  { return Unary<ops::Sqrt, E>{e}; }
-template <nn::Expression E> [[nodiscard]] auto rsqrt(const E& e) { return Unary<ops::Rsqrt, E>{e}; }
-template <nn::Expression E> [[nodiscard]] auto tanh(const E& e)  { return Unary<ops::Tanh, E>{e}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] constexpr auto neg(const E& e) { return Unary<ops::Neg, E>{e}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] auto abs(const E& e)   { return Unary<ops::Abs, E>{e}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] auto exp(const E& e)   { return Unary<ops::Exp, E>{e}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] auto log(const E& e)   { return Unary<ops::Log, E>{e}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] auto sqrt(const E& e)  { return Unary<ops::Sqrt, E>{e}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] auto rsqrt(const E& e) { return Unary<ops::Rsqrt, E>{e}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] auto tanh(const E& e)  { return Unary<ops::Tanh, E>{e}; }
 
 // ══════════════════════════════════════════════════════════════════════════
 // 二元函数：max / min / select
 // ══════════════════════════════════════════════════════════════════════════
-template <nn::Expression L, nn::Expression R> [[nodiscard]] constexpr auto max(const L& l, const R& r) { return Binary<ops::Max, L, R>{l, r}; }
-template <nn::Expression E> [[nodiscard]] constexpr auto max(const E& e, Scalar s) { return Binary<ops::Max, E, ConstLeaf>{e, ConstLeaf{s}}; }
-template <nn::Expression E> [[nodiscard]] constexpr auto max(Scalar s, const E& e) { return Binary<ops::Max, ConstLeaf, E>{ConstLeaf{s}, e}; }
-template <nn::Expression L, nn::Expression R> [[nodiscard]] constexpr auto min(const L& l, const R& r) { return Binary<ops::Min, L, R>{l, r}; }
-template <nn::Expression E> [[nodiscard]] constexpr auto min(const E& e, Scalar s) { return Binary<ops::Min, E, ConstLeaf>{e, ConstLeaf{s}}; }
-template <nn::Expression E> [[nodiscard]] constexpr auto min(Scalar s, const E& e) { return Binary<ops::Min, ConstLeaf, E>{ConstLeaf{s}, e}; }
+template <nn::dsl::DslExpr L, nn::dsl::DslExpr R> [[nodiscard]] constexpr auto max(const L& l, const R& r) { return Binary<ops::Max, L, R>{l, r}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] constexpr auto max(const E& e, Scalar s) { return Binary<ops::Max, E, ConstLeaf>{e, ConstLeaf{s}}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] constexpr auto max(Scalar s, const E& e) { return Binary<ops::Max, ConstLeaf, E>{ConstLeaf{s}, e}; }
+template <nn::dsl::DslExpr L, nn::dsl::DslExpr R> [[nodiscard]] constexpr auto min(const L& l, const R& r) { return Binary<ops::Min, L, R>{l, r}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] constexpr auto min(const E& e, Scalar s) { return Binary<ops::Min, E, ConstLeaf>{e, ConstLeaf{s}}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] constexpr auto min(Scalar s, const E& e) { return Binary<ops::Min, ConstLeaf, E>{ConstLeaf{s}, e}; }
 
 /// relu(x) = max(x, 0)
-template <nn::Expression E> [[nodiscard]] auto relu(const E& e) { return nn::dsl::max(e, ConstLeaf{Scalar{0}}); }
+template <nn::dsl::DslExpr E> [[nodiscard]] auto relu(const E& e) { return nn::dsl::max(e, ConstLeaf{Scalar{0}}); }
 
-template <nn::BoolExpression C, nn::Expression T, nn::Expression E>
+template <nn::BoolExpression C, nn::dsl::DslExpr T, nn::dsl::DslExpr E>
 [[nodiscard]] constexpr auto select(const C& c, const T& t, const E& e)
 { return Select<C, T, E>{c, t, e}; }
-template <nn::BoolExpression C, nn::Expression T>
+template <nn::BoolExpression C, nn::dsl::DslExpr T>
 [[nodiscard]] constexpr auto select(const C& c, const T& t, Scalar ev)
 { return Select<C, T, ConstLeaf>{c, t, ConstLeaf{ev}}; }
-template <nn::BoolExpression C, nn::Expression E>
+template <nn::BoolExpression C, nn::dsl::DslExpr E>
 [[nodiscard]] constexpr auto select(const C& c, Scalar tv, const E& e)
 { return Select<C, ConstLeaf, E>{c, ConstLeaf{tv}, e}; }
 template <nn::BoolExpression C>
@@ -225,13 +349,13 @@ template <nn::BoolExpression C>
 // 值运算（+ - * /）返回值表达式；比较（> < >= <= == !=）返回布尔表达式。
 // ══════════════════════════════════════════════════════════════════════════
 #define NN_DSL_BINARY(OP, OpT)                                                            \
-    template <nn::Expression L, nn::Expression R>                                         \
+    template <nn::dsl::DslExpr L, nn::dsl::DslExpr R>                                     \
     [[nodiscard]] constexpr auto operator OP(const L& l, const R& r)                      \
     { return Binary<OpT, L, R>{l, r}; }                                                   \
-    template <nn::Expression E>                                                           \
+    template <nn::dsl::DslExpr E>                                                         \
     [[nodiscard]] constexpr auto operator OP(const E& e, Scalar s)                        \
     { return Binary<OpT, E, ConstLeaf>{e, ConstLeaf{s}}; }                                \
-    template <nn::Expression E>                                                           \
+    template <nn::dsl::DslExpr E>                                                         \
     [[nodiscard]] constexpr auto operator OP(Scalar s, const E& e)                        \
     { return Binary<OpT, ConstLeaf, E>{ConstLeaf{s}, e}; }
 
@@ -247,7 +371,7 @@ NN_DSL_BINARY(==, ops::Eq)
 NN_DSL_BINARY(!=, ops::Ne)
 #undef NN_DSL_BINARY
 
-template <nn::Expression E> [[nodiscard]] constexpr auto operator-(const E& e)
+template <nn::dsl::DslExpr E> [[nodiscard]] constexpr auto operator-(const E& e)
 { return Unary<ops::Neg, E>{e}; }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -285,47 +409,65 @@ template <typename E>
 [[nodiscard]] Result<Tensor> compute(ComputeEngine& eng, const E& e,
                                      std::size_t rows, std::size_t cols)
 {
+#ifdef NN_EXPR_SCAN
+    // 构建期扫描模式：折叠内联表达式的**结构**并登记进全局注册表，
+    // 返回占位张量让 dry-run 流程继续（scan 只关心表达式集合，不真算）。
+    // 表达式文本仍只出现在 Layer；这里登记的是派生物 ExprSpec。
+    (void)eng;
+    auto [spec, inputs] = to_expr_spec(e);
+    if (auto v = validate_expr_spec(spec, inputs.size()); !v)
+        return std::unexpected(v.error());
+    fused::global_registry().add(spec);
+    return Tensor::cpu(rows, cols);
+#else
     if (eng.device() == Device::CPU)
+    {
+        if constexpr (nn::dsl::has_reduction_v<E>)
+        {
+            // 含归约：模板求值无法表达"全行/全列归约"，折叠成 ExprSpec 走
+            // 引擎 eval_expr（CPU 扩展语义处理归约视图/指令，先正确后优化）
+            auto [spec, inputs] = to_expr_spec(e);
+            if (auto v = validate_expr_spec(spec, inputs.size()); !v)
+                return std::unexpected(v.error());
+            return eng.eval_expr(spec, inputs, rows, cols);
+        }
         return eval_cpu(e, rows, cols);
+    }
 
     auto [spec, inputs] = to_expr_spec(e);
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)
         return std::unexpected(v.error());
     return eng.eval_expr(spec, inputs, rows, cols);  // 闭合世界：GPU 未命中即报错
+#endif
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// 常用表达式工厂（单一事实来源；CPU 与 AOT 生成器共用同一段定义）
+// start_expr / end_expr — 把"无法写进一行"的表达式按块融合
+//
+// 与 compute() 等价：内联数学表达式只出现在这里（Layer），end_expr 时
+// 整块一次融合（AOT 收集 / CPU 融合 / GPU 匹配预编译 shader）。跨多行
+// 书写同一表达式，框内即一个融合单元。
+//   auto out = dsl::end_expr(dsl::start_expr(engine, rows, cols,
+//       leaf(a) * leaf(b)
+//       + leaf(c) * Scalar{2}
+//       - leaf(d)));
 // ══════════════════════════════════════════════════════════════════════════
-// RoPE（LLaMA half-swap）：
-//   forward:  q_rot = q·cos + rotate_half(q)·sin
-//   backward: g_rot = q·cos − rotate_half(q)·sin（旋转正交，逆 = 反角）
-// q 为 (batch*H*d_k, seq)，cos/sin 为 (d_k, seq) 短表（RowMod 平铺）。
-// dk 为**运行时**索引映射参数（CPU 支持任意 d_k；GPU AOT 只对生成的
-// {32,64,128} 命中，未命中即闭合世界报错）；backward 为编译期参数，
-// 决定算子序列（mul/mul/add|sub），故融合在编译期完成。
-template <bool Backward>
-[[nodiscard]] auto make_rope(const Tensor& q, const Tensor& cos, const Tensor& sin,
-                             std::uint32_t dk)
+template <typename E>
+struct ExprBlock
 {
-    auto term1 = leaf(q) * row_mod(cos, dk);
-    auto term2 = rotate_half(q, dk) * row_mod(sin, dk);
-    if constexpr (Backward) return term1 - term2;
-    else                    return term1 + term2;
-}
+    ComputeEngine* eng;
+    std::size_t    rows, cols;
+    E              expr;
+};
 
-// SwiGLU backward：
-//   grad_gate = grad_out ⊙ up ⊙ s ⊙ (1 + gate ⊙ (1 − s))
-//   grad_up   = grad_out ⊙ gate ⊙ s
-[[nodiscard]] inline auto make_swiglu_grad_gate(const Tensor& g, const Tensor& s,
-                                                const Tensor& gate, const Tensor& up)
-{
-    const auto one = ConstLeaf{Scalar{1}};
-    return leaf(g) * leaf(up) * (leaf(s) * (one + leaf(gate) * (one - leaf(s))));
-}
-[[nodiscard]] inline auto make_swiglu_grad_up(const Tensor& g, const Tensor& s,
-                                              const Tensor& gate)
-{ return leaf(g) * leaf(gate) * leaf(s); }
+template <typename E>
+[[nodiscard]] ExprBlock<E> start_expr(ComputeEngine& eng, std::size_t rows,
+                                      std::size_t cols, const E& e)
+{ return {&eng, rows, cols, e}; }
+
+template <typename E>
+[[nodiscard]] Result<Tensor> end_expr(const ExprBlock<E>& b)
+{ return compute(*b.eng, b.expr, b.rows, b.cols); }
 
 } // namespace nn::dsl
 

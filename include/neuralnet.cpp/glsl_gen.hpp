@@ -4,8 +4,8 @@
 // ═══════════════════════════════════════════════════════════════════════════
 //  glsl_gen.hpp — AOT 算子融合：ExprSpec → GLSL 计算 shader 源码
 //
-//  在构建期由 tools/gen_fused 调用：把 C++ 端定义的表达式（ExprSpec，
-//  单一事实来源见 fused_exprs.hpp）展开为单个融合 .comp 文件。
+//  在构建期由 tools/gen_fused 调用：把 scan_exprs 收集的内联表达式结构
+//  （ExprSpec，派生物）展开为单个融合 .comp 文件。
 //    - 指令序列展开为直线浮点代码（无解释器开销，GPU 无分支）
 //    - 视图（RotateHalf/RowMod）的索引映射内联（不物化中间张量）
 //    - 常量以 push constant 传入（运行时可变）

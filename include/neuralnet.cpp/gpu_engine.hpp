@@ -32,7 +32,9 @@
 #ifdef NN_HAS_VULKAN
 
 #include "compute_engine.hpp"
-#include "fused_exprs.hpp"
+#if __has_include("fused_registry.hpp")
+#include "fused_registry.hpp"
+#endif
 #include "backend/vk_backend.hpp"
 
 namespace nn
@@ -70,6 +72,12 @@ public:
     {
         return backend_.flush_batch();
     }
+
+    // ── 表达式录制（M2 框架）：当前为 no-op ─────────────────────────────
+    // 各原语照常独立 dispatch；录制融合分析（虚拟寄存器 DAG + 融合边界判定）
+    // 在 M3 落地。begin/end 保持幂等，Layer 可先行包住算法段落。
+    [[nodiscard]] Result<void> begin_expr() override { return {}; }
+    [[nodiscard]] Result<void> end_expr() override { return {}; }
 
     // ══════════════════════════════════════════════════════════════════════
     // 张量工厂（纯 GPU：全部创建/上传为 GPU Tensor）
@@ -553,9 +561,10 @@ public:
     // ══════════════════════════════════════════════════════════════════════
     // 表达式求值（闭合世界 AOT）
     //
-    // 与 fused_exprs.hpp 预生成实例表逐一比对（expr_spec_equal），命中则
-    // dispatch 单个融合 shader；未命中**硬报错**（无 eager、无运行时生成）。
-    // 新增 GPU 表达式必须加入 kGenInstances 并生成 AOT shader。
+    // 折叠内联表达式 → expr_spec_key → 查构建期合成的融合 shader 注册表
+    // （fused_registry.hpp，由 scan_exprs 收集 + gen_fused 合成）；命中则
+    // dispatch 单个融合 shader；未命中**硬报错**（无 eager、无运行时生成），
+    // 提示把该内联表达式纳入构建期扫描。
     // ══════════════════════════════════════════════════════════════════════
 
     [[nodiscard]] Result<Tensor> eval_expr(
@@ -563,14 +572,12 @@ public:
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols) override
     {
-        // ── AOT 匹配：查找与 spec 完全一致的预生成融合 shader ──────────
-        for (const auto& inst : nn::fused::kGenInstances)
+        // ── AOT 匹配：按规范结构 key 查预编译融合 shader ──────────────
+        const std::string key = nn::expr_spec_key(spec);
+#ifdef NN_FUSED_REGISTRY_EMBEDDED
+        const nn::fused::FusedShader* fs = nn::fused::find_fused(key);
+        if (fs && backend_.has_fused_shader(key))
         {
-            if (!backend_.has_fused_shader(inst.name))
-                continue;  // 未嵌入/未注册：跳过
-            if (!expr_spec_equal(spec, nn::fused::make_fused(inst)))
-                continue;
-
             // 命中：收集 GPU 输入（同一 buffer 可重复绑定，如 RoPE 的 q×2）
             // GpuTensor 内部为 shared_ptr<GpuBuffer>，拷贝即共享，零成本
             std::vector<GpuTensor> gpu_inputs;
@@ -582,15 +589,16 @@ public:
                 gpu_inputs.push_back(g->gpu_tensor());
             }
             auto out = backend_.run_fused_gpu(
-                inst.name, gpu_inputs, spec.consts, rows, cols);
+                key, gpu_inputs, spec.consts, rows, cols);
             if (!out) return std::unexpected(out.error());
             return Tensor::from_gpu(std::move(*out));
         }
+#endif
 
         // ── 闭合世界：未命中任何 AOT 融合 shader → 硬报错 ──────────────
         return std::unexpected(Error{
-            "GpuEngine::eval_expr: 未找到匹配的 AOT 融合 shader（闭合世界）；"
-            "请将表达式加入 fused_exprs.hpp kGenInstances"});
+            "GpuEngine::eval_expr: 未找到该内联表达式的 AOT 融合 shader（闭合世界）；"
+            "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）"});
     }
 
 private:

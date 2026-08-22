@@ -1,0 +1,445 @@
+# 算子融合设计（Operator Fusion）—— 减少 GPT+Vulkan 训练显存
+
+> 状态：实施中 · 里程碑 **M1（ExprSpec 归约语义）✅ 完成**、**M2（begin_expr/end_expr 录制框架）✅ 完成**
+> 目标版本：与现有 `eval_expr` AOT 融合管线共存
+> 关联文档：`DEVELOPMENT_STANDARDS.md`（分层铁律）、`AST_COMPUTE.md`（表达式 DSL）、`01-architecture.md`
+
+---
+
+## 0. 问题与目标
+
+### 0.1 现象
+GPT+Vulkan 训练显存远高于 PyTorch。根因（详见前期分析）：
+1. **注意力分数矩阵全量物化**：`scores / masked / attn_cache_` 各一份 `H·batch·seq²`，且 `attn_cache_` 永久缓存供反向。
+2. **无算子融合**：Softmax/LayerNorm/RMSNorm 用多次原语 + 多次 `clone`，产生多份全尺寸中间 Tensor。
+3. **损失侧全量 softmax over vocab**：`logits` + `softmax` 各 `vocab×seq·batch`。
+4. 内存池 first-fit 碎片化 + 永不归还（本设计不涉及，单独跟踪）。
+
+### 0.2 目标
+在**严格不违反分层铁律**的前提下，通过"原语进引擎 + 算法留 Layer + 结构融合"实现：
+- Softmax / LayerNorm / RMSNorm / CrossEntropy 融为单 kernel，消除全尺寸中间 Tensor。
+- 注意力采用**两趟式内存高效算法**，不物化 `O(seq²)` 分数矩阵。
+- 完全兼容现有 `eval_expr` AOT 闭合世界机制，不引入运行时编译。
+
+### 0.3 合规红线（不可逾越）
+> 本设计成立的前提是以下红线被严格尊重，任何改动不得跨越：
+
+| 红线 | 说明 |
+|------|------|
+| **引擎只提供 op-level 原语** | `ComputeEngine` 只能有 `matmul`/`reduce`/`broadcast`/`elementwise` 这类通用原语；**绝不允许出现 `softmax`/`attention`/`layernorm` 命名的接口** |
+| **算法文本只在 Layer** | ReLU/GeLU/Softmax/LayerNorm/Attention/CrossEntropy 的公式只写在 `compute_layer.hpp` / `compute_loss.hpp` |
+| **融合逻辑归工具/引擎内部** | `glsl_gen` / `gen_fused` / 各引擎实现负责"怎么融"，Layer 只写"是什么" |
+| **Shader 是引擎内部实现** | 融合 shader 只存在于 `shaders/` + 各引擎，用户不可见 |
+
+> ⚠️ 设计原则：**原语可以多、可以专（matmul+归约、matmul+exp+sum 都是合法原语），但原语必须"通用可复用、不叫算法名"。** 引擎可以认"结构"（`reduce(matmul(A,B))`、`matmul→softmax→matmul`），绝不认"算法名"。
+
+---
+
+## 1. 总体架构
+
+```mermaid
+graph LR
+    subgraph L2[Layer（算法文本）]
+        A[Softmax::forward] -->|组合原语| E
+        B[LayerNorm::forward] -->|组合原语| E
+        C[AttentionBase::forward] -->|组合原语| E
+        D[CrossEntropyLoss] -->|组合原语| E
+    end
+    subgraph Eng[ComputeEngine（op-level 原语）]
+        E[batched_matmul_reduce / eval_expr / begin_expr..end_expr]
+        F[CPU 实现]
+        G[GPU 实现 + 融合 shader]
+        H[CUDA 实现]
+    end
+    E --> F & G & H
+    G -->|结构 key| I[scan_exprs + gen_fused 闭合世界]
+```
+
+**核心机制**：Layer 用现有 `eval_expr` + 新增录制 `begin_expr/end_expr` 表达算法；引擎/工具按**结构**合成融合 kernel。所有中间 Tensor 由融合 kernel 内部消解，不落 VRAM。
+
+---
+
+## 2. 阶段一：`ExprSpec` 增加归约语义（地基）
+
+### 2.1 目标
+让现有逐元素 `ExprSpec` 能表达"按列/按行归约出小标量 → 广播回各元素"，从而表达 Softmax/LayerNorm。**这是录制融合和两趟注意力的共同地基。**
+
+### 2.2 改动文件：`include/neuralnet.cpp/expr_spec.hpp`
+
+#### 2.2.1 `ExprViewKind` 增加归约视图
+```cpp
+enum class ExprViewKind : uint8_t
+{
+    Linear       = 0,   // 现有
+    RotateHalf   = 1,   // 现有
+    RowMod       = 2,   // 现有
+    // ── 新增：归约视图（输出为每列/每行一个标量，供广播）──
+    ColReduceSum = 3,   // 该输入按列求和 → (1, cols)
+    ColReduceMax = 4,   // 该输入按列求 max → (1, cols)
+    RowReduceSum = 5,   // 该输入按行求和 → (rows, 1)
+    RowReduceMax = 6,   // 该输入按行求 max → (rows, 1)
+};
+```
+> 语义：当某输入视图是归约视图时，它在求值期代表一个"每列/每行一个标量"的广播向量。归约视图的**求值索引语义**：对输出元素 `(r,c)`，读取的是归约向量在 `r`（行归约）或 `c`（列归约）处的标量。
+
+#### 2.2.2 明确 ExprSpec 的"归约-广播"扩展语义
+现有 `ExprSpec` 语义是"逐元素：输出=最后寄存器"。扩展后增加：
+- 允许**归约视图输入**参与表达式（它自动广播到整行/整列）。
+- 引入**归约指令**（可选，见 2.3），使"先对某表达式结果归约"可表达。
+
+新增上限说明：归约视图不改变输入张量数量上限（仍 ≤8）。
+
+### 2.3 新增归约指令（推荐，能力更强）
+在 `ExprOp` 增加两类指令（供"表达式内部归约"使用，如 `exp(shifted)` 求和）：
+```cpp
+enum class ExprOp : uint8_t
+{
+    // ...现有...
+    // ── 新增：归约指令（dst 为归约结果标量向量）──
+    ColSum    = 20,  // dst[c] = Σ_r a[r][c]
+    ColMax    = 21,  // dst[c] = max_r a[r][c]
+    RowSum    = 22,  // dst[r] = Σ_c a[r][c]
+    RowMax    = 23,  // dst[r] = max_c a[r][c]
+};
+```
+> 归约指令的 `dst` 是一个"隐式张量"（每列/每行一个标量），后续指令可通过**广播操作数**引用它。
+
+#### 2.3.1 操作数 kind 增加"广播引用"
+```cpp
+enum class ExprOperandKind : uint8_t
+{
+    Reg    = 0,  // 现有
+    Input  = 1,  // 现有
+    Const  = 2,  // 现有
+    Fanout = 3,  // 现有
+    // ── 新增：引用一个"行/列归约结果"，自动广播 ──
+    Reduce = 4,  // 引用某归约指令 dst（按行或按列广播）
+};
+```
+
+### 2.4 求值/折叠扩展（`expr_dsl.hpp` 的 `SpecBuilder`）
+- `add_reduce_input(t, kind)`：登记归约视图 + 输入。
+- `add_reduce_instr(op, operand)`：登记归约指令。
+- DSL 层提供 `col_reduce_sum(x)` / `col_reduce_max(x)` / `row_reduce_sum(x)` / `row_reduce_max(x)` 自由函数，返回可参与后续算术的"归约叶子"。
+
+### 2.5 CPU 正确性实现（`cpu_engine.hpp`）
+`eval_expr` 的 CPU 路径按扩展语义求值：
+- 先对归约视图输入做一次归约，缓存每列/每行标量；
+- 归约指令就地归约寄存器数组；
+- 逐元素求值时，广播操作数按当前 `(r,c)` 取对应标量。
+- 为保持零开销，`eval()` 仍内联；归约预计算在循环外完成（每列/每行一次）。
+
+### 2.6 兼容性
+- 现有逐元素表达式（无归约）行为完全不变，`expr_spec_key` 兼容（新增枚举值不影响旧结构）。
+- `gen_fused` / `glsl_gen` 需识别新视图/指令；旧 shader 不受影响。
+
+---
+
+## 3. 阶段二：表达式录制 `begin_expr/end_expr`
+
+### 3.1 目标
+让 Layer 用**多行表达式**写出算法（如 Softmax 的五步），引擎录制结构并在 `end_expr` 时整体融合。这是 `begin_batch/end_batch`（提交级）的"计算级"推广。
+
+### 3.2 改动文件：`include/neuralnet.cpp/compute_engine.hpp`
+```cpp
+// 表达式录制（计算级融合）：
+//   begin_expr 进入录制；期间 Layer 调 eval_expr / 组合原语；
+//   end_expr 时引擎做融合分析，将可融合子序列合成单 kernel。
+//   CPU 引擎：begin/end 为 no-op（各表达式直接求值）。
+//   GPU 引擎：录制结构 → 融合 → dispatch；闭合世界，未命中硬报错。
+[[nodiscard]] virtual Result<void> begin_expr() = 0;
+[[nodiscard]] virtual Result<void> end_expr() = 0;
+```
+
+### 3.3 虚拟寄存器 DAG（引擎内部）
+录制期间，每个表达式产出：
+- 一个**虚拟寄存器**（Tensor 形态中间引用，记录其 `ExprSpec` 结构 + 依赖）。
+- 后续表达式可把前序虚拟寄存器当作输入（依赖边）。
+
+`end_expr` 时执行**融合分析**：
+1. 构建依赖 DAG。
+2. 判定融合边界：
+   - **小中间量**（每列/每行标量的归约结果）→ 留寄存器/共享内存，不落 VRAM；
+   - **逐元素链**（同一形状、无分支）→ 并入同一 kernel；
+   - **大张量 / matmul 结果** → spill 到内存，作为下一 kernel 输入。
+3. 产出 `{kernel 序列}`，每个 kernel 由 `glsl_gen` 从结构合成。
+
+### 3.4 录制状态的存放
+- 录制状态（虚拟寄存器表、依赖图）存放于各引擎内部（`cpu_engine.hpp` / `gpu_engine.hpp`），Layer 无感知。
+- GPU 引擎在 `end_expr` 时：查/合成融合 shader → `begin_batch` 语义下发 → `end_batch`。
+
+### 3.5 闭合世界保持
+- `scan_exprs` 增加对各 Layer 录制路径的 dry-run 覆盖（见 §6）。
+- 未命中的录制结构 → `eval_expr` 现有"硬报错"逻辑，提示补进扫描。
+
+---
+
+## 4. 阶段三：新增 matmul 融合原语（两趟注意力的承载点）
+
+> 这些是**通用、可复用**的 op-level 原语，引擎不认识"attention"，只认识"matmul 后接归约 / matmul 操作数含 softmax 结构"。
+
+### 4.1 改动文件：`include/neuralnet.cpp/compute_engine.hpp`
+
+#### 4.1.1 `ReduceOp` 枚举（新增，op-level）
+```cpp
+enum class ReduceOp : uint32_t
+{
+    Sum = 0,
+    Max = 1,
+    Min = 2,
+};
+```
+
+#### 4.1.2 通用原语 1：`batched_matmul_reduce`
+```cpp
+// 批量矩阵乘后沿某输出维度归约，不物化中间 A·B。
+// 语义：对每个 batch b，C_b = reduce_axis( alpha * op(A_b, B_b) )。
+//   reduce_cols=true : 沿输出列归约 → 每 batch 输出 (M_b, 1)
+//   reduce_cols=false: 沿输出行归约 → 每 batch 输出 (1, N_b)
+// 典型用途：softmax 的分子/分母（max/sum of QKᵀ），norm 类统计。
+[[nodiscard]] virtual Result<Tensor> batched_matmul_reduce(
+    const Tensor& A, const Tensor& B, std::size_t batch,
+    ReduceOp op, bool transA, bool transB,
+    Scalar alpha, bool reduce_cols) = 0;
+```
+
+#### 4.1.3 通用原语 2：`batched_matmul_softmax_denom`
+```cpp
+// 批量矩阵乘后：减去行 max → exp → 按输出列求和。
+// out = Σ_col exp( alpha*op(A_b,B_b) - row_max_b )，每 batch 输出 (M_b, 1)
+// 将 softmax 的分母（含数值稳定）与 matmul 融合，不物化 (M_b, N_b)。
+[[nodiscard]] virtual Result<Tensor> batched_matmul_softmax_denom(
+    const Tensor& A, const Tensor& B, const Tensor& row_max,
+    std::size_t batch, bool transA, bool transB, Scalar alpha) = 0;
+```
+
+#### 4.1.4 通用原语 3：`batched_matmul_softmax_apply`
+```cpp
+// 批量矩阵乘 + 行 softmax 归一化后与第三个张量相乘累加（两趟式注意力 Pass 2）。
+// 对每个 batch b：
+//   W_b[i,j] = exp( alpha*op(A_b,B_b)[i,j] - row_max_b[i] ) / denom_b[i]
+//   out_b[i,k] = Σ_j W_b[i,j] * V_b[j,k]
+// 按 tile 流式执行，不物化 W_b（即 (M_b, N_b) 权重矩阵）。
+[[nodiscard]] virtual Result<Tensor> batched_matmul_softmax_apply(
+    const Tensor& A, const Tensor& B, const Tensor& V,
+    const Tensor& row_max, const Tensor& denom,
+    std::size_t batch, bool transA, bool transB, Scalar alpha) = 0;
+```
+
+> 说明：这三个原语**都可复用**于其他场景（softmax、layernorm 统计、grad-norm 等），不叫算法名。`ReduceOp`/原语均返回 `Result<Tensor>`、RAII，符合"零手动内存/无异常"。
+
+---
+
+## 5. 阶段四：Layer 算法重构（算法文本留 Layer）
+
+> 本阶段只改 `compute_layer.hpp` / `compute_loss.hpp` 内部，把"多次原语 + clone"改为"录制/融合原语"。**不改接口语义，算法公式不变。**
+
+### 5.1 `Softmax::forward`（`compute_layer.hpp` ~820）
+改为表达式录制（结构不变，算法文本仍是那五步）：
+```cpp
+Result<Tensor> Softmax::forward(ComputeEngine& engine, const Tensor& input) override
+{
+    auto b = engine.begin_expr();                 // 开始录制
+    if (!b) return std::unexpected(b.error());
+
+    auto row_max = engine.row_reduce_max(input);  // (rows,1) 小标量，留寄存器
+    if (!row_max) return std::unexpected(row_max.error());
+    auto shifted = engine.elementwise_binary_scalar_sub_broadcast(input, *row_max); // 见 5.1.1
+    auto exp_shift = engine.elementwise_unary(UnaryOp::Exp, *shifted);
+    auto row_sum = engine.row_reduce_sum(*exp_shift);   // (rows,1) 小标量
+    auto output = engine.elementwise_binary_div_broadcast(*exp_shift, *row_sum);
+
+    auto e = engine.end_expr();                   // 整段合成单 kernel
+    if (!e) return std::unexpected(e.error());
+
+    output_cache_ = *output;
+    return output;
+}
+```
+> 录制期间 `row_max`/`row_sum`（每行一个标量）由融合分析判定留在共享内存，`shifted`/`exp_shift` 为 kernel 内部寄存器，**仅 `input` 与 `output` 落 VRAM**。中间三份全尺寸 Tensor 全部消除。
+
+#### 5.1.1 新增最小广播原语（可选，避免引入新命名算法）
+为让 Layer 少 clone，可在引擎加两个通用广播原语：
+```cpp
+// out = A - B（B 为 (rows,1)，按行广播）
+[[nodiscard]] virtual Result<Tensor> elementwise_broadcast_row(
+    BinaryOp op, const Tensor& A, const Tensor& row_vec) = 0;
+// out = A / B（B 为 (rows,1)，按行广播）
+```
+> 若不想加，可复用现有 `clone + broadcast_row_inplace`，但录制融合仍能把这两步并进 kernel。**优先加广播原语**（更干净、减少 clone 分配）。
+
+### 5.2 `LayerNorm` / `RMSNorm`（`compute_layer.hpp` ~492 / ~686）
+同样用录制表达：
+- 均值/方差归约（`row_reduce_sum` + 组合）→ 归一化 → γ/β 逐元素。
+- 归约中间量（每行标量）留寄存器；归一化 + 仿射逐元素链融成一个 kernel。
+- 反向同理（`gy*normalized`、`broadcast_col` 等）。
+
+### 5.3 `CrossEntropyLoss::forward_sparse`（`compute_loss.hpp`）
+- 用录制 + `batched_matmul_softmax_denom`/归约表达 softmax；
+- 只对标签位置 gather `log_softmax` 求 loss；
+- 只算标签位置梯度（`softmax - one_hot` 的稀疏版），**不物化 `vocab×seq·batch` 全 softmax**。
+- 保留现有"下载 softmax 到 CPU"的正确性回退路径（见 §8）。
+
+### 5.4 `AttentionBase::forward`（`compute_layer.hpp` ~1159）—— 两趟式
+把现有 `batched_matmul(Q,K) → mask → softmax → batched_matmul(softmax,V)` 改为两趟，用 §4 原语：
+```cpp
+// Q_cache,K_cache,V_cache: (BH*d_k, seq)，按 batch*H 切块
+const std::size_t BH = batch * num_heads_;
+auto b = engine.begin_expr();
+
+// Pass 1a：m = 行 max of (alpha*QᵀK)   —— 不物化 scores
+auto m = engine.batched_matmul_reduce(
+    Q_cache_, K_cache_, BH, ReduceOp::Max, /*transA=*/true, /*transB=*/false,
+    scale_, /*reduce_cols=*/true);
+// 施加因果/ALiBi 掩码到 m（常数掩码对 max 的修正，见 5.4.1）
+apply_mask_to_rowmax(engine, *m, batch, seq);
+
+// Pass 1b：l = Σ exp(alpha*QᵀK - m)   —— 重算 QᵀK，仍不物化
+auto l = engine.batched_matmul_softmax_denom(
+    Q_cache_, K_cache_, *m, BH, /*transA=*/true, /*transB=*/false, scale_);
+
+// Pass 2：O = W·V，W 为行 softmax，逐 tile 累加，不物化
+auto concat_out = engine.batched_matmul_softmax_apply(
+    Q_cache_, K_cache_, V_cache_, *m, *l, BH,
+    /*transA=*/true, /*transB=*/false, scale_);
+
+auto e = engine.end_expr();
+```
+> **显存收益**：`scores`/`masked`/`attn_cache_` 三份 `BH·seq×seq` 全部消失，只剩 `m`/`l`（`BH·seq`）与 `O`（`BH·d_k·seq`）。每层从 ~3×`BH·seq²` 降到 `O(BH·seq·d_k)`。代价：`QᵀK` 计算两遍（2× FLOPs），对训练可接受。
+
+#### 5.4.1 掩码处理
+- **因果掩码**：对 row-max 的修正是常数（`-inf` 屏蔽列），可通过在 `batched_matmul_reduce` 传入掩码上界，或 Layer 在 `m` 上做一次常数修正（不物化 scores）。
+- **ALiBi 线性偏置**：`m_i = max_j(alpha*scores_ij + slope*|i-j|)`，偏置可折进 `alpha` 与 mask 的修正中。
+- **文档块对角掩码**：按 doc_id 分组，同 softmax 结构处理。
+> 掩码逻辑在 **Layer**（`apply_mask_` 钩子保留），引擎只认"matmul+reduce"结构。
+
+### 5.5 注意力反向（`AttentionBase::backward`）
+两趟式反向需要 `attn` 权重 `W` 用于 `grad_Q/grad_K/grad_V`。两条路线（Layer 决策）：
+- **A（推荐，省显存）**：反向**重算** `W`（用 §4 原语再算一次），不缓存 `attn_cache_`。多 1 次 `QᵀK`，但省去整份 `BH·seq²` 缓存。
+- B（省计算）：保留 `attn_cache_`（放弃部分显存收益）。
+> 设计默认 A，暴露开关。
+
+---
+
+## 6. 阶段五：工具链 / 构建（闭合世界）
+
+### 6.1 `tools/scan_exprs.cpp`
+增加对各 Layer **录制路径**的 dry-run 覆盖：
+- `Softmax::forward/backward`
+- `LayerNorm`/`RMSNorm::forward/backward`
+- `CrossEntropyLoss`（softmax 结构）
+- `AttentionBase` 两趟结构（至少覆盖常用 `seq/H/d_k` 组合）
+使新融合结构被收集进 `expr_specs.bin`。
+
+### 6.2 `tools/gen_fused.cpp` + `glsl_gen.hpp`
+- `glsl_gen` 学会从含**归约视图/归约指令**的 `ExprSpec` 生成带 workgroup 归约（共享内存 + `barrier`）的 shader。
+- 为 §4 的三个 matmul 融合原语生成 tile 化 shader（两趟：Pass1 归约、Pass2 流式 `W·V`，均不写 `(M,N)` 中间矩阵）。
+- 产物 `fused_registry.hpp` 增加这些结构的 key。
+
+### 6.3 `CMakeLists.txt`
+沿用现有 `scan_exprs → gen_fused` 两步（§177-205 已存在）：
+- 新增 shader 源（如 `shaders/bmm_reduce.comp`、`shaders/bmm_softmax_apply.comp`）加入 `GPU_SHADER_HPPS`。
+- `scan_exprs` 目标追加新 dry-run 调用。
+- 无需新外部依赖（仍走 `glslc` + 内联 SPIR-V）。
+
+---
+
+## 7. 阶段六：后端实现
+
+| 后端 | 文件 | 实现 |
+|------|------|------|
+| CPU | `cpu_engine.hpp` | `begin_expr/end_expr` 为 no-op；`eval_expr` 扩展归约语义；§4 三个原语用等效循环（先正确、后可向量化） |
+| GPU (Vulkan) | `gpu_engine.hpp` + `shaders/*.comp` + `vk_backend.hpp` | 录制融合分析；`eval_expr` 查 `fused_registry`；§4 原语 dispatch 融合 shader |
+| CUDA | `cuda_engine.hpp` + `cuda_kernels.cu` | 同 GPU，CUDA 融合 kernel（`bmm_reduce`、`bmm_softmax_apply`） |
+
+所有原语遵循现有约定：`Result<T>` 返回、batch 录制可组合、失败回退到组合路径。
+
+---
+
+## 8. 正确性与回退策略
+
+1. **CPU 正确性基准**：CPU 实现先按"多次原语"正确实现，作为融合 kernel 的参考。
+2. **gradcheck**：为 Softmax/LayerNorm/RMSNorm/Attention/CrossEntropy 加/复用中心差分 gradcheck（现有 `softmax_gradcheck`、`rmsnorm_gradcheck`、`attn_gradcheck`、`gpt_gradcheck` 均可扩展）。
+3. **GPU 回退**：融合 kernel 未命中/失败时，回退到"原语组合"路径（复用现有 fallback 模式），保证训练不中断、结果不变。
+4. **数值稳定性**：`batched_matmul_reduce` 保留 `-max` 平移（`alpha*QᵀK - m`），与现有 softmax 一致。
+5. **两趟一致性**：两趟 `QᵀK` 重算，需保证 `m`/`l` 在两次计算间一致（同一 kernel 内共享，无漂移）。
+
+---
+
+## 9. 显存收益估算（示例：batch=32, H=8, seq=1024, fp32）
+
+| 项目 | 现状 | 融合后 |
+|------|------|--------|
+| 注意力分数/缓存（每层） | ~3×`BH·seq²` ≈ 3.2 GB | `O(BH·seq·d_k)` ≈ 0.2 GB |
+| 注意力缓存（8 层） | ~8.6 GB | ~1.6 GB |
+| 损失全 softmax（vocab=25k） | `logits`+`softmax` ≈ 6.6 GB | 仅标签 gather ≈ 0 |
+| Softmax/LN 中间量 | 每 op 全尺寸中间 | 融合消除 |
+
+> 注意：以上为**激活路径**收益。参数/优化器状态（Adam m/v = 2×params）不受影响；内存池碎片化另案处理。
+
+---
+
+## 10. 里程碑（增量、每步可验证）
+
+| 里程碑 | 内容 | 验证 |
+|--------|------|------|
+| M1 ✅ | `ExprSpec` 加归约视图/指令 + CPU `eval_expr` 扩展 | `expr_reduce_test` 全过 + `expr_dsl_test` 回归 |
+| M2 ✅ | `begin_expr/end_expr` 录制框架 + CPU no-op | 现有测试回归通过 |
+| M3 | Softmax/LayerNorm/RMSNorm 改录制，GPU 融合 shader | gradcheck + 显存对比 |
+| M4 | §4 三个 matmul 融合原语（CPU + GPU） | `gpt_gradcheck` 通过 |
+| M5 | CrossEntropyLoss 融合（不物化全 softmax） | loss/grad 一致性 + 显存下降 |
+| M6 | Attention 两趟式（forward + 反向重算） | `attn_gradcheck` + 显存大幅下降 |
+| M7 | CUDA 后端对齐；文档与 `DEVELOPMENT_STANDARDS.md` 补"原语可专、不叫算法名"约定 | 全套测试 |
+
+---
+
+## 11. 风险与开放问题
+
+1. **glsl_gen 融合工作量**：两趟注意力的 tile 化代码生成是最大工作量，等价于手写一版内存高效注意力生成器。M4-M6 可先用**手写固定 shader** 验证收益，再决定是否泛化为结构生成。
+2. **闭合世界 vs 形状变化**：录制融合结构若依赖形状（tile 尺寸），需在 `scan_exprs` 覆盖常用形状；超范围则回退组合路径（正确但省显存效果降级）。
+3. **反向重算 vs 缓存**：默认反向重算 `W`（省显存），若训练变慢明显，提供缓存开关。
+4. **不引入运行时编译**：所有融合 kernel 保持 AOT 预编译，`end_expr` 只做查表/装配。
+
+---
+
+## 12. 文件改动清单（汇总）
+
+| 文件 | 改动 |
+|------|------|
+| `include/neuralnet.cpp/expr_spec.hpp` | 归约视图、归约指令、`Reduce` 操作数 |
+| `include/neuralnet.cpp/expr_dsl.hpp` | `SpecBuilder` 支持归约；归约 DSL 自由函数 |
+| `include/neuralnet.cpp/compute_engine.hpp` | `ReduceOp` 枚举；`begin_expr/end_expr`；`batched_matmul_reduce`/`..._softmax_denom`/`..._softmax_apply`；`elementwise_broadcast_row` |
+| `include/neuralnet.cpp/cpu_engine.hpp` | 上述原语 CPU 实现（先正确后优化） |
+| `include/neuralnet.cpp/gpu_engine.hpp` | 录制融合分析；GPU 原语实现 |
+| `include/neuralnet.cpp/backend/vk_backend.hpp` | 新融合 shader dispatch |
+| `include/neuralnet.cpp/cuda_engine.hpp` + `cuda_kernels.cu` | CUDA 实现 |
+| `include/neuralnet.cpp/compute_layer.hpp` | Softmax/LN/RMSNorm/Attention 改录制/两趟 |
+| `include/neuralnet.cpp/compute_loss.hpp` | CrossEntropyLoss 融合 |
+| `shaders/*.comp` | 归约/两趟注意力融合 shader |
+| `tools/scan_exprs.cpp` | 录制路径 dry-run |
+| `tools/gen_fused.cpp` + `glsl_gen.hpp` | 归约/两趟结构生成 |
+| `CMakeLists.txt` | 新 shader 接入 |
+| `docs/DEVELOPMENT_STANDARDS.md` | 补"原语可专、不叫算法名"约定 |
+
+---
+
+## 13. 实施记录
+
+### M1 ✅（2026-08）— ExprSpec 归约语义（地基）
+
+**改动**：
+- `expr_spec.hpp`：`ExprViewKind` 增加 `ColReduceSum/Max`、`RowReduceSum/Max`（归约视图）；`ExprOp` 增加 `ColSum/ColMax/RowSum/RowMax`（归约指令）；`ExprOperandKind` 增加 `Reduce`（广播引用归约结果）；辅助谓词 `expr_op_is_reduce`/`expr_view_is_reduce` 等；`expr::reduce`/归约视图便捷构造；`validate_expr_spec` 增加归约语义校验（Reduce 只能引用已出现的归约指令、禁止自引用、寄存器不得引用归约 dst）。
+- `expr_dsl.hpp`：`SpecBuilder::add_reduce_input/add_reduce_instr`；`ReduceViewRef<Kind>`（归约视图叶子，`row_reduce_sum(x)` 等 Tensor 重载）；`ReduceRef<E,Rop>`（归约指令节点，表达式重载）；`has_reduction_v` 特征；`dsl::compute` 对含归约表达式在 CPU 上分流到 `eval_expr`（模板求值无法表达全行/全列归约）。
+- `cpu_engine.hpp`：`eval_expr` 扩展——归约视图预计算（每行/每列标量）+ 归约指令按指令序预计算（重放前缀、支持转递依赖）+ 主循环跳过归约指令、`Reduce` 操作数广播读取；输出为归约向量时广播到 (rows,cols)。
+- `src/expr_reduce_test.cpp`（新）+ `CMakeLists.txt`：7 组数值验证（行/列归约广播、Softmax 视图+指令混合、纯指令输出、归约叠加视图、标量混合）+ 折叠结构断言 + 非法引用校验 + key 确定性。
+
+**关键决策**：
+- **固定 DSL 折叠求值顺序**（`Binary`/`Select::to_spec` 先求值操作数到局部变量再 `add_instr`）：C++ 函数实参求值顺序未指定，直接 `add_instr(op, l.to_spec(b), r.to_spec(b))` 会让 views/inputs 登记顺序随编译器（MSVC 左→右 / Clang 右→左）漂移，破坏 `expr_spec_key` 跨编译器稳定性。已修复并在 `expr_dsl_test`/`fused_gpu_test` 验证无回归。
+- 归约指令源允许引用更早归约结果（转递依赖），按指令序预计算保证拓扑依赖成立。
+- GPU 尚未支持归约结构：含归约表达式在 GPU 上走现有闭合世界硬报错（M3 引入融合 shader 前不改 Layer 行为）。
+
+### M2 ✅（2026-08）— begin_expr/end_expr 录制框架
+
+- `compute_engine.hpp`：`begin_expr()/end_expr()` 纯虚接口（计算级融合入口）。
+- `cpu_engine.hpp` / `gpu_engine.hpp` / `cuda_engine.hpp`：no-op 实现（各表达式/原语独立求值，行为不变）。
+- Layer 可先行用 `begin_expr/end_expr` 包住算法段落而语义不变；录制融合分析（虚拟寄存器 DAG + 融合边界判定）在 M3 落地。

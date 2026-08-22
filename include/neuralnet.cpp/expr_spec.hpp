@@ -15,6 +15,8 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include <cstdint>
+#include <cstdio>
+#include <string>
 #include <vector>
 
 #include "config.hpp"
@@ -51,7 +53,26 @@ enum class ExprOp : uint8_t
     Ne    = 18, // a != b
     // 选择：dst = (a != 0) ? b : c
     Select = 19,
+    // ── 新增：归约指令（dst 为隐式"每行/每列一个标量"的归约向量，
+    //          仅能经 ExprOperandKind::Reduce 操作数按行/列广播访问）──
+    ColSum = 20,  // dst[c] = Σ_r a[r][c]
+    ColMax = 21,  // dst[c] = max_r a[r][c]
+    RowSum = 22,  // dst[r] = Σ_c a[r][c]
+    RowMax = 23,  // dst[r] = max_c a[r][c]
 };
+
+// ── 归约语义辅助（引擎/校验共用）──────────────────────────────────────
+// 归约指令：dst 是"每行/每列一个标量"的隐式向量，供 Reduce 操作数广播引用。
+[[nodiscard]] inline constexpr bool expr_op_is_reduce(ExprOp op) noexcept
+{
+    return op == ExprOp::ColSum || op == ExprOp::ColMax ||
+           op == ExprOp::RowSum || op == ExprOp::RowMax;
+}
+// 该归约指令产出的向量方向：true=按列归约 → (1, cols)，false=按行归约 → (rows, 1)
+[[nodiscard]] inline constexpr bool expr_op_reduces_cols(ExprOp op) noexcept
+{
+    return op == ExprOp::ColSum || op == ExprOp::ColMax;
+}
 
 // ── 操作数 ─────────────────────────────────────────────────────────────────
 enum class ExprOperandKind : uint8_t
@@ -60,6 +81,8 @@ enum class ExprOperandKind : uint8_t
     Input  = 1,  // 引用第 idx 个输入 Tensor（按 views[idx] 视图访问）
     Const  = 2,  // 引用常量池第 idx 项
     Fanout = 3,  // 引用前驱结果寄存器（语义同 Reg，显式表达 fanout 语义）
+    // ── 新增：引用一个"行/列归约结果"，自动按行或按列广播 ──
+    Reduce = 4,  // 引用某归约指令 dst（idx 指向归约指令的目标寄存器号）
 };
 
 // 操作数：2 字节（kind + idx），指令布局紧凑、可序列化、未来可入 push constant
@@ -83,7 +106,26 @@ enum class ExprViewKind : uint8_t
                        //   读取源 rl+block_rows/2 并取负（LLaMA 式 rotate_half）
     RowMod       = 2,  // 行取模广播：读取 data[(r % param)*cols + c]
                        //   用于 cos/sin 频率表 ((d_k,seq)) 平铺到 (batch*H*d_k,seq)
+    // ── 新增：归约视图（该输入被归约为每列/每行一个标量，自动广播）──
+    // 求值期代表一个"每行/每列一个标量"的广播向量：
+    //   对输出元素 (r,c)，行归约读取向量在 r 处的标量，列归约读取 c 处标量。
+    ColReduceSum = 3,  // 该输入按列求和 → (1, cols)
+    ColReduceMax = 4,  // 该输入按列求 max → (1, cols)
+    RowReduceSum = 5,  // 该输入按行求和 → (rows, 1)
+    RowReduceMax = 6,  // 该输入按行求 max → (rows, 1)
 };
+
+// ── 归约视图辅助（引擎/校验共用）──────────────────────────────────────
+[[nodiscard]] inline constexpr bool expr_view_is_reduce(ExprViewKind k) noexcept
+{
+    return k == ExprViewKind::ColReduceSum || k == ExprViewKind::ColReduceMax ||
+           k == ExprViewKind::RowReduceSum || k == ExprViewKind::RowReduceMax;
+}
+// 该归约视图按行归约（输出 (rows,1)，按 r 广播）；false=按列归约（输出 (1,cols)，按 c 广播）
+[[nodiscard]] inline constexpr bool expr_view_reduces_rows(ExprViewKind k) noexcept
+{
+    return k == ExprViewKind::RowReduceSum || k == ExprViewKind::RowReduceMax;
+}
 
 struct ExprView
 {
@@ -130,6 +172,55 @@ struct ExprSpec
            a.consts == b.consts && a.num_regs == b.num_regs;
 }
 
+// ── 规范结构 key（AOT 收集/匹配的单一依据）──────────────────────────────
+// 把 ExprSpec 的**结构**（指令、视图、常量、寄存器数；不含输入张量）确定性地
+// 哈希成 16 位十六进制字符串。同一结构跨构建/跨调用恒得同 key，不同结构
+// 以极大概率不同。用于：
+//   1. 构建期 scan_exprs 注册表去重（identical 表达式只合成一个 shader）
+//   2. gen_fused 产物命名（fused_<key>）与嵌入注册
+//   3. 运行时 eval_expr 折叠内联表达式 → key → 查预编译 shader（闭合世界）
+// 逐字段字节级串接（不用 memcpy 整个 struct，避免 padding/平台差异）。
+[[nodiscard]] inline std::string expr_spec_key(const ExprSpec& s)
+{
+    std::uint64_t h = 0xcbf29ce484222325ull;  // FNV-1a 64 offset basis
+    const auto feed = [&h](const void* p, std::size_t n)
+    {
+        const auto* b = static_cast<const std::uint8_t*>(p);
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            h ^= static_cast<std::uint64_t>(b[i]);
+            h *= 0x100000001b3ull;
+        }
+    };
+    const auto feed_u32 = [&](std::uint32_t v) { feed(&v, sizeof(v)); };
+
+    feed_u32(s.num_regs);
+    feed_u32(static_cast<std::uint32_t>(s.instrs.size()));
+    for (const auto& in : s.instrs)
+    {
+        feed(&in.op, 1);
+        feed(&in.dst, 1);
+        feed(&in.a, sizeof(in.a));  // ExprOperand: 2 字节 POD
+        feed(&in.b, sizeof(in.b));
+        feed(&in.c, sizeof(in.c));
+    }
+    feed_u32(static_cast<std::uint32_t>(s.views.size()));
+    for (const auto& v : s.views)
+    {
+        feed(&v.kind, 1);
+        feed(&v.negate_first_half, 1);
+        feed_u32(v.param);
+    }
+    feed_u32(static_cast<std::uint32_t>(s.consts.size()));
+    for (const auto& c : s.consts)
+        feed(&c, sizeof(c));
+
+    char buf[17];
+    std::snprintf(buf, sizeof(buf), "%016llx",
+                  static_cast<unsigned long long>(h));
+    return std::string(buf);
+}
+
 // ── 上限（GPU 资源 / 校验共用）───────────────────────────────────────────
 inline constexpr std::size_t EXPR_MAX_INPUTS = 8;
 inline constexpr std::size_t EXPR_MAX_CONSTS = 16;
@@ -168,6 +259,45 @@ inline constexpr std::size_t EXPR_MAX_INSTRS = 64;
                 return std::unexpected(Error{"validate_expr_spec: const index out of range"});
         }
     }
+
+    // ── 归约语义校验 ─────────────────────────────────────────────────────
+    //   1. Reduce 操作数只能引用"已出现的归约指令 dst"（隐式标量向量），
+    //      且禁止自引用（归约指令的源引用自己）。
+    //   2. 普通 Reg/Fanout 引用归约 dst 无意义（归约结果只能经 Reduce 操作数
+    //      按行/列广播访问）——拒绝，避免引擎侧产生歧义。
+    //   3. 归约指令只需源操作数 a，b/c 忽略。
+    {
+        std::vector<uint8_t> reduce_dst(spec.num_regs, 0);  // dst -> 是否为归约结果
+        std::vector<uint8_t> elem_dst(spec.num_regs, 0);    // dst -> 是否为逐元素结果
+        for (const auto& ins : spec.instrs)
+        {
+            const ExprOp op = static_cast<ExprOp>(ins.op);
+            const bool is_reduce = expr_op_is_reduce(op);
+            (is_reduce ? reduce_dst : elem_dst)[ins.dst] = 1;
+
+            const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
+            const std::size_t nops = is_reduce ? 1 : 3;
+            for (std::size_t oi = 0; oi < nops; ++oi)
+            {
+                const ExprOperand& opnd = *ops[oi];
+                if (opnd.kind == static_cast<uint8_t>(ExprOperandKind::Reduce))
+                {
+                    if (opnd.idx >= spec.num_regs)
+                        return std::unexpected(Error{"validate_expr_spec: reduce ref out of range"});
+                    if (opnd.idx == ins.dst)
+                        return std::unexpected(Error{"validate_expr_spec: reduce self-reference"});
+                    if (!reduce_dst[opnd.idx] || elem_dst[opnd.idx])
+                        return std::unexpected(Error{"validate_expr_spec: Reduce operand must reference a prior reduce instruction"});
+                }
+                else if ((opnd.kind == static_cast<uint8_t>(ExprOperandKind::Reg) ||
+                          opnd.kind == static_cast<uint8_t>(ExprOperandKind::Fanout)) &&
+                         opnd.idx < spec.num_regs && reduce_dst[opnd.idx])
+                {
+                    return std::unexpected(Error{"validate_expr_spec: register ref to reduce dst (use Reduce operand)"});
+                }
+            }
+        }
+    }
     return {};
 }
 
@@ -178,11 +308,16 @@ namespace expr
     inline constexpr ExprOperand input(std::uint8_t i) { return {1, i}; }
     inline constexpr ExprOperand cst(std::uint8_t c)   { return {2, c}; }
     inline constexpr ExprOperand fanout(std::uint8_t r){ return {3, r}; }
+    inline constexpr ExprOperand reduce(std::uint8_t r){ return {4, r}; }  // 引用归约指令 dst
     inline constexpr ExprView linear()                 { return {0, 0, 0}; }
     inline constexpr ExprView rotate_half(std::uint32_t block_rows, bool negate_first_half = true)
     { return {1, negate_first_half ? std::uint8_t{1} : std::uint8_t{0}, block_rows}; }
     inline constexpr ExprView row_mod(std::uint32_t modulo)
     { return {2, 0, modulo}; }
+    inline constexpr ExprView col_reduce_sum() { return {3, 0, 0}; }
+    inline constexpr ExprView col_reduce_max() { return {4, 0, 0}; }
+    inline constexpr ExprView row_reduce_sum() { return {5, 0, 0}; }
+    inline constexpr ExprView row_reduce_max() { return {6, 0, 0}; }
 } // namespace expr
 
 } // namespace nn

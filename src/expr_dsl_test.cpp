@@ -4,8 +4,11 @@
 //  验证内容：
 //   1. CPU 编译期模板求值正确性（eval_cpu 与手写参考逐元素对照）
 //   2. to_expr_spec 折叠结构正确（指令/寄存器/视图/输入数量与算子序列）
-//   3. forward / backward spec 可区分（闭合世界 AOT 匹配的前提）
-//   4. 标量广播、比较 + select（relu）正确性
+//   3. forward / backward spec 可区分（AOT 匹配的前提）
+//   4. 规范 key 确定性：同表达式同 key、不同表达式/不同参数 key 不同
+//      （key = 构建期 scan 去重与运行时匹配的依据）
+//   5. start_expr / end_expr 块式融合
+//   6. 标量广播、比较 + select（relu）正确性
 //
 //  编译（本机性能差，用单 TU 快速验证）：
 //    clang++ -std=c++26 -stdlib=libc++ -fno-exceptions \
@@ -20,7 +23,7 @@
 #include <neuralnet.cpp/tensor.hpp>
 #include <neuralnet.cpp/expr_dsl.hpp>
 #include <neuralnet.cpp/expr_spec.hpp>
-#include <neuralnet.cpp/fused_exprs.hpp>
+#include <neuralnet.cpp/cpu_engine.hpp>
 
 // 测试写在全局作用域（非 namespace nn），避免与旧代数运算符的 ADL 歧义。
 using namespace nn::dsl;
@@ -63,6 +66,17 @@ float rope_ref(const nn::Tensor& q, const nn::Tensor& cos, const nn::Tensor& sin
     return backward ? (qc - qs2) : (qc + qs2);
 }
 
+// 内联 RoPE 表达式（与 Layer 里写的同一段，唯一事实来源）
+template <bool Backward>
+auto rope_expr(const nn::Tensor& q, const nn::Tensor& cos, const nn::Tensor& sin,
+               std::uint32_t dk)
+{
+    auto term1 = leaf(q) * row_mod(cos, dk);
+    auto term2 = rotate_half(q, dk) * row_mod(sin, dk);
+    if constexpr (Backward) return term1 - term2;
+    else                    return term1 + term2;
+}
+
 void test_rope()
 {
     constexpr std::size_t DK = 32, ROWS = 64, COLS = 4;
@@ -72,7 +86,7 @@ void test_rope()
 
     // forward
     {
-        auto expr = make_rope<false>(q, cos, sin, DK);
+        auto expr = rope_expr<false>(q, cos, sin, DK);
         nn::Tensor out = eval_cpu(expr, ROWS, COLS);
         const auto os = out.cpu_matrix().span();
         bool ok = true;
@@ -95,15 +109,16 @@ void test_rope()
         CHECK(spec.instrs[1].op == static_cast<uint8_t>(nn::ExprOp::Mul), "instr1=Mul(rot*sin)");
         CHECK(spec.instrs[2].op == static_cast<uint8_t>(nn::ExprOp::Add), "instr2=Add(r0+r1)");
         CHECK(spec.instrs[2].dst == 2, "输出寄存器 = 2");
-        CHECK(nn::expr_spec_equal(spec, nn::fused::make_rope(DK, false)),
-              "dsl 折叠 == fused::make_rope（AOT 匹配防漂移）");
-        CHECK(nn::expr_spec_equal(spec, to_expr_spec(make_rope<false>(q, cos, sin, DK)).first),
-              "同一表达式两次折叠 spec 相同（AOT 匹配前提）");
+
+        // 规范 key：同表达式折叠两次 key 相同（AOT 匹配前提）
+        const std::string k1 = nn::expr_spec_key(spec);
+        const std::string k2 = nn::expr_spec_key(to_expr_spec(rope_expr<false>(q, cos, sin, DK)).first);
+        CHECK(k1 == k2, "同表达式两次折叠 key 相同");
     }
 
     // backward：spec 应与 forward 不同（末条为 Sub）
     {
-        auto expr = make_rope<true>(q, cos, sin, DK);
+        auto expr = rope_expr<true>(q, cos, sin, DK);
         nn::Tensor out = eval_cpu(expr, ROWS, COLS);
         const auto os = out.cpu_matrix().span();
         bool ok = true;
@@ -116,8 +131,15 @@ void test_rope()
         CHECK(ok, "RoPE backward CPU 求值与参考一致");
         auto [spec, _] = to_expr_spec(expr);
         CHECK(spec.instrs.back().op == static_cast<uint8_t>(nn::ExprOp::Sub), "backward 末条=Sub");
-        CHECK(!nn::expr_spec_equal(spec, to_expr_spec(make_rope<false>(q, cos, sin, DK)).first),
-              "forward/backward spec 可区分");
+        CHECK(nn::expr_spec_key(spec) !=
+              nn::expr_spec_key(to_expr_spec(rope_expr<false>(q, cos, sin, DK)).first),
+              "forward/backward key 可区分");
+
+        // 不同 d_k → 不同 key（构建期需为每个 d_k 各合成一个 shader）
+        constexpr std::uint32_t DK2 = 64;
+        CHECK(nn::expr_spec_key(spec) !=
+              nn::expr_spec_key(to_expr_spec(rope_expr<true>(q, cos, sin, DK2)).first),
+              "不同 d_k 的 key 不同");
     }
 }
 
@@ -198,9 +220,11 @@ void test_swiglu()
     nn::Tensor gate = make_tensor(R, C, 0.5f, 0.006f);
     nn::Tensor up = make_tensor(R, C, 1.2f, 0.004f);
 
-    // grad_gate = g*up*s*(1 + gate*(1-s))
+    // grad_gate = g*up*s*(1 + gate*(1-s))（内联，与 Layer 相同）
     {
-        auto expr = make_swiglu_grad_gate(g, s, gate, up);
+        const Scalar one{1};
+        auto expr = leaf(g) * leaf(up)
+            * (leaf(s) * (one + leaf(gate) * (one - leaf(s))));
         nn::Tensor out = eval_cpu(expr, R, C);
         const auto os = out.cpu_matrix().span();
         const auto gs = g.cpu_matrix().span();
@@ -215,12 +239,14 @@ void test_swiglu()
         }
         CHECK(ok, "swiglu grad_gate CPU 正确");
         auto [spec, _] = to_expr_spec(expr);
-        CHECK(nn::expr_spec_equal(spec, nn::fused::make_swiglu_grad_gate()),
-              "dsl swiglu grad_gate == fused（AOT 防漂移）");
+        CHECK(nn::expr_spec_key(spec) ==
+              nn::expr_spec_key(to_expr_spec(
+                  leaf(g) * leaf(up) * (leaf(s) * (one + leaf(gate) * (one - leaf(s))))).first),
+              "swiglu grad_gate 同表达式 key 稳定");
     }
     // grad_up = g*gate*s
     {
-        auto expr = make_swiglu_grad_up(g, s, gate);
+        auto expr = leaf(g) * leaf(gate) * leaf(s);
         nn::Tensor out = eval_cpu(expr, R, C);
         const auto os = out.cpu_matrix().span();
         const auto gs = g.cpu_matrix().span();
@@ -231,8 +257,39 @@ void test_swiglu()
             if (std::fabs((gs[i] * gts[i] * ss[i]) - os[i]) > 1e-4f) { ok = false; break; }
         CHECK(ok, "swiglu grad_up CPU 正确");
         auto [spec, _] = to_expr_spec(expr);
-        CHECK(nn::expr_spec_equal(spec, nn::fused::make_swiglu_grad_up()),
-              "dsl swiglu grad_up == fused（AOT 防漂移）");
+        CHECK(nn::expr_spec_key(spec) !=
+              nn::expr_spec_key(to_expr_spec(
+                  leaf(g) * leaf(up)
+                  * (leaf(s) * (Scalar{1} + leaf(gate) * (Scalar{1} - leaf(s))))).first),
+              "grad_gate 与 grad_up key 不同");
+    }
+}
+
+void test_blocks()
+{
+    // start_expr / end_expr 块式融合（走 CpuEngine，最终 eval_cpu）
+    constexpr std::size_t R = 4, C = 3;
+    nn::Tensor a = make_tensor(R, C, 1.0f, 0.1f);
+    nn::Tensor b = make_tensor(R, C, 2.0f, 0.2f);
+    nn::Tensor c = make_tensor(R, C, 3.0f, 0.3f);
+    nn::Tensor d = make_tensor(R, C, 4.0f, 0.4f);
+
+    nn::CpuEngine eng;
+    auto out = nn::dsl::end_expr(nn::dsl::start_expr(eng, R, C,
+        leaf(a) * leaf(b) + leaf(c) * Scalar{2} - leaf(d)));
+    CHECK(static_cast<bool>(out), "end_expr 成功");
+    if (out)
+    {
+        const auto os = out->cpu_matrix().span();
+        const auto as = a.cpu_matrix().span();
+        const auto bs = b.cpu_matrix().span();
+        const auto cs = c.cpu_matrix().span();
+        const auto ds = d.cpu_matrix().span();
+        bool ok = true;
+        for (std::size_t i = 0; i < R * C; ++i)
+            if (std::fabs((as[i] * bs[i] + cs[i] * 2.0f - ds[i]) - os[i]) > 1e-5f)
+            { ok = false; break; }
+        CHECK(ok, "start_expr..end_expr 块式融合结果正确");
     }
 }
 
@@ -243,6 +300,7 @@ int main()
     test_rope();
     test_elementwise();
     test_swiglu();
+    test_blocks();
 
     if (g_fail == 0)
         std::printf("ALL PASS\n");

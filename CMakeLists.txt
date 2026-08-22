@@ -98,6 +98,9 @@ nn_add_executable(tensor_expr_test src/tensor_expr_test.cpp)
 # ── 统一表达式 DSL 单元测试（编译期融合 + AOT 折叠 + 防漂移断言，纯 CPU） ──
 nn_add_executable(expr_dsl_test src/expr_dsl_test.cpp)
 
+# ── ExprSpec 归约语义测试（M1：归约视图/归约指令 CPU 求值，纯 CPU） ──────
+nn_add_executable(expr_reduce_test src/expr_reduce_test.cpp)
+
 # ── Softmax 数值梯度检查（gradcheck，验证 softmax 反向） ───────────────────
 nn_add_executable(softmax_gradcheck src/softmax_gradcheck.cpp)
 
@@ -130,22 +133,14 @@ if(Vulkan_FOUND)
         transpose
         gather
         scatter_add)
-    # ── 融合 shader：算法在 C++（单一事实来源），构建期降级成 GPU ─────
-    # GPU_FUSED_SHADERS 的每个条目都来自 include/neuralnet.cpp/fused_exprs.hpp
-    # 的 kGenInstances：构建期 tools/gen_fused 用 dsl 折叠同一段表达式生成
-    # .comp，再走 glslc → embed 管线。**算法唯一事实来源在 C++ 源码**，
-    # 融合 shader 是自动生成的产物（请勿手写算法 GLSL）。
-    # 一个算法允许拆成多个融合 kernel（如 SwiGLU backward = grad_gate +
-    # grad_up 两个）；不强制"每算法单 kernel"。性能让位于清晰/可维护。
-    set(GPU_FUSED_SHADERS
-        rope_forward_dk32
-        rope_forward_dk64
-        rope_forward_dk128
-        rope_backward_dk32
-        rope_backward_dk64
-        rope_backward_dk128
-        swiglu_grad_gate
-        swiglu_grad_up)
+    # ── 融合 shader：构建期从 Layer 内联表达式自动合成 ───────────────
+    # 表达式**文本只出现在 Layer**（compute / start_expr..end_expr）。
+    # 构建期两步：
+    #   ① scan_exprs：dry-run 跑 Layer 的 forward/backward，收集折叠出的
+    #      ExprSpec 结构（去重）→ expr_specs.bin（派生物，非手写定义）
+    #   ② gen_fused：读 bin → glsl_gen → glslc → 内联 SPIR-V
+    #      → fused_registry.hpp（key=expr_spec_key → 融合 shader）
+    # 运行时按 key 精确匹配 dispatch；未命中硬报错（闭合世界）。
     set(GPU_SHADER_HPPS "")
 
     # 便捷函数：glslc → .spv → embed_spirv.cmake → C++ 头文件
@@ -182,28 +177,35 @@ if(Vulkan_FOUND)
         nn_embed_shader(${SHADER_NAME} ${CMAKE_SOURCE_DIR}/shaders/${SHADER_NAME}.comp)
     endforeach()
 
-    # 2. AOT 融合 shader：构建期编译 tools/gen_fused（复用 fused_exprs.hpp /
-    #    glsl_gen.hpp，单一事实来源），运行生成 fused/*.comp
-    set(FUSED_GEN_SRC ${CMAKE_SOURCE_DIR}/tools/gen_fused.cpp)
-    set(FUSED_OUT_DIR ${CMAKE_BINARY_DIR}/fused)
-    add_executable(gen_fused ${FUSED_GEN_SRC})
-    target_include_directories(gen_fused PRIVATE ${CMAKE_SOURCE_DIR}/include/neuralnet.cpp)
+    # 2. AOT 融合 shader：scan_exprs + gen_fused
+    set(NN_EXPR_SCAN_BIN     ${CMAKE_BINARY_DIR}/generated/expr_specs.bin)
+    set(NN_FUSED_REGISTRY_HPP ${CMAKE_BINARY_DIR}/generated/fused_registry.hpp)
 
-    set(FUSED_COMP_FILES "")
-    foreach(SHADER_NAME ${GPU_FUSED_SHADERS})
-        list(APPEND FUSED_COMP_FILES ${FUSED_OUT_DIR}/${SHADER_NAME}.comp)
-    endforeach()
-
+    # 2a. scan_exprs：dry-run Layer 收集内联表达式结构 → expr_specs.bin
+    set(SCAN_SRC ${CMAKE_SOURCE_DIR}/tools/scan_exprs.cpp)
+    add_executable(scan_exprs ${SCAN_SRC})
+    target_include_directories(scan_exprs PRIVATE ${CMAKE_SOURCE_DIR}/include/neuralnet.cpp)
+    target_link_libraries(scan_exprs PRIVATE nn_core Vulkan::Vulkan)
     add_custom_command(
-        OUTPUT ${FUSED_COMP_FILES}
-        COMMAND gen_fused ${FUSED_OUT_DIR}
-        DEPENDS gen_fused ${FUSED_GEN_SRC}
-        COMMENT "[GPU] Generating fused shaders from fused_exprs.hpp (gen_fused)"
+        OUTPUT ${NN_EXPR_SCAN_BIN}
+        COMMAND scan_exprs ${NN_EXPR_SCAN_BIN}
+        DEPENDS scan_exprs ${SCAN_SRC}
+        COMMENT "[GPU] Scanning Layer expressions (scan_exprs) → expr_specs.bin"
     )
 
-    foreach(SHADER_NAME ${GPU_FUSED_SHADERS})
-        nn_embed_shader(${SHADER_NAME} ${FUSED_OUT_DIR}/${SHADER_NAME}.comp)
-    endforeach()
+    # 2b. gen_fused：读 bin → glsl_gen → glslc → 内联 SPIR-V → fused_registry.hpp
+    set(FUSED_GEN_SRC ${CMAKE_SOURCE_DIR}/tools/gen_fused.cpp)
+    add_executable(gen_fused ${FUSED_GEN_SRC})
+    target_include_directories(gen_fused PRIVATE ${CMAKE_SOURCE_DIR}/include/neuralnet.cpp)
+    target_link_libraries(gen_fused PRIVATE nn_core)
+    add_custom_command(
+        OUTPUT ${NN_FUSED_REGISTRY_HPP}
+        COMMAND gen_fused ${CMAKE_BINARY_DIR}/generated ${GLSLC} ${NN_EXPR_SCAN_BIN}
+        DEPENDS gen_fused ${FUSED_GEN_SRC} ${NN_EXPR_SCAN_BIN}
+        COMMENT "[GPU] Synthesizing fused shaders (gen_fused) → fused_registry.hpp"
+    )
+
+    list(APPEND GPU_SHADER_HPPS ${NN_FUSED_REGISTRY_HPP})
 
     if(NOT GLSLC)
         message(WARNING "No SPIR-V compiler found (glslc). "

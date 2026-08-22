@@ -90,6 +90,18 @@ public:
     [[nodiscard]] virtual Result<void> begin_batch() = 0;
     [[nodiscard]] virtual Result<void> end_batch() = 0;
 
+    // ── 表达式录制（计算级融合，M2 框架） ───────────────────────────────
+    // begin_expr 进入录制；期间 Layer 调 eval_expr / 组合原语；
+    // end_expr 时引擎做融合分析，将可融合子序列合成单 kernel。
+    //
+    // M2 现状（地基）：
+    //   - CPU 引擎：no-op（各表达式直接求值，行为不变）。
+    //   - GPU 引擎：no-op（各原语正常 dispatch；录制融合分析在 M3 落地，
+    //     届时 begin/end 之间的小中间量/逐元素链并入单 kernel）。
+    // Layer 可先行用 begin_expr/end_expr 包住算法段落，语义不变。
+    [[nodiscard]] virtual Result<void> begin_expr() = 0;
+    [[nodiscard]] virtual Result<void> end_expr() = 0;
+
     // ── 批处理中点刷新（防 TDR） ─────────────────────────────────────────
     // GPU 引擎：提交当前 command buffer 并等待完成，然后自动开始新的录制。
     // 可在 forward 与 backward 之间调用，将一次大提交拆分为多次小提交，

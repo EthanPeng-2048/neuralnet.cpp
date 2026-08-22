@@ -1,54 +1,196 @@
 // ───────────────────────────────────────────────────────────────────────────
-//  gen_fused.cpp — AOT 算子融合生成器（构建期运行）
+//  gen_fused.cpp — AOT 算子融合：构建期合成（读 scan_exprs 的 bin）
 //
-//  遍历 fused_exprs.hpp 的 kGenInstances（表达式单一事实来源），用
-//  glsl_gen.hpp 把每个 ExprSpec 展开为单个融合 .comp 文件。
-//  之后由 CMake 走 glslc → .spv → embed_spirv.cmake 嵌入运行时。
+//  读取 scan_exprs dump 的 expr_specs.bin（表达式结构集合），对每条
+//  用 glsl_gen.hpp 展开为单个融合 .comp，再经 glslc 编译成 SPIR-V，最后
+//  内联进单个生成头 fused_registry.hpp（key → {ExprSpec, SPIR-V}）。
 //
-//  用法： gen_fused <out_dir>
-//  产物： <out_dir>/<name>.comp
+//  表达式**文本只出现在 Layer**；本工具只消费折叠后的结构（派生物）。
+//  产物 fused_registry.hpp 供运行时（GpuEngine::eval_expr / vk_backend）
+//  按 expr_spec_key 精确匹配 dispatch——闭合世界，未命中硬报错。
+//
+//  用法： gen_fused <out_dir> <glslc_path> <expr_specs.bin>
+//  产物： <out_dir>/fused_registry.hpp（+ 调试用 .comp/.spv）
 // ───────────────────────────────────────────────────────────────────────────
 
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
+#include <vector>
 
-#include "fused_exprs.hpp"
+#include "expr_spec.hpp"
+#include "expr_registry.hpp"
 #include "glsl_gen.hpp"
+
+namespace
+{
+
+[[nodiscard]] bool run_glslc(const std::string& glslc,
+                             const std::string& src, const std::string& dst)
+{
+    // 仅给 glslc 路径加引号；src/dst 为无空格路径（out_dir 由 CMake 控制），
+    // 正斜杠相对路径不加引号，避免 cmd/system 解析问题。
+    const std::string cmd =
+        "\"" + glslc + "\" -fshader-stage=compute -o " + dst + " " + src;
+    return std::system(cmd.c_str()) == 0;
+}
+
+[[nodiscard]] std::vector<std::uint32_t> read_spv(const std::string& path)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return {};
+    f.seekg(0, std::ios::end);
+    const std::streamsize sz = f.tellg();
+    f.seekg(0, std::ios::beg);
+    std::vector<std::uint32_t> v(static_cast<std::size_t>(sz) / sizeof(std::uint32_t));
+    if (!v.empty())
+        f.read(reinterpret_cast<char*>(v.data()), sz);
+    return v;
+}
+
+// ExprSpec → 生成头里的聚合初始化（ExprSpec{ instrs, views, consts, num_regs }）
+[[nodiscard]] std::string emit_spec(const nn::ExprSpec& spec)
+{
+    std::ostringstream o;
+    o << "ExprSpec{ \n";
+    o << "        std::vector<ExprInstr>{";
+    for (std::size_t i = 0; i < spec.instrs.size(); ++i)
+    {
+        const auto& in = spec.instrs[i];
+        if (i) o << ",";
+        o << " {" << static_cast<int>(in.op) << ", " << static_cast<int>(in.dst)
+          << ", {" << static_cast<int>(in.a.kind) << ", " << static_cast<int>(in.a.idx) << "}"
+          << ", {" << static_cast<int>(in.b.kind) << ", " << static_cast<int>(in.b.idx) << "}"
+          << ", {" << static_cast<int>(in.c.kind) << ", " << static_cast<int>(in.c.idx) << "}}";
+    }
+    o << "},\n        std::vector<ExprView>{";
+    for (std::size_t i = 0; i < spec.views.size(); ++i)
+    {
+        const auto& v = spec.views[i];
+        if (i) o << ",";
+        o << " {" << static_cast<int>(v.kind) << ", "
+          << static_cast<int>(v.negate_first_half) << ", " << v.param << "u}";
+    }
+    o << "},\n        std::vector<Scalar>{";
+    for (std::size_t i = 0; i < spec.consts.size(); ++i)
+    {
+        if (i) o << ",";
+        o << " static_cast<Scalar>(" << spec.consts[i] << ")";
+    }
+    o << "}, " << spec.num_regs << "u }";
+    return o.str();
+}
+
+} // namespace
 
 int main(int argc, char* argv[])
 {
-    if (argc < 2)
+    if (argc < 4)
     {
-        std::fprintf(stderr, "用法: gen_fused <out_dir>\n");
+        std::fprintf(stderr, "用法: gen_fused <out_dir> <glslc_path> <expr_specs.bin>\n");
         return 2;
     }
-    const std::string out_dir = argv[1];
+    const std::string out_dir  = argv[1];
+    const std::string glslc    = argv[2];
+    const std::string bin_path = argv[3];
+
     std::error_code ec;
     std::filesystem::create_directories(out_dir, ec);
 
-    int fail = 0;
-    for (const auto& inst : nn::fused::kGenInstances)
+    nn::fused::ExprRegistry reg;
+    if (!nn::fused::read_registry(bin_path, reg))
     {
-        const auto spec = nn::fused::make_fused(inst);
-        const auto glsl = nn::generate_glsl(inst.name, spec);
-        if (glsl.empty())
-        {
-            std::fprintf(stderr, "[FAIL] %s: 生成失败\n", inst.name);
-            ++fail;
-            continue;
-        }
-        const std::string path = out_dir + "/" + inst.name + ".comp";
-        std::ofstream f(path);
-        if (!f)
-        {
-            std::fprintf(stderr, "[FAIL] %s: 无法写入 %s\n", inst.name, path.c_str());
-            ++fail;
-            continue;
-        }
-        f << glsl;
-        std::printf("[gen] %s\n", path.c_str());
+        std::fprintf(stderr, "[FAIL] 无法读取表达式集合 %s\n", bin_path.c_str());
+        return 1;
     }
-    return fail == 0 ? 0 : 1;
+    if (reg.specs.empty())
+    {
+        std::fprintf(stderr, "[FAIL] 表达式集合为空（scan_exprs 未覆盖任何路径）\n");
+        return 1;
+    }
+
+    std::ostringstream H;
+    H << "// ═══════════════════════════════════════════════════════════════\n";
+    H << "//  fused_registry.hpp — AUTO-GENERATED by gen_fused，请勿手动编辑\n";
+    H << "//  构建期 scan_exprs 收集 + gen_fused 合成的融合 shader 注册表\n";
+    H << "//  每个条目：key(=expr_spec_key) → {ExprSpec 结构, 内联 SPIR-V}\n";
+    H << "//  运行时按 key 精确匹配 dispatch（闭合世界）。\n";
+    H << "// ═══════════════════════════════════════════════════════════════\n";
+    H << "#ifndef NN_FUSED_REGISTRY_HPP\n#define NN_FUSED_REGISTRY_HPP\n";
+    H << "#define NN_FUSED_REGISTRY_EMBEDDED\n";
+    H << "#include <cstdint>\n#include <string>\n#include <vector>\n";
+    H << "#include \"neuralnet.cpp/expr_spec.hpp\"\n";
+    H << "namespace nn::fused {\n";
+    H << "struct FusedShader {\n";
+    H << "    const char* key;\n";
+    H << "    ExprSpec    spec;\n";
+    H << "    const std::uint32_t* spirv;\n";
+    H << "    std::size_t spirv_words;\n";
+    H << "};\n\n";
+
+    for (const auto& spec : reg.specs)
+    {
+        const std::string key = nn::expr_spec_key(spec);
+        const std::string comp_path = out_dir + "/fused_" + key + ".comp";
+        const std::string spv_path  = out_dir + "/fused_" + key + ".spv";
+
+        const std::string glsl = nn::generate_glsl("fused_" + key, spec);
+        {
+            std::ofstream f(comp_path);
+            if (!f) { std::fprintf(stderr, "[FAIL] 无法写入 %s\n", comp_path.c_str()); return 1; }
+            f << glsl;
+        }
+        if (!run_glslc(glslc, comp_path, spv_path))
+        {
+            std::fprintf(stderr, "[FAIL] glslc 编译 %s 失败\n", key.c_str());
+            return 1;
+        }
+        const auto spv = read_spv(spv_path);
+        if (spv.empty())
+        {
+            std::fprintf(stderr, "[FAIL] 读取 %s 失败\n", spv_path.c_str());
+            return 1;
+        }
+
+        H << "inline constexpr std::uint32_t kSpirv_" << key << "[] = {";
+        for (std::size_t i = 0; i < spv.size(); ++i)
+        {
+            if (i % 8 == 0) H << "\n    ";
+            H << "0x" << std::hex << spv[i] << "u, ";
+        }
+        H << std::dec << "\n};\n\n";
+    }
+
+    H << "inline const FusedShader kFusedShaders[] = {\n";
+    for (const auto& spec : reg.specs)
+    {
+        const std::string key = nn::expr_spec_key(spec);
+        H << "    { \"" << key << "\",\n        " << emit_spec(spec) << ",\n"
+          << "        kSpirv_" << key
+          << ", sizeof(kSpirv_" << key << ")/sizeof(std::uint32_t) },\n";
+    }
+    H << "};\n";
+    H << "inline constexpr std::size_t kFusedShaderCount =\n"
+      << "    sizeof(kFusedShaders) / sizeof(kFusedShaders[0]);\n";
+    H << "[[nodiscard]] inline const FusedShader* find_fused(const std::string& key)\n";
+    H << "{\n";
+    H << "    for (const auto& f : kFusedShaders)\n";
+    H << "        if (key == f.key) return &f;\n";
+    H << "    return nullptr;\n";
+    H << "}\n";
+    H << "} // namespace nn::fused\n";
+    H << "#endif // NN_FUSED_REGISTRY_HPP\n";
+
+    const std::string reg_path = out_dir + "/fused_registry.hpp";
+    {
+        std::ofstream f(reg_path);
+        if (!f) { std::fprintf(stderr, "[FAIL] 无法写入 %s\n", reg_path.c_str()); return 1; }
+        f << H.str();
+    }
+    std::printf("[gen] %zu 条融合表达式 -> %s\n", reg.specs.size(), reg_path.c_str());
+    return 0;
 }
