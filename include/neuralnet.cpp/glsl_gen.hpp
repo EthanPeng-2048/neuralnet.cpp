@@ -62,10 +62,14 @@ inline const char* glsl_unary_op(ExprOp op)
 
 // ── 视图 → 读取第 i 个元素的索引/表达式 ──────────────────────────────────
 // 布局约定：row = i/cols, col = i%cols（与 C++ 端 eval_expr 一致）
+// vp_slot：该视图的运行时参数槽位（仅 RowMod/RotateHalf 有效；在视图序列中
+//   此前出现的运行时参数视图个数）。RowMod 周期 / RotateHalf 块大小从
+//   push constant vpN 读取——同结构不同形状（不同 d_k）共享一个融合 shader。
 inline void glsl_view_read(std::ostringstream& os,
                            const ExprView& v, std::uint32_t buf_id,
                            const std::string& idx_var,
-                           const std::string& row_var, const std::string& col_var)
+                           const std::string& row_var, const std::string& col_var,
+                           std::uint32_t vp_slot = 0)
 {
     const std::string buf = "b" + std::to_string(buf_id);
     switch (v.kind)
@@ -76,24 +80,24 @@ inline void glsl_view_read(std::ostringstream& os,
         return;
     case static_cast<uint8_t>(ExprViewKind::RotateHalf):
     {
-        const std::uint32_t block = v.param;
-        const std::uint32_t half = block / 2;
-        const std::string blk = "(" + row_var + " / " + std::to_string(block) + "u)";
-        const std::string rl  = "(" + row_var + " % " + std::to_string(block) + "u)";
+        // block 为运行时视图参数（push constant vpN），形状无关融合
+        const std::string blk = "(" + row_var + " / vp" + std::to_string(vp_slot) + ")";
+        const std::string rl  = "(" + row_var + " % vp" + std::to_string(vp_slot) + ")";
+        const std::string half = "(vp" + std::to_string(vp_slot) + " / 2u)";
         // 列主序索引 = 源行 * cols + 列号（cols 为 push constant 列数）
-        const std::string hi  = "((" + blk + " * " + std::to_string(block) + "u + "
-                                + rl + " + " + std::to_string(half) + "u) * cols + " + col_var + ")";
-        const std::string lo  = "((" + blk + " * " + std::to_string(block) + "u + "
-                                + rl + " - " + std::to_string(half) + "u) * cols + " + col_var + ")";
+        const std::string hi  = "((" + blk + " * vp" + std::to_string(vp_slot) + " + "
+                                + rl + " + " + half + ") * cols + " + col_var + ")";
+        const std::string lo  = "((" + blk + " * vp" + std::to_string(vp_slot) + " + "
+                                + rl + " - " + half + ") * cols + " + col_var + ")";
         const std::string neg = v.negate_first_half ? "-" : "";
-        os << "((" << rl << " < " << std::to_string(half) << "u) ? "
+        os << "((" << rl << " < " << half << ") ? "
            << neg << buf << "[" << hi << "] : " << buf << "[" << lo << "])";
         return;
     }
     case static_cast<uint8_t>(ExprViewKind::RowMod):
     {
-        const std::uint32_t mod = v.param;
-        os << buf << "[(" << row_var << " % " << std::to_string(mod) << "u) * cols + "
+        // 周期为运行时视图参数（push constant vpN），形状无关融合
+        os << buf << "[(" << row_var << " % vp" << std::to_string(vp_slot) << ") * cols + "
            << col_var << "]";
         return;
     }
@@ -125,10 +129,13 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
     L << "layout(std430, binding = " << n_inputs
       << ") writeonly buffer BufOut { float bout[]; };\n\n";
 
-    // push constants：count + cols（视图行/列）+ 常量
+    // push constants：count + cols（视图行/列）+ 运行时视图参数 vp + 常量
     L << "layout(push_constant) uniform PC {\n";
     L << "    uint count;\n";
     L << "    uint cols;\n";
+    const std::uint32_t n_vp = expr_spec_runtime_view_param_count(spec);
+    for (std::uint32_t i = 0; i < n_vp; ++i)
+        L << "    uint vp" << i << ";\n";
     for (std::size_t i = 0; i < spec.consts.size(); ++i)
         L << "    float c" << i << ";\n";
     L << "};\n\n";
@@ -139,11 +146,17 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
     L << "    const uint row = i / cols;\n";
     L << "    const uint col = i % cols;\n";
 
-    // 输入读取变量（每输入缓存一次）
+    // 输入读取变量（每输入缓存一次）；vp 槽 = 此前运行时参数视图个数
     for (std::size_t i = 0; i < n_inputs; ++i)
     {
+        std::uint32_t vp = 0;
+        for (std::size_t j = 0; j < i; ++j)
+            if (expr_view_has_runtime_param(
+                    static_cast<ExprViewKind>(spec.views[j].kind)))
+                ++vp;
         L << "    const float v" << i << " = ";
-        glsl_view_read(L, spec.views[i], static_cast<std::uint32_t>(i), "i", "row", "col");
+        glsl_view_read(L, spec.views[i], static_cast<std::uint32_t>(i),
+                       "i", "row", "col", vp);
         L << ";\n";
     }
 
@@ -288,6 +301,9 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
     L << "    uint cols;\n";
     L << "    uint rows;\n";
     L << "    uint vector_out;   // 1=输出归约向量（(rows,1)/(1,cols)），0=广播\n";
+    const std::uint32_t n_vp = expr_spec_runtime_view_param_count(spec);
+    for (std::uint32_t i = 0; i < n_vp; ++i)
+        L << "    uint vp" << i << ";\n";
     for (std::size_t i = 0; i < spec.consts.size(); ++i)
         L << "    float c" << i << ";\n";
     L << "};\n\n";
@@ -322,10 +338,15 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
                 return "b" + std::to_string(op.idx) + "[row]";
             if (vk == ExprViewKind::ColBroadcast)
                 return "b" + std::to_string(op.idx) + "[col]";
-            // Linear / RotateHalf / RowMod：索引映射内联
+            // Linear / RotateHalf / RowMod：索引映射内联；vp 槽 = 此前运行时参数视图个数
             std::ostringstream os;
+            std::uint32_t vp = 0;
+            for (std::size_t j = 0; j < op.idx; ++j)
+                if (expr_view_has_runtime_param(
+                        static_cast<ExprViewKind>(spec.views[j].kind)))
+                    ++vp;
             glsl_view_read(os, v, static_cast<std::uint32_t>(op.idx),
-                           "(row*cols + col)", "row", "col");
+                           "(row*cols + col)", "row", "col", vp);
             return os.str();
         }
         }
