@@ -2,7 +2,7 @@
 
 > 状态：实施中 · 里程碑 **M1（ExprSpec 归约语义）✅ 完成**、**M2（begin_expr/end_expr 录制框架）✅ 完成**、**M3（Softmax/LayerNorm/RMSNorm 归约融合）✅ 完成**、**M4（matmul 融合原语）✅ 完成**、**M5（CrossEntropy 稀疏融合）✅ 完成**、**M6（两趟式注意力）✅ 完成**
 > 目标版本：与现有 `eval_expr` AOT 融合管线共存
-> 关联文档：`DEVELOPMENT_STANDARDS.md`（分层铁律）、`AST_COMPUTE.md`（表达式 DSL）、`01-architecture.md`
+> 关联文档：`DEVELOPMENT_STANDARDS.md`（分层铁律）、`01-architecture.md`
 
 ---
 

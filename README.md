@@ -27,9 +27,8 @@ neuralnet.cpp/
 │   ├── 03-quickstart-model.md   ← 模型构建教程
 │   ├── 04-quickstart-train-infer.md ← 训练推理教程
 │   ├── 05-algorithm-reference.md    ← 算法解析参考
-│   ├── DEVELOPMENT_STANDARDS.md ← 开发规范
-│   ├── GPU_DESIGN_V2.md         ← GPU 后端设计 (Vulkan)
-│   └── 06-cuda-backend.md       ← CUDA 后端设计
+│   ├── 06-cuda-backend.md       ← CUDA 后端设计
+│   └── DEVELOPMENT_STANDARDS.md ← 开发规范
 ├── gui.py                       ← 图形化操作界面 (CustomTkinter)
 ├── include/neuralnet.cpp/
 │   ├── nn.hpp                   ← 统一入口头文件
@@ -96,11 +95,8 @@ cmake -B build -G Ninja
 
 ### 准备数据
 
-```bash
-#运行下载脚本
-pip install pillow
-python save_dataset.py
-```
+- MNIST 数据：`datasets/mnist_data/`（`train.csv` / `test.csv`）
+- 文本语料：使用 `scripts/` 下的 `download_*.py` 脚本下载
 
 ### 运行训练
 

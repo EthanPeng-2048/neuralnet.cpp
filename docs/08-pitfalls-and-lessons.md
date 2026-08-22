@@ -310,7 +310,6 @@ GPU-resident 单算子对、链式错;attn batch=1 对、batch=2 错;gradcheck �
 ## 📚 相关文档
 
 - `docs/DEVELOPMENT_STANDARDS.md` — 分层职责规范("每层只能负责每层的事")
-- `docs/01-architecture.md` / `docs/ARCHITECTURE.md` — 架构分层
+- `docs/01-architecture.md` — 架构分层
 - `docs/06-cuda-backend.md` — CUDA 构建与版本匹配
 - `docs/07-train-package.md` — 训练包格式
-- ⚠️ `docs/GPU_DESIGN_V2.md` / `docs/GPU_FIX_PLAN.md` — **历史设计文档,描述旧分支状态,已过时**(声称"当前是纯 CPU 实现"),阅读时以 `backend/vk_backend.hpp` 实际代码为准
