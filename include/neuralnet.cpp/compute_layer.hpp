@@ -1035,7 +1035,29 @@ protected:
 
     // forward 缓存（rearranged 版本，供 backward 直接使用）
     Tensor Q_cache_, K_cache_, V_cache_;  // (batch*H*d_k, seq) rearranged
-    Tensor attn_cache_;                    // (batch*H*seq, seq)
+    Tensor attn_cache_;                    // (batch*H*seq, seq) 旧路径缓存
+
+    // 两趟式缓存（M6）：m/l 替代 attn_cache_（不物化得分矩阵）
+    Tensor m_cache_, l_cache_;   // (batch*H*seq, 1)：行 max / softmax 分母
+    Tensor two_pass_mask_cache_;  // 共享 (seq, seq) 掩码（空 = 无掩码）
+    bool two_pass_active_ = false;  // forward 是否走了两趟式路径（backward 读取）
+
+    // ── 两趟式（M6）决策钩子 ──────────────────────────────────────────
+    // 决定是否用两趟式注意力（不物化 (BH*seq, seq) 得分/概率矩阵，显存峰值
+    // 从 ~3-4×BH·seq² 降至 ~1×）。返回 {use_two_pass, mask}：
+    //   - use_two_pass=true：两趟式；mask 为共享 (seq, seq) 掩码（空 = 无掩码）
+    //   - use_two_pass=false：回退旧路径（掩码不适用共享形式时，如 ALiBi/doc_ids）
+    struct TwoPassMask
+    {
+        bool use_two_pass = true;
+        Tensor mask;
+    };
+    [[nodiscard]] virtual Result<TwoPassMask> two_pass_mask_(
+        ComputeEngine& engine, std::size_t batch, std::size_t seq)
+    {
+        (void)engine; (void)batch; (void)seq;
+        return TwoPassMask{true, {}};  // MHA：无掩码，两趟式
+    }
 
     // 掩码钩子：子类重写以施加掩码，默认 no-op（MHA 行为）
     // 在 forward 中 scores（已含 alpha=scale 缩放）之后、softmax 之前调用
@@ -1163,41 +1185,83 @@ public:
             K_cache_ = std::move(*kr2);
         }
 
-        // 3. S = batched_matmul(Q_re, K_re, batch*H, transA=true) → (batch*H*seq, seq)
-        //    scale (1/sqrt(d_k)) 通过 alpha 系数折进 matmul 写出（cuBLAS sgemm 语义），
-        //    省去一次全矩阵 scale pass + 额外 barrier
+        // 3-7. 注意力主体：两趟式 vs 旧路径（由掩码钩子决策）
         const std::size_t BH = batch * num_heads_;
-        auto scores = engine.batched_matmul(
-            Q_cache_, K_cache_, BH, true, false, scale_);
-        if (!scores) return std::unexpected(scores.error());
-
-        // 4. 施加掩码（钩子：MHA 默认 no-op，CSA 施加因果/ALiBi 掩码）
-        auto masked = apply_mask_(engine, std::move(*scores), batch, seq);
-        if (!masked) return std::unexpected(masked.error());
-
-        // 6. A = softmax(S_masked)
-        auto attn = softmax_.forward(engine, *masked);
-        if (!attn) return std::unexpected(attn.error());
-        attn_cache_ = *attn;
-
-        // 7. O_re = batched_matmul(V_re, A, batch*H, transB=true) → (batch*H*d_k, seq)
-        //    标准 attention: O[:,i] = sum_j V[:,j] * A[i,j] = (V × A^T)[:,i]
-        //    A[i,j] = P(key j | query i),A^T[j,i] = A[i,j]
-        auto concat_out = engine.batched_matmul(
-            V_cache_, attn_cache_, BH, false, true);
-        if (!concat_out) return std::unexpected(concat_out.error());
+        auto tpm = two_pass_mask_(engine, batch, seq);
+        if (!tpm) return std::unexpected(tpm.error());
+        Tensor concat_out;  // (batch*H*d_k, seq)
+        if (tpm->use_two_pass)
+        {
+            // ── 两趟式（M6）：不物化 (BH*seq, seq) 得分/概率矩阵 ──
+            //   m = rowmax(scale·Q·K^T + mask)        → (BH*seq, 1)
+            //   l = Σ_j exp(scale·Q·K^T + mask − m)   → (BH*seq, 1)
+            //   O = W·V_t（W = softmax 归一化权重）    → (BH*seq, d_k)
+            two_pass_mask_cache_ = std::move(tpm->mask);
+            const Tensor* mask_ptr =
+                (two_pass_mask_cache_.rows() > 0) ? &two_pass_mask_cache_ : nullptr;
+            auto m = engine.batched_matmul_reduce(
+                Q_cache_, K_cache_, BH, ReduceOp::Max, true, false,
+                scale_, /*reduce_cols=*/true, mask_ptr);
+            if (!m) return std::unexpected(m.error());
+            auto l = engine.batched_matmul_softmax_denom(
+                Q_cache_, K_cache_, *m, BH, true, false, scale_, mask_ptr);
+            if (!l) return std::unexpected(l.error());
+            // V 需 (BH*seq, d_k) 布局（apply 原语的 V 约定）：V_cache_ (BH*d_k, seq)
+            // 是 per-batch (d_k, seq)，需按 batch 转置：
+            //   transpose → (seq, BH*d_k) → rearrange_3d(seq, BH, d_k) → (BH*seq, d_k)
+            auto V_T_full = engine.transpose(V_cache_);
+            if (!V_T_full) return std::unexpected(V_T_full.error());
+            auto V_t = engine.rearrange_3d(*V_T_full, seq, BH, d_k_, false);
+            if (!V_t) return std::unexpected(V_t.error());
+            auto O_t = engine.batched_matmul_softmax_apply(
+                Q_cache_, K_cache_, *V_t, *m, *l, BH, true, false, scale_, mask_ptr);
+            if (!O_t) return std::unexpected(O_t.error());
+            // O_t: (BH*seq, d_k) → 按 batch 转置回 (BH*d_k, seq) 供后续 rearrange：
+            //   transpose → (d_k, BH*seq) → rearrange_3d(d_k, BH, seq) → (BH*d_k, seq)
+            auto O_T_full = engine.transpose(*O_t);
+            if (!O_T_full) return std::unexpected(O_T_full.error());
+            auto co = engine.rearrange_3d(*O_T_full, d_k_, BH, seq, false);
+            if (!co) return std::unexpected(co.error());
+            concat_out = std::move(*co);
+            m_cache_ = std::move(*m);
+            l_cache_ = std::move(*l);
+            two_pass_active_ = true;
+        }
+        else
+        {
+            // ── 旧路径：物化得分矩阵（ALiBi/doc_ids 等共享掩码不适用时回退） ──
+            two_pass_active_ = false;
+            // S = batched_matmul(Q_re, K_re, batch*H, transA=true) → (batch*H*seq, seq)
+            // scale (1/sqrt(d_k)) 通过 alpha 系数折进 matmul 写出（cuBLAS sgemm 语义），
+            // 省去一次全矩阵 scale pass + 额外 barrier
+            auto scores = engine.batched_matmul(
+                Q_cache_, K_cache_, BH, true, false, scale_);
+            if (!scores) return std::unexpected(scores.error());
+            // 施加掩码（钩子：MHA 默认 no-op，CSA 施加因果/ALiBi 掩码）
+            auto masked = apply_mask_(engine, std::move(*scores), batch, seq);
+            if (!masked) return std::unexpected(masked.error());
+            // A = softmax(S_masked)
+            auto attn = softmax_.forward(engine, *masked);
+            if (!attn) return std::unexpected(attn.error());
+            attn_cache_ = *attn;
+            // O_re = batched_matmul(V_re, A, batch*H, transB=true) → (batch*H*d_k, seq)
+            // 标准 attention: O[:,i] = sum_j V[:,j] * A[i,j] = (V × A^T)[:,i]
+            auto co = engine.batched_matmul(V_cache_, attn_cache_, BH, false, true);
+            if (!co) return std::unexpected(co.error());
+            concat_out = std::move(*co);
+        }
 
         // 8. rearrange back: (batch*H*d_k, seq) → (H*d_k, batch*seq)
         Tensor concat;
         if (batch > 1)
         {
-            auto cb = engine.rearrange_3d(*concat_out, H_dk, batch, seq, true);
+            auto cb = engine.rearrange_3d(concat_out, H_dk, batch, seq, true);
             if (!cb) return std::unexpected(cb.error());
             concat = std::move(*cb);
         }
         else
         {
-            concat = std::move(*concat_out);
+            concat = std::move(concat_out);
         }
 
         // 9. 输出投影
@@ -1231,43 +1295,79 @@ public:
             grad_concat_re = std::move(*gc);
         }
 
-        // 3. grad_V_re = batched_matmul(grad_concat, A, BH, false, false)
-        //    forward: O = V × A^T → grad_V = grad_O × A
-        auto grad_V_re = engine.batched_matmul(
-            grad_concat_re, attn_cache_, BH, false, false);
-        if (!grad_V_re) return std::unexpected(grad_V_re.error());
-
-        // 4. grad_A = batched_matmul(grad_concat^T, V, BH, true, false)
-        //    forward: O = V × A^T → grad_A = grad_O^T × V
-        auto grad_A = engine.batched_matmul(
-            grad_concat_re, V_cache_, BH, true, false);
-        if (!grad_A) return std::unexpected(grad_A.error());
-
-        // 5. grad_S = softmax.backward(grad_A) — 掩码/偏置为常数，梯度直接穿透
-        auto grad_S = softmax_.backward(engine, *grad_A);
-        if (!grad_S) return std::unexpected(grad_S.error());
-
-        // 6. grad_Q_re = batched_matmul(K, grad_S, BH, false, true) × scale
-        //    前向 S = scale·Q^T·K → ∂L/∂Q = scale·K·grad_S^T，
-        //    scale 通过 alpha 折进 matmul 写出（省去两次全矩阵 scale pass）
-        auto grad_Q_re = engine.batched_matmul(
-            K_cache_, *grad_S, BH, false, true, scale_);
-        if (!grad_Q_re) return std::unexpected(grad_Q_re.error());
-
-        // 7. grad_K_re = batched_matmul(Q, grad_S, BH, false, false) × scale
-        //    ∂L/∂K = scale·Q·grad_S，同样折进 alpha
-        auto grad_K_re = engine.batched_matmul(
-            Q_cache_, *grad_S, BH, false, false, scale_);
-        if (!grad_K_re) return std::unexpected(grad_K_re.error());
+        // 3-7. 注意力反向：两趟式（M6，重算 W 不物化 grad_S）vs 旧路径
+        Tensor grad_Q_re, grad_K_re, grad_V_re;  // 均 (batch*H*d_k, seq)
+        if (two_pass_active_)
+        {
+            const Tensor* mask_ptr =
+                (two_pass_mask_cache_.rows() > 0) ? &two_pass_mask_cache_ : nullptr;
+            // P = grad_A = batched_matmul(grad_concat^T, V, BH, true, false)
+            // forward: O = V × A^T → grad_A = grad_O^T × V（两趟式反向的 P 输入）
+            auto grad_A = engine.batched_matmul(
+                grad_concat_re, V_cache_, BH, true, false);
+            if (!grad_A) return std::unexpected(grad_A.error());
+            // G = grad_concat_re^T 按 batch 转置 → (BH*seq, d_k)，
+            // 供 grad_V[j][k] = Σ_i W·G[i][k]（同 V 的布局转换）
+            auto G_T_full = engine.transpose(grad_concat_re);
+            if (!G_T_full) return std::unexpected(G_T_full.error());
+            auto G = engine.rearrange_3d(*G_T_full, seq, BH, d_k_, false);
+            if (!G) return std::unexpected(G.error());
+            // Pass 1：R[i] = Σ_j W·P；grad_Q[:,i] = scale·Σ_j W·(P−R)·K_b[:,j]
+            // （kernel 内部重算 W，不物化 (BH*seq, seq)）
+            Tensor R;
+            auto gq = engine.batched_matmul_softmax_backward_q(
+                Q_cache_, K_cache_, *grad_A, m_cache_, l_cache_,
+                BH, true, false, scale_, R, mask_ptr);
+            if (!gq) return std::unexpected(gq.error());
+            // Pass 2：grad_K[:,j] = scale·Σ_i W·(P−R)·Q_b[:,i]；
+            //          grad_V[j][k] = Σ_i W·G[i][k]
+            auto gkv = engine.batched_matmul_softmax_backward_kv(
+                Q_cache_, K_cache_, *grad_A, *G, R, m_cache_, l_cache_,
+                BH, true, false, scale_, grad_V_re, mask_ptr);
+            if (!gkv) return std::unexpected(gkv.error());
+            grad_Q_re = std::move(*gq);
+            grad_K_re = std::move(*gkv);
+        }
+        else
+        {
+            // grad_V_re = batched_matmul(grad_concat, A, BH, false, false)
+            // forward: O = V × A^T → grad_V = grad_O × A
+            auto gvr = engine.batched_matmul(
+                grad_concat_re, attn_cache_, BH, false, false);
+            if (!gvr) return std::unexpected(gvr.error());
+            grad_V_re = std::move(*gvr);
+            // grad_A = batched_matmul(grad_concat^T, V, BH, true, false)
+            // forward: O = V × A^T → grad_A = grad_O^T × V
+            auto grad_A = engine.batched_matmul(
+                grad_concat_re, V_cache_, BH, true, false);
+            if (!grad_A) return std::unexpected(grad_A.error());
+            // grad_S = softmax.backward(grad_A) — 掩码/偏置为常数，梯度直接穿透
+            auto grad_S = softmax_.backward(engine, *grad_A);
+            if (!grad_S) return std::unexpected(grad_S.error());
+            mask_backward_(engine, *grad_S, batch, seq);
+            // grad_Q_re = batched_matmul(K, grad_S, BH, false, true) × scale
+            // 前向 S = scale·Q^T·K → ∂L/∂Q = scale·K·grad_S^T，
+            // scale 通过 alpha 折进 matmul 写出（省去两次全矩阵 scale pass）
+            auto gq = engine.batched_matmul(
+                K_cache_, *grad_S, BH, false, true, scale_);
+            if (!gq) return std::unexpected(gq.error());
+            grad_Q_re = std::move(*gq);
+            // grad_K_re = batched_matmul(Q, grad_S, BH, false, false) × scale
+            // ∂L/∂K = scale·Q·grad_S，同样折进 alpha
+            auto gk = engine.batched_matmul(
+                Q_cache_, *grad_S, BH, false, false, scale_);
+            if (!gk) return std::unexpected(gk.error());
+            grad_K_re = std::move(*gk);
+        }
 
         // 7.5 RoPE backward：对 Q/K 梯度施加反角旋转
         //    （forward 的旋转矩阵正交，逆 = 转置 = 反角：grad*cos − rot(grad)*sin）
         if (use_rope_)
         {
-            auto gq2 = rope_.apply(engine, *grad_Q_re, seq, /*backward=*/true);
+            auto gq2 = rope_.apply(engine, grad_Q_re, seq, /*backward=*/true);
             if (!gq2) return std::unexpected(gq2.error());
             grad_Q_re = std::move(*gq2);
-            auto gk2 = rope_.apply(engine, *grad_K_re, seq, /*backward=*/true);
+            auto gk2 = rope_.apply(engine, grad_K_re, seq, /*backward=*/true);
             if (!gk2) return std::unexpected(gk2.error());
             grad_K_re = std::move(*gk2);
         }
@@ -1276,21 +1376,21 @@ public:
         Tensor grad_Q, grad_K, grad_V;
         if (batch > 1)
         {
-            auto gq = engine.rearrange_3d(*grad_Q_re, H_dk, batch, seq, true);
+            auto gq = engine.rearrange_3d(grad_Q_re, H_dk, batch, seq, true);
             if (!gq) return std::unexpected(gq.error());
             grad_Q = std::move(*gq);
-            auto gk = engine.rearrange_3d(*grad_K_re, H_dk, batch, seq, true);
+            auto gk = engine.rearrange_3d(grad_K_re, H_dk, batch, seq, true);
             if (!gk) return std::unexpected(gk.error());
             grad_K = std::move(*gk);
-            auto gv = engine.rearrange_3d(*grad_V_re, H_dk, batch, seq, true);
+            auto gv = engine.rearrange_3d(grad_V_re, H_dk, batch, seq, true);
             if (!gv) return std::unexpected(gv.error());
             grad_V = std::move(*gv);
         }
         else
         {
-            grad_Q = std::move(*grad_Q_re);
-            grad_K = std::move(*grad_K_re);
-            grad_V = std::move(*grad_V_re);
+            grad_Q = std::move(grad_Q_re);
+            grad_K = std::move(grad_K_re);
+            grad_V = std::move(grad_V_re);
         }
 
         // 9. 投影层反向 + 累加输入梯度
@@ -2064,6 +2164,10 @@ private:
     std::size_t mask_cached_batch_ = 0;  // 缓存键：batch（独立字段，避免位打包溢出）
     std::size_t mask_cached_seq_ = 0;    // 缓存键：seq_len
 
+    // 两趟式（M6）共享掩码缓存：(seq, seq)，仅纯因果模式（无 ALiBi/doc_ids）
+    Tensor shared_mask_cache_;
+    std::size_t shared_mask_seq_ = 0;    // 缓存键：seq_len
+
     // ALiBi 斜率：m_h = 2^(-8h/H)（仅 use_alibi_ = true 时使用）
     std::vector<Scalar> slopes_;
 
@@ -2131,6 +2235,28 @@ protected:
         }
         ensure_mask_(engine, batch, seq);
         return engine.elementwise_binary(BinaryOp::Add, scores, mask_cache_);
+    }
+
+    // 重写两趟式决策：纯因果（无 ALiBi、无 doc_ids）→ 共享 (seq, seq) 掩码两趟式；
+    // ALiBi（按头偏置）或 doc_ids（按样本掩码）不适用共享掩码 → 回退旧路径。
+    [[nodiscard]] Result<TwoPassMask> two_pass_mask_(
+        ComputeEngine& engine, std::size_t /*batch*/, std::size_t seq) override
+    {
+        if (use_alibi_ || has_doc_ids_)
+            return TwoPassMask{/*use_two_pass=*/false, {}};
+        if (shared_mask_seq_ != seq)
+        {
+            Matrix mask(seq, seq, Scalar{0});
+            const Scalar neg_inf = -std::numeric_limits<Scalar>::infinity();
+            for (std::size_t i = 0; i < seq; ++i)
+                for (std::size_t j = i + 1; j < seq; ++j)
+                    mask.set_value_unchecked(i, j, neg_inf);
+            auto t = engine.from_matrix(mask);
+            if (!t) return std::unexpected(t.error());
+            shared_mask_cache_ = std::move(*t);
+            shared_mask_seq_ = seq;
+        }
+        return TwoPassMask{/*use_two_pass=*/true, shared_mask_cache_};
     }
 
     // 重写增量推理掩码钩子：ALiBi 模式下施加线性距离偏置。

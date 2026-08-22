@@ -38,7 +38,12 @@ int main(int argc, char* argv[])
 
     // ── RoPE：forward + backward，覆盖代码库实际用到的 d_k 集合 ──────────
     // （apply 与 apply_step 折叠出的结构相同，会自动去重）
-    for (const std::size_t dk : {std::size_t{32}, std::size_t{64}, std::size_t{128}})
+    // d_k = d_model/num_heads 的常见取值：16（如 d_model=64/heads=4、
+    //   d_model=32/heads=2 的 MNIST Transformer）、32、64、128。
+    // 闭合世界安全网：若某条 Layer 路径未被本工具覆盖，其内联表达式在
+    //   GPU 运行时将硬报错——新增 d_k 配置时记得补进此列表。
+    for (const std::size_t dk : {std::size_t{16}, std::size_t{32},
+                                 std::size_t{64}, std::size_t{128}})
     {
         nn::RotaryEmbedding rope(engine, dk);
         nn::Tensor q = nn::Tensor::cpu(2 * dk, 8);   // rows 为 dk 的整数倍

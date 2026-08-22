@@ -239,6 +239,69 @@ public:
         std::size_t batch, bool transA, bool transB, Scalar alpha,
         const Tensor* mask = nullptr) = 0;
 
+    // ══════════════════════════════════════════════════════════════════════
+    // 两趟式注意力反向融合原语（M6，重算 W 不物化得分矩阵）
+    //
+    // 语义（全部在 kernel 内部重算 W[i][j] = exp(alpha*score+mask-row_max)/denom，
+    // 绝不物化 (M, N) 得分/概率矩阵）：
+    //   Pass 1 (backward_q)：沿输出行归约 + 与 B 左乘（grad_Q）：
+    //     R[i]         = Σ_j W[i][j] * P[i][j]                    → r_out (batch*M,1)
+    //     grad_Q_b[k][i] = alpha * Σ_j W[i][j]*(P[i][j]-R[i])*B_b[k][j]
+    //                       → 返回 (batch*K, M)，每 batch (K, M)
+    //   Pass 2 (backward_kv)：与 A 左乘 + 与 G 右乘（grad_K 与 grad_V）：
+    //     grad_K_b[k][j] = alpha * Σ_i W[i][j]*(P[i][j]-R[i])*A_b[k][i]
+    //     grad_V_b[k][j] = Σ_i W[i][j] * G[i][k]
+    //                       → 返回 (batch*K, N)，每 batch (K, N)；grad_V 经 out 参数
+    // 共同约定：
+    //   - A 布局同 batched_matmul（每 batch (K, M) 按 transA 解释），B 每 batch (K, N)。
+    //   - P/G/R/row_max/denom 按 batch 垂直堆叠：P (batch*M,N)、G (batch*M,D)、
+    //     R/row_max/denom (batch*M,1)。
+    //   - mask（可选）：(M, N) 共享掩码，语义与 M4 原语一致。
+    //   - 返回 grad_Q / grad_K；R / grad_V 经 out 参数（引擎负责分配输出）。
+    // ══════════════════════════════════════════════════════════════════════
+
+    // Pass 1：行内积 R 与 grad_Q（单次 dispatch 计算两者，避免重复重算 W）。
+    [[nodiscard]] virtual Result<Tensor> batched_matmul_softmax_backward_q(
+        const Tensor& A, const Tensor& B, const Tensor& P,
+        const Tensor& row_max, const Tensor& denom,
+        std::size_t batch, bool transA, bool transB, Scalar alpha,
+        Tensor& r_out, const Tensor* mask = nullptr) = 0;
+
+    // Pass 2：grad_K 与 grad_V（单次 dispatch 计算两者，共享重算的 W 列）。
+    [[nodiscard]] virtual Result<Tensor> batched_matmul_softmax_backward_kv(
+        const Tensor& A, const Tensor& B, const Tensor& P,
+        const Tensor& G, const Tensor& R,
+        const Tensor& row_max, const Tensor& denom,
+        std::size_t batch, bool transA, bool transB, Scalar alpha,
+        Tensor& grad_v_out, const Tensor* mask = nullptr) = 0;
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 列式 softmax 相关融合原语（M5，CrossEntropy 融合的承载点；op-level 结构）
+    //
+    // 两者都不物化 (C, N) 的 exp/softmax 中间张量，读 logits 一遍写出结果。
+    // ══════════════════════════════════════════════════════════════════════
+
+    // 列式稳定 exp 和（softmax 分母等归一化统计）：
+    //   denom[c] = Σ_r exp( logits[r][c] - col_max[c] )
+    // logits: (C, N)，col_max: (1, N)（调用方先行 col_reduce_max）
+    // 输出：(1, N)。单 kernel 融合（工作组内先算减 max 的 exp 再求和），
+    // 可复用于任意"exp 后列归约"结构（dense softmax 分母、数值稳定等）。
+    [[nodiscard]] virtual Result<Tensor> col_softmax_denom(
+        const Tensor& logits, const Tensor& col_max) = 0;
+
+    // 列式稀疏 softmax 交叉熵融合：单 kernel 同时计算稠密梯度与标签位置
+    // log_softmax（不物化 (C, N) 全 softmax，只在标签位置做 -1 与 loss 收集）：
+    //   grad[c][i] = valid(i) ? inv_num_valid * exp(logits[c][i]-col_max[i])/denom[i]
+    //                          - [c == labels[i]] * inv_num_valid : 0
+    //   loss_vec[i] = valid(i) ? logits[labels[i]][i] - col_max[i] - log(denom[i]) : 0
+    //   其中 valid(i) = (mask 为空 || mask[i] >= 0.5) && (labels[i] < vocab_size)
+    // logits: (C, N)；labels: (1, N) 浮点打包的类别索引（值 < vocab_size ≤ C，
+    // 需精确表示，vocab_size ≤ 2^24）；mask（可选）: (1, N)（0/1，参与 loss 位置）
+    // 返回 grad (C, N)；loss_vec 经 out 参数 (1, N)。
+    [[nodiscard]] virtual Result<Tensor> col_softmax_sparse_forward(
+        const Tensor& logits, const Tensor& labels, const Tensor* mask,
+        std::size_t vocab_size, Scalar inv_num_valid, Tensor& loss_vec_out) = 0;
+
     // A += B（逐元素，同形状）
     [[nodiscard]] virtual Result<void> add_inplace(Tensor& A, const Tensor& B) = 0;
 

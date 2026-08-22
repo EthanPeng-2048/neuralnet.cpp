@@ -141,6 +141,100 @@ nn::Matrix ref_apply(const nn::Matrix& a, const nn::Matrix& b, const nn::Matrix&
     return out;
 }
 
+// bmm_q_backward 参考：R 与 grad_Q
+nn::Matrix ref_backward_q(const nn::Matrix& a, const nn::Matrix& b, const nn::Matrix& p,
+                          const nn::Matrix& row_max, const nn::Matrix& denom,
+                          std::size_t batch, bool transA, bool transB, Scalar alpha,
+                          const nn::Matrix* mask,
+                          std::size_t M, std::size_t K, std::size_t N,
+                          nn::Matrix& r_out)
+{
+    nn::Matrix r(batch * M, 1);
+    nn::Matrix gq(batch * K, M);
+    for (std::size_t bi = 0; bi < batch; ++bi)
+    {
+        for (std::size_t i = 0; i < M; ++i)
+        {
+            const Scalar mval = row_max.at_unchecked(bi * M + i, 0);
+            const Scalar inv_l = Scalar{1} / denom.at_unchecked(bi * M + i, 0);
+            std::vector<Scalar> w(N);
+            Scalar rv = 0;
+            for (std::size_t j = 0; j < N; ++j)
+            {
+                Scalar mv = 0;
+                if (mask) mv = mask->at_unchecked(i, j);
+                if (mv == -std::numeric_limits<Scalar>::infinity()) { w[j] = 0; continue; }
+                const Scalar s = alpha * ref_dot(a, b, bi, i, j, M, K, N, transA, transB) + mv - mval;
+                w[j] = std::exp(s) * inv_l;
+                rv += w[j] * p.at_unchecked(bi * M + i, j);
+            }
+            r.set_value_unchecked(bi * M + i, 0, rv);
+            for (std::size_t k = 0; k < K; ++k)
+            {
+                Scalar acc = 0;
+                for (std::size_t j = 0; j < N; ++j)
+                {
+                    const Scalar bv = !transB ? b.at_unchecked(bi * K + k, j)
+                                              : b.at_unchecked(bi * N + j, k);
+                    acc += w[j] * (p.at_unchecked(bi * M + i, j) - rv) * bv;
+                }
+                gq.set_value_unchecked(bi * K + k, i, alpha * acc);
+            }
+        }
+    }
+    r_out = std::move(r);
+    return gq;
+}
+
+// bmm_kv_backward 参考：grad_K 与 grad_V
+nn::Matrix ref_backward_kv(const nn::Matrix& a, const nn::Matrix& b, const nn::Matrix& p,
+                           const nn::Matrix& g, const nn::Matrix& r,
+                           const nn::Matrix& row_max, const nn::Matrix& denom,
+                           std::size_t batch, bool transA, bool transB, Scalar alpha,
+                           const nn::Matrix* mask,
+                           std::size_t M, std::size_t K, std::size_t N, std::size_t D,
+                           nn::Matrix& gv_out)
+{
+    (void)D;  // G 的列数由矩阵自身携带；D 仅用于语义对齐
+    nn::Matrix gk(batch * K, N);
+    nn::Matrix gv(batch * K, N);
+    for (std::size_t bi = 0; bi < batch; ++bi)
+    {
+        for (std::size_t j = 0; j < N; ++j)
+        {
+            std::vector<Scalar> w(M);
+            for (std::size_t i = 0; i < M; ++i)
+            {
+                Scalar mv = 0;
+                if (mask) mv = mask->at_unchecked(i, j);
+                if (mv == -std::numeric_limits<Scalar>::infinity()) { w[i] = 0; continue; }
+                const std::size_t ri = bi * M + i;
+                const Scalar s = alpha * ref_dot(a, b, bi, i, j, M, K, N, transA, transB)
+                                 + mv - row_max.at_unchecked(ri, 0);
+                w[i] = std::exp(s) / denom.at_unchecked(ri, 0);
+            }
+            for (std::size_t k = 0; k < K; ++k)
+            {
+                Scalar accK = 0, accV = 0;
+                for (std::size_t i = 0; i < M; ++i)
+                {
+                    const std::size_t ri = bi * M + i;
+                    // A_b[:,i]（第 i 个 query 向量）：!transA 取 A_b[i][k]，
+                    // transA 时 A_b (K,M) 取 A_b[k][i]。
+                    const Scalar av = !transA ? a.at_unchecked(bi * M + i, k)
+                                              : a.at_unchecked(bi * K + k, i);
+                    accK += w[i] * (p.at_unchecked(ri, j) - r.at_unchecked(ri, 0)) * av;
+                    accV += w[i] * g.at_unchecked(ri, k);
+                }
+                gk.set_value_unchecked(bi * K + k, j, alpha * accK);
+                gv.set_value_unchecked(bi * K + k, j, accV);
+            }
+        }
+    }
+    gv_out = std::move(gv);
+    return gk;
+}
+
 Scalar max_abs_diff(const nn::Matrix& a, const nn::Matrix& b)
 {
     if (a.rows() != b.rows() || a.cols() != b.cols()) return 1e30f;
@@ -148,9 +242,7 @@ Scalar max_abs_diff(const nn::Matrix& a, const nn::Matrix& b)
     for (std::size_t i = 0; i < a.span().size(); ++i)
         e = std::max(e, std::fabs(a.span()[i] - b.span()[i]));
     return e;
-}
-
-void check_matrix(const nn::Matrix& got, const nn::Matrix& ref, const char* msg)
+}void check_matrix(const nn::Matrix& got, const nn::Matrix& ref, const char* msg)
 {
     const Scalar err = max_abs_diff(got, ref);
     const bool ok = err < 1e-4f;
@@ -275,6 +367,120 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
         auto r2 = eng.batched_matmul_softmax_apply(ta_t, tb, tv, trm, tdl, batch,
                                                    true, false, alpha, nullptr);
         check(nm, std::move(r2), ref2);
+    }
+
+    // ── bmm_q_backward（注意力布局 + 掩码）：R 与 grad_Q ──
+    {
+        char nm[128];
+        const nn::Tensor ta_t = nn::Tensor::from_matrix(nn::Matrix(A_t));
+        const nn::Tensor tb = nn::Tensor::from_matrix(nn::Matrix(B));
+        const nn::Tensor tm = nn::Tensor::from_matrix(nn::Matrix(mask));
+        const nn::Tensor trm = nn::Tensor::from_matrix(nn::Matrix(row_max));
+        const nn::Tensor tdl = nn::Tensor::from_matrix(nn::Matrix(denom));
+        // P: (batch*M, N) — 模拟 grad_A
+        nn::Matrix P(batch * M, N);
+        for (auto& x : P.span()) x = dist(rng);
+        const nn::Tensor tp = nn::Tensor::from_matrix(nn::Matrix(P));
+
+        // 有掩码：R 与 grad_Q
+        nn::Matrix r_ref, gq_ref;
+        gq_ref = ref_backward_q(A_t, B, P, row_max, denom, batch, true, false,
+                                alpha, &mask, M, K, N, r_ref);
+        {
+            nn::Tensor r_out;
+            std::snprintf(nm, sizeof(nm), "%s bmm_q_backward (mask)", tag);
+            auto r = eng.batched_matmul_softmax_backward_q(
+                ta_t, tb, tp, trm, tdl, batch, true, false, alpha, r_out, &tm);
+            if (!r) { std::printf("[FAIL] %s: %s\n", nm, r.error().message.c_str()); ++fail; }
+            else
+            {
+                auto dq = eng.to_matrix(*r);
+                if (!dq) { std::printf("[FAIL] %s: 下载失败\n", nm); ++fail; }
+                else check_matrix(*dq, gq_ref, nm);
+                auto dr = eng.to_matrix(r_out);
+                if (!dr) { std::printf("[FAIL] %s (R): 下载失败\n", nm); ++fail; }
+                else check_matrix(*dr, r_ref, "  R (mask)");
+            }
+        }
+        // 无掩码：R 与 grad_Q
+        nn::Matrix r_ref2, gq_ref2;
+        gq_ref2 = ref_backward_q(A_t, B, P, row_max, denom, batch, true, false,
+                                 alpha, nullptr, M, K, N, r_ref2);
+        {
+            nn::Tensor r_out;
+            std::snprintf(nm, sizeof(nm), "%s bmm_q_backward (no mask)", tag);
+            auto r = eng.batched_matmul_softmax_backward_q(
+                ta_t, tb, tp, trm, tdl, batch, true, false, alpha, r_out, nullptr);
+            if (!r) { std::printf("[FAIL] %s: %s\n", nm, r.error().message.c_str()); ++fail; }
+            else
+            {
+                auto dq = eng.to_matrix(*r);
+                if (!dq) { std::printf("[FAIL] %s: 下载失败\n", nm); ++fail; }
+                else check_matrix(*dq, gq_ref2, nm);
+                auto dr = eng.to_matrix(r_out);
+                if (!dr) { std::printf("[FAIL] %s (R): 下载失败\n", nm); ++fail; }
+                else check_matrix(*dr, r_ref2, "  R (no mask)");
+            }
+        }
+    }
+
+    // ── bmm_kv_backward（注意力布局 + 掩码）：grad_K 与 grad_V ──
+    {
+        char nm[128];
+        const nn::Tensor ta_t = nn::Tensor::from_matrix(nn::Matrix(A_t));
+        const nn::Tensor tb = nn::Tensor::from_matrix(nn::Matrix(B));
+        const nn::Tensor tm = nn::Tensor::from_matrix(nn::Matrix(mask));
+        const nn::Tensor trm = nn::Tensor::from_matrix(nn::Matrix(row_max));
+        const nn::Tensor tdl = nn::Tensor::from_matrix(nn::Matrix(denom));
+        // P: (batch*M, N)，G: (batch*M, D)（模拟 grad_O^T），R: (batch*M, 1)
+        nn::Matrix P(batch * M, N);
+        nn::Matrix G(batch * M, D);
+        nn::Matrix R(batch * M, 1);
+        for (auto& x : P.span()) x = dist(rng);
+        for (auto& x : G.span()) x = dist(rng);
+        for (auto& x : R.span()) x = dist(rng);
+        const nn::Tensor tp = nn::Tensor::from_matrix(nn::Matrix(P));
+        const nn::Tensor tg = nn::Tensor::from_matrix(nn::Matrix(G));
+        const nn::Tensor tr = nn::Tensor::from_matrix(nn::Matrix(R));
+
+        nn::Matrix gk_ref, gv_ref;
+        gk_ref = ref_backward_kv(A_t, B, P, G, R, row_max, denom, batch, true, false,
+                                 alpha, &mask, M, K, N, D, gv_ref);
+        {
+            nn::Tensor gv_out;
+            std::snprintf(nm, sizeof(nm), "%s bmm_kv_backward (mask)", tag);
+            auto r = eng.batched_matmul_softmax_backward_kv(
+                ta_t, tb, tp, tg, tr, trm, tdl, batch, true, false, alpha, gv_out, &tm);
+            if (!r) { std::printf("[FAIL] %s: %s\n", nm, r.error().message.c_str()); ++fail; }
+            else
+            {
+                auto dk = eng.to_matrix(*r);
+                if (!dk) { std::printf("[FAIL] %s: 下载失败\n", nm); ++fail; }
+                else check_matrix(*dk, gk_ref, nm);
+                auto dv = eng.to_matrix(gv_out);
+                if (!dv) { std::printf("[FAIL] %s (V): 下载失败\n", nm); ++fail; }
+                else check_matrix(*dv, gv_ref, "  grad_V (mask)");
+            }
+        }
+        nn::Matrix gk_ref2, gv_ref2;
+        gk_ref2 = ref_backward_kv(A_t, B, P, G, R, row_max, denom, batch, true, false,
+                                  alpha, nullptr, M, K, N, D, gv_ref2);
+        {
+            nn::Tensor gv_out;
+            std::snprintf(nm, sizeof(nm), "%s bmm_kv_backward (no mask)", tag);
+            auto r = eng.batched_matmul_softmax_backward_kv(
+                ta_t, tb, tp, tg, tr, trm, tdl, batch, true, false, alpha, gv_out, nullptr);
+            if (!r) { std::printf("[FAIL] %s: %s\n", nm, r.error().message.c_str()); ++fail; }
+            else
+            {
+                auto dk = eng.to_matrix(*r);
+                if (!dk) { std::printf("[FAIL] %s: 下载失败\n", nm); ++fail; }
+                else check_matrix(*dk, gk_ref2, nm);
+                auto dv = eng.to_matrix(gv_out);
+                if (!dv) { std::printf("[FAIL] %s (V): 下载失败\n", nm); ++fail; }
+                else check_matrix(*dv, gv_ref2, "  grad_V (no mask)");
+            }
+        }
     }
 
     return fail;

@@ -1,0 +1,81 @@
+// ── col_softmax_sparse_forward.comp ───────────────────────────────────────
+// M5 列式稀疏 softmax 交叉熵融合：单 kernel 计算稠密梯度 + 标签位置 log_softmax，
+// 不物化 (C, N) 全 softmax 中间张量（只在标签位置做 -1 与 loss 收集）。
+//   grad[c][i] = valid(i) ? inv_num_valid * exp(logits[c][i]-col_max[i])/denom[i]
+//                          - (c == labels[i]) * inv_num_valid : 0
+//   loss_vec[i] = valid(i) ? logits[labels[i]][i] - col_max[i] - log(denom[i]) : 0
+//   其中 col_max[i] = max_r logits[r][i]，denom[i] = Σ_r exp(logits[r][i]-col_max[i])
+//   valid(i) = (mask 为空 || mask[i] >= 0.5) && (labels[i] < vocab_size)
+//
+// Bindings：Logits(0), Labels(1), Mask(2), LossVec(3), Grad(4)
+//   （grad 为返回输出，须在最后；loss_vec 经 out 参数；mask 为空绑定 Labels 占位）
+// Push Constants：uint C, uint N, uint vocab_size, uint flags, float inv_num_valid
+// Dispatch：(N, 1, 1)，每个工作组（256 线程）处理一列
+// ─────────────────────────────────────────────────────────────────────────
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer  BufLogits { float LOGITS[]; };
+layout(std430, binding = 1) readonly buffer  BufLabels { float LABELS[]; };
+layout(std430, binding = 2) readonly buffer  BufMask   { float MASK[]; };
+layout(std430, binding = 3) writeonly buffer BufLv     { float LV[]; };
+layout(std430, binding = 4) writeonly buffer BufGrad   { float GRAD[]; };
+
+layout(push_constant) uniform PC {
+    uint C;
+    uint N;
+    uint vocab_size;
+    uint flags;
+    float inv_num_valid;
+};
+
+shared float sdata[256];
+
+void main()
+{
+    const uint tid = gl_LocalInvocationID.x;
+    const uint col = gl_WorkGroupID.x;
+    const bool has_mask = (flags & 1u) != 0u;
+
+    // ── Phase A：col_max 与 denom（两趟树形归约） ──
+    float mx = -3.402823466e+38;  // float 最小有限值近似（-FLT_MAX）
+    for (uint r = tid; r < C; r += 256u)
+        mx = max(mx, LOGITS[r * N + col]);
+    sdata[tid] = mx;
+    barrier();
+    for (uint st = 128u; st > 0u; st >>= 1u)
+    {
+        if (tid < st) sdata[tid] = max(sdata[tid], sdata[tid + st]);
+        barrier();
+    }
+    const float col_max = sdata[0];
+
+    float acc = 0.0;
+    for (uint r = tid; r < C; r += 256u)
+        acc += exp(LOGITS[r * N + col] - col_max);
+    sdata[tid] = acc;
+    barrier();
+    for (uint st = 128u; st > 0u; st >>= 1u)
+    {
+        if (tid < st) sdata[tid] += sdata[tid + st];
+        barrier();
+    }
+    const float denom = sdata[0];
+
+    // ── Phase B：写 grad 与 loss_vec ──
+    const float lbl_f = LABELS[col];
+    const uint lbl = (lbl_f >= 0.0) ? uint(lbl_f) : 0u;
+    const bool valid = (!has_mask || MASK[col] >= 0.5) && (lbl < vocab_size);
+    const float inv = valid ? inv_num_valid : 0.0;
+    const float scale = inv / denom;
+    for (uint r = tid; r < C; r += 256u)
+        GRAD[r * N + col] = scale * exp(LOGITS[r * N + col] - col_max);
+    if (tid == 0u)
+    {
+        if (valid)
+            GRAD[lbl * N + col] -= inv_num_valid;
+        LV[col] = valid ? LOGITS[lbl * N + col] - col_max - log(denom) : 0.0;
+    }
+}

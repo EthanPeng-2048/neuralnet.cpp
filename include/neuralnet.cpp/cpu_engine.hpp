@@ -698,6 +698,313 @@ public:
         return Tensor::from_matrix(std::move(result));
     }
 
+    // 两趟式注意力反向 Pass 1：R 与 grad_Q（CPU 参考实现）
+    [[nodiscard]] Result<Tensor> batched_matmul_softmax_backward_q(
+        const Tensor& A, const Tensor& B, const Tensor& P,
+        const Tensor& row_max, const Tensor& denom,
+        std::size_t batch, bool transA, bool transB, Scalar alpha,
+        Tensor& r_out, const Tensor* mask) override
+    {
+        if (A.is_gpu() || B.is_gpu() || P.is_gpu())
+            return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+        if (batch == 0)
+            return std::unexpected(Error{"batched_matmul_softmax_backward_q: batch must be > 0"});
+        const Matrix& a = A.cpu_matrix();
+        const Matrix& b = B.cpu_matrix();
+        const Matrix& p = P.cpu_matrix();
+        const Matrix& m = row_max.cpu_matrix();
+        const Matrix& l = denom.cpu_matrix();
+        if (a.rows() % batch != 0 || b.rows() % batch != 0)
+            return std::unexpected(Error{"batched_matmul_softmax_backward_q: rows not divisible by batch"});
+        const std::size_t a_rpb = a.rows() / batch;
+        const std::size_t b_rpb = b.rows() / batch;
+        const std::size_t M = transA ? a.cols() : a_rpb;
+        const std::size_t K = transA ? a_rpb : a.cols();
+        const std::size_t K2 = transB ? b.cols() : b_rpb;
+        const std::size_t N = transB ? b_rpb : b.cols();
+        if (K != K2)
+            return std::unexpected(Error{"batched_matmul_softmax_backward_q: K dimension mismatch"});
+        if (p.rows() != batch * M || p.cols() != N)
+            return std::unexpected(Error{"batched_matmul_softmax_backward_q: P shape mismatch"});
+        if (m.rows() != batch * M || m.cols() != 1)
+            return std::unexpected(Error{"batched_matmul_softmax_backward_q: row_max shape mismatch"});
+        if (l.rows() != batch * M || l.cols() != 1)
+            return std::unexpected(Error{"batched_matmul_softmax_backward_q: denom shape mismatch"});
+        if (mask && (mask->rows() != M || mask->cols() != N))
+            return std::unexpected(Error{"batched_matmul_softmax_backward_q: mask shape mismatch"});
+
+        const auto a_span = a.span();
+        const auto b_span = b.span();
+        const auto p_span = p.span();
+        const auto m_span = m.span();
+        const auto l_span = l.span();
+        const auto dot_ab = [&](std::size_t bi, std::size_t i, std::size_t j) -> Scalar
+        {
+            Scalar s = Scalar{0};
+            const std::size_t abase = bi * M * K;
+            const std::size_t bbase = bi * K * N;
+            for (std::size_t k = 0; k < K; ++k)
+            {
+                const Scalar av = !transA
+                    ? a_span[abase + i * K + k]
+                    : a_span[abase + k * M + i];
+                const Scalar bv = !transB
+                    ? b_span[bbase + k * N + j]
+                    : b_span[bbase + j * K + k];
+                s += av * bv;
+            }
+            return s;
+        };
+
+        Matrix result(batch * K, M);
+        Matrix r(batch * M, 1);
+        auto out = result.span();
+        auto rout = r.span();
+        for (std::size_t b = 0; b < batch; ++b)
+        {
+            for (std::size_t i = 0; i < M; ++i)
+            {
+                const Scalar mval = m_span[b * M + i];
+                const Scalar inv_l = Scalar{1} / l_span[b * M + i];
+                std::vector<Scalar> w(N);
+                Scalar rv = Scalar{0};
+                for (std::size_t j = 0; j < N; ++j)
+                {
+                    Scalar mv = Scalar{0};
+                    if (mask) mv = mask->cpu_matrix().at_unchecked(i, j);
+                    if (mv == -std::numeric_limits<Scalar>::infinity())
+                    {
+                        w[j] = Scalar{0};
+                        continue;
+                    }
+                    const Scalar s = alpha * dot_ab(b, i, j) + mv - mval;
+                    w[j] = std::exp(s) * inv_l;
+                    rv += w[j] * p_span[(b * M + i) * N + j];
+                }
+                rout[b * M + i] = rv;
+                for (std::size_t k = 0; k < K; ++k)
+                {
+                    Scalar acc = Scalar{0};
+                    for (std::size_t j = 0; j < N; ++j)
+                    {
+                        const Scalar bv = !transB
+                            ? b_span[(b * K + k) * N + j]
+                            : b_span[(b * N + j) * K + k];
+                        acc += w[j] * (p_span[(b * M + i) * N + j] - rv) * bv;
+                    }
+                    out[(b * K + k) * M + i] = alpha * acc;
+                }
+            }
+        }
+        r_out = Tensor::from_matrix(std::move(r));
+        return Tensor::from_matrix(std::move(result));
+    }
+
+    // 两趟式注意力反向 Pass 2：grad_K 与 grad_V（CPU 参考实现）
+    [[nodiscard]] Result<Tensor> batched_matmul_softmax_backward_kv(
+        const Tensor& A, const Tensor& B, const Tensor& P,
+        const Tensor& G, const Tensor& R,
+        const Tensor& row_max, const Tensor& denom,
+        std::size_t batch, bool transA, bool transB, Scalar alpha,
+        Tensor& grad_v_out, const Tensor* mask) override
+    {
+        if (A.is_gpu() || B.is_gpu() || P.is_gpu() || G.is_gpu())
+            return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+        if (batch == 0)
+            return std::unexpected(Error{"batched_matmul_softmax_backward_kv: batch must be > 0"});
+        const Matrix& a = A.cpu_matrix();
+        const Matrix& b = B.cpu_matrix();
+        const Matrix& p = P.cpu_matrix();
+        const Matrix& g = G.cpu_matrix();
+        const Matrix& r = R.cpu_matrix();
+        const Matrix& m = row_max.cpu_matrix();
+        const Matrix& l = denom.cpu_matrix();
+        if (a.rows() % batch != 0 || b.rows() % batch != 0)
+            return std::unexpected(Error{"batched_matmul_softmax_backward_kv: rows not divisible by batch"});
+        const std::size_t a_rpb = a.rows() / batch;
+        const std::size_t b_rpb = b.rows() / batch;
+        const std::size_t M = transA ? a.cols() : a_rpb;
+        const std::size_t K = transA ? a_rpb : a.cols();
+        const std::size_t K2 = transB ? b.cols() : b_rpb;
+        const std::size_t N = transB ? b_rpb : b.cols();
+        if (K != K2)
+            return std::unexpected(Error{"batched_matmul_softmax_backward_kv: K dimension mismatch"});
+        if (p.rows() != batch * M || p.cols() != N)
+            return std::unexpected(Error{"batched_matmul_softmax_backward_kv: P shape mismatch"});
+        const std::size_t D = g.cols();
+        if (g.rows() != batch * M)
+            return std::unexpected(Error{"batched_matmul_softmax_backward_kv: G rows != batch*M"});
+        if (r.rows() != batch * M || r.cols() != 1)
+            return std::unexpected(Error{"batched_matmul_softmax_backward_kv: R shape mismatch"});
+        if (m.rows() != batch * M || m.cols() != 1)
+            return std::unexpected(Error{"batched_matmul_softmax_backward_kv: row_max shape mismatch"});
+        if (l.rows() != batch * M || l.cols() != 1)
+            return std::unexpected(Error{"batched_matmul_softmax_backward_kv: denom shape mismatch"});
+        if (mask && (mask->rows() != M || mask->cols() != N))
+            return std::unexpected(Error{"batched_matmul_softmax_backward_kv: mask shape mismatch"});
+
+        const auto a_span = a.span();
+        const auto b_span = b.span();
+        const auto p_span = p.span();
+        const auto g_span = g.span();
+        const auto r_span = r.span();
+        const auto m_span = m.span();
+        const auto l_span = l.span();
+        const auto dot_ab = [&](std::size_t bi, std::size_t i, std::size_t j) -> Scalar
+        {
+            Scalar s = Scalar{0};
+            const std::size_t abase = bi * M * K;
+            const std::size_t bbase = bi * K * N;
+            for (std::size_t k = 0; k < K; ++k)
+            {
+                const Scalar av = !transA
+                    ? a_span[abase + i * K + k]
+                    : a_span[abase + k * M + i];
+                const Scalar bv = !transB
+                    ? b_span[bbase + k * N + j]
+                    : b_span[bbase + j * K + k];
+                s += av * bv;
+            }
+            return s;
+        };
+
+        Matrix result(batch * K, N);
+        Matrix gv(batch * K, N);
+        auto out = result.span();
+        auto gvout = gv.span();
+        for (std::size_t b = 0; b < batch; ++b)
+        {
+            for (std::size_t j = 0; j < N; ++j)
+            {
+                std::vector<Scalar> w(M);
+                for (std::size_t i = 0; i < M; ++i)
+                {
+                    Scalar mv = Scalar{0};
+                    if (mask) mv = mask->cpu_matrix().at_unchecked(i, j);
+                    if (mv == -std::numeric_limits<Scalar>::infinity())
+                    {
+                        w[i] = Scalar{0};
+                        continue;
+                    }
+                    const std::size_t ri = b * M + i;
+                    const Scalar s = alpha * dot_ab(b, i, j) + mv - m_span[ri];
+                    w[i] = std::exp(s) / l_span[ri];
+                }
+                for (std::size_t k = 0; k < K; ++k)
+                {
+                    Scalar accK = Scalar{0};
+                    Scalar accV = Scalar{0};
+                    for (std::size_t i = 0; i < M; ++i)
+                    {
+                        const std::size_t ri = b * M + i;
+                        // A_b[:,i]（第 i 个 query 向量）：!transA 时 A_b (M,K)
+                        // 取 A_b[i][k]；transA 时 A_b (K,M) 取 A_b[k][i]。
+                        const Scalar av = !transA
+                            ? a_span[(b * M + i) * K + k]
+                            : a_span[(b * K + k) * M + i];
+                        accK += w[i] * (p_span[ri * N + j] - r_span[ri]) * av;
+                        accV += w[i] * g_span[ri * D + k];
+                    }
+                    out[(b * K + k) * N + j] = alpha * accK;
+                    gvout[(b * K + k) * N + j] = accV;
+                }
+            }
+        }
+        grad_v_out = Tensor::from_matrix(std::move(gv));
+        return Tensor::from_matrix(std::move(result));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 列式 softmax 融合原语（M5，CPU 参考实现；先正确后优化）
+    // ══════════════════════════════════════════════════════════════════════
+
+    // 列式稳定 exp 和：denom[c] = Σ_r exp(logits[r][c] - col_max[c])
+    [[nodiscard]] Result<Tensor> col_softmax_denom(
+        const Tensor& logits, const Tensor& col_max) override
+    {
+        if (logits.is_gpu() || col_max.is_gpu())
+            return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+        const Matrix& l = logits.cpu_matrix();
+        const Matrix& m = col_max.cpu_matrix();
+        const std::size_t C = l.rows(), N = l.cols();
+        if (m.rows() != 1 || m.cols() != N)
+            return std::unexpected(Error{"col_softmax_denom: col_max shape mismatch"});
+        const auto l_span = l.span();
+        const auto m_span = m.span();
+        Matrix result(1, N);
+        auto out = result.span();
+        for (std::size_t i = 0; i < N; ++i)
+        {
+            const Scalar mv = m_span[i];
+            Scalar acc = Scalar{0};
+            for (std::size_t r = 0; r < C; ++r)
+                acc += std::exp(l_span[r * N + i] - mv);
+            out[i] = acc;
+        }
+        return Tensor::from_matrix(std::move(result));
+    }
+
+    // 列式稀疏 softmax 交叉熵融合：grad 与 loss_vec（参考实现，与 shader 语义一致）
+    [[nodiscard]] Result<Tensor> col_softmax_sparse_forward(
+        const Tensor& logits, const Tensor& labels, const Tensor* mask,
+        std::size_t vocab_size, Scalar inv_num_valid,
+        Tensor& loss_vec_out) override
+    {
+        if (logits.is_gpu() || labels.is_gpu() || (mask && mask->is_gpu()))
+            return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+        if (vocab_size > (std::size_t{1} << 24))
+            return std::unexpected(Error{
+                "col_softmax_sparse_forward: vocab_size exceeds 2^24 "
+                "(float labels not exactly representable)"});
+        const Matrix& l = logits.cpu_matrix();
+        const Matrix& lb = labels.cpu_matrix();
+        const std::size_t C = l.rows(), N = l.cols();
+        if (lb.rows() != 1 || lb.cols() != N)
+            return std::unexpected(Error{"col_softmax_sparse_forward: labels shape mismatch"});
+        if (vocab_size > C)
+            return std::unexpected(Error{"col_softmax_sparse_forward: vocab_size > classes"});
+        if (mask && (mask->rows() != 1 || mask->cols() != N))
+            return std::unexpected(Error{"col_softmax_sparse_forward: mask shape mismatch"});
+
+        const auto l_span = l.span();
+        const auto lb_span = lb.span();
+        Matrix grad(C, N);
+        Matrix loss_vec(1, N);
+        auto g_span = grad.span();
+        auto lv_span = loss_vec.span();
+
+        for (std::size_t i = 0; i < N; ++i)
+        {
+            const Scalar lbl_f = lb_span[i];
+            const std::size_t lbl = (lbl_f >= Scalar{0})
+                ? static_cast<std::size_t>(lbl_f) : static_cast<std::size_t>(0);
+            const bool valid = (!mask || mask->cpu_matrix().at_unchecked(0, i) >= Scalar{0.5})
+                && (lbl < vocab_size);
+
+            if (!valid)
+            {
+                for (std::size_t r = 0; r < C; ++r)
+                    g_span[r * N + i] = Scalar{0};
+                lv_span[i] = Scalar{0};
+                continue;
+            }
+            // 列内 max + denom（与 GPU kernel 一致，用双循环重读；C 小无所谓）
+            Scalar mv = -std::numeric_limits<Scalar>::infinity();
+            for (std::size_t r = 0; r < C; ++r)
+                mv = std::max(mv, l_span[r * N + i]);
+            Scalar denom = Scalar{0};
+            for (std::size_t r = 0; r < C; ++r)
+                denom += std::exp(l_span[r * N + i] - mv);
+            for (std::size_t r = 0; r < C; ++r)
+                g_span[r * N + i] = inv_num_valid * std::exp(l_span[r * N + i] - mv) / denom;
+            g_span[lbl * N + i] -= inv_num_valid;
+            lv_span[i] = l_span[lbl * N + i] - mv - std::log(denom);
+        }
+
+        loss_vec_out = Tensor::from_matrix(std::move(loss_vec));
+        return Tensor::from_matrix(std::move(grad));
+    }
+
     [[nodiscard]] Result<void> add_inplace(Tensor& A, const Tensor& B) override
     {
         if (A.rows() != B.rows() || A.cols() != B.cols())

@@ -252,6 +252,36 @@ public:
         return std::unexpected(Error{"CudaEngine: batched_matmul_softmax_apply 未实现"});
     }
 
+    // ── 两趟式注意力反向原语（M6）：CUDA 尚未实现，返回错误（调用方回退） ──
+    [[nodiscard]] Result<Tensor> batched_matmul_softmax_backward_q(
+        const Tensor&, const Tensor&, const Tensor&,
+        const Tensor&, const Tensor&,
+        std::size_t, bool, bool, Scalar, Tensor&, const Tensor*) override
+    {
+        return std::unexpected(Error{"CudaEngine: batched_matmul_softmax_backward_q 未实现"});
+    }
+    [[nodiscard]] Result<Tensor> batched_matmul_softmax_backward_kv(
+        const Tensor&, const Tensor&, const Tensor&,
+        const Tensor&, const Tensor&,
+        const Tensor&, const Tensor&,
+        std::size_t, bool, bool, Scalar, Tensor&, const Tensor*) override
+    {
+        return std::unexpected(Error{"CudaEngine: batched_matmul_softmax_backward_kv 未实现"});
+    }
+
+    // ── 列式 softmax 融合原语（M5）：CUDA 尚未实现，返回错误（调用方回退） ──
+    [[nodiscard]] Result<Tensor> col_softmax_denom(
+        const Tensor&, const Tensor&) override
+    {
+        return std::unexpected(Error{"CudaEngine: col_softmax_denom 未实现"});
+    }
+    [[nodiscard]] Result<Tensor> col_softmax_sparse_forward(
+        const Tensor&, const Tensor&, const Tensor*,
+        std::size_t, Scalar, Tensor&) override
+    {
+        return std::unexpected(Error{"CudaEngine: col_softmax_sparse_forward 未实现"});
+    }
+
     // A += B
     [[nodiscard]] Result<void> add_inplace(Tensor& A, const Tensor& B) override
     {
