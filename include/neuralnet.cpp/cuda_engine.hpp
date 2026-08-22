@@ -95,20 +95,15 @@ public:
     }
 
     // ── 行插入 ────────────────────────────────────────────────────────────
+    // 纯 CUDA 架构：dst 必须为 CUDA Tensor，不接受 CPU 目标（不做 CPU 回退，
+    // 保持"硬报错、不降级"）。CPU 目标说明调用方混用了设备，属调用错误。
     [[nodiscard]] Result<void> insert_rows(
         Tensor& dst, std::size_t dst_start_row, const Tensor& src) override
     {
         if (dst.is_cpu())
-        {
-            if (!src.is_cpu())
-            {
-                auto sm = to_matrix(src);
-                if (!sm) return std::unexpected(sm.error());
-                Tensor src_cpu = Tensor::from_matrix(Matrix(*sm));
-                return insert_rows_cpu_fallback(dst, dst_start_row, src_cpu);
-            }
-            return insert_rows_cpu_fallback(dst, dst_start_row, src);
-        }
+            return std::unexpected(Error{
+                "CudaEngine::insert_rows: dst must be a CUDA tensor"
+                "（不做 CPU 回退；请保证目标张量在 CUDA 上）"});
         auto src_gpu = ensure_cuda(src);
         if (!src_gpu) return std::unexpected(src_gpu.error());
         return backend_.insert_rows_gpu(dst.cuda_tensor(), dst_start_row, src_gpu->cuda_tensor());
@@ -142,23 +137,6 @@ public:
     }
 
 private:
-    [[nodiscard]] Result<void> insert_rows_cpu_fallback(
-        Tensor& dst, std::size_t dst_start_row, const Tensor& src)
-    {
-        Matrix& d = dst.cpu_matrix();
-        const Matrix& s = src.cpu_matrix();
-        if (d.cols() != s.cols())
-            return std::unexpected(Error{"insert_rows: column count mismatch"});
-        if (dst_start_row + s.rows() > d.rows())
-            return std::unexpected(Error{"insert_rows: range out of bounds"});
-        const auto dst_span = d.span();
-        const auto src_span = s.span();
-        const std::size_t cols = d.cols();
-        for (std::size_t r = 0; r < s.rows(); ++r)
-            std::copy_n(src_span.begin() + r * cols, cols,
-                        dst_span.begin() + (dst_start_row + r) * cols);
-        return {};
-    }
 
 public:
 

@@ -90,8 +90,9 @@ int main(int argc, char* argv[])
     nn::cli::EngineConfig ecfg;
     ecfg.use_cuda = use_cuda;
     ecfg.use_gpu = use_gpu;
-    auto engine = nn::cli::create_engine(ecfg, std::cout);
-    if (!engine) { std::cerr << "引擎创建失败\n"; return 1; }
+    auto engine_res = nn::cli::create_engine(ecfg, std::cout);
+    if (!engine_res) { std::cerr << "引擎创建失败: " << engine_res.error().message << "\n"; return 1; }
+    auto engine = std::move(*engine_res);
     ComputeEngine& eng = *engine;
 
     const std::size_t vocab = 64, d_model = 16, seq = 8, heads = 2, d_ff = 32, layers = 2;

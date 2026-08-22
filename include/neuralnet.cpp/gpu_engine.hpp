@@ -32,14 +32,9 @@
 #ifdef NN_HAS_VULKAN
 
 #include <cstdint>
-#include <cstdio>
-#include <mutex>
 #include <optional>
-#include <unordered_set>
-#include <vector>
 
 #include "compute_engine.hpp"
-#include "cpu_engine.hpp"   // 优雅回退：未命中 AOT 融合 shader 时 CPU 求值
 #if __has_include("fused_registry.hpp")
 #include "fused_registry.hpp"
 #endif
@@ -864,12 +859,12 @@ public:
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 表达式求值（AOT 融合优先，未命中优雅回退 CPU）
+    // 表达式求值（闭合世界 AOT；未命中硬报错，绝不静默回退）
     //
     // 折叠内联表达式 → expr_spec_key → 查构建期合成的融合 shader 注册表
     // （fused_registry.hpp，由 scan_exprs 收集 + gen_fused 合成）；命中则
-    // dispatch 单个融合 shader；未命中（如形状未纳入闭合世界）**优雅回退**
-    // CPU 求值（通用参考实现，正确性有保证，但慢）并打印一次性警告。
+    // dispatch 单个融合 shader；未命中**硬报错**（无 eager、无运行时生成、
+    // 不回退 CPU），提示把该内联表达式纳入构建期扫描。
     //
     // 形状无关融合：RowMod/RotateHalf 的周期/块大小（如 RoPE 的 d_k）是
     // 运行时视图参数（不进 key），dispatch 时按实际 spec 填充 push constant
@@ -908,9 +903,10 @@ public:
         }
 #endif
 
-        // ── 优雅回退：未命中 AOT 融合 shader → CPU 求值（正确性兜底） ──
-        warn_miss_once_(key);
-        return eval_expr_cpu_fallback_(spec, inputs, rows, cols, /*reduce=*/false);
+        // ── 闭合世界：未命中任何 AOT 融合 shader → 硬报错（绝不静默回退） ──
+        return std::unexpected(Error{
+            "GpuEngine::eval_expr: 未找到该内联表达式的 AOT 融合 shader（闭合世界）；"
+            "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）"});
     }
 
     // ── 归约向量原生形状输出（M3：LayerNorm/RMSNorm 小向量缓存） ────────
@@ -941,47 +937,13 @@ public:
             return Tensor::from_gpu(std::move(*out));
         }
 #endif
-        warn_miss_once_(key);
-        return eval_expr_cpu_fallback_(spec, inputs, rows, cols, /*reduce=*/true);
+        // ── 闭合世界：未命中归约融合 shader → 硬报错（绝不静默回退） ──
+        return std::unexpected(Error{
+            "GpuEngine::eval_expr_reduce: 未找到该归约表达式的 AOT 融合 shader（闭合世界）；"
+            "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）"});
     }
 
 private:
-    // ── 优雅回退：未命中 AOT 融合 shader → 下载输入 → CPU 求值 → 上传 ──
-    // 仅未覆盖形状走此慢路径（正确性兜底）；命中仍走融合 shader。
-    [[nodiscard]] Result<Tensor> eval_expr_cpu_fallback_(
-        const ExprSpec& spec, std::span<const Tensor> inputs,
-        std::size_t rows, std::size_t cols, bool reduce)
-    {
-        CpuEngine cpu;
-        std::vector<Tensor> cpu_inputs;
-        cpu_inputs.reserve(inputs.size());
-        for (const auto& t : inputs)
-        {
-            auto m = to_matrix(t);
-            if (!m) return std::unexpected(m.error());
-            cpu_inputs.push_back(Tensor::from_matrix(std::move(*m)));
-        }
-        auto r = reduce
-            ? cpu.eval_expr_reduce(spec, cpu_inputs, rows, cols)
-            : cpu.eval_expr(spec, cpu_inputs, rows, cols);
-        if (!r) return std::unexpected(r.error());
-        auto g = ensure_gpu(*r);
-        if (!g) return std::unexpected(g.error());
-        return g;  // ensure_gpu 返回共享 GPU 拷贝或上传
-    }
-
-    // 一次性警告：覆盖缺口仍可见（避免静默降级），但不再硬报错
-    static void warn_miss_once_(const std::string& key)
-    {
-        static std::mutex m;
-        static std::unordered_set<std::string> warned;
-        std::lock_guard<std::mutex> lk(m);
-        if (warned.insert(key).second)
-            std::fprintf(stderr,
-                "[GpuEngine] 警告：内联表达式未命中 AOT 融合 shader（key=%s），"
-                "已回退 CPU 求值（正确但较慢）。建议将该路径补入 scan_exprs 覆盖。\n",
-                key.c_str());
-    }
     // ── 辅助：确保 Tensor 在 GPU 上 ──────────────────────────────────────
     // 若已是 GPU，返回共享拷贝（零开销）；若为 CPU，上传到 GPU。
     // 纯 GPU 架构下，所有 Tensor 应已是 GPU，此方法为防御性兜底。

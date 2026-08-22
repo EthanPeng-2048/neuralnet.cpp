@@ -251,7 +251,13 @@ int main(int argc, char *argv[])
     nn::cli::EngineConfig eng_cfg;
     eng_cfg.use_gpu = cfg.gpu_enabled;
     eng_cfg.use_cuda = cfg.cuda_enabled;
-    auto engine = nn::cli::create_engine(eng_cfg, std::cout);
+    auto engine_res = nn::cli::create_engine(eng_cfg, std::cout);
+    if (!engine_res)
+    {
+        std::cerr << "引擎创建失败: " << engine_res.error().message << "\n";
+        return 1;
+    }
+    auto engine = std::move(*engine_res);
 
     // ── 构建 GPT 模型 ────────────────────────────────────────
     std::cout << "模型规格: vocab=" << spec.vocab_size

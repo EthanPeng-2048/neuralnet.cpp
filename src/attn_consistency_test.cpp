@@ -310,12 +310,13 @@ int main(int argc, char* argv[])
     // ── 创建引擎 ──
     nn::cli::EngineConfig cfg;
     cfg.use_gpu = use_gpu;
-    auto engine = nn::cli::create_engine(cfg, std::cout);
-    if (!engine)
+    auto engine_res = nn::cli::create_engine(cfg, std::cout);
+    if (!engine_res)
     {
-        std::cerr << "引擎创建失败\n";
+        std::cerr << "引擎创建失败: " << engine_res.error().message << "\n";
         return 1;
     }
+    auto engine = std::move(*engine_res);
 
     bool all_pass = true;
 

@@ -1,7 +1,6 @@
 ```
 # ==================== Build ====================
-build/
-build_rel/
+build*/
 *.o
 *.obj
 *.a
@@ -11,6 +10,7 @@ build_rel/
 *.dylib
 *.exe
 *.out
+*.pdb
 compile_commands.json
 
 # ==================== CMake ====================
