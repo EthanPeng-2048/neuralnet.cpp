@@ -358,6 +358,8 @@ void print_usage(const char *prog)
         << "  --checkpoint-every <n> 每 N 个 Transformer block 重算一次 forward\n"
         << "    (激活重计算，默认: 0=不启用)。1=每块都重算，显存收益最大，\n"
         << "    以约 1 次额外前向 FLOPs 为代价省去整层激活驻留。\n"
+        << "  --activation-offload  把每块激活搬 host-visible，backward 拷回\n"
+        << "    (不重算，FLOPs 保持 1.0×，代价是 PCIe 传输；与 --checkpoint-every 互斥)\n"
         << "  GPU 训练每 step 末尾自动归还完全空闲的内存池底材（L2 整块释放）。\n"
         << "\n"
         << "学习率调度:\n"
@@ -415,6 +417,9 @@ struct TrainConfig
 
     // 梯度检查点（激活重计算 L1）：每 N 个 GPTBlock 重算一次
     std::size_t checkpoint_every = 0;        // 0=不启用（默认），>0=每 N 个 block 重算
+
+    // activation offload（L1-offload）：把每块内部激活搬 host-visible，backward 拷回
+    bool activation_offload = false;         // false=不启用（默认）
 
     // 学习率调度
     std::string lr_schedule = "fixed";  // fixed / cosine / step_cosine
@@ -682,6 +687,10 @@ TrainConfig parse_args(int argc, char *argv[])
             if (!v) { std::cerr << "无效 --checkpoint-every: " << v.error().message << "\n"; std::exit(1); }
             cfg.checkpoint_every = *v;
         }
+        else if (arg == "--activation-offload")
+        {
+            cfg.activation_offload = true;
+        }
         else if (arg == "--test-file" && i + 1 < argc)
             cfg.test_path = argv[++i];
         else if (!arg.starts_with("--"))
@@ -930,6 +939,19 @@ int main(int argc, char *argv[])
     model.set_checkpoint_every(cfg.checkpoint_every);
     if (cfg.checkpoint_every > 0)
         std::cout << "梯度检查点已启用: 每 " << cfg.checkpoint_every << " 个 block 重算一次\n";
+
+    // ── 设置 activation offload（L1-offload） ──
+    // offload 与 checkpoint 互斥（offload 用 PCIe 换显存、不重算，更省计算）
+    if (cfg.activation_offload)
+    {
+        if (cfg.checkpoint_every > 0)
+        {
+            std::cout << "⚠ --activation-offload 与 --checkpoint-every 互斥，已禁用 checkpoint\n";
+            model.set_checkpoint_every(0);
+        }
+        model.set_activation_offload(true);
+        std::cout << "activation offload 已启用: 每块激活搬 host-visible，backward 拷回（不重算）\n";
+    }
 
     // ── 构建规格（用于保存） ─────────────────────────────────
     auto spec = nn::make_gpt_spec(
