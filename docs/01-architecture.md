@@ -174,11 +174,16 @@ class Tensor {
 
 | 文件 | 职责 |
 |------|------|
-| `expr_spec.hpp` | `ExprSpec` 逐元素表达式扁平 IR（纯数据结构，跨后端可序列化，GPU AOT 契约） |
-| `expr_dsl.hpp` | 统一表达式 DSL（`nn::dsl`）：编译期模板，普通数学写法；CPU 直接求值（内联+SIMD），GPU 经 `to_expr_spec` 折叠匹配 AOT shader |
-| `fused_exprs.hpp` | AOT 融合 shader 单一事实来源（`kGenInstances` 实例表 + `make_fused`），与 `dsl` 折叠结果一致（防漂移由 `expr_dsl_test` 断言） |
-| `eval_expr` | `ComputeEngine` 虚接口：CPU 编译期模板求值（经 `dsl::compute`）；Vulkan AOT 融合 shader（闭合世界，未命中硬报错，无 eager） |
-| `dsl::compute(engine, expr, rows, cols)` | 统一求值入口：CPU 走编译期模板；GPU 折叠成 `ExprSpec` 后走 `eval_expr` AOT 分发 |
+| `expr_spec.hpp` | `ExprSpec` 逐元素表达式扁平 IR（纯数据结构，跨后端可序列化，GPU AOT 契约）+ `expr_spec_key`（规范结构 key，AOT 收集/匹配依据） |
+| `expr_dsl.hpp` | 统一表达式 DSL（`nn::dsl`）：编译期模板，普通数学写法；CPU 直接求值（内联+SIMD）；GPU 经 `to_expr_spec` 折叠出 `ExprSpec` → 按 `expr_spec_key` 匹配预编译融合 shader。含 `start_expr/end_expr` 块式融合 |
+| `expr_registry.hpp` | 构建期表达式注册表（`scan_exprs` 收集折叠出的结构，按 key 去重；二进制 dump/load 供 `gen_fused` 消费） |
+| `fused_registry.hpp` | **生成物**（构建期 `gen_fused` 产出）：`key → {ExprSpec 结构, 内联 SPIR-V}` 融合 shader 注册表；运行时按 key 精确匹配 |
+| `tools/scan_exprs.cpp` | 构建期工具：dry-run 跑 Layer 的 forward/backward，收集内联表达式的结构（派生物）→ `expr_specs.bin` |
+| `tools/gen_fused.cpp` | 构建期工具：读 bin → `glsl_gen` → glslc → 内联 SPIR-V → `fused_registry.hpp` |
+| `eval_expr` | `ComputeEngine` 虚接口：CPU 编译期模板求值（经 `dsl::compute`）；Vulkan 按 `expr_spec_key` 查 `fused_registry`（闭合世界，未命中硬报错，无 eager、无运行时编译） |
+| `dsl::compute(engine, expr, rows, cols)` | 统一求值入口：CPU 走编译期模板；GPU 折叠成 `ExprSpec` → `eval_expr` 按 key AOT 分发 |
+
+> **AOT 收集原则**：表达式**文本只出现在 Layer**（内联写进 `forward/backward`）。构建期 `scan_exprs` dry-run 执行 Layer 代码触达它们，把折叠后的 `ExprSpec` 结构（派生物，非手写定义）收集进注册表；`gen_fused` 据此合成融合 shader 并内联进 `fused_registry.hpp`。运行时按 key 精确匹配 dispatch，最终程序自包含、无运行时编译器。
 
 ### L3 实现层
 

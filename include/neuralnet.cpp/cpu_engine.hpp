@@ -32,6 +32,10 @@ public:
     [[nodiscard]] Result<void> end_batch() override { return {}; }
     [[nodiscard]] Result<void> flush_batch() override { return {}; }
 
+    // ── 表达式录制：CPU 为 no-op（各表达式直接求值，行为不变） ──────────
+    [[nodiscard]] Result<void> begin_expr() override { return {}; }
+    [[nodiscard]] Result<void> end_expr() override { return {}; }
+
     // ── 张量工厂 ──────────────────────────────────────────────────────────
     [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols) override
     {
@@ -705,6 +709,11 @@ public:
             {
             default:
             case static_cast<uint8_t>(ExprViewKind::Linear):
+            case static_cast<uint8_t>(ExprViewKind::ColReduceSum):
+            case static_cast<uint8_t>(ExprViewKind::ColReduceMax):
+            case static_cast<uint8_t>(ExprViewKind::RowReduceSum):
+            case static_cast<uint8_t>(ExprViewKind::RowReduceMax):
+                // 归约视图：对该输入按行/按列归约出标量向量，输入形状与输出一致
                 if (t.rows() != rows)
                     return std::unexpected(Error{"eval_expr: Linear input rows mismatch"});
                 break;
@@ -726,7 +735,39 @@ public:
         if (n == 0)
             return Tensor::from_matrix(std::move(result));
 
-        // 视图求值：按 (row, col) 映射到输入 span 的元素
+        // ── 归约视图预计算：每行/每列一个标量，供广播读取 ──────────────
+        // 仅在 views[k] 为归约视图时填充 view_reduce[k]（长度 rows 或 cols）。
+        std::vector<std::vector<Scalar>> view_reduce(inputs.size());
+        for (std::size_t k = 0; k < inputs.size(); ++k)
+        {
+            const ExprView& v = spec.views[k];
+            if (!expr_view_is_reduce(static_cast<ExprViewKind>(v.kind)))
+                continue;
+            const bool is_row = expr_view_reduces_rows(static_cast<ExprViewKind>(v.kind));
+            const bool is_max =
+                (v.kind == static_cast<uint8_t>(ExprViewKind::RowReduceMax) ||
+                 v.kind == static_cast<uint8_t>(ExprViewKind::ColReduceMax));
+            const ConstSpan& s = spans[k];
+            const std::size_t len = is_row ? rows : cols;
+            std::vector<Scalar>& acc = view_reduce[k];
+            acc.assign(len, is_max ? std::numeric_limits<Scalar>::lowest() : Scalar{0});
+            if (is_row)
+            {
+                for (std::size_t r = 0; r < rows; ++r)
+                    for (std::size_t c = 0; c < cols; ++c)
+                        acc[r] = is_max ? std::max(acc[r], s[r * cols + c])
+                                        : acc[r] + s[r * cols + c];
+            }
+            else
+            {
+                for (std::size_t c = 0; c < cols; ++c)
+                    for (std::size_t r = 0; r < rows; ++r)
+                        acc[c] = is_max ? std::max(acc[c], s[r * cols + c])
+                                        : acc[c] + s[r * cols + c];
+            }
+        }
+
+        // 视图求值：按 (row, col) 映射到输入 span（归约视图读取预计算标量向量）
         auto read_input = [&](std::size_t k, std::size_t r, std::size_t c) -> Scalar
         {
             const ExprView& v = spec.views[k];
@@ -749,14 +790,121 @@ public:
             }
             case static_cast<uint8_t>(ExprViewKind::RowMod):
                 return s[(r % v.param) * cols + c];
+            case static_cast<uint8_t>(ExprViewKind::RowReduceSum):
+            case static_cast<uint8_t>(ExprViewKind::RowReduceMax):
+                return view_reduce[k][r];
+            case static_cast<uint8_t>(ExprViewKind::ColReduceSum):
+            case static_cast<uint8_t>(ExprViewKind::ColReduceMax):
+                return view_reduce[k][c];
             }
         };
 
-        // 逐元素解释执行
+        // ── 归约指令预计算 ──────────────────────────────────────────────
+        // 归约指令 dst 是隐式"每行/每列一个标量"的向量，存于 reduce_vec[dst]；
+        // reduce_axis[dst]：1=按列归约 (1,cols)，0=按行归约 (rows,1)。
+        // 按指令序处理：处理第 ri 条归约指令时，其源操作数（含转递依赖）引用的
+        // 更早归约指令向量已完整——指令序保证拓扑依赖成立。
+        std::vector<std::vector<Scalar>> reduce_vec(EXPR_MAX_REGS);
+        std::vector<std::uint8_t> reduce_axis(EXPR_MAX_REGS, 0);
+
+        for (std::size_t ri = 0; ri < spec.instrs.size(); ++ri)
+        {
+            const ExprInstr& R = spec.instrs[ri];
+            const ExprOp rop = static_cast<ExprOp>(R.op);
+            if (!expr_op_is_reduce(rop))
+                continue;
+
+            const bool is_col = expr_op_reduces_cols(rop);
+            const bool is_max = (rop == ExprOp::ColMax || rop == ExprOp::RowMax);
+            reduce_axis[R.dst] = is_col ? std::uint8_t{1} : std::uint8_t{0};
+
+            std::vector<Scalar>& acc = reduce_vec[R.dst];
+            acc.assign(is_col ? cols : rows,
+                       is_max ? std::numeric_limits<Scalar>::lowest() : Scalar{0});
+
+            // 逐元素重放 [0, ri) 前缀（跳过归约指令，Reduce 操作数读已完整向量），
+            // 求 R.a 的值并累加——归约指令的源允许引用更早归约结果。
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                const std::size_t r = i / cols;
+                const std::size_t c = i % cols;
+
+                Scalar regs[EXPR_MAX_REGS] = {};
+                const auto eval_op = [&](const ExprOperand& op) -> Scalar
+                {
+                    switch (op.kind)
+                    {
+                    default:
+                    case static_cast<uint8_t>(ExprOperandKind::Reg):
+                    case static_cast<uint8_t>(ExprOperandKind::Fanout): return regs[op.idx];
+                    case static_cast<uint8_t>(ExprOperandKind::Const): return spec.consts[op.idx];
+                    case static_cast<uint8_t>(ExprOperandKind::Input): return read_input(op.idx, r, c);
+                    case static_cast<uint8_t>(ExprOperandKind::Reduce):
+                        return reduce_vec[op.idx][reduce_axis[op.idx] ? c : r];
+                    }
+                };
+
+                for (std::size_t j = 0; j < ri; ++j)
+                {
+                    const ExprInstr& J = spec.instrs[j];
+                    if (expr_op_is_reduce(static_cast<ExprOp>(J.op)))
+                        continue;  // 归约指令已在上方处理中完整计算
+                    const Scalar va = eval_op(J.a);
+                    const ExprOp op = static_cast<ExprOp>(J.op);
+                    switch (op)
+                    {
+                    // 一元
+                    case ExprOp::Neg:   regs[J.dst] = -va; break;
+                    case ExprOp::Exp:   regs[J.dst] = std::exp(va); break;
+                    case ExprOp::Log:   regs[J.dst] = std::log(va); break;
+                    case ExprOp::Sqrt:  regs[J.dst] = std::sqrt(va); break;
+                    case ExprOp::Rsqrt: regs[J.dst] = Scalar{1} / std::sqrt(va); break;
+                    case ExprOp::Abs:   regs[J.dst] = std::abs(va); break;
+                    case ExprOp::Tanh:  regs[J.dst] = std::tanh(va); break;
+                    // 二元
+                    case ExprOp::Add:   regs[J.dst] = va + eval_op(J.b); break;
+                    case ExprOp::Sub:   regs[J.dst] = va - eval_op(J.b); break;
+                    case ExprOp::Mul:   regs[J.dst] = va * eval_op(J.b); break;
+                    case ExprOp::Div:   regs[J.dst] = va / eval_op(J.b); break;
+                    case ExprOp::Max:   regs[J.dst] = std::max(va, eval_op(J.b)); break;
+                    case ExprOp::Min:   regs[J.dst] = std::min(va, eval_op(J.b)); break;
+                    // 比较（输出 1.0 / 0.0）
+                    case ExprOp::Lt:    regs[J.dst] = (va <  eval_op(J.b)) ? Scalar{1} : Scalar{0}; break;
+                    case ExprOp::Le:    regs[J.dst] = (va <= eval_op(J.b)) ? Scalar{1} : Scalar{0}; break;
+                    case ExprOp::Gt:    regs[J.dst] = (va >  eval_op(J.b)) ? Scalar{1} : Scalar{0}; break;
+                    case ExprOp::Ge:    regs[J.dst] = (va >= eval_op(J.b)) ? Scalar{1} : Scalar{0}; break;
+                    case ExprOp::Eq:    regs[J.dst] = (va == eval_op(J.b)) ? Scalar{1} : Scalar{0}; break;
+                    case ExprOp::Ne:    regs[J.dst] = (va != eval_op(J.b)) ? Scalar{1} : Scalar{0}; break;
+                    // 选择
+                    case ExprOp::Select: regs[J.dst] = (va != Scalar{0}) ? eval_op(J.b) : eval_op(J.c); break;
+                    default: break;  // 归约指令已在 continue 中跳过
+                    }
+                }
+
+                const Scalar v = eval_op(R.a);
+                if (is_col)
+                    acc[c] = is_max ? std::max(acc[c], v) : acc[c] + v;
+                else
+                    acc[r] = is_max ? std::max(acc[r], v) : acc[r] + v;
+            }
+        }
+
+        // ── 逐元素解释执行（主循环） ────────────────────────────────────
+        // 归约指令已预计算；主循环跳过它们，Reduce 操作数读 reduce_vec 广播。
+        const ExprInstr& last = spec.instrs.back();
+        const bool last_is_reduce = expr_op_is_reduce(static_cast<ExprOp>(last.op));
+
         for (std::size_t i = 0; i < n; ++i)
         {
             const std::size_t r = i / cols;
             const std::size_t c = i % cols;
+
+            if (last_is_reduce)
+            {
+                // 输出本身就是归约向量 → 广播到 (rows, cols)
+                out[i] = reduce_vec[last.dst][reduce_axis[last.dst] ? c : r];
+                continue;
+            }
 
             Scalar regs[EXPR_MAX_REGS] = {};
             const auto eval_op = [&](const ExprOperand& op) -> Scalar
@@ -768,11 +916,15 @@ public:
                 case static_cast<uint8_t>(ExprOperandKind::Fanout): return regs[op.idx];
                 case static_cast<uint8_t>(ExprOperandKind::Const): return spec.consts[op.idx];
                 case static_cast<uint8_t>(ExprOperandKind::Input): return read_input(op.idx, r, c);
+                case static_cast<uint8_t>(ExprOperandKind::Reduce):
+                    return reduce_vec[op.idx][reduce_axis[op.idx] ? c : r];
                 }
             };
 
             for (const auto& ins : spec.instrs)
             {
+                if (expr_op_is_reduce(static_cast<ExprOp>(ins.op)))
+                    continue;  // 归约指令已预计算（隐式向量，不经寄存器）
                 const Scalar va = eval_op(ins.a);
                 const ExprOp op = static_cast<ExprOp>(ins.op);
                 switch (op)
@@ -801,9 +953,10 @@ public:
                 case ExprOp::Ne:    regs[ins.dst] = (va != eval_op(ins.b)) ? Scalar{1} : Scalar{0}; break;
                 // 选择
                 case ExprOp::Select: regs[ins.dst] = (va != Scalar{0}) ? eval_op(ins.b) : eval_op(ins.c); break;
+                default: break;  // 归约指令已在上方 continue 跳过
                 }
             }
-            out[i] = regs[spec.instrs.back().dst];
+            out[i] = regs[last.dst];
         }
 
         return Tensor::from_matrix(std::move(result));

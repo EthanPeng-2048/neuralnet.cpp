@@ -30,7 +30,6 @@
 #include "compute_engine.hpp"
 #include "tensor.hpp"
 #include "model_spec.hpp"
-#include "fused_exprs.hpp"
 #include "expr_dsl.hpp"
 
 namespace nn
@@ -430,14 +429,19 @@ public:
         const std::size_t rows = d_ff_;
         const std::size_t cols = grad_output.cols();
 
-        // ── 统一表达式 DSL（编译期融合；CPU 单次遍历 + SIMD）──
+        // ── 统一表达式 DSL（内联数学式，融合；CPU 单次遍历 + SIMD）──
         //   grad_gate = grad_out ⊙ up ⊙ s ⊙ (1 + gate ⊙ (1 − s))
         //   grad_up   = grad_out ⊙ gate ⊙ s
-        auto grad_gate = dsl::compute(engine, dsl::make_swiglu_grad_gate(
-            grad_output, sigmoid_cache_, gate_cache_, up_cache_), rows, cols);
+        const nn::Scalar one{1};
+        auto grad_gate = dsl::compute(engine,
+            dsl::leaf(grad_output) * dsl::leaf(up_cache_)
+              * (dsl::leaf(sigmoid_cache_)
+                 * (one + dsl::leaf(gate_cache_) * (one - dsl::leaf(sigmoid_cache_)))),
+            rows, cols);
         if (!grad_gate) return std::unexpected(grad_gate.error());
-        auto grad_up = dsl::compute(engine, dsl::make_swiglu_grad_up(
-            grad_output, sigmoid_cache_, gate_cache_), rows, cols);
+        auto grad_up = dsl::compute(engine,
+            dsl::leaf(grad_output) * dsl::leaf(gate_cache_) * dsl::leaf(sigmoid_cache_),
+            rows, cols);
         if (!grad_up) return std::unexpected(grad_up.error());
 
         // 合并：grad_input = (grad_gate; grad_up) → (2*d_ff, batch)
@@ -947,10 +951,9 @@ private:
         seq_cached_ = seq;
     }
 
-    // 构造 RoPE 表达式（forward 用 Add 结尾，backward 用 Sub 结尾）
-    // 单一事实来源：定义见 fused_exprs.hpp（nn::fused::make_rope），
-    // 运行时与构建期生成器（tools/gen_fused）共用同一份 C++ 定义。
-    // [[nodiscard]] ExprSpec make_expr(bool backward) const  ← 已移除，复用 fused
+    // 构造 RoPE 内联表达式（forward 用 Add 结尾，backward 用 Sub 结尾）
+    // 表达式文本只写在本 Layer（apply/apply_step），AOT 收集（scan_exprs）
+    // 用同一段代码 dry-run 折叠出结构并合成融合 shader——绝不漂移。
 
 public:
     RotaryEmbedding() = default;
@@ -971,9 +974,18 @@ public:
         if (seq != seq_cached_)
             rebuild(engine, seq);
         const std::uint32_t dk = static_cast<std::uint32_t>(d_k_);
+        // 内联 RoPE 表达式（LLaMA half-swap；backward 为旋转正交，逆 = 反角）：
+        //   forward:  out = q·cos + rotate_half(q)·sin
+        //   backward: out = q·cos − rotate_half(q)·sin
         if (backward)
-            return dsl::compute(engine, dsl::make_rope<true>(q, cos_cache_, sin_cache_, dk), q.rows(), q.cols());
-        return dsl::compute(engine, dsl::make_rope<false>(q, cos_cache_, sin_cache_, dk), q.rows(), q.cols());
+            return dsl::compute(engine,
+                dsl::leaf(q) * dsl::row_mod(cos_cache_, dk)
+                - dsl::rotate_half(q, dk) * dsl::row_mod(sin_cache_, dk),
+                q.rows(), q.cols());
+        return dsl::compute(engine,
+            dsl::leaf(q) * dsl::row_mod(cos_cache_, dk)
+            + dsl::rotate_half(q, dk) * dsl::row_mod(sin_cache_, dk),
+            q.rows(), q.cols());
     }
 
     // 增量推理：q 为 (H*d_k, 1)，位置 = pos（cur_len）
@@ -991,8 +1003,14 @@ public:
         if (!sr) return std::unexpected(sr.error());
         const std::uint32_t dk = static_cast<std::uint32_t>(d_k_);
         if (backward)
-            return dsl::compute(engine, dsl::make_rope<true>(q, *cr, *sr, dk), q.rows(), q.cols());
-        return dsl::compute(engine, dsl::make_rope<false>(q, *cr, *sr, dk), q.rows(), q.cols());
+            return dsl::compute(engine,
+                dsl::leaf(q) * dsl::row_mod(*cr, dk)
+                - dsl::rotate_half(q, dk) * dsl::row_mod(*sr, dk),
+                q.rows(), q.cols());
+        return dsl::compute(engine,
+            dsl::leaf(q) * dsl::row_mod(*cr, dk)
+            + dsl::rotate_half(q, dk) * dsl::row_mod(*sr, dk),
+            q.rows(), q.cols());
     }
 };
 
