@@ -214,14 +214,13 @@ public:
     // 解决大词表（vocab_size≈25k）+ 大 batch 时 one-hot 矩阵
     // (vocab_size, total_tokens) 爆显存的问题。
     //
-    // M5 融合路径（默认）：
+    // M5 融合路径（唯一路径，不做旧路径回退）：
     //   1. 上传 labels / loss_mask 为 (1, total) 浮点张量（小传输）
     //   2. col_softmax_sparse_forward 单 kernel：列内 max + denom + 稠密梯度
     //      + 标签位置 log_softmax（loss_vec）——不物化 (classes, total) 全 softmax
     //   3. loss = -(1/num_valid)·Σ loss_vec（下载标量）
-    // 正确性回退（保留旧路径）：GPU 上算 softmax → 下载 CPU → CPU 算 loss/grad
-    //   → 上传。当融合原语不可用（如 vocab_size>2^24 浮点标签不可精确表示）
-    //   时自动回退，保证数值一致。
+    // 融合原语不可用（如 CUDA 未对齐返回"未实现"、vocab_size>2^24 浮点标签
+    // 不可精确表示）时**直接报错**，绝不静默回退旧路径（保持"硬报错、不降级"）。
     //
     // 参数：
     //   labels     — 平坦标签数组，大小 = logits.cols()，值域 [0, vocab_size)
@@ -244,11 +243,8 @@ public:
         if (classes == 0 || total == 0)
             return std::unexpected(Error{"sparse CE: empty input"});
 
-        // ── M5 融合路径（默认；不物化全 softmax） ──
-        auto fused = fused_forward_sparse_(engine, logits, labels, loss_mask, vocab_size);
-        if (fused) return *fused;
-        // 融合不可用 → 回退旧路径（下载 softmax 到 CPU，正确性安全网）
-        return fallback_forward_sparse_(engine, logits, labels, loss_mask, vocab_size);
+        // ── M5 融合路径（不物化全 softmax；失败直接透传错误，不回退） ──
+        return fused_forward_sparse_(engine, logits, labels, loss_mask, vocab_size);
     }
 
     // ── M5 融合路径实现（单 kernel：col_max + denom + 稠密梯度 + loss_vec） ──
@@ -310,92 +306,6 @@ public:
         return (num_valid > 0)
             ? -m->at_unchecked(0, 0) / static_cast<Scalar>(num_valid)
             : Scalar{0};
-    }
-
-    // ── 旧路径（正确性回退）：GPU softmax → 下载 CPU → CPU loss/grad → 上传 ──
-    [[nodiscard]] Result<Scalar> fallback_forward_sparse_(
-        ComputeEngine& engine, const Tensor& logits,
-        std::span<const std::size_t> labels,
-        std::span<const Scalar> loss_mask,
-        std::size_t vocab_size)
-    {
-        // ── 1. GPU 上计算 softmax（与 dense forward 共用 softmax_cols_） ──
-        auto softmax_t = softmax_cols_(engine, logits);
-        if (!softmax_t) return std::unexpected(softmax_t.error());
-
-        // ── 2. 下载 softmax 到 CPU ────────────────────────────────
-        auto softmax_cpu = engine.to_matrix(*softmax_t);
-        if (!softmax_cpu) return std::unexpected(softmax_cpu.error());
-
-        // softmax_t 现在可以释放
-        softmax_t = Tensor();
-
-        // ── 3. CPU 上计算 loss 和 gradient ────────────────────────
-        const std::size_t rows = softmax_cpu->rows();
-        const std::size_t cols = softmax_cpu->cols();
-
-        // gradient 拷贝 softmax（后面只修改稀疏位置）
-        Matrix grad_cpu(*softmax_cpu);
-
-        Scalar loss_sum = 0.0;
-        std::size_t num_valid = 0;
-        const bool use_mask = !loss_mask.empty();
-
-        for (std::size_t i = 0; i < cols; ++i)
-        {
-            // mask 检查
-            if (use_mask && loss_mask[i] < Scalar{0.5})
-            {
-                // 被 mask 的位置：gradient 整列清零
-                for (std::size_t c = 0; c < rows; ++c)
-                    grad_cpu.set_value_unchecked(c, i, 0.0);
-                continue;
-            }
-
-            const std::size_t lbl = labels[i];
-            if (lbl >= vocab_size)
-            {
-                // 越界标签：跳过 loss，gradient 整列清零
-                for (std::size_t c = 0; c < rows; ++c)
-                    grad_cpu.set_value_unchecked(c, i, 0.0);
-                continue;
-            }
-
-            // loss += log(softmax[lbl, i])
-            const Scalar sm_val = softmax_cpu->at_unchecked(lbl, i);
-            loss_sum += std::log(std::max(sm_val, Scalar{1e-20}));
-            ++num_valid;
-
-            // gradient: softmax[lbl, i] -= 1.0（softmax - one_hot 的稀疏等价）
-            grad_cpu.set_value_unchecked(lbl, i, sm_val - Scalar{1});
-        }
-
-        // 除以有效 token 数（而非 total），避免 padding 拉低 loss 报告值
-        const Scalar loss = (num_valid > 0)
-            ? -loss_sum / static_cast<Scalar>(num_valid)
-            : Scalar{0};
-
-        // ── 3.5 梯度归一化：与 PyTorch 一致，grad = (softmax - one_hot) / num_valid ──
-        // 之前缺少 1/num_valid 缩放，导致梯度被整体放大 num_valid 倍。
-        // 由于 loss = -Σ log_softmax / num_valid，故
-        //   d(loss)/d(logits) = (softmax - one_hot) / num_valid（有效位置），
-        //   mask 位置/越界标签位置梯度为 0（缩放 0 仍为 0，安全）。
-        // 对 Adam 而言，梯度常数缩放会被二阶矩归一化抵消（曲线不变），
-        // 但对 SGD/动量、梯度裁剪 --max-norm 以及 --grad-log 统计，
-        // 缺少该缩放会导致与 PyTorch 行为不一致。
-        if (num_valid > 0)
-        {
-            const Scalar inv_num_valid = Scalar{1} / static_cast<Scalar>(num_valid);
-            auto grad_span = grad_cpu.span();
-            for (auto& val : grad_span) val *= inv_num_valid;
-        }
-
-        // ── 4. 上传 gradient 到 GPU ──────────────────────────────
-        auto grad_tensor_r = engine.from_matrix(grad_cpu);
-        if (!grad_tensor_r) return std::unexpected(grad_tensor_r.error());
-
-        grad_input_ = std::move(*grad_tensor_r);
-        return loss;
     }
 };
 

@@ -108,8 +108,9 @@ int main(int argc, char* argv[])
         else if (arg == "--cuda") ecfg.use_cuda = true;
         else { std::cerr << "未知参数: " << arg << "\n"; return 1; }
     }
-    auto engine = nn::cli::create_engine(ecfg, std::cout);
-    if (!engine) { std::cerr << "引擎创建失败\n"; return 1; }
+    auto engine_res = nn::cli::create_engine(ecfg, std::cout);
+    if (!engine_res) { std::cerr << "引擎创建失败: " << engine_res.error().message << "\n"; return 1; }
+    auto engine = std::move(*engine_res);
     ComputeEngine& eng = *engine;
 
     std::cout << "========================================\n";

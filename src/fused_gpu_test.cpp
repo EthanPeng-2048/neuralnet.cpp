@@ -230,10 +230,10 @@ int run_norm(const char* name, CpuEngine& cpu, GpuEngine& gpu)
     return (ok_f && ok_b) ? 0 : 1;
 }
 
-// ── 优雅回退：未扫描表达式 → CPU 求值（正确性兜底） ────────────────────
-// 构造一个任何 Layer 都不使用的表达式（x*y + 3），其 key 不在融合注册表，
-// GPU eval_expr 应回退 CPU 求值并返回与 CPU 模板求值一致的结果。
-// （首次会打印一次性 [GpuEngine] 警告，属预期。）
+// ── 闭合世界：未扫描表达式 → GPU 硬报错（绝不静默回退） ─────────────────
+// 构造一个任何 Layer 都不使用的表达式（x*y + 3），其 key 不在融合注册表。
+// 项目哲学：GPU eval_expr 未命中**硬报错**，不静默回退 CPU（expr_dsl.hpp
+// "GPU 直接硬报错，绝不静默回退"）。本用例断言 GPU 侧必须返回错误。
 int run_fallback(CpuEngine& cpu, GpuEngine& gpu)
 {
     std::mt19937 rng(42);
@@ -246,22 +246,18 @@ int run_fallback(CpuEngine& cpu, GpuEngine& gpu)
     const Tensor yt = Tensor::from_matrix(Matrix(y));
     const nn::Scalar three{3};
 
+    // CPU 求值正常（模板路径）
     auto cr = nn::dsl::compute(cpu,
         nn::dsl::leaf(xt) * nn::dsl::leaf(yt) + three, R, C);
+    if (!cr) { std::cerr << "  CPU 求值失败: " << cr.error().message << "\n"; return 1; }
+
+    // 未扫描表达式在 GPU 上必须**硬报错**（闭合世界，绝不静默回退）
     auto gr = nn::dsl::compute(gpu,
         nn::dsl::leaf(xt) * nn::dsl::leaf(yt) + three, R, C);
-    if (!cr) { std::cerr << "  CPU 求值失败: " << cr.error().message << "\n"; return 1; }
-    if (!gr)
-    {
-        std::cerr << "  回退失败: " << gr.error().message << "\n";
-        return 1;
-    }
-    auto dm = gpu.to_matrix(*gr);
-    if (!dm) { std::cerr << "  下载失败\n"; return 1; }
-    const Scalar err = max_abs_diff(*dm, cr->cpu_matrix());
-    const bool ok = err < 1e-5f;
-    std::cout << "[" << (ok ? "PASS" : "FAIL") << "] fallback (未扫描表达式 → CPU 回退)"
-              << "  err=" << std::scientific << std::setprecision(2) << err << "\n";
+    const bool ok = !gr;
+    if (!ok)
+        std::cerr << "  未扫描表达式在 GPU 上未报错（应硬报错而非静默回退/成功）\n";
+    std::cout << "[" << (ok ? "PASS" : "FAIL") << "] 未扫描表达式 → GPU 硬报错（不静默回退）\n";
     return ok ? 0 : 1;
 }
 

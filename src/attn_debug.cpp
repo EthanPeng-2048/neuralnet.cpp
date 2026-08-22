@@ -157,8 +157,9 @@ void cmp(const std::string& name, const Matrix& got, const Matrix& ref)
 int main()
 {
     nn::cli::EngineConfig ecfg;
-    auto engine = nn::cli::create_engine(ecfg, std::cout);
-    if (!engine) { std::cerr << "引擎创建失败\n"; return 1; }
+    auto engine_res = nn::cli::create_engine(ecfg, std::cout);
+    if (!engine_res) { std::cerr << "引擎创建失败: " << engine_res.error().message << "\n"; return 1; }
+    auto engine = std::move(*engine_res);
     ComputeEngine& eng = *engine;
 
     const std::size_t d_model = 16;
