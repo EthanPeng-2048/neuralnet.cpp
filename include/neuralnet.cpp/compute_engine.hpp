@@ -142,6 +142,28 @@ public:
         return handle.reshape(rows, cols);
     }
 
+    // ── activation offload slab（L1-offload，持久复用缓冲） ────────────
+    // 每个 GPTBlock 持有一块持久 host-visible slab，所有激活按 float 偏移
+    // 写入/读出，跨 step 复用 → RAM = 激活实际体积（避免每 tensor 独立
+    // 128MB 块导致的碎片膨胀）。CPU 引擎 no-op。
+    [[nodiscard]] virtual Result<Tensor> create_offload_buffer(std::size_t /*bytes*/)
+    {
+        return Tensor::cpu(1, 1);
+    }
+    // 把 src 复制到 buffer 的 offset（float 单位）处
+    [[nodiscard]] virtual Result<void> offload_save(
+        const Tensor& /*buffer*/, std::size_t /*offset*/, const Tensor& /*src*/)
+    {
+        return {};
+    }
+    // 从 buffer 的 offset（float 单位）处复制 rows×cols 到新 GPU tensor
+    [[nodiscard]] virtual Result<Tensor> offload_restore(
+        const Tensor& /*buffer*/, std::size_t /*offset*/,
+        std::size_t /*rows*/, std::size_t /*cols*/)
+    {
+        return Tensor::cpu(1, 1);
+    }
+
     // ── 张量工厂 ──────────────────────────────────────────────────────────
     [[nodiscard]] virtual Tensor create_tensor(std::size_t rows, std::size_t cols) = 0;
     [[nodiscard]] virtual Result<Tensor> from_matrix(const Matrix& m) = 0;
