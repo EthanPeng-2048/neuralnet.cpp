@@ -43,6 +43,11 @@ public:
     static constexpr VkDeviceSize HOST_VISIBLE_FRACTION = 16;
     // 动态计算 staging 大小的下限，避免小显存机器分配过小
     static constexpr VkDeviceSize MIN_REGION_SIZE = 32ull * 1024 * 1024;
+    // 动态计算 staging 大小的上限（借鉴 llama.cpp 按需小 staging）：
+    // 大上传/下载已由分块逻辑（每块 ≤ region）自动切分，故 staging 无需按
+    // 整机 host heap 的 1/16 常驻（V100 上曾达 2×2GB=4GB host 预算）。
+    // 封顶 256MB/region → 2 regions 共 512MB，共享显存架构下大幅释放预算。
+    static constexpr VkDeviceSize MAX_REGION_SIZE = 256ull * 1024 * 1024;
 
 private:
     // Staging region 内部结构（外部通过索引访问，无需直接使用此类型）
@@ -77,7 +82,9 @@ public:
         cmd_pool_ = cmd_pool;
         pool_.reset(&pool);
 
-        // 动态计算 Staging 大小：取 host-visible 显存的 1/16，下限 32MB
+        // 动态计算 Staging 大小：取 host-visible 显存的 1/16，
+        // 夹在 [MIN_REGION_SIZE, MAX_REGION_SIZE] 之间（下限防过小、
+        // 上限防大内存机器预占整块 host 预算；超大传输自动分块）。
         // 用户传入的 region_size 作为额外参考（取两者中较大值）。
         VkPhysicalDeviceMemoryProperties mem_props;
         vkGetPhysicalDeviceMemoryProperties(physical_device, &mem_props);
@@ -93,11 +100,10 @@ public:
         }
 
         VkDeviceSize calculated_size = max_host_visible / HOST_VISIBLE_FRACTION;
-        if (calculated_size < MIN_REGION_SIZE)
-            calculated_size = MIN_REGION_SIZE;
+        calculated_size = std::clamp(calculated_size, MIN_REGION_SIZE, MAX_REGION_SIZE);
 
         // 最终取 用户请求值 与 动态计算值 的较大者
-        // （不再人为封顶 64MB，避免大 batch / 大 vocab 时上传失败）
+        // （上限已封顶，避免小显存机器被 staging 占满预算）
         region_size_ = std::max(
             static_cast<VkDeviceSize>(region_size), calculated_size);
 

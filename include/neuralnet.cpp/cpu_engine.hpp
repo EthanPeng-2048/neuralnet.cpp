@@ -15,6 +15,7 @@
 #include "compute_engine.hpp"
 #include "algebra_compute.hpp"
 #include "algebra_expr.hpp"
+#include "expr_opt.hpp"
 
 namespace nn
 {
@@ -1323,10 +1324,15 @@ public:
 
     // ── eval_expr / eval_expr_reduce 共用实现 ────────────────────────────
     [[nodiscard]] Result<Tensor> eval_expr_impl(
-        const ExprSpec& spec,
+        const ExprSpec& raw_spec,
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols, bool vector_out)
     {
+        // canonical IR：canonicalize 为引擎内部优化（IR-A/IR-B），Layer 无感知；
+        // 结构统一在 canonical 形态上，与 scan/gen_fused 两端一致。
+        if (auto v = validate_expr_spec(raw_spec, inputs.size()); !v)
+            return std::unexpected(v.error());
+        const ExprSpec spec = canonicalize_expr_spec(raw_spec);
         if (auto v = validate_expr_spec(spec, inputs.size()); !v)
             return std::unexpected(v.error());
         if (spec.instrs.empty())

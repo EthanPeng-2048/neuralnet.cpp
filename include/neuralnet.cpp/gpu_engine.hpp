@@ -36,6 +36,7 @@
 #include <string>
 
 #include "compute_engine.hpp"
+#include "expr_opt.hpp"
 #if __has_include("fused_registry.hpp")
 #include "fused_registry.hpp"
 #endif
@@ -1016,10 +1017,13 @@ public:
     // ══════════════════════════════════════════════════════════════════════
 
     [[nodiscard]] Result<Tensor> eval_expr(
-        const ExprSpec& spec,
+        const ExprSpec& raw_spec,
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols) override
     {
+        // ── canonical IR：canonicalize 为引擎内部优化（IR-A/IR-B），
+        //    key 与 shader 合成两端一致；dispatch 用 canonical 的 consts ──
+        const ExprSpec spec = nn::canonicalize_expr_spec(raw_spec);
         // ── AOT 匹配：按规范结构 key 查预编译融合 shader ──────────────
         const std::string key = nn::expr_spec_key(spec);
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
@@ -1057,10 +1061,12 @@ public:
     // 与 eval_expr 相同，但以 vector_out=1 调度归约融合 shader（thread 0 写
     // (rows,1)/(1,cols) 归约向量，不写全尺寸广播）。
     [[nodiscard]] Result<Tensor> eval_expr_reduce(
-        const ExprSpec& spec,
+        const ExprSpec& raw_spec,
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols) override
     {
+        // canonical IR：与 eval_expr 同（canonicalize 为引擎内部优化）
+        const ExprSpec spec = nn::canonicalize_expr_spec(raw_spec);
         const std::string key = nn::expr_spec_key(spec);
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
         const nn::fused::FusedShader* fs = nn::fused::find_fused(key);

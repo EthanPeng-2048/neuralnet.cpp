@@ -620,6 +620,11 @@ public:
     // 创建 Host Visible 缓冲区（activation offload 存储）
     // 数据驻留在主机可见内存（通常 = RAM），从 device-local VRAM 的角度
     // 释放显存；GPU↔host 之间通过 vkCmdCopyBuffer 中转。
+    //
+    // 内存类型选择（借鉴 llama.cpp UMA 分支）：优先 DEVICE_LOCAL|HOST_VISIBLE|
+    // HOST_COHERENT ——共享显存/UMA 架构（iGPU/APU）下 slab 直接落在统一内存
+    // 池，CPU 可映射且 GPU 直读，无需 PCIe 中转；独显无该组合类型时回退到
+    // 纯 HOST_VISIBLE（系统 RAM），行为与旧路径一致。
     [[nodiscard]] static Result<GpuBuffer> create_host_visible(
         VkDevice device, MemoryPool& pool,
         std::size_t elem_count, VkBufferUsageFlags usage)
@@ -638,11 +643,12 @@ public:
         VkMemoryRequirements mem_reqs;
         vkGetBufferMemoryRequirements(device, buffer, &mem_reqs);
 
-        // 优先 HOST_VISIBLE|HOST_COHERENT，回退 HOST_VISIBLE
+        // 优先 DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT（UMA/共享显存），
+        // 回退 HOST_VISIBLE|HOST_COHERENT（独显：slab 在系统 RAM）
         auto alloc_r = pool.allocate(
             mem_reqs,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         if (!alloc_r)
         {
             vkDestroyBuffer(device, buffer, nullptr);
@@ -2412,9 +2418,15 @@ public:
         vkCmdPushConstants(cmd, pipeline.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
 
-        // Dispatch
-        const uint32_t wg_x = (N + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
-        const uint32_t wg_y = (M + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+        // Dispatch：按 shader 输出块尺寸计算工作组数
+        //   matmul.comp（naive）：16×16 线程网格 = 16×16 输出块
+        //   matmul_tiled.comp：64×64 输出块（BM/BN）
+        // ⚠ 曾误用 WORKGROUP_SIZE=16 统一计算 → tiled 版 dispatch 出 16 倍
+        // 冗余工作组（每 16×16 一个组而非 64×64），GPU 做 16 倍无效计算，
+        // matmul 峰值只剩 ~4%（0.7/15.7 TFLOPS）。此处按实际块尺寸修复。
+        const uint32_t tile = use_tiled ? 64u : 16u;
+        const uint32_t wg_x = (N + tile - 1u) / tile;
+        const uint32_t wg_y = (M + tile - 1u) / tile;
         vkCmdDispatch(cmd, wg_x, wg_y, 1);
 
         // 输出屏障

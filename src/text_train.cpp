@@ -547,13 +547,13 @@ TrainConfig parse_args(int argc, char *argv[])
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
             if (!v) { std::cerr << "无效 --log-interval: " << v.error().message << "\n"; std::exit(1); }
-            cfg.log_interval = *v;
+            cfg.log_interval = std::max<std::size_t>(1, *v);  // 0 → 1，避免步进 % 0 除零
         }
         else if (arg == "--save-interval" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
             if (!v) { std::cerr << "无效 --save-interval: " << v.error().message << "\n"; std::exit(1); }
-            cfg.save_interval = *v;
+            cfg.save_interval = *v;  // 0 = 禁用保存（下方 % 前有 >0 保护）
         }
         else if (arg == "--gpu")
             cfg.gpu_enabled = true;
@@ -945,7 +945,8 @@ int main(int argc, char *argv[])
         std::cout << "梯度检查点已启用: 每 " << cfg.checkpoint_every << " 个 block 重算一次\n";
 
     // ── 设置 activation offload（L1-offload） ──
-    // offload 与 checkpoint 互斥（offload 用 PCIe 换显存、不重算，更省计算）
+    // offload 与 checkpoint 互斥（offload 用 PCIe 换显存、不重算，更省计算；
+    // 共享显存架构下 offload 的 host slab 仍占同一预算，checkpoint 更省）
     if (cfg.activation_offload)
     {
         if (cfg.checkpoint_every > 0)
@@ -1386,8 +1387,9 @@ int main(int argc, char *argv[])
                 steps_since_update = 0;
             }
 
-            // ── 定期保存 checkpoint（独立于 log_interval） ──
-            if ((step + 1) % cfg.save_interval == 0 || step + 1 == steps_per_epoch)
+            // ── 定期保存 checkpoint（独立于 log_interval；save_interval=0 禁用） ──
+            if (cfg.save_interval > 0 &&
+                ((step + 1) % cfg.save_interval == 0 || step + 1 == steps_per_epoch))
             {
                 auto save_r = nn::save_model(cfg.save_path, model, spec, tokenizer_json);
                 if (!save_r)

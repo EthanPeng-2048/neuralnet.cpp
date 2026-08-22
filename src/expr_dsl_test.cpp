@@ -135,11 +135,13 @@ void test_rope()
               nn::expr_spec_key(to_expr_spec(rope_expr<false>(q, cos, sin, DK)).first),
               "forward/backward key 可区分");
 
-        // 不同 d_k → 不同 key（构建期需为每个 d_k 各合成一个 shader）
+        // 形状无关融合：RowMod/RotateHalf 的 param（周期/块大小 = d_k）是
+        // 运行时视图参数（不进 key）→ 不同 d_k 同构 → 同 key（共享一个融合
+        // shader，任意 d_k 全融合；glsl_gen 把 param 作为 push constant 读取）
         constexpr std::uint32_t DK2 = 64;
-        CHECK(nn::expr_spec_key(spec) !=
+        CHECK(nn::expr_spec_key(spec) ==
               nn::expr_spec_key(to_expr_spec(rope_expr<true>(q, cos, sin, DK2)).first),
-              "不同 d_k 的 key 不同");
+              "不同 d_k 的 key 相同（形状无关融合）");
     }
 }
 

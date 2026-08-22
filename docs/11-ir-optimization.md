@@ -1,6 +1,6 @@
 # IR 优化（IR Optimization）—— 为融合算子引入中间表示
 
-> 状态：设计稿 · 待实施
+> 状态：**IR-A（canonicalize：DCE/常量折叠/代数化简/稳定重编号）+ IR-B（CSE + 寄存器分配 liveness）✅ 已实施（2026-08-23）**；IR-C（图 IR）/IR-D（emitter）待立项
 > 关联文档：`09-operator-fusion.md`（算子融合）、`DEVELOPMENT_STANDARDS.md`（分层铁律）、`08-pitfalls-and-lessons.md`
 > 目标：在**不推翻现有 AOT 闭合世界**的前提下，把 `ExprSpec` 从"直通轻量 IR"演进为带优化 pass 的规范 IR，分阶段提升开发便利与代码质量。
 
@@ -158,6 +158,15 @@ IR → GlslEmitter / CudaEmitter / CpuEmitter
 | **IR-B** | CSE + 寄存器分配（liveness） | 中（3–5天） | 中 | 缓解超限拆表达式 |
 | **IR-C** | 图 IR + `begin_expr/end_expr` 融合分析 | 大（1–2周） | 高 | 多表达式自动融合 |
 | **IR-D** | 后端 emitter 抽象（GLSL/CUDA/CPU） | 中（3–5天） | 中 | 一份 IR 多后端 |
+
+> **实施记录（2026-08-23，IR-A + IR-B 已完成）**：
+> - 新增 `include/neuralnet.cpp/expr_opt.hpp`：`fold_constants_and_algebra`（常量池去重 + 保守常量折叠 + 代数化简）、`dead_code_elimination`、`renumber_registers`（寄存器连续重编号 + 常量池清理）、`common_subexpression_elimination`（Fanout 归一化 + 哈希复用）、`allocate_registers_liveness`（liveness 线性扫描，确定性贪心）、`canonicalize_expr_spec`（完整链）。
+> - **canonical IR 接入 key**：`ExprRegistry::add/contains`、CPU `eval_expr_impl`、GPU `eval_expr/eval_expr_reduce` 全部先 `canonicalize_expr_spec` 再算 key；scan/gen_fused 存 canonical spec → shader 按 canonical 合成（闭合世界两端一致）。**dispatch 必须用 canonical 的 consts**（折叠可能增删常量池）。
+> - **关键不变量**：canonicalize 不改变 views/inputs（顺序、内容），只优化 instrs/consts/num_regs → 运行时输入绑定布局不变；输出指令（最后一条）恒为真实寄存器（glsl_gen 输出 `r<last_dst>`）。
+> - **glsl_gen 配套重构**：寄存器"先声明、后赋值"（`float r0, r1, ...;` + 纯赋值），兼容 liveness 复用同号寄存器（否则 GLSL redefinition）。
+> - **关键坑**：① regalloc 复用后归约指令 dst 与逐元素 dst 必须**区段分离**（validate 要求 reduce_dst/elem_dst 按号互斥）；② 各 pass 重映射只处理 `expr_instr_num_operands(op)` 实际使用的操作数（未用 b/c 是默认哨兵 {0,0}，不得当 Reg(0) 重编号）。
+> - 验证：新增 `src/expr_opt_test`（各 pass/确定性/幂等/语义等价/上限压力/归约区段互斥）；`expr_dsl_test`/`expr_reduce_test`/`tensor_expr_test`/`fused_gpu_test`/`matmul_fusion_test`/`ce_fusion_test`/gradcheck 系列/gpt_checkpoint_test 全绿；MNIST + text_train（CPU/GPU、含 checkpoint-every）端到端训练正常。
+> - 顺带修复预存在 bug：`text_train --save-interval 0` 触发 `(step+1) % 0` 整数除零崩溃（HEAD 亦复现，与 IR 无关）。
 
 **推荐**：先落地 IR-A + IR-B（约 1 周），解决真实痛点并铺好确定性地基；IR-C 视需求再投入。
 
