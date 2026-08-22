@@ -1,0 +1,57 @@
+// ── 自动生成（AOT 算子融合 · 归约 kernel），请勿手动编辑 ──
+// 表达式: fused_3d964ca881632bd2
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Buf0 { float b0[]; };
+layout(std430, binding = 1) readonly buffer Buf1 { float b1[]; };
+layout(std430, binding = 2) writeonly buffer BufOut { float bout[]; };
+
+layout(push_constant) uniform PC {
+    uint count;
+    uint cols;
+    uint rows;
+    uint vector_out;   // 1=输出归约向量（(rows,1)/(1,cols)），0=广播
+};
+
+shared float s_red[1][256];
+
+void main()
+{
+    const uint tid = gl_LocalInvocationID.x;
+    const uint idx = gl_WorkGroupID.x;
+    if (idx >= cols) return;
+
+    // 归约指令 1 (槽 0)
+    {
+        float acc = 0.0;
+    for (uint r = tid; r < rows; r += 256u) {
+        const uint row = r;
+        const uint col = idx;
+        float r0 = b0[(row*cols + col)] * b1[(row*cols + col)];
+        acc = (acc + r0);
+        }
+        s_red[0][tid] = acc;
+    }
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) s_red[0][tid] = (s_red[0][tid] + s_red[0][tid + s]);
+        barrier();
+    }
+
+    // 输出
+    if (vector_out == 1u) {
+        const uint row = 0u;
+        const uint col = idx;
+        if (tid == 0u) {
+            bout[col] = s_red[0][0];
+        }
+        return;
+    }
+    for (uint r = tid; r < rows; r += 256u) {
+        const uint row = r;
+        const uint col = idx;
+        bout[row*cols + col] = s_red[0][0];
+    }
+}

@@ -73,6 +73,14 @@ enum class CompareOp : uint32_t
     Ne = 5,  // a != b
 };
 
+// 归约算子（matmul 融合原语用，op-level 无算法语义）
+enum class ReduceOp : uint32_t
+{
+    Sum = 0,
+    Max = 1,
+    Min = 2,
+};
+
 // ══════════════════════════════════════════════════════════════════════════
 // ComputeEngine — 计算引擎抽象接口
 // ══════════════════════════════════════════════════════════════════════════
@@ -189,6 +197,47 @@ public:
         std::size_t batch,
         bool transA = false, bool transB = false,
         Scalar alpha = Scalar{1}) = 0;
+
+    // ══════════════════════════════════════════════════════════════════════
+    // matmul 融合原语（M4，两趟注意力的承载点；op-level，无算法语义）
+    //
+    // 共同约定：
+    //   - A/B 布局与 batched_matmul 相同（按 batch 垂直切分为连续行块）；
+    //     逻辑维度：M/K（A）、K/N（B），由 transA/transB 决定。
+    //   - mask（可选）：(M, N) 共享掩码/偏置张量，对所有 batch 相同。
+    //     mask[i][j] == -inf（跳过该位置）；有限值作为偏置加到得分上
+    //     （可用于 ALiBi 线性偏置）。nullptr = 无掩码。
+    //   - 三原语均不物化中间 (M, N) 得分矩阵（GPU 融合 kernel 内部消解）。
+    // ══════════════════════════════════════════════════════════════════════
+
+    // 批量矩阵乘后沿输出列归约（softmax 数值稳定的分子/分母、norm 统计等）：
+    //   C_b[i] = reduce_j( alpha*op(A_b,B_b)[i][j] + mask[i][j] )
+    // 输出：每 batch (M, 1) → 堆叠 (batch*M, 1)；reduce_cols=false 时
+    // 沿输出行归约 → 每 batch (1, N) → 堆叠 (batch, N)。
+    [[nodiscard]] virtual Result<Tensor> batched_matmul_reduce(
+        const Tensor& A, const Tensor& B, std::size_t batch,
+        ReduceOp op, bool transA, bool transB,
+        Scalar alpha, bool reduce_cols = true,
+        const Tensor* mask = nullptr) = 0;
+
+    // 批量矩阵乘后：减行 max → exp → 沿输出列求和（softmax 分母，含数值稳定）：
+    //   l_b[i] = Σ_j exp( alpha*op(A_b,B_b)[i][j] + mask[i][j] - row_max_b[i] )
+    // 输出：每 batch (M, 1) → 堆叠 (batch*M, 1)
+    [[nodiscard]] virtual Result<Tensor> batched_matmul_softmax_denom(
+        const Tensor& A, const Tensor& B, const Tensor& row_max,
+        std::size_t batch, bool transA, bool transB, Scalar alpha,
+        const Tensor* mask = nullptr) = 0;
+
+    // 批量矩阵乘 + 行 softmax 归一化后与第三张量相乘累加（两趟式注意力 Pass 2）：
+    //   W_b[i][j] = exp( alpha*op(A_b,B_b)[i][j] + mask[i][j] - row_max_b[i] ) / denom_b[i]
+    //   out_b[i][k] = Σ_j W_b[i][j] * V_b[j][k]
+    // V 布局同 batched_matmul（每 batch 垂直堆叠 (V_rows_per, N)）；
+    // 输出：每 batch (M, V_cols) → 堆叠 (batch*M, V_cols)。
+    [[nodiscard]] virtual Result<Tensor> batched_matmul_softmax_apply(
+        const Tensor& A, const Tensor& B, const Tensor& V,
+        const Tensor& row_max, const Tensor& denom,
+        std::size_t batch, bool transA, bool transB, Scalar alpha,
+        const Tensor* mask = nullptr) = 0;
 
     // A += B（逐元素，同形状）
     [[nodiscard]] virtual Result<void> add_inplace(Tensor& A, const Tensor& B) = 0;

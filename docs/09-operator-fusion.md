@@ -1,6 +1,6 @@
 # 算子融合设计（Operator Fusion）—— 减少 GPT+Vulkan 训练显存
 
-> 状态：实施中 · 里程碑 **M1（ExprSpec 归约语义）✅ 完成**、**M2（begin_expr/end_expr 录制框架）✅ 完成**、**M3（Softmax/LayerNorm/RMSNorm 归约融合）✅ 完成**
+> 状态：实施中 · 里程碑 **M1（ExprSpec 归约语义）✅ 完成**、**M2（begin_expr/end_expr 录制框架）✅ 完成**、**M3（Softmax/LayerNorm/RMSNorm 归约融合）✅ 完成**、**M4（matmul 融合原语）✅ 完成**
 > 目标版本：与现有 `eval_expr` AOT 融合管线共存
 > 关联文档：`DEVELOPMENT_STANDARDS.md`（分层铁律）、`AST_COMPUTE.md`（表达式 DSL）、`01-architecture.md`
 
@@ -386,7 +386,7 @@ auto e = engine.end_expr();
 | M1 ✅ | `ExprSpec` 加归约视图/指令 + CPU `eval_expr` 扩展 | `expr_reduce_test` 全过 + `expr_dsl_test` 回归 |
 | M2 ✅ | `begin_expr/end_expr` 录制框架 + CPU no-op | 现有测试回归通过 |
 | M3 ✅ | **Softmax/LayerNorm/RMSNorm fwd/bwd 改 DSL 归约表达式 + GPU 归约融合 shader**（glsl_gen 工作组归约、gen_fused 归约轴、vk_backend 归约调度、eval_expr_reduce 归约向量输出） | `fused_gpu_test` 全过 + `rmsnorm_gradcheck`/`softmax_gradcheck`/`attn_gradcheck`/`gpt_gradcheck` + MNIST Transformer 训练（CPU/GPU × layernorm/rmsnorm） |
-| M4 | §4 三个 matmul 融合原语（CPU + GPU） | `gpt_gradcheck` 通过 |
+| M4 ✅ | **§4 三个 matmul 融合原语（bmm_reduce/bmm_denom/bmm_apply，CPU + GPU 融合 shader，可选掩码）** | `matmul_fusion_test`（CPU err=0 / GPU err≤1.9e-6）+ `gpt_gradcheck` 回归 |
 | M5 | CrossEntropyLoss 融合（不物化全 softmax） | loss/grad 一致性 + 显存下降 |
 | M6 | Attention 两趟式（forward + 反向重算） | `attn_gradcheck` + 显存大幅下降 |
 | M7 | CUDA 后端对齐；文档与 `DEVELOPMENT_STANDARDS.md` 补"原语可专、不叫算法名"约定 | 全套测试 |
@@ -472,3 +472,27 @@ auto e = engine.end_expr();
 - `softmax_gradcheck` / `rmsnorm_gradcheck` / `attn_gradcheck` / `gpt_gradcheck` 全过 ✅
 - MNIST Transformer 训练冒烟（CPU/GPU × layernorm/rmsnorm）正常 ✅；`expr_reduce_test`/`expr_dsl_test`/`tensor_expr_test`/`doc_attn_test`/`attn_consistency_test` 全过 ✅
 - 构建：非 CUDA 全量编译通过（`build_verify`）
+
+### M4 ✅（2026-08）— matmul 融合原语（两趟注意力的承载点）
+
+**接口**（`compute_engine.hpp`）：
+- `ReduceOp` 枚举（Sum/Max/Min）。
+- `batched_matmul_reduce(A, B, batch, op, transA, transB, alpha, reduce_cols, mask?)`：matmul 后沿输出列归约 → 每 batch (M,1) 堆叠 (batch*M,1)。`reduce_cols=false`（沿输出行归约）仅 CPU 实现。
+- `batched_matmul_softmax_denom(A, B, row_max, batch, transA, transB, alpha, mask?)`：减行 max → exp → 沿输出列求和（softmax 分母，数值稳定）。
+- `batched_matmul_softmax_apply(A, B, V, row_max, denom, batch, transA, transB, alpha, mask?)`：行 softmax 归一化后与 V 相乘累加（两趟式注意力 Pass 2），不物化 W。
+- **掩码约定**：可选 `mask` (M,N) 共享张量（所有 batch 相同）；`-inf` 屏蔽（max 天然免疫、sum/min/denom/apply 显式跳过或贡献 0），有限值为偏置（ALiBi）。掩码由 Layer 构建，原语保持 op-level。
+
+**实现**：
+- `cpu_engine.hpp`：三个原语 CPU 参考实现（含 mask、四种转置组合）。
+- `shaders/bmm_reduce.comp` / `bmm_denom.comp` / `bmm_apply.comp`：手写融合 shader（工作组级，每工作组协作处理一行；`bmm_apply` 用共享内存存 W 行，N≤4096）。push constants `M,N,K[,D],flags,alpha`。
+- `vk_backend.hpp`：三 pipeline + `dispatch_bmm_generic` + `bmm_reduce_gpu`/`bmm_denom_gpu`/`bmm_apply_gpu`（mask 为空时绑定 A 占位 + has_mask=0）。
+- `gpu_engine.hpp`：三原语 GPU 实现（`reduce_cols=false` 报错回退）。
+- `cuda_engine.hpp`：占位（返回错误，回退组合路径）。
+- `src/matmul_fusion_test.cpp`（新）：CPU err=0 / GPU err≤1.9e-6，覆盖四种转置 × Max/Sum × 有/无掩码 + denom/apply 注意力布局。
+
+**关键决策**：
+- 掩码用共享 (M,N) 张量（-inf 屏蔽 + 有限偏置），而非在引擎中硬编码因果/ALiBi——保持"引擎只认 op-level 结构"。M6 集成时 Layer 构建掩码并传给原语。
+- `bmm_apply` 共享内存存 W 行（N≤4096），Phase1 算 W、Phase2 累加 O——不物化 (M,N) 权重。
+- M6 集成时注意力 V 需 (N,D) 布局（当前 V_cache 为 (d_k,seq)），用现有 transpose 原语转换。
+
+**验证**：`matmul_fusion_test` 全过（40 用例）+ `gpt_gradcheck`/`fused_gpu_test`/`expr_reduce_test`/`expr_dsl_test` 回归全过 ✅

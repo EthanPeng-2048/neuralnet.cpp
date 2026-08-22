@@ -1,0 +1,78 @@
+// ── bmm_denom.comp ───────────────────────────────────────────────────────
+// 批量矩阵乘 + 减行 max → exp → 沿输出列求和（M4 融合原语，softmax 分母）
+//
+// 语义：l_b[i] = Σ_j exp( alpha*op(A_b,B_b)[i][j] + mask[i][j] - row_max_b[i] )
+//   - A/B 布局与 bmm_reduce 相同；mask（可选）(M, N)，-inf 屏蔽（贡献 0）
+//   - row_max: (batch*M, 1) 每行一个标量（-max 平移保证数值稳定）
+//   - 输出：每 batch (M, 1) → 堆叠 (batch*M, 1)
+//
+// Bindings：A(0), B(1), Mask(2), RowMax(3), Out(4)
+// Push Constants：uint M, uint N, uint K, uint flags, float alpha
+//   flags bit0=transA, bit1=transB, bit2=has_mask
+// Dispatch：(batch*M, 1, 1)，每个工作组（256 线程）协作归约一行
+// ─────────────────────────────────────────────────────────────────────────
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer  BufA    { float A[]; };
+layout(std430, binding = 1) readonly buffer  BufB    { float B[]; };
+layout(std430, binding = 2) readonly buffer  BufMask { float MASK[]; };
+layout(std430, binding = 3) readonly buffer  BufM    { float MV[]; };
+layout(std430, binding = 4) writeonly buffer BufOut  { float OUT[]; };
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint K;
+    uint flags;
+    float alpha;
+};
+
+shared float sdata[256];
+
+void main()
+{
+    const float NEG_INF = uintBitsToFloat(0xff800000u);
+    const uint tid = gl_LocalInvocationID.x;
+    const uint idx = gl_WorkGroupID.x;   // b*M + i
+    const uint b = idx / M;
+    const uint i = idx % M;
+    const uint abase = b * M * K;
+    const uint bbase = b * K * N;
+
+    const bool transA = (flags & 1u) != 0u;
+    const bool transB = (flags & 2u) != 0u;
+    const bool has_mask = (flags & 4u) != 0u;
+    const float mval = MV[idx];
+
+    float acc = 0.0;
+    for (uint j = tid; j < N; j += 256u)
+    {
+        float mv = 0.0;
+        if (has_mask)
+        {
+            mv = MASK[i * N + j];
+            if (mv == NEG_INF) continue;   // 屏蔽列贡献 0
+        }
+        float s = 0.0;
+        for (uint k = 0u; k < K; ++k)
+        {
+            const float av = transA ? A[abase + k * M + i] : A[abase + i * K + k];
+            const float bv = transB ? B[bbase + j * K + k] : B[bbase + k * N + j];
+            s += av * bv;
+        }
+        acc += exp(alpha * s + mv - mval);
+    }
+
+    sdata[tid] = acc;
+    barrier();
+    for (uint st = 128u; st > 0u; st >>= 1u)
+    {
+        if (tid < st) sdata[tid] += sdata[tid + st];
+        barrier();
+    }
+
+    if (tid == 0u) OUT[idx] = sdata[0];
+}

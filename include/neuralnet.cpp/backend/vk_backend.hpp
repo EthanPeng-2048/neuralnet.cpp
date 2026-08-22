@@ -96,6 +96,21 @@
 #define NN_SCATTER_ADD_SPV_EMBEDDED
 #endif
 
+#if __has_include("bmm_reduce_spv.hpp")
+#include "bmm_reduce_spv.hpp"
+#define NN_BMM_REDUCE_SPV_EMBEDDED
+#endif
+
+#if __has_include("bmm_denom_spv.hpp")
+#include "bmm_denom_spv.hpp"
+#define NN_BMM_DENOM_SPV_EMBEDDED
+#endif
+
+#if __has_include("bmm_apply_spv.hpp")
+#include "bmm_apply_spv.hpp"
+#define NN_BMM_APPLY_SPV_EMBEDDED
+#endif
+
 // AOT 融合 shader 注册表（构建期 scan_exprs 收集 + gen_fused 合成；表达式
 // 只出现在 Layer，本表是折叠后的派生物）。运行时按 expr_spec_key 匹配 dispatch。
 #if __has_include("fused_registry.hpp")
@@ -645,6 +660,10 @@ private:
     VulkanPipeline transpose_pipeline_;
     VulkanPipeline gather_pipeline_;
     VulkanPipeline scatter_add_pipeline_;
+    // M4 matmul 融合原语 pipelines（bmm_reduce/bmm_denom/bmm_apply）
+    VulkanPipeline bmm_reduce_pipeline_;
+    VulkanPipeline bmm_denom_pipeline_;
+    VulkanPipeline bmm_apply_pipeline_;
 
     // AOT 融合 shader pipelines（key = expr_spec_key → pipeline；由构建期
     // fused_registry.hpp 注册，运行时按 key 匹配后直接 dispatch）
@@ -782,6 +801,36 @@ private:
     {
 #ifdef NN_SCATTER_ADD_SPV_EMBEDDED
         return nn_scatter_add_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_bmm_reduce_spirv()
+    {
+#ifdef NN_BMM_REDUCE_SPV_EMBEDDED
+        return nn_bmm_reduce_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_bmm_denom_spirv()
+    {
+#ifdef NN_BMM_DENOM_SPV_EMBEDDED
+        return nn_bmm_denom_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_bmm_apply_spirv()
+    {
+#ifdef NN_BMM_APPLY_SPV_EMBEDDED
+        return nn_bmm_apply_spirv_bytecode();
 #else
         static const std::vector<uint32_t> empty;
         return empty;
@@ -966,6 +1015,32 @@ public:
                 batched_matmul_pipeline_ = std::move(*bp_r);
         }
 
+        // 9b2. M4 matmul 融合原语 pipelines
+        // bmm_reduce: 4 bindings (A,B,Mask,Out), PC M,N,K,flags,alpha = 20B
+        const auto& bmm_reduce_spirv = get_bmm_reduce_spirv();
+        if (!bmm_reduce_spirv.empty())
+        {
+            auto pr = VulkanPipeline::create_generic(
+                device_.device(), bmm_reduce_spirv, 4, 5 * sizeof(uint32_t));
+            if (pr) bmm_reduce_pipeline_ = std::move(*pr);
+        }
+        // bmm_denom: 5 bindings (A,B,Mask,RowMax,Out), PC 20B
+        const auto& bmm_denom_spirv = get_bmm_denom_spirv();
+        if (!bmm_denom_spirv.empty())
+        {
+            auto pr = VulkanPipeline::create_generic(
+                device_.device(), bmm_denom_spirv, 5, 5 * sizeof(uint32_t));
+            if (pr) bmm_denom_pipeline_ = std::move(*pr);
+        }
+        // bmm_apply: 7 bindings (A,B,Mask,RowMax,Denom,V,Out), PC M,N,K,D,flags,alpha = 24B
+        const auto& bmm_apply_spirv = get_bmm_apply_spirv();
+        if (!bmm_apply_spirv.empty())
+        {
+            auto pr = VulkanPipeline::create_generic(
+                device_.device(), bmm_apply_spirv, 7, 6 * sizeof(uint32_t));
+            if (pr) bmm_apply_pipeline_ = std::move(*pr);
+        }
+
         // 9c. 创建 rearrange_3d pipeline（2 bindings, 5*4=20B push constants）
         const auto& rearrange_spirv = get_rearrange_3d_spirv();
         if (!rearrange_spirv.empty())
@@ -1077,6 +1152,177 @@ public:
     [[nodiscard]] bool has_transpose_pipeline() const noexcept { return transpose_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_gather_pipeline() const noexcept { return gather_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_scatter_add_pipeline() const noexcept { return scatter_add_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_bmm_reduce_pipeline() const noexcept { return bmm_reduce_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_bmm_denom_pipeline() const noexcept { return bmm_denom_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_bmm_apply_pipeline() const noexcept { return bmm_apply_pipeline_.handle() != VK_NULL_HANDLE; }
+
+    // ══════════════════════════════════════════════════════════════════
+    // M4 matmul 融合原语（bmm_reduce / bmm_denom / bmm_apply）
+    // 布局：N 输入 + 1 输出 bindings；push constants 字节流；dispatch (wg,1,1)
+    // ══════════════════════════════════════════════════════════════════
+    [[nodiscard]] Result<void> dispatch_bmm_generic(
+        const VulkanPipeline& pipeline, std::span<const GpuTensor> inputs,
+        const GpuTensor& output, const std::vector<std::uint8_t>& pc,
+        std::uint32_t wg)
+    {
+        if (!initialized_)
+            return std::unexpected(Error{"GPU backend not initialized"});
+        auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
+        if (!ds_r) return std::unexpected(ds_r.error());
+        VkDescriptorSet desc_set = *ds_r;
+
+        const std::size_t n = inputs.size() + 1;
+        std::vector<VkDescriptorBufferInfo> buf_infos(n);
+        std::vector<VkWriteDescriptorSet> writes(n);
+        for (std::size_t i = 0; i < inputs.size(); ++i)
+            buf_infos[i] = {inputs[i].buffer().impl(), 0, VK_WHOLE_SIZE};
+        buf_infos[n - 1] = {output.buffer().impl(), 0, VK_WHOLE_SIZE};
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = desc_set;
+            writes[i].dstBinding = static_cast<uint32_t>(i);
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &buf_infos[i];
+        }
+        vkUpdateDescriptorSets(device_.device(),
+            static_cast<uint32_t>(n), writes.data(), 0, nullptr);
+
+        auto cmd_r = acquire_cmd();
+        if (!cmd_r)
+        {
+            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            return std::unexpected(cmd_r.error());
+        }
+        auto [cmd, owns_cmd] = *cmd_r;
+
+        std::vector<VkBuffer> in_bufs;
+        in_bufs.reserve(inputs.size());
+        for (const auto& t : inputs)
+            in_bufs.push_back(t.buffer().impl());
+        record_input_barriers(cmd, in_bufs);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+        vkCmdPushConstants(cmd, pipeline.pipeline_layout(),
+            VK_SHADER_STAGE_COMPUTE_BIT, 0,
+            static_cast<uint32_t>(pc.size()), pc.data());
+        vkCmdDispatch(cmd, wg, 1, 1);
+        record_output_barrier(cmd, output.buffer().impl());
+
+        if (owns_cmd)
+        {
+            auto r = submit_and_wait(cmd, desc_set);
+            if (!r) return std::unexpected(r.error());
+        }
+        return {};
+    }
+
+    // bmm_reduce：C[b*M+i] = reduce_j(alpha*op(A_b,B_b)[i][j] + mask[i][j])
+    // 输出 (batch*M, 1)；mask 为空时绑定 A 占位（has_mask=0）
+    [[nodiscard]] Result<GpuTensor> bmm_reduce_gpu(
+        const GpuTensor& A, const GpuTensor& B, const GpuTensor* mask,
+        std::size_t M, std::size_t N, std::size_t K, std::size_t batch,
+        std::size_t op, bool transA, bool transB, Scalar alpha)
+    {
+        if (!has_bmm_reduce_pipeline())
+            return std::unexpected(Error{"bmm_reduce_gpu: pipeline not available"});
+        if (N > 4096u)
+            return std::unexpected(Error{"bmm_reduce_gpu: N exceeds 4096"});
+        auto out = GpuTensor::create_empty(batch * M, 1, *this);
+        if (!out) return std::unexpected(out.error());
+
+        std::vector<GpuTensor> inputs{A, B, mask ? *mask : A};
+        const std::uint32_t flags =
+            (transA ? 1u : 0u) | (transB ? 2u : 0u) | (mask ? 4u : 0u)
+            | (static_cast<std::uint32_t>(op & 3u) << 3u);
+        std::vector<std::uint8_t> pc(5 * sizeof(std::uint32_t));
+        const auto put32 = [&](std::size_t off, std::uint32_t v)
+        { std::memcpy(pc.data() + off, &v, sizeof(std::uint32_t)); };
+        put32(0, static_cast<std::uint32_t>(M));
+        put32(4, static_cast<std::uint32_t>(N));
+        put32(8, static_cast<std::uint32_t>(K));
+        put32(12, flags);
+        const float af = static_cast<float>(alpha);
+        std::memcpy(pc.data() + 16, &af, sizeof(float));
+
+        auto r = dispatch_bmm_generic(bmm_reduce_pipeline_, inputs, *out, pc,
+            static_cast<std::uint32_t>(batch * M));
+        if (!r) return std::unexpected(r.error());
+        return out;
+    }
+
+    // bmm_denom：l[b*M+i] = Σ_j exp(alpha*op(A_b,B_b)[i][j] + mask - row_max)
+    // 输出 (batch*M, 1)
+    [[nodiscard]] Result<GpuTensor> bmm_denom_gpu(
+        const GpuTensor& A, const GpuTensor& B, const GpuTensor* mask,
+        const GpuTensor& row_max,
+        std::size_t M, std::size_t N, std::size_t K, std::size_t batch,
+        bool transA, bool transB, Scalar alpha)
+    {
+        if (!has_bmm_denom_pipeline())
+            return std::unexpected(Error{"bmm_denom_gpu: pipeline not available"});
+        if (N > 4096u)
+            return std::unexpected(Error{"bmm_denom_gpu: N exceeds 4096"});
+        auto out = GpuTensor::create_empty(batch * M, 1, *this);
+        if (!out) return std::unexpected(out.error());
+
+        std::vector<GpuTensor> inputs{A, B, mask ? *mask : A, row_max};
+        const std::uint32_t flags =
+            (transA ? 1u : 0u) | (transB ? 2u : 0u) | (mask ? 4u : 0u);
+        std::vector<std::uint8_t> pc(5 * sizeof(std::uint32_t));
+        const auto put32 = [&](std::size_t off, std::uint32_t v)
+        { std::memcpy(pc.data() + off, &v, sizeof(std::uint32_t)); };
+        put32(0, static_cast<std::uint32_t>(M));
+        put32(4, static_cast<std::uint32_t>(N));
+        put32(8, static_cast<std::uint32_t>(K));
+        put32(12, flags);
+        const float af = static_cast<float>(alpha);
+        std::memcpy(pc.data() + 16, &af, sizeof(float));
+
+        auto r = dispatch_bmm_generic(bmm_denom_pipeline_, inputs, *out, pc,
+            static_cast<std::uint32_t>(batch * M));
+        if (!r) return std::unexpected(r.error());
+        return out;
+    }
+
+    // bmm_apply：out[b*M+i][k] = Σ_j W_ij·V_b[j][k]（两趟式注意力 Pass 2）
+    // W_ij = exp(alpha*op(A_b,B_b)[i][j] + mask - row_max)/denom
+    // V: (batch*N, D)；输出 (batch*M, D)
+    [[nodiscard]] Result<GpuTensor> bmm_apply_gpu(
+        const GpuTensor& A, const GpuTensor& B, const GpuTensor* mask,
+        const GpuTensor& row_max, const GpuTensor& denom, const GpuTensor& V,
+        std::size_t M, std::size_t N, std::size_t K, std::size_t D,
+        std::size_t batch, bool transA, bool transB, Scalar alpha)
+    {
+        if (!has_bmm_apply_pipeline())
+            return std::unexpected(Error{"bmm_apply_gpu: pipeline not available"});
+        if (N > 4096u)
+            return std::unexpected(Error{"bmm_apply_gpu: N exceeds 4096 (shared memory limit)"});
+        auto out = GpuTensor::create_empty(batch * M, D, *this);
+        if (!out) return std::unexpected(out.error());
+
+        std::vector<GpuTensor> inputs{A, B, mask ? *mask : A, row_max, denom, V};
+        const std::uint32_t flags =
+            (transA ? 1u : 0u) | (transB ? 2u : 0u) | (mask ? 4u : 0u);
+        std::vector<std::uint8_t> pc(6 * sizeof(std::uint32_t));
+        const auto put32 = [&](std::size_t off, std::uint32_t v)
+        { std::memcpy(pc.data() + off, &v, sizeof(std::uint32_t)); };
+        put32(0, static_cast<std::uint32_t>(M));
+        put32(4, static_cast<std::uint32_t>(N));
+        put32(8, static_cast<std::uint32_t>(K));
+        put32(12, static_cast<std::uint32_t>(D));
+        put32(16, flags);
+        const float af = static_cast<float>(alpha);
+        std::memcpy(pc.data() + 20, &af, sizeof(float));
+
+        auto r = dispatch_bmm_generic(bmm_apply_pipeline_, inputs, *out, pc,
+            static_cast<std::uint32_t>(batch * M));
+        if (!r) return std::unexpected(r.error());
+        return out;
+    }
 
     [[nodiscard]] VulkanDevice& device() noexcept { return device_; }
     [[nodiscard]] MemoryPool& memory_pool() noexcept { return *memory_pool_; }

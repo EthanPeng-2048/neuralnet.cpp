@@ -1,0 +1,65 @@
+// ── 自动生成（AOT 算子融合 · 归约 kernel），请勿手动编辑 ──
+// 表达式: fused_114d647de347e012
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Buf0 { float b0[]; };
+layout(std430, binding = 1) readonly buffer Buf1 { float b1[]; };
+layout(std430, binding = 2) readonly buffer Buf2 { float b2[]; };
+layout(std430, binding = 3) readonly buffer Buf3 { float b3[]; };
+layout(std430, binding = 4) writeonly buffer BufOut { float bout[]; };
+
+layout(push_constant) uniform PC {
+    uint count;
+    uint cols;
+    uint rows;
+    uint vector_out;   // 1=输出归约向量（(rows,1)/(1,cols)），0=广播
+};
+
+shared float s_red[1][256];
+
+void main()
+{
+    const uint tid = gl_LocalInvocationID.x;
+    const uint idx = gl_WorkGroupID.x;
+    if (idx >= rows) return;
+
+    // 归约指令 1 (槽 0)
+    {
+        float acc = 0.0;
+    for (uint c = tid; c < cols; c += 256u) {
+        const uint row = idx;
+        const uint col = c;
+        float r0 = b2[(row*cols + col)] * b3[(row*cols + col)];
+        acc = (acc + r0);
+        }
+        s_red[0][tid] = acc;
+    }
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) s_red[0][tid] = (s_red[0][tid] + s_red[0][tid + s]);
+        barrier();
+    }
+
+    // 输出
+    if (vector_out == 1u) {
+        const uint row = idx;
+        const uint col = 0u;
+        if (tid == 0u) {
+        float r0 = b2[(row*cols + col)] * b3[(row*cols + col)];
+        float r2 = b1[(row*cols + col)] - s_red[0][0];
+        float r3 = b0[(row*cols + col)] * r2;
+            bout[row] = r3;
+        }
+        return;
+    }
+    for (uint c = tid; c < cols; c += 256u) {
+        const uint row = idx;
+        const uint col = c;
+        float r0 = b2[(row*cols + col)] * b3[(row*cols + col)];
+        float r2 = b1[(row*cols + col)] - s_red[0][0];
+        float r3 = b0[(row*cols + col)] * r2;
+        bout[row*cols + col] = r3;
+    }
+}
