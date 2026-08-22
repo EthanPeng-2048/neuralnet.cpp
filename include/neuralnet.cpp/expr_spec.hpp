@@ -185,6 +185,39 @@ struct ExprSpec
     std::uint32_t               num_regs = 0;
 };
 
+// ── 运行时视图参数（形状无关融合的关键）───────────────────────────────
+// RowMod（周期）与 RotateHalf（块大小）的 param 是**运行时形状数据**（如
+// RoPE 的 d_k），不是表达式结构：同结构不同 param（不同 d_k）应共享一个
+// 融合 shader。因此：
+//   - expr_spec_key **不**把这两个 param 折进 key（结构相同 → 同 key）
+//   - glsl_gen 把它们作为 push constant（vp 槽）读取，dispatch 时按实际
+//     spec 填充 → 一个 shader 适配所有形状（任何 d_k）
+[[nodiscard]] inline constexpr bool expr_view_has_runtime_param(ExprViewKind k) noexcept
+{
+    return k == ExprViewKind::RowMod || k == ExprViewKind::RotateHalf;
+}
+// 该 spec 的运行时视图参数个数（= 融合 shader 的 push constant vp 槽位数）
+[[nodiscard]] inline std::uint32_t expr_spec_runtime_view_param_count(
+    const ExprSpec& s) noexcept
+{
+    std::uint32_t n = 0;
+    for (const auto& v : s.views)
+        if (expr_view_has_runtime_param(static_cast<ExprViewKind>(v.kind)))
+            ++n;
+    return n;
+}
+// 按视图顺序提取运行时视图参数（RowMod 周期 / RotateHalf 块大小），
+// 运行时 eval_expr 用它填充融合 shader 的 push constant vp 槽。
+[[nodiscard]] inline std::vector<std::uint32_t> expr_spec_runtime_view_params(
+    const ExprSpec& s)
+{
+    std::vector<std::uint32_t> out;
+    for (const auto& v : s.views)
+        if (expr_view_has_runtime_param(static_cast<ExprViewKind>(v.kind)))
+            out.push_back(v.param);
+    return out;
+}
+
 // ── 表达式归约轴（融合 shader 生成用）────────────────────────────────────
 // 返回 -1=无归约（逐元素）、0=全部行归约、1=全部列归约、-2=混合（不支持单 kernel 融合）
 [[nodiscard]] inline int expr_spec_reduce_axis(const ExprSpec& s)
@@ -255,7 +288,12 @@ struct ExprSpec
     {
         feed(&v.kind, 1);
         feed(&v.negate_first_half, 1);
-        feed_u32(v.param);
+        // RowMod/RotateHalf 的 param（周期/块大小）是**运行时形状数据**，
+        // 不进 key：同结构不同形状（如不同 d_k）共享一个融合 shader
+        // （glsl_gen 把 param 作为 push constant 读取，dispatch 时按实际
+        // spec 填充）。其余视图 param=0 固定，feed 与否不影响。
+        if (!expr_view_has_runtime_param(static_cast<ExprViewKind>(v.kind)))
+            feed_u32(v.param);
     }
     feed_u32(static_cast<std::uint32_t>(s.consts.size()));
     for (const auto& c : s.consts)

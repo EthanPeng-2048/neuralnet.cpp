@@ -396,7 +396,7 @@ auto e = engine.end_expr();
 ## 11. 风险与开放问题
 
 1. **glsl_gen 融合工作量**：两趟注意力的 tile 化代码生成是最大工作量，等价于手写一版内存高效注意力生成器。M4-M6 可先用**手写固定 shader** 验证收益，再决定是否泛化为结构生成。
-2. **闭合世界 vs 形状变化**：录制融合结构若依赖形状（tile 尺寸），需在 `scan_exprs` 覆盖常用形状；超范围则回退组合路径（正确但省显存效果降级）。
+2. **闭合世界 vs 形状变化 ✅ 已解决（形状无关融合 + 优雅回退）**：`RowMod`/`RotateHalf` 的周期/块大小（如 RoPE 的 d_k）改为**运行时视图参数**——不进 `expr_spec_key`，作为 push constant vp 槽由 dispatch 按实际 spec 填充 → 同结构不同形状共享一个融合 shader（**任意 d_k 全融合，零额外显存**）。彻底无法覆盖的结构（如新表达式）由 `eval_expr` 未命中时的 **CPU 求值回退**兜底（正确但慢，一次性警告）。
 3. **反向重算 vs 缓存**：默认反向重算 `W`（省显存），若训练变慢明显，提供缓存开关。
 4. **不引入运行时编译**：所有融合 kernel 保持 AOT 预编译，`end_expr` 只做查表/装配。
 
@@ -556,11 +556,29 @@ auto e = engine.end_expr();
 - **`dispatch_bmm_generic` 的输出约定**：返回张量永远是最后一个 binding，out 参数张量是倒数第二 → shader 里 `OutK` 必须在最后（9）、`OutV` 在 8（曾写反导致 GPU grad_K 与 grad_V 互换）。
 - **kv_backward 的 `A_b[:,i]` 索引**：`transA` 时 A_b 物理 (K,M)，第 i 个 query 向量为 `A_b[k][i] = flat[b*K*M + k*M + i]`；`!transA` 时为 `A_b[i][k] = flat[b*M*K + i*K + k]`。CPU 参考实现最初把两个分支写反（shader 是对的），导致 CPU 与参考互相一致但语义错——以 shader/前向 dot_ab 约定为准修正。
 - **V/G 布局转换**：`transpose` 是全矩阵转置，无法直接得到 (BH*seq, d_k)；用 `transpose → rearrange_3d(seq, BH, d_k, false)` 实现按 batch 转置（同 trick 用于 O 转回）。
-- **闭合世界限制**：RoPE 的 AOT 融合 shader 只覆盖 dk ∈ {32,64,128}（预先存在），d_k 不在集合内时回退错误（非本次回归）。
+- **闭合世界限制（已由"形状无关融合"解决）**：RoPE 的 AOT 融合 shader 当时只覆盖 dk ∈ {32,64,128}，d_k 不在集合内会回退错误。见下文"形状无关融合"——RowMod/RotateHalf 参数改为运行时视图参数后，**任意 d_k 都命中同一融合 shader**，且未命中时优雅回退 CPU。
 
 **验证**（全部通过 ✅）：
 - `matmul_fusion_test`：48 用例（新增 8），CPU err=0 / GPU err≤4.8e-7
 - `attn_gradcheck` / `gpt_gradcheck` 全过（两趟式前向+重算反向数值正确，max_err≤0.014）
 - `fused_gpu_test` / `expr_reduce_test` / `expr_dsl_test` / `tensor_expr_test` / `doc_attn_test` / `attn_consistency_test` / `softmax_gradcheck` / `rmsnorm_gradcheck` 回归全过
 - GPT 文本训练冒烟（CPU+GPU × learned 两趟式 / alibi 回退 / rope 两趟式）loss 正常下降；MNIST Transformer 训练冒烟（CPU+GPU）正常
+
+### 形状无关融合 ✅（2026-08）— 任意 d_k / 任意形状适配
+
+**问题**：`RowMod`（周期=d_k）与 `RotateHalf`（块=d_k）的 `param` 以**结构常量**折进 `expr_spec_key` → 每换一个 d_k 就要一个新融合 shader → 闭合世界无法穷举所有 d_k（d_k 实际可为任意值，含非 2 的幂）。
+
+**方案（核心：把形状参数从 key 里拿出来变成运行时数据）**：
+1. **`expr_spec_key` 剔除 RowMod/RotateHalf 的 param**（保留 kind 与 negate_first_half）——结构相同 → 同 key；不同 d_k 共享一个融合 shader。
+2. **`glsl_gen` 把这两个参数作为 push constant `vpN` 槽读取**（而非 GLSL 字面量）——生成的 shader 是"泛化"的，mod/block 由运行时提供。
+3. **`gen_fused`/`vk_backend` 记录并传递 vp 槽数**：FusedShader 增 `view_param_count`；注册时 pc_uints = 固定头 + view_param_count；`run_fused_gpu` 增 `view_params` 参数，置于固定头之后、常量池之前。
+4. **`GpuEngine::eval_expr`/`eval_expr_reduce` 按实际 spec 提取 vp 参数**（`expr_spec_runtime_view_params`）传入 dispatch。
+5. **优雅回退安全网**：未命中任何融合 shader（如未来新增未扫描表达式）不再硬报错，改为**下载输入 → CpuEngine 求值 → 上传**（正确性兜底，一次性警告，覆盖缺口仍可见）。
+
+**效果**：
+- 扫描表达式从 24 → 18 条（RoPE 的 4×dk 去重为同构）；`fused_gpu_test` 用 d_k ∈ {16, 40, 64, 96, 128}（含非 2 的幂）全部命中同一融合 shader，err≤1.2e-7。
+- `scan_exprs` 只需收集**任意一个 d_k** 即可覆盖所有 d_k；RoPE 仍是唯一使用 RowMod/RotateHalf 的表达式，其余融合表达式（norm/softmax/swiglu）本就形状无关。
+- 零额外显存：cos/sin 仍以小表 (d_k, seq) 按 RowMod 平铺，不物化 (batch*H*d_k, seq) 大表。
+
+**验证**：`fused_gpu_test` 新增非 2 的幂 d_k（40/96）+ 未扫描表达式回退用例（err=0）全过；GPT 训练 d_k=40/d_k=16 + rope + GPU 无回退警告（全融合）；全部回归（matmul_fusion/ce_fusion/attn_gradcheck/gpt_gradcheck/expr_*/doc_attn/attn_consistency/softmax/rmsnorm）全过 ✅
 

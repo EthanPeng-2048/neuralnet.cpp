@@ -58,7 +58,8 @@ Scalar max_abs_diff(const Matrix& a, const Matrix& b)
 }
 
 // ── RoPE：GPU（融合 shader）vs CPU（eval_cpu）───────────────────────────
-// d_k 必须在 scan_exprs 覆盖的集合内，否则 GPU 端 eval_expr 硬报错。
+// 形状无关融合：RowMod/RotateHalf 周期/块大小是运行时视图参数（不进 key），
+// 任意 d_k（含非 2 的幂）都命中同一个融合 shader。
 int run_rope(CpuEngine& cpu, GpuEngine& gpu, std::size_t dk, bool backward)
 {
     std::mt19937 rng(1000 + static_cast<unsigned>(dk));
@@ -229,6 +230,41 @@ int run_norm(const char* name, CpuEngine& cpu, GpuEngine& gpu)
     return (ok_f && ok_b) ? 0 : 1;
 }
 
+// ── 优雅回退：未扫描表达式 → CPU 求值（正确性兜底） ────────────────────
+// 构造一个任何 Layer 都不使用的表达式（x*y + 3），其 key 不在融合注册表，
+// GPU eval_expr 应回退 CPU 求值并返回与 CPU 模板求值一致的结果。
+// （首次会打印一次性 [GpuEngine] 警告，属预期。）
+int run_fallback(CpuEngine& cpu, GpuEngine& gpu)
+{
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<Scalar> dist(-2.0f, 2.0f);
+    const std::size_t R = 5, C = 7;
+    Matrix x(R, C), y(R, C);
+    for (auto& v : x.span()) v = dist(rng);
+    for (auto& v : y.span()) v = dist(rng);
+    const Tensor xt = Tensor::from_matrix(Matrix(x));
+    const Tensor yt = Tensor::from_matrix(Matrix(y));
+    const nn::Scalar three{3};
+
+    auto cr = nn::dsl::compute(cpu,
+        nn::dsl::leaf(xt) * nn::dsl::leaf(yt) + three, R, C);
+    auto gr = nn::dsl::compute(gpu,
+        nn::dsl::leaf(xt) * nn::dsl::leaf(yt) + three, R, C);
+    if (!cr) { std::cerr << "  CPU 求值失败: " << cr.error().message << "\n"; return 1; }
+    if (!gr)
+    {
+        std::cerr << "  回退失败: " << gr.error().message << "\n";
+        return 1;
+    }
+    auto dm = gpu.to_matrix(*gr);
+    if (!dm) { std::cerr << "  下载失败\n"; return 1; }
+    const Scalar err = max_abs_diff(*dm, cr->cpu_matrix());
+    const bool ok = err < 1e-5f;
+    std::cout << "[" << (ok ? "PASS" : "FAIL") << "] fallback (未扫描表达式 → CPU 回退)"
+              << "  err=" << std::scientific << std::setprecision(2) << err << "\n";
+    return ok ? 0 : 1;
+}
+
 int main()
 {
     std::cout << "========================================\n"
@@ -247,7 +283,10 @@ int main()
     std::cout << "[init] CpuEngine + GpuEngine 就绪\n";
 
     int fail = 0;
-    for (const std::size_t dk : {std::size_t{32}, std::size_t{64}, std::size_t{128}})
+    // 形状无关融合：任意 d_k（含非 2 的幂 40/96）都命中同一个融合 shader
+    for (const std::size_t dk : {std::size_t{16}, std::size_t{40},
+                                 std::size_t{64}, std::size_t{96},
+                                 std::size_t{128}})
     {
         fail += run_rope(*cpu_engine, *gpu_engine, dk, /*backward=*/false);
         fail += run_rope(*cpu_engine, *gpu_engine, dk, /*backward=*/true);
@@ -256,6 +295,7 @@ int main()
     fail += run_softmax(*cpu_engine, *gpu_engine);
     fail += run_norm<nn::RMSNorm>("rmsnorm", *cpu_engine, *gpu_engine);
     fail += run_norm<nn::LayerNorm>("layernorm", *cpu_engine, *gpu_engine);
+    fail += run_fallback(*cpu_engine, *gpu_engine);
 
     std::cout << (fail == 0 ? "ALL PASS\n" : "FAILED\n");
     return fail == 0 ? 0 : 1;

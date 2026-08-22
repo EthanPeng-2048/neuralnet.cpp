@@ -131,6 +131,7 @@ int main(int argc, char* argv[])
     H << "    const std::uint32_t* spirv;\n";
     H << "    std::size_t spirv_words;\n";
     H << "    int         reduce_axis;   // -1=逐元素, 0=行归约, 1=列归约\n";
+    H << "    std::uint32_t view_param_count;  // 运行时视图参数个数（RowMod/RotateHalf 的 push constant vp 槽）\n";
     H << "};\n\n";
 
     for (const auto& spec : reg.specs)
@@ -192,7 +193,8 @@ int main(int argc, char* argv[])
         H << "    { \"" << key << "\",\n        " << emit_spec(spec) << ",\n"
           << "        kSpirv_" << key
           << ", sizeof(kSpirv_" << key << ")/sizeof(std::uint32_t), "
-          << raxis << " },\n";
+          << raxis << ", "
+          << nn::expr_spec_runtime_view_param_count(spec) << " },\n";
     }
     H << "};\n";
     H << "inline constexpr std::size_t kFusedShaderCount =\n"

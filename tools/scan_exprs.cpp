@@ -36,12 +36,14 @@ int main(int argc, char* argv[])
 
     nn::CpuEngine engine;
 
-    // ── RoPE：forward + backward，覆盖代码库实际用到的 d_k 集合 ──────────
+    // ── RoPE：forward + backward ─────────────────────────────────────────
     // （apply 与 apply_step 折叠出的结构相同，会自动去重）
-    // d_k = d_model/num_heads 的常见取值：16（如 d_model=64/heads=4、
-    //   d_model=32/heads=2 的 MNIST Transformer）、32、64、128。
-    // 闭合世界安全网：若某条 Layer 路径未被本工具覆盖，其内联表达式在
-    //   GPU 运行时将硬报错——新增 d_k 配置时记得补进此列表。
+    //
+    // 形状无关融合：RowMod/RotateHalf 的周期/块大小是**运行时视图参数**
+    // （不进 expr_spec_key），故 RoPE 结构不依赖 d_k——这里任意 d_k 收集到的
+    // 结构完全相同（去重成一个），**任何 d_k（含非 2 的幂）都能命中该融合
+    // shader**。下面保留多个 d_k 仅作覆盖验证；若未来表达式重新引入形状
+    // 常量，需再补对应 dry-run。
     for (const std::size_t dk : {std::size_t{16}, std::size_t{32},
                                  std::size_t{64}, std::size_t{128}})
     {

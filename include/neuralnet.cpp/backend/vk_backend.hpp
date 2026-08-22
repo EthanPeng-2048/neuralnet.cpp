@@ -696,6 +696,8 @@ private:
     std::unordered_map<std::string, VulkanPipeline> fused_pipelines_;
     // 归约轴：-1=逐元素, 0=行归约, 1=列归约（决定 push constants 与 dispatch）
     std::unordered_map<std::string, int> fused_reduce_axis_;
+    // 运行时视图参数个数（RowMod/RotateHalf 的 vp push constant 槽数）
+    std::unordered_map<std::string, std::uint32_t> fused_view_param_counts_;
 
     std::unique_ptr<MemoryPool> memory_pool_;
     std::unique_ptr<StagingRing> staging_ring_;
@@ -1223,8 +1225,10 @@ public:
                 continue;  // 空 SPIR-V：跳过（构建配置缺失）
             const std::uint32_t num_bindings =
                 static_cast<std::uint32_t>(fs.spec.views.size()) + 1;  // 输入 + 输出
-            // 归约 kernel 的 push constants 多 uint rows + uint vector_out
-            const std::uint32_t pc_uints = (fs.reduce_axis >= 0) ? 4u : 2u;
+            // 归约 kernel 的 push constants 多 uint rows + uint vector_out；
+            // 另加 fs.view_param_count 个运行时视图参数槽（RowMod/RotateHalf）
+            const std::uint32_t pc_uints =
+                ((fs.reduce_axis >= 0) ? 4u : 2u) + fs.view_param_count;
             const std::uint32_t pc_size =
                 static_cast<std::uint32_t>(pc_uints * sizeof(std::uint32_t) +
                                            sizeof(Scalar) * fs.spec.consts.size());
@@ -1235,6 +1239,7 @@ public:
             {
                 fused_pipelines_.emplace(fs.key, std::move(*fp_r));
                 fused_reduce_axis_.emplace(fs.key, fs.reduce_axis);
+                fused_view_param_counts_.emplace(fs.key, fs.view_param_count);
             }
         }
 #endif
@@ -2918,7 +2923,8 @@ public:
         std::span<const GpuTensor> inputs,
         std::span<const Scalar> consts,
         std::size_t rows, std::size_t cols,
-        bool vector_out = false)
+        bool vector_out = false,
+        std::span<const std::uint32_t> view_params = {})
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
@@ -2929,11 +2935,17 @@ public:
         // 归约轴：-1=逐元素, 0=行归约, 1=列归约
         const int raxis = fused_reduce_axis_.count(shader_name)
             ? fused_reduce_axis_.at(shader_name) : -1;
+        // 运行时视图参数个数（RowMod/RotateHalf 的 vp 槽）
+        const std::uint32_t n_vp = fused_view_param_counts_.count(shader_name)
+            ? fused_view_param_counts_.at(shader_name) : 0u;
 
         if (inputs.size() + 1 > EXPR_MAX_INPUTS + 1)
             return std::unexpected(Error{"run_fused_gpu: too many inputs"});
         if (consts.size() > EXPR_MAX_CONSTS)
             return std::unexpected(Error{"run_fused_gpu: too many constants"});
+        if (view_params.size() != n_vp)
+            return std::unexpected(Error{
+                "run_fused_gpu: view_params count mismatch for " + shader_name});
 
         // count 以 uint32 传入 shader（gl_GlobalInvocationID / push constant），
         // 必须保证 rows*cols 不溢出 uint32，否则分派与索引会静默截断。
@@ -2995,11 +3007,11 @@ public:
             pipeline.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
 
         // Push constants 布局与 glsl_gen.hpp 一致：
-        //   逐元素: count, cols, c0..
-        //   归约:   count, cols, rows, vector_out, c0..
+        //   逐元素: count, cols, [vp0..], c0..
+        //   归约:   count, cols, rows, vector_out, [vp0..], c0..
         const std::uint32_t pc_uints = (raxis >= 0) ? 4u : 2u;
         std::vector<std::uint8_t> pc(
-            pc_uints * sizeof(std::uint32_t) + sizeof(Scalar) * consts.size());
+            (pc_uints + n_vp) * sizeof(std::uint32_t) + sizeof(Scalar) * consts.size());
         std::memcpy(pc.data(), &count, sizeof(std::uint32_t));
         const std::uint32_t cols32 = static_cast<std::uint32_t>(cols);
         std::memcpy(pc.data() + sizeof(std::uint32_t), &cols32, sizeof(std::uint32_t));
@@ -3012,8 +3024,12 @@ public:
             std::memcpy(pc.data() + 3 * sizeof(std::uint32_t), &vo,
                         sizeof(std::uint32_t));
         }
+        // 运行时视图参数（RowMod 周期 / RotateHalf 块大小），置于固定头之后、常量池之前
+        for (std::uint32_t i = 0; i < n_vp; ++i)
+            std::memcpy(pc.data() + (pc_uints + i) * sizeof(std::uint32_t),
+                        &view_params[i], sizeof(std::uint32_t));
         if (!consts.empty())
-            std::memcpy(pc.data() + pc_uints * sizeof(std::uint32_t), consts.data(),
+            std::memcpy(pc.data() + (pc_uints + n_vp) * sizeof(std::uint32_t), consts.data(),
                         sizeof(Scalar) * consts.size());
         vkCmdPushConstants(cmd, pipeline.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, static_cast<std::uint32_t>(pc.size()), pc.data());
