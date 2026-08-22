@@ -128,6 +128,20 @@ public:
     // 用于训练中显存采样与逐项归因。
     [[nodiscard]] virtual std::string pool_stats() const { return {}; }
 
+    // ── 激活 offload（L1-offload）───────────────────────────────────
+    // offload_store：把 GPU 激活复制到 host-visible 存储（释放 device-local
+    //    VRAM），返回一个 opaque 句柄。GPU 引擎录制式（batch 内不提交）；
+    //    CPU 引擎 no-op（返回 src 本身）。
+    // offload_load：从 offload_store 的句柄复制回 GPU，恢复为 (rows, cols)。
+    //    CPU 引擎 no-op（返回句柄 reshape 为 rows×cols）。
+    [[nodiscard]] virtual Result<Tensor> offload_store(const Tensor& src) { return src; }
+
+    [[nodiscard]] virtual Result<Tensor> offload_load(
+        const Tensor& handle, std::size_t rows, std::size_t cols)
+    {
+        return handle.reshape(rows, cols);
+    }
+
     // ── 张量工厂 ──────────────────────────────────────────────────────────
     [[nodiscard]] virtual Tensor create_tensor(std::size_t rows, std::size_t cols) = 0;
     [[nodiscard]] virtual Result<Tensor> from_matrix(const Matrix& m) = 0;

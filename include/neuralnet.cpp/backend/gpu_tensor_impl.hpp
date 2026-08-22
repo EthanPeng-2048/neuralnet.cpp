@@ -56,6 +56,21 @@ inline Result<GpuTensor> GpuTensor::create_empty(
     return GpuTensor(std::make_shared<GpuBuffer>(std::move(*buf_res)), rows, cols);
 }
 
+inline Result<GpuTensor> GpuTensor::create_host_visible_empty(
+    std::size_t rows, std::size_t cols, GpuBackend& backend)
+{
+    // Host Visible 存储（activation offload）：数据驻留主机可见内存。
+    // 仅用于 vkCmdCopyBuffer 中转（TRANSFER_DST/SRC）。
+    auto buf_res = GpuBuffer::create_host_visible(
+        backend.device().device(), backend.memory_pool(),
+        rows * cols,
+        TENSOR_BUFFER_USAGE);
+    if (!buf_res)
+        return std::unexpected(buf_res.error());
+
+    return GpuTensor(std::make_shared<GpuBuffer>(std::move(*buf_res)), rows, cols);
+}
+
 inline Result<Matrix> GpuTensor::to_matrix(GpuBackend& backend) const
 {
     if (!valid())

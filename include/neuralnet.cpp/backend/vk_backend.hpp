@@ -617,6 +617,49 @@ public:
         return GpuBuffer(device, buffer, *alloc_r, pool);
     }
 
+    // 创建 Host Visible 缓冲区（activation offload 存储）
+    // 数据驻留在主机可见内存（通常 = RAM），从 device-local VRAM 的角度
+    // 释放显存；GPU↔host 之间通过 vkCmdCopyBuffer 中转。
+    [[nodiscard]] static Result<GpuBuffer> create_host_visible(
+        VkDevice device, MemoryPool& pool,
+        std::size_t elem_count, VkBufferUsageFlags usage)
+    {
+        VkBufferCreateInfo buf_info{};
+        buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        buf_info.size = elem_count * sizeof(float);
+        buf_info.usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkResult res = vkCreateBuffer(device, &buf_info, nullptr, &buffer);
+        if (res != VK_SUCCESS)
+            return std::unexpected(Error{"vkCreateBuffer failed: " + std::to_string(res)});
+
+        VkMemoryRequirements mem_reqs;
+        vkGetBufferMemoryRequirements(device, buffer, &mem_reqs);
+
+        // 优先 HOST_VISIBLE|HOST_COHERENT，回退 HOST_VISIBLE
+        auto alloc_r = pool.allocate(
+            mem_reqs,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+        if (!alloc_r)
+        {
+            vkDestroyBuffer(device, buffer, nullptr);
+            return std::unexpected(alloc_r.error());
+        }
+
+        res = vkBindBufferMemory(device, buffer, alloc_r->memory, alloc_r->offset);
+        if (res != VK_SUCCESS)
+        {
+            pool.free(*alloc_r);
+            vkDestroyBuffer(device, buffer, nullptr);
+            return std::unexpected(Error{"vkBindBufferMemory failed: " + std::to_string(res)});
+        }
+
+        return GpuBuffer(device, buffer, *alloc_r, pool);
+    }
+
     [[nodiscard]] VkBuffer impl() const noexcept { return buffer_; }
     [[nodiscard]] bool valid() const noexcept { return buffer_ != VK_NULL_HANDLE; }
 };
@@ -644,6 +687,10 @@ public:
 
     // 创建空的 GPU Tensor（用于输出）
     [[nodiscard]] static Result<GpuTensor> create_empty(
+        std::size_t rows, std::size_t cols, class GpuBackend& backend);
+
+    // 创建空的 Host Visible Tensor（activation offload 存储）
+    [[nodiscard]] static Result<GpuTensor> create_host_visible_empty(
         std::size_t rows, std::size_t cols, class GpuBackend& backend);
 
     // 转换为 CPU Matrix（下载数据）

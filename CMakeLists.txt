@@ -83,6 +83,9 @@ nn_add_executable(gpt_gradcheck src/gpt_gradcheck.cpp)
 # ── GPT 梯度检查点一致性测试（验证激活重计算 L1 与全存结果一致） ───────
 nn_add_executable(gpt_checkpoint_test src/gpt_checkpoint_test.cpp)
 
+# ── activation offload 原语往返验证（GPU 激活 → host → GPU 一致） ──────
+nn_add_executable(offload_test src/offload_test.cpp)
+
 # ── 文档感知注意力掩码构建单测（验证块对角∧因果∧ALiBi 组合） ───────────
 nn_add_executable(doc_mask_test src/doc_mask_test.cpp)
 
@@ -245,6 +248,7 @@ if(Vulkan_FOUND)
             rmsnorm_gradcheck
             gpt_gradcheck
             gpt_checkpoint_test
+            offload_test
             attn_gradcheck
             fused_gpu_test
             tensor_expr_test
