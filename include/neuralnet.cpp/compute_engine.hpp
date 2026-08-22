@@ -83,6 +83,42 @@ enum class ReduceOp : uint32_t
 };
 
 // ══════════════════════════════════════════════════════════════════════════
+// 通用注意力偏置/掩码描述子（AttnBias，两趟式原语掩码契约升级版 2026-08）
+//
+// 组合语义：把偏置加到得分上（score_j = alpha*s + bias；-inf = 屏蔽）：
+//   bias(bb,i,j) =
+//       dense（共享 (M,N) 掩码，旧契约；-inf 屏蔽 / 有限值作偏置）
+//     + (causal && j>i                       ? -inf : 0)
+//     + (doc_ids 非空 && doc[b,i]!=doc[b,j]  ? -inf : 0)   块对角文档感知
+//     + (slopes 非空                         ? -slope[h]*(i-j) : 0)  ALiBi
+// 其中两趟式原语的 batch 参数 = num_samples*num_heads；由 batch 索引
+// bb 分解：b = 样本号 = bb/num_heads，h = 头号 = bb%num_heads。
+// i = query 行，j = key 列。
+//
+// 说明：
+//   - dense / doc_ids / slopes 均为可选小张量（空 = 对应分量不启用）；
+//     causal 为纯标志位。组合即最一般情形（同时覆盖 因果/ALiBi/文档感知
+//     /组合，且保持两趟式不物化 (BH·seq,seq) 的显存收益）。
+//   - doc_ids：(1, num_samples*seq) 每位置文档 id（float 打包，< 2^24）。
+//   - slopes：(1, num_heads) ALiBi 按头斜率 m_h。
+//   - dense 保留旧共享掩码语义（仅供向后兼容/测试）；生产注意力走
+//     causal/doc_ids/slopes 组合路径。
+// ══════════════════════════════════════════════════════════════════════════
+struct AttnBias
+{
+    const Tensor* dense = nullptr;   // 共享 (M, N) 掩码（旧契约；空 = 无）
+    bool causal = false;             // 纯因果掩码 (j>i 屏蔽)
+    std::size_t num_heads = 1;       // 用于拆解 bb → (b,h)
+    const Tensor* doc_ids = nullptr; // (1, num_samples*seq)，块对角文档感知
+    const Tensor* slopes = nullptr;  // (1, num_heads)，ALiBi 按头斜率
+
+    // 便捷构造：仅共享稠密掩码（旧契约，测试用）
+    explicit AttnBias(const Tensor* dense_mask) : dense(dense_mask) {}
+    // 默认：无任何偏置/掩码
+    AttnBias() = default;
+};
+
+// ══════════════════════════════════════════════════════════════════════════
 // ComputeEngine — 计算引擎抽象接口
 // ══════════════════════════════════════════════════════════════════════════
 class ComputeEngine
@@ -251,32 +287,30 @@ public:
     // 共同约定：
     //   - A/B 布局与 batched_matmul 相同（按 batch 垂直切分为连续行块）；
     //     逻辑维度：M/K（A）、K/N（B），由 transA/transB 决定。
-    //   - mask（可选）：(M, N) 共享掩码/偏置张量，对所有 batch 相同。
-    //     mask[i][j] == -inf（跳过该位置）；有限值作为偏置加到得分上
-    //     （可用于 ALiBi 线性偏置）。nullptr = 无掩码。
+    //   - bias（可选）：AttnBias 组合描述子（见上）；默认空 = 无掩码/偏置。
     //   - 三原语均不物化中间 (M, N) 得分矩阵（GPU 融合 kernel 内部消解）。
     // ══════════════════════════════════════════════════════════════════════
 
     // 批量矩阵乘后沿输出列归约（softmax 数值稳定的分子/分母、norm 统计等）：
-    //   C_b[i] = reduce_j( alpha*op(A_b,B_b)[i][j] + mask[i][j] )
+    //   C_b[i] = reduce_j( alpha*op(A_b,B_b)[i][j] + bias(bb,i,j) )
     // 输出：每 batch (M, 1) → 堆叠 (batch*M, 1)；reduce_cols=false 时
     // 沿输出行归约 → 每 batch (1, N) → 堆叠 (batch, N)。
     [[nodiscard]] virtual Result<Tensor> batched_matmul_reduce(
         const Tensor& A, const Tensor& B, std::size_t batch,
         ReduceOp op, bool transA, bool transB,
         Scalar alpha, bool reduce_cols = true,
-        const Tensor* mask = nullptr) = 0;
+        const AttnBias& bias = {}) = 0;
 
     // 批量矩阵乘后：减行 max → exp → 沿输出列求和（softmax 分母，含数值稳定）：
-    //   l_b[i] = Σ_j exp( alpha*op(A_b,B_b)[i][j] + mask[i][j] - row_max_b[i] )
+    //   l_b[i] = Σ_j exp( alpha*op(A_b,B_b)[i][j] + bias(bb,i,j) - row_max_b[i] )
     // 输出：每 batch (M, 1) → 堆叠 (batch*M, 1)
     [[nodiscard]] virtual Result<Tensor> batched_matmul_softmax_denom(
         const Tensor& A, const Tensor& B, const Tensor& row_max,
         std::size_t batch, bool transA, bool transB, Scalar alpha,
-        const Tensor* mask = nullptr) = 0;
+        const AttnBias& bias = {}) = 0;
 
     // 批量矩阵乘 + 行 softmax 归一化后与第三张量相乘累加（两趟式注意力 Pass 2）：
-    //   W_b[i][j] = exp( alpha*op(A_b,B_b)[i][j] + mask[i][j] - row_max_b[i] ) / denom_b[i]
+    //   W_b[i][j] = exp( alpha*op(A_b,B_b)[i][j] + bias(bb,i,j) - row_max_b[i] ) / denom_b[i]
     //   out_b[i][k] = Σ_j W_b[i][j] * V_b[j][k]
     // V 布局同 batched_matmul（每 batch 垂直堆叠 (V_rows_per, N)）；
     // 输出：每 batch (M, V_cols) → 堆叠 (batch*M, V_cols)。
@@ -284,12 +318,12 @@ public:
         const Tensor& A, const Tensor& B, const Tensor& V,
         const Tensor& row_max, const Tensor& denom,
         std::size_t batch, bool transA, bool transB, Scalar alpha,
-        const Tensor* mask = nullptr) = 0;
+        const AttnBias& bias = {}) = 0;
 
     // ══════════════════════════════════════════════════════════════════════
     // 两趟式注意力反向融合原语（M6，重算 W 不物化得分矩阵）
     //
-    // 语义（全部在 kernel 内部重算 W[i][j] = exp(alpha*score+mask-row_max)/denom，
+    // 语义（全部在 kernel 内部重算 W[i][j] = exp(alpha*score+bias-row_max)/denom，
     // 绝不物化 (M, N) 得分/概率矩阵）：
     //   Pass 1 (backward_q)：沿输出行归约 + 与 B 左乘（grad_Q）：
     //     R[i]         = Σ_j W[i][j] * P[i][j]                    → r_out (batch*M,1)
@@ -303,7 +337,7 @@ public:
     //   - A 布局同 batched_matmul（每 batch (K, M) 按 transA 解释），B 每 batch (K, N)。
     //   - P/G/R/row_max/denom 按 batch 垂直堆叠：P (batch*M,N)、G (batch*M,D)、
     //     R/row_max/denom (batch*M,1)。
-    //   - mask（可选）：(M, N) 共享掩码，语义与 M4 原语一致。
+    //   - bias（可选）：AttnBias 组合描述子，语义与 M4 原语一致。
     //   - 返回 grad_Q / grad_K；R / grad_V 经 out 参数（引擎负责分配输出）。
     // ══════════════════════════════════════════════════════════════════════
 
@@ -312,7 +346,7 @@ public:
         const Tensor& A, const Tensor& B, const Tensor& P,
         const Tensor& row_max, const Tensor& denom,
         std::size_t batch, bool transA, bool transB, Scalar alpha,
-        Tensor& r_out, const Tensor* mask = nullptr) = 0;
+        Tensor& r_out, const AttnBias& bias = {}) = 0;
 
     // Pass 2：grad_K 与 grad_V（单次 dispatch 计算两者，共享重算的 W 列）。
     [[nodiscard]] virtual Result<Tensor> batched_matmul_softmax_backward_kv(
@@ -320,7 +354,7 @@ public:
         const Tensor& G, const Tensor& R,
         const Tensor& row_max, const Tensor& denom,
         std::size_t batch, bool transA, bool transB, Scalar alpha,
-        Tensor& grad_v_out, const Tensor* mask = nullptr) = 0;
+        Tensor& grad_v_out, const AttnBias& bias = {}) = 0;
 
     // ══════════════════════════════════════════════════════════════════════
     // 列式 softmax 相关融合原语（M5，CrossEntropy 融合的承载点；op-level 结构）

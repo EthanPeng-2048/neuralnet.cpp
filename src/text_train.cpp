@@ -872,11 +872,15 @@ int main(int argc, char *argv[])
         std::cout << "文档感知掩码已启用（每行 = 一篇文档，"
                   << flow_doc_ids.back() << " 篇文档，已删除 BOS/EOS）\n";
 
-    // 切窗口：每个窗口 = 一个训练样本（长度 seq_len，末窗不足则 PAD）
+    // 切窗口：每个窗口 = 一个训练样本（长度 seq_len，末窗不足则 PAD）。
+    // 保留全部窗口（含跨文档）；文档感知经 M7 AttnBias 块对角掩码在两趟式
+    // 融合路径内生效（不物化 (BH·seq,seq)），无需再丢弃跨文档窗口。
     std::vector<std::size_t> window_offsets;  // 每个窗口在 token_flow 中的起始偏移
     window_offsets.reserve(token_flow.size() / stride + 1);
     for (std::size_t pos = 0; pos < token_flow.size(); pos += stride)
+    {
         window_offsets.push_back(pos);
+    }
     std::cout << "滑动窗口: seq_len=" << cfg.seq_len << " stride=" << stride
               << " 样本数=" << window_offsets.size() << "\n" << std::endl;
 
@@ -951,6 +955,8 @@ int main(int argc, char *argv[])
         }
         model.set_activation_offload(true);
         std::cout << "activation offload 已启用: 每块激活搬 host-visible，backward 拷回（不重算）\n";
+        std::cout << "  理论 offload RAM: " << (model.offload_ram_bytes() / (1024*1024))
+                  << " MB（实际含驱动/对齐可能更高）\n";
     }
 
     // ── 构建规格（用于保存） ─────────────────────────────────
@@ -1073,8 +1079,11 @@ int main(int argc, char *argv[])
                                     test_flow, test_flow_doc_ids);
         }
 
+        // 测试窗口：保留全部窗口（与训练一致，含跨文档；文档感知两趟式生效）
         for (std::size_t pos = 0; pos < test_flow.size(); pos += stride)
+        {
             test_window_offsets.push_back(pos);
+        }
         std::cout << "测试集: " << cfg.test_path << "  样本数: " << test_window_offsets.size()
                   << "  tokens: " << test_flow.size() << std::endl;
     }
@@ -1196,13 +1205,14 @@ int main(int argc, char *argv[])
                 }
             }
 
-            // ── 文档感知：每窗口 doc_ids（batch-major b*seq+t） ──────
+            // ── 文档感知 ────────────────────────────────────────
             // 行边界即文档边界（每行 = 一篇文档，见 build_flow_doc_ids）。
-            // PAD 位置 doc=0（区别于真实文档，从 1 起），块对角上互相隔离。
-            // flow_doc_ids 为空（无 BOS）时 doc_ids 为空 → set_doc_ids 退化为纯因果。
-            std::vector<std::size_t> doc_ids(cfg.seq_len * this_bs, 0);
+            // 为每窗口设 doc_ids 施加块对角掩码；M7 AttnBias 使该路径走两趟式
+            //（不物化 (BH·seq,seq)），无需再丢弃跨文档窗口。
+            std::vector<std::size_t> doc_ids;
             if (!flow_doc_ids.empty())
             {
+                doc_ids.assign(cfg.seq_len * this_bs, 0);
                 for (std::size_t b = 0; b < this_bs; ++b)
                 {
                     const std::size_t win_pos = window_offsets[sample_indices[offset + b]];
@@ -1212,12 +1222,8 @@ int main(int argc, char *argv[])
                         if (t < win_len)
                             doc_ids[b * cfg.seq_len + t] = flow_doc_ids[win_pos + t];
                 }
-                model.set_doc_ids(doc_ids);
             }
-            else
-            {
-                model.set_doc_ids({});
-            }
+            model.set_doc_ids(doc_ids);
 
             // ── Matrix → Tensor（上传到引擎设备） ──────────────
             auto x_tensor_r = engine->from_matrix(x_tokens);
@@ -1394,7 +1400,14 @@ int main(int argc, char *argv[])
                 std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
                           << "  step " << step + 1 << "/" << steps_per_epoch
                           << "  loss: " << std::fixed << std::setprecision(4) << loss
-                          << "   " << std::flush;
+                          << "   ";
+                // 显存池统计（GPU 有效）：dev=真实显存 host=offload RAM
+                const auto ps = engine->pool_stats();
+                if (!ps.empty())
+                    std::cout << "[pool: " << ps << "]  ";
+                if (cfg.activation_offload)
+                    std::cout << "[offload " << (model.offload_ram_bytes() / (1024*1024)) << "MB]  ";
+                std::cout << std::flush;
             }
         }
 
@@ -1454,11 +1467,12 @@ int main(int argc, char *argv[])
                 auto x_tensor_r = engine->from_matrix(x_tokens);
                 if (!x_tensor_r) { std::cerr << "  测试 from_matrix 失败: " << x_tensor_r.error().message << '\n'; break; }
 
-                // 文档感知：与训练一致，为测试 batch 设置每窗口 doc_ids
+                // 文档感知：与训练一致；为每窗口设 doc_ids（M7 两趟式块对角掩码）
                 {
-                    std::vector<std::size_t> test_doc_ids(cfg.seq_len * this_bs, 0);
+                    std::vector<std::size_t> test_doc_ids;
                     if (!test_flow_doc_ids.empty())
                     {
+                        test_doc_ids.assign(cfg.seq_len * this_bs, 0);
                         for (std::size_t b = 0; b < this_bs; ++b)
                         {
                             const std::size_t win_pos = test_window_offsets[toffset + b];

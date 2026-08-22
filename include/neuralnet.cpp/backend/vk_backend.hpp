@@ -1131,46 +1131,47 @@ public:
         }
 
         // 9b2. M4 matmul 融合原语 pipelines
-        // bmm_reduce: 4 bindings (A,B,Mask,Out), PC M,N,K,flags,alpha = 20B
+        // bmm_reduce: 6 bindings (A,B,Mask,DOC,SLOPES,Out), PC M,N,K,flags,num_heads,alpha = 24B
         const auto& bmm_reduce_spirv = get_bmm_reduce_spirv();
         if (!bmm_reduce_spirv.empty())
         {
             auto pr = VulkanPipeline::create_generic(
-                device_.device(), bmm_reduce_spirv, 4, 5 * sizeof(uint32_t));
+                device_.device(), bmm_reduce_spirv, 6, 6 * sizeof(uint32_t));
             if (pr) bmm_reduce_pipeline_ = std::move(*pr);
         }
-        // bmm_denom: 5 bindings (A,B,Mask,RowMax,Out), PC 20B
+        // bmm_denom: 7 bindings (A,B,Mask,RowMax,DOC,SLOPES,Out), PC 24B
         const auto& bmm_denom_spirv = get_bmm_denom_spirv();
         if (!bmm_denom_spirv.empty())
         {
             auto pr = VulkanPipeline::create_generic(
-                device_.device(), bmm_denom_spirv, 5, 5 * sizeof(uint32_t));
+                device_.device(), bmm_denom_spirv, 7, 6 * sizeof(uint32_t));
             if (pr) bmm_denom_pipeline_ = std::move(*pr);
         }
-        // bmm_apply: 7 bindings (A,B,Mask,RowMax,Denom,V,Out), PC M,N,K,D,flags,alpha = 24B
+        // bmm_apply: 9 bindings (A,B,Mask,RowMax,Denom,V,DOC,SLOPES,Out),
+        // PC M,N,K,D,flags,num_heads,alpha = 28B
         const auto& bmm_apply_spirv = get_bmm_apply_spirv();
         if (!bmm_apply_spirv.empty())
         {
             auto pr = VulkanPipeline::create_generic(
-                device_.device(), bmm_apply_spirv, 7, 6 * sizeof(uint32_t));
+                device_.device(), bmm_apply_spirv, 9, 7 * sizeof(uint32_t));
             if (pr) bmm_apply_pipeline_ = std::move(*pr);
         }
-        // M6 反向融合：bmm_q_backward 8 bindings (A,B,Mask,RowMax,Denom,P,OutR,OutGQ),
-        // PC M,N,K,flags,alpha = 20B
+        // M6 反向融合：bmm_q_backward 10 bindings
+        // (A,B,Mask,RowMax,Denom,P,DOC,SLOPES,OutR,OutGQ), PC M,N,K,flags,num_heads,alpha = 24B
         const auto& bmm_q_backward_spirv = get_bmm_q_backward_spirv();
         if (!bmm_q_backward_spirv.empty())
         {
             auto pr = VulkanPipeline::create_generic(
-                device_.device(), bmm_q_backward_spirv, 8, 5 * sizeof(uint32_t));
+                device_.device(), bmm_q_backward_spirv, 10, 6 * sizeof(uint32_t));
             if (pr) bmm_q_backward_pipeline_ = std::move(*pr);
         }
-        // bmm_kv_backward: 10 bindings (A,B,Mask,RowMax,Denom,P,G,R,OutK,OutV),
-        // PC M,N,K,D,flags,alpha = 24B
+        // bmm_kv_backward: 12 bindings
+        // (A,B,Mask,RowMax,Denom,P,G,R,DOC,SLOPES,OutV,OutK), PC M,N,K,D,flags,num_heads,alpha = 28B
         const auto& bmm_kv_backward_spirv = get_bmm_kv_backward_spirv();
         if (!bmm_kv_backward_spirv.empty())
         {
             auto pr = VulkanPipeline::create_generic(
-                device_.device(), bmm_kv_backward_spirv, 10, 6 * sizeof(uint32_t));
+                device_.device(), bmm_kv_backward_spirv, 12, 7 * sizeof(uint32_t));
             if (pr) bmm_kv_backward_pipeline_ = std::move(*pr);
         }
         // M5 列式 softmax 融合：col_softmax_denom 3 bindings (Logits,ColMax,Out),
@@ -1382,8 +1383,10 @@ public:
     // 输出 (batch*M, 1)；mask 为空时绑定 A 占位（has_mask=0）
     [[nodiscard]] Result<GpuTensor> bmm_reduce_gpu(
         const GpuTensor& A, const GpuTensor& B, const GpuTensor* mask,
+        const GpuTensor* doc_ids, const GpuTensor* slopes,
         std::size_t M, std::size_t N, std::size_t K, std::size_t batch,
-        std::size_t op, bool transA, bool transB, Scalar alpha)
+        std::size_t op, bool transA, bool transB, Scalar alpha,
+        bool causal, std::size_t num_heads)
     {
         if (!has_bmm_reduce_pipeline())
             return std::unexpected(Error{"bmm_reduce_gpu: pipeline not available"});
@@ -1392,19 +1395,22 @@ public:
         auto out = GpuTensor::create_empty(batch * M, 1, *this);
         if (!out) return std::unexpected(out.error());
 
-        std::vector<GpuTensor> inputs{A, B, mask ? *mask : A};
+        std::vector<GpuTensor> inputs{A, B, mask ? *mask : A,
+            doc_ids ? *doc_ids : A, slopes ? *slopes : A};
         const std::uint32_t flags =
             (transA ? 1u : 0u) | (transB ? 2u : 0u) | (mask ? 4u : 0u)
-            | (static_cast<std::uint32_t>(op & 3u) << 3u);
-        std::vector<std::uint8_t> pc(5 * sizeof(std::uint32_t));
+            | (doc_ids ? 8u : 0u) | (slopes ? 16u : 0u) | (causal ? 32u : 0u)
+            | (static_cast<std::uint32_t>(op & 3u) << 6u);
+        std::vector<std::uint8_t> pc(6 * sizeof(std::uint32_t));
         const auto put32 = [&](std::size_t off, std::uint32_t v)
         { std::memcpy(pc.data() + off, &v, sizeof(std::uint32_t)); };
         put32(0, static_cast<std::uint32_t>(M));
         put32(4, static_cast<std::uint32_t>(N));
         put32(8, static_cast<std::uint32_t>(K));
         put32(12, flags);
+        put32(16, static_cast<std::uint32_t>(num_heads));
         const float af = static_cast<float>(alpha);
-        std::memcpy(pc.data() + 16, &af, sizeof(float));
+        std::memcpy(pc.data() + 20, &af, sizeof(float));
 
         auto r = dispatch_bmm_generic(bmm_reduce_pipeline_, inputs, *out, pc,
             static_cast<std::uint32_t>(batch * M));
@@ -1416,9 +1422,11 @@ public:
     // 输出 (batch*M, 1)
     [[nodiscard]] Result<GpuTensor> bmm_denom_gpu(
         const GpuTensor& A, const GpuTensor& B, const GpuTensor* mask,
+        const GpuTensor* doc_ids, const GpuTensor* slopes,
         const GpuTensor& row_max,
         std::size_t M, std::size_t N, std::size_t K, std::size_t batch,
-        bool transA, bool transB, Scalar alpha)
+        bool transA, bool transB, Scalar alpha,
+        bool causal, std::size_t num_heads)
     {
         if (!has_bmm_denom_pipeline())
             return std::unexpected(Error{"bmm_denom_gpu: pipeline not available"});
@@ -1427,18 +1435,21 @@ public:
         auto out = GpuTensor::create_empty(batch * M, 1, *this);
         if (!out) return std::unexpected(out.error());
 
-        std::vector<GpuTensor> inputs{A, B, mask ? *mask : A, row_max};
+        std::vector<GpuTensor> inputs{A, B, mask ? *mask : A, row_max,
+            doc_ids ? *doc_ids : A, slopes ? *slopes : A};
         const std::uint32_t flags =
-            (transA ? 1u : 0u) | (transB ? 2u : 0u) | (mask ? 4u : 0u);
-        std::vector<std::uint8_t> pc(5 * sizeof(std::uint32_t));
+            (transA ? 1u : 0u) | (transB ? 2u : 0u) | (mask ? 4u : 0u)
+            | (doc_ids ? 8u : 0u) | (slopes ? 16u : 0u) | (causal ? 32u : 0u);
+        std::vector<std::uint8_t> pc(6 * sizeof(std::uint32_t));
         const auto put32 = [&](std::size_t off, std::uint32_t v)
         { std::memcpy(pc.data() + off, &v, sizeof(std::uint32_t)); };
         put32(0, static_cast<std::uint32_t>(M));
         put32(4, static_cast<std::uint32_t>(N));
         put32(8, static_cast<std::uint32_t>(K));
         put32(12, flags);
+        put32(16, static_cast<std::uint32_t>(num_heads));
         const float af = static_cast<float>(alpha);
-        std::memcpy(pc.data() + 16, &af, sizeof(float));
+        std::memcpy(pc.data() + 20, &af, sizeof(float));
 
         auto r = dispatch_bmm_generic(bmm_denom_pipeline_, inputs, *out, pc,
             static_cast<std::uint32_t>(batch * M));
@@ -1451,9 +1462,11 @@ public:
     // V: (batch*N, D)；输出 (batch*M, D)
     [[nodiscard]] Result<GpuTensor> bmm_apply_gpu(
         const GpuTensor& A, const GpuTensor& B, const GpuTensor* mask,
+        const GpuTensor* doc_ids, const GpuTensor* slopes,
         const GpuTensor& row_max, const GpuTensor& denom, const GpuTensor& V,
         std::size_t M, std::size_t N, std::size_t K, std::size_t D,
-        std::size_t batch, bool transA, bool transB, Scalar alpha)
+        std::size_t batch, bool transA, bool transB, Scalar alpha,
+        bool causal, std::size_t num_heads)
     {
         if (!has_bmm_apply_pipeline())
             return std::unexpected(Error{"bmm_apply_gpu: pipeline not available"});
@@ -1462,10 +1475,12 @@ public:
         auto out = GpuTensor::create_empty(batch * M, D, *this);
         if (!out) return std::unexpected(out.error());
 
-        std::vector<GpuTensor> inputs{A, B, mask ? *mask : A, row_max, denom, V};
+        std::vector<GpuTensor> inputs{A, B, mask ? *mask : A, row_max, denom, V,
+            doc_ids ? *doc_ids : A, slopes ? *slopes : A};
         const std::uint32_t flags =
-            (transA ? 1u : 0u) | (transB ? 2u : 0u) | (mask ? 4u : 0u);
-        std::vector<std::uint8_t> pc(6 * sizeof(std::uint32_t));
+            (transA ? 1u : 0u) | (transB ? 2u : 0u) | (mask ? 4u : 0u)
+            | (doc_ids ? 8u : 0u) | (slopes ? 16u : 0u) | (causal ? 32u : 0u);
+        std::vector<std::uint8_t> pc(7 * sizeof(std::uint32_t));
         const auto put32 = [&](std::size_t off, std::uint32_t v)
         { std::memcpy(pc.data() + off, &v, sizeof(std::uint32_t)); };
         put32(0, static_cast<std::uint32_t>(M));
@@ -1473,8 +1488,9 @@ public:
         put32(8, static_cast<std::uint32_t>(K));
         put32(12, static_cast<std::uint32_t>(D));
         put32(16, flags);
+        put32(20, static_cast<std::uint32_t>(num_heads));
         const float af = static_cast<float>(alpha);
-        std::memcpy(pc.data() + 20, &af, sizeof(float));
+        std::memcpy(pc.data() + 24, &af, sizeof(float));
 
         auto r = dispatch_bmm_generic(bmm_apply_pipeline_, inputs, *out, pc,
             static_cast<std::uint32_t>(batch * M));
@@ -1488,9 +1504,11 @@ public:
     // 输出两个张量：返回 grad_Q，R 经 r_out 传出。
     [[nodiscard]] Result<GpuTensor> bmm_q_backward_gpu(
         const GpuTensor& A, const GpuTensor& B, const GpuTensor* mask,
+        const GpuTensor* doc_ids, const GpuTensor* slopes,
         const GpuTensor& row_max, const GpuTensor& denom, const GpuTensor& P,
         std::size_t M, std::size_t N, std::size_t K, std::size_t batch,
-        bool transA, bool transB, Scalar alpha, GpuTensor* r_out)
+        bool transA, bool transB, Scalar alpha,
+        bool causal, std::size_t num_heads, GpuTensor* r_out)
     {
         if (!has_bmm_q_backward_pipeline())
             return std::unexpected(Error{"bmm_q_backward_gpu: pipeline not available"});
@@ -1501,20 +1519,24 @@ public:
         auto rout = GpuTensor::create_empty(batch * M, 1, *this);
         if (!rout) return std::unexpected(rout.error());
 
-        std::vector<GpuTensor> inputs{A, B, mask ? *mask : A, row_max, denom, P};
+        std::vector<GpuTensor> inputs{A, B, mask ? *mask : A, row_max, denom, P,
+            doc_ids ? *doc_ids : A, slopes ? *slopes : A};
         const std::uint32_t flags =
-            (transA ? 1u : 0u) | (transB ? 2u : 0u) | (mask ? 4u : 0u);
-        std::vector<std::uint8_t> pc(5 * sizeof(std::uint32_t));
+            (transA ? 1u : 0u) | (transB ? 2u : 0u) | (mask ? 4u : 0u)
+            | (doc_ids ? 8u : 0u) | (slopes ? 16u : 0u) | (causal ? 32u : 0u);
+        std::vector<std::uint8_t> pc(6 * sizeof(std::uint32_t));
         const auto put32 = [&](std::size_t off, std::uint32_t v)
         { std::memcpy(pc.data() + off, &v, sizeof(std::uint32_t)); };
         put32(0, static_cast<std::uint32_t>(M));
         put32(4, static_cast<std::uint32_t>(N));
         put32(8, static_cast<std::uint32_t>(K));
         put32(12, flags);
+        put32(16, static_cast<std::uint32_t>(num_heads));
         const float af = static_cast<float>(alpha);
-        std::memcpy(pc.data() + 16, &af, sizeof(float));
+        std::memcpy(pc.data() + 20, &af, sizeof(float));
 
-        // bindings：A(0),B(1),Mask(2),RowMax(3),Denom(4),P(5),OutR(6),OutGQ(7)
+        // bindings：A(0),B(1),Mask(2),RowMax(3),Denom(4),P(5),Doc(6),Slopes(7),
+        //           OutR(8),OutGQ(9)
         inputs.push_back(*rout);
         auto r = dispatch_bmm_generic(bmm_q_backward_pipeline_, inputs, *out, pc,
             static_cast<std::uint32_t>(batch * M));
@@ -1529,10 +1551,12 @@ public:
     // 输出两个张量：返回 grad_K，grad_V 经 gv_out 传出。
     [[nodiscard]] Result<GpuTensor> bmm_kv_backward_gpu(
         const GpuTensor& A, const GpuTensor& B, const GpuTensor* mask,
+        const GpuTensor* doc_ids, const GpuTensor* slopes,
         const GpuTensor& row_max, const GpuTensor& denom, const GpuTensor& P,
         const GpuTensor& G, const GpuTensor& R,
         std::size_t M, std::size_t N, std::size_t K, std::size_t D,
         std::size_t batch, bool transA, bool transB, Scalar alpha,
+        bool causal, std::size_t num_heads,
         GpuTensor* gv_out)
     {
         if (!has_bmm_kv_backward_pipeline())
@@ -1544,10 +1568,12 @@ public:
         auto gvout = GpuTensor::create_empty(batch * K, N, *this);
         if (!gvout) return std::unexpected(gvout.error());
 
-        std::vector<GpuTensor> inputs{A, B, mask ? *mask : A, row_max, denom, P, G, R};
+        std::vector<GpuTensor> inputs{A, B, mask ? *mask : A, row_max, denom, P, G, R,
+            doc_ids ? *doc_ids : A, slopes ? *slopes : A};
         const std::uint32_t flags =
-            (transA ? 1u : 0u) | (transB ? 2u : 0u) | (mask ? 4u : 0u);
-        std::vector<std::uint8_t> pc(6 * sizeof(std::uint32_t));
+            (transA ? 1u : 0u) | (transB ? 2u : 0u) | (mask ? 4u : 0u)
+            | (doc_ids ? 8u : 0u) | (slopes ? 16u : 0u) | (causal ? 32u : 0u);
+        std::vector<std::uint8_t> pc(7 * sizeof(std::uint32_t));
         const auto put32 = [&](std::size_t off, std::uint32_t v)
         { std::memcpy(pc.data() + off, &v, sizeof(std::uint32_t)); };
         put32(0, static_cast<std::uint32_t>(M));
@@ -1555,10 +1581,12 @@ public:
         put32(8, static_cast<std::uint32_t>(K));
         put32(12, static_cast<std::uint32_t>(D));
         put32(16, flags);
+        put32(20, static_cast<std::uint32_t>(num_heads));
         const float af = static_cast<float>(alpha);
-        std::memcpy(pc.data() + 20, &af, sizeof(float));
+        std::memcpy(pc.data() + 24, &af, sizeof(float));
 
-        // bindings：A(0),B(1),Mask(2),RowMax(3),Denom(4),P(5),G(6),R(7),OutK(8),OutV(9)
+        // bindings：A(0),B(1),Mask(2),RowMax(3),Denom(4),P(5),G(6),R(7),
+        //           Doc(8),Slopes(9),OutV(10),OutK(11)（grad_K 返回输出须在最后）
         inputs.push_back(*gvout);
         auto r = dispatch_bmm_generic(bmm_kv_backward_pipeline_, inputs, *out, pc,
             static_cast<std::uint32_t>(batch * N));

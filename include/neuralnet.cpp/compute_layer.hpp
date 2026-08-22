@@ -122,6 +122,9 @@ public:
 
     // activation offload（L1-offload）开关（默认 no-op；GPTModel override）
     virtual void set_activation_offload(bool /*enabled*/) {}
+
+    // 理论 offload RAM 字节数（各层累计；默认 0，GPTModel override）
+    [[nodiscard]] virtual std::size_t offload_ram_bytes() { return 0; }
 };
 
 // ── 辅助：深拷贝 Tensor（通过 engine.clone()，无 PCIe 传输） ──────────────
@@ -960,6 +963,9 @@ public:
 
     void clear_cache() override { output_cache_ = Tensor{}; }
 
+    // 供组合层（AttentionBase）读取/复用 softmax 输出，避免重复存一份
+    Tensor& output_cache() { return output_cache_; }
+
     std::vector<TensorRef> activation_cache() override
     {
         std::vector<TensorRef> r;
@@ -981,9 +987,11 @@ public:
                 dsl::exp(dsl::leaf(input) - dsl::row_reduce_max(input))),
             input.rows(), input.cols());
         if (!out) return std::unexpected(out.error());
-        if (!checkpoint_mode_)
-            output_cache_ = *out;
-        return out;
+        if (checkpoint_mode_)
+            return out;
+        // 单缓冲：把结果移入 output_cache_（唯一持有者），返回共享同一 buffer
+        output_cache_ = std::move(*out);
+        return output_cache_;
     }
 
     [[nodiscard]] Result<Tensor> backward(
@@ -1178,24 +1186,25 @@ protected:
 
     // 两趟式缓存（M6）：m/l 替代 attn_cache_（不物化得分矩阵）
     Tensor m_cache_, l_cache_;   // (batch*H*seq, 1)：行 max / softmax 分母
-    Tensor two_pass_mask_cache_;  // 共享 (seq, seq) 掩码（空 = 无掩码）
+    AttnBias two_pass_bias_;     // 两趟式组合偏置描述子（指针指向子类缓存张量）
     bool two_pass_active_ = false;  // forward 是否走了两趟式路径（backward 读取）
 
     // ── 两趟式（M6）决策钩子 ──────────────────────────────────────────
     // 决定是否用两趟式注意力（不物化 (BH*seq, seq) 得分/概率矩阵，显存峰值
-    // 从 ~3-4×BH·seq² 降至 ~1×）。返回 {use_two_pass, mask}：
-    //   - use_two_pass=true：两趟式；mask 为共享 (seq, seq) 掩码（空 = 无掩码）
-    //   - use_two_pass=false：回退旧路径（掩码不适用共享形式时，如 ALiBi/doc_ids）
+    // 从 ~3-4×BH·seq² 降至 ~1×）。返回 {use_two_pass, bias}：
+    //   - use_two_pass=true：两趟式；bias 为组合式 AttnBias 描述子
+    //     （causal / doc_ids / slopes，见 compute_engine.hpp；空 = 无偏置/掩码）
+    //   - use_two_pass=false：回退旧路径
     struct TwoPassMask
     {
         bool use_two_pass = true;
-        Tensor mask;
+        AttnBias bias;
     };
     [[nodiscard]] virtual Result<TwoPassMask> two_pass_mask_(
         ComputeEngine& engine, std::size_t batch, std::size_t seq)
     {
         (void)engine; (void)batch; (void)seq;
-        return TwoPassMask{true, {}};  // MHA：无掩码，两趟式
+        return TwoPassMask{true, AttnBias{}};  // MHA：无偏置，两趟式
     }
 
     // 掩码钩子：子类重写以施加掩码，默认 no-op（MHA 行为）
@@ -1288,7 +1297,8 @@ public:
         attn_cache_ = Tensor{};
         m_cache_ = Tensor{};
         l_cache_ = Tensor{};
-        // 掩码（two_pass_mask_cache_ 等）小而常驻，不随激活清理
+        // 掩码/偏置描述子（two_pass_bias_ 指向子类 doc_ids/slopes 缓存）小而常驻，
+        // 不随激活清理
         w_q_.clear_cache();
         w_k_.clear_cache();
         w_v_.clear_cache();
@@ -1302,7 +1312,6 @@ public:
         if (Q_cache_.valid()) r.emplace_back(Q_cache_);
         if (K_cache_.valid()) r.emplace_back(K_cache_);
         if (V_cache_.valid()) r.emplace_back(V_cache_);
-        if (attn_cache_.valid()) r.emplace_back(attn_cache_);
         if (m_cache_.valid()) r.emplace_back(m_cache_);
         if (l_cache_.valid()) r.emplace_back(l_cache_);
         auto wq = w_q_.activation_cache(); r.insert(r.end(), wq.begin(), wq.end());
@@ -1381,15 +1390,13 @@ public:
             //   m = rowmax(scale·Q·K^T + mask)        → (BH*seq, 1)
             //   l = Σ_j exp(scale·Q·K^T + mask − m)   → (BH*seq, 1)
             //   O = W·V_t（W = softmax 归一化权重）    → (BH*seq, d_k)
-            two_pass_mask_cache_ = std::move(tpm->mask);
-            const Tensor* mask_ptr =
-                (two_pass_mask_cache_.rows() > 0) ? &two_pass_mask_cache_ : nullptr;
+            two_pass_bias_ = tpm->bias;
             auto m = engine.batched_matmul_reduce(
                 Q, K, BH, ReduceOp::Max, true, false,
-                scale_, /*reduce_cols=*/true, mask_ptr);
+                scale_, /*reduce_cols=*/true, two_pass_bias_);
             if (!m) return std::unexpected(m.error());
             auto l = engine.batched_matmul_softmax_denom(
-                Q, K, *m, BH, true, false, scale_, mask_ptr);
+                Q, K, *m, BH, true, false, scale_, two_pass_bias_);
             if (!l) return std::unexpected(l.error());
             // V 需 (BH*seq, d_k) 布局（apply 原语的 V 约定）：V (BH*d_k, seq)
             // 是 per-batch (d_k, seq)，需按 batch 转置：
@@ -1399,7 +1406,7 @@ public:
             auto V_t = engine.rearrange_3d(*V_T_full, seq, BH, d_k_, false);
             if (!V_t) return std::unexpected(V_t.error());
             auto O_t = engine.batched_matmul_softmax_apply(
-                Q, K, *V_t, *m, *l, BH, true, false, scale_, mask_ptr);
+                Q, K, *V_t, *m, *l, BH, true, false, scale_, two_pass_bias_);
             if (!O_t) return std::unexpected(O_t.error());
             // O_t: (BH*seq, d_k) → 按 batch 转置回 (BH*d_k, seq) 供后续 rearrange：
             //   transpose → (d_k, BH*seq) → rearrange_3d(d_k, BH, seq) → (BH*d_k, seq)
@@ -1442,7 +1449,8 @@ public:
             concat_out = std::move(*co);
             if (!checkpoint_mode_)
             {
-                attn_cache_ = std::move(A);
+                // 注意力概率由 softmax_.output_cache() 单一持有（A 与其共享 buffer），
+                // 不再另存 attn_cache_（避免旧路径重复存一份 (BH*seq, seq) 大矩阵）
                 Q_cache_ = std::move(Q);
                 K_cache_ = std::move(K);
                 V_cache_ = std::move(V);
@@ -1497,8 +1505,6 @@ public:
         Tensor grad_Q_re, grad_K_re, grad_V_re;  // 均 (batch*H*d_k, seq)
         if (two_pass_active_)
         {
-            const Tensor* mask_ptr =
-                (two_pass_mask_cache_.rows() > 0) ? &two_pass_mask_cache_ : nullptr;
             // P = grad_A = batched_matmul(grad_concat^T, V, BH, true, false)
             // forward: O = V × A^T → grad_A = grad_O^T × V（两趟式反向的 P 输入）
             auto grad_A = engine.batched_matmul(
@@ -1515,13 +1521,13 @@ public:
             Tensor R;
             auto gq = engine.batched_matmul_softmax_backward_q(
                 Q_cache_, K_cache_, *grad_A, m_cache_, l_cache_,
-                BH, true, false, scale_, R, mask_ptr);
+                BH, true, false, scale_, R, two_pass_bias_);
             if (!gq) return std::unexpected(gq.error());
             // Pass 2：grad_K[:,j] = scale·Σ_i W·(P−R)·Q_b[:,i]；
             //          grad_V[j][k] = Σ_i W·G[i][k]
             auto gkv = engine.batched_matmul_softmax_backward_kv(
                 Q_cache_, K_cache_, *grad_A, *G, R, m_cache_, l_cache_,
-                BH, true, false, scale_, grad_V_re, mask_ptr);
+                BH, true, false, scale_, grad_V_re, two_pass_bias_);
             if (!gkv) return std::unexpected(gkv.error());
             grad_Q_re = std::move(*gq);
             grad_K_re = std::move(*gkv);
@@ -1530,8 +1536,9 @@ public:
         {
             // grad_V_re = batched_matmul(grad_concat, A, BH, false, false)
             // forward: O = V × A^T → grad_V = grad_O × A
+            // A 由 softmax.output_cache() 单一持有（避免 attn_cache_ 重复存一份）
             auto gvr = engine.batched_matmul(
-                grad_concat_re, attn_cache_, BH, false, false);
+                grad_concat_re, softmax_.output_cache(), BH, false, false);
             if (!gvr) return std::unexpected(gvr.error());
             grad_V_re = std::move(*gvr);
             // grad_A = batched_matmul(grad_concat^T, V, BH, true, false)
@@ -2434,9 +2441,9 @@ private:
     std::size_t mask_cached_batch_ = 0;  // 缓存键：batch（独立字段，避免位打包溢出）
     std::size_t mask_cached_seq_ = 0;    // 缓存键：seq_len
 
-    // 两趟式（M6）共享掩码缓存：(seq, seq)，仅纯因果模式（无 ALiBi/doc_ids）
-    Tensor shared_mask_cache_;
-    std::size_t shared_mask_seq_ = 0;    // 缓存键：seq_len
+    // 两趟式（M6）组合偏置小张量缓存（AttnBias 描述子指向它们）
+    Tensor slopes_cache_;   // (1, num_heads) ALiBi 按头斜率（惰性构建）
+    Tensor doc_ids_cache_;  // (1, batch*seq) 每位置文档 id（每步重建）
 
     // ALiBi 斜率：m_h = 2^(-8h/H)（仅 use_alibi_ = true 时使用）
     std::vector<Scalar> slopes_;
@@ -2507,26 +2514,39 @@ protected:
         return engine.elementwise_binary(BinaryOp::Add, scores, mask_cache_);
     }
 
-    // 重写两趟式决策：纯因果（无 ALiBi、无 doc_ids）→ 共享 (seq, seq) 掩码两趟式；
-    // ALiBi（按头偏置）或 doc_ids（按样本掩码）不适用共享掩码 → 回退旧路径。
+    // 重写两趟式决策：组合式 AttnBias 描述子统一 因果/ALiBi/doc_ids（及其组合），
+    // 全部走两趟式（不物化 (BH·seq, seq) 得分矩阵），不再回退旧路径。
     [[nodiscard]] Result<TwoPassMask> two_pass_mask_(
-        ComputeEngine& engine, std::size_t /*batch*/, std::size_t seq) override
+        ComputeEngine& engine, std::size_t batch, std::size_t seq) override
     {
-        if (use_alibi_ || has_doc_ids_)
-            return TwoPassMask{/*use_two_pass=*/false, {}};
-        if (shared_mask_seq_ != seq)
+        AttnBias bias;
+        bias.causal = true;
+        bias.num_heads = num_heads_;
+        if (use_alibi_)
         {
-            Matrix mask(seq, seq, Scalar{0});
-            const Scalar neg_inf = -std::numeric_limits<Scalar>::infinity();
-            for (std::size_t i = 0; i < seq; ++i)
-                for (std::size_t j = i + 1; j < seq; ++j)
-                    mask.set_value_unchecked(i, j, neg_inf);
-            auto t = engine.from_matrix(mask);
-            if (!t) return std::unexpected(t.error());
-            shared_mask_cache_ = std::move(*t);
-            shared_mask_seq_ = seq;
+            if (!slopes_cache_.valid())
+            {
+                Matrix s(1, num_heads_);
+                for (std::size_t h = 0; h < num_heads_; ++h)
+                    s.set_value_unchecked(0, h, slopes_[h]);
+                auto t = engine.from_matrix(s);
+                if (!t) return std::unexpected(t.error());
+                slopes_cache_ = std::move(*t);
+            }
+            bias.slopes = &slopes_cache_;
         }
-        return TwoPassMask{/*use_two_pass=*/true, shared_mask_cache_};
+        if (has_doc_ids_)
+        {
+            // 文档感知：doc_ids_ 每 batch 变化，每步重建（小张量 O(batch*seq)）
+            Matrix d(1, batch * seq);
+            for (std::size_t p = 0; p < batch * seq; ++p)
+                d.set_value_unchecked(0, p, static_cast<Scalar>(doc_ids_[p]));
+            auto t = engine.from_matrix(d);
+            if (!t) return std::unexpected(t.error());
+            doc_ids_cache_ = std::move(*t);
+            bias.doc_ids = &doc_ids_cache_;
+        }
+        return TwoPassMask{/*use_two_pass=*/true, bias};
     }
 
     // 重写增量推理掩码钩子：ALiBi 模式下施加线性距离偏置。
@@ -2700,6 +2720,23 @@ public:
         offload_refs_ = activation_cache();
         offload_offsets_.clear();
         offload_shapes_.clear();
+        // 一次性明细诊断（仅首个块首次导出打印一次）
+        {
+            static bool dumped = false;
+            if (!dumped)
+            {
+                std::size_t sum = 0;
+                for (auto& ref : offload_refs_)
+                {
+                    if (!ref.get().valid()) continue;
+                    sum += ref.get().size();
+                    std::cout << "[offload-diag] tensor " << ref.get().rows() << "x"
+                              << ref.get().cols() << " = " << (ref.get().size() * 4 / (1024*1024)) << "MB\n";
+                }
+                std::cout << "[offload-diag] block0 slab sum = " << (sum * 4 / (1024*1024)) << "MB\n";
+                dumped = true;
+            }
+        }
         // 惰性创建持久 slab（大小 = 本块激活总 float 数，跨 step 复用）
         if (!offload_slab_.valid())
         {
@@ -2739,6 +2776,12 @@ public:
         }
         offloaded_ = false;
         return {};
+    }
+
+    // 实际 slab 字节数（诊断用；未创建时 0）
+    [[nodiscard]] std::size_t offload_slab_bytes() const noexcept
+    {
+        return offload_slab_.valid() ? offload_slab_.size() * sizeof(float) : 0;
     }
 
     [[nodiscard]] Result<Tensor> forward(
@@ -3351,6 +3394,15 @@ public:
         for (auto& b : blocks_) b.set_offload_enabled(enabled);
     }
     [[nodiscard]] bool activation_offload() const noexcept { return activation_offload_; }
+
+    // 实际 offload RAM 字节数：各块已创建 slab 大小之和（诊断用）
+    [[nodiscard]] std::size_t offload_ram_bytes() override
+    {
+        std::size_t total = 0;
+        for (auto& b : blocks_)
+            total += b.offload_slab_bytes();
+        return total;
+    }
 
     // 梯度检查点：把模式传播给所有块与末级归一化/LM Head
     // （当本 GPTModel 整体作为 Model 的一层被置于 checkpoint 模式时生效）

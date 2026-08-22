@@ -388,6 +388,44 @@ public:
         return Tensor::from_gpu(std::move(*r));
     }
 
+private:
+    // AttnBias 的 GPU 小张量准备（doc_ids/slopes 上传 + causal/num_heads），
+    // 供 5 个两趟式融合原语 dispatch 复用。dense 掩码在调用点单独处理。
+    //
+    // 注意：doc_ptr/slopes_ptr 指向本结构体内 optional 持有的 GpuTensor，
+    // 故必须用 out-参数填充（调用点持有的局部对象；按值返回会被 move 使指针悬垂）。
+    struct GpuBiasPrep
+    {
+        std::optional<GpuTensor> doc_gpu, slopes_gpu;
+        GpuTensor* doc_ptr = nullptr;
+        GpuTensor* slopes_ptr = nullptr;
+        bool causal = false;
+        std::size_t num_heads = 1;
+    };
+    [[nodiscard]] Result<void> prep_bias_(const AttnBias& b, GpuBiasPrep& r)
+    {
+        r.causal = b.causal;
+        r.num_heads = b.num_heads;
+        r.doc_ptr = nullptr;
+        r.slopes_ptr = nullptr;
+        if (b.doc_ids)
+        {
+            auto d = ensure_gpu(*b.doc_ids);
+            if (!d) return std::unexpected(d.error());
+            r.doc_gpu = d->gpu_tensor();
+            r.doc_ptr = &*r.doc_gpu;
+        }
+        if (b.slopes)
+        {
+            auto s = ensure_gpu(*b.slopes);
+            if (!s) return std::unexpected(s.error());
+            r.slopes_gpu = s->gpu_tensor();
+            r.slopes_ptr = &*r.slopes_gpu;
+        }
+        return {};
+    }
+
+public:
     // ══════════════════════════════════════════════════════════════════════
     // matmul 融合原语（M4；GPU 融合 shader 不物化中间得分矩阵）
     // ══════════════════════════════════════════════════════════════════════
@@ -395,7 +433,7 @@ public:
     [[nodiscard]] Result<Tensor> batched_matmul_reduce(
         const Tensor& A, const Tensor& B, std::size_t batch,
         ReduceOp op, bool transA, bool transB,
-        Scalar alpha, bool reduce_cols, const Tensor* mask) override
+        Scalar alpha, bool reduce_cols, const AttnBias& bias) override
     {
         if (!reduce_cols)
             return std::unexpected(Error{
@@ -420,17 +458,21 @@ public:
         if (!b_gpu) return std::unexpected(b_gpu.error());
         std::optional<GpuTensor> mask_gpu;
         GpuTensor* mask_ptr = nullptr;
-        if (mask)
+        if (bias.dense)
         {
-            auto mg = ensure_gpu(*mask);
+            auto mg = ensure_gpu(*bias.dense);
             if (!mg) return std::unexpected(mg.error());
             mask_gpu = mg->gpu_tensor();
             mask_ptr = &*mask_gpu;
         }
+        GpuBiasPrep bp;
+        auto bp_r = prep_bias_(bias, bp);
+        if (!bp_r) return std::unexpected(bp_r.error());
         auto r = backend_.bmm_reduce_gpu(
             a_gpu->gpu_tensor(), b_gpu->gpu_tensor(), mask_ptr,
+            bp.doc_ptr, bp.slopes_ptr,
             M, N, K, batch, static_cast<std::size_t>(op),
-            transA, transB, alpha);
+            transA, transB, alpha, bp.causal, bp.num_heads);
         if (!r) return std::unexpected(r.error());
         return Tensor::from_gpu(std::move(*r));
     }
@@ -438,7 +480,7 @@ public:
     [[nodiscard]] Result<Tensor> batched_matmul_softmax_denom(
         const Tensor& A, const Tensor& B, const Tensor& row_max,
         std::size_t batch, bool transA, bool transB, Scalar alpha,
-        const Tensor* mask) override
+        const AttnBias& bias) override
     {
         if (batch == 0)
             return std::unexpected(Error{"batched_matmul_softmax_denom: batch must be > 0"});
@@ -461,16 +503,21 @@ public:
         if (!m_gpu) return std::unexpected(m_gpu.error());
         std::optional<GpuTensor> mask_gpu;
         GpuTensor* mask_ptr = nullptr;
-        if (mask)
+        if (bias.dense)
         {
-            auto mg = ensure_gpu(*mask);
+            auto mg = ensure_gpu(*bias.dense);
             if (!mg) return std::unexpected(mg.error());
             mask_gpu = mg->gpu_tensor();
             mask_ptr = &*mask_gpu;
         }
+        GpuBiasPrep bp;
+        auto bp_r = prep_bias_(bias, bp);
+        if (!bp_r) return std::unexpected(bp_r.error());
         auto r = backend_.bmm_denom_gpu(
             a_gpu->gpu_tensor(), b_gpu->gpu_tensor(), mask_ptr,
-            m_gpu->gpu_tensor(), M, N, K, batch, transA, transB, alpha);
+            bp.doc_ptr, bp.slopes_ptr,
+            m_gpu->gpu_tensor(), M, N, K, batch, transA, transB, alpha,
+            bp.causal, bp.num_heads);
         if (!r) return std::unexpected(r.error());
         return Tensor::from_gpu(std::move(*r));
     }
@@ -479,7 +526,7 @@ public:
         const Tensor& A, const Tensor& B, const Tensor& V,
         const Tensor& row_max, const Tensor& denom,
         std::size_t batch, bool transA, bool transB, Scalar alpha,
-        const Tensor* mask) override
+        const AttnBias& bias) override
     {
         if (batch == 0)
             return std::unexpected(Error{"batched_matmul_softmax_apply: batch must be > 0"});
@@ -510,17 +557,21 @@ public:
         if (!l_gpu) return std::unexpected(l_gpu.error());
         std::optional<GpuTensor> mask_gpu;
         GpuTensor* mask_ptr = nullptr;
-        if (mask)
+        if (bias.dense)
         {
-            auto mg = ensure_gpu(*mask);
+            auto mg = ensure_gpu(*bias.dense);
             if (!mg) return std::unexpected(mg.error());
             mask_gpu = mg->gpu_tensor();
             mask_ptr = &*mask_gpu;
         }
+        GpuBiasPrep bp;
+        auto bp_r = prep_bias_(bias, bp);
+        if (!bp_r) return std::unexpected(bp_r.error());
         auto r = backend_.bmm_apply_gpu(
             a_gpu->gpu_tensor(), b_gpu->gpu_tensor(), mask_ptr,
+            bp.doc_ptr, bp.slopes_ptr,
             m_gpu->gpu_tensor(), l_gpu->gpu_tensor(), v_gpu->gpu_tensor(),
-            M, N, K, D, batch, transA, transB, alpha);
+            M, N, K, D, batch, transA, transB, alpha, bp.causal, bp.num_heads);
         if (!r) return std::unexpected(r.error());
         return Tensor::from_gpu(std::move(*r));
     }
@@ -530,7 +581,7 @@ public:
         const Tensor& A, const Tensor& B, const Tensor& P,
         const Tensor& row_max, const Tensor& denom,
         std::size_t batch, bool transA, bool transB, Scalar alpha,
-        Tensor& r_out, const Tensor* mask) override
+        Tensor& r_out, const AttnBias& bias) override
     {
         if (batch == 0)
             return std::unexpected(Error{"batched_matmul_softmax_backward_q: batch must be > 0"});
@@ -557,18 +608,22 @@ public:
         if (!l_gpu) return std::unexpected(l_gpu.error());
         std::optional<GpuTensor> mask_gpu;
         GpuTensor* mask_ptr = nullptr;
-        if (mask)
+        if (bias.dense)
         {
-            auto mg = ensure_gpu(*mask);
+            auto mg = ensure_gpu(*bias.dense);
             if (!mg) return std::unexpected(mg.error());
             mask_gpu = mg->gpu_tensor();
             mask_ptr = &*mask_gpu;
         }
+        GpuBiasPrep bp;
+        auto bp_r = prep_bias_(bias, bp);
+        if (!bp_r) return std::unexpected(bp_r.error());
         GpuTensor r_gpu;
         auto r = backend_.bmm_q_backward_gpu(
             a_gpu->gpu_tensor(), b_gpu->gpu_tensor(), mask_ptr,
+            bp.doc_ptr, bp.slopes_ptr,
             m_gpu->gpu_tensor(), l_gpu->gpu_tensor(), p_gpu->gpu_tensor(),
-            M, N, K, batch, transA, transB, alpha, &r_gpu);
+            M, N, K, batch, transA, transB, alpha, bp.causal, bp.num_heads, &r_gpu);
         if (!r) return std::unexpected(r.error());
         r_out = Tensor::from_gpu(std::move(r_gpu));
         return Tensor::from_gpu(std::move(*r));
@@ -580,7 +635,7 @@ public:
         const Tensor& G, const Tensor& R,
         const Tensor& row_max, const Tensor& denom,
         std::size_t batch, bool transA, bool transB, Scalar alpha,
-        Tensor& grad_v_out, const Tensor* mask) override
+        Tensor& grad_v_out, const AttnBias& bias) override
     {
         if (batch == 0)
             return std::unexpected(Error{"batched_matmul_softmax_backward_kv: batch must be > 0"});
@@ -615,19 +670,23 @@ public:
         if (!l_gpu) return std::unexpected(l_gpu.error());
         std::optional<GpuTensor> mask_gpu;
         GpuTensor* mask_ptr = nullptr;
-        if (mask)
+        if (bias.dense)
         {
-            auto mg = ensure_gpu(*mask);
+            auto mg = ensure_gpu(*bias.dense);
             if (!mg) return std::unexpected(mg.error());
             mask_gpu = mg->gpu_tensor();
             mask_ptr = &*mask_gpu;
         }
+        GpuBiasPrep bp;
+        auto bp_r = prep_bias_(bias, bp);
+        if (!bp_r) return std::unexpected(bp_r.error());
         GpuTensor gv_gpu;
         auto r = backend_.bmm_kv_backward_gpu(
             a_gpu->gpu_tensor(), b_gpu->gpu_tensor(), mask_ptr,
+            bp.doc_ptr, bp.slopes_ptr,
             m_gpu->gpu_tensor(), l_gpu->gpu_tensor(), p_gpu->gpu_tensor(),
             g_gpu->gpu_tensor(), r_gpu->gpu_tensor(),
-            M, N, K, D, batch, transA, transB, alpha, &gv_gpu);
+            M, N, K, D, batch, transA, transB, alpha, bp.causal, bp.num_heads, &gv_gpu);
         if (!r) return std::unexpected(r.error());
         grad_v_out = Tensor::from_gpu(std::move(gv_gpu));
         return Tensor::from_gpu(std::move(*r));
