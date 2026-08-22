@@ -73,6 +73,21 @@ enum class ExprOp : uint8_t
 {
     return op == ExprOp::ColSum || op == ExprOp::ColMax;
 }
+// 指令实际使用的操作数个数（未用的 b/c 保持默认 {0,0}，不可当作 Reg(0) 引用）
+[[nodiscard]] inline std::size_t expr_instr_num_operands(ExprOp op) noexcept
+{
+    switch (op)
+    {
+    case ExprOp::Neg: case ExprOp::Exp: case ExprOp::Log:
+    case ExprOp::Sqrt: case ExprOp::Rsqrt: case ExprOp::Abs: case ExprOp::Tanh:
+    case ExprOp::ColSum: case ExprOp::ColMax: case ExprOp::RowSum: case ExprOp::RowMax:
+        return 1;
+    case ExprOp::Select:
+        return 3;
+    default:
+        return 2;
+    }
+}
 
 // ── 操作数 ─────────────────────────────────────────────────────────────────
 enum class ExprOperandKind : uint8_t
@@ -113,6 +128,9 @@ enum class ExprViewKind : uint8_t
     ColReduceMax = 4,  // 该输入按列求 max → (1, cols)
     RowReduceSum = 5,  // 该输入按行求和 → (rows, 1)
     RowReduceMax = 6,  // 该输入按行求 max → (rows, 1)
+    // ── 新增：广播视图（输入本身已是 (rows,1)/(1,cols) 小向量，按行/列广播）──
+    RowBroadcast = 7,  // 输入 (rows, 1)：读 b[r]（gamma/beta 等逐行参数）
+    ColBroadcast = 8,  // 输入 (1, cols)：读 b[c]（std_inv 等逐列统计量）
 };
 
 // ── 归约视图辅助（引擎/校验共用）──────────────────────────────────────
@@ -125,6 +143,10 @@ enum class ExprViewKind : uint8_t
 [[nodiscard]] inline constexpr bool expr_view_reduces_rows(ExprViewKind k) noexcept
 {
     return k == ExprViewKind::RowReduceSum || k == ExprViewKind::RowReduceMax;
+}
+[[nodiscard]] inline constexpr bool expr_view_is_broadcast(ExprViewKind k) noexcept
+{
+    return k == ExprViewKind::RowBroadcast || k == ExprViewKind::ColBroadcast;
 }
 
 struct ExprView
@@ -162,6 +184,30 @@ struct ExprSpec
     std::vector<Scalar>         consts;
     std::uint32_t               num_regs = 0;
 };
+
+// ── 表达式归约轴（融合 shader 生成用）────────────────────────────────────
+// 返回 -1=无归约（逐元素）、0=全部行归约、1=全部列归约、-2=混合（不支持单 kernel 融合）
+[[nodiscard]] inline int expr_spec_reduce_axis(const ExprSpec& s)
+{
+    int axis = -1;
+    for (const auto& v : s.views)
+    {
+        if (!expr_view_is_reduce(static_cast<ExprViewKind>(v.kind)))
+            continue;
+        const int a = expr_view_reduces_rows(static_cast<ExprViewKind>(v.kind)) ? 0 : 1;
+        if (axis == -1) axis = a;
+        else if (axis != a) return -2;
+    }
+    for (const auto& in : s.instrs)
+    {
+        if (!expr_op_is_reduce(static_cast<ExprOp>(in.op)))
+            continue;
+        const int a = expr_op_reduces_cols(static_cast<ExprOp>(in.op)) ? 1 : 0;
+        if (axis == -1) axis = a;
+        else if (axis != a) return -2;
+    }
+    return axis;
+}
 
 // ── 表达式规格相等比较（GPU AOT 匹配用）────────────────────────────────
 // 两个 ExprSpec 相等 ⟺ 指令序列、输入视图、常量池、寄存器数全部一致。
@@ -248,14 +294,17 @@ inline constexpr std::size_t EXPR_MAX_INSTRS = 64;
     {
         if (ins.dst >= spec.num_regs)
             return std::unexpected(Error{"validate_expr_spec: dst reg out of range"});
-        for (const ExprOperand* op : {&ins.a, &ins.b, &ins.c})
+        const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
+        const std::size_t nops = expr_instr_num_operands(static_cast<ExprOp>(ins.op));
+        for (std::size_t oi = 0; oi < nops; ++oi)
         {
-            if ((op->kind == static_cast<uint8_t>(ExprOperandKind::Reg) ||
-                 op->kind == static_cast<uint8_t>(ExprOperandKind::Fanout)) && op->idx >= spec.num_regs)
+            const ExprOperand& op = *ops[oi];
+            if ((op.kind == static_cast<uint8_t>(ExprOperandKind::Reg) ||
+                 op.kind == static_cast<uint8_t>(ExprOperandKind::Fanout)) && op.idx >= spec.num_regs)
                 return std::unexpected(Error{"validate_expr_spec: src reg out of range"});
-            if (op->kind == static_cast<uint8_t>(ExprOperandKind::Input) && op->idx >= num_inputs)
+            if (op.kind == static_cast<uint8_t>(ExprOperandKind::Input) && op.idx >= num_inputs)
                 return std::unexpected(Error{"validate_expr_spec: input index out of range"});
-            if (op->kind == static_cast<uint8_t>(ExprOperandKind::Const) && op->idx >= spec.consts.size())
+            if (op.kind == static_cast<uint8_t>(ExprOperandKind::Const) && op.idx >= spec.consts.size())
                 return std::unexpected(Error{"validate_expr_spec: const index out of range"});
         }
     }
@@ -276,7 +325,8 @@ inline constexpr std::size_t EXPR_MAX_INSTRS = 64;
             (is_reduce ? reduce_dst : elem_dst)[ins.dst] = 1;
 
             const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
-            const std::size_t nops = is_reduce ? 1 : 3;
+            const std::size_t nops = is_reduce ? 1
+                : expr_instr_num_operands(op);
             for (std::size_t oi = 0; oi < nops; ++oi)
             {
                 const ExprOperand& opnd = *ops[oi];
@@ -318,6 +368,8 @@ namespace expr
     inline constexpr ExprView col_reduce_max() { return {4, 0, 0}; }
     inline constexpr ExprView row_reduce_sum() { return {5, 0, 0}; }
     inline constexpr ExprView row_reduce_max() { return {6, 0, 0}; }
+    inline constexpr ExprView row_broadcast()  { return {7, 0, 0}; }
+    inline constexpr ExprView col_broadcast()  { return {8, 0, 0}; }
 } // namespace expr
 
 } // namespace nn

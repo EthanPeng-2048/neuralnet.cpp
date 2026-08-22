@@ -691,8 +691,39 @@ public:
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols) override
     {
+        return eval_expr_impl(spec, inputs, rows, cols, /*vector_out=*/false);
+    }
+
+    // ── 归约向量原生形状输出（M3：LayerNorm/RMSNorm 小向量缓存用） ──────
+    // 语义：表达式在 (rows,cols) 网格上求值，但输出为归约向量本身：
+    //   行归约轴 → (rows,1)，列归约轴 → (1,cols)（而非广播到 (rows,cols)）。
+    // 要求：表达式归约轴为 0/1；末指令为归约时直接取归约向量，否则按代表
+    //   元素求值（所有 Input 须经归约/广播视图访问，保证沿归约轴恒定）。
+    [[nodiscard]] Result<Tensor> eval_expr_reduce(
+        const ExprSpec& spec,
+        std::span<const Tensor> inputs,
+        std::size_t rows, std::size_t cols) override
+    {
+        return eval_expr_impl(spec, inputs, rows, cols, /*vector_out=*/true);
+    }
+
+    // ── eval_expr / eval_expr_reduce 共用实现 ────────────────────────────
+    [[nodiscard]] Result<Tensor> eval_expr_impl(
+        const ExprSpec& spec,
+        std::span<const Tensor> inputs,
+        std::size_t rows, std::size_t cols, bool vector_out)
+    {
         if (auto v = validate_expr_spec(spec, inputs.size()); !v)
             return std::unexpected(v.error());
+        if (spec.instrs.empty())
+            return std::unexpected(Error{"eval_expr: empty instruction list"});
+
+        // vector_out：要求表达式为纯行/列归约（归约轴 0/1），输出取向量形状
+        const int raxis = vector_out ? expr_spec_reduce_axis(spec) : -1;
+        if (vector_out && raxis != 0 && raxis != 1)
+            return std::unexpected(Error{
+                "eval_expr_reduce: 表达式需为行/列归约（归约轴 0/1）"});
+        const bool vec_is_row = (raxis == 0);
 
         std::vector<ConstSpan> spans;
         spans.reserve(inputs.size());
@@ -701,10 +732,9 @@ public:
             const Tensor& t = inputs[k];
             if (!t.is_cpu())
                 return std::unexpected(Error{"eval_expr: input not CPU"});
-            // 列数必须一致；行数由视图语义决定（RowMod 允许短表、RotateHalf 允许长表）
-            if (t.cols() != cols)
-                return std::unexpected(Error{"eval_expr: input cols mismatch"});
             const ExprView& v = spec.views[k];
+            // 列数/行数由视图语义决定：Linear/归约视图与输出一致；RowMod 允许
+            // 短表；RotateHalf 允许长表；RowBroadcast 为 (rows,1)、ColBroadcast 为 (1,cols)。
             switch (v.kind)
             {
             default:
@@ -714,16 +744,27 @@ public:
             case static_cast<uint8_t>(ExprViewKind::RowReduceSum):
             case static_cast<uint8_t>(ExprViewKind::RowReduceMax):
                 // 归约视图：对该输入按行/按列归约出标量向量，输入形状与输出一致
-                if (t.rows() != rows)
-                    return std::unexpected(Error{"eval_expr: Linear input rows mismatch"});
+                if (t.rows() != rows || t.cols() != cols)
+                    return std::unexpected(Error{"eval_expr: Linear/reduce input shape mismatch"});
                 break;
             case static_cast<uint8_t>(ExprViewKind::RotateHalf):
-                if (t.rows() != rows || v.param == 0 || rows % v.param != 0 || v.param % 2 != 0)
+                if (t.rows() != rows || t.cols() != cols || v.param == 0 ||
+                    rows % v.param != 0 || v.param % 2 != 0)
                     return std::unexpected(Error{"eval_expr: RotateHalf shape/param invalid"});
                 break;
             case static_cast<uint8_t>(ExprViewKind::RowMod):
-                if (t.rows() != v.param || v.param == 0 || rows % v.param != 0)
+                if (t.rows() != v.param || t.cols() != cols || v.param == 0 || rows % v.param != 0)
                     return std::unexpected(Error{"eval_expr: RowMod shape/param invalid"});
+                break;
+            case static_cast<uint8_t>(ExprViewKind::RowBroadcast):
+                // 输入 (rows,1)：每行一个值，按行广播
+                if (t.rows() != rows || t.cols() != 1)
+                    return std::unexpected(Error{"eval_expr: RowBroadcast input must be (rows,1)"});
+                break;
+            case static_cast<uint8_t>(ExprViewKind::ColBroadcast):
+                // 输入 (1,cols)：每列一个值，按列广播
+                if (t.rows() != 1 || t.cols() != cols)
+                    return std::unexpected(Error{"eval_expr: ColBroadcast input must be (1,cols)"});
                 break;
             }
             spans.push_back(t.cpu_matrix().span());
@@ -796,6 +837,10 @@ public:
             case static_cast<uint8_t>(ExprViewKind::ColReduceSum):
             case static_cast<uint8_t>(ExprViewKind::ColReduceMax):
                 return view_reduce[k][c];
+            case static_cast<uint8_t>(ExprViewKind::RowBroadcast):
+                return s[r];           // 输入 (rows,1)
+            case static_cast<uint8_t>(ExprViewKind::ColBroadcast):
+                return s[c];           // 输入 (1,cols)
             }
         };
 
@@ -889,23 +934,13 @@ public:
             }
         }
 
-        // ── 逐元素解释执行（主循环） ────────────────────────────────────
-        // 归约指令已预计算；主循环跳过它们，Reduce 操作数读 reduce_vec 广播。
+        // ── 输出 ────────────────────────────────────────────────────────
         const ExprInstr& last = spec.instrs.back();
         const bool last_is_reduce = expr_op_is_reduce(static_cast<ExprOp>(last.op));
 
-        for (std::size_t i = 0; i < n; ++i)
+        // 求单元素 (r,c) 的逐元素链结果（跳过归约指令，归约经 reduce_vec 读取）
+        auto eval_element = [&](std::size_t r, std::size_t c) -> Scalar
         {
-            const std::size_t r = i / cols;
-            const std::size_t c = i % cols;
-
-            if (last_is_reduce)
-            {
-                // 输出本身就是归约向量 → 广播到 (rows, cols)
-                out[i] = reduce_vec[last.dst][reduce_axis[last.dst] ? c : r];
-                continue;
-            }
-
             Scalar regs[EXPR_MAX_REGS] = {};
             const auto eval_op = [&](const ExprOperand& op) -> Scalar
             {
@@ -920,7 +955,6 @@ public:
                     return reduce_vec[op.idx][reduce_axis[op.idx] ? c : r];
                 }
             };
-
             for (const auto& ins : spec.instrs)
             {
                 if (expr_op_is_reduce(static_cast<ExprOp>(ins.op)))
@@ -956,7 +990,82 @@ public:
                 default: break;  // 归约指令已在上方 continue 跳过
                 }
             }
-            out[i] = regs[last.dst];
+            return regs[last.dst];
+        };
+
+        if (vector_out)
+        {
+            // 归约向量原生形状输出：(rows,1)（行归约轴）或 (1,cols)（列归约轴）
+            const std::size_t len = vec_is_row ? rows : cols;
+            Matrix result(vec_is_row ? rows : 1, vec_is_row ? 1 : cols);
+            Span o = result.span();
+            if (last_is_reduce)
+            {
+                // 末指令为归约 → 直接取归约向量
+                for (std::size_t k = 0; k < len; ++k)
+                    o[k] = reduce_vec[last.dst][k];
+                return Tensor::from_matrix(std::move(result));
+            }
+            // 否则按代表元素求值：行归约 → 每行 (k, 0)；列归约 → 每列 (0, k)。
+            // 前置校验（反向数据流）：从末指令收集"影响输出"的非归约指令链，
+            // 其 Input 操作数必须经归约/广播视图访问（保证沿归约轴恒定）。
+            // 归约指令的源在全网格求值（可自由读 Linear），不参与本分析。
+            {
+                std::vector<uint8_t> needed(EXPR_MAX_REGS, 0);
+                needed[last.dst] = 1;
+                for (std::size_t ii = spec.instrs.size(); ii-- > 0;)
+                {
+                    const ExprInstr& ins = spec.instrs[ii];
+                    if (!needed[ins.dst])
+                        continue;
+                    if (expr_op_is_reduce(static_cast<ExprOp>(ins.op)))
+                        continue;  // 归约指令：源全网格求值，dst 已标记
+                    // 只遍历该算子实际使用的操作数（c 默认 {0,0} 会被误当作 Reg(0)）
+                    const std::size_t nops =
+                        expr_instr_num_operands(static_cast<ExprOp>(ins.op));
+                    const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
+                    for (std::size_t oi = 0; oi < nops; ++oi)
+                    {
+                        const ExprOperand& op = *ops[oi];
+                        if (op.kind == static_cast<uint8_t>(ExprOperandKind::Input))
+                        {
+                            const ExprViewKind vk =
+                                static_cast<ExprViewKind>(spec.views[op.idx].kind);
+                            if (!expr_view_is_reduce(vk) && !expr_view_is_broadcast(vk))
+                                return std::unexpected(Error{
+                                    "eval_expr_reduce: 输出链经 Linear/视图直接访问输入，"
+                                    "输出不沿归约轴恒定"});
+                        }
+                        else if (op.kind == static_cast<uint8_t>(ExprOperandKind::Reg) ||
+                                 op.kind == static_cast<uint8_t>(ExprOperandKind::Fanout) ||
+                                 op.kind == static_cast<uint8_t>(ExprOperandKind::Reduce))
+                        {
+                            needed[op.idx] = 1;
+                        }
+                    }
+                }
+            }
+            for (std::size_t k = 0; k < len; ++k)
+            {
+                const std::size_t r = vec_is_row ? k : 0;
+                const std::size_t c = vec_is_row ? 0 : k;
+                o[k] = eval_element(r, c);
+            }
+            return Tensor::from_matrix(std::move(result));
+        }
+
+        // ── 广播输出（常规 eval_expr）：每元素求值，输出 (rows, cols) ──
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const std::size_t r = i / cols;
+            const std::size_t c = i % cols;
+            if (last_is_reduce)
+            {
+                // 输出本身就是归约向量 → 广播到 (rows, cols)
+                out[i] = reduce_vec[last.dst][reduce_axis[last.dst] ? c : r];
+                continue;
+            }
+            out[i] = eval_element(r, c);
         }
 
         return Tensor::from_matrix(std::move(result));

@@ -528,6 +528,16 @@ public:
     }
 
     // ── forward ───────────────────────────────────────────────────────────
+    // M3 融合（算法公式不变，diff_sq (F,B) 由归约 kernel 内部消解）：
+    //   融合表达式保持 F 无关结构（不含 1/F、ε 常量）；形状相关标量在
+    //   (1,B) 小向量上用引擎原语施加：
+    //   1. mean_raw = col_reduce_sum(x)                    → (1,B) 归约向量输出
+    //   2. mean     = mean_raw*(1/F)
+    //   3. diff     = x - mean (col 广播)                  → (F,B) 融合逐元素
+    //   4. var_raw  = col_reduce_sum(diff²)                → (1,B) 归约向量输出
+    //   5. std_inv  = rsqrt(var_raw*(1/F) + ε)             → (1,B) 原语
+    //   6. normalized=diff * std_inv (col 广播)            → (F,B) 融合逐元素
+    //   7. out      = normalized*gamma + beta (row 广播)   → (F,B) 融合逐元素
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
@@ -535,124 +545,112 @@ public:
             return std::unexpected(Error{"layernorm forward: input shape mismatch"});
 
         const Scalar inv_features = Scalar{1} / static_cast<Scalar>(normalized_shape_);
+        const std::size_t F = normalized_shape_;
+        const std::size_t B = input.cols();
 
-        // mean = col_reduce_sum(input) * inv_features → (1, batch)
-        auto mean = engine.col_reduce_sum(input);
+        // 1. mean_raw = col_reduce_sum(x) → (1,B)
+        auto mean_raw = dsl::compute_reduce(engine,
+            dsl::col_reduce_sum(dsl::leaf(input)), F, B);
+        if (!mean_raw) return std::unexpected(mean_raw.error());
+
+        // 2. mean = mean_raw*(1/F) → (1,B)
+        auto mean = engine.elementwise_binary_scalar(BinaryOp::Mul, *mean_raw, inv_features);
         if (!mean) return std::unexpected(mean.error());
-        auto r = engine.scale_inplace(*mean, inv_features);
-        if (!r) return std::unexpected(r.error());
 
-        // diff = input - mean (broadcast_col Sub) — 需要深拷贝 input
-        auto diff = clone_tensor(engine, input);
+        // 3. diff = x - mean (col 广播) → (F,B)
+        auto diff = dsl::compute(engine,
+            dsl::leaf(input) - dsl::col_broadcast(*mean), F, B);
         if (!diff) return std::unexpected(diff.error());
-        r = engine.broadcast_col_inplace(*diff, *mean, BinaryOp::Sub);
-        if (!r) return std::unexpected(r.error());
 
-        // diff_sq = diff * diff
-        auto diff_sq = engine.elementwise_binary(BinaryOp::Mul, *diff, *diff);
-        if (!diff_sq) return std::unexpected(diff_sq.error());
+        // 4. var_raw = col_reduce_sum(diff²) → (1,B)
+        auto var_raw = dsl::compute_reduce(engine,
+            dsl::col_reduce_sum(dsl::leaf(*diff) * dsl::leaf(*diff)), F, B);
+        if (!var_raw) return std::unexpected(var_raw.error());
 
-        // var = col_reduce_sum(diff_sq) * inv_features → (1, batch)
-        auto var = engine.col_reduce_sum(*diff_sq);
+        // 5. std_inv = rsqrt(var_raw*(1/F) + ε) → (1,B)
+        auto var = engine.elementwise_binary_scalar(BinaryOp::Mul, *var_raw, inv_features);
         if (!var) return std::unexpected(var.error());
-        r = engine.scale_inplace(*var, inv_features);
-        if (!r) return std::unexpected(r.error());
-
-        // var_eps = var + eps
         auto var_eps = engine.elementwise_binary_scalar(BinaryOp::Add, *var, epsilon_);
         if (!var_eps) return std::unexpected(var_eps.error());
-
-        // std_inv = rsqrt(var + eps) → (1, batch)
         auto std_inv = engine.elementwise_unary(UnaryOp::Rsqrt, *var_eps);
         if (!std_inv) return std::unexpected(std_inv.error());
-
-        // normalized = diff * std_inv (broadcast_col Mul) — 就地修改 diff
-        r = engine.broadcast_col_inplace(*diff, *std_inv, BinaryOp::Mul);
-        if (!r) return std::unexpected(r.error());
-
-        // 缓存 normalized 和 std_inv 供 backward 使用
-        normalized_cache_ = *diff;
         std_cache_ = *std_inv;
 
-        // output = gamma * normalized + beta (broadcast_row)
-        // 先深拷贝 normalized，再就地广播
-        auto output = clone_tensor(engine, *diff);
-        if (!output) return std::unexpected(output.error());
+        // 6. normalized = diff * std_inv (col 广播) → (F,B)
+        auto normalized = dsl::compute(engine,
+            dsl::leaf(*diff) * dsl::col_broadcast(std_cache_), F, B);
+        if (!normalized) return std::unexpected(normalized.error());
+        normalized_cache_ = *normalized;
 
-        r = engine.broadcast_row_inplace(*output, gamma_, BinaryOp::Mul);
-        if (!r) return std::unexpected(r.error());
-
-        r = engine.broadcast_row_inplace(*output, beta_, BinaryOp::Add);
-        if (!r) return std::unexpected(r.error());
-
-        return output;
+        // 7. out = normalized*gamma + beta (row 广播) → (F,B)
+        return dsl::compute(engine,
+            dsl::leaf(normalized_cache_) * dsl::row_broadcast(gamma_)
+            + dsl::row_broadcast(beta_),
+            F, B);
     }
 
     // ── backward ──────────────────────────────────────────────────────────
     // grad_x = (gy - mean_g - normalized*mean_gn) * std_inv
-    // gy = grad_out * gamma
-    // mean_g = mean(gy), mean_gn = mean(gy * normalized)
-    // grad_gamma += row_sum(gy * normalized)
-    // grad_beta += row_sum(grad_out)
+    //   gy = grad_out * gamma
+    //   mean_g  = col_reduce_sum(gy) * invF
+    //   mean_gn = col_reduce_sum(gy * normalized) * invF
+    // grad_gamma += row_sum(gy ⊙ normalized)
+    // grad_beta  += row_sum(grad_out)
+    // M3 融合（融合表达式 F 无关，1/F 在 (1,B) 上用原语施加）：
+    //   mean_g/mean_gn 为列归约向量输出；(F,B) 全尺寸中间量由融合 kernel 消解。
     [[nodiscard]] Result<Tensor> backward(
         ComputeEngine& engine, const Tensor& grad_output) override
     {
         const Scalar inv_features = Scalar{1} / static_cast<Scalar>(normalized_shape_);
+        const std::size_t F = normalized_shape_;
+        const std::size_t B = grad_output.cols();
 
-        // gy = grad_out * gamma (broadcast_row Mul) — 深拷贝 grad_output
-        auto gy = clone_tensor(engine, grad_output);
-        if (!gy) return std::unexpected(gy.error());
-        auto r = engine.broadcast_row_inplace(*gy, gamma_, BinaryOp::Mul);
-        if (!r) return std::unexpected(r.error());
-
-        // mean_g = col_reduce_sum(gy) * inv_features → (1, batch)
-        auto mean_g = engine.col_reduce_sum(*gy);
+        // 1. mean_g_raw = col_reduce_sum(gy) → (1,B)
+        auto mg_raw = dsl::compute_reduce(engine,
+            dsl::col_reduce_sum(
+                dsl::leaf(grad_output) * dsl::row_broadcast(gamma_)),
+            F, B);
+        if (!mg_raw) return std::unexpected(mg_raw.error());
+        auto mean_g = engine.elementwise_binary_scalar(BinaryOp::Mul, *mg_raw, inv_features);
         if (!mean_g) return std::unexpected(mean_g.error());
-        r = engine.scale_inplace(*mean_g, inv_features);
-        if (!r) return std::unexpected(r.error());
 
-        // gy_norm = gy * normalized_cache_ (elementwise Mul)
-        auto gy_norm = engine.elementwise_binary(BinaryOp::Mul, *gy, normalized_cache_);
-        if (!gy_norm) return std::unexpected(gy_norm.error());
-
-        // mean_gn = col_reduce_sum(gy_norm) * inv_features → (1, batch)
-        auto mean_gn = engine.col_reduce_sum(*gy_norm);
+        // 2. mean_gn_raw = col_reduce_sum(gy ⊙ normalized) → (1,B)
+        auto mgn_raw = dsl::compute_reduce(engine,
+            dsl::col_reduce_sum(
+                dsl::leaf(grad_output) * dsl::row_broadcast(gamma_)
+                * dsl::leaf(normalized_cache_)),
+            F, B);
+        if (!mgn_raw) return std::unexpected(mgn_raw.error());
+        auto mean_gn = engine.elementwise_binary_scalar(BinaryOp::Mul, *mgn_raw, inv_features);
         if (!mean_gn) return std::unexpected(mean_gn.error());
-        r = engine.scale_inplace(*mean_gn, inv_features);
-        if (!r) return std::unexpected(r.error());
 
-        // t1 = gy - mean_g (broadcast_col Sub) — 就地修改 gy
-        r = engine.broadcast_col_inplace(*gy, *mean_g, BinaryOp::Sub);
-        if (!r) return std::unexpected(r.error());
+        // 3. grad_x = (gy - mean_g - normalized*mean_gn) * std_inv → (F,B)
+        auto grad_x = dsl::compute(engine,
+            (dsl::leaf(grad_output) * dsl::row_broadcast(gamma_)
+             - dsl::col_broadcast(*mean_g)
+             - dsl::leaf(normalized_cache_) * dsl::col_broadcast(*mean_gn))
+            * dsl::col_broadcast(std_cache_),
+            F, B);
+        if (!grad_x) return std::unexpected(grad_x.error());
 
-        // t2 = normalized * mean_gn (broadcast_col Mul) — 深拷贝 normalized
-        auto t2 = clone_tensor(engine, normalized_cache_);
-        if (!t2) return std::unexpected(t2.error());
-        r = engine.broadcast_col_inplace(*t2, *mean_gn, BinaryOp::Mul);
-        if (!r) return std::unexpected(r.error());
-
-        // grad_input = (t1 - t2) * std_inv
-        // 先 t1 -= t2 (elementwise Sub)
-        auto t2_neg = engine.elementwise_binary(BinaryOp::Sub, *gy, *t2);
-        if (!t2_neg) return std::unexpected(t2_neg.error());
-
-        // 上面创建新 Tensor 作为 (gy - t2)，再乘 std_inv (broadcast_col Mul)
-        r = engine.broadcast_col_inplace(*t2_neg, std_cache_, BinaryOp::Mul);
-        if (!r) return std::unexpected(r.error());
-
-        // grad_gamma += row_reduce_sum(gy_norm) → (features, 1)
-        auto gg = engine.row_reduce_sum(*gy_norm);
+        // 4. grad_gamma += row_reduce_sum(gy ⊙ normalized) → (F,1)
+        auto gg = dsl::compute_reduce(engine,
+            dsl::row_reduce_sum(
+                dsl::leaf(grad_output) * dsl::row_broadcast(gamma_)
+                * dsl::leaf(normalized_cache_)),
+            F, B);
         if (!gg) return std::unexpected(gg.error());
-        r = engine.add_inplace(grad_gamma_, *gg);
+        auto r = engine.add_inplace(grad_gamma_, *gg);
         if (!r) return std::unexpected(r.error());
 
-        // grad_beta += row_reduce_sum(grad_output) → (features, 1)
-        auto gb = engine.row_reduce_sum(grad_output);
+        // 5. grad_beta += row_reduce_sum(grad_out) → (F,1)
+        auto gb = dsl::compute_reduce(engine,
+            dsl::row_reduce_sum(dsl::leaf(grad_output)), F, B);
         if (!gb) return std::unexpected(gb.error());
         r = engine.add_inplace(grad_beta_, *gb);
         if (!r) return std::unexpected(r.error());
 
-        return t2_neg;
+        return grad_x;
     }
 };
 
@@ -714,6 +712,13 @@ public:
     }
 
     // ── forward ───────────────────────────────────────────────────────────
+    // M3 融合（算法公式不变，中间 x_sq (F,B) 由归约 kernel 内部消解）：
+    //   融合表达式保持 F 无关结构（不含 1/F、ε 常量，避免闭合世界 key 随
+    //   归一化维度漂移）；形状相关标量在 (1,B) 小向量上用引擎原语施加：
+    //   1. s_raw  = col_reduce_sum(x*x)                    → (1,B) 归约向量输出
+    //   2. rms_inv= rsqrt(s_raw*(1/F) + ε)                 → (1,B) 原语
+    //   3. normed = x * rms_inv (col 广播)                 → (F,B) 融合逐元素
+    //   4. out    = normed * gamma (row 广播)              → (F,B) 融合逐元素
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
@@ -721,89 +726,77 @@ public:
             return std::unexpected(Error{"rmsnorm forward: input shape mismatch"});
 
         const Scalar inv_features = Scalar{1} / static_cast<Scalar>(normalized_shape_);
+        const std::size_t F = normalized_shape_;
+        const std::size_t B = input.cols();
 
-        // x_sq = x * x
-        auto x_sq = engine.elementwise_binary(BinaryOp::Mul, input, input);
-        if (!x_sq) return std::unexpected(x_sq.error());
+        // 1. s_raw = col_reduce_sum(x*x) → (1,B)
+        auto s_raw = dsl::compute_reduce(engine,
+            dsl::col_reduce_sum(dsl::leaf(input) * dsl::leaf(input)), F, B);
+        if (!s_raw) return std::unexpected(s_raw.error());
 
-        // mean_sq = col_reduce_sum(x_sq) * inv_features → (1, batch)
-        auto mean_sq = engine.col_reduce_sum(*x_sq);
-        if (!mean_sq) return std::unexpected(mean_sq.error());
-        auto r = engine.scale_inplace(*mean_sq, inv_features);
-        if (!r) return std::unexpected(r.error());
-
-        // rms_inv = rsqrt(mean_sq + eps) → (1, batch)
-        auto var_eps = engine.elementwise_binary_scalar(BinaryOp::Add, *mean_sq, epsilon_);
+        // 2. rms_inv = rsqrt(s_raw*(1/F) + ε) → (1,B)
+        auto scaled = engine.elementwise_binary_scalar(BinaryOp::Mul, *s_raw, inv_features);
+        if (!scaled) return std::unexpected(scaled.error());
+        auto var_eps = engine.elementwise_binary_scalar(BinaryOp::Add, *scaled, epsilon_);
         if (!var_eps) return std::unexpected(var_eps.error());
         auto rms_inv = engine.elementwise_unary(UnaryOp::Rsqrt, *var_eps);
         if (!rms_inv) return std::unexpected(rms_inv.error());
-
-        // normed = x * rms_inv (broadcast_col Mul) — 就地修改 x 副本
-        auto normed = clone_tensor(engine, input);
-        if (!normed) return std::unexpected(normed.error());
-        r = engine.broadcast_col_inplace(*normed, *rms_inv, BinaryOp::Mul);
-        if (!r) return std::unexpected(r.error());
-
-        // 缓存 normed 和 rms_inv 供 backward 使用
-        normed_cache_ = *normed;
         rms_inv_cache_ = *rms_inv;
 
-        // output = normed * gamma (broadcast_row Mul)
-        auto output = clone_tensor(engine, *normed);
-        if (!output) return std::unexpected(output.error());
-        r = engine.broadcast_row_inplace(*output, gamma_, BinaryOp::Mul);
-        if (!r) return std::unexpected(r.error());
+        // 3. normed = x * rms_inv (col 广播) → (F,B)
+        auto normed = dsl::compute(engine,
+            dsl::leaf(input) * dsl::col_broadcast(rms_inv_cache_), F, B);
+        if (!normed) return std::unexpected(normed.error());
+        normed_cache_ = *normed;
 
-        return output;
+        // 4. out = normed * gamma (row 广播) → (F,B)
+        return dsl::compute(engine,
+            dsl::leaf(normed_cache_) * dsl::row_broadcast(gamma_), F, B);
     }
 
     // ── backward ──────────────────────────────────────────────────────────
-    // grad_x = (gy - m*normed) * rms_inv
-    // gy = grad_out * gamma
-    // m  = mean(gy ⊙ normed)
-    // grad_gamma += row_sum(gy ⊙ normed)
+    // M3 融合（融合表达式 F 无关，1/F 在 (1,B) 小向量上用原语施加）：
+    //   gy       = grad * gamma
+    //   m_raw    = col_reduce_sum(gy ⊙ normed)             → (1,B) 归约向量输出
+    //   m        = m_raw * (1/F)
+    //   grad_x   = (gy - m*normed) * rms_inv               → (F,B) 融合逐元素
+    //   grad_gamma += row_reduce_sum(gy ⊙ normed)          → (F,1) 归约向量输出
     [[nodiscard]] Result<Tensor> backward(
         ComputeEngine& engine, const Tensor& grad_output) override
     {
         const Scalar inv_features = Scalar{1} / static_cast<Scalar>(normalized_shape_);
+        const std::size_t F = normalized_shape_;
+        const std::size_t B = grad_output.cols();
 
-        // gy = grad_out * gamma (broadcast_row Mul)
-        auto gy = clone_tensor(engine, grad_output);
-        if (!gy) return std::unexpected(gy.error());
-        auto r = engine.broadcast_row_inplace(*gy, gamma_, BinaryOp::Mul);
-        if (!r) return std::unexpected(r.error());
-
-        // gy_norm = gy ⊙ normed
-        auto gy_norm = engine.elementwise_binary(BinaryOp::Mul, *gy, normed_cache_);
-        if (!gy_norm) return std::unexpected(gy_norm.error());
-
-        // m = col_reduce_sum(gy_norm) * inv_features → (1, batch)
-        auto m = engine.col_reduce_sum(*gy_norm);
+        // 1. m_raw = col_reduce_sum(gy ⊙ normed) → (1,B)
+        auto m_raw = dsl::compute_reduce(engine,
+            dsl::col_reduce_sum(
+                dsl::leaf(grad_output) * dsl::row_broadcast(gamma_)
+                * dsl::leaf(normed_cache_)),
+            F, B);
+        if (!m_raw) return std::unexpected(m_raw.error());
+        auto m = engine.elementwise_binary_scalar(BinaryOp::Mul, *m_raw, inv_features);
         if (!m) return std::unexpected(m.error());
-        r = engine.scale_inplace(*m, inv_features);
-        if (!r) return std::unexpected(r.error());
 
-        // m_normed = normed * m (broadcast_col Mul)
-        auto m_normed = clone_tensor(engine, normed_cache_);
-        if (!m_normed) return std::unexpected(m_normed.error());
-        r = engine.broadcast_col_inplace(*m_normed, *m, BinaryOp::Mul);
-        if (!r) return std::unexpected(r.error());
+        // 2. grad_x = (gy - m*normed) * rms_inv → (F,B)
+        auto grad_x = dsl::compute(engine,
+            (dsl::leaf(grad_output) * dsl::row_broadcast(gamma_)
+             - dsl::col_broadcast(*m) * dsl::leaf(normed_cache_))
+            * dsl::col_broadcast(rms_inv_cache_),
+            F, B);
+        if (!grad_x) return std::unexpected(grad_x.error());
 
-        // t = gy - m_normed
-        auto t = engine.elementwise_binary(BinaryOp::Sub, *gy, *m_normed);
-        if (!t) return std::unexpected(t.error());
-
-        // grad_x = t * rms_inv (broadcast_col Mul) — 就地修改 t
-        r = engine.broadcast_col_inplace(*t, rms_inv_cache_, BinaryOp::Mul);
-        if (!r) return std::unexpected(r.error());
-
-        // grad_gamma += row_reduce_sum(gy_norm) → (features, 1)
-        auto gg = engine.row_reduce_sum(*gy_norm);
+        // 3. grad_gamma += row_reduce_sum(gy ⊙ normed) → (F,1)
+        auto gg = dsl::compute_reduce(engine,
+            dsl::row_reduce_sum(
+                dsl::leaf(grad_output) * dsl::row_broadcast(gamma_)
+                * dsl::leaf(normed_cache_)),
+            F, B);
         if (!gg) return std::unexpected(gg.error());
-        r = engine.add_inplace(grad_gamma_, *gg);
+        auto r = engine.add_inplace(grad_gamma_, *gg);
         if (!r) return std::unexpected(r.error());
 
-        return t;
+        return grad_x;
     }
 };
 
@@ -839,53 +832,33 @@ public:
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
-        // 1. row_max = max per row
-        auto row_max = engine.row_reduce_max(input);
-        if (!row_max) return std::unexpected(row_max.error());
-
-        // 2. shifted = input - row_max (broadcast_row Sub) — 深拷贝 input
-        auto shifted = clone_tensor(engine, input);
-        if (!shifted) return std::unexpected(shifted.error());
-        auto r = engine.broadcast_row_inplace(*shifted, *row_max, BinaryOp::Sub);
-        if (!r) return std::unexpected(r.error());
-
-        // 3. exp_shift = exp(shifted)
-        auto exp_shift = engine.elementwise_unary(UnaryOp::Exp, *shifted);
-        if (!exp_shift) return std::unexpected(exp_shift.error());
-
-        // 4. row_sum = Σ_c exp_shift[r][c]
-        auto row_sum = engine.row_reduce_sum(*exp_shift);
-        if (!row_sum) return std::unexpected(row_sum.error());
-
-        // 5. output = exp_shift / row_sum (broadcast_row Div) — 深拷贝 exp_shift
-        auto output = clone_tensor(engine, *exp_shift);
-        if (!output) return std::unexpected(output.error());
-        r = engine.broadcast_row_inplace(*output, *row_sum, BinaryOp::Div);
-        if (!r) return std::unexpected(r.error());
-
-        output_cache_ = *output;
-        return output;
+        // 行 softmax（数值稳定）：out = exp(x - row_max) / Σ_c exp(x - row_max)
+        // 单表达式融合（M3）：row_max/row_sum 为归约视图/归约指令，中间全尺寸
+        // Tensor（shifted/exp_shift/row_max/row_sum 的物化）由融合 kernel 消解，
+        // 仅 input 与 output 落显存。算法公式与旧多次原语完全一致。
+        // 表达式文本只写在本 Layer；AOT 收集由 scan_exprs dry-run 本方法完成。
+        auto out = dsl::compute(engine,
+            dsl::exp(dsl::leaf(input) - dsl::row_reduce_max(input))
+            / dsl::row_reduce_sum(
+                dsl::exp(dsl::leaf(input) - dsl::row_reduce_max(input))),
+            input.rows(), input.cols());
+        if (!out) return std::unexpected(out.error());
+        output_cache_ = *out;
+        return out;
     }
 
     [[nodiscard]] Result<Tensor> backward(
         ComputeEngine& engine, const Tensor& grad_output) override
     {
-        // ep = out ⊙ grad_output
-        auto ep = engine.elementwise_binary(BinaryOp::Mul, output_cache_, grad_output);
-        if (!ep) return std::unexpected(ep.error());
-
-        // dot[r] = Σ_c ep[r][c]
-        auto dot = engine.row_reduce_sum(*ep);
-        if (!dot) return std::unexpected(dot.error());
-
-        // gmd = grad_output - dot (broadcast_row Sub) — 深拷贝 grad_output
-        auto gmd = clone_tensor(engine, grad_output);
-        if (!gmd) return std::unexpected(gmd.error());
-        auto r = engine.broadcast_row_inplace(*gmd, *dot, BinaryOp::Sub);
-        if (!r) return std::unexpected(r.error());
-
-        // grad_input = out ⊙ gmd
-        return engine.elementwise_binary(BinaryOp::Mul, output_cache_, *gmd);
+        // grad_x = out ⊙ (grad_output - row_dot(out ⊙ grad_output))
+        // 单表达式融合（M3）：row_dot 为归约指令，消除 ep/gmd 等全尺寸中间 Tensor。
+        auto out = dsl::compute(engine,
+            dsl::leaf(output_cache_)
+            * (dsl::leaf(grad_output)
+               - dsl::row_reduce_sum(dsl::leaf(output_cache_)
+                                     * dsl::leaf(grad_output))),
+            output_cache_.rows(), output_cache_.cols());
+        return out;
     }
 };
 

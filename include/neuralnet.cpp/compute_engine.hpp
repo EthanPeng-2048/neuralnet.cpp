@@ -281,6 +281,20 @@ public:
         const ExprSpec& spec,
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols) = 0;
+
+    // ── 归约向量原生形状输出（LayerNorm/RMSNorm 小向量缓存等） ──────────
+    // 语义同 eval_expr，但输出为归约向量本身（非广播）：
+    //   行归约轴 → (rows,1)；列归约轴 → (1,cols)。
+    // 要求表达式归约轴为 0/1（expr_spec_reduce_axis）。
+    // 默认实现返回错误（未支持的引擎）；CPU/GPU 覆盖。
+    [[nodiscard]] virtual Result<Tensor> eval_expr_reduce(
+        const ExprSpec& spec,
+        std::span<const Tensor> inputs,
+        std::size_t rows, std::size_t cols)
+    {
+        (void)spec; (void)inputs; (void)rows; (void)cols;
+        return std::unexpected(Error{"eval_expr_reduce: 该引擎不支持归约向量输出"});
+    }
 };
 
 } // namespace nn

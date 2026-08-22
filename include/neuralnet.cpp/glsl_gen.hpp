@@ -97,6 +97,12 @@ inline void glsl_view_read(std::ostringstream& os,
            << col_var << "]";
         return;
     }
+    case static_cast<uint8_t>(ExprViewKind::RowBroadcast):
+        os << buf << "[" << row_var << "]";   // 输入 (rows,1)：每行一个值
+        return;
+    case static_cast<uint8_t>(ExprViewKind::ColBroadcast):
+        os << buf << "[" << col_var << "]";   // 输入 (1,cols)：每列一个值
+        return;
     }
 }
 
@@ -209,6 +215,289 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
     // 输出 = 最后一条指令的目标寄存器
     const std::uint32_t last_dst = spec.instrs.back().dst;
     L << "    bout[i] = r" << last_dst << ";\n";
+    L << "}\n";
+    return L.str();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  归约融合 shader 生成（M3）：含归约视图/归约指令的表达式
+//
+//  处理 expr_spec_reduce_axis(spec) >= 0 的表达式（全部归约同轴）：
+//    - 工作组级归约：每个工作组（256 线程）协作处理一行（行归约）或一列
+//      （列归约），shared memory 树形归约，随后输出该行/列的全部元素。
+//    - 布局：bindings 输入 0..N-1 + 输出 N；
+//      push constants: uint count, uint cols, uint rows, [float c0..]；
+//      dispatch: 行归约 (rows,1,1)，列归约 (cols,1,1)。
+//    - 归约槽：每个归约视图/归约指令占一个共享槽 s_red[slot][256]；
+//      归约视图经 Input 操作数（槽），归约指令经 Reduce 操作数（槽）访问，
+//      最终值读取 s_red[slot][0]（完成屏障后全线程可见）。
+//    - 限制：归约槽 ≤ 8（共享内存 ≤ 8KB）；混合轴（行+列）不支持 → 返回 ""。
+// ═══════════════════════════════════════════════════════════════════════════
+[[nodiscard]] inline std::string generate_glsl_reduce(
+    const std::string& name, const ExprSpec& spec)
+{
+    const int axis = expr_spec_reduce_axis(spec);
+    if (axis < 0)
+        return {};  // 无归约（走逐元素生成器）或混合轴（不支持）
+    const bool is_row = (axis == 0);
+
+    const std::size_t n_inputs = spec.views.size();
+
+    // ── 归约槽分配 ──
+    // slot_of_view[k]：归约视图 k → 槽号；slot_of_instr[dst]：归约指令 dst → 槽号
+    std::vector<int> slot_of_view(n_inputs, -1);
+    std::vector<int> slot_of_instr(EXPR_MAX_REGS, -1);
+    std::vector<bool> slot_is_max;
+    int n_slots = 0;
+    for (std::size_t k = 0; k < n_inputs; ++k)
+    {
+        const ExprView& v = spec.views[k];
+        if (!expr_view_is_reduce(static_cast<ExprViewKind>(v.kind)))
+            continue;
+        slot_of_view[k] = n_slots++;
+        slot_is_max.push_back(
+            static_cast<ExprViewKind>(v.kind) == ExprViewKind::RowReduceMax ||
+            static_cast<ExprViewKind>(v.kind) == ExprViewKind::ColReduceMax);
+    }
+    for (const auto& ins : spec.instrs)
+    {
+        const ExprOp op = static_cast<ExprOp>(ins.op);
+        if (!expr_op_is_reduce(op))
+            continue;
+        slot_of_instr[ins.dst] = n_slots++;
+        slot_is_max.push_back(op == ExprOp::RowMax || op == ExprOp::ColMax);
+    }
+    if (n_slots == 0 || n_slots > 8)
+        return {};  // 无归约或槽过多（共享内存超限）
+
+    const bool last_is_reduce =
+        expr_op_is_reduce(static_cast<ExprOp>(spec.instrs.back().op));
+
+    std::ostringstream L;
+    L << "// ── 自动生成（AOT 算子融合 · 归约 kernel），请勿手动编辑 ──\n";
+    L << "// 表达式: " << name << "\n";
+    L << "#version 450\n\n";
+    L << "layout(local_size_x = 256) in;\n\n";
+    for (std::size_t i = 0; i < n_inputs; ++i)
+        L << "layout(std430, binding = " << i << ") readonly buffer Buf" << i
+          << " { float b" << i << "[]; };\n";
+    L << "layout(std430, binding = " << n_inputs
+      << ") writeonly buffer BufOut { float bout[]; };\n\n";
+    L << "layout(push_constant) uniform PC {\n";
+    L << "    uint count;\n";
+    L << "    uint cols;\n";
+    L << "    uint rows;\n";
+    L << "    uint vector_out;   // 1=输出归约向量（(rows,1)/(1,cols)），0=广播\n";
+    for (std::size_t i = 0; i < spec.consts.size(); ++i)
+        L << "    float c" << i << ";\n";
+    L << "};\n\n";
+    L << "shared float s_red[" << n_slots << "][256];\n\n";
+
+    L << "void main()\n{\n";
+    L << "    const uint tid = gl_LocalInvocationID.x;\n";
+    L << "    const uint idx = gl_WorkGroupID.x;\n";
+    L << (is_row ? "    if (idx >= rows) return;\n"
+                 : "    if (idx >= cols) return;\n");
+
+    // ── 操作数求值（当前元素由 row/col 变量给出） ──
+    const auto operand = [&](const ExprOperand& op) -> std::string
+    {
+        switch (op.kind)
+        {
+        default:
+        case static_cast<uint8_t>(ExprOperandKind::Reg):
+        case static_cast<uint8_t>(ExprOperandKind::Fanout):
+            return "r" + std::to_string(op.idx);
+        case static_cast<uint8_t>(ExprOperandKind::Const):
+            return "c" + std::to_string(op.idx);
+        case static_cast<uint8_t>(ExprOperandKind::Reduce):
+            return "s_red[" + std::to_string(slot_of_instr[op.idx]) + "][0]";
+        case static_cast<uint8_t>(ExprOperandKind::Input):
+        {
+            const ExprView& v = spec.views[op.idx];
+            const ExprViewKind vk = static_cast<ExprViewKind>(v.kind);
+            if (expr_view_is_reduce(vk))
+                return "s_red[" + std::to_string(slot_of_view[op.idx]) + "][0]";
+            if (vk == ExprViewKind::RowBroadcast)
+                return "b" + std::to_string(op.idx) + "[row]";
+            if (vk == ExprViewKind::ColBroadcast)
+                return "b" + std::to_string(op.idx) + "[col]";
+            // Linear / RotateHalf / RowMod：索引映射内联
+            std::ostringstream os;
+            glsl_view_read(os, v, static_cast<std::uint32_t>(op.idx),
+                           "(row*cols + col)", "row", "col");
+            return os.str();
+        }
+        }
+    };
+
+    // 直线指令展开（跳过归约指令；归约结果经 s_red 访问）
+    const auto emit_instrs = [&](std::size_t begin, std::size_t end)
+    {
+        for (std::size_t j = begin; j < end; ++j)
+        {
+            const ExprInstr& ins = spec.instrs[j];
+            const ExprOp op = static_cast<ExprOp>(ins.op);
+            if (expr_op_is_reduce(op))
+                continue;
+            const std::string dst = "r" + std::to_string(ins.dst);
+            const std::string a = operand(ins.a);
+            switch (op)
+            {
+            case ExprOp::Add: case ExprOp::Sub: case ExprOp::Mul: case ExprOp::Div:
+            {
+                bool cmp = false;
+                const char* s = glsl_binary_op(op, cmp);
+                L << "        float " << dst << " = " << a << " " << s << " "
+                  << operand(ins.b) << ";\n";
+                break;
+            }
+            case ExprOp::Max: case ExprOp::Min:
+            {
+                const char* s = (op == ExprOp::Max) ? "max" : "min";
+                L << "        float " << dst << " = " << s << "(" << a
+                  << ", " << operand(ins.b) << ");\n";
+                break;
+            }
+            case ExprOp::Lt: case ExprOp::Le: case ExprOp::Gt:
+            case ExprOp::Ge: case ExprOp::Eq: case ExprOp::Ne:
+            {
+                bool cmp = false;
+                const char* s = glsl_binary_op(op, cmp);
+                L << "        float " << dst << " = (" << a << " " << s << " "
+                  << operand(ins.b) << ") ? 1.0 : 0.0;\n";
+                break;
+            }
+            case ExprOp::Neg:
+                L << "        float " << dst << " = -(" << a << ");\n";
+                break;
+            case ExprOp::Exp: case ExprOp::Log: case ExprOp::Sqrt:
+            case ExprOp::Rsqrt: case ExprOp::Abs: case ExprOp::Tanh:
+            {
+                const char* s = glsl_unary_op(op);
+                L << "        float " << dst << " = " << s << "(" << a << ");\n";
+                break;
+            }
+            case ExprOp::Select:
+                L << "        float " << dst << " = (" << a << " != 0.0) ? "
+                  << operand(ins.b) << " : " << operand(ins.c) << ";\n";
+                break;
+            default:
+                break;  // 归约指令已 continue
+            }
+        }
+    };
+
+    // 组合表达式：sum → "a + b"（中缀），max → "max(a, b)"（函数）
+    const auto combine = [](bool is_max, const std::string& a, const std::string& b)
+    {
+        return is_max ? "max(" + a + ", " + b + ")" : "(" + a + " + " + b + ")";
+    };
+
+    // 归约树形归约（barrier 在每步内，最后一步后全线程可见 s_red[slot][0]）
+    const auto emit_tree_reduce = [&](int slot, bool is_max)
+    {
+        const std::string s = "s_red[" + std::to_string(slot) + "]";
+        L << "    barrier();\n";
+        L << "    for (uint s = 128u; s > 0u; s >>= 1u) {\n";
+        L << "        if (tid < s) " << s << "[tid] = "
+          << combine(is_max, s + "[tid]", s + "[tid + s]") << ";\n";
+        L << "        barrier();\n";
+        L << "    }\n";
+    };
+
+    // 元素索引声明（行归约：固定行、循环列；列归约：循环行、固定列）
+    const std::string loop_decl = is_row
+        ? "    for (uint c = tid; c < cols; c += 256u) {\n        const uint row = idx;\n        const uint col = c;\n"
+        : "    for (uint r = tid; r < rows; r += 256u) {\n        const uint row = r;\n        const uint col = idx;\n";
+    const std::string out_idx = "row*cols + col";
+
+    // ── 归约视图归约 pass ──
+    for (std::size_t k = 0; k < n_inputs; ++k)
+    {
+        const ExprView& v = spec.views[k];
+        if (!expr_view_is_reduce(static_cast<ExprViewKind>(v.kind)))
+            continue;
+        const int slot = slot_of_view[k];
+        const bool is_max = slot_is_max[static_cast<std::size_t>(slot)];
+        L << "\n    // 归约视图 " << k << " (槽 " << slot << ")\n";
+        L << "    {\n";
+        L << "        float acc = "
+          << (is_max ? "uintBitsToFloat(0xff800000u)" : "0.0") << ";\n";
+        L << loop_decl;
+        L << "            acc = " << combine(is_max, "acc",
+            "b" + std::to_string(k) + "[row*cols + col]") << ";\n";
+        L << "        }\n";
+        L << "        s_red[" << slot << "][tid] = acc;\n";
+        L << "    }\n";
+        emit_tree_reduce(slot, is_max);
+    }
+
+    // ── 归约指令 pass（按指令序，源可引用更早归约结果） ──
+    // 寄存器声明直接放在 for 循环体内（无需额外 {} 包裹），使源寄存器在
+    // combine 处可见；不同 pass 各自循环体作用域隔离，无重声明冲突。
+    for (std::size_t ri = 0; ri < spec.instrs.size(); ++ri)
+    {
+        const ExprInstr& R = spec.instrs[ri];
+        const ExprOp rop = static_cast<ExprOp>(R.op);
+        if (!expr_op_is_reduce(rop))
+            continue;
+        const int slot = slot_of_instr[R.dst];
+        const bool is_max = slot_is_max[static_cast<std::size_t>(slot)];
+        const bool src_is_reg =
+            (R.a.kind == static_cast<uint8_t>(ExprOperandKind::Reg) ||
+             R.a.kind == static_cast<uint8_t>(ExprOperandKind::Fanout));
+        const std::string src = src_is_reg
+            ? "r" + std::to_string(static_cast<int>(R.a.idx))
+            : operand(R.a);
+        L << "\n    // 归约指令 " << ri << " (槽 " << slot << ")\n";
+        L << "    {\n";
+        L << "        float acc = "
+          << (is_max ? "uintBitsToFloat(0xff800000u)" : "0.0") << ";\n";
+        L << loop_decl;
+        emit_instrs(0, ri);
+        L << "        acc = " << combine(is_max, "acc", src) << ";\n";
+        L << "        }\n";
+        L << "        s_red[" << slot << "][tid] = acc;\n";
+        L << "    }\n";
+        emit_tree_reduce(slot, is_max);
+    }
+
+    // ── 输出 pass ──
+    // vector_out=1：输出归约向量（thread 0 写代表元素，输出形状由后端分配
+    //   (rows,1)/(1,cols)）；vector_out=0：广播到 (rows,cols)。
+    L << "\n    // 输出\n";
+    L << "    if (vector_out == 1u) {\n";
+    L << "        const uint row = " << (is_row ? "idx" : "0u") << ";\n";
+    L << "        const uint col = " << (is_row ? "0u" : "idx") << ";\n";
+    L << "        if (tid == 0u) {\n";
+    if (last_is_reduce)
+    {
+        L << "            bout[" << (is_row ? "row" : "col") << "] = s_red["
+          << slot_of_instr[spec.instrs.back().dst] << "][0];\n";
+    }
+    else
+    {
+        emit_instrs(0, spec.instrs.size());
+        L << "            bout[" << (is_row ? "row" : "col") << "] = r"
+          << static_cast<int>(spec.instrs.back().dst) << ";\n";
+    }
+    L << "        }\n";
+    L << "        return;\n";
+    L << "    }\n";
+    L << loop_decl;
+    if (last_is_reduce)
+    {
+        L << "        bout[" << out_idx << "] = s_red["
+          << slot_of_instr[spec.instrs.back().dst] << "][0];\n";
+    }
+    else
+    {
+        emit_instrs(0, spec.instrs.size());
+        L << "        bout[" << out_idx << "] = r"
+          << static_cast<int>(spec.instrs.back().dst) << ";\n";
+    }
+    L << "    }\n";
     L << "}\n";
     return L.str();
 }

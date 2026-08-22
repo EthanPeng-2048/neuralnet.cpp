@@ -649,6 +649,8 @@ private:
     // AOT 融合 shader pipelines（key = expr_spec_key → pipeline；由构建期
     // fused_registry.hpp 注册，运行时按 key 匹配后直接 dispatch）
     std::unordered_map<std::string, VulkanPipeline> fused_pipelines_;
+    // 归约轴：-1=逐元素, 0=行归约, 1=列归约（决定 push constants 与 dispatch）
+    std::unordered_map<std::string, int> fused_reduce_axis_;
 
     std::unique_ptr<MemoryPool> memory_pool_;
     std::unique_ptr<StagingRing> staging_ring_;
@@ -1044,14 +1046,19 @@ public:
                 continue;  // 空 SPIR-V：跳过（构建配置缺失）
             const std::uint32_t num_bindings =
                 static_cast<std::uint32_t>(fs.spec.views.size()) + 1;  // 输入 + 输出
+            // 归约 kernel 的 push constants 多 uint rows + uint vector_out
+            const std::uint32_t pc_uints = (fs.reduce_axis >= 0) ? 4u : 2u;
             const std::uint32_t pc_size =
-                static_cast<std::uint32_t>(sizeof(std::uint32_t) * 2 +
+                static_cast<std::uint32_t>(pc_uints * sizeof(std::uint32_t) +
                                            sizeof(Scalar) * fs.spec.consts.size());
             auto fp_r = VulkanPipeline::create_generic(
                 device_.device(), std::span<const std::uint32_t>(fs.spirv, fs.spirv_words),
                 num_bindings, pc_size);
             if (fp_r)
+            {
                 fused_pipelines_.emplace(fs.key, std::move(*fp_r));
+                fused_reduce_axis_.emplace(fs.key, fs.reduce_axis);
+            }
         }
 #endif
 
@@ -2414,7 +2421,8 @@ public:
         const std::string& shader_name,
         std::span<const GpuTensor> inputs,
         std::span<const Scalar> consts,
-        std::size_t rows, std::size_t cols)
+        std::size_t rows, std::size_t cols,
+        bool vector_out = false)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
@@ -2422,6 +2430,9 @@ public:
         if (it == fused_pipelines_.end())
             return std::unexpected(Error{"fused shader not registered: " + shader_name});
         const VulkanPipeline& pipeline = it->second;
+        // 归约轴：-1=逐元素, 0=行归约, 1=列归约
+        const int raxis = fused_reduce_axis_.count(shader_name)
+            ? fused_reduce_axis_.at(shader_name) : -1;
 
         if (inputs.size() + 1 > EXPR_MAX_INPUTS + 1)
             return std::unexpected(Error{"run_fused_gpu: too many inputs"});
@@ -2435,8 +2446,12 @@ public:
                 "run_fused_gpu: rows*cols exceeds uint32 range"});
         const std::uint32_t count = static_cast<std::uint32_t>(rows * cols);
 
-        // 1. 分配输出 Tensor
-        auto output_res = GpuTensor::create_empty(rows, cols, *this);
+        // 1. 分配输出 Tensor（vector_out：归约向量原生形状 (rows,1)/(1,cols)）
+        const std::size_t out_rows = (vector_out && raxis == 0) ? rows
+                                  : (vector_out && raxis == 1) ? 1 : rows;
+        const std::size_t out_cols = (vector_out && raxis == 1) ? cols
+                                  : (vector_out && raxis == 0) ? 1 : cols;
+        auto output_res = GpuTensor::create_empty(out_rows, out_cols, *this);
         if (!output_res) return std::unexpected(output_res.error());
         GpuTensor output = std::move(*output_res);
 
@@ -2483,18 +2498,35 @@ public:
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             pipeline.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
 
-        // Push constants 布局与 glsl_gen.hpp 一致：count, cols, c0..
-        std::vector<std::uint8_t> pc(sizeof(std::uint32_t) * 2 + sizeof(Scalar) * consts.size());
+        // Push constants 布局与 glsl_gen.hpp 一致：
+        //   逐元素: count, cols, c0..
+        //   归约:   count, cols, rows, vector_out, c0..
+        const std::uint32_t pc_uints = (raxis >= 0) ? 4u : 2u;
+        std::vector<std::uint8_t> pc(
+            pc_uints * sizeof(std::uint32_t) + sizeof(Scalar) * consts.size());
         std::memcpy(pc.data(), &count, sizeof(std::uint32_t));
         const std::uint32_t cols32 = static_cast<std::uint32_t>(cols);
         std::memcpy(pc.data() + sizeof(std::uint32_t), &cols32, sizeof(std::uint32_t));
+        if (raxis >= 0)
+        {
+            const std::uint32_t rows32 = static_cast<std::uint32_t>(rows);
+            std::memcpy(pc.data() + 2 * sizeof(std::uint32_t), &rows32,
+                        sizeof(std::uint32_t));
+            const std::uint32_t vo = vector_out ? 1u : 0u;
+            std::memcpy(pc.data() + 3 * sizeof(std::uint32_t), &vo,
+                        sizeof(std::uint32_t));
+        }
         if (!consts.empty())
-            std::memcpy(pc.data() + sizeof(std::uint32_t) * 2, consts.data(),
+            std::memcpy(pc.data() + pc_uints * sizeof(std::uint32_t), consts.data(),
                         sizeof(Scalar) * consts.size());
         vkCmdPushConstants(cmd, pipeline.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, static_cast<std::uint32_t>(pc.size()), pc.data());
 
-        const std::uint32_t wg_count = (count + 255) / 256;
+        // dispatch：逐元素 = ceil(count/256)；行归约 = rows 个工作组；列归约 = cols 个工作组
+        const std::uint32_t wg_count =
+            (raxis == 0) ? static_cast<std::uint32_t>(rows)
+            : (raxis == 1) ? static_cast<std::uint32_t>(cols)
+            : (count + 255) / 256;
         vkCmdDispatch(cmd, wg_count, 1, 1);
         record_output_barrier(cmd, output.buffer().impl());
 

@@ -129,6 +129,106 @@ int run_swiglu(CpuEngine& cpu, GpuEngine& gpu)
     return ok ? 0 : 1;
 }
 
+// ── Softmax forward/backward：GPU（M3 行归约融合 shader）vs CPU ───────────
+// forward:  exp(x - row_max) / row_sum(exp(x - row_max))
+// backward: out * (grad - row_dot(out * grad))
+// 归约融合 shader 未命中（未扫描）时 GPU 端 eval_expr 硬报错。
+int run_softmax(CpuEngine& cpu, GpuEngine& gpu)
+{
+    const std::size_t R = 6, C = 9;   // 与 scan_exprs 结构一致（结构不依赖形状）
+    std::mt19937 rng(777);
+    std::uniform_real_distribution<Scalar> dist(-1.0f, 1.0f);
+    Matrix x(R, C), grad(R, C);
+    for (auto& v : x.span()) v = dist(rng);
+    for (auto& v : grad.span()) v = dist(rng);
+
+    nn::Softmax sm_cpu, sm_gpu;
+    const Tensor in = Tensor::from_matrix(Matrix(x));
+    auto fc = sm_cpu.forward(cpu, in);
+    auto fg = sm_gpu.forward(gpu, in);
+    if (!fc) { std::cerr << "  CPU softmax forward 失败: " << fc.error().message << "\n"; return 1; }
+    if (!fg)
+    {
+        std::cerr << "  GPU softmax forward 失败（未命中归约融合 shader？）: "
+                  << fg.error().message << "\n";
+        return 1;
+    }
+    auto fgm = gpu.to_matrix(*fg);
+    if (!fgm) { std::cerr << "  GPU softmax forward 结果下载失败\n"; return 1; }
+    const Scalar err_f = max_abs_diff(fc->cpu_matrix(), *fgm);
+    const bool ok_f = err_f < 1e-4f;
+    std::cout << "[" << (ok_f ? "PASS" : "FAIL") << "] softmax forward"
+              << "  err=" << std::scientific << std::setprecision(2) << err_f << "\n";
+
+    const Tensor gd = Tensor::from_matrix(Matrix(grad));
+    auto bc = sm_cpu.backward(cpu, gd);
+    auto bg = sm_gpu.backward(gpu, gd);
+    if (!bc) { std::cerr << "  CPU softmax backward 失败: " << bc.error().message << "\n"; return 1; }
+    if (!bg)
+    {
+        std::cerr << "  GPU softmax backward 失败（未命中归约融合 shader？）: "
+                  << bg.error().message << "\n";
+        return 1;
+    }
+    auto bgm = gpu.to_matrix(*bg);
+    if (!bgm) { std::cerr << "  GPU softmax backward 结果下载失败\n"; return 1; }
+    const Scalar err_b = max_abs_diff(bc->cpu_matrix(), *bgm);
+    const bool ok_b = err_b < 1e-4f;
+    std::cout << "[" << (ok_b ? "PASS" : "FAIL") << "] softmax backward"
+              << "  err=" << std::scientific << std::setprecision(2) << err_b << "\n";
+    return (ok_f && ok_b) ? 0 : 1;
+}
+
+// ── 归一化层通用：GPU（M3 归约融合 shader）vs CPU ────────────────────────
+// 驱动同一个 Layer（RMSNorm/LayerNorm）在 CPU 与 GPU 引擎上，对比
+// forward/backward 输出。未命中融合 shader 时 GPU 端 eval_expr 硬报错。
+template <typename NormT>
+int run_norm(const char* name, CpuEngine& cpu, GpuEngine& gpu)
+{
+    const std::size_t F = 8, B = 5;
+    std::mt19937 rng(888);
+    std::uniform_real_distribution<Scalar> dist(-1.0f, 1.0f);
+    Matrix x(F, B), grad(F, B);
+    for (auto& v : x.span()) v = dist(rng);
+    for (auto& v : grad.span()) v = dist(rng);
+
+    NormT n_cpu(cpu, F), n_gpu(gpu, F);
+    const Tensor in = Tensor::from_matrix(Matrix(x));
+    auto fc = n_cpu.forward(cpu, in);
+    auto fg = n_gpu.forward(gpu, in);
+    if (!fc) { std::cerr << "  CPU " << name << " forward 失败: " << fc.error().message << "\n"; return 1; }
+    if (!fg)
+    {
+        std::cerr << "  GPU " << name << " forward 失败（未命中归约融合 shader？）: "
+                  << fg.error().message << "\n";
+        return 1;
+    }
+    auto fgm = gpu.to_matrix(*fg);
+    if (!fgm) { std::cerr << "  GPU " << name << " forward 结果下载失败\n"; return 1; }
+    const Scalar err_f = max_abs_diff(fc->cpu_matrix(), *fgm);
+    const bool ok_f = err_f < 1e-4f;
+    std::cout << "[" << (ok_f ? "PASS" : "FAIL") << "] " << name << " forward"
+              << "  err=" << std::scientific << std::setprecision(2) << err_f << "\n";
+
+    const Tensor gd = Tensor::from_matrix(Matrix(grad));
+    auto bc = n_cpu.backward(cpu, gd);
+    auto bg = n_gpu.backward(gpu, gd);
+    if (!bc) { std::cerr << "  CPU " << name << " backward 失败: " << bc.error().message << "\n"; return 1; }
+    if (!bg)
+    {
+        std::cerr << "  GPU " << name << " backward 失败（未命中归约融合 shader？）: "
+                  << bg.error().message << "\n";
+        return 1;
+    }
+    auto bgm = gpu.to_matrix(*bg);
+    if (!bgm) { std::cerr << "  GPU " << name << " backward 结果下载失败\n"; return 1; }
+    const Scalar err_b = max_abs_diff(bc->cpu_matrix(), *bgm);
+    const bool ok_b = err_b < 1e-4f;
+    std::cout << "[" << (ok_b ? "PASS" : "FAIL") << "] " << name << " backward"
+              << "  err=" << std::scientific << std::setprecision(2) << err_b << "\n";
+    return (ok_f && ok_b) ? 0 : 1;
+}
+
 int main()
 {
     std::cout << "========================================\n"
@@ -153,6 +253,9 @@ int main()
         fail += run_rope(*cpu_engine, *gpu_engine, dk, /*backward=*/true);
     }
     fail += run_swiglu(*cpu_engine, *gpu_engine);
+    fail += run_softmax(*cpu_engine, *gpu_engine);
+    fail += run_norm<nn::RMSNorm>("rmsnorm", *cpu_engine, *gpu_engine);
+    fail += run_norm<nn::LayerNorm>("layernorm", *cpu_engine, *gpu_engine);
 
     std::cout << (fail == 0 ? "ALL PASS\n" : "FAILED\n");
     return fail == 0 ? 0 : 1;

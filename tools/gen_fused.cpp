@@ -130,15 +130,32 @@ int main(int argc, char* argv[])
     H << "    ExprSpec    spec;\n";
     H << "    const std::uint32_t* spirv;\n";
     H << "    std::size_t spirv_words;\n";
+    H << "    int         reduce_axis;   // -1=逐元素, 0=行归约, 1=列归约\n";
     H << "};\n\n";
 
     for (const auto& spec : reg.specs)
     {
+        const int raxis = nn::expr_spec_reduce_axis(spec);
+        if (raxis == -2)
+        {
+            // 混合归约轴（行+列）无法单 kernel 融合：跳过，运行时闭合世界硬报错
+            std::fprintf(stderr, "[skip] 混合归约轴结构不支持融合: %s\n",
+                         nn::expr_spec_key(spec).c_str());
+            continue;
+        }
         const std::string key = nn::expr_spec_key(spec);
         const std::string comp_path = out_dir + "/fused_" + key + ".comp";
         const std::string spv_path  = out_dir + "/fused_" + key + ".spv";
 
-        const std::string glsl = nn::generate_glsl("fused_" + key, spec);
+        // 含归约（raxis >= 0）→ 归约 kernel（workgroup 级共享内存归约）；否则逐元素
+        const std::string glsl = (raxis >= 0)
+            ? nn::generate_glsl_reduce("fused_" + key, spec)
+            : nn::generate_glsl("fused_" + key, spec);
+        if (glsl.empty())
+        {
+            std::fprintf(stderr, "[FAIL] 生成 %s 失败（归约结构不支持？）\n", key.c_str());
+            return 1;
+        }
         {
             std::ofstream f(comp_path);
             if (!f) { std::fprintf(stderr, "[FAIL] 无法写入 %s\n", comp_path.c_str()); return 1; }
@@ -168,10 +185,14 @@ int main(int argc, char* argv[])
     H << "inline const FusedShader kFusedShaders[] = {\n";
     for (const auto& spec : reg.specs)
     {
+        const int raxis = nn::expr_spec_reduce_axis(spec);
+        if (raxis == -2)
+            continue;  // 与上方跳过保持一致
         const std::string key = nn::expr_spec_key(spec);
         H << "    { \"" << key << "\",\n        " << emit_spec(spec) << ",\n"
           << "        kSpirv_" << key
-          << ", sizeof(kSpirv_" << key << ")/sizeof(std::uint32_t) },\n";
+          << ", sizeof(kSpirv_" << key << ")/sizeof(std::uint32_t), "
+          << raxis << " },\n";
     }
     H << "};\n";
     H << "inline constexpr std::size_t kFusedShaderCount =\n"
