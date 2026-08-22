@@ -115,6 +115,45 @@ public:
         return Tensor::from_gpu(std::move(*dst));
     }
 
+    // ── activation offload slab（持久复用缓冲） ───────────────────────
+    [[nodiscard]] Result<Tensor> create_offload_buffer(std::size_t bytes) override
+    {
+        auto g = GpuTensor::create_host_visible_empty(1, bytes, backend_);
+        if (!g) return std::unexpected(g.error());
+        return Tensor::from_gpu(std::move(*g));
+    }
+
+    // 把 src 复制到 buffer 的 offset（float 单位）处（录制式）
+    [[nodiscard]] Result<void> offload_save(
+        const Tensor& buffer, std::size_t offset, const Tensor& src) override
+    {
+        if (src.is_cpu())
+            return {};
+        const VkDeviceSize size =
+            static_cast<VkDeviceSize>(src.size() * sizeof(float));
+        return backend_.copy_buffer_region_gpu(
+            src.gpu_tensor().buffer().impl(), 0,
+            buffer.gpu_tensor().buffer().impl(),
+            static_cast<VkDeviceSize>(offset * sizeof(float)), size);
+    }
+
+    // 从 buffer 的 offset（float 单位）处复制 rows×cols 到新 GPU tensor（录制式）
+    [[nodiscard]] Result<Tensor> offload_restore(
+        const Tensor& buffer, std::size_t offset,
+        std::size_t rows, std::size_t cols) override
+    {
+        auto dst = GpuTensor::create_empty(rows, cols, backend_);
+        if (!dst) return std::unexpected(dst.error());
+        const VkDeviceSize size =
+            static_cast<VkDeviceSize>(rows * cols * sizeof(float));
+        auto r = backend_.copy_buffer_region_gpu(
+            buffer.gpu_tensor().buffer().impl(),
+            static_cast<VkDeviceSize>(offset * sizeof(float)),
+            dst->buffer().impl(), 0, size);
+        if (!r) return std::unexpected(r.error());
+        return Tensor::from_gpu(std::move(*dst));
+    }
+
     // ── 中点刷新：提交当前 command buffer 并开始新的录制 ──
     // 用于拆分大 batch（如 forward 与 backward 之间），防 TDR。
     [[nodiscard]] Result<void> flush_batch() override

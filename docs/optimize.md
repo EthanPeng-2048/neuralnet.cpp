@@ -25,11 +25,16 @@
 - 显存：~9GB 级（同 N=1）
 - 每 step：~23s（vs N=1 的 31s），**快 ~8s，无重算**
 
-### 实现（已落地，阶段1+2）
+### 实现（已落地，阶段1+2+3）
 - 引擎原语：`ComputeEngine::offload_store(activation)` / `offload_load(handle, rows, cols)`（CPU no-op；GPU 用**录制式** `vkCmdCopyBuffer(dev↔host_visible)`，batch 内不提交，避免打断 batch）。
-- 后端：`GpuBuffer::create_host_visible` / `GpuTensor::create_host_visible_empty`（HOST_VISIBLE 内存池）。
+- 后端：`GpuBuffer::create_host_visible` / `GpuTensor::create_host_visible_empty`（HOST_VISIBLE 内存池）；`copy_buffer_region_gpu`（带偏移拷贝）。
 - 层：`Layer::activation_cache()` 枚举 backward 所需中间激活；GPTBlock `export_activations`（forward 后搬 host + 释放 GPU）/ `import_activations`（backward 前拷回，不重算）。掩码小而常驻不参与 offload。
+- **slab 复用**：每块用一块持久 host-visible slab（大小=激活总字节，跨 step 复用），激活按 offset 写入/读出 → RAM = 激活实际体积，避免 128MB 块碎片膨胀。
 - 接入：`text_train --activation-offload`（与 `--checkpoint-every` 互斥）、GUI/CLI。
+
+### RAM 实测（batch 6）
+- 早期（每 tensor 独立缓冲）：RAM **26GB**（128MB 块碎片膨胀）。
+- slab 修复后：RAM ≈ 激活实际体积 **~7GB**。
 
 ### 验证
 - `offload_test`：GPU 激活 → host → GPU 往返 **bit-exact**（非 batch + batch 路径）。
@@ -37,5 +42,5 @@
 - 全部 gradcheck/fusion 回归绿。
 
 ### 注意
-- 需足够主机 RAM（激活 ~5-8GB）与 PCIe 带宽；PCIe 3.0/x8 收益减半。
+- 需足够主机 RAM（激活随 batch 线性增长）与 PCIe 带宽；PCIe 3.0/x8 收益减半。
 - CUDA 后端 offload 暂为 no-op（未接 pinned memory）。

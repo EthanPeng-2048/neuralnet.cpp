@@ -3420,6 +3420,19 @@ public:
     [[nodiscard]] Result<void> copy_buffer_gpu(
         VkBuffer src, VkBuffer dst, VkDeviceSize size)
     {
+        return copy_buffer_region_gpu(src, 0, dst, 0, size);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // copy_buffer_region_gpu — 带偏移的 buffer 拷贝（activation offload slab 用）
+    // 从 src[src_offset, src_offset+size) 拷到 dst[dst_offset, dst_offset+size)。
+    // batch 模式只录制不提交；非 batch 独立提交等待。
+    // ══════════════════════════════════════════════════════════════════
+    [[nodiscard]] Result<void> copy_buffer_region_gpu(
+        VkBuffer src, VkDeviceSize src_offset,
+        VkBuffer dst, VkDeviceSize dst_offset,
+        VkDeviceSize size)
+    {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
 
@@ -3427,7 +3440,7 @@ public:
         if (!cmd_r) return std::unexpected(cmd_r.error());
         auto [cmd, owns_cmd] = *cmd_r;
 
-        VkBufferCopy cp{0, 0, size};
+        VkBufferCopy cp{src_offset, dst_offset, size};
         vkCmdCopyBuffer(cmd, src, dst, 1, &cp);
 
         VkBufferMemoryBarrier b{};
