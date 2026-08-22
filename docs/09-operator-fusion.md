@@ -1,6 +1,6 @@
 # 算子融合设计（Operator Fusion）—— 减少 GPT+Vulkan 训练显存
 
-> 状态：实施中 · 里程碑 **M1（ExprSpec 归约语义）✅ 完成**、**M2（begin_expr/end_expr 录制框架）✅ 完成**
+> 状态：实施中 · 里程碑 **M1（ExprSpec 归约语义）✅ 完成**、**M2（begin_expr/end_expr 录制框架）✅ 完成**、**M3（Softmax/LayerNorm/RMSNorm 归约融合）✅ 完成**
 > 目标版本：与现有 `eval_expr` AOT 融合管线共存
 > 关联文档：`DEVELOPMENT_STANDARDS.md`（分层铁律）、`AST_COMPUTE.md`（表达式 DSL）、`01-architecture.md`
 
@@ -385,7 +385,7 @@ auto e = engine.end_expr();
 |--------|------|------|
 | M1 ✅ | `ExprSpec` 加归约视图/指令 + CPU `eval_expr` 扩展 | `expr_reduce_test` 全过 + `expr_dsl_test` 回归 |
 | M2 ✅ | `begin_expr/end_expr` 录制框架 + CPU no-op | 现有测试回归通过 |
-| M3 | Softmax/LayerNorm/RMSNorm 改录制，GPU 融合 shader | gradcheck + 显存对比 |
+| M3 ✅ | **Softmax/LayerNorm/RMSNorm fwd/bwd 改 DSL 归约表达式 + GPU 归约融合 shader**（glsl_gen 工作组归约、gen_fused 归约轴、vk_backend 归约调度、eval_expr_reduce 归约向量输出） | `fused_gpu_test` 全过 + `rmsnorm_gradcheck`/`softmax_gradcheck`/`attn_gradcheck`/`gpt_gradcheck` + MNIST Transformer 训练（CPU/GPU × layernorm/rmsnorm） |
 | M4 | §4 三个 matmul 融合原语（CPU + GPU） | `gpt_gradcheck` 通过 |
 | M5 | CrossEntropyLoss 融合（不物化全 softmax） | loss/grad 一致性 + 显存下降 |
 | M6 | Attention 两趟式（forward + 反向重算） | `attn_gradcheck` + 显存大幅下降 |
@@ -443,3 +443,32 @@ auto e = engine.end_expr();
 - `compute_engine.hpp`：`begin_expr()/end_expr()` 纯虚接口（计算级融合入口）。
 - `cpu_engine.hpp` / `gpu_engine.hpp` / `cuda_engine.hpp`：no-op 实现（各表达式/原语独立求值，行为不变）。
 - Layer 可先行用 `begin_expr/end_expr` 包住算法段落而语义不变；录制融合分析（虚拟寄存器 DAG + 融合边界判定）在 M3 落地。
+
+### M3 ✅（2026-08）— Softmax 归约融合（GPU 工作组级归约 kernel）
+
+**改动**：
+- `expr_spec.hpp`：`RowBroadcast=7`（输入 (rows,1) 读 b[r]，gamma/beta 逐行参数）、`ColBroadcast=8`（输入 (1,cols) 读 b[c]，std_inv 逐列统计量）；`expr_spec_reduce_axis(spec)`（-1=逐元素 / 0=行归约 / 1=列归约 / -2=混合轴不支持）。
+- `expr_dsl.hpp`：`BroadcastRef<Kind>` 广播视图叶子 + `row_broadcast(t)`/`col_broadcast(t)` 自由函数；`has_reduction_v` 覆盖广播叶子（模板求值无法跨网格广播，分流 eval_expr）。
+- `cpu_engine.hpp`：视图校验/read_input 支持广播视图（形状与输出不同）。
+- `glsl_gen.hpp`：**`generate_glsl_reduce`** —— 工作组级归约融合 kernel 生成。每个工作组（256 线程）协作处理一行（行归约）/一列（列归约）：shared memory 树形归约（每归约槽 256 槽位，槽=归约视图+归约指令），随后输出该行/列全部元素。push constants 增加 `uint rows`；dispatch 行归约 (rows,1,1)、列归约 (cols,1,1)。
+- `tools/gen_fused.cpp`：`FusedShader` 增加 `int reduce_axis`；按轴选 `generate_glsl_reduce`/`generate_glsl`；混合轴结构跳过（运行时闭合世界硬报错）。
+- `include/neuralnet.cpp/backend/vk_backend.hpp`：`fused_reduce_axis_` 记录每 key 归约轴；注册时归约 shader push constants 多一个 uint rows；`run_fused_gpu` 按轴组 push constants 与 dispatch。
+- `compute_layer.hpp`：**Softmax::forward/backward 改为单 DSL 归约表达式**（算法公式不变）：
+  - forward: `exp(x - row_max) / row_sum(exp(x - row_max))`
+  - backward: `out * (grad - row_dot(out * grad))`
+- `tools/scan_exprs.cpp`：Softmax fwd/bwd dry-run（收集归约结构）。
+- `src/fused_gpu_test.cpp`：Softmax fwd/bwd GPU-vs-CPU 端到端（走真实 Layer + 融合 shader）。
+
+**关键决策**：
+- **全部归约必须同轴**（行或列）才能单 kernel 融合；混合轴（归一化 backward 的 `grad_gamma` 行归约 + `grad_x` 列归约）拆成多个表达式/原语。
+- 归约 shader 的寄存器声明直接放 for 循环体（勿用额外 `{}` 包裹，否则源寄存器越作用域）；sum 用中缀 `+`（`acc = acc + v`），max 用函数 `max(acc, v)`。
+- **归约向量原生输出 `eval_expr_reduce`/`dsl::compute_reduce`**：表达式在 (rows,cols) 网格求值，但输出为归约向量本身（(rows,1)/(1,cols)）。用于归一化的 (1,B) 统计量（mean/var/rms_inv）与 (F,1) 梯度归约（grad_gamma/grad_beta）。GPU 通过归约 shader 的 `vector_out` push constant（thread 0 写代表元素）实现；`compute_reduce` 的 scan 占位张量须按归约轴取向量形状，否则 dry-run 中 `add_inplace` 形状失配中断。
+- **融合表达式保持 F 无关结构（关键）**：`inv_features=1/F`、`epsilon` 等**形状相关常量**若折进表达式，`expr_spec_key` 随归一化维度 F 漂移 → 闭合世界硬报错。解法：融合表达式只含 F 无关结构（raw 归约 + 广播/逐元素），形状相关标量在 (1,B) 小向量上用引擎原语（运行时标量）施加。
+- **LayerNorm backward 拆分为多个表达式**：grad_x 若写成单表达式会因重复子表达式（`grad*gamma` 出现 3 次）超出 8 输入上限 → 拆成 mean_g/mean_gn 两个归约向量输出 + 一个逐元素 grad_x。
+- LayerNorm/RMSNorm 的 fwd/bwd 融合完成（M3 完整）；后续优化：DSL 子表达式共享（消除重复输入）、归一化反向重算优化。
+
+**验证**：
+- `fused_gpu_test`：softmax/rmsnorm/layernorm fwd+bwd 全过（GPU 归约融合 shader 端到端，err ≤ 2.4e-7）✅
+- `softmax_gradcheck` / `rmsnorm_gradcheck` / `attn_gradcheck` / `gpt_gradcheck` 全过 ✅
+- MNIST Transformer 训练冒烟（CPU/GPU × layernorm/rmsnorm）正常 ✅；`expr_reduce_test`/`expr_dsl_test`/`tensor_expr_test`/`doc_attn_test`/`attn_consistency_test` 全过 ✅
+- 构建：非 CUDA 全量编译通过（`build_verify`）

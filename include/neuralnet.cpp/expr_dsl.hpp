@@ -92,6 +92,19 @@ struct SpecBuilder
         spec.instrs.push_back(in);
         return expr::reduce(in.dst);
     }
+    // 广播视图：输入本身已是 (rows,1)/(1,cols) 小向量，按行/列广播
+    ExprOperand add_input_rowbroadcast(const Tensor& t)
+    {
+        spec.views.push_back(expr::row_broadcast());
+        inputs.push_back(t);
+        return expr::input(static_cast<std::uint8_t>(inputs.size() - 1));
+    }
+    ExprOperand add_input_colbroadcast(const Tensor& t)
+    {
+        spec.views.push_back(expr::col_broadcast());
+        inputs.push_back(t);
+        return expr::input(static_cast<std::uint8_t>(inputs.size() - 1));
+    }
     ExprOperand add_instr(ExprOp op, ExprOperand a, ExprOperand b = {}, ExprOperand c = {})
     {
         ExprInstr in;
@@ -186,6 +199,27 @@ using RowReduceMaxRef = ReduceViewRef<ExprViewKind::RowReduceMax>;
 using ColReduceSumRef = ReduceViewRef<ExprViewKind::ColReduceSum>;
 using ColReduceMaxRef = ReduceViewRef<ExprViewKind::ColReduceMax>;
 
+// 广播视图叶子：输入 (rows,1)/(1,cols) 小向量，按行/列广播参与算术。
+// 与归约叶子同理：eval 仅满足概念约束（模板求值路径不实例化，has_reduction_v 分流
+// 到 eval_expr，由引擎按 (r,c) 索引广播值）。
+template <ExprViewKind Kind>
+struct BroadcastRef
+{
+    Tensor t;
+
+    [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
+    ExprOperand to_spec(SpecBuilder& b) const
+    {
+        if constexpr (Kind == ExprViewKind::RowBroadcast)
+            return b.add_input_rowbroadcast(t);
+        else
+            return b.add_input_colbroadcast(t);
+    }
+};
+
+using RowBroadcastRef = BroadcastRef<ExprViewKind::RowBroadcast>;
+using ColBroadcastRef = BroadcastRef<ExprViewKind::ColBroadcast>;
+
 // ══════════════════════════════════════════════════════════════════════════
 // DSL 表达式概念（比 nn::Expression 更严格：额外要求可折叠成 ExprSpec）
 //
@@ -269,8 +303,11 @@ struct ReduceRef
 // ══════════════════════════════════════════════════════════════════════════
 template <typename T> inline constexpr bool has_reduction_v = false;
 
+// 归约/广播叶子均需走 eval_expr（模板求值无法表达全行/全列归约或跨网格广播）
 template <ExprViewKind K>
 inline constexpr bool has_reduction_v<ReduceViewRef<K>> = true;
+template <ExprViewKind K>
+inline constexpr bool has_reduction_v<BroadcastRef<K>> = true;
 template <nn::dsl::DslExpr E, ExprOp Rop>
 inline constexpr bool has_reduction_v<ReduceRef<E, Rop>> = true;
 template <typename Op, nn::Expression C>
@@ -306,6 +343,10 @@ template <nn::dsl::DslExpr E> [[nodiscard]] auto row_reduce_sum(const E& e) { re
 template <nn::dsl::DslExpr E> [[nodiscard]] auto row_reduce_max(const E& e) { return ReduceRef<E, ExprOp::RowMax>{e}; }
 template <nn::dsl::DslExpr E> [[nodiscard]] auto col_reduce_sum(const E& e) { return ReduceRef<E, ExprOp::ColSum>{e}; }
 template <nn::dsl::DslExpr E> [[nodiscard]] auto col_reduce_max(const E& e) { return ReduceRef<E, ExprOp::ColMax>{e}; }
+
+// 广播视图自由函数：gamma/beta (F,1) 按行广播、std_inv (1,B) 按列广播
+[[nodiscard]] inline RowBroadcastRef row_broadcast(Tensor t) { return {std::move(t)}; }
+[[nodiscard]] inline ColBroadcastRef col_broadcast(Tensor t) { return {std::move(t)}; }
 
 // ══════════════════════════════════════════════════════════════════════════
 // 一元函数（普通数学写法）
@@ -468,6 +509,39 @@ template <typename E>
 template <typename E>
 [[nodiscard]] Result<Tensor> end_expr(const ExprBlock<E>& b)
 { return compute(*b.eng, b.expr, b.rows, b.cols); }
+
+// ══════════════════════════════════════════════════════════════════════════
+// 归约向量原生形状输出：compute_reduce(engine, expr, rows, cols)
+//
+// 与 compute() 等价，但输出为归约向量本身（(rows,1)/(1,cols)），而非广播到
+// (rows,cols)。用于 LayerNorm/RMSNorm 的 (1,B) 统计量缓存（mean/var/rms_inv）
+// 与 (F,1) 梯度归约（grad_gamma/grad_beta）——只产出小向量，避免写全尺寸广播。
+// 要求表达式归约轴为 0/1（否则引擎报错）。
+// ══════════════════════════════════════════════════════════════════════════
+template <typename E>
+[[nodiscard]] Result<Tensor> compute_reduce(ComputeEngine& eng, const E& e,
+                                            std::size_t rows, std::size_t cols)
+{
+#ifdef NN_EXPR_SCAN
+    // 构建期扫描：同 compute()，登记结构（归约轴由 gen_fused 判定）。
+    // 占位张量按归约轴取向量形状 (rows,1)/(1,cols)，使 Layer 后续
+    // add_inplace 等形状相关操作在 dry-run 中不因形状失配而中断。
+    (void)eng;
+    auto [spec, inputs] = to_expr_spec(e);
+    if (auto v = validate_expr_spec(spec, inputs.size()); !v)
+        return std::unexpected(v.error());
+    fused::global_registry().add(spec);
+    const int raxis = expr_spec_reduce_axis(spec);
+    if (raxis == 0) return Tensor::cpu(rows, 1);
+    if (raxis == 1) return Tensor::cpu(1, cols);
+    return Tensor::cpu(rows, cols);
+#else
+    auto [spec, inputs] = to_expr_spec(e);
+    if (auto v = validate_expr_spec(spec, inputs.size()); !v)
+        return std::unexpected(v.error());
+    return eng.eval_expr_reduce(spec, inputs, rows, cols);
+#endif
+}
 
 } // namespace nn::dsl
 

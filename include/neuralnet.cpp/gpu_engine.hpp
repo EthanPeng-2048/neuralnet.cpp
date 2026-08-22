@@ -601,6 +601,38 @@ public:
             "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）"});
     }
 
+    // ── 归约向量原生形状输出（M3：LayerNorm/RMSNorm 小向量缓存） ────────
+    // 与 eval_expr 相同，但以 vector_out=1 调度归约融合 shader（thread 0 写
+    // (rows,1)/(1,cols) 归约向量，不写全尺寸广播）。
+    [[nodiscard]] Result<Tensor> eval_expr_reduce(
+        const ExprSpec& spec,
+        std::span<const Tensor> inputs,
+        std::size_t rows, std::size_t cols) override
+    {
+        const std::string key = nn::expr_spec_key(spec);
+#ifdef NN_FUSED_REGISTRY_EMBEDDED
+        const nn::fused::FusedShader* fs = nn::fused::find_fused(key);
+        if (fs && backend_.has_fused_shader(key))
+        {
+            std::vector<GpuTensor> gpu_inputs;
+            gpu_inputs.reserve(inputs.size());
+            for (const auto& t : inputs)
+            {
+                auto g = ensure_gpu(t);
+                if (!g) return std::unexpected(g.error());
+                gpu_inputs.push_back(g->gpu_tensor());
+            }
+            auto out = backend_.run_fused_gpu(
+                key, gpu_inputs, spec.consts, rows, cols, /*vector_out=*/true);
+            if (!out) return std::unexpected(out.error());
+            return Tensor::from_gpu(std::move(*out));
+        }
+#endif
+        return std::unexpected(Error{
+            "GpuEngine::eval_expr_reduce: 未找到该归约表达式的 AOT 融合 shader（闭合世界）；"
+            "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）"});
+    }
+
 private:
     // ── 辅助：确保 Tensor 在 GPU 上 ──────────────────────────────────────
     // 若已是 GPU，返回共享拷贝（零开销）；若为 CPU，上传到 GPU。

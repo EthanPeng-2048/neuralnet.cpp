@@ -60,6 +60,43 @@ int main(int argc, char* argv[])
         (void)swiglu.backward(engine, grad);
     }
 
+    // ── Softmax forward + backward（M3 行归约融合）────────────────────────
+    // forward:  exp(x - row_max) / row_sum(exp(x - row_max))
+    // backward: out * (grad - row_dot(out * grad))
+    // 结构不依赖形状，任取一个 R×C 即可。
+    {
+        const std::size_t R = 6, C = 9;
+        nn::Softmax softmax;
+        nn::Tensor input = nn::Tensor::cpu(R, C);
+        (void)softmax.forward(engine, input);   // 填充 output_cache_ + 登记 fwd 结构
+        nn::Tensor grad = nn::Tensor::cpu(R, C);
+        (void)softmax.backward(engine, grad);   // 登记 bwd 结构
+    }
+
+    // ── RMSNorm forward + backward（M3 列/行归约融合）────────────────────
+    // forward:  s=col_sum(x²)*invF+eps → rms_inv=rsqrt(s) → normed=x*rms_inv → out=normed*gamma
+    // backward: grad_x 列归约表达式 + grad_gamma 行归约表达式
+    {
+        const std::size_t F = 8, B = 5;
+        nn::RMSNorm rms(engine, F);
+        nn::Tensor input = nn::Tensor::cpu(F, B);
+        (void)rms.forward(engine, input);       // 填充 normed/rms_inv 缓存 + 登记 fwd 结构
+        nn::Tensor grad = nn::Tensor::cpu(F, B);
+        (void)rms.backward(engine, grad);       // 登记 bwd 结构
+    }
+
+    // ── LayerNorm forward + backward（M3 列/行归约融合）──────────────────
+    // forward: mean → diff → var → std_inv → normalized → out=normalized*gamma+beta
+    // backward: grad_x 列归约表达式 + grad_gamma/grad_beta 行归约表达式
+    {
+        const std::size_t F = 8, B = 5;
+        nn::LayerNorm ln(engine, F);
+        nn::Tensor input = nn::Tensor::cpu(F, B);
+        (void)ln.forward(engine, input);
+        nn::Tensor grad = nn::Tensor::cpu(F, B);
+        (void)ln.backward(engine, grad);
+    }
+
     auto& reg = nn::fused::global_registry();
     if (!nn::fused::write_registry(out_path, reg))
     {
