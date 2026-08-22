@@ -82,6 +82,39 @@ public:
         return backend_.memory_pool().pool_debug_stats().to_string();
     }
 
+    // ── 激活 offload（L1-offload）─────────────────────────────────────
+    // GPU 激活 → host-visible 存储（录制式，batch 内不提交；数据由 GPU 写、
+    // 仅作中转，主机不读）。返回封装 host-visible GpuBuffer 的 Tensor 句柄。
+    [[nodiscard]] Result<Tensor> offload_store(const Tensor& src) override
+    {
+        if (src.is_cpu())
+            return src;
+        const auto& g = src.gpu_tensor();
+        auto host = GpuTensor::create_host_visible_empty(g.rows(), g.cols(), backend_);
+        if (!host) return std::unexpected(host.error());
+        const VkDeviceSize size =
+            static_cast<VkDeviceSize>(g.rows() * g.cols() * sizeof(float));
+        auto r = backend_.copy_buffer_gpu(g.buffer().impl(), host->buffer().impl(), size);
+        if (!r) return std::unexpected(r.error());
+        return Tensor::from_gpu(std::move(*host));
+    }
+
+    // 从 host-visible 句柄复制回 GPU，恢复为 (rows, cols)（录制式）
+    [[nodiscard]] Result<Tensor> offload_load(
+        const Tensor& handle, std::size_t rows, std::size_t cols) override
+    {
+        if (handle.is_cpu())
+            return handle.reshape(rows, cols);
+        auto dst = GpuTensor::create_empty(rows, cols, backend_);
+        if (!dst) return std::unexpected(dst.error());
+        const VkDeviceSize size =
+            static_cast<VkDeviceSize>(rows * cols * sizeof(float));
+        auto r = backend_.copy_buffer_gpu(
+            handle.gpu_tensor().buffer().impl(), dst->buffer().impl(), size);
+        if (!r) return std::unexpected(r.error());
+        return Tensor::from_gpu(std::move(*dst));
+    }
+
     // ── 中点刷新：提交当前 command buffer 并开始新的录制 ──
     // 用于拆分大 batch（如 forward 与 backward 之间），防 TDR。
     [[nodiscard]] Result<void> flush_batch() override
