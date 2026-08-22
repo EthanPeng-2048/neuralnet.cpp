@@ -176,7 +176,13 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
         }
     };
 
-    // 指令展开（直线代码）
+    // 指令展开（直线代码；寄存器先声明、后赋值——兼容 IR-B liveness 复用同号寄存器）
+    if (spec.num_regs > 0)
+    {
+        L << "    float r0";
+        for (std::uint32_t r = 1; r < spec.num_regs; ++r) L << ", r" << r;
+        L << ";\n";
+    }
     for (const auto& ins : spec.instrs)
     {
         const ExprOp op = static_cast<ExprOp>(ins.op);
@@ -188,13 +194,13 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
         {
             bool cmp = false;
             const char* s = glsl_binary_op(op, cmp);
-            L << "    float " << dst << " = " << a << " " << s << " " << operand(ins.b) << ";\n";
+            L << "    " << dst << " = " << a << " " << s << " " << operand(ins.b) << ";\n";
             break;
         }
         case ExprOp::Max: case ExprOp::Min:
         {
             const char* s = (op == ExprOp::Max) ? "max" : "min";
-            L << "    float " << dst << " = " << s << "(" << a << ", " << operand(ins.b) << ");\n";
+            L << "    " << dst << " = " << s << "(" << a << ", " << operand(ins.b) << ");\n";
             break;
         }
         case ExprOp::Lt: case ExprOp::Le: case ExprOp::Gt:
@@ -202,22 +208,22 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
         {
             bool cmp = false;
             const char* s = glsl_binary_op(op, cmp);
-            L << "    float " << dst << " = (" << a << " " << s << " " << operand(ins.b)
+            L << "    " << dst << " = (" << a << " " << s << " " << operand(ins.b)
               << ") ? 1.0 : 0.0;\n";
             break;
         }
         case ExprOp::Neg:
-            L << "    float " << dst << " = -(" << a << ");\n";
+            L << "    " << dst << " = -(" << a << ");\n";
             break;
         case ExprOp::Exp: case ExprOp::Log: case ExprOp::Sqrt:
         case ExprOp::Rsqrt: case ExprOp::Abs: case ExprOp::Tanh:
         {
             const char* s = glsl_unary_op(op);
-            L << "    float " << dst << " = " << s << "(" << a << ");\n";
+            L << "    " << dst << " = " << s << "(" << a << ");\n";
             break;
         }
         case ExprOp::Select:
-            L << "    float " << dst << " = (" << a << " != 0.0) ? "
+            L << "    " << dst << " = (" << a << " != 0.0) ? "
               << operand(ins.b) << " : " << operand(ins.c) << ";\n";
             break;
         default:
@@ -352,7 +358,18 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
         }
     };
 
-    // 直线指令展开（跳过归约指令；归约结果经 s_red 访问）
+    // 寄存器声明（先声明后赋值，兼容 IR-B liveness 复用同号寄存器）；
+    // 每个 emit_instrs 调用点所在作用域内须先调用一次。
+    const auto emit_reg_decl = [&]()
+    {
+        if (spec.num_regs == 0)
+            return;
+        L << "        float r0";
+        for (std::uint32_t r = 1; r < spec.num_regs; ++r) L << ", r" << r;
+        L << ";\n";
+    };
+
+    // 直线指令展开（跳过归约指令；归约结果经 s_red 访问；纯赋值，寄存器已声明）
     const auto emit_instrs = [&](std::size_t begin, std::size_t end)
     {
         for (std::size_t j = begin; j < end; ++j)
@@ -369,14 +386,14 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
             {
                 bool cmp = false;
                 const char* s = glsl_binary_op(op, cmp);
-                L << "        float " << dst << " = " << a << " " << s << " "
+                L << "        " << dst << " = " << a << " " << s << " "
                   << operand(ins.b) << ";\n";
                 break;
             }
             case ExprOp::Max: case ExprOp::Min:
             {
                 const char* s = (op == ExprOp::Max) ? "max" : "min";
-                L << "        float " << dst << " = " << s << "(" << a
+                L << "        " << dst << " = " << s << "(" << a
                   << ", " << operand(ins.b) << ");\n";
                 break;
             }
@@ -385,22 +402,22 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
             {
                 bool cmp = false;
                 const char* s = glsl_binary_op(op, cmp);
-                L << "        float " << dst << " = (" << a << " " << s << " "
+                L << "        " << dst << " = (" << a << " " << s << " "
                   << operand(ins.b) << ") ? 1.0 : 0.0;\n";
                 break;
             }
             case ExprOp::Neg:
-                L << "        float " << dst << " = -(" << a << ");\n";
+                L << "        " << dst << " = -(" << a << ");\n";
                 break;
             case ExprOp::Exp: case ExprOp::Log: case ExprOp::Sqrt:
             case ExprOp::Rsqrt: case ExprOp::Abs: case ExprOp::Tanh:
             {
                 const char* s = glsl_unary_op(op);
-                L << "        float " << dst << " = " << s << "(" << a << ");\n";
+                L << "        " << dst << " = " << s << "(" << a << ");\n";
                 break;
             }
             case ExprOp::Select:
-                L << "        float " << dst << " = (" << a << " != 0.0) ? "
+                L << "        " << dst << " = (" << a << " != 0.0) ? "
                   << operand(ins.b) << " : " << operand(ins.c) << ";\n";
                 break;
             default:
@@ -476,6 +493,7 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
         L << "        float acc = "
           << (is_max ? "uintBitsToFloat(0xff800000u)" : "0.0") << ";\n";
         L << loop_decl;
+        emit_reg_decl();
         emit_instrs(0, ri);
         L << "        acc = " << combine(is_max, "acc", src) << ";\n";
         L << "        }\n";
@@ -499,6 +517,7 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
     }
     else
     {
+        emit_reg_decl();
         emit_instrs(0, spec.instrs.size());
         L << "            bout[" << (is_row ? "row" : "col") << "] = r"
           << static_cast<int>(spec.instrs.back().dst) << ";\n";
@@ -514,6 +533,7 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
     }
     else
     {
+        emit_reg_decl();
         emit_instrs(0, spec.instrs.size());
         L << "        bout[" << out_idx << "] = r"
           << static_cast<int>(spec.instrs.back().dst) << ";\n";

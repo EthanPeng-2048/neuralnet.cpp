@@ -1,5 +1,5 @@
 // ── matmul_tiled.comp ─────────────────────────────────────────────────────
-// 4×4 线程粗化分块矩阵乘法：C[M][N] = A × B
+// vec4 向量化分块矩阵乘法：C[M][N] = A × B（借鉴 llama.cpp GEMM 思路）
 //
 // 支持转置（同 matmul.comp）：
 //   - transA=0, transB=0: C[M][N] = A[M][K] × B[K][N]
@@ -7,11 +7,12 @@
 //   - transA=0, transB=1: C[M][N] = A[M][K] × B^T[N,K]
 //   - transA=1, transB=1: C[M][N] = A^T[K,M] × B^T[N,K]
 //
-// 优化策略：
+// 优化策略（对比旧标量 4×4 版：内层每 k 8 次标量 LDS + 16 FMA，2:1）：
 //   - WorkGroup：16×16 线程，计算 64×64 输出块（每线程 4×4 元素）
-//   - 寄存器分块：每线程在寄存器中维护 4×4 累加和，大幅提升计算访存比
-//   - Shared Memory Padding：17/65 列宽避免 Bank Conflict
-//   - 向量化加载：每个线程每轮加载 4 个元素到共享内存
+//   - vec4 共享内存：Ash[k][m]（A 转置）/ Bsh[k][n]，每线程每 k 仅 2 次
+//     vec4 LDS + 16 FMA（8:1 计算:加载比），消除旧版标量读的 bank 冲突
+//   - vec4 累加器：acc[4]（4×4 = 16 个累加值），寄存器常驻
+//   - 共享内存 8KB（4KB A + 4KB B），远低于 V100 96KB 上限
 // ─────────────────────────────────────────────────────────────────────────
 
 #version 450
@@ -33,11 +34,14 @@ layout(push_constant) uniform PushConstants {
 // 分块维度常量
 const uint BM = 64u;  // 输出块行数
 const uint BN = 64u;  // 输出块列数
-const uint BK = 16u;  // K 维度分块宽度
+const uint BK = 32u;  // K 维度分块宽度（32：barrier 次数减半，共享内存 16KB）
 
-// Shared Memory：Padding 避免 Bank Conflict
-shared float tileA[64][17];
-shared float tileB[16][65];
+// Shared Memory（vec4 布局，16B 对齐）：
+//   Ash[k][m]：A^T 分块 —— A[m][k]（转置写共享内存，内层按行连续读）
+//   Bsh[k][n]：B 分块 —— B[k][n]（内层按行连续读）
+// 每个 vec4 = 4 个 float（64 行/列的 1/4）
+shared vec4 Ash[BK][BM / 4];
+shared vec4 Bsh[BK][BN / 4];
 
 // ── 访问 A 元素（转置感知）─────────────────────────────────────────────
 // transA=0: A[m][k] = A[m * K + k]  （标准行主序 (M,K)）
@@ -63,62 +67,59 @@ void main()
     const uint block_row = gl_WorkGroupID.y * BM;
     const uint block_col = gl_WorkGroupID.x * BN;
 
-    // ── 寄存器分块：4×4 累加器 ──────────────────────────────────────
-    float acc[4][4];
+    // ── 寄存器分块：4×4 累加器（vec4 数组） ─────────────────────────
+    vec4 acc[4];
     for (uint i = 0u; i < 4u; ++i)
-        for (uint j = 0u; j < 4u; ++j)
-            acc[i][j] = 0.0;
+        acc[i] = vec4(0.0);
 
     const uint num_tiles = (K + BK - 1u) / BK;
 
     for (uint t = 0u; t < num_tiles; ++t)
     {
-        // ── 协作加载 tileA[64][16]：1024 元素，256 线程，每线程 4 元素 ──
+        // ── 协作加载 A 分块 → Ash（转置写）：64×32 = 2048 元素，每线程 8 ──
         {
             const uint a_base_col = t * BK;
-            for (uint load = 0u; load < 4u; ++load)
+            for (uint load = 0u; load < 8u; ++load)
             {
-                const uint elem = tid * 4u + load;   // 0..1023
-                const uint r = elem / BK;             // 0..63
-                const uint c = elem % BK;             // 0..15
-                const uint gr = block_row + r;
-                const uint gc = a_base_col + c;
-                tileA[r][c] = (gr < M && gc < K) ? getA(gr, gc) : 0.0;
+                const uint elem = tid * 8u + load;   // 0..2047
+                const uint m = elem / BK;             // 行 0..63
+                const uint k = elem % BK;             // k 0..31
+                const uint gr = block_row + m;
+                const uint gc = a_base_col + k;
+                const float v = (gr < M && gc < K) ? getA(gr, gc) : 0.0;
+                Ash[k][m >> 2][m & 3u] = v;
             }
         }
 
-        // ── 协作加载 tileB[16][64]：1024 元素，256 线程，每线程 4 元素 ──
+        // ── 协作加载 B 分块 → Bsh：32×64 = 2048 元素，每线程 8 ──
         {
             const uint b_base_row = t * BK;
-            for (uint load = 0u; load < 4u; ++load)
+            for (uint load = 0u; load < 8u; ++load)
             {
-                const uint elem = tid * 4u + load;
-                const uint r = elem / BN;             // 0..15
-                const uint c = elem % BN;             // 0..63
-                const uint gr = b_base_row + r;
-                const uint gc = block_col + c;
-                tileB[r][c] = (gr < K && gc < N) ? getB(gr, gc) : 0.0;
+                const uint elem = tid * 8u + load;
+                const uint k = elem / BN;             // k 0..31
+                const uint n = elem % BN;             // 列 0..63
+                const uint gr = b_base_row + k;
+                const uint gc = block_col + n;
+                const float v = (gr < K && gc < N) ? getB(gr, gc) : 0.0;
+                Bsh[k][n >> 2][n & 3u] = v;
             }
         }
 
         barrier();
 
-        // ── 4×4 外积累加 ────────────────────────────────────────────
+        // ── vec4 外积累加（每 k：2 次 vec4 LDS + 16 FMA = 8:1） ──────
+        #pragma unroll 4
         for (uint k = 0u; k < BK; ++k)
         {
-            // 每个线程读取 4 个 A 元素和 4 个 B 元素
-            float a_vals[4];
-            float b_vals[4];
+            // 本线程负责的 4 行（ty*4..ty*4+3）与 4 列（tx*4..tx*4+3）
+            const vec4 a_vec = Ash[k][ty];
+            const vec4 b_vec = Bsh[k][tx];
 
-            for (uint i = 0u; i < 4u; ++i)
-                a_vals[i] = tileA[ty * 4u + i][k];
-            for (uint j = 0u; j < 4u; ++j)
-                b_vals[j] = tileB[k][tx * 4u + j];
-
-            // 外积累加
-            for (uint i = 0u; i < 4u; ++i)
-                for (uint j = 0u; j < 4u; ++j)
-                    acc[i][j] += a_vals[i] * b_vals[j];
+            acc[0] += a_vec.x * b_vec;
+            acc[1] += a_vec.y * b_vec;
+            acc[2] += a_vec.z * b_vec;
+            acc[3] += a_vec.w * b_vec;
         }
 
         barrier();
@@ -129,11 +130,16 @@ void main()
     {
         const uint out_row = block_row + ty * 4u + i;
         if (out_row >= M) continue;
-        for (uint j = 0u; j < 4u; ++j)
-        {
-            const uint out_col = block_col + tx * 4u + j;
-            if (out_col >= N) continue;
-            C[out_row * N + out_col] = acc[i][j];
-        }
+        const uint out_col0 = block_col + tx * 4u;
+        if (out_col0 + 3u >= N && out_col0 >= N) continue;
+        if (out_col0 + 3u < N)
+            C[out_row * N + out_col0 + 0u] = acc[i].x;
+        if (out_col0 + 1u < N)
+            C[out_row * N + out_col0 + 1u] = acc[i].y;
+        if (out_col0 + 2u < N)
+            C[out_row * N + out_col0 + 2u] = acc[i].z;
+        if (out_col0 + 3u < N)
+            C[out_row * N + out_col0 + 3u] = acc[i].w;
     }
 }
+

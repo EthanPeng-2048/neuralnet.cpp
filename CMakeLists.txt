@@ -110,6 +110,9 @@ nn_add_executable(expr_dsl_test src/expr_dsl_test.cpp)
 # ── ExprSpec 归约语义测试（M1：归约视图/归约指令 CPU 求值，纯 CPU） ──────
 nn_add_executable(expr_reduce_test src/expr_reduce_test.cpp)
 
+# ── IR 优化 pass 测试（IR-A canonicalize + IR-B CSE/寄存器分配，纯 CPU） ─
+nn_add_executable(expr_opt_test src/expr_opt_test.cpp)
+
 # ── Softmax 数值梯度检查（gradcheck，验证 softmax 反向） ───────────────────
 nn_add_executable(softmax_gradcheck src/softmax_gradcheck.cpp)
 

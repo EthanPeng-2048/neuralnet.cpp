@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "expr_spec.hpp"
+#include "expr_opt.hpp"
 
 namespace nn::fused
 {
@@ -37,12 +38,15 @@ struct ExprRegistry
 
     void add(const ExprSpec& s)
     {
-        const std::string k = expr_spec_key(s);
+        // 登记 canonical IR：canonicalize 为引擎内部优化（IR-A/IR-B），
+        // bin 与 key 建立在 canonical 形态上（scan 与 runtime 两端一致）。
+        const ExprSpec canon = canonicalize_expr_spec(s);
+        const std::string k = expr_spec_key(canon);
         if (keys.insert(k).second)
-            specs.push_back(s);
+            specs.push_back(canon);
     }
     [[nodiscard]] bool contains(const ExprSpec& s) const
-    { return keys.count(expr_spec_key(s)) != 0; }
+    { return keys.count(expr_spec_key(canonicalize_expr_spec(s))) != 0; }
 };
 
 // 全局注册表（scan_exprs 记录模式写入；普通构建不含 NN_EXPR_SCAN，零开销）
