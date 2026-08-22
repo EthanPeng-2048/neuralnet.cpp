@@ -842,7 +842,11 @@ class GptTrainController(CLIController):
         # 梯度检查点（激活重计算 L1）：每 N 个 Transformer block 重算一次
         if "checkpoint_every" in kwargs:
             args.extend(["--checkpoint-every", self._format_arg_value(kwargs["checkpoint_every"])])
-        
+
+        # activation offload（L1-offload）：把激活搬 host-visible（与 checkpoint 互斥）
+        if kwargs.get("activation_offload", False):
+            args.append("--activation-offload")
+
         # 学习率调度
         if "lr_schedule" in kwargs:
             args.extend(["--lr-schedule", self._format_arg_value(kwargs["lr_schedule"])])

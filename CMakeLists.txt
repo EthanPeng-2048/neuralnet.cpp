@@ -86,6 +86,9 @@ nn_add_executable(gpt_checkpoint_test src/gpt_checkpoint_test.cpp)
 # ── activation offload 原语往返验证（GPU 激活 → host → GPU 一致） ──────
 nn_add_executable(offload_test src/offload_test.cpp)
 
+# ── GPT activation offload 一致性测试（GPU：offload vs 全存基线） ──────
+nn_add_executable(gpt_offload_test src/gpt_offload_test.cpp)
+
 # ── 文档感知注意力掩码构建单测（验证块对角∧因果∧ALiBi 组合） ───────────
 nn_add_executable(doc_mask_test src/doc_mask_test.cpp)
 
@@ -249,6 +252,7 @@ if(Vulkan_FOUND)
             gpt_gradcheck
             gpt_checkpoint_test
             offload_test
+            gpt_offload_test
             attn_gradcheck
             fused_gpu_test
             tensor_expr_test
