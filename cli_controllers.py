@@ -839,6 +839,10 @@ class GptTrainController(CLIController):
         if "flush_interval" in kwargs:
             args.extend(["--flush-interval", self._format_arg_value(kwargs["flush_interval"])])
         
+        # 梯度检查点（激活重计算 L1）：每 N 个 Transformer block 重算一次
+        if "checkpoint_every" in kwargs:
+            args.extend(["--checkpoint-every", self._format_arg_value(kwargs["checkpoint_every"])])
+        
         # 学习率调度
         if "lr_schedule" in kwargs:
             args.extend(["--lr-schedule", self._format_arg_value(kwargs["lr_schedule"])])
