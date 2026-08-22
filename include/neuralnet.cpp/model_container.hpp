@@ -89,6 +89,15 @@ public:
             layer->set_flush_interval(interval);
     }
 
+    // ── 梯度检查点（激活重计算 L1）：按间隔配置各层 ──
+    // 通过 Layer 基类虚函数分发：GPTModel override 生效，
+    // 其他层类型默认 no-op。
+    void set_checkpoint_every(std::size_t stride)
+    {
+        for (auto& layer : layers_)
+            layer->set_checkpoint_every(stride);
+    }
+
     // ── 训练/推理模式切换：转发给各 Layer（BatchNorm 等需要区分） ──
     void set_training(bool training)
     {

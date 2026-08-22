@@ -80,6 +80,9 @@ nn_add_executable(rmsnorm_gradcheck src/rmsnorm_gradcheck.cpp)
 # ── GPTModel 整链数值梯度检查（gradcheck，验证多层堆叠全部参数梯度） ──────
 nn_add_executable(gpt_gradcheck src/gpt_gradcheck.cpp)
 
+# ── GPT 梯度检查点一致性测试（验证激活重计算 L1 与全存结果一致） ───────
+nn_add_executable(gpt_checkpoint_test src/gpt_checkpoint_test.cpp)
+
 # ── 文档感知注意力掩码构建单测（验证块对角∧因果∧ALiBi 组合） ───────────
 nn_add_executable(doc_mask_test src/doc_mask_test.cpp)
 
@@ -241,6 +244,7 @@ if(Vulkan_FOUND)
             swiglu_gradcheck
             rmsnorm_gradcheck
             gpt_gradcheck
+            gpt_checkpoint_test
             attn_gradcheck
             fused_gpu_test
             tensor_expr_test
@@ -286,6 +290,7 @@ if(NN_ENABLE_CUDA)
                 swiglu_gradcheck
                 rmsnorm_gradcheck
                 gpt_gradcheck
+                gpt_checkpoint_test
                 attn_gradcheck
                 softmax_gradcheck
                 doc_attn_test

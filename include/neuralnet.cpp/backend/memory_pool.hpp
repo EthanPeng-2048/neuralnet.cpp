@@ -27,6 +27,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -122,10 +123,13 @@ private:
     VkDeviceSize block_size_;
     VkPhysicalDeviceMemoryProperties mem_props_;
 
+    // L2：整块归还时保留的最小空闲字节数（避免频繁整块释放/重建抖动）
+    VkDeviceSize retain_free_bytes_ = 0;
+
     // 使用 unique_ptr 避免 vector 扩容/删除时触发 Block 的移动和析构
     std::vector<std::unique_ptr<Block>> blocks_;
     std::unordered_map<SuballocKey, VkDeviceSize, SuballocKeyHash> active_allocs_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
 
     [[nodiscard]] static std::optional<VkDeviceSize> find_free(
         Block& block, VkDeviceSize alignment, VkDeviceSize size)
@@ -309,6 +313,92 @@ public:
             block.allocation_count--;
             active_allocs_.erase(active_it);
             return;
+        }
+    }
+
+    // ── 池统计（L2 仪器化，供显存采样/逐项归因） ──────────────────────
+    struct PoolStats
+    {
+        std::size_t block_count = 0;       // 活跃 block 数
+        std::size_t allocation_count = 0;  // 活跃子分配数
+        VkDeviceSize total_bytes = 0;      // 所有 block 底材总大小
+        VkDeviceSize free_bytes = 0;       // 空闲区域总大小
+        VkDeviceSize allocated_bytes = 0;  // total - free
+        VkDeviceSize max_contiguous_free = 0;  // 最大连续空闲块
+        double fragmentation = 0.0;        // 1 - 最大连续空闲/总空闲
+
+        [[nodiscard]] std::string to_string() const
+        {
+            constexpr std::size_t MB = 1024 * 1024;
+            std::string s;
+            s += "blocks=" + std::to_string(block_count);
+            s += " allocs=" + std::to_string(allocation_count);
+            s += " total=" + std::to_string(total_bytes / MB) + "MB";
+            s += " free=" + std::to_string(free_bytes / MB) + "MB";
+            s += " frag=" + std::to_string(fragmentation);
+            return s;
+        }
+    };
+
+    [[nodiscard]] PoolStats pool_debug_stats() const
+    {
+        std::lock_guard lock(mutex_);
+        PoolStats s;
+        s.block_count = blocks_.size();
+        for (const auto& bp : blocks_)
+        {
+            const auto& b = *bp;
+            s.allocation_count += b.allocation_count;
+            s.total_bytes += b.size;
+            for (const auto& r : b.free_regions)
+            {
+                s.free_bytes += r.size;
+                if (r.size > s.max_contiguous_free)
+                    s.max_contiguous_free = r.size;
+            }
+        }
+        s.allocated_bytes = s.total_bytes - s.free_bytes;
+        if (s.free_bytes > 0)
+            s.fragmentation = 1.0 - static_cast<double>(s.max_contiguous_free)
+                                   / static_cast<double>(s.free_bytes);
+        return s;
+    }
+
+    // ── 整块归还（L2）───────────────────────────────────────────────
+    // 设置整块归还时保留的最小空闲字节（默认 0 = 尽量回收）。
+    void set_retain_free_bytes(VkDeviceSize bytes) { retain_free_bytes_ = bytes; }
+
+    // 释放“完全空闲且超出保留阈值”的 block 底材（调用 vkFreeMemory 并移出池）。
+    // 调用时机：训练 step 边界（end_batch 提交完成、延迟销毁已 flush 之后），
+    // 避免在 batch 录制中释放仍被引用/延迟销毁的 buffer 底材。
+    void release_idle_blocks()
+    {
+        std::lock_guard lock(mutex_);
+        // 当前总空闲（用于保留阈值判断）
+        VkDeviceSize total_free = 0;
+        for (const auto& bp : blocks_)
+            for (const auto& r : bp->free_regions)
+                total_free += r.size;
+
+        for (auto it = blocks_.begin(); it != blocks_.end(); )
+        {
+            const auto& b = **it;
+            // 完全空闲：无活跃子分配，且整个 block 被单个空闲区覆盖
+            if (b.allocation_count == 0 &&
+                b.free_regions.size() == 1 &&
+                b.free_regions.begin()->offset == 0 &&
+                b.free_regions.begin()->size == b.size)
+            {
+                // 仅当释放后总空闲仍 ≥ 保留目标时才释放（避免抖动）
+                if (total_free - b.size >= retain_free_bytes_)
+                {
+                    total_free -= b.size;
+                    // 通过 erase 触发 Block 析构（析构中 vkFreeMemory）
+                    it = blocks_.erase(it);
+                    continue;
+                }
+            }
+            ++it;
         }
     }
 };

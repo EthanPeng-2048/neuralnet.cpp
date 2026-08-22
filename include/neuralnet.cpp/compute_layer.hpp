@@ -40,6 +40,13 @@ namespace nn
 // ══════════════════════════════════════════════════════════════════════════
 class Layer
 {
+protected:
+    // 梯度检查点模式：为 true 时 forward 不保留逐层中间激活（供激活重计算）。
+    // 该模式由支持重计算的复合层（GPTBlock/TransformerEncoderLayer）在
+    // forward 中按 checkpoint 边界设置，子层（Linear/GeLU/Norm/Attention 等）
+    // 据此决定是否跳过缓存写入。
+    bool checkpoint_mode_ = false;
+
 public:
     virtual ~Layer() = default;
 
@@ -77,6 +84,31 @@ public:
 
     // 非可学习状态收集（默认空，BatchNorm 的 running 统计量等需要 override）
     [[nodiscard]] virtual std::vector<TensorRef> extra_state() { return {}; }
+
+    // ── 梯度检查点（激活重计算）契约 ──────────────────────────────────
+    // checkpoint_mode_ = true 时，forward 不保留中间激活（供 L1 激活重计算）；
+    // forward_recompute 重算 forward 并重建缓存（供 backward 使用）。
+    virtual void set_checkpoint_mode(bool enabled) { checkpoint_mode_ = enabled; }
+    [[nodiscard]] bool checkpoint_mode() const noexcept { return checkpoint_mode_; }
+
+    // 该层是否可作为“重计算单元”（即 forward_recompute 有实际意义）
+    [[nodiscard]] virtual bool recompute_supported() const { return false; }
+
+    // 从保存的输入重算 forward，重建本层 backward 所需的中间缓存。
+    // 默认实现：临时关闭 checkpoint 模式重跑 forward（保留缓存）再恢复。
+    // 复合层（GPTBlock 等）override 以同时关闭子层的 checkpoint 模式。
+    [[nodiscard]] virtual Result<Tensor> forward_recompute(
+        ComputeEngine& engine, const Tensor& saved_input)
+    {
+        const bool prev = checkpoint_mode_;
+        checkpoint_mode_ = false;
+        auto r = forward(engine, saved_input);
+        checkpoint_mode_ = prev;
+        return r;
+    }
+
+    // 梯度检查点粒度（默认 0 = 不启用；由 GPTModel 等 override）
+    virtual void set_checkpoint_every(std::size_t /*stride*/) {}
 };
 
 // ── 辅助：深拷贝 Tensor（通过 engine.clone()，无 PCIe 传输） ──────────────
@@ -154,8 +186,9 @@ public:
         if (input.rows() != w_.cols())
             return std::unexpected(Error{"linear forward: input shape mismatch"});
 
-        // 缓存输入供 backward 使用
-        input_cache_ = input;
+        // 缓存输入供 backward 使用（checkpoint 模式下不保留，由重计算重建）
+        if (!checkpoint_mode_)
+            input_cache_ = input;
 
         // out = W × x
         auto out = engine.matmul(w_, input, false, false);
@@ -216,7 +249,8 @@ public:
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
-        input_cache_ = input;
+        if (!checkpoint_mode_)
+            input_cache_ = input;
         return engine.elementwise_binary_scalar(BinaryOp::Max, input, Scalar{0});
     }
 
@@ -274,7 +308,8 @@ public:
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
-        input_cache_ = input;
+        if (!checkpoint_mode_)
+            input_cache_ = input;
 
         // t1 = x * β
         auto t1 = engine.elementwise_binary_scalar(BinaryOp::Mul, input, BETA);
@@ -296,7 +331,8 @@ public:
         auto s = engine.elementwise_binary_scalar(BinaryOp::Div, *t4, Scalar{1}, true);
         if (!s) return std::unexpected(s.error());
 
-        sigmoid_cache_ = *s;  // 缓存供 backward
+        if (!checkpoint_mode_)
+            sigmoid_cache_ = *s;  // 缓存供 backward
 
         // out = x * s
         return engine.elementwise_binary(BinaryOp::Mul, input, *s);
@@ -389,9 +425,12 @@ public:
         auto s = engine.elementwise_binary_scalar(BinaryOp::Div, *t3, Scalar{1}, true);
         if (!s) return std::unexpected(s.error());
 
-        gate_cache_ = *gate;
-        sigmoid_cache_ = *s;
-        up_cache_ = *up;
+        if (!checkpoint_mode_)
+        {
+            gate_cache_ = *gate;
+            sigmoid_cache_ = *s;
+            up_cache_ = *up;
+        }
 
         // sw = gate * s，out = sw ⊙ up
         auto sw = engine.elementwise_binary(BinaryOp::Mul, *gate, *s);
@@ -574,17 +613,21 @@ public:
         if (!var_eps) return std::unexpected(var_eps.error());
         auto std_inv = engine.elementwise_unary(UnaryOp::Rsqrt, *var_eps);
         if (!std_inv) return std::unexpected(std_inv.error());
-        std_cache_ = *std_inv;
+        Tensor std_inv_t = std::move(*std_inv);
+        if (!checkpoint_mode_)
+            std_cache_ = std_inv_t;
 
         // 6. normalized = diff * std_inv (col 广播) → (F,B)
         auto normalized = dsl::compute(engine,
-            dsl::leaf(*diff) * dsl::col_broadcast(std_cache_), F, B);
+            dsl::leaf(*diff) * dsl::col_broadcast(std_inv_t), F, B);
         if (!normalized) return std::unexpected(normalized.error());
-        normalized_cache_ = *normalized;
+        Tensor normalized_t = std::move(*normalized);
+        if (!checkpoint_mode_)
+            normalized_cache_ = normalized_t;
 
         // 7. out = normalized*gamma + beta (row 广播) → (F,B)
         return dsl::compute(engine,
-            dsl::leaf(normalized_cache_) * dsl::row_broadcast(gamma_)
+            dsl::leaf(normalized_t) * dsl::row_broadcast(gamma_)
             + dsl::row_broadcast(beta_),
             F, B);
     }
@@ -741,17 +784,21 @@ public:
         if (!var_eps) return std::unexpected(var_eps.error());
         auto rms_inv = engine.elementwise_unary(UnaryOp::Rsqrt, *var_eps);
         if (!rms_inv) return std::unexpected(rms_inv.error());
-        rms_inv_cache_ = *rms_inv;
+        Tensor rms_inv_t = std::move(*rms_inv);
+        if (!checkpoint_mode_)
+            rms_inv_cache_ = rms_inv_t;
 
         // 3. normed = x * rms_inv (col 广播) → (F,B)
         auto normed = dsl::compute(engine,
-            dsl::leaf(input) * dsl::col_broadcast(rms_inv_cache_), F, B);
+            dsl::leaf(input) * dsl::col_broadcast(rms_inv_t), F, B);
         if (!normed) return std::unexpected(normed.error());
-        normed_cache_ = *normed;
+        Tensor normed_t = std::move(*normed);
+        if (!checkpoint_mode_)
+            normed_cache_ = normed_t;
 
         // 4. out = normed * gamma (row 广播) → (F,B)
         return dsl::compute(engine,
-            dsl::leaf(normed_cache_) * dsl::row_broadcast(gamma_), F, B);
+            dsl::leaf(normed_t) * dsl::row_broadcast(gamma_), F, B);
     }
 
     // ── backward ──────────────────────────────────────────────────────────
@@ -843,7 +890,8 @@ public:
                 dsl::exp(dsl::leaf(input) - dsl::row_reduce_max(input))),
             input.rows(), input.cols());
         if (!out) return std::unexpected(out.error());
-        output_cache_ = *out;
+        if (!checkpoint_mode_)
+            output_cache_ = *out;
         return out;
     }
 
@@ -1130,6 +1178,17 @@ public:
         return g;
     }
 
+    // 梯度检查点：把模式传播给内部投影层与 softmax
+    void set_checkpoint_mode(bool enabled) override
+    {
+        Layer::set_checkpoint_mode(enabled);
+        w_q_.set_checkpoint_mode(enabled);
+        w_k_.set_checkpoint_mode(enabled);
+        w_v_.set_checkpoint_mode(enabled);
+        w_o_.set_checkpoint_mode(enabled);
+        softmax_.set_checkpoint_mode(enabled);
+    }
+
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
@@ -1152,37 +1211,39 @@ public:
 
         // 2. rearrange: (H*d_k, batch*seq) → (batch*H*d_k, seq)
         //    使 batched_matmul 能按 batch*H 切分行块
+        //    局部 Q/K/V 承载 forward 计算；仅在非 checkpoint 模式下写入成员缓存。
         const std::size_t H_dk = num_heads_ * d_k_;
+        Tensor Q, K, V;  // (batch*H*d_k, seq) rearranged
         if (batch > 1)
         {
             auto qr = engine.rearrange_3d(*q_res, H_dk, batch, seq, false);
             if (!qr) return std::unexpected(qr.error());
-            Q_cache_ = std::move(*qr);
+            Q = std::move(*qr);
             auto kr = engine.rearrange_3d(*k_res, H_dk, batch, seq, false);
             if (!kr) return std::unexpected(kr.error());
-            K_cache_ = std::move(*kr);
+            K = std::move(*kr);
             auto vr = engine.rearrange_3d(*v_res, H_dk, batch, seq, false);
             if (!vr) return std::unexpected(vr.error());
-            V_cache_ = std::move(*vr);
+            V = std::move(*vr);
         }
         else
         {
             // batch=1: rearrange 是恒等拷贝，跳过
-            Q_cache_ = std::move(*q_res);
-            K_cache_ = std::move(*k_res);
-            V_cache_ = std::move(*v_res);
+            Q = std::move(*q_res);
+            K = std::move(*k_res);
+            V = std::move(*v_res);
         }
 
         // 2.5 RoPE：对 Q/K 施加旋转位置编码（rearrange 后列=position，
         //    每 d_k 行一个头，cos/sin 短表按 RowMod 平铺）
         if (use_rope_)
         {
-            auto qr2 = rope_.apply(engine, Q_cache_, seq, /*backward=*/false);
+            auto qr2 = rope_.apply(engine, Q, seq, /*backward=*/false);
             if (!qr2) return std::unexpected(qr2.error());
-            Q_cache_ = std::move(*qr2);
-            auto kr2 = rope_.apply(engine, K_cache_, seq, /*backward=*/false);
+            Q = std::move(*qr2);
+            auto kr2 = rope_.apply(engine, K, seq, /*backward=*/false);
             if (!kr2) return std::unexpected(kr2.error());
-            K_cache_ = std::move(*kr2);
+            K = std::move(*kr2);
         }
 
         // 3-7. 注意力主体：两趟式 vs 旧路径（由掩码钩子决策）
@@ -1200,21 +1261,21 @@ public:
             const Tensor* mask_ptr =
                 (two_pass_mask_cache_.rows() > 0) ? &two_pass_mask_cache_ : nullptr;
             auto m = engine.batched_matmul_reduce(
-                Q_cache_, K_cache_, BH, ReduceOp::Max, true, false,
+                Q, K, BH, ReduceOp::Max, true, false,
                 scale_, /*reduce_cols=*/true, mask_ptr);
             if (!m) return std::unexpected(m.error());
             auto l = engine.batched_matmul_softmax_denom(
-                Q_cache_, K_cache_, *m, BH, true, false, scale_, mask_ptr);
+                Q, K, *m, BH, true, false, scale_, mask_ptr);
             if (!l) return std::unexpected(l.error());
-            // V 需 (BH*seq, d_k) 布局（apply 原语的 V 约定）：V_cache_ (BH*d_k, seq)
+            // V 需 (BH*seq, d_k) 布局（apply 原语的 V 约定）：V (BH*d_k, seq)
             // 是 per-batch (d_k, seq)，需按 batch 转置：
             //   transpose → (seq, BH*d_k) → rearrange_3d(seq, BH, d_k) → (BH*seq, d_k)
-            auto V_T_full = engine.transpose(V_cache_);
+            auto V_T_full = engine.transpose(V);
             if (!V_T_full) return std::unexpected(V_T_full.error());
             auto V_t = engine.rearrange_3d(*V_T_full, seq, BH, d_k_, false);
             if (!V_t) return std::unexpected(V_t.error());
             auto O_t = engine.batched_matmul_softmax_apply(
-                Q_cache_, K_cache_, *V_t, *m, *l, BH, true, false, scale_, mask_ptr);
+                Q, K, *V_t, *m, *l, BH, true, false, scale_, mask_ptr);
             if (!O_t) return std::unexpected(O_t.error());
             // O_t: (BH*seq, d_k) → 按 batch 转置回 (BH*d_k, seq) 供后续 rearrange：
             //   transpose → (d_k, BH*seq) → rearrange_3d(d_k, BH, seq) → (BH*d_k, seq)
@@ -1223,19 +1284,25 @@ public:
             auto co = engine.rearrange_3d(*O_T_full, d_k_, BH, seq, false);
             if (!co) return std::unexpected(co.error());
             concat_out = std::move(*co);
-            m_cache_ = std::move(*m);
-            l_cache_ = std::move(*l);
+            if (!checkpoint_mode_)
+            {
+                Q_cache_ = std::move(Q);
+                K_cache_ = std::move(K);
+                V_cache_ = std::move(V);
+                m_cache_ = std::move(*m);
+                l_cache_ = std::move(*l);
+            }
             two_pass_active_ = true;
         }
         else
         {
             // ── 旧路径：物化得分矩阵（ALiBi/doc_ids 等共享掩码不适用时回退） ──
             two_pass_active_ = false;
-            // S = batched_matmul(Q_re, K_re, batch*H, transA=true) → (batch*H*seq, seq)
+            // S = batched_matmul(Q, K, batch*H, transA=true) → (batch*H*seq, seq)
             // scale (1/sqrt(d_k)) 通过 alpha 系数折进 matmul 写出（cuBLAS sgemm 语义），
             // 省去一次全矩阵 scale pass + 额外 barrier
             auto scores = engine.batched_matmul(
-                Q_cache_, K_cache_, BH, true, false, scale_);
+                Q, K, BH, true, false, scale_);
             if (!scores) return std::unexpected(scores.error());
             // 施加掩码（钩子：MHA 默认 no-op，CSA 施加因果/ALiBi 掩码）
             auto masked = apply_mask_(engine, std::move(*scores), batch, seq);
@@ -1243,12 +1310,19 @@ public:
             // A = softmax(S_masked)
             auto attn = softmax_.forward(engine, *masked);
             if (!attn) return std::unexpected(attn.error());
-            attn_cache_ = *attn;
-            // O_re = batched_matmul(V_re, A, batch*H, transB=true) → (batch*H*d_k, seq)
+            Tensor A = std::move(*attn);
+            // O_re = batched_matmul(V, A, batch*H, transB=true) → (batch*H*d_k, seq)
             // 标准 attention: O[:,i] = sum_j V[:,j] * A[i,j] = (V × A^T)[:,i]
-            auto co = engine.batched_matmul(V_cache_, attn_cache_, BH, false, true);
+            auto co = engine.batched_matmul(V, A, BH, false, true);
             if (!co) return std::unexpected(co.error());
             concat_out = std::move(*co);
+            if (!checkpoint_mode_)
+            {
+                attn_cache_ = std::move(A);
+                Q_cache_ = std::move(Q);
+                K_cache_ = std::move(K);
+                V_cache_ = std::move(V);
+            }
         }
 
         // 8. rearrange back: (batch*H*d_k, seq) → (H*d_k, batch*seq)
@@ -1655,6 +1729,16 @@ public:
         return g;
     }
 
+    // 梯度检查点：把模式传播给内部 fc1/fc2/gelu/swiglu
+    void set_checkpoint_mode(bool enabled) override
+    {
+        Layer::set_checkpoint_mode(enabled);
+        fc1_.set_checkpoint_mode(enabled);
+        fc2_.set_checkpoint_mode(enabled);
+        gelu_.set_checkpoint_mode(enabled);
+        swiglu_.set_checkpoint_mode(enabled);
+    }
+
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
@@ -1741,6 +1825,28 @@ public:
         return g;
     }
 
+    // 梯度检查点：把模式传播给内部注意力/归一化/FFN
+    void set_checkpoint_mode(bool enabled) override
+    {
+        Layer::set_checkpoint_mode(enabled);
+        self_attn_.set_checkpoint_mode(enabled);
+        norm1_.set_checkpoint_mode(enabled);
+        ff_.set_checkpoint_mode(enabled);
+        norm2_.set_checkpoint_mode(enabled);
+    }
+
+    [[nodiscard]] bool recompute_supported() const override { return true; }
+
+    [[nodiscard]] Result<Tensor> forward_recompute(
+        ComputeEngine& engine, const Tensor& saved_input) override
+    {
+        // 临时关闭本层及其子层的 checkpoint 模式，使 forward 重建缓存
+        set_checkpoint_mode(false);
+        auto r = forward(engine, saved_input);
+        set_checkpoint_mode(true);
+        return r;
+    }
+
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
@@ -1755,18 +1861,20 @@ public:
         // r2 = input + a
         auto r2 = engine.elementwise_binary(BinaryOp::Add, input, *a);
         if (!r2) return std::unexpected(r2.error());
-        residual2_cache_ = *r2;
+        Tensor res2 = std::move(*r2);
+        if (!checkpoint_mode_)
+            residual2_cache_ = res2;
 
-        // x2 = LN₂(r2)
-        auto n2 = norm2_.forward(engine, residual2_cache_);
+        // x2 = LN₂(res2)
+        auto n2 = norm2_.forward(engine, res2);
         if (!n2) return n2;
 
         // f = FFN(x2)
         auto f = ff_.forward(engine, *n2);
         if (!f) return f;
 
-        // out = r2 + f
-        return engine.elementwise_binary(BinaryOp::Add, residual2_cache_, *f);
+        // out = res2 + f
+        return engine.elementwise_binary(BinaryOp::Add, res2, *f);
     }
 
     [[nodiscard]] Result<Tensor> backward(
@@ -2363,6 +2471,29 @@ public:
         return g;
     }
 
+    // 梯度检查点：把模式传播给内部注意力/归一化/FFN
+    void set_checkpoint_mode(bool enabled) override
+    {
+        Layer::set_checkpoint_mode(enabled);
+        self_attn_.set_checkpoint_mode(enabled);
+        norm1_->set_checkpoint_mode(enabled);
+        ff_.set_checkpoint_mode(enabled);
+        norm2_->set_checkpoint_mode(enabled);
+    }
+
+    // GPTBlock 可作为“重计算单元”：从保存的块输入重算 forward 重建缓存
+    [[nodiscard]] bool recompute_supported() const override { return true; }
+
+    [[nodiscard]] Result<Tensor> forward_recompute(
+        ComputeEngine& engine, const Tensor& saved_input) override
+    {
+        // 临时关闭本块及其子层的 checkpoint 模式，使 forward 重建缓存
+        set_checkpoint_mode(false);
+        auto r = forward(engine, saved_input);
+        set_checkpoint_mode(true);
+        return r;
+    }
+
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
@@ -2374,15 +2505,17 @@ public:
 
         auto r2 = engine.elementwise_binary(BinaryOp::Add, input, *a);
         if (!r2) return std::unexpected(r2.error());
-        residual2_cache_ = *r2;
+        Tensor res2 = std::move(*r2);
+        if (!checkpoint_mode_)
+            residual2_cache_ = res2;
 
-        auto n2 = norm2_->forward(engine, residual2_cache_);
+        auto n2 = norm2_->forward(engine, res2);
         if (!n2) return n2;
 
         auto f = ff_.forward(engine, *n2);
         if (!f) return f;
 
-        return engine.elementwise_binary(BinaryOp::Add, residual2_cache_, *f);
+        return engine.elementwise_binary(BinaryOp::Add, res2, *f);
     }
 
     [[nodiscard]] Result<Tensor> backward(
@@ -2687,6 +2820,11 @@ private:
     // 0 = 不在 block 间 flush（默认），>0 = 每 N 个 block flush 一次
     std::size_t flush_interval_ = 0;
 
+    // 梯度检查点（激活重计算 L1）：每隔 checkpoint_every_ 个 GPTBlock 保存一次
+    // 块输入，backward 时重算以省去驻留整层激活。0 = 不启用。
+    std::size_t checkpoint_every_ = 0;
+    std::vector<Tensor> checkpoint_inputs_;  // 各 checkpoint 块的输入 (d_model, batch*seq)
+
 public:
     GPTModel(ComputeEngine& engine,
              std::size_t vocab_size, std::size_t d_model, std::size_t seq_len,
@@ -2813,10 +2951,25 @@ public:
         if (!x_result) return std::unexpected(x_result.error());
         // ── 4. 通过 Transformer 块（全批量化，无 per-sample 循环） ──
         Tensor x = std::move(*x_result);
+        checkpoint_inputs_.clear();
+        const bool ckpt = (checkpoint_every_ > 0);
         for (std::size_t bi = 0; bi < blocks_.size(); ++bi)
         {
             // 文档感知：把本 step 每样本文档 id 传给各 block 的注意力
             blocks_[bi].set_doc_ids(doc_ids_);
+            // 梯度检查点：每 checkpoint_every_ 个块保存一次输入；
+            // 该块及其子层以 checkpoint 模式运行（不驻留中间激活）
+            if (ckpt && (bi % checkpoint_every_ == 0))
+            {
+                auto save = engine.clone(x);
+                if (!save) return std::unexpected(save.error());
+                checkpoint_inputs_.push_back(std::move(*save));
+                blocks_[bi].set_checkpoint_mode(true);
+            }
+            else
+            {
+                blocks_[bi].set_checkpoint_mode(false);
+            }
             auto r = blocks_[bi].forward(engine, x);
             if (!r) return r;
             x = std::move(*r);
@@ -2865,7 +3018,17 @@ public:
             const std::size_t n = blocks_.size();
             for (std::size_t bi = 0; bi < n; ++bi)
             {
-                auto br = blocks_[n - 1 - bi].backward(engine, grad_x);
+                const std::size_t idx = n - 1 - bi;
+                // 梯度检查点：若是 checkpoint 块，先重算 forward 重建缓存再反向
+                if (checkpoint_every_ > 0 && (idx % checkpoint_every_ == 0))
+                {
+                    const std::size_t seg = idx / checkpoint_every_;
+                    NN_ASSERT(seg < checkpoint_inputs_.size(),
+                              "GPTModel backward: checkpoint input missing");
+                    auto cr = blocks_[idx].forward_recompute(engine, checkpoint_inputs_[seg]);
+                    if (!cr) return cr;
+                }
+                auto br = blocks_[idx].backward(engine, grad_x);
                 if (!br) return br;
                 grad_x = std::move(*br);
                 if (flush_interval_ > 0 && (bi + 1) % flush_interval_ == 0 && bi + 1 < n)
@@ -2898,6 +3061,22 @@ public:
     // ── batch 录制粒度控制 ──
     void set_flush_interval(std::size_t interval) override { flush_interval_ = interval; }
     [[nodiscard]] std::size_t flush_interval() const noexcept { return flush_interval_; }
+
+    // ── 梯度检查点（激活重计算 L1）粒度控制 ──
+    // stride：每 N 个 GPTBlock 保存一次块输入，backward 时重算该块 forward。
+    // 0 = 不启用（默认）。stride=1 时显存收益最大（仅保留块输入 + 单块激活）。
+    void set_checkpoint_every(std::size_t stride) override { checkpoint_every_ = stride; }
+    [[nodiscard]] std::size_t checkpoint_every() const noexcept { return checkpoint_every_; }
+
+    // 梯度检查点：把模式传播给所有块与末级归一化/LM Head
+    // （当本 GPTModel 整体作为 Model 的一层被置于 checkpoint 模式时生效）
+    void set_checkpoint_mode(bool enabled) override
+    {
+        Layer::set_checkpoint_mode(enabled);
+        for (auto& b : blocks_) b.set_checkpoint_mode(enabled);
+        ln_f_->set_checkpoint_mode(enabled);
+        lm_head_.set_checkpoint_mode(enabled);
+    }
 
     // ── 增量推理：单 token 前向（KV cache）──────────────────────────
     // 流程: token_emb[token] [+ pos_emb[pos]] → N × GPTBlock.forward_step
