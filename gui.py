@@ -1326,6 +1326,7 @@ class GptTrainTab(TabBase):
                                            ["on", "off"], "on"); r += 1
         self.max_tdr_retries = _make_entry_row(p, "最大重试次数", r, "4"); r += 1
         self.flush_interval = _make_entry_row(p, "flush 间隔", r, "0"); r += 1
+        self.checkpoint_every = _make_entry_row(p, "梯度检查点间隔", r, "0"); r += 1
 
         # --- 日志与保存 ---
         _make_label(p, "── 日志与保存 ──", r); r += 1
@@ -1432,6 +1433,7 @@ class GptTrainTab(TabBase):
         args["tdr_retry"] = self.tdr_retry.get()
         args.update(_int(self.max_tdr_retries, "max_tdr_retries"))
         args.update(_int(self.flush_interval, "flush_interval", skip_vals=()))
+        args.update(_int(self.checkpoint_every, "checkpoint_every", skip_vals=()))
         # 日志
         args.update(_int(self.log_interval, "log_interval", skip_vals=()))
         args.update(_int(self.save_interval, "save_interval", skip_vals=()))

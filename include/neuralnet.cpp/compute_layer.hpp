@@ -85,11 +85,17 @@ public:
     // 非可学习状态收集（默认空，BatchNorm 的 running 统计量等需要 override）
     [[nodiscard]] virtual std::vector<TensorRef> extra_state() { return {}; }
 
-    // ── 梯度检查点（激活重计算）契约 ──────────────────────────────────
+    // 梯度检查点（激活重计算）契约 ──────────────────────────────────
     // checkpoint_mode_ = true 时，forward 不保留中间激活（供 L1 激活重计算）；
     // forward_recompute 重算 forward 并重建缓存（供 backward 使用）。
     virtual void set_checkpoint_mode(bool enabled) { checkpoint_mode_ = enabled; }
     [[nodiscard]] bool checkpoint_mode() const noexcept { return checkpoint_mode_; }
+
+    // 释放本层为 backward 保留的中间激活缓存（清空成员缓存 Tensor，归还显存）。
+    // 由 GPTModel 在 checkpoint 块 backward 之后调用，避免重算的激活跨块累积
+    // （否则所有块缓存会在 backward 末尾同时驻留，抵消检查点的显存收益）。
+    // 默认 no-op；各缓存持有层 override。
+    virtual void clear_cache() {}
 
     // 该层是否可作为“重计算单元”（即 forward_recompute 有实际意义）
     [[nodiscard]] virtual bool recompute_supported() const { return false; }
@@ -179,6 +185,8 @@ public:
         return {grad_w_, grad_b_};
     }
 
+    void clear_cache() override { input_cache_ = Tensor{}; }
+
     // ── forward: out = W × x + b ──────────────────────────────────────────
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
@@ -243,6 +251,8 @@ private:
 public:
     ReLU() = default;
 
+    void clear_cache() override { input_cache_ = Tensor{}; }
+
     // ── forward: out = max(x, 0) ──────────────────────────────────────────
     // ReLU 算法由 Layer 表达为 Max 原语 + 标量 0
     // Engine/Shader 只提供 Max 原语，不知道 "ReLU" 是什么
@@ -296,6 +306,12 @@ private:
 
 public:
     GeLU() = default;
+
+    void clear_cache() override
+    {
+        input_cache_ = Tensor{};
+        sigmoid_cache_ = Tensor{};
+    }
 
     // ── forward: out = x * sigmoid(β * x) ────────────────────────────────
     // 分解为原语：
@@ -404,6 +420,13 @@ private:
 public:
     SwiGLU() = default;
     explicit SwiGLU(std::size_t d_ff) : d_ff_(d_ff) {}
+
+    void clear_cache() override
+    {
+        gate_cache_ = Tensor{};
+        sigmoid_cache_ = Tensor{};
+        up_cache_ = Tensor{};
+    }
 
     // ── forward: out = SiLU(gate) ⊙ up ────────────────────────────────────
     [[nodiscard]] Result<Tensor> forward(
@@ -564,6 +587,12 @@ public:
     [[nodiscard]] std::vector<TensorRef> param_gradients() override
     {
         return {grad_gamma_, grad_beta_};
+    }
+
+    void clear_cache() override
+    {
+        normalized_cache_ = Tensor{};
+        std_cache_ = Tensor{};
     }
 
     // ── forward ───────────────────────────────────────────────────────────
@@ -754,6 +783,12 @@ public:
         return {grad_gamma_};
     }
 
+    void clear_cache() override
+    {
+        normed_cache_ = Tensor{};
+        rms_inv_cache_ = Tensor{};
+    }
+
     // ── forward ───────────────────────────────────────────────────────────
     // M3 融合（算法公式不变，中间 x_sq (F,B) 由归约 kernel 内部消解）：
     //   融合表达式保持 F 无关结构（不含 1/F、ε 常量，避免闭合世界 key 随
@@ -875,6 +910,8 @@ private:
 
 public:
     Softmax() = default;
+
+    void clear_cache() override { output_cache_ = Tensor{}; }
 
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
@@ -1187,6 +1224,22 @@ public:
         w_v_.set_checkpoint_mode(enabled);
         w_o_.set_checkpoint_mode(enabled);
         softmax_.set_checkpoint_mode(enabled);
+    }
+
+    void clear_cache() override
+    {
+        Q_cache_ = Tensor{};
+        K_cache_ = Tensor{};
+        V_cache_ = Tensor{};
+        attn_cache_ = Tensor{};
+        m_cache_ = Tensor{};
+        l_cache_ = Tensor{};
+        two_pass_mask_cache_ = Tensor{};
+        w_q_.clear_cache();
+        w_k_.clear_cache();
+        w_v_.clear_cache();
+        w_o_.clear_cache();
+        softmax_.clear_cache();
     }
 
     [[nodiscard]] Result<Tensor> forward(
@@ -1739,6 +1792,14 @@ public:
         swiglu_.set_checkpoint_mode(enabled);
     }
 
+    void clear_cache() override
+    {
+        fc1_.clear_cache();
+        fc2_.clear_cache();
+        gelu_.clear_cache();
+        swiglu_.clear_cache();
+    }
+
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
@@ -1845,6 +1906,15 @@ public:
         auto r = forward(engine, saved_input);
         set_checkpoint_mode(true);
         return r;
+    }
+
+    void clear_cache() override
+    {
+        self_attn_.clear_cache();
+        norm1_.clear_cache();
+        ff_.clear_cache();
+        norm2_.clear_cache();
+        residual2_cache_ = Tensor{};
     }
 
     [[nodiscard]] Result<Tensor> forward(
@@ -2494,6 +2564,15 @@ public:
         return r;
     }
 
+    void clear_cache() override
+    {
+        self_attn_.clear_cache();
+        norm1_->clear_cache();
+        ff_.clear_cache();
+        norm2_->clear_cache();
+        residual2_cache_ = Tensor{};
+    }
+
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
@@ -3031,6 +3110,11 @@ public:
                 auto br = blocks_[idx].backward(engine, grad_x);
                 if (!br) return br;
                 grad_x = std::move(*br);
+                // 梯度检查点：backward 后立即释放该块的重算激活缓存，
+                // 避免跨块累积（否则所有块缓存会在 backward 末尾同时驻留，
+                // 抵消检查点的显存收益）。非 checkpoint 模式下不清理。
+                if (checkpoint_every_ > 0)
+                    blocks_[idx].clear_cache();
                 if (flush_interval_ > 0 && (bi + 1) % flush_interval_ == 0 && bi + 1 < n)
                 {
                     auto fr = engine.flush_batch();
@@ -3038,6 +3122,9 @@ public:
                 }
             }
         }
+
+        // ── 3.5 重计算完成：释放保存的块输入（供 L2 整块归还） ──
+        checkpoint_inputs_.clear();
 
         // ── 4. 转置 grad_x + pos_grad GPU 计算 ──
         //   grad_x: (d_model, batch*seq)（batch-major 列序）
@@ -3076,6 +3163,14 @@ public:
         for (auto& b : blocks_) b.set_checkpoint_mode(enabled);
         ln_f_->set_checkpoint_mode(enabled);
         lm_head_.set_checkpoint_mode(enabled);
+    }
+
+    void clear_cache() override
+    {
+        for (auto& b : blocks_) b.clear_cache();
+        ln_f_->clear_cache();
+        lm_head_.clear_cache();
+        checkpoint_inputs_.clear();
     }
 
     // ── 增量推理：单 token 前向（KV cache）──────────────────────────
