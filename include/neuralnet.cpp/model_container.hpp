@@ -107,6 +107,15 @@ public:
             layer->set_activation_offload(enabled);
     }
 
+    // 理论 offload RAM 字节数（各层累计，用于诊断）
+    [[nodiscard]] std::size_t offload_ram_bytes()
+    {
+        std::size_t total = 0;
+        for (auto& layer : layers_)
+            total += layer->offload_ram_bytes();
+        return total;
+    }
+
     // ── 训练/推理模式切换：转发给各 Layer（BatchNorm 等需要区分） ──
     void set_training(bool training)
     {

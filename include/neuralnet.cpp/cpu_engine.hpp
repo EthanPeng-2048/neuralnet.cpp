@@ -20,6 +20,39 @@ namespace nn
 {
 
 // ══════════════════════════════════════════════════════════════════════════
+// AttnBias 组合偏置求值（CPU 参考实现，与 GPU shader 语义一致）
+//
+// 返回 {偏置值 mv, 是否屏蔽}。语义见 compute_engine.hpp 的 AttnBias 注释：
+//   mv(bb,i,j) = dense(i,j) + (causal && j>i ? -inf) + (doc ? -inf)
+//              + (slopes ? -slope[h]*(i-j))
+// bb = 两趟式原语的 batch 索引 = b*num_heads + h；i = query 行，j = key 列。
+// ══════════════════════════════════════════════════════════════════════════
+inline std::pair<Scalar, bool> attn_bias_at(
+    const AttnBias& bias, std::size_t bb, std::size_t i, std::size_t j,
+    std::size_t /*M*/, std::size_t N)
+{
+    const Scalar neg_inf = -std::numeric_limits<Scalar>::infinity();
+    Scalar mv = Scalar{0};
+    if (bias.dense)
+        mv = bias.dense->cpu_matrix().at_unchecked(i, j);
+    const std::size_t h = bb % bias.num_heads;
+    const std::size_t bs = bb / bias.num_heads;
+    bool masked = (bias.dense && mv == neg_inf)
+               || (bias.causal && j > i)
+               || (bias.doc_ids &&
+                   bias.doc_ids->cpu_matrix().at_unchecked(0, bs * N + i) !=
+                   bias.doc_ids->cpu_matrix().at_unchecked(0, bs * N + j));
+    if (bias.slopes && !masked)
+    {
+        const Scalar slope = bias.slopes->cpu_matrix().at_unchecked(0, h);
+        const long long dist = static_cast<long long>(i) - static_cast<long long>(j);
+        mv -= slope * static_cast<Scalar>(dist);
+    }
+    if (masked) mv = neg_inf;
+    return {mv, masked};
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 // CpuEngine — CPU 计算引擎
 // ══════════════════════════════════════════════════════════════════════════
 class CpuEngine final : public ComputeEngine
@@ -426,7 +459,7 @@ public:
     [[nodiscard]] Result<Tensor> batched_matmul_reduce(
         const Tensor& A, const Tensor& B, std::size_t batch,
         ReduceOp op, bool transA, bool transB,
-        Scalar alpha, bool reduce_cols, const Tensor* mask) override
+        Scalar alpha, bool reduce_cols, const AttnBias& bias) override
     {
         if (A.is_gpu() || B.is_gpu())
             return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
@@ -444,8 +477,8 @@ public:
         const std::size_t N = transB ? b_rpb : b.cols();
         if (K != K2)
             return std::unexpected(Error{"batched_matmul_reduce: K dimension mismatch"});
-        if (mask && (mask->rows() != M || mask->cols() != N))
-            return std::unexpected(Error{"batched_matmul_reduce: mask shape mismatch"});
+        if (bias.dense && (bias.dense->rows() != M || bias.dense->cols() != N))
+            return std::unexpected(Error{"batched_matmul_reduce: dense mask shape mismatch"});
 
         const auto a_span = a.span();
         const auto b_span = b.span();
@@ -494,9 +527,8 @@ public:
                     Scalar acc = init_val(op);
                     for (std::size_t j = 0; j < N; ++j)
                     {
-                        Scalar mv = Scalar{0};
-                        if (mask) mv = mask->cpu_matrix().at_unchecked(i, j);
-                        if (masked_skip && mv == -std::numeric_limits<Scalar>::infinity())
+                        auto [mv, msk] = attn_bias_at(bias, b, i, j, M, N);
+                        if (masked_skip && msk)
                             continue;
                         const Scalar s = alpha * dot_ab(b, i, j) + mv;
                         acc = combine(op, acc, s);
@@ -517,9 +549,8 @@ public:
                     Scalar acc = init_val(op);
                     for (std::size_t i = 0; i < M; ++i)
                     {
-                        Scalar mv = Scalar{0};
-                        if (mask) mv = mask->cpu_matrix().at_unchecked(i, j);
-                        if (masked_skip && mv == -std::numeric_limits<Scalar>::infinity())
+                        auto [mv, msk] = attn_bias_at(bias, b, i, j, M, N);
+                        if (masked_skip && msk)
                             continue;
                         const Scalar s = alpha * dot_ab(b, i, j) + mv;
                         acc = combine(op, acc, s);
@@ -535,7 +566,7 @@ public:
     [[nodiscard]] Result<Tensor> batched_matmul_softmax_denom(
         const Tensor& A, const Tensor& B, const Tensor& row_max,
         std::size_t batch, bool transA, bool transB, Scalar alpha,
-        const Tensor* mask) override
+        const AttnBias& bias) override
     {
         if (A.is_gpu() || B.is_gpu())
             return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
@@ -556,8 +587,8 @@ public:
             return std::unexpected(Error{"batched_matmul_softmax_denom: K dimension mismatch"});
         if (m.rows() != batch * M || m.cols() != 1)
             return std::unexpected(Error{"batched_matmul_softmax_denom: row_max shape mismatch"});
-        if (mask && (mask->rows() != M || mask->cols() != N))
-            return std::unexpected(Error{"batched_matmul_softmax_denom: mask shape mismatch"});
+        if (bias.dense && (bias.dense->rows() != M || bias.dense->cols() != N))
+            return std::unexpected(Error{"batched_matmul_softmax_denom: dense mask shape mismatch"});
 
         const auto a_span = a.span();
         const auto b_span = b.span();
@@ -590,9 +621,8 @@ public:
                 Scalar acc = Scalar{0};
                 for (std::size_t j = 0; j < N; ++j)
                 {
-                    Scalar mv = Scalar{0};
-                    if (mask) mv = mask->cpu_matrix().at_unchecked(i, j);
-                    if (mv == -std::numeric_limits<Scalar>::infinity())
+                    auto [mv, msk] = attn_bias_at(bias, b, i, j, M, N);
+                    if (msk)
                         continue;  // 屏蔽列贡献 0
                     const Scalar s = alpha * dot_ab(b, i, j) + mv - mval;
                     acc += std::exp(s);
@@ -608,7 +638,7 @@ public:
         const Tensor& A, const Tensor& B, const Tensor& V,
         const Tensor& row_max, const Tensor& denom,
         std::size_t batch, bool transA, bool transB, Scalar alpha,
-        const Tensor* mask) override
+        const AttnBias& bias) override
     {
         if (A.is_gpu() || B.is_gpu() || V.is_gpu())
             return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
@@ -638,8 +668,8 @@ public:
             return std::unexpected(Error{"batched_matmul_softmax_apply: row_max shape mismatch"});
         if (l.rows() != batch * M || l.cols() != 1)
             return std::unexpected(Error{"batched_matmul_softmax_apply: denom shape mismatch"});
-        if (mask && (mask->rows() != M || mask->cols() != N))
-            return std::unexpected(Error{"batched_matmul_softmax_apply: mask shape mismatch"});
+        if (bias.dense && (bias.dense->rows() != M || bias.dense->cols() != N))
+            return std::unexpected(Error{"batched_matmul_softmax_apply: dense mask shape mismatch"});
 
         const auto a_span = a.span();
         const auto b_span = b.span();
@@ -676,9 +706,8 @@ public:
                 std::vector<Scalar> w(N);
                 for (std::size_t j = 0; j < N; ++j)
                 {
-                    Scalar mv = Scalar{0};
-                    if (mask) mv = mask->cpu_matrix().at_unchecked(i, j);
-                    if (mv == -std::numeric_limits<Scalar>::infinity())
+                    auto [mv, msk] = attn_bias_at(bias, b, i, j, M, N);
+                    if (msk)
                     {
                         w[j] = Scalar{0};
                         continue;
@@ -703,7 +732,7 @@ public:
         const Tensor& A, const Tensor& B, const Tensor& P,
         const Tensor& row_max, const Tensor& denom,
         std::size_t batch, bool transA, bool transB, Scalar alpha,
-        Tensor& r_out, const Tensor* mask) override
+        Tensor& r_out, const AttnBias& bias) override
     {
         if (A.is_gpu() || B.is_gpu() || P.is_gpu())
             return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
@@ -730,8 +759,8 @@ public:
             return std::unexpected(Error{"batched_matmul_softmax_backward_q: row_max shape mismatch"});
         if (l.rows() != batch * M || l.cols() != 1)
             return std::unexpected(Error{"batched_matmul_softmax_backward_q: denom shape mismatch"});
-        if (mask && (mask->rows() != M || mask->cols() != N))
-            return std::unexpected(Error{"batched_matmul_softmax_backward_q: mask shape mismatch"});
+        if (bias.dense && (bias.dense->rows() != M || bias.dense->cols() != N))
+            return std::unexpected(Error{"batched_matmul_softmax_backward_q: dense mask shape mismatch"});
 
         const auto a_span = a.span();
         const auto b_span = b.span();
@@ -770,9 +799,8 @@ public:
                 Scalar rv = Scalar{0};
                 for (std::size_t j = 0; j < N; ++j)
                 {
-                    Scalar mv = Scalar{0};
-                    if (mask) mv = mask->cpu_matrix().at_unchecked(i, j);
-                    if (mv == -std::numeric_limits<Scalar>::infinity())
+                    auto [mv, msk] = attn_bias_at(bias, b, i, j, M, N);
+                    if (msk)
                     {
                         w[j] = Scalar{0};
                         continue;
@@ -806,7 +834,7 @@ public:
         const Tensor& G, const Tensor& R,
         const Tensor& row_max, const Tensor& denom,
         std::size_t batch, bool transA, bool transB, Scalar alpha,
-        Tensor& grad_v_out, const Tensor* mask) override
+        Tensor& grad_v_out, const AttnBias& bias) override
     {
         if (A.is_gpu() || B.is_gpu() || P.is_gpu() || G.is_gpu())
             return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
@@ -840,8 +868,8 @@ public:
             return std::unexpected(Error{"batched_matmul_softmax_backward_kv: row_max shape mismatch"});
         if (l.rows() != batch * M || l.cols() != 1)
             return std::unexpected(Error{"batched_matmul_softmax_backward_kv: denom shape mismatch"});
-        if (mask && (mask->rows() != M || mask->cols() != N))
-            return std::unexpected(Error{"batched_matmul_softmax_backward_kv: mask shape mismatch"});
+        if (bias.dense && (bias.dense->rows() != M || bias.dense->cols() != N))
+            return std::unexpected(Error{"batched_matmul_softmax_backward_kv: dense mask shape mismatch"});
 
         const auto a_span = a.span();
         const auto b_span = b.span();
@@ -879,9 +907,8 @@ public:
                 std::vector<Scalar> w(M);
                 for (std::size_t i = 0; i < M; ++i)
                 {
-                    Scalar mv = Scalar{0};
-                    if (mask) mv = mask->cpu_matrix().at_unchecked(i, j);
-                    if (mv == -std::numeric_limits<Scalar>::infinity())
+                    auto [mv, msk] = attn_bias_at(bias, b, i, j, M, N);
+                    if (msk)
                     {
                         w[i] = Scalar{0};
                         continue;

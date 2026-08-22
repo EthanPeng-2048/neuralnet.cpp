@@ -317,7 +317,7 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
                     auto r = eng.batched_matmul_reduce(
                         trA ? ta_t : ta, trB ? tb_t : tb, batch, op,
                         trA, trB, alpha, /*reduce_cols=*/true,
-                        usemask ? &tm : nullptr);
+                        usemask ? nn::AttnBias{&tm} : nn::AttnBias{});
                     check(nm, std::move(r), ref);
                 }
             }
@@ -334,13 +334,13 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
         const nn::Tensor trm = nn::Tensor::from_matrix(nn::Matrix(row_max));
         const nn::Matrix ref = ref_denom(A_t, B, row_max, batch, /*trA=*/true, /*trB=*/false,
                                          alpha, &mask, M, K, N);
-        auto r = eng.batched_matmul_softmax_denom(ta_t, tb, trm, batch, true, false, alpha, &tm);
+        auto r = eng.batched_matmul_softmax_denom(ta_t, tb, trm, batch, true, false, alpha, nn::AttnBias{&tm});
         check(nm, std::move(r), ref);
 
         // 无掩码
         std::snprintf(nm, sizeof(nm), "%s bmm_denom (no mask)", tag);
         const nn::Matrix ref2 = ref_denom(A_t, B, row_max, batch, true, false, alpha, nullptr, M, K, N);
-        auto r2 = eng.batched_matmul_softmax_denom(ta_t, tb, trm, batch, true, false, alpha, nullptr);
+        auto r2 = eng.batched_matmul_softmax_denom(ta_t, tb, trm, batch, true, false, alpha, nn::AttnBias{});
         check(nm, std::move(r2), ref2);
     }
 
@@ -357,7 +357,7 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
         const nn::Matrix ref = ref_apply(A_t, B, V, row_max, denom, batch,
                                          true, false, alpha, &mask, M, K, N, D);
         auto r = eng.batched_matmul_softmax_apply(ta_t, tb, tv, trm, tdl, batch,
-                                                  true, false, alpha, &tm);
+                                                  true, false, alpha, nn::AttnBias{&tm});
         check(nm, std::move(r), ref);
 
         // 无掩码
@@ -365,7 +365,7 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
         const nn::Matrix ref2 = ref_apply(A_t, B, V, row_max, denom, batch,
                                           true, false, alpha, nullptr, M, K, N, D);
         auto r2 = eng.batched_matmul_softmax_apply(ta_t, tb, tv, trm, tdl, batch,
-                                                   true, false, alpha, nullptr);
+                                                   true, false, alpha, nn::AttnBias{});
         check(nm, std::move(r2), ref2);
     }
 
@@ -390,7 +390,7 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
             nn::Tensor r_out;
             std::snprintf(nm, sizeof(nm), "%s bmm_q_backward (mask)", tag);
             auto r = eng.batched_matmul_softmax_backward_q(
-                ta_t, tb, tp, trm, tdl, batch, true, false, alpha, r_out, &tm);
+                ta_t, tb, tp, trm, tdl, batch, true, false, alpha, r_out, nn::AttnBias{&tm});
             if (!r) { std::printf("[FAIL] %s: %s\n", nm, r.error().message.c_str()); ++fail; }
             else
             {
@@ -410,7 +410,7 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
             nn::Tensor r_out;
             std::snprintf(nm, sizeof(nm), "%s bmm_q_backward (no mask)", tag);
             auto r = eng.batched_matmul_softmax_backward_q(
-                ta_t, tb, tp, trm, tdl, batch, true, false, alpha, r_out, nullptr);
+                ta_t, tb, tp, trm, tdl, batch, true, false, alpha, r_out, nn::AttnBias{});
             if (!r) { std::printf("[FAIL] %s: %s\n", nm, r.error().message.c_str()); ++fail; }
             else
             {
@@ -450,7 +450,7 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
             nn::Tensor gv_out;
             std::snprintf(nm, sizeof(nm), "%s bmm_kv_backward (mask)", tag);
             auto r = eng.batched_matmul_softmax_backward_kv(
-                ta_t, tb, tp, tg, tr, trm, tdl, batch, true, false, alpha, gv_out, &tm);
+                ta_t, tb, tp, tg, tr, trm, tdl, batch, true, false, alpha, gv_out, nn::AttnBias{&tm});
             if (!r) { std::printf("[FAIL] %s: %s\n", nm, r.error().message.c_str()); ++fail; }
             else
             {
@@ -469,7 +469,7 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
             nn::Tensor gv_out;
             std::snprintf(nm, sizeof(nm), "%s bmm_kv_backward (no mask)", tag);
             auto r = eng.batched_matmul_softmax_backward_kv(
-                ta_t, tb, tp, tg, tr, trm, tdl, batch, true, false, alpha, gv_out, nullptr);
+                ta_t, tb, tp, tg, tr, trm, tdl, batch, true, false, alpha, gv_out, nn::AttnBias{});
             if (!r) { std::printf("[FAIL] %s: %s\n", nm, r.error().message.c_str()); ++fail; }
             else
             {
@@ -483,6 +483,79 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
         }
     }
 
+    return fail;
+}
+
+// ── 组合偏置（AttnBias：causal + doc_ids + ALiBi slopes）CPU vs GPU 一致性 ──
+// 覆盖两趟式原语的通用偏置描述子（M7 统一位置编码路径）：5 个原语分别跑在
+// CPU / GPU，比较输出（GPU shader 与 CPU attn_bias_at 参考应一致）。
+int run_compositional_bias(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
+{
+    int fail = 0;
+    const std::size_t batch = 2, heads = 2, M = 4, N = 6, K = 4, D = 5;
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<Scalar> dist(-1.0f, 1.0f);
+    nn::Matrix A(batch * M, K), B(batch * K, N), V(batch * N, D);
+    nn::Matrix row_max(batch * M, 1), denom(batch * M, 1);
+    nn::Matrix P(batch * M, N), G(batch * M, D), R0(batch * M, 1);
+    for (auto* X : {&A, &B, &V, &P, &G, &R0}) for (auto& x : X->span()) x = dist(rng);
+    for (auto& x : row_max.span()) x = dist(rng) + 1.0f;   // 保证 denom>0、稳定
+    for (auto& x : denom.span())  x = dist(rng) + 1.0f;
+    // doc_ids：(1, batch*N)，前半样本 doc=1、后半 doc=2（块对角）
+    nn::Matrix doc(1, batch * N);
+    for (std::size_t p = 0; p < batch * N; ++p)
+        doc.set_value_unchecked(0, p, (p / N < batch / 2) ? 1.0f : 2.0f);
+    // slopes：(1, heads) ALiBi 斜率 m_h = 2^(-8h/H)
+    nn::Matrix slopes(1, heads);
+    for (std::size_t h = 0; h < heads; ++h)
+        slopes.set_value_unchecked(0, h, std::pow(2.0f, -8.0f * h / heads));
+
+    auto to_t = [](const nn::Matrix& m) { return nn::Tensor::from_matrix(nn::Matrix(m)); };
+    const nn::Tensor tA = to_t(A), tB = to_t(B), tV = to_t(V), trm = to_t(row_max),
+                     tdl = to_t(denom), tP = to_t(P), tG = to_t(G), tR0 = to_t(R0),
+                     tDoc = to_t(doc), tSlopes = to_t(slopes);
+    nn::AttnBias bias;
+    bias.causal = true;
+    bias.num_heads = heads;
+    bias.doc_ids = &tDoc;
+    bias.slopes = &tSlopes;
+
+    // 在指定引擎上跑 5 个原语，收集输出；失败返回 false
+    auto run = [&](nn::ComputeEngine& eng, std::vector<nn::Tensor>& out) -> bool
+    {
+        out.clear();
+        auto m = eng.batched_matmul_reduce(tA, tB, batch, nn::ReduceOp::Max,
+                                           true, false, 0.7f, true, bias);
+        if (!m) return false;
+        auto l = eng.batched_matmul_softmax_denom(tA, tB, *m, batch, true, false, 0.7f, bias);
+        if (!l) return false;
+        auto O = eng.batched_matmul_softmax_apply(tA, tB, tV, *m, *l, batch, true, false, 0.7f, bias);
+        if (!O) return false;
+        nn::Tensor R, gv;
+        auto gq = eng.batched_matmul_softmax_backward_q(tA, tB, tP, *m, *l,
+                                                        batch, true, false, 0.7f, R, bias);
+        if (!gq) return false;
+        auto gkv = eng.batched_matmul_softmax_backward_kv(tA, tB, tP, tG, R, *m, *l,
+                                                          batch, true, false, 0.7f, gv, bias);
+        if (!gkv) return false;
+        out = {std::move(*m), std::move(*l), std::move(*O), std::move(*gq),
+               std::move(R), std::move(*gkv), std::move(gv)};
+        return true;
+    };
+
+    std::vector<nn::Tensor> co, go;
+    if (!run(cpu, co)) { std::printf("[FAIL] compositional: CPU 执行失败\n"); return 1; }
+    if (!run(gpu, go)) { std::printf("[FAIL] compositional: GPU 执行失败\n"); return 1; }
+    const char* names[] = {"m", "l", "O", "gq", "R", "gk", "gv"};
+    for (std::size_t i = 0; i < co.size() && i < go.size(); ++i)
+    {
+        auto cm = cpu.to_matrix(co[i]);
+        auto gm = gpu.to_matrix(go[i]);
+        if (!cm || !gm) { ++fail; std::printf("[FAIL] compositional %s 下载失败\n", names[i]); continue; }
+        std::string msg = std::string("compositional ") + names[i] + " (CPU vs GPU)";
+        check_matrix(*gm, *cm, msg.c_str());
+        if (max_abs_diff(*cm, *gm) >= 1e-4f) ++fail;
+    }
     return fail;
 }
 
@@ -507,6 +580,7 @@ int main()
     }
     nn::GpuEngine gpu_engine(backend);
     fail += run_case(gpu_engine, "GPU");
+    fail += run_compositional_bias(cpu_engine, gpu_engine);
 #endif
 
     std::cout << (fail == 0 ? "\nALL PASS\n" : "\nFAILED\n");

@@ -44,3 +44,13 @@
 ### 注意
 - 需足够主机 RAM（激活随 batch 线性增长）与 PCIe 带宽；PCIe 3.0/x8 收益减半。
 - CUDA 后端 offload 暂为 no-op（未接 pinned memory）。
+
+## 显存实测诊断（doc_ids 场景）
+
+**问题**：doc_ids 强制注意力走旧路径，物化 (BH×seq, seq)=384MB/块 注意力矩阵，且曾把 `attn_cache_`+`softmax.output_cache_` 存两份 → slab 实测 **22GB**（理论 ~11GB）。
+
+**修复**：
+1. **去重**：Softmax 单缓冲，旧路径只用 `softmax_.output_cache()` 一份 → slab 22→**16GB**。
+2. **（M7，2026-08）`AttnBias` 组合偏置统一位置编码**：两趟式原语掩码契约升级为组合式描述子（causal + doc_ids 块对角 + ALiBi slopes，见 [09 §4](09-operator-fusion.md)），doc_ids / ALiBi 及其组合**不再回退旧路径**，全部在融合 kernel 内按 (b,h,i,j) 组合偏置。doc_ids 仅需 `O(batch·seq)` 小张量每步上传，不再物化 (BH·seq,seq) 注意力矩阵。因此 `--doc-aligned-windows`（丢弃跨文档窗口以退化为纯因果）已**删除**——所有窗口（含跨文档）均保留，块对角文档掩码在两趟式路径内生效。
+
+

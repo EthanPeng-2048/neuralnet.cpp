@@ -549,7 +549,7 @@ auto e = engine.end_expr();
 - `compute_layer.hpp` AttentionBase：
   - **forward 两趟式**：`m = bmm_reduce(Max)` → `l = bmm_denom` → `O = bmm_apply(Q,K,V_t,m,l)`（V 需 (BH*seq, d_k)，用 `transpose + rearrange_3d(seq,BH,d_k)` 按 batch 转置）；`O` 再按 batch 转置回 (BH*d_k, seq)。缓存 m/l（各 (BH*seq,1)，替代 attn_cache_）。
   - **backward 重算**：`P = grad_A = bmm(grad_concat,V)`；`G = grad_concat^T`（同 V 的布局转换）；`bmm_softmax_backward_q` → grad_Q；`bmm_softmax_backward_kv` → grad_K/grad_V。不再物化 grad_S。
-  - **掩码决策钩子 `two_pass_mask_`**：返回 `{use_two_pass, mask}`；MHA 无掩码两趟式；`CausalSelfAttention` 纯因果（无 ALiBi/doc_ids）构建共享 (seq,seq) 掩码走两趟式，ALiBi（按头偏置）或 doc_ids（按样本掩码）回退旧路径。
+  - **掩码决策钩子 `two_pass_mask_`**：返回 `{use_two_pass, bias}`（组合式 `AttnBias` 描述子）；MHA 无偏置两趟式；`CausalSelfAttention` 用 `AttnBias` 组合 因果 / ALiBi(slopes) / doc_ids（及组合），全部走两趟式，不再回退旧路径（不物化 (BH·seq,seq)）。
 - `src/matmul_fusion_test.cpp`：新增 8 用例（q_backward/kv_backward × 有/无掩码 × R/grad_Q/grad_K/grad_V）。
 
 **关键决策与坑**：

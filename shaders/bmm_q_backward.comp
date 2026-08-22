@@ -23,19 +23,38 @@ layout(std430, binding = 2) readonly buffer  BufMask { float MASK[]; };
 layout(std430, binding = 3) readonly buffer  BufM    { float MV[]; };
 layout(std430, binding = 4) readonly buffer  BufL    { float LV[]; };
 layout(std430, binding = 5) readonly buffer  BufP    { float P[]; };
-layout(std430, binding = 6) writeonly buffer BufR    { float OUTR[]; };
-layout(std430, binding = 7) writeonly buffer BufGQ   { float OUTGQ[]; };
+layout(std430, binding = 6) readonly buffer  BufDoc  { float DOC[]; };
+layout(std430, binding = 7) readonly buffer  BufSlopes { float SLOPES[]; };
+layout(std430, binding = 8) writeonly buffer BufR    { float OUTR[]; };
+layout(std430, binding = 9) writeonly buffer BufGQ   { float OUTGQ[]; };
 
 layout(push_constant) uniform PC {
     uint M;
     uint N;
     uint K;
     uint flags;
+    uint num_heads;
     float alpha;
 };
 
 shared float w[4096];
 shared float sdata[256];
+
+// 组合注意力偏置：bias(b,i,j)；-inf 表示屏蔽
+float biasOf(uint b, uint i, uint j)
+{
+    const float NEG_INF = uintBitsToFloat(0xff800000u);
+    float mv = 0.0;
+    if ((flags & 4u) != 0u) mv = MASK[i * N + j];
+    const uint h = b % num_heads;
+    const uint bs = b / num_heads;
+    bool masked = ((flags & 4u) != 0u && mv == NEG_INF)
+               || ((flags & 32u) != 0u && j > i)
+               || ((flags & 8u) != 0u && DOC[bs * N + i] != DOC[bs * N + j]);
+    if ((flags & 16u) != 0u && !masked)
+        mv -= SLOPES[h] * float(int(i) - int(j));
+    return masked ? NEG_INF : mv;
+}
 
 void main()
 {
@@ -48,7 +67,6 @@ void main()
     const uint bbase = b * K * N;
     const bool transA = (flags & 1u) != 0u;
     const bool transB = (flags & 2u) != 0u;
-    const bool has_mask = (flags & 4u) != 0u;
     const float mval = MV[idx];
     const float inv_l = 1.0 / LV[idx];
 
@@ -56,12 +74,8 @@ void main()
     float acc = 0.0;
     for (uint j = tid; j < N; j += 256u)
     {
-        float mv = 0.0;
-        if (has_mask)
-        {
-            mv = MASK[i * N + j];
-            if (mv == NEG_INF) { w[j] = 0.0; continue; }
-        }
+        float mv = biasOf(b, i, j);
+        if (mv == NEG_INF) { w[j] = 0.0; continue; }
         float s = 0.0;
         for (uint k = 0u; k < K; ++k)
         {

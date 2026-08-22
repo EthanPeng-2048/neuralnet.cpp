@@ -326,6 +326,8 @@ public:
         VkDeviceSize allocated_bytes = 0;  // total - free
         VkDeviceSize max_contiguous_free = 0;  // 最大连续空闲块
         double fragmentation = 0.0;        // 1 - 最大连续空闲/总空闲
+        VkDeviceSize device_bytes = 0;     // DEVICE_LOCAL 块（真实显存）
+        VkDeviceSize host_bytes = 0;       // HOST_VISIBLE 块（host RAM，offload 用）
 
         [[nodiscard]] std::string to_string() const
         {
@@ -334,6 +336,8 @@ public:
             s += "blocks=" + std::to_string(block_count);
             s += " allocs=" + std::to_string(allocation_count);
             s += " total=" + std::to_string(total_bytes / MB) + "MB";
+            s += " dev=" + std::to_string(device_bytes / MB) + "MB";
+            s += " host=" + std::to_string(host_bytes / MB) + "MB";
             s += " free=" + std::to_string(free_bytes / MB) + "MB";
             s += " frag=" + std::to_string(fragmentation);
             return s;
@@ -350,6 +354,10 @@ public:
             const auto& b = *bp;
             s.allocation_count += b.allocation_count;
             s.total_bytes += b.size;
+            if (b.property_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+                s.device_bytes += b.size;
+            if (b.property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+                s.host_bytes += b.size;
             for (const auto& r : b.free_regions)
             {
                 s.free_bytes += r.size;
