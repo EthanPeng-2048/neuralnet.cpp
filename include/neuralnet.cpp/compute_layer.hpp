@@ -2437,6 +2437,212 @@ public:
 };
 
 // ══════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════
+// PositionEncoder — 位置编码抽象基类
+//
+// 把 GPTModel 中原本按 PosEncodingType 散落的 if-else 位置编码逻辑
+// （可学习 / 正弦波 / 无）抽离为独立的多态层次，GPTModel 通过基类指针使用，
+// 消除 use_pos_emb_ / pos_emb_learnable_ 等标志位分支的耦合。
+//
+// 接口：
+//   - apply(engine, token_emb_T, batch, seq)   全量前向，返回已加位置信息的 x
+//   - apply_step(engine, x, pos)               增量单 token 前向
+//   - backward(engine, grad_T, batch, seq)     累计位置梯度（仅可学习有意义）
+//   - parameters() / param_gradients()         可学习参数（仅 Learned 返回非空）
+//
+// 注意：ALiBi / RoPE 的位置信息由注意力层注入（CausalSelfAttention 线性偏置 /
+//        AttentionBase 的 RotaryEmbedding），故其编码器为 no-op。
+// ══════════════════════════════════════════════════════════════════════════
+class PositionEncoder
+{
+public:
+    virtual ~PositionEncoder() = default;
+
+    // 全量前向：token_emb_T 为 (d_model, batch*seq)，返回 x = token_emb_T (+ pos_emb)
+    [[nodiscard]] virtual Result<Tensor> apply(
+        ComputeEngine& engine, const Tensor& token_emb_T,
+        std::size_t batch, std::size_t seq) = 0;
+
+    // 增量前向：x 为 (d_model, 1)，返回 x + pos_emb[pos]
+    [[nodiscard]] virtual Result<Tensor> apply_step(
+        ComputeEngine& engine, const Tensor& x, std::size_t pos) = 0;
+
+    // 反向：累计位置梯度到 grad_pos_emb_（默认 no-op）
+    [[nodiscard]] virtual Result<void> backward(
+        ComputeEngine& engine, const Tensor& grad_T,
+        std::size_t batch, std::size_t seq) = 0;
+
+    [[nodiscard]] virtual std::vector<TensorRef> parameters() { return {}; }
+    [[nodiscard]] virtual std::vector<TensorRef> param_gradients() { return {}; }
+};
+
+// 加性位置编码基类（Learned / Sinusoidal 共用）：
+// 通过 pos_emb_ 张量按位置 gather 并加到 token 嵌入上。
+class AdditivePositionEncoder : public PositionEncoder
+{
+protected:
+    bool learnable_ = false;
+
+    Tensor pos_emb_;        // (seq_len, d_model)
+    Tensor grad_pos_emb_;   // (seq_len, d_model)，仅 learnable_ 有效
+
+    // pos_indices 缓存（避免每 step 重建）— (total, 1) 值为 [0,..,0,1,..,1,...,seq-1,..]
+    Tensor pos_indices_cache_;
+    std::size_t pos_indices_batch_ = 0;  // 缓存键：batch_size
+    std::size_t pos_indices_seq_ = 0;    // 缓存键：seq_len
+
+    // 用给定的位置编码矩阵初始化 pos_emb_（learnable 时额外分配梯度）
+    void init_(ComputeEngine& engine, Matrix&& pe, bool learnable)
+    {
+        const std::size_t rows = pe.rows();
+        const std::size_t cols = pe.cols();
+        learnable_ = learnable;
+        auto pe_r = engine.from_matrix(pe);
+        NN_ASSERT(pe_r, pe_r ? "" : pe_r.error().message.c_str());
+        pos_emb_ = std::move(*pe_r);
+        if (learnable_)
+        {
+            grad_pos_emb_ = engine.create_tensor(rows, cols);
+            auto r = engine.zero(grad_pos_emb_);
+            NN_ASSERT(r, r ? "" : r.error().message.c_str());
+        }
+    }
+
+    // 确保 pos_indices 缓存有效（batch-major：i = b*seq + t → position=t）
+    [[nodiscard]] Result<void> ensure_pos_indices_(
+        ComputeEngine& engine, std::size_t batch, std::size_t seq)
+    {
+        if (pos_indices_batch_ == batch && pos_indices_seq_ == seq)
+            return {};
+        Matrix pidx_m(batch * seq, 1);
+        for (std::size_t b = 0; b < batch; ++b)
+            for (std::size_t t = 0; t < seq; ++t)
+                pidx_m.set_value_unchecked(b * seq + t, 0,
+                    static_cast<Scalar>(t));
+        auto pidx_t = engine.from_matrix(pidx_m);
+        if (!pidx_t) return std::unexpected(pidx_t.error());
+        pos_indices_cache_ = std::move(*pidx_t);
+        pos_indices_batch_ = batch;
+        pos_indices_seq_ = seq;
+        return {};
+    }
+
+public:
+    AdditivePositionEncoder() = default;
+
+    [[nodiscard]] bool learnable() const noexcept { return learnable_; }
+
+    [[nodiscard]] Result<Tensor> apply(
+        ComputeEngine& engine, const Tensor& token_emb_T,
+        std::size_t batch, std::size_t seq) override
+    {
+        auto ci = ensure_pos_indices_(engine, batch, seq);
+        if (!ci) return std::unexpected(ci.error());
+        auto pos_gathered = engine.gather_rows(pos_emb_, pos_indices_cache_);
+        if (!pos_gathered) return std::unexpected(pos_gathered.error());
+        auto pos_T = engine.transpose(*pos_gathered);
+        if (!pos_T) return std::unexpected(pos_T.error());
+        auto x_with_pos = engine.elementwise_binary(BinaryOp::Add, token_emb_T, *pos_T);
+        if (!x_with_pos) return std::unexpected(x_with_pos.error());
+        return std::move(*x_with_pos);
+    }
+
+    [[nodiscard]] Result<Tensor> apply_step(
+        ComputeEngine& engine, const Tensor& x, std::size_t pos) override
+    {
+        Matrix pos_m(1, 1);
+        pos_m.set_value_unchecked(0, 0, static_cast<Scalar>(pos));
+        auto pos_t = engine.from_matrix(pos_m);
+        if (!pos_t) return std::unexpected(pos_t.error());
+        auto pos_emb_g = engine.gather_rows(pos_emb_, *pos_t);
+        if (!pos_emb_g) return std::unexpected(pos_emb_g.error());
+        auto pos_T = engine.transpose(*pos_emb_g);
+        if (!pos_T) return std::unexpected(pos_T.error());
+        auto x_wp = engine.elementwise_binary(BinaryOp::Add, x, *pos_T);
+        if (!x_wp) return std::unexpected(x_wp.error());
+        return std::move(*x_wp);
+    }
+
+    [[nodiscard]] Result<void> backward(
+        ComputeEngine& engine, const Tensor& grad_T,
+        std::size_t /*batch*/, std::size_t /*seq*/) override
+    {
+        if (!learnable_) return {};
+        // pos_indices 缓存由 apply() 建立，backward 直接复用（batch/seq 一致）。
+        auto pr = engine.scatter_add_rows(grad_pos_emb_, pos_indices_cache_, grad_T);
+        if (!pr) return std::unexpected(pr.error());
+        return {};
+    }
+
+    [[nodiscard]] std::vector<TensorRef> parameters() override
+    {
+        if (!learnable_) return {};
+        return { pos_emb_ };
+    }
+    [[nodiscard]] std::vector<TensorRef> param_gradients() override
+    {
+        if (!learnable_) return {};
+        return { grad_pos_emb_ };
+    }
+};
+
+// 可学习位置编码（GPT 默认）：N(0, 0.02) 随机初始化。
+// 与 token_emb_ 共享同一 rng 序列（保持与旧实现完全一致的可复现性）。
+class LearnedPositionEncoder final : public AdditivePositionEncoder
+{
+public:
+    LearnedPositionEncoder(ComputeEngine& engine, std::size_t d_model,
+                           std::size_t seq_len,
+                           std::mt19937_64& rng,
+                           std::normal_distribution<Scalar>& dist)
+    {
+        Matrix pe(seq_len, d_model);
+        auto pe_s = pe.span();
+        for (std::size_t i = 0; i < pe.size(); ++i) pe_s[i] = dist(rng);
+        init_(engine, std::move(pe), /*learnable=*/true);
+    }
+};
+
+// 正弦波固定位置编码（冻结，不参与训练）：
+//   PE(pos, 2i) = sin(pos/10000^(2i/d)), PE(pos, 2i+1) = cos(...)
+class SinusoidalPositionEncoder final : public AdditivePositionEncoder
+{
+public:
+    SinusoidalPositionEncoder(ComputeEngine& engine, std::size_t d_model,
+                              std::size_t seq_len)
+    {
+        Matrix pe(seq_len, d_model);
+        auto pe_s = pe.span();
+        for (std::size_t pos = 0; pos < seq_len; ++pos)
+            for (std::size_t i = 0; i < d_model; ++i)
+            {
+                Scalar angle = static_cast<Scalar>(pos) /
+                    std::pow(Scalar{10000}, static_cast<Scalar>(2 * (i / 2)) / static_cast<Scalar>(d_model));
+                pe_s[pos * d_model + i] = (i % 2 == 0) ? std::sin(angle) : std::cos(angle);
+            }
+        init_(engine, std::move(pe), /*learnable=*/false);
+    }
+};
+
+// 无位置编码（ALiBi / RoPE）：位置信息由注意力层注入，此处为 no-op。
+class NoPositionEncoder final : public PositionEncoder
+{
+public:
+    [[nodiscard]] Result<Tensor> apply(
+        ComputeEngine& /*engine*/, const Tensor& token_emb_T,
+        std::size_t /*batch*/, std::size_t /*seq*/) override
+    { return token_emb_T; }
+
+    [[nodiscard]] Result<Tensor> apply_step(
+        ComputeEngine& /*engine*/, const Tensor& x, std::size_t /*pos*/) override
+    { return x; }
+
+    [[nodiscard]] Result<void> backward(
+        ComputeEngine& /*engine*/, const Tensor& /*grad_T*/,
+        std::size_t /*batch*/, std::size_t /*seq*/) override
+    { return {}; }
+};
+
 // GPTModel — Decoder-only Transformer 语言模型
 //
 // 算法（只在此处，不在 Engine/Shader）：
@@ -2459,14 +2665,11 @@ private:
     std::size_t vocab_size_;
     std::size_t d_model_;
     std::size_t seq_len_;
-    bool use_pos_emb_;       // true = 使用位置嵌入（Learned 或 Sinusoidal），false = ALiBi 模式
-    bool pos_emb_learnable_; // true = 可学习位置嵌入（Learned），false = 冻结（Sinusoidal）或 ALiBi
 
     // 嵌入
     Tensor token_emb_;       // (vocab_size, d_model)
     Tensor grad_token_emb_;
-    Tensor pos_emb_;         // (seq_len, d_model) — 仅 use_pos_emb_ = true 时有效
-    Tensor grad_pos_emb_;    // 同上
+    std::unique_ptr<PositionEncoder> pos_encoder_;  // 位置编码（多态：Learned/Sinusoidal/无）
 
     std::vector<GPTBlock> blocks_;
     std::unique_ptr<Layer> ln_f_;
@@ -2475,11 +2678,6 @@ private:
     // 反向缓存
     Tensor stored_tokens_tensor_;          // token IDs 的 Tensor 版本 (total, 1)
     std::size_t batch_size_ = 0;
-
-    // pos_indices 缓存（避免每 step 重建）— 仅 use_pos_emb_ = true 时使用
-    Tensor pos_indices_cache_;             // (total, 1) 值为 [0,0,..,1,1,..,...,seq-1,..]
-    std::size_t pos_indices_batch_ = 0;    // 缓存键：batch_size（独立字段，避免位打包溢出）
-    std::size_t pos_indices_seq_ = 0;      // 缓存键：seq_len
 
     // 文档感知：当前 step 每样本文档 id（batch-major b*seq+t → doc id），
     // 由调用方在 forward 前 set_doc_ids 设置，转发给各 GPTBlock。
@@ -2497,9 +2695,6 @@ public:
              ActivationType activation = ActivationType::GeLU,
              NormType norm_type = NormType::LayerNorm)
         : vocab_size_(vocab_size), d_model_(d_model), seq_len_(seq_len),
-          use_pos_emb_(pos_enc_type != PosEncodingType::ALiBi &&
-                       pos_enc_type != PosEncodingType::RoPE),
-          pos_emb_learnable_(pos_enc_type == PosEncodingType::Learned),
           ln_f_(make_norm_layer(engine, d_model, norm_type)),
           lm_head_(engine, d_model, vocab_size)
     {
@@ -2518,35 +2713,21 @@ public:
         grad_token_emb_ = engine.create_tensor(vocab_size, d_model);
         { auto r1 = engine.zero(grad_token_emb_); NN_ASSERT(r1, r1 ? "" : r1.error().message.c_str()); }
 
-        // 初始化 pos_emb_（仅非 ALiBi 模式）
-        if (use_pos_emb_)
+        // 初始化位置编码器（Learned / Sinusoidal / ALiBi / RoPE）
+        // 注意：Learned 与 token_emb_ 共享同一 rng，保证与旧实现完全一致的可复现性。
+        switch (pos_enc_type)
         {
-            Matrix pe(seq_len, d_model);
-            if (pos_enc_type == PosEncodingType::Sinusoidal)
-            {
-                // 正弦波固定位置编码: PE(pos, 2i) = sin(pos/10000^(2i/d)), PE(pos, 2i+1) = cos(...)
-                auto pe_s = pe.span();
-                for (std::size_t pos = 0; pos < seq_len; ++pos)
-                    for (std::size_t i = 0; i < d_model; ++i)
-                    {
-                        Scalar angle = static_cast<Scalar>(pos) /
-                            std::pow(Scalar{10000}, static_cast<Scalar>(2 * (i / 2)) / static_cast<Scalar>(d_model));
-                        pe_s[pos * d_model + i] = (i % 2 == 0) ? std::sin(angle) : std::cos(angle);
-                    }
-            }
-            else
-            {
-                // 可学习位置编码: N(0, 0.02) 随机初始化
-                auto pe_s = pe.span();
-                for (std::size_t i = 0; i < pe.size(); ++i) pe_s[i] = dist(rng);
-            }
-
-            auto pe_r = engine.from_matrix(pe);
-            NN_ASSERT(pe_r, pe_r ? "" : pe_r.error().message.c_str());
-            pos_emb_ = std::move(*pe_r);
-
-            grad_pos_emb_ = engine.create_tensor(seq_len, d_model);
-            { auto r2 = engine.zero(grad_pos_emb_); NN_ASSERT(r2, r2 ? "" : r2.error().message.c_str()); }
+            case PosEncodingType::Learned:
+                pos_encoder_ = std::make_unique<LearnedPositionEncoder>(
+                    engine, d_model, seq_len, rng, dist);
+                break;
+            case PosEncodingType::Sinusoidal:
+                pos_encoder_ = std::make_unique<SinusoidalPositionEncoder>(
+                    engine, d_model, seq_len);
+                break;
+            default:  // ALiBi / RoPE：位置信息由注意力层注入
+                pos_encoder_ = std::make_unique<NoPositionEncoder>();
+                break;
         }
 
         // GPTBlock 传入 seq_len、pos_enc_type、activation 和 norm_type
@@ -2559,8 +2740,8 @@ public:
     {
         std::vector<TensorRef> p;
         p.push_back(token_emb_);
-        if (use_pos_emb_ && pos_emb_learnable_)
-            p.push_back(pos_emb_);
+        auto pp = pos_encoder_->parameters();
+        p.insert(p.end(), pp.begin(), pp.end());
         for (auto& b : blocks_)
         {
             auto bp = b.parameters();
@@ -2577,8 +2758,8 @@ public:
     {
         std::vector<TensorRef> g;
         g.push_back(grad_token_emb_);
-        if (use_pos_emb_ && pos_emb_learnable_)
-            g.push_back(grad_pos_emb_);
+        auto gp = pos_encoder_->param_gradients();
+        g.insert(g.end(), gp.begin(), gp.end());
         for (auto& b : blocks_)
         {
             auto bg = b.param_gradients();
@@ -2604,7 +2785,7 @@ public:
     {
         const std::size_t seq_len = input.rows();
         batch_size_ = input.cols();
-        const std::size_t total = seq_len * batch_size_;        // ── 1. gather 所有 token 的 embedding（统一采用 batch-major 列序） ──
+        // ── 1. gather 所有 token 的 embedding（统一采用 batch-major 列序） ──
         // 下方注意力（AttentionBase::forward 的 rearrange_3d + batched_matmul + 因果掩码）
         // 假定扁平列为 batch-major（b*seq + t）。因此先把输入 (seq, batch) 转置为
         // (batch, seq)，使 gather_rows 的 flat 序即为 batch-major：i = b*seq + t。
@@ -2627,45 +2808,11 @@ public:
         auto all_T = engine.transpose(*all_emb);
         if (!all_T) return std::unexpected(all_T.error());
 
-        Tensor x_result;
-        if (use_pos_emb_)
-        {
-            // ── 3a. 确保 pos_indices 缓存有效 ──
-            {
-                if (pos_indices_batch_ != batch_size_ || pos_indices_seq_ != seq_len)
-                {
-                    // 位置缓存按 batch-major（i = b*seq + t）存放 position=t
-                    Matrix pidx_m(total, 1);
-                    for (std::size_t b = 0; b < batch_size_; ++b)
-                        for (std::size_t t = 0; t < seq_len; ++t)
-                            pidx_m.set_value_unchecked(b * seq_len + t, 0,
-                                static_cast<Scalar>(t));
-                    auto pidx_t = engine.from_matrix(pidx_m);
-                    if (!pidx_t) return std::unexpected(pidx_t.error());
-                    pos_indices_cache_ = std::move(*pidx_t);
-                    pos_indices_batch_ = batch_size_;
-                    pos_indices_seq_ = seq_len;
-                }
-            }
-
-            // x = transpose(gather(token_emb, input)) + transpose(gather(pos_emb, pos_idx))
-            auto pos_gathered = engine.gather_rows(pos_emb_, pos_indices_cache_);
-            if (!pos_gathered) return std::unexpected(pos_gathered.error());
-
-            auto pos_T = engine.transpose(*pos_gathered);
-            if (!pos_T) return std::unexpected(pos_T.error());
-
-            auto x_with_pos = engine.elementwise_binary(BinaryOp::Add, *all_T, *pos_T);
-            if (!x_with_pos) return std::unexpected(x_with_pos.error());
-            x_result = std::move(*x_with_pos);
-        }
-        else
-        {
-            // ALiBi 模式：不使用位置嵌入，直接使用 token embedding
-            x_result = std::move(*all_T);
-        }
+        // ── 3. 施加位置编码（Learned/Sinusoidal 相加；ALiBi/RoPE 为 no-op） ──
+        auto x_result = pos_encoder_->apply(engine, *all_T, batch_size_, seq_len);
+        if (!x_result) return std::unexpected(x_result.error());
         // ── 4. 通过 Transformer 块（全批量化，无 per-sample 循环） ──
-        Tensor x = std::move(x_result);
+        Tensor x = std::move(*x_result);
         for (std::size_t bi = 0; bi < blocks_.size(); ++bi)
         {
             // 文档感知：把本 step 每样本文档 id 传给各 block 的注意力
@@ -2700,9 +2847,8 @@ public:
         //   grad_token_emb_ 已注册到优化器的 param_gradients() 中，
         //   由优化器的 zero_grad() 统一清零。这里如果额外清零会破坏
         //   梯度积累（accum_steps > 1 时前几轮的梯度信号全部丢失）。
+        //   位置编码梯度同理（pos_encoder_->param_gradients() 已注册，勿在此清零）。
         // (void)engine.zero(grad_token_emb_);
-        // if (use_pos_emb_ && pos_emb_learnable_)
-        //     (void)engine.zero(grad_pos_emb_);
 
         // ── 1. LM Head 反向 → (d_model, seq*batch) ──
         auto b_lm = lm_head_.backward(engine, grad_output);
@@ -2736,16 +2882,9 @@ public:
         auto grad_T = engine.transpose(grad_x);
         if (!grad_T) return std::unexpected(grad_T.error());
 
-        if (use_pos_emb_ && pos_emb_learnable_)
-        {
-            // grad_T: (total, d_model)，行序 = batch-major（i = b*seq + t）。
-            // pos_indices_cache_[i] = t（同一 t 在多个 batch 出现）。
-            // scatter_add_rows 将所有同 t 的批次梯度贡献累加到 grad_pos_emb_[t]，
-            // 即 pos_grad[t][d] = Σ_b grad_x[d][b*seq + t] —— batch-major 下的位置归约。
-            auto pr = engine.scatter_add_rows(
-                grad_pos_emb_, pos_indices_cache_, *grad_T);
-            if (!pr) return std::unexpected(pr.error());
-        }
+        // 位置编码反向（Learned 累计 grad_pos_emb_；Sinusoidal/ALiBi/RoPE no-op）
+        auto pr = pos_encoder_->backward(engine, *grad_T, batch_size_, seq_len_);
+        if (!pr) return std::unexpected(pr.error());
 
         // ── 5. scatter_add_rows: grad_token_emb_[tokens] += grad_T ──
         auto sr = engine.scatter_add_rows(grad_token_emb_, stored_tokens_tensor_, *grad_T);
@@ -2782,21 +2921,10 @@ public:
         auto x_new = engine.transpose(*emb);
         if (!x_new) return std::unexpected(x_new.error());
 
-        // 2. 位置嵌入（ALiBi 模式跳过）
-        if (use_pos_emb_)
-        {
-            Matrix pos_m(1, 1);
-            pos_m.set_value_unchecked(0, 0, static_cast<Scalar>(pos));
-            auto pos_t = engine.from_matrix(pos_m);
-            if (!pos_t) return std::unexpected(pos_t.error());
-            auto pos_emb_g = engine.gather_rows(pos_emb_, *pos_t);
-            if (!pos_emb_g) return std::unexpected(pos_emb_g.error());
-            auto pos_T = engine.transpose(*pos_emb_g);
-            if (!pos_T) return std::unexpected(pos_T.error());
-            auto x_wp = engine.elementwise_binary(BinaryOp::Add, *x_new, *pos_T);
-            if (!x_wp) return std::unexpected(x_wp.error());
-            x_new = std::move(*x_wp);
-        }
+        // 2. 位置编码（Learned/Sinusoidal 相加；ALiBi/RoPE no-op）
+        auto x_wp = pos_encoder_->apply_step(engine, *x_new, pos);
+        if (!x_wp) return std::unexpected(x_wp.error());
+        x_new = std::move(*x_wp);
 
         // 3. 逐块增量前向
         Tensor x = std::move(*x_new);

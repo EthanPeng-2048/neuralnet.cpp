@@ -184,6 +184,15 @@ namespace nn::cli
         // 评估结束后恢复训练模式（调用方默认为训练场景）。
         model.set_training(false);
 
+        // RAII guard：无论成功与否，函数退出时都恢复训练模式。
+        // 避免 begin_batch/forward/end_batch 失败提前返回时，模型被静默留在
+        // 推理模式（BatchNorm 会错误使用 running 统计量，破坏后续训练）。
+        struct TrainingGuard
+        {
+            nn::Model &m;
+            ~TrainingGuard() { m.set_training(true); }
+        } training_guard{model};
+
         // batch 模式加速 forward（GPU 下消除 per-primitive 提交开销）
         auto bb = engine.begin_batch();
         if (!bb) return std::unexpected(bb.error());
@@ -193,8 +202,6 @@ namespace nn::cli
 
         auto eb = engine.end_batch();
         if (!eb) return std::unexpected(eb.error());
-
-        model.set_training(true);
 
         auto out_r = engine.to_matrix(*out_tensor_r);
         if (!out_r) return std::unexpected(std::move(out_r).error());
