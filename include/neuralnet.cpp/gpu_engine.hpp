@@ -33,6 +33,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 
 #include "compute_engine.hpp"
 #if __has_include("fused_registry.hpp")
@@ -67,6 +68,18 @@ public:
     [[nodiscard]] Result<void> end_batch() override
     {
         return backend_.end_batch();
+    }
+
+    // ── 显存回收（L2）：end_batch 之后归还完全空闲的内存池底材 ──────
+    [[nodiscard]] Result<void> release_idle_pool_blocks() override
+    {
+        return backend_.release_idle_pool_blocks();
+    }
+
+    // ── 显存池统计（L2 仪器化） ──────────────────────────────────────
+    [[nodiscard]] std::string pool_stats() const override
+    {
+        return backend_.memory_pool().pool_debug_stats().to_string();
     }
 
     // ── 中点刷新：提交当前 command buffer 并开始新的录制 ──

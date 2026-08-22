@@ -1585,6 +1585,19 @@ public:
     [[nodiscard]] VkCommandPool command_pool() const noexcept { return command_pool_; }
     [[nodiscard]] VkDescriptorPool gpu_tensor_pool() const noexcept { return gpu_tensor_pool_; }
 
+    // ── 显存回收（L2）：归还完全空闲的内存池底材给 GPU ───────────────
+    // 应在 end_batch（提交完成、延迟销毁已 flush）之后调用，避免释放
+    // 仍被 batch 引用的 buffer 底材。
+    [[nodiscard]] Result<void> release_idle_pool_blocks()
+    {
+        if (!initialized_ || !memory_pool_)
+            return {};
+        flush_pending_destroys();
+        memory_pool_->release_idle_blocks();
+        return {};
+    }
+
+
     // ══════════════════════════════════════════════════════════════════
     // Command Buffer Batching API
     // ══════════════════════════════════════════════════════════════════

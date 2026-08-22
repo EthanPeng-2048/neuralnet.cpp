@@ -26,6 +26,7 @@
 
 #include <cstddef>
 #include <span>
+#include <string>
 
 #include "config.hpp"
 #include "core_errors.hpp"
@@ -116,6 +117,16 @@ public:
     // 避免单次提交时间过长触发 Windows TDR。
     // CPU 引擎：no-op。
     [[nodiscard]] virtual Result<void> flush_batch() { return {}; }
+
+    // ── 显存回收（L2）─────────────────────────────────────────────────
+    // GPU 引擎：在 end_batch（提交完成、延迟销毁已 flush）之后归还完全
+    // 空闲的内存池底材给 GPU。CPU/CUDA 引擎：no-op。
+    [[nodiscard]] virtual Result<void> release_idle_pool_blocks() { return {}; }
+
+    // ── 显存池统计（L2 仪器化）──────────────────────────────────────
+    // GPU 引擎返回池统计字符串（块数/占用/空闲/碎片）；CPU/CUDA 返回空。
+    // 用于训练中显存采样与逐项归因。
+    [[nodiscard]] virtual std::string pool_stats() const { return {}; }
 
     // ── 张量工厂 ──────────────────────────────────────────────────────────
     [[nodiscard]] virtual Tensor create_tensor(std::size_t rows, std::size_t cols) = 0;

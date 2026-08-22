@@ -354,6 +354,12 @@ void print_usage(const char *prog)
         << "  设备丢失 (VK_ERROR_DEVICE_LOST) 时自动保存 checkpoint 并退出，\n"
         << "  可用 --resume 恢复训练。\n"
         << "\n"
+        << "显存优化:\n"
+        << "  --checkpoint-every <n> 每 N 个 Transformer block 重算一次 forward\n"
+        << "    (激活重计算，默认: 0=不启用)。1=每块都重算，显存收益最大，\n"
+        << "    以约 1 次额外前向 FLOPs 为代价省去整层激活驻留。\n"
+        << "  GPU 训练每 step 末尾自动归还完全空闲的内存池底材（L2 整块释放）。\n"
+        << "\n"
         << "学习率调度:\n"
         << "  --lr-schedule <type> 学习率调度: fixed/cosine/step_cosine (默认: fixed)\n"
         << "                   cosine: 余弦退火（epoch 级），lr 从初始值衰减到 min-lr\n"
@@ -406,6 +412,9 @@ struct TrainConfig
 
     // batch 录制粒度：在 Transformer block 间按间隔 flush，拆分大提交
     std::size_t flush_interval = 0;          // 0=不间断（默认），>0=每 N 个 block flush
+
+    // 梯度检查点（激活重计算 L1）：每 N 个 GPTBlock 重算一次
+    std::size_t checkpoint_every = 0;        // 0=不启用（默认），>0=每 N 个 block 重算
 
     // 学习率调度
     std::string lr_schedule = "fixed";  // fixed / cosine / step_cosine
@@ -667,6 +676,12 @@ TrainConfig parse_args(int argc, char *argv[])
             if (!v) { std::cerr << "无效 --flush-interval: " << v.error().message << "\n"; std::exit(1); }
             cfg.flush_interval = *v;
         }
+        else if (arg == "--checkpoint-every" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --checkpoint-every: " << v.error().message << "\n"; std::exit(1); }
+            cfg.checkpoint_every = *v;
+        }
         else if (arg == "--test-file" && i + 1 < argc)
             cfg.test_path = argv[++i];
         else if (!arg.starts_with("--"))
@@ -910,6 +925,11 @@ int main(int argc, char *argv[])
 
     // ── 设置 batch 录制粒度 ──
     model.set_flush_interval(cfg.flush_interval);
+
+    // ── 设置梯度检查点（激活重计算 L1） ──
+    model.set_checkpoint_every(cfg.checkpoint_every);
+    if (cfg.checkpoint_every > 0)
+        std::cout << "梯度检查点已启用: 每 " << cfg.checkpoint_every << " 个 block 重算一次\n";
 
     // ── 构建规格（用于保存） ─────────────────────────────────
     auto spec = nn::make_gpt_spec(
@@ -1277,6 +1297,11 @@ int main(int argc, char *argv[])
                 std::cerr << '\n';
                 return 1;
             }
+
+            // ── 显存回收（L2）：end_batch 提交完成、延迟销毁已 flush，
+            //    归还完全空闲的内存池底材（GPU 引擎有效，CPU/CUDA no-op） ──
+            auto rel_r = engine->release_idle_pool_blocks();
+            if (!rel_r) { std::cerr << "\n显存回收失败: " << rel_r.error().message << '\n'; return 1; }
 
             // ── 梯度累积：每 accum_steps 步才更新一次参数 ──
             // forward+backward 每步都执行（梯度累加到参数梯度），

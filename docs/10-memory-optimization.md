@@ -1,9 +1,24 @@
 # 显存优化计划（Memory Optimization）— GPT + Vulkan/CPU 训练显存下探
 
-> 文档状态：规划（草案）
+> 文档状态：**L1 ✅ 已实施 / L2 ✅ 已实施**（L3 远期）
 > 关联文档：[09-operator-fusion.md](./09-operator-fusion.md)（算子融合已完成部分）
 
 ## 0. 背景与目标
+
+> ### 实施进度（2026-08-22）
+>
+> **L1 激活重计算（梯度检查点）— ✅ 已实施**
+> - 接口：`Layer` 新增 `set_checkpoint_mode / recompute_supported / forward_recompute / set_checkpoint_every` 契约；`Model::set_checkpoint_every` 逐层分发；`GPTModel` override 实现块级检查点（每 N 个 GPTBlock 存一次输入，backward 重算）。
+> - 实现：`AttentionBase`/`FeedForward`/`GPTBlock`/`TransformerEncoderLayer` 传播 checkpoint 模式；`Linear/ReLU/GeLU/SwiGLU/LayerNorm/RMSNorm/Softmax/AttentionBase` 在 checkpoint 模式下跳过中间激活缓存写入（forward 改用局部变量承载计算，避免空缓存读取）。
+> - 验证：新增 `src/gpt_checkpoint_test.cpp`（`gpt_checkpoint_test`），stride∈{1,2} 与全存基线 **逐位一致（max_abs=0）**；`gpt_gradcheck/rmsnorm/swiglu/softmax/attn_gradcheck`、`matmul_fusion_test`、`ce_fusion_test` 全绿；`text_train --checkpoint-every N` CPU 端到端训练正常（loss 正常下降、exit=0）。
+>
+> **L2 内存池整块归还 + 统计 — ✅ 已实施**
+> - `MemoryPool`：新增 `PoolStats` + `pool_debug_stats()`（块数/占用/空闲/碎片）、`release_idle_blocks()`（整块 `vkFreeMemory` + 从 `blocks_` 移除，带 `retain_free_bytes_` 保留阈值防抖动）、`set_retain_free_bytes()`。
+> - `GpuBackend::release_idle_pool_blocks()`（先 `flush_pending_destroys()` 再归还）；`ComputeEngine` 新增 `release_idle_pool_blocks()` / `pool_stats()`（CPU/CUDA no-op）；`GpuEngine` override。
+> - 接入：`text_train` 新增 `--checkpoint-every N` 与每 step 末尾 `release_idle_pool_blocks()`（end_batch 提交完成、延迟销毁已 flush 后调用，安全）。
+> - 数值/性能回归：仅 GPU 内存管理路径，不影响 CPU 数值；L1 相关 gradcheck 全绿。
+>
+> **L3（自动融合 + 优化器降内存）— 待立项**
 
 以实测配置为基准（滑动窗口，seq_len=1024，stride=1024，样本数 435736）：
 
