@@ -97,6 +97,10 @@ public:
     // 默认 no-op；各缓存持有层 override。
     virtual void clear_cache() {}
 
+    // 返回本层 backward 所需的中间激活缓存引用（供 activation offload 导出/导入）。
+    // 仅返回 valid 的张量；掩码等小而常驻的缓存不在此列（不参与 offload，保持常驻）。
+    [[nodiscard]] virtual std::vector<TensorRef> activation_cache() { return {}; }
+
     // 该层是否可作为“重计算单元”（即 forward_recompute 有实际意义）
     [[nodiscard]] virtual bool recompute_supported() const { return false; }
 
@@ -115,6 +119,9 @@ public:
 
     // 梯度检查点粒度（默认 0 = 不启用；由 GPTModel 等 override）
     virtual void set_checkpoint_every(std::size_t /*stride*/) {}
+
+    // activation offload（L1-offload）开关（默认 no-op；GPTModel override）
+    virtual void set_activation_offload(bool /*enabled*/) {}
 };
 
 // ── 辅助：深拷贝 Tensor（通过 engine.clone()，无 PCIe 传输） ──────────────
@@ -186,6 +193,13 @@ public:
     }
 
     void clear_cache() override { input_cache_ = Tensor{}; }
+
+    std::vector<TensorRef> activation_cache() override
+    {
+        std::vector<TensorRef> r;
+        if (input_cache_.valid()) r.emplace_back(input_cache_);
+        return r;
+    }
 
     // ── forward: out = W × x + b ──────────────────────────────────────────
     [[nodiscard]] Result<Tensor> forward(
@@ -313,6 +327,14 @@ public:
         sigmoid_cache_ = Tensor{};
     }
 
+    std::vector<TensorRef> activation_cache() override
+    {
+        std::vector<TensorRef> r;
+        if (input_cache_.valid()) r.emplace_back(input_cache_);
+        if (sigmoid_cache_.valid()) r.emplace_back(sigmoid_cache_);
+        return r;
+    }
+
     // ── forward: out = x * sigmoid(β * x) ────────────────────────────────
     // 分解为原语：
     //   t1 = x * β                    (binary_scalar Mul)
@@ -426,6 +448,15 @@ public:
         gate_cache_ = Tensor{};
         sigmoid_cache_ = Tensor{};
         up_cache_ = Tensor{};
+    }
+
+    std::vector<TensorRef> activation_cache() override
+    {
+        std::vector<TensorRef> r;
+        if (gate_cache_.valid()) r.emplace_back(gate_cache_);
+        if (sigmoid_cache_.valid()) r.emplace_back(sigmoid_cache_);
+        if (up_cache_.valid()) r.emplace_back(up_cache_);
+        return r;
     }
 
     // ── forward: out = SiLU(gate) ⊙ up ────────────────────────────────────
@@ -593,6 +624,14 @@ public:
     {
         normalized_cache_ = Tensor{};
         std_cache_ = Tensor{};
+    }
+
+    std::vector<TensorRef> activation_cache() override
+    {
+        std::vector<TensorRef> r;
+        if (normalized_cache_.valid()) r.emplace_back(normalized_cache_);
+        if (std_cache_.valid()) r.emplace_back(std_cache_);
+        return r;
     }
 
     // ── forward ───────────────────────────────────────────────────────────
@@ -789,6 +828,14 @@ public:
         rms_inv_cache_ = Tensor{};
     }
 
+    std::vector<TensorRef> activation_cache() override
+    {
+        std::vector<TensorRef> r;
+        if (normed_cache_.valid()) r.emplace_back(normed_cache_);
+        if (rms_inv_cache_.valid()) r.emplace_back(rms_inv_cache_);
+        return r;
+    }
+
     // ── forward ───────────────────────────────────────────────────────────
     // M3 融合（算法公式不变，中间 x_sq (F,B) 由归约 kernel 内部消解）：
     //   融合表达式保持 F 无关结构（不含 1/F、ε 常量，避免闭合世界 key 随
@@ -912,6 +959,13 @@ public:
     Softmax() = default;
 
     void clear_cache() override { output_cache_ = Tensor{}; }
+
+    std::vector<TensorRef> activation_cache() override
+    {
+        std::vector<TensorRef> r;
+        if (output_cache_.valid()) r.emplace_back(output_cache_);
+        return r;
+    }
 
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
@@ -1234,12 +1288,29 @@ public:
         attn_cache_ = Tensor{};
         m_cache_ = Tensor{};
         l_cache_ = Tensor{};
-        two_pass_mask_cache_ = Tensor{};
+        // 掩码（two_pass_mask_cache_ 等）小而常驻，不随激活清理
         w_q_.clear_cache();
         w_k_.clear_cache();
         w_v_.clear_cache();
         w_o_.clear_cache();
         softmax_.clear_cache();
+    }
+
+    std::vector<TensorRef> activation_cache() override
+    {
+        std::vector<TensorRef> r;
+        if (Q_cache_.valid()) r.emplace_back(Q_cache_);
+        if (K_cache_.valid()) r.emplace_back(K_cache_);
+        if (V_cache_.valid()) r.emplace_back(V_cache_);
+        if (attn_cache_.valid()) r.emplace_back(attn_cache_);
+        if (m_cache_.valid()) r.emplace_back(m_cache_);
+        if (l_cache_.valid()) r.emplace_back(l_cache_);
+        auto wq = w_q_.activation_cache(); r.insert(r.end(), wq.begin(), wq.end());
+        auto wk = w_k_.activation_cache(); r.insert(r.end(), wk.begin(), wk.end());
+        auto wv = w_v_.activation_cache(); r.insert(r.end(), wv.begin(), wv.end());
+        auto wo = w_o_.activation_cache(); r.insert(r.end(), wo.begin(), wo.end());
+        auto sm = softmax_.activation_cache(); r.insert(r.end(), sm.begin(), sm.end());
+        return r;
     }
 
     [[nodiscard]] Result<Tensor> forward(
@@ -1800,6 +1871,16 @@ public:
         swiglu_.clear_cache();
     }
 
+    std::vector<TensorRef> activation_cache() override
+    {
+        std::vector<TensorRef> r;
+        auto a = fc1_.activation_cache(); r.insert(r.end(), a.begin(), a.end());
+        auto b = fc2_.activation_cache(); r.insert(r.end(), b.begin(), b.end());
+        auto g = gelu_.activation_cache(); r.insert(r.end(), g.begin(), g.end());
+        auto s = swiglu_.activation_cache(); r.insert(r.end(), s.begin(), s.end());
+        return r;
+    }
+
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
@@ -1915,6 +1996,17 @@ public:
         ff_.clear_cache();
         norm2_.clear_cache();
         residual2_cache_ = Tensor{};
+    }
+
+    std::vector<TensorRef> activation_cache() override
+    {
+        std::vector<TensorRef> r;
+        auto a = self_attn_.activation_cache(); r.insert(r.end(), a.begin(), a.end());
+        auto n1 = norm1_.activation_cache(); r.insert(r.end(), n1.begin(), n1.end());
+        auto f = ff_.activation_cache(); r.insert(r.end(), f.begin(), f.end());
+        auto n2 = norm2_.activation_cache(); r.insert(r.end(), n2.begin(), n2.end());
+        if (residual2_cache_.valid()) r.emplace_back(residual2_cache_);
+        return r;
     }
 
     [[nodiscard]] Result<Tensor> forward(
@@ -2498,6 +2590,13 @@ private:
 
     Tensor residual2_cache_;
 
+    // ── activation offload（L1-offload）状态 ──
+    bool offload_enabled_ = false;      // GPTModel 是否启用 offload
+    bool offloaded_ = false;            // 当前激活是否已导出到 host
+    std::vector<TensorRef> offload_refs_;        // 需 offload 的缓存成员引用（稳定地址）
+    std::vector<Tensor> offload_handles_;        // host 句柄
+    std::vector<std::pair<std::size_t, std::size_t>> offload_shapes_;  // 各缓存形状
+
 public:
     GPTBlock(ComputeEngine& engine,
              std::size_t d_model, std::size_t num_heads,
@@ -2573,6 +2672,58 @@ public:
         residual2_cache_ = Tensor{};
     }
 
+    std::vector<TensorRef> activation_cache() override
+    {
+        std::vector<TensorRef> r;
+        auto a = self_attn_.activation_cache(); r.insert(r.end(), a.begin(), a.end());
+        auto n1 = norm1_->activation_cache(); r.insert(r.end(), n1.begin(), n1.end());
+        auto f = ff_.activation_cache(); r.insert(r.end(), f.begin(), f.end());
+        auto n2 = norm2_->activation_cache(); r.insert(r.end(), n2.begin(), n2.end());
+        if (residual2_cache_.valid()) r.emplace_back(residual2_cache_);
+        return r;
+    }
+
+    // ── activation offload（L1-offload）────────────────────────────────
+    void set_offload_enabled(bool enabled) { offload_enabled_ = enabled; }
+    [[nodiscard]] bool offload_enabled() const noexcept { return offload_enabled_; }
+
+    // 导出：把本块 backward 所需的中间激活逐个 offload 到 host，释放 GPU 显存。
+    // offload_refs_ 记录各缓存成员地址（forward 后成员地址稳定），导入时复用。
+    [[nodiscard]] Result<void> export_activations(ComputeEngine& engine)
+    {
+        if (!offload_enabled_ || offloaded_) return {};
+        offload_refs_ = activation_cache();
+        offload_handles_.clear();
+        offload_shapes_.clear();
+        for (auto& ref : offload_refs_)
+        {
+            if (!ref.get().valid()) continue;
+            auto h = engine.offload_store(ref.get());
+            if (!h) return std::unexpected(h.error());
+            offload_shapes_.push_back({ref.get().rows(), ref.get().cols()});
+            offload_handles_.push_back(std::move(*h));
+            ref.get() = Tensor{};  // 释放 GPU 版（数据已在 host）
+        }
+        offloaded_ = true;
+        return {};
+    }
+
+    // 导入：从 host 恢复激活到缓存成员（backward 前调用，替代重计算）
+    [[nodiscard]] Result<void> import_activations(ComputeEngine& engine)
+    {
+        if (!offloaded_) return {};
+        for (std::size_t i = 0; i < offload_handles_.size(); ++i)
+        {
+            auto t = engine.offload_load(offload_handles_[i],
+                                         offload_shapes_[i].first,
+                                         offload_shapes_[i].second);
+            if (!t) return std::unexpected(t.error());
+            offload_refs_[i].get() = std::move(*t);
+        }
+        offloaded_ = false;
+        return {};
+    }
+
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
@@ -2600,6 +2751,13 @@ public:
     [[nodiscard]] Result<Tensor> backward(
         ComputeEngine& engine, const Tensor& grad_output) override
     {
+        // activation offload：从 host 恢复激活再反向（替代重计算）
+        if (offloaded_)
+        {
+            auto im = import_activations(engine);
+            if (!im) return std::unexpected(im.error());
+        }
+
         auto grad_ff = ff_.backward(engine, grad_output);
         if (!grad_ff) return grad_ff;
         auto b_n2 = norm2_->backward(engine, *grad_ff);
@@ -2904,6 +3062,9 @@ private:
     std::size_t checkpoint_every_ = 0;
     std::vector<Tensor> checkpoint_inputs_;  // 各 checkpoint 块的输入 (d_model, batch*seq)
 
+    // activation offload（L1-offload）：把每块内部激活搬 host-visible，backward 拷回
+    bool activation_offload_ = false;
+
 public:
     GPTModel(ComputeEngine& engine,
              std::size_t vocab_size, std::size_t d_model, std::size_t seq_len,
@@ -3052,6 +3213,12 @@ public:
             auto r = blocks_[bi].forward(engine, x);
             if (!r) return r;
             x = std::move(*r);
+            // activation offload：forward 后把本块内部激活搬 host-visible，释放 GPU 显存
+            if (activation_offload_)
+            {
+                auto ex = blocks_[bi].export_activations(engine);
+                if (!ex) return std::unexpected(ex.error());
+            }
             // 按间隔 flush，将大录制拆分为多个小提交（防 TDR）
             if (flush_interval_ > 0 && (bi + 1) % flush_interval_ == 0 && bi + 1 < blocks_.size())
             {
@@ -3115,6 +3282,9 @@ public:
                 // 抵消检查点的显存收益）。非 checkpoint 模式下不清理。
                 if (checkpoint_every_ > 0)
                     blocks_[idx].clear_cache();
+                // activation offload：backward 后释放恢复的激活缓存（掩码常驻不清理）
+                if (activation_offload_)
+                    blocks_[idx].clear_cache();
                 if (flush_interval_ > 0 && (bi + 1) % flush_interval_ == 0 && bi + 1 < n)
                 {
                     auto fr = engine.flush_batch();
@@ -3154,6 +3324,16 @@ public:
     // 0 = 不启用（默认）。stride=1 时显存收益最大（仅保留块输入 + 单块激活）。
     void set_checkpoint_every(std::size_t stride) override { checkpoint_every_ = stride; }
     [[nodiscard]] std::size_t checkpoint_every() const noexcept { return checkpoint_every_; }
+
+    // ── activation offload（L1-offload）开关 ──
+    // 启用后：forward 把每块内部激活搬 host-visible（释放 device-local VRAM），
+    // backward 拷回再反向（不重算，FLOPs 保持 1.0×，代价是 PCIe 传输）。
+    void set_activation_offload(bool enabled) override
+    {
+        activation_offload_ = enabled;
+        for (auto& b : blocks_) b.set_offload_enabled(enabled);
+    }
+    [[nodiscard]] bool activation_offload() const noexcept { return activation_offload_; }
 
     // 梯度检查点：把模式传播给所有块与末级归一化/LM Head
     // （当本 GPTModel 整体作为 Model 的一层被置于 checkpoint 模式时生效）

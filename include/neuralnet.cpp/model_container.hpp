@@ -98,6 +98,15 @@ public:
             layer->set_checkpoint_every(stride);
     }
 
+    // ── activation offload（L1-offload）：把激活搬 host-visible ──
+    // 通过 Layer 基类虚函数分发：GPTModel override 生效，
+    // 其他层类型默认 no-op。
+    void set_activation_offload(bool enabled)
+    {
+        for (auto& layer : layers_)
+            layer->set_activation_offload(enabled);
+    }
+
     // ── 训练/推理模式切换：转发给各 Layer（BatchNorm 等需要区分） ──
     void set_training(bool training)
     {
