@@ -31,6 +31,9 @@
 
 #ifdef NN_HAS_VULKAN
 
+#include <cstdint>
+#include <optional>
+
 #include "compute_engine.hpp"
 #if __has_include("fused_registry.hpp")
 #include "fused_registry.hpp"
@@ -297,6 +300,143 @@ public:
             static_cast<float>(alpha));
         if (!r)
             return std::unexpected(r.error());
+        return Tensor::from_gpu(std::move(*r));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // matmul 融合原语（M4；GPU 融合 shader 不物化中间得分矩阵）
+    // ══════════════════════════════════════════════════════════════════════
+
+    [[nodiscard]] Result<Tensor> batched_matmul_reduce(
+        const Tensor& A, const Tensor& B, std::size_t batch,
+        ReduceOp op, bool transA, bool transB,
+        Scalar alpha, bool reduce_cols, const Tensor* mask) override
+    {
+        if (!reduce_cols)
+            return std::unexpected(Error{
+                "GpuEngine::batched_matmul_reduce: reduce_cols=false 未在 GPU 实现"
+                "（调用方回退 CPU/组合路径）"});
+        if (batch == 0)
+            return std::unexpected(Error{"batched_matmul_reduce: batch must be > 0"});
+        if (A.rows() % batch != 0 || B.rows() % batch != 0)
+            return std::unexpected(Error{"batched_matmul_reduce: rows not divisible by batch"});
+        const std::size_t a_rpb = A.rows() / batch;
+        const std::size_t b_rpb = B.rows() / batch;
+        const std::size_t M = transA ? A.cols() : a_rpb;
+        const std::size_t K = transA ? a_rpb : A.cols();
+        const std::size_t K2 = transB ? B.cols() : b_rpb;
+        const std::size_t N = transB ? b_rpb : B.cols();
+        if (K != K2)
+            return std::unexpected(Error{"batched_matmul_reduce: K dimension mismatch"});
+
+        auto a_gpu = ensure_gpu(A);
+        if (!a_gpu) return std::unexpected(a_gpu.error());
+        auto b_gpu = ensure_gpu(B);
+        if (!b_gpu) return std::unexpected(b_gpu.error());
+        std::optional<GpuTensor> mask_gpu;
+        GpuTensor* mask_ptr = nullptr;
+        if (mask)
+        {
+            auto mg = ensure_gpu(*mask);
+            if (!mg) return std::unexpected(mg.error());
+            mask_gpu = mg->gpu_tensor();
+            mask_ptr = &*mask_gpu;
+        }
+        auto r = backend_.bmm_reduce_gpu(
+            a_gpu->gpu_tensor(), b_gpu->gpu_tensor(), mask_ptr,
+            M, N, K, batch, static_cast<std::size_t>(op),
+            transA, transB, alpha);
+        if (!r) return std::unexpected(r.error());
+        return Tensor::from_gpu(std::move(*r));
+    }
+
+    [[nodiscard]] Result<Tensor> batched_matmul_softmax_denom(
+        const Tensor& A, const Tensor& B, const Tensor& row_max,
+        std::size_t batch, bool transA, bool transB, Scalar alpha,
+        const Tensor* mask) override
+    {
+        if (batch == 0)
+            return std::unexpected(Error{"batched_matmul_softmax_denom: batch must be > 0"});
+        if (A.rows() % batch != 0 || B.rows() % batch != 0)
+            return std::unexpected(Error{"batched_matmul_softmax_denom: rows not divisible by batch"});
+        const std::size_t a_rpb = A.rows() / batch;
+        const std::size_t b_rpb = B.rows() / batch;
+        const std::size_t M = transA ? A.cols() : a_rpb;
+        const std::size_t K = transA ? a_rpb : A.cols();
+        const std::size_t K2 = transB ? B.cols() : b_rpb;
+        const std::size_t N = transB ? b_rpb : B.cols();
+        if (K != K2)
+            return std::unexpected(Error{"batched_matmul_softmax_denom: K dimension mismatch"});
+
+        auto a_gpu = ensure_gpu(A);
+        if (!a_gpu) return std::unexpected(a_gpu.error());
+        auto b_gpu = ensure_gpu(B);
+        if (!b_gpu) return std::unexpected(b_gpu.error());
+        auto m_gpu = ensure_gpu(row_max);
+        if (!m_gpu) return std::unexpected(m_gpu.error());
+        std::optional<GpuTensor> mask_gpu;
+        GpuTensor* mask_ptr = nullptr;
+        if (mask)
+        {
+            auto mg = ensure_gpu(*mask);
+            if (!mg) return std::unexpected(mg.error());
+            mask_gpu = mg->gpu_tensor();
+            mask_ptr = &*mask_gpu;
+        }
+        auto r = backend_.bmm_denom_gpu(
+            a_gpu->gpu_tensor(), b_gpu->gpu_tensor(), mask_ptr,
+            m_gpu->gpu_tensor(), M, N, K, batch, transA, transB, alpha);
+        if (!r) return std::unexpected(r.error());
+        return Tensor::from_gpu(std::move(*r));
+    }
+
+    [[nodiscard]] Result<Tensor> batched_matmul_softmax_apply(
+        const Tensor& A, const Tensor& B, const Tensor& V,
+        const Tensor& row_max, const Tensor& denom,
+        std::size_t batch, bool transA, bool transB, Scalar alpha,
+        const Tensor* mask) override
+    {
+        if (batch == 0)
+            return std::unexpected(Error{"batched_matmul_softmax_apply: batch must be > 0"});
+        if (A.rows() % batch != 0 || B.rows() % batch != 0 || V.rows() % batch != 0)
+            return std::unexpected(Error{"batched_matmul_softmax_apply: rows not divisible by batch"});
+        const std::size_t a_rpb = A.rows() / batch;
+        const std::size_t b_rpb = B.rows() / batch;
+        const std::size_t M = transA ? A.cols() : a_rpb;
+        const std::size_t K = transA ? a_rpb : A.cols();
+        const std::size_t K2 = transB ? B.cols() : b_rpb;
+        const std::size_t N = transB ? b_rpb : B.cols();
+        const std::size_t Nv = V.rows() / batch;
+        const std::size_t D = V.cols();
+        if (K != K2)
+            return std::unexpected(Error{"batched_matmul_softmax_apply: K dimension mismatch"});
+        if (Nv != N)
+            return std::unexpected(Error{"batched_matmul_softmax_apply: V rows per batch != N"});
+
+        auto a_gpu = ensure_gpu(A);
+        if (!a_gpu) return std::unexpected(a_gpu.error());
+        auto b_gpu = ensure_gpu(B);
+        if (!b_gpu) return std::unexpected(b_gpu.error());
+        auto v_gpu = ensure_gpu(V);
+        if (!v_gpu) return std::unexpected(v_gpu.error());
+        auto m_gpu = ensure_gpu(row_max);
+        if (!m_gpu) return std::unexpected(m_gpu.error());
+        auto l_gpu = ensure_gpu(denom);
+        if (!l_gpu) return std::unexpected(l_gpu.error());
+        std::optional<GpuTensor> mask_gpu;
+        GpuTensor* mask_ptr = nullptr;
+        if (mask)
+        {
+            auto mg = ensure_gpu(*mask);
+            if (!mg) return std::unexpected(mg.error());
+            mask_gpu = mg->gpu_tensor();
+            mask_ptr = &*mask_gpu;
+        }
+        auto r = backend_.bmm_apply_gpu(
+            a_gpu->gpu_tensor(), b_gpu->gpu_tensor(), mask_ptr,
+            m_gpu->gpu_tensor(), l_gpu->gpu_tensor(), v_gpu->gpu_tensor(),
+            M, N, K, D, batch, transA, transB, alpha);
+        if (!r) return std::unexpected(r.error());
         return Tensor::from_gpu(std::move(*r));
     }
 

@@ -231,6 +231,27 @@ public:
         return out;
     }
 
+    // ── matmul 融合原语（M4）：CUDA 尚未实现，返回错误（调用方回退 CPU/组合路径） ──
+    [[nodiscard]] Result<Tensor> batched_matmul_reduce(
+        const Tensor&, const Tensor&, std::size_t,
+        ReduceOp, bool, bool, Scalar, bool, const Tensor*) override
+    {
+        return std::unexpected(Error{"CudaEngine: batched_matmul_reduce 未实现"});
+    }
+    [[nodiscard]] Result<Tensor> batched_matmul_softmax_denom(
+        const Tensor&, const Tensor&, const Tensor&,
+        std::size_t, bool, bool, Scalar, const Tensor*) override
+    {
+        return std::unexpected(Error{"CudaEngine: batched_matmul_softmax_denom 未实现"});
+    }
+    [[nodiscard]] Result<Tensor> batched_matmul_softmax_apply(
+        const Tensor&, const Tensor&, const Tensor&,
+        const Tensor&, const Tensor&,
+        std::size_t, bool, bool, Scalar, const Tensor*) override
+    {
+        return std::unexpected(Error{"CudaEngine: batched_matmul_softmax_apply 未实现"});
+    }
+
     // A += B
     [[nodiscard]] Result<void> add_inplace(Tensor& A, const Tensor& B) override
     {

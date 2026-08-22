@@ -418,6 +418,286 @@ public:
         return Tensor::from_matrix(std::move(result));
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    // matmul 融合原语（M4，CPU 参考实现；先正确后优化）
+    // ══════════════════════════════════════════════════════════════════════
+
+    // 批量 matmul + 沿输出维度归约（可选掩码）
+    [[nodiscard]] Result<Tensor> batched_matmul_reduce(
+        const Tensor& A, const Tensor& B, std::size_t batch,
+        ReduceOp op, bool transA, bool transB,
+        Scalar alpha, bool reduce_cols, const Tensor* mask) override
+    {
+        if (A.is_gpu() || B.is_gpu())
+            return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+        if (batch == 0)
+            return std::unexpected(Error{"batched_matmul_reduce: batch must be > 0"});
+        const Matrix& a = A.cpu_matrix();
+        const Matrix& b = B.cpu_matrix();
+        if (a.rows() % batch != 0 || b.rows() % batch != 0)
+            return std::unexpected(Error{"batched_matmul_reduce: rows not divisible by batch"});
+        const std::size_t a_rpb = a.rows() / batch;
+        const std::size_t b_rpb = b.rows() / batch;
+        const std::size_t M = transA ? a.cols() : a_rpb;
+        const std::size_t K = transA ? a_rpb : a.cols();
+        const std::size_t K2 = transB ? b.cols() : b_rpb;
+        const std::size_t N = transB ? b_rpb : b.cols();
+        if (K != K2)
+            return std::unexpected(Error{"batched_matmul_reduce: K dimension mismatch"});
+        if (mask && (mask->rows() != M || mask->cols() != N))
+            return std::unexpected(Error{"batched_matmul_reduce: mask shape mismatch"});
+
+        const auto a_span = a.span();
+        const auto b_span = b.span();
+
+        // 逐点 dot（batch b，输出行 i，输出列 j）；A 批量步长 = M*K，B = K*N
+        const auto dot_ab = [&](std::size_t b, std::size_t i, std::size_t j) -> Scalar
+        {
+            Scalar s = Scalar{0};
+            const std::size_t abase = b * M * K;
+            const std::size_t bbase = b * K * N;
+            for (std::size_t k = 0; k < K; ++k)
+            {
+                const Scalar av = !transA
+                    ? a_span[abase + i * K + k]
+                    : a_span[abase + k * M + i];
+                const Scalar bv = !transB
+                    ? b_span[bbase + k * N + j]
+                    : b_span[bbase + j * K + k];
+                s += av * bv;
+            }
+            return s;
+        };
+        const auto init_val = [&](ReduceOp r) -> Scalar
+        {
+            if (r == ReduceOp::Max) return std::numeric_limits<Scalar>::lowest();
+            if (r == ReduceOp::Min) return std::numeric_limits<Scalar>::max();
+            return Scalar{0};
+        };
+        const auto combine = [&](ReduceOp r, Scalar acc, Scalar v) -> Scalar
+        {
+            if (r == ReduceOp::Max) return std::max(acc, v);
+            if (r == ReduceOp::Min) return std::min(acc, v);
+            return acc + v;
+        };
+        const bool masked_skip = (op == ReduceOp::Sum || op == ReduceOp::Min);
+
+        if (reduce_cols)
+        {
+            // 每 batch 输出 (M, 1)：C_b[i] = reduce_j(...)
+            Matrix result(batch * M, 1);
+            auto out = result.span();
+            for (std::size_t b = 0; b < batch; ++b)
+            {
+                for (std::size_t i = 0; i < M; ++i)
+                {
+                    Scalar acc = init_val(op);
+                    for (std::size_t j = 0; j < N; ++j)
+                    {
+                        Scalar mv = Scalar{0};
+                        if (mask) mv = mask->cpu_matrix().at_unchecked(i, j);
+                        if (masked_skip && mv == -std::numeric_limits<Scalar>::infinity())
+                            continue;
+                        const Scalar s = alpha * dot_ab(b, i, j) + mv;
+                        acc = combine(op, acc, s);
+                    }
+                    out[b * M + i] = acc;
+                }
+            }
+            return Tensor::from_matrix(std::move(result));
+        }
+        // 沿输出行归约：每 batch 输出 (1, N)：C_b[j] = reduce_i(...)
+        {
+            Matrix result(batch, N);
+            auto out = result.span();
+            for (std::size_t b = 0; b < batch; ++b)
+            {
+                for (std::size_t j = 0; j < N; ++j)
+                {
+                    Scalar acc = init_val(op);
+                    for (std::size_t i = 0; i < M; ++i)
+                    {
+                        Scalar mv = Scalar{0};
+                        if (mask) mv = mask->cpu_matrix().at_unchecked(i, j);
+                        if (masked_skip && mv == -std::numeric_limits<Scalar>::infinity())
+                            continue;
+                        const Scalar s = alpha * dot_ab(b, i, j) + mv;
+                        acc = combine(op, acc, s);
+                    }
+                    out[b * N + j] = acc;
+                }
+            }
+            return Tensor::from_matrix(std::move(result));
+        }
+    }
+
+    // 批量 matmul + 减行 max → exp → 沿输出列求和（softmax 分母）
+    [[nodiscard]] Result<Tensor> batched_matmul_softmax_denom(
+        const Tensor& A, const Tensor& B, const Tensor& row_max,
+        std::size_t batch, bool transA, bool transB, Scalar alpha,
+        const Tensor* mask) override
+    {
+        if (A.is_gpu() || B.is_gpu())
+            return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+        if (batch == 0)
+            return std::unexpected(Error{"batched_matmul_softmax_denom: batch must be > 0"});
+        const Matrix& a = A.cpu_matrix();
+        const Matrix& b = B.cpu_matrix();
+        const Matrix& m = row_max.cpu_matrix();
+        if (a.rows() % batch != 0 || b.rows() % batch != 0)
+            return std::unexpected(Error{"batched_matmul_softmax_denom: rows not divisible by batch"});
+        const std::size_t a_rpb = a.rows() / batch;
+        const std::size_t b_rpb = b.rows() / batch;
+        const std::size_t M = transA ? a.cols() : a_rpb;
+        const std::size_t K = transA ? a_rpb : a.cols();
+        const std::size_t K2 = transB ? b.cols() : b_rpb;
+        const std::size_t N = transB ? b_rpb : b.cols();
+        if (K != K2)
+            return std::unexpected(Error{"batched_matmul_softmax_denom: K dimension mismatch"});
+        if (m.rows() != batch * M || m.cols() != 1)
+            return std::unexpected(Error{"batched_matmul_softmax_denom: row_max shape mismatch"});
+        if (mask && (mask->rows() != M || mask->cols() != N))
+            return std::unexpected(Error{"batched_matmul_softmax_denom: mask shape mismatch"});
+
+        const auto a_span = a.span();
+        const auto b_span = b.span();
+        const auto m_span = m.span();
+        const auto dot_ab = [&](std::size_t bi, std::size_t i, std::size_t j) -> Scalar
+        {
+            Scalar s = Scalar{0};
+            const std::size_t abase = bi * M * K;
+            const std::size_t bbase = bi * K * N;
+            for (std::size_t k = 0; k < K; ++k)
+            {
+                const Scalar av = !transA
+                    ? a_span[abase + i * K + k]
+                    : a_span[abase + k * M + i];
+                const Scalar bv = !transB
+                    ? b_span[bbase + k * N + j]
+                    : b_span[bbase + j * K + k];
+                s += av * bv;
+            }
+            return s;
+        };
+
+        Matrix result(batch * M, 1);
+        auto out = result.span();
+        for (std::size_t b = 0; b < batch; ++b)
+        {
+            for (std::size_t i = 0; i < M; ++i)
+            {
+                const Scalar mval = m_span[b * M + i];
+                Scalar acc = Scalar{0};
+                for (std::size_t j = 0; j < N; ++j)
+                {
+                    Scalar mv = Scalar{0};
+                    if (mask) mv = mask->cpu_matrix().at_unchecked(i, j);
+                    if (mv == -std::numeric_limits<Scalar>::infinity())
+                        continue;  // 屏蔽列贡献 0
+                    const Scalar s = alpha * dot_ab(b, i, j) + mv - mval;
+                    acc += std::exp(s);
+                }
+                out[b * M + i] = acc;
+            }
+        }
+        return Tensor::from_matrix(std::move(result));
+    }
+
+    // 批量 matmul + 行 softmax 归一化后与 V 相乘累加（两趟式注意力 Pass 2）
+    [[nodiscard]] Result<Tensor> batched_matmul_softmax_apply(
+        const Tensor& A, const Tensor& B, const Tensor& V,
+        const Tensor& row_max, const Tensor& denom,
+        std::size_t batch, bool transA, bool transB, Scalar alpha,
+        const Tensor* mask) override
+    {
+        if (A.is_gpu() || B.is_gpu() || V.is_gpu())
+            return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+        if (batch == 0)
+            return std::unexpected(Error{"batched_matmul_softmax_apply: batch must be > 0"});
+        const Matrix& a = A.cpu_matrix();
+        const Matrix& b = B.cpu_matrix();
+        const Matrix& v = V.cpu_matrix();
+        const Matrix& m = row_max.cpu_matrix();
+        const Matrix& l = denom.cpu_matrix();
+        if (a.rows() % batch != 0 || b.rows() % batch != 0 || v.rows() % batch != 0)
+            return std::unexpected(Error{"batched_matmul_softmax_apply: rows not divisible by batch"});
+        const std::size_t a_rpb = a.rows() / batch;
+        const std::size_t b_rpb = b.rows() / batch;
+        const std::size_t M = transA ? a.cols() : a_rpb;
+        const std::size_t K = transA ? a_rpb : a.cols();
+        const std::size_t K2 = transB ? b.cols() : b_rpb;
+        const std::size_t N = transB ? b_rpb : b.cols();
+        if (K != K2)
+            return std::unexpected(Error{"batched_matmul_softmax_apply: K dimension mismatch"});
+        // V 每 batch (N, D)
+        const std::size_t Nv = v.rows() / batch;
+        const std::size_t D = v.cols();
+        if (Nv != N)
+            return std::unexpected(Error{"batched_matmul_softmax_apply: V rows per batch != N"});
+        if (m.rows() != batch * M || m.cols() != 1)
+            return std::unexpected(Error{"batched_matmul_softmax_apply: row_max shape mismatch"});
+        if (l.rows() != batch * M || l.cols() != 1)
+            return std::unexpected(Error{"batched_matmul_softmax_apply: denom shape mismatch"});
+        if (mask && (mask->rows() != M || mask->cols() != N))
+            return std::unexpected(Error{"batched_matmul_softmax_apply: mask shape mismatch"});
+
+        const auto a_span = a.span();
+        const auto b_span = b.span();
+        const auto v_span = v.span();
+        const auto m_span = m.span();
+        const auto l_span = l.span();
+        const auto dot_ab = [&](std::size_t bi, std::size_t i, std::size_t j) -> Scalar
+        {
+            Scalar s = Scalar{0};
+            const std::size_t abase = bi * M * K;
+            const std::size_t bbase = bi * K * N;
+            for (std::size_t k = 0; k < K; ++k)
+            {
+                const Scalar av = !transA
+                    ? a_span[abase + i * K + k]
+                    : a_span[abase + k * M + i];
+                const Scalar bv = !transB
+                    ? b_span[bbase + k * N + j]
+                    : b_span[bbase + j * K + k];
+                s += av * bv;
+            }
+            return s;
+        };
+
+        Matrix result(batch * M, D);
+        auto out = result.span();
+        for (std::size_t b = 0; b < batch; ++b)
+        {
+            for (std::size_t i = 0; i < M; ++i)
+            {
+                const Scalar mval = m_span[b * M + i];
+                const Scalar inv_l = Scalar{1} / l_span[b * M + i];
+                // 预计算该行所有 W_ij（N 个标量，行级缓存）
+                std::vector<Scalar> w(N);
+                for (std::size_t j = 0; j < N; ++j)
+                {
+                    Scalar mv = Scalar{0};
+                    if (mask) mv = mask->cpu_matrix().at_unchecked(i, j);
+                    if (mv == -std::numeric_limits<Scalar>::infinity())
+                    {
+                        w[j] = Scalar{0};
+                        continue;
+                    }
+                    const Scalar s = alpha * dot_ab(b, i, j) + mv - mval;
+                    w[j] = std::exp(s) * inv_l;
+                }
+                for (std::size_t k = 0; k < D; ++k)
+                {
+                    Scalar acc = Scalar{0};
+                    for (std::size_t j = 0; j < N; ++j)
+                        acc += w[j] * v_span[(b * N + j) * D + k];
+                    out[(b * M + i) * D + k] = acc;
+                }
+            }
+        }
+        return Tensor::from_matrix(std::move(result));
+    }
+
     [[nodiscard]] Result<void> add_inplace(Tensor& A, const Tensor& B) override
     {
         if (A.rows() != B.rows() || A.cols() != B.cols())
