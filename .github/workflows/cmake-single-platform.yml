@@ -45,10 +45,13 @@ jobs:
     - name: Install Vulkan SDK (Linux)
       if: runner.os == 'Linux'
       run: |
+        # 官方 LunarG 仓库。自建 keyring 并显式 signed-by，确保 apt 能找到公钥
+        # （不再依赖 apt-key，也避免 LunarG .list 未指向 keyring 导致 NO_PUBKEY）
+        sudo install -m 0755 -d /etc/apt/keyrings
         wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | \
-          sudo gpg --dearmor -o /usr/share/keyrings/lunarg-signing-key-pub.gpg
-        sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-$(lsb_release -cs).list \
-          https://packages.lunarg.com/vulkan/lunarg-vulkan-$(lsb_release -cs).list
+          sudo gpg --dearmor -o /etc/apt/keyrings/lunarg.gpg
+        echo "deb [signed-by=/etc/apt/keyrings/lunarg.gpg] https://packages.lunarg.com/vulkan $(lsb_release -cs) main" | \
+          sudo tee /etc/apt/sources.list.d/lunarg-vulkan.list
         sudo apt-get update
         sudo apt-get install -y vulkan-sdk
         glslc --version
@@ -71,7 +74,10 @@ jobs:
       shell: pwsh
       run: |
         $exe = "$env:TEMP\vulkan_sdk.exe"
-        Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan_sdk.exe" -OutFile $exe
+        # 用 curl.exe 下载（Invoke-WebRequest 对大文件易超时被取消），带重试；
+        # --fail 让 HTTP 错误码直接失败，避免写入错误页
+        curl.exe -L --fail --retry 5 --retry-delay 5 --retry-all-errors -o $exe "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan_sdk.exe"
+        if (-not (Test-Path $exe)) { throw "Vulkan SDK download failed" }
         # 官方无人值守安装（新版安装器废弃了旧的 /S 参数）
         Start-Process -FilePath $exe -ArgumentList "--accept-licenses","--default-answer","--confirm-command","install" -Wait
         # 定位已安装的 Vulkan SDK 目录（安装器把 VULKAN_SDK 设为 C:\VulkanSDK\<version>，
