@@ -42,20 +42,24 @@ jobs:
         # libc++（LLVM 标准库）：对 C++26 range 迭代器的处理比默认 libstdc++ 更标准
         sudo apt-get install -y ninja-build p7zip-full libc++-dev libc++abi-dev
 
-    # ========== Linux: 安装 Vulkan SDK（LunarG apt 源，含 glslc）==========
+    # ========== Linux: 安装 Vulkan SDK（官方 tar 包；Ubuntu 26.04 无 LunarG apt 源）==========
     - name: Install Vulkan SDK (Linux)
       if: runner.os == 'Linux'
       run: |
-        # 官方 LunarG 仓库。自建 keyring 并显式 signed-by，确保 apt 能找到公钥
-        # （不再依赖 apt-key，也避免 LunarG .list 未指向 keyring 导致 NO_PUBKEY）
-        sudo install -m 0755 -d /etc/apt/keyrings
-        wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | \
-          sudo gpg --dearmor -o /etc/apt/keyrings/lunarg.gpg
-        echo "deb [signed-by=/etc/apt/keyrings/lunarg.gpg] https://packages.lunarg.com/vulkan $(lsb_release -cs) main" | \
-          sudo tee /etc/apt/sources.list.d/lunarg-vulkan.list
-        sudo apt-get update
-        sudo apt-get install -y vulkan-sdk
-        glslc --version
+        # Ubuntu 26.04 (resolute) 的 LunarG apt 仓库不存在（404），改用官方 tar.xz。
+        # 解压后为 1.x.yy.z/x86_64，内含 bin(含 glslc)/include/lib。
+        # 注：Linux 无 "latest" 下载端点（404），固定用官方版本号 URL（LunarG 保留旧版本）。
+        cd "$HOME"
+        curl -L --fail --retry 5 --retry-delay 5 --retry-all-errors \
+          -o vulkansdk.tar.xz \
+          "https://sdk.lunarg.com/sdk/download/1.4.357.0/linux/vulkansdk-linux-x86_64-1.4.357.0.tar.xz"
+        tar xf vulkansdk.tar.xz
+        SDK_DIR="$(ls -d "$HOME"/1.*/x86_64 2>/dev/null | head -n1)"
+        if [ -z "$SDK_DIR" ]; then echo "SDK extract dir not found"; exit 1; fi
+        # 供后续步骤使用：find_package(Vulkan) 读 VULKAN_SDK，PATH 找到 glslc
+        echo "VULKAN_SDK=$SDK_DIR" >> "$GITHUB_ENV"
+        echo "$SDK_DIR/bin" >> "$GITHUB_PATH"
+        "$SDK_DIR/bin/glslc" --version
 
     # ========== Windows: 安装 LLVM Clang + Ninja ==========
     - name: Install Clang & Ninja (Windows)
