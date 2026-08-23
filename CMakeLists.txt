@@ -2,9 +2,20 @@
 cmake_minimum_required(VERSION 3.30)
 project(neuralnet.cpp VERSION 1.0.0 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 26)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+# ── C++26 标准 ──────────────────────────────────────────────────────────
+# CMake 4.3 尚未内置 MSVC 的 CXX26 方言标志映射（VS2026 cl 19.51 也不认
+# /std:c++26，C++26 特性走 /std:c++latest），故对 MSVC 用 CMAKE_CXX_STANDARD=23
+# 让方言探测通过，再显式传 /std:c++latest。Clang/GCC 走标准 CMAKE_CXX_STANDARD=26。
+if(MSVC)
+    set(CMAKE_CXX_STANDARD 23)
+    set(CMAKE_CXX_STANDARD_REQUIRED OFF)
+    set(CMAKE_CXX_EXTENSIONS OFF)
+    add_compile_options(/std:c++latest)
+else()
+    set(CMAKE_CXX_STANDARD 26)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_CXX_EXTENSIONS OFF)
+endif()
 
 # ── 默认 Release 模式，可通过 -DCMAKE_BUILD_TYPE=Debug 切换 ────────────────
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -12,9 +23,15 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 # ── 公共编译标志 ─────────────────────────────────────────────────────────
-# -fno-exceptions: 项目规范禁止异常，编译器层面强制执行
-# -Wall -Wextra -Wpedantic -Werror: 严格警告
-add_compile_options(-fno-exceptions -Wall -Wextra -Wpedantic -Werror)
+# 项目规范：禁止异常、开启严格警告。按编译器选择对应标志：
+# - Clang/GCC：-fno-exceptions -Wall -Wextra -Wpedantic -Werror
+# - MSVC：     /W4 /permissive-（严格一致性）；保留 /EHsc（ppltasks.h 需要），
+#              不强制 /WX（MSVC 与 clang 警告集不同，代码未按 MSVC 零警告编写）
+if(MSVC)
+    add_compile_options(/W4 /permissive-)
+else()
+    add_compile_options(-fno-exceptions -Wall -Wextra -Wpedantic -Werror)
+endif()
 
 # ── 编译器特有选项 ───────────────────────────────────────────────────────
 # -fexperimental-library 仅 Clang 识别；GCC 不识别会产生警告
@@ -26,8 +43,14 @@ endif()
 # Release: -O3 -funroll-loops -march=native（最大性能）
 # Debug:   -O0 -g（调试优先）
 # 注意：不使用 -ffast-math，因为它会禁用 NaN/Infinity 支持，影响训练稳定性
-set(RELEASE_FLAGS -O3 -fno-math-errno -fno-trapping-math -funroll-loops -march=native)
-set(DEBUG_FLAGS -O0 -g)
+# MSVC 用 /O2 /fp:fast（近似 -O3 + 宽松浮点）；Clang/GCC 用 -O3 + 向量化。
+if(MSVC)
+    set(RELEASE_FLAGS /O2 /fp:fast)
+    set(DEBUG_FLAGS /Od /Zi)
+else()
+    set(RELEASE_FLAGS -O3 -fno-math-errno -fno-trapping-math -funroll-loops -march=native)
+    set(DEBUG_FLAGS -O0 -g)
+endif()
 
 add_compile_options(
     "$<$<CONFIG:Release>:${RELEASE_FLAGS}>"

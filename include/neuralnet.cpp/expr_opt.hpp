@@ -182,7 +182,7 @@ namespace nn
     std::vector<std::optional<ExprOperand>> replace(spec.num_regs);
     // 定义 r 的指令（化简后）的 op 与 a 操作数（用于 neg(neg(x)) 化简）
     std::vector<ExprOp>   def_op(spec.num_regs, ExprOp::Add);
-    std::vector<ExprOperand> def_a(spec.num_regs, {});
+    std::vector<ExprOperand> def_a(spec.num_regs, ExprOperand{});
 
     const auto remap_op = [&](const ExprOperand& op) -> ExprOperand
     {

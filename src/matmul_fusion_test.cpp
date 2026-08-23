@@ -486,9 +486,11 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
     return fail;
 }
 
+#ifdef NN_HAS_VULKAN
 // ── 组合偏置（AttnBias：causal + doc_ids + ALiBi slopes）CPU vs GPU 一致性 ──
 // 覆盖两趟式原语的通用偏置描述子（M7 统一位置编码路径）：5 个原语分别跑在
 // CPU / GPU，比较输出（GPU shader 与 CPU attn_bias_at 参考应一致）。
+// 注：仅在 NN_HAS_VULKAN 下编译，因为函数签名引用 nn::GpuEngine（Vulkan 专属）。
 int run_compositional_bias(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
 {
     int fail = 0;
@@ -558,6 +560,7 @@ int run_compositional_bias(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
     }
     return fail;
 }
+#endif  // NN_HAS_VULKAN
 
 int main()
 {
