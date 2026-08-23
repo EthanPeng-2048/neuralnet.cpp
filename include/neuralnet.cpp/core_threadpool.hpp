@@ -17,6 +17,14 @@
 
 #include "core_assert.hpp"
 
+// ── CPU pause 自旋原语：GCC/Clang 用 __builtin_ia32_pause，MSVC 用 _mm_pause ──
+#if defined(_MSC_VER)
+#include <immintrin.h>
+#define NN_CPU_PAUSE() _mm_pause()
+#else
+#define NN_CPU_PAUSE() __builtin_ia32_pause()
+#endif
+
 namespace nn
 {
     // ── 简易线程池（latch 零分配设计）──────────────────────────────────────
@@ -114,7 +122,7 @@ namespace nn
                 if (latch.load(std::memory_order_acquire) == 0)
                     return;
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-                __builtin_ia32_pause();
+                NN_CPU_PAUSE();
 #endif
             }
 
@@ -139,7 +147,7 @@ namespace nn
                         if (latch.load(std::memory_order_acquire) == 0)
                             return;
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-                        __builtin_ia32_pause();
+                        NN_CPU_PAUSE();
 #endif
                     }
                 }
