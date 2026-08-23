@@ -170,7 +170,7 @@ namespace nn
         template<typename Iterator, typename Func>
         void parallel_for_each(Iterator first, Iterator last, Func&& func)
         {
-            const auto total = static_cast<std::size_t>(std::distance(first, last));
+            const auto total = static_cast<std::size_t>(std::ranges::distance(first, last));
             if (total == 0) return;
 
             const auto n_chunks = chunk_count(total);
@@ -233,7 +233,7 @@ namespace nn
         template<typename Iterator, typename Func>
         void parallel_for_blocks(Iterator first, Iterator last, Func&& func)
         {
-            const auto total = static_cast<std::size_t>(std::distance(first, last));
+            const auto total = static_cast<std::size_t>(std::ranges::distance(first, last));
             if (total <= 1)
             {
                 for (auto it = first; it != last; ++it)
@@ -336,7 +336,7 @@ namespace nn
         template<typename InputIt, typename OutputIt, typename UnaryOp>
         void parallel_transform(InputIt first, InputIt last, OutputIt d_first, UnaryOp&& op)
         {
-            const auto total = static_cast<std::size_t>(std::distance(first, last));
+            const auto total = static_cast<std::size_t>(std::ranges::distance(first, last));
             if (total == 0) return;
 
             const auto n_chunks = chunk_count(total);
@@ -396,7 +396,7 @@ namespace nn
         void parallel_transform(InputIt1 first1, InputIt1 last1, InputIt2 first2,
                                 OutputIt d_first, BinaryOp&& op)
         {
-            const auto total = static_cast<std::size_t>(std::distance(first1, last1));
+            const auto total = static_cast<std::size_t>(std::ranges::distance(first1, last1));
             if (total == 0) return;
 
             const auto n_chunks = chunk_count(total);
@@ -461,7 +461,7 @@ namespace nn
         T parallel_transform_reduce(InputIt first, InputIt last, T init,
                                     BinaryOp&& reduce_op, UnaryOp&& transform_op)
         {
-            const auto total = static_cast<std::size_t>(std::distance(first, last));
+            const auto total = static_cast<std::size_t>(std::ranges::distance(first, last));
             if (total == 0) return init;
 
             const auto n_chunks = chunk_count(total);
@@ -528,7 +528,7 @@ namespace nn
         T parallel_transform_reduce(InputIt1 first1, InputIt1 last1, InputIt2 first2,
                                     T init, BinaryOp&& reduce_op, UnaryOp&& transform_op)
         {
-            const auto total = static_cast<std::size_t>(std::distance(first1, last1));
+            const auto total = static_cast<std::size_t>(std::ranges::distance(first1, last1));
             if (total == 0) return init;
 
             const auto n_chunks = chunk_count(total);

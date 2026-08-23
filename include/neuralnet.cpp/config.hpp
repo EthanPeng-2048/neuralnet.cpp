@@ -51,7 +51,7 @@ namespace nn
     template<typename Iterator, typename Func>
     inline void for_each(Iterator first, Iterator last, Func&& func)
     {
-        const auto n = static_cast<std::size_t>(std::distance(first, last));
+        const auto n = static_cast<std::size_t>(std::ranges::distance(first, last));
         if (n >= PARALLEL_THRESHOLD)
         {
             global_thread_pool().parallel_for_each(first, last, std::forward<Func>(func));
@@ -67,7 +67,7 @@ namespace nn
     template<typename InputIt, typename OutputIt, typename UnaryOp>
     inline void transform(InputIt first, InputIt last, OutputIt d_first, UnaryOp&& op)
     {
-        const auto n = static_cast<std::size_t>(std::distance(first, last));
+        const auto n = static_cast<std::size_t>(std::ranges::distance(first, last));
         if (n >= PARALLEL_THRESHOLD)
         {
             global_thread_pool().parallel_transform(first, last, d_first, std::forward<UnaryOp>(op));
@@ -84,7 +84,7 @@ namespace nn
     inline void transform(InputIt1 first1, InputIt1 last1, InputIt2 first2,
                           OutputIt d_first, BinaryOp&& op)
     {
-        const auto n = static_cast<std::size_t>(std::distance(first1, last1));
+        const auto n = static_cast<std::size_t>(std::ranges::distance(first1, last1));
         if (n >= PARALLEL_THRESHOLD)
         {
             global_thread_pool().parallel_transform(first1, last1, first2, d_first,
@@ -102,7 +102,7 @@ namespace nn
     inline T transform_reduce(InputIt first, InputIt last, T init,
                               BinaryReduceOp&& reduce_op, UnaryTransformOp&& transform_op)
     {
-        const auto n = static_cast<std::size_t>(std::distance(first, last));
+        const auto n = static_cast<std::size_t>(std::ranges::distance(first, last));
         if (n >= PARALLEL_THRESHOLD)
         {
             return global_thread_pool().parallel_transform_reduce(
@@ -126,7 +126,7 @@ namespace nn
                               T init, BinaryReduceOp&& reduce_op,
                               BinaryTransformOp&& transform_op)
     {
-        const auto n = static_cast<std::size_t>(std::distance(first1, last1));
+        const auto n = static_cast<std::size_t>(std::ranges::distance(first1, last1));
         if (n >= PARALLEL_THRESHOLD)
         {
             return global_thread_pool().parallel_transform_reduce(
