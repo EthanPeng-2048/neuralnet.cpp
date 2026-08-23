@@ -945,17 +945,15 @@ int main(int argc, char *argv[])
         std::cout << "梯度检查点已启用: 每 " << cfg.checkpoint_every << " 个 block 重算一次\n";
 
     // ── 设置 activation offload（L1-offload） ──
-    // offload 与 checkpoint 互斥（offload 用 PCIe 换显存、不重算，更省计算；
-    // 共享显存架构下 offload 的 host slab 仍占同一预算，checkpoint 更省）
+    // 与 checkpoint 可共存（混合模式）：每 checkpoint_every_ 个 block 走重算
+    // （不驻留激活），其余 block 走 offload（激活搬 host-visible 不重算）。
+    // 兼顾：checkpoint 块省显存但 FLOPs 2×；offload 块省显存但 PCIe 开销。
     if (cfg.activation_offload)
     {
-        if (cfg.checkpoint_every > 0)
-        {
-            std::cout << "⚠ --activation-offload 与 --checkpoint-every 互斥，已禁用 checkpoint\n";
-            model.set_checkpoint_every(0);
-        }
         model.set_activation_offload(true);
         std::cout << "activation offload 已启用: 每块激活搬 host-visible，backward 拷回（不重算）\n";
+        if (cfg.checkpoint_every > 0)
+            std::cout << "  （混合模式）与 checkpoint 共存：checkpoint 块重算，其余块 offload\n";
         std::cout << "  理论 offload RAM: " << (model.offload_ram_bytes() / (1024*1024))
                   << " MB（实际含驱动/对齐可能更高）\n";
     }
@@ -1291,6 +1289,12 @@ int main(int argc, char *argv[])
                 }
                 return 1;
             }
+
+            // ── 显存优化：logits 已消费完毕，立即释放 ──
+            //   loss 已算出，LM Head 的 backward 只需 input + grad_output（CE 已提供），
+            //   不再需要 logits 本身。若不释放，1.6GB（vocab×seq*batch）会在整个
+            //   backward 期间驻留设备显存。flush 之后 forward 已执行完，释放安全。
+            logits = {};
             // ── 反向传播（梯度已含 mask，无需额外处理） ────────
             auto grad_result = ce_loss.backward();
             if (!grad_result) { std::cerr << "\nLoss backward failed: " << grad_result.error().message << '\n'; return 1; }
@@ -1331,6 +1335,11 @@ int main(int argc, char *argv[])
             //    归还完全空闲的内存池底材（GPU 引擎有效，CPU/CUDA no-op） ──
             auto rel_r = engine->release_idle_pool_blocks();
             if (!rel_r) { std::cerr << "\n显存回收失败: " << rel_r.error().message << '\n'; return 1; }
+
+            // ── 显存优化：logits 梯度已消费完毕，立即释放 ──
+            //   model.backward 已把 grad 传播到各参数梯度，grad_result（1.6GB）
+            //   不再需要。end_batch 之后 backward 已提交执行完，释放安全。
+            grad_result = {};
 
             // ── 梯度累积：每 accum_steps 步才更新一次参数 ──
             // forward+backward 每步都执行（梯度累加到参数梯度），
