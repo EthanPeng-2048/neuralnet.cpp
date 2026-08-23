@@ -316,6 +316,29 @@ public:
         }
     }
 
+    // ── UMA/共享显存检测 ─────────────────────────────────────────────
+    // 判断设备是否为统一内存架构：所有 DEVICE_LOCAL 内存类型都可被 HOST_VISIBLE
+    // 访问（iGPU/APU：device-local 即 host-visible，共享同一内存池）。
+    // 独立显卡（如 V100）存在"纯 device-local、不可 host 映射"的专用 VRAM
+    // heap，此时即使驱动报告 DEVICE_LOCAL|HOST_VISIBLE 组合类型，那也是
+    // GPU 可驻留/Zero-copy 内存（仍占专用显存）——offload 到它无效。
+    // 返回 true 表示可安全地把 offload slab 放 DEVICE_LOCAL|HOST_VISIBLE。
+    [[nodiscard]] bool is_uma() const noexcept
+    {
+        bool has_device_local = false;
+        for (uint32_t i = 0; i < mem_props_.memoryTypeCount; ++i)
+        {
+            const auto flags = mem_props_.memoryTypes[i].propertyFlags;
+            if (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+            {
+                has_device_local = true;
+                if (!(flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+                    return false;  // 存在纯 device-local（独显专用 VRAM）
+            }
+        }
+        return has_device_local;  // 全部 device-local 均可 host 映射 → UMA
+    }
+
     // ── 池统计（L2 仪器化，供显存采样/逐项归因） ──────────────────────
     struct PoolStats
     {

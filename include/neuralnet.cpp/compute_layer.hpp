@@ -2743,6 +2743,12 @@ public:
             std::size_t total = 0;
             for (auto& ref : offload_refs_)
                 if (ref.get().valid()) total += ref.get().size();
+            // 无有效激活可导出（如混合模式下 checkpoint 块 forward 不驻留缓存）
+            if (total == 0)
+            {
+                offloaded_ = false;
+                return {};
+            }
             auto slab = engine.create_offload_buffer(total);
             if (!slab) return std::unexpected(slab.error());
             offload_slab_ = std::move(*slab);
@@ -3273,8 +3279,11 @@ public:
             auto r = blocks_[bi].forward(engine, x);
             if (!r) return r;
             x = std::move(*r);
-            // activation offload：forward 后把本块内部激活搬 host-visible，释放 GPU 显存
-            if (activation_offload_)
+            // activation offload：forward 后把本块内部激活搬 host-visible，释放 GPU 显存。
+            // 混合模式（offload + checkpoint 共存）：checkpoint 块 forward 不驻留激活
+            // （checkpoint_mode=true），无可导出的缓存，必须跳过 export（否则会创建
+            // 空 slab 而失败）；非 checkpoint 块才导出。
+            if (activation_offload_ && !blocks_[bi].checkpoint_mode())
             {
                 auto ex = blocks_[bi].export_activations(engine);
                 if (!ex) return std::unexpected(ex.error());
