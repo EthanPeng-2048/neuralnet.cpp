@@ -195,9 +195,9 @@ namespace nn
                 {
                     const std::size_t len = base + (c < rem ? 1 : 0);
                     auto beg = first;
-                    std::advance(beg, static_cast<std::ptrdiff_t>(off));
+                    std::ranges::advance(beg, static_cast<std::ptrdiff_t>(off));
                     auto end = beg;
-                    std::advance(end, static_cast<std::ptrdiff_t>(len));
+                    std::ranges::advance(end, static_cast<std::ptrdiff_t>(len));
                     off += len;
 
                     tasks_.emplace([beg, end, &func, &latch]()
@@ -216,7 +216,7 @@ namespace nn
                 const std::size_t len = base + (c < rem ? 1 : 0);
                 const std::size_t off = total - len;
                 auto beg = first;
-                std::advance(beg, static_cast<std::ptrdiff_t>(off));
+                std::ranges::advance(beg, static_cast<std::ptrdiff_t>(off));
                 for (auto it = beg; it != last; ++it)
                     func(*it);
                 latch.fetch_sub(1, std::memory_order_release);
@@ -253,9 +253,9 @@ namespace nn
                 {
                     const std::size_t len = base + (c < rem ? 1 : 0);
                     auto beg = first;
-                    std::advance(beg, static_cast<std::ptrdiff_t>(off));
+                    std::ranges::advance(beg, static_cast<std::ptrdiff_t>(off));
                     auto end = beg;
-                    std::advance(end, static_cast<std::ptrdiff_t>(len));
+                    std::ranges::advance(end, static_cast<std::ptrdiff_t>(len));
                     off += len;
 
                     tasks_.emplace([beg, end, &func, &latch]()
@@ -272,7 +272,7 @@ namespace nn
                 const std::size_t c = n_chunks - 1;
                 const std::size_t off = total - (base + (c < rem ? 1 : 0));
                 auto beg = first;
-                std::advance(beg, static_cast<std::ptrdiff_t>(off));
+                std::ranges::advance(beg, static_cast<std::ptrdiff_t>(off));
                 for (auto it = beg; it != last; ++it)
                     func(*it);
                 latch.fetch_sub(1, std::memory_order_release);
@@ -358,10 +358,10 @@ namespace nn
                     const std::size_t len = base + (c < rem ? 1 : 0);
                     auto in_beg = first;
                     auto out_beg = d_first;
-                    std::advance(in_beg,  static_cast<std::ptrdiff_t>(off));
-                    std::advance(out_beg, static_cast<std::ptrdiff_t>(off));
+                    std::ranges::advance(in_beg,  static_cast<std::ptrdiff_t>(off));
+                    std::ranges::advance(out_beg, static_cast<std::ptrdiff_t>(off));
                     auto in_end = in_beg;
-                    std::advance(in_end, static_cast<std::ptrdiff_t>(len));
+                    std::ranges::advance(in_end, static_cast<std::ptrdiff_t>(len));
                     off += len;
 
                     tasks_.emplace([in_beg, in_end, out_beg, &op, &latch]()
@@ -381,8 +381,8 @@ namespace nn
                 const std::size_t off = total - (base + (c < rem ? 1 : 0));
                 auto in_beg = first;
                 auto out_beg = d_first;
-                std::advance(in_beg,  static_cast<std::ptrdiff_t>(off));
-                std::advance(out_beg, static_cast<std::ptrdiff_t>(off));
+                std::ranges::advance(in_beg,  static_cast<std::ptrdiff_t>(off));
+                std::ranges::advance(out_beg, static_cast<std::ptrdiff_t>(off));
                 for (; in_beg != last; ++in_beg, ++out_beg)
                     *out_beg = op(*in_beg);
                 latch.fetch_sub(1, std::memory_order_release);
@@ -419,11 +419,11 @@ namespace nn
                     auto i1 = first1;
                     auto i2 = first2;
                     auto o = d_first;
-                    std::advance(i1, static_cast<std::ptrdiff_t>(off));
-                    std::advance(i2, static_cast<std::ptrdiff_t>(off));
-                    std::advance(o,  static_cast<std::ptrdiff_t>(off));
+                    std::ranges::advance(i1, static_cast<std::ptrdiff_t>(off));
+                    std::ranges::advance(i2, static_cast<std::ptrdiff_t>(off));
+                    std::ranges::advance(o,  static_cast<std::ptrdiff_t>(off));
                     auto i1_end = i1;
-                    std::advance(i1_end, static_cast<std::ptrdiff_t>(len));
+                    std::ranges::advance(i1_end, static_cast<std::ptrdiff_t>(len));
                     off += len;
 
                     tasks_.emplace([i1, i1_end, i2, o, &op, &latch]()
@@ -445,9 +445,9 @@ namespace nn
                 auto i1 = first1;
                 auto i2 = first2;
                 auto o = d_first;
-                std::advance(i1, static_cast<std::ptrdiff_t>(off));
-                std::advance(i2, static_cast<std::ptrdiff_t>(off));
-                std::advance(o,  static_cast<std::ptrdiff_t>(off));
+                std::ranges::advance(i1, static_cast<std::ptrdiff_t>(off));
+                std::ranges::advance(i2, static_cast<std::ptrdiff_t>(off));
+                std::ranges::advance(o,  static_cast<std::ptrdiff_t>(off));
                 for (; i1 != last1; ++i1, ++i2, ++o)
                     *o = op(*i1, *i2);
                 latch.fetch_sub(1, std::memory_order_release);
@@ -486,9 +486,9 @@ namespace nn
                 {
                     const std::size_t len = base + (c < rem ? 1 : 0);
                     auto beg = first;
-                    std::advance(beg, static_cast<std::ptrdiff_t>(off));
+                    std::ranges::advance(beg, static_cast<std::ptrdiff_t>(off));
                     auto end = beg;
-                    std::advance(end, static_cast<std::ptrdiff_t>(len));
+                    std::ranges::advance(end, static_cast<std::ptrdiff_t>(len));
                     off += len;
 
                     tasks_.emplace([beg, end, &reduce_op, &transform_op, &partials, &latch, c, init]()
@@ -507,7 +507,7 @@ namespace nn
                 const std::size_t c = n_chunks - 1;
                 const std::size_t off = total - (base + (c < rem ? 1 : 0));
                 auto beg = first;
-                std::advance(beg, static_cast<std::ptrdiff_t>(off));
+                std::ranges::advance(beg, static_cast<std::ptrdiff_t>(off));
                 T local = init;  // 以调用者 init 为单位元（不能用 T{}）
                 for (auto it = beg; it != last; ++it)
                     local = reduce_op(local, transform_op(*it));
@@ -552,10 +552,10 @@ namespace nn
                     const std::size_t len = base + (c < rem ? 1 : 0);
                     auto i1 = first1;
                     auto i2 = first2;
-                    std::advance(i1, static_cast<std::ptrdiff_t>(off));
-                    std::advance(i2, static_cast<std::ptrdiff_t>(off));
+                    std::ranges::advance(i1, static_cast<std::ptrdiff_t>(off));
+                    std::ranges::advance(i2, static_cast<std::ptrdiff_t>(off));
                     auto i1_end = i1;
-                    std::advance(i1_end, static_cast<std::ptrdiff_t>(len));
+                    std::ranges::advance(i1_end, static_cast<std::ptrdiff_t>(len));
                     off += len;
 
                     tasks_.emplace([i1, i1_end, i2, &reduce_op, &transform_op, &partials, &latch, c, init]()
@@ -577,8 +577,8 @@ namespace nn
                 const std::size_t off = total - (base + (c < rem ? 1 : 0));
                 auto i1 = first1;
                 auto i2 = first2;
-                std::advance(i1, static_cast<std::ptrdiff_t>(off));
-                std::advance(i2, static_cast<std::ptrdiff_t>(off));
+                std::ranges::advance(i1, static_cast<std::ptrdiff_t>(off));
+                std::ranges::advance(i2, static_cast<std::ptrdiff_t>(off));
                 T local = init;  // 以调用者 init 为单位元（不能用 T{}）
                 for (; i1 != last1; ++i1, ++i2)
                     local = reduce_op(local, transform_op(*i1, *i2));

@@ -39,7 +39,8 @@ jobs:
         sudo ./llvm.sh all
         sudo ln -sf $(ls /usr/bin/clang-[0-9]* | sort -V | tail -n1) /usr/bin/clang
         sudo ln -sf $(ls /usr/bin/clang++-[0-9]* | sort -V | tail -n1) /usr/bin/clang++
-        sudo apt-get install -y ninja-build p7zip-full
+        # libc++（LLVM 标准库）：对 C++26 range 迭代器的处理比默认 libstdc++ 更标准
+        sudo apt-get install -y ninja-build p7zip-full libc++-dev libc++abi-dev
 
     # ========== Linux: 安装 Vulkan SDK（LunarG apt 源，含 glslc）==========
     - name: Install Vulkan SDK (Linux)
@@ -99,7 +100,9 @@ jobs:
           -DCMAKE_C_COMPILER=clang \
           -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
           -DCMAKE_CXX_STANDARD=26 \
-          -DCMAKE_CXX_STANDARD_REQUIRED=ON
+          -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+          -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
+          -DCMAKE_EXE_LINKER_FLAGS="-stdlib=libc++"
       env:
         CC: clang
         CXX: clang++
