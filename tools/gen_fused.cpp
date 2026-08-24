@@ -2,14 +2,20 @@
 //  gen_fused.cpp — AOT 算子融合：构建期合成（读 scan_exprs 的 bin）
 //
 //  读取 scan_exprs dump 的 expr_specs.bin（表达式结构集合），对每条
-//  用 glsl_gen.hpp 展开为单个融合 .comp，再经 glslc 编译成 SPIR-V，最后
-//  内联进单个生成头 fused_registry.hpp（key → {ExprSpec, SPIR-V}）。
+//  用 emitter 抽象（IR-D：expr_emitter.hpp）展开为单个融合 kernel 源码，
+//  再经 glslc 编译成 SPIR-V，最后内联进单个生成头 fused_registry.hpp
+//  （key → {ExprSpec, SPIR-V}）。
+//
+//  IR-D 落地：本工具经 nn::emitter_registry 选择后端（默认 "glsl" =
+//  GlslEmitter），不再直接绑定 GLSL 生成函数——同一份 canonical IR 可由
+//  CpuEmitter 等其它后端展开（--list-backends 查看；CpuEmitter 生成 C++
+//  直线代码，供调试/交叉验证，不产出 SPIR-V）。
 //
 //  表达式**文本只出现在 Layer**；本工具只消费折叠后的结构（派生物）。
 //  产物 fused_registry.hpp 供运行时（GpuEngine::eval_expr / vk_backend）
 //  按 expr_spec_key 精确匹配 dispatch——闭合世界，未命中硬报错。
 //
-//  用法： gen_fused <out_dir> <glslc_path> <expr_specs.bin>
+//  用法： gen_fused <out_dir> <glslc_path> <expr_specs.bin> [--list-backends]
 //  产物： <out_dir>/fused_registry.hpp（+ 调试用 .comp/.spv）
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -24,7 +30,9 @@
 
 #include "expr_spec.hpp"
 #include "expr_registry.hpp"
-#include "glsl_gen.hpp"
+#include "expr_emitter.hpp"   // IR-D：emitter 抽象（后端选择）
+#include "glsl_gen.hpp"       // 注册 GlslEmitter（默认后端）
+#include "cpu_emitter.hpp"    // 注册 CpuEmitter（IR-D 第二后端，供 --list-backends）
 
 namespace
 {
@@ -89,9 +97,19 @@ namespace
 
 int main(int argc, char* argv[])
 {
+    // --list-backends：列出可用 emitter 后端（IR-D 多后端验证）
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--list-backends")
+        {
+            std::printf("[gen] 可用 emitter 后端（IR-D）:\n");
+            for (const auto& n : nn::emitter_registry::names())
+                std::printf("      - %s\n", n.c_str());
+            return 0;
+        }
+
     if (argc < 4)
     {
-        std::fprintf(stderr, "用法: gen_fused <out_dir> <glslc_path> <expr_specs.bin>\n");
+        std::fprintf(stderr, "用法: gen_fused <out_dir> <glslc_path> <expr_specs.bin> [--list-backends]\n");
         return 2;
     }
     const std::string out_dir  = argv[1];
@@ -148,10 +166,18 @@ int main(int argc, char* argv[])
         const std::string comp_path = out_dir + "/fused_" + key + ".comp";
         const std::string spv_path  = out_dir + "/fused_" + key + ".spv";
 
+        // 经 emitter 抽象（IR-D）生成 kernel 源码：默认 GlslEmitter。
+        // 同一份 canonical IR 可由其它后端（CpuEmitter）展开（--list-backends）。
+        auto emitter = nn::emitter_registry::make("glsl");
+        if (!emitter)
+        {
+            std::fprintf(stderr, "[FAIL] 无法创建 GLSL emitter（IR-D 注册表异常）\n");
+            return 1;
+        }
         // 含归约（raxis >= 0）→ 归约 kernel（workgroup 级共享内存归约）；否则逐元素
         const std::string glsl = (raxis >= 0)
-            ? nn::generate_glsl_reduce("fused_" + key, spec)
-            : nn::generate_glsl("fused_" + key, spec);
+            ? emitter->generate_reduce("fused_" + key, spec)
+            : emitter->generate("fused_" + key, spec);
         if (glsl.empty())
         {
             std::fprintf(stderr, "[FAIL] 生成 %s 失败（归约结构不支持？）\n", key.c_str());

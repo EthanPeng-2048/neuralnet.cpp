@@ -1,6 +1,6 @@
 # IR 优化（IR Optimization）—— 为融合算子引入中间表示
 
-> 状态：**IR-A（canonicalize：DCE/常量折叠/代数化简/稳定重编号）+ IR-B（CSE + 寄存器分配 liveness）✅ 已实施（2026-08-23）**；IR-C（图 IR）/IR-D（emitter）待立项
+> 状态：**IR-A（canonicalize：DCE/常量折叠/代数化简/稳定重编号）+ IR-B（CSE + 寄存器分配 liveness）✅ 已实施（2026-08-23）**；**IR-C（图 IR + begin_expr/end_expr 融合分析）✅ 已实施（基础版：逐元素链拼接，2026-08-24）**；**IR-D（后端 emitter 抽象）✅ 已实施（2026-08-24）**；IR-C 进阶（多输入 DAG 融合 / 跨 kernel 自动融合）待立项
 > 关联文档：`09-operator-fusion.md`（算子融合）、`DEVELOPMENT_STANDARDS.md`（分层铁律）、`08-pitfalls-and-lessons.md`
 > 目标：在**不推翻现有 AOT 闭合世界**的前提下，把 `ExprSpec` 从"直通轻量 IR"演进为带优化 pass 的规范 IR，分阶段提升开发便利与代码质量。
 
@@ -167,6 +167,21 @@ IR → GlslEmitter / CudaEmitter / CpuEmitter
 > - **关键坑**：① regalloc 复用后归约指令 dst 与逐元素 dst 必须**区段分离**（validate 要求 reduce_dst/elem_dst 按号互斥）；② 各 pass 重映射只处理 `expr_instr_num_operands(op)` 实际使用的操作数（未用 b/c 是默认哨兵 {0,0}，不得当 Reg(0) 重编号）。
 > - 验证：新增 `src/expr_opt_test`（各 pass/确定性/幂等/语义等价/上限压力/归约区段互斥）；`expr_dsl_test`/`expr_reduce_test`/`tensor_expr_test`/`fused_gpu_test`/`matmul_fusion_test`/`ce_fusion_test`/gradcheck 系列/gpt_checkpoint_test 全绿；MNIST + text_train（CPU/GPU、含 checkpoint-every）端到端训练正常。
 > - 顺带修复预存在 bug：`text_train --save-interval 0` 触发 `(step+1) % 0` 整数除零崩溃（HEAD 亦复现，与 IR 无关）。
+
+> **实施记录（2026-08-24，IR-C 基础版 + IR-D 已完成）**：
+> - **IR-C（图 IR + 融合分析，`expr_graph.hpp`）**：
+>   - 图结构：`ExprGraphNode{ spec(canonical), rows/cols, vector_out, dep_of_input, input_tensors }` + `ExprGraph`；`add_node` 录制（依赖识别基于 Tensor 的 `virtual_tag`，占位 Tensor 标记前序节点输出）。
+>   - 融合分析 `fuse_expr_graph`：贪心按节点序，维护"当前 kernel"；**逐元素链拼接**——B 以 Linear 视图消费 A 的输出且 A 无其他消费者、形状相同、均无归约 → 把 A 的指令内联进 B（A 输出寄存器作为 B 的操作数），中间结果不落显存、单 kernel dispatch。拼接后 canonicalize + validate；超限/非法 → 保守放弃融合（各自成 kernel）。归约节点/归约输出作为融合边界。
+>   - `Tensor` 增加 `virtual_tag`（0=非节点输出；reshape 保留）。
+>   - **引擎接入**：`GpuEngine::begin_expr/end_expr` 录制 → `end_expr` 融合执行（每 kernel 一次 AOT dispatch，输出写入末尾节点占位 buffer——`run_fused_gpu` 新增 `output_override` 参数复用占位）；`CpuEngine` 在 `NN_EXPR_SCAN` 下 begin/end 录制并登记融合后的复合 spec（闭合世界两端一致）；`dsl::compute/compute_reduce` 的 scan 分支在录制段内加入录制图。
+>   - 演示 Layer：`FusedChainLayer`（forward 用 begin_expr/end_expr 写三段链式表达式，GPU 融合成单 kernel，CPU 逐节点参考）。
+>   - **关键坑**：① 拼接时 B 的常量池必须追加在 A 之后（否则 Const 引用越界，canonicalize 产出垃圾索引）；② 录制段内单个表达式**不单独登记**（被融合进复合 spec），闭合世界要求 scan dry-run 覆盖录制段内所有可能的融合组合（含 backward）；③ 中间量不逃逸是融合语义约束（如 LayerNorm/RMSNorm 的 cache 中间结果不可包进 begin/end 段）。
+>   - 验证：新增 `src/expr_graph_test`（链融合/三节点链/独立分支/多消费者/归约边界/上限压力/确定性/依赖识别/输入顺序）+ `src/expr_fuse_test`（GPU 端到端：FusedChain forward 融合 err=0、手写录制融合 err=0、backward/未录制回归）。
+> - **IR-D（emitter 抽象，`expr_emitter.hpp`）**：
+>   - `ExprEmitter` 纯接口（name/generate/generate_reduce）+ `emitter_registry`（按后端名选择工厂）。
+>   - `GlslEmitter`（glsl_gen.hpp 现有 generate_glsl/generate_glsl_reduce 封装）+ `CpuEmitter`（cpu_emitter.hpp，生成可编译 C++ 直线代码，验证"一份 IR 多后端"；数值与 CPU 解释器一致）。
+>   - `gen_fused` 经 emitter 注册表选择后端（默认 glsl）；`--list-backends` 展示可用后端（glsl/cpu）。
+> - 验证：ctest 24/24 全绿（含新增 expr_graph_test / expr_fuse_test）；`scan_exprs` 收集到 20 条融合表达式（含 FusedChain 融合复合 spec + backward）；`fused_gpu_test` 等既有回归无回归。
 
 **推荐**：先落地 IR-A + IR-B（约 1 周），解决真实痛点并铺好确定性地基；IR-C 视需求再投入。
 

@@ -176,6 +176,14 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(expr_opt_test src/expr_opt_test.cpp)
     list(APPEND NN_TEST_TARGETS expr_opt_test)
 
+    # ── 图 IR + 融合分析测试（IR-C：expr_graph.hpp 纯函数，无 GPU） ─────
+    nn_add_executable(expr_graph_test src/expr_graph_test.cpp)
+    list(APPEND NN_TEST_TARGETS expr_graph_test)
+
+    # ── 图 IR 融合 GPU 端到端（IR-C：begin_expr/end_expr 融合执行） ─────
+    nn_add_executable(expr_fuse_test src/expr_fuse_test.cpp)
+    list(APPEND NN_TEST_TARGETS expr_fuse_test)
+
     # ── ModelSpec 架构校验一致性测试（load_model 文件头 vs 模型规格比对） ────
     nn_add_executable(model_spec_validation_test src/model_spec_validation_test.cpp)
     list(APPEND NN_TEST_TARGETS model_spec_validation_test)

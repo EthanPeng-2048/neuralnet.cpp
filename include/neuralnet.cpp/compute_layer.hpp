@@ -932,6 +932,71 @@ public:
     }
 };
 
+// ══════════════════════════════════════════════════════════════════════════
+// FusedChainLayer — IR-C 演示：begin_expr/end_expr 多表达式链式融合
+//
+// forward 用 begin_expr/end_expr 把"无法写进一行的多步逐元素变换"写成多个
+// 表达式（t、u 为中间量，不逃逸——融合的语义约束）：
+//     t   = x * 2                    (Linear 输入 + 常量)
+//     u   = t + 3                    (消费 t：Linear 引用 → 内联为寄存器)
+//     out = u * gamma                (row 广播参数 (F,1))
+// 引擎在 end_expr 时做融合分析（IR-C，expr_graph.hpp）：三段拼接成单个
+// kernel，中间结果 t/u 留在寄存器（不落显存、不额外 dispatch）。
+//   - GPU：begin_expr 录制 → end_expr 融合 → AOT 融合 shader 匹配 dispatch
+//     （闭合世界：scan_exprs 必须 dry-run 本 Layer 登记融合后的复合 spec）。
+//   - CPU：begin/end 为 no-op，各表达式直接求值（参考实现）。
+//   - scan：NN_EXPR_SCAN 下 end_expr 登记融合后的复合 spec（两端一致）。
+// ══════════════════════════════════════════════════════════════════════════
+class FusedChainLayer final : public Layer
+{
+private:
+    Tensor gamma_;   // (F, 1) 按行广播系数
+
+public:
+    explicit FusedChainLayer(ComputeEngine& engine, std::size_t features)
+    {
+        Matrix g(features, 1, Scalar{0.5f});  // 演示用固定系数
+        auto g_t = engine.from_matrix(g);
+        NN_ASSERT(g_t, g_t ? "" : g_t.error().message.c_str());
+        gamma_ = std::move(*g_t);
+    }
+
+    [[nodiscard]] Result<Tensor> forward(
+        ComputeEngine& engine, const Tensor& input) override
+    {
+        const std::size_t F = input.rows();
+        const std::size_t B = input.cols();
+
+        auto b = engine.begin_expr();
+        if (!b) return std::unexpected(b.error());
+        auto t = dsl::compute(engine, dsl::leaf(input) * Scalar{2}, F, B);
+        if (!t) return std::unexpected(t.error());
+        auto u = dsl::compute(engine, dsl::leaf(*t) + Scalar{3}, F, B);
+        if (!u) return std::unexpected(u.error());
+        auto out = dsl::compute(engine,
+            dsl::leaf(*u) * dsl::row_broadcast(gamma_), F, B);
+        if (!out) return std::unexpected(out.error());
+        auto e = engine.end_expr();
+        if (!e) return std::unexpected(e.error());
+        return out;
+    }
+
+    // out = ((x*2)+3)*gamma → dout/dx = 2*gamma。
+    // 非 IR-C 演示路径：单表达式直接求值（scan 单独登记，GPU 独立 AOT）。
+    [[nodiscard]] Result<Tensor> backward(
+        ComputeEngine& engine, const Tensor& grad_output) override
+    {
+        const std::size_t F = grad_output.rows();
+        const std::size_t B = grad_output.cols();
+        return dsl::compute(engine,
+            dsl::leaf(grad_output) * dsl::row_broadcast(gamma_) * Scalar{2},
+            F, B);
+    }
+
+    [[nodiscard]] std::vector<TensorRef> parameters() override { return {}; }
+    [[nodiscard]] std::vector<TensorRef> param_gradients() override { return {}; }
+};
+
 // ── 归一化层工厂：按 NormType 创建 LayerNorm 或 RMSNorm ──────────────────
 [[nodiscard]] inline std::unique_ptr<Layer> make_norm_layer(
     ComputeEngine& engine, std::size_t d_model, NormType norm_type)

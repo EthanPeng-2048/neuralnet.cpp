@@ -3042,7 +3042,8 @@ public:
         std::span<const Scalar> consts,
         std::size_t rows, std::size_t cols,
         bool vector_out = false,
-        std::span<const std::uint32_t> view_params = {})
+        std::span<const std::uint32_t> view_params = {},
+        GpuTensor* output_override = nullptr)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
@@ -3073,13 +3074,30 @@ public:
         const std::uint32_t count = static_cast<std::uint32_t>(rows * cols);
 
         // 1. 分配输出 Tensor（vector_out：归约向量原生形状 (rows,1)/(1,cols)）
+        //    若调用方指定 output_override（IR-C 录制占位 buffer），则复用其
+        //    buffer（形状必须匹配），结果直接写入占位 → Layer 持有的 Tensor
+        //    在 end_expr 后即物化，避免额外拷贝。
         const std::size_t out_rows = (vector_out && raxis == 0) ? rows
                                   : (vector_out && raxis == 1) ? 1 : rows;
         const std::size_t out_cols = (vector_out && raxis == 1) ? cols
                                   : (vector_out && raxis == 0) ? 1 : cols;
-        auto output_res = GpuTensor::create_empty(out_rows, out_cols, *this);
-        if (!output_res) return std::unexpected(output_res.error());
-        GpuTensor output = std::move(*output_res);
+        std::optional<GpuTensor> owned_output;
+        GpuTensor* output_ptr = output_override;
+        if (output_override)
+        {
+            if (output_override->rows() != out_rows || output_override->cols() != out_cols)
+                return std::unexpected(Error{
+                    "run_fused_gpu: output_override shape mismatch (" +
+                    std::to_string(out_rows) + "x" + std::to_string(out_cols) + ")"});
+        }
+        else
+        {
+            auto output_res = GpuTensor::create_empty(out_rows, out_cols, *this);
+            if (!output_res) return std::unexpected(output_res.error());
+            owned_output.emplace(std::move(*output_res));
+            output_ptr = &*owned_output;
+        }
+        GpuTensor output = *output_ptr;
 
         // 2. 分配描述符集（N 输入 + 1 输出）
         auto ds_r = alloc_desc_set(pipeline.descriptor_layout());

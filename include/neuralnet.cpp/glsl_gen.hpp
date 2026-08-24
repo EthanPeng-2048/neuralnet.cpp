@@ -19,6 +19,7 @@
 #include <string>
 
 #include "expr_spec.hpp"
+#include "expr_emitter.hpp"   // IR-D：emitter 抽象（GlslEmitter 实现）
 
 namespace nn
 {
@@ -542,6 +543,34 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
     L << "}\n";
     return L.str();
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  GlslEmitter — GLSL 后端 emitter（IR-D）
+//
+//  把上述 generate_glsl / generate_glsl_reduce 封装为 ExprEmitter 接口实现，
+//  使生成器工具（gen_fused）可经统一接口选择后端，不再与 GLSL 绑定。
+//  自由函数 generate_glsl / generate_glsl_reduce 保留为便捷入口
+//  （内部转发到 GlslEmitter），向后兼容既有调用方。
+// ═══════════════════════════════════════════════════════════════════════════
+class GlslEmitter final : public ExprEmitter
+{
+public:
+    [[nodiscard]] std::string_view name() const noexcept override
+    { return "glsl"; }
+
+    [[nodiscard]] std::string generate(
+        const std::string& name_, const ExprSpec& spec) override
+    { return nn::generate_glsl(name_, spec); }
+
+    [[nodiscard]] std::string generate_reduce(
+        const std::string& name_, const ExprSpec& spec) override
+    { return nn::generate_glsl_reduce(name_, spec); }
+};
+
+// 登记到 emitter 注册表（静态初始化；重复包含无害——同名拒绝覆盖）
+inline const bool kGlslEmitterRegistered =
+    emitter_registry::register_backend("glsl",
+        []() -> ExprEmitter* { return new GlslEmitter(); });
 
 } // namespace nn
 
