@@ -315,6 +315,10 @@ if(Vulkan_FOUND)
     target_link_libraries(scan_exprs PRIVATE nn_core Vulkan::Vulkan)
     add_custom_command(
         OUTPUT ${NN_EXPR_SCAN_BIN}
+        # scan_exprs 是原生可执行文件，直接写文件、不会自建目录。
+        # Ninja 会自动创建自定义命令的输出目录，但 Makefiles 生成器不会，
+        # 全新构建时 generated/ 尚未存在会写入失败（见 08-pitfalls）。
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/generated
         COMMAND scan_exprs ${NN_EXPR_SCAN_BIN}
         DEPENDS scan_exprs ${SCAN_SRC}
         COMMENT "[GPU] Scanning Layer expressions (scan_exprs) → expr_specs.bin"
@@ -327,6 +331,8 @@ if(Vulkan_FOUND)
     target_link_libraries(gen_fused PRIVATE nn_core)
     add_custom_command(
         OUTPUT ${NN_FUSED_REGISTRY_HPP}
+        # 同 scan_exprs：gen_fused 也是原生可执行文件，需先确保输出目录存在
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/generated
         COMMAND gen_fused ${CMAKE_BINARY_DIR}/generated ${GLSLC} ${NN_EXPR_SCAN_BIN}
         DEPENDS gen_fused ${FUSED_GEN_SRC} ${NN_EXPR_SCAN_BIN}
         COMMENT "[GPU] Synthesizing fused shaders (gen_fused) → fused_registry.hpp"
