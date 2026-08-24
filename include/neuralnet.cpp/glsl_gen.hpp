@@ -512,8 +512,12 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
     L << "void main()\n{\n";
     L << "    const uint tid = gl_LocalInvocationID.x;\n";
     L << "    const uint idx = gl_WorkGroupID.x;\n";
-    L << (is_row ? "    if (idx >= rows) return;\n"
-                 : "    if (idx >= cols) return;\n");
+    // 行归约：工作组=单行，idx<rows 守卫。列归约(tile)：工作组=256 列 tile，
+    // 每线程一列，守卫/列号在 else 分支内给出（col = idx*256 + tid）。
+    L << (is_row ? "    if (idx >= rows) return;\n" : "");
+
+    // 归约结果索引：行=工作组单行（s_red[slot][0]）；列 tile=每线程一列（s_red[slot][tid]）
+    const std::string red_idx = is_row ? "0" : "tid";
 
     // ── 操作数求值（当前元素由 row/col 变量给出） ──
     const auto operand = [&](const ExprOperand& op) -> std::string
@@ -527,13 +531,13 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
         case static_cast<uint8_t>(ExprOperandKind::Const):
             return "c" + std::to_string(op.idx);
         case static_cast<uint8_t>(ExprOperandKind::Reduce):
-            return "s_red[" + std::to_string(slot_of_instr[op.idx]) + "][0]";
+            return "s_red[" + std::to_string(slot_of_instr[op.idx]) + "][" + red_idx + "]";
         case static_cast<uint8_t>(ExprOperandKind::Input):
         {
             const ExprView& v = spec.views[op.idx];
             const ExprViewKind vk = static_cast<ExprViewKind>(v.kind);
             if (expr_view_is_reduce(vk))
-                return "s_red[" + std::to_string(slot_of_view[op.idx]) + "][0]";
+                return "s_red[" + std::to_string(slot_of_view[op.idx]) + "][" + red_idx + "]";
             if (vk == ExprViewKind::RowBroadcast)
                 return "b" + std::to_string(op.idx) + "[row]";
             if (vk == ExprViewKind::ColBroadcast)
@@ -651,117 +655,186 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
         L << "    barrier();\n";
     };
 
-    // 元素索引声明（行归约：固定行、循环列；列归约：循环行、固定列）
-    const std::string loop_decl = is_row
-        ? "    for (uint c = tid; c < cols; c += 256u) {\n        const uint row = idx;\n        const uint col = c;\n"
-        : "    for (uint r = tid; r < rows; r += 256u) {\n        const uint row = r;\n        const uint col = idx;\n";
-    const std::string out_idx = "row*cols + col";
+    // 组合 4 路累加器（sum/max）
+    const auto combine4 = [&](bool is_max, const std::string& a0, const std::string& a1,
+                              const std::string& a2, const std::string& a3) {
+        return combine(is_max, combine(is_max, combine(is_max, a0, a1), a2), a3);
+    };
 
-    // ── 归约视图归约 pass（多路独立累加器，破串行累积延迟）──
-    // view_val(t)：跨步索引 t 处的输入值（行归约：row=idx 固定、col=t；
-    //              列归约：col=idx 固定、row=t）。多累加器 stride 4*256。
-    for (std::size_t k = 0; k < n_inputs; ++k)
+    if (is_row)
     {
-        const ExprView& v = spec.views[k];
-        if (!expr_view_is_reduce(static_cast<ExprViewKind>(v.kind)))
-            continue;
-        const int slot = slot_of_view[k];
-        const bool is_max = slot_is_max[static_cast<std::size_t>(slot)];
-        const std::string init = is_max ? "uintBitsToFloat(0xff800000u)" : "0.0";
-        const auto view_val = [&](const std::string& t) {
-            return is_row
-                ? "b" + std::to_string(k) + "[idx*cols + " + t + "]"
-                : "b" + std::to_string(k) + "[" + t + "*cols + idx]";
-        };
-        L << "\n    // 归约视图 " << k << " (槽 " << slot << ")\n";
-        L << "    {\n";
-        L << "        float acc0 = " << init << ", acc1 = " << init
-          << ", acc2 = " << init << ", acc3 = " << init << ";\n";
-        L << "        const uint len = " << (is_row ? "cols" : "rows") << ";\n";
-        L << "        uint i = tid;\n";
-        L << "        for (; i + 3u*256u < len; i += 4u*256u) {\n";
-        L << "            acc0 = " << combine(is_max, "acc0", view_val("i")) << ";\n";
-        L << "            acc1 = " << combine(is_max, "acc1", view_val("i+256u")) << ";\n";
-        L << "            acc2 = " << combine(is_max, "acc2", view_val("i+512u")) << ";\n";
-        L << "            acc3 = " << combine(is_max, "acc3", view_val("i+768u")) << ";\n";
+        // ═══ 行归约（工作组单行、跨线程跨步 + 树形归约；合并访问）═══
+        const std::string loop_decl =
+            "    for (uint c = tid; c < cols; c += 256u) {\n        const uint row = idx;\n        const uint col = c;\n";
+        const std::string out_idx = "row*cols + col";
+
+        // ── 归约视图 pass（多累加器，跨步 4*256）──
+        for (std::size_t k = 0; k < n_inputs; ++k)
+        {
+            const ExprView& v = spec.views[k];
+            if (!expr_view_is_reduce(static_cast<ExprViewKind>(v.kind)))
+                continue;
+            const int slot = slot_of_view[k];
+            const bool is_max = slot_is_max[static_cast<std::size_t>(slot)];
+            const std::string init = is_max ? "uintBitsToFloat(0xff800000u)" : "0.0";
+            L << "\n    // 归约视图 " << k << " (槽 " << slot << ")\n";
+            L << "    {\n";
+            L << "        float acc0 = " << init << ", acc1 = " << init
+              << ", acc2 = " << init << ", acc3 = " << init << ";\n";
+            L << "        uint i = tid;\n";
+            L << "        for (; i + 3u*256u < cols; i += 4u*256u) {\n";
+            L << "            acc0 = " << combine(is_max, "acc0", "b" + std::to_string(k) + "[idx*cols + i]") << ";\n";
+            L << "            acc1 = " << combine(is_max, "acc1", "b" + std::to_string(k) + "[idx*cols + i+256u]") << ";\n";
+            L << "            acc2 = " << combine(is_max, "acc2", "b" + std::to_string(k) + "[idx*cols + i+512u]") << ";\n";
+            L << "            acc3 = " << combine(is_max, "acc3", "b" + std::to_string(k) + "[idx*cols + i+768u]") << ";\n";
+            L << "        }\n";
+            L << "        for (; i < cols; i += 256u)\n";
+            L << "            acc0 = " << combine(is_max, "acc0", "b" + std::to_string(k) + "[idx*cols + i]") << ";\n";
+            L << "        s_red[" << slot << "][tid] = "
+              << combine4(is_max, "acc0", "acc1", "acc2", "acc3") << ";\n";
+            L << "    }\n";
+            emit_tree_reduce(slot, is_max);
+        }
+
+        // ── 归约指令 pass（跨步循环 + 树形归约）──
+        for (std::size_t ri = 0; ri < spec.instrs.size(); ++ri)
+        {
+            const ExprInstr& R = spec.instrs[ri];
+            if (!expr_op_is_reduce(static_cast<ExprOp>(R.op)))
+                continue;
+            const int slot = slot_of_instr[R.dst];
+            const bool is_max = slot_is_max[static_cast<std::size_t>(slot)];
+            const bool src_is_reg =
+                (R.a.kind == static_cast<uint8_t>(ExprOperandKind::Reg) ||
+                 R.a.kind == static_cast<uint8_t>(ExprOperandKind::Fanout));
+            const std::string src = src_is_reg
+                ? "r" + std::to_string(static_cast<int>(R.a.idx)) : operand(R.a);
+            L << "\n    // 归约指令 " << ri << " (槽 " << slot << ")\n";
+            L << "    {\n";
+            L << "        float acc = " << (is_max ? "uintBitsToFloat(0xff800000u)" : "0.0") << ";\n";
+            L << loop_decl;
+            emit_reg_decl();
+            emit_instrs(0, ri);
+            L << "        acc = " << combine(is_max, "acc", src) << ";\n";
+            L << "        }\n";
+            L << "        s_red[" << slot << "][tid] = acc;\n";
+            L << "    }\n";
+            emit_tree_reduce(slot, is_max);
+        }
+
+        // ── 输出 pass（行）──
+        L << "\n    // 输出\n";
+        L << "    if (vector_out == 1u) {\n";
+        L << "        if (tid == 0u) {\n";
+        if (last_is_reduce)
+            L << "            bout[idx] = s_red[" << slot_of_instr[spec.instrs.back().dst] << "][0];\n";
+        else
+        {
+            L << "            const uint row = idx;\n            const uint col = 0u;\n";
+            emit_reg_decl();
+            emit_instrs(0, spec.instrs.size());
+            L << "            bout[idx] = r" << static_cast<int>(spec.instrs.back().dst) << ";\n";
+        }
         L << "        }\n";
-        L << "        for (; i < len; i += 256u)\n";
-        L << "            acc0 = " << combine(is_max, "acc0", view_val("i")) << ";\n";
-        L << "        s_red[" << slot << "][tid] = "
-          << combine(is_max, combine(is_max, combine(is_max, "acc0", "acc1"), "acc2"), "acc3")
-          << ";\n";
+        L << "        return;\n";
         L << "    }\n";
-        emit_tree_reduce(slot, is_max);
-    }
-
-    // ── 归约指令 pass（按指令序，源可引用更早归约结果） ──
-    // 寄存器声明直接放在 for 循环体内（无需额外 {} 包裹），使源寄存器在
-    // combine 处可见；不同 pass 各自循环体作用域隔离，无重声明冲突。
-    for (std::size_t ri = 0; ri < spec.instrs.size(); ++ri)
-    {
-        const ExprInstr& R = spec.instrs[ri];
-        const ExprOp rop = static_cast<ExprOp>(R.op);
-        if (!expr_op_is_reduce(rop))
-            continue;
-        const int slot = slot_of_instr[R.dst];
-        const bool is_max = slot_is_max[static_cast<std::size_t>(slot)];
-        const bool src_is_reg =
-            (R.a.kind == static_cast<uint8_t>(ExprOperandKind::Reg) ||
-             R.a.kind == static_cast<uint8_t>(ExprOperandKind::Fanout));
-        const std::string src = src_is_reg
-            ? "r" + std::to_string(static_cast<int>(R.a.idx))
-            : operand(R.a);
-        L << "\n    // 归约指令 " << ri << " (槽 " << slot << ")\n";
-        L << "    {\n";
-        L << "        float acc = "
-          << (is_max ? "uintBitsToFloat(0xff800000u)" : "0.0") << ";\n";
         L << loop_decl;
-        emit_reg_decl();
-        emit_instrs(0, ri);
-        L << "        acc = " << combine(is_max, "acc", src) << ";\n";
-        L << "        }\n";
-        L << "        s_red[" << slot << "][tid] = acc;\n";
+        if (last_is_reduce)
+            L << "        bout[" << out_idx << "] = s_red[" << slot_of_instr[spec.instrs.back().dst] << "][0];\n";
+        else
+        {
+            emit_reg_decl();
+            emit_instrs(0, spec.instrs.size());
+            L << "        bout[" << out_idx << "] = r" << static_cast<int>(spec.instrs.back().dst) << ";\n";
+        }
         L << "    }\n";
-        emit_tree_reduce(slot, is_max);
     }
+    else
+    {
+        // ═══ 列归约 tile（合并访问）：每工作组 256 列、每线程一整列，无需跨线程归约 ═══
+        L << "    const uint col = idx * 256u + tid;\n";
+        L << "    if (col >= cols) return;\n";
 
-    // ── 输出 pass ──
-    // vector_out=1：输出归约向量（thread 0 写代表元素，输出形状由后端分配
-    //   (rows,1)/(1,cols)）；vector_out=0：广播到 (rows,cols)。
-    L << "\n    // 输出\n";
-    L << "    if (vector_out == 1u) {\n";
-    L << "        const uint row = " << (is_row ? "idx" : "0u") << ";\n";
-    L << "        const uint col = " << (is_row ? "0u" : "idx") << ";\n";
-    L << "        if (tid == 0u) {\n";
-    if (last_is_reduce)
-    {
-        L << "            bout[" << (is_row ? "row" : "col") << "] = s_red["
-          << slot_of_instr[spec.instrs.back().dst] << "][0];\n";
+        // ── 归约视图 pass（tile：每线程一整列，多累加器跨行顺序读，合并访问）──
+        for (std::size_t k = 0; k < n_inputs; ++k)
+        {
+            const ExprView& v = spec.views[k];
+            if (!expr_view_is_reduce(static_cast<ExprViewKind>(v.kind)))
+                continue;
+            const int slot = slot_of_view[k];
+            const bool is_max = slot_is_max[static_cast<std::size_t>(slot)];
+            const std::string init = is_max ? "uintBitsToFloat(0xff800000u)" : "0.0";
+            L << "\n    // 归约视图 " << k << " (槽 " << slot << ")\n";
+            L << "    {\n";
+            L << "        float acc0 = " << init << ", acc1 = " << init
+              << ", acc2 = " << init << ", acc3 = " << init << ";\n";
+            L << "        uint i = 0u;\n";
+            L << "        for (; i + 3u < rows; i += 4u) {\n";
+            L << "            acc0 = " << combine(is_max, "acc0", "b" + std::to_string(k) + "[i*cols + col]") << ";\n";
+            L << "            acc1 = " << combine(is_max, "acc1", "b" + std::to_string(k) + "[(i+1u)*cols + col]") << ";\n";
+            L << "            acc2 = " << combine(is_max, "acc2", "b" + std::to_string(k) + "[(i+2u)*cols + col]") << ";\n";
+            L << "            acc3 = " << combine(is_max, "acc3", "b" + std::to_string(k) + "[(i+3u)*cols + col]") << ";\n";
+            L << "        }\n";
+            L << "        for (; i < rows; ++i)\n";
+            L << "            acc0 = " << combine(is_max, "acc0", "b" + std::to_string(k) + "[i*cols + col]") << ";\n";
+            L << "        s_red[" << slot << "][tid] = "
+              << combine4(is_max, "acc0", "acc1", "acc2", "acc3") << ";\n";
+            L << "    }\n";
+        }
+
+        // ── 归约指令 pass（tile：单累加器，跨行顺序读，合并访问）──
+        for (std::size_t ri = 0; ri < spec.instrs.size(); ++ri)
+        {
+            const ExprInstr& R = spec.instrs[ri];
+            if (!expr_op_is_reduce(static_cast<ExprOp>(R.op)))
+                continue;
+            const int slot = slot_of_instr[R.dst];
+            const bool is_max = slot_is_max[static_cast<std::size_t>(slot)];
+            const bool src_is_reg =
+                (R.a.kind == static_cast<uint8_t>(ExprOperandKind::Reg) ||
+                 R.a.kind == static_cast<uint8_t>(ExprOperandKind::Fanout));
+            const std::string src = src_is_reg
+                ? "r" + std::to_string(static_cast<int>(R.a.idx)) : operand(R.a);
+            L << "\n    // 归约指令 " << ri << " (槽 " << slot << ")\n";
+            L << "    {\n";
+            L << "        float acc = " << (is_max ? "uintBitsToFloat(0xff800000u)" : "0.0") << ";\n";
+            L << "        for (uint row = 0u; row < rows; ++row) {\n";
+            emit_reg_decl();
+            emit_instrs(0, ri);
+            L << "            acc = " << combine(is_max, "acc", src) << ";\n";
+            L << "        }\n";
+            L << "        s_red[" << slot << "][tid] = acc;\n";
+            L << "    }\n";
+        }
+
+        // ── 输出 pass（列 tile）──
+        L << "\n    // 输出\n";
+        L << "    if (vector_out == 1u) {\n";
+        if (last_is_reduce)
+            L << "        bout[col] = s_red[" << slot_of_instr[spec.instrs.back().dst] << "][tid];\n";
+        else
+        {
+            L << "        const uint row = 0u;\n";
+            emit_reg_decl();
+            emit_instrs(0, spec.instrs.size());
+            L << "        bout[col] = r" << static_cast<int>(spec.instrs.back().dst) << ";\n";
+        }
+        L << "        return;\n";
+        L << "    }\n";
+        if (last_is_reduce)
+        {
+            L << "    for (uint row = 0u; row < rows; ++row)\n";
+            L << "        bout[row*cols + col] = s_red[" << slot_of_instr[spec.instrs.back().dst] << "][tid];\n";
+        }
+        else
+        {
+            L << "    for (uint row = 0u; row < rows; ++row) {\n";
+            emit_reg_decl();
+            emit_instrs(0, spec.instrs.size());
+            L << "        bout[row*cols + col] = r" << static_cast<int>(spec.instrs.back().dst) << ";\n";
+            L << "    }\n";
+        }
     }
-    else
-    {
-        emit_reg_decl();
-        emit_instrs(0, spec.instrs.size());
-        L << "            bout[" << (is_row ? "row" : "col") << "] = r"
-          << static_cast<int>(spec.instrs.back().dst) << ";\n";
-    }
-    L << "        }\n";
-    L << "        return;\n";
-    L << "    }\n";
-    L << loop_decl;
-    if (last_is_reduce)
-    {
-        L << "        bout[" << out_idx << "] = s_red["
-          << slot_of_instr[spec.instrs.back().dst] << "][0];\n";
-    }
-    else
-    {
-        emit_reg_decl();
-        emit_instrs(0, spec.instrs.size());
-        L << "        bout[" << out_idx << "] = r"
-          << static_cast<int>(spec.instrs.back().dst) << ";\n";
-    }
-    L << "    }\n";
     L << "}\n";
     return L.str();
 }

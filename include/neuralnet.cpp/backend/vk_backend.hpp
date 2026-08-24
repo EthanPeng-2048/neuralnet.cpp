@@ -3173,12 +3173,13 @@ public:
         vkCmdPushConstants(cmd, pipeline.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, static_cast<std::uint32_t>(pc.size()), pc.data());
 
-        // dispatch：逐元素 = ceil(count/(256*vec_width))；行归约 = rows 个工作组；列归约 = cols 个工作组
+        // dispatch：逐元素 = ceil(count/(256*vec_width))；行归约 = rows 个工作组；
+        // 列归约(tile) = ceil(cols/256) 个工作组（每工作组 256 列）
         const std::uint32_t vec_width = fused_vec_width_.count(shader_name)
             ? fused_vec_width_.at(shader_name) : 1u;
         const std::uint32_t wg_count =
             (raxis == 0) ? static_cast<std::uint32_t>(rows)
-            : (raxis == 1) ? static_cast<std::uint32_t>(cols)
+            : (raxis == 1) ? (static_cast<std::uint32_t>(cols) + 255u) / 256u
             : (count + 256u * vec_width - 1u) / (256u * vec_width);
         vkCmdDispatch(cmd, wg_count, 1, 1);
         record_output_barrier(cmd, output.buffer().impl());
