@@ -136,6 +136,9 @@ nn_add_executable(expr_reduce_test src/expr_reduce_test.cpp)
 # ── IR 优化 pass 测试（IR-A canonicalize + IR-B CSE/寄存器分配，纯 CPU） ─
 nn_add_executable(expr_opt_test src/expr_opt_test.cpp)
 
+# ── ModelSpec 架构校验一致性测试（load_model 文件头 vs 模型规格比对） ────
+nn_add_executable(model_spec_validation_test src/model_spec_validation_test.cpp)
+
 # ── Softmax 数值梯度检查（gradcheck，验证 softmax 反向） ───────────────────
 nn_add_executable(softmax_gradcheck src/softmax_gradcheck.cpp)
 

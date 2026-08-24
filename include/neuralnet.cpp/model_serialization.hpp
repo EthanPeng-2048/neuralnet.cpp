@@ -486,10 +486,21 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
     if (!version_r) return std::unexpected(version_r.error());
 
     // 读取并跳过规格头（规格已隐含在构建好的 model 中）
-    // TODO: 此处读完 spec 即丢弃，未与 model 自身的架构校验。
-    //       完整校验需要 Layer 基类支持 spec() 方法，改动较大，暂留待后续实现。
+    // 若 model 记录了架构规格（Model::spec()，由 build_*_from_spec 设置），
+    // 则与文件头部规格做一致性校验，防止把不匹配的参数加载进模型。
     auto spec_r = detail::read_spec_header(ifs, *version_r);
     if (!spec_r) return std::unexpected(spec_r.error());
+
+    if (auto stored = model.spec(); stored)
+    {
+        if (!spec_matches(*stored, *spec_r))
+        {
+            return std::unexpected(Error{
+                "Model architecture mismatch while loading '" + filename + "': "
+                "model expects " + spec_summary(*stored) +
+                " but file contains " + spec_summary(*spec_r)});
+        }
+    }
 
     auto& engine = model.engine();
     auto params = model.parameters();
