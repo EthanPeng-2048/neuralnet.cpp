@@ -255,7 +255,7 @@ int main(int argc, char *argv[])
     }
     nn::ModelSpec spec = spec_result.value();
 
-    // 支持的模型类型：MLP、Transformer（ViT）
+    // 支持的模型类型：MLP、Transformer（ViT）、CNN
     if (spec.type == nn::ModelType::MLP)
     {
         std::cout << "从模型文件读取规格: MLP\n";
@@ -263,6 +263,10 @@ int main(int argc, char *argv[])
     else if (spec.is_transformer())
     {
         std::cout << "从模型文件读取规格: Transformer (ViT)\n";
+    }
+    else if (spec.is_cnn())
+    {
+        std::cout << "从模型文件读取规格: CNN (LeNet)\n";
     }
     else
     {
