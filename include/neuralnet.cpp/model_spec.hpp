@@ -52,6 +52,7 @@ enum class ModelType : uint32_t
     Transformer = 2,
     GPT         = 3,
     ALiBi_GPT   = 4,  // 使用 ALiBi 的 GPT 模型（向后兼容）
+    CNN         = 5,  // 卷积神经网络（LeNet 风格，MNIST）
 };
 
 // ── 模型架构描述 ─────────────────────────────────────────────────────────
@@ -77,10 +78,22 @@ struct ModelSpec
     ActivationType activation = ActivationType::GeLU;         // FFN 激活类型
     NormType norm_type = NormType::LayerNorm;                 // 归一化层类型
 
+    // ── CNN ──
+    std::size_t cnn_in_channels = 0;         // 输入通道数（MNIST=1）
+    std::size_t cnn_in_size     = 0;         // 输入空间尺寸（方形，MNIST=28）
+    std::size_t cnn_pool        = 0;         // 每个卷积后的 MaxPool 窗口（0=无池化）
+    std::vector<std::size_t> cnn_channels;   // 每个卷积层输出通道数
+    std::vector<std::size_t> cnn_kernels;    // 每个卷积核大小
+    std::vector<std::size_t> cnn_strides;    // 每个卷积步长（默认 1）
+    std::vector<std::size_t> cnn_paddings;   // 每个卷积填充（默认 0）
+    // CNN 的全连接头（layer_dims 复用）：展平 → Linear(H1) → ReLU → ... → Linear(num_classes)
+    //   其中 layer_dims = {H1, H2, ..., num_classes}，首元素为展平后第一隐藏层宽度。
+
     [[nodiscard]] bool is_mlp()         const noexcept { return type == ModelType::MLP; }
     [[nodiscard]] bool is_transformer() const noexcept { return type == ModelType::Transformer; }
     [[nodiscard]] bool is_gpt()         const noexcept { return type == ModelType::GPT; }
     [[nodiscard]] bool is_alibi_gpt()   const noexcept { return pos_encoding == PosEncodingType::ALiBi; }
+    [[nodiscard]] bool is_cnn()         const noexcept { return type == ModelType::CNN; }
 };
 
 } // namespace nn

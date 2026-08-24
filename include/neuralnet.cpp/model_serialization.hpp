@@ -213,6 +213,22 @@ template <typename... Ts>
     kv.set("pos_encoding", static_cast<uint64_t>(spec.pos_encoding));
     kv.set("activation",   static_cast<uint64_t>(spec.activation));
     kv.set("norm_type",    static_cast<uint64_t>(spec.norm_type));
+
+    // ── CNN ──
+    kv.set("cnn_in_channels", static_cast<uint64_t>(spec.cnn_in_channels));
+    kv.set("cnn_in_size",     static_cast<uint64_t>(spec.cnn_in_size));
+    kv.set("cnn_pool",        static_cast<uint64_t>(spec.cnn_pool));
+
+    auto to_u64_vec = [](const std::vector<std::size_t>& src) {
+        std::vector<uint64_t> out;
+        out.reserve(src.size());
+        for (auto v : src) out.push_back(static_cast<uint64_t>(v));
+        return out;
+    };
+    kv.set("cnn_channels",  to_u64_vec(spec.cnn_channels));
+    kv.set("cnn_kernels",   to_u64_vec(spec.cnn_kernels));
+    kv.set("cnn_strides",   to_u64_vec(spec.cnn_strides));
+    kv.set("cnn_paddings",  to_u64_vec(spec.cnn_paddings));
     return kv;
 }
 
@@ -259,6 +275,22 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
     if (kv.get("pos_encoding", v)) spec.pos_encoding = static_cast<PosEncodingType>(v);
     if (kv.get("activation", v))  spec.activation   = static_cast<ActivationType>(v);
     if (kv.get("norm_type", v))   spec.norm_type    = static_cast<NormType>(v);
+
+    // ── CNN ──
+    if (kv.get("cnn_in_channels", v)) spec.cnn_in_channels = static_cast<std::size_t>(v);
+    if (kv.get("cnn_in_size", v))     spec.cnn_in_size     = static_cast<std::size_t>(v);
+    if (kv.get("cnn_pool", v))        spec.cnn_pool        = static_cast<std::size_t>(v);
+
+    auto from_u64_vec = [](const std::vector<uint64_t>& src) {
+        std::vector<std::size_t> out;
+        out.reserve(src.size());
+        for (auto v : src) out.push_back(static_cast<std::size_t>(v));
+        return out;
+    };
+    if (kv.get("cnn_channels", dims)) spec.cnn_channels  = from_u64_vec(dims);
+    if (kv.get("cnn_kernels", dims))  spec.cnn_kernels   = from_u64_vec(dims);
+    if (kv.get("cnn_strides", dims))  spec.cnn_strides   = from_u64_vec(dims);
+    if (kv.get("cnn_paddings", dims)) spec.cnn_paddings  = from_u64_vec(dims);
 
     if (spec.type == ModelType::Unknown)
         return std::unexpected(Error{"模型文件规格缺少有效的 type 字段"});

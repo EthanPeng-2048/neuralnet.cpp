@@ -19,6 +19,7 @@
 #include "compute_engine.hpp"
 #include "model_container.hpp"
 #include "model_spec.hpp"
+#include "domain_cnn.hpp"
 
 namespace nn {
 
@@ -187,8 +188,11 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
             spec.d_model, spec.num_heads, spec.d_ff, spec.num_layers);
     }
 
+    if (spec.is_cnn())
+        return build_cnn_model_from_spec(engine, spec);
+
     return std::unexpected(Error{
-        "Invalid ModelSpec type for MNIST: expected MLP or Transformer"});
+        "Invalid ModelSpec type for MNIST: expected MLP, Transformer, or CNN"});
 }
 
 } // namespace nn
