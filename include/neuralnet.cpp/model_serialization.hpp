@@ -51,6 +51,17 @@ namespace nn
 inline constexpr uint32_t MODEL_MAGIC    = 0x4E4E4E4E;  // "NNNN"
 inline constexpr uint32_t MODEL_VERSION  = 4;            // 自描述格式起始版本
 
+// ── 序列化待办（1.1，代码审查项 S3 / M1 / M2）────────────────────────────
+// S3: read_spec_header / read_tokenizer 直接用文件里的 uint64 长度预分配
+//     std::string(len,'\0')，无上限校验；配合 -fno-exceptions，恶意/损坏文件
+//     可触发 bad_alloc → 进程崩溃。恢复前需加长度上限与读取完整性校验。
+//     （1.0 决定暂不处理：仅影响本地加载自己/下载的模型，用户自行把关。）
+// M1: .bin 全文件无校验和（.nnpkg 有 sha256）。内容损坏会被静默载入错误权重
+//     且无感知。建议 MODEL_VERSION 5 增加整文件校验和与尾部完整性标记。
+// M2: extra_state 的注释称"旧文件读到 EOF 保持默认（running_mean=0 等）"，
+//     但实现是直接返回错误，注释与实现不符。需统一为按版本回退默认值。
+// ═══════════════════════════════════════════════════════════════════════
+
 // ── 精度标记（写入文件头，加载时校验） ──────────────────────────────────
 // 0 = float (f32), 1 = double (f64)
 inline constexpr uint8_t PRECISION_TAG = sizeof(Scalar) == 4 ? 0 : 1;
@@ -517,6 +528,8 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
 
     // 非可学习状态（如 BatchNorm 的 running_mean/running_var），紧跟在参数之后。
     // 旧文件（无额外状态）读到 EOF 时保持默认（running_mean=0, running_var=1）。
+    // TODO(1.1, M2): 上述"读到 EOF 保持默认"的语义与下方实现不符——read_matrix
+    //   失败时这里直接 return 错误而非回退默认值。需统一为按版本回退。
     auto extras = model.extra_state();
     for (auto& e_tensor : extras)
     {
