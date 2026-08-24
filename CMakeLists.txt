@@ -195,6 +195,24 @@ if(NN_ENABLE_TESTS)
 
 endif()
 
+# ── 测试目标统一处理：输出到 <默认可执行目录>/test，并注册到 ctest ──────────
+# 单一开关 NN_ENABLE_TESTS 同时负责「编译测试程序」与「注册 ctest 测试」：
+#   编译：上面 if(NN_ENABLE_TESTS) 内的 nn_add_executable(...)
+#   注册：这里对 NN_TEST_TARGETS 逐一 add_test
+# 可执行文件位置不硬编码生成器差异，统一设为 ${CMAKE_CURRENT_BINARY_DIR}/test，
+# 由 CMake 自动适配：
+#   - 单配置生成器（Ninja / Make）：默认可执行目录为 build 根目录 → build/test
+#   - 多配置生成器（MSVC）：CMake 自动追加配置子目录 → build/test/Release(或 Debug)
+# add_test 直接传目标名，CTest 会按当前配置自动解析出真实可执行文件路径。
+if(NN_ENABLE_TESTS)
+    enable_testing()
+    foreach(TARGET ${NN_TEST_TARGETS})
+        set_target_properties(${TARGET} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test)
+        add_test(NAME ${TARGET} COMMAND ${TARGET})
+    endforeach()
+endif()
+
 # ── Vulkan GPU 加速（可选） ────────────────────────────────────────────────
 find_package(Vulkan QUIET)
 if(Vulkan_FOUND)
