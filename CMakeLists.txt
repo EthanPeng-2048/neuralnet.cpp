@@ -44,11 +44,20 @@ endif()
 # Debug:   -O0 -g（调试优先）
 # 注意：不使用 -ffast-math，因为它会禁用 NaN/Infinity 支持，影响训练稳定性
 # MSVC 用 /O2 /fp:fast（近似 -O3 + 宽松浮点）；Clang/GCC 用 -O3 + 向量化。
+#
+# -march=native 会让二进制只能在编译机同代 CPU 上运行，分发/换机可能 SIGILL。
+# 默认开启（本地追求最大性能）；发布/CI 构建请用 -DNN_ENABLE_NATIVE=OFF 生成
+# 通用可移植基线（见 .github/workflows 的 Configure 步骤）。
+option(NN_ENABLE_NATIVE "Enable -march=native (max perf, non-portable binary)" ON)
 if(MSVC)
     set(RELEASE_FLAGS /O2 /fp:fast)
     set(DEBUG_FLAGS /Od /Zi)
 else()
-    set(RELEASE_FLAGS -O3 -fno-math-errno -fno-trapping-math -funroll-loops -march=native)
+    if(NN_ENABLE_NATIVE)
+        set(RELEASE_FLAGS -O3 -fno-math-errno -fno-trapping-math -funroll-loops -march=native)
+    else()
+        set(RELEASE_FLAGS -O3 -fno-math-errno -fno-trapping-math -funroll-loops)
+    endif()
     set(DEBUG_FLAGS -O0 -g)
 endif()
 
@@ -345,44 +354,19 @@ else()
     message(STATUS "Vulkan not found. GPU acceleration disabled.")
 endif()
 
-# ── CUDA GPU 加速（可选）──────────────────────────────────────────────────
+# ── CUDA GPU 加速（已停用）────────────────────────────────────────────────
+# TODO(1.1): 恢复 CUDA 后端。
+#   停用原因：M4/M5/M6 融合原语与 DSL 表达式在 CUDA 上仍未实现
+#   （cuda_engine.hpp 直接返回 "未实现"），而 Layer 侧无条件接入融合路径且
+#   无真实回退，导致 CUDA 上 GPT/MNIST 训练推理均无法运行。为避免"文档声称
+#   支持但实际损坏"，1.0.0 起不提供该开关（不定义 NN_ENABLE_CUDA option）。
+#   恢复前置条件：
+#     1) 补齐 cuda/ 下的融合原语，或为各引擎加能力查询并在 Layer 侧做真实回退；
+#     2) 解决 CUDA 内核 --use_fast_math 与主机侧"禁用 fast-math"的数值语义不一致；
+#     3) 解除 cuda/CMakeLists.txt 中硬编码的 MSVC 版本路径（见其中 TODO）。
+#   恢复时：恢复 option(NN_ENABLE_CUDA ...) 与下方 if(NN_ENABLE_CUDA) ... endif()
+#   块，以及 add_subdirectory(cuda) 调用。
 # CUDA 内核由 nvcc 编译为独立目标文件，通过 C-linkage 接口链接到主程序。
 # - Windows：nvcc 以 MSVC 为 host 编译器，与 LLVM/Clang 通过 C ABI 兼容。
 # - Linux：  nvcc 以 GCC/Clang 为 host 编译器，同样通过 C ABI 链接。
-option(NN_ENABLE_CUDA "Enable CUDA GPU acceleration" OFF)
-if(NN_ENABLE_CUDA)
-    find_package(CUDAToolkit QUIET)
-    if(NOT CUDAToolkit_FOUND)
-        message(WARNING "CUDA Toolkit not found. GPU acceleration disabled.")
-    else()
-        add_subdirectory(cuda)
-        if(NN_CUDA_FOUND)
-            set(NN_CUDA_TARGETS ${NN_APP_TARGETS})
-            if(NN_ENABLE_TESTS)
-                list(APPEND NN_CUDA_TARGETS ${NN_TEST_TARGETS})
-            endif()
-
-            foreach(TARGET ${NN_CUDA_TARGETS})
-                target_compile_definitions(${TARGET} PRIVATE NN_HAS_CUDA NN_HAS_CUBLAS)
-                target_include_directories(${TARGET} PRIVATE
-                    ${NN_CUDA_INCLUDE_DIR}
-                    ${CUDAToolkit_INCLUDE_DIRS}
-                )
-                # nvcc 编译的 .obj + CUDA 运行时 + cuBLAS（matmul 加速）
-                target_link_libraries(${TARGET} PRIVATE
-                    ${NN_CUDA_KERNELS_OBJ}
-                    CUDA::cudart
-                    CUDA::cublas
-                    CUDA::cublasLt
-                )
-                add_dependencies(${TARGET} compile_cuda_kernels)
-            endforeach()
-
-            message(STATUS "CUDA GPU acceleration enabled (nvcc → obj → link, cuBLAS enabled)")
-        else()
-            message(WARNING "CUDA not built. GPU acceleration disabled.")
-        endif()
-    endif()
-else()
-    message(STATUS "CUDA disabled. Use -DNN_ENABLE_CUDA=ON to enable.")
-endif()
+message(STATUS "CUDA backend disabled for 1.0.0 (fusion primitives unimplemented). See cuda/ TODO.")

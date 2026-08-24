@@ -56,6 +56,11 @@ protected:
     }
 
     // 为每个参数创建同形状的零初始化 Tensor（供 Momentum/Adam/Muon 复用）
+    // TODO(1.1, S2): 本方法及各 Layer 构造函数/LayerNorm/RMSNorm 构造器/RoPE::rebuild
+    //   中的 `NN_ASSERT(<Result>, ...)` 在 Release(NDEBUG) 下会吞掉引擎错误。
+    //   正确做法（符合项目 Result/expected 规范）：把这些 void/构造函数改为返回
+    //   Result，并将 `NN_ASSERT(r, ...)` 改为 `if (!r) return std::unexpected(r.error());`
+    //   （或前置条件用 NN_REQUIRE）。因属签名级重构，1.0.0 暂缓。
     std::vector<Tensor> create_zero_buffers_() const
     {
         std::vector<Tensor> buffers;

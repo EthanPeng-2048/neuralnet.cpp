@@ -106,9 +106,15 @@ FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU �
 - **方案**：
   1. `MemoryPool` 支持**整块释放**：`allocation_count==0` 且全 region 空闲的 Block，调用 `vkFreeMemory` 并从 `blocks_` 移除（阈值控制，避免抖动）。
   2. 统计上报：`pool_debug_stats()`（总占用/空闲/block 数/碎片比），供 §4 采样确认真实构成。
-  3. 评估按"训练-step 生命周期池 + 长生命周期参数池"分池，避免 step 间临时张量污染参数驻留区；或由 `staging`/`Tensor::destructor` 返回池而非直接 `vkFreeMemory`（现状中间 Tensor 的归还路径需核对）。
+  3. 评估按"训练-step 生命周期池 + 长生命周期参数池"分池，避免 step 间临时张量污染参数驻留区；或由 `staging`/`Tensor::destructor` 返回池而非直接 `vkFreeMemory`。
 - **范围**：仅 `backend/memory_pool.hpp` 与 Tensor 分配/销毁路径，不涉及算法。
 - **风险**：低；需 benchmark 分配总时长与碎片比变化。
+
+> ✅ **已核对（2026-08-24）**：中间 Tensor 的归还路径是安全的，无需修改即可维持正确性。
+> - batch 模式下 `GpuBuffer::~GpuBuffer` **立即 `pool_->free()`**（内存可复用）+ **延迟 `vkDestroyBuffer`**（经 `pending_destroys_` 到 `end_batch` 提交并同步等待后统一销毁），满足 `VUID-vkDestroyBuffer-buffer-00922`。
+> - 安全性由两点保证：① 每个原语 op 录制时都包裹全内存屏障（input: `MEMORY_WRITE→SHADER_READ` + output: `SHADER_WRITE→MEMORY_READ`，src/dstStage 含 COMPUTE），保证 batch 命令缓冲内前序 op 的写入先完成并对后续可见；② 复用只发生在命令缓冲中更靠后的 op，且被复用的 scratch 在读取前总会先被该 op 写满。
+> - 注意：该安全性**依赖每个 op 都插入输出屏障**——新增原语若漏写 output barrier 会重新引入此风险；新增 op 时须照此约定。
+> - 另注意：内存池复用不保证清零，任何"读取前期望为 0"的 op 必须显式 `zero()`（现有模式）。
 
 ### L3 — 自动融合优化 + 优化器降内存（远期）
 - **自动融合（替代手写注意力 kernel）**：不手写任何融合算子；基于既有自动融合/算子生成路径（[09-operator-fusion.md](./09-operator-fusion.md)），将注意力与 softmax 相关子图自动合并为更省内存的单一计算，消除 Q/K/V 激活集物化。
