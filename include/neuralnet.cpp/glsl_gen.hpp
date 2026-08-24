@@ -629,6 +629,7 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
     // 归约：warp shuffle 蝴蝶归约（subgroup）替代共享内存树形归约。
     //   第 1 步：warp 内 subgroupAdd/subgroupMax → 每 warp 一个部分和（零共享/屏障）
     //   第 2 步：首 warp 归约全部 warp 部分和 → s_red[slot][0]（屏障后全线程可见）
+    // 真机(NVIDIA, prime-run)大矩阵实测有效（combine 步骤不再是多步 barrier 串行）。
     const auto emit_tree_reduce = [&](int slot, bool is_max)
     {
         const std::string s = "s_red[" + std::to_string(slot) + "]";
