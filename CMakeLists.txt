@@ -73,88 +73,127 @@ function(nn_add_executable name)
     target_link_libraries(${name} PRIVATE nn_core)
 endfunction()
 
+# ── 测试/验证目标开关（默认关闭） ──────────────────────────────────────
+# 默认只构建应用与基准工具目标，避免生成大量验证程序；
+# 需要时用 -DNN_ENABLE_TESTS=ON 开启全部 gradcheck / *_test / *_probe / *_debug。
+option(NN_ENABLE_TESTS "Build test/verification executables" OFF)
+
+# 收集实际构建的目标，供 GPU/CUDA 统一启用（避免引用未定义目标）
+set(NN_APP_TARGETS "")
+set(NN_TEST_TARGETS "")
+
 # ── MNIST 目标 ──────────────────────────────────────────────────────────────
 nn_add_executable(mnist_train src/mnist_train.cpp)
 nn_add_executable(mnist_infer src/mnist_infer.cpp)
 nn_add_executable(mnist_bench src/mnist_bench.cpp)
+list(APPEND NN_APP_TARGETS mnist_train mnist_infer mnist_bench)
 
 # ── 文本目标（GPT 训练/推理 + BPE 分词器训练/推理） ───────────────────
 nn_add_executable(text_train src/text_train.cpp)
 nn_add_executable(text_infer src/text_infer.cpp)
 nn_add_executable(tokenizer_train src/tokenizer_train.cpp)
 nn_add_executable(tokenizer_infer src/tokenizer_infer.cpp)
+list(APPEND NN_APP_TARGETS text_train text_infer tokenizer_train tokenizer_infer)
 
-# ── 计算性能基准测试 ─────────────────────────────────────────────────────
+# ── 计算性能基准工具 ─────────────────────────────────────────────────────
 nn_add_executable(compute_bench src/compute_bench.cpp)
 nn_add_executable(bench_thresholds src/bench_thresholds.cpp)
+list(APPEND NN_APP_TARGETS compute_bench bench_thresholds)
 
-# ── GPU 测试（需要 Vulkan） ──────────────────────────────────────────────
-nn_add_executable(gpu_test src/gpu_test.cpp)
+# ── 测试 / 验证目标（默认关闭，NN_ENABLE_TESTS=ON 时构建）─────────────
+if(NN_ENABLE_TESTS)
 
-# ── Attention 一致性验证（forward vs forward_step）──────────────────────
-nn_add_executable(attn_consistency_test src/attn_consistency_test.cpp)
+    # GPU 测试（需要 Vulkan）
+    nn_add_executable(gpu_test src/gpu_test.cpp)
+    list(APPEND NN_TEST_TARGETS gpu_test)
 
-# ── SwiGLU 数值梯度检查（gradcheck，验证 split/merge 反向正确性）──────────
-nn_add_executable(swiglu_gradcheck src/swiglu_gradcheck.cpp)
+    # ── Attention 一致性验证（forward vs forward_step）──────────────────────
+    nn_add_executable(attn_consistency_test src/attn_consistency_test.cpp)
+    list(APPEND NN_TEST_TARGETS attn_consistency_test)
 
-# ── RMSNorm 数值梯度检查（gradcheck，验证 gamma/输入梯度） ───────────────
-nn_add_executable(rmsnorm_gradcheck src/rmsnorm_gradcheck.cpp)
+    # ── SwiGLU 数值梯度检查（gradcheck，验证 split/merge 反向正确性）──────────
+    nn_add_executable(swiglu_gradcheck src/swiglu_gradcheck.cpp)
+    list(APPEND NN_TEST_TARGETS swiglu_gradcheck)
 
-# ── GPTModel 整链数值梯度检查（gradcheck，验证多层堆叠全部参数梯度） ──────
-nn_add_executable(gpt_gradcheck src/gpt_gradcheck.cpp)
+    # ── RMSNorm 数值梯度检查（gradcheck，验证 gamma/输入梯度） ───────────────
+    nn_add_executable(rmsnorm_gradcheck src/rmsnorm_gradcheck.cpp)
+    list(APPEND NN_TEST_TARGETS rmsnorm_gradcheck)
 
-# ── GPT 梯度检查点一致性测试（验证激活重计算 L1 与全存结果一致） ───────
-nn_add_executable(gpt_checkpoint_test src/gpt_checkpoint_test.cpp)
+    # ── GPTModel 整链数值梯度检查（gradcheck，验证多层堆叠全部参数梯度） ──────
+    nn_add_executable(gpt_gradcheck src/gpt_gradcheck.cpp)
+    list(APPEND NN_TEST_TARGETS gpt_gradcheck)
 
-# ── activation offload 原语往返验证（GPU 激活 → host → GPU 一致） ──────
-nn_add_executable(offload_test src/offload_test.cpp)
+    # ── GPT 梯度检查点一致性测试（验证激活重计算 L1 与全存结果一致） ───────
+    nn_add_executable(gpt_checkpoint_test src/gpt_checkpoint_test.cpp)
+    list(APPEND NN_TEST_TARGETS gpt_checkpoint_test)
 
-# ── GPT activation offload 一致性测试（GPU：offload vs 全存基线） ──────
-nn_add_executable(gpt_offload_test src/gpt_offload_test.cpp)
+    # ── activation offload 原语往返验证（GPU 激活 → host → GPU 一致） ──────
+    nn_add_executable(offload_test src/offload_test.cpp)
+    list(APPEND NN_TEST_TARGETS offload_test)
 
-# ── 文档感知注意力掩码构建单测（验证块对角∧因果∧ALiBi 组合） ───────────
-nn_add_executable(doc_mask_test src/doc_mask_test.cpp)
+    # ── GPT activation offload 一致性测试（GPU：offload vs 全存基线） ──────
+    nn_add_executable(gpt_offload_test src/gpt_offload_test.cpp)
+    list(APPEND NN_TEST_TARGETS gpt_offload_test)
 
-# ── 文档感知掩码端到端正确性测试（不变性验证：跨文档屏蔽） ───────────────
-nn_add_executable(doc_attn_test src/doc_attn_test.cpp)
+    # ── 文档感知注意力掩码构建单测（验证块对角∧因果∧ALiBi 组合） ───────────
+    nn_add_executable(doc_mask_test src/doc_mask_test.cpp)
+    list(APPEND NN_TEST_TARGETS doc_mask_test)
 
-# ── CausalSelfAttention 数值梯度检查（gradcheck，验证 attention 内部反向） ──
-nn_add_executable(attn_gradcheck src/attn_gradcheck.cpp)
+    # ── 文档感知掩码端到端正确性测试（不变性验证：跨文档屏蔽） ───────────────
+    nn_add_executable(doc_attn_test src/doc_attn_test.cpp)
+    list(APPEND NN_TEST_TARGETS doc_attn_test)
 
-# ── 融合 shader（AOT）GPU 数值验证（ExprSpec 单一事实来源 vs GPU 输出） ──
-nn_add_executable(fused_gpu_test src/fused_gpu_test.cpp)
+    # ── CausalSelfAttention 数值梯度检查（gradcheck，验证 attention 内部反向） ──
+    nn_add_executable(attn_gradcheck src/attn_gradcheck.cpp)
+    list(APPEND NN_TEST_TARGETS attn_gradcheck)
 
-# ── engine.compute(Mat_A + Mat_B) 表达式求值测试（CPU/GPU/CUDA 统一入口） ──
-nn_add_executable(tensor_expr_test src/tensor_expr_test.cpp)
+    # ── 融合 shader（AOT）GPU 数值验证（ExprSpec 单一事实来源 vs GPU 输出） ──
+    nn_add_executable(fused_gpu_test src/fused_gpu_test.cpp)
+    list(APPEND NN_TEST_TARGETS fused_gpu_test)
 
-# ── 统一表达式 DSL 单元测试（编译期融合 + AOT 折叠 + 防漂移断言，纯 CPU） ──
-nn_add_executable(expr_dsl_test src/expr_dsl_test.cpp)
+    # ── engine.compute(Mat_A + Mat_B) 表达式求值测试（CPU/GPU/CUDA 统一入口） ──
+    nn_add_executable(tensor_expr_test src/tensor_expr_test.cpp)
+    list(APPEND NN_TEST_TARGETS tensor_expr_test)
 
-# ── ExprSpec 归约语义测试（M1：归约视图/归约指令 CPU 求值，纯 CPU） ──────
-nn_add_executable(expr_reduce_test src/expr_reduce_test.cpp)
+    # ── 统一表达式 DSL 单元测试（编译期融合 + AOT 折叠 + 防漂移断言，纯 CPU） ──
+    nn_add_executable(expr_dsl_test src/expr_dsl_test.cpp)
+    list(APPEND NN_TEST_TARGETS expr_dsl_test)
 
-# ── IR 优化 pass 测试（IR-A canonicalize + IR-B CSE/寄存器分配，纯 CPU） ─
-nn_add_executable(expr_opt_test src/expr_opt_test.cpp)
+    # ── ExprSpec 归约语义测试（M1：归约视图/归约指令 CPU 求值，纯 CPU） ──────
+    nn_add_executable(expr_reduce_test src/expr_reduce_test.cpp)
+    list(APPEND NN_TEST_TARGETS expr_reduce_test)
 
-# ── ModelSpec 架构校验一致性测试（load_model 文件头 vs 模型规格比对） ────
-nn_add_executable(model_spec_validation_test src/model_spec_validation_test.cpp)
+    # ── IR 优化 pass 测试（IR-A canonicalize + IR-B CSE/寄存器分配，纯 CPU） ─
+    nn_add_executable(expr_opt_test src/expr_opt_test.cpp)
+    list(APPEND NN_TEST_TARGETS expr_opt_test)
 
-# ── Softmax 数值梯度检查（gradcheck，验证 softmax 反向） ───────────────────
-nn_add_executable(softmax_gradcheck src/softmax_gradcheck.cpp)
+    # ── ModelSpec 架构校验一致性测试（load_model 文件头 vs 模型规格比对） ────
+    nn_add_executable(model_spec_validation_test src/model_spec_validation_test.cpp)
+    list(APPEND NN_TEST_TARGETS model_spec_validation_test)
 
-# ── 注意力反向逐级调试探针（对比暴力 Matrix 参考与引擎原语） ────────────
-nn_add_executable(attn_debug src/attn_debug.cpp)
+    # ── Softmax 数值梯度检查（gradcheck，验证 softmax 反向） ───────────────────
+    nn_add_executable(softmax_gradcheck src/softmax_gradcheck.cpp)
+    list(APPEND NN_TEST_TARGETS softmax_gradcheck)
 
-# ── batched_matmul 原语探针（四种转置组合 vs 手工参考） ───────────────────
-nn_add_executable(matmul_probe src/matmul_probe.cpp)
+    # ── 注意力反向逐级调试探针（对比暴力 Matrix 参考与引擎原语） ────────────
+    nn_add_executable(attn_debug src/attn_debug.cpp)
+    list(APPEND NN_TEST_TARGETS attn_debug)
 
-# ── M4 matmul 融合原语测试（bmm_reduce/bmm_denom/bmm_apply，CPU+GPU） ──
-# ── M6 两趟式注意力反向原语测试（bmm_q_backward/bmm_kv_backward，CPU+GPU）
-# ── M5 列式 softmax 融合原语测试（col_softmax_denom/col_softmax_sparse_forward）
-nn_add_executable(matmul_fusion_test src/matmul_fusion_test.cpp)
+    # ── batched_matmul 原语探针（四种转置组合 vs 手工参考） ───────────────────
+    nn_add_executable(matmul_probe src/matmul_probe.cpp)
+    list(APPEND NN_TEST_TARGETS matmul_probe)
 
-# ── M5 稀疏交叉熵融合测试（loss/grad vs 参考，CPU+GPU） ──
-nn_add_executable(ce_fusion_test src/ce_fusion_test.cpp)
+    # ── M4 matmul 融合原语测试（bmm_reduce/bmm_denom/bmm_apply，CPU+GPU） ──
+    # ── M6 两趟式注意力反向原语测试（bmm_q_backward/bmm_kv_backward，CPU+GPU）
+    # ── M5 列式 softmax 融合原语测试（col_softmax_denom/col_softmax_sparse_forward）
+    nn_add_executable(matmul_fusion_test src/matmul_fusion_test.cpp)
+    list(APPEND NN_TEST_TARGETS matmul_fusion_test)
+
+    # ── M5 稀疏交叉熵融合测试（loss/grad vs 参考，CPU+GPU） ──
+    nn_add_executable(ce_fusion_test src/ce_fusion_test.cpp)
+    list(APPEND NN_TEST_TARGETS ce_fusion_test)
+
+endif()
 
 # ── Vulkan GPU 加速（可选） ────────────────────────────────────────────────
 find_package(Vulkan QUIET)
@@ -269,29 +308,11 @@ if(Vulkan_FOUND)
     if(Vulkan_FOUND)
         add_custom_target(compile_gpu_shaders DEPENDS ${GPU_SHADER_HPPS})
 
-        # 为所有目标启用 Vulkan
-        set(NN_GPU_TARGETS
-            mnist_train mnist_infer mnist_bench
-            text_train text_infer
-            tokenizer_train tokenizer_infer
-            compute_bench bench_thresholds gpu_test
-            attn_consistency_test
-            swiglu_gradcheck
-            rmsnorm_gradcheck
-            gpt_gradcheck
-            gpt_checkpoint_test
-            offload_test
-            gpt_offload_test
-            attn_gradcheck
-            fused_gpu_test
-            tensor_expr_test
-            softmax_gradcheck
-            attn_debug
-            matmul_probe
-            matmul_fusion_test
-            ce_fusion_test
-            doc_attn_test
-        )
+        # 为所有实际构建的目标启用 Vulkan（测试目标按 NN_ENABLE_TESTS 决定）
+        set(NN_GPU_TARGETS ${NN_APP_TARGETS})
+        if(NN_ENABLE_TESTS)
+            list(APPEND NN_GPU_TARGETS ${NN_TEST_TARGETS})
+        endif()
 
         foreach(TARGET ${NN_GPU_TARGETS})
             target_compile_definitions(${TARGET} PRIVATE NN_HAS_VULKAN)
@@ -318,20 +339,10 @@ if(NN_ENABLE_CUDA)
     else()
         add_subdirectory(cuda)
         if(NN_CUDA_FOUND)
-            set(NN_CUDA_TARGETS
-                mnist_train mnist_infer mnist_bench
-                text_train text_infer
-                tokenizer_train tokenizer_infer
-                compute_bench bench_thresholds gpu_test
-                attn_consistency_test
-                swiglu_gradcheck
-                rmsnorm_gradcheck
-                gpt_gradcheck
-                gpt_checkpoint_test
-                attn_gradcheck
-                softmax_gradcheck
-                doc_attn_test
-            )
+            set(NN_CUDA_TARGETS ${NN_APP_TARGETS})
+            if(NN_ENABLE_TESTS)
+                list(APPEND NN_CUDA_TARGETS ${NN_TEST_TARGETS})
+            endif()
 
             foreach(TARGET ${NN_CUDA_TARGETS})
                 target_compile_definitions(${TARGET} PRIVATE NN_HAS_CUDA NN_HAS_CUBLAS)
