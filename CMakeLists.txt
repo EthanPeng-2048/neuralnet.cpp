@@ -107,7 +107,8 @@ list(APPEND NN_APP_TARGETS text_train text_infer tokenizer_train tokenizer_infer
 # ── 计算性能基准工具 ─────────────────────────────────────────────────────
 nn_add_executable(compute_bench src/compute_bench.cpp)
 nn_add_executable(bench_thresholds src/bench_thresholds.cpp)
-list(APPEND NN_APP_TARGETS compute_bench bench_thresholds)
+nn_add_executable(reduce_bench src/reduce_bench.cpp)
+list(APPEND NN_APP_TARGETS compute_bench bench_thresholds reduce_bench)
 
 # ── 测试 / 验证目标（默认关闭，NN_ENABLE_TESTS=ON 时构建）─────────────
 if(NN_ENABLE_TESTS)
