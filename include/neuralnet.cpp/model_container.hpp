@@ -20,10 +20,12 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "core_assert.hpp"
 #include "compute_layer.hpp"
+#include "model_spec.hpp"
 
 namespace nn
 {
@@ -33,6 +35,9 @@ class Model
 private:
     observer_ptr<ComputeEngine> engine_;
     std::vector<std::unique_ptr<Layer>> layers_;
+    // 可选架构规格：由 build_*_from_spec 工厂在构建时设置，供 load_model
+    // 校验文件头部与模型架构是否一致。为空表示未记录（跳过校验，向后兼容）。
+    std::optional<ModelSpec> spec_;
 
 public:
     Model() = default;
@@ -79,6 +84,11 @@ public:
         NN_ASSERT(index < layers_.size(), "Model::layer_at index out of range");
         return *layers_[index];
     }
+
+    // ── 架构规格（可选）：记录本模型对应的 ModelSpec ────────────────────
+    // build_*_from_spec 工厂自动设置；也可手动 set_spec 以启用 load_model 校验。
+    void set_spec(const ModelSpec& spec) { spec_ = spec; }
+    [[nodiscard]] const std::optional<ModelSpec>& spec() const noexcept { return spec_; }
 
     // ── batch 录制粒度：在 Transformer block 间按间隔 flush ──
     // 通过 Layer 基类虚函数分发：GPTModel override 生效，

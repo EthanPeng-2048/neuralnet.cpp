@@ -179,7 +179,10 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
 {
     auto cfg_r = cnn_config_from_spec(spec);
     if (!cfg_r) return std::unexpected(std::move(cfg_r).error());
-    return build_cnn_model(engine, *cfg_r);
+    auto model = build_cnn_model(engine, *cfg_r);
+    if (model)
+        model->set_spec(spec);  // 记录架构规格，供 load_model 校验
+    return model;
 }
 
 } // namespace nn

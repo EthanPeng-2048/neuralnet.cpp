@@ -178,18 +178,31 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
     ComputeEngine& engine, const ModelSpec &spec)
 {
     if (spec.is_mlp())
-        return build_mnist_mlp_model(engine, spec.layer_dims, spec.norm_type);
+    {
+        auto model = build_mnist_mlp_model(engine, spec.layer_dims, spec.norm_type);
+        if (model)
+            model->set_spec(spec);  // 记录架构规格，供 load_model 校验
+        return model;
+    }
 
     if (spec.is_transformer())
     {
         const std::size_t patch_size = spec.patch_size != 0 ? spec.patch_size : MNIST_PATCH_SIZE;
-        return build_mnist_transformer_model(
+        auto model = build_mnist_transformer_model(
             engine, MNIST_IMG_SIZE, patch_size,
             spec.d_model, spec.num_heads, spec.d_ff, spec.num_layers);
+        if (model)
+            model->set_spec(spec);  // 记录架构规格，供 load_model 校验
+        return model;
     }
 
     if (spec.is_cnn())
-        return build_cnn_model_from_spec(engine, spec);
+    {
+        auto model = build_cnn_model_from_spec(engine, spec);
+        if (model)
+            model->set_spec(spec);  // 记录架构规格，供 load_model 校验
+        return model;
+    }
 
     return std::unexpected(Error{
         "Invalid ModelSpec type for MNIST: expected MLP, Transformer, or CNN"});
