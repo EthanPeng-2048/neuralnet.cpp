@@ -91,24 +91,22 @@ option(NN_ENABLE_TESTS "Build test/verification executables" OFF)
 set(NN_APP_TARGETS "")
 set(NN_TEST_TARGETS "")
 
-# ── MNIST 目标 ──────────────────────────────────────────────────────────────
+# 收集实际构建的目标，供 GPU/CUDA 统一启用（避免引用未定义目标）
+set(NN_APP_TARGETS "")
+set(NN_TEST_TARGETS "")
+set(NN_BENCH_TARGETS "")   # 性能基准（仅测试构建，手工运行，不注册 ctest）
+
+# ── MNIST 目标（标准构建核心应用） ───────────────────────────────────────
 nn_add_executable(mnist_train src/mnist_train.cpp)
 nn_add_executable(mnist_infer src/mnist_infer.cpp)
-nn_add_executable(mnist_bench src/mnist_bench.cpp)
-list(APPEND NN_APP_TARGETS mnist_train mnist_infer mnist_bench)
+list(APPEND NN_APP_TARGETS mnist_train mnist_infer)
 
-# ── 文本目标（GPT 训练/推理 + BPE 分词器训练/推理） ───────────────────
+# ── 文本目标（GPT 训练/推理 + BPE 分词器训练/推理，标准构建核心应用） ──
 nn_add_executable(text_train src/text_train.cpp)
 nn_add_executable(text_infer src/text_infer.cpp)
 nn_add_executable(tokenizer_train src/tokenizer_train.cpp)
 nn_add_executable(tokenizer_infer src/tokenizer_infer.cpp)
 list(APPEND NN_APP_TARGETS text_train text_infer tokenizer_train tokenizer_infer)
-
-# ── 计算性能基准工具 ─────────────────────────────────────────────────────
-nn_add_executable(compute_bench src/compute_bench.cpp)
-nn_add_executable(bench_thresholds src/bench_thresholds.cpp)
-nn_add_executable(reduce_bench src/reduce_bench.cpp)
-list(APPEND NN_APP_TARGETS compute_bench bench_thresholds reduce_bench)
 
 # ── 测试 / 验证目标（默认关闭，NN_ENABLE_TESTS=ON 时构建）─────────────
 if(NN_ENABLE_TESTS)
@@ -193,14 +191,6 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(softmax_gradcheck src/softmax_gradcheck.cpp)
     list(APPEND NN_TEST_TARGETS softmax_gradcheck)
 
-    # ── 注意力反向逐级调试探针（对比暴力 Matrix 参考与引擎原语） ────────────
-    nn_add_executable(attn_debug src/attn_debug.cpp)
-    list(APPEND NN_TEST_TARGETS attn_debug)
-
-    # ── batched_matmul 原语探针（四种转置组合 vs 手工参考） ───────────────────
-    nn_add_executable(matmul_probe src/matmul_probe.cpp)
-    list(APPEND NN_TEST_TARGETS matmul_probe)
-
     # ── M4 matmul 融合原语测试（bmm_reduce/bmm_denom/bmm_apply，CPU+GPU） ──
     # ── M6 两趟式注意力反向原语测试（bmm_q_backward/bmm_kv_backward，CPU+GPU）
     # ── M5 列式 softmax 融合原语测试（col_softmax_denom/col_softmax_sparse_forward）
@@ -210,6 +200,13 @@ if(NN_ENABLE_TESTS)
     # ── M5 稀疏交叉熵融合测试（loss/grad vs 参考，CPU+GPU） ──
     nn_add_executable(ce_fusion_test src/ce_fusion_test.cpp)
     list(APPEND NN_TEST_TARGETS ce_fusion_test)
+
+    # ── 性能基准工具（仅测试构建；手工运行，不注册 ctest） ──
+    nn_add_executable(mnist_bench src/mnist_bench.cpp)
+    nn_add_executable(compute_bench src/compute_bench.cpp)
+    nn_add_executable(bench_thresholds src/bench_thresholds.cpp)
+    nn_add_executable(reduce_bench src/reduce_bench.cpp)
+    list(APPEND NN_BENCH_TARGETS mnist_bench compute_bench bench_thresholds reduce_bench)
 
 endif()
 
@@ -228,6 +225,11 @@ if(NN_ENABLE_TESTS)
         set_target_properties(${TARGET} PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test)
         add_test(NAME ${TARGET} COMMAND ${TARGET})
+    endforeach()
+    # 基准工具输出到 test/，但不注册 ctest（手工运行）
+    foreach(TARGET ${NN_BENCH_TARGETS})
+        set_target_properties(${TARGET} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test)
     endforeach()
 endif()
 
@@ -354,6 +356,7 @@ if(Vulkan_FOUND)
         set(NN_GPU_TARGETS ${NN_APP_TARGETS})
         if(NN_ENABLE_TESTS)
             list(APPEND NN_GPU_TARGETS ${NN_TEST_TARGETS})
+            list(APPEND NN_GPU_TARGETS ${NN_BENCH_TARGETS})
         endif()
 
         foreach(TARGET ${NN_GPU_TARGETS})
