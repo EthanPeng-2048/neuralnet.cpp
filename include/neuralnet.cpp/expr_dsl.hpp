@@ -33,6 +33,7 @@
 #include "compute_engine.hpp"
 #include "expr_spec.hpp"
 #include "expr_registry.hpp"
+#include "expr_graph.hpp"   // IR-C：录制图（begin_expr/end_expr 扫描登记）
 #include "algebra_expr.hpp"   // nn::Expression / nn::BoolExpression 概念
 #include "algebra_ops.hpp"    // nn::ops（唯一算子来源，含 op_id()）
 #include "algebra_matrix.hpp" // Matrix
@@ -458,6 +459,16 @@ template <typename E>
     auto [spec, inputs] = to_expr_spec(e);
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)
         return std::unexpected(v.error());
+    // IR-C：begin_expr/end_expr 录制段内，表达式加入录制图（而非直接登记）；
+    // end_expr 时 CpuEngine 融合分析并登记融合后的复合 spec（闭合世界）。
+    if (auto* g = fused::recording_graph())
+    {
+        const int node = g->add_node(spec, inputs, rows, cols,
+                                     /*vector_out=*/false);
+        Tensor t = Tensor::cpu(rows, cols);
+        t.set_virtual_tag(static_cast<std::uint64_t>(node) + 1);
+        return t;
+    }
     fused::global_registry().add(spec);
     return Tensor::cpu(rows, cols);
 #else
@@ -530,11 +541,24 @@ template <typename E>
     auto [spec, inputs] = to_expr_spec(e);
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)
         return std::unexpected(v.error());
-    fused::global_registry().add(spec);
     const int raxis = expr_spec_reduce_axis(spec);
-    if (raxis == 0) return Tensor::cpu(rows, 1);
-    if (raxis == 1) return Tensor::cpu(1, cols);
-    return Tensor::cpu(rows, cols);
+    const auto placeholder = [&](int node) {
+        Tensor t = (raxis == 0) ? Tensor::cpu(rows, 1)
+                 : (raxis == 1) ? Tensor::cpu(1, cols)
+                 : Tensor::cpu(rows, cols);
+        if (node >= 0)
+            t.set_virtual_tag(static_cast<std::uint64_t>(node) + 1);
+        return t;
+    };
+    // IR-C：录制段内加入图（end_expr 时融合登记）；否则直接登记
+    if (auto* g = fused::recording_graph())
+    {
+        const int node = g->add_node(spec, inputs, rows, cols,
+                                     /*vector_out=*/true);
+        return placeholder(node);
+    }
+    fused::global_registry().add(spec);
+    return placeholder(-1);
 #else
     auto [spec, inputs] = to_expr_spec(e);
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)

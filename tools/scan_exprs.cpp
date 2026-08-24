@@ -104,6 +104,20 @@ int main(int argc, char* argv[])
         (void)ln.backward(engine, grad);
     }
 
+    // ── FusedChainLayer（IR-C：begin_expr/end_expr 图 IR 链式融合）────────
+    // forward 的三个逐元素表达式在 end_expr 时融合成单个 kernel（t/u 内联为
+    // 寄存器）。必须 dry-run 覆盖本路径：GPU 运行时 begin_expr/end_expr 融合
+    // 出的复合 spec 才能在 fused_registry 中命中（闭合世界两端一致）。
+    // backward 为独立表达式（非录制段），单独登记。
+    {
+        const std::size_t F = 8, B = 5;
+        nn::FusedChainLayer chain(engine, F);
+        nn::Tensor input = nn::Tensor::cpu(F, B);
+        (void)chain.forward(engine, input);
+        nn::Tensor grad = nn::Tensor::cpu(F, B);
+        (void)chain.backward(engine, grad);
+    }
+
     auto& reg = nn::fused::global_registry();
     if (!nn::fused::write_registry(out_path, reg))
     {
