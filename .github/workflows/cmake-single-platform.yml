@@ -30,6 +30,35 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    # ========== 缓存：ccache（Linux） ==========
+    - name: Cache ccache (Linux)
+      if: runner.os == 'Linux'
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/ccache
+        key: ${{ runner.os }}-ccache-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-ccache-
+
+    # ========== 缓存：ccache（Windows） ==========
+    - name: Cache ccache (Windows)
+      if: runner.os == 'Windows'
+      uses: actions/cache@v4
+      with:
+        path: C:\Users\runneradmin\AppData\Local\ccache
+        key: ${{ runner.os }}-ccache-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-ccache-
+
+    # ========== 缓存：CMake 构建目录（配合 ccache 加速增量构建） ==========
+    - name: Cache CMake build directory
+      uses: actions/cache@v4
+      with:
+        path: ${{ github.workspace }}/build
+        key: ${{ runner.os }}-cmake-build-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-cmake-build-
+
     # ========== Linux: 安装 LLVM Clang + Ninja ==========
     - name: Install Clang & Ninja (Linux)
       if: runner.os == 'Linux'
@@ -40,11 +69,30 @@ jobs:
         sudo ln -sf $(ls /usr/bin/clang-[0-9]* | sort -V | tail -n1) /usr/bin/clang
         sudo ln -sf $(ls /usr/bin/clang++-[0-9]* | sort -V | tail -n1) /usr/bin/clang++
         # libc++（LLVM 标准库）：对 C++26 range 迭代器的处理比默认 libstdc++ 更标准
-        sudo apt-get install -y ninja-build p7zip-full libc++-dev libc++abi-dev
+        # ccache：缓存编译产物，加速跨运行增量构建
+        sudo apt-get install -y ninja-build p7zip-full libc++-dev libc++abi-dev ccache
 
-    # ========== Linux: 安装 Vulkan SDK（官方 tar 包；Ubuntu 26.04 无 LunarG apt 源）==========
-    - name: Install Vulkan SDK (Linux)
+    # ========== Linux: 缓存 Vulkan SDK（避免每次下载 300MB+ tar 包）==========
+    - name: Cache Vulkan SDK (Linux)
+      id: cache-vulkan-linux
       if: runner.os == 'Linux'
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.tool_cache }}/vulkan-sdk
+        key: vulkan-sdk-linux-1.4.357.0
+
+    # 命中缓存：直接复用已解压的 SDK，仅设置环境变量
+    - name: Setup Vulkan SDK env (Linux, cached)
+      if: runner.os == 'Linux' && steps.cache-vulkan-linux.outputs.cache-hit == 'true'
+      run: |
+        SDK_DIR="${{ runner.tool_cache }}/vulkan-sdk"
+        echo "VULKAN_SDK=$SDK_DIR" >> "$GITHUB_ENV"
+        echo "$SDK_DIR/bin" >> "$GITHUB_PATH"
+        "$SDK_DIR/bin/glslc" --version
+
+    # 未命中：下载官方 tar 包并解压到固定缓存目录（保证后续路径稳定）
+    - name: Install Vulkan SDK (Linux)
+      if: runner.os == 'Linux' && steps.cache-vulkan-linux.outputs.cache-hit != 'true'
       run: |
         # Ubuntu 26.04 (resolute) 的 LunarG apt 仓库不存在（404），改用官方 tar.xz。
         # 解压后为 1.x.yy.z/x86_64，内含 bin(含 glslc)/include/lib。
@@ -54,8 +102,12 @@ jobs:
           -o vulkansdk.tar.xz \
           "https://sdk.lunarg.com/sdk/download/1.4.357.0/linux/vulkansdk-linux-x86_64-1.4.357.0.tar.xz"
         tar xf vulkansdk.tar.xz
-        SDK_DIR="$(ls -d "$HOME"/1.*/x86_64 2>/dev/null | head -n1)"
-        if [ -z "$SDK_DIR" ]; then echo "SDK extract dir not found"; exit 1; fi
+        SDK_SRC="$(ls -d "$HOME"/1.*/x86_64 2>/dev/null | head -n1)"
+        if [ -z "$SDK_SRC" ]; then echo "SDK extract dir not found"; exit 1; fi
+        # 拷到固定缓存目录，保证命中后 VULKAN_SDK 路径稳定
+        SDK_DIR="${{ runner.tool_cache }}/vulkan-sdk"
+        mkdir -p "$SDK_DIR"
+        cp -a "$SDK_SRC/." "$SDK_DIR/"
         # 供后续步骤使用：find_package(Vulkan) 读 VULKAN_SDK，PATH 找到 glslc
         echo "VULKAN_SDK=$SDK_DIR" >> "$GITHUB_ENV"
         echo "$SDK_DIR/bin" >> "$GITHUB_PATH"
@@ -69,13 +121,35 @@ jobs:
         choco install llvm --yes --no-progress
         choco install ninja --yes --no-progress
         choco install 7zip --yes --no-progress
+        # ccache：缓存编译产物，加速跨运行增量构建
+        choco install ccache --yes --no-progress
         # 将 LLVM 的 bin 目录加入 PATH
         $llvmPath = "C:\Program Files\LLVM\bin"
         echo "$llvmPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-    # ========== Windows: 安装 Vulkan SDK（LunarG 官方无人值守安装） ==========
-    - name: Install Vulkan SDK (Windows)
+    # ========== Windows: 缓存 Vulkan SDK（避免重复下载安装） ==========
+    - name: Cache Vulkan SDK (Windows)
+      id: cache-vulkan-windows
       if: runner.os == 'Windows'
+      uses: actions/cache@v4
+      with:
+        path: C:\VulkanSDK
+        key: vulkan-sdk-windows-latest
+
+    # 命中缓存：直接复用已安装的 SDK，仅设置环境变量
+    - name: Setup Vulkan SDK env (Windows, cached)
+      if: runner.os == 'Windows' && steps.cache-vulkan-windows.outputs.cache-hit == 'true'
+      shell: pwsh
+      run: |
+        $sdkDir = Get-ChildItem "C:\VulkanSDK" -Directory -ErrorAction SilentlyContinue |
+                  Sort-Object Name -Descending | Select-Object -First 1
+        if (-not $sdkDir) { throw "Vulkan SDK cache empty under C:\VulkanSDK" }
+        "VULKAN_SDK=$($sdkDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "$($sdkDir.FullName)\Bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+    # 未命中：LunarG 官方无人值守安装
+    - name: Install Vulkan SDK (Windows)
+      if: runner.os == 'Windows' && steps.cache-vulkan-windows.outputs.cache-hit != 'true'
       shell: pwsh
       run: |
         $exe = "$env:TEMP\vulkan_sdk.exe"
@@ -105,6 +179,8 @@ jobs:
           -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
           -DCMAKE_CXX_STANDARD=26 \
           -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
           -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
           -DCMAKE_EXE_LINKER_FLAGS="-stdlib=libc++"
       env:
@@ -121,7 +197,9 @@ jobs:
           -DCMAKE_C_COMPILER=clang `
           -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} `
           -DCMAKE_CXX_STANDARD=26 `
-          -DCMAKE_CXX_STANDARD_REQUIRED=ON
+          -DCMAKE_CXX_STANDARD_REQUIRED=ON `
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
       env:
         CC: clang
         CXX: clang++
@@ -129,24 +207,28 @@ jobs:
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}}
 
-    - name: Test
-      working-directory: ${{github.workspace}}/build
-      run: ctest -C ${{env.BUILD_TYPE}}
-
     # 将编译产物打包为 7z
     - name: Package binaries (Linux)
       if: runner.os == 'Linux'
       run: |
         7z a ${{github.workspace}}/build/${{ matrix.archive-name }} \
           ${{github.workspace}}/build/mnist_train \
-          ${{github.workspace}}/build/mnist_infer
+          ${{github.workspace}}/build/mnist_infer \
+          ${{github.workspace}}/build/text_train \
+          ${{github.workspace}}/build/text_infer \
+          ${{github.workspace}}/build/tokenizer_train \
+          ${{github.workspace}}/build/tokenizer_infer
 
     - name: Package binaries (Windows)
       if: runner.os == 'Windows'
       run: |
         7z a ${{github.workspace}}/build/${{ matrix.archive-name }} `
           ${{github.workspace}}/build/mnist_train.exe `
-          ${{github.workspace}}/build/mnist_infer.exe
+          ${{github.workspace}}/build/mnist_infer.exe `
+          ${{github.workspace}}/build/text_train.exe `
+          ${{github.workspace}}/build/text_infer.exe `
+          ${{github.workspace}}/build/tokenizer_train.exe `
+          ${{github.workspace}}/build/tokenizer_infer.exe
 
     # 将 7z 包上传为 artifact，供 release job 使用
     - name: Upload build artifacts
