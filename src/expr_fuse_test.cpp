@@ -183,6 +183,48 @@ int run_non_recording(CpuEngine& cpu, GpuEngine& gpu)
     return ok ? 0 : 1;
 }
 
+// ── vec4 向量化路径验证（cols%4==0）──────────────────────────────────────
+// 用已登记的 vec4 合格表达式（Linear × RowBroadcast × const，即 FusedChain
+// backward 的 grad*gamma*2）在 cols 为 4 的倍数时运行，确保 glsl_gen 的 vec4
+// 快速路径（vec4 加载/广播/运算/存储）数值与 CPU 参考一致。尾部与非 4 倍数
+// cols 的标量回退由 run_non_recording（C=6）覆盖。
+int run_vec4_path(CpuEngine& cpu, GpuEngine& gpu)
+{
+    const std::size_t R = 4;
+    int fail = 0;
+    for (const std::size_t C : {std::size_t{4}, std::size_t{8}, std::size_t{12}})
+    {
+        std::mt19937 rng(42 + static_cast<unsigned>(C));
+        std::uniform_real_distribution<Scalar> dist(-1.0f, 1.0f);
+        Matrix x(R, C);
+        for (auto& v : x.span()) v = dist(rng);
+        Matrix g(R, 1);
+        for (auto& v : g.span()) v = 0.5f + 0.01f * static_cast<Scalar>(rng() % 10);
+
+        const Tensor xt = Tensor::from_matrix(Matrix(x));
+        const Tensor gt = Tensor::from_matrix(Matrix(g));
+        auto cr = nn::dsl::compute(cpu,
+            nn::dsl::leaf(xt) * nn::dsl::row_broadcast(gt) * Scalar{2}, R, C);
+        auto gr = nn::dsl::compute(gpu,
+            nn::dsl::leaf(xt) * nn::dsl::row_broadcast(gt) * Scalar{2}, R, C);
+        if (!cr) { std::cerr << "  CPU 求值失败\n"; return 1; }
+        if (!gr)
+        {
+            std::cerr << "  GPU vec4 路径失败（未命中 AOT shader？）: "
+                      << gr.error().message << "\n";
+            return 1;
+        }
+        auto gm = gpu.to_matrix(*gr);
+        if (!gm) { std::cerr << "  GPU 结果下载失败\n"; return 1; }
+        const Scalar err = max_abs_diff(cr->cpu_matrix(), *gm);
+        const bool ok = err < 1e-4f;
+        std::cout << "[" << (ok ? "PASS" : "FAIL") << "] vec4 向量化路径 (cols=" << C << ")"
+                  << "  err=" << std::scientific << std::setprecision(2) << err << "\n";
+        fail += ok ? 0 : 1;
+    }
+    return fail == 0 ? 0 : 1;
+}
+
 int main()
 {
     std::cout << "========================================\n"
@@ -204,6 +246,7 @@ int main()
     fail += run_fused_chain(*cpu_engine, *gpu_engine);
     fail += run_manual_recording(*cpu_engine, *gpu_engine);
     fail += run_non_recording(*cpu_engine, *gpu_engine);
+    fail += run_vec4_path(*cpu_engine, *gpu_engine);
 
     std::cout << (fail == 0 ? "ALL PASS\n" : "FAILED\n");
     return fail == 0 ? 0 : 1;

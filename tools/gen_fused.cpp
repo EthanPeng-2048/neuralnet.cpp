@@ -42,8 +42,10 @@ namespace
 {
     // 仅给 glslc 路径加引号；src/dst 为无空格路径（out_dir 由 CMake 控制），
     // 正斜杠相对路径不加引号，避免 cmd/system 解析问题。
+    // --target-env=vulkan1.2 → SPIR-V 1.5：subgroup 算子（GL_KHR_shader_subgroup_*）
+    // 需 SPIR-V ≥1.3；现基本找不到 <1.2 的显卡，直接定 vulkan1.2。
     const std::string cmd =
-        "\"" + glslc + "\" -fshader-stage=compute -o " + dst + " " + src;
+        "\"" + glslc + "\" -fshader-stage=compute --target-env=vulkan1.2 -o " + dst + " " + src;
     return std::system(cmd.c_str()) == 0;
 }
 
@@ -150,6 +152,7 @@ int main(int argc, char* argv[])
     H << "    std::size_t spirv_words;\n";
     H << "    int         reduce_axis;   // -1=逐元素, 0=行归约, 1=列归约\n";
     H << "    std::uint32_t view_param_count;  // 运行时视图参数个数（RowMod/RotateHalf 的 push constant vp 槽）\n";
+    H << "    std::uint32_t vec_width;    // 每线程处理元素数（1=标量, 4=vec4）\n";
     H << "};\n\n";
 
     for (const auto& spec : reg.specs)
@@ -216,11 +219,13 @@ int main(int argc, char* argv[])
         if (raxis == -2)
             continue;  // 与上方跳过保持一致
         const std::string key = nn::expr_spec_key(spec);
+        const std::uint32_t vecw =
+            (raxis < 0 && nn::glsl_vec4_eligible(spec)) ? 4u : 1u;
         H << "    { \"" << key << "\",\n        " << emit_spec(spec) << ",\n"
           << "        kSpirv_" << key
           << ", sizeof(kSpirv_" << key << ")/sizeof(std::uint32_t), "
           << raxis << ", "
-          << nn::expr_spec_runtime_view_param_count(spec) << " },\n";
+          << nn::expr_spec_runtime_view_param_count(spec) << ", " << vecw << " },\n";
     }
     H << "};\n";
     H << "inline constexpr std::size_t kFusedShaderCount =\n"

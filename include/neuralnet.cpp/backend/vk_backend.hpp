@@ -766,6 +766,8 @@ private:
     std::unordered_map<std::string, int> fused_reduce_axis_;
     // 运行时视图参数个数（RowMod/RotateHalf 的 vp push constant 槽数）
     std::unordered_map<std::string, std::uint32_t> fused_view_param_counts_;
+    // 每线程处理元素数（1=标量, 4=vec4；决定 dispatch 宽度缩放）
+    std::unordered_map<std::string, std::uint32_t> fused_vec_width_;
 
     std::unique_ptr<MemoryPool> memory_pool_;
     std::unique_ptr<StagingRing> staging_ring_;
@@ -1312,6 +1314,7 @@ public:
                 fused_pipelines_.emplace(fs.key, std::move(*fp_r));
                 fused_reduce_axis_.emplace(fs.key, fs.reduce_axis);
                 fused_view_param_counts_.emplace(fs.key, fs.view_param_count);
+                fused_vec_width_.emplace(fs.key, fs.vec_width);
             }
         }
 #endif
@@ -3170,11 +3173,13 @@ public:
         vkCmdPushConstants(cmd, pipeline.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, static_cast<std::uint32_t>(pc.size()), pc.data());
 
-        // dispatch：逐元素 = ceil(count/256)；行归约 = rows 个工作组；列归约 = cols 个工作组
+        // dispatch：逐元素 = ceil(count/(256*vec_width))；行归约 = rows 个工作组；列归约 = cols 个工作组
+        const std::uint32_t vec_width = fused_vec_width_.count(shader_name)
+            ? fused_vec_width_.at(shader_name) : 1u;
         const std::uint32_t wg_count =
             (raxis == 0) ? static_cast<std::uint32_t>(rows)
             : (raxis == 1) ? static_cast<std::uint32_t>(cols)
-            : (count + 255) / 256;
+            : (count + 256u * vec_width - 1u) / (256u * vec_width);
         vkCmdDispatch(cmd, wg_count, 1, 1);
         record_output_barrier(cmd, output.buffer().impl());
 
