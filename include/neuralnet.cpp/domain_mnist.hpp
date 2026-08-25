@@ -110,12 +110,21 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
         std::size_t in_dim  = layer_dims[i];
         std::size_t out_dim = layer_dims[i + 1];
 
-        model.add<Linear>(engine, in_dim, out_dim);
+        {
+            auto r = model.add<Linear>(in_dim, out_dim);
+            if (!r) return std::unexpected(r.error());
+        }
 
         if (i < layer_dims.size() - 2)
         {
-            model.add_layer(make_norm_layer(engine, out_dim, norm_type))
-                 .add<GeLU>();
+            {
+                auto r = model.add_layer(make_norm_layer(out_dim, norm_type));
+                if (!r) return std::unexpected(r.error());
+            }
+            {
+                auto r = model.add<GeLU>();
+                if (!r) return std::unexpected(r.error());
+            }
         }
     }
     return model;
@@ -146,9 +155,18 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
     const std::size_t num_patches = grid_size * grid_size;
 
     Model model(engine);
-    model.add<PatchEmbedding>(engine, img_size, patch_size, d_model);
-    model.add<TransformerEncoder>(engine, d_model, num_heads, d_ff, num_layers, num_patches);
-    model.add<Linear>(engine, d_model, MNIST_NUM_CLASSES);
+    {
+        auto r = model.add<PatchEmbedding>(img_size, patch_size, d_model);
+        if (!r) return std::unexpected(r.error());
+    }
+    {
+        auto r = model.add<TransformerEncoder>(d_model, num_heads, d_ff, num_layers, num_patches);
+        if (!r) return std::unexpected(r.error());
+    }
+    {
+        auto r = model.add<Linear>(d_model, MNIST_NUM_CLASSES);
+        if (!r) return std::unexpected(r.error());
+    }
     return model;
 }
 

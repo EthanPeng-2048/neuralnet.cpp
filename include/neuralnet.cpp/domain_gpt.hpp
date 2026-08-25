@@ -56,9 +56,12 @@ struct GptConfig {
         return std::unexpected(Error{"GPT d_model must be divisible by num_heads"});
 
     Model model(engine);
-    model.add<GPTModel>(engine, cfg.vocab_size, cfg.d_model, cfg.seq_len,
-                        cfg.num_heads, cfg.d_ff, cfg.num_layers, cfg.pos_enc,
-                        cfg.activation, cfg.norm_type);
+    {
+        auto r = model.add<GPTModel>(cfg.vocab_size, cfg.d_model, cfg.seq_len,
+                                     cfg.num_heads, cfg.d_ff, cfg.num_layers, cfg.pos_enc,
+                                     cfg.activation, cfg.norm_type);
+        if (!r) return std::unexpected(r.error());
+    }
     return model;
 }
 

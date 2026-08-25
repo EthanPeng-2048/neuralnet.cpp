@@ -90,10 +90,6 @@ option(NN_ENABLE_TESTS "Build test/verification executables" OFF)
 # 收集实际构建的目标，供 GPU/CUDA 统一启用（避免引用未定义目标）
 set(NN_APP_TARGETS "")
 set(NN_TEST_TARGETS "")
-
-# 收集实际构建的目标，供 GPU/CUDA 统一启用（避免引用未定义目标）
-set(NN_APP_TARGETS "")
-set(NN_TEST_TARGETS "")
 set(NN_BENCH_TARGETS "")   # 性能基准（仅测试构建，手工运行，不注册 ctest）
 
 # ── MNIST 目标（标准构建核心应用） ───────────────────────────────────────

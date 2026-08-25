@@ -56,19 +56,15 @@ protected:
     }
 
     // 为每个参数创建同形状的零初始化 Tensor（供 Momentum/Adam/Muon 复用）
-    // TODO(1.1, S2): 本方法及各 Layer 构造函数/LayerNorm/RMSNorm 构造器/RoPE::rebuild
-    //   中的 `NN_ASSERT(<Result>, ...)` 在 Release(NDEBUG) 下会吞掉引擎错误。
-    //   正确做法（符合项目 Result/expected 规范）：把这些 void/构造函数改为返回
-    //   Result，并将 `NN_ASSERT(r, ...)` 改为 `if (!r) return std::unexpected(r.error());`
-    //   （或前置条件用 NN_REQUIRE）。因属签名级重构，1.0.0 暂缓。
-    std::vector<Tensor> create_zero_buffers_() const
+    [[nodiscard]] Result<std::vector<Tensor>> create_zero_buffers_() const
     {
         std::vector<Tensor> buffers;
         buffers.reserve(params_.size());
         for (auto& p : params_)
         {
             auto buf = engine_.create_tensor(p.get().rows(), p.get().cols());
-            { auto r = engine_.zero(buf); NN_ASSERT(r, r ? "" : r.error().message.c_str()); }
+            auto r = engine_.zero(buf);
+            if (!r) return std::unexpected(r.error());
             buffers.push_back(std::move(buf));
         }
         return buffers;
@@ -206,8 +202,17 @@ public:
                      std::vector<TensorRef> grads,
                      Scalar lr, Scalar beta = 0.9)
         : Optimizer(engine, std::move(params), std::move(grads)),
-          lr_(lr), beta_(beta),
-          velocities_(create_zero_buffers_()) {}
+          lr_(lr), beta_(beta)
+    {
+        auto v_r = create_zero_buffers_();
+        if (!v_r)
+        {
+            std::fprintf(stderr, "SGDWithMomentum init failed: %s\n",
+                         v_r.error().message.c_str());
+            std::abort();
+        }
+        velocities_ = std::move(*v_r);
+    }
 
     void set_lr(Scalar lr) override { lr_ = lr; }
 
@@ -310,8 +315,22 @@ protected:
 
     void init_moments_()
     {
-        m_ = create_zero_buffers_();
-        v_ = create_zero_buffers_();
+        auto m_r = create_zero_buffers_();
+        if (!m_r)
+        {
+            std::fprintf(stderr, "Adam init (m_) failed: %s\n",
+                         m_r.error().message.c_str());
+            std::abort();
+        }
+        m_ = std::move(*m_r);
+        auto v_r = create_zero_buffers_();
+        if (!v_r)
+        {
+            std::fprintf(stderr, "Adam init (v_) failed: %s\n",
+                         v_r.error().message.c_str());
+            std::abort();
+        }
+        v_ = std::move(*v_r);
     }
 
     // 偏差修正系数（Adam/AdamW 共用）：给定下一步步数 t_next，
@@ -539,8 +558,17 @@ public:
          Scalar ns_eps = 1e-7f)
         : Optimizer(engine, std::move(params), std::move(grads)),
           lr_(lr), momentum_(momentum), nesterov_(nesterov),
-          ns_steps_(ns_steps), ns_eps_(ns_eps),
-          velocities_(create_zero_buffers_()) {}
+          ns_steps_(ns_steps), ns_eps_(ns_eps)
+    {
+        auto v_r = create_zero_buffers_();
+        if (!v_r)
+        {
+            std::fprintf(stderr, "Muon init failed: %s\n",
+                         v_r.error().message.c_str());
+            std::abort();
+        }
+        velocities_ = std::move(*v_r);
+    }
 
     void set_lr(Scalar lr) override { lr_ = lr; }
 
