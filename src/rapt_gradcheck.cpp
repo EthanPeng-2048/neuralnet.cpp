@@ -231,6 +231,51 @@ int main(int argc, char* argv[])
         all_ok &= check_all_params(eng, eval_loss, params, grads, eps, tol);
     }
 
+    // ── ReLULinearAttention（causal + 文档感知） ───────────────────────
+    // 验证文档边界处重置运行态的正反向正确性（跨文档不串扰）。
+    {
+        std::cout << "=== ReLULinearAttention (causal + doc-aware) gradcheck ===\n";
+        const std::size_t d_model = 8, heads = 2, seq = 4, batch = 2;
+        ReLULinearAttention attn(d_model, heads, seq, /*causal=*/true,
+                                 nn::PosEncodingType::RoPE);
+        if (!attn.init(eng)) { std::cerr << "  init failed\n"; return 1; }
+        { auto prm = attn.parameters(); if (!reseed_params(eng, prm, 404)) return 1; }
+
+        // 文档边界（batch-major）：batch0=[0,0,1,1]，batch1=[2,2,2,3]
+        // → 边界位置：batch0 t0,t2；batch1 t0,t3
+        std::vector<std::size_t> doc_ids(batch * seq);
+        doc_ids[0]=0; doc_ids[1]=0; doc_ids[2]=1; doc_ids[3]=1;
+        doc_ids[4]=2; doc_ids[5]=2; doc_ids[6]=2; doc_ids[7]=3;
+        attn.set_doc_ids(doc_ids);
+
+        std::mt19937_64 rng{13};
+        std::normal_distribution<Scalar> dist(0.0, 1.0);
+        Matrix x_m(d_model, batch * seq);
+        { auto sp = x_m.span(); for (auto& v : sp) v = dist(rng); }
+        auto x_t = eng.from_matrix(x_m);
+        if (!x_t) return 1;
+        Matrix go_m(d_model, batch * seq);
+        { auto sp = go_m.span(); for (auto& v : sp) v = dist(rng); }
+        auto go_t = eng.from_matrix(go_m);
+        if (!go_t) return 1;
+
+        auto eval_loss = [&]() -> Scalar {
+            auto y = attn.forward(eng, *x_t);
+            auto ym = eng.to_matrix(*y);
+            return dot(*ym, go_m);
+        };
+
+        auto grads = attn.param_gradients();
+        for (auto& g : grads) { if (!eng.zero(g)) return 1; }
+        auto y0 = attn.forward(eng, *x_t);
+        if (!y0) { std::cerr << "  fwd failed\n"; return 1; }
+        auto gx = attn.backward(eng, *go_t);
+        if (!gx) { std::cerr << "  bwd failed\n"; return 1; }
+
+        auto params = attn.parameters();
+        all_ok &= check_all_params(eng, eval_loss, params, grads, eps, tol);
+    }
+
     std::cout << (all_ok ? "\nALL RAPT GRADCHECKS PASSED\n"
                          : "\nSOME RAPT GRADCHECKS FAILED\n");
     return all_ok ? 0 : 1;

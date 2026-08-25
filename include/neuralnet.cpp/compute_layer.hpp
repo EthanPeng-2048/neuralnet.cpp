@@ -1489,6 +1489,7 @@ class RotaryEmbedding
 private:
     std::size_t d_k_ = 0;
     std::size_t seq_cached_ = 0;   // 缓存表的列数（全表应用）
+    std::size_t pos_offset_ = 0;   // 绝对位置偏移（滑动窗生成时用，0=从 0 起）
     Tensor cos_cache_;             // (d_k, seq_cached_)
     Tensor sin_cache_;             // (d_k, seq_cached_)
 
@@ -1512,12 +1513,13 @@ private:
         }
     }
 
-    // 重建全表 (d_k, seq)：cos/sin 按维度对交错重复
+    // 重建全表 (d_k, seq)：cos/sin 按维度对交错重复；位置 = pos + pos_offset_
+    // （绝对位置偏移：滑动窗生成时，输入被截断到窗口，但位置应从真实起点算起）
     [[nodiscard]] Result<void> rebuild(ComputeEngine& engine, std::size_t seq)
     {
         Matrix c(d_k_, seq), s(d_k_, seq);
         for (std::size_t pos = 0; pos < seq; ++pos)
-            fill_pos_column_(c, s, pos, pos);
+            fill_pos_column_(c, s, pos + pos_offset_, pos);
         auto cr = engine.from_matrix(c);
         if (!cr) return std::unexpected(cr.error());
         cos_cache_ = std::move(*cr);
@@ -1542,6 +1544,17 @@ public:
     [[nodiscard]] Result<void> init(ComputeEngine& /*engine*/) { return {}; }
 
     [[nodiscard]] std::size_t d_k() const noexcept { return d_k_; }
+
+    // 设置绝对位置偏移（滑动窗生成：输入截断到窗口，位置从真实起点算起）。
+    // 改变后强制下次 apply 重建 cos/sin 表。
+    void set_position_offset(std::size_t off)
+    {
+        if (off != pos_offset_)
+        {
+            pos_offset_ = off;
+            seq_cached_ = 0;   // 使下次 apply 触发 rebuild
+        }
+    }
 
     // 全表应用：q 为 (batch*H*d_k, seq)，cos/sin 为 (d_k, seq) 短表
     [[nodiscard]] Result<Tensor> apply(
@@ -5203,6 +5216,25 @@ private:
     std::size_t batch_cache_ = 0;
     std::size_t seq_cache_   = 0;
 
+    // 文档感知：每位置文档 id（batch-major，size = batch*seq）；空=无文档感知
+    std::vector<std::size_t> doc_ids_;
+    bool has_doc_ids_ = false;
+
+    // 由 doc_ids_ 构建文档边界向量（size = batch*seq）：boundary[b*seq+t]=1
+    // 表示位置 t 是文档起点（t==0 或与前一位置文档不同）。
+    [[nodiscard]] std::vector<uint8_t> build_boundary_(
+        std::size_t batch, std::size_t seq) const
+    {
+        std::vector<uint8_t> boundary;
+        if (!has_doc_ids_) return boundary;
+        boundary.assign(batch * seq, 0);
+        for (std::size_t b = 0; b < batch; ++b)
+            for (std::size_t t = 0; t < seq; ++t)
+                if (t == 0 || doc_ids_[b * seq + t] != doc_ids_[b * seq + t - 1])
+                    boundary[b * seq + t] = 1;
+        return boundary;
+    }
+
     // ── 标量线性代数助手（行主序向量化，dk×dk 矩阵） ──────────────────
     static void matvec_(const std::vector<Scalar>& M,
                         const std::vector<Scalar>& x,
@@ -5236,15 +5268,25 @@ private:
     }
 
     // ── 前向扫描：out[bh*dk+j][t] = RLA 输出 ──────────────────────────
+    // boundary（可选，空=无文档感知）：size = batch*seq，boundary[b*seq+t]=1
+    // 表示位置 t 是文档起点。causal 模式下文档边界处重置运行态 A/B，
+    // 使每个 token 只聚合本文档内前缀（文档感知 = 运行态重置于边界）。
     static void scan_forward_(const Matrix& Q, const Matrix& K, const Matrix& V,
                               Matrix& out, std::size_t dk, std::size_t BH,
-                              std::size_t seq, bool causal, Scalar eps)
+                              std::size_t seq, bool causal,
+                              std::size_t num_heads,
+                              const std::vector<uint8_t>& boundary,
+                              Scalar eps)
     {
         std::vector<Scalar> A(dk * dk), B(dk * dk), qv(dk), kv(dk), vv(dk),
                             num(dk), Aq(dk);
         for (std::size_t bh = 0; bh < BH; ++bh)
         {
             const std::size_t r0 = bh * dk;
+            const std::size_t batch = bh / num_heads;
+            const auto doc_reset = [&](std::size_t t) {
+                return !boundary.empty() && boundary[batch * seq + t] != 0;
+            };
             std::fill(A.begin(), A.end(), Scalar{0});
             std::fill(B.begin(), B.end(), Scalar{0});
             if (!causal)  // 双向：先求全集 A, B
@@ -5268,8 +5310,13 @@ private:
                     kv[j] = K.at_unchecked(r0 + j, t);
                     vv[j] = V.at_unchecked(r0 + j, t);
                 }
-                if (causal)  // 前缀和含自身 i<=t
+                if (causal)  // 前缀和含自身 i<=t；文档边界处重置
                 {
+                    if (doc_reset(t))
+                    {
+                        std::fill(A.begin(), A.end(), Scalar{0});
+                        std::fill(B.begin(), B.end(), Scalar{0});
+                    }
                     add_outer_(A, kv, kv, dk);
                     add_outer_(B, vv, kv, dk);
                 }
@@ -5290,13 +5337,18 @@ private:
     static void scan_backward_(const Matrix& Q, const Matrix& K, const Matrix& V,
                                const Matrix& G, Matrix& gQ, Matrix& gK, Matrix& gV,
                                std::size_t dk, std::size_t BH, std::size_t seq,
-                               bool causal, Scalar eps)
+                               bool causal, std::size_t num_heads,
+                               const std::vector<uint8_t>& boundary, Scalar eps)
     {
         std::vector<Scalar> A(dk * dk), B(dk * dk), qv(dk), kv(dk), vv(dk),
                             num(dk), Aq(dk), gnum(dk), tmp(dk), tmp2(dk);
         for (std::size_t bh = 0; bh < BH; ++bh)
         {
             const std::size_t r0 = bh * dk;
+            const std::size_t batch = bh / num_heads;
+            const auto doc_reset = [&](std::size_t t) {
+                return !boundary.empty() && boundary[batch * seq + t] != 0;
+            };
             std::vector<Scalar> store_q(seq * dk), store_dq(seq * dk),
                                 store_dA(seq * dk * dk), store_dB(seq * dk * dk);
             std::vector<Scalar> dA_total(dk * dk, Scalar{0}),
@@ -5327,6 +5379,11 @@ private:
                 }
                 if (causal)
                 {
+                    if (doc_reset(t))
+                    {
+                        std::fill(A.begin(), A.end(), Scalar{0});
+                        std::fill(B.begin(), B.end(), Scalar{0});
+                    }
                     add_outer_(A, kv, kv, dk);
                     add_outer_(B, vv, kv, dk);
                 }
@@ -5376,6 +5433,12 @@ private:
                 if (causal)
                 {
                     // 后缀和：SA = Σ_{t>=i} dL/dA_t，SB = Σ_{t>=i} dL/dB_t
+                    // 文档感知：跨入前一文档时重置后缀和（只统计本文档内 t>=i）
+                    if (i + 1 < seq && doc_reset(i + 1))
+                    {
+                        std::fill(A.begin(), A.end(), Scalar{0});
+                        std::fill(B.begin(), B.end(), Scalar{0});
+                    }
                     for (std::size_t idx = 0; idx < dk * dk; ++idx)
                     {
                         A[idx] += store_dA[i * dk * dk + idx];
@@ -5481,6 +5544,22 @@ public:
         w_v_.clear_cache(); w_o_.clear_cache();
     }
 
+    // 文档感知：记录每位置文档 id（batch-major），forward/backward 据此
+    // 在文档边界重置运行态（每个 token 只聚合本文档内前缀）。
+    void set_doc_ids(std::span<const std::size_t> ids) override
+    {
+        if (ids.empty()) { doc_ids_.clear(); has_doc_ids_ = false; return; }
+        doc_ids_.assign(ids.begin(), ids.end());
+        has_doc_ids_ = true;
+    }
+
+    // 绝对位置偏移（滑动窗生成用）：转发给 RoPE，使重计算式生成的
+    // 位置从真实起点算起而非每次从 0 重置。
+    void set_position_offset(std::size_t off)
+    {
+        if (use_rope_) rope_.set_position_offset(off);
+    }
+
     std::vector<TensorRef> activation_cache() override
     {
         std::vector<TensorRef> r;
@@ -5553,8 +5632,10 @@ public:
         if (!Km) return std::unexpected(Km.error());
         auto Vm = engine.to_matrix(V);
         if (!Vm) return std::unexpected(Vm.error());
+        const auto boundary = build_boundary_(batch, seq);
         Matrix out_m(BH * d_k_, seq, Scalar{0});
-        scan_forward_(*Qm, *Km, *Vm, out_m, d_k_, BH, seq, causal_, Scalar{1e-6});
+        scan_forward_(*Qm, *Km, *Vm, out_m, d_k_, BH, seq, causal_,
+                      num_heads_, boundary, Scalar{1e-6});
         auto out_t = engine.from_matrix(out_m);
         if (!out_t) return std::unexpected(out_t.error());
 
@@ -5613,7 +5694,9 @@ public:
 
         Matrix gQ(BH * d_k_, seq, Scalar{0}), gK(BH * d_k_, seq, Scalar{0}),
                gV(BH * d_k_, seq, Scalar{0});
-        scan_backward_(*Qm, *Km, *Vm, *Gm, gQ, gK, gV, d_k_, BH, seq, causal_, Scalar{1e-6});
+        const auto boundary = build_boundary_(batch, seq);
+        scan_backward_(*Qm, *Km, *Vm, *Gm, gQ, gK, gV, d_k_, BH, seq, causal_,
+                       num_heads_, boundary, Scalar{1e-6});
 
         auto gQt = engine.from_matrix(gQ);
         if (!gQt) return std::unexpected(gQt.error());
@@ -5668,6 +5751,77 @@ public:
         if (!giv) return giv;
         { auto r = engine.add_inplace(grad_input, *giv); if (!r) return std::unexpected(r.error()); }
         return grad_input;
+    }
+
+    // ── 增量推理（运行态 KV cache） ──────────────────────────────
+    // 处理单个新 token，增量更新运行态 A/B（RLA 的"KV cache"），O(d_k²) 每步，
+    // 使自回归生成真正线性于上下文长度（无需逐窗重算）。
+    //   A_state/B_state: (num_heads*d_k, d_k)，行块 h 分别 = Σ k'_h k'_h^T、Σ v_h k'_h^T
+    //   pos: 绝对位置（RoPE 施加于 Q/K 进 ReLU 前）
+    // 输入 input: (d_model, 1) 单 token 隐藏态；返回 (d_model, 1) 经 w_o 输出。
+    [[nodiscard]] Result<Tensor> forward_step(
+        ComputeEngine& engine, const Tensor& input,
+        Matrix& A_state, Matrix& B_state, std::size_t pos)
+    {
+        auto q_res = w_q_.forward(engine, input);   // (d_model, 1) = (H*dk, 1)
+        if (!q_res) return q_res;
+        auto k_res = w_k_.forward(engine, input);
+        if (!k_res) return k_res;
+        auto v_res = w_v_.forward(engine, input);
+        if (!v_res) return v_res;
+        Tensor Q = std::move(*q_res), K = std::move(*k_res), V = std::move(*v_res);
+        if (use_rope_)
+        {
+            auto qr = rope_.apply_step(engine, Q, pos, false); if (!qr) return std::unexpected(qr.error());
+            Q = std::move(*qr);
+            auto kr = rope_.apply_step(engine, K, pos, false); if (!kr) return std::unexpected(kr.error());
+            K = std::move(*kr);
+        }
+        auto Qp = engine.elementwise_binary_scalar(BinaryOp::Max, Q, Scalar{0}, false);
+        if (!Qp) return std::unexpected(Qp.error());
+        auto Kp = engine.elementwise_binary_scalar(BinaryOp::Max, K, Scalar{0}, false);
+        if (!Kp) return std::unexpected(Kp.error());
+        auto Qm = engine.to_matrix(*Qp); if (!Qm) return std::unexpected(Qm.error());
+        auto Km = engine.to_matrix(*Kp); if (!Km) return std::unexpected(Km.error());
+        auto Vm = engine.to_matrix(V);   if (!Vm) return std::unexpected(Vm.error());
+        const std::size_t H = num_heads_;
+        const std::size_t dk = d_k_;
+        Matrix out_m(H * dk, 1, Scalar{0});
+        std::vector<Scalar> num(dk), Aq(dk);
+        for (std::size_t h = 0; h < H; ++h)
+        {
+            const std::size_t r0 = h * dk;
+            // 更新运行态：A[h] += k'k'^T，B[h] += v k'^T（因果：先累积再用）
+            for (std::size_t a = 0; a < dk; ++a)
+                for (std::size_t b = 0; b < dk; ++b)
+                {
+                    const Scalar ka = Km->at_unchecked(r0 + a, 0);
+                    const Scalar kb = Km->at_unchecked(r0 + b, 0);
+                    A_state.set_value_unchecked(r0 + a, b,
+                        A_state.at_unchecked(r0 + a, b) + ka * kb);
+                    B_state.set_value_unchecked(r0 + a, b,
+                        B_state.at_unchecked(r0 + a, b) + Vm->at_unchecked(r0 + a, 0) * kb);
+                }
+            // num = B[h]·q'；Aq = A[h]·q'；s = q'·Aq；out = num / sqrt(s+eps)
+            for (std::size_t i = 0; i < dk; ++i)
+            {
+                Scalar n{0}, aq{0};
+                for (std::size_t b = 0; b < dk; ++b)
+                {
+                    n  += B_state.at_unchecked(r0 + i, b) * Qm->at_unchecked(r0 + b, 0);
+                    aq += A_state.at_unchecked(r0 + i, b) * Qm->at_unchecked(r0 + b, 0);
+                }
+                num[i] = n; Aq[i] = aq;
+            }
+            Scalar s{0};
+            for (std::size_t i = 0; i < dk; ++i) s += Qm->at_unchecked(r0 + i, 0) * Aq[i];
+            const Scalar denom = std::sqrt(s + Scalar{1e-6});
+            for (std::size_t i = 0; i < dk; ++i)
+                out_m.set_value_unchecked(r0 + i, 0, num[i] / denom);
+        }
+        auto out_t = engine.from_matrix(out_m);
+        if (!out_t) return std::unexpected(out_t.error());
+        return w_o_.forward(engine, *out_t);
     }
 };
 
@@ -5738,6 +5892,18 @@ public:
         norm2_->clear_cache(); ff_.clear_cache();
     }
 
+    // 文档感知：转发给内部 RLA 注意力（文档边界处重置运行态）
+    void set_doc_ids(std::span<const std::size_t> ids) override
+    {
+        attn_.set_doc_ids(ids);
+    }
+
+    // 绝对位置偏移：转发给内部 RLA 注意力（滑动窗生成时 RoPE 用绝对位置）
+    void set_position_offset(std::size_t off)
+    {
+        attn_.set_position_offset(off);
+    }
+
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
@@ -5769,6 +5935,25 @@ public:
         if (!b_n1) return b_n1;
         return engine.elementwise_binary(BinaryOp::Add, *grad_r1, *b_n1);
     }
+
+    // 增量推理：单 token 经 norm1 → RLA 运行态注意力 → 残差 → norm2 → FFN → 残差
+    // A/B_state: RLA 运行态 KV cache（见 ReLULinearAttention::forward_step）
+    [[nodiscard]] Result<Tensor> forward_step(
+        ComputeEngine& engine, const Tensor& input,
+        Matrix& A_state, Matrix& B_state, std::size_t pos)
+    {
+        auto n1 = norm1_->forward(engine, input);
+        if (!n1) return n1;
+        auto a = attn_.forward_step(engine, *n1, A_state, B_state, pos);
+        if (!a) return a;
+        auto r1 = engine.elementwise_binary(BinaryOp::Add, input, *a);
+        if (!r1) return std::unexpected(r1.error());
+        auto n2 = norm2_->forward(engine, *r1);
+        if (!n2) return n2;
+        auto f = ff_.forward(engine, *n2);
+        if (!f) return f;
+        return engine.elementwise_binary(BinaryOp::Add, *r1, *f);
+    }
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -5785,7 +5970,8 @@ private:
     std::size_t vocab_size_;
     std::size_t d_model_;
     std::size_t seq_len_;
-    // （num_heads_/d_ff_/num_layers_/causal_ 仅构造时用，不存成员避免 -Wunused）
+    std::size_t num_heads_;   // 用于运行态 KV cache 尺寸（d_k = d_model/num_heads）
+    // （d_ff_/num_layers_/causal_ 仅构造时用，不存成员避免 -Wunused）
 
     Tensor token_emb_;
     Tensor grad_token_emb_;
@@ -5796,6 +5982,7 @@ private:
 
     Tensor stored_tokens_tensor_;
     std::size_t batch_size_ = 0;
+    std::vector<std::size_t> doc_ids_;   // 文档感知：每位置文档 id（batch-major）
 
 public:
     RAPTModel(std::size_t vocab_size, std::size_t d_model, std::size_t seq_len,
@@ -5805,6 +5992,7 @@ public:
               NormType norm_type = NormType::LayerNorm,
               bool causal = true)
         : vocab_size_(vocab_size), d_model_(d_model), seq_len_(seq_len),
+          num_heads_(num_heads),
           ln_f_(make_norm_layer(d_model, norm_type)),
           lm_head_(d_model, vocab_size)
     {
@@ -5904,6 +6092,19 @@ public:
         batch_size_ = 0;
     }
 
+    // 文档感知：记录 doc_ids，forward 时下发给各块（文档边界处重置 RLA 运行态）
+    void set_doc_ids(std::span<const std::size_t> ids) override
+    {
+        if (ids.empty()) { doc_ids_.clear(); return; }
+        doc_ids_.assign(ids.begin(), ids.end());
+    }
+
+    // 绝对位置偏移：下发给各块（滑动窗生成时 RoPE 用绝对位置，非 0..seq-1 重置）
+    void set_position_offset(std::size_t off)
+    {
+        for (auto& b : blocks_) b.set_position_offset(off);
+    }
+
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
@@ -5925,8 +6126,10 @@ public:
         if (!x_res) return std::unexpected(x_res.error());
         Tensor x = std::move(*x_res);
 
+        // 文档感知：每块 forward 前下发本步 doc_ids（边界重置运行态）
         for (auto& b : blocks_)
         {
+            if (!doc_ids_.empty()) b.set_doc_ids(doc_ids_);
             auto r = b.forward(engine, x);
             if (!r) return r;
             x = std::move(*r);
@@ -5966,15 +6169,10 @@ public:
         return engine.from_matrix(grad_input);
     }
 
-    // ── 采样生成（重计算式，无 KV cache） ────────────────────────
-    // 每步把「当前上下文（prompt + 已生成，滑动窗口截断到 seq_len）」pad 到整窗
-    // (seq_len, 1) 重新 forward（causal RLA 只看到前缀），取末位真实 token 的
-    // logits 采样。复杂度 O(seq²)，对首个 CLI 接入足够；KV cache 优化留待后续。
-    //
-    // 注意（RoPE 位置）：重计算式生成每步从位置 0 重新施 RoPE，绝对位置会重置；
-    // 对 < seq_len 的上下文正确，超长滑动窗生成的绝对位置语义会退化。
-    // 这是 v1 简化实现（与 ZiPTModel::generate 一致），后续可用 KV cache +
-    // 绝对位置偏移修正。
+    // ── 采样生成（增量运行态，KV cache） ────────────────────────
+    // 利用 RLA 的运行态前缀和（A_t、B_t）作为天然 KV cache：逐 token 增量更新，
+    // 每步 O(d²)（不重算前文），使生成真正线性于上下文长度，且无滑动窗截断
+    // （绝对位置经 pos 计数器自然递增，RoPE 位置恒正确）。
     [[nodiscard]] Result<std::vector<std::size_t>>
     generate(ComputeEngine& engine,
              const std::vector<std::size_t>& prompt,
@@ -5983,43 +6181,74 @@ public:
              std::size_t eos_token_id = static_cast<std::size_t>(-1),
              std::size_t min_new_tokens = 0)
     {
-        std::vector<std::size_t> context(prompt);
-        std::vector<std::size_t> generated;
-        std::mt19937_64 rng{std::random_device{}()};
-        std::uniform_real_distribution<Scalar> dist(0.0, 1.0);
-
-        for (std::size_t step = 0; step < max_new_tokens; ++step)
+        if (prompt.empty())
+            return std::unexpected(Error{"RAPT generate: empty prompt"});
+        const std::size_t dk = d_model_ / num_heads_;
+        // 每块一个运行态 KV cache（A/B，形状 (d_model, d_k)，行块按头划分）
+        std::vector<Matrix> statesA, statesB;
+        for (std::size_t i = 0; i < blocks_.size(); ++i)
         {
-            std::size_t start = 0;
-            if (context.size() > seq_len_) start = context.size() - seq_len_;
-            const std::size_t n = context.size() - start;
+            statesA.emplace_back(d_model_, dk, Scalar{0});
+            statesB.emplace_back(d_model_, dk, Scalar{0});
+        }
 
-            // 左对齐 pad 到整窗 (seq_len_, 1)；末位真实 token 在位置 n-1
-            const std::size_t pred_col = n - 1;
-            Matrix in(seq_len_, 1);
-            for (std::size_t i = 0; i < seq_len_; ++i)
-                in.set_value_unchecked(i, 0,
-                    static_cast<Scalar>((i < n) ? context[start + i] : 0));
-            auto in_t = engine.from_matrix(in);
-            if (!in_t) return std::unexpected(in_t.error());
-            auto logits = forward(engine, *in_t);
+        // 处理单个 token：embed → 各块 forward_step → LN → LM head → 返回 logits 列
+        auto step_one = [&](std::size_t tok, std::size_t pos)
+            -> Result<std::vector<Scalar>>
+        {
+            Matrix idx(1, 1);
+            idx.set_value_unchecked(0, 0, static_cast<Scalar>(tok));
+            auto idx_t = engine.from_matrix(idx);
+            if (!idx_t) return std::unexpected(idx_t.error());
+            auto emb = engine.gather_rows(token_emb_, *idx_t);   // (1, d_model)
+            if (!emb) return std::unexpected(emb.error());
+            auto emb_t = engine.transpose(*emb);                  // (d_model, 1)
+            if (!emb_t) return std::unexpected(emb_t.error());
+            Tensor h = std::move(*emb_t);
+            for (std::size_t i = 0; i < blocks_.size(); ++i)
+            {
+                auto r = blocks_[i].forward_step(engine, h, statesA[i], statesB[i], pos);
+                if (!r) return std::unexpected(r.error());
+                h = std::move(*r);
+            }
+            auto ln = ln_f_->forward(engine, h);
+            if (!ln) return std::unexpected(ln.error());
+            auto logits = lm_head_.forward(engine, *ln);
             if (!logits) return std::unexpected(logits.error());
             auto lm = engine.to_matrix(*logits);
             if (!lm) return std::unexpected(lm.error());
-
             std::vector<Scalar> last(vocab_size_);
             for (std::size_t v = 0; v < vocab_size_; ++v)
-                last[v] = lm->at_unchecked(v, pred_col);
+                last[v] = lm->at_unchecked(v, 0);
+            return last;
+        };
 
+        // 逐 token 处理 prompt（建立运行态）；保留最后一步 logits（预测下一 token）
+        std::size_t pos = 0;
+        std::vector<Scalar> last;
+        for (std::size_t i = 0; i < prompt.size(); ++i)
+        {
+            auto r = step_one(prompt[i], pos++);
+            if (!r) return std::unexpected(r.error());
+            last = std::move(*r);
+        }
+
+        // 采样生成
+        std::vector<std::size_t> generated;
+        std::mt19937_64 rng{std::random_device{}()};
+        std::uniform_real_distribution<Scalar> dist(0.0, 1.0);
+        for (std::size_t step = 0; step < max_new_tokens; ++step)
+        {
+            std::vector<Scalar> lastv = last;
             if (temperature > 0.0 && temperature != 1.0)
-                for (auto& x : last) x /= temperature;
+                for (auto& x : lastv) x /= temperature;
 
-            Scalar max_val = last[0];
+            Scalar max_val = lastv[0];
             for (std::size_t v = 1; v < vocab_size_; ++v)
-                max_val = std::max(max_val, last[v]);
+                max_val = std::max(max_val, lastv[v]);
             Scalar sum_exp = 0;
-            for (auto& x : last) { x = std::exp(x - max_val); sum_exp += x; }
-            for (auto& x : last) x /= sum_exp;
+            for (auto& x : lastv) { x = std::exp(x - max_val); sum_exp += x; }
+            for (auto& x : lastv) x /= sum_exp;
 
             std::size_t next;
             if (temperature > 0.0)
@@ -6029,21 +6258,24 @@ public:
                 next = vocab_size_ - 1;
                 for (std::size_t v = 0; v < vocab_size_; ++v)
                 {
-                    cum += last[v];
+                    cum += lastv[v];
                     if (r <= cum) { next = v; break; }
                 }
             }
             else
             {
                 next = 0;
-                Scalar best = last[0];
+                Scalar best = lastv[0];
                 for (std::size_t v = 1; v < vocab_size_; ++v)
-                    if (last[v] > best) { best = last[v]; next = v; }
+                    if (lastv[v] > best) { best = lastv[v]; next = v; }
             }
 
-            context.push_back(next);
             if (step >= min_new_tokens && next == eos_token_id) break;
             generated.push_back(next);
+
+            auto r = step_one(next, pos++);
+            if (!r) return std::unexpected(r.error());
+            last = std::move(*r);
         }
         return generated;
     }
