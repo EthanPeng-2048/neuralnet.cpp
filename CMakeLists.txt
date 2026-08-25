@@ -151,6 +151,18 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(attn_gradcheck src/attn_gradcheck.cpp)
     list(APPEND NN_TEST_TARGETS attn_gradcheck)
 
+    # ── AttnZip（ZiPT）数值梯度检查（gradcheck：压缩 CrossAttention + 联合注意力块） ──
+    nn_add_executable(zipt_gradcheck src/zipt_gradcheck.cpp)
+    list(APPEND NN_TEST_TARGETS zipt_gradcheck)
+
+    # ── ZiPT（AttnZip）端到端冒烟测试（构建 + 规格往返 + 训练 loss 下降） ──
+    nn_add_executable(zipt_smoke_test src/zipt_smoke_test.cpp)
+    list(APPEND NN_TEST_TARGETS zipt_smoke_test)
+
+    # ── ZiPT CPU/GPU 一致性测试（同权重下 forward logits 与梯度范数对齐） ──
+    nn_add_executable(zipt_consistency_test src/zipt_consistency_test.cpp)
+    list(APPEND NN_TEST_TARGETS zipt_consistency_test)
+
     # ── 融合 shader（AOT）GPU 数值验证（ExprSpec 单一事实来源 vs GPU 输出） ──
     nn_add_executable(fused_gpu_test src/fused_gpu_test.cpp)
     list(APPEND NN_TEST_TARGETS fused_gpu_test)
