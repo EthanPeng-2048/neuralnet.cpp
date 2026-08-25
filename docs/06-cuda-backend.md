@@ -1,6 +1,14 @@
 # ⚡ CUDA GPU 加速后端
 
-> **版本**：1.0  
+> **⚠️ 已停用（v1.0.0）**
+>
+> **CUDA 后端已正式停用**：M4/M5/M6 融合原语与 DSL 表达式在 CUDA 上未实现，无真实回退，导致 CUDA 上 GPT/MNIST 训练推理均无法运行。为避免"文档声称支持但实际损坏"，自 v1.0.0 起**不提供 `NN_ENABLE_CUDA` 开关**（CMake 不再定义该 option），`cuda_engine.hpp` 仅在 `NN_HAS_CUDA` 下编译但该宏永不定义。CLI 的 `--cuda` 参数仍会被解析，但传入后返回错误"请求 --cuda 但未编译 CUDA 支持；不回退 CPU"。
+>
+> **本页保留作为恢复 CUDA 后端时的参考文档**，其中的构建命令、CMake 选项、运行方式在当前版本均**不可用**。恢复路线见 `docs/13-optimize-proposal-list.md` §5（P5-01/P5-02/P5-03）。
+
+---
+
+> **版本**：1.0（已停用）  
 > **GPU**：Tesla V100-PCIE-32GB (sm_70)  
 > **CUDA Toolkit**：12.8  
 > **依赖**：nvcc + MSVC 2022 BuildTools（编译期），cudart / cuda / nvrtc（运行时）
@@ -70,9 +78,11 @@ cmake --build build --parallel
 
 ### CMake 选项
 
+> **⚠️ 以下选项在当前版本已不存在**（CUDA 已停用，CMake 不再提供 `NN_ENABLE_CUDA` option）。仅作为恢复 CUDA 时的历史参考。
+
 | 选项 | 默认值 | 说明 |
 |------|--------|------|
-| `NN_ENABLE_CUDA` | `OFF` | 启用 CUDA GPU 加速 |
+| `NN_ENABLE_CUDA` | `OFF` | 启用 CUDA GPU 加速（已停用，不再提供） |
 | `NN_CUDA_ARCH` | `50` | SM 架构版本（50=GTX850M/Maxwell, 70=V100, 80=A100, 86=RTX30xx, 89=RTX40xx） |
 
 ---
@@ -224,7 +234,9 @@ lld-link: error: /failifmismatch: mismatch detected for 'RuntimeLibrary'
 
 ## 🎮 使用方式
 
-### 命令行
+> **⚠️ 当前版本（v1.0.0+）不可用**：以下 `--cuda` 命令在传入后都会返回错误"请求 --cuda 但未编译 CUDA 支持（NN_HAS_CUDA）；不回退 CPU"。此处仅保留为恢复 CUDA 时的历史参考。
+
+### 命令行（历史参考，当前不可用）
 
 ```bash
 # MNIST 训练 + CUDA 加速
@@ -244,7 +256,7 @@ lld-link: error: /failifmismatch: mismatch detected for 'RuntimeLibrary'
 
 `--cuda` 优先于 `--gpu`（Vulkan）。如果同时指定两者，CUDA 生效。
 
-### C++ API
+### C++ API（历史参考，当前不可用）
 
 ```cpp
 #include <neuralnet.cpp/nn.hpp>

@@ -96,8 +96,9 @@ int main(int argc, char* argv[])
     ComputeEngine& eng = *engine;
 
     const std::size_t vocab = 64, d_model = 16, seq = 8, heads = 2, d_ff = 32, layers = 2;
-    GPTModel model(eng, vocab, d_model, seq, heads, d_ff, layers,
+    GPTModel model(vocab, d_model, seq, heads, d_ff, layers,
                    PosEncodingType::Learned, ActivationType::GeLU, NormType::LayerNorm);
+    { auto r = model.init(eng); if (!r) { std::cerr << "GPTModel init 失败: " << r.error().message << "\n"; return 1; } }
 
     // 单窗口：doc A 占 0..3，doc B 占 4..7
     const std::vector<std::size_t> doc_ids{1, 1, 1, 1, 2, 2, 2, 2};

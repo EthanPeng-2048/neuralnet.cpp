@@ -31,7 +31,7 @@
 
 ### 1.1 引擎化架构（Engine-Based）
 
-**创新点**：让 `Layer::forward/backward` 只写一次，通过传入的 `ComputeEngine` 自动适配 CPU / GPU / CUDA，而不是像多数教学框架那样为每后端各写一份。
+**创新点**：让 `Layer::forward/backward` 只写一次，通过传入的 `ComputeEngine` 自动适配 CPU / GPU 双后端（CUDA 已停用，见 `docs/13-optimize-proposal-list.md` §5），而不是像多数教学框架那样为每后端各写一份。
 
 ```cpp
 class Layer {

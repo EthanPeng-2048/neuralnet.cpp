@@ -22,7 +22,7 @@ Layer 内联表达式 → to_expr_spec 折叠 → ExprSpec → glsl_gen → GLSL
 1. **子表达式重复**导致超输入/寄存器上限（如 `grad*gamma` 出现 3 次 → 超 `EXPR_MAX_INPUTS=8`，被迫手工拆表达式）。
 2. **无死代码消除、无常量折叠、无代数化简**，shader 携带冗余计算。
 3. **无寄存器分配**，`num_regs` 线性增长，受 `EXPR_MAX_REGS=16` 约束。
-4. **后端耦合**：`glsl_gen` 为 GLSL 专用，CUDA 各自实现，无法"一份 IR 多后端"。
+4. **后端耦合**：`glsl_gen` 为 GLSL 专用，无法"一份 IR 多后端"（CUDA 已停用，目标为 GLSL/CPU 双 emitter）。
 5. **无融合分析**：`begin_expr/end_expr` 规划的多表达式融合（文档 §3.3）因缺图 IR 未落地。
 
 本文给出一个**分阶段**引入 IR 优化的设计，核心约束是**不破坏闭合世界的确定性 key 匹配**。
@@ -49,7 +49,7 @@ IR 属于"引擎/工具内部"，**完全落在红线允许区**，且强化"引
 1. **规范性**：把 `ExprSpec` 正式确立为 IR 规范，写清语义、上限、序列化。
 2. **可优化性**：提供确定性优化 pass（DCE、常量折叠、CSE、寄存器分配、代数化简）。
 3. **闭合世界兼容**：key 定义在 **canonical（优化后）IR** 上，scan 与 runtime 两端一致。
-4. **跨后端**：IR → 多 emitter（GLSL / CUDA / CPU），可选推进。
+4. **跨后端**：IR → 多 emitter（GLSL / CPU），可选扩展。
 5. **可扩展为图 IR**：为 `begin_expr/end_expr` 融合分析预留 DAG 演进路径。
 
 ---
@@ -115,9 +115,9 @@ expr_spec_key(spec) ≡ expr_spec_key(canonicalize_expr_spec(spec))
 
 CSE 需处理 `Input/Const/Reduce` 操作数的等价性（视图相同 + 输入相同 + 常量相同才等价）。归约指令的 CSE 需保证归约槽语义一致。
 
-### 5.3 阶段 C：图 IR（DAG，可选推进）
+### 5.3 阶段 C：图 IR（已实施基础版）
 
-为支撑 `begin_expr/end_expr` 融合分析，把扁平 IR 演进为**图 IR**：
+为支撑 `begin_expr/end_expr` 融合分析，把扁平 IR 演进为**图 IR**（已实施，`expr_graph.hpp`）：
 
 ```mermaid
 graph TD
@@ -132,21 +132,20 @@ graph TD
 - **kernel 序列产出**：DAG 分层 → 每层一个融合 kernel。
 - **key 语义扩展**：从"单表达式结构"变为"kernel 图结构"，`expr_registry` 序列化格式需兼容/迁移。
 
-> 阶段 C 是工作量主体（约 1–2 周），**建议在确有跨 kernel 自动融合需求时再投入**。
+> 阶段 C 基础版已实施（逐元素链拼接，见 §7 实施记录）。**进阶方向**（多消费者 DAG / 跨 kernel 自动融合）建议在确有需求时再投入。
 
 ---
 
-## 6. 后端 emitter 抽象（阶段 D，可选）
+## 6. 后端 emitter 抽象（阶段 D，已实施）
 
-把 `glsl_gen.hpp` 的 GLSL 专用生成抽象为 emitter 接口：
+把 `glsl_gen.hpp` 的 GLSL 专用生成抽象为 emitter 接口（已实施，`expr_emitter.hpp` / `cpu_emitter.hpp`）：
 
 ```
-IR → GlslEmitter / CudaEmitter / CpuEmitter
+IR → GlslEmitter / CpuEmitter
 ```
 
 - `generate_glsl` / `generate_glsl_reduce` 保留为 GLSL emitter 实现。
-- 一份 canonical IR 可产出多后端代码，替换"GLSL 专用 + CUDA 各自实现"。
-- 依赖阶段 A/B 的 canonical IR 形态稳定后推进。
+- 一份 canonical IR 可产出多后端代码，替换"GLSL 专用"实现。
 
 ---
 
@@ -156,8 +155,8 @@ IR → GlslEmitter / CudaEmitter / CpuEmitter
 |--------|------|--------|------|------|
 | **IR-A** | 确立 ExprSpec 为 IR 规范 + `canonicalize_expr_spec`（DCE/常量折叠/稳定排序）+ 接入 key | 小（1–2天） | 低 | DCE/常量折叠、确定性地基 |
 | **IR-B** | CSE + 寄存器分配（liveness） | 中（3–5天） | 中 | 缓解超限拆表达式 |
-| **IR-C** | 图 IR + `begin_expr/end_expr` 融合分析 | 大（1–2周） | 高 | 多表达式自动融合 |
-| **IR-D** | 后端 emitter 抽象（GLSL/CUDA/CPU） | 中（3–5天） | 中 | 一份 IR 多后端 |
+| **IR-C** | 图 IR + `begin_expr/end_expr` 融合分析（基础版已实施） | 大（1–2周） | 高 | 多表达式自动融合 |
+| **IR-D** | 后端 emitter 抽象（GLSL/CPU，已实施） | 中（3–5天） | 中 | 一份 IR 多后端 |
 
 > **实施记录（2026-08-23，IR-A + IR-B 已完成）**：
 > - 新增 `include/neuralnet.cpp/expr_opt.hpp`：`fold_constants_and_algebra`（常量池去重 + 保守常量折叠 + 代数化简）、`dead_code_elimination`、`renumber_registers`（寄存器连续重编号 + 常量池清理）、`common_subexpression_elimination`（Fanout 归一化 + 哈希复用）、`allocate_registers_liveness`（liveness 线性扫描，确定性贪心）、`canonicalize_expr_spec`（完整链）。
@@ -183,7 +182,7 @@ IR → GlslEmitter / CudaEmitter / CpuEmitter
 >   - `gen_fused` 经 emitter 注册表选择后端（默认 glsl）；`--list-backends` 展示可用后端（glsl/cpu）。
 > - 验证：ctest 24/24 全绿（含新增 expr_graph_test / expr_fuse_test）；`scan_exprs` 收集到 20 条融合表达式（含 FusedChain 融合复合 spec + backward）；`fused_gpu_test` 等既有回归无回归。
 
-**推荐**：先落地 IR-A + IR-B（约 1 周），解决真实痛点并铺好确定性地基；IR-C 视需求再投入。
+**现状**：IR-A / IR-B / IR-C（基础版）/ IR-D 均已实施（见上方实施记录）。后续可选方向：IR-C 进阶（多消费者 DAG / 跨 kernel 自动融合）。
 
 ---
 
@@ -205,10 +204,10 @@ canonicalization 与优化 pass 的验证重点：
 
 ## 9. 工作量小结
 
-| 目标 | 总工作量 |
-|------|----------|
-| 轻量 IR + 优化（IR-A + IR-B） | 约 1 周 |
-| 完整 IR + 图 IR 融合分析（A+B+C） | 约 2–4 周 |
-| + 后端 emitter（+D） | 视需要追加 3–5 天 |
+| 目标 | 状态 |
+|------|------|
+| 轻量 IR + 优化（IR-A + IR-B） | ✅ 已实施 |
+| 完整 IR + 图 IR 融合分析（A+B+C） | ✅ 基础版已实施 |
+| + 后端 emitter（+D） | ✅ 已实施（GLSL/CPU） |
 
 最大成本集中在**阶段 C（图 IR）**与**确定性 key 验证**。现有 `ExprSpec` 已是合格轻量 IR，直通、简单、确定性是其最大优点，建议以"小步演进、不推翻"为原则推进。

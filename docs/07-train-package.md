@@ -42,7 +42,7 @@ python train_pkg.py new --task mnist -o runs/mnist.json
   "format_version": 1,
   "name": "gpt-tiny",
   "task": "gpt",                // gpt | mnist
-  "device": "cpu",              // cpu | gpu | cuda（train 时可用 --device 覆盖）
+  "device": "cpu",              // cpu | gpu（CUDA 已停用；train 时可用 --device 覆盖）
   "data": {                     // 训练集路径（相对本配置所在目录）
     "train": "datasets/tinystories_20k.txt",
     "test": "",
@@ -90,7 +90,7 @@ python train_pkg.py pack runs/gpt.json -o runs/gpt.nnpkg --compress zstd
 ```bash
 python train_pkg.py info runs/gpt.nnpkg     # 查看包内配置/数据/校验和
 python train_pkg.py train runs/gpt.nnpkg    # 自动解包 + 校验 + 训练
-python train_pkg.py train runs/gpt.nnpkg --device cuda   # 按设备覆盖
+python train_pkg.py train runs/gpt.nnpkg --device gpu    # 按设备覆盖（CUDA 已停用）
 python train_pkg.py train runs/gpt.nnpkg --save runs/gpt.bin
 ```
 

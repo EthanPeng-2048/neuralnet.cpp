@@ -14,7 +14,7 @@
 >
 > **L2 内存池整块归还 + 统计 — ✅ 已实施**
 > - `MemoryPool`：新增 `PoolStats` + `pool_debug_stats()`（块数/占用/空闲/碎片）、`release_idle_blocks()`（整块 `vkFreeMemory` + 从 `blocks_` 移除，带 `retain_free_bytes_` 保留阈值防抖动）、`set_retain_free_bytes()`。
-> - `GpuBackend::release_idle_pool_blocks()`（先 `flush_pending_destroys()` 再归还）；`ComputeEngine` 新增 `release_idle_pool_blocks()` / `pool_stats()`（CPU/CUDA no-op）；`GpuEngine` override。
+> - `GpuBackend::release_idle_pool_blocks()`（先 `flush_pending_destroys()` 再归还）；`ComputeEngine` 新增 `release_idle_pool_blocks()` / `pool_stats()`（CPU no-op；CUDA 已停用）；`GpuEngine` override。
 > - 接入：`text_train` 新增 `--checkpoint-every N` 与每 step 末尾 `release_idle_pool_blocks()`（end_batch 提交完成、延迟销毁已 flush 后调用，安全）。
 > - 数值/性能回归：仅 GPU 内存管理路径，不影响 CPU 数值；L1 相关 gradcheck 全绿。
 >
@@ -85,7 +85,7 @@ FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU �
 
 按"不动分层、不动精度、收益先验证"排序：
 
-### L1 — 激活重计算（梯度检查点）【提案，优先做】
+### L1 — 激活重计算（梯度检查点）【✅ 已实施，见 §0】
 - **目标**：把逐层激活从"全存"降到"只存 block 边界 input（或隔层存）"，backward 重算中间，使② 从 ~6.4G 降到 ~0.6G。
 - **归属层**：`Model`（[model_container.hpp](../../include/neuralnet.cpp/model_container.hpp)）编排 + `Layer` 契约新增可选方法，`Layer::compute_backward_from_scratch`（默认走缓存；支持者重算）。**不动 ComputeEngine、不动精度**。
 - **接口**：
@@ -101,7 +101,7 @@ FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU �
 - **验证时序**：逐层数 1/2/4/8 层梯度与现有全存结果数值一致（复用 `gpt_gradcheck.cpp` 渠道）。
 - **风险**：约 +1 次前向 FLOPs（训练可接受）；需保证重算路径与原始 forward 数值一致。
 
-### L2 — 内存池复用/归还 + 生命周期边界【提案，低风险】
+### L2 — 内存池复用/归还 + 生命周期边界【✅ 已实施，见 §0】
 - **目标**：回收 ⑤ 中碎片与闲置底材。
 - **方案**：
   1. `MemoryPool` 支持**整块释放**：`allocation_count==0` 且全 region 空闲的 Block，调用 `vkFreeMemory` 并从 `blocks_` 移除（阈值控制，避免抖动）。

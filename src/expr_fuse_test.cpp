@@ -64,7 +64,9 @@ int run_fused_chain(CpuEngine& cpu, GpuEngine& gpu)
     for (auto& v : x.span()) v = dist(rng);
     for (auto& v : grad.span()) v = dist(rng);
 
-    nn::FusedChainLayer c_cpu(cpu, F), c_gpu(gpu, F);
+    nn::FusedChainLayer c_cpu(F), c_gpu(F);
+    { auto r = c_cpu.init(cpu); if (!r) { std::cerr << "  CPU FusedChain init 失败: " << r.error().message << "\n"; return 1; } }
+    { auto r = c_gpu.init(gpu); if (!r) { std::cerr << "  GPU FusedChain init 失败: " << r.error().message << "\n"; return 1; } }
     const Tensor in = Tensor::from_matrix(Matrix(x));
 
     // forward：GPU 走 begin_expr/end_expr 融合，CPU 逐节点
