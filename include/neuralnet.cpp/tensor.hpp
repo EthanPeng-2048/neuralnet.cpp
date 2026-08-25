@@ -48,6 +48,12 @@ private:
     std::size_t rows_ = 0;
     std::size_t cols_ = 0;
 
+    // 图 IR 录制（IR-C）：虚拟寄存器标记。
+    // begin_expr/end_expr 录制模式下，eval_expr 返回的占位 Tensor 携带
+    // 该标记（= 图节点下标 + 1；0 = 非图节点输出），供后续表达式建立
+    // 依赖边（Layer 无感知，见 expr_graph.hpp / gpu_engine.hpp）。
+    std::uint64_t virtual_tag_ = 0;
+
     // CPU 存储（device_ == CPU 时有效）
     std::shared_ptr<Matrix> cpu_data_;
 
@@ -109,6 +115,10 @@ public:
     [[nodiscard]] std::size_t size() const noexcept { return rows_ * cols_; }
     [[nodiscard]] bool is_cpu() const noexcept { return device_ == Device::CPU; }
     [[nodiscard]] bool is_gpu() const noexcept { return device_ == Device::GPU; }
+
+    // ── 图 IR 虚拟寄存器标记（IR-C 录制用，Layer 无感知） ───────────────
+    [[nodiscard]] std::uint64_t virtual_tag() const noexcept { return virtual_tag_; }
+    void set_virtual_tag(std::uint64_t tag) noexcept { virtual_tag_ = tag; }
     [[nodiscard]] bool valid() const noexcept
     {
         if (device_ == Device::CPU)
@@ -190,6 +200,7 @@ public:
         t.device_ = device_;
         t.rows_ = new_rows;
         t.cols_ = new_cols;
+        t.virtual_tag_ = virtual_tag_;  // reshape 保留图 IR 标记
 #ifdef NN_HAS_VULKAN
         t.gpu_data_ = gpu_data_;
 #endif

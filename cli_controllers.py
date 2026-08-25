@@ -383,7 +383,7 @@ class MnistTrainController(CLIController):
     MNIST训练CLI控制器
     
     封装mnist_train.exe，支持以下功能：
-    - 架构选择：MLP或Transformer
+    - 架构选择：MLP、Transformer 或 CNN
     - 训练参数：轮数、学习率、批大小、优化器等
     - 设备选择：CPU、GPU(Vulkan)、CUDA
     - 模型管理：保存、恢复
@@ -469,6 +469,19 @@ class MnistTrainController(CLIController):
         
         if "eval_samples" in kwargs:
             args.extend(["--eval-samples", self._format_arg_value(kwargs["eval_samples"])])
+        
+        # CNN专用参数 (LeNet-5 风格)
+        if "cnn_channels" in kwargs:
+            args.extend(["--cnn-channels", self._format_arg_value(kwargs["cnn_channels"])])
+        
+        if "cnn_kernels" in kwargs:
+            args.extend(["--cnn-kernels", self._format_arg_value(kwargs["cnn_kernels"])])
+        
+        if "cnn_pool" in kwargs:
+            args.extend(["--cnn-pool", self._format_arg_value(kwargs["cnn_pool"])])
+        
+        if "cnn_fc" in kwargs:
+            args.extend(["--cnn-fc", self._format_arg_value(kwargs["cnn_fc"])])
         
         # 振荡检测
         if "osc_guard" in kwargs:

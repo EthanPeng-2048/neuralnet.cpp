@@ -166,8 +166,14 @@ private:
         // col_sum ≥ 1（因 max 元素 shifted=0 → exp=1），故 log(col_sum) 有限
         auto log_col_sum = engine.elementwise_unary(UnaryOp::Log, *col_sum);
         if (!log_col_sum) return std::unexpected(log_col_sum.error());
-        auto log_softmax = engine.elementwise_binary(BinaryOp::Sub, *shifted, *log_col_sum);
-        if (!log_softmax) return std::unexpected(log_softmax.error());
+
+        // log_softmax = shifted - log(col_sum)：这是**列广播**（每个元素减去
+        // 对应列的 log(col_sum)），不能用 elementwise_binary —— log_col_sum
+        // 形状为 (1, batch) 而 shifted 为 (classes, batch)，两引擎均要求形状
+        // 完全一致会报 shape mismatch。此处 shifted 已不再使用，可就地广播。
+        r = engine.broadcast_col_inplace(*shifted, *log_col_sum, BinaryOp::Sub);
+        if (!r) return std::unexpected(r.error());
+        auto log_softmax = std::move(shifted);
 
         return DenseSoftmax{/*softmax=*/std::move(*exp_shift),
                             /*log_softmax=*/std::move(*log_softmax)};

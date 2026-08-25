@@ -528,11 +528,14 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
 
     // 非可学习状态（如 BatchNorm 的 running_mean/running_var），紧跟在参数之后。
     // 旧文件（无额外状态）读到 EOF 时保持默认（running_mean=0, running_var=1）。
-    // TODO(1.1, M2): 上述"读到 EOF 保持默认"的语义与下方实现不符——read_matrix
-    //   失败时这里直接 return 错误而非回退默认值。需统一为按版本回退。
+    // 注意：读取前用 peek() 检查 EOF，而非依赖 read_matrix 读失败后回退——
+    //   read_matrix 在 shape 不匹配时也会报错，不应吞掉真正的损坏。
     auto extras = model.extra_state();
     for (auto& e_tensor : extras)
     {
+        // 已经没有更多数据 → 保持默认值（零/一），跳过剩余 extras
+        if (ifs.peek() == EOF) break;
+
         // 先读入临时 Matrix（按状态 Tensor 的形状）
         Matrix tmp(e_tensor.get().rows(), e_tensor.get().cols());
         auto mr = detail::read_matrix(ifs, tmp);

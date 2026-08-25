@@ -11,11 +11,14 @@
 #include <algorithm>
 #include <functional>
 #include <limits>
+#include <optional>
 
 #include "compute_engine.hpp"
 #include "algebra_compute.hpp"
 #include "algebra_expr.hpp"
 #include "expr_opt.hpp"
+#include "expr_graph.hpp"    // IR-C：图 IR + 融合分析（scan 模式登记用）
+#include "expr_registry.hpp" // scan 模式融合 kernel 登记（NN_EXPR_SCAN）
 
 namespace nn
 {
@@ -58,6 +61,14 @@ inline std::pair<Scalar, bool> attn_bias_at(
 // ══════════════════════════════════════════════════════════════════════════
 class CpuEngine final : public ComputeEngine
 {
+private:
+    // IR-C 图 IR 录制（仅构建期 scan 模式启用；普通 CPU 运行保持 no-op）。
+    // scan 模式下 begin_expr 开启录制，期间 dsl::compute/compute_reduce 把
+    // 表达式加入录制图（见 expr_dsl.hpp 的 scan 分支），end_expr 时融合分析
+    // 并把每个融合 kernel 的复合 spec 登记进 global_registry —— 保证 GPU
+    // 运行时 begin_expr/end_expr 融合出的复合 spec 命中 AOT shader（闭合世界）。
+    std::optional<ExprGraph> recording_;
+
 public:
     [[nodiscard]] Device device() const noexcept override { return Device::CPU; }
 
@@ -66,9 +77,33 @@ public:
     [[nodiscard]] Result<void> end_batch() override { return {}; }
     [[nodiscard]] Result<void> flush_batch() override { return {}; }
 
-    // ── 表达式录制：CPU 为 no-op（各表达式直接求值，行为不变） ──────────
-    [[nodiscard]] Result<void> begin_expr() override { return {}; }
-    [[nodiscard]] Result<void> end_expr() override { return {}; }
+    // ── 表达式录制（IR-C）──────────────────────────────────────────────
+    // 普通 CPU 运行：no-op（各表达式直接求值，行为不变——融合是 GPU 优化）。
+    // 构建期 scan（NN_EXPR_SCAN）：begin_expr 开启录制图；end_expr 融合分析
+    // 并登记全部融合 kernel 的复合 spec（闭合世界两端一致）。
+    [[nodiscard]] Result<void> begin_expr() override
+    {
+#ifdef NN_EXPR_SCAN
+        recording_.emplace();
+        fused::recording_graph_ptr() = &*recording_;
+#endif
+        return {};
+    }
+
+    [[nodiscard]] Result<void> end_expr() override
+    {
+#ifdef NN_EXPR_SCAN
+        if (!recording_)
+            return {};
+        ExprGraph g = std::move(*recording_);
+        recording_.reset();
+        fused::recording_graph_ptr() = nullptr;
+        auto kernels = fuse_expr_graph(g);
+        for (auto& k : kernels)
+            fused::global_registry().add(k.spec);
+#endif
+        return {};
+    }
 
     // ── 张量工厂 ──────────────────────────────────────────────────────────
     [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols) override

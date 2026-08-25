@@ -509,7 +509,10 @@ int main(int argc, char *argv[])
         for (std::size_t i = 0; i < dims.size(); ++i)
         {
             std::cout << dims[i];
-            if (i < dims.size() - 2)
+            // norm+GeLU 挂在隐藏层 Linear 的输出维度上：dims[1]..dims[size-2]。
+            // 首元素 dims[0] 是输入、末元素 dims[size-1] 是 logits 输出，
+            // 两者都不挂 norm/激活（CE 损失需要原始 logits）。
+            if (i > 0 && i < dims.size() - 1)
                 std::cout << "(" << norm_name << "+GeLU)";
             if (i < dims.size() - 1)
                 std::cout << " -> ";

@@ -47,7 +47,7 @@ int main(int argc, char* argv[])
     for (const std::size_t dk : {std::size_t{16}, std::size_t{32},
                                  std::size_t{64}, std::size_t{128}})
     {
-        nn::RotaryEmbedding rope(engine, dk);
+        nn::RotaryEmbedding rope(dk);
         nn::Tensor q = nn::Tensor::cpu(2 * dk, 8);   // rows 为 dk 的整数倍
         (void)rope.apply(engine, q, /*seq=*/8, /*backward=*/false);
         (void)rope.apply(engine, q, /*seq=*/8, /*backward=*/true);
@@ -85,7 +85,8 @@ int main(int argc, char* argv[])
     // backward: grad_x 列归约表达式 + grad_gamma 行归约表达式
     {
         const std::size_t F = 8, B = 5;
-        nn::RMSNorm rms(engine, F);
+        nn::RMSNorm rms(F);
+        (void)rms.init(engine);
         nn::Tensor input = nn::Tensor::cpu(F, B);
         (void)rms.forward(engine, input);       // 填充 normed/rms_inv 缓存 + 登记 fwd 结构
         nn::Tensor grad = nn::Tensor::cpu(F, B);
@@ -97,11 +98,27 @@ int main(int argc, char* argv[])
     // backward: grad_x 列归约表达式 + grad_gamma/grad_beta 行归约表达式
     {
         const std::size_t F = 8, B = 5;
-        nn::LayerNorm ln(engine, F);
+        nn::LayerNorm ln(F);
+        (void)ln.init(engine);
         nn::Tensor input = nn::Tensor::cpu(F, B);
         (void)ln.forward(engine, input);
         nn::Tensor grad = nn::Tensor::cpu(F, B);
         (void)ln.backward(engine, grad);
+    }
+
+    // ── FusedChainLayer（IR-C：begin_expr/end_expr 图 IR 链式融合）────────
+    // forward 的三个逐元素表达式在 end_expr 时融合成单个 kernel（t/u 内联为
+    // 寄存器）。必须 dry-run 覆盖本路径：GPU 运行时 begin_expr/end_expr 融合
+    // 出的复合 spec 才能在 fused_registry 中命中（闭合世界两端一致）。
+    // backward 为独立表达式（非录制段），单独登记。
+    {
+        const std::size_t F = 8, B = 5;
+        nn::FusedChainLayer chain(F);
+        (void)chain.init(engine);
+        nn::Tensor input = nn::Tensor::cpu(F, B);
+        (void)chain.forward(engine, input);
+        nn::Tensor grad = nn::Tensor::cpu(F, B);
+        (void)chain.backward(engine, grad);
     }
 
     auto& reg = nn::fused::global_registry();
