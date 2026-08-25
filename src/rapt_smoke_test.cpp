@@ -147,6 +147,58 @@ int main(int argc, char* argv[])
         std::cout << "batch>1 (batch=" << batch << ") smoke OK\n";
     }
 
+    // ── 4. KV cache 一致性：整序列 forward 末位 == 逐 token forward_step 累积 ──
+    // 验证增量运行态生成（RLA 的 KV cache）与批量 forward 完全一致。
+    {
+        const std::size_t d_model = 16, heads = 2, L = 6;   // d_k = 8
+        nn::ReLULinearAttention attn(d_model, heads, /*seq_len=*/0,
+                                     /*causal=*/true, nn::PosEncodingType::RoPE);
+        if (!attn.init(eng)) { std::cerr << "kv attn init failed\n"; return 1; }
+        std::mt19937_64 rng{77};
+        std::normal_distribution<nn::Scalar> dist(0.0, 1.0);
+        nn::Matrix x_m(d_model, L);
+        { auto sp = x_m.span(); for (auto& v : sp) v = dist(rng); }
+        auto x_t = eng.from_matrix(x_m);
+        if (!x_t) return 1;
+        auto full = attn.forward(eng, *x_t);
+        if (!full) { std::cerr << "kv full forward failed\n"; return 1; }
+        auto full_m = eng.to_matrix(*full);
+        if (!full_m) return 1;
+
+        // 逐 token 增量（运行态 KV cache）
+        const std::size_t dk = d_model / heads;
+        nn::Matrix A(d_model, dk, nn::Scalar{0}), B(d_model, dk, nn::Scalar{0});
+        nn::Tensor inc_out;
+        for (std::size_t t = 0; t < L; ++t)
+        {
+            nn::Matrix col(d_model, 1);
+            for (std::size_t r = 0; r < d_model; ++r)
+                col.set_value_unchecked(r, 0, x_m.at_unchecked(r, t));
+            auto col_t = eng.from_matrix(col);
+            if (!col_t) return 1;
+            auto o = attn.forward_step(eng, *col_t, A, B, t);
+            if (!o) { std::cerr << "kv forward_step failed\n"; return 1; }
+            inc_out = std::move(*o);
+        }
+        auto inc_m = eng.to_matrix(inc_out);
+        if (!inc_m) return 1;
+        // 比较增量末位 vs 整序列 forward 末位
+        nn::Scalar max_diff{0};
+        for (std::size_t r = 0; r < d_model; ++r)
+        {
+            const nn::Scalar a = full_m->at_unchecked(r, L - 1);
+            const nn::Scalar b = inc_m->at_unchecked(r, 0);
+            max_diff = std::max(max_diff, std::fabs(a - b));
+        }
+        std::cout << "KV-cache consistency: max_diff=" << max_diff << "\n";
+        if (!(max_diff < 1e-3f))
+        {
+            std::cerr << "KV-cache inconsistency!\n";
+            return 1;
+        }
+        std::cout << "KV-cache consistency OK\n";
+    }
+
     std::cout << "RAPT SMOKE TEST PASSED\n";
     return 0;
 }

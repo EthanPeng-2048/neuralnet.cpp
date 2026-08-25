@@ -1289,7 +1289,7 @@ class GptTrainTab(TabBase):
         self.save_path = _make_save_row(p, "保存路径", r,
                                          default_name="gpt_model.bin"); r += 1
         self.resume_path = _make_file_row(p, "恢复路径", r,
-                                           filetypes=[("模型文件", "*.bin")]); r += 1
+                                           filetypes=[("模型文件", "*.bin *.nnpkg")]); r += 1
         self.test_file = _make_file_row(p, "测试集 (可选)", r,
                                          filetypes=[("文本文件", "*.txt")]); r += 1
         self.vocab_path = _make_file_row(p, "词表路径", r,
@@ -1490,7 +1490,7 @@ class GptInferTab(TabBase):
         p = self.params_frame
         r = 0
         self.model_path = _make_file_row(p, "模型路径", r,
-                                          filetypes=[("模型文件", "*.bin *.pt")]); r += 1
+                                          filetypes=[("模型文件", "*.bin *.pt *.nnpkg")]); r += 1
         self.max_tokens = _make_entry_row(p, "最大生成token数", r, "200"); r += 1
         self.temperature = _make_entry_row(p, "温度 (0=贪心)", r, "0.8"); r += 1
         self.engine = _make_option_row(p, "计算引擎", r, ENGINE_OPTIONS, "CPU"); r += 1
