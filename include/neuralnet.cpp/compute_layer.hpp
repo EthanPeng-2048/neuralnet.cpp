@@ -5267,6 +5267,156 @@ private:
                 M[i * dk + j] += x[i] * y[j];
     }
 
+    // 构造 RLA 掩码 (BH*seq, seq) 0/1 矩阵：mask[b*H+h][t, j] = 1 iff 允许 q_t 看 k_j
+    //   causal:       j <= t
+    //   文档感知:     j <= t 且 doc[j] == doc[t]（仅 causal 模式生效）
+    //   bidirectional: 全 1（无掩码）
+    [[nodiscard]] Result<Tensor> build_rla_mask_(
+        ComputeEngine& engine, std::size_t batch, std::size_t seq)
+    {
+        const std::size_t BH = batch * num_heads_;
+        Matrix mask(BH * seq, seq, Scalar{1});
+        if (causal_)
+        {
+            for (std::size_t bh = 0; bh < BH; ++bh)
+            {
+                const std::size_t b = bh / num_heads_;
+                for (std::size_t t = 0; t < seq; ++t)
+                    for (std::size_t j = 0; j < seq; ++j)
+                    {
+                        bool ok = (j <= t);
+                        if (ok && has_doc_ids_ &&
+                            doc_ids_[b * seq + j] != doc_ids_[b * seq + t])
+                            ok = false;
+                        if (!ok) mask.set_value_unchecked(bh * seq + t, j, Scalar{0});
+                    }
+            }
+        }
+        return engine.from_matrix(mask);
+    }
+
+    // ── 原语组合版 RLA 前向（GPU 上运行，消除 PCIe 往返） ──────────────
+    // 用现有引擎原语（batched_matmul / elementwise / reduce / broadcast）
+    // 组合出 RLA 计算，不落 CPU。代价：物化 (BH*seq, seq) 分数矩阵（O(L²)），
+    // 作为过渡实现；后续可被 IR 张量复用优化改进为 O(L·d²) 运行态。
+    //
+    // 输入 Qp/Kp/V: (BH*dk, seq)；返回 (BH*dk, seq)
+    //   S[i,j] = q_i·k_j  (非负，Qp/Kp 经 ReLU)
+    //   num = S·Vᵀ；denom = sqrt(Σ_j S² + eps)；out = num/denom
+    [[nodiscard]] Result<Tensor> forward_matmul(
+        ComputeEngine& engine, const Tensor& Qp, const Tensor& Kp,
+        const Tensor& V, std::size_t batch, std::size_t seq)
+    {
+        const std::size_t BH = batch * num_heads_;
+        const std::size_t dk = d_k_;
+        auto S = engine.batched_matmul(Qp, Kp, BH, true, false, Scalar{1});   // (BH*seq, seq)
+        if (!S) return std::unexpected(S.error());
+        auto mask = build_rla_mask_(engine, batch, seq);                      // (BH*seq, seq)
+        if (!mask) return std::unexpected(mask.error());
+        auto Sm = engine.elementwise_binary(BinaryOp::Mul, *S, *mask);
+        if (!Sm) return std::unexpected(Sm.error());
+        auto num = engine.batched_matmul(*Sm, V, BH, false, true);            // Sm @ Vᵀ → (BH*seq, dk)
+        if (!num) return std::unexpected(num.error());
+        auto S2 = engine.elementwise_binary(BinaryOp::Mul, *Sm, *Sm);
+        if (!S2) return std::unexpected(S2.error());
+        auto denom2 = engine.row_reduce_sum(*S2);                             // (BH*seq, 1)
+        if (!denom2) return std::unexpected(denom2.error());
+        auto denom_e = engine.elementwise_binary_scalar(BinaryOp::Add, *denom2, Scalar{1e-6}, false);
+        if (!denom_e) return std::unexpected(denom_e.error());
+        auto denom = engine.elementwise_unary(UnaryOp::Sqrt, *denom_e);
+        if (!denom) return std::unexpected(denom.error());
+        auto out = engine.clone(*num);                                        // (BH*seq, dk)
+        if (!out) return std::unexpected(out.error());
+        { auto r = engine.broadcast_row_inplace(*out, *denom, BinaryOp::Div);
+          if (!r) return std::unexpected(r.error()); }
+        auto O_T = engine.transpose(*out);                                    // (dk, BH*seq)
+        if (!O_T) return std::unexpected(O_T.error());
+        return engine.rearrange_3d(*O_T, dk, BH, seq, false);                 // (BH*dk, seq)
+    }
+
+    // ── 原语组合版 RLA 反向 ──────────────────────────────────────────
+    // 返回 {grad_Qp, grad_Kp, grad_V}，均 (BH*dk, seq)。与 forward_matmul 对应。
+    [[nodiscard]] Result<std::array<Tensor, 3>> backward_matmul(
+        ComputeEngine& engine,
+        const Tensor& Qp, const Tensor& Kp, const Tensor& V,
+        const Tensor& grad_out_re,   // (BH*dk, seq)
+        std::size_t batch, std::size_t seq)
+    {
+        const std::size_t BH = batch * num_heads_;
+        // ── 重算前向量 ──
+        auto S = engine.batched_matmul(Qp, Kp, BH, true, false, Scalar{1});
+        if (!S) return std::unexpected(S.error());
+        auto mask = build_rla_mask_(engine, batch, seq);
+        if (!mask) return std::unexpected(mask.error());
+        auto Sm = engine.elementwise_binary(BinaryOp::Mul, *S, *mask);
+        if (!Sm) return std::unexpected(Sm.error());
+        auto num = engine.batched_matmul(*Sm, V, BH, false, true);            // Sm @ Vᵀ → (BH*seq, dk)
+        if (!num) return std::unexpected(num.error());
+        auto S2 = engine.elementwise_binary(BinaryOp::Mul, *Sm, *Sm);
+        if (!S2) return std::unexpected(S2.error());
+        auto denom2 = engine.row_reduce_sum(*S2);
+        if (!denom2) return std::unexpected(denom2.error());
+        auto denom_e = engine.elementwise_binary_scalar(BinaryOp::Add, *denom2, Scalar{1e-6}, false);
+        if (!denom_e) return std::unexpected(denom_e.error());
+        auto denom = engine.elementwise_unary(UnaryOp::Sqrt, *denom_e);
+        if (!denom) return std::unexpected(denom.error());
+
+        // ── dO_t: (BH*seq, dk) ──
+        auto dO_T = engine.transpose(grad_out_re);
+        if (!dO_T) return std::unexpected(dO_T.error());
+        auto dO_t = engine.rearrange_3d(*dO_T, seq, BH, d_k_, false);
+        if (!dO_t) return std::unexpected(dO_t.error());
+
+        // dnum = dO / denom（按行广播）
+        auto dnum = engine.clone(*dO_t);
+        if (!dnum) return std::unexpected(dnum.error());
+        { auto r = engine.broadcast_row_inplace(*dnum, *denom, BinaryOp::Div);
+          if (!r) return std::unexpected(r.error()); }
+
+        // ddenom = -rowsum(dO·num) / denom²
+        auto prod = engine.elementwise_binary(BinaryOp::Mul, *dO_t, *num);
+        if (!prod) return std::unexpected(prod.error());
+        auto dot = engine.row_reduce_sum(*prod);
+        if (!dot) return std::unexpected(dot.error());
+        auto negdot = engine.elementwise_unary(UnaryOp::Neg, *dot);
+        if (!negdot) return std::unexpected(negdot.error());
+        auto denom_sq = engine.elementwise_binary(BinaryOp::Mul, *denom, *denom);
+        if (!denom_sq) return std::unexpected(denom_sq.error());
+        auto ddenom = engine.elementwise_binary(BinaryOp::Div, *negdot, *denom_sq);
+        if (!ddenom) return std::unexpected(ddenom.error());
+        // ddenom2 = ddenom / (2·denom)
+        auto two_denom = engine.elementwise_binary_scalar(BinaryOp::Mul, *denom, Scalar{2}, false);
+        if (!two_denom) return std::unexpected(two_denom.error());
+        auto ddenom2 = engine.elementwise_binary(BinaryOp::Div, *ddenom, *two_denom);
+        if (!ddenom2) return std::unexpected(ddenom2.error());
+
+        // dSm = dSm_num + dSm_den
+        //   dSm_num = dnum @ V；dSm_den = 2·Sm·ddenom2（按行广播）
+        auto dSm_num = engine.batched_matmul(*dnum, V, BH, false, false);
+        if (!dSm_num) return std::unexpected(dSm_num.error());
+        auto dSm_den = engine.clone(*Sm);
+        if (!dSm_den) return std::unexpected(dSm_den.error());
+        { auto r = engine.broadcast_row_inplace(*dSm_den, *ddenom2, BinaryOp::Mul);
+          if (!r) return std::unexpected(r.error()); }
+        dSm_den = engine.elementwise_binary_scalar(BinaryOp::Mul, *dSm_den, Scalar{2}, false);
+        if (!dSm_den) return std::unexpected(dSm_den.error());
+        auto dSm = engine.elementwise_binary(BinaryOp::Add, *dSm_num, *dSm_den);
+        if (!dSm) return std::unexpected(dSm.error());
+        // dS = dSm · mask（掩码是常数 0/1 乘法）
+        auto dS = engine.elementwise_binary(BinaryOp::Mul, *dSm, *mask);
+        if (!dS) return std::unexpected(dS.error());
+
+        // ── 梯度 Q/K/V ──
+        auto grad_Qp = engine.batched_matmul(Kp, *dS, BH, false, true);    // Kp @ dSᵀ (BH*dk, seq)
+        if (!grad_Qp) return std::unexpected(grad_Qp.error());
+        auto grad_Kp = engine.batched_matmul(Qp, *dS, BH, false, false);   // Qp @ dS  (BH*dk, seq)
+        if (!grad_Kp) return std::unexpected(grad_Kp.error());
+        auto grad_V = engine.batched_matmul(*dnum, *Sm, BH, true, false);  // dnumᵀ @ Sm → (BH*dk, seq)
+        if (!grad_V) return std::unexpected(grad_V.error());
+
+        return std::array<Tensor, 3>{std::move(*grad_Qp), std::move(*grad_Kp), std::move(*grad_V)};
+    }
+
     // ── 前向扫描：out[bh*dk+j][t] = RLA 输出 ──────────────────────────
     // boundary（可选，空=无文档感知）：size = batch*seq，boundary[b*seq+t]=1
     // 表示位置 t 是文档起点。causal 模式下文档边界处重置运行态 A/B，
@@ -5586,7 +5736,6 @@ public:
         if (total != batch * seq)
             return std::unexpected(Error{"ReLULinearAttention forward: cols not divisible by seq_len"});
         const std::size_t H_dk = num_heads_ * d_k_;
-        const std::size_t BH = batch * num_heads_;
 
         auto q_res = w_q_.forward(engine, input);
         if (!q_res) return q_res;
@@ -5626,17 +5775,8 @@ public:
         if (!Kp) return std::unexpected(Kp.error());
 
         // 核心扫描（CPU 标量；任意后端经 staging）
-        auto Qm = engine.to_matrix(*Qp);
-        if (!Qm) return std::unexpected(Qm.error());
-        auto Km = engine.to_matrix(*Kp);
-        if (!Km) return std::unexpected(Km.error());
-        auto Vm = engine.to_matrix(V);
-        if (!Vm) return std::unexpected(Vm.error());
-        const auto boundary = build_boundary_(batch, seq);
-        Matrix out_m(BH * d_k_, seq, Scalar{0});
-        scan_forward_(*Qm, *Km, *Vm, out_m, d_k_, BH, seq, causal_,
-                      num_heads_, boundary, Scalar{1e-6});
-        auto out_t = engine.from_matrix(out_m);
+        // 原语组合版 RLA 前向（GPU 上运行，消除 PCIe 往返）
+        auto out_t = forward_matmul(engine, *Qp, *Kp, V, batch, seq);
         if (!out_t) return std::unexpected(out_t.error());
 
         Tensor concat;
@@ -5667,7 +5807,6 @@ public:
         const std::size_t seq = seq_cache_;
         const std::size_t batch = batch_cache_;
         const std::size_t H_dk = num_heads_ * d_k_;
-        const std::size_t BH = batch * num_heads_;
 
         auto gc = w_o_.backward(engine, grad_output);
         if (!gc) return gc;
@@ -5683,34 +5822,20 @@ public:
             gcr = std::move(*gc);
         }
 
-        auto Gm = engine.to_matrix(gcr);
-        if (!Gm) return std::unexpected(Gm.error());
-        auto Qm = engine.to_matrix(Qp_cache_);
-        if (!Qm) return std::unexpected(Qm.error());
-        auto Km = engine.to_matrix(Kp_cache_);
-        if (!Km) return std::unexpected(Km.error());
-        auto Vm = engine.to_matrix(V_re_cache_);
-        if (!Vm) return std::unexpected(Vm.error());
-
-        Matrix gQ(BH * d_k_, seq, Scalar{0}), gK(BH * d_k_, seq, Scalar{0}),
-               gV(BH * d_k_, seq, Scalar{0});
-        const auto boundary = build_boundary_(batch, seq);
-        scan_backward_(*Qm, *Km, *Vm, *Gm, gQ, gK, gV, d_k_, BH, seq, causal_,
-                       num_heads_, boundary, Scalar{1e-6});
-
-        auto gQt = engine.from_matrix(gQ);
-        if (!gQt) return std::unexpected(gQt.error());
-        auto gKt = engine.from_matrix(gK);
-        if (!gKt) return std::unexpected(gKt.error());
-        auto gVt = engine.from_matrix(gV);
-        if (!gVt) return std::unexpected(gVt.error());
+        // 原语组合版 RLA 反向（GPU 上运行）
+        auto gres = backward_matmul(engine, Qp_cache_, Kp_cache_, V_re_cache_,
+                                    gcr, batch, seq);
+        if (!gres) return std::unexpected(gres.error());
+        auto gQt = std::move((*gres)[0]);
+        auto gKt = std::move((*gres)[1]);
+        auto gVt = std::move((*gres)[2]);
 
         // ReLU 反向：(x>0) ? g : 0（x>0 与 Qp/Kp>0 同号）
         auto gq_relu = engine.elementwise_select_scalar_cond(
-            CompareOp::Gt, Qp_cache_, Scalar{0}, *gQt, Scalar{0});
+            CompareOp::Gt, Qp_cache_, Scalar{0}, gQt, Scalar{0});
         if (!gq_relu) return std::unexpected(gq_relu.error());
         auto gk_relu = engine.elementwise_select_scalar_cond(
-            CompareOp::Gt, Kp_cache_, Scalar{0}, *gKt, Scalar{0});
+            CompareOp::Gt, Kp_cache_, Scalar{0}, gKt, Scalar{0});
         if (!gk_relu) return std::unexpected(gk_relu.error());
 
         // RoPE 反向（旋转正交，逆 = 反角）
@@ -5731,14 +5856,14 @@ public:
             gq_r = std::move(*a);
             auto b = engine.rearrange_3d(*gk_relu, H_dk, batch, seq, true); if (!b) return std::unexpected(b.error());
             gk_r = std::move(*b);
-            auto c = engine.rearrange_3d(*gVt, H_dk, batch, seq, true); if (!c) return std::unexpected(c.error());
+            auto c = engine.rearrange_3d(gVt, H_dk, batch, seq, true); if (!c) return std::unexpected(c.error());
             gv_r = std::move(*c);
         }
         else
         {
             gq_r = std::move(*gq_relu);
             gk_r = std::move(*gk_relu);
-            gv_r = std::move(*gVt);
+            gv_r = std::move(gVt);
         }
 
         auto giq = w_q_.backward(engine, gq_r);
