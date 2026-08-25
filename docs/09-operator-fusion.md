@@ -49,9 +49,8 @@ graph LR
         E[batched_matmul_reduce / eval_expr / begin_expr..end_expr]
         F[CPU 实现]
         G[GPU 实现 + 融合 shader]
-        H[CUDA 实现]
     end
-    E --> F & G & H
+    E --> F & G
     G -->|结构 key| I[scan_exprs + gen_fused 闭合世界]
 ```
 
@@ -350,7 +349,8 @@ auto e = engine.end_expr();
 |------|------|------|
 | CPU | `cpu_engine.hpp` | `begin_expr/end_expr` 为 no-op；`eval_expr` 扩展归约语义；§4 三个原语用等效循环（先正确、后可向量化） |
 | GPU (Vulkan) | `gpu_engine.hpp` + `shaders/*.comp` + `vk_backend.hpp` | 录制融合分析；`eval_expr` 查 `fused_registry`；§4 原语 dispatch 融合 shader |
-| CUDA | `cuda_engine.hpp` + `cuda_kernels.cu` | 同 GPU，CUDA 融合 kernel（`bmm_reduce`、`bmm_softmax_apply`） |
+
+> 注：CUDA 后端已停用（v1.0.0），此处不再列为后端。恢复见 `docs/13-optimize-proposal-list.md` §5。
 
 所有原语遵循现有约定：`Result<T>` 返回、batch 录制可组合、失败回退到组合路径。
 
@@ -389,7 +389,7 @@ auto e = engine.end_expr();
 | M4 ✅ | **§4 三个 matmul 融合原语（bmm_reduce/bmm_denom/bmm_apply，CPU + GPU 融合 shader，可选掩码）** | `matmul_fusion_test`（CPU err=0 / GPU err≤1.9e-6）+ `gpt_gradcheck` 回归 |
 | M5 ✅ | **CrossEntropyLoss 稀疏融合（`col_softmax_denom` + `col_softmax_sparse_forward`，不物化全 softmax；单 kernel 稠密梯度 + 标签位置 loss_vec）** | `ce_fusion_test`（CPU err=0 / GPU err≤4.8e-7）+ GPT 训练（CPU/GPU）回归 |
 | M6 ✅ | **Attention 两趟式（forward m/l/O + 反向重算 W 的两个融合原语，不物化 (BH·seq, seq) 得分/概率矩阵）** | `matmul_fusion_test` 扩展（8 用例）+ `attn_gradcheck`/`gpt_gradcheck` 全过 + GPT/MNIST 训练（CPU/GPU × learned/alibi/rope） |
-| M7 | CUDA 后端对齐；文档与 `DEVELOPMENT_STANDARDS.md` 补"原语可专、不叫算法名"约定 | 全套测试 |
+| M7 ✅ | 文档与 `DEVELOPMENT_STANDARDS.md` 补"原语可专、不叫算法名"约定（CUDA 后端已停用，不再对齐） | 全套测试 |
 
 ---
 
@@ -412,7 +412,6 @@ auto e = engine.end_expr();
 | `include/neuralnet.cpp/cpu_engine.hpp` | 上述原语 CPU 实现（先正确后优化） |
 | `include/neuralnet.cpp/gpu_engine.hpp` | 录制融合分析；GPU 原语实现 |
 | `include/neuralnet.cpp/backend/vk_backend.hpp` | 新融合 shader dispatch（含 M6 两反向 pipeline、M5 两列式 pipeline） |
-| `include/neuralnet.cpp/cuda_engine.hpp` + `cuda_kernels.cu` | CUDA 实现 |
 | `include/neuralnet.cpp/compute_layer.hpp` | Softmax/LN/RMSNorm/Attention 改录制/两趟（`two_pass_mask_` 决策钩子） |
 | `include/neuralnet.cpp/compute_loss.hpp` | CrossEntropyLoss 稀疏融合（`forward_sparse` 融合路径 + 旧回退；`softmax_cols_` 用融合分母） |
 | `shaders/*.comp` | 归约/两趟注意力融合 shader |
@@ -441,7 +440,7 @@ auto e = engine.end_expr();
 ### M2 ✅（2026-08）— begin_expr/end_expr 录制框架
 
 - `compute_engine.hpp`：`begin_expr()/end_expr()` 纯虚接口（计算级融合入口）。
-- `cpu_engine.hpp` / `gpu_engine.hpp` / `cuda_engine.hpp`：no-op 实现（各表达式/原语独立求值，行为不变）。
+- `cpu_engine.hpp` / `gpu_engine.hpp`：no-op 实现（各表达式/原语独立求值，行为不变）。
 - Layer 可先行用 `begin_expr/end_expr` 包住算法段落而语义不变；录制融合分析（虚拟寄存器 DAG + 融合边界判定）在 M3 落地。
 
 ### M3 ✅（2026-08）— Softmax 归约融合（GPU 工作组级归约 kernel）
@@ -487,7 +486,6 @@ auto e = engine.end_expr();
 - `shaders/bmm_reduce.comp` / `bmm_denom.comp` / `bmm_apply.comp`：手写融合 shader（工作组级，每工作组协作处理一行；`bmm_apply` 用共享内存存 W 行，N≤4096）。push constants `M,N,K[,D],flags,alpha`。
 - `vk_backend.hpp`：三 pipeline + `dispatch_bmm_generic` + `bmm_reduce_gpu`/`bmm_denom_gpu`/`bmm_apply_gpu`（mask 为空时绑定 A 占位 + has_mask=0）。
 - `gpu_engine.hpp`：三原语 GPU 实现（`reduce_cols=false` 报错回退）。
-- `cuda_engine.hpp`：占位（返回错误，回退组合路径）。
 - `src/matmul_fusion_test.cpp`（新）：CPU err=0 / GPU err≤1.9e-6，覆盖四种转置 × Max/Sum × 有/无掩码 + denom/apply 注意力布局。
 
 **关键决策**：
@@ -511,7 +509,7 @@ auto e = engine.end_expr();
 **实现**：
 - `shaders/col_softmax_denom.comp`（3 bindings，PC C,N，dispatch N 工作组）；`shaders/col_softmax_sparse_forward.comp`（5 bindings，PC C,N,vocab_size,flags,inv_num_valid）。
 - `vk_backend.hpp`：两 pipeline + `col_softmax_denom_gpu`/`col_softmax_sparse_forward_gpu`（复用 `dispatch_bmm_generic`；grad 返回张量在最后 binding，loss_vec 倒数第二）。
-- `cpu_engine.hpp` / `gpu_engine.hpp` / `cuda_engine.hpp`（桩）。
+- `cpu_engine.hpp` / `gpu_engine.hpp` / `cuda_engine.hpp`（桩，CUDA 已停用）。
 - `compute_loss.hpp`：
   - `softmax_cols_`（dense 路径）改用 `col_softmax_denom`（替代 clone-sub+exp+reduce）。
   - `forward_sparse` 重构：**融合路径**（上传 labels/mask 小张量 → 单 kernel 得 grad + loss_vec → `row_reduce_sum(loss_vec)` 下载标量算 loss）+ **旧路径回退**（下载 softmax 到 CPU，正确性安全网；如 vocab_size>2^24 时自动回退）。
@@ -545,7 +543,7 @@ auto e = engine.end_expr();
 - `shaders/bmm_q_backward.comp`：工作组 per (b,i)；Phase A 算 W 行（共享内存，N≤4096）+ 累加 R + 树形归约；Phase B 用共享 W 行算 grad_Q 各 k。8 bindings（A,B,Mask,RowMax,Denom,P,OutR,OutGQ）。
 - `shaders/bmm_kv_backward.comp`：工作组 per (b,j)；Phase A 算 W 列（共享内存，M≤4096）；Phase B 算 grad_K 与 grad_V。10 bindings（A,B,Mask,RowMax,Denom,P,G,R,OutV,OutK）。
 - `vk_backend.hpp`：`bmm_q_backward_gpu`/`bmm_kv_backward_gpu`（复用 `dispatch_bmm_generic`；`r_out`/`grad_v_out` 作为倒数第二 binding 输入、返回张量作为最后一个 binding 输出）。
-- `cpu_engine.hpp`：两原语 CPU 参考实现；`gpu_engine.hpp`：GPU 实现；`cuda_engine.hpp`：占位（回退）。
+- `cpu_engine.hpp`：两原语 CPU 参考实现；`gpu_engine.hpp`：GPU 实现；`cuda_engine.hpp`：占位（回退，CUDA 已停用）。
 - `compute_layer.hpp` AttentionBase：
   - **forward 两趟式**：`m = bmm_reduce(Max)` → `l = bmm_denom` → `O = bmm_apply(Q,K,V_t,m,l)`（V 需 (BH*seq, d_k)，用 `transpose + rearrange_3d(seq,BH,d_k)` 按 batch 转置）；`O` 再按 batch 转置回 (BH*d_k, seq)。缓存 m/l（各 (BH*seq,1)，替代 attn_cache_）。
   - **backward 重算**：`P = grad_A = bmm(grad_concat,V)`；`G = grad_concat^T`（同 V 的布局转换）；`bmm_softmax_backward_q` → grad_Q；`bmm_softmax_backward_kv` → grad_K/grad_V。不再物化 grad_S。

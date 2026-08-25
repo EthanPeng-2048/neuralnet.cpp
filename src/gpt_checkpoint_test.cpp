@@ -77,10 +77,11 @@ int run_test()
               << " layers=" << num_layers << "\n";
 
     // 单一模型实例（checkpoint 关闭初始化）
-    GPTModel model(eng, vocab, d_model, seq_len, num_heads, d_ff, num_layers,
+    GPTModel model(vocab, d_model, seq_len, num_heads, d_ff, num_layers,
                    PosEncodingType::Learned,
                    ActivationType::SwiGLU,
                    NormType::RMSNorm);
+    { auto r = model.init(eng); if (!r) { std::cerr << "GPTModel init 失败: " << r.error().message << "\n"; return 1; } }
 
     std::mt19937_64 rng(7);
     std::uniform_real_distribution<Scalar> dist(-1, 1);

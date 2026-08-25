@@ -36,12 +36,10 @@
 - **现状**：16×16 workgroup、64×64 输出 tile、BK=32、vec4 共享内存布局、每线程 4×4=16 元素。
 - **收益**：compute:load 比 8:1、bank conflict 消除、转置感知。
 
-### P1-04 📋 逐元素 kernel 的 row/col 除法消除
-- **现状**：标量路径（非 vec4）仍恒算 `row = i / cols` 和 `col = i % cols`，即使只用 `row`（如只用 `Linear` 视图）或只用 `col`。GPU 整数除法/模运算延迟约 20-30 周期。
-- **方案**：在 `generate_glsl` 标量路径中也检查 `need_row` / `need_col`，仅发射需要的。vec4 路径已实现此逻辑（`glsl_gen.hpp` L149 起），标量路径可复用同一套守卫。
-- **工作量**：小（0.5 天）
-- **收益**：所有非 vec4 融合 kernel 消除冗余除法（~10-15% 内核时间）
-- **风险**：低（纯代码生成变更，vec4 路径已有先例）
+### P1-04 ✅ 逐元素 kernel 的 row/col 除法消除（已实现）
+- **文件**：`glsl_gen.hpp`
+- **现状**：标量路径（纯标量 kernel + vec4 回退循环）均已按 `need_row` / `need_col` 守卫发射，仅计算实际使用的 `row`/`col`。与 vec4 快速路径共用同一套 `glsl_view_uses_row` / `glsl_view_uses_col` 判定。
+- **收益**：所有非 vec4 融合 kernel 消除冗余整数除法/模运算（~10-15% 内核时间）。
 
 ### P1-05 📋 归约指令 pass 多累加器
 - **现状**：归约视图 pass 已用多累加器（acc0-acc3，stride 4×256），但归约指令 pass（每条归约指令）仍单累加器串行。参见 `codegen-opt-assessment.md`。
@@ -74,10 +72,11 @@
 - **收益**：对 ALU 轻量 kernel（如 broadcast）可提升 occupancy
 - **风险**：低（但需逐 kernel 测评，收益可能有限）
 
-### P1-09 ❌ warp shuffle（subgroup）归约——经评估搁置
-- **曾尝试**：用 `subgroupShuffle` 替代共享内存树归约。
-- **搁置原因**：该 kernel 内存受限，combine 步骤占比极小（<5%），shuffle 对整体吞吐无实质提升，不值得引入 subgroup 依赖（Vulkan 1.3+ 或 `VK_EXT_subgroup_size_control`）。
-- **结论**：保留共享内存树归约是正确终点。
+### P1-09 ✅ warp shuffle（subgroup）归约（已实现）
+- **文件**：`glsl_gen.hpp`（`emit_tree_reduce`）
+- **现状**：归约已改用 subgroup 蝴蝶归约替代共享内存树归约——第 1 步 `subgroupAdd`/`subgroupMax` 得到每 warp 部分和（零共享/屏障），第 2 步首 warp 归约全部 warp 部分和（`gl_SubgroupID == 0`，屏障后全线程可见）。
+- **收益**：消除共享内存树归约的屏障与共享内存访问开销。
+- **注意**：启用 `GL_KHR_shader_subgroup_basic` / `GL_KHR_shader_subgroup_arithmetic` 扩展，需 Vulkan 1.3+ 或 `VK_EXT_subgroup_size_control` 支持。
 
 ---
 
@@ -281,13 +280,10 @@
 
 ## 6. 序列化与工程
 
-### P6-01 📋 序列化 EOF 语义修复
-- **文件**：`model_serialization.hpp:531`
-- **现状**：`TODO(1.1, M2)` — doc 说 "keep defaults on EOF"，但代码在 `read_matrix` 失败时返回错误。
-- **方案**：统一为版本化 fallback——读到 EOF 时保持默认值（向后兼容旧格式），非 EOF 错误才报错。
-- **工作量**：小（0.5 天）
+### P6-01 ✅ 序列化 EOF 语义修复（已实现）
+- **文件**：`model_serialization.hpp`
+- **现状**：`load_model` 已用 `ifs.peek() == EOF` 在读取前检查文件结尾，读到 EOF 时保持默认值（向后兼容旧格式），非 EOF 错误才报错。原 `TODO(1.1, M2)` 已移除。
 - **收益**：旧模型格式兼容性
-- **风险**：低
 
 ### P6-02 📋 Vulkan singleton 内存泄漏修复
 - **文件**：`backend/vk_backend.hpp:1017`
@@ -298,15 +294,15 @@
 - **风险**：低（但需验证多线程安全）
 
 ### P6-03 📋 优化器构造器重构
-- **文件**：`compute_optimizer.hpp:59`
-- **现状**：`TODO(1.1, S2)` — `NN_ASSERT` 在 Release 模式下吞掉错误。
+- **文件**：`compute_optimizer.hpp`
+- **现状**：原 `TODO(1.1, S2)` 已移除；配置校验失败时改用 `std::abort()`（非原 `NN_ASSERT`），但 Release 模式下仍会中止进程而非通过 `Result<T>` 返回可恢复错误。
 - **方案**：构造器改为返回 `Result<T>`（如 `Adam::create(...)`），签名级重构。
 - **工作量**：中（2-3 天，涉及所有优化器调用点）
-- **收益**：Release 模式下也能正确报告配置错误
+- **收益**：Release 模式下也能正确报告配置错误而非中止进程
 - **风险**：中（大量调用点需同步修改）
 
 ### P6-04 📋 测试覆盖率提升
-- **现状**：32 个测试文件覆盖核心功能，但缺少：
+- **现状**：17 个测试目标（`src/*test*.cpp`）覆盖核心功能，但缺少：
   - 极端形状测试（rows=1, cols=1, rows=100000）
   - 数值边界测试（全零、全最大值、NaN/Inf 传播）
   - 并发安全测试（多线程同时 forward/backward）
@@ -438,13 +434,11 @@
 
 | 编号 | 方案 | 工作量 | 收益 |
 |------|------|--------|------|
-| P1-04 | 标量路径 row/col 除法消除 | 0.5 天 | 所有非 vec4 kernel 提速 |
 | P1-05 | 归约多累加器 | 2-3 天 | 计算密集归约 ~2× |
 | P2-07 | ExprSpec 上限分级策略 | 1 天 | 更多层享受融合 |
 | P3-05 | BLOCK_SIZE 自适应 | 1 天 | 多硬件适配 |
 | P5-03 | CUDA cuBLAS GEMM | 3-5 天 | NVIDIA GPU GEMM 3-10× |
 | P4-07 | 内存池预分配 | 0.5 天 | 减少初期延迟 |
-| P6-01 | 序列化 EOF 修复 | 0.5 天 | 向后兼容 |
 | P6-02 | Vulkan 内存泄漏修复 | 1 天 | ASan 干净退出 |
 
 ### ⚡ 中影响 + 架构级（需要更大投入）
@@ -473,7 +467,6 @@
 
 | 编号 | 方案 | 搁置原因 |
 |------|------|---------|
-| P1-09 | warp shuffle 归约 | 内存受限 kernel，shuffle 对整体吞吐无实质提升 |
 | P3-04 | 8 路累加器 dot_kernel | 编译器自动向量化已最优，手写反而让 forward 回退 |
 
 ---
@@ -485,6 +478,8 @@
 | P1-01 | vec4 向量化发射 | 2026-08-25 | `glsl_gen.hpp`, `gen_fused.cpp`, `vk_backend.hpp` |
 | P1-02 | 按需 row/col | 2026-08-25 | `glsl_gen.hpp` |
 | P1-03 | GPU matmul tiled | — | `shaders/matmul_tiled.comp` |
+| P1-04 | 标量路径 row/col 除法消除 | 2026-08-25 | `glsl_gen.hpp` |
+| P1-09 | warp shuffle 归约 | 2026-08-25 | `glsl_gen.hpp` |
 | P2-01 | IR-A DCE/折叠/化简 | 2026-08-23 | `expr_opt.hpp` |
 | P2-02 | IR-B CSE/寄存器分配 | 2026-08-23 | `expr_opt.hpp` |
 | P2-03 | IR-C 图 IR/链融合 | 2026-08-24 | `expr_graph.hpp` |
@@ -495,6 +490,7 @@
 | P4-01 | 激活重计算 L1 | 2026-08-22 | `compute_layer.hpp`, `model_container.hpp` |
 | P4-02 | 内存池归还 L2 | 2026-08-22 | `backend/memory_pool.hpp` |
 | P5-01 | CUDA 后端基础 | — | `backend/cuda_backend.hpp` |
+| P6-01 | 序列化 EOF 语义修复 | 2026-08-25 | `model_serialization.hpp` |
 | — | 注意力 M4/M5/M6 融合 | 2026-08-21 | `compute_layer.hpp`, `shaders/` |
 | — | 列归约 tile 化 | 2026-08-25 | `glsl_gen.hpp`, `vk_backend.hpp` |
 | — | CNN im2col（CPU 端） | 2026-08 | `compute_layer.hpp` |

@@ -326,7 +326,8 @@ int main(int argc, char* argv[])
         };
 
         for (auto [in, out, batch] : cases) {
-            nn::Linear layer(engine, in, out);
+            nn::Linear layer(in, out);
+            { auto r = layer.init(engine); if (!r) { std::cerr << "Linear init 失败: " << r.error().message << "\n"; return 1; } }
             auto input = rand_matrix(in, batch);
             auto input_t = engine.from_matrix(input);
             if (!input_t) {

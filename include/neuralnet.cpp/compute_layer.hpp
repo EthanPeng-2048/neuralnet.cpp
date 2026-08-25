@@ -1175,7 +1175,6 @@ public:
           kernel_(kernel), stride_(stride), padding_(padding),
           in_h_(in_h), in_w_(in_w)
     {
-        const std::size_t fan_in = in_channels * kernel * kernel;
         out_h_ = (in_h_ + 2 * padding_ - kernel_) / stride_ + 1;
         out_w_ = (in_w_ + 2 * padding_ - kernel_) / stride_ + 1;
     }
@@ -3546,20 +3545,20 @@ class LearnedPositionEncoder final : public AdditivePositionEncoder
 {
     std::size_t d_model_;
     std::size_t seq_len_;
-    std::mt19937_64* rng_;           // 非拥有指针
-    std::normal_distribution<Scalar>* dist_;  // 非拥有指针
+    // 自持 RNG（seed=42、N(0,0.02)）：init() 延迟到构造之后调用，
+    // 不能持有指向构造函数局部变量的非拥有指针（会悬空）。
+    std::mt19937_64 rng_{42};
+    std::normal_distribution<Scalar> dist_{0.0, 0.02};
 
 public:
-    LearnedPositionEncoder(std::size_t d_model, std::size_t seq_len,
-                           std::mt19937_64& rng,
-                           std::normal_distribution<Scalar>& dist)
-        : d_model_(d_model), seq_len_(seq_len), rng_(&rng), dist_(&dist) {}
+    LearnedPositionEncoder(std::size_t d_model, std::size_t seq_len)
+        : d_model_(d_model), seq_len_(seq_len) {}
 
     [[nodiscard]] Result<void> init(ComputeEngine& engine) override
     {
         Matrix pe(seq_len_, d_model_);
         auto pe_s = pe.span();
-        for (std::size_t i = 0; i < pe.size(); ++i) pe_s[i] = (*dist_)(*rng_);
+        for (std::size_t i = 0; i < pe.size(); ++i) pe_s[i] = dist_(rng_);
         return init_(engine, std::move(pe), /*learnable=*/true);
     }
 };
@@ -3680,12 +3679,8 @@ public:
         switch (pos_enc_type)
         {
             case PosEncodingType::Learned:
-                {
-                    std::mt19937_64 rng{42};
-                    std::normal_distribution<Scalar> dist(0.0, 0.02);
-                    pos_encoder_ = std::make_unique<LearnedPositionEncoder>(
-                        d_model, seq_len, rng, dist);
-                }
+                pos_encoder_ = std::make_unique<LearnedPositionEncoder>(
+                    d_model, seq_len);
                 break;
             case PosEncodingType::Sinusoidal:
                 pos_encoder_ = std::make_unique<SinusoidalPositionEncoder>(

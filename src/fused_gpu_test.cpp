@@ -69,8 +69,8 @@ int run_rope(CpuEngine& cpu, GpuEngine& gpu, std::size_t dk, bool backward)
     Matrix q(rows, seq);
     for (auto& v : q.span()) v = dist(rng);
 
-    nn::RotaryEmbedding rope_cpu(cpu, dk);
-    nn::RotaryEmbedding rope_gpu(gpu, dk);
+    nn::RotaryEmbedding rope_cpu(dk);
+    nn::RotaryEmbedding rope_gpu(dk);
     const Tensor qc = Tensor::from_matrix(Matrix(q));
 
     auto cr = rope_cpu.apply(cpu, qc, seq, backward);
@@ -193,7 +193,9 @@ int run_norm(const char* name, CpuEngine& cpu, GpuEngine& gpu)
     for (auto& v : x.span()) v = dist(rng);
     for (auto& v : grad.span()) v = dist(rng);
 
-    NormT n_cpu(cpu, F), n_gpu(gpu, F);
+    NormT n_cpu(F), n_gpu(F);
+    { auto r = n_cpu.init(cpu); if (!r) { std::cerr << "  CPU " << name << " init 失败: " << r.error().message << "\n"; return 1; } }
+    { auto r = n_gpu.init(gpu); if (!r) { std::cerr << "  GPU " << name << " init 失败: " << r.error().message << "\n"; return 1; } }
     const Tensor in = Tensor::from_matrix(Matrix(x));
     auto fc = n_cpu.forward(cpu, in);
     auto fg = n_gpu.forward(gpu, in);

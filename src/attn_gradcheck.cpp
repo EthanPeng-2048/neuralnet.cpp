@@ -146,7 +146,8 @@ int main(int argc, char* argv[])
               << " seq=" << seq << " batch=" << batch << " tol=" << tol
               << " pos_enc=" << pos_enc_name << "\n";
 
-    CausalSelfAttention attn(eng, d_model, num_heads, seq, seq, pos_enc);
+    CausalSelfAttention attn(d_model, num_heads, seq, seq, pos_enc);
+    { auto r = attn.init(eng); if (!r) { std::cerr << "CausalSelfAttention init 失败: " << r.error().message << "\n"; return 1; } }
 
     std::mt19937_64 rng(123);
     std::uniform_real_distribution<Scalar> dist(-1, 1);

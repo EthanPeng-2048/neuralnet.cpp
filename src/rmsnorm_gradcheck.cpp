@@ -155,7 +155,8 @@ int main(int argc, char *argv[])
     std::cout << "  features=" << features << " batch=" << batch
               << " tol=" << tol << "\n";
 
-    RMSNorm norm(eng, features);
+    RMSNorm norm(features);
+    { auto r = norm.init(eng); if (!r) { std::cerr << "RMSNorm init 失败: " << r.error().message << "\n"; return 1; } }
 
     std::mt19937_64 rng(123);
     std::uniform_real_distribution<Scalar> dist(-1, 1);

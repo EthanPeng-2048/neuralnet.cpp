@@ -182,10 +182,11 @@ int main(int argc, char* argv[])
     std::cout << "  activation=SwiGLU norm=RMSNorm pos=" << pos_enc_name << "\n";
     std::cout << "  tol=" << tol << "\n";
 
-    GPTModel model(eng, vocab, d_model, seq_len, num_heads, d_ff, num_layers,
+    GPTModel model(vocab, d_model, seq_len, num_heads, d_ff, num_layers,
                    pos_enc,
                    ActivationType::SwiGLU,
                    NormType::RMSNorm);
+    { auto r = model.init(eng); if (!r) { std::cerr << "GPTModel init 失败: " << r.error().message << "\n"; return 1; } }
 
     std::mt19937_64 rng(123);
     std::uniform_real_distribution<Scalar> dist(-1, 1);

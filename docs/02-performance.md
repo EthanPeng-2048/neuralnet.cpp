@@ -14,7 +14,7 @@
 │  L4 GPU 加速  │ Vulkan Compute、批量提交、Command Buffer     │
 │  L3 内存级    │ 缓存分块、零分配热路径、Tensor 零拷贝         │
 │  L2 并行级    │ SmartPolicy 自适应并行、线程池 latch 零分配   │
-│  L1 指令级    │ AVX2 SIMD、-ffast-math、-funroll-loops       │
+│  L1 指令级    │ AVX2 SIMD、-march=native（不使用 -ffast-math）       │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -123,17 +123,21 @@ for i_block in range(0, M, BLOCK_SIZE):
 
 ### Release 模式编译标志
 
+> ⚠️ **不使用 `-ffast-math`**：为保证 NaN/Inf 传播与训练数值稳定性，项目明确禁用 `-ffast-math`（也禁用 `-funroll-loops`）。实际 Release 标志为 `-O3 -march=native -fno-exceptions -Wall -Wextra -Wpedantic -Werror`（见 `CMakeLists.txt` / `AGENTS.md` §9）。
+
 ```cmake
 # CMakeLists.txt
-set(RELEASE_FLAGS -O3 -ffast-math -funroll-loops -march=native)
+set(RELEASE_FLAGS -O3 -march=native -fno-exceptions -Wall -Wextra -Wpedantic -Werror)
 ```
 
 | 标志 | 作用 |
 |------|------|
 | `-O3` | 最高级别优化（内联、循环变换、向量化） |
-| `-ffast-math` | 允许浮点重排序、忽略 NaN/Infinity（提升 FMA 吞吐） |
-| `-funroll-loops` | 循环展开，减少分支预测开销 |
 | `-march=native` | 启用本机 CPU 指令集（AVX2/AVX-512 等 SIMD） |
+| `-fno-exceptions` | 禁用异常（配合 `Result<T>` 错误处理铁律） |
+| `-Wall -Wextra -Wpedantic -Werror` | 严格告警，告警即错误 |
+
+> 说明：项目**刻意不用** `-ffast-math`（允许浮点重排序、忽略 NaN/Infinity 会破坏训练稳定性）与 `-funroll-loops`（由 `-O3` 自动处理）。
 
 ---
 
@@ -358,8 +362,7 @@ compute::apply(span, expr);
 | SmartPolicy | 小数据串行、大数据并行 | 避免小数据 0.3x 退化 |
 | 线程池 latch | 所有并行操作 | 消除 N 次堆分配/加锁 |
 | 缓存分块 | 矩阵乘法 | L1 命中率 → 3-8x 加速 |
-| -ffast-math | 所有浮点运算 | FMA 重排序 + SIMD |
-| -march=native | 所有计算 | AVX2/AVX-512 SIMD |
+| -march=native | 所有计算 | AVX2/AVX-512 SIMD（不使用 -ffast-math，保数值稳定） |
 | GPU 批量提交 | GPU 推理/训练 | 减少 kernel launch 开销 |
 | Tensor 零拷贝 | Layer 间传递 | 消除数据拷贝 |
 | 融合 axpy | 优化器更新 | 减少 600 次 buffer 分配/step |

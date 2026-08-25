@@ -160,7 +160,8 @@ int main(int argc, char *argv[])
     std::cout << "  d_model=" << d_model << " d_ff=" << d_ff
               << " batch=" << batch << " tol=" << tol << "\n";
 
-    FeedForward ff(eng, d_model, d_ff, ActivationType::SwiGLU);
+    FeedForward ff(d_model, d_ff, ActivationType::SwiGLU);
+    { auto r = ff.init(eng); if (!r) { std::cerr << "FeedForward init 失败: " << r.error().message << "\n"; return 1; } }
 
     std::mt19937_64 rng(123);
     std::uniform_real_distribution<Scalar> dist(-1, 1);

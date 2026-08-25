@@ -110,8 +110,9 @@ bool test_consistency(
     // ── 1. 构建模型 ──
     std::cout << "[1/4] 构建 GPTModel..." << std::flush;
     GPTModel model(
-        engine, vocab_size, d_model, seq_len,
+        vocab_size, d_model, seq_len,
         num_heads, d_ff, num_layers, pos_enc);
+    { auto r = model.init(engine); if (!r) { std::cerr << "GPTModel init 失败: " << r.error().message << "\n"; return false; } }
     std::cout << " 完成\n";
 
     // ── 2. 生成随机 token 序列 ──
