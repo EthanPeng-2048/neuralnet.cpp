@@ -837,6 +837,9 @@ class GptTrainController(CLIController):
         if "memory_tokens" in kwargs:
             args.extend(["--memory-tokens", self._format_arg_value(kwargs["memory_tokens"])])
         
+        if "window" in kwargs:
+            args.extend(["--window", self._format_arg_value(kwargs["window"])])
+        
         # 日志和保存间隔
         if "log_interval" in kwargs:
             args.extend(["--log-interval", self._format_arg_value(kwargs["log_interval"])])

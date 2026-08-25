@@ -339,10 +339,15 @@ void print_usage(const char *prog)
         << "  --norm <type>      归一化层: layernorm(默认)/rmsnorm\n"
         << "                     layernorm: LayerNorm（GPT-2 风格）\n"
         << "                     rmsnorm: RMSNorm（LLaMA/Mistral 风格，更快更稳）\n"
-        << "  --model <type>     模型架构: gpt(默认)/zipt (AttnZip 记忆压缩)\n"
-        << "                     zipt: 先整段压缩为 memory-tokens 个记忆 token，再逐块\n"
-        << "                           对 [记忆;局部] 联合注意力（长上下文 O(L) 复杂度）\n"
+        << "  --model <type>     模型架构: gpt(默认)/zipt (AttnZip 记忆压缩)/rapt (ReLU 线性注意力)\n"
+        << "                     zipt: 把长上下文压缩为记忆 token，再逐块对 [记忆;窗口]\n"
+        << "                           联合注意力（长上下文线性复杂度）\n"
+        << "                     rapt: ReLU 线性注意力（RLA）语言模型，动态稀疏检索，\n"
+        << "                           O(L·d²) 复杂度；强制 RoPE（ReLU 前施加）\n"
         << "  --memory-tokens <n> ZiPT 记忆 token 数 M (默认: 32；建议偶数且 ≪ seq-len)\n"
+        << "  --window <n>       ZiPT 局部窗口 W (默认: seq-len)。当 W<seq-len 时启用\n"
+        << "                     压缩模式 L=W+C：历史 (seq-len - W) 压缩为 M 个记忆 token，\n"
+        << "                     窗口 W 直接注意力。注意力预算 = W + M。<seq-len 建议用整窗数\n"
         << "  --log-interval <n> 每隔多少 step 显示进度 (默认: 50)\n"
         << "  --save-interval <n> 每隔多少 step 保存 checkpoint (默认: 100)\n"
         << "  --grad-log         显示梯度统计（范数/最大值/均值）\n"
@@ -403,6 +408,7 @@ struct TrainConfig
     std::size_t d_ff = nn::GPT_D_FF;
     std::string model_type = "gpt";   // gpt / zipt（AttnZip 记忆压缩）
     std::size_t memory_tokens = nn::ZIPT_MEMORY_TOKENS;  // ZiPT 记忆 token 数 M
+    std::size_t window = 0;           // ZiPT 局部窗口 W（0=默认=seq-len，旧行为 W=L 无压缩）
     std::size_t log_interval = 50;
     std::size_t save_interval = 100;  // checkpoint 保存间隔（独立于 log_interval）
     bool load_existing = false;
@@ -552,9 +558,11 @@ TrainConfig parse_args(int argc, char *argv[])
         else if (arg == "--model" && i + 1 < argc)
         {
             cfg.model_type = argv[++i];
-            if (cfg.model_type != "gpt" && cfg.model_type != "zipt")
+            if (cfg.model_type != "gpt" && cfg.model_type != "zipt" &&
+                cfg.model_type != "rapt")
             {
-                std::cerr << "未知模型架构: " << cfg.model_type << ", 可选: gpt, zipt\n";
+                std::cerr << "未知模型架构: " << cfg.model_type
+                          << ", 可选: gpt, zipt, rapt\n";
                 std::exit(1);
             }
         }
@@ -563,6 +571,12 @@ TrainConfig parse_args(int argc, char *argv[])
             auto v = nn::parse_number<std::size_t>(argv[++i]);
             if (!v) { std::cerr << "无效 --memory-tokens: " << v.error().message << "\n"; std::exit(1); }
             cfg.memory_tokens = *v;
+        }
+        else if (arg == "--window" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --window: " << v.error().message << "\n"; std::exit(1); }
+            cfg.window = *v;
         }
         else if (arg == "--log-interval" && i + 1 < argc)
         {
@@ -915,9 +929,24 @@ int main(int argc, char *argv[])
     std::cout << "  Transformer 层数: " << cfg.num_layers << "\n";
     std::cout << "  FFN 维度: " << cfg.d_ff << "\n";
     std::cout << "  序列长度: " << cfg.seq_len << "\n";
-    std::cout << "  模型架构: " << (cfg.model_type == "zipt" ? "ZiPT (AttnZip 记忆压缩)" : "GPT") << "\n";
+    std::cout << "  模型架构: "
+              << (cfg.model_type == "zipt" ? "ZiPT (AttnZip 记忆压缩)"
+                  : cfg.model_type == "rapt" ? "RAPT (ReLU 线性注意力)"
+                  : "GPT") << "\n";
     if (cfg.model_type == "zipt")
+    {
         std::cout << "  记忆 token 数 (M): " << cfg.memory_tokens << "\n";
+        const std::size_t win = (cfg.window == 0) ? cfg.seq_len : cfg.window;
+        std::cout << "  局部窗口 (W): " << win
+                  << (win < cfg.seq_len
+                      ? "  [压缩模式 L=W+C: 历史 " + std::to_string(cfg.seq_len - win) + " 压入 " + std::to_string(cfg.memory_tokens) + " 记忆]"
+                      : "  [W=L，无压缩（传统注意力度量）]")
+                  << "\n";
+    }
+    else if (cfg.model_type == "rapt")
+    {
+        std::cout << "  位置编码: RoPE（RLA 强制，施加在 ReLU 之前）\n";
+    }
     std::cout << "  优化器: " << cfg.optimizer_name << "  学习率: " << cfg.lr << "\n";
     std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
     std::cout << "  GPU: " << (cfg.gpu_enabled ? "启用" : "禁用") << "\n";
@@ -950,10 +979,19 @@ int main(int argc, char *argv[])
 
     // ── 构建模型（绑定引擎） ─────────────────────────────────
     nn::Result<nn::Model> model_build;
-    if (cfg.model_type == "zipt")
+    if (cfg.model_type == "rapt")
+    {
+        // RLA 强约束：位置编码必须 RoPE（施加在 Q/K 进 ReLU 之前），强制覆盖
+        cfg.pos_encoding = nn::PosEncodingType::RoPE;
+        model_build = nn::build_rapt_model(*engine, nn::RAPTConfig{
+            tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
+            cfg.num_heads, cfg.d_ff, cfg.num_layers,
+            cfg.pos_encoding, cfg.activation, cfg.norm_type});
+    }
+    else if (cfg.model_type == "zipt")
     {
         model_build = nn::build_zipt_model(*engine, nn::ZiPTConfig{
-            tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
+            tokenizer->vocab_size(), cfg.d_model, cfg.seq_len, cfg.window,
             cfg.num_heads, cfg.d_ff, cfg.num_layers, cfg.memory_tokens,
             cfg.pos_encoding, cfg.activation, cfg.norm_type});
     }
@@ -995,11 +1033,16 @@ int main(int argc, char *argv[])
 
     // ── 构建规格（用于保存） ─────────────────────────────────
     nn::ModelSpec spec;
-    if (cfg.model_type == "zipt")
+    if (cfg.model_type == "rapt")
+        spec = nn::make_rapt_spec(
+            tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
+            cfg.num_heads, cfg.d_ff, cfg.num_layers,
+            cfg.pos_encoding, cfg.activation, cfg.norm_type);
+    else if (cfg.model_type == "zipt")
         spec = nn::make_zipt_spec(
             tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
             cfg.num_heads, cfg.d_ff, cfg.num_layers, cfg.memory_tokens,
-            cfg.pos_encoding, cfg.activation, cfg.norm_type);
+            cfg.window, cfg.pos_encoding, cfg.activation, cfg.norm_type);
     else
         spec = nn::make_gpt_spec(
             tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
@@ -1016,8 +1059,21 @@ int main(int argc, char *argv[])
         else
         {
             auto file_spec = std::move(*spec_result);
+            // RAPT 独立构建路径
+            if (file_spec.is_rapt())
+            {
+                std::cout << "从模型文件读取 RAPT 规格\n";
+                auto build_result = nn::build_rapt_model_from_spec(*engine, file_spec);
+                if (!build_result)
+                {
+                    std::cerr << "Error: " << build_result.error().message << '\n';
+                    return 1;
+                }
+                model = std::move(*build_result);
+                spec = file_spec;
+            }
             // ZiPT 独立构建路径
-            if (file_spec.is_zipt())
+            else if (file_spec.is_zipt())
             {
                 std::cout << "从模型文件读取 ZiPT 规格\n";
                 auto build_result = nn::build_zipt_model_from_spec(*engine, file_spec);
@@ -1170,6 +1226,20 @@ int main(int argc, char *argv[])
     for (std::size_t i = 0; i < sample_indices.size(); ++i)
         sample_indices[i] = i;
 
+    // ── 损失覆盖范围（ZiPT 压缩模式） ─────────────────────────────
+    // 当 window < seq_len 时，模型输出 logits 仅覆盖窗口 W（历史被压缩器"消费"，
+    // 不直接预测），因此 loss 只在每个样本的最后 W 个位置上计算。
+    //   eff_seq  = 参与 loss 的序列位置数
+    //   win_offs = 每个样本窗口的起始位置（历史长度 = seq_len - W）
+    std::size_t eff_seq = cfg.seq_len;
+    std::size_t win_offs = 0;
+    if (cfg.model_type == "zipt")
+    {
+        const std::size_t win = (cfg.window == 0) ? cfg.seq_len : cfg.window;
+        eff_seq = win;
+        win_offs = cfg.seq_len - win;
+    }
+
     // ── 预分配 batch 缓冲区（末批不满时 resize 到实际 this_bs） ──
     // x_tokens: (seq_len, batch) 输入 token IDs（每窗口一列）
     // y_tokens: (seq_len, batch) 目标 token IDs（x 左移一位）
@@ -1177,7 +1247,7 @@ int main(int argc, char *argv[])
     nn::Matrix x_tokens(cfg.seq_len, cfg.batch_size);
     nn::Matrix y_tokens(cfg.seq_len, cfg.batch_size);
     nn::Matrix loss_mask(cfg.seq_len, cfg.batch_size);
-    std::vector<std::size_t> flat_targets(cfg.seq_len * cfg.batch_size);
+    std::vector<std::size_t> flat_targets(eff_seq * cfg.batch_size);
 
     auto t_start = std::chrono::steady_clock::now();
 
@@ -1235,7 +1305,7 @@ int main(int argc, char *argv[])
                 x_tokens.resize(cfg.seq_len, this_bs);
                 y_tokens.resize(cfg.seq_len, this_bs);
                 loss_mask.resize(cfg.seq_len, this_bs);
-                flat_targets.resize(cfg.seq_len * this_bs);
+                flat_targets.resize(eff_seq * this_bs);
             }
             std::size_t step_valid = 0;  // 本 step 参与 loss 的有效 token 数
 
@@ -1255,7 +1325,8 @@ int main(int argc, char *argv[])
                     y_tokens.set_value_unchecked(t, b, static_cast<Scalar>(y_id));
                     const bool participate = (t + 1 < win_len);
                     loss_mask.set_value_unchecked(t, b, participate ? 1.0f : 0.0f);
-                    if (participate) ++step_valid;
+                    // ZiPT 压缩模式：仅窗口位置参与 loss（历史被压缩器消费）
+                    if (participate && t >= win_offs) ++step_valid;
                 }
             }
 
@@ -1286,17 +1357,19 @@ int main(int argc, char *argv[])
                 return 1;
             }
 
-            // ── 构造平坦标签（与 logits 列序一致：batch-major，i = b*seq + t） ──
-            // GPTModel forward 对输入 transpose 后按 batch-major 列序输出 logits，
+            // ── 构造平坦标签（与 logits 列序一致：batch-major，i = b*eff_seq + t） ──
+            // GPTModel/ZiPTModel forward 对输入 transpose 后按 batch-major 列序输出 logits，
             // 因此 flat_targets / flat_mask 必须与之一一对应（b 外层、t 内层）。
+            // ZiPT 压缩模式：仅窗口位置（src_t ∈ [win_offs, seq_len)）参与 loss。
             auto y_span = y_tokens.span();
             auto m_span = loss_mask.span();
-            std::vector<Scalar> flat_mask(cfg.seq_len * this_bs);
+            std::vector<Scalar> flat_mask(eff_seq * this_bs);
             for (std::size_t b = 0; b < this_bs; ++b)
-                for (std::size_t t = 0; t < cfg.seq_len; ++t)
+                for (std::size_t t = 0; t < eff_seq; ++t)
                 {
-                    const std::size_t pm = t * this_bs + b;  // 源的 position-major 索引
-                    const std::size_t bm = b * cfg.seq_len + t;  // 目标的 batch-major 索引
+                    const std::size_t src_t = win_offs + t;   // 窗口内真实位置
+                    const std::size_t pm = src_t * this_bs + b;  // 源的 position-major 索引
+                    const std::size_t bm = b * eff_seq + t;     // 目标的 batch-major 索引
                     flat_targets[bm] = static_cast<std::size_t>(y_span[pm]);
                     flat_mask[bm] = m_span[pm];
                 }
@@ -1508,7 +1581,7 @@ int main(int argc, char *argv[])
                     x_tokens.resize(cfg.seq_len, this_bs);
                     y_tokens.resize(cfg.seq_len, this_bs);
                     loss_mask.resize(cfg.seq_len, this_bs);
-                    flat_targets.resize(cfg.seq_len * this_bs);
+                    flat_targets.resize(eff_seq * this_bs);
                 }
 
                 // 填充 batch（与训练一致：末窗不足时 PAD 并屏蔽）
@@ -1525,7 +1598,8 @@ int main(int argc, char *argv[])
                         y_tokens.set_value(t, b, static_cast<Scalar>(y_id));
                         const bool participate = (t + 1 < win_len);
                         loss_mask.set_value(t, b, participate ? 1.0f : 0.0f);
-                        if (participate) ++test_valid;
+                        // ZiPT 压缩模式：仅窗口位置参与 loss
+                        if (participate && t >= win_offs) ++test_valid;
                     }
                 }
 
@@ -1553,15 +1627,17 @@ int main(int argc, char *argv[])
                     model.set_doc_ids(test_doc_ids);
                 }
 
-                // 构建 flat_targets / flat_mask（与 logits 列序一致：batch-major，i = b*seq + t）
+                // 构建 flat_targets / flat_mask（与 logits 列序一致：batch-major，i = b*eff_seq + t）
+                // ZiPT 压缩模式：仅窗口位置（src_t ∈ [win_offs, seq_len)）参与 loss。
                 auto y_span = y_tokens.span();
                 auto mm_span = loss_mask.span();
-                std::vector<Scalar> tmask(cfg.seq_len * this_bs);
+                std::vector<Scalar> tmask(eff_seq * this_bs);
                 for (std::size_t b = 0; b < this_bs; ++b)
-                    for (std::size_t t = 0; t < cfg.seq_len; ++t)
+                    for (std::size_t t = 0; t < eff_seq; ++t)
                     {
-                        const std::size_t pm = t * this_bs + b;   // 源 position-major 索引
-                        const std::size_t bm = b * cfg.seq_len + t;  // 目标 batch-major 索引
+                        const std::size_t src_t = win_offs + t;   // 窗口内真实位置
+                        const std::size_t pm = src_t * this_bs + b;   // 源 position-major 索引
+                        const std::size_t bm = b * eff_seq + t;  // 目标 batch-major 索引
                         flat_targets[bm] = static_cast<std::size_t>(y_span[pm]);
                         tmask[bm] = mm_span[pm];
                     }

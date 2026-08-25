@@ -4758,19 +4758,32 @@ public:
 // ══════════════════════════════════════════════════════════════════════════
 // ZiPTModel — AttnZip 解码器（zipt：zip + GPT）
 //
-//   token_emb → (+pos_enc) → CrossAttention 压缩 → C (d_model, batch·M)
-//   → N × ZiPTBlock(Y, C) → LN → LM Head
+//   token_emb → (+pos_enc) → [历史 H 压缩为记忆 C] → N × ZiPTBlock(窗口 W, C)
+//   → LN → LM Head
 //
-// 训练范式：对完整序列 X 一次性压缩为记忆 C，随后每块对 [C ; X] 联合注意力。
-// 复杂度：O(M·L·d)（线性），消除 O(L²) 瓶颈。
+// 两种模式（由 window 参数决定，W=seq_len 为旧行为向后兼容）：
+//   * W = L（window==seq_len，旧行为）：压缩整条序列 X → C，块对 [C;X] 联合注意力。
+//     注意：此时块注意力键 = M+L，复杂度 O(L²)，实际上「无压缩」。
+//   * W < L（L = W + C，新行为）：把输入 X(长度 L) 按 batch 拆为
+//       历史 H = X[0 : L-W]（长度 C = L-W）→ 压缩为记忆 C (M 个 token)
+//       窗口 W_seq = X[L-W : L]（长度 W）→ 块直接注意力
+//     每块对 [M 记忆 ; W 窗口] 联合注意力，键数 = M+W（注意力预算）。
+//     复杂度：压缩 O(M·C·d) 线性于 L；块注意力 O(W·(M+W)) 对 L 为常数。
+//     即：用「传统上下文 (M+W)」的注意力预算处理「总长度 L」的上下文。
+//
+// 训练范式：对完整序列 X 一次性压缩历史为记忆 C，随后每块对 [C ; 窗口] 联合
+// 注意力，loss 仅在窗口 W 上计算（历史被压缩器"消费"，不直接预测）。
 // ══════════════════════════════════════════════════════════════════════════
 class ZiPTModel final : public Layer
 {
 private:
     std::size_t vocab_size_;
     std::size_t d_model_;
-    std::size_t seq_len_;
-    std::size_t memory_;   // M
+    std::size_t seq_len_;    // L：总上下文长度
+    std::size_t window_;     // W：局部窗口（=seq_len 时为旧行为 W=L 无压缩）
+    std::size_t hist_len_;   // C = L - W：历史长度（被压缩，split 模式 >0）
+    std::size_t memory_;     // M
+    bool split_;             // true = W<L 新行为（历史/窗口分离）；false = 旧行为 W=L
 
     Tensor token_emb_;
     Tensor grad_token_emb_;
@@ -4783,22 +4796,80 @@ private:
     Tensor stored_tokens_tensor_;
     std::size_t batch_size_ = 0;
 
+    // 沿 batch-major 列序把 x (d_model, batch·L) 拆为 历史 H (d_model, batch·C)
+    // 与 窗口 W_seq (d_model, batch·W)。列序 i=b·L+t（batch 在列方向）。
+    [[nodiscard]] Result<std::pair<Tensor, Tensor>>
+    split_history_window_(ComputeEngine& engine, const Tensor& x,
+                          std::size_t batch, std::size_t L,
+                          std::size_t C, std::size_t W)
+    {
+        auto x_re = engine.rearrange_3d(x, d_model_, batch, L, false); // (batch·d, L)
+        if (!x_re) return std::unexpected(x_re.error());
+        auto xT = engine.transpose(*x_re);                            // (L, batch·d)
+        if (!xT) return std::unexpected(xT.error());
+        auto hT = engine.slice_rows(*xT, 0, C);                       // (C, batch·d)
+        if (!hT) return std::unexpected(hT.error());
+        auto wT = engine.slice_rows(*xT, C, W);                       // (W, batch·d)
+        if (!wT) return std::unexpected(wT.error());
+        auto h_re = engine.transpose(*hT);                            // (batch·d, C)
+        if (!h_re) return std::unexpected(h_re.error());
+        auto w_re = engine.transpose(*wT);                            // (batch·d, W)
+        if (!w_re) return std::unexpected(w_re.error());
+        auto H = engine.rearrange_3d(*h_re, d_model_, batch, C, true);   // (d, batch·C)
+        if (!H) return std::unexpected(H.error());
+        auto Ws = engine.rearrange_3d(*w_re, d_model_, batch, W, true);  // (d, batch·W)
+        if (!Ws) return std::unexpected(Ws.error());
+        return std::pair<Tensor, Tensor>{std::move(*H), std::move(*Ws)};
+    }
+
+    // 合并 历史梯度 (d, batch·C) 与 窗口梯度 (d, batch·W) → (d, batch·L)
+    [[nodiscard]] Result<Tensor>
+    merge_history_window_(ComputeEngine& engine, const Tensor& gradH,
+                          const Tensor& gradW, std::size_t batch,
+                          std::size_t L, std::size_t C, std::size_t W)
+    {
+        auto h_re = engine.rearrange_3d(gradH, d_model_, batch, C, false); // (batch·d, C)
+        if (!h_re) return std::unexpected(h_re.error());
+        auto w_re = engine.rearrange_3d(gradW, d_model_, batch, W, false); // (batch·d, W)
+        if (!w_re) return std::unexpected(w_re.error());
+        auto hT = engine.transpose(*h_re);   // (C, batch·d)
+        if (!hT) return std::unexpected(hT.error());
+        auto wT = engine.transpose(*w_re);   // (W, batch·d)
+        if (!wT) return std::unexpected(wT.error());
+        Tensor dstT = engine.create_tensor(L, batch * d_model_);
+        auto r1 = engine.insert_rows(dstT, 0, *hT);
+        if (!r1) return std::unexpected(r1.error());
+        auto r2 = engine.insert_rows(dstT, C, *wT);
+        if (!r2) return std::unexpected(r2.error());
+        auto dst = engine.transpose(dstT);   // (batch·d, L)
+        if (!dst) return std::unexpected(dst.error());
+        return engine.rearrange_3d(*dst, d_model_, batch, L, true);  // (d, batch·L)
+    }
+
 public:
     ZiPTModel(std::size_t vocab_size, std::size_t d_model, std::size_t seq_len,
+              std::size_t window,
               std::size_t num_heads, std::size_t d_ff, std::size_t num_layers,
               std::size_t memory_tokens,
               PosEncodingType pos_enc_type = PosEncodingType::Learned,
               ActivationType activation = ActivationType::GeLU,
               NormType norm_type = NormType::LayerNorm)
         : vocab_size_(vocab_size), d_model_(d_model), seq_len_(seq_len),
-          memory_(memory_tokens),
-          compressor_(d_model, memory_tokens, seq_len),
+          window_(window), memory_(memory_tokens),
+          compressor_(d_model, memory_tokens,
+                      (window < seq_len) ? (seq_len - window) : seq_len),
           ln_f_(make_norm_layer(d_model, norm_type)),
           lm_head_(d_model, vocab_size)
     {
+        // 归约 W：W==0 或 W>seq_len → 回退到 W=L（旧行为）
+        if (window_ == 0 || window_ > seq_len_) window_ = seq_len_;
+        hist_len_ = seq_len_ - window_;
+        split_    = (window_ < seq_len_);
+        const std::size_t block_window = split_ ? window_ : seq_len_;
+
         blocks_.reserve(num_layers);
         for (std::size_t i = 0; i < num_layers; ++i)
-            blocks_.emplace_back(d_model, num_heads, d_ff, seq_len, memory_tokens,
+            blocks_.emplace_back(d_model, num_heads, d_ff, block_window, memory_tokens,
                                  norm_type, activation);
         switch (pos_enc_type)
         {
@@ -4910,19 +4981,35 @@ public:
         if (!x_res) return std::unexpected(x_res.error());
         Tensor x = std::move(*x_res);
 
-        // 阶段一：压缩 → 记忆 C (d_model, batch·M)
-        auto C = compressor_.forward(engine, x);
-        if (!C) return C;
-
-        // 阶段二：逐块联合注意力
-        for (auto& b : blocks_)
+        // 阶段一：历史压缩 → 记忆 C；阶段二：块对窗口联合注意力
+        Tensor C;
+        Tensor block_input;
+        if (split_)
         {
-            auto r = b.forward(engine, x, *C);
-            if (!r) return r;
-            x = std::move(*r);
+            auto split = split_history_window_(engine, x, batch, seq_len_, hist_len_, window_);
+            if (!split) return std::unexpected(split.error());
+            auto c_res = compressor_.forward(engine, split->first);   // H → C (d, batch·M)
+            if (!c_res) return c_res;
+            C = std::move(*c_res);
+            block_input = std::move(split->second);                   // W_seq (d, batch·W)
+        }
+        else
+        {
+            auto c_res = compressor_.forward(engine, x);              // 旧行为：压缩整条 X
+            if (!c_res) return c_res;
+            C = std::move(*c_res);
+            block_input = x;
         }
 
-        auto ln = ln_f_->forward(engine, x);
+        // 阶段二：逐块联合注意力（对 [C ; 窗口]）
+        for (auto& b : blocks_)
+        {
+            auto r = b.forward(engine, block_input, C);
+            if (!r) return r;
+            block_input = std::move(*r);
+        }
+
+        auto ln = ln_f_->forward(engine, block_input);
         if (!ln) return ln;
         return lm_head_.forward(engine, *ln);
     }
@@ -4937,7 +5024,7 @@ public:
         if (!b_lm) return b_lm;
         auto b_ln = ln_f_->backward(engine, *b_lm);
         if (!b_ln) return b_ln;
-        Tensor grad_x = std::move(*b_ln);   // (d_model, batch·seq)
+        Tensor grad_w = std::move(*b_ln);   // (d_model, batch·W) 块输出梯度
 
         // 记忆 C 梯度：跨块累加
         Tensor grad_C = engine.create_tensor(d_model_, batch * memory_);
@@ -4945,18 +5032,34 @@ public:
 
         for (std::size_t i = blocks_.size(); i-- > 0;)
         {
-            auto br = blocks_[i].backward(engine, grad_x, grad_C);
+            auto br = blocks_[i].backward(engine, grad_w, grad_C);
             if (!br) return br;
-            grad_x = std::move(*br);
+            grad_w = std::move(*br);
         }
 
-        // 压缩器反向：grad_C → 对 x 的梯度
-        auto gxc = compressor_.backward(engine, grad_C);
-        if (!gxc) return gxc;
-        auto gx_sum = engine.elementwise_binary(BinaryOp::Add, grad_x, *gxc);
-        if (!gx_sum) return std::unexpected(gx_sum.error());
+        Tensor grad_x;
+        if (split_)
+        {
+            // 压缩器反向：grad_C → 对历史 H 的梯度 (d, batch·C)
+            auto gxh = compressor_.backward(engine, grad_C);
+            if (!gxh) return gxh;
+            // 合并 [grad_H ; grad_W] → (d, batch·L)
+            auto merged = merge_history_window_(engine, *gxh, grad_w,
+                                                batch, seq_len_, hist_len_, window_);
+            if (!merged) return std::unexpected(merged.error());
+            grad_x = std::move(*merged);
+        }
+        else
+        {
+            // 旧行为：压缩器对整条 X 的梯度与块梯度同形状，直接累加
+            auto gxc = compressor_.backward(engine, grad_C);
+            if (!gxc) return gxc;
+            auto gx_sum = engine.elementwise_binary(BinaryOp::Add, grad_w, *gxc);
+            if (!gx_sum) return std::unexpected(gx_sum.error());
+            grad_x = std::move(*gx_sum);
+        }
 
-        auto grad_T = engine.transpose(*gx_sum);
+        auto grad_T = engine.transpose(grad_x);
         if (!grad_T) return std::unexpected(grad_T.error());
         auto pr = pos_encoder_->backward(engine, *grad_T, batch, seq_len);
         if (!pr) return std::unexpected(pr.error());
@@ -4991,8 +5094,908 @@ public:
             if (context.size() > seq_len_) start = context.size() - seq_len_;
             const std::size_t n = context.size() - start;
 
-            // 输入 (seq_len_, 1)：前 n 个为上下文，其余用 pad_id=0 填充，
-            // 使 forward 始终处理整窗（压缩机/块按固定 seq_len 构建）。
+            // 输入 (seq_len_, 1)：使 forward 始终处理整窗（压缩机/块按固定长度构建）。
+            // 旧行为 (W=L)：前 n 个为上下文，其余 pad_id=0 填充；末位 logits 取 n-1。
+            // 新行为 (W<L)：右对齐，末位真实 token 落到窗口末（位置 seq_len_-1），
+            //   forward 输出仅覆盖窗口 (vocab, W)，logits 取窗口末列 window_-1。
+            const std::size_t pred_col = split_ ? (window_ - 1) : (n - 1);
+            Matrix in(seq_len_, 1);
+            if (split_)
+            {
+                const std::size_t pad_head = seq_len_ - n;
+                for (std::size_t i = 0; i < seq_len_; ++i)
+                    in.set_value_unchecked(i, 0,
+                        static_cast<Scalar>((i >= pad_head) ? context[start + (i - pad_head)] : 0));
+            }
+            else
+            {
+                for (std::size_t i = 0; i < seq_len_; ++i)
+                    in.set_value_unchecked(i, 0,
+                        static_cast<Scalar>((i < n) ? context[start + i] : 0));
+            }
+            auto in_t = engine.from_matrix(in);
+            if (!in_t) return std::unexpected(in_t.error());
+            auto logits = forward(engine, *in_t);
+            if (!logits) return std::unexpected(logits.error());
+            auto lm = engine.to_matrix(*logits);
+            if (!lm) return std::unexpected(lm.error());
+
+            // 末位（最后真实位置）logits
+            std::vector<Scalar> last(vocab_size_);
+            for (std::size_t v = 0; v < vocab_size_; ++v)
+                last[v] = lm->at_unchecked(v, pred_col);
+
+            if (temperature > 0.0 && temperature != 1.0)
+                for (auto& x : last) x /= temperature;
+
+            Scalar max_val = last[0];
+            for (std::size_t v = 1; v < vocab_size_; ++v)
+                max_val = std::max(max_val, last[v]);
+            Scalar sum_exp = 0;
+            for (auto& x : last) { x = std::exp(x - max_val); sum_exp += x; }
+            for (auto& x : last) x /= sum_exp;
+
+            std::size_t next;
+            if (temperature > 0.0)
+            {
+                Scalar r = dist(rng);
+                Scalar cum = 0;
+                next = vocab_size_ - 1;
+                for (std::size_t v = 0; v < vocab_size_; ++v)
+                {
+                    cum += last[v];
+                    if (r <= cum) { next = v; break; }
+                }
+            }
+            else
+            {
+                next = 0;
+                Scalar best = last[0];
+                for (std::size_t v = 1; v < vocab_size_; ++v)
+                    if (last[v] > best) { best = last[v]; next = v; }
+            }
+
+            context.push_back(next);
+            if (step >= min_new_tokens && next == eos_token_id) break;
+            generated.push_back(next);
+        }
+        return generated;
+    }
+};
+
+// ══════════════════════════════════════════════════════════════════════════
+// ReLULinearAttention — ReLU 线性注意力（RLA / RAPT 核心层）
+//
+// 算法（RLA.md §3，causal 版；bidirectional 亦支持）：
+//   q' = ReLU(RoPE(q)), k' = ReLU(RoPE(k)), v = V·W_v（V 不做 ReLU）
+//   分子 num_t  = Σ_{i∈S_t} (q'_t·k'_i) v_i  = B_t · q'_t,   B_t = Σ_{i∈S_t} v_i k'_i^T
+//   分母 den_t  = sqrt( Σ_{i∈S_t} (q'_t·k'_i)^2 + eps )
+//               = sqrt( q'_t^T A_t q'_t + eps ),  A_t = Σ_{i∈S_t} k'_i k'_i^T
+//   out_t = num_t / den_t
+//   其中 S_t = { i<=t }（causal）或 { 全部 }（bidirectional）。
+//
+// 关键性质：
+//   * 复杂度 O(L·d_k²)，无 O(L²) 物化 —— 分子/分母都靠运行态前缀和。
+//     分母 L2 恒等式：Σ_i (q'·k'_i)² = q'^T (Σ k'_i k'_i^T) q'（避免显式 L×L 分数矩阵）。
+//   * 施加顺序必须 RoPE → ReLU（RoPE 若在 ReLU 之后，旋转产生的负值被截断 → 丢位置信息）。
+//   * 数值：分母 L2 归一化（余弦式约束）；禁 1/sqrt(d_k) 缩放；稳定性靠 LayerNorm + eps。
+//
+// 实现说明：causal 的前缀和递推本质是序列化的，无法折叠为 matmul 批次，
+//   故核心扫描用 CPU Matrix 标量循环，经 to_matrix/from_matrix 适配任意后端
+//   （GPU 走 staging 往返，v1 正确性优先）。
+// ══════════════════════════════════════════════════════════════════════════
+class ReLULinearAttention final : public Layer
+{
+private:
+    std::size_t d_model_;
+    std::size_t num_heads_;
+    std::size_t d_k_;
+    std::size_t seq_len_;    // 单样本序列长度（0 = 单样本，cols 即 seq）
+    bool causal_;            // true=因果前缀和；false=全量双向
+    bool use_rope_;          // RoPE 施加在 Q/K 进 ReLU 之前（RLA 强约束）
+    RotaryEmbedding rope_;
+    Linear w_q_, w_k_, w_v_, w_o_;
+
+    // forward 缓存（backward 用）
+    Tensor Qp_cache_;        // (batch*H*d_k, seq) ReLU(RoPE(Q))
+    Tensor Kp_cache_;        // (batch*H*d_k, seq) ReLU(RoPE(K))
+    Tensor V_re_cache_;      // (batch*H*d_k, seq) V（不 ReLU、不 RoPE）
+    std::size_t batch_cache_ = 0;
+    std::size_t seq_cache_   = 0;
+
+    // ── 标量线性代数助手（行主序向量化，dk×dk 矩阵） ──────────────────
+    static void matvec_(const std::vector<Scalar>& M,
+                        const std::vector<Scalar>& x,
+                        std::vector<Scalar>& y, std::size_t dk)
+    {
+        for (std::size_t i = 0; i < dk; ++i)
+        {
+            Scalar acc{0};
+            for (std::size_t j = 0; j < dk; ++j) acc += M[i * dk + j] * x[j];
+            y[i] = acc;
+        }
+    }
+    static void matvec_T_(const std::vector<Scalar>& M,
+                          const std::vector<Scalar>& x,
+                          std::vector<Scalar>& y, std::size_t dk)
+    {
+        for (std::size_t j = 0; j < dk; ++j)
+        {
+            Scalar acc{0};
+            for (std::size_t i = 0; i < dk; ++i) acc += M[i * dk + j] * x[i];
+            y[j] = acc;
+        }
+    }
+    static void add_outer_(std::vector<Scalar>& M,
+                           const std::vector<Scalar>& x,
+                           const std::vector<Scalar>& y, std::size_t dk)
+    {
+        for (std::size_t i = 0; i < dk; ++i)
+            for (std::size_t j = 0; j < dk; ++j)
+                M[i * dk + j] += x[i] * y[j];
+    }
+
+    // ── 前向扫描：out[bh*dk+j][t] = RLA 输出 ──────────────────────────
+    static void scan_forward_(const Matrix& Q, const Matrix& K, const Matrix& V,
+                              Matrix& out, std::size_t dk, std::size_t BH,
+                              std::size_t seq, bool causal, Scalar eps)
+    {
+        std::vector<Scalar> A(dk * dk), B(dk * dk), qv(dk), kv(dk), vv(dk),
+                            num(dk), Aq(dk);
+        for (std::size_t bh = 0; bh < BH; ++bh)
+        {
+            const std::size_t r0 = bh * dk;
+            std::fill(A.begin(), A.end(), Scalar{0});
+            std::fill(B.begin(), B.end(), Scalar{0});
+            if (!causal)  // 双向：先求全集 A, B
+            {
+                for (std::size_t t = 0; t < seq; ++t)
+                {
+                    for (std::size_t j = 0; j < dk; ++j)
+                    {
+                        kv[j] = K.at_unchecked(r0 + j, t);
+                        vv[j] = V.at_unchecked(r0 + j, t);
+                    }
+                    add_outer_(A, kv, kv, dk);
+                    add_outer_(B, vv, kv, dk);
+                }
+            }
+            for (std::size_t t = 0; t < seq; ++t)
+            {
+                for (std::size_t j = 0; j < dk; ++j)
+                {
+                    qv[j] = Q.at_unchecked(r0 + j, t);
+                    kv[j] = K.at_unchecked(r0 + j, t);
+                    vv[j] = V.at_unchecked(r0 + j, t);
+                }
+                if (causal)  // 前缀和含自身 i<=t
+                {
+                    add_outer_(A, kv, kv, dk);
+                    add_outer_(B, vv, kv, dk);
+                }
+                matvec_(B, qv, num, dk);
+                matvec_(A, qv, Aq, dk);
+                Scalar s{0};
+                for (std::size_t j = 0; j < dk; ++j) s += qv[j] * Aq[j];
+                const Scalar denom = std::sqrt(s + eps);
+                for (std::size_t j = 0; j < dk; ++j)
+                    out.set_value_unchecked(r0 + j, t, num[j] / denom);
+            }
+        }
+    }
+
+    // ── 反向扫描：G 为 grad_out_re，写 gQ/gK/gV（均 (BH*dk, seq)） ────
+    // 前向重算运行态；dL/dA_t=dL/ds_t·q_tq_t^T，dL/dB_t=outer(dL/dnum_t,q_t)；
+    // 后缀和得 dL/dk_i = 2·SA·k_i + SB^T·v_i，dL/dv_i = SB·k_i。
+    static void scan_backward_(const Matrix& Q, const Matrix& K, const Matrix& V,
+                               const Matrix& G, Matrix& gQ, Matrix& gK, Matrix& gV,
+                               std::size_t dk, std::size_t BH, std::size_t seq,
+                               bool causal, Scalar eps)
+    {
+        std::vector<Scalar> A(dk * dk), B(dk * dk), qv(dk), kv(dk), vv(dk),
+                            num(dk), Aq(dk), gnum(dk), tmp(dk), tmp2(dk);
+        for (std::size_t bh = 0; bh < BH; ++bh)
+        {
+            const std::size_t r0 = bh * dk;
+            std::vector<Scalar> store_q(seq * dk), store_dq(seq * dk),
+                                store_dA(seq * dk * dk), store_dB(seq * dk * dk);
+            std::vector<Scalar> dA_total(dk * dk, Scalar{0}),
+                                dB_total(dk * dk, Scalar{0});
+            std::fill(A.begin(), A.end(), Scalar{0});
+            std::fill(B.begin(), B.end(), Scalar{0});
+            if (!causal)
+            {
+                for (std::size_t t = 0; t < seq; ++t)
+                {
+                    for (std::size_t j = 0; j < dk; ++j)
+                    {
+                        kv[j] = K.at_unchecked(r0 + j, t);
+                        vv[j] = V.at_unchecked(r0 + j, t);
+                    }
+                    add_outer_(A, kv, kv, dk);
+                    add_outer_(B, vv, kv, dk);
+                }
+            }
+            // Pass 1：重算运行态，存每位置 q_t、dL/dq_t、dL/dA_t、dL/dB_t
+            for (std::size_t t = 0; t < seq; ++t)
+            {
+                for (std::size_t j = 0; j < dk; ++j)
+                {
+                    qv[j] = Q.at_unchecked(r0 + j, t);
+                    kv[j] = K.at_unchecked(r0 + j, t);
+                    vv[j] = V.at_unchecked(r0 + j, t);
+                }
+                if (causal)
+                {
+                    add_outer_(A, kv, kv, dk);
+                    add_outer_(B, vv, kv, dk);
+                }
+                matvec_(B, qv, num, dk);
+                matvec_(A, qv, Aq, dk);
+                Scalar s{0};
+                for (std::size_t j = 0; j < dk; ++j) s += qv[j] * Aq[j];
+                const Scalar denom = std::sqrt(s + eps);
+                const Scalar denom_inv = Scalar{1} / denom;
+                Scalar gdot{0};
+                for (std::size_t j = 0; j < dk; ++j)
+                {
+                    gnum[j] = G.at_unchecked(r0 + j, t) * denom_inv;
+                    gdot   += G.at_unchecked(r0 + j, t) * num[j];
+                }
+                const Scalar ddenom = -gdot / (denom * denom);
+                const Scalar ds = ddenom * (Scalar{0.5} * denom_inv);
+                matvec_T_(B, gnum, tmp, dk);   // tmp = B^T·gnum
+                for (std::size_t j = 0; j < dk; ++j)
+                {
+                    store_q[t * dk + j]  = qv[j];
+                    store_dq[t * dk + j] = tmp[j] + Scalar{2} * ds * Aq[j];
+                }
+                for (std::size_t a = 0; a < dk; ++a)
+                    for (std::size_t b = 0; b < dk; ++b)
+                    {
+                        const Scalar dA_ab = ds * qv[a] * qv[b];
+                        const Scalar dB_ab = gnum[a] * qv[b];
+                        if (causal)
+                        {
+                            store_dA[(t * dk + a) * dk + b] = dA_ab;
+                            store_dB[(t * dk + a) * dk + b] = dB_ab;
+                        }
+                        else
+                        {
+                            // 双向：A、B 为全集常数，dL/dA、dL/dB 是所有 t 求和
+                            dA_total[a * dk + b] += dA_ab;
+                            dB_total[a * dk + b] += dB_ab;
+                        }
+                    }
+            }
+            // Pass 2：反向
+            std::fill(A.begin(), A.end(), Scalar{0});  // 复用 A/B 作累积
+            std::fill(B.begin(), B.end(), Scalar{0});
+            for (std::size_t i = seq; i-- > 0;)
+            {
+                if (causal)
+                {
+                    // 后缀和：SA = Σ_{t>=i} dL/dA_t，SB = Σ_{t>=i} dL/dB_t
+                    for (std::size_t idx = 0; idx < dk * dk; ++idx)
+                    {
+                        A[idx] += store_dA[i * dk * dk + idx];
+                        B[idx] += store_dB[i * dk * dk + idx];
+                    }
+                }
+                else
+                {
+                    // 双向：A、B 即全集梯度 dL/dA、dL/dB（对每个 i 相同）
+                    std::copy(dA_total.begin(), dA_total.end(), A.begin());
+                    std::copy(dB_total.begin(), dB_total.end(), B.begin());
+                }
+                for (std::size_t j = 0; j < dk; ++j)
+                {
+                    kv[j] = K.at_unchecked(r0 + j, i);
+                    vv[j] = V.at_unchecked(r0 + j, i);
+                }
+                matvec_(A, kv, tmp, dk);      // SA·k_i
+                matvec_T_(B, vv, tmp2, dk);   // SB^T·v_i
+                for (std::size_t j = 0; j < dk; ++j)
+                    gK.set_value_unchecked(r0 + j, i, Scalar{2} * tmp[j] + tmp2[j]);
+                matvec_(B, kv, tmp2, dk);     // SB·k_i
+                for (std::size_t j = 0; j < dk; ++j)
+                    gV.set_value_unchecked(r0 + j, i, tmp2[j]);
+                for (std::size_t j = 0; j < dk; ++j)
+                    gQ.set_value_unchecked(r0 + j, i, store_dq[i * dk + j]);
+            }
+        }
+    }
+
+public:
+    ReLULinearAttention(std::size_t d_model, std::size_t num_heads,
+                        std::size_t seq_len = 0,
+                        bool causal = true,
+                        PosEncodingType pos_enc = PosEncodingType::RoPE)
+        : d_model_(d_model), num_heads_(num_heads),
+          d_k_(d_model / num_heads),
+          seq_len_(seq_len), causal_(causal),
+          use_rope_(pos_enc == PosEncodingType::RoPE),
+          rope_(d_model / num_heads),
+          w_q_(d_model, d_model), w_k_(d_model, d_model),
+          w_v_(d_model, d_model), w_o_(d_model, d_model)
+    {
+        NN_ASSERT(d_model % num_heads == 0,
+                  "ReLULinearAttention: d_model must be divisible by num_heads");
+        NN_ASSERT(d_model % num_heads == 0 && (d_model / num_heads) % 2 == 0,
+                  "ReLULinearAttention: RoPE requires even d_k");
+    }
+
+    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    {
+        auto r1 = w_q_.init(engine); if (!r1) return std::unexpected(r1.error());
+        auto r2 = w_k_.init(engine); if (!r2) return std::unexpected(r2.error());
+        auto r3 = w_v_.init(engine); if (!r3) return std::unexpected(r3.error());
+        auto r4 = w_o_.init(engine); if (!r4) return std::unexpected(r4.error());
+        if (use_rope_)
+        {
+            auto r5 = rope_.init(engine); if (!r5) return std::unexpected(r5.error());
+        }
+        return {};
+    }
+
+    std::vector<TensorRef> parameters() override
+    {
+        auto p = w_q_.parameters();
+        auto k = w_k_.parameters();
+        auto v = w_v_.parameters();
+        auto o = w_o_.parameters();
+        p.insert(p.end(), k.begin(), k.end());
+        p.insert(p.end(), v.begin(), v.end());
+        p.insert(p.end(), o.begin(), o.end());
+        return p;
+    }
+    std::vector<TensorRef> param_gradients() override
+    {
+        auto g = w_q_.param_gradients();
+        auto k = w_k_.param_gradients();
+        auto v = w_v_.param_gradients();
+        auto o = w_o_.param_gradients();
+        g.insert(g.end(), k.begin(), k.end());
+        g.insert(g.end(), v.begin(), v.end());
+        g.insert(g.end(), o.begin(), o.end());
+        return g;
+    }
+
+    void set_checkpoint_mode(bool enabled) override
+    {
+        Layer::set_checkpoint_mode(enabled);
+        w_q_.set_checkpoint_mode(enabled);
+        w_k_.set_checkpoint_mode(enabled);
+        w_v_.set_checkpoint_mode(enabled);
+        w_o_.set_checkpoint_mode(enabled);
+    }
+
+    void clear_cache() override
+    {
+        Qp_cache_ = Tensor{};
+        Kp_cache_ = Tensor{};
+        V_re_cache_ = Tensor{};
+        batch_cache_ = 0;
+        seq_cache_ = 0;
+        w_q_.clear_cache(); w_k_.clear_cache();
+        w_v_.clear_cache(); w_o_.clear_cache();
+    }
+
+    std::vector<TensorRef> activation_cache() override
+    {
+        std::vector<TensorRef> r;
+        if (Qp_cache_.valid()) r.emplace_back(Qp_cache_);
+        if (Kp_cache_.valid()) r.emplace_back(Kp_cache_);
+        if (V_re_cache_.valid()) r.emplace_back(V_re_cache_);
+        auto wq = w_q_.activation_cache(); r.insert(r.end(), wq.begin(), wq.end());
+        auto wk = w_k_.activation_cache(); r.insert(r.end(), wk.begin(), wk.end());
+        auto wv = w_v_.activation_cache(); r.insert(r.end(), wv.begin(), wv.end());
+        auto wo = w_o_.activation_cache(); r.insert(r.end(), wo.begin(), wo.end());
+        return r;
+    }
+
+    // 前向：输入 X (d_model, batch·seq) → 输出 (d_model, batch·seq)
+    [[nodiscard]] Result<Tensor> forward(
+        ComputeEngine& engine, const Tensor& input) override
+    {
+        if (input.rows() != d_model_)
+            return std::unexpected(Error{"ReLULinearAttention forward: input shape mismatch"});
+
+        const std::size_t total = input.cols();
+        const std::size_t seq = (seq_len_ > 0) ? seq_len_ : total;
+        const std::size_t batch = (seq_len_ > 0) ? (total / seq_len_) : 1;
+        if (total != batch * seq)
+            return std::unexpected(Error{"ReLULinearAttention forward: cols not divisible by seq_len"});
+        const std::size_t H_dk = num_heads_ * d_k_;
+        const std::size_t BH = batch * num_heads_;
+
+        auto q_res = w_q_.forward(engine, input);
+        if (!q_res) return q_res;
+        auto k_res = w_k_.forward(engine, input);
+        if (!k_res) return k_res;
+        auto v_res = w_v_.forward(engine, input);
+        if (!v_res) return v_res;
+
+        Tensor Q, K, V;   // (BH*dk, seq) rearranged
+        if (batch > 1)
+        {
+            auto qr = engine.rearrange_3d(*q_res, H_dk, batch, seq, false); if (!qr) return std::unexpected(qr.error());
+            Q = std::move(*qr);
+            auto kr = engine.rearrange_3d(*k_res, H_dk, batch, seq, false); if (!kr) return std::unexpected(kr.error());
+            K = std::move(*kr);
+            auto vr = engine.rearrange_3d(*v_res, H_dk, batch, seq, false); if (!vr) return std::unexpected(vr.error());
+            V = std::move(*vr);
+        }
+        else
+        {
+            Q = std::move(*q_res);
+            K = std::move(*k_res);
+            V = std::move(*v_res);
+        }
+
+        // RoPE → ReLU（顺序必须：先旋转后截断，否则丢位置信息）
+        if (use_rope_)
+        {
+            auto qr = rope_.apply(engine, Q, seq, false); if (!qr) return std::unexpected(qr.error());
+            Q = std::move(*qr);
+            auto kr = rope_.apply(engine, K, seq, false); if (!kr) return std::unexpected(kr.error());
+            K = std::move(*kr);
+        }
+        auto Qp = engine.elementwise_binary_scalar(BinaryOp::Max, Q, Scalar{0}, false);
+        if (!Qp) return std::unexpected(Qp.error());
+        auto Kp = engine.elementwise_binary_scalar(BinaryOp::Max, K, Scalar{0}, false);
+        if (!Kp) return std::unexpected(Kp.error());
+
+        // 核心扫描（CPU 标量；任意后端经 staging）
+        auto Qm = engine.to_matrix(*Qp);
+        if (!Qm) return std::unexpected(Qm.error());
+        auto Km = engine.to_matrix(*Kp);
+        if (!Km) return std::unexpected(Km.error());
+        auto Vm = engine.to_matrix(V);
+        if (!Vm) return std::unexpected(Vm.error());
+        Matrix out_m(BH * d_k_, seq, Scalar{0});
+        scan_forward_(*Qm, *Km, *Vm, out_m, d_k_, BH, seq, causal_, Scalar{1e-6});
+        auto out_t = engine.from_matrix(out_m);
+        if (!out_t) return std::unexpected(out_t.error());
+
+        Tensor concat;
+        if (batch > 1)
+        {
+            auto cb = engine.rearrange_3d(*out_t, H_dk, batch, seq, true);
+            if (!cb) return std::unexpected(cb.error());
+            concat = std::move(*cb);
+        }
+        else
+        {
+            concat = std::move(*out_t);
+        }
+
+        Qp_cache_ = std::move(*Qp);
+        Kp_cache_ = std::move(*Kp);
+        V_re_cache_ = std::move(V);
+        batch_cache_ = batch;
+        seq_cache_   = seq;
+
+        return w_o_.forward(engine, concat);
+    }
+
+    // 反向：grad_output (d_model, batch·seq) → 输入梯度 (d_model, batch·seq)
+    [[nodiscard]] Result<Tensor> backward(
+        ComputeEngine& engine, const Tensor& grad_output) override
+    {
+        const std::size_t seq = seq_cache_;
+        const std::size_t batch = batch_cache_;
+        const std::size_t H_dk = num_heads_ * d_k_;
+        const std::size_t BH = batch * num_heads_;
+
+        auto gc = w_o_.backward(engine, grad_output);
+        if (!gc) return gc;
+        Tensor gcr;
+        if (batch > 1)
+        {
+            auto g = engine.rearrange_3d(*gc, H_dk, batch, seq, false);
+            if (!g) return std::unexpected(g.error());
+            gcr = std::move(*g);
+        }
+        else
+        {
+            gcr = std::move(*gc);
+        }
+
+        auto Gm = engine.to_matrix(gcr);
+        if (!Gm) return std::unexpected(Gm.error());
+        auto Qm = engine.to_matrix(Qp_cache_);
+        if (!Qm) return std::unexpected(Qm.error());
+        auto Km = engine.to_matrix(Kp_cache_);
+        if (!Km) return std::unexpected(Km.error());
+        auto Vm = engine.to_matrix(V_re_cache_);
+        if (!Vm) return std::unexpected(Vm.error());
+
+        Matrix gQ(BH * d_k_, seq, Scalar{0}), gK(BH * d_k_, seq, Scalar{0}),
+               gV(BH * d_k_, seq, Scalar{0});
+        scan_backward_(*Qm, *Km, *Vm, *Gm, gQ, gK, gV, d_k_, BH, seq, causal_, Scalar{1e-6});
+
+        auto gQt = engine.from_matrix(gQ);
+        if (!gQt) return std::unexpected(gQt.error());
+        auto gKt = engine.from_matrix(gK);
+        if (!gKt) return std::unexpected(gKt.error());
+        auto gVt = engine.from_matrix(gV);
+        if (!gVt) return std::unexpected(gVt.error());
+
+        // ReLU 反向：(x>0) ? g : 0（x>0 与 Qp/Kp>0 同号）
+        auto gq_relu = engine.elementwise_select_scalar_cond(
+            CompareOp::Gt, Qp_cache_, Scalar{0}, *gQt, Scalar{0});
+        if (!gq_relu) return std::unexpected(gq_relu.error());
+        auto gk_relu = engine.elementwise_select_scalar_cond(
+            CompareOp::Gt, Kp_cache_, Scalar{0}, *gKt, Scalar{0});
+        if (!gk_relu) return std::unexpected(gk_relu.error());
+
+        // RoPE 反向（旋转正交，逆 = 反角）
+        if (use_rope_)
+        {
+            auto gq = rope_.apply(engine, *gq_relu, seq, true);
+            if (!gq) return std::unexpected(gq.error());
+            gq_relu = std::move(*gq);
+            auto gk = rope_.apply(engine, *gk_relu, seq, true);
+            if (!gk) return std::unexpected(gk.error());
+            gk_relu = std::move(*gk);
+        }
+
+        Tensor gq_r, gk_r, gv_r;
+        if (batch > 1)
+        {
+            auto a = engine.rearrange_3d(*gq_relu, H_dk, batch, seq, true); if (!a) return std::unexpected(a.error());
+            gq_r = std::move(*a);
+            auto b = engine.rearrange_3d(*gk_relu, H_dk, batch, seq, true); if (!b) return std::unexpected(b.error());
+            gk_r = std::move(*b);
+            auto c = engine.rearrange_3d(*gVt, H_dk, batch, seq, true); if (!c) return std::unexpected(c.error());
+            gv_r = std::move(*c);
+        }
+        else
+        {
+            gq_r = std::move(*gq_relu);
+            gk_r = std::move(*gk_relu);
+            gv_r = std::move(*gVt);
+        }
+
+        auto giq = w_q_.backward(engine, gq_r);
+        if (!giq) return giq;
+        Tensor grad_input = std::move(*giq);
+        auto gik = w_k_.backward(engine, gk_r);
+        if (!gik) return gik;
+        { auto r = engine.add_inplace(grad_input, *gik); if (!r) return std::unexpected(r.error()); }
+        auto giv = w_v_.backward(engine, gv_r);
+        if (!giv) return giv;
+        { auto r = engine.add_inplace(grad_input, *giv); if (!r) return std::unexpected(r.error()); }
+        return grad_input;
+    }
+};
+
+// ══════════════════════════════════════════════════════════════════════════
+// RAPTBlock — RAPT 解码器块（GPT 风格：Norm → RLA 注意力 → 残差 → FFN → 残差）
+// ══════════════════════════════════════════════════════════════════════════
+class RAPTBlock final : public Layer
+{
+private:
+    std::unique_ptr<Layer> norm1_;
+    ReLULinearAttention attn_;
+    std::unique_ptr<Layer> norm2_;
+    FeedForward ff_;
+
+public:
+    RAPTBlock(std::size_t d_model, std::size_t num_heads, std::size_t d_ff,
+              std::size_t seq_len, PosEncodingType pos_enc,
+              ActivationType activation = ActivationType::GeLU,
+              NormType norm_type = NormType::LayerNorm,
+              bool causal = true)
+        : norm1_(make_norm_layer(d_model, norm_type)),
+          attn_(d_model, num_heads, seq_len, causal, pos_enc),
+          norm2_(make_norm_layer(d_model, norm_type)),
+          ff_(d_model, d_ff, activation)
+    {
+    }
+
+    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    {
+        auto r1 = norm1_->init(engine); if (!r1) return std::unexpected(r1.error());
+        auto r2 = attn_.init(engine);   if (!r2) return std::unexpected(r2.error());
+        auto r3 = norm2_->init(engine); if (!r3) return std::unexpected(r3.error());
+        auto r4 = ff_.init(engine);     if (!r4) return std::unexpected(r4.error());
+        return {};
+    }
+
+    std::vector<TensorRef> parameters() override
+    {
+        std::vector<TensorRef> p;
+        auto n1 = norm1_->parameters(); p.insert(p.end(), n1.begin(), n1.end());
+        auto a = attn_.parameters();    p.insert(p.end(), a.begin(), a.end());
+        auto n2 = norm2_->parameters(); p.insert(p.end(), n2.begin(), n2.end());
+        auto f = ff_.parameters();      p.insert(p.end(), f.begin(), f.end());
+        return p;
+    }
+    std::vector<TensorRef> param_gradients() override
+    {
+        std::vector<TensorRef> g;
+        auto n1 = norm1_->param_gradients(); g.insert(g.end(), n1.begin(), n1.end());
+        auto a = attn_.param_gradients();    g.insert(g.end(), a.begin(), a.end());
+        auto n2 = norm2_->param_gradients(); g.insert(g.end(), n2.begin(), n2.end());
+        auto f = ff_.param_gradients();      g.insert(g.end(), f.begin(), f.end());
+        return g;
+    }
+
+    void set_checkpoint_mode(bool enabled) override
+    {
+        Layer::set_checkpoint_mode(enabled);
+        norm1_->set_checkpoint_mode(enabled);
+        attn_.set_checkpoint_mode(enabled);
+        norm2_->set_checkpoint_mode(enabled);
+        ff_.set_checkpoint_mode(enabled);
+    }
+
+    void clear_cache() override
+    {
+        norm1_->clear_cache(); attn_.clear_cache();
+        norm2_->clear_cache(); ff_.clear_cache();
+    }
+
+    [[nodiscard]] Result<Tensor> forward(
+        ComputeEngine& engine, const Tensor& input) override
+    {
+        auto n1 = norm1_->forward(engine, input);
+        if (!n1) return n1;
+        auto a = attn_.forward(engine, *n1);
+        if (!a) return a;
+        auto r1 = engine.elementwise_binary(BinaryOp::Add, input, *a);
+        if (!r1) return std::unexpected(r1.error());
+        auto n2 = norm2_->forward(engine, *r1);
+        if (!n2) return n2;
+        auto f = ff_.forward(engine, *n2);
+        if (!f) return f;
+        return engine.elementwise_binary(BinaryOp::Add, *r1, *f);
+    }
+
+    [[nodiscard]] Result<Tensor> backward(
+        ComputeEngine& engine, const Tensor& grad_output) override
+    {
+        auto grad_ff = ff_.backward(engine, grad_output);
+        if (!grad_ff) return grad_ff;
+        auto b_n2 = norm2_->backward(engine, *grad_ff);
+        if (!b_n2) return b_n2;
+        auto grad_r1 = engine.elementwise_binary(BinaryOp::Add, grad_output, *b_n2);
+        if (!grad_r1) return std::unexpected(grad_r1.error());
+        auto grad_a = attn_.backward(engine, *grad_r1);
+        if (!grad_a) return grad_a;
+        auto b_n1 = norm1_->backward(engine, *grad_a);
+        if (!b_n1) return b_n1;
+        return engine.elementwise_binary(BinaryOp::Add, *grad_r1, *b_n1);
+    }
+};
+
+// ══════════════════════════════════════════════════════════════════════════
+// RAPTModel — RAPT 解码器（ReLU 激活线性注意力语言模型）
+//
+//   token_emb → (+pos_enc，RoPE 在注意力内部施加) → N × RAPTBlock → LN → LM Head
+//
+// RLA 约束：位置编码必须用 RoPE（或 ALiBi），且 RoPE 施加在 Q/K 进 ReLU 之前；
+// 本实现强制 RoPE（v1 不支持 ALiBi），输入侧用 NoPositionEncoder（无位置嵌入）。
+// ══════════════════════════════════════════════════════════════════════════
+class RAPTModel final : public Layer
+{
+private:
+    std::size_t vocab_size_;
+    std::size_t d_model_;
+    std::size_t seq_len_;
+    // （num_heads_/d_ff_/num_layers_/causal_ 仅构造时用，不存成员避免 -Wunused）
+
+    Tensor token_emb_;
+    Tensor grad_token_emb_;
+    std::unique_ptr<PositionEncoder> pos_encoder_;
+    std::vector<RAPTBlock> blocks_;
+    std::unique_ptr<Layer> ln_f_;
+    Linear lm_head_;
+
+    Tensor stored_tokens_tensor_;
+    std::size_t batch_size_ = 0;
+
+public:
+    RAPTModel(std::size_t vocab_size, std::size_t d_model, std::size_t seq_len,
+              std::size_t num_heads, std::size_t d_ff, std::size_t num_layers,
+              PosEncodingType pos_enc = PosEncodingType::RoPE,
+              ActivationType activation = ActivationType::GeLU,
+              NormType norm_type = NormType::LayerNorm,
+              bool causal = true)
+        : vocab_size_(vocab_size), d_model_(d_model), seq_len_(seq_len),
+          ln_f_(make_norm_layer(d_model, norm_type)),
+          lm_head_(d_model, vocab_size)
+    {
+        blocks_.reserve(num_layers);
+        for (std::size_t i = 0; i < num_layers; ++i)
+            blocks_.emplace_back(d_model, num_heads, d_ff, seq_len, pos_enc,
+                                 activation, norm_type, causal);
+        // RLA 强约束：必须 RoPE（或 ALiBi）。v1 强制 RoPE，输入侧无位置嵌入。
+        pos_encoder_ = std::make_unique<NoPositionEncoder>();
+    }
+
+    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    {
+        Matrix te(vocab_size_, d_model_);
+        constexpr Scalar emb_init_std = 0.02;
+        std::mt19937_64 rng{42};
+        std::normal_distribution<Scalar> dist(0.0, emb_init_std);
+        auto te_s = te.span();
+        for (std::size_t i = 0; i < te.size(); ++i) te_s[i] = dist(rng);
+        auto te_r = engine.from_matrix(te);
+        if (!te_r) return std::unexpected(te_r.error());
+        token_emb_ = std::move(*te_r);
+
+        grad_token_emb_ = engine.create_tensor(vocab_size_, d_model_);
+        { auto r = engine.zero(grad_token_emb_); if (!r) return std::unexpected(r.error()); }
+
+        if (pos_encoder_)
+        {
+            auto r = pos_encoder_->init(engine);
+            if (!r) return std::unexpected(r.error());
+        }
+        for (auto& b : blocks_)
+        {
+            auto r = b.init(engine);
+            if (!r) return std::unexpected(r.error());
+        }
+        if (ln_f_)
+        {
+            auto r = ln_f_->init(engine);
+            if (!r) return std::unexpected(r.error());
+        }
+        { auto r = lm_head_.init(engine); if (!r) return std::unexpected(r.error()); }
+        return {};
+    }
+
+    std::vector<TensorRef> parameters() override
+    {
+        std::vector<TensorRef> p;
+        p.push_back(token_emb_);
+        auto pp = pos_encoder_->parameters();
+        p.insert(p.end(), pp.begin(), pp.end());
+        for (auto& b : blocks_)
+        {
+            auto bp = b.parameters();
+            p.insert(p.end(), bp.begin(), bp.end());
+        }
+        auto lp = ln_f_->parameters();
+        p.insert(p.end(), lp.begin(), lp.end());
+        auto hp = lm_head_.parameters();
+        p.insert(p.end(), hp.begin(), hp.end());
+        return p;
+    }
+    std::vector<TensorRef> param_gradients() override
+    {
+        std::vector<TensorRef> g;
+        g.push_back(grad_token_emb_);
+        auto gp = pos_encoder_->param_gradients();
+        g.insert(g.end(), gp.begin(), gp.end());
+        for (auto& b : blocks_)
+        {
+            auto bg = b.param_gradients();
+            g.insert(g.end(), bg.begin(), bg.end());
+        }
+        auto lg = ln_f_->param_gradients();
+        g.insert(g.end(), lg.begin(), lg.end());
+        auto hg = lm_head_.param_gradients();
+        g.insert(g.end(), hg.begin(), hg.end());
+        return g;
+    }
+
+    void set_checkpoint_mode(bool enabled) override
+    {
+        Layer::set_checkpoint_mode(enabled);
+        for (auto& b : blocks_) b.set_checkpoint_mode(enabled);
+        ln_f_->set_checkpoint_mode(enabled);
+        lm_head_.set_checkpoint_mode(enabled);
+    }
+
+    void clear_cache() override
+    {
+        token_emb_ = Tensor{};
+        grad_token_emb_ = Tensor{};
+        for (auto& b : blocks_) b.clear_cache();
+        ln_f_->clear_cache();
+        lm_head_.clear_cache();
+        stored_tokens_tensor_ = Tensor{};
+        batch_size_ = 0;
+    }
+
+    [[nodiscard]] Result<Tensor> forward(
+        ComputeEngine& engine, const Tensor& input) override
+    {
+        const std::size_t seq = input.rows();
+        const std::size_t batch = input.cols();
+        batch_size_ = batch;
+
+        auto input_T = engine.transpose(input);   // (batch, seq)
+        if (!input_T) return std::unexpected(input_T.error());
+        auto all_emb = engine.gather_rows(token_emb_, *input_T);
+        if (!all_emb) return std::unexpected(all_emb.error());
+        auto st = engine.clone(*input_T);
+        if (!st) return std::unexpected(st.error());
+        stored_tokens_tensor_ = std::move(*st);
+        auto all_T = engine.transpose(*all_emb);
+        if (!all_T) return std::unexpected(all_T.error());
+
+        auto x_res = pos_encoder_->apply(engine, *all_T, batch, seq);
+        if (!x_res) return std::unexpected(x_res.error());
+        Tensor x = std::move(*x_res);
+
+        for (auto& b : blocks_)
+        {
+            auto r = b.forward(engine, x);
+            if (!r) return r;
+            x = std::move(*r);
+        }
+        auto ln = ln_f_->forward(engine, x);
+        if (!ln) return ln;
+        return lm_head_.forward(engine, *ln);
+    }
+
+    [[nodiscard]] Result<Tensor> backward(
+        ComputeEngine& engine, const Tensor& grad_output) override
+    {
+        const std::size_t seq = seq_len_;
+        const std::size_t batch = batch_size_;
+
+        auto b_lm = lm_head_.backward(engine, grad_output);
+        if (!b_lm) return b_lm;
+        auto b_ln = ln_f_->backward(engine, *b_lm);
+        if (!b_ln) return b_ln;
+        Tensor grad_x = std::move(*b_ln);
+
+        for (std::size_t i = blocks_.size(); i-- > 0;)
+        {
+            auto br = blocks_[i].backward(engine, grad_x);
+            if (!br) return br;
+            grad_x = std::move(*br);
+        }
+
+        auto grad_T = engine.transpose(grad_x);
+        if (!grad_T) return std::unexpected(grad_T.error());
+        auto pr = pos_encoder_->backward(engine, *grad_T, batch, seq);
+        if (!pr) return std::unexpected(pr.error());
+        auto sr = engine.scatter_add_rows(grad_token_emb_, stored_tokens_tensor_, *grad_T);
+        if (!sr) return std::unexpected(sr.error());
+
+        Matrix grad_input(seq, batch, Scalar{0});
+        return engine.from_matrix(grad_input);
+    }
+
+    // ── 采样生成（重计算式，无 KV cache） ────────────────────────
+    // 每步把「当前上下文（prompt + 已生成，滑动窗口截断到 seq_len）」pad 到整窗
+    // (seq_len, 1) 重新 forward（causal RLA 只看到前缀），取末位真实 token 的
+    // logits 采样。复杂度 O(seq²)，对首个 CLI 接入足够；KV cache 优化留待后续。
+    //
+    // 注意（RoPE 位置）：重计算式生成每步从位置 0 重新施 RoPE，绝对位置会重置；
+    // 对 < seq_len 的上下文正确，超长滑动窗生成的绝对位置语义会退化。
+    // 这是 v1 简化实现（与 ZiPTModel::generate 一致），后续可用 KV cache +
+    // 绝对位置偏移修正。
+    [[nodiscard]] Result<std::vector<std::size_t>>
+    generate(ComputeEngine& engine,
+             const std::vector<std::size_t>& prompt,
+             std::size_t max_new_tokens,
+             Scalar temperature = 1.0,
+             std::size_t eos_token_id = static_cast<std::size_t>(-1),
+             std::size_t min_new_tokens = 0)
+    {
+        std::vector<std::size_t> context(prompt);
+        std::vector<std::size_t> generated;
+        std::mt19937_64 rng{std::random_device{}()};
+        std::uniform_real_distribution<Scalar> dist(0.0, 1.0);
+
+        for (std::size_t step = 0; step < max_new_tokens; ++step)
+        {
+            std::size_t start = 0;
+            if (context.size() > seq_len_) start = context.size() - seq_len_;
+            const std::size_t n = context.size() - start;
+
+            // 左对齐 pad 到整窗 (seq_len_, 1)；末位真实 token 在位置 n-1
+            const std::size_t pred_col = n - 1;
             Matrix in(seq_len_, 1);
             for (std::size_t i = 0; i < seq_len_; ++i)
                 in.set_value_unchecked(i, 0,
@@ -5004,10 +6007,9 @@ public:
             auto lm = engine.to_matrix(*logits);
             if (!lm) return std::unexpected(lm.error());
 
-            // 末位（最后真实位置 n-1）logits
             std::vector<Scalar> last(vocab_size_);
             for (std::size_t v = 0; v < vocab_size_; ++v)
-                last[v] = lm->at_unchecked(v, n - 1);
+                last[v] = lm->at_unchecked(v, pred_col);
 
             if (temperature > 0.0 && temperature != 1.0)
                 for (auto& x : last) x /= temperature;

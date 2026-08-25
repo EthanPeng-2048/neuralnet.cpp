@@ -107,6 +107,70 @@ int main(int argc, char* argv[])
         std::cerr << "initial loss invalid (NaN?)\n";
         return 1;
     }
+
+    // ── 3. 压缩模式（L=W+C）冒烟：window < seq_len ───────────────────
+    // 验证历史/窗口分离前向、压缩器仅吃历史、loss 只在窗口上计算、反向合并梯度。
+    {
+        nn::ZiPTConfig scfg;
+        scfg.vocab_size    = 32;
+        scfg.d_model       = 16;
+        scfg.seq_len       = 8;   // L
+        scfg.window        = 4;   // W（< L，启用压缩模式；偶数规避 GPU 奇数列后端 bug）
+        scfg.num_heads     = 2;
+        scfg.d_ff          = 32;
+        scfg.num_layers    = 2;
+        scfg.memory_tokens = 4;   // M；历史 = L - W = 4 压入 4 个记忆 token
+        auto sspec = nn::make_zipt_spec(scfg.vocab_size, scfg.d_model, scfg.seq_len,
+                                        scfg.num_heads, scfg.d_ff, scfg.num_layers,
+                                        scfg.memory_tokens, scfg.window);
+        auto smodel = nn::build_zipt_model_from_spec(eng, sspec);
+        if (!smodel) { std::cerr << "build_zipt_model(split) failed\n"; return 1; }
+        if (!nn::spec_matches(sspec, *smodel->spec()))
+        {
+            std::cerr << "ZiPT split spec mismatch\n";
+            return 1;
+        }
+        std::cout << "split-mode spec OK (" << nn::spec_summary(sspec) << ")\n";
+
+        auto sopt = nn::create_optimizer(
+            "adamw", eng, smodel->parameters(), smodel->param_gradients(),
+            nn::Scalar{1e-3}, nn::Scalar{0.01});
+        if (!sopt) { std::cerr << "split optimizer creation failed\n"; return 1; }
+
+        nn::Matrix sin(scfg.seq_len, 1);
+        std::vector<std::size_t> slabels(scfg.window);   // 输出仅覆盖窗口 W
+        for (std::size_t t = 0; t < scfg.seq_len; ++t)
+            sin.set_value_unchecked(t, 0, static_cast<nn::Scalar>(tok(rng)));
+        for (std::size_t t = 0; t < scfg.window; ++t)
+            slabels[t] = tok(rng);
+        auto sx = eng.from_matrix(sin);
+        if (!sx) return 1;
+
+        nn::Scalar sfirst = 0;
+        for (std::size_t step = 0; step < steps; ++step)
+        {
+            auto zero = sopt->zero_grad();
+            if (!zero) { std::cerr << "split zero_grad failed\n"; return 1; }
+            auto logits = smodel->forward(*sx);
+            if (!logits) { std::cerr << "split forward failed: " << logits.error().message << "\n"; return 1; }
+            auto loss = ce.forward_sparse(eng, *logits, slabels, {}, scfg.vocab_size);
+            if (!loss) { std::cerr << "split loss failed: " << loss.error().message << "\n"; return 1; }
+            auto grad = ce.backward();
+            if (!grad) { std::cerr << "split loss backward failed\n"; return 1; }
+            auto b = smodel->backward(*grad);
+            if (!b) { std::cerr << "split model backward failed: " << b.error().message << "\n"; return 1; }
+            auto st = sopt->step();
+            if (!st) { std::cerr << "split optimizer step failed\n"; return 1; }
+            if (step == 0) sfirst = *loss;
+        }
+        if (!(sfirst > 0) || !(sfirst == sfirst))
+        {
+            std::cerr << "split initial loss invalid (NaN?)\n";
+            return 1;
+        }
+        std::cout << "split-mode (L=W+C) smoke: first_loss=" << sfirst << " OK\n";
+    }
+
     std::cout << "ZIPT SMOKE TEST PASSED\n";
     return 0;
 }

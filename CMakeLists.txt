@@ -163,6 +163,14 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(zipt_consistency_test src/zipt_consistency_test.cpp)
     list(APPEND NN_TEST_TARGETS zipt_consistency_test)
 
+    # ── RAPT（ReLU 线性注意力）数值梯度检查（gradcheck：RLA 核心 + 块） ──
+    nn_add_executable(rapt_gradcheck src/rapt_gradcheck.cpp)
+    list(APPEND NN_TEST_TARGETS rapt_gradcheck)
+
+    # ── RAPT（ReLU 线性注意力）端到端冒烟测试（构建 + 规格往返 + 训练 loss 下降） ──
+    nn_add_executable(rapt_smoke_test src/rapt_smoke_test.cpp)
+    list(APPEND NN_TEST_TARGETS rapt_smoke_test)
+
     # ── 融合 shader（AOT）GPU 数值验证（ExprSpec 单一事实来源 vs GPU 输出） ──
     nn_add_executable(fused_gpu_test src/fused_gpu_test.cpp)
     list(APPEND NN_TEST_TARGETS fused_gpu_test)
