@@ -224,6 +224,8 @@ template <typename... Ts>
     kv.set("pos_encoding", static_cast<uint64_t>(spec.pos_encoding));
     kv.set("activation",   static_cast<uint64_t>(spec.activation));
     kv.set("norm_type",    static_cast<uint64_t>(spec.norm_type));
+    // ZiPT 记忆 token 数（可选字段：GPT/旧文件缺失时回落 0，不影响加载）
+    kv.set("memory_tokens", static_cast<uint64_t>(spec.memory_tokens));
 
     // ── CNN ──
     kv.set("cnn_in_channels", static_cast<uint64_t>(spec.cnn_in_channels));
@@ -286,6 +288,7 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
     if (kv.get("pos_encoding", v)) spec.pos_encoding = static_cast<PosEncodingType>(v);
     if (kv.get("activation", v))  spec.activation   = static_cast<ActivationType>(v);
     if (kv.get("norm_type", v))   spec.norm_type    = static_cast<NormType>(v);
+    if (kv.get("memory_tokens", v)) spec.memory_tokens = static_cast<std::size_t>(v);
 
     // ── CNN ──
     if (kv.get("cnn_in_channels", v)) spec.cnn_in_channels = static_cast<std::size_t>(v);

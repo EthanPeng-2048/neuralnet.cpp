@@ -115,16 +115,18 @@ nn::Result<std::vector<std::size_t>> generate_text(
     std::size_t eos_token_id)
 {
     auto &layer_ref = model.layer_at(0);
-    auto *gpt_ptr = dynamic_cast<nn::GPTModel *>(&layer_ref);
-    if (!gpt_ptr)
-        return std::unexpected(nn::Error{"Model does not contain a GPTModel layer"});
 
     // 传入 EOS_ID，生成遇到 EOS 自动停止
     // min_new_tokens = max_new_tokens/2，至少生成一半 token 才允许 EOS 停止，
     // 避免模型因训练偏置一上来就输出 EOS 导致无输出。
     const std::size_t min_new = max_new_tokens / 2;
-    return gpt_ptr->generate(engine, prompt_tokens, max_new_tokens, temperature,
-                             eos_token_id, min_new);
+    if (auto *gpt_ptr = dynamic_cast<nn::GPTModel *>(&layer_ref))
+        return gpt_ptr->generate(engine, prompt_tokens, max_new_tokens, temperature,
+                                 eos_token_id, min_new);
+    if (auto *zipt_ptr = dynamic_cast<nn::ZiPTModel *>(&layer_ref))
+        return zipt_ptr->generate(engine, prompt_tokens, max_new_tokens, temperature,
+                                  eos_token_id, min_new);
+    return std::unexpected(nn::Error{"Model does not contain a GPTModel or ZiPTModel layer"});
 }
 
 // ==================== 交互模式 ====================
@@ -240,9 +242,9 @@ int main(int argc, char *argv[])
         return 1;
     }
     nn::ModelSpec spec = spec_result.value();
-    if (!spec.is_gpt())
+    if (!spec.is_gpt() && !spec.is_zipt())
     {
-        std::cerr << "模型文件不是 GPT 类型 (type="
+        std::cerr << "模型文件不是 GPT/ZiPT 类型 (type="
                   << static_cast<uint32_t>(spec.type) << ")\n";
         return 1;
     }
@@ -266,6 +268,8 @@ int main(int argc, char *argv[])
               << " layers=" << spec.num_layers
               << " d_ff=" << spec.d_ff
               << " seq_len=" << spec.seq_len;
+    if (spec.is_zipt())
+        std::cout << " memory_tokens=" << spec.memory_tokens << " [ZiPT]";
     if (spec.is_alibi_gpt() || spec.pos_encoding == nn::PosEncodingType::ALiBi)
         std::cout << " [ALiBi]";
     else if (spec.pos_encoding == nn::PosEncodingType::Sinusoidal)
@@ -277,9 +281,10 @@ int main(int argc, char *argv[])
     std::cout << "\n";
 
     nn::Result<nn::Model> model_result;
-    // 统一的 GPTModel 通过 pos_encoding 区分 Learned/Sinusoidal/ALiBi，
-    // GPT 和旧格式 ALiBi_GPT 文件都走同一条构建路径。
-    model_result = nn::build_gpt_model_from_spec(*engine, spec);
+    if (spec.is_zipt())
+        model_result = nn::build_zipt_model_from_spec(*engine, spec);
+    else  // 统一的 GPTModel 通过 pos_encoding 区分 Learned/Sinusoidal/ALiBi
+        model_result = nn::build_gpt_model_from_spec(*engine, spec);
     if (!model_result)
     {
         std::cerr << "构建模型失败: " << model_result.error().message << std::endl;

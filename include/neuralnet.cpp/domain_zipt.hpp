@@ -22,6 +22,9 @@
 
 namespace nn {
 
+// ── ZiPT 默认记忆 token 数 ───────────────────────────────────────────────
+inline constexpr std::size_t ZIPT_MEMORY_TOKENS = 32;  // M（≪ seq_len，建议偶数规避 GPU matmul 奇数列后端 bug）
+
 // ── ZiPT 配置结构体 ─────────────────────────────────────────────────────
 struct ZiPTConfig {
     std::size_t vocab_size    = GPT_VOCAB_SIZE;
@@ -30,7 +33,7 @@ struct ZiPTConfig {
     std::size_t num_heads     = GPT_NUM_HEADS;
     std::size_t d_ff          = GPT_D_FF;
     std::size_t num_layers    = GPT_NUM_LAYERS;
-    std::size_t memory_tokens = 32;                       // M：记忆 token 数（≪ seq_len）
+    std::size_t memory_tokens = ZIPT_MEMORY_TOKENS;       // M：记忆 token 数（≪ seq_len）
     PosEncodingType pos_enc   = PosEncodingType::Learned;
     ActivationType activation = ActivationType::GeLU;
     NormType norm_type        = NormType::LayerNorm;

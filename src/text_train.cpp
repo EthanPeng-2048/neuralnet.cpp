@@ -339,6 +339,10 @@ void print_usage(const char *prog)
         << "  --norm <type>      归一化层: layernorm(默认)/rmsnorm\n"
         << "                     layernorm: LayerNorm（GPT-2 风格）\n"
         << "                     rmsnorm: RMSNorm（LLaMA/Mistral 风格，更快更稳）\n"
+        << "  --model <type>     模型架构: gpt(默认)/zipt (AttnZip 记忆压缩)\n"
+        << "                     zipt: 先整段压缩为 memory-tokens 个记忆 token，再逐块\n"
+        << "                           对 [记忆;局部] 联合注意力（长上下文 O(L) 复杂度）\n"
+        << "  --memory-tokens <n> ZiPT 记忆 token 数 M (默认: 32；建议偶数且 ≪ seq-len)\n"
         << "  --log-interval <n> 每隔多少 step 显示进度 (默认: 50)\n"
         << "  --save-interval <n> 每隔多少 step 保存 checkpoint (默认: 100)\n"
         << "  --grad-log         显示梯度统计（范数/最大值/均值）\n"
@@ -397,6 +401,8 @@ struct TrainConfig
     std::size_t num_heads = nn::GPT_NUM_HEADS;
     std::size_t num_layers = nn::GPT_NUM_LAYERS;
     std::size_t d_ff = nn::GPT_D_FF;
+    std::string model_type = "gpt";   // gpt / zipt（AttnZip 记忆压缩）
+    std::size_t memory_tokens = nn::ZIPT_MEMORY_TOKENS;  // ZiPT 记忆 token 数 M
     std::size_t log_interval = 50;
     std::size_t save_interval = 100;  // checkpoint 保存间隔（独立于 log_interval）
     bool load_existing = false;
@@ -542,6 +548,21 @@ TrainConfig parse_args(int argc, char *argv[])
             auto v = nn::parse_number<std::size_t>(argv[++i]);
             if (!v) { std::cerr << "无效 --d-ff: " << v.error().message << "\n"; std::exit(1); }
             cfg.d_ff = *v;
+        }
+        else if (arg == "--model" && i + 1 < argc)
+        {
+            cfg.model_type = argv[++i];
+            if (cfg.model_type != "gpt" && cfg.model_type != "zipt")
+            {
+                std::cerr << "未知模型架构: " << cfg.model_type << ", 可选: gpt, zipt\n";
+                std::exit(1);
+            }
+        }
+        else if (arg == "--memory-tokens" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --memory-tokens: " << v.error().message << "\n"; std::exit(1); }
+            cfg.memory_tokens = *v;
         }
         else if (arg == "--log-interval" && i + 1 < argc)
         {
@@ -894,6 +915,9 @@ int main(int argc, char *argv[])
     std::cout << "  Transformer 层数: " << cfg.num_layers << "\n";
     std::cout << "  FFN 维度: " << cfg.d_ff << "\n";
     std::cout << "  序列长度: " << cfg.seq_len << "\n";
+    std::cout << "  模型架构: " << (cfg.model_type == "zipt" ? "ZiPT (AttnZip 记忆压缩)" : "GPT") << "\n";
+    if (cfg.model_type == "zipt")
+        std::cout << "  记忆 token 数 (M): " << cfg.memory_tokens << "\n";
     std::cout << "  优化器: " << cfg.optimizer_name << "  学习率: " << cfg.lr << "\n";
     std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
     std::cout << "  GPU: " << (cfg.gpu_enabled ? "启用" : "禁用") << "\n";
@@ -925,11 +949,22 @@ int main(int argc, char *argv[])
     auto engine = std::move(*engine_res);
 
     // ── 构建模型（绑定引擎） ─────────────────────────────────
-    auto model_build = nn::build_gpt_model(
-        *engine,
-        tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
-        cfg.num_heads, cfg.d_ff, cfg.num_layers,
-        cfg.pos_encoding, cfg.activation, cfg.norm_type);
+    nn::Result<nn::Model> model_build;
+    if (cfg.model_type == "zipt")
+    {
+        model_build = nn::build_zipt_model(*engine, nn::ZiPTConfig{
+            tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
+            cfg.num_heads, cfg.d_ff, cfg.num_layers, cfg.memory_tokens,
+            cfg.pos_encoding, cfg.activation, cfg.norm_type});
+    }
+    else
+    {
+        model_build = nn::build_gpt_model(
+            *engine,
+            tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
+            cfg.num_heads, cfg.d_ff, cfg.num_layers,
+            cfg.pos_encoding, cfg.activation, cfg.norm_type);
+    }
     if (!model_build) {
         std::cerr << "构建模型失败: " << model_build.error().message << '\n';
         return 1;
@@ -959,10 +994,17 @@ int main(int argc, char *argv[])
     }
 
     // ── 构建规格（用于保存） ─────────────────────────────────
-    auto spec = nn::make_gpt_spec(
-        tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
-        cfg.num_heads, cfg.d_ff, cfg.num_layers,
-        cfg.pos_encoding, cfg.activation, cfg.norm_type);
+    nn::ModelSpec spec;
+    if (cfg.model_type == "zipt")
+        spec = nn::make_zipt_spec(
+            tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
+            cfg.num_heads, cfg.d_ff, cfg.num_layers, cfg.memory_tokens,
+            cfg.pos_encoding, cfg.activation, cfg.norm_type);
+    else
+        spec = nn::make_gpt_spec(
+            tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
+            cfg.num_heads, cfg.d_ff, cfg.num_layers,
+            cfg.pos_encoding, cfg.activation, cfg.norm_type);
 
     if (cfg.load_existing)
     {
@@ -974,9 +1016,22 @@ int main(int argc, char *argv[])
         else
         {
             auto file_spec = std::move(*spec_result);
+            // ZiPT 独立构建路径
+            if (file_spec.is_zipt())
+            {
+                std::cout << "从模型文件读取 ZiPT 规格\n";
+                auto build_result = nn::build_zipt_model_from_spec(*engine, file_spec);
+                if (!build_result)
+                {
+                    std::cerr << "Error: " << build_result.error().message << '\n';
+                    return 1;
+                }
+                model = std::move(*build_result);
+                spec = file_spec;
+            }
             // 统一的 GPTModel 通过 pos_encoding 区分 Learned/Sinusoidal/ALiBi，
             // 因此 GPT 和旧格式 ALiBi_GPT 文件都走同一条构建路径。
-            if (file_spec.is_gpt() || file_spec.is_alibi_gpt())
+            else if (file_spec.is_gpt() || file_spec.is_alibi_gpt())
             {
                 if (file_spec.pos_encoding == nn::PosEncodingType::ALiBi)
                     std::cout << "从模型文件读取 ALiBi GPT 规格\n";
