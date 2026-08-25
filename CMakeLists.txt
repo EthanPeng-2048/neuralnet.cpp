@@ -90,24 +90,19 @@ option(NN_ENABLE_TESTS "Build test/verification executables" OFF)
 # 收集实际构建的目标，供 GPU/CUDA 统一启用（避免引用未定义目标）
 set(NN_APP_TARGETS "")
 set(NN_TEST_TARGETS "")
+set(NN_BENCH_TARGETS "")   # 性能基准（仅测试构建，手工运行，不注册 ctest）
 
-# ── MNIST 目标 ──────────────────────────────────────────────────────────────
+# ── MNIST 目标（标准构建核心应用） ───────────────────────────────────────
 nn_add_executable(mnist_train src/mnist_train.cpp)
 nn_add_executable(mnist_infer src/mnist_infer.cpp)
-nn_add_executable(mnist_bench src/mnist_bench.cpp)
-list(APPEND NN_APP_TARGETS mnist_train mnist_infer mnist_bench)
+list(APPEND NN_APP_TARGETS mnist_train mnist_infer)
 
-# ── 文本目标（GPT 训练/推理 + BPE 分词器训练/推理） ───────────────────
+# ── 文本目标（GPT 训练/推理 + BPE 分词器训练/推理，标准构建核心应用） ──
 nn_add_executable(text_train src/text_train.cpp)
 nn_add_executable(text_infer src/text_infer.cpp)
 nn_add_executable(tokenizer_train src/tokenizer_train.cpp)
 nn_add_executable(tokenizer_infer src/tokenizer_infer.cpp)
 list(APPEND NN_APP_TARGETS text_train text_infer tokenizer_train tokenizer_infer)
-
-# ── 计算性能基准工具 ─────────────────────────────────────────────────────
-nn_add_executable(compute_bench src/compute_bench.cpp)
-nn_add_executable(bench_thresholds src/bench_thresholds.cpp)
-list(APPEND NN_APP_TARGETS compute_bench bench_thresholds)
 
 # ── 测试 / 验证目标（默认关闭，NN_ENABLE_TESTS=ON 时构建）─────────────
 if(NN_ENABLE_TESTS)
@@ -176,6 +171,14 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(expr_opt_test src/expr_opt_test.cpp)
     list(APPEND NN_TEST_TARGETS expr_opt_test)
 
+    # ── 图 IR + 融合分析测试（IR-C：expr_graph.hpp 纯函数，无 GPU） ─────
+    nn_add_executable(expr_graph_test src/expr_graph_test.cpp)
+    list(APPEND NN_TEST_TARGETS expr_graph_test)
+
+    # ── 图 IR 融合 GPU 端到端（IR-C：begin_expr/end_expr 融合执行） ─────
+    nn_add_executable(expr_fuse_test src/expr_fuse_test.cpp)
+    list(APPEND NN_TEST_TARGETS expr_fuse_test)
+
     # ── ModelSpec 架构校验一致性测试（load_model 文件头 vs 模型规格比对） ────
     nn_add_executable(model_spec_validation_test src/model_spec_validation_test.cpp)
     list(APPEND NN_TEST_TARGETS model_spec_validation_test)
@@ -183,14 +186,6 @@ if(NN_ENABLE_TESTS)
     # ── Softmax 数值梯度检查（gradcheck，验证 softmax 反向） ───────────────────
     nn_add_executable(softmax_gradcheck src/softmax_gradcheck.cpp)
     list(APPEND NN_TEST_TARGETS softmax_gradcheck)
-
-    # ── 注意力反向逐级调试探针（对比暴力 Matrix 参考与引擎原语） ────────────
-    nn_add_executable(attn_debug src/attn_debug.cpp)
-    list(APPEND NN_TEST_TARGETS attn_debug)
-
-    # ── batched_matmul 原语探针（四种转置组合 vs 手工参考） ───────────────────
-    nn_add_executable(matmul_probe src/matmul_probe.cpp)
-    list(APPEND NN_TEST_TARGETS matmul_probe)
 
     # ── M4 matmul 融合原语测试（bmm_reduce/bmm_denom/bmm_apply，CPU+GPU） ──
     # ── M6 两趟式注意力反向原语测试（bmm_q_backward/bmm_kv_backward，CPU+GPU）
@@ -201,6 +196,13 @@ if(NN_ENABLE_TESTS)
     # ── M5 稀疏交叉熵融合测试（loss/grad vs 参考，CPU+GPU） ──
     nn_add_executable(ce_fusion_test src/ce_fusion_test.cpp)
     list(APPEND NN_TEST_TARGETS ce_fusion_test)
+
+    # ── 性能基准工具（仅测试构建；手工运行，不注册 ctest） ──
+    nn_add_executable(mnist_bench src/mnist_bench.cpp)
+    nn_add_executable(compute_bench src/compute_bench.cpp)
+    nn_add_executable(bench_thresholds src/bench_thresholds.cpp)
+    nn_add_executable(reduce_bench src/reduce_bench.cpp)
+    list(APPEND NN_BENCH_TARGETS mnist_bench compute_bench bench_thresholds reduce_bench)
 
 endif()
 
@@ -219,6 +221,11 @@ if(NN_ENABLE_TESTS)
         set_target_properties(${TARGET} PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test)
         add_test(NAME ${TARGET} COMMAND ${TARGET})
+    endforeach()
+    # 基准工具输出到 test/，但不注册 ctest（手工运行）
+    foreach(TARGET ${NN_BENCH_TARGETS})
+        set_target_properties(${TARGET} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test)
     endforeach()
 endif()
 
@@ -307,6 +314,10 @@ if(Vulkan_FOUND)
     target_link_libraries(scan_exprs PRIVATE nn_core Vulkan::Vulkan)
     add_custom_command(
         OUTPUT ${NN_EXPR_SCAN_BIN}
+        # scan_exprs 是原生可执行文件，直接写文件、不会自建目录。
+        # Ninja 会自动创建自定义命令的输出目录，但 Makefiles 生成器不会，
+        # 全新构建时 generated/ 尚未存在会写入失败（见 08-pitfalls）。
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/generated
         COMMAND scan_exprs ${NN_EXPR_SCAN_BIN}
         DEPENDS scan_exprs ${SCAN_SRC}
         COMMENT "[GPU] Scanning Layer expressions (scan_exprs) → expr_specs.bin"
@@ -319,6 +330,8 @@ if(Vulkan_FOUND)
     target_link_libraries(gen_fused PRIVATE nn_core)
     add_custom_command(
         OUTPUT ${NN_FUSED_REGISTRY_HPP}
+        # 同 scan_exprs：gen_fused 也是原生可执行文件，需先确保输出目录存在
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/generated
         COMMAND gen_fused ${CMAKE_BINARY_DIR}/generated ${GLSLC} ${NN_EXPR_SCAN_BIN}
         DEPENDS gen_fused ${FUSED_GEN_SRC} ${NN_EXPR_SCAN_BIN}
         COMMENT "[GPU] Synthesizing fused shaders (gen_fused) → fused_registry.hpp"
@@ -339,6 +352,7 @@ if(Vulkan_FOUND)
         set(NN_GPU_TARGETS ${NN_APP_TARGETS})
         if(NN_ENABLE_TESTS)
             list(APPEND NN_GPU_TARGETS ${NN_TEST_TARGETS})
+            list(APPEND NN_GPU_TARGETS ${NN_BENCH_TARGETS})
         endif()
 
         foreach(TARGET ${NN_GPU_TARGETS})

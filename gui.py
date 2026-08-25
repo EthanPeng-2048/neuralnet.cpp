@@ -48,7 +48,7 @@ PRETRAINED_DIR = PROJECT_DIR / "pretrained"
 BUILD_DIR = PROJECT_DIR / "build"
 
 # ---------- 枚举选项 ----------
-ARCH_OPTIONS = ["mlp", "transformer"]
+ARCH_OPTIONS = ["mlp", "transformer", "cnn"]
 OPTIMIZER_OPTIONS = ["sgd", "sgd_momentum", "adam", "adamw", "muon"]
 ENGINE_OPTIONS = ["CPU", "GPU (Vulkan)", "CUDA"]
 LR_SCHEDULE_OPTIONS = ["fixed", "cosine"]
@@ -788,6 +788,15 @@ class MnistTrainTab(TabBase):
         self._tf_widgets = [self.tf_sep_label, self.d_model, self.num_heads,
                             self.num_layers, self.d_ff, self.patch_size, self.eval_samples]
 
+        # --- CNN 专用参数 (LeNet-5 风格) ---
+        self.cnn_sep_label = _make_label(p, "── CNN 参数 ──", r); r += 1
+        self.cnn_channels = _make_entry_row(p, "cnn_channels", r, "6,16"); r += 1
+        self.cnn_kernels = _make_entry_row(p, "cnn_kernels", r, "5,5"); r += 1
+        self.cnn_pool = _make_entry_row(p, "cnn_pool", r, "2"); r += 1
+        self.cnn_fc = _make_entry_row(p, "cnn_fc", r, "120,10"); r += 1
+        self._cnn_widgets = [self.cnn_sep_label, self.cnn_channels, self.cnn_kernels,
+                             self.cnn_pool, self.cnn_fc]
+
         # --- LR 调度相关控件（fixed 时隐藏） ---
         self._lr_schedule_widgets = [self.min_lr, self.warmup_epochs]
 
@@ -815,14 +824,17 @@ class MnistTrainTab(TabBase):
                 "device": dev, "data": data, "hyperparameters": args}
 
     def _on_arch_change(self, *args):
-        """根据架构选择显示 MLP 或 Transformer 参数"""
-        is_mlp = self.arch.get() == "mlp"
+        """根据架构选择显示 MLP / Transformer / CNN 参数"""
+        arch = self.arch.get()
         for w in self._mlp_widgets:
             w = getattr(w, "widget", w)
-            w.grid() if is_mlp else w.grid_remove()
+            w.grid() if arch == "mlp" else w.grid_remove()
         for w in self._tf_widgets:
             w = getattr(w, "widget", w)
-            w.grid() if not is_mlp else w.grid_remove()
+            w.grid() if arch == "transformer" else w.grid_remove()
+        for w in self._cnn_widgets:
+            w = getattr(w, "widget", w)
+            w.grid() if arch == "cnn" else w.grid_remove()
 
     def _on_lr_schedule_change(self, *args):
         """fixed 调度下隐藏 min_lr / warmup"""
@@ -854,16 +866,22 @@ class MnistTrainTab(TabBase):
         if self.min_lr.get(): args["min_lr"] = float(self.min_lr.get())
         if self.warmup_epochs.get(): args["warmup_epochs"] = int(self.warmup_epochs.get())
         # 架构特定参数
-        if self.arch.get() == "mlp":
+        arch = self.arch.get()
+        if arch == "mlp":
             if self.layer_dims.get(): args["layer_dims"] = self.layer_dims.get()
             args["norm"] = self.norm.get()
-        else:
+        elif arch == "transformer":
             if self.d_model.get(): args["d_model"] = int(self.d_model.get())
             if self.num_heads.get(): args["num_heads"] = int(self.num_heads.get())
             if self.num_layers.get(): args["num_layers"] = int(self.num_layers.get())
             if self.d_ff.get(): args["d_ff"] = int(self.d_ff.get())
             if self.patch_size.get(): args["patch_size"] = int(self.patch_size.get())
             if self.eval_samples.get(): args["eval_samples"] = int(self.eval_samples.get())
+        elif arch == "cnn":
+            if self.cnn_channels.get(): args["cnn_channels"] = self.cnn_channels.get()
+            if self.cnn_kernels.get(): args["cnn_kernels"] = self.cnn_kernels.get()
+            if self.cnn_pool.get(): args["cnn_pool"] = int(self.cnn_pool.get())
+            if self.cnn_fc.get(): args["cnn_fc"] = self.cnn_fc.get()
         return args
 
 

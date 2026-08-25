@@ -85,6 +85,11 @@ public:
     // 非可学习状态收集（默认空，BatchNorm 的 running 统计量等需要 override）
     [[nodiscard]] virtual std::vector<TensorRef> extra_state() { return {}; }
 
+    // 引擎相关初始化（创建/上传权重张量），替换构造函数中的 NN_ASSERT 模式。
+    // 默认实现空操作；各层在构造后由 Model::add<T>() 调用。
+    // 返回 Result 以正确传播引擎错误，而非在 Release 下吞掉。
+    [[nodiscard]] virtual Result<void> init(ComputeEngine& /*engine*/) { return {}; }
+
     // 梯度检查点（激活重计算）契约 ──────────────────────────────────
     // checkpoint_mode_ = true 时，forward 不保留中间激活（供 L1 激活重计算）；
     // forward_recompute 重算 forward 并重建缓存（供 backward 使用）。
@@ -147,6 +152,8 @@ public:
 class Linear final : public Layer
 {
 private:
+    std::size_t in_features_;
+    std::size_t out_features_;
     Tensor w_;           // 权重 (out_features, in_features)
     Tensor b_;           // 偏置 (out_features, 1)
     Tensor grad_w_;      // 权重梯度
@@ -156,33 +163,36 @@ private:
     inline static thread_local std::mt19937_64 rng_{std::random_device{}()};
 
 public:
-    Linear(ComputeEngine& engine,
-           std::size_t in_features, std::size_t out_features)
+    Linear(std::size_t in_features, std::size_t out_features)
+        : in_features_(in_features), out_features_(out_features) {}
+
+    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
     {
         // ── 在 CPU 上初始化权重（Xavier 均匀分布） ──
-        Matrix w_cpu(out_features, in_features);
-        const Scalar limit = std::sqrt(6.0 / static_cast<Scalar>(in_features + out_features));
+        Matrix w_cpu(out_features_, in_features_);
+        const Scalar limit = std::sqrt(6.0 / static_cast<Scalar>(in_features_ + out_features_));
         std::uniform_real_distribution<Scalar> dist(-limit, limit);
         auto w_span = w_cpu.span();
         for (std::size_t i = 0; i < w_cpu.size(); ++i)
             w_span[i] = dist(rng_);
 
-        Matrix b_cpu(out_features, 1);  // 零初始化
+        Matrix b_cpu(out_features_, 1);  // 零初始化
 
         // ── 通过 engine 上传到目标设备 ──
         auto w_res = engine.from_matrix(w_cpu);
-        NN_ASSERT(w_res, w_res ? "" : w_res.error().message.c_str());
+        if (!w_res) return std::unexpected(w_res.error());
         w_ = std::move(*w_res);
 
         auto b_res = engine.from_matrix(b_cpu);
-        NN_ASSERT(b_res, b_res ? "" : b_res.error().message.c_str());
+        if (!b_res) return std::unexpected(b_res.error());
         b_ = std::move(*b_res);
 
         // ── 创建梯度张量（零初始化） ──
-        grad_w_ = engine.create_tensor(out_features, in_features);
-        grad_b_ = engine.create_tensor(out_features, 1);
-        { auto r1 = engine.zero(grad_w_); NN_ASSERT(r1, r1 ? "" : r1.error().message.c_str()); }
-        { auto r2 = engine.zero(grad_b_); NN_ASSERT(r2, r2 ? "" : r2.error().message.c_str()); }
+        grad_w_ = engine.create_tensor(out_features_, in_features_);
+        grad_b_ = engine.create_tensor(out_features_, 1);
+        { auto r1 = engine.zero(grad_w_); if (!r1) return std::unexpected(r1.error()); }
+        { auto r2 = engine.zero(grad_b_); if (!r2) return std::unexpected(r2.error()); }
+        return {};
     }
 
     [[nodiscard]] std::vector<TensorRef> parameters() override
@@ -591,26 +601,28 @@ private:
     static constexpr Scalar EPSILON = 1e-5;
 
 public:
-    explicit LayerNorm(ComputeEngine& engine,
-                       std::size_t normalized_shape, Scalar epsilon = EPSILON)
-        : normalized_shape_(normalized_shape), epsilon_(epsilon)
+    explicit LayerNorm(std::size_t normalized_shape, Scalar epsilon = EPSILON)
+        : normalized_shape_(normalized_shape), epsilon_(epsilon) {}
+
+    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
     {
         // gamma 初始化为 1, beta 初始化为 0
-        Matrix gamma_cpu(normalized_shape, 1, Scalar{1});
-        Matrix beta_cpu(normalized_shape, 1, Scalar{0});
+        Matrix gamma_cpu(normalized_shape_, 1, Scalar{1});
+        Matrix beta_cpu(normalized_shape_, 1, Scalar{0});
 
         auto g = engine.from_matrix(gamma_cpu);
-        NN_ASSERT(g, g ? "" : g.error().message.c_str());
+        if (!g) return std::unexpected(g.error());
         gamma_ = std::move(*g);
 
         auto bv = engine.from_matrix(beta_cpu);
-        NN_ASSERT(bv, bv ? "" : bv.error().message.c_str());
+        if (!bv) return std::unexpected(bv.error());
         beta_ = std::move(*bv);
 
-        grad_gamma_ = engine.create_tensor(normalized_shape, 1);
-        grad_beta_ = engine.create_tensor(normalized_shape, 1);
-        { auto r1 = engine.zero(grad_gamma_); NN_ASSERT(r1, r1 ? "" : r1.error().message.c_str()); }
-        { auto r2 = engine.zero(grad_beta_);  NN_ASSERT(r2, r2 ? "" : r2.error().message.c_str()); }
+        grad_gamma_ = engine.create_tensor(normalized_shape_, 1);
+        grad_beta_ = engine.create_tensor(normalized_shape_, 1);
+        { auto r1 = engine.zero(grad_gamma_); if (!r1) return std::unexpected(r1.error()); }
+        { auto r2 = engine.zero(grad_beta_);  if (!r2) return std::unexpected(r2.error()); }
+        return {};
     }
 
     [[nodiscard]] std::vector<TensorRef> parameters() override
@@ -801,18 +813,20 @@ private:
     static constexpr Scalar EPSILON = 1e-5;
 
 public:
-    explicit RMSNorm(ComputeEngine& engine,
-                     std::size_t normalized_shape, Scalar epsilon = EPSILON)
-        : normalized_shape_(normalized_shape), epsilon_(epsilon)
+    explicit RMSNorm(std::size_t normalized_shape, Scalar epsilon = EPSILON)
+        : normalized_shape_(normalized_shape), epsilon_(epsilon) {}
+
+    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
     {
         // gamma 初始化为 1（无 beta）
-        Matrix gamma_cpu(normalized_shape, 1, Scalar{1});
+        Matrix gamma_cpu(normalized_shape_, 1, Scalar{1});
         auto g = engine.from_matrix(gamma_cpu);
-        NN_ASSERT(g, g ? "" : g.error().message.c_str());
+        if (!g) return std::unexpected(g.error());
         gamma_ = std::move(*g);
 
-        grad_gamma_ = engine.create_tensor(normalized_shape, 1);
-        { auto r1 = engine.zero(grad_gamma_); NN_ASSERT(r1, r1 ? "" : r1.error().message.c_str()); }
+        grad_gamma_ = engine.create_tensor(normalized_shape_, 1);
+        { auto r1 = engine.zero(grad_gamma_); if (!r1) return std::unexpected(r1.error()); }
+        return {};
     }
 
     [[nodiscard]] std::vector<TensorRef> parameters() override
@@ -932,13 +946,82 @@ public:
     }
 };
 
+// ══════════════════════════════════════════════════════════════════════════
+// FusedChainLayer — IR-C 演示：begin_expr/end_expr 多表达式链式融合
+//
+// forward 用 begin_expr/end_expr 把"无法写进一行的多步逐元素变换"写成多个
+// 表达式（t、u 为中间量，不逃逸——融合的语义约束）：
+//     t   = x * 2                    (Linear 输入 + 常量)
+//     u   = t + 3                    (消费 t：Linear 引用 → 内联为寄存器)
+//     out = u * gamma                (row 广播参数 (F,1))
+// 引擎在 end_expr 时做融合分析（IR-C，expr_graph.hpp）：三段拼接成单个
+// kernel，中间结果 t/u 留在寄存器（不落显存、不额外 dispatch）。
+//   - GPU：begin_expr 录制 → end_expr 融合 → AOT 融合 shader 匹配 dispatch
+//     （闭合世界：scan_exprs 必须 dry-run 本 Layer 登记融合后的复合 spec）。
+//   - CPU：begin/end 为 no-op，各表达式直接求值（参考实现）。
+//   - scan：NN_EXPR_SCAN 下 end_expr 登记融合后的复合 spec（两端一致）。
+// ══════════════════════════════════════════════════════════════════════════
+class FusedChainLayer final : public Layer
+{
+private:
+    std::size_t features_;
+    Tensor gamma_;   // (F, 1) 按行广播系数
+
+public:
+    FusedChainLayer(std::size_t features) : features_(features) {}
+
+    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    {
+        Matrix g(features_, 1, Scalar{0.5f});  // 演示用固定系数
+        auto g_t = engine.from_matrix(g);
+        if (!g_t) return std::unexpected(g_t.error());
+        gamma_ = std::move(*g_t);
+        return {};
+    }
+
+    [[nodiscard]] Result<Tensor> forward(
+        ComputeEngine& engine, const Tensor& input) override
+    {
+        const std::size_t F = input.rows();
+        const std::size_t B = input.cols();
+
+        auto b = engine.begin_expr();
+        if (!b) return std::unexpected(b.error());
+        auto t = dsl::compute(engine, dsl::leaf(input) * Scalar{2}, F, B);
+        if (!t) return std::unexpected(t.error());
+        auto u = dsl::compute(engine, dsl::leaf(*t) + Scalar{3}, F, B);
+        if (!u) return std::unexpected(u.error());
+        auto out = dsl::compute(engine,
+            dsl::leaf(*u) * dsl::row_broadcast(gamma_), F, B);
+        if (!out) return std::unexpected(out.error());
+        auto e = engine.end_expr();
+        if (!e) return std::unexpected(e.error());
+        return out;
+    }
+
+    // out = ((x*2)+3)*gamma → dout/dx = 2*gamma。
+    // 非 IR-C 演示路径：单表达式直接求值（scan 单独登记，GPU 独立 AOT）。
+    [[nodiscard]] Result<Tensor> backward(
+        ComputeEngine& engine, const Tensor& grad_output) override
+    {
+        const std::size_t F = grad_output.rows();
+        const std::size_t B = grad_output.cols();
+        return dsl::compute(engine,
+            dsl::leaf(grad_output) * dsl::row_broadcast(gamma_) * Scalar{2},
+            F, B);
+    }
+
+    [[nodiscard]] std::vector<TensorRef> parameters() override { return {}; }
+    [[nodiscard]] std::vector<TensorRef> param_gradients() override { return {}; }
+};
+
 // ── 归一化层工厂：按 NormType 创建 LayerNorm 或 RMSNorm ──────────────────
 [[nodiscard]] inline std::unique_ptr<Layer> make_norm_layer(
-    ComputeEngine& engine, std::size_t d_model, NormType norm_type)
+    std::size_t d_model, NormType norm_type)
 {
     if (norm_type == NormType::RMSNorm)
-        return std::make_unique<RMSNorm>(engine, d_model);
-    return std::make_unique<LayerNorm>(engine, d_model);
+        return std::make_unique<RMSNorm>(d_model);
+    return std::make_unique<LayerNorm>(d_model);
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1085,8 +1168,7 @@ private:
     }
 
 public:
-    Conv2D(ComputeEngine& engine,
-           std::size_t in_channels, std::size_t out_channels,
+    Conv2D(std::size_t in_channels, std::size_t out_channels,
            std::size_t kernel, std::size_t stride = 1, std::size_t padding = 0,
            std::size_t in_h = 0, std::size_t in_w = 0)
         : in_channels_(in_channels), out_channels_(out_channels),
@@ -1096,28 +1178,34 @@ public:
         const std::size_t fan_in = in_channels * kernel * kernel;
         out_h_ = (in_h_ + 2 * padding_ - kernel_) / stride_ + 1;
         out_w_ = (in_w_ + 2 * padding_ - kernel_) / stride_ + 1;
+    }
+
+    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    {
+        const std::size_t fan_in = in_channels_ * kernel_ * kernel_;
 
         // 权重 (C_out, C_in*k*k) — He 风格均匀初始化
-        Matrix w_cpu(out_channels, fan_in);
-        const Scalar limit = std::sqrt(6.0 / static_cast<Scalar>(fan_in + out_channels));
+        Matrix w_cpu(out_channels_, fan_in);
+        const Scalar limit = std::sqrt(6.0 / static_cast<Scalar>(fan_in + out_channels_));
         std::uniform_real_distribution<Scalar> dist(-limit, limit);
         auto w_span = w_cpu.span();
         for (std::size_t i = 0; i < w_cpu.size(); ++i)
             w_span[i] = dist(rng_);
 
-        Matrix b_cpu(out_channels, 1);  // 零初始化
+        Matrix b_cpu(out_channels_, 1);  // 零初始化
 
         auto w_res = engine.from_matrix(w_cpu);
-        NN_ASSERT(w_res, w_res ? "" : w_res.error().message.c_str());
+        if (!w_res) return std::unexpected(w_res.error());
         w_ = std::move(*w_res);
         auto b_res = engine.from_matrix(b_cpu);
-        NN_ASSERT(b_res, b_res ? "" : b_res.error().message.c_str());
+        if (!b_res) return std::unexpected(b_res.error());
         b_ = std::move(*b_res);
 
-        grad_w_ = engine.create_tensor(out_channels, fan_in);
-        grad_b_ = engine.create_tensor(out_channels, 1);
-        { auto r1 = engine.zero(grad_w_); NN_ASSERT(r1, r1 ? "" : r1.error().message.c_str()); }
-        { auto r2 = engine.zero(grad_b_); NN_ASSERT(r2, r2 ? "" : r2.error().message.c_str()); }
+        grad_w_ = engine.create_tensor(out_channels_, fan_in);
+        grad_b_ = engine.create_tensor(out_channels_, 1);
+        { auto r1 = engine.zero(grad_w_); if (!r1) return std::unexpected(r1.error()); }
+        { auto r2 = engine.zero(grad_b_); if (!r2) return std::unexpected(r2.error()); }
+        return {};
     }
 
     std::vector<TensorRef> parameters() override { return {w_, b_}; }
@@ -1426,18 +1514,19 @@ private:
     }
 
     // 重建全表 (d_k, seq)：cos/sin 按维度对交错重复
-    void rebuild(ComputeEngine& engine, std::size_t seq)
+    [[nodiscard]] Result<void> rebuild(ComputeEngine& engine, std::size_t seq)
     {
         Matrix c(d_k_, seq), s(d_k_, seq);
         for (std::size_t pos = 0; pos < seq; ++pos)
             fill_pos_column_(c, s, pos, pos);
         auto cr = engine.from_matrix(c);
-        NN_ASSERT(cr, cr ? "" : cr.error().message.c_str());
+        if (!cr) return std::unexpected(cr.error());
         cos_cache_ = std::move(*cr);
         auto sr = engine.from_matrix(s);
-        NN_ASSERT(sr, sr ? "" : sr.error().message.c_str());
+        if (!sr) return std::unexpected(sr.error());
         sin_cache_ = std::move(*sr);
         seq_cached_ = seq;
+        return {};
     }
 
     // 构造 RoPE 内联表达式（forward 用 Add 结尾，backward 用 Sub 结尾）
@@ -1446,10 +1535,12 @@ private:
 
 public:
     RotaryEmbedding() = default;
-    RotaryEmbedding(ComputeEngine& /*engine*/, std::size_t d_k)
+    explicit RotaryEmbedding(std::size_t d_k)
         : d_k_(d_k)
     {
     }
+
+    [[nodiscard]] Result<void> init(ComputeEngine& /*engine*/) { return {}; }
 
     [[nodiscard]] std::size_t d_k() const noexcept { return d_k_; }
 
@@ -1461,7 +1552,10 @@ public:
         if (d_k_ == 0 || d_k_ % 2 != 0)
             return std::unexpected(Error{"RotaryEmbedding::apply: d_k must be positive and even"});
         if (seq != seq_cached_)
-            rebuild(engine, seq);
+        {
+            auto r = rebuild(engine, seq);
+            if (!r) return std::unexpected(r.error());
+        }
         const std::uint32_t dk = static_cast<std::uint32_t>(d_k_);
         // 内联 RoPE 表达式（LLaMA half-swap；backward 为旋转正交，逆 = 反角）：
         //   forward:  out = q·cos + rotate_half(q)·sin
@@ -1604,23 +1698,35 @@ protected:
         std::size_t /*batch*/, std::size_t /*seq*/) {}
 
 public:
-    AttentionBase(ComputeEngine& engine,
-                  std::size_t d_model, std::size_t num_heads,
+    AttentionBase(std::size_t d_model, std::size_t num_heads,
                   std::size_t seq_len = 0,
                   PosEncodingType pos_enc = PosEncodingType::Learned)
         : d_model_(d_model), num_heads_(num_heads),
           d_k_(d_model / num_heads),
           seq_len_(seq_len),
           scale_(Scalar{1} / std::sqrt(static_cast<Scalar>(d_model / num_heads))),
-          w_q_(engine, d_model, d_model),
-          w_k_(engine, d_model, d_model),
-          w_v_(engine, d_model, d_model),
-          w_o_(engine, d_model, d_model),
+          w_q_(d_model, d_model),
+          w_k_(d_model, d_model),
+          w_v_(d_model, d_model),
+          w_o_(d_model, d_model),
           use_rope_(pos_enc == PosEncodingType::RoPE),
-          rope_(engine, d_model / num_heads)
+          rope_(d_model / num_heads)
     {
         NN_ASSERT(d_model % num_heads == 0,
                   "AttentionBase: d_model must be divisible by num_heads");
+    }
+
+    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    {
+        auto r1 = w_q_.init(engine); if (!r1) return std::unexpected(r1.error());
+        auto r2 = w_k_.init(engine); if (!r2) return std::unexpected(r2.error());
+        auto r3 = w_v_.init(engine); if (!r3) return std::unexpected(r3.error());
+        auto r4 = w_o_.init(engine); if (!r4) return std::unexpected(r4.error());
+        if (use_rope_)
+        {
+            auto r5 = rope_.init(engine); if (!r5) return std::unexpected(r5.error());
+        }
+        return {};
     }
 
     std::vector<TensorRef> parameters() override
@@ -2091,10 +2197,9 @@ public:
 class MultiHeadAttention final : public AttentionBase
 {
 public:
-    MultiHeadAttention(ComputeEngine& engine,
-                       std::size_t d_model, std::size_t num_heads,
+    MultiHeadAttention(std::size_t d_model, std::size_t num_heads,
                        std::size_t seq_len = 0)
-        : AttentionBase(engine, d_model, num_heads, seq_len) {}
+        : AttentionBase(d_model, num_heads, seq_len) {}
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -2120,7 +2225,7 @@ private:
     Tensor encoding_cache_;
     std::size_t cached_total_ = 0;
 
-    void rebuild_encoding(ComputeEngine& engine, std::size_t total_len)
+    [[nodiscard]] Result<void> rebuild_encoding(ComputeEngine& engine, std::size_t total_len)
     {
         const std::size_t base_len = (tile_size_ > 0) ? tile_size_ : total_len;
         const std::size_t batch    = (tile_size_ > 0) ? total_len / tile_size_ : 1;
@@ -2154,14 +2259,14 @@ private:
             }
         }
         auto r = engine.from_matrix(enc);
-        NN_ASSERT(r, r ? "" : r.error().message.c_str());
+        if (!r) return std::unexpected(r.error());
         encoding_cache_ = std::move(*r);
         cached_total_ = total_len;
+        return {};
     }
 
 public:
-    PositionalEncoding(ComputeEngine& /*engine*/,
-                       std::size_t d_model, std::size_t max_len = 5000,
+    PositionalEncoding(std::size_t d_model, std::size_t max_len = 5000,
                        std::size_t tile_size = 0)
         : d_model_(d_model), max_len_(max_len), tile_size_(tile_size)
     {
@@ -2179,7 +2284,10 @@ public:
             return std::unexpected(Error{"PE forward: seq_len exceeds max_len"});
 
         if (cached_total_ != total_len)
-            rebuild_encoding(engine, total_len);
+        {
+            auto r = rebuild_encoding(engine, total_len);
+            if (!r) return std::unexpected(r.error());
+        }
 
         return engine.elementwise_binary(BinaryOp::Add, input, encoding_cache_);
     }
@@ -2204,14 +2312,20 @@ private:
     bool use_swiglu_ = false;
 
 public:
-    FeedForward(ComputeEngine& engine,
-                std::size_t d_model, std::size_t d_ff,
+    FeedForward(std::size_t d_model, std::size_t d_ff,
                 ActivationType activation = ActivationType::GeLU)
-        : fc1_(engine, d_model,
+        : fc1_(d_model,
                activation == ActivationType::SwiGLU ? 2 * d_ff : d_ff),
-          fc2_(engine, d_ff, d_model),
+          fc2_(d_ff, d_model),
           swiglu_(d_ff),
           use_swiglu_(activation == ActivationType::SwiGLU) {}
+
+    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    {
+        auto r1 = fc1_.init(engine); if (!r1) return std::unexpected(r1.error());
+        auto r2 = fc2_.init(engine); if (!r2) return std::unexpected(r2.error());
+        return {};
+    }
 
     std::vector<TensorRef> parameters() override
     {
@@ -2311,13 +2425,21 @@ private:
     Tensor residual2_cache_;
 
 public:
-    TransformerEncoderLayer(ComputeEngine& engine,
-                            std::size_t d_model, std::size_t num_heads,
+    TransformerEncoderLayer(std::size_t d_model, std::size_t num_heads,
                             std::size_t d_ff, std::size_t seq_len = 0)
-        : self_attn_(engine, d_model, num_heads, seq_len),
-          norm1_(engine, d_model),
-          ff_(engine, d_model, d_ff),
-          norm2_(engine, d_model) {}
+        : self_attn_(d_model, num_heads, seq_len),
+          norm1_(d_model),
+          ff_(d_model, d_ff),
+          norm2_(d_model) {}
+
+    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    {
+        auto r1 = self_attn_.init(engine); if (!r1) return std::unexpected(r1.error());
+        auto r2 = norm1_.init(engine); if (!r2) return std::unexpected(r2.error());
+        auto r3 = ff_.init(engine); if (!r3) return std::unexpected(r3.error());
+        auto r4 = norm2_.init(engine); if (!r4) return std::unexpected(r4.error());
+        return {};
+    }
 
     std::vector<TensorRef> parameters() override
     {
@@ -2468,24 +2590,32 @@ private:
     Tensor ones_row_;  // (1, num_patches) 全1，用于 backward 池化梯度广播
 
 public:
-    TransformerEncoder(ComputeEngine& engine,
-                       std::size_t d_model, std::size_t num_heads,
+    TransformerEncoder(std::size_t d_model, std::size_t num_heads,
                        std::size_t d_ff, std::size_t num_layers,
                        std::size_t num_patches)
         : d_model_(d_model), num_patches_(num_patches),
           inv_num_patches_(Scalar{1} / static_cast<Scalar>(num_patches)),
           // PE 启用 tiling：每个样本独立使用 (d_model, num_patches) 的编码
-          pos_encoding_(engine, d_model, num_patches, num_patches)
+          pos_encoding_(d_model, num_patches, num_patches)
     {
         // 所有 EncoderLayer 传入 seq_len=num_patches，启用 MHA 批量化路径
         for (std::size_t i = 0; i < num_layers; ++i)
-            layers_.emplace_back(engine, d_model, num_heads, d_ff, num_patches);
+            layers_.emplace_back(d_model, num_heads, d_ff, num_patches);
+    }
 
+    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    {
+        for (auto& layer : layers_)
+        {
+            auto r = layer.init(engine);
+            if (!r) return std::unexpected(r.error());
+        }
         // 预创建 ones_row_ (1, num_patches) 全1，用于 backward 广播
         Matrix ones_cpu(1, num_patches_, Scalar{1});
         auto or_t = engine.from_matrix(ones_cpu);
-        NN_ASSERT(or_t, or_t ? "" : or_t.error().message.c_str());
+        if (!or_t) return std::unexpected(or_t.error());
         ones_row_ = std::move(*or_t);
+        return {};
     }
 
     std::vector<TensorRef> parameters() override
@@ -2612,18 +2742,22 @@ private:
     Tensor input_cache_;
 
 public:
-    PatchEmbedding(ComputeEngine& engine,
-                   std::size_t img_size, std::size_t patch_size,
+    PatchEmbedding(std::size_t img_size, std::size_t patch_size,
                    std::size_t d_model)
         : img_size_(img_size), patch_size_(patch_size),
           grid_size_(img_size / patch_size),
           num_patches_(grid_size_ * grid_size_),
           patch_dim_(patch_size * patch_size),
           d_model_(d_model),
-          projection_(engine, patch_dim_, d_model)
+          projection_(patch_dim_, d_model)
     {
         NN_ASSERT(img_size % patch_size == 0,
                   "PatchEmbedding: img_size must be divisible by patch_size");
+    }
+
+    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    {
+        return projection_.init(engine);
     }
 
     [[nodiscard]] std::size_t num_patches() const noexcept { return num_patches_; }
@@ -2832,20 +2966,21 @@ private:
         }
     }
 
-    void ensure_mask_(ComputeEngine& engine, std::size_t batch, std::size_t seq_len)
+    [[nodiscard]] Result<void> ensure_mask_(ComputeEngine& engine, std::size_t batch, std::size_t seq_len)
     {
         // 用 (batch, seq_len) 作为缓存键
         if (mask_cached_batch_ == batch && mask_cached_seq_ == seq_len)
-            return;
+            return {};
 
         // 纯因果掩码：委托 build_attention_mask（doc_ids 为空）
         auto mask = build_attention_mask(batch, seq_len, num_heads_,
                                          use_alibi_, slopes_);
         auto r = engine.from_matrix(mask);
-        NN_ASSERT(r, r ? "" : r.error().message.c_str());
+        if (!r) return std::unexpected(r.error());
         mask_cache_ = std::move(*r);
         mask_cached_batch_ = batch;
         mask_cached_seq_ = seq_len;
+        return {};
     }
 
 public:
@@ -2879,7 +3014,10 @@ protected:
             if (!mt) return std::unexpected(mt.error());
             return engine.elementwise_binary(BinaryOp::Add, scores, *mt);
         }
-        ensure_mask_(engine, batch, seq);
+        {
+            auto r = ensure_mask_(engine, batch, seq);
+            if (!r) return std::unexpected(r.error());
+        }
         return engine.elementwise_binary(BinaryOp::Add, scores, mask_cache_);
     }
 
@@ -2949,12 +3087,11 @@ protected:
     }
 
 public:
-    CausalSelfAttention(ComputeEngine& engine,
-                       std::size_t d_model, std::size_t num_heads,
+    CausalSelfAttention(std::size_t d_model, std::size_t num_heads,
                        std::size_t /*max_len*/ = 1024,
                        std::size_t seq_len = 0,
                        PosEncodingType pos_enc = PosEncodingType::Learned)
-        : AttentionBase(engine, d_model, num_heads, seq_len, pos_enc),
+        : AttentionBase(d_model, num_heads, seq_len, pos_enc),
           use_alibi_(pos_enc == PosEncodingType::ALiBi)
     {
         if (use_alibi_)
@@ -2988,17 +3125,25 @@ private:
     std::vector<std::size_t> offload_offsets_;   // 各激活在 slab 中的 float 偏移
 
 public:
-    GPTBlock(ComputeEngine& engine,
-             std::size_t d_model, std::size_t num_heads,
+    GPTBlock(std::size_t d_model, std::size_t num_heads,
              std::size_t d_ff, std::size_t max_len = 1024,
              std::size_t seq_len = 0,
              PosEncodingType pos_enc = PosEncodingType::Learned,
              ActivationType activation = ActivationType::GeLU,
              NormType norm_type = NormType::LayerNorm)
-        : self_attn_(engine, d_model, num_heads, max_len, seq_len, pos_enc),
-          norm1_(make_norm_layer(engine, d_model, norm_type)),
-          ff_(engine, d_model, d_ff, activation),
-          norm2_(make_norm_layer(engine, d_model, norm_type)) {}
+        : self_attn_(d_model, num_heads, max_len, seq_len, pos_enc),
+          norm1_(make_norm_layer(d_model, norm_type)),
+          ff_(d_model, d_ff, activation),
+          norm2_(make_norm_layer(d_model, norm_type)) {}
+
+    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    {
+        auto r1 = self_attn_.init(engine); if (!r1) return std::unexpected(r1.error());
+        if (norm1_) { auto r = norm1_->init(engine); if (!r) return std::unexpected(r.error()); }
+        auto r2 = ff_.init(engine); if (!r2) return std::unexpected(r2.error());
+        if (norm2_) { auto r = norm2_->init(engine); if (!r) return std::unexpected(r.error()); }
+        return {};
+    }
 
     std::vector<TensorRef> parameters() override
     {
@@ -3277,6 +3422,9 @@ public:
         ComputeEngine& engine, const Tensor& grad_T,
         std::size_t batch, std::size_t seq) = 0;
 
+    // 初始化（引擎相关操作，如创建张量等）
+    [[nodiscard]] virtual Result<void> init(ComputeEngine& /*engine*/) { return {}; }
+
     [[nodiscard]] virtual std::vector<TensorRef> parameters() { return {}; }
     [[nodiscard]] virtual std::vector<TensorRef> param_gradients() { return {}; }
 };
@@ -3297,20 +3445,21 @@ protected:
     std::size_t pos_indices_seq_ = 0;    // 缓存键：seq_len
 
     // 用给定的位置编码矩阵初始化 pos_emb_（learnable 时额外分配梯度）
-    void init_(ComputeEngine& engine, Matrix&& pe, bool learnable)
+    [[nodiscard]] Result<void> init_(ComputeEngine& engine, Matrix&& pe, bool learnable)
     {
         const std::size_t rows = pe.rows();
         const std::size_t cols = pe.cols();
         learnable_ = learnable;
         auto pe_r = engine.from_matrix(pe);
-        NN_ASSERT(pe_r, pe_r ? "" : pe_r.error().message.c_str());
+        if (!pe_r) return std::unexpected(pe_r.error());
         pos_emb_ = std::move(*pe_r);
         if (learnable_)
         {
             grad_pos_emb_ = engine.create_tensor(rows, cols);
             auto r = engine.zero(grad_pos_emb_);
-            NN_ASSERT(r, r ? "" : r.error().message.c_str());
+            if (!r) return std::unexpected(r.error());
         }
+        return {};
     }
 
     // 确保 pos_indices 缓存有效（batch-major：i = b*seq + t → position=t）
@@ -3395,16 +3544,23 @@ public:
 // 与 token_emb_ 共享同一 rng 序列（保持与旧实现完全一致的可复现性）。
 class LearnedPositionEncoder final : public AdditivePositionEncoder
 {
+    std::size_t d_model_;
+    std::size_t seq_len_;
+    std::mt19937_64* rng_;           // 非拥有指针
+    std::normal_distribution<Scalar>* dist_;  // 非拥有指针
+
 public:
-    LearnedPositionEncoder(ComputeEngine& engine, std::size_t d_model,
-                           std::size_t seq_len,
+    LearnedPositionEncoder(std::size_t d_model, std::size_t seq_len,
                            std::mt19937_64& rng,
                            std::normal_distribution<Scalar>& dist)
+        : d_model_(d_model), seq_len_(seq_len), rng_(&rng), dist_(&dist) {}
+
+    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
     {
-        Matrix pe(seq_len, d_model);
+        Matrix pe(seq_len_, d_model_);
         auto pe_s = pe.span();
-        for (std::size_t i = 0; i < pe.size(); ++i) pe_s[i] = dist(rng);
-        init_(engine, std::move(pe), /*learnable=*/true);
+        for (std::size_t i = 0; i < pe.size(); ++i) pe_s[i] = (*dist_)(*rng_);
+        return init_(engine, std::move(pe), /*learnable=*/true);
     }
 };
 
@@ -3412,20 +3568,25 @@ public:
 //   PE(pos, 2i) = sin(pos/10000^(2i/d)), PE(pos, 2i+1) = cos(...)
 class SinusoidalPositionEncoder final : public AdditivePositionEncoder
 {
+    std::size_t d_model_;
+    std::size_t seq_len_;
+
 public:
-    SinusoidalPositionEncoder(ComputeEngine& engine, std::size_t d_model,
-                              std::size_t seq_len)
+    SinusoidalPositionEncoder(std::size_t d_model, std::size_t seq_len)
+        : d_model_(d_model), seq_len_(seq_len) {}
+
+    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
     {
-        Matrix pe(seq_len, d_model);
+        Matrix pe(seq_len_, d_model_);
         auto pe_s = pe.span();
-        for (std::size_t pos = 0; pos < seq_len; ++pos)
-            for (std::size_t i = 0; i < d_model; ++i)
+        for (std::size_t pos = 0; pos < seq_len_; ++pos)
+            for (std::size_t i = 0; i < d_model_; ++i)
             {
                 Scalar angle = static_cast<Scalar>(pos) /
-                    std::pow(Scalar{10000}, static_cast<Scalar>(2 * (i / 2)) / static_cast<Scalar>(d_model));
-                pe_s[pos * d_model + i] = (i % 2 == 0) ? std::sin(angle) : std::cos(angle);
+                    std::pow(Scalar{10000}, static_cast<Scalar>(2 * (i / 2)) / static_cast<Scalar>(d_model_));
+                pe_s[pos * d_model_ + i] = (i % 2 == 0) ? std::sin(angle) : std::cos(angle);
             }
-        init_(engine, std::move(pe), /*learnable=*/false);
+        return init_(engine, std::move(pe), /*learnable=*/false);
     }
 };
 
@@ -3501,18 +3662,45 @@ private:
     bool activation_offload_ = false;
 
 public:
-    GPTModel(ComputeEngine& engine,
-             std::size_t vocab_size, std::size_t d_model, std::size_t seq_len,
+    GPTModel(std::size_t vocab_size, std::size_t d_model, std::size_t seq_len,
              std::size_t num_heads, std::size_t d_ff, std::size_t num_layers,
              PosEncodingType pos_enc_type = PosEncodingType::Learned,
              ActivationType activation = ActivationType::GeLU,
              NormType norm_type = NormType::LayerNorm)
         : vocab_size_(vocab_size), d_model_(d_model), seq_len_(seq_len),
-          ln_f_(make_norm_layer(engine, d_model, norm_type)),
-          lm_head_(engine, d_model, vocab_size)
+          ln_f_(make_norm_layer(d_model, norm_type)),
+          lm_head_(d_model, vocab_size)
+    {
+        blocks_.reserve(num_layers);
+        for (std::size_t i = 0; i < num_layers; ++i)
+            blocks_.emplace_back(d_model, num_heads, d_ff, seq_len, seq_len,
+                                 pos_enc_type, activation, norm_type);
+
+        // 初始化位置编码器（Learned / Sinusoidal / ALiBi / RoPE）
+        switch (pos_enc_type)
+        {
+            case PosEncodingType::Learned:
+                {
+                    std::mt19937_64 rng{42};
+                    std::normal_distribution<Scalar> dist(0.0, 0.02);
+                    pos_encoder_ = std::make_unique<LearnedPositionEncoder>(
+                        d_model, seq_len, rng, dist);
+                }
+                break;
+            case PosEncodingType::Sinusoidal:
+                pos_encoder_ = std::make_unique<SinusoidalPositionEncoder>(
+                    d_model, seq_len);
+                break;
+            default:  // ALiBi / RoPE：位置信息由注意力层注入
+                pos_encoder_ = std::make_unique<NoPositionEncoder>();
+                break;
+        }
+    }
+
+    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
     {
         // 初始化 token_emb_
-        Matrix te(vocab_size, d_model);
+        Matrix te(vocab_size_, d_model_);
         constexpr Scalar emb_init_std = 0.02;
         std::mt19937_64 rng{42};
         std::normal_distribution<Scalar> dist(0.0, emb_init_std);
@@ -3520,33 +3708,30 @@ public:
         for (std::size_t i = 0; i < te.size(); ++i) te_s[i] = dist(rng);
 
         auto te_r = engine.from_matrix(te);
-        NN_ASSERT(te_r, te_r ? "" : te_r.error().message.c_str());
+        if (!te_r) return std::unexpected(te_r.error());
         token_emb_ = std::move(*te_r);
 
-        grad_token_emb_ = engine.create_tensor(vocab_size, d_model);
-        { auto r1 = engine.zero(grad_token_emb_); NN_ASSERT(r1, r1 ? "" : r1.error().message.c_str()); }
+        grad_token_emb_ = engine.create_tensor(vocab_size_, d_model_);
+        { auto r1 = engine.zero(grad_token_emb_); if (!r1) return std::unexpected(r1.error()); }
 
-        // 初始化位置编码器（Learned / Sinusoidal / ALiBi / RoPE）
-        // 注意：Learned 与 token_emb_ 共享同一 rng，保证与旧实现完全一致的可复现性。
-        switch (pos_enc_type)
+        // 初始化子层
+        if (pos_encoder_)
         {
-            case PosEncodingType::Learned:
-                pos_encoder_ = std::make_unique<LearnedPositionEncoder>(
-                    engine, d_model, seq_len, rng, dist);
-                break;
-            case PosEncodingType::Sinusoidal:
-                pos_encoder_ = std::make_unique<SinusoidalPositionEncoder>(
-                    engine, d_model, seq_len);
-                break;
-            default:  // ALiBi / RoPE：位置信息由注意力层注入
-                pos_encoder_ = std::make_unique<NoPositionEncoder>();
-                break;
+            auto r = pos_encoder_->init(engine);
+            if (!r) return std::unexpected(r.error());
         }
-
-        // GPTBlock 传入 seq_len、pos_enc_type、activation 和 norm_type
-        for (std::size_t i = 0; i < num_layers; ++i)
-            blocks_.emplace_back(engine, d_model, num_heads, d_ff, seq_len, seq_len,
-                                 pos_enc_type, activation, norm_type);
+        for (auto& block : blocks_)
+        {
+            auto r = block.init(engine);
+            if (!r) return std::unexpected(r.error());
+        }
+        if (ln_f_)
+        {
+            auto r = ln_f_->init(engine);
+            if (!r) return std::unexpected(r.error());
+        }
+        { auto r = lm_head_.init(engine); if (!r) return std::unexpected(r.error()); }
+        return {};
     }
 
     std::vector<TensorRef> parameters() override

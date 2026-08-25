@@ -766,6 +766,8 @@ private:
     std::unordered_map<std::string, int> fused_reduce_axis_;
     // 运行时视图参数个数（RowMod/RotateHalf 的 vp push constant 槽数）
     std::unordered_map<std::string, std::uint32_t> fused_view_param_counts_;
+    // 每线程处理元素数（1=标量, 4=vec4；决定 dispatch 宽度缩放）
+    std::unordered_map<std::string, std::uint32_t> fused_vec_width_;
 
     std::unique_ptr<MemoryPool> memory_pool_;
     std::unique_ptr<StagingRing> staging_ring_;
@@ -1312,6 +1314,7 @@ public:
                 fused_pipelines_.emplace(fs.key, std::move(*fp_r));
                 fused_reduce_axis_.emplace(fs.key, fs.reduce_axis);
                 fused_view_param_counts_.emplace(fs.key, fs.view_param_count);
+                fused_vec_width_.emplace(fs.key, fs.vec_width);
             }
         }
 #endif
@@ -3042,7 +3045,8 @@ public:
         std::span<const Scalar> consts,
         std::size_t rows, std::size_t cols,
         bool vector_out = false,
-        std::span<const std::uint32_t> view_params = {})
+        std::span<const std::uint32_t> view_params = {},
+        GpuTensor* output_override = nullptr)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
@@ -3073,13 +3077,30 @@ public:
         const std::uint32_t count = static_cast<std::uint32_t>(rows * cols);
 
         // 1. 分配输出 Tensor（vector_out：归约向量原生形状 (rows,1)/(1,cols)）
+        //    若调用方指定 output_override（IR-C 录制占位 buffer），则复用其
+        //    buffer（形状必须匹配），结果直接写入占位 → Layer 持有的 Tensor
+        //    在 end_expr 后即物化，避免额外拷贝。
         const std::size_t out_rows = (vector_out && raxis == 0) ? rows
                                   : (vector_out && raxis == 1) ? 1 : rows;
         const std::size_t out_cols = (vector_out && raxis == 1) ? cols
                                   : (vector_out && raxis == 0) ? 1 : cols;
-        auto output_res = GpuTensor::create_empty(out_rows, out_cols, *this);
-        if (!output_res) return std::unexpected(output_res.error());
-        GpuTensor output = std::move(*output_res);
+        std::optional<GpuTensor> owned_output;
+        GpuTensor* output_ptr = output_override;
+        if (output_override)
+        {
+            if (output_override->rows() != out_rows || output_override->cols() != out_cols)
+                return std::unexpected(Error{
+                    "run_fused_gpu: output_override shape mismatch (" +
+                    std::to_string(out_rows) + "x" + std::to_string(out_cols) + ")"});
+        }
+        else
+        {
+            auto output_res = GpuTensor::create_empty(out_rows, out_cols, *this);
+            if (!output_res) return std::unexpected(output_res.error());
+            owned_output.emplace(std::move(*output_res));
+            output_ptr = &*owned_output;
+        }
+        GpuTensor output = *output_ptr;
 
         // 2. 分配描述符集（N 输入 + 1 输出）
         auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
@@ -3152,11 +3173,14 @@ public:
         vkCmdPushConstants(cmd, pipeline.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, static_cast<std::uint32_t>(pc.size()), pc.data());
 
-        // dispatch：逐元素 = ceil(count/256)；行归约 = rows 个工作组；列归约 = cols 个工作组
+        // dispatch：逐元素 = ceil(count/(256*vec_width))；行归约 = rows 个工作组；
+        // 列归约(tile) = ceil(cols/256) 个工作组（每工作组 256 列）
+        const std::uint32_t vec_width = fused_vec_width_.count(shader_name)
+            ? fused_vec_width_.at(shader_name) : 1u;
         const std::uint32_t wg_count =
             (raxis == 0) ? static_cast<std::uint32_t>(rows)
-            : (raxis == 1) ? static_cast<std::uint32_t>(cols)
-            : (count + 255) / 256;
+            : (raxis == 1) ? (static_cast<std::uint32_t>(cols) + 255u) / 256u
+            : (count + 256u * vec_width - 1u) / (256u * vec_width);
         vkCmdDispatch(cmd, wg_count, 1, 1);
         record_output_barrier(cmd, output.buffer().impl());
 
