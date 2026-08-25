@@ -4966,6 +4966,85 @@ public:
         Matrix grad_input(seq_len, batch, Scalar{0});
         return engine.from_matrix(grad_input);
     }
+
+    // ── 采样生成（重计算式，无 KV cache） ────────────────────────
+    // 每步把「当前上下文（prompt + 已生成，滑动窗口截断到 seq_len）」
+    // 重新 forward（内部重做压缩 C + 联合注意力），取末位 logits 采样。
+    // 复杂度 O(seq²)（每步 O(seq)），对首个 CLI 接入足够；KV cache 优化留待后续。
+    [[nodiscard]] Result<std::vector<std::size_t>>
+    generate(ComputeEngine& engine,
+             const std::vector<std::size_t>& prompt,
+             std::size_t max_new_tokens,
+             Scalar temperature = 1.0,
+             std::size_t eos_token_id = static_cast<std::size_t>(-1),
+             std::size_t min_new_tokens = 0)
+    {
+        std::vector<std::size_t> context(prompt);
+        std::vector<std::size_t> generated;
+        std::mt19937_64 rng{std::random_device{}()};
+        std::uniform_real_distribution<Scalar> dist(0.0, 1.0);
+
+        for (std::size_t step = 0; step < max_new_tokens; ++step)
+        {
+            // 滑动窗口截断到 seq_len_
+            std::size_t start = 0;
+            if (context.size() > seq_len_) start = context.size() - seq_len_;
+            const std::size_t n = context.size() - start;
+
+            // 输入 (seq_len_, 1)：前 n 个为上下文，其余用 pad_id=0 填充，
+            // 使 forward 始终处理整窗（压缩机/块按固定 seq_len 构建）。
+            Matrix in(seq_len_, 1);
+            for (std::size_t i = 0; i < seq_len_; ++i)
+                in.set_value_unchecked(i, 0,
+                    static_cast<Scalar>((i < n) ? context[start + i] : 0));
+            auto in_t = engine.from_matrix(in);
+            if (!in_t) return std::unexpected(in_t.error());
+            auto logits = forward(engine, *in_t);
+            if (!logits) return std::unexpected(logits.error());
+            auto lm = engine.to_matrix(*logits);
+            if (!lm) return std::unexpected(lm.error());
+
+            // 末位（最后真实位置 n-1）logits
+            std::vector<Scalar> last(vocab_size_);
+            for (std::size_t v = 0; v < vocab_size_; ++v)
+                last[v] = lm->at_unchecked(v, n - 1);
+
+            if (temperature > 0.0 && temperature != 1.0)
+                for (auto& x : last) x /= temperature;
+
+            Scalar max_val = last[0];
+            for (std::size_t v = 1; v < vocab_size_; ++v)
+                max_val = std::max(max_val, last[v]);
+            Scalar sum_exp = 0;
+            for (auto& x : last) { x = std::exp(x - max_val); sum_exp += x; }
+            for (auto& x : last) x /= sum_exp;
+
+            std::size_t next;
+            if (temperature > 0.0)
+            {
+                Scalar r = dist(rng);
+                Scalar cum = 0;
+                next = vocab_size_ - 1;
+                for (std::size_t v = 0; v < vocab_size_; ++v)
+                {
+                    cum += last[v];
+                    if (r <= cum) { next = v; break; }
+                }
+            }
+            else
+            {
+                next = 0;
+                Scalar best = last[0];
+                for (std::size_t v = 1; v < vocab_size_; ++v)
+                    if (last[v] > best) { best = last[v]; next = v; }
+            }
+
+            context.push_back(next);
+            if (step >= min_new_tokens && next == eos_token_id) break;
+            generated.push_back(next);
+        }
+        return generated;
+    }
 };
 
 } // namespace nn

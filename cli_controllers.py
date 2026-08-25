@@ -830,6 +830,13 @@ class GptTrainController(CLIController):
         if "norm" in kwargs:
             args.extend(["--norm", self._format_arg_value(kwargs["norm"])])
         
+        # 模型架构（gpt/zipt AttnZip 记忆压缩）
+        if "model" in kwargs:
+            args.extend(["--model", self._format_arg_value(kwargs["model"])])
+        
+        if "memory_tokens" in kwargs:
+            args.extend(["--memory-tokens", self._format_arg_value(kwargs["memory_tokens"])])
+        
         # 日志和保存间隔
         if "log_interval" in kwargs:
             args.extend(["--log-interval", self._format_arg_value(kwargs["log_interval"])])
