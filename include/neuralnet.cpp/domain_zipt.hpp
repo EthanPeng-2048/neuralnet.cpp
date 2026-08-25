@@ -29,11 +29,12 @@ inline constexpr std::size_t ZIPT_MEMORY_TOKENS = 32;  // M（≪ seq_len，建�
 struct ZiPTConfig {
     std::size_t vocab_size    = GPT_VOCAB_SIZE;
     std::size_t d_model       = GPT_D_MODEL;
-    std::size_t seq_len       = GPT_SEQ_LEN;
+    std::size_t seq_len       = GPT_SEQ_LEN;        // L：总上下文长度（一次 forward 处理的最大长度）
+    std::size_t window        = 0;                  // W：局部窗口（直接注意力；0=默认=seq_len，旧行为 W=L 无压缩）
     std::size_t num_heads     = GPT_NUM_HEADS;
     std::size_t d_ff          = GPT_D_FF;
     std::size_t num_layers    = GPT_NUM_LAYERS;
-    std::size_t memory_tokens = ZIPT_MEMORY_TOKENS;       // M：记忆 token 数（≪ seq_len）
+    std::size_t memory_tokens = ZIPT_MEMORY_TOKENS; // M：记忆 token 数（≪ seq_len）
     PosEncodingType pos_enc   = PosEncodingType::Learned;
     ActivationType activation = ActivationType::GeLU;
     NormType norm_type        = NormType::LayerNorm;
@@ -52,13 +53,17 @@ struct ZiPTConfig {
         return std::unexpected(Error{"ZiPT d_model must be divisible by num_heads"});
     if (cfg.memory_tokens > cfg.seq_len)
         return std::unexpected(Error{"ZiPT memory_tokens must be <= seq_len"});
+    ZiPTConfig c = cfg;
+    if (c.window == 0) c.window = c.seq_len;   // 默认 W=L（旧行为，向后兼容）
+    if (c.window > c.seq_len)
+        return std::unexpected(Error{"ZiPT window must be <= seq_len"});
 
     Model model(engine);
     {
         auto r = model.add<ZiPTModel>(
-            cfg.vocab_size, cfg.d_model, cfg.seq_len,
-            cfg.num_heads, cfg.d_ff, cfg.num_layers, cfg.memory_tokens,
-            cfg.pos_enc, cfg.activation, cfg.norm_type);
+            c.vocab_size, c.d_model, c.seq_len, c.window,
+            c.num_heads, c.d_ff, c.num_layers, c.memory_tokens,
+            c.pos_enc, c.activation, c.norm_type);
         if (!r) return std::unexpected(r.error());
     }
     return model;
@@ -72,8 +77,8 @@ struct ZiPTConfig {
         return std::unexpected(Error{"Invalid ModelSpec type for ZiPT: expected ZiPT"});
 
     auto model = build_zipt_model(engine, ZiPTConfig{
-        spec.vocab_size, spec.d_model, spec.seq_len, spec.num_heads,
-        spec.d_ff, spec.num_layers, spec.memory_tokens,
+        spec.vocab_size, spec.d_model, spec.seq_len, spec.window,
+        spec.num_heads, spec.d_ff, spec.num_layers, spec.memory_tokens,
         spec.pos_encoding, spec.activation, spec.norm_type});
     if (model)
         model->set_spec(spec);
@@ -89,6 +94,7 @@ struct ZiPTConfig {
     std::size_t d_ff,
     std::size_t num_layers,
     std::size_t memory_tokens,
+    std::size_t window = 0,
     PosEncodingType pos_encoding = PosEncodingType::Learned,
     ActivationType activation = ActivationType::GeLU,
     NormType norm_type = NormType::LayerNorm)
@@ -102,6 +108,7 @@ struct ZiPTConfig {
     spec.d_ff           = d_ff;
     spec.num_layers     = num_layers;
     spec.memory_tokens  = memory_tokens;
+    spec.window         = window;
     spec.pos_encoding   = pos_encoding;
     spec.activation     = activation;
     spec.norm_type      = norm_type;

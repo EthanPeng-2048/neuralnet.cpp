@@ -1338,8 +1338,9 @@ class GptTrainTab(TabBase):
         self.norm_type = _make_option_row(p, "归一化层", r,
                                            GPT_NORM_OPTIONS, "layernorm"); r += 1
         self.model_type = _make_option_row(p, "模型架构", r,
-                                            ["gpt", "zipt"], "gpt"); r += 1
+                                            ["gpt", "zipt", "rapt"], "gpt"); r += 1
         self.memory_tokens = _make_entry_row(p, "记忆 token 数 (M)", r, "32"); r += 1
+        self.window = _make_entry_row(p, "局部窗口 (W)", r, "0"); r += 1
         self.model_type.trace_add("write", self._on_model_type_change)
         self._on_model_type_change()
 
@@ -1377,12 +1378,14 @@ class GptTrainTab(TabBase):
                 "device": dev, "data": data, "hyperparameters": args}
 
     def _on_model_type_change(self, *args):
-        """zipt 架构下显示记忆 token 数控件"""
-        w = getattr(self.memory_tokens, "widget", self.memory_tokens)
-        if self.model_type.get() == "zipt":
-            w.grid()
-        else:
-            w.grid_remove()
+        """zipt 架构下显示记忆 token 数/窗口控件"""
+        is_zipt = self.model_type.get() == "zipt"
+        for w in (self.memory_tokens, self.window):
+            w = getattr(w, "widget", w)
+            if is_zipt:
+                w.grid()
+            else:
+                w.grid_remove()
 
     def _on_lr_schedule_change(self, *args):
         """fixed 调度下隐藏 min_lr / warmup / grad_clip"""
@@ -1463,6 +1466,7 @@ class GptTrainTab(TabBase):
         args["norm"] = self.norm_type.get()
         args["model"] = self.model_type.get()
         args.update(_int(self.memory_tokens, "memory_tokens"))
+        args.update(_int(self.window, "window", skip_vals=()))
         # GPU 保护
         args["tdr_retry"] = self.tdr_retry.get()
         args.update(_int(self.max_tdr_retries, "max_tdr_retries"))
