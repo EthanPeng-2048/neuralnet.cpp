@@ -931,13 +931,17 @@ protected:
                                           use_alibi_, slopes_, doc_ids_);
             auto mt = engine.from_matrix(m);
             if (!mt) return std::unexpected(mt.error());
-            return engine.elementwise_binary(BinaryOp::Add, scores, *mt);
+            return dsl::compute(engine,
+                dsl::leaf(scores) + dsl::leaf(*mt),
+                scores.rows(), scores.cols());
         }
         {
             auto r = ensure_mask_(engine, batch, seq);
             if (!r) return std::unexpected(r.error());
         }
-        return engine.elementwise_binary(BinaryOp::Add, scores, mask_cache_);
+        return dsl::compute(engine,
+            dsl::leaf(scores) + dsl::leaf(mask_cache_),
+            scores.rows(), scores.cols());
     }
 
     // 重写两趟式决策：组合式 AttnBias 描述子统一 因果/ALiBi/doc_ids（及其组合），
@@ -1002,7 +1006,9 @@ protected:
         }
         auto bias_t = engine.from_matrix(bias);
         if (!bias_t) return std::unexpected(bias_t.error());
-        return engine.elementwise_binary(BinaryOp::Add, scores, *bias_t);
+        return dsl::compute(engine,
+            dsl::leaf(scores) + dsl::leaf(*bias_t),
+            scores.rows(), scores.cols());
     }
 
 public:

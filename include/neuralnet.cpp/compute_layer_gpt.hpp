@@ -227,7 +227,9 @@ public:
         auto a = self_attn_.forward(engine, *n1);
         if (!a) return a;
 
-        auto r2 = engine.elementwise_binary(BinaryOp::Add, input, *a);
+        auto r2 = dsl::compute(engine,
+            dsl::leaf(input) + dsl::leaf(*a),
+            input.rows(), input.cols());
         if (!r2) return std::unexpected(r2.error());
         Tensor res2 = std::move(*r2);
         if (!checkpoint_mode_)
@@ -239,7 +241,9 @@ public:
         auto f = ff_.forward(engine, *n2);
         if (!f) return f;
 
-        return engine.elementwise_binary(BinaryOp::Add, res2, *f);
+        return dsl::compute(engine,
+            dsl::leaf(res2) + dsl::leaf(*f),
+            res2.rows(), res2.cols());
     }
 
     [[nodiscard]] Result<Tensor> backward(
@@ -257,7 +261,9 @@ public:
         auto b_n2 = norm2_->backward(engine, *grad_ff);
         if (!b_n2) return b_n2;
 
-        auto grad_r1 = engine.elementwise_binary(BinaryOp::Add, grad_output, *b_n2);
+        auto grad_r1 = dsl::compute(engine,
+            dsl::leaf(grad_output) + dsl::leaf(*b_n2),
+            grad_output.rows(), grad_output.cols());
         if (!grad_r1) return std::unexpected(grad_r1.error());
 
         auto b_sa = self_attn_.backward(engine, *grad_r1);
@@ -265,7 +271,9 @@ public:
         auto b_n1 = norm1_->backward(engine, *b_sa);
         if (!b_n1) return b_n1;
 
-        return engine.elementwise_binary(BinaryOp::Add, *grad_r1, *b_n1);
+        return dsl::compute(engine,
+            dsl::leaf(*grad_r1) + dsl::leaf(*b_n1),
+            grad_r1->rows(), grad_r1->cols());
     }
 
     // ── 增量推理（KV cache）──────────────────────────────────────────
@@ -287,7 +295,9 @@ public:
         auto a = self_attn_.forward_step(engine, *n1, k_cache, v_cache, cur_len);
         if (!a) return a;
 
-        auto r2 = engine.elementwise_binary(BinaryOp::Add, x_new, *a);
+        auto r2 = dsl::compute(engine,
+            dsl::leaf(x_new) + dsl::leaf(*a),
+            x_new.rows(), x_new.cols());
         if (!r2) return std::unexpected(r2.error());
 
         auto n2 = norm2_->forward(engine, *r2);
@@ -296,7 +306,9 @@ public:
         auto f = ff_.forward(engine, *n2);
         if (!f) return f;
 
-        return engine.elementwise_binary(BinaryOp::Add, *r2, *f);
+        return dsl::compute(engine,
+            dsl::leaf(*r2) + dsl::leaf(*f),
+            r2->rows(), r2->cols());
     }
 };
 
@@ -410,7 +422,9 @@ public:
         if (!pos_gathered) return std::unexpected(pos_gathered.error());
         auto pos_T = engine.transpose(*pos_gathered);
         if (!pos_T) return std::unexpected(pos_T.error());
-        auto x_with_pos = engine.elementwise_binary(BinaryOp::Add, token_emb_T, *pos_T);
+        auto x_with_pos = dsl::compute(engine,
+            dsl::leaf(token_emb_T) + dsl::leaf(*pos_T),
+            token_emb_T.rows(), token_emb_T.cols());
         if (!x_with_pos) return std::unexpected(x_with_pos.error());
         return std::move(*x_with_pos);
     }
@@ -426,7 +440,9 @@ public:
         if (!pos_emb_g) return std::unexpected(pos_emb_g.error());
         auto pos_T = engine.transpose(*pos_emb_g);
         if (!pos_T) return std::unexpected(pos_T.error());
-        auto x_wp = engine.elementwise_binary(BinaryOp::Add, x, *pos_T);
+        auto x_wp = dsl::compute(engine,
+            dsl::leaf(x) + dsl::leaf(*pos_T),
+            x.rows(), x.cols());
         if (!x_wp) return std::unexpected(x_wp.error());
         return std::move(*x_wp);
     }

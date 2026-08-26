@@ -23,6 +23,8 @@
 
 #include "compute_cpu_engine.hpp"
 #include "compute_layer.hpp"
+#include "compute_loss.hpp"
+#include "compute_optimizer.hpp"
 #include "expr_registry.hpp"
 
 int main(int argc, char* argv[])
@@ -54,6 +56,18 @@ int main(int argc, char* argv[])
         nn::Tensor q1 = nn::Tensor::cpu(dk, 1);      // 增量推理（单位置）
         (void)rope.apply_step(engine, q1, /*pos=*/3, /*backward=*/false);
         (void)rope.apply_step(engine, q1, /*pos=*/3, /*backward=*/true);
+    }
+
+    // ── ReLU forward + backward（DSL 融合，CNN/RAPT 模型使用）────────────────
+    // forward:  max(x, 0)；backward: select(x>0, grad, 0)。
+    // 结构不依赖形状，任取一个 R×C 即可；先 forward 填 input_cache_ 再 backward。
+    {
+        const std::size_t R = 6, C = 9;
+        nn::ReLU relu;
+        nn::Tensor input = nn::Tensor::cpu(R, C);
+        (void)relu.forward(engine, input);
+        nn::Tensor grad = nn::Tensor::cpu(R, C);
+        (void)relu.backward(engine, grad);
     }
 
     // ── SwiGLU backward（grad_gate / grad_up 两条内联表达式）──────────────
@@ -132,6 +146,90 @@ int main(int argc, char* argv[])
         (void)chain.forward(engine, input);
         nn::Tensor grad = nn::Tensor::cpu(F, B);
         (void)chain.backward(engine, grad);
+    }
+
+    // ── ReLULinearAttention forward + backward（RLA 原语组合版逐元素链）──
+    // forward:  Sm=S·mask, S2=Sm·Sm, denom=sqrt(rowsum(S2)+1e-6), out=num/denom
+    // backward: dnum=dO/denom, prod=dO·num, ddenom=-dot/(denom²),
+    //           ddenom2=ddenom/(2·denom), dSm_den=2·Sm·ddenom2, dSm=dSm_num+dSm_den,
+    //           dS=dSm·mask
+    // 结构不依赖形状，任取一个小 d_model/seq 即可。
+    {
+        const std::size_t d_model = 8, heads = 2, seq = 4, batch = 2;
+        nn::ReLULinearAttention attn(d_model, heads, seq, /*causal=*/true,
+                                     nn::PosEncodingType::RoPE);
+        (void)attn.init(engine);
+        nn::Tensor x = nn::Tensor::cpu(d_model, batch * seq);
+        (void)attn.forward(engine, x);                       // 填 cache + 登记 fwd 结构
+        nn::Tensor grad = nn::Tensor::cpu(d_model, batch * seq);
+        (void)attn.backward(engine, grad);                   // 登记 bwd 结构
+    }
+
+    // ── GPTBlock forward + backward（残差相加 A+B）────────────────────────
+    {
+        const std::size_t d_model = 16, heads = 2, d_ff = 32, seq = 4, batch = 2;
+        nn::GPTBlock block(d_model, heads, d_ff, /*max_len=*/1024, /*seq_len=*/seq,
+                           nn::PosEncodingType::Learned, nn::ActivationType::GeLU,
+                           nn::NormType::LayerNorm);
+        (void)block.init(engine);
+        nn::Tensor x = nn::Tensor::cpu(d_model, batch * seq);
+        (void)block.forward(engine, x);
+        nn::Tensor grad = nn::Tensor::cpu(d_model, batch * seq);
+        (void)block.backward(engine, grad);
+    }
+
+    // ── TransformerEncoderLayer forward + backward（残差相加 + 位置编码）──
+    {
+        const std::size_t d_model = 16, heads = 2, d_ff = 32, seq = 4, batch = 2;
+        nn::TransformerEncoderLayer enc(d_model, heads, d_ff, seq);
+        (void)enc.init(engine);
+        nn::Tensor x = nn::Tensor::cpu(d_model, batch * seq);
+        (void)enc.forward(engine, x);
+        nn::Tensor grad = nn::Tensor::cpu(d_model, batch * seq);
+        (void)enc.backward(engine, grad);
+    }
+
+    // ── ZiPTBlock forward + backward（残差相加 + 注意力梯度累加）─────────
+    {
+        const std::size_t d_model = 16, heads = 2, d_ff = 32, win = 4, mem = 2;
+        nn::ZiPTBlock zipt(d_model, heads, d_ff, win, mem,
+                           nn::NormType::LayerNorm, nn::ActivationType::GeLU);
+        (void)zipt.init(engine);
+        nn::Tensor x = nn::Tensor::cpu(d_model, win);
+        (void)zipt.forward(engine, x);
+        nn::Tensor grad = nn::Tensor::cpu(d_model, win);
+        (void)zipt.backward(engine, grad);
+    }
+
+    // ── MSELoss forward（diff = pred-target；diff_sq = diff*diff）────────
+    {
+        const std::size_t R = 8, C = 5;
+        nn::MSELoss mse;
+        nn::Tensor pred = nn::Tensor::cpu(R, C);
+        nn::Tensor target = nn::Tensor::cpu(R, C);
+        (void)mse.forward(engine, pred, target);
+    }
+
+    // ── CrossEntropyLoss 稠密 forward（grad=softmax-target；target*log_sm；
+    //    log_col_sum = log(col_sum)）─────────────────────────────────────
+    {
+        const std::size_t C = 8, B = 5;
+        nn::CrossEntropyLoss ce;
+        nn::Tensor logits = nn::Tensor::cpu(C, B);
+        nn::Tensor target = nn::Tensor::cpu(C, B);
+        (void)ce.forward(engine, logits, target);
+    }
+
+    // ── Adam 优化器 step（g*g、m_hat/denom）+ 梯度裁剪（g*g、acc+col_sum）─
+    {
+        const std::size_t R = 8, C = 5;
+        nn::Tensor p = nn::Tensor::cpu(R, C);
+        nn::Tensor g = nn::Tensor::cpu(R, C);
+        auto opt = nn::create_optimizer("adam", engine,
+                                        std::vector<nn::TensorRef>{p},
+                                        std::vector<nn::TensorRef>{g},
+                                        nn::Scalar{1e-3f});
+        if (opt) { (void)opt->step(); (void)opt->clip_grad_norm(nn::Scalar{1e3f}); }
     }
 
     auto& reg = nn::fused::global_registry();
