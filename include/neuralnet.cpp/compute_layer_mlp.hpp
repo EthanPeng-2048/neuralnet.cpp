@@ -92,6 +92,10 @@ public:
     }
 
     // ── forward: out = W × x + b ──────────────────────────────────────────
+    // 算子融合二期（docs/14 S4）：matmul+bias 改走 dsl::compute（含 matmul 段），
+    // GPU 上经 AOT 融合 shader 单 kernel 完成（matmul 预计算 + 逐元素链），
+    // CPU 上 eval_expr 参考实现（matmul 预计算 + 逐元素链），语义不变。
+    // 形状：W (out, in)，x (in, batch)，b (out,1) 行广播 → 输出 (out, batch)。
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
@@ -102,15 +106,9 @@ public:
         if (!checkpoint_mode_)
             input_cache_ = input;
 
-        // out = W × x
-        auto out = engine.matmul(w_, input, false, false);
-        if (!out) return std::unexpected(out.error());
-
-        // out += b（按行广播加法：out[f][b] += bias[f]）
-        auto r = engine.broadcast_row_inplace(*out, b_, BinaryOp::Add);
-        if (!r) return std::unexpected(r.error());
-
-        return out;
+        return dsl::compute(engine,
+            dsl::matmul(w_, input) + dsl::row_broadcast(b_),
+            w_.rows(), input.cols());
     }
 
     // ── backward: grad_x = W^T × grad_out, 累积 grad_W / grad_b ──────────

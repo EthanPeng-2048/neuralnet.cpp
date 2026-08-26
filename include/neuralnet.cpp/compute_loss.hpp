@@ -151,8 +151,12 @@ private:
         auto col_max = engine.col_reduce_max(logits);
         if (!col_max) return std::unexpected(col_max.error());
 
-        // M5：列式稳定 exp 和（单 kernel 融合，读 logits 一遍，不物化 exp 张量）
-        auto col_sum = engine.col_softmax_denom(logits, *col_max);
+        // S7：denom = Σ_r exp(logits[r][c] - col_max[c]) 用 IR 表达式
+        // （列归约 + ColBroadcast 视图 + exp，单 kernel，不物化 exp 张量）
+        auto col_sum = dsl::compute_reduce(engine,
+            dsl::col_reduce_sum(
+                dsl::exp(dsl::leaf(logits) - dsl::col_broadcast(*col_max))),
+            logits.rows(), logits.cols());
         if (!col_sum) return std::unexpected(col_sum.error());
 
         auto shifted = clone_tensor(engine, logits);
@@ -282,59 +286,84 @@ public:
         return fused_forward_sparse_(engine, logits, labels, loss_mask, vocab_size);
     }
 
-    // ── M5 融合路径实现（单 kernel：col_max + denom + 稠密梯度 + loss_vec） ──
+    // ── M5→S7 融合路径实现（IR 组合：col_max 原语 + denom/loss_vec/grad 表达式）──
+    // 不物化 (classes, total) 全 softmax；与旧 col_softmax_sparse_forward 语义一致：
+    //   col_max  = 列内 max（原语）
+    //   denom    = col_sum(exp(logits - cb(col_max)))          （IR 表达式）
+    //   loss_vec = (rg(logits) - cb(col_max) - log(denom)) * cb(mask)  （IR，(1,total)）
+    //   grad     = (exp/logits 链 - select(Row==cb(labels),1,0)) * cb(mask) * inv（IR）
     [[nodiscard]] Result<Scalar> fused_forward_sparse_(
         ComputeEngine& engine, const Tensor& logits,
         std::span<const std::size_t> labels,
         std::span<const Scalar> loss_mask,
         std::size_t vocab_size)
     {
+        const std::size_t classes = logits.rows();
         const std::size_t total = logits.cols();
 
-        // 1. 上传 labels（(1, total) 浮点打包；vocab_size ≤ 2^24 时可精确表示）
+        // 1. 上传 labels（(1, total) 浮点打包；vocab_size ≤ 2^24 时可精确表示）。
+        //    越界 label 修正为 0（GPU RowGather 无越界守卫，靠 mask 置零无效）
         Matrix labels_m(1, total);
         {
             auto sp = labels_m.span();
             for (std::size_t i = 0; i < total; ++i)
-                sp[i] = static_cast<Scalar>(labels[i]);
+                sp[i] = static_cast<Scalar>(
+                    (labels[i] < vocab_size) ? labels[i] : 0);
         }
         auto labels_t = engine.from_matrix(labels_m);
         if (!labels_t) return std::unexpected(labels_t.error());
 
-        // 2. 上传 mask（可选，(1, total) 0/1）
-        std::optional<Tensor> mask_t;
-        const Tensor* mask_ptr = nullptr;
-        if (!loss_mask.empty())
+        // 2. 有效 mask（总是构造，(1,total) 0/1；含 mask 缺失与 label 越界修正）：
+        //    valid = (loss_mask 空 || mask[i]>=0.5) && labels[i] < vocab_size
+        Matrix mask_m(1, total);
         {
-            Matrix mask_m(1, total);
             auto sp = mask_m.span();
             for (std::size_t i = 0; i < total; ++i)
-                sp[i] = (loss_mask[i] >= Scalar{0.5}) ? Scalar{1} : Scalar{0};
-            auto mt = engine.from_matrix(mask_m);
-            if (!mt) return std::unexpected(mt.error());
-            mask_t = std::move(*mt);
-            mask_ptr = &*mask_t;
+            {
+                const bool masked = !loss_mask.empty() && loss_mask[i] < Scalar{0.5};
+                sp[i] = (!masked && labels[i] < vocab_size) ? Scalar{1} : Scalar{0};
+            }
         }
+        auto mask_t = engine.from_matrix(mask_m);
+        if (!mask_t) return std::unexpected(mask_t.error());
 
-        // 3. num_valid（CPU 直接统计 labels/mask；kernel 内部同样判定）
+        // 3. num_valid（与 mask 判定一致）
         std::size_t num_valid = 0;
         for (std::size_t i = 0; i < total; ++i)
-        {
-            const bool masked = !loss_mask.empty() && loss_mask[i] < Scalar{0.5};
-            if (!masked && labels[i] < vocab_size) ++num_valid;
-        }
+            if (mask_m.span()[i] >= Scalar{0.5}) ++num_valid;
         const Scalar inv_num_valid = (num_valid > 0)
             ? Scalar{1} / static_cast<Scalar>(num_valid) : Scalar{0};
 
-        // 4. 融合 kernel：grad（稠密）+ loss_vec（标签位置 log_softmax）
-        Tensor loss_vec;
-        auto grad = engine.col_softmax_sparse_forward(
-            logits, *labels_t, mask_ptr, vocab_size, inv_num_valid, loss_vec);
+        // 4. col_max → denom（IR）→ loss_vec / grad（IR）
+        auto col_max = engine.col_reduce_max(logits);
+        if (!col_max) return std::unexpected(col_max.error());
+        auto denom = dsl::compute_reduce(engine,
+            dsl::col_reduce_sum(
+                dsl::exp(dsl::leaf(logits) - dsl::col_broadcast(*col_max))),
+            classes, total);
+        if (!denom) return std::unexpected(denom.error());
+        // loss_vec[c] = (logits[label[c]][c] - col_max[c] - log(denom[c])) * mask[c]
+        auto loss_vec = dsl::compute(engine,
+            (dsl::row_gather(logits, *labels_t) - dsl::col_broadcast(*col_max)
+             - dsl::log(dsl::leaf(*denom))) * dsl::col_broadcast(*mask_t),
+            1, total);
+        if (!loss_vec) return std::unexpected(loss_vec.error());
+        // grad[r][c] = (exp(logits-col_max)/denom - [r==label[c]]) * mask[c]
+        auto grad = dsl::compute(engine,
+            (dsl::exp(dsl::leaf(logits) - dsl::col_broadcast(*col_max))
+                / dsl::col_broadcast(*denom)
+             - dsl::select(dsl::row() == dsl::col_broadcast(*labels_t),
+                           Scalar{1}, Scalar{0}))
+            * dsl::col_broadcast(*mask_t),
+            classes, total);
         if (!grad) return std::unexpected(grad.error());
+        // inv_num_valid 是运行时值（依赖 batch 内容），不进表达式（进 key 会
+        // 破坏闭合世界匹配），后置 scale_inplace（语义等价）
+        { auto gs = engine.scale_inplace(*grad, inv_num_valid); if (!gs) return std::unexpected(gs.error()); }
         grad_input_ = std::move(*grad);
 
-        // 5. loss = -(1/num_valid)·Σ loss_vec（无效列 kernel 已置 0）
-        auto total_t = engine.row_reduce_sum(loss_vec);   // (1, total) → (1, 1)
+        // 5. loss = -(1/num_valid)·Σ loss_vec（无效列已乘 0）
+        auto total_t = engine.row_reduce_sum(*loss_vec);   // (1, total) → (1, 1)
         if (!total_t) return std::unexpected(total_t.error());
         auto m = engine.to_matrix(*total_t);
         if (!m) return std::unexpected(m.error());

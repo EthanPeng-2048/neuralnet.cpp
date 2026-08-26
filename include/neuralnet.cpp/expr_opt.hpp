@@ -155,7 +155,8 @@ namespace nn
 [[nodiscard]] inline ExprSpec fold_constants_and_algebra(const ExprSpec& spec)
 {
     ExprSpec out;
-    out.views = spec.views;  // 不变量：views 不变
+    out.views  = spec.views;   // 不变量：views 不变
+    out.matmul = spec.matmul;  // 不变量：matmul 段不变（pass 只优化 instrs/consts）
 
     // 1) 常量池去重（相同值合并，保持出现序）
     std::vector<int> const_remap(spec.consts.size(), -1);
@@ -326,6 +327,7 @@ namespace nn
     out.views   = spec.views;
     out.consts  = spec.consts;
     out.num_regs = spec.num_regs;
+    out.matmul  = spec.matmul;
     out.instrs.reserve(n);
     for (std::size_t i = 0; i < n; ++i)
         if (live_instr[i])
@@ -342,7 +344,8 @@ namespace nn
 [[nodiscard]] inline ExprSpec renumber_registers(const ExprSpec& spec)
 {
     ExprSpec out;
-    out.views = spec.views;
+    out.views  = spec.views;
+    out.matmul = spec.matmul;
 
     // 常量池清理：只保留被引用的（保持出现序）
     std::vector<int> const_remap(spec.consts.size(), -1);
@@ -414,6 +417,7 @@ namespace nn
     ExprSpec out;
     out.views  = spec.views;
     out.consts = spec.consts;
+    out.matmul = spec.matmul;
 
     // key: op(8) + a.kind(8) + a.idx(8) + b.kind(8) + b.idx(8) + c.kind(8) + c.idx(8)
     std::unordered_map<std::uint64_t, std::uint8_t> cse;
@@ -554,6 +558,7 @@ namespace nn
     ExprSpec out;
     out.views  = spec.views;
     out.consts = spec.consts;
+    out.matmul = spec.matmul;
     out.instrs.reserve(n);
     for (std::size_t i = 0; i < n; ++i)
     {

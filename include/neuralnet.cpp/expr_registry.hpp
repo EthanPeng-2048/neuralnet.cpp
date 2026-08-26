@@ -58,13 +58,16 @@ struct ExprRegistry
 
 // ── 二进制序列化（dump/load 共用同一格式）───────────────────────────────
 // 格式（小端，x86/ARM 通用）：
-//   magic "NNEXP" (5B) + version (u8=1)
+//   magic "NNEXP" (5B) + version (u8=2)
 //   count (u32)
 //   每 spec：num_regs(u32)
 //            instrs: count(u32) × {op(u8) dst(u8) a.kind a.idx b.kind b.idx c.kind c.idx}
 //            views:  count(u32) × {kind(u8) negate(u8) param(u32)}
 //            consts: count(u32) × Scalar
-inline constexpr std::uint8_t kExprBinVersion = 1;
+//            matmul: has(u8=0/1)；1 时 {a_input(u8) b_input(u8) transA(u8)
+//                    transB(u8) k(u32)}
+//  v2 起支持 matmul 段（v1 无 matmul，读 v1 等价 has=0）。
+inline constexpr std::uint8_t kExprBinVersion = 2;
 
 [[nodiscard]] inline bool write_registry(const std::string& path,
                                          const ExprRegistry& reg)
@@ -98,6 +101,15 @@ inline constexpr std::uint8_t kExprBinVersion = 1;
         f.write(reinterpret_cast<const char*>(&n), sizeof(n));
         for (const auto& c : s.consts)
             f.write(reinterpret_cast<const char*>(&c), sizeof(c));
+        const std::uint8_t has_mm = s.matmul ? 1 : 0;
+        f.write(reinterpret_cast<const char*>(&has_mm), 1);
+        if (s.matmul)
+        {
+            std::uint8_t mbytes[4] = { s.matmul->a_input, s.matmul->b_input,
+                                       s.matmul->transA, s.matmul->transB };
+            f.write(reinterpret_cast<const char*>(mbytes), sizeof(mbytes));
+            f.write(reinterpret_cast<const char*>(&s.matmul->k), sizeof(s.matmul->k));
+        }
     }
     return static_cast<bool>(f);
 }
@@ -146,6 +158,18 @@ inline constexpr std::uint8_t kExprBinVersion = 1;
         s.consts.resize(n);
         for (auto& c : s.consts)
             f.read(reinterpret_cast<char*>(&c), sizeof(c));
+        std::uint8_t has_mm = 0;
+        f.read(reinterpret_cast<char*>(&has_mm), 1);
+        if (has_mm)
+        {
+            MatmulSpec mm;
+            std::uint8_t mbytes[4];
+            f.read(reinterpret_cast<char*>(mbytes), sizeof(mbytes));
+            mm.a_input = mbytes[0]; mm.b_input = mbytes[1];
+            mm.transA  = mbytes[2]; mm.transB  = mbytes[3];
+            f.read(reinterpret_cast<char*>(&mm.k), sizeof(mm.k));
+            s.matmul = mm;
+        }
         out.add(s);
     }
     return true;

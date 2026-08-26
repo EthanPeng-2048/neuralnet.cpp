@@ -22,8 +22,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -62,7 +64,7 @@ namespace
     return v;
 }
 
-// ExprSpec → 生成头里的聚合初始化（ExprSpec{ instrs, views, consts, num_regs }）
+// ExprSpec → 生成头里的聚合初始化（ExprSpec{ instrs, views, consts, num_regs, matmul }）
 [[nodiscard]] std::string emit_spec(const nn::ExprSpec& spec)
 {
     std::ostringstream o;
@@ -89,9 +91,24 @@ namespace
     for (std::size_t i = 0; i < spec.consts.size(); ++i)
     {
         if (i) o << ",";
-        o << " static_cast<Scalar>(" << spec.consts[i] << ")";
+        const nn::Scalar v = spec.consts[i];
+        // ±inf（掩码屏蔽常量）不能直接流输出（C++ 无 inf 字面量）
+        if (std::isinf(v))
+            o << (v < 0 ? " -std::numeric_limits<Scalar>::infinity()"
+                        : " std::numeric_limits<Scalar>::infinity()");
+        else
+            o << " static_cast<Scalar>(" << v << ")";
     }
-    o << "}, " << spec.num_regs << "u }";
+    o << "}, " << spec.num_regs << "u, \n        std::optional<MatmulSpec>{";
+    if (spec.matmul)
+    {
+        o << "MatmulSpec{" << static_cast<int>(spec.matmul->a_input) << ", "
+          << static_cast<int>(spec.matmul->b_input) << ", "
+          << static_cast<int>(spec.matmul->transA) << ", "
+          << static_cast<int>(spec.matmul->transB) << ", "
+          << spec.matmul->k << "u}";
+    }
+    o << "} }";
     return o.str();
 }
 
@@ -142,7 +159,7 @@ int main(int argc, char* argv[])
     H << "// ═══════════════════════════════════════════════════════════════\n";
     H << "#ifndef NN_FUSED_REGISTRY_HPP\n#define NN_FUSED_REGISTRY_HPP\n";
     H << "#define NN_FUSED_REGISTRY_EMBEDDED\n";
-    H << "#include <cstdint>\n#include <string>\n#include <vector>\n";
+    H << "#include <cstdint>\n#include <limits>\n#include <string>\n#include <vector>\n";
     H << "#include \"neuralnet.cpp/expr_spec.hpp\"\n";
     H << "namespace nn::fused {\n";
     H << "struct FusedShader {\n";
@@ -151,6 +168,7 @@ int main(int argc, char* argv[])
     H << "    const std::uint32_t* spirv;\n";
     H << "    std::size_t spirv_words;\n";
     H << "    int         reduce_axis;   // -1=逐元素, 0=行归约, 1=列归约\n";
+    H << "    int         has_matmul;     // 1=含前置 matmul 段（push constants 多 rows+mm_k）\n";
     H << "    std::uint32_t view_param_count;  // 运行时视图参数个数（RowMod/RotateHalf 的 push constant vp 槽）\n";
     H << "    std::uint32_t vec_width;    // 每线程处理元素数（1=标量, 4=vec4）\n";
     H << "};\n\n";
@@ -165,6 +183,15 @@ int main(int argc, char* argv[])
                          nn::expr_spec_key(spec).c_str());
             continue;
         }
+        if (raxis == 1 && spec.matmul)
+        {
+            // matmul+列归约：batch 分解未实现（注意力只用行归约），保守跳过
+            std::fprintf(stderr, "[skip] matmul+列归约组合暂不支持: %s\n",
+                         nn::expr_spec_key(spec).c_str());
+            continue;
+        }
+        // matmul+归约（S5，注意力结构）：generate_glsl_reduce 支持 Matmul
+        // 操作数（内联点积，不物化 (batch*M,N) 中间矩阵），不再跳过。
         const std::string key = nn::expr_spec_key(spec);
         const std::string comp_path = out_dir + "/fused_" + key + ".comp";
         const std::string spv_path  = out_dir + "/fused_" + key + ".spv";
@@ -216,15 +243,15 @@ int main(int argc, char* argv[])
     for (const auto& spec : reg.specs)
     {
         const int raxis = nn::expr_spec_reduce_axis(spec);
-        if (raxis == -2)
-            continue;  // 与上方跳过保持一致
+        if (raxis == -2 || (raxis == 1 && spec.matmul))
+            continue;  // 与上方跳过保持一致（混合轴 / matmul+列归约）
         const std::string key = nn::expr_spec_key(spec);
         const std::uint32_t vecw =
             (raxis < 0 && nn::glsl_vec4_eligible(spec)) ? 4u : 1u;
         H << "    { \"" << key << "\",\n        " << emit_spec(spec) << ",\n"
           << "        kSpirv_" << key
           << ", sizeof(kSpirv_" << key << ")/sizeof(std::uint32_t), "
-          << raxis << ", "
+          << raxis << ", " << (spec.matmul ? 1 : 0) << ", "
           << nn::expr_spec_runtime_view_param_count(spec) << ", " << vecw << " },\n";
     }
     H << "};\n";

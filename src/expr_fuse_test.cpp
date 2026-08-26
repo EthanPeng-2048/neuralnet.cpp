@@ -86,6 +86,27 @@ int run_fused_chain(CpuEngine& cpu, GpuEngine& gpu)
     std::cout << "[" << (ok_f ? "PASS" : "FAIL") << "] FusedChain forward（begin_expr/end_expr 融合）"
               << "  err=" << std::scientific << std::setprecision(2) << err_f << "\n";
 
+    // P2-12：重复 forward（同结构 → 图级缓存命中），结果应与首次一致，
+    // 验证缓存计划实例化正确绑定新输入张量。
+    Matrix x2(F, B);
+    for (auto& v : x2.span()) v = dist(rng);
+    const Tensor in2 = Tensor::from_matrix(Matrix(x2));
+    auto fc2 = c_cpu.forward(cpu, in2);
+    auto fg2 = c_gpu.forward(gpu, in2);
+    if (!fc2 || !fg2)
+    {
+        std::cerr << "  第二次 FusedChain forward 失败: "
+                  << (fg2 ? fc2.error().message : fg2.error().message) << "\n";
+        return 1;
+    }
+    auto fg2m = gpu.to_matrix(*fg2);
+    if (!fg2m) { std::cerr << "  第二次 forward 结果下载失败\n"; return 1; }
+    const Scalar err_f2 = max_abs_diff(fc2->cpu_matrix(), *fg2m);
+    const bool ok_f2 = err_f2 < 1e-4f;
+    std::cout << "[" << (ok_f2 ? "PASS" : "FAIL")
+              << "] FusedChain forward 重复（P2-12 图级缓存命中）"
+              << "  err=" << std::scientific << std::setprecision(2) << err_f2 << "\n";
+
     // backward：GPU 独立 AOT
     const Tensor gd = Tensor::from_matrix(Matrix(grad));
     auto bc = c_cpu.backward(cpu, gd);
@@ -102,7 +123,7 @@ int run_fused_chain(CpuEngine& cpu, GpuEngine& gpu)
     const bool ok_b = err_b < 1e-4f;
     std::cout << "[" << (ok_b ? "PASS" : "FAIL") << "] FusedChain backward"
               << "  err=" << std::scientific << std::setprecision(2) << err_b << "\n";
-    return (ok_f && ok_b) ? 0 : 1;
+    return (ok_f && ok_f2 && ok_b) ? 0 : 1;
 }
 
 // ── 手写录制：显式 begin_expr/end_expr 链式融合 ────────────────────────

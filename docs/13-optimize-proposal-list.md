@@ -100,12 +100,10 @@
 - **收益**：embedding 梯度累积提速
 - **风险**：低（原语义不变，仍保持非确定例外）
 
-### P1-13 📋 matmul / batched_matmul 代码去重（对话审查 P3）
-- **现状**：`matmul_gpu` 与 `batched_matmul_gpu` 各有 ~200 行重复的 descriptor/cmd/barrier/dispatch 逻辑。
-- **方案**：提取 `dispatch_matmul_generic` 公共 helper（仿 `dispatch_bmm_generic`）。
-- **工作量**：小-中（1-2 天）
-- **收益**：减少重复代码与维护风险
-- **风险**：低
+### P1-13 ✅ matmul / batched_matmul 代码去重（已实现，2026-08-27）
+- **文件**：`backend/compute_vk_backend.hpp`
+- **现状**：提取通用 `dispatch_compute` helper（统一 descriptor/cmd/barrier/bind/push/3D-dispatch/submit 样板），`matmul_gpu`/`batched_matmul_gpu` 及 `dispatch_bmm_generic` 全部复用。原 `matmul_gpu` 与 `batched_matmul_gpu` 各自手写 ~200 行重复的 alloc_desc/barrier/bind/submit 逻辑。
+- **收益**：减少重复代码与维护风险；matmul/batched_matmul 统一走一套录制/屏障约定。
 
 ---
 
@@ -130,13 +128,14 @@
 
 ### P2-05 📋 跨 matmul 融合（matmul + 偏置 + 激活）
 - **现状**：matmul 作硬融合边界，`linear(x) + bias + relu` 需 3 次 kernel dispatch + 2 个中间 Tensor。
-- **方案**：
-  - 在 `ExprSpec` 中引入 `MatmulInstr`（或 `FusedLinear` 原语），表达 `matmul(A, B) + bias + activation`。
-  - 或扩展融合分析：允许 `elementwise → reduce → elementwise` 跨归约融合（将 matmul 结果直接内联进后续逐元素链）。
-  - GPU 端：生成包含 matmul + bias + activation 的单 kernel（利用共享内存分块 + 尾部激活融合）。
-- **工作量**：大（1-2 周）
+- **⛔ 方向约束（定稿 2026-08-27，见 [14-operator-fusion-2.md](./14-operator-fusion-2.md)）**：**不新增手写融合原语**（不做 `FusedLinear` shader），**靠 IR 融合**实现：
+  - `ExprSpec` 增加前置 `MatmulSpec` 段 + `ExprOperandKind::Matmul`，表达 `matmul(A,B)` 作为逐元素链起始寄存器。
+  - `glsl_gen` 从 IR 结构合成"matmul 分块 + 尾逐元素链"的单 kernel（结构驱动，非手写固定 kernel）。
+  - `k`（求和维度）作形状参数不进 key（同 P2-13 形状无关），不同 K 共享一个融合 shader。
+- **路线**：S1 IR 地基 → S2 CPU 正确性 → S3 GLSL 生成 → S4 Layer 迁移 → S5 跨 matmul 链 → S7 删除 M4-M6。详见 `14` 文档 §5。
+- **工作量**：大（随 IR 管线推进；不含手写 kernel）
 - **收益**：GPT forward 每层减少 2+ kernel dispatch + 消除 Linear 输出中间 Tensor（~seq×d_ff × 4B）
-- **风险**：高（需修改 ExprSpec 语义或融合分析核心逻辑）
+- **风险**：中-高（需扩展 `ExprSpec` 形状语义；融合分析跨 matmul 边界）
 
 ### P2-06 📋 多消费者 DAG 融合
 - **现状**：当前融合要求 `A` 只有一个消费者（`A.tail` 必须只有一个下游）。多消费者场景（如注意力中 Q/K/V 共享投影输出）各自成独立 kernel。
@@ -173,10 +172,11 @@
 
 ### P2-10 📋 跨 kernel 自动融合（对话 G2/L3，消除手工 begin_expr/end_expr）
 - **现状**：只有演示层 `FusedChainLayer` 手工标记，真实 Layer 全部独立 dispatch——IR 融合收益几乎为零。
-- **方案**：`eval_expr` 内部自动维护"融合窗口"——相邻可融合表达式自动并入；遇不兼容（matmul/归约边界）自动关窗。Layer 无感知。
+- **方案**：`eval_expr` 内部自动维护"融合窗口"——相邻可融合表达式自动并入；遇不兼容（matmul/归约边界）自动关窗。Layer 无感知。占位 Tensor 被非 DSL 原语消费时集中式 `flush_auto_window_if_needed` 物化（`NN_AUTO_FUSION=0` 可禁用回退）。详见 [14-operator-fusion-2.md](./14-operator-fusion-2.md) §4（阶段 S6）。
+- **前置依赖**：S3（matmul GLSL 生成）之后推进；与 P2-12 图级缓存叠加。
 - **工作量**：中-大（1 周）
 - **收益**：让 IR 融合真正覆盖实际 Layer，是收敛专用融合算子的前提
-- **风险**：中-高（正确性敏感）
+- **风险**：中-高（占位 Tensor 漏检 → 静默错；集中式检查 + 逐 Layer gradcheck + 开关缓解）
 
 ### P2-11 📋 融合成本/收益启发式（对话 G4）
 - **现状**：纯按节点序贪心，超限即放弃。
@@ -185,12 +185,12 @@
 - **收益**：融合决策更优
 - **风险**：低（需保证确定性）
 
-### P2-12 📋 图级缓存跨 step 复用（对话 G5）
-- **现状**：训练每 step 表达式结构高度重复，却每 step 重跑融合分析 + canonicalize + key 计算。
-- **方案**：整图 key（FNV 哈希）→ 缓存"节点序列→kernel 计划"，命中直接复用。
-- **工作量**：中（3-5 天）
-- **收益**：训练热路径消除重复 CPU 融合分析开销
-- **风险**：中（key 须覆盖全部语义含视图 param）
+### P2-12 ✅ 图级缓存跨 step 复用（已实现，2026-08-27）
+- **文件**：`expr_graph.hpp`（`graph_cache_key`/`plan_from_kernel`/`instantiate_plan` + `fused::graph_plan_cache`）、`compute_gpu_engine.hpp`（`execute_fused_graph` 接入）
+- **现状**：训练每 step 表达式结构高度重复，却每 step 重跑 `fuse_expr_graph` + 拼接 canonicalize + validate + key 计算。
+- **方案**：整图结构 key（FNV-1a，覆盖节点 canonical key + 形状 + vector_out + 依赖拓扑）→ 缓存"kernel 计划"（结构，不含运行时张量）。命中后 `instantiate_plan` 绑定当前图 node_outputs 与外部输入槽，跳过全部融合分析。thread_local 隔离（D3 一致），容量上限 512。
+- **验证**：`expr_fuse_test` 新增"重复 forward（缓存命中）"用例（err=0）；`expr_graph_test`/`expr_fuse_test`/`fused_gpu_test`/`matmul_fusion_test`/全量 ctest 28/28 通过。
+- **收益**：训练热路径消除重复 CPU 融合分析开销；不改变融合决策或数值（确定性铁律 8 保持）。
 
 ### P2-13 📋 视图组合化简（对话 G6）
 - **现状**：RotateHalf/RowMod 是运行时 param（不进 key），组合视图会重复物化。
@@ -435,14 +435,22 @@
 
 ## 7. 算法与模型扩展
 
-### P7-01 📋 注意力形态升级（Flash-Attention）
+### P7-01 🔮 注意力形态升级（Flash-Attention 效果，经融合算子实现）
 - **现状**：M6 两趟式注意力消除了 `seq²` 物化，但仍用多 kernel dispatch（`batched_matmul_reduce` → `denom` → `apply`）。
-- **方案**：参考 FlashAttention 算法——将 matmul + softmax + matmul 融合为单 kernel，利用 SRAM tiling 消除所有中间矩阵。
-- **工作量**：大（2-3 周，需重写注意力 GPU kernel）
+- **⛔ 硬约束（红线）**：**不得手写 flash-attn 专用 kernel**。与项目铁律一致（docs/09 §0.3：引擎只提供 op-level 原语、绝不出现 `attention`/`softmax` 命名的接口；docs/10 §1.4：不手写 flash-attention 类融合 kernel，沿用自动融合/算子生成路径）。Flash-Attention 的 SRAM tiling 收益必须**由融合算子管线表达**：
+  - 把 `matmul → 归约(max/denom) → 广播(减/除) → matmul` 作为**跨算子融合结构**（P2-05 跨 matmul 融合 + P2-09 归约→广播→逐元素链融合的组合），由 `ExprSpec`/图 IR 表达，`glsl_gen` 从结构生成 tile 化 kernel。
+  - 引擎/工具只认"结构"（`reduce(matmul(A,B))`、`matmul(softmax_denom, V)`），不认"算法名"。
+  - 正确性验证沿用现有 `attn_gradcheck` / `gpt_gradcheck` 渠道（不引入独立 flash kernel 的专属验证）。
+- **方案**：
+  1. **前置依赖**：P2-10（跨 kernel 自动融合）先落地，让真实 Attention Layer 的 begin_expr 段无感覆盖；P2-05（跨 matmul 融合，ExprSpec 引入 `MatmulInstr` 或 `FusedLinear`）提供 matmul 参与融合的承载。
+  2. 融合分析扩展：允许 `elementwise → reduce → elementwise → matmul` 跨归约/跨 matmul 链融合（kernel 内共享内存 tile 保留中间行块）。
+  3. `glsl_gen` 生成"单 kernel 内分 tile 流式"结构（行块 max/denom 在共享内存、逐 tile 累加 O），等价于 FlashAttention 的 online-softmax 结构，但来源是 IR 结构而非手写算法。
+  4. backward 同理（依赖 M6 已有的 `batched_matmul_softmax_backward_q/kv` 结构被融合分析覆盖）。
+- **工作量**：大（2-3 周，随 P2-05/P2-10 管线推进；**不含**手写 kernel）
 - **收益**：
-  - 显存 O(seq) vs 当前 O(seq)（M6 已消除 seq²，但多 kernel 仍有开销）
+  - 显存 O(seq)（M6 已消除 seq²，融合后进一步消除多 kernel 中间行块落显存）
   - 速度 ~1.5-2×（减少 kernel dispatch + 重访 Q/K/V 的 HBM 读写）
-- **风险**：高（正确性验证复杂、backward 更难实现）
+- **风险**：中-高（融合分析跨 matmul/归约边界复杂度高；正确性经 gradcheck 回归）
 
 ### P7-02 📋 KV Cache 优化（推理）
 - **现状**：`forward_step` 已支持增量推理（逐 token 写 cache），但 cache 复制/管理可能有冗余。
@@ -565,7 +573,7 @@
 
 | 编号 | 方案 | 工作量 | 收益 |
 |------|------|--------|------|
-| P7-01 | Flash-Attention | 2-3 周 | 注意力速度 + 显存 |
+| P7-01 | Flash-Attention（效果，经融合算子实现，**不手写**） | 2-3 周 | 注意力速度 + 显存 |
 | P7-03 | 分布式训练 | 2-4 周 | 多卡扩展 |
 | P4-04 | 8-bit Adam | 1 周 | 优化器显存 7.4→2 GB |
 | P7-02 | PagedAttention / GQA | 1-3 周 | 推理扩展 |
@@ -583,36 +591,55 @@
 ## 9.5 本对话（2026-08-26）新增优化汇总
 
 > 由 GPU 后端缺陷审查 + IR 中间张量消除设计 + 进阶 IR/并发/算子优化讨论整理而成。
+>
+> **⚠ 代码验证结论（2026-08-27）**：文档中标记为"已完成"的条目经代码检查，以下项**并未实现**，状态已修正。
 
-### ✅ 本次已完成
+### ✅ 代码中已实现
 
-| 编号 | 项 | 状态 |
-|------|-----|------|
-| D1 | GpuBuffer 延迟销毁 buffer 内存重叠（规范违规）修复 | ✅ 已修（内存归还延迟到 vkDestroyBuffer 之后） |
-| D2 | scatter_add CAS 原子加非确定性 | ✅ 已文档化为例外（docs/08 坑 19，不修复） |
-| D3 | node_outputs_ 跨线程共享数据竞争 | ✅ 已修（录制图改 thread_local unique_ptr） |
-| P1 | IR 融合中间节点占位 buffer 显存消除 | ✅ 已实现（execute_fused_graph 释放被融合节点 buffer） |
-| P2 | from_matrix 批内免强制 flush | ✅ 已实现（上传新建 buffer 独立提交先于 batch） |
+| 编号 | 项 | 代码位置 | 证据 |
+|------|-----|----------|------|
+| D1 | GpuBuffer 延迟销毁 buffer 内存重叠修复 | `backend/compute_vk_backend.hpp` | 内存归还延迟到 `vkDestroyBuffer` 之后 |
+| D3 | node_outputs_ 跨线程共享数据竞争修复 | `compute_gpu_engine.hpp` | D3 修复：`thread_local unique_ptr<ExprGraph>` + `node_outputs` 随图隔离 |
+| P1 | IR 融合中间节点占位 buffer 显存消除 | `compute_gpu_engine.hpp:execute_fused_graph` | 释放被融合节点的占位 buffer |
+| P2 | from_matrix 批内免强制 flush | `compute_gpu_engine.hpp` | 新建 buffer 独立上传提交，不强制 `end_batch` |
+| **P1-10** | **matmul tile 调优** | `core_config.hpp:20` | `BLOCK_SIZE = 64` 硬编码，`b_block ≤ 64KB` |
+| **P1-11** | **共享内存两级归约** | `expr_glsl_gen.hpp:generate_glsl_reduce` | `subgroupAdd`/`subgroupMax` 替代 shared 树归约 |
+| **P2-09** | **归约→广播→逐元素链融合** | `expr_spec.hpp:127-133` + `compute_layer.hpp` | 归约视图 + `glsl_gen::generate_glsl_reduce` + LayerNorm/Softmax DSL 化 |
+| **P2-13** | **视图组合化简** | `expr_spec.hpp:195-205` | RowMod/RotateHalf 的 `param` 不进 `expr_spec_key` |
+| P2-14 | 冗余 broadcast/逐元素原语收敛 DSL | `compute_layer_mlp.hpp` | GeLU 已 DSL 化；其余 Layer 逐步迁移中 |
+| **P1-13** | **matmul / batched_matmul 代码去重** | `backend/compute_vk_backend.hpp` | 提取通用 `dispatch_compute` helper（3D dispatch），matmul/batched_matmul/bmm 统一复用，消除 ~200 行重复样板 |
+| **P2-12** | **图级缓存跨 step 复用** | `expr_graph.hpp` + `compute_gpu_engine.hpp` | 整图结构 key（FNV-1a）→ kernel 计划缓存；训练热路径命中后跳过融合分析/拼接 canonicalize/validate/key 计算；`expr_fuse_test` 覆盖缓存命中路径（err=0） |
+
+### 📋 代码中**未实现**（需修正）
+
+| 编号 | 原标记 | 实际状态 | 说明 |
+|------|--------|----------|------|
+| P1-06 | ✅ | 📋 | 归约 shader CSE 未实现 |
+| P1-12 | 📋 | ❌ | scatter_add 仍用 CAS 循环（`scatter_add.comp:50-62`），非原生 float atomic |
+| P2-07 | 📋 | ❌ | ExprSpec 上限硬编码（`EXPR_MAX_INPUTS=8` 等），无动态化 |
+| P2-10 | ✅ | 📋 | 跨 kernel 自动融合未实现（仅 `FusedChainLayer` 手工录制） |
+| P2-15 | ✅ | ❌ | `fuse_expr_graph` 是单线程，无并行化 |
+| P2-16 | ✅ | ❌ | 无双缓冲 command buffer 流水化 |
+| P2-17 | ✅ | ❌ | 无多线程数据并行 IR（单队列串行提交） |
+| P2-18 | ✅ | ❌ | `MemoryPool` 有 `mutex_` 但高并发下成瓶颈，无 per-thread 缓存 |
+| P2-19 | ✅ | ❌ | 无并发确定性保证测试 |
 
 ### 📋 待做（按优先级）
 
 | 优先级 | 编号 | 方案 | 工作量 |
 |--------|------|------|--------|
-| P0 | P2-10 | 跨 kernel 自动融合（消除手工 begin_expr） | 1 周 |
-| P0 | P2-09 | 归约→广播→逐元素链融合 | 1 周 |
-| P1 | P1-10 | matmul tile 调优 | 1-2 天 |
-| P1 | P1-11 | 共享内存两级归约 | 3-5 天 |
-| P1 | P2-15 | 融合分析并行化 | 2-3 天 |
-| P1 | P2-16 | 双缓冲 command buffer 流水化 | 3-5 天 |
-| P2 | P2-11 | 融合成本/收益启发式 | 3-5 天 |
-| P2 | P2-12 | 图级缓存跨 step 复用 | 3-5 天 |
-| P2 | P2-13 | 视图组合化简 | 1-2 天 |
-| P2 | P2-14 | 冗余原语收敛 DSL | 中 |
-| P2 | P1-12 | scatter_add 原子优化 | 1 天 |
-| P2 | P1-13 | matmul 代码去重 | 1-2 天 |
-| P3 | P2-17 | 多线程数据并行 IR | 2-3 周 |
-| P3 | P2-18 | 内存池并发安全 | 3-5 天 |
-| P3 | P2-19 | 并发确定性保证 | 1-2 天 |
+| P0 | **P2-10** | **跨 kernel 自动融合（消除手工 begin_expr）** | **1 周** |
+| P1 | **P1-06** | **归约 shader 公共子表达式消除** | **2-3 天** |
+| P1 | **P2-11** | **融合成本/收益启发式** | **3-5 天** |
+| P1 | **P1-12** | **scatter_add 原子优化**（原生 float atomic 或分桶） | **1 天** |
+| P1 | **P2-15** | **融合分析并行化**（P2-12 落地后优先级已降） | **2-3 天** |
+| P1 | **P2-16** | **双缓冲 command buffer 流水化** | **3-5 天** |
+| P2 | **P2-07** | **ExprSpec 上限动态化** | **3-5 天** |
+| P2 | **P2-14** | **冗余 broadcast/逐元素原语收敛 DSL** | **中** |
+| P2 | **P2-17** | **多线程数据并行 IR** | **2-3 周** |
+| P2 | **P2-18** | **内存池并发安全** | **3-5 天** |
+| P2 | **P2-19** | **并发确定性保证** | **1-2 天** |
+| P3 | **P1-11** | **共享内存两级归约** | **3-5 天** |
 
 ---
 
@@ -644,6 +671,8 @@
 | D3 | node_outputs_ 线程安全修复 | 2026-08-26 | `compute_gpu_engine.hpp`, `compute_cpu_engine.hpp`, `expr_graph.hpp` |
 | P1 | IR 融合中间节点 buffer 显存消除 | 2026-08-26 | `compute_gpu_engine.hpp` |
 | P2 | from_matrix 批内免 flush | 2026-08-26 | `compute_gpu_engine.hpp` |
+| P1-13 | matmul/batched_matmul 代码去重（dispatch_compute 统一） | 2026-08-27 | `backend/compute_vk_backend.hpp` |
+| P2-12 | 图级缓存跨 step 复用 | 2026-08-27 | `expr_graph.hpp`, `compute_gpu_engine.hpp` |
 | D2 | scatter_add 非确定性文档化例外 | 2026-08-26 | `shaders/scatter_add.comp`, `docs/08` |
 
 ---

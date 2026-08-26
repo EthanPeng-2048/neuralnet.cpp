@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -98,6 +99,20 @@ enum class ExprOperandKind : uint8_t
     Fanout = 3,  // 引用前驱结果寄存器（语义同 Reg，显式表达 fanout 语义）
     // ── 新增：引用一个"行/列归约结果"，自动按行或按列广播 ──
     Reduce = 4,  // 引用某归约指令 dst（idx 指向归约指令的目标寄存器号）
+    // ── 新增：引用前置 matmul 段（MatmulSpec）的输出 ──
+    // 语义：等价于把 matmul 输出 C(r,c) = Σ_k opA(r,k)*opB(k,c) 当作一个
+    // "虚拟输入寄存器"，按当前输出网格 (r,c) 读取（MatmulSpec 结构见下）。
+    // idx 恒为 0（一个 spec 至多一个 matmul 段）。
+    Matmul = 5,
+    // ── 新增：网格索引操作数（位置相关掩码/偏置，S7）──
+    // 把当前输出元素的行/列/批次下标作为标量值参与算术（uint → float）。
+    //   Row   = 输出元素在 batch 内的行号（batched 网格 r % m_per；非 batched = r）
+    //   Col   = 输出列号 c
+    //   Batch = 批次下标（batched matmul 段网格的 batch 维；无 matmul 段 = 0）
+    // 用于 causal 掩码 select(Col > Row, -inf, 0)、ALiBi -slope*(Row-Col) 等。
+    Row   = 6,
+    Col   = 7,
+    Batch = 8,
 };
 
 // 操作数：2 字节（kind + idx），指令布局紧凑、可序列化、未来可入 push constant
@@ -131,6 +146,18 @@ enum class ExprViewKind : uint8_t
     // ── 新增：广播视图（输入本身已是 (rows,1)/(1,cols) 小向量，按行/列广播）──
     RowBroadcast = 7,  // 输入 (rows, 1)：读 b[r]（gamma/beta 等逐行参数）
     ColBroadcast = 8,  // 输入 (1, cols)：读 b[c]（std_inv 等逐列统计量）
+    // ── 新增（S7）：标签行收集 / 按批次索引 / 按批次列切片 ──
+    // RowGather = 9：读取 data[uint(labels[col]) * cols + col]，其中 labels
+    //   是 param 指向的输入槽（(1, cols) 浮点打包的类别索引）。用于稀疏
+    //   交叉熵的标签位置 log_softmax：logits[label[c]][c]。
+    // BatchMod = 10：读取 data[uint(batch) % param]（param = 取模数）。
+    //   用于按批次索引的小向量（如 ALiBi 按头斜率 slopes[head]，
+    //   head = batch % num_heads）。
+    // BatchCol = 11：读取 data[uint(batch) * param + col]（param = 每批列数，
+    //   输入 (1, batch*param)，如 doc_ids (1, batch*seq) 按 (batch, col) 切片）。
+    RowGather = 9,
+    BatchMod  = 10,
+    BatchCol  = 11,
 };
 
 // ── 归约视图辅助（引擎/校验共用）──────────────────────────────────────
@@ -170,11 +197,47 @@ struct ExprInstr
     friend bool operator==(const ExprInstr&, const ExprInstr&) = default;
 };
 
+// ── 前置 matmul 段（算子融合二期 S1：matmul 参与 IR 融合）─────────────────
+// 可选的 matmul 段（位于逐元素指令之前），表达 C(rows,cols) = op(A,B) 作为
+// 逐元素链的起始"虚拟寄存器 0"：
+//   C[r][c] = Σ_{k<mm_k} opA(r,k) * opB(k,c)
+// 逐元素链经 ExprOperandKind::Matmul 操作数按 (r,c) 读取该结果。
+//
+// 形状语义（对"所有输入同形状"假设的定向放宽，见 docs/14 §3.1）：
+//   - a_input/b_input 指向的两个输入按 matmul 语义解释：
+//       A 存储 (ar, ac)：transA=0 → 逻辑 (M, K)（M=ar, K=ac）
+//                         transA=1 → 存储 (K, M)（K=ar, M=ac，按 A^T 使用）
+//       B 存储 (br, bc)：transB=0 → 逻辑 (K, N)（K=br, N=bc）
+//                         transB=1 → 存储 (N, K)（N=br, K=bc，按 B^T 使用）
+//     输出网格 (M, N) = 逐元素输出网格 (rows, cols)。
+//   - 其余逐元素输入的视图/形状仍要求 (M, N)（如 bias、残差）。
+//   - k（求和维度）是**形状参数**：不进 expr_spec_key（同结构不同 K 共享
+//     一个融合 shader），运行时作为 push constant 填充。
+//   - transA/transB/a_input/b_input 是**结构**：进 expr_spec_key。
+//   - batch（S7）：批量数，A/B 按 batch 垂直切分为连续行块（与
+//     batched_matmul 原语同布局），输出网格 (batch*M, N)；
+//     **形状参数**：不进 key（同结构不同 batch 共享一个融合 shader），
+//     运行时作为 push constant 填充，dispatch 的 z 维 = batch。
+struct MatmulSpec
+{
+    std::uint8_t a_input = 0;  // A 是第几个输入（0-based，指向 views/inputs）
+    std::uint8_t b_input = 0;  // B 是第几个输入
+    std::uint8_t transA  = 0;  // 1 = A 存储为 (K, M)，按 A^T 使用
+    std::uint8_t transB  = 0;  // 1 = B 存储为 (N, K)，按 B^T 使用
+    std::uint32_t k      = 0;  // 求和维度（形状参数，运行时 push constant）
+    std::uint32_t batch  = 1;  // 批量数（形状参数，运行时 push constant）
+
+    friend bool operator==(const MatmulSpec&, const MatmulSpec&) = default;
+};
+
 // ── 表达式规格（运行时可序列化，跨后端）─────────────────────────────────
 // 语义：
 //   - 所有输入 Tensor 同形状 (rows, cols)，views[i] 与 inputs[i] 一一对应
 //   - 顺序执行 instrs，每指令结果写入 regs[dst]（寄存器数组 num_regs 个）
 //   - 输出 = instrs.back().dst 寄存器的值，逐元素写入 (rows, cols) 输出
+//   - matmul 段（可选）：若存在，先计算 C = op(A,B)（输出网格 (rows,cols)），
+//     逐元素链经 Matmul 操作数读取（matmul 不消耗逐元素寄存器）；
+//     instrs 可为空（输出 = matmul 结果本身）。
 // 上限（校验保证，亦约束 GPU 路径资源）：
 //   - 指令 ≤ 64，寄存器 ≤ 16，输入 ≤ 8，常量 ≤ 16
 struct ExprSpec
@@ -183,7 +246,32 @@ struct ExprSpec
     std::vector<ExprView>       views;   // 与 inputs 一一对应
     std::vector<Scalar>         consts;
     std::uint32_t               num_regs = 0;
+    std::optional<MatmulSpec>   matmul;  // 前置 matmul 段（可选；缺省=无）
 };
+
+// ── matmul 段辅助（引擎/校验/生成器共用）──────────────────────────────
+[[nodiscard]] inline bool expr_spec_has_matmul(const ExprSpec& s) noexcept
+{ return s.matmul.has_value(); }
+// 运行时 matmul 形状参数（k：求和维度；batch：批量数）。形状无关融合：
+// k/batch 不进 key，作为 push constant 运行时填充（同 P2-13 的
+// RowMod/RotateHalf 处理）。
+[[nodiscard]] inline std::optional<std::uint32_t> expr_spec_runtime_matmul_k(
+    const ExprSpec& s) noexcept
+{
+    return s.matmul ? std::optional<std::uint32_t>{s.matmul->k} : std::nullopt;
+}
+[[nodiscard]] inline std::uint32_t expr_spec_runtime_matmul_batch(
+    const ExprSpec& s) noexcept
+{
+    return s.matmul ? s.matmul->batch : 1u;
+}
+// batched 网格的"每 batch 行数"（M）：rows 为输出总行（batch*M）
+[[nodiscard]] inline std::size_t expr_spec_rows_per_batch(const ExprSpec& s,
+                                                          std::size_t rows) noexcept
+{
+    const std::uint32_t b = expr_spec_runtime_matmul_batch(s);
+    return (b > 0 && rows % b == 0) ? rows / b : rows;
+}
 
 // ── 运行时视图参数（形状无关融合的关键）───────────────────────────────
 // RowMod（周期）与 RotateHalf（块大小）的 param 是**运行时形状数据**（如
@@ -243,12 +331,13 @@ struct ExprSpec
 }
 
 // ── 表达式规格相等比较（GPU AOT 匹配用）────────────────────────────────
-// 两个 ExprSpec 相等 ⟺ 指令序列、输入视图、常量池、寄存器数全部一致。
+// 两个 ExprSpec 相等 ⟺ 指令序列、输入视图、常量池、寄存器数、matmul 段全部一致。
 // 用于运行时 eval_expr 判断"该表达式是否有预生成融合 shader"。
 [[nodiscard]] inline bool expr_spec_equal(const ExprSpec& a, const ExprSpec& b)
 {
     return a.instrs == b.instrs && a.views == b.views &&
-           a.consts == b.consts && a.num_regs == b.num_regs;
+           a.consts == b.consts && a.num_regs == b.num_regs &&
+           a.matmul == b.matmul;
 }
 
 // ── 规范结构 key（AOT 收集/匹配的单一依据）──────────────────────────────
@@ -298,6 +387,17 @@ struct ExprSpec
     feed_u32(static_cast<std::uint32_t>(s.consts.size()));
     for (const auto& c : s.consts)
         feed(&c, sizeof(c));
+    // matmul 段（可选）：transA/transB/a_input/b_input 是**结构** → 进 key；
+    // k（求和维度）是**形状参数** → 不进 key（同 RowMod/RotateHalf 的 param
+    // 处理）：同结构不同 K 共享一个融合 shader（glsl_gen 把 k 作为 push
+    // constant 读取，dispatch 时按实际 spec 填充）。
+    if (s.matmul)
+    {
+        feed(&s.matmul->a_input, 1);
+        feed(&s.matmul->b_input, 1);
+        feed(&s.matmul->transA, 1);
+        feed(&s.matmul->transB, 1);
+    }
 
     char buf[17];
     std::snprintf(buf, sizeof(buf), "%016llx",
@@ -311,23 +411,50 @@ inline constexpr std::size_t EXPR_MAX_CONSTS = 16;
 inline constexpr std::size_t EXPR_MAX_REGS   = 16;
 inline constexpr std::size_t EXPR_MAX_INSTRS = 64;
 
+// ── matmul 融合分块尺寸（S5：glsl_gen 生成与后端 dispatch 共用）─────────
+// 生成器把 matmul 段展开为共享内存分块 kernel：
+//   - EXPR_MATMUL_TILE：local_size 每维线程数（16×16 = 256 线程）
+//   - EXPR_MATMUL_BLOCK：每工作组计算的输出块每维元素数（64×64，
+//     每线程 4×4 寄存器分块；共享内存 AshT/BshT = 8×64×16B×2 = 16KB）
+//   - K 方向每块 32（BK=32，barrier 减半）
+// 后端 dispatch 按输出块缩放：(ceil(cols/BLOCK), ceil(rows/BLOCK), 1)，
+// 与生成器必须保持一致。
+inline constexpr std::uint32_t EXPR_MATMUL_TILE   = 16;
+inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
+
 // ── 校验 ──────────────────────────────────────────────────────────────────
 // 返回 unexpected(Error) 描述首个非法点。Layer 侧可在提交前调用以尽早报错。
 [[nodiscard]] inline Result<void> validate_expr_spec(const ExprSpec& spec,
                                                      std::size_t num_inputs)
 {
-    if (spec.instrs.empty())
+    // matmul 段存在时允许空指令表（输出 = matmul 结果本身）
+    if (spec.instrs.empty() && !spec.matmul)
         return std::unexpected(Error{"validate_expr_spec: empty instruction list"});
     if (spec.instrs.size() > EXPR_MAX_INSTRS)
         return std::unexpected(Error{"validate_expr_spec: too many instructions"});
-    if (spec.num_regs == 0 || spec.num_regs > EXPR_MAX_REGS)
-        return std::unexpected(Error{"validate_expr_spec: invalid num_regs"});
+    if (spec.num_regs > EXPR_MAX_REGS)
+        return std::unexpected(Error{"validate_expr_spec: too many registers"});
     if (num_inputs > EXPR_MAX_INPUTS)
         return std::unexpected(Error{"validate_expr_spec: too many inputs"});
     if (spec.consts.size() > EXPR_MAX_CONSTS)
         return std::unexpected(Error{"validate_expr_spec: too many constants"});
     if (spec.views.size() != num_inputs)
         return std::unexpected(Error{"validate_expr_spec: views count != inputs count"});
+    // matmul 段：A/B 输入下标必须在输入范围内（形状由引擎按实际张量推导）
+    if (spec.matmul)
+    {
+        if (spec.matmul->a_input >= num_inputs || spec.matmul->b_input >= num_inputs)
+            return std::unexpected(Error{"validate_expr_spec: matmul input out of range"});
+        if (spec.matmul->batch == 0)
+            return std::unexpected(Error{"validate_expr_spec: matmul batch must be > 0"});
+    }
+    // S7 视图：RowGather 的标签槽（param）必须在输入范围内
+    for (std::size_t k = 0; k < spec.views.size(); ++k)
+    {
+        if (static_cast<ExprViewKind>(spec.views[k].kind) == ExprViewKind::RowGather &&
+            spec.views[k].param >= num_inputs)
+            return std::unexpected(Error{"validate_expr_spec: RowGather label slot out of range"});
+    }
     for (const auto& ins : spec.instrs)
     {
         if (ins.dst >= spec.num_regs)
@@ -344,6 +471,9 @@ inline constexpr std::size_t EXPR_MAX_INSTRS = 64;
                 return std::unexpected(Error{"validate_expr_spec: input index out of range"});
             if (op.kind == static_cast<uint8_t>(ExprOperandKind::Const) && op.idx >= spec.consts.size())
                 return std::unexpected(Error{"validate_expr_spec: const index out of range"});
+            if (op.kind == static_cast<uint8_t>(ExprOperandKind::Matmul) && !spec.matmul)
+                return std::unexpected(Error{
+                    "validate_expr_spec: Matmul operand without matmul segment"});
         }
     }
 
@@ -397,6 +527,10 @@ namespace expr
     inline constexpr ExprOperand cst(std::uint8_t c)   { return {2, c}; }
     inline constexpr ExprOperand fanout(std::uint8_t r){ return {3, r}; }
     inline constexpr ExprOperand reduce(std::uint8_t r){ return {4, r}; }  // 引用归约指令 dst
+    inline constexpr ExprOperand matmul_op()           { return {5, 0}; }  // 引用前置 matmul 段输出
+    inline constexpr ExprOperand row()                 { return {6, 0}; }  // 当前行号（batch 内）
+    inline constexpr ExprOperand col()                 { return {7, 0}; }  // 当前列号
+    inline constexpr ExprOperand batch()               { return {8, 0}; }  // 当前批次下标
     inline constexpr ExprView linear()                 { return {0, 0, 0}; }
     inline constexpr ExprView rotate_half(std::uint32_t block_rows, bool negate_first_half = true)
     { return {1, negate_first_half ? std::uint8_t{1} : std::uint8_t{0}, block_rows}; }
@@ -408,6 +542,13 @@ namespace expr
     inline constexpr ExprView row_reduce_max() { return {6, 0, 0}; }
     inline constexpr ExprView row_broadcast()  { return {7, 0, 0}; }
     inline constexpr ExprView col_broadcast()  { return {8, 0, 0}; }
+    // S7：标签行收集（param = 标签输入槽）与按批次索引/切片
+    inline constexpr ExprView row_gather(std::uint8_t label_slot)
+    { return {9, 0, label_slot}; }
+    inline constexpr ExprView batch_mod(std::uint32_t modulo)
+    { return {10, 0, modulo}; }
+    inline constexpr ExprView batch_col(std::uint32_t per_batch_cols)
+    { return {11, 0, per_batch_cols}; }
 } // namespace expr
 
 } // namespace nn

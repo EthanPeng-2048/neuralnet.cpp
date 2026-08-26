@@ -200,6 +200,111 @@ using RowReduceMaxRef = ReduceViewRef<ExprViewKind::RowReduceMax>;
 using ColReduceSumRef = ReduceViewRef<ExprViewKind::ColReduceSum>;
 using ColReduceMaxRef = ReduceViewRef<ExprViewKind::ColReduceMax>;
 
+// ══════════════════════════════════════════════════════════════════════════
+// matmul 叶子（算子融合二期 S1/S2：matmul 参与 IR 融合）
+//
+// matmul(A, B) 折叠成 ExprSpec 的**前置 matmul 段**（MatmulSpec）：
+//   逐元素链经 Matmul 操作数按 (r,c) 读取 C = op(A,B)，中间结果不物化。
+// A/B 在折叠时登记为输入（Linear 视图），槽位记录进 MatmulSpec.a_input/b_input
+// （折叠顺序决定槽位，MatmulRef::to_spec 记录实际槽位，不假设 0/1）。
+// k（求和维度）是形状参数：不进 expr_spec_key，同结构不同 K 共享融合 shader。
+//
+// 模板 CPU 求值路径不实例化（has_reduction_v<MatmulRef>=true 把 dsl::compute
+// 分流到引擎 eval_expr，由引擎做 matmul 预计算 + 逐元素链），eval 仅满足
+// nn::Expression 概念约束，返回占位值。
+// ══════════════════════════════════════════════════════════════════════════
+struct MatmulRef
+{
+    Tensor a, b;
+    bool transA = false;
+    bool transB = false;
+    std::uint32_t batch = 1;  // S7：批量数（形状参数，不进 key）
+
+    [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
+    ExprOperand to_spec(SpecBuilder& sb) const
+    {
+        // 显式固定登记顺序（A 先 B 后），保证跨编译器确定（同 Binary 约定）
+        const std::uint8_t ai = static_cast<std::uint8_t>(sb.inputs.size());
+        (void)sb.add_input_linear(a);
+        const std::uint8_t bi = static_cast<std::uint8_t>(sb.inputs.size());
+        (void)sb.add_input_linear(b);
+        // k = 求和维度：transA=0 → A.cols()（A 存储 (batch*M, K)）；
+        // transA=1 → A.rows()/batch（A 存储 (batch*K, M)，每批 (K, M)）
+        const std::uint32_t k = static_cast<std::uint32_t>(
+            transA ? (a.rows() / batch) : a.cols());
+        sb.spec.matmul = MatmulSpec{ai, bi, transA ? std::uint8_t{1} : std::uint8_t{0},
+                                    transB ? std::uint8_t{1} : std::uint8_t{0}, k, batch};
+        return expr::matmul_op();
+    }
+};
+
+// ══════════════════════════════════════════════════════════════════════════
+// 网格索引叶子（S7）：行号/列号/批次下标作为标量参与算术
+//
+//   row()   = 当前输出元素在 batch 内的行号
+//   col()   = 当前输出列号
+//   batch() = 当前批次下标
+// 用于位置相关掩码/偏置（causal select(Col > Row, -inf, 0)、ALiBi 等）。
+// 走引擎 eval_expr（索引由引擎按网格推导），eval 仅满足概念约束。
+// ══════════════════════════════════════════════════════════════════════════
+struct RowIdxLeaf  { [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; } ExprOperand to_spec(SpecBuilder&) const { return expr::row(); } };
+struct ColIdxLeaf  { [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; } ExprOperand to_spec(SpecBuilder&) const { return expr::col(); } };
+struct BatchIdxLeaf{ [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; } ExprOperand to_spec(SpecBuilder&) const { return expr::batch(); } };
+
+// ══════════════════════════════════════════════════════════════════════════
+// S7 视图叶子：标签行收集 / 按批次索引
+//   row_gather(logits, labels)：读取 logits[label[c]][c]（稀疏 CE loss 收集）；
+//     labels 登记为 ColBroadcast 视图（(1,cols)），RowGather 视图的 param
+//     指向 labels 输入槽。
+//   batch_mod(t, modulo)：读取 t[batch % modulo]（ALiBi 按头斜率等）。
+// ══════════════════════════════════════════════════════════════════════════
+struct RowGatherRef
+{
+    Tensor t;      // 主输入（rows, cols），如 logits (classes, total)
+    Tensor labels; // 标签 (1, cols) 浮点打包
+
+    [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
+    ExprOperand to_spec(SpecBuilder& sb) const
+    {
+        const std::uint8_t ti = static_cast<std::uint8_t>(sb.inputs.size());
+        (void)sb.add_input_linear(t);
+        const std::uint8_t li = static_cast<std::uint8_t>(sb.inputs.size());
+        (void)sb.add_input_colbroadcast(labels);
+        sb.spec.views[ti] = expr::row_gather(li);  // RowGather 视图，param=标签槽
+        return expr::input(ti);
+    }
+};
+
+struct BatchModRef
+{
+    Tensor t;
+    std::uint32_t modulo;
+
+    [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
+    ExprOperand to_spec(SpecBuilder& sb) const
+    {
+        // 直接登记 BatchMod 视图（输入 (1,mod) 小向量，按 batch 取模索引）
+        sb.spec.views.push_back(expr::batch_mod(modulo));
+        sb.inputs.push_back(t);
+        return expr::input(static_cast<std::uint8_t>(sb.inputs.size() - 1));
+    }
+};
+
+// 按 (batch, col) 切片（S7）：doc_ids (1, batch*seq) → data[batch*seq + col]
+struct BatchColRef
+{
+    Tensor t;
+    std::uint32_t per_batch_cols;
+
+    [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
+    ExprOperand to_spec(SpecBuilder& sb) const
+    {
+        sb.spec.views.push_back(expr::batch_col(per_batch_cols));
+        sb.inputs.push_back(t);
+        return expr::input(static_cast<std::uint8_t>(sb.inputs.size() - 1));
+    }
+};
+
 // 广播视图叶子：输入 (rows,1)/(1,cols) 小向量，按行/列广播参与算术。
 // 与归约叶子同理：eval 仅满足概念约束（模板求值路径不实例化，has_reduction_v 分流
 // 到 eval_expr，由引擎按 (r,c) 索引广播值）。
@@ -309,6 +414,22 @@ template <ExprViewKind K>
 inline constexpr bool has_reduction_v<ReduceViewRef<K>> = true;
 template <ExprViewKind K>
 inline constexpr bool has_reduction_v<BroadcastRef<K>> = true;
+// matmul 叶子同样需走 eval_expr（matmul 预计算 + 逐元素链，引擎实现）
+template <>
+inline constexpr bool has_reduction_v<MatmulRef> = true;
+// 索引/收集叶子（S7）：行/列/批次下标与标签收集由引擎按网格推导
+template <>
+inline constexpr bool has_reduction_v<RowIdxLeaf> = true;
+template <>
+inline constexpr bool has_reduction_v<ColIdxLeaf> = true;
+template <>
+inline constexpr bool has_reduction_v<BatchIdxLeaf> = true;
+template <>
+inline constexpr bool has_reduction_v<RowGatherRef> = true;
+template <>
+inline constexpr bool has_reduction_v<BatchModRef> = true;
+template <>
+inline constexpr bool has_reduction_v<BatchColRef> = true;
 template <nn::dsl::DslExpr E, ExprOp Rop>
 inline constexpr bool has_reduction_v<ReduceRef<E, Rop>> = true;
 template <typename Op, nn::Expression C>
@@ -323,6 +444,28 @@ inline constexpr bool has_reduction_v<Select<C, T, E>>
 // 叶子构造（普通写法入口）
 // ══════════════════════════════════════════════════════════════════════════
 [[nodiscard]] inline TensorRef leaf(Tensor t) { return TensorRef{std::move(t)}; }
+
+// matmul 叶子（S1/S2）：C = op(A,B)，折叠为 ExprSpec 的前置 matmul 段。
+// 逐元素链（如 +bias、激活）自动与 matmul 融合成一个 kernel（GPU AOT）。
+// batch（S7）：A/B 按 batch 垂直切分（batched_matmul 同布局），形状参数。
+[[nodiscard]] inline MatmulRef matmul(Tensor a, Tensor b,
+                                      bool transA = false, bool transB = false,
+                                      std::uint32_t batch = 1)
+{ return MatmulRef{std::move(a), std::move(b), transA, transB, batch}; }
+
+// 网格索引叶子（S7）：行号/列号/批次下标
+[[nodiscard]] inline RowIdxLeaf row()   { return {}; }
+[[nodiscard]] inline ColIdxLeaf col()   { return {}; }
+[[nodiscard]] inline BatchIdxLeaf batch() { return {}; }
+
+// S7 视图叶子：标签行收集（稀疏 CE loss）/ 按批次取模索引（ALiBi 斜率）/
+// 按 (batch,col) 切片（doc_ids）
+[[nodiscard]] inline RowGatherRef row_gather(Tensor t, Tensor labels)
+{ return RowGatherRef{std::move(t), std::move(labels)}; }
+[[nodiscard]] inline BatchModRef batch_mod(Tensor t, std::uint32_t modulo)
+{ return BatchModRef{std::move(t), modulo}; }
+[[nodiscard]] inline BatchColRef batch_col(Tensor t, std::uint32_t per_batch_cols)
+{ return BatchColRef{std::move(t), per_batch_cols}; }
 
 [[nodiscard]] inline RotateHalfRef rotate_half(Tensor t, std::uint32_t block)
 { return RotateHalfRef{std::move(t), block}; }
