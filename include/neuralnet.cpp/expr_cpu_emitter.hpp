@@ -90,6 +90,14 @@ inline void cpu_view_read(std::ostringstream& os,
     case static_cast<uint8_t>(ExprViewKind::ColBroadcast):
         os << buf << "[" << col_var << "]";
         return;
+    case static_cast<uint8_t>(ExprViewKind::BatchMod):
+        // S7：按批次取模索引：data[batch % vpN]（取模数 num_heads 为运行时视图参数）
+        os << buf << "[batch % vp" << std::to_string(vp_slot) << "]";
+        return;
+    case static_cast<uint8_t>(ExprViewKind::BatchCol):
+        // S7：按 (batch, col) 切片：data[batch*vpN + col]（每批列数 seq 为运行时视图参数）
+        os << buf << "[batch * vp" << std::to_string(vp_slot) << " + " << col_var << "]";
+        return;
     }
 }
 
