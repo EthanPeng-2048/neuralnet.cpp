@@ -148,16 +148,22 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
     const nn::Tensor t_logits = nn::Tensor::from_matrix(nn::Matrix(logits));
     const nn::Tensor t_colmax = nn::Tensor::from_matrix(nn::Matrix(col_max));
 
-    // ── col_softmax_denom（有/无参考） ──
+    // ── S7 IR 组合：denom = col_sum(exp(logits - cb(col_max))) ──
     {
         char nm[128];
-        std::snprintf(nm, sizeof(nm), "%s col_softmax_denom", tag);
+        std::snprintf(nm, sizeof(nm), "%s IR denom", tag);
         const nn::Matrix ref = ref_denom(logits, col_max);
-        auto r = eng.col_softmax_denom(t_logits, t_colmax);
+        auto r = nn::dsl::compute_reduce(eng,
+            nn::dsl::col_reduce_sum(
+                nn::dsl::exp(nn::dsl::leaf(t_logits) - nn::dsl::col_broadcast(t_colmax))),
+            C, N);
         check(nm, std::move(r), ref);
     }
 
-    // ── col_softmax_sparse_forward：无 mask、有 mask、全越界 ──
+    // ── S7 IR 组合：loss_vec / grad（RowGather + Row 操作数）──
+    //   loss_vec = (rg(logits) - cb(col_max) - log(denom)) * cb(mask)  （(1,N)）
+    //   grad     = (exp(logits-cb(col_max))/cb(denom)
+    //               - select(Row==cb(labels),1,0)) * cb(mask) * inv     （(C,N)）
     {
         nn::Matrix labels_m(1, N);
         for (std::size_t i = 0; i < N; ++i)
@@ -170,19 +176,35 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
             nn::Matrix lv_ref;
             const nn::Matrix g_ref = ref_sparse_forward(
                 logits, labels, nullptr, vocab_size, inv_num_valid, lv_ref);
-            nn::Tensor lv;
-            std::snprintf(nm, sizeof(nm), "%s col_sparse (no mask)", tag);
-            auto r = eng.col_softmax_sparse_forward(
-                t_logits, t_labels, nullptr, vocab_size, inv_num_valid, lv);
-            if (!r) { std::printf("[FAIL] %s: %s\n", nm, r.error().message.c_str()); ++fail; }
+            // S7 Layer 行为：mask = valid 修正（越界 label → 0）
+            nn::Matrix mask_m(1, N);
+            for (std::size_t i = 0; i < N; ++i)
+                mask_m.set_value_unchecked(0, i,
+                    labels[i] < vocab_size ? Scalar{1} : Scalar{0});
+            const nn::Tensor t_mask = nn::Tensor::from_matrix(std::move(mask_m));
+            auto denom = nn::dsl::compute_reduce(eng,
+                nn::dsl::col_reduce_sum(nn::dsl::exp(
+                    nn::dsl::leaf(t_logits) - nn::dsl::col_broadcast(t_colmax))),
+                C, N);
+            if (!denom) { std::printf("[FAIL] %s denom: %s\n", tag, denom.error().message.c_str()); ++fail; }
             else
             {
-                auto dg = eng.to_matrix(*r);
-                if (!dg) { std::printf("[FAIL] %s: 下载失败\n", nm); ++fail; }
-                else check_matrix(*dg, g_ref, nm);
-                auto dl = eng.to_matrix(lv);
-                if (!dl) { std::printf("[FAIL] %s (loss_vec): 下载失败\n", nm); ++fail; }
-                else check_matrix(*dl, lv_ref, "  loss_vec (no mask)");
+                auto lv = nn::dsl::compute(eng,
+                    (nn::dsl::row_gather(t_logits, t_labels) - nn::dsl::col_broadcast(t_colmax)
+                     - nn::dsl::log(nn::dsl::leaf(*denom))) * nn::dsl::col_broadcast(t_mask),
+                    1, N);
+                std::snprintf(nm, sizeof(nm), "%s IR loss_vec (no mask)", tag);
+                check(nm, std::move(lv), lv_ref);
+                auto g = nn::dsl::compute(eng,
+                    (nn::dsl::exp(nn::dsl::leaf(t_logits) - nn::dsl::col_broadcast(t_colmax))
+                        / nn::dsl::col_broadcast(*denom)
+                     - nn::dsl::select(nn::dsl::row() == nn::dsl::col_broadcast(t_labels),
+                                       Scalar{1}, Scalar{0}))
+                    * nn::dsl::col_broadcast(t_mask),
+                    C, N);
+                { auto gs = eng.scale_inplace(*g, inv_num_valid); if (!gs) { std::printf("[FAIL] scale: %s\n", gs.error().message.c_str()); ++fail; } }
+                std::snprintf(nm, sizeof(nm), "%s IR grad (no mask)", tag);
+                check(nm, std::move(g), g_ref);
             }
         }
         // 有 mask
@@ -190,27 +212,39 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
             char nm[128];
             nn::Matrix mask_m(1, N);
             for (std::size_t i = 0; i < N; ++i)
-                mask_m.set_value_unchecked(0, i, loss_mask[i] >= Scalar{0.5} ? Scalar{1} : Scalar{0});
+                mask_m.set_value_unchecked(0, i,
+                    (loss_mask[i] >= Scalar{0.5} && labels[i] < vocab_size)
+                        ? Scalar{1} : Scalar{0});
             const nn::Tensor t_mask = nn::Tensor::from_matrix(std::move(mask_m));
             nn::Matrix lv_ref;
             const nn::Matrix g_ref = ref_sparse_forward(
                 logits, labels, &loss_mask, vocab_size, inv_num_valid, lv_ref);
-            nn::Tensor lv;
-            std::snprintf(nm, sizeof(nm), "%s col_sparse (mask)", tag);
-            auto r = eng.col_softmax_sparse_forward(
-                t_logits, t_labels, &t_mask, vocab_size, inv_num_valid, lv);
-            if (!r) { std::printf("[FAIL] %s: %s\n", nm, r.error().message.c_str()); ++fail; }
+            auto denom = nn::dsl::compute_reduce(eng,
+                nn::dsl::col_reduce_sum(nn::dsl::exp(
+                    nn::dsl::leaf(t_logits) - nn::dsl::col_broadcast(t_colmax))),
+                C, N);
+            if (!denom) { std::printf("[FAIL] %s denom: %s\n", tag, denom.error().message.c_str()); ++fail; }
             else
             {
-                auto dg = eng.to_matrix(*r);
-                if (!dg) { std::printf("[FAIL] %s: 下载失败\n", nm); ++fail; }
-                else check_matrix(*dg, g_ref, nm);
-                auto dl = eng.to_matrix(lv);
-                if (!dl) { std::printf("[FAIL] %s (loss_vec): 下载失败\n", nm); ++fail; }
-                else check_matrix(*dl, lv_ref, "  loss_vec (mask)");
+                auto lv = nn::dsl::compute(eng,
+                    (nn::dsl::row_gather(t_logits, t_labels) - nn::dsl::col_broadcast(t_colmax)
+                     - nn::dsl::log(nn::dsl::leaf(*denom))) * nn::dsl::col_broadcast(t_mask),
+                    1, N);
+                std::snprintf(nm, sizeof(nm), "%s IR loss_vec (mask)", tag);
+                check(nm, std::move(lv), lv_ref);
+                auto g = nn::dsl::compute(eng,
+                    (nn::dsl::exp(nn::dsl::leaf(t_logits) - nn::dsl::col_broadcast(t_colmax))
+                        / nn::dsl::col_broadcast(*denom)
+                     - nn::dsl::select(nn::dsl::row() == nn::dsl::col_broadcast(t_labels),
+                                       Scalar{1}, Scalar{0}))
+                    * nn::dsl::col_broadcast(t_mask),
+                    C, N);
+                { auto gs = eng.scale_inplace(*g, inv_num_valid); if (!gs) { std::printf("[FAIL] scale: %s\n", gs.error().message.c_str()); ++fail; } }
+                std::snprintf(nm, sizeof(nm), "%s IR grad (mask)", tag);
+                check(nm, std::move(g), g_ref);
             }
         }
-        // 全越界（num_valid=0）：grad 全 0、loss 0
+        // 全越界（num_valid=0）：mask 修正为 0 → grad 全 0、loss_vec 0
         {
             char nm[128];
             std::vector<std::size_t> bad(N, 99);
@@ -221,19 +255,34 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
             nn::Matrix lv_ref;
             const nn::Matrix g_ref = ref_sparse_forward(
                 logits, bad, nullptr, vocab_size, Scalar{0}, lv_ref);
-            nn::Tensor lv;
-            std::snprintf(nm, sizeof(nm), "%s col_sparse (all invalid)", tag);
-            auto r = eng.col_softmax_sparse_forward(
-                t_logits, t_bad, nullptr, vocab_size, Scalar{0}, lv);
-            if (!r) { std::printf("[FAIL] %s: %s\n", nm, r.error().message.c_str()); ++fail; }
+            // 越界 label 修正为 0（Layer 行为）+ mask 全 0（越界无效）
+            nn::Matrix mask_m(1, N);
+            for (std::size_t i = 0; i < N; ++i)
+                mask_m.set_value_unchecked(0, i, Scalar{0});
+            const nn::Tensor t_mask = nn::Tensor::from_matrix(std::move(mask_m));
+            auto denom = nn::dsl::compute_reduce(eng,
+                nn::dsl::col_reduce_sum(nn::dsl::exp(
+                    nn::dsl::leaf(t_logits) - nn::dsl::col_broadcast(t_colmax))),
+                C, N);
+            if (!denom) { std::printf("[FAIL] %s denom: %s\n", tag, denom.error().message.c_str()); ++fail; }
             else
             {
-                auto dg = eng.to_matrix(*r);
-                if (!dg) { std::printf("[FAIL] %s: 下载失败\n", nm); ++fail; }
-                else check_matrix(*dg, g_ref, nm);
-                auto dl = eng.to_matrix(lv);
-                if (!dl) { std::printf("[FAIL] %s (loss_vec): 下载失败\n", nm); ++fail; }
-                else check_matrix(*dl, lv_ref, "  loss_vec (all invalid)");
+                auto lv = nn::dsl::compute(eng,
+                    (nn::dsl::row_gather(t_logits, t_bad) - nn::dsl::col_broadcast(t_colmax)
+                     - nn::dsl::log(nn::dsl::leaf(*denom))) * nn::dsl::col_broadcast(t_mask),
+                    1, N);
+                std::snprintf(nm, sizeof(nm), "%s IR loss_vec (all invalid)", tag);
+                check(nm, std::move(lv), lv_ref);
+                auto g = nn::dsl::compute(eng,
+                    (nn::dsl::exp(nn::dsl::leaf(t_logits) - nn::dsl::col_broadcast(t_colmax))
+                        / nn::dsl::col_broadcast(*denom)
+                     - nn::dsl::select(nn::dsl::row() == nn::dsl::col_broadcast(t_bad),
+                                       Scalar{1}, Scalar{0}))
+                    * nn::dsl::col_broadcast(t_mask),
+                    C, N);
+                { auto gs = eng.scale_inplace(*g, inv_num_valid); if (!gs) { std::printf("[FAIL] scale: %s\n", gs.error().message.c_str()); ++fail; } }
+                std::snprintf(nm, sizeof(nm), "%s IR grad (all invalid)", tag);
+                check(nm, std::move(g), g_ref);
             }
         }
     }
@@ -311,3 +360,4 @@ int main()
     std::cout << (fail == 0 ? "\nALL PASS\n" : "\nFAILED\n");
     return fail == 0 ? 0 : 1;
 }
+

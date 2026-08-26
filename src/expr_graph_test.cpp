@@ -480,7 +480,116 @@ void test_input_order()
     std::printf("[OK] test_input_order\n");
 }
 
-// ── 测试 10：IR-D emitter 抽象（一份 canonical IR → 多后端） ───────────
+// ── 测试 10：matmul 参与图融合（S5：matmul 节点 + 尾逐元素节点拼接） ───
+//   A: y = matmul(A0,B0) + bias（matmul 段 + Add 尾链）
+//   B: z = max(y, 0)（relu）消费 A → 融合为单 kernel：spec.matmul 保留，
+//      instrs = A 尾链 + B 指令（matmul 输出经"虚拟寄存器"流入 relu）。
+void test_matmul_chain_fuse()
+{
+    nn::CpuEngine eng;
+    const std::size_t M = 3, K = 4, N = 2;
+    nn::ExprGraph g;
+    nn::Tensor A0 = make_tensor(M, K, 0.5f, 0.03f);
+    nn::Tensor B0 = make_tensor(K, N, -0.2f, 0.04f);
+    nn::Tensor bias = make_tensor(M, N, 0.1f, 0.01f);
+
+    // A：matmul(A0,B0) + bias
+    nn::ExprSpec sa;
+    sa.views    = {nn::expr::linear(), nn::expr::linear(), nn::expr::linear()};
+    sa.num_regs = 1;
+    sa.matmul   = nn::MatmulSpec{0, 1, 0, 0, static_cast<std::uint32_t>(K)};
+    sa.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::Add), 0,
+                         nn::expr::matmul_op(), nn::expr::input(2), {}});
+    const int nA = g.add_node(sa, std::vector<nn::Tensor>{A0, B0, bias}, M, N, false);
+    nn::Tensor yt = nn::Tensor::cpu(M, N);
+    yt.set_virtual_tag(static_cast<std::uint64_t>(nA) + 1);
+    // B：relu（max(y, 0)）消费 A
+    const int nB = g.add_node(make_unary_const(nn::ExprOp::Max, Scalar{0}),
+                              std::vector<nn::Tensor>{yt}, M, N, false);
+    (void)nB;
+
+    auto kernels = fuse_expr_graph(g);
+    CHECK(kernels.size() == 1, "matmul+bias → relu 应融合为单个 kernel");
+    if (kernels.size() != 1) return;
+    CHECK(kernels[0].members.size() == 2, "kernel 应包含 2 个节点");
+    CHECK(kernels[0].spec.matmul.has_value(), "融合 spec 应保留 matmul 段");
+    CHECK(kernels[0].spec.matmul->a_input == 0 && kernels[0].spec.matmul->b_input == 1,
+          "matmul A/B 输入槽保留（views 前缀顺序不变）");
+    CHECK(kernels[0].inputs.size() == 3, "融合 kernel 应有 3 个外部输入（A0/B0/bias）");
+    if (!kernels[0].spec.matmul) return;
+
+    // 融合 kernel 求值 vs 逐节点参考
+    std::vector<nn::Tensor> kinputs;
+    for (auto& in : kernels[0].inputs) kinputs.push_back(in.external);
+    auto fused = eng.eval_expr(kernels[0].spec, kinputs, M, N);
+    CHECK(static_cast<bool>(fused), "融合 kernel 求值成功");
+    if (!fused) return;
+
+    auto a_res = eng.eval_expr(sa, std::vector<nn::Tensor>{A0, B0, bias}, M, N);
+    auto b_res = eng.eval_expr(make_unary_const(nn::ExprOp::Max, Scalar{0}),
+                               std::vector<nn::Tensor>{*a_res}, M, N);
+    CHECK(static_cast<bool>(b_res), "参考求值成功");
+    if (!b_res) return;
+    const Scalar err = max_abs_diff(fused->cpu_matrix(), b_res->cpu_matrix());
+    CHECK(err < 1e-6f, "matmul 图融合结果与逐节点一致");
+    std::printf("[OK] test_matmul_chain_fuse\n");
+}
+
+// ── 测试 11：纯 matmul 节点 + 消费节点拼接（S5：tail 引用 → Matmul 操作数）
+//   A: y = matmul(A0,B0)（纯 matmul，空指令链）
+//   B: z = y + bias 消费 A → 融合为单 kernel（B 对 A 的引用替换为 Matmul 操作数）
+void test_matmul_pure_chain_fuse()
+{
+    nn::CpuEngine eng;
+    const std::size_t M = 2, K = 3, N = 4;
+    nn::ExprGraph g;
+    nn::Tensor A0 = make_tensor(M, K, 0.4f, 0.05f);
+    nn::Tensor B0 = make_tensor(K, N, -0.1f, 0.02f);
+    nn::Tensor bias = make_tensor(M, N, 0.2f, 0.01f);
+
+    // A：纯 matmul（空指令链）
+    nn::ExprSpec sa;
+    sa.views    = {nn::expr::linear(), nn::expr::linear()};
+    sa.num_regs = 0;
+    sa.matmul   = nn::MatmulSpec{0, 1, 0, 0, static_cast<std::uint32_t>(K)};
+    const int nA = g.add_node(sa, std::vector<nn::Tensor>{A0, B0}, M, N, false);
+    nn::Tensor yt = nn::Tensor::cpu(M, N);
+    yt.set_virtual_tag(static_cast<std::uint64_t>(nA) + 1);
+    // B：Add(y, bias)
+    nn::ExprSpec sb;
+    sb.views    = {nn::expr::linear(), nn::expr::linear()};
+    sb.num_regs = 1;
+    sb.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::Add), 0,
+                         nn::expr::input(0), nn::expr::input(1), {}});
+    const int nB = g.add_node(sb, std::vector<nn::Tensor>{yt, bias}, M, N, false);
+    (void)nB;
+
+    auto kernels = fuse_expr_graph(g);
+    CHECK(kernels.size() == 1, "纯 matmul → Add 应融合为单个 kernel");
+    if (kernels.size() != 1) return;
+    CHECK(kernels[0].spec.matmul.has_value(), "融合 spec 应保留 matmul 段");
+    CHECK(kernels[0].spec.instrs.size() == 1, "融合指令 = B 的 Add（A 为空链）");
+    CHECK(kernels[0].spec.instrs[0].a.kind ==
+              static_cast<std::uint8_t>(nn::ExprOperandKind::Matmul),
+          "B 对 A 的引用应替换为 Matmul 操作数");
+    CHECK(kernels[0].inputs.size() == 3, "融合 kernel 应有 3 个外部输入（A0/B0/bias）");
+    if (!kernels[0].spec.matmul) return;
+
+    std::vector<nn::Tensor> kinputs;
+    for (auto& in : kernels[0].inputs) kinputs.push_back(in.external);
+    auto fused = eng.eval_expr(kernels[0].spec, kinputs, M, N);
+    CHECK(static_cast<bool>(fused), "融合 kernel 求值成功");
+    if (!fused) return;
+
+    // 参考：matmul + bias
+    auto a_res = eng.matmul(A0, B0, false, false);
+    auto ref = eng.elementwise_binary(nn::BinaryOp::Add, *a_res, bias);
+    const Scalar err = max_abs_diff(fused->cpu_matrix(), ref->cpu_matrix());
+    CHECK(err < 1e-6f, "纯 matmul 图融合结果与参考一致");
+    std::printf("[OK] test_matmul_pure_chain_fuse\n");
+}
+
+// ── 测试 12：IR-D emitter 抽象（一份 canonical IR → 多后端） ───────────
 void test_emitter()
 {
     // 逐元素 spec：out = input0 * 2
@@ -529,6 +638,8 @@ int main()
     test_determinism();
     test_dep_recognition();
     test_input_order();
+    test_matmul_chain_fuse();
+    test_matmul_pure_chain_fuse();
     test_emitter();
 
     if (g_fail == 0)

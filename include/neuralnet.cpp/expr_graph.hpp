@@ -30,6 +30,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -110,7 +111,11 @@ struct ExprGraph
 struct FusedKernelInput
 {
     int     node = -1;   // >= 0：该输入是图节点 node 的输出（作为外部 buffer 绑定）
-    Tensor  external;    // node < 0：Layer 外部输入
+    Tensor  external;    // node < 0：Layer 外部输入（运行时张量）
+    // P2-12（图级缓存跨 step 复用）：node < 0 时记录该外部输入的来源，
+    // 以便从缓存计划反查当前图对应节点的输入槽（input_tensors[ext_slot]）。
+    int     ext_node = -1;  // 来源原图节点 index
+    int     ext_slot = -1;  // 来源节点输入槽 index
 };
 
 struct FusedKernel
@@ -175,6 +180,11 @@ namespace fused
 
         // 1) 前置：均逐元素（无归约）、非归约输出、形状相同
         if (cur.vector_out || B.vector_out) return false;
+        // 1a) matmul 段（S5）：matmul 是"前置段"（唯一、位于链首）——
+        //   - B 含 matmul → 不能拼入当前 kernel（matmul 必须位于链首）→ 新 kernel
+        //   - A 含 matmul → 允许拼接 B：fused 保留 A.matmul，B 的指令拼在
+        //     A 的尾链之后（A 纯 matmul 时 B 对 A 输出的引用替换为 Matmul 操作数）
+        if (Bs.matmul) return false;
         if (expr_spec_reduce_axis(A) != -1) return false;
         if (expr_spec_reduce_axis(Bs) != -1) return false;
         if (cur.rows != B.rows || cur.cols != B.cols) return false;
@@ -202,7 +212,10 @@ namespace fused
             return false;
 
         // 3) 拼接（确定性：tail 的 views/consts/instrs 在前，B 的在后）
-        const std::size_t out_reg_A = A.instrs.back().dst;
+        // A 纯 matmul（空链，S5）时无输出寄存器：B 对 A 输出的引用替换为
+        // Matmul 操作数（读取前置 matmul 段输出），否则替换为 A 的输出寄存器。
+        const bool a_pure_matmul = A.matmul && A.instrs.empty();
+        const std::size_t out_reg_A = a_pure_matmul ? 0 : A.instrs.back().dst;
 
         // 3a) 寄存器偏移溢出防护：B 的指令 dst 经 +A.num_regs 重映射后必须 < 256
         // （ExprInstr.dst 为 uint8_t）。超限则放弃融合（保守，正确性优先）。
@@ -247,7 +260,11 @@ namespace fused
                     const auto it = std::find(tail_slots.begin(), tail_slots.end(),
                                               static_cast<int>(k));
                     if (it != tail_slots.end())
+                    {
+                        if (a_pure_matmul)
+                            return expr::matmul_op();  // 引用前置 matmul 段输出
                         return expr::reg(static_cast<std::uint8_t>(out_reg_A));
+                    }
                     return expr::input(static_cast<std::uint8_t>(
                         b_view_map[k]));
                 }
@@ -273,6 +290,7 @@ namespace fused
         fused.consts  = std::move(consts);
         fused.instrs  = std::move(instrs);
         fused.num_regs = static_cast<std::uint32_t>(reg_base + Bs.num_regs);
+        fused.matmul  = A.matmul;   // 保留前置 matmul 段（S5：matmul 参与图融合）
         fused = canonicalize_expr_spec(fused);
         if (auto v = validate_expr_spec(fused, fused.views.size()); !v)
             return false;  // 超限/非法 → 放弃融合（保守）
@@ -284,7 +302,8 @@ namespace fused
             const std::size_t kk = static_cast<std::size_t>(k);
             if (B.dep_of_input[kk] < 0)
                 new_inputs.push_back(FusedKernelInput{
-                    /*node=*/-1, /*external=*/B.input_tensors[kk]});
+                    /*node=*/-1, /*external=*/B.input_tensors[kk],
+                    /*ext_node=*/bi, /*ext_slot=*/static_cast<int>(kk)});
             else
                 new_inputs.push_back(FusedKernelInput{
                     /*node=*/B.dep_of_input[kk], /*external=*/Tensor{}});
@@ -316,7 +335,8 @@ namespace fused
         {
             if (N.dep_of_input[kk] < 0)
                 k.inputs.push_back(FusedKernelInput{
-                    /*node=*/-1, /*external=*/N.input_tensors[kk]});
+                    /*node=*/-1, /*external=*/N.input_tensors[kk],
+                    /*ext_node=*/static_cast<int>(i), /*ext_slot=*/static_cast<int>(kk)});
             else
                 k.inputs.push_back(FusedKernelInput{
                     /*node=*/N.dep_of_input[kk], /*external=*/Tensor{}});
@@ -325,6 +345,137 @@ namespace fused
     }
     return kernels;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  P2-12 图级缓存跨 step 复用
+//
+//  训练每 step 的表达式结构高度重复（Layer 结构固定），但 `fuse_expr_graph`
+//  每 step 都重跑：融合分析 + 拼接 canonicalize + validate。这属于训练热路径
+//  上的纯 CPU 开销。为消除它，这里缓存"整图结构 key → 融合 kernel 计划"：
+//    - key 覆盖所有影响融合决策的因素（节点 canonical key + 形状 + 拓扑），
+//      同一结构必然产出同一 kernel 计划（确定性铁律 8 保证）。
+//    - 计划只存结构（spec/shape/tail/members/输入来源），不存运行时张量；
+//      命中后由 instantiate_plan 绑定当前图的 node_outputs 与外部输入。
+//  不改变任何融合决策或计算，故不引入数值差异，不影响逐字节确定性。
+// ═══════════════════════════════════════════════════════════════════════════
+
+// 缓存的 kernel 计划（不含运行时张量）
+struct FusedKernelPlan
+{
+    ExprSpec           spec;             // 复合 spec（canonical）
+    std::vector<int>   input_node;       // 每输入槽：来源节点 idx（>=0）或 -1（外部）
+    std::vector<int>   input_ext_node;   // 外部时：来源原图节点 idx
+    std::vector<int>   input_ext_slot;   // 外部时：来源节点输入槽 index
+    std::size_t        rows = 0, cols = 0;
+    bool               vector_out = false;
+    int                tail = -1;
+    std::vector<int>   members;
+};
+
+// 整图结构 key（FNV-1a）：覆盖节点 spec key、形状、vector_out、依赖拓扑。
+[[nodiscard]] inline std::uint64_t graph_cache_key(const ExprGraph& g)
+{
+    constexpr std::uint64_t kFnvOffset = 14695981039346656037ull;
+    constexpr std::uint64_t kFnvPrime = 1099511628211ull;
+    std::uint64_t h = kFnvOffset;
+    const auto mix_u64 = [&](std::uint64_t v)
+    {
+        for (int b = 0; b < 8; ++b)
+        {
+            h ^= static_cast<std::uint8_t>(v >> (8 * b));
+            h *= kFnvPrime;
+        }
+    };
+    const auto mix_str = [&](const std::string& s)
+    {
+        for (const unsigned char c : s)
+        {
+            h ^= c;
+            h *= kFnvPrime;
+        }
+    };
+    mix_u64(static_cast<std::uint64_t>(g.nodes.size()));
+    for (const auto& n : g.nodes)
+    {
+        mix_u64(static_cast<std::uint64_t>(n.rows));
+        mix_u64(static_cast<std::uint64_t>(n.cols));
+        mix_u64(n.vector_out ? 1ull : 0ull);
+        mix_str(expr_spec_key(n.spec));
+        mix_u64(static_cast<std::uint64_t>(n.dep_of_input.size()));
+        for (const int d : n.dep_of_input)
+            mix_u64(static_cast<std::uint64_t>(d));
+    }
+    return h;
+}
+
+// 从 fused kernel 提取计划（不含运行时张量）。
+[[nodiscard]] inline FusedKernelPlan plan_from_kernel(const FusedKernel& k)
+{
+    FusedKernelPlan p;
+    p.spec        = k.spec;
+    p.rows        = k.rows;
+    p.cols        = k.cols;
+    p.vector_out  = k.vector_out;
+    p.tail        = k.tail;
+    p.members     = k.members;
+    p.input_node.reserve(k.inputs.size());
+    p.input_ext_node.reserve(k.inputs.size());
+    p.input_ext_slot.reserve(k.inputs.size());
+    for (const auto& in : k.inputs)
+    {
+        p.input_node.push_back(in.node);
+        p.input_ext_node.push_back(in.ext_node);
+        p.input_ext_slot.push_back(in.ext_slot);
+    }
+    return p;
+}
+
+// 从计划实例化 kernel，绑定当前图的运行时张量（node 输出 / 外部输入）。
+[[nodiscard]] inline FusedKernel instantiate_plan(const FusedKernelPlan& p, const ExprGraph& g)
+{
+    FusedKernel k;
+    k.spec        = p.spec;
+    k.rows        = p.rows;
+    k.cols        = p.cols;
+    k.vector_out  = p.vector_out;
+    k.tail        = p.tail;
+    k.members     = p.members;
+    k.inputs.reserve(p.input_node.size());
+    for (std::size_t i = 0; i < p.input_node.size(); ++i)
+    {
+        FusedKernelInput in;
+        in.node = p.input_node[i];
+        if (in.node < 0)
+        {
+            in.ext_node = p.input_ext_node[i];
+            in.ext_slot = p.input_ext_slot[i];
+            in.external = (in.ext_node >= 0 && in.ext_slot >= 0)
+                ? g.nodes[static_cast<std::size_t>(in.ext_node)]
+                      .input_tensors[static_cast<std::size_t>(in.ext_slot)]
+                : Tensor{};
+        }
+        k.inputs.push_back(std::move(in));
+    }
+    return k;
+}
+
+// ── 图级缓存容器（thread_local，与录制图同线程隔离，D3 一致） ──────────
+// 容量受限：结构种类（每 Layer 一种图结构）通常很少，但防御性地设上限，
+// 超限清空（等价于重建缓存，不影响正确性）。
+namespace fused
+{
+
+[[nodiscard]] inline std::unordered_map<std::uint64_t,
+                                        std::vector<FusedKernelPlan>>&
+graph_plan_cache()
+{
+    static thread_local std::unordered_map<std::uint64_t,
+                                           std::vector<FusedKernelPlan>> c;
+    return c;
+}
+inline constexpr std::size_t GRAPH_PLAN_CACHE_MAX = 512;
+
+} // namespace fused
 
 } // namespace nn
 

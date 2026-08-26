@@ -196,27 +196,78 @@ protected:
     Tensor Q_cache_, K_cache_, V_cache_;  // (batch*H*d_k, seq) rearranged
     Tensor attn_cache_;                    // (batch*H*seq, seq) 旧路径缓存
 
-    // 两趟式缓存（M6）：m/l 替代 attn_cache_（不物化得分矩阵）
+    // 两趟式缓存（M6→S7）：m/l 替代 attn_cache_（不物化得分矩阵）；
+    // W_cache_（S7）为物化的 softmax 权重 (BH*seq, seq)，backward 复用
     Tensor m_cache_, l_cache_;   // (batch*H*seq, 1)：行 max / softmax 分母
-    AttnBias two_pass_bias_;     // 两趟式组合偏置描述子（指针指向子类缓存张量）
+    Tensor W_cache_;             // (batch*H*seq, seq)：softmax 权重（S7 物化）
     bool two_pass_active_ = false;  // forward 是否走了两趟式路径（backward 读取）
 
-    // ── 两趟式（M6）决策钩子 ──────────────────────────────────────────
-    // 决定是否用两趟式注意力（不物化 (BH*seq, seq) 得分/概率矩阵，显存峰值
-    // 从 ~3-4×BH·seq² 降至 ~1×）。返回 {use_two_pass, bias}：
-    //   - use_two_pass=true：两趟式；bias 为组合式 AttnBias 描述子
-    //     （causal / doc_ids / slopes，见 compute_engine.hpp；空 = 无偏置/掩码）
-    //   - use_two_pass=false：回退旧路径
+    // ── S7：掩码输入张量钩子（IR 掩码表达式用；空 = 无该分量）──────────
+    //   mask_slopes_   — ALiBi 按头斜率 (1, num_heads)，batch_mod(num_heads) 索引
+    //   mask_doc_col_  — 每行文档 id (BH*seq, 1)，row_broadcast（doc_col[b*H*seq+h*seq+i]）
+    //   mask_doc_ids_  — 每位置文档 id (1, batch*seq)，batch_col(seq) 切片
+    [[nodiscard]] virtual const Tensor* mask_slopes_() const { return nullptr; }
+    [[nodiscard]] virtual const Tensor* mask_doc_col_() const { return nullptr; }
+    [[nodiscard]] virtual const Tensor* mask_doc_ids_() const { return nullptr; }
+
+    // ── S7：掩码 DSL 表达式（causal 恒有 + alibi/doc 按钩子）──────────
+    // 4 种组合（causal / causal+alibi / causal+doc / causal+alibi+doc）各自
+    // 生成确定结构（scan dry-run 覆盖全部组合，闭合世界两端一致）。
+    // blocked≠0 的位置屏蔽（-inf）。
+    const Scalar kNegInf_ = -std::numeric_limits<Scalar>::infinity();
+    [[nodiscard]] bool use_alibi_mask_() const { return mask_slopes_() != nullptr; }
+    [[nodiscard]] bool use_doc_mask_() const { return mask_doc_col_() != nullptr; }
+    template <typename E>
+    auto masked_causal_(const E& scores, std::size_t /*seq*/) const
+    {
+        const auto causal = dsl::select(dsl::col() > dsl::row(),
+                                        Scalar{1}, Scalar{0});
+        return scores + dsl::select(causal != Scalar{0}, kNegInf_, Scalar{0});
+    }
+    template <typename E>
+    auto masked_alibi_(const E& scores, std::size_t /*seq*/) const
+    {
+        const auto causal = dsl::select(dsl::col() > dsl::row(),
+                                        Scalar{1}, Scalar{0});
+        const auto alibi = dsl::batch_mod(*mask_slopes_(), num_heads_)
+                         * (dsl::col() - dsl::row());
+        return scores + dsl::select(causal != Scalar{0}, kNegInf_, alibi);
+    }
+    template <typename E>
+    auto masked_doc_(const E& scores, std::size_t seq) const
+    {
+        const auto causal = dsl::select(dsl::col() > dsl::row(),
+                                        Scalar{1}, Scalar{0});
+        const auto blocked = causal + dsl::select(
+            dsl::row_broadcast(*mask_doc_col_()) != dsl::batch_col(*mask_doc_ids_(), seq),
+            Scalar{1}, Scalar{0});
+        return scores + dsl::select(blocked != Scalar{0}, kNegInf_, Scalar{0});
+    }
+    template <typename E>
+    auto masked_alibi_doc_(const E& scores, std::size_t seq) const
+    {
+        const auto causal = dsl::select(dsl::col() > dsl::row(),
+                                        Scalar{1}, Scalar{0});
+        const auto blocked = causal + dsl::select(
+            dsl::row_broadcast(*mask_doc_col_()) != dsl::batch_col(*mask_doc_ids_(), seq),
+            Scalar{1}, Scalar{0});
+        const auto alibi = dsl::batch_mod(*mask_slopes_(), num_heads_)
+                         * (dsl::col() - dsl::row());
+        return scores + dsl::select(blocked != Scalar{0}, kNegInf_, alibi);
+    }
+
+    // ── 两趟式（M6→S7）决策钩子 ──────────────────────────────────────
+    // 决定是否用两趟式注意力（S7 起恒 true：IR 融合路径不物化得分矩阵；
+    // 掩码分量经 mask_slopes_/mask_doc_col_/mask_doc_ids_ 钩子读取）。
     struct TwoPassMask
     {
         bool use_two_pass = true;
-        AttnBias bias;
     };
     [[nodiscard]] virtual Result<TwoPassMask> two_pass_mask_(
         ComputeEngine& engine, std::size_t batch, std::size_t seq)
     {
         (void)engine; (void)batch; (void)seq;
-        return TwoPassMask{true, AttnBias{}};  // MHA：无偏置，两趟式
+        return TwoPassMask{true};  // MHA：无偏置，两趟式
     }
 
     // 掩码钩子：子类重写以施加掩码，默认 no-op（MHA 行为）
@@ -402,6 +453,10 @@ public:
             if (!kr2) return std::unexpected(kr2.error());
             K = std::move(*kr2);
         }
+        // 2.6 S7：scale（1/sqrt(d_k)）折进 Q（Q *= scale）：注意力表达式不含
+        // scale 常量 → 结构与 d_k 无关（不同 d_k 共享融合 shader，闭合世界
+        // key 稳定）。backward 的 grad_Q 相应补乘 scale。
+        { auto qs = engine.scale_inplace(Q, scale_); if (!qs) return std::unexpected(qs.error()); }
 
         // 3-7. 注意力主体：两趟式 vs 旧路径（由掩码钩子决策）
         const std::size_t BH = batch * num_heads_;
@@ -410,27 +465,104 @@ public:
         Tensor concat_out;  // (batch*H*d_k, seq)
         if (tpm->use_two_pass)
         {
-            // ── 两趟式（M6）：不物化 (BH*seq, seq) 得分/概率矩阵 ──
-            //   m = rowmax(scale·Q·K^T + mask)        → (BH*seq, 1)
+            // ── S7 IR 融合路径（M4-M6 → matmul 段 + 归约 + 普通 batched_matmul）──
+            //   m = rowmax(scale·Q·K^T + mask)        → (BH*seq, 1)（不物化 QK^T）
             //   l = Σ_j exp(scale·Q·K^T + mask − m)   → (BH*seq, 1)
-            //   O = W·V_t（W = softmax 归一化权重）    → (BH*seq, d_k)
-            two_pass_bias_ = tpm->bias;
-            auto m = engine.batched_matmul_reduce(
-                Q, K, BH, ReduceOp::Max, true, false,
-                scale_, /*reduce_cols=*/true, two_pass_bias_);
+            //   W = softmax 归一化权重（物化 (BH*seq, seq)，backward 复用）
+            //   O = W·V_t                              → (BH*seq, d_k)
+            
+            const bool use_slopes = use_alibi_mask_();
+            const bool use_doc = use_doc_mask_();
+            // 掩码组合选择器：同一选择用于 m/l/W 三个表达式（结构一致）。
+            // 每个分支返回 Result<Tensor>（统一返回类型，内部表达式各异）。
+            const auto compute_m = [&]() -> Result<Tensor> {
+                if (use_slopes && use_doc)
+                    return dsl::compute_reduce(engine,
+                        dsl::row_reduce_max(masked_alibi_doc_(
+                            dsl::matmul(Q, K, true, false, BH), seq)),
+                        BH * seq, seq);
+                if (use_slopes)
+                    return dsl::compute_reduce(engine,
+                        dsl::row_reduce_max(masked_alibi_(
+                            dsl::matmul(Q, K, true, false, BH), seq)),
+                        BH * seq, seq);
+                if (use_doc)
+                    return dsl::compute_reduce(engine,
+                        dsl::row_reduce_max(masked_doc_(
+                            dsl::matmul(Q, K, true, false, BH), seq)),
+                        BH * seq, seq);
+                return dsl::compute_reduce(engine,
+                    dsl::row_reduce_max(masked_causal_(
+                        dsl::matmul(Q, K, true, false, BH), seq)),
+                    BH * seq, seq);
+            };
+            const auto compute_l = [&](const Tensor& m_t) -> Result<Tensor> {
+                if (use_slopes && use_doc)
+                    return dsl::compute_reduce(engine,
+                        dsl::row_reduce_sum(dsl::exp(masked_alibi_doc_(
+                            dsl::matmul(Q, K, true, false, BH), seq)
+                            - dsl::row_broadcast(m_t))),
+                        BH * seq, seq);
+                if (use_slopes)
+                    return dsl::compute_reduce(engine,
+                        dsl::row_reduce_sum(dsl::exp(masked_alibi_(
+                            dsl::matmul(Q, K, true, false, BH), seq)
+                            - dsl::row_broadcast(m_t))),
+                        BH * seq, seq);
+                if (use_doc)
+                    return dsl::compute_reduce(engine,
+                        dsl::row_reduce_sum(dsl::exp(masked_doc_(
+                            dsl::matmul(Q, K, true, false, BH), seq)
+                            - dsl::row_broadcast(m_t))),
+                        BH * seq, seq);
+                return dsl::compute_reduce(engine,
+                    dsl::row_reduce_sum(dsl::exp(masked_causal_(
+                        dsl::matmul(Q, K, true, false, BH), seq)
+                        - dsl::row_broadcast(m_t))),
+                    BH * seq, seq);
+            };
+            const auto compute_W = [&](const Tensor& m_t, const Tensor& l_t) -> Result<Tensor> {
+                if (use_slopes && use_doc)
+                    return dsl::compute(engine,
+                        dsl::exp(masked_alibi_doc_(
+                            dsl::matmul(Q, K, true, false, BH), seq)
+                            - dsl::row_broadcast(m_t)) / dsl::row_broadcast(l_t),
+                        BH * seq, seq);
+                if (use_slopes)
+                    return dsl::compute(engine,
+                        dsl::exp(masked_alibi_(
+                            dsl::matmul(Q, K, true, false, BH), seq)
+                            - dsl::row_broadcast(m_t)) / dsl::row_broadcast(l_t),
+                        BH * seq, seq);
+                if (use_doc)
+                    return dsl::compute(engine,
+                        dsl::exp(masked_doc_(
+                            dsl::matmul(Q, K, true, false, BH), seq)
+                            - dsl::row_broadcast(m_t)) / dsl::row_broadcast(l_t),
+                        BH * seq, seq);
+                return dsl::compute(engine,
+                    dsl::exp(masked_causal_(
+                        dsl::matmul(Q, K, true, false, BH), seq)
+                        - dsl::row_broadcast(m_t)) / dsl::row_broadcast(l_t),
+                    BH * seq, seq);
+            };
+            // m = row_max(scale·Q·K^T + mask)
+            auto m = compute_m();
             if (!m) return std::unexpected(m.error());
-            auto l = engine.batched_matmul_softmax_denom(
-                Q, K, *m, BH, true, false, scale_, two_pass_bias_);
+            // l = row_sum(exp(scale·Q·K^T + mask − m))
+            auto l = compute_l(*m);
             if (!l) return std::unexpected(l.error());
-            // V 需 (BH*seq, d_k) 布局（apply 原语的 V 约定）：V (BH*d_k, seq)
-            // 是 per-batch (d_k, seq)，需按 batch 转置：
-            //   transpose → (seq, BH*d_k) → rearrange_3d(seq, BH, d_k) → (BH*seq, d_k)
+            // W = exp(scale·Q·K^T + mask − m) / l（物化，backward 复用）
+            auto W = compute_W(*m, *l);
+            if (!W) return std::unexpected(W.error());
+            // V 需 (BH*seq, d_k) 布局：V (BH*d_k, seq) 是 per-batch (d_k, seq)，
+            // 按 batch 转置：transpose → (seq, BH*d_k) → rearrange_3d → (BH*seq, d_k)
             auto V_T_full = engine.transpose(V);
             if (!V_T_full) return std::unexpected(V_T_full.error());
             auto V_t = engine.rearrange_3d(*V_T_full, seq, BH, d_k_, false);
             if (!V_t) return std::unexpected(V_t.error());
-            auto O_t = engine.batched_matmul_softmax_apply(
-                Q, K, *V_t, *m, *l, BH, true, false, scale_, two_pass_bias_);
+            // O = W × V_t（普通 batched_matmul 原语）
+            auto O_t = engine.batched_matmul(*W, *V_t, BH, false, false);
             if (!O_t) return std::unexpected(O_t.error());
             // O_t: (BH*seq, d_k) → 按 batch 转置回 (BH*d_k, seq) 供后续 rearrange：
             //   transpose → (d_k, BH*seq) → rearrange_3d(d_k, BH, seq) → (BH*d_k, seq)
@@ -446,6 +578,7 @@ public:
                 V_cache_ = std::move(V);
                 m_cache_ = std::move(*m);
                 l_cache_ = std::move(*l);
+                W_cache_ = std::move(*W);
             }
             two_pass_active_ = true;
         }
@@ -540,21 +673,38 @@ public:
             if (!G_T_full) return std::unexpected(G_T_full.error());
             auto G = engine.rearrange_3d(*G_T_full, seq, BH, d_k_, false);
             if (!G) return std::unexpected(G.error());
-            // Pass 1：R[i] = Σ_j W·P；grad_Q[:,i] = scale·Σ_j W·(P−R)·K_b[:,j]
-            // （kernel 内部重算 W，不物化 (BH*seq, seq)）
-            Tensor R;
-            auto gq = engine.batched_matmul_softmax_backward_q(
-                Q_cache_, K_cache_, *grad_A, m_cache_, l_cache_,
-                BH, true, false, scale_, R, two_pass_bias_);
+            // ── S7 IR 路径（M6 → R/X 表达式 + 普通 batched_matmul）──
+            //   R  = row_sum(W·P)                     → (BH*seq, 1)
+            //   X  = scale·W·(P − R)                  → (BH*seq, seq)（物化）
+            //   grad_Q = K × X^T；grad_K = Q × X；grad_V = W^T × G
+            auto R = dsl::compute_reduce(engine,
+                dsl::row_reduce_sum(dsl::leaf(W_cache_) * dsl::leaf(*grad_A)),
+                BH * seq, seq);
+            if (!R) return std::unexpected(R.error());
+            auto X = dsl::compute(engine,
+                dsl::leaf(W_cache_)
+                    * (dsl::leaf(*grad_A) - dsl::row_broadcast(*R)),
+                BH * seq, seq);
+            if (!X) return std::unexpected(X.error());
+            // grad_Q = K × X^T（K_b (d_k,seq)，X_b (seq,seq) 按 X^T 使用）
+            auto gq = engine.batched_matmul(K_cache_, *X, BH, false, true);
             if (!gq) return std::unexpected(gq.error());
-            // Pass 2：grad_K[:,j] = scale·Σ_i W·(P−R)·Q_b[:,i]；
-            //          grad_V[j][k] = Σ_i W·G[i][k]
-            auto gkv = engine.batched_matmul_softmax_backward_kv(
-                Q_cache_, K_cache_, *grad_A, *G, R, m_cache_, l_cache_,
-                BH, true, false, scale_, grad_V_re, two_pass_bias_);
-            if (!gkv) return std::unexpected(gkv.error());
+            { auto gqs = engine.scale_inplace(*gq, scale_); if (!gqs) return std::unexpected(gqs.error()); }
+            if (!gq) return std::unexpected(gq.error());
+            // grad_K = Q × X
+            auto gk = engine.batched_matmul(Q_cache_, *X, BH, false, false);
+            if (!gk) return std::unexpected(gk.error());
+            // grad_V = W^T × G（W_b (seq,seq) 按 W^T 使用，G_b (seq,d_k)）→ (BH*seq, d_k)
+            auto gv_t = engine.batched_matmul(W_cache_, *G, BH, true, false);
+            if (!gv_t) return std::unexpected(gv_t.error());
+            // grad_V 转置回 (BH*d_k, seq)（与 forward 的 V_t→V 逆变换一致）
+            auto gv_T = engine.transpose(*gv_t);
+            if (!gv_T) return std::unexpected(gv_T.error());
+            auto gv_re = engine.rearrange_3d(*gv_T, d_k_, BH, seq, false);
+            if (!gv_re) return std::unexpected(gv_re.error());
             grad_Q_re = std::move(*gq);
-            grad_K_re = std::move(*gkv);
+            grad_K_re = std::move(*gk);
+            grad_V_re = std::move(*gv_re);
         }
         else
         {
@@ -863,9 +1013,11 @@ private:
     std::size_t mask_cached_batch_ = 0;  // 缓存键：batch（独立字段，避免位打包溢出）
     std::size_t mask_cached_seq_ = 0;    // 缓存键：seq_len
 
-    // 两趟式（M6）组合偏置小张量缓存（AttnBias 描述子指向它们）
+    // 两趟式（M6→S7）组合偏置小张量缓存（AttnBias 描述子指向它们；
+    // S7 IR 掩码表达式经 mask_slopes_/mask_doc_col_/mask_doc_ids_ 读取）
     Tensor slopes_cache_;   // (1, num_heads) ALiBi 按头斜率（惰性构建）
     Tensor doc_ids_cache_;  // (1, batch*seq) 每位置文档 id（每步重建）
+    Tensor doc_col_;        // (BH*seq, 1) 每行文档 id（每步重建，S7 掩码用）
 
     // ALiBi 斜率：m_h = 2^(-8h/H)（仅 use_alibi_ = true 时使用）
     std::vector<Scalar> slopes_;
@@ -949,9 +1101,7 @@ protected:
     [[nodiscard]] Result<TwoPassMask> two_pass_mask_(
         ComputeEngine& engine, std::size_t batch, std::size_t seq) override
     {
-        AttnBias bias;
-        bias.causal = true;
-        bias.num_heads = num_heads_;
+        // 掩码分量由 mask_slopes_/mask_doc_col_/mask_doc_ids_ 钩子读取（IR 表达式）
         if (use_alibi_)
         {
             if (!slopes_cache_.valid())
@@ -963,21 +1113,50 @@ protected:
                 if (!t) return std::unexpected(t.error());
                 slopes_cache_ = std::move(*t);
             }
-            bias.slopes = &slopes_cache_;
         }
         if (has_doc_ids_)
         {
-            // 文档感知：doc_ids_ 每 batch 变化，每步重建（小张量 O(batch*seq)）
-            Matrix d(1, batch * seq);
-            for (std::size_t p = 0; p < batch * seq; ++p)
-                d.set_value_unchecked(0, p, static_cast<Scalar>(doc_ids_[p]));
+            // 文档感知：doc_ids_ 每 batch 变化，每步重建（小张量 O(BH*seq)）。
+            // S7：doc_ids_cache_ 为 (1, BH*seq) 布局——每 (b,h) 块重复
+            // doc_ids[b*seq..]（BatchCol 视图的 batch 下标 = BH 网格下标；
+            // 旧 M5 AttnBias 的 (1, batch*seq) 布局 S7 起不再适用）
+            Matrix d(1, batch * num_heads_ * seq);
+            for (std::size_t b = 0; b < batch; ++b)
+                for (std::size_t h = 0; h < num_heads_; ++h)
+                    for (std::size_t i = 0; i < seq; ++i)
+                        d.set_value_unchecked(0, (b * num_heads_ + h) * seq + i,
+                                              static_cast<Scalar>(doc_ids_[b * seq + i]));
             auto t = engine.from_matrix(d);
             if (!t) return std::unexpected(t.error());
             doc_ids_cache_ = std::move(*t);
-            bias.doc_ids = &doc_ids_cache_;
+
+            // S7：doc_col_（(BH*seq,1)）每行文档 id：doc_col[b*H*seq+h*seq+i]
+            // = doc_ids[b*seq+i]（跨 head 重复；IR 掩码按行广播读取）
+            {
+                const std::size_t BH = batch * num_heads_;
+                Matrix dc(BH * seq, 1);
+                for (std::size_t b = 0; b < batch; ++b)
+                    for (std::size_t h = 0; h < num_heads_; ++h)
+                        for (std::size_t i = 0; i < seq; ++i)
+                            dc.set_value_unchecked(
+                                (b * num_heads_ + h) * seq + i, 0,
+                                static_cast<Scalar>(doc_ids_[b * seq + i]));
+                auto tc = engine.from_matrix(dc);
+                if (!tc) return std::unexpected(tc.error());
+                doc_col_ = std::move(*tc);
+            }
+
         }
-        return TwoPassMask{/*use_two_pass=*/true, bias};
+        return TwoPassMask{/*use_two_pass=*/true};
     }
+
+    // ── S7 掩码输入张量钩子（IR 掩码表达式读取）──────────────────────
+    [[nodiscard]] const Tensor* mask_slopes_() const override
+    { return use_alibi_ ? &slopes_cache_ : nullptr; }
+    [[nodiscard]] const Tensor* mask_doc_col_() const override
+    { return has_doc_ids_ ? &doc_col_ : nullptr; }
+    [[nodiscard]] const Tensor* mask_doc_ids_() const override
+    { return has_doc_ids_ ? &doc_ids_cache_ : nullptr; }
 
     // 重写增量推理掩码钩子：ALiBi 模式下施加线性距离偏置。
     // 普通因果模式（use_alibi_ = false）：no-op，因 cache 只含前文，因果天然满足。

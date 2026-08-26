@@ -414,362 +414,6 @@ public:
         return Tensor::from_gpu(std::move(*r));
     }
 
-private:
-    // AttnBias 的 GPU 小张量准备（doc_ids/slopes 上传 + causal/num_heads），
-    // 供 5 个两趟式融合原语 dispatch 复用。dense 掩码在调用点单独处理。
-    //
-    // 注意：doc_ptr/slopes_ptr 指向本结构体内 optional 持有的 GpuTensor，
-    // 故必须用 out-参数填充（调用点持有的局部对象；按值返回会被 move 使指针悬垂）。
-    struct GpuBiasPrep
-    {
-        std::optional<GpuTensor> doc_gpu, slopes_gpu;
-        GpuTensor* doc_ptr = nullptr;
-        GpuTensor* slopes_ptr = nullptr;
-        bool causal = false;
-        std::size_t num_heads = 1;
-    };
-    [[nodiscard]] Result<void> prep_bias_(const AttnBias& b, GpuBiasPrep& r)
-    {
-        r.causal = b.causal;
-        r.num_heads = b.num_heads;
-        r.doc_ptr = nullptr;
-        r.slopes_ptr = nullptr;
-        if (b.doc_ids)
-        {
-            auto d = ensure_gpu(*b.doc_ids);
-            if (!d) return std::unexpected(d.error());
-            r.doc_gpu = d->gpu_tensor();
-            r.doc_ptr = &*r.doc_gpu;
-        }
-        if (b.slopes)
-        {
-            auto s = ensure_gpu(*b.slopes);
-            if (!s) return std::unexpected(s.error());
-            r.slopes_gpu = s->gpu_tensor();
-            r.slopes_ptr = &*r.slopes_gpu;
-        }
-        return {};
-    }
-
-public:
-    // ══════════════════════════════════════════════════════════════════════
-    // matmul 融合原语（M4；GPU 融合 shader 不物化中间得分矩阵）
-    // ══════════════════════════════════════════════════════════════════════
-
-    [[nodiscard]] Result<Tensor> batched_matmul_reduce(
-        const Tensor& A, const Tensor& B, std::size_t batch,
-        ReduceOp op, bool transA, bool transB,
-        Scalar alpha, bool reduce_cols, const AttnBias& bias) override
-    {
-        if (!reduce_cols)
-            return std::unexpected(Error{
-                "GpuEngine::batched_matmul_reduce: reduce_cols=false 未在 GPU 实现"
-                "（调用方回退 CPU/组合路径）"});
-        if (batch == 0)
-            return std::unexpected(Error{"batched_matmul_reduce: batch must be > 0"});
-        if (A.rows() % batch != 0 || B.rows() % batch != 0)
-            return std::unexpected(Error{"batched_matmul_reduce: rows not divisible by batch"});
-        const std::size_t a_rpb = A.rows() / batch;
-        const std::size_t b_rpb = B.rows() / batch;
-        const std::size_t M = transA ? A.cols() : a_rpb;
-        const std::size_t K = transA ? a_rpb : A.cols();
-        const std::size_t K2 = transB ? B.cols() : b_rpb;
-        const std::size_t N = transB ? b_rpb : B.cols();
-        if (K != K2)
-            return std::unexpected(Error{"batched_matmul_reduce: K dimension mismatch"});
-
-        auto a_gpu = ensure_gpu(A);
-        if (!a_gpu) return std::unexpected(a_gpu.error());
-        auto b_gpu = ensure_gpu(B);
-        if (!b_gpu) return std::unexpected(b_gpu.error());
-        std::optional<GpuTensor> mask_gpu;
-        GpuTensor* mask_ptr = nullptr;
-        if (bias.dense)
-        {
-            auto mg = ensure_gpu(*bias.dense);
-            if (!mg) return std::unexpected(mg.error());
-            mask_gpu = mg->gpu_tensor();
-            mask_ptr = &*mask_gpu;
-        }
-        GpuBiasPrep bp;
-        auto bp_r = prep_bias_(bias, bp);
-        if (!bp_r) return std::unexpected(bp_r.error());
-        auto r = backend_.bmm_reduce_gpu(
-            a_gpu->gpu_tensor(), b_gpu->gpu_tensor(), mask_ptr,
-            bp.doc_ptr, bp.slopes_ptr,
-            M, N, K, batch, static_cast<std::size_t>(op),
-            transA, transB, alpha, bp.causal, bp.num_heads);
-        if (!r) return std::unexpected(r.error());
-        return Tensor::from_gpu(std::move(*r));
-    }
-
-    [[nodiscard]] Result<Tensor> batched_matmul_softmax_denom(
-        const Tensor& A, const Tensor& B, const Tensor& row_max,
-        std::size_t batch, bool transA, bool transB, Scalar alpha,
-        const AttnBias& bias) override
-    {
-        if (batch == 0)
-            return std::unexpected(Error{"batched_matmul_softmax_denom: batch must be > 0"});
-        if (A.rows() % batch != 0 || B.rows() % batch != 0)
-            return std::unexpected(Error{"batched_matmul_softmax_denom: rows not divisible by batch"});
-        const std::size_t a_rpb = A.rows() / batch;
-        const std::size_t b_rpb = B.rows() / batch;
-        const std::size_t M = transA ? A.cols() : a_rpb;
-        const std::size_t K = transA ? a_rpb : A.cols();
-        const std::size_t K2 = transB ? B.cols() : b_rpb;
-        const std::size_t N = transB ? b_rpb : B.cols();
-        if (K != K2)
-            return std::unexpected(Error{"batched_matmul_softmax_denom: K dimension mismatch"});
-
-        auto a_gpu = ensure_gpu(A);
-        if (!a_gpu) return std::unexpected(a_gpu.error());
-        auto b_gpu = ensure_gpu(B);
-        if (!b_gpu) return std::unexpected(b_gpu.error());
-        auto m_gpu = ensure_gpu(row_max);
-        if (!m_gpu) return std::unexpected(m_gpu.error());
-        std::optional<GpuTensor> mask_gpu;
-        GpuTensor* mask_ptr = nullptr;
-        if (bias.dense)
-        {
-            auto mg = ensure_gpu(*bias.dense);
-            if (!mg) return std::unexpected(mg.error());
-            mask_gpu = mg->gpu_tensor();
-            mask_ptr = &*mask_gpu;
-        }
-        GpuBiasPrep bp;
-        auto bp_r = prep_bias_(bias, bp);
-        if (!bp_r) return std::unexpected(bp_r.error());
-        auto r = backend_.bmm_denom_gpu(
-            a_gpu->gpu_tensor(), b_gpu->gpu_tensor(), mask_ptr,
-            bp.doc_ptr, bp.slopes_ptr,
-            m_gpu->gpu_tensor(), M, N, K, batch, transA, transB, alpha,
-            bp.causal, bp.num_heads);
-        if (!r) return std::unexpected(r.error());
-        return Tensor::from_gpu(std::move(*r));
-    }
-
-    [[nodiscard]] Result<Tensor> batched_matmul_softmax_apply(
-        const Tensor& A, const Tensor& B, const Tensor& V,
-        const Tensor& row_max, const Tensor& denom,
-        std::size_t batch, bool transA, bool transB, Scalar alpha,
-        const AttnBias& bias) override
-    {
-        if (batch == 0)
-            return std::unexpected(Error{"batched_matmul_softmax_apply: batch must be > 0"});
-        if (A.rows() % batch != 0 || B.rows() % batch != 0 || V.rows() % batch != 0)
-            return std::unexpected(Error{"batched_matmul_softmax_apply: rows not divisible by batch"});
-        const std::size_t a_rpb = A.rows() / batch;
-        const std::size_t b_rpb = B.rows() / batch;
-        const std::size_t M = transA ? A.cols() : a_rpb;
-        const std::size_t K = transA ? a_rpb : A.cols();
-        const std::size_t K2 = transB ? B.cols() : b_rpb;
-        const std::size_t N = transB ? b_rpb : B.cols();
-        const std::size_t Nv = V.rows() / batch;
-        const std::size_t D = V.cols();
-        if (K != K2)
-            return std::unexpected(Error{"batched_matmul_softmax_apply: K dimension mismatch"});
-        if (Nv != N)
-            return std::unexpected(Error{"batched_matmul_softmax_apply: V rows per batch != N"});
-
-        auto a_gpu = ensure_gpu(A);
-        if (!a_gpu) return std::unexpected(a_gpu.error());
-        auto b_gpu = ensure_gpu(B);
-        if (!b_gpu) return std::unexpected(b_gpu.error());
-        auto v_gpu = ensure_gpu(V);
-        if (!v_gpu) return std::unexpected(v_gpu.error());
-        auto m_gpu = ensure_gpu(row_max);
-        if (!m_gpu) return std::unexpected(m_gpu.error());
-        auto l_gpu = ensure_gpu(denom);
-        if (!l_gpu) return std::unexpected(l_gpu.error());
-        std::optional<GpuTensor> mask_gpu;
-        GpuTensor* mask_ptr = nullptr;
-        if (bias.dense)
-        {
-            auto mg = ensure_gpu(*bias.dense);
-            if (!mg) return std::unexpected(mg.error());
-            mask_gpu = mg->gpu_tensor();
-            mask_ptr = &*mask_gpu;
-        }
-        GpuBiasPrep bp;
-        auto bp_r = prep_bias_(bias, bp);
-        if (!bp_r) return std::unexpected(bp_r.error());
-        auto r = backend_.bmm_apply_gpu(
-            a_gpu->gpu_tensor(), b_gpu->gpu_tensor(), mask_ptr,
-            bp.doc_ptr, bp.slopes_ptr,
-            m_gpu->gpu_tensor(), l_gpu->gpu_tensor(), v_gpu->gpu_tensor(),
-            M, N, K, D, batch, transA, transB, alpha, bp.causal, bp.num_heads);
-        if (!r) return std::unexpected(r.error());
-        return Tensor::from_gpu(std::move(*r));
-    }
-
-    // 两趟式注意力反向 Pass 1：R 与 grad_Q（GPU 融合 kernel，不物化得分矩阵）
-    [[nodiscard]] Result<Tensor> batched_matmul_softmax_backward_q(
-        const Tensor& A, const Tensor& B, const Tensor& P,
-        const Tensor& row_max, const Tensor& denom,
-        std::size_t batch, bool transA, bool transB, Scalar alpha,
-        Tensor& r_out, const AttnBias& bias) override
-    {
-        if (batch == 0)
-            return std::unexpected(Error{"batched_matmul_softmax_backward_q: batch must be > 0"});
-        if (A.rows() % batch != 0 || B.rows() % batch != 0 || P.rows() % batch != 0)
-            return std::unexpected(Error{"batched_matmul_softmax_backward_q: rows not divisible by batch"});
-        const std::size_t a_rpb = A.rows() / batch;
-        const std::size_t b_rpb = B.rows() / batch;
-        const std::size_t M = transA ? A.cols() : a_rpb;
-        const std::size_t K = transA ? a_rpb : A.cols();
-        const std::size_t K2 = transB ? B.cols() : b_rpb;
-        const std::size_t N = transB ? b_rpb : B.cols();
-        if (K != K2)
-            return std::unexpected(Error{"batched_matmul_softmax_backward_q: K dimension mismatch"});
-
-        auto a_gpu = ensure_gpu(A);
-        if (!a_gpu) return std::unexpected(a_gpu.error());
-        auto b_gpu = ensure_gpu(B);
-        if (!b_gpu) return std::unexpected(b_gpu.error());
-        auto p_gpu = ensure_gpu(P);
-        if (!p_gpu) return std::unexpected(p_gpu.error());
-        auto m_gpu = ensure_gpu(row_max);
-        if (!m_gpu) return std::unexpected(m_gpu.error());
-        auto l_gpu = ensure_gpu(denom);
-        if (!l_gpu) return std::unexpected(l_gpu.error());
-        std::optional<GpuTensor> mask_gpu;
-        GpuTensor* mask_ptr = nullptr;
-        if (bias.dense)
-        {
-            auto mg = ensure_gpu(*bias.dense);
-            if (!mg) return std::unexpected(mg.error());
-            mask_gpu = mg->gpu_tensor();
-            mask_ptr = &*mask_gpu;
-        }
-        GpuBiasPrep bp;
-        auto bp_r = prep_bias_(bias, bp);
-        if (!bp_r) return std::unexpected(bp_r.error());
-        GpuTensor r_gpu;
-        auto r = backend_.bmm_q_backward_gpu(
-            a_gpu->gpu_tensor(), b_gpu->gpu_tensor(), mask_ptr,
-            bp.doc_ptr, bp.slopes_ptr,
-            m_gpu->gpu_tensor(), l_gpu->gpu_tensor(), p_gpu->gpu_tensor(),
-            M, N, K, batch, transA, transB, alpha, bp.causal, bp.num_heads, &r_gpu);
-        if (!r) return std::unexpected(r.error());
-        r_out = Tensor::from_gpu(std::move(r_gpu));
-        return Tensor::from_gpu(std::move(*r));
-    }
-
-    // 两趟式注意力反向 Pass 2：grad_K 与 grad_V（GPU 融合 kernel）
-    [[nodiscard]] Result<Tensor> batched_matmul_softmax_backward_kv(
-        const Tensor& A, const Tensor& B, const Tensor& P,
-        const Tensor& G, const Tensor& R,
-        const Tensor& row_max, const Tensor& denom,
-        std::size_t batch, bool transA, bool transB, Scalar alpha,
-        Tensor& grad_v_out, const AttnBias& bias) override
-    {
-        if (batch == 0)
-            return std::unexpected(Error{"batched_matmul_softmax_backward_kv: batch must be > 0"});
-        if (A.rows() % batch != 0 || B.rows() % batch != 0 || P.rows() % batch != 0
-            || G.rows() % batch != 0)
-            return std::unexpected(Error{"batched_matmul_softmax_backward_kv: rows not divisible by batch"});
-        const std::size_t a_rpb = A.rows() / batch;
-        const std::size_t b_rpb = B.rows() / batch;
-        const std::size_t M = transA ? A.cols() : a_rpb;
-        const std::size_t K = transA ? a_rpb : A.cols();
-        const std::size_t K2 = transB ? B.cols() : b_rpb;
-        const std::size_t N = transB ? b_rpb : B.cols();
-        const std::size_t D = G.cols();
-        if (K != K2)
-            return std::unexpected(Error{"batched_matmul_softmax_backward_kv: K dimension mismatch"});
-        if (G.rows() != batch * M)
-            return std::unexpected(Error{"batched_matmul_softmax_backward_kv: G rows != batch*M"});
-
-        auto a_gpu = ensure_gpu(A);
-        if (!a_gpu) return std::unexpected(a_gpu.error());
-        auto b_gpu = ensure_gpu(B);
-        if (!b_gpu) return std::unexpected(b_gpu.error());
-        auto p_gpu = ensure_gpu(P);
-        if (!p_gpu) return std::unexpected(p_gpu.error());
-        auto g_gpu = ensure_gpu(G);
-        if (!g_gpu) return std::unexpected(g_gpu.error());
-        auto r_gpu = ensure_gpu(R);
-        if (!r_gpu) return std::unexpected(r_gpu.error());
-        auto m_gpu = ensure_gpu(row_max);
-        if (!m_gpu) return std::unexpected(m_gpu.error());
-        auto l_gpu = ensure_gpu(denom);
-        if (!l_gpu) return std::unexpected(l_gpu.error());
-        std::optional<GpuTensor> mask_gpu;
-        GpuTensor* mask_ptr = nullptr;
-        if (bias.dense)
-        {
-            auto mg = ensure_gpu(*bias.dense);
-            if (!mg) return std::unexpected(mg.error());
-            mask_gpu = mg->gpu_tensor();
-            mask_ptr = &*mask_gpu;
-        }
-        GpuBiasPrep bp;
-        auto bp_r = prep_bias_(bias, bp);
-        if (!bp_r) return std::unexpected(bp_r.error());
-        GpuTensor gv_gpu;
-        auto r = backend_.bmm_kv_backward_gpu(
-            a_gpu->gpu_tensor(), b_gpu->gpu_tensor(), mask_ptr,
-            bp.doc_ptr, bp.slopes_ptr,
-            m_gpu->gpu_tensor(), l_gpu->gpu_tensor(), p_gpu->gpu_tensor(),
-            g_gpu->gpu_tensor(), r_gpu->gpu_tensor(),
-            M, N, K, D, batch, transA, transB, alpha, bp.causal, bp.num_heads, &gv_gpu);
-        if (!r) return std::unexpected(r.error());
-        grad_v_out = Tensor::from_gpu(std::move(gv_gpu));
-        return Tensor::from_gpu(std::move(*r));
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 列式 softmax 融合原语（M5；GPU 融合 shader 不物化 (C, N) exp/softmax）
-    // ══════════════════════════════════════════════════════════════════════
-
-    [[nodiscard]] Result<Tensor> col_softmax_denom(
-        const Tensor& logits, const Tensor& col_max) override
-    {
-        const std::size_t C = logits.rows(), N = logits.cols();
-        auto l_gpu = ensure_gpu(logits);
-        if (!l_gpu) return std::unexpected(l_gpu.error());
-        auto m_gpu = ensure_gpu(col_max);
-        if (!m_gpu) return std::unexpected(m_gpu.error());
-        auto r = backend_.col_softmax_denom_gpu(
-            l_gpu->gpu_tensor(), m_gpu->gpu_tensor(), C, N);
-        if (!r) return std::unexpected(r.error());
-        return Tensor::from_gpu(std::move(*r));
-    }
-
-    [[nodiscard]] Result<Tensor> col_softmax_sparse_forward(
-        const Tensor& logits, const Tensor& labels, const Tensor* mask,
-        std::size_t vocab_size, Scalar inv_num_valid,
-        Tensor& loss_vec_out) override
-    {
-        if (vocab_size > (std::size_t{1} << 24))
-            return std::unexpected(Error{
-                "col_softmax_sparse_forward: vocab_size exceeds 2^24 "
-                "(float labels not exactly representable)"});
-        const std::size_t C = logits.rows(), N = logits.cols();
-        if (vocab_size > C)
-            return std::unexpected(Error{"col_softmax_sparse_forward: vocab_size > classes"});
-        auto l_gpu = ensure_gpu(logits);
-        if (!l_gpu) return std::unexpected(l_gpu.error());
-        auto lb_gpu = ensure_gpu(labels);
-        if (!lb_gpu) return std::unexpected(lb_gpu.error());
-        std::optional<GpuTensor> mask_gpu;
-        GpuTensor* mask_ptr = nullptr;
-        if (mask)
-        {
-            auto mg = ensure_gpu(*mask);
-            if (!mg) return std::unexpected(mg.error());
-            mask_gpu = mg->gpu_tensor();
-            mask_ptr = &*mask_gpu;
-        }
-        GpuTensor lv_gpu;
-        auto r = backend_.col_softmax_sparse_forward_gpu(
-            l_gpu->gpu_tensor(), lb_gpu->gpu_tensor(), mask_ptr,
-            C, N, vocab_size, inv_num_valid, &lv_gpu);
-        if (!r) return std::unexpected(r.error());
-        loss_vec_out = Tensor::from_gpu(std::move(lv_gpu));
-        return Tensor::from_gpu(std::move(*r));
-    }
-
     // A += B：真原地，直接写回 A 的 buffer（与 CpuEngine 语义一致）
     // 逐元素 kernel 每线程只读写自己下标一次，read-before-write 天然成立。
     // 免去新 buffer 分配 + 全量写出，消除优化器/梯度累积路径的分配风暴。
@@ -1086,7 +730,9 @@ public:
             const auto vp = nn::expr_spec_runtime_view_params(spec);
             auto out = backend_.run_fused_gpu(
                 key, gpu_inputs, spec.consts, rows, cols,
-                /*vector_out=*/false, vp);
+                /*vector_out=*/false, vp, /*output_override=*/nullptr,
+                nn::expr_spec_runtime_matmul_k(spec),
+                nn::expr_spec_runtime_matmul_batch(spec));
             if (!out) return std::unexpected(out.error());
             return Tensor::from_gpu(std::move(*out));
         }
@@ -1139,7 +785,9 @@ public:
             }
             const auto vp = nn::expr_spec_runtime_view_params(spec);
             auto out = backend_.run_fused_gpu(
-                key, gpu_inputs, spec.consts, rows, cols, /*vector_out=*/true, vp);
+                key, gpu_inputs, spec.consts, rows, cols, /*vector_out=*/true, vp,
+                /*output_override=*/nullptr, nn::expr_spec_runtime_matmul_k(spec),
+                nn::expr_spec_runtime_matmul_batch(spec));
             if (!out) return std::unexpected(out.error());
             return Tensor::from_gpu(std::move(*out));
         }
@@ -1160,7 +808,31 @@ private:
     // D3：node_outputs 随图（thread-local 堆分配）隔离，不再用引擎成员。
     [[nodiscard]] Result<void> execute_fused_graph(ExprGraph& g)
     {
-        auto kernels = fuse_expr_graph(g);
+        // P2-12 图级缓存跨 step 复用：训练每 step 结构重复，整图结构 key
+        // 命中缓存则直接实例化 kernel 计划（跳过融合分析 + 拼接 canonicalize
+        // + validate + key 计算），消除训练热路径的重复 CPU 融合开销。
+        // 缓存只复用结构决策，运行时按 plan 绑定 node_outputs 与外部张量。
+        auto& gcache = fused::graph_plan_cache();
+        const std::uint64_t gkey = graph_cache_key(g);
+        std::vector<FusedKernel> kernels;
+        const auto cit = gcache.find(gkey);
+        if (cit != gcache.end())
+        {
+            kernels.reserve(cit->second.size());
+            for (const auto& p : cit->second)
+                kernels.push_back(instantiate_plan(p, g));
+        }
+        else
+        {
+            kernels = fuse_expr_graph(g);
+            std::vector<FusedKernelPlan> plans;
+            plans.reserve(kernels.size());
+            for (const auto& k : kernels)
+                plans.push_back(plan_from_kernel(k));
+            if (gcache.size() >= fused::GRAPH_PLAN_CACHE_MAX)
+                gcache.clear();
+            gcache.emplace(gkey, std::move(plans));
+        }
 
         // P1（IR 中间张量消除）：标记需要保留占位 buffer 的节点——
         //   * kernel 的 tail（输出节点，Layer 持有的占位 Tensor 在此物化）
@@ -1216,7 +888,9 @@ private:
                     out_override = &out_it->second.gpu_tensor();
                 auto out = backend_.run_fused_gpu(
                     key, gpu_inputs, k.spec.consts, k.rows, k.cols,
-                    k.vector_out, vp, out_override);
+                    k.vector_out, vp, out_override,
+                    nn::expr_spec_runtime_matmul_k(k.spec),
+                    nn::expr_spec_runtime_matmul_batch(k.spec));
                 if (!out) return std::unexpected(out.error());
                 if (!out_override)
                     g.node_outputs[k.tail] = Tensor::from_gpu(std::move(*out));

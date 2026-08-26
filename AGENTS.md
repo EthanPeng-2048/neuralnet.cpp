@@ -155,4 +155,5 @@ optimizer.step();
 | `11-ir-optimization.md` | IR 优化（IR-A/B/C/D 已实施） |
 | `12-innovative-designs.md` | 创新设计全景 |
 | `13-optimize-proposal-list.md` | 待做优化方案清单 |
+| `14-operator-fusion-2.md` | 融合算子二期：matmul 参与 IR 融合 + 跨 kernel 自动融合（P2-05/P2-10，删 M4-M6 手写原语） |
 | `DEVELOPMENT_STANDARDS.md` | C++ 编码规范全文 |

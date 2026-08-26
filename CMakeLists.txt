@@ -191,6 +191,10 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(expr_reduce_test src/expr_reduce_test.cpp)
     list(APPEND NN_TEST_TARGETS expr_reduce_test)
 
+    # ── matmul 参与 IR 融合测试（14 文档 S1+S2：MatmulSpec + CPU 正确性） ──
+    nn_add_executable(expr_matmul_test src/expr_matmul_test.cpp)
+    list(APPEND NN_TEST_TARGETS expr_matmul_test)
+
     # ── IR 优化 pass 测试（IR-A canonicalize + IR-B CSE/寄存器分配，纯 CPU） ─
     nn_add_executable(expr_opt_test src/expr_opt_test.cpp)
     list(APPEND NN_TEST_TARGETS expr_opt_test)
@@ -210,12 +214,6 @@ if(NN_ENABLE_TESTS)
     # ── Softmax 数值梯度检查（gradcheck，验证 softmax 反向） ───────────────────
     nn_add_executable(softmax_gradcheck src/softmax_gradcheck.cpp)
     list(APPEND NN_TEST_TARGETS softmax_gradcheck)
-
-    # ── M4 matmul 融合原语测试（bmm_reduce/bmm_denom/bmm_apply，CPU+GPU） ──
-    # ── M6 两趟式注意力反向原语测试（bmm_q_backward/bmm_kv_backward，CPU+GPU）
-    # ── M5 列式 softmax 融合原语测试（col_softmax_denom/col_softmax_sparse_forward）
-    nn_add_executable(matmul_fusion_test src/matmul_fusion_test.cpp)
-    list(APPEND NN_TEST_TARGETS matmul_fusion_test)
 
     # ── M5 稀疏交叉熵融合测试（loss/grad vs 参考，CPU+GPU） ──
     nn_add_executable(ce_fusion_test src/ce_fusion_test.cpp)
@@ -268,14 +266,7 @@ if(Vulkan_FOUND)
         broadcast
         transpose
         gather
-        scatter_add
-        bmm_reduce
-        bmm_denom
-        bmm_apply
-        bmm_q_backward
-        bmm_kv_backward
-        col_softmax_denom
-        col_softmax_sparse_forward)
+        scatter_add)
     # ── 融合 shader：构建期从 Layer 内联表达式自动合成 ───────────────
     # 表达式**文本只出现在 Layer**（compute / start_expr..end_expr）。
     # 构建期两步：
