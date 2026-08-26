@@ -28,6 +28,7 @@
 #include "compute_engine.hpp"
 #include "compute_layer.hpp"  // clone_tensor
 #include "compute_tensor.hpp"
+#include "expr_dsl.hpp"
 
 namespace nn
 {
@@ -100,7 +101,8 @@ public:
         {
             auto& g = g_ref.get();
             // g² = g * g（逐元素乘法）
-            auto g_sq_r = engine_.elementwise_binary(BinaryOp::Mul, g, g);
+            auto g_sq_r = dsl::compute(engine_, dsl::leaf(g) * dsl::leaf(g),
+                                       g.rows(), g.cols());
             if (!g_sq_r) return std::unexpected(g_sq_r.error());
             // 按行求和 → (rows, 1)
             auto row_sums_r = engine_.row_reduce_sum(*g_sq_r);
@@ -111,7 +113,8 @@ public:
 
             if (acc.valid())
             {
-                auto sum_r = engine_.elementwise_binary(BinaryOp::Add, acc, *col_sum_r);
+                auto sum_r = dsl::compute(engine_, dsl::leaf(acc) + dsl::leaf(*col_sum_r),
+                                          acc.rows(), acc.cols());
                 if (!sum_r) return std::unexpected(sum_r.error());
                 acc = std::move(*sum_r);
             }
@@ -276,7 +279,8 @@ protected:
         // v = β2*v + (1-β2)*g²
         r = engine_.scale_inplace(v_[i], beta2_);
         if (!r) return std::unexpected(r.error());
-        auto g_sq = engine_.elementwise_binary(BinaryOp::Mul, g, g);
+        auto g_sq = dsl::compute(engine_, dsl::leaf(g) * dsl::leaf(g),
+                                 g.rows(), g.cols());
         if (!g_sq) return std::unexpected(g_sq.error());
         r = engine_.scale_inplace(*g_sq, one_minus_beta2);
         if (!r) return std::unexpected(r.error());
@@ -300,11 +304,14 @@ protected:
         if (!sqrt_v) return std::unexpected(sqrt_v.error());
 
         // denom = sqrt_v + eps
+        // （eps_ 为运行期标量，折叠进 DSL key 会使不同 eps 产生不同 AOT key，
+        //   破坏闭合世界，故保留原语路径）
         auto denom = engine_.elementwise_binary_scalar(BinaryOp::Add, *sqrt_v, eps_);
         if (!denom) return std::unexpected(denom.error());
 
         // ratio = m_hat / denom
-        auto ratio = engine_.elementwise_binary(BinaryOp::Div, *m_hat, *denom);
+        auto ratio = dsl::compute(engine_, dsl::leaf(*m_hat) / dsl::leaf(*denom),
+                                  m_hat->rows(), m_hat->cols());
         if (!ratio) return std::unexpected(ratio.error());
 
         // p -= lr * ratio
@@ -461,7 +468,8 @@ public:
 
     // 计算 Frobenius 范数的平方：||G||_F² = Σ g_ij²
     // 通过 elementwise(Mul) → row_reduce_sum → col_reduce_sum 三步原语得到 (1,1) 张量
-    auto norm_sq = engine.elementwise_binary(BinaryOp::Mul, G, G);
+    auto norm_sq = dsl::compute(engine, dsl::leaf(G) * dsl::leaf(G),
+                                G.rows(), G.cols());
     if (!norm_sq) return std::unexpected(norm_sq.error());
     auto row_sum_norm = engine.row_reduce_sum(*norm_sq);
     if (!row_sum_norm) return std::unexpected(row_sum_norm.error());

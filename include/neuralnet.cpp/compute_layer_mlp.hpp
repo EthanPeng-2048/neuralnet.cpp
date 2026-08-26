@@ -165,7 +165,9 @@ public:
     {
         if (!checkpoint_mode_)
             input_cache_ = input;
-        return engine.elementwise_binary_scalar(BinaryOp::Max, input, Scalar{0});
+        return dsl::compute(engine,
+            dsl::max(dsl::leaf(input), Scalar{0}),
+            input.rows(), input.cols());
     }
 
     // ── backward: grad_x = (x > 0) ? grad_out : 0 ────────────────────────
@@ -178,12 +180,10 @@ public:
             input_cache_.cols() != grad_output.cols())
             return std::unexpected(Error{"relu backward: shape mismatch"});
 
-        return engine.elementwise_select_scalar_cond(
-            CompareOp::Gt,           // 条件：x > 0
-            input_cache_,            // 条件操作数 A = x
-            Scalar{0},               // 条件操作数 B = 0 (标量)
-            grad_output,             // then = grad_output (张量)
-            Scalar{0});              // else = 0 (标量)
+        return dsl::compute(engine,
+            dsl::select(dsl::leaf(input_cache_) > Scalar{0},
+                        dsl::leaf(grad_output), Scalar{0}),
+            grad_output.rows(), grad_output.cols());
     }
 };
 
@@ -316,13 +316,9 @@ public:
         if (!up) return std::unexpected(up.error());
 
         // s = sigmoid(gate) = 1 / (1 + exp(-gate))
-        auto t1 = engine.elementwise_unary(UnaryOp::Neg, *gate);
-        if (!t1) return std::unexpected(t1.error());
-        auto t2 = engine.elementwise_unary(UnaryOp::Exp, *t1);
-        if (!t2) return std::unexpected(t2.error());
-        auto t3 = engine.elementwise_binary_scalar(BinaryOp::Add, *t2, Scalar{1});
-        if (!t3) return std::unexpected(t3.error());
-        auto s = engine.elementwise_binary_scalar(BinaryOp::Div, *t3, Scalar{1}, true);
+        auto s = dsl::compute(engine,
+            Scalar{1} / (Scalar{1} + dsl::exp(-dsl::leaf(*gate))),
+            gate->rows(), gate->cols());
         if (!s) return std::unexpected(s.error());
 
         if (!checkpoint_mode_)
@@ -332,10 +328,10 @@ public:
             up_cache_ = *up;
         }
 
-        // sw = gate * s，out = sw ⊙ up
-        auto sw = engine.elementwise_binary(BinaryOp::Mul, *gate, *s);
-        if (!sw) return std::unexpected(sw.error());
-        return engine.elementwise_binary(BinaryOp::Mul, *sw, *up);
+        // out = SiLU(gate) ⊙ up = gate * sigmoid(gate) * up
+        return dsl::compute(engine,
+            dsl::leaf(*gate) * dsl::leaf(*s) * dsl::leaf(*up),
+            gate->rows(), gate->cols());
     }
 
     // ── backward: 用 eval_expr（表达式 DSL）融合逐元素计算 ──────────────────
@@ -509,6 +505,7 @@ public:
         if (!mean_raw) return std::unexpected(mean_raw.error());
 
         // 2. mean = mean_raw*(1/F) → (1,B)
+        // （1/F 形状相关标量在 (1,B) 小向量上用原语施加，保持融合表达式 F 无关）
         auto mean = engine.elementwise_binary_scalar(BinaryOp::Mul, *mean_raw, inv_features);
         if (!mean) return std::unexpected(mean.error());
 
@@ -523,6 +520,7 @@ public:
         if (!var_raw) return std::unexpected(var_raw.error());
 
         // 5. std_inv = rsqrt(var_raw*(1/F) + ε) → (1,B)
+        // （1/F、ε 形状相关标量在 (1,B) 小向量上用原语施加，保持融合表达式 F 无关）
         auto var = engine.elementwise_binary_scalar(BinaryOp::Mul, *var_raw, inv_features);
         if (!var) return std::unexpected(var.error());
         auto var_eps = engine.elementwise_binary_scalar(BinaryOp::Add, *var, epsilon_);
@@ -710,6 +708,7 @@ public:
         if (!s_raw) return std::unexpected(s_raw.error());
 
         // 2. rms_inv = rsqrt(s_raw*(1/F) + ε) → (1,B)
+        // （1/F、ε 形状相关标量在 (1,B) 小向量上用原语施加，保持融合表达式 F 无关）
         auto scaled = engine.elementwise_binary_scalar(BinaryOp::Mul, *s_raw, inv_features);
         if (!scaled) return std::unexpected(scaled.error());
         auto var_eps = engine.elementwise_binary_scalar(BinaryOp::Add, *scaled, epsilon_);

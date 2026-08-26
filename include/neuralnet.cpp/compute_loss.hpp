@@ -27,6 +27,7 @@
 #include "compute_engine.hpp"
 #include "compute_layer.hpp"  // clone_tensor
 #include "compute_tensor.hpp"
+#include "expr_dsl.hpp"
 
 namespace nn
 {
@@ -75,7 +76,9 @@ public:
         const Scalar scale = Scalar{2} / total;
 
         // diff = pred - target
-        auto diff = engine.elementwise_binary(BinaryOp::Sub, pred, target);
+        auto diff = dsl::compute(engine,
+            dsl::leaf(pred) - dsl::leaf(target),
+            pred.rows(), pred.cols());
         if (!diff) return std::unexpected(diff.error());
 
         // grad = diff * (2/N) — 深拷贝后 scale
@@ -84,7 +87,9 @@ public:
         if (!r) return std::unexpected(r.error());
 
         // diff_sq = diff * diff
-        auto diff_sq = engine.elementwise_binary(BinaryOp::Mul, *diff, *diff);
+        auto diff_sq = dsl::compute(engine,
+            dsl::leaf(*diff) * dsl::leaf(*diff),
+            diff->rows(), diff->cols());
         if (!diff_sq) return std::unexpected(diff_sq.error());
 
         // 全局求和：先按列归约 (1, cols)，再按行归约 (1, 1)
@@ -164,7 +169,9 @@ private:
 
         // 稳定 log_softmax = shifted - log(col_sum)
         // col_sum ≥ 1（因 max 元素 shifted=0 → exp=1），故 log(col_sum) 有限
-        auto log_col_sum = engine.elementwise_unary(UnaryOp::Log, *col_sum);
+        auto log_col_sum = dsl::compute(engine,
+            dsl::log(dsl::leaf(*col_sum)),
+            col_sum->rows(), col_sum->cols());
         if (!log_col_sum) return std::unexpected(log_col_sum.error());
 
         // log_softmax = shifted - log(col_sum)：这是**列广播**（每个元素减去
@@ -202,7 +209,9 @@ public:
         //    d(loss)/d(logits) = (softmax - one_hot) / batch。
         //    缺少 1/batch 缩放会使 SGD/动量、梯度裁剪与 PyTorch 不一致
         //    （Adam 的二阶矩会抵消常数缩放，但其他优化器不会）。
-        auto grad = engine.elementwise_binary(BinaryOp::Sub, sm->softmax, target);
+        auto grad = dsl::compute(engine,
+            dsl::leaf(sm->softmax) - dsl::leaf(target),
+            sm->softmax.rows(), sm->softmax.cols());
         if (!grad) return std::unexpected(grad.error());
         auto rg = engine.scale_inplace(*grad, Scalar{1} / static_cast<Scalar>(batch));
         if (!rg) return std::unexpected(rg.error());
@@ -212,7 +221,9 @@ public:
         //    （= shifted - log(col_sum)，避免 0*log(0)=NaN，见 M3）
 
         // 4. target_dot_log = target * log_softmax
-        auto target_dot_log = engine.elementwise_binary(BinaryOp::Mul, target, sm->log_softmax);
+        auto target_dot_log = dsl::compute(engine,
+            dsl::leaf(target) * dsl::leaf(sm->log_softmax),
+            target.rows(), target.cols());
         if (!target_dot_log) return std::unexpected(target_dot_log.error());
 
         // 5. Σ target * log_softmax (先列归约再行归约 → (1,1))

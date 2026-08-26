@@ -209,7 +209,9 @@ public:
         if (!gk) return gk;
         auto gv = w_v_.backward(engine, *grad_V);
         if (!gv) return gv;
-        return engine.elementwise_binary(BinaryOp::Add, *gk, *gv);
+        return dsl::compute(engine,
+            dsl::leaf(*gk) + dsl::leaf(*gv),
+            gk->rows(), gk->cols());
     }
 };
 
@@ -253,21 +255,39 @@ private:
     // 掩码缓存（常数，跨 step 复用；按 batch 键控）
     Tensor mask_cache_;
     std::size_t mask_batch_ = 0;
+    // 文档感知：每窗口位置 doc id（batch-major，size = batch*window_）；空=无。
+    // 用于在局部因果掩码之上叠加文档边界隔离（含 [PAD] 隔离，PAD 的 doc=0）。
+    std::vector<std::size_t> doc_ids_;
+    bool has_doc_ids_ = false;
 
     // 构建记忆-局部联合掩码 (batch*H*W, M+W)：
     //   行 (bb, t)：列 [0, M) 记忆全可见；列 [M, M+t] 局部因果；列 [M+t+1, M+W) = -1e30
+    //   文档感知（has_doc_ids_）：局部列再加 doc[j]==doc[t] 约束（跨文档/PAD 屏蔽），
+    //   记忆列仍全可见（记忆=压缩历史，不含 PAD，按 AttnZip 设计保持全局可见）。
+    //   有 doc_ids 时掩码每 step 变化，不缓存；否则按 batch 缓存复用。
     [[nodiscard]] Result<Tensor> build_mask_(ComputeEngine& engine, std::size_t batch)
     {
-        if (mask_cache_.valid() && mask_batch_ == batch)
+        if (!has_doc_ids_ && mask_cache_.valid() && mask_batch_ == batch)
             return mask_cache_;
         const std::size_t BH = batch * num_heads_;
         const std::size_t total_keys = memory_ + window_;
         Matrix mask(BH * window_, total_keys, Scalar{0});
         const Scalar NEG = Scalar{-1e30};
         for (std::size_t bb = 0; bb < BH; ++bb)
+        {
+            const std::size_t b = bb / num_heads_;
             for (std::size_t t = 0; t < window_; ++t)
-                for (std::size_t j = memory_ + t + 1; j < total_keys; ++j)
-                    mask.set_value_unchecked(bb * window_ + t, j, NEG);
+            {
+                // 局部因果：未来位置（j_local > t）屏蔽
+                for (std::size_t jl = t + 1; jl < window_; ++jl)
+                    mask.set_value_unchecked(bb * window_ + t, memory_ + jl, NEG);
+                // 文档边界：跨文档（含 PAD，doc=0）屏蔽
+                if (has_doc_ids_)
+                    for (std::size_t jl = 0; jl < window_; ++jl)
+                        if (doc_ids_[b * window_ + jl] != doc_ids_[b * window_ + t])
+                            mask.set_value_unchecked(bb * window_ + t, memory_ + jl, NEG);
+            }
+        }
         auto mr = engine.from_matrix(mask);
         if (!mr) return std::unexpected(mr.error());
         mask_cache_ = std::move(*mr);
@@ -363,6 +383,21 @@ public:
         batch_cache_ = 0;
     }
 
+    // 文档感知：记录本块输入（局部窗口）每位置的文档 id（batch-major）。
+    // 传空 span 清除文档感知，退化为纯因果局部掩码。
+    void set_doc_ids(std::span<const std::size_t> ids) override
+    {
+        if (ids.empty())
+        {
+            doc_ids_.clear();
+            has_doc_ids_ = false;
+            mask_cache_ = Tensor{};   // 使掩码回到按 batch 缓存
+            return;
+        }
+        doc_ids_.assign(ids.begin(), ids.end());
+        has_doc_ids_ = true;
+    }
+
     // 基类单输入 forward/backward 不适用于双输入块（仅经 ZiPTModel 组合使用）
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& /*input*/) override
@@ -438,7 +473,9 @@ public:
         auto out_attn = w_o_.forward(engine, *O);
         if (!out_attn) return out_attn;
 
-        auto r2 = engine.elementwise_binary(BinaryOp::Add, input, *out_attn);
+        auto r2 = dsl::compute(engine,
+            dsl::leaf(input) + dsl::leaf(*out_attn),
+            input.rows(), input.cols());
         if (!r2) return std::unexpected(r2.error());
         if (!checkpoint_mode_)
             residual2_cache_ = *r2;
@@ -455,7 +492,9 @@ public:
             V_cat_cache_ = std::move(*V_cat);
             batch_cache_ = batch;
         }
-        return engine.elementwise_binary(BinaryOp::Add, *r2, *f);
+        return dsl::compute(engine,
+            dsl::leaf(*r2) + dsl::leaf(*f),
+            r2->rows(), r2->cols());
     }
 
     // 反向：grad_output (d_model, batch·W)；grad_C_out 累加记忆 C 的梯度
@@ -471,7 +510,9 @@ public:
         if (!grad_ff) return grad_ff;
         auto b_n2 = norm2_->backward(engine, *grad_ff);
         if (!b_n2) return b_n2;
-        auto grad_r1 = engine.elementwise_binary(BinaryOp::Add, grad_output, *b_n2);
+        auto grad_r1 = dsl::compute(engine,
+            dsl::leaf(grad_output) + dsl::leaf(*b_n2),
+            grad_output.rows(), grad_output.cols());
         if (!grad_r1) return std::unexpected(grad_r1.error());
 
         // ── 联合注意力反向（materialized 路径，镜像 AttentionBase 旧路径） ──
@@ -531,13 +572,19 @@ public:
         if (!grad_Vy) return std::unexpected(grad_Vy.error());
         auto gv = w_v_.backward(engine, *grad_Vy);
         if (!gv) return gv;
-        auto g_attn = engine.elementwise_binary(BinaryOp::Add, *gq, *gk);
+        auto g_attn = dsl::compute(engine,
+            dsl::leaf(*gq) + dsl::leaf(*gk),
+            gq->rows(), gq->cols());
         if (!g_attn) return std::unexpected(g_attn.error());
-        auto grad_n1 = engine.elementwise_binary(BinaryOp::Add, *g_attn, *gv);
+        auto grad_n1 = dsl::compute(engine,
+            dsl::leaf(*g_attn) + dsl::leaf(*gv),
+            g_attn->rows(), g_attn->cols());
         if (!grad_n1) return std::unexpected(grad_n1.error());
         auto b_n1 = norm1_->backward(engine, *grad_n1);
         if (!b_n1) return b_n1;
-        auto grad_x = engine.elementwise_binary(BinaryOp::Add, *grad_r1, *b_n1);
+        auto grad_x = dsl::compute(engine,
+            dsl::leaf(*grad_r1) + dsl::leaf(*b_n1),
+            grad_r1->rows(), grad_r1->cols());
         if (!grad_x) return std::unexpected(grad_x.error());
 
         // ── 记忆路径梯度（累加进 grad_C_out） ──
@@ -596,6 +643,9 @@ private:
 
     Tensor stored_tokens_tensor_;
     std::size_t batch_size_ = 0;
+    // 文档感知：每位置文档 id（batch-major，size = batch*seq_len_）；空=无。
+    // forward 时切出块输入（窗口）对应的子段下发给各块做局部文档掩码。
+    std::vector<std::size_t> doc_ids_;
 
     // 沿 batch-major 列序把 x (d_model, batch·L) 拆为 历史 H (d_model, batch·C)
     // 与 窗口 W_seq (d_model, batch·W)。列序 i=b·L+t（batch 在列方向）。
@@ -734,6 +784,14 @@ public:
         std::abort();
     }
 
+    // 文档感知：记录每位置文档 id（batch-major，size = batch*seq_len_）。
+    // forward 时按窗口切段下发给各块，使块内局部注意力在文档边界（含 [PAD]）隔离。
+    void set_doc_ids(std::span<const std::size_t> ids) override
+    {
+        if (ids.empty()) { doc_ids_.clear(); return; }
+        doc_ids_.assign(ids.begin(), ids.end());
+    }
+
     std::vector<TensorRef> parameters() override
     {
         std::vector<TensorRef> p;
@@ -817,6 +875,17 @@ public:
         }
 
         // 阶段二：逐块联合注意力（对 [C ; 窗口]）
+        // 文档感知：把块输入（窗口）对应的 doc 子段下发给各块做局部文档/PAD 掩码。
+        if (!doc_ids_.empty())
+        {
+            const std::size_t win_cols = split_ ? window_ : seq_len_;
+            std::vector<std::size_t> block_doc_ids(batch * win_cols);
+            for (std::size_t b = 0; b < batch; ++b)
+                for (std::size_t t = 0; t < win_cols; ++t)
+                    block_doc_ids[b * win_cols + t] =
+                        doc_ids_[b * seq_len_ + (split_ ? hist_len_ + t : t)];
+            for (auto& blk : blocks_) blk.set_doc_ids(block_doc_ids);
+        }
         for (auto& b : blocks_)
         {
             auto r = b.forward(engine, block_input, C);
@@ -869,7 +938,9 @@ public:
             // 旧行为：压缩器对整条 X 的梯度与块梯度同形状，直接累加
             auto gxc = compressor_.backward(engine, grad_C);
             if (!gxc) return gxc;
-            auto gx_sum = engine.elementwise_binary(BinaryOp::Add, grad_w, *gxc);
+            auto gx_sum = dsl::compute(engine,
+                dsl::leaf(grad_w) + dsl::leaf(*gxc),
+                grad_w.rows(), grad_w.cols());
             if (!gx_sum) return std::unexpected(gx_sum.error());
             grad_x = std::move(*gx_sum);
         }

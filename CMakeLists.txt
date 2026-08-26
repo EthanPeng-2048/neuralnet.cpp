@@ -163,6 +163,10 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(zipt_consistency_test src/zipt_consistency_test.cpp)
     list(APPEND NN_TEST_TARGETS zipt_consistency_test)
 
+    # ── ZiPT 块级文档感知掩码正确性测试（doc_ids 隔离跨文档局部 key） ──
+    nn_add_executable(zipt_doc_test src/zipt_doc_test.cpp)
+    list(APPEND NN_TEST_TARGETS zipt_doc_test)
+
     # ── RAPT（ReLU 线性注意力）数值梯度检查（gradcheck：RLA 核心 + 块） ──
     nn_add_executable(rapt_gradcheck src/rapt_gradcheck.cpp)
     list(APPEND NN_TEST_TARGETS rapt_gradcheck)

@@ -1,6 +1,6 @@
 # 📋 优化方案全览（Optimization Proposal List）
 
-> **文档版本**：2026-08-26
+> **文档版本**：2026-08-26（2026 代码结构重构后更新）
 > **适用范围**：neuralnet.cpp 框架全部优化方向——GPU 内核、IR/编译器、CPU 计算、显存管理、架构扩展
 > **关联文档**：[02-performance.md](./02-performance.md) · [09-operator-fusion.md](./09-operator-fusion.md) · [10-memory-optimization.md](./10-memory-optimization.md) · [11-ir-optimization.md](./11-ir-optimization.md) · [12-innovative-designs.md](./12-innovative-designs.md)
 
@@ -21,13 +21,13 @@
 ## 1. GPU 内核与代码生成
 
 ### P1-01 ✅ vec4 向量化发射（已实现）
-- **文件**：`glsl_gen.hpp`、`gen_fused.cpp`、`vk_backend.hpp`
+- **文件**：`expr_glsl_gen.hpp`、`gen_fused.cpp`、`backend/compute_vk_backend.hpp`
 - **现状**：所有视图 ∈ `{Linear, RowBroadcast, ColBroadcast}` 的表达式自动走 vec4 路径（每线程 4 元素），不满足时回退标量。
 - **收益**：计算:加载比从 2:1 提升到 8:1，bank conflict 消除。
 - **限制**：`RotateHalf`、`RowMod` 视图排除（索引映射逐通道变化，vec4 同行保证不成立）。
 
 ### P1-02 ✅ 按需 row/col 发射（已实现）
-- **文件**：`glsl_gen.hpp` `glsl_view_uses_row()`
+- **文件**：`expr_glsl_gen.hpp` `glsl_view_uses_row()`
 - **现状**：`Linear` 和 `ColBroadcast` 不发射 `row = i / cols`；其他视图按需发射。
 - **收益**：消除 GPU 昂贵的整数除法/模运算（对只用 `col` 的 kernel 消除一次 `i/cols` 和 `i%cols`）。
 
@@ -37,12 +37,12 @@
 - **收益**：compute:load 比 8:1、bank conflict 消除、转置感知。
 
 ### P1-04 ✅ 逐元素 kernel 的 row/col 除法消除（已实现）
-- **文件**：`glsl_gen.hpp`
+- **文件**：`expr_glsl_gen.hpp`
 - **现状**：标量路径（纯标量 kernel + vec4 回退循环）均已按 `need_row` / `need_col` 守卫发射，仅计算实际使用的 `row`/`col`。与 vec4 快速路径共用同一套 `glsl_view_uses_row` / `glsl_view_uses_col` 判定。
 - **收益**：所有非 vec4 融合 kernel 消除冗余整数除法/模运算（~10-15% 内核时间）。
 
 ### P1-05 ✅ 归约指令 pass 多累加器（已实现，2026-08-26）
-- **文件**：`glsl_gen.hpp`（`generate_glsl_reduce` 行/列归约指令 pass）
+- **文件**：`expr_glsl_gen.hpp`（`generate_glsl_reduce` 行/列归约指令 pass）
 - **现状**：归约指令 pass（每条归约指令）已改为 4 路独立标量累加器（acc0-acc3，独立变量非数组索引）+ 4 路展开循环，与归约视图 pass 一致。打破 `acc = acc + x` 串行 FMA 依赖链，提升 ILP。
 - **验证**：27/27 ctest 全绿（含 gradcheck/融合测试）。原 `reduce_instr_bench`（GPU 驻留内核级基准）已随 bench 工具移除（2026 清理），吞吐以 fused_gpu_test 覆盖。
 - **A/B 实测（GTX 850M）**：`col_reduce_sum(a*b)`（LayerNorm 方差路径，**内存带宽受限**）新/旧基本持平（±5% 噪声内）。这是**预期的**——带宽受限 kernel 的累加器依赖链已被掩盖，多累加器无增益。
@@ -74,7 +74,7 @@
 - **风险**：低（但需逐 kernel 测评，收益可能有限）
 
 ### P1-09 ✅ warp shuffle（subgroup）归约（已实现）
-- **文件**：`glsl_gen.hpp`（`emit_tree_reduce`）
+- **文件**：`expr_glsl_gen.hpp`（`emit_tree_reduce`）
 - **现状**：归约已改用 subgroup 蝴蝶归约替代共享内存树归约——第 1 步 `subgroupAdd`/`subgroupMax` 得到每 warp 部分和（零共享/屏障），第 2 步首 warp 归约全部 warp 部分和（`gl_SubgroupID == 0`，屏障后全线程可见）。
 - **收益**：消除共享内存树归约的屏障与共享内存访问开销。
 - **注意**：启用 `GL_KHR_shader_subgroup_basic` / `GL_KHR_shader_subgroup_arithmetic` 扩展，需 Vulkan 1.3+ 或 `VK_EXT_subgroup_size_control` 支持。
@@ -125,7 +125,7 @@
 - **限制**：仅支持逐元素→逐元素链，不支持跨 matmul、不支持多消费者 DAG。
 
 ### P2-04 ✅ IR-D：后端 emitter 抽象
-- **文件**：`expr_emitter.hpp`、`cpu_emitter.hpp`
+- **文件**：`expr_emitter.hpp`、`expr_cpu_emitter.hpp`
 - **现状**：`ExprEmitter` 纯接口 + emitter registry，`GlslEmitter` + `CpuEmitter` 双实现。
 
 ### P2-05 📋 跨 matmul 融合（matmul + 偏置 + 激活）
@@ -199,9 +199,9 @@
 - **收益**：进一步消中间物化
 - **风险**：低
 
-### P2-14 📋 冗余 broadcast/逐元素原语收敛 DSL（对话 O5）
-- **现状**：独立 broadcast_row/col、elementwise_* 原语在 IR 成熟后是冗余（DSL 内联已覆盖）。
-- **方案**：Layer 逐步改用 `dsl::compute` 融合表达，独立原语仅作 fallback。
+### P2-14 🚧 冗余 broadcast/逐元素原语收敛 DSL（对话 O5，部分完成）
+- **现状**：独立 broadcast_row/col、elementwise_* 原语在 IR 成熟后是冗余（DSL 内联已覆盖）。已有 Softmax/LayerNorm/RMSNorm/SwiGLU/RoPE/GeLU 走 DSL 融合（scan 22 条表达式）。
+- **方案**：其余 Layer 逐步改用 `dsl::compute` 融合表达，独立原语仅作 fallback。
 - **前置依赖**：P2-10（自动融合）先落地。
 - **工作量**：中（随 Layer 逐步迁移）
 - **收益**：减少算子数量（呼应"融合收敛到 IR"）
@@ -247,7 +247,7 @@
 ## 3. CPU 计算优化
 
 ### P3-01 ✅ 缓存分块 matmul（BLOCK_SIZE=64）
-- **文件**：`config.hpp`
+- **文件**：`core_config.hpp`
 - **现状**：64×64 tile，`static_assert` 确保 b_block ≤ 64KB 栈预算。
 
 ### P3-02 ✅ SmartPolicy 自适应并行
@@ -313,7 +313,7 @@
 - **方案**：
   - **阶段 1**：前向传播 bf16（激活 + 权重），反向传播 fp32（梯度 + 优化器）→ **混合精度训练**。
   - **阶段 2**：全链路 bf16（含优化器状态）→ **纯 bf16 训练**。
-  - 实现：`config.hpp` 增加 `Precision` 枚举；tensor 支持 bf16 存储 + fp32 累加；matmul 内核支持 bf16→fp32 dequant。
+  - 实现：`core_config.hpp` 增加 `Precision` 枚举；tensor 支持 bf16 存储 + fp32 累加；matmul 内核支持 bf16→fp32 dequant。
   - 需 GPU 端：Vulkan `VK_KHR_shader_float16_int8` 或 CUDA `__nv_bfloat16`。
 - **工作量**：大（2-3 周，含数值验证）
 - **收益**：
@@ -409,12 +409,14 @@
 - **风险**：中（大量调用点需同步修改）
 
 ### P6-04 📋 测试覆盖率提升
-- **现状**：17 个测试目标（`src/*test*.cpp`）覆盖核心功能，但缺少：
+- **现状**：27 个测试目标（`src/*test*.cpp` / `*gradcheck*.cpp`）覆盖核心功能，但仍有缺口：
+  - **优化器（SGD/Adam/AdamW/Muon）与损失函数无专属 gradcheck**——只在训练/推理入口间接验证（本次评估发现）。
+  - **scatter_add** CPU/GPU 均无专属测试。
   - 极端形状测试（rows=1, cols=1, rows=100000）
   - 数值边界测试（全零、全最大值、NaN/Inf 传播）
   - 并发安全测试（多线程同时 forward/backward）
   - 长序列压力测试（seq_len=8192+）
-- **方案**：增加 fuzzing 测试 + property-based 测试。
+- **方案**：增加优化器/loss gradcheck、scatter_add 单测、fuzzing 测试 + property-based 测试。
 - **工作量**：中（持续进行）
 - **收益**：发现边界 bug、提升长期可维护性
 - **风险**：低
@@ -618,31 +620,60 @@
 
 | 编号 | 方案 | 完成日期 | 关键文件 |
 |------|------|---------|---------|
-| P1-01 | vec4 向量化发射 | 2026-08-25 | `glsl_gen.hpp`, `gen_fused.cpp`, `vk_backend.hpp` |
-| P1-02 | 按需 row/col | 2026-08-25 | `glsl_gen.hpp` |
+| P1-01 | vec4 向量化发射 | 2026-08-25 | `expr_glsl_gen.hpp`, `gen_fused.cpp`, `backend/compute_vk_backend.hpp` |
+| P1-02 | 按需 row/col | 2026-08-25 | `expr_glsl_gen.hpp` |
 | P1-03 | GPU matmul tiled | — | `shaders/matmul_tiled.comp` |
-| P1-04 | 标量路径 row/col 除法消除 | 2026-08-25 | `glsl_gen.hpp` |
-| P1-09 | warp shuffle 归约 | 2026-08-25 | `glsl_gen.hpp` |
-| P1-05 | 归约指令 pass 多累加器 | 2026-08-26 | `glsl_gen.hpp`（原 `reduce_instr_bench` 已移除） |
+| P1-04 | 标量路径 row/col 除法消除 | 2026-08-25 | `expr_glsl_gen.hpp` |
+| P1-09 | warp shuffle 归约 | 2026-08-25 | `expr_glsl_gen.hpp` |
+| P1-05 | 归约指令 pass 多累加器 | 2026-08-26 | `expr_glsl_gen.hpp`（原 `reduce_instr_bench` 已移除） |
 | P2-01 | IR-A DCE/折叠/化简 | 2026-08-23 | `expr_opt.hpp` |
 | P2-02 | IR-B CSE/寄存器分配 | 2026-08-23 | `expr_opt.hpp` |
 | P2-03 | IR-C 图 IR/链融合 | 2026-08-24 | `expr_graph.hpp` |
-| P2-04 | IR-D emitter 抽象 | 2026-08-24 | `expr_emitter.hpp`, `cpu_emitter.hpp` |
-| P3-01 | 缓存分块 matmul | — | `config.hpp` |
-| P3-02 | SmartPolicy 自适应并行 | — | `config.hpp` |
+| P2-04 | IR-D emitter 抽象 | 2026-08-24 | `expr_emitter.hpp`, `expr_cpu_emitter.hpp` |
+| P3-01 | 缓存分块 matmul | — | `core_config.hpp` |
+| P3-02 | SmartPolicy 自适应并行 | — | `core_config.hpp` |
 | P3-03 | 线程池 latch 零分配 | — | `core_threadpool.hpp` |
 | P4-01 | 激活重计算 L1 | 2026-08-22 | `compute_layer.hpp`, `model_container.hpp` |
 | P4-02 | 内存池归还 L2 | 2026-08-22 | `backend/compute_memory_pool.hpp` |
 | P5-01 | CUDA 后端基础 | — | `backend/compute_cuda_backend.hpp` |
 | P6-01 | 序列化 EOF 语义修复 | 2026-08-25 | `model_serialization.hpp` |
 | — | 注意力 M4/M5/M6 融合 | 2026-08-21 | `compute_layer.hpp`, `shaders/` |
-| — | 列归约 tile 化 | 2026-08-25 | `glsl_gen.hpp`, `vk_backend.hpp` |
+| — | 列归约 tile 化 | 2026-08-25 | `expr_glsl_gen.hpp`, `backend/compute_vk_backend.hpp` |
 | — | CNN im2col（CPU 端） | 2026-08 | `compute_layer.hpp` |
 | D1 | GpuBuffer 延迟销毁 buffer 内存重叠修复 | 2026-08-26 | `backend/compute_vk_backend.hpp` |
-| D3 | node_outputs_ 线程安全修复 | 2026-08-26 | `gpu_engine.hpp`, `cpu_engine.hpp`, `expr_graph.hpp` |
-| P1 | IR 融合中间节点 buffer 显存消除 | 2026-08-26 | `gpu_engine.hpp` |
-| P2 | from_matrix 批内免 flush | 2026-08-26 | `gpu_engine.hpp` |
+| D3 | node_outputs_ 线程安全修复 | 2026-08-26 | `compute_gpu_engine.hpp`, `compute_cpu_engine.hpp`, `expr_graph.hpp` |
+| P1 | IR 融合中间节点 buffer 显存消除 | 2026-08-26 | `compute_gpu_engine.hpp` |
+| P2 | from_matrix 批内免 flush | 2026-08-26 | `compute_gpu_engine.hpp` |
 | D2 | scatter_add 非确定性文档化例外 | 2026-08-26 | `shaders/scatter_add.comp`, `docs/08` |
+
+---
+
+## 11. 2026 代码结构重构与新增优化
+
+> 本批次为「代码结构重置 + 融合路线推进」：统一头文件命名规范、拆分超大单体文件、
+> 删除无用死代码（bench 工具 + 遗留分词器）、补强测试与 AOT 扫描覆盖。
+
+### ✅ 已完成
+
+| 编号 | 项 | 关键文件 |
+|------|-----|---------|
+| R-01 | **统一头文件命名规范**（`[层级]_[功能]_[子分类].hpp`） | 8 个顶层头文件 + backend 5 个 + cli 4 个重命名 |
+| R-02 | **拆分 `compute_layer.hpp`（6413 行）→ 10 个子文件** | `compute_layer_{base,mlp,conv,softmax,attention,feedforward,transformer,gpt,zipt,rapt}.hpp` |
+| R-03 | **拆分 `domain_tokenizer.hpp`（1667 行）→ 3 个子文件** | `domain_tokenizer_{base,bpe,charbpe}.hpp` |
+| R-04 | **拆分 `backend/compute_vk_backend.hpp`（4034 行）→ 拆出设备/Pipeline 辅助** | `backend/compute_vk_device.hpp` |
+| R-05 | **删除 5 个 bench 工具**（无法在 -Werror 下编译，从未被 CI 覆盖） | `src/{mnist,compute,bench_thresholds,reduce,reduce_instr}_bench.cpp` |
+| R-06 | **删除遗留分词器 WordZip/Space**（~1040 行死代码） | `domain_tokenizer.hpp` |
+| R-07 | **GeLU 改写成单表达式 DSL 融合**（forward/backward 各 5 次 dispatch → 1 次） | `compute_layer_mlp.hpp`（scan 表达式 20→22 条） |
+| R-08 | **修复 ZiPT 序列长度不一致 + 补 batch>1/loss 下降测试** | `compute_layer_zipt.hpp`, `src/zipt_smoke_test.cpp` |
+| R-09 | **补 scan_exprs 覆盖**（新增 GeLU dry-run，闭合世界两端一致） | `tools/scan_exprs.cpp` |
+
+### 📋 拆分的单大类（保留，不强拆）
+
+以下为**单大类**文件：方法高度耦合私有成员，强拆需 friend/getter 破坏封装，收益低风险高，故保留：
+- `backend/compute_vk_backend.hpp`（3652 行，`GpuBackend` 单类）
+- `compute_cpu_engine.hpp`（1737 行，`CpuEngine`）
+- `compute_gpu_engine.hpp`（1268 行，`GpuEngine`）
+- `expr_glsl_gen.hpp`（907 行，GLSL 生成器）
 
 ---
 
