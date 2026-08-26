@@ -1,8 +1,8 @@
-#ifndef NN_CPU_EMITTER_HPP
-#define NN_CPU_EMITTER_HPP
+#ifndef NN_EXPR_CPU_EMITTER_HPP
+#define NN_EXPR_CPU_EMITTER_HPP
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  cpu_emitter.hpp — CPU 后端 emitter（IR-D 第二实现）
+//  expr_cpu_emitter.hpp — CPU 后端 emitter（IR-D 第二实现）
 //
 //  对应文档 `docs/11-ir-optimization.md` IR-D：一份 canonical IR → 多后端。
 //  本 emitter 把 ExprSpec 展开为一段可直接嵌入 C++ 的**逐元素直线代码**
@@ -249,4 +249,4 @@ inline const bool kCpuEmitterRegistered =
 
 } // namespace nn
 
-#endif // NN_CPU_EMITTER_HPP
+#endif // NN_EXPR_CPU_EMITTER_HPP

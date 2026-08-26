@@ -21,9 +21,9 @@
 #include <type_traits>
 #include <vector>
 
-#include "config.hpp"
+#include "core_config.hpp"
 #include "model_spec.hpp"
-#include "keyvalue_record.hpp"
+#include "model_keyvalue_record.hpp"
 #include "compute_layer.hpp"
 #include "model_container.hpp"
 

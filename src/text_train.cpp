@@ -309,7 +309,7 @@ void print_usage(const char *prog)
         << "  --resume-step <n>   从本 epoch 内第 n 步继续（0-based，需配合 --resume；默认 0）\n"
         << "                       TDR 自动重启时会自行带上这两个参数续训\n"
         << "  --vocab <path>     词表 JSON 路径 (默认: gpt_bpe.json)\n"
-        << "                     自动识别分词器类型（bpe / charbpe / wordzip / space）\n"
+        << "                     自动识别分词器类型（bpe / charbpe）\n"
         << "  --test-file <path> 测试集文件路径（可选，每 epoch 结束后评估 test loss）\n"
         << "  --epochs <n>       训练轮数 (默认: 10)\n"
         << "  --lr <lr>          学习率 (默认: 0.001)\n"
@@ -830,7 +830,7 @@ int main(int argc, char *argv[])
     const std::string program_name = argv[0];
     TrainConfig cfg = parse_args(argc, argv);
 
-    // ── 加载分词器（自动识别类型：BPE/CharBPE/WordZip/Space） ───
+    // ── 加载分词器（自动识别类型：BPE/CharBPE） ───
     auto tokenizer = nn::load_tokenizer_from_file(cfg.vocab_path);
     if (!tokenizer)
     {

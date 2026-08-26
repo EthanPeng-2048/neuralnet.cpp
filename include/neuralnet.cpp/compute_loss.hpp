@@ -26,7 +26,7 @@
 
 #include "compute_engine.hpp"
 #include "compute_layer.hpp"  // clone_tensor
-#include "tensor.hpp"
+#include "compute_tensor.hpp"
 
 namespace nn
 {

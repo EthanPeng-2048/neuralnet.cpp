@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#include "config.hpp"
+#include "core_config.hpp"
 #include "core_errors.hpp"
 
 namespace nn

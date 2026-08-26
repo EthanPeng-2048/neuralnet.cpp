@@ -27,7 +27,7 @@
 #include <vector>
 
 #include "../core_errors.hpp"
-#include "../config.hpp"
+#include "../core_config.hpp"
 
 // cuBLAS（matmul 加速，由 cmake -DNN_HAS_CUBLAS 启用）
 #ifdef NN_HAS_CUBLAS

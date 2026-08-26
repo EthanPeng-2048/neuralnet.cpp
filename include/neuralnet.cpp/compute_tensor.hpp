@@ -1,7 +1,7 @@
-#ifndef NN_TENSOR_HPP
-#define NN_TENSOR_HPP
+#ifndef NN_COMPUTE_TENSOR_HPP
+#define NN_COMPUTE_TENSOR_HPP
 
-// ── tensor.hpp — 统一张量类型 ─────────────────────────────────────────────
+// ── compute_tensor.hpp — 统一张量类型 ─────────────────────────────────────────────
 // Tensor 是跨设备的统一数据容器：CPU 持有 Matrix，GPU 持有 GpuTensor。
 // Layer 和 ComputeEngine 只操作 Tensor，不关心底层存储设备。
 //
@@ -16,7 +16,7 @@
 #include <functional>
 #include <memory>
 
-#include "config.hpp"
+#include "core_config.hpp"
 #include "core_errors.hpp"
 #include "algebra_matrix.hpp"
 
@@ -235,4 +235,4 @@ using TensorRef = std::reference_wrapper<Tensor>;
 
 } // namespace nn
 
-#endif // NN_TENSOR_HPP
+#endif // NN_COMPUTE_TENSOR_HPP

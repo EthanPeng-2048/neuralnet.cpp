@@ -1,8 +1,8 @@
-#ifndef NN_KEYVALUE_RECORD_HPP
-#define NN_KEYVALUE_RECORD_HPP
+#ifndef NN_MODEL_KEYVALUE_RECORD_HPP
+#define NN_MODEL_KEYVALUE_RECORD_HPP
 
 // ══════════════════════════════════════════════════════════════════════════
-//  keyvalue_record.hpp — 自描述键值记录（替代 JSON 的轻量二进制格式）
+//  model_keyvalue_record.hpp — 自描述键值记录（替代 JSON 的轻量二进制格式）
 //
 //  设计目标：
 //    1. 容易解析 —— 长度前缀 + 显式类型 + 值长度前缀，无状态机/偏移量假设。
@@ -260,4 +260,4 @@ inline bool KeyValueRecord::get(const std::string &key, std::vector<uint64_t> &o
 
 }  // namespace nn
 
-#endif // NN_KEYVALUE_RECORD_HPP
+#endif // NN_MODEL_KEYVALUE_RECORD_HPP

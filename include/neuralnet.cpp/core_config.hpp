@@ -1,5 +1,5 @@
-#ifndef NN_CONFIG_HPP
-#define NN_CONFIG_HPP
+#ifndef NN_CORE_CONFIG_HPP
+#define NN_CORE_CONFIG_HPP
 
 #include <cstddef>
 #include <iterator>  // for std::distance
@@ -166,4 +166,4 @@ namespace nn
     }
 } // namespace nn
 
-#endif // NN_CONFIG_HPP
+#endif // NN_CORE_CONFIG_HPP

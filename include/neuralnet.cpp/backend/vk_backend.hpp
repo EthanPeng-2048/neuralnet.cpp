@@ -41,7 +41,7 @@
 
 #include "../core_errors.hpp"
 #include "../core_observer_ptr.hpp"
-#include "../config.hpp"
+#include "../core_config.hpp"
 #include "memory_pool.hpp"
 #include "staging_ring.hpp"
 

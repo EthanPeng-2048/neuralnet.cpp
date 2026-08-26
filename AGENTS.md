@@ -20,20 +20,19 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 
 - 编译器：Clang++ 22.1+（C++26）；CMake 3.30+。
 - Vulkan 可选：CMake 自动探测 Vulkan + glslc，找到则定义 `NN_HAS_VULKAN` 启用 GPU，否则纯 CPU。
-- **CUDA 后端 1.0.0 已停用**（融合原语未实现，`cuda_engine.hpp` 返回"未实现"），勿依赖、勿在文档中声称支持。
-- 基准工具（`compute_bench` / `mnist_bench` / `reduce_bench` / `bench_thresholds`）不注册 ctest，手工运行。
+- **CUDA 后端 1.0.0 已停用**（融合原语未实现，`compute_cuda_engine.hpp` 返回"未实现"），勿依赖、勿在文档中声称支持。
 - 应用入口：`build/{mnist_train,mnist_infer,text_train,text_infer,tokenizer_train,tokenizer_infer}`；`gui.py` 是 Python GUI（subprocess 调这些可执行文件）。
 
 ## 3. 目录速查（改什么任务 → 看什么文件）
 
 | 任务 | 文件 |
 |------|------|
-| 加/改神经网络层（Linear/Attention/Norm/激活…） | `include/neuralnet.cpp/compute_layer.hpp` |
+| 加/改神经网络层（Linear/Attention/Norm/激活…） | `compute_layer.hpp`（聚合头）+ `compute_layer_{base,mlp,conv,softmax,attention,feedforward,transformer,gpt,zipt,rapt}.hpp` |
 | 加/改损失函数 | `compute_loss.hpp` |
 | 加/改优化器（SGD/Adam/AdamW/Muon） | `compute_optimizer.hpp` |
-| 加/改引擎原语（CPU 实现） | `compute_engine.hpp`（接口）+ `cpu_engine.hpp` |
-| 加/改引擎原语（GPU 实现） | `gpu_engine.hpp` + `backend/vk_backend.hpp` + `shaders/*.comp` |
-| 张量/设备抽象 | `tensor.hpp` |
+| 加/改引擎原语（CPU 实现） | `compute_engine.hpp`（接口）+ `compute_cpu_engine.hpp` |
+| 加/改引擎原语（GPU 实现） | `compute_gpu_engine.hpp` + `backend/vk_backend.hpp` + `shaders/*.comp` |
+| 张量/设备抽象 | `compute_tensor.hpp` |
 | 矩阵/表达式模板（CPU 代数层） | `algebra_matrix.hpp` / `algebra_expr.hpp` / `algebra_ops.hpp` / `algebra_compute.hpp` |
 | 表达式 DSL / 融合 IR | `expr_dsl.hpp` / `expr_spec.hpp` / `expr_opt.hpp` / `expr_graph.hpp` / `expr_registry.hpp` |
 | 模型容器/规格/序列化 | `model_container.hpp` / `model_spec.hpp` / `model_serialization.hpp` |
@@ -48,9 +47,9 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 L5 入口    src/*.cpp（mnist/text/tokenizer 的 train/infer）、gui.py
 L4 领域    domain_*.hpp（模型工厂：build_mnist_* / build_gpt_model / Tokenizer）
 L3 实现    model_container.hpp（Model 容器）、model_spec.hpp、model_serialization.hpp
-L2 计算    compute_engine.hpp（引擎抽象）、cpu/gpu_engine.hpp、compute_layer/loss/optimizer.hpp
+L2 计算    compute_engine.hpp（引擎抽象）、compute_cpu/gpu_engine.hpp、compute_layer/loss/optimizer.hpp
 L1 代数    algebra_*.hpp（Matrix、表达式模板 AST、compute::apply）
-L0 硬件    config.hpp（Scalar=float、BLOCK_SIZE=64、SmartPolicy）、core_threadpool/errors/assert/file.hpp
+L0 硬件    core_config.hpp（Scalar=float、BLOCK_SIZE=64、SmartPolicy）、core_threadpool/errors/assert/file.hpp
 ```
 
 **核心设计：引擎化（Engine-Based）**
@@ -123,7 +122,7 @@ optimizer.step();
 - 序列化：`save_model` / `load_model` / `peek_model_spec`（`model_serialization.hpp`，v4 自描述格式）；`.nnpkg` 训练包见 `docs/07-train-package.md`。
 - GPT 高级特性（`GPTModel`，`compute_layer.hpp` 尾部）：梯度检查点（`checkpoint_every_`）、activation offload、文档感知掩码（`set_doc_ids`）、batch flush 粒度。
 
-## 9. 关键常量与配置（`config.hpp`）
+## 9. 关键常量与配置（`core_config.hpp`）
 
 - `Scalar = float`；`BLOCK_SIZE = 64`（matmul 分块，b_block 栈预算 64KB）；`PARALLEL_THRESHOLD = 524288`（SmartPolicy 并行阈值）。
 - 不使用 `-ffast-math`（保 NaN/Inf，训练稳定性）。

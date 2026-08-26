@@ -11,7 +11,7 @@
 #include <cstddef>
 #include <type_traits>
 
-#include "config.hpp"
+#include "core_config.hpp"
 #include "algebra_ops.hpp"
 
 namespace nn

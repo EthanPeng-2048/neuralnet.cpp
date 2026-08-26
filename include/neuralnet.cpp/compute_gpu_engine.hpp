@@ -1,7 +1,7 @@
-#ifndef NN_GPU_ENGINE_HPP
-#define NN_GPU_ENGINE_HPP
+#ifndef NN_COMPUTE_GPU_ENGINE_HPP
+#define NN_COMPUTE_GPU_ENGINE_HPP
 
-// ── gpu_engine.hpp — GPU 计算引擎实现（纯 GPU 架构）─────────────────────────
+// ── compute_gpu_engine.hpp — GPU 计算引擎实现（纯 GPU 架构）─────────────────────────
 // GpuEngine 封装 GpuBackend，实现 ComputeEngine 接口。
 //
 // 纯 GPU 架构策略：
@@ -1265,4 +1265,4 @@ private:
 
 #endif // NN_HAS_VULKAN
 
-#endif // NN_GPU_ENGINE_HPP
+#endif // NN_COMPUTE_GPU_ENGINE_HPP

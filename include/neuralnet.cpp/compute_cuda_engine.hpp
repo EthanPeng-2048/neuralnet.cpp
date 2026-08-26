@@ -1,10 +1,10 @@
-// ── cuda_engine.hpp — CUDA 计算引擎实现 ────────────────────────────────────
+// ── compute_cuda_engine.hpp — CUDA 计算引擎实现 ────────────────────────────────────
 // CudaEngine 封装 CudaBackend，实现 ComputeEngine 接口。
 // 与 GpuEngine（Vulkan）架构对称，所有原语在 GPU 上原生执行。
 // ─────────────────────────────────────────────────────────────────────────
 
-#ifndef NN_CUDA_ENGINE_HPP
-#define NN_CUDA_ENGINE_HPP
+#ifndef NN_COMPUTE_CUDA_ENGINE_HPP
+#define NN_COMPUTE_CUDA_ENGINE_HPP
 
 #ifdef NN_HAS_CUDA
 
@@ -485,4 +485,4 @@ private:
 } // namespace nn
 
 #endif // NN_HAS_CUDA
-#endif // NN_CUDA_ENGINE_HPP
+#endif // NN_COMPUTE_CUDA_ENGINE_HPP

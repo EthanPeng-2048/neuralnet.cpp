@@ -34,7 +34,7 @@ void print_usage(const char *prog)
         << "                       V3 格式模型自动读取规格和嵌入 tokenizer\n"
         << "  --vocab <path>       词表 JSON 路径 (默认: bpe_vocab.json)\n"
         << "                       仅当模型未嵌入 tokenizer 时使用\n"
-        << "                       自动识别分词器类型（bpe / charbpe / wordzip / space）\n"
+        << "                       自动识别分词器类型（bpe / charbpe）\n"
         << "  --prompt <text>      输入提示文本\n"
         << "  --interactive        交互式生成模式\n"
         << "  --max-tokens <n>     最大生成 token 数 (默认: 200)\n"

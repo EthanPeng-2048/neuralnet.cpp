@@ -90,7 +90,7 @@ option(NN_ENABLE_TESTS "Build test/verification executables" OFF)
 # 收集实际构建的目标，供 GPU/CUDA 统一启用（避免引用未定义目标）
 set(NN_APP_TARGETS "")
 set(NN_TEST_TARGETS "")
-set(NN_BENCH_TARGETS "")   # 性能基准（仅测试构建，手工运行，不注册 ctest）
+set(NN_BENCH_TARGETS "")   # 性能基准已移除（2026 清理：bench 工具不注册 ctest 且无法在 -Werror 下编译）
 
 # ── MNIST 目标（标准构建核心应用） ───────────────────────────────────────
 nn_add_executable(mnist_train src/mnist_train.cpp)
@@ -217,14 +217,6 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(ce_fusion_test src/ce_fusion_test.cpp)
     list(APPEND NN_TEST_TARGETS ce_fusion_test)
 
-    # ── 性能基准工具（仅测试构建；手工运行，不注册 ctest） ──
-    nn_add_executable(mnist_bench src/mnist_bench.cpp)
-    nn_add_executable(compute_bench src/compute_bench.cpp)
-    nn_add_executable(bench_thresholds src/bench_thresholds.cpp)
-    nn_add_executable(reduce_bench src/reduce_bench.cpp)
-    nn_add_executable(reduce_instr_bench src/reduce_instr_bench.cpp)
-    list(APPEND NN_BENCH_TARGETS mnist_bench compute_bench bench_thresholds reduce_bench reduce_instr_bench)
-
 endif()
 
 # ── 测试目标统一处理：输出到 <默认可执行目录>/test，并注册到 ctest ──────────
@@ -243,7 +235,7 @@ if(NN_ENABLE_TESTS)
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test)
         add_test(NAME ${TARGET} COMMAND ${TARGET})
     endforeach()
-    # 基准工具输出到 test/，但不注册 ctest（手工运行）
+    # 基准工具已移除（2026 清理：无法在 -Werror 下编译，且无 ctest 覆盖）
     foreach(TARGET ${NN_BENCH_TARGETS})
         set_target_properties(${TARGET} PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test)
@@ -373,7 +365,6 @@ if(Vulkan_FOUND)
         set(NN_GPU_TARGETS ${NN_APP_TARGETS})
         if(NN_ENABLE_TESTS)
             list(APPEND NN_GPU_TARGETS ${NN_TEST_TARGETS})
-            list(APPEND NN_GPU_TARGETS ${NN_BENCH_TARGETS})
         endif()
 
         foreach(TARGET ${NN_GPU_TARGETS})

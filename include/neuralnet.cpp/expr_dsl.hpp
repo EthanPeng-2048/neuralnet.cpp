@@ -29,7 +29,7 @@
 #include <utility>
 #include <vector>
 
-#include "tensor.hpp"
+#include "compute_tensor.hpp"
 #include "compute_engine.hpp"
 #include "expr_spec.hpp"
 #include "expr_registry.hpp"

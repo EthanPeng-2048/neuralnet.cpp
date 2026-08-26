@@ -6,7 +6,7 @@
 //
 // 包含顺序按依赖关系排列：L0 → L1 → L2 → L3 → L4
 // 注意：algebra_matrix.hpp 已传递包含 algebra_span/ops/expr/compute.hpp，
-//       config.hpp 已传递包含 core_errors.hpp，
+//       core_config.hpp 已传递包含 core_errors.hpp，
 //       此处显式列出所有头文件是为了清晰展示模块结构。
 //
 // 新架构（引擎化）：
@@ -19,22 +19,22 @@
 #include "core_observer_ptr.hpp"
 #include "core_threadpool.hpp"
 #include "core_file.hpp"
-#include "config.hpp"
+#include "core_config.hpp"
 
 // L1 代数层（algebra_matrix.hpp 已传递包含其余代数头文件）
 #include "algebra_matrix.hpp"
 
 // L2 计算层 — 引擎化
-#include "tensor.hpp"
+#include "compute_tensor.hpp"
 #include "expr_spec.hpp"
 #include "compute_engine.hpp"
 #include "expr_dsl.hpp"
-#include "cpu_engine.hpp"
+#include "compute_cpu_engine.hpp"
 #ifdef NN_HAS_VULKAN
-#include "gpu_engine.hpp"
+#include "compute_gpu_engine.hpp"
 #endif
 #ifdef NN_HAS_CUDA
-#include "cuda_engine.hpp"
+#include "compute_cuda_engine.hpp"
 #endif
 #include "compute_layer.hpp"
 #include "compute_loss.hpp"

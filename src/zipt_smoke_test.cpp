@@ -83,6 +83,7 @@ int main(int argc, char* argv[])
     if (!x) return 1;
 
     nn::Scalar first_loss = 0;
+    nn::Scalar last_loss = 0;
     for (std::size_t step = 0; step < steps; ++step)
     {
         auto zero = optimizer->zero_grad();
@@ -98,15 +99,24 @@ int main(int argc, char* argv[])
         auto st = optimizer->step();
         if (!st) { std::cerr << "optimizer step failed\n"; return 1; }
         if (step == 0) first_loss = *loss;
+        last_loss = *loss;
         std::cout << "  step " << step << "  loss=" << *loss << "\n";
     }
 
-    std::cout << "first_loss=" << first_loss << "\n";
+    std::cout << "first_loss=" << first_loss << " last_loss=" << last_loss << "\n";
     if (!(first_loss > 0) || !(first_loss == first_loss))  // 有效且非 NaN
     {
         std::cerr << "initial loss invalid (NaN?)\n";
         return 1;
     }
+    // 训练后 loss 应显著下降（梯度有效、可学习）
+    if (!(last_loss < first_loss))
+    {
+        std::cerr << "loss did not decrease (first=" << first_loss
+                  << " last=" << last_loss << ")\n";
+        return 1;
+    }
+    std::cout << "loss decreased OK (" << first_loss << " -> " << last_loss << ")\n";
 
     // ── 3. 压缩模式（L=W+C）冒烟：window < seq_len ───────────────────
     // 验证历史/窗口分离前向、压缩器仅吃历史、loss 只在窗口上计算、反向合并梯度。
@@ -147,6 +157,7 @@ int main(int argc, char* argv[])
         if (!sx) return 1;
 
         nn::Scalar sfirst = 0;
+        nn::Scalar slast = 0;
         for (std::size_t step = 0; step < steps; ++step)
         {
             auto zero = sopt->zero_grad();
@@ -162,13 +173,79 @@ int main(int argc, char* argv[])
             auto st = sopt->step();
             if (!st) { std::cerr << "split optimizer step failed\n"; return 1; }
             if (step == 0) sfirst = *loss;
+            slast = *loss;
         }
         if (!(sfirst > 0) || !(sfirst == sfirst))
         {
             std::cerr << "split initial loss invalid (NaN?)\n";
             return 1;
         }
-        std::cout << "split-mode (L=W+C) smoke: first_loss=" << sfirst << " OK\n";
+        if (!(slast < sfirst))
+        {
+            std::cerr << "split loss did not decrease (first=" << sfirst
+                      << " last=" << slast << ")\n";
+            return 1;
+        }
+        std::cout << "split-mode (L=W+C) smoke: loss "
+                  << sfirst << " -> " << slast << " OK\n";
+    }
+
+    // ── 4. batch>1 冒烟（铁律 5：注意力/序列路径必须覆盖 batch>1，否则 batch-major
+    //      布局在 batch=1 时与 position-major 重合，测不出跨样本串扰） ────────
+    {
+        nn::ZiPTConfig bcfg;
+        bcfg.vocab_size    = 32;
+        bcfg.d_model       = 16;
+        bcfg.seq_len       = 8;
+        bcfg.window        = 4;   // split 模式（W<L）
+        bcfg.num_heads     = 2;
+        bcfg.d_ff          = 32;
+        bcfg.num_layers    = 2;
+        bcfg.memory_tokens = 4;
+        auto bmodel = nn::build_zipt_model(eng, bcfg);
+        if (!bmodel) { std::cerr << "build_zipt_model(batch>1) failed\n"; return 1; }
+
+        auto bopt = nn::create_optimizer(
+            "adamw", eng, bmodel->parameters(), bmodel->param_gradients(),
+            nn::Scalar{1e-3}, nn::Scalar{0.01});
+        if (!bopt) { std::cerr << "batch>1 optimizer creation failed\n"; return 1; }
+
+        const std::size_t B = 2;
+        nn::Matrix bin(bcfg.seq_len, B);
+        std::vector<std::size_t> blabels(bcfg.window * B);
+        for (std::size_t b = 0; b < B; ++b)
+        {
+            for (std::size_t t = 0; t < bcfg.seq_len; ++t)
+                bin.set_value_unchecked(t, b, static_cast<nn::Scalar>(tok(rng)));
+            for (std::size_t t = 0; t < bcfg.window; ++t)
+                blabels[b * bcfg.window + t] = tok(rng);
+        }
+        auto bx = eng.from_matrix(bin);
+        if (!bx) return 1;
+
+        nn::Scalar bfirst = 0;
+        for (std::size_t step = 0; step < steps; ++step)
+        {
+            auto zero = bopt->zero_grad();
+            if (!zero) { std::cerr << "batch>1 zero_grad failed\n"; return 1; }
+            auto logits = bmodel->forward(*bx);
+            if (!logits) { std::cerr << "batch>1 forward failed: " << logits.error().message << "\n"; return 1; }
+            auto loss = ce.forward_sparse(eng, *logits, blabels, {}, bcfg.vocab_size);
+            if (!loss) { std::cerr << "batch>1 loss failed: " << loss.error().message << "\n"; return 1; }
+            auto grad = ce.backward();
+            if (!grad) { std::cerr << "batch>1 loss backward failed\n"; return 1; }
+            auto bkw = bmodel->backward(*grad);
+            if (!bkw) { std::cerr << "batch>1 model backward failed: " << bkw.error().message << "\n"; return 1; }
+            auto st = bopt->step();
+            if (!st) { std::cerr << "batch>1 optimizer step failed\n"; return 1; }
+            if (step == 0) bfirst = *loss;
+        }
+        if (!(bfirst > 0) || !(bfirst == bfirst))
+        {
+            std::cerr << "batch>1 initial loss invalid (NaN?)\n";
+            return 1;
+        }
+        std::cout << "batch>1 (batch=" << B << ") smoke: first_loss=" << bfirst << " OK\n";
     }
 
     std::cout << "ZIPT SMOKE TEST PASSED\n";

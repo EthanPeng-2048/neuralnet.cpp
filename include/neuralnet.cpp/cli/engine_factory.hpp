@@ -21,12 +21,12 @@
 
 #include "neuralnet.cpp/compute_engine.hpp"
 #include "neuralnet.cpp/core_errors.hpp"
-#include "neuralnet.cpp/cpu_engine.hpp"
+#include "neuralnet.cpp/compute_cpu_engine.hpp"
 #ifdef NN_HAS_VULKAN
-#include "neuralnet.cpp/gpu_engine.hpp"
+#include "neuralnet.cpp/compute_gpu_engine.hpp"
 #endif
 #ifdef NN_HAS_CUDA
-#include "neuralnet.cpp/cuda_engine.hpp"
+#include "neuralnet.cpp/compute_cuda_engine.hpp"
 #endif
 
 namespace nn::cli
