@@ -130,6 +130,52 @@ int run_swiglu(CpuEngine& cpu, GpuEngine& gpu)
     return ok ? 0 : 1;
 }
 
+// ── GeLU forward/backward：GPU（单表达式 DSL 融合 shader）vs CPU ─────────
+// forward:  x / (1 + exp(-βx))；backward: grad_out * s*(1 + βx*(1-s))。
+// GPU 走融合 shader（scan 已收集 GeLU 结构），CPU 走 eval_cpu，二者应一致。
+int run_gelu(CpuEngine& cpu, GpuEngine& gpu)
+{
+    const std::size_t R = 6, C = 9;   // 与 scan_exprs 结构一致（结构不依赖形状）
+    std::mt19937 rng(999);
+    std::uniform_real_distribution<Scalar> dist(-1.0f, 1.0f);
+    Matrix x(R, C), grad(R, C);
+    for (auto& v : x.span()) v = dist(rng);
+    for (auto& v : grad.span()) v = dist(rng);
+
+    nn::GeLU gl_cpu, gl_gpu;
+    const Tensor in = Tensor::from_matrix(Matrix(x));
+    auto fc = gl_cpu.forward(cpu, in);
+    auto fg = gl_gpu.forward(gpu, in);
+    if (!fc) { std::cerr << "  CPU gelu forward 失败: " << fc.error().message << "\n"; return 1; }
+    if (!fg)
+    {
+        std::cerr << "  GPU gelu forward 失败（未命中融合 shader？）: "
+                  << fg.error().message << "\n";
+        return 1;
+    }
+    const Scalar err_f = max_abs_diff(fc->cpu_matrix(), *gpu.to_matrix(*fg));
+
+    const Tensor gd = Tensor::from_matrix(Matrix(grad));
+    auto bc = gl_cpu.backward(cpu, gd);
+    auto bg = gl_gpu.backward(gpu, gd);
+    if (!bc) { std::cerr << "  CPU gelu backward 失败: " << bc.error().message << "\n"; return 1; }
+    if (!bg)
+    {
+        std::cerr << "  GPU gelu backward 失败（未命中融合 shader？）: "
+                  << bg.error().message << "\n";
+        return 1;
+    }
+    const Scalar err_b = max_abs_diff(bc->cpu_matrix(), *gpu.to_matrix(*bg));
+
+    const bool ok_f = err_f < 1e-4f;
+    const bool ok_b = err_b < 1e-4f;
+    std::cout << "[" << (ok_f ? "PASS" : "FAIL") << "] gelu forward"
+              << "  err=" << std::scientific << std::setprecision(2) << err_f << "\n";
+    std::cout << "[" << (ok_b ? "PASS" : "FAIL") << "] gelu backward"
+              << "  err=" << std::scientific << std::setprecision(2) << err_b << "\n";
+    return (ok_f && ok_b) ? 0 : 1;
+}
+
 // ── Softmax forward/backward：GPU（M3 行归约融合 shader）vs CPU ───────────
 // forward:  exp(x - row_max) / row_sum(exp(x - row_max))
 // backward: out * (grad - row_dot(out * grad))
@@ -290,6 +336,7 @@ int main()
         fail += run_rope(*cpu_engine, *gpu_engine, dk, /*backward=*/true);
     }
     fail += run_swiglu(*cpu_engine, *gpu_engine);
+    fail += run_gelu(*cpu_engine, *gpu_engine);
     fail += run_softmax(*cpu_engine, *gpu_engine);
     fail += run_norm<nn::RMSNorm>("rmsnorm", *cpu_engine, *gpu_engine);
     fail += run_norm<nn::LayerNorm>("layernorm", *cpu_engine, *gpu_engine);

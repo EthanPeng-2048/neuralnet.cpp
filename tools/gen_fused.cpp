@@ -31,8 +31,8 @@
 #include "expr_spec.hpp"
 #include "expr_registry.hpp"
 #include "expr_emitter.hpp"   // IR-D：emitter 抽象（后端选择）
-#include "glsl_gen.hpp"       // 注册 GlslEmitter（默认后端）
-#include "cpu_emitter.hpp"    // 注册 CpuEmitter（IR-D 第二后端，供 --list-backends）
+#include "expr_glsl_gen.hpp"       // 注册 GlslEmitter（默认后端）
+#include "expr_cpu_emitter.hpp"    // 注册 CpuEmitter（IR-D 第二后端，供 --list-backends）
 
 namespace
 {

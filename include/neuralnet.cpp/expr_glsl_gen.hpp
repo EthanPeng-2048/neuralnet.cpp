@@ -1,8 +1,8 @@
-#ifndef NN_GLSL_GEN_HPP
-#define NN_GLSL_GEN_HPP
+#ifndef NN_EXPR_GLSL_GEN_HPP
+#define NN_EXPR_GLSL_GEN_HPP
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  glsl_gen.hpp — AOT 算子融合：ExprSpec → GLSL 计算 shader 源码
+//  expr_glsl_gen.hpp — AOT 算子融合：ExprSpec → GLSL 计算 shader 源码
 //
 //  在构建期由 tools/gen_fused 调用：把 scan_exprs 收集的内联表达式结构
 //  （ExprSpec，派生物）展开为单个融合 .comp 文件。
@@ -904,4 +904,4 @@ inline const bool kGlslEmitterRegistered =
 
 } // namespace nn
 
-#endif // NN_GLSL_GEN_HPP
+#endif // NN_EXPR_GLSL_GEN_HPP

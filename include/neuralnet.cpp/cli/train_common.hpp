@@ -36,7 +36,7 @@
 #include <string>
 #include <vector>
 
-#include "neuralnet.cpp/config.hpp"      // nn::Scalar
+#include "neuralnet.cpp/core_config.hpp"      // nn::Scalar
 #include "neuralnet.cpp/core_errors.hpp"  // nn::parse_number
 
 namespace nn::cli

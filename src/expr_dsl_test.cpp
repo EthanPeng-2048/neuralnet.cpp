@@ -20,10 +20,10 @@
 #include <cstdio>
 #include <vector>
 
-#include <neuralnet.cpp/tensor.hpp>
+#include <neuralnet.cpp/compute_tensor.hpp>
 #include <neuralnet.cpp/expr_dsl.hpp>
 #include <neuralnet.cpp/expr_spec.hpp>
-#include <neuralnet.cpp/cpu_engine.hpp>
+#include <neuralnet.cpp/compute_cpu_engine.hpp>
 
 // 测试写在全局作用域（非 namespace nn），避免与旧代数运算符的 ADL 歧义。
 using namespace nn::dsl;

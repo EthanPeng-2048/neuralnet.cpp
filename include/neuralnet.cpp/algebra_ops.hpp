@@ -9,7 +9,7 @@
 #include <algorithm>
 #include <cmath>
 
-#include "config.hpp"
+#include "core_config.hpp"
 #include "expr_spec.hpp"  // ExprOp（单一算子来源：ops 是唯一事实来源）
 
 namespace nn::ops

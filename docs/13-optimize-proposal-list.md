@@ -44,7 +44,7 @@
 ### P1-05 ✅ 归约指令 pass 多累加器（已实现，2026-08-26）
 - **文件**：`glsl_gen.hpp`（`generate_glsl_reduce` 行/列归约指令 pass）
 - **现状**：归约指令 pass（每条归约指令）已改为 4 路独立标量累加器（acc0-acc3，独立变量非数组索引）+ 4 路展开循环，与归约视图 pass 一致。打破 `acc = acc + x` 串行 FMA 依赖链，提升 ILP。
-- **验证**：27/27 ctest 全绿（含 gradcheck/融合测试）。新增 `reduce_instr_bench`（GPU 驻留内核级基准）测量指令 pass 吞吐。
+- **验证**：27/27 ctest 全绿（含 gradcheck/融合测试）。原 `reduce_instr_bench`（GPU 驻留内核级基准）已随 bench 工具移除（2026 清理），吞吐以 fused_gpu_test 覆盖。
 - **A/B 实测（GTX 850M）**：`col_reduce_sum(a*b)`（LayerNorm 方差路径，**内存带宽受限**）新/旧基本持平（±5% 噪声内）。这是**预期的**——带宽受限 kernel 的累加器依赖链已被掩盖，多累加器无增益。
 - **理论收益**：对**计算密集**归约（每元素 exp/sqrt/多步运算后才累加，计算成瓶颈时）可 ~1.5-2×。当前生产 DSL 归约均为内存受限简单归约，该收益为"潜伏"状态；随更多计算密集融合走 DSL 路径（P2-09/P2-14）而兑现。
 - **结论**：保留（零回归 + 与视图 pass 一致性 + 计算密集归约潜在收益）。**评估教训**：A/B 需针对目标瓶颈类型选 kernel，测内存受限 kernel 得出中性不代表实现无效。
@@ -497,7 +497,7 @@
 ## 8. 工具链与开发者体验
 
 ### P8-01 📋 基准测试框架自动化
-- **现状**：`reduce_bench` / `compute_bench` / `bench_thresholds` / `mnist_bench` 各自独立，无统一框架。
+- **现状**：bench 工具（`compute_bench` / `mnist_bench` / `bench_thresholds` / `reduce_bench` / `reduce_instr_bench`）已移除（2026 清理，无法在 -Werror 下编译）。若需性能基准，重建统一框架。
 - **方案**：
   - 统一基准框架（类似 Google Benchmark），支持 CI 集成 + 回归检测。
   - 自动生成性能报告（HTML/Markdown）。
@@ -623,7 +623,7 @@
 | P1-03 | GPU matmul tiled | — | `shaders/matmul_tiled.comp` |
 | P1-04 | 标量路径 row/col 除法消除 | 2026-08-25 | `glsl_gen.hpp` |
 | P1-09 | warp shuffle 归约 | 2026-08-25 | `glsl_gen.hpp` |
-| P1-05 | 归约指令 pass 多累加器 | 2026-08-26 | `glsl_gen.hpp`, `reduce_instr_bench` |
+| P1-05 | 归约指令 pass 多累加器 | 2026-08-26 | `glsl_gen.hpp`（原 `reduce_instr_bench` 已移除） |
 | P2-01 | IR-A DCE/折叠/化简 | 2026-08-23 | `expr_opt.hpp` |
 | P2-02 | IR-B CSE/寄存器分配 | 2026-08-23 | `expr_opt.hpp` |
 | P2-03 | IR-C 图 IR/链融合 | 2026-08-24 | `expr_graph.hpp` |

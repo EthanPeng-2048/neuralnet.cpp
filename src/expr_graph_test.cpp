@@ -22,14 +22,14 @@
 #include <string>
 #include <vector>
 
-#include <neuralnet.cpp/tensor.hpp>
+#include <neuralnet.cpp/compute_tensor.hpp>
 #include <neuralnet.cpp/expr_spec.hpp>
 #include <neuralnet.cpp/expr_opt.hpp>
 #include <neuralnet.cpp/expr_graph.hpp>
 #include <neuralnet.cpp/expr_emitter.hpp>
-#include <neuralnet.cpp/glsl_gen.hpp>    // 注册 GlslEmitter（IR-D）
-#include <neuralnet.cpp/cpu_emitter.hpp> // 注册 CpuEmitter（IR-D）
-#include <neuralnet.cpp/cpu_engine.hpp>
+#include <neuralnet.cpp/expr_glsl_gen.hpp>    // 注册 GlslEmitter（IR-D）
+#include <neuralnet.cpp/expr_cpu_emitter.hpp> // 注册 CpuEmitter（IR-D）
+#include <neuralnet.cpp/compute_cpu_engine.hpp>
 
 using nn::Scalar;
 

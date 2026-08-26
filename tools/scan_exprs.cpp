@@ -21,7 +21,7 @@
 #include <cstdio>
 #include <cstddef>
 
-#include "cpu_engine.hpp"
+#include "compute_cpu_engine.hpp"
 #include "compute_layer.hpp"
 #include "expr_registry.hpp"
 
@@ -65,6 +65,19 @@ int main(int argc, char* argv[])
         (void)swiglu.forward(engine, input);
         nn::Tensor grad = nn::Tensor::cpu(d_ff, 5);
         (void)swiglu.backward(engine, grad);
+    }
+
+    // ── GeLU forward + backward（QuickGeLU 单表达式 DSL 融合）─────────────
+    // forward:  x / (1 + exp(-βx))；backward: grad_out * s*(1 + βx*(1-s))，
+    //           s = sigmoid(βx)。sigmoid 在 backward 用 input_cache_ 重算。
+    // 结构不依赖形状，任取一个 R×C 即可；先 forward 填 input_cache_ 再 backward。
+    {
+        const std::size_t R = 6, C = 9;
+        nn::GeLU gelu;
+        nn::Tensor input = nn::Tensor::cpu(R, C);
+        (void)gelu.forward(engine, input);
+        nn::Tensor grad = nn::Tensor::cpu(R, C);
+        (void)gelu.backward(engine, grad);
     }
 
     // ── Softmax forward + backward（M3 行归约融合）────────────────────────

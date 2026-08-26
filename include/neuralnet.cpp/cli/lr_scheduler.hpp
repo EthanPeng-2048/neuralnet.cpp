@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-#include "neuralnet.cpp/config.hpp"  // nn::Scalar
+#include "neuralnet.cpp/core_config.hpp"  // nn::Scalar
 
 namespace nn::cli
 {

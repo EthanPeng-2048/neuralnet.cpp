@@ -199,7 +199,7 @@ class Tensor {
 |------|------|
 | `domain_mnist.hpp` | MNIST 工厂函数：`build_mnist_mlp_model()` / `build_mnist_transformer_model()` |
 | `domain_gpt.hpp` | GPT 工厂函数：`build_gpt_model()` / `build_gpt_model_from_spec()` |
-| `domain_tokenizer.hpp` | 分词器：`Tokenizer` 基类 + `WordZipTokenizer` / `BPETokenizer` / `ByteZipTokenizer` |
+| `domain_tokenizer.hpp` | 分词器：`Tokenizer` 基类 + `BPETokenizer` / `CharBPETokenizer` |
 
 ---
 
@@ -285,8 +285,6 @@ cmake --build build --parallel
 | `text_infer` | GPT 文本推理 |
 | `tokenizer_train` | BPE 分词器训练 |
 | `tokenizer_infer` | BPE 分词器推理 |
-| `compute_bench` | 计算性能基准测试 |
-| `bench_thresholds` | 并行阈值基准测试 |
 | `gpu_test` | GPU 后端测试 |
 
 ---

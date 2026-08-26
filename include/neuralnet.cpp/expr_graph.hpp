@@ -33,7 +33,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "tensor.hpp"
+#include "compute_tensor.hpp"
 #include "expr_spec.hpp"
 #include "expr_opt.hpp"
 

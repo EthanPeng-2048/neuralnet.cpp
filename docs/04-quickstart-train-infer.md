@@ -178,8 +178,6 @@ cmake --build build --parallel
 |------|---------------------|------|
 | BPE | `"bpe"` | Byte-Pair Encoding |
 | CharBPE | `"charbpe"` | 字符级 BPE |
-| WordZip | `"wordzip"` | 词频统计分词 |
-| Space | `"space"` | 空格分词 |
 
 V4 格式模型文件会自动嵌入分词器，推理时无需单独指定 `--vocab`。
 

@@ -1,7 +1,7 @@
-#ifndef NN_CPU_ENGINE_HPP
-#define NN_CPU_ENGINE_HPP
+#ifndef NN_COMPUTE_CPU_ENGINE_HPP
+#define NN_COMPUTE_CPU_ENGINE_HPP
 
-// ── cpu_engine.hpp — CPU 计算引擎实现 ─────────────────────────────────────
+// ── compute_cpu_engine.hpp — CPU 计算引擎实现 ─────────────────────────────────────
 // CpuEngine 封装现有 Matrix 方法和 AST（compute::apply），实现
 // ComputeEngine 接口。所有操作同步执行，begin_batch/end_batch 为 no-op。
 //
@@ -1734,4 +1734,4 @@ public:
 
 } // namespace nn
 
-#endif // NN_CPU_ENGINE_HPP
+#endif // NN_COMPUTE_CPU_ENGINE_HPP

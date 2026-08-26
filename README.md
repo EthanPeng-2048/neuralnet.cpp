@@ -48,22 +48,23 @@ neuralnet.cpp/
 ├── gui.py                       ← 图形化操作界面 (CustomTkinter)
 ├── include/neuralnet.cpp/
 │   ├── nn.hpp                   ← 统一入口头文件
-│   ├── config.hpp               ← SmartPolicy、BLOCK_SIZE
-│   ├── tensor.hpp               ← 统一跨设备张量
+│   ├── core_config.hpp          ← SmartPolicy、BLOCK_SIZE
+│   ├── compute_tensor.hpp       ← 统一跨设备张量
 │   ├── compute_engine.hpp       ← 引擎抽象接口
-│   ├── cpu_engine.hpp           ← CPU 引擎
-│   ├── gpu_engine.hpp           ← GPU 引擎 (Vulkan)
-│   ├── cuda_engine.hpp          ← GPU 引擎 (CUDA)
-│   ├── compute_layer.hpp        ← Layer 基类 + 所有层
+│   ├── compute_cpu_engine.hpp   ← CPU 引擎
+│   ├── compute_gpu_engine.hpp   ← GPU 引擎 (Vulkan)
+│   ├── compute_cuda_engine.hpp  ← GPU 引擎 (CUDA, 已停用)
+│   ├── compute_layer.hpp        ← Layer 聚合头
+│   ├── compute_layer_{base,mlp,conv,softmax,attention,feedforward,transformer,gpt,zipt,rapt}.hpp ← 各层域
 │   ├── compute_loss.hpp         ← 损失函数
 │   ├── compute_optimizer.hpp    ← 优化器 (SGD/Adam/AdamW/Muon)
 │   ├── model_container.hpp      ← Model 容器
 │   ├── model_spec.hpp           ← 架构描述
 │   ├── model_serialization.hpp  ← 二进制序列化
+│   ├── model_keyvalue_record.hpp ← 自描述键值记录
 │   ├── domain_mnist.hpp         ← MNIST 模型工厂
 │   ├── domain_gpt.hpp           ← GPT 模型工厂
 │   ├── domain_tokenizer.hpp     ← 分词器
-│   ├── tensor.hpp               ← 统一跨设备张量
 │   ├── algebra_matrix.hpp       ← 矩阵类
 │   ├── algebra_expr.hpp         ← 表达式模板
 │   ├── algebra_ops.hpp          ← 逐元素算子
@@ -82,8 +83,6 @@ neuralnet.cpp/
 │   ├── text_infer.cpp           ← GPT 文本推理
 │   ├── tokenizer_train.cpp      ← 分词器训练
 │   ├── tokenizer_infer.cpp      ← 分词器推理
-│   ├── compute_bench.cpp        ← 性能基准测试
-│   ├── bench_thresholds.cpp     ← 并行阈值测试
 │   └── gpu_test.cpp             ← GPU 后端测试
 ├── datasets/                    ← 训练数据
 ├── pretrained/                  ← 预训练模型

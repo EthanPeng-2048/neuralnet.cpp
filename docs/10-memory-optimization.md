@@ -139,7 +139,7 @@ FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU �
 1. **显存采样**：在训练 step 间记录 `pool_stats`（块数/已分配/空闲/碎片比）与 GPU 总占用曲线，标出 step 内峰值出现阶段（forward/backward/optimizer）。
 2. **逐项归因**：跑一次 step，分别关闭激活缓存（假想）、池归还、自动融合，量化每项独立贡献——修正 §0.1 的⑤残差。
 3. **数值回归**：`gpt_gradcheck`、`rmsnorm_gradcheck`、`swiglu_gradcheck`、`softmax_gradcheck`、`matmul_fusion_test`、`ce_fusion_test` 保持全绿；训练 loss 曲线与参考一致。
-4. **性能回归**：`compute_bench`/`mnist_bench` 确认"省显存"未以显著耗时退化为代价（重计算倍率、池复用消耗）。
+4. **性能回归**：确认"省显存"未以显著耗时退化为代价（重计算倍率、池复用消耗），用训练 step 耗时采样替代（bench 工具已移除）。
 
 ---
 

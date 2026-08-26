@@ -18,7 +18,7 @@
 #include "core_errors.hpp"
 #include "core_assert.hpp"
 #include "core_threadpool.hpp"
-#include "config.hpp"
+#include "core_config.hpp"
 #include "algebra_span.hpp"
 #include "algebra_compute.hpp"
 

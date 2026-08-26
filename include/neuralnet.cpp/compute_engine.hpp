@@ -28,9 +28,9 @@
 #include <span>
 #include <string>
 
-#include "config.hpp"
+#include "core_config.hpp"
 #include "core_errors.hpp"
-#include "tensor.hpp"
+#include "compute_tensor.hpp"
 #include "expr_spec.hpp"
 
 namespace nn
