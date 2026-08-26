@@ -73,7 +73,7 @@ FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU �
 - 文档 09 §0 将"内存池 first-fit 碎片化 + 永不归还"列为**独立跟踪项、不随融合解决**。
 
 ### 1.4 注意力形态（L3，语义复杂）
-- M6 已实现**两趟式**：forward 用 `batched_matmul_reduce/max → denom → apply` 不物化 `BH·seq²`；backward 默认**反向重算 `W`**（[09 §4 A 方案](09-operator-fusion.md)），省 `attn_cache_`，代价 2× FLOPs。
+- M6 ⚠️ 已删除：原 `batched_matmul_reduce/max → denom → apply` 两趟式 forward 与 `batched_matmul_softmax_backward_q/kv` backward 重算 `W` 方案，已被 IR 融合替代（[14-operator-fusion-2.md](14-operator-fusion-2.md) §S7）。
 - 该路径已消除 `BH·seq²` 物化，剩余驻留为逐层 Q/K/V 激活集（属 L1 激活重计算可覆盖范围）。**不手写** flash-attention 类融合 kernel：沿用现有自动融合/算子生成路径（见 [09-operator-fusion.md](./09-operator-fusion.md)），由 L3 的自动融合优化统一推进。
 
 ### 1.5 分布式分片（超长序列，远期）
