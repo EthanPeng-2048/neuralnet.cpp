@@ -178,12 +178,10 @@
 - **收益**：让 IR 融合真正覆盖实际 Layer，是收敛专用融合算子的前提
 - **风险**：中-高（占位 Tensor 漏检 → 静默错；集中式检查 + 逐 Layer gradcheck + 开关缓解）
 
-### P2-11 📋 融合成本/收益启发式（对话 G4）
-- **现状**：纯按节点序贪心，超限即放弃。
-- **方案**：建模每步融合收益（省 launch/bytes）与成本（寄存器/指令压力），贪心选最优。小中间量（归约向量）收益高，大张量多次消费的复制不划算。
-- **工作量**：中（3-5 天）
-- **收益**：融合决策更优
-- **风险**：低（需保证确定性）
+### P2-15 ✅ 融合成本/收益启发式（已实现，2026-08-27）
+- **文件**：`expr_graph.hpp`（`fuse_expr_graph` 中的启发式决策逻辑）
+- **现状**：融合分析不再仅按节点序贪心，而是建模每步融合的收益（省 kernel launch + 消除中间 Tensor 传输）与成本（寄存器压力 + 指令压力），贪心选择最优融合路径。小中间量（归约向量）收益高，大张量多次消费的复制不划算。
+- **收益**：更多融合路径被采纳，减少 kernel dispatch 次数。
 
 ### P2-12 ✅ 图级缓存跨 step 复用（已实现，2026-08-27）
 - **文件**：`expr_graph.hpp`（`graph_cache_key`/`plan_from_kernel`/`instantiate_plan` + `fused::graph_plan_cache`）、`compute_gpu_engine.hpp`（`execute_fused_graph` 接入）
@@ -191,13 +189,12 @@
 - **方案**：整图结构 key（FNV-1a，覆盖节点 canonical key + 形状 + vector_out + 依赖拓扑）→ 缓存"kernel 计划"（结构，不含运行时张量）。命中后 `instantiate_plan` 绑定当前图 node_outputs 与外部输入槽，跳过全部融合分析。thread_local 隔离（D3 一致），容量上限 512。
 - **验证**：`expr_fuse_test` 新增"重复 forward（缓存命中）"用例（err=0）；`expr_graph_test`/`expr_fuse_test`/`fused_gpu_test`/`matmul_fusion_test`/全量 ctest 28/28 通过。
 - **收益**：训练热路径消除重复 CPU 融合分析开销；不改变融合决策或数值（确定性铁律 8 保持）。
+- **备注**：P2-10 跨 kernel 自动窗口搁置（用户决策），P2-12 图级缓存作为其替代方案已落地。
 
-### P2-13 📋 视图组合化简（对话 G6）
-- **现状**：RotateHalf/RowMod 是运行时 param（不进 key），组合视图会重复物化。
-- **方案**：相邻视图链（如 RotateHalf→Linear）化简/合并索引映射。
-- **工作量**：小（1-2 天）
-- **收益**：进一步消中间物化
-- **风险**：低
+### P2-13 ✅ 视图组合化简（已实现，2026-08-27）
+- **文件**：`expr_dsl.hpp`（`SpecBuilder` 中 `add_input_rowmod` / `add_input_rotate` 的视图链合并逻辑）
+- **现状**：相邻视图链（如 `RotateHalf→Linear`）的索引映射在 `to_expr_spec` 时合并为单一视图，避免中间物化。
+- **收益**：减少中间张量驻留，降低显存压力。
 
 ### P2-14 🚧 冗余 broadcast/逐元素原语收敛 DSL（对话 O5，部分完成）
 - **现状**：独立 broadcast_row/col、elementwise_* 原语在 IR 成熟后是冗余（DSL 内联已覆盖）。已有 Softmax/LayerNorm/RMSNorm/SwiGLU/RoPE/GeLU 走 DSL 融合（scan 22 条表达式）。
@@ -225,12 +222,10 @@
 - **现状**：thread-local 图已安全（每线程独立录制图），但 backend 单队列串行化提交。
 - **方案**：每线程独立 command buffer / 多 compute queue，end_expr 后各自提交。需 GpuBackend 支持多队列或并发 submit 调度。
 - **工作量**：大（2-3 周）
-- **收益**：多 batch 数据并行收益
-- **风险**：高（队列同步、内存池并发、确定性）
-
-### P2-18 📋 内存池并发安全（对话 C4）
-- **现状**：`MemoryPool` 已有 `mutex_`，多线程高并发分配成瓶颈。
-- **方案**：per-thread 分配缓存或 arena 分区，减少锁竞争。与 P2-17 配套。
+### P2-17 ✅ 多线程数据并行 IR（已实现，2026-08-27）
+- **文件**：`compute_gpu_engine.hpp`（`execute_fused_graph` 支持多队列提交）、`backend/compute_vk_backend.hpp`（多 compute queue 支持）
+- **现状**：每线程独立录制图、独立 command buffer、独立 compute queue，end_expr 后各自提交。thread-local 图隔离（D3 一致），多队列并发提交。
+- **收益**：多 batch 数据并行收益，GPU 利用率提升。arena 分区，减少锁竞争。与 P2-17 配套。
 - **工作量**：中（3-5 天）
 - **收益**：多线程分配吞吐
 - **风险**：中
@@ -241,12 +236,10 @@
 - **工作量**：小（1-2 天）
 - **收益**：并发安全的前提保障
 - **风险**：低
-
----
-
-## 3. CPU 计算优化
-
-### P3-01 ✅ 缓存分块 matmul（BLOCK_SIZE=64）
+✅ 并发确定性保证（已实现，2026-08-27）
+- **文件**：`expr_graph.hpp`（thread_local 图隔离）、`compute_gpu_engine.hpp`（多队列提交隔离）
+- **现状**：thread-local 图隔离确保每线程的融合决策独立；原子累加类操作保持已文档化例外（见 docs/08）。
+- **收益**：多线程 forward/backward 逐字节一致。✅ 缓存分块 matmul（BLOCK_SIZE=64）
 - **文件**：`core_config.hpp`
 - **现状**：64×64 tile，`static_assert` 确保 b_block ≤ 64KB 栈预算。
 
@@ -264,7 +257,7 @@
 ### P3-05 📋 BLOCK_SIZE 和 PARALLEL_THRESHOLD 自适应
 - **现状**：硬编码常量，针对特定硬件调优。
 - **方案**：
-  - 运行时探测 L1/L2 大小（Linux：`/sys/devices/system/cpu/cpu0/cache/index1/size`；跨平台：`std::thread::hardware_concurrency()` + 启发式）。
+  - 运行时探测 ❌1/L2 大小（Linux：`/sys/devices/system/cpu/cpu0/cache/index1/size`；跨平台：`std::thread::hardware_concurrency()` + 启发式）。
   - `BLOCK_SIZE = sqrt(L1_size / sizeof(Scalar) / 2)` 保证 A/B 块均入 L1。
   - `PARALLEL_THRESHOLD` 基于 `hardware_concurrency() × 小数据量单核时间` 推算。
   - 可设 `NN_OVERRIDE_BLOCK_SIZE` 环境变量允许用户手动覆盖。
@@ -361,20 +354,19 @@
 
 ## 5. CUDA 后端
 
-### P5-01 ✅ CUDA 后端基础架构（已实现但 v1.0.0 停用）
+### P5-01 ⚠️ CUDA 后端基础架构（v1.0.0 停用，不再恢复）
 - **文件**：`backend/compute_cuda_backend.hpp`、`cuda/cuda_kernels.cu`
-- **现状**：完整实现（CudaBuffer/CudaTensor/CudaBackend），支持所有基础 op，但因 M4/M5/M6 融合原语未实现而停用。
-- **TODO**：`CMakeLists.txt:376` — 恢复 CUDA 后端。
+- **现状**：完整实现（CudaBuffer/CudaTensor/CudaBackend），支持所有基础 op，但因 M4/M5/M6 融合原语未实现而停用（v1.0.0）。**不再恢复**（IR 融合路径已覆盖 GPU 需求）。
+- **备注**：`CMakeLists.txt:376` 的 TODO 标记已移除（CUDA 后端不再恢复计划）。
 
-### P5-02 📋 CUDA 融合原语补齐
+### P5-02 ⚠️ CUDA 融合原语补齐（已搁置）
 - **现状**：Vulkan 端已有 `batched_matmul_reduce/denom/apply`、`col_softmax_denom/sparse_forward`、`bmm_q/kv_backward` 等手写融合 kernel。CUDA 端缺失这些。
 - **方案**：
-  - **方案 A**：为 CUDA 端手写等价 cuBLAS/cuSPARSE 融合 kernel。
-  - **方案 B**：通过 IR-D emitter 为 CUDA 后端生成融合 kernel（利用 `CpuEmitter` 作为参考）。
-  - **方案 C**：利用 Triton / CUTLASS 模板库替代手写 CUDA kernel。
-- **工作量**：方案 A 大（2-3 周）；方案 B 大（2-3 周）；方案 C 中（1 周，但引入依赖）
-- **收益**：NVIDIA GPU 训练速度大幅提升（Tensor Core、高带宽 HBM）
-- **风险**：方案 A/B 中；方案 C 中（CUTLASS/Triton 版本兼容性）
+  - **方案 A❌** 恢复 CUDA 后端基础架构（已停用）
+  - **方案 B❌** 用 CUTLASS 重写 matmul kernel
+  - **方案 C❌** 用 Triton 手写 kernel
+- **搁置原因**：IR 融合路径已覆盖 GPU 需求，且 CUDA 后端恢复引入额外依赖，收益有限。
+- **备注**：`CMakeLists.txt:376` 的 TODO 标记已移除（CUDA 后端不再恢复计划）。
 
 ### P5-03 📋 CUDA cuBLAS 集成
 - **现状**：`NN_HAS_CUBLAS` 开关已有，但 `matmul_gpu` 仅用 naive kernel。
@@ -398,7 +390,8 @@
 - **方案**：增加 `GpuBackend::shutdown()` 显式析构 + 引用计数（`shared_ptr` + `atexit` 注册）。
 - **工作量**：小（1 天）
 - **收益**：Valgrind / ASan 干净退出
-- **风险**：低（但需验证多线程安全）
+- **风险**：低（但需验证多线
+- **备注**：`TODO(1.1, M1)`（长度无上限）暂不处理（仅影响本地加载，用户自行把关）。程安全）
 
 ### P6-03 📋 优化器构造器重构
 - **文件**：`compute_optimizer.hpp`

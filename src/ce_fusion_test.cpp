@@ -2,8 +2,8 @@
 //  ce_fusion_test.cpp — M5：列式 softmax 融合原语 + 稀疏交叉熵端到端
 //
 //  验证：
-//    - col_softmax_denom：denom[c] = Σ_r exp(logits[r][c] - col_max[c])
-//    - col_softmax_sparse_forward：单 kernel 稠密梯度 + 标签位置 loss_vec
+//    - col_softmax_denom：denom[c] = Σ_r exp(logits[r][c] - col_max[c]) → 已删除（IR 融合替代）
+//    - col_softmax_sparse_forward：单 kernel 稠密梯度 + 标签位置 loss_vec → 已删除（IR 融合替代）
 //      （不物化全 softmax），含 mask / 越界标签处理
 //    - CrossEntropyLoss::forward_sparse 端到端（loss + grad vs 参考）
 //  CPU 引擎 vs 手写参考；GPU（Vulkan）融合 shader vs CPU 参考。

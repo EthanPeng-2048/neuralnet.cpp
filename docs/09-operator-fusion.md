@@ -408,7 +408,7 @@ auto e = engine.end_expr();
 |------|------|
 | `include/neuralnet.cpp/expr_spec.hpp` | 归约视图、归约指令、`Reduce` 操作数 |
 | `include/neuralnet.cpp/expr_dsl.hpp` | `SpecBuilder` 支持归约；归约 DSL 自由函数 |
-| `include/neuralnet.cpp/compute_engine.hpp` | `ReduceOp` 枚举；`begin_expr/end_expr`；`batched_matmul_reduce`/`..._softmax_denom`/`..._softmax_apply`；M6 反向 `..._softmax_backward_q`/`..._softmax_backward_kv`；M5 列式 `col_softmax_denom`/`col_softmax_sparse_forward`；`elementwise_broadcast_row` |
+| `include/neuralnet.cpp/compute_engine.hpp` | `ReduceOp` 枚举；`begin_expr/end_expr`；M4-M6 手写原语已删除（IR 融合替代）；`elementwise_broadcast_row` |
 | `include/neuralnet.cpp/cpu_engine.hpp` | 上述原语 CPU 实现（先正确后优化） |
 | `include/neuralnet.cpp/gpu_engine.hpp` | 录制融合分析；GPU 原语实现 |
 | `include/neuralnet.cpp/backend/compute_vk_backend.hpp` | 新融合 shader dispatch（含 M6 两反向 pipeline、M5 两列式 pipeline） |

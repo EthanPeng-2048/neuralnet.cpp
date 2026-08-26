@@ -111,31 +111,25 @@ struct MatmulSpec {
 ### 4.1 目标
 消除手工 `begin_expr/end_expr`。真实 Layer（如 LayerNorm 的 5 个 `dsl::compute`）连续可融合表达式自动并入窗口，遇不兼容自动关窗执行。**Layer 无感知**。
 
-### 4.2 机制：eval_expr 自动窗口
-- `GpuEngine` 维护 `std::optional<ExprGraph> auto_window_`（线程局部，与 D3/图级缓存一致）。
-- `eval_expr/eval_expr_reduce` 被调用时：
-  1. 若窗口为空 → 开新窗口，加入当前表达式，返回占位 Tensor。
-  2. 若窗口非空 → 尝试把新表达式并入当前窗口的图（`ExprGraph::add_node`）；若节点可与窗口内已有节点融合（同形状、归约边界允许、依赖关系成立）→ 并入；否则 **flush 窗口**（`execute_fused_graph` 物化已有节点）+ 为新表达式开新窗口。
-- **窗口关闭（flush）触发点**（统一集中式检查，防漏检）：
-  - 下一个 `eval_expr` 不兼容时（见上）。
-  - **任何"消费 Tensor"的引擎入口**（`matmul`/`batched_matmul`/`elementwise_*`/`row|col_reduce_*`/`transpose`/`rearrange_3d`/`axpy`/`to_matrix`/下载等）收到**属于当前窗口的占位 Tensor** 时，先 flush。
-  - `end_batch`/`flush_batch` 边界（若窗口残留）自动 flush。
-- **占位 Tensor 识别**：`virtual_tag` 已存在（IR-C 复用）。新增辅助 `bool tensor_in_auto_window(const Tensor&)`，各入口统一调用 `flush_auto_window_if_needed(span<const Tensor>)`。
+### 4.2 机制：eval_expr 自动窗口（搁置）
+- **状态**：此方案因用户决策搁置。
+- **原设计**：`GpuEngine` 维护 `std::optional<ExprGraph> auto_window_`（线程局部，与 D3/图级缓存一致）。`eval_expr/eval_expr_reduce` 被调用时：若窗口为空则开新窗口，若窗口非空则尝试并入新表达式；不兼容时 flush 窗口。
+- **窗口关闭触发点**：不兼容表达式、消费占位 Tensor 的引擎入口、`end_batch`/`flush_batch` 边界。
+- **占位 Tensor 识别**：`virtual_tag` 已存在（IR-C 复用）。
+- **替代方案**：P2-12 图级缓存（`expr_graph.hpp` 的 `graph_cache_key`/`plan_from_kernel`/`instantiate_plan`）已作为替代方案落地，消除重复融合分析开销。
 
-### 4.3 正确性与风险缓解
-- **铁律 8 确定性**：窗口融合决策基于结构（`fuse_expr_graph` 已确定），不改变数值；P2-12 图级缓存保证同结构复用。
-- **主要风险**：漏检某入口导致占位 Tensor 被当作真实 buffer → 读未初始化内存 → 静默错。缓解：
-  1. 所有原语入口**统一**走 `flush_auto_window_if_needed`（集中在 `GpuEngine` 一个类内，可 grep 审计）。
-  2. 逐 Layer 回归：`gpt_gradcheck` / `fused_gpu_test` / `expr_fuse_test` / 各 `*_gradcheck` 全绿。
-  3. 提供 `NN_AUTO_FUSION=0` 开关可禁用（回退现状逐表达式 dispatch），便于二分定位。
-- **默认关闭窗口到 Layer 语义边界**：为避免误融合跨 Layer 的 matmul/归约边界，窗口默认在"遇到的第一个 matmul / 归约输出 / 形状变化"时 flush（与 `fuse_expr_graph` 的融合边界一致）。
+### 4.3 正确性与风险缓解（搁置）
+- **状态**：此方案因用户决策搁置。
+- **原设计**：`GpuEngine` 集中式 flush 检查 + 逐 Layer gradcheck 回归 + `NN_AUTO_FUSION=0` 开关。
+- **替代方案**：P2-12 图级缓存（`expr_graph.hpp`）已作为替代方案落地，通过跨 step 缓存消除重复融合分析开销，同时保持确定性。
 
 ### 4.4 与 P2-12 的关系
 - P2-12（图级缓存）已消除"命中缓存时"的融合分析 CPU 开销。
 - P2-10 消除"未命中/首步"时的手工窗口与重复 dispatch，并让**真实 Layer** 落入图级缓存的受益范围。
-
----
-
+（替代方案）
+- P2-12（图级缓存）已作为 P2-10 的替代方案落地，通过跨 step 缓存消除重复融合分析开销。
+- P2-12 与 P2-10 的核心目标一致（减少重复融合分析），但实现路径不同：P2-10 用自动窗口，P2-12 用缓存命中。
+- P2-12 已实现并通过 `expr_fuse_test` / `fused_gpu_test` / 全量 ctest 验证
 ## 5. 分阶段实施路线
 
 > 每阶段独立可构建、可测试、可回归；阶段间不破坏既有功能。
@@ -155,6 +149,7 @@ struct MatmulSpec {
 - S4 依赖 S3；S5 依赖 S3；S6 相对独立（可在 S3 后并行推进）；S7 依赖 S5+S6。
 
 ---
+- **S6 搁置**：因用户决策，S6 自动窗口方案搁置，由 P2-12 图级缓存作为替代方案。
 
 ## 6. 迁移与删除 M4-M6 的计划（S7 详述）
 
@@ -174,7 +169,7 @@ struct MatmulSpec {
 - **现有回归**：`expr_*_test` / `fused_gpu_test` / `matmul_fusion_test` / `ce_fusion_test` / `attn_gradcheck` / `gpt_gradcheck` / `rmsnorm_gradcheck` / `softmax_gradcheck` / `gpt_checkpoint_test` 保持全绿。
 - **形状无关**：matmul 的 `k` 不进 key，测试覆盖不同 K（含非对齐）命中同一融合 shader。
 - **并发**：自动窗口线程局部（D3 一致），多线程 forward/backward 隔离。
-
+thread-local 图隔离
 ---
 
 ## 8. 风险与开放问题
@@ -183,7 +178,6 @@ struct MatmulSpec {
 |----|------|------|
 | **matmul 形状语义** | A/B 与逐元素输入形状不同，破坏"输入同形状"假设 | S1 明确定义输入顺序与 shape 推导；dispatch 从实际张量推 M/N/K |
 | **自动窗口漏检** | 占位 Tensor 被未检查入口误用 → 静默错 | 集中式 `flush_auto_window_if_needed` + 逐 Layer gradcheck + `NN_AUTO_FUSION=0` 开关 |
-| **GLSL matmul 生成** | 生成含 matmul 分块的 shader 工作量大 | S3 先复用 `matmul_tiled.comp` 逻辑生成（结构驱动，非手写固定 kernel） |
 | **上限压力** | matmul + 尾链可能超输入/寄存器上限 | 融合分析保守放弃（回退独立 kernel）；S5 再评估上限动态化（P2-07） |
 | **M4-M6 删除回归面** | 注意力/交叉熵路径广泛 | 分阶段删、每步先有 IR 覆盖再删 |
 
@@ -198,6 +192,10 @@ struct MatmulSpec {
 | **M-II-3** | 跨归约/跨 matmul 链融合（S5，注意力/CE 结构） | 本设计 §3.3/§5 |
 | **M-II-4** | 跨 kernel 自动窗口（S6，P2-10） | 本设计 §4 |
 | **M-II-5** | 删除 M4-M6 手写原语（S7） | 本设计 §6 |
+| **M-II-6** | Flash-Attention 效果经融合算子实现（P7-01）（搁置） |
+| **M-II-5** | 删除 M4-M6 手写原语（S7） | 本设计 §6 |
 | **M-II-6** | Flash-Attention 效果经融合算子实现（P7-01） | 本设计 §5 / `13` P7-01 |
 
 > 每里程碑增量、可独立验证，符合项目"小步演进、不推翻"原则（`11` §9）。
+>
+> **备注**：S6 自动窗口方案因用户决策搁置，由 P2-12 图级缓存作为替代方案落地
