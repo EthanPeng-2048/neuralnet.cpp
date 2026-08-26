@@ -1,4 +1,4 @@
-// ── cuda_backend.hpp — CUDA 计算后端 ─────────────────────────────────────
+// ── compute_cuda_backend.hpp — CUDA 计算后端 ─────────────────────────────────────
 // CudaBackend 管理 CUDA 设备、cuBLAS 句柄、CUDA 流，提供 GPU 操作 API。
 // 内核函数通过 C-linkage 接口调用 nvcc 编译的静态库。
 //
@@ -13,8 +13,8 @@
 //   实现真正异步的流水线执行。
 // ─────────────────────────────────────────────────────────────────────────
 
-#ifndef NN_CUDA_BACKEND_HPP
-#define NN_CUDA_BACKEND_HPP
+#ifndef NN_COMPUTE_CUDA_BACKEND_HPP
+#define NN_COMPUTE_CUDA_BACKEND_HPP
 
 #ifdef NN_HAS_CUDA
 
@@ -694,4 +694,4 @@ inline Result<Matrix> CudaTensor::to_matrix(CudaBackend& backend) const
 } // namespace nn
 
 #endif // NN_HAS_CUDA
-#endif // NN_CUDA_BACKEND_HPP
+#endif // NN_COMPUTE_CUDA_BACKEND_HPP

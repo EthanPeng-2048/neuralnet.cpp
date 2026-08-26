@@ -1,4 +1,4 @@
-// ── mnist_io.hpp — MNIST 数据加载与评估工具 ─────────────────────────────────
+// ── cli_cli_mnist_io.hpp — MNIST 数据加载与评估工具 ─────────────────────────────────
 //
 // 抽取自 mnist_train/mnist_bench 中重复的 load_csv 与 evaluate 函数。
 //

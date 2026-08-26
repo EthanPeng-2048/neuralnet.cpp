@@ -21,11 +21,11 @@
 #include "algebra_matrix.hpp"
 
 #ifdef NN_HAS_VULKAN
-#include "backend/vk_backend.hpp"
+#include "backend/compute_vk_backend.hpp"
 #endif
 
 #ifdef NN_HAS_CUDA
-#include "backend/cuda_backend.hpp"
+#include "backend/compute_cuda_backend.hpp"
 #endif
 
 namespace nn

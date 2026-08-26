@@ -1,4 +1,4 @@
-// ── memory_pool.hpp ─────────────────────────────────────────────────────
+// ── compute_memory_pool.hpp ─────────────────────────────────────────────────────
 // GPU 内存子分配器
 //
 // 职责：
@@ -14,8 +14,8 @@
 //   - 释放时自动合并相邻空闲区域
 // ─────────────────────────────────────────────────────────────────────────
 
-#ifndef NN_MEMORY_POOL_HPP
-#define NN_MEMORY_POOL_HPP
+#ifndef NN_COMPUTE_MEMORY_POOL_HPP
+#define NN_COMPUTE_MEMORY_POOL_HPP
 
 #ifdef NN_HAS_VULKAN
 
@@ -437,4 +437,4 @@ public:
 } // namespace nn
 
 #endif // NN_HAS_VULKAN
-#endif // NN_MEMORY_POOL_HPP
+#endif // NN_COMPUTE_MEMORY_POOL_HPP

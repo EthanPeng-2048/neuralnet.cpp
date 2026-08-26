@@ -14,7 +14,7 @@
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>
-#include <neuralnet.cpp/cli/engine_factory.hpp>
+#include <neuralnet.cpp/cli/cli_engine_factory.hpp>
 
 #include <cmath>
 #include <cstdlib>

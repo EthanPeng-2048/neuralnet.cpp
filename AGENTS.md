@@ -31,7 +31,7 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 | 加/改损失函数 | `compute_loss.hpp` |
 | 加/改优化器（SGD/Adam/AdamW/Muon） | `compute_optimizer.hpp` |
 | 加/改引擎原语（CPU 实现） | `compute_engine.hpp`（接口）+ `compute_cpu_engine.hpp` |
-| 加/改引擎原语（GPU 实现） | `compute_gpu_engine.hpp` + `backend/vk_backend.hpp` + `shaders/*.comp` |
+| 加/改引擎原语（GPU 实现） | `compute_gpu_engine.hpp` + `backend/compute_vk_backend.hpp` + `shaders/*.comp` |
 | 张量/设备抽象 | `compute_tensor.hpp` |
 | 矩阵/表达式模板（CPU 代数层） | `algebra_matrix.hpp` / `algebra_expr.hpp` / `algebra_ops.hpp` / `algebra_compute.hpp` |
 | 表达式 DSL / 融合 IR | `expr_dsl.hpp` / `expr_spec.hpp` / `expr_opt.hpp` / `expr_graph.hpp` / `expr_registry.hpp` |
