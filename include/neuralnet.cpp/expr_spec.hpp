@@ -282,7 +282,12 @@ struct ExprSpec
 //     spec 填充 → 一个 shader 适配所有形状（任何 d_k）
 [[nodiscard]] inline constexpr bool expr_view_has_runtime_param(ExprViewKind k) noexcept
 {
-    return k == ExprViewKind::RowMod || k == ExprViewKind::RotateHalf;
+    // RowMod/RotateHalf 的形状参数（d_k）与 BatchMod/BatchCol 的形状参数
+    // （num_heads / seq）都是**运行时形状数据**：不进 expr_spec_key，作为
+    // push constant vp 槽由 dispatch 按实际 spec 填充 → 同结构不同形状
+    // （不同 d_k / num_heads / seq_len）共享一个融合 shader（形状无关融合）。
+    return k == ExprViewKind::RowMod || k == ExprViewKind::RotateHalf ||
+           k == ExprViewKind::BatchMod || k == ExprViewKind::BatchCol;
 }
 // 该 spec 的运行时视图参数个数（= 融合 shader 的 push constant vp 槽位数）
 [[nodiscard]] inline std::uint32_t expr_spec_runtime_view_param_count(
