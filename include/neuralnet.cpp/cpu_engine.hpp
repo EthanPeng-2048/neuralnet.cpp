@@ -67,7 +67,8 @@ private:
     // 表达式加入录制图（见 expr_dsl.hpp 的 scan 分支），end_expr 时融合分析
     // 并把每个融合 kernel 的复合 spec 登记进 global_registry —— 保证 GPU
     // 运行时 begin_expr/end_expr 融合出的复合 spec 命中 AOT shader（闭合世界）。
-    std::optional<ExprGraph> recording_;
+    // D3：录制图由 fused::recording_graph_owner()（thread_local unique_ptr）
+    // 持有，不再用引擎成员（消除跨线程共享）。
 
 public:
     [[nodiscard]] Device device() const noexcept override { return Device::CPU; }
@@ -84,8 +85,11 @@ public:
     [[nodiscard]] Result<void> begin_expr() override
     {
 #ifdef NN_EXPR_SCAN
-        recording_.emplace();
-        fused::recording_graph_ptr() = &*recording_;
+        // D3：每线程独立堆分配录制图（与 GpuEngine 一致）
+        auto& owner = fused::recording_graph_owner();
+        if (owner)
+            return std::unexpected(Error{"begin_expr: 嵌套录制（已有未结束的 begin_expr）"});
+        owner = std::make_unique<ExprGraph>();
 #endif
         return {};
     }
@@ -93,11 +97,11 @@ public:
     [[nodiscard]] Result<void> end_expr() override
     {
 #ifdef NN_EXPR_SCAN
-        if (!recording_)
+        auto& owner = fused::recording_graph_owner();
+        if (!owner)
             return {};
-        ExprGraph g = std::move(*recording_);
-        recording_.reset();
-        fused::recording_graph_ptr() = nullptr;
+        ExprGraph g = std::move(*owner);
+        owner.reset();
         auto kernels = fuse_expr_graph(g);
         for (auto& k : kernels)
             fused::global_registry().add(k.spec);

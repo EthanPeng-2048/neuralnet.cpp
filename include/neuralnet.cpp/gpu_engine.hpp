@@ -56,10 +56,10 @@ private:
     GpuBackend& backend_;
 
     // IR-C 图 IR 录制（begin_expr/end_expr）：
-    //   recording_   ：录制中的图（nullopt = 未录制）
-    //   node_outputs_：节点下标 → 占位输出 buffer（end_expr 时写入真实结果）
-    std::optional<ExprGraph> recording_;
-    std::unordered_map<int, Tensor> node_outputs_;
+    // 录制图由 fused::recording_graph_owner()（thread_local unique_ptr）
+    // 持有（D3 修复：原 recording_/node_outputs_ 成员跨线程共享，与
+    // thread_local 录制指针组合存在数据竞争；现每线程独立堆分配，
+    // 节点占位输出 node_outputs 随图一起隔离）。
 
 public:
     explicit GpuEngine(GpuBackend& backend) : backend_(backend) {}
@@ -178,19 +178,21 @@ public:
     // 的 Tensor 即物化）。未命中 AOT 融合 shader → 硬报错（闭合世界）。
     [[nodiscard]] Result<void> begin_expr() override
     {
-        recording_.emplace();
-        node_outputs_.clear();
-        fused::recording_graph_ptr() = &*recording_;
+        // D3：每线程独立堆分配录制图（含 node_outputs），互不干扰
+        auto& owner = fused::recording_graph_owner();
+        if (owner)
+            return std::unexpected(Error{"begin_expr: 嵌套录制（已有未结束的 begin_expr）"});
+        owner = std::make_unique<ExprGraph>();
         return {};
     }
 
     [[nodiscard]] Result<void> end_expr() override
     {
-        if (!recording_)
+        auto& owner = fused::recording_graph_owner();
+        if (!owner)
             return {};
-        ExprGraph g = std::move(*recording_);
-        recording_.reset();
-        fused::recording_graph_ptr() = nullptr;
+        ExprGraph g = std::move(*owner);
+        owner.reset();
         return execute_fused_graph(g);
     }
 
@@ -212,17 +214,14 @@ public:
 
     [[nodiscard]] Result<Tensor> from_matrix(const Matrix& m) override
     {
-        // batch 模式下必须先 flush（提交并等待），否则 upload_blocking 会
-        // 独立提交 command buffer 到队列，与正在录制的 batch 产生竞争。
-        // flush 后自动重新 begin_batch，保持 batch 上下文不断裂。
-        if (in_batch())
-        {
-            auto r = end_batch();
-            if (!r) return std::unexpected(r.error());
-            auto rb = begin_batch();
-            if (!rb) return std::unexpected(rb.error());
-        }
         // 上传 CPU Matrix → GPU Tensor（PCIe 上传，唯一的上传点）
+        // P2 优化：batch 模式下不再强制 flush（end_batch → begin_batch）。
+        // 安全性：from_matrix 总是**新建** GpuTensor（GpuTensor::from_matrix
+        // 内部 upload_blocking 独立提交 + 等待完成）。新 buffer 未被正在录制
+        // 的 batch 引用；独立上传提交先于 batch（batch 尚未提交，队列 FIFO），
+        // 等待完成后数据即就绪，后续 batch 录制引用该 buffer 安全。
+        // 注意：to_matrix / copy_from 仍须 flush——前者要读 batch 中刚写入的
+        // buffer（跳过 flush 会读到旧数据），后者要写 batch 已引用的既有 dst。
         auto r = GpuTensor::from_matrix(m, backend_);
         if (!r)
             return std::unexpected(r.error());
@@ -1059,7 +1058,7 @@ public:
             if (!out) return std::unexpected(out.error());
             Tensor t = Tensor::from_gpu(std::move(*out));
             t.set_virtual_tag(static_cast<std::uint64_t>(node) + 1);
-            node_outputs_[node] = t;
+            g->node_outputs[node] = t;  // D3：占位输出随图隔离（thread-local）
             return t;
         }
 
@@ -1119,7 +1118,7 @@ public:
             if (!out) return std::unexpected(out.error());
             Tensor t = Tensor::from_gpu(std::move(*out));
             t.set_virtual_tag(static_cast<std::uint64_t>(node) + 1);
-            node_outputs_[node] = t;
+            g->node_outputs[node] = t;  // D3：占位输出随图隔离（thread-local）
             return t;
         }
 
@@ -1154,13 +1153,31 @@ public:
 private:
     // ── IR-C：融合执行 ──────────────────────────────────────────────────
     // 图 → 融合分析 → kernel 序列 → 逐个 AOT dispatch。每个 kernel 的输出
-    // 写入其末尾节点（tail）的占位 buffer（node_outputs_[tail]），使 Layer
+    // 写入其末尾节点（tail）的占位 buffer（g.node_outputs[tail]），使 Layer
     // 持有的占位 Tensor 在 end_expr 后物化。中间节点若被融合则无独立输出
     // （作为寄存器内联），若为融合边界则其占位 buffer 由自身 kernel 写入
     // 并被后续 kernel 当作输入绑定（FusedKernelInput.node 来源）。
+    // D3：node_outputs 随图（thread-local 堆分配）隔离，不再用引擎成员。
     [[nodiscard]] Result<void> execute_fused_graph(ExprGraph& g)
     {
         auto kernels = fuse_expr_graph(g);
+
+        // P1（IR 中间张量消除）：标记需要保留占位 buffer 的节点——
+        //   * kernel 的 tail（输出节点，Layer 持有的占位 Tensor 在此物化）
+        //   * kernel 的输入源（融合边界，其 buffer 被后续 kernel 绑定为输入）
+        // 被融合进其他 kernel 的中间节点（既非 tail 也非任何 kernel 输入源）
+        // 的占位 buffer **从未被写入**（其输出已内联为寄存器），纯浪费显存。
+        // dispatch 完成后立即释放，归还内存池。
+        std::vector<std::uint8_t> keep(g.nodes.size(), 0);
+        for (const auto& k : kernels)
+        {
+            if (k.tail >= 0 && static_cast<std::size_t>(k.tail) < keep.size())
+                keep[static_cast<std::size_t>(k.tail)] = 1;
+            for (const auto& in : k.inputs)
+                if (in.node >= 0 && static_cast<std::size_t>(in.node) < keep.size())
+                    keep[static_cast<std::size_t>(in.node)] = 1;
+        }
+
         for (auto& k : kernels)
         {
             // 解析输入：node 来源 → 该节点占位输出 buffer；external → 直接张量
@@ -1171,8 +1188,8 @@ private:
                 Tensor t;
                 if (in.node >= 0)
                 {
-                    const auto it = node_outputs_.find(in.node);
-                    if (it == node_outputs_.end())
+                    const auto it = g.node_outputs.find(in.node);
+                    if (it == g.node_outputs.end())
                         return std::unexpected(Error{
                             "GpuEngine::end_expr: 依赖节点输出缺失（图 IR 状态损坏）"});
                     t = it->second;
@@ -1194,21 +1211,36 @@ private:
             {
                 const auto vp = nn::expr_spec_runtime_view_params(k.spec);
                 GpuTensor* out_override = nullptr;
-                const auto out_it = node_outputs_.find(k.tail);
-                if (out_it != node_outputs_.end())
+                const auto out_it = g.node_outputs.find(k.tail);
+                if (out_it != g.node_outputs.end())
                     out_override = &out_it->second.gpu_tensor();
                 auto out = backend_.run_fused_gpu(
                     key, gpu_inputs, k.spec.consts, k.rows, k.cols,
                     k.vector_out, vp, out_override);
                 if (!out) return std::unexpected(out.error());
                 if (!out_override)
-                    node_outputs_[k.tail] = Tensor::from_gpu(std::move(*out));
+                    g.node_outputs[k.tail] = Tensor::from_gpu(std::move(*out));
                 continue;
             }
 #endif
             return std::unexpected(Error{
                 "GpuEngine::end_expr: 融合 kernel 未命中 AOT 融合 shader（闭合世界）；"
                 "请将 begin_expr/end_expr 段纳入构建期扫描（scan_exprs）"});
+        }
+
+        // P1：释放被融合中间节点的占位 buffer（显存中间张量消除）。
+        // 安全依据：被融合节点的占位 Tensor 只被 g.node_outputs 持有（Layer
+        // 侧局部变量 t/u 在 forward 返回后已析构），erase 后 shared_ptr 计数
+        // 归零，buffer 归还内存池。tail 与输入源节点保留（仍在图生命周期内
+        // 使用，且 Layer 持有的 tail Tensor 与之共享 buffer）。
+        for (auto it = g.node_outputs.begin(); it != g.node_outputs.end();)
+        {
+            const int nd = it->first;
+            if (nd >= 0 && static_cast<std::size_t>(nd) < keep.size()
+                && !keep[static_cast<std::size_t>(nd)])
+                it = g.node_outputs.erase(it);
+            else
+                ++it;
         }
         return {};
     }

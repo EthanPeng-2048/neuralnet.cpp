@@ -773,7 +773,6 @@ private:
     std::unique_ptr<StagingRing> staging_ring_;
 
     VkCommandPool command_pool_ = VK_NULL_HANDLE;
-    VkDescriptorPool dispatch_pool_ = VK_NULL_HANDLE;
     VkDescriptorPool gpu_tensor_pool_ = VK_NULL_HANDLE;
 
     // ── Command Buffer Batching：将所有 GPU 操作录制到同一个 command buffer ──
@@ -790,12 +789,22 @@ private:
     // ── 延迟销毁：batch 录制期间 copy-on-write 替换旧 buffer 时，旧 buffer
     // 仍被已录制的 descriptor set 引用，不能立即 vkDestroyBuffer。
     // end_batch/flush_batch 提交完成并释放 descriptor sets 后统一销毁。
-    // 注意：内存已通过 pool_->free() 立即归还池（可被新分配复用），
-    // 此处仅延迟 vkDestroyBuffer 调用以满足 Vulkan 规范。
+    //
+    // ⚠ 内存归还也须延迟到 vkDestroyBuffer 之后（D1 修复）：
+    //   若立即 pool_->free()，新 buffer 可能分配到旧 buffer 尚未销毁的
+    //   同一区间 → 两个存活 buffer 内存重叠，违反 Vulkan 规范
+    //   （VUID-vkBindBufferMemory-memory-01988 类约束）。
+    //   数据竞争方面：同一 command buffer 内命令按录制顺序执行，旧 buffer
+    //   的已录制命令先于复用同一区间的新 buffer 命令执行，无数据竞争。
+    //   但规范合规要求 buffer 对象本身不得重叠，故内存归还必须等 buffer
+    //   销毁完成。代价：batch 期间该区间不可复用（batch 通常只持续一个
+    //   step，内存影响可忽略）。
     struct PendingDestroy
     {
         VkDevice device = VK_NULL_HANDLE;
         VkBuffer buffer = VK_NULL_HANDLE;
+        MemoryPool::Allocation alloc;
+        observer_ptr<MemoryPool> pool;
     };
     std::mutex pending_mutex_;
     std::vector<PendingDestroy> pending_destroys_;
@@ -991,8 +1000,6 @@ public:
 
             if (gpu_tensor_pool_ != VK_NULL_HANDLE)
                 vkDestroyDescriptorPool(device_.device(), gpu_tensor_pool_, nullptr);
-            if (dispatch_pool_ != VK_NULL_HANDLE)
-                vkDestroyDescriptorPool(device_.device(), dispatch_pool_, nullptr);
             if (command_pool_ != VK_NULL_HANDLE)
                 vkDestroyCommandPool(device_.device(), command_pool_, nullptr);
         }
@@ -1023,15 +1030,19 @@ public:
 
     // ── 延迟销毁入口（GpuBuffer 析构时调用）──────────────────────────
     // batch 模式下不立即销毁 VkBuffer，等待提交完成；否则立即销毁。
-    // 注意：调用方应在调用此函数前已通过 pool_->free() 归还内存。
-    void defer_buffer_destroy(VkDevice device, VkBuffer buffer)
+    // 内存归还也一并延迟（D1）：buffer 销毁前不得把区间还给池，
+    // 否则新 buffer 可能与未销毁的旧 buffer 内存重叠（规范违规）。
+    void defer_buffer_destroy(VkDevice device, VkBuffer buffer,
+                              const MemoryPool::Allocation& alloc,
+                              observer_ptr<MemoryPool> pool)
     {
         std::lock_guard lock(pending_mutex_);
-        pending_destroys_.push_back({device, buffer});
+        pending_destroys_.push_back({device, buffer, alloc, pool});
     }
 
     // ── 统一执行延迟销毁（必须在 batch descriptor sets 释放之后调用）──
-    // 仅销毁 VkBuffer 对象；内存已通过 pool_->free() 提前归还池。
+    // 先 vkDestroyBuffer 再归还内存到池（D1）：保证 buffer 对象销毁后
+    // 其区间才可被新分配复用，杜绝存活 buffer 间的内存重叠。
     void flush_pending_destroys()
     {
         std::lock_guard lock(pending_mutex_);
@@ -1039,6 +1050,8 @@ public:
         {
             if (pd.buffer != VK_NULL_HANDLE && pd.device != VK_NULL_HANDLE)
                 vkDestroyBuffer(pd.device, pd.buffer, nullptr);
+            if (pd.pool && pd.alloc.valid())
+                pd.pool->free(pd.alloc);
         }
         pending_destroys_.clear();
     }
@@ -1089,29 +1102,7 @@ public:
         if (!st_r)
             return st_r;
 
-        // 7. 创建 descriptor pool for staging path
-        constexpr std::size_t MAX_CACHED_DISPATCHES = 256;
-        constexpr std::size_t DESCRIPTORS_PER_DISPATCH = 3;
-        constexpr std::size_t total_descriptors = MAX_CACHED_DISPATCHES * DESCRIPTORS_PER_DISPATCH;
-
-        VkDescriptorPoolSize dispatch_pool_size{};
-        dispatch_pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        dispatch_pool_size.descriptorCount = static_cast<uint32_t>(total_descriptors);
-
-        VkDescriptorPoolCreateInfo dispatch_pool_info{};
-        dispatch_pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        dispatch_pool_info.maxSets = static_cast<uint32_t>(MAX_CACHED_DISPATCHES);
-        dispatch_pool_info.poolSizeCount = 1;
-        dispatch_pool_info.pPoolSizes = &dispatch_pool_size;
-        dispatch_pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-
-        r = detail::vk_check(
-            vkCreateDescriptorPool(device_.device(), &dispatch_pool_info, nullptr, &dispatch_pool_),
-            __FILE__, __LINE__);
-        if (!r)
-            return r;
-
-        // 8. 创建 descriptor pool for GPU-resident path
+        // 7. 创建 descriptor pool for GPU-resident path
         // elementwise_v2 需要 4 个描述符/次，按最大值计算
         // batch 模式下描述符集延迟到 end_batch 释放，需足够大以容纳整个 batch
         //   ViT forward+backward ≈ 230 ops/样本，batch_size=512 时累积 ~118K sets
@@ -4013,12 +4004,17 @@ GpuBuffer::~GpuBuffer()
     auto& backend = GpuBackend::instance();
     if (backend.is_initialized() && backend.in_batch())
     {
-        // batch 模式：立即归还内存到池（可被新分配复用），
-        // 仅延迟 vkDestroyBuffer（Vulkan 规范要求 buffer 在引用它的命令
-        // 提交完成前不能被销毁）。
-        if (pool_ && alloc_.valid())
-            pool_->free(alloc_);
-        backend.defer_buffer_destroy(device_, buffer_);
+        // batch 模式：延迟 vkDestroyBuffer（Vulkan 规范要求 buffer 在引用
+        // 它的命令提交完成前不能被销毁）。
+        // D1 修复：内存归还也一并延迟到 buffer 销毁之后（见
+        // flush_pending_destroys）。若此处立即 pool_->free()，新 buffer
+        // 可能分配到本 buffer 尚未销毁的同一区间 → 两个存活 buffer 内存
+        // 重叠，违反 Vulkan 规范。数据竞争方面本就安全（同一 command
+        // buffer 内命令按录制顺序执行），但规范合规要求 buffer 对象本身
+        // 不得重叠。
+        // GpuBuffer 只经 MemoryPool 创建（create_device_local /
+        // create_host_visible），pool_ 恒有效；alloc_ 无效时 free 为 no-op。
+        backend.defer_buffer_destroy(device_, buffer_, alloc_, pool_);
     }
     else
     {
