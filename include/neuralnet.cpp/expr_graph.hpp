@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <unordered_map>
@@ -54,11 +55,15 @@ struct ExprGraphNode
 };
 
 // ── 图（录制期累积） ─────────────────────────────────────────────────────
+// D3 修复：node_outputs 移入 ExprGraph（随图一起堆分配、thread-local 指针
+// 持有），消除 GpuEngine 成员 node_outputs_ 的跨线程共享数据竞争。
 struct ExprGraph
 {
     std::vector<ExprGraphNode> nodes;
     // 占位 Tensor 的 virtual_tag → 节点下标（录制时建立，供依赖识别）
     std::unordered_map<std::uint64_t, int> node_by_tag;
+    // 节点下标 → 占位输出 Tensor（end_expr 时写入真实结果）
+    std::unordered_map<int, Tensor> node_outputs;
 
     // 录制：把一个表达式加入图，返回节点下标。
     // inputs 中带 virtual_tag 的占位 Tensor 会被识别为前序节点输出（依赖边）。
@@ -119,22 +124,28 @@ struct FusedKernel
     std::vector<int> members;     // kernel 包含的节点（顺序 = 融合顺序）
 };
 
-// ── 全局录制状态（线程局部） ────────────────────────────────────────────
+// ── 全局录制状态（线程局部，D3 修复） ──────────────────────────────────
 // begin_expr/end_expr（GPU 引擎执行 / scan 引擎登记）开启/关闭录制图。
 // dsl::compute 的 scan 分支与 GpuEngine::eval_expr 通过 recording_graph()
 // 判断"当前是否在录制"以及把表达式加入录制图。
+//
+// D3 修复：录制图由 thread_local unique_ptr 持有（堆分配），而非引擎成员
+// （std::optional<ExprGraph> recording_）。原设计中 recording_ 是引擎成员
+// （跨线程共享），而 thread_local 指针指向它——两个线程同时 begin_expr 会
+// 让各自的 thread_local 指针指向同一个引擎成员，且 node_outputs_ 也是共享
+// 成员 → 数据竞争。改为每线程独立堆分配后，各线程的录制图完全隔离。
 namespace fused
 {
 
-[[nodiscard]] inline ExprGraph*& recording_graph_ptr()
+[[nodiscard]] inline std::unique_ptr<ExprGraph>& recording_graph_owner()
 {
-    static thread_local ExprGraph* g = nullptr;
+    static thread_local std::unique_ptr<ExprGraph> g;
     return g;
 }
 [[nodiscard]] inline ExprGraph* recording_graph() noexcept
-{ return recording_graph_ptr(); }
+{ return recording_graph_owner().get(); }
 [[nodiscard]] inline bool is_recording() noexcept
-{ return recording_graph_ptr() != nullptr; }
+{ return recording_graph_owner() != nullptr; }
 
 } // namespace fused
 
@@ -191,8 +202,17 @@ namespace fused
             return false;
 
         // 3) 拼接（确定性：tail 的 views/consts/instrs 在前，B 的在后）
-        const std::size_t na = A.instrs.size();
         const std::size_t out_reg_A = A.instrs.back().dst;
+
+        // 3a) 寄存器偏移溢出防护：B 的指令 dst 经 +A.num_regs 重映射后必须 < 256
+        // （ExprInstr.dst 为 uint8_t）。超限则放弃融合（保守，正确性优先）。
+        // ⚠ 寄存器偏移必须用 A.num_regs（A 占用的寄存器数），而非 A 的指令数。
+        // canonical 后指令数与寄存器数可能不同（liveness 复用），用指令数会产生
+        // 寄存器空洞（A 的寄存器 0..num_regs-1 之后空出 instrs.size()-num_regs 个号），
+        // 浪费寄存器并可能使本可融合的表达式超出 EXPR_MAX_REGS=16 而被放弃。
+        for (const auto& ins : Bs.instrs)
+            if (static_cast<std::size_t>(ins.dst) + A.num_regs >= 256)
+                return false;
 
         std::vector<ExprView> views = A.views;
         std::vector<int> b_view_map(Bs.views.size(), -1);
@@ -207,11 +227,18 @@ namespace fused
         // 关键：B 的常量池必须追加在 A 之后（B 的 Const 引用经偏移指向这里）
         consts.insert(consts.end(), Bs.consts.begin(), Bs.consts.end());
 
+        // 寄存器偏移基准：A 占用的寄存器数（canonical 后 A 的寄存器号为
+        // 0..A.num_regs-1）。B 的寄存器整体平移 A.num_regs，避免与 A 冲突。
+        // （用 A.num_regs 而非 A.instrs.size()：canonical 后指令数 ≥ 寄存器数，
+        //  用指令数会留下寄存器空洞；虽然后续 canonicalize 会重新紧凑编号，
+        //  但用寄存器数更精确，且溢出检查更宽松，允许更多融合。）
+        const std::size_t reg_base = A.num_regs;
+
         std::vector<ExprInstr> instrs = A.instrs;
         for (const auto& ins : Bs.instrs)
         {
             ExprInstr ni = ins;
-            ni.dst = static_cast<std::uint8_t>(ni.dst + na);
+            ni.dst = static_cast<std::uint8_t>(ni.dst + reg_base);
             const auto remap_op = [&](ExprOperand o) -> ExprOperand
             {
                 if (o.kind == static_cast<std::uint8_t>(ExprOperandKind::Input))
@@ -230,7 +257,7 @@ namespace fused
                 if (o.kind == static_cast<std::uint8_t>(ExprOperandKind::Reg) ||
                     o.kind == static_cast<std::uint8_t>(ExprOperandKind::Fanout) ||
                     o.kind == static_cast<std::uint8_t>(ExprOperandKind::Reduce))
-                    return {o.kind, static_cast<std::uint8_t>(o.idx + na)};
+                    return {o.kind, static_cast<std::uint8_t>(o.idx + reg_base)};
                 return o;
             };
             const std::size_t nops =
@@ -245,7 +272,7 @@ namespace fused
         fused.views   = std::move(views);
         fused.consts  = std::move(consts);
         fused.instrs  = std::move(instrs);
-        fused.num_regs = static_cast<std::uint32_t>(na + Bs.num_regs);
+        fused.num_regs = static_cast<std::uint32_t>(reg_base + Bs.num_regs);
         fused = canonicalize_expr_spec(fused);
         if (auto v = validate_expr_spec(fused, fused.views.size()); !v)
             return false;  // 超限/非法 → 放弃融合（保守）

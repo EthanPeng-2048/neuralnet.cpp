@@ -696,7 +696,10 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
             emit_tree_reduce(slot, is_max);
         }
 
-        // ── 归约指令 pass（跨步循环 + 树形归约）──
+        // ── 归约指令 pass（多累加器跨步循环 + 树形归约）──
+        // 用 4 路独立标量累加器（非数组索引，见 matmul-opt.md 教训）打破 acc 串行依赖链，
+        // 提升 ILP；跨步 4*256 与归约视图 pass 一致。归约结合序改变（与视图 pass 相同），
+        // 测试容差已覆盖。
         for (std::size_t ri = 0; ri < spec.instrs.size(); ++ri)
         {
             const ExprInstr& R = spec.instrs[ri];
@@ -709,15 +712,31 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
                  R.a.kind == static_cast<uint8_t>(ExprOperandKind::Fanout));
             const std::string src = src_is_reg
                 ? "r" + std::to_string(static_cast<int>(R.a.idx)) : operand(R.a);
+            const std::string init = is_max ? "uintBitsToFloat(0xff800000u)" : "0.0";
             L << "\n    // 归约指令 " << ri << " (槽 " << slot << ")\n";
             L << "    {\n";
-            L << "        float acc = " << (is_max ? "uintBitsToFloat(0xff800000u)" : "0.0") << ";\n";
-            L << loop_decl;
+            L << "        float acc0 = " << init << ", acc1 = " << init
+              << ", acc2 = " << init << ", acc3 = " << init << ";\n";
+            L << "        uint c = tid;\n";
+            L << "        for (; c + 3u*256u < cols; c += 4u*256u) {\n";
+            for (int k = 0; k < 4; ++k)
+            {
+                L << "            { const uint row = idx; const uint col = c + "
+                  << std::to_string(256 * k) << "u; ";
+                emit_reg_decl();
+                emit_instrs(0, ri);
+                L << " acc" << k << " = " << combine(is_max, "acc" + std::to_string(k), src)
+                  << "; }\n";
+            }
+            L << "        }\n";
+            L << "        for (; c < cols; c += 256u) {\n";
+            L << "            { const uint row = idx; const uint col = c; ";
             emit_reg_decl();
             emit_instrs(0, ri);
-            L << "        acc = " << combine(is_max, "acc", src) << ";\n";
+            L << " acc0 = " << combine(is_max, "acc0", src) << "; }\n";
             L << "        }\n";
-            L << "        s_red[" << slot << "][tid] = acc;\n";
+            L << "        s_red[" << slot << "][tid] = "
+              << combine4(is_max, "acc0", "acc1", "acc2", "acc3") << ";\n";
             L << "    }\n";
             emit_tree_reduce(slot, is_max);
         }
@@ -782,7 +801,8 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
             L << "    }\n";
         }
 
-        // ── 归约指令 pass（tile：单累加器，跨行顺序读，合并访问）──
+        // ── 归约指令 pass（tile：多累加器，跨行顺序读，合并访问）──
+        // 4 路独立标量累加器打破 acc 串行依赖链，提升 ILP（与行归约一致）。
         for (std::size_t ri = 0; ri < spec.instrs.size(); ++ri)
         {
             const ExprInstr& R = spec.instrs[ri];
@@ -795,15 +815,30 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
                  R.a.kind == static_cast<uint8_t>(ExprOperandKind::Fanout));
             const std::string src = src_is_reg
                 ? "r" + std::to_string(static_cast<int>(R.a.idx)) : operand(R.a);
+            const std::string init = is_max ? "uintBitsToFloat(0xff800000u)" : "0.0";
             L << "\n    // 归约指令 " << ri << " (槽 " << slot << ")\n";
             L << "    {\n";
-            L << "        float acc = " << (is_max ? "uintBitsToFloat(0xff800000u)" : "0.0") << ";\n";
-            L << "        for (uint row = 0u; row < rows; ++row) {\n";
+            L << "        float acc0 = " << init << ", acc1 = " << init
+              << ", acc2 = " << init << ", acc3 = " << init << ";\n";
+            L << "        uint i = 0u;\n";
+            L << "        for (; i + 3u < rows; i += 4u) {\n";
+            for (int k = 0; k < 4; ++k)
+            {
+                L << "            { const uint row = i + " << std::to_string(k) << "u; ";
+                emit_reg_decl();
+                emit_instrs(0, ri);
+                L << " acc" << k << " = " << combine(is_max, "acc" + std::to_string(k), src)
+                  << "; }\n";
+            }
+            L << "        }\n";
+            L << "        for (; i < rows; ++i) {\n";
+            L << "            { const uint row = i; ";
             emit_reg_decl();
             emit_instrs(0, ri);
-            L << "            acc = " << combine(is_max, "acc", src) << ";\n";
+            L << " acc0 = " << combine(is_max, "acc0", src) << "; }\n";
             L << "        }\n";
-            L << "        s_red[" << slot << "][tid] = acc;\n";
+            L << "        s_red[" << slot << "][tid] = "
+              << combine4(is_max, "acc0", "acc1", "acc2", "acc3") << ";\n";
             L << "    }\n";
         }
 

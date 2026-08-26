@@ -222,7 +222,8 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(compute_bench src/compute_bench.cpp)
     nn_add_executable(bench_thresholds src/bench_thresholds.cpp)
     nn_add_executable(reduce_bench src/reduce_bench.cpp)
-    list(APPEND NN_BENCH_TARGETS mnist_bench compute_bench bench_thresholds reduce_bench)
+    nn_add_executable(reduce_instr_bench src/reduce_instr_bench.cpp)
+    list(APPEND NN_BENCH_TARGETS mnist_bench compute_bench bench_thresholds reduce_bench reduce_instr_bench)
 
 endif()
 

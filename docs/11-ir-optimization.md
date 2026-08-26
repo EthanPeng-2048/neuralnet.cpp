@@ -182,7 +182,25 @@ IR → GlslEmitter / CpuEmitter
 >   - `gen_fused` 经 emitter 注册表选择后端（默认 glsl）；`--list-backends` 展示可用后端（glsl/cpu）。
 > - 验证：ctest 24/24 全绿（含新增 expr_graph_test / expr_fuse_test）；`scan_exprs` 收集到 20 条融合表达式（含 FusedChain 融合复合 spec + backward）；`fused_gpu_test` 等既有回归无回归。
 
-**现状**：IR-A / IR-B / IR-C（基础版）/ IR-D 均已实施（见上方实施记录）。后续可选方向：IR-C 进阶（多消费者 DAG / 跨 kernel 自动融合）。
+> **实施记录（2026-08-26，IR-C 中间张量消除增强 + 批内上传免 flush）**：
+> - **IR 中间张量消除（P1）**：`GpuEngine::execute_fused_graph` 在融合分析后计算
+>   需保留占位 buffer 的节点集合（各 kernel 的 tail + 输入源/融合边界），dispatch
+>   完成后**释放被融合进其他 kernel 的中间节点占位 buffer**（其输出已内联为寄存器，
+>   占位 buffer 从未被写入，纯浪费显存）。例：`FusedChainLayer` 3 节点融合成单
+>   kernel 后，node 0/1 的全尺寸 buffer 立即归还内存池，只保留 tail node 2。
+>   安全依据：被融合节点的占位 Tensor 只被 `g.node_outputs` 持有（Layer 侧局部变量
+>   已析构），erase 后 shared_ptr 归零即归还；tail 与输入源保留（仍在图生命周期内
+>   使用）。
+> - **批内上传免 flush（P2）**：`GpuEngine::from_matrix` 移除 batch 模式下的强制
+>   `end_batch → begin_batch`。安全依据：`from_matrix` 总是新建 GpuTensor，
+>   `upload_blocking` 独立提交 + 等待完成，新 buffer 未被正在录制的 batch 引用，
+>   独立上传提交先于 batch（batch 尚未提交，队列 FIFO），等待完成后数据即就绪。
+>   `to_matrix` / `copy_from` 仍须 flush（前者读 batch 中刚写的 buffer、后者写
+>   batch 已引用的既有 dst，跳过会读到旧数据）。
+> - 验证：构建 150/150 全绿（`-Werror` 无告警）；ctest 27/27 全绿（含 expr_fuse_test
+>   / fused_gpu_test 覆盖 IR-C 融合路径）。
+
+**现状**：IR-A / IR-B / IR-C（基础版 + 中间张量消除增强）/ IR-D 均已实施（见上方实施记录）。后续可选方向：IR-C 进阶（多消费者 DAG / 跨 kernel 自动融合）。
 
 ---
 

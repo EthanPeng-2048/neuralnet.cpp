@@ -1,6 +1,6 @@
 # 📋 优化方案全览（Optimization Proposal List）
 
-> **文档版本**：2026-08-25
+> **文档版本**：2026-08-26
 > **适用范围**：neuralnet.cpp 框架全部优化方向——GPU 内核、IR/编译器、CPU 计算、显存管理、架构扩展
 > **关联文档**：[02-performance.md](./02-performance.md) · [09-operator-fusion.md](./09-operator-fusion.md) · [10-memory-optimization.md](./10-memory-optimization.md) · [11-ir-optimization.md](./11-ir-optimization.md) · [12-innovative-designs.md](./12-innovative-designs.md)
 
@@ -41,12 +41,13 @@
 - **现状**：标量路径（纯标量 kernel + vec4 回退循环）均已按 `need_row` / `need_col` 守卫发射，仅计算实际使用的 `row`/`col`。与 vec4 快速路径共用同一套 `glsl_view_uses_row` / `glsl_view_uses_col` 判定。
 - **收益**：所有非 vec4 融合 kernel 消除冗余整数除法/模运算（~10-15% 内核时间）。
 
-### P1-05 📋 归约指令 pass 多累加器
-- **现状**：归约视图 pass 已用多累加器（acc0-acc3，stride 4×256），但归约指令 pass（每条归约指令）仍单累加器串行。参见 `codegen-opt-assessment.md`。
-- **方案**：归约指令 pass 也用 8 路独立累加器（独立标量变量，非数组索引——参见 `matmul-opt.md` 教训），提升 ILP。
-- **工作量**：中（2-3 天，含验证）
-- **收益**：计算密集型归约 ~1.5-2× 提升
-- **风险**：中（需验证 regalloc 与归约段互斥约束不被破坏）
+### P1-05 ✅ 归约指令 pass 多累加器（已实现，2026-08-26）
+- **文件**：`glsl_gen.hpp`（`generate_glsl_reduce` 行/列归约指令 pass）
+- **现状**：归约指令 pass（每条归约指令）已改为 4 路独立标量累加器（acc0-acc3，独立变量非数组索引）+ 4 路展开循环，与归约视图 pass 一致。打破 `acc = acc + x` 串行 FMA 依赖链，提升 ILP。
+- **验证**：27/27 ctest 全绿（含 gradcheck/融合测试）。新增 `reduce_instr_bench`（GPU 驻留内核级基准）测量指令 pass 吞吐。
+- **A/B 实测（GTX 850M）**：`col_reduce_sum(a*b)`（LayerNorm 方差路径，**内存带宽受限**）新/旧基本持平（±5% 噪声内）。这是**预期的**——带宽受限 kernel 的累加器依赖链已被掩盖，多累加器无增益。
+- **理论收益**：对**计算密集**归约（每元素 exp/sqrt/多步运算后才累加，计算成瓶颈时）可 ~1.5-2×。当前生产 DSL 归约均为内存受限简单归约，该收益为"潜伏"状态；随更多计算密集融合走 DSL 路径（P2-09/P2-14）而兑现。
+- **结论**：保留（零回归 + 与视图 pass 一致性 + 计算密集归约潜在收益）。**评估教训**：A/B 需针对目标瓶颈类型选 kernel，测内存受限 kernel 得出中性不代表实现无效。
 
 ### P1-06 📋 归约 shader 公共子表达式消除
 - **现状**：每条归约指令重跑 `emit_instrs(0, ri)`，逐元素链在多个归约间重复计算。复杂度 O(归约数 × 元素指令数)。
@@ -77,6 +78,34 @@
 - **现状**：归约已改用 subgroup 蝴蝶归约替代共享内存树归约——第 1 步 `subgroupAdd`/`subgroupMax` 得到每 warp 部分和（零共享/屏障），第 2 步首 warp 归约全部 warp 部分和（`gl_SubgroupID == 0`，屏障后全线程可见）。
 - **收益**：消除共享内存树归约的屏障与共享内存访问开销。
 - **注意**：启用 `GL_KHR_shader_subgroup_basic` / `GL_KHR_shader_subgroup_arithmetic` 扩展，需 Vulkan 1.3+ 或 `VK_EXT_subgroup_size_control` 支持。
+
+### P1-10 📋 matmul 分块参数调优（对话 O1）
+- **现状**：`BM=BN=64` 硬编码。历史上 tiled dispatch 曾错用 16（峰值掉到 4%），参数极敏感。
+- **方案**：基准测 32/64/128，按 shape 范围选最优 tile；大 K 用 K 维分块循环。
+- **工作量**：小-中（1-2 天）
+- **收益**：不同矩阵形状自适应最优分块
+- **风险**：低（纯调参 + 基准）
+
+### P1-11 📋 共享内存两级归约（对话 O3）
+- **现状**：reduce 每 workgroup 256 线程单级归约。
+- **方案**：局部（thread→shared）→ 全局（workgroup→block）两级归约，减少 barrier 次数、提升大 N/K 归约吞吐。
+- **工作量**：中（3-5 天）
+- **收益**：大列宽/大行归约 ~1.5×
+- **风险**：中
+
+### P1-12 📋 scatter_add 原子优化（对话 O4）
+- **现状**：CAS 循环 float atomicAdd，慢且非确定（已在 docs/08 文档化为例外）。
+- **方案**：若设备支持 `VK_EXT_shader_atomic_float` 用原生 float atomic；否则冲突分桶减少 CAS 重试。
+- **工作量**：小（1 天）
+- **收益**：embedding 梯度累积提速
+- **风险**：低（原语义不变，仍保持非确定例外）
+
+### P1-13 📋 matmul / batched_matmul 代码去重（对话审查 P3）
+- **现状**：`matmul_gpu` 与 `batched_matmul_gpu` 各有 ~200 行重复的 descriptor/cmd/barrier/dispatch 逻辑。
+- **方案**：提取 `dispatch_matmul_generic` 公共 helper（仿 `dispatch_bmm_generic`）。
+- **工作量**：小-中（1-2 天）
+- **收益**：减少重复代码与维护风险
+- **风险**：低
 
 ---
 
@@ -134,6 +163,84 @@
 - **工作量**：中（2-3 天，需修改 canonicalize 语义）
 - **收益**：减少 shader 中的冗余超越函数调用（如 `exp(0) → 1.0`）
 - **风险**：中（key 两端一致性约束更复杂）
+
+### P2-09 📋 归约→广播→逐元素链融合（对话 G1，最高价值）
+- **现状**：归约是硬边界，LayerNorm/Softmax 的 mean/var/rms_inv 归约向量必须落显存。
+- **方案**：ExprOp 已有 ColSum/ColMax/RowSum/RowMax + Reduce 操作数（单 ExprSpec 内已支持归约广播）。关键缺口是**跨节点复用归约向量**——节点 A 的归约结果直接作为节点 B 的 `Reduce` 输入（kernel 内部共享内存保留），而非落显存再 broadcast 读回。
+- **工作量**：中-大（1 周）
+- **收益**：LayerNorm 等"归约+广播+逐元素"模式核心收益
+- **风险**：中（需扩展归约向量生命周期追踪）
+
+### P2-10 📋 跨 kernel 自动融合（对话 G2/L3，消除手工 begin_expr/end_expr）
+- **现状**：只有演示层 `FusedChainLayer` 手工标记，真实 Layer 全部独立 dispatch——IR 融合收益几乎为零。
+- **方案**：`eval_expr` 内部自动维护"融合窗口"——相邻可融合表达式自动并入；遇不兼容（matmul/归约边界）自动关窗。Layer 无感知。
+- **工作量**：中-大（1 周）
+- **收益**：让 IR 融合真正覆盖实际 Layer，是收敛专用融合算子的前提
+- **风险**：中-高（正确性敏感）
+
+### P2-11 📋 融合成本/收益启发式（对话 G4）
+- **现状**：纯按节点序贪心，超限即放弃。
+- **方案**：建模每步融合收益（省 launch/bytes）与成本（寄存器/指令压力），贪心选最优。小中间量（归约向量）收益高，大张量多次消费的复制不划算。
+- **工作量**：中（3-5 天）
+- **收益**：融合决策更优
+- **风险**：低（需保证确定性）
+
+### P2-12 📋 图级缓存跨 step 复用（对话 G5）
+- **现状**：训练每 step 表达式结构高度重复，却每 step 重跑融合分析 + canonicalize + key 计算。
+- **方案**：整图 key（FNV 哈希）→ 缓存"节点序列→kernel 计划"，命中直接复用。
+- **工作量**：中（3-5 天）
+- **收益**：训练热路径消除重复 CPU 融合分析开销
+- **风险**：中（key 须覆盖全部语义含视图 param）
+
+### P2-13 📋 视图组合化简（对话 G6）
+- **现状**：RotateHalf/RowMod 是运行时 param（不进 key），组合视图会重复物化。
+- **方案**：相邻视图链（如 RotateHalf→Linear）化简/合并索引映射。
+- **工作量**：小（1-2 天）
+- **收益**：进一步消中间物化
+- **风险**：低
+
+### P2-14 📋 冗余 broadcast/逐元素原语收敛 DSL（对话 O5）
+- **现状**：独立 broadcast_row/col、elementwise_* 原语在 IR 成熟后是冗余（DSL 内联已覆盖）。
+- **方案**：Layer 逐步改用 `dsl::compute` 融合表达，独立原语仅作 fallback。
+- **前置依赖**：P2-10（自动融合）先落地。
+- **工作量**：中（随 Layer 逐步迁移）
+- **收益**：减少算子数量（呼应"融合收敛到 IR"）
+- **风险**：中
+
+### P2-15 📋 融合分析并行化（对话 C1，低风险）
+- **现状**：`fuse_expr_graph` 是纯函数（只读图、无共享状态）。
+- **方案**：end_expr 时多线程并行做各 kernel 的 canonicalize / key 计算 / dispatch 参数打包。
+- **工作量**：小-中（2-3 天）
+- **收益**：减少融合分析 CPU 开销
+- **风险**：低（每 kernel 独立计算，无顺序依赖）
+
+### P2-16 📋 双缓冲 command buffer 流水化（对话 C2/O6）
+- **现状**：batch 模式录制所有 kernel 到单 command buffer 一次性提交，CPU 录制天然快于 GPU 执行（已有隐式重叠）。
+- **方案**：双缓冲——录制下一个 batch 时提交上一个，消除 end_batch 的空闲等待，让 CPU 融合分析与 GPU 执行流水化。
+- **工作量**：中（3-5 天）
+- **收益**：消除提交间隙空闲
+- **风险**：中（生命周期管理，可复用 pending_destroys 机制）
+
+### P2-17 📋 多线程数据并行 IR（对话 C3，高价值大工程）
+- **现状**：thread-local 图已安全（每线程独立录制图），但 backend 单队列串行化提交。
+- **方案**：每线程独立 command buffer / 多 compute queue，end_expr 后各自提交。需 GpuBackend 支持多队列或并发 submit 调度。
+- **工作量**：大（2-3 周）
+- **收益**：多 batch 数据并行收益
+- **风险**：高（队列同步、内存池并发、确定性）
+
+### P2-18 📋 内存池并发安全（对话 C4）
+- **现状**：`MemoryPool` 已有 `mutex_`，多线程高并发分配成瓶颈。
+- **方案**：per-thread 分配缓存或 arena 分区，减少锁竞争。与 P2-17 配套。
+- **工作量**：中（3-5 天）
+- **收益**：多线程分配吞吐
+- **风险**：中
+
+### P2-19 📋 并发确定性保证（对话 C5）
+- **现状**：铁律 8 要求单线程逐字节一致；决策类逻辑（融合顺序/key/ID）并发时必须显式同步。
+- **方案**：并发版融合分析结果与串行版逐字节比对测试；原子累加类保持已文档化例外。
+- **工作量**：小（1-2 天）
+- **收益**：并发安全的前提保障
+- **风险**：低
 
 ---
 
@@ -471,6 +578,42 @@
 
 ---
 
+## 9.5 本对话（2026-08-26）新增优化汇总
+
+> 由 GPU 后端缺陷审查 + IR 中间张量消除设计 + 进阶 IR/并发/算子优化讨论整理而成。
+
+### ✅ 本次已完成
+
+| 编号 | 项 | 状态 |
+|------|-----|------|
+| D1 | GpuBuffer 延迟销毁 buffer 内存重叠（规范违规）修复 | ✅ 已修（内存归还延迟到 vkDestroyBuffer 之后） |
+| D2 | scatter_add CAS 原子加非确定性 | ✅ 已文档化为例外（docs/08 坑 19，不修复） |
+| D3 | node_outputs_ 跨线程共享数据竞争 | ✅ 已修（录制图改 thread_local unique_ptr） |
+| P1 | IR 融合中间节点占位 buffer 显存消除 | ✅ 已实现（execute_fused_graph 释放被融合节点 buffer） |
+| P2 | from_matrix 批内免强制 flush | ✅ 已实现（上传新建 buffer 独立提交先于 batch） |
+
+### 📋 待做（按优先级）
+
+| 优先级 | 编号 | 方案 | 工作量 |
+|--------|------|------|--------|
+| P0 | P2-10 | 跨 kernel 自动融合（消除手工 begin_expr） | 1 周 |
+| P0 | P2-09 | 归约→广播→逐元素链融合 | 1 周 |
+| P1 | P1-10 | matmul tile 调优 | 1-2 天 |
+| P1 | P1-11 | 共享内存两级归约 | 3-5 天 |
+| P1 | P2-15 | 融合分析并行化 | 2-3 天 |
+| P1 | P2-16 | 双缓冲 command buffer 流水化 | 3-5 天 |
+| P2 | P2-11 | 融合成本/收益启发式 | 3-5 天 |
+| P2 | P2-12 | 图级缓存跨 step 复用 | 3-5 天 |
+| P2 | P2-13 | 视图组合化简 | 1-2 天 |
+| P2 | P2-14 | 冗余原语收敛 DSL | 中 |
+| P2 | P1-12 | scatter_add 原子优化 | 1 天 |
+| P2 | P1-13 | matmul 代码去重 | 1-2 天 |
+| P3 | P2-17 | 多线程数据并行 IR | 2-3 周 |
+| P3 | P2-18 | 内存池并发安全 | 3-5 天 |
+| P3 | P2-19 | 并发确定性保证 | 1-2 天 |
+
+---
+
 ## 10. 已完成优化索引
 
 | 编号 | 方案 | 完成日期 | 关键文件 |
@@ -480,6 +623,7 @@
 | P1-03 | GPU matmul tiled | — | `shaders/matmul_tiled.comp` |
 | P1-04 | 标量路径 row/col 除法消除 | 2026-08-25 | `glsl_gen.hpp` |
 | P1-09 | warp shuffle 归约 | 2026-08-25 | `glsl_gen.hpp` |
+| P1-05 | 归约指令 pass 多累加器 | 2026-08-26 | `glsl_gen.hpp`, `reduce_instr_bench` |
 | P2-01 | IR-A DCE/折叠/化简 | 2026-08-23 | `expr_opt.hpp` |
 | P2-02 | IR-B CSE/寄存器分配 | 2026-08-23 | `expr_opt.hpp` |
 | P2-03 | IR-C 图 IR/链融合 | 2026-08-24 | `expr_graph.hpp` |
@@ -494,6 +638,11 @@
 | — | 注意力 M4/M5/M6 融合 | 2026-08-21 | `compute_layer.hpp`, `shaders/` |
 | — | 列归约 tile 化 | 2026-08-25 | `glsl_gen.hpp`, `vk_backend.hpp` |
 | — | CNN im2col（CPU 端） | 2026-08 | `compute_layer.hpp` |
+| D1 | GpuBuffer 延迟销毁 buffer 内存重叠修复 | 2026-08-26 | `backend/vk_backend.hpp` |
+| D3 | node_outputs_ 线程安全修复 | 2026-08-26 | `gpu_engine.hpp`, `cpu_engine.hpp`, `expr_graph.hpp` |
+| P1 | IR 融合中间节点 buffer 显存消除 | 2026-08-26 | `gpu_engine.hpp` |
+| P2 | from_matrix 批内免 flush | 2026-08-26 | `gpu_engine.hpp` |
+| D2 | scatter_add 非确定性文档化例外 | 2026-08-26 | `shaders/scatter_add.comp`, `docs/08` |
 
 ---
 
