@@ -17,10 +17,10 @@
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/model_serialization.hpp>
 #include <neuralnet.cpp/domain_mnist.hpp>
-#include <neuralnet.cpp/cli/engine_factory.hpp>
-#include <neuralnet.cpp/cli/lr_scheduler.hpp>
-#include <neuralnet.cpp/cli/mnist_io.hpp>
-#include <neuralnet.cpp/cli/train_common.hpp>
+#include <neuralnet.cpp/cli/cli_engine_factory.hpp>
+#include <neuralnet.cpp/cli/cli_lr_scheduler.hpp>
+#include <neuralnet.cpp/cli/cli_mnist_io.hpp>
+#include <neuralnet.cpp/cli/cli_train_common.hpp>
 
 #include <algorithm>
 #include <chrono>

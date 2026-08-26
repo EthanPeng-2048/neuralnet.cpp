@@ -411,7 +411,7 @@ auto e = engine.end_expr();
 | `include/neuralnet.cpp/compute_engine.hpp` | `ReduceOp` 枚举；`begin_expr/end_expr`；`batched_matmul_reduce`/`..._softmax_denom`/`..._softmax_apply`；M6 反向 `..._softmax_backward_q`/`..._softmax_backward_kv`；M5 列式 `col_softmax_denom`/`col_softmax_sparse_forward`；`elementwise_broadcast_row` |
 | `include/neuralnet.cpp/cpu_engine.hpp` | 上述原语 CPU 实现（先正确后优化） |
 | `include/neuralnet.cpp/gpu_engine.hpp` | 录制融合分析；GPU 原语实现 |
-| `include/neuralnet.cpp/backend/vk_backend.hpp` | 新融合 shader dispatch（含 M6 两反向 pipeline、M5 两列式 pipeline） |
+| `include/neuralnet.cpp/backend/compute_vk_backend.hpp` | 新融合 shader dispatch（含 M6 两反向 pipeline、M5 两列式 pipeline） |
 | `include/neuralnet.cpp/compute_layer.hpp` | Softmax/LN/RMSNorm/Attention 改录制/两趟（`two_pass_mask_` 决策钩子） |
 | `include/neuralnet.cpp/compute_loss.hpp` | CrossEntropyLoss 稀疏融合（`forward_sparse` 融合路径 + 旧回退；`softmax_cols_` 用融合分母） |
 | `shaders/*.comp` | 归约/两趟注意力融合 shader |
@@ -451,7 +451,7 @@ auto e = engine.end_expr();
 - `cpu_engine.hpp`：视图校验/read_input 支持广播视图（形状与输出不同）。
 - `glsl_gen.hpp`：**`generate_glsl_reduce`** —— 工作组级归约融合 kernel 生成。每个工作组（256 线程）协作处理一行（行归约）/一列（列归约）：shared memory 树形归约（每归约槽 256 槽位，槽=归约视图+归约指令），随后输出该行/列全部元素。push constants 增加 `uint rows`；dispatch 行归约 (rows,1,1)、列归约 (cols,1,1)。
 - `tools/gen_fused.cpp`：`FusedShader` 增加 `int reduce_axis`；按轴选 `generate_glsl_reduce`/`generate_glsl`；混合轴结构跳过（运行时闭合世界硬报错）。
-- `include/neuralnet.cpp/backend/vk_backend.hpp`：`fused_reduce_axis_` 记录每 key 归约轴；注册时归约 shader push constants 多一个 uint rows；`run_fused_gpu` 按轴组 push constants 与 dispatch。
+- `include/neuralnet.cpp/backend/compute_vk_backend.hpp`：`fused_reduce_axis_` 记录每 key 归约轴；注册时归约 shader push constants 多一个 uint rows；`run_fused_gpu` 按轴组 push constants 与 dispatch。
 - `compute_layer.hpp`：**Softmax::forward/backward 改为单 DSL 归约表达式**（算法公式不变）：
   - forward: `exp(x - row_max) / row_sum(exp(x - row_max))`
   - backward: `out * (grad - row_dot(out * grad))`

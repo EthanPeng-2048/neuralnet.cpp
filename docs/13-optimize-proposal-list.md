@@ -362,7 +362,7 @@
 ## 5. CUDA 后端
 
 ### P5-01 ✅ CUDA 后端基础架构（已实现但 v1.0.0 停用）
-- **文件**：`backend/cuda_backend.hpp`、`cuda/cuda_kernels.cu`
+- **文件**：`backend/compute_cuda_backend.hpp`、`cuda/cuda_kernels.cu`
 - **现状**：完整实现（CudaBuffer/CudaTensor/CudaBackend），支持所有基础 op，但因 M4/M5/M6 融合原语未实现而停用。
 - **TODO**：`CMakeLists.txt:376` — 恢复 CUDA 后端。
 
@@ -393,7 +393,7 @@
 - **收益**：旧模型格式兼容性
 
 ### P6-02 📋 Vulkan singleton 内存泄漏修复
-- **文件**：`backend/vk_backend.hpp:1017`
+- **文件**：`backend/compute_vk_backend.hpp:1017`
 - **现状**：`TODO(1.1, L1)` — `GpuBackend::instance()` 故意泄漏以避免静态析构顺序问题。
 - **方案**：增加 `GpuBackend::shutdown()` 显式析构 + 引用计数（`shared_ptr` + `atexit` 注册）。
 - **工作量**：小（1 天）
@@ -632,13 +632,13 @@
 | P3-02 | SmartPolicy 自适应并行 | — | `config.hpp` |
 | P3-03 | 线程池 latch 零分配 | — | `core_threadpool.hpp` |
 | P4-01 | 激活重计算 L1 | 2026-08-22 | `compute_layer.hpp`, `model_container.hpp` |
-| P4-02 | 内存池归还 L2 | 2026-08-22 | `backend/memory_pool.hpp` |
-| P5-01 | CUDA 后端基础 | — | `backend/cuda_backend.hpp` |
+| P4-02 | 内存池归还 L2 | 2026-08-22 | `backend/compute_memory_pool.hpp` |
+| P5-01 | CUDA 后端基础 | — | `backend/compute_cuda_backend.hpp` |
 | P6-01 | 序列化 EOF 语义修复 | 2026-08-25 | `model_serialization.hpp` |
 | — | 注意力 M4/M5/M6 融合 | 2026-08-21 | `compute_layer.hpp`, `shaders/` |
 | — | 列归约 tile 化 | 2026-08-25 | `glsl_gen.hpp`, `vk_backend.hpp` |
 | — | CNN im2col（CPU 端） | 2026-08 | `compute_layer.hpp` |
-| D1 | GpuBuffer 延迟销毁 buffer 内存重叠修复 | 2026-08-26 | `backend/vk_backend.hpp` |
+| D1 | GpuBuffer 延迟销毁 buffer 内存重叠修复 | 2026-08-26 | `backend/compute_vk_backend.hpp` |
 | D3 | node_outputs_ 线程安全修复 | 2026-08-26 | `gpu_engine.hpp`, `cpu_engine.hpp`, `expr_graph.hpp` |
 | P1 | IR 融合中间节点 buffer 显存消除 | 2026-08-26 | `gpu_engine.hpp` |
 | P2 | from_matrix 批内免 flush | 2026-08-26 | `gpu_engine.hpp` |

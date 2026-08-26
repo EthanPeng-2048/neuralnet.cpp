@@ -68,7 +68,7 @@ FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU �
 - 每层驻留约 8 个 `B·seq·d` 与 2 个 `B·seq·d_ff` 的 fp32 副本（d_ff=4096 每张 100MB 是重要大头），16 层累加 ~6.4G。**无梯度重计算（activation checkpointing）**。
 
 ### 1.3 内存池碎片化 + 不归还（问题 L2）
-- [memory_pool.hpp](../../include/neuralnet.cpp/backend/memory_pool.hpp) 已实现 **first-fit 子分配 + 相邻 free region 自动前后合并**（O(log n)、O(1) 合并）。
+- [memory_pool.hpp](../../include/neuralnet.cpp/backend/compute_memory_pool.hpp) 已实现 **first-fit 子分配 + 相邻 free region 自动前后合并**（O(log n)、O(1) 合并）。
 - 但：**从未将整个空 Block 归还 GPU**（`blocks_.clear()` 仅在析构时触发），block 底材按需 128MB（或超尺寸单块）申请后不回收 ⇒ 峰值生命周期等于整个进程/测试生命周期，碎片与闲置块长期累积。
 - 文档 09 §0 将"内存池 first-fit 碎片化 + 永不归还"列为**独立跟踪项、不随融合解决**。
 
@@ -107,7 +107,7 @@ FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU �
   1. `MemoryPool` 支持**整块释放**：`allocation_count==0` 且全 region 空闲的 Block，调用 `vkFreeMemory` 并从 `blocks_` 移除（阈值控制，避免抖动）。
   2. 统计上报：`pool_debug_stats()`（总占用/空闲/block 数/碎片比），供 §4 采样确认真实构成。
   3. 评估按"训练-step 生命周期池 + 长生命周期参数池"分池，避免 step 间临时张量污染参数驻留区；或由 `staging`/`Tensor::destructor` 返回池而非直接 `vkFreeMemory`。
-- **范围**：仅 `backend/memory_pool.hpp` 与 Tensor 分配/销毁路径，不涉及算法。
+- **范围**：仅 `backend/compute_memory_pool.hpp` 与 Tensor 分配/销毁路径，不涉及算法。
 - **风险**：低；需 benchmark 分配总时长与碎片比变化。
 
 > ✅ **已核对（2026-08-24）**：中间 Tensor 的归还路径是安全的，无需修改即可维持正确性。

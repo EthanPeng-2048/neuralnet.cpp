@@ -1,4 +1,4 @@
-// ── engine_factory.hpp — 计算引擎选择工厂 ──────────────────────────────────
+// ── cli_cli_engine_factory.hpp — 计算引擎选择工厂 ──────────────────────────────────
 //
 // 抽取自 mnist_train/mnist_infer/text_train/text_infer/mnist_bench 中重复约 50 行的
 // `#ifdef NN_HAS_VULKAN / #ifdef NN_HAS_CUDA` 三段式样板。

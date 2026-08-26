@@ -42,7 +42,7 @@
 #if __has_include("fused_registry.hpp")
 #include "fused_registry.hpp"
 #endif
-#include "backend/vk_backend.hpp"
+#include "backend/compute_vk_backend.hpp"
 
 namespace nn
 {

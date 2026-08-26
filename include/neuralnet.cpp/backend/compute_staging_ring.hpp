@@ -1,4 +1,4 @@
-// ── staging_ring.hpp ─────────────────────────────────────────────────────
+// ── compute_staging_ring.hpp ─────────────────────────────────────────────────────
 // 环形 Staging 缓冲区
 //
 // 职责：
@@ -13,8 +13,8 @@
 //   - 内存预算上限保留 max_host_visible / 16，避免在小显存机器上过度分配
 // ─────────────────────────────────────────────────────────────────────────
 
-#ifndef NN_STAGING_RING_HPP
-#define NN_STAGING_RING_HPP
+#ifndef NN_COMPUTE_STAGING_RING_HPP
+#define NN_COMPUTE_STAGING_RING_HPP
 
 #ifdef NN_HAS_VULKAN
 
@@ -27,7 +27,7 @@
 #include "../core_errors.hpp"
 #include "../core_observer_ptr.hpp"
 #include "../core_config.hpp"
-#include "memory_pool.hpp"
+#include "compute_memory_pool.hpp"
 
 namespace nn
 {
@@ -256,4 +256,4 @@ public:
 } // namespace nn
 
 #endif // NN_HAS_VULKAN
-#endif // NN_STAGING_RING_HPP
+#endif // NN_COMPUTE_STAGING_RING_HPP

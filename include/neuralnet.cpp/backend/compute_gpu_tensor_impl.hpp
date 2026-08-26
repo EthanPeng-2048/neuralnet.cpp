@@ -1,10 +1,10 @@
-// ── gpu_tensor_impl.hpp ─────────────────────────────────────────────────
+// ── compute_gpu_tensor_impl.hpp ─────────────────────────────────────────────────
 // GpuTensor 方法实现（需要 Matrix 和 GpuBackend 的完整定义）
 // 此文件在 algebra_matrix.hpp 末尾自动包含，解决循环依赖问题。
 // ─────────────────────────────────────────────────────────────────────────
 
-#ifndef NN_GPU_TENSOR_IMPL_HPP
-#define NN_GPU_TENSOR_IMPL_HPP
+#ifndef NN_COMPUTE_GPU_TENSOR_IMPL_HPP
+#define NN_COMPUTE_GPU_TENSOR_IMPL_HPP
 
 #ifdef NN_HAS_VULKAN
 
@@ -87,4 +87,4 @@ inline Result<Matrix> GpuTensor::to_matrix(GpuBackend& backend) const
 } // namespace nn
 
 #endif // NN_HAS_VULKAN
-#endif // NN_GPU_TENSOR_IMPL_HPP
+#endif // NN_COMPUTE_GPU_TENSOR_IMPL_HPP

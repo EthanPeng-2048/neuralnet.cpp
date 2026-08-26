@@ -9,7 +9,7 @@
 #ifdef NN_HAS_CUDA
 
 #include "compute_engine.hpp"
-#include "backend/cuda_backend.hpp"
+#include "backend/compute_cuda_backend.hpp"
 
 namespace nn
 {

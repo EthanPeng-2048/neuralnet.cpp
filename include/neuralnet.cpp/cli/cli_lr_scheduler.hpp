@@ -1,4 +1,4 @@
-// ── lr_scheduler.hpp — 学习率调度器 ─────────────────────────────────────────
+// ── cli_cli_lr_scheduler.hpp — 学习率调度器 ─────────────────────────────────────────
 //
 // 抽取自 mnist_train/text_train 中逐字重复的 compute_epoch_lr lambda。
 //

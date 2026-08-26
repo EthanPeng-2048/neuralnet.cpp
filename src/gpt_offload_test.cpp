@@ -31,7 +31,7 @@ int main()
     return 0;
 }
 #else
-#include <neuralnet.cpp/backend/vk_backend.hpp>
+#include <neuralnet.cpp/backend/compute_vk_backend.hpp>
 
 using nn::ActivationType;
 using nn::GPTModel;

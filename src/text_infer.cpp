@@ -10,7 +10,7 @@
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/model_serialization.hpp>
 #include <neuralnet.cpp/domain_gpt.hpp>
-#include <neuralnet.cpp/cli/engine_factory.hpp>
+#include <neuralnet.cpp/cli/cli_engine_factory.hpp>
 
 #include <chrono>
 #include <iomanip>
