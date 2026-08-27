@@ -31,6 +31,7 @@ private:
     Tensor grad_w_;
     Tensor grad_b_;
     Matrix col_cache_;           // im2col 输出 (C_in*k*k, batch*OH*OW)，供 backward
+    bool shape_invalid_ = false; // 构造期守卫：kernel 过大（无符号下溢）→ init 报错
 
     inline static thread_local std::mt19937_64 rng_{std::random_device{}()};
 
@@ -144,15 +145,28 @@ public:
            std::size_t kernel, std::size_t stride = 1, std::size_t padding = 0,
            std::size_t in_h = 0, std::size_t in_w = 0)
         : in_channels_(in_channels), out_channels_(out_channels),
-          kernel_(kernel), stride_(stride), padding_(padding),
+          kernel_(kernel), stride_(stride != 0 ? stride : 1), padding_(padding),
           in_h_(in_h), in_w_(in_w)
     {
-        out_h_ = (in_h_ + 2 * padding_ - kernel_) / stride_ + 1;
-        out_w_ = (in_w_ + 2 * padding_ - kernel_) / stride_ + 1;
+        // API 级守卫：kernel 过大时 (in + 2*pad - kernel) 无符号下溢 →
+        // out_h_/out_w_ 巨值 → 分配 abort。记录无效，init() 时报错。
+        if (in_h_ + 2 * padding_ < kernel_ || in_w_ + 2 * padding_ < kernel_)
+        {
+            shape_invalid_ = true;
+            out_h_ = 0;
+            out_w_ = 0;
+        }
+        else
+        {
+            out_h_ = (in_h_ + 2 * padding_ - kernel_) / stride_ + 1;
+            out_w_ = (in_w_ + 2 * padding_ - kernel_) / stride_ + 1;
+        }
     }
 
     [[nodiscard]] Result<void> init(ComputeEngine& engine) override
     {
+        if (shape_invalid_)
+            return std::unexpected(Error{"Conv2D: kernel 过大 (kernel > in + 2*padding)"});
         const std::size_t fan_in = in_channels_ * kernel_ * kernel_;
 
         // 权重 (C_out, C_in*k*k) — He 风格均匀初始化
@@ -275,15 +289,27 @@ private:
     std::size_t pool_, stride_;
     std::size_t out_h_, out_w_;
     std::vector<std::size_t> max_indices_;  // (channels*out_h*out_w, batch) 扁平 argmax 行索引
+    bool shape_invalid_ = false; // 构造期守卫：pool 过大（无符号下溢）→ forward/backward 报错
 
 public:
     MaxPool2D(std::size_t channels, std::size_t in_h, std::size_t in_w,
               std::size_t pool = 2, std::size_t stride = 0)
         : channels_(channels), in_h_(in_h), in_w_(in_w),
-          pool_(pool), stride_(stride != 0 ? stride : pool)
+          pool_(pool), stride_(stride != 0 ? stride : (pool != 0 ? pool : 1))
     {
-        out_h_ = (in_h_ - pool_) / stride_ + 1;
-        out_w_ = (in_w_ - pool_) / stride_ + 1;
+        // API 级守卫：pool 过大（或 pool=0）时 (in - pool) 无符号下溢 →
+        // out_h_/out_w_ 巨值 → 分配 abort。记录无效，forward/backward 时报错。
+        if (pool_ == 0 || in_h_ < pool_ || in_w_ < pool_)
+        {
+            shape_invalid_ = true;
+            out_h_ = 0;
+            out_w_ = 0;
+        }
+        else
+        {
+            out_h_ = (in_h_ - pool_) / stride_ + 1;
+            out_w_ = (in_w_ - pool_) / stride_ + 1;
+        }
     }
 
     void clear_cache() override { max_indices_.clear(); }
@@ -292,6 +318,8 @@ public:
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
+        if (shape_invalid_)
+            return std::unexpected(Error{"MaxPool2D: pool 窗口大于输入尺寸"});
         if (input.rows() != channels_ * in_h_ * in_w_)
             return std::unexpected(Error{"maxpool forward: input shape mismatch"});
         const std::size_t batch = input.cols();
@@ -341,6 +369,8 @@ public:
     [[nodiscard]] Result<Tensor> backward(
         ComputeEngine& engine, const Tensor& grad_output) override
     {
+        if (shape_invalid_)
+            return std::unexpected(Error{"MaxPool2D: pool 窗口大于输入尺寸"});
         const std::size_t batch = grad_output.cols();
         const std::size_t out_area = out_h_ * out_w_;
 

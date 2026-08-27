@@ -1052,7 +1052,7 @@ public:
 // ══════════════════════════════════════════════════════════════════════════
 // ReLULinearAttention — ReLU 线性注意力（RLA / RAPT 核心层）
 //
-// 算法（RLA.md §3，causal 版；bidirectional 亦支持）：
+// 算法（docs/15-rapt-algorithm.md §3，causal 版；bidirectional 亦支持）：
 //   q' = ReLU(RoPE(q)), k' = ReLU(RoPE(k)), v = V·W_v（V 不做 ReLU）
 //   分子 num_t  = Σ_{i∈S_t} (q'_t·k'_i) v_i  = B_t · q'_t,   B_t = Σ_{i∈S_t} v_i k'_i^T
 //   分母 den_t  = sqrt( Σ_{i∈S_t} (q'_t·k'_i)^2 + eps )

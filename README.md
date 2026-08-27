@@ -27,7 +27,7 @@
 | [快速上手：构建模型](docs/03-quickstart-model.md) | ComputeEngine/Layer/Model 三件套使用教程 |
 | [快速上手：训练与推理](docs/04-quickstart-train-infer.md) | MNIST/GPT 训练推理命令行 + C++ API 示例 + GUI 操作指南 |
 | [算法解析](docs/05-algorithm-reference.md) | 每个 Layer/Loss/Optimizer 的数学原理与原语分解 |
-| [CUDA 后端](docs/06-cuda-backend.md) | CUDA GPU 加速后端设计、构建方法、编译器兼容性 |
+| [CUDA 后端](docs/06-cuda-backend.md) | CUDA 后端（1.0.0 起已停用，仅作恢复参考；构建方法、编译器兼容性） |
 | [训练包](docs/07-train-package.md) | 用 `.nnpkg` 打包超参+训练集，跨设备一键复现训练 |
 | [开发规范](docs/DEVELOPMENT_STANDARDS.md) | C++ 编码规范、模块隔离、内存管理 |
 
@@ -43,7 +43,18 @@ neuralnet.cpp/
 │   ├── 03-quickstart-model.md   ← 模型构建教程
 │   ├── 04-quickstart-train-infer.md ← 训练推理教程
 │   ├── 05-algorithm-reference.md    ← 算法解析参考
-│   ├── 06-cuda-backend.md       ← CUDA 后端设计
+│   ├── 06-cuda-backend.md       ← CUDA 后端设计（1.0.0 起停用）
+│   ├── 07-train-package.md      ← .nnpkg 训练包
+│   ├── 08-pitfalls-and-lessons.md  ← 踩坑警示录
+│   ├── 09-operator-fusion.md    ← 算子融合一期（M1-M6）
+│   ├── 10-memory-optimization.md  ← 显存优化
+│   ├── 11-ir-optimization.md    ← IR 优化
+│   ├── 12-innovative-designs.md ← 创新设计全景
+│   ├── 13-optimize-proposal-list.md ← 优化方案清单
+│   ├── 14-operator-fusion-2.md  ← 算子融合二期（IR 融合）
+│   ├── 15-rapt-algorithm.md     ← RLA / RAPT 算法
+│   ├── 16-zipt-algorithm.md     ← AttnZip / ZiPT 算法
+│   ├── flash_attn_analysis.md   ← 两趟式注意力分析
 │   └── DEVELOPMENT_STANDARDS.md ← 开发规范
 ├── gui.py                       ← 图形化操作界面 (CustomTkinter)
 ├── include/neuralnet.cpp/

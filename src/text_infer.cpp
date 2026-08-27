@@ -82,6 +82,7 @@ InferConfig parse_args(int argc, char *argv[])
         {
             auto v = nn::parse_number<int>(argv[++i]);
             if (!v) { std::cerr << "无效 --max-tokens\n"; std::exit(1); }
+            if (*v < 1) { std::cerr << "--max-tokens 必须 >= 1\n"; std::exit(1); }
             cfg.max_tokens = *v;
         }
         else if (arg == "--temperature" && i + 1 < argc)

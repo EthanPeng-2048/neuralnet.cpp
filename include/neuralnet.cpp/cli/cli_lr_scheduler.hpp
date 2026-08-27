@@ -61,8 +61,12 @@ namespace nn::cli
             const nn::Scalar progress =
                 static_cast<nn::Scalar>(epoch - cfg.warmup_epochs) /
                 static_cast<nn::Scalar>(cosine_epochs);
+            // 钳制：epoch 超出 total_epochs（如 TDR 重启续训）时停在 min_lr，
+            // 与 compute_step_lr 一致（不钳制时 cos 回升 → lr 振荡）
+            const nn::Scalar p =
+                progress < 0 ? nn::Scalar{0} : (progress > 1 ? nn::Scalar{1} : progress);
             return lr_min + 0.5f * (max_lr - lr_min) *
-                                (1.0f + std::cos(3.14159265358979323846f * progress));
+                                (1.0f + std::cos(3.14159265358979323846f * p));
         }
 
         return cfg.base_lr;  // fixed / constant

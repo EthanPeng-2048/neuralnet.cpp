@@ -589,9 +589,10 @@ public:
         if (!grad_x) return std::unexpected(grad_x.error());
 
         // 4. grad_gamma += row_reduce_sum(gy ⊙ normalized) → (F,1)
+        //    （∂L/∂γ_f = Σ_b gy·n：γ 是 out 的线性因子，导数不含 γ）
         auto gg = dsl::compute_reduce(engine,
             dsl::row_reduce_sum(
-                dsl::leaf(grad_output) * dsl::row_broadcast(gamma_)
+                dsl::leaf(grad_output)
                 * dsl::leaf(normalized_cache_)),
             F, B);
         if (!gg) return std::unexpected(gg.error());
@@ -763,9 +764,10 @@ public:
         if (!grad_x) return std::unexpected(grad_x.error());
 
         // 3. grad_gamma += row_reduce_sum(gy ⊙ normed) → (F,1)
+        //    （∂L/∂γ_f = Σ_b gy·n：γ 是 out 的线性因子，导数不含 γ）
         auto gg = dsl::compute_reduce(engine,
             dsl::row_reduce_sum(
-                dsl::leaf(grad_output) * dsl::row_broadcast(gamma_)
+                dsl::leaf(grad_output)
                 * dsl::leaf(normed_cache_)),
             F, B);
         if (!gg) return std::unexpected(gg.error());

@@ -615,8 +615,15 @@ public:
                     engine_, update, ns_steps_, ns_eps_);
                 if (!ortho_update) return std::unexpected(ortho_update.error());
 
-                // 3. 参数更新: p -= lr * ortho_update（用 axpy_inplace 融合 scale+add）
-                r = engine_.axpy_inplace(params_[i], -lr_, *ortho_update);
+                // 3. 参数更新: p -= lr * 0.2 * sqrt(max(m,n)) * NS(update)
+                //    NorMuon 论文 / KellerJordan 参考实现的形状缩放：NS 输出谱范数为 1，
+                //    不缩放则等效学习率偏差 0.2*sqrt(max(m,n)) 倍（如 256×768 权重 → 5.5×）
+                const std::size_t m = params_[i].get().rows();
+                const std::size_t n = params_[i].get().cols();
+                const std::size_t big = m > n ? m : n;
+                const Scalar muon_scale =
+                    Scalar{0.2} * std::sqrt(static_cast<Scalar>(big));
+                r = engine_.axpy_inplace(params_[i], -lr_ * muon_scale, *ortho_update);
                 if (!r) return std::unexpected(r.error());
             }
             else

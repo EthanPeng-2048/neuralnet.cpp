@@ -250,6 +250,12 @@ TrainConfig parse_args(int argc, char *argv[])
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
             if (!v) { std::cerr << "无效 --patch-size: " << v.error().message << "\n"; std::exit(1); }
+            if (*v == 0 || nn::MNIST_IMG_SIZE % *v != 0)
+            {
+                std::cerr << "--patch-size 必须能整除 " << nn::MNIST_IMG_SIZE
+                          << "（当前: " << *v << "）\n";
+                std::exit(1);
+            }
             cfg.patch_size = *v;
         }
         else if (arg == "--max-samples" && i + 1 < argc)
@@ -296,6 +302,12 @@ TrainConfig parse_args(int argc, char *argv[])
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
             if (!v) { std::cerr << "无效 --cnn-pool: " << v.error().message << "\n"; std::exit(1); }
+            if (*v != 0 && *v > nn::MNIST_IMG_SIZE)
+            {
+                std::cerr << "--cnn-pool 不能大于输入边长 " << nn::MNIST_IMG_SIZE
+                          << "（当前: " << *v << "）\n";
+                std::exit(1);
+            }
             cfg.cnn_pool = *v;
         }
         else if (arg == "--cnn-fc" && i + 1 < argc)

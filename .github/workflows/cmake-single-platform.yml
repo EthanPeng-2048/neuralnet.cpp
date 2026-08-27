@@ -1,4 +1,4 @@
-# .github/workflows/cmake-clang-latest.yml
+# .github/workflows/cmake-single-platform.yml
 name: CMake (Clang Latest, C++26)
 
 on:

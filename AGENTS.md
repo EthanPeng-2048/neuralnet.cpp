@@ -90,7 +90,7 @@ GPT 序列展平: 列序 i = b*seq + t（batch-major，全局唯一约定）
 - **构建期两步**（CMake 自动编排，改 Layer 内联表达式后重跑构建即可）：
   1. `scan_exprs`：dry-run 跑 Layer forward/backward，收集折叠出的 `ExprSpec` 结构（去重）→ `build/generated/expr_specs.bin`
   2. `gen_fused`：读 bin → `glsl_gen` 生成 GLSL → glslc → 内联 SPIR-V → `build/generated/fused_registry.hpp`
-- 手写原语 shader 在 `shaders/*.comp`（matmul、reduce、broadcast、bmm_*、col_softmax_* 等），构建期 glslc 编译并嵌入 C++ 头文件。
+- 手写原语 shader 在 `shaders/*.comp`（matmul、matmul_tiled、batched_matmul、reduce、broadcast、elementwise_v2、transpose、gather、scatter_add、rearrange_3d），构建期 glslc 编译并嵌入 C++ 头文件。
 - IR 优化 pass（canonicalize/CSE/寄存器分配/图 IR 融合）见 `expr_opt.hpp` / `expr_graph.hpp`，设计文档 `docs/11-ir-optimization.md`。
 
 ## 8. 训练循环范式（写新入口时照抄）
@@ -156,4 +156,7 @@ optimizer.step();
 | `12-innovative-designs.md` | 创新设计全景 |
 | `13-optimize-proposal-list.md` | 待做优化方案清单 |
 | `14-operator-fusion-2.md` | 融合算子二期：matmul 参与 IR 融合 + 跨 kernel 自动融合（P2-05/P2-10，删 M4-M6 手写原语） |
+| `15-rapt-algorithm.md` | RLA / RAPT：ReLU 线性注意力算法设计与实现说明 |
+| `16-zipt-algorithm.md` | AttnZip / ZiPT：记忆压缩解码器算法设计 |
+| `flash_attn_analysis.md` | 两趟式注意力等价 FlashAttention 的融合算子的分析报告 |
 | `DEVELOPMENT_STANDARDS.md` | C++ 编码规范全文 |

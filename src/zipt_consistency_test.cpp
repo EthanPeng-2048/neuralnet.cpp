@@ -41,8 +41,9 @@ int main(int argc, char* argv[])
     auto gpu_engine = nn::cli::create_engine(nn::cli::EngineConfig{true, false});
     if (!gpu_engine)
     {
+        // 返回 77 = ctest SKIP：无 GPU 时 GPU 比较未执行，不得计为 "Passed"
         std::cout << "GPU unavailable, skipping GPU consistency check\n";
-        return 0;
+        return 77;
     }
     nn::ComputeEngine& gpu = **gpu_engine;
 
