@@ -492,6 +492,7 @@ TrainConfig parse_args(int argc, char *argv[])
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
             if (!v) { std::cerr << "无效 --batch-size: " << v.error().message << "\n"; std::exit(1); }
+            if (*v == 0) { std::cerr << "--batch-size 必须 >= 1\n"; std::exit(1); }
             cfg.batch_size = *v;
         }
         else if (arg == "--accum-steps" && i + 1 < argc)

@@ -302,6 +302,13 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
             }
         };
         // 输入读取（跳过 matmul A/B 槽：其形状不是 (rows,cols) 网格）
+        // 行索引视图（Linear/RowBroadcast/RowMod/RotateHalf）必须用**全局行**
+        // grow = batch*m_per + row——CPU 参考（compute_cpu_engine read_input）
+        // 以全局行 r 索引 (rows,·) 全网格输入（如注意力 m/l 的 (BH·seq,1)）；
+        // Row 操作数保持 batch 内行号（causal 掩码 col > row 语义，CPU 端
+        // row() = r % m_per 一致）。
+        L << "    const uint m_per = rows / mm_batch;\n";
+        L << "    const uint grow = batch * m_per + row;\n";
         for (std::size_t i = 0; i < n_inputs; ++i)
         {
             if (i == a_slot || i == b_slot)
@@ -312,7 +319,7 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
                         static_cast<ExprViewKind>(spec.views[j].kind))) ++vp;
             L << "    const float v" << i << " = ";
             glsl_view_read(L, spec.views[i], static_cast<std::uint32_t>(i),
-                           "row*cols + col", "row", "col", vp);
+                           "grow*cols + col", "grow", "col", vp);
             L << ";\n";
         }
         if (spec.num_regs > 0)
@@ -745,8 +752,9 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
             break;
         }
         case ExprOp::Select:
-            L << "        " << dst << " = mix(" << vec4_operand(ins.b) << ", "
-              << vec4_operand(ins.c) << ", notEqual(" << a
+            // mix(x,y,t) = x(1-t) + y·t：t=(a≠0) 时须取 b → b 在 y 位
+            L << "        " << dst << " = mix(" << vec4_operand(ins.c) << ", "
+              << vec4_operand(ins.b) << ", notEqual(" << a
               << ", vec4(0.0)));\n";
             break;
         default:

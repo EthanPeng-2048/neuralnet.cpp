@@ -360,7 +360,7 @@
 - **备注**：`CMakeLists.txt:376` 的 TODO 标记已移除（CUDA 后端不再恢复计划）。
 
 ### P5-02 ⚠️ CUDA 融合原语补齐（已搁置）
-- **现状**：Vulkan 端已有 `batched_matmul_reduce/denom/apply`、`col_softmax_denom/sparse_forward`、`bmm_q/kv_backward` 等手写融合 kernel。CUDA 端缺失这些。
+- **现状**：Vulkan 端原本的 `batched_matmul_reduce/denom/apply`、`col_softmax_denom/sparse_forward`、`bmm_q/kv_backward` 手写融合 kernel 已在一期后被删除，改由 IR 融合（`docs/14-operator-fusion-2.md`）实现等价语义。CUDA 端始终缺失这些。
 - **方案**：
   - **方案 A❌** 恢复 CUDA 后端基础架构（已停用）
   - **方案 B❌** 用 CUTLASS 重写 matmul kernel

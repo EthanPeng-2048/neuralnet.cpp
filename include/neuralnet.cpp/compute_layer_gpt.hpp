@@ -148,23 +148,6 @@ public:
         offload_refs_ = activation_cache();
         offload_offsets_.clear();
         offload_shapes_.clear();
-        // 一次性明细诊断（仅首个块首次导出打印一次）
-        {
-            static bool dumped = false;
-            if (!dumped)
-            {
-                std::size_t sum = 0;
-                for (auto& ref : offload_refs_)
-                {
-                    if (!ref.get().valid()) continue;
-                    sum += ref.get().size();
-                    std::cout << "[offload-diag] tensor " << ref.get().rows() << "x"
-                              << ref.get().cols() << " = " << (ref.get().size() * 4 / (1024*1024)) << "MB\n";
-                }
-                std::cout << "[offload-diag] block0 slab sum = " << (sum * 4 / (1024*1024)) << "MB\n";
-                dumped = true;
-            }
-        }
         // 惰性创建持久 slab（大小 = 本块激活总 float 数，跨 step 复用）
         if (!offload_slab_.valid())
         {

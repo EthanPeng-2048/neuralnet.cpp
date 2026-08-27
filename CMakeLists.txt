@@ -115,6 +115,11 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(attn_consistency_test src/attn_consistency_test.cpp)
     list(APPEND NN_TEST_TARGETS attn_consistency_test)
 
+    # ── GPU 注意力 W 表达式 batch 行号回归（多头/多 batch CPU/GPU 一致性，
+    #    4 组配置；回归 2026-08-27 审查 P0-1）────────────────────────────────
+    nn_add_executable(attn_w_batch_test src/attn_w_batch_test.cpp)
+    list(APPEND NN_TEST_TARGETS attn_w_batch_test)
+
     # ── SwiGLU 数值梯度检查（gradcheck，验证 split/merge 反向正确性）──────────
     nn_add_executable(swiglu_gradcheck src/swiglu_gradcheck.cpp)
     list(APPEND NN_TEST_TARGETS swiglu_gradcheck)

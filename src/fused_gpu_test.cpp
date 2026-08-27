@@ -31,8 +31,9 @@ using nn::Scalar;
 #ifndef NN_HAS_VULKAN
 int main()
 {
+    // 返回 77 = ctest SKIP：纯 CPU 构建无法执行 GPU 测试，不得计为 "Passed"
     std::cout << "[SKIP] 此程序需要 Vulkan SDK 支持，请使用 -DNN_HAS_VULKAN 编译。\n";
-    return 0;
+    return 77;
 }
 #else
 #include <neuralnet.cpp/backend/compute_vk_backend.hpp>

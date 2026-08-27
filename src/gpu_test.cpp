@@ -23,8 +23,9 @@ using nn::Scalar;
 #ifndef NN_HAS_VULKAN
 int main()
 {
+    // 返回 77 = ctest SKIP：纯 CPU 构建无法执行 GPU 测试，不得计为 "Passed"
     std::cout << "[SKIP] 此程序需要 Vulkan SDK 支持，请使用 -DNN_HAS_VULKAN 编译。\n";
-    return 0;
+    return 77;
 }
 #else
 #include <neuralnet.cpp/backend/compute_vk_backend.hpp>
@@ -113,6 +114,8 @@ int main(int argc, char* argv[])
         else { std::cerr << "未知参数: " << arg << "\n"; return 1; }
     }
 
+    std::size_t failures = 0;  // ✅/❌ 检查计数，决定退出码（CI 必须反映 GPU 状态）
+
     std::cout << "========================================\n"
               << "  ComputeEngine 正确性与性能测试\n"
               << "========================================\n"
@@ -191,10 +194,11 @@ int main(int argc, char* argv[])
         if (cpu_r && gpu_r)
         {
             Scalar err = max_abs_diff(*cpu_r, *gpu_r);
+            if (err >= 1e-2f) ++failures;
             std::cout << "\n  A^T * B 最大误差: " << std::scientific << std::setprecision(4) << err
                       << (err < 1e-2f ? " ✅" : " ❌") << "\n";
         }
-        else std::cout << "\n  ❌ A^T * B 失败\n";
+        else { std::cout << "\n  ❌ A^T * B 失败\n"; ++failures; }
 
         // A * B^T
         auto cpu_r2 = engine_matmul(*cpu_engine, A, B, false, true);
@@ -202,10 +206,11 @@ int main(int argc, char* argv[])
         if (cpu_r2 && gpu_r2)
         {
             Scalar err = max_abs_diff(*cpu_r2, *gpu_r2);
+            if (err >= 1e-2f) ++failures;
             std::cout << "  A * B^T 最大误差: " << std::scientific << std::setprecision(4) << err
                       << (err < 1e-2f ? " ✅" : " ❌") << "\n";
         }
-        else std::cout << "  ❌ A * B^T 失败\n";
+        else { std::cout << "  ❌ A * B^T 失败\n"; ++failures; }
     }
 
     // ── 4. roundtrip + 逐元素 + 归约测试 ─────────────────────────
@@ -219,13 +224,14 @@ int main(int argc, char* argv[])
             if (a_back_r)
             {
                 Scalar err = max_abs_diff(A, *a_back_r);
+                if (err != 0.0f) ++failures;
                 std::cout << "  Upload→Download roundtrip 最大误差: "
                           << std::scientific << std::setprecision(4) << err
                           << (err == 0.0f ? " ✅" : " ❌") << "\n";
             }
-            else std::cout << "  ❌ roundtrip download 失败: " << a_back_r.error().message << "\n";
+            else { std::cout << "  ❌ roundtrip download 失败: " << a_back_r.error().message << "\n"; ++failures; }
         }
-        else std::cout << "  ❌ roundtrip upload 失败\n";
+        else { std::cout << "  ❌ roundtrip upload 失败\n"; ++failures; }
 
         // 4b. 逐元素二元: Max(A, B) ≈ elementwise (CPU 参考用 CPU 计算)
         auto a_cpu_t = cpu_engine->from_matrix(A);
@@ -244,12 +250,13 @@ int main(int argc, char* argv[])
                 if (mc && mg)
                 {
                     Scalar err = max_abs_diff(*mc, *mg);
+                    if (err >= 1e-5f) ++failures;
                     std::cout << "  elementwise Max(A,B) 最大误差: "
                               << std::scientific << std::setprecision(4) << err
                               << (err < 1e-5f ? " ✅" : " ❌") << "\n";
                 }
             }
-            else std::cout << "  ❌ elementwise Max 失败\n";
+            else { std::cout << "  ❌ elementwise Max 失败\n"; ++failures; }
 
             // 4c. 逐元素一元: Exp(A)
             auto exp_cpu_r = cpu_engine->elementwise_unary(UnaryOp::Exp, *a_cpu_t);
@@ -261,12 +268,13 @@ int main(int argc, char* argv[])
                 if (ec && eg)
                 {
                     Scalar err = max_abs_diff(*ec, *eg);
+                    if (err >= 1e-4f) ++failures;
                     std::cout << "  elementwise Exp(A) 最大误差: "
                               << std::scientific << std::setprecision(4) << err
                               << (err < 1e-4f ? " ✅" : " ❌") << "\n";
                 }
             }
-            else std::cout << "  ❌ elementwise Exp 失败\n";
+            else { std::cout << "  ❌ elementwise Exp 失败\n"; ++failures; }
 
             // 4d. 归约: col_reduce_sum(A) → (1, N)
             auto csum_cpu_r = cpu_engine->col_reduce_sum(*a_cpu_t);
@@ -278,12 +286,13 @@ int main(int argc, char* argv[])
                 if (sc && sg)
                 {
                     Scalar err = max_abs_diff(*sc, *sg);
+                    if (err >= 1e-3f) ++failures;
                     std::cout << "  col_reduce_sum(A) 最大误差: "
                               << std::scientific << std::setprecision(4) << err
                               << (err < 1e-3f ? " ✅" : " ❌") << "\n";
                 }
             }
-            else std::cout << "  ❌ col_reduce_sum 失败\n";
+            else { std::cout << "  ❌ col_reduce_sum 失败\n"; ++failures; }
 
             // 4e. 归约: col_reduce_max(A) → (1, N)
             auto cmax_cpu_r = cpu_engine->col_reduce_max(*a_cpu_t);
@@ -295,12 +304,13 @@ int main(int argc, char* argv[])
                 if (mc2 && mg2)
                 {
                     Scalar err = max_abs_diff(*mc2, *mg2);
+                    if (err >= 1e-5f) ++failures;
                     std::cout << "  col_reduce_max(A) 最大误差: "
                               << std::scientific << std::setprecision(4) << err
                               << (err < 1e-5f ? " ✅" : " ❌") << "\n";
                 }
             }
-            else std::cout << "  ❌ col_reduce_max 失败\n";
+            else { std::cout << "  ❌ col_reduce_max 失败\n"; ++failures; }
         }
     }
 
@@ -358,17 +368,18 @@ int main(int argc, char* argv[])
                         if (c_res)
                         {
                             Scalar err = max_abs_diff(*cpu_c_r, *c_res);
+                            if (err >= 1e-2f) ++failures;
                             std::cout << "  Batch+matmul 最大误差: "
                                       << std::scientific << std::setprecision(4) << err
                                       << (err < 1e-2f ? " ✅" : " ❌") << "\n";
                         }
-                        else std::cout << "  ❌ download failed: " << c_res.error().message << "\n";
+                        else { std::cout << "  ❌ download failed: " << c_res.error().message << "\n"; ++failures; }
                     }
-                    else std::cout << "  ❌ end_batch failed: " << end_r.error().message << "\n";
+                    else { std::cout << "  ❌ end_batch failed: " << end_r.error().message << "\n"; ++failures; }
                 }
-                else std::cout << "  ❌ matmul failed: " << c_t.error().message << "\n";
+                else { std::cout << "  ❌ matmul failed: " << c_t.error().message << "\n"; ++failures; }
             }
-            else std::cout << "  ❌ begin_batch failed: " << batch_r.error().message << "\n";
+            else { std::cout << "  ❌ begin_batch failed: " << batch_r.error().message << "\n"; ++failures; }
         }
 
         // 链式: matmul(A, B) → elementwise Exp → col_reduce_sum
@@ -474,8 +485,10 @@ int main(int argc, char* argv[])
     }
 
     std::cout << "\n========================================\n";
-    std::cout << "  测试完成\n";
+    std::cout << "  测试完成";
+    if (failures > 0) std::cout << "（" << failures << " 项失败）";
+    std::cout << "\n";
     std::cout << "========================================\n";
-    return 0;
+    return failures > 0 ? 1 : 0;
 }
 #endif
