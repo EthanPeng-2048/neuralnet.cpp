@@ -334,18 +334,31 @@ public:
         auto flush_plain = [&]() {
             if (plain.empty()) return;
             std::string s = std::move(plain); plain.clear();
-            auto begin = std::sregex_iterator(s.begin(), s.end(), pre_pattern());
-            auto end   = std::sregex_iterator();
-            for (auto it = begin; it != end; ++it) chunks.push_back(it->str());
+            // 手写状态机替代 std::sregex_iterator（预分词热路径），语义与
+            // pre_pattern() 完全一致（左最先优先，byte 级）；正确性由
+            // src/tokenizer_consistency_test.cpp 对拍 std::regex 仲裁。
+            std::size_t p = 0;
+            while (p < s.size())
+            {
+                const std::size_t len = pre_match_len(s, p);
+                if (len == 0) { ++p; continue; }   // 无匹配字符（如 '_'）跳过，与 sregex_iterator 一致
+                chunks.push_back(s.substr(p, len));
+                p += len;
+            }
         };
 
         std::size_t pos = 0;
         while (pos < text.size())
         {
             std::size_t mlen = 0;
-            for (const auto &mk : markers)
-                if (pos + mk.size() <= text.size() && text.substr(pos, mk.size()) == mk)
-                { mlen = mk.size(); break; }
+            // 全部特殊标记以 '<' 开头：非 '<' 位置直接跳过线性扫描，
+            // 避免对每个普通字符做 14 次比较 + substr 分配；compare 免中间字符串。
+            if (text[pos] == '<')
+            {
+                for (const auto &mk : markers)
+                    if (pos + mk.size() <= text.size() && text.compare(pos, mk.size(), mk) == 0)
+                    { mlen = mk.size(); break; }
+            }
             if (mlen > 0)
             {
                 flush_plain();
@@ -363,6 +376,82 @@ public:
     }
 
 private:
+    // ── 手写 GPT-2 预分词状态机：单步返回从 pos 起的匹配长度 ───────────────
+    // 对应 pre_pattern()（ECMAScript 左最先优先，byte 级）：
+    //   's|'t|'re|'ve|'m|'ll|'d| ?[a-zA-Z]+| ?[0-9]+|[^\s\w]+|\s+
+    // 语义要点：① 缩写依序尝试；② ' ?[a-zA-Z]+' 可选空格后须跟字母（空格后非
+    // 字母则整体失败，落回 \s+）；③ 非 ASCII 字节视作 [^\s\w] 标点运行。
+    static std::size_t pre_match_len(std::string_view text, std::size_t pos) noexcept
+    {
+        static constexpr std::string_view contractions[] = {
+            "'s", "'t", "'re", "'ve", "'m", "'ll", "'d"
+        };
+        const char c = text[pos];
+        if (c == '\'')
+            for (const auto &a : contractions)
+                if (pos + a.size() <= text.size() && text.compare(pos, a.size(), a) == 0)
+                    return a.size();
+
+        const auto is_letter = [](char ch) noexcept {
+            return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+        };
+        const auto is_digit = [](char ch) noexcept { return ch >= '0' && ch <= '9'; };
+        const auto is_ws = [](char ch) noexcept {
+            return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v';
+        };
+        const auto is_word = [&](char ch) noexcept { return is_letter(ch) || is_digit(ch) || ch == '_'; };
+
+        // ' ?[a-zA-Z]+'
+        if (c == ' ')
+        {
+            if (pos + 1 < text.size() && is_letter(text[pos + 1]))
+            {
+                std::size_t e = pos + 2;
+                while (e < text.size() && is_letter(text[e])) ++e;
+                return e - pos;
+            }
+        }
+        else if (is_letter(c))
+        {
+            std::size_t e = pos + 1;
+            while (e < text.size() && is_letter(text[e])) ++e;
+            return e - pos;
+        }
+        // ' ?[0-9]+'
+        if (c == ' ')
+        {
+            if (pos + 1 < text.size() && is_digit(text[pos + 1]))
+            {
+                std::size_t e = pos + 2;
+                while (e < text.size() && is_digit(text[e])) ++e;
+                return e - pos;
+            }
+        }
+        else if (is_digit(c))
+        {
+            std::size_t e = pos + 1;
+            while (e < text.size() && is_digit(text[e])) ++e;
+            return e - pos;
+        }
+        // '[^\s\w]+'
+        if (!is_ws(c) && !is_word(c))
+        {
+            std::size_t e = pos + 1;
+            while (e < text.size() && !is_ws(text[e]) && !is_word(text[e])) ++e;
+            return e - pos;
+        }
+        // '\s+'
+        if (is_ws(c))
+        {
+            std::size_t e = pos + 1;
+            while (e < text.size() && is_ws(text[e])) ++e;
+            return e - pos;
+        }
+        // 无匹配：返回 0 表示该字符被跳过（如 '_' 是 \w 但非字母/数字，不属于
+        // 任何分支），与 std::sregex_iterator 的"跳过无匹配字符"语义一致。
+        return 0;
+    }
+
     std::vector<std::string> vocab_;
 };
 

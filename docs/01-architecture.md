@@ -205,7 +205,7 @@ class Tensor {
 
 ## 📊 数据布局约定
 
-所有张量采用 **列主序 batch-major** 布局（column-major, batch-major）：
+所有张量采用 **batch-major** 布局（batch-major）：
 
 ```
 输入:  (feature_dim, batch_size)     — 每列一个样本
