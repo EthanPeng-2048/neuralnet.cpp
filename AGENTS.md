@@ -160,3 +160,36 @@ optimizer.step();
 | `16-zipt-algorithm.md` | AttnZip / ZiPT：记忆压缩解码器算法设计 |
 | `flash_attn_analysis.md` | 两趟式注意力等价 FlashAttention 的融合算子的分析报告 |
 | `DEVELOPMENT_STANDARDS.md` | C++ 编码规范全文 |
+
+
+## 12. 当前状态（2026-08-28）
+
+### 融合二期（docs/14）完成：S1-S5、S7
+
+S7 关键教训（改融合/IR 代码前必读）：
+
+1. **运行时值禁进表达式常量池**（进 `expr_spec_key` 会破坏闭合世界）：`scale` 折进 Q（forward `scale_inplace` + backward 补乘）、`inv_num_valid` 后置 `scale_inplace`。
+2. **BatchCol 视图要求 `(1, BH*seq)`**（doc_ids 按 (b,h) 块重复），`(1, batch*seq)` 会越界。
+3. **RowGather 主输入行数≠网格行数**（loss_vec 在 (1,N) 读 (C,N) logits），校验只查 cols。
+4. `gen_fused` `emit_spec` 的 ±inf 常量必须用 `numeric_limits`。
+5. matmul + 列归约不支持（gen_fused 跳过）。
+6. **PS 删大文件段行号易漂移**、`-replace` 多行静默失败——先 read 再 edit，删前 `git diff` 核对。
+7. `dispatch_compute` 误删后从调用点重建。
+8. **IR 扩展**：MatmulSpec.batch（不进 key，dispatch z）、Row/Col/Batch 操作数(6/7/8)、RowGather(9)/BatchMod(10)/BatchCol(11)；注意力 fwd=m/l/W 表达式+bm(W,V_t)，bwd=R/X 表达式+3 个 bm；CE 稠密 `denom=col_sum(exp(logits-cb(col_max)))`，稀疏 grad/loss_vec 用 Row+RowGather。
+9. **CpuEmitter 产物从不编译**（gen_fused 硬编码 glsl），缺陷全隐性（见下方待修）。
+
+### 全库审查（2026-08-27 审查，08-28 已修）
+
+- **P0 已修**：① grad_gamma 多乘 γ ② vec4 Select mix 序 ③ matmul_tiled .x 条件 ④ matmul 尾链视图读全局行（attn_w_batch_test 4 配置一致，ctest 28/28 全绿）
+- **P1 已修**：BPE vocab≥258、batch-size≥1、patch-size 整除 28、cnn-pool≤28、max-tokens≥1、Conv/MaxPool 构造下溢守卫、gpu_test 失败计数进退出码 + 无 Vulkan return 77
+- **P2 已修**：Muon 0.2√max(m,n)、epoch lr 钳制
+- **未修**：col_reduce 并行非逐字节、VK_TIMEOUT/DEVICE_LOST 错误路径、第三梯队（序列化/GUI/测试质量/set_doc_ids 残留）
+- CE/Adam/AdamW/SGD 公式已验证正确
+
+### 待修：CpuEmitter 隐性缺陷
+
+CpuEmitter 产物从不参与编译（gen_fused 硬编码 glsl），以下缺陷全部隐性：
+
+- `BatchMod`/`BatchCol` 引用未声明 `batch`（ee49f5d 引入）
+- `Row`/`Col`/`Batch`/`Matmul`/`Reduce` 操作数与 `RowGather` 视图走 default 错语义
+- 纯 matmul spec `instrs.back()` UB

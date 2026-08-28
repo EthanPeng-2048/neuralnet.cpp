@@ -904,6 +904,9 @@ public:
         // matmul 输出作为"虚拟寄存器 0"，逐元素链经 Matmul 操作数按 (r,c) 读取。
         // 与 batched_matmul 原语语义一致（A/B 按 batch 垂直切分，转置标志按
         // MatmulSpec 解释），再执行逐元素链（同现有归约预计算模式）。
+        // 实现：复用 Matrix 分块 matmul span 内核（分块 + 并行 + 向量化），替代
+        // 原三层标量循环；DSL 实际只产生 (0,0)/(1,0) 组合（MLP / 注意力 QK^T），
+        // (0,1) 免费覆盖，(1,1) 无调用点，保留标量兜底保证语义一致。
         Matrix matmul_out;
         if (mm)
         {
@@ -915,29 +918,49 @@ public:
             const std::size_t K = mm_k;
             const ConstSpan& as = spans[mm->a_input];
             const ConstSpan& bs = spans[mm->b_input];
-            matmul_out = Matrix(rows, N);
+            matmul_out = Matrix(rows, N);   // 零初始化：span 内核为累加语义（r += A*B）
             auto out = matmul_out.span();
             for (std::size_t b = 0; b < mm_batch; ++b)
             {
-                const std::size_t a_base = trA ? b * K * M : b * M * K;
-                const std::size_t b_base = trB ? b * N * K : b * K * N;
-                for (std::size_t i = 0; i < M; ++i)
+                // 每批切片：A 存储 (M,K) 或 (K,M)，元素数恒为 M*K；B 同理恒为 K*N。
+                // ConstSpan/Span 是 AST 视图（无到 std::span 的隐式转换），
+                // 与 batched_matmul 一致，用 data()+偏移显式构造 std::span 子区间。
+                const std::size_t a_off = b * M * K;
+                const std::size_t b_off = b * K * N;
+                const auto a_sub = std::span<const Scalar>(as.data() + a_off, M * K);
+                const auto b_sub = std::span<const Scalar>(bs.data() + b_off, K * N);
+                auto c_sub = std::span<Scalar>(out.data() + b * M * N, M * N);
+                if (!trA && !trB)
                 {
-                    for (std::size_t j = 0; j < N; ++j)
-                    {
-                        Scalar s = Scalar{0};
-                        for (std::size_t kk = 0; kk < K; ++kk)
+                    Matrix::multiply_to_span(c_sub, M, N,
+                        a_sub, M, K,
+                        b_sub, K, N);
+                }
+                else if (!trA && trB)
+                {
+                    Matrix::multiply_transposed_to_span(c_sub, M, N,
+                        a_sub, M, K,
+                        b_sub, N, K);
+                }
+                else if (trA && !trB)
+                {
+                    Matrix::transpose_multiply_to_span(c_sub, M, N,
+                        a_sub, K, M,
+                        b_sub, K, N);
+                }
+                else
+                {
+                    // 双转置（DSL 无此组合）：保留原标量循环兜底
+                    const std::size_t a_base = b * K * M;
+                    const std::size_t b_base = b * N * K;
+                    for (std::size_t i = 0; i < M; ++i)
+                        for (std::size_t j = 0; j < N; ++j)
                         {
-                            const Scalar av = trA
-                                ? as[a_base + kk * M + i]
-                                : as[a_base + i * K + kk];
-                            const Scalar bv = trB
-                                ? bs[b_base + j * K + kk]
-                                : bs[b_base + kk * N + j];
-                            s += av * bv;
+                            Scalar s = Scalar{0};
+                            for (std::size_t kk = 0; kk < K; ++kk)
+                                s += as[a_base + kk * M + i] * bs[b_base + j * K + kk];
+                            out[(b * M + i) * N + j] = s;
                         }
-                        out[(b * M + i) * N + j] = s;
-                    }
                 }
             }
         }

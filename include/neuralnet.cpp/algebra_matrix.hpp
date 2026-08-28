@@ -211,6 +211,7 @@ namespace nn
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
                             Scalar sum = 0.0;
+#pragma clang loop vectorize(assume_safety)
                             for (std::size_t kk = 0; kk < k_len; ++kk)
                                 sum += a_row[kk] * b_col[kk];
                             r_row[j] += sum;
@@ -269,6 +270,7 @@ namespace nn
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
                             Scalar sum = 0.0;
+#pragma clang loop vectorize(assume_safety)
                             for (std::size_t kk = 0; kk < k_len; ++kk)
                                 sum += a_row[kk] * b_col[kk];
                             r_row[j] += sum;
@@ -332,6 +334,7 @@ namespace nn
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
                             Scalar sum = 0.0;
+#pragma clang loop vectorize(assume_safety)
                             for (std::size_t kk = 0; kk < k_len; ++kk)
                                 sum += a_row[kk] * b_col[kk];
                             r_row[j] += sum;
@@ -498,6 +501,7 @@ namespace nn
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
                             Scalar sum = 0.0;
+#pragma clang loop vectorize(assume_safety)
                             for (std::size_t kk = 0; kk < k_len; ++kk)
                                 sum += a_row[kk] * b_col[kk];
                             r_row[j] += sum;
@@ -539,6 +543,7 @@ namespace nn
                                 {
                                     const auto b_col = b_block_span.subspan(j * k_len, k_len);
                                     Scalar sum = 0.0;
+#pragma clang loop vectorize(assume_safety)
                                     for (std::size_t kk = 0; kk < k_len; ++kk)
                                         sum += a_row[kk] * b_col[kk];
                                     r_row[j] += sum;
@@ -607,6 +612,7 @@ namespace nn
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
                             Scalar sum = 0.0;
+#pragma clang loop vectorize(assume_safety)
                             for (std::size_t kk = 0; kk < k_len; ++kk)
                                 sum += a_row[kk] * b_col[kk];
                             r_row[j] += sum;
@@ -656,6 +662,7 @@ namespace nn
                                 {
                                     const auto b_col = b_block_span.subspan(j * k_len, k_len);
                                     Scalar sum = 0.0;
+#pragma clang loop vectorize(assume_safety)
                                     for (std::size_t kk = 0; kk < k_len; ++kk)
                                         sum += a_row[kk] * b_col[kk];
                                     r_row[j] += sum;
@@ -709,6 +716,7 @@ namespace nn
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
                             Scalar sum = 0.0;
+#pragma clang loop vectorize(assume_safety)
                             for (std::size_t kk = 0; kk < k_len; ++kk)
                                 sum += a_row[kk] * b_col[kk];
                             r_row[j] += sum;
@@ -750,6 +758,7 @@ namespace nn
                                 {
                                     const auto b_col = b_block_span.subspan(j * k_len, k_len);
                                     Scalar sum = 0.0;
+#pragma clang loop vectorize(assume_safety)
                                     for (std::size_t kk = 0; kk < k_len; ++kk)
                                         sum += a_row[kk] * b_col[kk];
                                     r_row[j] += sum;
@@ -830,7 +839,7 @@ namespace nn
         //
         // 实现策略：cache-friendly blocked + 行块并行。
         // bench_thresholds 实测：blocked 全面优于 naive（按列跨行扫描），
-        // 行块并行仅在 R >= 1024 且 R*C >= PARALLEL_THRESHOLD 时启用，
+        // 行块并行仅在 R >= 256 且 R*C >= PARALLEL_THRESHOLD 时启用，
         // 详见 bench_thresholds.cpp 测试 2/3。
         template <typename T, typename ReduceOp, typename TransformOp>
         [[nodiscard]] Matrix col_reduce(T init, ReduceOp&& reduce_op, TransformOp&& transform_op) const
@@ -857,9 +866,9 @@ namespace nn
             }
 
             // 行块并行启用条件：R >= COL_REDUCE_PARALLEL_ROWS 且 R*C >= PARALLEL_THRESHOLD。
-            // bench_thresholds 实测：R >= 1024 是行块并行的硬门槛（R<1024 时同步开销主导），
-            // 详见 bench_thresholds.cpp 测试 3。
-            constexpr std::size_t COL_REDUCE_PARALLEL_ROWS = 1024;     // 行数门槛
+            // 门槛由 1024 降至 256：R*C >= 512K 时即使 R=256 每线程也有 >=16K 元素
+            // 的工作量（32 线程假设），同步开销不占主导；256 覆盖常见 d_model=768 场景。
+            constexpr std::size_t COL_REDUCE_PARALLEL_ROWS = 256;      // 行数门槛
             const std::size_t hw_threads = std::thread::hardware_concurrency();
             const std::size_t n_threads = (hw_threads == 0) ? 1 : hw_threads;
             const bool use_parallel =
@@ -933,13 +942,22 @@ namespace nn
         {
             NN_ASSERT(row_vec.rows_ == rows_ && row_vec.cols_ == 1, "row_vec shape mismatch");
             const auto v = row_vec.span();
+            const std::size_t R = rows_;
             const std::size_t C = cols_;
             auto d = span();
-            auto idx = std::views::iota(std::size_t{0}, d.size());
-            nn::for_each(idx.begin(), idx.end(),
-                [&d, &v, C, op = std::forward<F>(op)](std::size_t i) noexcept {
-                    d[i] = static_cast<Scalar>(op(d[i], v[i / C]));
-                });
+            // 按行处理：v[r] 每行只取一次（替代逐元素 i/C 除法），行内连续访问可向量化。
+            // 并行阈值与旧实现一致（元素数 >= PARALLEL_THRESHOLD），仅并行粒度由元素改为行。
+            auto process_row = [&d, &v, C, op = std::forward<F>(op)](std::size_t r) noexcept {
+                const Scalar vr = v[r];
+                Scalar* row = d.data() + r * C;
+                for (std::size_t c = 0; c < C; ++c)
+                    row[c] = static_cast<Scalar>(op(row[c], vr));
+            };
+            if (R * C >= PARALLEL_THRESHOLD && R > 1)
+                nn::parallel_for_samples(R, process_row);
+            else
+                for (std::size_t r = 0; r < R; ++r)
+                    process_row(r);
         }
 
         // ── 按列广播（通用数学原语，不是算法） ──────────────────────────
@@ -950,13 +968,21 @@ namespace nn
         {
             NN_ASSERT(col_vec.rows_ == 1 && col_vec.cols_ == cols_, "col_vec shape mismatch");
             const auto v = col_vec.span();
+            const std::size_t R = rows_;
             const std::size_t C = cols_;
             auto d = span();
-            auto idx = std::views::iota(std::size_t{0}, d.size());
-            nn::for_each(idx.begin(), idx.end(),
-                [&d, &v, C, op = std::forward<F>(op)](std::size_t i) noexcept {
-                    d[i] = static_cast<Scalar>(op(d[i], v[i % C]));
-                });
+            // 按行处理：行内直接用 v[c]（替代逐元素 i%C 取模），行内连续访问可向量化。
+            // 并行阈值与旧实现一致（元素数 >= PARALLEL_THRESHOLD），仅并行粒度由元素改为行。
+            auto process_row = [&d, &v, C, op = std::forward<F>(op)](std::size_t r) noexcept {
+                Scalar* row = d.data() + r * C;
+                for (std::size_t c = 0; c < C; ++c)
+                    row[c] = static_cast<Scalar>(op(row[c], v[c]));
+            };
+            if (R * C >= PARALLEL_THRESHOLD && R > 1)
+                nn::parallel_for_samples(R, process_row);
+            else
+                for (std::size_t r = 0; r < R; ++r)
+                    process_row(r);
         }
     };
 

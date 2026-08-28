@@ -181,13 +181,18 @@ protected:
     [[nodiscard]] std::pair<std::size_t, std::size_t>
     try_match_marker(std::string_view text, std::size_t pos) const noexcept
     {
+        // 所有标记（6 对话 + 保留 token）都以 '<' 开头：非 '<' 位置直接返回，
+        // 避免对每个普通字符做线性扫描与 substr 分配。
+        if (pos >= text.size() || text[pos] != '<')
+            return {npos, 0};
+
         static constexpr std::string_view markers[] = {
             "<|system|>", "<|end_of_system|>", "<|user|>", "<|end_of_user|>",
             "<|assistant|>", "<|end_of_assistant|>"
         };
         for (const auto &m : markers)
         {
-            if (pos + m.size() <= text.size() && text.substr(pos, m.size()) == m)
+            if (pos + m.size() <= text.size() && text.compare(pos, m.size(), m) == 0)
             {
                 std::size_t id = npos;
                 if      (m == "<|system|>")            id = markers_.system;
@@ -203,7 +208,7 @@ protected:
         for (const auto &[tok, id] : reserved_ids_)
         {
             if (id != npos && pos + tok.size() <= text.size()
-                && text.substr(pos, tok.size()) == tok)
+                && text.compare(pos, tok.size(), tok) == 0)
                 return {id, tok.size()};
         }
         return {npos, 0};

@@ -104,12 +104,20 @@ nn_add_executable(tokenizer_train src/tokenizer_train.cpp)
 nn_add_executable(tokenizer_infer src/tokenizer_infer.cpp)
 list(APPEND NN_APP_TARGETS text_train text_infer tokenizer_train tokenizer_infer)
 
+# ── 层吞吐量基准（CPU/Vulkan GPU；--all 或 --layer <name> 指定） ────────
+nn_add_executable(layer_bench src/layer_bench.cpp)
+list(APPEND NN_APP_TARGETS layer_bench)
+
 # ── 测试 / 验证目标（默认关闭，NN_ENABLE_TESTS=ON 时构建）─────────────
 if(NN_ENABLE_TESTS)
 
     # GPU 测试（需要 Vulkan）
     nn_add_executable(gpu_test src/gpu_test.cpp)
     list(APPEND NN_TEST_TARGETS gpu_test)
+
+    # ── 分词器优化正确性仲裁（阶段2：pre_tokenize 手写状态机对拍 + 标记往返） ──
+    nn_add_executable(tokenizer_consistency_test src/tokenizer_consistency_test.cpp)
+    list(APPEND NN_TEST_TARGETS tokenizer_consistency_test)
 
     # ── Attention 一致性验证（forward vs forward_step）──────────────────────
     nn_add_executable(attn_consistency_test src/attn_consistency_test.cpp)
