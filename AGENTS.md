@@ -158,6 +158,7 @@ optimizer.step();
 | `14-operator-fusion-2.md` | 融合算子二期：matmul 参与 IR 融合 + 跨 kernel 自动融合（P2-05/P2-10，删 M4-M6 手写原语） |
 | `15-rapt-algorithm.md` | RLA / RAPT：ReLU 线性注意力算法设计与实现说明 |
 | `16-zipt-algorithm.md` | AttnZip / ZiPT：记忆压缩解码器算法设计 |
+| `17-pointer-audit.md` | 指针审查：每处指针的改造难度×价值标注 + nn-allow 关账路线（2026-08-30） |
 | `flash_attn_analysis.md` | 两趟式注意力等价 FlashAttention 的融合算子的分析报告 |
 | `DEVELOPMENT_STANDARDS.md` | C++ 编码规范全文 |
 
