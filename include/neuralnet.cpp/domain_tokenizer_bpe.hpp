@@ -229,6 +229,8 @@ public:
             if (id == markers_.user_end)      { result += "<|end_of_user|>";     continue; }
             if (id == markers_.assistant)     { result += "<|assistant|>";       continue; }
             if (id == markers_.assistant_end) { result += "<|end_of_assistant|>";continue; }
+            if (id == markers_.start_think)   { result += "<think>";                continue; }
+            if (id == markers_.end_think)     { result += "</think>";              continue; }
             result += id < vocab_.size() ? vocab_[id] : std::string{REPLACEMENT_CHAR};
         }
         return result;

@@ -16,11 +16,13 @@
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/cli/cli_engine_factory.hpp>
 
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <random>
 #include <string>
+#include <string_view>
 
 using nn::Scalar;
 using nn::Matrix;
@@ -247,7 +249,8 @@ int main(int argc, char* argv[])
         }
         std::string name = "param[" + std::to_string(pi++) + "]";
         // 精简命名：按顺序标注
-        static const char* tags[] = {"token_emb", "pos_emb", "blk0.wq", "blk0.wk",
+        static constexpr std::array<std::string_view, 12> tags = {
+            "token_emb", "pos_emb", "blk0.wq", "blk0.wk",
             "blk0.wv", "blk0.wo", "blk0.norm1.g", "blk0.fc1.w", "blk0.fc1.b",
             "blk0.fc2.w", "blk0.fc2.b", "blk0.norm2.g"};
         if (pi - 1 < 12)

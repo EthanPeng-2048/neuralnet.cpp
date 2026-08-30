@@ -20,10 +20,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <span>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
+#include "core_file.hpp"   // 二进制 POD 读写（cast 边界收敛点，docs/17 §2.1）
 #include "expr_spec.hpp"
 #include "expr_opt.hpp"
 
@@ -75,40 +77,40 @@ inline constexpr std::uint8_t kExprBinVersion = 2;
     std::ofstream f(path, std::ios::binary);
     if (!f) return false;
     f.write("NNEXP", 5);
-    f.write(reinterpret_cast<const char*>(&kExprBinVersion), 1);
+    if (!write_pod(f, kExprBinVersion)) return false;
     const std::uint32_t count = static_cast<std::uint32_t>(reg.specs.size());
-    f.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    if (!write_pod(f, count)) return false;
     for (const auto& s : reg.specs)
     {
-        f.write(reinterpret_cast<const char*>(&s.num_regs), sizeof(s.num_regs));
+        if (!write_pod(f, s.num_regs)) return false;
         std::uint32_t n = static_cast<std::uint32_t>(s.instrs.size());
-        f.write(reinterpret_cast<const char*>(&n), sizeof(n));
+        if (!write_pod(f, n)) return false;
         for (const auto& in : s.instrs)
         {
             std::uint8_t bytes[8] = { in.op, in.dst, in.a.kind, in.a.idx,
                                       in.b.kind, in.b.idx, in.c.kind, in.c.idx };
-            f.write(reinterpret_cast<const char*>(bytes), sizeof(bytes));
+            if (!write_pod_span(f, std::span(bytes, 8))) return false;
         }
         n = static_cast<std::uint32_t>(s.views.size());
-        f.write(reinterpret_cast<const char*>(&n), sizeof(n));
+        if (!write_pod(f, n)) return false;
         for (const auto& v : s.views)
         {
-            f.write(reinterpret_cast<const char*>(&v.kind), 1);
-            f.write(reinterpret_cast<const char*>(&v.negate_first_half), 1);
-            f.write(reinterpret_cast<const char*>(&v.param), sizeof(v.param));
+            if (!write_pod(f, v.kind)) return false;
+            if (!write_pod(f, v.negate_first_half)) return false;
+            if (!write_pod(f, v.param)) return false;
         }
         n = static_cast<std::uint32_t>(s.consts.size());
-        f.write(reinterpret_cast<const char*>(&n), sizeof(n));
+        if (!write_pod(f, n)) return false;
         for (const auto& c : s.consts)
-            f.write(reinterpret_cast<const char*>(&c), sizeof(c));
+            if (!write_pod(f, c)) return false;
         const std::uint8_t has_mm = s.matmul ? 1 : 0;
-        f.write(reinterpret_cast<const char*>(&has_mm), 1);
+        if (!write_pod(f, has_mm)) return false;
         if (s.matmul)
         {
             std::uint8_t mbytes[4] = { s.matmul->a_input, s.matmul->b_input,
                                        s.matmul->transA, s.matmul->transB };
-            f.write(reinterpret_cast<const char*>(mbytes), sizeof(mbytes));
-            f.write(reinterpret_cast<const char*>(&s.matmul->k), sizeof(s.matmul->k));
+            if (!write_pod_span(f, std::span(mbytes, 4))) return false;
+            if (!write_pod(f, s.matmul->k)) return false;
         }
     }
     return static_cast<bool>(f);
@@ -123,51 +125,51 @@ inline constexpr std::uint8_t kExprBinVersion = 2;
     f.read(magic, 5);
     if (std::string(magic, 5) != "NNEXP") return false;
     std::uint8_t ver = 0;
-    f.read(reinterpret_cast<char*>(&ver), 1);
+    if (!read_pod(f, ver)) return false;
     if (ver != kExprBinVersion) return false;
     std::uint32_t count = 0;
-    f.read(reinterpret_cast<char*>(&count), sizeof(count));
+    if (!read_pod(f, count)) return false;
     out.specs.clear();
     out.keys.clear();
     out.specs.reserve(count);
     for (std::uint32_t i = 0; i < count; ++i)
     {
         ExprSpec s;
-        f.read(reinterpret_cast<char*>(&s.num_regs), sizeof(s.num_regs));
+        if (!read_pod(f, s.num_regs)) return false;
         std::uint32_t n = 0;
-        f.read(reinterpret_cast<char*>(&n), sizeof(n));
+        if (!read_pod(f, n)) return false;
         s.instrs.resize(n);
         for (auto& in : s.instrs)
         {
             std::uint8_t bytes[8];
-            f.read(reinterpret_cast<char*>(bytes), sizeof(bytes));
+            if (!read_pod_span(f, std::span(bytes, 8))) return false;
             in.op = bytes[0]; in.dst = bytes[1];
             in.a.kind = bytes[2]; in.a.idx = bytes[3];
             in.b.kind = bytes[4]; in.b.idx = bytes[5];
             in.c.kind = bytes[6]; in.c.idx = bytes[7];
         }
-        f.read(reinterpret_cast<char*>(&n), sizeof(n));
+        if (!read_pod(f, n)) return false;
         s.views.resize(n);
         for (auto& v : s.views)
         {
-            f.read(reinterpret_cast<char*>(&v.kind), 1);
-            f.read(reinterpret_cast<char*>(&v.negate_first_half), 1);
-            f.read(reinterpret_cast<char*>(&v.param), sizeof(v.param));
+            if (!read_pod(f, v.kind)) return false;
+            if (!read_pod(f, v.negate_first_half)) return false;
+            if (!read_pod(f, v.param)) return false;
         }
-        f.read(reinterpret_cast<char*>(&n), sizeof(n));
+        if (!read_pod(f, n)) return false;
         s.consts.resize(n);
         for (auto& c : s.consts)
-            f.read(reinterpret_cast<char*>(&c), sizeof(c));
+            if (!read_pod(f, c)) return false;
         std::uint8_t has_mm = 0;
-        f.read(reinterpret_cast<char*>(&has_mm), 1);
+        if (!read_pod(f, has_mm)) return false;
         if (has_mm)
         {
             MatmulSpec mm;
             std::uint8_t mbytes[4];
-            f.read(reinterpret_cast<char*>(mbytes), sizeof(mbytes));
+            if (!read_pod_span(f, std::span(mbytes, 4))) return false;
             mm.a_input = mbytes[0]; mm.b_input = mbytes[1];
             mm.transA  = mbytes[2]; mm.transB  = mbytes[3];
-            f.read(reinterpret_cast<char*>(&mm.k), sizeof(mm.k));
+            if (!read_pod(f, mm.k)) return false;
             s.matmul = mm;
         }
         out.add(s);

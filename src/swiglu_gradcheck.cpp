@@ -15,6 +15,7 @@
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/cli/cli_engine_factory.hpp>
 
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -194,7 +195,7 @@ int main(int argc, char *argv[])
     // ── 验证参数梯度 ──
     const Scalar eps = 1e-3f;
     bool all_pass = true;
-    const char *pnames[] = {"fc1.w", "fc1.b", "fc2.w", "fc2.b"};
+    static constexpr std::array<std::string_view, 4> pnames{"fc1.w", "fc1.b", "fc2.w", "fc2.b"};
 
     for (std::size_t pi = 0; pi < params.size(); ++pi)
     {
@@ -202,7 +203,7 @@ int main(int argc, char *argv[])
         if (!p) { std::cerr << "to_matrix(param) failed\n"; return 1; }
         auto g = eng.to_matrix(grads[pi].get());
         if (!g) { std::cerr << "to_matrix(grad) failed\n"; return 1; }
-        std::string name = pi < 4 ? pnames[pi] : ("param[" + std::to_string(pi) + "]");
+        std::string name = pi < 4 ? std::string(pnames[pi]) : ("param[" + std::to_string(pi) + "]");
         all_pass &= check_grad_tensor(
             eng, ff, *x, *go, params[pi].get(), *p, *g, name, eps, tol);
     }

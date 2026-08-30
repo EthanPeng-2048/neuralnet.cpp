@@ -13,6 +13,7 @@
 // ───────────────────────────────────────────────────────────────────────────
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <random>
@@ -110,7 +111,7 @@ void check_one(std::string_view s, const char* label)
 
 void test_fixed_cases()
 {
-    static const char* fixed[] = {
+    static constexpr std::array<std::string_view, 55> fixed = {
         "hello", " hello", "  hello", "hello world", "don't", "can't", "I'm", "you're",
         "they've", "it'll", "we'd", "she's", "'t", "'re", "'", "'x", "it's a test",
         "123", " 123", "abc123", "123abc", "foo bar 42 baz", "0", " 0x1F",
@@ -122,9 +123,9 @@ void test_fixed_cases()
         "one two\nthree\tfour", "  leading  spaces  ", "trailing  \n\n",
         "'tis", "rock 'n' roll", "it''s", "A'B", "don't stop",
     };
-    for (const char* s : fixed)
+    for (const auto& s : fixed)
         check_one(s, "fixed");
-    std::printf("fixed cases: %zu\n", sizeof(fixed) / sizeof(fixed[0]));
+    std::printf("fixed cases: %zu\n", fixed.size());
 }
 
 void test_random_ascii()
@@ -161,9 +162,9 @@ void test_random_bytes()
 void test_contraction_whitespace_grid()
 {
     // 缩写 × 前后缀 × 空白 组合
-    static const char* cont[] = {"'s", "'t", "'re", "'ve", "'m", "'ll", "'d"};
-    static const char* pre[] = {"", "a", " ", "  ", "\t", "a ", "'"};
-    static const char* post[] = {"", "b", " bb", " ", "123", "!", "_x", "'"};
+    static constexpr std::array<std::string_view, 7> cont = {"'s", "'t", "'re", "'ve", "'m", "'ll", "'d"};
+    static constexpr std::array<std::string_view, 7> pre = {"", "a", " ", "  ", "\t", "a ", "'"};
+    static constexpr std::array<std::string_view, 8> post = {"", "b", " bb", " ", "123", "!", "_x", "'"};
     std::mt19937 g(999);
     std::string buf;
     for (auto c : cont)

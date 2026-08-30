@@ -18,8 +18,10 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <random>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -91,13 +93,13 @@ struct LayerSpec
 {
     const char* name;
     // 构建单层模型；返回 false 表示构建失败
-    bool (*build)(Model&, const BenchConfig&);
+    std::function<bool(Model&, const BenchConfig&)> build;
     // 输入张量形状 (rows, cols)
-    std::pair<std::size_t, std::size_t> (*shape)(const BenchConfig&);
+    std::function<std::pair<std::size_t, std::size_t>(const BenchConfig&)> shape;
     // 前向 FLOP 估算（用于 GFLOPS）
-    double (*flops)(const BenchConfig&);
+    std::function<double(const BenchConfig&)> flops;
     // 每次迭代的 token 数（sequence 层 = batch*seq；MLP 类 = batch）
-    std::size_t (*tokens)(const BenchConfig&);
+    std::function<std::size_t(const BenchConfig&)> tokens;
 };
 
 bool build_linear(Model& m, const BenchConfig& c)
@@ -244,12 +246,12 @@ struct OpSpec
 {
     const char* name;
     // setup: 一次性创建输入张量（不计时）
-    void (*setup)(ComputeEngine&, const BenchConfig&, OpCtx&);
+    std::function<void(ComputeEngine&, const BenchConfig&, OpCtx&)> setup;
     // run: 每次迭代执行算子（计时）
-    void (*run)(ComputeEngine&, const BenchConfig&, OpCtx&);
+    std::function<void(ComputeEngine&, const BenchConfig&, OpCtx&)> run;
     // 工作量：is_flops 时 = FLOPs；否则 = 读写字节数
-    double (*work)(const BenchConfig&);
-    bool is_flops;     // true → GFLOPS；false → GB/s
+    std::function<double(const BenchConfig&)> work;
+    bool is_flops;     // true → GFLOPS; false → GB/s
 };
 
 void setup_matmul(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
@@ -362,7 +364,7 @@ void bench_op(ComputeEngine& engine, const BenchConfig& cfg, const OpSpec& spec)
     spec.setup(engine, cfg, ctx);
     const bool is_flops = spec.is_flops;
     const double work = spec.work(cfg);
-    const char* unit = is_flops ? "GFLOPS" : "GB/s";
+    const std::string_view unit = is_flops ? "GFLOPS" : "GB/s";
     const double scale = is_flops ? 1e9 : 1e9;  // 除以秒，再除以 1e9 得 G-单位
 
     // warmup
@@ -377,7 +379,7 @@ void bench_op(ComputeEngine& engine, const BenchConfig& cfg, const OpSpec& spec)
         best = std::min(best, ms_since(t0));
     }
     const double g = (work / (best / 1000.0)) / scale;
-    std::printf("  %-14s : %8.3f ms  %10.1f %s\n", spec.name, best, g, unit);
+    std::printf("  %-14s : %8.3f ms  %10.1f %s\n", spec.name, best, g, unit.data());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

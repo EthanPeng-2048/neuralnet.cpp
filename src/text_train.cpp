@@ -201,8 +201,7 @@ struct TokenizedData {
     if (!ifs) return std::nullopt;
 
     TokCacheHeader hdr{};
-    ifs.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
-    if (!ifs) return std::nullopt;
+    if (!nn::read_pod(ifs, hdr)) return std::nullopt;
     if (std::memcmp(hdr.magic, TOKCACHE_MAGIC, 4) != 0) return std::nullopt;
     if (hdr.version != TOKCACHE_VERSION) return std::nullopt;
     if (hdr.sizeof_size_t != sizeof(std::size_t)) return std::nullopt;
@@ -212,12 +211,8 @@ struct TokenizedData {
     TokenizedData data;
     data.flow.resize(hdr.token_count);
     data.doc_ids.resize(hdr.token_count);
-    ifs.read(reinterpret_cast<char*>(data.flow.data()),
-             static_cast<std::streamsize>(hdr.token_count * sizeof(std::size_t)));
-    if (!ifs) return std::nullopt;
-    ifs.read(reinterpret_cast<char*>(data.doc_ids.data()),
-             static_cast<std::streamsize>(hdr.token_count * sizeof(std::size_t)));
-    if (!ifs) return std::nullopt;
+    if (!nn::read_pod_span(ifs, std::span(data.flow))) return std::nullopt;
+    if (!nn::read_pod_span(ifs, std::span(data.doc_ids))) return std::nullopt;
     return data;
 }
 
@@ -239,12 +234,10 @@ bool save_tokenize_cache(
     hdr.vocab_size = vocab_file_size;
     hdr.token_count = token_flow.size();
 
-    ofs.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
-    ofs.write(reinterpret_cast<const char*>(token_flow.data()),
-              static_cast<std::streamsize>(token_flow.size() * sizeof(std::size_t)));
-    ofs.write(reinterpret_cast<const char*>(doc_ids.data()),
-              static_cast<std::streamsize>(doc_ids.size() * sizeof(std::size_t)));
-    return ofs.good();
+    if (!nn::write_pod(ofs, hdr)) return false;
+    if (!nn::write_pod_span(ofs, std::span(token_flow))) return false;
+    if (!nn::write_pod_span(ofs, std::span(doc_ids))) return false;
+    return true;
 }
 
 // ── 设备丢失自动重启：保存 checkpoint → 等待 GPU 驱动恢复 → 重新启动进程 ──

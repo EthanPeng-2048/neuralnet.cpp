@@ -68,6 +68,7 @@ public:
     struct DialogueMarkers {
         std::size_t system = npos, user = npos, assistant = npos;
         std::size_t system_end = npos, user_end = npos, assistant_end = npos;
+        std::size_t start_think = npos, end_think = npos;
     };
 
     // ── 对话标记 token（默认从 markers_ 读取，子类一般无需重写） ─────
@@ -77,6 +78,8 @@ public:
     [[nodiscard]] virtual std::size_t end_system_marker_id()   const noexcept { return markers_.system_end; }
     [[nodiscard]] virtual std::size_t end_user_marker_id()      const noexcept { return markers_.user_end; }
     [[nodiscard]] virtual std::size_t end_assistant_marker_id() const noexcept { return markers_.assistant_end; }
+    [[nodiscard]] virtual std::size_t start_think_marker_id()   const noexcept { return markers_.start_think; }
+    [[nodiscard]] virtual std::size_t end_think_marker_id()     const noexcept { return markers_.end_think; }
 
     // ── 是否包含对话标记 ──────────────────────────────────────
     [[nodiscard]] bool has_dialogue_markers() const noexcept
@@ -91,11 +94,11 @@ public:
     {
         static constexpr std::string_view marker_strs[] = {
             "<|system|>", "<|end_of_system|>", "<|user|>", "<|end_of_user|>",
-            "<|assistant|>", "<|end_of_assistant|>"
+            "<|assistant|>", "<|end_of_assistant|>", "<think>", "</think>"
         };
-        std::size_t ids[6];
+        std::size_t ids[8];
         bool all_found = true;
-        for (int i = 0; i < 6; ++i)
+        for (int i = 0; i < 8; ++i)
         {
             ids[i] = npos;
             for (std::size_t j = 0; j < vocab.size(); ++j)
@@ -108,7 +111,7 @@ public:
         if (!all_found)
         {
             // 部分标记缺失，追加全部（保持连续 ID）
-            for (int i = 0; i < 6; ++i)
+            for (int i = 0; i < 8; ++i)
             {
                 if (ids[i] == npos)
                 { ids[i] = vocab.size(); vocab.emplace_back(marker_strs[i]); }
@@ -117,7 +120,7 @@ public:
         // 追加额外保留特殊 token（回合结束/SEP/工具/多模态/文件）
         append_reserved_extras_(vocab);
         // 通过虚方法设置 markers_（基类默认实现赋值 markers_）
-        set_dialogue_marker_ids(ids[0], ids[1], ids[2], ids[3], ids[4], ids[5]);
+        set_dialogue_marker_ids(ids[0], ids[1], ids[2], ids[3], ids[4], ids[5], ids[6], ids[7]);
     }
 
 protected:
@@ -131,7 +134,8 @@ protected:
     virtual void set_dialogue_marker_ids(
         std::size_t system, std::size_t end_system,
         std::size_t user, std::size_t end_user,
-        std::size_t assistant, std::size_t end_assistant)
+        std::size_t assistant, std::size_t end_assistant,
+        std::size_t start_think, std::size_t end_think)
     {
         markers_.system        = system;
         markers_.system_end    = end_system;
@@ -139,9 +143,11 @@ protected:
         markers_.user_end      = end_user;
         markers_.assistant      = assistant;
         markers_.assistant_end = end_assistant;
+        markers_.start_think   = start_think;
+        markers_.end_think     = end_think;
     }
 
-    // 添加 6 个对话标记到词表末尾，并绑定 ID 到 markers_；随后追加额外保留 token
+    // 添加 8 个对话标记到词表末尾，并绑定 ID 到 markers_；随后追加额外保留 token
     void add_dialogue_markers_to_vocab_(std::vector<std::string> &vocab)
     {
         markers_.system        = vocab.size(); vocab.emplace_back("<|system|>");
@@ -150,6 +156,8 @@ protected:
         markers_.user_end      = vocab.size(); vocab.emplace_back("<|end_of_user|>");
         markers_.assistant      = vocab.size(); vocab.emplace_back("<|assistant|>");
         markers_.assistant_end = vocab.size(); vocab.emplace_back("<|end_of_assistant|>");
+        markers_.start_think   = vocab.size(); vocab.emplace_back("<think>");
+        markers_.end_think     = vocab.size(); vocab.emplace_back("</think>");
         append_reserved_extras_(vocab);
     }
 
@@ -177,18 +185,18 @@ protected:
     }
 
     // ── 辅助：尝试匹配对话标记，返回 (token_id, 匹配字节数)，不匹配返回 (npos, 0) ──
-    // 先匹配 6 个对话标记，再匹配额外保留 token（按长度降序，最长优先）。
+    // 先匹配 8 个对话标记，再匹配额外保留 token（按长度降序，最长优先）。
     [[nodiscard]] std::pair<std::size_t, std::size_t>
     try_match_marker(std::string_view text, std::size_t pos) const noexcept
     {
-        // 所有标记（6 对话 + 保留 token）都以 '<' 开头：非 '<' 位置直接返回，
+        // 所有标记（8 对话 + 保留 token）都以 '<' 开头：非 '<' 位置直接返回，
         // 避免对每个普通字符做线性扫描与 substr 分配。
         if (pos >= text.size() || text[pos] != '<')
             return {npos, 0};
 
         static constexpr std::string_view markers[] = {
             "<|system|>", "<|end_of_system|>", "<|user|>", "<|end_of_user|>",
-            "<|assistant|>", "<|end_of_assistant|>"
+            "<|assistant|>", "<|end_of_assistant|>", "<think>", "</think>"
         };
         for (const auto &m : markers)
         {
@@ -201,6 +209,8 @@ protected:
                 else if (m == "<|end_of_user|>")      id = markers_.user_end;
                 else if (m == "<|assistant|>")        id = markers_.assistant;
                 else if (m == "<|end_of_assistant|>") id = markers_.assistant_end;
+                else if (m == "<think>")            id = markers_.start_think;
+                else if (m == "</think>")          id = markers_.end_think;
                 if (id != npos) return {id, m.size()};
             }
         }

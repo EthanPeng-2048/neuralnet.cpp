@@ -883,7 +883,8 @@ namespace nn
                     out[c] = static_cast<Scalar>(init);
                 for (std::size_t r = 0; r < R; ++r)
                 {
-                    const Scalar* row = self.data() + r * C;
+                    // 行视图：std::span::subspan 零成本（ptr+len），替代裸指针行起点
+                    const auto row = self.subspan(r * C, C);
                     for (std::size_t c = 0; c < C; ++c)
                     {
                         Scalar v = static_cast<Scalar>(transform_op(row[c]));
@@ -909,10 +910,11 @@ namespace nn
                 [self, &local_acc, &reduce_op, &transform_op, C, base, rem](std::size_t t) noexcept {
                     const std::size_t r0 = t * base + std::min(t, rem);
                     const std::size_t r_end = (t + 1) * base + std::min(t + 1, rem);
-                    auto* acc = local_acc.data() + t * C;
+                    // 本线程累加器行视图（lambda 体内局部，捕获语义不受影响）
+                    auto acc = std::span(local_acc).subspan(t * C, C);
                     for (std::size_t r = r0; r < r_end; ++r)
                     {
-                        const Scalar* row = self.data() + r * C;
+                        const auto row = self.subspan(r * C, C);
                         for (std::size_t c = 0; c < C; ++c)
                         {
                             Scalar v = static_cast<Scalar>(transform_op(row[c]));
@@ -927,7 +929,7 @@ namespace nn
                 out[c] = static_cast<Scalar>(local_acc[c]);  // 组 0
             for (std::size_t t = 1; t < n_threads; ++t)
             {
-                const auto* acc = local_acc.data() + t * C;
+                const auto acc = std::span(local_acc).subspan(t * C, C);
                 for (std::size_t c = 0; c < C; ++c)
                     out[c] = static_cast<Scalar>(reduce_op(static_cast<T>(out[c]), acc[c]));
             }
@@ -949,7 +951,7 @@ namespace nn
             // 并行阈值与旧实现一致（元素数 >= PARALLEL_THRESHOLD），仅并行粒度由元素改为行。
             auto process_row = [&d, &v, C, op = std::forward<F>(op)](std::size_t r) noexcept {
                 const Scalar vr = v[r];
-                Scalar* row = d.data() + r * C;
+                auto row = d.subspan(r * C, C);
                 for (std::size_t c = 0; c < C; ++c)
                     row[c] = static_cast<Scalar>(op(row[c], vr));
             };
@@ -974,7 +976,7 @@ namespace nn
             // 按行处理：行内直接用 v[c]（替代逐元素 i%C 取模），行内连续访问可向量化。
             // 并行阈值与旧实现一致（元素数 >= PARALLEL_THRESHOLD），仅并行粒度由元素改为行。
             auto process_row = [&d, &v, C, op = std::forward<F>(op)](std::size_t r) noexcept {
-                Scalar* row = d.data() + r * C;
+                auto row = d.subspan(r * C, C);
                 for (std::size_t c = 0; c < C; ++c)
                     row[c] = static_cast<Scalar>(op(row[c], v[c]));
             };
