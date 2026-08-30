@@ -514,7 +514,7 @@ int main(int argc, char *argv[])
     else
     {
         const auto &dims = spec.is_mlp() ? spec.layer_dims : nn::MNIST_LAYER_DIMS;
-        const char *norm_name =
+        const std::string_view norm_name =
             (spec.norm_type == nn::NormType::RMSNorm) ? "RMSNorm" :
             (spec.norm_type == nn::NormType::BatchNorm) ? "BatchNorm" : "LayerNorm";
         std::cout << "  网络: ";

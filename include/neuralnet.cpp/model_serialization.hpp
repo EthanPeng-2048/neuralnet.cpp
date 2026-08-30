@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "core_config.hpp"
+#include "core_file.hpp"    // 二进制 POD 读写（cast 边界收敛点，docs/17 §2.1）
 #include "model_spec.hpp"
 #include "model_keyvalue_record.hpp"
 #include "compute_layer.hpp"
@@ -78,18 +79,14 @@ static_assert(sizeof(Scalar) == 4 || sizeof(Scalar) == 8,
 namespace detail
 {
 
-// ── 安全二进制 I/O 辅助（替代 reinterpret_cast）─────────────────────
-// 使用 std::as_bytes(std::span) 实现类型安全的二进制读写，
-// 避免直接 reinterpret_cast<char*>。
+// ── 安全二进制 I/O 辅助（转发 L0 收敛点 core_file.hpp::write_pod/read_pod）
+// 字节级 reinterpret_cast 只出现在 core_file.hpp（docs/17 §2.1）。
 
 template <typename T>
     requires std::is_trivially_copyable_v<T>
 [[nodiscard]] inline Result<void> write_bytes(std::ofstream &ofs, const T &v)
 {
-    auto bytes = std::as_bytes(std::span(&v, 1));
-    ofs.write(reinterpret_cast<const char *>(bytes.data()),
-              static_cast<std::streamsize>(bytes.size_bytes()));
-    if (!ofs)
+    if (!nn::write_pod(ofs, v))
         return std::unexpected(Error{"Write error"});
     return {};
 }
@@ -99,10 +96,7 @@ template <typename T>
 [[nodiscard]] inline Result<T> read_bytes(std::ifstream &ifs)
 {
     T v{};
-    auto bytes = std::as_writable_bytes(std::span(&v, 1));
-    ifs.read(reinterpret_cast<char *>(bytes.data()),
-             static_cast<std::streamsize>(bytes.size_bytes()));
-    if (!ifs)
+    if (!nn::read_pod(ifs, v))
         return std::unexpected(Error{"Unexpected end of file"});
     return v;
 }
@@ -168,10 +162,7 @@ template <typename... Ts>
         return std::unexpected(r.error());
     if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.cols())); !r)
         return std::unexpected(r.error());
-    const auto s = m.span();
-    ofs.write(reinterpret_cast<const char *>(s.data()),
-              static_cast<std::streamsize>(s.size_bytes()));
-    if (!ofs)
+    if (!nn::write_pod_span(ofs, m.span()))
         return std::unexpected(Error{"Write error while writing matrix data"});
     return {};
 }
@@ -193,10 +184,7 @@ template <typename... Ts>
             + std::to_string(rows) + ", " + std::to_string(cols) + ")"});
     }
 
-    auto s = m.span();
-    ifs.read(reinterpret_cast<char *>(s.data()),
-             static_cast<std::streamsize>(s.size_bytes()));
-    if (!ifs)
+    if (!nn::read_pod_span(ifs, m.span()))
         return std::unexpected(Error{"Unexpected end of file while reading matrix data"});
     return {};
 }

@@ -68,9 +68,9 @@ template <typename T>
     }
     else
     {
-        const auto *end = s.data() + s.size();
-        auto [ptr, ec] = std::from_chars(s.data(), end, value);
-        if (ec != std::errc{} || ptr != end)
+        // string_view::end() 即指向末尾后一位置的 const char*，无需手动指针算术
+        auto [ptr, ec] = std::from_chars(s.data(), s.end(), value);
+        if (ec != std::errc{} || ptr != s.end())
             return std::unexpected(Error{"invalid number: " + std::string(s)});
     }
     return value;

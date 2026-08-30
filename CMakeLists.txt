@@ -39,6 +39,12 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "App
     add_compile_options(-fexperimental-library)
 endif()
 
+find_program(CCACHE_FOUND ccache)
+if(CCACHE_FOUND)
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ccache)
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
+endif()
+
 # ── 按构建类型设置优化标志 ───────────────────────────────────────────────
 # Release: -O3 -funroll-loops -march=native（最大性能）
 # Debug:   -O0 -g（调试优先）

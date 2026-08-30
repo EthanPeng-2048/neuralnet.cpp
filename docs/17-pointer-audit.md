@@ -3,6 +3,8 @@
 > 2026-08-30。工具：`scripts/audit_modern_style.py`（W1 零误报版）+ grep 盲补。
 > 扫描范围：`include/` + `src/` + `tools/`，**100 个文件**。
 > 基线：**ERROR 50 / WARN 52 / nn-allow 豁免 0**（豁免机制已建但从未使用）。
+> **2026-08-29 第 1 轮执行完成**（约束：不用 nn-allow——能解的解，解不了的留基线）。
+> 最新状态、新基线与审查器缺陷修复结果见 **§9**。
 >
 > 难度：低 = 机械改动/单点，中 = 需回归验证（全量 ctest 30/30），高 = 跨模块设计改动。
 > 价值：按"消除铁律违反 / 消除死代码地雷 / CI 门禁可用性 / 纯形式"四档。
@@ -55,7 +57,7 @@
 |---|------|------|------|:---:|:---:|
 | 3.1 | `algebra_matrix.hpp:886,912,915,930,952,977`（6 处，reduce/broadcast 并行热循环） | `const Scalar* row = self.data()+r*C`、`auto* acc = local_acc.data()+t*C` | `Scalar& base = local_acc[t*C]` + `base[c]`（引用替代指针算术，零成本）；`row` 同理用 `const Scalar&`。注意 912/930 在 lambda 内捕获，引用捕获语义需逐处核对 | **中**（热路径+并行，需 gradcheck 全量回归） | 低-中 |
 | 3.2 | `algebra_span.hpp:30,88`（Span/ConstSpan 的 `data_` 成员） | 手写的 L1 视图容器，形状与 `std::span` 完全一致（前 std::span 普及产物） | 成员改存 `std::span`/`std::span<const Scalar>`（`data()` 转发，接口不变）。影响面 = 整个表达式模板路径，需全量 ctest | 中 | 低（行为完全等价，纯内部形态统一；风险>收益，可延后） |
-| 3.3 | `core_errors.hpp:71`、`cli/cli_mnist_io.hpp:69` | `const auto* end = s.data()+s.size();` 喂 `std::from_chars` | `std::string::end()` 即指向 '\0 的迭代器/指针 → `from_chars(s.data(), s.end(), …)`，删 2 行 | 低 | 低 |
+| 3.3 | `core_errors.hpp:71`、`cli/cli_mnist_io.hpp:69` | `const auto* end = s.data()+s.size();` 喂 `std::from_chars` | ~~`std::string::end()` 即指向 '\0 的迭代器/指针~~ **原方案有误**：libc++ 的 `std::string::end()` 返回 `__wrap_iter` 迭代器，不能当 `const char*` 喂 `from_chars`（编译失败），仅 `std::string_view::end()` 适用。实际执行：string_view 处改 `s.end()`；std::string 处保留 `data()+size()` 并加注释（见 §9.1） | 低 | 低 |
 | 3.4 | `core_errors.hpp:59` `char* p` | `strtoX` endptr，C 互操作（注释已说明不用 from_chars 的原因） | `nn-allow: C 互操作 endptr` | 低 | 低 |
 | 3.5 | `text_train.cpp:68` `const char* buf = fc.buffer.data()` | 非拥有视图喂 fread/fwrite | 保持（非审查项）或改 `const char* buf = data` 内联 | 低 | 低 |
 | 3.6 | `layer_bench.cpp:365`、`mnist_train.cpp:517` `const char* x = 字符串字面量` | 字面量天然是指针 | 改 `std::string_view`（可选） | 低 | 低（纯美观） |
@@ -111,3 +113,52 @@
 - **`std::from_chars`/`strtoX` 的 C 指针参数**：标准库 API 设计如此，属互操作边界。
 - **`memcpy(pc.data()+off, &x, n)` 家族**（`compute_vk_backend.hpp:1999-2034` 等）：
   `void*` 是 memcpy 的标准签名，非裸指针使用。
+
+## 9. 2026-08-29 第 1 轮执行状态与最新基线
+
+> 执行约束：**不使用 nn-allow**——能解的解掉，解不了的留基线。
+> 与 §7 的差异：①（47 行 nn-allow）与 ⑤（1.2 的 nn-allow）**未做**，E 类留基线；
+> 其余（②③④⑥⑦）全部完成，其中 ⑦ 只做 3.1、不做 3.2（风险>收益）。
+
+### 9.1 已完成（代码均已过全量构建 + ctest 30/30）
+
+| 项 | 实际做法 | 与原计划差异 |
+|----|----------|--------------|
+| 1.1 | `Factory` 改 `std::unique_ptr<ExprEmitter>(*)()`，注册 lambda 改 `std::make_unique` | 无 |
+| 1.3 | 删 `expr_cpu_emitter.hpp`（文件+注册行），`expr_graph_test` 12 断言改为对 "cpu" 后端的硬报错断言 | 无 |
+| 2.1（P2-E4） | **收敛**：`core_file.hpp` 新增 `write_pod/read_pod/write_pod_span/read_pod_span` 四个 POD 读写原语，4 文件 39 处 cast 全部改走它们 | 原计划逐行 nn-allow；现全库 `reinterpret_cast` 仅剩收敛点自身 4 处（`core_file.hpp:52,63,73,83`，文件头已注明"唯一收敛点"） |
+| 3.1 | 6 处热循环行起点改 `std::span::subspan(r*C, C)`（reduce/broadcast 并行路径，`algebra_matrix.hpp:887,914,917,932,954,979`） | 原计划 `Scalar& base` 引用；span 更贴合铁律 2，同为 ptr+len 零成本 |
+| 3.3 | `core_errors.hpp`（string_view）改 `s.end()`；`cli_mnist_io.hpp`（std::string）保留 `data()+size()` 并加注释 | 见 3.3 行的方案修正（libc++ `__wrap_iter` 不能喂 from_chars） |
+| 3.6 | `layer_bench.cpp:366`、`mnist_train.cpp:518` 字面量改 `const std::string_view` | 无 |
+| 4.3 | 11 处测试/工具字符串表改 `constexpr std::array<std::string_view, N>`（attn/gpt/swiglu gradcheck + tokenizer 4 张表 77 元素） | 无 |
+| 5.1 | `layer_bench.cpp` 7 处函数指针成员改 `std::function` | 无 |
+| 6.1/6.2 | `_has_decl_ctx` 补"左上下文以类型名（`_BUILTIN_TYPES` 或 `a::B` 限定标识符）词尾结束"判定；strip 后取最后 token，`::` 形式要求 `fullmatch`（防 `std::to_string(x * 2)` 乘法误报） | 无 |
+| 6.3 | `RE_ARR_PARAM` 结尾字符类 `[,)=]` → `[),]`（`{`/`=` 是初始化非参数） | 无 |
+| 6.4 | `RE_FUNCPTR` 命中后要求 `(` 前一 token 为类型（`_BUILTIN_TYPES`/`std`/`_is_type_token`），`(*task)()` 解引用调用不再误报 | 无 |
+| argv 去噪 | `RE_ARR_PARAM` 命中且数组名为 `argv` 时豁免（main/parse_args 的 CLI 边界，现存 14 处 `char* argv[]`）；参数语境的 `char* argv` 同时被 `_known_ptr_params` 排除出 W1 | 审查器侧豁免实现 §4.1/4.2，**未用 nn-allow** |
+
+**6.1-6.4 回测**（合成用例 + 实际基线双重验证）：`char* p`、`const Scalar* row`、
+成员 `Scalar* data_`（`algebra_span.hpp:30,88`）均进基线；`(*task)()`、`char* argv[]`、
+`constexpr std::string_view x[]` 不再误报；库内无 `qualified * qualified` 乘法模式，
+6.1/6.2 新增 `::` 分支零误报。
+
+### 9.2 最新基线（2026-08-29，`python3 scripts/audit_modern_style.py`）
+
+**99 个文件：ERROR 13 / WARN 37（全 W1）/ W2 0 / W3 0 / 豁免 0**
+
+| 类 | 数 | 构成 | 处置 |
+|----|:--:|------|------|
+| E1 | 1 | vk 单例故意泄漏（1.2，注释+§8 有技术理由） | 留基线（shutdown 重构属 1.1 范围） |
+| E4 | 4 | `core_file.hpp:52,63,73,83` 收敛点自身 | 留基线（2.1 的"收敛而非消灭"已是终态） |
+| E7 | 8 | CUDA 6（已停用）+ `compute_staging_ring.hpp:58`（vkMapMemory）+ `expr_spec.hpp:359`（FNV 哈希边界） | 留基线（改实现为负收益） |
+| W1 | 37 | P3 剩余：`algebra_span.hpp:30,88`（3.2）、`core_errors.hpp:59`（3.4）、`text_train.cpp:47,68`（3.5）、`expr_spec.hpp:361`（3.7）、`expr_glsl_gen.hpp` 19 处 `const char* s`（GLSL 表）、`compute_gpu_engine.hpp:715,775,881`（FusedShader observer）、`cli_mnist_io.hpp:71,166`、`compute_vk_device.hpp:41,51`（__restrict 参数）、CUDA 3 处 | 择机改 span/引用或留基线 |
+| W2/W3 | 0 | — | 6.3/6.4 + argv 豁免 + 4.3/5.1 改码后清零 |
+
+### 9.3 未做（留基线，及理由）
+
+- **① 47 行 nn-allow / ⑤ 1.2 的 nn-allow**：按执行约束未做。审查器当前 `FAIL`
+  （13 ERROR，全部为 §8/§9.2 所列合法边界），**暂不挂 CI 硬门禁**；日常软检查
+  （ERROR 计数不回升、新增裸指针进 W1 基线）。
+- **3.2** `algebra_span.hpp` 成员改 `std::span`：风险>收益（§3 原判定），未动。
+- **1.2** 单例 shutdown 重构：属 1.1 路线图，不在本次范围。
+

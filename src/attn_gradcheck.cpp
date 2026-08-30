@@ -10,11 +10,13 @@
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/cli/cli_engine_factory.hpp>
 
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <random>
 #include <string>
+#include <string_view>
 
 using nn::Scalar;
 using nn::Matrix;
@@ -178,7 +180,7 @@ int main(int argc, char* argv[])
 
     const Scalar eps = 1e-3f;
     bool all_pass = true;
-    const char* tags[] = {"wq.w","wq.b","wk.w","wk.b","wv.w","wv.b","wo.w","wo.b"};
+    static constexpr std::array<std::string_view, 8> tags{"wq.w","wq.b","wk.w","wk.b","wv.w","wv.b","wo.w","wo.b"};
     for (std::size_t p = 0; p < params.size(); ++p)
     {
         auto pm = eng.to_matrix(params[p].get());

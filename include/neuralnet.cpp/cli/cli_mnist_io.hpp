@@ -66,6 +66,8 @@ namespace nn::cli
             row_count = max_samples;
 
         const char *ptr = buffer.data();
+        // std::string::iterator 是 __wrap_iter 类（libc++），不能当 const char* 用；
+        // from_chars 需要裸指针，data()+size() 是唯一边界（docs/17 §3.3 仅适用于 string_view）
         const char *end = buffer.data() + buffer.size();
 
         // 探测第一行以确定特征维度

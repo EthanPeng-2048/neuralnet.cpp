@@ -1310,7 +1310,9 @@ public:
 // 登记到 emitter 注册表（静态初始化；重复包含无害——同名拒绝覆盖）
 inline const bool kGlslEmitterRegistered =
     emitter_registry::register_backend("glsl",
-        []() -> ExprEmitter* { return new GlslEmitter(); });
+        []() -> std::unique_ptr<ExprEmitter> {
+            return std::make_unique<GlslEmitter>();
+        });
 
 } // namespace nn
 

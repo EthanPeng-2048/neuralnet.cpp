@@ -7,7 +7,7 @@
 //  对应文档 `docs/11-ir-optimization.md` IR-D：把后端代码生成从 GLSL 专用
 //  抽象为 emitter 接口，实现"一份 canonical IR → 多后端代码"：
 //
-//      IR (canonical ExprSpec) → GlslEmitter / CudaEmitter / CpuEmitter
+//      IR (canonical ExprSpec) → GlslEmitter / CudaEmitter / …
 //
 //  设计：
 //    - ExprEmitter 是纯接口：给定 name + canonical ExprSpec，产出目标后端
@@ -55,12 +55,13 @@ public:
 
 // ── 简单注册表：按后端名选择 emitter 工厂 ────────────────────────────────
 // 供生成器工具（gen_fused 等）按 --backend 选择目标 emitter。
-// 具体 emitter 类型在各自头文件中向本注册表登记（见 GlslEmitter / CpuEmitter）。
+// 具体 emitter 类型在各自头文件中向本注册表登记（见 GlslEmitter）。
 // 线程安全：初始化期单线程登记（静态初始化），运行期只读查询。
 namespace emitter_registry
 {
 
-using Factory = ExprEmitter* (*)();
+// 工厂返回 unique_ptr（铁律 2：无裸指针所有权）；make() 直接转发。
+using Factory = std::unique_ptr<ExprEmitter>(*)();
 
 // 后端表（静态初始化，见各 emitter 头文件的登记语句）
 inline std::unordered_map<std::string, Factory>& backends()
@@ -83,7 +84,7 @@ inline bool register_backend(std::string_view name, Factory factory)
     const auto it = m.find(std::string(name));
     if (it == m.end())
         return nullptr;
-    return std::unique_ptr<ExprEmitter>(it->second());
+    return it->second();
 }
 
 // 所有已登记后端名（调试/日志）

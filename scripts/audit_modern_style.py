@@ -230,8 +230,15 @@ def _extract_param_pointer_names(src: str) -> set[str]:
     return ptr_names
 
 
-RE_ARR_PARAM = re.compile(r"\b[\w:]+\s*\w+\s*\[\s*\]\s*[,)=]")
+# W2：C 数组参数 `T arr[]`。只取 `,` / `)` 结尾（数组参数不可能有默认值，
+# `= {` 是初始化而非参数，docs/17 §6.3 去 constexpr 数组误报）。
+# 匹配后若紧邻 `[` 的名字为 argv：main/parse_args 的 CLI 边界，豁免
+# （docs/17 §4.1/4.2，平台 ABI 不可改，纯审查器去噪，非 nn-allow）。
+RE_ARR_PARAM = re.compile(r"\b[\w:]+\s*\w+\s*\[\s*\]\s*[),]")
+# W3：函数指针声明 `Rt (*fp)(args)`。要求 `(` 前一个 token 为类型名/类型
+# 关键字，否则 `(*task)()` 这类解引用调用为误报（docs/17 §6.4）。
 RE_FUNCPTR = re.compile(r"\(\s*\*\s*[\w]+\s*\)\s*\([^;{]*\)")
+_TYPEISH_TOKENS = _BUILTIN_TYPES | {"std"}
 RE_ALLOW = re.compile(r"//\s*nn-allow\b")
 RE_SMART = re.compile(r"\bstd::(?:unique_ptr|shared_ptr|weak_ptr)\b")
 RE_MAKE_UNIQUE = re.compile(r"\bstd::make_unique\b")
@@ -308,6 +315,18 @@ def scan_file(path: Path, rel: str, rep: Report) -> None:
                 r"noexcept|constexpr|inline|using|typedef|typename|class|struct)\b)\s*$",
                 _left_ctx
             ))
+            # 6.1/6.2（docs/17 §P6）：左上下文以类型名词尾结束（char* p、
+            # const Scalar* row、类成员 Scalar* data_——含缩进，^ 锚失效）
+            # 同样是声明。_BUILTIN_TYPES 词尾匹配补上这类漏报。
+            if not _has_decl_ctx:
+                _stripped = _left_ctx.strip()
+                _last_tok = _stripped.split()[-1] if _stripped else ""
+                # :: 形式必须是完整标识符（如 nn::Matrix），否则
+                # "std::to_string(x * 2)" 里的乘法会误报
+                _qualified = (re.fullmatch(r"[A-Za-z_][\w:]*", _last_tok)
+                              and "::" in _last_tok)
+                if _last_tok in _BUILTIN_TYPES or _qualified:
+                    _has_decl_ctx = True
             if not _has_decl_ctx:
                 continue
             # 排除解引用：return *ptr / = *ptr / ( *ptr ) 中的 * 是解引用运算符
@@ -318,9 +337,20 @@ def scan_file(path: Path, rel: str, rep: Report) -> None:
                 if re.match(r"[\w]+\s*\)", _right_ctx):
                     continue
             hit("W1", raw)
-        if RE_ARR_PARAM.search(line):
+        for m in RE_ARR_PARAM.finditer(line):
+            # 取紧邻 '[' 前的标识符（'[' 前最后一个词）
+            before_bracket = m.group(0).split("[")[0]
+            words = re.findall(r"\w+", before_bracket)
+            arr_name = words[-1] if words else ""
+            if arr_name == "argv":
+                continue  # main/parse_args CLI 边界（docs/17 §4.1/4.2）
             hit("W2", raw)
-        if RE_FUNCPTR.search(line):
+        for m in RE_FUNCPTR.finditer(line):
+            before = line[:m.start()].rstrip()
+            prev_tok = before.split()[-1] if before else ""
+            # 前一 token 非类型（如 `{`、`=`、`(`）→ (*x)() 解引用调用，跳过
+            if prev_tok not in _TYPEISH_TOKENS and not _is_type_token(prev_tok):
+                continue
             hit("W3", raw)
 
     # 信息统计（对全文件计次）
