@@ -285,7 +285,11 @@ bool save_tokenize_cache(
     std::cerr << "  [TDR] 自动重启: " << cmd << "\n\n";
     std::cerr.flush();
 
-    std::system(cmd.c_str());
+    int ret = std::system(cmd.c_str());
+    if (ret != 0) {
+        // 处理错误，例如打印日志、抛异常或忽略（根据业务决定）
+        std::cerr << "Command failed with code " << ret << "\n";
+    }
     std::exit(0);
 }
 
