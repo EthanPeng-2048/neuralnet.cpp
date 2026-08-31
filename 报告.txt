@@ -1,0 +1,45 @@
+clang++24
+
+(.venv) ethan@ethan-t63:~/codes/neuralnet.cpp$ ./build/layer_bench --op all --m 1024 --n 1024 --k 1024
+=== layer_bench (CPU, ops) ===
+  matmul         :   43.410 ms        49.5 GFLOPS
+  matmul_bt      :   35.693 ms        60.2 GFLOPS
+  matmul_at      :   50.033 ms        42.9 GFLOPS
+  batched_matmul :   44.736 ms        48.0 GFLOPS
+  add_inplace    :    0.669 ms        18.8 GB/s
+  elementwise_exp :    1.867 ms         4.5 GB/s
+  broadcast_col  :    0.315 ms        26.6 GB/s
+  row_reduce_sum :    0.992 ms         8.5 GB/s
+  col_reduce_sum :    0.101 ms        83.4 GB/s
+  transpose      :    1.812 ms         4.6 GB/s
+  scale_inplace  :    0.248 ms        33.9 GB/s
+
+g++16
+(.venv) ethan@ethan-t63:~/codes/neuralnet.cpp$ ./build/layer_bench --op all --m 1024 --n 1024 --k 1024
+=== layer_bench (CPU, ops) ===
+  matmul         :  127.722 ms        16.8 GFLOPS
+  matmul_bt      :  126.888 ms        16.9 GFLOPS
+  matmul_at      :  130.377 ms        16.5 GFLOPS
+  batched_matmul :  125.965 ms        17.0 GFLOPS
+  add_inplace    :    0.433 ms        29.0 GB/s
+  elementwise_exp :    1.310 ms         6.4 GB/s
+  broadcast_col  :    0.134 ms        62.8 GB/s
+  row_reduce_sum :    0.935 ms         9.0 GB/s
+  col_reduce_sum :    0.097 ms        86.7 GB/s
+  transpose      :    1.832 ms         4.6 GB/s
+  scale_inplace  :    0.095 ms        88.3 GB/s
+
+clang++24 libstdc++
+(.venv) ethan@ethan-t63:~/codes/neuralnet.cpp$ ./build/layer_bench --op all --m 1024 --n 1024 --k 1024
+=== layer_bench (CPU, ops) ===
+  matmul         :   43.660 ms        49.2 GFLOPS
+  matmul_bt      :   35.981 ms        59.7 GFLOPS
+  matmul_at      :   51.248 ms        41.9 GFLOPS
+  batched_matmul :   40.572 ms        52.9 GFLOPS
+  add_inplace    :    0.468 ms        26.9 GB/s
+  elementwise_exp :    1.425 ms         5.9 GB/s
+  broadcast_col  :    0.177 ms        47.4 GB/s
+  row_reduce_sum :    0.932 ms         9.0 GB/s
+  col_reduce_sum :    0.102 ms        82.4 GB/s
+  transpose      :    1.952 ms         4.3 GB/s
+  scale_inplace  :    0.109 ms        76.8 GB/s
