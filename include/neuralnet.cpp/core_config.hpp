@@ -1,5 +1,4 @@
-#ifndef NN_CORE_CONFIG_HPP
-#define NN_CORE_CONFIG_HPP
+#pragma once
 
 #include <cstddef>
 #include <iterator>  // for std::distance
@@ -7,6 +6,22 @@
 
 #include "core_threadpool.hpp"
 #include "core_errors.hpp"
+
+// 放在 algebra_matrix.hpp 或一个通用的 config.h 里
+#if defined(__clang__)
+    #define NN_VECTORIZE_PRAGMA _Pragma("clang loop vectorize(assume_safety)")
+#elif defined(__GNUC__) || defined(__GNUG__)
+    #define NN_VECTORIZE_PRAGMA _Pragma("GCC ivdep")
+#elif defined(_MSC_VER)
+    // MSVC 的 #pragma loop(ivdep) / __pragma(loop(ivdep)) 在 lambda/复合语句内部
+    // 会导致 C2059/C3925 编译错误（解析器将 { 误判为循环体）。
+    // MSVC 在 /O2 下默认启用自动向量化，此处留空即可。
+    #define NN_VECTORIZE_PRAGMA
+#elif defined(__ICC) || defined(__INTEL_COMPILER)
+    #define NN_VECTORIZE_PRAGMA _Pragma("vector always")
+#else
+    #define NN_VECTORIZE_PRAGMA
+#endif
 
 // ── 缓存分块大小 ─────────────────────────────────────────────────────────────
 // 64×64×8 = 32 KB，安全装入大多数 CPU 的 L1 缓存
@@ -166,4 +181,3 @@ namespace nn
     }
 } // namespace nn
 
-#endif // NN_CORE_CONFIG_HPP

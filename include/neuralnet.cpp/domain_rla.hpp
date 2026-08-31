@@ -1,5 +1,4 @@
-#ifndef NN_DOMAIN_RLA_HPP
-#define NN_DOMAIN_RLA_HPP
+#pragma once
 
 // ── domain_rla.hpp — RAPT 领域构建层（ReLU 激活线性注意力语言模型） ──────────
 //
@@ -108,4 +107,3 @@ struct RAPTConfig {
 
 } // namespace nn
 
-#endif // NN_DOMAIN_RLA_HPP

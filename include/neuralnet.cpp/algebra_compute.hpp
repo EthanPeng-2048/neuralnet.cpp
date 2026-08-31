@@ -1,5 +1,4 @@
-#ifndef NN_ALGEBRA_COMPUTE_DISPATCH_HPP
-#define NN_ALGEBRA_COMPUTE_DISPATCH_HPP
+#pragma once
 
 // ── compute_dispatch.hpp — 表达式模板统一入口 ─────────────────────────────
 // compute::apply(span, expr) 是所有逐元素运算的统一入口。
@@ -51,4 +50,3 @@ void apply(Span x, const Expr &expr)
 
 } // namespace nn::compute
 
-#endif // NN_ALGEBRA_COMPUTE_DISPATCH_HPP

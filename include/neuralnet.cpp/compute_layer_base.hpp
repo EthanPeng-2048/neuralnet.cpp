@@ -1,5 +1,4 @@
-#ifndef NN_COMPUTE_LAYER_BASE_HPP
-#define NN_COMPUTE_LAYER_BASE_HPP
+#pragma once
 
 #include <algorithm>
 #include <cmath>
@@ -125,4 +124,3 @@ public:
 
 } // namespace nn
 
-#endif // NN_COMPUTE_LAYER_BASE_HPP

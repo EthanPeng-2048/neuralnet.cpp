@@ -1,5 +1,4 @@
-#ifndef NN_DOMAIN_TOKENIZER_HPP
-#define NN_DOMAIN_TOKENIZER_HPP
+#pragma once
 
 // ── domain_tokenizer.hpp — 分词器（聚合头） ─────────────────────────────
 //
@@ -15,4 +14,3 @@
 #include "domain_tokenizer_bpe.hpp"
 #include "domain_tokenizer_charbpe.hpp"
 
-#endif // NN_DOMAIN_TOKENIZER_HPP

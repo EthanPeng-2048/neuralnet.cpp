@@ -1,5 +1,4 @@
-#ifndef NN_COMPUTE_CPU_ENGINE_HPP
-#define NN_COMPUTE_CPU_ENGINE_HPP
+#pragma once
 
 // ── compute_cpu_engine.hpp — CPU 计算引擎实现 ─────────────────────────────────────
 // CpuEngine 封装现有 Matrix 方法和 AST（compute::apply），实现
@@ -1290,4 +1289,3 @@ public:
 
 } // namespace nn
 
-#endif // NN_COMPUTE_CPU_ENGINE_HPP

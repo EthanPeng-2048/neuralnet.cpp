@@ -1,5 +1,4 @@
-#ifndef NN_DOMAIN_GPT_HPP
-#define NN_DOMAIN_GPT_HPP
+#pragma once
 
 // ── domain_gpt.hpp — GPT 领域构建层（引擎化架构） ──────────────────────────
 //
@@ -132,4 +131,3 @@ struct GptConfig {
 
 } // namespace nn
 
-#endif // NN_DOMAIN_GPT_HPP

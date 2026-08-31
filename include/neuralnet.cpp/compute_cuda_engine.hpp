@@ -3,8 +3,7 @@
 // 与 GpuEngine（Vulkan）架构对称，所有原语在 GPU 上原生执行。
 // ─────────────────────────────────────────────────────────────────────────
 
-#ifndef NN_COMPUTE_CUDA_ENGINE_HPP
-#define NN_COMPUTE_CUDA_ENGINE_HPP
+#pragma once
 
 #ifdef NN_HAS_CUDA
 
@@ -432,4 +431,3 @@ private:
 } // namespace nn
 
 #endif // NN_HAS_CUDA
-#endif // NN_COMPUTE_CUDA_ENGINE_HPP

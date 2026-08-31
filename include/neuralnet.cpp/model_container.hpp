@@ -1,5 +1,4 @@
-#ifndef NN_MODEL_CONTAINER_HPP
-#define NN_MODEL_CONTAINER_HPP
+#pragma once
 
 // ── model_container.hpp — 引擎化模型容器 ───────────────────────────────────
 //
@@ -232,4 +231,3 @@ public:
 
 } // namespace nn
 
-#endif // NN_MODEL_CONTAINER_HPP

@@ -1,5 +1,4 @@
-#ifndef NN_ALGEBRA_MATRIX_HPP
-#define NN_ALGEBRA_MATRIX_HPP
+#pragma once
 
 #include <algorithm>
 #include <array>
@@ -211,15 +210,7 @@ namespace nn
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
                             Scalar sum = 0.0;
-#if defined(__clang__)
-    #pragma clang loop vectorize(assume_safety)
-#elif defined(__GNUC__) || defined(__GNUG__)
-    #pragma GCC ivdep
-#elif defined(_MSC_VER)
-    #pragma loop(ivdep)
-#elif defined(__ICC) || defined(__INTEL_COMPILER)
-    #pragma vector always
-#endif
+                            NN_VECTORIZE_PRAGMA
                             for (std::size_t kk = 0; kk < k_len; ++kk)
                                 sum += a_row[kk] * b_col[kk];
                             r_row[j] += sum;
@@ -278,15 +269,7 @@ namespace nn
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
                             Scalar sum = 0.0;
-#if defined(__clang__)
-    #pragma clang loop vectorize(assume_safety)
-#elif defined(__GNUC__) || defined(__GNUG__)
-    #pragma GCC ivdep
-#elif defined(_MSC_VER)
-    #pragma loop(ivdep)
-#elif defined(__ICC) || defined(__INTEL_COMPILER)
-    #pragma vector always
-#endif
+                            NN_VECTORIZE_PRAGMA
                             for (std::size_t kk = 0; kk < k_len; ++kk)
                                 sum += a_row[kk] * b_col[kk];
                             r_row[j] += sum;
@@ -350,15 +333,7 @@ namespace nn
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
                             Scalar sum = 0.0;
-#if defined(__clang__)
-    #pragma clang loop vectorize(assume_safety)
-#elif defined(__GNUC__) || defined(__GNUG__)
-    #pragma GCC ivdep
-#elif defined(_MSC_VER)
-    #pragma loop(ivdep)
-#elif defined(__ICC) || defined(__INTEL_COMPILER)
-    #pragma vector always
-#endif
+                            NN_VECTORIZE_PRAGMA
                             for (std::size_t kk = 0; kk < k_len; ++kk)
                                 sum += a_row[kk] * b_col[kk];
                             r_row[j] += sum;
@@ -423,15 +398,7 @@ namespace nn
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
                             Scalar sum = 0.0;
-#if defined(__clang__)
-    #pragma clang loop vectorize(assume_safety)
-#elif defined(__GNUC__) || defined(__GNUG__)
-    #pragma GCC ivdep
-#elif defined(_MSC_VER)
-    #pragma loop(ivdep)
-#elif defined(__ICC) || defined(__INTEL_COMPILER)
-    #pragma vector always
-#endif
+                            NN_VECTORIZE_PRAGMA
                             for (std::size_t kk = 0; kk < k_len; ++kk)
                                 sum += a_row[kk] * b_col[kk];
                             r_row[j] += sum;
@@ -473,15 +440,7 @@ namespace nn
                                 {
                                     const auto b_col = b_block_span.subspan(j * k_len, k_len);
                                     Scalar sum = 0.0;
-#if defined(__clang__)
-    #pragma clang loop vectorize(assume_safety)
-#elif defined(__GNUC__) || defined(__GNUG__)
-    #pragma GCC ivdep
-#elif defined(_MSC_VER)
-    #pragma loop(ivdep)
-#elif defined(__ICC) || defined(__INTEL_COMPILER)
-    #pragma vector always
-#endif
+                                    NN_VECTORIZE_PRAGMA
                                     for (std::size_t kk = 0; kk < k_len; ++kk)
                                         sum += a_row[kk] * b_col[kk];
                                     r_row[j] += sum;
@@ -541,15 +500,7 @@ namespace nn
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
                             Scalar sum = 0.0;
-#if defined(__clang__)
-    #pragma clang loop vectorize(assume_safety)
-#elif defined(__GNUC__) || defined(__GNUG__)
-    #pragma GCC ivdep
-#elif defined(_MSC_VER)
-    #pragma loop(ivdep)
-#elif defined(__ICC) || defined(__INTEL_COMPILER)
-    #pragma vector always
-#endif
+                            NN_VECTORIZE_PRAGMA
                             for (std::size_t kk = 0; kk < k_len; ++kk)
                                 sum += a_row[kk] * b_col[kk];
                             r_row[j] += sum;
@@ -591,15 +542,7 @@ namespace nn
                                 {
                                     const auto b_col = b_block_span.subspan(j * k_len, k_len);
                                     Scalar sum = 0.0;
-#if defined(__clang__)
-    #pragma clang loop vectorize(assume_safety)
-#elif defined(__GNUC__) || defined(__GNUG__)
-    #pragma GCC ivdep
-#elif defined(_MSC_VER)
-    #pragma loop(ivdep)
-#elif defined(__ICC) || defined(__INTEL_COMPILER)
-    #pragma vector always
-#endif
+                                    NN_VECTORIZE_PRAGMA
                                     for (std::size_t kk = 0; kk < k_len; ++kk)
                                         sum += a_row[kk] * b_col[kk];
                                     r_row[j] += sum;
@@ -668,15 +611,7 @@ namespace nn
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
                             Scalar sum = 0.0;
-#if defined(__clang__)
-    #pragma clang loop vectorize(assume_safety)
-#elif defined(__GNUC__) || defined(__GNUG__)
-    #pragma GCC ivdep
-#elif defined(_MSC_VER)
-    #pragma loop(ivdep)
-#elif defined(__ICC) || defined(__INTEL_COMPILER)
-    #pragma vector always
-#endif
+                            NN_VECTORIZE_PRAGMA
                             for (std::size_t kk = 0; kk < k_len; ++kk)
                                 sum += a_row[kk] * b_col[kk];
                             r_row[j] += sum;
@@ -726,15 +661,7 @@ namespace nn
                                 {
                                     const auto b_col = b_block_span.subspan(j * k_len, k_len);
                                     Scalar sum = 0.0;
-#if defined(__clang__)
-    #pragma clang loop vectorize(assume_safety)
-#elif defined(__GNUC__) || defined(__GNUG__)
-    #pragma GCC ivdep
-#elif defined(_MSC_VER)
-    #pragma loop(ivdep)
-#elif defined(__ICC) || defined(__INTEL_COMPILER)
-    #pragma vector always
-#endif
+                                    NN_VECTORIZE_PRAGMA
                                     for (std::size_t kk = 0; kk < k_len; ++kk)
                                         sum += a_row[kk] * b_col[kk];
                                     r_row[j] += sum;
@@ -788,15 +715,7 @@ namespace nn
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
                             Scalar sum = 0.0;
-#if defined(__clang__)
-    #pragma clang loop vectorize(assume_safety)
-#elif defined(__GNUC__) || defined(__GNUG__)
-    #pragma GCC ivdep
-#elif defined(_MSC_VER)
-    #pragma loop(ivdep)
-#elif defined(__ICC) || defined(__INTEL_COMPILER)
-    #pragma vector always
-#endif
+                            NN_VECTORIZE_PRAGMA
                             for (std::size_t kk = 0; kk < k_len; ++kk)
                                 sum += a_row[kk] * b_col[kk];
                             r_row[j] += sum;
@@ -838,15 +757,7 @@ namespace nn
                                 {
                                     const auto b_col = b_block_span.subspan(j * k_len, k_len);
                                     Scalar sum = 0.0;
-#if defined(__clang__)
-    #pragma clang loop vectorize(assume_safety)
-#elif defined(__GNUC__) || defined(__GNUG__)
-    #pragma GCC ivdep
-#elif defined(_MSC_VER)
-    #pragma loop(ivdep)
-#elif defined(__ICC) || defined(__INTEL_COMPILER)
-    #pragma vector always
-#endif
+                                    NN_VECTORIZE_PRAGMA
                                     for (std::size_t kk = 0; kk < k_len; ++kk)
                                         sum += a_row[kk] * b_col[kk];
                                     r_row[j] += sum;
@@ -1134,4 +1045,3 @@ namespace nn
 #include "backend/compute_gpu_tensor_impl.hpp"
 #endif
 
-#endif // NN_ALGEBRA_MATRIX_HPP

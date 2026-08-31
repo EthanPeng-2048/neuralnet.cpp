@@ -1,5 +1,4 @@
-#ifndef NN_EXPR_OPT_HPP
-#define NN_EXPR_OPT_HPP
+#pragma once
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  expr_opt.hpp — ExprSpec 规范化与优化 pass（IR-A + IR-B）
@@ -604,4 +603,3 @@ namespace nn
 
 } // namespace nn
 
-#endif // NN_EXPR_OPT_HPP

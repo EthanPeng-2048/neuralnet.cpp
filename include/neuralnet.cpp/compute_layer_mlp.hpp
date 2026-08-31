@@ -1,5 +1,4 @@
-#ifndef NN_COMPUTE_LAYER_MLP_HPP
-#define NN_COMPUTE_LAYER_MLP_HPP
+#pragma once
 
 #include <algorithm>
 #include <cmath>
@@ -10,6 +9,7 @@
 #include <random>
 #include <vector>
 
+#include "compute_layer_base.hpp"
 #include "compute_engine.hpp"
 #include "compute_tensor.hpp"
 #include "model_spec.hpp"
@@ -879,4 +879,3 @@ public:
 //       MNIST 尺度下 CPU↔设备往返开销可忽略；GPU 融合卷积内核留作后续优化。
 } // namespace nn
 
-#endif // NN_COMPUTE_LAYER_MLP_HPP

@@ -15,8 +15,7 @@
 //   - 返回值：表示可能为空的查询结果
 // ─────────────────────────────────────────────────────────────────────────
 
-#ifndef NN_CORE_OBSERVER_PTR_HPP
-#define NN_CORE_OBSERVER_PTR_HPP
+#pragma once
 
 #include <cstddef>
 #include <utility>
@@ -76,5 +75,3 @@ template <typename T>
 }
 
 } // namespace nn
-
-#endif // NN_CORE_OBSERVER_PTR_HPP

@@ -1,5 +1,4 @@
-#ifndef NN_COMPUTE_LOSS_HPP
-#define NN_COMPUTE_LOSS_HPP
+#pragma once
 
 // ── compute_loss.hpp — 引擎化损失函数 ──────────────────────────────────────
 //
@@ -25,7 +24,7 @@
 // ─────────────────────────────────────────────────────────────────────────
 
 #include "compute_engine.hpp"
-#include "compute_layer.hpp"  // clone_tensor
+#include "compute_layer_base.hpp"  // clone_tensor
 #include "compute_tensor.hpp"
 #include "expr_dsl.hpp"
 
@@ -375,4 +374,3 @@ public:
 
 } // namespace nn
 
-#endif // NN_COMPUTE_LOSS_HPP

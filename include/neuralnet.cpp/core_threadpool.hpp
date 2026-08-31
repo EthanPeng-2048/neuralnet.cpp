@@ -1,5 +1,4 @@
-#ifndef NN_CORE_THREAD_POOL_HPP
-#define NN_CORE_THREAD_POOL_HPP
+#pragma once
 
 #include <vector>
 #include <queue>
@@ -623,4 +622,3 @@ namespace nn
 
 } // namespace nn
 
-#endif // NN_CORE_THREAD_POOL_HPP

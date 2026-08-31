@@ -1,7 +1,8 @@
-#ifndef NN_COMPUTE_LAYER_GPT_HPP
-#define NN_COMPUTE_LAYER_GPT_HPP
+#pragma once
 
 #include "compute_layer_base.hpp"
+#include "compute_layer_mlp.hpp"
+#include "compute_layer_feedforward.hpp"
 #include "compute_layer_attention.hpp"
 
 #include <algorithm>
@@ -1136,4 +1137,3 @@ public:
 // ══════════════════════════════════════════════════════════════════════════
 } // namespace nn
 
-#endif // NN_COMPUTE_LAYER_GPT_HPP

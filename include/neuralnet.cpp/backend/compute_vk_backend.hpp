@@ -17,8 +17,7 @@
 //   - GPU-Resident Path：GpuTensor → 计算 → GpuTensor（全程 GPU 显存）
 // ─────────────────────────────────────────────────────────────────────────
 
-#ifndef NN_COMPUTE_VK_BACKEND_HPP
-#define NN_COMPUTE_VK_BACKEND_HPP
+#pragma once
 
 #ifdef NN_HAS_VULKAN
 
@@ -2920,4 +2919,3 @@ GpuBuffer::~GpuBuffer()
 } // namespace nn
 
 #endif // NN_HAS_VULKAN
-#endif // NN_COMPUTE_VK_BACKEND_HPP

@@ -1,5 +1,4 @@
-#ifndef NN_COMPUTE_ENGINE_HPP
-#define NN_COMPUTE_ENGINE_HPP
+#pragma once
 
 // ── compute_engine.hpp — 计算引擎抽象接口 ─────────────────────────────────
 // ComputeEngine 是与底层硬件接触的唯一抽象层。
@@ -354,4 +353,3 @@ public:
 
 } // namespace nn
 
-#endif // NN_COMPUTE_ENGINE_HPP

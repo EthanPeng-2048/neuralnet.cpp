@@ -1,5 +1,4 @@
-#ifndef NN_EXPR_EMITTER_HPP
-#define NN_EXPR_EMITTER_HPP
+#pragma once
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  expr_emitter.hpp — 后端 emitter 抽象（IR-D）
@@ -101,4 +100,3 @@ inline bool register_backend(std::string_view name, Factory factory)
 
 } // namespace nn
 
-#endif // NN_EXPR_EMITTER_HPP

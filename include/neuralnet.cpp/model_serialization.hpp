@@ -1,5 +1,4 @@
-#ifndef NN_MODEL_SERIALIZATION_HPP
-#define NN_MODEL_SERIALIZATION_HPP
+#pragma once
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  model_io.hpp — 模型二进制序列化
@@ -554,4 +553,3 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
 
 } // namespace nn
 
-#endif // NN_MODEL_SERIALIZATION_HPP

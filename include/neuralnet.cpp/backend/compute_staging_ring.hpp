@@ -13,8 +13,7 @@
 //   - 内存预算上限保留 max_host_visible / 16，避免在小显存机器上过度分配
 // ─────────────────────────────────────────────────────────────────────────
 
-#ifndef NN_COMPUTE_STAGING_RING_HPP
-#define NN_COMPUTE_STAGING_RING_HPP
+#pragma once
 
 #ifdef NN_HAS_VULKAN
 
@@ -256,4 +255,3 @@ public:
 } // namespace nn
 
 #endif // NN_HAS_VULKAN
-#endif // NN_COMPUTE_STAGING_RING_HPP

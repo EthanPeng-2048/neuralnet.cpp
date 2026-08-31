@@ -1,5 +1,4 @@
-#ifndef NN_EXPR_GRAPH_HPP
-#define NN_EXPR_GRAPH_HPP
+#pragma once
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  expr_graph.hpp — 图 IR + 融合分析（IR-C）
@@ -479,4 +478,3 @@ inline constexpr std::size_t GRAPH_PLAN_CACHE_MAX = 512;
 
 } // namespace nn
 
-#endif // NN_EXPR_GRAPH_HPP

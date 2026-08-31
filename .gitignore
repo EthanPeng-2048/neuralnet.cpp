@@ -71,6 +71,7 @@ dist/
 *.swp
 *.swo
 *~
+nn-cppcheck-build-dir/
 
 # ==================== Logs ====================
 *.log

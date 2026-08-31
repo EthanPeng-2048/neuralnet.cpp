@@ -1,5 +1,4 @@
-#ifndef NN_DOMAIN_ZIPT_HPP
-#define NN_DOMAIN_ZIPT_HPP
+#pragma once
 
 // ── domain_zipt.hpp — ZiPT 领域构建层（AttnZip 记忆压缩解码器） ─────────────
 //
@@ -117,4 +116,3 @@ struct ZiPTConfig {
 
 } // namespace nn
 
-#endif // NN_DOMAIN_ZIPT_HPP

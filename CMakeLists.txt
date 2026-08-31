@@ -48,7 +48,7 @@ endif()
 # - MSVC：     /W4 /permissive-（严格一致性）；保留 /EHsc（ppltasks.h 需要），
 #              不强制 /WX（MSVC 与 clang 警告集不同，代码未按 MSVC 零警告编写）
 if(MSVC)
-    add_compile_options(/W4 /permissive-)
+    add_compile_options(/W4 /permissive- /source-charset:utf-8 /execution-charset:utf-8)
 else()
     add_compile_options(-fno-exceptions -Wall -Wextra -Wpedantic -Werror)
 endif()

@@ -3,8 +3,7 @@
 // 此文件在 algebra_matrix.hpp 末尾自动包含，解决循环依赖问题。
 // ─────────────────────────────────────────────────────────────────────────
 
-#ifndef NN_COMPUTE_GPU_TENSOR_IMPL_HPP
-#define NN_COMPUTE_GPU_TENSOR_IMPL_HPP
+#pragma once
 
 #ifdef NN_HAS_VULKAN
 
@@ -87,4 +86,3 @@ inline Result<Matrix> GpuTensor::to_matrix(GpuBackend& backend) const
 } // namespace nn
 
 #endif // NN_HAS_VULKAN
-#endif // NN_COMPUTE_GPU_TENSOR_IMPL_HPP

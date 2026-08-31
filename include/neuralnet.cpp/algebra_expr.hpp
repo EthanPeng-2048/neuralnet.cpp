@@ -1,5 +1,4 @@
-#ifndef NN_ALGEBRA_EXPR_HPP
-#define NN_ALGEBRA_EXPR_HPP
+#pragma once
 
 // ── expr.hpp — 表达式模板核心：编译期 AST 节点类型系统 ───────────────────
 // 上层用普通 C++ 运算符写表达式，编译器自动构建编译期 AST。
@@ -442,4 +441,3 @@ template <Expression L, Expression R>
 
 } // namespace nn
 
-#endif // NN_ALGEBRA_EXPR_HPP

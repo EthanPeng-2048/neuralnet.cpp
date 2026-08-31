@@ -1,5 +1,4 @@
-#ifndef NN_CORE_FILE_HPP
-#define NN_CORE_FILE_HPP
+#pragma once
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  core_file.hpp — 文件 I/O 工具
@@ -87,4 +86,3 @@ inline bool read_pod_span(std::istream &is, const std::span<T, Ext> &s)
 
 } // namespace nn
 
-#endif // NN_CORE_FILE_HPP

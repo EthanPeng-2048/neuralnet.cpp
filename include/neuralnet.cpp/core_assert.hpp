@@ -1,5 +1,4 @@
-#ifndef NN_CORE_ASSERT_HPP
-#define NN_CORE_ASSERT_HPP
+#pragma once
 
 #include <cstdio>
 #include <string>
@@ -54,4 +53,3 @@ namespace nn {
 
 } // namespace nn
 
-#endif // NN_CORE_ASSERT_HPP

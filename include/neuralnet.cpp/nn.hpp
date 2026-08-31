@@ -1,5 +1,4 @@
-#ifndef NN_HPP
-#define NN_HPP
+#pragma once
 
 // ── neuralnet.cpp 统一入口 ────────────────────────────────────────────────
 // 包含所有核心模块，用户只需 #include "nn.hpp"
@@ -74,4 +73,3 @@ namespace nn
     }
 } // namespace nn
 
-#endif // NN_HPP

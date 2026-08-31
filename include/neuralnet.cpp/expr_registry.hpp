@@ -1,5 +1,4 @@
-#ifndef NN_EXPR_REGISTRY_HPP
-#define NN_EXPR_REGISTRY_HPP
+#pragma once
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  expr_registry.hpp — 可融合表达式注册表（AOT 收集的两端共用）
@@ -179,4 +178,3 @@ inline constexpr std::uint8_t kExprBinVersion = 2;
 
 } // namespace nn::fused
 
-#endif // NN_EXPR_REGISTRY_HPP
