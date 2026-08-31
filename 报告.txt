@@ -17,17 +17,17 @@ clang++24
 g++16
 (.venv) ethan@ethan-t63:~/codes/neuralnet.cpp$ ./build/layer_bench --op all --m 1024 --n 1024 --k 1024
 === layer_bench (CPU, ops) ===
-  matmul         :  127.722 ms        16.8 GFLOPS
-  matmul_bt      :  126.888 ms        16.9 GFLOPS
-  matmul_at      :  130.377 ms        16.5 GFLOPS
-  batched_matmul :  125.965 ms        17.0 GFLOPS
-  add_inplace    :    0.433 ms        29.0 GB/s
-  elementwise_exp :    1.310 ms         6.4 GB/s
-  broadcast_col  :    0.134 ms        62.8 GB/s
-  row_reduce_sum :    0.935 ms         9.0 GB/s
-  col_reduce_sum :    0.097 ms        86.7 GB/s
-  transpose      :    1.832 ms         4.6 GB/s
-  scale_inplace  :    0.095 ms        88.3 GB/s
+  matmul         :  129.171 ms        16.6 GFLOPS
+  matmul_bt      :  126.810 ms        16.9 GFLOPS
+  matmul_at      :  131.258 ms        16.4 GFLOPS
+  batched_matmul :  125.907 ms        17.1 GFLOPS
+  add_inplace    :    0.471 ms        26.7 GB/s
+  elementwise_exp :    1.327 ms         6.3 GB/s
+  broadcast_col  :    0.129 ms        64.8 GB/s
+  row_reduce_sum :    0.903 ms         9.3 GB/s
+  col_reduce_sum :    0.123 ms        67.9 GB/s
+  transpose      :    1.941 ms         4.3 GB/s
+  scale_inplace  :    0.147 ms        57.2 GB/s
 
 clang++24 libstdc++
 (.venv) ethan@ethan-t63:~/codes/neuralnet.cpp$ ./build/layer_bench --op all --m 1024 --n 1024 --k 1024
@@ -43,3 +43,6 @@ clang++24 libstdc++
   col_reduce_sum :    0.102 ms        82.4 GB/s
   transpose      :    1.952 ms         4.3 GB/s
   scale_inplace  :    0.109 ms        76.8 GB/s
+
+我们建议在实际开发中使用clang++，clang++在自动向量化上效果明显优于g++
+同时，建议使用libstdc++，它的线程开销更小
