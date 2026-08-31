@@ -1,0 +1,2 @@
+[1/4] Scanning C:/Users/ethan/Codes/neuralnet.cpp/src/gpt_gradcheck.cpp for CXX dependencies
+[2/4] Generating CXX dyndep file CMakeFiles/gpt_gradcheck.dir/CXX.dd
