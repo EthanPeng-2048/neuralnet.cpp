@@ -229,6 +229,8 @@ optimizer.step();
 | `16-zipt-algorithm.md` | AttnZip / ZiPT：记忆压缩解码器算法设计 |
 | `17-pointer-audit.md` | 指针审查：每处指针的改造难度×价值标注 + nn-allow 关账路线（2026-08-30） |
 | `18-understanding-checklist.md` | **理解检查清单：评估理解程度、识别盲区、制定学习计划** |
+| `19-compute-engine-development.md` | **计算引擎开发指南：接口详解、实现模式、添加新原语** |
+| `20-compute-engine-usage.md` | **计算引擎使用指南：张量操作、矩阵运算、表达式融合** |
 | `flash_attn_analysis.md` | 两趟式注意力等价 FlashAttention 的融合算子的分析报告 |
 | `DEVELOPMENT_STANDARDS.md` | C++ 编码规范全文 |
 
