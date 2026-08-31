@@ -22,7 +22,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -1261,6 +1263,7 @@ int main(int argc, char *argv[])
         auto ep_start = std::chrono::steady_clock::now();
         Scalar total_weighted = 0.0;  // Σ(loss × 有效token)，用于按 token 加权平均
         std::size_t total_valid = 0;  // 累计有效 token 数
+        std::size_t nan_skip_count = 0;  // NaN 跳步计数
 
         // 每个 epoch 开始前 shuffle 样本索引队列
         std::shuffle(sample_indices.begin(), sample_indices.end(), rng);
@@ -1384,12 +1387,67 @@ int main(int argc, char *argv[])
             auto logits = std::move(*fwd_result);
             // logits: (vocab_size, seq_len × batch_size)
 
+            // NaN 检测：forward 完成后扫描 logits，若含 NaN 则跳过本步（不 backward/step）
+            bool step_nan = false;
+            {
+                auto lm = engine->to_matrix(logits);
+                // 注意：to_matrix 内部已调用 end_batch()+begin_batch()，forward 已提交
+                if (lm)
+                {
+                    const auto sp = lm->span();
+                    for (std::size_t i = 0; i < sp.size(); ++i)
+                        if (!std::isfinite(sp[i])) { step_nan = true; break; }
+                }
+            }
+            if (step_nan)
+            {
+                std::fprintf(stderr, "[NaNSkip] step %zu: NaN in logits, skipping backward+step\n", step + 1);
+                // to_matrix 已提交 forward batch 并重新 begin_batch；
+                // 此处需要 end_batch 清理空的 batch 状态，然后 continue
+                logits = {};
+                auto end_r = engine->end_batch();
+                if (!end_r) {
+                    std::string err_msg = end_r.error().message;
+                    if (err_msg.find("VK_ERROR_DEVICE_LOST") != std::string::npos) {
+                        std::cerr << "\nend_batch (NaNSkip) device lost: " << err_msg << '\n';
+                        restart_on_device_lost(program_name, model, spec, tokenizer_json,
+                            cfg.save_path, cfg.text_path,
+                            cfg.flush_interval == 0 ? std::size_t{1} : cfg.flush_interval * 2,
+                            cfg.gpu_enabled, cfg.cuda_enabled, epoch, step);
+                    }
+                    return 1;
+                }
+                ++nan_skip_count;
+                continue;  // 跳到下一个训练窗口
+            }
+
             // ── 损失（稀疏标签，避免 one-hot 爆显存） ────────
             auto mask_span = std::span<const Scalar>(flat_mask);
             auto loss_result = ce_loss.forward_sparse(
                 *engine, logits, flat_targets, mask_span, tokenizer->vocab_size());
             if (!loss_result) { std::cerr << "Error: " << loss_result.error().message << '\n'; return 1; }
             Scalar loss = *loss_result;
+            // NaN 跳步：loss 为 NaN/Inf 时跳过 backward+step
+            if (!std::isfinite(loss))
+            {
+                std::fprintf(stderr, "[NaNSkip] step %zu: loss=%g non-finite, skipping backward+step\n",
+                             step + 1, static_cast<double>(loss));
+                logits = {};
+                auto end_r = engine->end_batch();
+                if (!end_r) {
+                    std::string err_msg = end_r.error().message;
+                    if (err_msg.find("VK_ERROR_DEVICE_LOST") != std::string::npos) {
+                        std::cerr << "\nend_batch (NaNSkip loss) device lost: " << err_msg << '\n';
+                        restart_on_device_lost(program_name, model, spec, tokenizer_json,
+                            cfg.save_path, cfg.text_path,
+                            cfg.flush_interval == 0 ? std::size_t{1} : cfg.flush_interval * 2,
+                            cfg.gpu_enabled, cfg.cuda_enabled, epoch, step);
+                    }
+                    return 1;
+                }
+                ++nan_skip_count;
+                continue;
+            }
             total_weighted += loss * step_valid;        // 按有效 token 加权
             total_valid += step_valid;
 
@@ -1556,6 +1614,8 @@ int main(int argc, char *argv[])
                   << "  lr=" << std::scientific << std::setprecision(4) << optimizer_current_lr
                   << "  avg_loss=" << std::fixed << std::setprecision(4) << avg_loss
                   << "  time=" << std::setprecision(1) << ep_sec << "s";
+        if (nan_skip_count > 0)
+            std::cout << "  nan_skip=" << nan_skip_count;
 
         // ── 测试集评估（可选，与训练一致的滑动窗口） ─────────────
         if (!test_window_offsets.empty())

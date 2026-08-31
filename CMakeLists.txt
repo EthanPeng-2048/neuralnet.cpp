@@ -166,6 +166,10 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(doc_attn_test src/doc_attn_test.cpp)
     list(APPEND NN_TEST_TARGETS doc_attn_test)
 
+    # ── step-474 NaN 批次复现（batch=8 真实 doc 模式，边界在窗口中部） ──────
+    nn_add_executable(nan_repro_test src/nan_repro_test.cpp)
+    list(APPEND NN_TEST_TARGETS nan_repro_test)
+
     # ── CausalSelfAttention 数值梯度检查（gradcheck，验证 attention 内部反向） ──
     nn_add_executable(attn_gradcheck src/attn_gradcheck.cpp)
     list(APPEND NN_TEST_TARGETS attn_gradcheck)
