@@ -4,6 +4,108 @@
 
 ---
 
+## 🚀 快速理解（30秒版本）
+
+**这个项目是什么**：一个从零实现的深度学习框架，类似 PyTorch 但更简单。
+
+**核心设计**：
+1. **分层架构**：6层严格隔离，上层只调用下层接口
+2. **引擎化**：同一个 Layer 代码自动适配 CPU 和 GPU
+3. **表达式融合**：自动把多个小操作合并成一个 GPU kernel
+
+**你需要理解的最少概念**：
+1. `Matrix`（L1）：CPU 上的矩阵
+2. `Tensor`（L2）：跨设备的张量（CPU/GPU）
+3. `ComputeEngine`（L2）：计算引擎（CPU/GPU 后端）
+4. `Layer`（L2）：神经网络层（Linear, Attention 等）
+
+**复杂度来源**：
+- GPU 编程（Vulkan）
+- 表达式 DSL 和 AOT 融合
+- 分布式状态机（CPU/GPU 双存储）
+
+---
+
+## 🗺️ 理解路线图
+
+### 第一步：理解基础数据结构（1-2天）
+**目标**：理解数据如何表示和存储
+- **文件**：`algebra_matrix.hpp`（Matrix类）
+- **关键概念**：行主序存储、矩阵运算
+- **验证**：能解释 `data_[row * cols + col]` 的含义
+
+### 第二步：理解计算引擎（2-3天）
+**目标**：理解如何执行计算
+- **文件**：`compute_engine.hpp`（接口）、`compute_cpu_engine.hpp`（CPU实现）
+- **关键概念**：引擎化、原语（matmul, add, exp）
+- **验证**：能解释 `engine.matmul(a, b)` 如何工作
+
+### 第三步：理解神经网络层（3-5天）
+**目标**：理解如何构建模型
+- **文件**：`compute_layer.hpp`（所有层定义）
+- **关键概念**：forward/backward、梯度计算
+- **验证**：能解释 `Linear::forward` 如何计算
+
+### 第四步：理解模型容器（1-2天）
+**目标**：理解如何组合层
+- **文件**：`model_container.hpp`
+- **关键概念**：链式构建、参数管理
+- **验证**：能解释 `model.add_linear(784,256)` 的作用
+
+### 第五步：理解训练流程（2-3天）
+**目标**：理解端到端训练
+- **文件**：`src/text_train.cpp`（训练入口）
+- **关键概念**：梯度下降、优化器
+- **验证**：能解释训练循环的每一步
+
+### 可选：理解 GPU 后端（5-7天）
+**目标**：理解 GPU 加速
+- **文件**：`compute_gpu_engine.hpp`、`shaders/`
+- **关键概念**：Vulkan、command buffer、SPIR-V
+- **注意**：这是最复杂的部分，可以跳过
+
+---
+
+## 📊 模块关系简化图
+
+```mermaid
+graph LR
+    subgraph "用户代码"
+        U[训练脚本]
+    end
+    
+    subgraph "模型层"
+        M[Model容器]
+        L[Layer层]
+    end
+    
+    subgraph "计算层"
+        E[ComputeEngine]
+        T[Tensor]
+    end
+    
+    subgraph "数据层"
+        MT[Matrix]
+    end
+    
+    U --> M
+    M --> L
+    L --> E
+    E --> T
+    T --> MT
+    
+    style U fill:#e1f5fe
+    style M fill:#f3e5f5
+    style L fill:#f3e5f5
+    style E fill:#e8f5e8
+    style T fill:#e8f5e8
+    style MT fill:#fff3e0
+```
+
+**箭头含义**：调用关系（上层调用下层）
+
+---
+
 ## 📐 系统分层总览
 
 项目采用 **6 层分层架构**（L0 ~ L5），每层职责单一、严格隔离，上层仅依赖下层的公有接口。

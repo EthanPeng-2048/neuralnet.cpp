@@ -43,22 +43,91 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 
 ## 4. 分层架构（L0→L5，严格单向依赖，上层只依赖下层公有接口）
 
-```
-L5 入口    src/*.cpp（mnist/text/tokenizer 的 train/infer）、gui.py
-L4 领域    domain_*.hpp（模型工厂：build_mnist_* / build_gpt_model / Tokenizer）
-L3 实现    model_container.hpp（Model 容器）、model_spec.hpp、model_serialization.hpp
-L2 计算    compute_engine.hpp（引擎抽象）、compute_cpu/gpu_engine.hpp、compute_layer/loss/optimizer.hpp
-L1 代数    algebra_*.hpp（Matrix、表达式模板 AST、compute::apply）
-L0 硬件    core_config.hpp（Scalar=float、BLOCK_SIZE=64、SmartPolicy）、core_threadpool/errors/assert/file.hpp
+### 4.1 架构概览图
+
+```mermaid
+graph TB
+    subgraph "L5 用户入口层"
+        A["mnist_train/infer"]
+        B["text_train/infer"]
+        C["tokenizer_train/infer"]
+        D["gui.py"]
+    end
+    
+    subgraph "L4 领域构建层"
+        E["domain_mnist.hpp"]
+        F["domain_gpt.hpp"]
+        G["domain_tokenizer.hpp"]
+    end
+    
+    subgraph "L3 实现层"
+        H["model_container.hpp"]
+        I["model_spec.hpp"]
+        J["model_serialization.hpp"]
+    end
+    
+    subgraph "L2 计算层（引擎化）"
+        K["compute_engine.hpp"]
+        L["cpu_engine.hpp"]
+        M["gpu_engine.hpp"]
+        N["compute_layer.hpp"]
+        O["compute_loss.hpp"]
+        P["compute_optimizer.hpp"]
+    end
+    
+    subgraph "L1 代数层"
+        Q["algebra_matrix.hpp"]
+        R["algebra_expr.hpp"]
+        S["algebra_ops.hpp"]
+    end
+    
+    subgraph "L0 硬件层"
+        V["core_config.hpp"]
+        W["core_threadpool.hpp"]
+        X["core_errors.hpp"]
+    end
+    
+    D -->|subprocess| A & B & C
+    A & B & C --> E & F & G
+    E & F & G --> H & I & J
+    H & I & J --> K & N & O & P
+    K --> L & M
+    N & O & P --> Q
+    Q --> R & S
+    Q --> V & W & X
 ```
 
-**核心设计：引擎化（Engine-Based）**
-- Layer 的 `forward/backward` 只写一次，通过 `ComputeEngine&` 参数自动适配 CPU/GPU。没有 `forward_gpu` 这种东西。
-- **算法与原语分离**：Engine 只提供 op-level 原语（`matmul`/`add`/`exp`/`reduce`…），不知道 "ReLU" 是什么；Layer 用原语组合表达算法（`ReLU = max(x,0)`）。
-- 数据流：`Matrix → engine.from_matrix → Tensor[GPU] → forward/loss/optimizer 全程在 GPU → 仅 evaluate 时 to_matrix 回 CPU`。
+### 4.2 核心设计原则
 
-**ComputeEngine 原语分类**（`compute_engine.hpp`）：
-矩阵级 `matmul/batched_matmul/transpose/add_inplace/scale_inplace/zero/axpy_inplace`；归约级 `row/col_reduce_sum/max`；广播级 `broadcast_row/col_inplace`；逐元素 `elementwise_unary/binary/binary_scalar`；数据操作 `slice_rows/insert_rows/gather_rows/scatter_add_rows/rearrange_3d/clone`；批控制 `begin_batch/end_batch`（CPU no-op，GPU 录 command buffer）。
+**引擎化（Engine-Based）**：Layer 的 `forward/backward` 只写一次，通过 `ComputeEngine&` 参数自动适配 CPU/GPU。
+
+**算法与原语分离**：
+- Engine 只提供 op-level 原语（`matmul`/`add`/`exp`/`reduce`…）
+- Layer 用原语组合表达算法（`ReLU = max(x,0)`）
+- Engine 不知道 "ReLU" 是什么
+
+**数据流**：
+```
+Matrix → engine.from_matrix → Tensor[GPU] → forward/loss/optimizer 全程在 GPU → 仅 evaluate 时 to_matrix 回 CPU
+```
+
+### 4.3 ComputeEngine 原语分类
+
+| 类别 | 原语 |
+|------|------|
+| 矩阵级 | `matmul/batched_matmul/transpose/add_inplace/scale_inplace/zero/axpy_inplace` |
+| 归约级 | `row/col_reduce_sum/max` |
+| 广播级 | `broadcast_row/col_inplace` |
+| 逐元素 | `elementwise_unary/binary/binary_scalar` |
+| 数据操作 | `slice_rows/insert_rows/gather_rows/scatter_add_rows/rearrange_3d/clone` |
+| 批控制 | `begin_batch/end_batch`（CPU no-op，GPU 录 command buffer） |
+
+### 4.4 理解优先级（建议学习顺序）
+
+1. **先理解 L0-L1**（基础数据结构）：`Matrix`、`Tensor`、`Scalar`
+2. **再理解 L2 核心**：`ComputeEngine` 接口 + 一个简单 Layer（如 `Linear`）
+3. **然后理解 L3**：`Model` 容器如何组合 Layer
+4. **最后理解 L4-L5**：具体模型实现和训练流程
 
 ## 5. 铁律（违反必出 bug）
 
@@ -142,7 +211,7 @@ optimizer.step();
 
 | 文档 | 何时读 |
 |------|--------|
-| `01-architecture.md` | 需要完整分层/数据流/模块详解时 |
+| `01-architecture.md` | 需要完整分层/数据流/模块详解时（**含快速理解指南和理解路线图**） |
 | `02-performance.md` | 性能优化（SmartPolicy、缓存分块、GPU） |
 | `03-quickstart-model.md` | 构建模型 API 教程 |
 | `04-quickstart-train-infer.md` | 训练/推理 CLI + C++ API + GUI |
@@ -159,6 +228,7 @@ optimizer.step();
 | `15-rapt-algorithm.md` | RLA / RAPT：ReLU 线性注意力算法设计与实现说明 |
 | `16-zipt-algorithm.md` | AttnZip / ZiPT：记忆压缩解码器算法设计 |
 | `17-pointer-audit.md` | 指针审查：每处指针的改造难度×价值标注 + nn-allow 关账路线（2026-08-30） |
+| `18-understanding-checklist.md` | **理解检查清单：评估理解程度、识别盲区、制定学习计划** |
 | `flash_attn_analysis.md` | 两趟式注意力等价 FlashAttention 的融合算子的分析报告 |
 | `DEVELOPMENT_STANDARDS.md` | C++ 编码规范全文 |
 
