@@ -258,6 +258,64 @@ public:
     [[nodiscard]] virtual Result<void> zero(Tensor& A) = 0;
 
     // ══════════════════════════════════════════════════════════════════════
+    // 扫描级原语（带状态的顺序归约 + matvec 读出；RLA 线性注意力积木）
+    //
+    // 引擎只提供"前缀/后缀顺序归约 + matvec 读出"；RLA 算法（L2 归一化
+    // 分母 / ReLU 门控 / 梯度公式 / 文档重置策略）全部由 Layer 用这些原语
+    // 与逐元素原语组合表达（铁律 3：shader 永不含算法）。
+    //
+    // 形状约定（batch-major，列序 i = b*seq + t；头 (b,h) 的行块起点
+    // r0 = (b*H + h)*d_k，每头 d_k 行）：
+    //   K/V/P/R（X/Y）: (B·H·d_k, seq)
+    //   D             : (B·H·d_k², seq)，(b,h) 的 (a,b') 元素在
+    //                    行 (b*H*d_k + a)*d_k + b'
+    //   A0/B0         : (H·d_k, d_k) 初始运行态，行块 h = 第 h 头
+    //                    （B>1 时按头循环）；has_state=false → 按零
+    //                    处理（传 (1,1) dummy，规避 0 字节 buffer）
+    //   boundary      : (1, B·seq)，1 = 文档起点（t==0 或与前一位置
+    //                    文档不同）；has_bnd=false → 无文档感知
+    //                    （传 (1,1) dummy）
+    //   标量块（s/r）: 每 (b,h,t) 一个标量，在头块内 d_k 行重复存放
+    //                    （避免块级广播原语）；实现写全部 d_k 行
+    //                    的同一值，Layer 读任一行均可。
+    // ══════════════════════════════════════════════════════════════════════
+
+    // 前缀扫描：
+    //   causal=true : 含自身前缀（i<=t）：A_t = A0 + Σ_{i≤t, 与 t 同文档}
+    //                 k_i·k_i^T，B_t = B0 + Σ_{i≤t, 同文档} v_i·k_i^T；
+    //                 文档边界处运行态清零（A0/B0 仅首个文档生效）。
+    //   causal=false: 全集常数 A = A0 + Σ_all k·k^T，B = B0 + Σ_all v·k^T
+    //                 （无边界重置）。
+    // 输出 (B·H·5·d_k, seq)，行块（每块 (B·H·d_k, seq)）：
+    //   [0) B·P   [1) A·P   [2) B^T·R   [3) s = P·(A·P)   [4) r = R·(B·P)
+    //   其中 [3)/[4) 为逐列标量（头内逐行重复）。
+    [[nodiscard]] virtual Result<Tensor> scan_prefix_outer(
+        const Tensor& K, const Tensor& V, const Tensor& P, const Tensor& R,
+        const Tensor& A0, const Tensor& B0, bool has_state,
+        std::size_t dk, std::size_t heads, bool causal,
+        const Tensor& boundary, bool has_bnd) = 0;
+
+    // 后缀扫描（RLA 反向 pass 2）：
+    //   causal=true : S_i = Σ_{t≥i, 与 i 同文档} D_t（i+1 为文档起点时
+    //                 先清零再累加 D_i）；
+    //   causal=false: S_i = D_i（Layer 预先把全集梯度沿 seq 广播）。
+    // D (B·H·d_k², seq)，X/Y (B·H·d_k, seq)
+    // 输出 (B·H·3·d_k, seq)，行块：[0) S·X   [1) S·Y   [2) S^T·Y
+    [[nodiscard]] virtual Result<Tensor> scan_suffix_outer(
+        const Tensor& D, const Tensor& X, const Tensor& Y,
+        std::size_t dk, std::size_t heads, bool causal,
+        const Tensor& boundary, bool has_bnd) = 0;
+
+    // 逐列外积（RLA 反向的 dL/dA、dL/dB 物化）：
+    //   out[(b,h): (a,b'), t] = P[a,t]·R[b',t] (· S[t] if has_scale)
+    // P/R: (B·H·d_k, seq)；S: (B·H·d_k, seq)（标量头内逐行重复，
+    // 实现读头块首行；has_scale=false → 传 dummy）
+    // 输出: (B·H·d_k², seq)
+    [[nodiscard]] virtual Result<Tensor> outer_col(
+        const Tensor& P, const Tensor& R, const Tensor& S,
+        std::size_t dk, bool has_scale) = 0;
+
+    // ══════════════════════════════════════════════════════════════════════
     // 归约原语
     // ══════════════════════════════════════════════════════════════════════
 

@@ -499,6 +499,65 @@ public:
     }
 
     // ══════════════════════════════════════════════════════════════════════
+    // 扫描级原语（RLA）——手写原语 shader + GpuBackend 接线
+    // 形状契约见 compute_engine.hpp 扫描级原语注释；纯 GPU 架构：
+    // 无 pipeline 时硬报错，不做 CPU 回退。
+    // ══════════════════════════════════════════════════════════════════════
+
+    [[nodiscard]] Result<Tensor> scan_prefix_outer(
+        const Tensor& K, const Tensor& V, const Tensor& P, const Tensor& R,
+        const Tensor& A0, const Tensor& B0, bool has_state,
+        std::size_t dk, std::size_t heads, bool causal,
+        const Tensor& boundary, bool has_bnd) override
+    {
+        auto k = ensure_gpu(K); if (!k) return std::unexpected(k.error());
+        auto v = ensure_gpu(V); if (!v) return std::unexpected(v.error());
+        auto p = ensure_gpu(P); if (!p) return std::unexpected(p.error());
+        auto r = ensure_gpu(R); if (!r) return std::unexpected(r.error());
+        auto a = ensure_gpu(A0); if (!a) return std::unexpected(a.error());
+        auto b = ensure_gpu(B0); if (!b) return std::unexpected(b.error());
+        auto bn = ensure_gpu(boundary); if (!bn) return std::unexpected(bn.error());
+        auto res = backend_.scan_prefix_outer_gpu(
+            k->gpu_tensor(), v->gpu_tensor(), p->gpu_tensor(), r->gpu_tensor(),
+            a->gpu_tensor(), b->gpu_tensor(), has_state,
+            static_cast<uint32_t>(dk), static_cast<uint32_t>(heads), causal,
+            bn->gpu_tensor(), has_bnd);
+        if (!res) return std::unexpected(res.error());
+        return Tensor::from_gpu(std::move(*res));
+    }
+
+    [[nodiscard]] Result<Tensor> scan_suffix_outer(
+        const Tensor& D, const Tensor& X, const Tensor& Y,
+        std::size_t dk, std::size_t heads, bool causal,
+        const Tensor& boundary, bool has_bnd) override
+    {
+        auto d = ensure_gpu(D); if (!d) return std::unexpected(d.error());
+        auto x = ensure_gpu(X); if (!x) return std::unexpected(x.error());
+        auto y = ensure_gpu(Y); if (!y) return std::unexpected(y.error());
+        auto bn = ensure_gpu(boundary); if (!bn) return std::unexpected(bn.error());
+        auto res = backend_.scan_suffix_outer_gpu(
+            d->gpu_tensor(), x->gpu_tensor(), y->gpu_tensor(),
+            static_cast<uint32_t>(dk), static_cast<uint32_t>(heads), causal,
+            bn->gpu_tensor(), has_bnd);
+        if (!res) return std::unexpected(res.error());
+        return Tensor::from_gpu(std::move(*res));
+    }
+
+    [[nodiscard]] Result<Tensor> outer_col(
+        const Tensor& P, const Tensor& R, const Tensor& S,
+        std::size_t dk, bool has_scale) override
+    {
+        auto p = ensure_gpu(P); if (!p) return std::unexpected(p.error());
+        auto r = ensure_gpu(R); if (!r) return std::unexpected(r.error());
+        auto s = ensure_gpu(S); if (!s) return std::unexpected(s.error());
+        auto res = backend_.outer_col_gpu(
+            p->gpu_tensor(), r->gpu_tensor(), s->gpu_tensor(),
+            static_cast<uint32_t>(dk), has_scale);
+        if (!res) return std::unexpected(res.error());
+        return Tensor::from_gpu(std::move(*res));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
     // 归约原语
     // ══════════════════════════════════════════════════════════════════════
 

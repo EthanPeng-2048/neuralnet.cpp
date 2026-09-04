@@ -1,0 +1,13 @@
+=== layer_bench (CPU, fwd+bwd) ===
+  linear         : fwd    0.257 ms        8.2 GFLOPS  |  train    4.322 ms        231 tok/s
+  swiglu         : fwd    0.044 ms        1.1 GFLOPS  |  train    0.079 ms      12594 tok/s
+  layernorm      : fwd   37.738 ms        0.1 GFLOPS  |  train   84.581 ms       6053 tok/s
+  rmsnorm        : fwd   22.483 ms        0.1 GFLOPS  |  train   54.923 ms       9322 tok/s
+  softmax        : fwd   37.387 ms        0.1 GFLOPS  |  train   57.362 ms         17 tok/s
+  mha            : fwd  583.805 ms        4.5 GFLOPS  |  train  865.634 ms        591 tok/s
+  causal_attn    : fwd  594.916 ms        4.4 GFLOPS  |  train  857.606 ms        597 tok/s
+  feedforward    : fwd   80.844 ms       59.8 GFLOPS  |  train  173.056 ms       2959 tok/s
+  transformer    : fwd  765.385 ms        9.7 GFLOPS  |  train 1221.014 ms        419 tok/s
+  gpt_block      : fwd  761.821 ms        9.8 GFLOPS  |  train 1213.469 ms        422 tok/s
+  conv2d         : fwd    1.392 ms        2.5 GFLOPS  |  train    3.272 ms        306 tok/s
+  maxpool        : fwd    0.011 ms        0.1 GFLOPS  |  train    0.015 ms      68493 tok/s

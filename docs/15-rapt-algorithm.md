@@ -155,3 +155,47 @@ def causal_rla_step(q_t, k_cache, v_cache, eps=1e-6):
 
 - **分块分母近似**：如果显式构建 \( L \times L \) 的 `attn_scores` 占用显存过大，可采用 **“分段累加”** 策略：将 Q/K 切成 Chunk，在 Chunk 内计算局部分母，再将分子累加。这能将显存占用从 \( O(L^2) \) 降为 \( O(L \cdot \text{chunk\_size}) \)，但会牺牲极少数全局精度。
 - **搭配滑动窗口**：若 \( L \) 极端长（>500K），可结合你的初始设想：用本算法做“粗筛（全局）”，再搭配局部滑动窗口做“细筛（局部）”，构成混合专家层。
+
+---
+
+## 7. 引擎化（GPU 扫描原语，2026-09-04 完成）
+
+### 7.1 三个扫描原语（`ComputeEngine`，`compute_engine.hpp`）
+
+`compute_layer_rapt.hpp` 的扫描计算全面引擎化：删除 `scan_forward_` / `scan_backward_` CPU 标量循环与 `forward_step` 逐 token PCIe 往返，改为 3 个 op-level 原语。RLA 算法（L2 归一分母 / ReLU 门控 / 梯度公式 / 文档重置策略）全部由 Layer 用原语 + 逐元素原语组合表达（铁律 3：shader 永不含算法）。
+
+| 原语 | 语义 | 输出 |
+|---|---|---|
+| `scan_prefix_outer(K,V,P,R,A0,B0,has_state,dk,heads,causal,boundary,has_bnd)` | causal=true：`A_t = A0 + Σ_{i≤t, 同文档} k_i·k_iᵀ`、`B_t = B0 + Σ v_i·k_iᵀ`（文档边界处运行态清零，A0/B0 仅首文档生效）；causal=false：全集常数 | `(B·H·5·dk, seq)` 行块：[0) B·P  [1) A·P  [2) Bᵀ·R  [3) s  [4) r |
+| `scan_suffix_outer(D,X,Y,dk,heads,causal,boundary,has_bnd)` | causal=true：`S_i = Σ_{t≥i, 同文档} D_t`（i+1 为文档起点时先清零）；causal=false：`S_i = D_i`（Layer 已把全集梯度沿 seq 广播） | `(B·H·3·dk, seq)`：[0) S·X  [1) S·Y  [2) Sᵀ·Y |
+| `outer_col(P,R,S,dk,has_scale)` | 逐列外积 `out = P·Rᵀ`（has_scale 时逐列乘 S[t]） | `(B·H·dk², seq)` |
+
+**形状约定**：batch-major（`i = b*seq+t`）；头 (b,h) 行块起点 `r0=(b*H+h)*dk`；K/V/P/R（X/Y）`(B·H·dk, seq)`，D `(B·H·dk², seq)`；A0/B0 `(H·dk, dk)`（B>1 按头循环）；boundary `(1, B·seq)`（1=文档起点）；空参数用 **(1,1) dummy + bool 标志**（规避 0 字节 GPU buffer）；**dk ≤ 64**（GPU MAX_DK）；标量块 s/r 在头块内 dk 行重复存放（实现写全部行，Layer 读任一行均可）。
+
+### 7.2 Layer 组合（算法在 Layer）
+
+- **forward**：`scan_prefix_outer(Kp, V, Qp, V, ·, ·, causal_, bnd, ·)` → slice 取 [0)BP、[3)s → `out = BP / sqrt(s + 1e-6)`（elementwise 原语链）→ rearrange → w_o。
+- **backward pass 1**：`scan_prefix_outer(Kp, V, Qp, gcr, ·, ·, causal_, bnd, ·)` → slice 取 AP/BTR/s/r → elementwise 链（denom/inv/gnum/ddenom→ds、t2=2·ds·Aq）→ `gQt = BTR·inv + t2`；`outer_col` 物化 `dA = ds·q·qᵀ`（has_scale=true，S=ds）、`dB = gnum·q`（has_scale=false）。
+- **backward pass 2**：`scan_suffix_outer(dA, Kp, V, ·, causal=true, bnd)`、`scan_suffix_outer(dB, ·)` → `gK = 2·(SA·K) + SBᵀ·V`、`gV = SB·K`。**双向分支**：`row_reduce_sum(dA/dB) → (BH·dk², 1)` → `broadcast_row_inplace` 沿 seq 广播 → `scan_suffix_outer(causal=false, dummy, false)`（shader 的 causal=0 分支即 S_i=D_i，D 已是全集梯度，等价全集后缀）。
+- **forward_step（推理逐 token）**：Q/K/V → RoPE → ReLU → `scan_prefix_outer(K1, V1, Q1, Q1, A_state, B_state, true, dk, H, causal, ·, false)`（**先扫描**，A0=旧状态）→ `batched_matmul`（k·kᵀ、v·kᵀ）→ `add_inplace` 更新状态（**后更新**）。
+
+### 7.3 引擎化中暴露的坑（改这段代码前必读）
+
+1. **forward_step 顺序 = 先扫描、后更新状态**：`causal=true, has_state=true` 的扫描语义**含自身**（A_t 含 k_t·k_tᵀ）；若 A0 已含当前 token 则双算。与旧 CPU 实现"先累积再用"等价的前提是 A0 为旧状态。
+2. **双向分支用 `row_reduce_sum`，不是 `col_reduce_sum`**：col 版返回 (1,C)；需要 (R,1)=(BH·dk²,1) 直接作 `broadcast_row_inplace` 的 row_vec（无需 transpose）。
+3. **CPU 参考实现 boundary 形状校验曾潜伏 bug**：写成 `(rows/dk)*seq`（=B·H·seq），契约是 `(1, B·seq)`（shader 索引 `Bnd[b*seq+t]` 亦证）。旧 Layer 从不走引擎路径所以从未暴露；Layer 引擎化后 doc-aware gradcheck 直接踩中，已修为 `(rows/(dk*heads))*seq`，并给 vk backend 三个 `*_gpu` 方法补同义校验。
+4. **标量块 s/r 头内逐行重复**（shader 写全部行），Layer 读任一行即可。
+
+### 7.4 验证基线（2026-09-04，GTX 850M）
+
+| 验证 | 结果 |
+|---|---|
+| `rapt_gradcheck`（CPU） | 14/14，max_err 与改造前基线逐位一致（causal 0.0290 / bidir kink 0.2554 / doc-aware 0.00868） |
+| `rapt_gradcheck --gpu` | 3 段全 OK，kink 值 0.102/0.252 符合预期，全部 ≪ tol 5e-2；batch>1 覆盖（铁律 5）由 causal / doc-aware 段保证（段内 batch=2 固定，无 --batch 参数） |
+| `rapt_smoke_test`（CPU） | KV-cache 一致性 max_diff=0（逐位一致） |
+| `rapt_smoke_test --gpu` | KV-cache 一致性 max_diff=2.98e-08（= float32 1 ulp：GPU 加法顺序与 CPU 不同，数值正确） |
+| `text_train --model rapt --gpu` | 106KB 语料 / 528 词表 / 319 步 / 1 epoch：loss 6.3→3.9，10.3s，无 TDR |
+| `text_infer --model rapt --gpu` | 16 token 生成 0.4s（39 tok/s）；forward_step GPU 录制路径（batched_matmul 状态更新 + has_state 扫描同 command buffer）验证通过 |
+| ctest 全量 | 31/31 全绿；AOT 收集仍 56 条融合表达式（手写原语不进融合注册表，闭合世界未破坏） |
+
+> 完整 handoff（设计决策、文件锚点、步骤指令）见 `docs/rapt-gpu-handoff.md`。

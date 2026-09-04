@@ -320,7 +320,10 @@ if(Vulkan_FOUND)
         broadcast
         transpose
         gather
-        scatter_add)
+        scatter_add
+        scan_prefix_outer
+        scan_suffix_outer
+        outer_col)
     # ── 融合 shader：构建期从 Layer 内联表达式自动合成 ───────────────
     # 表达式**文本只出现在 Layer**（compute / start_expr..end_expr）。
     # 构建期两步：

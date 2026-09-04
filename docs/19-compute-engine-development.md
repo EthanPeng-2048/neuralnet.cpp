@@ -269,6 +269,39 @@ engine.end_batch();  // 提交并等待
 
 **作用**：将多个逐元素操作合并为一次调用，减少临时张量
 
+### 11. 扫描级原语（RLA / RAPT）
+
+```cpp
+// 前缀扫描（RLA forward / backward pass 1 / forward_step）：
+//   causal=true : A_t = A0 + Σ_{i≤t, 同文档} k_i·k_i^T（文档边界处清零）
+//   causal=false: 全集常数（无边界重置）
+// 输出 (B·H·5·d_k, seq)：[0) B·P  [1) A·P  [2) B^T·R  [3) s  [4) r
+[[nodiscard]] virtual Result<Tensor> scan_prefix_outer(
+    const Tensor& K, const Tensor& V, const Tensor& P, const Tensor& R,
+    const Tensor& A0, const Tensor& B0, bool has_state,
+    std::size_t dk, std::size_t heads, bool causal,
+    const Tensor& boundary, bool has_bnd) = 0;
+
+// 后缀扫描（RLA backward pass 2）：
+//   causal=true : S_i = Σ_{t≥i, 同文档} D_t
+//   causal=false: S_i = D_i（Layer 已把全集梯度沿 seq 广播）
+// 输出 (B·H·3·d_k, seq)：[0) S·X  [1) S·Y  [2) S^T·Y
+[[nodiscard]] virtual Result<Tensor> scan_suffix_outer(
+    const Tensor& D, const Tensor& X, const Tensor& Y,
+    std::size_t dk, std::size_t heads, bool causal,
+    const Tensor& boundary, bool has_bnd) = 0;
+
+// 逐列外积（RLA backward 物化 dL/dA、dL/dB）：
+// 输出 (B·H·d_k², seq)：out = P·R^T（has_scale 时逐列乘 S[t]）
+[[nodiscard]] virtual Result<Tensor> outer_col(
+    const Tensor& P, const Tensor& R, const Tensor& S,
+    std::size_t dk, bool has_scale) = 0;
+```
+
+**形状约定**：batch-major `i = b*seq+t`；头 (b,h) 行块起点 `r0=(b*H+h)*d_k`；K/V/P/R（X/Y）`(B·H·d_k, seq)`、D `(B·H·d_k², seq)`、A0/B0 `(H·d_k, d_k)`；boundary `(1, B·seq)`（1=文档起点）；空参数用 (1,1) dummy + bool 标志（规避 0 字节 GPU buffer）；`d_k ≤ 64`（GPU MAX_DK）；标量块 s/r 头内逐行重复（实现写全部行，调用方读任一行）。
+
+**使用方**：`ReLULinearAttention`（RAPT 层）——shader 只含"带状态的顺序归约 + matvec 读出 / 外积"，算法（L2 分母 / ReLU 门控 / 梯度公式 / 文档重置）全部由 Layer 用原语组合表达（`docs/15-rapt-algorithm.md` §7）。
+
 ---
 
 ## 🖥️ CPU 引擎实现

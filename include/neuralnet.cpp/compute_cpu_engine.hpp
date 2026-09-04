@@ -504,6 +504,303 @@ public:
     }
 
     // ══════════════════════════════════════════════════════════════════════
+    // 扫描级原语（RLA：带状态的顺序归约 + matvec 读出）
+    //
+    // CPU 参考实现（逐头标量循环；顺序归约本质串行，t 维递推无并行切分
+    // 空间）。加法/累加顺序与原 RLA 层静态实现（scan_forward_/
+    // scan_backward_）逐位一致——引擎化后 gradcheck 行为不变。
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── 前缀扫描（forward / backward pass 1 / forward_step）──────────────
+    [[nodiscard]] Result<Tensor> scan_prefix_outer(
+        const Tensor& K, const Tensor& V, const Tensor& P, const Tensor& R,
+        const Tensor& A0, const Tensor& B0, bool has_state,
+        std::size_t dk, std::size_t heads, bool causal,
+        const Tensor& boundary, bool has_bnd) override
+    {
+        for (const auto& t : {K, V, P, R, A0, B0, boundary})
+            if (t.is_gpu())
+                return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+        if (dk == 0 || heads == 0)
+            return std::unexpected(Error{"scan_prefix_outer: dk/heads must be > 0"});
+
+        const Matrix& Km = K.cpu_matrix();
+        const std::size_t rows = Km.rows();
+        const std::size_t seq  = Km.cols();
+        if (rows % (dk * heads) != 0)
+            return std::unexpected(Error{"scan_prefix_outer: K rows not divisible by H*dk"});
+        for (const auto* m : {&V.cpu_matrix(), &P.cpu_matrix(), &R.cpu_matrix()})
+            if (m->rows() != rows || m->cols() != seq)
+                return std::unexpected(Error{"scan_prefix_outer: K/V/P/R shape mismatch"});
+        if (has_state)
+        {
+            if (A0.cpu_matrix().rows() != heads * dk || A0.cpu_matrix().cols() != dk ||
+                B0.cpu_matrix().rows() != heads * dk || B0.cpu_matrix().cols() != dk)
+                return std::unexpected(Error{"scan_prefix_outer: A0/B0 must be (H*dk, dk)"});
+        }
+        if (has_bnd)
+        {
+            const Matrix& bd = boundary.cpu_matrix();
+            if (bd.rows() != 1 || bd.cols() != (rows / (dk * heads)) * seq)
+                return std::unexpected(Error{"scan_prefix_outer: boundary must be (1, B*seq)"});
+        }
+
+        const std::size_t BH = rows / dk;
+        const Matrix& Vm = V.cpu_matrix();
+        const Matrix& Pm = P.cpu_matrix();
+        const Matrix& Rm = R.cpu_matrix();
+        const Matrix& bdm = boundary.cpu_matrix();
+
+        Matrix out(rows * 5, seq);
+        auto out_s = out.span();
+        for (std::size_t bh = 0; bh < BH; ++bh)
+        {
+            const std::size_t r0 = bh * dk;
+            const std::size_t batch = bh / heads;
+            const std::size_t h     = bh % heads;
+            const auto doc_reset = [bdm, batch, seq, has_bnd](std::size_t t) {
+                return has_bnd && bdm.at_unchecked(0, batch * seq + t) != Scalar{0};
+            };
+
+            std::vector<Scalar> A(dk * dk, Scalar{0}), B(dk * dk, Scalar{0}),
+                                qv(dk), kv(dk), vv(dk), num(dk), Aq(dk);
+            if (has_state)
+            {
+                const Matrix& a0m = A0.cpu_matrix();
+                const Matrix& b0m = B0.cpu_matrix();
+                for (std::size_t a = 0; a < dk; ++a)
+                    for (std::size_t b2 = 0; b2 < dk; ++b2)
+                    {
+                        A[a * dk + b2] = a0m.at_unchecked(h * dk + a, b2);
+                        B[a * dk + b2] = b0m.at_unchecked(h * dk + a, b2);
+                    }
+            }
+            if (!causal)  // 双向：先求全集 A, B
+            {
+                for (std::size_t t = 0; t < seq; ++t)
+                {
+                    for (std::size_t j = 0; j < dk; ++j)
+                    {
+                        kv[j] = Km.at_unchecked(r0 + j, t);
+                        vv[j] = Vm.at_unchecked(r0 + j, t);
+                    }
+                    for (std::size_t i = 0; i < dk; ++i)
+                        for (std::size_t j = 0; j < dk; ++j)
+                        {
+                            A[i * dk + j] += kv[i] * kv[j];
+                            B[i * dk + j] += vv[i] * kv[j];
+                        }
+                }
+            }
+            for (std::size_t t = 0; t < seq; ++t)
+            {
+                for (std::size_t j = 0; j < dk; ++j)
+                {
+                    qv[j] = Pm.at_unchecked(r0 + j, t);
+                    kv[j] = Km.at_unchecked(r0 + j, t);
+                    vv[j] = Vm.at_unchecked(r0 + j, t);
+                }
+                if (causal)  // 前缀和含自身 i<=t；文档边界处重置
+                {
+                    if (doc_reset(t))
+                    {
+                        std::fill(A.begin(), A.end(), Scalar{0});
+                        std::fill(B.begin(), B.end(), Scalar{0});
+                    }
+                    for (std::size_t i = 0; i < dk; ++i)
+                        for (std::size_t j = 0; j < dk; ++j)
+                        {
+                            A[i * dk + j] += kv[i] * kv[j];
+                            B[i * dk + j] += vv[i] * kv[j];
+                        }
+                }
+                // num = B·qv；Aq = A·qv
+                for (std::size_t i = 0; i < dk; ++i)
+                {
+                    Scalar acc{0}, acc2{0};
+                    for (std::size_t j = 0; j < dk; ++j)
+                    {
+                        acc  += B[i * dk + j] * qv[j];
+                        acc2 += A[i * dk + j] * qv[j];
+                    }
+                    num[i] = acc;
+                    Aq[i]  = acc2;
+                }
+                Scalar s{0};
+                for (std::size_t j = 0; j < dk; ++j)
+                    s += qv[j] * Aq[j];
+
+                const std::size_t row0 = bh * dk;
+                for (std::size_t i = 0; i < dk; ++i)
+                {
+                    // [0) B·P
+                    out_s[(row0 + i) * seq + t] = num[i];
+                    // [1) A·P
+                    out_s[(rows + row0 + i) * seq + t] = Aq[i];
+                    // [3) s（头内逐行重复）
+                    out_s[(3 * rows + row0 + i) * seq + t] = s;
+                }
+                // [2) B^T·R：(B^T·Rv)[j] = Σ_i B[i,j]·Rv[i]
+                for (std::size_t j = 0; j < dk; ++j)
+                {
+                    Scalar acc{0};
+                    for (std::size_t i = 0; i < dk; ++i)
+                        acc += B[i * dk + j] * Rm.at_unchecked(r0 + i, t);
+                    out_s[(2 * rows + row0 + j) * seq + t] = acc;
+                }
+                // [4) r = R·(B·P)：r = Σ_j Rv[j]·num[j]（头内逐行重复）
+                Scalar r{0};
+                for (std::size_t j = 0; j < dk; ++j)
+                    r += Rm.at_unchecked(r0 + j, t) * num[j];
+                for (std::size_t i = 0; i < dk; ++i)
+                    out_s[(4 * rows + row0 + i) * seq + t] = r;
+            }
+        }
+        return Tensor::from_matrix(std::move(out));
+    }
+
+    // ── 后缀扫描（backward pass 2：gK/gV）────────────────────────────────
+    [[nodiscard]] Result<Tensor> scan_suffix_outer(
+        const Tensor& D, const Tensor& X, const Tensor& Y,
+        std::size_t dk, std::size_t heads, bool causal,
+        const Tensor& boundary, bool has_bnd) override
+    {
+        for (const auto& t : {D, X, Y, boundary})
+            if (t.is_gpu())
+                return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+        if (dk == 0 || heads == 0)
+            return std::unexpected(Error{"scan_suffix_outer: dk/heads must be > 0"});
+
+        const Matrix& Xm = X.cpu_matrix();
+        const std::size_t rows = Xm.rows();
+        const std::size_t seq  = Xm.cols();
+        if (rows % (dk * heads) != 0)
+            return std::unexpected(Error{"scan_suffix_outer: X rows not divisible by H*dk"});
+        const Matrix& Dm = D.cpu_matrix();
+        if (Dm.rows() != rows * dk || Dm.cols() != seq)
+            return std::unexpected(Error{"scan_suffix_outer: D must be (B*H*dk*dk, seq)"});
+        if (Y.cpu_matrix().rows() != rows || Y.cpu_matrix().cols() != seq)
+            return std::unexpected(Error{"scan_suffix_outer: X/Y shape mismatch"});
+        if (has_bnd)
+        {
+            const Matrix& bd = boundary.cpu_matrix();
+            if (bd.rows() != 1 || bd.cols() != (rows / (dk * heads)) * seq)
+                return std::unexpected(Error{"scan_suffix_outer: boundary must be (1, B*seq)"});
+        }
+
+        const std::size_t BH = rows / dk;
+        const Matrix& Ym = Y.cpu_matrix();
+        const Matrix& bdm = boundary.cpu_matrix();
+
+        Matrix out(rows * 3, seq);
+        auto out_s = out.span();
+        for (std::size_t bh = 0; bh < BH; ++bh)
+        {
+            const std::size_t r0 = bh * dk;
+            const std::size_t dbase = bh * dk * dk;
+            const std::size_t batch = bh / heads;
+            const auto doc_reset = [bdm, batch, seq, has_bnd](std::size_t t) {
+                return has_bnd && bdm.at_unchecked(0, batch * seq + t) != Scalar{0};
+            };
+
+            std::vector<Scalar> S(dk * dk, Scalar{0}), xv(dk), yv(dk);
+            for (std::size_t i = seq; i-- > 0;)
+            {
+                if (causal)
+                {
+                    // 后缀和：S = Σ_{t>=i} D_t；跨入前一文档时重置
+                    if (i + 1 < seq && doc_reset(i + 1))
+                        std::fill(S.begin(), S.end(), Scalar{0});
+                    for (std::size_t idx = 0; idx < dk * dk; ++idx)
+                        S[idx] += Dm.at_unchecked(dbase + idx, i);
+                }
+                else
+                {
+                    // 双向：S_i = D_i（Layer 已把全集梯度广播到每一列）
+                    for (std::size_t idx = 0; idx < dk * dk; ++idx)
+                        S[idx] = Dm.at_unchecked(dbase + idx, i);
+                }
+                for (std::size_t j = 0; j < dk; ++j)
+                {
+                    xv[j] = Xm.at_unchecked(r0 + j, i);
+                    yv[j] = Ym.at_unchecked(r0 + j, i);
+                }
+                const std::size_t row0 = bh * dk;
+                for (std::size_t r = 0; r < dk; ++r)
+                {
+                    // [0) S·X：(S·xv)[r] = Σ_c S[r,c]·xv[c]
+                    // [1) S·Y
+                    Scalar sx{0}, sy{0};
+                    for (std::size_t c = 0; c < dk; ++c)
+                    {
+                        sx += S[r * dk + c] * xv[c];
+                        sy += S[r * dk + c] * yv[c];
+                    }
+                    out_s[(row0 + r) * seq + i] = sx;
+                    out_s[(rows + row0 + r) * seq + i] = sy;
+                }
+                // [2) S^T·Y：(S^T·yv)[c] = Σ_r S[r,c]·yv[r]
+                for (std::size_t c = 0; c < dk; ++c)
+                {
+                    Scalar syt{0};
+                    for (std::size_t r = 0; r < dk; ++r)
+                        syt += S[r * dk + c] * yv[r];
+                    out_s[(2 * rows + row0 + c) * seq + i] = syt;
+                }
+            }
+        }
+        return Tensor::from_matrix(std::move(out));
+    }
+
+    // ── 逐列外积（backward 的 dL/dA、dL/dB 物化）─────────────────────────
+    [[nodiscard]] Result<Tensor> outer_col(
+        const Tensor& P, const Tensor& R, const Tensor& S,
+        std::size_t dk, bool has_scale) override
+    {
+        for (const auto& t : {P, R, S})
+            if (t.is_gpu())
+                return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+        if (dk == 0)
+            return std::unexpected(Error{"outer_col: dk must be > 0"});
+
+        const Matrix& Pm = P.cpu_matrix();
+        const std::size_t rows = Pm.rows();
+        const std::size_t seq  = Pm.cols();
+        if (rows % dk != 0)
+            return std::unexpected(Error{"outer_col: rows not divisible by dk"});
+        if (R.cpu_matrix().rows() != rows || R.cpu_matrix().cols() != seq)
+            return std::unexpected(Error{"outer_col: P/R shape mismatch"});
+        if (has_scale &&
+            (S.cpu_matrix().rows() != rows || S.cpu_matrix().cols() != seq))
+            return std::unexpected(Error{"outer_col: S must be (B*H*dk, seq)"});
+
+        const Matrix& Rm = R.cpu_matrix();
+        const Matrix& Sm = S.cpu_matrix();
+
+        Matrix out(rows * dk, seq);
+        auto out_s = out.span();
+        for (std::size_t bh = 0; bh < rows / dk; ++bh)
+        {
+            const std::size_t r0 = bh * dk;
+            const std::size_t obase = bh * dk * dk;
+            for (std::size_t t = 0; t < seq; ++t)
+            {
+                const Scalar sv = has_scale ? Sm.at_unchecked(r0, t) : Scalar{1};
+                for (std::size_t a = 0; a < dk; ++a)
+                {
+                    const Scalar pa = Pm.at_unchecked(r0 + a, t);
+                    for (std::size_t b2 = 0; b2 < dk; ++b2)
+                    {
+                        const Scalar p = pa * Rm.at_unchecked(r0 + b2, t);
+                        out_s[(obase + a * dk + b2) * seq + t] = has_scale ? p * sv : p;
+                    }
+                }
+            }
+        }
+        return Tensor::from_matrix(std::move(out));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
     // 归约原语
     // ══════════════════════════════════════════════════════════════════════
 

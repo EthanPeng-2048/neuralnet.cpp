@@ -95,6 +95,21 @@
 #define NN_SCATTER_ADD_SPV_EMBEDDED
 #endif
 
+#if __has_include("scan_prefix_outer_spv.hpp")
+#include "scan_prefix_outer_spv.hpp"
+#define NN_SCAN_PREFIX_OUTER_SPV_EMBEDDED
+#endif
+
+#if __has_include("scan_suffix_outer_spv.hpp")
+#include "scan_suffix_outer_spv.hpp"
+#define NN_SCAN_SUFFIX_OUTER_SPV_EMBEDDED
+#endif
+
+#if __has_include("outer_col_spv.hpp")
+#include "outer_col_spv.hpp"
+#define NN_OUTER_COL_SPV_EMBEDDED
+#endif
+
 // AOT 融合 shader 注册表（构建期 scan_exprs 收集 + gen_fused 合成；表达式
 // 只出现在 Layer，本表是折叠后的派生物）。运行时按 expr_spec_key 匹配 dispatch。
 #if __has_include("fused_registry.hpp")
@@ -330,6 +345,10 @@ private:
     VulkanPipeline transpose_pipeline_;
     VulkanPipeline gather_pipeline_;
     VulkanPipeline scatter_add_pipeline_;
+    // RLA 扫描原语（手写原语，不进 AOT 融合注册表；铁律 3：shader 不含算法）
+    VulkanPipeline scan_prefix_outer_pipeline_;
+    VulkanPipeline scan_suffix_outer_pipeline_;
+    VulkanPipeline outer_col_pipeline_;
     // AOT 融合 shader pipelines（key = expr_spec_key → pipeline；由构建期
     // fused_registry.hpp 注册，运行时按 key 匹配后直接 dispatch）
     std::unordered_map<std::string, VulkanPipeline> fused_pipelines_;
@@ -481,6 +500,36 @@ private:
     {
 #ifdef NN_SCATTER_ADD_SPV_EMBEDDED
         return nn_scatter_add_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_scan_prefix_outer_spirv()
+    {
+#ifdef NN_SCAN_PREFIX_OUTER_SPV_EMBEDDED
+        return nn_scan_prefix_outer_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_scan_suffix_outer_spirv()
+    {
+#ifdef NN_SCAN_SUFFIX_OUTER_SPV_EMBEDDED
+        return nn_scan_suffix_outer_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_outer_col_spirv()
+    {
+#ifdef NN_OUTER_COL_SPV_EMBEDDED
+        return nn_outer_col_spirv_bytecode();
 #else
         static const std::vector<uint32_t> empty;
         return empty;
@@ -720,6 +769,32 @@ public:
                 scatter_add_pipeline_ = std::move(*sp_r);
         }
 
+        // 16. 创建 RLA 扫描原语 pipelines（手写原语，不进融合注册表）
+        const auto& spf_spirv = get_scan_prefix_outer_spirv();
+        if (!spf_spirv.empty())
+        {
+            auto spf_r = VulkanPipeline::create_generic(
+                device_.device(), spf_spirv, 8, 7 * sizeof(uint32_t));
+            if (spf_r)
+                scan_prefix_outer_pipeline_ = std::move(*spf_r);
+        }
+        const auto& sfs_spirv = get_scan_suffix_outer_spirv();
+        if (!sfs_spirv.empty())
+        {
+            auto sfs_r = VulkanPipeline::create_generic(
+                device_.device(), sfs_spirv, 5, 6 * sizeof(uint32_t));
+            if (sfs_r)
+                scan_suffix_outer_pipeline_ = std::move(*sfs_r);
+        }
+        const auto& oc_spirv = get_outer_col_spirv();
+        if (!oc_spirv.empty())
+        {
+            auto oc_r = VulkanPipeline::create_generic(
+                device_.device(), oc_spirv, 4, 4 * sizeof(uint32_t));
+            if (oc_r)
+                outer_col_pipeline_ = std::move(*oc_r);
+        }
+
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
         // 16. 注册 AOT 融合 shader pipelines（构建期 scan_exprs 收集 +
         //     gen_fused 合成；每个条目：N 输入 + 1 输出 binding；
@@ -770,6 +845,9 @@ public:
     [[nodiscard]] bool has_transpose_pipeline() const noexcept { return transpose_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_gather_pipeline() const noexcept { return gather_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_scatter_add_pipeline() const noexcept { return scatter_add_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_scan_prefix_outer_pipeline() const noexcept { return scan_prefix_outer_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_scan_suffix_outer_pipeline() const noexcept { return scan_suffix_outer_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_outer_col_pipeline() const noexcept { return outer_col_pipeline_.handle() != VK_NULL_HANDLE; }
 
     [[nodiscard]] VulkanDevice& device() noexcept { return device_; }
     [[nodiscard]] MemoryPool& memory_pool() noexcept { return *memory_pool_; }
@@ -1569,6 +1647,139 @@ public:
         std::vector<GpuTensor> inputs{A, B};
         auto r = dispatch_compute(batched_matmul_pipeline_, inputs, C, pc,
             (N + BN - 1) / BN, (M + BM - 1) / BM, batch);
+        if (!r)
+            return std::unexpected(r.error());
+        return C;
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // RLA 扫描原语（手写原语，形状契约见 compute_engine.hpp 扫描级原语注释）
+    // 1 workgroup/头：dispatch (1, B*H, 1)；标量块在头块内逐行重复存放
+    // ══════════════════════════════════════════════════════════════════
+
+    // ── 前缀扫描 + matvec 读出：输出 (rows*5, seq) ─────────────────────
+    [[nodiscard]] Result<GpuTensor> scan_prefix_outer_gpu(
+        const GpuTensor& K, const GpuTensor& V, const GpuTensor& P, const GpuTensor& R,
+        const GpuTensor& A0, const GpuTensor& B0, bool has_state,
+        uint32_t dk, uint32_t heads, bool causal,
+        const GpuTensor& boundary, bool has_bnd)
+    {
+        if (!initialized_)
+            return std::unexpected(Error{"GPU backend not initialized"});
+        if (!has_scan_prefix_outer_pipeline())
+            return std::unexpected(Error{"scan_prefix_outer_gpu: pipeline not available"});
+        if (dk == 0u || heads == 0u)
+            return std::unexpected(Error{"scan_prefix_outer_gpu: dk/heads must be > 0"});
+        if (dk > 64u)
+            return std::unexpected(Error{"scan_prefix_outer_gpu: d_k > 64 not supported"});
+        const auto rows = static_cast<uint32_t>(K.rows());
+        if (rows % (dk * heads) != 0)
+            return std::unexpected(Error{"scan_prefix_outer_gpu: rows not divisible by H*dk"});
+        if (V.rows() != rows || V.cols() != K.cols() ||
+            P.rows() != rows || P.cols() != K.cols() ||
+            R.rows() != rows || R.cols() != K.cols())
+            return std::unexpected(Error{"scan_prefix_outer_gpu: K/V/P/R shape mismatch"});
+        if (has_state && (A0.rows() != heads * dk || A0.cols() != dk ||
+                          B0.rows() != heads * dk || B0.cols() != dk))
+            return std::unexpected(Error{"scan_prefix_outer_gpu: A0/B0 must be (H*dk, dk)"});
+        const auto seq = static_cast<uint32_t>(K.cols());
+        if (has_bnd)
+        {
+            if (boundary.rows() != 1 || boundary.cols() != (rows / (dk * heads)) * seq)
+                return std::unexpected(Error{"scan_prefix_outer_gpu: boundary must be (1, B*seq)"});
+        }
+        const auto BH = rows / dk;
+        auto C_res = GpuTensor::create_empty(static_cast<std::size_t>(rows) * 5, seq, *this);
+        if (!C_res)
+            return std::unexpected(C_res.error());
+        GpuTensor C = std::move(*C_res);
+        struct PushPrefix { uint32_t dk, heads, seq, causal, has_state, has_bnd, rows; };
+        PushPrefix push{dk, heads, seq, causal ? 1u : 0u, has_state ? 1u : 0u,
+                        has_bnd ? 1u : 0u, rows};
+        std::vector<std::uint8_t> pc(sizeof(push));
+        std::memcpy(pc.data(), &push, sizeof(push));
+        std::vector<GpuTensor> inputs{K, V, P, R, A0, B0, boundary};
+        auto r = dispatch_compute(scan_prefix_outer_pipeline_, inputs, C, pc, 1u, BH, 1u);
+        if (!r)
+            return std::unexpected(r.error());
+        return C;
+    }
+
+    // ── 后缀扫描 + matvec 读出：输出 (rows*3, seq) ─────────────────────
+    [[nodiscard]] Result<GpuTensor> scan_suffix_outer_gpu(
+        const GpuTensor& D, const GpuTensor& X, const GpuTensor& Y,
+        uint32_t dk, uint32_t heads, bool causal,
+        const GpuTensor& boundary, bool has_bnd)
+    {
+        if (!initialized_)
+            return std::unexpected(Error{"GPU backend not initialized"});
+        if (!has_scan_suffix_outer_pipeline())
+            return std::unexpected(Error{"scan_suffix_outer_gpu: pipeline not available"});
+        if (dk == 0u || heads == 0u)
+            return std::unexpected(Error{"scan_suffix_outer_gpu: dk/heads must be > 0"});
+        if (dk > 64u)
+            return std::unexpected(Error{"scan_suffix_outer_gpu: d_k > 64 not supported"});
+        const auto rows = static_cast<uint32_t>(X.rows());
+        if (rows % (dk * heads) != 0)
+            return std::unexpected(Error{"scan_suffix_outer_gpu: X rows not divisible by H*dk"});
+        if (D.rows() != rows * dk || D.cols() != X.cols() ||
+            Y.rows() != rows || Y.cols() != X.cols())
+            return std::unexpected(Error{"scan_suffix_outer_gpu: D/X/Y shape mismatch"});
+        const auto seq = static_cast<uint32_t>(X.cols());
+        if (has_bnd)
+        {
+            if (boundary.rows() != 1 || boundary.cols() != (rows / (dk * heads)) * seq)
+                return std::unexpected(Error{"scan_suffix_outer_gpu: boundary must be (1, B*seq)"});
+        }
+        const auto BH = rows / dk;
+        auto C_res = GpuTensor::create_empty(static_cast<std::size_t>(rows) * 3, seq, *this);
+        if (!C_res)
+            return std::unexpected(C_res.error());
+        GpuTensor C = std::move(*C_res);
+        struct PushSuffix { uint32_t dk, heads, seq, causal, has_bnd, rows; };
+        PushSuffix push{dk, heads, seq, causal ? 1u : 0u, has_bnd ? 1u : 0u, rows};
+        std::vector<std::uint8_t> pc(sizeof(push));
+        std::memcpy(pc.data(), &push, sizeof(push));
+        std::vector<GpuTensor> inputs{D, X, Y, boundary};
+        auto r = dispatch_compute(scan_suffix_outer_pipeline_, inputs, C, pc, 1u, BH, 1u);
+        if (!r)
+            return std::unexpected(r.error());
+        return C;
+    }
+
+    // ── 逐列外积：输出 (rows*dk, seq) ──────────────────────────────────
+    [[nodiscard]] Result<GpuTensor> outer_col_gpu(
+        const GpuTensor& P, const GpuTensor& R, const GpuTensor& S,
+        uint32_t dk, bool has_scale)
+    {
+        if (!initialized_)
+            return std::unexpected(Error{"GPU backend not initialized"});
+        if (!has_outer_col_pipeline())
+            return std::unexpected(Error{"outer_col_gpu: pipeline not available"});
+        if (dk == 0u)
+            return std::unexpected(Error{"outer_col_gpu: dk must be > 0"});
+        if (dk > 64u)
+            return std::unexpected(Error{"outer_col_gpu: d_k > 64 not supported"});
+        const auto rows = static_cast<uint32_t>(P.rows());
+        if (rows % dk != 0)
+            return std::unexpected(Error{"outer_col_gpu: rows not divisible by dk"});
+        if (R.rows() != rows || R.cols() != P.cols())
+            return std::unexpected(Error{"outer_col_gpu: P/R shape mismatch"});
+        if (has_scale && (S.rows() != rows || S.cols() != P.cols()))
+            return std::unexpected(Error{"outer_col_gpu: S must be (B*H*dk, seq)"});
+        const auto seq = static_cast<uint32_t>(P.cols());
+        auto C_res = GpuTensor::create_empty(static_cast<std::size_t>(rows) * dk, seq, *this);
+        if (!C_res)
+            return std::unexpected(C_res.error());
+        GpuTensor C = std::move(*C_res);
+        struct PushOuter { uint32_t dk, seq, rows, has_scale; };
+        PushOuter push{dk, seq, rows, has_scale ? 1u : 0u};
+        std::vector<std::uint8_t> pc(sizeof(push));
+        std::memcpy(pc.data(), &push, sizeof(push));
+        std::vector<GpuTensor> inputs{P, R, S};
+        const auto total = static_cast<uint32_t>(rows) * dk * seq;
+        auto r = dispatch_compute(outer_col_pipeline_, inputs, C, pc,
+            (total + 255u) / 256u, 1u, 1u);
         if (!r)
             return std::unexpected(r.error());
         return C;

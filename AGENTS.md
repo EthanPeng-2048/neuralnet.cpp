@@ -120,6 +120,7 @@ Matrix → engine.from_matrix → Tensor[GPU] → forward/loss/optimizer 全程�
 | 广播级 | `broadcast_row/col_inplace` |
 | 逐元素 | `elementwise_unary/binary/binary_scalar` |
 | 数据操作 | `slice_rows/insert_rows/gather_rows/scatter_add_rows/rearrange_3d/clone` |
+| 扫描级 | `scan_prefix_outer/scan_suffix_outer/outer_col`（RLA/RAPT，dk≤64，见 docs/15 §7） |
 | 批控制 | `begin_batch/end_batch`（CPU no-op，GPU 录 command buffer） |
 
 ### 4.4 理解优先级（建议学习顺序）
