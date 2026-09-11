@@ -2,12 +2,14 @@
 #define LOSS_HPP
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
-#include <neuralnet.cpp/nn_config.hpp>
-#include <neuralnet.cpp/matrix.hpp>
+#include "nn_config.hpp"
+#include "matrix.hpp"
 
 namespace nn
 {
@@ -38,11 +40,10 @@ namespace nn
                 throw std::invalid_argument("mse loss cannot be computed on an empty matrix");
             }
 
-            grad_input_ = Matrix(pred.rows(), pred.cols());
+            grad_input_.resize(pred.rows(), pred.cols());
             const auto total = static_cast<double>(pred.size());
 
-            const double sum_sq = std::transform_reduce(
-                NN_EXEC_POLICY,
+            const double sum_sq = SmartPolicy::transform_reduce(
                 pred.data().begin(), pred.data().end(),
                 target.data().begin(),
                 0.0,
@@ -56,8 +57,7 @@ namespace nn
             const double loss = sum_sq / total;
             const double factor = 2.0 / total;
 
-            std::transform(NN_EXEC_POLICY,
-                           pred.data().begin(), pred.data().end(),
+            SmartPolicy::transform(pred.data().begin(), pred.data().end(),
                            target.data().begin(),
                            grad_input_.data().begin(),
                            [factor](double prediction, double actual) noexcept
@@ -97,9 +97,17 @@ namespace nn
                     if (val > max_val) max_val = val;
                 }
                 
-                // 预分配 exp_vals 避免重复分配
-                std::array<double, 128> exp_vals_storage{}; // 栈上分配，支持最多 128 类
-                double* exp_vals = exp_vals_storage.data();
+                // 栈上分配 exp_vals，支持最多 128 类
+                // 超过 128 类时改用 vector（非热路径，开销可接受）
+                std::array<double, 128> exp_vals_fixed{};
+                std::vector<double> exp_vals_heap;
+                std::span<double> exp_vals;
+                if (classes <= 128) {
+                    exp_vals = exp_vals_fixed;
+                } else {
+                    exp_vals_heap.resize(classes);
+                    exp_vals = exp_vals_heap;
+                }
                 
                 double sum_exp = 0.0;
                 for (std::size_t c = 0; c < classes; ++c)

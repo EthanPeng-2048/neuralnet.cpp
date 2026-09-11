@@ -6,8 +6,8 @@
 #include <stdexcept>
 #include <vector>
 
-#include <neuralnet.cpp/nn_config.hpp>
-#include <neuralnet.cpp/layer.hpp>
+#include "nn_config.hpp"
+#include "layer.hpp"
 
 namespace nn
 {
