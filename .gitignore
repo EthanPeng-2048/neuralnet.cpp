@@ -1,4 +1,3 @@
-```
 # ==================== Build ====================
 build*/
 *.o
@@ -30,6 +29,7 @@ CMakeUserPresets.json
 pretrained/
 
 # ==================== Tokenizer / 词表 (训练产物) ====================
+*.tokcache
 gpt_bpe*.json
 gpt_bpe_torch*.json
 gpt_Bytezip*.json
@@ -93,4 +93,3 @@ htmlcov/
 .DS_Store
 Thumbs.db
 desktop.ini
-```

@@ -14,7 +14,7 @@
 #include <cstddef>
 #include <span>
 
-#include "config.hpp"
+#include "core_config.hpp"
 #include "algebra_expr.hpp"
 
 namespace nn

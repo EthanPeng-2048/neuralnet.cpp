@@ -27,7 +27,8 @@
 
 #include "compute_engine.hpp"
 #include "compute_layer.hpp"  // clone_tensor
-#include "tensor.hpp"
+#include "compute_tensor.hpp"
+#include "expr_dsl.hpp"
 
 namespace nn
 {
@@ -56,19 +57,15 @@ protected:
     }
 
     // 为每个参数创建同形状的零初始化 Tensor（供 Momentum/Adam/Muon 复用）
-    // TODO(1.1, S2): 本方法及各 Layer 构造函数/LayerNorm/RMSNorm 构造器/RoPE::rebuild
-    //   中的 `NN_ASSERT(<Result>, ...)` 在 Release(NDEBUG) 下会吞掉引擎错误。
-    //   正确做法（符合项目 Result/expected 规范）：把这些 void/构造函数改为返回
-    //   Result，并将 `NN_ASSERT(r, ...)` 改为 `if (!r) return std::unexpected(r.error());`
-    //   （或前置条件用 NN_REQUIRE）。因属签名级重构，1.0.0 暂缓。
-    std::vector<Tensor> create_zero_buffers_() const
+    [[nodiscard]] Result<std::vector<Tensor>> create_zero_buffers_() const
     {
         std::vector<Tensor> buffers;
         buffers.reserve(params_.size());
         for (auto& p : params_)
         {
             auto buf = engine_.create_tensor(p.get().rows(), p.get().cols());
-            { auto r = engine_.zero(buf); NN_ASSERT(r, r ? "" : r.error().message.c_str()); }
+            auto r = engine_.zero(buf);
+            if (!r) return std::unexpected(r.error());
             buffers.push_back(std::move(buf));
         }
         return buffers;
@@ -104,7 +101,8 @@ public:
         {
             auto& g = g_ref.get();
             // g² = g * g（逐元素乘法）
-            auto g_sq_r = engine_.elementwise_binary(BinaryOp::Mul, g, g);
+            auto g_sq_r = dsl::compute(engine_, dsl::leaf(g) * dsl::leaf(g),
+                                       g.rows(), g.cols());
             if (!g_sq_r) return std::unexpected(g_sq_r.error());
             // 按行求和 → (rows, 1)
             auto row_sums_r = engine_.row_reduce_sum(*g_sq_r);
@@ -115,7 +113,8 @@ public:
 
             if (acc.valid())
             {
-                auto sum_r = engine_.elementwise_binary(BinaryOp::Add, acc, *col_sum_r);
+                auto sum_r = dsl::compute(engine_, dsl::leaf(acc) + dsl::leaf(*col_sum_r),
+                                          acc.rows(), acc.cols());
                 if (!sum_r) return std::unexpected(sum_r.error());
                 acc = std::move(*sum_r);
             }
@@ -206,8 +205,17 @@ public:
                      std::vector<TensorRef> grads,
                      Scalar lr, Scalar beta = 0.9)
         : Optimizer(engine, std::move(params), std::move(grads)),
-          lr_(lr), beta_(beta),
-          velocities_(create_zero_buffers_()) {}
+          lr_(lr), beta_(beta)
+    {
+        auto v_r = create_zero_buffers_();
+        if (!v_r)
+        {
+            std::fprintf(stderr, "SGDWithMomentum init failed: %s\n",
+                         v_r.error().message.c_str());
+            std::abort();
+        }
+        velocities_ = std::move(*v_r);
+    }
 
     void set_lr(Scalar lr) override { lr_ = lr; }
 
@@ -271,7 +279,8 @@ protected:
         // v = β2*v + (1-β2)*g²
         r = engine_.scale_inplace(v_[i], beta2_);
         if (!r) return std::unexpected(r.error());
-        auto g_sq = engine_.elementwise_binary(BinaryOp::Mul, g, g);
+        auto g_sq = dsl::compute(engine_, dsl::leaf(g) * dsl::leaf(g),
+                                 g.rows(), g.cols());
         if (!g_sq) return std::unexpected(g_sq.error());
         r = engine_.scale_inplace(*g_sq, one_minus_beta2);
         if (!r) return std::unexpected(r.error());
@@ -295,11 +304,14 @@ protected:
         if (!sqrt_v) return std::unexpected(sqrt_v.error());
 
         // denom = sqrt_v + eps
+        // （eps_ 为运行期标量，折叠进 DSL key 会使不同 eps 产生不同 AOT key，
+        //   破坏闭合世界，故保留原语路径）
         auto denom = engine_.elementwise_binary_scalar(BinaryOp::Add, *sqrt_v, eps_);
         if (!denom) return std::unexpected(denom.error());
 
         // ratio = m_hat / denom
-        auto ratio = engine_.elementwise_binary(BinaryOp::Div, *m_hat, *denom);
+        auto ratio = dsl::compute(engine_, dsl::leaf(*m_hat) / dsl::leaf(*denom),
+                                  m_hat->rows(), m_hat->cols());
         if (!ratio) return std::unexpected(ratio.error());
 
         // p -= lr * ratio
@@ -310,8 +322,22 @@ protected:
 
     void init_moments_()
     {
-        m_ = create_zero_buffers_();
-        v_ = create_zero_buffers_();
+        auto m_r = create_zero_buffers_();
+        if (!m_r)
+        {
+            std::fprintf(stderr, "Adam init (m_) failed: %s\n",
+                         m_r.error().message.c_str());
+            std::abort();
+        }
+        m_ = std::move(*m_r);
+        auto v_r = create_zero_buffers_();
+        if (!v_r)
+        {
+            std::fprintf(stderr, "Adam init (v_) failed: %s\n",
+                         v_r.error().message.c_str());
+            std::abort();
+        }
+        v_ = std::move(*v_r);
     }
 
     // 偏差修正系数（Adam/AdamW 共用）：给定下一步步数 t_next，
@@ -442,7 +468,8 @@ public:
 
     // 计算 Frobenius 范数的平方：||G||_F² = Σ g_ij²
     // 通过 elementwise(Mul) → row_reduce_sum → col_reduce_sum 三步原语得到 (1,1) 张量
-    auto norm_sq = engine.elementwise_binary(BinaryOp::Mul, G, G);
+    auto norm_sq = dsl::compute(engine, dsl::leaf(G) * dsl::leaf(G),
+                                G.rows(), G.cols());
     if (!norm_sq) return std::unexpected(norm_sq.error());
     auto row_sum_norm = engine.row_reduce_sum(*norm_sq);
     if (!row_sum_norm) return std::unexpected(row_sum_norm.error());
@@ -539,8 +566,17 @@ public:
          Scalar ns_eps = 1e-7f)
         : Optimizer(engine, std::move(params), std::move(grads)),
           lr_(lr), momentum_(momentum), nesterov_(nesterov),
-          ns_steps_(ns_steps), ns_eps_(ns_eps),
-          velocities_(create_zero_buffers_()) {}
+          ns_steps_(ns_steps), ns_eps_(ns_eps)
+    {
+        auto v_r = create_zero_buffers_();
+        if (!v_r)
+        {
+            std::fprintf(stderr, "Muon init failed: %s\n",
+                         v_r.error().message.c_str());
+            std::abort();
+        }
+        velocities_ = std::move(*v_r);
+    }
 
     void set_lr(Scalar lr) override { lr_ = lr; }
 
@@ -579,8 +615,15 @@ public:
                     engine_, update, ns_steps_, ns_eps_);
                 if (!ortho_update) return std::unexpected(ortho_update.error());
 
-                // 3. 参数更新: p -= lr * ortho_update（用 axpy_inplace 融合 scale+add）
-                r = engine_.axpy_inplace(params_[i], -lr_, *ortho_update);
+                // 3. 参数更新: p -= lr * 0.2 * sqrt(max(m,n)) * NS(update)
+                //    NorMuon 论文 / KellerJordan 参考实现的形状缩放：NS 输出谱范数为 1，
+                //    不缩放则等效学习率偏差 0.2*sqrt(max(m,n)) 倍（如 256×768 权重 → 5.5×）
+                const std::size_t m = params_[i].get().rows();
+                const std::size_t n = params_[i].get().cols();
+                const std::size_t big = m > n ? m : n;
+                const Scalar muon_scale =
+                    Scalar{0.2} * std::sqrt(static_cast<Scalar>(big));
+                r = engine_.axpy_inplace(params_[i], -lr_ * muon_scale, *ortho_update);
                 if (!r) return std::unexpected(r.error());
             }
             else

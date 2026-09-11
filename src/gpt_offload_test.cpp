@@ -27,11 +27,12 @@ using nn::Tensor;
 #ifndef NN_HAS_VULKAN
 int main()
 {
+    // 返回 77 = ctest SKIP：纯 CPU 构建无法执行 GPU 测试，不得计为 "Passed"
     std::cout << "[SKIP] 此程序需要 Vulkan SDK 支持（NN_HAS_VULKAN）。\n";
-    return 0;
+    return 77;
 }
 #else
-#include <neuralnet.cpp/backend/vk_backend.hpp>
+#include <neuralnet.cpp/backend/compute_vk_backend.hpp>
 
 using nn::ActivationType;
 using nn::GPTModel;
@@ -92,10 +93,11 @@ int run_test()
               << " heads=" << num_heads << " d_ff=" << d_ff
               << " layers=" << num_layers << "\n";
 
-    GPTModel model(eng, vocab, d_model, seq_len, num_heads, d_ff, num_layers,
+    GPTModel model(vocab, d_model, seq_len, num_heads, d_ff, num_layers,
                    PosEncodingType::Learned,
                    ActivationType::SwiGLU,
                    NormType::RMSNorm);
+    { auto r = model.init(eng); if (!r) { std::cerr << "GPTModel init 失败: " << r.error().message << "\n"; return 1; } }
 
     std::mt19937_64 rng(7);
     std::uniform_real_distribution<Scalar> dist(-1, 1);

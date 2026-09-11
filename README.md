@@ -27,7 +27,7 @@
 | [快速上手：构建模型](docs/03-quickstart-model.md) | ComputeEngine/Layer/Model 三件套使用教程 |
 | [快速上手：训练与推理](docs/04-quickstart-train-infer.md) | MNIST/GPT 训练推理命令行 + C++ API 示例 + GUI 操作指南 |
 | [算法解析](docs/05-algorithm-reference.md) | 每个 Layer/Loss/Optimizer 的数学原理与原语分解 |
-| [CUDA 后端](docs/06-cuda-backend.md) | CUDA GPU 加速后端设计、构建方法、编译器兼容性 |
+| [CUDA 后端](docs/06-cuda-backend.md) | CUDA 后端（1.0.0 起已停用，仅作恢复参考；构建方法、编译器兼容性） |
 | [训练包](docs/07-train-package.md) | 用 `.nnpkg` 打包超参+训练集，跨设备一键复现训练 |
 | [开发规范](docs/DEVELOPMENT_STANDARDS.md) | C++ 编码规范、模块隔离、内存管理 |
 
@@ -43,27 +43,39 @@ neuralnet.cpp/
 │   ├── 03-quickstart-model.md   ← 模型构建教程
 │   ├── 04-quickstart-train-infer.md ← 训练推理教程
 │   ├── 05-algorithm-reference.md    ← 算法解析参考
-│   ├── 06-cuda-backend.md       ← CUDA 后端设计
+│   ├── 06-cuda-backend.md       ← CUDA 后端设计（1.0.0 起停用）
+│   ├── 07-train-package.md      ← .nnpkg 训练包
+│   ├── 08-pitfalls-and-lessons.md  ← 踩坑警示录
+│   ├── 09-operator-fusion.md    ← 算子融合一期（M1-M6）
+│   ├── 10-memory-optimization.md  ← 显存优化
+│   ├── 11-ir-optimization.md    ← IR 优化
+│   ├── 12-innovative-designs.md ← 创新设计全景
+│   ├── 13-optimize-proposal-list.md ← 优化方案清单
+│   ├── 14-operator-fusion-2.md  ← 算子融合二期（IR 融合）
+│   ├── 15-rapt-algorithm.md     ← RLA / RAPT 算法
+│   ├── 16-zipt-algorithm.md     ← AttnZip / ZiPT 算法
+│   ├── flash_attn_analysis.md   ← 两趟式注意力分析
 │   └── DEVELOPMENT_STANDARDS.md ← 开发规范
 ├── gui.py                       ← 图形化操作界面 (CustomTkinter)
 ├── include/neuralnet.cpp/
 │   ├── nn.hpp                   ← 统一入口头文件
-│   ├── config.hpp               ← SmartPolicy、BLOCK_SIZE
-│   ├── tensor.hpp               ← 统一跨设备张量
+│   ├── core_config.hpp          ← SmartPolicy、BLOCK_SIZE
+│   ├── compute_tensor.hpp       ← 统一跨设备张量
 │   ├── compute_engine.hpp       ← 引擎抽象接口
-│   ├── cpu_engine.hpp           ← CPU 引擎
-│   ├── gpu_engine.hpp           ← GPU 引擎 (Vulkan)
-│   ├── cuda_engine.hpp          ← GPU 引擎 (CUDA)
-│   ├── compute_layer.hpp        ← Layer 基类 + 所有层
+│   ├── compute_cpu_engine.hpp   ← CPU 引擎
+│   ├── compute_gpu_engine.hpp   ← GPU 引擎 (Vulkan)
+│   ├── compute_cuda_engine.hpp  ← GPU 引擎 (CUDA, 已停用)
+│   ├── compute_layer.hpp        ← Layer 聚合头
+│   ├── compute_layer_{base,mlp,conv,softmax,attention,feedforward,transformer,gpt,zipt,rapt}.hpp ← 各层域
 │   ├── compute_loss.hpp         ← 损失函数
 │   ├── compute_optimizer.hpp    ← 优化器 (SGD/Adam/AdamW/Muon)
 │   ├── model_container.hpp      ← Model 容器
 │   ├── model_spec.hpp           ← 架构描述
 │   ├── model_serialization.hpp  ← 二进制序列化
+│   ├── model_keyvalue_record.hpp ← 自描述键值记录
 │   ├── domain_mnist.hpp         ← MNIST 模型工厂
 │   ├── domain_gpt.hpp           ← GPT 模型工厂
 │   ├── domain_tokenizer.hpp     ← 分词器
-│   ├── tensor.hpp               ← 统一跨设备张量
 │   ├── algebra_matrix.hpp       ← 矩阵类
 │   ├── algebra_expr.hpp         ← 表达式模板
 │   ├── algebra_ops.hpp          ← 逐元素算子
@@ -82,8 +94,6 @@ neuralnet.cpp/
 │   ├── text_infer.cpp           ← GPT 文本推理
 │   ├── tokenizer_train.cpp      ← 分词器训练
 │   ├── tokenizer_infer.cpp      ← 分词器推理
-│   ├── compute_bench.cpp        ← 性能基准测试
-│   ├── bench_thresholds.cpp     ← 并行阈值测试
 │   └── gpu_test.cpp             ← GPU 后端测试
 ├── datasets/                    ← 训练数据
 ├── pretrained/                  ← 预训练模型

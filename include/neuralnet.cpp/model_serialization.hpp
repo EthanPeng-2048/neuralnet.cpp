@@ -21,9 +21,9 @@
 #include <type_traits>
 #include <vector>
 
-#include "config.hpp"
+#include "core_config.hpp"
 #include "model_spec.hpp"
-#include "keyvalue_record.hpp"
+#include "model_keyvalue_record.hpp"
 #include "compute_layer.hpp"
 #include "model_container.hpp"
 
@@ -224,6 +224,10 @@ template <typename... Ts>
     kv.set("pos_encoding", static_cast<uint64_t>(spec.pos_encoding));
     kv.set("activation",   static_cast<uint64_t>(spec.activation));
     kv.set("norm_type",    static_cast<uint64_t>(spec.norm_type));
+    // ZiPT 记忆 token 数（可选字段：GPT/旧文件缺失时回落 0，不影响加载）
+    kv.set("memory_tokens", static_cast<uint64_t>(spec.memory_tokens));
+    // ZiPT 局部窗口 W（可选字段：缺失时回落 0 = 旧行为 W=L，即无压缩）
+    kv.set("window", static_cast<uint64_t>(spec.window));
 
     // ── CNN ──
     kv.set("cnn_in_channels", static_cast<uint64_t>(spec.cnn_in_channels));
@@ -286,6 +290,8 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
     if (kv.get("pos_encoding", v)) spec.pos_encoding = static_cast<PosEncodingType>(v);
     if (kv.get("activation", v))  spec.activation   = static_cast<ActivationType>(v);
     if (kv.get("norm_type", v))   spec.norm_type    = static_cast<NormType>(v);
+    if (kv.get("memory_tokens", v)) spec.memory_tokens = static_cast<std::size_t>(v);
+    if (kv.get("window", v))       spec.window       = static_cast<std::size_t>(v);
 
     // ── CNN ──
     if (kv.get("cnn_in_channels", v)) spec.cnn_in_channels = static_cast<std::size_t>(v);
@@ -528,11 +534,14 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
 
     // 非可学习状态（如 BatchNorm 的 running_mean/running_var），紧跟在参数之后。
     // 旧文件（无额外状态）读到 EOF 时保持默认（running_mean=0, running_var=1）。
-    // TODO(1.1, M2): 上述"读到 EOF 保持默认"的语义与下方实现不符——read_matrix
-    //   失败时这里直接 return 错误而非回退默认值。需统一为按版本回退。
+    // 注意：读取前用 peek() 检查 EOF，而非依赖 read_matrix 读失败后回退——
+    //   read_matrix 在 shape 不匹配时也会报错，不应吞掉真正的损坏。
     auto extras = model.extra_state();
     for (auto& e_tensor : extras)
     {
+        // 已经没有更多数据 → 保持默认值（零/一），跳过剩余 extras
+        if (ifs.peek() == EOF) break;
+
         // 先读入临时 Matrix（按状态 Tensor 的形状）
         Matrix tmp(e_tensor.get().rows(), e_tensor.get().cols());
         auto mr = detail::read_matrix(ifs, tmp);

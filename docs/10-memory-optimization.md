@@ -14,7 +14,7 @@
 >
 > **L2 内存池整块归还 + 统计 — ✅ 已实施**
 > - `MemoryPool`：新增 `PoolStats` + `pool_debug_stats()`（块数/占用/空闲/碎片）、`release_idle_blocks()`（整块 `vkFreeMemory` + 从 `blocks_` 移除，带 `retain_free_bytes_` 保留阈值防抖动）、`set_retain_free_bytes()`。
-> - `GpuBackend::release_idle_pool_blocks()`（先 `flush_pending_destroys()` 再归还）；`ComputeEngine` 新增 `release_idle_pool_blocks()` / `pool_stats()`（CPU/CUDA no-op）；`GpuEngine` override。
+> - `GpuBackend::release_idle_pool_blocks()`（先 `flush_pending_destroys()` 再归还）；`ComputeEngine` 新增 `release_idle_pool_blocks()` / `pool_stats()`（CPU no-op；CUDA 已停用）；`GpuEngine` override。
 > - 接入：`text_train` 新增 `--checkpoint-every N` 与每 step 末尾 `release_idle_pool_blocks()`（end_batch 提交完成、延迟销毁已 flush 后调用，安全）。
 > - 数值/性能回归：仅 GPU 内存管理路径，不影响 CPU 数值；L1 相关 gradcheck 全绿。
 >
@@ -68,12 +68,12 @@ FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU �
 - 每层驻留约 8 个 `B·seq·d` 与 2 个 `B·seq·d_ff` 的 fp32 副本（d_ff=4096 每张 100MB 是重要大头），16 层累加 ~6.4G。**无梯度重计算（activation checkpointing）**。
 
 ### 1.3 内存池碎片化 + 不归还（问题 L2）
-- [memory_pool.hpp](../../include/neuralnet.cpp/backend/memory_pool.hpp) 已实现 **first-fit 子分配 + 相邻 free region 自动前后合并**（O(log n)、O(1) 合并）。
+- [memory_pool.hpp](../../include/neuralnet.cpp/backend/compute_memory_pool.hpp) 已实现 **first-fit 子分配 + 相邻 free region 自动前后合并**（O(log n)、O(1) 合并）。
 - 但：**从未将整个空 Block 归还 GPU**（`blocks_.clear()` 仅在析构时触发），block 底材按需 128MB（或超尺寸单块）申请后不回收 ⇒ 峰值生命周期等于整个进程/测试生命周期，碎片与闲置块长期累积。
 - 文档 09 §0 将"内存池 first-fit 碎片化 + 永不归还"列为**独立跟踪项、不随融合解决**。
 
 ### 1.4 注意力形态（L3，语义复杂）
-- M6 已实现**两趟式**：forward 用 `batched_matmul_reduce/max → denom → apply` 不物化 `BH·seq²`；backward 默认**反向重算 `W`**（[09 §4 A 方案](09-operator-fusion.md)），省 `attn_cache_`，代价 2× FLOPs。
+- M6 ⚠️ 已删除：原 `batched_matmul_reduce/max → denom → apply` 两趟式 forward 与 `batched_matmul_softmax_backward_q/kv` backward 重算 `W` 方案，已被 IR 融合替代（[14-operator-fusion-2.md](14-operator-fusion-2.md) §S7）。
 - 该路径已消除 `BH·seq²` 物化，剩余驻留为逐层 Q/K/V 激活集（属 L1 激活重计算可覆盖范围）。**不手写** flash-attention 类融合 kernel：沿用现有自动融合/算子生成路径（见 [09-operator-fusion.md](./09-operator-fusion.md)），由 L3 的自动融合优化统一推进。
 
 ### 1.5 分布式分片（超长序列，远期）
@@ -85,7 +85,7 @@ FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU �
 
 按"不动分层、不动精度、收益先验证"排序：
 
-### L1 — 激活重计算（梯度检查点）【提案，优先做】
+### L1 — 激活重计算（梯度检查点）【✅ 已实施，见 §0】
 - **目标**：把逐层激活从"全存"降到"只存 block 边界 input（或隔层存）"，backward 重算中间，使② 从 ~6.4G 降到 ~0.6G。
 - **归属层**：`Model`（[model_container.hpp](../../include/neuralnet.cpp/model_container.hpp)）编排 + `Layer` 契约新增可选方法，`Layer::compute_backward_from_scratch`（默认走缓存；支持者重算）。**不动 ComputeEngine、不动精度**。
 - **接口**：
@@ -101,13 +101,13 @@ FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU �
 - **验证时序**：逐层数 1/2/4/8 层梯度与现有全存结果数值一致（复用 `gpt_gradcheck.cpp` 渠道）。
 - **风险**：约 +1 次前向 FLOPs（训练可接受）；需保证重算路径与原始 forward 数值一致。
 
-### L2 — 内存池复用/归还 + 生命周期边界【提案，低风险】
+### L2 — 内存池复用/归还 + 生命周期边界【✅ 已实施，见 §0】
 - **目标**：回收 ⑤ 中碎片与闲置底材。
 - **方案**：
   1. `MemoryPool` 支持**整块释放**：`allocation_count==0` 且全 region 空闲的 Block，调用 `vkFreeMemory` 并从 `blocks_` 移除（阈值控制，避免抖动）。
   2. 统计上报：`pool_debug_stats()`（总占用/空闲/block 数/碎片比），供 §4 采样确认真实构成。
   3. 评估按"训练-step 生命周期池 + 长生命周期参数池"分池，避免 step 间临时张量污染参数驻留区；或由 `staging`/`Tensor::destructor` 返回池而非直接 `vkFreeMemory`。
-- **范围**：仅 `backend/memory_pool.hpp` 与 Tensor 分配/销毁路径，不涉及算法。
+- **范围**：仅 `backend/compute_memory_pool.hpp` 与 Tensor 分配/销毁路径，不涉及算法。
 - **风险**：低；需 benchmark 分配总时长与碎片比变化。
 
 > ✅ **已核对（2026-08-24）**：中间 Tensor 的归还路径是安全的，无需修改即可维持正确性。
@@ -139,7 +139,7 @@ FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU �
 1. **显存采样**：在训练 step 间记录 `pool_stats`（块数/已分配/空闲/碎片比）与 GPU 总占用曲线，标出 step 内峰值出现阶段（forward/backward/optimizer）。
 2. **逐项归因**：跑一次 step，分别关闭激活缓存（假想）、池归还、自动融合，量化每项独立贡献——修正 §0.1 的⑤残差。
 3. **数值回归**：`gpt_gradcheck`、`rmsnorm_gradcheck`、`swiglu_gradcheck`、`softmax_gradcheck`、`matmul_fusion_test`、`ce_fusion_test` 保持全绿；训练 loss 曲线与参考一致。
-4. **性能回归**：`compute_bench`/`mnist_bench` 确认"省显存"未以显著耗时退化为代价（重计算倍率、池复用消耗）。
+4. **性能回归**：确认"省显存"未以显著耗时退化为代价（重计算倍率、池复用消耗），用训练 step 耗时采样替代（bench 工具已移除）。
 
 ---
 

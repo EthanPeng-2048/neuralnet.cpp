@@ -26,7 +26,7 @@
 |------|------|------|----------|
 | 🔴 灾难级 | 4 | 数据损坏 / 设备永久失效 / 训练白费数小时 | GPT 布局混用、GPU-resident 10% 正确率 |
 | 🟠 高危 | 6 | 内存爆炸 / 崩溃 / 断言失败 | BPE 60-80GB、reshape 视图断言 |
-| 🟡 中危 | 10 | 结果偏差 / 性能退化 / 并行不确定 | BPE 迭代序泄漏、one-hot 3.2GB |
+| 🟡 中危 | 11 | 结果偏差 / 性能退化 / 并行不确定 | BPE 迭代序泄漏、one-hot 3.2GB、scatter_add 非确定性 |
 | 🟢 低危 | 15+ | 构建失败 / UI 异常 / 兼容性 | CRLF、MSVC 编译器版本、tkinter 保留属性 |
 
 **一句话预警**:本项目最大的两类风险是 **① 布局/索引约定不一致** 和 **② GPU 资源生命周期**,
@@ -104,7 +104,7 @@
 - **症状**:`add_inplace` 断言失败 `lhs=(seq,d_model) rhs=(seq*d_model,1)`。
 - **根因**:`Tensor::reshape()` 是零拷贝视图:共享 `cpu_data_` 只改 Tensor 元数据 `rows_/cols_`,
   但 CPU 引擎的 `add_inplace` 用底层 `Matrix` 实际 shape 检查 → 不一致。
-- **修复**:CPU 分支 reshape 复制数据到新 shape;GPU/CUDA 分支保持零拷贝(buffer+count 无 shape)。
+- **修复**:CPU 分支 reshape 复制数据到新 shape;GPU 分支保持零拷贝(buffer+count 无 shape)。
 - **教训**:**任何"零拷贝视图 + 后端无关"的 Tensor 操作,CPU 与 GPU 语义天然不同**。
   排查 `add_inplace` 断言:先怀疑 reshape 后共享 Matrix 参与运算。
 
@@ -124,6 +124,8 @@
 
 ### 9. CUDA obj 不随 Debug/Release 重编:链接失败(2026-08-07)
 
+> ⚠️ **CUDA 后端已停用（v1.0.0）**，此坑仅作为历史参考，恢复 CUDA 时需注意。
+
 - **症状**:Debug↔Release 切换后 `cuda_kernels.obj` 的 DEPENDS 只有 .cu,不重编 →
   `_ITERATOR_DEBUG_LEVEL` 不匹配(clang-cl=2 vs nvcc obj=0)→ lld-link 失败。
 - **修复**:`-Xcompiler /D_ITERATOR_DEBUG_LEVEL=N` 对齐;切换配置后
@@ -132,7 +134,7 @@
 
 ### 10. 除零/越界防护缺失(2026-08-14 code review 批量发现)
 
-- `steps=0`(mnist_train/mnist_bench/text_train)、`--topk>10`、tokenizer_infer 空输入、
+- `steps=0`(mnist_train/text_train)、`--topk>10`、tokenizer_infer 空输入、
   `--iters 0`、`evaluate_mnist` 空数据集、`mnist_io.hpp` 末行无换行符丢样本、
   SGF 坐标跳 i/嵌套括号。
 - **教训**:CLI 入口的参数防护是一次性成本,review 时逐参数过一遍。
@@ -198,6 +200,26 @@
   不支持引用成员(P2988R0 未实现)→ 用 `T*` 兜底。
 - **教训**:新 C++26 特性先验证 MSVC STL 支持度再采用。
 
+### 19. GPU scatter_add 的 CAS float atomicAdd 非确定性(2026-08-26,已文档化例外)
+
+- **症状**:GPU 路径 `scatter_add_rows`(embedding 梯度累积)用 CAS 循环实现
+  float atomicAdd,同一行多个梯度值的累加顺序取决于 GPU 调度 → 跨 run 有
+  ~1e-7 相对误差的舍入抖动,违反铁律 8(逐字节确定性)。
+- **为何从未被触发**:① 偏差仅为浮点舍入噪声,被 Adam/AdamW 的动量与学习率
+  噪声完全吸收,loss 曲线与最终精度无可观测差异;② 项目没有"GPU vs CPU
+  逐字节比对"的测试(只有容差比对),抖动落在容差内;③ 单行冲突率低
+  (embedding 梯度中同一 token 在一个 batch 内重复次数少),多数行只累加
+  一次,顺序无关。
+- **处置**:**已文档化例外**(不修复)。理由:PyTorch 的 `index_add_` 同样
+  非确定;改为"排序+顺序累加"需全局排序(开销大),改为"分桶+确定性归约"
+  需额外显存与 kernel。偏差量级(1e-7)远小于训练噪声(1e-3),修复收益为负。
+  CPU 参考路径(`CpuEngine::scatter_add_rows`)保持顺序累加、逐字节确定,
+  作为 ground truth。
+- **教训**:铁律 8 的"逐字节一致"对**原子累加类**算子应放宽为"容差内一致"
+  (与 PyTorch 对齐);真正需要逐字节确定的是**决策类**逻辑(平局打破、ID
+  分配、缓存 key),而非浮点累加顺序。新增原子算子时先评估冲突率与偏差量级,
+  再决定"修复"还是"文档化例外"。
+
 ---
 
 ## 🟢 工具链与 UI 坑
@@ -215,7 +237,7 @@
 | Gradio `gr.Sketchpad` 输入是 dict,PIL composite 是对象非路径 | GUI | `_to_gray()` 兼容 dict/PIL/路径/图层 |
 | `torch.load` 反序列化漏洞 | Python | 一律 `weights_only=True` |
 | Python 3.10 `tarfile.extractall(filter=...)` 不可用 | Python | `_safe_extract` 逐成员校验路径 |
-| nvcc 12.8 与 MSVC 2026 (v14.51) 不兼容,cudafe++ crash | 构建 | 用 VS 2022 BuildTools;`-allow-unsupported-compiler` |
+| nvcc 12.8 与 MSVC 2026 (v14.51) 不兼容,cudafe++ crash | 构建(CUDA 已停用) | 用 VS 2022 BuildTools;`-allow-unsupported-compiler` |
 | `train_bytebpe.py`:正则 `[ \t]+` 空格独立成段,空格占 44.8% token | 分词器 | GPT-2 风格正则 `\s*[CJK]+|\s*[a-zA-Z0-9]+|\s*[单标点]` |
 | `byte_fallback=True` 不自动补 256 字节,中文→UNK | 分词器 | `BpeTrainer(initial_alphabet=ByteLevel.alphabet())` |
 | C++ CharBPETokenizer 对中文仍是 UNK | 分词器 | 字节级 BPE 拆中文字节,须改 encode 或换 charbpe |
@@ -244,7 +266,7 @@ unordered_map 迭代顺序(字符 ID 分配、平局打破)、Naive 缓存 key �
 
 ### 模式 D:异步生命周期管理 ⚠️🔴
 Vulkan "录制 vs 执行" 两段时间线(TDR、use-after-free、pending_destroys)、
-静态析构顺序、CUDA obj 缓存失效。
+静态析构顺序。
 **对策**:资源所有权用 RAII 表达;销毁走延迟队列;设备错误区分 DEVICE_LOST/TIMEOUT。
 
 ### 模式 E:跨工具链语义差异 🟢
@@ -269,9 +291,10 @@ GPU-resident 单算子对、链式错;attn batch=1 对、batch=2 错;gradcheck �
 - [ ] `compute_engine.hpp` 接口 + 文档注释(shape/转置语义)
 - [ ] `cpu_engine.hpp` 实现(注意 AVX2 可向量化,不要退化成裸指针循环)
 - [ ] Vulkan:shader + SPIR-V 嵌入 + `vk_backend.hpp` 管线
-- [ ] CUDA:`cuda_kernels.cu` + 接口
-- [ ] gradcheck / 一致性测试(forward+backward,CPU/GPU/CUDA 三后端对比)
+- [ ] gradcheck / 一致性测试(forward+backward,CPU/GPU 双后端对比)
 - [ ] 检查缓存 key(强哈希)、batch 模式生命周期(pending_destroys)
+
+> 注:CUDA 已停用(v1.0.0),新增原语不再需要实现 CUDA 内核。
 
 ### 添加新 Layer
 - [ ] 布局约定:flat 索引公式必须与 GPTModel/AttentionBase 一致(batch-major)
@@ -297,8 +320,8 @@ GPU-resident 单算子对、链式错;attn batch=1 对、batch=2 错;gradcheck �
 - [ ] CLI 输出格式变更 = 同步改 parser 正则(CLI 是 GUI 的唯一契约)
 
 ### 修改构建/工具链
-- [ ] Debug↔Release 切换:清 `build/cuda/cuda_kernels.obj` 再编
-- [ ] nvcc 编译器版本匹配(12.8 ↔ VS 2022 BuildTools)
+- [ ] Debug↔Release 切换:清 `build/cuda/cuda_kernels.obj` 再编(CUDA 已停用,仅恢复时适用)
+- [ ] nvcc 编译器版本匹配(12.8 ↔ VS 2022 BuildTools;CUDA 已停用)
 - [ ] 新 C++26 特性先验证 MSVC STL 支持度
 
 ### 修改模型格式
@@ -311,5 +334,5 @@ GPU-resident 单算子对、链式错;attn batch=1 对、batch=2 错;gradcheck �
 
 - `docs/DEVELOPMENT_STANDARDS.md` — 分层职责规范("每层只能负责每层的事")
 - `docs/01-architecture.md` — 架构分层
-- `docs/06-cuda-backend.md` — CUDA 构建与版本匹配
+- `docs/06-cuda-backend.md` — CUDA 构建与版本匹配（已停用，恢复参考）
 - `docs/07-train-package.md` — 训练包格式
