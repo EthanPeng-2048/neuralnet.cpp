@@ -1,10 +1,10 @@
-# 🛠️ 快速上手：构建自己的模型
+# 快速上手：构建自己的模型
 
-> 本教程教你如何使用 `ComputeEngine` + `Layer` + `Model` 三件套从零构建神经网络模型。
+**本教程教你如何使用 `ComputeEngine` + `Layer` + `Model` 三件套从零构建神经网络模型。**
 
 ---
 
-## 📐 三件套概念
+## 三件套概念
 
 ```
 ComputeEngine  — 硬件抽象（CPU/GPU），提供计算原语
@@ -25,7 +25,7 @@ auto result = model.forward(input);  // engine 在 Model 内部自动传递
 
 ---
 
-## 🚀 第一步：选择引擎
+## 第一步：选择引擎
 
 ```cpp
 #include <neuralnet.cpp/nn.hpp>
@@ -39,7 +39,7 @@ nn::CpuEngine engine;
 
 ---
 
-## 🔨 第二步：构建 Model
+## 第二步：构建 Model
 
 ### 方式一：链式构建（推荐，适合 MLP）
 
@@ -95,7 +95,7 @@ model.add<nn::GPTBlock>(128, 4, 512, 1024);        // GPT 块
 
 ---
 
-## 📊 Tensor 的使用
+## Tensor 的使用
 
 `Tensor` 是所有数据的统一容器：
 
@@ -134,7 +134,7 @@ Matrix/Tensor 行主序:  (rows, cols)
 
 ---
 
-## 🔄 完整前向传播示例
+## 完整前向传播示例
 
 ```cpp
 #include <neuralnet.cpp/nn.hpp>
@@ -176,7 +176,7 @@ int main() {
 
 ---
 
-## 🏗️ 自定义 Layer
+## 自定义 Layer
 
 如果内置层不够用，可以继承 `Layer` 实现自己的层：
 
@@ -243,7 +243,7 @@ model.add<MyLayer>(256, 10);
 
 ---
 
-## ⚠️ 常见陷阱
+## 常见陷阱
 
 ### 1. Tensor 布局错误
 
@@ -301,7 +301,7 @@ optimizer.step();
 
 ---
 
-## 📋 可用层速查表
+## 可用层速查表
 
 | 层 | 构造参数 | 用途 |
 |----|---------|------|

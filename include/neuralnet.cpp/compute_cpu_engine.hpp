@@ -18,6 +18,7 @@
 #include "expr_opt.hpp"
 #include "expr_graph.hpp"    // IR-C：图 IR + 融合分析（scan 模式登记用）
 #include "expr_registry.hpp" // scan 模式融合 kernel 登记（NN_EXPR_SCAN）
+#include "expr_dsl.hpp"      // P3-3：matmul_with_bias 经 DSL 融合（单一事实源）
 
 namespace nn
 {
@@ -495,6 +496,27 @@ public:
         }
 
         return std::unexpected(Error{"matmul: unsupported precision"});
+    }
+
+    // ── matmul + 行广播 bias（P3-3）：经 DSL 融合（单一事实源）──────────────
+    // 重写基类默认的"matmul + CPU 往返加 bias"：CPU 走模板求值，GPU 走 AOT
+    // 融合 shader；且 scan_exprs dry-run 会收集该结构→gen_fused 生成融合 kernel
+    // （此前 GPU Linear 每步做 to_matrix/from_matrix CPU 往返，且该 DSL 结构
+    // 从未被扫描，导致"Linear 结构"融合测试 AOT 未命中）。
+    [[nodiscard]] Result<Tensor> matmul_with_bias(
+        const Tensor& A, const Tensor& B, const Tensor& bias,
+        bool transA = false, bool transB = false,
+        Precision P = Precision::F32) override
+    {
+        (void)P;  // 精度由张量原生类型决定（现调用方均为 F32）
+        if (A.is_gpu() || B.is_gpu())
+            return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+        const std::size_t rows = transA ? A.cols() : A.rows();
+        const std::size_t cols = transB ? B.rows() : B.cols();
+        return nn::dsl::compute(*this,
+            nn::dsl::matmul(A, B, transA, transB, 1)
+                + nn::dsl::row_broadcast(bias),
+            rows, cols);
     }
 
     // ── 批量矩阵乘法：按 batch 切分行块，逐 batch 矩阵乘 ──

@@ -39,6 +39,12 @@ class MemoryPool
 {
 public:
     static constexpr VkDeviceSize DEFAULT_BLOCK_SIZE = 128ull * 1024 * 1024; // 128MB
+    // 尺寸分类分池（抗碎片，P3）：大块底材只服务大分配，小块底材只服务小分配，
+    // 避免大量高频的小临时分配在 128MB 底材里切出不可复用碎片、破坏大分配的
+    // 连续性（见《显存&负载不均衡分析》）。
+    static constexpr VkDeviceSize DEFAULT_SMALL_BLOCK_SIZE = 4ull * 1024 * 1024;  // 4MB
+    // 小于该阈值视为"小分配"，走小块底材池。
+    static constexpr VkDeviceSize SMALL_ALLOC_THRESHOLD = 256ull * 1024;           // 256KB
 
     struct Allocation
     {
@@ -120,6 +126,7 @@ private:
     VkDevice device_;
     VkPhysicalDevice physical_device_;
     VkDeviceSize block_size_;
+    VkDeviceSize small_block_size_;
     VkPhysicalDeviceMemoryProperties mem_props_;
 
     // L2：整块归还时保留的最小空闲字节数（避免频繁整块释放/重建抖动）
@@ -130,27 +137,56 @@ private:
     std::unordered_map<SuballocKey, VkDeviceSize, SuballocKeyHash> active_allocs_;
     mutable std::mutex mutex_;
 
-    [[nodiscard]] static std::optional<VkDeviceSize> find_free(
+    // 空闲区查找：best-fit（P3 抗碎片）。
+    // 在候选块内选"对齐后剩余碎片最小 && 对齐 padding 不超预算"的空闲区。
+    // 相比 first-fit，best-fit 降低把一个大小合适的洞切成两个小洞的概率，
+    // 且跳过对齐 padding 过大的候选（避免产生不可复用的残片）。
+    // 返回 (offset, padding_bytes)；无合适候选返回 nullopt。
+    [[nodiscard]] static std::optional<std::pair<VkDeviceSize, VkDeviceSize>> find_best(
         Block& block, VkDeviceSize alignment, VkDeviceSize size)
     {
-        for (auto it = block.free_regions.begin(); it != block.free_regions.end(); ++it)
+        const VkDeviceSize align_mask = alignment - 1;
+        // 对齐 padding 预算：超过该值即视为"残片"，跳过该候选。
+        const VkDeviceSize max_padding =
+            std::max<VkDeviceSize>(64, (size >= 16384) ? (size >> 4) : (size >> 1));
+
+        std::optional<VkDeviceSize> best_offset;
+        VkDeviceSize best_padding = 0;
+        VkDeviceSize best_region_start = 0;
+        VkDeviceSize best_waste = std::numeric_limits<VkDeviceSize>::max();
+
+        for (const auto& r : block.free_regions)
         {
-            VkDeviceSize aligned = (it->offset + alignment - 1) & ~(alignment - 1);
-            VkDeviceSize padding = aligned - it->offset;
-            if (it->size >= padding + size)
+            const VkDeviceSize aligned = (r.offset + align_mask) & ~align_mask;
+            const VkDeviceSize padding = aligned - r.offset;
+            if (padding > max_padding)
+                continue;  // 对齐残片过大，跳过
+            if (r.size < padding + size)
+                continue;  // 放不下
+            // 剩余碎片 = 该区分配后剩下的字节数（越小越贴合）
+            const VkDeviceSize waste = r.size - (padding + size);
+            if (waste < best_waste)
             {
-                VkDeviceSize result = aligned;
-                VkDeviceSize remaining = it->size - padding - size;
-                VkDeviceSize orig_offset = it->offset;
-                block.free_regions.erase(it);
-                if (padding > 0)
-                    block.free_regions.insert({orig_offset, padding});
-                if (remaining > 0)
-                    block.free_regions.insert({aligned + size, remaining});
-                return result;
+                best_waste = waste;
+                best_offset = aligned;
+                best_padding = padding;
+                best_region_start = r.offset;
             }
         }
-        return std::nullopt;
+        if (!best_offset)
+            return std::nullopt;
+
+        // 定位被选中的区域并从集合中剔除，按 padding/remaining 重插
+        auto it = block.free_regions.lower_bound(FreeRegion{best_region_start, 1});
+        if (it == block.free_regions.end() || it->offset != best_region_start)
+            return std::nullopt;  // 防御：理论不可达
+        const VkDeviceSize remaining = it->size - best_padding - size;
+        block.free_regions.erase(it);
+        if (best_padding > 0)
+            block.free_regions.insert({best_region_start, best_padding});
+        if (remaining > 0)
+            block.free_regions.insert({*best_offset + size, remaining});
+        return std::make_pair(*best_offset, best_padding);
     }
 
     // 注：Block 的移动赋值被 delete（防止 vector 操作引发意外释放），
@@ -200,8 +236,10 @@ private:
 
 public:
     MemoryPool(VkDevice device, VkPhysicalDevice physical_device,
-               VkDeviceSize block_size = DEFAULT_BLOCK_SIZE)
-        : device_(device), physical_device_(physical_device), block_size_(block_size)
+               VkDeviceSize block_size = DEFAULT_BLOCK_SIZE,
+               VkDeviceSize small_block_size = DEFAULT_SMALL_BLOCK_SIZE)
+        : device_(device), physical_device_(physical_device), block_size_(block_size),
+          small_block_size_(small_block_size), retain_free_bytes_(0)
     {
         vkGetPhysicalDeviceMemoryProperties(physical_device_, &mem_props_);
     }
@@ -227,40 +265,50 @@ public:
 
         VkDeviceSize alignment = requirements.alignment > 0 ? requirements.alignment : 1;
         const VkDeviceSize alloc_size = requirements.size;
-        VkDeviceSize effective_block_size = (alloc_size > block_size_) ? alloc_size : block_size_;
+        // 尺寸分类分池：超大分配独占整块；小分配走小块池；其余走大块池。
+        // 顺序：alloc > 大块阈值 → 独占超大块；alloc < 小块阈值 → 小块池。
+        VkDeviceSize pool_size;
+        if (alloc_size > block_size_)
+            pool_size = alloc_size;                 // 超出大块底材：独占整块
+        else if (alloc_size < SMALL_ALLOC_THRESHOLD)
+            pool_size = small_block_size_;          // 小分配：小块底材池（抗碎片）
+        else
+            pool_size = block_size_;
 
-        // 尝试在现有 block 中分配
+        // 尝试在现有同类块中分配（best-fit）
         for (auto& block_ptr : blocks_)
         {
             auto& block = *block_ptr;
             if (block.memory_type_index != *mem_type)
                 continue;
-            auto offset = find_free(block, alignment, alloc_size);
-            if (offset)
+            if (block.size != pool_size)
+                continue;  // 只服务同尺寸分类的块，保持大块连续性
+            auto best = find_best(block, alignment, alloc_size);
+            if (best)
             {
                 block.allocation_count++;
-                active_allocs_[{block.memory, *offset}] = alloc_size;
-                return Allocation{block.memory, *offset, alloc_size, block.property_flags};
+                active_allocs_[{block.memory, best->first}] = alloc_size;
+                return Allocation{block.memory, best->first, alloc_size, block.property_flags};
             }
         }
 
-        // 创建新 block
-        auto block_result = create_block(*mem_type, preferred_flags, effective_block_size);
+        // 创建新块
+        auto block_result = create_block(*mem_type, preferred_flags, pool_size);
         if (!block_result)
             return std::unexpected(block_result.error());
 
         auto new_block = std::make_unique<Block>(std::move(*block_result));
-        auto offset = find_free(*new_block, alignment, alloc_size);
-        if (!offset)
+        auto best = find_best(*new_block, alignment, alloc_size);
+        if (!best)
             return std::unexpected(Error{"Suballocation failed in new block"});
 
         VkDeviceMemory mem = new_block->memory;
         VkMemoryPropertyFlags flags = new_block->property_flags;
         new_block->allocation_count++;
-        active_allocs_[{mem, *offset}] = alloc_size;
+        active_allocs_[{mem, best->first}] = alloc_size;
         blocks_.push_back(std::move(new_block));
 
-        return Allocation{mem, *offset, alloc_size, flags};
+        return Allocation{mem, best->first, alloc_size, flags};
     }
 
     void free(const Allocation& alloc)

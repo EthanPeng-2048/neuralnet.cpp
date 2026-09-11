@@ -1,13 +1,11 @@
-# 🎚️ 多精度计算改造（f16 / 混合精度）设计
+# 多精度计算改造（f16 / 混合精度）设计
 
-> **状态**：设计定稿（2026-09-08），Phase 1 未启动
-> **范围**：f16 + f32（bf16 / f64 仅枚举占位）
-> **来源**：docs/13 P4-03「半精度训练」（显存减半 + 带宽翻倍）
-> **配套**：docs/19（引擎开发）、docs/20（引擎使用）、docs/08（踩坑）、docs/21（代码审查，CpuEmitter 缺陷与本文 §11.1 相关）
+> **状态**：设计定稿（2026-09-08），Phase 1 未启动。
+> **范围**：f16 + f32（bf16 / f64 仅枚举占位）。
+> **来源**：docs/13 P4-03「半精度训练」（显存减半 + 带宽翻倍）。
+> **配套**：`../development/01-compute-engine-development.md`（引擎开发）、`../28-compute-engine-usage.md`（引擎使用）、`../08-pitfalls-and-lessons.md`（踩坑）、`../30-code-review-2026-09-04.md`（CpuEmitter 隐性缺陷与本文 §11.1 相关）。
 
----
-
-## 📋 目录
+## 目录
 
 1. [概述](#1-概述)
 2. [需求追溯](#2-需求追溯)
@@ -20,7 +18,7 @@
 9. [模型级控制：PrecisionProfile](#9-模型级控制precisionprofile)
 10. [全链路走查](#10-全链路走查)
 11. [对现有架构的影响](#11-对现有架构的影响)
-12. [分期（Phase 1 范围 / 验收 / Phase 2 / 已知限制）](#12-分期)
+12. [分期](#12-分期)
 13. [测试计划](#13-测试计划)
 14. [风险与对策](#14-风险与对策)
 15. [涉及文件（模块级）](#15-涉及文件模块级)
@@ -64,7 +62,7 @@
 
 | # | 原始需求 | 落地章节 |
 |---|---|---|
-| 1 | 存储精度是 Tensor 类型参数，具体设备具体适配（matrix、gputensor） | §5 + §6：`Tensor` 携带 `precision_` 属性（"类型参数"的落地方式见决策 Q2）；CPU 侧 `Matrix<P>` 模板、GPU 侧 `GpuTensor<P>` 模板，元素字节数由 P 决定 |
+| 1 | 存储精度是 Tensor 类型参数，具体设备具体适配（matrix、gputensor） | §5 + §6：`Tensor` 携带 `precision_` 属性；CPU 侧 `Matrix<P>` 模板、GPU 侧 `GpuTensor<P>` 模板，元素字节数由 P 决定 |
 | 2 | 精度与设备无关；设备支持硬件加速则启用，否则使用兼容方案 | §7：P 精度算术有**唯一的、设备无关的形式化定义**（§7.2）；`(算子, P, 设备)` 能力表在设备初始化时定死分派到 {硬件路径, 兼容路径} |
 | 3 | 计算不指定精度 = 操作数中最高；指定 = 指定值 | §8：`P_op = 调用点显式 P，否则 max(操作数精度)`；显式 P 的语义 = **整个算子在该精度下做**（决策 Q3-A：操作数 cast、计算、输出存储全在 P） |
 | 4 | （补充）代码显式指定精度（算子 + 张量创建），不存在隐式精度推导 | §8.5 + §9：所有 P 实参在调用点可见；值统一来自 `PrecisionProfile`（模型构造器一行）；唯一兜底 `Auto = max(操作数)` 是**可见操作数的纯函数**；引擎无任何隐藏的精度状态 |
@@ -77,15 +75,15 @@
 
 | ID | 决策 | 结论 | 关键理由 |
 |---|---|---|---|
-| Q1 | 精度集合 | **f16 + f32**；bf16 移出范围（GPU 上 bf16 无硬件 ALU，永远兼容路径，价值仅在存储/带宽，留 Phase 2）；f64 枚举占位不实现（消费级 GPU 无 f64 ALU，代码库无 f64 路径） | 范围最小且覆盖 f16 训练主诉求 |
-| Q2 | "Tensor 类型参数"的落地方式 | **运行时 tag + 内部类型化**：`Tensor` 非模板（运行时 `precision_` + 类型擦除存储），`Matrix<P>` / `GpuTensor<P>` 为存储/代数层模板 | 全模板方案会迫使 `ComputeEngine` 虚接口、所有 Layer、dsl 路径按 P 分裂，与"Layer 只写一次"铁律冲突；运行时 tag 下公共 API 形态不变 |
-| Q3 | 指定精度的语义 | **A：指定 = 整个算子的精度**——操作数升/降 cast 到 P、在 P 下计算、输出存 P。配套两条：① matmul/归约累加 = `max(P, f32)`；② 数值敏感算子（softmax/LayerNorm/loss）的 P 由 `stable` 参数显式给（默认 F32，见 §9） | 语义单一可预测："指定 P = 这个算子整个在 P 下做"；"f32 算存 f16"不塞进算子参数，用显式 `cast` 表达 |
-| Q4 | 兼容路径（无 P 硬件加速时）的语义 | **f32 参考计算 + 每个算子输出舍入到 P**（round-half-to-even）。P 精度算术的形式化定义 = f32 参考 + 每算子输出舍入；matmul/归约另加累加 `max(P, f32)` | 硬件路径与兼容路径**语义等价**（硬件 f16 运算输出本来就舍入到 f16；tensor core 点积用 f32 累加，与定义一致），差异仅在归约内累加顺序 → 跨设备同精度**容差内相等，不字节一致** |
-| Q5 | 精度控制层级 | **显式 + `Model` 构造器 `PrecisionProfile`（4 参数：param / compute / stable / optimizer）**；每个算子调用点显式传 P（值来自 profile）；引擎**无隐藏精度状态**；per-layer 覆盖留 Phase 2 | 用户的原始诉求；比"引擎级隐式 target"更干净——删除唯一隐藏状态，Layer 仍只写一次（P 是可见实参，值来自构造器注入成员） |
-| Q6 | GPU 融合 / AOT 路线 | **分期**：Phase 1 = f32 融合世界 + 边界显式 cast + f16 GEMM（`expr_spec_key` 不变）；Phase 2 = in-kernel f16 融合（key 加 1B 精度维度，glsl_gen f16 变体，CpuEmitter 按精度实例化） | Phase 1 改动面最小；f16 收益（显存/带宽减半 + GEMM 提速）已拿到，逐元素链的 in-kernel f16 收益 Phase 2 再拿 |
-| D7 | P 参数形式 | `std::optional<Precision> p = std::nullopt`；`nullopt = Auto = max(操作数)`（Q3 规则）；代码库约定 Layer/工厂/优化器/loss 调用**永远显式传** | 数据操作类算子（clone/transpose/gather…）的 Auto = 源精度，自然语义 |
-| D8 | "张量精度"的拆分 | 用户提的"张量精度"落为 **`param`（权重/参数存储精度）**；激活/梯度精度**不设独立参数**——按 Q3-A，算子输出存储精度 = 该算子的 P（`compute` / `stable` 已决定） | 张量分两类：工厂创建的（权重）与算子产生的（激活/梯度），后者精度由产生它的算子参数决定 |
-| D9 | loss 的 backward 输出精度 | **= `stable`**（loss 前向 + backward 全链路同一 P，默认 F32） | loss 链 f32 是数值安全默认；首个反向 matmul 处梯度降 cast 到 `compute`（经典 f16 训练形态） |
+| Q1 | 精度集合 | **f16 + f32**；bf16 移出范围（GPU 上 bf16 无硬件 ALU，永远兼容路径，价值仅在存储/带宽，留 Phase 2）；f64 枚举占位不实现（消费级 GPU 无 f64 ALU） | 范围最小且覆盖 f16 训练主诉求 |
+| Q2 | "Tensor 类型参数"的落地方式 | **运行时 tag + 内部类型化**：`Tensor` 非模板（运行时 `precision_` + 类型擦除存储），`Matrix<P>` / `GpuTensor<P>` 为存储/代数层模板 | 全模板方案会迫使 `ComputeEngine` 虚接口、所有 Layer、dsl 路径按 P 分裂，与"Layer 只写一次"铁律冲突 |
+| Q3 | 指定精度的语义 | **A：指定 = 整个算子的精度**——操作数升/降 cast 到 P、在 P 下计算、输出存 P。配套：① matmul/归约累加 = `max(P, f32)`；② 数值敏感算子（softmax/LayerNorm/loss）的 P 由 `stable` 参数显式给（默认 F32） | 语义单一可预测；"f32 算存 f16"不塞进算子参数，用显式 `cast` 表达 |
+| Q4 | 兼容路径（无 P 硬件加速时）的语义 | **f32 参考计算 + 每个算子输出舍入到 P**（round-half-to-even）。P 精度算术的形式化定义 = f32 参考 + 每算子输出舍入；matmul/归约另加累加 `max(P, f32)` | 硬件路径与兼容路径**语义等价**；差异仅在归约内累加顺序 → 跨设备同精度**容差内相等，不字节一致** |
+| Q5 | 精度控制层级 | **显式 + `Model` 构造器 `PrecisionProfile`（4 参数：param / compute / stable / optimizer）**；每算子调用点显式传 P（值来自 profile） | 比"引擎级隐式 target"更干净；Layer 仍只写一次（P 是可见实参） |
+| Q6 | GPU 融合 / AOT 路线 | **分期**：Phase 1 = f32 融合世界 + 边界显式 cast + f16 GEMM（`expr_spec_key` 不变）；Phase 2 = in-kernel f16 融合（key 加 1B 精度维度，glsl_gen f16 变体） | Phase 1 改动面最小 |
+| D7 | P 参数形式 | `std::optional<Precision> p = std::nullopt`；`nullopt = Auto = max(操作数)`；代码库约定 Layer/工厂/优化器/loss 调用**永远显式传** | 数据操作类算子的 Auto = 源精度，自然语义 |
+| D8 | "张量精度"的拆分 | 用户提的"张量精度"落为 **`param`**（权重/参数存储精度）；激活/梯度精度**不设独立参数** | 激活/梯度精度由产生它的算子参数决定 |
+| D9 | loss 的 backward 输出精度 | **= `stable`**（loss 前向 + backward 全链路同一 P，默认 F32） | loss 链 f32 是数值安全默认 |
 | D10 | Profile 默认值 | **全 F32** = 今天的行为，零回归 | G5 |
 | D11 | 提升序 | **F16 < F32**；BF16 / F64 为保留值，Phase 1 使用 → `Result` 清晰报错"精度未实现" | 无 bf16 后无不可公度问题 |
 
@@ -110,7 +108,7 @@ graph TB
     end
     subgraph L3["L3 计算层（分派）"]
         E["ComputeEngine 原语（+ 显式 P 参数）"]
-        D["dispatch(op, P, device)<br/>→ 硬件路径 | 兼容路径（设备初始化时定死）"]
+        D["dispatch(op, P, device)<br/>→ 硬件路径 \| 兼容路径（设备初始化时定死）"]
         E --> D
     end
     P --> DEF
@@ -172,12 +170,12 @@ enum class Precision : uint8_t
 | `precision_` | 无 | `Precision`，新增 |
 | `cpu_data_` | `shared_ptr<Matrix>` | `variant<shared_ptr<Matrix<F16>>, shared_ptr<Matrix<F32>>>`（Phase 1 两候选；未来加 f64 只加候选） |
 | `gpu_data_` | `shared_ptr<GpuTensor>` | `variant<shared_ptr<GpuTensor<F16>>, shared_ptr<GpuTensor<F32>>>` |
-| `cuda_data_` | （CUDA 后端已停用，AGENTS.md §2） | Phase 1 不动 |
+| `cuda_data_` | （CUDA 后端已停用） | Phase 1 不动 |
 | 其余 | `device_` / `rows_` / `cols_` / `virtual_tag_` / 拷贝语义 | 不变（存储仍 shared_ptr 共享，廉价拷贝） |
 
 - `precision_` 即"激活候选"的标记，与 `device_` 共同唯一确定存储的有效类型。
 - **无裸指针**（铁律 2）：类型擦除用 `std::variant` of 类型化 `shared_ptr`，不做 `shared_ptr<void>` + 强转。
-- 访问器按 P 模板化：`Matrix<P>& cpu_matrix<P>()`，P 与 `precision_` 不符 → `NN_ASSERT`（编程错误，L2 层语义）。
+- 访问器按 P 模板化：`Matrix<P>& cpu_matrix<P>()`，P 与 `precision_` 不符 → `NN_ASSERT`（编程错误）。
 - `TensorRef`（`reference_wrapper`）不变。
 - **图 IR 录制（`virtual_tag_`）与本文正交**：Phase 1 融合世界保持 f32（Q6），图 IR 逻辑零改动。
 
@@ -185,12 +183,12 @@ enum class Precision : uint8_t
 
 - `std::vector<elem<P>> data_`；现有全部运算代码**模板化到 P**（代数层是纯 CPU、无虚接口，模板化零成本）。
 - Phase 1 只实例化 **F32 / F16**；**F32 实例化必须与现状逐字节一致**（验收 A/B 测试，§13.1）。
-- dsl / 表达式模板链（`algebra_expr.hpp` / `expr_dsl.hpp`）随 P 实例化（§11.5）。
+- dsl / 表达式模板链（`algebra_expr.hpp` / `expr_dsl.hpp`）随 P 实例化。
 
 ### 6.3 GpuTensor&lt;P&gt;（L0 GPU 存储）
 
 - `buffer 字节数 = elems × sizeof(elem<P>)`（消除现状 `sizeof(float)` 硬编码）；分配对齐 ≥ 4 字节（向量宽度）。
-- `GpuBuffer::create_device_local / create_host_visible` 的 `elem_count` 语义改为**字节数**（或 (elem_count, P) 双参，工程细节，不影响本文语义）。
+- `GpuBuffer::create_device_local / create_host_visible` 的 `elem_count` 语义改为**字节数**（或 (elem_count, P) 双参，工程细节）。
 
 ### 6.4 创建 API（P 显式；无 Auto——创建无操作数可推导）
 
@@ -210,14 +208,14 @@ engine.to_matrix(const Tensor& t, P)          // 重载；P ≠ t.precision() �
                                              // "需要别的精度" → 先显式 cast（§7 的 cast 原语）
 ```
 
-- **同精度跨设备**（CPU f16 ↔ GPU f16）= 原始字节拷贝（`vkCmdCopyBuffer` / memcpy），零转换——f16 位布局 CPU/GPU 一致（§5.2）。
+- **同精度跨设备**（CPU f16 ↔ GPU f16）= 原始字节拷贝（`vkCmdCopyBuffer` / memcpy），零转换——f16 位布局 CPU/GPU 一致。
 - **跨精度跨设备** = 逐元素 `cast`。
-- `reshape`（零拷贝视图）继承精度（同一底层存储）；CPU 侧 reshape 的复制语义不变（现状：CPU reshape 复制、GPU 零拷贝，docs/08 坑 6）。
+- `reshape`（零拷贝视图）继承精度（同一底层存储）；CPU 侧 reshape 的复制语义不变。
 
 ### 6.6 内存约定
 
 - `b_block` 64KB 栈预算（`BLOCK_SIZE² × sizeof(Scalar)`）按 P 重核：f16 同块元素数可 ×2，或保持块数不变（工程选择，§16）。
-- activation offload slab 的偏移单位现状注释为 "float 单位" → **统一改为"元素单位"**（P 决定每元素字节数；slab 按字节寻址，API 注释澄清）。
+- activation offload slab 的偏移单位现注释为 "float 单位" → **统一改为"元素单位"**（P 决定每元素字节数）。
 
 ---
 
@@ -228,7 +226,7 @@ engine.to_matrix(const Tensor& t, P)          // 重载；P ≠ t.precision() �
 | P | CPU | GPU（Vulkan） |
 |---|---|---|
 | F32 | 硬件（现状） | 硬件（`shaderFloat32` 必有） |
-| F16 | **看 ISA**：AVX512-FP16 / AVX10 / ARMv8.2-AFP（编译期宏探测）→ 硬件；否则兼容 | **看特性**：`shaderFloat16`（Vulkan 1.2 核心 / 对应扩展）→ 硬件；否则兼容。现代独显基本都有，老核显可能没有 |
+| F16 | **看 ISA**：AVX512-FP16 / AVX10 / ARMv8.2-AFP（编译期宏探测）→ 硬件；否则兼容 | **看特性**：`shaderFloat16`（Vulkan 1.2 核心 / 对应扩展）→ 硬件；否则兼容 |
 
 Phase 1 只有两个精度，"兼容路径"实际只有两种情形：**① CPU 无 f16 ISA；② GPU 无 `shaderFloat16`**。
 
@@ -250,7 +248,7 @@ P = F32：参考即自身，不舍入（= 现状行为）
 ### 7.3 分派规则
 
 - 分派粒度 = **`(算子, P, 设备)` 三元组**；设备初始化时建表（GPU：特性查询；CPU：编译期 ISA 宏），运行期只查表。
-- **确定性**：同一 `(算子, P, 设备)` 永远走同一路径（无容器迭代顺序依赖，铁律 8 满足）；"同 (设备, P, 路径) 串行确定性"（§11.2）。
+- **确定性**：同一 `(算子, P, 设备)` 永远走同一路径（无容器迭代顺序依赖，铁律 8 满足）。
 - Phase 1 逐算子路径（工程落地表）：
 
 | 算子 | CPU f16（无 ISA） | GPU f16（无特性） | GPU f16（有特性） |
@@ -317,7 +315,7 @@ in-place 算子（`add_inplace` / `scale_inplace` / `axpy_inplace` / `zero`…�
 P 的来源只有两个：
 
 1. **调用点显式参数**（值可追溯到模型构造器的 `PrecisionProfile`，§9）；
-2. **Auto = max(操作数)**——可见操作数的纯函数（用户规则，Q3 第 3 条的原文语义）。
+2. **Auto = max(操作数)**——可见操作数的纯函数。
 
 **不存在第三个来源**：引擎无任何默认精度状态，Layer 无任何隐藏策略。唯一"非用户选择"的精度是**设备能力分派**（硬件/兼容，§7.3）——那是设备物理事实而非语义选择，且 Q4 保证两路径语义等价。代码库约定：**Layer / 工厂 / 优化器 / loss 的所有引擎调用显式传 P**（可见实参，如 `p_.compute`），Auto 只留给用户直调引擎与数据操作的自然语义。
 
@@ -341,9 +339,9 @@ struct PrecisionProfile
 
 **参数映射说明（D8）**：用户原始三参数"张量精度 / 计算精度 / 优化器精度"中——
 
-- "张量精度"拆为 **`param`**（工厂创建的权重）；**激活/梯度不设独立参数**：按 Q3-A，算子输出存储精度 = 该算子的 P，激活由 `compute` 产生、梯度由反向算子（`compute`）与 loss backward（`stable`）产生，已被完全决定；
+- "张量精度"拆为 **`param`**（工厂创建的权重）；**激活/梯度不设独立参数**：按 Q3-A，算子输出存储精度 = 该算子的 P，激活由 `compute` 产生、梯度由反向算子（`compute`）与 loss backward（`stable`）产生；
 - "计算精度" = `compute`；
-- 新增 **`stable`**：f16 范围溢出（65504）风险集中在 softmax / loss / 归一化，显式化为构造器参数，替代"隐藏 floor 规则"；
+- 新增 **`stable`**：f16 范围溢出（65504）风险集中在 softmax / loss / 归一化，显式化为构造器参数；
 - "优化器精度" = `optimizer`（与计算精度解耦；f16 训练下 Adam 的 m/v 必须 f32，否则状态被 f16 舍入污染）。
 
 ### 9.2 注入机制（Layer 只写一次，P 可见）
@@ -380,7 +378,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 
 - 权重/嵌入表由工厂按 `param` 创建；优化器状态按 `optimizer` 创建。
 - 优化器更新算子全部显式：参数更新 P = `param`（in-place，存储不变），状态更新 P = `optimizer`。
-- **per-layer 覆盖 = Phase 2**：`p_` 本就是每层成员，改成员即覆盖（如末层 head 强制 F32），纯增量，不推翻 Phase 1。
+- **per-layer 覆盖 = Phase 2**：`p_` 本就是每层成员，改成员即覆盖（如末层 head 强制 F32），纯增量。
 - CLI 入口可选新增 `--f16` 标志 = master-weights 配方 `{param=F32, compute=F16, stable=F32, optimizer=F32}`（§9.4 第 3 行）。
 
 ### 9.4 典型配方
@@ -413,7 +411,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 **两个可见的推论**（写入文档防止误解）：
 
 1. **激活"弹跳"**：`stable` 算子按 Q3-A 输出存 F32 → 激活在层边界 f16→f32→f16 弹跳；f32 中间量最多多一个张量的显存，可接受。
-2. **权重按 op cast**：f32 权重每个 matmul 现降 cast（功能正确，有带宽开销）；**f16 权重镜像缓存 = Phase 2 优化（D 类），语义不变**。
+2. **权重按 op cast**：f32 权重每个 matmul 降 cast（功能正确，有带宽开销）；**f16 权重镜像缓存 = Phase 2 优化（D 类），语义不变**。
 
 ---
 
@@ -421,8 +419,8 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 
 ### 11.1 AOT 闭合世界（铁律 7，Q6 分期）
 
-- **Phase 1：`expr_spec_key` 不变。** 融合世界保持全 f32：f16 张量进出融合链时走**显式边界 cast**（cast 可融入首/尾 kernel 的 load/store，或独立小 kernel——工程选择，不影响语义）；f16 GEMM 是手写原语，不进 spec。GPU f16 训练在 Phase 1 的收益 = 显存减半 + 带宽减半 + GEMM 提速，**逐元素链的 in-kernel f16 收益 Phase 2 再拿**。
-- **Phase 2**：in-kernel f16 融合 → key 加 1B 精度维度；`glsl_gen` 生成 f16 变体（GLSL `f16vec*`，explicit arithmetic 扩展）；`CpuEmitter` 产物必须可编译并按 P 实例化——**CpuEmitter 现有隐性缺陷（docs/21 代码审查 P1-26 相关：BatchMod/BatchCol 未声明 batch、操作数走 default 等）必须在 Phase 2 前修复**，否则 f16 CPU 融合链不可信。
+- **Phase 1：`expr_spec_key` 不变。** 融合世界保持全 f32：f16 张量进出融合链时走**显式边界 cast**（cast 可融入首/尾 kernel 的 load/store，或独立小 kernel——工程选择）；f16 GEMM 是手写原语，不进 spec。GPU f16 训练在 Phase 1 的收益 = 显存减半 + 带宽减半 + GEMM 提速，**逐元素链的 in-kernel f16 收益 Phase 2 再拿**。
+- **Phase 2**：in-kernel f16 融合 → key 加 1B 精度维度；`glsl_gen` 生成 f16 变体（GLSL `f16vec*`，explicit arithmetic 扩展）；`CpuEmitter` 产物必须可编译并按 P 实例化——**CpuEmitter 现有隐性缺陷（BatchMod/BatchCol 未声明 batch、操作数走 default 等）必须在 Phase 2 前修复**，否则 f16 CPU 融合链不可信。
 
 ### 11.2 确定性契约（修订版）
 
@@ -430,11 +428,11 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 |---|---|
 | f32，同设备 | **不变**：并行 = 单线程逐字节（现状契约） |
 | f16，同 (设备, P, 路径) | 串行确定性；并行容差 = 与现有 f32 并行同级 |
-| f16，CPU vs GPU | **容差内相等**（建议 rtol 1e-2 / atol 1e-2，待实测校准，§16），不字节一致 |
+| f16，CPU vs GPU | **容差内相等**（建议 rtol 1e-2 / atol 1e-2，待实测校准），不字节一致 |
 | f16 路径 vs f32 路径 | 不可比（不同语义，Q4） |
 
 - gradcheck 容差**按 P 分级**（f32 沿用现值；f16 用 f16 表）。
-- 现有"并行非逐字节"的已知项（col_reduce 并行，AGENTS.md §12 未修清单）不在本文范围，f16 不使其恶化（同一路径内行为一致）。
+- 现有"并行非逐字节"的已知项（col_reduce 并行）不在本文范围，f16 不使其恶化。
 
 ### 11.3 序列化 v4 → v5
 
@@ -482,7 +480,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 | D6 | f16 计算实现：CPU（f32 参考 + 舍入；有 ISA 则向量化）；GPU（边界 cast 路径 + **f16 GEMM** 变体①，特性可用加变体②） | 两引擎 + `shaders/matmul_f16*.comp` |
 | D7 | `PrecisionProfile` + Model/Layer/Loss/Optimizer/工厂接线（全部显式 P） | `model_container.hpp`、`compute_layer_*.hpp`、`compute_loss.hpp`、`compute_optimizer.hpp`、`domain_*.hpp` |
 | D8 | 序列化 v5（每张量 tag）+ `model_spec` 精度字段 | `model_serialization.hpp`、`model_spec.hpp` |
-| D9 | gradcheck / 测试容差按 P 分级 + 新增测试集（§13） | `tests/` |
+| D9 | gradcheck / 测试容差按 P 分级 + 新增测试集 | `tests/` |
 
 ### 12.2 Phase 1 验收标准
 
@@ -499,7 +497,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 
 ### 12.3 Phase 2（列出，不在本期）
 
-1. in-kernel f16 融合：`expr_spec_key` 加精度维度、`glsl_gen` f16 变体、CpuEmitter 按 P 实例化（**前提：先修 CpuEmitter 既有缺陷，docs/21**）。
+1. in-kernel f16 融合：`expr_spec_key` 加精度维度、`glsl_gen` f16 变体、CpuEmitter 按 P 实例化（**前提：先修 CpuEmitter 既有缺陷**）。
 2. per-layer `PrecisionProfile` 覆盖（`p_` 成员已就位，纯增量）。
 3. bf16（兼容路径精度，§7.1 注）。
 4. f16 权重镜像缓存（消除按 op cast 的带宽开销）。
@@ -538,13 +536,13 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 
 | 风险 | 等级 | 对策 |
 |---|---|---|
-| L1 代数层模板化改动面大（`algebra_matrix.hpp` ~1000 行） | 高 | Phase 1 只实例化 F32 / F16；T1 A/B 测试强制 F32 逐字节不变；改动分批（先 `Matrix<P>` 壳 + F32 实例化验证，再接 F16） |
-| GPU f16 GEMM 是新代码路径 | 中 | 小矩阵先行 vs CPU f16 对拍；变体①（u8 对，设备无关）单一实现起步，特性可用再加② |
-| `shaderFloat16` 设备覆盖不全 | 低 | 无特性 = 兼容路径，功能正确（Q4），平滑降级（G2 的本意） |
-| AOT 世界被破坏 | 低 | Phase 1 key 不变（f16 GEMM 手写原语）；Phase 2 的 key 扩展在 §11.1 单独评审 |
+| L1 代数层模板化改动面大（`algebra_matrix.hpp` ~1000 行） | 高 | Phase 1 只实例化 F32 / F16；T1 A/B 测试强制 F32 逐字节不变；改动分批 |
+| GPU f16 GEMM 是新代码路径 | 中 | 小矩阵先行 vs CPU f16 对拍；变体①（u8 对，设备无关）单一实现起步 |
+| `shaderFloat16` 设备覆盖不全 | 低 | 无特性 = 兼容路径，功能正确（Q4），平滑降级 |
+| AOT 世界被破坏 | 低 | Phase 1 key 不变（f16 GEMM 手写原语）；Phase 2 的 key 扩展单独评审 |
 | f16 溢出导致训练发散 | 中 | `stable = F32` + §12.4 明示 + 训练 inf/nan 监控；loss scaling 留 Phase 2 |
-| CpuEmitter 既有隐性缺陷拖累 Phase 2 | 中 | 列 Phase 2 前置条件（docs/21 审查项） |
-| f16 容差取值不当（过松掩盖 bug / 过紧误报） | 中 | T4/T5 实测校准后定默认（§16），gradcheck 按 P 表分级 |
+| CpuEmitter 既有隐性缺陷拖累 Phase 2 | 中 | 列 Phase 2 前置条件 |
+| f16 容差取值不当（过松掩盖 bug / 过紧误报） | 中 | T4/T5 实测校准后定默认，gradcheck 按 P 表分级 |
 
 ---
 

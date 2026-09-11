@@ -1,7 +1,7 @@
 // ───────────────────────────────────────────────────────────────────────────
 //  expr_fuse_test.cpp — IR-C 图 IR 融合 GPU 端到端验证（begin_expr/end_expr）
 //
-//  验证内容（对应 docs/11-ir-optimization.md IR-C）：
+//  验证内容（对应 docs/development/03-ir-optimization.md IR-C）：
 //    1. FusedChainLayer forward：GPU（begin_expr 录制 → end_expr 融合 →
 //       AOT 融合 shader 单 kernel dispatch）vs CPU（逐节点求值）一致。
 //       —— 中间量 t/u 内联为寄存器，不落显存、不额外 dispatch。
