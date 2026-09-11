@@ -1,0 +1,495 @@
+#ifndef NN_COMPUTE_ENGINE_HPP
+#define NN_COMPUTE_ENGINE_HPP
+
+// ── compute_engine.hpp — 计算引擎抽象接口 ─────────────────────────────────
+// ComputeEngine 是与底层硬件接触的唯一抽象层。
+//
+// 设计原则（铁律）：
+//   1. 本接口只提供 op-level 原语（矩阵乘法、加法、转置、归约、广播、
+//      逐元素运算等），绝不包含任何算法。
+//   2. ReLU、GeLU、LayerNorm、Softmax、Attention 等算法由 Layer 层
+//      通过组合原语表达。
+//   3. Layer 持有 ComputeEngine 引用，forward/backward 只写一次，
+//      CPU/GPU 由引擎实现自动分发。
+//
+// 原语分类：
+//   - 矩阵级：matmul, batched_matmul, transpose, add_inplace, scale_inplace, zero
+//   - 归约级：row_reduce_sum, col_reduce_sum
+//   - 广播级：broadcast_row_inplace, broadcast_col_inplace
+//   - 逐元素：elementwise_unary, elementwise_binary, elementwise_binary_scalar
+//   - 条件选择：elementwise_select_scalar_cond
+//
+// 批处理控制：
+//   - begin_batch / end_batch：CPU 引擎为 no-op；GPU 引擎录制到
+//     command buffer，end_batch 时统一提交。
+// ─────────────────────────────────────────────────────────────────────────
+
+#include <cstddef>
+#include <span>
+#include <string>
+
+#include "config.hpp"
+#include "core_errors.hpp"
+#include "tensor.hpp"
+#include "expr_spec.hpp"
+
+namespace nn
+{
+
+// ══════════════════════════════════════════════════════════════════════════
+// 算子枚举（op-level，不含算法语义）
+// ══════════════════════════════════════════════════════════════════════════
+
+// 一元算子
+enum class UnaryOp : uint32_t
+{
+    Neg   = 0,  // -x
+    Exp   = 1,  // e^x
+    Log   = 2,  // ln(x)
+    Sqrt  = 3,  // √x
+    Rsqrt = 4,  // 1/√x
+    Abs   = 5,  // |x|
+    Tanh  = 6,  // tanh(x)
+};
+
+// 二元算子
+enum class BinaryOp : uint32_t
+{
+    Add = 0,  // a + b
+    Sub = 1,  // a - b
+    Mul = 2,  // a * b
+    Div = 3,  // a / b
+    Max = 4,  // max(a, b)
+    Min = 5,  // min(a, b)
+};
+
+// 比较算子（用于条件选择）
+enum class CompareOp : uint32_t
+{
+    Lt = 0,  // a <  b
+    Le = 1,  // a <= b
+    Gt = 2,  // a >  b
+    Ge = 3,  // a >= b
+    Eq = 4,  // a == b
+    Ne = 5,  // a != b
+};
+
+// 归约算子（matmul 融合原语用，op-level 无算法语义）
+enum class ReduceOp : uint32_t
+{
+    Sum = 0,
+    Max = 1,
+    Min = 2,
+};
+
+// ══════════════════════════════════════════════════════════════════════════
+// 通用注意力偏置/掩码描述子（AttnBias，两趟式原语掩码契约升级版 2026-08）
+//
+// 组合语义：把偏置加到得分上（score_j = alpha*s + bias；-inf = 屏蔽）：
+//   bias(bb,i,j) =
+//       dense（共享 (M,N) 掩码，旧契约；-inf 屏蔽 / 有限值作偏置）
+//     + (causal && j>i                       ? -inf : 0)
+//     + (doc_ids 非空 && doc[b,i]!=doc[b,j]  ? -inf : 0)   块对角文档感知
+//     + (slopes 非空                         ? -slope[h]*(i-j) : 0)  ALiBi
+// 其中两趟式原语的 batch 参数 = num_samples*num_heads；由 batch 索引
+// bb 分解：b = 样本号 = bb/num_heads，h = 头号 = bb%num_heads。
+// i = query 行，j = key 列。
+//
+// 说明：
+//   - dense / doc_ids / slopes 均为可选小张量（空 = 对应分量不启用）；
+//     causal 为纯标志位。组合即最一般情形（同时覆盖 因果/ALiBi/文档感知
+//     /组合，且保持两趟式不物化 (BH·seq,seq) 的显存收益）。
+//   - doc_ids：(1, num_samples*seq) 每位置文档 id（float 打包，< 2^24）。
+//   - slopes：(1, num_heads) ALiBi 按头斜率 m_h。
+//   - dense 保留旧共享掩码语义（仅供向后兼容/测试）；生产注意力走
+//     causal/doc_ids/slopes 组合路径。
+// ══════════════════════════════════════════════════════════════════════════
+struct AttnBias
+{
+    const Tensor* dense = nullptr;   // 共享 (M, N) 掩码（旧契约；空 = 无）
+    bool causal = false;             // 纯因果掩码 (j>i 屏蔽)
+    std::size_t num_heads = 1;       // 用于拆解 bb → (b,h)
+    const Tensor* doc_ids = nullptr; // (1, num_samples*seq)，块对角文档感知
+    const Tensor* slopes = nullptr;  // (1, num_heads)，ALiBi 按头斜率
+
+    // 便捷构造：仅共享稠密掩码（旧契约，测试用）
+    explicit AttnBias(const Tensor* dense_mask) : dense(dense_mask) {}
+    // 默认：无任何偏置/掩码
+    AttnBias() = default;
+};
+
+// ══════════════════════════════════════════════════════════════════════════
+// ComputeEngine — 计算引擎抽象接口
+// ══════════════════════════════════════════════════════════════════════════
+class ComputeEngine
+{
+public:
+    virtual ~ComputeEngine() = default;
+
+    // ── 设备查询 ──────────────────────────────────────────────────────────
+    [[nodiscard]] virtual Device device() const noexcept = 0;
+
+    // ── 批处理控制 ────────────────────────────────────────────────────────
+    // CPU 引擎：no-op（操作立即同步执行）
+    // GPU 引擎：begin 开始录制，end 统一提交 + fence wait
+    [[nodiscard]] virtual Result<void> begin_batch() = 0;
+    [[nodiscard]] virtual Result<void> end_batch() = 0;
+
+    // ── 表达式录制（计算级融合，M2 框架） ───────────────────────────────
+    // begin_expr 进入录制；期间 Layer 调 eval_expr / 组合原语；
+    // end_expr 时引擎做融合分析，将可融合子序列合成单 kernel。
+    //
+    // M2 现状（地基）：
+    //   - CPU 引擎：no-op（各表达式直接求值，行为不变）。
+    //   - GPU 引擎：no-op（各原语正常 dispatch；录制融合分析在 M3 落地，
+    //     届时 begin/end 之间的小中间量/逐元素链并入单 kernel）。
+    // Layer 可先行用 begin_expr/end_expr 包住算法段落，语义不变。
+    [[nodiscard]] virtual Result<void> begin_expr() = 0;
+    [[nodiscard]] virtual Result<void> end_expr() = 0;
+
+    // ── 批处理中点刷新（防 TDR） ─────────────────────────────────────────
+    // GPU 引擎：提交当前 command buffer 并等待完成，然后自动开始新的录制。
+    // 可在 forward 与 backward 之间调用，将一次大提交拆分为多次小提交，
+    // 避免单次提交时间过长触发 Windows TDR。
+    // CPU 引擎：no-op。
+    [[nodiscard]] virtual Result<void> flush_batch() { return {}; }
+
+    // ── 显存回收（L2）─────────────────────────────────────────────────
+    // GPU 引擎：在 end_batch（提交完成、延迟销毁已 flush）之后归还完全
+    // 空闲的内存池底材给 GPU。CPU/CUDA 引擎：no-op。
+    [[nodiscard]] virtual Result<void> release_idle_pool_blocks() { return {}; }
+
+    // ── 显存池统计（L2 仪器化）──────────────────────────────────────
+    // GPU 引擎返回池统计字符串（块数/占用/空闲/碎片）；CPU/CUDA 返回空。
+    // 用于训练中显存采样与逐项归因。
+    [[nodiscard]] virtual std::string pool_stats() const { return {}; }
+
+    // ── 激活 offload（L1-offload）───────────────────────────────────
+    // offload_store：把 GPU 激活复制到 host-visible 存储（释放 device-local
+    //    VRAM），返回一个 opaque 句柄。GPU 引擎录制式（batch 内不提交）；
+    //    CPU 引擎 no-op（返回 src 本身）。
+    // offload_load：从 offload_store 的句柄复制回 GPU，恢复为 (rows, cols)。
+    //    CPU 引擎 no-op（返回句柄 reshape 为 rows×cols）。
+    [[nodiscard]] virtual Result<Tensor> offload_store(const Tensor& src) { return src; }
+
+    [[nodiscard]] virtual Result<Tensor> offload_load(
+        const Tensor& handle, std::size_t rows, std::size_t cols)
+    {
+        return handle.reshape(rows, cols);
+    }
+
+    // ── activation offload slab（L1-offload，持久复用缓冲） ────────────
+    // 每个 GPTBlock 持有一块持久 host-visible slab，所有激活按 float 偏移
+    // 写入/读出，跨 step 复用 → RAM = 激活实际体积（避免每 tensor 独立
+    // 128MB 块导致的碎片膨胀）。CPU 引擎 no-op。
+    [[nodiscard]] virtual Result<Tensor> create_offload_buffer(std::size_t /*bytes*/)
+    {
+        return Tensor::cpu(1, 1);
+    }
+    // 把 src 复制到 buffer 的 offset（float 单位）处
+    [[nodiscard]] virtual Result<void> offload_save(
+        const Tensor& /*buffer*/, std::size_t /*offset*/, const Tensor& /*src*/)
+    {
+        return {};
+    }
+    // 从 buffer 的 offset（float 单位）处复制 rows×cols 到新 GPU tensor
+    [[nodiscard]] virtual Result<Tensor> offload_restore(
+        const Tensor& /*buffer*/, std::size_t /*offset*/,
+        std::size_t /*rows*/, std::size_t /*cols*/)
+    {
+        return Tensor::cpu(1, 1);
+    }
+
+    // ── 张量工厂 ──────────────────────────────────────────────────────────
+    [[nodiscard]] virtual Tensor create_tensor(std::size_t rows, std::size_t cols) = 0;
+    [[nodiscard]] virtual Result<Tensor> from_matrix(const Matrix& m) = 0;
+    [[nodiscard]] virtual Result<Matrix> to_matrix(const Tensor& t) = 0;
+
+    // 将 CPU Matrix 数据写入已有 Tensor（CPU 拷贝 / GPU 上传）
+    // 用于序列化加载、Optimizer 参数写回等场景
+    [[nodiscard]] virtual Result<void> copy_from(Tensor& dst, const Matrix& src) = 0;
+
+    // 深拷贝 Tensor（CPU 矩阵拷贝 / GPU buffer 拷贝，无 PCIe 传输）
+    // 用于需要修改中间结果但不影响原 Tensor 的场景
+    [[nodiscard]] virtual Result<Tensor> clone(const Tensor& src) = 0;
+
+    // ── 行切片原语（op-level 数据操作，不含算法语义） ──────────────────
+    // 返回 src 的行 [start_row, start_row + count) 的连续拷贝。
+    // 用于多头注意力中 per-head Q/K/V 切片等场景。
+    [[nodiscard]] virtual Result<Tensor> slice_rows(
+        const Tensor& src, std::size_t start_row, std::size_t count) = 0;
+
+    // 将 src 的所有行写入 dst 的行 [dst_start_row, dst_start_row + src.rows())。
+    // 真·就地修改（GPU 用 vkCmdCopyBuffer with dstOffset）。
+    // 用于多头注意力中 per-head 输出拼接等场景。
+    [[nodiscard]] virtual Result<void> insert_rows(
+        Tensor& dst, std::size_t dst_start_row, const Tensor& src) = 0;
+
+    // ── 行 gather / scatter-add 原语（op-level 数据操作） ────────────────
+    // gather_rows: 按 indices 从 table 中按行查表，等价于 tf.gather / torch.index_select
+    //   table: (vocab, D)
+    //   indices: (num_indices,) — 行索引；越界索引返回零行（防御性，不抛错）
+    //   输出: (num_indices, D)，out[i] = table[indices[i]]
+    // 典型用途：Token embedding 查表（避免 Layer 内手动 to_matrix + at_unchecked）
+    [[nodiscard]] virtual Result<Tensor> gather_rows(
+        const Tensor& table, const Tensor& indices) = 0;
+
+    // scatter_add_rows: 按 indices 把 grad 的行原子累加到 dst 的对应行
+    //   dst: (vocab, D)，原地修改
+    //   indices: (num_indices,)
+    //   grad: (num_indices, D)
+    //   语义: dst[indices[i]] += grad[i]  (重复 indices 会被多次累加)
+    // 典型用途：Embedding 反向梯度按 token ID 累加（替代 Layer 内手动循环）
+    [[nodiscard]] virtual Result<void> scatter_add_rows(
+        Tensor& dst, const Tensor& indices, const Tensor& grad) = 0;
+
+    // 3D 维度转置：(M, B, N) ↔ (B, M, N)
+    //   inverse=false: 输入 (M, B*N) → 输出 (B*M, N)
+    //     out[b*M + m, n] = in[m, b*N + n]
+    //   inverse=true:  输入 (B*M, N) → 输出 (M, B*N)
+    //     out[m, b*N + n] = in[b*M + m, n]
+    // 典型用途：MHA 批量化时把 (H*d_k, batch*seq) 重排为 (batch*H*d_k, seq)，
+    //   使 batched_matmul 能按 batch*H 切分行块。
+    [[nodiscard]] virtual Result<Tensor> rearrange_3d(
+        const Tensor& x, std::size_t M, std::size_t B, std::size_t N,
+        bool inverse = false) = 0;
+    // ── 矩阵转置：A (R, C) → out (C, R) ──
+    // 纯 layout 操作，零算法语义。用于 embedding 列布局转换等场景。
+    [[nodiscard]] virtual Result<Tensor> transpose(const Tensor& A) = 0;
+    // ══════════════════════════════════════════════════════════════════════
+    // 矩阵级原语
+    // ══════════════════════════════════════════════════════════════════════
+
+    // C = A × B（支持转置标志）
+    // transA: 使用 A^T，transB: 使用 B^T
+    [[nodiscard]] virtual Result<Tensor> matmul(
+        const Tensor& A, const Tensor& B,
+        bool transA = false, bool transB = false) = 0;
+
+    // 批量矩阵乘法：对每个 batch b 计算 C_b = alpha * op(A_b, B_b)，结果垂直堆叠
+    // A: (batch * A_rows_per_batch, A_cols) — 按 batch 切分为连续行块
+    // B: (batch * B_rows_per_batch, B_cols)
+    // 输出: (batch * M, N)，M/N 为每个 batch 的逻辑输出维度
+    //   transA=0: A_b 为 (M, K)，transA=1: A_b 存储为 (K, M) 按 A_b^T 使用
+    //   transB=0: B_b 为 (K, N)，transB=1: B_b 存储为 (N, K) 按 B_b^T 使用
+    // alpha: 输出缩放系数（cuBLAS sgemm 语义），GPU 在 shader 写出时一次完成，
+    //   供上层折叠 1/sqrt(d_k) 等系数，省去额外全矩阵 scale pass
+    // 典型用途：多头注意力的 Q^T×K 和 V×A 批量化（消除 per-head 循环）
+    [[nodiscard]] virtual Result<Tensor> batched_matmul(
+        const Tensor& A, const Tensor& B,
+        std::size_t batch,
+        bool transA = false, bool transB = false,
+        Scalar alpha = Scalar{1}) = 0;
+
+    // ══════════════════════════════════════════════════════════════════════
+    // matmul 融合原语（M4，两趟注意力的承载点；op-level，无算法语义）
+    //
+    // 共同约定：
+    //   - A/B 布局与 batched_matmul 相同（按 batch 垂直切分为连续行块）；
+    //     逻辑维度：M/K（A）、K/N（B），由 transA/transB 决定。
+    //   - bias（可选）：AttnBias 组合描述子（见上）；默认空 = 无掩码/偏置。
+    //   - 三原语均不物化中间 (M, N) 得分矩阵（GPU 融合 kernel 内部消解）。
+    // ══════════════════════════════════════════════════════════════════════
+
+    // 批量矩阵乘后沿输出列归约（softmax 数值稳定的分子/分母、norm 统计等）：
+    //   C_b[i] = reduce_j( alpha*op(A_b,B_b)[i][j] + bias(bb,i,j) )
+    // 输出：每 batch (M, 1) → 堆叠 (batch*M, 1)；reduce_cols=false 时
+    // 沿输出行归约 → 每 batch (1, N) → 堆叠 (batch, N)。
+    [[nodiscard]] virtual Result<Tensor> batched_matmul_reduce(
+        const Tensor& A, const Tensor& B, std::size_t batch,
+        ReduceOp op, bool transA, bool transB,
+        Scalar alpha, bool reduce_cols = true,
+        const AttnBias& bias = {}) = 0;
+
+    // 批量矩阵乘后：减行 max → exp → 沿输出列求和（softmax 分母，含数值稳定）：
+    //   l_b[i] = Σ_j exp( alpha*op(A_b,B_b)[i][j] + bias(bb,i,j) - row_max_b[i] )
+    // 输出：每 batch (M, 1) → 堆叠 (batch*M, 1)
+    [[nodiscard]] virtual Result<Tensor> batched_matmul_softmax_denom(
+        const Tensor& A, const Tensor& B, const Tensor& row_max,
+        std::size_t batch, bool transA, bool transB, Scalar alpha,
+        const AttnBias& bias = {}) = 0;
+
+    // 批量矩阵乘 + 行 softmax 归一化后与第三张量相乘累加（两趟式注意力 Pass 2）：
+    //   W_b[i][j] = exp( alpha*op(A_b,B_b)[i][j] + bias(bb,i,j) - row_max_b[i] ) / denom_b[i]
+    //   out_b[i][k] = Σ_j W_b[i][j] * V_b[j][k]
+    // V 布局同 batched_matmul（每 batch 垂直堆叠 (V_rows_per, N)）；
+    // 输出：每 batch (M, V_cols) → 堆叠 (batch*M, V_cols)。
+    [[nodiscard]] virtual Result<Tensor> batched_matmul_softmax_apply(
+        const Tensor& A, const Tensor& B, const Tensor& V,
+        const Tensor& row_max, const Tensor& denom,
+        std::size_t batch, bool transA, bool transB, Scalar alpha,
+        const AttnBias& bias = {}) = 0;
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 两趟式注意力反向融合原语（M6，重算 W 不物化得分矩阵）
+    //
+    // 语义（全部在 kernel 内部重算 W[i][j] = exp(alpha*score+bias-row_max)/denom，
+    // 绝不物化 (M, N) 得分/概率矩阵）：
+    //   Pass 1 (backward_q)：沿输出行归约 + 与 B 左乘（grad_Q）：
+    //     R[i]         = Σ_j W[i][j] * P[i][j]                    → r_out (batch*M,1)
+    //     grad_Q_b[k][i] = alpha * Σ_j W[i][j]*(P[i][j]-R[i])*B_b[k][j]
+    //                       → 返回 (batch*K, M)，每 batch (K, M)
+    //   Pass 2 (backward_kv)：与 A 左乘 + 与 G 右乘（grad_K 与 grad_V）：
+    //     grad_K_b[k][j] = alpha * Σ_i W[i][j]*(P[i][j]-R[i])*A_b[k][i]
+    //     grad_V_b[k][j] = Σ_i W[i][j] * G[i][k]
+    //                       → 返回 (batch*K, N)，每 batch (K, N)；grad_V 经 out 参数
+    // 共同约定：
+    //   - A 布局同 batched_matmul（每 batch (K, M) 按 transA 解释），B 每 batch (K, N)。
+    //   - P/G/R/row_max/denom 按 batch 垂直堆叠：P (batch*M,N)、G (batch*M,D)、
+    //     R/row_max/denom (batch*M,1)。
+    //   - bias（可选）：AttnBias 组合描述子，语义与 M4 原语一致。
+    //   - 返回 grad_Q / grad_K；R / grad_V 经 out 参数（引擎负责分配输出）。
+    // ══════════════════════════════════════════════════════════════════════
+
+    // Pass 1：行内积 R 与 grad_Q（单次 dispatch 计算两者，避免重复重算 W）。
+    [[nodiscard]] virtual Result<Tensor> batched_matmul_softmax_backward_q(
+        const Tensor& A, const Tensor& B, const Tensor& P,
+        const Tensor& row_max, const Tensor& denom,
+        std::size_t batch, bool transA, bool transB, Scalar alpha,
+        Tensor& r_out, const AttnBias& bias = {}) = 0;
+
+    // Pass 2：grad_K 与 grad_V（单次 dispatch 计算两者，共享重算的 W 列）。
+    [[nodiscard]] virtual Result<Tensor> batched_matmul_softmax_backward_kv(
+        const Tensor& A, const Tensor& B, const Tensor& P,
+        const Tensor& G, const Tensor& R,
+        const Tensor& row_max, const Tensor& denom,
+        std::size_t batch, bool transA, bool transB, Scalar alpha,
+        Tensor& grad_v_out, const AttnBias& bias = {}) = 0;
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 列式 softmax 相关融合原语（M5，CrossEntropy 融合的承载点；op-level 结构）
+    //
+    // 两者都不物化 (C, N) 的 exp/softmax 中间张量，读 logits 一遍写出结果。
+    // ══════════════════════════════════════════════════════════════════════
+
+    // 列式稳定 exp 和（softmax 分母等归一化统计）：
+    //   denom[c] = Σ_r exp( logits[r][c] - col_max[c] )
+    // logits: (C, N)，col_max: (1, N)（调用方先行 col_reduce_max）
+    // 输出：(1, N)。单 kernel 融合（工作组内先算减 max 的 exp 再求和），
+    // 可复用于任意"exp 后列归约"结构（dense softmax 分母、数值稳定等）。
+    [[nodiscard]] virtual Result<Tensor> col_softmax_denom(
+        const Tensor& logits, const Tensor& col_max) = 0;
+
+    // 列式稀疏 softmax 交叉熵融合：单 kernel 同时计算稠密梯度与标签位置
+    // log_softmax（不物化 (C, N) 全 softmax，只在标签位置做 -1 与 loss 收集）：
+    //   grad[c][i] = valid(i) ? inv_num_valid * exp(logits[c][i]-col_max[i])/denom[i]
+    //                          - [c == labels[i]] * inv_num_valid : 0
+    //   loss_vec[i] = valid(i) ? logits[labels[i]][i] - col_max[i] - log(denom[i]) : 0
+    //   其中 valid(i) = (mask 为空 || mask[i] >= 0.5) && (labels[i] < vocab_size)
+    // logits: (C, N)；labels: (1, N) 浮点打包的类别索引（值 < vocab_size ≤ C，
+    // 需精确表示，vocab_size ≤ 2^24）；mask（可选）: (1, N)（0/1，参与 loss 位置）
+    // 返回 grad (C, N)；loss_vec 经 out 参数 (1, N)。
+    [[nodiscard]] virtual Result<Tensor> col_softmax_sparse_forward(
+        const Tensor& logits, const Tensor& labels, const Tensor* mask,
+        std::size_t vocab_size, Scalar inv_num_valid, Tensor& loss_vec_out) = 0;
+
+    // A += B（逐元素，同形状）
+    [[nodiscard]] virtual Result<void> add_inplace(Tensor& A, const Tensor& B) = 0;
+
+    // A *= scalar
+    [[nodiscard]] virtual Result<void> scale_inplace(Tensor& A, Scalar s) = 0;
+
+    // A += scalar * B（融合 axpy：单次 dispatch 替代 clone+scale+add 三步）
+    // 用于 Optimizer 的 scale_add_ 辅助方法，减少 2 个临时 GPU buffer 分配
+    [[nodiscard]] virtual Result<void> axpy_inplace(Tensor& A, Scalar scalar, const Tensor& B) = 0;
+
+    // A = 0
+    [[nodiscard]] virtual Result<void> zero(Tensor& A) = 0;
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 归约原语
+    // ══════════════════════════════════════════════════════════════════════
+
+    // 按行求和：A (rows, cols) → out (rows, 1)
+    // out[r] = Σ_c A[r][c]
+    [[nodiscard]] virtual Result<Tensor> row_reduce_sum(const Tensor& A) = 0;
+
+    // 按列求和：A (rows, cols) → out (1, cols)
+    // out[c] = Σ_r A[r][c]
+    [[nodiscard]] virtual Result<Tensor> col_reduce_sum(const Tensor& A) = 0;
+
+    // 按行求最大值：A (rows, cols) → out (rows, 1)
+    // out[r] = max_c A[r][c]
+    [[nodiscard]] virtual Result<Tensor> row_reduce_max(const Tensor& A) = 0;
+
+    // 按列求最大值：A (rows, cols) → out (1, cols)
+    // out[c] = max_r A[r][c]
+    [[nodiscard]] virtual Result<Tensor> col_reduce_max(const Tensor& A) = 0;
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 广播原语
+    // ══════════════════════════════════════════════════════════════════════
+
+    // 按行广播：A (R, C) op= row_vec (R, 1)
+    // A[r][c] = op(A[r][c], row_vec[r][0])
+    [[nodiscard]] virtual Result<void> broadcast_row_inplace(
+        Tensor& A, const Tensor& row_vec, BinaryOp op) = 0;
+
+    // 按列广播：A (R, C) op= col_vec (1, C)
+    // A[r][c] = op(A[r][c], col_vec[0][c])
+    [[nodiscard]] virtual Result<void> broadcast_col_inplace(
+        Tensor& A, const Tensor& col_vec, BinaryOp op) = 0;
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 逐元素原语
+    // ══════════════════════════════════════════════════════════════════════
+
+    // out = unary_op(A)
+    [[nodiscard]] virtual Result<Tensor> elementwise_unary(
+        UnaryOp op, const Tensor& A) = 0;
+
+    // out = binary_op(A, B)
+    [[nodiscard]] virtual Result<Tensor> elementwise_binary(
+        BinaryOp op, const Tensor& A, const Tensor& B) = 0;
+
+    // out = binary_op(A, scalar) 或 binary_op(scalar, A)
+    // scalar_first=true: out = op(scalar, A)；false: out = op(A, scalar)
+    [[nodiscard]] virtual Result<Tensor> elementwise_binary_scalar(
+        BinaryOp op, const Tensor& A, Scalar s, bool scalar_first = false) = 0;
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 条件选择原语
+    // ══════════════════════════════════════════════════════════════════════
+
+    // out = compare_op(A, scalar_b) ? then_t : scalar_else
+    // 条件操作数 2 为标量，then 为张量，else 为标量。
+    // 典型用途：ReLU 反向 (x > 0) ? grad : 0
+    [[nodiscard]] virtual Result<Tensor> elementwise_select_scalar_cond(
+        CompareOp cmp, const Tensor& A, Scalar scalar_b,
+        const Tensor& then_t, Scalar scalar_else) = 0;
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 表达式求值（逐元素融合的统一入口）
+    // ══════════════════════════════════════════════════════════════════════
+
+    // 对一个逐元素表达式求值，输出 (rows, cols)。所有输入同形状。
+    //
+    // 这是"函数式逐元素原语"的表达式升级：单行内多次计算（如 RoPE 的
+    // q*cos + rotate(q)*sin、残差、激活）可合并为一次调用，减少临时 Tensor。
+    // 执行策略由后端决定（CPU 编译期模板求值；Vulkan AOT 融合 shader，闭合世界），
+    // Layer 侧无需关心——表达式是唯一逐元素编程模型。
+    //
+    // 语义与上限见 expr_spec.hpp（ExprSpec）。输出 = 最后一条指令的目标寄存器。
+    [[nodiscard]] virtual Result<Tensor> eval_expr(
+        const ExprSpec& spec,
+        std::span<const Tensor> inputs,
+        std::size_t rows, std::size_t cols) = 0;
+
+    // ── 归约向量原生形状输出（LayerNorm/RMSNorm 小向量缓存等） ──────────
+    // 语义同 eval_expr，但输出为归约向量本身（非广播）：
+    //   行归约轴 → (rows,1)；列归约轴 → (1,cols)。
+    // 要求表达式归约轴为 0/1（expr_spec_reduce_axis）。
+    // 默认实现返回错误（未支持的引擎）；CPU/GPU 覆盖。
+    [[nodiscard]] virtual Result<Tensor> eval_expr_reduce(
+        const ExprSpec& spec,
+        std::span<const Tensor> inputs,
+        std::size_t rows, std::size_t cols)
+    {
+        (void)spec; (void)inputs; (void)rows; (void)cols;
+        return std::unexpected(Error{"eval_expr_reduce: 该引擎不支持归约向量输出"});
+    }
+};
+
+} // namespace nn
+
+#endif // NN_COMPUTE_ENGINE_HPP

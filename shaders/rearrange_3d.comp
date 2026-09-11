@@ -1,0 +1,63 @@
+// ── rearrange_3d.comp ───────────────────────────────────────────────────────
+// 纯原语：3D 维度转置 (M, B, N) ↔ (B, M, N)
+//
+// 设计原则：本着色器只提供数据重排原语，不含任何算法语义。
+//
+// inverse=0: 输入 (M, B*N) → 输出 (B*M, N)
+//   out[b*M + m, n] = in[m, b*N + n]
+// inverse=1: 输入 (B*M, N) → 输出 (M, B*N)
+//   out[m, b*N + n] = in[b*M + m, n]
+//
+// Push Constants：
+//   uint M       — 第一维度大小
+//   uint B       — 第二维度大小
+//   uint N       — 第三维度大小
+//   uint inverse — 0=forward, 1=inverse
+//   uint total   — 元素总数 M*B*N
+// ─────────────────────────────────────────────────────────────────────────
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer  BufferIn  { float in_data[];  };
+layout(std430, binding = 1) writeonly buffer BufferOut { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint B;
+    uint N;
+    uint inverse;
+    uint total;
+};
+
+void main()
+{
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= total) return;
+
+    // 把线性索引 idx 分解为 (m, b, n) 或 (b, m, n)
+    if (inverse == 0u)
+    {
+        // 输入按 (M, B*N) 存储：idx = m * (B*N) + b * N + n
+        const uint n = idx % N;
+        const uint rest = idx / N;
+        const uint b = rest % B;
+        const uint m = rest / B;
+        // 输出按 (B*M, N) 存储：out_idx = (b * M + m) * N + n
+        const uint out_idx = (b * M + m) * N + n;
+        out_data[out_idx] = in_data[idx];
+    }
+    else
+    {
+        // 输入按 (B*M, N) 存储：idx = (b * M + m) * N + n
+        const uint n = idx % N;
+        const uint rest = idx / N;
+        const uint bm = rest;          // b * M + m
+        const uint m = bm % M;
+        const uint b = bm / M;
+        // 输出按 (M, B*N) 存储：out_idx = m * (B * N) + b * N + n
+        const uint out_idx = m * (B * N) + b * N + n;
+        out_data[out_idx] = in_data[idx];
+    }
+}
