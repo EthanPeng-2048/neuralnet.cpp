@@ -53,6 +53,8 @@ enum class ModelType : uint32_t
     GPT         = 3,
     ALiBi_GPT   = 4,  // 使用 ALiBi 的 GPT 模型（向后兼容）
     CNN         = 5,  // 卷积神经网络（LeNet 风格，MNIST）
+    ZiPT        = 6,  // AttnZip 记忆压缩解码器（zip + GPT）
+    RAPT        = 7,  // ReLU 激活线性注意力（ReLU-Linear Attention，causal LM）
 };
 
 // ── 模型架构描述 ─────────────────────────────────────────────────────────
@@ -78,6 +80,10 @@ struct ModelSpec
     ActivationType activation = ActivationType::GeLU;         // FFN 激活类型
     NormType norm_type = NormType::LayerNorm;                 // 归一化层类型
 
+    // ── ZiPT ──
+    std::size_t memory_tokens = 0;   // 记忆 token 数 M（AttnZip 瓶颈大小）
+    std::size_t window       = 0;   // 局部窗口 W（0=默认回退 seq_len，即旧行为 W=L 无压缩）
+
     // ── CNN ──
     std::size_t cnn_in_channels = 0;         // 输入通道数（MNIST=1）
     std::size_t cnn_in_size     = 0;         // 输入空间尺寸（方形，MNIST=28）
@@ -94,6 +100,8 @@ struct ModelSpec
     [[nodiscard]] bool is_gpt()         const noexcept { return type == ModelType::GPT; }
     [[nodiscard]] bool is_alibi_gpt()   const noexcept { return pos_encoding == PosEncodingType::ALiBi; }
     [[nodiscard]] bool is_cnn()         const noexcept { return type == ModelType::CNN; }
+    [[nodiscard]] bool is_zipt()        const noexcept { return type == ModelType::ZiPT; }
+    [[nodiscard]] bool is_rapt()        const noexcept { return type == ModelType::RAPT; }
 };
 
 // ── 架构一致性校验 ────────────────────────────────────────────────────────
@@ -110,6 +118,35 @@ struct ModelSpec
     // GPT 家族（GPT / ALiBi_GPT）——统一 GPTModel，比较共享字段
     auto gpt_family = [](const ModelSpec& s) { return s.is_gpt() || s.is_alibi_gpt(); };
     if (gpt_family(a) && gpt_family(b))
+    {
+        return a.vocab_size   == b.vocab_size &&
+               a.d_model      == b.d_model &&
+               a.seq_len      == b.seq_len &&
+               a.num_heads    == b.num_heads &&
+               a.d_ff         == b.d_ff &&
+               a.num_layers   == b.num_layers &&
+               a.pos_encoding == b.pos_encoding &&
+               a.activation   == b.activation &&
+               a.norm_type    == b.norm_type;
+    }
+
+    if (a.type == ModelType::ZiPT && b.type == ModelType::ZiPT)
+    {
+        return a.vocab_size    == b.vocab_size &&
+               a.d_model       == b.d_model &&
+               a.seq_len       == b.seq_len &&
+               a.num_heads     == b.num_heads &&
+               a.d_ff          == b.d_ff &&
+               a.num_layers    == b.num_layers &&
+               a.memory_tokens == b.memory_tokens &&
+               a.window        == b.window &&
+               a.pos_encoding  == b.pos_encoding &&
+               a.activation    == b.activation &&
+               a.norm_type     == b.norm_type;
+    }
+
+    // RAPT：ReLU-Linear Attention（causal LM），共享 GPT 类似字段
+    if (a.type == ModelType::RAPT && b.type == ModelType::RAPT)
     {
         return a.vocab_size   == b.vocab_size &&
                a.d_model      == b.d_model &&
@@ -161,9 +198,34 @@ struct ModelSpec
         case ModelType::GPT:         return "GPT";
         case ModelType::ALiBi_GPT:   return "ALiBi_GPT";
         case ModelType::CNN:         return "CNN";
+        case ModelType::ZiPT:        return "ZiPT";
+        case ModelType::RAPT:        return "RAPT";
         default:                     return "Unknown";
         }
     };
+
+    if (s.is_rapt())
+    {
+        return std::string(type_name(s.type)) + "(vocab=" + std::to_string(s.vocab_size) +
+               ",d_model=" + std::to_string(s.d_model) +
+               ",seq_len=" + std::to_string(s.seq_len) +
+               ",heads=" + std::to_string(s.num_heads) +
+               ",d_ff=" + std::to_string(s.d_ff) +
+               ",layers=" + std::to_string(s.num_layers) +
+               ",pos_enc=" + std::to_string(static_cast<unsigned>(s.pos_encoding)) + ")";
+    }
+
+    if (s.is_zipt())
+    {
+        return std::string(type_name(s.type)) + "(vocab=" + std::to_string(s.vocab_size) +
+               ",d_model=" + std::to_string(s.d_model) +
+               ",seq_len=" + std::to_string(s.seq_len) +
+               ",win=" + std::to_string(s.window) +
+               ",heads=" + std::to_string(s.num_heads) +
+               ",d_ff=" + std::to_string(s.d_ff) +
+               ",layers=" + std::to_string(s.num_layers) +
+               ",mem=" + std::to_string(s.memory_tokens) + ")";
+    }
 
     if (s.is_gpt() || s.is_alibi_gpt())
     {

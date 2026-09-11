@@ -90,24 +90,19 @@ option(NN_ENABLE_TESTS "Build test/verification executables" OFF)
 # 收集实际构建的目标，供 GPU/CUDA 统一启用（避免引用未定义目标）
 set(NN_APP_TARGETS "")
 set(NN_TEST_TARGETS "")
+set(NN_BENCH_TARGETS "")   # 性能基准已移除（2026 清理：bench 工具不注册 ctest 且无法在 -Werror 下编译）
 
-# ── MNIST 目标 ──────────────────────────────────────────────────────────────
+# ── MNIST 目标（标准构建核心应用） ───────────────────────────────────────
 nn_add_executable(mnist_train src/mnist_train.cpp)
 nn_add_executable(mnist_infer src/mnist_infer.cpp)
-nn_add_executable(mnist_bench src/mnist_bench.cpp)
-list(APPEND NN_APP_TARGETS mnist_train mnist_infer mnist_bench)
+list(APPEND NN_APP_TARGETS mnist_train mnist_infer)
 
-# ── 文本目标（GPT 训练/推理 + BPE 分词器训练/推理） ───────────────────
+# ── 文本目标（GPT 训练/推理 + BPE 分词器训练/推理，标准构建核心应用） ──
 nn_add_executable(text_train src/text_train.cpp)
 nn_add_executable(text_infer src/text_infer.cpp)
 nn_add_executable(tokenizer_train src/tokenizer_train.cpp)
 nn_add_executable(tokenizer_infer src/tokenizer_infer.cpp)
 list(APPEND NN_APP_TARGETS text_train text_infer tokenizer_train tokenizer_infer)
-
-# ── 计算性能基准工具 ─────────────────────────────────────────────────────
-nn_add_executable(compute_bench src/compute_bench.cpp)
-nn_add_executable(bench_thresholds src/bench_thresholds.cpp)
-list(APPEND NN_APP_TARGETS compute_bench bench_thresholds)
 
 # ── 测试 / 验证目标（默认关闭，NN_ENABLE_TESTS=ON 时构建）─────────────
 if(NN_ENABLE_TESTS)
@@ -119,6 +114,11 @@ if(NN_ENABLE_TESTS)
     # ── Attention 一致性验证（forward vs forward_step）──────────────────────
     nn_add_executable(attn_consistency_test src/attn_consistency_test.cpp)
     list(APPEND NN_TEST_TARGETS attn_consistency_test)
+
+    # ── GPU 注意力 W 表达式 batch 行号回归（多头/多 batch CPU/GPU 一致性，
+    #    4 组配置；回归 2026-08-27 审查 P0-1）────────────────────────────────
+    nn_add_executable(attn_w_batch_test src/attn_w_batch_test.cpp)
+    list(APPEND NN_TEST_TARGETS attn_w_batch_test)
 
     # ── SwiGLU 数值梯度检查（gradcheck，验证 split/merge 反向正确性）──────────
     nn_add_executable(swiglu_gradcheck src/swiglu_gradcheck.cpp)
@@ -156,6 +156,30 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(attn_gradcheck src/attn_gradcheck.cpp)
     list(APPEND NN_TEST_TARGETS attn_gradcheck)
 
+    # ── AttnZip（ZiPT）数值梯度检查（gradcheck：压缩 CrossAttention + 联合注意力块） ──
+    nn_add_executable(zipt_gradcheck src/zipt_gradcheck.cpp)
+    list(APPEND NN_TEST_TARGETS zipt_gradcheck)
+
+    # ── ZiPT（AttnZip）端到端冒烟测试（构建 + 规格往返 + 训练 loss 下降） ──
+    nn_add_executable(zipt_smoke_test src/zipt_smoke_test.cpp)
+    list(APPEND NN_TEST_TARGETS zipt_smoke_test)
+
+    # ── ZiPT CPU/GPU 一致性测试（同权重下 forward logits 与梯度范数对齐） ──
+    nn_add_executable(zipt_consistency_test src/zipt_consistency_test.cpp)
+    list(APPEND NN_TEST_TARGETS zipt_consistency_test)
+
+    # ── ZiPT 块级文档感知掩码正确性测试（doc_ids 隔离跨文档局部 key） ──
+    nn_add_executable(zipt_doc_test src/zipt_doc_test.cpp)
+    list(APPEND NN_TEST_TARGETS zipt_doc_test)
+
+    # ── RAPT（ReLU 线性注意力）数值梯度检查（gradcheck：RLA 核心 + 块） ──
+    nn_add_executable(rapt_gradcheck src/rapt_gradcheck.cpp)
+    list(APPEND NN_TEST_TARGETS rapt_gradcheck)
+
+    # ── RAPT（ReLU 线性注意力）端到端冒烟测试（构建 + 规格往返 + 训练 loss 下降） ──
+    nn_add_executable(rapt_smoke_test src/rapt_smoke_test.cpp)
+    list(APPEND NN_TEST_TARGETS rapt_smoke_test)
+
     # ── 融合 shader（AOT）GPU 数值验证（ExprSpec 单一事实来源 vs GPU 输出） ──
     nn_add_executable(fused_gpu_test src/fused_gpu_test.cpp)
     list(APPEND NN_TEST_TARGETS fused_gpu_test)
@@ -172,9 +196,21 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(expr_reduce_test src/expr_reduce_test.cpp)
     list(APPEND NN_TEST_TARGETS expr_reduce_test)
 
+    # ── matmul 参与 IR 融合测试（14 文档 S1+S2：MatmulSpec + CPU 正确性） ──
+    nn_add_executable(expr_matmul_test src/expr_matmul_test.cpp)
+    list(APPEND NN_TEST_TARGETS expr_matmul_test)
+
     # ── IR 优化 pass 测试（IR-A canonicalize + IR-B CSE/寄存器分配，纯 CPU） ─
     nn_add_executable(expr_opt_test src/expr_opt_test.cpp)
     list(APPEND NN_TEST_TARGETS expr_opt_test)
+
+    # ── 图 IR + 融合分析测试（IR-C：expr_graph.hpp 纯函数，无 GPU） ─────
+    nn_add_executable(expr_graph_test src/expr_graph_test.cpp)
+    list(APPEND NN_TEST_TARGETS expr_graph_test)
+
+    # ── 图 IR 融合 GPU 端到端（IR-C：begin_expr/end_expr 融合执行） ─────
+    nn_add_executable(expr_fuse_test src/expr_fuse_test.cpp)
+    list(APPEND NN_TEST_TARGETS expr_fuse_test)
 
     # ── ModelSpec 架构校验一致性测试（load_model 文件头 vs 模型规格比对） ────
     nn_add_executable(model_spec_validation_test src/model_spec_validation_test.cpp)
@@ -183,20 +219,6 @@ if(NN_ENABLE_TESTS)
     # ── Softmax 数值梯度检查（gradcheck，验证 softmax 反向） ───────────────────
     nn_add_executable(softmax_gradcheck src/softmax_gradcheck.cpp)
     list(APPEND NN_TEST_TARGETS softmax_gradcheck)
-
-    # ── 注意力反向逐级调试探针（对比暴力 Matrix 参考与引擎原语） ────────────
-    nn_add_executable(attn_debug src/attn_debug.cpp)
-    list(APPEND NN_TEST_TARGETS attn_debug)
-
-    # ── batched_matmul 原语探针（四种转置组合 vs 手工参考） ───────────────────
-    nn_add_executable(matmul_probe src/matmul_probe.cpp)
-    list(APPEND NN_TEST_TARGETS matmul_probe)
-
-    # ── M4 matmul 融合原语测试（bmm_reduce/bmm_denom/bmm_apply，CPU+GPU） ──
-    # ── M6 两趟式注意力反向原语测试（bmm_q_backward/bmm_kv_backward，CPU+GPU）
-    # ── M5 列式 softmax 融合原语测试（col_softmax_denom/col_softmax_sparse_forward）
-    nn_add_executable(matmul_fusion_test src/matmul_fusion_test.cpp)
-    list(APPEND NN_TEST_TARGETS matmul_fusion_test)
 
     # ── M5 稀疏交叉熵融合测试（loss/grad vs 参考，CPU+GPU） ──
     nn_add_executable(ce_fusion_test src/ce_fusion_test.cpp)
@@ -219,6 +241,11 @@ if(NN_ENABLE_TESTS)
         set_target_properties(${TARGET} PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test)
         add_test(NAME ${TARGET} COMMAND ${TARGET})
+    endforeach()
+    # 基准工具已移除（2026 清理：无法在 -Werror 下编译，且无 ctest 覆盖）
+    foreach(TARGET ${NN_BENCH_TARGETS})
+        set_target_properties(${TARGET} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test)
     endforeach()
 endif()
 
@@ -244,14 +271,7 @@ if(Vulkan_FOUND)
         broadcast
         transpose
         gather
-        scatter_add
-        bmm_reduce
-        bmm_denom
-        bmm_apply
-        bmm_q_backward
-        bmm_kv_backward
-        col_softmax_denom
-        col_softmax_sparse_forward)
+        scatter_add)
     # ── 融合 shader：构建期从 Layer 内联表达式自动合成 ───────────────
     # 表达式**文本只出现在 Layer**（compute / start_expr..end_expr）。
     # 构建期两步：
@@ -307,6 +327,10 @@ if(Vulkan_FOUND)
     target_link_libraries(scan_exprs PRIVATE nn_core Vulkan::Vulkan)
     add_custom_command(
         OUTPUT ${NN_EXPR_SCAN_BIN}
+        # scan_exprs 是原生可执行文件，直接写文件、不会自建目录。
+        # Ninja 会自动创建自定义命令的输出目录，但 Makefiles 生成器不会，
+        # 全新构建时 generated/ 尚未存在会写入失败（见 08-pitfalls）。
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/generated
         COMMAND scan_exprs ${NN_EXPR_SCAN_BIN}
         DEPENDS scan_exprs ${SCAN_SRC}
         COMMENT "[GPU] Scanning Layer expressions (scan_exprs) → expr_specs.bin"
@@ -319,6 +343,8 @@ if(Vulkan_FOUND)
     target_link_libraries(gen_fused PRIVATE nn_core)
     add_custom_command(
         OUTPUT ${NN_FUSED_REGISTRY_HPP}
+        # 同 scan_exprs：gen_fused 也是原生可执行文件，需先确保输出目录存在
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/generated
         COMMAND gen_fused ${CMAKE_BINARY_DIR}/generated ${GLSLC} ${NN_EXPR_SCAN_BIN}
         DEPENDS gen_fused ${FUSED_GEN_SRC} ${NN_EXPR_SCAN_BIN}
         COMMENT "[GPU] Synthesizing fused shaders (gen_fused) → fused_registry.hpp"

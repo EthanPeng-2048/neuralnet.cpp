@@ -12,7 +12,7 @@
 #include <cstddef>
 #include <ranges>
 
-#include "config.hpp"
+#include "core_config.hpp"
 #include "algebra_span.hpp"
 
 namespace nn::compute

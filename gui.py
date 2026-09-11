@@ -48,7 +48,7 @@ PRETRAINED_DIR = PROJECT_DIR / "pretrained"
 BUILD_DIR = PROJECT_DIR / "build"
 
 # ---------- 枚举选项 ----------
-ARCH_OPTIONS = ["mlp", "transformer"]
+ARCH_OPTIONS = ["mlp", "transformer", "cnn"]
 OPTIMIZER_OPTIONS = ["sgd", "sgd_momentum", "adam", "adamw", "muon"]
 ENGINE_OPTIONS = ["CPU", "GPU (Vulkan)", "CUDA"]
 LR_SCHEDULE_OPTIONS = ["fixed", "cosine"]
@@ -788,6 +788,15 @@ class MnistTrainTab(TabBase):
         self._tf_widgets = [self.tf_sep_label, self.d_model, self.num_heads,
                             self.num_layers, self.d_ff, self.patch_size, self.eval_samples]
 
+        # --- CNN 专用参数 (LeNet-5 风格) ---
+        self.cnn_sep_label = _make_label(p, "── CNN 参数 ──", r); r += 1
+        self.cnn_channels = _make_entry_row(p, "cnn_channels", r, "6,16"); r += 1
+        self.cnn_kernels = _make_entry_row(p, "cnn_kernels", r, "5,5"); r += 1
+        self.cnn_pool = _make_entry_row(p, "cnn_pool", r, "2"); r += 1
+        self.cnn_fc = _make_entry_row(p, "cnn_fc", r, "120,10"); r += 1
+        self._cnn_widgets = [self.cnn_sep_label, self.cnn_channels, self.cnn_kernels,
+                             self.cnn_pool, self.cnn_fc]
+
         # --- LR 调度相关控件（fixed 时隐藏） ---
         self._lr_schedule_widgets = [self.min_lr, self.warmup_epochs]
 
@@ -815,14 +824,17 @@ class MnistTrainTab(TabBase):
                 "device": dev, "data": data, "hyperparameters": args}
 
     def _on_arch_change(self, *args):
-        """根据架构选择显示 MLP 或 Transformer 参数"""
-        is_mlp = self.arch.get() == "mlp"
+        """根据架构选择显示 MLP / Transformer / CNN 参数"""
+        arch = self.arch.get()
         for w in self._mlp_widgets:
             w = getattr(w, "widget", w)
-            w.grid() if is_mlp else w.grid_remove()
+            w.grid() if arch == "mlp" else w.grid_remove()
         for w in self._tf_widgets:
             w = getattr(w, "widget", w)
-            w.grid() if not is_mlp else w.grid_remove()
+            w.grid() if arch == "transformer" else w.grid_remove()
+        for w in self._cnn_widgets:
+            w = getattr(w, "widget", w)
+            w.grid() if arch == "cnn" else w.grid_remove()
 
     def _on_lr_schedule_change(self, *args):
         """fixed 调度下隐藏 min_lr / warmup"""
@@ -854,16 +866,22 @@ class MnistTrainTab(TabBase):
         if self.min_lr.get(): args["min_lr"] = float(self.min_lr.get())
         if self.warmup_epochs.get(): args["warmup_epochs"] = int(self.warmup_epochs.get())
         # 架构特定参数
-        if self.arch.get() == "mlp":
+        arch = self.arch.get()
+        if arch == "mlp":
             if self.layer_dims.get(): args["layer_dims"] = self.layer_dims.get()
             args["norm"] = self.norm.get()
-        else:
+        elif arch == "transformer":
             if self.d_model.get(): args["d_model"] = int(self.d_model.get())
             if self.num_heads.get(): args["num_heads"] = int(self.num_heads.get())
             if self.num_layers.get(): args["num_layers"] = int(self.num_layers.get())
             if self.d_ff.get(): args["d_ff"] = int(self.d_ff.get())
             if self.patch_size.get(): args["patch_size"] = int(self.patch_size.get())
             if self.eval_samples.get(): args["eval_samples"] = int(self.eval_samples.get())
+        elif arch == "cnn":
+            if self.cnn_channels.get(): args["cnn_channels"] = self.cnn_channels.get()
+            if self.cnn_kernels.get(): args["cnn_kernels"] = self.cnn_kernels.get()
+            if self.cnn_pool.get(): args["cnn_pool"] = int(self.cnn_pool.get())
+            if self.cnn_fc.get(): args["cnn_fc"] = self.cnn_fc.get()
         return args
 
 
@@ -1271,7 +1289,7 @@ class GptTrainTab(TabBase):
         self.save_path = _make_save_row(p, "保存路径", r,
                                          default_name="gpt_model.bin"); r += 1
         self.resume_path = _make_file_row(p, "恢复路径", r,
-                                           filetypes=[("模型文件", "*.bin")]); r += 1
+                                           filetypes=[("模型文件", "*.bin *.nnpkg")]); r += 1
         self.test_file = _make_file_row(p, "测试集 (可选)", r,
                                          filetypes=[("文本文件", "*.txt")]); r += 1
         self.vocab_path = _make_file_row(p, "词表路径", r,
@@ -1319,6 +1337,12 @@ class GptTrainTab(TabBase):
                                             ACTIVATION_OPTIONS, "gelu"); r += 1
         self.norm_type = _make_option_row(p, "归一化层", r,
                                            GPT_NORM_OPTIONS, "layernorm"); r += 1
+        self.model_type = _make_option_row(p, "模型架构", r,
+                                            ["gpt", "zipt", "rapt"], "gpt"); r += 1
+        self.memory_tokens = _make_entry_row(p, "记忆 token 数 (M)", r, "32"); r += 1
+        self.window = _make_entry_row(p, "局部窗口 (W)", r, "0"); r += 1
+        self.model_type.trace_add("write", self._on_model_type_change)
+        self._on_model_type_change()
 
         # --- GPU 保护 ---
         _make_label(p, "── GPU 保护 ──", r); r += 1
@@ -1352,6 +1376,16 @@ class GptTrainTab(TabBase):
         name = Path(args.get("save", "gpt_model.bin")).stem or "gpt_run"
         return {"format_version": 1, "name": name, "task": "gpt",
                 "device": dev, "data": data, "hyperparameters": args}
+
+    def _on_model_type_change(self, *args):
+        """zipt 架构下显示记忆 token 数/窗口控件"""
+        is_zipt = self.model_type.get() == "zipt"
+        for w in (self.memory_tokens, self.window):
+            w = getattr(w, "widget", w)
+            if is_zipt:
+                w.grid()
+            else:
+                w.grid_remove()
 
     def _on_lr_schedule_change(self, *args):
         """fixed 调度下隐藏 min_lr / warmup / grad_clip"""
@@ -1430,6 +1464,9 @@ class GptTrainTab(TabBase):
         args["positional_encoding"] = self.positional_encoding.get()
         args["activation"] = self.activation.get()
         args["norm"] = self.norm_type.get()
+        args["model"] = self.model_type.get()
+        args.update(_int(self.memory_tokens, "memory_tokens"))
+        args.update(_int(self.window, "window", skip_vals=()))
         # GPU 保护
         args["tdr_retry"] = self.tdr_retry.get()
         args.update(_int(self.max_tdr_retries, "max_tdr_retries"))
@@ -1453,7 +1490,7 @@ class GptInferTab(TabBase):
         p = self.params_frame
         r = 0
         self.model_path = _make_file_row(p, "模型路径", r,
-                                          filetypes=[("模型文件", "*.bin *.pt")]); r += 1
+                                          filetypes=[("模型文件", "*.bin *.pt *.nnpkg")]); r += 1
         self.max_tokens = _make_entry_row(p, "最大生成token数", r, "200"); r += 1
         self.temperature = _make_entry_row(p, "温度 (0=贪心)", r, "0.8"); r += 1
         self.engine = _make_option_row(p, "计算引擎", r, ENGINE_OPTIONS, "CPU"); r += 1

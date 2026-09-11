@@ -79,6 +79,13 @@ Config parse_args(int argc, char *argv[])
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
             if (!v) { std::cerr << "无效 --vocab-size: " << v.error().message << "\n"; std::exit(1); }
+            if (*v < 258)
+            {
+                // BPE 词表 = 256 字节 + BOS/EOS；更小值会在
+                // merges_.reserve(vocab_size - 258) 无符号下溢 → abort
+                std::cerr << "--vocab-size 必须 >= 258（256 字节 + BOS/EOS）\n";
+                std::exit(1);
+            }
             cfg.vocab_size = *v;
         }
         else if (arg == "--min-freq" && i + 1 < argc)

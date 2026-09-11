@@ -11,7 +11,7 @@
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/model_serialization.hpp>
 #include <neuralnet.cpp/domain_mnist.hpp>
-#include <neuralnet.cpp/cli/engine_factory.hpp>
+#include <neuralnet.cpp/cli/cli_engine_factory.hpp>
 
 #include <algorithm>
 #include <cstdint>

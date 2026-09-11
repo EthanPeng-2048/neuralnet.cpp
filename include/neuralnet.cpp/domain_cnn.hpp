@@ -87,15 +87,19 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
         if (cv.kernel > h + 2 * cv.padding || cv.kernel > w + 2 * cv.padding)
             return std::unexpected(Error{"CNN: kernel larger than input spatial size"});
 
-        model.add<Conv2D>(engine, c, cv.out_channels, cv.kernel,
-                          cv.stride, cv.padding, h, w);
+        {
+            auto r = model.add<Conv2D>(c, cv.out_channels, cv.kernel,
+                                       cv.stride, cv.padding, h, w);
+            if (!r) return std::unexpected(r.error());
+        }
         h = conv_out_size(h, cv.kernel, cv.stride, cv.padding);
         w = conv_out_size(w, cv.kernel, cv.stride, cv.padding);
         c = cv.out_channels;
 
         if (cfg.pool > 0)
         {
-            model.add<MaxPool2D>(c, h, w, cfg.pool);
+            auto r = model.add<MaxPool2D>(c, h, w, cfg.pool);
+            if (!r) return std::unexpected(r.error());
             h = (h - cfg.pool) / cfg.pool + 1;
             w = (w - cfg.pool) / cfg.pool + 1;
         }
@@ -106,11 +110,20 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
         return std::unexpected(Error{"CNN: flattened size is zero"});
 
     // 全连接头：Linear(flatten → fc_dims[0]) → ReLU → ... → Linear(→ num_classes)
-    model.add<Linear>(engine, flattened, cfg.fc_dims[0]);
+    {
+        auto r = model.add<Linear>(flattened, cfg.fc_dims[0]);
+        if (!r) return std::unexpected(r.error());
+    }
     for (std::size_t i = 1; i < cfg.fc_dims.size(); ++i)
     {
-        model.add<ReLU>();
-        model.add<Linear>(engine, cfg.fc_dims[i - 1], cfg.fc_dims[i]);
+        {
+            auto r = model.add<ReLU>();
+            if (!r) return std::unexpected(r.error());
+        }
+        {
+            auto r = model.add<Linear>(cfg.fc_dims[i - 1], cfg.fc_dims[i]);
+            if (!r) return std::unexpected(r.error());
+        }
     }
     return model;
 }

@@ -58,22 +58,28 @@ public:
     }
 
     // ── 构建网络（通用模板接口） ────────────────────────────────────────
-    // 用法：model.add<Linear>(engine, in, out) / model.add<ReLU>() / ...
+    // 用法：model.add<Linear>(in, out) / model.add<ReLU>() / ...
+    // 注意：构造后自动调用 Layer::init()，无需手动调用。
     // 注意：MultiHeadAttention 的构造函数是 protected（设计为基类，
     //       由 TransformerEncoderLayer / CausalSelfAttention 内部组合），
     //       因此不直接通过 add 添加。
     template <typename LayerType, typename... Args>
-    Model& add(Args&&... args)
+    Result<void> add(Args&&... args)
     {
-        layers_.emplace_back(std::make_unique<LayerType>(std::forward<Args>(args)...));
-        return *this;
+        auto layer = std::make_unique<LayerType>(std::forward<Args>(args)...);
+        auto r = layer->init(engine());
+        if (!r) return std::unexpected(r.error());
+        layers_.emplace_back(std::move(layer));
+        return {};
     }
 
     // 添加已由工厂构造的 Layer（如 make_norm_layer 按 NormType 创建归一化层）
-    Model& add_layer(std::unique_ptr<Layer> layer)
+    Result<void> add_layer(std::unique_ptr<Layer> layer)
     {
+        auto r = layer->init(engine());
+        if (!r) return std::unexpected(r.error());
         layers_.emplace_back(std::move(layer));
-        return *this;
+        return {};
     }
 
     // ── 访问 ─────────────────────────────────────────────────────────────

@@ -413,7 +413,7 @@ include/neuralnet.cpp/
 │  ┌─ L4 构建层 ──────────────────────────────────────┐
 ├── domain_mnist.hpp       # MNIST 模型工厂（构建函数 + 超参数常量）
 ├── domain_gpt.hpp         # GPT 模型工厂（构建函数 + 超参数常量）
-├── domain_tokenizer.hpp   # 分词器（WordZip/BPE/ByteZip）
+├── domain_tokenizer.hpp   # 分词器（BPE/CharBPE）
 │
 │  ┌─ 统一入口 ──────────────────────────────────────┐
 └── nn.hpp                 # 统一入口头文件（聚合所有公共 API）

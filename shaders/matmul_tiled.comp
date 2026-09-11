@@ -131,9 +131,8 @@ void main()
         const uint out_row = block_row + ty * 4u + i;
         if (out_row >= M) continue;
         const uint out_col0 = block_col + tx * 4u;
-        if (out_col0 + 3u >= N && out_col0 >= N) continue;
-        if (out_col0 + 3u < N)
-            C[out_row * N + out_col0 + 0u] = acc[i].x;
+        if (out_col0 >= N) continue;
+        C[out_row * N + out_col0 + 0u] = acc[i].x;
         if (out_col0 + 1u < N)
             C[out_row * N + out_col0 + 1u] = acc[i].y;
         if (out_col0 + 2u < N)

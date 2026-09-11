@@ -17,10 +17,10 @@
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/model_serialization.hpp>
 #include <neuralnet.cpp/domain_mnist.hpp>
-#include <neuralnet.cpp/cli/engine_factory.hpp>
-#include <neuralnet.cpp/cli/lr_scheduler.hpp>
-#include <neuralnet.cpp/cli/mnist_io.hpp>
-#include <neuralnet.cpp/cli/train_common.hpp>
+#include <neuralnet.cpp/cli/cli_engine_factory.hpp>
+#include <neuralnet.cpp/cli/cli_lr_scheduler.hpp>
+#include <neuralnet.cpp/cli/cli_mnist_io.hpp>
+#include <neuralnet.cpp/cli/cli_train_common.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -250,6 +250,12 @@ TrainConfig parse_args(int argc, char *argv[])
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
             if (!v) { std::cerr << "无效 --patch-size: " << v.error().message << "\n"; std::exit(1); }
+            if (*v == 0 || nn::MNIST_IMG_SIZE % *v != 0)
+            {
+                std::cerr << "--patch-size 必须能整除 " << nn::MNIST_IMG_SIZE
+                          << "（当前: " << *v << "）\n";
+                std::exit(1);
+            }
             cfg.patch_size = *v;
         }
         else if (arg == "--max-samples" && i + 1 < argc)
@@ -296,6 +302,12 @@ TrainConfig parse_args(int argc, char *argv[])
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
             if (!v) { std::cerr << "无效 --cnn-pool: " << v.error().message << "\n"; std::exit(1); }
+            if (*v != 0 && *v > nn::MNIST_IMG_SIZE)
+            {
+                std::cerr << "--cnn-pool 不能大于输入边长 " << nn::MNIST_IMG_SIZE
+                          << "（当前: " << *v << "）\n";
+                std::exit(1);
+            }
             cfg.cnn_pool = *v;
         }
         else if (arg == "--cnn-fc" && i + 1 < argc)
@@ -509,7 +521,10 @@ int main(int argc, char *argv[])
         for (std::size_t i = 0; i < dims.size(); ++i)
         {
             std::cout << dims[i];
-            if (i < dims.size() - 2)
+            // norm+GeLU 挂在隐藏层 Linear 的输出维度上：dims[1]..dims[size-2]。
+            // 首元素 dims[0] 是输入、末元素 dims[size-1] 是 logits 输出，
+            // 两者都不挂 norm/激活（CE 损失需要原始 logits）。
+            if (i > 0 && i < dims.size() - 1)
                 std::cout << "(" << norm_name << "+GeLU)";
             if (i < dims.size() - 1)
                 std::cout << " -> ";

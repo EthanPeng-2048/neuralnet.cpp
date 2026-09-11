@@ -5,8 +5,6 @@
 // 自动根据 JSON 的 "type" 字段识别分词器类型：
 //   - bpe_tokenizer      → 字节级 BPE（BBPE）
 //   - char_bpe_tokenizer  → 字符级 BPE（支持中文）
-//   - wordzip_tokenizer   → WordZip 词级分词器
-//   - space_tokenizer     → 空白分词器
 //
 // 支持交互模式和命令行模式。
 // ─────────────────────────────────────────────────────────────────────────
@@ -37,7 +35,7 @@ void print_usage(const char *prog)
         << "  " << prog << " --vocab <path> <text-file>           统计文本文件每行 token 数\n\n"
         << "选项:\n"
         << "  --vocab <path>       词表 JSON 路径 (默认: bpe_vocab.json)\n"
-        << "                       自动识别分词器类型（bpe / charbpe / wordzip / space）\n"
+        << "                       自动识别分词器类型（bpe / charbpe）\n"
         << "  --encode <text>      编码文本为 token IDs\n"
         << "  --decode <ids>       解码 token IDs (逗号分隔) 为文本\n"
         << "  --encode-file <path> 编码整个文件（同时自动统计最长行 token 数）\n"
