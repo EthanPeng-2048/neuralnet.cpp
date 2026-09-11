@@ -1,5 +1,4 @@
-#ifndef NN_ALGEBRA_OPS_HPP
-#define NN_ALGEBRA_OPS_HPP
+#pragma once
 
 // ── ops.hpp — 表达式模板操作策略定义 ──────────────────────────────────────
 // 每个 Op 定义 CPU 行为（apply），用于构建编译期 AST，
@@ -173,4 +172,3 @@ struct Min
 
 } // namespace nn::ops
 
-#endif // NN_ALGEBRA_OPS_HPP

@@ -1,5 +1,4 @@
-#ifndef NN_EXPR_GLSL_GEN_HPP
-#define NN_EXPR_GLSL_GEN_HPP
+#pragma once
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  expr_glsl_gen.hpp — AOT 算子融合：ExprSpec → GLSL 计算 shader 源码
@@ -1310,8 +1309,9 @@ public:
 // 登记到 emitter 注册表（静态初始化；重复包含无害——同名拒绝覆盖）
 inline const bool kGlslEmitterRegistered =
     emitter_registry::register_backend("glsl",
-        []() -> ExprEmitter* { return new GlslEmitter(); });
+        []() -> std::unique_ptr<ExprEmitter> {
+            return std::make_unique<GlslEmitter>();
+        });
 
 } // namespace nn
 
-#endif // NN_EXPR_GLSL_GEN_HPP

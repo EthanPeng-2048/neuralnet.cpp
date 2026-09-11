@@ -1,5 +1,4 @@
-#ifndef NN_MODEL_SERIALIZATION_HPP
-#define NN_MODEL_SERIALIZATION_HPP
+#pragma once
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  model_io.hpp — 模型二进制序列化
@@ -22,6 +21,7 @@
 #include <vector>
 
 #include "core_config.hpp"
+#include "core_file.hpp"    // 二进制 POD 读写（cast 边界收敛点，docs/17 §2.1）
 #include "model_spec.hpp"
 #include "model_keyvalue_record.hpp"
 #include "compute_layer.hpp"
@@ -49,7 +49,7 @@ namespace nn
 // ═══════════════════════════════════════════════════════════════════════════
 
 inline constexpr uint32_t MODEL_MAGIC    = 0x4E4E4E4E;  // "NNNN"
-inline constexpr uint32_t MODEL_VERSION  = 4;            // 自描述格式起始版本
+inline constexpr uint32_t MODEL_VERSION  = 5;            // v5: per-tensor precision tags
 
 // ── 序列化待办（1.1，代码审查项 S3 / M1 / M2）────────────────────────────
 // S3: read_spec_header / read_tokenizer 直接用文件里的 uint64 长度预分配
@@ -78,18 +78,14 @@ static_assert(sizeof(Scalar) == 4 || sizeof(Scalar) == 8,
 namespace detail
 {
 
-// ── 安全二进制 I/O 辅助（替代 reinterpret_cast）─────────────────────
-// 使用 std::as_bytes(std::span) 实现类型安全的二进制读写，
-// 避免直接 reinterpret_cast<char*>。
+// ── 安全二进制 I/O 辅助（转发 L0 收敛点 core_file.hpp::write_pod/read_pod）
+// 字节级 reinterpret_cast 只出现在 core_file.hpp（docs/17 §2.1）。
 
 template <typename T>
     requires std::is_trivially_copyable_v<T>
 [[nodiscard]] inline Result<void> write_bytes(std::ofstream &ofs, const T &v)
 {
-    auto bytes = std::as_bytes(std::span(&v, 1));
-    ofs.write(reinterpret_cast<const char *>(bytes.data()),
-              static_cast<std::streamsize>(bytes.size_bytes()));
-    if (!ofs)
+    if (!nn::write_pod(ofs, v))
         return std::unexpected(Error{"Write error"});
     return {};
 }
@@ -99,10 +95,7 @@ template <typename T>
 [[nodiscard]] inline Result<T> read_bytes(std::ifstream &ifs)
 {
     T v{};
-    auto bytes = std::as_writable_bytes(std::span(&v, 1));
-    ifs.read(reinterpret_cast<char *>(bytes.data()),
-             static_cast<std::streamsize>(bytes.size_bytes()));
-    if (!ifs)
+    if (!nn::read_pod(ifs, v))
         return std::unexpected(Error{"Unexpected end of file"});
     return v;
 }
@@ -160,18 +153,86 @@ template <typename... Ts>
     return values;
 }
 
-// ── 矩阵读写 ──────────────────────────────────────────────────────────
+// ── 矩阵读写（v5：per-tensor precision tag）──────────────────────────────
 
+// v5：写入矩阵时附带 precision tag（1B），tag 值见 precision_tag()
+[[nodiscard]] inline Result<void> write_matrix_v5(std::ofstream &ofs, const Matrix &m, Precision p)
+{
+    // 写入 precision tag（§11.3）
+    if (auto r = write_bytes<uint8_t>(ofs, precision_tag(p)); !r)
+        return std::unexpected(r.error());
+    // 写入形状
+    if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.rows())); !r)
+        return std::unexpected(r.error());
+    if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.cols())); !r)
+        return std::unexpected(r.error());
+    // 写入数据
+    if (!nn::write_pod_span(ofs, m.span()))
+        return std::unexpected(Error{"Write error while writing matrix data"});
+    return {};
+}
+
+// v5：写入 f16 矩阵
+[[nodiscard]] inline Result<void> write_matrix_fp16(std::ofstream &ofs, const MatrixT<Precision::F16> &m)
+{
+    if (auto r = write_bytes<uint8_t>(ofs, precision_tag(Precision::F16)); !r)
+        return std::unexpected(r.error());
+    if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.rows())); !r)
+        return std::unexpected(r.error());
+    if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.cols())); !r)
+        return std::unexpected(r.error());
+    if (!nn::write_pod_span(ofs, m.span()))
+        return std::unexpected(Error{"Write error while writing f16 matrix data"});
+    return {};
+}
+
+// v5：读取矩阵（自动识别 precision tag）
+[[nodiscard]] inline Result<std::pair<Precision, Matrix>> read_matrix_v5(std::ifstream &ifs)
+{
+    // 读取 precision tag
+    auto tag_r = read_bytes<uint8_t>(ifs);
+    if (!tag_r) return std::unexpected(tag_r.error());
+    Precision p = precision_from_tag(*tag_r);
+    if (p != Precision::F32 && p != Precision::F16)
+        return std::unexpected(Error{"Unsupported precision tag in v5: " + std::to_string(*tag_r)});
+
+    // 读取形状
+    auto rows_r = read_bytes<uint64_t>(ifs);
+    if (!rows_r) return std::unexpected(rows_r.error());
+    auto cols_r = read_bytes<uint64_t>(ifs);
+    if (!cols_r) return std::unexpected(cols_r.error());
+    const auto rows = static_cast<std::size_t>(*rows_r);
+    const auto cols = static_cast<std::size_t>(*cols_r);
+
+    if (p == Precision::F16)
+    {
+        // 读取 f16 数据到临时 buffer，然后转为 f32 Matrix
+        std::vector<f16> buf(rows * cols);
+        if (!nn::read_pod_span(ifs, std::span<f16>(buf.data(), buf.size())))
+            return std::unexpected(Error{"Unexpected end of file while reading f16 matrix data"});
+        // 转为 f32（升 cast，精确无损）
+        Matrix m(rows, cols);
+        auto span = m.span();
+        for (std::size_t i = 0; i < buf.size(); ++i)
+            span[i] = static_cast<float>(buf[i]);
+        return std::make_pair(Precision::F16, std::move(m));
+    }
+
+    // F32 路径
+    Matrix m(rows, cols);
+    if (!nn::read_pod_span(ifs, m.span()))
+        return std::unexpected(Error{"Unexpected end of file while reading matrix data"});
+    return std::make_pair(Precision::F32, std::move(m));
+}
+
+// ── v4 兼容：无 precision tag 的矩阵读写 ─────────────────────────────────
 [[nodiscard]] inline Result<void> write_matrix(std::ofstream &ofs, const Matrix &m)
 {
     if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.rows())); !r)
         return std::unexpected(r.error());
     if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.cols())); !r)
         return std::unexpected(r.error());
-    const auto s = m.span();
-    ofs.write(reinterpret_cast<const char *>(s.data()),
-              static_cast<std::streamsize>(s.size_bytes()));
-    if (!ofs)
+    if (!nn::write_pod_span(ofs, m.span()))
         return std::unexpected(Error{"Write error while writing matrix data"});
     return {};
 }
@@ -193,10 +254,7 @@ template <typename... Ts>
             + std::to_string(rows) + ", " + std::to_string(cols) + ")"});
     }
 
-    auto s = m.span();
-    ifs.read(reinterpret_cast<char *>(s.data()),
-             static_cast<std::streamsize>(s.size_bytes()));
-    if (!ifs)
+    if (!nn::read_pod_span(ifs, m.span()))
         return std::unexpected(Error{"Unexpected end of file while reading matrix data"});
     return {};
 }
@@ -374,14 +432,14 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
     auto version_r = read_bytes<uint32_t>(ifs);
     if (!version_r) return std::unexpected(version_r.error());
     const auto version = *version_r;
-    if (version < MODEL_VERSION)
+    if (version < 4)
         return std::unexpected(Error{"模型文件为旧格式 (v" + std::to_string(version)
                            + ")，已不再支持；请用当前版本重新训练/保存。"});
     if (version > MODEL_VERSION)
         return std::unexpected(Error{"模型文件版本过新 (v" + std::to_string(version)
                            + " > v" + std::to_string(MODEL_VERSION) + ")，请升级程序。"});
 
-    // 读取并校验精度标记
+    // 读取并校验精度标记（v4/v5 通用）
     auto pt_result = read_bytes<uint8_t>(ifs);
     if (!pt_result)
         return std::unexpected(Error{"Unexpected end: missing precision tag"});
@@ -433,8 +491,9 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
 //  peek_model_spec — 只读文件头，返回 ModelSpec（不读参数）
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ── 保存模型（v4 自描述格式） ───────────────────────────────────────────
-// 参数为 Tensor*，通过 engine.to_matrix 下载到 CPU Matrix 后写入。
+// ── 保存模型（v5：per-tensor precision tag）──────────────────────────────
+// 参数为 Tensor*，通过 engine.to_matrix 下载到 CPU 后写入。
+// v5 格式：每个矩阵前加 1B precision tag（0=f32, 2=f16）。
 [[nodiscard]] inline Result<void> save_model(const std::string &filename,
     Model &model, const ModelSpec &spec, const std::string &tokenizer_json = {})
 {
@@ -451,23 +510,52 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
     auto params = model.parameters();
     for (auto& p_tensor : params)
     {
-        auto m = engine.to_matrix(p_tensor);
-        if (!m) return std::unexpected(m.error());
-        if (auto r = detail::write_matrix(ofs, *m); !r)
-            return std::unexpected(r.error());
+        Precision p = p_tensor.get().precision();
+        if (p == Precision::F16)
+        {
+            // f16 参数：写入带 f16 tag
+            // 对于 CPU f16 tensor，直接访问底层 f16 数据
+            if (p_tensor.get().is_cpu())
+            {
+                const auto& m16 = p_tensor.get().cpu_matrix<Precision::F16>();
+                if (auto r = detail::write_matrix_fp16(ofs, m16); !r)
+                    return std::unexpected(r.error());
+            }
+            else
+            {
+                // GPU f16：download 到 CPU（f32 升 cast），再写 f16
+                auto m32_r = engine.to_matrix(p_tensor, Precision::F32);
+                if (!m32_r) return std::unexpected(m32_r.error());
+                MatrixT<Precision::F16> m16(m32_r->rows(), m32_r->cols());
+                const auto src = m32_r->span();
+                auto dst = m16.span();
+                for (std::size_t i = 0; i < src.size(); ++i)
+                    dst[i] = src[i];
+                if (auto r = detail::write_matrix_fp16(ofs, m16); !r)
+                    return std::unexpected(r.error());
+            }
+        }
+        else
+        {
+            // f32 参数（默认路径）
+            auto m = engine.to_matrix(p_tensor, Precision::F32);
+            if (!m) return std::unexpected(m.error());
+            if (auto r = detail::write_matrix_v5(ofs, *m, p); !r)
+                return std::unexpected(r.error());
+        }
     }
 
-    // 非可学习状态（如 BatchNorm 的 running_mean/running_var），紧跟在参数之后
+    // 非可学习状态（如 BatchNorm 的 running_mean/running_var）
     auto extras = model.extra_state();
     for (auto& e_tensor : extras)
     {
         auto m = engine.to_matrix(e_tensor);
         if (!m) return std::unexpected(m.error());
-        if (auto r = detail::write_matrix(ofs, *m); !r)
+        if (auto r = detail::write_matrix_v5(ofs, *m, e_tensor.get().precision()); !r)
             return std::unexpected(r.error());
     }
 
-    // V3: 写入 tokenizer JSON（长度前缀，0 表示无）
+    // tokenizer JSON（长度前缀，0 表示无）
     if (auto r = detail::write_tokenizer(ofs, tokenizer_json); !r)
         return std::unexpected(r.error());
 
@@ -491,8 +579,8 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
 
 // ── 加载参数 + tokenizer ───────────────────────────────────────────────
 //    返回嵌入的 tokenizer 数据字符串（空串 = 未嵌入）
-// 新架构：先 read_matrix 读入临时 CPU Matrix，再通过 engine.copy_from
-// 上传到参数 Tensor（CPU 拷贝 / GPU 上传由引擎实现决定）。
+// v5：per-tensor precision tag（读取时自动识别 f32/f16）
+// v4：无 precision tag（所有矩阵为 f32）
 [[nodiscard]] inline Result<std::string> load_model(const std::string &filename, Model &model)
 {
     std::ifstream ifs(filename, std::ios::binary);
@@ -501,11 +589,10 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
 
     auto version_r = detail::read_and_validate_header(ifs);
     if (!version_r) return std::unexpected(version_r.error());
+    const uint32_t version = *version_r;
 
-    // 读取并跳过规格头（规格已隐含在构建好的 model 中）
-    // 若 model 记录了架构规格（Model::spec()，由 build_*_from_spec 设置），
-    // 则与文件头部规格做一致性校验，防止把不匹配的参数加载进模型。
-    auto spec_r = detail::read_spec_header(ifs, *version_r);
+    // 读取并校验规格头
+    auto spec_r = detail::read_spec_header(ifs, version);
     if (!spec_r) return std::unexpected(spec_r.error());
 
     if (auto stored = model.spec(); stored)
@@ -521,37 +608,80 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
 
     auto& engine = model.engine();
     auto params = model.parameters();
-    for (auto& p_tensor : params)
+
+    if (version >= 5)
     {
-        // 先读入临时 Matrix（按参数 Tensor 的形状）
-        Matrix tmp(p_tensor.get().rows(), p_tensor.get().cols());
-        if (auto r = detail::read_matrix(ifs, tmp); !r)
-            return std::unexpected(r.error());
-        // 通过 engine 上传到参数 Tensor
-        if (auto r = engine.copy_from(p_tensor, tmp); !r)
-            return std::unexpected(r.error());
+        // ── v5：per-tensor precision tag ─────────────────────────────
+        for (auto& p_tensor : params)
+        {
+            auto result_r = detail::read_matrix_v5(ifs);
+            if (!result_r) return std::unexpected(result_r.error());
+            auto& [file_prec, file_matrix] = *result_r;
+
+            // 统一接口：from_matrix(m, P) 上传到目标精度
+            Precision target_p = p_tensor.get().precision();
+            if (file_prec == target_p)
+            {
+                // 同精度：直接上传
+                auto uploaded = engine.from_matrix(file_matrix, target_p);
+                if (!uploaded) return std::unexpected(uploaded.error());
+                // copy_from 从上传结果写入目标 tensor
+                if (auto r = engine.copy_from(p_tensor, file_matrix); !r)
+                    return std::unexpected(r.error());
+            }
+            else
+            {
+                // 跨精度：cast 后上传
+                auto uploaded = engine.from_matrix(file_matrix, file_prec);
+                if (!uploaded) return std::unexpected(uploaded.error());
+                auto casted = engine.cast(*uploaded, target_p);
+                if (!casted) return std::unexpected(casted.error());
+                // 从 cast 结果下载为 f32，再 copy_from
+                auto m32 = engine.to_matrix(*casted, Precision::F32);
+                if (!m32) return std::unexpected(m32.error());
+                if (auto r = engine.copy_from(p_tensor, *m32); !r)
+                    return std::unexpected(r.error());
+            }
+        }
+    }
+    else
+    {
+        // ── v4：无 precision tag（所有矩阵为 f32）───────────────────
+        for (auto& p_tensor : params)
+        {
+            Matrix tmp(p_tensor.get().rows(), p_tensor.get().cols());
+            if (auto r = detail::read_matrix(ifs, tmp); !r)
+                return std::unexpected(r.error());
+            if (auto r = engine.copy_from(p_tensor, tmp); !r)
+                return std::unexpected(r.error());
+        }
     }
 
-    // 非可学习状态（如 BatchNorm 的 running_mean/running_var），紧跟在参数之后。
-    // 旧文件（无额外状态）读到 EOF 时保持默认（running_mean=0, running_var=1）。
-    // 注意：读取前用 peek() 检查 EOF，而非依赖 read_matrix 读失败后回退——
-    //   read_matrix 在 shape 不匹配时也会报错，不应吞掉真正的损坏。
+    // 非可学习状态
     auto extras = model.extra_state();
     for (auto& e_tensor : extras)
     {
-        // 已经没有更多数据 → 保持默认值（零/一），跳过剩余 extras
         if (ifs.peek() == EOF) break;
 
-        // 先读入临时 Matrix（按状态 Tensor 的形状）
-        Matrix tmp(e_tensor.get().rows(), e_tensor.get().cols());
-        auto mr = detail::read_matrix(ifs, tmp);
-        if (!mr)
-            return std::unexpected(mr.error());
-        if (auto r = engine.copy_from(e_tensor, tmp); !r)
-            return std::unexpected(r.error());
+        if (version >= 5)
+        {
+            auto result_r = detail::read_matrix_v5(ifs);
+            if (!result_r) return std::unexpected(result_r.error());
+            auto& [file_prec, file_matrix] = *result_r;
+            if (auto r = engine.copy_from(e_tensor, file_matrix); !r)
+                return std::unexpected(r.error());
+        }
+        else
+        {
+            Matrix tmp(e_tensor.get().rows(), e_tensor.get().cols());
+            auto mr = detail::read_matrix(ifs, tmp);
+            if (!mr) return std::unexpected(mr.error());
+            if (auto r = engine.copy_from(e_tensor, tmp); !r)
+                return std::unexpected(r.error());
+        }
     }
 
-    // 读取嵌入的 tokenizer 数据
+    // 读取 tokenizer
     std::string tokenizer_json;
     {
         auto tok_r = detail::read_tokenizer(ifs);
@@ -566,4 +696,3 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
 
 } // namespace nn
 
-#endif // NN_MODEL_SERIALIZATION_HPP

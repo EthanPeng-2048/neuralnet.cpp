@@ -166,8 +166,12 @@ int main(int argc, char* argv[])
         if (!full_m) return 1;
 
         // 逐 token 增量（运行态 KV cache）
+        // RLA-2 状态：B_state (d_model, d_k) + z_state (d_model, 1)
         const std::size_t dk = d_model / heads;
-        nn::Matrix A(d_model, dk, nn::Scalar{0}), B(d_model, dk, nn::Scalar{0});
+        nn::Tensor B_state = eng.create_tensor(d_model, dk);
+        { auto zr = eng.zero(B_state); if (!zr) { std::cerr << "kv zero B_state failed\n"; return 1; } }
+        nn::Tensor z_state = eng.create_tensor(d_model, 1);
+        { auto zr = eng.zero(z_state); if (!zr) { std::cerr << "kv zero z_state failed\n"; return 1; } }
         nn::Tensor inc_out;
         for (std::size_t t = 0; t < L; ++t)
         {
@@ -176,8 +180,8 @@ int main(int argc, char* argv[])
                 col.set_value_unchecked(r, 0, x_m.at_unchecked(r, t));
             auto col_t = eng.from_matrix(col);
             if (!col_t) return 1;
-            auto o = attn.forward_step(eng, *col_t, A, B, t);
-            if (!o) { std::cerr << "kv forward_step failed\n"; return 1; }
+            auto o = attn.forward_step(eng, *col_t, B_state, z_state, t);
+            if (!o) { std::cerr << "kv forward_step failed: " << o.error().message << "\n"; return 1; }
             inc_out = std::move(*o);
         }
         auto inc_m = eng.to_matrix(inc_out);

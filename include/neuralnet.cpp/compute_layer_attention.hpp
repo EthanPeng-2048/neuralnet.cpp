@@ -1,7 +1,7 @@
-#ifndef NN_COMPUTE_LAYER_ATTENTION_HPP
-#define NN_COMPUTE_LAYER_ATTENTION_HPP
+#pragma once
 
 #include "compute_layer_base.hpp"
+#include "compute_layer_mlp.hpp"
 #include "compute_layer_softmax.hpp"
 
 #include <algorithm>
@@ -197,9 +197,8 @@ protected:
     Tensor attn_cache_;                    // (batch*H*seq, seq) 旧路径缓存
 
     // 两趟式缓存（M6→S7）：m/l 替代 attn_cache_（不物化得分矩阵）；
-    // W_cache_（S7）为物化的 softmax 权重 (BH*seq, seq)，backward 复用
+    // P0-5：W_cache_ 已删除（backward 改为从 Q/K/m/l 重算，省 6.4G）
     Tensor m_cache_, l_cache_;   // (batch*H*seq, 1)：行 max / softmax 分母
-    Tensor W_cache_;             // (batch*H*seq, seq)：softmax 权重（S7 物化）
     bool two_pass_active_ = false;  // forward 是否走了两趟式路径（backward 读取）
 
     // ── S7：掩码输入张量钩子（IR 掩码表达式用；空 = 无该分量）──────────
@@ -254,6 +253,43 @@ protected:
         const auto alibi = dsl::batch_mod(*mask_slopes_(), num_heads_)
                          * (dsl::col() - dsl::row());
         return scores + dsl::select(blocked != Scalar{0}, kNegInf_, alibi);
+    }
+
+    // ── P0-5：从 Q/K/m/l 重算 W（消除 W_cache_ 的 6.4G 显存占用）──────
+    // 与 forward 的 compute_W 使用同一 DSL 表达式（闭合世界 key 一致）；
+    // attention FLOPs ×1.5–2（QK^T 在 backward 重算），训练可接受。
+    // 返回 (BH*seq, seq) 的 softmax 归一化权重。
+    [[nodiscard]] Result<Tensor> recompute_W_(
+        ComputeEngine& engine,
+        const Tensor& Q, const Tensor& K,
+        const Tensor& m_t, const Tensor& l_t,
+        std::size_t BH, std::size_t seq) const
+    {
+        const bool use_slopes = use_alibi_mask_();
+        const bool use_doc = use_doc_mask_();
+        if (use_slopes && use_doc)
+            return dsl::compute(engine,
+                dsl::exp(masked_alibi_doc_(
+                    dsl::matmul(Q, K, true, false, BH), seq)
+                    - dsl::row_broadcast(m_t)) / dsl::row_broadcast(l_t),
+                BH * seq, seq);
+        if (use_slopes)
+            return dsl::compute(engine,
+                dsl::exp(masked_alibi_(
+                    dsl::matmul(Q, K, true, false, BH), seq)
+                    - dsl::row_broadcast(m_t)) / dsl::row_broadcast(l_t),
+                BH * seq, seq);
+        if (use_doc)
+            return dsl::compute(engine,
+                dsl::exp(masked_doc_(
+                    dsl::matmul(Q, K, true, false, BH), seq)
+                    - dsl::row_broadcast(m_t)) / dsl::row_broadcast(l_t),
+                BH * seq, seq);
+        return dsl::compute(engine,
+            dsl::exp(masked_causal_(
+                dsl::matmul(Q, K, true, false, BH), seq)
+                - dsl::row_broadcast(m_t)) / dsl::row_broadcast(l_t),
+            BH * seq, seq);
     }
 
     // ── 两趟式（M6→S7）决策钩子 ──────────────────────────────────────
@@ -578,7 +614,7 @@ public:
                 V_cache_ = std::move(V);
                 m_cache_ = std::move(*m);
                 l_cache_ = std::move(*l);
-                W_cache_ = std::move(*W);
+                // P0-5：不缓存 W（6.4G），backward 改为从 Q/K/m/l 重算
             }
             two_pass_active_ = true;
         }
@@ -674,15 +710,20 @@ public:
             auto G = engine.rearrange_3d(*G_T_full, seq, BH, d_k_, false);
             if (!G) return std::unexpected(G.error());
             // ── S7 IR 路径（M6 → R/X 表达式 + 普通 batched_matmul）──
+            //   从 Q/K/m/l 重算 W（P0-5：消除 W_cache_ 的 6.4G 显存占用）；
+            //   FLOPs ×1.5-2（QK^T 重算），训练可接受。
+            auto W_re = recompute_W_(engine, Q_cache_, K_cache_,
+                                     m_cache_, l_cache_, BH, seq);
+            if (!W_re) return std::unexpected(W_re.error());
             //   R  = row_sum(W·P)                     → (BH*seq, 1)
             //   X  = scale·W·(P − R)                  → (BH*seq, seq)（物化）
             //   grad_Q = K × X^T；grad_K = Q × X；grad_V = W^T × G
             auto R = dsl::compute_reduce(engine,
-                dsl::row_reduce_sum(dsl::leaf(W_cache_) * dsl::leaf(*grad_A)),
+                dsl::row_reduce_sum(dsl::leaf(*W_re) * dsl::leaf(*grad_A)),
                 BH * seq, seq);
             if (!R) return std::unexpected(R.error());
             auto X = dsl::compute(engine,
-                dsl::leaf(W_cache_)
+                dsl::leaf(*W_re)
                     * (dsl::leaf(*grad_A) - dsl::row_broadcast(*R)),
                 BH * seq, seq);
             if (!X) return std::unexpected(X.error());
@@ -695,7 +736,7 @@ public:
             auto gk = engine.batched_matmul(Q_cache_, *X, BH, false, false);
             if (!gk) return std::unexpected(gk.error());
             // grad_V = W^T × G（W_b (seq,seq) 按 W^T 使用，G_b (seq,d_k)）→ (BH*seq, d_k)
-            auto gv_t = engine.batched_matmul(W_cache_, *G, BH, true, false);
+            auto gv_t = engine.batched_matmul(*W_re, *G, BH, true, false);
             if (!gv_t) return std::unexpected(gv_t.error());
             // grad_V 转置回 (BH*d_k, seq)（与 forward 的 V_t→V 逆变换一致）
             auto gv_T = engine.transpose(*gv_t);
@@ -1205,4 +1246,3 @@ public:
 
 } // namespace nn
 
-#endif // NN_COMPUTE_LAYER_ATTENTION_HPP

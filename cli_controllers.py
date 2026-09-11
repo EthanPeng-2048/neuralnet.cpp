@@ -486,13 +486,26 @@ class MnistTrainController(CLIController):
         # 振荡检测
         if "osc_guard" in kwargs:
             args.extend(["--osc-guard", self._format_arg_value(kwargs["osc_guard"])])
-        
+
         if "osc_window" in kwargs:
             args.extend(["--osc-window", self._format_arg_value(kwargs["osc_window"])])
-        
+
         if "osc_threshold" in kwargs:
             args.extend(["--osc-threshold", self._format_arg_value(kwargs["osc_threshold"])])
-        
+
+        # 混合精度
+        if kwargs.get("f16", False):
+            args.append("--f16")
+        else:
+            if "precision_param" in kwargs:
+                args.extend(["--precision-param", self._format_arg_value(kwargs["precision_param"])])
+            if "precision_compute" in kwargs:
+                args.extend(["--precision-compute", self._format_arg_value(kwargs["precision_compute"])])
+            if "precision_stable" in kwargs:
+                args.extend(["--precision-stable", self._format_arg_value(kwargs["precision_stable"])])
+            if "precision_optimizer" in kwargs:
+                args.extend(["--precision-optimizer", self._format_arg_value(kwargs["precision_optimizer"])])
+
         # 学习率调度
         if "lr_schedule" in kwargs:
             args.extend(["--lr-schedule", self._format_arg_value(kwargs["lr_schedule"])])
@@ -851,13 +864,6 @@ class GptTrainController(CLIController):
         if kwargs.get("grad_log", False):
             args.append("--grad-log")
         
-        # TDR防护
-        if "tdr_retry" in kwargs:
-            args.extend(["--tdr-retry", self._format_arg_value(kwargs["tdr_retry"])])
-        
-        if "max_tdr_retries" in kwargs:
-            args.extend(["--max-tdr-retries", self._format_arg_value(kwargs["max_tdr_retries"])])
-        
         # Batch录制粒度
         if "flush_interval" in kwargs:
             args.extend(["--flush-interval", self._format_arg_value(kwargs["flush_interval"])])
@@ -869,6 +875,19 @@ class GptTrainController(CLIController):
         # activation offload（L1-offload）：把激活搬 host-visible（与 checkpoint 互斥）
         if kwargs.get("activation_offload", False):
             args.append("--activation-offload")
+
+        # 混合精度
+        if kwargs.get("f16", False):
+            args.append("--f16")
+        else:
+            if "precision_param" in kwargs:
+                args.extend(["--precision-param", self._format_arg_value(kwargs["precision_param"])])
+            if "precision_compute" in kwargs:
+                args.extend(["--precision-compute", self._format_arg_value(kwargs["precision_compute"])])
+            if "precision_stable" in kwargs:
+                args.extend(["--precision-stable", self._format_arg_value(kwargs["precision_stable"])])
+            if "precision_optimizer" in kwargs:
+                args.extend(["--precision-optimizer", self._format_arg_value(kwargs["precision_optimizer"])])
 
         # 学习率调度
         if "lr_schedule" in kwargs:

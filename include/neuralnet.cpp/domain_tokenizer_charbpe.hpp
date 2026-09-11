@@ -1,5 +1,4 @@
-#ifndef NN_DOMAIN_TOKENIZER_CHARBPE_HPP
-#define NN_DOMAIN_TOKENIZER_CHARBPE_HPP
+#pragma once
 
 #include <algorithm>
 #include <atomic>
@@ -659,4 +658,3 @@ load_tokenizer_from_file(const std::string &path)
 
 } // namespace nn
 
-#endif // NN_DOMAIN_TOKENIZER_CHARBPE_HPP

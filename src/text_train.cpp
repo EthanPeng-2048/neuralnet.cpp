@@ -17,12 +17,15 @@
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/model_serialization.hpp>
 #include <neuralnet.cpp/domain_gpt.hpp>
+#include <neuralnet.cpp/precision.hpp>
 #include <neuralnet.cpp/cli/cli_engine_factory.hpp>
 #include <neuralnet.cpp/cli/cli_lr_scheduler.hpp>
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -201,8 +204,7 @@ struct TokenizedData {
     if (!ifs) return std::nullopt;
 
     TokCacheHeader hdr{};
-    ifs.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
-    if (!ifs) return std::nullopt;
+    if (!nn::read_pod(ifs, hdr)) return std::nullopt;
     if (std::memcmp(hdr.magic, TOKCACHE_MAGIC, 4) != 0) return std::nullopt;
     if (hdr.version != TOKCACHE_VERSION) return std::nullopt;
     if (hdr.sizeof_size_t != sizeof(std::size_t)) return std::nullopt;
@@ -212,12 +214,8 @@ struct TokenizedData {
     TokenizedData data;
     data.flow.resize(hdr.token_count);
     data.doc_ids.resize(hdr.token_count);
-    ifs.read(reinterpret_cast<char*>(data.flow.data()),
-             static_cast<std::streamsize>(hdr.token_count * sizeof(std::size_t)));
-    if (!ifs) return std::nullopt;
-    ifs.read(reinterpret_cast<char*>(data.doc_ids.data()),
-             static_cast<std::streamsize>(hdr.token_count * sizeof(std::size_t)));
-    if (!ifs) return std::nullopt;
+    if (!nn::read_pod_span(ifs, std::span(data.flow))) return std::nullopt;
+    if (!nn::read_pod_span(ifs, std::span(data.doc_ids))) return std::nullopt;
     return data;
 }
 
@@ -239,59 +237,19 @@ bool save_tokenize_cache(
     hdr.vocab_size = vocab_file_size;
     hdr.token_count = token_flow.size();
 
-    ofs.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
-    ofs.write(reinterpret_cast<const char*>(token_flow.data()),
-              static_cast<std::streamsize>(token_flow.size() * sizeof(std::size_t)));
-    ofs.write(reinterpret_cast<const char*>(doc_ids.data()),
-              static_cast<std::streamsize>(doc_ids.size() * sizeof(std::size_t)));
-    return ofs.good();
+    if (!nn::write_pod(ofs, hdr)) return false;
+    if (!nn::write_pod_span(ofs, std::span(token_flow))) return false;
+    if (!nn::write_pod_span(ofs, std::span(doc_ids))) return false;
+    return true;
 }
 
-// ── 设备丢失自动重启：保存 checkpoint → 等待 GPU 驱动恢复 → 重新启动进程 ──
-// Windows TDR 重置 GPU 驱动后，需要重新创建 VkDevice 才能继续使用 GPU。
-// 由于 VkDevice 已死且无法在同进程内恢复，最可靠的方式是保存 checkpoint 后
-// 自动重启进程（带 --resume 和增大 flush_interval 来拆分 GPU 提交）。
-[[noreturn]] void restart_on_device_lost(
-    const std::string& program_name,
-    nn::Model& model,
-    const nn::ModelSpec& spec,
-    const std::string& tokenizer_json,
-    const std::string& save_path,
-    const std::string& text_path,
-    std::size_t new_flush_interval,
-    bool gpu_enabled,
-    bool cuda_enabled,
-    int current_epoch,          // 0-based，设备丢失时正在进行的 epoch
-    std::size_t current_step)   // 0-based，本 epoch 内正在进行的 step
+// ── 精度解析辅助 ─────────────────────────────────────────────────────────
+nn::Precision parse_precision(const std::string& name, const char* flag)
 {
-    std::cerr << "\n  [TDR] GPU 设备已丢失 (VK_ERROR_DEVICE_LOST)\n";
-    std::cerr << "  [TDR] 尝试保存 checkpoint...\n";
-    auto save_r = nn::save_model(save_path, model, spec, tokenizer_json);
-    if (save_r)
-        std::cerr << "  [TDR] 模型已保存到: " << save_path << "\n";
-    else
-        std::cerr << "  [TDR] 保存失败: " << save_r.error().message << "\n";
-
-    // 重建命令行：加入 --resume、保留当前 epoch/step 进度（避免重启后
-    // 从 Epoch 1 从头重放日志，导致 GUI 图表出现"loss 片段重复"），
-    // 并增大 flush_interval（不降 batch_size）。
-    std::ostringstream oss;
-    oss << "\"" << program_name << "\" \"" << text_path
-        << "\" --resume \"" << save_path
-        << "\" --resume-epoch " << current_epoch
-        << " --resume-step " << current_step
-        << " --flush-interval " << new_flush_interval;
-    if (gpu_enabled) oss << " --gpu";
-    if (cuda_enabled) oss << " --cuda";
-
-    std::string cmd = oss.str();
-    std::cerr << "\n  [TDR] 等待 GPU 驱动恢复 (5 秒)...\n";
-    std::this_thread::sleep_for(std::chrono::seconds(5));
-    std::cerr << "  [TDR] 自动重启: " << cmd << "\n\n";
-    std::cerr.flush();
-
-    std::system(cmd.c_str());
-    std::exit(0);
+    if (name == "f16" || name == "half") return nn::Precision::F16;
+    if (name == "f32" || name == "float") return nn::Precision::F32;
+    std::cerr << "无效 --" << flag << ": " << name << "，可选: f16, f32\n";
+    std::exit(1);
 }
 
 // ==================== 帮助信息 ====================
@@ -307,7 +265,6 @@ void print_usage(const char *prog)
         << "  --resume <path>    从已有模型恢复训练\n"
         << "  --resume-epoch <n>  从第 n 个 epoch 继续（0-based，需配合 --resume；默认 0）\n"
         << "  --resume-step <n>   从本 epoch 内第 n 步继续（0-based，需配合 --resume；默认 0）\n"
-        << "                       TDR 自动重启时会自行带上这两个参数续训\n"
         << "  --vocab <path>     词表 JSON 路径 (默认: gpt_bpe.json)\n"
         << "                     自动识别分词器类型（bpe / charbpe）\n"
         << "  --test-file <path> 测试集文件路径（可选，每 epoch 结束后评估 test loss）\n"
@@ -353,15 +310,11 @@ void print_usage(const char *prog)
         << "  --grad-log         显示梯度统计（范数/最大值/均值）\n"
         << "  --no-cache         禁用 tokenize 缓存（默认自动缓存到 .tokcache 文件）\n"
         << "\n"
-        << "TDR 防护:\n"
-        << "  --tdr-retry <on|off>  GPU 超时自动减小 batch 重试 (默认: on)\n"
-        << "  --max-tdr-retries <n> 最大重试次数，每次 batch 减半 (默认: 4)\n"
-        << "\n"
         << "Batch 录制粒度:\n"
-        << "  --flush-interval <n>  每 N 个 Transformer block flush 一次 (默认: 0=不间断)\n"
-        << "  增大此值可拆分大提交防 TDR，不影响 batch_size 和训练质量\n"
-        << "  设备丢失 (VK_ERROR_DEVICE_LOST) 时自动保存 checkpoint 并退出，\n"
-        << "  可用 --resume 恢复训练。\n"
+        << "  --flush-interval <n>  每 N 个 Transformer block flush 一次 (默认: 2)\n"
+        << "  按层切 batch 缩短 D1 延迟销毁锁窗、拆分大提交防 TDR；\n"
+        << "  P0-1 非阻塞提交后细粒度 flush 的额外 submit 代价不在关键路径，\n"
+        << "  不影响 batch_size 和训练质量\n"
         << "\n"
         << "显存优化:\n"
         << "  --checkpoint-every <n> 每 N 个 Transformer block 重算一次 forward\n"
@@ -381,6 +334,17 @@ void print_usage(const char *prog)
         << "  --min-lr <lr>     余弦退火最低学习率 (默认: 1e-6)\n"
         << "  --lr-per-epoch <v1,v2,...>  手动指定每轮学习率 (逗号分隔，优先级最高)\n"
         << "  --max-norm <f>    梯度裁剪最大全局 L2 范数 (默认: 0=不裁剪)\n"
+        << "\n"
+        << "混合精度 (docs/23-mixed-precision.md):\n"
+        << "  --f16              快捷方式：master-weights 配方 (param=f32,compute=f16,stable=f32,optimizer=f32)\n"
+        << "  --precision-param <f16|f32>\n"
+        << "                     权重/参数存储精度 (默认: f32)\n"
+        << "  --precision-compute <f16|f32>\n"
+        << "                     常规算子计算精度 (matmul/逐元素/gather，默认: f32)\n"
+        << "  --precision-stable <f16|f32>\n"
+        << "                     数值敏感算子精度 (softmax/LayerNorm/loss，默认: f32)\n"
+        << "  --precision-optimizer <f16|f32>\n"
+        << "                     优化器状态精度 (Adam m/v，默认: f32)\n"
         << "  --help             显示此帮助信息\n";
 }
 
@@ -420,12 +384,12 @@ struct TrainConfig
     nn::ActivationType activation = nn::ActivationType::GeLU;  // FFN 激活
     nn::NormType norm_type = nn::NormType::LayerNorm;           // 归一化层类型
 
-    // TDR 自动重试
-    bool auto_tdr_retry = true;              // 遇到 TDR 超时自动减小 batch 重试
-    std::size_t max_tdr_retries = 4;         // 最大重试次数（每次 batch 减半）
-
     // batch 录制粒度：在 Transformer block 间按间隔 flush，拆分大提交
-    std::size_t flush_interval = 0;          // 0=不间断（默认），>0=每 N 个 block flush
+    // P0-4（报告 §3A）：默认 0→2——按层切 batch 把 D1 延迟销毁锁窗从
+    // "整个 backward" 缩短到 "单 block"（显存峰值关键项），同时拆分大
+    // 提交防 TDR；P0-1 非阻塞提交后细粒度 flush 的额外 submit 代价不在
+    // 关键路径，--flush-interval 0 仍可回退旧行为
+    std::size_t flush_interval = 2;          // 0=不间断，>0=每 N 个 block flush
 
     // 梯度检查点（激活重计算 L1）：每 N 个 GPTBlock 重算一次
     std::size_t checkpoint_every = 0;        // 0=不启用（默认），>0=每 N 个 block 重算
@@ -442,6 +406,9 @@ struct TrainConfig
 
     // 梯度裁剪
     Scalar max_norm = 0.0f;             // 0 = 不裁剪
+
+    // 混合精度控制（docs/23-mixed-precision.md §9.1）
+    nn::PrecisionProfile precision;     // 默认全 F32（D10：零回归）
 };
 
 TrainConfig parse_args(int argc, char *argv[])
@@ -599,6 +566,27 @@ TrainConfig parse_args(int argc, char *argv[])
             cfg.grad_log = true;
         else if (arg == "--no-cache")
             cfg.no_cache = true;
+        else if (arg == "--f16")
+        {
+            // 快捷方式：master-weights 配方（param=F32, compute=F16, stable=F32, optimizer=F32）
+            cfg.precision = nn::profile_master_weights();
+        }
+        else if (arg == "--precision-param" && i + 1 < argc)
+        {
+            cfg.precision.param = parse_precision(argv[++i], "precision-param");
+        }
+        else if (arg == "--precision-compute" && i + 1 < argc)
+        {
+            cfg.precision.compute = parse_precision(argv[++i], "precision-compute");
+        }
+        else if (arg == "--precision-stable" && i + 1 < argc)
+        {
+            cfg.precision.stable = parse_precision(argv[++i], "precision-stable");
+        }
+        else if (arg == "--precision-optimizer" && i + 1 < argc)
+        {
+            cfg.precision.optimizer = parse_precision(argv[++i], "precision-optimizer");
+        }
         else if (arg == "--lr-schedule" && i + 1 < argc)
         {
             cfg.lr_schedule = argv[++i];
@@ -691,25 +679,6 @@ TrainConfig parse_args(int argc, char *argv[])
                           << "，可选: layernorm, rmsnorm\n";
                 std::exit(1);
             }
-        }
-        else if (arg == "--tdr-retry" && i + 1 < argc)
-        {
-            std::string v = argv[++i];
-            if (v == "on" || v == "1" || v == "true")
-                cfg.auto_tdr_retry = true;
-            else if (v == "off" || v == "0" || v == "false")
-                cfg.auto_tdr_retry = false;
-            else
-            {
-                std::cerr << "无效 --tdr-retry: " << v << "，可选: on, off\n";
-                std::exit(1);
-            }
-        }
-        else if (arg == "--max-tdr-retries" && i + 1 < argc)
-        {
-            auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --max-tdr-retries: " << v.error().message << "\n"; std::exit(1); }
-            cfg.max_tdr_retries = *v;
         }
         else if (arg == "--flush-interval" && i + 1 < argc)
         {
@@ -828,7 +797,6 @@ void log_gradient_stats(nn::ComputeEngine &engine, const std::vector<nn::TensorR
 // ==================== 主函数 ====================
 int main(int argc, char *argv[])
 {
-    const std::string program_name = argv[0];
     TrainConfig cfg = parse_args(argc, argv);
 
     // ── 加载分词器（自动识别类型：BPE/CharBPE） ───
@@ -987,28 +955,45 @@ int main(int argc, char *argv[])
         model_build = nn::build_rapt_model(*engine, nn::RAPTConfig{
             tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
             cfg.num_heads, cfg.d_ff, cfg.num_layers,
-            cfg.pos_encoding, cfg.activation, cfg.norm_type});
+            cfg.pos_encoding, cfg.activation, cfg.norm_type,
+            /*causal=*/true, cfg.precision});
     }
     else if (cfg.model_type == "zipt")
     {
         model_build = nn::build_zipt_model(*engine, nn::ZiPTConfig{
             tokenizer->vocab_size(), cfg.d_model, cfg.seq_len, cfg.window,
             cfg.num_heads, cfg.d_ff, cfg.num_layers, cfg.memory_tokens,
-            cfg.pos_encoding, cfg.activation, cfg.norm_type});
+            cfg.pos_encoding, cfg.activation, cfg.norm_type, cfg.precision});
     }
     else
     {
+        std::cerr << "[DBG] building GPT model...\n" << std::flush;
         model_build = nn::build_gpt_model(
             *engine,
             tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
             cfg.num_heads, cfg.d_ff, cfg.num_layers,
-            cfg.pos_encoding, cfg.activation, cfg.norm_type);
+            cfg.pos_encoding, cfg.activation, cfg.norm_type,
+            cfg.precision);
     }
     if (!model_build) {
         std::cerr << "构建模型失败: " << model_build.error().message << '\n';
         return 1;
     }
+    std::cerr << "[DBG] model built OK\n" << std::flush;
     auto model = std::move(*model_build);
+
+    // ── 打印精度配置 ──
+    {
+        const auto& pp = cfg.precision;
+        if (pp.param != nn::Precision::F32 || pp.compute != nn::Precision::F32 ||
+            pp.stable != nn::Precision::F32 || pp.optimizer != nn::Precision::F32)
+        {
+            std::cout << "混合精度配置: param=" << nn::precision_name(pp.param)
+                      << " compute=" << nn::precision_name(pp.compute)
+                      << " stable=" << nn::precision_name(pp.stable)
+                      << " optimizer=" << nn::precision_name(pp.optimizer) << "\n";
+        }
+    }
 
     // ── 设置 batch 录制粒度 ──
     model.set_flush_interval(cfg.flush_interval);
@@ -1064,7 +1049,7 @@ int main(int argc, char *argv[])
             if (file_spec.is_rapt())
             {
                 std::cout << "从模型文件读取 RAPT 规格\n";
-                auto build_result = nn::build_rapt_model_from_spec(*engine, file_spec);
+                auto build_result = nn::build_rapt_model_from_spec(*engine, file_spec, cfg.precision);
                 if (!build_result)
                 {
                     std::cerr << "Error: " << build_result.error().message << '\n';
@@ -1077,7 +1062,7 @@ int main(int argc, char *argv[])
             else if (file_spec.is_zipt())
             {
                 std::cout << "从模型文件读取 ZiPT 规格\n";
-                auto build_result = nn::build_zipt_model_from_spec(*engine, file_spec);
+                auto build_result = nn::build_zipt_model_from_spec(*engine, file_spec, cfg.precision);
                 if (!build_result)
                 {
                     std::cerr << "Error: " << build_result.error().message << '\n';
@@ -1096,7 +1081,7 @@ int main(int argc, char *argv[])
                     std::cout << "从模型文件读取 RoPE GPT 规格\n";
                 else
                     std::cout << "从模型文件读取 GPT 规格\n";
-                auto build_result = nn::build_gpt_model_from_spec(*engine, file_spec);
+                auto build_result = nn::build_gpt_model_from_spec(*engine, file_spec, cfg.precision);
                 if (!build_result)
                 {
                     std::cerr << "Error: " << build_result.error().message << '\n';
@@ -1220,7 +1205,7 @@ int main(int argc, char *argv[])
         static_cast<int>(steps_per_epoch * static_cast<std::size_t>(cfg.epochs));
     step_lr_cfg.cosine = true;
 
-    // 随机种子：每次训练/每次 TDR 重启后的样本顺序都不同，避免跨进程
+    // 随机种子：每次训练/每次 --resume 续训后的样本顺序都不同，避免跨进程
     // 数据顺序完全一致导致 GUI 图表上出现"loss 片段重复"（与 mnist_train 一致）。
     std::mt19937_64 rng{std::random_device{}()};
     std::vector<std::size_t> sample_indices(window_offsets.size());
@@ -1268,6 +1253,7 @@ int main(int argc, char *argv[])
         auto ep_start = std::chrono::steady_clock::now();
         Scalar total_weighted = 0.0;  // Σ(loss × 有效token)，用于按 token 加权平均
         std::size_t total_valid = 0;  // 累计有效 token 数
+        std::size_t nan_skip_count = 0;  // NaN 跳步计数
 
         // 每个 epoch 开始前 shuffle 样本索引队列
         std::shuffle(sample_indices.begin(), sample_indices.end(), rng);
@@ -1391,12 +1377,39 @@ int main(int argc, char *argv[])
             auto logits = std::move(*fwd_result);
             // logits: (vocab_size, seq_len × batch_size)
 
+            // ── NaN 检测（P0-3：移除 logits 探针抽检）─────────────────────
+            // 旧实现（P0-2）每步 slice_rows 前 8 行 + to_matrix 下载抽检 isfinite。
+            // GPU 引擎 to_matrix 在 batch 中点会强制 end_batch（提交整段 forward）
+            // + wait_in_flight（CPU 阻塞至 GPU 全部完成）+ begin_batch——即每步
+            // 一次完整流水线 drain，破坏 batch 录制的 CPU/GPU 重叠（见
+            // compute_gpu_engine.hpp to_matrix / P0-1），是训练热循环的同步瓶颈。
+            // 防线 = 下方 loss 非有限值检查：CE 稀疏前向
+            //   loss_vec[c] = (gather − col_max − log denom)·mask, loss = −Σ loss_vec/nv
+            // 中，只要 num_valid > 0，IEEE 754 下 0·NaN = NaN，logits 任一列
+            // （含被 loss_mask 完全遮住的列）出现 NaN/Inf 都必然传播进 loss 求和，
+            // loss 检查完全覆盖；num_valid = 0 时 inv_num_valid = 0，梯度恒为 0，
+            // 同样无 NaN 风险。
+
             // ── 损失（稀疏标签，避免 one-hot 爆显存） ────────
             auto mask_span = std::span<const Scalar>(flat_mask);
             auto loss_result = ce_loss.forward_sparse(
                 *engine, logits, flat_targets, mask_span, tokenizer->vocab_size());
             if (!loss_result) { std::cerr << "Error: " << loss_result.error().message << '\n'; return 1; }
             Scalar loss = *loss_result;
+            // NaN 跳步：loss 为 NaN/Inf 时跳过 backward+step
+            if (!std::isfinite(loss))
+            {
+                std::fprintf(stderr, "[NaNSkip] step %zu: loss=%g non-finite, skipping backward+step\n",
+                             step + 1, static_cast<double>(loss));
+                logits = {};
+                auto end_r = engine->end_batch();
+                if (!end_r) {
+                    std::cerr << "end_batch (NaNSkip loss) failed: " << end_r.error().message << '\n';
+                    return 1;
+                }
+                ++nan_skip_count;
+                continue;
+            }
             total_weighted += loss * step_valid;        // 按有效 token 加权
             total_valid += step_valid;
 
@@ -1405,17 +1418,7 @@ int main(int argc, char *argv[])
             // 在 forward 与 backward 之间 flush，将一次大提交拆为两次小提交。
             auto flush_r = engine->flush_batch();
             if (!flush_r) {
-                std::string err_msg = flush_r.error().message;
-                bool is_device_lost = err_msg.find("VK_ERROR_DEVICE_LOST") != std::string::npos;
-                std::cerr << "\nflush_batch (forward) failed: " << err_msg;
-                if (is_device_lost)
-                {
-                    restart_on_device_lost(program_name, model, spec, tokenizer_json,
-                        cfg.save_path, cfg.text_path,
-                        cfg.flush_interval == 0 ? std::size_t{1} : cfg.flush_interval * 2,
-                        cfg.gpu_enabled, cfg.cuda_enabled,
-                        epoch, step);
-                }
+                std::cerr << "\nflush_batch (forward) failed: " << flush_r.error().message << '\n';
                 return 1;
             }
 
@@ -1445,18 +1448,7 @@ int main(int argc, char *argv[])
             // ── 提交 backward batch（单独一次提交，已与 forward 拆分） ──
             auto bwd_end = engine->end_batch();
             if (!bwd_end) {
-                std::string err_msg = bwd_end.error().message;
-                bool is_device_lost = err_msg.find("VK_ERROR_DEVICE_LOST") != std::string::npos;
-                std::cerr << "\nend_batch (backward) failed: " << err_msg;
-                if (is_device_lost)
-                {
-                    restart_on_device_lost(program_name, model, spec, tokenizer_json,
-                        cfg.save_path, cfg.text_path,
-                        cfg.flush_interval == 0 ? std::size_t{1} : cfg.flush_interval * 2,
-                        cfg.gpu_enabled, cfg.cuda_enabled,
-                        epoch, step);
-                }
-                std::cerr << '\n';
+                std::cerr << "\nend_batch (backward) failed: " << bwd_end.error().message << '\n';
                 return 1;
             }
 
@@ -1563,6 +1555,8 @@ int main(int argc, char *argv[])
                   << "  lr=" << std::scientific << std::setprecision(4) << optimizer_current_lr
                   << "  avg_loss=" << std::fixed << std::setprecision(4) << avg_loss
                   << "  time=" << std::setprecision(1) << ep_sec << "s";
+        if (nan_skip_count > 0)
+            std::cout << "  nan_skip=" << nan_skip_count;
 
         // ── 测试集评估（可选，与训练一致的滑动窗口） ─────────────
         if (!test_window_offsets.empty())

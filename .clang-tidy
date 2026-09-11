@@ -1,0 +1,4 @@
+# .clang-tidy 文件
+Checks: '-*,modernize-*,performance-*,portability-*,cppcoreguidelines-*,bugprone-*,clang-analyzer-*'
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*'

@@ -13,8 +13,7 @@
 //   实现真正异步的流水线执行。
 // ─────────────────────────────────────────────────────────────────────────
 
-#ifndef NN_COMPUTE_CUDA_BACKEND_HPP
-#define NN_COMPUTE_CUDA_BACKEND_HPP
+#pragma once
 
 #ifdef NN_HAS_CUDA
 
@@ -694,4 +693,3 @@ inline Result<Matrix> CudaTensor::to_matrix(CudaBackend& backend) const
 } // namespace nn
 
 #endif // NN_HAS_CUDA
-#endif // NN_COMPUTE_CUDA_BACKEND_HPP

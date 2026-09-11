@@ -1,5 +1,4 @@
-#ifndef NN_COMPUTE_ENGINE_HPP
-#define NN_COMPUTE_ENGINE_HPP
+#pragma once
 
 // ── compute_engine.hpp — 计算引擎抽象接口 ─────────────────────────────────
 // ComputeEngine 是与底层硬件接触的唯一抽象层。
@@ -164,18 +163,29 @@ public:
         return Tensor::cpu(1, 1);
     }
 
-    // ── 张量工厂 ──────────────────────────────────────────────────────────
-    [[nodiscard]] virtual Tensor create_tensor(std::size_t rows, std::size_t cols) = 0;
-    [[nodiscard]] virtual Result<Tensor> from_matrix(const Matrix& m) = 0;
-    [[nodiscard]] virtual Result<Matrix> to_matrix(const Tensor& t) = 0;
+    // ── 张量工厂（统一接口，§6.4, §6.5）────────────────────────────────
+    // P 由调用方显式指定（§8.5）：无隐式推导，无 Auto
+    [[nodiscard]] virtual Tensor create_tensor(std::size_t rows, std::size_t cols, Precision P = Precision::F32) = 0;
+    [[nodiscard]] virtual Result<Tensor> from_matrix(const Matrix& m, Precision P = Precision::F32) = 0;
+    [[nodiscard]] virtual Result<Matrix> to_matrix(const Tensor& t, Precision P = Precision::F32) = 0;
+
+    // ── D5：cast 原语（§7.5，唯一"变精度"算子，永远显式）────────────────
+    // 升 cast（f16→f32）精确无损；降 cast（f32→f16）round-half-to-even。
+    // 默认实现：同精度 = 返回 src 拷贝；跨精度 = 错误（引擎覆盖）。
+    [[nodiscard]] virtual Result<Tensor> cast(const Tensor& src, Precision dst)
+    {
+        if (src.precision() == dst)
+            return src;  // 同精度 = 返回共享所有权（零拷贝）
+        return std::unexpected(Error{"cast: 该引擎不支持跨精度转换"});
+    }
+
+    // ── 深拷贝 Tensor（CPU 矩阵拷贝 / GPU buffer 拷贝，无 PCIe 传输） ──
+    // 用于需要修改中间结果但不影响原 Tensor 的场景
+    [[nodiscard]] virtual Result<Tensor> clone(const Tensor& src) = 0;
 
     // 将 CPU Matrix 数据写入已有 Tensor（CPU 拷贝 / GPU 上传）
     // 用于序列化加载、Optimizer 参数写回等场景
     [[nodiscard]] virtual Result<void> copy_from(Tensor& dst, const Matrix& src) = 0;
-
-    // 深拷贝 Tensor（CPU 矩阵拷贝 / GPU buffer 拷贝，无 PCIe 传输）
-    // 用于需要修改中间结果但不影响原 Tensor 的场景
-    [[nodiscard]] virtual Result<Tensor> clone(const Tensor& src) = 0;
 
     // ── 行切片原语（op-level 数据操作，不含算法语义） ──────────────────
     // 返回 src 的行 [start_row, start_row + count) 的连续拷贝。
@@ -224,11 +234,15 @@ public:
     // 矩阵级原语
     // ══════════════════════════════════════════════════════════════════════
 
-    // C = A × B（支持转置标志）
+    // C = A × B（支持转置标志 + 精度参数，D5 §8.1）
     // transA: 使用 A^T，transB: 使用 B^T
+    // P: 计算精度（F32 = 现状；F16 = f16 GEMM，§7.4）
+    //   - Auto 推导（P=F32 默认）：操作数中最高精度
+    //   - 显式 P：Layer 通过 PrecisionProfile.compute 传入
     [[nodiscard]] virtual Result<Tensor> matmul(
         const Tensor& A, const Tensor& B,
-        bool transA = false, bool transB = false) = 0;
+        bool transA = false, bool transB = false,
+        Precision P = Precision::F32) = 0;
 
     // 批量矩阵乘法：对每个 batch b 计算 C_b = alpha * op(A_b, B_b)，结果垂直堆叠
     // A: (batch * A_rows_per_batch, A_cols) — 按 batch 切分为连续行块
@@ -238,12 +252,62 @@ public:
     //   transB=0: B_b 为 (K, N)，transB=1: B_b 存储为 (N, K) 按 B_b^T 使用
     // alpha: 输出缩放系数（cuBLAS sgemm 语义），GPU 在 shader 写出时一次完成，
     //   供上层折叠 1/sqrt(d_k) 等系数，省去额外全矩阵 scale pass
+    // P: 计算精度（D5 §8.1，同 matmul）
     // 典型用途：多头注意力的 Q^T×K 和 V×A 批量化（消除 per-head 循环）
     [[nodiscard]] virtual Result<Tensor> batched_matmul(
         const Tensor& A, const Tensor& B,
         std::size_t batch,
         bool transA = false, bool transB = false,
-        Scalar alpha = Scalar{1}) = 0;
+        Scalar alpha = Scalar{1},
+        Precision P = Precision::F32) = 0;
+
+    // ── 新增：matmul + broadcast bias（统一精度处理）────────────────────
+    // out = A × B + bias（broadcast add，bias (out,1) → (out,batch)）
+    // 引擎内部处理精度：P 指定 matmul 精度，bias add 在 P 精度下完成
+    // Layer 无需判断精度，直接调用即可
+    [[nodiscard]] virtual Result<Tensor> matmul_with_bias(
+        const Tensor& A, const Tensor& B, const Tensor& bias,
+        bool transA = false, bool transB = false,
+        Precision P = Precision::F32)
+    {
+        // 默认实现：matmul + 逐行 add bias（兼容所有引擎）
+        auto result = matmul(A, B, transA, transB, P);
+        if (!result) return std::unexpected(result.error());
+
+        // broadcast bias: (out,1) → (out,batch)
+        // 用 engine.add_inplace 逐行加
+        auto bias_mat = to_matrix(bias, P);
+        if (!bias_mat) return std::unexpected(bias_mat.error());
+
+        auto res_mat = to_matrix(*result, P);
+        if (!res_mat) return std::unexpected(res_mat.error());
+
+        for (std::size_t row = 0; row < A.rows(); ++row)
+        {
+            float b_val = bias_mat->at(row, 0);
+            for (std::size_t col = 0; col < B.cols(); ++col)
+                res_mat->set_value(row, col, res_mat->at(row, col) + b_val);
+        }
+
+        return from_matrix(*res_mat, P);
+    }
+
+    // ── 新增：梯度累加（自动 cast 到目标精度）────────────────────────────
+    // dst += src（dst 始终 f32，src 可能是 f16）
+    // 引擎内部 cast src 到 f32 后累加
+    [[nodiscard]] virtual Result<void> accumulate(Tensor& dst, const Tensor& src)
+    {
+        if (dst.precision() != Precision::F32)
+            return std::unexpected(Error{"accumulate: dst must be F32"});
+
+        if (src.precision() == Precision::F32)
+            return add_inplace(dst, src);
+
+        // src 是 f16 → cast 到 f32 后累加
+        auto src32 = cast(src, Precision::F32);
+        if (!src32) return std::unexpected(src32.error());
+        return add_inplace(dst, *src32);
+    }
 
     // A += B（逐元素，同形状）
     [[nodiscard]] virtual Result<void> add_inplace(Tensor& A, const Tensor& B) = 0;
@@ -257,6 +321,64 @@ public:
 
     // A = 0
     [[nodiscard]] virtual Result<void> zero(Tensor& A) = 0;
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 扫描级原语（带状态的顺序归约 + matvec 读出；RLA 线性注意力积木）
+    //
+    // 引擎只提供"前缀/后缀顺序归约 + matvec 读出"；RLA 算法（L2 归一化
+    // 分母 / ReLU 门控 / 梯度公式 / 文档重置策略）全部由 Layer 用这些原语
+    // 与逐元素原语组合表达（铁律 3：shader 永不含算法）。
+    //
+    // 形状约定（batch-major，列序 i = b*seq + t；头 (b,h) 的行块起点
+    // r0 = (b*H + h)*d_k，每头 d_k 行）：
+    //   K/V/P/R（X/Y）: (B·H·d_k, seq)
+    //   D             : (B·H·d_k², seq)，(b,h) 的 (a,b') 元素在
+    //                    行 (b*H*d_k + a)*d_k + b'
+    //   A0/B0         : (H·d_k, d_k) 初始运行态，行块 h = 第 h 头
+    //                    （B>1 时按头循环）；has_state=false → 按零
+    //                    处理（传 (1,1) dummy，规避 0 字节 buffer）
+    //   boundary      : (1, B·seq)，1 = 文档起点（t==0 或与前一位置
+    //                    文档不同）；has_bnd=false → 无文档感知
+    //                    （传 (1,1) dummy）
+    //   标量块（s/r）: 每 (b,h,t) 一个标量，在头块内 d_k 行重复存放
+    //                    （避免块级广播原语）；实现写全部 d_k 行
+    //                    的同一值，Layer 读任一行均可。
+    // ══════════════════════════════════════════════════════════════════════
+
+    // 前缀扫描：
+    //   causal=true : 含自身前缀（i<=t）：A_t = A0 + Σ_{i≤t, 与 t 同文档}
+    //                 k_i·k_i^T，B_t = B0 + Σ_{i≤t, 同文档} v_i·k_i^T；
+    //                 文档边界处运行态清零（A0/B0 仅首个文档生效）。
+    //   causal=false: 全集常数 A = A0 + Σ_all k·k^T，B = B0 + Σ_all v·k^T
+    //                 （无边界重置）。
+    // 输出 (B·H·5·d_k, seq)，行块（每块 (B·H·d_k, seq)）：
+    //   [0) B·P   [1) A·P   [2) B^T·R   [3) s = P·(A·P)   [4) r = R·(B·P)
+    //   其中 [3)/[4) 为逐列标量（头内逐行重复）。
+    [[nodiscard]] virtual Result<Tensor> scan_prefix_outer(
+        const Tensor& K, const Tensor& V, const Tensor& P, const Tensor& R,
+        const Tensor& A0, const Tensor& B0, bool has_state,
+        std::size_t dk, std::size_t heads, bool causal,
+        const Tensor& boundary, bool has_bnd) = 0;
+
+    // 后缀扫描（RLA 反向 pass 2）：
+    //   causal=true : S_i = Σ_{t≥i, 与 i 同文档} D_t（i+1 为文档起点时
+    //                 先清零再累加 D_i）；
+    //   causal=false: S_i = D_i（Layer 预先把全集梯度沿 seq 广播）。
+    // D (B·H·d_k², seq)，X/Y (B·H·d_k, seq)
+    // 输出 (B·H·3·d_k, seq)，行块：[0) S·X   [1) S·Y   [2) S^T·Y
+    [[nodiscard]] virtual Result<Tensor> scan_suffix_outer(
+        const Tensor& D, const Tensor& X, const Tensor& Y,
+        std::size_t dk, std::size_t heads, bool causal,
+        const Tensor& boundary, bool has_bnd) = 0;
+
+    // 逐列外积（RLA 反向的 dL/dA、dL/dB 物化）：
+    //   out[(b,h): (a,b'), t] = P[a,t]·R[b',t] (· S[t] if has_scale)
+    // P/R: (B·H·d_k, seq)；S: (B·H·d_k, seq)（标量头内逐行重复，
+    // 实现读头块首行；has_scale=false → 传 dummy）
+    // 输出: (B·H·d_k², seq)
+    [[nodiscard]] virtual Result<Tensor> outer_col(
+        const Tensor& P, const Tensor& R, const Tensor& S,
+        std::size_t dk, bool has_scale) = 0;
 
     // ══════════════════════════════════════════════════════════════════════
     // 归约原语
@@ -354,4 +476,3 @@ public:
 
 } // namespace nn
 
-#endif // NN_COMPUTE_ENGINE_HPP
