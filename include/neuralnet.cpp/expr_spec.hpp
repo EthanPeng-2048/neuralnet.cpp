@@ -1,5 +1,4 @@
-#ifndef NN_EXPR_SPEC_HPP
-#define NN_EXPR_SPEC_HPP
+#pragma once
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  expr_spec.hpp — 逐元素表达式 DSL：数据结构定义
@@ -558,4 +557,3 @@ namespace expr
 
 } // namespace nn
 
-#endif // NN_EXPR_SPEC_HPP

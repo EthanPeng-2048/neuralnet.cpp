@@ -1,5 +1,4 @@
-#ifndef NN_EXPR_GLSL_GEN_HPP
-#define NN_EXPR_GLSL_GEN_HPP
+#pragma once
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  expr_glsl_gen.hpp — AOT 算子融合：ExprSpec → GLSL 计算 shader 源码
@@ -1316,4 +1315,3 @@ inline const bool kGlslEmitterRegistered =
 
 } // namespace nn
 
-#endif // NN_EXPR_GLSL_GEN_HPP

@@ -1,5 +1,4 @@
-#ifndef NN_CORE_ERRORS_HPP
-#define NN_CORE_ERRORS_HPP
+#pragma once
 
 #include <charconv>
 #include <cstddef>
@@ -69,8 +68,8 @@ template <typename T>
     else
     {
         // string_view::end() 即指向末尾后一位置的 const char*，无需手动指针算术
-        auto [ptr, ec] = std::from_chars(s.data(), s.end(), value);
-        if (ec != std::errc{} || ptr != s.end())
+        auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), value);
+        if (ec != std::errc{} || ptr != s.data() + s.size())
             return std::unexpected(Error{"invalid number: " + std::string(s)});
     }
     return value;
@@ -78,4 +77,3 @@ template <typename T>
 
 } // namespace nn
 
-#endif // NN_CORE_ERRORS_HPP

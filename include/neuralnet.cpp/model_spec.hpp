@@ -1,5 +1,4 @@
-#ifndef NN_MODEL_SPEC_HPP
-#define NN_MODEL_SPEC_HPP
+#pragma once
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  model_spec.hpp — 模型架构描述（纯数据结构，无 L2 依赖）
@@ -252,4 +251,3 @@ struct ModelSpec
 
 } // namespace nn
 
-#endif // NN_MODEL_SPEC_HPP

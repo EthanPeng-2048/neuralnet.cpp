@@ -254,7 +254,8 @@ int main(int argc, char* argv[])
             "blk0.wv", "blk0.wo", "blk0.norm1.g", "blk0.fc1.w", "blk0.fc1.b",
             "blk0.fc2.w", "blk0.fc2.b", "blk0.norm2.g"};
         if (pi - 1 < 12)
-            name = std::string("p[") + std::to_string(pi - 1) + "]=" + tags[pi - 1];
+            name = std::string("p[") + std::to_string(pi - 1) + "]= "
+                   + std::string(tags[pi - 1]);
         all_pass &= check_grad_tensor(
             eng, model, *x, *go, params[p].get(), *pm, *gm, name, eps, tol);
     }

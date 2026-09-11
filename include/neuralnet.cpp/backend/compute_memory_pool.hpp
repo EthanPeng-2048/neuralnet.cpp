@@ -14,8 +14,7 @@
 //   - 释放时自动合并相邻空闲区域
 // ─────────────────────────────────────────────────────────────────────────
 
-#ifndef NN_COMPUTE_MEMORY_POOL_HPP
-#define NN_COMPUTE_MEMORY_POOL_HPP
+#pragma once
 
 #ifdef NN_HAS_VULKAN
 
@@ -437,4 +436,3 @@ public:
 } // namespace nn
 
 #endif // NN_HAS_VULKAN
-#endif // NN_COMPUTE_MEMORY_POOL_HPP

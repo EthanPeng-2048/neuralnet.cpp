@@ -17,8 +17,7 @@
 //   - GPU-Resident Path：GpuTensor → 计算 → GpuTensor（全程 GPU 显存）
 // ─────────────────────────────────────────────────────────────────────────
 
-#ifndef NN_COMPUTE_VK_BACKEND_HPP
-#define NN_COMPUTE_VK_BACKEND_HPP
+#pragma once
 
 #ifdef NN_HAS_VULKAN
 
@@ -96,6 +95,21 @@
 #define NN_SCATTER_ADD_SPV_EMBEDDED
 #endif
 
+#if __has_include("scan_prefix_outer_spv.hpp")
+#include "scan_prefix_outer_spv.hpp"
+#define NN_SCAN_PREFIX_OUTER_SPV_EMBEDDED
+#endif
+
+#if __has_include("scan_suffix_outer_spv.hpp")
+#include "scan_suffix_outer_spv.hpp"
+#define NN_SCAN_SUFFIX_OUTER_SPV_EMBEDDED
+#endif
+
+#if __has_include("outer_col_spv.hpp")
+#include "outer_col_spv.hpp"
+#define NN_OUTER_COL_SPV_EMBEDDED
+#endif
+
 // AOT 融合 shader 注册表（构建期 scan_exprs 收集 + gen_fused 合成；表达式
 // 只出现在 Layer，本表是折叠后的派生物）。运行时按 expr_spec_key 匹配 dispatch。
 #if __has_include("fused_registry.hpp")
@@ -108,11 +122,15 @@
 namespace nn
 {
 
-// 前向声明
-class GpuTensor;
+// 前向声明（模板 + 别名，匹配 algebra_matrix.hpp 的 MatrixT<P>）
+template <Precision P> class MatrixT;
+using Matrix = MatrixT<Precision::F32>;
 
-// 前向声明
-class Matrix;
+// 前向声明（模板 + 别名，匹配本文件末尾的 GpuTensorT<P> 定义，§6.3）
+template <Precision P> class GpuTensorT;
+using GpuTensor = GpuTensorT<Precision::F32>;
+using GpuTensorF32 = GpuTensorT<Precision::F32>;
+using GpuTensorF16 = GpuTensorT<Precision::F16>;
 
 // ══════════════════════════════════════════════════════════════════════════
 // GpuBuffer — GPU 缓冲区 RAII 封装
@@ -162,14 +180,14 @@ public:
     GpuBuffer(const GpuBuffer&) = delete;
     GpuBuffer& operator=(const GpuBuffer&) = delete;
 
-    // 创建 Device Local 缓冲区
+    // 创建 Device Local 缓冲区（尺寸语义 = 字节数，§6.3）
     [[nodiscard]] static Result<GpuBuffer> create_device_local(
         VkDevice device, MemoryPool& pool,
-        std::size_t elem_count, VkBufferUsageFlags usage)
+        std::size_t byte_count, VkBufferUsageFlags usage)
     {
         VkBufferCreateInfo buf_info{};
         buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        buf_info.size = elem_count * sizeof(float);
+        buf_info.size = byte_count;
         buf_info.usage = usage;
         buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
@@ -200,23 +218,14 @@ public:
         return GpuBuffer(device, buffer, *alloc_r, pool);
     }
 
-    // 创建 Host Visible 缓冲区（activation offload 存储）
-    // 数据驻留在主机可见内存（通常 = RAM），从 device-local VRAM 的角度
-    // 释放显存；GPU↔host 之间通过 vkCmdCopyBuffer 中转。
-    //
-    // 内存类型选择（借鉴 llama.cpp UMA 分支）：
-    //   - 真 UMA/共享显存（is_uma()）：DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT
-    //     ——slab 直接落在统一内存池，CPU 可映射且 GPU 直读，无需 PCIe 中转。
-    //   - 独立显卡：必须用纯 HOST_VISIBLE（系统 RAM）。⚠ 绝不能选
-    //     DEVICE_LOCAL|HOST_VISIBLE——NVIDIA 等独显驱动也会报告该组合类型，
-    //     但那是 GPU 可驻留/Zero-copy 内存，仍占专用显存，offload 会无效。
+    // 创建 Host Visible 缓冲区（尺寸语义 = 字节数，§6.3）
     [[nodiscard]] static Result<GpuBuffer> create_host_visible(
         VkDevice device, MemoryPool& pool,
-        std::size_t elem_count, VkBufferUsageFlags usage)
+        std::size_t byte_count, VkBufferUsageFlags usage)
     {
         VkBufferCreateInfo buf_info{};
         buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        buf_info.size = elem_count * sizeof(float);
+        buf_info.size = byte_count;
         buf_info.usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
         buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
@@ -269,10 +278,13 @@ public:
 };
 
 // ══════════════════════════════════════════════════════════════════════════
-// GpuTensor — GPU 矩阵抽象
+// GpuTensorT<P> — GPU 矩阵抽象（多精度，docs/23 §6.3）
+// buffer 字节数 = rows * cols * sizeof(elem<P>)（f32=4B / f16=2B）
+// 别名：GpuTensor = GpuTensorT<F32>（现有调用点零改动）
 // ══════════════════════════════════════════════════════════════════════════
 
-class GpuTensor
+template <Precision P>
+class GpuTensorT
 {
 private:
     std::shared_ptr<GpuBuffer> buffer_;
@@ -280,25 +292,25 @@ private:
     std::size_t cols_ = 0;
 
 public:
-    GpuTensor() = default;
+    GpuTensorT() = default;
 
-    GpuTensor(std::shared_ptr<GpuBuffer> buffer, std::size_t rows, std::size_t cols)
+    GpuTensorT(std::shared_ptr<GpuBuffer> buffer, std::size_t rows, std::size_t cols)
         : buffer_(std::move(buffer)), rows_(rows), cols_(cols) {}
 
-    // 从 CPU Matrix 创建（上传数据）
-    [[nodiscard]] static Result<GpuTensor> from_matrix(
-        const Matrix& cpu_mat, class GpuBackend& backend);
+    // 从 CPU Matrix 创建（上传数据；同精度跨设备 = 原始字节拷贝，§6.5）
+    [[nodiscard]] static Result<GpuTensorT<P>> from_matrix(
+        const MatrixT<P>& cpu_mat, class GpuBackend& backend);
 
     // 创建空的 GPU Tensor（用于输出）
-    [[nodiscard]] static Result<GpuTensor> create_empty(
+    [[nodiscard]] static Result<GpuTensorT<P>> create_empty(
         std::size_t rows, std::size_t cols, class GpuBackend& backend);
 
-    // 创建空的 Host Visible Tensor（activation offload 存储）
-    [[nodiscard]] static Result<GpuTensor> create_host_visible_empty(
+    // 创建空的 Host Visible Tensor（activation offload 存储，§6.6）
+    [[nodiscard]] static Result<GpuTensorT<P>> create_host_visible_empty(
         std::size_t rows, std::size_t cols, class GpuBackend& backend);
 
     // 转换为 CPU Matrix（下载数据）
-    [[nodiscard]] Result<Matrix> to_matrix(class GpuBackend& backend) const;
+    [[nodiscard]] Result<MatrixT<P>> to_matrix(class GpuBackend& backend) const;
 
     // 访问器
     [[nodiscard]] std::size_t rows() const noexcept { return rows_; }
@@ -307,11 +319,16 @@ public:
     [[nodiscard]] const GpuBuffer& buffer() const noexcept { return *buffer_; }
 
     // 零拷贝 reshape：共享底层 buffer，只改变形状元数据
-    [[nodiscard]] GpuTensor with_shape(std::size_t new_rows, std::size_t new_cols) const
+    [[nodiscard]] GpuTensorT<P> with_shape(std::size_t new_rows, std::size_t new_cols) const
     {
-        return GpuTensor(buffer_, new_rows, new_cols);
+        return GpuTensorT<P>(buffer_, new_rows, new_cols);
     }
 };
+
+// 别名（现有调用点零改动；f16 显式使用 GpuTensorF16）
+using GpuTensor = GpuTensorT<Precision::F32>;
+using GpuTensorF32 = GpuTensorT<Precision::F32>;
+using GpuTensorF16 = GpuTensorT<Precision::F16>;
 
 // ══════════════════════════════════════════════════════════════════════════
 // GpuBackend — Vulkan 计算后端单例
@@ -331,6 +348,10 @@ private:
     VulkanPipeline transpose_pipeline_;
     VulkanPipeline gather_pipeline_;
     VulkanPipeline scatter_add_pipeline_;
+    // RLA 扫描原语（手写原语，不进 AOT 融合注册表；铁律 3：shader 不含算法）
+    VulkanPipeline scan_prefix_outer_pipeline_;
+    VulkanPipeline scan_suffix_outer_pipeline_;
+    VulkanPipeline outer_col_pipeline_;
     // AOT 融合 shader pipelines（key = expr_spec_key → pipeline；由构建期
     // fused_registry.hpp 注册，运行时按 key 匹配后直接 dispatch）
     std::unordered_map<std::string, VulkanPipeline> fused_pipelines_;
@@ -349,16 +370,49 @@ private:
     VkCommandPool command_pool_ = VK_NULL_HANDLE;
     VkDescriptorPool gpu_tensor_pool_ = VK_NULL_HANDLE;
 
-    // ── Command Buffer Batching：将所有 GPU 操作录制到同一个 command buffer ──
-    // 消除 per-layer fence wait，只在 end_batch() 时提交一次、等一次
-    VkCommandBuffer batch_cmd_ = VK_NULL_HANDLE;
-    VkFence batch_fence_ = VK_NULL_HANDLE;
+    // ── Command Buffer Batching + 多帧流水线（P0-1）─────────────────────
+    // 旧实现：单一 batch_cmd_ + 单 fence，end_batch/flush_batch 每次
+    // vkQueueSubmit + 阻塞 vkWaitForFences——GPU 执行 step N 时 host 被 fence
+    // 卡死无法录制 step N+1（GPU 占用率 = GPU 忙时间 / (GPU 忙 + 全部 host
+    // 录制 + 传输)，见《显存 & 负载不均衡分析报告》§2.1）。
+    //
+    // 新模型（N 帧环）：
+    //   - PIPELINE_FRAMES 个 (command buffer + fence) 在 initialize() 预分配，
+    //     轮转复用；描述符集按帧归属（帧的 fence 信号后才可释放）
+    //   - begin_batch：取下一帧；该帧若仍在飞行则等其 fence（**只在环槽
+    //     复用前等待**），reap 后开始录制
+    //   - end_batch / flush_batch：提交不等待（host 继续录制，GPU 在队列
+    //     上先行执行；同队列 FIFO 保证数据依赖）。空帧不提交（省 submit）
+    //   - wait_in_flight：**"真正要结果"的阻塞点**（to_matrix/copy_from 读
+    //     GPU 内存前）——等待所有在飞帧并 reap
+    //   - release_idle_pool_blocks：非阻塞 reap 已完成帧 + 归还空闲块
+    // 效果：host 录制 step N+1 与 GPU 执行 step N 重叠；host 只在真正要
+    // 读 GPU 数据（logits 探针 / loss 标量 / 日志采样）时阻塞。
+    static constexpr std::size_t PIPELINE_FRAMES = 3;  // 环深度（报告 P0-1: N=3）
+    struct Frame
+    {
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;  // 创建即为 unsignaled
+        std::vector<VkDescriptorSet> desc_sets;  // 本帧使用的描述符集
+        bool in_flight = false;                  // 已提交、fence 尚未被等待
+    };
+    std::vector<Frame> frames_;
+    std::size_t frame_next_ = 0;         // 下一轮转帧（begin/flush 取用）
+    std::size_t last_active_frame_ = 0;  // 最近录制/提交的帧（非 batch 销毁决策用）
     bool batch_mode_ = false;
-    std::vector<VkDescriptorSet> batch_desc_sets_;  // batch 期间分配的描述符集
+    std::size_t batch_frame_ = 0;        // 当前录制中的帧
+    bool batch_has_ops_ = false;         // 当前帧是否已录制 op（空帧不提交）
+    VkCommandBuffer batch_cmd_ = VK_NULL_HANDLE;  // 当前帧的 command buffer
 
     std::mutex init_mutex_;
     std::mutex queue_mutex_;
     bool initialized_ = false;
+
+    // ── f16 硬件能力（D4，§7.1）────────────────────────────────────────
+    // GPU shaderFloat16：运行期一次查定，运行期不变。
+    // true  → f16 GEMM 变体②（f16vec 加载，需该特性）
+    // false → f16 GEMM 变体①（u8 软件解码，设备无关，默认路径）
+    bool has_shader_float16_ = false;
 
     // ── 延迟销毁：batch 录制期间 copy-on-write 替换旧 buffer 时，旧 buffer
     // 仍被已录制的 descriptor set 引用，不能立即 vkDestroyBuffer。
@@ -371,14 +425,18 @@ private:
     //   数据竞争方面：同一 command buffer 内命令按录制顺序执行，旧 buffer
     //   的已录制命令先于复用同一区间的新 buffer 命令执行，无数据竞争。
     //   但规范合规要求 buffer 对象本身不得重叠，故内存归还必须等 buffer
-    //   销毁完成。代价：batch 期间该区间不可复用（batch 通常只持续一个
-    //   step，内存影响可忽略）。
+    //   销毁完成。
+    //
+    //   多帧流水线（P0-1）：锁窗从"整个 batch"缩短到"所属帧"——每条延迟
+    //   销毁打上帧标签（frame），该帧的 fence 信号后（环槽复用 / drain /
+    //   非阻塞 reap）即销毁并归还内存。
     struct PendingDestroy
     {
         VkDevice device = VK_NULL_HANDLE;
         VkBuffer buffer = VK_NULL_HANDLE;
         MemoryPool::Allocation alloc;
         observer_ptr<MemoryPool> pool;
+        std::size_t frame = 0;  // 允许销毁的帧索引（该帧完成后才可释放）
     };
     std::mutex pending_mutex_;
     std::vector<PendingDestroy> pending_destroys_;
@@ -488,6 +546,36 @@ private:
 #endif
     }
 
+    [[nodiscard]] static const std::vector<uint32_t>& get_scan_prefix_outer_spirv()
+    {
+#ifdef NN_SCAN_PREFIX_OUTER_SPV_EMBEDDED
+        return nn_scan_prefix_outer_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_scan_suffix_outer_spirv()
+    {
+#ifdef NN_SCAN_SUFFIX_OUTER_SPV_EMBEDDED
+        return nn_scan_suffix_outer_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_outer_col_spirv()
+    {
+#ifdef NN_OUTER_COL_SPV_EMBEDDED
+        return nn_outer_col_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
     // ── AOT 融合 shader SPIR-V 来自构建期生成的 fused_registry.hpp ────────
     // （FusedShader 直接携带内联 SPIR-V，无需按名 getter；注册在 init 时遍历）
 
@@ -501,6 +589,13 @@ public:
             flush_pending_destroys();
 
             staging_ring_.reset();
+
+            // 释放帧环 fences（环内 command buffers 随 command pool 一起释放）
+            for (auto& f : frames_)
+            {
+                if (f.fence != VK_NULL_HANDLE)
+                    vkDestroyFence(device_.device(), f.fence, nullptr);
+            }
 
             if (gpu_tensor_pool_ != VK_NULL_HANDLE)
                 vkDestroyDescriptorPool(device_.device(), gpu_tensor_pool_, nullptr);
@@ -532,21 +627,36 @@ public:
         return *backend;
     }
 
+    // ── 延迟销毁决策（GpuBuffer 析构时调用）────────────────────────────
+    // 返回 true = 必须延迟（调用 defer_buffer_destroy）；false = 可立即销毁。
+    //   - batch 录制中：延迟，打当前帧标签（buffer 仍被本帧已录制命令引用）
+    //   - 非 batch：最近一次提交的帧若仍在飞行则延迟（buffer 可能被该帧
+    //     命令引用，帧 fence 信号即可证明安全）；否则立即销毁
+    // 内存归还与 buffer 销毁同批（D1）：buffer 销毁前不得把区间还给池。
+    [[nodiscard]] bool needs_deferred_destroy() const noexcept
+    {
+        if (batch_mode_)
+            return true;
+        return last_active_frame_ < frames_.size() &&
+               frames_[last_active_frame_].in_flight;
+    }
+
     // ── 延迟销毁入口（GpuBuffer 析构时调用）──────────────────────────
-    // batch 模式下不立即销毁 VkBuffer，等待提交完成；否则立即销毁。
-    // 内存归还也一并延迟（D1）：buffer 销毁前不得把区间还给池，
-    // 否则新 buffer 可能与未销毁的旧 buffer 内存重叠（规范违规）。
+    // 打上帧标签：batch 录制中 → 当前帧；非 batch → 最近活跃帧。
     void defer_buffer_destroy(VkDevice device, VkBuffer buffer,
                               const MemoryPool::Allocation& alloc,
                               observer_ptr<MemoryPool> pool)
     {
+        const std::size_t frame =
+            batch_mode_ ? batch_frame_ : last_active_frame_;
         std::lock_guard lock(pending_mutex_);
-        pending_destroys_.push_back({device, buffer, alloc, pool});
+        pending_destroys_.push_back({device, buffer, alloc, pool, frame});
     }
 
-    // ── 统一执行延迟销毁（必须在 batch descriptor sets 释放之后调用）──
+    // ── 统一执行延迟销毁（必须在对应帧的 fence 信号之后调用）─────────
     // 先 vkDestroyBuffer 再归还内存到池（D1）：保证 buffer 对象销毁后
     // 其区间才可被新分配复用，杜绝存活 buffer 间的内存重叠。
+    // flush 全部：用于"所有帧已完成"的 drain 点（wait_in_flight / 析构）。
     void flush_pending_destroys()
     {
         std::lock_guard lock(pending_mutex_);
@@ -558,6 +668,65 @@ public:
                 pd.pool->free(pd.alloc);
         }
         pending_destroys_.clear();
+    }
+
+    // ── reap 单帧（多帧流水线 P0-1）──────────────────────────────────
+    // 等待该帧 fence（wait=true；wait=false 要求调用方已用零超时
+    // vkWaitForFences 确认 VK_SUCCESS）→ 销毁该帧的延迟 buffer 并归还
+    // 内存 → 释放该帧描述符集（帧提交期间被已录制命令引用，fence 信号
+    // 前不得释放）→ in_flight=false
+    [[nodiscard]] Result<void> reap_frame(std::size_t i, bool wait)
+    {
+        auto& f = frames_[i];
+        if (f.in_flight && wait)
+        {
+            constexpr uint64_t kFrameTimeoutNs = 60'000'000'000ULL;  // 60s
+            const VkResult wr = vkWaitForFences(
+                device_.device(), 1, &f.fence, VK_TRUE, kFrameTimeoutNs);
+            if (wr == VK_ERROR_DEVICE_LOST)
+            {
+                // 设备丢失（TDR 触发）：GPU 已死亡，无法恢复
+                device_lost_ = true;
+                return std::unexpected(Error{
+                    "GPU 设备丢失 (VK_ERROR_DEVICE_LOST): Windows TDR 已重置 GPU 驱动。"
+                    "\n模型已自动保存，请使用 --resume <save-path> 重启训练。"
+                    "\n建议：减小 --batch-size 或 --seq-len，或增大 Windows TDR 超时"
+                    " (注册表 TdrDelay)"});
+            }
+            if (wr != VK_SUCCESS)
+                return std::unexpected(Error{
+                    std::string("GPU 帧等待失败: Vulkan error ") +
+                    std::to_string(static_cast<int>(wr)) +
+                    "\n建议：减小 --batch-size 或 --seq-len，或增大 Windows TDR 超时"
+                    " (注册表 TdrDelay)"});
+        }
+        // 该帧的延迟销毁：先 vkDestroyBuffer 再归还内存（D1）
+        {
+            std::lock_guard lock(pending_mutex_);
+            std::vector<PendingDestroy> rest;
+            rest.reserve(pending_destroys_.size());
+            for (auto& pd : pending_destroys_)
+            {
+                if (pd.frame == i)
+                {
+                    if (pd.buffer != VK_NULL_HANDLE && pd.device != VK_NULL_HANDLE)
+                        vkDestroyBuffer(pd.device, pd.buffer, nullptr);
+                    if (pd.pool && pd.alloc.valid())
+                        pd.pool->free(pd.alloc);
+                }
+                else
+                {
+                    rest.push_back(std::move(pd));
+                }
+            }
+            pending_destroys_ = std::move(rest);
+        }
+        if (!f.desc_sets.empty())
+            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_,
+                static_cast<uint32_t>(f.desc_sets.size()), f.desc_sets.data());
+        f.desc_sets.clear();
+        f.in_flight = false;
+        return {};
     }
 
     // 初始化
@@ -630,6 +799,40 @@ public:
             __FILE__, __LINE__);
         if (!r)
             return r;
+
+        // 7b. 预分配流水线帧环（P0-1）：N 个 command buffer + N 个 fence。
+        //     旧实现每步 vkAllocateCommandBuffers + vkCreateFence（host 侧
+        //     每步固定开销）；现在环内复用，全程零分配。
+        frames_.resize(PIPELINE_FRAMES);
+        {
+            VkCommandBufferAllocateInfo cmd_alloc{};
+            cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cmd_alloc.commandPool = command_pool_;
+            cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cmd_alloc.commandBufferCount = static_cast<uint32_t>(PIPELINE_FRAMES);
+            std::vector<VkCommandBuffer> cmds(PIPELINE_FRAMES, VK_NULL_HANDLE);
+            r = detail::vk_check(
+                vkAllocateCommandBuffers(device_.device(), &cmd_alloc, cmds.data()),
+                __FILE__, __LINE__);
+            if (!r)
+                return r;
+            for (std::size_t i = 0; i < PIPELINE_FRAMES; ++i)
+                frames_[i].cmd = cmds[i];
+
+            VkFenceCreateInfo fence_info{};
+            fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            // 初始 unsignaled：vkQueueSubmit 要求 fence 未 signal
+            for (std::size_t i = 0; i < PIPELINE_FRAMES; ++i)
+            {
+                r = detail::vk_check(
+                    vkCreateFence(device_.device(), &fence_info, nullptr, &frames_[i].fence),
+                    __FILE__, __LINE__);
+                if (!r)
+                    return r;
+            }
+        }
+        frame_next_ = 0;
+        last_active_frame_ = 0;
 
         // 9. 创建 tiled matmul pipeline（可选）
         const auto& tiled_spirv = get_matmul_tiled_spirv();
@@ -721,6 +924,32 @@ public:
                 scatter_add_pipeline_ = std::move(*sp_r);
         }
 
+        // 16. 创建 RLA 扫描原语 pipelines（手写原语，不进融合注册表）
+        const auto& spf_spirv = get_scan_prefix_outer_spirv();
+        if (!spf_spirv.empty())
+        {
+            auto spf_r = VulkanPipeline::create_generic(
+                device_.device(), spf_spirv, 8, 7 * sizeof(uint32_t));
+            if (spf_r)
+                scan_prefix_outer_pipeline_ = std::move(*spf_r);
+        }
+        const auto& sfs_spirv = get_scan_suffix_outer_spirv();
+        if (!sfs_spirv.empty())
+        {
+            auto sfs_r = VulkanPipeline::create_generic(
+                device_.device(), sfs_spirv, 5, 6 * sizeof(uint32_t));
+            if (sfs_r)
+                scan_suffix_outer_pipeline_ = std::move(*sfs_r);
+        }
+        const auto& oc_spirv = get_outer_col_spirv();
+        if (!oc_spirv.empty())
+        {
+            auto oc_r = VulkanPipeline::create_generic(
+                device_.device(), oc_spirv, 4, 4 * sizeof(uint32_t));
+            if (oc_r)
+                outer_col_pipeline_ = std::move(*oc_r);
+        }
+
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
         // 16. 注册 AOT 融合 shader pipelines（构建期 scan_exprs 收集 +
         //     gen_fused 合成；每个条目：N 输入 + 1 输出 binding；
@@ -756,6 +985,22 @@ public:
         }
 #endif
 
+        // ── D4：查询 GPU f16 硬件能力（§7.1）─────────────────────────────
+        // shaderFloat16：Vulkan 1.2 核心特性 / VK_KHR_shader_float16_int8 扩展。
+        // 查询 VkPhysicalDeviceShaderFloat16Int8Features（扩展 pNext 链）。
+        // 未找到扩展 → has_shader_float16_ = false（兼容路径，变体①）。
+        {
+            VkPhysicalDeviceShaderFloat16Int8Features f16_features{};
+            f16_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
+
+            VkPhysicalDeviceFeatures2 device_features{};
+            device_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            device_features.pNext = &f16_features;
+
+            vkGetPhysicalDeviceFeatures2(device_.physical_device(), &device_features);
+            has_shader_float16_ = (f16_features.shaderFloat16 == VK_TRUE);
+        }
+
         initialized_ = true;
         return {};
     }
@@ -771,6 +1016,12 @@ public:
     [[nodiscard]] bool has_transpose_pipeline() const noexcept { return transpose_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_gather_pipeline() const noexcept { return gather_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_scatter_add_pipeline() const noexcept { return scatter_add_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_scan_prefix_outer_pipeline() const noexcept { return scan_prefix_outer_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_scan_suffix_outer_pipeline() const noexcept { return scan_suffix_outer_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_outer_col_pipeline() const noexcept { return outer_col_pipeline_.handle() != VK_NULL_HANDLE; }
+
+    // ── D4：f16 硬件能力查询（§7.1）────────────────────────────────────
+    [[nodiscard]] bool has_shader_float16() const noexcept { return has_shader_float16_; }
 
     [[nodiscard]] VulkanDevice& device() noexcept { return device_; }
     [[nodiscard]] MemoryPool& memory_pool() noexcept { return *memory_pool_; }
@@ -778,29 +1029,136 @@ public:
     [[nodiscard]] VkCommandPool command_pool() const noexcept { return command_pool_; }
     [[nodiscard]] VkDescriptorPool gpu_tensor_pool() const noexcept { return gpu_tensor_pool_; }
 
-    // ── 显存回收（L2）：归还完全空闲的内存池底材给 GPU ───────────────
-    // 应在 end_batch（提交完成、延迟销毁已 flush）之后调用，避免释放
-    // 仍被 batch 引用的 buffer 底材。
+    // ── 显存回收（L2，P0-1 非阻塞版）：归还完全空闲的内存池底材 ─────
+    // 非阻塞 reap 已完成帧（vkGetFenceStatus 查询，不等待）：销毁其延迟
+    // buffer + 释放描述符集，使底材可被归还；未完成的帧留给环槽复用 /
+    // 下次 drain reap——不在 step 边界阻塞流水线（GPU 仍在执行本 step
+    // 帧时，host 可继续录制下一 step）。
     [[nodiscard]] Result<void> release_idle_pool_blocks()
     {
         if (!initialized_ || !memory_pool_)
             return {};
-        flush_pending_destroys();
+        for (std::size_t i = 0; i < frames_.size(); ++i)
+        {
+            if (!frames_[i].in_flight)
+                continue;
+            // 非阻塞查询：vkWaitForFences(timeout=0) 返回 VK_SUCCESS
+            // （已就绪）或 VK_TIMEOUT（未就绪）。VK_NOT_READY 是
+            // vkGetFenceStatus 的返回值，vkWaitForFences 不使用它。
+            const VkResult rs =
+                vkWaitForFences(device_.device(), 1, &frames_[i].fence,
+                                VK_TRUE, 0);
+            if (rs == VK_ERROR_DEVICE_LOST)
+            {
+                // 设备丢失（TDR 触发）：GPU 已死亡，无法恢复
+                device_lost_ = true;
+                return std::unexpected(Error{
+                    "GPU 设备丢失 (VK_ERROR_DEVICE_LOST): Windows TDR 已重置 GPU 驱动。"
+                    "\n模型已自动保存，请使用 --resume <save-path> 重启训练。"
+                    "\n建议：减小 --batch-size 或 --seq-len，或增大 Windows TDR 超时"
+                    " (注册表 TdrDelay)"});
+            }
+            if (rs != VK_TIMEOUT && rs != VK_SUCCESS)
+                return std::unexpected(Error{
+                    std::string("GPU fence 非阻塞查询失败: Vulkan error ") +
+                    std::to_string(static_cast<int>(rs))});
+            if (rs == VK_SUCCESS)
+            {
+                auto rr = reap_frame(i, /*wait=*/false);
+                if (!rr)
+                    return std::unexpected(rr.error());
+            }
+        }
         memory_pool_->release_idle_blocks();
         return {};
     }
 
 
     // ══════════════════════════════════════════════════════════════════
-    // Command Buffer Batching API
+    // Command Buffer Batching API（多帧流水线 P0-1）
     // ══════════════════════════════════════════════════════════════════
     // 用法：
     //   backend.begin_batch();
     //   // ... 多次 matmul_gpu / elementwise_gpu / layernorm_gpu 调用 ...
     //   backend.end_batch();
-    // 效果：所有操作录制到同一个 command buffer，一次提交、一次 fence wait。
+    // 效果：所有操作录制到同一个 command buffer，一次提交（**不等待**）；
+    // host 继续录制下一段，GPU 在队列上先行执行（host 录制与 GPU 执行
+    // 重叠）。真正要读 GPU 数据时调 wait_in_flight()（to_matrix 内部）。
     // ══════════════════════════════════════════════════════════════════
     [[nodiscard]] bool in_batch() const noexcept { return batch_mode_; }
+
+    // ── 取下一帧并开始录制（begin_batch / flush_batch 共用）──────────
+    // 环槽复用前等待：该帧若仍在飞行，等其 fence（这是唯一的常规等待点；
+    // 环深度 N 限制 host 至多超前 N 帧）。
+    [[nodiscard]] Result<void> start_frame()
+    {
+        const std::size_t i = frame_next_;
+        frame_next_ = (i + 1) % PIPELINE_FRAMES;
+
+        auto rr = reap_frame(i, /*wait=*/true);
+        if (!rr)
+        {
+            batch_mode_ = false;
+            return std::unexpected(rr.error());
+        }
+
+        auto& f = frames_[i];
+        auto r = detail::vk_check(vkResetCommandBuffer(f.cmd, 0), __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
+
+        VkCommandBufferBeginInfo begin_info{};
+        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        r = detail::vk_check(vkBeginCommandBuffer(f.cmd, &begin_info), __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
+
+        batch_cmd_ = f.cmd;
+        batch_frame_ = i;
+        last_active_frame_ = i;
+        batch_has_ops_ = false;
+        batch_mode_ = true;
+        return {};
+    }
+
+    // ── 提交当前帧（不等待）────────────────────────────────────────────
+    // 空帧不提交（无 op 的帧跳过，省一次 vkQueueSubmit + 一个环槽）。
+    [[nodiscard]] Result<void> submit_frame_no_wait()
+    {
+        auto& f = frames_[batch_frame_];
+        if (!batch_has_ops_)
+            return {};  // 空帧：不提交
+
+        // reap 已确保 fence 处于 unsignaled（或从未提交）状态
+        auto r = detail::vk_check(
+            vkResetFences(device_.device(), 1, &f.fence), __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
+
+        // 跨 submit 数据依赖：帧命令的输入可能刚由 batch 内的 from_matrix
+        // 独立上传提交写入——等 in-flight region 信号量（GPU 队列内等待，
+        // host 不阻塞）
+        const auto sw = collect_staging_waits();
+
+        {
+            std::lock_guard lock(queue_mutex_);
+            VkSubmitInfo submit_info{};
+            submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submit_info.commandBufferCount = 1;
+            submit_info.pCommandBuffers = &f.cmd;
+            if (sw.any())
+            {
+                submit_info.waitSemaphoreCount = static_cast<uint32_t>(sw.sems.size());
+                submit_info.pWaitSemaphores = sw.sems.data();
+            }
+            r = detail::vk_check(
+                vkQueueSubmit(device_.compute_queue(), 1, &submit_info, f.fence),
+                __FILE__, __LINE__);
+        }
+        if (!r) return std::unexpected(r.error());
+
+        f.in_flight = true;
+        last_active_frame_ = batch_frame_;
+        return {};
+    }
 
     [[nodiscard]] Result<void> begin_batch()
     {
@@ -808,51 +1166,12 @@ public:
             return std::unexpected(Error{"GPU backend not initialized"});
         if (batch_mode_)
             return std::unexpected(Error{"Already in batch mode"});
-
-        // 1. 分配 command buffer
-        VkCommandBufferAllocateInfo cmd_alloc{};
-        cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cmd_alloc.commandPool = command_pool_;
-        cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cmd_alloc.commandBufferCount = 1;
-
-        auto r = detail::vk_check(
-            vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &batch_cmd_),
-            __FILE__, __LINE__);
-        if (!r) return std::unexpected(r.error());
-
-        // 2. 开始录制
-        VkCommandBufferBeginInfo begin_info{};
-        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-        r = detail::vk_check(vkBeginCommandBuffer(batch_cmd_, &begin_info), __FILE__, __LINE__);
-        if (!r)
-        {
-            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
-            batch_cmd_ = VK_NULL_HANDLE;
-            return std::unexpected(r.error());
-        }
-
-        // 3. 创建 fence
-        VkFenceCreateInfo fence_info{};
-        fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        r = detail::vk_check(
-            vkCreateFence(device_.device(), &fence_info, nullptr, &batch_fence_),
-            __FILE__, __LINE__);
-        if (!r)
-        {
-            vkEndCommandBuffer(batch_cmd_);
-            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
-            batch_cmd_ = VK_NULL_HANDLE;
-            return std::unexpected(r.error());
-        }
-
-        batch_mode_ = true;
-        batch_desc_sets_.clear();
-        return {};
+        return start_frame();
     }
 
+    // ── 结束 batch：提交当前帧，**不等待**（P0-1）─────────────────────
+    // 帧在队列上执行；其延迟销毁 / 描述符集在 reap 时释放。
+    // 设备丢失等错误在 wait_in_flight / 环槽复用 reap 时浮出。
     [[nodiscard]] Result<void> end_batch()
     {
         if (!batch_mode_)
@@ -862,248 +1181,75 @@ public:
         auto r = detail::vk_check(vkEndCommandBuffer(batch_cmd_), __FILE__, __LINE__);
         if (!r)
         {
-            vkDestroyFence(device_.device(), batch_fence_, nullptr);
-            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
-            batch_cmd_ = VK_NULL_HANDLE;
-            batch_fence_ = VK_NULL_HANDLE;
             batch_mode_ = false;
             return std::unexpected(r.error());
         }
 
-        // 2. 提交
-        vkResetFences(device_.device(), 1, &batch_fence_);
-        {
-            std::lock_guard lock(queue_mutex_);
-            VkSubmitInfo submit_info{};
-            submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            submit_info.commandBufferCount = 1;
-            submit_info.pCommandBuffers = &batch_cmd_;
-
-            r = detail::vk_check(
-                vkQueueSubmit(device_.compute_queue(), 1, &submit_info, batch_fence_),
-                __FILE__, __LINE__);
-            if (!r)
-            {
-                vkDestroyFence(device_.device(), batch_fence_, nullptr);
-                vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
-                batch_cmd_ = VK_NULL_HANDLE;
-                batch_fence_ = VK_NULL_HANDLE;
-                batch_mode_ = false;
-                return std::unexpected(r.error());
-            }
-        }
-
-        // 3. 等待完成（60 秒超时，避免 TDR 导致无限挂起）
-        constexpr uint64_t kBatchTimeoutNs = 60'000'000'000ULL;  // 60s
-        VkResult wait_result = vkWaitForFences(
-            device_.device(), 1, &batch_fence_, VK_TRUE, kBatchTimeoutNs);
-        if (wait_result == VK_ERROR_DEVICE_LOST)
-        {
-            // ── 设备丢失（TDR 触发）：GPU 已死亡，无法恢复 ──
-            vkDestroyFence(device_.device(), batch_fence_, nullptr);
-            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
-            if (!batch_desc_sets_.empty())
-                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_,
-                    static_cast<uint32_t>(batch_desc_sets_.size()), batch_desc_sets_.data());
-            batch_desc_sets_.clear();
-            batch_cmd_ = VK_NULL_HANDLE;
-            batch_fence_ = VK_NULL_HANDLE;
-            batch_mode_ = false;
-            device_lost_ = true;
-            flush_pending_destroys();
-            return std::unexpected(Error{
-                "GPU 设备丢失 (VK_ERROR_DEVICE_LOST): Windows TDR 已重置 GPU 驱动。"
-                "\n模型已自动保存，请使用 --resume <save-path> --batch-size <较小值> 重启训练。"
-                "\n建议：减小 --batch-size 或 --seq-len，或增大 Windows TDR 超时"
-                " (注册表 TdrDelay)"});
-        }
-        else if (wait_result != VK_SUCCESS)
-        {
-            // 其他错误（含 VK_TIMEOUT）
-            vkDestroyFence(device_.device(), batch_fence_, nullptr);
-            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
-            if (!batch_desc_sets_.empty())
-                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_,
-                    static_cast<uint32_t>(batch_desc_sets_.size()), batch_desc_sets_.data());
-            batch_desc_sets_.clear();
-            batch_cmd_ = VK_NULL_HANDLE;
-            batch_fence_ = VK_NULL_HANDLE;
-            batch_mode_ = false;
-            flush_pending_destroys();
-            return std::unexpected(Error{
-                std::string("GPU batch 等待失败: Vulkan error ") + std::to_string(static_cast<int>(wait_result)) +
-                "\n建议：减小 --batch-size 或 --seq-len，或增大 Windows TDR 超时"
-                " (注册表 TdrDelay)"});
-        }
-
-        // 4. 清理
-        vkDestroyFence(device_.device(), batch_fence_, nullptr);
-        vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
-        // 释放 batch 期间分配的所有描述符集
-        if (!batch_desc_sets_.empty())
-            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_,
-                static_cast<uint32_t>(batch_desc_sets_.size()), batch_desc_sets_.data());
-        batch_desc_sets_.clear();
-        batch_cmd_ = VK_NULL_HANDLE;
-        batch_fence_ = VK_NULL_HANDLE;
+        // 2. 提交（不等待）
+        r = submit_frame_no_wait();
         batch_mode_ = false;
-
-        // 提交已完成且描述符集已释放，可安全销毁延迟的旧 buffer
-        flush_pending_destroys();
-
         return r;
     }
 
-    // ── 批处理中点刷新（防 TDR） ─────────────────────────────────────────
-    // 提交当前 command buffer 并等待完成，然后自动开始新的录制。
-    // 用于拆分大 batch（如 forward 与 backward 之间），避免单次提交时间
-    // 过长触发 Windows TDR。调用后仍处于 batch 模式。
+    // ── 批处理中点刷新（防 TDR，P0-1 不等待版）────────────────────────
+    // 提交当前帧（不等待），然后开始录制下一帧。用于拆分大 batch（如
+    // forward 与 backward 之间），避免单次提交时间过长触发 Windows TDR。
+    // 当前帧为空（无 op 录制）时 no-op——不提交、不换帧（避免浪费环槽
+    // 与 submit，如 to_matrix 的 drain 已换过帧的场景）。
     [[nodiscard]] Result<void> flush_batch()
     {
         if (!batch_mode_)
             return {};  // 非 batch 模式时 no-op
+        if (!batch_has_ops_)
+            return {};  // 空帧：无需提交，继续在同一帧录制
 
-        // 1. 结束当前录制
         auto r = detail::vk_check(vkEndCommandBuffer(batch_cmd_), __FILE__, __LINE__);
         if (!r)
         {
-            vkDestroyFence(device_.device(), batch_fence_, nullptr);
-            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
-            batch_cmd_ = VK_NULL_HANDLE;
-            batch_fence_ = VK_NULL_HANDLE;
             batch_mode_ = false;
             return std::unexpected(r.error());
         }
 
-        // 2. 提交并等待完成（超时保护）
-        vkResetFences(device_.device(), 1, &batch_fence_);
+        r = submit_frame_no_wait();  // 不等待
+        if (!r)
         {
-            std::lock_guard lock(queue_mutex_);
-            VkSubmitInfo submit_info{};
-            submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            submit_info.commandBufferCount = 1;
-            submit_info.pCommandBuffers = &batch_cmd_;
-            r = detail::vk_check(
-                vkQueueSubmit(device_.compute_queue(), 1, &submit_info, batch_fence_),
-                __FILE__, __LINE__);
-            if (!r)
+            batch_mode_ = false;
+            return std::unexpected(r.error());
+        }
+
+        // 仍处于 batch 模式：开始录制下一帧
+        return start_frame();
+    }
+
+    // ── "真正要结果"的阻塞点（P0-1）───────────────────────────────────
+    // 等待所有在飞帧完成并 reap（延迟销毁 + 描述符集释放）。
+    // to_matrix / copy_from 读 GPU 内存前必须调用：要读的数据可能刚由
+    // 在飞帧写入，队列 FIFO 只保证顺序、不保证完成。
+    [[nodiscard]] Result<void> wait_in_flight()
+    {
+        for (std::size_t i = 0; i < frames_.size(); ++i)
+        {
+            if (frames_[i].in_flight)
             {
-                vkDestroyFence(device_.device(), batch_fence_, nullptr);
-                vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
-                batch_cmd_ = VK_NULL_HANDLE;
-                batch_fence_ = VK_NULL_HANDLE;
-                batch_mode_ = false;
-                return std::unexpected(r.error());
+                auto r = reap_frame(i, /*wait=*/true);
+                if (!r)
+                    return std::unexpected(r.error());
             }
         }
-
-        constexpr uint64_t kFlushTimeoutNs = 60'000'000'000ULL;  // 60s
-        VkResult flush_wait = vkWaitForFences(
-            device_.device(), 1, &batch_fence_, VK_TRUE, kFlushTimeoutNs);
-        if (flush_wait == VK_ERROR_DEVICE_LOST)
-        {
-            // 设备丢失：GPU 已死亡
-            vkDestroyFence(device_.device(), batch_fence_, nullptr);
-            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
-            if (!batch_desc_sets_.empty())
-                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_,
-                    static_cast<uint32_t>(batch_desc_sets_.size()), batch_desc_sets_.data());
-            batch_desc_sets_.clear();
-            batch_cmd_ = VK_NULL_HANDLE;
-            batch_fence_ = VK_NULL_HANDLE;
-            batch_mode_ = false;
-            device_lost_ = true;
-            flush_pending_destroys();
-            return std::unexpected(Error{
-                std::string("GPU flush 期间设备丢失 (VK_ERROR_DEVICE_LOST), Vulkan error ")
-                + std::to_string(static_cast<int>(flush_wait))});
-        }
-        else if (flush_wait != VK_SUCCESS)
-        {
-            vkDestroyFence(device_.device(), batch_fence_, nullptr);
-            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
-            if (!batch_desc_sets_.empty())
-                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_,
-                    static_cast<uint32_t>(batch_desc_sets_.size()), batch_desc_sets_.data());
-            batch_desc_sets_.clear();
-            batch_cmd_ = VK_NULL_HANDLE;
-            batch_fence_ = VK_NULL_HANDLE;
-            batch_mode_ = false;
-            flush_pending_destroys();
-            return std::unexpected(Error{
-                std::string("GPU flush_batch 等待失败: Vulkan error ")
-                + std::to_string(static_cast<int>(flush_wait))});
-        }
-
-        // 3. 释放已提交的描述符集
-        if (!batch_desc_sets_.empty())
-            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_,
-                static_cast<uint32_t>(batch_desc_sets_.size()), batch_desc_sets_.data());
-        batch_desc_sets_.clear();
-
-        // 提交已完成，可安全销毁延迟的旧 buffer
+        // 所有帧已完成：兜底清理剩余延迟销毁（正常应为空）
         flush_pending_destroys();
-
-        // 4. 销毁旧 command buffer 和 fence
-        vkDestroyFence(device_.device(), batch_fence_, nullptr);
-        vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
-
-        // 5. 分配新的 command buffer（继续录制）
-        VkCommandBufferAllocateInfo cmd_alloc{};
-        cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cmd_alloc.commandPool = command_pool_;
-        cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cmd_alloc.commandBufferCount = 1;
-        r = detail::vk_check(
-            vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &batch_cmd_),
-            __FILE__, __LINE__);
-        if (!r)
-        {
-            batch_cmd_ = VK_NULL_HANDLE;
-            batch_fence_ = VK_NULL_HANDLE;
-            batch_mode_ = false;
-            return std::unexpected(r.error());
-        }
-
-        VkCommandBufferBeginInfo begin_info{};
-        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        r = detail::vk_check(vkBeginCommandBuffer(batch_cmd_, &begin_info), __FILE__, __LINE__);
-        if (!r)
-        {
-            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
-            batch_cmd_ = VK_NULL_HANDLE;
-            batch_fence_ = VK_NULL_HANDLE;
-            batch_mode_ = false;
-            return std::unexpected(r.error());
-        }
-
-        // 6. 创建新的 fence
-        VkFenceCreateInfo fence_info{};
-        fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        r = detail::vk_check(
-            vkCreateFence(device_.device(), &fence_info, nullptr, &batch_fence_),
-            __FILE__, __LINE__);
-        if (!r)
-        {
-            vkEndCommandBuffer(batch_cmd_);
-            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &batch_cmd_);
-            batch_cmd_ = VK_NULL_HANDLE;
-            batch_fence_ = VK_NULL_HANDLE;
-            batch_mode_ = false;
-            return std::unexpected(r.error());
-        }
-
-        // 仍处于 batch 模式，只是提交了一段并开始新的录制
         return {};
     }
 
     // ── 阻塞式上传：CPU → GPU（支持分块传输大矩阵）─────────────────────
     // 当数据超过 staging region 大小时，自动分块上传。
     // 每块大小不超过 staging region，通过多次 memcpy + vkCmdCopyBuffer 完成。
+    // 元素类型由 P 决定（f32=4B / f16=2B），memcpy 为字节级操作，§6.5。
+    template <Precision P>
     [[nodiscard]] Result<void> upload_blocking(
-        GpuTensor& dst, std::span<const Scalar> cpu_data)
+        GpuTensorT<P>& dst, std::span<const elem<P>> cpu_data)
     {
+        using ElemType = elem<P>;
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
         if (!dst.valid())
@@ -1113,10 +1259,17 @@ public:
         if (cpu_data.size() != elem_count)
             return std::unexpected(Error{"Upload size mismatch"});
 
-        const std::size_t total_bytes = elem_count * sizeof(Scalar);
+        const std::size_t total_bytes = elem_count * sizeof(ElemType);
         const std::size_t staging_cap = staging_ring_->region_size();
 
         // ── 小矩阵快速路径：单次传输 ──────────────────────────────────
+        // region 专属 command buffer（P0-1 修复）：不再每次上传
+        // vkAllocateCommandBuffers + 提交后立即可复用/释放——VUID-
+        // vkFreeCommandBuffers-pCommandBuffers-00058 禁止释放 pending
+        // （已提交、fence 未 signal）的 command buffer；旧代码"submit 后
+        // 立即 free"是规范违规（实测导致驱动通道排序失效、fence 提前
+        // signal、跨 submit 乱序）。acquire 已等在飞 fence → 该 cmd 的
+        // 上一次使用完成（invalid 状态）→ vkResetCommandBuffer 复用合法。
         if (total_bytes <= staging_cap)
         {
             auto ri = staging_ring_->acquire();
@@ -1124,16 +1277,9 @@ public:
             auto r = staging_ring_->upload(ri, cpu_data, 0);
             if (!r) return r;
 
-            VkCommandBufferAllocateInfo cmd_alloc{};
-            cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-            cmd_alloc.commandPool = command_pool_;
-            cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cmd_alloc.commandBufferCount = 1;
+            auto cmd = staging_ring_->command_buffer(ri);
 
-            VkCommandBuffer cmd = VK_NULL_HANDLE;
-            r = detail::vk_check(
-                vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &cmd),
-                __FILE__, __LINE__);
+            r = detail::vk_check(vkResetCommandBuffer(cmd, 0), __FILE__, __LINE__);
             if (!r) return r;
 
             VkCommandBufferBeginInfo begin_info{};
@@ -1141,13 +1287,13 @@ public:
             begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
             r = detail::vk_check(vkBeginCommandBuffer(cmd, &begin_info), __FILE__, __LINE__);
-            if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
+            if (!r) return r;
 
             VkBufferCopy cp{0, 0, total_bytes};
             vkCmdCopyBuffer(cmd, staging_ring_->buffer(ri), dst.buffer().impl(), 1, &cp);
 
             r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
-            if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
+            if (!r) return r;
 
             auto fence = staging_ring_->fence(ri);
             vkResetFences(device_.device(), 1, &fence);
@@ -1158,51 +1304,51 @@ public:
                 submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
                 submit_info.commandBufferCount = 1;
                 submit_info.pCommandBuffers = &cmd;
+                // 跨 submit 数据依赖（P0-1 修复）：信号本 region 的信号量。
+                // 读取"本 copy 写入的 buffer"的后续 submit 必须
+                // pWaitSemaphores（见 collect_staging_waits）。
+                const auto sem = staging_ring_->semaphore(ri);
+                submit_info.signalSemaphoreCount = 1;
+                submit_info.pSignalSemaphores = &sem;
 
                 r = detail::vk_check(
                     vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
                     __FILE__, __LINE__);
-                if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
             }
+            if (!r) return r;
 
-            r = detail::vk_check(
-                vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, 10'000'000'000ULL),
-                __FILE__, __LINE__);
-
-            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
-            return r;
+            // P0-1：提交后不等待——host 可立即继续录制。标记 region
+            // in use：下次 acquire 到该 region 时等其 fence（staging 安全
+            // + 等待后该 cmd 离开 pending，可 reset 复用）。**不释放 cmd**
+            // （pending 状态，见上方 VUID 注释）。
+            staging_ring_->mark_in_flight(ri);
+            return {};
         }
 
         // ── 大矩阵分块上传 ───────────────────────────────────────────
-        // 每块大小对齐到 sizeof(Scalar)，确保元素边界对齐
-        const std::size_t chunk_bytes = (staging_cap / sizeof(Scalar)) * sizeof(Scalar);
+        // 每块大小对齐到 sizeof(ElemType)，确保元素边界对齐
+        const std::size_t chunk_bytes = (staging_cap / sizeof(ElemType)) * sizeof(ElemType);
         std::size_t dst_offset = 0;
 
         while (dst_offset < total_bytes)
         {
             const std::size_t this_chunk = std::min(chunk_bytes, total_bytes - dst_offset);
-            const std::size_t this_elems = this_chunk / sizeof(Scalar);
-            const std::size_t src_elem_offset = dst_offset / sizeof(Scalar);
+            const std::size_t this_elems = this_chunk / sizeof(ElemType);
+            const std::size_t src_elem_offset = dst_offset / sizeof(ElemType);
 
             // 1. 获取 staging region 并上传当前块
             auto ri = staging_ring_->acquire();
             auto r = staging_ring_->upload(
                 ri,
-                std::span<const Scalar>(cpu_data.data() + src_elem_offset, this_elems),
+                std::span<const ElemType>(cpu_data.data() + src_elem_offset, this_elems),
                 0);
             if (!r) return r;
 
-            // 2. 录制 copy 命令
-            VkCommandBufferAllocateInfo cmd_alloc{};
-            cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-            cmd_alloc.commandPool = command_pool_;
-            cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cmd_alloc.commandBufferCount = 1;
+            // 2. 录制 copy 命令（region 专属 cmd buffer：禁止 pending 释放，
+            //    见小矩阵路径的 VUID 注释；acquire 已等在飞 fence，reset 合法）
+            auto cmd = staging_ring_->command_buffer(ri);
 
-            VkCommandBuffer cmd = VK_NULL_HANDLE;
-            r = detail::vk_check(
-                vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &cmd),
-                __FILE__, __LINE__);
+            r = detail::vk_check(vkResetCommandBuffer(cmd, 0), __FILE__, __LINE__);
             if (!r) return r;
 
             VkCommandBufferBeginInfo begin_info{};
@@ -1210,15 +1356,17 @@ public:
             begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
             r = detail::vk_check(vkBeginCommandBuffer(cmd, &begin_info), __FILE__, __LINE__);
-            if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
+            if (!r) return r;
 
             VkBufferCopy cp{0, dst_offset, this_chunk};
             vkCmdCopyBuffer(cmd, staging_ring_->buffer(ri), dst.buffer().impl(), 1, &cp);
 
             r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
-            if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
+            if (!r) return r;
 
-            // 3. 提交并等待
+            // 3. 提交（P0-1：不等待；region 标记 in use，下次 acquire 到该
+            //    region 时等其 fence；不释放 cmd——pending 状态）+ 信号本
+            //    region 信号量（跨 submit 数据依赖，见 collect_staging_waits）
             auto fence = staging_ring_->fence(ri);
             vkResetFences(device_.device(), 1, &fence);
 
@@ -1228,19 +1376,17 @@ public:
                 submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
                 submit_info.commandBufferCount = 1;
                 submit_info.pCommandBuffers = &cmd;
+                const auto sem = staging_ring_->semaphore(ri);
+                submit_info.signalSemaphoreCount = 1;
+                submit_info.pSignalSemaphores = &sem;
 
                 r = detail::vk_check(
                     vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
                     __FILE__, __LINE__);
-                if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
             }
+            if (!r) return r;
 
-            r = detail::vk_check(
-                vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, 10'000'000'000ULL),
-                __FILE__, __LINE__);
-            if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
-
-            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
+            staging_ring_->mark_in_flight(ri);
             dst_offset += this_chunk;
         }
 
@@ -1249,9 +1395,12 @@ public:
 
     // ── 阻塞式下载：GPU → CPU（支持分块传输大矩阵）─────────────────────
     // 当数据超过 staging region 大小时，自动分块下载。
+    // 元素类型由 P 决定（f32=4B / f16=2B），memcpy 为字节级操作，§6.5。
+    template <Precision P>
     [[nodiscard]] Result<void> download_blocking(
-        const GpuTensor& src, std::span<Scalar> cpu_data)
+        const GpuTensorT<P>& src, std::span<elem<P>> cpu_data)
     {
+        using ElemType = elem<P>;
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
         if (!src.valid())
@@ -1261,7 +1410,7 @@ public:
         if (cpu_data.size() != elem_count)
             return std::unexpected(Error{"Download size mismatch"});
 
-        const std::size_t total_bytes = elem_count * sizeof(Scalar);
+        const std::size_t total_bytes = elem_count * sizeof(ElemType);
         const std::size_t staging_cap = staging_ring_->region_size();
 
         // ── 小矩阵快速路径：单次传输 ──────────────────────────────────
@@ -1297,12 +1446,24 @@ public:
             auto fence = staging_ring_->fence(ri);
             vkResetFences(device_.device(), 1, &fence);
 
+            // 跨 submit 数据依赖：源 buffer 可能刚由在飞上传的 copy 写入
+            // （from_matrix → to_matrix 无中间 op 即此场景）——等 in-flight
+            // region 信号量（本下载自用的 region 已在 acquire 中等待并重置，
+            // 不在 in-flight 集合内）
+            const auto sw = collect_staging_waits();
+
             {
                 std::lock_guard lock(queue_mutex_);
                 VkSubmitInfo submit_info{};
                 submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
                 submit_info.commandBufferCount = 1;
                 submit_info.pCommandBuffers = &cmd;
+                if (sw.any())
+                {
+                    submit_info.waitSemaphoreCount =
+                        static_cast<uint32_t>(sw.sems.size());
+                    submit_info.pWaitSemaphores = sw.sems.data();
+                }
 
                 r = detail::vk_check(
                     vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
@@ -1322,14 +1483,14 @@ public:
         }
 
         // ── 大矩阵分块下载 ───────────────────────────────────────────
-        const std::size_t chunk_bytes = (staging_cap / sizeof(Scalar)) * sizeof(Scalar);
+        const std::size_t chunk_bytes = (staging_cap / sizeof(ElemType)) * sizeof(ElemType);
         std::size_t src_offset = 0;
 
         while (src_offset < total_bytes)
         {
             const std::size_t this_chunk = std::min(chunk_bytes, total_bytes - src_offset);
-            const std::size_t this_elems = this_chunk / sizeof(Scalar);
-            const std::size_t dst_elem_offset = src_offset / sizeof(Scalar);
+            const std::size_t this_elems = this_chunk / sizeof(ElemType);
+            const std::size_t dst_elem_offset = src_offset / sizeof(ElemType);
 
             // 1. 获取 staging region
             auto ri = staging_ring_->acquire();
@@ -1360,9 +1521,12 @@ public:
             r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
             if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
 
-            // 3. 提交并等待
+            // 3. 提交并等待（+ 跨 submit 数据依赖：等 in-flight region
+            //    信号量，源 buffer 可能刚由在飞上传的 copy 写入）
             auto fence = staging_ring_->fence(ri);
             vkResetFences(device_.device(), 1, &fence);
+
+            const auto sw = collect_staging_waits();
 
             {
                 std::lock_guard lock(queue_mutex_);
@@ -1370,6 +1534,12 @@ public:
                 submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
                 submit_info.commandBufferCount = 1;
                 submit_info.pCommandBuffers = &cmd;
+                if (sw.any())
+                {
+                    submit_info.waitSemaphoreCount =
+                        static_cast<uint32_t>(sw.sems.size());
+                    submit_info.pWaitSemaphores = sw.sems.data();
+                }
 
                 r = detail::vk_check(
                     vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
@@ -1385,7 +1555,7 @@ public:
             // 4. 从 staging 下载当前块到 CPU
             r = staging_ring_->download(
                 ri,
-                std::span<Scalar>(cpu_data.data() + dst_elem_offset, this_elems),
+                std::span<ElemType>(cpu_data.data() + dst_elem_offset, this_elems),
                 0);
             if (!r) { vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd); return r; }
 
@@ -1576,6 +1746,139 @@ public:
     }
 
     // ══════════════════════════════════════════════════════════════════
+    // RLA 扫描原语（手写原语，形状契约见 compute_engine.hpp 扫描级原语注释）
+    // 1 workgroup/头：dispatch (1, B*H, 1)；标量块在头块内逐行重复存放
+    // ══════════════════════════════════════════════════════════════════
+
+    // ── 前缀扫描 + matvec 读出：输出 (rows*5, seq) ─────────────────────
+    [[nodiscard]] Result<GpuTensor> scan_prefix_outer_gpu(
+        const GpuTensor& K, const GpuTensor& V, const GpuTensor& P, const GpuTensor& R,
+        const GpuTensor& A0, const GpuTensor& B0, bool has_state,
+        uint32_t dk, uint32_t heads, bool causal,
+        const GpuTensor& boundary, bool has_bnd)
+    {
+        if (!initialized_)
+            return std::unexpected(Error{"GPU backend not initialized"});
+        if (!has_scan_prefix_outer_pipeline())
+            return std::unexpected(Error{"scan_prefix_outer_gpu: pipeline not available"});
+        if (dk == 0u || heads == 0u)
+            return std::unexpected(Error{"scan_prefix_outer_gpu: dk/heads must be > 0"});
+        if (dk > 64u)
+            return std::unexpected(Error{"scan_prefix_outer_gpu: d_k > 64 not supported"});
+        const auto rows = static_cast<uint32_t>(K.rows());
+        if (rows % (dk * heads) != 0)
+            return std::unexpected(Error{"scan_prefix_outer_gpu: rows not divisible by H*dk"});
+        if (V.rows() != rows || V.cols() != K.cols() ||
+            P.rows() != rows || P.cols() != K.cols() ||
+            R.rows() != rows || R.cols() != K.cols())
+            return std::unexpected(Error{"scan_prefix_outer_gpu: K/V/P/R shape mismatch"});
+        if (has_state && (A0.rows() != heads * dk || A0.cols() != dk ||
+                          B0.rows() != heads * dk || B0.cols() != dk))
+            return std::unexpected(Error{"scan_prefix_outer_gpu: A0/B0 must be (H*dk, dk)"});
+        const auto seq = static_cast<uint32_t>(K.cols());
+        if (has_bnd)
+        {
+            if (boundary.rows() != 1 || boundary.cols() != (rows / (dk * heads)) * seq)
+                return std::unexpected(Error{"scan_prefix_outer_gpu: boundary must be (1, B*seq)"});
+        }
+        const auto BH = rows / dk;
+        auto C_res = GpuTensor::create_empty(static_cast<std::size_t>(rows) * 5, seq, *this);
+        if (!C_res)
+            return std::unexpected(C_res.error());
+        GpuTensor C = std::move(*C_res);
+        struct PushPrefix { uint32_t dk, heads, seq, causal, has_state, has_bnd, rows; };
+        PushPrefix push{dk, heads, seq, causal ? 1u : 0u, has_state ? 1u : 0u,
+                        has_bnd ? 1u : 0u, rows};
+        std::vector<std::uint8_t> pc(sizeof(push));
+        std::memcpy(pc.data(), &push, sizeof(push));
+        std::vector<GpuTensor> inputs{K, V, P, R, A0, B0, boundary};
+        auto r = dispatch_compute(scan_prefix_outer_pipeline_, inputs, C, pc, 1u, BH, 1u);
+        if (!r)
+            return std::unexpected(r.error());
+        return C;
+    }
+
+    // ── 后缀扫描 + matvec 读出：输出 (rows*3, seq) ─────────────────────
+    [[nodiscard]] Result<GpuTensor> scan_suffix_outer_gpu(
+        const GpuTensor& D, const GpuTensor& X, const GpuTensor& Y,
+        uint32_t dk, uint32_t heads, bool causal,
+        const GpuTensor& boundary, bool has_bnd)
+    {
+        if (!initialized_)
+            return std::unexpected(Error{"GPU backend not initialized"});
+        if (!has_scan_suffix_outer_pipeline())
+            return std::unexpected(Error{"scan_suffix_outer_gpu: pipeline not available"});
+        if (dk == 0u || heads == 0u)
+            return std::unexpected(Error{"scan_suffix_outer_gpu: dk/heads must be > 0"});
+        if (dk > 64u)
+            return std::unexpected(Error{"scan_suffix_outer_gpu: d_k > 64 not supported"});
+        const auto rows = static_cast<uint32_t>(X.rows());
+        if (rows % (dk * heads) != 0)
+            return std::unexpected(Error{"scan_suffix_outer_gpu: X rows not divisible by H*dk"});
+        if (D.rows() != rows * dk || D.cols() != X.cols() ||
+            Y.rows() != rows || Y.cols() != X.cols())
+            return std::unexpected(Error{"scan_suffix_outer_gpu: D/X/Y shape mismatch"});
+        const auto seq = static_cast<uint32_t>(X.cols());
+        if (has_bnd)
+        {
+            if (boundary.rows() != 1 || boundary.cols() != (rows / (dk * heads)) * seq)
+                return std::unexpected(Error{"scan_suffix_outer_gpu: boundary must be (1, B*seq)"});
+        }
+        const auto BH = rows / dk;
+        auto C_res = GpuTensor::create_empty(static_cast<std::size_t>(rows) * 3, seq, *this);
+        if (!C_res)
+            return std::unexpected(C_res.error());
+        GpuTensor C = std::move(*C_res);
+        struct PushSuffix { uint32_t dk, heads, seq, causal, has_bnd, rows; };
+        PushSuffix push{dk, heads, seq, causal ? 1u : 0u, has_bnd ? 1u : 0u, rows};
+        std::vector<std::uint8_t> pc(sizeof(push));
+        std::memcpy(pc.data(), &push, sizeof(push));
+        std::vector<GpuTensor> inputs{D, X, Y, boundary};
+        auto r = dispatch_compute(scan_suffix_outer_pipeline_, inputs, C, pc, 1u, BH, 1u);
+        if (!r)
+            return std::unexpected(r.error());
+        return C;
+    }
+
+    // ── 逐列外积：输出 (rows*dk, seq) ──────────────────────────────────
+    [[nodiscard]] Result<GpuTensor> outer_col_gpu(
+        const GpuTensor& P, const GpuTensor& R, const GpuTensor& S,
+        uint32_t dk, bool has_scale)
+    {
+        if (!initialized_)
+            return std::unexpected(Error{"GPU backend not initialized"});
+        if (!has_outer_col_pipeline())
+            return std::unexpected(Error{"outer_col_gpu: pipeline not available"});
+        if (dk == 0u)
+            return std::unexpected(Error{"outer_col_gpu: dk must be > 0"});
+        if (dk > 64u)
+            return std::unexpected(Error{"outer_col_gpu: d_k > 64 not supported"});
+        const auto rows = static_cast<uint32_t>(P.rows());
+        if (rows % dk != 0)
+            return std::unexpected(Error{"outer_col_gpu: rows not divisible by dk"});
+        if (R.rows() != rows || R.cols() != P.cols())
+            return std::unexpected(Error{"outer_col_gpu: P/R shape mismatch"});
+        if (has_scale && (S.rows() != rows || S.cols() != P.cols()))
+            return std::unexpected(Error{"outer_col_gpu: S must be (B*H*dk, seq)"});
+        const auto seq = static_cast<uint32_t>(P.cols());
+        auto C_res = GpuTensor::create_empty(static_cast<std::size_t>(rows) * dk, seq, *this);
+        if (!C_res)
+            return std::unexpected(C_res.error());
+        GpuTensor C = std::move(*C_res);
+        struct PushOuter { uint32_t dk, seq, rows, has_scale; };
+        PushOuter push{dk, seq, rows, has_scale ? 1u : 0u};
+        std::vector<std::uint8_t> pc(sizeof(push));
+        std::memcpy(pc.data(), &push, sizeof(push));
+        std::vector<GpuTensor> inputs{P, R, S};
+        const auto total = static_cast<uint32_t>(rows) * dk * seq;
+        auto r = dispatch_compute(outer_col_pipeline_, inputs, C, pc,
+            (total + 255u) / 256u, 1u, 1u);
+        if (!r)
+            return std::unexpected(r.error());
+        return C;
+    }
+
+    // ══════════════════════════════════════════════════════════════════
     // 纯 GPU 原语方法（纯 GPU 架构核心）
     //
     // 所有方法遵循同一模式：
@@ -1600,8 +1903,43 @@ public:
             vkAllocateDescriptorSets(device_.device(), &desc_alloc, &desc_set),
             __FILE__, __LINE__);
         if (!r) return std::unexpected(r.error());
-        if (batch_mode_) batch_desc_sets_.push_back(desc_set);
+        // batch 模式：描述符集被当前帧的已录制命令引用，归属该帧，
+        // 帧的 fence 信号后（reap_frame）才释放
+        if (batch_mode_) frames_[batch_frame_].desc_sets.push_back(desc_set);
         return desc_set;
+    }
+
+    // ── 辅助：跨 submit 数据依赖（P0-1 修复核心）────────────────────────
+    // 背景：单队列 FIFO 只是执行顺序保证。实测本驱动（NVIDIA V100 +
+    // Windows）下，消费方 submit（download/matmul/batch 帧）紧跟上传
+    // submit（<~2ms）时，消费方 GPU 操作会读到上传写入的旧值（零）；
+    // host 侧 sleep ≥5ms 或 fence 等待可规避——即隐式跨 submit 数据依赖
+    // 不可靠，必须用队列级信号量（spec 标准跨 submit 排序原语）显式建立：
+    //   上传 submit:  pSignalSemaphores = {region 信号量}
+    //   消费 submit:  pWaitSemaphores   = {所有 in-flight region 信号量}
+    // 用 core VkSubmitInfo（Vulkan 1.0 语义，最可移植）：无 stage 字段，
+    // wait 侧等价于"全部 stage 等待"（信号量 signaled 后消费命令的任何
+    // stage 均可开始）——正是所需的全序依赖。host 永不阻塞（P0-1 流水线
+    // 收益保留），GPU 在队列内等待数据就绪。
+    // 保守等待全部 in-flight region（最多 2 个）：消费方读到的 buffer 必然
+    // 由某个在飞上传写入，等待只推迟 GPU 启动到数据就绪，无正确性损失。
+    struct StagingWait
+    {
+        std::vector<VkSemaphore> sems;
+        [[nodiscard]] bool any() const noexcept { return !sems.empty(); }
+    };
+    [[nodiscard]] StagingWait collect_staging_waits() const
+    {
+        StagingWait w;
+        if (!staging_ring_)
+            return w;
+        for (std::size_t i = 0; i < staging_ring_->num_regions(); ++i)
+        {
+            if (!staging_ring_->in_flight(i))
+                continue;
+            w.sems.push_back(staging_ring_->semaphore(i));
+        }
+        return w;
     }
 
     // ── 辅助：获取 command buffer（batch 或独立）──────────────────────
@@ -1609,7 +1947,10 @@ public:
     [[nodiscard]] Result<std::pair<VkCommandBuffer, bool>> acquire_cmd()
     {
         if (batch_mode_)
+        {
+            batch_has_ops_ = true;  // P0-1：当前帧已含 op（空帧不提交）
             return std::make_pair(batch_cmd_, false);
+        }
 
         VkCommandBufferAllocateInfo cmd_alloc{};
         cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -1664,12 +2005,22 @@ public:
             return std::unexpected(r.error());
         }
 
+        // 跨 submit 数据依赖：输入 buffer 可能刚由在飞上传的 copy 写入
+        // （from_matrix 非阻塞提交后本原语立即执行）——等 in-flight region
+        // 信号量。host 不阻塞；GPU 在队列内等数据就绪。
+        const auto sw = collect_staging_waits();
+
         {
             std::lock_guard lock(queue_mutex_);
             VkSubmitInfo submit_info{};
             submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             submit_info.commandBufferCount = 1;
             submit_info.pCommandBuffers = &cmd;
+            if (sw.any())
+            {
+                submit_info.waitSemaphoreCount = static_cast<uint32_t>(sw.sems.size());
+                submit_info.pWaitSemaphores = sw.sems.data();
+            }
             r = detail::vk_check(
                 vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
                 __FILE__, __LINE__);
@@ -2339,9 +2690,10 @@ public:
     }
 
     // ══════════════════════════════════════════════════════════════════
-    // fill_zero_gpu — 清零 GPU buffer（使用 vkCmdFillBuffer）
+    // fill_zero_gpu — 清零 GPU buffer（使用 vkCmdFillBuffer，字节级操作，§6.3）
     // ══════════════════════════════════════════════════════════════════
-    [[nodiscard]] Result<void> fill_zero_gpu(GpuTensor& tensor)
+    template <Precision P>
+    [[nodiscard]] Result<void> fill_zero_gpu(GpuTensorT<P>& tensor)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
@@ -2430,19 +2782,20 @@ public:
     // ══════════════════════════════════════════════════════════════════
     // clone_gpu — GPU 内深拷贝（分配新 buffer + copy，无 PCIe 传输）
     // ══════════════════════════════════════════════════════════════════
-    [[nodiscard]] Result<GpuTensor> clone_gpu(const GpuTensor& src)
+    template <Precision P>
+    [[nodiscard]] Result<GpuTensorT<P>> clone_gpu(const GpuTensorT<P>& src)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
 
         // 1. 分配同形状的新 buffer
-        auto dst_res = GpuTensor::create_empty(src.rows(), src.cols(), *this);
+        auto dst_res = GpuTensorT<P>::create_empty(src.rows(), src.cols(), *this);
         if (!dst_res) return std::unexpected(dst_res.error());
-        GpuTensor dst = std::move(*dst_res);
+        GpuTensorT<P> dst = std::move(*dst_res);
 
         // 2. GPU 内拷贝
         const VkDeviceSize size = static_cast<VkDeviceSize>(
-            src.rows() * src.cols() * sizeof(float));
+            src.rows() * src.cols() * sizeof(elem<P>));
         auto r = copy_buffer_gpu(src.buffer().impl(), dst.buffer().impl(), size);
         if (!r) return std::unexpected(r.error());
 
@@ -2451,10 +2804,11 @@ public:
 
     // ══════════════════════════════════════════════════════════════════
     // slice_rows_gpu — 行切片（GPU 内拷贝连续行区间，无 PCIe 传输）
-    // 返回 (count, cols) 的新 GpuTensor，内容为 src 行 [start_row, start_row + count)
+    // 返回 (count, cols) 的新 GpuTensorT<P>，内容为 src 行 [start_row, start_row + count)
     // ══════════════════════════════════════════════════════════════════
-    [[nodiscard]] Result<GpuTensor> slice_rows_gpu(
-        const GpuTensor& src, std::size_t start_row, std::size_t count)
+    template <Precision P>
+    [[nodiscard]] Result<GpuTensorT<P>> slice_rows_gpu(
+        const GpuTensorT<P>& src, std::size_t start_row, std::size_t count)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
@@ -2464,15 +2818,16 @@ public:
             return std::unexpected(Error{"slice_rows_gpu: range out of bounds"});
 
         // 分配目标 buffer
-        auto dst_res = GpuTensor::create_empty(count, cols, *this);
+        auto dst_res = GpuTensorT<P>::create_empty(count, cols, *this);
         if (!dst_res) return std::unexpected(dst_res.error());
-        GpuTensor dst = std::move(*dst_res);
+        GpuTensorT<P> dst = std::move(*dst_res);
 
         // 行区间在行主序下连续：[start_row * cols, (start_row + count) * cols)
+        const std::size_t elem_size = sizeof(elem<P>);
         const VkDeviceSize src_offset = static_cast<VkDeviceSize>(
-            start_row * cols * sizeof(float));
+            start_row * cols * elem_size);
         const VkDeviceSize size = static_cast<VkDeviceSize>(
-            count * cols * sizeof(float));
+            count * cols * elem_size);
 
         auto cmd_r = acquire_cmd();
         if (!cmd_r) return std::unexpected(cmd_r.error());
@@ -2509,8 +2864,9 @@ public:
     // 真·就地修改（vkCmdCopyBuffer with dstOffset）。
     // 注意：dst 必须以 TRANSFER_DST_BIT 创建（create_empty 已包含）。
     // ══════════════════════════════════════════════════════════════════
+    template <Precision P>
     [[nodiscard]] Result<void> insert_rows_gpu(
-        GpuTensor& dst, std::size_t dst_start_row, const GpuTensor& src)
+        GpuTensorT<P>& dst, std::size_t dst_start_row, const GpuTensorT<P>& src)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
@@ -2521,10 +2877,11 @@ public:
         if (dst_start_row + src.rows() > dst.rows())
             return std::unexpected(Error{"insert_rows_gpu: range out of bounds"});
 
+        const std::size_t elem_size = sizeof(elem<P>);
         const VkDeviceSize dst_offset = static_cast<VkDeviceSize>(
-            dst_start_row * cols * sizeof(float));
+            dst_start_row * cols * elem_size);
         const VkDeviceSize size = static_cast<VkDeviceSize>(
-            src.rows() * cols * sizeof(float));
+            src.rows() * cols * elem_size);
 
         auto cmd_r = acquire_cmd();
         if (!cmd_r) return std::unexpected(cmd_r.error());
@@ -2564,15 +2921,15 @@ public:
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
 
-        // 1. 创建临时 GPU buffers
+        // 1. 创建临时 GPU buffers（byte count = 元素数 × sizeof(float)，§6.3）
         auto a_buf = GpuBuffer::create_device_local(
-            device_.device(), *memory_pool_, M * K,
+            device_.device(), *memory_pool_, M * K * sizeof(float),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         if (!a_buf)
             return std::unexpected(a_buf.error());
 
         auto b_buf = GpuBuffer::create_device_local(
-            device_.device(), *memory_pool_, K * N,
+            device_.device(), *memory_pool_, K * N * sizeof(float),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         if (!b_buf)
             return std::unexpected(b_buf.error());
@@ -2891,22 +3248,26 @@ GpuBuffer::~GpuBuffer()
         return;
 
     auto& backend = GpuBackend::instance();
-    if (backend.is_initialized() && backend.in_batch())
+    if (backend.is_initialized() && backend.needs_deferred_destroy())
     {
-        // batch 模式：延迟 vkDestroyBuffer（Vulkan 规范要求 buffer 在引用
-        // 它的命令提交完成前不能被销毁）。
-        // D1 修复：内存归还也一并延迟到 buffer 销毁之后（见
-        // flush_pending_destroys）。若此处立即 pool_->free()，新 buffer
-        // 可能分配到本 buffer 尚未销毁的同一区间 → 两个存活 buffer 内存
-        // 重叠，违反 Vulkan 规范。数据竞争方面本就安全（同一 command
-        // buffer 内命令按录制顺序执行），但规范合规要求 buffer 对象本身
-        // 不得重叠。
+        // 延迟 vkDestroyBuffer（Vulkan 规范要求 buffer 在引用它的命令
+        // 提交完成前不能被销毁）。两种延迟场景（needs_deferred_destroy）：
+        //   1. batch 录制中：本 buffer 被当前帧已录制的命令引用
+        //   2. 非 batch 但最近提交的帧仍在飞行：本 buffer 可能被该帧命令
+        //      引用（fence 信号即可证明安全）
+        // 延迟销毁打上帧标签，该帧完成（环槽复用 / drain / 非阻塞 reap）
+        // 时立即销毁 + 归还内存——锁窗从"整个 batch"缩短到"所属帧"
+        // （P0-1）。
+        // D1 修复：内存归还也一并延迟到 buffer 销毁之后。若此处立即
+        // pool_->free()，新 buffer 可能分配到本 buffer 尚未销毁的同一区间
+        // → 两个存活 buffer 内存重叠，违反 Vulkan 规范。
         // GpuBuffer 只经 MemoryPool 创建（create_device_local /
         // create_host_visible），pool_ 恒有效；alloc_ 无效时 free 为 no-op。
         backend.defer_buffer_destroy(device_, buffer_, alloc_, pool_);
     }
     else
     {
+        // 无在飞帧引用：立即销毁 + 归还内存
         vkDestroyBuffer(device_, buffer_, nullptr);
         if (pool_ && alloc_.valid())
             pool_->free(alloc_);
@@ -2920,4 +3281,3 @@ GpuBuffer::~GpuBuffer()
 } // namespace nn
 
 #endif // NN_HAS_VULKAN
-#endif // NN_COMPUTE_VK_BACKEND_HPP

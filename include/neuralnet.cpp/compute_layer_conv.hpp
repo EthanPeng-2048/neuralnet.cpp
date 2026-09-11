@@ -1,5 +1,4 @@
-#ifndef NN_COMPUTE_LAYER_CONV_HPP
-#define NN_COMPUTE_LAYER_CONV_HPP
+#pragma once
 
 #include <algorithm>
 #include <cmath>
@@ -10,6 +9,7 @@
 #include <random>
 #include <vector>
 
+#include "compute_layer_base.hpp"
 #include "compute_engine.hpp"
 #include "compute_tensor.hpp"
 #include "model_spec.hpp"
@@ -413,4 +413,3 @@ public:
 // ══════════════════════════════════════════════════════════════════════════
 } // namespace nn
 
-#endif // NN_COMPUTE_LAYER_CONV_HPP

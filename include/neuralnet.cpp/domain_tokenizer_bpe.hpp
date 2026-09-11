@@ -1,5 +1,4 @@
-#ifndef NN_DOMAIN_TOKENIZER_BPE_HPP
-#define NN_DOMAIN_TOKENIZER_BPE_HPP
+#pragma once
 
 #include <algorithm>
 #include <atomic>
@@ -460,4 +459,3 @@ private:
 
 } // namespace nn
 
-#endif // NN_DOMAIN_TOKENIZER_BPE_HPP

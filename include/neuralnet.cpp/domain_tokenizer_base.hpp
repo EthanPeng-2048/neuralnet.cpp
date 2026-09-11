@@ -1,5 +1,4 @@
-#ifndef NN_DOMAIN_TOKENIZER_BASE_HPP
-#define NN_DOMAIN_TOKENIZER_BASE_HPP
+#pragma once
 
 #include <algorithm>
 #include <atomic>
@@ -721,4 +720,3 @@ protected:
 };
 } // namespace nn
 
-#endif // NN_DOMAIN_TOKENIZER_BASE_HPP

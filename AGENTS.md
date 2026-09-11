@@ -120,6 +120,7 @@ Matrix → engine.from_matrix → Tensor[GPU] → forward/loss/optimizer 全程�
 | 广播级 | `broadcast_row/col_inplace` |
 | 逐元素 | `elementwise_unary/binary/binary_scalar` |
 | 数据操作 | `slice_rows/insert_rows/gather_rows/scatter_add_rows/rearrange_3d/clone` |
+| 扫描级 | `scan_prefix_outer/scan_suffix_outer/outer_col`（RLA/RAPT，dk≤64，见 docs/15 §7） |
 | 批控制 | `begin_batch/end_batch`（CPU no-op，GPU 录 command buffer） |
 
 ### 4.4 理解优先级（建议学习顺序）
@@ -231,6 +232,9 @@ optimizer.step();
 | `18-understanding-checklist.md` | **理解检查清单：评估理解程度、识别盲区、制定学习计划** |
 | `19-compute-engine-development.md` | **计算引擎开发指南：接口详解、实现模式、添加新原语** |
 | `20-compute-engine-usage.md` | **计算引擎使用指南：张量操作、矩阵运算、表达式融合** |
+| `21-code-review-2026-09-04.md` | **全库 C++ 代码审查报告（2026-09-04，102 文件，P0×0 / P1×48 / P2×92 / P3×95；CpuEmitter 隐性缺陷相关项是多精度 Phase 2 前置条件，见 23）** |
+| `22-rla2.md` | **RLA-2：极简硬截断线性注意力（修正版）：Sum 归一化 / 无衰减 / RMSNorm，O(Ld²) 训练 + O(d²) 推理** |
+| `23-mixed-precision.md` | **多精度计算（f16/混合精度）设计：Precision 类型系统、类型化存储、硬件/兼容路径分派、显式精度推导（无隐式状态）、PrecisionProfile（param/compute/stable/optimizer）、Phase 1/2 分期与验收（docs/13 P4-03）** |
 | `flash_attn_analysis.md` | 两趟式注意力等价 FlashAttention 的融合算子的分析报告 |
 | `DEVELOPMENT_STANDARDS.md` | C++ 编码规范全文 |
 

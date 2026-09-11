@@ -1,5 +1,4 @@
-#ifndef NN_COMPUTE_VK_DEVICE_HPP
-#define NN_COMPUTE_VK_DEVICE_HPP
+#pragma once
 
 // ── compute_vk_device.hpp — Vulkan 设备与 Pipeline 辅助（RAII） ─────────
 //
@@ -407,4 +406,3 @@ public:
 };
 } // namespace nn
 
-#endif // NN_COMPUTE_VK_DEVICE_HPP

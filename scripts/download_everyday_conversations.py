@@ -9,6 +9,10 @@
 转换格式（每行 = 一篇对话文档，使用新保留标记，与 tokenizer 词表一致）:
   <|system|>...</|end_of_system|><|user|>...</|end_of_user|><|assistant|>...</|end_of_assistant|>
 
+语言过滤: 仅保留主体为英文的对话（ASCII 字母占比 >= 60%，
+与 download_fineweb.py / download_openwebtext.py 同一兜底启发式），
+中文/日文/韩文/阿拉伯文/西里尔文等非英文对话直接跳过。
+
 输出:
   datasets/everyday_conversations_train_sft.txt
   datasets/everyday_conversations_test_sft.txt
@@ -26,6 +30,22 @@ from tqdm import tqdm   # 新增导入
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(SCRIPT_DIR, "datasets")
 _WS_RE = re.compile(r"\s+")
+_SFT_TAG_RE = re.compile(r"<\|[^|]*\|>")
+
+
+def is_english_text(text: str) -> bool:
+    """简单判断文本主体是否为英文（与 download_fineweb.py 同一兜底启发式）。
+
+    要求 ASCII 字母占比 >= 60%，可排除 CJK/阿拉伯/西里尔等非英文对话；
+    注意这是兜底而非严格检测器，法/德/西等拉丁字母语言无法区分。
+    """
+    if not text:
+        return False
+    letters = sum(1 for c in text if c.isalpha())
+    if letters == 0:
+        return False
+    ascii_letters = sum(1 for c in text if ("a" <= c.lower() <= "z"))
+    return ascii_letters / letters >= 0.6
 
 
 def render_content(content) -> str:
@@ -85,6 +105,7 @@ def main() -> int:
         out_path = os.path.join(args.output_dir, f"everyday_conversations_{split}_sft.txt")
         current_size = 0
         n = 0
+        skipped_lang = 0
 
         # 创建进度条
         # 如果设置了大小上限，则 total 为 max_bytes，显示百分比；否则不设 total，只显示计数和速度
@@ -101,6 +122,12 @@ def main() -> int:
             for row in ds[split]:
                 line = render_conversation(row.get("messages"))
                 if not line:
+                    continue
+
+                # 语言过滤：跳过非英文对话。先剔除 <|...|> 保留标记再检测，
+                # 否则标记自身的 ASCII 字母会让很短的非英文对话误判为英文
+                if not is_english_text(_SFT_TAG_RE.sub(" ", line)):
+                    skipped_lang += 1
                     continue
 
                 line_bytes = len((line + "\n").encode("utf-8"))
@@ -121,7 +148,8 @@ def main() -> int:
                 pbar.set_postfix(条数=n)
 
         pbar.close()
-        print(f"[+] {split}: 共写入 {n} 条对话，文件大小约 {current_size / (1024*1024):.2f} MB → {out_path}")
+        print(f"[+] {split}: 共写入 {n} 条对话（跳过非英文 {skipped_lang:,} 条），"
+              f"文件大小约 {current_size / (1024*1024):.2f} MB → {out_path}")
 
     return 0
 

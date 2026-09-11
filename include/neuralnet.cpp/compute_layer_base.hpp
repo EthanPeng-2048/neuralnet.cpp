@@ -1,5 +1,4 @@
-#ifndef NN_COMPUTE_LAYER_BASE_HPP
-#define NN_COMPUTE_LAYER_BASE_HPP
+#pragma once
 
 #include <algorithm>
 #include <cmath>
@@ -25,16 +24,20 @@ class Layer
 {
 protected:
     // 梯度检查点模式：为 true 时 forward 不保留逐层中间激活（供激活重计算）。
-    // 该模式由支持重计算的复合层（GPTBlock/TransformerEncoderLayer）在
-    // forward 中按 checkpoint 边界设置，子层（Linear/GeLU/Norm/Attention 等）
-    // 据此决定是否跳过缓存写入。
     bool checkpoint_mode_ = false;
+
+    // D7：精度配置（§9.2，Model 在 add/构造 Layer 时注入，每层一份）
+    // 默认全 F32 = 现状行为，零回归（G5）
+    PrecisionProfile p_;
 
 public:
     virtual ~Layer() = default;
 
+    // ── D7：精度配置注入（§9.2）─────────────────────────────────────────
+    void set_precision_profile(const PrecisionProfile& profile) { p_ = profile; }
+    [[nodiscard]] const PrecisionProfile& precision_profile() const noexcept { return p_; }
+
     // forward/backward 接收 ComputeEngine 引用，自动适配 CPU/GPU
-    // 只有一套实现，不再有 forward_gpu / backward_gpu
     [[nodiscard]] virtual Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) = 0;
 
@@ -125,4 +128,3 @@ public:
 
 } // namespace nn
 
-#endif // NN_COMPUTE_LAYER_BASE_HPP
