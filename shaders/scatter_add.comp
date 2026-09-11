@@ -1,0 +1,69 @@
+// ── scatter_add.comp ──────────────────────────────────────────────────────
+// 纯原语：按行索引原子累加梯度（scatter_add_rows）
+//
+// 语义：
+//   dst: (vocab, D)    — 读写，原地累加
+//   indices: (num,)    — 行索引（float 编码的整数）
+//   grad: (num, D)     — 待累加梯度
+//
+//   dst[indices[i]][d] += grad[i][d]
+//
+// 使用 CAS 循环实现 float atomicAdd，兼容所有 Vulkan 设备。
+// 越界索引被跳过（不修改 dst）。
+//
+// 绑定布局：
+//   binding 0: dst (readwrite, coherent — float 数据以 uint 存储用于原子操作)
+//   binding 1: indices (readonly)
+//   binding 2: grad (readonly)
+//
+// Push Constants（12 bytes）：
+//   uint vocab — dst 行数
+//   uint D     — 列宽
+//   uint num   — indices 元素个数
+// ─────────────────────────────────────────────────────────────────────────
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// dst 以 uint 声明，用于 atomicCompSwap 操作
+// float 数据位模式直接存储为 uint（IEEE 754 位兼容）
+layout(std430, binding = 0) coherent buffer BufDst     { uint  dst[];     };
+layout(std430, binding = 1) readonly buffer BufIndices  { float indices[]; };
+layout(std430, binding = 2) readonly buffer BufGrad     { float grad[];    };
+
+layout(push_constant) uniform PushConstants {
+    uint vocab;
+    uint D;
+    uint num;
+};
+
+// ── 基于 CAS 的 float atomicAdd ──────────────────────────────────────────
+// 兼容所有 Vulkan 1.0 设备，无需 VK_EXT_shader_atomic_float 扩展。
+void atomicAddFloat(uint idx, float val)
+{
+    uint old_v = dst[idx];
+    uint new_v;
+    while (true)
+    {
+        new_v = floatBitsToUint(uintBitsToFloat(old_v) + val);
+        uint prev = atomicCompSwap(dst[idx], old_v, new_v);
+        if (prev == old_v) break;
+        old_v = prev;
+    }
+}
+
+void main()
+{
+    const uint flat_idx = gl_GlobalInvocationID.x;
+    const uint total = num * D;
+    if (flat_idx >= total) return;
+
+    const uint i = flat_idx / D;  // 第 i 个索引
+    const uint d = flat_idx % D;  // 第 d 列
+
+    const uint row_idx = uint(indices[i]);
+    if (row_idx >= vocab) return;  // 越界跳过
+
+    atomicAddFloat(row_idx * D + d, grad[flat_idx]);
+}

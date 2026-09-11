@@ -1,0 +1,70 @@
+// ── broadcast.comp ─────────────────────────────────────────────────────────
+// 广播原语着色器（不含任何算法）
+//
+// 将一维向量广播到矩阵的每一行或每一列，执行逐元素二元运算。
+//
+// 模式：
+//   mode=0: row_broadcast — A[r][c] = op(A[r][c], vec[r])
+//           vec 形状 (rows, 1)，沿列方向广播
+//   mode=1: col_broadcast — A[r][c] = op(A[r][c], vec[c])
+//           vec 形状 (1, cols)，沿行方向广播
+//
+// 二元算子（op）：
+//   0=Add, 1=Sub, 2=Mul, 3=Div, 4=Max, 5=Min
+//
+// 绑定布局：
+//   binding 0: 输入 A (readonly, rows×cols)
+//   binding 1: 输入 vec (readonly, rows×1 或 1×cols)
+//   binding 2: 输出 OUT (writeonly, rows×cols)
+//
+// Push Constants：
+//   uint rows — 矩阵行数
+//   uint cols — 矩阵列数
+//   uint mode — 0=row_broadcast, 1=col_broadcast
+//   uint op   — 二元算子编号
+// ─────────────────────────────────────────────────────────────────────────
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer  BufA   { float buf_a[]; };
+layout(std430, binding = 1) readonly buffer  BufVec { float buf_vec[]; };
+layout(std430, binding = 2) writeonly buffer BufOut { float buf_out[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint cols;
+    uint mode;
+    uint op;
+};
+
+float apply_binary(uint op_id, float a, float b)
+{
+    if (op_id == 0u) return a + b;
+    if (op_id == 1u) return a - b;
+    if (op_id == 2u) return a * b;
+    if (op_id == 3u) return a / b;
+    if (op_id == 4u) return max(a, b);
+    if (op_id == 5u) return min(a, b);
+    return 0.0;
+}
+
+void main()
+{
+    const uint idx = gl_GlobalInvocationID.x;
+    const uint total = rows * cols;
+    if (idx >= total) return;
+
+    const uint r = idx / cols;
+    const uint c = idx % cols;
+
+    const float a = buf_a[idx];
+
+    // row_broadcast: vec 索引按行号 r
+    // col_broadcast: vec 索引按列号 c
+    const uint vec_idx = (mode == 0u) ? r : c;
+    const float v = buf_vec[vec_idx];
+
+    buf_out[idx] = apply_binary(op, a, v);
+}

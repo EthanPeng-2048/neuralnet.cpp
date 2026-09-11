@@ -1,0 +1,36 @@
+// ── transpose.comp ────────────────────────────────────────────────────────
+// 纯原语：矩阵转置 A (R, C) → OUT (C, R)
+//
+// out[c * R + r] = in[r * C + c]
+//
+// 绑定布局：
+//   binding 0: 输入 A (readonly, R×C)
+//   binding 1: 输出 OUT (writeonly, C×R)
+//
+// Push Constants（8 bytes）：
+//   uint rows — 输入行数 R
+//   uint cols — 输入列数 C
+// ─────────────────────────────────────────────────────────────────────────
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer  BufIn  { float in_data[];  };
+layout(std430, binding = 1) writeonly buffer BufOut { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint cols;
+};
+
+void main()
+{
+    const uint idx = gl_GlobalInvocationID.x;
+    const uint total = rows * cols;
+    if (idx >= total) return;
+
+    const uint r = idx / cols;
+    const uint c = idx % cols;
+    out_data[c * rows + r] = in_data[idx];
+}
