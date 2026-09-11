@@ -8,36 +8,50 @@
 neuralnet.cpp/
 ├── .gitignore
 ├── CMakeLists.txt
+├── ARCHITECTURE.md          ← 架构文档
+├── DEVELOPMENT_STANDARDS.md ← 开发规范
 ├── README.md
-├── csv_png.py
-├── extract_digits.py
-├── save_dataset.py
-├── build/
-│   ├── mnist_infer.exe
+├── gui.py                   ← 图形化操作界面 (Tkinter)
+├── csv_png.py               ← CSV 转 PNG 图像
+├── extract_digits.py        ← 从 MNIST CSV 提取单个数字
+├── save_dataset.py          ← 下载 MNIST 数据集
+├── build/                   ← CMake 构建输出
 │   ├── mnist_train.exe
-│   └── mnist_data/
-│       ├── test.csv
-│       └── train.csv
+│   └── mnist_infer.exe
 ├── include/
 │   └── neuralnet.cpp/
-│       ├── layer.hpp
-│       ├── loss.hpp
-│       ├── matrix.hpp
-│       └── optimizer.hpp
-└── src/
-    ├── infer.cpp
-    └── train.cpp
+│       ├── nn.hpp              ← 统一入口头文件
+│       ├── nn_config.hpp       ← SmartPolicy、BLOCK_SIZE 等配置
+│       ├── thread_pool.hpp     ← 全局线程池
+│       ├── matrix.hpp          ← Matrix 类（列主序）
+│       ├── layer.hpp           ← Layer 基类 + Linear/ReLU/GeLU/LayerNorm/PositionalEncoding
+│       ├── loss.hpp            ← Loss 基类 + MSELoss/CrossEntropyLoss
+│       ├── optimizer.hpp       ← SGD / SGD_w_Momentum / Adam
+│       ├── model.hpp           ← Model 容器（链式 add<>）
+│       ├── model_io.hpp        ← 二进制模型序列化
+│       └── mnist_common.hpp    ← MNIST 常量与 build_mnist_model()
+├── src/
+│   ├── train.cpp
+│   └── infer.cpp
+├── datasets/
+│   ├── mnist_data/          ← MNIST CSV 数据
+│   └── test/                ← 按数字分类的测试图片
+└── pretrained/
+    └── mnist_model.bin      ← 预训练模型
 ```
+
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/EthanPeng-2048/neuralnet.cpp)
 
 ## 依赖
 
 - **编译器**: LLVM Clang++ 22.1+（`C:/Program Files/LLVM/bin/clang++.exe`）
 - **C++ 标准**: C++26
 - **构建工具**: CMake 4.x Ninja
+- **GUI** (可选): Python 3.8+，tkinter（内置），Pillow（`pip install Pillow`）
 
 ## 构建与运行
 
-### build.cmake
+### 构建 C++ 项目
 
 ```powershell
 cmake -B build -G Ninja
@@ -54,30 +68,89 @@ python save_dataset.py
 ### 运行训练
 
 ```bash
-# 从头开始训练
+# 从头开始训练（默认: 10轮, 学习率0.001, 批大小64, Adam优化器）
 ./build/mnist_train
 
 # 从已有模型恢复训练
-./build/mnist_train --load mnist_model.bin
+./build/mnist_train --resume pretrained/mnist_model.bin
 
-# 指定保存路径
-./build/mnist_train --save my_model.bin
+# 自定义参数
+./build/mnist_train --epochs 20 --lr 0.001 --batch-size 32 --optimizer adam --save my_model.bin
+
+# 支持的优化器: sgd / sgd_w_momentum / adam
+./build/mnist_train --optimizer sgd_w_momentum
 ```
+
+### 🖥️ 图形化界面 (GUI)
+
+提供了一个基于 tkinter 的图形化界面，方便进行训练、推理和图片查看操作。
+
+```bash
+# 启动 GUI
+python gui.py
+```
+
+> **前提**: 需要先构建 C++ 项目（`cmake -B build -G Ninja`），GUI 会调用 build 目录下的可执行文件。
+
+#### GUI 功能一览
+
+| Tab | 功能 |
+|-----|------|
+| 🏋️ **训练** | 配置数据集路径、模型保存路径、轮数、学习率、批大小、优化器，支持恢复训练；实时显示训练日志 |
+| 🔍 **推理** | 选择模型文件和图片 CSV 文件/目录，显示预测结果置信度条形图和手写数字图片预览 |
+| 🖼️ **图片查看** | 浏览单张 CSV 图片或批量加载目录，支持前后翻页导航 |
 
 ## 网络结构
 
+默认 MNIST 架构（定义在 `mnist_common.hpp`）：
+
 ```
-输入 (784) → Linear(64) → ReLU → Linear(64) → ReLU → Linear(64) → ReLU → Linear(10)
+输入 (784)
+→ Linear(784 → 512) + LayerNorm + GeLU
+→ Linear(512 → 256) + LayerNorm + GeLU
+→ Linear(256 → 128) + LayerNorm + GeLU
+→ Linear(128 → 64)  + LayerNorm + GeLU
+→ Linear(64  → 10)
+→ CrossEntropy Loss (含 Softmax)
 ```
 
 ## 提供的组件
 
 | 组件 | 说明 |
 |------|------|
-| `nn::Matrix` | 列主序矩阵，支持并行加/减/乘/转置 |
-| `nn::Linear` | 全连接层（含 Xavier 初始化） |
+| `nn::Matrix` | 列主序矩阵，支持并行加/减/乘/转置、预分配缓冲区 |
+| `nn::Model` | 网络容器，支持链式 `add<LayerType>()` 构建 |
+| `nn::Linear` | 全连接层（含 Xavier 均匀初始化、融合 bias 计算） |
 | `nn::ReLU` | ReLU 激活函数 |
+| `nn::GeLU` | QuickGeLU 激活函数（`x · σ(1.702x)`） |
+| `nn::LayerNorm` | 层归一化（含可学习 γ/β 参数） |
+| `nn::PositionalEncoding` | 正弦/余弦位置编码（Transformer 用） |
 | `nn::MSELoss` | 均方误差损失 |
-| `CrossEntropyLoss` | 交叉熵损失（含数值稳定 Softmax，在 `train.cpp` 中定义） |
+| `nn::CrossEntropyLoss` | 交叉熵损失（含数值稳定 Softmax，`loss.hpp` 中定义） |
 | `nn::SGD` | 随机梯度下降优化器 |
-| `save_model` / `load_model` | 二进制模型序列化 |
+| `nn::SGD_w_Momentum` | 动量 SGD 优化器 |
+| `nn::Adam` | Adam 优化器（一阶/二阶矩估计） |
+| `nn::SmartPolicy` | 自适应并行策略：小矩阵串行，大矩阵线程池并行 |
+| `nn::ThreadPool` | 全局单例线程池（懒初始化） |
+| `nn::save_model` / `nn::load_model` | 二进制模型序列化 |
+
+## 📐 开发规范
+
+本项目遵循严格的 C++ 开发规范，详见 [DEVELOPMENT_STANDARDS.md](DEVELOPMENT_STANDARDS.md)。
+
+### 核心原则
+
+1. **零手动内存管理** - 完全消除显式指针操作和手动内存管理
+2. **模块化设计** - 清晰的职责分离，简洁的接口设计
+3. **高性能优先** - 预分配、缓存友好、并行化
+4. **紧跟最新标准** - 始终使用最新的 C++ 标准（当前：C++26）
+
+### 快速参考
+
+| 规范 | 要求 |
+|------|------|
+| 内存管理 | 禁止 `new`/`delete`，使用 `std::vector`、`std::unique_ptr`、`std::span` |
+| 接口设计 | 流式 API、两级访问（安全 + 快速） |
+| 性能优化 | 预分配缓冲区、缓存友好分块算法、智能并行化 |
+| C++ 标准 | C++26，积极使用 ranges、concepts、std::print 等新特性 |
+| 命名规范 | 类名 CamelCase，函数/变量 snake_case，私有成员尾部下划线 |
