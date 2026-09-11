@@ -1,10 +1,8 @@
-# 🔧 计算引擎开发指南
+# 计算引擎开发指南
 
-> 面向想要理解或修改计算引擎实现的开发者。
+> 面向想要理解或修改计算引擎实现的开发者。本文覆盖 ComputeEngine 接口全解、CPU / GPU 实现模式、以及添加新原语的完整方法。
 
----
-
-## 📋 目录
+## 目录
 
 1. [引擎架构概览](#引擎架构概览)
 2. [ComputeEngine 接口详解](#computeengine-接口详解)
@@ -17,7 +15,7 @@
 
 ---
 
-## 🏗️ 引擎架构概览
+## 引擎架构概览
 
 ### 设计原则
 
@@ -28,21 +26,21 @@ graph TB
         L2[Attention::forward]
         L3[ReLU::forward]
     end
-    
+
     subgraph "ComputeEngine 接口"
         E[ComputeEngine]
     end
-    
+
     subgraph "引擎实现"
         CPU[CpuEngine]
         GPU[GpuEngine]
     end
-    
+
     subgraph "底层硬件"
         C[CPU 矩阵运算]
         G[Vulkan GPU]
     end
-    
+
     L1 & L2 & L3 --> E
     E --> CPU & GPU
     CPU --> C
@@ -68,7 +66,7 @@ include/neuralnet.cpp/
 
 ---
 
-## 🔌 ComputeEngine 接口详解
+## ComputeEngine 接口详解
 
 ### 1. 设备查询
 
@@ -300,11 +298,11 @@ engine.end_batch();  // 提交并等待
 
 **形状约定**：batch-major `i = b*seq+t`；头 (b,h) 行块起点 `r0=(b*H+h)*d_k`；K/V/P/R（X/Y）`(B·H·d_k, seq)`、D `(B·H·d_k², seq)`、A0/B0 `(H·d_k, d_k)`；boundary `(1, B·seq)`（1=文档起点）；空参数用 (1,1) dummy + bool 标志（规避 0 字节 GPU buffer）；`d_k ≤ 64`（GPU MAX_DK）；标量块 s/r 头内逐行重复（实现写全部行，调用方读任一行）。
 
-**使用方**：`ReLULinearAttention`（RAPT 层）——shader 只含"带状态的顺序归约 + matvec 读出 / 外积"，算法（L2 分母 / ReLU 门控 / 梯度公式 / 文档重置）全部由 Layer 用原语组合表达（`docs/15-rapt-algorithm.md` §7）。
+**使用方**：`ReLULinearAttention`（RAPT 层）——shader 只含"带状态的顺序归约 + matvec 读出 / 外积"，算法（L2 分母 / ReLU 门控 / 梯度公式 / 文档重置）全部由 Layer 用原语组合表达（见 `../16-zipt-algorithm.md` 与 RLA 算法文档 §7）。
 
 ---
 
-## 🖥️ CPU 引擎实现
+## CPU 引擎实现
 
 ### 文件位置
 
@@ -316,19 +314,19 @@ engine.end_batch();  // 提交并等待
 class CpuEngine final : public ComputeEngine {
 public:
     // 1. 设备查询
-    [[nodiscard]] Device device() const noexcept override { 
-        return Device::CPU; 
+    [[nodiscard]] Device device() const noexcept override {
+        return Device::CPU;
     }
-    
+
     // 2. 批处理控制（no-op）
     [[nodiscard]] Result<void> begin_batch() override { return {}; }
     [[nodiscard]] Result<void> end_batch() override { return {}; }
-    
+
     // 3. 张量工厂
     [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols) override {
         return Tensor::cpu(rows, cols);
     }
-    
+
     // 4. 矩阵乘法（委托给 Matrix::multiply）
     [[nodiscard]] Result<Tensor> matmul(
         const Tensor& A, const Tensor& B,
@@ -390,7 +388,7 @@ public:
 
 ---
 
-## 🎮 GPU 引擎实现
+## GPU 引擎实现
 
 ### 文件位置
 
@@ -402,22 +400,22 @@ public:
 class GpuEngine final : public ComputeEngine {
 private:
     VkBackend backend_;  // Vulkan 后端
-    
+
 public:
     // 1. 设备查询
-    [[nodiscard]] Device device() const noexcept override { 
-        return Device::GPU; 
+    [[nodiscard]] Device device() const noexcept override {
+        return Device::GPU;
     }
-    
+
     // 2. 批处理控制（录制 command buffer）
     [[nodiscard]] Result<void> begin_batch() override {
         return backend_.begin_recording();
     }
-    
+
     [[nodiscard]] Result<void> end_batch() override {
         return backend_.end_recording_and_submit();
     }
-    
+
     // 3. 矩阵乘法（dispatch shader）
     [[nodiscard]] Result<Tensor> matmul(...) override {
         // 选择 matmul shader（naive/tiled/batched）
@@ -480,7 +478,7 @@ public:
 
 ---
 
-## ➕ 添加新原语
+## 添加新原语
 
 ### 步骤 1：在接口中声明
 
@@ -503,16 +501,16 @@ public:
         return std::unexpected(Error{"elementwise_abs_diff: tensors are not CPU"});
     if (A.rows() != B.rows() || A.cols() != B.cols())
         return std::unexpected(Error{"elementwise_abs_diff: shape mismatch"});
-    
+
     Matrix result(A.rows(), A.cols());
     auto a_span = A.cpu_matrix().span();
     auto b_span = B.cpu_matrix().span();
     auto r_span = result.span();
-    
+
     for (std::size_t i = 0; i < a_span.size(); ++i) {
         r_span[i] = std::abs(a_span[i] - b_span[i]);
     }
-    
+
     return Tensor::from_matrix(std::move(result));
 }
 ```
@@ -563,17 +561,17 @@ void main() {
 ```cpp
 TEST_CASE("elementwise_abs_diff") {
     CpuEngine engine;
-    
+
     Matrix a(2, 2);
     Matrix b(2, 2);
     // ... 初始化 ...
-    
+
     auto ta = engine.from_matrix(a);
     auto tb = engine.from_matrix(b);
-    
+
     auto result = engine.elementwise_abs_diff(*ta, *tb);
     REQUIRE(result);
-    
+
     auto r_matrix = engine.to_matrix(*result);
     // ... 验证结果 ...
 }
@@ -583,11 +581,11 @@ TEST_CASE("elementwise_abs_diff") {
 
 1. 更新 `compute_engine.hpp` 的注释
 2. 更新本文档的原语列表
-3. 更新 `docs/01-architecture.md` 的原语分类表
+3. 更新架构文档的原语分类表
 
 ---
 
-## ⚡ 性能优化考虑
+## 性能优化考虑
 
 ### 1. 内存分配
 
@@ -598,7 +596,7 @@ TEST_CASE("elementwise_abs_diff") {
 // 使用内存池
 class GpuEngine {
     MemoryPool pool_;  // 显存池
-    
+
     [[nodiscard]] Result<Tensor> create_tensor(std::size_t rows, std::size_t cols) {
         auto buffer = pool_.allocate(rows * cols * sizeof(Scalar));
         return Tensor::gpu(rows, cols, std::move(buffer));
@@ -631,7 +629,7 @@ auto result = dsl::compute(
 ```cpp
 // 使用行块并行
 if (total_work >= PARALLEL_THRESHOLD) {
-    nn::for_each(row_indices.begin(), row_indices.end(), 
+    nn::for_each(row_indices.begin(), row_indices.end(),
         [&](std::size_t i) {
             // 每行独立处理，无数据竞争
         });
@@ -654,7 +652,7 @@ for (std::size_t r = 0; r < rows; ++r) {
 
 ---
 
-## 🧪 测试策略
+## 测试策略
 
 ### 1. 单元测试
 
@@ -663,17 +661,17 @@ for (std::size_t r = 0; r < rows; ++r) {
 ```cpp
 TEST_CASE("matmul") {
     CpuEngine engine;
-    
+
     Matrix a(2, 3);
     Matrix b(3, 2);
     // ... 初始化 ...
-    
+
     auto ta = engine.from_matrix(a);
     auto tb = engine.from_matrix(b);
-    
+
     auto result = engine.matmul(*ta, *tb);
     REQUIRE(result);
-    
+
     auto r_matrix = engine.to_matrix(*result);
     // ... 验证结果 ...
 }
@@ -687,10 +685,10 @@ TEST_CASE("matmul") {
 TEST_CASE("linear_gradcheck") {
     CpuEngine engine;
     Linear layer(10, 5);
-    
+
     Matrix input(10, 1);
     // ... 初始化 ...
-    
+
     bool ok = gradcheck(engine, layer, input);
     REQUIRE(ok);
 }
@@ -710,11 +708,11 @@ TEST_CASE("linear_gradcheck") {
 ./build/gpu_test
 ```
 
-**注意**：无 Vulkan 时返回 77（跳过）
+**注意**：无 Vulkan 时返回 77（跳过）。
 
 ---
 
-## ❓ 常见问题
+## 常见问题
 
 ### Q1: 为什么使用 `Result<T>` 而不是异常？
 
@@ -747,20 +745,3 @@ TEST_CASE("linear_gradcheck") {
 ### Q5: 为什么 `begin_batch/end_batch` 在 CPU 上是 no-op？
 
 **A**: CPU 操作是同步的，立即执行。GPU 操作是异步的，需要录制 command buffer 后统一提交。
-
----
-
-## 📚 相关文档
-
-- **接口定义**：`include/neuralnet.cpp/compute_engine.hpp`
-- **CPU 实现**：`include/neuralnet.cpp/compute_cpu_engine.hpp`
-- **GPU 实现**：`include/neuralnet.cpp/compute_gpu_engine.hpp`
-- **Tensor 定义**：`include/neuralnet.cpp/compute_tensor.hpp`
-- **表达式 DSL**：`include/neuralnet.cpp/expr_dsl.hpp`
-- **性能优化**：`docs/02-performance.md`
-- **踩坑警示**：`docs/08-pitfalls-and-lessons.md`
-
----
-
-*最后更新：2026-08-31*
-*维护者：Ethan*

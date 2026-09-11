@@ -37,7 +37,7 @@ public:
     // 默认 64MB × 2 region（实际分配大小由 initialize() 动态计算，
     // 会根据 host-visible 显存大小自动扩容，此值仅作为下限参考）
     static constexpr std::size_t DEFAULT_REGION_SIZE = 64ull * 1024 * 1024; // 64MB
-    static constexpr std::size_t DEFAULT_NUM_REGIONS = 2;
+    static constexpr std::size_t DEFAULT_NUM_REGIONS = 4;  // 2→4：降低 acquire 阻塞概率
     // host-visible 显存预算占比的倒数（实际取 1/HOST_VISIBLE_FRACTION）
     static constexpr VkDeviceSize HOST_VISIBLE_FRACTION = 16;
     // 动态计算 staging 大小的下限，避免小显存机器分配过小

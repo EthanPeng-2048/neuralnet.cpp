@@ -1,10 +1,10 @@
-# 📐 C++ 开发规范
+# C++ 开发规范
 
-> 本文档定义了 neuralnet.cpp 项目的开发规范，旨在确保代码质量、可维护性和高性能。
+> 本文档定义 neuralnet.cpp 项目的开发规范，旨在确保代码质量、可维护性和高性能。
 
 ---
 
-## 📋 目录
+## 1. 目录
 
 1. [核心原则](#-核心原则)
 2. [内存管理规范](#-内存管理规范)
@@ -18,63 +18,68 @@
 
 ---
 
-## 🎯 核心原则
+## 2. 核心原则
 
-### 1. 零手动内存管理
+### 2.1 零手动内存管理
+
 **目标：** 完全消除显式指针操作和手动内存管理。
 
 ```cpp
-// ❌ 禁止
+// 禁止
 int* data = new int[100];
 delete[] data;
 
-// ✅ 推荐
+// 推荐
 std::vector<int> data(100);
 // 或
 std::array<int, 100> data;
 ```
 
-### 2. 简洁接口设计
+### 2.2 简洁接口设计
+
 **目标：** 面向开发者的接口尽可能简单、直观。
 
 ```cpp
-// ❌ 复杂接口
+// 复杂接口
 void train(Matrix& W, Matrix& b, const Matrix& X, double lr, int epochs, bool verbose, ...);
 
-// ✅ 简洁接口
+// 简洁接口
 model.train(dataset, config);
 ```
 
-### 3. 高性能优先
+### 2.3 高性能优先
+
 **目标：** 在保证可读性的前提下，追求极致性能。
 
-### 4. 紧跟最新标准
+### 2.4 紧跟最新标准
+
 **目标：** 始终使用最新的 C++ 标准（当前：C++26）。
 
-### 5. 模块隔离与最小化依赖
-**目标：** 每个模块只通过简洁的公有接口对外提供服务。修改某个模块的内部实现（如 Matrix 的存储格式、ThreadPool 的调度策略）不应引发其他模块的连锁修改。即**改一个模块只需改一个头文件**。
+### 2.5 模块隔离与最小化依赖
+
+**目标：** 每个模块只通过简洁的公有接口对外提供服务。修改某个模块的内部实现（如 Matrix 的存储格式、ThreadPool 的调度策略）不应引发其他模块的连锁修改。即 **改一个模块只需改一个头文件**。
 
 ```cpp
-// ❌ 违反隔离：上层模块直接穿透接口、访问底层数据结构
-// layer.hpp 中：
+// 违反隔离：上层模块直接穿透接口、访问底层数据结构
 auto m_span = matrix.span();            // 泄露了内部 std::span 视图
 matrix.data().begin();                  // 泄露了内部 std::vector&
 
-// ✅ 遵循隔离：上层模块只调用 Matrix 暴露的语义化操作
+// 遵循隔离：上层模块只调用 Matrix 暴露的语义化操作
 matrix.apply_relu();                    // Matrix 自己封装逐元素操作
 matrix.add_inplace(other);              // Matrix 自己封装算术操作
 // 并行策略由 Matrix 内部决定，上层不感知
 ```
 
-**核心规则：**
+核心规则：
 
 | 规则 | 说明 |
 |------|------|
-| **不穿透接口** | 上层模块不应直接访问下层模块的底层数据结构（如 `.data()`, `.span()`） |
+| **不穿透接口** | 上层模块不应直接访问下层模块的底层数据结构（如 `.data()`、`.span()`） |
 | **不假设实现** | 上层模块不应依赖下层模块的内部类型（如假定数据存储在 `std::vector` 中） |
 | **自包含修改** | 修改模块内部实现（如换存储格式、换并行策略），只需修改该模块的头文件 |
 
-### 6. 分层职责单一
+### 2.6 分层职责单一
+
 **目标：** 每一层只做自己该做的事，严禁职责越界。
 
 > **核心口号：每层只能负责每层的事，Matrix 不能写算法，Layer 不能写底层计算。**
@@ -91,13 +96,11 @@ matrix.add_inplace(other);              // Matrix 自己封装算术操作
 // ✅ Layer 可以：通过 Matrix::span() 取得 Span 后调用 compute::apply(span, expr) 表达逐元素算法
 
 // ── 正确示例：Layer 通过 AST 表达逐元素算法 ──
-// layer.hpp 中 ReLU::forward：
 Span x = result.span();
-compute::apply(x, max(x, Scalar{0}));   // ✅ 直接调用 AST 入口，底层自动并行
+compute::apply(x, max(x, Scalar{0}));   // 直接调用 AST 入口，底层自动并行
 
 // ── 正确示例：Layer 之间组合 ──
-// layer.hpp 中 MultiHeadAttention::forward：
-auto sm_res = softmax_.forward(attn_[h]);  // ✅ Layer 调用 Layer
+auto sm_res = softmax_.forward(attn_[h]);  // Layer 调用 Layer
 ```
 
 | 规则 | 说明 |
@@ -109,9 +112,9 @@ auto sm_res = softmax_.forward(attn_[h]);  // ✅ Layer 调用 Layer
 
 ---
 
-## 🧠 内存管理规范
+## 3. 内存管理规范
 
-### 1. 禁止使用的模式
+### 3.1 禁止使用的模式
 
 | 模式 | 说明 | 替代方案 |
 |------|------|----------|
@@ -122,21 +125,23 @@ auto sm_res = softmax_.forward(attn_[h]);  // ✅ Layer 调用 Layer
 | C 风格指针转换 | `(int*)ptr` | `static_cast`, `reinterpret_cast` |
 | 裸指针所有权 | `void process(int* data)` | `std::span<T>`, `std::vector<T>&` |
 
-### 2. 推荐使用的模式
+### 3.2 推荐使用的模式
 
-#### 2.1 值语义优先
+#### 3.2.1 值语义优先
+
 ```cpp
 // 使用值类型存储数据
 class Matrix {
-    std::vector<double> data_;  // ✅ 自动内存管理
+    std::vector<double> data_;  // 自动内存管理
     std::size_t rows_, cols_;
 };
 
 // 使用 std::array 处理固定大小
-std::array<double, 128> buffer;  // ✅ 栈上分配
+std::array<double, 128> buffer;  // 栈上分配
 ```
 
-#### 2.2 智能指针管理多态对象
+#### 3.2.2 智能指针管理多态对象
+
 ```cpp
 // 独占所有权
 std::unique_ptr<Layer> layer = std::make_unique<Linear>(784, 64);
@@ -148,18 +153,20 @@ std::shared_ptr<Resource> resource = std::make_shared<Resource>();
 [[nodiscard]] std::unique_ptr<Optimizer> create_optimizer(const Config& config);
 ```
 
-#### 2.3 使用 std::span 传递只读数据
+#### 3.2.3 使用 std::span 传递只读数据
+
 ```cpp
-// ✅ 推荐：使用 span 传递连续数据
+// 推荐：使用 span 传递连续数据
 void process(std::span<const double> data);
 
-// ❌ 避免：使用裸指针
+// 避免：使用裸指针
 void process(const double* data, std::size_t size);
 ```
 
-#### 2.4 使用 std::span 访问矩阵数据
+#### 3.2.4 使用 std::span 访问矩阵数据
+
 ```cpp
-// ✅ 推荐：使用 span() 访问矩阵数据（C++20 零开销抽象）
+// 推荐：使用 span() 访问矩阵数据（C++20 零开销抽象）
 auto data = matrix.span();          // std::span<double>
 auto cdata = const_matrix.span();   // std::span<const double>
 
@@ -168,13 +175,14 @@ auto func = [data](std::size_t i) noexcept {
     return data[i] * 2.0;
 };
 
-// ❌ 避免：使用已废弃的 data_ptr()
+// 避免：使用已废弃的 data_ptr()
 double* ptr = matrix.data_ptr();  // [[deprecated]]
 ```
 
-#### 2.5 预分配缓冲区模式
+#### 3.2.5 预分配缓冲区模式
+
 ```cpp
-// ✅ 推荐：预分配并在就地操作
+// 推荐：预分配并在就地操作
 void multiply_to(Matrix& result, const Matrix& other) const {
     // 直接写入预分配的缓冲区
     for (std::size_t i = 0; i < rows_; ++i) {
@@ -189,7 +197,7 @@ void multiply_to(Matrix& result, const Matrix& other) const {
 }
 ```
 
-### 3. 内存管理检查清单
+### 3.3 内存管理检查清单
 
 - [ ] 是否有裸指针用于所有权管理？
 - [ ] 是否有 `new` / `delete` 操作？
@@ -200,11 +208,11 @@ void multiply_to(Matrix& result, const Matrix& other) const {
 
 ---
 
-## 🔒 模块隔离规范
+## 4. 模块隔离规范
 
 > 本章节是「核心原则 5. 模块隔离与最小化依赖」的具体化规则，**必须严格遵守**。
 
-### 1. 模块架构
+### 4.1 模块架构
 
 ```mermaid
 graph TB
@@ -259,32 +267,32 @@ graph TB
 
 > 层级仅供参考，不强制限制调用方向。**唯一硬约束：Matrix 不得包含任何神经网络算法**（ReLU/GeLU/Softmax/LayerNorm/CrossEntropy/Adam/SGD 等必须放在 L2 计算层）。
 
-### 2. 禁止的反模式
+### 4.2 禁止的反模式
 
-#### 2.1 上层直接操作底层数据结构
+#### 4.2.1 上层直接操作底层数据结构
 
 ```cpp
-// ❌ 禁止：Optimizer 直接获取 Matrix 的底层 vector 并迭代
+// 禁止：Optimizer 直接获取 Matrix 的底层 vector 并迭代
 auto &p_vec = p.data();       // 泄露 std::vector<Scalar>&！
 auto &g_vec = g.data();
 SmartPolicy::for_each(zip_view.begin(), zip_view.end(), [...]);
 
-// ✅ 正确：通过 Matrix 语义化操作（apply / binary_apply_inplace）表达算法
+// 正确：通过 Matrix 语义化操作（apply / binary_apply_inplace）表达算法
 p.binary_apply_inplace(g,
     [lr](Scalar pv, Scalar gv) noexcept { return pv - lr * gv; });
 ```
 
-#### 2.2 Matrix 中写入神经网络算法
+#### 4.2.2 Matrix 中写入神经网络算法
 
 ```cpp
-// ❌ 禁止：Matrix 内部定义 ReLU/GeLU/Softmax 等算法
+// 禁止：Matrix 内部定义 ReLU/GeLU/Softmax 等算法
 class Matrix {
     void relu_inplace() { /* ... */ }              // 算法不应在 Matrix
     void adam_update(/*...*/) { /* ... */ }        // 算法不应在 Matrix
     static void softmax_rows(/*...*/) { /* ... */ } // 算法不应在 Matrix
 };
 
-// ✅ 正确：Matrix 只提供通用数学原语，算法在 Layer / Optimizer / Loss 中表达
+// 正确：Matrix 只提供通用数学原语，算法在 Layer / Optimizer / Loss 中表达
 // layer.hpp 中 ReLU::forward：
 Span x = result.span();
 compute::apply(x, max(x, Scalar{0}));
@@ -294,9 +302,9 @@ p.binary_apply_inplace(g,
     [lr](Scalar pv, Scalar gv) noexcept { return pv - lr * gv; });
 ```
 
-### 3. 推荐的接口设计
+### 4.3 推荐的接口设计
 
-#### 3.1 Matrix 暴露的通用数学原语
+#### 4.3.1 Matrix 暴露的通用数学原语
 
 ```cpp
 class Matrix {
@@ -322,10 +330,10 @@ public:
 };
 ```
 
-#### 3.2 Layer 通过 AST 表达逐元素算法
+#### 4.3.2 Layer 通过 AST 表达逐元素算法
 
 ```cpp
-// ✅ ReLU::forward 通过 AST 入口
+// ReLU::forward 通过 AST 入口
 Result<Matrix> ReLU::forward(const Matrix& input) override {
     input_cache_ = input;
     Matrix result = input;
@@ -335,17 +343,17 @@ Result<Matrix> ReLU::forward(const Matrix& input) override {
 }
 ```
 
-#### 3.3 Layer 之间可自由组合
+#### 4.3.3 Layer 之间可自由组合
 
 ```cpp
-// ✅ MultiHeadAttention 内部使用 Softmax Layer
+// MultiHeadAttention 内部使用 Softmax Layer
 class MultiHeadAttention : public Layer {
     Softmax softmax_;  // 组合其他 Layer
     // ...
     auto sm_res = softmax_.forward(attn_[h]);
 };
 
-// ✅ FeedForward 组合 Linear + GeLU
+// FeedForward 组合 Linear + GeLU
 class FeedForward : public Layer {
     Linear fc1_;
     Linear fc2_;
@@ -354,35 +362,35 @@ class FeedForward : public Layer {
 };
 ```
 
-#### 3.4 Optimizer 通过 Matrix 通用接口表达更新公式
+#### 4.3.4 Optimizer 通过 Matrix 通用接口表达更新公式
 
 ```cpp
-// ✅ Adam::step 通过 binary_apply_inplace 表达
+// Adam::step 通过 binary_apply_inplace 表达
 m.binary_apply_inplace(g,
     [beta1, one_minus_beta1](Scalar mv, Scalar gv) noexcept {
         return beta1 * mv + one_minus_beta1 * gv;
     });
 ```
 
-### 4. 模块化自检清单
+### 4.4 模块化自检清单
 
 修改以下模块时，受影响的文件应**不超过 2 个**：
 
 | 修改场景 | 预期只改 | 当前状态 |
 |----------|----------|----------|
-| Matrix 换存储格式（如 `vector` → 自定义 allocator） | `algebra_matrix.hpp` | ✅ 已满足（上层只通过 `span()` / 语义 API 访问） |
-| SmartPolicy 换并行策略（如线程池 → TBB） | `config.hpp` | ✅ 已满足（上层不直接调 SmartPolicy） |
-| Layer 新增一种激活函数 | `compute_layer.hpp` | ✅ 已满足 |
-| Optimizer 新增一种优化器 | `compute_optimizer.hpp` | ✅ 已满足 |
-| 新增一种模型架构 | 新增 `domain_xxx.hpp` (L4) | ✅ 已满足 |
-| 修改 GPT 超参数默认值 | `domain_gpt.hpp` | ✅ 已满足 |
-| 修改 MNIST 数据集路径 | `domain_mnist.hpp` | ✅ 已满足 |
+| Matrix 换存储格式（如 `vector` → 自定义 allocator） | `algebra_matrix.hpp` | 已满足（上层只通过 `span()` / 语义 API 访问） |
+| SmartPolicy 换并行策略（如线程池 → TBB） | `config.hpp` | 已满足（上层不直接调 SmartPolicy） |
+| Layer 新增一种激活函数 | `compute_layer.hpp` | 已满足 |
+| Optimizer 新增一种优化器 | `compute_optimizer.hpp` | 已满足 |
+| 新增一种模型架构 | 新增 `domain_xxx.hpp` (L4) | 已满足 |
+| 修改 GPT 超参数默认值 | `domain_gpt.hpp` | 已满足 |
+| 修改 MNIST 数据集路径 | `domain_mnist.hpp` | 已满足 |
 
 ---
 
-## 🏗️ 模块化设计规范
+## 5. 模块化设计规范
 
-### 1. 目录结构（扁平化）
+### 5.1 目录结构（扁平化）
 
 ```
 include/neuralnet.cpp/
@@ -419,40 +427,41 @@ include/neuralnet.cpp/
 └── nn.hpp                 # 统一入口头文件（聚合所有公共 API）
 ```
 
-> **扁平化设计**：所有头文件放在同一目录，使用前缀命名（`core_`, `algebra_`, `compute_`, `domain_`, `model_`）区分层级。
-> 避免子目录带来的包含路径复杂性，同时保持清晰的层级划分。
+> **扁平化设计**：所有头文件放在同一目录，使用前缀命名（`core_`, `algebra_`, `compute_`, `domain_`, `model_`）区分层级。避免子目录带来的包含路径复杂性，同时保持清晰的层级划分。
 
-### 2. 头文件设计原则
+### 5.2 头文件设计原则
 
-#### 2.1 单一职责
+#### 5.2.1 单一职责
+
 ```cpp
-// ✅ 每个头文件只负责一个功能模块
+// 每个头文件只负责一个功能模块
 // matrix.hpp - 矩阵运算
 // layer.hpp  - 层定义
 // loss.hpp   - 损失函数
-
-// ❌ 避免大而全的头文件
+// 避免大而全的头文件
 ```
 
-#### 2.2 最小化依赖
+#### 5.2.2 最小化依赖
+
 ```cpp
-// ✅ 只包含必要的头文件
+// 只包含必要的头文件
 #include <vector>
 #include <cstddef>
 #include <utility>
 
-// ❌ 避免包含不必要的头文件
+// 避免包含不必要的头文件
 #include <iostream>  // 除非需要 I/O
 #include <algorithm> // 除非需要算法
 ```
 
-#### 2.3 命名空间组织
+#### 5.2.3 命名空间组织
+
 ```cpp
 namespace nn {
     // 所有公共 API 都在 nn 命名空间中
     class Matrix { ... };
     class Model { ... };
-    
+
     // 内部实现使用嵌套命名空间
     namespace detail {
         class InternalHelper { ... };
@@ -460,11 +469,12 @@ namespace nn {
 }
 ```
 
-### 3. 接口设计模式
+### 5.3 接口设计模式
 
-#### 3.1 流式 API（Fluent API）
+#### 5.3.1 流式 API（Fluent API）
+
 ```cpp
-// ✅ 支持链式调用
+// 支持链式调用
 Model model;
 model.add<Linear>(784, 64)
     .add<ReLU>()
@@ -472,9 +482,10 @@ model.add<Linear>(784, 64)
     .add<CrossEntropyLoss>();
 ```
 
-#### 3.2 类型安全的工厂函数
+#### 5.3.2 类型安全的工厂函数
+
 ```cpp
-// ✅ 使用模板参数推导
+// 使用模板参数推导
 template <typename LayerType, typename... Args>
 Model& add(Args&&... args) {
     layers_.push_back(std::make_unique<LayerType>(std::forward<Args>(args)...));
@@ -482,26 +493,28 @@ Model& add(Args&&... args) {
 }
 ```
 
-#### 3.3 两级访问接口
+#### 5.3.3 两级访问接口
+
 ```cpp
-// ✅ 安全访问 + 快速访问
+// 安全访问 + 快速访问
 class Matrix {
     // 安全访问（带边界检查）
     [[nodiscard]] double at(std::size_t row, std::size_t col) const;
-    
+
     // 快速访问（热路径使用）
     [[nodiscard]] double at_unchecked(std::size_t row, std::size_t col) const noexcept;
 };
 ```
 
-#### 3.4 使用 std::reference_wrapper 避免拷贝
+#### 5.3.4 使用 std::reference_wrapper 避免拷贝
+
 ```cpp
-// ✅ 传递引用而非拷贝
-void update(std::vector<std::reference_wrapper<Matrix>> params, 
+// 传递引用而非拷贝
+void update(std::vector<std::reference_wrapper<Matrix>> params,
             std::vector<std::reference_wrapper<Matrix>> grads);
 ```
 
-### 4. 模块化检查清单
+### 5.4 模块化检查清单
 
 - [ ] 每个头文件是否只负责一个功能？
 - [ ] 是否最小化头文件依赖？
@@ -511,41 +524,35 @@ void update(std::vector<std::reference_wrapper<Matrix>> params,
 
 ---
 
-## ⚡ 高性能编程规范
+## 6. 高性能编程规范
 
-### 1. 编译期优化
+### 6.1 编译期优化
 
-#### 1.1 constexpr 函数
 ```cpp
-// ✅ 编译期计算
+// constexpr 函数（编译期计算）
 [[nodiscard]] constexpr std::size_t index(std::size_t row, std::size_t col) const noexcept {
     return row * cols_ + col;
 }
-```
 
-#### 1.2 编译期常量
-```cpp
-// ✅ 使用 constexpr 常量
+// 编译期常量
 constexpr std::size_t BLOCK_SIZE = 64;  // 缓存友好的块大小
 constexpr double EPSILON = 1e-12;
-```
 
-#### 1.3 static_assert 编译期检查
-```cpp
-// ✅ 编译期断言
-static_assert(BLOCK_SIZE * BLOCK_SIZE * sizeof(double) <= 32768, 
+// 编译期断言
+static_assert(BLOCK_SIZE * BLOCK_SIZE * sizeof(double) <= 32768,
               "Block size exceeds L1 cache size");
 ```
 
-### 2. 运行期优化
+### 6.2 运行期优化
 
-#### 2.1 预分配缓冲区
+#### 6.2.1 预分配缓冲区
+
 ```cpp
-// ✅ 预分配避免热路径中的内存分配
+// 预分配避免热路径中的内存分配
 class Linear : public Layer {
     Matrix product_buf_;    // 预分配的中间结果缓冲区
     Matrix grad_WT_buf_;    // 预分配的梯度缓冲区
-    
+
     void forward(const Matrix& input) override {
         // 使用预分配缓冲区，避免 new/delete
         multiply_to(product_buf_, weights_);
@@ -553,9 +560,10 @@ class Linear : public Layer {
 };
 ```
 
-#### 2.2 栈上小对象优化
+#### 6.2.2 栈上小对象优化
+
 ```cpp
-// ✅ 小对象使用 std::array（栈分配）
+// 小对象使用 std::array（栈分配）
 class CrossEntropyLoss : public Loss {
     [[nodiscard]] double compute(const Matrix& predicted, const Matrix& target) const override {
         if (num_classes <= 128) {
@@ -570,12 +578,13 @@ class CrossEntropyLoss : public Loss {
 };
 ```
 
-#### 2.3 缓存友好的算法
+#### 6.2.3 缓存友好的算法
+
 ```cpp
-// ✅ 分块算法提高缓存命中率
+// 分块算法提高缓存命中率
 void matrix_multiply(Matrix& result, const Matrix& a, const Matrix& b) {
     constexpr std::size_t BLOCK = 64;  // 适配 L1 缓存
-    
+
     for (std::size_t i = 0; i < a.rows(); i += BLOCK) {
         for (std::size_t j = 0; j < b.cols(); j += BLOCK) {
             for (std::size_t k = 0; k < a.cols(); k += BLOCK) {
@@ -595,9 +604,10 @@ void matrix_multiply(Matrix& result, const Matrix& a, const Matrix& b) {
 }
 ```
 
-#### 2.4 并行化
+#### 6.2.4 并行化
+
 ```cpp
-// ✅ 使用自定义 SmartPolicy 进行并行化
+// 使用自定义 SmartPolicy 进行并行化
 void SmartPolicy::apply(Iterator begin, Iterator end, Func func) {
     const auto distance = std::distance(begin, end);
     if (distance < PARALLEL_THRESHOLD) {
@@ -610,31 +620,24 @@ void SmartPolicy::apply(Iterator begin, Iterator end, Func func) {
 }
 ```
 
-### 3. 性能注解
+### 6.3 性能注解
 
-#### 3.1 noexcept 标注
 ```cpp
-// ✅ 明确标注 noexcept
+// noexcept 标注
 [[nodiscard]] double at_unchecked(std::size_t row, std::size_t col) const noexcept {
     return data_[index(row, col)];
 }
-```
 
-#### 3.2 [[nodiscard]] 标注
-```cpp
-// ✅ 避免忽略返回值
+// [[nodiscard]] 标注：避免忽略返回值
 [[nodiscard]] Matrix transpose() const;
 [[nodiscard]] double compute_loss(const Matrix& predicted, const Matrix& target) const;
-```
 
-#### 3.3 inline 标注
-```cpp
-// ✅ 小函数使用 inline
+// inline 标注：小函数使用 inline
 [[nodiscard]] constexpr std::size_t rows() const noexcept { return rows_; }
 [[nodiscard]] constexpr std::size_t cols() const noexcept { return cols_; }
 ```
 
-### 4. 性能检查清单
+### 6.4 性能检查清单
 
 - [ ] 热路径中是否预分配缓冲区？
 - [ ] 是否使用 constexpr 进行编译期计算？
@@ -645,9 +648,9 @@ void SmartPolicy::apply(Iterator begin, Iterator end, Func func) {
 
 ---
 
-## 🔧 C++ 标准跟进规范
+## 7. C++ 标准跟进规范
 
-### 1. 当前标准：C++26
+### 7.1 当前标准：C++26
 
 ```cmake
 # CMakeLists.txt
@@ -655,7 +658,7 @@ set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 ```
 
-### 2. 积极使用的 C++20/23 特性
+### 7.2 积极使用的 C++20/23 特性
 
 | 特性 | 标准 | 用途 |
 |------|------|------|
@@ -666,7 +669,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 | `std::views::zip` | C++20 | 多范围并行迭代（优化器参数更新） |
 | `std::execution::par_unseq` | C++17 | 并行执行策略（矩阵运算） |
 
-### 3. 标准跟进检查清单
+### 7.3 标准跟进检查清单
 
 - [ ] 是否使用最新的 C++ 标准（C++26）？
 - [ ] 是否积极使用 C++20/23/26 新特性？
@@ -675,9 +678,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 ---
 
-## 📝 代码风格规范
+## 8. 代码风格规范
 
-### 1. 命名规范
+### 8.1 命名规范
 
 | 类型 | 风格 | 示例 |
 |------|------|------|
@@ -689,7 +692,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 | 模板参数 | CamelCase | `LayerType`, `ValueType` |
 | 命名空间 | snake_case | `nn`, `nn::detail` |
 
-### 2. 格式规范
+### 8.2 格式规范
 
 ```cpp
 // 缩进：4 个空格
@@ -703,14 +706,11 @@ void function() {
 }
 
 // 指针/引用：靠近类型名
-int* ptr;       // ✅ 推荐
-int *ptr;       // ❌ 避免
-
-const std::vector<int>& vec;  // ✅ 推荐
-const std::vector<int> &vec;  // ❌ 避免
+int* ptr;       // 推荐
+const std::vector<int>& vec;  // 推荐
 ```
 
-### 3. 包含顺序
+### 8.3 包含顺序
 
 ```cpp
 // 1. 对应的头文件（如适用）
@@ -730,9 +730,9 @@ const std::vector<int> &vec;  // ❌ 避免
 
 ---
 
-## 🛡️ 错误处理规范
+## 9. 错误处理规范
 
-### 1. 使用 std::expected (C++23)
+### 9.1 使用 std::expected（C++23）
 
 **全项目禁止使用 throw/try/catch**，统一使用 C++23 的 `std::expected<T, E>` 进行错误传播。
 
@@ -749,12 +749,12 @@ using Result = std::expected<T, Error>;
 #### 函数签名约定
 
 ```cpp
-// ✅ 所有公共 API 使用 Result<T> 返回错误
+// 所有公共 API 使用 Result<T> 返回错误
 Result<Matrix> forward(const Matrix& input);
 Result<void> save_model(const std::string& path, Model& model);
 Result<ModelSpec> peek_model_spec(const std::string& path);
 
-// ❌ 禁止抛异常
+// 禁止抛异常
 Matrix forward(const Matrix& input);  // 旧方式
 void save_model(...);                  // 旧方式
 ```
@@ -787,7 +787,7 @@ if (!r) return std::unexpected(r.error());  // 向上传播
 return *r;
 ```
 
-### 2. 构造函数中的验证
+### 9.2 构造函数中的验证
 
 构造函数不能返回 `std::expected`，使用以下策略：
 
@@ -815,18 +815,18 @@ class Optimizer {
 assert(false && "matrix multiplication dimension mismatch");
 ```
 
-### 3. 热路径中的错误处理
+### 9.3 热路径中的错误处理
 
 ```cpp
-// ✅ 热路径中标注 noexcept（不抛异常的函数）
+// 热路径中标注 noexcept（不抛异常的函数）
 [[nodiscard]] double at_unchecked(std::size_t row, std::size_t col) const noexcept {
     return data_[index(row, col)];
 }
 
-// ✅ 使用 assert 检查编程错误（debug 模式有效，release 模式编译掉）
+// 使用 assert 检查编程错误（debug 模式有效，release 模式编译掉）
 assert(rows_ == other.rows() && "dimension mismatch");
 
-// ✅ 使用 if constexpr 在编译期分支
+// 使用 if constexpr 在编译期分支
 if constexpr (std::is_same_v<Policy, SeqPolicy>) {
     // 串行执行
 } else {
@@ -834,7 +834,7 @@ if constexpr (std::is_same_v<Policy, SeqPolicy>) {
 }
 ```
 
-### 4. 错误处理检查清单
+### 9.4 错误处理检查清单
 
 - [ ] 所有公共 API 是否使用 `Result<T>` 返回错误？
 - [ ] 是否禁止使用 throw/try/catch？
@@ -845,9 +845,9 @@ if constexpr (std::is_same_v<Policy, SeqPolicy>) {
 
 ---
 
-## 📚 文档与注释规范
+## 10. 文档与注释规范
 
-### 1. 注释风格
+### 10.1 注释风格
 
 ```cpp
 // ── 函数描述 ──
@@ -861,21 +861,21 @@ if constexpr (std::is_same_v<Policy, SeqPolicy>) {
 [[nodiscard]] Matrix transpose() const;
 ```
 
-### 2. Doxygen 风格（可选）
+### 10.2 Doxygen 风格（可选）
 
 ```cpp
 /**
  * @brief 计算前向传播
- * 
+ *
  * @param input 输入数据矩阵
  * @return 计算结果矩阵
- * 
+ *
  * @throws std::invalid_argument 如果维度不匹配
  */
 [[nodiscard]] Matrix forward(const Matrix& input) const;
 ```
 
-### 3. 文档检查清单
+### 10.3 文档检查清单
 
 - [ ] 公共 API 是否有文档注释？
 - [ ] 复杂算法是否有解释性注释？
@@ -884,7 +884,7 @@ if constexpr (std::is_same_v<Policy, SeqPolicy>) {
 
 ---
 
-## ✅ 总结
+## 11. 总结
 
 本规范旨在确保 neuralnet.cpp 项目：
 
@@ -895,9 +895,3 @@ if constexpr (std::is_same_v<Policy, SeqPolicy>) {
 5. **类型安全的错误处理**：使用 `std::expected<T, Error>` 替代异常，错误是类型签名的一部分
 
 遵循本规范将帮助团队构建高质量、可维护、高性能的 C++ 代码库。
-
----
-
-> 📅 最后更新：2026-07-15
-> 
-> 维护者：EthanPeng-2048 & AI

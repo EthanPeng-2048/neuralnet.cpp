@@ -101,7 +101,7 @@ void print_usage(const char *prog)
         << "  --min-lr <lr>     余弦退火最低学习率 (默认: 1e-6)\n"
         << "  --lr-per-epoch <v1,v2,...>  手动指定每轮学习率 (逗号分隔，优先级最高)\n"
         << "\n"
-        << "混合精度 (docs/23-mixed-precision.md):\n"
+        << "混合精度 (docs/development/05-mixed-precision.md):\n"
         << "  --f16              快捷方式：master-weights 配方 (param=f32,compute=f16,stable=f32,optimizer=f32)\n"
         << "  --precision-param <f16|f32>\n"
         << "                     权重/参数存储精度 (默认: f32)\n"
@@ -158,7 +158,7 @@ struct TrainConfig
     Scalar min_lr = 1e-6f;              // 余弦退火最低 lr
     std::vector<Scalar> lr_per_epoch;   // 手动指定每轮 lr（为空则自动计算）
 
-    // 混合精度控制（docs/23-mixed-precision.md §9.1）
+    // 混合精度控制（docs/development/05-mixed-precision.md §9.1）
     nn::PrecisionProfile precision;     // 默认全 F32（D10：零回归）
 };
 

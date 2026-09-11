@@ -335,7 +335,7 @@ void print_usage(const char *prog)
         << "  --lr-per-epoch <v1,v2,...>  手动指定每轮学习率 (逗号分隔，优先级最高)\n"
         << "  --max-norm <f>    梯度裁剪最大全局 L2 范数 (默认: 0=不裁剪)\n"
         << "\n"
-        << "混合精度 (docs/23-mixed-precision.md):\n"
+        << "混合精度 (docs/development/05-mixed-precision.md):\n"
         << "  --f16              快捷方式：master-weights 配方 (param=f32,compute=f16,stable=f32,optimizer=f32)\n"
         << "  --precision-param <f16|f32>\n"
         << "                     权重/参数存储精度 (默认: f32)\n"
@@ -407,7 +407,7 @@ struct TrainConfig
     // 梯度裁剪
     Scalar max_norm = 0.0f;             // 0 = 不裁剪
 
-    // 混合精度控制（docs/23-mixed-precision.md §9.1）
+    // 混合精度控制（docs/development/05-mixed-precision.md §9.1）
     nn::PrecisionProfile precision;     // 默认全 F32（D10：零回归）
 };
 

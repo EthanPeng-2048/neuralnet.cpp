@@ -1,7 +1,7 @@
 // ───────────────────────────────────────────────────────────────────────────
 //  expr_opt_test.cpp — IR 优化 pass（IR-A + IR-B）单元验证（纯 CPU、无 GPU）
 //
-//  验证内容（对应 docs/11-ir-optimization.md 的验证策略）：
+//  验证内容（对应 docs/development/03-ir-optimization.md 的验证策略）：
 //   1. canonicalize 各 pass 正确性：DCE / 常量折叠 / 代数化简 / CSE / 寄存器分配
 //   2. 确定性：同一 spec 多次 canonicalize 结果完全相同（含 key）
 //   3. 语义等价：canonical 前后 CPU 求值结果一致（含归约表达式）

@@ -1,15 +1,15 @@
-# 🧠 neuralnet.cpp 架构设计
+# neuralnet.cpp 架构设计
 
-> 一个从零实现的 C++26 神经网络库，支持 CPU/GPU 双后端、多层 Transformer、GPT 语言模型训练与推理。
+从零实现的 C++26 神经网络库，支持 CPU/GPU 双后端、多层 Transformer、GPT 语言模型训练与推理。
 
 ---
 
-## 🚀 快速理解（30秒版本）
+## 快速理解（30 秒版本）
 
 **这个项目是什么**：一个从零实现的深度学习框架，类似 PyTorch 但更简单。
 
 **核心设计**：
-1. **分层架构**：6层严格隔离，上层只调用下层接口
+1. **分层架构**：6 层严格隔离，上层只调用下层接口
 2. **引擎化**：同一个 Layer 代码自动适配 CPU 和 GPU
 3. **表达式融合**：自动把多个小操作合并成一个 GPU kernel
 
@@ -26,39 +26,39 @@
 
 ---
 
-## 🗺️ 理解路线图
+## 理解路线图
 
-### 第一步：理解基础数据结构（1-2天）
+### 第一步：理解基础数据结构（1-2 天）
 **目标**：理解数据如何表示和存储
-- **文件**：`algebra_matrix.hpp`（Matrix类）
+- **文件**：`algebra_matrix.hpp`（Matrix 类）
 - **关键概念**：行主序存储、矩阵运算
 - **验证**：能解释 `data_[row * cols + col]` 的含义
 
-### 第二步：理解计算引擎（2-3天）
+### 第二步：理解计算引擎（2-3 天）
 **目标**：理解如何执行计算
-- **文件**：`compute_engine.hpp`（接口）、`compute_cpu_engine.hpp`（CPU实现）
+- **文件**：`compute_engine.hpp`（接口）、`compute_cpu_engine.hpp`（CPU 实现）
 - **关键概念**：引擎化、原语（matmul, add, exp）
 - **验证**：能解释 `engine.matmul(a, b)` 如何工作
 
-### 第三步：理解神经网络层（3-5天）
+### 第三步：理解神经网络层（3-5 天）
 **目标**：理解如何构建模型
 - **文件**：`compute_layer.hpp`（所有层定义）
 - **关键概念**：forward/backward、梯度计算
 - **验证**：能解释 `Linear::forward` 如何计算
 
-### 第四步：理解模型容器（1-2天）
+### 第四步：理解模型容器（1-2 天）
 **目标**：理解如何组合层
 - **文件**：`model_container.hpp`
 - **关键概念**：链式构建、参数管理
 - **验证**：能解释 `model.add_linear(784,256)` 的作用
 
-### 第五步：理解训练流程（2-3天）
+### 第五步：理解训练流程（2-3 天）
 **目标**：理解端到端训练
 - **文件**：`src/text_train.cpp`（训练入口）
 - **关键概念**：梯度下降、优化器
 - **验证**：能解释训练循环的每一步
 
-### 可选：理解 GPU 后端（5-7天）
+### 可选：理解 GPU 后端（5-7 天）
 **目标**：理解 GPU 加速
 - **文件**：`compute_gpu_engine.hpp`、`shaders/`
 - **关键概念**：Vulkan、command buffer、SPIR-V
@@ -66,34 +66,34 @@
 
 ---
 
-## 📊 模块关系简化图
+## 模块关系简化图
 
 ```mermaid
 graph LR
     subgraph "用户代码"
         U[训练脚本]
     end
-    
+
     subgraph "模型层"
         M[Model容器]
         L[Layer层]
     end
-    
+
     subgraph "计算层"
         E[ComputeEngine]
         T[Tensor]
     end
-    
+
     subgraph "数据层"
         MT[Matrix]
     end
-    
+
     U --> M
     M --> L
     L --> E
     E --> T
     T --> MT
-    
+
     style U fill:#e1f5fe
     style M fill:#f3e5f5
     style L fill:#f3e5f5
@@ -106,32 +106,32 @@ graph LR
 
 ---
 
-## 📐 系统分层总览
+## 系统分层总览
 
 项目采用 **6 层分层架构**（L0 ~ L5），每层职责单一、严格隔离，上层仅依赖下层的公有接口。
 
 ```mermaid
 graph TB
-    subgraph "🖥️ L5 用户入口层"
+    subgraph "L5 用户入口层"
         A["mnist_train / mnist_infer"]
         B["text_train / text_infer"]
         C["tokenizer_train / tokenizer_infer"]
         D["gui.py (Python GUI)"]
     end
 
-    subgraph "🧩 L4 领域构建层"
+    subgraph "L4 领域构建层"
         E["domain_mnist.hpp — MNIST 模型工厂"]
         F["domain_gpt.hpp — GPT 模型工厂"]
         G["domain_tokenizer.hpp — 分词器"]
     end
 
-    subgraph "🧩 L3 实现层"
+    subgraph "L3 实现层"
         H["model_container.hpp — Model 容器"]
         I["model_serialization.hpp — 二进制序列化"]
         J["model_spec.hpp — 架构描述"]
     end
 
-    subgraph "🧩 L2 计算层（引擎化）"
+    subgraph "L2 计算层（引擎化）"
         K["compute_engine.hpp — 引擎抽象接口"]
         L["cpu_engine.hpp — CPU 引擎"]
         M["gpu_engine.hpp — GPU 引擎 (Vulkan)"]
@@ -140,7 +140,7 @@ graph TB
         P["compute_optimizer.hpp — 优化器"]
     end
 
-    subgraph "🧩 L1 代数层"
+    subgraph "L1 代数层"
         Q["algebra_matrix.hpp — 矩阵类 + 运算原语"]
         R["algebra_expr.hpp — 表达式模板"]
         S["algebra_ops.hpp — 逐元素算子"]
@@ -148,10 +148,10 @@ graph TB
         U["algebra_span.hpp — Span 抽象"]
     end
 
-    subgraph "🧩 L0 硬件层"
+    subgraph "L0 硬件层"
         V["config.hpp — SmartPolicy / BLOCK_SIZE"]
         W["core_threadpool.hpp — 全局线程池"]
-        X["core_errors.hpp — Result&lt;T&gt; = std::expected&lt;T, Error&gt;"]
+        X["core_errors.hpp — Result<T> = std::expected<T, Error>"]
         Y["core_assert.hpp — 断言宏"]
     end
 
@@ -167,7 +167,7 @@ graph TB
 
 ---
 
-## 🔑 核心设计原则
+## 核心设计原则
 
 ### 1. 引擎化架构（Engine-Based Architecture）
 
@@ -236,7 +236,7 @@ class Tensor {
 
 ---
 
-## 📂 模块详解
+## 模块详解
 
 ### L0 硬件层
 
@@ -305,9 +305,9 @@ class Tensor {
 
 ---
 
-## 📊 数据布局约定
+## 数据布局约定
 
-所有张量采用 **batch-major** 布局（batch-major）：
+所有张量采用 **batch-major** 布局：
 
 ```
 输入:  (feature_dim, batch_size)     — 每列一个样本
@@ -321,12 +321,12 @@ Matrix 索引:  data_[row * cols + col]
 
 ```
 多头 Q/K/V: (H*d_k, batch*seq)    — 头维度在行方向，batch 在列方向
-rearrange 后: (batch*H*d_k, seq)   — 使 batched_matmul 能按 batch*H 切分
+rearrange 后: (batch*H*d_k, seq)  — 使 batched_matmul 能按 batch*H 切分
 ```
 
 ---
 
-## 🔄 完整训练流程
+## 完整训练流程
 
 ```mermaid
 sequenceDiagram
@@ -363,7 +363,7 @@ sequenceDiagram
 
 ---
 
-## 🏗️ 构建与编译
+## 构建与编译
 
 **环境要求：**
 - CMake ≥ 3.30
@@ -391,7 +391,7 @@ cmake --build build --parallel
 
 ---
 
-## 📁 完整头文件依赖图
+## 完整头文件依赖图
 
 ```
 nn.hpp（统一入口）
@@ -402,3 +402,15 @@ nn.hpp（统一入口）
 ├── L3: model_container → model_spec → model_serialization
 └── L4: domain_mnist → domain_gpt → domain_tokenizer
 ```
+
+---
+
+## 备注：CUDA 后端已停用
+
+**CUDA 后端自 v1.0.0 起正式停用，不可用，请勿依赖。** 融合原语（M4/M5/M6）与 DSL 表达式在 CUDA 上未实现，无真实回退，导致 CUDA 上 GPT/MNIST 训练推理均无法运行。具体表现：
+
+- CMake **不再提供 `NN_ENABLE_CUDA` 开关**（不定义该 option）；
+- `cuda_engine.hpp` 仅在 `NN_HAS_CUDA` 下编译，但该宏**永不定义**；
+- CLI 的 `--cuda` 参数仍会被解析，但传入后返回错误"请求 --cuda 但未编译 CUDA 支持；不回退 CPU"。
+
+引擎只支持 CPU（`CpuEngine`）与 Vulkan GPU（`GpuEngine`）两个后端。CUDA 后端已停用，当前无计划恢复。

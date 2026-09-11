@@ -23,7 +23,7 @@
 namespace nn
 {
 // ══════════════════════════════════════════════════════════════════════════
-// ReLULinearAttention — RLA-2：极简硬截断线性注意力（docs/22-rla2.md）
+// ReLULinearAttention — RLA-2：极简硬截断线性注意力（docs/development/06-rapt-algorithm.md）
 //
 // 算法（RLA-2，修正版；causal / bidirectional 均支持）：
 //   q' = ReLU(RoPE(q)), k' = ReLU(RoPE(k)), v = W_v·x（V 不做 ReLU）

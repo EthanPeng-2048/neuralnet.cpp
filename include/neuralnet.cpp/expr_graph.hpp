@@ -3,7 +3,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 //  expr_graph.hpp — 图 IR + 融合分析（IR-C）
 //
-//  对应文档 `docs/11-ir-optimization.md` IR-C：把扁平 ExprSpec 演进为图 IR
+//  对应文档 `docs/development/03-ir-optimization.md` IR-C：把扁平 ExprSpec 演进为图 IR
 //  （DAG），为 begin_expr/end_expr 提供多表达式融合分析。
 //
 //  图结构：

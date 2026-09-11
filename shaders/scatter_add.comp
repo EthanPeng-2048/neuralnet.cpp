@@ -11,7 +11,7 @@
 // 使用 CAS 循环实现 float atomicAdd，兼容所有 Vulkan 设备。
 // 越界索引被跳过（不修改 dst）。
 //
-// ⚠ 已知确定性偏差（见 docs/08-pitfalls-and-lessons.md 坑 19）：
+// ⚠ 已知确定性偏差（见 docs/development/08-pitfalls-and-lessons.md 坑 19）：
 //   CAS 循环的执行顺序取决于 GPU 调度，同一行多个梯度值的累加顺序
 //   跨 run 不一致 → 浮点舍入结果有 ~1e-7 相对误差的 run 间抖动。
 //   这是铁律 8（确定性）的**已文档化例外**：偏差仅为舍入噪声，被
