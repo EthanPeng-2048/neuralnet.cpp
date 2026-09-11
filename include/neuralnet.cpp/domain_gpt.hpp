@@ -91,11 +91,14 @@ struct GptConfig {
     if (!spec.is_gpt() && !spec.is_alibi_gpt())
         return std::unexpected(Error{"Invalid ModelSpec type for GPT: expected GPT or ALiBi_GPT"});
 
-    return build_gpt_model(
+    auto model = build_gpt_model(
         engine,
         spec.vocab_size, spec.d_model, spec.seq_len,
         spec.num_heads, spec.d_ff, spec.num_layers,
         spec.pos_encoding, spec.activation, spec.norm_type);
+    if (model)
+        model->set_spec(spec);  // 记录架构规格，供 load_model 校验
+    return model;
 }
 
 // ── 构造 GPT ModelSpec ──────────────────────────────────────────────────

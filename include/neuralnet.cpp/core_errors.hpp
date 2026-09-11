@@ -3,6 +3,7 @@
 
 #include <charconv>
 #include <cstddef>
+#include <cstdlib>  // for strtof/strtod/strtold（浮点解析回退）
 #include <expected>
 #include <string>
 #include <string_view>
@@ -49,10 +50,29 @@ template <typename T>
         return std::unexpected(Error{"empty numeric string"});
 
     T value{};
-    const auto *end = s.data() + s.size();
-    auto [ptr, ec] = std::from_chars(s.data(), end, value);
-    if (ec != std::errc{} || ptr != end)
-        return std::unexpected(Error{"invalid number: " + std::string(s)});
+    if constexpr (std::is_floating_point_v<T>)
+    {
+        // 浮点：libc++ 部分版本缺少浮点 std::from_chars（__charconv/from_chars_integral.h
+        // 只有整型版），会选中被删除的 bool 重载而编译失败。改用 C 的 strtoX
+        // （全平台/全标准库都有、不抛异常）。s 已去除首尾空白，要求整串被解析。
+        std::string tmp(s);  // strtoX 需要 null 结尾
+        char* p = nullptr;
+        if constexpr (std::is_same_v<T, float>)
+            value = std::strtof(tmp.c_str(), &p);
+        else if constexpr (std::is_same_v<T, double>)
+            value = std::strtod(tmp.c_str(), &p);
+        else
+            value = std::strtold(tmp.c_str(), &p);
+        if (p != tmp.c_str() + tmp.size())
+            return std::unexpected(Error{"invalid number: " + std::string(s)});
+    }
+    else
+    {
+        const auto *end = s.data() + s.size();
+        auto [ptr, ec] = std::from_chars(s.data(), end, value);
+        if (ec != std::errc{} || ptr != end)
+            return std::unexpected(Error{"invalid number: " + std::string(s)});
+    }
     return value;
 }
 

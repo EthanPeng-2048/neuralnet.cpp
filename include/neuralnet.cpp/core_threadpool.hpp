@@ -17,6 +17,14 @@
 
 #include "core_assert.hpp"
 
+// ── CPU pause 自旋原语：GCC/Clang 用 __builtin_ia32_pause，MSVC 用 _mm_pause ──
+#if defined(_MSC_VER)
+#include <immintrin.h>
+#define NN_CPU_PAUSE() _mm_pause()
+#else
+#define NN_CPU_PAUSE() __builtin_ia32_pause()
+#endif
+
 namespace nn
 {
     // ── 简易线程池（latch 零分配设计）──────────────────────────────────────
@@ -114,7 +122,7 @@ namespace nn
                 if (latch.load(std::memory_order_acquire) == 0)
                     return;
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-                __builtin_ia32_pause();
+                NN_CPU_PAUSE();
 #endif
             }
 
@@ -139,7 +147,7 @@ namespace nn
                         if (latch.load(std::memory_order_acquire) == 0)
                             return;
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-                        __builtin_ia32_pause();
+                        NN_CPU_PAUSE();
 #endif
                     }
                 }
@@ -162,7 +170,7 @@ namespace nn
         template<typename Iterator, typename Func>
         void parallel_for_each(Iterator first, Iterator last, Func&& func)
         {
-            const auto total = static_cast<std::size_t>(std::distance(first, last));
+            const auto total = static_cast<std::size_t>(std::ranges::distance(first, last));
             if (total == 0) return;
 
             const auto n_chunks = chunk_count(total);
@@ -187,9 +195,9 @@ namespace nn
                 {
                     const std::size_t len = base + (c < rem ? 1 : 0);
                     auto beg = first;
-                    std::advance(beg, static_cast<std::ptrdiff_t>(off));
+                    std::ranges::advance(beg, static_cast<std::ptrdiff_t>(off));
                     auto end = beg;
-                    std::advance(end, static_cast<std::ptrdiff_t>(len));
+                    std::ranges::advance(end, static_cast<std::ptrdiff_t>(len));
                     off += len;
 
                     tasks_.emplace([beg, end, &func, &latch]()
@@ -208,7 +216,7 @@ namespace nn
                 const std::size_t len = base + (c < rem ? 1 : 0);
                 const std::size_t off = total - len;
                 auto beg = first;
-                std::advance(beg, static_cast<std::ptrdiff_t>(off));
+                std::ranges::advance(beg, static_cast<std::ptrdiff_t>(off));
                 for (auto it = beg; it != last; ++it)
                     func(*it);
                 latch.fetch_sub(1, std::memory_order_release);
@@ -225,7 +233,7 @@ namespace nn
         template<typename Iterator, typename Func>
         void parallel_for_blocks(Iterator first, Iterator last, Func&& func)
         {
-            const auto total = static_cast<std::size_t>(std::distance(first, last));
+            const auto total = static_cast<std::size_t>(std::ranges::distance(first, last));
             if (total <= 1)
             {
                 for (auto it = first; it != last; ++it)
@@ -245,9 +253,9 @@ namespace nn
                 {
                     const std::size_t len = base + (c < rem ? 1 : 0);
                     auto beg = first;
-                    std::advance(beg, static_cast<std::ptrdiff_t>(off));
+                    std::ranges::advance(beg, static_cast<std::ptrdiff_t>(off));
                     auto end = beg;
-                    std::advance(end, static_cast<std::ptrdiff_t>(len));
+                    std::ranges::advance(end, static_cast<std::ptrdiff_t>(len));
                     off += len;
 
                     tasks_.emplace([beg, end, &func, &latch]()
@@ -264,7 +272,7 @@ namespace nn
                 const std::size_t c = n_chunks - 1;
                 const std::size_t off = total - (base + (c < rem ? 1 : 0));
                 auto beg = first;
-                std::advance(beg, static_cast<std::ptrdiff_t>(off));
+                std::ranges::advance(beg, static_cast<std::ptrdiff_t>(off));
                 for (auto it = beg; it != last; ++it)
                     func(*it);
                 latch.fetch_sub(1, std::memory_order_release);
@@ -328,7 +336,7 @@ namespace nn
         template<typename InputIt, typename OutputIt, typename UnaryOp>
         void parallel_transform(InputIt first, InputIt last, OutputIt d_first, UnaryOp&& op)
         {
-            const auto total = static_cast<std::size_t>(std::distance(first, last));
+            const auto total = static_cast<std::size_t>(std::ranges::distance(first, last));
             if (total == 0) return;
 
             const auto n_chunks = chunk_count(total);
@@ -350,10 +358,10 @@ namespace nn
                     const std::size_t len = base + (c < rem ? 1 : 0);
                     auto in_beg = first;
                     auto out_beg = d_first;
-                    std::advance(in_beg,  static_cast<std::ptrdiff_t>(off));
-                    std::advance(out_beg, static_cast<std::ptrdiff_t>(off));
+                    std::ranges::advance(in_beg,  static_cast<std::ptrdiff_t>(off));
+                    std::ranges::advance(out_beg, static_cast<std::ptrdiff_t>(off));
                     auto in_end = in_beg;
-                    std::advance(in_end, static_cast<std::ptrdiff_t>(len));
+                    std::ranges::advance(in_end, static_cast<std::ptrdiff_t>(len));
                     off += len;
 
                     tasks_.emplace([in_beg, in_end, out_beg, &op, &latch]()
@@ -373,8 +381,8 @@ namespace nn
                 const std::size_t off = total - (base + (c < rem ? 1 : 0));
                 auto in_beg = first;
                 auto out_beg = d_first;
-                std::advance(in_beg,  static_cast<std::ptrdiff_t>(off));
-                std::advance(out_beg, static_cast<std::ptrdiff_t>(off));
+                std::ranges::advance(in_beg,  static_cast<std::ptrdiff_t>(off));
+                std::ranges::advance(out_beg, static_cast<std::ptrdiff_t>(off));
                 for (; in_beg != last; ++in_beg, ++out_beg)
                     *out_beg = op(*in_beg);
                 latch.fetch_sub(1, std::memory_order_release);
@@ -388,7 +396,7 @@ namespace nn
         void parallel_transform(InputIt1 first1, InputIt1 last1, InputIt2 first2,
                                 OutputIt d_first, BinaryOp&& op)
         {
-            const auto total = static_cast<std::size_t>(std::distance(first1, last1));
+            const auto total = static_cast<std::size_t>(std::ranges::distance(first1, last1));
             if (total == 0) return;
 
             const auto n_chunks = chunk_count(total);
@@ -411,11 +419,11 @@ namespace nn
                     auto i1 = first1;
                     auto i2 = first2;
                     auto o = d_first;
-                    std::advance(i1, static_cast<std::ptrdiff_t>(off));
-                    std::advance(i2, static_cast<std::ptrdiff_t>(off));
-                    std::advance(o,  static_cast<std::ptrdiff_t>(off));
+                    std::ranges::advance(i1, static_cast<std::ptrdiff_t>(off));
+                    std::ranges::advance(i2, static_cast<std::ptrdiff_t>(off));
+                    std::ranges::advance(o,  static_cast<std::ptrdiff_t>(off));
                     auto i1_end = i1;
-                    std::advance(i1_end, static_cast<std::ptrdiff_t>(len));
+                    std::ranges::advance(i1_end, static_cast<std::ptrdiff_t>(len));
                     off += len;
 
                     tasks_.emplace([i1, i1_end, i2, o, &op, &latch]()
@@ -437,9 +445,9 @@ namespace nn
                 auto i1 = first1;
                 auto i2 = first2;
                 auto o = d_first;
-                std::advance(i1, static_cast<std::ptrdiff_t>(off));
-                std::advance(i2, static_cast<std::ptrdiff_t>(off));
-                std::advance(o,  static_cast<std::ptrdiff_t>(off));
+                std::ranges::advance(i1, static_cast<std::ptrdiff_t>(off));
+                std::ranges::advance(i2, static_cast<std::ptrdiff_t>(off));
+                std::ranges::advance(o,  static_cast<std::ptrdiff_t>(off));
                 for (; i1 != last1; ++i1, ++i2, ++o)
                     *o = op(*i1, *i2);
                 latch.fetch_sub(1, std::memory_order_release);
@@ -453,7 +461,7 @@ namespace nn
         T parallel_transform_reduce(InputIt first, InputIt last, T init,
                                     BinaryOp&& reduce_op, UnaryOp&& transform_op)
         {
-            const auto total = static_cast<std::size_t>(std::distance(first, last));
+            const auto total = static_cast<std::size_t>(std::ranges::distance(first, last));
             if (total == 0) return init;
 
             const auto n_chunks = chunk_count(total);
@@ -478,9 +486,9 @@ namespace nn
                 {
                     const std::size_t len = base + (c < rem ? 1 : 0);
                     auto beg = first;
-                    std::advance(beg, static_cast<std::ptrdiff_t>(off));
+                    std::ranges::advance(beg, static_cast<std::ptrdiff_t>(off));
                     auto end = beg;
-                    std::advance(end, static_cast<std::ptrdiff_t>(len));
+                    std::ranges::advance(end, static_cast<std::ptrdiff_t>(len));
                     off += len;
 
                     tasks_.emplace([beg, end, &reduce_op, &transform_op, &partials, &latch, c, init]()
@@ -499,7 +507,7 @@ namespace nn
                 const std::size_t c = n_chunks - 1;
                 const std::size_t off = total - (base + (c < rem ? 1 : 0));
                 auto beg = first;
-                std::advance(beg, static_cast<std::ptrdiff_t>(off));
+                std::ranges::advance(beg, static_cast<std::ptrdiff_t>(off));
                 T local = init;  // 以调用者 init 为单位元（不能用 T{}）
                 for (auto it = beg; it != last; ++it)
                     local = reduce_op(local, transform_op(*it));
@@ -520,7 +528,7 @@ namespace nn
         T parallel_transform_reduce(InputIt1 first1, InputIt1 last1, InputIt2 first2,
                                     T init, BinaryOp&& reduce_op, UnaryOp&& transform_op)
         {
-            const auto total = static_cast<std::size_t>(std::distance(first1, last1));
+            const auto total = static_cast<std::size_t>(std::ranges::distance(first1, last1));
             if (total == 0) return init;
 
             const auto n_chunks = chunk_count(total);
@@ -544,10 +552,10 @@ namespace nn
                     const std::size_t len = base + (c < rem ? 1 : 0);
                     auto i1 = first1;
                     auto i2 = first2;
-                    std::advance(i1, static_cast<std::ptrdiff_t>(off));
-                    std::advance(i2, static_cast<std::ptrdiff_t>(off));
+                    std::ranges::advance(i1, static_cast<std::ptrdiff_t>(off));
+                    std::ranges::advance(i2, static_cast<std::ptrdiff_t>(off));
                     auto i1_end = i1;
-                    std::advance(i1_end, static_cast<std::ptrdiff_t>(len));
+                    std::ranges::advance(i1_end, static_cast<std::ptrdiff_t>(len));
                     off += len;
 
                     tasks_.emplace([i1, i1_end, i2, &reduce_op, &transform_op, &partials, &latch, c, init]()
@@ -569,8 +577,8 @@ namespace nn
                 const std::size_t off = total - (base + (c < rem ? 1 : 0));
                 auto i1 = first1;
                 auto i2 = first2;
-                std::advance(i1, static_cast<std::ptrdiff_t>(off));
-                std::advance(i2, static_cast<std::ptrdiff_t>(off));
+                std::ranges::advance(i1, static_cast<std::ptrdiff_t>(off));
+                std::ranges::advance(i2, static_cast<std::ptrdiff_t>(off));
                 T local = init;  // 以调用者 init 为单位元（不能用 T{}）
                 for (; i1 != last1; ++i1, ++i2)
                     local = reduce_op(local, transform_op(*i1, *i2));
