@@ -1,10 +1,10 @@
-# 📖 计算引擎使用指南
+# 计算引擎使用指南
 
-> 面向想要使用计算引擎构建神经网络的开发者。
+**面向想要使用计算引擎构建神经网络的开发者。**
 
 ---
 
-## 📋 目录
+## 目录
 
 1. [快速入门](#快速入门)
 2. [引擎选择](#引擎选择)
@@ -21,7 +21,7 @@
 
 ---
 
-## 🚀 快速入门
+## 快速入门
 
 ### 1. 包含头文件
 
@@ -74,7 +74,7 @@ auto matrix = engine.to_matrix(*result);
 
 ---
 
-## 🎯 引擎选择
+## 引擎选择
 
 ### CPU vs GPU
 
@@ -109,7 +109,7 @@ if (model_params < 10'000'000) {  // < 10M 参数
 
 ---
 
-## 📐 张量操作
+## 张量操作
 
 ### 创建张量
 
@@ -149,7 +149,7 @@ auto copy = engine.clone(*tensor);
 
 ---
 
-## 🧮 矩阵运算
+## 矩阵运算
 
 ### 矩阵乘法
 
@@ -224,7 +224,7 @@ engine.zero(*tensor);
 
 ---
 
-## 📊 归约与广播
+## 归约与广播
 
 ### 归约操作
 
@@ -275,7 +275,7 @@ engine.broadcast_col_inplace(*output, *scale, BinaryOp::Mul);
 
 ---
 
-## 🔢 逐元素运算
+## 逐元素运算
 
 ### 一元运算
 
@@ -349,7 +349,7 @@ auto relu_grad = engine.elementwise_select_scalar_cond(
 
 ---
 
-## 📦 数据操作
+## 数据操作
 
 ### 行切片
 
@@ -423,7 +423,7 @@ auto transposed = engine.transpose(*tensor);
 
 ---
 
-## 🔗 表达式融合
+## 表达式融合
 
 ### 基本用法
 
@@ -488,7 +488,7 @@ auto rope = nn::dsl::compute(
 
 ---
 
-## ⏱️ 批处理控制
+## 批处理控制
 
 ### CPU 引擎
 
@@ -520,7 +520,7 @@ engine.end_batch();
 
 ---
 
-## 📝 实际示例
+## 实际示例
 
 ### 示例 1：线性层前向传播
 
@@ -625,7 +625,7 @@ public:
 
 ---
 
-## ⚡ 性能建议
+## 性能建议
 
 ### 1. 使用表达式融合
 
@@ -705,7 +705,7 @@ for (int step = 0; step < num_steps; ++step) {
 
 ---
 
-## ❓ 常见问题
+## 常见问题
 
 ### Q1: 为什么 `from_matrix` 返回的是智能指针？
 
@@ -742,17 +742,17 @@ auto& t = *tensor;  // 解引用
 
 ### Q5: 如何添加自定义操作？
 
-**A**: 参考 [计算引擎开发指南](19-compute-engine-development.md) 的"添加新原语"部分。
+**A**: 参考 `docs/development/01-compute-engine-development.md` 的"添加新原语"部分。
 
 ---
 
-## 📚 相关文档
+## 相关文档
 
-- **引擎开发**：`docs/19-compute-engine-development.md`
-- **架构设计**：`docs/01-architecture.md`
-- **算法参考**：`docs/05-algorithm-reference.md`
-- **性能优化**：`docs/02-performance.md`
-- **快速开始**：`docs/03-quickstart-model.md`
+- **引擎开发**：`docs/development/01-compute-engine-development.md`
+- **架构设计**：`docs/introduction/01-architecture.md`
+- **算法参考**：`docs/introduction/03-algorithm-reference.md`
+- **性能优化**：`docs/introduction/02-performance.md`
+- **快速开始（训练与推理）**：`docs/usage/02-quickstart-train-infer.md`
 
 ---
 

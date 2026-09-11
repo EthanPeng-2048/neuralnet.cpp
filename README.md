@@ -22,14 +22,24 @@
 
 | 文档 | 说明 |
 |------|------|
-| [架构设计](docs/01-architecture.md) | 项目分层架构、引擎化设计、数据流、模块详解 |
-| [性能优化](docs/02-performance.md) | SmartPolicy、线程池、缓存分块、GPU 加速、算子融合等 |
-| [快速上手：构建模型](docs/03-quickstart-model.md) | ComputeEngine/Layer/Model 三件套使用教程 |
-| [快速上手：训练与推理](docs/04-quickstart-train-infer.md) | MNIST/GPT 训练推理命令行 + C++ API 示例 + GUI 操作指南 |
-| [算法解析](docs/05-algorithm-reference.md) | 每个 Layer/Loss/Optimizer 的数学原理与原语分解 |
-| [CUDA 后端](docs/06-cuda-backend.md) | CUDA 后端（1.0.0 起已停用，仅作恢复参考；构建方法、编译器兼容性） |
-| [训练包](docs/07-train-package.md) | 用 `.nnpkg` 打包超参+训练集，跨设备一键复现训练 |
-| [开发规范](docs/DEVELOPMENT_STANDARDS.md) | C++ 编码规范、模块隔离、内存管理 |
+| [架构设计](docs/introduction/01-architecture.md) | 项目分层架构、引擎化设计、数据流、模块详解 |
+| [性能优化](docs/introduction/02-performance.md) | SmartPolicy、线程池、缓存分块、GPU 加速、算子融合等 |
+| [算法解析](docs/introduction/03-algorithm-reference.md) | 每个 Layer/Loss/Optimizer 的数学原理与原语分解 |
+| [创新设计](docs/introduction/04-innovative-designs.md) | 引擎化、AOT 融合、多精度等创新全景 |
+| [计算引擎开发](docs/development/01-compute-engine-development.md) | ComputeEngine 接口详解、实现模式、添加新原语 |
+| [算子融合](docs/development/02-operator-fusion.md) | IR 扩展 → 表达式录制 → matmul 参与 IR 融合 → 跨 kernel 自动融合 |
+| [IR 优化](docs/development/03-ir-optimization.md) | IR-A/B/C/D 优化 pass |
+| [显存优化](docs/development/04-memory-optimization.md) | 激活重计算、内存池归还 |
+| [多精度计算](docs/development/05-mixed-precision.md) | f16/混合精度设计：Precision 类型系统、PrecisionProfile |
+| [线性注意力](docs/development/06-rapt-algorithm.md) | RLA / RAPT / RLA-2 + 两趟式/flash 等价 + GPU 落地 |
+| [ZiPT 记忆压缩](docs/development/07-zipt-algorithm.md) | AttnZip / ZiPT 解码器算法 |
+| [踩坑警示录](docs/development/08-pitfalls-and-lessons.md) | **改代码前读**，历史 bug 分级与根因模式 |
+| [代码审查报告](docs/development/09-code-review-2026-09-04.md) | 全库 C++ 审查结果与修复建议 |
+| [开发规范](docs/development/10-development-standards.md) | C++ 编码规范、模块隔离、内存管理 |
+| [快速上手：构建模型](docs/usage/01-quickstart-model.md) | ComputeEngine/Layer/Model 三件套使用教程 |
+| [快速上手：训练与推理](docs/usage/02-quickstart-train-infer.md) | MNIST/GPT 训练推理命令行 + C++ API 示例 + GUI 操作指南 |
+| [计算引擎使用](docs/usage/03-compute-engine-usage.md) | 张量操作、矩阵运算、表达式融合 |
+| [训练包](docs/usage/04-train-package.md) | 用 `.nnpkg` 打包超参+训练集，跨设备一键复现训练 |
 
 ## 项目结构
 
@@ -38,24 +48,27 @@ neuralnet.cpp/
 ├── CMakeLists.txt
 ├── README.md
 ├── docs/
-│   ├── 01-architecture.md       ← 架构设计文档
-│   ├── 02-performance.md        ← 性能优化文档
-│   ├── 03-quickstart-model.md   ← 模型构建教程
-│   ├── 04-quickstart-train-infer.md ← 训练推理教程
-│   ├── 05-algorithm-reference.md    ← 算法解析参考
-│   ├── 06-cuda-backend.md       ← CUDA 后端设计（1.0.0 起停用）
-│   ├── 07-train-package.md      ← .nnpkg 训练包
-│   ├── 08-pitfalls-and-lessons.md  ← 踩坑警示录
-│   ├── 09-operator-fusion.md    ← 算子融合一期（M1-M6）
-│   ├── 10-memory-optimization.md  ← 显存优化
-│   ├── 11-ir-optimization.md    ← IR 优化
-│   ├── 12-innovative-designs.md ← 创新设计全景
-│   ├── 13-optimize-proposal-list.md ← 优化方案清单
-│   ├── 14-operator-fusion-2.md  ← 算子融合二期（IR 融合）
-│   ├── 15-rapt-algorithm.md     ← RLA / RAPT 算法
-│   ├── 16-zipt-algorithm.md     ← AttnZip / ZiPT 算法
-│   ├── flash_attn_analysis.md   ← 两趟式注意力分析
-│   └── DEVELOPMENT_STANDARDS.md ← 开发规范
+│   ├── introduction/          ← 介绍类
+│   │   ├── 01-architecture.md            ← 架构设计文档
+│   │   ├── 02-performance.md             ← 性能优化文档
+│   │   ├── 03-algorithm-reference.md     ← 算法解析参考
+│   │   └── 04-innovative-designs.md      ← 创新设计全景
+│   ├── development/          ← 开发类
+│   │   ├── 01-compute-engine-development.md ← 引擎开发指南
+│   │   ├── 02-operator-fusion.md         ← 算子融合全篇（一期 M + 二期 S）
+│   │   ├── 03-ir-optimization.md         ← IR 优化
+│   │   ├── 04-memory-optimization.md     ← 显存优化
+│   │   ├── 05-mixed-precision.md         ← 多精度计算
+│   │   ├── 06-rapt-algorithm.md          ← RLA / RAPT / RLA-2 算法
+│   │   ├── 07-zipt-algorithm.md          ← AttnZip / ZiPT 算法
+│   │   ├── 08-pitfalls-and-lessons.md    ← 踩坑警示录
+│   │   ├── 09-code-review-2026-09-04.md  ← 代码审查报告
+│   │   └── 10-development-standards.md   ← 开发规范
+│   └── usage/                 ← 使用类
+│       ├── 01-quickstart-model.md        ← 模型构建教程
+│       ├── 02-quickstart-train-infer.md  ← 训练推理教程
+│       ├── 03-compute-engine-usage.md    ← 引擎使用指南
+│       └── 04-train-package.md           ← .nnpkg 训练包
 ├── gui.py                       ← 图形化操作界面 (CustomTkinter)
 ├── include/neuralnet.cpp/
 │   ├── nn.hpp                   ← 统一入口头文件

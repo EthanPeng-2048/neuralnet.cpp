@@ -1,10 +1,10 @@
-# 📚 算法解析：Layer / Loss / Optimizer
+# 算法参考：Layer / Loss / Optimizer
 
-> 本文档详细解析 neuralnet.cpp 中每个计算组件的数学原理、实现细节和引擎原语分解。
+本文档详细解析 neuralnet.cpp 中每个计算组件的数学原理、实现细节和引擎原语分解。
 
 ---
 
-## 📐 约定
+## 约定
 
 - **矩阵布局**：行主序 `(rows, cols)`，`data_[row * cols + col]`
 - **批处理布局**：列主序 batch-major `(feature_dim, batch_size)`
@@ -13,7 +13,7 @@
 
 ---
 
-## 🧱 Layer 篇
+## Layer 篇
 
 ### 1. Linear — 全连接层
 
@@ -25,7 +25,9 @@
 
 **Forward：**
 
-$$\text{out} = W \times x + b$$
+```
+out = W × x + b
+```
 
 引擎原语分解：
 ```
@@ -35,9 +37,11 @@ engine.broadcast_row_inplace(out, b, Add)         // 按行广播加法
 
 **Backward：**
 
-$$\text{grad}_x = W^T \times \text{grad}_{\text{out}}$$
-$$\text{grad}_W += \text{grad}_{\text{out}} \times x^T$$
-$$\text{grad}_b += \sum_{\text{batch}} \text{grad}_{\text{out}}$$
+```
+grad_x = W^T × grad_out
+grad_W += grad_out × x^T
+grad_b += Σ_batch grad_out
+```
 
 引擎原语分解：
 ```
@@ -54,7 +58,9 @@ grad_b += engine.row_reduce_sum(grad_out)
 
 **Forward：**
 
-$$\text{out} = \max(x, 0)$$
+```
+out = max(x, 0)
+```
 
 ```
 out = engine.elementwise_binary_scalar(Max, x, 0)
@@ -62,7 +68,10 @@ out = engine.elementwise_binary_scalar(Max, x, 0)
 
 **Backward：**
 
-$$\text{grad}_x = \begin{cases} \text{grad}_{\text{out}} & \text{if } x > 0 \\ 0 & \text{otherwise} \end{cases}$$
+```
+grad_x = grad_out   if x > 0
+         0           otherwise
+```
 
 ```
 grad_input = engine.elementwise_select_scalar_cond(Gt, x, 0, grad_out, 0)
@@ -76,24 +85,28 @@ grad_input = engine.elementwise_select_scalar_cond(Gt, x, 0, grad_out, 0)
 
 **Forward：**
 
-$$\text{out} = x \cdot \sigma(\beta x) = x \cdot \frac{1}{1 + e^{-\beta x}}$$
+```
+out = x · σ(βx) = x · 1/(1 + e^(−βx))
+```
 
-引擎原语分解（5 次调用）：
+引擎原语分解（6 次调用）：
 ```
 t1 = engine.elementwise_binary_scalar(Mul, x, β)      // βx
 t2 = engine.elementwise_unary(Neg, t1)                 // -βx
 t3 = engine.elementwise_unary(Exp, t2)                 // exp(-βx)
 t4 = engine.elementwise_binary_scalar(Add, t3, 1)      // 1 + exp(-βx)
-s  = engine.elementwise_binary_scalar(Div, t4, 1)      // sigmoid(βx)
+s  = engine.elementwise_binary_scalar(Div, t4, 1)      // sigmoid(βx) 的倒数
 out = engine.elementwise_binary(Mul, x, s)
 ```
 
 **Backward：**
 
-$$\text{factor} = s \cdot (1 + \beta x \cdot (1 - s)), \quad s = \sigma(\beta x)$$
-$$\text{grad}_x = \text{grad}_{\text{out}} \cdot \text{factor}$$
+```
+factor = s · (1 + βx · (1 − s)),   其中 s = σ(βx)
+grad_x = grad_out · factor
+```
 
-引擎原语分解（5 次调用）：
+引擎原语分解（6 次调用）：
 ```
 one_minus_s = engine.elementwise_binary_scalar(Sub, s, 1)
 bx = engine.elementwise_binary_scalar(Mul, x, β)
@@ -115,21 +128,25 @@ grad_input = engine.elementwise_binary(Mul, grad_out, factor)
 
 **Forward：**
 
-$$\mu = \frac{1}{F} \sum_f x_{f,b}$$
-$$\text{diff} = x - \mu$$
-$$\sigma^2 = \frac{1}{F} \sum_f \text{diff}_f^2$$
-$$\text{normalized} = \frac{\text{diff}}{\sqrt{\sigma^2 + \epsilon}}$$
-$$\text{out} = \gamma \cdot \text{normalized} + \beta$$
+```
+μ = (1/F) Σ_f x_{f,b}
+diff = x − μ
+σ² = (1/F) Σ_f diff_f²
+normalized = diff / √(σ² + ε)
+out = γ · normalized + β
+```
 
 **Backward：**
 
-$$\text{gy} = \text{grad}_{\text{out}} \cdot \gamma$$
-$$\text{mean}_g = \frac{1}{F} \sum_f \text{gy}_f$$
-$$\text{gy}_{\text{norm}} = \text{gy} \cdot \text{normalized}$$
-$$\text{mean}_{gn} = \frac{1}{F} \sum_f \text{gy}_{\text{norm},f}$$
-$$\text{grad}_x = (\text{gy} - \text{mean}_g - \text{normalized} \cdot \text{mean}_{gn}) \cdot \frac{1}{\sqrt{\sigma^2 + \epsilon}}$$
-$$\text{grad}_\gamma += \sum_b \text{gy}_{\text{norm},b}$$
-$$\text{grad}_\beta += \sum_b \text{grad}_{\text{out},b}$$
+```
+gy = grad_out · γ
+mean_g = (1/F) Σ_f gy_f
+gy_norm = gy · normalized
+mean_gn = (1/F) Σ_f gy_norm,f
+grad_x = (gy − mean_g − normalized · mean_gn) · 1/√(σ² + ε)
+grad_γ += Σ_b gy_norm,b
+grad_β += Σ_b grad_out,b
+```
 
 ---
 
@@ -139,11 +156,13 @@ $$\text{grad}_\beta += \sum_b \text{grad}_{\text{out},b}$$
 
 **Forward（数值稳定）：**
 
-$$\text{row\_max}_r = \max_c x_{r,c}$$
-$$\text{shifted}_{r,c} = x_{r,c} - \text{row\_max}_r$$
-$$\text{exp\_shift}_{r,c} = e^{\text{shifted}_{r,c}}$$
-$$\text{row\_sum}_r = \sum_c \text{exp\_shift}_{r,c}$$
-$$\text{out}_{r,c} = \frac{\text{exp\_shift}_{r,c}}{\text{row\_sum}_r}$$
+```
+row_max_r = max_c x_{r,c}
+shifted_{r,c} = x_{r,c} − row_max_r
+exp_shift_{r,c} = e^shifted
+row_sum_r = Σ_c exp_shift_{r,c}
+out_{r,c} = exp_shift_{r,c} / row_sum_r
+```
 
 引擎原语分解：
 ```
@@ -158,10 +177,12 @@ engine.broadcast_row_inplace(output, row_sum, Div)
 
 **Backward：**
 
-$$\text{ep} = \text{out} \odot \text{grad}_{\text{out}}$$
-$$\text{dot}_r = \sum_c \text{ep}_{r,c}$$
-$$\text{gmd} = \text{grad}_{\text{out}} - \text{dot}$$
-$$\text{grad}_x = \text{out} \odot \text{gmd}$$
+```
+ep = out ⊙ grad_out
+dot_r = Σ_c ep_{r,c}
+gmd = grad_out − dot
+grad_x = out ⊙ gmd
+```
 
 ---
 
@@ -192,8 +213,10 @@ $$\text{grad}_x = \text{out} \odot \text{gmd}$$
 
 **算法（固定，不可学习）：**
 
-$$\text{PE}(\text{pos}, 2i) = \sin\left(\frac{\text{pos}}{10000^{2i/d_{\text{model}}}}\right)$$
-$$\text{PE}(\text{pos}, 2i+1) = \cos\left(\frac{\text{pos}}{10000^{2i/d_{\text{model}}}}\right)$$
+```
+PE(pos, 2i)   = sin(pos / 10000^(2i/d_model))
+PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
+```
 
 **Forward：** `out = input + PE`
 
@@ -222,12 +245,14 @@ Forward/Backward 直接委托给子层的 forward/backward。
 
 **算法（Pre-Norm）：**
 
-$$x_1 = \text{LN}_1(x)$$
-$$a = \text{SelfAttn}(x_1)$$
-$$r_2 = x + a$$
-$$x_2 = \text{LN}_2(r_2)$$
-$$f = \text{FFN}(x_2)$$
-$$\text{out} = r_2 + f$$
+```
+x_1 = LN_1(x)
+a   = SelfAttn(x_1)
+r_2 = x + a
+x_2 = LN_2(r_2)
+f   = FFN(x_2)
+out = r_2 + f
+```
 
 包含子层：`MultiHeadAttention` + `LayerNorm`×2 + `FeedForward`
 
@@ -244,10 +269,16 @@ $$\text{out} = r_2 + f$$
 3. 全局平均池化（按样本聚合 `num_patches` 维度）
 
 **池化：**
-$$\text{out}[:, b] = \frac{1}{P} \sum_{p=0}^{P-1} x[:, b \cdot P + p]$$
+
+```
+out[:, b] = (1/P) Σ_{p=0}^{P-1} x[:, b·P + p]
+```
 
 **反池化（backward）：**
-$$\text{grad}_x[:, b \cdot P + p] = \frac{1}{P} \cdot \text{grad}_{\text{out}}[:, b]$$
+
+```
+grad_x[:, b·P + p] = (1/P) · grad_out[:, b]
+```
 
 ---
 
@@ -269,7 +300,10 @@ $$\text{grad}_x[:, b \cdot P + p] = \frac{1}{P} \cdot \text{grad}_{\text{out}}[:
 
 与 `MultiHeadAttention` 相同的批量化策略，额外施加因果掩码：
 
-$$\text{mask}[i][j] = \begin{cases} 0 & \text{if } j \leq i \\ -\infty & \text{if } j > i \end{cases}$$
+```
+mask[i][j] = 0     if j ≤ i
+           = -∞    if j > i
+```
 
 掩码在 softmax 前施加：`S += mask`
 
@@ -283,8 +317,10 @@ $$\text{mask}[i][j] = \begin{cases} 0 & \text{if } j \leq i \\ -\infty & \text{i
 
 **算法（Pre-Norm）：**
 
-$$x = x + \text{CausalSelfAttn}(\text{LN}_1(x))$$
-$$x = x + \text{FFN}(\text{LN}_2(x))$$
+```
+x = x + CausalSelfAttn(LN_1(x))
+x = x + FFN(LN_2(x))
+```
 
 包含子层：`CausalSelfAttention` + `LayerNorm`×2 + `FeedForward`
 
@@ -316,15 +352,17 @@ $$x = x + \text{FFN}(\text{LN}_2(x))$$
 
 ---
 
-## 📉 Loss 篇
+## Loss 篇
 
 ### 1. MSELoss — 均方误差
 
 **算法：**
 
-$$\text{diff} = \text{pred} - \text{target}$$
-$$\text{loss} = \frac{1}{N} \sum \text{diff}^2$$
-$$\text{grad} = \frac{2}{N} \cdot \text{diff}$$
+```
+diff = pred − target
+loss = (1/N) Σ diff²
+grad = (2/N) · diff
+```
 
 ---
 
@@ -332,26 +370,30 @@ $$\text{grad} = \frac{2}{N} \cdot \text{diff}$$
 
 **算法（数值稳定）：**
 
-$$\text{col\_max} = \text{col\_reduce\_max}(\text{logits})$$
-$$\text{shifted} = \text{logits} - \text{col\_max}$$
-$$\text{exp\_shift} = e^{\text{shifted}}$$
-$$\text{col\_sum} = \text{col\_reduce\_sum}(\text{exp\_shift})$$
-$$\text{softmax} = \text{exp\_shift} / \text{col\_sum}$$
-$$\text{grad} = \text{softmax} - \text{target}$$
-$$\text{log\_sm} = \text{shifted} - \log(\text{col\_sum})$$
-$$\text{loss} = -\frac{1}{\text{batch}} \sum \text{target} \cdot \text{log\_sm}$$
+```
+col_max   = col_reduce_max(logits)
+shifted   = logits − col_max
+exp_shift = e^shifted
+col_sum   = col_reduce_sum(exp_shift)
+softmax   = exp_shift / col_sum
+grad      = softmax − target
+log_sm    = shifted − log(col_sum)
+loss      = −(1/batch) Σ target · log_sm
+```
 
-**Backward：** `grad = softmax - target_onehot`
+**Backward：** `grad = softmax − target_onehot`
 
 ---
 
-## ⚙️ Optimizer 篇
+## Optimizer 篇
 
 ### 1. SGD — 随机梯度下降
 
 **算法：**
 
-$$p \leftarrow p - \eta \cdot g$$
+```
+p ← p − η·g
+```
 
 **引擎原语：** `scale_add_(p, -lr, g)` — 单次 axpy
 
@@ -361,14 +403,17 @@ $$p \leftarrow p - \eta \cdot g$$
 
 **算法：**
 
-$$v \leftarrow \beta \cdot v + (1 - \beta) \cdot g$$
-$$p \leftarrow p - \eta \cdot v$$
+```
+v ← β·v + (1−β)·g
+p ← p − η·v
+```
 
 **引擎原语：**
+
 ```
 engine.scale_inplace(v, β)           // v *= β
-scale_add_(v, 1-β, g)               // v += (1-β)*g
-scale_add_(p, -lr, v)               // p -= lr*v
+scale_add_(v, 1-β, g)                // v += (1-β)*g
+scale_add_(p, -lr, v)                // p -= lr*v
 ```
 
 **参数：** `lr`（学习率）, `beta = 0.9`（动量系数）
@@ -379,12 +424,15 @@ scale_add_(p, -lr, v)               // p -= lr*v
 
 **算法：**
 
-$$m \leftarrow \beta_1 \cdot m + (1 - \beta_1) \cdot g$$
-$$v \leftarrow \beta_2 \cdot v + (1 - \beta_2) \cdot g^2$$
-$$\hat{m} = \frac{m}{1 - \beta_1^t}, \quad \hat{v} = \frac{v}{1 - \beta_2^t}$$
-$$p \leftarrow p - \eta \cdot \frac{\hat{m}}{\sqrt{\hat{v}} + \epsilon}$$
+```
+m ← β₁·m + (1−β₁)·g
+v ← β₂·v + (1−β₂)·g²
+m̂ = m / (1 − β₁ᵗ),   v̂ = v / (1 − β₂ᵗ)
+p ← p − η·(m̂ / (√v̂ + ε))
+```
 
 **引擎原语：**
+
 ```
 // m = β1*m + (1-β1)*g
 engine.scale_inplace(m, β1)
@@ -408,8 +456,8 @@ engine.add_inplace(p, step)
 **参数：** `lr`, `β1=0.9`, `β2=0.999`, `ε=1e-8`
 
 **偏差修正：**
-- `bc1 = 1 - β1^t`（一阶矩偏差修正）
-- `bc2 = 1 - β2^t`（二阶矩偏差修正）
+- `bc1 = 1 − β1ᵗ`（一阶矩偏差修正）
+- `bc2 = 1 − β2ᵗ`（二阶矩偏差修正）
 
 ---
 
@@ -417,53 +465,58 @@ engine.add_inplace(p, step)
 
 **算法：**
 
-$$p \leftarrow (1 - \eta \cdot \lambda) \cdot p \quad \text{（权重衰减，独立于梯度）}$$
-$$m \leftarrow \beta_1 \cdot m + (1 - \beta_1) \cdot g$$
-$$v \leftarrow \beta_2 \cdot v + (1 - \beta_2) \cdot g^2$$
-$$p \leftarrow p - \eta \cdot \frac{\hat{m}}{\sqrt{\hat{v}} + \epsilon}$$
+```
+p ← (1 − η·λ)·p       （权重衰减，独立于梯度）
+m ← β₁·m + (1−β₁)·g
+v ← β₂·v + (1−β₂)·g²
+p ← p − η·(m̂ / (√v̂ + ε))
+```
 
 **与 Adam 的区别：**
 - Adam 的 L2 正则化：`g += λ·p` → 权重衰减被自适应学习率稀释
-- AdamW 的解耦衰减：`p *= (1-η·λ)` → 权重衰减对所有参数等效
+- AdamW 的解耦衰减：`p *= (1−η·λ)` → 权重衰减对所有参数等效
 
 **参数：** `lr`, `β1=0.9`, `β2=0.999`, `ε=1e-8`, `weight_decay=0.01`
 
 ---
 
-### 5. Muon — MomentUm Orthogonalized by Newton-Schulz
+### 5. Muon — Momentum Orthogonalized by Newton-Schulz
 
 **算法（Keller Jordan et al., 2024）：**
 
-对于每个 2D 参数 $p$（权重矩阵）：
+对于每个 2D 参数 `p`（权重矩阵）：
 
-1. **SGD-Momentum：** $v \leftarrow \mu \cdot v + g$
-2. **Newton-Schulz 正交化：** $\text{update} = \text{NS}_5(v)$
-3. **参数更新：** $p \leftarrow p - \eta \cdot \text{update}$
+1. **SGD-Momentum：** `v ← μ·v + g`
+2. **Newton-Schulz 正交化：** `update = NS_5(v)`
+3. **参数更新：** `p ← p − η·update`
 
 对于非 2D 参数（bias 等）：标准 SGD 更新。
 
 #### Newton-Schulz 正交化
 
-**目标：** 计算矩阵 $G$ 的最近半正交矩阵 $\text{Ortho}(G) = UV^T$（$G = USV^T$ 为 SVD）。
+**目标：** 计算矩阵 `G` 的最近半正交矩阵 `Ortho(G) = UV^T`（`G = USV^T` 为 SVD）。
 
 **算法：**
 
-$$X = \frac{G}{\|G\|_F + \epsilon}$$
+```
+X = G / (‖G‖_F + ε)
 
 重复 5 次：
-$$A = X \cdot X^T$$
-$$B = b \cdot A + c \cdot A^2$$
-$$X = a \cdot X + B \cdot X$$
+  A = X · X^T
+  B = b·A + c·A²
+  X = a·X + B·X
+```
 
 **调优系数：** `a = 3.4445`, `b = -4.7750`, `c = 2.0315`
 
-这些系数使 quintic 多项式 $\phi^N(x) \to 1$ for $x \in [0,1]$，5 步内收敛。
+这些系数使 quintic 多项式 `φ^N(x) → 1` for `x ∈ [0,1]`，5 步内收敛。
 
 **参考：**
 - Keller Jordan et al., "Muon: An optimizer for hidden layers in neural networks"
 - https://kellerjordan.github.io/posts/muon/
 
 **引擎原语（每步）：**
+
 ```
 A = engine.matmul(X, X, transB=true)    // X × X^T
 A_sq = engine.matmul(A, A)              // A²
@@ -476,7 +529,7 @@ X = engine.scale(X, a) + BX
 
 ---
 
-## 🏭 优化器工厂函数
+## Optimizer 工厂函数
 
 ```cpp
 auto optimizer = nn::create_optimizer(
@@ -494,7 +547,7 @@ auto optimizer = nn::create_optimizer(
 
 ---
 
-## 📊 各组件复杂度对比
+## 各组件复杂度对比
 
 | 组件 | 参数量 | Forward FLOPs (per sample) | Backward FLOPs |
 |------|--------|---------------------------|----------------|

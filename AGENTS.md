@@ -120,7 +120,7 @@ Matrix → engine.from_matrix → Tensor[GPU] → forward/loss/optimizer 全程�
 | 广播级 | `broadcast_row/col_inplace` |
 | 逐元素 | `elementwise_unary/binary/binary_scalar` |
 | 数据操作 | `slice_rows/insert_rows/gather_rows/scatter_add_rows/rearrange_3d/clone` |
-| 扫描级 | `scan_prefix_outer/scan_suffix_outer/outer_col`（RLA/RAPT，dk≤64，见 docs/15 §7） |
+| 扫描级 | `scan_prefix_outer/scan_suffix_outer/outer_col`（RLA/RAPT，dk≤64，见 docs/development/06 §扫描原语） |
 | 批控制 | `begin_batch/end_batch`（CPU no-op，GPU 录 command buffer） |
 
 ### 4.4 理解优先级（建议学习顺序）
@@ -161,7 +161,7 @@ GPT 序列展平: 列序 i = b*seq + t（batch-major，全局唯一约定）
   1. `scan_exprs`：dry-run 跑 Layer forward/backward，收集折叠出的 `ExprSpec` 结构（去重）→ `build/generated/expr_specs.bin`
   2. `gen_fused`：读 bin → `glsl_gen` 生成 GLSL → glslc → 内联 SPIR-V → `build/generated/fused_registry.hpp`
 - 手写原语 shader 在 `shaders/*.comp`（matmul、matmul_tiled、batched_matmul、reduce、broadcast、elementwise_v2、transpose、gather、scatter_add、rearrange_3d），构建期 glslc 编译并嵌入 C++ 头文件。
-- IR 优化 pass（canonicalize/CSE/寄存器分配/图 IR 融合）见 `expr_opt.hpp` / `expr_graph.hpp`，设计文档 `docs/11-ir-optimization.md`。
+- IR 优化 pass（canonicalize/CSE/寄存器分配/图 IR 融合）见 `expr_opt.hpp` / `expr_graph.hpp`，设计文档 `docs/development/03-ir-optimization.md`。
 
 ## 8. 训练循环范式（写新入口时照抄）
 
@@ -189,7 +189,7 @@ optimizer.step();
 
 - 模型工厂：`nn::build_mnist_mlp_model(engine)` / `build_mnist_transformer_model(engine)` / `build_gpt_model(...)` / `build_gpt_model_from_spec(spec)`。
 - 链式构建：`model.add_linear(784,256).add_relu().add_linear(256,10)`；模板版 `model.add<nn::Linear>(784,256)`。
-- 序列化：`save_model` / `load_model` / `peek_model_spec`（`model_serialization.hpp`，v4 自描述格式）；`.nnpkg` 训练包见 `docs/07-train-package.md`。
+- 序列化：`save_model` / `load_model` / `peek_model_spec`（`model_serialization.hpp`，v4 自描述格式）；`.nnpkg` 训练包见 `docs/usage/04-train-package.md`。
 - GPT 高级特性（`GPTModel`，`compute_layer.hpp` 尾部）：梯度检查点（`checkpoint_every_`）、activation offload、文档感知掩码（`set_doc_ids`）、batch flush 粒度。
 
 ## 9. 关键常量与配置（`core_config.hpp`）
@@ -197,7 +197,7 @@ optimizer.step();
 - `Scalar = float`；`BLOCK_SIZE = 64`（matmul 分块，b_block 栈预算 64KB）；`PARALLEL_THRESHOLD = 524288`（SmartPolicy 并行阈值）。
 - 不使用 `-ffast-math`（保 NaN/Inf，训练稳定性）。
 
-## 10. 高频坑（Top 8，详见 `docs/08-pitfalls-and-lessons.md`）
+## 10. 高频坑（Top 8，详见 `docs/development/08-pitfalls-and-lessons.md`）
 
 1. **布局混用**：position-major vs batch-major → 跨样本串扰、loss 平台期。改序列代码先确认列序约定。
 2. **GPU 双存储影子一致性**：CPU/GPU 双存储是分布式状态机问题；GPU-resident 路径已禁用，走 staging（每次算子往返 PCIe）。
@@ -208,40 +208,45 @@ optimizer.step();
 7. **内存爆炸**："所有出现位置"类索引随输入线性膨胀（BPE 曾 60-80GB）；大词表 one-hot 曾 3.2GB。先做内存预算。
 8. **gradcheck 必须先 forward** 填充 `input_cache_` 再 backward，否则空缓存崩溃。
 
-## 11. 文档索引（docs/）
+## 11. 文档索引（docs/，按类别子目录组织）
+
+### 介绍类（docs/introduction/）
 
 | 文档 | 何时读 |
 |------|--------|
-| `01-architecture.md` | 需要完整分层/数据流/模块详解时（**含快速理解指南和理解路线图**） |
-| `02-performance.md` | 性能优化（SmartPolicy、缓存分块、GPU） |
-| `03-quickstart-model.md` | 构建模型 API 教程 |
-| `04-quickstart-train-infer.md` | 训练/推理 CLI + C++ API + GUI |
-| `05-algorithm-reference.md` | 每个 Layer/Loss/Optimizer 的数学与原语分解 |
-| `06-cuda-backend.md` | CUDA 后端（已停用，恢复参考） |
-| `07-train-package.md` | `.nnpkg` 训练包 |
-| `08-pitfalls-and-lessons.md` | **踩坑警示录，改代码前读** |
-| `09-operator-fusion.md` | 算子融合（M1-M6 已完成） |
-| `10-memory-optimization.md` | 显存优化（L1/L2 已实施） |
-| `11-ir-optimization.md` | IR 优化（IR-A/B/C/D 已实施） |
-| `12-innovative-designs.md` | 创新设计全景 |
-| `13-optimize-proposal-list.md` | 待做优化方案清单 |
-| `14-operator-fusion-2.md` | 融合算子二期：matmul 参与 IR 融合 + 跨 kernel 自动融合（P2-05/P2-10，删 M4-M6 手写原语） |
-| `15-rapt-algorithm.md` | RLA / RAPT：ReLU 线性注意力算法设计与实现说明 |
-| `16-zipt-algorithm.md` | AttnZip / ZiPT：记忆压缩解码器算法设计 |
-| `17-pointer-audit.md` | 指针审查：每处指针的改造难度×价值标注 + nn-allow 关账路线（2026-08-30） |
-| `18-understanding-checklist.md` | **理解检查清单：评估理解程度、识别盲区、制定学习计划** |
-| `19-compute-engine-development.md` | **计算引擎开发指南：接口详解、实现模式、添加新原语** |
-| `20-compute-engine-usage.md` | **计算引擎使用指南：张量操作、矩阵运算、表达式融合** |
-| `21-code-review-2026-09-04.md` | **全库 C++ 代码审查报告（2026-09-04，102 文件，P0×0 / P1×48 / P2×92 / P3×95；CpuEmitter 隐性缺陷相关项是多精度 Phase 2 前置条件，见 23）** |
-| `22-rla2.md` | **RLA-2：极简硬截断线性注意力（修正版）：Sum 归一化 / 无衰减 / RMSNorm，O(Ld²) 训练 + O(d²) 推理** |
-| `23-mixed-precision.md` | **多精度计算（f16/混合精度）设计：Precision 类型系统、类型化存储、硬件/兼容路径分派、显式精度推导（无隐式状态）、PrecisionProfile（param/compute/stable/optimizer）、Phase 1/2 分期与验收（docs/13 P4-03）** |
-| `flash_attn_analysis.md` | 两趟式注意力等价 FlashAttention 的融合算子的分析报告 |
-| `DEVELOPMENT_STANDARDS.md` | C++ 编码规范全文 |
+| `introduction/01-architecture.md` | 需要完整分层/数据流/模块详解时（**含快速理解指南和理解路线图**；CUDA 已停用备注见篇末） |
+| `introduction/02-performance.md` | 性能优化（SmartPolicy、缓存分块、GPU） |
+| `introduction/03-algorithm-reference.md` | 每个 Layer/Loss/Optimizer 的数学与原语分解 |
+| `introduction/04-innovative-designs.md` | 创新设计全景 |
+
+### 开发类（docs/development/）
+
+| 文档 | 何时读 |
+|------|--------|
+| `development/01-compute-engine-development.md` | **计算引擎开发指南：接口详解、实现模式、添加新原语** |
+| `development/02-operator-fusion.md` | **算子融合全篇：IR 扩展（归约语义）→ 表达式录制 → matmul 参与 IR 融合 → 跨 kernel 自动融合（一期 M + 二期 S1-S7 整合，删手写原语）** |
+| `development/03-ir-optimization.md` | IR 优化（IR-A/B/C/D 已实施） |
+| `development/04-memory-optimization.md` | 显存优化（L1 激活重计算 / L2 内存池归还，已实施） |
+| `development/05-mixed-precision.md` | **多精度计算（f16/混合精度）设计：Precision 类型系统、类型化存储、硬件/兼容路径分派、显式精度推导、PrecisionProfile（param/compute/stable/optimizer）、Phase 1/2 分期与验收** |
+| `development/06-rapt-algorithm.md` | **线性注意力家族演进：RLA → RAPT → RLA-2 + 两趟式/flash 等价分析 + GPU 落地** |
+| `development/07-zipt-algorithm.md` | AttnZip / ZiPT：记忆压缩解码器算法设计 |
+| `development/08-pitfalls-and-lessons.md` | **踩坑警示录，改代码前读** |
+| `development/09-code-review-2026-09-04.md` | **全库 C++ 代码审查报告（2026-09-04，102 文件，P0×0 / P1×48 / P2×92 / P3×95；CpuEmitter 隐性缺陷相关项是多精度 Phase 2 前置条件）** |
+| `development/10-development-standards.md` | C++ 编码规范全文 |
+
+### 使用类（docs/usage/）
+
+| 文档 | 何时读 |
+|------|--------|
+| `usage/01-quickstart-model.md` | 构建模型 API 教程 |
+| `usage/02-quickstart-train-infer.md` | 训练/推理 CLI + C++ API + GUI |
+| `usage/03-compute-engine-usage.md` | 计算引擎使用指南：张量操作、矩阵运算、表达式融合 |
+| `usage/04-train-package.md` | `.nnpkg` 训练包 |
 
 
 ## 12. 当前状态（2026-08-28）
 
-### 融合二期（docs/14）完成：S1-S5、S7
+### 融合二期（docs/development/02-operator-fusion.md）完成：S1-S5、S7
 
 S7 关键教训（改融合/IR 代码前必读）：
 

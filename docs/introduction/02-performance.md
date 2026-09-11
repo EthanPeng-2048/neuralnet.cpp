@@ -1,10 +1,10 @@
-# ⚡ 性能优化手段
+# 性能优化手段
 
-> 本文档详细梳理 neuralnet.cpp 项目中的所有性能优化策略，涵盖 CPU 多线程、缓存优化、GPU 加速、内存管理、算法级优化等层面。
+本文档详细梳理 neuralnet.cpp 项目中的所有性能优化策略，涵盖 CPU 多线程、缓存优化、GPU 加速、内存管理、算法级优化等层面。
 
 ---
 
-## 📊 优化全景图
+## 优化全景图
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -14,7 +14,7 @@
 │  L4 GPU 加速  │ Vulkan Compute、批量提交、Command Buffer     │
 │  L3 内存级    │ 缓存分块、零分配热路径、Tensor 零拷贝         │
 │  L2 并行级    │ SmartPolicy 自适应并行、线程池 latch 零分配   │
-│  L1 指令级    │ AVX2 SIMD、-march=native（不使用 -ffast-math）       │
+│  L1 指令级    │ AVX2 SIMD、-march=native（不使用 -ffast-math）│
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -37,7 +37,7 @@ inline constexpr std::size_t PARALLEL_THRESHOLD = 524288;  // 512K 元素
 |--------|---------|---------|--------|------|
 | 16384 | 9.6 | 9.8 | 0.98x | 串行 |
 | 65536 | 38.7 | 121.7 | 0.32x | 串行 |
-| 524288 | 308.7 | 201.5 | **1.53x** | ← 首次稳定 > 1.5x |
+| 524288 | 308.7 | 201.5 | **1.53x** | 首次稳定 > 1.5x |
 | 1048576 | 620.3 | 186.7 | **3.32x** | 并行 |
 | 4194304 | 2657.3 | 340.6 | **7.80x** | 并行 |
 
@@ -123,7 +123,7 @@ for i_block in range(0, M, BLOCK_SIZE):
 
 ### Release 模式编译标志
 
-> ⚠️ **不使用 `-ffast-math`**：为保证 NaN/Inf 传播与训练数值稳定性，项目明确禁用 `-ffast-math`（也禁用 `-funroll-loops`）。实际 Release 标志为 `-O3 -march=native -fno-exceptions -Wall -Wextra -Wpedantic -Werror`（见 `CMakeLists.txt` / `AGENTS.md` §9）。
+> **不使用 `-ffast-math`**：为保证 NaN/Inf 传播与训练数值稳定性，项目明确禁用 `-ffast-math`（也禁用 `-funroll-loops`）。实际 Release 标志为 `-O3 -march=native -fno-exceptions -Wall -Wextra -Wpedantic -Werror`（见 `CMakeLists.txt` / `AGENTS.md` §9）。
 
 ```cmake
 # CMakeLists.txt
@@ -338,7 +338,7 @@ compute::apply(span, expr);
 
 ---
 
-## 📋 优化效果总结
+## 优化效果总结
 
 | 优化手段 | 场景 | 预期收益 |
 |----------|------|----------|

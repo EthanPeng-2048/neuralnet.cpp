@@ -365,6 +365,11 @@ private:
     std::unordered_map<std::string, std::uint32_t> fused_vec_width_;
 
     std::unique_ptr<MemoryPool> memory_pool_;
+    // 第二阶段（P3-2）：瞬态/持久分池。batch 录制期（batch_mode_=true）创建的
+    // 张量（融合临时、每步激活、输入上传等）走 transient_pool_，参数/梯度/权重
+    // （构建期 batch_mode_=false）走 memory_pool_。此拆分**纯组织性**——两池均
+    // 不强制释放，仅按生命周期隔离，避免频繁临时分配在参数常驻块里切出碎片。
+    std::unique_ptr<MemoryPool> transient_pool_;
     std::unique_ptr<StagingRing> staging_ring_;
 
     VkCommandPool command_pool_ = VK_NULL_HANDLE;
@@ -388,7 +393,7 @@ private:
     //   - release_idle_pool_blocks：非阻塞 reap 已完成帧 + 归还空闲块
     // 效果：host 录制 step N+1 与 GPU 执行 step N 重叠；host 只在真正要
     // 读 GPU 数据（logits 探针 / loss 标量 / 日志采样）时阻塞。
-    static constexpr std::size_t PIPELINE_FRAMES = 3;  // 环深度（报告 P0-1: N=3）
+    static constexpr std::size_t PIPELINE_FRAMES = 6;  // 环深度（P0-1: 3→6，加深流水线提重叠度）
     struct Frame
     {
         VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -604,6 +609,7 @@ public:
         }
 
         memory_pool_.reset();
+        transient_pool_.reset();
     }
 
     // 设备丢失状态
@@ -752,8 +758,10 @@ public:
             return std::unexpected(pl_r.error());
         matmul_pipeline_ = std::move(*pl_r);
 
-        // 4. 创建 memory pool
+        // 4. 创建 memory pool（持久 + 瞬态）
         memory_pool_ = std::make_unique<MemoryPool>(
+            device_.device(), device_.physical_device());
+        transient_pool_ = std::make_unique<MemoryPool>(
             device_.device(), device_.physical_device());
 
         // 5. 创建 command pool
@@ -1025,6 +1033,14 @@ public:
 
     [[nodiscard]] VulkanDevice& device() noexcept { return device_; }
     [[nodiscard]] MemoryPool& memory_pool() noexcept { return *memory_pool_; }
+    [[nodiscard]] MemoryPool& transient_pool() noexcept { return *transient_pool_; }
+    // 瞬态/持久分池选择器：batch 录制期→瞬态池，否则→持久池（纯组织性）。
+    // 供 GpuTensorT 分配（create_empty / from_matrix / create_host_visible_empty）
+    // 使用，使批量内的临时/激活与构建期的参数/权重分池驻留。
+    [[nodiscard]] MemoryPool& alloc_pool() noexcept
+    {
+        return batch_mode_ ? *transient_pool_ : *memory_pool_;
+    }
     [[nodiscard]] StagingRing& staging_ring() noexcept { return *staging_ring_; }
     [[nodiscard]] VkCommandPool command_pool() const noexcept { return command_pool_; }
     [[nodiscard]] VkDescriptorPool gpu_tensor_pool() const noexcept { return gpu_tensor_pool_; }
@@ -1070,6 +1086,8 @@ public:
             }
         }
         memory_pool_->release_idle_blocks();
+        if (transient_pool_)
+            transient_pool_->release_idle_blocks();
         return {};
     }
 

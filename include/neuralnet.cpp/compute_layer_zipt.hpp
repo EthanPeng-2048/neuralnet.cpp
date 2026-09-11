@@ -795,7 +795,7 @@ public:
     // ZiPT 未实现 forward_recompute（压缩器 CrossAttention 与 ZiPTBlock 都无
     // 重计算路径）。梯度检查点（激活重计算）需要 forward_recompute 才能在
     // backward 时重建缓存；若被请求，明确中止而非静默产生错误结果。
-    // 已知限制：见 docs/12-innovative-designs.md §10。
+    // 已知限制：见 docs/introduction/04-innovative-designs.md §10。
     void set_checkpoint_every(std::size_t /*stride*/) override
     {
         std::fprintf(stderr, "FATAL: ZiPTModel does not support gradient checkpointing "
@@ -1072,7 +1072,7 @@ public:
 // ══════════════════════════════════════════════════════════════════════════
 // ReLULinearAttention — ReLU 线性注意力（RLA / RAPT 核心层）
 //
-// 算法（docs/15-rapt-algorithm.md §3，causal 版；bidirectional 亦支持）：
+// 算法（docs/development/06-rapt-algorithm.md §3，causal 版；bidirectional 亦支持）：
 //   q' = ReLU(RoPE(q)), k' = ReLU(RoPE(k)), v = V·W_v（V 不做 ReLU）
 //   分子 num_t  = Σ_{i∈S_t} (q'_t·k'_i) v_i  = B_t · q'_t,   B_t = Σ_{i∈S_t} v_i k'_i^T
 //   分母 den_t  = sqrt( Σ_{i∈S_t} (q'_t·k'_i)^2 + eps )

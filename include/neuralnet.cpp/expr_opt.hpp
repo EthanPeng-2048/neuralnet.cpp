@@ -3,7 +3,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 //  expr_opt.hpp — ExprSpec 规范化与优化 pass（IR-A + IR-B）
 //
-//  对应文档 `docs/11-ir-optimization.md`：
+//  对应文档 `docs/development/03-ir-optimization.md`：
 //    - IR-A：canonicalize_expr_spec（DCE / 常量折叠 / 代数化简 / 稳定重编号）
 //    - IR-B：CSE（公共子表达式消除）+ 寄存器分配（liveness 线性扫描）
 //

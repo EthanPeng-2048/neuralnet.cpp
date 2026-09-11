@@ -1,8 +1,8 @@
-# 🚀 neuralnet.cpp 创新设计总览
+# neuralnet.cpp 创新设计总览
 
-> 本文档汇总本项目中所有具有**原创性或系统性思考**的设计。它不是架构/性能/融合等专项文档的重复，而是从"为什么这么做、创新点在哪、带来什么收益"的角度，把这些设计串成一张全景图。
->
-> 关联文档：[01-architecture](./01-architecture.md) · [02-performance](./02-performance.md) · [09-operator-fusion](./09-operator-fusion.md) · [10-memory-optimization](./10-memory-optimization.md) · [11-ir-optimization](./11-ir-optimization.md) · [05-algorithm-reference](./05-algorithm-reference.md)
+本文档汇总本项目中所有具有**原创性或系统性思考**的设计。它不是架构/性能/融合等专项文档的重复，而是从"为什么这么做、创新点在哪、带来什么收益"的角度，把这些设计串成一张全景图。
+
+关联文档：`01-architecture` · `02-performance` · `03-algorithm-reference`（介绍类）；专项设计见 `docs/` 下的融合、优化、IR 等文档。
 
 ---
 
@@ -23,7 +23,7 @@
 | **IR** | 带确定性 pass 的规范 IR | DCE/常量折叠/CSE/寄存器分配，key 定义在 canonical IR 上 |
 | **算法** | 纯 BPE + 兜底词表自举 | 小模型也能稳定启动、支持中文 |
 | **算法** | ZiPT 注意力压缩（AttnZip） | 可学习记忆查询把长上下文压成记忆 token，O(L²)→O(L) |
-| **算法** | RAPT 注意力门控（RLA） | 利用RoPE硬截断无用token |
+| **算法** | RAPT 注意力门控（RLA） | 利用 RoPE 硬截断无用 token |
 
 下面逐条展开。
 
@@ -33,7 +33,7 @@
 
 ### 1.1 引擎化架构（Engine-Based）
 
-**创新点**：让 `Layer::forward/backward` 只写一次，通过传入的 `ComputeEngine` 自动适配 CPU / GPU 双后端（CUDA 已停用，见 `docs/13-optimize-proposal-list.md` §5），而不是像多数教学框架那样为每后端各写一份。
+**创新点**：让 `Layer::forward/backward` 只写一次，通过传入的 `ComputeEngine` 自动适配 CPU / GPU 双后端（CUDA 已停用），而不是像多数教学框架那样为每后端各写一份。
 
 ```cpp
 class Layer {
@@ -59,7 +59,7 @@ Shader / 融合逻辑是引擎内部实现，用户不可见
 **创新点**：不是把"引擎是否认识 softmax"当实现细节，而是把它当一条**不可逾越的红线**。引擎只认**结构**（如 `reduce(matmul(A,B))`），绝不认**算法名**。这使得算子融合、IR 优化、新后端都能在一个稳定的契约上展开。
 
 配套约束：
-- `ComputEngine` 原语可"专"（matmul+归约、matmul+softmax分母都是合法原语）但必须通用可复用、不叫算法名。
+- `ComputeEngine` 原语可"专"（matmul+归约、matmul+softmax 分母都是合法原语）但必须通用可复用、不叫算法名。
 - 全程 `noexcept` / `Result<T>`（`std::expected`），零手动内存管理（`-fno-exceptions`）。
 
 ### 1.3 统一张量 `Tensor` + 零拷贝
@@ -115,7 +115,7 @@ key 定义在 **canonical（优化后）IR** 上，scan 与 runtime 两端必须
 
 ### 3.3 三个 matmul 融合原语
 
-为承载两趟注意力，新增了一组**通用、可复用**的原语（不是"attention"，而是"matmul 后接结构"）：
+为承载两趟注意力，新增了一组**通用、可复用**的原语（不是 "attention"，而是 "matmul 后接结构"）：
 
 - `batched_matmul_reduce`：matmul 后沿输出维度归约，不物化中间 `A·B`。
 - `batched_matmul_softmax_denom`：减行 max → exp → 按列求和（softmax 分母，数值稳定）。
@@ -123,7 +123,7 @@ key 定义在 **canonical（优化后）IR** 上，scan 与 runtime 两端必须
 
 反向同样有 `..._softmax_backward_q` / `..._softmax_backward_kv`，kernel 内部重算权重矩阵。
 
-### 3.4 形状无关融合（Key 创新）
+### 3.4 形状无关融合（关键创新）
 
 RoPE 的 `RowMod/RotateHalf` 参数如果以**结构常量**折进 key，每个 `d_k` 就要一个新融合 shader → 闭合世界无法穷举。
 
@@ -141,7 +141,7 @@ RoPE 的 `RowMod/RotateHalf` 参数如果以**结构常量**折进 key，每个 
 
 把 `scores → mask → softmax → ×V` 拆成**不物化 `seq²` 矩阵**的算法：
 
-- **Forward**：`m = max of QᵀK`（bmm_reduce）→ `l = Σ exp(QᵀK - m)`（bmm_denom）→ `O = W·V` 逐 tile（bmm_apply）。只留下 `m/l`（`H·batch·seq`）与 `O`（`H·batch·d_k·seq`）。
+- **Forward**：`m = max of QᵀK`（bmm_reduce）→ `l = Σ exp(QᵀK − m)`（bmm_denom）→ `O = W·V` 逐 tile（bmm_apply）。只留下 `m/l`（`H·batch·seq`）与 `O`（`H·batch·d_k·seq`）。
 - **Backward**：默认**反向重算 W**（用原语再算一次），放弃 `attn_cache_`。代价是 2× FLOPs，换整份 `BH·seq²` 缓存。
 
 ### 4.3 收益
@@ -242,44 +242,48 @@ canonicalize 不改变 views/inputs 的顺序与内容，只优化 instrs/consts
 
 ## 10. ZiPT — 注意力压缩（AttnZip 记忆压缩）
 
-**一句话**：用可学习的"记忆查询"把长上下文压缩成少量记忆 token，再逐块对 [记忆; 局部] 做联合注意力，把自注意力从 O(L²) 降为 O(L)。
+**一句话**：用可学习的"记忆查询"把长上下文压缩成少量记忆 token，再逐块对 `[记忆; 局部]` 做联合注意力，把自注意力从 O(L²) 降为 O(L)。
 
 ### 10.1 核心思想
 
-标准 Self-Attention 的 O(L²) 是长上下文瓶颈。主流解法（线性注意力 / SSM / 带门控变体）往往引入大量工程补丁。ZiPT（zip + GPT）回归极简：**核心算子仅为标准 Softmax 与矩阵乘法**，通过一组可学习记忆查询矩阵 $P\,(M\times d,\,M\ll L)$ 做交叉注意力，把长度为 $L$ 的上下文压缩为 $M$ 个连续的"信息 Token"：
+标准 Self-Attention 的 O(L²) 是长上下文瓶颈。主流解法（线性注意力 / SSM / 带门控变体）往往引入大量工程补丁。ZiPT（zip + GPT）回归极简：**核心算子仅为标准 Softmax 与矩阵乘法**，通过一组可学习记忆查询矩阵 `P (M×d, M≪L)` 做交叉注意力，把长度为 `L` 的上下文压缩为 `M` 个连续的"信息 Token"：
 
-$$A = \text{Softmax}(P K^T/\sqrt{d}),\quad C = A V$$
+```
+A = Softmax(P Kᵀ/√d),   C = A V
+```
 
-Softmax 行和为 1 的归一化本质，使模型天然获得 $M$ 个"注意力预算"，自动把高权重分给重要 Token——**Softmax 即重要性分配器**。
+Softmax 行和为 1 的归一化本质，使模型天然获得 `M` 个"注意力预算"，自动把高权重分给重要 Token——**Softmax 即重要性分配器**。
 
 ### 10.2 创新点
 
-- **结构 > 命名（呼应 §1.2 铁律）**：核心算子仅为标准 Attention，无门控、无状态递推、无卷积，与项目"引擎认结构不认算法名"的哲学天然一致，实现极简。
-- **隐变量不还原文本**：$C$ 是稠密语义隐变量，作为条件 / 上下文供解码读取，无需"压缩→还原→生成"的冗余路径。
-- **与 FlashAttention 天然兼容**：阶段一注意力矩阵为 $M\times L$（线性），阶段二为 $W\times(M+W)$（常数），无需自定义 kernel。
-- **可解释性强**：可视化阶段一注意力矩阵 $A$ 即可观察模型认为哪些 Token 重要（白盒特性）。
-- **容量可调**：通过 $M$ 在"记忆容量"与"算力"间平滑 trade-off。
+- **结构 > 命名（呼应 1.2 铁律）**：核心算子仅为标准 Attention，无门控、无状态递推、无卷积，与项目"引擎认结构不认算法名"的哲学天然一致，实现极简。
+- **隐变量不还原文本**：`C` 是稠密语义隐变量，作为条件/上下文供解码读取，无需"压缩→还原→生成"的冗余路径。
+- **与 FlashAttention 天然兼容**：阶段一注意力矩阵为 `M×L`（线性），阶段二为 `W×(M+W)`（常数），无需自定义 kernel。
+- **可解释性强**：可视化阶段一注意力矩阵 `A` 即可观察模型认为哪些 Token 重要（白盒特性）。
+- **容量可调**：通过 `M` 在"记忆容量"与"算力"间平滑 trade-off。
 
 ### 10.3 实现落地（引擎化）
 
 - 新增 `domain_zipt.hpp` + `compute_layer.hpp` 中三个层类：`CrossAttention`（阶段一压缩）、`ZiPTBlock`（阶段二联合注意力）、`ZiPTModel`。
-- **只用既有引擎原语**（`batched_matmul` / `rearrange_3d` / `transpose` / `insert_rows` / `Softmax`）→ CPU/GPU 同码、零新 shader、无需重跑 AOT 融合（呼应 §1.1 引擎化）。
-- **复杂度**：阶段一 $O(M\cdot L\cdot d)$（线性），阶段二 $O(W\cdot(M+W)\cdot d)$（常数）——彻底消除 O(L²) 瓶颈。
-- **可验证增量里程碑（呼应「可验证增量里程碑」方法）**：`CrossAttention`/`ZiPTBlock` 全参数 gradcheck + CPU/GPU 一致性 + 端到端训练 loss 下降，全部通过。
+- **只用既有引擎原语**（`batched_matmul` / `rearrange_3d` / `transpose` / `insert_rows` / `Softmax`）→ CPU/GPU 同码、零新 shader、无需重跑 AOT 融合（呼应 1.1 引擎化）。
+- **复杂度**：阶段一 `O(M·L·d)`（线性），阶段二 `O(W·(M+W)·d)`（常数）——彻底消除 O(L²) 瓶颈。
+- **可验证增量里程碑**：`CrossAttention`/`ZiPTBlock` 全参数 gradcheck + CPU/GPU 一致性 + 端到端训练 loss 下降，全部通过。
 
 ### 10.4 局限与应对
 
-- **有损压缩**：$M\ll L$ 时极端长尾细节可能丢失 → 保留局部窗口 $W$（近端不压缩，确保短期精确信息）。
-- **重要性评估滞后**：压缩时未必预知未来问题 → 多层中间隔若干层重复压缩，让不同层 $P$ 学不同抽象层级。
+- **有损压缩**：`M≪L` 时极端长尾细节可能丢失 → 保留局部窗口 `W`（近端不压缩，确保短期精确信息）。
+- **重要性评估滞后**：压缩时未必预知未来问题 → 多层中间隔若干层重复压缩，让不同层 `P` 学不同抽象层级。
 - **实现简化**：当前阶段一压缩整序列（含相对未来 token）；严格因果需压缩 prefix-only（待做）；`generate` 用重计算式（O(seq²)，KV cache 待做）。
 
 ### 10.5 收益
 
 | 项 | 收益 |
 |----|------|
-| 计算复杂度 | $O(L²) \to O(M\cdot L\cdot d + W\cdot(M+W)\cdot d)$，长上下文下 O(L) 主导 |
-| 显存 | 注意力矩阵 $M\times L$（线性）与 $W\times(M+W)$（常数），不实例化 $L²$ |
+| 计算复杂度 | O(L²) → O(M·L·d + W·(M+W)·d)，长上下文下 O(L) 主导 |
+| 显存 | 注意力矩阵 M×L（线性）与 W×(M+W)（常数），不实例化 L² |
 | 代码量 | 核心算子仅标准 Attention，无自定义 kernel |
+
+---
 
 ## 11. 创新背后的工程方法
 
@@ -292,11 +296,11 @@ Softmax 行和为 1 的归一化本质，使模型天然获得 $M$ 个"注意力
 | **闭合世界 + 硬报错** | 不静默降级，宁可报错暴露覆盖缺口 |
 | **恶意保守的正确性安全网** | GPU 融合未命中/失败回退原语组合；融合路径与回退路径数值一致并互相验证 |
 | **数值确定性** | 全程 fp32、定点可复现，优化 pass 不改变浮点语义 |
-| **可验证增量里程碑** | M1-M6 每步有独立测试验证（gradcheck / GRUD/CPU 对照），先小层数回归再全面放开 |
+| **可验证增量里程碑** | M1-M6 每步有独立测试验证（gradcheck / CPU 对照），先小层数回归再全面放开 |
 
 ---
 
-## 12. 收益一栏
+## 12. 收益一览
 
 | 设计 | 量化收益（示例配置） |
 |------|---------------------|
@@ -308,6 +312,4 @@ Softmax 行和为 1 的归一化本质，使模型天然获得 $M$ 个"注意力
 | 融合 axpy | 每 step 减少 ~600 次 GPU buffer 分配 |
 | 注意力批量化 | H 次 matmul → 1 次 batched_matmul |
 
----
-
-> 🌙 本文档为创新设计的**全景速览**，不替代各专项文档的细节。想要深入的读者请跳转文首的关联文档。
+> 本文档为创新设计的**全景速览**，不替代各专项文档的细节。想要深入的读者请跳转文首的关联文档。

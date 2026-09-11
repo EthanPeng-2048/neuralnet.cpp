@@ -26,7 +26,7 @@ inline Result<GpuTensorT<P>> GpuTensorT<P>::from_matrix(const MatrixT<P>& cpu_ma
     // buffer 字节数 = 元素数 × sizeof(elem<P>)（§6.3）
     const std::size_t byte_count = cpu_mat.size() * sizeof(elem<P>);
     auto buf_res = GpuBuffer::create_device_local(
-        backend.device().device(), backend.memory_pool(),
+        backend.device().device(), backend.alloc_pool(),
         byte_count,
         TENSOR_BUFFER_USAGE);
     if (!buf_res)
@@ -53,7 +53,7 @@ inline Result<GpuTensorT<P>> GpuTensorT<P>::create_empty(
     // TRANSFER_DST_BIT: 允许 vkCmdFillBuffer (zero) 和 vkCmdCopyBuffer (insert_rows) 写入
     // TRANSFER_SRC_BIT: 允许 vkCmdCopyBuffer (clone/slice_rows) 读取
     auto buf_res = GpuBuffer::create_device_local(
-        backend.device().device(), backend.memory_pool(),
+        backend.device().device(), backend.alloc_pool(),
         byte_count,
         TENSOR_BUFFER_USAGE);
     if (!buf_res)
@@ -70,7 +70,7 @@ inline Result<GpuTensorT<P>> GpuTensorT<P>::create_host_visible_empty(
     // 仅用于 vkCmdCopyBuffer 中转（TRANSFER_DST/SRC）。
     const std::size_t byte_count = rows * cols * sizeof(elem<P>);
     auto buf_res = GpuBuffer::create_host_visible(
-        backend.device().device(), backend.memory_pool(),
+        backend.device().device(), backend.alloc_pool(),
         byte_count,
         TENSOR_BUFFER_USAGE);
     if (!buf_res)

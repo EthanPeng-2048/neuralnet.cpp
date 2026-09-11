@@ -1,6 +1,6 @@
 #pragma once
 
-// ── precision.hpp — 多精度类型系统（docs/23-mixed-precision.md）──────────────
+// ── precision.hpp — 多精度类型系统（docs/development/05-mixed-precision.md）──────────────
 // L1 语义层（设备无关）：
 //   - Precision 枚举：F16 / F32（BF16 / F64 为保留值，Phase 1 使用 → 清晰报错）
 //   - nn::f16：IEEE binary16 值类型（uint16 位布局，与 GPU R16F 内存布局一致，
