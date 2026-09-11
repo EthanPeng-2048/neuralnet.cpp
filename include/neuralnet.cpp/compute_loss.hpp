@@ -125,11 +125,22 @@ class CrossEntropyLoss final : public Loss
 private:
     Tensor grad_input_;
 
-    // ── 按列 softmax（dense/sparse forward 共用）──────────────────────
+    // ── 按列 softmax 的稠密结果：既给 grad（softmax），也给数值稳定的
+    //    log_softmax（= shifted - log(col_sum)，避免 0*log(0)=NaN，见 M3）。
+    struct DenseSoftmax
+    {
+        Tensor softmax;     // (classes, batch)
+        Tensor log_softmax; // (classes, batch) = shifted - log(col_sum)
+    };
+
+    // ── 按列 softmax（稠密 forward 使用）──────────────────────────────
     // col_max → col_sum = col_softmax_denom（M5 融合，不物化 exp 中间张量）
     //         → softmax = exp(logits - col_max) / col_sum
-    // 返回 (classes, batch) 的 softmax 张量
-    [[nodiscard]] static Result<Tensor> softmax_cols_(
+    // 同时计算数值稳定的 log_softmax = (logits - col_max) - log(col_sum)：
+    //   直接 log(softmax) 在极负 logits/大词表下 softmax→0 → log→-inf，
+    //   与 target=0 相乘得 0*(-inf)=NaN；稳定形式中 shifted 与 log(col_sum)
+    //   均有限，可避免该 NaN（稠密/软标签路径，稀疏 kernel 已用稳定形式）。
+    [[nodiscard]] static Result<DenseSoftmax> softmax_cols_(
         ComputeEngine& engine, const Tensor& logits)
     {
         auto col_max = engine.col_reduce_max(logits);
@@ -150,7 +161,16 @@ private:
         // softmax 就地于 exp_shift 上，省一次 (classes, batch) 分配
         r = engine.broadcast_col_inplace(*exp_shift, *col_sum, BinaryOp::Div);
         if (!r) return std::unexpected(r.error());
-        return exp_shift;
+
+        // 稳定 log_softmax = shifted - log(col_sum)
+        // col_sum ≥ 1（因 max 元素 shifted=0 → exp=1），故 log(col_sum) 有限
+        auto log_col_sum = engine.elementwise_unary(UnaryOp::Log, *col_sum);
+        if (!log_col_sum) return std::unexpected(log_col_sum.error());
+        auto log_softmax = engine.elementwise_binary(BinaryOp::Sub, *shifted, *log_col_sum);
+        if (!log_softmax) return std::unexpected(log_softmax.error());
+
+        return DenseSoftmax{/*softmax=*/std::move(*exp_shift),
+                            /*log_softmax=*/std::move(*log_softmax)};
     }
 
 public:
@@ -167,28 +187,26 @@ public:
         if (classes == 0 || batch == 0)
             return std::unexpected(Error{"cross_entropy loss: empty input"});
 
-        // 1. softmax = softmax_cols(logits)（与 sparse 路径共用）
-        auto softmax = softmax_cols_(engine, logits);
-        if (!softmax) return std::unexpected(softmax.error());
+        // 1. softmax / log_softmax = softmax_cols(logits)（稳定形式，见 M3）
+        auto sm = softmax_cols_(engine, logits);
+        if (!sm) return std::unexpected(sm.error());
 
         // 2. grad = (softmax - target) / batch (elementwise Sub + scale)
         //    loss = -(1/batch) * Σ target * log_softmax，故
         //    d(loss)/d(logits) = (softmax - one_hot) / batch。
         //    缺少 1/batch 缩放会使 SGD/动量、梯度裁剪与 PyTorch 不一致
         //    （Adam 的二阶矩会抵消常数缩放，但其他优化器不会）。
-        auto grad = engine.elementwise_binary(BinaryOp::Sub, *softmax, target);
+        auto grad = engine.elementwise_binary(BinaryOp::Sub, sm->softmax, target);
         if (!grad) return std::unexpected(grad.error());
         auto rg = engine.scale_inplace(*grad, Scalar{1} / static_cast<Scalar>(batch));
         if (!rg) return std::unexpected(rg.error());
         grad_input_ = *grad;
 
-        // 3. log_softmax = log(softmax)
-        //    数学上等价于 shifted - log(col_sum)，少一次 clone + broadcast
-        auto log_softmax = engine.elementwise_unary(UnaryOp::Log, *softmax);
-        if (!log_softmax) return std::unexpected(log_softmax.error());
+        // 3. log_softmax 已在 softmax_cols_ 内以数值稳定形式算出
+        //    （= shifted - log(col_sum)，避免 0*log(0)=NaN，见 M3）
 
         // 4. target_dot_log = target * log_softmax
-        auto target_dot_log = engine.elementwise_binary(BinaryOp::Mul, target, *log_softmax);
+        auto target_dot_log = engine.elementwise_binary(BinaryOp::Mul, target, sm->log_softmax);
         if (!target_dot_log) return std::unexpected(target_dot_log.error());
 
         // 5. Σ target * log_softmax (先列归约再行归约 → (1,1))

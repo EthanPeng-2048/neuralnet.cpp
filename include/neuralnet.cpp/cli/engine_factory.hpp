@@ -43,7 +43,7 @@ namespace nn::cli
     // 返回 Result：显式请求的后端不可用（初始化失败/未编译）时返回错误，
     // **不回退 CPU**；成功返回引擎并打印选择信息到 log。
     [[nodiscard]] inline nn::Result<std::unique_ptr<nn::ComputeEngine>> create_engine(
-        const EngineConfig &cfg, std::ostream &log = std::cerr)
+        const EngineConfig &cfg, [[maybe_unused]] std::ostream &log = std::cerr)
     {
         // 优先级：CUDA > Vulkan > CPU
         if (cfg.use_cuda)

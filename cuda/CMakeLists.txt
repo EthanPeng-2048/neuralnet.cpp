@@ -1,5 +1,12 @@
 # ── cuda/CMakeLists.txt — CUDA 计算后端（独立 nvcc 编译）────────────────────
 #
+# TODO(1.1): 本后端已随 1.0.0 停用，主项目 CMakeLists 不再 add_subdirectory(cuda)。
+#   停用原因见 CMakeLists.txt 顶部 CUDA 段 TODO：M4/M5/M6 融合原语与 DSL 表达式
+#   在 CUDA 上未实现且无真实回退，CUDA 训练/推理已损坏。恢复时同步处理：
+#     - cuda_engine.hpp 的 batched_matmul_* / col_softmax_* 融合原语未实现回退；
+#     - 本文件硬编码的 MSVC 版本路径（WIN32 分支）需改为可移植定位；
+#     - CUDA 内核 --use_fast_math 与主机侧数值语义不一致问题。
+#
 # 跨平台 nvcc 编译：
 #   - Windows：nvcc 以 MSVC 为 host 编译器，需 vcvars64 环境 + MSVC CRT 标志，
 #             输出 .obj，链接到主 Clang 项目（C ABI 兼容）。

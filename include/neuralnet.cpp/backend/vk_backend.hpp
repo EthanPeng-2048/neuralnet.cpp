@@ -1012,6 +1012,9 @@ public:
     {
         // 故意泄漏（进程退出时由 OS 回收）：避免静态析构顺序问题——
         // 全局 GpuTensor 的析构可能晚于 backend，届时访问 instance() 会 UB。
+        // TODO(1.1, L1): 若作为库被长驻进程 embed，此泄漏会持续累积
+        //   （vkDestroyDevice/vkDestroyInstance/vkFreeMemory 永不调用）。
+        //   恢复方案：显式 shutdown() + 引用计数，或进程级一次清理。
         static GpuBackend* backend = new GpuBackend();
         return *backend;
     }

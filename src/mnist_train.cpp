@@ -37,7 +37,7 @@
 
 using nn::Scalar;
 
-enum class ArchType { MLP, Transformer };
+enum class ArchType { MLP, Transformer, CNN };
 
 // ==================== 帮助信息 ====================
 void print_usage(const char *prog)
@@ -78,6 +78,12 @@ void print_usage(const char *prog)
         << "  --osc-window <n>   振荡检测窗口大小 (默认: 20)\n"
         << "  --osc-threshold <f> 振荡反转率阈值 (默认: 0.55)\n"
         << "\n"
+        << "CNN 专用 (LeNet-5 风格):\n"
+        << "  --cnn-channels <c1,c2,...> 每个卷积层输出通道 (默认: 6,16)\n"
+        << "  --cnn-kernels <k1,k2,...>  每个卷积核大小 (默认: 5,5)\n"
+        << "  --cnn-pool <n>      每个卷积后的 MaxPool 窗口 (默认: 2, 0=无池化)\n"
+        << "  --cnn-fc <d1,d2,...> 展平后的全连接头 (默认: 120,10，末位为类别数)\n"
+        << "\n"
         << "学习率调度:\n"
         << "  --lr-schedule <type> 学习率调度: fixed/cosine (默认: fixed)\n"
         << "                   cosine: 余弦退火，lr 从初始值衰减到 min-lr\n"
@@ -117,6 +123,14 @@ struct TrainConfig
     std::size_t patch_size = nn::MNIST_PATCH_SIZE;
     std::size_t eval_samples = 200;  // Transformer 评估样本上限
 
+    // CNN 参数（LeNet-5 风格默认）
+    std::size_t cnn_in_channels = 1;
+    std::size_t cnn_in_size     = 28;
+    std::size_t cnn_pool        = 2;
+    std::vector<std::size_t> cnn_channels;  // 每卷积输出通道
+    std::vector<std::size_t> cnn_kernels;   // 每卷积核大小
+    std::vector<std::size_t> cnn_fc_dims;   // 全连接头（不含展平输入）
+
     // 学习率调度
     std::string lr_schedule = "fixed";  // fixed / cosine
     int warmup_epochs = 0;              // 线性预热轮数
@@ -154,9 +168,11 @@ TrainConfig parse_args(int argc, char *argv[])
                 cfg.arch = ArchType::MLP;
             else if (v == "transformer" || v == "tf")
                 cfg.arch = ArchType::Transformer;
+            else if (v == "cnn")
+                cfg.arch = ArchType::CNN;
             else
             {
-                std::cerr << "未知 --arch: " << v << "，可选: mlp, transformer\n";
+                std::cerr << "未知 --arch: " << v << "，可选: mlp, transformer, cnn\n";
                 std::exit(1);
             }
         }
@@ -248,6 +264,54 @@ TrainConfig parse_args(int argc, char *argv[])
             if (!v) { std::cerr << "无效 --eval-samples: " << v.error().message << "\n"; std::exit(1); }
             cfg.eval_samples = *v;
         }
+        else if (arg == "--cnn-channels" && i + 1 < argc)
+        {
+            std::string dims_str = argv[++i];
+            std::stringstream ss(dims_str);
+            std::string token;
+            while (std::getline(ss, token, ','))
+            {
+                auto v = nn::parse_number<std::size_t>(token);
+                if (!v) { std::cerr << "无效 --cnn-channels: " << v.error().message << "\n"; std::exit(1); }
+                if (*v == 0) { std::cerr << "--cnn-channels 不能为 0\n"; std::exit(1); }
+                cfg.cnn_channels.push_back(*v);
+            }
+            if (cfg.cnn_channels.empty()) { std::cerr << "--cnn-channels 至少需要一个值\n"; std::exit(1); }
+        }
+        else if (arg == "--cnn-kernels" && i + 1 < argc)
+        {
+            std::string dims_str = argv[++i];
+            std::stringstream ss(dims_str);
+            std::string token;
+            while (std::getline(ss, token, ','))
+            {
+                auto v = nn::parse_number<std::size_t>(token);
+                if (!v) { std::cerr << "无效 --cnn-kernels: " << v.error().message << "\n"; std::exit(1); }
+                if (*v == 0) { std::cerr << "--cnn-kernels 不能为 0\n"; std::exit(1); }
+                cfg.cnn_kernels.push_back(*v);
+            }
+            if (cfg.cnn_kernels.empty()) { std::cerr << "--cnn-kernels 至少需要一个值\n"; std::exit(1); }
+        }
+        else if (arg == "--cnn-pool" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --cnn-pool: " << v.error().message << "\n"; std::exit(1); }
+            cfg.cnn_pool = *v;
+        }
+        else if (arg == "--cnn-fc" && i + 1 < argc)
+        {
+            std::string dims_str = argv[++i];
+            std::stringstream ss(dims_str);
+            std::string token;
+            while (std::getline(ss, token, ','))
+            {
+                auto v = nn::parse_number<std::size_t>(token);
+                if (!v) { std::cerr << "无效 --cnn-fc: " << v.error().message << "\n"; std::exit(1); }
+                if (*v == 0) { std::cerr << "--cnn-fc 不能为 0\n"; std::exit(1); }
+                cfg.cnn_fc_dims.push_back(*v);
+            }
+            if (cfg.cnn_fc_dims.size() < 2) { std::cerr << "--cnn-fc 至少需要 2 个维度\n"; std::exit(1); }
+        }
         else if (arg == "--shuffle-steps" && i + 1 < argc)
         {
             std::string v = argv[++i];
@@ -285,6 +349,41 @@ TrainConfig parse_args(int argc, char *argv[])
 }
 
 // ==================== 构建模型规格 ====================
+// 从 CLI 配置构建 CNN 配置（未指定的项用 LeNet-5 默认补齐）
+nn::CnnConfig build_cnn_config(const TrainConfig &cfg)
+{
+    nn::CnnConfig c;
+    c.in_channels = cfg.cnn_in_channels;
+    c.in_size     = cfg.cnn_in_size;
+    c.pool        = cfg.cnn_pool;
+
+    std::vector<std::size_t> channels = cfg.cnn_channels;
+    std::vector<std::size_t> kernels  = cfg.cnn_kernels;
+    if (channels.empty() && kernels.empty())
+    {
+        channels = {6, 16};
+        kernels  = {5, 5};
+    }
+    else if (channels.empty())
+    {
+        channels.assign(kernels.size(), 6);
+    }
+    else if (kernels.empty())
+    {
+        kernels.assign(channels.size(), 5);
+    }
+    else if (channels.size() != kernels.size())
+    {
+        std::cerr << "--cnn-channels 与 --cnn-kernels 长度必须一致\n";
+        std::exit(1);
+    }
+    for (std::size_t i = 0; i < channels.size(); ++i)
+        c.convs.push_back({channels[i], kernels[i]});
+
+    c.fc_dims = cfg.cnn_fc_dims.empty() ? std::vector<std::size_t>{120, 10} : cfg.cnn_fc_dims;
+    return c;
+}
+
 nn::ModelSpec build_spec(const TrainConfig &cfg)
 {
     if (cfg.arch == ArchType::Transformer)
@@ -292,6 +391,12 @@ nn::ModelSpec build_spec(const TrainConfig &cfg)
         return nn::make_mnist_transformer_spec(
             cfg.patch_size,
             cfg.d_model, cfg.num_heads, cfg.d_ff, cfg.num_layers);
+    }
+    if (cfg.arch == ArchType::CNN)
+    {
+        nn::CnnConfig c = build_cnn_config(cfg);
+        std::vector<nn::CnnConvSpec> convs = c.convs;
+        return nn::make_cnn_spec(c.in_channels, c.in_size, c.pool, convs, c.fc_dims);
     }
     // MLP
     nn::ModelSpec spec;
@@ -332,6 +437,18 @@ int main(int argc, char *argv[])
                 cfg.d_ff = spec.d_ff;
                 cfg.num_layers = spec.num_layers;
             }
+            else if (spec_result->is_cnn())
+            {
+                std::cout << "从模型文件读取 CNN 规格\n";
+                spec = std::move(*spec_result);
+                cfg.arch = ArchType::CNN;
+                cfg.cnn_in_channels = spec.cnn_in_channels;
+                cfg.cnn_in_size     = spec.cnn_in_size;
+                cfg.cnn_pool        = spec.cnn_pool;
+                cfg.cnn_channels    = spec.cnn_channels;
+                cfg.cnn_kernels     = spec.cnn_kernels;
+                cfg.cnn_fc_dims     = spec.layer_dims;
+            }
             else
             {
                 std::cerr << "模型文件类型不支持 (type="
@@ -350,9 +467,28 @@ int main(int argc, char *argv[])
     std::cout << "========================================\n";
     std::cout << "  MNIST 手写数字训练 (引擎化架构)\n";
     std::cout << "========================================\n";
-    std::cout << "  架构: " << (cfg.arch == ArchType::Transformer ? "Transformer (ViT)" : "MLP") << "\n";
+    std::cout << "  架构: " << (cfg.arch == ArchType::Transformer ? "Transformer (ViT)"
+                            : cfg.arch == ArchType::CNN ? "CNN (LeNet)" : "MLP") << "\n";
 
-    if (cfg.arch == ArchType::Transformer)
+    if (cfg.arch == ArchType::CNN)
+    {
+        nn::CnnConfig c = build_cnn_config(cfg);
+        std::cout << "  卷积: ";
+        for (std::size_t i = 0; i < c.convs.size(); ++i)
+        {
+            std::cout << "Conv(" << c.convs[i].out_channels << ",k" << c.convs[i].kernel << ")";
+            if (c.pool > 0) std::cout << "+Pool" << c.pool;
+            if (i < c.convs.size() - 1) std::cout << " -> ";
+        }
+        std::cout << " -> Flatten\n  全连接: ";
+        for (std::size_t i = 0; i < c.fc_dims.size(); ++i)
+        {
+            std::cout << c.fc_dims[i];
+            if (i < c.fc_dims.size() - 1) std::cout << " -> ";
+        }
+        std::cout << "\n";
+    }
+    else if (cfg.arch == ArchType::Transformer)
     {
         const std::size_t grid = nn::MNIST_IMG_SIZE / cfg.patch_size;
         const std::size_t num_patches = grid * grid;

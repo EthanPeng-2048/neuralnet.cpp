@@ -51,6 +51,17 @@ namespace nn
 inline constexpr uint32_t MODEL_MAGIC    = 0x4E4E4E4E;  // "NNNN"
 inline constexpr uint32_t MODEL_VERSION  = 4;            // 自描述格式起始版本
 
+// ── 序列化待办（1.1，代码审查项 S3 / M1 / M2）────────────────────────────
+// S3: read_spec_header / read_tokenizer 直接用文件里的 uint64 长度预分配
+//     std::string(len,'\0')，无上限校验；配合 -fno-exceptions，恶意/损坏文件
+//     可触发 bad_alloc → 进程崩溃。恢复前需加长度上限与读取完整性校验。
+//     （1.0 决定暂不处理：仅影响本地加载自己/下载的模型，用户自行把关。）
+// M1: .bin 全文件无校验和（.nnpkg 有 sha256）。内容损坏会被静默载入错误权重
+//     且无感知。建议 MODEL_VERSION 5 增加整文件校验和与尾部完整性标记。
+// M2: extra_state 的注释称"旧文件读到 EOF 保持默认（running_mean=0 等）"，
+//     但实现是直接返回错误，注释与实现不符。需统一为按版本回退默认值。
+// ═══════════════════════════════════════════════════════════════════════
+
 // ── 精度标记（写入文件头，加载时校验） ──────────────────────────────────
 // 0 = float (f32), 1 = double (f64)
 inline constexpr uint8_t PRECISION_TAG = sizeof(Scalar) == 4 ? 0 : 1;
@@ -213,6 +224,22 @@ template <typename... Ts>
     kv.set("pos_encoding", static_cast<uint64_t>(spec.pos_encoding));
     kv.set("activation",   static_cast<uint64_t>(spec.activation));
     kv.set("norm_type",    static_cast<uint64_t>(spec.norm_type));
+
+    // ── CNN ──
+    kv.set("cnn_in_channels", static_cast<uint64_t>(spec.cnn_in_channels));
+    kv.set("cnn_in_size",     static_cast<uint64_t>(spec.cnn_in_size));
+    kv.set("cnn_pool",        static_cast<uint64_t>(spec.cnn_pool));
+
+    auto to_u64_vec = [](const std::vector<std::size_t>& src) {
+        std::vector<uint64_t> out;
+        out.reserve(src.size());
+        for (auto v : src) out.push_back(static_cast<uint64_t>(v));
+        return out;
+    };
+    kv.set("cnn_channels",  to_u64_vec(spec.cnn_channels));
+    kv.set("cnn_kernels",   to_u64_vec(spec.cnn_kernels));
+    kv.set("cnn_strides",   to_u64_vec(spec.cnn_strides));
+    kv.set("cnn_paddings",  to_u64_vec(spec.cnn_paddings));
     return kv;
 }
 
@@ -259,6 +286,22 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
     if (kv.get("pos_encoding", v)) spec.pos_encoding = static_cast<PosEncodingType>(v);
     if (kv.get("activation", v))  spec.activation   = static_cast<ActivationType>(v);
     if (kv.get("norm_type", v))   spec.norm_type    = static_cast<NormType>(v);
+
+    // ── CNN ──
+    if (kv.get("cnn_in_channels", v)) spec.cnn_in_channels = static_cast<std::size_t>(v);
+    if (kv.get("cnn_in_size", v))     spec.cnn_in_size     = static_cast<std::size_t>(v);
+    if (kv.get("cnn_pool", v))        spec.cnn_pool        = static_cast<std::size_t>(v);
+
+    auto from_u64_vec = [](const std::vector<uint64_t>& src) {
+        std::vector<std::size_t> out;
+        out.reserve(src.size());
+        for (auto v : src) out.push_back(static_cast<std::size_t>(v));
+        return out;
+    };
+    if (kv.get("cnn_channels", dims)) spec.cnn_channels  = from_u64_vec(dims);
+    if (kv.get("cnn_kernels", dims))  spec.cnn_kernels   = from_u64_vec(dims);
+    if (kv.get("cnn_strides", dims))  spec.cnn_strides   = from_u64_vec(dims);
+    if (kv.get("cnn_paddings", dims)) spec.cnn_paddings  = from_u64_vec(dims);
 
     if (spec.type == ModelType::Unknown)
         return std::unexpected(Error{"模型文件规格缺少有效的 type 字段"});
@@ -454,10 +497,21 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
     if (!version_r) return std::unexpected(version_r.error());
 
     // 读取并跳过规格头（规格已隐含在构建好的 model 中）
-    // TODO: 此处读完 spec 即丢弃，未与 model 自身的架构校验。
-    //       完整校验需要 Layer 基类支持 spec() 方法，改动较大，暂留待后续实现。
+    // 若 model 记录了架构规格（Model::spec()，由 build_*_from_spec 设置），
+    // 则与文件头部规格做一致性校验，防止把不匹配的参数加载进模型。
     auto spec_r = detail::read_spec_header(ifs, *version_r);
     if (!spec_r) return std::unexpected(spec_r.error());
+
+    if (auto stored = model.spec(); stored)
+    {
+        if (!spec_matches(*stored, *spec_r))
+        {
+            return std::unexpected(Error{
+                "Model architecture mismatch while loading '" + filename + "': "
+                "model expects " + spec_summary(*stored) +
+                " but file contains " + spec_summary(*spec_r)});
+        }
+    }
 
     auto& engine = model.engine();
     auto params = model.parameters();
@@ -474,6 +528,8 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
 
     // 非可学习状态（如 BatchNorm 的 running_mean/running_var），紧跟在参数之后。
     // 旧文件（无额外状态）读到 EOF 时保持默认（running_mean=0, running_var=1）。
+    // TODO(1.1, M2): 上述"读到 EOF 保持默认"的语义与下方实现不符——read_matrix
+    //   失败时这里直接 return 错误而非回退默认值。需统一为按版本回退。
     auto extras = model.extra_state();
     for (auto& e_tensor : extras)
     {
