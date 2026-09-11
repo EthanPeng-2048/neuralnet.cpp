@@ -1,0 +1,115 @@
+#include <neuralnet.cpp/nn.hpp>
+#include <neuralnet.cpp/model_io.hpp>
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <cstdint>
+
+// -------------------- 从 CSV 字符串读取单样本 --------------------
+nn::Matrix load_image_from_csv(const std::string &csv_line)
+{
+    std::vector<double> pixels;
+    std::stringstream ss(csv_line);
+    std::string token;
+    while (std::getline(ss, token, ','))
+    {
+        pixels.push_back(std::stod(token));
+    }
+    if (pixels.size() != 784)
+        throw std::runtime_error("CSV must contain exactly 784 values");
+
+    // 构造形状为 (784, 1) 的矩阵
+    nn::Matrix img(784, 1);
+    for (std::size_t i = 0; i < 784; ++i)
+        img.set_value_unchecked(i, 0, pixels[i]);
+    return img;
+}
+
+// -------------------- 预测函数（Model 版本） --------------------
+int predict(nn::Model &model, const nn::Matrix &img)
+{
+    auto out = model.forward(img);
+    // 找到最大值的索引
+    double max_val = out.at_unchecked(0, 0);
+    int pred = 0;
+    for (int i = 1; i < 10; ++i)
+    {
+        double val = out.at_unchecked(i, 0);
+        if (val > max_val)
+        {
+            max_val = val;
+            pred = i;
+        }
+    }
+    return pred;
+}
+
+// -------------------- 主函数 --------------------
+int main(int argc, char *argv[])
+{
+    if (argc < 3)
+    {
+        std::cerr << "Usage: " << argv[0] << " <model.bin> <image.csv>" << std::endl;
+        std::cerr << "   or: " << argv[0] << " <model.bin> <image.png>  (if compiled with stb_image)" << std::endl;
+        return 1;
+    }
+
+    std::string model_path = argv[1];
+    std::string img_path = argv[2];
+
+    // 构建网络 — 使用 nn::Model（与训练时结构一致）
+    nn::Model model;
+    model.add<nn::Linear>(784, 64)
+         .add<nn::ReLU>()
+         .add<nn::Linear>(64, 64)
+         .add<nn::ReLU>()
+         .add<nn::Linear>(64, 64)
+         .add<nn::ReLU>()
+         .add<nn::Linear>(64, 10);
+
+    // 加载模型参数（Model 版本）
+    try
+    {
+        nn::load_model(model_path, model);
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "Error loading model: " << e.what() << std::endl;
+        return 1;
+    }
+
+    // 读取图片
+    nn::Matrix img;
+    try
+    {
+        // 判断文件扩展名（简单处理）
+        if (img_path.find(".csv") != std::string::npos || img_path.find(".txt") != std::string::npos)
+        {
+            std::ifstream file(img_path);
+            if (!file)
+                throw std::runtime_error("Cannot open image file");
+            std::string line;
+            std::getline(file, line);
+            img = load_image_from_csv(line);
+        }
+        else
+        {
+            // 图像文件需要额外依赖，此处仅作示例框架
+            std::cerr << "Image file loading not implemented in this example.\n";
+            std::cerr << "Please use a CSV file with 784 pixel values.\n";
+            return 1;
+        }
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "Error loading image: " << e.what() << std::endl;
+        return 1;
+    }
+
+    int result = predict(model, img);
+    std::cout << "Predicted digit: " << result << std::endl;
+    return 0;
+}
