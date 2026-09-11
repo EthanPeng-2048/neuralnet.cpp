@@ -3,8 +3,7 @@
 // 与 GpuEngine（Vulkan）架构对称，所有原语在 GPU 上原生执行。
 // ─────────────────────────────────────────────────────────────────────────
 
-#ifndef NN_COMPUTE_CUDA_ENGINE_HPP
-#define NN_COMPUTE_CUDA_ENGINE_HPP
+#pragma once
 
 #ifdef NN_HAS_CUDA
 
@@ -171,7 +170,8 @@ public:
 
     [[nodiscard]] Result<Tensor> matmul(
         const Tensor& A, const Tensor& B,
-        bool transA, bool transB) override
+        bool transA, bool transB,
+        Precision P = Precision::F32) override
     {
         auto a_gpu = ensure_cuda(A);
         if (!a_gpu) return std::unexpected(a_gpu.error());
@@ -188,7 +188,8 @@ public:
         const Tensor& A, const Tensor& B,
         std::size_t batch,
         bool transA, bool transB,
-        Scalar alpha) override
+        Scalar alpha,
+        Precision P = Precision::F32) override
     {
         auto a_gpu = ensure_cuda(A);
         if (!a_gpu) return std::unexpected(a_gpu.error());
@@ -415,6 +416,37 @@ public:
             "CudaEngine::eval_expr: 闭合世界无 CUDA AOT 融合 shader；请用 Vulkan"});
     }
 
+    // ── 扫描级原语（RLA）：未实现（CUDA 后端 1.0.0 已停用，勿依赖）──────
+    [[nodiscard]] Result<Tensor> scan_prefix_outer(
+        const Tensor& K, const Tensor& V, const Tensor& P, const Tensor& R,
+        const Tensor& A0, const Tensor& B0, bool has_state,
+        std::size_t dk, std::size_t heads, bool causal,
+        const Tensor& boundary, bool has_bnd) override
+    {
+        (void)K; (void)V; (void)P; (void)R; (void)A0; (void)B0;
+        (void)has_state; (void)dk; (void)heads; (void)causal;
+        (void)boundary; (void)has_bnd;
+        return std::unexpected(Error{"CudaEngine::scan_prefix_outer: 未实现"});
+    }
+
+    [[nodiscard]] Result<Tensor> scan_suffix_outer(
+        const Tensor& D, const Tensor& X, const Tensor& Y,
+        std::size_t dk, std::size_t heads, bool causal,
+        const Tensor& boundary, bool has_bnd) override
+    {
+        (void)D; (void)X; (void)Y; (void)dk; (void)heads; (void)causal;
+        (void)boundary; (void)has_bnd;
+        return std::unexpected(Error{"CudaEngine::scan_suffix_outer: 未实现"});
+    }
+
+    [[nodiscard]] Result<Tensor> outer_col(
+        const Tensor& P, const Tensor& R, const Tensor& S,
+        std::size_t dk, bool has_scale) override
+    {
+        (void)P; (void)R; (void)S; (void)dk; (void)has_scale;
+        return std::unexpected(Error{"CudaEngine::outer_col: 未实现"});
+    }
+
 private:
     // ── 辅助：确保 Tensor 在 CUDA 上 ─────────────────────────────────────
     [[nodiscard]] Result<Tensor> ensure_cuda(const Tensor& t)
@@ -432,4 +464,3 @@ private:
 } // namespace nn
 
 #endif // NN_HAS_CUDA
-#endif // NN_COMPUTE_CUDA_ENGINE_HPP

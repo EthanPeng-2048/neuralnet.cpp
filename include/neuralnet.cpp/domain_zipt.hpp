@@ -1,5 +1,4 @@
-#ifndef NN_DOMAIN_ZIPT_HPP
-#define NN_DOMAIN_ZIPT_HPP
+#pragma once
 
 // ── domain_zipt.hpp — ZiPT 领域构建层（AttnZip 记忆压缩解码器） ─────────────
 //
@@ -18,6 +17,7 @@
 #include "compute_engine.hpp"
 #include "model_container.hpp"
 #include "model_spec.hpp"
+#include "precision.hpp"
 #include "domain_gpt.hpp"  // GPT_VOCAB_SIZE 等共享默认超参
 
 namespace nn {
@@ -38,6 +38,7 @@ struct ZiPTConfig {
     PosEncodingType pos_enc   = PosEncodingType::Learned;
     ActivationType activation = ActivationType::GeLU;
     NormType norm_type        = NormType::LayerNorm;
+    PrecisionProfile precision;  // 模型级精度配置（§9.1，默认全 F32）
 };
 
 // ── 构建 ZiPT 模型（推荐使用） ─────────────────────────────────────────
@@ -63,7 +64,7 @@ struct ZiPTConfig {
         auto r = model.add<ZiPTModel>(
             c.vocab_size, c.d_model, c.seq_len, c.window,
             c.num_heads, c.d_ff, c.num_layers, c.memory_tokens,
-            c.pos_enc, c.activation, c.norm_type);
+            c.pos_enc, c.activation, c.norm_type, c.precision);
         if (!r) return std::unexpected(r.error());
     }
     return model;
@@ -71,7 +72,8 @@ struct ZiPTConfig {
 
 // ── 从 ModelSpec 构建 ZiPT 模型 ─────────────────────────────────────────
 [[nodiscard]] inline Result<Model> build_zipt_model_from_spec(
-    ComputeEngine& engine, const ModelSpec& spec)
+    ComputeEngine& engine, const ModelSpec& spec,
+    PrecisionProfile precision = PrecisionProfile{})
 {
     if (!spec.is_zipt())
         return std::unexpected(Error{"Invalid ModelSpec type for ZiPT: expected ZiPT"});
@@ -79,7 +81,7 @@ struct ZiPTConfig {
     auto model = build_zipt_model(engine, ZiPTConfig{
         spec.vocab_size, spec.d_model, spec.seq_len, spec.window,
         spec.num_heads, spec.d_ff, spec.num_layers, spec.memory_tokens,
-        spec.pos_encoding, spec.activation, spec.norm_type});
+        spec.pos_encoding, spec.activation, spec.norm_type, precision});
     if (model)
         model->set_spec(spec);
     return model;
@@ -117,4 +119,3 @@ struct ZiPTConfig {
 
 } // namespace nn
 
-#endif // NN_DOMAIN_ZIPT_HPP

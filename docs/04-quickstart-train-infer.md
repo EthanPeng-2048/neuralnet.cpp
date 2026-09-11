@@ -118,16 +118,16 @@ cmake --build build --parallel
 
 ```bash
 # 单次生成
-./build/text_infer --prompt "Once upon a time" --max-tokens 200
+./build/text_infer --model gpt_model.bin --prompt "Once upon a time" --max-tokens 200
 
 # 交互模式
 ./build/text_infer --interactive
 
 # 调节温度（0=贪心，>1=更随机）
-./build/text_infer --prompt "Hello" --temperature 0.8
+./build/text_infer --model gpt_model.bin --prompt "Hello" --temperature 0.8
 
 # 使用 GPU
-./build/text_infer --gpu --prompt "Hello"
+./build/text_infer --model gpt_model.bin --gpu --prompt "Hello"
 ```
 
 **完整参数：**
@@ -195,7 +195,7 @@ V4 格式模型文件会自动嵌入分词器，推理时无需单独指定 `--v
 int main() {
     nn::CpuEngine engine;
 
-    // 1. 构建模型
+    // 1. 构建模型（使用工厂函数，自动创建同设备权重）
     auto model_result = nn::build_mnist_mlp_model(engine);
     nn::Model model = std::move(*model_result);
 
@@ -326,10 +326,9 @@ int main() {
     }
 
     // 6. 保存模型（含嵌入词表）
-    auto spec = nn::make_gpt_spec(
-        tokenizer->vocab_size(), 128, 256, 4, 512, 4);
-    nn::save_model("gpt_model.bin", model, spec,
-                   tokenizer.get());  // 嵌入分词器
+    // 注意：v4 格式将 ModelSpec 和 tokenizer 的 JSON 嵌入文件头部，
+    // 推理时无需单独指定 --vocab 参数。
+    nn::save_model("gpt_model.bin", model, model.spec(), tokenizer_json);
 }
 ```
 
@@ -343,9 +342,13 @@ int main() {
 int main() {
     nn::CpuEngine engine;
 
-    // 1. 加载模型（v4 格式自动读取规格 + 嵌入词表）
-    auto load_result = nn::load_model_with_spec("gpt_model.bin", engine);
-    auto& [model, spec, tokenizer] = *load_result;
+    // 1. 加载模型（v4 格式：文件头部含 spec + tokenizer；Model 需预先构建以提供 spec 用于校验）
+    auto load_result = nn::load_model("gpt_model.bin", model);
+    auto tokenizer_json = std::move(*load_result);
+    auto tokenizer = nn::load_tokenizer_from_string(tokenizer_json);
+
+    // 或使用带规格参数的工厂函数（从二进制规格直接重建模型）：
+    // auto model_result = nn::build_gpt_model_from_spec(engine, spec_from_file("spec.bin"));
 
     // 2. 编码提示文本
     auto prompt_tokens = tokenizer->encode("Once upon a time");

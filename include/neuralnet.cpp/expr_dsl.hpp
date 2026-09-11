@@ -1,5 +1,4 @@
-#ifndef NN_EXPR_DSL_HPP
-#define NN_EXPR_DSL_HPP
+#pragma once
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  expr_dsl.hpp — 统一表达式 DSL（编译期模板，唯一前端）
@@ -712,4 +711,3 @@ template <typename E>
 
 } // namespace nn::dsl
 
-#endif // NN_EXPR_DSL_HPP

@@ -5,7 +5,9 @@
 // 而 LayerNorm gamma 经注意力 ReLU 后拐点密度极高，元素级有限差分不可靠，
 // 故只对 novel 的注意力核心做 gradcheck；整链正确性由 rapt_smoke_test 保证。
 //
-// 用法：rapt_gradcheck [--batch N] [--tol <f>] [--gpu] [--cuda]
+// 用法：rapt_gradcheck [--tol <f>] [--gpu] [--cuda]
+// 注意：无 --batch 参数——batch 在各测试段内固定（causal=2、bidirectional=1、
+// doc-aware=2），batch>1 覆盖（铁律 5）由 causal/doc-aware 段保证。
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>

@@ -1,5 +1,4 @@
-#ifndef NN_DOMAIN_MNIST_HPP
-#define NN_DOMAIN_MNIST_HPP
+#pragma once
 
 // ── domain_mnist.hpp — MNIST 领域构建层 ────────────────────────────────────
 //
@@ -228,4 +227,3 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
 
 } // namespace nn
 
-#endif // NN_DOMAIN_MNIST_HPP

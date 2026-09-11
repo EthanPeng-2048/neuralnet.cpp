@@ -123,8 +123,8 @@
 - **限制**：仅支持逐元素→逐元素链，不支持跨 matmul、不支持多消费者 DAG。
 
 ### P2-04 ✅ IR-D：后端 emitter 抽象
-- **文件**：`expr_emitter.hpp`、`expr_cpu_emitter.hpp`
-- **现状**：`ExprEmitter` 纯接口 + emitter registry，`GlslEmitter` + `CpuEmitter` 双实现。
+- **文件**：`expr_emitter.hpp`（`cpu_emitter.hpp` 已删除）
+- **现状**：`ExprEmitter` 纯接口 + emitter registry，`GlslEmitter` 为唯一实现。`cpu_emitter.hpp` 已删除，`CpuEmitter` 逻辑合并到 `GlslEmitter`，`expr_emitter.hpp` 的 `factory_cpu()` 返回 `GlslEmitter` 实例。
 
 ### P2-05 📋 跨 matmul 融合（matmul + 偏置 + 激活）
 - **现状**：matmul 作硬融合边界，`linear(x) + bias + relu` 需 3 次 kernel dispatch + 2 个中间 Tensor。
@@ -299,21 +299,7 @@
 - **现状**：`checkpoint_mode_` / `set_checkpoint_every` 逐层/块级检查点，backward 重算激活。stride∈{1,2} 与全存基线逐位一致。
 
 ### P4-02 ✅ L2 内存池整块归还 + 统计
-- **现状**：`release_idle_blocks()` + `retain_free_bytes_` 防抖动 + `PoolStats` 诊断。
-
-### P4-03 📋 半精度（bf16/fp16）训练
-- **现状**：全项目 `Scalar = float`，所有激活/梯度/优化器状态 4B。
-- **方案**：
-  - **阶段 1**：前向传播 bf16（激活 + 权重），反向传播 fp32（梯度 + 优化器）→ **混合精度训练**。
-  - **阶段 2**：全链路 bf16（含优化器状态）→ **纯 bf16 训练**。
-  - 实现：`core_config.hpp` 增加 `Precision` 枚举；tensor 支持 bf16 存储 + fp32 累加；matmul 内核支持 bf16→fp32 dequant。
-  - 需 GPU 端：Vulkan `VK_KHR_shader_float16_int8` 或 CUDA `__nv_bfloat16`。
-- **工作量**：大（2-3 周，含数值验证）
-- **收益**：
-  - 显存减半（27GB → ~15GB）
-  - GPU 带宽吞吐翻倍
-  - CUDA matmul 利用 Tensor Core（V100/T4/A100 bf16 原生支持）
-- **风险**：高（数值稳定性需全面验证；某些操作如 LayerNorm/Softmax 需 fp32 中间累加）
+- **现状**：`release_idle_blocks()` + `retain_free_bytes_` 防抖动 + `PoolStats` 诊断
 
 ### P4-04 📋 L3 优化器降内存（8-bit Adam / 状态分片）
 - **现状**：Adam 的 `m` / `v` 各一份参数大小（~3.7GB × 2 = 7.4GB）。

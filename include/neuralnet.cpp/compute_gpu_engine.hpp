@@ -1,5 +1,4 @@
-#ifndef NN_COMPUTE_GPU_ENGINE_HPP
-#define NN_COMPUTE_GPU_ENGINE_HPP
+#pragma once
 
 // ── compute_gpu_engine.hpp — GPU 计算引擎实现（纯 GPU 架构）─────────────────────────
 // GpuEngine 封装 GpuBackend，实现 ComputeEngine 接口。
@@ -199,49 +198,140 @@ public:
     // ══════════════════════════════════════════════════════════════════════
     // 张量工厂（纯 GPU：全部创建/上传为 GPU Tensor）
     // ══════════════════════════════════════════════════════════════════════
+    // 统一接口：create_tensor / from_matrix / to_matrix（§6.4, §6.5）
+    // P 由调用方显式指定（§8.5）：无隐式推导，无 Auto
+    // ══════════════════════════════════════════════════════════════════════
 
-    [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols) override
+    [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols, Precision P = Precision::F32) override
     {
-        // 分配 GPU buffer（用于参数/梯度，后续通过 copy_from 填充）
-        auto r = GpuTensor::create_empty(rows, cols, backend_);
-        if (!r)
+        if (P == Precision::F16)
         {
-            // 分配失败时返回空 Tensor（调用方应检查 valid()）
-            return Tensor();
+            auto r = GpuTensorF16::create_empty(rows, cols, backend_);
+            if (!r) return Tensor();
+            return Tensor::from_gpu(std::move(*r));
         }
+        auto r = GpuTensor::create_empty(rows, cols, backend_);
+        if (!r) return Tensor();
         return Tensor::from_gpu(std::move(*r));
     }
 
-    [[nodiscard]] Result<Tensor> from_matrix(const Matrix& m) override
+    [[nodiscard]] Result<Tensor> from_matrix(const Matrix& m, Precision P = Precision::F32) override
     {
-        // 上传 CPU Matrix → GPU Tensor（PCIe 上传，唯一的上传点）
-        // P2 优化：batch 模式下不再强制 flush（end_batch → begin_batch）。
-        // 安全性：from_matrix 总是**新建** GpuTensor（GpuTensor::from_matrix
-        // 内部 upload_blocking 独立提交 + 等待完成）。新 buffer 未被正在录制
-        // 的 batch 引用；独立上传提交先于 batch（batch 尚未提交，队列 FIFO），
-        // 等待完成后数据即就绪，后续 batch 录制引用该 buffer 安全。
-        // 注意：to_matrix / copy_from 仍须 flush——前者要读 batch 中刚写入的
-        // buffer（跳过 flush 会读到旧数据），后者要写 batch 已引用的既有 dst。
+        if (P == Precision::F16)
+        {
+            MatrixT<Precision::F16> m16(m.rows(), m.cols());
+            const auto src = m.span();
+            auto dst = m16.span();
+            for (std::size_t i = 0; i < src.size(); ++i)
+                dst[i] = src[i];
+            auto r = GpuTensorF16::from_matrix(m16, backend_);
+            if (!r) return std::unexpected(r.error());
+            return Tensor::from_gpu(std::move(*r));
+        }
         auto r = GpuTensor::from_matrix(m, backend_);
-        if (!r)
-            return std::unexpected(r.error());
+        if (!r) return std::unexpected(r.error());
         return Tensor::from_gpu(std::move(*r));
     }
 
-    [[nodiscard]] Result<Matrix> to_matrix(const Tensor& t) override
+    [[nodiscard]] Result<Matrix> to_matrix(const Tensor& t, Precision P = Precision::F32) override
     {
         if (t.is_cpu())
+        {
+            if (t.precision() == Precision::F16 && P == Precision::F32)
+            {
+                const auto& m16 = t.cpu_matrix<Precision::F16>();
+                Matrix m32(m16.rows(), m16.cols());
+                const auto src = m16.span();
+                auto dst = m32.span();
+                for (std::size_t i = 0; i < src.size(); ++i)
+                    dst[i] = static_cast<float>(src[i]);
+                return m32;
+            }
             return Matrix(t.cpu_matrix());
-        // batch 模式下必须先 flush（提交并等待），否则 GPU 计算未执行，读到旧数据
-        // flush 后自动重新 begin_batch，保持 batch 上下文不断裂
+        }
+        // GPU tensor → drain + download
         if (in_batch())
         {
             auto r = end_batch();
             if (!r) return std::unexpected(r.error());
+            auto rw = backend_.wait_in_flight();
+            if (!rw) return std::unexpected(rw.error());
             auto rb = begin_batch();
             if (!rb) return std::unexpected(rb.error());
         }
+        if (t.precision() == Precision::F16)
+        {
+            auto m16_r = t.gpu_tensor<Precision::F16>().to_matrix(backend_);
+            if (!m16_r) return std::unexpected(m16_r.error());
+            if (P == Precision::F32)
+            {
+                Matrix m32(m16_r->rows(), m16_r->cols());
+                const auto src = m16_r->span();
+                auto dst = m32.span();
+                for (std::size_t i = 0; i < src.size(); ++i)
+                    dst[i] = static_cast<float>(src[i]);
+                return m32;
+            }
+        }
         return t.gpu_tensor().to_matrix(backend_);
+    }
+
+    // ── cast 原语（§7.5，统一接口）──────────────────────────────────────
+    [[nodiscard]] Result<Tensor> cast(const Tensor& src, Precision dst) override
+    {
+        if (src.precision() == dst)
+            return src;
+
+        if (src.is_gpu())
+        {
+            if (src.precision() == Precision::F16 && dst == Precision::F32)
+            {
+                // f16 GPU → f32 CPU → f32 GPU（升 cast，精确无损）
+                auto m32 = to_matrix(src, Precision::F32);
+                if (!m32) return std::unexpected(m32.error());
+                return from_matrix(*m32, Precision::F32);
+            }
+            if (src.precision() == Precision::F32 && dst == Precision::F16)
+            {
+                // f32 GPU → f32 CPU → f16 CPU → f16 GPU（降 cast，RHE）
+                auto m32 = to_matrix(src, Precision::F32);
+                if (!m32) return std::unexpected(m32.error());
+                // 创建 f16 矩阵（CPU 临时）
+                MatrixT<Precision::F16> m16(m32->rows(), m32->cols());
+                const auto s = m32->span();
+                auto d = m16.span();
+                for (std::size_t i = 0; i < s.size(); ++i)
+                    d[i] = s[i];
+                // 上传 f16 到 GPU
+                auto r = GpuTensorF16::from_matrix(m16, backend_);
+                if (!r) return std::unexpected(r.error());
+                return Tensor::from_gpu(std::move(*r));
+            }
+            return std::unexpected(Error{"cast: unsupported precision conversion"});
+        }
+        // CPU path
+        if (src.precision() == Precision::F16 && dst == Precision::F32)
+        {
+            const auto& m16 = src.cpu_matrix<Precision::F16>();
+            Matrix m32(m16.rows(), m16.cols());
+            const auto s = m16.span();
+            auto d = m32.span();
+            for (std::size_t i = 0; i < s.size(); ++i)
+                d[i] = static_cast<float>(s[i]);
+            return from_matrix(m32, Precision::F32);
+        }
+        if (src.precision() == Precision::F32 && dst == Precision::F16)
+        {
+            const auto& m32 = src.cpu_matrix();
+            MatrixT<Precision::F16> m16(m32.rows(), m32.cols());
+            const auto s = m32.span();
+            auto d = m16.span();
+            for (std::size_t i = 0; i < s.size(); ++i)
+                d[i] = s[i];
+            // CPU f16 tensor
+            return Tensor::from_matrix(std::move(m16));
+        }
+        return std::unexpected(Error{"cast: unsupported precision conversion"});
     }
 
     [[nodiscard]] Result<void> copy_from(Tensor& dst, const Matrix& src) override
@@ -254,11 +344,17 @@ public:
             dst = Tensor::from_matrix(Matrix(src));
             return {};
         }
-        // batch 模式下必须先 flush（与 from_matrix 同理，upload_blocking 独立提交）
+        // batch 模式下必须先 drain（P0-1）：dst 是当前帧已引用的既有
+        // buffer——当前帧尚未提交，若先把上传提交到队列，GPU 会先执行
+        // 上传、后执行当前帧命令 → 本帧后续对 dst 的写入覆盖上传数据。
+        // 故：end_batch 提交当前帧（不等待）→ wait_in_flight 等完 →
+        // 新帧开始录制 → 上传（独立提交，排在新帧之后提交、GPU 先执行）。
         if (in_batch())
         {
             auto r = end_batch();
             if (!r) return std::unexpected(r.error());
+            auto rw = backend_.wait_in_flight();
+            if (!rw) return std::unexpected(rw.error());
             auto rb = begin_batch();
             if (!rb) return std::unexpected(rb.error());
         }
@@ -375,7 +471,8 @@ public:
 
     [[nodiscard]] Result<Tensor> matmul(
         const Tensor& A, const Tensor& B,
-        bool transA, bool transB) override
+        bool transA, bool transB,
+        Precision P = Precision::F32) override
     {
         // 确保 A、B 在 GPU 上
         auto a_gpu = ensure_gpu(A);
@@ -383,35 +480,101 @@ public:
         auto b_gpu = ensure_gpu(B);
         if (!b_gpu) return std::unexpected(b_gpu.error());
 
-        auto r = backend_.matmul_gpu(
-            a_gpu->gpu_tensor(), b_gpu->gpu_tensor(),
-            transA ? 1u : 0u, transB ? 1u : 0u);
-        if (!r)
-            return std::unexpected(r.error());
-        return Tensor::from_gpu(std::move(*r));
+        // ── F32 路径（现状，零改动）─────────────────────────────────────
+        if (P == Precision::F32)
+        {
+            auto r = backend_.matmul_gpu(
+                a_gpu->gpu_tensor(), b_gpu->gpu_tensor(),
+                transA ? 1u : 0u, transB ? 1u : 0u);
+            if (!r)
+                return std::unexpected(r.error());
+            return Tensor::from_gpu(std::move(*r));
+        }
+
+        // ── F16 路径（D5 Phase 1：边界 cast → f32 matmul → cast 回 f16）──
+        // D6 将实现原生 f16 GEMM；当前用 f32 参考路径保证正确性
+        if (P == Precision::F16)
+        {
+            // 边界 cast：f16 → f32（§7.5 cast 原语）
+            auto a32 = cast(*a_gpu, Precision::F32);
+            if (!a32) return std::unexpected(a32.error());
+            auto b32 = cast(*b_gpu, Precision::F32);
+            if (!b32) return std::unexpected(b32.error());
+
+            auto a32_gpu = ensure_gpu(*a32);
+            if (!a32_gpu) return std::unexpected(a32_gpu.error());
+            auto b32_gpu = ensure_gpu(*b32);
+            if (!b32_gpu) return std::unexpected(b32_gpu.error());
+
+            // f32 matmul
+            auto r = backend_.matmul_gpu(
+                a32_gpu->gpu_tensor(), b32_gpu->gpu_tensor(),
+                transA ? 1u : 0u, transB ? 1u : 0u);
+            if (!r)
+                return std::unexpected(r.error());
+
+            // cast 回 f16
+            Tensor result_f32 = Tensor::from_gpu(std::move(*r));
+            return cast(result_f32, Precision::F16);
+        }
+
+        return std::unexpected(Error{"matmul: unsupported precision"});
     }
 
     // ── 批量矩阵乘法：按 batch 切分行块，单次 dispatch 处理所有 batch ──
     // alpha 在 shader 写出时一次完成（如注意力 1/sqrt(d_k) 缩放）
+    // P: 计算精度（D5 §8.1，同 matmul）
     [[nodiscard]] Result<Tensor> batched_matmul(
         const Tensor& A, const Tensor& B,
         std::size_t batch,
         bool transA, bool transB,
-        Scalar alpha) override
+        Scalar alpha,
+        Precision P = Precision::F32) override
     {
         auto a_gpu = ensure_gpu(A);
         if (!a_gpu) return std::unexpected(a_gpu.error());
         auto b_gpu = ensure_gpu(B);
         if (!b_gpu) return std::unexpected(b_gpu.error());
 
-        auto r = backend_.batched_matmul_gpu(
-            a_gpu->gpu_tensor(), b_gpu->gpu_tensor(),
-            static_cast<uint32_t>(batch),
-            transA ? 1u : 0u, transB ? 1u : 0u,
-            static_cast<float>(alpha));
-        if (!r)
-            return std::unexpected(r.error());
-        return Tensor::from_gpu(std::move(*r));
+        // ── F32 路径（现状，零改动）─────────────────────────────────────
+        if (P == Precision::F32)
+        {
+            auto r = backend_.batched_matmul_gpu(
+                a_gpu->gpu_tensor(), b_gpu->gpu_tensor(),
+                static_cast<uint32_t>(batch),
+                transA ? 1u : 0u, transB ? 1u : 0u,
+                static_cast<float>(alpha));
+            if (!r)
+                return std::unexpected(r.error());
+            return Tensor::from_gpu(std::move(*r));
+        }
+
+        // ── F16 路径（D5 Phase 1：边界 cast → f32 batched_matmul → cast 回 f16）
+        if (P == Precision::F16)
+        {
+            auto a32 = cast(*a_gpu, Precision::F32);
+            if (!a32) return std::unexpected(a32.error());
+            auto b32 = cast(*b_gpu, Precision::F32);
+            if (!b32) return std::unexpected(b32.error());
+
+            auto a32_gpu = ensure_gpu(*a32);
+            if (!a32_gpu) return std::unexpected(a32_gpu.error());
+            auto b32_gpu = ensure_gpu(*b32);
+            if (!b32_gpu) return std::unexpected(b32_gpu.error());
+
+            auto r = backend_.batched_matmul_gpu(
+                a32_gpu->gpu_tensor(), b32_gpu->gpu_tensor(),
+                static_cast<uint32_t>(batch),
+                transA ? 1u : 0u, transB ? 1u : 0u,
+                static_cast<float>(alpha));
+            if (!r)
+                return std::unexpected(r.error());
+
+            Tensor result_f32 = Tensor::from_gpu(std::move(*r));
+            return cast(result_f32, Precision::F16);
+        }
+
+        return std::unexpected(Error{"batched_matmul: unsupported precision"});
     }
 
     // A += B：真原地，直接写回 A 的 buffer（与 CpuEngine 语义一致）
@@ -497,6 +660,65 @@ public:
         if (A.is_cpu())
             A = std::move(*a_gpu);
         return {};
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 扫描级原语（RLA）——手写原语 shader + GpuBackend 接线
+    // 形状契约见 compute_engine.hpp 扫描级原语注释；纯 GPU 架构：
+    // 无 pipeline 时硬报错，不做 CPU 回退。
+    // ══════════════════════════════════════════════════════════════════════
+
+    [[nodiscard]] Result<Tensor> scan_prefix_outer(
+        const Tensor& K, const Tensor& V, const Tensor& P, const Tensor& R,
+        const Tensor& A0, const Tensor& B0, bool has_state,
+        std::size_t dk, std::size_t heads, bool causal,
+        const Tensor& boundary, bool has_bnd) override
+    {
+        auto k = ensure_gpu(K); if (!k) return std::unexpected(k.error());
+        auto v = ensure_gpu(V); if (!v) return std::unexpected(v.error());
+        auto p = ensure_gpu(P); if (!p) return std::unexpected(p.error());
+        auto r = ensure_gpu(R); if (!r) return std::unexpected(r.error());
+        auto a = ensure_gpu(A0); if (!a) return std::unexpected(a.error());
+        auto b = ensure_gpu(B0); if (!b) return std::unexpected(b.error());
+        auto bn = ensure_gpu(boundary); if (!bn) return std::unexpected(bn.error());
+        auto res = backend_.scan_prefix_outer_gpu(
+            k->gpu_tensor(), v->gpu_tensor(), p->gpu_tensor(), r->gpu_tensor(),
+            a->gpu_tensor(), b->gpu_tensor(), has_state,
+            static_cast<uint32_t>(dk), static_cast<uint32_t>(heads), causal,
+            bn->gpu_tensor(), has_bnd);
+        if (!res) return std::unexpected(res.error());
+        return Tensor::from_gpu(std::move(*res));
+    }
+
+    [[nodiscard]] Result<Tensor> scan_suffix_outer(
+        const Tensor& D, const Tensor& X, const Tensor& Y,
+        std::size_t dk, std::size_t heads, bool causal,
+        const Tensor& boundary, bool has_bnd) override
+    {
+        auto d = ensure_gpu(D); if (!d) return std::unexpected(d.error());
+        auto x = ensure_gpu(X); if (!x) return std::unexpected(x.error());
+        auto y = ensure_gpu(Y); if (!y) return std::unexpected(y.error());
+        auto bn = ensure_gpu(boundary); if (!bn) return std::unexpected(bn.error());
+        auto res = backend_.scan_suffix_outer_gpu(
+            d->gpu_tensor(), x->gpu_tensor(), y->gpu_tensor(),
+            static_cast<uint32_t>(dk), static_cast<uint32_t>(heads), causal,
+            bn->gpu_tensor(), has_bnd);
+        if (!res) return std::unexpected(res.error());
+        return Tensor::from_gpu(std::move(*res));
+    }
+
+    [[nodiscard]] Result<Tensor> outer_col(
+        const Tensor& P, const Tensor& R, const Tensor& S,
+        std::size_t dk, bool has_scale) override
+    {
+        auto p = ensure_gpu(P); if (!p) return std::unexpected(p.error());
+        auto r = ensure_gpu(R); if (!r) return std::unexpected(r.error());
+        auto s = ensure_gpu(S); if (!s) return std::unexpected(s.error());
+        auto res = backend_.outer_col_gpu(
+            p->gpu_tensor(), r->gpu_tensor(), s->gpu_tensor(),
+            static_cast<uint32_t>(dk), has_scale);
+        if (!res) return std::unexpected(res.error());
+        return Tensor::from_gpu(std::move(*res));
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -939,4 +1161,3 @@ private:
 
 #endif // NN_HAS_VULKAN
 
-#endif // NN_COMPUTE_GPU_ENGINE_HPP

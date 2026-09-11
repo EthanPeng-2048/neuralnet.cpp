@@ -28,7 +28,6 @@
 #include <neuralnet.cpp/expr_graph.hpp>
 #include <neuralnet.cpp/expr_emitter.hpp>
 #include <neuralnet.cpp/expr_glsl_gen.hpp>    // 注册 GlslEmitter（IR-D）
-#include <neuralnet.cpp/expr_cpu_emitter.hpp> // 注册 CpuEmitter（IR-D）
 #include <neuralnet.cpp/compute_cpu_engine.hpp>
 
 using nn::Scalar;
@@ -599,7 +598,8 @@ void test_emitter()
     auto cpu  = nn::emitter_registry::make("cpu");
     auto none = nn::emitter_registry::make("nonexistent");
     CHECK(static_cast<bool>(glsl), "GlslEmitter 已注册可创建");
-    CHECK(static_cast<bool>(cpu), "CpuEmitter 已注册可创建");
+    // CpuEmitter 产物从不参与编译（gen_fused 硬编码 glsl），死代码已清除（docs/17 §1.3）
+    CHECK(!cpu, "CpuEmitter 已下线（不再注册）");
     CHECK(!none, "未知后端返回 nullptr");
 
     if (glsl)
@@ -608,19 +608,8 @@ void test_emitter()
         const std::string g = glsl->generate("fused_x", s);
         CHECK(!g.empty(), "GlslEmitter 生成逐元素 GLSL 成功");
         CHECK(g.find("#version 450") != std::string::npos, "GLSL 含版本头");
-    }
-    if (cpu)
-    {
-        CHECK(std::string(cpu->name()) == "cpu", "CpuEmitter 后端名");
-        const std::string c = cpu->generate("cpu_x", s);
-        CHECK(!c.empty(), "CpuEmitter 生成 C++ 代码成功");
-        CHECK(c.find("inline void cpu_x") != std::string::npos, "C++ 代码含函数签名");
-        CHECK(c.find("std::max") == std::string::npos, "逐元素含基本运算");
-        // 归约：CpuEmitter 暂不支持 → 空串；GlslEmitter 支持
-        nn::ExprSpec rs = make_row_sum();
-        CHECK(cpu->generate_reduce("cpu_r", rs).empty(), "CpuEmitter 归约返回空（不支持）");
-        if (glsl)
-            CHECK(!glsl->generate_reduce("fused_r", rs).empty(), "GlslEmitter 归约生成成功");
+        CHECK(!glsl->generate_reduce("fused_r", make_row_sum()).empty(),
+              "GlslEmitter 归约生成成功");
     }
     std::printf("[OK] test_emitter\n");
 }

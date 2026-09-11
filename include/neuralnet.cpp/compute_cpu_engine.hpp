@@ -1,5 +1,4 @@
-#ifndef NN_COMPUTE_CPU_ENGINE_HPP
-#define NN_COMPUTE_CPU_ENGINE_HPP
+#pragma once
 
 // ── compute_cpu_engine.hpp — CPU 计算引擎实现 ─────────────────────────────────────
 // CpuEngine 封装现有 Matrix 方法和 AST（compute::apply），实现
@@ -84,22 +83,110 @@ public:
         return {};
     }
 
-    // ── 张量工厂 ──────────────────────────────────────────────────────────
-    [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols) override
+    // ── 张量工厂（统一接口，§6.4, §6.5）────────────────────────────────
+    // P 由调用方显式指定（§8.5）：无隐式推导，无 Auto
+    [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols, Precision P = Precision::F32) override
     {
+        if (P == Precision::F16)
+            return Tensor::cpu<Precision::F16>(rows, cols);
         return Tensor::cpu(rows, cols);
     }
 
-    [[nodiscard]] Result<Tensor> from_matrix(const Matrix& m) override
+    [[nodiscard]] Result<Tensor> from_matrix(const Matrix& m, Precision P = Precision::F32) override
     {
-        return Tensor::from_matrix(Matrix(m));  // 拷贝，避免外部修改影响
+        if (P == Precision::F16)
+        {
+            // f32 → f16：cast 后上传
+            MatrixT<Precision::F16> m16(m.rows(), m.cols());
+            const auto src = m.span();
+            auto dst = m16.span();
+            for (std::size_t i = 0; i < src.size(); ++i)
+                dst[i] = src[i];  // RHE 舍入
+            return Tensor::from_matrix(std::move(m16));
+        }
+        return Tensor::from_matrix(Matrix(m));  // f32 拷贝
     }
 
-    [[nodiscard]] Result<Matrix> to_matrix(const Tensor& t) override
+    [[nodiscard]] Result<Matrix> to_matrix(const Tensor& t, Precision P = Precision::F32) override
     {
         if (!t.is_cpu())
             return std::unexpected(Error{"to_matrix: tensor is not CPU"});
-        return Matrix(t.cpu_matrix());  // 返回拷贝
+
+        if (P == Precision::F16)
+        {
+            // 下载为 f16 → cast 到 f32（升 cast，精确无损）
+            if (t.precision() == Precision::F16)
+            {
+                const auto& m16 = t.cpu_matrix<Precision::F16>();
+                Matrix m32(m16.rows(), m16.cols());
+                const auto src = m16.span();
+                auto dst = m32.span();
+                for (std::size_t i = 0; i < src.size(); ++i)
+                    dst[i] = static_cast<float>(src[i]);
+                return m32;
+            }
+            // tensor 是 f32，要求 f16 → 降 cast
+            MatrixT<Precision::F16> m16(t.rows(), t.cols());
+            const auto src = t.cpu_matrix().span();
+            auto dst = m16.span();
+            for (std::size_t i = 0; i < src.size(); ++i)
+                dst[i] = src[i];
+            // 返回 f32（升 cast 回来）
+            Matrix m32(t.rows(), t.cols());
+            const auto src16 = m16.span();
+            auto dst32 = m32.span();
+            for (std::size_t i = 0; i < src16.size(); ++i)
+                dst32[i] = static_cast<float>(src16[i]);
+            return m32;
+        }
+
+        // P == F32（默认路径）
+        if (t.precision() == Precision::F16)
+        {
+            // f16 → f32（升 cast，精确无损）
+            const auto& m16 = t.cpu_matrix<Precision::F16>();
+            Matrix m32(m16.rows(), m16.cols());
+            const auto src = m16.span();
+            auto dst = m32.span();
+            for (std::size_t i = 0; i < src.size(); ++i)
+                dst[i] = static_cast<float>(src[i]);
+            return m32;
+        }
+        return Matrix(t.cpu_matrix());  // f32 拷贝
+    }
+
+    // ── cast 原语（§7.5，唯一"变精度"算子）──────────────────────────────
+    [[nodiscard]] Result<Tensor> cast(const Tensor& src, Precision dst) override
+    {
+        if (src.precision() == dst)
+            return src;
+
+        if (!src.is_cpu())
+            return std::unexpected(Error{"cast: CPU engine only supports CPU tensors"});
+
+        if (src.precision() == Precision::F16 && dst == Precision::F32)
+        {
+            const auto& m16 = src.cpu_matrix<Precision::F16>();
+            Matrix m32(m16.rows(), m16.cols());
+            const auto src_span = m16.span();
+            auto dst_span = m32.span();
+            for (std::size_t i = 0; i < src_span.size(); ++i)
+                dst_span[i] = static_cast<float>(src_span[i]);
+            return Tensor::from_matrix(std::move(m32));
+        }
+
+        if (src.precision() == Precision::F32 && dst == Precision::F16)
+        {
+            const auto& m32 = src.cpu_matrix();
+            MatrixT<Precision::F16> m16(m32.rows(), m32.cols());
+            const auto src_span = m32.span();
+            auto dst_span = m16.span();
+            for (std::size_t i = 0; i < src_span.size(); ++i)
+                dst_span[i] = src_span[i];
+            return Tensor::from_matrix(std::move(m16));
+        }
+
+        return std::unexpected(Error{"cast: unsupported precision conversion"});
     }
 
     [[nodiscard]] Result<void> copy_from(Tensor& dst, const Matrix& src) override
@@ -340,57 +427,143 @@ public:
 
     [[nodiscard]] Result<Tensor> matmul(
         const Tensor& A, const Tensor& B,
-        bool transA, bool transB) override
+        bool transA, bool transB,
+        Precision P = Precision::F32) override
     {
         if (A.is_gpu() || B.is_gpu())
             return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
 
-        const Matrix& a = A.cpu_matrix();
-        const Matrix& b = B.cpu_matrix();
+        // ── F32 路径（现状，零改动）─────────────────────────────────────
+        if (P == Precision::F32)
+        {
+            const Matrix& a = A.cpu_matrix();
+            const Matrix& b = B.cpu_matrix();
 
-        // 维度校验（基于逻辑维度，避免不必要的转置拷贝）
-        // A_eff = transA ? A^T : A，B_eff = transB ? B^T : B
-        const std::size_t M  = transA ? a.cols() : a.rows();
-        const std::size_t K  = transA ? a.rows() : a.cols();
-        const std::size_t K2 = transB ? b.cols() : b.rows();
-        const std::size_t N  = transB ? b.rows() : b.cols();
-        if (K != K2)
-            return std::unexpected(Error{"matmul: dimension mismatch A=" +
-                std::to_string(a.rows()) + "x" + std::to_string(a.cols()) +
-                " transA=" + (transA ? "1" : "0") +
-                " B=" + std::to_string(b.rows()) + "x" + std::to_string(b.cols()) +
-                " transB=" + (transB ? "1" : "0") +
-                " K=" + std::to_string(K) + " K2=" + std::to_string(K2)});
+            const std::size_t M  = transA ? a.cols() : a.rows();
+            const std::size_t K  = transA ? a.rows() : a.cols();
+            const std::size_t K2 = transB ? b.cols() : b.rows();
+            const std::size_t N  = transB ? b.rows() : b.cols();
+            if (K != K2)
+                return std::unexpected(Error{"matmul: dimension mismatch A=" +
+                    std::to_string(a.rows()) + "x" + std::to_string(a.cols()) +
+                    " transA=" + (transA ? "1" : "0") +
+                    " B=" + std::to_string(b.rows()) + "x" + std::to_string(b.cols()) +
+                    " transB=" + (transB ? "1" : "0") +
+                    " K=" + std::to_string(K) + " K2=" + std::to_string(K2)});
 
-        Matrix result(M, N);
-        // 使用 Matrix 原生转置 matmul 方法，零额外拷贝
-        if (!transA && !transB) {
-            a.multiply_to(result, b);
-        } else if (!transA && transB) {
-            a.multiply_transposed_to(result, b);  // C = A × B^T
-        } else if (transA && !transB) {
-            a.transpose_multiply_to(result, b);   // C = A^T × B
-        } else {
-            // 双转置 C = A^T × B^T，罕见路径
-            Matrix a_t = a.transpose();
-            a_t.multiply_transposed_to(result, b);
+            Matrix result(M, N);
+            if (!transA && !transB) {
+                a.multiply_to(result, b);
+            } else if (!transA && transB) {
+                a.multiply_transposed_to(result, b);
+            } else if (transA && !transB) {
+                a.transpose_multiply_to(result, b);
+            } else {
+                Matrix a_t = a.transpose();
+                a_t.multiply_transposed_to(result, b);
+            }
+            return Tensor::from_matrix(std::move(result));
         }
-        return Tensor::from_matrix(std::move(result));
+
+        // ── F16 路径（D6：f16 读 / f32 累加 / f16 写，§7.2）───────────
+        // f16 无原生 SIMD → 向量化失败是预期行为，抑制 -Wpass-failed
+        if (P == Precision::F16)
+        {
+            const auto& a = A.cpu_matrix<Precision::F16>();
+            const auto& b = B.cpu_matrix<Precision::F16>();
+
+            const std::size_t M  = transA ? a.cols() : a.rows();
+            const std::size_t K  = transA ? a.rows() : a.cols();
+            const std::size_t K2 = transB ? b.cols() : b.rows();
+            const std::size_t N  = transB ? b.rows() : b.cols();
+            if (K != K2)
+                return std::unexpected(Error{"matmul(f16): dimension mismatch"});
+
+            MatrixT<Precision::F16> result(M, N);
+            // f16 无原生 x86 SIMD → 向量化失败是预期行为（§7.2 兼容路径）
+            if (!transA && !transB) {
+                a.multiply_to(result, b);
+            } else if (!transA && transB) {
+                a.multiply_transposed_to(result, b);
+            } else if (transA && !transB) {
+                a.transpose_multiply_to(result, b);
+            } else {
+                auto a_t = a.transpose();
+                a_t.multiply_transposed_to(result, b);
+            }
+            return Tensor::from_matrix(std::move(result));
+        }
+
+        return std::unexpected(Error{"matmul: unsupported precision"});
     }
 
     // ── 批量矩阵乘法：按 batch 切分行块，逐 batch 矩阵乘 ──
     // C_b = alpha * op(A_b, B_b)（alpha 为 cuBLAS sgemm 语义的输出缩放系数）
+    // P: 计算精度（D5 §8.1，同 matmul）
     [[nodiscard]] Result<Tensor> batched_matmul(
         const Tensor& A, const Tensor& B,
         std::size_t batch,
         bool transA, bool transB,
-        Scalar alpha) override
+        Scalar alpha,
+        Precision P = Precision::F32) override
     {
         if (A.is_gpu() || B.is_gpu())
             return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
         if (batch == 0)
             return std::unexpected(Error{"batched_matmul: batch must be > 0"});
 
+        // ── F16 路径（Phase 1：逐 batch 调用单 matmul，正确性优先）───────
+        if (P == Precision::F16)
+        {
+            // 逐 batch 拆分 + 单 matmul(f16) + 拼接
+            const auto& a = A.cpu_matrix<Precision::F16>();
+            const auto& b = B.cpu_matrix<Precision::F16>();
+            const std::size_t a_rows_per = a.rows() / batch;
+            const std::size_t b_rows_per = b.rows() / batch;
+            const std::size_t M = transA ? a.cols() : a_rows_per;
+            const std::size_t N = transB ? b_rows_per : b.cols();
+
+            MatrixT<Precision::F16> result(batch * M, N);
+            for (std::size_t bi = 0; bi < batch; ++bi)
+            {
+                // 构造 per-batch 子张量（共享底层数据，零拷贝）
+                // 用 MatrixT<F16> 的 span 子区间做 per-batch matmul
+                const std::size_t a_off = bi * a_rows_per * a.cols();
+                const std::size_t b_off = bi * b_rows_per * b.cols();
+                MatrixT<Precision::F16> a_view(a_rows_per, a.cols());
+                MatrixT<Precision::F16> b_view(b_rows_per, b.cols());
+                std::copy_n(a.span().data() + a_off, a_rows_per * a.cols(), a_view.span().data());
+                std::copy_n(b.span().data() + b_off, b_rows_per * b.cols(), b_view.span().data());
+
+                MatrixT<Precision::F16> c_view(M, N);
+                // f16 无原生 x86 SIMD → 向量化失败是预期行为（§7.2 兼容路径）
+                if (!transA && !transB)
+                    a_view.multiply_to(c_view, b_view);
+                else if (!transA && transB)
+                    a_view.multiply_transposed_to(c_view, b_view);
+                else if (transA && !transB)
+                    a_view.transpose_multiply_to(c_view, b_view);
+                else {
+                    auto a_t = a_view.transpose();
+                    a_t.multiply_transposed_to(c_view, b_view);
+                }
+
+                // 写入结果的对应 batch 行块
+                std::copy_n(c_view.span().begin(), M * N,
+                    result.span().data() + bi * M * N);
+            }
+
+            // alpha 缩放
+            if (alpha != Scalar{1})
+            {
+                auto dst = result.span();
+                for (std::size_t i = 0; i < dst.size(); ++i)
+                    dst[i] = dst[i] * alpha;  // f16 * float → f16
+            }
+            return Tensor::from_matrix(std::move(result));
+        }
+
+        // ── F32 路径（现状，零改动）─────────────────────────────────────
         const Matrix& a = A.cpu_matrix();
         const Matrix& b = B.cpu_matrix();
 
@@ -502,6 +675,303 @@ public:
     {
         A.cpu_matrix().zero();
         return {};
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 扫描级原语（RLA：带状态的顺序归约 + matvec 读出）
+    //
+    // CPU 参考实现（逐头标量循环；顺序归约本质串行，t 维递推无并行切分
+    // 空间）。加法/累加顺序与原 RLA 层静态实现（scan_forward_/
+    // scan_backward_）逐位一致——引擎化后 gradcheck 行为不变。
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── 前缀扫描（forward / backward pass 1 / forward_step）──────────────
+    [[nodiscard]] Result<Tensor> scan_prefix_outer(
+        const Tensor& K, const Tensor& V, const Tensor& P, const Tensor& R,
+        const Tensor& A0, const Tensor& B0, bool has_state,
+        std::size_t dk, std::size_t heads, bool causal,
+        const Tensor& boundary, bool has_bnd) override
+    {
+        for (const auto& t : {K, V, P, R, A0, B0, boundary})
+            if (t.is_gpu())
+                return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+        if (dk == 0 || heads == 0)
+            return std::unexpected(Error{"scan_prefix_outer: dk/heads must be > 0"});
+
+        const Matrix& Km = K.cpu_matrix();
+        const std::size_t rows = Km.rows();
+        const std::size_t seq  = Km.cols();
+        if (rows % (dk * heads) != 0)
+            return std::unexpected(Error{"scan_prefix_outer: K rows not divisible by H*dk"});
+        for (const auto* m : {&V.cpu_matrix(), &P.cpu_matrix(), &R.cpu_matrix()})
+            if (m->rows() != rows || m->cols() != seq)
+                return std::unexpected(Error{"scan_prefix_outer: K/V/P/R shape mismatch"});
+        if (has_state)
+        {
+            if (A0.cpu_matrix().rows() != heads * dk || A0.cpu_matrix().cols() != dk ||
+                B0.cpu_matrix().rows() != heads * dk || B0.cpu_matrix().cols() != dk)
+                return std::unexpected(Error{"scan_prefix_outer: A0/B0 must be (H*dk, dk)"});
+        }
+        if (has_bnd)
+        {
+            const Matrix& bd = boundary.cpu_matrix();
+            if (bd.rows() != 1 || bd.cols() != (rows / (dk * heads)) * seq)
+                return std::unexpected(Error{"scan_prefix_outer: boundary must be (1, B*seq)"});
+        }
+
+        const std::size_t BH = rows / dk;
+        const Matrix& Vm = V.cpu_matrix();
+        const Matrix& Pm = P.cpu_matrix();
+        const Matrix& Rm = R.cpu_matrix();
+        const Matrix& bdm = boundary.cpu_matrix();
+
+        Matrix out(rows * 5, seq);
+        auto out_s = out.span();
+        for (std::size_t bh = 0; bh < BH; ++bh)
+        {
+            const std::size_t r0 = bh * dk;
+            const std::size_t batch = bh / heads;
+            const std::size_t h     = bh % heads;
+            const auto doc_reset = [bdm, batch, seq, has_bnd](std::size_t t) {
+                return has_bnd && bdm.at_unchecked(0, batch * seq + t) != Scalar{0};
+            };
+
+            std::vector<Scalar> A(dk * dk, Scalar{0}), B(dk * dk, Scalar{0}),
+                                qv(dk), kv(dk), vv(dk), num(dk), Aq(dk);
+            if (has_state)
+            {
+                const Matrix& a0m = A0.cpu_matrix();
+                const Matrix& b0m = B0.cpu_matrix();
+                for (std::size_t a = 0; a < dk; ++a)
+                    for (std::size_t b2 = 0; b2 < dk; ++b2)
+                    {
+                        A[a * dk + b2] = a0m.at_unchecked(h * dk + a, b2);
+                        B[a * dk + b2] = b0m.at_unchecked(h * dk + a, b2);
+                    }
+            }
+            if (!causal)  // 双向：先求全集 A, B
+            {
+                for (std::size_t t = 0; t < seq; ++t)
+                {
+                    for (std::size_t j = 0; j < dk; ++j)
+                    {
+                        kv[j] = Km.at_unchecked(r0 + j, t);
+                        vv[j] = Vm.at_unchecked(r0 + j, t);
+                    }
+                    for (std::size_t i = 0; i < dk; ++i)
+                        for (std::size_t j = 0; j < dk; ++j)
+                        {
+                            A[i * dk + j] += kv[i] * kv[j];
+                            B[i * dk + j] += vv[i] * kv[j];
+                        }
+                }
+            }
+            for (std::size_t t = 0; t < seq; ++t)
+            {
+                for (std::size_t j = 0; j < dk; ++j)
+                {
+                    qv[j] = Pm.at_unchecked(r0 + j, t);
+                    kv[j] = Km.at_unchecked(r0 + j, t);
+                    vv[j] = Vm.at_unchecked(r0 + j, t);
+                }
+                if (causal)  // 前缀和含自身 i<=t；文档边界处重置
+                {
+                    if (doc_reset(t))
+                    {
+                        std::fill(A.begin(), A.end(), Scalar{0});
+                        std::fill(B.begin(), B.end(), Scalar{0});
+                    }
+                    for (std::size_t i = 0; i < dk; ++i)
+                        for (std::size_t j = 0; j < dk; ++j)
+                        {
+                            A[i * dk + j] += kv[i] * kv[j];
+                            B[i * dk + j] += vv[i] * kv[j];
+                        }
+                }
+                // num = B·qv；Aq = A·qv
+                for (std::size_t i = 0; i < dk; ++i)
+                {
+                    Scalar acc{0}, acc2{0};
+                    for (std::size_t j = 0; j < dk; ++j)
+                    {
+                        acc  += B[i * dk + j] * qv[j];
+                        acc2 += A[i * dk + j] * qv[j];
+                    }
+                    num[i] = acc;
+                    Aq[i]  = acc2;
+                }
+                Scalar s{0};
+                for (std::size_t j = 0; j < dk; ++j)
+                    s += qv[j] * Aq[j];
+
+                const std::size_t row0 = bh * dk;
+                for (std::size_t i = 0; i < dk; ++i)
+                {
+                    // [0) B·P
+                    out_s[(row0 + i) * seq + t] = num[i];
+                    // [1) A·P
+                    out_s[(rows + row0 + i) * seq + t] = Aq[i];
+                    // [3) s（头内逐行重复）
+                    out_s[(3 * rows + row0 + i) * seq + t] = s;
+                }
+                // [2) B^T·R：(B^T·Rv)[j] = Σ_i B[i,j]·Rv[i]
+                for (std::size_t j = 0; j < dk; ++j)
+                {
+                    Scalar acc{0};
+                    for (std::size_t i = 0; i < dk; ++i)
+                        acc += B[i * dk + j] * Rm.at_unchecked(r0 + i, t);
+                    out_s[(2 * rows + row0 + j) * seq + t] = acc;
+                }
+                // [4) r = R·(B·P)：r = Σ_j Rv[j]·num[j]（头内逐行重复）
+                Scalar r{0};
+                for (std::size_t j = 0; j < dk; ++j)
+                    r += Rm.at_unchecked(r0 + j, t) * num[j];
+                for (std::size_t i = 0; i < dk; ++i)
+                    out_s[(4 * rows + row0 + i) * seq + t] = r;
+            }
+        }
+        return Tensor::from_matrix(std::move(out));
+    }
+
+    // ── 后缀扫描（backward pass 2：gK/gV）────────────────────────────────
+    [[nodiscard]] Result<Tensor> scan_suffix_outer(
+        const Tensor& D, const Tensor& X, const Tensor& Y,
+        std::size_t dk, std::size_t heads, bool causal,
+        const Tensor& boundary, bool has_bnd) override
+    {
+        for (const auto& t : {D, X, Y, boundary})
+            if (t.is_gpu())
+                return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+        if (dk == 0 || heads == 0)
+            return std::unexpected(Error{"scan_suffix_outer: dk/heads must be > 0"});
+
+        const Matrix& Xm = X.cpu_matrix();
+        const std::size_t rows = Xm.rows();
+        const std::size_t seq  = Xm.cols();
+        if (rows % (dk * heads) != 0)
+            return std::unexpected(Error{"scan_suffix_outer: X rows not divisible by H*dk"});
+        const Matrix& Dm = D.cpu_matrix();
+        if (Dm.rows() != rows * dk || Dm.cols() != seq)
+            return std::unexpected(Error{"scan_suffix_outer: D must be (B*H*dk*dk, seq)"});
+        if (Y.cpu_matrix().rows() != rows || Y.cpu_matrix().cols() != seq)
+            return std::unexpected(Error{"scan_suffix_outer: X/Y shape mismatch"});
+        if (has_bnd)
+        {
+            const Matrix& bd = boundary.cpu_matrix();
+            if (bd.rows() != 1 || bd.cols() != (rows / (dk * heads)) * seq)
+                return std::unexpected(Error{"scan_suffix_outer: boundary must be (1, B*seq)"});
+        }
+
+        const std::size_t BH = rows / dk;
+        const Matrix& Ym = Y.cpu_matrix();
+        const Matrix& bdm = boundary.cpu_matrix();
+
+        Matrix out(rows * 3, seq);
+        auto out_s = out.span();
+        for (std::size_t bh = 0; bh < BH; ++bh)
+        {
+            const std::size_t r0 = bh * dk;
+            const std::size_t dbase = bh * dk * dk;
+            const std::size_t batch = bh / heads;
+            const auto doc_reset = [bdm, batch, seq, has_bnd](std::size_t t) {
+                return has_bnd && bdm.at_unchecked(0, batch * seq + t) != Scalar{0};
+            };
+
+            std::vector<Scalar> S(dk * dk, Scalar{0}), xv(dk), yv(dk);
+            for (std::size_t i = seq; i-- > 0;)
+            {
+                if (causal)
+                {
+                    // 后缀和：S = Σ_{t>=i} D_t；跨入前一文档时重置
+                    if (i + 1 < seq && doc_reset(i + 1))
+                        std::fill(S.begin(), S.end(), Scalar{0});
+                    for (std::size_t idx = 0; idx < dk * dk; ++idx)
+                        S[idx] += Dm.at_unchecked(dbase + idx, i);
+                }
+                else
+                {
+                    // 双向：S_i = D_i（Layer 已把全集梯度广播到每一列）
+                    for (std::size_t idx = 0; idx < dk * dk; ++idx)
+                        S[idx] = Dm.at_unchecked(dbase + idx, i);
+                }
+                for (std::size_t j = 0; j < dk; ++j)
+                {
+                    xv[j] = Xm.at_unchecked(r0 + j, i);
+                    yv[j] = Ym.at_unchecked(r0 + j, i);
+                }
+                const std::size_t row0 = bh * dk;
+                for (std::size_t r = 0; r < dk; ++r)
+                {
+                    // [0) S·X：(S·xv)[r] = Σ_c S[r,c]·xv[c]
+                    // [1) S·Y
+                    Scalar sx{0}, sy{0};
+                    for (std::size_t c = 0; c < dk; ++c)
+                    {
+                        sx += S[r * dk + c] * xv[c];
+                        sy += S[r * dk + c] * yv[c];
+                    }
+                    out_s[(row0 + r) * seq + i] = sx;
+                    out_s[(rows + row0 + r) * seq + i] = sy;
+                }
+                // [2) S^T·Y：(S^T·yv)[c] = Σ_r S[r,c]·yv[r]
+                for (std::size_t c = 0; c < dk; ++c)
+                {
+                    Scalar syt{0};
+                    for (std::size_t r = 0; r < dk; ++r)
+                        syt += S[r * dk + c] * yv[r];
+                    out_s[(2 * rows + row0 + c) * seq + i] = syt;
+                }
+            }
+        }
+        return Tensor::from_matrix(std::move(out));
+    }
+
+    // ── 逐列外积（backward 的 dL/dA、dL/dB 物化）─────────────────────────
+    [[nodiscard]] Result<Tensor> outer_col(
+        const Tensor& P, const Tensor& R, const Tensor& S,
+        std::size_t dk, bool has_scale) override
+    {
+        for (const auto& t : {P, R, S})
+            if (t.is_gpu())
+                return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+        if (dk == 0)
+            return std::unexpected(Error{"outer_col: dk must be > 0"});
+
+        const Matrix& Pm = P.cpu_matrix();
+        const std::size_t rows = Pm.rows();
+        const std::size_t seq  = Pm.cols();
+        if (rows % dk != 0)
+            return std::unexpected(Error{"outer_col: rows not divisible by dk"});
+        if (R.cpu_matrix().rows() != rows || R.cpu_matrix().cols() != seq)
+            return std::unexpected(Error{"outer_col: P/R shape mismatch"});
+        if (has_scale &&
+            (S.cpu_matrix().rows() != rows || S.cpu_matrix().cols() != seq))
+            return std::unexpected(Error{"outer_col: S must be (B*H*dk, seq)"});
+
+        const Matrix& Rm = R.cpu_matrix();
+        const Matrix& Sm = S.cpu_matrix();
+
+        Matrix out(rows * dk, seq);
+        auto out_s = out.span();
+        for (std::size_t bh = 0; bh < rows / dk; ++bh)
+        {
+            const std::size_t r0 = bh * dk;
+            const std::size_t obase = bh * dk * dk;
+            for (std::size_t t = 0; t < seq; ++t)
+            {
+                const Scalar sv = has_scale ? Sm.at_unchecked(r0, t) : Scalar{1};
+                for (std::size_t a = 0; a < dk; ++a)
+                {
+                    const Scalar pa = Pm.at_unchecked(r0 + a, t);
+                    for (std::size_t b2 = 0; b2 < dk; ++b2)
+                    {
+                        const Scalar p = pa * Rm.at_unchecked(r0 + b2, t);
+                        out_s[(obase + a * dk + b2) * seq + t] = has_scale ? p * sv : p;
+                    }
+                }
+            }
+        }
+        return Tensor::from_matrix(std::move(out));
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -904,6 +1374,9 @@ public:
         // matmul 输出作为"虚拟寄存器 0"，逐元素链经 Matmul 操作数按 (r,c) 读取。
         // 与 batched_matmul 原语语义一致（A/B 按 batch 垂直切分，转置标志按
         // MatmulSpec 解释），再执行逐元素链（同现有归约预计算模式）。
+        // 实现：复用 Matrix 分块 matmul span 内核（分块 + 并行 + 向量化），替代
+        // 原三层标量循环；DSL 实际只产生 (0,0)/(1,0) 组合（MLP / 注意力 QK^T），
+        // (0,1) 免费覆盖，(1,1) 无调用点，保留标量兜底保证语义一致。
         Matrix matmul_out;
         if (mm)
         {
@@ -915,29 +1388,49 @@ public:
             const std::size_t K = mm_k;
             const ConstSpan& as = spans[mm->a_input];
             const ConstSpan& bs = spans[mm->b_input];
-            matmul_out = Matrix(rows, N);
+            matmul_out = Matrix(rows, N);   // 零初始化：span 内核为累加语义（r += A*B）
             auto out = matmul_out.span();
             for (std::size_t b = 0; b < mm_batch; ++b)
             {
-                const std::size_t a_base = trA ? b * K * M : b * M * K;
-                const std::size_t b_base = trB ? b * N * K : b * K * N;
-                for (std::size_t i = 0; i < M; ++i)
+                // 每批切片：A 存储 (M,K) 或 (K,M)，元素数恒为 M*K；B 同理恒为 K*N。
+                // ConstSpan/Span 是 AST 视图（无到 std::span 的隐式转换），
+                // 与 batched_matmul 一致，用 data()+偏移显式构造 std::span 子区间。
+                const std::size_t a_off = b * M * K;
+                const std::size_t b_off = b * K * N;
+                const auto a_sub = std::span<const Scalar>(as.data() + a_off, M * K);
+                const auto b_sub = std::span<const Scalar>(bs.data() + b_off, K * N);
+                auto c_sub = std::span<Scalar>(out.data() + b * M * N, M * N);
+                if (!trA && !trB)
                 {
-                    for (std::size_t j = 0; j < N; ++j)
-                    {
-                        Scalar s = Scalar{0};
-                        for (std::size_t kk = 0; kk < K; ++kk)
+                    Matrix::multiply_to_span(c_sub, M, N,
+                        a_sub, M, K,
+                        b_sub, K, N);
+                }
+                else if (!trA && trB)
+                {
+                    Matrix::multiply_transposed_to_span(c_sub, M, N,
+                        a_sub, M, K,
+                        b_sub, N, K);
+                }
+                else if (trA && !trB)
+                {
+                    Matrix::transpose_multiply_to_span(c_sub, M, N,
+                        a_sub, K, M,
+                        b_sub, K, N);
+                }
+                else
+                {
+                    // 双转置（DSL 无此组合）：保留原标量循环兜底
+                    const std::size_t a_base = b * K * M;
+                    const std::size_t b_base = b * N * K;
+                    for (std::size_t i = 0; i < M; ++i)
+                        for (std::size_t j = 0; j < N; ++j)
                         {
-                            const Scalar av = trA
-                                ? as[a_base + kk * M + i]
-                                : as[a_base + i * K + kk];
-                            const Scalar bv = trB
-                                ? bs[b_base + j * K + kk]
-                                : bs[b_base + kk * N + j];
-                            s += av * bv;
+                            Scalar s = Scalar{0};
+                            for (std::size_t kk = 0; kk < K; ++kk)
+                                s += as[a_base + kk * M + i] * bs[b_base + j * K + kk];
+                            out[(b * M + i) * N + j] = s;
                         }
-                        out[(b * M + i) * N + j] = s;
-                    }
                 }
             }
         }
@@ -1267,4 +1760,3 @@ public:
 
 } // namespace nn
 
-#endif // NN_COMPUTE_CPU_ENGINE_HPP

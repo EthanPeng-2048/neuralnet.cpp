@@ -1,5 +1,4 @@
-#ifndef NN_CORE_THREAD_POOL_HPP
-#define NN_CORE_THREAD_POOL_HPP
+#pragma once
 
 #include <vector>
 #include <queue>
@@ -13,7 +12,6 @@
 #include <numeric>    // for std::transform_reduce (serial fallback)
 #include <iterator>   // for std::distance
 #include <type_traits>
-#include <chrono>
 
 #include "core_assert.hpp"
 
@@ -42,14 +40,20 @@ namespace nn
         std::atomic<bool> stop_{false};
 
     public:
+        // ── worker 线程索引（每个 worker 在构造时绑定唯一 ID） ──────
+        // 用于 parallel_for_each 内部识别当前执行线程，支持 per-worker 状态
+        // （如 BPE 训练的并行合并 delta 映射）。
+        static thread_local std::size_t tl_worker_index;
+
         explicit ThreadPool(std::size_t num_threads = std::thread::hardware_concurrency())
         {
             if (num_threads == 0) num_threads = 1;
             workers_.reserve(num_threads);
             for (std::size_t i = 0; i < num_threads; ++i)
             {
-                workers_.emplace_back([this]
+                workers_.emplace_back([this, i]
                 {
+                    tl_worker_index = i;
                     for (;;)
                     {
                         std::function<void()> task;
@@ -105,15 +109,29 @@ namespace nn
             return n < 1 ? 1 : n;
         }
 
+        // ── 分片完成：递减 latch；最后一个完成者唤醒 cv 等待者 ──────────
+        // 等待方（wait_for_latch 的无超时 wait / worker 主循环）都挂在
+        // condition_ 上，latch 归零必须通知，否则等待者会永久睡眠。
+        // 用 notify_all：等待者可能同时包含调用者与空闲 worker。
+        void finish_chunk(std::atomic<int>& latch) noexcept
+        {
+            if (latch.fetch_sub(1, std::memory_order_release) == 1)
+                condition_.notify_all();
+        }
+
         // ── work-stealing 等待：调用者不空转，帮忙处理队列任务 ─────────
         // 优化（依据性能审查报告）：
         //   - 旧实现：spin 64 次 + yield，64 次 spin 中反复原子读取消耗电量
         //     CPU 占用率显示 100% 但实际有效计算比例低（调用者空转）
         //   - 新实现：
         //     1) 短自旋（16 次 pause）快速检测 latch 归零——典型情况无 yield 开销
-        //     2) 自旋失败后 try_work_steal：尝试从队列取任务执行（参与计算）
-        //     3) 队列为空时进入 condition_variable 等待，避免 CPU 空转
-        //        （cv.wait_until 短超时 100μs，确保不睡过太久）
+        //     2) 自旋失败后 work-steal：尝试从队列取任务执行（参与计算）
+        //     3) 队列为空时阻塞等待 condition_variable（无超时轮询），
+        //        由 finish_chunk 在 latch 归零时通知唤醒
+        // 线程索引约定：调用者线程帮忙执行偷来的任务时，临时将
+        // tl_worker_index 置为 workers_.size()（调用者 slot），避免
+        // parallel_for_each_indexed 的任务体与 worker 0 撞同一 slot；
+        // 执行完恢复原值（嵌套并行时 worker 保留自己的索引）。
         void wait_for_latch(std::atomic<int>& latch)
         {
             // 阶段 1：短自旋（16 次 pause）——应对 latch 即将归零的快路径
@@ -140,7 +158,12 @@ namespace nn
                 }
                 if (task)
                 {
+                    // 借用"调用者 slot 索引"执行，执行完恢复原值
+                    const std::size_t saved = tl_worker_index;
+                    tl_worker_index = workers_.size();
                     task();
+                    tl_worker_index = saved;
+
                     // 执行完一个任务后回到阶段 1 短自旋
                     for (int spin = 0; spin < 16; ++spin)
                     {
@@ -153,10 +176,10 @@ namespace nn
                 }
                 else
                 {
-                    // 队列为空：用 cv.wait_for 短超时等待，避免纯 yield 反复调度
-                    // 100μs 超时确保即使没任务也能及时唤醒检查 latch
+                    // 队列为空：阻塞等待（无超时）；
+                    // 完成通知来自 finish_chunk，虚假唤醒由谓词兜底
                     std::unique_lock lock(queue_mutex_);
-                    condition_.wait_for(lock, std::chrono::microseconds(100),
+                    condition_.wait(lock,
                         [&latch]() {
                             return latch.load(std::memory_order_acquire) == 0;
                         });
@@ -187,7 +210,8 @@ namespace nn
             // 原子计数器：初始值 = n_chunks
             std::atomic<int> latch{static_cast<int>(n_chunks)};
 
-            // 将前 n_chunks-1 个分块批量入队（仅一次加锁）
+            // 将前 n_chunks-1 个分块批量入队（仅一次加锁）；
+            // 每入队一个任务 notify_one，避免高核机器上唤醒全部 worker
             {
                 std::lock_guard lock(queue_mutex_);
                 std::size_t off = 0;
@@ -200,15 +224,15 @@ namespace nn
                     std::ranges::advance(end, static_cast<std::ptrdiff_t>(len));
                     off += len;
 
-                    tasks_.emplace([beg, end, &func, &latch]()
+                    tasks_.emplace([this, beg, end, &func, &latch]()
                     {
                         for (auto it = beg; it != end; ++it)
                             func(*it);
-                        latch.fetch_sub(1, std::memory_order_release);
+                        finish_chunk(latch);
                     });
+                    condition_.notify_one();
                 }
             }
-            condition_.notify_all();
 
             // 调用者处理最后一个分块（不经过队列，零分配）
             {
@@ -219,10 +243,71 @@ namespace nn
                 std::ranges::advance(beg, static_cast<std::ptrdiff_t>(off));
                 for (auto it = beg; it != last; ++it)
                     func(*it);
-                latch.fetch_sub(1, std::memory_order_release);
+                finish_chunk(latch);
             }
 
             // work-stealing 等待：调用者帮忙处理队列任务而非空转
+            wait_for_latch(latch);
+        }
+
+        // ── 带 worker 索引的并行 for_each ────────────────────────────
+        // 与 parallel_for_each 相同的分区和调度策略，但回调额外接收
+        // worker_index 参数（worker 线程 = 0..size()-1，调用者线程 = size()）。
+        // 用于需要 per-worker 状态（如 BPE 训练的 local delta）的场景，
+        // 调用者可安全使用 index = n_threads 作为独立 slot，避免与 worker 0 冲突。
+        template<typename Iterator, typename Func>
+        void parallel_for_each_indexed(Iterator first, Iterator last, Func&& func)
+        {
+            const auto total = static_cast<std::size_t>(std::ranges::distance(first, last));
+            if (total == 0) return;
+
+            const auto n_chunks = chunk_count(total);
+            if (n_chunks <= 1)
+            {
+                for (auto it = first; it != last; ++it)
+                    func(*it, 0);  // 单线程：index = 0
+                return;
+            }
+
+            const std::size_t base = total / n_chunks;
+            const std::size_t rem  = total % n_chunks;
+
+            std::atomic<int> latch{static_cast<int>(n_chunks)};
+
+            {
+                std::lock_guard lock(queue_mutex_);
+                std::size_t off = 0;
+                for (std::size_t c = 0; c < n_chunks - 1; ++c)
+                {
+                    const std::size_t len = base + (c < rem ? 1 : 0);
+                    auto beg = first;
+                    std::ranges::advance(beg, static_cast<std::ptrdiff_t>(off));
+                    auto end = beg;
+                    std::ranges::advance(end, static_cast<std::ptrdiff_t>(len));
+                    off += len;
+
+                    tasks_.emplace([this, beg, end, &func, &latch]()
+                    {
+                        for (auto it = beg; it != end; ++it)
+                            func(*it, tl_worker_index);
+                        finish_chunk(latch);
+                    });
+                    condition_.notify_one();
+                }
+            }
+
+            // 调用者处理最后一个分块，index = workers_.size()（不与任何 worker 冲突）
+            {
+                const std::size_t c = n_chunks - 1;
+                const std::size_t len = base + (c < rem ? 1 : 0);
+                const std::size_t off = total - len;
+                auto beg = first;
+                std::ranges::advance(beg, static_cast<std::ptrdiff_t>(off));
+                for (auto it = beg; it != last; ++it)
+                    func(*it, workers_.size());
+                finish_chunk(latch);
+            }
+
             wait_for_latch(latch);
         }
 
@@ -258,15 +343,15 @@ namespace nn
                     std::ranges::advance(end, static_cast<std::ptrdiff_t>(len));
                     off += len;
 
-                    tasks_.emplace([beg, end, &func, &latch]()
+                    tasks_.emplace([this, beg, end, &func, &latch]()
                     {
                         for (auto it = beg; it != end; ++it)
                             func(*it);
-                        latch.fetch_sub(1, std::memory_order_release);
+                        finish_chunk(latch);
                     });
+                    condition_.notify_one();
                 }
             }
-            condition_.notify_all();
 
             {
                 const std::size_t c = n_chunks - 1;
@@ -275,7 +360,7 @@ namespace nn
                 std::ranges::advance(beg, static_cast<std::ptrdiff_t>(off));
                 for (auto it = beg; it != last; ++it)
                     func(*it);
-                latch.fetch_sub(1, std::memory_order_release);
+                finish_chunk(latch);
             }
 
             wait_for_latch(latch);
@@ -310,15 +395,15 @@ namespace nn
                     const std::size_t end   = off + len;
                     off += len;
 
-                    tasks_.emplace([start, end, &func, &latch]()
+                    tasks_.emplace([this, start, end, &func, &latch]()
                     {
                         for (std::size_t i = start; i < end; ++i)
                             func(i);
-                        latch.fetch_sub(1, std::memory_order_release);
+                        finish_chunk(latch);
                     });
+                    condition_.notify_one();
                 }
             }
-            condition_.notify_all();
 
             // 调用者处理最后一个分片
             {
@@ -326,7 +411,7 @@ namespace nn
                 const std::size_t start = num_samples - (base + (c < rem ? 1 : 0));
                 for (std::size_t i = start; i < num_samples; ++i)
                     func(i);
-                latch.fetch_sub(1, std::memory_order_release);
+                finish_chunk(latch);
             }
 
             wait_for_latch(latch);
@@ -364,17 +449,17 @@ namespace nn
                     std::ranges::advance(in_end, static_cast<std::ptrdiff_t>(len));
                     off += len;
 
-                    tasks_.emplace([in_beg, in_end, out_beg, &op, &latch]()
+                    tasks_.emplace([this, in_beg, in_end, out_beg, &op, &latch]()
                     {
                         auto in = in_beg;
                         auto out = out_beg;
                         for (; in != in_end; ++in, ++out)
                             *out = op(*in);
-                        latch.fetch_sub(1, std::memory_order_release);
+                        finish_chunk(latch);
                     });
+                    condition_.notify_one();
                 }
             }
-            condition_.notify_all();
 
             {
                 const std::size_t c = n_chunks - 1;
@@ -385,7 +470,7 @@ namespace nn
                 std::ranges::advance(out_beg, static_cast<std::ptrdiff_t>(off));
                 for (; in_beg != last; ++in_beg, ++out_beg)
                     *out_beg = op(*in_beg);
-                latch.fetch_sub(1, std::memory_order_release);
+                finish_chunk(latch);
             }
 
             wait_for_latch(latch);
@@ -426,18 +511,18 @@ namespace nn
                     std::ranges::advance(i1_end, static_cast<std::ptrdiff_t>(len));
                     off += len;
 
-                    tasks_.emplace([i1, i1_end, i2, o, &op, &latch]()
+                    tasks_.emplace([this, i1, i1_end, i2, o, &op, &latch]()
                     {
                         auto it1 = i1;
                         auto it2 = i2;
                         auto out = o;
                         for (; it1 != i1_end; ++it1, ++it2, ++out)
                             *out = op(*it1, *it2);
-                        latch.fetch_sub(1, std::memory_order_release);
+                        finish_chunk(latch);
                     });
+                    condition_.notify_one();
                 }
             }
-            condition_.notify_all();
 
             {
                 const std::size_t c = n_chunks - 1;
@@ -450,7 +535,7 @@ namespace nn
                 std::ranges::advance(o,  static_cast<std::ptrdiff_t>(off));
                 for (; i1 != last1; ++i1, ++i2, ++o)
                     *o = op(*i1, *i2);
-                latch.fetch_sub(1, std::memory_order_release);
+                finish_chunk(latch);
             }
 
             wait_for_latch(latch);
@@ -491,17 +576,17 @@ namespace nn
                     std::ranges::advance(end, static_cast<std::ptrdiff_t>(len));
                     off += len;
 
-                    tasks_.emplace([beg, end, &reduce_op, &transform_op, &partials, &latch, c, init]()
+                    tasks_.emplace([this, beg, end, &reduce_op, &transform_op, &partials, &latch, c, init]()
                     {
                         T local = init;  // 以调用者 init 为单位元（不能用 T{}）
                         for (auto it = beg; it != end; ++it)
                             local = reduce_op(local, transform_op(*it));
                         partials[c] = std::move(local);
-                        latch.fetch_sub(1, std::memory_order_release);
+                        finish_chunk(latch);
                     });
+                    condition_.notify_one();
                 }
             }
-            condition_.notify_all();
 
             {
                 const std::size_t c = n_chunks - 1;
@@ -512,7 +597,7 @@ namespace nn
                 for (auto it = beg; it != last; ++it)
                     local = reduce_op(local, transform_op(*it));
                 partials[c] = std::move(local);
-                latch.fetch_sub(1, std::memory_order_release);
+                finish_chunk(latch);
             }
 
             wait_for_latch(latch);
@@ -558,7 +643,7 @@ namespace nn
                     std::ranges::advance(i1_end, static_cast<std::ptrdiff_t>(len));
                     off += len;
 
-                    tasks_.emplace([i1, i1_end, i2, &reduce_op, &transform_op, &partials, &latch, c, init]()
+                    tasks_.emplace([this, i1, i1_end, i2, &reduce_op, &transform_op, &partials, &latch, c, init]()
                     {
                         T local = init;  // 以调用者 init 为单位元（不能用 T{}）
                         auto it1 = i1;
@@ -566,11 +651,11 @@ namespace nn
                         for (; it1 != i1_end; ++it1, ++it2)
                             local = reduce_op(local, transform_op(*it1, *it2));
                         partials[c] = std::move(local);
-                        latch.fetch_sub(1, std::memory_order_release);
+                        finish_chunk(latch);
                     });
+                    condition_.notify_one();
                 }
             }
-            condition_.notify_all();
 
             {
                 const std::size_t c = n_chunks - 1;
@@ -583,7 +668,7 @@ namespace nn
                 for (; i1 != last1; ++i1, ++i2)
                     local = reduce_op(local, transform_op(*i1, *i2));
                 partials[c] = std::move(local);
-                latch.fetch_sub(1, std::memory_order_release);
+                finish_chunk(latch);
             }
 
             wait_for_latch(latch);
@@ -612,7 +697,16 @@ namespace nn
         ThreadPool& operator=(ThreadPool&&) = delete;
 
         [[nodiscard]] std::size_t size() const noexcept { return workers_.size(); }
+
+        // 返回当前线程的 worker 索引（0..size()-1）。
+        // 非 worker 线程默认返回 0；当调用者线程在 wait_for_latch 中帮忙
+        // 执行偷来的任务、或处理 parallel_for_each_indexed 的调用者分片时，
+        // 返回 size()（调用者 slot，不与任何 worker 冲突）。
+        [[nodiscard]] static std::size_t worker_index() noexcept { return tl_worker_index; }
     };
+
+    // thread_local 定义（inline，ODR-safe）
+    inline thread_local std::size_t ThreadPool::tl_worker_index = 0;
 
     // ── 全局线程池单例 ─────────────────────────────────────────────────────
     inline ThreadPool& global_thread_pool()
@@ -623,4 +717,3 @@ namespace nn
 
 } // namespace nn
 
-#endif // NN_CORE_THREAD_POOL_HPP

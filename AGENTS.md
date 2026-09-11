@@ -43,22 +43,92 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 
 ## 4. 分层架构（L0→L5，严格单向依赖，上层只依赖下层公有接口）
 
-```
-L5 入口    src/*.cpp（mnist/text/tokenizer 的 train/infer）、gui.py
-L4 领域    domain_*.hpp（模型工厂：build_mnist_* / build_gpt_model / Tokenizer）
-L3 实现    model_container.hpp（Model 容器）、model_spec.hpp、model_serialization.hpp
-L2 计算    compute_engine.hpp（引擎抽象）、compute_cpu/gpu_engine.hpp、compute_layer/loss/optimizer.hpp
-L1 代数    algebra_*.hpp（Matrix、表达式模板 AST、compute::apply）
-L0 硬件    core_config.hpp（Scalar=float、BLOCK_SIZE=64、SmartPolicy）、core_threadpool/errors/assert/file.hpp
+### 4.1 架构概览图
+
+```mermaid
+graph TB
+    subgraph "L5 用户入口层"
+        A["mnist_train/infer"]
+        B["text_train/infer"]
+        C["tokenizer_train/infer"]
+        D["gui.py"]
+    end
+    
+    subgraph "L4 领域构建层"
+        E["domain_mnist.hpp"]
+        F["domain_gpt.hpp"]
+        G["domain_tokenizer.hpp"]
+    end
+    
+    subgraph "L3 实现层"
+        H["model_container.hpp"]
+        I["model_spec.hpp"]
+        J["model_serialization.hpp"]
+    end
+    
+    subgraph "L2 计算层（引擎化）"
+        K["compute_engine.hpp"]
+        L["cpu_engine.hpp"]
+        M["gpu_engine.hpp"]
+        N["compute_layer.hpp"]
+        O["compute_loss.hpp"]
+        P["compute_optimizer.hpp"]
+    end
+    
+    subgraph "L1 代数层"
+        Q["algebra_matrix.hpp"]
+        R["algebra_expr.hpp"]
+        S["algebra_ops.hpp"]
+    end
+    
+    subgraph "L0 硬件层"
+        V["core_config.hpp"]
+        W["core_threadpool.hpp"]
+        X["core_errors.hpp"]
+    end
+    
+    D -->|subprocess| A & B & C
+    A & B & C --> E & F & G
+    E & F & G --> H & I & J
+    H & I & J --> K & N & O & P
+    K --> L & M
+    N & O & P --> Q
+    Q --> R & S
+    Q --> V & W & X
 ```
 
-**核心设计：引擎化（Engine-Based）**
-- Layer 的 `forward/backward` 只写一次，通过 `ComputeEngine&` 参数自动适配 CPU/GPU。没有 `forward_gpu` 这种东西。
-- **算法与原语分离**：Engine 只提供 op-level 原语（`matmul`/`add`/`exp`/`reduce`…），不知道 "ReLU" 是什么；Layer 用原语组合表达算法（`ReLU = max(x,0)`）。
-- 数据流：`Matrix → engine.from_matrix → Tensor[GPU] → forward/loss/optimizer 全程在 GPU → 仅 evaluate 时 to_matrix 回 CPU`。
+### 4.2 核心设计原则
 
-**ComputeEngine 原语分类**（`compute_engine.hpp`）：
-矩阵级 `matmul/batched_matmul/transpose/add_inplace/scale_inplace/zero/axpy_inplace`；归约级 `row/col_reduce_sum/max`；广播级 `broadcast_row/col_inplace`；逐元素 `elementwise_unary/binary/binary_scalar`；数据操作 `slice_rows/insert_rows/gather_rows/scatter_add_rows/rearrange_3d/clone`；批控制 `begin_batch/end_batch`（CPU no-op，GPU 录 command buffer）。
+**引擎化（Engine-Based）**：Layer 的 `forward/backward` 只写一次，通过 `ComputeEngine&` 参数自动适配 CPU/GPU。
+
+**算法与原语分离**：
+- Engine 只提供 op-level 原语（`matmul`/`add`/`exp`/`reduce`…）
+- Layer 用原语组合表达算法（`ReLU = max(x,0)`）
+- Engine 不知道 "ReLU" 是什么
+
+**数据流**：
+```
+Matrix → engine.from_matrix → Tensor[GPU] → forward/loss/optimizer 全程在 GPU → 仅 evaluate 时 to_matrix 回 CPU
+```
+
+### 4.3 ComputeEngine 原语分类
+
+| 类别 | 原语 |
+|------|------|
+| 矩阵级 | `matmul/batched_matmul/transpose/add_inplace/scale_inplace/zero/axpy_inplace` |
+| 归约级 | `row/col_reduce_sum/max` |
+| 广播级 | `broadcast_row/col_inplace` |
+| 逐元素 | `elementwise_unary/binary/binary_scalar` |
+| 数据操作 | `slice_rows/insert_rows/gather_rows/scatter_add_rows/rearrange_3d/clone` |
+| 扫描级 | `scan_prefix_outer/scan_suffix_outer/outer_col`（RLA/RAPT，dk≤64，见 docs/15 §7） |
+| 批控制 | `begin_batch/end_batch`（CPU no-op，GPU 录 command buffer） |
+
+### 4.4 理解优先级（建议学习顺序）
+
+1. **先理解 L0-L1**（基础数据结构）：`Matrix`、`Tensor`、`Scalar`
+2. **再理解 L2 核心**：`ComputeEngine` 接口 + 一个简单 Layer（如 `Linear`）
+3. **然后理解 L3**：`Model` 容器如何组合 Layer
+4. **最后理解 L4-L5**：具体模型实现和训练流程
 
 ## 5. 铁律（违反必出 bug）
 
@@ -142,7 +212,7 @@ optimizer.step();
 
 | 文档 | 何时读 |
 |------|--------|
-| `01-architecture.md` | 需要完整分层/数据流/模块详解时 |
+| `01-architecture.md` | 需要完整分层/数据流/模块详解时（**含快速理解指南和理解路线图**） |
 | `02-performance.md` | 性能优化（SmartPolicy、缓存分块、GPU） |
 | `03-quickstart-model.md` | 构建模型 API 教程 |
 | `04-quickstart-train-infer.md` | 训练/推理 CLI + C++ API + GUI |
@@ -158,5 +228,45 @@ optimizer.step();
 | `14-operator-fusion-2.md` | 融合算子二期：matmul 参与 IR 融合 + 跨 kernel 自动融合（P2-05/P2-10，删 M4-M6 手写原语） |
 | `15-rapt-algorithm.md` | RLA / RAPT：ReLU 线性注意力算法设计与实现说明 |
 | `16-zipt-algorithm.md` | AttnZip / ZiPT：记忆压缩解码器算法设计 |
+| `17-pointer-audit.md` | 指针审查：每处指针的改造难度×价值标注 + nn-allow 关账路线（2026-08-30） |
+| `18-understanding-checklist.md` | **理解检查清单：评估理解程度、识别盲区、制定学习计划** |
+| `19-compute-engine-development.md` | **计算引擎开发指南：接口详解、实现模式、添加新原语** |
+| `20-compute-engine-usage.md` | **计算引擎使用指南：张量操作、矩阵运算、表达式融合** |
+| `21-code-review-2026-09-04.md` | **全库 C++ 代码审查报告（2026-09-04，102 文件，P0×0 / P1×48 / P2×92 / P3×95；CpuEmitter 隐性缺陷相关项是多精度 Phase 2 前置条件，见 23）** |
+| `22-rla2.md` | **RLA-2：极简硬截断线性注意力（修正版）：Sum 归一化 / 无衰减 / RMSNorm，O(Ld²) 训练 + O(d²) 推理** |
+| `23-mixed-precision.md` | **多精度计算（f16/混合精度）设计：Precision 类型系统、类型化存储、硬件/兼容路径分派、显式精度推导（无隐式状态）、PrecisionProfile（param/compute/stable/optimizer）、Phase 1/2 分期与验收（docs/13 P4-03）** |
 | `flash_attn_analysis.md` | 两趟式注意力等价 FlashAttention 的融合算子的分析报告 |
 | `DEVELOPMENT_STANDARDS.md` | C++ 编码规范全文 |
+
+
+## 12. 当前状态（2026-08-28）
+
+### 融合二期（docs/14）完成：S1-S5、S7
+
+S7 关键教训（改融合/IR 代码前必读）：
+
+1. **运行时值禁进表达式常量池**（进 `expr_spec_key` 会破坏闭合世界）：`scale` 折进 Q（forward `scale_inplace` + backward 补乘）、`inv_num_valid` 后置 `scale_inplace`。
+2. **BatchCol 视图要求 `(1, BH*seq)`**（doc_ids 按 (b,h) 块重复），`(1, batch*seq)` 会越界。
+3. **RowGather 主输入行数≠网格行数**（loss_vec 在 (1,N) 读 (C,N) logits），校验只查 cols。
+4. `gen_fused` `emit_spec` 的 ±inf 常量必须用 `numeric_limits`。
+5. matmul + 列归约不支持（gen_fused 跳过）。
+6. **PS 删大文件段行号易漂移**、`-replace` 多行静默失败——先 read 再 edit，删前 `git diff` 核对。
+7. `dispatch_compute` 误删后从调用点重建。
+8. **IR 扩展**：MatmulSpec.batch（不进 key，dispatch z）、Row/Col/Batch 操作数(6/7/8)、RowGather(9)/BatchMod(10)/BatchCol(11)；注意力 fwd=m/l/W 表达式+bm(W,V_t)，bwd=R/X 表达式+3 个 bm；CE 稠密 `denom=col_sum(exp(logits-cb(col_max)))`，稀疏 grad/loss_vec 用 Row+RowGather。
+9. **CpuEmitter 产物从不编译**（gen_fused 硬编码 glsl），缺陷全隐性（见下方待修）。
+
+### 全库审查（2026-08-27 审查，08-28 已修）
+
+- **P0 已修**：① grad_gamma 多乘 γ ② vec4 Select mix 序 ③ matmul_tiled .x 条件 ④ matmul 尾链视图读全局行（attn_w_batch_test 4 配置一致，ctest 28/28 全绿）
+- **P1 已修**：BPE vocab≥258、batch-size≥1、patch-size 整除 28、cnn-pool≤28、max-tokens≥1、Conv/MaxPool 构造下溢守卫、gpu_test 失败计数进退出码 + 无 Vulkan return 77
+- **P2 已修**：Muon 0.2√max(m,n)、epoch lr 钳制
+- **未修**：col_reduce 并行非逐字节、VK_TIMEOUT/DEVICE_LOST 错误路径、第三梯队（序列化/GUI/测试质量/set_doc_ids 残留）
+- CE/Adam/AdamW/SGD 公式已验证正确
+
+### 待修：CpuEmitter 隐性缺陷
+
+CpuEmitter 产物从不参与编译（gen_fused 硬编码 glsl），以下缺陷全部隐性：
+
+- `BatchMod`/`BatchCol` 引用未声明 `batch`（ee49f5d 引入）
+- `Row`/`Col`/`Batch`/`Matmul`/`Reduce` 操作数与 `RowGather` 视图走 default 错语义
+- 纯 matmul spec `instrs.back()` UB

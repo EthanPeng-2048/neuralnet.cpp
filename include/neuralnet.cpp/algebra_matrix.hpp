@@ -1,5 +1,4 @@
-#ifndef NN_ALGEBRA_MATRIX_HPP
-#define NN_ALGEBRA_MATRIX_HPP
+#pragma once
 
 #include <algorithm>
 #include <array>
@@ -39,10 +38,23 @@ namespace nn
     //            上层需要向用户报告错误，故使用 Result<T>
     //    - 参见 DEVELOPMENT_STANDARDS.md "分层职责单一" 章节
     // ═══════════════════════════════════════════════════════════════════════
-    class Matrix
+    // ── MatrixT<P> — 类型化矩阵存储（docs/23 D2：存储精度是 P）─────────────
+    // element = elem<P>（f16 / f32）；F32 实例与旧 Matrix 逐字节一致（T1 零回归）。
+    // F16 实例遵循 §7.2 形式化定义：
+    //   matmul / 归约：f16 载入 / f32 累加 / f16 写出（acc_type = f32）
+    //   逐元素：f32 参考计算 + 每算子输出舍入到 f16（f16 运算符语义）
+    // 注意：C++ 不允许模板与同名的 using 别名共存，故模板名为 MatrixT，
+    //       f32 便捷别名保持 Matrix 不变（所有既有代码零改动）。
+    template <Precision P>
+    class MatrixT
     {
+    public:
+        static constexpr Precision precision = P;
+        using element = elem<P>;
+        using acc_type = acc<P>;  // F32: float（= element，现状）；F16: float（f32 累加）
+
     private:
-        std::vector<Scalar> data_{};
+        std::vector<element> data_{};
         std::size_t rows_{0};
         std::size_t cols_{0};
 
@@ -51,7 +63,7 @@ namespace nn
             return row * cols_ + col;
         }
 
-        static void require_same_shape(const Matrix &lhs, const Matrix &rhs, [[maybe_unused]] std::string_view message)
+        static void require_same_shape(const MatrixT &lhs, const MatrixT &rhs, [[maybe_unused]] std::string_view message)
         {
             if (lhs.rows_ != rhs.rows_ || lhs.cols_ != rhs.cols_)
             {
@@ -60,21 +72,21 @@ namespace nn
         }
 
     public:
-        Matrix() = default;
+        MatrixT() = default;
 
-        explicit Matrix(std::size_t rows, std::size_t cols)
+        explicit MatrixT(std::size_t rows, std::size_t cols)
             : data_(rows * cols), rows_(rows), cols_(cols) {}
 
-        // 从标量值初始化矩阵
-        Matrix(std::size_t rows, std::size_t cols, Scalar value)
+        // 从标量值初始化矩阵（host 标量为 f32；F16 实例构造时舍入到 f16）
+        MatrixT(std::size_t rows, std::size_t cols, element value)
             : data_(rows * cols, value), rows_(rows), cols_(cols) {}
 
         // 拷贝/移动构造与赋值：使用默认实现（vector 已提供强异常安全保证）
-        Matrix(const Matrix &other) = default;
-        Matrix(Matrix &&other) noexcept = default;
-        Matrix &operator=(const Matrix &other) = default;
-        Matrix &operator=(Matrix &&other) noexcept = default;
-        ~Matrix() = default;
+        MatrixT(const MatrixT &other) = default;
+        MatrixT(MatrixT &&other) noexcept = default;
+        MatrixT &operator=(const MatrixT &other) = default;
+        MatrixT &operator=(MatrixT &&other) noexcept = default;
+        ~MatrixT() = default;
 
         // ── 就地调整大小（复用已有内存） ──────────────────────────────────
         void resize(std::size_t rows, std::size_t cols)
@@ -87,18 +99,18 @@ namespace nn
 
         // ── std::span 访问（C++20 现代接口，推荐使用） ────────────────────
         // 零开销抽象：编译后等价于裸指针 + 大小，可替代所有 data_ptr() 场景
-        [[nodiscard]] std::span<const Scalar> span() const
+        [[nodiscard]] std::span<const element> span() const
         {
             return {data_.data(), data_.size()};
         }
-        [[nodiscard]] std::span<Scalar> span() noexcept { return {data_.data(), data_.size()}; }
+        [[nodiscard]] std::span<element> span() noexcept { return {data_.data(), data_.size()}; }
 
         // 访问器
         [[nodiscard]] constexpr std::size_t rows() const noexcept { return rows_; }
         [[nodiscard]] constexpr std::size_t cols() const noexcept { return cols_; }
         [[nodiscard]] constexpr std::size_t size() const noexcept { return data_.size(); }
         [[nodiscard]] constexpr bool empty() const noexcept { return data_.empty(); }
-        [[nodiscard]] Scalar at(std::size_t row, std::size_t col) const
+        [[nodiscard]] element at(std::size_t row, std::size_t col) const
         {
             if (row >= rows_ || col >= cols_)
             {
@@ -106,7 +118,7 @@ namespace nn
             }
             return data_[index(row, col)];
         }
-        void set_value(std::size_t row, std::size_t col, Scalar value)
+        void set_value(std::size_t row, std::size_t col, element value)
         {
             if (row >= rows_ || col >= cols_)
             {
@@ -114,19 +126,19 @@ namespace nn
             }
             data_[index(row, col)] = value;
         }
-        [[nodiscard]] constexpr Scalar at_unchecked(std::size_t row, std::size_t col) const noexcept { return data_[index(row, col)]; } // 无校验
-        constexpr void set_value_unchecked(std::size_t row, std::size_t col, Scalar value) noexcept { data_[index(row, col)] = value; } // 无校验
+        [[nodiscard]] constexpr element at_unchecked(std::size_t row, std::size_t col) const noexcept { return data_[index(row, col)]; } // 无校验
+        constexpr void set_value_unchecked(std::size_t row, std::size_t col, element value) noexcept { data_[index(row, col)] = value; } // 无校验
 
         // ── 转置（返回新矩阵） ─────────────────────────────────────────────
-        [[nodiscard]] Matrix transpose() const
+        [[nodiscard]] MatrixT transpose() const
         {
-            Matrix result(cols_, rows_);
+            MatrixT result(cols_, rows_);
             transpose_to(result);
             return result;
         }
 
         // ── 转置到预分配缓冲区（零分配热路径） ─────────────────────────────
-        void transpose_to(Matrix &result) const
+        void transpose_to(MatrixT &result) const
         {
             NN_ASSERT(&result != this, "transpose_to: self-referencing not supported");
             result.resize(cols_, rows_);
@@ -171,9 +183,9 @@ namespace nn
         // ── 基于 span 的矩阵乘法（零拷贝，供 batched_matmul 等场景使用） ──
         // 从 a/b 的子区间直接计算，无需构造临时 Matrix 拷贝
         static void multiply_to_span(
-            std::span<Scalar> r, std::size_t M, std::size_t N,
-            std::span<const Scalar> a, std::size_t /*a_rows*/, std::size_t a_cols,
-            std::span<const Scalar> b, std::size_t b_rows, std::size_t b_cols)
+            std::span<element> r, std::size_t M, std::size_t N,
+            std::span<const element> a, std::size_t /*a_rows*/, std::size_t a_cols,
+            std::span<const element> b, std::size_t b_rows, std::size_t b_cols)
         {
             NN_ASSERT(a_cols == b_rows, "multiply_to_span: inner dimension mismatch");
             (void)b_rows;  // NN_ASSERT 在 Release 模式下展开为空，参数仅用于断言
@@ -198,11 +210,11 @@ namespace nn
                     const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
                     const std::size_t k_len = k_end - k_start;
                     const std::size_t j_len = j_end - j_start;
-                    std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                    std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                     for (std::size_t jj = 0; jj < j_len; ++jj)
                         for (std::size_t kk = 0; kk < k_len; ++kk)
                             b_block[jj * k_len + kk] = b[(k_start + kk) * b_cols + (j_start + jj)];
-                    const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
+                    const auto b_block_span = std::span<const element>(b_block.data(), k_len * j_len);
                     for (std::size_t i = i_start; i < i_end; ++i)
                     {
                         const auto a_row = a.subspan(i * a_cols + k_start);
@@ -210,10 +222,11 @@ namespace nn
                         for (std::size_t j = 0; j < j_len; ++j)
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                            Scalar sum = 0.0;
+                            acc_type sum = acc_type{0};
+                            NN_VECTORIZE_PRAGMA
                             for (std::size_t kk = 0; kk < k_len; ++kk)
-                                sum += a_row[kk] * b_col[kk];
-                            r_row[j] += sum;
+                                sum += static_cast<acc_type>(a_row[kk]) * static_cast<acc_type>(b_col[kk]);
+                            r_row[j] += static_cast<element>(sum);
                         }
                     }
                 }
@@ -230,9 +243,9 @@ namespace nn
 
         // ── 基于 span 的矩阵乘法（B 转置，零拷贝） ─────────────────────────
         static void multiply_transposed_to_span(
-            std::span<Scalar> r, std::size_t M, std::size_t N,
-            std::span<const Scalar> a, std::size_t /*a_rows*/, std::size_t a_cols,
-            std::span<const Scalar> bt, std::size_t /*bt_rows*/, std::size_t bt_cols)
+            std::span<element> r, std::size_t M, std::size_t N,
+            std::span<const element> a, std::size_t /*a_rows*/, std::size_t a_cols,
+            std::span<const element> bt, std::size_t /*bt_rows*/, std::size_t bt_cols)
         {
             NN_ASSERT(a_cols == bt_cols, "multiply_transposed_to_span: inner dimension mismatch");
             (void)bt_cols;  // NN_ASSERT 在 Release 模式下展开为空，参数仅用于断言
@@ -256,11 +269,11 @@ namespace nn
                     const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
                     const std::size_t k_len = k_end - k_start;
                     const std::size_t j_len = j_end - j_start;
-                    std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                    std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                     for (std::size_t jj = 0; jj < j_len; ++jj)
                         for (std::size_t kk = 0; kk < k_len; ++kk)
                             b_block[jj * k_len + kk] = bt[(j_start + jj) * K + (k_start + kk)];
-                    const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
+                    const auto b_block_span = std::span<const element>(b_block.data(), k_len * j_len);
                     for (std::size_t i = i_start; i < i_end; ++i)
                     {
                         const auto a_row = a.subspan(i * K + k_start);
@@ -268,10 +281,11 @@ namespace nn
                         for (std::size_t j = 0; j < j_len; ++j)
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                            Scalar sum = 0.0;
+                            acc_type sum = acc_type{0};
+                            NN_VECTORIZE_PRAGMA
                             for (std::size_t kk = 0; kk < k_len; ++kk)
-                                sum += a_row[kk] * b_col[kk];
-                            r_row[j] += sum;
+                                sum += static_cast<acc_type>(a_row[kk]) * static_cast<acc_type>(b_col[kk]);
+                            r_row[j] += static_cast<element>(sum);
                         }
                     }
                 }
@@ -288,9 +302,9 @@ namespace nn
 
         // ── 基于 span 的矩阵乘法（A 转置，零拷贝） ─────────────────────────
         static void transpose_multiply_to_span(
-            std::span<Scalar> r, std::size_t M, std::size_t N,
-            std::span<const Scalar> a, std::size_t a_rows, std::size_t a_cols,
-            std::span<const Scalar> b, std::size_t b_rows, std::size_t b_cols)
+            std::span<element> r, std::size_t M, std::size_t N,
+            std::span<const element> a, std::size_t a_rows, std::size_t a_cols,
+            std::span<const element> b, std::size_t b_rows, std::size_t b_cols)
         {
             NN_ASSERT(a_rows == b_rows, "transpose_multiply_to_span: inner dimension mismatch");
             (void)b_rows;  // NN_ASSERT 在 Release 模式下展开为空，参数仅用于断言
@@ -315,26 +329,27 @@ namespace nn
                     const std::size_t k_len = k_end - k_start;
                     const std::size_t j_len = j_end - j_start;
                     const std::size_t i_len = i_end - i_start;
-                    std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> a_block{};
+                    std::array<element, BLOCK_SIZE * BLOCK_SIZE> a_block{};
                     for (std::size_t ii = 0; ii < i_len; ++ii)
                         for (std::size_t kk = 0; kk < k_len; ++kk)
                             a_block[ii * k_len + kk] = a[(k_start + kk) * a_cols + (i_start + ii)];
-                    std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                    std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                     for (std::size_t jj = 0; jj < j_len; ++jj)
                         for (std::size_t kk = 0; kk < k_len; ++kk)
                             b_block[jj * k_len + kk] = b[(k_start + kk) * b_cols + (j_start + jj)];
-                    const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
+                    const auto b_block_span = std::span<const element>(b_block.data(), k_len * j_len);
                     for (std::size_t i = 0; i < i_len; ++i)
                     {
-                        const auto a_row = std::span<const Scalar>(a_block.data() + i * k_len, k_len);
+                        const auto a_row = std::span<const element>(a_block.data() + i * k_len, k_len);
                         auto r_row = r.subspan((i_start + i) * N + j_start);
                         for (std::size_t j = 0; j < j_len; ++j)
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                            Scalar sum = 0.0;
+                            acc_type sum = acc_type{0};
+                            NN_VECTORIZE_PRAGMA
                             for (std::size_t kk = 0; kk < k_len; ++kk)
-                                sum += a_row[kk] * b_col[kk];
-                            r_row[j] += sum;
+                                sum += static_cast<acc_type>(a_row[kk]) * static_cast<acc_type>(b_col[kk]);
+                            r_row[j] += static_cast<element>(sum);
                         }
                     }
                 }
@@ -351,7 +366,7 @@ namespace nn
 
         // ── 矩阵乘法到预分配缓冲区（零分配热路径） ─────────────────────────
         // 使用 std::span（C++20）提供类型安全的非拥有视图
-        void multiply_to(Matrix &result, const Matrix &other) const
+        void multiply_to(MatrixT &result, const MatrixT &other) const
         {
             NN_ASSERT(&result != this, "multiply_to: self-referencing not supported");
             const std::size_t M = rows_;
@@ -383,11 +398,11 @@ namespace nn
                     const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
                     const std::size_t k_len = k_end - k_start;
                     const std::size_t j_len = j_end - j_start;
-                    std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                    std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                     for (std::size_t jj = 0; jj < j_len; ++jj)
                         for (std::size_t kk = 0; kk < k_len; ++kk)
                             b_block[jj * k_len + kk] = b[(k_start + kk) * N + (j_start + jj)];
-                    const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
+                    const auto b_block_span = std::span<const element>(b_block.data(), k_len * j_len);
                     for (std::size_t i = i_start; i < i_end; ++i)
                     {
                         const auto a_row = a.subspan(i * K + k_start);
@@ -395,11 +410,11 @@ namespace nn
                         for (std::size_t j = 0; j < j_len; ++j)
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                            Scalar sum = 0.0;
-#pragma clang loop vectorize(assume_safety)
+                            acc_type sum = acc_type{0};
+                            NN_VECTORIZE_PRAGMA
                             for (std::size_t kk = 0; kk < k_len; ++kk)
-                                sum += a_row[kk] * b_col[kk];
-                            r_row[j] += sum;
+                                sum += static_cast<acc_type>(a_row[kk]) * static_cast<acc_type>(b_col[kk]);
+                            r_row[j] += static_cast<element>(sum);
                         }
                     }
                 }
@@ -424,11 +439,11 @@ namespace nn
                             const std::size_t k_len = k_end - k_start;
                             const std::size_t j_len = j_end - j_start;
 
-                            std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                            std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                             for (std::size_t jj = 0; jj < j_len; ++jj)
                                 for (std::size_t kk = 0; kk < k_len; ++kk)
                                     b_block[jj * k_len + kk] = b[(k_start + kk) * N + (j_start + jj)];
-                            const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
+                            const auto b_block_span = std::span<const element>(b_block.data(), k_len * j_len);
 
                             for (std::size_t i = i_start; i < i_end; ++i)
                             {
@@ -437,11 +452,11 @@ namespace nn
                                 for (std::size_t j = 0; j < j_len; ++j)
                                 {
                                     const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                                    Scalar sum = 0.0;
-#pragma clang loop vectorize(assume_safety)
+                                    acc_type sum = acc_type{0};
+                                    NN_VECTORIZE_PRAGMA
                                     for (std::size_t kk = 0; kk < k_len; ++kk)
-                                        sum += a_row[kk] * b_col[kk];
-                                    r_row[j] += sum;
+                                        sum += static_cast<acc_type>(a_row[kk]) * static_cast<acc_type>(b_col[kk]);
+                                    r_row[j] += static_cast<element>(sum);
                                 }
                             }
                         }
@@ -455,7 +470,7 @@ namespace nn
         // 
         // 维度要求：this=(M,K), b_trans=(N,K) → result=(M,N)
         // 即 C[m][n] = Σ_k A[m][k] * B[n][k]
-        void multiply_transposed_to(Matrix &result, const Matrix &b_trans) const
+        void multiply_transposed_to(MatrixT &result, const MatrixT &b_trans) const
         {
             NN_ASSERT(&result != this && &result != &b_trans, "multiply_transposed_to: self-referencing not supported");
             NN_ASSERT(cols_ == b_trans.cols_, "multiply_transposed_to: inner dimensions mismatch");
@@ -485,11 +500,11 @@ namespace nn
                     const std::size_t k_len = k_end - k_start;
                     const std::size_t j_len = j_end - j_start;
                     // B^T 块加载：B[n][k] 从 bt[n * K + k] 读取
-                    std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                    std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                     for (std::size_t jj = 0; jj < j_len; ++jj)
                         for (std::size_t kk = 0; kk < k_len; ++kk)
                             b_block[jj * k_len + kk] = bt[(j_start + jj) * K + (k_start + kk)];
-                    const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
+                    const auto b_block_span = std::span<const element>(b_block.data(), k_len * j_len);
                     for (std::size_t i = i_start; i < i_end; ++i)
                     {
                         const auto a_row = a.subspan(i * K + k_start);
@@ -497,10 +512,11 @@ namespace nn
                         for (std::size_t j = 0; j < j_len; ++j)
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                            Scalar sum = 0.0;
+                            acc_type sum = acc_type{0};
+                            NN_VECTORIZE_PRAGMA
                             for (std::size_t kk = 0; kk < k_len; ++kk)
-                                sum += a_row[kk] * b_col[kk];
-                            r_row[j] += sum;
+                                sum += static_cast<acc_type>(a_row[kk]) * static_cast<acc_type>(b_col[kk]);
+                            r_row[j] += static_cast<element>(sum);
                         }
                     }
                 }
@@ -525,11 +541,11 @@ namespace nn
                             const std::size_t k_len = k_end - k_start;
                             const std::size_t j_len = j_end - j_start;
 
-                            std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                            std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                             for (std::size_t jj = 0; jj < j_len; ++jj)
                                 for (std::size_t kk = 0; kk < k_len; ++kk)
                                     b_block[jj * k_len + kk] = bt[(j_start + jj) * K + (k_start + kk)];
-                            const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
+                            const auto b_block_span = std::span<const element>(b_block.data(), k_len * j_len);
 
                             for (std::size_t i = i_start; i < i_end; ++i)
                             {
@@ -538,10 +554,11 @@ namespace nn
                                 for (std::size_t j = 0; j < j_len; ++j)
                                 {
                                     const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                                    Scalar sum = 0.0;
+                                    acc_type sum = acc_type{0};
+                                    NN_VECTORIZE_PRAGMA
                                     for (std::size_t kk = 0; kk < k_len; ++kk)
-                                        sum += a_row[kk] * b_col[kk];
-                                    r_row[j] += sum;
+                                        sum += static_cast<acc_type>(a_row[kk]) * static_cast<acc_type>(b_col[kk]);
+                                    r_row[j] += static_cast<element>(sum);
                                 }
                             }
                         }
@@ -555,7 +572,7 @@ namespace nn
         //
         // 维度要求：this=(K,M), b=(K,N) → result=(M,N)
         // 即 C[m][n] = Σ_k A[k][m] * B[k][n]
-        void transpose_multiply_to(Matrix &result, const Matrix &b) const
+        void transpose_multiply_to(MatrixT &result, const MatrixT &b) const
         {
             NN_ASSERT(&result != this && &result != &b, "transpose_multiply_to: self-referencing not supported");
             NN_ASSERT(rows_ == b.rows_, "transpose_multiply_to: inner dimensions mismatch");
@@ -587,29 +604,30 @@ namespace nn
                     const std::size_t i_len = i_end - i_start;
 
                     // A^T 块加载：A^T[m][k] = A[k][m] 从 a[k * M + m] 读取
-                    std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> a_block{};
+                    std::array<element, BLOCK_SIZE * BLOCK_SIZE> a_block{};
                     for (std::size_t ii = 0; ii < i_len; ++ii)
                         for (std::size_t kk = 0; kk < k_len; ++kk)
                             a_block[ii * k_len + kk] = a[(k_start + kk) * M + (i_start + ii)];
 
                     // B 块加载：B[k][n] 从 b_data[k * N + n] 读取
-                    std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                    std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                     for (std::size_t jj = 0; jj < j_len; ++jj)
                         for (std::size_t kk = 0; kk < k_len; ++kk)
                             b_block[jj * k_len + kk] = b_data[(k_start + kk) * N + (j_start + jj)];
-                    const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
+                    const auto b_block_span = std::span<const element>(b_block.data(), k_len * j_len);
 
                     for (std::size_t i = 0; i < i_len; ++i)
                     {
-                        const auto a_row = std::span<const Scalar>(a_block.data() + i * k_len, k_len);
+                        const auto a_row = std::span<const element>(a_block.data() + i * k_len, k_len);
                         auto r_row = r.subspan((i_start + i) * N + j_start);
                         for (std::size_t j = 0; j < j_len; ++j)
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                            Scalar sum = 0.0;
+                            acc_type sum = acc_type{0};
+                            NN_VECTORIZE_PRAGMA
                             for (std::size_t kk = 0; kk < k_len; ++kk)
-                                sum += a_row[kk] * b_col[kk];
-                            r_row[j] += sum;
+                                sum += static_cast<acc_type>(a_row[kk]) * static_cast<acc_type>(b_col[kk]);
+                            r_row[j] += static_cast<element>(sum);
                         }
                     }
                 }
@@ -636,29 +654,30 @@ namespace nn
                             const std::size_t j_len = j_end - j_start;
 
                             // A^T 块加载
-                            std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> a_block{};
+                            std::array<element, BLOCK_SIZE * BLOCK_SIZE> a_block{};
                             for (std::size_t ii = 0; ii < i_len; ++ii)
                                 for (std::size_t kk = 0; kk < k_len; ++kk)
                                     a_block[ii * k_len + kk] = a[(k_start + kk) * M + (i_start + ii)];
 
                             // B 块加载
-                            std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                            std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                             for (std::size_t jj = 0; jj < j_len; ++jj)
                                 for (std::size_t kk = 0; kk < k_len; ++kk)
                                     b_block[jj * k_len + kk] = b_data[(k_start + kk) * N + (j_start + jj)];
-                            const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
+                            const auto b_block_span = std::span<const element>(b_block.data(), k_len * j_len);
 
                             for (std::size_t i = 0; i < i_len; ++i)
                             {
-                                const auto a_row = std::span<const Scalar>(a_block.data() + i * k_len, k_len);
+                                const auto a_row = std::span<const element>(a_block.data() + i * k_len, k_len);
                                 auto r_row = r.subspan((i_start + i) * N + j_start);
                                 for (std::size_t j = 0; j < j_len; ++j)
                                 {
                                     const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                                    Scalar sum = 0.0;
+                                    acc_type sum = acc_type{0};
+                                    NN_VECTORIZE_PRAGMA
                                     for (std::size_t kk = 0; kk < k_len; ++kk)
-                                        sum += a_row[kk] * b_col[kk];
-                                    r_row[j] += sum;
+                                        sum += static_cast<acc_type>(a_row[kk]) * static_cast<acc_type>(b_col[kk]);
+                                    r_row[j] += static_cast<element>(sum);
                                 }
                             }
                         }
@@ -669,7 +688,7 @@ namespace nn
         // ── 累加矩阵乘法（A * B^T，结果累加到 result） ─────────────
         // 计算 result += this * B^T
         // 用于梯度累加：grad_w += grad_output * input^T
-        void multiply_transposed_add_to(Matrix &result, const Matrix &b_trans) const
+        void multiply_transposed_add_to(MatrixT &result, const MatrixT &b_trans) const
         {
             NN_ASSERT(&result != this && &result != &b_trans, "multiply_transposed_add_to: self-referencing");
             NN_ASSERT(cols_ == b_trans.cols_, "multiply_transposed_add_to: inner dimensions mismatch");
@@ -696,11 +715,11 @@ namespace nn
                     const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
                     const std::size_t k_len = k_end - k_start;
                     const std::size_t j_len = j_end - j_start;
-                    std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                    std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                     for (std::size_t jj = 0; jj < j_len; ++jj)
                         for (std::size_t kk = 0; kk < k_len; ++kk)
                             b_block[jj * k_len + kk] = bt[(j_start + jj) * K + (k_start + kk)];
-                    const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
+                    const auto b_block_span = std::span<const element>(b_block.data(), k_len * j_len);
                     for (std::size_t i = i_start; i < i_end; ++i)
                     {
                         const auto a_row = a.subspan(i * K + k_start);
@@ -708,10 +727,11 @@ namespace nn
                         for (std::size_t j = 0; j < j_len; ++j)
                         {
                             const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                            Scalar sum = 0.0;
+                            acc_type sum = acc_type{0};
+                            NN_VECTORIZE_PRAGMA
                             for (std::size_t kk = 0; kk < k_len; ++kk)
-                                sum += a_row[kk] * b_col[kk];
-                            r_row[j] += sum;
+                                sum += static_cast<acc_type>(a_row[kk]) * static_cast<acc_type>(b_col[kk]);
+                            r_row[j] += static_cast<element>(sum);
                         }
                     }
                 }
@@ -736,11 +756,11 @@ namespace nn
                             const std::size_t k_len = k_end - k_start;
                             const std::size_t j_len = j_end - j_start;
 
-                            std::array<Scalar, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                            std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_block{};
                             for (std::size_t jj = 0; jj < j_len; ++jj)
                                 for (std::size_t kk = 0; kk < k_len; ++kk)
                                     b_block[jj * k_len + kk] = bt[(j_start + jj) * K + (k_start + kk)];
-                            const auto b_block_span = std::span<const Scalar>(b_block.data(), k_len * j_len);
+                            const auto b_block_span = std::span<const element>(b_block.data(), k_len * j_len);
 
                             for (std::size_t i = i_start; i < i_end; ++i)
                             {
@@ -749,10 +769,11 @@ namespace nn
                                 for (std::size_t j = 0; j < j_len; ++j)
                                 {
                                     const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                                    Scalar sum = 0.0;
+                                    acc_type sum = acc_type{0};
+                                    NN_VECTORIZE_PRAGMA
                                     for (std::size_t kk = 0; kk < k_len; ++kk)
-                                        sum += a_row[kk] * b_col[kk];
-                                    r_row[j] += sum;
+                                        sum += static_cast<acc_type>(a_row[kk]) * static_cast<acc_type>(b_col[kk]);
+                                    r_row[j] += static_cast<element>(sum);
                                 }
                             }
                         }
@@ -764,11 +785,11 @@ namespace nn
         {
             auto s = span();
             nn::for_each(s.begin(), s.end(),
-                           [scalar](Scalar &value) noexcept { value *= scalar; });
+                           [scalar](element &value) noexcept { value *= scalar; });
         }
 
         // 逐元素加法 inplace
-        void add_inplace(const Matrix &other)
+        void add_inplace(const MatrixT &other)
         {
             require_same_shape(*this, other, "add_inplace dimension mismatch");
             auto s = span();
@@ -798,9 +819,9 @@ namespace nn
         //   result[r][0] = reduce_op(init, transform_op(this[r][0]), ..., transform_op(this[r][cols-1]))
         // 上层可基于此表达 softmax 行最大值/行求和、按行范数等算法。
         template <typename T, typename ReduceOp, typename TransformOp>
-        [[nodiscard]] Matrix row_reduce(T init, ReduceOp&& reduce_op, TransformOp&& transform_op) const
+        [[nodiscard]] MatrixT row_reduce(T init, ReduceOp&& reduce_op, TransformOp&& transform_op) const
         {
-            Matrix result(rows_, 1);
+            MatrixT result(rows_, 1);
             if (rows_ == 0) return result;
 
             const auto self = span();
@@ -816,7 +837,7 @@ namespace nn
                 T acc = init;
                 for (std::size_t c = 0; c < C; ++c)
                     acc = reduce_op(acc, transform_op(row[c]));
-                out[r] = static_cast<Scalar>(acc);
+                out[r] = static_cast<element>(acc);
             };
 
             nn::for_each(row_indices.begin(), row_indices.end(), process_row);
@@ -830,12 +851,12 @@ namespace nn
         //
         // 实现策略：cache-friendly blocked + 行块并行。
         // bench_thresholds 实测：blocked 全面优于 naive（按列跨行扫描），
-        // 行块并行仅在 R >= 1024 且 R*C >= PARALLEL_THRESHOLD 时启用，
+        // 行块并行仅在 R >= 256 且 R*C >= PARALLEL_THRESHOLD 时启用，
         // 详见 bench_thresholds.cpp 测试 2/3。
         template <typename T, typename ReduceOp, typename TransformOp>
-        [[nodiscard]] Matrix col_reduce(T init, ReduceOp&& reduce_op, TransformOp&& transform_op) const
+        [[nodiscard]] MatrixT col_reduce(T init, ReduceOp&& reduce_op, TransformOp&& transform_op) const
         {
-            Matrix result(1, cols_);
+            MatrixT result(1, cols_);
             if (cols_ == 0) return result;
 
             const auto self = span();
@@ -851,15 +872,15 @@ namespace nn
                     T acc = init;
                     for (std::size_t r = 0; r < R; ++r)
                         acc = reduce_op(acc, transform_op(self[r * C + c]));
-                    out[c] = static_cast<Scalar>(acc);
+                    out[c] = static_cast<element>(acc);
                 }
                 return result;
             }
 
             // 行块并行启用条件：R >= COL_REDUCE_PARALLEL_ROWS 且 R*C >= PARALLEL_THRESHOLD。
-            // bench_thresholds 实测：R >= 1024 是行块并行的硬门槛（R<1024 时同步开销主导），
-            // 详见 bench_thresholds.cpp 测试 3。
-            constexpr std::size_t COL_REDUCE_PARALLEL_ROWS = 1024;     // 行数门槛
+            // 门槛由 1024 降至 256：R*C >= 512K 时即使 R=256 每线程也有 >=16K 元素
+            // 的工作量（32 线程假设），同步开销不占主导；256 覆盖常见 d_model=768 场景。
+            constexpr std::size_t COL_REDUCE_PARALLEL_ROWS = 256;      // 行数门槛
             const std::size_t hw_threads = std::thread::hardware_concurrency();
             const std::size_t n_threads = (hw_threads == 0) ? 1 : hw_threads;
             const bool use_parallel =
@@ -871,14 +892,15 @@ namespace nn
             {
                 // ── 单线程行主序扫描 ──
                 for (std::size_t c = 0; c < C; ++c)
-                    out[c] = static_cast<Scalar>(init);
+                    out[c] = static_cast<element>(init);
                 for (std::size_t r = 0; r < R; ++r)
                 {
-                    const Scalar* row = self.data() + r * C;
+                    // 行视图：std::span::subspan 零成本（ptr+len），替代裸指针行起点
+                    const auto row = self.subspan(r * C, C);
                     for (std::size_t c = 0; c < C; ++c)
                     {
-                        Scalar v = static_cast<Scalar>(transform_op(row[c]));
-                        out[c] = static_cast<Scalar>(reduce_op(static_cast<T>(out[c]), v));
+                        element v = static_cast<element>(transform_op(row[c]));
+                        out[c] = static_cast<element>(reduce_op(static_cast<T>(out[c]), v));
                     }
                 }
                 return result;
@@ -900,13 +922,14 @@ namespace nn
                 [self, &local_acc, &reduce_op, &transform_op, C, base, rem](std::size_t t) noexcept {
                     const std::size_t r0 = t * base + std::min(t, rem);
                     const std::size_t r_end = (t + 1) * base + std::min(t + 1, rem);
-                    auto* acc = local_acc.data() + t * C;
+                    // 本线程累加器行视图（lambda 体内局部，捕获语义不受影响）
+                    auto acc = std::span(local_acc).subspan(t * C, C);
                     for (std::size_t r = r0; r < r_end; ++r)
                     {
-                        const Scalar* row = self.data() + r * C;
+                        const auto row = self.subspan(r * C, C);
                         for (std::size_t c = 0; c < C; ++c)
                         {
-                            Scalar v = static_cast<Scalar>(transform_op(row[c]));
+                            element v = static_cast<element>(transform_op(row[c]));
                             acc[c] = reduce_op(acc[c], v);
                         }
                     }
@@ -915,12 +938,12 @@ namespace nn
             // 归并阶段：串行合并 n_threads 组累加器到 out[c]
             // 第 0 组直接写入，其余组归并进来（reduce_op 满足结合律，结果与单线程一致）
             for (std::size_t c = 0; c < C; ++c)
-                out[c] = static_cast<Scalar>(local_acc[c]);  // 组 0
+                out[c] = static_cast<element>(local_acc[c]);  // 组 0
             for (std::size_t t = 1; t < n_threads; ++t)
             {
-                const auto* acc = local_acc.data() + t * C;
+                const auto acc = std::span(local_acc).subspan(t * C, C);
                 for (std::size_t c = 0; c < C; ++c)
-                    out[c] = static_cast<Scalar>(reduce_op(static_cast<T>(out[c]), acc[c]));
+                    out[c] = static_cast<element>(reduce_op(static_cast<T>(out[c]), acc[c]));
             }
             return result;
         }
@@ -929,36 +952,58 @@ namespace nn
         // this[r][c] = op(this[r][c], row_vec[r][0])，row_vec 形状必须为 (rows_, 1)
         // 上层可基于此表达 softmax 减行最大值、除行求和等算法。
         template <typename F>
-        void broadcast_row_inplace(const Matrix& row_vec, F&& op)
+        void broadcast_row_inplace(const MatrixT& row_vec, F&& op)
         {
             NN_ASSERT(row_vec.rows_ == rows_ && row_vec.cols_ == 1, "row_vec shape mismatch");
             const auto v = row_vec.span();
+            const std::size_t R = rows_;
             const std::size_t C = cols_;
             auto d = span();
-            auto idx = std::views::iota(std::size_t{0}, d.size());
-            nn::for_each(idx.begin(), idx.end(),
-                [&d, &v, C, op = std::forward<F>(op)](std::size_t i) noexcept {
-                    d[i] = static_cast<Scalar>(op(d[i], v[i / C]));
-                });
+            // 按行处理：v[r] 每行只取一次（替代逐元素 i/C 除法），行内连续访问可向量化。
+            // 并行阈值与旧实现一致（元素数 >= PARALLEL_THRESHOLD），仅并行粒度由元素改为行。
+            auto process_row = [&d, &v, C, op = std::forward<F>(op)](std::size_t r) noexcept {
+                const element vr = v[r];
+                auto row = d.subspan(r * C, C);
+                for (std::size_t c = 0; c < C; ++c)
+                    row[c] = static_cast<element>(op(row[c], vr));
+            };
+            if (R * C >= PARALLEL_THRESHOLD && R > 1)
+                nn::parallel_for_samples(R, process_row);
+            else
+                for (std::size_t r = 0; r < R; ++r)
+                    process_row(r);
         }
 
         // ── 按列广播（通用数学原语，不是算法） ──────────────────────────
         // this[r][c] = op(this[r][c], col_vec[0][c])，col_vec 形状必须为 (1, cols_)
         // 上层可基于此表达 LayerNorm 减列均值、乘列标准差等算法。
         template <typename F>
-        void broadcast_col_inplace(const Matrix& col_vec, F&& op)
+        void broadcast_col_inplace(const MatrixT& col_vec, F&& op)
         {
             NN_ASSERT(col_vec.rows_ == 1 && col_vec.cols_ == cols_, "col_vec shape mismatch");
             const auto v = col_vec.span();
+            const std::size_t R = rows_;
             const std::size_t C = cols_;
             auto d = span();
-            auto idx = std::views::iota(std::size_t{0}, d.size());
-            nn::for_each(idx.begin(), idx.end(),
-                [&d, &v, C, op = std::forward<F>(op)](std::size_t i) noexcept {
-                    d[i] = static_cast<Scalar>(op(d[i], v[i % C]));
-                });
+            // 按行处理：行内直接用 v[c]（替代逐元素 i%C 取模），行内连续访问可向量化。
+            // 并行阈值与旧实现一致（元素数 >= PARALLEL_THRESHOLD），仅并行粒度由元素改为行。
+            auto process_row = [&d, &v, C, op = std::forward<F>(op)](std::size_t r) noexcept {
+                auto row = d.subspan(r * C, C);
+                for (std::size_t c = 0; c < C; ++c)
+                    row[c] = static_cast<element>(op(row[c], v[c]));
+            };
+            if (R * C >= PARALLEL_THRESHOLD && R > 1)
+                nn::parallel_for_samples(R, process_row);
+            else
+                for (std::size_t r = 0; r < R; ++r)
+                    process_row(r);
         }
     };
+
+    // ── 便捷类型别名 ────────────────────────────────────────────────────
+    using Matrix = MatrixT<Precision::F32>;
+    using MatrixF32 = MatrixT<Precision::F32>;
+    using MatrixF16 = MatrixT<Precision::F16>;
 
     // ═══════════════════════════════════════════════════════════════════════
     // detail 命名空间：逐元素变换的自由函数（原 Matrix 成员方法）
@@ -970,10 +1015,10 @@ namespace nn
     {
         // ── 逐元素一元变换（返回新矩阵） ────────────────────────────────
         // out[i] = func(in[i])，内部自动选择串行/并行。
-        template <typename F>
-        [[nodiscard]] Matrix apply(const Matrix& mat, F&& func)
+        template <Precision P, typename F>
+        [[nodiscard]] MatrixT<P> apply(const MatrixT<P>& mat, F&& func)
         {
-            Matrix result(mat.rows(), mat.cols());
+            MatrixT<P> result(mat.rows(), mat.cols());
             auto s = mat.span();
             auto r = result.span();
             nn::transform(s.begin(), s.end(),
@@ -983,12 +1028,12 @@ namespace nn
 
         // ── 逐元素二元变换（返回新矩阵） ────────────────────────────────
         // out[i] = func(a[i], b[i])
-        template <typename F>
-        [[nodiscard]] Matrix binary_apply(const Matrix& a, const Matrix& b, F&& func)
+        template <Precision P, typename F>
+        [[nodiscard]] MatrixT<P> binary_apply(const MatrixT<P>& a, const MatrixT<P>& b, F&& func)
         {
             NN_ASSERT(a.rows() == b.rows() && a.cols() == b.cols(),
                        "binary_apply dimension mismatch");
-            Matrix result(a.rows(), a.cols());
+            MatrixT<P> result(a.rows(), a.cols());
             auto s = a.span();
             auto o = b.span();
             auto r = result.span();
@@ -999,8 +1044,8 @@ namespace nn
         }
 
         // ── 逐元素二元变换（就地修改） ──────────────────────────────────
-        template <typename F>
-        void binary_apply_inplace(Matrix& a, const Matrix& b, F&& func)
+        template <Precision P, typename F>
+        void binary_apply_inplace(MatrixT<P>& a, const MatrixT<P>& b, F&& func)
         {
             NN_ASSERT(a.rows() == b.rows() && a.cols() == b.cols(),
                        "binary_apply_inplace dimension mismatch");
@@ -1018,4 +1063,3 @@ namespace nn
 #include "backend/compute_gpu_tensor_impl.hpp"
 #endif
 
-#endif // NN_ALGEBRA_MATRIX_HPP

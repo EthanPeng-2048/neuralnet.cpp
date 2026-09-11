@@ -8,8 +8,7 @@
 //
 //  IR-D 落地：本工具经 nn::emitter_registry 选择后端（默认 "glsl" =
 //  GlslEmitter），不再直接绑定 GLSL 生成函数——同一份 canonical IR 可由
-//  CpuEmitter 等其它后端展开（--list-backends 查看；CpuEmitter 生成 C++
-//  直线代码，供调试/交叉验证，不产出 SPIR-V）。
+//  其它后端展开（--list-backends 查看已登记后端）。
 //
 //  表达式**文本只出现在 Layer**；本工具只消费折叠后的结构（派生物）。
 //  产物 fused_registry.hpp 供运行时（GpuEngine::eval_expr / vk_backend）
@@ -26,6 +25,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <span>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -34,7 +34,6 @@
 #include "expr_registry.hpp"
 #include "expr_emitter.hpp"   // IR-D：emitter 抽象（后端选择）
 #include "expr_glsl_gen.hpp"       // 注册 GlslEmitter（默认后端）
-#include "expr_cpu_emitter.hpp"    // 注册 CpuEmitter（IR-D 第二后端，供 --list-backends）
 
 namespace
 {
@@ -60,7 +59,7 @@ namespace
     f.seekg(0, std::ios::beg);
     std::vector<std::uint32_t> v(static_cast<std::size_t>(sz) / sizeof(std::uint32_t));
     if (!v.empty())
-        f.read(reinterpret_cast<char*>(v.data()), sz);
+        nn::read_pod_span(f, std::span(v));
     return v;
 }
 
@@ -197,7 +196,7 @@ int main(int argc, char* argv[])
         const std::string spv_path  = out_dir + "/fused_" + key + ".spv";
 
         // 经 emitter 抽象（IR-D）生成 kernel 源码：默认 GlslEmitter。
-        // 同一份 canonical IR 可由其它后端（CpuEmitter）展开（--list-backends）。
+        // 同一份 canonical IR 可由其它后端展开（--list-backends）。
         auto emitter = nn::emitter_registry::make("glsl");
         if (!emitter)
         {

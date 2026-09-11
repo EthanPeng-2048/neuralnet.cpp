@@ -1,0 +1,34 @@
+// ── outer_col.comp ────────────────────────────────────────────────────
+// 逐列外积原语（backward 物化 dL/dA / dL/dB）：
+//   out[(bh*dk+a)*dk+c, t] = P[a,t]·R[c,t] (· S[t] if has_scale)
+// P/R (B*H*dk, seq); S (B*H*dk, seq) 标量头内逐行重复（读首行）；
+// has_scale=0 时 S 为 dummy。
+// 输出 (B*H*dk², seq)；扁平并行，无 shared memory。
+// ─────────────────────────────────────────────────────────────────────
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufP   { float P[]; };
+layout(std430, binding = 1) readonly  buffer BufR   { float R[]; };
+layout(std430, binding = 2) readonly  buffer BufS   { float S[]; };
+layout(std430, binding = 3) writeonly buffer BufOut { float Out[]; };
+
+layout(push_constant) uniform Push {
+    uint dk, seq, rows, has_scale;
+};
+
+void main() {
+    const uint idx   = gl_GlobalInvocationID.x;
+    if (idx >= rows * dk * seq) return;
+
+    const uint t  = idx % seq;
+    const uint e  = idx / seq;
+    const uint bh = e / (dk * dk);
+    const uint rem = e % (dk * dk);
+    const uint a  = rem / dk;
+    const uint c  = rem % dk;
+    const uint r0 = bh * dk;
+
+    const float p = P[(r0 + a) * seq + t] * R[(r0 + c) * seq + t];
+    Out[idx] = (has_scale == 1u) ? (p * S[r0 * seq + t]) : p;
+}

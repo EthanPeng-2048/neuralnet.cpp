@@ -1,12 +1,14 @@
-#ifndef NN_COMPUTE_LAYER_GPT_HPP
-#define NN_COMPUTE_LAYER_GPT_HPP
+#pragma once
 
 #include "compute_layer_base.hpp"
+#include "compute_layer_mlp.hpp"
+#include "compute_layer_feedforward.hpp"
 #include "compute_layer_attention.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -44,11 +46,20 @@ public:
              std::size_t seq_len = 0,
              PosEncodingType pos_enc = PosEncodingType::Learned,
              ActivationType activation = ActivationType::GeLU,
-             NormType norm_type = NormType::LayerNorm)
+             NormType norm_type = NormType::LayerNorm,
+             PrecisionProfile precision = PrecisionProfile{})
         : self_attn_(d_model, num_heads, max_len, seq_len, pos_enc),
           norm1_(make_norm_layer(d_model, norm_type)),
           ff_(d_model, d_ff, activation),
-          norm2_(make_norm_layer(d_model, norm_type)) {}
+          norm2_(make_norm_layer(d_model, norm_type))
+    {
+        // D7：将精度配置注入所有子层（§9.2）
+        set_precision_profile(precision);
+        self_attn_.set_precision_profile(precision);
+        if (norm1_) norm1_->set_precision_profile(precision);
+        ff_.set_precision_profile(precision);
+        if (norm2_) norm2_->set_precision_profile(precision);
+    }
 
     [[nodiscard]] Result<void> init(ComputeEngine& engine) override
     {
@@ -579,15 +590,21 @@ public:
              std::size_t num_heads, std::size_t d_ff, std::size_t num_layers,
              PosEncodingType pos_enc_type = PosEncodingType::Learned,
              ActivationType activation = ActivationType::GeLU,
-             NormType norm_type = NormType::LayerNorm)
+             NormType norm_type = NormType::LayerNorm,
+             PrecisionProfile precision = PrecisionProfile{})
         : vocab_size_(vocab_size), d_model_(d_model), seq_len_(seq_len),
           ln_f_(make_norm_layer(d_model, norm_type)),
           lm_head_(d_model, vocab_size)
     {
+        // D7：将精度配置注入自身和所有子层（§9.2）
+        set_precision_profile(precision);
+        if (ln_f_) ln_f_->set_precision_profile(precision);
+        lm_head_.set_precision_profile(precision);
+
         blocks_.reserve(num_layers);
         for (std::size_t i = 0; i < num_layers; ++i)
             blocks_.emplace_back(d_model, num_heads, d_ff, seq_len, seq_len,
-                                 pos_enc_type, activation, norm_type);
+                                 pos_enc_type, activation, norm_type, precision);
 
         // 初始化位置编码器（Learned / Sinusoidal / ALiBi / RoPE）
         switch (pos_enc_type)
@@ -1135,4 +1152,3 @@ public:
 // ══════════════════════════════════════════════════════════════════════════
 } // namespace nn
 
-#endif // NN_COMPUTE_LAYER_GPT_HPP

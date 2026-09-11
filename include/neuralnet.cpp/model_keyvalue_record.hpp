@@ -1,5 +1,4 @@
-#ifndef NN_MODEL_KEYVALUE_RECORD_HPP
-#define NN_MODEL_KEYVALUE_RECORD_HPP
+#pragma once
 
 // ══════════════════════════════════════════════════════════════════════════
 //  model_keyvalue_record.hpp — 自描述键值记录（替代 JSON 的轻量二进制格式）
@@ -260,4 +259,3 @@ inline bool KeyValueRecord::get(const std::string &key, std::vector<uint64_t> &o
 
 }  // namespace nn
 
-#endif // NN_MODEL_KEYVALUE_RECORD_HPP

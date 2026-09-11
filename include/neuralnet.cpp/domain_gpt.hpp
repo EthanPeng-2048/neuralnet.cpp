@@ -1,5 +1,4 @@
-#ifndef NN_DOMAIN_GPT_HPP
-#define NN_DOMAIN_GPT_HPP
+#pragma once
 
 // ── domain_gpt.hpp — GPT 领域构建层（引擎化架构） ──────────────────────────
 //
@@ -16,6 +15,7 @@
 #include "compute_engine.hpp"
 #include "model_container.hpp"
 #include "model_spec.hpp"
+#include "precision.hpp"
 
 namespace nn {
 
@@ -39,6 +39,7 @@ struct GptConfig {
     PosEncodingType pos_enc = PosEncodingType::Learned;
     ActivationType activation = ActivationType::GeLU;
     NormType norm_type = NormType::LayerNorm;
+    PrecisionProfile precision;  // 模型级精度配置（§9.1，默认全 F32）
 };
 
 // ── 构建 GPT 模型（GptConfig 版本，推荐使用） ────────────────────────────
@@ -59,7 +60,7 @@ struct GptConfig {
     {
         auto r = model.add<GPTModel>(cfg.vocab_size, cfg.d_model, cfg.seq_len,
                                      cfg.num_heads, cfg.d_ff, cfg.num_layers, cfg.pos_enc,
-                                     cfg.activation, cfg.norm_type);
+                                     cfg.activation, cfg.norm_type, cfg.precision);
         if (!r) return std::unexpected(r.error());
     }
     return model;
@@ -76,11 +77,12 @@ struct GptConfig {
     std::size_t num_layers  = GPT_NUM_LAYERS,
     PosEncodingType pos_enc_type = PosEncodingType::Learned,
     ActivationType activation = ActivationType::GeLU,
-    NormType norm_type = NormType::LayerNorm)
+    NormType norm_type = NormType::LayerNorm,
+    PrecisionProfile precision = PrecisionProfile{})
 {
     return build_gpt_model(engine, GptConfig{
         vocab_size, d_model, seq_len, num_heads, d_ff, num_layers,
-        pos_enc_type, activation, norm_type});
+        pos_enc_type, activation, norm_type, precision});
 }
 
 // ── 从 ModelSpec 构建 GPT 模型 ──────────────────────────────────────────
@@ -88,7 +90,8 @@ struct GptConfig {
 // 统一的 GPTModel 通过 spec.pos_encoding 区分 Learned/Sinusoidal/ALiBi 模式，
 // 因此无需为 ALiBi 单独提供构建函数。
 [[nodiscard]] inline Result<Model> build_gpt_model_from_spec(
-    ComputeEngine& engine, const ModelSpec &spec)
+    ComputeEngine& engine, const ModelSpec &spec,
+    PrecisionProfile precision = PrecisionProfile{})
 {
     // 接受 GPT 类型，或旧格式 ALiBi_GPT 类型（向后兼容旧模型文件）
     if (!spec.is_gpt() && !spec.is_alibi_gpt())
@@ -98,7 +101,7 @@ struct GptConfig {
         engine,
         spec.vocab_size, spec.d_model, spec.seq_len,
         spec.num_heads, spec.d_ff, spec.num_layers,
-        spec.pos_encoding, spec.activation, spec.norm_type);
+        spec.pos_encoding, spec.activation, spec.norm_type, precision);
     if (model)
         model->set_spec(spec);  // 记录架构规格，供 load_model 校验
     return model;
@@ -132,4 +135,3 @@ struct GptConfig {
 
 } // namespace nn
 
-#endif // NN_DOMAIN_GPT_HPP

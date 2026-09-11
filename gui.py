@@ -58,6 +58,7 @@ POSITIONAL_ENCODING_OPTIONS = ["learned", "sinusoidal", "alibi", "rope"]
 ACTIVATION_OPTIONS = ["gelu", "swiglu"]
 NORM_OPTIONS = ["layernorm", "rmsnorm", "batchnorm"]
 GPT_NORM_OPTIONS = ["layernorm", "rmsnorm"]  # GPT 仅支持 LayerNorm/RMSNorm
+PRECISION_OPTIONS = ["f32", "f16"]  # 混合精度选项
 
 
 # ---------- 工具函数 ----------
@@ -771,6 +772,18 @@ class MnistTrainTab(TabBase):
         self.min_lr = _make_entry_row(p, "最小学习率 (min_lr)", r, "1e-6"); r += 1
         self.warmup_epochs = _make_entry_row(p, "预热轮数", r, "0"); r += 1
 
+        # --- 混合精度 ---
+        self.mp_sep_label = _make_label(p, "── 混合精度 ──", r); r += 1
+        self.precision_preset = _make_option_row(p, "精度预设", r,
+            ["f32 (默认)", "f16 (master-weights)"], "f32 (默认)"); r += 1
+        self.precision_param = _make_option_row(p, "参数精度 (param)", r, PRECISION_OPTIONS, "f32"); r += 1
+        self.precision_compute = _make_option_row(p, "计算精度 (compute)", r, PRECISION_OPTIONS, "f32"); r += 1
+        self.precision_stable = _make_option_row(p, "稳定精度 (stable)", r, PRECISION_OPTIONS, "f32"); r += 1
+        self.precision_optimizer = _make_option_row(p, "优化器精度 (optimizer)", r, PRECISION_OPTIONS, "f32"); r += 1
+        self._mp_widgets = [self.mp_sep_label, self.precision_preset,
+                            self.precision_param, self.precision_compute,
+                            self.precision_stable, self.precision_optimizer]
+
         # --- MLP 专用参数 ---
         self.mlp_sep_label = _make_label(p, "── MLP 参数 ──", r); r += 1
         self.layer_dims = _make_entry_row(p, "layer_dims", r, "784,512,256,128,64,10"); r += 1
@@ -803,8 +816,10 @@ class MnistTrainTab(TabBase):
         # 架构/调度切换回调
         self.arch.trace_add("write", self._on_arch_change)
         self.lr_schedule.trace_add("write", self._on_lr_schedule_change)
+        self.precision_preset.trace_add("write", self._on_precision_preset_change)
         self._on_arch_change()
         self._on_lr_schedule_change()
+        self._on_precision_preset_change()
 
         self._add_export_button()
 
@@ -846,6 +861,22 @@ class MnistTrainTab(TabBase):
             else:
                 w.grid()
 
+    def _on_precision_preset_change(self, *args):
+        """精度预设切换时自动填充各精度字段"""
+        preset = self.precision_preset.get()
+        if "f16" in preset:
+            # master-weights 配方：param=f32, compute=f16, stable=f32, optimizer=f32
+            self.precision_param.widget.set("f32")
+            self.precision_compute.widget.set("f16")
+            self.precision_stable.widget.set("f32")
+            self.precision_optimizer.widget.set("f32")
+        else:
+            # 全 f32
+            self.precision_param.widget.set("f32")
+            self.precision_compute.widget.set("f32")
+            self.precision_stable.widget.set("f32")
+            self.precision_optimizer.widget.set("f32")
+
     def collect_args(self):
         args = {"arch": self.arch.get()}
         if self.dataset.get(): args["dataset"] = self.dataset.get()
@@ -865,6 +896,14 @@ class MnistTrainTab(TabBase):
         if self.lr_schedule.get(): args["lr_schedule"] = self.lr_schedule.get()
         if self.min_lr.get(): args["min_lr"] = float(self.min_lr.get())
         if self.warmup_epochs.get(): args["warmup_epochs"] = int(self.warmup_epochs.get())
+        # 混合精度
+        if "f16" in self.precision_preset.get():
+            args["f16"] = True
+        else:
+            args["precision_param"] = self.precision_param.get()
+            args["precision_compute"] = self.precision_compute.get()
+            args["precision_stable"] = self.precision_stable.get()
+            args["precision_optimizer"] = self.precision_optimizer.get()
         # 架构特定参数
         arch = self.arch.get()
         if arch == "mlp":
@@ -1322,6 +1361,17 @@ class GptTrainTab(TabBase):
         self.lr_schedule.trace_add("write", self._on_lr_schedule_change)
         self._on_lr_schedule_change()
 
+        # --- 混合精度 ---
+        _make_label(p, "── 混合精度 ──", r); r += 1
+        self.precision_preset = _make_option_row(p, "精度预设", r,
+            ["f32 (默认)", "f16 (master-weights)"], "f32 (默认)"); r += 1
+        self.precision_param = _make_option_row(p, "参数精度 (param)", r, PRECISION_OPTIONS, "f32"); r += 1
+        self.precision_compute = _make_option_row(p, "计算精度 (compute)", r, PRECISION_OPTIONS, "f32"); r += 1
+        self.precision_stable = _make_option_row(p, "稳定精度 (stable)", r, PRECISION_OPTIONS, "f32"); r += 1
+        self.precision_optimizer = _make_option_row(p, "优化器精度 (optimizer)", r, PRECISION_OPTIONS, "f32"); r += 1
+        self.precision_preset.trace_add("write", self._on_precision_preset_change)
+        self._on_precision_preset_change()
+
         # --- 模型参数 ---
         _make_label(p, "── 模型参数 ──", r); r += 1
         self.d_model = _make_entry_row(p, "d_model", r, "256"); r += 1
@@ -1346,9 +1396,6 @@ class GptTrainTab(TabBase):
 
         # --- GPU 保护 ---
         _make_label(p, "── GPU 保护 ──", r); r += 1
-        self.tdr_retry = _make_option_row(p, "TDR 超时重试", r,
-                                           ["on", "off"], "on"); r += 1
-        self.max_tdr_retries = _make_entry_row(p, "最大重试次数", r, "4"); r += 1
         self.flush_interval = _make_entry_row(p, "flush 间隔", r, "0"); r += 1
         self.checkpoint_every = _make_entry_row(p, "梯度检查点间隔", r, "0"); r += 1
         self.activation_offload_var = _make_checkbox_row(p, "activation offload", r); r += 1
@@ -1407,6 +1454,20 @@ class GptTrainTab(TabBase):
                 self.warmup_epochs.grid_remove()
                 self.warmup_steps.grid()
 
+    def _on_precision_preset_change(self, *args):
+        """精度预设切换时自动填充各精度字段"""
+        preset = self.precision_preset.get()
+        if "f16" in preset:
+            self.precision_param.widget.set("f32")
+            self.precision_compute.widget.set("f16")
+            self.precision_stable.widget.set("f32")
+            self.precision_optimizer.widget.set("f32")
+        else:
+            self.precision_param.widget.set("f32")
+            self.precision_compute.widget.set("f32")
+            self.precision_stable.widget.set("f32")
+            self.precision_optimizer.widget.set("f32")
+
     def collect_args(self):
         def _int(entry, key, skip_vals=("0",)):
             v = entry.get()
@@ -1460,6 +1521,14 @@ class GptTrainTab(TabBase):
         args.update(_int(self.num_heads, "num_heads"))
         args.update(_int(self.num_layers, "num_layers"))
         args.update(_int(self.d_ff, "d_ff"))
+        # 混合精度
+        if "f16" in self.precision_preset.get():
+            args["f16"] = True
+        else:
+            args["precision_param"] = self.precision_param.get()
+            args["precision_compute"] = self.precision_compute.get()
+            args["precision_stable"] = self.precision_stable.get()
+            args["precision_optimizer"] = self.precision_optimizer.get()
         # 架构细节
         args["positional_encoding"] = self.positional_encoding.get()
         args["activation"] = self.activation.get()
@@ -1468,8 +1537,6 @@ class GptTrainTab(TabBase):
         args.update(_int(self.memory_tokens, "memory_tokens"))
         args.update(_int(self.window, "window", skip_vals=()))
         # GPU 保护
-        args["tdr_retry"] = self.tdr_retry.get()
-        args.update(_int(self.max_tdr_retries, "max_tdr_retries"))
         args.update(_int(self.flush_interval, "flush_interval", skip_vals=()))
         args.update(_int(self.checkpoint_every, "checkpoint_every", skip_vals=()))
         args["activation_offload"] = self.activation_offload_var.get()

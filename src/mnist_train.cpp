@@ -17,6 +17,7 @@
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/model_serialization.hpp>
 #include <neuralnet.cpp/domain_mnist.hpp>
+#include <neuralnet.cpp/precision.hpp>
 #include <neuralnet.cpp/cli/cli_engine_factory.hpp>
 #include <neuralnet.cpp/cli/cli_lr_scheduler.hpp>
 #include <neuralnet.cpp/cli/cli_mnist_io.hpp>
@@ -36,6 +37,15 @@
 #include <vector>
 
 using nn::Scalar;
+
+// ── 精度解析辅助 ─────────────────────────────────────────────────────────
+nn::Precision parse_precision(const std::string& name, const char* flag)
+{
+    if (name == "f16" || name == "half") return nn::Precision::F16;
+    if (name == "f32" || name == "float") return nn::Precision::F32;
+    std::cerr << "无效 --" << flag << ": " << name << "，可选: f16, f32\n";
+    std::exit(1);
+}
 
 enum class ArchType { MLP, Transformer, CNN };
 
@@ -90,6 +100,17 @@ void print_usage(const char *prog)
         << "  --warmup-epochs <n> 线性预热轮数 (默认: 0, 即不预热)\n"
         << "  --min-lr <lr>     余弦退火最低学习率 (默认: 1e-6)\n"
         << "  --lr-per-epoch <v1,v2,...>  手动指定每轮学习率 (逗号分隔，优先级最高)\n"
+        << "\n"
+        << "混合精度 (docs/23-mixed-precision.md):\n"
+        << "  --f16              快捷方式：master-weights 配方 (param=f32,compute=f16,stable=f32,optimizer=f32)\n"
+        << "  --precision-param <f16|f32>\n"
+        << "                     权重/参数存储精度 (默认: f32)\n"
+        << "  --precision-compute <f16|f32>\n"
+        << "                     常规算子计算精度 (默认: f32)\n"
+        << "  --precision-stable <f16|f32>\n"
+        << "                     数值敏感算子精度 (默认: f32)\n"
+        << "  --precision-optimizer <f16|f32>\n"
+        << "                     优化器状态精度 (默认: f32)\n"
         << "  --help             显示此帮助信息\n";
 }
 
@@ -136,6 +157,9 @@ struct TrainConfig
     int warmup_epochs = 0;              // 线性预热轮数
     Scalar min_lr = 1e-6f;              // 余弦退火最低 lr
     std::vector<Scalar> lr_per_epoch;   // 手动指定每轮 lr（为空则自动计算）
+
+    // 混合精度控制（docs/23-mixed-precision.md §9.1）
+    nn::PrecisionProfile precision;     // 默认全 F32（D10：零回归）
 };
 
 TrainConfig parse_args(int argc, char *argv[])
@@ -337,6 +361,26 @@ TrainConfig parse_args(int argc, char *argv[])
                 std::exit(1);
             }
         }
+        else if (arg == "--f16")
+        {
+            cfg.precision = nn::profile_master_weights();
+        }
+        else if (arg == "--precision-param" && i + 1 < argc)
+        {
+            cfg.precision.param = parse_precision(argv[++i], "precision-param");
+        }
+        else if (arg == "--precision-compute" && i + 1 < argc)
+        {
+            cfg.precision.compute = parse_precision(argv[++i], "precision-compute");
+        }
+        else if (arg == "--precision-stable" && i + 1 < argc)
+        {
+            cfg.precision.stable = parse_precision(argv[++i], "precision-stable");
+        }
+        else if (arg == "--precision-optimizer" && i + 1 < argc)
+        {
+            cfg.precision.optimizer = parse_precision(argv[++i], "precision-optimizer");
+        }
         else
         {
             std::cerr << "未知参数: " << arg << "\n使用 --help 查看用法\n";
@@ -514,7 +558,7 @@ int main(int argc, char *argv[])
     else
     {
         const auto &dims = spec.is_mlp() ? spec.layer_dims : nn::MNIST_LAYER_DIMS;
-        const char *norm_name =
+        const std::string_view norm_name =
             (spec.norm_type == nn::NormType::RMSNorm) ? "RMSNorm" :
             (spec.norm_type == nn::NormType::BatchNorm) ? "BatchNorm" : "LayerNorm";
         std::cout << "  网络: ";
@@ -579,6 +623,20 @@ int main(int argc, char *argv[])
     }
     auto model = std::move(*model_result);
     model.set_training(true);  // 训练模式：BatchNorm 使用 batch 统计量并更新 running 统计
+
+    // ── 注入精度配置 ──
+    model.set_precision_profile(cfg.precision);
+    {
+        const auto& pp = cfg.precision;
+        if (pp.param != nn::Precision::F32 || pp.compute != nn::Precision::F32 ||
+            pp.stable != nn::Precision::F32 || pp.optimizer != nn::Precision::F32)
+        {
+            std::cout << "混合精度配置: param=" << nn::precision_name(pp.param)
+                      << " compute=" << nn::precision_name(pp.compute)
+                      << " stable=" << nn::precision_name(pp.stable)
+                      << " optimizer=" << nn::precision_name(pp.optimizer) << "\n";
+        }
+    }
 
     if (cfg.load_existing)
     {

@@ -13,8 +13,7 @@
 //   - 内存预算上限保留 max_host_visible / 16，避免在小显存机器上过度分配
 // ─────────────────────────────────────────────────────────────────────────
 
-#ifndef NN_COMPUTE_STAGING_RING_HPP
-#define NN_COMPUTE_STAGING_RING_HPP
+#pragma once
 
 #ifdef NN_HAS_VULKAN
 
@@ -57,6 +56,26 @@ private:
         VkBuffer buffer = VK_NULL_HANDLE;
         void* mapped_ptr = nullptr;
         VkFence fence = VK_NULL_HANDLE;
+        // 跨 submit 数据依赖（P0-1 修复）：本 region 的上传 copy 以该信号量
+        // 为提交期信号；后续读取"由该上传写入的 buffer"的 submit（download /
+        // matmul / batch 帧）在 VkSubmitInfo.pWaitSemaphores 中等它。
+        // 背景：单队列 FIFO 只是执行顺序保证，实测本驱动（NVIDIA V100 +
+        // Windows）在消费方 submit 紧跟上传 submit（<~2ms）时，消费方 GPU
+        // 操作会读到上传写入的旧值（零），host 侧 sleep/fence 等待都能规避
+        // ——即隐式跨 submit 数据依赖不可靠，必须用队列级信号量显式建立
+        // （spec 标准跨 submit 排序原语，host 不阻塞，GPU 在队列内等待）。
+        // 生命周期：region 复用（acquire 等完 fence）时销毁重建为 unsignaled
+        // （vkResetFences 类 API 无信号量等价物；重建开销 ~µs，每 region
+        // 每次复用一次，可忽略）。
+        VkSemaphore semaphore = VK_NULL_HANDLE;
+        // 专属 command buffer（P0-1 修复）：上传 copy 命令录在这里，**永不
+        // 在 pending 状态释放**——VUID-vkFreeCommandBuffers-pCommandBuffers-
+        // 00058 禁止释放 pending（已提交未 signal）的 command buffer。旧实
+        // 现"submit 后立即可复用/释放"是规范违规：实测导致驱动通道排序失
+        // 效（fence 提前 signal、跨 submit 乱序执行）。acquire 等完 fence
+        // 后该 cmd 离开 pending（invalid），vkResetCommandBuffer 复用合法。
+        // 新分配时为 invalid 状态，首次使用前 vkResetCommandBuffer。
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
         bool in_flight = false;
     };
 
@@ -151,6 +170,23 @@ public:
             res = vkCreateFence(device_, &fence_info, nullptr, &r.fence);
             if (res != VK_SUCCESS)
                 return std::unexpected(Error{"vkCreateFence failed: " + std::to_string(res)});
+
+            // 创建跨 submit 信号量（初始 unsignaled，见 Region::semaphore 注释）
+            VkSemaphoreCreateInfo sema_info{};
+            sema_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+            res = vkCreateSemaphore(device_, &sema_info, nullptr, &r.semaphore);
+            if (res != VK_SUCCESS)
+                return std::unexpected(Error{"vkCreateSemaphore failed: " + std::to_string(res)});
+
+            // 分配专属 command buffer（见 Region::cmd 注释：禁止 pending 释放）
+            VkCommandBufferAllocateInfo cmd_alloc{};
+            cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cmd_alloc.commandPool = cmd_pool_;
+            cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cmd_alloc.commandBufferCount = 1;
+            res = vkAllocateCommandBuffers(device_, &cmd_alloc, &r.cmd);
+            if (res != VK_SUCCESS)
+                return std::unexpected(Error{"vkAllocateCommandBuffers failed: " + std::to_string(res)});
         }
 
         return {};
@@ -165,6 +201,10 @@ public:
         {
             if (r.fence != VK_NULL_HANDLE)
                 vkDestroyFence(device_, r.fence, nullptr);
+            if (r.semaphore != VK_NULL_HANDLE)
+                vkDestroySemaphore(device_, r.semaphore, nullptr);
+            if (r.cmd != VK_NULL_HANDLE)
+                vkFreeCommandBuffers(device_, cmd_pool_, 1, &r.cmd);
             if (r.buffer != VK_NULL_HANDLE)
                 vkDestroyBuffer(device_, r.buffer, nullptr);
             // MemoryPool 会自动释放内存
@@ -189,20 +229,27 @@ public:
             vkWaitForFences(device_, 1, &r.fence, VK_TRUE, UINT64_MAX);
             vkResetFences(device_, 1, &r.fence);
             r.in_flight = false;
+            // 上传已完成（fence 信号）→ 其信号量已 signaled。销毁重建为
+            // unsignaled，供本 region 的下次上传使用（信号量无 reset API）。
+            vkDestroySemaphore(device_, r.semaphore, nullptr);
+            VkSemaphoreCreateInfo sema_info{};
+            sema_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+            vkCreateSemaphore(device_, &sema_info, nullptr, &r.semaphore);
         }
 
         return idx;
     }
 
-    // 上传数据到 staging region
+    // 上传数据到 staging region（元素类型无关，memcpy 字节级操作，§6.3）
+    template <typename T>
     [[nodiscard]] Result<void> upload(
-        std::size_t region_idx, std::span<const Scalar> data, VkDeviceSize offset = 0)
+        std::size_t region_idx, std::span<const T> data, VkDeviceSize offset = 0)
     {
         if (region_idx >= regions_.size())
             return std::unexpected(Error{"Invalid region index"});
 
         auto& r = regions_[region_idx];
-        const std::size_t byte_size = data.size() * sizeof(Scalar);
+        const std::size_t byte_size = data.size() * sizeof(T);
 
         if (offset + byte_size > region_size_)
             return std::unexpected(Error{"Upload exceeds staging region size"});
@@ -211,15 +258,16 @@ public:
         return {};
     }
 
-    // 从 staging region 下载数据
+    // 从 staging region 下载数据（元素类型无关，memcpy 字节级操作，§6.3）
+    template <typename T>
     [[nodiscard]] Result<void> download(
-        std::size_t region_idx, std::span<Scalar> data, VkDeviceSize offset = 0)
+        std::size_t region_idx, std::span<T> data, VkDeviceSize offset = 0)
     {
         if (region_idx >= regions_.size())
             return std::unexpected(Error{"Invalid region index"});
 
         auto& r = regions_[region_idx];
-        const std::size_t byte_size = data.size() * sizeof(Scalar);
+        const std::size_t byte_size = data.size() * sizeof(T);
 
         if (offset + byte_size > region_size_)
             return std::unexpected(Error{"Download exceeds staging region size"});
@@ -240,6 +288,25 @@ public:
         return regions_[region_idx].fence;
     }
 
+    // 获取 region 的跨 submit 信号量（消费方 submit 的 pWaitSemaphores 用）
+    [[nodiscard]] VkSemaphore semaphore(std::size_t region_idx) const noexcept
+    {
+        return regions_[region_idx].semaphore;
+    }
+
+    // 获取 region 的专属 command buffer（上传 copy 录制用；acquire 等完
+    // fence 后 vkResetCommandBuffer 复用，禁止在 pending 状态释放/重建）
+    [[nodiscard]] VkCommandBuffer command_buffer(std::size_t region_idx) const noexcept
+    {
+        return regions_[region_idx].cmd;
+    }
+
+    // region 是否 in flight（已提交、fence 尚未被等待）
+    [[nodiscard]] bool in_flight(std::size_t region_idx) const noexcept
+    {
+        return regions_[region_idx].in_flight;
+    }
+
     // 标记 region 为正在使用
     void mark_in_flight(std::size_t region_idx) noexcept
     {
@@ -256,4 +323,3 @@ public:
 } // namespace nn
 
 #endif // NN_HAS_VULKAN
-#endif // NN_COMPUTE_STAGING_RING_HPP

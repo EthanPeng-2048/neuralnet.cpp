@@ -1,5 +1,4 @@
-#ifndef NN_COMPUTE_OPTIMIZER_HPP
-#define NN_COMPUTE_OPTIMIZER_HPP
+#pragma once
 
 // ── compute_optimizer.hpp — 引擎化优化器 ───────────────────────────────────
 //
@@ -26,7 +25,7 @@
 #include <vector>
 
 #include "compute_engine.hpp"
-#include "compute_layer.hpp"  // clone_tensor
+#include "compute_layer_base.hpp"  // clone_tensor
 #include "compute_tensor.hpp"
 #include "expr_dsl.hpp"
 
@@ -664,4 +663,3 @@ public:
 
 } // namespace nn
 
-#endif // NN_COMPUTE_OPTIMIZER_HPP

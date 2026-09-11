@@ -1,5 +1,4 @@
-#ifndef NN_DOMAIN_CNN_HPP
-#define NN_DOMAIN_CNN_HPP
+#pragma once
 
 // ── domain_cnn.hpp — CNN 领域构建层（引擎化架构） ──────────────────────────
 //
@@ -200,4 +199,3 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
 
 } // namespace nn
 
-#endif // NN_DOMAIN_CNN_HPP

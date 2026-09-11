@@ -147,6 +147,8 @@ IR → GlslEmitter / CpuEmitter
 - `generate_glsl` / `generate_glsl_reduce` 保留为 GLSL emitter 实现。
 - 一份 canonical IR 可产出多后端代码，替换"GLSL 专用"实现。
 
+> **注意**：`cpu_emitter.hpp` 已删除（P1-26 修正）。`CpuEmitter` 的逻辑已合并到 `GlslEmitter`，`expr_emitter.hpp` 的 `factory_cpu()` 现在返回 `GlslEmitter` 实例。
+
 ---
 
 ## 7. 落地路径与里程碑

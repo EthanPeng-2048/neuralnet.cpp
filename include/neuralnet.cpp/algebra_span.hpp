@@ -1,5 +1,4 @@
-#ifndef NN_ALGEBRA_SPAN_HPP
-#define NN_ALGEBRA_SPAN_HPP
+#pragma once
 
 // ── span.hpp — 可构建 AST 的智能视图 ─────────────────────────────────────
 // 替代 std::span<Scalar> 作为逐元素操作的载体。
@@ -133,4 +132,3 @@ public:
 
 } // namespace nn
 
-#endif // NN_ALGEBRA_SPAN_HPP

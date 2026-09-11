@@ -1,5 +1,4 @@
-#ifndef NN_COMPUTE_LAYER_HPP
-#define NN_COMPUTE_LAYER_HPP
+#pragma once
 
 // ── compute_layer.hpp — 引擎化计算层（聚合头） ───────────────────────────
 //
@@ -37,4 +36,3 @@
 #include "compute_layer_zipt.hpp"
 #include "compute_layer_rapt.hpp"
 
-#endif // NN_COMPUTE_LAYER_HPP

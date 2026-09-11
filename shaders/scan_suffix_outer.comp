@@ -1,0 +1,74 @@
+// ── scan_suffix_outer.comp ────────────────────────────────────────────
+// RLA 后缀扫描原语（backward pass 2）：
+//   causal=1: S_i = Σ_{t≥i, 同文档} D_t（i+1 为文档起点时先清零）
+//   causal=0: S_i = D_i（Layer 已把全集梯度沿 seq 广播）
+// D (B*H*dk², seq), X/Y (B*H*dk, seq)
+// 输出 (B*H*3*dk, seq)：[0) S·X  [1) S·Y  [2) S^T·Y
+// 1 workgroup/头，256 线程；S 驻 shared 64×65≈16.6KB
+// ─────────────────────────────────────────────────────────────────────
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufD   { float D[]; };
+layout(std430, binding = 1) readonly  buffer BufX   { float X[]; };
+layout(std430, binding = 2) readonly  buffer BufY   { float Y[]; };
+layout(std430, binding = 3) readonly  buffer BufBnd { float Bnd[]; };
+layout(std430, binding = 4) writeonly buffer BufOut { float Out[]; };
+
+layout(push_constant) uniform Push {
+    uint dk, heads, seq, causal, has_bnd, rows;
+};
+
+const uint PAD = 65u;
+shared float sS[64][PAD];
+shared float s_xv[64], s_yv[64];
+
+void main() {
+    const uint bh   = gl_WorkGroupID.y;
+    const uint b    = bh / heads;
+    const uint r0   = bh * dk;
+    const uint dbase = bh * dk * dk;
+    const uint tid  = gl_LocalInvocationID.x;
+
+    // 初始化 S 为零
+    for (uint idx = tid; idx < dk * dk; idx += 256u)
+        sS[idx / dk][idx % dk] = 0.0;
+    barrier();
+
+    for (uint i = seq; i-- > 0u;) {
+        if (causal == 1u) {
+            uint reset = 0u;
+            if (has_bnd == 1u && i + 1u < seq)
+                reset = (Bnd[b * seq + i + 1u] != 0.0) ? 1u : 0u;
+            for (uint idx = tid; idx < dk * dk; idx += 256u) {
+                const uint a = idx / dk, c = idx % dk;
+                if (reset == 1u) sS[a][c] = 0.0;
+                sS[a][c] += D[(dbase + a * dk + c) * seq + i];
+            }
+        } else {
+            for (uint idx = tid; idx < dk * dk; idx += 256u) {
+                const uint a = idx / dk, c = idx % dk;
+                sS[a][c] = D[(dbase + a * dk + c) * seq + i];
+            }
+        }
+        if (tid < dk) {
+            s_xv[tid] = X[(r0 + tid) * seq + i];
+            s_yv[tid] = Y[(r0 + tid) * seq + i];
+        }
+        barrier();
+
+        if (tid < dk) {
+            float sx = 0.0, sy = 0.0, syt = 0.0;
+            for (uint c = 0u; c < dk; ++c) {
+                sx += sS[tid][c] * s_xv[c];
+                sy += sS[tid][c] * s_yv[c];
+            }
+            for (uint r = 0u; r < dk; ++r)
+                syt += sS[r][tid] * s_yv[r];
+            Out[(r0 + tid) * seq + i]               = sx;  // [0) S·X
+            Out[(rows + r0 + tid) * seq + i]          = sy;  // [1) S·Y
+            Out[(2u * rows + r0 + tid) * seq + i]     = syt; // [2) S^T·Y
+        }
+        barrier();
+    }
+}

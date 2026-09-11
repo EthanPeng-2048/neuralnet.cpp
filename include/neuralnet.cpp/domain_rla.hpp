@@ -1,5 +1,4 @@
-#ifndef NN_DOMAIN_RLA_HPP
-#define NN_DOMAIN_RLA_HPP
+#pragma once
 
 // ── domain_rla.hpp — RAPT 领域构建层（ReLU 激活线性注意力语言模型） ──────────
 //
@@ -20,6 +19,7 @@
 #include "compute_engine.hpp"
 #include "model_container.hpp"
 #include "model_spec.hpp"
+#include "precision.hpp"
 #include "domain_gpt.hpp"  // GPT_VOCAB_SIZE 等共享默认超参
 
 namespace nn {
@@ -36,6 +36,7 @@ struct RAPTConfig {
     ActivationType activation = ActivationType::GeLU;
     NormType norm_type        = NormType::LayerNorm;
     bool causal = true;                                  // RAPT 是 causal LM
+    PrecisionProfile precision;  // 模型级精度配置（§9.1，默认全 F32）
 };
 
 // ── 构建 RAPT 模型（推荐使用） ─────────────────────────────────────────
@@ -58,7 +59,7 @@ struct RAPTConfig {
         auto r = model.add<RAPTModel>(
             cfg.vocab_size, cfg.d_model, cfg.seq_len,
             cfg.num_heads, cfg.d_ff, cfg.num_layers,
-            cfg.pos_enc, cfg.activation, cfg.norm_type, cfg.causal);
+            cfg.pos_enc, cfg.activation, cfg.norm_type, cfg.causal, cfg.precision);
         if (!r) return std::unexpected(r.error());
     }
     return model;
@@ -66,7 +67,8 @@ struct RAPTConfig {
 
 // ── 从 ModelSpec 构建 RAPT 模型 ─────────────────────────────────────────
 [[nodiscard]] inline Result<Model> build_rapt_model_from_spec(
-    ComputeEngine& engine, const ModelSpec& spec)
+    ComputeEngine& engine, const ModelSpec& spec,
+    PrecisionProfile precision = PrecisionProfile{})
 {
     if (!spec.is_rapt())
         return std::unexpected(Error{"Invalid ModelSpec type for RAPT: expected RAPT"});
@@ -74,7 +76,7 @@ struct RAPTConfig {
     auto model = build_rapt_model(engine, RAPTConfig{
         spec.vocab_size, spec.d_model, spec.seq_len,
         spec.num_heads, spec.d_ff, spec.num_layers,
-        spec.pos_encoding, spec.activation, spec.norm_type, /*causal=*/true});
+        spec.pos_encoding, spec.activation, spec.norm_type, /*causal=*/true, precision});
     if (model)
         model->set_spec(spec);
     return model;
@@ -108,4 +110,3 @@ struct RAPTConfig {
 
 } // namespace nn
 
-#endif // NN_DOMAIN_RLA_HPP

@@ -1,5 +1,25 @@
 # CMake 3.30+ required for C++26 standard support (stable in 3.30+)
 cmake_minimum_required(VERSION 3.30)
+
+# ── 默认编译器：优先 clang++（依据 报告.txt 2026-08-31 实测） ───────────────
+# 实测 clang++ 自动向量化显著优于 g++（matmul@1024³：49.5 vs 16.6 GFLOPS，
+# 约 3 倍差距）。这里只做"自动默认"，优先级从低到高：
+#   ① 已存在的 CMakeCache（重配置不改变已选编译器）
+#   ② -DCMAKE_CXX_COMPILER=...
+#   ③ CXX 环境变量（CXX=g++ 即可回退 g++）
+#   ④ 本段：PATH 中能找到 clang++ 就用它；找不到则用系统默认编译器
+if(NOT WIN32 AND NOT DEFINED ENV{CXX} AND NOT DEFINED CMAKE_CXX_COMPILER)
+    execute_process(COMMAND /bin/sh -c "command -v clang++"
+                    OUTPUT_VARIABLE NN_DEFAULT_CLANG
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET)
+    if(NN_DEFAULT_CLANG)
+        set(ENV{CXX} "${NN_DEFAULT_CLANG}")
+        message(STATUS "默认 C++ 编译器: clang++（自动向量化优于 g++，见 报告.txt）；"
+                       "如需 g++ 请用 CXX=g++ 或 -DCMAKE_CXX_COMPILER 覆盖")
+    endif()
+endif()
+
 project(neuralnet.cpp VERSION 1.0.0 LANGUAGES CXX)
 
 # ── C++26 标准 ──────────────────────────────────────────────────────────
@@ -28,7 +48,7 @@ endif()
 # - MSVC：     /W4 /permissive-（严格一致性）；保留 /EHsc（ppltasks.h 需要），
 #              不强制 /WX（MSVC 与 clang 警告集不同，代码未按 MSVC 零警告编写）
 if(MSVC)
-    add_compile_options(/W4 /permissive-)
+    add_compile_options(/W4 /permissive- /source-charset:utf-8 /execution-charset:utf-8)
 else()
     add_compile_options(-fno-exceptions -Wall -Wextra -Wpedantic -Werror)
 endif()
@@ -37,6 +57,26 @@ endif()
 # -fexperimental-library 仅 Clang 识别；GCC 不识别会产生警告
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
     add_compile_options(-fexperimental-library)
+    # f16 矩阵乘法（MatrixT<F16>）无原生 x86 SIMD → 优化器无法向量化是预期行为
+    # （§7.2 兼容路径：f32 参考计算 + f16 舍入），抑制 -Wpass-failed 避免 -Werror 下编译失败
+    add_compile_options(-Wno-pass-failed)
+endif()
+# ── C++ 标准库：显式 libstdc++（依据 报告.txt 2026-08-31 实测） ───────────
+# Linux 上 clang 默认即 libstdc++，显式声明是防止构建环境意外切到 libc++
+#（实测 libstdc++ 线程开销更小，内存带宽类原语更快：
+#  add_inplace 0.47 vs 0.67 ms、scale_inplace 0.11 vs 0.25 ms 等）。
+# 如需切到 libc++：-DNN_STDLIB=libc++（需系统装有 libc++）。
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
+   AND (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang"))
+    if(NOT DEFINED NN_STDLIB)
+        set(NN_STDLIB "libstdc++" CACHE STRING "C++ standard library for Clang: libstdc++ / libc++")
+    endif()
+    add_compile_options(-stdlib=${NN_STDLIB})
+endif()
+find_program(CCACHE_FOUND ccache)
+if(CCACHE_FOUND)
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ccache)
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
 endif()
 
 # ── 按构建类型设置优化标志 ───────────────────────────────────────────────
@@ -104,123 +144,75 @@ nn_add_executable(tokenizer_train src/tokenizer_train.cpp)
 nn_add_executable(tokenizer_infer src/tokenizer_infer.cpp)
 list(APPEND NN_APP_TARGETS text_train text_infer tokenizer_train tokenizer_infer)
 
+# ── 层吞吐量基准（CPU/Vulkan GPU；--all 或 --layer <name> 指定） ────────
+nn_add_executable(layer_bench src/layer_bench.cpp)
+list(APPEND NN_APP_TARGETS layer_bench)
+
 # ── 测试 / 验证目标（默认关闭，NN_ENABLE_TESTS=ON 时构建）─────────────
 if(NN_ENABLE_TESTS)
 
-    # GPU 测试（需要 Vulkan）
+    # ══════════════════════════════════════════════════════════════════════
+    # 测试目标（15 个，按功能域分组合并；原 35 个独立目标已精简）
+    # 合并策略：wrapper .cpp 通过 #define main + #include 聚合原测试源文件
+    # ══════════════════════════════════════════════════════════════════════
+
+    # ── GPU 集成测试（需要 Vulkan）────────────────────────────────────────
     nn_add_executable(gpu_test src/gpu_test.cpp)
     list(APPEND NN_TEST_TARGETS gpu_test)
 
-    # ── Attention 一致性验证（forward vs forward_step）──────────────────────
-    nn_add_executable(attn_consistency_test src/attn_consistency_test.cpp)
-    list(APPEND NN_TEST_TARGETS attn_consistency_test)
+    # ── GPU f16 能力检查 + cast/matmul 验证 ──────────────────────────────
+    nn_add_executable(gpu_f16_test src/gpu_f16_test.cpp)
+    list(APPEND NN_TEST_TARGETS gpu_f16_test)
 
-    # ── GPU 注意力 W 表达式 batch 行号回归（多头/多 batch CPU/GPU 一致性，
-    #    4 组配置；回归 2026-08-27 审查 P0-1）────────────────────────────────
-    nn_add_executable(attn_w_batch_test src/attn_w_batch_test.cpp)
-    list(APPEND NN_TEST_TARGETS attn_w_batch_test)
+    # ── 多精度类型系统（f16 转换 / 舍入 / 张量精度 / f16 计算）──────────
+    nn_add_executable(precision_test src/precision_test.cpp)
+    list(APPEND NN_TEST_TARGETS precision_test)
 
-    # ── SwiGLU 数值梯度检查（gradcheck，验证 split/merge 反向正确性）──────────
-    nn_add_executable(swiglu_gradcheck src/swiglu_gradcheck.cpp)
-    list(APPEND NN_TEST_TARGETS swiglu_gradcheck)
+    # ── 分词器正确性（BPE pre_tokenize 对拍 + 标记往返）─────────────────
+    nn_add_executable(tokenizer_test src/tokenizer_test.cpp)
+    list(APPEND NN_TEST_TARGETS tokenizer_test)
 
-    # ── RMSNorm 数值梯度检查（gradcheck，验证 gamma/输入梯度） ───────────────
-    nn_add_executable(rmsnorm_gradcheck src/rmsnorm_gradcheck.cpp)
-    list(APPEND NN_TEST_TARGETS rmsnorm_gradcheck)
+    # ── Attention（梯度检查 + forward 一致性 + batch 行号回归）──────────
+    nn_add_executable(attn_test src/attn_test.cpp)
+    list(APPEND NN_TEST_TARGETS attn_test)
 
-    # ── GPTModel 整链数值梯度检查（gradcheck，验证多层堆叠全部参数梯度） ──────
-    nn_add_executable(gpt_gradcheck src/gpt_gradcheck.cpp)
-    list(APPEND NN_TEST_TARGETS gpt_gradcheck)
+    # ── 基础层数值梯度检查（SwiGLU / RMSNorm / Softmax）─────────────────
+    nn_add_executable(layer_gradcheck_test src/layer_gradcheck_test.cpp)
+    list(APPEND NN_TEST_TARGETS layer_gradcheck_test)
 
-    # ── GPT 梯度检查点一致性测试（验证激活重计算 L1 与全存结果一致） ───────
-    nn_add_executable(gpt_checkpoint_test src/gpt_checkpoint_test.cpp)
-    list(APPEND NN_TEST_TARGETS gpt_checkpoint_test)
+    # ── GPT 模型（整链梯度检查 + 梯度检查点一致性）──────────────────────
+    nn_add_executable(gpt_test src/gpt_test.cpp)
+    list(APPEND NN_TEST_TARGETS gpt_test)
 
-    # ── activation offload 原语往返验证（GPU 激活 → host → GPU 一致） ──────
+    # ── Activation Offload（原语往返 + GPT 级一致性）────────────────────
     nn_add_executable(offload_test src/offload_test.cpp)
     list(APPEND NN_TEST_TARGETS offload_test)
 
-    # ── GPT activation offload 一致性测试（GPU：offload vs 全存基线） ──────
-    nn_add_executable(gpt_offload_test src/gpt_offload_test.cpp)
-    list(APPEND NN_TEST_TARGETS gpt_offload_test)
-
-    # ── 文档感知注意力掩码构建单测（验证块对角∧因果∧ALiBi 组合） ───────────
-    nn_add_executable(doc_mask_test src/doc_mask_test.cpp)
-    list(APPEND NN_TEST_TARGETS doc_mask_test)
-
-    # ── 文档感知掩码端到端正确性测试（不变性验证：跨文档屏蔽） ───────────────
+    # ── 文档感知注意力（掩码构建 + 端到端不变性）────────────────────────
     nn_add_executable(doc_attn_test src/doc_attn_test.cpp)
     list(APPEND NN_TEST_TARGETS doc_attn_test)
 
-    # ── CausalSelfAttention 数值梯度检查（gradcheck，验证 attention 内部反向） ──
-    nn_add_executable(attn_gradcheck src/attn_gradcheck.cpp)
-    list(APPEND NN_TEST_TARGETS attn_gradcheck)
+    # ── ZiPT / AttnZip（梯度 + 冒烟 + 一致性 + 文档掩码）────────────────
+    nn_add_executable(zipt_test src/zipt_test.cpp)
+    list(APPEND NN_TEST_TARGETS zipt_test)
 
-    # ── AttnZip（ZiPT）数值梯度检查（gradcheck：压缩 CrossAttention + 联合注意力块） ──
-    nn_add_executable(zipt_gradcheck src/zipt_gradcheck.cpp)
-    list(APPEND NN_TEST_TARGETS zipt_gradcheck)
+    # ── RAPT / ReLU 线性注意力（梯度 + 冒烟）────────────────────────────
+    nn_add_executable(rapt_test src/rapt_test.cpp)
+    list(APPEND NN_TEST_TARGETS rapt_test)
 
-    # ── ZiPT（AttnZip）端到端冒烟测试（构建 + 规格往返 + 训练 loss 下降） ──
-    nn_add_executable(zipt_smoke_test src/zipt_smoke_test.cpp)
-    list(APPEND NN_TEST_TARGETS zipt_smoke_test)
+    # ── 表达式/IR 纯 CPU（DSL + 归约 + matmul + 优化 pass + 图 IR）────
+    nn_add_executable(expr_cpu_test src/expr_cpu_test.cpp)
+    list(APPEND NN_TEST_TARGETS expr_cpu_test)
 
-    # ── ZiPT CPU/GPU 一致性测试（同权重下 forward logits 与梯度范数对齐） ──
-    nn_add_executable(zipt_consistency_test src/zipt_consistency_test.cpp)
-    list(APPEND NN_TEST_TARGETS zipt_consistency_test)
+    # ── 表达式/IR GPU（图融合端到端 + AOT shader 验证 + 表达式求值）────
+    nn_add_executable(expr_gpu_test src/expr_gpu_test.cpp)
+    list(APPEND NN_TEST_TARGETS expr_gpu_test)
 
-    # ── ZiPT 块级文档感知掩码正确性测试（doc_ids 隔离跨文档局部 key） ──
-    nn_add_executable(zipt_doc_test src/zipt_doc_test.cpp)
-    list(APPEND NN_TEST_TARGETS zipt_doc_test)
-
-    # ── RAPT（ReLU 线性注意力）数值梯度检查（gradcheck：RLA 核心 + 块） ──
-    nn_add_executable(rapt_gradcheck src/rapt_gradcheck.cpp)
-    list(APPEND NN_TEST_TARGETS rapt_gradcheck)
-
-    # ── RAPT（ReLU 线性注意力）端到端冒烟测试（构建 + 规格往返 + 训练 loss 下降） ──
-    nn_add_executable(rapt_smoke_test src/rapt_smoke_test.cpp)
-    list(APPEND NN_TEST_TARGETS rapt_smoke_test)
-
-    # ── 融合 shader（AOT）GPU 数值验证（ExprSpec 单一事实来源 vs GPU 输出） ──
-    nn_add_executable(fused_gpu_test src/fused_gpu_test.cpp)
-    list(APPEND NN_TEST_TARGETS fused_gpu_test)
-
-    # ── engine.compute(Mat_A + Mat_B) 表达式求值测试（CPU/GPU/CUDA 统一入口） ──
-    nn_add_executable(tensor_expr_test src/tensor_expr_test.cpp)
-    list(APPEND NN_TEST_TARGETS tensor_expr_test)
-
-    # ── 统一表达式 DSL 单元测试（编译期融合 + AOT 折叠 + 防漂移断言，纯 CPU） ──
-    nn_add_executable(expr_dsl_test src/expr_dsl_test.cpp)
-    list(APPEND NN_TEST_TARGETS expr_dsl_test)
-
-    # ── ExprSpec 归约语义测试（M1：归约视图/归约指令 CPU 求值，纯 CPU） ──────
-    nn_add_executable(expr_reduce_test src/expr_reduce_test.cpp)
-    list(APPEND NN_TEST_TARGETS expr_reduce_test)
-
-    # ── matmul 参与 IR 融合测试（14 文档 S1+S2：MatmulSpec + CPU 正确性） ──
-    nn_add_executable(expr_matmul_test src/expr_matmul_test.cpp)
-    list(APPEND NN_TEST_TARGETS expr_matmul_test)
-
-    # ── IR 优化 pass 测试（IR-A canonicalize + IR-B CSE/寄存器分配，纯 CPU） ─
-    nn_add_executable(expr_opt_test src/expr_opt_test.cpp)
-    list(APPEND NN_TEST_TARGETS expr_opt_test)
-
-    # ── 图 IR + 融合分析测试（IR-C：expr_graph.hpp 纯函数，无 GPU） ─────
-    nn_add_executable(expr_graph_test src/expr_graph_test.cpp)
-    list(APPEND NN_TEST_TARGETS expr_graph_test)
-
-    # ── 图 IR 融合 GPU 端到端（IR-C：begin_expr/end_expr 融合执行） ─────
-    nn_add_executable(expr_fuse_test src/expr_fuse_test.cpp)
-    list(APPEND NN_TEST_TARGETS expr_fuse_test)
-
-    # ── ModelSpec 架构校验一致性测试（load_model 文件头 vs 模型规格比对） ────
+    # ── ModelSpec 架构校验（load_model 文件头 vs 模型规格比对）──────────
     nn_add_executable(model_spec_validation_test src/model_spec_validation_test.cpp)
     list(APPEND NN_TEST_TARGETS model_spec_validation_test)
 
-    # ── Softmax 数值梯度检查（gradcheck，验证 softmax 反向） ───────────────────
-    nn_add_executable(softmax_gradcheck src/softmax_gradcheck.cpp)
-    list(APPEND NN_TEST_TARGETS softmax_gradcheck)
-
-    # ── M5 稀疏交叉熵融合测试（loss/grad vs 参考，CPU+GPU） ──
+    # ── 稀疏交叉熵融合（loss/grad vs 参考，CPU+GPU）─────────────────────
     nn_add_executable(ce_fusion_test src/ce_fusion_test.cpp)
     list(APPEND NN_TEST_TARGETS ce_fusion_test)
 
@@ -271,7 +263,10 @@ if(Vulkan_FOUND)
         broadcast
         transpose
         gather
-        scatter_add)
+        scatter_add
+        scan_prefix_outer
+        scan_suffix_outer
+        outer_col)
     # ── 融合 shader：构建期从 Layer 内联表达式自动合成 ───────────────
     # 表达式**文本只出现在 Layer**（compute / start_expr..end_expr）。
     # 构建期两步：

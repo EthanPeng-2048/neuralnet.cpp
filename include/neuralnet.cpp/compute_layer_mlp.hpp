@@ -1,5 +1,4 @@
-#ifndef NN_COMPUTE_LAYER_MLP_HPP
-#define NN_COMPUTE_LAYER_MLP_HPP
+#pragma once
 
 #include <algorithm>
 #include <cmath>
@@ -10,6 +9,7 @@
 #include <random>
 #include <vector>
 
+#include "compute_layer_base.hpp"
 #include "compute_engine.hpp"
 #include "compute_tensor.hpp"
 #include "model_spec.hpp"
@@ -56,6 +56,7 @@ public:
         Matrix b_cpu(out_features_, 1);  // 零初始化
 
         // ── 通过 engine 上传到目标设备 ──
+        // Phase 1：权重始终 F32 存储（master-weights），精度控制留给 Phase 2
         auto w_res = engine.from_matrix(w_cpu);
         if (!w_res) return std::unexpected(w_res.error());
         w_ = std::move(*w_res);
@@ -64,11 +65,13 @@ public:
         if (!b_res) return std::unexpected(b_res.error());
         b_ = std::move(*b_res);
 
-        // ── 创建梯度张量（零初始化） ──
-        grad_w_ = engine.create_tensor(out_features_, in_features_);
-        grad_b_ = engine.create_tensor(out_features_, 1);
-        { auto r1 = engine.zero(grad_w_); if (!r1) return std::unexpected(r1.error()); }
-        { auto r2 = engine.zero(grad_b_); if (!r2) return std::unexpected(r2.error()); }
+        // ── 梯度张量始终 f32（master-weights 策略）──
+        grad_w_ = engine.create_tensor(out_features_, in_features_, Precision::F32);
+        grad_b_ = engine.create_tensor(out_features_, 1, Precision::F32);
+        auto r1 = engine.zero(grad_w_);
+        auto r2 = engine.zero(grad_b_);
+        if (!r1) return std::unexpected(r1.error());
+        if (!r2) return std::unexpected(r2.error());
         return {};
     }
 
@@ -91,47 +94,41 @@ public:
         return r;
     }
 
-    // ── forward: out = W × x + b ──────────────────────────────────────────
-    // 算子融合二期（docs/14 S4）：matmul+bias 改走 dsl::compute（含 matmul 段），
-    // GPU 上经 AOT 融合 shader 单 kernel 完成（matmul 预计算 + 逐元素链），
-    // CPU 上 eval_expr 参考实现（matmul 预计算 + 逐元素链），语义不变。
-    // 形状：W (out, in)，x (in, batch)，b (out,1) 行广播 → 输出 (out, batch)。
+    // ── forward: 一行代码，精度由 p_.compute 决定 ──────────────────────
+    // 引擎内部处理 matmul + broadcast bias 的精度问题
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
         if (input.rows() != w_.cols())
             return std::unexpected(Error{"linear forward: input shape mismatch"});
 
-        // 缓存输入供 backward 使用（checkpoint 模式下不保留，由重计算重建）
         if (!checkpoint_mode_)
             input_cache_ = input;
 
-        return dsl::compute(engine,
-            dsl::matmul(w_, input) + dsl::row_broadcast(b_),
-            w_.rows(), input.cols());
+        // Phase 1：计算始终 F32（引擎 F16 路径的 to_matrix 未正确转换，见 bug fix）
+        return engine.matmul_with_bias(w_, input, b_, false, false);
     }
 
-    // ── backward: grad_x = W^T × grad_out, 累积 grad_W / grad_b ──────────
+    // ── backward: 同样简洁，精度由引擎处理 ────────────────────────────
     [[nodiscard]] Result<Tensor> backward(
         ComputeEngine& engine, const Tensor& grad_output) override
     {
         if (grad_output.rows() != w_.rows())
             return std::unexpected(Error{"linear backward: grad_output shape mismatch"});
 
-        // grad_input = W^T × grad_output
+        // Phase 1：计算始终 F32
         auto grad_input = engine.matmul(w_, grad_output, true, false);
         if (!grad_input) return std::unexpected(grad_input.error());
 
-        // grad_W += grad_output × input_cache^T
         auto gw = engine.matmul(grad_output, input_cache_, false, true);
         if (!gw) return std::unexpected(gw.error());
-        auto r1 = engine.add_inplace(grad_w_, *gw);
+        auto r1 = engine.accumulate(grad_w_, *gw);
         if (!r1) return std::unexpected(r1.error());
 
-        // grad_b += Σ_batch grad_output（按行归约求和）
+        // grad_b += Σ grad_output（行归约，默认 f32）
         auto gb = engine.row_reduce_sum(grad_output);
         if (!gb) return std::unexpected(gb.error());
-        auto r2 = engine.add_inplace(grad_b_, *gb);
+        auto r2 = engine.accumulate(grad_b_, *gb);
         if (!r2) return std::unexpected(r2.error());
 
         return grad_input;
@@ -879,4 +876,3 @@ public:
 //       MNIST 尺度下 CPU↔设备往返开销可忽略；GPU 融合卷积内核留作后续优化。
 } // namespace nn
 
-#endif // NN_COMPUTE_LAYER_MLP_HPP

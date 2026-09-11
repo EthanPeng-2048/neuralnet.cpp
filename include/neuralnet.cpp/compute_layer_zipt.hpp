@@ -1,7 +1,8 @@
-#ifndef NN_COMPUTE_LAYER_ZIPT_HPP
-#define NN_COMPUTE_LAYER_ZIPT_HPP
+#pragma once
 
 #include "compute_layer_base.hpp"
+#include "compute_layer_mlp.hpp"
+#include "compute_layer_feedforward.hpp"
 #include "compute_layer_attention.hpp"
 #include "compute_layer_gpt.hpp"
 
@@ -299,7 +300,8 @@ public:
     ZiPTBlock(std::size_t d_model, std::size_t num_heads, std::size_t d_ff,
               std::size_t window, std::size_t memory,
               NormType norm_type = NormType::LayerNorm,
-              ActivationType activation = ActivationType::GeLU)
+              ActivationType activation = ActivationType::GeLU,
+              PrecisionProfile precision = PrecisionProfile{})
         : num_heads_(num_heads),
           d_k_(d_model / num_heads), window_(window), memory_(memory),
           scale_(Scalar{1} / std::sqrt(static_cast<Scalar>(d_model / num_heads))),
@@ -312,6 +314,17 @@ public:
     {
         NN_ASSERT(d_model % num_heads == 0,
                   "ZiPTBlock: d_model must be divisible by num_heads");
+        // D7：将精度配置注入所有子层（§9.2）
+        set_precision_profile(precision);
+        if (norm1_) norm1_->set_precision_profile(precision);
+        w_q_.set_precision_profile(precision);
+        w_k_.set_precision_profile(precision);
+        w_v_.set_precision_profile(precision);
+        w_o_.set_precision_profile(precision);
+        w_kc_.set_precision_profile(precision);
+        w_vc_.set_precision_profile(precision);
+        if (norm2_) norm2_->set_precision_profile(precision);
+        ff_.set_precision_profile(precision);
     }
 
     [[nodiscard]] Result<void> init(ComputeEngine& engine) override
@@ -704,7 +717,8 @@ public:
               std::size_t memory_tokens,
               PosEncodingType pos_enc_type = PosEncodingType::Learned,
               ActivationType activation = ActivationType::GeLU,
-              NormType norm_type = NormType::LayerNorm)
+              NormType norm_type = NormType::LayerNorm,
+              PrecisionProfile precision = PrecisionProfile{})
         : vocab_size_(vocab_size), d_model_(d_model), seq_len_(seq_len),
           window_(window), memory_(memory_tokens),
           compressor_(d_model, memory_tokens,
@@ -712,6 +726,12 @@ public:
           ln_f_(make_norm_layer(d_model, norm_type)),
           lm_head_(d_model, vocab_size)
     {
+        // D7：将精度配置注入自身和所有子层（§9.2）
+        set_precision_profile(precision);
+        compressor_.set_precision_profile(precision);
+        if (ln_f_) ln_f_->set_precision_profile(precision);
+        lm_head_.set_precision_profile(precision);
+
         // 归约 W：W==0 或 W>seq_len → 回退到 W=L（旧行为）
         if (window_ == 0 || window_ > seq_len_) window_ = seq_len_;
         hist_len_ = seq_len_ - window_;
@@ -721,7 +741,7 @@ public:
         blocks_.reserve(num_layers);
         for (std::size_t i = 0; i < num_layers; ++i)
             blocks_.emplace_back(d_model, num_heads, d_ff, block_window, memory_tokens,
-                                 norm_type, activation);
+                                 norm_type, activation, precision);
         switch (pos_enc_type)
         {
             case PosEncodingType::Learned:
@@ -1072,4 +1092,3 @@ public:
 // ══════════════════════════════════════════════════════════════════════════
 } // namespace nn
 
-#endif // NN_COMPUTE_LAYER_ZIPT_HPP

@@ -1,7 +1,7 @@
-#ifndef NN_COMPUTE_LAYER_TRANSFORMER_HPP
-#define NN_COMPUTE_LAYER_TRANSFORMER_HPP
+#pragma once
 
 #include "compute_layer_base.hpp"
+#include "compute_layer_mlp.hpp"
 #include "compute_layer_attention.hpp"
 #include "compute_layer_feedforward.hpp"
 
@@ -587,4 +587,3 @@ public:
 
 } // namespace nn
 
-#endif // NN_COMPUTE_LAYER_TRANSFORMER_HPP
