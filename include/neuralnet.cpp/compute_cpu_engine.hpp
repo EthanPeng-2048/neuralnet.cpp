@@ -1330,6 +1330,11 @@ public:
                 if (t.rows() != v.param || t.cols() != cols || v.param == 0 || rows % v.param != 0)
                     return std::unexpected(Error{"eval_expr: RowMod shape/param invalid"});
                 break;
+            case static_cast<uint8_t>(ExprViewKind::RowAccess):
+                // 读取行 [offset, offset+mod)，须在输入行数内；offset 为运行时形状
+                if (t.cols() != cols || v.param == 0 || v.param2 + v.param > t.rows())
+                    return std::unexpected(Error{"eval_expr: RowAccess shape/param invalid"});
+                break;
             case static_cast<uint8_t>(ExprViewKind::RowBroadcast):
                 // 输入 (rows,1)：每行一个值，按行广播
                 if (t.rows() != rows || t.cols() != 1)
@@ -1494,6 +1499,9 @@ public:
             }
             case static_cast<uint8_t>(ExprViewKind::RowMod):
                 return s[(r % v.param) * cols + c];
+            case static_cast<uint8_t>(ExprViewKind::RowAccess):
+                // 行偏移+取模：data[(offset + r % mod)*cols + c]
+                return s[(v.param2 + (r % v.param)) * cols + c];
             case static_cast<uint8_t>(ExprViewKind::RowReduceSum):
             case static_cast<uint8_t>(ExprViewKind::RowReduceMax):
                 return view_reduce[k][r];
@@ -1559,6 +1567,7 @@ public:
                     case static_cast<uint8_t>(ExprOperandKind::Reg):
                     case static_cast<uint8_t>(ExprOperandKind::Fanout): return regs[op.idx];
                     case static_cast<uint8_t>(ExprOperandKind::Const): return spec.consts[op.idx];
+                    case static_cast<uint8_t>(ExprOperandKind::RParam): return spec.rparams[op.idx];
                     case static_cast<uint8_t>(ExprOperandKind::Input): return read_input(op.idx, r, c);
                     case static_cast<uint8_t>(ExprOperandKind::Reduce):
                         return reduce_vec[op.idx][reduce_axis[op.idx] ? c : r];
@@ -1634,6 +1643,7 @@ public:
                 case static_cast<uint8_t>(ExprOperandKind::Reg):
                 case static_cast<uint8_t>(ExprOperandKind::Fanout): return regs[op.idx];
                 case static_cast<uint8_t>(ExprOperandKind::Const): return spec.consts[op.idx];
+                case static_cast<uint8_t>(ExprOperandKind::RParam): return spec.rparams[op.idx];
                 case static_cast<uint8_t>(ExprOperandKind::Input): return read_input(op.idx, r, c);
                 case static_cast<uint8_t>(ExprOperandKind::Reduce):
                     return reduce_vec[op.idx][reduce_axis[op.idx] ? c : r];

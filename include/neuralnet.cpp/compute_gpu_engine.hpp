@@ -87,9 +87,13 @@ public:
     }
 
     // ── 显存池统计（L2 仪器化） ──────────────────────────────────────
+    // 同时上报持久池（参数/权重）与瞬态池（激活/临时），否则只报持久池会
+    // 掩盖瞬态池的占用，导致"拆分后显存不降反升"的误判。
     [[nodiscard]] std::string pool_stats() const override
     {
-        return backend_.memory_pool().pool_debug_stats().to_string();
+        const std::string p = backend_.memory_pool().pool_debug_stats().to_string();
+        const std::string t = backend_.transient_pool().pool_debug_stats().to_string();
+        return "persist{" + p + "} transient{" + t + "}";
     }
 
     // ── 激活 offload（L1-offload）─────────────────────────────────────
@@ -278,36 +282,43 @@ public:
         return t.gpu_tensor().to_matrix(backend_);
     }
 
-    // ── cast 原语（§7.5，统一接口）──────────────────────────────────────
+    // ── cast 原语（§7.5，统一接口；GPU 原生转换，无 PCIe 往返）─────────────
     [[nodiscard]] Result<Tensor> cast(const Tensor& src, Precision dst) override
     {
         if (src.precision() == dst)
             return src;
 
+        // 保留精度 Pair（BF16/F64 Phase 1 未实现）清晰报错
+        if (auto pcheck = check_precision_supported(src.precision()); !pcheck)
+            return std::unexpected(pcheck.error());
+        if (auto pcheck = check_precision_supported(dst); !pcheck)
+            return std::unexpected(pcheck.error());
+
         if (src.is_gpu())
         {
+            const std::size_t count = src.rows() * src.cols();
             if (src.precision() == Precision::F16 && dst == Precision::F32)
             {
-                // f16 GPU → f32 CPU → f32 GPU（升 cast，精确无损）
-                auto m32 = to_matrix(src, Precision::F32);
-                if (!m32) return std::unexpected(m32.error());
-                return from_matrix(*m32, Precision::F32);
+                // f16 GPU → f32 GPU（升 cast，精确无损，GPU kernel）
+                auto dst_gpu = GpuTensor::create_empty(src.rows(), src.cols(), backend_);
+                if (!dst_gpu) return std::unexpected(dst_gpu.error());
+                auto r = backend_.cast_gpu(
+                    src.gpu_tensor<Precision::F16>().buffer(), dst_gpu->buffer(),
+                    count, /*kind=0*/ 0u);
+                if (!r) return std::unexpected(r.error());
+                return Tensor::from_gpu(std::move(*dst_gpu));
             }
             if (src.precision() == Precision::F32 && dst == Precision::F16)
             {
-                // f32 GPU → f32 CPU → f16 CPU → f16 GPU（降 cast，RHE）
-                auto m32 = to_matrix(src, Precision::F32);
-                if (!m32) return std::unexpected(m32.error());
-                // 创建 f16 矩阵（CPU 临时）
-                MatrixT<Precision::F16> m16(m32->rows(), m32->cols());
-                const auto s = m32->span();
-                auto d = m16.span();
-                for (std::size_t i = 0; i < s.size(); ++i)
-                    d[i] = s[i];
-                // 上传 f16 到 GPU
-                auto r = GpuTensorF16::from_matrix(m16, backend_);
+                // f32 GPU → f16 GPU（降 cast，round-half-to-even，GPU kernel）
+                // create_f16_tensor 保证奇数元素 count 时 word 写入不越界。
+                auto dst_gpu = backend_.create_f16_tensor(src.rows(), src.cols());
+                if (!dst_gpu) return std::unexpected(dst_gpu.error());
+                auto r = backend_.cast_gpu(
+                    src.gpu_tensor().buffer(), dst_gpu->buffer(),
+                    count, /*kind=1*/ 1u);
                 if (!r) return std::unexpected(r.error());
-                return Tensor::from_gpu(std::move(*r));
+                return Tensor::from_gpu(std::move(*dst_gpu));
             }
             return std::unexpected(Error{"cast: unsupported precision conversion"});
         }
@@ -973,7 +984,7 @@ public:
             const auto vp = nn::expr_spec_runtime_view_params(spec);
             auto out = backend_.run_fused_gpu(
                 key, gpu_inputs, spec.consts, rows, cols,
-                /*vector_out=*/false, vp, /*output_override=*/nullptr,
+                /*vector_out=*/false, vp, spec.rparams, /*output_override=*/nullptr,
                 nn::expr_spec_runtime_matmul_k(spec),
                 nn::expr_spec_runtime_matmul_batch(spec));
             if (!out) return std::unexpected(out.error());
@@ -1029,6 +1040,7 @@ public:
             const auto vp = nn::expr_spec_runtime_view_params(spec);
             auto out = backend_.run_fused_gpu(
                 key, gpu_inputs, spec.consts, rows, cols, /*vector_out=*/true, vp,
+                spec.rparams,
                 /*output_override=*/nullptr, nn::expr_spec_runtime_matmul_k(spec),
                 nn::expr_spec_runtime_matmul_batch(spec));
             if (!out) return std::unexpected(out.error());
@@ -1131,7 +1143,7 @@ private:
                     out_override = &out_it->second.gpu_tensor();
                 auto out = backend_.run_fused_gpu(
                     key, gpu_inputs, k.spec.consts, k.rows, k.cols,
-                    k.vector_out, vp, out_override,
+                    k.vector_out, vp, k.spec.rparams, out_override,
                     nn::expr_spec_runtime_matmul_k(k.spec),
                     nn::expr_spec_runtime_matmul_batch(k.spec));
                 if (!out) return std::unexpected(out.error());

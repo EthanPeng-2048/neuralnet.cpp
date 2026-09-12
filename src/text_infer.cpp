@@ -25,7 +25,7 @@ using nn::Scalar;
 void print_usage(const char *prog)
 {
     std::cout
-        << "GPT 文本生成推理程序 (引擎化架构)\n\n"
+        << "GPT 文本生成推理程序\n\n"
         << "用法:\n"
         << "  " << prog << " --prompt \"text\" [选项]\n"
         << "  " << prog << " --interactive          交互模式\n\n"

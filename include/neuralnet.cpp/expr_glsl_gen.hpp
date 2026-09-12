@@ -101,6 +101,15 @@ inline void glsl_view_read(std::ostringstream& os,
            << col_var << "]";
         return;
     }
+    case static_cast<uint8_t>(ExprViewKind::RowAccess):
+    {
+        // 行偏移+取模：data[(offset + r % mod)*cols + c]。
+        // vp_slot=mod（op），vp_slot+1=offset（param2），双 vp 槽（形状无关）。
+        os << buf << "[(" << "vp" << std::to_string(vp_slot + 1) << " + ("
+           << row_var << " % vp" << std::to_string(vp_slot) << ")) * cols + "
+           << col_var << "]";
+        return;
+    }
     case static_cast<uint8_t>(ExprViewKind::RowBroadcast):
         os << buf << "[" << row_var << "]";   // 输入 (rows,1)：每行一个值
         return;
@@ -245,6 +254,9 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
         L << "    uint vp" << i << ";\n";
     for (std::size_t i = 0; i < spec.consts.size(); ++i)
         L << "    float c" << i << ";\n";
+    const std::uint32_t n_rp = static_cast<std::uint32_t>(spec.rparams.size());
+    for (std::uint32_t i = 0; i < n_rp; ++i)
+        L << "    float rp" << i << ";\n";
     L << "};\n\n";
     // 共享内存分块（vec4 布局，16B 对齐，转置 [k4][m] 消除 bank 冲突）：
     //   AshT[k4][m]：A 分块（32 行 × 32 k，8 个 vec4/行），k4 在前 → 内层
@@ -292,6 +304,8 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
                 return "r" + std::to_string(op.idx);
             case static_cast<uint8_t>(ExprOperandKind::Const):
                 return "c" + std::to_string(op.idx);
+            case static_cast<uint8_t>(ExprOperandKind::RParam):
+                return "rp" + std::to_string(op.idx);
             case static_cast<uint8_t>(ExprOperandKind::Row):
                 return "float(row)";  // row 参数已是 batch 内行号
             case static_cast<uint8_t>(ExprOperandKind::Col):
@@ -315,7 +329,9 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
             std::uint32_t vp = 0;
             for (std::size_t j = 0; j < i; ++j)
                 if (expr_view_has_runtime_param(
-                        static_cast<ExprViewKind>(spec.views[j].kind))) ++vp;
+                        static_cast<ExprViewKind>(spec.views[j].kind)))
+                    vp += expr_view_runtime_param_slots(
+                        static_cast<ExprViewKind>(spec.views[j].kind));
             L << "    const float v" << i << " = ";
             glsl_view_read(L, spec.views[i], static_cast<std::uint32_t>(i),
                            "grow*cols + col", "grow", "col", vp);
@@ -502,6 +518,9 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
         L << "    uint vp" << i << ";\n";
     for (std::size_t i = 0; i < spec.consts.size(); ++i)
         L << "    float c" << i << ";\n";
+    const std::uint32_t n_rp = static_cast<std::uint32_t>(spec.rparams.size());
+    for (std::uint32_t i = 0; i < n_rp; ++i)
+        L << "    float rp" << i << ";\n";
     L << "};\n\n";
 
     const bool vec4_ok = glsl_vec4_eligible(spec);
@@ -540,6 +559,8 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
             return "r" + std::to_string(op.idx);
         case static_cast<uint8_t>(ExprOperandKind::Const):
             return "c" + std::to_string(op.idx);
+        case static_cast<uint8_t>(ExprOperandKind::RParam):
+            return "rp" + std::to_string(op.idx);
         // S7 索引操作数：当前网格下标（uint → float 参与算术）
         case static_cast<uint8_t>(ExprOperandKind::Row):
             return "float(row)";
@@ -565,7 +586,9 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
             std::uint32_t vp = 0;
             for (std::size_t j = 0; j < i; ++j)
                 if (expr_view_has_runtime_param(
-                        static_cast<ExprViewKind>(spec.views[j].kind))) ++vp;
+                        static_cast<ExprViewKind>(spec.views[j].kind)))
+                    vp += expr_view_runtime_param_slots(
+                        static_cast<ExprViewKind>(spec.views[j].kind));
             o << indent << "const float v" << i << " = ";
             glsl_view_read(o, spec.views[i], static_cast<std::uint32_t>(i),
                            idx_var, row_var, col_var, vp);
@@ -692,6 +715,8 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
             return "r" + std::to_string(op.idx);
         case static_cast<uint8_t>(ExprOperandKind::Const):
             return "vec4(c" + std::to_string(op.idx) + ")";
+        case static_cast<uint8_t>(ExprOperandKind::RParam):
+            return "vec4(rp" + std::to_string(op.idx) + ")";
         }
     };
     if (spec.num_regs > 0)
@@ -868,6 +893,9 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
         L << "    uint vp" << i << ";\n";
     for (std::size_t i = 0; i < spec.consts.size(); ++i)
         L << "    float c" << i << ";\n";
+    const std::uint32_t n_rp = static_cast<std::uint32_t>(spec.rparams.size());
+    for (std::uint32_t i = 0; i < n_rp; ++i)
+        L << "    float rp" << i << ";\n";
     L << "};\n\n";
     L << "shared float s_red[" << n_slots << "][256];\n\n";
 
@@ -926,6 +954,8 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
             return "r" + std::to_string(op.idx);
         case static_cast<uint8_t>(ExprOperandKind::Const):
             return "c" + std::to_string(op.idx);
+        case static_cast<uint8_t>(ExprOperandKind::RParam):
+            return "rp" + std::to_string(op.idx);
         case static_cast<uint8_t>(ExprOperandKind::Reduce):
             return "s_red[" + std::to_string(slot_of_instr[op.idx]) + "][" + red_idx + "]";
         case static_cast<uint8_t>(ExprOperandKind::Matmul):
@@ -955,7 +985,8 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
             for (std::size_t j = 0; j < op.idx; ++j)
                 if (expr_view_has_runtime_param(
                         static_cast<ExprViewKind>(spec.views[j].kind)))
-                    ++vp;
+                    vp += expr_view_runtime_param_slots(
+                        static_cast<ExprViewKind>(spec.views[j].kind));
             glsl_view_read(os, v, static_cast<std::uint32_t>(op.idx),
                            "(row*cols + col)", "row", "col", vp);
             return os.str();

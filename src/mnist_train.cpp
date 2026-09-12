@@ -53,7 +53,7 @@ enum class ArchType { MLP, Transformer, CNN };
 void print_usage(const char *prog)
 {
     std::cout
-        << "MNIST 手写数字训练程序 (引擎化架构，支持 MLP/Transformer)\n\n"
+        << "MNIST 手写数字训练程序 (支持 MLP/Transformer)\n\n"
         << "用法: " << prog << " [选项]\n\n"
         << "选项:\n"
         << "  --arch <name>      模型架构: mlp/transformer (默认: mlp)\n"
@@ -521,7 +521,7 @@ int main(int argc, char *argv[])
 
     // ── 打印配置 ─────────────────────────────────────────────
     std::cout << "========================================\n";
-    std::cout << "  MNIST 手写数字训练 (引擎化架构)\n";
+    std::cout << "  MNIST 手写数字训练\n";
     std::cout << "========================================\n";
     std::cout << "  架构: " << (cfg.arch == ArchType::Transformer ? "Transformer (ViT)"
                             : cfg.arch == ArchType::CNN ? "CNN (LeNet)" : "MLP") << "\n";
