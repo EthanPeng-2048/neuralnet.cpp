@@ -156,6 +156,8 @@ namespace nn
     ExprSpec out;
     out.views  = spec.views;   // 不变量：views 不变
     out.matmul = spec.matmul;  // 不变量：matmul 段不变（pass 只优化 instrs/consts）
+    out.rparams = spec.rparams; // RParam 值序列：非结构、不进 key，原样透传
+                               // （值不参与常量折叠/代数化简，跨 pass 保持顺序）
 
     // 1) 常量池去重（相同值合并，保持出现序）
     std::vector<int> const_remap(spec.consts.size(), -1);
@@ -325,6 +327,7 @@ namespace nn
     ExprSpec out;
     out.views   = spec.views;
     out.consts  = spec.consts;
+    out.rparams = spec.rparams;  // RParam 值序列：非结构、跨 pass 原样透传
     out.num_regs = spec.num_regs;
     out.matmul  = spec.matmul;
     out.instrs.reserve(n);
@@ -344,6 +347,7 @@ namespace nn
 {
     ExprSpec out;
     out.views  = spec.views;
+    out.rparams = spec.rparams;  // RParam 值序列：跨 pass 原样透传
     out.matmul = spec.matmul;
 
     // 常量池清理：只保留被引用的（保持出现序）
@@ -416,6 +420,7 @@ namespace nn
     ExprSpec out;
     out.views  = spec.views;
     out.consts = spec.consts;
+    out.rparams = spec.rparams;  // RParam 值序列：跨 pass 原样透传
     out.matmul = spec.matmul;
 
     // key: op(8) + a.kind(8) + a.idx(8) + b.kind(8) + b.idx(8) + c.kind(8) + c.idx(8)
@@ -557,6 +562,7 @@ namespace nn
     ExprSpec out;
     out.views  = spec.views;
     out.consts = spec.consts;
+    out.rparams = spec.rparams;  // RParam 值序列：跨 pass 原样透传
     out.matmul = spec.matmul;
     out.instrs.reserve(n);
     for (std::size_t i = 0; i < n; ++i)

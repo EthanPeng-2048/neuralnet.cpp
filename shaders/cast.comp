@@ -1,0 +1,49 @@
+// ── cast.comp — 通用精度转换原语 ───────────────────────────────────────
+// 目标：engine.cast(tensor, precision) 的 GPU 原生实现（无 PCIe 往返）。
+// 源/目标均以原始 32-bit word 缓冲读写（float=4B，f16 按 2B 紧密打包）：
+//   - f16→f32（kind=0）：S[w] = 两个 half 打包成 uint；D[2w/2w+1] = float words
+//   - f32→f16（kind=1，round-half-to-even）：S[2w/2w+1] = float words；
+//              D[w] = unpackHalf2x16 逆操作 packHalf2x16 打包两个 half
+// 同精度 cast 是别名不落 kernel；BF16/F64 为保留值，后端分派处清晰报错。
+// 后续精度对（BF16/F64/f8 等）扩 kind 枚举 + 后端 (src,dst) 分派表即可，
+// 引擎 API 恒为 cast(tensor, precision)，不因精度增加而改变。
+// ───────────────────────────────────────────────────────────────────────
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufS { uint S[]; };
+layout(std430, binding = 1) writeonly buffer BufD { uint D[]; };
+
+layout(push_constant) uniform Push {
+    uint count;   // 元素数 rows*cols（源与目标元素数相同，仅字节宽度差）
+    uint kind;    // 0 = f16→f32，1 = f32→f16
+};
+
+void main() {
+    const uint pairs = (count + 1u) >> 1u;   // 每线程处理 2 元素（一对 half 或单词对）
+    const uint gsize = gl_NumWorkGroups.x * gl_NumWorkGroups.y
+                     * gl_NumWorkGroups.z * 256u;
+
+    if (kind == 0u)
+    {
+        // f16 → f32（升精度，精确无损）
+        for (uint w = gl_GlobalInvocationID.x; w < pairs; w += gsize)
+        {
+            const vec2 h = unpackHalf2x16(S[w]);
+            D[2u * w] = floatBitsToUint(h.x);
+            if (2u * w + 1u < count)
+                D[2u * w + 1u] = floatBitsToUint(h.y);
+        }
+    }
+    else
+    {
+        // f32 → f16（降精度，packHalf2x16 按 round-half-to-even）
+        for (uint w = gl_GlobalInvocationID.x; w < pairs; w += gsize)
+        {
+            const uint i0 = 2u * w;
+            const float x = uintBitsToFloat(S[i0]);
+            const float y = (i0 + 1u < count) ? uintBitsToFloat(S[i0 + 1u]) : 0.0f;
+            D[w] = packHalf2x16(vec2(x, y));
+        }
+    }
+}

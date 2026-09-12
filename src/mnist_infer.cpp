@@ -33,7 +33,7 @@ using nn::Scalar;
 void print_usage(const char *prog)
 {
     std::cout
-        << "MNIST 手写数字推理程序 (引擎化架构)\n\n"
+        << "MNIST 手写数字推理程序\n\n"
         << "用法:\n"
         << "  " << prog << " <image.csv> [选项]     推理单张图片\n"
         << "  " << prog << " <目录>   [选项]     批量推理目录下所有 CSV\n\n"

@@ -53,6 +53,15 @@ struct SpecBuilder
         spec.consts.push_back(v);
         return expr::cst(static_cast<std::uint8_t>(spec.consts.size() - 1));
     }
+    // 运行时标量参数（RParam）：值作为运行时数据存入 spec.rparams，不进
+    // expr_spec_key；同结构不同值共享一个融合 shader（glsl_gen 把 rparams
+    // 作为 push constant 读取，dispatch 时按实际 spec 填充）。用于优化器的
+    // lr/eps/β、偏差修正系数等每步会变、但结构固定的标量。
+    ExprOperand add_rparam(Scalar v)
+    {
+        spec.rparams.push_back(v);
+        return expr::rval(static_cast<std::uint8_t>(spec.rparams.size() - 1));
+    }
     ExprOperand add_input_linear(const Tensor& t)
     {
         spec.views.push_back(expr::linear());
@@ -68,6 +77,12 @@ struct SpecBuilder
     ExprOperand add_input_rowmod(const Tensor& t, std::uint32_t mod)
     {
         spec.views.push_back(expr::row_mod(mod));
+        inputs.push_back(t);
+        return expr::input(static_cast<std::uint8_t>(inputs.size() - 1));
+    }
+    ExprOperand add_input_rowaccess(const Tensor& t, std::uint32_t offset, std::uint32_t mod)
+    {
+        spec.views.push_back(expr::row_access(offset, mod));
         inputs.push_back(t);
         return expr::input(static_cast<std::uint8_t>(inputs.size() - 1));
     }
@@ -129,6 +144,17 @@ struct ConstLeaf
     ExprOperand to_spec(SpecBuilder& b) const { return b.add_const(value); }
 };
 
+// 运行时标量参数叶子（RParam）：常量与运行时的折中。值参与算术但**不进
+// expr_spec_key**（非表达式结构），glsl_gen 把 rparams 作为 push constant
+// 读取；CPU 求值用 spec.rparams[idx]。适配"每步会变的标量"（优化器超参）。
+struct RParamLeaf
+{
+    Scalar value;
+
+    [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return value; }
+    ExprOperand to_spec(SpecBuilder& b) const { return b.add_rparam(value); }
+};
+
 // 线性叶子：直接读取 Tensor 数据（row-major 扁平）
 struct TensorRef
 {
@@ -170,6 +196,26 @@ struct RowModRef
         return t.cpu_matrix().span()[(r % mod) * cols + c];
     }
     ExprOperand to_spec(SpecBuilder& b) const { return b.add_input_rowmod(t, mod); }
+};
+
+// 视图：RowAccess —— 行偏移+取模访问：data[(offset + r % mod)*cols + c]
+// 用于 SwiGLU 等"同一 (2·d_ff) 输入按半个偏移读取"的行切分：
+//   gate = row_access(in, offset=0,      mod=d_ff) → in[r % d_ff]
+//   up   = row_access(in, offset=d_ff,   mod=d_ff) → in[d_ff + r % d_ff]
+// offset/mod 均为运行时形状数据（共享一个融合 shader，运行时经 vp 槽填充）。
+struct RowAccessRef
+{
+    Tensor t;
+    std::uint32_t offset;
+    std::uint32_t mod;
+
+    [[nodiscard]] Scalar eval(std::size_t i) const
+    {
+        const std::size_t cols = t.cols();
+        const std::size_t r = i / cols, c = i % cols;
+        return t.cpu_matrix().span()[(offset + (r % mod)) * cols + c];
+    }
+    ExprOperand to_spec(SpecBuilder& b) const { return b.add_input_rowaccess(t, offset, mod); }
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -444,6 +490,10 @@ inline constexpr bool has_reduction_v<Select<C, T, E>>
 // ══════════════════════════════════════════════════════════════════════════
 [[nodiscard]] inline TensorRef leaf(Tensor t) { return TensorRef{std::move(t)}; }
 
+// 运行时标量参数（RParam）：值不限、结构固定 → 同结构共享融合 shader。
+// 用于优化器超参（lr/eps/β）、偏差修正系数等每步会变但结构不变的标量。
+[[nodiscard]] inline constexpr RParamLeaf rparam(Scalar v) { return RParamLeaf{v}; }
+
 // matmul 叶子（S1/S2）：C = op(A,B)，折叠为 ExprSpec 的前置 matmul 段。
 // 逐元素链（如 +bias、激活）自动与 matmul 融合成一个 kernel（GPU AOT）。
 // batch（S7）：A/B 按 batch 垂直切分（batched_matmul 同布局），形状参数。
@@ -471,6 +521,10 @@ inline constexpr bool has_reduction_v<Select<C, T, E>>
 
 [[nodiscard]] inline RowModRef row_mod(Tensor t, std::uint32_t mod)
 { return RowModRef{std::move(t), mod}; }
+
+// 行偏移+取模访问（SwiGLU 半切分等）：data[(offset + r % mod)*cols + c]
+[[nodiscard]] inline RowAccessRef row_access(Tensor t, std::uint32_t offset, std::uint32_t mod)
+{ return RowAccessRef{std::move(t), offset, mod}; }
 
 // ══════════════════════════════════════════════════════════════════════════
 // 归约自由函数：对输入 Tensor 直接归约 → 归约**视图**（GPU 融合更友好）；

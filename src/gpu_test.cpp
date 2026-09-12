@@ -484,6 +484,146 @@ int main(int argc, char* argv[])
         }
     }
 
+    // ── Adam / AdamW CPU vs GPU（RParam 融合 K1/K2/K3）────────────────
+    // 优化器超参经 RParam 运行时标量承载，GPU 走融合 shader（无 clone）。
+    // 验证两引擎逐步结果一致。
+    {
+        std::cout << "\n════════════════════════════════════════════\n";
+        std::cout << "  Adam/AdamW (RParam 融合) CPU vs GPU\n";
+        std::cout << "════════════════════════════════════════════\n";
+        const std::size_t R = 64, C = 32, STEPS = 4;
+        std::mt19937 rng(2026);
+        std::uniform_real_distribution<Scalar> cop(-1.0f, 1.0f);
+        std::uniform_real_distribution<Scalar> cog(-0.1f, 0.1f);
+        const Matrix p0 = [&]{ Matrix m(R, C); for (auto& v : m.span()) v = cop(rng); return m; }();
+        const Matrix g0 = [&]{ Matrix m(R, C); for (auto& v : m.span()) v = cog(rng); return m; }();
+
+        for (const char* name : {"adam", "adamw"})
+        {
+            // CPU 侧
+            auto p_cpu_r = cpu_engine->from_matrix(p0);
+            auto g_cpu_r = cpu_engine->from_matrix(g0);
+            auto p_gpu_r = gpu_engine->from_matrix(p0);
+            auto g_gpu_r = gpu_engine->from_matrix(g0);
+            bool ok = p_cpu_r && g_cpu_r && p_gpu_r && g_gpu_r;
+            std::unique_ptr<nn::Optimizer> opt_cpu, opt_gpu;
+            if (ok)
+            {
+                opt_cpu = nn::create_optimizer(name, *cpu_engine,
+                    std::vector<nn::TensorRef>{*p_cpu_r}, std::vector<nn::TensorRef>{*g_cpu_r},
+                    Scalar{1e-3f});
+                opt_gpu = nn::create_optimizer(name, *gpu_engine,
+                    std::vector<nn::TensorRef>{*p_gpu_r}, std::vector<nn::TensorRef>{*g_gpu_r},
+                    Scalar{1e-3f});
+            }
+            if (!ok || !opt_cpu || !opt_gpu)
+            {
+                std::cout << "  ❌ " << name << " 初始化失败\n";
+                ++failures;
+                continue;
+            }
+            bool step_ok = true;
+            for (std::size_t s = 0; s < STEPS && step_ok; ++s)
+            {
+                // 每步用同一梯度（两引擎一致），先后向 zero_grad 再 step
+                step_ok = opt_cpu->step() && opt_gpu->step();
+            }
+            if (!step_ok) { std::cout << "  ❌ " << name << " step 失败\n"; ++failures; continue; }
+
+            auto p_cpu_m = cpu_engine->to_matrix(*p_cpu_r);
+            auto p_gpu_m = gpu_engine->to_matrix(*p_gpu_r);
+            if (!p_cpu_m || !p_gpu_m) { std::cout << "  ❌ " << name << " 下载失败\n"; ++failures; continue; }
+            Scalar err = max_abs_diff(*p_cpu_m, *p_gpu_m);
+            bool pass = err < 2e-3f;
+            std::cout << "  " << (pass ? "[PASS]" : "[FAIL]") << " " << name << " p_err="
+                      << std::scientific << std::setprecision(2) << err << "\n";
+            if (!pass) ++failures;
+        }
+    }
+
+    // ── RLA 扫描原语 CPU vs GPU（含通用 d_k>64 路径）──────────────────
+    // dk=128 时 GPU 走 scan_*_gen（状态驻全局 scratch）。断言与 CPU 一致。
+    {
+        std::cout << "\n════════════════════════════════════════════\n";
+        std::cout << "  RLA 扫描原语 (scan_prefix/suffix_outer) CPU vs GPU\n";
+        std::cout << "════════════════════════════════════════════\n";
+        const std::size_t B = 2, H = 2, dk = 128, seq = 4;  // dk>64 → 通用路径
+        const std::size_t rows = B * H * dk;
+        const std::size_t BH = rows / dk;  // == B*H
+
+        std::mt19937 rng(777);
+        std::normal_distribution<Scalar> cop(0.0f, 0.5f);
+        auto fill = [&](Matrix& m) { for (auto& v : m.span()) v = cop(rng); };
+        Matrix Kv(rows, seq), Vv(rows, seq), Pv(rows, seq), Rv(rows, seq);
+        Matrix Dm(BH * dk * dk, seq), Xs(rows, seq), Ys(rows, seq);
+        Matrix A0v(H * dk, dk), B0v(H * dk, dk), bnd(1, B * seq);
+        fill(Kv); fill(Vv); fill(Pv); fill(Rv); fill(Dm); fill(Xs); fill(Ys);
+        (void)A0v; (void)B0v; (void)bnd;
+
+        auto run_prefix = [&](ComputeEngine& e, const Matrix& Ki, const Matrix& Vi,
+                              const Matrix& Pi, const Matrix& Ri) -> nn::Result<Matrix> {
+            auto k = e.from_matrix(Ki);  if (!k) return std::unexpected(k.error());
+            auto v = e.from_matrix(Vi);  if (!v) return std::unexpected(v.error());
+            auto p = e.from_matrix(Pi);  if (!p) return std::unexpected(p.error());
+            auto r = e.from_matrix(Ri);  if (!r) return std::unexpected(r.error());
+            auto a0 = e.from_matrix(A0v); const auto& a0r = *a0;
+            auto b0 = e.from_matrix(B0v); const auto& b0r = *b0;
+            auto bd = e.from_matrix(bnd); const auto& bdr = *bd;
+            auto out = e.scan_prefix_outer(*k, *v, *p, *r, a0r, b0r, false,
+                                           dk, H, /*causal=*/true, bdr, false);
+            if (!out) return std::unexpected(out.error());
+            return e.to_matrix(*out);
+        };
+        auto run_suffix = [&](ComputeEngine& e, const Matrix& Di, const Matrix& Xi,
+                              const Matrix& Yi) -> nn::Result<Matrix> {
+            auto d = e.from_matrix(Di);  if (!d) return std::unexpected(d.error());
+            auto x = e.from_matrix(Xi);  if (!x) return std::unexpected(x.error());
+            auto y = e.from_matrix(Yi);  if (!y) return std::unexpected(y.error());
+            auto bd = e.from_matrix(bnd); const auto& bdr = *bd;
+            auto out = e.scan_suffix_outer(*d, *x, *y, dk, H, /*causal=*/true, bdr, false);
+            if (!out) return std::unexpected(out.error());
+            return e.to_matrix(*out);
+        };
+
+        auto cpu_p = run_prefix(*cpu_engine, Kv, Vv, Pv, Rv);
+        auto gpu_p = run_prefix(*gpu_engine, Kv, Vv, Pv, Rv);
+        if (!cpu_p || !gpu_p)
+        {
+            std::cout << "  [FAIL] scan_prefix_outer 失败\n";
+            if (!cpu_p) std::cout << "    cpu: " << cpu_p.error().message << "\n";
+            if (!gpu_p) std::cout << "    gpu: " << gpu_p.error().message << "\n";
+            ++failures;
+        }
+        else
+        {
+            Scalar err = max_abs_diff(*cpu_p, *gpu_p);
+            bool pass = err < 2e-3f;
+            std::cout << "  " << (pass ? "[PASS]" : "[FAIL]")
+                      << " prefix_outer(dk=128) err="
+                      << std::scientific << std::setprecision(2) << err << "\n";
+            if (!pass) ++failures;
+        }
+
+        auto cpu_s = run_suffix(*cpu_engine, Dm, Xs, Ys);
+        auto gpu_s = run_suffix(*gpu_engine, Dm, Xs, Ys);
+        if (!cpu_s || !gpu_s)
+        {
+            std::cout << "  [FAIL] scan_suffix_outer 失败\n";
+            if (!cpu_s) std::cout << "    cpu: " << cpu_s.error().message << "\n";
+            if (!gpu_s) std::cout << "    gpu: " << gpu_s.error().message << "\n";
+            ++failures;
+        }
+        else
+        {
+            Scalar err = max_abs_diff(*cpu_s, *gpu_s);
+            bool pass = err < 2e-3f;
+            std::cout << "  " << (pass ? "[PASS]" : "[FAIL]")
+                      << " suffix_outer(dk=128) err="
+                      << std::scientific << std::setprecision(2) << err << "\n";
+            if (!pass) ++failures;
+        }
+    }
+
     std::cout << "\n========================================\n";
     std::cout << "  测试完成";
     if (failures > 0) std::cout << "（" << failures << " 项失败）";

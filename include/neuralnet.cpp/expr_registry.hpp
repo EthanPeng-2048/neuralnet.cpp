@@ -59,16 +59,17 @@ struct ExprRegistry
 
 // ── 二进制序列化（dump/load 共用同一格式）───────────────────────────────
 // 格式（小端，x86/ARM 通用）：
-//   magic "NNEXP" (5B) + version (u8=2)
+//   magic "NNEXP" (5B) + version (u8=3)
 //   count (u32)
 //   每 spec：num_regs(u32)
 //            instrs: count(u32) × {op(u8) dst(u8) a.kind a.idx b.kind b.idx c.kind c.idx}
 //            views:  count(u32) × {kind(u8) negate(u8) param(u32)}
 //            consts: count(u32) × Scalar
+//            rparams: count(u32) × Scalar   （v3 起支持运行时标量参数）
 //            matmul: has(u8=0/1)；1 时 {a_input(u8) b_input(u8) transA(u8)
 //                    transB(u8) k(u32)}
-//  v2 起支持 matmul 段（v1 无 matmul，读 v1 等价 has=0）。
-inline constexpr std::uint8_t kExprBinVersion = 2;
+//  v2 起支持 matmul 段（v1 无 matmul，读 v1 等价 has=0）；v3 起支持 rparams。
+inline constexpr std::uint8_t kExprBinVersion = 4;  // v4：ExprView 增加 param2（RowAccess offset）
 
 [[nodiscard]] inline bool write_registry(const std::string& path,
                                          const ExprRegistry& reg)
@@ -97,11 +98,16 @@ inline constexpr std::uint8_t kExprBinVersion = 2;
             if (!write_pod(f, v.kind)) return false;
             if (!write_pod(f, v.negate_first_half)) return false;
             if (!write_pod(f, v.param)) return false;
+            if (!write_pod(f, v.param2)) return false;  // v4：RowAccess offset
         }
         n = static_cast<std::uint32_t>(s.consts.size());
         if (!write_pod(f, n)) return false;
         for (const auto& c : s.consts)
             if (!write_pod(f, c)) return false;
+        n = static_cast<std::uint32_t>(s.rparams.size());
+        if (!write_pod(f, n)) return false;
+        for (const auto& r : s.rparams)
+            if (!write_pod(f, r)) return false;
         const std::uint8_t has_mm = s.matmul ? 1 : 0;
         if (!write_pod(f, has_mm)) return false;
         if (s.matmul)
@@ -154,11 +160,16 @@ inline constexpr std::uint8_t kExprBinVersion = 2;
             if (!read_pod(f, v.kind)) return false;
             if (!read_pod(f, v.negate_first_half)) return false;
             if (!read_pod(f, v.param)) return false;
+            if (!read_pod(f, v.param2)) return false;  // v4：RowAccess offset
         }
         if (!read_pod(f, n)) return false;
         s.consts.resize(n);
         for (auto& c : s.consts)
             if (!read_pod(f, c)) return false;
+        if (!read_pod(f, n)) return false;
+        s.rparams.resize(n);
+        for (auto& r : s.rparams)
+            if (!read_pod(f, r)) return false;
         std::uint8_t has_mm = 0;
         if (!read_pod(f, has_mm)) return false;
         if (has_mm)
