@@ -84,7 +84,8 @@ namespace
         const auto& v = spec.views[i];
         if (i) o << ",";
         o << " {" << static_cast<int>(v.kind) << ", "
-          << static_cast<int>(v.negate_first_half) << ", " << v.param << "u}";
+          << static_cast<int>(v.negate_first_half) << ", " << v.param << "u, "
+          << v.param2 << "u}";
     }
     o << "},\n        std::vector<Scalar>{";
     for (std::size_t i = 0; i < spec.consts.size(); ++i)
@@ -97,6 +98,12 @@ namespace
                         : " std::numeric_limits<Scalar>::infinity()");
         else
             o << " static_cast<Scalar>(" << v << ")";
+    }
+    o << "},\n        std::vector<Scalar>{";   // rparams（运行时标量参数，值本身不参与 key）
+    for (std::size_t i = 0; i < spec.rparams.size(); ++i)
+    {
+        if (i) o << ",";
+        o << " static_cast<Scalar>(" << spec.rparams[i] << ")";
     }
     o << "}, " << spec.num_regs << "u, \n        std::optional<MatmulSpec>{";
     if (spec.matmul)
@@ -169,6 +176,7 @@ int main(int argc, char* argv[])
     H << "    int         reduce_axis;   // -1=逐元素, 0=行归约, 1=列归约\n";
     H << "    int         has_matmul;     // 1=含前置 matmul 段（push constants 多 rows+mm_k）\n";
     H << "    std::uint32_t view_param_count;  // 运行时视图参数个数（RowMod/RotateHalf 的 push constant vp 槽）\n";
+    H << "    std::uint32_t rparam_count;    // 运行时标量参数个数（优化器 lr/eps/β 等的 push constant rp 槽）\n";
     H << "    std::uint32_t vec_width;    // 每线程处理元素数（1=标量, 4=vec4）\n";
     H << "};\n\n";
 
@@ -251,7 +259,8 @@ int main(int argc, char* argv[])
           << "        kSpirv_" << key
           << ", sizeof(kSpirv_" << key << ")/sizeof(std::uint32_t), "
           << raxis << ", " << (spec.matmul ? 1 : 0) << ", "
-          << nn::expr_spec_runtime_view_param_count(spec) << ", " << vecw << " },\n";
+          << nn::expr_spec_runtime_view_param_count(spec) << ", "
+          << nn::expr_spec_runtime_param_count(spec) << ", " << vecw << " },\n";
     }
     H << "};\n";
     H << "inline constexpr std::size_t kFusedShaderCount =\n"

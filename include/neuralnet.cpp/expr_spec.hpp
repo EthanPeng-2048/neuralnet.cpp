@@ -112,6 +112,15 @@ enum class ExprOperandKind : uint8_t
     Row   = 6,
     Col   = 7,
     Batch = 8,
+    // ── 新增：运行时标量参数（RParam，形状无关融合的标量推广）──
+    // 引用 spec.rparams 第 idx 项。与视图参数（RowMod 周期 / RotateHalf
+    // 块大小）同思想：**值本身是运行时数据**（如优化器的 lr/eps/β、偏差
+    // 修正系数），不是表达式结构 → 不进 expr_spec_key；同结构不同值的
+    // 表达式（如不同 lr、每步变化的 inv_bc）共享一个融合 shader，运行时
+    // 按实际 spec 填充 push constant。
+    // 与 Const 的区别：Const 值进 key（结构）、编译期不变；RParam 值不进
+    // key（运行时）、CPU 求值用 spec.rparams[idx]、GPU 经 PC 传入。
+    RParam = 9,
 };
 
 // 操作数：2 字节（kind + idx），指令布局紧凑、可序列化、未来可入 push constant
@@ -157,6 +166,13 @@ enum class ExprViewKind : uint8_t
     RowGather = 9,
     BatchMod  = 10,
     BatchCol  = 11,
+    // RowAccess = 12：行偏移+取模访问：读取 data[(offset + r % mod)*cols + c]。
+    //   param = mod（取模数），param2 = offset（行偏移）。
+    //   用于共享内存 SwiGLU 等"同一 (2·d_ff) 输入按半个偏移读取"的行切分：
+    //     gate = RowAccess(in, mod=d_ff, offset=0)   → in[r % d_ff]
+    //     up   = RowAccess(in, mod=d_ff, offset=d_ff) → in[d_ff + r % d_ff]
+    //   覆盖 RowMod（offset=0）且支持跨半偏移；offset/mod 均为运行时形状数据。
+    RowAccess = 12,
 };
 
 // ── 归约视图辅助（引擎/校验共用）──────────────────────────────────────
@@ -179,7 +195,8 @@ struct ExprView
 {
     uint8_t kind = 0;                 // ExprViewKind
     uint8_t negate_first_half = 0;    // 仅 RotateHalf 有效
-    uint32_t param = 0;               // RotateHalf: block_rows；RowMod: modulo
+    uint32_t param = 0;               // RotateHalf: block_rows；RowMod: modulo；RowAccess: mod
+    uint32_t param2 = 0;              // 仅 RowAccess：行偏移 offset
 
     friend bool operator==(const ExprView&, const ExprView&) = default;
 };
@@ -244,6 +261,7 @@ struct ExprSpec
     std::vector<ExprInstr>      instrs;
     std::vector<ExprView>       views;   // 与 inputs 一一对应
     std::vector<Scalar>         consts;
+    std::vector<Scalar>         rparams; // 运行时标量参数（不进 key，运行时按实际值填充）
     std::uint32_t               num_regs = 0;
     std::optional<MatmulSpec>   matmul;  // 前置 matmul 段（可选；缺省=无）
 };
@@ -286,7 +304,14 @@ struct ExprSpec
     // push constant vp 槽由 dispatch 按实际 spec 填充 → 同结构不同形状
     // （不同 d_k / num_heads / seq_len）共享一个融合 shader（形状无关融合）。
     return k == ExprViewKind::RowMod || k == ExprViewKind::RotateHalf ||
-           k == ExprViewKind::BatchMod || k == ExprViewKind::BatchCol;
+           k == ExprViewKind::BatchMod || k == ExprViewKind::BatchCol ||
+           k == ExprViewKind::RowAccess;
+}
+// 该视图消耗的运行时视图参数槽位数（RowAccess 用 offset+mod 两个 vp 槽）
+[[nodiscard]] inline constexpr std::uint32_t expr_view_runtime_param_slots(
+    ExprViewKind k) noexcept
+{
+    return (k == ExprViewKind::RowAccess) ? 2u : 1u;
 }
 // 该 spec 的运行时视图参数个数（= 融合 shader 的 push constant vp 槽位数）
 [[nodiscard]] inline std::uint32_t expr_spec_runtime_view_param_count(
@@ -295,18 +320,24 @@ struct ExprSpec
     std::uint32_t n = 0;
     for (const auto& v : s.views)
         if (expr_view_has_runtime_param(static_cast<ExprViewKind>(v.kind)))
-            ++n;
+            n += expr_view_runtime_param_slots(static_cast<ExprViewKind>(v.kind));
     return n;
 }
-// 按视图顺序提取运行时视图参数（RowMod 周期 / RotateHalf 块大小），
-// 运行时 eval_expr 用它填充融合 shader 的 push constant vp 槽。
+// 按视图顺序提取运行时视图参数（RowMod 周期 / RotateHalf 块大小 / RowAccess
+// 的 mod+offset），运行时 eval_expr 用它填充融合 shader 的 push constant vp 槽。
 [[nodiscard]] inline std::vector<std::uint32_t> expr_spec_runtime_view_params(
     const ExprSpec& s)
 {
     std::vector<std::uint32_t> out;
     for (const auto& v : s.views)
-        if (expr_view_has_runtime_param(static_cast<ExprViewKind>(v.kind)))
-            out.push_back(v.param);
+    {
+        const auto k = static_cast<ExprViewKind>(v.kind);
+        if (!expr_view_has_runtime_param(k))
+            continue;
+        out.push_back(v.param);               // RowMod/RotateHalf: mod/block；RowAccess: mod
+        if (k == ExprViewKind::RowAccess)
+            out.push_back(v.param2);          // RowAccess 额外 offset 槽
+    }
     return out;
 }
 
@@ -335,13 +366,22 @@ struct ExprSpec
 }
 
 // ── 表达式规格相等比较（GPU AOT 匹配用）────────────────────────────────
-// 两个 ExprSpec 相等 ⟺ 指令序列、输入视图、常量池、寄存器数、matmul 段全部一致。
+// 两个 ExprSpec 相等 ⟺ 指令序列、输入视图、常量池、运行时参数、寄存器数、
+// matmul 段全部一致。
 // 用于运行时 eval_expr 判断"该表达式是否有预生成融合 shader"。
 [[nodiscard]] inline bool expr_spec_equal(const ExprSpec& a, const ExprSpec& b)
 {
     return a.instrs == b.instrs && a.views == b.views &&
-           a.consts == b.consts && a.num_regs == b.num_regs &&
+           a.consts == b.consts && a.rparams == b.rparams &&
+           a.num_regs == b.num_regs &&
            a.matmul == b.matmul;
+}
+
+// 该 spec 的运行时标量参数个数（= 融合 shader 的 push constant 浮点 p 槽位数）
+[[nodiscard]] inline std::uint32_t expr_spec_runtime_param_count(
+    const ExprSpec& s) noexcept
+{
+    return static_cast<std::uint32_t>(s.rparams.size());
 }
 
 // ── 规范结构 key（AOT 收集/匹配的单一依据）──────────────────────────────
@@ -381,16 +421,24 @@ struct ExprSpec
     {
         feed(&v.kind, 1);
         feed(&v.negate_first_half, 1);
-        // RowMod/RotateHalf 的 param（周期/块大小）是**运行时形状数据**，
-        // 不进 key：同结构不同形状（如不同 d_k）共享一个融合 shader
-        // （glsl_gen 把 param 作为 push constant 读取，dispatch 时按实际
-        // spec 填充）。其余视图 param=0 固定，feed 与否不影响。
+        // RowMod/RotateHalf 的 param（周期/块大小）与 RowAccess 的 mod/offset
+        // 是**运行时形状数据**，不进 key：同结构不同形状（如不同 d_k）共享
+        // 一个融合 shader（glsl_gen 把 param 作为 push constant 读取，dispatch
+        // 时按实际 spec 填充）。其余视图 param=0 固定，feed 与否不影响。
         if (!expr_view_has_runtime_param(static_cast<ExprViewKind>(v.kind)))
+        {
             feed_u32(v.param);
+            feed_u32(v.param2);
+        }
     }
     feed_u32(static_cast<std::uint32_t>(s.consts.size()));
     for (const auto& c : s.consts)
         feed(&c, sizeof(c));
+    // 运行时标量参数（RParam）：只喂**个数**（结构），不喂值——值本身是
+    // 运行时数据（如优化器的 lr/eps/β），不进 key；同结构不同值的表达式
+    // 共享一个融合 shader（glsl_gen 把 rparams 作为 push constant 读取，
+    // dispatch 时按实际 spec 填充）。与 RowMod/RotateHalf 的 param 同处理。
+    feed_u32(static_cast<std::uint32_t>(s.rparams.size()));
     // matmul 段（可选）：transA/transB/a_input/b_input 是**结构** → 进 key；
     // k（求和维度）是**形状参数** → 不进 key（同 RowMod/RotateHalf 的 param
     // 处理）：同结构不同 K 共享一个融合 shader（glsl_gen 把 k 作为 push
@@ -410,9 +458,9 @@ struct ExprSpec
 }
 
 // ── 上限（GPU 资源 / 校验共用）───────────────────────────────────────────
-inline constexpr std::size_t EXPR_MAX_INPUTS = 8;
+inline constexpr std::size_t EXPR_MAX_INPUTS = 16;  // 树型 DSL 重复叶子上限（绑定按 spec 实际 views 动态创建，非固定）
 inline constexpr std::size_t EXPR_MAX_CONSTS = 16;
-inline constexpr std::size_t EXPR_MAX_REGS   = 16;
+inline constexpr std::size_t EXPR_MAX_REGS   = 32;  // 全融合分支 select 表达式（如 SwiGLU backward）所需；shader 仅声明实际 num_regs
 inline constexpr std::size_t EXPR_MAX_INSTRS = 64;
 
 // ── matmul 融合分块尺寸（S5：glsl_gen 生成与后端 dispatch 共用）─────────
@@ -442,6 +490,9 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
         return std::unexpected(Error{"validate_expr_spec: too many inputs"});
     if (spec.consts.size() > EXPR_MAX_CONSTS)
         return std::unexpected(Error{"validate_expr_spec: too many constants"});
+    // 运行时标量参数同样受限（PC 浮点槽位有限）
+    if (spec.rparams.size() > EXPR_MAX_CONSTS)
+        return std::unexpected(Error{"validate_expr_spec: too many runtime params"});
     if (spec.views.size() != num_inputs)
         return std::unexpected(Error{"validate_expr_spec: views count != inputs count"});
     // matmul 段：A/B 输入下标必须在输入范围内（形状由引擎按实际张量推导）
@@ -475,6 +526,8 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
                 return std::unexpected(Error{"validate_expr_spec: input index out of range"});
             if (op.kind == static_cast<uint8_t>(ExprOperandKind::Const) && op.idx >= spec.consts.size())
                 return std::unexpected(Error{"validate_expr_spec: const index out of range"});
+            if (op.kind == static_cast<uint8_t>(ExprOperandKind::RParam) && op.idx >= spec.rparams.size())
+                return std::unexpected(Error{"validate_expr_spec: rparam index out of range"});
             if (op.kind == static_cast<uint8_t>(ExprOperandKind::Matmul) && !spec.matmul)
                 return std::unexpected(Error{
                     "validate_expr_spec: Matmul operand without matmul segment"});
@@ -535,11 +588,16 @@ namespace expr
     inline constexpr ExprOperand row()                 { return {6, 0}; }  // 当前行号（batch 内）
     inline constexpr ExprOperand col()                 { return {7, 0}; }  // 当前列号
     inline constexpr ExprOperand batch()               { return {8, 0}; }  // 当前批次下标
+    // 运行时标量参数（RParam）：运行时按实际 spec.rparams[idx] 填充
+    inline constexpr ExprOperand rval(std::uint8_t r)  { return {9, r}; }
     inline constexpr ExprView linear()                 { return {0, 0, 0}; }
     inline constexpr ExprView rotate_half(std::uint32_t block_rows, bool negate_first_half = true)
     { return {1, negate_first_half ? std::uint8_t{1} : std::uint8_t{0}, block_rows}; }
     inline constexpr ExprView row_mod(std::uint32_t modulo)
     { return {2, 0, modulo}; }
+    // RowAccess(offset, mod)：source_row = offset + (r % mod)；param=mod, param2=offset
+    inline constexpr ExprView row_access(std::uint32_t offset, std::uint32_t modulo)
+    { return {12, 0, modulo, offset}; }
     inline constexpr ExprView col_reduce_sum() { return {3, 0, 0}; }
     inline constexpr ExprView col_reduce_max() { return {4, 0, 0}; }
     inline constexpr ExprView row_reduce_sum() { return {5, 0, 0}; }

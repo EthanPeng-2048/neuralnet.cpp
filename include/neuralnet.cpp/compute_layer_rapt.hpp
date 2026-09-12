@@ -467,10 +467,10 @@ public:
         auto u_r = engine.slice_rows(*Z_sc, 0, BHdk);
         if (!u_r) return std::unexpected(u_r.error());
 
-        // den = q'·z + ε；out = num / den
-        auto den_r = engine.elementwise_binary_scalar(BinaryOp::Add, *u_r, Scalar{1e-4});
-        if (!den_r) return std::unexpected(den_r.error());
-        auto div_r = engine.elementwise_binary(BinaryOp::Div, *BP_r, *den_r);
+        // den = q'·z + ε；out = num / den（逐元素链融合为单 kernel：num/(u+ε)）
+        auto div_r = dsl::compute(engine,
+            dsl::leaf(*BP_r) / (dsl::leaf(*u_r) + Scalar{1e-4}),
+            (*BP_r).rows(), (*BP_r).cols());
         if (!div_r) return std::unexpected(div_r.error());
         Tensor out_t = std::move(*div_r);
 
@@ -583,31 +583,28 @@ public:
         auto r_r = engine.slice_rows(*Sc, 4 * BHdk, BHdk);    // r = g·(B·q)
         if (!r_r) return std::unexpected(r_r.error());
 
-        // ── 公共中间量 ───────────────────────────────────────────────
-        auto den_r = engine.elementwise_binary_scalar(BinaryOp::Add, *u_r, Scalar{1e-4});
-        if (!den_r) return std::unexpected(den_r.error());
-        auto inv_r = engine.elementwise_binary_scalar(BinaryOp::Div, *den_r, Scalar{1.0}, true);
-        if (!inv_r) return std::unexpected(inv_r.error());
-        auto gnum_r = engine.elementwise_binary(BinaryOp::Mul, gcr, *inv_r);
+        // ── 公共中间量（逐元素链全融合为 DSL，消除 inv/den² 中间缓冲）──
+        //   gnum = g/(u+ε)           （分子梯度，用于 outer→dB）
+        //   scale = -r/(u+ε)²        （分母修正系数，用于 gQ/gK）
+        //   gQt  = B^T·g/(u+ε) + scale·z   （gQ 完整表达式）
+        const std::size_t cRows = (*u_r).rows(), cCols = (*u_r).cols();
+        auto gnum_r = dsl::compute(engine,
+            dsl::leaf(gcr) / (dsl::leaf(*u_r) + Scalar{1e-4}),
+            cRows, cCols);
         if (!gnum_r) return std::unexpected(gnum_r.error());
-        auto neg_r = engine.elementwise_unary(UnaryOp::Neg, *r_r);
-        if (!neg_r) return std::unexpected(neg_r.error());
-        auto den2_r = engine.elementwise_binary(BinaryOp::Mul, *den_r, *den_r);
-        if (!den2_r) return std::unexpected(den2_r.error());
-        auto scale_r = engine.elementwise_binary(BinaryOp::Div, *neg_r, *den2_r);
+        auto scale_r = dsl::compute(engine,
+            dsl::neg(dsl::leaf(*r_r))
+                / ((dsl::leaf(*u_r) + Scalar{1e-4}) * (dsl::leaf(*u_r) + Scalar{1e-4})),
+            cRows, cCols);
         if (!scale_r) return std::unexpected(scale_r.error()); // -r/den²（标量重复 dk 次）
 
-        // ── gQ = B^T·gnum + scale·z ─────────────────────────────────
-        auto btrg_r = engine.elementwise_binary(BinaryOp::Mul, *BTR_r, *inv_r);
-        if (!btrg_r) return std::unexpected(btrg_r.error());
-        auto gQ_den_r = engine.elementwise_binary(BinaryOp::Mul, *scale_r, *z_inv_r);
-        if (!gQ_den_r) return std::unexpected(gQ_den_r.error());
-        Tensor gQt;
-        {
-            auto r = engine.elementwise_binary(BinaryOp::Add, *btrg_r, *gQ_den_r);
-            if (!r) return std::unexpected(r.error());
-            gQt = std::move(*r);
-        }
+        // ── gQ = B^T·gnum + scale·z（全链融合为单 kernel） ─────────────
+        auto gQt_r = dsl::compute(engine,
+            dsl::leaf(*BTR_r) / (dsl::leaf(*u_r) + Scalar{1e-4})
+                + dsl::leaf(*scale_r) * dsl::leaf(*z_inv_r),
+            cRows, cCols);
+        if (!gQt_r) return std::unexpected(gQt_r.error());
+        Tensor gQt = std::move(*gQt_r);
 
         // ── gV 和 gK ─────────────────────────────────────────────────
         Tensor gKt, gVt;

@@ -22,6 +22,7 @@
 #include <neuralnet.cpp/cli/cli_lr_scheduler.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -256,7 +257,7 @@ nn::Precision parse_precision(const std::string& name, const char* flag)
 void print_usage(const char *prog)
 {
     std::cout
-        << "GPT 文本生成训练程序 (引擎化架构)\n\n"
+        << "GPT 文本生成训练程序\n\n"
         << "用法: " << prog << " <text-file> [选项]\n\n"
         << "参数:\n"
         << "  <text-file>        训练文本文件路径 (必需)\n\n"
@@ -890,7 +891,7 @@ int main(int argc, char *argv[])
 
     // ── 打印配置 ─────────────────────────────────────────────
     std::cout << "========================================\n";
-    std::cout << "  GPT 文本生成训练 (引擎化架构)\n";
+    std::cout << "  GPT 文本生成训练\n";
     std::cout << "========================================\n";
     std::cout << "  词表大小: " << tokenizer->vocab_size() << "\n";
     std::cout << "  模型维度: " << cfg.d_model << "\n";
@@ -967,7 +968,6 @@ int main(int argc, char *argv[])
     }
     else
     {
-        std::cerr << "[DBG] building GPT model...\n" << std::flush;
         model_build = nn::build_gpt_model(
             *engine,
             tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
@@ -979,7 +979,6 @@ int main(int argc, char *argv[])
         std::cerr << "构建模型失败: " << model_build.error().message << '\n';
         return 1;
     }
-    std::cerr << "[DBG] model built OK\n" << std::flush;
     auto model = std::move(*model_build);
 
     // ── 打印精度配置 ──
@@ -1532,14 +1531,7 @@ int main(int argc, char *argv[])
                 std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
                           << "  step " << step + 1 << "/" << steps_per_epoch
                           << "  loss: " << std::fixed << std::setprecision(4) << loss
-                          << "   ";
-                // 显存池统计（GPU 有效）：dev=真实显存 host=offload RAM
-                const auto ps = engine->pool_stats();
-                if (!ps.empty())
-                    std::cout << "[pool: " << ps << "]  ";
-                if (cfg.activation_offload)
-                    std::cout << "[offload " << (model.offload_ram_bytes() / (1024*1024)) << "MB]  ";
-                std::cout << std::flush;
+                          << "   " << std::flush;
             }
         }
 

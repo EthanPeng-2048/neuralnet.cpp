@@ -261,62 +261,53 @@ protected:
 
     // Adam 核心更新（提取为 protected，AdamW 复用）
     // inv_bc1/inv_bc2 由 step() 提前计算（每步仅一次 pow），失败时不推进 t。
+    //
+    // 融合改造（消除 GPU Copy / 中间缓冲）：
+    //   旧实现对 m/v 各做一次 clone_tensor（整份模型尺寸 vkCmdCopyBuffer，逐
+    //   步 2×model_size 的 Copy）+ 多次逐元素原语 + 多个中间张量。现改为三个
+    //   DSL 融合 kernel，全部超参（β1/β2/eps/lr/inv_bc1/inv_bc2）经 RParam
+    //   （运行时标量）承载——值不进 expr_spec_key，同结构共享 fusion shader，
+    //   引擎适应计算。无任何 clone、无 m_hat/v_hat/sqrt_v/denom/ratio 物化：
+    //     K1  m = β1*m + (1-β1)*g            （m_ owned，直接重赋值）
+    //     K2  v = β2*v + (1-β2)*g²           （v_ owned，直接重赋值）
+    //     K3  p -= lr * (inv_bc1*m) / (sqrt(inv_bc2*v)+eps)（p 为模型张量，add_inplace 就地）
     [[nodiscard]] Result<void> adam_update_(
         std::size_t i, Scalar inv_bc1, Scalar inv_bc2)
     {
         const Scalar one_minus_beta1 = Scalar{1} - beta1_;
         const Scalar one_minus_beta2 = Scalar{1} - beta2_;
-
         const Tensor& g = grads_[i];
+        const std::size_t rows = g.rows(), cols = g.cols();
 
-        // m = β1*m + (1-β1)*g
-        auto r = engine_.scale_inplace(m_[i], beta1_);
-        if (!r) return std::unexpected(r.error());
-        r = engine_.axpy_inplace(m_[i], one_minus_beta1, g);
-        if (!r) return std::unexpected(r.error());
+        // K1: m = β1*m + (1-β1)*g（单 kernel 融合）
+        auto m_new = dsl::compute(engine_,
+            dsl::leaf(m_[i]) * dsl::rparam(beta1_) +
+                dsl::leaf(g) * dsl::rparam(one_minus_beta1),
+            rows, cols);
+        if (!m_new) return std::unexpected(m_new.error());
+        m_[i] = std::move(*m_new);
 
-        // v = β2*v + (1-β2)*g²
-        r = engine_.scale_inplace(v_[i], beta2_);
-        if (!r) return std::unexpected(r.error());
-        auto g_sq = dsl::compute(engine_, dsl::leaf(g) * dsl::leaf(g),
-                                 g.rows(), g.cols());
-        if (!g_sq) return std::unexpected(g_sq.error());
-        r = engine_.scale_inplace(*g_sq, one_minus_beta2);
-        if (!r) return std::unexpected(r.error());
-        r = engine_.add_inplace(v_[i], *g_sq);
-        if (!r) return std::unexpected(r.error());
+        // K2: v = β2*v + (1-β2)*g²（单 kernel 融合）
+        auto v_new = dsl::compute(engine_,
+            dsl::leaf(v_[i]) * dsl::rparam(beta2_) +
+                dsl::leaf(g) * dsl::leaf(g) * dsl::rparam(one_minus_beta2),
+            rows, cols);
+        if (!v_new) return std::unexpected(v_new.error());
+        v_[i] = std::move(*v_new);
 
-        // m_hat = m / bc1
-        auto m_hat = clone_tensor(engine_, m_[i]);
-        if (!m_hat) return std::unexpected(m_hat.error());
-        r = engine_.scale_inplace(*m_hat, inv_bc1);
+        // K3: p -= lr * (inv_bc1*m) / (sqrt(inv_bc2*v)+eps)（全链单 kernel 融合；
+        //     依赖刚更新的 m_[i]/v_[i]，偏置修正系数 inv_bc1/inv_bc2 逐步变化
+        //     由 RParam 承载，不进 key → 共享 shader）
+        auto delta = dsl::compute(engine_,
+              -dsl::rparam(lr_)
+              * ((dsl::leaf(m_[i]) * dsl::rparam(inv_bc1))
+                 / (dsl::sqrt(dsl::leaf(v_[i]) * dsl::rparam(inv_bc2))
+                    + dsl::rparam(eps_))),
+            rows, cols);
+        if (!delta) return std::unexpected(delta.error());
+        auto r = engine_.add_inplace(params_[i], *delta);
         if (!r) return std::unexpected(r.error());
-
-        // v_hat = v / bc2
-        auto v_hat = clone_tensor(engine_, v_[i]);
-        if (!v_hat) return std::unexpected(v_hat.error());
-        r = engine_.scale_inplace(*v_hat, inv_bc2);
-        if (!r) return std::unexpected(r.error());
-
-        // sqrt_v = sqrt(v_hat)
-        auto sqrt_v = engine_.elementwise_unary(UnaryOp::Sqrt, *v_hat);
-        if (!sqrt_v) return std::unexpected(sqrt_v.error());
-
-        // denom = sqrt_v + eps
-        // （eps_ 为运行期标量，折叠进 DSL key 会使不同 eps 产生不同 AOT key，
-        //   破坏闭合世界，故保留原语路径）
-        auto denom = engine_.elementwise_binary_scalar(BinaryOp::Add, *sqrt_v, eps_);
-        if (!denom) return std::unexpected(denom.error());
-
-        // ratio = m_hat / denom
-        auto ratio = dsl::compute(engine_, dsl::leaf(*m_hat) / dsl::leaf(*denom),
-                                  m_hat->rows(), m_hat->cols());
-        if (!ratio) return std::unexpected(ratio.error());
-
-        // p -= lr * ratio
-        r = engine_.scale_inplace(*ratio, -lr_);
-        if (!r) return std::unexpected(r.error());
-        return engine_.add_inplace(params_[i], *ratio);
+        return {};
     }
 
     void init_moments_()
@@ -488,40 +479,71 @@ public:
     auto r = engine.scale_inplace(*X, inv_norm_scalar);
     if (!r) return std::unexpected(r.error());
 
-    // Newton-Schulz 迭代：X_new = a*X + (b*A + c*A²) @ X，其中 A = X @ X^T
-    //
-    // 性能优化：通过就地复用 matmul 输出缓冲区，减少 clone_tensor 调用：
-    //   - A 缓冲区就地修改为 B = b*A + c*A²（A 在计算 B 后不再需要）
-    //   - BX 缓冲区就地添加 a*X 得到 X_new（BX 在 aX 加法后不再需要）
-    // 注意：每步仍创建 3 个新 Tensor（A、A_sq、BX，均为 matmul 返回值），
-    //       但消除了额外的 clone_tensor 步骤。
-    for (std::size_t t = 0; t < steps; ++t)
+    // 选更小一侧构造母矩阵，避免显存爆炸（Muon 显存 > AdamW 的根因）：
+    //   - 短宽/方阵（m ≤ n）：行正交化，母矩阵 A = X·X^T（m×m，m 为短边）
+    //   - 高窄矩阵（m > n）：列正交化，母矩阵 G = X^T·X（n×n，n 为短边）
+    // 故母矩阵恒为 min(m,n)² 而非 max(m,n)²。对高窄大参数（如 50257×1024 的
+    // 词嵌入），旧实现构造 50257² 的 A/A²（≈10GB/个）会 OOM；新实现降至
+    // 1024²（≈4MB）。且列正交化要求 n ≤ m，高窄时"列"是唯一可达的近正交目标，
+    // 数学上与参考实现（对短边一侧正交化）一致。
+    const std::size_t m = G.rows();
+    const std::size_t n = G.cols();
+    const bool tall = m > n;
+
+    if (!tall)
     {
-        // A = X @ X^T（matmul 返回新 tensor，无分配开销）
-        auto A = engine.matmul(*X, *X, false, true);
-        if (!A) return std::unexpected(A.error());
+        // 行正交化：X ← (a + bA + cA²)·X，A = X·X^T（m×m）
+        // 性能优化：就地复用 matmul 输出缓冲区，减少 clone_tensor 调用：
+        //   A 就地改为 B = bA + cA²；BX 就地加 aX 得 X_new。每步仍创建 3 个
+        //   新 Tensor（A、A_sq、BX），但消除了额外的 clone_tensor 步骤。
+        for (std::size_t t = 0; t < steps; ++t)
+        {
+            auto A = engine.matmul(*X, *X, false, true);     // A = X·X^T
+            if (!A) return std::unexpected(A.error());
+            auto A_sq = engine.matmul(*A, *A, false, false); // A²
+            if (!A_sq) return std::unexpected(A_sq.error());
 
-        // A_sq = A @ A（matmul 返回新 tensor）
-        auto A_sq = engine.matmul(*A, *A, false, false);
-        if (!A_sq) return std::unexpected(A_sq.error());
+            r = engine.scale_inplace(*A_sq, c);
+            if (!r) return std::unexpected(r.error());
+            r = engine.scale_inplace(*A, b);
+            if (!r) return std::unexpected(r.error());
+            r = engine.add_inplace(*A, *A_sq);               // A = bA + cA²
+            if (!r) return std::unexpected(r.error());
 
-        // B = b*A + c*A²
-        // 就地复用：A_sq 不再需要后修改为 c*A²，A 不再需要后修改为 b*A
-        r = engine.scale_inplace(*A_sq, c);
-        if (!r) return std::unexpected(r.error());
-        r = engine.scale_inplace(*A, b);
-        if (!r) return std::unexpected(r.error());
-        r = engine.add_inplace(*A, *A_sq);  // A 现在是 B = b*A + c*A²
-        if (!r) return std::unexpected(r.error());
+            auto BX = engine.matmul(*A, *X, false, false);   // B·X
+            if (!BX) return std::unexpected(BX.error());
+            r = engine.axpy_inplace(*BX, a, *X);             // + aX
+            if (!r) return std::unexpected(r.error());
 
-        // X_new = a*X + B @ X
-        // 就地复用：BX 是 matmul 新输出，axpy_inplace 就地添加 a*X
-        auto BX = engine.matmul(*A, *X, false, false);
-        if (!BX) return std::unexpected(BX.error());
-        r = engine.axpy_inplace(*BX, a, *X);  // BX += a*X → (B + aI)*X
-        if (!r) return std::unexpected(r.error());
+            X = std::move(*BX);
+        }
+    }
+    else
+    {
+        // 列正交化：X ← X·(a + bG + cG²)，G = X^T·X（n×n，n < m）
+        // 由 X_new^T·X_new = (aI+bG+cG²)·G·(...)=φ(G)²·G，驱动 G → I（列正交）。
+        // 母矩阵恒为 n×n，高窄时远小于 m×m。
+        for (std::size_t t = 0; t < steps; ++t)
+        {
+            auto Gr = engine.matmul(*X, *X, true, false);    // G = X^T·X（n×n）
+            if (!Gr) return std::unexpected(Gr.error());
+            auto Gr_sq = engine.matmul(*Gr, *Gr, false, false); // G²
+            if (!Gr_sq) return std::unexpected(Gr_sq.error());
 
-        X = std::move(*BX);
+            r = engine.scale_inplace(*Gr_sq, c);
+            if (!r) return std::unexpected(r.error());
+            r = engine.scale_inplace(*Gr, b);
+            if (!r) return std::unexpected(r.error());
+            r = engine.add_inplace(*Gr, *Gr_sq);             // G = bG + cG²
+            if (!r) return std::unexpected(r.error());
+
+            auto XM = engine.matmul(*X, *Gr, false, false);  // X·G
+            if (!XM) return std::unexpected(XM.error());
+            r = engine.axpy_inplace(*XM, a, *X);             // + aX
+            if (!r) return std::unexpected(r.error());
+
+            X = std::move(*XM);
+        }
     }
 
     return *X;

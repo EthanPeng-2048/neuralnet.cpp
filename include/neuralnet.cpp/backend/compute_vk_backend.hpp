@@ -105,9 +105,24 @@
 #define NN_SCAN_SUFFIX_OUTER_SPV_EMBEDDED
 #endif
 
+#if __has_include("scan_prefix_outer_gen_spv.hpp")
+#include "scan_prefix_outer_gen_spv.hpp"
+#define NN_SCAN_PREFIX_OUTER_GEN_SPV_EMBEDDED
+#endif
+
+#if __has_include("scan_suffix_outer_gen_spv.hpp")
+#include "scan_suffix_outer_gen_spv.hpp"
+#define NN_SCAN_SUFFIX_OUTER_GEN_SPV_EMBEDDED
+#endif
+
 #if __has_include("outer_col_spv.hpp")
 #include "outer_col_spv.hpp"
 #define NN_OUTER_COL_SPV_EMBEDDED
+#endif
+
+#if __has_include("cast_spv.hpp")
+#include "cast_spv.hpp"
+#define NN_CAST_SPV_EMBEDDED
 #endif
 
 // AOT 融合 shader 注册表（构建期 scan_exprs 收集 + gen_fused 合成；表达式
@@ -351,7 +366,11 @@ private:
     // RLA 扫描原语（手写原语，不进 AOT 融合注册表；铁律 3：shader 不含算法）
     VulkanPipeline scan_prefix_outer_pipeline_;
     VulkanPipeline scan_suffix_outer_pipeline_;
+    VulkanPipeline scan_prefix_outer_gen_pipeline_;  // 通用 d_k（>64）前缀扫描
+    VulkanPipeline scan_suffix_outer_gen_pipeline_;  // 通用 d_k（>64）后缀扫描
     VulkanPipeline outer_col_pipeline_;
+    // 通用精度转换原语（engine.cast 的 GPU 实现；f16↔f32，kind 分派精度对）
+    VulkanPipeline cast_pipeline_;
     // AOT 融合 shader pipelines（key = expr_spec_key → pipeline；由构建期
     // fused_registry.hpp 注册，运行时按 key 匹配后直接 dispatch）
     std::unordered_map<std::string, VulkanPipeline> fused_pipelines_;
@@ -361,6 +380,8 @@ private:
     std::unordered_map<std::string, bool> fused_has_matmul_;
     // 运行时视图参数个数（RowMod/RotateHalf 的 vp push constant 槽数）
     std::unordered_map<std::string, std::uint32_t> fused_view_param_counts_;
+    // 运行时标量参数个数（优化器 lr/eps/β 等的 rp push constant 槽数）
+    std::unordered_map<std::string, std::uint32_t> fused_rparam_counts_;
     // 每线程处理元素数（1=标量, 4=vec4；决定 dispatch 宽度缩放）
     std::unordered_map<std::string, std::uint32_t> fused_vec_width_;
 
@@ -571,10 +592,40 @@ private:
 #endif
     }
 
+    [[nodiscard]] static const std::vector<uint32_t>& get_scan_prefix_outer_gen_spirv()
+    {
+#ifdef NN_SCAN_PREFIX_OUTER_GEN_SPV_EMBEDDED
+        return nn_scan_prefix_outer_gen_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_scan_suffix_outer_gen_spirv()
+    {
+#ifdef NN_SCAN_SUFFIX_OUTER_GEN_SPV_EMBEDDED
+        return nn_scan_suffix_outer_gen_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
     [[nodiscard]] static const std::vector<uint32_t>& get_outer_col_spirv()
     {
 #ifdef NN_OUTER_COL_SPV_EMBEDDED
         return nn_outer_col_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_cast_spirv()
+    {
+#ifdef NN_CAST_SPV_EMBEDDED
+        return nn_cast_spirv_bytecode();
 #else
         static const std::vector<uint32_t> empty;
         return empty;
@@ -949,6 +1000,23 @@ public:
             if (sfs_r)
                 scan_suffix_outer_pipeline_ = std::move(*sfs_r);
         }
+        // 16b. 通用 d_k（>64）前缀/后缀扫描 pipelines（状态驻全局 scratch）
+        const auto& spfg_spirv = get_scan_prefix_outer_gen_spirv();
+        if (!spfg_spirv.empty())
+        {
+            auto spfg_r = VulkanPipeline::create_generic(
+                device_.device(), spfg_spirv, 9, 7 * sizeof(uint32_t));
+            if (spfg_r)
+                scan_prefix_outer_gen_pipeline_ = std::move(*spfg_r);
+        }
+        const auto& sfsg_spirv = get_scan_suffix_outer_gen_spirv();
+        if (!sfsg_spirv.empty())
+        {
+            auto sfsg_r = VulkanPipeline::create_generic(
+                device_.device(), sfsg_spirv, 6, 6 * sizeof(uint32_t));
+            if (sfsg_r)
+                scan_suffix_outer_gen_pipeline_ = std::move(*sfsg_r);
+        }
         const auto& oc_spirv = get_outer_col_spirv();
         if (!oc_spirv.empty())
         {
@@ -956,6 +1024,15 @@ public:
                 device_.device(), oc_spirv, 4, 4 * sizeof(uint32_t));
             if (oc_r)
                 outer_col_pipeline_ = std::move(*oc_r);
+        }
+        // 15. 通用精度转换 pipeline（f16↔f32；2 缓冲 + push{count,kind}）
+        const auto& cast_spirv = get_cast_spirv();
+        if (!cast_spirv.empty())
+        {
+            auto cast_r = VulkanPipeline::create_generic(
+                device_.device(), cast_spirv, 2, 2u * sizeof(uint32_t));
+            if (cast_r)
+                cast_pipeline_ = std::move(*cast_r);
         }
 
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
@@ -978,7 +1055,8 @@ public:
             const std::uint32_t pc_uints = pc_base + fs.view_param_count;
             const std::uint32_t pc_size =
                 static_cast<std::uint32_t>(pc_uints * sizeof(std::uint32_t) +
-                                           sizeof(Scalar) * fs.spec.consts.size());
+                                           sizeof(Scalar) * fs.spec.consts.size() +
+                                           sizeof(Scalar) * fs.spec.rparams.size());
             auto fp_r = VulkanPipeline::create_generic(
                 device_.device(), std::span<const std::uint32_t>(fs.spirv, fs.spirv_words),
                 num_bindings, pc_size);
@@ -988,6 +1066,7 @@ public:
                 fused_reduce_axis_.emplace(fs.key, fs.reduce_axis);
                 fused_has_matmul_.emplace(fs.key, fs.has_matmul != 0);
                 fused_view_param_counts_.emplace(fs.key, fs.view_param_count);
+                fused_rparam_counts_.emplace(fs.key, fs.rparam_count);
                 fused_vec_width_.emplace(fs.key, fs.vec_width);
             }
         }
@@ -1026,7 +1105,10 @@ public:
     [[nodiscard]] bool has_scatter_add_pipeline() const noexcept { return scatter_add_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_scan_prefix_outer_pipeline() const noexcept { return scan_prefix_outer_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_scan_suffix_outer_pipeline() const noexcept { return scan_suffix_outer_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_scan_prefix_outer_gen_pipeline() const noexcept { return scan_prefix_outer_gen_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_scan_suffix_outer_gen_pipeline() const noexcept { return scan_suffix_outer_gen_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_outer_col_pipeline() const noexcept { return outer_col_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_cast_pipeline() const noexcept { return cast_pipeline_.handle() != VK_NULL_HANDLE; }
 
     // ── D4：f16 硬件能力查询（§7.1）────────────────────────────────────
     [[nodiscard]] bool has_shader_float16() const noexcept { return has_shader_float16_; }
@@ -1777,12 +1859,13 @@ public:
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
-        if (!has_scan_prefix_outer_pipeline())
-            return std::unexpected(Error{"scan_prefix_outer_gpu: pipeline not available"});
         if (dk == 0u || heads == 0u)
             return std::unexpected(Error{"scan_prefix_outer_gpu: dk/heads must be > 0"});
-        if (dk > 64u)
-            return std::unexpected(Error{"scan_prefix_outer_gpu: d_k > 64 not supported"});
+        const bool generic = dk > 64u;  // 通用路径（状态驻全局 scratch，无 dk 上限）
+        if (!generic && !has_scan_prefix_outer_pipeline())
+            return std::unexpected(Error{"scan_prefix_outer_gpu: pipeline not available"});
+        if (generic && !has_scan_prefix_outer_gen_pipeline())
+            return std::unexpected(Error{"scan_prefix_outer_gpu: generic pipeline not available"});
         const auto rows = static_cast<uint32_t>(K.rows());
         if (rows % (dk * heads) != 0)
             return std::unexpected(Error{"scan_prefix_outer_gpu: rows not divisible by H*dk"});
@@ -1809,6 +1892,22 @@ public:
                         has_bnd ? 1u : 0u, rows};
         std::vector<std::uint8_t> pc(sizeof(push));
         std::memcpy(pc.data(), &push, sizeof(push));
+        if (generic)
+        {
+            // 通用 d_k > 64：状态驻全局 scratch（B*H*2*dk²），共享内存 O(1)，
+            // 对任意 dk 安全。GpuTensor 析构走 pending_destroys 延迟归还，
+            // batch 录制期被引用（descriptor set）也不会过早释放。
+            auto St_res = GpuTensor::create_empty(
+                static_cast<std::size_t>(BH) * 2u * dk * dk, 1u, *this);
+            if (!St_res)
+                return std::unexpected(St_res.error());
+            GpuTensor St = std::move(*St_res);
+            std::vector<GpuTensor> inputs{K, V, P, R, A0, B0, boundary, St};
+            auto r = dispatch_compute(scan_prefix_outer_gen_pipeline_, inputs, C, pc, 1u, BH, 1u);
+            if (!r)
+                return std::unexpected(r.error());
+            return C;
+        }
         std::vector<GpuTensor> inputs{K, V, P, R, A0, B0, boundary};
         auto r = dispatch_compute(scan_prefix_outer_pipeline_, inputs, C, pc, 1u, BH, 1u);
         if (!r)
@@ -1824,12 +1923,13 @@ public:
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
-        if (!has_scan_suffix_outer_pipeline())
-            return std::unexpected(Error{"scan_suffix_outer_gpu: pipeline not available"});
         if (dk == 0u || heads == 0u)
             return std::unexpected(Error{"scan_suffix_outer_gpu: dk/heads must be > 0"});
-        if (dk > 64u)
-            return std::unexpected(Error{"scan_suffix_outer_gpu: d_k > 64 not supported"});
+        const bool generic = dk > 64u;  // 通用路径（状态驻全局 scratch，无 dk 上限）
+        if (!generic && !has_scan_suffix_outer_pipeline())
+            return std::unexpected(Error{"scan_suffix_outer_gpu: pipeline not available"});
+        if (generic && !has_scan_suffix_outer_gen_pipeline())
+            return std::unexpected(Error{"scan_suffix_outer_gpu: generic pipeline not available"});
         const auto rows = static_cast<uint32_t>(X.rows());
         if (rows % (dk * heads) != 0)
             return std::unexpected(Error{"scan_suffix_outer_gpu: X rows not divisible by H*dk"});
@@ -1851,6 +1951,19 @@ public:
         PushSuffix push{dk, heads, seq, causal ? 1u : 0u, has_bnd ? 1u : 0u, rows};
         std::vector<std::uint8_t> pc(sizeof(push));
         std::memcpy(pc.data(), &push, sizeof(push));
+        if (generic)
+        {
+            auto St_res = GpuTensor::create_empty(
+                static_cast<std::size_t>(BH) * dk * dk, 1u, *this);
+            if (!St_res)
+                return std::unexpected(St_res.error());
+            GpuTensor St = std::move(*St_res);
+            std::vector<GpuTensor> inputs{D, X, Y, boundary, St};
+            auto r = dispatch_compute(scan_suffix_outer_gen_pipeline_, inputs, C, pc, 1u, BH, 1u);
+            if (!r)
+                return std::unexpected(r.error());
+            return C;
+        }
         std::vector<GpuTensor> inputs{D, X, Y, boundary};
         auto r = dispatch_compute(scan_suffix_outer_pipeline_, inputs, C, pc, 1u, BH, 1u);
         if (!r)
@@ -1869,8 +1982,6 @@ public:
             return std::unexpected(Error{"outer_col_gpu: pipeline not available"});
         if (dk == 0u)
             return std::unexpected(Error{"outer_col_gpu: dk must be > 0"});
-        if (dk > 64u)
-            return std::unexpected(Error{"outer_col_gpu: d_k > 64 not supported"});
         const auto rows = static_cast<uint32_t>(P.rows());
         if (rows % dk != 0)
             return std::unexpected(Error{"outer_col_gpu: rows not divisible by dk"});
@@ -2241,6 +2352,7 @@ public:
         std::size_t rows, std::size_t cols,
         bool vector_out = false,
         std::span<const std::uint32_t> view_params = {},
+        std::span<const Scalar> rparams = {},
         GpuTensor* output_override = nullptr,
         std::optional<std::uint32_t> matmul_k = std::nullopt,
         std::uint32_t matmul_batch = 1)
@@ -2260,6 +2372,9 @@ public:
         // 运行时视图参数个数（RowMod/RotateHalf 的 vp 槽）
         const std::uint32_t n_vp = fused_view_param_counts_.count(shader_name)
             ? fused_view_param_counts_.at(shader_name) : 0u;
+        // 运行时标量参数个数（优化器 lr/eps/β 的 rp 槽）
+        const std::uint32_t n_rp = fused_rparam_counts_.count(shader_name)
+            ? fused_rparam_counts_.at(shader_name) : 0u;
 
         if (inputs.size() + 1 > EXPR_MAX_INPUTS + 1)
             return std::unexpected(Error{"run_fused_gpu: too many inputs"});
@@ -2268,6 +2383,9 @@ public:
         if (view_params.size() != n_vp)
             return std::unexpected(Error{
                 "run_fused_gpu: view_params count mismatch for " + shader_name});
+        if (rparams.size() != n_rp)
+            return std::unexpected(Error{
+                "run_fused_gpu: rparams count mismatch for " + shader_name});
         if (has_mm && !matmul_k)
             return std::unexpected(Error{
                 "run_fused_gpu: matmul shader 缺少 matmul_k（求和维度）"});
@@ -2362,7 +2480,8 @@ public:
           : ((raxis >= 0 || has_mm) ? 5u : 2u);
         const std::uint32_t pc_uints = pc_base;
         std::vector<std::uint8_t> pc(
-            (pc_uints + n_vp) * sizeof(std::uint32_t) + sizeof(Scalar) * consts.size());
+            (pc_uints + n_vp) * sizeof(std::uint32_t) + sizeof(Scalar) * consts.size()
+            + sizeof(Scalar) * rparams.size());
         std::memcpy(pc.data(), &count, sizeof(std::uint32_t));
         const std::uint32_t cols32 = static_cast<std::uint32_t>(cols);
         std::memcpy(pc.data() + sizeof(std::uint32_t), &cols32, sizeof(std::uint32_t));
@@ -2402,6 +2521,11 @@ public:
         if (!consts.empty())
             std::memcpy(pc.data() + (pc_uints + n_vp) * sizeof(std::uint32_t), consts.data(),
                         sizeof(Scalar) * consts.size());
+        // 运行时标量参数（优化器 lr/eps/β 等 float rp 槽），置于常量池之后
+        if (!rparams.empty())
+            std::memcpy(pc.data() + (pc_uints + n_vp) * sizeof(std::uint32_t) +
+                            sizeof(Scalar) * consts.size(),
+                        rparams.data(), sizeof(Scalar) * rparams.size());
         vkCmdPushConstants(cmd, pipeline.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, static_cast<std::uint32_t>(pc.size()), pc.data());
 
@@ -2820,10 +2944,100 @@ public:
         return dst;
     }
 
-    // ══════════════════════════════════════════════════════════════════
-    // slice_rows_gpu — 行切片（GPU 内拷贝连续行区间，无 PCIe 传输）
-    // 返回 (count, cols) 的新 GpuTensorT<P>，内容为 src 行 [start_row, start_row + count)
-    // ══════════════════════════════════════════════════════════════════
+    // ── 通用精度转换原语（engine.cast 的 GPU 实现，无 PCIe 往返）────────
+    // 源/目标均为原始 32-bit word 缓冲；kind 分派精度对：
+    //   0 = f16→f32（src 2B/pair 打包，dst 4B/word）
+    //   1 = f32→f16（src 4B/word，dst 2B/pair 打包，round-half-to-even）
+    // 元素数保持不变（count = rows*cols），仅字节宽度差。后续精度对
+    // （BF16/F64/f8 等）扩 kind 枚举即可，绝不改引擎 cast API。
+    [[nodiscard]] Result<void> cast_gpu(
+        const GpuBuffer& src, const GpuBuffer& dst,
+        std::size_t count, std::uint32_t kind)
+    {
+        if (!initialized_)
+            return std::unexpected(Error{"GPU backend not initialized"});
+        if (!has_cast_pipeline())
+            return std::unexpected(Error{"cast_gpu: cast pipeline not available"});
+
+        auto ds_r = alloc_desc_set(cast_pipeline_.descriptor_layout());
+        if (!ds_r) return std::unexpected(ds_r.error());
+        VkDescriptorSet desc_set = *ds_r;
+
+        VkDescriptorBufferInfo binfo[2] = {
+            {src.impl(), 0, VK_WHOLE_SIZE},
+            {dst.impl(), 0, VK_WHOLE_SIZE},
+        };
+        VkWriteDescriptorSet writes[2];
+        for (std::uint32_t i = 0; i < 2; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].pNext = nullptr;
+            writes[i].dstSet = desc_set;
+            writes[i].dstBinding = i;
+            writes[i].dstArrayElement = 0;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pImageInfo = nullptr;
+            writes[i].pBufferInfo = &binfo[i];
+            writes[i].pTexelBufferView = nullptr;
+        }
+        vkUpdateDescriptorSets(device_.device(), 2, writes, 0, nullptr);
+
+        auto cmd_r = acquire_cmd();
+        if (!cmd_r)
+        {
+            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            return std::unexpected(cmd_r.error());
+        }
+        auto [cmd, owns_cmd] = *cmd_r;
+
+        std::vector<VkBuffer> in_bufs{src.impl()};
+        record_input_barriers(cmd, in_bufs);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cast_pipeline_.handle());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            cast_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+
+        struct Push { std::uint32_t count; std::uint32_t kind; };
+        Push push{static_cast<std::uint32_t>(count), kind};
+        std::vector<std::uint8_t> pc(sizeof(push));
+        std::memcpy(pc.data(), &push, sizeof(push));
+        vkCmdPushConstants(cmd, cast_pipeline_.pipeline_layout(),
+            VK_SHADER_STAGE_COMPUTE_BIT, 0,
+            static_cast<uint32_t>(pc.size()), pc.data());
+
+        // 每线程处理 2 元素（一对一 half 或单词对）
+        const auto pairs = (count + 1u) / 2u;
+        const std::uint32_t wg = static_cast<std::uint32_t>((pairs + 255u) / 256u);
+        vkCmdDispatch(cmd, wg < 1u ? 1u : wg, 1u, 1u);
+        record_output_barrier(cmd, dst.impl());
+
+        if (owns_cmd)
+        {
+            auto r = submit_and_wait(cmd, desc_set);
+            if (!r) return std::unexpected(r.error());
+        }
+        return {};
+    }
+
+    // ── 创建逻辑形状 (rows,cols) 但存储为偶数槽位的 f16 张量 ───────────
+    // f32→f16 的 cast 每线程按整 word（两 half）写入；奇数元素 count 时最后一个
+    // word 会越界 2 字节。这里把底层缓冲按偶数元素分配（多 1 槽），逻辑形状不变，
+    // 写 word 永不越界；to_matrix 仍只读前 rows*cols 个元素。
+    [[nodiscard]] Result<GpuTensorF16> create_f16_tensor(
+        std::size_t rows, std::size_t cols)
+    {
+        if (!initialized_)
+            return std::unexpected(Error{"GPU backend not initialized"});
+        const std::size_t cnt = rows * cols;
+        const std::size_t cnt_pad = cnt + (cnt & 1u);         // 偶数槽位
+        auto b = GpuBuffer::create_device_local(
+            device_.device(), *memory_pool_, cnt_pad * 2u,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        if (!b) return std::unexpected(b.error());
+        return GpuTensorF16(std::make_shared<GpuBuffer>(std::move(*b)), rows, cols);
+    }
     template <Precision P>
     [[nodiscard]] Result<GpuTensorT<P>> slice_rows_gpu(
         const GpuTensorT<P>& src, std::size_t start_row, std::size_t count)

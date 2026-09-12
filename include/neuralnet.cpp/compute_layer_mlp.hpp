@@ -276,9 +276,7 @@ class SwiGLU final : public Layer
 {
 private:
     std::size_t d_ff_ = 0;
-    Tensor gate_cache_;    // (d_ff, batch)
-    Tensor sigmoid_cache_; // σ(gate) (d_ff, batch)
-    Tensor up_cache_;      // (d_ff, batch)
+    Tensor input_cache_;  // 前向输入 (2*d_ff, batch)：backward 据此重算 gate/up/s（全融合，不缓存中间张量）
 
 public:
     SwiGLU() = default;
@@ -286,104 +284,75 @@ public:
 
     void clear_cache() override
     {
-        gate_cache_ = Tensor{};
-        sigmoid_cache_ = Tensor{};
-        up_cache_ = Tensor{};
+        input_cache_ = Tensor{};
     }
 
     std::vector<TensorRef> activation_cache() override
     {
         std::vector<TensorRef> r;
-        if (gate_cache_.valid()) r.emplace_back(gate_cache_);
-        if (sigmoid_cache_.valid()) r.emplace_back(sigmoid_cache_);
-        if (up_cache_.valid()) r.emplace_back(up_cache_);
+        if (input_cache_.valid()) r.emplace_back(input_cache_);
         return r;
     }
 
-    // ── forward: out = SiLU(gate) ⊙ up ────────────────────────────────────
+    // ── forward: out = SiLU(gate) ⊙ up = gate·σ(gate)·up ────────────────────
+    // 单表达式 DSL 融合：gate/up 用 RowAccess 行视图读取同一 (2*d_ff, batch)
+    // 输入（gate = row_access(in, 0, d_ff)，up = row_access(in, d_ff, d_ff)），
+    // 不再 slice_rows 物化半张量 → 消去 2 次 D2D 拷贝。输出 (d_ff, batch)。
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
-        // gate = 前 d_ff 行，up = 后 d_ff 行
-        auto gate = engine.slice_rows(input, 0, d_ff_);
-        if (!gate) return std::unexpected(gate.error());
-        auto up = engine.slice_rows(input, d_ff_, d_ff_);
-        if (!up) return std::unexpected(up.error());
-
-        // s = sigmoid(gate) = 1 / (1 + exp(-gate))
-        auto s = dsl::compute(engine,
-            Scalar{1} / (Scalar{1} + dsl::exp(-dsl::leaf(*gate))),
-            gate->rows(), gate->cols());
-        if (!s) return std::unexpected(s.error());
-
+        const std::uint32_t dff = static_cast<std::uint32_t>(d_ff_);
         if (!checkpoint_mode_)
-        {
-            gate_cache_ = *gate;
-            sigmoid_cache_ = *s;
-            up_cache_ = *up;
-        }
-
-        // out = SiLU(gate) ⊙ up = gate * sigmoid(gate) * up
+            input_cache_ = input;
+        const std::size_t cols = input.cols();
+        // gate[r] = in[r % d_ff]（r<d_ff 即 in[r]）；up[r] = in[d_ff + r % d_ff]
+        const auto gv = dsl::row_access(input, 0u, dff);
+        const auto uv = dsl::row_access(input, dff, dff);
+        // out = gate · σ(gate) · up；σ(g) = 1/(1+exp(-g))
         return dsl::compute(engine,
-            dsl::leaf(*gate) * dsl::leaf(*s) * dsl::leaf(*up),
-            gate->rows(), gate->cols());
+            gv * (Scalar{1} / (Scalar{1} + dsl::exp(-gv))) * uv,
+            d_ff_, cols);
     }
 
-    // ── backward: 用 eval_expr（表达式 DSL）融合逐元素计算 ──────────────────
+    // ── backward: 单 kernel 融合，消去 create+zero+2×insert_rows ──────────
     //
     // 数学：
-    //   sw   = gate ⊙ sigmoid
-    //   grad_up   = grad_out ⊙ sw = grad_out ⊙ gate ⊙ sigmoid
-    //   factor    = sigmoid ⊙ (1 + gate ⊙ (1 − sigmoid))
-    //             = sigmoid + sigmoid ⊙ gate ⊙ (1 − sigmoid)
-    //   grad_gate = grad_out ⊙ up ⊙ factor
+    //   s(node)     = σ(gate[node])
+    //   grad_gate   = grad_out ⊙ up ⊙ s ⊙ (1 + gate ⊙ (1 − s))
+    //   grad_up     = grad_out ⊙ gate ⊙ s
     //
-    // 两条 eval_expr（CPU 一次遍历融合、无中间 Tensor）：
-    //   expr1: grad_gate（6 regs, 6 instrs）
-    //     inputs=[grad_out, s, gate, up], consts=[1.0]
-    //     r0 = 1 − s          (Sub, cst(0), input(1))
-    //     r1 = gate * (1−s)   (Mul, input(2), fanout(0))
-    //     r2 = 1 + r1         (Add, cst(0), fanout(1))
-    //     r3 = s * r2         (Mul, input(1), fanout(2))                  // factor
-    //     r4 = up * r3        (Mul, input(3), fanout(3))
-    //     r5 = grad * r4      (Mul, input(0), fanout(4))                  // grad_gate
-    //
-    //   expr2: grad_up（2 regs, 2 instrs）
-    //     inputs=[grad_out, sigmoid, gate]
-    //     i0: r0 = grad * gate    (Mul, input(0), input(2))
-    //     i1: r1 = r0 * sigmoid   (Mul, fanout(0), input(1))               // grad_up
-    //
+    // 输出 grad_input (2*d_ff, batch) 分两半写回：
+    //   r ∈ [0, d_ff)       → grad_gate[r]
+    //   r ∈ [d_ff, 2*d_ff)  → grad_up[r − d_ff]
+    // 用 select(Row() < d_ff, grad_gate_expr, grad_up_expr) 分半；gate/up/s/go
+    // 均经 RowAccess(offset=0|d_ff, mod=d_ff) 行视图按 r % d_ff 定位到对应半，
+    // 两半表达式对"错误"半只会算出越界内但被 Select 丢弃的值，正确性无虞。
+    // （共享的 gate/s 子表达式在树型 DSL 中会重复折叠，故 EXPR_MAX_REGS/INPUTS
+    //   已相应放宽，换取零中间张量、零拷贝。）
     [[nodiscard]] Result<Tensor> backward(
         ComputeEngine& engine, const Tensor& grad_output) override
     {
-        const std::size_t rows = d_ff_;
+        const std::uint32_t dff = static_cast<std::uint32_t>(d_ff_);
+        const std::size_t rows = 2 * d_ff_;
         const std::size_t cols = grad_output.cols();
 
-        // ── 统一表达式 DSL（内联数学式，融合；CPU 单次遍历 + SIMD）──
-        //   grad_gate = grad_out ⊙ up ⊙ s ⊙ (1 + gate ⊙ (1 − s))
-        //   grad_up   = grad_out ⊙ gate ⊙ s
-        const nn::Scalar one{1};
-        auto grad_gate = dsl::compute(engine,
-            dsl::leaf(grad_output) * dsl::leaf(up_cache_)
-              * (dsl::leaf(sigmoid_cache_)
-                 * (one + dsl::leaf(gate_cache_) * (one - dsl::leaf(sigmoid_cache_)))),
-            rows, cols);
-        if (!grad_gate) return std::unexpected(grad_gate.error());
-        auto grad_up = dsl::compute(engine,
-            dsl::leaf(grad_output) * dsl::leaf(gate_cache_) * dsl::leaf(sigmoid_cache_),
-            rows, cols);
-        if (!grad_up) return std::unexpected(grad_up.error());
+        if (input_cache_.rows() != rows || input_cache_.cols() != cols)
+            return std::unexpected(Error{"swiglu backward: input_cache shape mismatch"});
+        if (grad_output.rows() != d_ff_ || grad_output.cols() != cols)
+            return std::unexpected(Error{"swiglu backward: grad_output shape mismatch"});
 
-        // 合并：grad_input = (grad_gate; grad_up) → (2*d_ff, batch)
-        auto grad_input = engine.create_tensor(2 * d_ff_, cols);
-        auto rz = engine.zero(grad_input);
-        if (!rz) return std::unexpected(rz.error());
-        auto ri0 = engine.insert_rows(grad_input, 0, *grad_gate);
-        if (!ri0) return std::unexpected(ri0.error());
-        auto ri1 = engine.insert_rows(grad_input, d_ff_, *grad_up);
-        if (!ri1) return std::unexpected(ri1.error());
+        const auto go   = dsl::row_access(grad_output, 0u, dff);   // go[r % d_ff]
+        const auto gate = dsl::row_access(input_cache_, 0u, dff);   // in[r % d_ff]
+        const auto up   = dsl::row_access(input_cache_, dff, dff);  // in[d_ff + r % d_ff]
+        const auto s    = Scalar{1} / (Scalar{1} + dsl::exp(-gate)); // σ(gate)
 
-        return grad_input;
+        // factor = s·(1 + gate·(1−s))；grad_gate = go·up·factor；grad_up = go·gate·s
+        const auto factor = s * (Scalar{1} + gate * (Scalar{1} - s));
+        const auto gg = go * up * factor;
+        const auto gu = go * gate * s;
+        return dsl::compute(engine,
+            dsl::select(dsl::row() < dsl::rparam(static_cast<nn::Scalar>(d_ff_)), gg, gu),
+            rows, cols);
     }
 };
 
