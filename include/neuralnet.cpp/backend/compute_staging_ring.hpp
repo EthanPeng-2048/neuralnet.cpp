@@ -59,15 +59,22 @@ private:
         // 跨 submit 数据依赖（P0-1 修复）：本 region 的上传 copy 以该信号量
         // 为提交期信号；后续读取"由该上传写入的 buffer"的 submit（download /
         // matmul / batch 帧）在 VkSubmitInfo.pWaitSemaphores 中等它。
-        // 背景：单队列 FIFO 只是执行顺序保证，实测本驱动（NVIDIA V100 +
-        // Windows）在消费方 submit 紧跟上传 submit（<~2ms）时，消费方 GPU
-        // 操作会读到上传写入的旧值（零），host 侧 sleep/fence 等待都能规避
-        // ——即隐式跨 submit 数据依赖不可靠，必须用队列级信号量显式建立
-        // （spec 标准跨 submit 排序原语，host 不阻塞，GPU 在队列内等待）。
-        // 生命周期：region 复用（acquire 等完 fence）时销毁重建为 unsignaled
-        // （vkResetFences 类 API 无信号量等价物；重建开销 ~µs，每 region
-        // 每次复用一次，可忽略）。
+        // 背景：单队列 FIFO 只是执行顺序保证，实测本驱动（NVIDIA + Windows）
+        // 在消费方 submit 紧跟上传 submit（<~2ms）时，消费方 GPU 操作会读到
+        // 上传写入的旧值（零），必须显式建立跨 submit 依赖。
+        //
+        // 必须用**时间线信号量**（timeline_=true）：
+        //   - 同一 value 可以被任意多个 submit 等待（binary 一次 signal 只能
+        //     被一个 wait 消费 → 第二个消费者等到"永远不会来的信号"→ 队列
+        //     永久阻塞，AMD 老驱动实测直接挂死，校验层报
+        //     VUID-vkQueueSubmit-pWaitSemaphores-03238）；
+        //   - 等待已达成/更小的 value 是 no-op，重复等待天然幂等。
+        // 设备不支持时间线信号量时（timeline_=false）不创建信号量，改由
+        // collect_staging_waits() → drain_in_flight() 在 host 侧阻塞等待，
+        // 正确性优先、放弃 P0-1 的非阻塞流水线。
         VkSemaphore semaphore = VK_NULL_HANDLE;
+        // 本 region 最近一次上传的信号 value（时间线信号量用；单调递增）
+        std::uint64_t signal_value = 0;
         // 专属 command buffer（P0-1 修复）：上传 copy 命令录在这里，**永不
         // 在 pending 状态释放**——VUID-vkFreeCommandBuffers-pCommandBuffers-
         // 00058 禁止释放 pending（已提交未 signal）的 command buffer。旧实
@@ -86,6 +93,7 @@ private:
     std::vector<Region> regions_;
     std::size_t region_size_;
     std::atomic<std::size_t> current_{0};
+    bool timeline_ = false;  // 用时间线信号量（否则 host 等 fence 回退）
 
 public:
     StagingRing() = default;
@@ -93,6 +101,7 @@ public:
     [[nodiscard]] Result<void> initialize(
         VkDevice device, VkPhysicalDevice physical_device,
         VkCommandPool cmd_pool, MemoryPool& pool,
+        bool use_timeline = false,
         std::size_t region_size = DEFAULT_REGION_SIZE,
         std::size_t num_regions = DEFAULT_NUM_REGIONS)
     {
@@ -100,6 +109,7 @@ public:
         physical_device_ = physical_device;
         cmd_pool_ = cmd_pool;
         pool_.reset(&pool);
+        timeline_ = use_timeline;
 
         // 动态计算 Staging 大小：取 host-visible 显存的 1/16，
         // 夹在 [MIN_REGION_SIZE, MAX_REGION_SIZE] 之间（下限防过小、
@@ -171,12 +181,23 @@ public:
             if (res != VK_SUCCESS)
                 return std::unexpected(Error{"vkCreateFence failed: " + std::to_string(res)});
 
-            // 创建跨 submit 信号量（初始 unsignaled，见 Region::semaphore 注释）
-            VkSemaphoreCreateInfo sema_info{};
-            sema_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-            res = vkCreateSemaphore(device_, &sema_info, nullptr, &r.semaphore);
-            if (res != VK_SUCCESS)
-                return std::unexpected(Error{"vkCreateSemaphore failed: " + std::to_string(res)});
+            // 创建跨 submit 信号量（仅时间线模式；初始 value 0 = 未 signal，
+            // 见 Region::semaphore 注释）
+            if (timeline_)
+            {
+                VkSemaphoreTypeCreateInfo type_info{};
+                type_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+                type_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+                type_info.initialValue = 0;
+
+                VkSemaphoreCreateInfo sema_info{};
+                sema_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+                sema_info.pNext = &type_info;
+                res = vkCreateSemaphore(device_, &sema_info, nullptr, &r.semaphore);
+                if (res != VK_SUCCESS)
+                    return std::unexpected(Error{
+                        "vkCreateSemaphore(timeline) failed: " + std::to_string(res)});
+            }
 
             // 分配专属 command buffer（见 Region::cmd 注释：禁止 pending 释放）
             VkCommandBufferAllocateInfo cmd_alloc{};
@@ -229,15 +250,27 @@ public:
             vkWaitForFences(device_, 1, &r.fence, VK_TRUE, UINT64_MAX);
             vkResetFences(device_, 1, &r.fence);
             r.in_flight = false;
-            // 上传已完成（fence 信号）→ 其信号量已 signaled。销毁重建为
-            // unsignaled，供本 region 的下次上传使用（信号量无 reset API）。
-            vkDestroySemaphore(device_, r.semaphore, nullptr);
-            VkSemaphoreCreateInfo sema_info{};
-            sema_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-            vkCreateSemaphore(device_, &sema_info, nullptr, &r.semaphore);
+            // 时间线信号量无需销毁重建：value 单调递增，旧 value 的等待合法
+            // 且已达成（no-op），销毁反而会踩到"已提交 submit 仍引用它"。
         }
 
         return idx;
+    }
+
+    // 非时间线回退：host 阻塞等待所有在飞上传完成并释放 region。
+    // 等完之后"后续 submit 读上传 buffer"不再构成跨 submit 依赖，消费者
+    // 无需等信号量。代价是 host 阻塞（正是 P0-1 想避免的路径），仅在设备
+    // 不支持时间线信号量时启用——正确性优先。
+    void drain_in_flight()
+    {
+        for (auto& r : regions_)
+        {
+            if (!r.in_flight)
+                continue;
+            vkWaitForFences(device_, 1, &r.fence, VK_TRUE, UINT64_MAX);
+            vkResetFences(device_, 1, &r.fence);
+            r.in_flight = false;
+        }
     }
 
     // 上传数据到 staging region（元素类型无关，memcpy 字节级操作，§6.3）
@@ -292,6 +325,23 @@ public:
     [[nodiscard]] VkSemaphore semaphore(std::size_t region_idx) const noexcept
     {
         return regions_[region_idx].semaphore;
+    }
+
+    // 是否使用时间线信号量（false = 走 drain_in_flight 阻塞回退）
+    [[nodiscard]] bool timeline() const noexcept { return timeline_; }
+
+    // 本 region 最近一次上传的信号 value（消费方 pWaitSemaphoreValues 用）
+    [[nodiscard]] std::uint64_t signal_value(std::size_t region_idx) const noexcept
+    {
+        return regions_[region_idx].signal_value;
+    }
+
+    // 为本次上传分配下一个信号 value（严格递增；必须在 mark_in_flight 前调用）
+    [[nodiscard]] std::uint64_t next_signal_value(std::size_t region_idx) noexcept
+    {
+        auto& r = regions_[region_idx];
+        r.signal_value = r.signal_value + 1;
+        return r.signal_value;
     }
 
     // 获取 region 的专属 command buffer（上传 copy 录制用；acquire 等完

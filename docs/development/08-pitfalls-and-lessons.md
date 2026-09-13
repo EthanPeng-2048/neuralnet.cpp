@@ -50,6 +50,19 @@
 - **修复**：所有录制期引用的张量存活到 `end_batch()` 之后；销毁转入 `pending_destroys_` 延迟队列，`end_batch/flush_batch` 释放 desc sets 后统一销毁。`GpuBackend::instance()` 改 new-leak 单例规避静态析构顺序问题。
 - **教训**："命令录制"与"命令执行"是两段时间线，对象生命周期必须覆盖到执行完成。
 
+### 2.5 多卡选错设备 + 二进制信号量重复 wait（2026-09-13）
+
+- **症状**：`gpu_test` 在 `[3/6] matmul 正确性验证` 失败，`Vulkan error 2` at `compute_vk_backend.hpp:1576`（`vkWaitForFences` 等 10s 超时；2 = `VK_TIMEOUT`，即**队列卡死**，不是"没算完"）。同一处偶发在 ~2100 行（`submit_and_wait` 的 fence 等待）。
+- **根因①（本次首因）**：`VulkanDevice::initialize` 取**第一个 `VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU`**。本机枚举顺序是 `[0] AMD Radeon R5 240`（老专有驱动，api 1.2.170）…`[2] NVIDIA CMP 40HX`（api 1.4.351），于是全程跑在最弱那张旧卡上：该卡 `maxComputeSharedMemorySize` 只有 32768，连 matmul 的 34560B 分块都放不下。
+- **根因②（本次已修）**：跨 submit 数据依赖用**二进制信号量**，且 `collect_staging_waits()` 把所有 in-flight region 都塞进 `pWaitSemaphores`。二进制信号量一次 signal **只能被一个 wait 消费**，第二个消费者（`download_blocking` 紧跟在 `submit_and_wait` 的 matmul 之后）等的就是"永远不会有信号"的信号量 → 队列永久阻塞。NVIDIA 驱动凑巧容忍，AMD 老驱动直接死锁。
+- **定位手段**：`$env:VK_LOADER_LAYERS_ENABLE="VK_LAYER_KHRONOS_validation"` 强制校验层（应用没启用层也能强制），一次运行即给出 `VUID-vkQueueSubmit-pWaitSemaphores-03238: ... waiting on semaphore (…) that has no way to be signaled`；同日志另有 `VUID-VkSubmitInfo-pWaitDstStageMask-parameter`（`waitSemaphoreCount≠0` 时 `pWaitDstStageMask=NULL`）、SPIR-V 1.5 按 Vulkan 1.0 语义校验失败等。
+- **修复**：
+  1. 设备选择改为按 `(设备类型权重, apiVersion)` 打分、D3D12 转译层（Mesa Dozen）降权；新增 `--gpu <索引>` / `--gpu=<名称子串>` 与 `NN_VULKAN_DEVICE` 手动指定；初始化打印所选 GPU 名；未命中时错误列出全部候选设备。
+  2. 跨 submit 依赖改用**时间线信号量**：实例版本请求到 1.2，启用 `timelineSemaphore` 特性；上传 submit 带 `VkTimelineSemaphoreSubmitInfo.pSignalSemaphoreValues`（region 内单调递增 value），消费 submit 带 `pWaitSemaphoreValues`；同一 value 可被多个 submit 等待、等待已达成的 value 是 no-op → 重复等待天然幂等。`acquire()` 不再销毁重建信号量（旧实现还会踩"已提交 submit 仍引用该信号量"）。不支持时退回 `drain_in_flight()`（host 等在飞上传），可用 `NN_VULKAN_NO_TIMELINE=1` 强制该路径验证。
+  3. 所有 `waitSemaphoreCount>0` 的 submit 补 `pWaitDstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT`。
+- **验证**：强制校验层跑完整 `gpu_test`（256×256/10 迭代）→ **0 条 VUID**（修复前 3 类报错）；`--gpu=AMD` 从"10s 超时失败"变为 2s 通过；两条路径（时间线 / `NN_VULKAN_NO_TIMELINE=1` 回退）+ `ctest 15/15` 全绿。
+- **教训**：`VkResult` 原值必须翻译（`VK_TIMEOUT` vs `VK_ERROR_DEVICE_LOST` 的处置完全不同）；"第一张独显"在多卡 + 转译层机器上不成立；**二进制信号量不能当"事件"反复等**，多消费者场景必须时间线信号量；校验层是"规范违规但某些驱动容忍"这类问题的唯一可靠放大器。
+
 ---
 
 ## 3. 高危：内存爆炸/崩溃/断言

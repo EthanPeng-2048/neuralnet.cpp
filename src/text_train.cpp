@@ -20,6 +20,7 @@
 #include <neuralnet.cpp/precision.hpp>
 #include <neuralnet.cpp/cli/cli_engine_factory.hpp>
 #include <neuralnet.cpp/cli/cli_lr_scheduler.hpp>
+#include <neuralnet.cpp/cli/cli_gpu_option.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -283,7 +284,8 @@ void print_usage(const char *prog)
         << "  --num-heads <n>    注意力头数 (默认: 4)\n"
         << "  --num-layers <n>   Transformer 层数 (默认: 4)\n"
         << "  --d-ff <n>         FFN 中间维度 (默认: 512)\n"
-        << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
+        << "  --gpu <索引>       启用 GPU 加速 (需要 Vulkan SDK)，可用枚举索引指定设备\n"
+        << "                     (名称子串写法: --gpu=NVIDIA / --gpu=40HX)\n"
         << "  --cuda             启用 CUDA GPU 加速 (需要 CUDA Toolkit)\n"
         << "  --positional-encoding <type>\n"
         << "                     位置编码类型: learned(默认)/sinusoidal/alibi/rope\n"
@@ -379,6 +381,7 @@ struct TrainConfig
     bool load_existing = false;
     bool gpu_enabled = false;
     bool cuda_enabled = false;
+    std::string gpu_device;         // --gpu 的可选设备选择子（空 = 自动选卡）
     bool grad_log = false;          // 显示梯度统计
     bool no_cache = false;          // 禁用 tokenize 缓存
     nn::PosEncodingType pos_encoding = nn::PosEncodingType::Learned;
@@ -559,8 +562,11 @@ TrainConfig parse_args(int argc, char *argv[])
             if (!v) { std::cerr << "无效 --save-interval: " << v.error().message << "\n"; std::exit(1); }
             cfg.save_interval = *v;  // 0 = 禁用保存（下方 % 前有 >0 保护）
         }
-        else if (arg == "--gpu")
+        else if (auto gpu_dev = nn::cli::parse_gpu_option(argc, argv, i))
+        {
             cfg.gpu_enabled = true;
+            if (!gpu_dev->empty()) cfg.gpu_device = *gpu_dev;
+        }
         else if (arg == "--cuda")
             cfg.cuda_enabled = true;
         else if (arg == "--grad-log")
@@ -939,6 +945,7 @@ int main(int argc, char *argv[])
     nn::cli::EngineConfig eng_cfg;
     eng_cfg.use_gpu = cfg.gpu_enabled;
     eng_cfg.use_cuda = cfg.cuda_enabled;
+    eng_cfg.gpu_device = cfg.gpu_device;
     auto engine_res = nn::cli::create_engine(eng_cfg, std::cout);
     if (!engine_res)
     {
