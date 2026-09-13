@@ -10,9 +10,13 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <span>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include "../core_errors.hpp"
@@ -71,6 +75,9 @@ private:
     VkQueue compute_queue_ = VK_NULL_HANDLE;
     uint32_t queue_family_index_ = 0;
     bool initialized_ = false;
+    std::string device_name_;   // 所选物理设备名（诊断用）
+    std::string device_selector_;  // 手动指定设备（空 = 自动选择）
+    bool timeline_semaphores_ = false;  // 设备支持时间线信号量（见 initialize）
 
 public:
     VulkanDevice() = default;
@@ -89,19 +96,56 @@ public:
     VulkanDevice(VulkanDevice&&) = delete;
     VulkanDevice& operator=(VulkanDevice&&) = delete;
 
+    // 读取环境变量（MSVC CRT 把 getenv 标记弃用，-Werror 下必须用 _dupenv_s）
+    [[nodiscard]] static std::string get_env(const char* name)
+    {
+#if defined(_MSC_VER)
+        char* buf = nullptr;
+        std::size_t len = 0;
+        _dupenv_s(&buf, &len, name);
+        const std::unique_ptr<char, decltype(&std::free)> guard(buf, &std::free);
+        return buf != nullptr ? std::string(buf) : std::string{};
+#else
+        const char* value = std::getenv(name);
+        return value != nullptr ? std::string(value) : std::string{};
+#endif
+    }
+
+    // ── 手动指定计算设备（必须在 initialize() 之前调用）────────────────────
+    // selector = 枚举索引（"2"）或设备名子串（"40HX" / "NVIDIA"）；
+    // 空字符串 = 自动选择（设备类型 + apiVersion 打分）。
+    // 优先级高于环境变量 NN_VULKAN_DEVICE；未命中时 initialize() 返回
+    // 列出全部候选设备的错误。
+    void set_device_selector(std::string selector)
+    {
+        device_selector_ = std::move(selector);
+    }
+
     [[nodiscard]] Result<void> initialize()
     {
         if (initialized_)
             return {};
 
         // 1. 创建 VkInstance
+        // 实例版本请求到 1.2：时间线信号量（跨 submit 依赖的正确原语）是
+        // 1.2 核心特性，且 1.2 目标环境下 SPIR-V 1.5 才合法。loader 不支持
+        // 1.2 时退回收到的最高版本（后续自动降级为"host 等在飞上传"）。
+        uint32_t loader_version = VK_API_VERSION_1_0;
+        if (auto enum_version = reinterpret_cast<PFN_vkEnumerateInstanceVersion>(
+                vkGetInstanceProcAddr(nullptr, "vkEnumerateInstanceVersion")))
+        {
+            uint32_t supported = VK_API_VERSION_1_0;
+            if (enum_version(&supported) == VK_SUCCESS)
+                loader_version = supported;
+        }
+
         VkApplicationInfo app_info{};
         app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         app_info.pApplicationName = "neuralnet.cpp";
         app_info.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
         app_info.pEngineName = "neuralnet.cpp";
         app_info.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-        app_info.apiVersion = VK_API_VERSION_1_0;
+        app_info.apiVersion = std::min(loader_version, VK_API_VERSION_1_2);
 
         VkInstanceCreateInfo instance_info{};
         instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -120,20 +164,100 @@ public:
         std::vector<VkPhysicalDevice> devices(device_count);
         vkEnumeratePhysicalDevices(instance_, &device_count, devices.data());
 
-        // 优先选择独立显卡
-        for (const auto& dev : devices)
+        // ── 物理设备选择：按能力打分取最优，而不是"取第一个独显" ─────────
+        // 实测教训（本机枚举顺序）：
+        //   [0] AMD Radeon R5 240      独显 / 老专有驱动, api 1.2.170
+        //   [1] Microsoft Direct3D12 (AMD R5 240)   ← Mesa Dozen 转译层
+        //   [2] NVIDIA CMP 40HX        独显 / 驱动 616.92, api 1.4.351
+        // 旧的"第一个 VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU"会选中 [0]：
+        // 该驱动的 maxComputeSharedMemorySize 仅 32768（matmul 分块要 34560，
+        // 校验层直接报 VUID-RuntimeSpirv-Workgroup-06530），且对跨 submit
+        // 信号量的重复 wait 直接死锁（vkWaitForFences 超时 → "Vulkan error 2"）。
+        // 打分 = (设备类型权重, apiVersion)，同分取先枚举者；D3D12 转译层
+        // 降权（非原生驱动，且常与原生条目重复枚举同一张卡）。
+        // 可用环境变量 NN_VULKAN_DEVICE 强制指定：索引（"2"）或名称子串（"NVIDIA"）。
+        // 选择器来源优先级：
+        //   显式 API（set_device_selector / GpuBackend::initialize(sel)）
+        //   > 环境变量 NN_VULKAN_DEVICE > 自动打分（见下）
+        std::string selector = device_selector_;
+        if (selector.empty())
+            selector = get_env("NN_VULKAN_DEVICE");
+
+        // selector = 枚举索引（"2"）或设备名称子串（"40HX"/"NVIDIA"）
+        if (!selector.empty())
         {
-            VkPhysicalDeviceProperties props;
-            vkGetPhysicalDeviceProperties(dev, &props);
-            if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+            const std::string_view want(selector);
+            // 纯数字只按索引匹配：否则 "2" 会命中 "R5 240" 这类名称子串
+            const bool want_is_index =
+                !want.empty() &&
+                want.find_first_not_of("0123456789") == std::string_view::npos;
+            for (std::size_t i = 0; i < devices.size(); ++i)
             {
-                physical_device_ = dev;
-                break;
+                VkPhysicalDeviceProperties props;
+                vkGetPhysicalDeviceProperties(devices[i], &props);
+                const std::string_view name(props.deviceName);
+                const bool matched = want_is_index
+                    ? (want == std::string_view(std::to_string(i)))
+                    : (name.find(want) != std::string_view::npos);
+                if (matched)
+                {
+                    physical_device_ = devices[i];
+                    break;
+                }
+            }
+            if (physical_device_ == VK_NULL_HANDLE)
+            {
+                // 未命中：列出全部候选，避免"猜索引"
+                std::string avail;
+                for (std::size_t i = 0; i < devices.size(); ++i)
+                {
+                    VkPhysicalDeviceProperties props;
+                    vkGetPhysicalDeviceProperties(devices[i], &props);
+                    avail += "\n  [" + std::to_string(i) + "] " + props.deviceName;
+                }
+                return std::unexpected(Error{
+                    "未找到匹配的计算设备 \"" + selector + "\"，可用设备:" + avail});
             }
         }
-        // 如果没有独立显卡，使用第一个设备
+
+        if (physical_device_ == VK_NULL_HANDLE)
+        {
+            int best_rank = -1;
+            uint32_t best_api = 0;
+            for (const auto& dev : devices)
+            {
+                VkPhysicalDeviceProperties props;
+                vkGetPhysicalDeviceProperties(dev, &props);
+                const std::string_view name(props.deviceName);
+
+                int rank = 1;
+                if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+                    rank = 3;
+                else if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU)
+                    rank = 2;
+                if (name.rfind("Microsoft Direct3D12", 0) == 0 ||
+                    name == "Microsoft Basic Render Driver")
+                    rank = 0;
+
+                if (rank > best_rank ||
+                    (rank == best_rank && props.apiVersion > best_api))
+                {
+                    best_rank = rank;
+                    best_api = props.apiVersion;
+                    physical_device_ = dev;
+                }
+            }
+        }
+        // 兜底：无可打分设备时使用第一个设备
         if (physical_device_ == VK_NULL_HANDLE)
             physical_device_ = devices[0];
+
+        // 记录所选设备名（诊断"到底跑在哪块卡上"用）
+        {
+            VkPhysicalDeviceProperties props;
+            vkGetPhysicalDeviceProperties(physical_device_, &props);
+            device_name_ = props.deviceName;
+        }
 
         // 3. 查找计算队列族
         uint32_t queue_family_count = 0;
@@ -156,6 +280,34 @@ public:
             return std::unexpected(Error{"No compute queue family found"});
 
         // 4. 创建逻辑设备
+        // 先探测时间线信号量能力（Vulkan 1.2 核心特性）：跨 submit 数据依赖
+        // 需要"同一信号量可被多个 submit 等待"的语义，二进制信号量做不到
+        // （一次 signal 只能被一个 wait 消费 → 第二个消费者永久阻塞，
+        // VUID-vkQueueSubmit-pWaitSemaphores-03238）。不支持的设备退回
+        // "host 等在飞上传"的阻塞路径。
+        timeline_semaphores_ = false;
+        VkPhysicalDeviceTimelineSemaphoreFeatures timeline_features{};
+        {
+            VkPhysicalDeviceProperties props{};
+            vkGetPhysicalDeviceProperties(physical_device_, &props);
+            if (app_info.apiVersion >= VK_API_VERSION_1_2 &&
+                props.apiVersion >= VK_API_VERSION_1_2)
+            {
+                timeline_features.sType =
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
+                VkPhysicalDeviceFeatures2 features2{};
+                features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+                features2.pNext = &timeline_features;
+                vkGetPhysicalDeviceFeatures2(physical_device_, &features2);
+                timeline_semaphores_ = (timeline_features.timelineSemaphore == VK_TRUE);
+            }
+            // 逃生阀：某些驱动的 timeline 实现有问题时，用
+            // NN_VULKAN_NO_TIMELINE=1 强制走"host 等在飞上传"回退路径
+            // （正确性优先，牺牲 P0-1 非阻塞流水线）。
+            if (!get_env("NN_VULKAN_NO_TIMELINE").empty())
+                timeline_semaphores_ = false;
+        }
+
         float queue_priority = 1.0f;
         VkDeviceQueueCreateInfo queue_info{};
         queue_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -165,6 +317,8 @@ public:
 
         VkDeviceCreateInfo device_info{};
         device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        if (timeline_semaphores_)
+            device_info.pNext = &timeline_features;
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;
 
@@ -184,6 +338,13 @@ public:
     [[nodiscard]] VkQueue compute_queue() const noexcept { return compute_queue_; }
     [[nodiscard]] uint32_t queue_family_index() const noexcept { return queue_family_index_; }
     [[nodiscard]] bool is_initialized() const noexcept { return initialized_; }
+    // 所选物理设备名（"NVIDIA CMP 40HX" 等；初始化前为空）
+    [[nodiscard]] const std::string& device_name() const noexcept { return device_name_; }
+    // 已启用时间线信号量（决定跨 submit 依赖走信号量还是 host 等 fence）
+    [[nodiscard]] bool has_timeline_semaphores() const noexcept
+    {
+        return timeline_semaphores_;
+    }
 };
 
 // ══════════════════════════════════════════════════════════════════════════

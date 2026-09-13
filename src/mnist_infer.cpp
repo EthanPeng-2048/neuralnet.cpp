@@ -12,6 +12,7 @@
 #include <neuralnet.cpp/model_serialization.hpp>
 #include <neuralnet.cpp/domain_mnist.hpp>
 #include <neuralnet.cpp/cli/cli_engine_factory.hpp>
+#include <neuralnet.cpp/cli/cli_gpu_option.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -41,7 +42,8 @@ void print_usage(const char *prog)
         << "  --model <path>     模型文件路径 (默认: pretrained/model.bin)\n"
         << "  --topk <n>         显示前 n 个预测结果 (默认: 3)\n"
         << "  --show-pixels      显示像素矩阵 (调试用)\n"
-        << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
+        << "  --gpu <索引>       启用 GPU 加速 (需要 Vulkan SDK)，可用枚举索引指定设备\n"
+        << "                     (名称子串写法: --gpu=NVIDIA / --gpu=40HX)\n"
         << "  --cuda             启用 CUDA GPU 加速 (需要 CUDA Toolkit)\n"
         << "  --help             显示此帮助信息\n";
 }
@@ -55,6 +57,7 @@ struct InferConfig
     bool show_pixels = false;
     bool gpu_enabled = false;
     bool cuda_enabled = false;
+    std::string gpu_device;      // --gpu 的可选设备选择子（空 = 自动选卡）
 };
 
 nn::Result<InferConfig> parse_args(int argc, char *argv[])
@@ -89,9 +92,10 @@ nn::Result<InferConfig> parse_args(int argc, char *argv[])
         {
             cfg.show_pixels = true;
         }
-        else if (arg == "--gpu")
+        else if (auto dev = nn::cli::parse_gpu_option(argc, argv, i))
         {
             cfg.gpu_enabled = true;
+            if (!dev->empty()) cfg.gpu_device = *dev;
         }
         else if (arg == "--cuda")
         {
@@ -280,6 +284,7 @@ int main(int argc, char *argv[])
     nn::cli::EngineConfig eng_cfg;
     eng_cfg.use_gpu = cfg.gpu_enabled;
     eng_cfg.use_cuda = cfg.cuda_enabled;
+    eng_cfg.gpu_device = cfg.gpu_device;
     auto engine_res = nn::cli::create_engine(eng_cfg, std::cout);
     if (!engine_res)
     {

@@ -8,6 +8,7 @@
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>
+#include <neuralnet.cpp/cli/cli_gpu_option.hpp>
 
 #include <cmath>
 #include <chrono>
@@ -46,6 +47,8 @@ void print_usage(const char* prog)
               << "选项:\n"
               << "  --size N   矩阵维度 (默认: 256)\n"
               << "  --iters N  性能迭代次数 (默认: 10)\n"
+              << "  --gpu <设备>  手动指定计算设备: 枚举索引 (如 2) 或名称子串\n"
+              << "                 (如 40HX / NVIDIA)；不带 --gpu 时自动选卡\n"
               << "  --help     显示此帮助信息\n";
 }
 
@@ -95,6 +98,7 @@ int main(int argc, char* argv[])
 {
     std::size_t N = 256;
     int iters = 10;
+    std::string gpu_device;   // --gpu 指定的设备（空 = 自动选卡）
 
     for (int i = 1; i < argc; ++i)
     {
@@ -110,6 +114,12 @@ int main(int argc, char* argv[])
         {
             iters = parse_num_or_die<int>(argv[++i], "--iters");
             if (iters <= 0) { std::cerr << "--iters 必须为正整数\n"; return 1; }
+        }
+        else if (auto dev = nn::cli::parse_gpu_option(
+                     argc, argv, i, /*allow_name_value=*/true))
+        {
+            // 本程序无位置参数，空格形式也可直接给名称子串
+            gpu_device = *dev;
         }
         else { std::cerr << "未知参数: " << arg << "\n"; return 1; }
     }
@@ -128,7 +138,7 @@ int main(int argc, char* argv[])
     auto cpu_engine = std::make_unique<CpuEngine>();
 
     auto& backend = GpuBackend::instance();
-    auto init_result = backend.initialize();
+    auto init_result = backend.initialize(gpu_device);
     if (!init_result)
     {
         std::cout << " 失败\n";
@@ -136,7 +146,10 @@ int main(int argc, char* argv[])
         return 1;
     }
     auto gpu_engine = std::make_unique<GpuEngine>(backend);
-    std::cout << " 成功 (CpuEngine + GpuEngine)\n";
+    // 打印所选物理设备：选错卡（例如把独显老卡当目标）会直接表现为
+    // 能力不足 / 驱动死锁，先让"跑在哪块卡上"可见。
+    std::cout << " 成功 (CpuEngine + GpuEngine, GPU: "
+              << backend.device().device_name() << ")\n";
 
     // ── 2. 生成随机测试数据 ────────────────────────────────────────
     std::cout << "[2/6] 生成 " << N << "×" << N << " 随机矩阵..." << std::flush;
