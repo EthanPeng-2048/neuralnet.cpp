@@ -6,6 +6,9 @@
 // 选择优先级：--cuda > --gpu > CPU
 //   - CUDA 路径：要求编译期 NN_HAS_CUDA，运行时 backend.initialize() 成功
 //   - Vulkan 路径：要求编译期 NN_HAS_VULKAN，运行时 backend.initialize() 成功
+//     EngineConfig::gpu_device 可手动指定计算设备（索引 "2" 或名称子串
+//     "40HX"/"NVIDIA"；空 = 自动选最优）。多卡机器上"第一张独显"可能不是
+//     想用的卡（本机 AMD R5 240 排在 NVIDIA CMP 40HX 之前）。
 //   - **显式请求后端（use_gpu/use_cuda）失败时直接返回错误**，绝不静默回退
 //     CPU（保持"硬报错、不降级"；调用方决定是否终止）。
 //   - 未显式请求时默认 CpuEngine。
@@ -18,6 +21,7 @@
 
 #include <iosfwd>  // std::ostream 前向声明
 #include <memory>
+#include <string>
 
 #include "neuralnet.cpp/compute_engine.hpp"
 #include "neuralnet.cpp/core_errors.hpp"
@@ -36,6 +40,11 @@ namespace nn::cli
     {
         bool use_gpu = false;   // 启用 Vulkan GpuEngine
         bool use_cuda = false;  // 启用 CUDA CudaEngine（优先级高于 use_gpu）
+        // 手动指定 Vulkan 计算设备（索引 "2" 或名称子串 "40HX"/"NVIDIA"）；
+        // 空 = 自动选择（设备类型 + apiVersion 打分）。
+        // 注意保留默认成员初始化器：聚合初始化 `EngineConfig{a, b}` 在
+        // -Wextra -Werror 下会对无初始化器的成员报 -Wmissing-field-initializers。
+        std::string gpu_device = {};
     };
 
     // ── 创建计算引擎 ───────────────────────────────────────────────────────
@@ -69,10 +78,11 @@ namespace nn::cli
         {
 #ifdef NN_HAS_VULKAN
             auto &backend = nn::GpuBackend::instance();
-            auto init_r = backend.initialize();
+            auto init_r = backend.initialize(cfg.gpu_device);
             if (init_r)
             {
-                log << "GPU 加速已启用 (Vulkan GpuEngine)\n\n";
+                log << "GPU 加速已启用 (Vulkan GpuEngine, GPU: "
+                    << backend.device().device_name() << ")\n\n";
                 return std::make_unique<nn::GpuEngine>(backend);
             }
             return std::unexpected(Error{

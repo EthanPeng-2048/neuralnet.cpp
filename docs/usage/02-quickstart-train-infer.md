@@ -36,6 +36,12 @@ cmake --build build --parallel
 # 使用 Vulkan GPU 加速
 ./build/mnist_train --gpu --epochs 10
 
+# 多卡机器：手动指定计算设备（默认自动按"独显优先 + 驱动 apiVersion"选卡）
+#   索引形式（枚举索引，见初始化时打印的 GPU 名或错误里列出的候选）
+./build/mnist_train --gpu 2 --epochs 10
+#   名称子串形式（--gpu= 写法，避免与位置参数歧义）
+./build/mnist_train --gpu=NVIDIA --epochs 10
+
 # 恢复训练
 ./build/mnist_train --resume mnist_model.bin --epochs 5
 
@@ -55,7 +61,7 @@ cmake --build build --parallel
 | `--lr <lr>` | `0.001` | 学习率 |
 | `--batch-size <n>` | `64` | 批大小 |
 | `--optimizer <name>` | `adam` | 优化器：`sgd`/`sgd_momentum`/`adam`/`adamw`/`muon` |
-| `--gpu` | 禁用 | 启用 Vulkan GPU 加速 |
+| `--gpu <索引>` / `--gpu=<名称>` | 禁用 | 启用 Vulkan GPU 加速；可选指定计算设备（索引如 `2`，名称子串如 `--gpu=40HX`/`--gpu=NVIDIA`） |
 | `--max-samples <n>` | 全部 | 限制训练样本数 |
 
 ### 推理
@@ -111,7 +117,7 @@ cmake --build build --parallel
 | `--num-heads <n>` | `4` | 注意力头数 |
 | `--num-layers <n>` | `4` | Transformer 层数 |
 | `--d-ff <n>` | `512` | FFN 中间维度 |
-| `--gpu` | 禁用 | 启用 Vulkan GPU 加速 |
+| `--gpu <索引>` / `--gpu=<名称>` | 禁用 | 启用 Vulkan GPU 加速；可选指定计算设备（索引如 `2`，名称子串如 `--gpu=40HX`/`--gpu=NVIDIA`） |
 | `--log-interval <n>` | `50` | 日志间隔 |
 
 ### 推理
@@ -140,7 +146,7 @@ cmake --build build --parallel
 | `--interactive` | 禁用 | 交互式生成模式 |
 | `--max-tokens <n>` | `200` | 最大生成 token 数 |
 | `--temperature <t>` | `1.0` | 温度参数（0=贪心） |
-| `--gpu` | 禁用 | 启用 Vulkan GPU 加速 |
+| `--gpu <索引>` / `--gpu=<名称>` | 禁用 | 启用 Vulkan GPU 加速；可选指定计算设备（索引如 `2`，名称子串如 `--gpu=40HX`/`--gpu=NVIDIA`） |
 | `--show-tokens` | 禁用 | 显示 token ID（调试） |
 
 ---

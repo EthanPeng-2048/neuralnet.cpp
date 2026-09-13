@@ -787,7 +787,9 @@ public:
     }
 
     // 初始化
-    [[nodiscard]] Result<void> initialize()
+    // device_selector：手动指定计算设备（索引 "2" 或名称子串 "40HX"/"NVIDIA"）。
+    // 空 = 自动选择（设备类型 + apiVersion 打分，见 VulkanDevice::initialize）。
+    [[nodiscard]] Result<void> initialize(std::string device_selector = {})
     {
         std::lock_guard lock(init_mutex_);
         if (initialized_)
@@ -798,7 +800,9 @@ public:
         if (spirv.empty())
             return std::unexpected(Error{"matmul SPIR-V bytecode not embedded"});
 
-        // 2. 初始化 Vulkan 设备
+        // 2. 初始化 Vulkan 设备（先登记设备选择器）
+        if (!device_selector.empty())
+            device_.set_device_selector(std::move(device_selector));
         auto dev_r = device_.initialize();
         if (!dev_r)
             return dev_r;
@@ -828,9 +832,12 @@ public:
             return r;
 
         // 6. 创建 staging ring
+        //    use_timeline = 设备是否支持时间线信号量（跨 submit 依赖的正确
+        //    原语；不支持则 staging 环走 host 等 fence 回退，见 StagingRing）
         staging_ring_ = std::make_unique<StagingRing>();
         auto st_r = staging_ring_->initialize(
-            device_.device(), device_.physical_device(), command_pool_, *memory_pool_);
+            device_.device(), device_.physical_device(), command_pool_, *memory_pool_,
+            device_.has_timeline_semaphores());
         if (!st_r)
             return st_r;
 
@@ -1244,11 +1251,8 @@ public:
             submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             submit_info.commandBufferCount = 1;
             submit_info.pCommandBuffers = &f.cmd;
-            if (sw.any())
-            {
-                submit_info.waitSemaphoreCount = static_cast<uint32_t>(sw.sems.size());
-                submit_info.pWaitSemaphores = sw.sems.data();
-            }
+            VkTimelineSemaphoreSubmitInfo timeline_info{};
+            attach_staging_waits(submit_info, sw, timeline_info);
             r = detail::vk_check(
                 vkQueueSubmit(device_.compute_queue(), 1, &submit_info, f.fence),
                 __FILE__, __LINE__);
@@ -1404,12 +1408,14 @@ public:
                 submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
                 submit_info.commandBufferCount = 1;
                 submit_info.pCommandBuffers = &cmd;
-                // 跨 submit 数据依赖（P0-1 修复）：信号本 region 的信号量。
-                // 读取"本 copy 写入的 buffer"的后续 submit 必须
-                // pWaitSemaphores（见 collect_staging_waits）。
-                const auto sem = staging_ring_->semaphore(ri);
-                submit_info.signalSemaphoreCount = 1;
-                submit_info.pSignalSemaphores = &sem;
+                // 跨 submit 数据依赖（P0-1 修复）：时间线信号量 signal 本次
+                // 上传的 value。读取"本 copy 写入的 buffer"的后续 submit 必须
+                // wait 该 value（见 collect_staging_waits）。
+                VkTimelineSemaphoreSubmitInfo timeline_info{};
+                VkSemaphore sem = VK_NULL_HANDLE;
+                std::uint64_t signal_value = 0;
+                attach_upload_signal(submit_info, *staging_ring_, ri,
+                                     timeline_info, sem, signal_value);
 
                 r = detail::vk_check(
                     vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
@@ -1476,9 +1482,13 @@ public:
                 submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
                 submit_info.commandBufferCount = 1;
                 submit_info.pCommandBuffers = &cmd;
-                const auto sem = staging_ring_->semaphore(ri);
-                submit_info.signalSemaphoreCount = 1;
-                submit_info.pSignalSemaphores = &sem;
+                // 跨 submit 数据依赖：时间线信号量 signal 本次上传的 value
+                // （读取本 copy 写入 buffer 的后续 submit 会 wait 该 value）
+                VkTimelineSemaphoreSubmitInfo timeline_info{};
+                VkSemaphore sem = VK_NULL_HANDLE;
+                std::uint64_t signal_value = 0;
+                attach_upload_signal(submit_info, *staging_ring_, ri,
+                                     timeline_info, sem, signal_value);
 
                 r = detail::vk_check(
                     vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
@@ -1549,7 +1559,8 @@ public:
             // 跨 submit 数据依赖：源 buffer 可能刚由在飞上传的 copy 写入
             // （from_matrix → to_matrix 无中间 op 即此场景）——等 in-flight
             // region 信号量（本下载自用的 region 已在 acquire 中等待并重置，
-            // 不在 in-flight 集合内）
+            // 不在 in-flight 集合内）。时间线信号量允许同一 value 被多个
+            // submit 等待，故这里与前面的 matmul 帧重复等待也合法。
             const auto sw = collect_staging_waits();
 
             {
@@ -1558,12 +1569,8 @@ public:
                 submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
                 submit_info.commandBufferCount = 1;
                 submit_info.pCommandBuffers = &cmd;
-                if (sw.any())
-                {
-                    submit_info.waitSemaphoreCount =
-                        static_cast<uint32_t>(sw.sems.size());
-                    submit_info.pWaitSemaphores = sw.sems.data();
-                }
+                VkTimelineSemaphoreSubmitInfo timeline_info{};
+                attach_staging_waits(submit_info, sw, timeline_info);
 
                 r = detail::vk_check(
                     vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
@@ -1634,12 +1641,8 @@ public:
                 submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
                 submit_info.commandBufferCount = 1;
                 submit_info.pCommandBuffers = &cmd;
-                if (sw.any())
-                {
-                    submit_info.waitSemaphoreCount =
-                        static_cast<uint32_t>(sw.sems.size());
-                    submit_info.pWaitSemaphores = sw.sems.data();
-                }
+                VkTimelineSemaphoreSubmitInfo timeline_info{};
+                attach_staging_waits(submit_info, sw, timeline_info);
 
                 r = detail::vk_check(
                     vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
@@ -2039,36 +2042,91 @@ public:
     }
 
     // ── 辅助：跨 submit 数据依赖（P0-1 修复核心）────────────────────────
-    // 背景：单队列 FIFO 只是执行顺序保证。实测本驱动（NVIDIA V100 +
-    // Windows）下，消费方 submit（download/matmul/batch 帧）紧跟上传
-    // submit（<~2ms）时，消费方 GPU 操作会读到上传写入的旧值（零）；
-    // host 侧 sleep ≥5ms 或 fence 等待可规避——即隐式跨 submit 数据依赖
-    // 不可靠，必须用队列级信号量（spec 标准跨 submit 排序原语）显式建立：
-    //   上传 submit:  pSignalSemaphores = {region 信号量}
+    // 背景：单队列 FIFO 只是执行顺序保证。实测本驱动（NVIDIA + Windows）
+    // 下，消费方 submit（download/matmul/batch 帧）紧跟上传 submit
+    // （<~2ms）时，消费方 GPU 操作会读到上传写入的旧值（零）；host 侧
+    // sleep ≥5ms 或 fence 等待可规避——即隐式跨 submit 数据依赖不可靠，
+    // 必须用队列级原语显式建立：
+    //   上传 submit:  pSignalSemaphores = {region 信号量} + value
     //   消费 submit:  pWaitSemaphores   = {所有 in-flight region 信号量}
-    // 用 core VkSubmitInfo（Vulkan 1.0 语义，最可移植）：无 stage 字段，
-    // wait 侧等价于"全部 stage 等待"（信号量 signaled 后消费命令的任何
-    // stage 均可开始）——正是所需的全序依赖。host 永不阻塞（P0-1 流水线
-    // 收益保留），GPU 在队列内等待数据就绪。
-    // 保守等待全部 in-flight region（最多 2 个）：消费方读到的 buffer 必然
-    // 由某个在飞上传写入，等待只推迟 GPU 启动到数据就绪，无正确性损失。
+    //                 pWaitSemaphoreValues = {各自的 value}
+    //                 pWaitDstStageMask  = {ALL_COMMANDS}（waitSemaphoreCount>0
+    //                                        时规范要求非空，见
+    //                                        VUID-VkSubmitInfo-pWaitDstStageMask）
+    // **必须用时间线信号量**：同一 value 可被任意多个 submit 等待且等待已达成
+    // 的 value 是 no-op。二进制信号量一次 signal 只能被一个 wait 消费，第二
+    // 个消费者会永久阻塞（VUID-vkQueueSubmit-pWaitSemaphores-03238），AMD
+    // 老驱动实测直接死锁。
+    // host 永不阻塞（P0-1 流水线收益保留），GPU 在队列内等待数据就绪。
+    // 设备不支持时间线信号量时不创建信号量，改由 drain_in_flight() 在 host
+    // 侧阻塞兜底（正确性优先）。
     struct StagingWait
     {
         std::vector<VkSemaphore> sems;
+        std::vector<VkPipelineStageFlags> stages;
+        std::vector<std::uint64_t> values;
         [[nodiscard]] bool any() const noexcept { return !sems.empty(); }
     };
-    [[nodiscard]] StagingWait collect_staging_waits() const
+    [[nodiscard]] StagingWait collect_staging_waits()
     {
         StagingWait w;
         if (!staging_ring_)
             return w;
+        if (!staging_ring_->timeline())
+        {
+            // 回退路径：host 等在飞上传完成（阻塞），后续 submit 无跨 submit
+            // 依赖，无需信号量
+            staging_ring_->drain_in_flight();
+            return w;
+        }
         for (std::size_t i = 0; i < staging_ring_->num_regions(); ++i)
         {
             if (!staging_ring_->in_flight(i))
                 continue;
             w.sems.push_back(staging_ring_->semaphore(i));
+            w.stages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            w.values.push_back(staging_ring_->signal_value(i));
         }
         return w;
+    }
+
+    // 把跨 submit 等待挂到 submit 上（pNext = VkTimelineSemaphoreSubmitInfo）
+    static void attach_staging_waits(
+        VkSubmitInfo& si, const StagingWait& sw, VkTimelineSemaphoreSubmitInfo& tsi)
+    {
+        if (!sw.any())
+            return;
+        si.waitSemaphoreCount = static_cast<std::uint32_t>(sw.sems.size());
+        si.pWaitSemaphores = sw.sems.data();
+        si.pWaitDstStageMask = sw.stages.data();
+        tsi.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+        tsi.waitSemaphoreValueCount = static_cast<std::uint32_t>(sw.values.size());
+        tsi.pWaitSemaphoreValues = sw.values.data();
+        si.pNext = &tsi;
+    }
+
+    // 上传 submit 的信号挂载（时间线信号量模式）。
+    // 返回 false = 当前设备非时间线模式：不 signal，消费者走 drain 回退。
+    // 调用方提供的 sem_storage/value_storage 必须活到 vkQueueSubmit（
+    // pSignalSemaphores/pSignalSemaphoreValues 是借用指针）。
+    // 必须在 mark_in_flight() 之前调用：消费者只认"in-flight region 的
+    // signal_value"，value 必须先写好。
+    static bool attach_upload_signal(
+        VkSubmitInfo& si, StagingRing& ring, std::size_t region_idx,
+        VkTimelineSemaphoreSubmitInfo& tsi,
+        VkSemaphore& sem_storage, std::uint64_t& value_storage)
+    {
+        if (!ring.timeline())
+            return false;
+        value_storage = ring.next_signal_value(region_idx);
+        sem_storage = ring.semaphore(region_idx);
+        tsi.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+        tsi.signalSemaphoreValueCount = 1;
+        tsi.pSignalSemaphoreValues = &value_storage;
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &sem_storage;
+        si.pNext = &tsi;
+        return true;
     }
 
     // ── 辅助：获取 command buffer（batch 或独立）──────────────────────
@@ -2145,11 +2203,8 @@ public:
             submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             submit_info.commandBufferCount = 1;
             submit_info.pCommandBuffers = &cmd;
-            if (sw.any())
-            {
-                submit_info.waitSemaphoreCount = static_cast<uint32_t>(sw.sems.size());
-                submit_info.pWaitSemaphores = sw.sems.data();
-            }
+            VkTimelineSemaphoreSubmitInfo timeline_info{};
+            attach_staging_waits(submit_info, sw, timeline_info);
             r = detail::vk_check(
                 vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
                 __FILE__, __LINE__);

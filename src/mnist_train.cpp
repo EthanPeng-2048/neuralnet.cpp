@@ -65,7 +65,8 @@ void print_usage(const char *prog)
         << "  --batch-size <n>   批大小 (默认: 64)\n"
         << "  --optimizer <name> 优化器: sgd/sgd_momentum/adam/adamw/muon (默认: adam)\n"
         << "  --weight-decay <w> AdamW 权重衰减系数 (默认: 0.01)\n"
-        << "  --gpu              启用 GPU 加速 (需要 Vulkan SDK)\n"
+        << "  --gpu <索引>       启用 GPU 加速 (需要 Vulkan SDK)，可用枚举索引指定设备\n"
+        << "                     (名称子串写法: --gpu=NVIDIA / --gpu=40HX)\n"
         << "  --cuda             启用 CUDA GPU 加速 (需要 CUDA Toolkit)\n"
         << "  --max-samples <n>  限制训练样本数 (用于快速测试, 默认: 全部)\n"
         << "  --shuffle-steps <true|false>  每 epoch 打乱 batch 顺序 (默认: true)\n"
@@ -129,6 +130,7 @@ struct TrainConfig
     bool load_existing = false;
     bool gpu_enabled = false;
     bool cuda_enabled = false;
+    std::string gpu_device;      // --gpu 的可选设备选择子（空 = 自动选卡）
     int max_train_samples = -1;  // -1 表示使用全部
     bool shuffle_steps = true;   // 每 epoch 打乱 batch 顺序
 
@@ -396,6 +398,7 @@ TrainConfig parse_args(int argc, char *argv[])
     cfg.weight_decay = common.weight_decay;
     cfg.gpu_enabled = common.use_gpu;
     cfg.cuda_enabled = common.use_cuda;
+    cfg.gpu_device = common.gpu_device;
     cfg.lr_schedule = common.lr_schedule;
     cfg.warmup_epochs = common.warmup_epochs;
     cfg.min_lr = common.min_lr;
@@ -593,6 +596,7 @@ int main(int argc, char *argv[])
     nn::cli::EngineConfig eng_cfg;
     eng_cfg.use_gpu = cfg.gpu_enabled;
     eng_cfg.use_cuda = cfg.cuda_enabled;
+    eng_cfg.gpu_device = cfg.gpu_device;
     auto engine_res = nn::cli::create_engine(eng_cfg, std::cout);
     if (!engine_res)
     {
