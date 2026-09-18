@@ -10,8 +10,7 @@
 //   6. 常量折叠保守性：不折叠超越函数（exp/log/sqrt/rsqrt/tanh）
 //
 //  编译（单 TU 快速验证，与 expr_dsl_test 相同）：
-//    clang++ -std=c++26 -stdlib=libc++ -fno-exceptions \
-//            -I include/neuralnet.cpp src/expr_opt_test.cpp -o build/expr_opt_test
+//    clang++ -std=c++26 -stdlib=libc++ -fno-exceptions -I include/neuralnet.cpp src/expr_opt_test.cpp -o build/expr_opt_test
 //  运行：./build/expr_opt_test
 // ───────────────────────────────────────────────────────────────────────────
 

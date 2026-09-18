@@ -11,8 +11,7 @@
 //   6. 标量广播、比较 + select（relu）正确性
 //
 //  编译（本机性能差，用单 TU 快速验证）：
-//    clang++ -std=c++26 -stdlib=libc++ -fno-exceptions \
-//            -I include/neuralnet.cpp src/expr_dsl_test.cpp -o build/expr_dsl_test
+//    clang++ -std=c++26 -stdlib=libc++ -fno-exceptions -I include/neuralnet.cpp src/expr_dsl_test.cpp -o build/expr_dsl_test
 //  运行：./build/expr_dsl_test
 // ───────────────────────────────────────────────────────────────────────────
 
