@@ -2,26 +2,28 @@
 
 > 本文档专为 AI 编码助手编写：用最少 token 建立项目心智模型，快速开始开发。
 > 人类向的完整文档在 `docs/`（索引见 §11）。**改代码前必读 §5 铁律与 §10 高频坑。**
+> 当前版本：v1.2.0（混合精度 / RLA-2 / 防 NaN 跳步 / CPU 优化）+ 后续提交（Vulkan 设备选择、activation offload）。
 
 ## 1. 项目一句话
 
-从零实现的 C++26 神经网络库：CPU / Vulkan 双后端，支持 MLP / ViT / GPT 训练推理 + BPE 分词器。
+从零实现的 C++26 神经网络库：CPU / Vulkan 双后端，支持 MLP / ViT / GPT 训练推理 + BPE 分词器，可选 f16 混合精度。
 `include/neuralnet.cpp/` 是 header-only 库（唯一入口 `nn.hpp`），`src/` 是可执行入口，`shaders/` 是 GPU 原语 shader。
 
-## 2. 构建与测试（Linux）
+## 2. 构建与测试
 
 ```bash
-# 构建（默认 Release：-O3 -march=native -fno-exceptions -Wall -Wextra -Wpedantic -Werror）
+# 构建（默认 Release：-O3 -funroll-loops -march=native，Clang/GCC 另加 -fno-exceptions -Wall -Wextra -Wpedantic -Werror）
 cmake -B build -G Ninja && cmake --build build
 
 # 测试（默认关闭；开启后测试程序在 build/test/，并注册 ctest）
 cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --test-dir build
 ```
 
-- 编译器：Clang++ 22.1+（C++26）；CMake 3.30+。
-- Vulkan 可选：CMake 自动探测 Vulkan + glslc，找到则定义 `NN_HAS_VULKAN` 启用 GPU，否则纯 CPU。
-- **CUDA 后端 1.0.0 已停用**（融合原语未实现，`compute_cuda_engine.hpp` 返回"未实现"），勿依赖、勿在文档中声称支持。
-- 应用入口：`build/{mnist_train,mnist_infer,text_train,text_infer,tokenizer_train,tokenizer_infer}`；`gui.py` 是 Python GUI（subprocess 调这些可执行文件）。
+- 编译器：Clang++ 22.1+（C++26）；CMake 3.30+。CMake 在 Linux 上若 PATH 中能找到 `clang++` 会优先选它（自动向量化优于 g++），可用 `CXX=g++` 或 `-DCMAKE_CXX_COMPILER` 覆盖；MSVC 走 `/std:c++latest`。
+- 构建选项：`NN_ENABLE_NATIVE`（默认 ON，开启 `-march=native`，分发/CI 用 `OFF` 生成可移植基线）；`NN_ENABLE_TESTS`（默认 OFF）。
+- Vulkan 可选：CMake 自动探测 Vulkan + glslc，找到则定义 `NN_HAS_VULKAN` 启用 GPU，否则纯 CPU。支持多 Vulkan 设备选择（`--gpu` 参数，见 `cli/cli_gpu_option.hpp`）。
+- **CUDA 后端已停用**（无 `NN_ENABLE_CUDA` 开关；融合原语未实现，`compute_cuda_engine.hpp` 的扫描级原语直接返回"未实现"），勿依赖、勿在文档中声称支持。
+- 应用入口：`build/{mnist_train,mnist_infer,text_train,text_infer,tokenizer_train,tokenizer_infer}`，另有 `layer_bench`（性能）与测试类可执行文件。`gui.py` 是 Python GUI，`train_pkg.py` 打包 `.nnpkg` 训练包，`cli_controllers.py` 提供 CLI 控制逻辑。
 
 ## 3. 目录速查（改什么任务 → 看什么文件）
 
@@ -31,14 +33,16 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 | 加/改损失函数 | `compute_loss.hpp` |
 | 加/改优化器（SGD/Adam/AdamW/Muon） | `compute_optimizer.hpp` |
 | 加/改引擎原语（CPU 实现） | `compute_engine.hpp`（接口）+ `compute_cpu_engine.hpp` |
-| 加/改引擎原语（GPU 实现） | `compute_gpu_engine.hpp` + `backend/compute_vk_backend.hpp` + `shaders/*.comp` |
+| 加/改引擎原语（GPU 实现） | `compute_gpu_engine.hpp` + `backend/compute_vk_backend.hpp` + `backend/compute_vk_device.hpp` + `shaders/*.comp` |
 | 张量/设备抽象 | `compute_tensor.hpp` |
-| 矩阵/表达式模板（CPU 代数层） | `algebra_matrix.hpp` / `algebra_expr.hpp` / `algebra_ops.hpp` / `algebra_compute.hpp` |
+| 混合精度 / f16 类型系统 | `precision.hpp`（Precision 枚举、`nn::f16`、`PrecisionProfile`） |
+| 矩阵/表达式模板（CPU 代数层） | `algebra_matrix.hpp` / `algebra_span.hpp` / `algebra_expr.hpp` / `algebra_ops.hpp` / `algebra_compute.hpp` |
 | 表达式 DSL / 融合 IR | `expr_dsl.hpp` / `expr_spec.hpp` / `expr_opt.hpp` / `expr_graph.hpp` / `expr_registry.hpp` |
-| 模型容器/规格/序列化 | `model_container.hpp` / `model_spec.hpp` / `model_serialization.hpp` |
-| MNIST / GPT / CNN / 分词器 模型工厂 | `domain_mnist.hpp` / `domain_gpt.hpp` / `domain_cnn.hpp` / `domain_tokenizer.hpp` |
+| 后端代码生成（IR-D emitter 抽象） | `expr_emitter.hpp`（注册表）+ `expr_glsl_gen.hpp`（GlslEmitter） |
+| 模型容器/规格/序列化 | `model_container.hpp` / `model_spec.hpp` / `model_serialization.hpp` / `model_keyvalue_record.hpp` |
+| MNIST / GPT / CNN / RLA / ZiPT / 分词器 模型工厂 | `domain_mnist.hpp` / `domain_gpt.hpp` / `domain_cnn.hpp` / `domain_rla.hpp` / `domain_zipt.hpp` / `domain_tokenizer{,_base,_bpe,_charbpe}.hpp` |
 | 训练/推理 CLI 入口 | `src/mnist_train.cpp` 等；公共 CLI 逻辑在 `include/neuralnet.cpp/cli/` |
-| 构建期工具（AOT 融合） | `tools/scan_exprs.cpp` / `tools/gen_fused.cpp` |
+| 构建期工具（AOT 融合） | `tools/scan_exprs.cpp` / `tools/gen_fused.cpp`（另有 `tools/decode_fused.py` 调试用） |
 | 与 PyTorch 对拍 | `compare_with_torch/`（model.py / text_train.py / text_infer.py） |
 
 ## 4. 分层架构（L0→L5，严格单向依赖，上层只依赖下层公有接口）
@@ -57,7 +61,8 @@ graph TB
     subgraph "L4 领域构建层"
         E["domain_mnist.hpp"]
         F["domain_gpt.hpp"]
-        G["domain_tokenizer.hpp"]
+        G["domain_tokenizer*.hpp"]
+        F2["domain_cnn / domain_rla / domain_zipt.hpp"]
     end
     
     subgraph "L3 实现层"
@@ -68,11 +73,12 @@ graph TB
     
     subgraph "L2 计算层（引擎化）"
         K["compute_engine.hpp"]
-        L["cpu_engine.hpp"]
-        M["gpu_engine.hpp"]
-        N["compute_layer.hpp"]
+        L["compute_cpu_engine.hpp"]
+        M["compute_gpu_engine.hpp"]
+        N["compute_layer*.hpp"]
         O["compute_loss.hpp"]
         P["compute_optimizer.hpp"]
+        P2["precision.hpp"]
     end
     
     subgraph "L1 代数层"
@@ -88,11 +94,12 @@ graph TB
     end
     
     D -->|subprocess| A & B & C
-    A & B & C --> E & F & G
-    E & F & G --> H & I & J
+    A & B & C --> E & F & G & F2
+    E & F & G & F2 --> H & I & J
     H & I & J --> K & N & O & P
     K --> L & M
     N & O & P --> Q
+    P2 -.精度配置.-> K
     Q --> R & S
     Q --> V & W & X
 ```
@@ -111,17 +118,21 @@ graph TB
 Matrix → engine.from_matrix → Tensor[GPU] → forward/loss/optimizer 全程在 GPU → 仅 evaluate 时 to_matrix 回 CPU
 ```
 
+**多精度（v1.2.0 起）**：`Precision`（F16/F32；BF16/F64 为保留值，使用即报错）贯穿张量存储与算子输出；`PrecisionProfile{param/compute/stable/optimizer}` 做模型级配置。语义锚点见 `precision.hpp` 头注释与 `docs/development/05-mixed-precision.md`。
+
 ### 4.3 ComputeEngine 原语分类
 
 | 类别 | 原语 |
 |------|------|
-| 矩阵级 | `matmul/batched_matmul/transpose/add_inplace/scale_inplace/zero/axpy_inplace` |
-| 归约级 | `row/col_reduce_sum/max` |
-| 广播级 | `broadcast_row/col_inplace` |
-| 逐元素 | `elementwise_unary/binary/binary_scalar` |
-| 数据操作 | `slice_rows/insert_rows/gather_rows/scatter_add_rows/rearrange_3d/clone` |
+| 矩阵级 | `matmul/batched_matmul/matmul_with_bias/transpose/add_inplace/accumulate/scale_inplace/axpy_inplace/zero` |
+| 归约级 | `row_reduce_sum/max`、`col_reduce_sum/max` |
+| 广播级 | `broadcast_row_inplace/broadcast_col_inplace` |
+| 逐元素 | `elementwise_unary/binary/binary_scalar/select_scalar_cond` |
+| 数据操作 | `slice_rows/insert_rows/gather_rows/scatter_add_rows/rearrange_3d/clone/copy_from/cast` |
 | 扫描级 | `scan_prefix_outer/scan_suffix_outer/outer_col`（RLA/RAPT，dk≤64，见 docs/development/06 §扫描原语） |
-| 批控制 | `begin_batch/end_batch`（CPU no-op，GPU 录 command buffer） |
+| 表达式 | `eval_expr/eval_expr_reduce`（AOT 融合 shader 入口） |
+| 批次/内存 | `begin_batch/end_batch/flush_batch/release_idle_pool_blocks/pool_stats` |
+| offload | `offload_store/offload_load/create_offload_buffer/offload_save/offload_restore`（activation offload） |
 
 ### 4.4 理解优先级（建议学习顺序）
 
@@ -156,11 +167,12 @@ GPT 序列展平: 列序 i = b*seq + t（batch-major，全局唯一约定）
 ## 7. 表达式 DSL 与 AOT 融合管线（GPU 开发必读）
 
 - Layer 内用 `nn::dsl`（`expr_dsl.hpp`）写普通数学表达式；CPU 编译期模板直接求值（内联+SIMD），GPU 折叠成 `ExprSpec`（扁平 IR，`expr_spec.hpp`）→ 按 key 查预编译融合 shader。
-- 块式融合：`start_expr() ... end_expr()` 录制一段表达式链。
+- 主要入口：`dsl::compute(engine, expr)`（一行表达式，最常用）；块式融合用 `dsl::start_expr(engine, rows, cols, expr) ... dsl::end_expr(block)`（复杂表达式按块录制）；归约语义用 `dsl::compute_reduce`。
 - **构建期两步**（CMake 自动编排，改 Layer 内联表达式后重跑构建即可）：
   1. `scan_exprs`：dry-run 跑 Layer forward/backward，收集折叠出的 `ExprSpec` 结构（去重）→ `build/generated/expr_specs.bin`
-  2. `gen_fused`：读 bin → `glsl_gen` 生成 GLSL → glslc → 内联 SPIR-V → `build/generated/fused_registry.hpp`
-- 手写原语 shader 在 `shaders/*.comp`（matmul、matmul_tiled、batched_matmul、reduce、broadcast、elementwise_v2、transpose、gather、scatter_add、rearrange_3d），构建期 glslc 编译并嵌入 C++ 头文件。
+  2. `gen_fused`：读 bin → 经 `emitter_registry` 选后端（默认 `"glsl"` = `GlslEmitter`）生成 GLSL → glslc → 内联 SPIR-V → `build/generated/fused_registry.hpp`
+- **IR-D emitter 抽象**（`expr_emitter.hpp`）：把后端代码生成从 GLSL 专用抽象为 emitter 接口（一份 canonical IR → 多后端代码），`--list-backends` 可列出注册后端。目前仅 `glsl` 后端注册；`CpuEmitter` / `CudaEmitter` 为预留设计（**尚未实现**，勿把它们当作现存代码）。
+- 手写原语 shader 在 `shaders/*.comp`（matmul、matmul_tiled、batched_matmul、reduce、broadcast、elementwise_v2、transpose、gather、scatter_add、rearrange_3d、scan_prefix_outer、scan_suffix_outer、outer_col、cast），构建期 glslc 编译并嵌入 C++ 头文件。
 - IR 优化 pass（canonicalize/CSE/寄存器分配/图 IR 融合）见 `expr_opt.hpp` / `expr_graph.hpp`，设计文档 `docs/development/03-ir-optimization.md`。
 
 ## 8. 训练循环范式（写新入口时照抄）
@@ -231,7 +243,7 @@ optimizer.step();
 | `development/06-rapt-algorithm.md` | **线性注意力家族演进：RLA → RAPT → RLA-2 + 两趟式/flash 等价分析 + GPU 落地** |
 | `development/07-zipt-algorithm.md` | AttnZip / ZiPT：记忆压缩解码器算法设计 |
 | `development/08-pitfalls-and-lessons.md` | **踩坑警示录，改代码前读** |
-| `development/09-code-review-2026-09-04.md` | **全库 C++ 代码审查报告（2026-09-04，102 文件，P0×0 / P1×48 / P2×92 / P3×95；CpuEmitter 隐性缺陷相关项是多精度 Phase 2 前置条件）** |
+| `development/09-code-review-2026-09-04.md` | **全库 C++ 代码审查报告（2026-09-04，102 文件，P0×0 / P1×48 / P2×92 / P3×95；含 08-27/08-28 已修项与未修项清单）** |
 | `development/10-development-standards.md` | C++ 编码规范全文 |
 
 ### 使用类（docs/usage/）
@@ -244,9 +256,17 @@ optimizer.step();
 | `usage/04-train-package.md` | `.nnpkg` 训练包 |
 
 
-## 12. 当前状态（2026-08-28）
+## 12. 当前状态（截至 2026-09-13，最新提交 15eb731）
 
-### 融合二期（docs/development/02-operator-fusion.md）完成：S1-S5、S7
+### 已交付能力
+
+- **v1.2.0**（Release）：混合精度（`precision.hpp` + CPU/GPU f16 路径）、RLA-2/RAPT、防 NaN 跳步、CPU 优化、头文件保护更换、编译器兼容（GCC/MSVC）、测试补充。
+- **v1.1.0**：GPT 训练错误修复、算子融合优化、ZiPT/RAPT 掩码。
+- **后续提交**（v1.2.0 之后）：
+  - **Vulkan 设备选择**（15eb731）：`--gpu` 参数指定设备（`cli/cli_gpu_option.hpp`、`backend/compute_vk_device.hpp`）。
+  - **activation offload**（ee11e29）：相较梯度检查点更省时（实测 18s vs 26s / 5 step），推荐优先使用；`GPTModel::set_offload_enabled` + `ComputeEngine::offload_*` 原语。
+
+### 融合二期（`docs/development/02-operator-fusion.md`）完成：S1-S5、S7
 
 S7 关键教训（改融合/IR 代码前必读）：
 
@@ -255,23 +275,18 @@ S7 关键教训（改融合/IR 代码前必读）：
 3. **RowGather 主输入行数≠网格行数**（loss_vec 在 (1,N) 读 (C,N) logits），校验只查 cols。
 4. `gen_fused` `emit_spec` 的 ±inf 常量必须用 `numeric_limits`。
 5. matmul + 列归约不支持（gen_fused 跳过）。
-6. **PS 删大文件段行号易漂移**、`-replace` 多行静默失败——先 read 再 edit，删前 `git diff` 核对。
-7. `dispatch_compute` 误删后从调用点重建。
-8. **IR 扩展**：MatmulSpec.batch（不进 key，dispatch z）、Row/Col/Batch 操作数(6/7/8)、RowGather(9)/BatchMod(10)/BatchCol(11)；注意力 fwd=m/l/W 表达式+bm(W,V_t)，bwd=R/X 表达式+3 个 bm；CE 稠密 `denom=col_sum(exp(logits-cb(col_max)))`，稀疏 grad/loss_vec 用 Row+RowGather。
-9. **CpuEmitter 产物从不编译**（gen_fused 硬编码 glsl），缺陷全隐性（见下方待修）。
+6. **IR 扩展**：MatmulSpec.batch（不进 key，dispatch z）、Row/Col/Batch 操作数(6/7/8)、RowGather(9)/BatchMod(10)/BatchCol(11)；注意力 fwd=m/l/W 表达式+bm(W,V_t)，bwd=R/X 表达式+3 个 bm；CE 稠密 `denom=col_sum(exp(logits-cb(col_max)))`，稀疏 grad/loss_vec 用 Row+RowGather。
 
-### 全库审查（2026-08-27 审查，08-28 已修）
+### 全库审查（`docs/development/09-code-review-2026-09-04.md`，2026-09-04 完成）
 
-- **P0 已修**：① grad_gamma 多乘 γ ② vec4 Select mix 序 ③ matmul_tiled .x 条件 ④ matmul 尾链视图读全局行（attn_w_batch_test 4 配置一致，ctest 28/28 全绿）
-- **P1 已修**：BPE vocab≥258、batch-size≥1、patch-size 整除 28、cnn-pool≤28、max-tokens≥1、Conv/MaxPool 构造下溢守卫、gpu_test 失败计数进退出码 + 无 Vulkan return 77
-- **P2 已修**：Muon 0.2√max(m,n)、epoch lr 钳制
-- **未修**：col_reduce 并行非逐字节、VK_TIMEOUT/DEVICE_LOST 错误路径、第三梯队（序列化/GUI/测试质量/set_doc_ids 残留）
-- CE/Adam/AdamW/SGD 公式已验证正确
+- 规模：102 个手写 C++ 文件（60 hpp + 42 cpp）；结论 **P0×0 / P1×48 / P2×92 / P3×95**。
+- 08-27 审查的 P0/P1/P2 已修项（BPE vocab≥258、batch-size≥1、patch-size 整除 28、cnn-pool≤28、Muon 0.2√max(m,n)、epoch lr 钳制、gpu_test 退出码等）见报告 §1。
+- **未修**：`col_reduce` 并行非逐字节、`VK_TIMEOUT` 重试未实现（且 `--tdr-retry` 配置从未被使用）、第三梯队（序列化/GUI/测试质量/`set_doc_ids` 残留）、CUDA 后端死代码（含隐藏编译错误）。
+- CE / Adam / AdamW / SGD 公式已验证正确。
 
-### 待修：CpuEmitter 隐性缺陷
+### 已过时的历史说明
 
-CpuEmitter 产物从不参与编译（gen_fused 硬编码 glsl），以下缺陷全部隐性：
+- **CpuEmitter**：`cpu_emitter.hpp` 与 CpuEmitter 实现**已删除**（审查报告记为已删、N/A，仅 `expr_emitter.hpp` 注释残留）。早期"待修 CpuEmitter 隐性缺陷"问题已随之消失，勿再引用。
+- **融合三期 S6**：未列入当前计划。
 
-- `BatchMod`/`BatchCol` 引用未声明 `batch`（ee49f5d 引入）
-- `Row`/`Col`/`Batch`/`Matmul`/`Reduce` 操作数与 `RowGather` 视图走 default 错语义
-- 纯 matmul spec `instrs.back()` UB
+> 变更此文件时务必同步 git 状态：`CMakeLists.txt` 的 `project(... VERSION ...)` 可能滞后于 git tag，以 git tag 为准。
