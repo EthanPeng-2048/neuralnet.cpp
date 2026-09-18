@@ -81,7 +81,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ${{ runner.tool_cache }}/vulkan-sdk
-        key: vulkan-sdk-linux-1.4.357.0
+        key: vulkan-sdk-linux-1.4.357.1
 
     # 命中缓存：直接复用已解压的 SDK，仅设置环境变量
     - name: Setup Vulkan SDK env (Linux, cached)
@@ -90,6 +90,11 @@ jobs:
         SDK_DIR="${{ runner.tool_cache }}/vulkan-sdk"
         echo "VULKAN_SDK=$SDK_DIR" >> "$GITHUB_ENV"
         echo "$SDK_DIR/bin" >> "$GITHUB_PATH"
+        # LunarG Linux SDK 把 loader 放在 lib/VulkanLoader/lib（不在 lib/），而
+        # CMake FindVulkan 只搜 lib/。SDK 自带 setup-env.sh 的关键就是设
+        # CMAKE_PREFIX_PATH=$VULKAN_SDK/lib/VulkanLoader；不设它 find_package(Vulkan)
+        # 永远失败 → CI 从不编译 GPU（仅纯 CPU 构建）。
+        echo "CMAKE_PREFIX_PATH=$SDK_DIR/lib/VulkanLoader:$SDK_DIR" >> "$GITHUB_ENV"
         "$SDK_DIR/bin/glslc" --version
 
     # 未命中：下载官方 tar 包并解压到固定缓存目录（保证后续路径稳定）
@@ -102,7 +107,7 @@ jobs:
         cd "$HOME"
         curl -L --fail --retry 5 --retry-delay 5 --retry-all-errors \
           -o vulkansdk.tar.xz \
-          "https://sdk.lunarg.com/sdk/download/1.4.357.0/linux/vulkansdk-linux-x86_64-1.4.357.0.tar.xz"
+          "https://sdk.lunarg.com/sdk/download/1.4.357.1/linux/vulkansdk-linux-x86_64-1.4.357.1.tar.xz"
         tar xf vulkansdk.tar.xz
         SDK_SRC="$(ls -d "$HOME"/1.*/x86_64 2>/dev/null | head -n1)"
         if [ -z "$SDK_SRC" ]; then echo "SDK extract dir not found"; exit 1; fi
@@ -110,9 +115,12 @@ jobs:
         SDK_DIR="${{ runner.tool_cache }}/vulkan-sdk"
         mkdir -p "$SDK_DIR"
         cp -a "$SDK_SRC/." "$SDK_DIR/"
-        # 供后续步骤使用：find_package(Vulkan) 读 VULKAN_SDK，PATH 找到 glslc
+        # 供后续步骤使用：find_package(Vulkan) 读 VULKAN_SDK，PATH 找到 glslc。
+        # CMAKE_PREFIX_PATH 必须含 lib/VulkanLoader —— loader 实际位置（见 SDK 的
+        # setup-env.sh），否则 CMake 找不到 libvulkan.so，GPU 编译被静默跳过。
         echo "VULKAN_SDK=$SDK_DIR" >> "$GITHUB_ENV"
         echo "$SDK_DIR/bin" >> "$GITHUB_PATH"
+        echo "CMAKE_PREFIX_PATH=$SDK_DIR/lib/VulkanLoader:$SDK_DIR" >> "$GITHUB_ENV"
         "$SDK_DIR/bin/glslc" --version
 
     # ========== Windows: 安装 LLVM Clang + Ninja ==========
