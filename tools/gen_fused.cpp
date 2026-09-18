@@ -112,7 +112,8 @@ namespace
           << static_cast<int>(spec.matmul->b_input) << ", "
           << static_cast<int>(spec.matmul->transA) << ", "
           << static_cast<int>(spec.matmul->transB) << ", "
-          << spec.matmul->k << "u}";
+          << spec.matmul->k << "u, "
+          << spec.matmul->batch << "u}";  // batch 必须显式生成（漏则退化为默认 1，registry spec 失真）
     }
     o << "} }";
     return o.str();
