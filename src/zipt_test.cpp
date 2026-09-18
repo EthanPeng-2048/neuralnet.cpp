@@ -25,18 +25,20 @@
 int main(int argc, char* argv[])
 {
     int failures = 0;
+    // 77 = 子测试因 GPU 不可用而跳过（ctest SKIP 约定），不计入失败
+    const auto add = [&failures](int r) { if (r != 77) failures += r; };
 
     std::puts("=== zipt_gradcheck (numerical) ===");
-    failures += test_zipt_gradcheck(argc, argv);
+    add(test_zipt_gradcheck(argc, argv));
 
     std::puts("=== zipt_smoke (build + spec roundtrip + loss) ===");
-    failures += test_zipt_smoke(argc, argv);
+    add(test_zipt_smoke(argc, argv));
 
     std::puts("=== zipt_consistency (CPU/GPU) ===");
-    failures += test_zipt_consistency(argc, argv);
+    add(test_zipt_consistency(argc, argv));
 
     std::puts("=== zipt_doc (block-level doc mask) ===");
-    failures += test_zipt_doc();
+    add(test_zipt_doc());
 
     std::printf("\nzipt_test: %d failure(s)\n", failures);
     return failures != 0 ? 1 : 0;
