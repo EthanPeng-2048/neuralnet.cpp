@@ -78,6 +78,14 @@ public:
 
     Result<void> train(const std::string &text, const Config &config)
     {
+        // 库 API 守卫（与 CLI 的 >=258 校验对齐）：vocab_size < BYTE_BASE+2 时，
+        // 下方 merges_.reserve(config.vocab_size - BYTE_BASE - 2) 会发生无符号
+        // 下溢 → ~SIZE_MAX 分配 → bad_alloc/terminate（-fno-exceptions 下不回 Result）。
+        if (config.vocab_size < BYTE_BASE + 2)
+            return std::unexpected(Error{
+                "BPETokenizer::train: vocab_size 必须 >= " +
+                std::to_string(BYTE_BASE + 2) + "（256 字节 token + BOS/EOS）"});
+
         auto log = config.log
             ? config.log
             : LogFn{[](std::string_view) { /* 静默 */ }};

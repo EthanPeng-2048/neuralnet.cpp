@@ -388,10 +388,17 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
     return {};
 }
 
+// 反序列化字符串段的硬上限：文件中的长度字段不可信（64 位，可能是损坏/恶意值），
+// 直接 std::string(len,'\0') 会先做巨量分配 → bad_alloc/terminate（-fno-exceptions
+// 下连 Result 都回不去）。模型 spec / tokenizer JSON 远小于此值。
+inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
+
 [[nodiscard]] inline Result<ModelSpec> read_spec_header(std::ifstream &ifs, uint32_t version)
 {
     auto len_r = read_bytes<uint64_t>(ifs);
     if (!len_r) return std::unexpected(len_r.error());
+    if (*len_r > kMaxSerializedStringBytes)
+        return std::unexpected(Error{"spec header 长度越界（超过 64 MiB），文件可能损坏或恶意"});
     const auto len = static_cast<std::size_t>(*len_r);
     std::string bytes(len, '\0');
     if (len > 0)
@@ -471,6 +478,8 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
 {
     auto len_r = read_bytes<uint64_t>(ifs);
     if (!len_r) return std::unexpected(len_r.error());
+    if (*len_r > kMaxSerializedStringBytes)
+        return std::unexpected(Error{"tokenizer 长度越界（超过 64 MiB），文件可能损坏或恶意"});
     const auto len = static_cast<std::size_t>(*len_r);
     if (len == 0) return std::string{};  // 未嵌入
 
