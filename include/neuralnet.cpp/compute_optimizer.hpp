@@ -70,6 +70,22 @@ protected:
         return buffers;
     }
 
+    // ── 构造期资源分配失败记录（替代 std::abort）─────────────────────────
+    // 构造函数无法返回 Result，故把首次失败原因存下，由 step() 开头经
+    // check_ready_() 上抛（铁律 1：禁止 throw/abort，错误一律走 Result）。
+    std::optional<Error> init_error_;
+
+    void record_init_error_(Error e)
+    {
+        if (!init_error_) init_error_ = std::move(e);
+    }
+
+    [[nodiscard]] Result<void> check_ready_() const
+    {
+        if (init_error_) return std::unexpected(*init_error_);
+        return {};
+    }
+
 public:
     Optimizer(ComputeEngine& engine,
               std::vector<TensorRef> params,
@@ -208,18 +224,16 @@ public:
     {
         auto v_r = create_zero_buffers_();
         if (!v_r)
-        {
-            std::fprintf(stderr, "SGDWithMomentum init failed: %s\n",
-                         v_r.error().message.c_str());
-            std::abort();
-        }
-        velocities_ = std::move(*v_r);
+            record_init_error_(v_r.error());  // 不 abort：由 step() 经 Result 上抛
+        else
+            velocities_ = std::move(*v_r);
     }
 
     void set_lr(Scalar lr) override { lr_ = lr; }
 
     [[nodiscard]] Result<void> step() override
     {
+        if (auto r = check_ready_(); !r) return std::unexpected(r.error());
         if (auto r = validate_sizes_(); !r) return std::unexpected(r.error());
 
         const Scalar one_minus_beta = Scalar{1} - beta_;
@@ -315,17 +329,15 @@ protected:
         auto m_r = create_zero_buffers_();
         if (!m_r)
         {
-            std::fprintf(stderr, "Adam init (m_) failed: %s\n",
-                         m_r.error().message.c_str());
-            std::abort();
+            record_init_error_(m_r.error());  // 不 abort：由 step() 经 Result 上抛
+            return;
         }
         m_ = std::move(*m_r);
         auto v_r = create_zero_buffers_();
         if (!v_r)
         {
-            std::fprintf(stderr, "Adam init (v_) failed: %s\n",
-                         v_r.error().message.c_str());
-            std::abort();
+            record_init_error_(v_r.error());
+            return;
         }
         v_ = std::move(*v_r);
     }
@@ -357,6 +369,7 @@ public:
 
     [[nodiscard]] Result<void> step() override
     {
+        if (auto r = check_ready_(); !r) return std::unexpected(r.error());
         if (auto r = validate_sizes_(); !r) return std::unexpected(r.error());
 
         // 偏差修正：每步只计算一次（而非每参数重复 pow）
@@ -408,6 +421,7 @@ public:
 
     [[nodiscard]] Result<void> step() override
     {
+        if (auto r = check_ready_(); !r) return std::unexpected(r.error());
         if (auto r = validate_sizes_(); !r) return std::unexpected(r.error());
 
         // 偏差修正：每步只计算一次（而非每参数重复 pow）
@@ -591,18 +605,16 @@ public:
     {
         auto v_r = create_zero_buffers_();
         if (!v_r)
-        {
-            std::fprintf(stderr, "Muon init failed: %s\n",
-                         v_r.error().message.c_str());
-            std::abort();
-        }
-        velocities_ = std::move(*v_r);
+            record_init_error_(v_r.error());  // 不 abort：由 step() 经 Result 上抛
+        else
+            velocities_ = std::move(*v_r);
     }
 
     void set_lr(Scalar lr) override { lr_ = lr; }
 
     [[nodiscard]] Result<void> step() override
     {
+        if (auto r = check_ready_(); !r) return std::unexpected(r.error());
         if (auto r = validate_sizes_(); !r) return std::unexpected(r.error());
 
         for (std::size_t i = 0; i < params_.size(); ++i)

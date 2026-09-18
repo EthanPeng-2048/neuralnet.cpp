@@ -1003,17 +1003,28 @@ public:
         Tensor last_logits_t;
 
         // ── 逐 token 填充 KV cache（prefill 与滑动窗口重建共用） ──────
-        // 从 context[start..end) 逐个 forward_step，更新 cur_len 与 last_logits_t
+        // 从 context[start..end) 逐个 forward_step，更新 cur_len 与 last_logits_t。
+        // 整段包进单次 begin_batch/end_batch：GPU 下避免 O(seq) 次独立提交
+        // （铁律 6）。forward_step 为纯 device-resident（不触发 host 同步），
+        // 且内部按 flush_interval_ 调用 flush_batch 防 TDR。
         auto fill_cache_ = [&](std::size_t start) -> Result<void>
         {
+            auto br = engine.begin_batch();
+            if (!br) return std::unexpected(br.error());
             for (std::size_t i = start; i < context.size(); ++i)
             {
                 auto r = forward_step(engine, context[i], cur_len,
                                       k_caches, v_caches, cur_len);
-                if (!r) return std::unexpected(r.error());
+                if (!r)
+                {
+                    (void)engine.end_batch();  // 出错也收尾，避免录制状态泄漏
+                    return std::unexpected(r.error());
+                }
                 last_logits_t = *r;
                 ++cur_len;
             }
+            auto er = engine.end_batch();
+            if (!er) return std::unexpected(er.error());
             return {};
         };
 
