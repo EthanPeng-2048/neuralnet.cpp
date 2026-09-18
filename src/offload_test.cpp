@@ -17,12 +17,14 @@
 int main()
 {
     int failures = 0;
+    // 77 = 子测试因 GPU 不可用而跳过（ctest SKIP 约定），不计入失败
+    const auto add = [&failures](int r) { if (r != 77) failures += r; };
 
     std::puts("=== offload_primitive (GPU activation roundtrip) ===");
-    failures += test_offload_primitive();
+    add(test_offload_primitive());
 
     std::puts("=== gpt_offload (GPT offload vs full-store) ===");
-    failures += test_gpt_offload();
+    add(test_gpt_offload());
 
     std::printf("\noffload_test: %d failure(s)\n", failures);
     return failures != 0 ? 1 : 0;

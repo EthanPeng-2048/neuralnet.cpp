@@ -12,8 +12,7 @@
 //   8. 独立分支：不消费前序输出的相邻表达式各自独立成 kernel
 //
 //  编译（单 TU 快速验证，与 expr_opt_test 相同）：
-//    clang++ -std=c++26 -stdlib=libc++ -fno-exceptions \
-//            -I include/neuralnet.cpp src/expr_graph_test.cpp -o build/expr_graph_test
+//    clang++ -std=c++26 -stdlib=libc++ -fno-exceptions -I include/neuralnet.cpp src/expr_graph_test.cpp -o build/expr_graph_test
 //  运行：./build/expr_graph_test
 // ───────────────────────────────────────────────────────────────────────────
 

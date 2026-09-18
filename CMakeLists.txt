@@ -233,6 +233,9 @@ if(NN_ENABLE_TESTS)
         set_target_properties(${TARGET} PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test)
         add_test(NAME ${TARGET} COMMAND ${TARGET})
+        # 退出码 77 = 依约定"跳过"（如纯 CPU 构建下需要 Vulkan 的测试）：
+        # 记 Skipped 而非 FAILED，否则 CPU-only 构建/CI 出现假红。
+        set_tests_properties(${TARGET} PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
     # 基准工具已移除（2026 清理：无法在 -Werror 下编译，且无 ctest 覆盖）
     foreach(TARGET ${NN_BENCH_TARGETS})
