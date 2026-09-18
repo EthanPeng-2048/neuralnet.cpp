@@ -72,6 +72,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
         set(NN_STDLIB "libstdc++" CACHE STRING "C++ standard library for Clang: libstdc++ / libc++")
     endif()
     add_compile_options(-stdlib=${NN_STDLIB})
+    # 链接端必须同步同一 stdlib：否则编译与链接可能取不同 ABI，链接期出现大量
+    # std 符号未定义（历史 bug：编译 libstdc++、链接 libc++）。
+    add_link_options(-stdlib=${NN_STDLIB})
 endif()
 find_program(CCACHE_FOUND ccache)
 if(CCACHE_FOUND)

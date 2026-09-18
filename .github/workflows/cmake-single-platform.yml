@@ -68,9 +68,11 @@ jobs:
         sudo ./llvm.sh all
         sudo ln -sf $(ls /usr/bin/clang-[0-9]* | sort -V | tail -n1) /usr/bin/clang
         sudo ln -sf $(ls /usr/bin/clang++-[0-9]* | sort -V | tail -n1) /usr/bin/clang++
-        # libc++（LLVM 标准库）：对 C++26 range 迭代器的处理比默认 libstdc++ 更标准
+        # 统一使用 libstdc++（CMakeLists 的 NN_STDLIB 默认；libstdc++ 线程开销更小、
+        # 内存带宽类原语更快）。不装/不用 libc++：编译与链接标准库不一致会在链接期
+        # 产生大量 std 符号 ABI 不匹配（std::__cxx11::* 未定义）。
         # ccache：缓存编译产物，加速跨运行增量构建
-        sudo apt-get install -y ninja-build p7zip-full libc++-dev libc++abi-dev ccache
+        sudo apt-get install -y ninja-build p7zip-full ccache
 
     # ========== Linux: 缓存 Vulkan SDK（避免每次下载 300MB+ tar 包）==========
     - name: Cache Vulkan SDK (Linux)
@@ -181,9 +183,7 @@ jobs:
           -DCMAKE_CXX_STANDARD_REQUIRED=ON \
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
           -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-          -DNN_ENABLE_NATIVE=OFF \
-          -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
-          -DCMAKE_EXE_LINKER_FLAGS="-stdlib=libc++"
+          -DNN_ENABLE_NATIVE=OFF
       env:
         CC: clang
         CXX: clang++
