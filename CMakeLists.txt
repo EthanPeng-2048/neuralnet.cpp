@@ -1,24 +1,12 @@
 # CMake 3.30+ required for C++26 standard support (stable in 3.30+)
 cmake_minimum_required(VERSION 3.30)
 
-# ── 默认编译器：优先 clang++（依据 报告.txt 2026-08-31 实测） ───────────────
-# 实测 clang++ 自动向量化显著优于 g++（matmul@1024³：49.5 vs 16.6 GFLOPS，
-# 约 3 倍差距）。这里只做"自动默认"，优先级从低到高：
-#   ① 已存在的 CMakeCache（重配置不改变已选编译器）
-#   ② -DCMAKE_CXX_COMPILER=...
-#   ③ CXX 环境变量（CXX=g++ 即可回退 g++）
-#   ④ 本段：PATH 中能找到 clang++ 就用它；找不到则用系统默认编译器
-if(NOT WIN32 AND NOT DEFINED ENV{CXX} AND NOT DEFINED CMAKE_CXX_COMPILER)
-    execute_process(COMMAND /bin/sh -c "command -v clang++"
-                    OUTPUT_VARIABLE NN_DEFAULT_CLANG
-                    OUTPUT_STRIP_TRAILING_WHITESPACE
-                    ERROR_QUIET)
-    if(NN_DEFAULT_CLANG)
-        set(ENV{CXX} "${NN_DEFAULT_CLANG}")
-        message(STATUS "默认 C++ 编译器: clang++（自动向量化优于 g++，见 报告.txt）；"
-                       "如需 g++ 请用 CXX=g++ 或 -DCMAKE_CXX_COMPILER 覆盖")
-    endif()
-endif()
+# ── 编译器与标准库：一律使用默认，不由本文件指定 ──────────────────────────
+# 编译器：用 CMake 默认探测结果，或调用方显式 -DCMAKE_CXX_COMPILER / CXX 环境变量。
+# 标准库：用编译器默认（Linux clang/gcc 默认 libstdc++）。如需 libc++，由调用方
+# 通过 -DCMAKE_CXX_FLAGS / -DCMAKE_EXE_LINKER_FLAGS 统一指定（编译与链接必须一致，
+# 否则链接期会出现 std 符号 ABI 不匹配）。
+# 本文件不再隐式挑选编译器或 stdlib，避免与调用方/CI 的设置冲突。
 
 project(neuralnet.cpp VERSION 1.0.0 LANGUAGES CXX)
 
@@ -61,21 +49,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "App
     # （§7.2 兼容路径：f32 参考计算 + f16 舍入），抑制 -Wpass-failed 避免 -Werror 下编译失败
     add_compile_options(-Wno-pass-failed)
 endif()
-# ── C++ 标准库：显式 libstdc++（依据 报告.txt 2026-08-31 实测） ───────────
-# Linux 上 clang 默认即 libstdc++，显式声明是防止构建环境意外切到 libc++
-#（实测 libstdc++ 线程开销更小，内存带宽类原语更快：
-#  add_inplace 0.47 vs 0.67 ms、scale_inplace 0.11 vs 0.25 ms 等）。
-# 如需切到 libc++：-DNN_STDLIB=libc++（需系统装有 libc++）。
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
-   AND (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang"))
-    if(NOT DEFINED NN_STDLIB)
-        set(NN_STDLIB "libstdc++" CACHE STRING "C++ standard library for Clang: libstdc++ / libc++")
-    endif()
-    add_compile_options(-stdlib=${NN_STDLIB})
-    # 链接端必须同步同一 stdlib：否则编译与链接可能取不同 ABI，链接期出现大量
-    # std 符号未定义（历史 bug：编译 libstdc++、链接 libc++）。
-    add_link_options(-stdlib=${NN_STDLIB})
-endif()
+# C++ 标准库由编译器默认决定（见文件开头的说明），此处不再显式指定 -stdlib。
 find_program(CCACHE_FOUND ccache)
 if(CCACHE_FOUND)
     set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ccache)
