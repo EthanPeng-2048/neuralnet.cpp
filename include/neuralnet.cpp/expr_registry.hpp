@@ -67,9 +67,9 @@ struct ExprRegistry
 //            consts: count(u32) × Scalar
 //            rparams: count(u32) × Scalar   （v3 起支持运行时标量参数）
 //            matmul: has(u8=0/1)；1 时 {a_input(u8) b_input(u8) transA(u8)
-//                    transB(u8) k(u32)}
+//                    transB(u8) k(u32) batch(u32)}
 //  v2 起支持 matmul 段（v1 无 matmul，读 v1 等价 has=0）；v3 起支持 rparams。
-inline constexpr std::uint8_t kExprBinVersion = 4;  // v4：ExprView 增加 param2（RowAccess offset）
+inline constexpr std::uint8_t kExprBinVersion = 5;  // v5：MatmulSpec 补 batch（v4 及更早丢失该字段）
 
 [[nodiscard]] inline bool write_registry(const std::string& path,
                                          const ExprRegistry& reg)
@@ -116,6 +116,7 @@ inline constexpr std::uint8_t kExprBinVersion = 4;  // v4：ExprView 增加 para
                                        s.matmul->transA, s.matmul->transB };
             if (!write_pod_span(f, std::span(mbytes, 4))) return false;
             if (!write_pod(f, s.matmul->k)) return false;
+            if (!write_pod(f, s.matmul->batch)) return false;  // v5：batch 必须持久化
         }
     }
     return static_cast<bool>(f);
@@ -180,6 +181,7 @@ inline constexpr std::uint8_t kExprBinVersion = 4;  // v4：ExprView 增加 para
             mm.a_input = mbytes[0]; mm.b_input = mbytes[1];
             mm.transA  = mbytes[2]; mm.transB  = mbytes[3];
             if (!read_pod(f, mm.k)) return false;
+            if (!read_pod(f, mm.batch)) return false;  // v5：batch 必须读回
             s.matmul = mm;
         }
         out.add(s);
