@@ -2,8 +2,8 @@
 //  scan_exprs.cpp — AOT 算子融合：构建期表达式收集（dry-run）
 //
 //  用 CPU 引擎 + 假张量跑一遍相关 Layer 的 forward/backward，使每个
-//  dsl::compute / end_expr 在 NN_EXPR_SCAN 记录模式下把折叠出的 ExprSpec
-//  **结构**登记进全局注册表（按 expr_spec_key 去重），跑完 dump 成 bin。
+//  dsl::compute / compute_reduce / compute_into 在 NN_EXPR_SCAN 记录模式下把
+//  折叠出的 ExprSpec **结构**登记进全局注册表（按 expr_spec_key 去重），跑完 dump 成 bin。
 //
 //  表达式**文本只出现在 Layer**；这里只是"执行 Layer 代码路径"以触达它们，
 //  dump 出来的是派生物（结构），不是手写定义。
@@ -131,21 +131,6 @@ int main(int argc, char* argv[])
         (void)ln.forward(engine, input);
         nn::Tensor grad = nn::Tensor::cpu(F, B);
         (void)ln.backward(engine, grad);
-    }
-
-    // ── FusedChainLayer（IR-C：begin_expr/end_expr 图 IR 链式融合）────────
-    // forward 的三个逐元素表达式在 end_expr 时融合成单个 kernel（t/u 内联为
-    // 寄存器）。必须 dry-run 覆盖本路径：GPU 运行时 begin_expr/end_expr 融合
-    // 出的复合 spec 才能在 fused_registry 中命中（闭合世界两端一致）。
-    // backward 为独立表达式（非录制段），单独登记。
-    {
-        const std::size_t F = 8, B = 5;
-        nn::FusedChainLayer chain(F);
-        (void)chain.init(engine);
-        nn::Tensor input = nn::Tensor::cpu(F, B);
-        (void)chain.forward(engine, input);
-        nn::Tensor grad = nn::Tensor::cpu(F, B);
-        (void)chain.backward(engine, grad);
     }
 
     // ── ReLULinearAttention forward + backward（RLA 原语组合版逐元素链）──
@@ -283,8 +268,8 @@ int main(int argc, char* argv[])
     // ── 算子融合二期（docs/14 S1-S3）：matmul 参与 IR 融合 ───────────────
     // 结构 = Layer 内 dsl::matmul(A,B)+bias+relu 折叠后的派生物：
     //   前置 matmul 段（MatmulSpec）+ 尾逐元素链（Add + Max）。
-    // 这里直接构造折叠后的结构并登记（等价于 scan 模式下 end_expr 登记复合
-    // spec 的机制），保证 GPU 运行时同一结构命中 AOT 融合 shader（闭合世界）。
+    // 这里直接构造折叠后的结构并登记（与 dsl::compute 登记 spec 是同一机制），
+    // 保证 GPU 运行时同一结构命中 AOT 融合 shader（闭合世界）。
     //   - transA/transB 是结构 → 分别登记（4 种组合各一个 shader）
     //   - k（求和维度）是形状参数 → 不进 key：任取一个 K 登记，运行时任何 K
     //     都命中同一融合 shader（同 P2-13 的 RowMod/RotateHalf 处理）
@@ -427,6 +412,38 @@ int main(int argc, char* argv[])
         (void)conv.forward(engine, x);
         nn::Tensor grad = nn::Tensor::cpu(c_out * oh * ow, batch);
         (void)conv.backward(engine, grad);
+    }
+
+    // ── MaxPool2D forward + backward（窗口 mask 表达式）──────────────────
+    // forward : 全原语（im2col / col_reduce_max / rearrange_3d / gather），无 dsL 表达式
+    // backward: mask = select(窗口 == col_broadcast(窗口max), col_broadcast(grad), 0)
+    //           —— **必须 dry-run**：这是 Conv/Pool 引擎化后新增的结构，未覆盖时
+    //           GPU 运行到该表达式会因闭合世界未命中而硬报错。
+    {
+        const std::size_t c = 2, in_h = 6, in_w = 6, pool = 2, stride = 2, batch = 2;
+        nn::MaxPool2D mp(c, in_h, in_w, pool, stride);
+        const std::size_t oh = (in_h - pool) / stride + 1;
+        const std::size_t ow = (in_w - pool) / stride + 1;
+        nn::Tensor x = nn::Tensor::cpu(c * in_h * in_w, batch);
+        (void)mp.forward(engine, x);
+        nn::Tensor grad = nn::Tensor::cpu(c * oh * ow, batch);
+        (void)mp.backward(engine, grad);
+    }
+
+    // ── 归约表达式内联常量（push-constant 头长度回归）────────────────────
+    // `col_reduce_sum(select(cond, 1, 0))` 是**带常量池的归约**结构：GPU 侧
+    // push-constant 固定头长度必须按形态算（归约且无 matmul = 4 个 uint）。
+    // 历史 bug 曾按 5 个 uint 打包 → 常量池整体后移一个 uint → GPU 静默错值
+    // （CPU 正常）。fused_gpu_test 的 run_reduce_consts 做 CPU/GPU 对比覆盖。
+    {
+        const std::size_t kk = 4, cols = 3;
+        nn::Tensor x = nn::Tensor::cpu(kk, cols);
+        nn::Tensor mx = nn::Tensor::cpu(1, cols);
+        (void)nn::dsl::compute_reduce(engine,
+            nn::dsl::col_reduce_sum(nn::dsl::select(
+                nn::dsl::leaf(x) == nn::dsl::col_broadcast(mx),
+                nn::Scalar{1}, nn::Scalar{0})),
+            kk, cols);
     }
 
     auto& reg = nn::fused::global_registry();

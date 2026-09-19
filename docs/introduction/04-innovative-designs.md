@@ -101,7 +101,7 @@ key 定义在 **canonical（优化后）IR** 上，scan 与 runtime 两端必须
 ### 3.1 设计哲学
 
 **不手写任何命名算法 kernel**（如不手写 flash-attention、不手写 softmax kernel），而是：
-1. Layer 用 `eval_expr` / `begin_expr/end_expr` 录制表达算法；
+1. Layer 用 `dsl::compute` / `compute_reduce` / `compute_into`（GPU 上折叠为 `ExprSpec`）表达算法；
 2. 引擎/工具按**结构**合成融合 kernel；
 3. 所有中间 Tensor 由融合 kernel 内部消解，不落显存。
 
@@ -179,7 +179,7 @@ RoPE 的 `RowMod/RotateHalf` 参数如果以**结构常量**折进 key，每个 
 
 - **IR-A canonicalize**：DCE + 常量折叠 + 代数化简 + 稳定重编号（保守、不改变浮点语义）。
 - **IR-B CSE + 寄存器分配**：哈希指令去重，liveness 线性扫描确定性贪心分配寄存器。
-- **IR-C 图 IR + 融合分析**：`begin_expr/end_expr` 录制虚拟寄存器 DAG；**逐元素链拼接**——B 以 Linear 视图消费 A 输出且 A 无其他消费者、形状相同、均无归约 → 指令内联进 B，单 kernel。归约节点/归约输出作为融合边界。
+- **IR-C 图 IR + 融合分析**：~~`begin_expr/end_expr` 录制虚拟寄存器 DAG；逐元素链拼接~~ → **已评估并整体移除（2026-09-19）**：当前层集合里没有可安全融合的纯逐元素链（归约是硬边界、且需要融的层都要为 backward 缓存中间量），设计无收益点。取舍见 `docs/development/03-ir-optimization.md` §5.3。
 - **IR-D emitter 抽象**：`ExprEmitter` 接口 + 注册表，一份 canonical IR 产出 GLSL/CPU 多后端（验证"一份 IR 多后端"）。
 
 ### 6.3 关键不变量
@@ -193,8 +193,15 @@ canonicalize 不改变 views/inputs 的顺序与内容，只优化 instrs/consts
 围绕 GPT 训练峰值显存（29GB → 27GB，持续下探）的三条独立路径：
 
 ### L1 激活重计算（梯度检查点）
-- `Layer` 契约扩展 `recompute_supported / forward_recompute`；`GPTModel` 实现**块级检查点**（每 N 个 GPTBlock 存一次输入，backward 重算中间）。
-- 与全存基线**逐位一致（max_abs=0）**。
+- `Layer` 契约扩展 `recompute_supported / forward_recompute`；`GPTModel` 与 `RAPTModel` 均实现**块级检查点**（每 N 个 Block 存一次输入，backward 重算中间）。
+- 与全存基线**逐位一致（max_abs=0）**（`gpt_checkpoint_test` / `rapt_checkpoint_test`）。
+- 注意：复合层 override `forward_recompute` 时必须走**虚函数** `set_checkpoint_mode` 关闭子层——基类默认实现只改本块标志位，子层仍处 checkpoint 模式会导致缓存不重建、backward 误用上一 step 的陈旧缓存。
+
+### L1-offload（activation offload）
+- 通用 `ActivationOffloader`（`compute_layer_base.hpp`）把 `Layer::activation_cache()` 枚举的全部激活写入持久 host-visible slab（释放 device-local 显存），backward 前恢复；`GPTBlock` / `RAPTBlock` 共用同一实现，不再各写一份。
+- 与全存基线**逐位一致（max_abs=0）**（`gpt_offload_test` / `rapt_offload_test`，GPU-only）。
+- 与梯度检查点可共存：checkpoint 块走重算（不驻留），其余块走 offload（不重算）。
+- 仅 GPU 有意义：CPU 引擎的 `create_offload_buffer / offload_restore` 是 no-op，开启会得到 1×1 张量 → 不要对 CPU 引擎启用。
 
 ### L2 内存池整块归还 + 统计
 - `MemoryPool` 新增 `PoolStats` / `release_idle_blocks()`（整块 `vkFreeMemory`，带保留阈值防抖动）。

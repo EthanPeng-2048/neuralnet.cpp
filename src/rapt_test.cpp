@@ -1,6 +1,7 @@
 // ── rapt_test — RAPT (ReLU 线性注意力) 合并测试 ─────────────────────────────
-// 合并：rapt_gradcheck + rapt_smoke_test
-// 覆盖：数值梯度检查 / 端到端冒烟
+// 合并：rapt_gradcheck + rapt_smoke_test + rapt_checkpoint_test
+// 覆盖：数值梯度检查 / 端到端冒烟 / 梯度检查点一致性
+// （GPU 侧的 activation offload 见独立目标 rapt_offload_test）
 // ───────────────────────────────────────────────────────────────────────────
 
 #include <cstdio>
@@ -14,6 +15,10 @@
 #include "rapt_smoke_test.cpp"
 #undef main
 
+#define main test_rapt_checkpoint
+#include "rapt_checkpoint_test.cpp"
+#undef main
+
 int main(int argc, char* argv[])
 {
     int failures = 0;
@@ -23,6 +28,9 @@ int main(int argc, char* argv[])
 
     std::puts("=== rapt_smoke (build + spec roundtrip + loss) ===");
     failures += test_rapt_smoke(argc, argv);
+
+    std::puts("=== rapt_checkpoint (activation checkpointing) ===");
+    failures += test_rapt_checkpoint();
 
     std::printf("\nrapt_test: %d failure(s)\n", failures);
     return failures != 0 ? 1 : 0;

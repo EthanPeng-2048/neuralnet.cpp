@@ -1,6 +1,6 @@
 // ── expr_cpu_test — 表达式/IR 纯 CPU 合并测试 ──────────────────────────────
-// 合并：expr_dsl_test + expr_reduce_test + expr_matmul_test + expr_opt_test + expr_graph_test
-// 覆盖：DSL 编译期融合 / 归约语义 / matmul IR 融合 / 优化 pass / 图 IR 分析
+// 合并：expr_dsl_test + expr_reduce_test + expr_matmul_test + expr_opt_test
+// 覆盖：DSL 编译期融合 / 归约语义 / matmul IR 融合 / 优化 pass
 // ───────────────────────────────────────────────────────────────────────────
 
 #include <cstdio>
@@ -56,18 +56,6 @@
 #undef g_fail
 #undef main
 
-// ── expr_graph_test ────────────────────────────────────────────────────────
-#define main test_expr_graph
-#define g_fail g_fail_graph
-#define make_tensor make_tensor_graph
-#define test_determinism test_determinism_graph
-#undef CHECK
-#include "expr_graph_test.cpp"
-#undef test_determinism
-#undef make_tensor
-#undef g_fail
-#undef main
-
 int main()
 {
     int failures = 0;
@@ -83,9 +71,6 @@ int main()
 
     std::puts("=== expr_opt (canonicalize + CSE + regalloc) ===");
     failures += test_expr_opt();
-
-    std::puts("=== expr_graph (graph IR + fusion analysis) ===");
-    failures += test_expr_graph();
 
     std::printf("\nexpr_cpu_test: %d failure(s)\n", failures);
     return failures != 0 ? 1 : 0;

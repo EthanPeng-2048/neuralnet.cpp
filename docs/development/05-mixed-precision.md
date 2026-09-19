@@ -161,7 +161,7 @@ enum class Precision : uint8_t
 
 ### 6.1 Tensor（非模板，Q2）
 
-现状：`device_ + rows_/cols_ + virtual_tag_ + 每设备一个 shared_ptr 存储成员（互斥）`。
+现状：`device_ + rows_/cols_ + 每设备一个 shared_ptr 存储成员（互斥）`（曾有 `virtual_tag_`，已随 IR-C 于 2026-09-19 删除）。
 
 改造：
 
@@ -171,13 +171,13 @@ enum class Precision : uint8_t
 | `cpu_data_` | `shared_ptr<Matrix>` | `variant<shared_ptr<Matrix<F16>>, shared_ptr<Matrix<F32>>>`（Phase 1 两候选；未来加 f64 只加候选） |
 | `gpu_data_` | `shared_ptr<GpuTensor>` | `variant<shared_ptr<GpuTensor<F16>>, shared_ptr<GpuTensor<F32>>>` |
 | `cuda_data_` | （CUDA 后端已停用） | Phase 1 不动 |
-| 其余 | `device_` / `rows_` / `cols_` / `virtual_tag_` / 拷贝语义 | 不变（存储仍 shared_ptr 共享，廉价拷贝） |
+| 其余 | `device_` / `rows_` / `cols_` / 拷贝语义 | 不变（存储仍 shared_ptr 共享，廉价拷贝） |
 
 - `precision_` 即"激活候选"的标记，与 `device_` 共同唯一确定存储的有效类型。
 - **无裸指针**（铁律 2）：类型擦除用 `std::variant` of 类型化 `shared_ptr`，不做 `shared_ptr<void>` + 强转。
 - 访问器按 P 模板化：`Matrix<P>& cpu_matrix<P>()`，P 与 `precision_` 不符 → `NN_ASSERT`（编程错误）。
 - `TensorRef`（`reference_wrapper`）不变。
-- **图 IR 录制（`virtual_tag_`）与本文正交**：Phase 1 融合世界保持 f32（Q6），图 IR 逻辑零改动。
+- **图 IR 录制（原 `virtual_tag_`）与本文正交**：Phase 1 融合世界保持 f32（Q6）；该机制已于 2026-09-19 随 IR-C 删除，本文不受影响。
 
 ### 6.2 Matrix&lt;P&gt;（L1 代数层）
 
@@ -450,7 +450,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 ### 11.5 dsl / CPU 表达式
 
 - dsl 模板按 P 实例化（L1 代数层模板化后自然跟随）；F32 实例化 = 现状，F16 实例化 = §7.2 定义（无 f16 ISA 时逐元素 decode→f32→encode，**慢**）。
-- 融合 IR（`expr_spec` / `expr_opt` / `expr_graph`）Phase 1 不动；Phase 2 的 key 扩展在 §11.1。
+- 融合 IR（`expr_spec` / `expr_opt`）Phase 1 不动；Phase 2 的 key 扩展在 §11.1。（`expr_graph` / IR-C 已于 2026-09-19 删除）
 
 ### 11.6 Vulkan 细节
 

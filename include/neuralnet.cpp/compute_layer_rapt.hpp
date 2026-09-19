@@ -155,7 +155,7 @@ private:
     // 无学习参数（固定增益=1），符合极简原则。
     [[nodiscard]] Result<Tensor> rms_norm_forward_(
         ComputeEngine& engine, const Tensor& input,
-        std::size_t BH, std::size_t dk, std::size_t seq, Tensor& rms_inv_out)
+        std::size_t BH, std::size_t dk, std::size_t seq, Tensor* rms_inv_out)
     {
         const Scalar inv_dk = Scalar{1} / static_cast<Scalar>(dk);
         const Scalar eps = Scalar{1e-5};
@@ -163,7 +163,10 @@ private:
         if (!output.valid())
             return std::unexpected(Error{
                 "rms_norm_forward_: GPU 张量分配失败（显存不足或设备异常）"});
-        Matrix rms_mat(BH, seq);
+        // rms_inv_out == nullptr（checkpoint 模式）：不收集逐头 1/rms 缓存，
+        // backward 由 forward_recompute 重建；同时省掉 BH 次 GPU→CPU 下载。
+        Matrix rms_mat;
+        if (rms_inv_out) rms_mat = Matrix(BH, seq);
         for (std::size_t bh = 0; bh < BH; ++bh)
         {
             auto x = engine.slice_rows(input, bh * dk, dk);
@@ -180,19 +183,25 @@ private:
                 dsl::rsqrt(dsl::leaf(*s) * dsl::rparam(inv_dk) + dsl::rparam(eps)),
                 s->rows(), s->cols());
             if (!ri) return std::unexpected(ri.error());
-            auto ri_m = engine.to_matrix(*ri);
-            if (!ri_m) return std::unexpected(ri_m.error());
-            for (std::size_t t = 0; t < seq; ++t)
-                rms_mat.set_value_unchecked(bh, t, ri_m->at_unchecked(0, t));
+            if (rms_inv_out)
+            {
+                auto ri_m = engine.to_matrix(*ri);
+                if (!ri_m) return std::unexpected(ri_m.error());
+                for (std::size_t t = 0; t < seq; ++t)
+                    rms_mat.set_value_unchecked(bh, t, ri_m->at_unchecked(0, t));
+            }
             auto n = dsl::compute(engine,
                 dsl::leaf(*x) * dsl::col_broadcast(*ri), dk, seq);
             if (!n) return std::unexpected(n.error());
             auto ins = engine.insert_rows(output, bh * dk, *n);
             if (!ins) return std::unexpected(ins.error());
         }
-        auto ri_t = engine.from_matrix(rms_mat);
-        if (!ri_t) return std::unexpected(ri_t.error());
-        rms_inv_out = std::move(*ri_t);
+        if (rms_inv_out)
+        {
+            auto ri_t = engine.from_matrix(rms_mat);
+            if (!ri_t) return std::unexpected(ri_t.error());
+            *rms_inv_out = std::move(*ri_t);
+        }
         return output;
     }
 
@@ -340,6 +349,12 @@ public:
         if (Qp_cache_.valid()) r.emplace_back(Qp_cache_);
         if (Kp_cache_.valid()) r.emplace_back(Kp_cache_);
         if (V_re_cache_.valid()) r.emplace_back(V_re_cache_);
+        // RLA-2 的 RMSNorm 反向缓存（此前漏在 activation_cache 之外 → offload
+        // 无法覆盖它们；补齐后 offload 覆盖 backward 所需的全部激活）
+        if (Q_normed_cache_.valid()) r.emplace_back(Q_normed_cache_);
+        if (K_normed_cache_.valid()) r.emplace_back(K_normed_cache_);
+        if (Q_rms_inv_cache_.valid()) r.emplace_back(Q_rms_inv_cache_);
+        if (K_rms_inv_cache_.valid()) r.emplace_back(K_rms_inv_cache_);
         auto wq = w_q_.activation_cache(); r.insert(r.end(), wq.begin(), wq.end());
         auto wk = w_k_.activation_cache(); r.insert(r.end(), wk.begin(), wk.end());
         auto wv = w_v_.activation_cache(); r.insert(r.end(), wv.begin(), wv.end());
@@ -394,17 +409,19 @@ public:
 
         // RLA-2：RMSNorm on Q and K（per-head, dk blocks）
         // 稳定数值分布，减少神经元死亡，保持 ReLU 硬截断纯粹性（文档 22 §4.3）。
+        // checkpoint 模式：不驻留任何 backward 缓存，交由 forward_recompute 重建。
         {
             const std::size_t BHrms = batch * num_heads_;
-            Tensor Qn, Kn;
-            auto rq = rms_norm_forward_(engine, Q, BHrms, d_k_, seq, Q_rms_inv_cache_);
+            auto rq = rms_norm_forward_(engine, Q, BHrms, d_k_, seq,
+                                        checkpoint_mode_ ? nullptr : &Q_rms_inv_cache_);
             if (!rq) return std::unexpected(rq.error());
             Q = std::move(*rq);
-            Q_normed_cache_ = Q;
-            auto rk = rms_norm_forward_(engine, K, BHrms, d_k_, seq, K_rms_inv_cache_);
+            if (!checkpoint_mode_) Q_normed_cache_ = Q;
+            auto rk = rms_norm_forward_(engine, K, BHrms, d_k_, seq,
+                                        checkpoint_mode_ ? nullptr : &K_rms_inv_cache_);
             if (!rk) return std::unexpected(rk.error());
             K = std::move(*rk);
-            K_normed_cache_ = K;
+            if (!checkpoint_mode_) K_normed_cache_ = K;
         }
 
         // RoPE → ReLU（顺序必须：先旋转后截断，否则丢位置信息）
@@ -488,9 +505,13 @@ public:
             concat = std::move(out_t);
         }
 
-        Qp_cache_ = std::move(*Qp);
-        Kp_cache_ = std::move(*Kp);
-        V_re_cache_ = std::move(V);
+        // checkpoint 模式：backward 缓存全部不驻留（由 forward_recompute 重建）
+        if (!checkpoint_mode_)
+        {
+            Qp_cache_ = std::move(*Qp);
+            Kp_cache_ = std::move(*Kp);
+            V_re_cache_ = std::move(V);
+        }
         batch_cache_ = batch;
         seq_cache_   = seq;
 
@@ -516,6 +537,18 @@ public:
     [[nodiscard]] Result<Tensor> backward(
         ComputeEngine& engine, const Tensor& grad_output) override
     {
+        // 缓存前置校验：checkpoint 模式（尚未 forward_recompute）或 offload
+        // （尚未 import）下缓存为空，旧行为会把问题推到某个 matmul 里甚至算出
+        // 垃圾梯度；这里立刻返回明确错误。
+        if (seq_cache_ == 0 || batch_cache_ == 0 ||
+            !Qp_cache_.valid() || !Kp_cache_.valid() || !V_re_cache_.valid() ||
+            !Q_normed_cache_.valid() || !K_normed_cache_.valid() ||
+            !Q_rms_inv_cache_.valid() || !K_rms_inv_cache_.valid())
+        {
+            return std::unexpected(Error{
+                "ReLULinearAttention::backward: forward 缓存缺失"
+                "（checkpoint 模式需先 forward_recompute）"});
+        }
         const std::size_t seq = seq_cache_;
         const std::size_t batch = batch_cache_;
         const std::size_t H_dk = num_heads_ * d_k_;
@@ -769,10 +802,10 @@ public:
         // RLA-2：RMSNorm on Q and K（per-head, dk blocks）
         {
             Tensor dummy_ri;
-            auto rq = rms_norm_forward_(engine, Q, num_heads_, d_k_, 1, dummy_ri);
+            auto rq = rms_norm_forward_(engine, Q, num_heads_, d_k_, 1, &dummy_ri);
             if (!rq) return std::unexpected(rq.error());
             Q = std::move(*rq);
-            auto rk = rms_norm_forward_(engine, K, num_heads_, d_k_, 1, dummy_ri);
+            auto rk = rms_norm_forward_(engine, K, num_heads_, d_k_, 1, &dummy_ri);
             if (!rk) return std::unexpected(rk.error());
             K = std::move(*rk);
         }
@@ -846,6 +879,7 @@ private:
     ReLULinearAttention attn_;
     std::unique_ptr<Layer> norm2_;
     FeedForward ff_;
+    ActivationOffloader offloader_;   // L1-offload（与 GPTBlock 共用实现）
 
 public:
     RAPTBlock(std::size_t d_model, std::size_t num_heads, std::size_t d_ff,
@@ -910,6 +944,48 @@ public:
         norm2_->clear_cache(); ff_.clear_cache();
     }
 
+    // RAPTBlock 与 GPTBlock 一样是"重计算单元"。
+    [[nodiscard]] bool recompute_supported() const override { return true; }
+
+    // 重计算：必须走**虚函数** set_checkpoint_mode 关闭本块+子层的 checkpoint
+    // 模式（基类默认实现只改本块的标志位，子层仍处于 checkpoint 模式 →
+    // forward 不会重建子层缓存 → backward 要么报错、要么误用上一 step 的陈旧缓存）。
+    [[nodiscard]] Result<Tensor> forward_recompute(
+        ComputeEngine& engine, const Tensor& saved_input) override
+    {
+        set_checkpoint_mode(false);
+        auto r = forward(engine, saved_input);
+        set_checkpoint_mode(true);
+        return r;
+    }
+
+    // ── activation offload（L1-offload）────────────────────────────────
+    // 导出/导入本块 backward 所需的全部激活（attn + 两个 Norm + FFN）。
+    void set_offload_enabled(bool enabled) { offloader_.set_enabled(enabled); }
+    [[nodiscard]] bool offload_enabled() const noexcept { return offloader_.enabled(); }
+    [[nodiscard]] Result<void> export_activations(ComputeEngine& engine)
+    {
+        return offloader_.export_activations(engine, activation_cache());
+    }
+    [[nodiscard]] Result<void> import_activations(ComputeEngine& engine)
+    {
+        return offloader_.import_activations(engine);
+    }
+    [[nodiscard]] std::size_t offload_slab_bytes() const noexcept
+    {
+        return offloader_.slab_bytes();
+    }
+
+    std::vector<TensorRef> activation_cache() override
+    {
+        std::vector<TensorRef> r;
+        auto a = attn_.activation_cache(); r.insert(r.end(), a.begin(), a.end());
+        auto n1 = norm1_->activation_cache(); r.insert(r.end(), n1.begin(), n1.end());
+        auto n2 = norm2_->activation_cache(); r.insert(r.end(), n2.begin(), n2.end());
+        auto f = ff_.activation_cache(); r.insert(r.end(), f.begin(), f.end());
+        return r;
+    }
+
     // 文档感知：转发给内部 RLA-2 注意力（文档边界处重置运行态）
     void set_doc_ids(std::span<const std::size_t> ids) override
     {
@@ -945,6 +1021,12 @@ public:
     [[nodiscard]] Result<Tensor> backward(
         ComputeEngine& engine, const Tensor& grad_output) override
     {
+        // activation offload：从 host 恢复激活再反向（替代重计算）
+        if (offloader_.offloaded())
+        {
+            auto im = offloader_.import_activations(engine);
+            if (!im) return std::unexpected(im.error());
+        }
         auto grad_ff = ff_.backward(engine, grad_output);
         if (!grad_ff) return grad_ff;
         auto b_n2 = norm2_->backward(engine, *grad_ff);
@@ -1012,6 +1094,17 @@ private:
     Tensor stored_tokens_tensor_;
     std::size_t batch_size_ = 0;
     std::vector<std::size_t> doc_ids_;   // 文档感知：每位置文档 id（batch-major）
+
+    // batch 录制粒度：每隔 flush_interval_ 个块提交一次（0 = 不在块间 flush）
+    std::size_t flush_interval_ = 0;
+
+    // 梯度检查点（激活重计算 L1）：每隔 checkpoint_every_ 个块保存一次块输入，
+    // backward 时重算以省去驻留整层激活。0 = 不启用。
+    std::size_t checkpoint_every_ = 0;
+    std::vector<Tensor> checkpoint_inputs_;   // 各 checkpoint 块的输入 (d_model, batch*seq)
+
+    // activation offload（L1-offload）：把每块内部激活搬 host-visible，backward 拷回
+    bool activation_offload_ = false;
 
 public:
     RAPTModel(std::size_t vocab_size, std::size_t d_model, std::size_t seq_len,
@@ -1116,15 +1209,17 @@ public:
         lm_head_.set_checkpoint_mode(enabled);
     }
 
+    // 只释放 backward 中间激活（Layer::clear_cache 契约）。
+    // 注意：token_emb_ / grad_token_emb_ 是**模型参数**，绝不在此清理——
+    // 它们由 Model/optimizer 持有，清理会导致词嵌入被销毁。
+    // stored_tokens_tensor_ 是 backward 末尾 scatter_add_rows 的索引张量（GPTModel
+    // 同样保留），清理会让梯度写不回词嵌入表。
     void clear_cache() override
     {
-        token_emb_ = Tensor{};
-        grad_token_emb_ = Tensor{};
         for (auto& b : blocks_) b.clear_cache();
         ln_f_->clear_cache();
         lm_head_.clear_cache();
-        stored_tokens_tensor_ = Tensor{};
-        batch_size_ = 0;
+        checkpoint_inputs_.clear();
     }
 
     // 文档感知：记录 doc_ids，forward 时下发给各块（文档边界处重置 RLA-2 运行态）
@@ -1138,6 +1233,30 @@ public:
     void set_position_offset(std::size_t off)
     {
         for (auto& b : blocks_) b.set_position_offset(off);
+    }
+
+    // ── batch 录制粒度（防 TDR）：每 N 个块提交一次，0 = 不启用 ──
+    void set_flush_interval(std::size_t interval) override { flush_interval_ = interval; }
+    [[nodiscard]] std::size_t flush_interval() const noexcept { return flush_interval_; }
+
+    // ── 梯度检查点（激活重计算 L1）：每 N 个块保存一次块输入，0 = 不启用 ──
+    void set_checkpoint_every(std::size_t stride) override { checkpoint_every_ = stride; }
+    [[nodiscard]] std::size_t checkpoint_every() const noexcept { return checkpoint_every_; }
+
+    // ── activation offload（L1-offload）：把每块激活搬 host-visible ──
+    void set_activation_offload(bool enabled) override
+    {
+        activation_offload_ = enabled;
+        for (auto& b : blocks_) b.set_offload_enabled(enabled);
+    }
+    [[nodiscard]] bool activation_offload() const noexcept { return activation_offload_; }
+
+    // 实际 offload RAM 字节数：各块已创建 slab 大小之和（诊断用）
+    [[nodiscard]] std::size_t offload_ram_bytes() override
+    {
+        std::size_t total = 0;
+        for (auto& b : blocks_) total += b.offload_slab_bytes();
+        return total;
     }
 
     [[nodiscard]] Result<Tensor> forward(
@@ -1161,12 +1280,43 @@ public:
         if (!x_res) return std::unexpected(x_res.error());
         Tensor x = std::move(*x_res);
 
-        for (auto& b : blocks_)
+        checkpoint_inputs_.clear();
+        const bool ckpt = (checkpoint_every_ > 0);
+        for (std::size_t bi = 0; bi < blocks_.size(); ++bi)
         {
-            if (!doc_ids_.empty()) b.set_doc_ids(doc_ids_);
+            RAPTBlock& b = blocks_[bi];
+            // 无条件下发：空 span 也要清掉上一 step 的文档感知（否则跨 step 串扰）
+            b.set_doc_ids(doc_ids_);
+            // 梯度检查点：每 checkpoint_every_ 个块保存一次输入，该块以 checkpoint
+            // 模式 forward（不驻留中间激活），backward 时用保存的输入重算
+            if (ckpt && (bi % checkpoint_every_ == 0))
+            {
+                auto save = engine.clone(x);
+                if (!save) return std::unexpected(save.error());
+                checkpoint_inputs_.push_back(std::move(*save));
+                b.set_checkpoint_mode(true);
+            }
+            else
+            {
+                b.set_checkpoint_mode(false);
+            }
             auto r = b.forward(engine, x);
             if (!r) return r;
             x = std::move(*r);
+            // activation offload：forward 后把本块内部激活搬 host-visible（释放
+            // 显存）。checkpoint 块 forward 不驻留激活 → 无可导出内容，必须跳过。
+            if (activation_offload_ && !b.checkpoint_mode())
+            {
+                auto ex = b.export_activations(engine);
+                if (!ex) return std::unexpected(ex.error());
+            }
+            // 按间隔 flush，将大录制拆成多个小提交（防 TDR）
+            if (flush_interval_ > 0 && (bi + 1) % flush_interval_ == 0
+                && bi + 1 < blocks_.size())
+            {
+                auto fr = engine.flush_batch();
+                if (!fr) return std::unexpected(fr.error());
+            }
         }
         auto ln = ln_f_->forward(engine, x);
         if (!ln) return ln;
@@ -1185,12 +1335,35 @@ public:
         if (!b_ln) return b_ln;
         Tensor grad_x = std::move(*b_ln);
 
-        for (std::size_t i = blocks_.size(); i-- > 0;)
+        const std::size_t n = blocks_.size();
+        for (std::size_t bi = 0; bi < n; ++bi)
         {
-            auto br = blocks_[i].backward(engine, grad_x);
-            if (!br) return br;
+            const std::size_t idx = n - 1 - bi;
+            // 梯度检查点：checkpoint 块先用保存的输入重算 forward 重建缓存，再反向
+            if (checkpoint_every_ > 0 && (idx % checkpoint_every_ == 0))
+            {
+                const std::size_t seg = idx / checkpoint_every_;
+                NN_ASSERT(seg < checkpoint_inputs_.size(),
+                          "RAPTModel backward: checkpoint input missing");
+                auto cr = blocks_[idx].forward_recompute(engine, checkpoint_inputs_[seg]);
+                if (!cr) return cr;
+            }
+            auto br = blocks_[idx].backward(engine, grad_x);
+            if (!br)
+                return std::unexpected(Error{
+                    "RAPTModel::backward: block " + std::to_string(idx) + " failed: "
+                    + br.error().message});
             grad_x = std::move(*br);
+            // 重算/恢复出来的激活用后即释放，避免跨块累积（否则抵消省显存收益）
+            if (checkpoint_every_ > 0 || activation_offload_)
+                blocks_[idx].clear_cache();
+            if (flush_interval_ > 0 && (bi + 1) % flush_interval_ == 0 && bi + 1 < n)
+            {
+                auto fr = engine.flush_batch();
+                if (!fr) return std::unexpected(fr.error());
+            }
         }
+        checkpoint_inputs_.clear();
 
         auto grad_T = engine.transpose(grad_x);
         if (!grad_T) return std::unexpected(grad_T.error());

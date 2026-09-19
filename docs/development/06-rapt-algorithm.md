@@ -454,3 +454,27 @@ s_ti = q_t^φ · k_i^φ = Σ_{j=1..d_φ} q_{t,j}^φ k_{i,j}^φ  ≥ 0
 - **工程层**：RAPT 引擎化给出 GPU 落地范式（3 个扫描原语 + Layer 组合 + shader 纯数据流）。
 
 在项目实现中以 RAPT（结合 §3 的引擎化扫描原语与 §4 的两趟式 AOT 融合管线）作为当前工程基线。
+
+---
+
+## 8. 训练期显存：激活重计算与 offload（2026-09-19 补齐）
+
+RAPT 此前只实现了前向/反向的正确性，训练期显存控制缺失：`RAPTModel` 没有 override `set_checkpoint_every` / `set_activation_offload` / `set_flush_interval`，而 `text_train` 对**所有**架构都会调用它们并打印"已启用" → 开关静默失效（ZiPT 至少会 abort 报错，RAPT 连报错都没有）。现已补齐，与 GPT 同档：
+
+| 能力 | 入口 | 实现要点 |
+|------|------|----------|
+| 梯度检查点（激活重计算） | `RAPTModel::set_checkpoint_every(N)` | 每 N 个 RAPTBlock 存一次块输入；backward 先 `forward_recompute` 再反向，用后 `clear_cache()` |
+| activation offload | `RAPTModel::set_activation_offload(true)` | 通用 `ActivationOffloader`（`compute_layer_base.hpp`，与 GPTBlock 共用）把 `activation_cache()` 的激活搬 host-visible |
+| batch flush | `RAPTModel::set_flush_interval(N)` | 每 N 个块 `flush_batch()`，拆小录制防 TDR |
+
+`ReLULinearAttention` 在 checkpoint 模式下不写入任何 backward 缓存（Qp/Kp/V_re/Q_normed/K_normed/逐头 1/rms），只保留按尺寸复用的 `V_ones/e_0` 辅助缓冲；`backward` 在缓存不全时直接报错，而不是拿空/陈旧张量算梯度。`activation_cache()` 补齐了此前遗漏的 `Q_normed/K_normed/Q_rms_inv/K_rms_inv` 四项（否则 offload 会漏搬）。
+
+**为什么 RLA 的重算特别划算**：RLA 前向是 O(L·d_k²)，GPT 注意力重算含 QK^T 是 O(L²)——同一 `stride` 下 RLA 的重算代价约为 GPT 的 1/L。因此对 RAPT **优先用检查点**，offload 次之（PCIe 搬运量与 GPT 相当，但重算更便宜）。
+
+**验收**：`rapt_test` 内含 `rapt_checkpoint`（stride∈{1,2} vs 全存基线逐位一致，max_abs=0）；`rapt_offload_test`（GPU-only）同样逐位一致。
+
+**已修的两个前置缺陷**（不修则上述管线会静默毁模型）：
+1. `RAPTModel::clear_cache()` 曾清空 `token_emb_` / `grad_token_emb_`（**模型参数**）；检查点每块 backward 后都要调 `clear_cache`，等于毁掉词嵌入。
+2. `RAPTModel::forward` 曾只在 `doc_ids` 非空时下发文档 id → `set_doc_ids({})` 关不掉文档感知，跨 step 切换数据集时残留边界重置（跨样本串扰）。
+
+**坑（务必记住）**：复合层 override `forward_recompute` 时必须调用**虚函数** `set_checkpoint_mode` 来关闭子层。基类 `Layer::forward_recompute` 的默认实现只改本块的 `checkpoint_mode_`，子层仍处 checkpoint 模式 → forward 不重建子层缓存 → backward 要么报 matmul shape 错，要么（更坏）误用上一轮 forward 的陈旧缓存，表现为"stride=1 能过、stride=2 过不了"这类诡异现象。

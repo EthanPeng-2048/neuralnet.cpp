@@ -1,7 +1,7 @@
 # IR 优化（IR Optimization）—— 为融合算子引入中间表示
 
 > 目标：在**不推翻现有 AOT 闭合世界**的前提下，把 `ExprSpec` 从"直通轻量 IR"演进为带优化 pass 的规范 IR，分阶段提升开发便利与代码质量。
-> 状态：**IR-A（canonicalize：DCE/常量折叠/代数化简/稳定重编号）+ IR-B（CSE + 寄存器分配 liveness）已实施（2026-08-23）**；**IR-C（图 IR + begin_expr/end_expr 融合分析）已实施（基础版：逐元素链拼接，2026-08-24，含 08-26 中间张量消除增强）**；**IR-D（后端 emitter 抽象）已实施（2026-08-24）**；IR-C 进阶（多输入 DAG 融合 / 跨 kernel 自动融合）待立项。
+> 状态：**IR-A（canonicalize：DCE/常量折叠/代数化简/稳定重编号）+ IR-B（CSE + 寄存器分配 liveness）已实施（2026-08-23）**；**IR-D（后端 emitter 抽象）已实施（2026-08-24）**；**IR-C（图 IR + `begin_expr/end_expr` 融合分析，基础版 2026-08-24 实施）已于 2026-09-19 整体移除**——因归约边界 + backward 缓存逃逸，当前层集合里无处可安全接入（详见 §5.3）。
 > 关联文档：`../development/02-operator-fusion.md`（算子融合）、`DEVELOPMENT_STANDARDS.md`（分层铁律）、`../08-pitfalls-and-lessons.md`。
 
 ## 目录
@@ -36,7 +36,7 @@ Layer 内联表达式 → to_expr_spec 折叠 → ExprSpec → glsl_gen → GLSL
 2. **无死代码消除、无常量折叠、无代数化简**，shader 携带冗余计算。
 3. **无寄存器分配**，`num_regs` 线性增长，受 `EXPR_MAX_REGS=16` 约束。
 4. **后端耦合**：`glsl_gen` 为 GLSL 专用，无法"一份 IR 多后端"（CUDA 已停用，目标为 GLSL/CPU 双 emitter）。
-5. **无融合分析**：`begin_expr/end_expr` 规划的多表达式融合因缺图 IR 未落地。
+5. **跨表达式融合曾无落地形态**：`begin_expr/end_expr` 规划的多表达式融合经图 IR（IR-C）实现后，因归约边界与 backward 缓存逃逸而**无生产调用方**，已于 2026-09-19 移除（§5.3）。
 
 本文给出一个**分阶段**引入 IR 优化的设计，核心约束是**不破坏闭合世界的确定性 key 匹配**。
 
@@ -63,7 +63,7 @@ IR 属于"引擎/工具内部"，**完全落在红线允许区**，且强化"引
 2. **可优化性**：提供确定性优化 pass（DCE、常量折叠、CSE、寄存器分配、代数化简）。
 3. **闭合世界兼容**：key 定义在 **canonical（优化后）IR** 上，scan 与 runtime 两端一致。
 4. **跨后端**：IR → 多 emitter（GLSL / CPU），可选扩展。
-5. **可扩展为图 IR**：为 `begin_expr/end_expr` 融合分析预留 DAG 演进路径。
+5. **可扩展性**：IR 保持"单表达式"形态；跨表达式融合（图 IR）已评估并**明确不采用**（§5.3），如需重提须先制造出可安全融合的层。
 
 ---
 
@@ -130,40 +130,44 @@ expr_spec_key(spec) ≡ expr_spec_key(canonicalize_expr_spec(spec))
 
 CSE 需处理 `Input/Const/Reduce` 操作数的等价性（视图相同 + 输入相同 + 常量相同才等价）。归约指令的 CSE 需保证归约槽语义一致。
 
-### 5.3 阶段 C：图 IR（已实施基础版）
+### 5.3 阶段 C：图 IR —— 已评估并移除（2026-09-19）
 
-为支撑 `begin_expr/end_expr` 融合分析，把扁平 IR 演进为**图 IR**（`expr_graph.hpp`）：
+阶段 C 的落地形态是：`expr_graph.hpp`（`ExprGraph` / `fuse_expr_graph` / `recording_graph_owner`
+/ 图级缓存）+ `ComputeEngine::begin_expr/end_expr` 显式录制 API + `dsl::start_expr/end_expr`
+（`ExprBlock`）+ 演示层 `FusedChainLayer`，基础版于 2026-08-24 实施、08-26 增补中间张量消除。
 
-```mermaid
-graph TD
-    A[ExprSpec A] -->|小中间量| B[ExprSpec B]
-    A --> C[ExprSpec C]
-    B --> D[ExprSpec D]
-    C --> D
-```
+**2026-09-19 决定：不接线，整体删除。** 依据（逐条经代码核对）：
 
-- 节点 = 表达式/虚拟寄存器，边 = 依赖。
-- **融合边界决策**：小中间量（每行/每列标量的归约结果）→ 留寄存器/共享内存；大张量 → spill 到内存作为下一 kernel 输入。
-- **kernel 序列产出**：DAG 分层 → 每层一个融合 kernel。
-- **key 语义扩展**：从"单表达式结构"变为"kernel 图结构"，`expr_registry` 序列化格式需兼容/迁移。
+1. **归约是硬边界**。`fuse_expr_graph` 只拼接**纯逐元素链**（两节点均无归约、同形状、
+   tail 恰好一个消费者且以 Linear 视图消费）。而 LayerNorm/RMSNorm 的前向是
+   "`col_reduce` → 逐元素 → `col_reduce`"、Softmax 是 "`row_max`/`row_sum` → 逐元素"、
+   Attention 的 m/l/W 同理——**需要融合的层恰好都以归约为骨架**，融合在这里立即中断。
+2. **backward 缓存逃逸**。融合要求"tail 只有一个消费者"，但它要融的层恰恰都要为 backward
+   缓存中间量（`LayerNorm::normalized_cache_`、`RMSNorm::normed_cache_`、
+   `GPTBlock::residual2_cache_`、Attention `W_re`）——**缓存就是图外的第二个消费者**，
+   而录制图看不见它。要让它看见，需要 Tensor 拷贝钩子做逃逸检测 + 自动作用域 +
+   ~22 个 flush 点 + `Layer::forward` 非虚壳（26+26 处），成本远高于收益。
+3. **能融的地方早已被写成单个表达式**。GeLU/SwiGLU/ReLU/Softmax/RoPE/掩码本就各是一个
+   `dsl::compute`（单个 AOT 融合 kernel，只有 input/output 落显存）；当前层集合里
+   **不存在"写不进一行"的纯逐元素链**。
+4. **CPU 零收益**。`CpuEngine` 的 begin/end 本身是 no-op（融合是纯 GPU 优化）。
+5. **无生产调用方 → 悬空设计**。唯一使用方是演示层 `FusedChainLayer`（任何模型工厂都不用它）
+   + `scan_exprs` dry-run + 两个测试。设计与实现完整却无人使用，是负资产。
 
-> **进阶方向**（多消费者 DAG / 跨 kernel 自动融合）建议在确有需求时再投入。
+**删除项**：`expr_graph.hpp`、`ComputeEngine::begin_expr/end_expr` 及其 CPU/GPU 实现、
+`dsl::start_expr/end_expr`（`ExprBlock`）、`FusedChainLayer`、`Tensor::virtual_tag_`、
+`GpuEngine::execute_fused_graph` 与图级计划缓存，以及 `expr_graph_test` / `expr_fuse_test`
+与 scan 的 `FusedChainLayer` dry-run 段。
 
-### 实施记录（IR-C 图结构）
+**保留项**：`run_fused_gpu` 的 `output_override` 参数——它现在服务于 `dsl::compute_into`
+（原地目标传递，零分配/零拷贝），与图 IR 无关。
 
-- 图结构：`ExprGraphNode{ spec(canonical), rows/cols, vector_out, dep_of_input, input_tensors }` + `ExprGraph`；`add_node` 录制（依赖识别基于 Tensor 的 `virtual_tag`，占位 Tensor 标记前序节点输出）。
-- 融合分析 `fuse_expr_graph`：贪心按节点序维护"当前 kernel"；**逐元素链拼接**——B 以 Linear 视图消费 A 的输出且 A 无其他消费者、形状相同、均无归约 → 把 A 的指令内联进 B（A 输出寄存器作为 B 的操作数），中间结果不落显存、单 kernel dispatch。拼接后 canonicalize + validate；超限/非法 → 保守放弃融合（各自成 kernel）。归约节点/归约输出作为融合边界。
-- `Tensor` 增加 `virtual_tag`（0=非节点输出；reshape 保留）。
-- **引擎接入**：`GpuEngine::begin_expr/end_expr` 录制 → `end_expr` 融合执行（每 kernel 一次 AOT dispatch，输出写入末尾节点占位 buffer——`run_fused_gpu` 新增 `output_override` 参数复用占位）；`CpuEngine` 在 `NN_EXPR_SCAN` 下 begin/end 录制并登记融合后的复合 spec；`dsl::compute/compute_reduce` 的 scan 分支在录制段内加入录制图。
+**重新立项的前提**（写清是为了避免"再设计一次却仍不接线"）：出现或写出这样一条链——
+**纯逐元素、同形状、中间量不必为 backward 保留、且长到单个 `dsl::compute` 写不下**。
+届时按"逃逸检测 + 自动作用域 + 自动 flush"实现，而不是复活显式录制 API。
 
-**关键坑**：
-1. 拼接时 B 的常量池必须追加在 A 之后（否则 Const 引用越界，canonicalize 产出垃圾索引）。
-2. 录制段内单个表达式**不单独登记**（被融合进复合 spec），闭合世界要求 scan dry-run 覆盖录制段内所有可能的融合组合（含 backward）。
-3. 中间量不逃逸是融合语义约束（如 LayerNorm/RMSNorm 的 cache 中间结果不可包进 begin/end 段）。
+### 实施记录（批内上传免 flush，与图 IR 无关，保留）
 
-### 实施记录（IR-C 中间张量消除增强 + 批内上传免 flush）
-
-- **IR 中间张量消除（P1）**：`GpuEngine::execute_fused_graph` 在融合分析后计算需保留占位 buffer 的节点集合（各 kernel 的 tail + 输入源/融合边界），dispatch 完成后**释放被融合进其他 kernel 的中间节点占位 buffer**（其输出已内联为寄存器，占位 buffer 从未被写入，纯浪费显存）。例：`FusedChainLayer` 3 节点融合成单 kernel 后，node 0/1 的全尺寸 buffer 立即归还内存池，只保留 tail node 2。安全依据：被融合节点的占位 Tensor 只被 `g.node_outputs` 持有（Layer 侧局部变量已析构），erase 后 shared_ptr 归零即归还。
 - **批内上传免 flush（P2）**：`GpuEngine::from_matrix` 移除 batch 模式下的强制 `end_batch → begin_batch`。安全依据：`from_matrix` 总是新建 GpuTensor，`upload_blocking` 独立提交 + 等待完成，新 buffer 未被正在录制的 batch 引用，独立上传提交先于 batch（队列 FIFO）。`to_matrix` / `copy_from` 仍须 flush（前者读 batch 中刚写的 buffer、后者写 batch 已引用的既有 dst）。
 
 ---
@@ -190,7 +194,7 @@ IR → GlslEmitter / CpuEmitter
 |--------|------|--------|------|------|
 | **IR-A** | 确立 ExprSpec 为 IR 规范 + `canonicalize_expr_spec`（DCE/常量折叠/稳定排序）+ 接入 key | 小（1–2天） | 低 | DCE/常量折叠、确定性地基 |
 | **IR-B** | CSE + 寄存器分配（liveness） | 中（3–5天） | 中 | 缓解超限拆表达式 |
-| **IR-C** | 图 IR + `begin_expr/end_expr` 融合分析（基础版已实施） | 大（1–2周） | 高 | 多表达式自动融合 |
+| **IR-C** | 图 IR + `begin_expr/end_expr` 融合分析 | 大（1–2周） | 高 | **已评估并移除**（归约边界 + 缓存逃逸，无收益点，§5.3） |
 | **IR-D** | 后端 emitter 抽象（GLSL/CPU，已实施） | 中（3–5天） | 中 | 一份 IR 多后端 |
 
 ### 实施记录（2026-08-23，IR-A + IR-B 已完成）
@@ -222,7 +226,9 @@ canonicalization 与优化 pass 的验证重点：
 | 目标 | 状态 |
 |------|------|
 | 轻量 IR + 优化（IR-A + IR-B） | 已实施 |
-| 完整 IR + 图 IR 融合分析（A+B+C） | 基础版已实施 |
-| + 后端 emitter（+D） | 已实施（GLSL/CPU） |
+| 图 IR 融合分析（C） | **已评估并移除**（§5.3） |
+| + 后端 emitter（D） | 已实施（GLSL；CPU emitter 已删） |
 
-最大成本集中在**阶段 C（图 IR）**与**确定性 key 验证**。现有 `ExprSpec` 已是合格轻量 IR，直通、简单、确定性是其最大优点，建议以"小步演进、不推翻"为原则推进。
+最大成本集中在**确定性 key 验证**。现有 `ExprSpec` 已是合格轻量 IR，直通、简单、确定性是其最大优点；
+IR-C 的教训是**"设计完整度不等于价值"**——一个没有生产调用方的优化层，即使实现了也是负资产。
+后续演进建议以"小步演进、不推翻、有真实调用方"为原则推进。

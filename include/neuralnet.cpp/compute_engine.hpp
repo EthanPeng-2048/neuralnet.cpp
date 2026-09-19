@@ -99,18 +99,6 @@ public:
     [[nodiscard]] virtual Result<void> begin_batch() = 0;
     [[nodiscard]] virtual Result<void> end_batch() = 0;
 
-    // ── 表达式录制（计算级融合，M2 框架） ───────────────────────────────
-    // begin_expr 进入录制；期间 Layer 调 eval_expr / 组合原语；
-    // end_expr 时引擎做融合分析，将可融合子序列合成单 kernel。
-    //
-    // M2 现状（地基）：
-    //   - CPU 引擎：no-op（各表达式直接求值，行为不变）。
-    //   - GPU 引擎：no-op（各原语正常 dispatch；录制融合分析在 M3 落地，
-    //     届时 begin/end 之间的小中间量/逐元素链并入单 kernel）。
-    // Layer 可先行用 begin_expr/end_expr 包住算法段落，语义不变。
-    [[nodiscard]] virtual Result<void> begin_expr() = 0;
-    [[nodiscard]] virtual Result<void> end_expr() = 0;
-
     // ── 批处理中点刷新（防 TDR） ─────────────────────────────────────────
     // GPU 引擎：提交当前 command buffer 并等待完成，然后自动开始新的录制。
     // 可在 forward 与 backward 之间调用，将一次大提交拆分为多次小提交，
@@ -143,9 +131,9 @@ public:
     }
 
     // ── activation offload slab（L1-offload，持久复用缓冲） ────────────
-    // 每个 GPTBlock 持有一块持久 host-visible slab，所有激活按 float 偏移
-    // 写入/读出，跨 step 复用 → RAM = 激活实际体积（避免每 tensor 独立
-    // 128MB 块导致的碎片膨胀）。CPU 引擎 no-op。
+    // 每个 GPTBlock / RAPTBlock 持有一块持久 host-visible slab，所有激活按
+    // float 偏移写入/读出，跨 step 复用 → RAM = 激活实际体积（避免每 tensor
+    // 独立 128MB 块导致的碎片膨胀）。CPU 引擎 no-op（开启只会得到 1×1 张量）。
     [[nodiscard]] virtual Result<Tensor> create_offload_buffer(std::size_t /*bytes*/)
     {
         return Tensor::cpu(1, 1);
@@ -284,6 +272,37 @@ public:
     // ── 矩阵转置：A (R, C) → out (C, R) ──
     // 纯 layout 操作，零算法语义。用于 embedding 列布局转换等场景。
     [[nodiscard]] virtual Result<Tensor> transpose(const Tensor& A) = 0;
+
+    // ── 卷积/池化窗口展开原语（op-level 数据搬运，零算法语义）─────────────
+    // im2col：把 (C, H, W) 输入按滑动窗展开成 GEMM 的列矩阵。
+    //   x:   (C*H*W, B)
+    //   out: (C*k*k, B*OH*OW)
+    //   out[(ci*k + kh)*k + kw, (oh*OW + ow)*B + b]
+    //       = x[ci*H*W + (oh*stride + kh - pad)*W + (ow*stride + kw - pad), b]
+    //   越界（padding 区）取 0。OH/OW 由调用方按 (H + 2*pad - k)/stride + 1 给出。
+    //   **列序为「位置优先」(oh, ow, b)**：这样 Layer 只需 rearrange_3d + gather_rows
+    //   各一次即可完成 (C, B*P) → (C*P, B) 的 samples 布局转换。
+    // 用途：Conv2D 把卷积变成 matmul（W × col）；MaxPool2D 展开窗口后做列归约
+    //   （取 k=pool, stride=stride, pad=0）。
+    [[nodiscard]] virtual Result<Tensor> im2col(
+        const Tensor& x,
+        std::size_t C, std::size_t H, std::size_t W,
+        std::size_t k, std::size_t stride, std::size_t pad,
+        std::size_t OH, std::size_t OW) = 0;
+
+    // col2im：im2col 的伴随（adjoint / 反向散射）。
+    //   col: (C*k*k, B*OH*OW) → out: (C*H*W, B)
+    //   out[ci*H*W + ih*W + iw, b]
+    //       = Σ_{kh,kw} col[(ci*k + kh)*k + kw, (oh*OW + ow)*B + b]
+    //   其中 oh = (ih + pad - kh)/stride（须整除且落在 [0, OH)），ow 同理。
+    //   **重叠窗口（stride < k）的贡献在此累加**；每个输出元素由单个线程/循环
+    //   完整求和，故无需原子操作/预清零。
+    [[nodiscard]] virtual Result<Tensor> col2im(
+        const Tensor& col,
+        std::size_t C, std::size_t H, std::size_t W,
+        std::size_t k, std::size_t stride, std::size_t pad,
+        std::size_t OH, std::size_t OW) = 0;
+
     // ══════════════════════════════════════════════════════════════════════
     // 矩阵级原语
     // ══════════════════════════════════════════════════════════════════════
@@ -453,6 +472,18 @@ public:
     // 按列求最大值：A (rows, cols) → out (1, cols)
     // out[c] = max_r A[r][c]
     [[nodiscard]] virtual Result<Tensor> col_reduce_max(const Tensor& A) = 0;
+
+    // ── 分组归约（segmented reduce，沿行方向按固定长度分组）───────────────
+    // 与 row/col_reduce 的区别：归约轴不是"整行/整列"，而是**每连续 R 行为一组**。
+    //   x: (G*R, N) → out: (G, N)
+    //   grouped_reduce_sum: out[g, n] = Σ_{i<R} x[g*R + i, n]
+    //   grouped_reduce_max: out[g, n] = max_i  x[g*R + i, n]
+    // 用途：把"逐通道/逐头一次 dispatch"的层内循环压成**单次**原语调用
+    //   （池化窗口归约、多头分组统计、分组归一化等）。
+    [[nodiscard]] virtual Result<Tensor> grouped_reduce_sum(
+        const Tensor& x, std::size_t G, std::size_t R) = 0;
+    [[nodiscard]] virtual Result<Tensor> grouped_reduce_max(
+        const Tensor& x, std::size_t G, std::size_t R) = 0;
 
     // ══════════════════════════════════════════════════════════════════════
     // 广播原语

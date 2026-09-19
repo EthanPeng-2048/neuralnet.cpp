@@ -1,0 +1,54 @@
+// ── group_reduce.comp ─────────────────────────────────────────────────────
+// 分组归约原语（segmented reduction，沿行方向按固定长度 R 分组）
+//
+//   x (G*R, N) → out (G, N)
+//   reduce_op=0 (sum): out[g][n] = Σ_{i<R} x[g*R + i][n]
+//   reduce_op=1 (max): out[g][n] = max_i  x[g*R + i][n]
+//
+// 与 reduce.comp 的区别：归约轴不是整行/整列，而是每连续 R 行一组。
+// 用途：池化窗口归约、多头分组统计等 —— 把"逐通道一次 dispatch"压成单次。
+//
+// 绑定布局：
+//   binding 0: 输入 x   (readonly,  G*R × N)
+//   binding 1: 输出 out (writeonly, G × N)
+//
+// Push Constants（16 bytes）：
+//   uint G, uint R, uint N, uint reduce_op
+//
+// Dispatch：(ceil(G*N/256), 1, 1) —— 每线程一个输出元素，沿 R 串行累加；
+//   线程在组内相邻（n 连续）→ 同一行的读地址连续、可合并访问。
+//   （R 很大时若需要可再改工作组并行版；当前用途 R = 池化窗口/头数，较小。）
+// ─────────────────────────────────────────────────────────────────────────
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufIn  { float in_data[];  };
+layout(std430, binding = 1) writeonly buffer BufOut { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint G;
+    uint R;
+    uint N;
+    uint reduce_op;
+};
+
+void main()
+{
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= G * N) return;
+
+    const uint g = idx / N;
+    const uint n = idx % N;
+    const bool is_max = (reduce_op == 1u);
+
+    float acc = is_max ? uintBitsToFloat(0xff800000u) : 0.0;   // -inf : 0
+    const uint base = g * R * N + n;
+    for (uint i = 0u; i < R; ++i)
+    {
+        const float v = in_data[base + i * N];
+        acc = is_max ? max(acc, v) : (acc + v);
+    }
+    out_data[idx] = acc;
+}

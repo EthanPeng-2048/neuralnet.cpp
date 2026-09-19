@@ -71,7 +71,7 @@ graph LR
         D[CrossEntropyLoss] -->|组合原语| E
     end
     subgraph Eng[ComputeEngine（op-level 原语）]
-        E[eval_expr / begin_expr..end_expr / DSL（含 matmul 段）]
+        E[eval_expr / DSL（compute / compute_reduce / compute_into，含 matmul 段）]
         F[CPU 实现]
         G[GPU 实现 + 融合 shader]
     end
@@ -79,7 +79,7 @@ graph LR
     G -->|结构 key| I[scan_exprs + gen_fused 闭合世界]
 ```
 
-**核心机制**：Layer 用现有 `eval_expr` + 录制 `begin_expr/end_expr`（二期后统一到 DSL 的 `dsl::compute`）表达算法；引擎/工具按**结构**合成融合 kernel。所有中间 Tensor 由融合 kernel 内部消解，不落 VRAM。一期依赖手写融合原语承载两趟注意力/稀疏 CE；二期把这些结构降级为 IR 表达，让 `glsl_gen` 从 IR 结构统一合成。
+**核心机制**：Layer 用 `dsl::compute` / `compute_reduce` / `compute_into`（GPU 上折叠为 `ExprSpec`）表达算法；引擎/工具按**结构**合成融合 kernel。所有中间 Tensor 由融合 kernel 内部消解，不落 VRAM。一期依赖手写融合原语承载两趟注意力/稀疏 CE；二期把这些结构降级为 IR 表达，让 `glsl_gen` 从 IR 结构统一合成。**"跨表达式融合"曾被设计为 IR-C（`begin_expr/end_expr` 录制图），因无收益点已于 2026-09-19 移除，见 §表达式录制与融合边界（已移除）。**
 
 ---
 
@@ -150,30 +150,28 @@ struct MatmulSpec {
 
 ---
 
-## 表达式录制与融合边界
+## 表达式录制与融合边界（已移除）
 
-一期用 `begin_expr/end_expr` 作为"计算级融合"入口（`begin_batch/end_batch` 是提交级）：
+> **状态（2026-09-19）：本节描述的显式录制 API 已全部删除。** 保留本节是为了记录"曾经这样设计过、
+> 为什么不用"——设计完整度不等于价值。完整取舍依据见 `03-ir-optimization.md` §5.3。
 
-```cpp
-// 表达式录制（计算级融合）：
-//   begin_expr 进入录制；期间 Layer 调 eval_expr / 组合原语；
-//   end_expr 时引擎做融合分析，将可融合子序列合成单 kernel。
-//   CPU 引擎：begin/end 为 no-op（各表达式直接求值）。
-//   GPU 引擎：录制结构 → 融合 → dispatch；闭合世界，未命中硬报错。
-[[nodiscard]] virtual Result<void> begin_expr() = 0;
-[[nodiscard]] virtual Result<void> end_expr() = 0;
-```
+一期曾用 `begin_expr/end_expr` 作为"计算级融合"入口（`begin_batch/end_batch` 是提交级）：`begin_expr`
+进入录制、`end_expr` 做融合分析（构建虚拟寄存器 DAG + 判定融合边界）——小中间量留寄存器、逐元素链
+并入同一 kernel、大张量 spill 成下一 kernel 输入。CPU 端为 no-op。
 
-录制期间每个表达式产出：
-- 一个**虚拟寄存器**（Tensor 形态中间引用，记录其 `ExprSpec` 结构 + 依赖）。
-- 后续表达式可把前序虚拟寄存器当作输入（依赖边）。
+**为什么最终不用它**（逐条经代码核对）：
 
-`end_expr` 时执行**融合分析**（构建虚拟寄存器 DAG + 判定融合边界）：
-- **小中间量**（每列/每行标量）→ 留寄存器/共享内存，不落 VRAM；
-- **逐元素链**（同一形状、无分支）→ 并入同一 kernel；
-- **大张量 / matmul 结果** → spill 到内存，作为下一 kernel 输入。
+1. 融合条件要求"**两节点均无归约、同形状、tail 恰好一个消费者**"；而 LayerNorm/RMSNorm/Softmax/
+   Attention 的骨架恰恰是"归约 → 逐元素 → 归约"，**归约处即中断**，可融的地方本就不存在。
+2. 需要融的层都要为 backward 缓存中间量（`normalized_cache_` / `normed_cache_` /
+   `residual2_cache_` / `W_re`）——**缓存就是图外的第二个消费者**，录制图看不见它；补上逃逸检测
+   的代价（Tensor 拷贝钩子 + 自动作用域 + ~22 个 flush 点）远超收益。
+3. 能融的"长逐元素链"本来就可以直接写成**一个** `dsl::compute` 表达式（单个 AOT 融合 kernel）。
+4. 唯一使用方是演示层 `FusedChainLayer`，**无生产调用方**。
 
-录制状态存放于各引擎内部，Layer 无感知。二期 S6 把该手工窗口自动化（P2-10），后由 P2-12 图级缓存作为替代方案落地（见"跨 kernel 自动融合"）。
+**删除项**：`expr_graph.hpp`、`ComputeEngine::begin_expr/end_expr`、`dsl::start_expr/end_expr`
+（`ExprBlock`）、`FusedChainLayer`、`Tensor::virtual_tag_`。**保留** `run_fused_gpu` 的
+`output_override`（现服务于 `dsl::compute_into` 原地目标传递，与图 IR 无关）。
 
 ---
 
@@ -218,8 +216,8 @@ Backward 采用**反向重算 W**（不缓存 `attn_cache_`），用 `batched_ma
 
 | 后端 | 文件 | 实现 |
 |------|------|------|
-| CPU | `cpu_engine.hpp` | `begin_expr/end_expr` 为 no-op；`eval_expr` 扩展归约语义与 matmul 段（matmul 预计算 + 逐元素链，`eval_expr_reduce` 经归约指令消费 matmul 输出） |
-| GPU (Vulkan) | `gpu_engine.hpp` + `shaders/*.comp` + `vk_backend.hpp` | 录制融合分析；`eval_expr` 查 `fused_registry`；`glsl_gen` 生成归约/两趟/matmul 结构 shader |
+| CPU | `cpu_engine.hpp` | `eval_expr` 扩展归约语义与 matmul 段（matmul 预计算 + 逐元素链，`eval_expr_reduce` 经归约指令消费 matmul 输出）；`dsl::compute` 的纯逐元素路径走编译期模板内联 |
+| GPU (Vulkan) | `gpu_engine.hpp` + `shaders/*.comp` + `vk_backend.hpp` | `eval_expr` 查 `fused_registry`；`glsl_gen` 生成归约/两趟/matmul 结构 shader |
 
 > 注：CUDA 后端已停用（v1.0.0），此处不再列为后端。
 
@@ -232,11 +230,16 @@ Backward 采用**反向重算 W**（不缓存 `attn_cache_`），用 `batched_ma
 
 ---
 
-## 跨 kernel 自动融合
+## 跨 kernel 自动融合（已评估，不采用）
 
-一期的跨表达式融合依赖手工 `begin_expr/end_expr`（仅演示 Layer `FusedChainLayer` 使用；真实 Layer 每表达式独立 dispatch）。二期的 S6（P2-10 自动窗口）方案为：`GpuEngine` 维护 `std::optional<ExprGraph> auto_window_`（线程局部），`eval_expr/eval_expr_reduce` 被调用时尝试并入窗口、不兼容时 flush。**该方案因用户决策搁置**。
+一期曾规划用 `begin_expr/end_expr` 做跨表达式融合（仅演示 Layer `FusedChainLayer` 使用；真实 Layer
+每表达式独立 dispatch）。二期 S6（P2-10 自动窗口）方案为：`GpuEngine` 维护线程局部 `std::optional<ExprGraph>`
+窗口，`eval_expr/eval_expr_reduce` 调用时尝试并入、不兼容时 flush——**该方案搁置**；随后落地的 P2-12
+图级缓存（`graph_cache_key` / `plan_from_kernel` / `instantiate_plan`，跨 step 复用融合分析结果）也随
+IR-C 一起**于 2026-09-19 删除**（见 §表达式录制与融合边界（已移除）、`03-ir-optimization.md` §5.3）。
 
-**替代方案（已落地）**：P2-12 图级缓存（`expr_graph.hpp` 的 `graph_cache_key`/`plan_from_kernel`/`instantiate_plan`），通过**跨 step 缓存**消除重复融合分析的开销，同时保持确定性。两者核心目标一致（减少重复融合分析），实现路径不同：P2-10 用自动窗口，P2-12 用缓存命中。
+**当前结论**：跨表达式融合不接线；能融的表达式直接写成单个 `dsl::compute`。重新立项的前提写在
+`03-ir-optimization.md` §5.3 末段。
 
 ---
 
@@ -249,7 +252,7 @@ Backward 采用**反向重算 W**（不缓存 `attn_cache_`），用 `batched_ma
 - forward: `exp(x - row_max) / row_sum(exp(x - row_max))`
 - backward: `out * (grad - row_dot(out * grad))`
 
-`LayerNorm` / `RMSNorm` 同理用录制/DSL 表达：均值/方差归约 → 归一化 → γ/β 逐元素，归约中间量（每行标量）留寄存器。Backward 若写成单表达式会因重复子表达式（`grad*gamma` 出现 3 次）超出 8 输入上限，因此拆成 mean_g/mean_gn 两个归约向量输出 + 一个逐元素 grad_x。
+`LayerNorm` / `RMSNorm` 同理用 DSL 归约表达式表达：均值/方差归约 → 归一化 → γ/β 逐元素，归约中间量（每行标量）留寄存器。Backward 若写成单表达式会因重复子表达式（`grad*gamma` 出现 3 次）超出 8 输入上限，因此拆成 mean_g/mean_gn 两个归约向量输出 + 一个逐元素 grad_x。
 
 ### 线性层（二期 S4）
 
@@ -268,7 +271,7 @@ Backward 采用**反向重算 W**（不缓存 `attn_cache_`），用 `batched_ma
 1. **`tools/scan_exprs.cpp`**：dry-run 跑各 Layer forward/backward，收集折叠出的 `ExprSpec` 结构（去重）→ `build/generated/expr_specs.bin`。
 2. **`tools/gen_fused.cpp`**：读 bin → `glsl_gen` 生成 GLSL → glslc → 内联 SPIR-V → `build/generated/fused_registry.hpp`。
 
-`scan_exprs` 需覆盖所有 Layer 录制/DSL 路径（Softmax/LN/RMSNorm fwd+bwd、CrossEntropy softmax 结构、Attention 两趟结构、Linear 的 matmul 段），使融合结构被收集。未命中 → `eval_expr` 现有"硬报错"逻辑，提示补进扫描（保持项目"GPU 硬报错、不降级"哲学）。
+`scan_exprs` 需覆盖所有 Layer 的 DSL 路径（Softmax/LN/RMSNorm fwd+bwd、CrossEntropy softmax 结构、Attention 两趟结构、Linear 的 matmul 段、optimizer 的 `compute_into` 原地表达式），使融合结构被收集。未命中 → `eval_expr` 现有"硬报错"逻辑，提示补进扫描（保持项目"GPU 硬报错、不降级"哲学）。
 
 ---
 
@@ -283,7 +286,7 @@ Backward 采用**反向重算 W**（不缓存 `attn_cache_`），用 `batched_ma
 | **S3 GLSL 生成** | `generate_glsl_matmul`（共享内存分块 + vec4）；`gen_fused`/`scan_exprs`/`run_fused_gpu` 接入 | `fused_gpu_test` matmul 融合用例（GPU vs CPU）；AOT 命中 |
 | **S4 Layer 迁移（线性）** | `Linear`/`FeedForward` 的 `matmul+bias+activation` 改走 `dsl::compute`（含 matmul 段） | `gpt_gradcheck` / MNIST/GPT 训练回归 |
 | **S5 跨归约/跨 matmul 链** | 融合分块矩阵乘法（16×16 线程/64×64 块/4×4 寄存器分块/vec4 转置共享内存 + `eval_tail` 函数）；matmul+归约（`row_max(matmul)`、`row_sum(exp(matmul-rm))`）经 `generate_glsl_reduce` 内联点积；图融合允许 matmul 节点拼接尾逐元素节点 | 注意力相关 gradcheck 全绿 |
-| **S6 自动窗口（P2-10）** | 搁置（用户决策），由 P2-12 图级缓存替代 | — |
+| **S6 自动窗口（P2-10）** | 搁置（用户决策）；其替代方案 P2-12 图级缓存亦随 IR-C 于 2026-09-19 删除 | — |
 | **S7 删除 M4-M6** | 全面替换并删除：`batched_matmul_reduce/softmax_denom/softmax_apply`（M4）、`batched_matmul_softmax_backward_q/kv`（M6）、`col_softmax_denom/col_softmax_sparse_forward`（M5）7 个原语（接口 + CPU/GPU/CUDA 实现 + 7 个手写 shader + vk pipeline + 测试改造）。IR 扩展：`MatmulSpec.batch`、`ExprOperandKind::Row/Col/Batch`、`ExprViewKind::RowGather/BatchMod/BatchCol` | 全量 ctest；训练冒烟（CPU+GPU） |
 
 **依赖关系**：S1→S2→S3 串行（IR → CPU → GPU 生成）；S4 依赖 S3；S5 依赖 S3；S7 依赖 S5。
@@ -311,7 +314,7 @@ Backward 采用**反向重算 W**（不缓存 `attn_cache_`），用 `batched_ma
 | 里程碑 | 内容 | 验证 |
 |--------|------|------|
 | M1 ✅ | `ExprSpec` 加归约视图/指令 + CPU `eval_expr` 扩展 | `expr_reduce_test` 全过 + `expr_dsl_test` 回归 |
-| M2 ✅ | `begin_expr/end_expr` 录制框架 + CPU no-op | 现有测试回归通过 |
+| M2 ~~✅~~ | `begin_expr/end_expr` 录制框架 + CPU no-op | **2026-09-19 移除**（IR-C 整体删除，见 `03-ir-optimization.md` §5.3） |
 | M3 ✅ | Softmax/LayerNorm/RMSNorm fwd/bwd 改 DSL 归约表达式 + GPU 归约融合 shader | `fused_gpu_test` 全过 + gradcheck 系列 |
 | M4 ✅ | 三个 matmul 融合原语（bmm_reduce/bmm_denom/bmm_apply，CPU+GPU，可选掩码） | `matmul_fusion_test`（CPU err=0 / GPU err≤1.9e-6） |
 | M5 ✅ | CrossEntropyLoss 稀疏融合（不物化全 softmax） | `ce_fusion_test`（CPU err=0 / GPU err≤4.8e-7） |
@@ -376,7 +379,7 @@ Backward 采用**反向重算 W**（不缓存 `attn_cache_`），用 `batched_ma
 1. **glsl_gen 融合工作量**：两趟注意力的 tile 化代码生成是最大工作量。一期 M4-M6 曾用手写固定 shader 验证收益，二期由结构生成统一。
 2. **闭合世界 vs 形状变化**：已通过"形状无关融合"解决。彻底无法覆盖的结构在 `eval_expr` 未命中时硬报错。
 3. **反向重算 vs 缓存**：默认反向重算 `W`（省显存），提供缓存开关。
-4. **不引入运行时编译**：所有融合 kernel AOT 预编译，`end_expr` 只做查表/装配。
+4. **不引入运行时编译**：所有融合 kernel AOT 预编译；运行时只做 key 查表 + dispatch。
 5. **上限压力**：matmul + 尾链可能超输入/寄存器上限 → 融合分析保守放弃（回退独立 kernel）。
 
 ### 正确性与回退策略

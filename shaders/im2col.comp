@@ -1,0 +1,65 @@
+// ── im2col.comp ───────────────────────────────────────────────────────────
+// 纯原语：滑动窗展开（数据搬运，绝不含卷积/池化算法）
+//
+//   x (C*H*W, B) → out (C*k*k, B*OH*OW)
+//   out[(ci*k + kh)*k + kw, (oh*OW + ow)*B + b]
+//     = x[ci*H*W + (oh*stride + kh - pad)*W + (ow*stride + kw - pad), b]
+//   越界（padding 区）取 0（列序为「位置优先」(oh, ow, b)）
+//
+// 绑定布局：
+//   binding 0: 输入 x   (readonly,  C*H*W × B)
+//   binding 1: 输出 out (writeonly, C*k*k × B*OH*OW)
+//
+// Push Constants（36 bytes）：
+//   uint C, H, W, k, stride, pad, OH, OW, B
+// ─────────────────────────────────────────────────────────────────────────
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufIn  { float in_data[];  };
+layout(std430, binding = 1) writeonly buffer BufOut { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint C;
+    uint H;
+    uint W;
+    uint k;
+    uint stride;
+    uint pad;
+    uint OH;
+    uint OW;
+    uint B;
+};
+
+void main()
+{
+    const uint idx = gl_GlobalInvocationID.x;
+    const uint kk   = k * k;
+    const uint rows = C * kk;
+    const uint P    = OH * OW;
+    const uint cols = B * P;
+    if (idx >= rows * cols) return;
+
+    const uint r = idx / cols;
+    const uint c = idx % cols;
+
+    const uint ci = r / kk;
+    const uint kh = (r / k) % k;
+    const uint kw = r % k;
+
+    const uint p  = c / B;          // 位置优先列序 (p, b)
+    const uint b  = c % B;
+    const uint oh = p / OW;
+    const uint ow = p % OW;
+
+    const int ih = int(oh * stride + kh) - int(pad);
+    const int iw = int(ow * stride + kw) - int(pad);
+
+    float v = 0.0;
+    if (ih >= 0 && ih < int(H) && iw >= 0 && iw < int(W))
+        // 行主序：(row, b) → row * B + b
+        v = in_data[(ci * H * W + uint(ih) * W + uint(iw)) * B + b];
+    out_data[idx] = v;
+}

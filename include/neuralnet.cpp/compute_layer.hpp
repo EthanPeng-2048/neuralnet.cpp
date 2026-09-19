@@ -13,7 +13,7 @@
 //
 // 拆分文件（按依赖顺序）：
 //   compute_layer_base.hpp          Layer 基类 + clone_tensor 辅助
-//   compute_layer_mlp.hpp           Linear/ReLU/GeLU/SwiGLU/LayerNorm/RMSNorm/FusedChainLayer
+//   compute_layer_mlp.hpp           Linear/ReLU/GeLU/SwiGLU/LayerNorm/RMSNorm
 //   compute_layer_conv.hpp          Conv2D / MaxPool2D
 //   compute_layer_softmax.hpp       Softmax
 //   compute_layer_attention.hpp     RotaryEmbedding / AttentionBase / MultiHeadAttention / CausalSelfAttention

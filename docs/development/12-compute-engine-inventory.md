@@ -1,5 +1,13 @@
 # 计算引擎现状盘点（2026-09-18）
 
+> ⚠️ **更新（2026-09-19）：本文中的 IR-C 部分已执行完毕——IR-C 被整体删除。**
+> `expr_graph.hpp`、`ComputeEngine::begin_expr/end_expr`、`dsl::start_expr/end_expr`、
+> `FusedChainLayer`、`Tensor::virtual_tag_` 均已从代码移除；取舍依据与重新立项前提见
+> `03-ir-optimization.md` §5.3。§4.2/§4.3/§5/§8 保留原文作为**决策前的证据快照**（其中"IR-C 该接上"
+> 的判断已被 §8.9 的实测结论推翻），阅读时请以本横幅与 §8 末的"决策已执行"为准。
+> 另：§3 表第 2 行（DSL 模板路径"串行"）与 §7.5 第 1 项（"DSL 没有 `compute_into`"）**已过时**，
+> 已在原位更正。
+>
 > 目的：在讨论"只保留 `dsl::compute` + 纯算子"之前，先把**今天代码里实际并存的东西**列清楚。
 > 全部结论来自当前工作树（HEAD `f5e5e85`）的源码与构建配置，未做改动。
 
@@ -8,14 +16,14 @@
 ## 0. 一句话总览
 
 引擎经历过 5 代设计（纯 Matrix → forward_gpu 双实现 → eager → begin_expr/end_expr → `dsl::compute`），
-**5 代里有 4 代的代码今天仍然在编译、且 3 代仍在被调用**：
+**5 代里有 3 代的代码今天仍在编译、且 2 代仍在被调用**（第 4 代 IR-C 已于 2026-09-19 删除）：
 
 | 世代 | 现状 |
 |------|------|
 | 纯 Matrix（无 Tensor） | `algebra_*` 仍在，是 `Tensor` 的底层存储 + CPU 手写 kernel |
 | `forward_gpu` / `backward_gpu` 双实现 | ✅ **已彻底移除**（仅注释残留） |
-| eager（直接调引擎算子） | ⚠️ **仍是 Layer 的主力**（37 个算子被直接调用） |
-| `begin_expr` / `end_expr`（IR-C 录制图） | ⚠️ 引擎已实现，但**没有生产调用方**（只剩演示层/scan/测试） |
+| eager（直接调引擎算子） | ⚠️ **仍是 Layer 的一部分主力**（32 个算子被直接调用） |
+| `begin_expr` / `end_expr`（IR-C 录制图） | 🗑️ **已移除**（2026-09-19：无收益点且无生产调用方，见 `03-ir-optimization.md` §5.3） |
 | `dsl::compute` | ✅ 当前主推，被 Layer 大量使用 |
 
 ---
@@ -40,30 +48,35 @@
 
 ---
 
-## 2. `ComputeEngine` 接口：49 个 virtual 成员
+## 2. `ComputeEngine` 接口：50 个 virtual 成员
 
-文件：`compute_engine.hpp`（26.8 KB）
+文件：`compute_engine.hpp`（2026-09-19 复核；原 52 个，`begin_expr`/`end_expr` 已随 IR-C 删除）
 
-### 2.1 被 Layer / Loss / Optimizer **直接调用**的算子：37 个
+### 2.1 被 Layer / Loss / Optimizer **直接调用**的算子：30 个
 
-（统计口径：`compute_layer*.hpp` + `compute_loss.hpp` + `compute_optimizer.hpp` 中出现的 `engine.<op>(`）
+（统计口径：`compute_layer*.hpp` + `compute_loss.hpp` + `compute_optimizer.hpp` 中出现的 `engine.<op>(`；
+2026-09-19 复核，`begin_expr`/`end_expr` 已随 IR-C 删除）
 
 ```
-accumulate, add_inplace, axpy_inplace, batched_matmul,
-begin_batch, begin_expr, broadcast_col_inplace, broadcast_row_inplace,
-clone, col_reduce_max, col_reduce_sum, create_offload_buffer, create_tensor,
-elementwise_binary, elementwise_binary_scalar, elementwise_unary,
-end_batch, end_expr, flush_batch, from_matrix, gather_rows, insert_rows,
+accumulate, add_inplace, batched_matmul, begin_batch, clone,
+col_reduce_max, col_reduce_sum, create_offload_buffer, create_tensor,
+elementwise_binary, end_batch, flush_batch, from_matrix, gather_rows,
+grouped_reduce_max, grouped_reduce_sum, im2col, col2im, insert_rows,
 matmul, matmul_with_bias, offload_restore, offload_save, outer_col,
 rearrange_3d, row_reduce_sum, scale_inplace, scan_prefix_outer,
 scan_suffix_outer, scatter_add_rows, slice_rows, to_matrix, transpose, zero
 ```
+（`im2col`/`col2im` 于 2026-09-20 新增：卷积/池化窗口展开与伴随散射，
+纯数据搬运、无算法语义；`grouped_reduce_max/sum` 同期新增：沿行方向按固定长度
+分组归约，用来把"逐通道一次 dispatch"的层内循环压成单次原语调用。
+Conv2D 与 MaxPool2D 已**全引擎化**，不再有 `to_matrix/from_matrix` 往返、
+CPU 标量循环或逐通道循环。）
 
-### 2.2 不被 Layer 直接调用（仅引擎内部 / DSL / 测试用）：12 个
+### 2.2 不被 Layer 直接调用（其余 20 个：引擎内部 / DSL / readback / 测试）
 
 | 算子 | 实际调用方 |
 |------|-----------|
-| `eval_expr` / `eval_expr_reduce` | `dsl::compute` / `compute_reduce` + 引擎内部（`matmul_with_bias`） |
+| `eval_expr` / `eval_expr_reduce` / `eval_expr_into` | `dsl::compute` / `compute_reduce` / `compute_into` + 引擎内部（`matmul_with_bias`） |
 | `cast` | `model_serialization.hpp:646` + f16 测试 |
 | `copy_from` | `model_serialization.hpp`（上传路径） |
 | `offload_store` / `offload_load` | 仅 `offload_primitive_test.cpp`（**Layer 用的是 `offload_save`/`offload_restore`**） |
@@ -71,8 +84,8 @@ scan_suffix_outer, scatter_add_rows, slice_rows, to_matrix, transpose, zero
 | `elementwise_select_scalar_cond` | 仅引擎实现；**无调用点** |
 | `release_idle_pool_blocks` | `src/text_train.cpp:1463` |
 | `pool_stats` | **无任何调用点**（死接口） |
+| `submit_scalar_readback` / `poll_scalar_readback` / `scalar_readback_slots` | 标量回读（loss 用），Layer 不直调 |
 | `device` | 引擎外部少量判断 |
-| `begin_expr` / `end_expr` | 见 §4 |
 
 ---
 
@@ -83,7 +96,7 @@ scan_suffix_outer, scatter_add_rows, slice_rows, to_matrix, transpose, zero
 | # | 机制 | 实现位置 | 并行度（实测） | 谁在用 |
 |---|------|----------|----------------|--------|
 | 1 | **旧代数 AST** `compute::apply(span, expr)` | `algebra_compute.hpp:38`（`nn::compute`）<br>AST 在 `algebra_expr.hpp` + `algebra_ops.hpp`（`nn::ops`） | 并行（走 `nn::for_each`） | **仅 `CpuEngine` 的 `elementwise_unary/binary/binary_scalar`**（`compute_cpu_engine.hpp:1094-1163`）+ `Matrix` 的 `detail::apply` |
-| 2 | **DSL 模板路径** `eval_cpu(e, rows, cols)` | `expr_dsl.hpp:630-638` | **串行**（纯 `for` 循环，每元素 `cpu_matrix().span()`） | `dsl::compute` 的**无归约**分支（`expr_dsl.hpp:682`） |
+| 2 | **DSL 模板路径** `eval_cpu(e, rows, cols)` → `eval_into_span` | `expr_dsl.hpp:181` | **并行 + 向量化**（2026-09-19 复核：`n≥PARALLEL_THRESHOLD` 走 `nn::parallel_for_samples` 分块，块内 `NN_VECTORIZE_PRAGMA`；不再 per-element 重导 `cpu_matrix().span()`） | `dsl::compute` 的**无归约**分支 + `dsl::compute_into` 的逐元素分支 |
 | 3 | **DSL IR 解释器** `eval_expr_impl` | `compute_cpu_engine.hpp:1251-1789` | **串行**（逐元素 switch 分派 + 归约前缀重放） | `dsl::compute` 的**含归约/广播/matmul/索引视图**分支（`expr_dsl.hpp:680`）+ `compute_reduce` |
 | 4 | **GPU AOT 融合** `eval_expr` | `compute_gpu_engine.hpp:942` | shader 并行 | GPU 全部表达式 |
 
@@ -92,8 +105,8 @@ scan_suffix_outer, scatter_add_rows, slice_rows, to_matrix, transpose, zero
 `dsl::compute(` 88 处、`dsl::compute_reduce(` 20 处（其中相当一部分含 `matmul`/`broadcast`/归约，落到机制 3）。
 
 **死/重复**：
-- 机制 1（旧代数 AST）与机制 2（DSL 模板）是**两套并行的表达式模板 AST**，做同一件事（逐元素求值），只是并行度不同。
-- 机制 2 与机制 3 是 DSL 在 CPU 上的两条路，一条内联、一条解释。
+- 机制 1（旧代数 AST）与机制 2（DSL 模板）是**两套并行的表达式模板 AST**，做同一件事（逐元素求值）。
+- 机制 2 与机制 3 是 DSL 在 CPU 上的两条路，一条内联、一条解释；机制 3（解释器）比等价原语慢 1.5–3.8 倍（见 `11-cpu-performance-diagnosis.md`）。
 
 ---
 
@@ -104,7 +117,11 @@ scan_suffix_outer, scatter_add_rows, slice_rows, to_matrix, transpose, zero
 GPU 侧每个都是独立的 backend kernel dispatch（`compute_gpu_engine.hpp:485` matmul、
 `:843` elementwise_unary、`:615` add_inplace…），即当初"kernel 开销大"的那条路。
 
-### 4.2 `begin_expr` / `end_expr` + `expr_graph.hpp`（IR-C 录制图）
+### 4.2 `begin_expr` / `end_expr` + `expr_graph.hpp`（IR-C 录制图）🗑️ 已移除
+
+> **2026-09-19：本节所述代码已全部删除**（依据见 §8.9 与 `03-ir-optimization.md` §5.3）。
+> 以下保留决策前的盘点原文，行号已随删除失效。
+>
 - 接口：`compute_engine.hpp:110-111`；`CpuEngine` 实现 `compute_cpu_engine.hpp:61/72`；`GpuEngine` 实现 `:184/194`
 - 录制图：`expr_graph.hpp`（22.5 KB，含 `ExprGraph` / `recording_graph_owner`）
 - **生产调用方：无**。唯二调用者是：
@@ -140,6 +157,8 @@ GPU 侧每个都是独立的 backend kernel dispatch（`compute_gpu_engine.hpp:4
 
 #### 4.2.2 不是二选一：`dsl::compute` 是前端，IR-A/B/C/D 是同一流水线的阶段
 
+> ⚠️ 本节描述的是**决策前**的流水线（含 IR-C）。2026-09-19 后流水线只剩 IR-A/B/D，见 §8.10。
+
 数据流是**一条线**，不是两条候选路线：
 
 ```
@@ -170,7 +189,7 @@ ExprSpec ──► IR-A/B (expr_opt.hpp: canonicalize/CSE/寄存器分配)      
 即 `dsl::compute` **先出现**，`begin_expr/end_expr` 和 IR-C 是随后 1~3 天在同一波里加的。
 它们是同一波开发的同一条流水线，不是前后取代关系。
 
-#### 4.2.3 关键非对称：IR-C **在 GPU 是活的，在 CPU 是 no-op**
+#### 4.2.3 关键非对称：IR-C 在 GPU 是活的，在 CPU 是 no-op（决策前结论，保留为证据）
 
 | | `begin_expr` / `end_expr` 运行时行为 |
 |---|---|
@@ -180,9 +199,9 @@ ExprSpec ──► IR-A/B (expr_opt.hpp: canonicalize/CSE/寄存器分配)      
 **推论：接 IR-C 对 CPU 的收益是零。** CPU 的病不是 kernel 数量，而是串行标量解释
 （见 `11-cpu-performance-diagnosis.md`）。所以在 CPU 侧讨论"IR-C vs dsl::compute"没有意义。
 
-### 4.3 `dsl::start_expr` / `end_expr`（块式融合 API）
-- `expr_dsl.hpp:703-718`（`ExprBlock`）
-- **仅被测试使用**：`src/expr_dsl_test.cpp:279`
+### 4.3 `dsl::start_expr` / `end_expr`（块式融合 API）🗑️ 已移除
+- 原 `expr_dsl.hpp` 的 `ExprBlock`；**仅被测试使用**
+- 2026-09-19 随 IR-C 一并删除（连同 `expr_dsl_test` 的对应用例）
 
 ### 4.4 `dsl::compute`（当前）
 - `expr_dsl.hpp:646-690`，Layer 全面使用。
@@ -196,16 +215,18 @@ ExprSpec ──► IR-A/B (expr_opt.hpp: canonicalize/CSE/寄存器分配)      
 | ~~CUDA 引擎 + backend + `cuda/` + 10 处 `#ifdef`~~ | ~100 KB | 🗑️ **已移除**（快照见 `legacy/cuda`） |
 | 旧代数 AST：`algebra_expr.hpp` + `algebra_ops.hpp` + `algebra_compute.hpp` | 27.6 KB | ⚠️ 仅 CPU elementwise 用，与 DSL 模板路径重复 |
 | IR-D 的 `CpuEmitter` 残留 | 注释 | ⚠️ `cpu_emitter.hpp` 已删（现仅 `GlslEmitter` 登记）；`expr_emitter.hpp:16` 仍引用它；文档 03 的「`factory_cpu()` 返回 GlslEmitter」说明已过时（该函数现不存在） |
-| `FusedChainLayer`（IR-C 演示层） | ~60 行 | ⚠️ 无模型使用；删它则 `begin_expr/end_expr` 只剩 scan/test |
+| ~~`FusedChainLayer`（IR-C 演示层）~~ | ~60 行 | 🗑️ **已移除**（2026-09-19） |
+| ~~`begin_expr`/`end_expr` + `expr_graph.hpp` + `Tensor::virtual_tag_`~~ | ~24 KB | 🗑️ **已移除**（2026-09-19） |
 | `pool_stats()` | 接口 1 个 | ❌ 无调用点 |
 | `elementwise_select_scalar_cond` | 接口 + 3 引擎实现 | ❌ 无调用点 |
 | `offload_store` / `offload_load` | 接口 + GPU 实现 | ⚠️ 仅测试用（Layer 用 `offload_save/restore`） |
 | `row_reduce_max`（引擎算子，非 DSL 叶子） | 接口 + 3 引擎实现 | ⚠️ 无 Layer 调用点 |
-| `eval_cpu` 串行模板路径 | 9 行 | ⚠️ 与解释器重复，且是串行 |
+| ~~`eval_cpu` 串行模板路径~~ | — | ✅ **已修复**：`eval_into_span` 已并行化 + 向量化（机制 2，见 §3） |
 | `NN_EXPR_SCAN` + `expr_registry.hpp` | — | ✅ 活（AOT 管线必需） |
 
-> **不属于遗留物**：IR-A/B（`expr_opt.hpp`）、**IR-C（`expr_graph.hpp`）**、IR-D（`expr_emitter.hpp`）
-> 是同一 IR 流水线的阶段，见 §4.2.1。IR-C 是**最新的优化层、只是没接线**——它的方向是"接上"，不是"删掉"。
+> **不属于遗留物**：IR-A/B（`expr_opt.hpp`）、IR-D（`expr_emitter.hpp`）是同一 IR 流水线的阶段。
+> **IR-C（`expr_graph.hpp`）曾是同一流水线的阶段 C，但已于 2026-09-19 整体删除**——原因是它
+> **设计完整却无处接线**，且接线代价（逃逸检测 + 自动作用域）远超收益（见 §8.9、§8.10）。
 
 ---
 
@@ -220,10 +241,10 @@ ExprSpec ──► IR-A/B (expr_opt.hpp: canonicalize/CSE/寄存器分配)      
 
 | 差距 | 现状 | 说明 |
 |------|------|------|
-| A. Layer 直调算子 | 37 个 | 要收敛到"只写表达式"，包括 `matmul`/`batched_matmul`/`transpose`/`gather_rows`/`scan_*`/`offload_*` |
+| A. Layer 直调算子 | 30 个（2026-09-19 复核） | 要收敛到"只写表达式"，包括 `matmul`/`batched_matmul`/`transpose`/`gather_rows`/`scan_*`/`offload_*` |
 | B. 四套求值机制 | 4 套 | 目标只剩 DSL + 引擎 lowering；旧代数 AST、`eval_cpu`、解释器都要重定义为 lowering |
-| C. 融合世代 | eager / IR-C+dsl | **只有 eager 是待收敛的旧世代**；IR-C 与 DSL 同属一套 IR 流水线（§4.2.1），要的是**接线**不是删除 |
-| D. 死代码 | 无调用点接口（CUDA 全链 ~100 KB 已清） | 与目标无关，已清理 |
+| C. 融合世代 | eager / dsl | **只有 eager 是待收敛的旧世代**；IR-C 已于 2026-09-19 移除（设计无收益点，见 §8.9 + `03-ir-optimization.md` §5.3） |
+| D. 死代码 | 无调用点接口（CUDA 全链 ~100 KB、IR-C ~24 KB 已清） | 与目标无关，已清理 |
 
 **注意**：A 与 C 不是纯删除——`scan_prefix_outer` / `outer_col`（RLA/RAPT）、`offload_*`（activation offload）、
 `begin_batch/end_batch`（GPU 命令录制）这些**不是普通逐元素/矩阵算子**，DSL 目前表达不了。
@@ -256,7 +277,7 @@ ExprSpec ──► IR-A/B (expr_opt.hpp: canonicalize/CSE/寄存器分配)      
 |------|------|------|
 | **① 与 DSL 重复**（DSL 完全能表达） | `elementwise_unary/binary/binary_scalar`、`broadcast_row/col_inplace`、`add_inplace`、`scale_inplace`、`axpy_inplace`、`accumulate`、`zero` | 应降为 **internal lowering**，不再对层公开 |
 | **② DSL 已有对应 IR 叶子** | `matmul`/`batched_matmul`、`row/col_reduce_sum/max`、`row_gather`、`row_mod`、`row_access`、`rotate_half`、`batch_mod`、`batch_col`、`select` | DSL 自带；engine 版本仅供 lowering |
-| **③ DSL 表达不了**（真·不可约） | `scan_prefix_outer`/`scan_suffix_outer`/`outer_col`（RLA/RAPT）、`offload_store/load/save/restore/create_offload_buffer`、`begin_batch`/`end_batch`/`flush_batch`、`slice_rows`/`insert_rows`/`rearrange_3d`/`transpose`、`create_tensor`/`from_matrix`/`to_matrix`/`clone`/`cast`/`copy_from` | **必须保留为层可见原语** |
+| **③ DSL 表达不了**（真·不可约） | `scan_prefix_outer`/`scan_suffix_outer`/`outer_col`（RLA/RAPT）、`im2col`/`col2im`（CNN 卷积/池化窗口展开）、`offload_store/load/save/restore/create_offload_buffer`、`begin_batch`/`end_batch`/`flush_batch`、`slice_rows`/`insert_rows`/`rearrange_3d`/`transpose`、`create_tensor`/`from_matrix`/`to_matrix`/`clone`/`cast`/`copy_from` | **必须保留为层可见原语** |
 
 ### 7.3 最优形态：不是两层并列，而是三档
 
@@ -281,14 +302,16 @@ L3  后端     : SIMD / 线程池 / GLSL kernel
   因为 shader 必须构建期枚举；而 eager 走手写 shader（`shaders/*.comp`），不需要构建期枚举。
   所以 §7.2 ③ 那批结构原语**留在 eager 侧是设计上的必需**，不是历史包袱。
 
-### 7.5 但要真做到"只保留 DSL"，DSL 现在缺三样
+### 7.5 但要真做到"只保留 DSL"，DSL 现在缺两样（原为三样）
 
-1. **输出缓冲 / 原地语义**：`dsl` 目前没有 `compute_into`（`expr_dsl.hpp` 无此 API，`compute` 总是
-   新建 Tensor）。所以 optimizer（`axpy_inplace`×多处）与残差加法（`add_inplace`）**换不掉**。
-2. **跨表达式融合没接线**：`begin_expr`/`end_expr` + `expr_graph.hpp`（IR-C）**无生产调用方**（§4.2）。
-   于是"写不进一行的多步"（LayerNorm 7 步、Attention 的 m/l/W）仍是多次 dispatch、
-   中间 Tensor 全部物化——"最多的优化能力"其实**没吃到**。
-3. **CPU lowering**：见 `11-cpu-performance-diagnosis.md` §8 —— 不做，DSL 在 CPU 上就还是串行解释器。
+1. ~~**输出缓冲 / 原地语义**：`dsl` 没有 `compute_into`~~ → ✅ **已完成**：`dsl::compute_into(eng, expr, dst)`
+   已落地（`expr_dsl.hpp`），optimizer / 残差加法 / LayerNorm 梯度累加 / CE 梯度均已迁移（CPU 走
+   `eval_into_span` 模板内联，GPU 走 `run_fused_gpu` 的 `output_override`）。
+2. ~~**跨表达式融合没接线**：`begin_expr`/`end_expr` + `expr_graph.hpp`（IR-C）无生产调用方~~
+   → 🗑️ **已判定为无收益并移除**（2026-09-19）：需要融合的层都以归约为骨架、且要为 backward 缓存
+   中间量（§8.9），能融的表达式本就可写成单个 `dsl::compute`。见 `03-ir-optimization.md` §5.3。
+3. **CPU lowering**：见 `11-cpu-performance-diagnosis.md` §8 —— 逐元素路径已向量化+并行（机制 2），
+   但**含归约/matmul 的表达式仍走串行解释器**（机制 3，比等价原语慢 1.5–3.8 倍）。这是剩下的一项。
 
 ### 7.6 结论
 
@@ -303,17 +326,21 @@ L3  后端     : SIMD / 线程池 / GLSL kernel
 
 ---
 
-## 8. 方案：把 IR-C 吸收进 `dsl::compute`，移除显式 IR-C API
+## 8. 方案（决策前草案）：把 IR-C 吸收进 `dsl::compute`
+
+> ⚠️ **本节是 2026-09-18 的候选方案，最终未被采用。** 2026-09-19 的决定是**直接删除 IR-C**（不做
+> 自动作用域/逃逸检测，因为 §8.9 已证明当前层集合里没有可安全接入的融合点）。本节保留用于说明
+> "当时考虑过哪条路、为什么放弃"。**已执行的决定见 §8.10。**
 
 ### 8.1 目标：用户入口从 3 个收敛到 1 个
 
-| # | 当前入口 | 使用情况 |
-|---|----------|----------|
-| 1 | `dsl::compute` / `compute_reduce` | ✅ torch 风格，Layer 全面使用 |
-| 2 | `dsl::start_expr(...) … dsl::end_expr(block)`（`ExprBlock`） | 仅 `expr_dsl_test.cpp:279` |
-| 3 | `engine.begin_expr() … engine.end_expr()` | 仅 `FusedChainLayer` + scan |
+| # | 当前入口（决策前） | 使用情况 | 2026-09-19 处置 |
+|---|----------|----------|----------------|
+| 1 | `dsl::compute` / `compute_reduce` / `compute_into` | ✅ torch 风格，Layer 全面使用 | **保留** |
+| 2 | `dsl::start_expr(...) … dsl::end_expr(block)`（`ExprBlock`） | 仅 `expr_dsl_test.cpp` | 🗑️ 已删 |
+| 3 | `engine.begin_expr() … engine.end_expr()` | 仅 `FusedChainLayer` + scan | 🗑️ 已删 |
 
-目标：**只留 1**，融合由框架自动完成。
+结果：**只留 1**，但**不是**通过"融合由框架自动完成"（原目标），而是通过**删除跨表达式融合能力**。
 
 ### 8.2 障碍：逃逸语义现在由**用户**负责（这是必须先解决的）
 
@@ -387,11 +414,11 @@ return dsl::compute(engine,
 - 未命中 AOT 仍是**硬报错**，风险面随 spec 数上升；
 - **CPU 仍是 no-op**（`compute_cpu_engine.hpp:58`）——必须先有 CPU 图执行才有意义。
 
-### 8.8 务实建议：分两步，可先做第 0 步
+### 8.8 务实建议（决策前）：分两步，可先做第 0 步
 
-- **第 0 步（现在就能做，零语义风险）**：删掉**显式** IR-C API
-  （`begin_expr`/`end_expr`、`FusedChainLayer`、`dsl::start/end_expr`），保留 `expr_graph.hpp`
-  作为内部资产。因为**没有任何生产调用方**，这是纯收敛，不承担 §8.2 的逃逸风险。
+- **第 0 步（零语义风险）**：删掉**显式** IR-C API（`begin_expr`/`end_expr`、`FusedChainLayer`、
+  `dsl::start/end_expr`），保留 `expr_graph.hpp` 作为内部资产。因为**没有任何生产调用方**，
+  这是纯收敛，不承担 §8.2 的逃逸风险。
 - **第 1 步（有真实需求再做）**：按 §8.3–8.5 实现自动作用域 + 逃逸检测。
 
 **为什么第 1 步可以等**：`fuse_expr_graph` 只拼接**逐元素链**，归约是硬边界。
@@ -428,6 +455,37 @@ B 不含 matmul、且 tail **恰好一个消费者**并以 **Linear** 视图使�
 
 **因此不建议现在接 IR-C。** 让它回本的前提是：出现（或写出）一个
 **纯逐元素、同形状、中间量不必为 backward 保留**的连续表达式链——那时 §8.3–8.5 的投入才值得。
+
+### 8.10 决策已执行（2026-09-19）：IR-C 整体删除，而非"只删显式 API"
+
+§8.8 的第 0 步建议是"删显式 API、**保留** `expr_graph.hpp` 作内部资产"。**最终决定更进一步：
+连 `expr_graph.hpp` 一起删。** 理由：
+
+- 删掉显式 API 后 `expr_graph.hpp` 就**一个调用方都没有**（`recording_graph()` 的唯一消费者是
+  被删的 `begin/end_expr`），保留它就是本文档自己批判的"悬空设计"；
+- §8.9 已证明**当前层集合无处可安全接入**，即"保留待接线"没有时间表，等于永久的死代码。
+
+**实际删除清单**（代码 + 测试 + 文档，已构建验证）：
+
+| 删除项 | 原位置 |
+|--------|--------|
+| `expr_graph.hpp`（`ExprGraph`/`fuse_expr_graph`/`recording_graph_owner`/图级计划缓存） | `include/neuralnet.cpp/` |
+| `ComputeEngine::begin_expr` / `end_expr`（接口 + CPU/GPU 实现） | `compute_engine.hpp` / `compute_cpu_engine.hpp` / `compute_gpu_engine.hpp` |
+| `GpuEngine::execute_fused_graph` | `compute_gpu_engine.hpp` |
+| `dsl::start_expr` / `end_expr`（`ExprBlock`） | `expr_dsl.hpp` |
+| `FusedChainLayer` | `compute_layer_mlp.hpp` |
+| `Tensor::virtual_tag_` / `virtual_tag()` / `set_virtual_tag()` | `compute_tensor.hpp` |
+| `src/expr_graph_test.cpp`、`src/expr_fuse_test.cpp` + 两个聚合器里的引用 | `src/` |
+| `scan_exprs` 的 `FusedChainLayer` dry-run 段 | `tools/scan_exprs.cpp` |
+
+**保留**：`run_fused_gpu` 的 `output_override`（现服务于 `dsl::compute_into` 的原地目标传递）。
+
+**验证**：重新构建通过；`ctest` 15/15 全绿（`expr_cpu_test` / `expr_gpu_test` 在去掉 IR-C 用例后
+仍覆盖 DSL 编译期融合、归约语义、matmul IR 融合、优化 pass 与 AOT 数值）。
+
+**重新立项前提**（避免"再设计一次却仍不接线"）：出现或写出**纯逐元素、同形状、中间量不必为
+backward 保留、且长到单个 `dsl::compute` 写不下**的链。届时按"逃逸检测 + 自动作用域 + 自动 flush"
+实现（§8.3–8.5），而不是复活显式录制 API。
 
 ---
 

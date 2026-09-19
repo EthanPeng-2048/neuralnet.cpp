@@ -16,7 +16,6 @@
 #include "algebra_compute.hpp"
 #include "algebra_expr.hpp"
 #include "expr_opt.hpp"
-#include "expr_graph.hpp"    // IR-C：图 IR + 融合分析（scan 模式登记用）
 #include "expr_registry.hpp" // scan 模式融合 kernel 登记（NN_EXPR_SCAN）
 #include "expr_dsl.hpp"      // P3-3：matmul_with_bias 经 DSL 融合（单一事实源）
 
@@ -37,15 +36,6 @@ namespace nn
 // ══════════════════════════════════════════════════════════════════════════
 class CpuEngine final : public ComputeEngine
 {
-private:
-    // IR-C 图 IR 录制（仅构建期 scan 模式启用；普通 CPU 运行保持 no-op）。
-    // scan 模式下 begin_expr 开启录制，期间 dsl::compute/compute_reduce 把
-    // 表达式加入录制图（见 expr_dsl.hpp 的 scan 分支），end_expr 时融合分析
-    // 并把每个融合 kernel 的复合 spec 登记进 global_registry —— 保证 GPU
-    // 运行时 begin_expr/end_expr 融合出的复合 spec 命中 AOT shader（闭合世界）。
-    // D3：录制图由 fused::recording_graph_owner()（thread_local unique_ptr）
-    // 持有，不再用引擎成员（消除跨线程共享）。
-
 public:
     [[nodiscard]] Device device() const noexcept override { return Device::CPU; }
 
@@ -53,36 +43,6 @@ public:
     [[nodiscard]] Result<void> begin_batch() override { return {}; }
     [[nodiscard]] Result<void> end_batch() override { return {}; }
     [[nodiscard]] Result<void> flush_batch() override { return {}; }
-
-    // ── 表达式录制（IR-C）──────────────────────────────────────────────
-    // 普通 CPU 运行：no-op（各表达式直接求值，行为不变——融合是 GPU 优化）。
-    // 构建期 scan（NN_EXPR_SCAN）：begin_expr 开启录制图；end_expr 融合分析
-    // 并登记全部融合 kernel 的复合 spec（闭合世界两端一致）。
-    [[nodiscard]] Result<void> begin_expr() override
-    {
-#ifdef NN_EXPR_SCAN
-        auto& owner = fused::recording_graph_owner();
-        if (owner)
-            return std::unexpected(Error{"begin_expr: 嵌套录制（已有未结束的 begin_expr）"});
-        owner = std::make_unique<ExprGraph>();
-#endif
-        return {};
-    }
-
-    [[nodiscard]] Result<void> end_expr() override
-    {
-#ifdef NN_EXPR_SCAN
-        auto& owner = fused::recording_graph_owner();
-        if (!owner)
-            return {};
-        ExprGraph g = std::move(*owner);
-        owner.reset();
-        auto kernels = fuse_expr_graph(g);
-        for (auto& k : kernels)
-            fused::global_registry().add(k.spec);
-#endif
-        return {};
-    }
 
     // ── 张量工厂（统一接口，§6.4, §6.5）────────────────────────────────
     // P 由调用方显式指定（§8.5）：无隐式推导，无 Auto
@@ -420,6 +380,142 @@ public:
         if (A.is_gpu())
             return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
         return Tensor::from_matrix(A.cpu_matrix().transpose());
+    }
+
+    // ── 卷积/池化窗口展开（详见 compute_engine.hpp 契约）───────────────
+    // 并行策略：按输出行（im2col 的 r / col2im 的输入像素行）切块，块间无竞争；
+    //   两个方向的写入都是**连续行**，读取按窗口散布。
+    [[nodiscard]] Result<Tensor> im2col(
+        const Tensor& x,
+        std::size_t C, std::size_t H, std::size_t W,
+        std::size_t k, std::size_t stride, std::size_t pad,
+        std::size_t OH, std::size_t OW) override
+    {
+        if (x.is_gpu())
+            return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+        if (C == 0 || H == 0 || W == 0 || k == 0 || stride == 0 || OH == 0 || OW == 0)
+            return std::unexpected(Error{"im2col: C/H/W/k/stride/OH/OW must be > 0"});
+        const std::size_t B = x.cols();
+        if (x.rows() != C * H * W)
+            return std::unexpected(Error{"im2col: x must be (C*H*W, B)"});
+
+        const std::size_t kk = k * k;
+        const std::size_t P = OH * OW;
+        const std::size_t rows = C * kk;
+        const std::size_t cols = B * P;
+
+        Matrix out(rows, cols);
+        const auto src = x.cpu_matrix().span();
+        const auto dst = out.span();
+
+        // 每行 r=(ci,kh,kw) 独立；列序为位置优先 (p, b)，内层对 b 连续
+        auto row_kernel = [&, src, dst](std::size_t r) noexcept {
+            const std::size_t ci = r / kk;
+            const std::size_t kh = (r / k) % k;
+            const std::size_t kw = r % k;
+            const std::size_t base = ci * H * W;
+            Scalar* outrow = dst.data() + r * cols;
+            for (std::size_t oh = 0; oh < OH; ++oh)
+            {
+                const long ih = static_cast<long>(oh * stride + kh)
+                              - static_cast<long>(pad);
+                const bool h_ok = (ih >= 0 && ih < static_cast<long>(H));
+                for (std::size_t ow = 0; ow < OW; ++ow)
+                {
+                    const long iw = static_cast<long>(ow * stride + kw)
+                                  - static_cast<long>(pad);
+                    const bool ok = h_ok && iw >= 0 && iw < static_cast<long>(W);
+                    Scalar* outp = outrow + (oh * OW + ow) * B;
+                    if (ok)
+                    {
+                        // 源 (row, b) 行主序 → row*B + b
+                        const Scalar* inp = src.data() +
+                            (base + static_cast<std::size_t>(ih) * W +
+                             static_cast<std::size_t>(iw)) * B;
+                        std::copy_n(inp, B, outp);
+                    }
+                    else
+                    {
+                        std::fill_n(outp, B, Scalar{0});
+                    }
+                }
+            }
+        };
+
+        if (rows * cols >= PARALLEL_THRESHOLD && rows > 1)
+        {
+            auto idx = std::views::iota(std::size_t{0}, rows);
+            nn::parallel_for_blocks(idx.begin(), idx.end(), row_kernel);
+        }
+        else
+        {
+            for (std::size_t r = 0; r < rows; ++r) row_kernel(r);
+        }
+        return Tensor::from_matrix(std::move(out));
+    }
+
+    [[nodiscard]] Result<Tensor> col2im(
+        const Tensor& col,
+        std::size_t C, std::size_t H, std::size_t W,
+        std::size_t k, std::size_t stride, std::size_t pad,
+        std::size_t OH, std::size_t OW) override
+    {
+        if (col.is_gpu())
+            return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+        if (C == 0 || H == 0 || W == 0 || k == 0 || stride == 0 || OH == 0 || OW == 0)
+            return std::unexpected(Error{"col2im: C/H/W/k/stride/OH/OW must be > 0"});
+        const std::size_t kk = k * k;
+        const std::size_t P = OH * OW;
+        if (col.rows() != C * kk || col.cols() == 0 || col.cols() % P != 0)
+            return std::unexpected(Error{"col2im: col must be (C*k*k, B*OH*OW)"});
+        const std::size_t B = col.cols() / P;
+
+        Matrix out(C * H * W, B, Scalar{0});
+        const auto src = col.cpu_matrix().span();
+        const auto dst = out.span();
+
+        // 每个输入像素 (ci, ih, iw) 独立：
+        // 对每个 tap (kh,kw)，至多存在一个窗口 (oh,ow) 覆盖该像素；整除性与
+        // 范围检查通过则累加 col 对应行 r=(ci*k+kh)*k+kw 的 (oh,ow) 位置（内层 b 连续）。
+        auto pixel_kernel = [&, src, dst](std::size_t row) noexcept {
+            const std::size_t ci = row / (H * W);
+            const std::size_t rem = row % (H * W);
+            const std::size_t ih = rem / W;
+            const std::size_t iw = rem % W;
+            Scalar* outp = dst.data() + row * B;
+            std::fill_n(outp, B, Scalar{0});
+            for (std::size_t kh = 0; kh < k; ++kh)
+            {
+                const long t = static_cast<long>(ih + pad) - static_cast<long>(kh);
+                if (t < 0 || t % static_cast<long>(stride) != 0) continue;
+                const long oh = t / static_cast<long>(stride);
+                if (oh >= static_cast<long>(OH)) continue;
+                for (std::size_t kw = 0; kw < k; ++kw)
+                {
+                    const long s = static_cast<long>(iw + pad) - static_cast<long>(kw);
+                    if (s < 0 || s % static_cast<long>(stride) != 0) continue;
+                    const long ow = s / static_cast<long>(stride);
+                    if (ow >= static_cast<long>(OW)) continue;
+                    const std::size_t r = (ci * k + kh) * k + kw;
+                    const Scalar* inp = src.data() + r * (B * P) +
+                        (static_cast<std::size_t>(oh) * OW +
+                         static_cast<std::size_t>(ow)) * B;
+                    for (std::size_t b = 0; b < B; ++b) outp[b] += inp[b];
+                }
+            }
+        };
+
+        const std::size_t in_rows = C * H * W;
+        if (in_rows * B >= PARALLEL_THRESHOLD && in_rows > 1)
+        {
+            auto idx = std::views::iota(std::size_t{0}, in_rows);
+            nn::parallel_for_blocks(idx.begin(), idx.end(), pixel_kernel);
+        }
+        else
+        {
+            for (std::size_t r = 0; r < in_rows; ++r) pixel_kernel(r);
+        }
+        return Tensor::from_matrix(std::move(out));
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1036,6 +1132,68 @@ public:
             [](Scalar a, Scalar b) noexcept { return std::max(a, b); },
             [](Scalar x) noexcept { return x; });
         return Tensor::from_matrix(std::move(result));
+    }
+
+    // ── 分组归约（契约见 compute_engine.hpp）───────────────────────────
+    // 按组并行（组间无竞争），组内沿 R 行累加、内层对列连续（可向量化）。
+    template <bool IsMax>
+    [[nodiscard]] Result<Tensor> grouped_reduce_cpu_(
+        const Tensor& x, std::size_t G, std::size_t R)
+    {
+        if (x.is_gpu())
+            return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+        if (G == 0 || R == 0)
+            return std::unexpected(Error{"grouped_reduce: G/R must be > 0"});
+        if (x.rows() != G * R)
+            return std::unexpected(Error{"grouped_reduce: x must be (G*R, N)"});
+        const std::size_t N = x.cols();
+        if (N == 0)
+            return std::unexpected(Error{"grouped_reduce: N must be > 0"});
+
+        Matrix out(G, N);
+        const auto src = x.cpu_matrix().span();
+        const auto dst = out.span();
+        const Scalar init = IsMax ? std::numeric_limits<Scalar>::lowest() : Scalar{0};
+
+        auto group_kernel = [&, src, dst, init](std::size_t g) noexcept {
+            Scalar* o = dst.data() + g * N;
+            for (std::size_t n = 0; n < N; ++n) o[n] = init;
+            for (std::size_t i = 0; i < R; ++i)
+            {
+                const Scalar* row = src.data() + (g * R + i) * N;
+                if constexpr (IsMax)
+                {
+                    for (std::size_t n = 0; n < N; ++n) o[n] = std::max(o[n], row[n]);
+                }
+                else
+                {
+                    for (std::size_t n = 0; n < N; ++n) o[n] += row[n];
+                }
+            }
+        };
+
+        if (G * R * N >= PARALLEL_THRESHOLD && G > 1)
+        {
+            auto idx = std::views::iota(std::size_t{0}, G);
+            nn::parallel_for_blocks(idx.begin(), idx.end(), group_kernel);
+        }
+        else
+        {
+            for (std::size_t g = 0; g < G; ++g) group_kernel(g);
+        }
+        return Tensor::from_matrix(std::move(out));
+    }
+
+    [[nodiscard]] Result<Tensor> grouped_reduce_sum(
+        const Tensor& x, std::size_t G, std::size_t R) override
+    {
+        return grouped_reduce_cpu_<false>(x, G, R);
+    }
+
+    [[nodiscard]] Result<Tensor> grouped_reduce_max(
+        const Tensor& x, std::size_t G, std::size_t R) override
+    {
+        return grouped_reduce_cpu_<true>(x, G, R);
     }
 
     // ══════════════════════════════════════════════════════════════════════

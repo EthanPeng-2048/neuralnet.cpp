@@ -144,8 +144,13 @@ namespace nn::cli
     }
 
     // ── 评估模型准确率 ─────────────────────────────────────────────────────
-    // 全量前向后下载到 CPU 做 argmax，计算 top-1 准确率。
+    // 分块前向 → 每块下载到 CPU 做 argmax → 汇总 top-1 准确率。
     // eval_samples > 0 时只评估前 N 个样本（用于 Transformer 等评估成本高的场景）。
+    // eval_batch   > 0 时每块 N 个样本前向（**CNN 必须分块**）：
+    //   卷积层的 im2col 展开是 k²×C_in 倍，全量评估 60000 样本单次 forward 需
+    //   ~6.4 GB 显存（实测 `vkAllocateMemory failed: -2`）；分块后峰值 ≈ 1/块数，
+    //   每块结束归还空闲池块（release_idle_pool_blocks），不再留高水位。
+    //   0 = 不分块（等价旧行为，仅适合 MLP 等小激活模型）。
     //
     // 注：原 evaluate 签名 (nn::Layer&, ...) 不可行 —— nn::Model 不派生自 nn::Layer，
     //     且 Model::forward 自带 engine 绑定，签名不同于 Layer::forward(engine, ...)。
@@ -153,34 +158,13 @@ namespace nn::cli
     [[nodiscard]] inline nn::Result<nn::Scalar>
     evaluate_mnist(nn::Model &model, nn::ComputeEngine &engine,
                    const nn::Matrix &x, const nn::Matrix &y_onehot,
-                   std::size_t eval_samples = 0)
+                   std::size_t eval_samples = 0, std::size_t eval_batch = 1000)
     {
         const std::size_t N =
             (eval_samples > 0) ? std::min(x.cols(), eval_samples) : x.cols();
         if (N == 0)
             return std::unexpected(nn::Error{"evaluate_mnist: empty dataset"});
-
-        // 若截取子集，则拷贝前 N 列；全量评估直接引用原矩阵（避免无谓拷贝）
-        nn::Matrix x_sub, y_sub;
-        const nn::Matrix *xp = &x;
-        const nn::Matrix *yp = &y_onehot;
-        if (N < x.cols())
-        {
-            x_sub = nn::Matrix(x.rows(), N);
-            y_sub = nn::Matrix(y_onehot.rows(), N);
-            for (std::size_t i = 0; i < N; ++i)
-            {
-                for (std::size_t r = 0; r < x.rows(); ++r)
-                    x_sub.set_value_unchecked(r, i, x.at_unchecked(r, i));
-                for (std::size_t r = 0; r < y_onehot.rows(); ++r)
-                    y_sub.set_value_unchecked(r, i, y_onehot.at_unchecked(r, i));
-            }
-            xp = &x_sub;
-            yp = &y_sub;
-        }
-
-        auto x_tensor_r = engine.from_matrix(*xp);
-        if (!x_tensor_r) return std::unexpected(std::move(x_tensor_r).error());
+        const std::size_t chunk = (eval_batch > 0) ? std::min(eval_batch, N) : N;
 
         // 评估一律用推理模式：BatchNorm 使用 running 统计量而非 batch 统计量。
         // 评估结束后恢复训练模式（调用方默认为训练场景）。
@@ -195,45 +179,67 @@ namespace nn::cli
             ~TrainingGuard() { m.set_training(true); }
         } training_guard{model};
 
-        // batch 模式加速 forward（GPU 下消除 per-primitive 提交开销）
-        auto bb = engine.begin_batch();
-        if (!bb) return std::unexpected(bb.error());
-
-        auto out_tensor_r = model.forward(*x_tensor_r);
-        if (!out_tensor_r) return std::unexpected(std::move(out_tensor_r).error());
-
-        auto eb = engine.end_batch();
-        if (!eb) return std::unexpected(eb.error());
-
-        auto out_r = engine.to_matrix(*out_tensor_r);
-        if (!out_r) return std::unexpected(std::move(out_r).error());
-        const auto &out = *out_r;
-
-        int correct = 0;
-        for (std::size_t i = 0; i < N; ++i)
+        std::size_t correct = 0;
+        for (std::size_t start = 0; start < N; start += chunk)
         {
-            nn::Scalar max_val = out.at_unchecked(0, i);
-            int pred = 0;
-            for (int j = 1; j < static_cast<int>(nn::MNIST_NUM_CLASSES); ++j)
+            const std::size_t cnt = std::min(chunk, N - start);
+
+            // 取第 [start, start+cnt) 列的子矩阵（CPU 侧拷贝，MNIST 量级很小）
+            nn::Matrix xb(x.rows(), cnt);
+            for (std::size_t i = 0; i < cnt; ++i)
+                for (std::size_t r = 0; r < x.rows(); ++r)
+                    xb.set_value_unchecked(r, i, x.at_unchecked(r, start + i));
+
+            auto x_tensor_r = engine.from_matrix(xb);
+            if (!x_tensor_r) return std::unexpected(std::move(x_tensor_r).error());
+
+            // batch 模式加速 forward（GPU 下消除 per-primitive 提交开销）
+            auto bb = engine.begin_batch();
+            if (!bb) return std::unexpected(bb.error());
+
+            auto out_tensor_r = model.forward(*x_tensor_r);
+            if (!out_tensor_r)
             {
-                nn::Scalar val = out.at_unchecked(j, i);
-                if (val > max_val)
-                {
-                    max_val = val;
-                    pred = j;
-                }
+                (void)engine.end_batch();   // 出错也收尾，避免录制状态泄漏
+                return std::unexpected(std::move(out_tensor_r).error());
             }
-            int true_label = -1;
-            for (int j = 0; j < static_cast<int>(nn::MNIST_NUM_CLASSES); ++j)
+
+            auto eb = engine.end_batch();
+            if (!eb) return std::unexpected(eb.error());
+
+            auto out_r = engine.to_matrix(*out_tensor_r);
+            if (!out_r) return std::unexpected(std::move(out_r).error());
+            const auto &out = *out_r;
+
+            for (std::size_t i = 0; i < cnt; ++i)
             {
-                if (yp->at_unchecked(j, i) == 1.0)
+                nn::Scalar max_val = out.at_unchecked(0, i);
+                int pred = 0;
+                for (int j = 1; j < static_cast<int>(nn::MNIST_NUM_CLASSES); ++j)
                 {
-                    true_label = j;
-                    break;
+                    nn::Scalar val = out.at_unchecked(j, i);
+                    if (val > max_val)
+                    {
+                        max_val = val;
+                        pred = j;
+                    }
                 }
+                int true_label = -1;
+                for (int j = 0; j < static_cast<int>(nn::MNIST_NUM_CLASSES); ++j)
+                {
+                    if (y_onehot.at_unchecked(j, start + i) == 1.0)
+                    {
+                        true_label = j;
+                        break;
+                    }
+                }
+                if (pred == true_label)
+                    ++correct;
             }
-            if (pred == true_label)
-                ++correct;
+
+            // 归还本块峰值产生的空闲池块：否则显存池高水位会留在 device
+            // （CPU 引擎 no-op）。
+            (void)engine.release_idle_pool_blocks();
         }
         return static_cast<nn::Scalar>(correct) / static_cast<nn::Scalar>(N);
     }

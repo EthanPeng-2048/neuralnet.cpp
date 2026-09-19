@@ -40,7 +40,6 @@
 
 #include "compute_engine.hpp"
 #include "expr_opt.hpp"
-#include "expr_graph.hpp"   // IR-C：图 IR + 融合分析
 #include "expr_dsl.hpp"    // P3-3：matmul_with_bias 经 DSL 融合（单一事实源）
 
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
@@ -58,12 +57,6 @@ class GpuEngine final : public ComputeEngine
 {
 private:
     GpuBackend& backend_;
-
-    // IR-C 图 IR 录制（begin_expr/end_expr）：
-    // 录制图由 fused::recording_graph_owner()（thread_local unique_ptr）
-    // 持有（D3 修复：原 recording_/node_outputs_ 成员跨线程共享，与
-    // thread_local 录制指针组合存在数据竞争；现每线程独立堆分配，
-    // 节点占位输出 node_outputs 随图一起隔离）。
 
 public:
     explicit GpuEngine(GpuBackend& backend) : backend_(backend) {}
@@ -208,32 +201,6 @@ public:
     [[nodiscard]] Result<void> flush_batch() override
     {
         return backend_.flush_batch();
-    }
-
-    // ── 表达式录制（IR-C）：begin_expr/end_expr 图 IR 融合 ─────────────
-    // begin_expr 开启录制：期间 eval_expr / eval_expr_reduce 把表达式加入
-    // 录制图并返回携带 virtual_tag 的占位 Tensor（真实 GPU buffer，Layer
-    // 无感知）。end_expr 做融合分析：逐元素链拼接成复合 ExprSpec → 每
-    // kernel 一次 AOT dispatch，输出写入对应节点的占位 buffer（Layer 持有
-    // 的 Tensor 即物化）。未命中 AOT 融合 shader → 硬报错（闭合世界）。
-    [[nodiscard]] Result<void> begin_expr() override
-    {
-        // D3：每线程独立堆分配录制图（含 node_outputs），互不干扰
-        auto& owner = fused::recording_graph_owner();
-        if (owner)
-            return std::unexpected(Error{"begin_expr: 嵌套录制（已有未结束的 begin_expr）"});
-        owner = std::make_unique<ExprGraph>();
-        return {};
-    }
-
-    [[nodiscard]] Result<void> end_expr() override
-    {
-        auto& owner = fused::recording_graph_owner();
-        if (!owner)
-            return {};
-        ExprGraph g = std::move(*owner);
-        owner.reset();
-        return execute_fused_graph(g);
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -509,6 +476,56 @@ public:
         auto a_gpu = ensure_gpu(A);
         if (!a_gpu) return std::unexpected(a_gpu.error());
         auto r = backend_.transpose_gpu(a_gpu->gpu_tensor());
+        if (!r) return std::unexpected(r.error());
+        return Tensor::from_gpu(std::move(*r));
+    }
+
+    // ── 卷积/池化窗口展开（纯数据搬运，无算法；契约见 compute_engine.hpp）──
+    [[nodiscard]] Result<Tensor> im2col(
+        const Tensor& x,
+        std::size_t C, std::size_t H, std::size_t W,
+        std::size_t k, std::size_t stride, std::size_t pad,
+        std::size_t OH, std::size_t OW) override
+    {
+        auto x_gpu = ensure_gpu(x);
+        if (!x_gpu) return std::unexpected(x_gpu.error());
+        auto r = backend_.im2col_gpu(x_gpu->gpu_tensor(),
+                                     C, H, W, k, stride, pad, OH, OW);
+        if (!r) return std::unexpected(r.error());
+        return Tensor::from_gpu(std::move(*r));
+    }
+
+    [[nodiscard]] Result<Tensor> col2im(
+        const Tensor& col,
+        std::size_t C, std::size_t H, std::size_t W,
+        std::size_t k, std::size_t stride, std::size_t pad,
+        std::size_t OH, std::size_t OW) override
+    {
+        auto c_gpu = ensure_gpu(col);
+        if (!c_gpu) return std::unexpected(c_gpu.error());
+        auto r = backend_.col2im_gpu(c_gpu->gpu_tensor(),
+                                     C, H, W, k, stride, pad, OH, OW);
+        if (!r) return std::unexpected(r.error());
+        return Tensor::from_gpu(std::move(*r));
+    }
+
+    // ── 分组归约（契约见 compute_engine.hpp）──────────────────────────
+    [[nodiscard]] Result<Tensor> grouped_reduce_sum(
+        const Tensor& x, std::size_t G, std::size_t R) override
+    {
+        auto x_gpu = ensure_gpu(x);
+        if (!x_gpu) return std::unexpected(x_gpu.error());
+        auto r = backend_.grouped_reduce_gpu(x_gpu->gpu_tensor(), G, R, /*is_max=*/false);
+        if (!r) return std::unexpected(r.error());
+        return Tensor::from_gpu(std::move(*r));
+    }
+
+    [[nodiscard]] Result<Tensor> grouped_reduce_max(
+        const Tensor& x, std::size_t G, std::size_t R) override
+    {
+        auto x_gpu = ensure_gpu(x);
+        if (!x_gpu) return std::unexpected(x_gpu.error());
+        auto r = backend_.grouped_reduce_gpu(x_gpu->gpu_tensor(), G, R, /*is_max=*/true);
         if (!r) return std::unexpected(r.error());
         return Tensor::from_gpu(std::move(*r));
     }
@@ -979,22 +996,6 @@ public:
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols) override
     {
-        // ── IR-C：录制模式（begin_expr/end_expr 内）──────────────────
-        // 把表达式加入录制图，返回携带 virtual_tag 的占位 GPU buffer；
-        // end_expr 时融合执行并物化。依赖识别：inputs 中带 virtual_tag 的
-        // 占位 Tensor（前序节点输出）建立依赖边，不作为 kernel 外部输入。
-        if (auto* g = fused::recording_graph())
-        {
-            const int node = g->add_node(raw_spec, inputs, rows, cols,
-                                         /*vector_out=*/false);
-            auto out = GpuTensor::create_empty(rows, cols, backend_);
-            if (!out) return std::unexpected(out.error());
-            Tensor t = Tensor::from_gpu(std::move(*out));
-            t.set_virtual_tag(static_cast<std::uint64_t>(node) + 1);
-            g->node_outputs[node] = t;  // D3：占位输出随图隔离（thread-local）
-            return t;
-        }
-
         // ── canonical IR：canonicalize 为引擎内部优化（IR-A/IR-B），
         //    key 与 shader 合成两端一致；dispatch 用 canonical 的 consts ──
         const ExprSpec spec = nn::canonicalize_expr_spec(raw_spec);
@@ -1041,22 +1042,6 @@ public:
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols) override
     {
-        // ── IR-C：录制模式（归约输出：占位 buffer 按归约向量形状分配）──
-        if (auto* g = fused::recording_graph())
-        {
-            const int node = g->add_node(raw_spec, inputs, rows, cols,
-                                         /*vector_out=*/true);
-            const int raxis = expr_spec_reduce_axis(raw_spec);
-            const std::size_t orows = (raxis == 0) ? rows : 1;
-            const std::size_t ocols = (raxis == 1) ? cols : 1;
-            auto out = GpuTensor::create_empty(orows, ocols, backend_);
-            if (!out) return std::unexpected(out.error());
-            Tensor t = Tensor::from_gpu(std::move(*out));
-            t.set_virtual_tag(static_cast<std::uint64_t>(node) + 1);
-            g->node_outputs[node] = t;  // D3：占位输出随图隔离（thread-local）
-            return t;
-        }
-
         // canonical IR：与 eval_expr 同（canonicalize 为引擎内部优化）
         const ExprSpec spec = nn::canonicalize_expr_spec(raw_spec);
 
@@ -1161,126 +1146,6 @@ public:
     }
 
 private:
-    // ── IR-C：融合执行 ──────────────────────────────────────────────────
-    // 图 → 融合分析 → kernel 序列 → 逐个 AOT dispatch。每个 kernel 的输出
-    // 写入其末尾节点（tail）的占位 buffer（g.node_outputs[tail]），使 Layer
-    // 持有的占位 Tensor 在 end_expr 后物化。中间节点若被融合则无独立输出
-    // （作为寄存器内联），若为融合边界则其占位 buffer 由自身 kernel 写入
-    // 并被后续 kernel 当作输入绑定（FusedKernelInput.node 来源）。
-    // D3：node_outputs 随图（thread-local 堆分配）隔离，不再用引擎成员。
-    [[nodiscard]] Result<void> execute_fused_graph(ExprGraph& g)
-    {
-        // P2-12 图级缓存跨 step 复用：训练每 step 结构重复，整图结构 key
-        // 命中缓存则直接实例化 kernel 计划（跳过融合分析 + 拼接 canonicalize
-        // + validate + key 计算），消除训练热路径的重复 CPU 融合开销。
-        // 缓存只复用结构决策，运行时按 plan 绑定 node_outputs 与外部张量。
-        auto& gcache = fused::graph_plan_cache();
-        const std::uint64_t gkey = graph_cache_key(g);
-        std::vector<FusedKernel> kernels;
-        const auto cit = gcache.find(gkey);
-        if (cit != gcache.end())
-        {
-            kernels.reserve(cit->second.size());
-            for (const auto& p : cit->second)
-                kernels.push_back(instantiate_plan(p, g));
-        }
-        else
-        {
-            kernels = fuse_expr_graph(g);
-            std::vector<FusedKernelPlan> plans;
-            plans.reserve(kernels.size());
-            for (const auto& k : kernels)
-                plans.push_back(plan_from_kernel(k));
-            if (gcache.size() >= fused::GRAPH_PLAN_CACHE_MAX)
-                gcache.clear();
-            gcache.emplace(gkey, std::move(plans));
-        }
-
-        // P1（IR 中间张量消除）：标记需要保留占位 buffer 的节点——
-        //   * kernel 的 tail（输出节点，Layer 持有的占位 Tensor 在此物化）
-        //   * kernel 的输入源（融合边界，其 buffer 被后续 kernel 绑定为输入）
-        // 被融合进其他 kernel 的中间节点（既非 tail 也非任何 kernel 输入源）
-        // 的占位 buffer **从未被写入**（其输出已内联为寄存器），纯浪费显存。
-        // dispatch 完成后立即释放，归还内存池。
-        std::vector<std::uint8_t> keep(g.nodes.size(), 0);
-        for (const auto& k : kernels)
-        {
-            if (k.tail >= 0 && static_cast<std::size_t>(k.tail) < keep.size())
-                keep[static_cast<std::size_t>(k.tail)] = 1;
-            for (const auto& in : k.inputs)
-                if (in.node >= 0 && static_cast<std::size_t>(in.node) < keep.size())
-                    keep[static_cast<std::size_t>(in.node)] = 1;
-        }
-
-        for (auto& k : kernels)
-        {
-            // 解析输入：node 来源 → 该节点占位输出 buffer；external → 直接张量
-            std::vector<GpuTensor> gpu_inputs;
-            gpu_inputs.reserve(k.inputs.size());
-            for (auto& in : k.inputs)
-            {
-                Tensor t;
-                if (in.node >= 0)
-                {
-                    const auto it = g.node_outputs.find(in.node);
-                    if (it == g.node_outputs.end())
-                        return std::unexpected(Error{
-                            "GpuEngine::end_expr: 依赖节点输出缺失（图 IR 状态损坏）"});
-                    t = it->second;
-                }
-                else
-                {
-                    t = in.external;
-                }
-                auto gg = ensure_gpu(t);
-                if (!gg) return std::unexpected(gg.error());
-                gpu_inputs.push_back(gg->gpu_tensor());
-            }
-
-            // AOT 匹配（闭合世界：融合后的复合 spec 必须在构建期 scan 登记过）
-            const std::string key = nn::expr_spec_key(k.spec);
-#ifdef NN_FUSED_REGISTRY_EMBEDDED
-            const nn::fused::FusedShader* fs = nn::fused::find_fused(key);
-            if (fs && backend_.has_fused_shader(key))
-            {
-                const auto vp = nn::expr_spec_runtime_view_params(k.spec);
-                GpuTensor* out_override = nullptr;
-                const auto out_it = g.node_outputs.find(k.tail);
-                if (out_it != g.node_outputs.end())
-                    out_override = &out_it->second.gpu_tensor();
-                auto out = backend_.run_fused_gpu(
-                    key, gpu_inputs, k.spec.consts, k.rows, k.cols,
-                    k.vector_out, vp, k.spec.rparams, out_override,
-                    nn::expr_spec_runtime_matmul_k(k.spec),
-                    nn::expr_spec_runtime_matmul_batch(k.spec));
-                if (!out) return std::unexpected(out.error());
-                if (!out_override)
-                    g.node_outputs[k.tail] = Tensor::from_gpu(std::move(*out));
-                continue;
-            }
-#endif
-            return std::unexpected(Error{
-                "GpuEngine::end_expr: 融合 kernel 未命中 AOT 融合 shader（闭合世界）；"
-                "请将 begin_expr/end_expr 段纳入构建期扫描（scan_exprs）"});
-        }
-
-        // P1：释放被融合中间节点的占位 buffer（显存中间张量消除）。
-        // 安全依据：被融合节点的占位 Tensor 只被 g.node_outputs 持有（Layer
-        // 侧局部变量 t/u 在 forward 返回后已析构），erase 后 shared_ptr 计数
-        // 归零，buffer 归还内存池。tail 与输入源节点保留（仍在图生命周期内
-        // 使用，且 Layer 持有的 tail Tensor 与之共享 buffer）。
-        for (auto it = g.node_outputs.begin(); it != g.node_outputs.end();)
-        {
-            const int nd = it->first;
-            if (nd >= 0 && static_cast<std::size_t>(nd) < keep.size()
-                && !keep[static_cast<std::size_t>(nd)])
-                it = g.node_outputs.erase(it);
-            else
-                ++it;
-        }
-        return {};
-    }
-
     // ── 辅助：确保 Tensor 在 GPU 上 ──────────────────────────────────────
     // 若已是 GPU，返回共享拷贝（零开销）；若为 CPU，上传到 GPU。
     // 纯 GPU 架构下，所有 Tensor 应已是 GPU，此方法为防御性兜底。

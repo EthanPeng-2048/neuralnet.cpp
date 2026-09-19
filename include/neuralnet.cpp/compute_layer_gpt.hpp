@@ -33,12 +33,8 @@ private:
     Tensor residual2_cache_;
 
     // ── activation offload（L1-offload）状态 ──
-    bool offload_enabled_ = false;      // GPTModel 是否启用 offload
-    bool offloaded_ = false;            // 当前激活是否已导出到 host
-    Tensor offload_slab_;               // 持久 host-visible 缓冲（跨 step 复用）
-    std::vector<TensorRef> offload_refs_;        // 需 offload 的缓存成员引用（稳定地址）
-    std::vector<std::pair<std::size_t, std::size_t>> offload_shapes_;  // 各缓存形状
-    std::vector<std::size_t> offload_offsets_;   // 各激活在 slab 中的 float 偏移
+    // 实现已抽到 compute_layer_base.hpp 的 ActivationOffloader（与 RAPTBlock 共用）
+    ActivationOffloader offloader_;
 
 public:
     GPTBlock(std::size_t d_model, std::size_t num_heads,
@@ -144,72 +140,25 @@ public:
     }
 
     // ── activation offload（L1-offload）────────────────────────────────
-    void set_offload_enabled(bool enabled)
-    {
-        offload_enabled_ = enabled;
-        if (!enabled) offload_slab_ = Tensor{};  // 释放持久缓冲
-    }
-    [[nodiscard]] bool offload_enabled() const noexcept { return offload_enabled_; }
+    void set_offload_enabled(bool enabled) { offloader_.set_enabled(enabled); }
+    [[nodiscard]] bool offload_enabled() const noexcept { return offloader_.enabled(); }
 
-    // 导出：把本块 backward 所需的中间激活逐个写入持久 host slab（释放 GPU 显存）。
-    // offload_refs_ 记录各缓存成员地址（forward 后成员地址稳定），导入时复用。
+    // 导出/导入：委托给通用 ActivationOffloader（见 compute_layer_base.hpp）。
+    // 参与 offload 的缓存集合 = 本块 activation_cache()。
     [[nodiscard]] Result<void> export_activations(ComputeEngine& engine)
     {
-        if (!offload_enabled_ || offloaded_) return {};
-        offload_refs_ = activation_cache();
-        offload_offsets_.clear();
-        offload_shapes_.clear();
-        // 惰性创建持久 slab（大小 = 本块激活总 float 数，跨 step 复用）
-        if (!offload_slab_.valid())
-        {
-            std::size_t total = 0;
-            for (auto& ref : offload_refs_)
-                if (ref.get().valid()) total += ref.get().size();
-            // 无有效激活可导出（如混合模式下 checkpoint 块 forward 不驻留缓存）
-            if (total == 0)
-            {
-                offloaded_ = false;
-                return {};
-            }
-            auto slab = engine.create_offload_buffer(total);
-            if (!slab) return std::unexpected(slab.error());
-            offload_slab_ = std::move(*slab);
-        }
-        std::size_t offset = 0;
-        for (auto& ref : offload_refs_)
-        {
-            if (!ref.get().valid()) continue;
-            auto r = engine.offload_save(offload_slab_, offset, ref.get());
-            if (!r) return std::unexpected(r.error());
-            offload_shapes_.push_back({ref.get().rows(), ref.get().cols()});
-            offload_offsets_.push_back(offset);
-            offset += ref.get().size();
-            ref.get() = Tensor{};  // 释放 GPU 版（数据已在 host slab）
-        }
-        offloaded_ = true;
-        return {};
+        return offloader_.export_activations(engine, activation_cache());
     }
 
-    // 导入：从 host slab 恢复激活到缓存成员（backward 前调用，替代重计算）
     [[nodiscard]] Result<void> import_activations(ComputeEngine& engine)
     {
-        if (!offloaded_) return {};
-        for (std::size_t i = 0; i < offload_offsets_.size(); ++i)
-        {
-            auto t = engine.offload_restore(offload_slab_, offload_offsets_[i],
-                                            offload_shapes_[i].first,
-                                            offload_shapes_[i].second);
-            if (!t) return std::unexpected(t.error());
-            offload_refs_[i].get() = std::move(*t);
-        }
-        offloaded_ = false;
-        return {};
+        return offloader_.import_activations(engine);
     }
 
     // 实际 slab 字节数（诊断用；未创建时 0）
     [[nodiscard]] std::size_t offload_slab_bytes() const noexcept
     {
-        return offload_slab_.valid() ? offload_slab_.size() * sizeof(float) : 0;
+        return offloader_.slab_bytes();
     }
 
     [[nodiscard]] Result<Tensor> forward(
@@ -244,7 +193,7 @@ public:
         ComputeEngine& engine, const Tensor& grad_output) override
     {
         // activation offload：从 host 恢复激活再反向（替代重计算）
-        if (offloaded_)
+        if (offloader_.offloaded())
         {
             auto im = import_activations(engine);
             if (!im) return std::unexpected(im.error());

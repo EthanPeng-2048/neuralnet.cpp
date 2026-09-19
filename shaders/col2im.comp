@@ -1,0 +1,74 @@
+// ── col2im.comp ───────────────────────────────────────────────────────────
+// 纯原语：im2col 的伴随（adjoint / 反向散射），数据搬运，绝不含算法
+//
+//   col (C*k*k, B*OH*OW) → out (C*H*W, B)
+//   out[ci*H*W + ih*W + iw, b]
+//     = Σ_{kh,kw} col[(ci*k + kh)*k + kw, (oh*OW + ow)*B + b]
+//   其中 oh = (ih + pad - kh)/stride（须整除且落在 [0, OH)），ow 同理。
+//   **重叠窗口（stride < k）的贡献在此累加**；每个输出元素由单个线程完整
+//   求和，故不需要原子操作、也不需要预先清零输出。
+//
+// 绑定布局：
+//   binding 0: 输入 col (readonly,  C*k*k × B*OH*OW)
+//   binding 1: 输出 out (writeonly, C*H*W × B)
+//
+// Push Constants（36 bytes）：
+//   uint C, H, W, k, stride, pad, OH, OW, B
+// ─────────────────────────────────────────────────────────────────────────
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufIn  { float in_data[];  };
+layout(std430, binding = 1) writeonly buffer BufOut { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint C;
+    uint H;
+    uint W;
+    uint k;
+    uint stride;
+    uint pad;
+    uint OH;
+    uint OW;
+    uint B;
+};
+
+void main()
+{
+    const uint idx = gl_GlobalInvocationID.x;
+    const uint rows = C * H * W;
+    const uint cols = B;
+    if (idx >= rows * cols) return;
+
+    const uint row = idx / cols;   // 输入像素行 = ci*H*W + ih*W + iw
+    const uint b   = idx % cols;
+
+    const uint ci  = row / (H * W);
+    const uint rem = row % (H * W);
+    const uint ih  = rem / W;
+    const uint iw  = rem % W;
+
+    const uint P = OH * OW;
+    const int s_stride = int(stride);
+
+    float acc = 0.0;
+    for (uint kh = 0; kh < k; ++kh)
+    {
+        const int t = int(ih + pad) - int(kh);
+        if (t < 0 || (t % s_stride) != 0) continue;
+        const int oh = t / s_stride;
+        if (oh >= int(OH)) continue;
+        for (uint kw = 0; kw < k; ++kw)
+        {
+            const int s = int(iw + pad) - int(kw);
+            if (s < 0 || (s % s_stride) != 0) continue;
+            const int ow = s / s_stride;
+            if (ow >= int(OW)) continue;
+            const uint r = (ci * k + kh) * k + kw;
+            acc += in_data[r * (B * P) + (uint(oh) * OW + uint(ow)) * B + b];
+        }
+    }
+    out_data[idx] = acc;
+}
