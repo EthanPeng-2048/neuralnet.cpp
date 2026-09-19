@@ -287,7 +287,6 @@ void print_usage(const char *prog)
         << "  --d-ff <n>         FFN 中间维度 (默认: 512)\n"
         << "  --gpu <索引>       启用 GPU 加速 (需要 Vulkan SDK)，可用枚举索引指定设备\n"
         << "                     (名称子串写法: --gpu=NVIDIA / --gpu=40HX)\n"
-        << "  --cuda             启用 CUDA GPU 加速 (需要 CUDA Toolkit)\n"
         << "  --positional-encoding <type>\n"
         << "                     位置编码类型: learned(默认)/sinusoidal/alibi/rope\n"
         << "                     learned: 可学习位置嵌入（默认，GPT 原版）\n"
@@ -381,7 +380,6 @@ struct TrainConfig
     std::size_t save_interval = 100;  // checkpoint 保存间隔（独立于 log_interval）
     bool load_existing = false;
     bool gpu_enabled = false;
-    bool cuda_enabled = false;
     std::string gpu_device;         // --gpu 的可选设备选择子（空 = 自动选卡）
     bool grad_log = false;          // 显示梯度统计
     bool no_cache = false;          // 禁用 tokenize 缓存
@@ -568,8 +566,6 @@ TrainConfig parse_args(int argc, char *argv[])
             cfg.gpu_enabled = true;
             if (!gpu_dev->empty()) cfg.gpu_device = *gpu_dev;
         }
-        else if (arg == "--cuda")
-            cfg.cuda_enabled = true;
         else if (arg == "--grad-log")
             cfg.grad_log = true;
         else if (arg == "--no-cache")
@@ -945,7 +941,6 @@ int main(int argc, char *argv[])
     // ── 创建计算引擎 ─────────────────────────────────────────
     nn::cli::EngineConfig eng_cfg;
     eng_cfg.use_gpu = cfg.gpu_enabled;
-    eng_cfg.use_cuda = cfg.cuda_enabled;
     eng_cfg.gpu_device = cfg.gpu_device;
     auto engine_res = nn::cli::create_engine(eng_cfg, std::cout);
     if (!engine_res)

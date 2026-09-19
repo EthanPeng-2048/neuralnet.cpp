@@ -10,7 +10,7 @@
 //   则 dL/dlogits = go；对每个参数元素做 ±eps 扰动重算 L，
 //   中心差分近似解析梯度（backward 所得）并比对。
 //
-// 用法：gpt_gradcheck [--cuda|--gpu] [--layers N] [--tol <f>]
+// 用法：gpt_gradcheck [--gpu] [--layers N] [--tol <f>]
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>
@@ -126,7 +126,6 @@ bool check_grad_tensor(
 int main(int argc, char* argv[])
 {
     Scalar tol = 5e-2f;
-    bool use_cuda = false;
     bool use_gpu = false;
     std::size_t num_layers = 2;
     std::size_t batch = 2;
@@ -142,19 +141,16 @@ int main(int argc, char* argv[])
             batch = static_cast<std::size_t>(std::atoi(argv[++i]));
         else if (a == "--pos-enc" && i + 1 < argc)
             pos_enc_name = argv[++i];
-        else if (a == "--cuda")
-            use_cuda = true;
         else if (a == "--gpu")
             use_gpu = true;
         else if (a == "--help")
         {
-            std::cout << "用法: gpt_gradcheck [--cuda|--gpu] [--layers N] [--batch N] [--tol <f>] [--pos-enc learned|sinusoidal|alibi|rope]\n";
+            std::cout << "用法: gpt_gradcheck [--gpu] [--layers N] [--batch N] [--tol <f>] [--pos-enc learned|sinusoidal|alibi|rope]\n";
             return 0;
         }
     }
 
     nn::cli::EngineConfig ecfg;
-    ecfg.use_cuda = use_cuda;
     ecfg.use_gpu = use_gpu;
     auto engine_res = nn::cli::create_engine(ecfg, std::cout);
     if (!engine_res) { std::cerr << "引擎创建失败: " << engine_res.error().message << "\n"; return 1; }

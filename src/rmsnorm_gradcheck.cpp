@@ -8,7 +8,7 @@
 //   则 dL/dθ = backward 得到的梯度
 //   对每个参数/输入元素做 ±eps 扰动，重算 L，中心差分近似解析梯度并比对。
 //
-// 用法：rmsnorm_gradcheck [--cuda|--gpu] [--tol <f>]
+// 用法：rmsnorm_gradcheck [--gpu] [--tol <f>]
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>
@@ -120,26 +120,22 @@ bool check_grad_tensor(
 int main(int argc, char *argv[])
 {
     Scalar tol = 2e-2f;
-    bool use_cuda = false;
     bool use_gpu = false;
     for (int i = 1; i < argc; ++i)
     {
         std::string a = argv[i];
         if (a == "--tol" && i + 1 < argc)
             tol = static_cast<Scalar>(std::atof(argv[++i]));
-        else if (a == "--cuda")
-            use_cuda = true;
         else if (a == "--gpu")
             use_gpu = true;
         else if (a == "--help")
         {
-            std::cout << "用法: rmsnorm_gradcheck [--cuda|--gpu] [--tol <f>]\n";
+            std::cout << "用法: rmsnorm_gradcheck [--gpu] [--tol <f>]\n";
             return 0;
         }
     }
 
     nn::cli::EngineConfig ecfg;
-    ecfg.use_cuda = use_cuda;
     ecfg.use_gpu = use_gpu;
     auto engine_res = nn::cli::create_engine(ecfg, std::cout);
     if (!engine_res) { std::cerr << "引擎创建失败: " << engine_res.error().message << "\n"; return 1; }
