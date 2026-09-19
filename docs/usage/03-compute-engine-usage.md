@@ -441,20 +441,18 @@ auto result = nn::dsl::compute(
 );
 ```
 
-### 块式融合
+### 原地更新（compute_into）
 
 ```cpp
-// 开始录制
-engine.begin_expr();
-
-// 多个操作（在 GPU 上融合）
-auto temp1 = nn::dsl::compute(...);
-auto temp2 = nn::dsl::compute(...);
-auto result = nn::dsl::compute(...);
-
-// 结束录制（GPU 执行融合）
-engine.end_expr();
+// 把结果写进既有张量，不分配新 Tensor：
+nn::dsl::compute_into(engine, nn::dsl::leaf(dst) + nn::dsl::leaf(other) * nn::dsl::rparam(k), dst);
 ```
+
+### ~~块式融合~~（已移除）
+
+> 2026-09-19：`engine.begin_expr()` / `engine.end_expr()` 已随 IR-C 整体删除（无收益点，见
+> `docs/development/03-ir-optimization.md` §5.3）。需要多步逐元素变换时，直接写成**一个**
+> `dsl::compute` 表达式即可（单个 GPU 融合 kernel）。
 
 ### 典型应用
 

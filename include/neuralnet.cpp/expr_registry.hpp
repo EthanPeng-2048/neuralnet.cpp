@@ -5,7 +5,7 @@
 //
 //  AOT 收集架构（表达式只在 Layer 里，别处一律不出现）：
 //    ① 构建期 scan_exprs 用假张量 dry-run Layer 的 forward/backward，
-//       每个 dsl::compute / end_expr 在记录模式下把折叠出的 ExprSpec
+//       每个 dsl::compute / compute_reduce / compute_into 在记录模式下把折叠出的 ExprSpec
 //       **结构**登记进全局注册表（按 expr_spec_key 去重）→ dump 成 bin。
 //    ② 构建期 gen_fused 读 bin → 每 spec 生成 GLSL（glsl_gen.hpp）→
 //       glslc → SPIR-V → 内联进生成头 fused_registry.hpp（key → spirv）。

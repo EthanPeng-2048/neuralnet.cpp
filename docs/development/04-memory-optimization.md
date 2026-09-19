@@ -25,6 +25,12 @@
 - 实现：`AttentionBase`/`FeedForward`/`GPTBlock`/`TransformerEncoderLayer` 传播 checkpoint 模式；`Linear/ReLU/GeLU/SwiGLU/LayerNorm/RMSNorm/Softmax/AttentionBase` 在 checkpoint 模式下跳过中间激活缓存写入（forward 改用局部变量承载计算，避免空缓存读取）。
 - 验证：新增 `src/gpt_checkpoint_test.cpp`（`gpt_checkpoint_test`），stride∈{1,2} 与全存基线**逐位一致（max_abs=0）**；`gpt_gradcheck/rmsnorm/swiglu/softmax/attn_gradcheck`、`matmul_fusion_test`、`ce_fusion_test` 全绿；`text_train --checkpoint-every N` CPU 端到端训练正常（loss 正常下降、exit=0）。
 
+**L1 续：RLA/RAPT 接入（2026-09-19）**
+- `RAPTBlock` 新增 `forward_recompute` + `activation_cache()`；`RAPTModel` 新增块级检查点/offload/flush 管线（此前 `set_checkpoint_every`/`set_activation_offload`/`set_flush_interval` 对 RAPT 是静默 no-op，而 CLI 会打印"已启用"）。
+- `ReLULinearAttention` 在 checkpoint 模式下跳过全部 7 项 backward 缓存（Qp/Kp/V_re/Q_normed/K_normed/Q_rms_inv/K_rms_inv），并在 `backward` 缺缓存时**硬报错**而非用空/陈旧张量算垃圾梯度；`activation_cache()` 补齐此前遗漏的 4 项（否则 offload 覆盖不全）。
+- **坑**：复合层重写 `forward_recompute` 必须调用**虚函数** `set_checkpoint_mode`（基类默认实现只改自身标志位，子层不重建缓存；stride>1 时会被上一步的陈旧缓存掩盖，表现为"某些 stride 能过、某些过不了"）。
+- 验证：`src/rapt_checkpoint_test.cpp` 并入 `rapt_test`，stride∈{1,2} 与全存基线**逐位一致（max_abs=0）**；新增 GPU 侧 `rapt_offload_test`（与全存基线逐位一致）。
+
 **L2 内存池整块归还 + 统计 — 已实施**
 - `MemoryPool`：新增 `PoolStats` + `pool_debug_stats()`（块数/占用/空闲/碎片）、`release_idle_blocks()`（整块 `vkFreeMemory` + 从 `blocks_` 移除，带 `retain_free_bytes_` 保留阈值防抖动）、`set_retain_free_bytes()`。
 - `GpuBackend::release_idle_pool_blocks()`（先 `flush_pending_destroys()` 再归还）；`ComputeEngine` 新增 `release_idle_pool_blocks()` / `pool_stats()`（CPU no-op；CUDA 已停用）；`GpuEngine` override。

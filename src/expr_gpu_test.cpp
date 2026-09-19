@@ -1,6 +1,6 @@
 // ── expr_gpu_test — 表达式/IR GPU 合并测试 ─────────────────────────────────
-// 合并：expr_fuse_test + fused_gpu_test + tensor_expr_test
-// 覆盖：图 IR 融合 GPU 端到端 / AOT 融合 shader 数值验证 / 表达式求值
+// 合并：fused_gpu_test + tensor_expr_test
+// 覆盖：AOT 融合 shader 数值验证 / 表达式求值
 // 注意：需要 Vulkan SDK；纯 CPU 构建返回 77（ctest SKIP）
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -14,13 +14,6 @@ int main()
     return 77;
 }
 #else
-
-// ── expr_fuse_test ─────────────────────────────────────────────────────────
-#define main test_expr_fuse
-#define max_abs_diff max_abs_diff_fuse
-#include "expr_fuse_test.cpp"
-#undef max_abs_diff
-#undef main
 
 // ── fused_gpu_test ─────────────────────────────────────────────────────────
 #define main test_fused_gpu
@@ -38,12 +31,8 @@ int main()
 {
     int failures = 0;
 
-    std::puts("=== expr_fuse (graph IR fusion GPU e2e) ===");
-    int r = test_expr_fuse();
-    if (r != 77) failures += r;
-
     std::puts("=== fused_gpu (AOT shader numerical) ===");
-    r = test_fused_gpu();
+    int r = test_fused_gpu();
     if (r != 77) failures += r;
 
     std::puts("=== tensor_expr (expression evaluation) ===");

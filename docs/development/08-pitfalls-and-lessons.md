@@ -105,6 +105,33 @@
 - `steps=0`（mnist_train/text_train）、`--topk>10`、tokenizer_infer 空输入、`--iters 0`、`evaluate_mnist` 空数据集、`mnist_io.hpp` 末行无换行符丢样本、SGF 坐标跳 i/嵌套括号。
 - **教训**：CLI 入口的参数防护是一次性成本，review 时逐参数过一遍。
 
+### 3.7 CNN 全量评估撑爆显存（2026-09-20，已修复）
+
+- **症状**：`mnist_train --arch cnn --batch-size 600 --gpu` 第 1 轮训练正常，但轮末评估时
+  `[ERR] 评估失败: vkAllocateMemory failed: -2`（`VK_ERROR_OUT_OF_DEVICE_MEMORY`）→ 进程退出。
+- **量化（探针 + `pool_stats()`）**：
+  | 场景 | device 池 | 结果 |
+  |---|---|---|
+  | 训练步 batch=600（fwd+bwd） | 132 → 260 MB（+130 MB） | ✅ 完全正常 |
+  | 评估 batch=10000（测试集，单次 forward） | 132 → **1571 MB** | 勉强 |
+  | 评估 batch=60000（训练集，单次 forward） | 涨到 **dev=6445 MB / total=7473 MB** | ❌ OOM |
+- **根因**：`cli_mnist_io.hpp::evaluate_mnist` **一次性对整个数据集 forward**
+  （`N = x.cols()`）。`mnist_train.cpp:808` 的 `eval_n` 只对 Transformer 生效
+  （`eval_n = (arch == Transformer) ? cfg.eval_samples : 0`），MLP/CNN 走全量。
+  MLP 全量没问题，但 CNN 的 im2col 展开是 **k²·C_in 倍**：C_in=1,k=5 时 conv1 的
+  col 是 `(25, 60000·576)` = 864M float ≈ 3.5 GB，加上 Z / rearrange / gather 三份
+  同量级中间量 → ~6.4 GB，超 8 GB 卡（其中还有 1 GB 是固定的 host-visible
+  staging region，模型初始化就占）。
+- **修复**：`evaluate_mnist` 增加 `eval_batch` 参数（默认 1000）**分块前向**，
+  逐块下载做 argmax 并累加正确数；每块结束 `release_idle_pool_blocks()` 归还空闲
+  池块。`mnist_train` 传 `cfg.batch_size`。峰值降为 1/块数，评估**结果不变**。
+  验证：60000 训练 + 全量评估一轮跑通（`train_acc=89.95% test_acc=90.45%`，7.2s）。
+- **教训**：① "训练能跑、评估就崩"先怀疑**评估的 batch 策略**，不要先怀疑模型本身占用
+  （本例训练步只多 130 MB）；② 任何"一次性吃下整个数据集"的路径都要用
+  `数据量 × 每样本激活` 做预算——**CNN 类层的每样本激活是输入尺寸的 k²·C_in 倍**，
+  和 MLP 不是一个量级；③ 大池子用完要显式 `release_idle_pool_blocks()`，
+  否则高水位会一直占着 device。
+
 ---
 
 ## 4. 中危：结果偏差/性能/确定性
@@ -159,6 +186,44 @@
 - **为何从未被触发**：① 偏差仅为浮点舍入噪声，被 Adam/AdamW 的动量与学习率噪声完全吸收，loss 曲线与最终精度无可观测差异；② 项目没有"GPU vs CPU 逐字节比对"的测试（只有容差比对），抖动落在容差内；③ 单行冲突率低（embedding 梯度中同一 token 在一个 batch 内重复次数少），多数行只累加一次，顺序无关。
 - **处置**：**已文档化例外**（不修复）。理由：PyTorch 的 `index_add_` 同样非确定；改为"排序+顺序累加"需全局排序（开销大），"分桶+确定性归约"需额外显存与 kernel。偏差量级（1e-7）远小于训练噪声（1e-3），修复收益为负。CPU 参考路径（`CpuEngine::scatter_add_rows`）保持顺序累加、逐字节确定，作为 ground truth。
 - **教训**：铁律 8 的"逐字节一致"对**原子累加类**算子应放宽为"容差内一致"（与 PyTorch 对齐）；真正需要逐字节确定的是**决策类**逻辑（平局打破、ID 分配、缓存 key），而非浮点累加顺序。新增原子算子时先评估冲突率与偏差量级，再决定"修复"还是"文档化例外"。
+
+### 4.10 归约融合的 push-constant 固定头长度算错：GPU 常量池错位（2026-09-20，已修复）
+
+- **症状**：MaxPool2D 反向需要「窗口内等于 max 的元素个数」做并列均分。写成一条
+  `compute_reduce(col_reduce_sum(select(x == col_broadcast(max), 1, 0)))` 时，
+  **CPU 正确、GPU 错误**：GPU 上该归约恒返回 `kk-1`（kk 为窗口大小）——
+  即"除 argmax 外全部命中"，把并列梯度算成全量；表现成"部分随机样本梯度偏差
+  0.66~1.33"，且换成"先把 mask 物化再归约"后 GPU 立刻正确。
+- **根因（一开始判断错了）**：最初怀疑 `generate_glsl_reduce` 内联 `col_broadcast`
+  视图时下标算错。**打印生成的 GLSL 后证明 shader 完全正确**（`b1[col]` 索引无误、
+  spec 的 views/consts/instrs 也正确）——真正的根因在**运行时 push-constant 打包**：
+  `GpuBackend::run_fused_gpu` 的 `pc_base` 把"归约但无 matmul"按 **5** 个 uint 算
+  （公式 `(raxis>=0 || has_mm) ? 5 : 2`），而该形态生成器的固定头只有 **4** 个
+  （`count, cols, rows, vector_out`）→ 常量池整体后移一个 uint → shader 从错位处读
+  `c0/c1`（读到上一个 push 的残留）→ 常量全错，归约静默错值。四种形态的固定头
+  长度分别是 2 / 5 / 4 / 6（逐元素、逐元素+matmul、归约、归约+matmul）。
+- **修复**：`pc_base` 按四形态逐档计算（`raxis>=0 && has_mm ? 6 : raxis>=0 ? 4 :
+  has_mm ? 5 : 2`），并在代码里写清"必须与生成器 PC 声明逐形态一致"。
+- **回归覆盖**：`fused_gpu_test::run_reduce_consts`（并入 `expr_gpu_test`）对
+  `col_reduce_sum(select(x == col_broadcast(mx), 1, 0))` 做 CPU/GPU 对比，
+  并列数期望 {2,1,4}；对应 dry-run 在 `tools/scan_exprs.cpp`。
+- **教训**：① "CPU 对、GPU 错" 的 bug 要**先打印生成代码**再猜成因——本轮因为跳过
+  这步，先写了一个错误注释和工作区规避，多花了一轮；② 融合 shader 的
+  **push-constant 布局是生成器与打包器的隐式契约**，任何"按形态分支"的长度计算都
+  必须逐形态与声明比对；③ 每条"层内表达式"都应有一个 CPU/GPU 对比用例，
+  否则这类"只有 GPU 错"的缺陷只能靠端到端测试偶然撞上。
+
+### 4.11 重排原语必须写清行/列主序（2026-09-20）
+
+- **症状**：新写的 `im2col` 首版把源矩阵读成「列主序」（`b*(C*H*W) + row`），
+  而 `Matrix` 是**行主序**（`row*B + col`）→ im2col 全错，且因为 `col2im` 用的是
+  正确索引，表现为"im2col 错、col2im 对、伴随点积不成立"这种自相矛盾的现象，
+  很容易先怀疑参考实现。
+- **定位手段**：写一个 2×2 的最小案例**打印矩阵**（引擎 vs 独立参考），比盯着
+  公式推演快得多；再加"伴随点积 ⟨im2col(x), c⟩ == ⟨x, col2im(c)⟩"作为不依赖
+  参考实现的结构性校验。
+- **教训**：涉及布局重排的新原语，测试必须同时包含 ① 独立参考的逐元素比对、
+  ② 伴随/结构与性质校验、③ 打印小案例。三者任一单独都不足以快速定位。
 
 ---
 
@@ -217,6 +282,17 @@ pair_locations（60-80GB）、字符串未去重（30GB）、one-hot（3.2GB）�
 ### 模式 G："本地正确 ≠ 集成正确"
 GPU-resident 单算子对、链式错；attn batch=1 对、batch=2 错；gradcheck 对、训练错。
 **对策**：集成层加**最小差异测试**（batch=1 vs batch=2 对比、单层 vs 多层对比），这是定位 #1 和 #2 两个灾难 bug 的关键手段。
+
+### 模式 H：模式开关（checkpoint / offload / doc-mask）下的缓存契约半实现
+`clear_cache` / `checkpoint_mode_` / `activation_cache()` / `forward_recompute` 是一组**隐式契约**，半实现即静默错值：
+- forward 在 `checkpoint_mode_` 下必须**不驻留**缓存，且要**显式清空**（只跳过赋值会因 size 相同而静默沿用上一轮的数据）；
+- backward 依赖的缓存在缺失时必须**报错**：`std::vector::clear()` 保留容量，越界读不崩、不报错，只是"静默用陈旧索引"；
+- 复合层 override `forward_recompute` 必须调用**虚函数** `set_checkpoint_mode` 关闭**子层**，否则子层不重建缓存；
+- 带模式开关的模型必须 **override 对应 setter**（基类默认是 no-op，会让 CLI 打印的"已启用"成为谎报）。
+
+**对策**：① 每个缓存持有层在 backward 入口做 size/valid 校验；② checkpoint 分支显式清缓存；③ 复合层 `forward_recompute` 走虚函数传播；④ 每个"支持 checkpoint/offload 的模型"都要有"与全存基线**逐位一致**"的测试（GPT/RAPT/CNN 各自覆盖）。
+
+**案例（2026-09 修复）**：`RAPTModel::clear_cache()` 曾清空 `token_emb_`（模型参数被毁）；`RAPTModel` 三个模式开关曾是静默 no-op；`MaxPool2D::backward()` 曾在 `clear_cache()` 后越界读空 vector 且不报错；`RAPTBlock` 曾用基类默认 `forward_recompute` → stride=2 静默用陈旧缓存（stride=1 因同样原因"碰巧通过"）；`RAPTModel::forward` 曾无法关闭文档感知（`set_doc_ids({})` 后仍残留）。
 
 ---
 

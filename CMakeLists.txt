@@ -157,13 +157,22 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(layer_gradcheck_test src/layer_gradcheck_test.cpp)
     list(APPEND NN_TEST_TARGETS layer_gradcheck_test)
 
+    # ── CNN（MaxPool2D 独立参考比对 + 缓存/checkpoint 契约 + 端到端冒烟）──
+    nn_add_executable(cnn_test src/cnn_test.cpp)
+    list(APPEND NN_TEST_TARGETS cnn_test)
+
     # ── GPT 模型（整链梯度检查 + 梯度检查点一致性）──────────────────────
     nn_add_executable(gpt_test src/gpt_test.cpp)
     list(APPEND NN_TEST_TARGETS gpt_test)
 
-    # ── Activation Offload（原语往返 + GPT 级一致性）────────────────────
+    # ── Activation Offload（原语往返 + GPT/RAPT 模型级一致性）──────────
     nn_add_executable(offload_test src/offload_test.cpp)
     list(APPEND NN_TEST_TARGETS offload_test)
+    # 模型级 offload 一致性（GPU-only：无 Vulkan 构建时自身返回 77 = SKIP）
+    nn_add_executable(gpt_offload_test src/gpt_offload_test.cpp)
+    list(APPEND NN_TEST_TARGETS gpt_offload_test)
+    nn_add_executable(rapt_offload_test src/rapt_offload_test.cpp)
+    list(APPEND NN_TEST_TARGETS rapt_offload_test)
 
     # ── 文档感知注意力（掩码构建 + 端到端不变性）────────────────────────
     nn_add_executable(doc_attn_test src/doc_attn_test.cpp)
@@ -173,7 +182,7 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(zipt_test src/zipt_test.cpp)
     list(APPEND NN_TEST_TARGETS zipt_test)
 
-    # ── RAPT / ReLU 线性注意力（梯度 + 冒烟）────────────────────────────
+    # ── RAPT / ReLU 线性注意力（梯度 + 冒烟 + 梯度检查点）──────────────
     nn_add_executable(rapt_test src/rapt_test.cpp)
     list(APPEND NN_TEST_TARGETS rapt_test)
 
@@ -244,6 +253,9 @@ if(Vulkan_FOUND)
         transpose
         gather
         scatter_add
+        im2col
+        col2im
+        group_reduce
         scan_prefix_outer
         scan_suffix_outer
         scan_prefix_outer_gen
@@ -251,7 +263,7 @@ if(Vulkan_FOUND)
         outer_col
         cast)
     # ── 融合 shader：构建期从 Layer 内联表达式自动合成 ───────────────
-    # 表达式**文本只出现在 Layer**（compute / start_expr..end_expr）。
+    # 表达式**文本只出现在 Layer**（compute / compute_reduce / compute_into）。
     # 构建期两步：
     #   ① scan_exprs：dry-run 跑 Layer 的 forward/backward，收集折叠出的
     #      ExprSpec 结构（去重）→ expr_specs.bin（派生物，非手写定义）

@@ -7,6 +7,7 @@
 #include <limits>
 #include <memory>
 #include <random>
+#include <utility>
 #include <vector>
 
 #include "compute_engine.hpp"
@@ -120,6 +121,99 @@ public:
 
 // ── 辅助：深拷贝 Tensor（通过 engine.clone()，无 PCIe 传输） ──────────────
 // 用于需要修改中间结果但不影响原 Tensor 的场景（如 LayerNorm 中的 diff）
+// ══════════════════════════════════════════════════════════════════════════
+// ActivationOffloader — 通用激活 offload（L1-offload）
+//
+// 把「本层 backward 所需的中间激活」（由 Layer::activation_cache() 枚举）
+// 逐个写进一块持久 host-visible slab，随后把成员张量置空以释放 device-local
+// 显存；backward 入口再从 slab 恢复。与具体层无关：GPTBlock / RAPTBlock 共用
+// 同一实现（避免两份易漂移的拷贝）。
+//
+// 用法：
+//   offloader.set_enabled(true);
+//   ... forward ...
+//   offloader.export_activations(engine, activation_cache());  // 导出并释放
+//   ... backward 入口 ...
+//   offloader.import_activations(engine);                      // 恢复
+//
+// 注意：export 依赖 forward 后成员地址稳定（refs_ 持有成员引用）；
+//       无有效缓存时（如 checkpoint 模式 forward 不驻留激活）静默跳过。
+// ══════════════════════════════════════════════════════════════════════════
+class ActivationOffloader
+{
+private:
+    bool enabled_ = false;
+    bool offloaded_ = false;
+    Tensor slab_;                                   // 持久 host-visible 缓冲（跨 step 复用）
+    std::vector<TensorRef> refs_;                   // 各激活成员引用（地址稳定）
+    std::vector<std::pair<std::size_t, std::size_t>> shapes_;  // 各激活形状
+    std::vector<std::size_t> offsets_;              // 各激活在 slab 中的 float 偏移
+
+public:
+    void set_enabled(bool enabled) noexcept
+    {
+        enabled_ = enabled;
+        if (!enabled) { slab_ = Tensor{}; offloaded_ = false; }  // 释放持久缓冲
+    }
+    [[nodiscard]] bool enabled() const noexcept { return enabled_; }
+    [[nodiscard]] bool offloaded() const noexcept { return offloaded_; }
+
+    // 导出：逐个写入 slab，写入后置空成员张量（数据已在 host slab）
+    [[nodiscard]] Result<void> export_activations(
+        ComputeEngine& engine, std::vector<TensorRef> refs)
+    {
+        if (!enabled_ || offloaded_) return {};
+        refs_ = std::move(refs);
+        offsets_.clear();
+        shapes_.clear();
+        // 惰性创建持久 slab（大小 = 本层激活总 float 数，跨 step 复用）
+        if (!slab_.valid())
+        {
+            std::size_t total = 0;
+            for (auto& ref : refs_)
+                if (ref.get().valid()) total += ref.get().size();
+            if (total == 0) { offloaded_ = false; return {}; }
+            auto slab = engine.create_offload_buffer(total);
+            if (!slab) return std::unexpected(slab.error());
+            slab_ = std::move(*slab);
+        }
+        std::size_t offset = 0;
+        for (auto& ref : refs_)
+        {
+            if (!ref.get().valid()) continue;
+            auto r = engine.offload_save(slab_, offset, ref.get());
+            if (!r) return std::unexpected(r.error());
+            shapes_.push_back({ref.get().rows(), ref.get().cols()});
+            offsets_.push_back(offset);
+            offset += ref.get().size();
+            ref.get() = Tensor{};   // 释放 GPU 版（数据已在 host slab）
+        }
+        offloaded_ = true;
+        return {};
+    }
+
+    // 导入：从 host slab 恢复激活到缓存成员（backward 前调用，替代重计算）
+    [[nodiscard]] Result<void> import_activations(ComputeEngine& engine)
+    {
+        if (!offloaded_) return {};
+        for (std::size_t i = 0; i < offsets_.size(); ++i)
+        {
+            auto t = engine.offload_restore(slab_, offsets_[i],
+                                            shapes_[i].first, shapes_[i].second);
+            if (!t) return std::unexpected(t.error());
+            refs_[i].get() = std::move(*t);
+        }
+        offloaded_ = false;
+        return {};
+    }
+
+    // 实际 slab 字节数（诊断用；未创建时 0）
+    [[nodiscard]] std::size_t slab_bytes() const noexcept
+    {
+        return slab_.valid() ? slab_.size() * sizeof(float) : 0;
+    }
+};
+
 [[nodiscard]] inline Result<Tensor> clone_tensor(
     ComputeEngine& engine, const Tensor& src)
 {

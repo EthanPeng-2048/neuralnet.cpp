@@ -85,6 +85,21 @@
 #define NN_TRANSPOSE_SPV_EMBEDDED
 #endif
 
+#if __has_include("im2col_spv.hpp")
+#include "im2col_spv.hpp"
+#define NN_IM2COL_SPV_EMBEDDED
+#endif
+
+#if __has_include("col2im_spv.hpp")
+#include "col2im_spv.hpp"
+#define NN_COL2IM_SPV_EMBEDDED
+#endif
+
+#if __has_include("group_reduce_spv.hpp")
+#include "group_reduce_spv.hpp"
+#define NN_GROUP_REDUCE_SPV_EMBEDDED
+#endif
+
 #if __has_include("gather_spv.hpp")
 #include "gather_spv.hpp"
 #define NN_GATHER_SPV_EMBEDDED
@@ -363,6 +378,11 @@ private:
     VulkanPipeline transpose_pipeline_;
     VulkanPipeline gather_pipeline_;
     VulkanPipeline scatter_add_pipeline_;
+    // 卷积/池化窗口展开（纯数据搬运；Conv2D/MaxPool2D 的 im2col/col2im）
+    VulkanPipeline im2col_pipeline_;
+    VulkanPipeline col2im_pipeline_;
+    // 分组归约（沿行方向按固定长度 R 分组求和/求最大）
+    VulkanPipeline group_reduce_pipeline_;
     // RLA 扫描原语（手写原语，不进 AOT 融合注册表；铁律 3：shader 不含算法）
     VulkanPipeline scan_prefix_outer_pipeline_;
     VulkanPipeline scan_suffix_outer_pipeline_;
@@ -568,6 +588,36 @@ private:
     {
 #ifdef NN_TRANSPOSE_SPV_EMBEDDED
         return nn_transpose_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_im2col_spirv()
+    {
+#ifdef NN_IM2COL_SPV_EMBEDDED
+        return nn_im2col_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_col2im_spirv()
+    {
+#ifdef NN_COL2IM_SPV_EMBEDDED
+        return nn_col2im_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_group_reduce_spirv()
+    {
+#ifdef NN_GROUP_REDUCE_SPV_EMBEDDED
+        return nn_group_reduce_spirv_bytecode();
 #else
         static const std::vector<uint32_t> empty;
         return empty;
@@ -999,6 +1049,31 @@ public:
                 transpose_pipeline_ = std::move(*tp_r);
         }
 
+        // 13b. im2col / col2im pipeline（2 bindings, 9 uint = 36B push constants）
+        {
+            const auto& im_spirv = get_im2col_spirv();
+            if (!im_spirv.empty())
+            {
+                auto r = VulkanPipeline::create_generic(
+                    device_.device(), im_spirv, 2, 9 * sizeof(uint32_t));
+                if (r) im2col_pipeline_ = std::move(*r);
+            }
+            const auto& c2_spirv = get_col2im_spirv();
+            if (!c2_spirv.empty())
+            {
+                auto r = VulkanPipeline::create_generic(
+                    device_.device(), c2_spirv, 2, 9 * sizeof(uint32_t));
+                if (r) col2im_pipeline_ = std::move(*r);
+            }
+            const auto& gr_spirv = get_group_reduce_spirv();
+            if (!gr_spirv.empty())
+            {
+                auto r = VulkanPipeline::create_generic(
+                    device_.device(), gr_spirv, 2, 4 * sizeof(uint32_t));
+                if (r) group_reduce_pipeline_ = std::move(*r);
+            }
+        }
+
         // 14. 创建 gather pipeline（3 bindings, 12B push constants）
         const auto& gather_spirv = get_gather_spirv();
         if (!gather_spirv.empty())
@@ -1137,6 +1212,9 @@ public:
     [[nodiscard]] bool has_reduce_pipeline() const noexcept { return reduce_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_broadcast_pipeline() const noexcept { return broadcast_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_transpose_pipeline() const noexcept { return transpose_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_im2col_pipeline() const noexcept { return im2col_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_col2im_pipeline() const noexcept { return col2im_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_group_reduce_pipeline() const noexcept { return group_reduce_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_gather_pipeline() const noexcept { return gather_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_scatter_add_pipeline() const noexcept { return scatter_add_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_scan_prefix_outer_pipeline() const noexcept { return scan_prefix_outer_pipeline_.handle() != VK_NULL_HANDLE; }
@@ -2491,9 +2569,9 @@ public:
         const std::uint32_t count = static_cast<std::uint32_t>(rows * cols);
 
         // 1. 分配输出 Tensor（vector_out：归约向量原生形状 (rows,1)/(1,cols)）
-        //    若调用方指定 output_override（IR-C 录制占位 buffer），则复用其
-        //    buffer（形状必须匹配），结果直接写入占位 → Layer 持有的 Tensor
-        //    在 end_expr 后即物化，避免额外拷贝。
+        //    若调用方指定 output_override（dsl::compute_into 的原地目标），
+        //    则复用其 buffer（形状必须匹配），结果直接写入目标 → 不额外分配、
+        //    不额外拷贝。
         const std::size_t out_rows = (vector_out && raxis == 0) ? rows
                                   : (vector_out && raxis == 1) ? 1 : rows;
         const std::size_t out_cols = (vector_out && raxis == 1) ? cols
@@ -2564,9 +2642,16 @@ public:
         //   归约:   count, cols, rows, vector_out, [vp0..], c0..
         //   matmul: count, cols, rows, mm_k, mm_batch, [vp0..], c0..
         //   matmul+归约: count, cols, rows, vector_out, mm_k, mm_batch, [vp0..], c0..
+        //
+        // ⚠ 固定头长度必须**逐形态**与生成器的 PC 声明一致（下面四档）。历史 bug：
+        //   "归约但无 matmul" 曾按 5 个 uint 计算（真实头部只有 4 个），导致常量池
+        //   整体后移一个 uint → shader 从错位处读常量（实测把 select(cond,1,0) 的
+        //   常量读成垃圾，GPU 上归约结果静默错值，而 CPU 正常）。
         const std::uint32_t pc_base =
-            (raxis >= 0 && has_mm) ? 6u
-          : ((raxis >= 0 || has_mm) ? 5u : 2u);
+            (raxis >= 0 && has_mm) ? 6u   // count, cols, rows, vector_out, mm_k, mm_batch
+          : (raxis >= 0)           ? 4u   // count, cols, rows, vector_out
+          : (has_mm)               ? 5u   // count, cols, rows, mm_k, mm_batch
+          :                          2u;  // count, cols
         const std::uint32_t pc_uints = pc_base;
         std::vector<std::uint8_t> pc(
             (pc_uints + n_vp) * sizeof(std::uint32_t) + sizeof(Scalar) * consts.size()
@@ -3545,6 +3630,248 @@ public:
     }
 
     // ══════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════
+    // im2col_gpu / col2im_gpu — 卷积/池化窗口展开（纯数据搬运，无算法）
+    //   Push Constants (36 bytes): C,H,W,k,stride,pad,OH,OW,B
+    //   Bindings: In(0), Out(1)
+    // ══════════════════════════════════════════════════════════════════
+    [[nodiscard]] Result<GpuTensor> im2col_gpu(
+        const GpuTensor& x,
+        std::size_t C, std::size_t H, std::size_t W,
+        std::size_t k, std::size_t stride, std::size_t pad,
+        std::size_t OH, std::size_t OW)
+    {
+        if (!initialized_)
+            return std::unexpected(Error{"GPU backend not initialized"});
+        if (!has_im2col_pipeline())
+            return std::unexpected(Error{"im2col pipeline not available"});
+        if (C == 0 || H == 0 || W == 0 || k == 0 || stride == 0 || OH == 0 || OW == 0)
+            return std::unexpected(Error{"im2col_gpu: C/H/W/k/stride/OH/OW must be > 0"});
+        if (x.rows() != C * H * W)
+            return std::unexpected(Error{"im2col_gpu: x must be (C*H*W, B)"});
+
+        const std::size_t B    = x.cols();
+        const std::size_t rows = C * k * k;
+        const std::size_t cols = B * OH * OW;
+
+        auto out_res = GpuTensor::create_empty(rows, cols, *this);
+        if (!out_res) return std::unexpected(out_res.error());
+        GpuTensor output = std::move(*out_res);
+
+        auto ds_r = alloc_desc_set(im2col_pipeline_.descriptor_layout());
+        if (!ds_r) return std::unexpected(ds_r.error());
+        VkDescriptorSet desc_set = *ds_r;
+
+        VkDescriptorBufferInfo buf_infos[2]{
+            {x.buffer().impl(), 0, VK_WHOLE_SIZE},
+            {output.buffer().impl(), 0, VK_WHOLE_SIZE},
+        };
+        VkWriteDescriptorSet writes[2]{};
+        for (int i = 0; i < 2; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = desc_set;
+            writes[i].dstBinding = static_cast<uint32_t>(i);
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &buf_infos[i];
+        }
+        vkUpdateDescriptorSets(device_.device(), 2, writes, 0, nullptr);
+
+        auto cmd_r = acquire_cmd();
+        if (!cmd_r)
+        {
+            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            return std::unexpected(cmd_r.error());
+        }
+        auto [cmd, owns_cmd] = *cmd_r;
+
+        record_input_barriers(cmd, {x.buffer().impl()});
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            im2col_pipeline_.handle());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            im2col_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+
+        const uint32_t push_data[9] = {
+            static_cast<uint32_t>(C),      static_cast<uint32_t>(H),
+            static_cast<uint32_t>(W),      static_cast<uint32_t>(k),
+            static_cast<uint32_t>(stride), static_cast<uint32_t>(pad),
+            static_cast<uint32_t>(OH),     static_cast<uint32_t>(OW),
+            static_cast<uint32_t>(B)};
+        vkCmdPushConstants(cmd, im2col_pipeline_.pipeline_layout(),
+            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
+
+        const std::size_t total = rows * cols;
+        const uint32_t wg_count = static_cast<uint32_t>((total + 255) / 256);
+        vkCmdDispatch(cmd, wg_count, 1, 1);
+        record_output_barrier(cmd, output.buffer().impl());
+
+        if (owns_cmd)
+        {
+            auto r = submit_and_wait(cmd, desc_set);
+            if (!r) return std::unexpected(r.error());
+        }
+        return output;
+    }
+
+    [[nodiscard]] Result<GpuTensor> col2im_gpu(
+        const GpuTensor& col,
+        std::size_t C, std::size_t H, std::size_t W,
+        std::size_t k, std::size_t stride, std::size_t pad,
+        std::size_t OH, std::size_t OW)
+    {
+        if (!initialized_)
+            return std::unexpected(Error{"GPU backend not initialized"});
+        if (!has_col2im_pipeline())
+            return std::unexpected(Error{"col2im pipeline not available"});
+        if (C == 0 || H == 0 || W == 0 || k == 0 || stride == 0 || OH == 0 || OW == 0)
+            return std::unexpected(Error{"col2im_gpu: C/H/W/k/stride/OH/OW must be > 0"});
+        const std::size_t P = OH * OW;
+        if (col.rows() != C * k * k || col.cols() == 0 || col.cols() % P != 0)
+            return std::unexpected(Error{"col2im_gpu: col must be (C*k*k, B*OH*OW)"});
+
+        const std::size_t B    = col.cols() / P;
+        const std::size_t rows = C * H * W;
+        const std::size_t cols = B;
+
+        auto out_res = GpuTensor::create_empty(rows, cols, *this);
+        if (!out_res) return std::unexpected(out_res.error());
+        GpuTensor output = std::move(*out_res);
+
+        auto ds_r = alloc_desc_set(col2im_pipeline_.descriptor_layout());
+        if (!ds_r) return std::unexpected(ds_r.error());
+        VkDescriptorSet desc_set = *ds_r;
+
+        VkDescriptorBufferInfo buf_infos[2]{
+            {col.buffer().impl(), 0, VK_WHOLE_SIZE},
+            {output.buffer().impl(), 0, VK_WHOLE_SIZE},
+        };
+        VkWriteDescriptorSet writes[2]{};
+        for (int i = 0; i < 2; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = desc_set;
+            writes[i].dstBinding = static_cast<uint32_t>(i);
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &buf_infos[i];
+        }
+        vkUpdateDescriptorSets(device_.device(), 2, writes, 0, nullptr);
+
+        auto cmd_r = acquire_cmd();
+        if (!cmd_r)
+        {
+            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            return std::unexpected(cmd_r.error());
+        }
+        auto [cmd, owns_cmd] = *cmd_r;
+
+        record_input_barriers(cmd, {col.buffer().impl()});
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            col2im_pipeline_.handle());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            col2im_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+
+        const uint32_t push_data[9] = {
+            static_cast<uint32_t>(C),      static_cast<uint32_t>(H),
+            static_cast<uint32_t>(W),      static_cast<uint32_t>(k),
+            static_cast<uint32_t>(stride), static_cast<uint32_t>(pad),
+            static_cast<uint32_t>(OH),     static_cast<uint32_t>(OW),
+            static_cast<uint32_t>(B)};
+        vkCmdPushConstants(cmd, col2im_pipeline_.pipeline_layout(),
+            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
+
+        const std::size_t total = rows * cols;
+        const uint32_t wg_count = static_cast<uint32_t>((total + 255) / 256);
+        vkCmdDispatch(cmd, wg_count, 1, 1);
+        record_output_barrier(cmd, output.buffer().impl());
+
+        if (owns_cmd)
+        {
+            auto r = submit_and_wait(cmd, desc_set);
+            if (!r) return std::unexpected(r.error());
+        }
+        return output;
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // grouped_reduce_gpu — 分组归约（沿行方向按固定长度 R 分组求和/求最大）
+    //   x (G*R, N) → out (G, N)
+    //   Push Constants (16 bytes): G, R, N, reduce_op
+    //   Bindings: In(0), Out(1)；Dispatch: ceil(G*N / 256)
+    // ══════════════════════════════════════════════════════════════════
+    [[nodiscard]] Result<GpuTensor> grouped_reduce_gpu(
+        const GpuTensor& x, std::size_t G, std::size_t R, bool is_max)
+    {
+        if (!initialized_)
+            return std::unexpected(Error{"GPU backend not initialized"});
+        if (!has_group_reduce_pipeline())
+            return std::unexpected(Error{"group_reduce pipeline not available"});
+        if (G == 0 || R == 0)
+            return std::unexpected(Error{"grouped_reduce_gpu: G/R must be > 0"});
+        if (x.rows() != G * R)
+            return std::unexpected(Error{"grouped_reduce_gpu: x must be (G*R, N)"});
+        const std::size_t N = x.cols();
+        if (N == 0)
+            return std::unexpected(Error{"grouped_reduce_gpu: N must be > 0"});
+
+        auto out_res = GpuTensor::create_empty(G, N, *this);
+        if (!out_res) return std::unexpected(out_res.error());
+        GpuTensor output = std::move(*out_res);
+
+        auto ds_r = alloc_desc_set(group_reduce_pipeline_.descriptor_layout());
+        if (!ds_r) return std::unexpected(ds_r.error());
+        VkDescriptorSet desc_set = *ds_r;
+
+        VkDescriptorBufferInfo buf_infos[2]{
+            {x.buffer().impl(), 0, VK_WHOLE_SIZE},
+            {output.buffer().impl(), 0, VK_WHOLE_SIZE},
+        };
+        VkWriteDescriptorSet writes[2]{};
+        for (int i = 0; i < 2; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = desc_set;
+            writes[i].dstBinding = static_cast<uint32_t>(i);
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &buf_infos[i];
+        }
+        vkUpdateDescriptorSets(device_.device(), 2, writes, 0, nullptr);
+
+        auto cmd_r = acquire_cmd();
+        if (!cmd_r)
+        {
+            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            return std::unexpected(cmd_r.error());
+        }
+        auto [cmd, owns_cmd] = *cmd_r;
+
+        record_input_barriers(cmd, {x.buffer().impl()});
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            group_reduce_pipeline_.handle());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            group_reduce_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+
+        const uint32_t push_data[4] = {
+            static_cast<uint32_t>(G), static_cast<uint32_t>(R),
+            static_cast<uint32_t>(N), is_max ? 1u : 0u};
+        vkCmdPushConstants(cmd, group_reduce_pipeline_.pipeline_layout(),
+            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
+
+        const std::size_t total = G * N;
+        const uint32_t wg_count = static_cast<uint32_t>((total + 255) / 256);
+        vkCmdDispatch(cmd, wg_count, 1, 1);
+        record_output_barrier(cmd, output.buffer().impl());
+
+        if (owns_cmd)
+        {
+            auto r = submit_and_wait(cmd, desc_set);
+            if (!r) return std::unexpected(r.error());
+        }
+        return output;
+    }
+
     // gather_gpu — 按行索引查表 (GPU-native)
     //
     // table: (vocab, D), indices: (num,) → output: (num, D)

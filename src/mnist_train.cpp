@@ -56,7 +56,7 @@ void print_usage(const char *prog)
         << "MNIST 手写数字训练程序 (支持 MLP/Transformer)\n\n"
         << "用法: " << prog << " [选项]\n\n"
         << "选项:\n"
-        << "  --arch <name>      模型架构: mlp/transformer (默认: mlp)\n"
+        << "  --arch <name>      模型架构: mlp/transformer/cnn (默认: mlp)\n"
         << "  --resume <path>    从已有模型恢复训练 (自动读取模型规格与架构)\n"
         << "  --save <path>      模型保存路径 (默认: mnist_model.bin)\n"
         << "  --dataset <path>   数据集目录 (默认: datasets/mnist_data)\n"
@@ -805,9 +805,11 @@ int main(int argc, char *argv[])
 
         Scalar avg_loss = total_loss / num_batches;
         // MLP 全量评估，Transformer 截取前 eval_samples 个样本评估
+        // 评估分块大小取训练 batch：CNN 的 im2col 展开是 k²·C_in 倍，
+        // 不分块时全量 60000 样本单次 forward 需 ~6.4 GB 显存 → OOM。
         const std::size_t eval_n = (cfg.arch == ArchType::Transformer) ? cfg.eval_samples : 0;
-        auto train_acc_r = nn::cli::evaluate_mnist(model, *engine, train_x, train_y, eval_n);
-        auto test_acc_r  = nn::cli::evaluate_mnist(model, *engine, test_x, test_y, eval_n);
+        auto train_acc_r = nn::cli::evaluate_mnist(model, *engine, train_x, train_y, eval_n, cfg.batch_size);
+        auto test_acc_r  = nn::cli::evaluate_mnist(model, *engine, test_x, test_y, eval_n, cfg.batch_size);
         if (!train_acc_r || !test_acc_r)
         {
             const auto &err = !train_acc_r ? train_acc_r.error() : test_acc_r.error();

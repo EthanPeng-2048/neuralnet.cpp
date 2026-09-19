@@ -55,9 +55,6 @@ private:
     std::size_t rows_ = 0;
     std::size_t cols_ = 0;
 
-    // 图 IR 录制（IR-C）：虚拟寄存器标记。
-    std::uint64_t virtual_tag_ = 0;
-
     // ── CPU 存储：类型擦除（std::variant，§6.1）──────────────────────────
     // Phase 1：F16（index 0）/ F32（index 1）
     using CpuF16 = std::shared_ptr<MatrixT<Precision::F16>>;
@@ -185,10 +182,6 @@ public:
     [[nodiscard]] bool is_cpu() const noexcept { return device_ == Device::CPU; }
     [[nodiscard]] bool is_gpu() const noexcept { return device_ == Device::GPU; }
 
-    // ── 图 IR 虚拟寄存器标记（IR-C 录制用，Layer 无感知） ───────────────
-    [[nodiscard]] std::uint64_t virtual_tag() const noexcept { return virtual_tag_; }
-    void set_virtual_tag(std::uint64_t tag) noexcept { virtual_tag_ = tag; }
-
     // ── valid：存储匹配 precision_ 且非空 ────────────────────────────────
     [[nodiscard]] bool valid() const noexcept
     {
@@ -288,7 +281,6 @@ public:
         t.precision_ = precision_;
         t.rows_ = new_rows;
         t.cols_ = new_cols;
-        t.virtual_tag_ = virtual_tag_;  // reshape 保留图 IR 标记
 #ifdef NN_HAS_VULKAN
         t.gpu_data_ = gpu_data_;
 #endif
