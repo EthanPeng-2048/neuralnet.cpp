@@ -25,11 +25,13 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include <cstdint>
+#include <ranges>
 #include <utility>
 #include <vector>
 
 #include "compute_tensor.hpp"
 #include "compute_engine.hpp"
+#include "core_assert.hpp"
 #include "expr_spec.hpp"
 #include "expr_registry.hpp"
 #include "expr_graph.hpp"   // IR-C：录制图（begin_expr/end_expr 扫描登记）
@@ -132,6 +134,120 @@ struct SpecBuilder
 };
 
 // ══════════════════════════════════════════════════════════════════════════
+// 编译期求值的"输出列数感知"分发：eval_with_cols
+//
+// nn::Expression 的契约是 eval(i)：只有一个扁平下标，**不知道输出列数**。
+// 大部分叶子是列数无关的（Linear/RotateHalf/RowMod/RowAccess 都能从自身
+// 张量推出列数），但有一类视图必须知道"输出列数"才能把扁平下标还原成
+// (row, col)：RowBroadcast（输入 (rows,1)，读第 i/cols 个标量）。这类节点
+// 额外提供 eval(i, cols)；复合节点把 cols 透传给子节点：
+//   eval_with_cols(child, i, cols)：子节点有 2 参 eval 就用它，否则退回 eval(i)。
+//
+// 只有真正需要"全行/全列"信息（归约视图/归约指令/matmul/网格索引）的表达式
+// 才走引擎解释器（由 has_reduction_v 分流）；纯索引映射（含广播视图）留在
+// 模板求值路径 → 编译器内联 + 与其它逐元素路径共用同一并行门控。
+// ══════════════════════════════════════════════════════════════════════════
+template <typename T>
+concept ColsAwareEval = requires(const T& t, std::size_t i, std::size_t cols)
+{
+    { t.eval(i, cols) } -> std::convertible_to<Scalar>;
+};
+
+template <typename E>
+[[nodiscard]] Scalar eval_with_cols(const E& e, std::size_t i, std::size_t cols)
+{
+    if constexpr (ColsAwareEval<E>)
+        return static_cast<Scalar>(e.eval(i, cols));
+    else
+        return static_cast<Scalar>(e.eval(i));
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// eval_into_span — 把逐元素表达式写进既有 span（eval_cpu / compute_into 共用）
+//
+// 与逐元素原语（algebra_matrix 的 apply/transform/原地运算）**同构**：
+//   - n < PARALLEL_THRESHOLD：串行计数循环 + NN_VECTORIZE_PRAGMA
+//   - n ≥ PARALLEL_THRESHOLD：自建分块并行，块内同样是**带向量化提示的裸
+//     指针计数循环**（不用 nn::for_each(iota)：其分块内层在池里，无法为该
+//     循环单独加向量化提示——池被多种读写模式复用，不能全局 assume_safety；
+//     实测大张量下慢 1.3–1.5 倍）
+// NN_VECTORIZE_PRAGMA（clang `loop vectorize(assume_safety)` / GCC ivdep）是
+// 关键：内层循环读写的是多个"来源未知"的指针（目标 + 各叶子），编译器无法
+// 证明互不别名；不给提示时不向量化，实测逐元素 add 慢 3 倍以上。
+// 语义安全性：本循环是纯 map —— 每个输出元素只依赖**同一下标**的输入，
+// 先读完再写回。无论目标是否与某输入同 buffer，向量化后的"载入同下标向量
+// →计算→存回"与串行逐一读改写逐字节一致（无跨下标依赖）。
+// ══════════════════════════════════════════════════════════════════════════
+template <typename E>
+inline void eval_into_span(const E& e, Span d_span, std::size_t cols) noexcept
+{
+    Scalar* d = d_span.data();
+    const std::size_t n = d_span.size();
+    if (n == 0)
+        return;
+    if (n < PARALLEL_THRESHOLD)
+    {
+        NN_VECTORIZE_PRAGMA
+        for (std::size_t i = 0; i < n; ++i)
+            d[i] = eval_with_cols(e, i, cols);
+        return;
+    }
+
+    const std::size_t hw = static_cast<std::size_t>(std::thread::hardware_concurrency());
+    // 分块数：以 ~64K 元素/块为目标（≈256KB，L2 友好），上限 hw*4 以保证
+    // 负载均衡（块太少会让大量线程闲置，实测 2.36M 元素时退化近 10 倍）。
+    constexpr std::size_t TARGET_CHUNK = std::size_t{1} << 16;
+    const std::size_t n_chunks = std::clamp(n / TARGET_CHUNK, std::size_t{1},
+                                           std::max<std::size_t>(hw, 1) * 4);
+    const std::size_t base = n / n_chunks;
+    const std::size_t rem  = n % n_chunks;
+    nn::parallel_for_samples(n_chunks, [&e, d, cols, base, rem](std::size_t c) noexcept
+    {
+        const std::size_t off = c * base + std::min(c, rem);
+        const std::size_t len = base + (c < rem ? 1 : 0);
+        Scalar* dc = d + off;
+        NN_VECTORIZE_PRAGMA
+        for (std::size_t k = 0; k < len; ++k)
+            dc[k] = eval_with_cols(e, off + k, cols);
+    });
+}
+// ══════════════════════════════════════════════════════════════════════════
+// CpuViewCache — 叶子节点的 CPU 数据视图缓存
+//
+// 逐元素模板求值会**按元素**读取叶子（e.eval(i)）。若每个元素都重新
+// t.cpu_matrix().span()，会引入固定开销：variant 槽检查 + span 构造 ——
+// 实测使模板路径比等价手写循环慢 1.5–4 倍（原地原语只做一次指针遍历）。
+// 因此在叶子构造时缓存一次数据视图（ConstSpan 只是 (指针, 长度)，16 字节）。
+//
+// 非 CPU 张量（GPU）**不**触发 cpu_matrix()：GPU 路径只走 to_spec 折叠，
+// 从不调用 eval；此时缓存留空，eval 走兜底（理论上不会到达该分支）。
+// ══════════════════════════════════════════════════════════════════════════
+struct CpuViewCache
+{
+    // CPU 张量的数据指针与列数（构造时缓存一次）。非 CPU 张量（GPU）留空：
+    // GPU 路径只走 to_spec 折叠，从不调用 eval。
+    // 用裸指针而非 ConstSpan：at() 必须**无分支**，否则编译器无法向量化
+    // 内层循环（实测带 `empty() ? ... : ...` 兜底分支时原地 add 慢 5 倍）。
+    const Scalar* data = nullptr;
+    std::size_t cols = 0;
+
+    void cache_cpu_view(const Tensor& t)
+    {
+        if (!t.is_cpu())
+            return;
+        const auto& m = t.cpu_matrix();
+        data = m.span().data();
+        cols = t.cols();
+    }
+    [[nodiscard]] Scalar at(std::size_t i) const
+    {
+        NN_ASSERT(data != nullptr,
+                  "DSL 叶子 eval 仅适用于 CPU 张量（GPU 路径走 to_spec 折叠）");
+        return data[i];
+    }
+};
+
+// ══════════════════════════════════════════════════════════════════════════
 // 叶子节点（同时满足 nn::Expression：可 eval(i)；以及可 to_spec(SpecBuilder&)）
 // ══════════════════════════════════════════════════════════════════════════
 
@@ -156,44 +272,49 @@ struct RParamLeaf
 };
 
 // 线性叶子：直接读取 Tensor 数据（row-major 扁平）
-struct TensorRef
+struct TensorRef : CpuViewCache
 {
     Tensor t;
 
-    [[nodiscard]] Scalar eval(std::size_t i) const { return t.cpu_matrix().span()[i]; }
+    TensorRef(Tensor tt) : t(std::move(tt)) { cache_cpu_view(t); }
+    [[nodiscard]] Scalar eval(std::size_t i) const { return at(i); }
     ExprOperand to_spec(SpecBuilder& b) const { return b.add_input_linear(t); }
 };
 
 // 视图：RotateHalf —— 按 block 分块，块内前后半行交换 + 前半取负（LLaMA rotate_half）
-struct RotateHalfRef
+struct RotateHalfRef : CpuViewCache
 {
     Tensor t;
     std::uint32_t block;
 
+    RotateHalfRef(Tensor tt, std::uint32_t blk) : t(std::move(tt)), block(blk)
+    { cache_cpu_view(t); }
+
     [[nodiscard]] Scalar eval(std::size_t i) const
     {
-        const std::size_t cols = t.cols();
-        const std::size_t r = i / cols, c = i % cols;
+        const std::size_t c = i % cols, r = i / cols;
         const std::size_t blk = block;
         const std::size_t rl = r % blk;
-        const std::size_t rr = (r / blk) * blk + ((rl < blk / 2) ? rl + blk / 2 : rl - blk / 2);
-        Scalar v = t.cpu_matrix().span()[rr * cols + c];
+        const std::size_t rr = (r / blk) * blk
+            + ((rl < blk / 2) ? (rl + blk / 2) : (rl - blk / 2));
+        const Scalar v = at(rr * cols + c);
         return (rl < blk / 2) ? -v : v;
     }
     ExprOperand to_spec(SpecBuilder& b) const { return b.add_input_rotate(t, block); }
 };
 
 // 视图：RowMod —— 行取模广播（频率表平铺到多行块）
-struct RowModRef
+struct RowModRef : CpuViewCache
 {
     Tensor t;
     std::uint32_t mod;
 
+    RowModRef(Tensor tt, std::uint32_t m) : t(std::move(tt)), mod(m) { cache_cpu_view(t); }
+
     [[nodiscard]] Scalar eval(std::size_t i) const
     {
-        const std::size_t cols = t.cols();
-        const std::size_t r = i / cols, c = i % cols;
-        return t.cpu_matrix().span()[(r % mod) * cols + c];
+        const std::size_t c = i % cols, r = i / cols;
+        return at((r % mod) * cols + c);
     }
     ExprOperand to_spec(SpecBuilder& b) const { return b.add_input_rowmod(t, mod); }
 };
@@ -203,17 +324,19 @@ struct RowModRef
 //   gate = row_access(in, offset=0,      mod=d_ff) → in[r % d_ff]
 //   up   = row_access(in, offset=d_ff,   mod=d_ff) → in[d_ff + r % d_ff]
 // offset/mod 均为运行时形状数据（共享一个融合 shader，运行时经 vp 槽填充）。
-struct RowAccessRef
+struct RowAccessRef : CpuViewCache
 {
     Tensor t;
     std::uint32_t offset;
     std::uint32_t mod;
 
+    RowAccessRef(Tensor tt, std::uint32_t off, std::uint32_t m)
+        : t(std::move(tt)), offset(off), mod(m) { cache_cpu_view(t); }
+
     [[nodiscard]] Scalar eval(std::size_t i) const
     {
-        const std::size_t cols = t.cols();
-        const std::size_t r = i / cols, c = i % cols;
-        return t.cpu_matrix().span()[(offset + (r % mod)) * cols + c];
+        const std::size_t c = i % cols, r = i / cols;
+        return at((offset + (r % mod)) * cols + c);
     }
     ExprOperand to_spec(SpecBuilder& b) const { return b.add_input_rowaccess(t, offset, mod); }
 };
@@ -351,14 +474,34 @@ struct BatchColRef
 };
 
 // 广播视图叶子：输入 (rows,1)/(1,cols) 小向量，按行/列广播参与算术。
-// 与归约叶子同理：eval 仅满足概念约束（模板求值路径不实例化，has_reduction_v 分流
-// 到 eval_expr，由引擎按 (r,c) 索引广播值）。
+//
+// 两者都是**纯索引映射**（不物化、无跨元素依赖），因此留在模板求值路径，
+// 不经引擎解释器（见 has_reduction_v<BroadcastRef> = false）：
+//   - 列广播：输入 (1,cols)，输出列数 = 输入列数 → 1 参 eval(i) 即可正确求值。
+//   - 行广播：输入 (rows,1)，读第 i/cols 个标量 —— 需要"输出列数"，输入自身
+//     推不出，故 1 参 eval(i)（无 cols）无法给出正确值，返回占位值；行广播
+//     一律经 2 参 eval(i, cols)（eval_with_cols 自动选择）求值。
 template <ExprViewKind Kind>
-struct BroadcastRef
+struct BroadcastRef : CpuViewCache
 {
     Tensor t;
 
-    [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
+    BroadcastRef(Tensor tt) : t(std::move(tt)) { cache_cpu_view(t); }
+
+    [[nodiscard]] Scalar eval(std::size_t i) const
+    {
+        if constexpr (Kind == ExprViewKind::ColBroadcast)
+            return at(i % cols);   // 输入 (1,cols) → cols 即输出列数
+        else
+            return Scalar{0};  // 行广播需输出列数，见 eval(i, out_cols)
+    }
+    [[nodiscard]] Scalar eval(std::size_t i, std::size_t out_cols) const
+    {
+        if constexpr (Kind == ExprViewKind::ColBroadcast)
+            return at(i % cols);
+        else
+            return at(i / out_cols);  // 输入 (rows,1)：读第 r 个标量
+    }
     ExprOperand to_spec(SpecBuilder& b) const
     {
         if constexpr (Kind == ExprViewKind::RowBroadcast)
@@ -393,6 +536,8 @@ struct Unary
 {
     C child;
     [[nodiscard]] auto eval(std::size_t i) const { return Op::apply(child.eval(i)); }
+    [[nodiscard]] auto eval(std::size_t i, std::size_t cols) const
+    { return Op::apply(eval_with_cols(child, i, cols)); }
     ExprOperand to_spec(SpecBuilder& b) const
     { return b.add_instr(Op::op_id(), child.to_spec(b)); }
 };
@@ -404,6 +549,8 @@ struct Binary
 {
     L l; R r;
     [[nodiscard]] auto eval(std::size_t i) const { return Op::apply(l.eval(i), r.eval(i)); }
+    [[nodiscard]] auto eval(std::size_t i, std::size_t cols) const
+    { return Op::apply(eval_with_cols(l, i, cols), eval_with_cols(r, i, cols)); }
     ExprOperand to_spec(SpecBuilder& b) const
     {
         // 显式固定操作数折叠顺序（l 先 r 后）：C++ 函数实参求值顺序未指定，
@@ -423,6 +570,11 @@ struct Select
     C cond; T then_e; E else_e;
     [[nodiscard]] Scalar eval(std::size_t i) const
     { return cond.eval(i) ? then_e.eval(i) : else_e.eval(i); }
+    [[nodiscard]] Scalar eval(std::size_t i, std::size_t cols) const
+    {
+        return (eval_with_cols(cond, i, cols) != Scalar{0})
+            ? eval_with_cols(then_e, i, cols) : eval_with_cols(else_e, i, cols);
+    }
     ExprOperand to_spec(SpecBuilder& b) const
     {
         // 同 Binary：显式固定折叠顺序（cond → then → else），保证跨编译器确定。
@@ -446,19 +598,24 @@ struct ReduceRef
 };
 
 // ══════════════════════════════════════════════════════════════════════════
-// has_reduction_v：表达式树是否含归约（视图叶子或归约指令节点）
+// has_reduction_v：表达式树是否**必须**走引擎解释器
 //
-// 用于 dsl::compute 的 CPU 路径分流：含归约的表达式无法按"逐元素模板求值"
-// （归约需要全行/全列信息），折叠成 ExprSpec 走引擎 eval_expr（CPU 扩展语义
-// 处理归约视图/指令）；不含归约的表达式保持原编译期模板求值（零开销）。
+// 用于 dsl::compute 的 CPU 路径分流：需要"全行/全列"信息、或需要引擎按网格
+// 推导的表达式（归约视图/归约指令/matmul/网格索引/标签收集）无法用逐元素
+// 模板求值表达 → 折叠成 ExprSpec 走引擎 eval_expr（CPU 扩展语义处理）；
+// 其余表达式（含广播视图这类纯索引映射）保持编译期模板求值（内联 + 并行）。
+// 该标志只影响 CPU 分支；GPU/scan 一律走 to_expr_spec，与本标志无关。
 // ══════════════════════════════════════════════════════════════════════════
 template <typename T> inline constexpr bool has_reduction_v = false;
 
-// 归约/广播叶子均需走 eval_expr（模板求值无法表达全行/全列归约或跨网格广播）
+// 归约叶子需走 eval_expr（模板求值无法表达全行/全列归约）
 template <ExprViewKind K>
 inline constexpr bool has_reduction_v<ReduceViewRef<K>> = true;
+// 广播视图**不需要**走 eval_expr：它是纯索引映射（无跨元素依赖），2 参
+// eval(i, cols) 即可在模板求值路径上正确求值（见 BroadcastRef 与
+// eval_with_cols）→ 留在编译期模板路径（内联 + 并行）。
 template <ExprViewKind K>
-inline constexpr bool has_reduction_v<BroadcastRef<K>> = true;
+inline constexpr bool has_reduction_v<BroadcastRef<K>> = false;
 // matmul 叶子同样需走 eval_expr（matmul 预计算 + 逐元素链，引擎实现）
 template <>
 inline constexpr bool has_reduction_v<MatmulRef> = true;
@@ -630,10 +787,9 @@ template <typename E>
 [[nodiscard]] Tensor eval_cpu(const E& e, std::size_t rows, std::size_t cols)
 {
     Matrix out(rows, cols);
-    auto sp = out.span();
-    const std::size_t n = sp.size();
-    for (std::size_t i = 0; i < n; ++i)
-        sp[i] = static_cast<Scalar>(e.eval(i));
+    // 与 eager 逐元素原语同构（串行+向量化提示 / 阈值以上并行）→ 同门控下
+    // DSL 取代 elementwise_* 时 CPU 性能不倒退。
+    eval_into_span(e, out.span(), cols);
     return Tensor::from_matrix(std::move(out));
 }
 
@@ -686,6 +842,63 @@ template <typename E>
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)
         return std::unexpected(v.error());
     return eng.eval_expr(spec, inputs, rows, cols);  // 闭合世界：GPU 未命中即报错
+#endif
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// compute_into — 目标传递入口：dst = expr（不分配新张量）
+//
+// 与 compute() 共用同一前端/同一 IR/同一 AOT 匹配，唯一差别是**输出落点**：
+// 结果直接写进调用方提供的 dst。用于把"原地更新"语义纳入 DSL（此前只能靠
+// 引擎的原地原语 add_inplace / scale_inplace / axpy_inplace / broadcast_*）：
+//   dst += expr            → compute_into(eng, leaf(dst) + expr, dst)
+//   dst *= k               → compute_into(eng, leaf(dst) * rparam(k), dst)
+//   dst += k * other       → compute_into(eng, leaf(dst) + leaf(other) * rparam(k), dst)
+//   dst += row_broadcast(v)→ compute_into(eng, leaf(dst) + row_broadcast(v), dst)
+// dst 与某个输入是同一 buffer 是安全的（逐元素先读后写）。
+//
+// CPU 走编译期模板求值（与 compute() 的 eval_cpu 同一路径 + 同一并行门控），
+// 因此"原地"不引入任何分配/拷贝；GPU 走 AOT 融合 shader 的 output_override。
+// 仅支持逐元素表达式（无归约）；归约向量输出用 compute_reduce。
+// ══════════════════════════════════════════════════════════════════════════
+template <typename E>
+[[nodiscard]] Result<void> compute_into(ComputeEngine& eng, const E& e, Tensor& dst)
+{
+#ifdef NN_EXPR_SCAN
+    // 构建期扫描：与 compute() 一样只登记结构（不真算、不关心 dst 的值）
+    (void)eng;
+    auto [spec, inputs] = to_expr_spec(e);
+    if (auto v = validate_expr_spec(spec, inputs.size()); !v)
+        return std::unexpected(v.error());
+    if (fused::recording_graph())
+        return std::unexpected(Error{
+            "dsl::compute_into: 不支持在 begin_expr/end_expr 录制段内使用"});
+    (void)dst;
+    fused::global_registry().add(spec);
+    return {};
+#else
+    if (eng.device() == Device::CPU)
+    {
+        if (!dst.is_cpu())
+            return std::unexpected(Error{"dsl::compute_into: dst not on CPU"});
+        if constexpr (nn::dsl::has_reduction_v<E>)
+        {
+            // 含归约：折叠成 ExprSpec 走引擎（与 compute() 的 CPU 分支一致）
+            auto [spec, inputs] = to_expr_spec(e);
+            if (auto v = validate_expr_spec(spec, inputs.size()); !v)
+                return std::unexpected(v.error());
+            return eng.eval_expr_into(spec, inputs, dst.rows(), dst.cols(), dst);
+        }
+        // 纯逐元素：编译期模板直接写进 dst 的 span（零解释器开销、零分配），
+        // 与 eval_cpu / 逐元素原语同一循环结构 + 同一并行门控。
+        eval_into_span(e, dst.cpu_matrix().span(), dst.cols());
+        return {};
+    }
+
+    auto [spec, inputs] = to_expr_spec(e);
+    if (auto v = validate_expr_spec(spec, inputs.size()); !v)
+        return std::unexpected(v.error());
+    return eng.eval_expr_into(spec, inputs, dst.rows(), dst.cols(), dst);
 #endif
 }
 

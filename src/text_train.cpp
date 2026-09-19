@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -1259,7 +1260,6 @@ int main(int argc, char *argv[])
         auto ep_start = std::chrono::steady_clock::now();
         Scalar total_weighted = 0.0;  // Σ(loss × 有效token)，用于按 token 加权平均
         std::size_t total_valid = 0;  // 累计有效 token 数
-        std::size_t nan_skip_count = 0;  // NaN 跳步计数
 
         // 每个 epoch 开始前 shuffle 样本索引队列
         std::shuffle(sample_indices.begin(), sample_indices.end(), rng);
@@ -1271,6 +1271,62 @@ int main(int argc, char *argv[])
 
         // 梯度累积：距上次参数更新的步数（每 accum_steps 步更新一次）
         std::size_t steps_since_update = 0;
+
+        // ── 非阻塞 loss 回读（P0-2）─────────────────────────────────────
+        // 每步把设备端 loss_sum 排入一个异步回读槽位（**不等待**），稍后就绪
+        // 即取。host 不再因取 loss 而 end_batch + wait_in_flight（旧路径每步
+        // drain 整条流水线，GPU 在 host 录制期间空转 → 占用率锯齿）。
+        // 稳定态下第 N 步即可取到第 N-1 步的 loss，打印仍是每步一条。
+        struct PendingLoss
+        {
+            std::size_t slot = 0;
+            std::size_t step = 0;
+            std::size_t valid = 0;
+            Scalar inv_num_valid = Scalar{0};
+            nn::Tensor keepalive;   // 回读命令引用的张量须活到就绪
+        };
+        std::deque<PendingLoss> pending_loss;
+        const std::size_t loss_slots =
+            std::max<std::size_t>(engine->scalar_readback_slots(), 1);
+        std::size_t loss_slot_next = 0;
+
+        // 非阻塞收割：消费所有已就绪的回读（累计统计 + 按 log_interval 打印）
+        auto harvest_loss = [&]() -> nn::Result<void>
+        {
+            while (!pending_loss.empty())
+            {
+                Scalar sum = Scalar{0};
+                auto pr = engine->poll_scalar_readback(pending_loss.front().slot, sum);
+                if (!pr) return std::unexpected(pr.error());
+                if (!*pr) break;   // 未就绪：留待下次（不阻塞）
+                PendingLoss pl = std::move(pending_loss.front());
+                pending_loss.pop_front();
+                const Scalar loss = -sum * pl.inv_num_valid;
+                total_weighted += loss * static_cast<Scalar>(pl.valid);
+                total_valid += pl.valid;
+                if ((pl.step + 1) % cfg.log_interval == 0 || pl.step + 1 == steps_per_epoch)
+                {
+                    std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
+                              << "  step " << pl.step + 1 << "/" << steps_per_epoch
+                              << "  loss: " << std::fixed << std::setprecision(4) << loss
+                              << "   " << std::flush;
+                }
+            }
+            return {};
+        };
+        // 阻塞兜底收割（槽位将满 / epoch 收尾）：等的是"已在 GPU 上跑的旧帧"，
+        // GPU 不会因此空转；正常路径不触发。
+        auto drain_loss = [&]() -> nn::Result<void>
+        {
+            while (!pending_loss.empty())
+            {
+                auto r0 = harvest_loss();
+                if (!r0) return r0;
+                if (pending_loss.empty()) break;
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+            }
+            return {};
+        };
 
         for (std::size_t step = epoch_first_step; step < steps_per_epoch; ++step)
         {
@@ -1383,41 +1439,28 @@ int main(int argc, char *argv[])
             auto logits = std::move(*fwd_result);
             // logits: (vocab_size, seq_len × batch_size)
 
-            // ── NaN 检测（P0-3：移除 logits 探针抽检）─────────────────────
-            // 旧实现（P0-2）每步 slice_rows 前 8 行 + to_matrix 下载抽检 isfinite。
-            // GPU 引擎 to_matrix 在 batch 中点会强制 end_batch（提交整段 forward）
-            // + wait_in_flight（CPU 阻塞至 GPU 全部完成）+ begin_batch——即每步
-            // 一次完整流水线 drain，破坏 batch 录制的 CPU/GPU 重叠（见
-            // compute_gpu_engine.hpp to_matrix / P0-1），是训练热循环的同步瓶颈。
-            // 防线 = 下方 loss 非有限值检查：CE 稀疏前向
-            //   loss_vec[c] = (gather − col_max − log denom)·mask, loss = −Σ loss_vec/nv
-            // 中，只要 num_valid > 0，IEEE 754 下 0·NaN = NaN，logits 任一列
-            // （含被 loss_mask 完全遮住的列）出现 NaN/Inf 都必然传播进 loss 求和，
-            // loss 检查完全覆盖；num_valid = 0 时 inv_num_valid = 0，梯度恒为 0，
-            // 同样无 NaN 风险。
-
-            // ── 损失（稀疏标签，避免 one-hot 爆显存） ────────
+            // ── 损失（稀疏标签，避免 one-hot 爆显存）────────
+            // P0-2：不再在此同步读回 loss。forward_sparse_sum 只算出设备端
+            // (1,1) loss 和（Σ loss_vec，未归一化）；flush 提交 forward 帧后
+            // 把它排入异步回读槽位，host 立刻继续录制 backward——全程不 drain。
+            // NaN 跳步已移除（loss 不再在 host 侧判定；数值稳定性改由
+            // --max-norm 梯度裁剪 + 观察 loss 曲线负责）。
             auto mask_span = std::span<const Scalar>(flat_mask);
-            auto loss_result = ce_loss.forward_sparse(
-                *engine, logits, flat_targets, mask_span, tokenizer->vocab_size());
-            if (!loss_result) { std::cerr << "Error: " << loss_result.error().message << '\n'; return 1; }
-            Scalar loss = *loss_result;
-            // NaN 跳步：loss 为 NaN/Inf 时跳过 backward+step
-            if (!std::isfinite(loss))
-            {
-                std::fprintf(stderr, "[NaNSkip] step %zu: loss=%g non-finite, skipping backward+step\n",
-                             step + 1, static_cast<double>(loss));
-                logits = {};
-                auto end_r = engine->end_batch();
-                if (!end_r) {
-                    std::cerr << "end_batch (NaNSkip loss) failed: " << end_r.error().message << '\n';
-                    return 1;
-                }
-                ++nan_skip_count;
-                continue;
+            std::size_t loss_num_valid = 0;
+            auto loss_sum_t = ce_loss.forward_sparse_sum(
+                *engine, logits, flat_targets, mask_span,
+                tokenizer->vocab_size(), loss_num_valid);
+            if (!loss_sum_t) {
+                std::cerr << "Error: " << loss_sum_t.error().message << '\n';
+                return 1;
             }
-            total_weighted += loss * step_valid;        // 按有效 token 加权
-            total_valid += step_valid;
+            // 回读固定按 F32 取 4 字节：非 F32 时在 batch 内先 cast
+            //（录制态，不提交、不 drain）
+            auto loss_sum_f32 = engine->cast(*loss_sum_t, nn::Precision::F32);
+            if (!loss_sum_f32) {
+                std::cerr << "Error: " << loss_sum_f32.error().message << '\n';
+                return 1;
+            }
 
             // ── 中点刷新：提交 forward+loss，拆分为两次 GPU 提交 ──
             // 大词表 + 长序列时 forward+backward 单次提交可能触发 TDR 超时。
@@ -1426,6 +1469,39 @@ int main(int argc, char *argv[])
             if (!flush_r) {
                 std::cerr << "\nflush_batch (forward) failed: " << flush_r.error().message << '\n';
                 return 1;
+            }
+
+            // forward 帧已提交 → 排队异步回读（同队列 FIFO：拷贝在生产者之后）
+            {
+                // 槽位将满：先非阻塞收割，必要时阻塞兜底（保证不覆盖未取走的值）
+                auto hv0 = harvest_loss();
+                if (!hv0) {
+                    std::cerr << "harvest_loss failed: " << hv0.error().message << '\n';
+                    return 1;
+                }
+                if (pending_loss.size() >= loss_slots)
+                {
+                    auto hv1 = drain_loss();
+                    if (!hv1) {
+                        std::cerr << "drain_loss failed: " << hv1.error().message << '\n';
+                        return 1;
+                    }
+                }
+                PendingLoss pl;
+                pl.slot = loss_slot_next;
+                pl.step = step;
+                pl.valid = step_valid;
+                pl.inv_num_valid = (loss_num_valid > 0)
+                    ? Scalar{1} / static_cast<Scalar>(loss_num_valid) : Scalar{0};
+                pl.keepalive = std::move(*loss_sum_f32);
+                auto sr = engine->submit_scalar_readback(pl.slot, pl.keepalive);
+                if (!sr) {
+                    std::cerr << "submit_scalar_readback failed: "
+                              << sr.error().message << '\n';
+                    return 1;
+                }
+                loss_slot_next = (loss_slot_next + 1) % loss_slots;
+                pending_loss.push_back(std::move(pl));
             }
 
             // ── 显存优化：logits 已消费完毕，立即释放 ──
@@ -1458,6 +1534,17 @@ int main(int argc, char *argv[])
                 return 1;
             }
 
+            // ── 收割已就绪的 loss 回读（非阻塞；打印/统计在此推进）─────────
+            // 稳定态：此刻第 N-1 步的 loss 早已写回（GPU 一直在跑），
+            // poll 立即命中 → 每步一条打印，且 host 一秒都不等 GPU。
+            {
+                auto hv = harvest_loss();
+                if (!hv) {
+                    std::cerr << "harvest_loss failed: " << hv.error().message << '\n';
+                    return 1;
+                }
+            }
+
             // ── 显存回收（L2）：end_batch 提交完成、延迟销毁已 flush，
             //    归还完全空闲的内存池底材（GPU 引擎有效，CPU/CUDA no-op） ──
             auto rel_r = engine->release_idle_pool_blocks();
@@ -1478,11 +1565,25 @@ int main(int argc, char *argv[])
             if (do_update)
             {
                 // ── 梯度裁剪（在 step() 之前，backward() 之后） ──
+                // P0-2：clip_grad_norm 逐原语在 batch **外**会各自
+                // submit_and_wait（约 200 次 host↔GPU 往返/次裁剪）；包进
+                // 一个 batch 后只剩一次范数下载同步（每 accum_steps 步一次，
+                // 而非每步）。这是范数的数据依赖，无法异步化。
                 if (cfg.max_norm > 0)
                 {
+                    auto clip_begin = engine->begin_batch();
+                    if (!clip_begin) {
+                        std::cerr << "begin_batch (clip) failed: " << clip_begin.error().message << '\n';
+                        return 1;
+                    }
                     auto clip_r = optimizer->clip_grad_norm(cfg.max_norm);
                     if (!clip_r) {
                         std::cerr << "\n梯度裁剪失败: " << clip_r.error().message << '\n';
+                        return 1;
+                    }
+                    auto clip_end = engine->end_batch();
+                    if (!clip_end) {
+                        std::cerr << "end_batch (clip) failed: " << clip_end.error().message << '\n';
                         return 1;
                     }
                 }
@@ -1532,13 +1633,17 @@ int main(int argc, char *argv[])
                     std::cerr << "\n  [ckpt] 保存失败: " << save_r.error().message << "\n";
             }
 
-            // ── 进度显示
-            if ((step + 1) % cfg.log_interval == 0 || step + 1 == steps_per_epoch)
-            {
-                std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
-                          << "  step " << step + 1 << "/" << steps_per_epoch
-                          << "  loss: " << std::fixed << std::setprecision(4) << loss
-                          << "   " << std::flush;
+            // 进度显示已移到 harvest_loss（loss 走异步回读）：按"值就绪即打印"，
+            // 稳定态仍是每步一条，且 host 全程不等 GPU。
+        }
+
+        // ── epoch 收尾：读完最后几步尚未取回的 loss（各 epoch 一次）──────
+        // 等的是已经在 GPU 上执行的旧帧，不影响 GPU 占空比。
+        {
+            auto ep_drain = drain_loss();
+            if (!ep_drain) {
+                std::cerr << "loss drain failed: " << ep_drain.error().message << '\n';
+                return 1;
             }
         }
 
@@ -1554,8 +1659,6 @@ int main(int argc, char *argv[])
                   << "  lr=" << std::scientific << std::setprecision(4) << optimizer_current_lr
                   << "  avg_loss=" << std::fixed << std::setprecision(4) << avg_loss
                   << "  time=" << std::setprecision(1) << ep_sec << "s";
-        if (nan_skip_count > 0)
-            std::cout << "  nan_skip=" << nan_skip_count;
 
         // ── 测试集评估（可选，与训练一致的滑动窗口） ─────────────
         if (!test_window_offsets.empty())

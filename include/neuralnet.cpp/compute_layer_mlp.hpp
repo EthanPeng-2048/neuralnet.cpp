@@ -120,12 +120,20 @@ public:
         auto grad_input = engine.matmul(w_, grad_output, true, false);
         if (!grad_input) return std::unexpected(grad_input.error());
 
-        auto gw = engine.matmul(grad_output, input_cache_, false, true);
-        if (!gw) return std::unexpected(gw.error());
-        auto r1 = engine.accumulate(grad_w_, *gw);
-        if (!r1) return std::unexpected(r1.error());
+        // grad_w += grad_output × input^T：matmul 段与累加**融合为单次 dispatch**
+        // 并原地写入 grad_w_（GPU 上 1 个融合 kernel：不物化 gw (out,in)，也不额外
+        // 分配输出缓冲；取代 matmul + accumulate 两次 dispatch）。
+        // k（求和维度 = batch 大小）是形状参数，不进 key → 同一 shader 适配任意 batch。
+        auto grad_w_acc = dsl::compute_into(engine,
+            dsl::leaf(grad_w_) + dsl::matmul(grad_output, input_cache_, false, true),
+            grad_w_);
+        if (!grad_w_acc) return std::unexpected(grad_w_acc.error());
 
         // grad_b += Σ grad_output（行归约，默认 f32）
+        // 注：此项**无法**并入表达式——归约向量输出契约要求输出链只经归约/
+        // 广播视图访问输入，而此处必须同时引用外部累加张量 grad_b_（Linear
+        // 视图），两者的语义冲突（见 eval_expr_reduce 的前置校验）。故保留
+        // "归约原语 + 累加原语"两步。
         auto gb = engine.row_reduce_sum(grad_output);
         if (!gb) return std::unexpected(gb.error());
         auto r2 = engine.accumulate(grad_b_, *gb);
@@ -469,8 +477,11 @@ public:
         if (!mean_raw) return std::unexpected(mean_raw.error());
 
         // 2. mean = mean_raw*(1/F) → (1,B)
-        // （1/F 形状相关标量在 (1,B) 小向量上用原语施加，保持融合表达式 F 无关）
-        auto mean = engine.elementwise_binary_scalar(BinaryOp::Mul, *mean_raw, inv_features);
+        // （1/F 是形状相关标量，由 RParam 承载：**值不进 expr_spec_key**，
+        //   融合表达式保持 F 无关 → 不同归一化维度共享同一 AOT 融合 shader）
+        auto mean = dsl::compute(engine,
+            dsl::leaf(*mean_raw) * dsl::rparam(inv_features),
+            mean_raw->rows(), mean_raw->cols());
         if (!mean) return std::unexpected(mean.error());
 
         // 3. diff = x - mean (col 广播) → (F,B)
@@ -484,12 +495,12 @@ public:
         if (!var_raw) return std::unexpected(var_raw.error());
 
         // 5. std_inv = rsqrt(var_raw*(1/F) + ε) → (1,B)
-        // （1/F、ε 形状相关标量在 (1,B) 小向量上用原语施加，保持融合表达式 F 无关）
-        auto var = engine.elementwise_binary_scalar(BinaryOp::Mul, *var_raw, inv_features);
-        if (!var) return std::unexpected(var.error());
-        auto var_eps = engine.elementwise_binary_scalar(BinaryOp::Add, *var, epsilon_);
-        if (!var_eps) return std::unexpected(var_eps.error());
-        auto std_inv = engine.elementwise_unary(UnaryOp::Rsqrt, *var_eps);
+        // （"乘 1/F → 加 ε → rsqrt"三步塌成单表达式、单次遍历；1/F、ε 由
+        //   RParam 承载，表达式结构仍与 F / ε 取值无关）
+        auto std_inv = dsl::compute(engine,
+            dsl::rsqrt(dsl::leaf(*var_raw) * dsl::rparam(inv_features)
+                       + dsl::rparam(epsilon_)),
+            var_raw->rows(), var_raw->cols());
         if (!std_inv) return std::unexpected(std_inv.error());
         Tensor std_inv_t = std::move(*std_inv);
         if (!checkpoint_mode_)
@@ -532,7 +543,9 @@ public:
                 dsl::leaf(grad_output) * dsl::row_broadcast(gamma_)),
             F, B);
         if (!mg_raw) return std::unexpected(mg_raw.error());
-        auto mean_g = engine.elementwise_binary_scalar(BinaryOp::Mul, *mg_raw, inv_features);
+        auto mean_g = dsl::compute(engine,
+            dsl::leaf(*mg_raw) * dsl::rparam(inv_features),
+            mg_raw->rows(), mg_raw->cols());
         if (!mean_g) return std::unexpected(mean_g.error());
 
         // 2. mean_gn_raw = col_reduce_sum(gy ⊙ normalized) → (1,B)
@@ -542,7 +555,9 @@ public:
                 * dsl::leaf(normalized_cache_)),
             F, B);
         if (!mgn_raw) return std::unexpected(mgn_raw.error());
-        auto mean_gn = engine.elementwise_binary_scalar(BinaryOp::Mul, *mgn_raw, inv_features);
+        auto mean_gn = dsl::compute(engine,
+            dsl::leaf(*mgn_raw) * dsl::rparam(inv_features),
+            mgn_raw->rows(), mgn_raw->cols());
         if (!mean_gn) return std::unexpected(mean_gn.error());
 
         // 3. grad_x = (gy - mean_g - normalized*mean_gn) * std_inv → (F,B)
@@ -562,15 +577,17 @@ public:
                 * dsl::leaf(normalized_cache_)),
             F, B);
         if (!gg) return std::unexpected(gg.error());
-        auto r = engine.add_inplace(grad_gamma_, *gg);
-        if (!r) return std::unexpected(r.error());
+        auto grad_gamma_acc = dsl::compute_into(engine,
+            dsl::leaf(grad_gamma_) + dsl::leaf(*gg), grad_gamma_);
+        if (!grad_gamma_acc) return std::unexpected(grad_gamma_acc.error());
 
         // 5. grad_beta += row_reduce_sum(grad_out) → (F,1)
         auto gb = dsl::compute_reduce(engine,
             dsl::row_reduce_sum(dsl::leaf(grad_output)), F, B);
         if (!gb) return std::unexpected(gb.error());
-        r = engine.add_inplace(grad_beta_, *gb);
-        if (!r) return std::unexpected(r.error());
+        auto grad_beta_acc = dsl::compute_into(engine,
+            dsl::leaf(grad_beta_) + dsl::leaf(*gb), grad_beta_);
+        if (!grad_beta_acc) return std::unexpected(grad_beta_acc.error());
 
         return grad_x;
     }
@@ -673,12 +690,12 @@ public:
         if (!s_raw) return std::unexpected(s_raw.error());
 
         // 2. rms_inv = rsqrt(s_raw*(1/F) + ε) → (1,B)
-        // （1/F、ε 形状相关标量在 (1,B) 小向量上用原语施加，保持融合表达式 F 无关）
-        auto scaled = engine.elementwise_binary_scalar(BinaryOp::Mul, *s_raw, inv_features);
-        if (!scaled) return std::unexpected(scaled.error());
-        auto var_eps = engine.elementwise_binary_scalar(BinaryOp::Add, *scaled, epsilon_);
-        if (!var_eps) return std::unexpected(var_eps.error());
-        auto rms_inv = engine.elementwise_unary(UnaryOp::Rsqrt, *var_eps);
+        // （"乘 1/F → 加 ε → rsqrt"三步塌成单表达式、单次遍历；1/F、ε 由
+        //   RParam 承载：值不进 expr_spec_key → 表达式结构保持 F/ε 无关）
+        auto rms_inv = dsl::compute(engine,
+            dsl::rsqrt(dsl::leaf(*s_raw) * dsl::rparam(inv_features)
+                       + dsl::rparam(epsilon_)),
+            s_raw->rows(), s_raw->cols());
         if (!rms_inv) return std::unexpected(rms_inv.error());
         Tensor rms_inv_t = std::move(*rms_inv);
         if (!checkpoint_mode_)
@@ -718,7 +735,9 @@ public:
                 * dsl::leaf(normed_cache_)),
             F, B);
         if (!m_raw) return std::unexpected(m_raw.error());
-        auto m = engine.elementwise_binary_scalar(BinaryOp::Mul, *m_raw, inv_features);
+        auto m = dsl::compute(engine,
+            dsl::leaf(*m_raw) * dsl::rparam(inv_features),
+            m_raw->rows(), m_raw->cols());
         if (!m) return std::unexpected(m.error());
 
         // 2. grad_x = (gy - m*normed) * rms_inv → (F,B)
@@ -737,8 +756,9 @@ public:
                 * dsl::leaf(normed_cache_)),
             F, B);
         if (!gg) return std::unexpected(gg.error());
-        auto r = engine.add_inplace(grad_gamma_, *gg);
-        if (!r) return std::unexpected(r.error());
+        auto grad_gamma_acc = dsl::compute_into(engine,
+            dsl::leaf(grad_gamma_) + dsl::leaf(*gg), grad_gamma_);
+        if (!grad_gamma_acc) return std::unexpected(grad_gamma_acc.error());
 
         return grad_x;
     }

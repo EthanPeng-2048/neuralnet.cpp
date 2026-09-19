@@ -1231,7 +1231,10 @@ public:
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols) override
     {
-        return eval_expr_impl(spec, inputs, rows, cols, /*vector_out=*/false);
+        Tensor out = Tensor::cpu(rows, cols);
+        auto r = eval_expr_impl(spec, inputs, rows, cols, /*vector_out=*/false, out);
+        if (!r) return std::unexpected(r.error());
+        return out;
     }
 
     // ── 归约向量原生形状输出（M3：LayerNorm/RMSNorm 小向量缓存用） ──────
@@ -1244,14 +1247,45 @@ public:
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols) override
     {
-        return eval_expr_impl(spec, inputs, rows, cols, /*vector_out=*/true);
+        const bool vec_is_row =
+            (expr_spec_reduce_axis(canonicalize_expr_spec(spec)) == 0);
+        Tensor out = vec_is_row ? Tensor::cpu(rows, 1) : Tensor::cpu(1, cols);
+        auto r = eval_expr_impl(spec, inputs, rows, cols, /*vector_out=*/true, out);
+        if (!r) return std::unexpected(r.error());
+        return out;
     }
 
-    // ── eval_expr / eval_expr_reduce 共用实现 ────────────────────────────
-    [[nodiscard]] Result<Tensor> eval_expr_impl(
+    // ── 目标传递（destination-passing）：结果直接写入已有张量 ─────────────
+    // 语义同 eval_expr，但**不分配新张量**：dst = f(dst, ...)。
+    // 用于把"原地更新"语义（累加/缩放/axpy/按行按列广播就地）纳入 DSL：
+    //   add_inplace(A,B)        → eval_expr_into(leaf(A) + leaf(B), A)
+    //   scale_inplace(A,s)      → eval_expr_into(leaf(A) * rparam(s), A)
+    //   axpy_inplace(A,s,B)     → eval_expr_into(leaf(A) + leaf(B)*rparam(s), A)
+    //   broadcast_row_inplace(A,v,Add) → eval_expr_into(leaf(A) + row_broadcast(v), A)
+    // dst 允许与某个输入是同一 buffer：每个元素先读完全部输入再写 out[i]
+    // （与 nn::compute::apply 的就地安全前提相同；GPU 同一 buffer 绑定为
+    // readonly 输入 + writeonly 输出的逐元素同索引读写亦无跨调用危害）。
+    // 仅支持逐元素表达式（无归约）；归约向量输出用 eval_expr_reduce。
+    [[nodiscard]] Result<void> eval_expr_into(
+        const ExprSpec& spec,
+        std::span<const Tensor> inputs,
+        std::size_t rows, std::size_t cols, Tensor& dst) override
+    {
+        if (dst.rows() != rows || dst.cols() != cols)
+            return std::unexpected(Error{"eval_expr_into: dst shape mismatch"});
+        if (expr_spec_reduce_axis(canonicalize_expr_spec(spec)) != -1)
+            return std::unexpected(Error{
+                "eval_expr_into: 仅支持逐元素表达式（无归约）"});
+        return eval_expr_impl(spec, inputs, rows, cols, /*vector_out=*/false, dst);
+    }
+
+    // ── eval_expr / eval_expr_reduce / eval_expr_into 共用实现 ────────────
+    // output：调用方预分配的输出张量，形状须与输出一致
+    //   （vector_out=false → (rows,cols)；true → (rows,1)/(1,cols)）。
+    [[nodiscard]] Result<void> eval_expr_impl(
         const ExprSpec& raw_spec,
         std::span<const Tensor> inputs,
-        std::size_t rows, std::size_t cols, bool vector_out)
+        std::size_t rows, std::size_t cols, bool vector_out, Tensor& output)
     {
         // canonical IR：canonicalize 为引擎内部优化（IR-A/IR-B），Layer 无感知；
         // 结构统一在 canonical 形态上，与 scan/gen_fused 两端一致。
@@ -1359,11 +1393,12 @@ public:
             spans.push_back(t.cpu_matrix().span());
         }
 
-        Matrix result(rows, cols);
-        Span out = result.span();
-        const std::size_t n = out.size();
+        // 输出 span 由调用方预分配；n 恒为**网格**元素数（vector_out 时输出
+        // span 更小，而下述归约重放循环仍按网格遍历）。
+        Span out = output.cpu_matrix().span();
+        const std::size_t n = rows * cols;
         if (n == 0)
-            return Tensor::from_matrix(std::move(result));
+            return {};
 
         // ── 归约视图预计算：每行/每列一个标量，供广播读取 ──────────────
         // 仅在 views[k] 为归约视图时填充 view_reduce[k]（长度 rows 或 cols）。
@@ -1467,12 +1502,10 @@ public:
         {
             if (!mm)
                 return std::unexpected(Error{"eval_expr: empty instruction list without matmul"});
-            Matrix r(rows, cols);
-            Span o = r.span();
             const auto ms = matmul_out.span();
             for (std::size_t i = 0; i < n; ++i)
-                o[i] = ms[i];
-            return Tensor::from_matrix(std::move(r));
+                out[i] = ms[i];
+            return {};
         }
 
         // 视图求值：按 (row, col) 映射到输入 span（归约视图读取预计算标量向量）
@@ -1699,29 +1732,38 @@ public:
         {
             // 归约向量原生形状输出：(rows,1)（行归约轴）或 (1,cols)（列归约轴）
             const std::size_t len = vec_is_row ? rows : cols;
-            Matrix result(vec_is_row ? rows : 1, vec_is_row ? 1 : cols);
-            Span o = result.span();
+            Span o = out;   // 调用方已按归约向量形状分配（见 eval_expr_reduce）
             if (last_is_reduce)
             {
                 // 末指令为归约 → 直接取归约向量
                 for (std::size_t k = 0; k < len; ++k)
                     o[k] = reduce_vec[last.dst][k];
-                return Tensor::from_matrix(std::move(result));
+                return {};
             }
             // 否则按代表元素求值：行归约 → 每行 (k, 0)；列归约 → 每列 (0, k)。
             // 前置校验（反向数据流）：从末指令收集"影响输出"的非归约指令链，
             // 其 Input 操作数必须经归约/广播视图访问（保证沿归约轴恒定）。
             // 归约指令的源在全网格求值（可自由读 Linear），不参与本分析。
+            //
+            // 实现要点：必须按**指令下标**做反向切片，而不是按"寄存器号是否被
+            // 需要"。寄存器分配（allocate_registers_liveness）按 liveness 复用
+            // 逐元素寄存器号：例如 `ColSum(x*x) * rp + rp` 规范化后
+            //   [0] Mul r0 = x*x   [1] ColSum r2 = r0   [2] Mul r0 = Reduce(r2)*rp …
+            // 后处理指令的 dst 与归约前的 Mul 同号。若用 needed[reg]（寄存器号）
+            // 传播，r0 会被 i2/后续指令标记，于是把 [0] 这个**归约前的定义**也
+            // 当成输出链的一部分，误报"输出链经 Linear 直接访问输入"。
+            // 按下标传播时，读某寄存器只标记"它在该处最近一次定义"的那条指令，
+            // 与寄存器复用无关（execution 本身按指令序写 regs[]，复用是正确的）。
             {
-                std::vector<uint8_t> needed(EXPR_MAX_REGS, 0);
-                needed[last.dst] = 1;
+                std::vector<uint8_t> instr_needed(spec.instrs.size(), 0);
+                instr_needed[spec.instrs.size() - 1] = 1;  // 输出 = instrs.back().dst
                 for (std::size_t ii = spec.instrs.size(); ii-- > 0;)
                 {
-                    const ExprInstr& ins = spec.instrs[ii];
-                    if (!needed[ins.dst])
+                    if (!instr_needed[ii])
                         continue;
+                    const ExprInstr& ins = spec.instrs[ii];
                     if (expr_op_is_reduce(static_cast<ExprOp>(ins.op)))
-                        continue;  // 归约指令：源全网格求值，dst 已标记
+                        continue;  // 归约指令：源全网格求值，不经输出链
                     // 只遍历该算子实际使用的操作数（c 默认 {0,0} 会被误当作 Reg(0)）
                     const std::size_t nops =
                         expr_instr_num_operands(static_cast<ExprOp>(ins.op));
@@ -1757,7 +1799,14 @@ public:
                                  op.kind == static_cast<uint8_t>(ExprOperandKind::Fanout) ||
                                  op.kind == static_cast<uint8_t>(ExprOperandKind::Reduce))
                         {
-                            needed[op.idx] = 1;
+                            // 标记 ii 之前最近一次定义 op.idx 的指令（拓扑序保证
+                            // 该定义就是此处读取的那个值）
+                            for (std::size_t j = ii; j-- > 0;)
+                                if (spec.instrs[j].dst == op.idx)
+                                {
+                                    instr_needed[j] = 1;
+                                    break;
+                                }
                         }
                     }
                 }
@@ -1768,24 +1817,28 @@ public:
                 const std::size_t c = vec_is_row ? 0 : k;
                 o[k] = eval_element(r, c);
             }
-            return Tensor::from_matrix(std::move(result));
+            return {};
         }
 
         // ── 广播输出（常规 eval_expr）：每元素求值，输出 (rows, cols) ──
-        for (std::size_t i = 0; i < n; ++i)
-        {
-            const std::size_t r = i / cols;
-            const std::size_t c = i % cols;
-            if (last_is_reduce)
+        // 逐元素无跨元素依赖（归约/matmul 段均已预计算且此处只读）→ 并行与
+        // 串行逐字节一致；用与其他逐元素路径相同的 PARALLEL_THRESHOLD 门控。
+        auto indices = std::views::iota(std::size_t{0}, n);
+        nn::for_each(indices.begin(), indices.end(),
+            [&](std::size_t i)
             {
-                // 输出本身就是归约向量 → 广播到 (rows, cols)
-                out[i] = reduce_vec[last.dst][reduce_axis[last.dst] ? c : r];
-                continue;
-            }
-            out[i] = eval_element(r, c);
-        }
+                const std::size_t r = i / cols;
+                const std::size_t c = i % cols;
+                if (last_is_reduce)
+                {
+                    // 输出本身就是归约向量 → 广播到 (rows, cols)
+                    out[i] = reduce_vec[last.dst][reduce_axis[last.dst] ? c : r];
+                    return;
+                }
+                out[i] = eval_element(r, c);
+            });
 
-        return Tensor::from_matrix(std::move(result));
+        return {};
     }
 
 };

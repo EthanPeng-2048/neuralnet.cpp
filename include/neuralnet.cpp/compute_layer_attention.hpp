@@ -492,6 +492,8 @@ public:
         // 2.6 S7：scale（1/sqrt(d_k)）折进 Q（Q *= scale）：注意力表达式不含
         // scale 常量 → 结构与 d_k 无关（不同 d_k 共享融合 shader，闭合世界
         // key 稳定）。backward 的 grad_Q 相应补乘 scale。
+        // 注：保留就地原语——DSL 表达式会多分配一整块 (BH·d_k, seq) 缓冲，
+        // 实测该点比 scale_inplace 慢（见 build/perfprobe 的原地/表达式对照）。
         { auto qs = engine.scale_inplace(Q, scale_); if (!qs) return std::unexpected(qs.error()); }
 
         // 3-7. 注意力主体：两趟式 vs 旧路径（由掩码钩子决策）
@@ -730,8 +732,9 @@ public:
             // grad_Q = K × X^T（K_b (d_k,seq)，X_b (seq,seq) 按 X^T 使用）
             auto gq = engine.batched_matmul(K_cache_, *X, BH, false, true);
             if (!gq) return std::unexpected(gq.error());
+            // grad_Q 补乘 scale（forward 把 scale 折进了 Q）：用就地原语（同 forward
+            // 的说明——DSL 表达式要多分配一整块缓冲，实测更慢）
             { auto gqs = engine.scale_inplace(*gq, scale_); if (!gqs) return std::unexpected(gqs.error()); }
-            if (!gq) return std::unexpected(gq.error());
             // grad_K = Q × X
             auto gk = engine.batched_matmul(Q_cache_, *X, BH, false, false);
             if (!gk) return std::unexpected(gk.error());
@@ -816,19 +819,18 @@ public:
         // 9. 投影层反向 + 累加输入梯度
         auto giq = w_q_.backward(engine, grad_Q);
         if (!giq) return giq;
-        Tensor grad_input = std::move(*giq);
-
         auto gik = w_k_.backward(engine, grad_K);
         if (!gik) return gik;
-        auto r1 = engine.add_inplace(grad_input, *gik);
-        if (!r1) return std::unexpected(r1.error());
-
         auto giv = w_v_.backward(engine, grad_V);
         if (!giv) return giv;
-        auto r2 = engine.add_inplace(grad_input, *giv);
-        if (!r2) return std::unexpected(r2.error());
 
-        return grad_input;
+        // grad_input = grad_Q + grad_K + grad_V：三路累加**原地**融合为单趟
+        // （目标传递，不额外分配；取代 clone + 两次 add_inplace）。加法结合
+        // 顺序与原实现一致（(giq + gik) + giv）→ 逐字节等价。
+        auto acc = dsl::compute_into(engine,
+            dsl::leaf(*giq) + dsl::leaf(*gik) + dsl::leaf(*giv), *giq);
+        if (!acc) return std::unexpected(acc.error());
+        return giq;
     }
 
     // ── 增量推理（KV cache）──────────────────────────────────────────

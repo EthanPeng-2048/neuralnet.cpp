@@ -168,15 +168,17 @@ private:
         {
             auto x = engine.slice_rows(input, bh * dk, dk);
             if (!x) return std::unexpected(x.error());
-            auto x_sq = engine.elementwise_binary(BinaryOp::Mul, *x, *x);
-            if (!x_sq) return std::unexpected(x_sq.error());
-            auto s = engine.col_reduce_sum(*x_sq);
+            // 原"乘 x² → 列归约 → 乘 1/dk → 加 eps → rsqrt"五步压成两步 DSL：
+            //   ① 归约出 (1,seq) 向量；② 在 (1,seq) 小向量上做后处理。
+            // 必须分两步：归约融合 shader 尚不支持"归约后仍有逐元素后处理"
+            // 的形态（GPU 侧会静默错值，见 GpuEngine::eval_expr_reduce 的显式
+            // 拒绝）；1/dk、eps 由 RParam 承载 → 值不进 expr_spec_key。
+            auto s = dsl::compute_reduce(engine,
+                dsl::col_reduce_sum(dsl::leaf(*x) * dsl::leaf(*x)), dk, seq);
             if (!s) return std::unexpected(s.error());
-            auto m = engine.elementwise_binary_scalar(BinaryOp::Mul, *s, inv_dk);
-            if (!m) return std::unexpected(m.error());
-            auto ve = engine.elementwise_binary_scalar(BinaryOp::Add, *m, eps);
-            if (!ve) return std::unexpected(ve.error());
-            auto ri = engine.elementwise_unary(UnaryOp::Rsqrt, *ve);
+            auto ri = dsl::compute(engine,
+                dsl::rsqrt(dsl::leaf(*s) * dsl::rparam(inv_dk) + dsl::rparam(eps)),
+                s->rows(), s->cols());
             if (!ri) return std::unexpected(ri.error());
             auto ri_m = engine.to_matrix(*ri);
             if (!ri_m) return std::unexpected(ri_m.error());
@@ -216,20 +218,20 @@ private:
             auto ri = engine.slice_rows(rms_inv, bh, 1);
             if (!ri) return std::unexpected(ri.error());
             // m = (1/dk) · col_reduce_sum(gy * y)  → (1, seq)
-            auto gy_y = engine.elementwise_binary(BinaryOp::Mul, *gy, *y);
-            if (!gy_y) return std::unexpected(gy_y.error());
-            auto m_raw = engine.col_reduce_sum(*gy_y);
+            // 归约与后处理分两步（原因同上：归约融合 shader 不支持归约后后处理）
+            auto m_raw = dsl::compute_reduce(engine,
+                dsl::col_reduce_sum(dsl::leaf(*gy) * dsl::leaf(*y)), dk, seq);
             if (!m_raw) return std::unexpected(m_raw.error());
-            auto m = engine.elementwise_binary_scalar(BinaryOp::Mul, *m_raw, inv_dk);
+            auto m = dsl::compute(engine,
+                dsl::leaf(*m_raw) * dsl::rparam(inv_dk),
+                m_raw->rows(), m_raw->cols());
             if (!m) return std::unexpected(m.error());
-            // grad_x = (gy - m·y) · rms_inv
-            auto term = dsl::compute(engine,
-                dsl::col_broadcast(*m) * dsl::leaf(*y), dk, seq);
-            if (!term) return std::unexpected(term.error());
-            auto diff = engine.elementwise_binary(BinaryOp::Sub, *gy, *term);
-            if (!diff) return std::unexpected(diff.error());
+            // grad_x = (gy − m·y) · rms_inv：三式合一（原为 term/diff/gx 三个
+            // 独立 kernel + 一个逐元素原语），单次遍历、无中间张量
             auto gx = dsl::compute(engine,
-                dsl::leaf(*diff) * dsl::col_broadcast(*ri), dk, seq);
+                (dsl::leaf(*gy) - dsl::col_broadcast(*m) * dsl::leaf(*y))
+                    * dsl::col_broadcast(*ri),
+                dk, seq);
             if (!gx) return std::unexpected(gx.error());
             auto ins = engine.insert_rows(output, bh * dk, *gx);
             if (!ins) return std::unexpected(ins.error());
@@ -569,7 +571,9 @@ public:
         if (!u_r) return std::unexpected(u_r.error());
         auto z2_r = engine.slice_rows(*Z_sc, 2 * BHdk, BHdk); // dk·z（向量）
         if (!z2_r) return std::unexpected(z2_r.error());
-        auto z_inv_r = engine.elementwise_binary_scalar(BinaryOp::Mul, *z2_r, Scalar{1} / static_cast<Scalar>(d_k_));
+        auto z_inv_r = dsl::compute(engine,
+            dsl::leaf(*z2_r) * dsl::rparam(Scalar{1} / static_cast<Scalar>(d_k_)),
+            z2_r->rows(), z2_r->cols());
         if (!z_inv_r) return std::unexpected(z_inv_r.error()); // z = [2)/dk
 
         // ── pass 1：主扫描，读出 B^T·g 和 r = g·(B·q) ────────────
@@ -634,7 +638,9 @@ public:
             if (!SZ_r) return std::unexpected(SZ_r.error());
             auto suffix_sq_r = engine.slice_rows(*SZ_r, 0, BHdk);
             if (!suffix_sq_r) return std::unexpected(suffix_sq_r.error());
-            auto gk_r = engine.elementwise_binary(BinaryOp::Add, *gK_B_r, *suffix_sq_r);
+            auto gk_r = dsl::compute(engine,
+                dsl::leaf(*gK_B_r) + dsl::leaf(*suffix_sq_r),
+                gK_B_r->rows(), gK_B_r->cols());
             if (!gk_r) return std::unexpected(gk_r.error());
             gKt = std::move(*gk_r);
         }
@@ -643,11 +649,16 @@ public:
             // 双向：A/B 为全集常数 → dB 在所有位置广播相同值
             auto dB_sum_r = engine.row_reduce_sum(*dB_r);
             if (!dB_sum_r) return std::unexpected(dB_sum_r.error());
-            Tensor Bb = engine.create_tensor(BHdk * d_k_, seq);
-            { auto r = engine.zero(Bb); if (!r) return std::unexpected(r.error()); }
-            { auto r = engine.broadcast_row_inplace(Bb, *dB_sum_r, BinaryOp::Add);
-              if (!r) return std::unexpected(r.error()); }
-            auto SBc_r = engine.scan_suffix_outer(Bb, Kp_cache_, V_re_cache_,
+            // Bb = broadcast_row(dB_sum)：单条表达式取代 create_tensor + zero +
+            // broadcast_row_inplace（GPU 上 3 → 1 次 dispatch）。
+            // 注：IR 规定"输出 = 最后一条指令的 dst"，故**单视图表达式不合法**
+            // （指令表为空会被 validate_expr_spec 拒绝）。这里与一个**运行时 0**
+            // （RParam，编译期无法被常量折叠掉）相加，使表达式合法且语义不变。
+            auto Bb_r = dsl::compute(engine,
+                dsl::row_broadcast(*dB_sum_r) + dsl::rparam(Scalar{0}),
+                BHdk * d_k_, seq);
+            if (!Bb_r) return std::unexpected(Bb_r.error());
+            auto SBc_r = engine.scan_suffix_outer(*Bb_r, Kp_cache_, V_re_cache_,
                                                   d_k_, num_heads_, false,
                                                   dummy, false);
             if (!SBc_r) return std::unexpected(SBc_r.error());
@@ -657,16 +668,17 @@ public:
             auto gK_B_r = engine.slice_rows(*SBc_r, 2 * BHdk, BHdk);
             if (!gK_B_r) return std::unexpected(gK_B_r.error());
 
-            // 双向 gK 的常数项：Σ_t scale_t · q_t（全集求和后广播）
-            auto scale_q_r = engine.elementwise_binary(BinaryOp::Mul, *scale_r, Qp_cache_);
-            if (!scale_q_r) return std::unexpected(scale_q_r.error());
-            auto tsq_r = engine.row_reduce_sum(*scale_q_r);
+            // 双向 gK 的常数项：Σ_t scale_t · q_t（逐元素链与行归约融合为单次
+            // dispatch，不物化 scale_q 中间张量）
+            auto tsq_r = dsl::compute_reduce(engine,
+                dsl::row_reduce_sum(dsl::leaf(*scale_r) * dsl::leaf(Qp_cache_)),
+                BHdk, seq);
             if (!tsq_r) return std::unexpected(tsq_r.error());
-            Tensor gK_den = engine.create_tensor(BHdk, seq);
-            { auto r = engine.zero(gK_den); if (!r) return std::unexpected(r.error()); }
-            { auto r = engine.broadcast_row_inplace(gK_den, *tsq_r, BinaryOp::Add);
-              if (!r) return std::unexpected(r.error()); }
-            auto gk_r = engine.elementwise_binary(BinaryOp::Add, *gK_B_r, gK_den);
+            // gk = gK_B + row_broadcast(tsq)：单条表达式（原 zero + broadcast_row_
+            // inplace + elementwise Add 三次 dispatch → 1 次）
+            auto gk_r = dsl::compute(engine,
+                dsl::leaf(*gK_B_r) + dsl::row_broadcast(*tsq_r),
+                gK_B_r->rows(), gK_B_r->cols());
             if (!gk_r) return std::unexpected(gk_r.error());
             gKt = std::move(*gk_r);
         }
@@ -726,14 +738,16 @@ public:
 
         auto giq = w_q_.backward(engine, gq_r);
         if (!giq) return giq;
-        Tensor grad_input = std::move(*giq);
         auto gik = w_k_.backward(engine, gk_r);
         if (!gik) return gik;
-        { auto r = engine.add_inplace(grad_input, *gik); if (!r) return std::unexpected(r.error()); }
         auto giv = w_v_.backward(engine, gv_r);
         if (!giv) return giv;
-        { auto r = engine.add_inplace(grad_input, *giv); if (!r) return std::unexpected(r.error()); }
-        return grad_input;
+        // grad_input = gq + gk + gv：三路累加**原地**融合为单趟（目标传递，
+        // 不额外分配）；结合顺序与原实现一致 → 逐字节等价
+        auto acc = dsl::compute_into(engine,
+            dsl::leaf(*giq) + dsl::leaf(*gik) + dsl::leaf(*giv), *giq);
+        if (!acc) return std::unexpected(acc.error());
+        return giq;
     }
 
     // ── 增量推理（RLA-2 KV cache） ──────────────────────────────────

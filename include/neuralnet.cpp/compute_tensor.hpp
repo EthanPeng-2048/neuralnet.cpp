@@ -88,6 +88,24 @@ private:
         return cpu_data_.index() == slot ? std::get<slot>(cpu_data_) : nullptr;
     }
 
+    // 同 cpu_get，但返回**裸指针、不拷贝 shared_ptr**。
+    // 逐元素热点路径（DSL 模板求值的叶子 eval、逐元素原语）会按元素调用
+    // cpu_matrix()；若每次拷贝 shared_ptr，则每元素两次原子引用计数操作
+    // （实测 ~20ns/元素，使 DSL 模板路径比等价手写循环慢 8-70 倍）。
+    // 调用方（cpu_matrix 的调用者）本身持有该 Tensor，故裸指针在其生存期内有效。
+    template <Precision P>
+    [[nodiscard]] MatrixT<P>* cpu_get_ptr() noexcept
+    {
+        constexpr auto slot = static_cast<std::size_t>(P);
+        return cpu_data_.index() == slot ? std::get<slot>(cpu_data_).get() : nullptr;
+    }
+    template <Precision P>
+    [[nodiscard]] const MatrixT<P>* cpu_get_ptr() const noexcept
+    {
+        constexpr auto slot = static_cast<std::size_t>(P);
+        return cpu_data_.index() == slot ? std::get<slot>(cpu_data_).get() : nullptr;
+    }
+
 #ifdef NN_HAS_VULKAN
     template <Precision P>
     [[nodiscard]] std::shared_ptr<GpuTensorT<P>> gpu_get() const noexcept
@@ -218,7 +236,9 @@ public:
     {
         static_assert(P == Precision::F16 || P == Precision::F32,
                       "Phase 1 仅支持 F16/F32");
-        auto p = cpu_get<P>();
+        // 用 cpu_get_ptr（不拷贝 shared_ptr）：该函数在逐元素热点上会被按元素
+        // 调用，拷贝 shared_ptr 的原子引用计数是实测的主要开销来源。
+        MatrixT<P>* p = cpu_get_ptr<P>();
         NN_ASSERT(device_ == Device::CPU && p,
                   "cpu_matrix<P>(): tensor has no P-precision CPU storage");
         return *p;
@@ -229,7 +249,7 @@ public:
     {
         static_assert(P == Precision::F16 || P == Precision::F32,
                       "Phase 1 仅支持 F16/F32");
-        auto p = cpu_get<P>();
+        const MatrixT<P>* p = cpu_get_ptr<P>();
         NN_ASSERT(device_ == Device::CPU && p,
                   "cpu_matrix<P>() const: tensor has no P-precision CPU storage");
         return *p;

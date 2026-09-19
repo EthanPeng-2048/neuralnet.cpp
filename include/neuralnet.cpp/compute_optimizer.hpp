@@ -25,7 +25,7 @@
 #include <vector>
 
 #include "compute_engine.hpp"
-#include "compute_layer_base.hpp"  // clone_tensor
+#include "compute_layer_base.hpp"  // Layer 基类 / clone_tensor 等工具
 #include "compute_tensor.hpp"
 #include "expr_dsl.hpp"
 
@@ -148,11 +148,12 @@ public:
         if (norm <= max_norm)
             return {};
 
-        // 等比例缩放所有梯度
+        // 等比例缩放所有梯度（目标传递：原地、单 dispatch）
         Scalar scale = max_norm / norm;
         for (auto& g_ref : grads_)
         {
-            auto r = engine_.scale_inplace(g_ref.get(), scale);
+            auto r = dsl::compute_into(engine_,
+                dsl::leaf(g_ref.get()) * dsl::rparam(scale), g_ref.get());
             if (!r) return std::unexpected(r.error());
         }
         return {};
@@ -195,7 +196,10 @@ public:
 
         for (std::size_t i = 0; i < params_.size(); ++i)
         {
-            auto r = engine_.axpy_inplace(params_[i], -lr_, grads_[i]);
+            // p -= lr * g（目标传递：原地、单 dispatch）
+            auto r = dsl::compute_into(engine_,
+                dsl::leaf(params_[i]) + dsl::leaf(grads_[i]) * dsl::rparam(-lr_),
+                params_[i]);
             if (!r) return std::unexpected(r.error());
         }
         return {};
@@ -240,14 +244,17 @@ public:
 
         for (std::size_t i = 0; i < params_.size(); ++i)
         {
-            // v = β*v + (1-β)*g
-            auto r = engine_.scale_inplace(velocities_[i], beta_);
-            if (!r) return std::unexpected(r.error());
-            r = engine_.axpy_inplace(velocities_[i], one_minus_beta, grads_[i]);
+            // v = β*v + (1-β)*g（两趟原语融合为单 dispatch 的原地目标传递）
+            auto r = dsl::compute_into(engine_,
+                dsl::leaf(velocities_[i]) * dsl::rparam(beta_)
+                    + dsl::leaf(grads_[i]) * dsl::rparam(one_minus_beta),
+                velocities_[i]);
             if (!r) return std::unexpected(r.error());
 
-            // p -= lr * v
-            r = engine_.axpy_inplace(params_[i], -lr_, velocities_[i]);
+            // p -= lr * v（原地、单 dispatch）
+            r = dsl::compute_into(engine_,
+                dsl::leaf(params_[i]) + dsl::leaf(velocities_[i]) * dsl::rparam(-lr_),
+                params_[i]);
             if (!r) return std::unexpected(r.error());
         }
         return {};
@@ -319,7 +326,9 @@ protected:
                     + dsl::rparam(eps_))),
             rows, cols);
         if (!delta) return std::unexpected(delta.error());
-        auto r = engine_.add_inplace(params_[i], *delta);
+        // p += delta（目标传递：原地、单 dispatch，不额外分配）
+        auto r = dsl::compute_into(engine_,
+            dsl::leaf(params_[i]) + dsl::leaf(*delta), params_[i]);
         if (!r) return std::unexpected(r.error());
         return {};
     }
@@ -431,10 +440,11 @@ public:
 
         for (std::size_t i = 0; i < params_.size(); ++i)
         {
-            // 权重衰减解耦：p = (1 - lr*wd) * p
+            // 权重衰减解耦：p = (1 - lr*wd) * p（目标传递：原地、单 dispatch）
             if (wd_ != Scalar{0})
             {
-                auto r = engine_.scale_inplace(params_[i], decay_factor);
+                auto r = dsl::compute_into(engine_,
+                    dsl::leaf(params_[i]) * dsl::rparam(decay_factor), params_[i]);
                 if (!r) return std::unexpected(r.error());
             }
 
@@ -471,11 +481,10 @@ public:
     constexpr Scalar c = 2.0315f;
 
     // 计算 Frobenius 范数的平方：||G||_F² = Σ g_ij²
-    // 通过 elementwise(Mul) → row_reduce_sum → col_reduce_sum 三步原语得到 (1,1) 张量
-    auto norm_sq = dsl::compute(engine, dsl::leaf(G) * dsl::leaf(G),
-                                G.rows(), G.cols());
-    if (!norm_sq) return std::unexpected(norm_sq.error());
-    auto row_sum_norm = engine.row_reduce_sum(*norm_sq);
+    // 逐元素链与行归约**融合为单 dispatch**（不物化 norm_sq 中间张量），
+    // 再对 (rows,1) 小向量做列归约 → (1,1)
+    auto row_sum_norm = dsl::compute_reduce(engine,
+        dsl::row_reduce_sum(dsl::leaf(G) * dsl::leaf(G)), G.rows(), G.cols());
     if (!row_sum_norm) return std::unexpected(row_sum_norm.error());
     auto total_norm_sq = engine.col_reduce_sum(*row_sum_norm);
     if (!total_norm_sq) return std::unexpected(total_norm_sq.error());
@@ -487,11 +496,11 @@ public:
     Scalar norm_sq_val = total_norm_sq_mat->at(0, 0);
     Scalar inv_norm_scalar = Scalar{1} / std::sqrt(norm_sq_val + eps * eps);
 
-    // X = G * inv_norm_scalar（一次标量乘法归一化）
-    auto X = clone_tensor(engine, G);
+    // X = G * inv_norm_scalar（归一化）：单表达式（取代 clone 整块拷贝 + scale
+    // 两次 dispatch；GPU 上 1 个融合 kernel + 1 次分配）
+    auto X = dsl::compute(engine,
+        dsl::leaf(G) * dsl::rparam(inv_norm_scalar), G.rows(), G.cols());
     if (!X) return std::unexpected(X.error());
-    auto r = engine.scale_inplace(*X, inv_norm_scalar);
-    if (!r) return std::unexpected(r.error());
 
     // 选更小一侧构造母矩阵，避免显存爆炸（Muon 显存 > AdamW 的根因）：
     //   - 短宽/方阵（m ≤ n）：行正交化，母矩阵 A = X·X^T（m×m，m 为短边）
@@ -507,9 +516,10 @@ public:
     if (!tall)
     {
         // 行正交化：X ← (a + bA + cA²)·X，A = X·X^T（m×m）
-        // 性能优化：就地复用 matmul 输出缓冲区，减少 clone_tensor 调用：
-        //   A 就地改为 B = bA + cA²；BX 就地加 aX 得 X_new。每步仍创建 3 个
-        //   新 Tensor（A、A_sq、BX），但消除了额外的 clone_tensor 步骤。
+        // 每步 5 次 dispatch：matmul(A) + matmul(A²) + 融合原地 A=bA+cA²
+        //                  + matmul(BX) + 融合原地 BX+=aX
+        // （原实现 7 次：多出 scale(A²,c)/scale(A,b)/add(A,A²) 三次，现合并为
+        //   一次原地目标传递）
         for (std::size_t t = 0; t < steps; ++t)
         {
             auto A = engine.matmul(*X, *X, false, true);     // A = X·X^T
@@ -517,17 +527,18 @@ public:
             auto A_sq = engine.matmul(*A, *A, false, false); // A²
             if (!A_sq) return std::unexpected(A_sq.error());
 
-            r = engine.scale_inplace(*A_sq, c);
-            if (!r) return std::unexpected(r.error());
-            r = engine.scale_inplace(*A, b);
-            if (!r) return std::unexpected(r.error());
-            r = engine.add_inplace(*A, *A_sq);               // A = bA + cA²
-            if (!r) return std::unexpected(r.error());
+            // A = b·A + c·A²：原为 scale(A²,c) + scale(A,b) + add(A,A²) 三次
+            // dispatch，融合为一次原地目标传递（GPU 上 1 个 kernel）
+            auto accA = dsl::compute_into(engine,
+                dsl::leaf(*A) * dsl::rparam(b) + dsl::leaf(*A_sq) * dsl::rparam(c), *A);
+            if (!accA) return std::unexpected(accA.error());
 
             auto BX = engine.matmul(*A, *X, false, false);   // B·X
             if (!BX) return std::unexpected(BX.error());
-            r = engine.axpy_inplace(*BX, a, *X);             // + aX
-            if (!r) return std::unexpected(r.error());
+            // BX += a·X（原地目标传递：单 dispatch，不额外分配）
+            auto accBX = dsl::compute_into(engine,
+                dsl::leaf(*BX) + dsl::leaf(*X) * dsl::rparam(a), *BX);
+            if (!accBX) return std::unexpected(accBX.error());
 
             X = std::move(*BX);
         }
@@ -544,17 +555,17 @@ public:
             auto Gr_sq = engine.matmul(*Gr, *Gr, false, false); // G²
             if (!Gr_sq) return std::unexpected(Gr_sq.error());
 
-            r = engine.scale_inplace(*Gr_sq, c);
-            if (!r) return std::unexpected(r.error());
-            r = engine.scale_inplace(*Gr, b);
-            if (!r) return std::unexpected(r.error());
-            r = engine.add_inplace(*Gr, *Gr_sq);             // G = bG + cG²
-            if (!r) return std::unexpected(r.error());
+            // G = b·G + c·G²（同上：三次 dispatch 融合为一次原地目标传递）
+            auto accG = dsl::compute_into(engine,
+                dsl::leaf(*Gr) * dsl::rparam(b) + dsl::leaf(*Gr_sq) * dsl::rparam(c), *Gr);
+            if (!accG) return std::unexpected(accG.error());
 
             auto XM = engine.matmul(*X, *Gr, false, false);  // X·G
             if (!XM) return std::unexpected(XM.error());
-            r = engine.axpy_inplace(*XM, a, *X);             // + aX
-            if (!r) return std::unexpected(r.error());
+            // XM += a·X（原地目标传递：单 dispatch）
+            auto accXM = dsl::compute_into(engine,
+                dsl::leaf(*XM) + dsl::leaf(*X) * dsl::rparam(a), *XM);
+            if (!accXM) return std::unexpected(accXM.error());
 
             X = std::move(*XM);
         }
@@ -621,22 +632,22 @@ public:
         {
             const Tensor& g = grads_[i];
 
-            // 1. SGD-Momentum: v = μ*v + g
-            auto r = engine_.scale_inplace(velocities_[i], momentum_);
-            if (!r) return std::unexpected(r.error());
-            r = engine_.add_inplace(velocities_[i], g);
+            // 1. SGD-Momentum: v = μ*v + g（两趟原语融合为单 dispatch）
+            auto r = dsl::compute_into(engine_,
+                dsl::leaf(velocities_[i]) * dsl::rparam(momentum_) + dsl::leaf(g),
+                velocities_[i]);
             if (!r) return std::unexpected(r.error());
 
             // 确定用于正交化的更新方向（Nesterov 时需临时缓冲，否则直接用 v）
             std::optional<Tensor> nesterov_buf;
             if (nesterov_)
             {
-                // Nesterov: update = g + μ*v
-                // 优化：clone g 一次，用 axpy_inplace 就地添加 μ*v（原实现需要 2 次 clone + scale + add）
-                auto buf = clone_tensor(engine_, g);
+                // Nesterov: update = g + μ*v（单表达式：一次 dispatch + 一次分配，
+                // 取代 clone(整块拷贝) + axpy 两次 dispatch）
+                auto buf = dsl::compute(engine_,
+                    dsl::leaf(g) + dsl::leaf(velocities_[i]) * dsl::rparam(momentum_),
+                    g.rows(), g.cols());
                 if (!buf) return std::unexpected(buf.error());
-                r = engine_.axpy_inplace(*buf, momentum_, velocities_[i]);
-                if (!r) return std::unexpected(r.error());
                 nesterov_buf = std::move(*buf);
             }
             const Tensor& update = nesterov_buf ? *nesterov_buf : velocities_[i];
@@ -656,13 +667,18 @@ public:
                 const std::size_t big = m > n ? m : n;
                 const Scalar muon_scale =
                     Scalar{0.2} * std::sqrt(static_cast<Scalar>(big));
-                r = engine_.axpy_inplace(params_[i], -lr_ * muon_scale, *ortho_update);
+                r = dsl::compute_into(engine_,
+                    dsl::leaf(params_[i])
+                        + dsl::leaf(*ortho_update) * dsl::rparam(-lr_ * muon_scale),
+                    params_[i]);
                 if (!r) return std::unexpected(r.error());
             }
             else
             {
-                // 非 2D 参数（bias 等）：标准 SGD 更新（用 axpy_inplace 融合 scale+add）
-                r = engine_.axpy_inplace(params_[i], -lr_, update);
+                // 非 2D 参数（bias 等）：标准 SGD 更新（目标传递：原地、单 dispatch）
+                r = dsl::compute_into(engine_,
+                    dsl::leaf(params_[i]) + dsl::leaf(update) * dsl::rparam(-lr_),
+                    params_[i]);
                 if (!r) return std::unexpected(r.error());
             }
         }

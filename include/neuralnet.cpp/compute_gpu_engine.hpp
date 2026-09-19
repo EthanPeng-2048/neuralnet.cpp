@@ -22,10 +22,13 @@
 //   end_batch 一次 vkQueueSubmit + vkWaitForFences，消除 per-primitive 同步开销。
 //   to_matrix/from_matrix 会打断 batch（flush 后自动重新 begin_batch）。
 //
-// 原地操作语义：
-//   add_inplace / scale_inplace / broadcast_*_inplace 采用"分配新 buffer +
-//   替换 Tensor"策略（copy-on-write 语义）。zero 使用 vkCmdFillBuffer 真原地
-//   清零（避免每步分配）。
+// 原地操作语义（2026-09 起已全部改为真原地，此前的 copy-on-write 描述已作废）：
+//   add_inplace / scale_inplace / axpy_inplace / broadcast_*_inplace 均直接写回
+//   A 自己的 buffer（逐元素 kernel 每线程只读写自己下标一次，read-before-write
+//   天然成立；同一 command buffer 内按录制顺序执行）。zero 用 vkCmdFillBuffer。
+//   目的：消除「分配新 buffer + 全量写出」在优化器/梯度累积路径上的分配风暴。
+//   注意：真原地要求调用方保证 A 不被同一录制窗口内已录制的命令读引用，
+//   也不能与别的 Tensor 共享 buffer 且语义上需要保持独立（否则请传副本）。
 // ─────────────────────────────────────────────────────────────────────────
 
 #ifdef NN_HAS_VULKAN
@@ -166,6 +169,38 @@ public:
             dst->buffer().impl(), 0, size);
         if (!r) return std::unexpected(r.error());
         return Tensor::from_gpu(std::move(*dst));
+    }
+
+    // ── 异步标量回读（P0-2）───────────────────────────────────────────
+    // 把 (1,1) F32 标量排入一次 D2H 拷贝并提交，不等待。调用时机：产出该
+    // 标量的主帧（flush_batch/end_batch）已提交之后——同队列 FIFO 保证拷贝
+    // 执行在生产命令之后。poll 非阻塞，就绪即取（见 compute_engine.hpp）。
+    [[nodiscard]] Result<void> submit_scalar_readback(
+        std::size_t slot, const Tensor& t) override
+    {
+        if (t.is_cpu())
+            return std::unexpected(Error{
+                "submit_scalar_readback: 期望 GPU 张量"});
+        if (t.precision() != Precision::F32)
+            return std::unexpected(Error{
+                "submit_scalar_readback: 仅支持 F32 标量（调用方先 cast）"});
+        return backend_.submit_scalar_readback(
+            slot, t.gpu_tensor().buffer().impl());
+    }
+
+    [[nodiscard]] Result<bool> poll_scalar_readback(
+        std::size_t slot, Scalar& out) override
+    {
+        float v = 0.0f;
+        auto r = backend_.poll_scalar_readback(slot, v);
+        if (!r) return std::unexpected(r.error());
+        out = static_cast<Scalar>(v);
+        return *r;
+    }
+
+    [[nodiscard]] std::size_t scalar_readback_slots() const override
+    {
+        return GpuBackend::scalar_readback_slot_count();
     }
 
     // ── 中点刷新：提交当前 command buffer 并开始新的录制 ──
@@ -1024,6 +1059,26 @@ public:
 
         // canonical IR：与 eval_expr 同（canonicalize 为引擎内部优化）
         const ExprSpec spec = nn::canonicalize_expr_spec(raw_spec);
+
+        // ── 限制：归约向量输出的末指令必须是归约指令 ──────────────────────
+        // 归约融合 shader（generate_glsl_reduce）对"归约**之后**还有逐元素
+        // 后处理"的形态（如 rsqrt(col_sum(x²)*k + c)）尚未正确实现：列归约
+        // 分支会把后处理链在错误的索引上求值，实测给出**静默错值**
+        // （ce_fusion_test 的"归约+后处理"用例：GPU err≈1.9，CPU err≈1e-7）。
+        // 这里显式硬报错，把"静默错值"变成"立即暴露的错误"（闭合世界原则）。
+        // 改用两步写法即可：先 compute_reduce 取归约向量，再对 (rows,1)/(1,cols)
+        // 小向量用 dsl::compute 施加后处理（LayerNorm/RMSNorm 即此写法）。
+        // 注意：CPU 端已支持该形态（eval_expr_impl 的按指令下标反向切片），
+        // 修复生成器后可在此放开。
+        if (!spec.instrs.empty() &&
+            !expr_op_is_reduce(static_cast<ExprOp>(spec.instrs.back().op)))
+        {
+            return std::unexpected(Error{
+                "GpuEngine::eval_expr_reduce: 归约向量输出的表达式末指令必须是归约指令"
+                "（归约后逐元素后处理在归约融合 shader 中尚未正确实现）；"
+                "请拆成两步：compute_reduce 取归约向量，再用 dsl::compute 做后处理"});
+        }
+
         const std::string key = nn::expr_spec_key(spec);
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
         const nn::fused::FusedShader* fs = nn::fused::find_fused(key);
@@ -1050,6 +1105,58 @@ public:
         // ── 闭合世界：未命中归约融合 shader → 硬报错（绝不静默回退） ──
         return std::unexpected(Error{
             "GpuEngine::eval_expr_reduce: 未找到该归约表达式的 AOT 融合 shader（闭合世界）；"
+            "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）"});
+    }
+
+    // ── 目标传递（destination-passing）：结果直接写回已有张量 ─────────────
+    // 走 run_fused_gpu 的 output_override —— dst 的 buffer 作为写only输出绑定，
+    // 若表达式引用了 leaf(dst) 则同一 buffer 同时作为 readonly 输入绑定：
+    // 逐元素同索引"先读后写"，无跨调用危害（与 GPU 原地原语的既有做法一致）。
+    // 语义与限制同 CpuEngine::eval_expr_into（仅逐元素表达式；无分配）。
+    [[nodiscard]] Result<void> eval_expr_into(
+        const ExprSpec& raw_spec,
+        std::span<const Tensor> inputs,
+        std::size_t rows, std::size_t cols, Tensor& dst) override
+    {
+        if (dst.rows() != rows || dst.cols() != cols)
+            return std::unexpected(Error{"eval_expr_into: dst shape mismatch"});
+
+        const ExprSpec spec = nn::canonicalize_expr_spec(raw_spec);
+        if (nn::expr_spec_reduce_axis(spec) != -1)
+            return std::unexpected(Error{
+                "eval_expr_into: 仅支持逐元素表达式（无归约）"});
+        const std::string key = nn::expr_spec_key(spec);
+#ifdef NN_FUSED_REGISTRY_EMBEDDED
+        const nn::fused::FusedShader* fs = nn::fused::find_fused(key);
+        if (fs && backend_.has_fused_shader(key))
+        {
+            std::vector<GpuTensor> gpu_inputs;
+            gpu_inputs.reserve(inputs.size());
+            for (const auto& t : inputs)
+            {
+                auto g = ensure_gpu(t);
+                if (!g) return std::unexpected(g.error());
+                gpu_inputs.push_back(g->gpu_tensor());
+            }
+            auto dst_gpu = ensure_gpu(dst);
+            if (!dst_gpu) return std::unexpected(dst_gpu.error());
+            const auto vp = nn::expr_spec_runtime_view_params(spec);
+            auto out = backend_.run_fused_gpu(
+                key, gpu_inputs, spec.consts, rows, cols, /*vector_out=*/false, vp,
+                spec.rparams, &dst_gpu->gpu_tensor(),
+                nn::expr_spec_runtime_matmul_k(spec),
+                nn::expr_spec_runtime_matmul_batch(spec));
+            if (!out) return std::unexpected(out.error());
+            // dst 原为 CPU staging 时，ensure_gpu 上传了新 buffer（结果在它上面）
+            // → 用 upload 后的张量替换 dst，保证调用方看到更新后的数据
+            if (dst.is_cpu())
+                dst = std::move(*dst_gpu);
+            return {};
+        }
+#endif
+        // ── 闭合世界：未命中 AOT 融合 shader → 硬报错（绝不静默回退） ──
+        return std::unexpected(Error{
+            "GpuEngine::eval_expr_into: 未找到该表达式的 AOT 融合 shader（闭合世界）；"
             "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）"});
     }
 

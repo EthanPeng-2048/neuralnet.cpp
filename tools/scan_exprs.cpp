@@ -165,6 +165,21 @@ int main(int argc, char* argv[])
         (void)attn.backward(engine, grad);                   // 登记 bwd 结构
     }
 
+    // ── ReLULinearAttention（**双向** causal=false）forward + backward ───
+    // 双向分支与因果分支表达式不同（Bb = broadcast_row(dB_sum)；
+    // tsq = row_reduce_sum(scale·q)；gk = gK_B + row_broadcast(tsq)），
+    // 必须单独 dry-run：否则 GPU 运行到该分支未命中融合 shader 会硬报错。
+    {
+        const std::size_t d_model = 8, heads = 2, seq = 4, batch = 2;
+        nn::ReLULinearAttention attn_nc(d_model, heads, seq, /*causal=*/false,
+                                       nn::PosEncodingType::RoPE);
+        (void)attn_nc.init(engine);
+        nn::Tensor x = nn::Tensor::cpu(d_model, batch * seq);
+        (void)attn_nc.forward(engine, x);
+        nn::Tensor grad = nn::Tensor::cpu(d_model, batch * seq);
+        (void)attn_nc.backward(engine, grad);
+    }
+
     // ── GPTBlock forward + backward（残差相加 A+B）────────────────────────
     {
         const std::size_t d_model = 16, heads = 2, d_ff = 32, seq = 4, batch = 2;
@@ -220,29 +235,49 @@ int main(int argc, char* argv[])
         (void)ce.forward(engine, logits, target);
     }
 
-    // ── Adam 优化器 step（g*g、m_hat/denom）+ 梯度裁剪（g*g、acc+col_sum）─
+    // ── 优化器 step + 梯度裁剪（全部变体）────────────────────────────────
+    // 各优化器已迁移为 DSL 融合表达式 / 目标传递（dsl::compute_into）：
+    //   sgd          : p += -lr*g
+    //   sgd_momentum : v = β*v + (1-β)*g ; p += -lr*v
+    //   adam         : m/v 更新 + p += delta
+    //   adamw        : p *= (1-lr*wd) + adam
+    //   muon         : v = μ*v + g；Nesterov；Newton–Schulz（含 A=bA+cA² 等）
+    //   clip_grad_norm: g *= scale
+    // 必须逐个 dry-run：GPU 运行时同一结构才能命中 AOT 融合 shader（闭合世界）。
+    // 结构不依赖形状，任取小 R×C 即可（Muon 的 NS 只对 ≥2D 参数生效）。
     {
         const std::size_t R = 8, C = 5;
-        nn::Tensor p = nn::Tensor::cpu(R, C);
-        nn::Tensor g = nn::Tensor::cpu(R, C);
-        auto opt = nn::create_optimizer("adam", engine,
-                                        std::vector<nn::TensorRef>{p},
-                                        std::vector<nn::TensorRef>{g},
-                                        nn::Scalar{1e-3f});
-        if (opt) { (void)opt->step(); (void)opt->clip_grad_norm(nn::Scalar{1e3f}); }
+        for (const char* name : {"sgd", "sgd_momentum", "adam", "adamw", "muon"})
+        {
+            nn::Tensor p = nn::Tensor::cpu(R, C);
+            nn::Tensor g = nn::Tensor::cpu(R, C);
+            auto opt = nn::create_optimizer(name, engine,
+                                            std::vector<nn::TensorRef>{p},
+                                            std::vector<nn::TensorRef>{g},
+                                            nn::Scalar{1e-3f});
+            if (opt)
+            {
+                (void)opt->step();
+                (void)opt->clip_grad_norm(nn::Scalar{1e3f});
+            }
+        }
     }
 
-    // ── Linear forward（算子融合二期 S4：matmul+bias 融合路径）───────────
+    // ── Linear forward + backward（算子融合二期 S4：matmul+bias 融合路径）──
     // Linear::forward 已迁移为 dsl::compute(matmul(W,x) + row_broadcast(b))：
-    // 折叠出前置 matmul 段 + 尾逐元素链（Add + RowBroadcast 视图）。必须
-    // dry-run 覆盖本路径：GPU 运行时同一结构命中 AOT 融合 shader（闭合世界
-    // 两端一致）。结构不依赖形状，任取一个 in/out/batch 即可。
+    // 折叠出前置 matmul 段 + 尾逐元素链（Add + RowBroadcast 视图）。
+    // Linear::backward 的 grad_w 累加已迁移为
+    // dsl::compute(grad_w + matmul(grad_out, input^T))（matmul 段 + Add 融合）。
+    // 两者都必须 dry-run 覆盖：GPU 运行时同一结构命中 AOT 融合 shader（闭合
+    // 世界两端一致）。结构不依赖形状，任取一个 in/out/batch 即可。
     {
         const std::size_t in_f = 8, out_f = 5, B = 4;
         nn::Linear linear(in_f, out_f);
         (void)linear.init(engine);
         nn::Tensor input = nn::Tensor::cpu(in_f, B);
         (void)linear.forward(engine, input);
+        nn::Tensor grad_out = nn::Tensor::cpu(out_f, B);
+        (void)linear.backward(engine, grad_out);   // 登记 grad_w 融合结构
     }
 
     // ── 算子融合二期（docs/14 S1-S3）：matmul 参与 IR 融合 ───────────────
@@ -376,6 +411,22 @@ int main(int argc, char* argv[])
         std::vector<std::size_t> labels2(B, 0);
         labels2[0] = 99;  // 越界 → mask 修正为 0
         (void)ce.forward_sparse(engine, logits, labels2, {}, C);
+    }
+
+    // ── Conv2D forward + backward（matmul 段融合 bias / 融合累加）──────────
+    // forward : Z = matmul(W, im2col(x)) + row_broadcast(b) —— matmul 段 + 尾链
+    // backward: grad_w += matmul(gZ, col^T) —— matmul 段 + 原地累加（compute_into）
+    // 两者都必须 dry-run：GPU 运行时同一结构才能命中 AOT 融合 shader。
+    // 结构不依赖形状，任取小尺寸即可。
+    {
+        const std::size_t c_in = 1, c_out = 2, k = 3, in_h = 5, in_w = 5, batch = 2;
+        nn::Conv2D conv(c_in, c_out, k, /*stride=*/1, /*padding=*/0, in_h, in_w);
+        (void)conv.init(engine);
+        const std::size_t oh = in_h - k + 1, ow = in_w - k + 1;
+        nn::Tensor x = nn::Tensor::cpu(c_in * in_h * in_w, batch);
+        (void)conv.forward(engine, x);
+        nn::Tensor grad = nn::Tensor::cpu(c_out * oh * ow, batch);
+        (void)conv.backward(engine, grad);
     }
 
     auto& reg = nn::fused::global_registry();

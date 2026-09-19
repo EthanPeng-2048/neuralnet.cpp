@@ -6,21 +6,22 @@
 //   1. Loss 的 forward/backward 只写一次，通过 ComputeEngine 参数自动适配
 //      CPU/GPU 设备。
 //   2. 算法只在 Loss（通过组合 engine 原语表达），绝不在 Engine/Shader 中。
-//   3. Softmax/CrossEntropy 算法由本文件通过 col_reduce_max + exp + col_reduce_sum
-//      + broadcast_col + elementwise 组合表达，Engine 不知道 "softmax" 是什么。
+//   3. Softmax/CrossEntropy 算法由本文件用 DSL 表达式（dsl::compute /
+//      dsl::compute_reduce）+ 归约/IO 引擎原语组合表达，Engine 不知道
+//      "softmax" 是什么。
 //
-// 算法表达示例：
-//   MSELoss forward:  grad = (2/N) * (pred - target);  loss = (1/N) * Σ diff²
+// 算法表达示例（均以 DSL 表达式书写，逐元素链与相邻归约融合为单 kernel）：
+//   MSELoss forward:  diff = pred-target; grad = diff*(2/N);
+//                     Σdiff² = compute_reduce(col_reduce_sum(diff*diff))
 //   CrossEntropy forward (with softmax):
-//     col_max   = col_reduce_max(logits)             // 数值稳定
-//     shifted   = logits - col_max                   (broadcast_col Sub)
-//     exp_shift = exp(shifted)                       (unary Exp)
-//     col_sum   = col_reduce_sum(exp_shift)
-//     softmax   = exp_shift / col_sum                (broadcast_col Div)
-//     grad      = softmax - target                   (elementwise Sub)
-//     log_sm    = shifted - log(col_sum)             (broadcast_col Sub)
+//     col_max   = col_reduce_max(logits)             // 数值稳定（归约原语）
+//     col_sum   = compute_reduce(col_reduce_sum(exp(logits - cb(col_max))))
+//     shifted   = logits - col_max                   // 列广播表达式
+//     softmax   = exp(shifted) / cb(col_sum)         // 列广播表达式
+//     log_sm    = shifted - cb(log(col_sum))         // 列广播表达式
+//     grad      = (softmax - target) * rparam(1/batch)
 //     loss      = -(1/batch) * Σ target * log_sm
-//   CrossEntropy backward: grad = softmax - target_onehot
+//   CrossEntropy backward: grad = (softmax - target_onehot) / batch
 // ─────────────────────────────────────────────────────────────────────────
 
 #include "compute_engine.hpp"
@@ -74,34 +75,35 @@ public:
         const Scalar total = static_cast<Scalar>(pred.size());
         const Scalar scale = Scalar{2} / total;
 
-        // diff = pred - target
+        // diff = pred - target（逐元素融合）
         auto diff = dsl::compute(engine,
             dsl::leaf(pred) - dsl::leaf(target),
             pred.rows(), pred.cols());
         if (!diff) return std::unexpected(diff.error());
 
-        // grad = diff * (2/N) — 深拷贝后 scale
-        grad_input_ = *diff;
-        auto r = engine.scale_inplace(grad_input_, scale);
-        if (!r) return std::unexpected(r.error());
-
-        // diff_sq = diff * diff
-        auto diff_sq = dsl::compute(engine,
-            dsl::leaf(*diff) * dsl::leaf(*diff),
+        // Σ diff²：逐元素链与列归约融合为**单次** dispatch（GPU 上 1 个融合
+        // kernel，不物化 diff_sq 中间张量；CPU 该路径更慢，但 GPU 是主战场）。
+        // 必须在下面"就地缩放 diff"之前完成（缩放与 diff 共享缓冲）。
+        auto col_sum = dsl::compute_reduce(engine,
+            dsl::col_reduce_sum(dsl::leaf(*diff) * dsl::leaf(*diff)),
             diff->rows(), diff->cols());
-        if (!diff_sq) return std::unexpected(diff_sq.error());
-
-        // 全局求和：先按列归约 (1, cols)，再按行归约 (1, 1)
-        auto col_sum = engine.col_reduce_sum(*diff_sq);
         if (!col_sum) return std::unexpected(col_sum.error());
         auto total_t = engine.row_reduce_sum(*col_sum);
         if (!total_t) return std::unexpected(total_t.error());
-
-        // 下载标量
         auto m = engine.to_matrix(*total_t);
         if (!m) return std::unexpected(m.error());
+        const Scalar loss = m->at_unchecked(0, 0) / total;
 
-        return m->at_unchecked(0, 0) / total;
+        // grad = diff * (2/N)：2/N 由 RParam 承载（值不进 expr_spec_key，同一
+        // 结构跨形状共享 AOT shader）。**就地**缩放在 diff 自己的缓冲上完成
+        // （零额外分配；guard 已用完 diff²，且 grad_input_ 与原实现一样与 diff
+        // 共享缓冲——但此时 diff² 已取用，故不产生"平方被缩放值"的污染）。
+        auto grad = dsl::compute_into(engine,
+            dsl::leaf(*diff) * dsl::rparam(scale), *diff);
+        if (!grad) return std::unexpected(grad.error());
+        grad_input_ = std::move(*diff);
+
+        return loss;
     }
 
     [[nodiscard]] Result<Tensor> backward() override
@@ -158,17 +160,18 @@ private:
             logits.rows(), logits.cols());
         if (!col_sum) return std::unexpected(col_sum.error());
 
-        auto shifted = clone_tensor(engine, logits);
+        // shifted / softmax / log_softmax 全部用**列广播表达式**：GPU 上各为 1 个
+        // 融合 kernel，且不再需要 clone 一份 (classes,batch)（旧路径 = clone
+        // 整块 vkCmdCopyBuffer + 3 次就地广播 dispatch）。
+        auto shifted = dsl::compute(engine,
+            dsl::leaf(logits) - dsl::col_broadcast(*col_max),
+            logits.rows(), logits.cols());
         if (!shifted) return std::unexpected(shifted.error());
-        auto r = engine.broadcast_col_inplace(*shifted, *col_max, BinaryOp::Sub);
-        if (!r) return std::unexpected(r.error());
 
-        auto exp_shift = engine.elementwise_unary(UnaryOp::Exp, *shifted);
-        if (!exp_shift) return std::unexpected(exp_shift.error());
-
-        // softmax 就地于 exp_shift 上，省一次 (classes, batch) 分配
-        r = engine.broadcast_col_inplace(*exp_shift, *col_sum, BinaryOp::Div);
-        if (!r) return std::unexpected(r.error());
+        auto softmax = dsl::compute(engine,
+            dsl::exp(dsl::leaf(*shifted)) / dsl::col_broadcast(*col_sum),
+            shifted->rows(), shifted->cols());
+        if (!softmax) return std::unexpected(softmax.error());
 
         // 稳定 log_softmax = shifted - log(col_sum)
         // col_sum ≥ 1（因 max 元素 shifted=0 → exp=1），故 log(col_sum) 有限
@@ -177,15 +180,12 @@ private:
             col_sum->rows(), col_sum->cols());
         if (!log_col_sum) return std::unexpected(log_col_sum.error());
 
-        // log_softmax = shifted - log(col_sum)：这是**列广播**（每个元素减去
-        // 对应列的 log(col_sum)），不能用 elementwise_binary —— log_col_sum
-        // 形状为 (1, batch) 而 shifted 为 (classes, batch)，两引擎均要求形状
-        // 完全一致会报 shape mismatch。此处 shifted 已不再使用，可就地广播。
-        r = engine.broadcast_col_inplace(*shifted, *log_col_sum, BinaryOp::Sub);
-        if (!r) return std::unexpected(r.error());
-        auto log_softmax = std::move(shifted);
+        auto log_softmax = dsl::compute(engine,
+            dsl::leaf(*shifted) - dsl::col_broadcast(*log_col_sum),
+            shifted->rows(), shifted->cols());
+        if (!log_softmax) return std::unexpected(log_softmax.error());
 
-        return DenseSoftmax{/*softmax=*/std::move(*exp_shift),
+        return DenseSoftmax{/*softmax=*/std::move(*softmax),
                             /*log_softmax=*/std::move(*log_softmax)};
     }
 
@@ -207,30 +207,28 @@ public:
         auto sm = softmax_cols_(engine, logits);
         if (!sm) return std::unexpected(sm.error());
 
-        // 2. grad = (softmax - target) / batch (elementwise Sub + scale)
+        // 2. grad = (softmax - target) / batch
         //    loss = -(1/batch) * Σ target * log_softmax，故
         //    d(loss)/d(logits) = (softmax - one_hot) / batch。
         //    缺少 1/batch 缩放会使 SGD/动量、梯度裁剪与 PyTorch 不一致
         //    （Adam 的二阶矩会抵消常数缩放，但其他优化器不会）。
+        //    1/batch 由 RParam 承载（值不进 expr_spec_key）→ 单 kernel，
+        //    取代 elementwise + scale_inplace。
         auto grad = dsl::compute(engine,
-            dsl::leaf(sm->softmax) - dsl::leaf(target),
+            (dsl::leaf(sm->softmax) - dsl::leaf(target))
+                * dsl::rparam(Scalar{1} / static_cast<Scalar>(batch)),
             sm->softmax.rows(), sm->softmax.cols());
         if (!grad) return std::unexpected(grad.error());
-        auto rg = engine.scale_inplace(*grad, Scalar{1} / static_cast<Scalar>(batch));
-        if (!rg) return std::unexpected(rg.error());
-        grad_input_ = *grad;
+        grad_input_ = std::move(*grad);
 
         // 3. log_softmax 已在 softmax_cols_ 内以数值稳定形式算出
         //    （= shifted - log(col_sum)，避免 0*log(0)=NaN，见 M3）
 
-        // 4. target_dot_log = target * log_softmax
-        auto target_dot_log = dsl::compute(engine,
-            dsl::leaf(target) * dsl::leaf(sm->log_softmax),
+        // 4+5. Σ target ⊙ log_softmax（先列归约再行归约 → (1,1)）：逐元素链与
+        //      列归约融合为单次 dispatch（GPU 上 1 个融合 kernel）
+        auto col_s = dsl::compute_reduce(engine,
+            dsl::col_reduce_sum(dsl::leaf(target) * dsl::leaf(sm->log_softmax)),
             target.rows(), target.cols());
-        if (!target_dot_log) return std::unexpected(target_dot_log.error());
-
-        // 5. Σ target * log_softmax (先列归约再行归约 → (1,1))
-        auto col_s = engine.col_reduce_sum(*target_dot_log);
         if (!col_s) return std::unexpected(col_s.error());
         auto total_t = engine.row_reduce_sum(*col_s);
         if (!total_t) return std::unexpected(total_t.error());
@@ -264,11 +262,17 @@ public:
     //   labels     — 平坦标签数组，大小 = logits.cols()，值域 [0, vocab_size)
     //   loss_mask  — 可选，平坦 mask 数组，>0.5 表示参与 loss，否则清零梯度
     //   vocab_size — 词表大小，用于越界检查
-    [[nodiscard]] Result<Scalar> forward_sparse(
+    // ── 稀疏 CE：设备端 loss 和（P0-2 非阻塞热路径入口）─────────────────
+    // 返回 (1,1) 设备张量 = Σ loss_vec（**未归一化，不下载**）。
+    // num_valid_out 回传有效 token 数；loss = -sum / num_valid。
+    // 训练热循环用本接口 + engine.submit_scalar_readback 异步取 loss，
+    // 避免每 step to_matrix 触发 end_batch + wait_in_flight 全流水线 drain。
+    [[nodiscard]] Result<Tensor> forward_sparse_sum(
         ComputeEngine& engine, const Tensor& logits,
         std::span<const std::size_t> labels,
-        std::span<const Scalar> loss_mask = {},
-        std::size_t vocab_size = 0)
+        std::span<const Scalar> loss_mask,
+        std::size_t vocab_size,
+        std::size_t& num_valid_out)
     {
         const std::size_t classes = logits.rows();
         const std::size_t total   = logits.cols();
@@ -282,7 +286,26 @@ public:
             return std::unexpected(Error{"sparse CE: empty input"});
 
         // ── M5 融合路径（不物化全 softmax；失败直接透传错误，不回退） ──
-        return fused_forward_sparse_(engine, logits, labels, loss_mask, vocab_size);
+        return fused_forward_sparse_(engine, logits, labels, loss_mask, vocab_size,
+                                     num_valid_out);
+    }
+
+    // 同步版稀疏 CE（测试/评估等非热路径）：内部 to_matrix 下载标量。
+    [[nodiscard]] Result<Scalar> forward_sparse(
+        ComputeEngine& engine, const Tensor& logits,
+        std::span<const std::size_t> labels,
+        std::span<const Scalar> loss_mask = {},
+        std::size_t vocab_size = 0)
+    {
+        std::size_t num_valid = 0;
+        auto sum_t = forward_sparse_sum(engine, logits, labels, loss_mask,
+                                        vocab_size, num_valid);
+        if (!sum_t) return std::unexpected(sum_t.error());
+        auto m = engine.to_matrix(*sum_t);
+        if (!m) return std::unexpected(m.error());
+        return (num_valid > 0)
+            ? -m->at_unchecked(0, 0) / static_cast<Scalar>(num_valid)
+            : Scalar{0};
     }
 
     // ── M5→S7 融合路径实现（IR 组合：col_max 原语 + denom/loss_vec/grad 表达式）──
@@ -291,11 +314,12 @@ public:
     //   denom    = col_sum(exp(logits - cb(col_max)))          （IR 表达式）
     //   loss_vec = (rg(logits) - cb(col_max) - log(denom)) * cb(mask)  （IR，(1,total)）
     //   grad     = (exp/logits 链 - select(Row==cb(labels),1,0)) * cb(mask) * inv（IR）
-    [[nodiscard]] Result<Scalar> fused_forward_sparse_(
+    [[nodiscard]] Result<Tensor> fused_forward_sparse_(
         ComputeEngine& engine, const Tensor& logits,
         std::span<const std::size_t> labels,
         std::span<const Scalar> loss_mask,
-        std::size_t vocab_size)
+        std::size_t vocab_size,
+        std::size_t& num_valid_out)
     {
         const std::size_t classes = logits.rows();
         const std::size_t total = logits.cols();
@@ -347,28 +371,27 @@ public:
              - dsl::log(dsl::leaf(*denom))) * dsl::col_broadcast(*mask_t),
             1, total);
         if (!loss_vec) return std::unexpected(loss_vec.error());
-        // grad[r][c] = (exp(logits-col_max)/denom - [r==label[c]]) * mask[c]
+        // grad[r][c] = (exp(logits-col_max)/denom - [r==label[c]]) * mask[c] / num_valid
+        // 1/num_valid 由 RParam 承载（运行时值、不进 expr_spec_key）→ 与整个
+        // 逐元素链融合为单 kernel，取代表达式后的 scale_inplace
         auto grad = dsl::compute(engine,
             (dsl::exp(dsl::leaf(logits) - dsl::col_broadcast(*col_max))
                 / dsl::col_broadcast(*denom)
              - dsl::select(dsl::row() == dsl::col_broadcast(*labels_t),
                            Scalar{1}, Scalar{0}))
-            * dsl::col_broadcast(*mask_t),
+            * dsl::col_broadcast(*mask_t)
+            * dsl::rparam(inv_num_valid),
             classes, total);
         if (!grad) return std::unexpected(grad.error());
-        // inv_num_valid 是运行时值（依赖 batch 内容），不进表达式（进 key 会
-        // 破坏闭合世界匹配），后置 scale_inplace（语义等价）
-        { auto gs = engine.scale_inplace(*grad, inv_num_valid); if (!gs) return std::unexpected(gs.error()); }
         grad_input_ = std::move(*grad);
 
-        // 5. loss = -(1/num_valid)·Σ loss_vec（无效列已乘 0）
+        // 5. loss_sum = Σ loss_vec（无效列已乘 0）——**不下载**：
+        //    热路径由调用方经 engine.submit_scalar_readback 异步取回；
+        //    同步版 forward_sparse 在此之后 to_matrix。
         auto total_t = engine.row_reduce_sum(*loss_vec);   // (1, total) → (1, 1)
         if (!total_t) return std::unexpected(total_t.error());
-        auto m = engine.to_matrix(*total_t);
-        if (!m) return std::unexpected(m.error());
-        return (num_valid > 0)
-            ? -m->at_unchecked(0, 0) / static_cast<Scalar>(num_valid)
-            : Scalar{0};
+        num_valid_out = num_valid;
+        return total_t;
     }
 };
 
