@@ -34,7 +34,6 @@
 #include "core_assert.hpp"
 #include "expr_spec.hpp"
 #include "expr_registry.hpp"
-#include "expr_graph.hpp"   // IR-C：录制图（begin_expr/end_expr 扫描登记）
 #include "algebra_expr.hpp"   // nn::Expression / nn::BoolExpression 概念
 #include "algebra_ops.hpp"    // nn::ops（唯一算子来源，含 op_id()）
 #include "algebra_matrix.hpp" // Matrix
@@ -811,16 +810,6 @@ template <typename E>
     auto [spec, inputs] = to_expr_spec(e);
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)
         return std::unexpected(v.error());
-    // IR-C：begin_expr/end_expr 录制段内，表达式加入录制图（而非直接登记）；
-    // end_expr 时 CpuEngine 融合分析并登记融合后的复合 spec（闭合世界）。
-    if (auto* g = fused::recording_graph())
-    {
-        const int node = g->add_node(spec, inputs, rows, cols,
-                                     /*vector_out=*/false);
-        Tensor t = Tensor::cpu(rows, cols);
-        t.set_virtual_tag(static_cast<std::uint64_t>(node) + 1);
-        return t;
-    }
     fused::global_registry().add(spec);
     return Tensor::cpu(rows, cols);
 #else
@@ -870,9 +859,6 @@ template <typename E>
     auto [spec, inputs] = to_expr_spec(e);
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)
         return std::unexpected(v.error());
-    if (fused::recording_graph())
-        return std::unexpected(Error{
-            "dsl::compute_into: 不支持在 begin_expr/end_expr 录制段内使用"});
     (void)dst;
     fused::global_registry().add(spec);
     return {};
@@ -903,34 +889,6 @@ template <typename E>
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// start_expr / end_expr — 把"无法写进一行"的表达式按块融合
-//
-// 与 compute() 等价：内联数学表达式只出现在这里（Layer），end_expr 时
-// 整块一次融合（AOT 收集 / CPU 融合 / GPU 匹配预编译 shader）。跨多行
-// 书写同一表达式，框内即一个融合单元。
-//   auto out = dsl::end_expr(dsl::start_expr(engine, rows, cols,
-//       leaf(a) * leaf(b)
-//       + leaf(c) * Scalar{2}
-//       - leaf(d)));
-// ══════════════════════════════════════════════════════════════════════════
-template <typename E>
-struct ExprBlock
-{
-    ComputeEngine* eng;
-    std::size_t    rows, cols;
-    E              expr;
-};
-
-template <typename E>
-[[nodiscard]] ExprBlock<E> start_expr(ComputeEngine& eng, std::size_t rows,
-                                      std::size_t cols, const E& e)
-{ return {&eng, rows, cols, e}; }
-
-template <typename E>
-[[nodiscard]] Result<Tensor> end_expr(const ExprBlock<E>& b)
-{ return compute(*b.eng, b.expr, b.rows, b.cols); }
-
-// ══════════════════════════════════════════════════════════════════════════
 // 归约向量原生形状输出：compute_reduce(engine, expr, rows, cols)
 //
 // 与 compute() 等价，但输出为归约向量本身（(rows,1)/(1,cols)），而非广播到
@@ -951,23 +909,10 @@ template <typename E>
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)
         return std::unexpected(v.error());
     const int raxis = expr_spec_reduce_axis(spec);
-    const auto placeholder = [&](int node) {
-        Tensor t = (raxis == 0) ? Tensor::cpu(rows, 1)
-                 : (raxis == 1) ? Tensor::cpu(1, cols)
-                 : Tensor::cpu(rows, cols);
-        if (node >= 0)
-            t.set_virtual_tag(static_cast<std::uint64_t>(node) + 1);
-        return t;
-    };
-    // IR-C：录制段内加入图（end_expr 时融合登记）；否则直接登记
-    if (auto* g = fused::recording_graph())
-    {
-        const int node = g->add_node(spec, inputs, rows, cols,
-                                     /*vector_out=*/true);
-        return placeholder(node);
-    }
     fused::global_registry().add(spec);
-    return placeholder(-1);
+    return (raxis == 0) ? Tensor::cpu(rows, 1)
+         : (raxis == 1) ? Tensor::cpu(1, cols)
+         : Tensor::cpu(rows, cols);
 #else
     auto [spec, inputs] = to_expr_spec(e);
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)

@@ -7,8 +7,7 @@
 //   3. forward / backward spec 可区分（AOT 匹配的前提）
 //   4. 规范 key 确定性：同表达式同 key、不同表达式/不同参数 key 不同
 //      （key = 构建期 scan 去重与运行时匹配的依据）
-//   5. start_expr / end_expr 块式融合
-//   6. 标量广播、比较 + select（relu）正确性
+//   5. 标量广播、比较 + select（relu）正确性
 //
 //  编译（本机性能差，用单 TU 快速验证）：
 //    clang++ -std=c++26 -stdlib=libc++ -fno-exceptions -I include/neuralnet.cpp src/expr_dsl_test.cpp -o build/expr_dsl_test
@@ -266,34 +265,6 @@ void test_swiglu()
     }
 }
 
-void test_blocks()
-{
-    // start_expr / end_expr 块式融合（走 CpuEngine，最终 eval_cpu）
-    constexpr std::size_t R = 4, C = 3;
-    nn::Tensor a = make_tensor(R, C, 1.0f, 0.1f);
-    nn::Tensor b = make_tensor(R, C, 2.0f, 0.2f);
-    nn::Tensor c = make_tensor(R, C, 3.0f, 0.3f);
-    nn::Tensor d = make_tensor(R, C, 4.0f, 0.4f);
-
-    nn::CpuEngine eng;
-    auto out = nn::dsl::end_expr(nn::dsl::start_expr(eng, R, C,
-        leaf(a) * leaf(b) + leaf(c) * Scalar{2} - leaf(d)));
-    CHECK(static_cast<bool>(out), "end_expr 成功");
-    if (out)
-    {
-        const auto os = out->cpu_matrix().span();
-        const auto as = a.cpu_matrix().span();
-        const auto bs = b.cpu_matrix().span();
-        const auto cs = c.cpu_matrix().span();
-        const auto ds = d.cpu_matrix().span();
-        bool ok = true;
-        for (std::size_t i = 0; i < R * C; ++i)
-            if (std::fabs((as[i] * bs[i] + cs[i] * 2.0f - ds[i]) - os[i]) > 1e-5f)
-            { ok = false; break; }
-        CHECK(ok, "start_expr..end_expr 块式融合结果正确");
-    }
-}
-
 } // namespace
 
 int main()
@@ -301,7 +272,6 @@ int main()
     test_rope();
     test_elementwise();
     test_swiglu();
-    test_blocks();
 
     if (g_fail == 0)
         std::printf("ALL PASS\n");

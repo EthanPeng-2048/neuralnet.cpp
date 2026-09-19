@@ -37,7 +37,7 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 | 张量/设备抽象 | `compute_tensor.hpp` |
 | 混合精度 / f16 类型系统 | `precision.hpp`（Precision 枚举、`nn::f16`、`PrecisionProfile`） |
 | 矩阵/表达式模板（CPU 代数层） | `algebra_matrix.hpp` / `algebra_span.hpp` / `algebra_expr.hpp` / `algebra_ops.hpp` / `algebra_compute.hpp` |
-| 表达式 DSL / 融合 IR | `expr_dsl.hpp` / `expr_spec.hpp` / `expr_opt.hpp` / `expr_graph.hpp` / `expr_registry.hpp` |
+| 表达式 DSL / 融合 IR | `expr_dsl.hpp` / `expr_spec.hpp` / `expr_opt.hpp` / `expr_registry.hpp`（`expr_graph.hpp`/IR-C 已于 2026-09-19 移除） |
 | 后端代码生成（IR-D emitter 抽象） | `expr_emitter.hpp`（注册表）+ `expr_glsl_gen.hpp`（GlslEmitter） |
 | 模型容器/规格/序列化 | `model_container.hpp` / `model_spec.hpp` / `model_serialization.hpp` / `model_keyvalue_record.hpp` |
 | MNIST / GPT / CNN / RLA / ZiPT / 分词器 模型工厂 | `domain_mnist.hpp` / `domain_gpt.hpp` / `domain_cnn.hpp` / `domain_rla.hpp` / `domain_zipt.hpp` / `domain_tokenizer{,_base,_bpe,_charbpe}.hpp` |
@@ -125,10 +125,10 @@ Matrix → engine.from_matrix → Tensor[GPU] → forward/loss/optimizer 全程�
 | 类别 | 原语 |
 |------|------|
 | 矩阵级 | `matmul/batched_matmul/matmul_with_bias/transpose/add_inplace/accumulate/scale_inplace/axpy_inplace/zero` |
-| 归约级 | `row_reduce_sum/max`、`col_reduce_sum/max` |
+| 归约级 | `row_reduce_sum/max`、`col_reduce_sum/max`、`grouped_reduce_sum/max`（沿行方向按固定长度 R 分组归约，池化/多头等场景免逐通道循环） |
 | 广播级 | `broadcast_row_inplace/broadcast_col_inplace` |
 | 逐元素 | `elementwise_unary/binary/binary_scalar/select_scalar_cond` |
-| 数据操作 | `slice_rows/insert_rows/gather_rows/scatter_add_rows/rearrange_3d/clone/copy_from/cast` |
+| 数据操作 | `slice_rows/insert_rows/gather_rows/scatter_add_rows/rearrange_3d/im2col/col2im/clone/copy_from/cast`（`im2col/col2im`：卷积/池化窗口展开与伴随散射，纯数据搬运） |
 | 扫描级 | `scan_prefix_outer/scan_suffix_outer/outer_col`（RLA/RAPT，dk≤64，见 docs/development/06 §扫描原语） |
 | 表达式 | `eval_expr/eval_expr_reduce`（AOT 融合 shader 入口） |
 | 批次/内存 | `begin_batch/end_batch/flush_batch/release_idle_pool_blocks/pool_stats` |
@@ -167,13 +167,13 @@ GPT 序列展平: 列序 i = b*seq + t（batch-major，全局唯一约定）
 ## 7. 表达式 DSL 与 AOT 融合管线（GPU 开发必读）
 
 - Layer 内用 `nn::dsl`（`expr_dsl.hpp`）写普通数学表达式；CPU 编译期模板直接求值（内联+SIMD），GPU 折叠成 `ExprSpec`（扁平 IR，`expr_spec.hpp`）→ 按 key 查预编译融合 shader。
-- 主要入口：`dsl::compute(engine, expr)`（一行表达式，最常用）；块式融合用 `dsl::start_expr(engine, rows, cols, expr) ... dsl::end_expr(block)`（复杂表达式按块录制）；归约语义用 `dsl::compute_reduce`。
+- 主要入口：`dsl::compute(engine, expr)`（一行表达式，最常用）；把结果写进既有张量（原地更新，零分配）用 `dsl::compute_into(engine, expr, dst)`；归约语义用 `dsl::compute_reduce`。**跨表达式融合（`start_expr/end_expr`、`begin_expr/end_expr`、`expr_graph.hpp`）已于 2026-09-19 移除**——理由与重新立项前提见 `docs/development/03-ir-optimization.md` §5.3。
 - **构建期两步**（CMake 自动编排，改 Layer 内联表达式后重跑构建即可）：
   1. `scan_exprs`：dry-run 跑 Layer forward/backward，收集折叠出的 `ExprSpec` 结构（去重）→ `build/generated/expr_specs.bin`
   2. `gen_fused`：读 bin → 经 `emitter_registry` 选后端（默认 `"glsl"` = `GlslEmitter`）生成 GLSL → glslc → 内联 SPIR-V → `build/generated/fused_registry.hpp`
 - **IR-D emitter 抽象**（`expr_emitter.hpp`）：把后端代码生成从 GLSL 专用抽象为 emitter 接口（一份 canonical IR → 多后端代码），`--list-backends` 可列出注册后端。目前仅 `glsl` 后端注册；`CpuEmitter`（已删除）与 `CudaEmitter`（随 CUDA 后端一并移除）均**不存在**，勿引用。
 - 手写原语 shader 在 `shaders/*.comp`（matmul、matmul_tiled、batched_matmul、reduce、broadcast、elementwise_v2、transpose、gather、scatter_add、rearrange_3d、scan_prefix_outer、scan_suffix_outer、outer_col、cast），构建期 glslc 编译并嵌入 C++ 头文件。
-- IR 优化 pass（canonicalize/CSE/寄存器分配/图 IR 融合）见 `expr_opt.hpp` / `expr_graph.hpp`，设计文档 `docs/development/03-ir-optimization.md`。
+- IR 优化 pass（canonicalize/CSE/寄存器分配）见 `expr_opt.hpp`，设计文档 `docs/development/03-ir-optimization.md`（含 IR-C 图融合的取舍记录 §5.3）。
 
 ## 8. 训练循环范式（写新入口时照抄）
 
@@ -202,7 +202,7 @@ optimizer.step();
 - 模型工厂：`nn::build_mnist_mlp_model(engine)` / `build_mnist_transformer_model(engine)` / `build_gpt_model(...)` / `build_gpt_model_from_spec(spec)`。
 - 链式构建：`model.add_linear(784,256).add_relu().add_linear(256,10)`；模板版 `model.add<nn::Linear>(784,256)`。
 - 序列化：`save_model` / `load_model` / `peek_model_spec`（`model_serialization.hpp`，v4 自描述格式）；`.nnpkg` 训练包见 `docs/usage/04-train-package.md`。
-- GPT 高级特性（`GPTModel`，`compute_layer.hpp` 尾部）：梯度检查点（`checkpoint_every_`）、activation offload、文档感知掩码（`set_doc_ids`）、batch flush 粒度。
+- GPT/RAPT 高级特性（`GPTModel` / `RAPTModel`，`compute_layer.hpp` 尾部）：梯度检查点（`checkpoint_every_`）、activation offload、文档感知掩码（`set_doc_ids`）、batch flush 粒度。RAPT 自 2026-09-19 起与 GPT 同档支持前三者（`RAPTModel::set_checkpoint_every/set_activation_offload/set_flush_interval`），offload 走共用实现 `ActivationOffloader`（`compute_layer_base.hpp`）。
 
 ## 9. 关键常量与配置（`core_config.hpp`）
 
@@ -237,7 +237,7 @@ optimizer.step();
 |------|--------|
 | `development/01-compute-engine-development.md` | **计算引擎开发指南：接口详解、实现模式、添加新原语** |
 | `development/02-operator-fusion.md` | **算子融合全篇：IR 扩展（归约语义）→ 表达式录制 → matmul 参与 IR 融合 → 跨 kernel 自动融合（一期 M + 二期 S1-S7 整合，删手写原语）** |
-| `development/03-ir-optimization.md` | IR 优化（IR-A/B/C/D 已实施） |
+| `development/03-ir-optimization.md` | IR 优化（IR-A/B/D 已实施；**IR-C 图融合已评估并移除，§5.3 是取舍记录**） |
 | `development/04-memory-optimization.md` | 显存优化（L1 激活重计算 / L2 内存池归还，已实施） |
 | `development/05-mixed-precision.md` | **多精度计算（f16/混合精度）设计：Precision 类型系统、类型化存储、硬件/兼容路径分派、显式精度推导、PrecisionProfile（param/compute/stable/optimizer）、Phase 1/2 分期与验收** |
 | `development/06-rapt-algorithm.md` | **线性注意力家族演进：RLA → RAPT → RLA-2 + 两趟式/flash 等价分析 + GPU 落地** |
@@ -256,7 +256,7 @@ optimizer.step();
 | `usage/04-train-package.md` | `.nnpkg` 训练包 |
 
 
-## 12. 当前状态（截至 2026-09-13，最新提交 15eb731）
+## 12. 当前状态（截至 2026-09-19，最新提交 96a3675 + 本次 IR-C 移除）
 
 ### 已交付能力
 
@@ -265,6 +265,16 @@ optimizer.step();
 - **后续提交**（v1.2.0 之后）：
   - **Vulkan 设备选择**（15eb731）：`--gpu` 参数指定设备（`cli/cli_gpu_option.hpp`、`backend/compute_vk_device.hpp`）。
   - **activation offload**（ee11e29）：相较梯度检查点更省时（实测 18s vs 26s / 5 step），推荐优先使用；`GPTModel::set_offload_enabled` + `ComputeEngine::offload_*` 原语。
+  - **CPU 逐元素优化 + `dsl::compute_into`**（c0d3298）：DSL 模板路径向量化/并行、`Tensor::cpu_get_ptr`、零分配原地目标传递（optimizer/layer/loss 已迁移）。
+  - **CUDA 后端整体移除**（96a3675）：`cuda/`、`compute_cuda_engine.hpp`、`backend/compute_cuda_backend.hpp`、全库 `NN_HAS_CUDA`/`--cuda`。快照见分支 `legacy/cuda`。
+  - **IR-C 整体移除**（本次）：`expr_graph.hpp`、`compute_engine` 的 `begin_expr/end_expr`、`dsl::start_expr/end_expr`、`FusedChainLayer`、`Tensor::virtual_tag_`。取舍记录见 `docs/development/03-ir-optimization.md` §5.3。
+  - **RLA/RAPT 激活重计算 + offload**（2026-09-19）：`RAPTModel/RAPTBlock` 补齐 `set_flush_interval / set_checkpoint_every / set_activation_offload`（此前对 RAPT 是静默 no-op，而 CLI 会打印"已启用"）；`ReLULinearAttention` 响应 `checkpoint_mode_`（跳过 7 项 backward 缓存）、`activation_cache()` 补齐遗漏的 4 项、backward 缺缓存硬报错；抽出通用 `ActivationOffloader`（`compute_layer_base.hpp`，GPT/RAPT 共用）；修 `RAPTModel::clear_cache()` 清空 `token_emb_`（参数被毁）与 `doc_ids` 无法关闭两个缺陷。新增 `rapt_checkpoint_test`（并入 `rapt_test`）与 `rapt_offload_test`，并让此前**从未被编译**的 `gpt_offload_test` 成为正式目标（ctest 15 → 18，全绿）。
+  - **CNN 缓存契约加固 + 测试补齐**（2026-09-19）：`MaxPool2D::backward` 补 argmax 缓存/形状校验（旧行为是 `clear_cache()` 后**越界读空 vector 且不报错**——`vector::clear()` 保留容量，表现为静默用陈旧索引）；`Conv2D::backward` 补 im2col 缓存/形状校验（旧行为是 checkpoint 模式或 batch 变化后**静默用陈旧 im2col**）；两层的 `forward` 在 checkpoint 模式下**显式清空**缓存（只跳过赋值会因 size 相同而静默沿用旧数据）；两层补 `recompute_supported()`。新增 `cnn_test`（`maxpool_gradcheck` 独立参考比对 3 组配置 + 缓存/checkpoint 契约 + `cnn_smoke_test` 规格往返/层组成/端到端训练），CPU 与 `--gpu` 均逐位一致（此前 Conv2D/MaxPool2D **无任何 GPU 覆盖**、MaxPool2D **无任何测试**）。
+  - **CNN 全引擎化**（2026-09-20）：新增 `im2col`/`col2im` 两个 op-level 数据搬运原语（接口 + CPU 实现 + Vulkan shader + backend 接线 + GpuEngine 包装）；`Conv2D`/`MaxPool2D` 的 forward/backward 改写为纯「引擎原语 + DSL」组合——消除 `to_matrix/from_matrix` PCIe 往返与 CPU 标量 im2col 循环，`col_cache_` 由 CPU `Matrix` 改为设备张量。布局 `(C,B*P) ↔ (C*P,B)` 用 `rearrange_3d` + `gather_rows/scatter_add_rows` + 缓存置换索引实现（`rearrange_3d` 单独做不到该三维转置）。池化反向改为「窗口内并列最大值**均分**梯度」（总梯度守恒；无并列时与 argmax-first 逐位一致）。`scan_exprs` 补 MaxPool2D dry-run（69 → 72 条融合表达式）。
+  - **分组归约原语 + 融合 push-constant 缺陷修复**（2026-09-20）：新增 `grouped_reduce_sum/max`（沿行方向按固定长度 R 分组归约，接口 + CPU + Vulkan shader + backend + GpuEngine 包装），MaxPool2D 因此**彻底去掉逐通道循环**（原 `slice_rows + col_reduce_max + insert_rows` 的 C 次 dispatch → 单次原语）；组内广播复用 `gather_rows` + 缓存索引。修复 `GpuBackend::run_fused_gpu` 的 push-constant 固定头长度 bug（见下）；新增 `fused_gpu_test::run_reduce_consts` 回归用例。
+  - **评估分块（CNN 全量评估 OOM 修复）**（2026-09-20）：`evaluate_mnist` 新增 `eval_batch`（默认 1000）分块前向 + 每块 `release_idle_pool_blocks()`；`mnist_train` 传 `cfg.batch_size`。此前 CNN/MLP 走 `N = x.cols()` 全量单次 forward，CNN 的 im2col 是 k²·C_in 倍 → 60000 样本需 ~6.4 GB → `vkAllocateMemory failed: -2`（训练步其实只多 130 MB）。见 `docs/development/08-pitfalls-and-lessons.md` §3.7。
+  - **坑（已修，2026-09-20）**：`run_fused_gpu` 的 push-constant **固定头长度必须逐形态**与生成器 PC 声明一致（逐元素 2 / 逐元素+matmul 5 / 归约 4 / 归约+matmul 6）。历史 bug 把"归约但无 matmul"按 **5** 算 → 常量池整体后移一个 uint → **GPU 上"带常量的归约"静默错值而 CPU 正常**（表现为 `col_reduce_sum(select(x == col_broadcast(max), 1, 0))` 恒返回 kk-1 而非真实并列数）。教训：这类"只有 GPU 错"的问题要**先打印生成的 GLSL/IR 再猜成因**——本轮最初误判成"广播视图内联"并写了错误规避。见 `docs/development/08-pitfalls-and-lessons.md` §4.10。
+  - **坑**：复合层 override `forward_recompute` 必须调用**虚函数** `set_checkpoint_mode` 关闭子层；基类默认实现只改本块标志位 → 子层缓存不重建（stride>1 时被上一轮陈旧缓存掩盖，表现为部分 stride 通过）。模式开关（checkpoint/offload/doc-mask）的缓存契约见 `docs/development/08-pitfalls-and-lessons.md` 模式 H。
 
 ### 融合二期（`docs/development/02-operator-fusion.md`）完成：S1-S5、S7
 
@@ -287,6 +297,7 @@ S7 关键教训（改融合/IR 代码前必读）：
 ### 已过时的历史说明
 
 - **CpuEmitter**：`cpu_emitter.hpp` 与 CpuEmitter 实现**已删除**（审查报告记为已删、N/A，仅 `expr_emitter.hpp` 注释残留）。早期"待修 CpuEmitter 隐性缺陷"问题已随之消失，勿再引用。
-- **融合三期 S6**：未列入当前计划。
+- **融合三期 S6**：未列入当前计划；其替代方案 P2-12 图级缓存亦随 IR-C 于 2026-09-19 删除。
+- **IR-C（图 IR / 跨表达式融合）**：已评估并整体移除，`expr_graph.hpp` / `begin_expr`/`end_expr` / `start_expr`/`end_expr` / `FusedChainLayer` 均**不存在**，勿引用或重新发明——重新立项前提见 `docs/development/03-ir-optimization.md` §5.3 末段。
 
 > 变更此文件时务必同步 git 状态：`CMakeLists.txt` 的 `project(... VERSION ...)` 可能滞后于 git tag，以 git tag 为准。

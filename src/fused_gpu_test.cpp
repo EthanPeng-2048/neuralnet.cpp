@@ -483,12 +483,65 @@ int run_fallback(CpuEngine& cpu, GpuEngine& gpu)
     return ok ? 0 : 1;
 }
 
+// ── 归约表达式内联常量：CPU vs GPU（push-constant 头长度回归）─────────────
+// 结构（与 tools/scan_exprs.cpp 的对应 dry-run 完全一致）：
+//   col_reduce_sum(select(x == col_broadcast(mx), 1, 0))
+// 该结构带**常量池**。GPU 侧 push-constant 固定头长度必须按形态算；历史上
+// "归约但无 matmul" 曾多算 1 个 uint（5 vs 4）→ 常量池整体后移一个 uint →
+// shader 读错常量 → **GPU 静默错值而 CPU 正常**。本用例锁死该回归。
+int run_reduce_consts(nn::ComputeEngine& cpu, nn::ComputeEngine& gpu)
+{
+    const std::size_t kk = 4, cols = 3;
+    // 列 0：两路并列最大（max=1 出现 2 次）
+    // 列 1：无并列（max=5 出现 1 次）
+    // 列 2：全相等（max=7 出现 4 次）
+    Matrix xm(kk, cols);
+    xm.span()[0] = 1; xm.span()[1] = 5; xm.span()[2] = 7;
+    xm.span()[3] = 1; xm.span()[4] = 4; xm.span()[5] = 7;
+    xm.span()[6] = 0; xm.span()[7] = 3; xm.span()[8] = 7;
+    xm.span()[9] = 0; xm.span()[10] = 2; xm.span()[11] = 7;
+    Matrix mxm(1, cols);
+    mxm.span()[0] = 1; mxm.span()[1] = 5; mxm.span()[2] = 7;
+    const Scalar expect[3] = {2, 1, 4};
+
+    const auto eval = [&](nn::ComputeEngine& e, const char* tag, Matrix& out) -> bool {
+        auto x = e.from_matrix(xm);
+        auto mx = e.from_matrix(mxm);
+        if (!x || !mx) { std::cerr << "    [" << tag << "] 上传失败\n"; return false; }
+        auto r = nn::dsl::compute_reduce(e,
+            nn::dsl::col_reduce_sum(nn::dsl::select(
+                nn::dsl::leaf(*x) == nn::dsl::col_broadcast(*mx),
+                nn::Scalar{1}, nn::Scalar{0})),
+            kk, cols);
+        if (!r) { std::cerr << "    [" << tag << "] compute_reduce 失败: "
+                            << r.error().message << "\n"; return false; }
+        auto m = e.to_matrix(*r);
+        if (!m) { std::cerr << "    [" << tag << "] to_matrix 失败\n"; return false; }
+        out = *m;
+        return true;
+    };
+
+    Matrix mc, mg;
+    if (!eval(cpu, "CPU", mc)) { std::cout << "[FAIL] reduce_consts: CPU 求值失败\n"; return 1; }
+    if (!eval(gpu, "GPU", mg)) { std::cout << "[FAIL] reduce_consts: GPU 求值失败\n"; return 1; }
+
+    const Scalar diff = max_abs_diff(mc, mg);
+    bool ok = (diff <= 1e-6f) && mc.rows() == 1 && mc.cols() == cols;
+    for (std::size_t i = 0; ok && i < cols; ++i)
+        ok = std::fabs(mc.span()[i] - expect[i]) < 1e-6f;
+    if (!ok)
+        std::cerr << "    CPU vs GPU max_diff=" << diff
+                  << "（GPU 常量池错位的历史 bug 回归）\n";
+    std::cout << "[" << (ok ? "PASS" : "FAIL")
+              << "] 归约内联常量（push-constant 固定头长度）CPU/GPU 一致\n";
+    return ok ? 0 : 1;
+}
+
 int main()
 {
     std::cout << "========================================\n"
               << "  AOT 融合 shader GPU 数值验证（端到端）\n"
               << "========================================\n";
-
     auto cpu_engine = std::make_unique<CpuEngine>();
     auto& backend = GpuBackend::instance();
     auto init_r = backend.initialize();
@@ -516,6 +569,7 @@ int main()
     fail += run_matmul_reduce(*cpu_engine, *gpu_engine);
     fail += run_norm<nn::RMSNorm>("rmsnorm", *cpu_engine, *gpu_engine);
     fail += run_norm<nn::LayerNorm>("layernorm", *cpu_engine, *gpu_engine);
+    fail += run_reduce_consts(*cpu_engine, *gpu_engine);
     fail += run_fallback(*cpu_engine, *gpu_engine);
 
     std::cout << (fail == 0 ? "ALL PASS\n" : "FAILED\n");
