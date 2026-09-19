@@ -77,7 +77,6 @@ neuralnet.cpp/
 │   ├── compute_engine.hpp       ← 引擎抽象接口
 │   ├── compute_cpu_engine.hpp   ← CPU 引擎
 │   ├── compute_gpu_engine.hpp   ← GPU 引擎 (Vulkan)
-│   ├── compute_cuda_engine.hpp  ← GPU 引擎 (CUDA, 已停用)
 │   ├── compute_layer.hpp        ← Layer 聚合头
 │   ├── compute_layer_{base,mlp,conv,softmax,attention,feedforward,transformer,gpt,zipt,rapt}.hpp ← 各层域
 │   ├── compute_loss.hpp         ← 损失函数

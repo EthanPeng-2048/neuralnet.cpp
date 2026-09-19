@@ -26,16 +26,17 @@
 |------|------|------|------|------|
 | `CpuEngine` | `compute_cpu_engine.hpp` | 88.5 KB | ✅ 活 | 默认引擎 |
 | `GpuEngine` | `compute_gpu_engine.hpp` | 58.0 KB | ✅ 活 | Vulkan（`NN_HAS_VULKAN`） |
-| `CudaEngine` | `compute_cuda_engine.hpp` | 22.4 KB | ❌ **死代码** | `CMakeLists.txt:361-376` 明确停用，不定义 `NN_ENABLE_CUDA`，`message(STATUS "CUDA backend disabled …")` |
-| CUDA backend | `backend/compute_cuda_backend.hpp` + `cuda/` 目录 | 29.5 KB + 47.9 KB | ❌ 死代码 | 同上 |
+| ~~`CudaEngine`~~ | ~~`compute_cuda_engine.hpp`~~ | ~~22.4 KB~~ | 🗑️ **已移除** | 与 `backend/compute_cuda_backend.hpp`、`cuda/` 目录一并删除；历史快照见 git 分支 `legacy/cuda` |
 
-**CUDA 死代码的扩散面**（开关永不定义，但分支代码还在）：
+**CUDA 移除范围**（原先约 100 KB 死代码 + 10 处条件分支已全部清除）：
 
-- `compute_tensor.hpp`：6 处 `#ifdef NN_HAS_CUDA`
-- `nn.hpp:35`、`cli/cli_engine_factory.hpp:32/60/73`（含 `--cuda` 报错路径）
-- AGENTS.md 记录 `compute_cuda_engine.hpp` 的扫描级原语直接返回"未实现"，且含隐藏编译错误
-
-> 合计约 **100 KB** 的永不编译代码 + 10 处条件分支。
+- 删除 `cuda/`（`CMakeLists.txt` / `cuda_kernels.h` / `cuda_kernels.cu`）
+- 删除 `compute_cuda_engine.hpp`、`backend/compute_cuda_backend.hpp`
+- 清除 `compute_tensor.hpp`（6 处 `#ifdef NN_HAS_CUDA`）、`nn.hpp`、
+  `cli/cli_engine_factory.hpp`（`EngineConfig::use_cuda`）、`cli/cli_train_common.hpp`
+  （`--cuda`）、`CMakeLists.txt` 停用段
+- 清除 15 个 `src/*.cpp` 的 `--cuda` / `use_cuda` / `cuda_enabled`
+- 清除 `cli_controllers.py` 的 `--cuda` 传参
 
 ---
 
@@ -67,7 +68,7 @@ scan_suffix_outer, scatter_add_rows, slice_rows, to_matrix, transpose, zero
 | `copy_from` | `model_serialization.hpp`（上传路径） |
 | `offload_store` / `offload_load` | 仅 `offload_primitive_test.cpp`（**Layer 用的是 `offload_save`/`offload_restore`**） |
 | `row_reduce_max` | 仅引擎实现存在；Layer 走的是 `dsl::row_reduce_max`（DSL 叶子，非此算子） |
-| `elementwise_select_scalar_cond` | 仅引擎实现 + CUDA 内部；**无调用点** |
+| `elementwise_select_scalar_cond` | 仅引擎实现；**无调用点** |
 | `release_idle_pool_blocks` | `src/text_train.cpp:1463` |
 | `pool_stats` | **无任何调用点**（死接口） |
 | `device` | 引擎外部少量判断 |
@@ -192,7 +193,7 @@ ExprSpec ──► IR-A/B (expr_opt.hpp: canonicalize/CSE/寄存器分配)      
 
 | 项 | 规模 | 判定 |
 |----|------|------|
-| CUDA 引擎 + backend + `cuda/` + 10 处 `#ifdef` | ~100 KB | ❌ 死代码（CMake 已停用两年） |
+| ~~CUDA 引擎 + backend + `cuda/` + 10 处 `#ifdef`~~ | ~100 KB | 🗑️ **已移除**（快照见 `legacy/cuda`） |
 | 旧代数 AST：`algebra_expr.hpp` + `algebra_ops.hpp` + `algebra_compute.hpp` | 27.6 KB | ⚠️ 仅 CPU elementwise 用，与 DSL 模板路径重复 |
 | IR-D 的 `CpuEmitter` 残留 | 注释 | ⚠️ `cpu_emitter.hpp` 已删（现仅 `GlslEmitter` 登记）；`expr_emitter.hpp:16` 仍引用它；文档 03 的「`factory_cpu()` 返回 GlslEmitter」说明已过时（该函数现不存在） |
 | `FusedChainLayer`（IR-C 演示层） | ~60 行 | ⚠️ 无模型使用；删它则 `begin_expr/end_expr` 只剩 scan/test |
@@ -222,7 +223,7 @@ ExprSpec ──► IR-A/B (expr_opt.hpp: canonicalize/CSE/寄存器分配)      
 | A. Layer 直调算子 | 37 个 | 要收敛到"只写表达式"，包括 `matmul`/`batched_matmul`/`transpose`/`gather_rows`/`scan_*`/`offload_*` |
 | B. 四套求值机制 | 4 套 | 目标只剩 DSL + 引擎 lowering；旧代数 AST、`eval_cpu`、解释器都要重定义为 lowering |
 | C. 融合世代 | eager / IR-C+dsl | **只有 eager 是待收敛的旧世代**；IR-C 与 DSL 同属一套 IR 流水线（§4.2.1），要的是**接线**不是删除 |
-| D. 死代码 | CUDA 全链 ~100 KB + 无调用点接口 | 与目标无关，可直接清 |
+| D. 死代码 | 无调用点接口（CUDA 全链 ~100 KB 已清） | 与目标无关，已清理 |
 
 **注意**：A 与 C 不是纯删除——`scan_prefix_outer` / `outer_col`（RLA/RAPT）、`offload_*`（activation offload）、
 `begin_batch/end_batch`（GPU 命令录制）这些**不是普通逐元素/矩阵算子**，DSL 目前表达不了。
@@ -442,6 +443,4 @@ Select-String -Path (Get-ChildItem include\neuralnet.cpp\compute_layer*.hpp, `
     -Pattern 'engine_?\.([a-z0-9_]+)\(' -AllMatches |
   % { $_.Matches } | % { $_.Groups[1].Value } | Sort-Object -Unique
 
-# CUDA 开关现状
-Select-String -Path CMakeLists.txt -Pattern 'CUDA'
 ```

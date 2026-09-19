@@ -4,7 +4,7 @@
 //       是否真的有反向 bug（batched_matmul / softmax backward / 掩码）。
 //       batch=1 时绕过 rearrange_3d，若仍 FAIL 则是 attention 内部问题。
 //
-// 用法：attn_gradcheck [--cuda|--gpu] [--batch N] [--seq N] [--tol <f>]
+// 用法：attn_gradcheck [--gpu] [--batch N] [--seq N] [--tol <f>]
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>
@@ -104,7 +104,6 @@ bool check_grad_tensor(
 int main(int argc, char* argv[])
 {
     Scalar tol = 5e-2f;
-    bool use_cuda = false;
     bool use_gpu = false;
     std::size_t batch = 2;
     std::size_t seq = 8;
@@ -116,17 +115,15 @@ int main(int argc, char* argv[])
         else if (a == "--batch" && i + 1 < argc) batch = static_cast<std::size_t>(std::atoi(argv[++i]));
         else if (a == "--seq" && i + 1 < argc) seq = static_cast<std::size_t>(std::atoi(argv[++i]));
         else if (a == "--pos-enc" && i + 1 < argc) pos_enc_name = argv[++i];
-        else if (a == "--cuda") use_cuda = true;
         else if (a == "--gpu") use_gpu = true;
         else if (a == "--help")
         {
-            std::cout << "用法: attn_gradcheck [--cuda|--gpu] [--batch N] [--seq N] [--tol <f>] [--pos-enc learned|sinusoidal|alibi|rope]\n";
+            std::cout << "用法: attn_gradcheck [--gpu] [--batch N] [--seq N] [--tol <f>] [--pos-enc learned|sinusoidal|alibi|rope]\n";
             return 0;
         }
     }
 
     nn::cli::EngineConfig ecfg;
-    ecfg.use_cuda = use_cuda;
     ecfg.use_gpu = use_gpu;
     auto engine_res = nn::cli::create_engine(ecfg, std::cout);
     if (!engine_res) { std::cerr << "引擎创建失败: " << engine_res.error().message << "\n"; return 1; }

@@ -7,7 +7,7 @@
 //                   grad_b += row_sum(gZ)
 //       这两条路径是 AOT 融合 shader 结构，必须两引擎都验证（--gpu）。
 //
-// 用法：conv2d_gradcheck [--cuda|--gpu]
+// 用法：conv2d_gradcheck [--gpu]
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>
@@ -101,21 +101,19 @@ Scalar max_abs_diff(const Matrix& a, const Matrix& b)
 
 int main(int argc, char* argv[])
 {
-    bool use_cuda = false, use_gpu = false;
+    bool use_gpu = false;
     for (int i = 1; i < argc; ++i)
     {
         const std::string a = argv[i];
-        if (a == "--cuda") use_cuda = true;
-        else if (a == "--gpu") use_gpu = true;
+        if (a == "--gpu") use_gpu = true;
         else if (a == "--help")
         {
-            std::cout << "用法: conv2d_gradcheck [--cuda|--gpu]\n";
+            std::cout << "用法: conv2d_gradcheck [--gpu]\n";
             return 0;
         }
     }
 
     nn::cli::EngineConfig ecfg;
-    ecfg.use_cuda = use_cuda;
     ecfg.use_gpu = use_gpu;
     auto engine_res = nn::cli::create_engine(ecfg, std::cout);
     if (!engine_res) { std::cerr << "引擎创建失败: " << engine_res.error().message << "\n"; return 1; }

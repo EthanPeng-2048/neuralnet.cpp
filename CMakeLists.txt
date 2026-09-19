@@ -104,7 +104,7 @@ endfunction()
 # 需要时用 -DNN_ENABLE_TESTS=ON 开启全部 gradcheck / *_test / *_probe / *_debug。
 option(NN_ENABLE_TESTS "Build test/verification executables" OFF)
 
-# 收集实际构建的目标，供 GPU/CUDA 统一启用（避免引用未定义目标）
+# 收集实际构建的目标，供 GPU 统一启用（避免引用未定义目标）
 set(NN_APP_TARGETS "")
 set(NN_TEST_TARGETS "")
 set(NN_BENCH_TARGETS "")   # 性能基准已移除（2026 清理：bench 工具不注册 ctest 且无法在 -Werror 下编译）
@@ -357,20 +357,3 @@ if(Vulkan_FOUND)
 else()
     message(STATUS "Vulkan not found. GPU acceleration disabled.")
 endif()
-
-# ── CUDA GPU 加速（已停用）────────────────────────────────────────────────
-# TODO(1.1): 恢复 CUDA 后端。
-#   停用原因：M4/M5/M6 融合原语与 DSL 表达式在 CUDA 上仍未实现
-#   （cuda_engine.hpp 直接返回 "未实现"），而 Layer 侧无条件接入融合路径且
-#   无真实回退，导致 CUDA 上 GPT/MNIST 训练推理均无法运行。为避免"文档声称
-#   支持但实际损坏"，1.0.0 起不提供该开关（不定义 NN_ENABLE_CUDA option）。
-#   恢复前置条件：
-#     1) 补齐 cuda/ 下的融合原语，或为各引擎加能力查询并在 Layer 侧做真实回退；
-#     2) 解决 CUDA 内核 --use_fast_math 与主机侧"禁用 fast-math"的数值语义不一致；
-#     3) 解除 cuda/CMakeLists.txt 中硬编码的 MSVC 版本路径（见其中 TODO）。
-#   恢复时：恢复 option(NN_ENABLE_CUDA ...) 与下方 if(NN_ENABLE_CUDA) ... endif()
-#   块，以及 add_subdirectory(cuda) 调用。
-# CUDA 内核由 nvcc 编译为独立目标文件，通过 C-linkage 接口链接到主程序。
-# - Windows：nvcc 以 MSVC 为 host 编译器，与 LLVM/Clang 通过 C ABI 兼容。
-# - Linux：  nvcc 以 GCC/Clang 为 host 编译器，同样通过 C ABI 链接。
-message(STATUS "CUDA backend disabled for 1.0.0 (fusion primitives unimplemented). See cuda/ TODO.")

@@ -4,7 +4,7 @@
 //       共同差异是 grad_S = softmax.backward(grad_A)。本测试单独验证
 //       Softmax 的 forward/backward 是否与中心差分一致。
 //
-// 用法：softmax_gradcheck [--cuda|--gpu] [--rows N] [--cols N] [--tol <f>]
+// 用法：softmax_gradcheck [--gpu] [--rows N] [--cols N] [--tol <f>]
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>
@@ -89,7 +89,6 @@ bool check_input_grad(ComputeEngine& engine, Softmax& sm,
 int main(int argc, char* argv[])
 {
     Scalar tol = 1e-2f;
-    bool use_cuda = false;
     bool use_gpu = false;
     std::size_t rows = 8;
     std::size_t cols = 8;
@@ -99,17 +98,15 @@ int main(int argc, char* argv[])
         if (a == "--tol" && i + 1 < argc) tol = static_cast<Scalar>(std::atof(argv[++i]));
         else if (a == "--rows" && i + 1 < argc) rows = static_cast<std::size_t>(std::atoi(argv[++i]));
         else if (a == "--cols" && i + 1 < argc) cols = static_cast<std::size_t>(std::atoi(argv[++i]));
-        else if (a == "--cuda") use_cuda = true;
         else if (a == "--gpu") use_gpu = true;
         else if (a == "--help")
         {
-            std::cout << "用法: softmax_gradcheck [--cuda|--gpu] [--rows N] [--cols N] [--tol <f>]\n";
+            std::cout << "用法: softmax_gradcheck [--gpu] [--rows N] [--cols N] [--tol <f>]\n";
             return 0;
         }
     }
 
     nn::cli::EngineConfig ecfg;
-    ecfg.use_cuda = use_cuda;
     ecfg.use_gpu = use_gpu;
     auto engine_res = nn::cli::create_engine(ecfg, std::cout);
     if (!engine_res) { std::cerr << "引擎创建失败: " << engine_res.error().message << "\n"; return 1; }

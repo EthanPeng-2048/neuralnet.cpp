@@ -536,7 +536,7 @@ int main(int argc, char* argv[])
     }
 
     // 选择引擎（CPU/GPU），失败硬报错不回退
-    auto engine_r = nn::cli::create_engine(nn::cli::EngineConfig{cfg.gpu, false});
+    auto engine_r = nn::cli::create_engine(nn::cli::EngineConfig{cfg.gpu});
     if (!engine_r)
     {
         std::printf("引擎创建失败: %s\n", engine_r.error().message.c_str());

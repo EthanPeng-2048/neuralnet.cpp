@@ -3,7 +3,7 @@
 // 验证阶段一 CrossAttention（记忆查询 P / w_k / w_v）与阶段二 ZiPTBlock
 // （局部 w_q/w_k/w_v/w_o、记忆 w_kc/w_vc、Norm、FFN）的反向梯度正确性。
 //
-// 用法：zipt_gradcheck [--batch N] [--tol <f>] [--gpu] [--cuda]
+// 用法：zipt_gradcheck [--batch N] [--tol <f>] [--gpu]
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>
@@ -113,16 +113,14 @@ int main(int argc, char* argv[])
 {
     Scalar tol = 1e-2f;
     bool use_gpu = false;
-    bool use_cuda = false;
     for (int i = 1; i < argc; ++i)
     {
         std::string a = argv[i];
         if (a == "--tol" && i + 1 < argc) tol = static_cast<Scalar>(std::atof(argv[++i]));
         else if (a == "--gpu") use_gpu = true;
-        else if (a == "--cuda") use_cuda = true;
     }
 
-    auto engine = nn::cli::create_engine(nn::cli::EngineConfig{use_gpu, use_cuda});
+    auto engine = nn::cli::create_engine(nn::cli::EngineConfig{use_gpu});
     if (!engine) { std::cerr << engine.error().message << "\n"; return 1; }
     ComputeEngine& eng = **engine;
 

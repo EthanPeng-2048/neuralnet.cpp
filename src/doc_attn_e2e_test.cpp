@@ -11,7 +11,7 @@
 //   4) 负对照：清空 doc_ids（纯因果）跑同样两组 → doc B 位置 logits 必须【不同】
 //      （证明测试有灵敏度，能抓住"掩码没生效"的 bug）
 //
-// 用法：doc_attn_test [--cuda|--gpu]
+// 用法：doc_attn_test [--gpu]
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>
@@ -74,21 +74,19 @@ Scalar max_col_diff(const Matrix& a, const Matrix& b,
 
 int main(int argc, char* argv[])
 {
-    bool use_cuda = false, use_gpu = false;
+    bool use_gpu = false;
     for (int i = 1; i < argc; ++i)
     {
         std::string a = argv[i];
-        if (a == "--cuda") use_cuda = true;
-        else if (a == "--gpu") use_gpu = true;
+        if (a == "--gpu") use_gpu = true;
         else if (a == "--help")
         {
-            std::cout << "用法: doc_attn_test [--cuda|--gpu]\n";
+            std::cout << "用法: doc_attn_test [--gpu]\n";
             return 0;
         }
     }
 
     nn::cli::EngineConfig ecfg;
-    ecfg.use_cuda = use_cuda;
     ecfg.use_gpu = use_gpu;
     auto engine_res = nn::cli::create_engine(ecfg, std::cout);
     if (!engine_res) { std::cerr << "引擎创建失败: " << engine_res.error().message << "\n"; return 1; }

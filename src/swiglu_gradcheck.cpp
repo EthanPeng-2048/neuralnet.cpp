@@ -124,26 +124,22 @@ bool check_grad_tensor(
 int main(int argc, char *argv[])
 {
     Scalar tol = 2e-2f;
-    bool use_cuda = false;
     bool use_gpu = false;
     for (int i = 1; i < argc; ++i)
     {
         std::string a = argv[i];
         if (a == "--tol" && i + 1 < argc)
             tol = static_cast<Scalar>(std::atof(argv[++i]));
-        else if (a == "--cuda")
-            use_cuda = true;
         else if (a == "--gpu")
             use_gpu = true;
         else if (a == "--help")
         {
-            std::cout << "用法: swiglu_gradcheck [--cuda|--gpu] [--tol <f>]\n";
+            std::cout << "用法: swiglu_gradcheck [--gpu] [--tol <f>]\n";
             return 0;
         }
     }
 
     nn::cli::EngineConfig ecfg;
-    ecfg.use_cuda = use_cuda;
     ecfg.use_gpu = use_gpu;
     auto engine_res = nn::cli::create_engine(ecfg, std::cout);
     if (!engine_res) { std::cerr << "引擎创建失败: " << engine_res.error().message << "\n"; return 1; }
