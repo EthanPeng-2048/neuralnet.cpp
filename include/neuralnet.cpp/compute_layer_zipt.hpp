@@ -609,8 +609,11 @@ public:
         if (!grad_Vc) return std::unexpected(grad_Vc.error());
         auto gvc = w_vc_.backward(engine, *grad_Vc);
         if (!gvc) return gvc;
-        { auto a1 = engine.add_inplace(grad_C_out, *gkc); if (!a1) return std::unexpected(a1.error()); }
-        { auto a2 = engine.add_inplace(grad_C_out, *gvc); if (!a2) return std::unexpected(a2.error()); }
+        // grad_C_out += gkc + gvc：两趟累加融合为单趟**原地**（目标传递；
+        // grad_C_out 是调用方持有的累加缓冲，原地写符合其语义且不额外分配）
+        auto acc = dsl::compute_into(engine,
+            dsl::leaf(grad_C_out) + dsl::leaf(*gkc) + dsl::leaf(*gvc), grad_C_out);
+        if (!acc) return std::unexpected(acc.error());
 
         return grad_x;
     }

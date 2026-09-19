@@ -217,11 +217,13 @@ public:
         auto col_t = engine.from_matrix(col);
         if (!col_t) return std::unexpected(col_t.error());
 
-        // Z = W × col → (C_out, batch*OH*OW)
-        auto Z = engine.matmul(w_, *col_t, false, false);
+        // Z = W × col + b → (C_out, batch*OH*OW)：matmul 段与行广播偏置**融合为
+        // 单次 dispatch**（GPU 上 2 → 1，且不物化 matmul 中间结果；与
+        // Linear::forward / matmul_with_bias 同一结构）。
+        auto Z = dsl::compute(engine,
+            dsl::matmul(w_, *col_t, false, false) + dsl::row_broadcast(b_),
+            out_channels_, batch * out_h_ * out_w_);
         if (!Z) return std::unexpected(Z.error());
-        auto rb = engine.broadcast_row_inplace(*Z, b_, BinaryOp::Add);
-        if (!rb) return std::unexpected(rb.error());
 
         // 重排 → (C_out*OH*OW, batch)
         auto Z_cpu = engine.to_matrix(*Z);
@@ -243,12 +245,12 @@ public:
         auto gZ = engine.from_matrix(gZ_cpu);
         if (!gZ) return std::unexpected(gZ.error());
 
-        // grad_W += gZ × col^T → (C_out, C_in*k*k)
+        // grad_W += gZ × col^T → (C_out, C_in*k*k)：matmul 段与累加**融合为单次
+        // dispatch**并原地写入 grad_w_（GPU 上 2 → 1，且不物化 gw）
         auto col_t = engine.from_matrix(col_cache_);
         if (!col_t) return std::unexpected(col_t.error());
-        auto gw = engine.matmul(*gZ, *col_t, false, true);
-        if (!gw) return std::unexpected(gw.error());
-        auto r1 = engine.add_inplace(grad_w_, *gw);
+        auto r1 = dsl::compute_into(engine,
+            dsl::leaf(grad_w_) + dsl::matmul(*gZ, *col_t, false, true), grad_w_);
         if (!r1) return std::unexpected(r1.error());
 
         // grad_b += row_reduce_sum(gZ) → (C_out, 1)

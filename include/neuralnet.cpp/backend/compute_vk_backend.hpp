@@ -430,6 +430,28 @@ private:
     bool batch_has_ops_ = false;         // 当前帧是否已录制 op（空帧不提交）
     VkCommandBuffer batch_cmd_ = VK_NULL_HANDLE;  // 当前帧的 command buffer
 
+    // ── 异步标量回读（P0-2：非阻塞 loss 取值）─────────────────────────
+    // 动机：forward 末尾下载 loss 标量若走 to_matrix，会 end_batch +
+    // wait_in_flight（等全部在飞帧）→ 每个 step 一次全流水线 drain，host 与
+    // GPU 无法重叠（锯齿）。这里给标量回读一条"不等"的路径：
+    //   每个槽位 = 独立 command buffer + fence + 持久 mapped host 缓冲（4B）。
+    //   submit：录制一次 4B D2H 拷贝并提交（**不等待**），调用方须在主帧
+    //           提交之后调用（同队列 FIFO ⇒ 拷贝排在生产者之后，不会读到旧值）。
+    //   poll ：vkGetFenceStatus 非阻塞查询；就绪则从 mapped 内存读值。
+    // 槽位不参与 frames_ 环（环槽会被复用、fence 会被 reset），故自带 fence。
+    static constexpr std::size_t SCALAR_READBACK_SLOTS = 8;
+
+    struct ScalarReadbackSlot
+    {
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        VkBuffer host = VK_NULL_HANDLE;
+        MemoryPool::Allocation alloc{};
+        void* mapped = nullptr;
+        bool pending = false;    // 已提交、fence 未确认
+    };
+    std::vector<ScalarReadbackSlot> rb_slots_;
+
     std::mutex init_mutex_;
     std::mutex queue_mutex_;
     bool initialized_ = false;
@@ -644,6 +666,8 @@ public:
 
             flush_pending_destroys();
 
+            destroy_scalar_readback_slots();
+
             staging_ring_.reset();
 
             // 释放帧环 fences（环内 command buffers 随 command pool 一起释放）
@@ -840,6 +864,11 @@ public:
             device_.has_timeline_semaphores());
         if (!st_r)
             return st_r;
+
+        // 6.5 异步标量回读槽（P0-2）：非阻塞取 loss 标量，避免每 step drain
+        auto rb_r = init_scalar_readback_slots();
+        if (!rb_r)
+            return rb_r;
 
         // 7. 创建 descriptor pool for GPU-resident path
         // elementwise_v2 需要 4 个描述符/次，按最大值计算
@@ -1129,6 +1158,11 @@ public:
     [[nodiscard]] MemoryPool& alloc_pool() noexcept
     {
         return batch_mode_ ? *transient_pool_ : *memory_pool_;
+    }
+    // 异步标量回读槽位数（P0-2）：供 GpuEngine 暴露给调用方做环形复用。
+    [[nodiscard]] static constexpr std::size_t scalar_readback_slot_count() noexcept
+    {
+        return SCALAR_READBACK_SLOTS;
     }
     [[nodiscard]] StagingRing& staging_ring() noexcept { return *staging_ring_; }
     [[nodiscard]] VkCommandPool command_pool() const noexcept { return command_pool_; }
@@ -2974,6 +3008,194 @@ public:
             if (!r) return std::unexpected(r.error());
         }
         return {};
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // 异步标量回读（P0-2）—— 语义见成员声明处
+    // ══════════════════════════════════════════════════════════════════
+    [[nodiscard]] Result<void> init_scalar_readback_slots()
+    {
+        rb_slots_.resize(SCALAR_READBACK_SLOTS);
+        for (auto& s : rb_slots_)
+        {
+            VkCommandBufferAllocateInfo ca{};
+            ca.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            ca.commandPool = command_pool_;
+            ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            ca.commandBufferCount = 1;
+            auto r = detail::vk_check(
+                vkAllocateCommandBuffers(device_.device(), &ca, &s.cmd), __FILE__, __LINE__);
+            if (!r) return std::unexpected(r.error());
+
+            VkFenceCreateInfo fi{};
+            fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            r = detail::vk_check(
+                vkCreateFence(device_.device(), &fi, nullptr, &s.fence), __FILE__, __LINE__);
+            if (!r) return std::unexpected(r.error());
+
+            VkBufferCreateInfo bi{};
+            bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            bi.size = sizeof(float);
+            bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            r = detail::vk_check(
+                vkCreateBuffer(device_.device(), &bi, nullptr, &s.host), __FILE__, __LINE__);
+            if (!r) return std::unexpected(r.error());
+
+            VkMemoryRequirements mr{};
+            vkGetBufferMemoryRequirements(device_.device(), s.host, &mr);
+            constexpr VkMemoryPropertyFlags kVis = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+            constexpr VkMemoryPropertyFlags kCoh = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            auto ar = memory_pool().allocate(mr, kVis | kCoh, kVis);
+            if (!ar) return std::unexpected(ar.error());
+            s.alloc = *ar;
+            r = detail::vk_check(
+                vkBindBufferMemory(device_.device(), s.host, s.alloc.memory, s.alloc.offset),
+                __FILE__, __LINE__);
+            if (!r) return std::unexpected(r.error());
+            r = detail::vk_check(
+                vkMapMemory(device_.device(), s.alloc.memory, s.alloc.offset,
+                            sizeof(float), 0, &s.mapped),
+                __FILE__, __LINE__);
+            if (!r) return std::unexpected(r.error());
+        }
+        return {};
+    }
+
+    void destroy_scalar_readback_slots()
+    {
+        for (auto& s : rb_slots_)
+        {
+            if (s.mapped != nullptr && s.alloc.valid())
+            {
+                vkUnmapMemory(device_.device(), s.alloc.memory);
+                s.mapped = nullptr;
+            }
+            if (s.host != VK_NULL_HANDLE)
+                vkDestroyBuffer(device_.device(), s.host, nullptr);
+            if (s.fence != VK_NULL_HANDLE)
+                vkDestroyFence(device_.device(), s.fence, nullptr);
+            if (s.alloc.valid())
+                memory_pool().free(s.alloc);
+            s.host = VK_NULL_HANDLE;
+            s.fence = VK_NULL_HANDLE;
+            s.cmd = VK_NULL_HANDLE;  // command buffer 随 command pool 释放
+            s.pending = false;
+        }
+        rb_slots_.clear();
+    }
+
+    // 录制一次 4B D2H 拷贝并提交（**不等待**）。
+    // 调用约定：必须在产出该标量的主帧已提交之后调用（同队列 FIFO ⇒
+    // 拷贝排在生产者之后；若在主帧提交前提交，会读到上一轮的旧值）。
+    [[nodiscard]] Result<void> submit_scalar_readback(std::size_t slot, VkBuffer src)
+    {
+        if (!initialized_)
+            return std::unexpected(Error{"GPU backend not initialized"});
+        if (slot >= rb_slots_.size())
+            return std::unexpected(Error{"scalar readback: slot out of range"});
+        auto& s = rb_slots_[slot];
+
+        // 上一轮的值尚未取走：等它就绪（防御路径；正常调用方先 poll）
+        if (s.pending)
+        {
+            constexpr uint64_t kTimeoutNs = 60'000'000'000ULL;
+            const VkResult wr =
+                vkWaitForFences(device_.device(), 1, &s.fence, VK_TRUE, kTimeoutNs);
+            if (wr == VK_ERROR_DEVICE_LOST)
+            {
+                device_lost_ = true;
+                return std::unexpected(Error{
+                    "scalar readback: VK_ERROR_DEVICE_LOST（GPU 已被 TDR 重置）"});
+            }
+            if (wr != VK_SUCCESS)
+                return std::unexpected(
+                    Error{"scalar readback: fence wait failed " +
+                          std::to_string(static_cast<int>(wr))});
+            s.pending = false;
+        }
+
+        auto r = detail::vk_check(vkResetCommandBuffer(s.cmd, 0), __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
+        VkCommandBufferBeginInfo cbi{};
+        cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        r = detail::vk_check(vkBeginCommandBuffer(s.cmd, &cbi), __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
+
+        VkBufferCopy cp{};
+        cp.srcOffset = 0;
+        cp.dstOffset = 0;
+        cp.size = sizeof(float);  // (1,1) f32 标量
+        vkCmdCopyBuffer(s.cmd, src, s.host, 1, &cp);
+
+        VkBufferMemoryBarrier b{};
+        b.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.buffer = s.host;
+        b.offset = 0;
+        b.size = sizeof(float);
+        vkCmdPipelineBarrier(s.cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+            0, 0, nullptr, 1, &b, 0, nullptr);
+
+        r = detail::vk_check(vkEndCommandBuffer(s.cmd), __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
+        r = detail::vk_check(vkResetFences(device_.device(), 1, &s.fence), __FILE__, __LINE__);
+        if (!r) return std::unexpected(r.error());
+
+        {
+            std::lock_guard lock(queue_mutex_);
+            VkSubmitInfo si{};
+            si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &s.cmd;
+            r = detail::vk_check(
+                vkQueueSubmit(device_.compute_queue(), 1, &si, s.fence), __FILE__, __LINE__);
+        }
+        if (!r) return std::unexpected(r.error());
+        s.pending = true;
+        return {};
+    }
+
+    // 非阻塞查询：就绪则写出 out 并返回 true；未就绪返回 false（不阻塞）。
+    [[nodiscard]] Result<bool> poll_scalar_readback(std::size_t slot, float& out)
+    {
+        if (slot >= rb_slots_.size())
+            return std::unexpected(Error{"scalar readback: slot out of range"});
+        auto& s = rb_slots_[slot];
+        if (!s.pending)
+            return false;
+        const VkResult st = vkGetFenceStatus(device_.device(), s.fence);
+        if (st == VK_NOT_READY)
+            return false;
+        if (st == VK_ERROR_DEVICE_LOST)
+        {
+            device_lost_ = true;
+            return std::unexpected(Error{
+                "scalar readback: VK_ERROR_DEVICE_LOST（GPU 已被 TDR 重置）"});
+        }
+        if (st != VK_SUCCESS)
+            return std::unexpected(
+                Error{"scalar readback: fence status " +
+                      std::to_string(static_cast<int>(st))});
+
+        // 非 coherent 内存需 invalidate；coherent 下该调用是合法的 no-op。
+        // size = VK_WHOLE_SIZE 时 offset 无对齐要求（VU 只约束非 WHOLE_SIZE）。
+        VkMappedMemoryRange mr{};
+        mr.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        mr.memory = s.alloc.memory;
+        mr.offset = s.alloc.offset;
+        mr.size = VK_WHOLE_SIZE;
+        if (vkInvalidateMappedMemoryRanges(device_.device(), 1, &mr) != VK_SUCCESS)
+            return std::unexpected(Error{"scalar readback: invalidate mapped range failed"});
+
+        std::memcpy(&out, s.mapped, sizeof(float));
+        s.pending = false;
+        return true;
     }
 
     // ══════════════════════════════════════════════════════════════════
