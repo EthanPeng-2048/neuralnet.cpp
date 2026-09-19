@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <span>
 #include <string>
+#include <vector>
 
 #include "core_config.hpp"
 #include "core_errors.hpp"
@@ -162,6 +163,59 @@ public:
     {
         return Tensor::cpu(1, 1);
     }
+
+    // ── 异步标量回读（P0-2：非阻塞取 loss）──────────────────────────────
+    // 动机：若用 to_matrix 取每步 loss，GPU 引擎会 end_batch + wait_in_flight
+    // （等全部在飞帧）→ 每 step 一次全流水线 drain，host/GPU 无法重叠。
+    //
+    // submit_scalar_readback(slot, t)：把 t（(1,1) **F32**）的头 4 字节排入
+    //   一次 D2H 拷贝并提交，**不等待**。
+    //   ⚠ 调用约定：必须在产出 t 的主帧已提交之后调用——同一队列 FIFO 保证
+    //   拷贝执行在生产者之后（在主帧提交前提交会读到上一轮旧值）。
+    //   ⚠ t 的宿主 Tensor 必须存活到 poll 返回就绪（buffer 生命周期跨越提交）。
+    // poll_scalar_readback(slot, out)：非阻塞查询。就绪写值并返回 true；
+    //   未就绪返回 false（调用方稍后重试）。
+    // scalar_readback_slots()：可用槽位数（调用方据此做环形复用）。
+    //
+    // 默认实现（CPU / 其他同步引擎）：submit 立刻取标量存值，poll 恒立刻就绪。
+    [[nodiscard]] virtual Result<void> submit_scalar_readback(
+        std::size_t slot, const Tensor& t)
+    {
+        if (!t.is_cpu())
+            return std::unexpected(Error{
+                "submit_scalar_readback: 默认实现仅支持 CPU 张量"});
+        Scalar v = Scalar{0};
+        if (t.precision() == Precision::F32)
+        {
+            const auto& m = t.cpu_matrix();
+            v = m.span()[0];
+        }
+        else if (t.precision() == Precision::F16)
+        {
+            const auto& m = t.cpu_matrix<Precision::F16>();
+            v = static_cast<Scalar>(m.span()[0]);
+        }
+        else
+        {
+            return std::unexpected(Error{
+                "submit_scalar_readback: 不支持的精度"});
+        }
+        if (sync_readback_slots_.size() <= slot)
+            sync_readback_slots_.resize(slot + 1, Scalar{0});
+        sync_readback_slots_[slot] = v;
+        return {};
+    }
+
+    [[nodiscard]] virtual Result<bool> poll_scalar_readback(
+        std::size_t slot, Scalar& out)
+    {
+        if (slot >= sync_readback_slots_.size())
+            return false;
+        out = sync_readback_slots_[slot];
+        return true;
+    }
+
+    [[nodiscard]] virtual std::size_t scalar_readback_slots() const { return 1; }
 
     // ── 张量工厂（统一接口，§6.4, §6.5）────────────────────────────────
     // P 由调用方显式指定（§8.5）：无隐式推导，无 Auto
@@ -472,6 +526,28 @@ public:
         (void)spec; (void)inputs; (void)rows; (void)cols;
         return std::unexpected(Error{"eval_expr_reduce: 该引擎不支持归约向量输出"});
     }
+
+    // ── 目标传递（destination-passing）：结果写入已有张量 ────────────────
+    // 语义同 eval_expr，但输出**直接写进 out**（不分配新张量），用于表达
+    // "原地更新"语义：dst = f(dst, ...)（梯度累加 / 参数更新 / 就地缩放 /
+    // 就地按行广播等）。out 允许与某个输入是同一 buffer：逐元素"先读完全部
+    // 输入再写 out[i]"，就地安全。
+    // 仅支持逐元素表达式（无归约）；归约向量输出用 eval_expr_reduce。
+    // 默认实现返回错误（未支持的引擎）；CPU/GPU 覆盖为真原地实现。
+    [[nodiscard]] virtual Result<void> eval_expr_into(
+        const ExprSpec& spec,
+        std::span<const Tensor> inputs,
+        std::size_t rows, std::size_t cols, Tensor& out)
+    {
+        (void)spec; (void)inputs; (void)rows; (void)cols; (void)out;
+        return std::unexpected(Error{
+            "eval_expr_into: 该引擎不支持原地表达式求值"});
+    }
+
+private:
+    // 默认（CPU / 同步引擎）标量回读槽：submit 立即存值，poll 立即就绪。
+    // GPU 引擎覆写为异步槽位（见 GpuEngine / GpuBackend::rb_slots_）。
+    std::vector<Scalar> sync_readback_slots_;
 };
 
 } // namespace nn
