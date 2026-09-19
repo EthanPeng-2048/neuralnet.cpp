@@ -255,7 +255,7 @@ GPU-resident 单算子对、链式错；attn batch=1 对、batch=2 错；gradche
 - [ ] CLI 输出格式变更 = 同步改 parser 正则（CLI 是 GUI 的唯一契约）
 
 ### 修改构建/工具链
-- [ ] Debug↔Release 切换：清 `build/cuda/cuda_kernels.obj` 再编（CUDA 已停用，仅恢复时适用）
+- [x] ~~Debug↔Release 切换：清 `build/cuda/cuda_kernels.obj` 再编~~（CUDA 后端已移除，此项作废）
 - [ ] nvcc 编译器版本匹配（12.8 ↔ VS 2022 BuildTools；CUDA 已停用）
 - [ ] 新 C++26 特性先验证 MSVC STL 支持度
 

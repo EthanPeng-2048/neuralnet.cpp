@@ -22,7 +22,7 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 - 编译器：Clang++ 22.1+（C++26）；CMake 3.30+。CMake 在 Linux 上若 PATH 中能找到 `clang++` 会优先选它（自动向量化优于 g++），可用 `CXX=g++` 或 `-DCMAKE_CXX_COMPILER` 覆盖；MSVC 走 `/std:c++latest`。
 - 构建选项：`NN_ENABLE_NATIVE`（默认 ON，开启 `-march=native`，分发/CI 用 `OFF` 生成可移植基线）；`NN_ENABLE_TESTS`（默认 OFF）。
 - Vulkan 可选：CMake 自动探测 Vulkan + glslc，找到则定义 `NN_HAS_VULKAN` 启用 GPU，否则纯 CPU。支持多 Vulkan 设备选择（`--gpu` 参数，见 `cli/cli_gpu_option.hpp`）。
-- **CUDA 后端已停用**（无 `NN_ENABLE_CUDA` 开关；融合原语未实现，`compute_cuda_engine.hpp` 的扫描级原语直接返回"未实现"），勿依赖、勿在文档中声称支持。
+- **CUDA 后端已整体移除**（`cuda/`、`compute_cuda_engine.hpp`、`backend/compute_cuda_backend.hpp` 及全库 `NN_HAS_CUDA` 分支已删除；CLI 不再接受 `--cuda`）。带 CUDA 的历史快照见 git 分支 `legacy/cuda`。勿在文档中声称支持 CUDA。
 - 应用入口：`build/{mnist_train,mnist_infer,text_train,text_infer,tokenizer_train,tokenizer_infer}`，另有 `layer_bench`（性能）与测试类可执行文件。`gui.py` 是 Python GUI，`train_pkg.py` 打包 `.nnpkg` 训练包，`cli_controllers.py` 提供 CLI 控制逻辑。
 
 ## 3. 目录速查（改什么任务 → 看什么文件）
@@ -171,7 +171,7 @@ GPT 序列展平: 列序 i = b*seq + t（batch-major，全局唯一约定）
 - **构建期两步**（CMake 自动编排，改 Layer 内联表达式后重跑构建即可）：
   1. `scan_exprs`：dry-run 跑 Layer forward/backward，收集折叠出的 `ExprSpec` 结构（去重）→ `build/generated/expr_specs.bin`
   2. `gen_fused`：读 bin → 经 `emitter_registry` 选后端（默认 `"glsl"` = `GlslEmitter`）生成 GLSL → glslc → 内联 SPIR-V → `build/generated/fused_registry.hpp`
-- **IR-D emitter 抽象**（`expr_emitter.hpp`）：把后端代码生成从 GLSL 专用抽象为 emitter 接口（一份 canonical IR → 多后端代码），`--list-backends` 可列出注册后端。目前仅 `glsl` 后端注册；`CpuEmitter` / `CudaEmitter` 为预留设计（**尚未实现**，勿把它们当作现存代码）。
+- **IR-D emitter 抽象**（`expr_emitter.hpp`）：把后端代码生成从 GLSL 专用抽象为 emitter 接口（一份 canonical IR → 多后端代码），`--list-backends` 可列出注册后端。目前仅 `glsl` 后端注册；`CpuEmitter`（已删除）与 `CudaEmitter`（随 CUDA 后端一并移除）均**不存在**，勿引用。
 - 手写原语 shader 在 `shaders/*.comp`（matmul、matmul_tiled、batched_matmul、reduce、broadcast、elementwise_v2、transpose、gather、scatter_add、rearrange_3d、scan_prefix_outer、scan_suffix_outer、outer_col、cast），构建期 glslc 编译并嵌入 C++ 头文件。
 - IR 优化 pass（canonicalize/CSE/寄存器分配/图 IR 融合）见 `expr_opt.hpp` / `expr_graph.hpp`，设计文档 `docs/development/03-ir-optimization.md`。
 
@@ -226,7 +226,7 @@ optimizer.step();
 
 | 文档 | 何时读 |
 |------|--------|
-| `introduction/01-architecture.md` | 需要完整分层/数据流/模块详解时（**含快速理解指南和理解路线图**；CUDA 已停用备注见篇末） |
+| `introduction/01-architecture.md` | 需要完整分层/数据流/模块详解时（**含快速理解指南和理解路线图**；CUDA 已移除备注见篇末） |
 | `introduction/02-performance.md` | 性能优化（SmartPolicy、缓存分块、GPU） |
 | `introduction/03-algorithm-reference.md` | 每个 Layer/Loss/Optimizer 的数学与原语分解 |
 | `introduction/04-innovative-designs.md` | 创新设计全景 |
@@ -281,7 +281,7 @@ S7 关键教训（改融合/IR 代码前必读）：
 
 - 规模：102 个手写 C++ 文件（60 hpp + 42 cpp）；结论 **P0×0 / P1×48 / P2×92 / P3×95**。
 - 08-27 审查的 P0/P1/P2 已修项（BPE vocab≥258、batch-size≥1、patch-size 整除 28、cnn-pool≤28、Muon 0.2√max(m,n)、epoch lr 钳制、gpu_test 退出码等）见报告 §1。
-- **未修**：`col_reduce` 并行非逐字节、`VK_TIMEOUT` 重试未实现（且 `--tdr-retry` 配置从未被使用）、第三梯队（序列化/GUI/测试质量/`set_doc_ids` 残留）、CUDA 后端死代码（含隐藏编译错误）。
+- **未修**：`col_reduce` 并行非逐字节、`VK_TIMEOUT` 重试未实现（且 `--tdr-retry` 配置从未被使用）、第三梯队（序列化/GUI/测试质量/`set_doc_ids` 残留）。CUDA 后端死代码（含隐藏编译错误）已整体移除，快照见 `legacy/cuda`。
 - CE / Adam / AdamW / SGD 公式已验证正确。
 
 ### 已过时的历史说明

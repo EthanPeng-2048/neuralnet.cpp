@@ -33,12 +33,12 @@ int main(int argc, char* argv[])
     }
 
     // CPU 引擎（必选）
-    auto cpu_engine = nn::cli::create_engine(nn::cli::EngineConfig{false, false});
+    auto cpu_engine = nn::cli::create_engine(nn::cli::EngineConfig{false});
     if (!cpu_engine) { std::cerr << cpu_engine.error().message << "\n"; return 1; }
     nn::ComputeEngine& cpu = **cpu_engine;
 
     // GPU 引擎（若不可用则跳过 GPU 比较）
-    auto gpu_engine = nn::cli::create_engine(nn::cli::EngineConfig{true, false});
+    auto gpu_engine = nn::cli::create_engine(nn::cli::EngineConfig{true});
     if (!gpu_engine)
     {
         // 返回 77 = ctest SKIP：无 GPU 时 GPU 比较未执行，不得计为 "Passed"

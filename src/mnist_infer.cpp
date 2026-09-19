@@ -44,7 +44,6 @@ void print_usage(const char *prog)
         << "  --show-pixels      显示像素矩阵 (调试用)\n"
         << "  --gpu <索引>       启用 GPU 加速 (需要 Vulkan SDK)，可用枚举索引指定设备\n"
         << "                     (名称子串写法: --gpu=NVIDIA / --gpu=40HX)\n"
-        << "  --cuda             启用 CUDA GPU 加速 (需要 CUDA Toolkit)\n"
         << "  --help             显示此帮助信息\n";
 }
 
@@ -56,7 +55,6 @@ struct InferConfig
     int topk = 3;
     bool show_pixels = false;
     bool gpu_enabled = false;
-    bool cuda_enabled = false;
     std::string gpu_device;      // --gpu 的可选设备选择子（空 = 自动选卡）
 };
 
@@ -96,10 +94,6 @@ nn::Result<InferConfig> parse_args(int argc, char *argv[])
         {
             cfg.gpu_enabled = true;
             if (!dev->empty()) cfg.gpu_device = *dev;
-        }
-        else if (arg == "--cuda")
-        {
-            cfg.cuda_enabled = true;
         }
         else if (!arg.starts_with("--"))
         {
@@ -283,7 +277,6 @@ int main(int argc, char *argv[])
     // 引擎必须先于 model 构造并晚于 model 析构（model 持有 engine 的非拥有指针）
     nn::cli::EngineConfig eng_cfg;
     eng_cfg.use_gpu = cfg.gpu_enabled;
-    eng_cfg.use_cuda = cfg.cuda_enabled;
     eng_cfg.gpu_device = cfg.gpu_device;
     auto engine_res = nn::cli::create_engine(eng_cfg, std::cout);
     if (!engine_res)

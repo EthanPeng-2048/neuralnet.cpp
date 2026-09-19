@@ -5,7 +5,7 @@
 // 而 LayerNorm gamma 经注意力 ReLU 后拐点密度极高，元素级有限差分不可靠，
 // 故只对 novel 的注意力核心做 gradcheck；整链正确性由 rapt_smoke_test 保证。
 //
-// 用法：rapt_gradcheck [--tol <f>] [--gpu] [--cuda]
+// 用法：rapt_gradcheck [--tol <f>] [--gpu]
 // 注意：无 --batch 参数——batch 在各测试段内固定（causal=2、bidirectional=1、
 // doc-aware=2），batch>1 覆盖（铁律 5）由 causal/doc-aware 段保证。
 // ─────────────────────────────────────────────────────────────────────────
@@ -143,16 +143,14 @@ int main(int argc, char* argv[])
 {
     Scalar tol = 5e-2f;
     bool use_gpu = false;
-    bool use_cuda = false;
     for (int i = 1; i < argc; ++i)
     {
         std::string a = argv[i];
         if (a == "--tol" && i + 1 < argc) tol = static_cast<Scalar>(std::atof(argv[++i]));
         else if (a == "--gpu") use_gpu = true;
-        else if (a == "--cuda") use_cuda = true;
     }
 
-    auto engine = nn::cli::create_engine(nn::cli::EngineConfig{use_gpu, use_cuda});
+    auto engine = nn::cli::create_engine(nn::cli::EngineConfig{use_gpu});
     if (!engine) { std::cerr << engine.error().message << "\n"; return 1; }
     ComputeEngine& eng = **engine;
 

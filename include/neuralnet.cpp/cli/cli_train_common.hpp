@@ -12,7 +12,6 @@
 //   --lr-per-epoch <v1,...> 手动指定每轮学习率（逗号分隔）
 //   --lr-schedule <type>    学习率调度：fixed/constant/cosine
 //   --gpu [设备]            启用 Vulkan GPU 加速；可选指定设备（索引或名称子串）
-//   --cuda                  启用 CUDA GPU 加速
 //
 // 用法：在调用方的 parse_args 循环中优先委托：
 //   for (int i = 1; i < argc; ++i) {
@@ -56,7 +55,6 @@ namespace nn::cli
         std::string lr_schedule = "constant";  // "fixed"/"constant" 等价，"cosine" 退火
         std::vector<nn::Scalar> lr_per_epoch;
         bool use_gpu = false;
-        bool use_cuda = false;
         // --gpu 的可选设备选择子（索引或名称子串）；空 = 自动选卡
         std::string gpu_device;
     };
@@ -162,12 +160,6 @@ namespace nn::cli
                 cfg.gpu_device = *dev;
             return true;
         }
-        if (arg == "--cuda")
-        {
-            cfg.use_cuda = true;
-            return true;
-        }
-
         return false;  // 不是通用 flag
     }
 } // namespace nn::cli

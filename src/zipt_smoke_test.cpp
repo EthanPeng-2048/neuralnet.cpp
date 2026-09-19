@@ -5,7 +5,7 @@
 //   2. ZiPTModel 整链 forward/backward 可运行（无 NaN、无崩溃）
 //   3. 短训练循环 loss 单调下降（证明梯度有效、可学习）
 //
-// 用法：zipt_smoke_test [--steps N] [--gpu] [--cuda]
+// 用法：zipt_smoke_test [--steps N] [--gpu]
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>
@@ -20,16 +20,15 @@
 int main(int argc, char* argv[])
 {
     std::size_t steps = 12;
-    bool use_gpu = false, use_cuda = false;
+    bool use_gpu = false;
     for (int i = 1; i < argc; ++i)
     {
         std::string a = argv[i];
         if (a == "--steps" && i + 1 < argc) steps = static_cast<std::size_t>(std::atoi(argv[++i]));
         else if (a == "--gpu") use_gpu = true;
-        else if (a == "--cuda") use_cuda = true;
     }
 
-    auto engine = nn::cli::create_engine(nn::cli::EngineConfig{use_gpu, use_cuda});
+    auto engine = nn::cli::create_engine(nn::cli::EngineConfig{use_gpu});
     if (!engine) { std::cerr << engine.error().message << "\n"; return 1; }
     nn::ComputeEngine& eng = **engine;
 

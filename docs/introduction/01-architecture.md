@@ -405,12 +405,15 @@ nn.hpp（统一入口）
 
 ---
 
-## 备注：CUDA 后端已停用
+## 备注：CUDA 后端已移除
 
-**CUDA 后端自 v1.0.0 起正式停用，不可用，请勿依赖。** 融合原语（M4/M5/M6）与 DSL 表达式在 CUDA 上未实现，无真实回退，导致 CUDA 上 GPT/MNIST 训练推理均无法运行。具体表现：
+**CUDA 后端已整体移除**：`cuda/` 目录（`cuda_kernels.cu` / `.h` / `CMakeLists.txt`）、
+`compute_cuda_engine.hpp`、`backend/compute_cuda_backend.hpp`，以及全库 `NN_HAS_CUDA`
+条件分支（`compute_tensor.hpp` 6 处、`nn.hpp`、`cli/cli_engine_factory.hpp`、
+`cli/cli_train_common.hpp`、`CMakeLists.txt`）均已删除。
 
-- CMake **不再提供 `NN_ENABLE_CUDA` 开关**（不定义该 option）；
-- `cuda_engine.hpp` 仅在 `NN_HAS_CUDA` 下编译，但该宏**永不定义**；
-- CLI 的 `--cuda` 参数仍会被解析，但传入后返回错误"请求 --cuda 但未编译 CUDA 支持；不回退 CPU"。
+移除原因：融合原语（M4/M5/M6）与 DSL 表达式在 CUDA 上未实现且无真实回退，导致 CUDA 上
+GPT/MNIST 训练推理均无法运行，属"文档声称支持但实际损坏"的死代码（且含隐藏编译错误）。
 
-引擎只支持 CPU（`CpuEngine`）与 Vulkan GPU（`GpuEngine`）两个后端。CUDA 后端已停用，当前无计划恢复。
+引擎只支持 CPU（`CpuEngine`）与 Vulkan GPU（`GpuEngine`）两个后端。CLI 不再接受
+`--cuda`（传入会报"未知参数"）。带 CUDA 的历史快照保存在 git 分支 `legacy/cuda`。

@@ -28,10 +28,6 @@
 #include "backend/compute_vk_backend.hpp"
 #endif
 
-#ifdef NN_HAS_CUDA
-#include "backend/compute_cuda_backend.hpp"
-#endif
-
 namespace nn
 {
 
@@ -75,10 +71,6 @@ private:
     std::variant<GpuF16, GpuF32> gpu_data_;
 #endif
 
-#ifdef NN_HAS_CUDA
-    // CUDA 存储（Phase 1 不动，cuda_data_ 保持原始类型）
-    std::shared_ptr<CudaTensor> cuda_data_;
-#endif
 
     // ── variant 安全访问辅助（避免 std::get UB，§6.1）────────────────────
     template <Precision P>
@@ -184,17 +176,6 @@ public:
     }
 #endif
 
-#ifdef NN_HAS_CUDA
-    // ── CUDA 构造（Phase 1 不动）─────────────────────────────────────────
-    explicit Tensor(std::shared_ptr<CudaTensor> t)
-        : device_(Device::GPU), rows_(t->rows()), cols_(t->cols()), cuda_data_(std::move(t)) {}
-
-    static Tensor from_cuda(CudaTensor t)
-    {
-        return Tensor(std::make_shared<CudaTensor>(std::move(t)));
-    }
-#endif
-
     // ── 访问器 ────────────────────────────────────────────────────────────
     [[nodiscard]] Device device() const noexcept { return device_; }
     [[nodiscard]] Precision precision() const noexcept { return precision_; }
@@ -217,10 +198,6 @@ public:
                 return cpu_data_.index() == 0 && static_cast<bool>(cpu_get<Precision::F16>());
             return cpu_data_.index() == 1 && static_cast<bool>(cpu_get<Precision::F32>());
         }
-#ifdef NN_HAS_CUDA
-        if (cuda_data_)
-            return static_cast<bool>(cuda_data_);
-#endif
 #ifdef NN_HAS_VULKAN
         if (precision_ == Precision::F16)
             return gpu_data_.index() == 0 && static_cast<bool>(gpu_get<Precision::F16>());
@@ -292,23 +269,6 @@ public:
     }
 #endif
 
-#ifdef NN_HAS_CUDA
-    // ── CUDA 存储访问（Phase 1 不动）─────────────────────────────────────
-    [[nodiscard]] CudaTensor& cuda_tensor()
-    {
-        NN_ASSERT(device_ == Device::GPU && cuda_data_, "cuda_tensor() on non-CUDA tensor");
-        return *cuda_data_;
-    }
-
-    [[nodiscard]] const CudaTensor& cuda_tensor() const
-    {
-        NN_ASSERT(device_ == Device::GPU && cuda_data_, "cuda_tensor() on non-CUDA tensor");
-        return *cuda_data_;
-    }
-
-    [[nodiscard]] std::shared_ptr<CudaTensor> cuda_shared() const noexcept { return cuda_data_; }
-#endif
-
     // ── 形状描述（调试用） ────────────────────────────────────────────────
     [[nodiscard]] std::string shape_str() const
     {
@@ -318,7 +278,7 @@ public:
     }
 
     // ── 零拷贝 reshape（共享底层 buffer，仅改变形状元数据）────────────────
-    // 后端无关：CPU/Vulkan/CUDA 均适用，避免上层代码直接访问 gpu_tensor()/cuda_tensor()
+    // 后端无关：CPU/Vulkan 均适用，避免上层代码直接访问 gpu_tensor()
     [[nodiscard]] Tensor reshape(std::size_t new_rows, std::size_t new_cols) const
     {
         NN_ASSERT(rows_ * cols_ == new_rows * new_cols,
@@ -331,9 +291,6 @@ public:
         t.virtual_tag_ = virtual_tag_;  // reshape 保留图 IR 标记
 #ifdef NN_HAS_VULKAN
         t.gpu_data_ = gpu_data_;
-#endif
-#ifdef NN_HAS_CUDA
-        t.cuda_data_ = cuda_data_;
 #endif
         if (device_ == Device::CPU)
         {

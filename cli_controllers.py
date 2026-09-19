@@ -385,7 +385,7 @@ class MnistTrainController(CLIController):
     封装mnist_train.exe，支持以下功能：
     - 架构选择：MLP、Transformer 或 CNN
     - 训练参数：轮数、学习率、批大小、优化器等
-    - 设备选择：CPU、GPU(Vulkan)、CUDA
+    - 设备选择：CPU、GPU(Vulkan)
     - 模型管理：保存、恢复
     - 实时指标：训练损失、验证准确率
     """
@@ -433,9 +433,6 @@ class MnistTrainController(CLIController):
         # 设备选择
         if kwargs.get("gpu", False):
             args.append("--gpu")
-        
-        if kwargs.get("cuda", False):
-            args.append("--cuda")
         
         # 其他参数
         if "max_samples" in kwargs:
@@ -564,7 +561,7 @@ class MnistInferController(CLIController):
     封装mnist_infer.exe，支持以下功能：
     - 单张图片推理
     - 批量推理
-    - GPU/CUDA加速
+    - GPU(Vulkan)加速
     - 预测结果展示
     """
     
@@ -595,9 +592,6 @@ class MnistInferController(CLIController):
         # 设备选择
         if kwargs.get("gpu", False):
             args.append("--gpu")
-        
-        if kwargs.get("cuda", False):
-            args.append("--cuda")
         
         return args
     
@@ -753,7 +747,7 @@ class GptTrainController(CLIController):
     - GPT模型训练
     - 多种优化器
     - 学习率调度
-    - GPU/CUDA加速
+    - GPU(Vulkan)加速
     - TDR防护
     - Checkpoint管理
     """
@@ -827,9 +821,6 @@ class GptTrainController(CLIController):
         # 设备选择
         if kwargs.get("gpu", False):
             args.append("--gpu")
-        
-        if kwargs.get("cuda", False):
-            args.append("--cuda")
         
         # 位置编码
         if "positional_encoding" in kwargs:
@@ -981,7 +972,7 @@ class GptInferController(CLIController):
     - 文本生成
     - 交互模式
     - 温度控制
-    - GPU/CUDA加速
+    - GPU(Vulkan)加速
     """
     
     @property
@@ -1019,9 +1010,6 @@ class GptInferController(CLIController):
         # 设备选择
         if kwargs.get("gpu", False):
             args.append("--gpu")
-        
-        if kwargs.get("cuda", False):
-            args.append("--cuda")
         
         # 显示token
         if kwargs.get("show_tokens", False):

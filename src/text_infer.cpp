@@ -42,7 +42,6 @@ void print_usage(const char *prog)
         << "  --temperature <t>    温度参数 (默认: 1.0, 0=贪心)\n"
         << "  --gpu <索引>         启用 GPU 加速 (需要 Vulkan SDK)，可用枚举索引指定设备\n"
         << "                       (名称子串写法: --gpu=NVIDIA / --gpu=40HX)\n"
-        << "  --cuda               启用 CUDA GPU 加速 (需要 CUDA Toolkit)\n"
         << "  --show-tokens        显示 token ID (调试用)\n"
         << "  --help               显示此帮助信息\n";
 }
@@ -58,7 +57,6 @@ struct InferConfig
     bool interactive = false;
     bool show_tokens = false;
     bool gpu_enabled = false;
-    bool cuda_enabled = false;
     std::string gpu_device;      // --gpu 的可选设备选择子（空 = 自动选卡）
 };
 
@@ -99,8 +97,6 @@ InferConfig parse_args(int argc, char *argv[])
             cfg.gpu_enabled = true;
             if (!gpu_dev->empty()) cfg.gpu_device = *gpu_dev;
         }
-        else if (arg == "--cuda")
-            cfg.cuda_enabled = true;
         else if (arg == "--show-tokens")
             cfg.show_tokens = true;
         else if (!arg.starts_with("--"))
@@ -262,7 +258,6 @@ int main(int argc, char *argv[])
     // ── 创建计算引擎 ─────────────────────────────────────────
     nn::cli::EngineConfig eng_cfg;
     eng_cfg.use_gpu = cfg.gpu_enabled;
-    eng_cfg.use_cuda = cfg.cuda_enabled;
     eng_cfg.gpu_device = cfg.gpu_device;
     auto engine_res = nn::cli::create_engine(eng_cfg, std::cout);
     if (!engine_res)
