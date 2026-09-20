@@ -24,7 +24,9 @@
 //    - 运算符重载/概念约束：普通 + - * / 与比较、select 均照常书写。
 // ═══════════════════════════════════════════════════════════════════════════
 
+#include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <ranges>
 #include <utility>
 #include <vector>
@@ -370,9 +372,30 @@ struct RowAccessRef : CpuViewCache
 template <ExprViewKind Kind>
 struct ReduceViewRef
 {
+    // 归约轴与算子：行归约 → 向量长度 rows；列归约 → 长度 cols
+    static constexpr bool reduces_rows =
+        (Kind == ExprViewKind::RowReduceSum || Kind == ExprViewKind::RowReduceMax);
+    static constexpr bool reduces_max =
+        (Kind == ExprViewKind::RowReduceMax || Kind == ExprViewKind::ColReduceMax);
+
     Tensor t;
 
+    // ── CPU 模板路径预绑定（引擎内部，Layer 无感知）─────────────────────
+    // 由 cpu_prepare 按输出槽算出行/列归约向量并绑定指针；随后 eval(i, cols)
+    // 按 (r, c) 读取该向量。槽内沿归约轴升序累加 → 与解释器的 view_reduce
+    // 预计算逐字节一致（铁律 8：并行只是把独立槽分给不同线程）。
+    // GPU/scan 不使用本状态（to_spec 只读 t 与 Kind）。
+    mutable std::vector<Scalar> vec_{};
+    mutable const Scalar *v_ = nullptr;
+
     [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
+    // CPU 模板路径（2 参）：归约视图按行/列广播
+    [[nodiscard]] Scalar eval(std::size_t i, std::size_t cols) const noexcept
+    {
+        if (v_ == nullptr)
+            return Scalar{0};
+        return reduces_rows ? v_[i / cols] : v_[i % cols];
+    }
     ExprOperand to_spec(SpecBuilder& b) const { return b.add_reduce_input(t, Kind); }
 };
 
@@ -633,9 +656,27 @@ struct Select
 template <nn::dsl::DslExpr E, ExprOp Rop>
 struct ReduceRef
 {
+    // 归约轴与算子：行归约 → 向量长度 rows；列归约 → 长度 cols
+    static constexpr bool reduces_rows = (Rop == ExprOp::RowSum || Rop == ExprOp::RowMax);
+    static constexpr bool reduces_max = (Rop == ExprOp::RowMax || Rop == ExprOp::ColMax);
+
     E child;
 
+    // ── CPU 模板路径预绑定（引擎内部，Layer 无感知）─────────────────────
+    // 两阶段：先递归备好子表达式（其内部若还有归约节点也一并备好），再按输出槽
+    // 对子表达式求值并归约到 vec_。槽内沿归约轴升序累加 → 与解释器
+    // replay_prefix 的累加顺序逐字节一致（铁律 8）。
+    mutable std::vector<Scalar> vec_{};
+    mutable const Scalar *v_ = nullptr;
+
     [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
+    // CPU 模板路径（2 参）：归约指令按行/列广播
+    [[nodiscard]] Scalar eval(std::size_t i, std::size_t cols) const noexcept
+    {
+        if (v_ == nullptr)
+            return Scalar{0};
+        return reduces_rows ? v_[i / cols] : v_[i % cols];
+    }
     ExprOperand to_spec(SpecBuilder& b) const { return b.add_reduce_instr(Rop, child.to_spec(b)); }
 };
 
@@ -850,8 +891,34 @@ template <typename E>
 // 含归约节点的白名单：已确认可"预绑定 + 模板内联"的才列在此（逐个迁移）
 template <typename T> inline constexpr bool cpu_preparable_leaf_v = false;
 
+// ── 表达式是否含"真正的行/列归约" ───────────────────────────────────────
+// 与 has_reduction_v 的区别：matmul 段与网格索引**不算**——它们只是"需要预计算
+// 的逐元素前缀"，输出形状仍是 (rows, cols)；而真正的归约把输出降成
+// (rows,1)/(1,cols)。
+// 用于维持 compute_into 的对外契约：它只接受逐元素表达式，含真归约必须报错
+// （与 CpuEngine::eval_expr_into 的 expr_spec_reduce_axis != -1 守卫一致）。
+template <typename T> inline constexpr bool has_real_reduction_v = false;
+template <ExprViewKind K> inline constexpr bool has_real_reduction_v<ReduceViewRef<K>> = true;
+template <typename C, ExprOp Rop> inline constexpr bool has_real_reduction_v<ReduceRef<C, Rop>> = true;
+template <typename Op, nn::Expression C>
+inline constexpr bool has_real_reduction_v<Unary<Op, C>> = has_real_reduction_v<C>;
+template <typename Op, nn::Expression L, nn::Expression R>
+inline constexpr bool has_real_reduction_v<Binary<Op, L, R>>
+    = has_real_reduction_v<L> || has_real_reduction_v<R>;
+template <nn::BoolExpression C, nn::Expression T, nn::Expression E>
+inline constexpr bool has_real_reduction_v<Select<C, T, E>>
+    = has_real_reduction_v<C> || has_real_reduction_v<T> || has_real_reduction_v<E>;
+
 // matmul：用引擎通用 GEMM 原语物化 C 后绑定指针，尾链交模板路径内联
 template <> inline constexpr bool cpu_preparable_leaf_v<MatmulRef> = true;
+
+// 归约视图：按输出槽预计算行/列归约向量后交模板路径（语义与解释器一致）
+template <ExprViewKind K>
+inline constexpr bool cpu_preparable_leaf_v<ReduceViewRef<K>> = true;
+
+// 归约指令：内部会先递归备好子表达式
+template <typename C, ExprOp Rop>
+inline constexpr bool cpu_preparable_leaf_v<ReduceRef<C, Rop>> = true;
 
 // 树级判定：不含归约的节点本就是模板路径原生节点，可直接预绑定（no-op）；
 // 含归约的节点只有白名单内的才可预绑定
@@ -866,6 +933,9 @@ inline constexpr bool cpu_preparable_v<Binary<Op, L, R>>
 template <nn::BoolExpression C, nn::Expression T, nn::Expression E>
 inline constexpr bool cpu_preparable_v<Select<C, T, E>>
     = cpu_preparable_v<C> && cpu_preparable_v<T> && cpu_preparable_v<E>;
+// 归约指令：可预绑定 ⇔ 子表达式可预绑定（其自身归约由 cpu_prepare 负责）
+template <typename C, ExprOp Rop>
+inline constexpr bool cpu_preparable_v<ReduceRef<C, Rop>> = cpu_preparable_v<C>;
 
 // 默认：普通叶子 / 视图 / 索引叶子无需预绑定
 template <typename T>
@@ -902,6 +972,119 @@ template <nn::BoolExpression C, nn::Expression T, nn::Expression E>
 [[nodiscard]] inline Result<void> cpu_prepare(const MatmulRef& m, ComputeEngine& eng,
                                               std::size_t, std::size_t)
 { return m.prepare_cpu(eng); }
+
+// 归约视图：按输出槽算出行/列归约向量（槽内沿归约轴升序累加）
+template <ExprViewKind K>
+[[nodiscard]] inline Result<void> cpu_prepare(const ReduceViewRef<K>& r, ComputeEngine&,
+                                              std::size_t rows, std::size_t cols)
+{
+    if (r.v_ != nullptr)
+        return {};
+    if (!r.t.is_cpu())
+        return std::unexpected(Error{"dsl reduce-view prepare: input not on CPU"});
+    if (r.t.rows() != rows || r.t.cols() != cols)
+        return std::unexpected(Error{"dsl reduce-view prepare: shape mismatch"});
+
+    using R = ReduceViewRef<K>;
+    const auto s = r.t.cpu_matrix().span();
+    const Scalar init = R::reduces_max ? std::numeric_limits<Scalar>::lowest() : Scalar{0};
+    const std::size_t len = R::reduces_rows ? rows : cols;
+    r.vec_.assign(len, init);
+
+    const auto slot_kernel = [&](std::size_t slot) noexcept
+    {
+        Scalar a = init;
+        if constexpr (R::reduces_rows)
+            for (std::size_t c = 0; c < cols; ++c)
+                a = R::reduces_max ? std::max(a, s[slot * cols + c])
+                                   : a + s[slot * cols + c];
+        else
+            for (std::size_t rr = 0; rr < rows; ++rr)
+                a = R::reduces_max ? std::max(a, s[rr * cols + slot])
+                                   : a + s[rr * cols + slot];
+        r.vec_[slot] = a;
+    };
+    // 槽间独立（累加方向固定）→ 并行与串行逐字节一致，无需归并
+    if (rows * cols >= kDslParallelThreshold && len > 1)
+        nn::parallel_for_samples(len, slot_kernel);
+    else
+        for (std::size_t k = 0; k < len; ++k)
+            slot_kernel(k);
+
+    r.v_ = r.vec_.data();
+    return {};
+}
+
+// 归约指令：先递归备好子表达式，再按输出槽对子表达式求值并归约。
+// 槽内沿归约轴升序累加 → 与解释器 replay_prefix 逐字节一致。
+template <typename C, ExprOp Rop>
+[[nodiscard]] inline Result<void> cpu_prepare(const ReduceRef<C, Rop>& r, ComputeEngine& eng,
+                                              std::size_t rows, std::size_t cols)
+{
+    if (r.v_ != nullptr)
+        return {};
+    if (auto pr = cpu_prepare(r.child, eng, rows, cols); !pr)
+        return pr;
+
+    using R = ReduceRef<C, Rop>;
+    const Scalar init = R::reduces_max ? std::numeric_limits<Scalar>::lowest() : Scalar{0};
+    const std::size_t len = R::reduces_rows ? rows : cols;
+    r.vec_.assign(len, init);
+
+    const auto slot_kernel = [&](std::size_t slot) noexcept
+    {
+        Scalar a = init;
+        if constexpr (R::reduces_rows)
+            for (std::size_t c = 0; c < cols; ++c)
+            {
+                const Scalar v = eval_with_cols(r.child, slot * cols + c, cols);
+                a = R::reduces_max ? std::max(a, v) : a + v;
+            }
+        else
+            for (std::size_t rr = 0; rr < rows; ++rr)
+            {
+                const Scalar v = eval_with_cols(r.child, rr * cols + slot, cols);
+                a = R::reduces_max ? std::max(a, v) : a + v;
+            }
+        r.vec_[slot] = a;
+    };
+    if (rows * cols >= kDslParallelThreshold && len > 1)
+        nn::parallel_for_samples(len, slot_kernel);
+    else
+        for (std::size_t k = 0; k < len; ++k)
+            slot_kernel(k);
+
+    r.v_ = r.vec_.data();
+    return {};
+}
+
+// ── 归约向量原生形状输出（compute_reduce 专用）──────────────────────────
+// 根节点是"纯归约"时，输出就是归约向量本身：行归约 → (rows,1)，列归约 → (1,cols)。
+// 与 CpuEngine::eval_expr_reduce 的 shapes 约定一致。
+template <typename T> inline constexpr bool cpu_reduce_root_v = false;
+template <ExprViewKind K> inline constexpr bool cpu_reduce_root_v<ReduceViewRef<K>> = true;
+template <typename C, ExprOp Rop> inline constexpr bool cpu_reduce_root_v<ReduceRef<C, Rop>> = true;
+
+[[nodiscard]] inline Tensor copy_reduce_vector(const Scalar* v, bool reduces_rows,
+                                               std::size_t rows, std::size_t cols)
+{
+    Matrix out = reduces_rows ? Matrix::make_uninitialized(rows, 1)
+                              : Matrix::make_uninitialized(1, cols);
+    const std::size_t len = reduces_rows ? rows : cols;
+    for (std::size_t k = 0; k < len; ++k)
+        out.span()[k] = v[k];
+    return Tensor::from_matrix(std::move(out));
+}
+
+template <ExprViewKind K>
+[[nodiscard]] inline Tensor reduce_vector_tensor(const ReduceViewRef<K>& r,
+                                                 std::size_t rows, std::size_t cols)
+{ return copy_reduce_vector(r.v_, ReduceViewRef<K>::reduces_rows, rows, cols); }
+
+template <typename C, ExprOp Rop>
+[[nodiscard]] inline Tensor reduce_vector_tensor(const ReduceRef<C, Rop>& r,
+                                                 std::size_t rows, std::size_t cols)
+{ return copy_reduce_vector(r.v_, ReduceRef<C, Rop>::reduces_rows, rows, cols); }
 
 // ══════════════════════════════════════════════════════════════════════════
 // CPU：编译期模板直接求值（编译器内联 + SIMD 融合，等价手写循环）
@@ -946,14 +1129,16 @@ template <typename E>
         {
             if constexpr (nn::dsl::cpu_preparable_v<E>)
             {
-                // 可预绑定：先物化需要全局信息的节点（如 matmul C），
+                // 可预绑定：先物化需要全局信息的节点（如 matmul C、归约向量），
                 // 其余交编译期模板内联求值（同一个 eval_into_span 循环）。
-                if (auto r = cpu_prepare(e, eng, rows, cols); !r)
-                    return std::unexpected(r.error());
-                return eval_cpu(e, rows, cols);
+                // 预绑定只是**优化**：任何前置条件不满足（形状/设备不符等）就
+                // 回退解释器，与迁移前逐位一致，不引入正确性风险。
+                if (auto r = cpu_prepare(e, eng, rows, cols); r)
+                    return eval_cpu(e, rows, cols);
             }
-            // 含归约且暂不可预绑定：模板求值无法表达"全行/全列归约"，
-            // 折叠成 ExprSpec 走引擎 eval_expr（CPU 扩展语义处理归约视图/指令）
+            // 含归约且不可预绑定（或预绑定失败）：模板求值无法表达"全行/全列
+            // 归约"，折叠成 ExprSpec 走引擎 eval_expr（CPU 扩展语义处理归约
+            // 视图/指令）
             auto [spec, inputs] = to_expr_spec(e);
             if (auto v = validate_expr_spec(spec, inputs.size()); !v)
                 return std::unexpected(v.error());
@@ -1004,14 +1189,21 @@ template <typename E>
             return std::unexpected(Error{"dsl::compute_into: dst not on CPU"});
         if constexpr (nn::dsl::has_reduction_v<E>)
         {
-            if constexpr (nn::dsl::cpu_preparable_v<E>)
+            // 注意：只在"不含真归约"时才走预绑定路径。含真归约的表达式必须落到
+            // 下面的 eval_expr_into，以保持 compute_into 的对外契约
+            // （"仅支持逐元素表达式（无归约）"，见 ce_fusion_test）。
+            // matmul 段/网格索引不算真归约 → 仍走预绑定（Linear/Conv 反向的
+            // grad_w += matmul(...) 就是这一类）。
+            if constexpr (nn::dsl::cpu_preparable_v<E> && !nn::dsl::has_real_reduction_v<E>)
             {
                 // 可预绑定：物化需要全局信息的节点后，直接内联写进 dst
-                // （与上面纯逐元素分支同一循环结构；dst 与输入同 buffer 安全）
-                if (auto r = cpu_prepare(e, eng, dst.rows(), dst.cols()); !r)
-                    return std::unexpected(r.error());
-                eval_into_span(e, dst.cpu_matrix().span(), dst.cols());
-                return {};
+                // （与纯逐元素分支同一循环结构；dst 与输入同 buffer 安全）。
+                // 同 compute()：预绑定失败即回退，不引入正确性风险。
+                if (auto r = cpu_prepare(e, eng, dst.rows(), dst.cols()); r)
+                {
+                    eval_into_span(e, dst.cpu_matrix().span(), dst.cols());
+                    return {};
+                }
             }
             // 含归约：折叠成 ExprSpec 走引擎（与 compute() 的 CPU 分支一致）
             auto [spec, inputs] = to_expr_spec(e);
@@ -1058,6 +1250,17 @@ template <typename E>
          : (raxis == 1) ? Tensor::cpu(1, cols)
          : Tensor::cpu(rows, cols);
 #else
+    if (eng.device() == Device::CPU)
+    {
+        // 必须用 if constexpr：非归约根节点的 E 不能实例化 reduce_vector_tensor
+        if constexpr (nn::dsl::cpu_reduce_root_v<E> && nn::dsl::cpu_preparable_v<E>)
+        {
+            // 预绑定路径：根节点是纯归约 → 归约向量已算好，直接拷成
+            // (rows,1)/(1,cols)，不必经 ExprSpec 解释器。失败即回退。
+            if (auto r = cpu_prepare(e, eng, rows, cols); r)
+                return reduce_vector_tensor(e, rows, cols);
+        }
+    }
     auto [spec, inputs] = to_expr_spec(e);
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)
         return std::unexpected(v.error());
