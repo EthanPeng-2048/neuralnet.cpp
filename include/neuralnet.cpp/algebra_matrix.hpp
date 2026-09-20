@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <execution>
 #include <functional>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <ranges>
@@ -54,7 +55,16 @@ namespace nn
         using acc_type = acc<P>;  // F32: float（= element，现状）；F16: float（f32 累加）
 
     private:
-        std::vector<element> data_{};
+        // ── 存储：std::unique_ptr<element[]> + 显式长度 ──────────────────
+        // 为何不用 std::vector：vector 的"按尺寸构造"必然值初始化（写满一遍零），
+        // 而"输出会被完整覆盖"的路径（如 dsl::compute 的逐元素结果）不需要这一遍。
+        // 实测本机单线程写满 1.57MB 要 0.50ms（~3.2 GB/s，内存带宽受限），
+        // 是每个全尺寸中间量的纯浪费。std::make_unique_for_overwrite（C++20）
+        // 正是为"内存马上会被覆盖"设计。
+        // 规范 §3.1：不出现 new[]/delete[]/裸指针所有权 —— unique_ptr 是
+        // 规范推荐的替代；不穿透接口（storage 仅本类可见）。
+        std::unique_ptr<element[]> data_{};
+        std::size_t size_{0};
         std::size_t rows_{0};
         std::size_t cols_{0};
 
@@ -62,6 +72,15 @@ namespace nn
         {
             return row * cols_ + col;
         }
+
+        // 只分配、不初始化（元素值不确定；调用方必须保证写满后才读）
+        [[nodiscard]] static std::unique_ptr<element[]> allocate_(std::size_t n)
+        {
+            return n == 0 ? std::unique_ptr<element[]>{}
+                          : std::make_unique_for_overwrite<element[]>(n);
+        }
+        [[nodiscard]] const element *ptr() const noexcept { return data_.get(); }
+        [[nodiscard]] element *ptr() noexcept { return data_.get(); }
 
         static void require_same_shape(const MatrixT &lhs, const MatrixT &rhs, [[maybe_unused]] std::string_view message)
         {
@@ -74,49 +93,113 @@ namespace nn
     public:
         MatrixT() = default;
 
+        // 零填充构造（保持既有语义：默认构造出的矩阵全零）
         explicit MatrixT(std::size_t rows, std::size_t cols)
-            : data_(rows * cols), rows_(rows), cols_(cols) {}
+            : data_(allocate_(rows * cols)), size_(rows * cols), rows_(rows), cols_(cols)
+        {
+            if (size_ != 0)
+                std::fill_n(ptr(), size_, element{});
+        }
 
         // 从标量值初始化矩阵（host 标量为 f32；F16 实例构造时舍入到 f16）
         MatrixT(std::size_t rows, std::size_t cols, element value)
-            : data_(rows * cols, value), rows_(rows), cols_(cols) {}
+            : data_(allocate_(rows * cols)), size_(rows * cols), rows_(rows), cols_(cols)
+        {
+            if (size_ != 0)
+                std::fill_n(ptr(), size_, value);
+        }
 
-        // 拷贝/移动构造与赋值：使用默认实现（vector 已提供强异常安全保证）
-        MatrixT(const MatrixT &other) = default;
-        MatrixT(MatrixT &&other) noexcept = default;
-        MatrixT &operator=(const MatrixT &other) = default;
-        MatrixT &operator=(MatrixT &&other) noexcept = default;
+        // ── 未初始化构造（输出会被完整覆盖的路径专用）──────────────────────
+        // 语义契约：调用方必须在任何读取之前把**全部** size() 个元素写满。
+        // 用于把"分配 + 写满零 + 马上全覆盖"里的那一遍零写掉。
+        struct uninitialized_tag {};
+        MatrixT(std::size_t rows, std::size_t cols, uninitialized_tag)
+            : data_(allocate_(rows * cols)), size_(rows * cols), rows_(rows), cols_(cols) {}
+
+        [[nodiscard]] static MatrixT make_uninitialized(std::size_t rows, std::size_t cols)
+        {
+            return MatrixT(rows, cols, uninitialized_tag{});
+        }
+
+        // ── 拷贝（深拷贝）/ 移动（指针转移）────────────────────────────────
+        // 不能用默认实现：unique_ptr 不可拷贝，且默认移动会把 size_ 留在被移对象里
+        // （表现为"size 非零但 data 为空"的悬空视图）。
+        MatrixT(const MatrixT &other)
+            : data_(allocate_(other.size_)), size_(other.size_),
+              rows_(other.rows_), cols_(other.cols_)
+        {
+            if (size_ != 0)
+                std::copy_n(other.ptr(), size_, ptr());
+        }
+        MatrixT(MatrixT &&other) noexcept
+            : data_(std::move(other.data_)), size_(other.size_),
+              rows_(other.rows_), cols_(other.cols_)
+        {
+            other.size_ = 0;
+            other.rows_ = 0;
+            other.cols_ = 0;
+        }
+        MatrixT &operator=(const MatrixT &other)
+        {
+            if (this != &other)
+            {
+                MatrixT tmp(other);
+                *this = std::move(tmp);
+            }
+            return *this;
+        }
+        MatrixT &operator=(MatrixT &&other) noexcept
+        {
+            if (this != &other)
+            {
+                data_ = std::move(other.data_);
+                size_ = other.size_;
+                rows_ = other.rows_;
+                cols_ = other.cols_;
+                other.size_ = 0;
+                other.rows_ = 0;
+                other.cols_ = 0;
+            }
+            return *this;
+        }
         ~MatrixT() = default;
 
-        // ── 就地调整大小（复用已有内存） ──────────────────────────────────
+        // ── 就地调整大小（复用已有内存；新增部分零填充，与原 vector 语义一致）──
         void resize(std::size_t rows, std::size_t cols)
         {
             if (rows_ == rows && cols_ == cols) return; // 尺寸不变，零开销
+            const std::size_t n = rows * cols;
+            auto nd = allocate_(n);
+            if (nd && size_ != 0)
+                std::copy_n(ptr(), std::min(size_, n), nd.get());
+            if (nd && n > size_)
+                std::fill_n(nd.get() + size_, n - size_, element{});
+            data_ = std::move(nd);
+            size_ = n;
             rows_ = rows;
             cols_ = cols;
-            data_.resize(rows * cols);
         }
 
         // ── std::span 访问（C++20 现代接口，推荐使用） ────────────────────
         // 零开销抽象：编译后等价于裸指针 + 大小，可替代所有 data_ptr() 场景
         [[nodiscard]] std::span<const element> span() const
         {
-            return {data_.data(), data_.size()};
+            return {ptr(), size_};
         }
-        [[nodiscard]] std::span<element> span() noexcept { return {data_.data(), data_.size()}; }
+        [[nodiscard]] std::span<element> span() noexcept { return {ptr(), size_}; }
 
         // 访问器
         [[nodiscard]] constexpr std::size_t rows() const noexcept { return rows_; }
         [[nodiscard]] constexpr std::size_t cols() const noexcept { return cols_; }
-        [[nodiscard]] constexpr std::size_t size() const noexcept { return data_.size(); }
-        [[nodiscard]] constexpr bool empty() const noexcept { return data_.empty(); }
+        [[nodiscard]] constexpr std::size_t size() const noexcept { return size_; }
+        [[nodiscard]] constexpr bool empty() const noexcept { return size_ == 0; }
         [[nodiscard]] element at(std::size_t row, std::size_t col) const
         {
             if (row >= rows_ || col >= cols_)
             {
                 NN_ASSERT(false, "Matrix index out of range");
             }
-            return data_[index(row, col)];
+            return ptr()[index(row, col)];
         }
         void set_value(std::size_t row, std::size_t col, element value)
         {
@@ -124,10 +207,10 @@ namespace nn
             {
                 NN_ASSERT(false, "Matrix index out of range");
             }
-            data_[index(row, col)] = value;
+            ptr()[index(row, col)] = value;
         }
-        [[nodiscard]] constexpr element at_unchecked(std::size_t row, std::size_t col) const noexcept { return data_[index(row, col)]; } // 无校验
-        constexpr void set_value_unchecked(std::size_t row, std::size_t col, element value) noexcept { data_[index(row, col)] = value; } // 无校验
+        [[nodiscard]] element at_unchecked(std::size_t row, std::size_t col) const noexcept { return ptr()[index(row, col)]; } // 无校验
+        void set_value_unchecked(std::size_t row, std::size_t col, element value) noexcept { ptr()[index(row, col)] = value; } // 无校验
 
         // ── 转置（返回新矩阵） ─────────────────────────────────────────────
         [[nodiscard]] MatrixT transpose() const
@@ -801,7 +884,8 @@ namespace nn
         // 填充零
         void zero() noexcept
         {
-            std::fill(span().begin(), span().end(), 0.0);
+            if (size_ != 0)
+                std::fill_n(ptr(), size_, element{});
         }
 
         // ── 归约操作 ────────────────────────────────────────────────────
@@ -828,8 +912,6 @@ namespace nn
             auto out = result.span();
             const std::size_t C = cols_;
 
-            auto row_indices = std::views::iota(std::size_t{0}, rows_);
-
             auto process_row = [self, out, C, init,
                                 reduce_op = std::forward<ReduceOp>(reduce_op),
                                 transform_op = std::forward<TransformOp>(transform_op)](std::size_t r) noexcept {
@@ -840,7 +922,16 @@ namespace nn
                 out[r] = static_cast<element>(acc);
             };
 
-            nn::for_each(row_indices.begin(), row_indices.end(), process_row);
+            // 并行门控按**元素数**（R*C），与 broadcast_* 一致。
+            // 旧实现用 nn::for_each(row_indices)：它把"行数"当元素数与
+            // PARALLEL_THRESHOLD 比较 → 行数永远达不到 512K → **恒定串行**
+            // （见 docs/development/11 §R3）。改为按行分片。
+            // 每行独立累加、行内顺序不变 → 并行与串行逐字节一致（铁律 8）。
+            if (rows_ * cols_ >= PARALLEL_THRESHOLD && rows_ > 1)
+                nn::parallel_for_samples(rows_, process_row);
+            else
+                for (std::size_t r = 0; r < rows_; ++r)
+                    process_row(r);
             return result;
         }
 
