@@ -503,96 +503,69 @@ public:
         Tensor concat_out;  // (batch*H*d_k, seq)
         if (tpm->use_two_pass)
         {
-            // ── S7 IR 融合路径（M4-M6 → matmul 段 + 归约 + 普通 batched_matmul）──
-            //   m = rowmax(scale·Q·K^T + mask)        → (BH*seq, 1)（不物化 QK^T）
-            //   l = Σ_j exp(scale·Q·K^T + mask − m)   → (BH*seq, 1)
-            //   W = softmax 归一化权重（物化 (BH*seq, seq)，backward 复用）
-            //   O = W·V_t                              → (BH*seq, d_k)
-            
+            // ── 两趟式注意力（S7 IR 融合 + 单遍 Q·Kᵀ）─────────────────────
+            //   S = masked(scale·Q·K^T)               → (BH*seq, seq)，物化一遍
+            //   m = row_max(S)                        → (BH*seq, 1)
+            //   l = row_sum(exp(S − m))               → (BH*seq, 1)
+            //   W = exp(S − m)/l（在 S 上原地完成）    → (BH*seq, seq)，供 O = W·V_t
+            // 注意：S 是**瞬时**物化的（与旧实现里 W 的那份缓冲同形、同生命周期），
+            // 并非持久驻留；backward 仍按 P0-5 从 Q/K/m/l 重算 W。
             const bool use_slopes = use_alibi_mask_();
             const bool use_doc = use_doc_mask_();
-            // 掩码组合选择器：同一选择用于 m/l/W 三个表达式（结构一致）。
-            // 每个分支返回 Result<Tensor>（统一返回类型，内部表达式各异）。
-            const auto compute_m = [&]() -> Result<Tensor> {
-                if (use_slopes && use_doc)
-                    return dsl::compute_reduce(engine,
-                        dsl::row_reduce_max(masked_alibi_doc_(
-                            dsl::matmul(Q, K, true, false, BH), seq)),
-                        BH * seq, seq);
-                if (use_slopes)
-                    return dsl::compute_reduce(engine,
-                        dsl::row_reduce_max(masked_alibi_(
-                            dsl::matmul(Q, K, true, false, BH), seq)),
-                        BH * seq, seq);
-                if (use_doc)
-                    return dsl::compute_reduce(engine,
-                        dsl::row_reduce_max(masked_doc_(
-                            dsl::matmul(Q, K, true, false, BH), seq)),
-                        BH * seq, seq);
-                return dsl::compute_reduce(engine,
-                    dsl::row_reduce_max(masked_causal_(
-                        dsl::matmul(Q, K, true, false, BH), seq)),
-                    BH * seq, seq);
-            };
-            const auto compute_l = [&](const Tensor& m_t) -> Result<Tensor> {
-                if (use_slopes && use_doc)
-                    return dsl::compute_reduce(engine,
-                        dsl::row_reduce_sum(dsl::exp(masked_alibi_doc_(
-                            dsl::matmul(Q, K, true, false, BH), seq)
-                            - dsl::row_broadcast(m_t))),
-                        BH * seq, seq);
-                if (use_slopes)
-                    return dsl::compute_reduce(engine,
-                        dsl::row_reduce_sum(dsl::exp(masked_alibi_(
-                            dsl::matmul(Q, K, true, false, BH), seq)
-                            - dsl::row_broadcast(m_t))),
-                        BH * seq, seq);
-                if (use_doc)
-                    return dsl::compute_reduce(engine,
-                        dsl::row_reduce_sum(dsl::exp(masked_doc_(
-                            dsl::matmul(Q, K, true, false, BH), seq)
-                            - dsl::row_broadcast(m_t))),
-                        BH * seq, seq);
-                return dsl::compute_reduce(engine,
-                    dsl::row_reduce_sum(dsl::exp(masked_causal_(
-                        dsl::matmul(Q, K, true, false, BH), seq)
-                        - dsl::row_broadcast(m_t))),
-                    BH * seq, seq);
-            };
-            const auto compute_W = [&](const Tensor& m_t, const Tensor& l_t) -> Result<Tensor> {
+            // ── 得分矩阵 S = masked(scale·Q·K^T)：**只算一遍** ────────────
+            // 旧实现把同一份 Q·Kᵀ 折进 m / l / W 三个表达式，解释器于是把
+            // 全网格（BH*seq × seq）跑三遍（3 次 GEMM + 3 次逐元素解释）——
+            // 这是 CPU 上 MHA 的最大热点，也是 GPU 上白算的 Q·Kᵀ。
+            // 现在：S 物化一次 → m/l 交给引擎归约原语 → W 原地在 S 上完成。
+            //   m = row_max(S)                    （原语，row_reduce）
+            //   S ← exp(S − m)                    （DSL 纯逐元素，原地）
+            //   l = row_sum(S)                    （原语；此时 S 即未归一化权重）
+            //   S ← S / l                         （DSL 纯逐元素，原地）→ W
+            // 峰值内存不变：旧实现同样要在 forward 里物化 W（与 S 同形，均
+            // (BH*seq, seq)），此处只是把那份缓冲提前到 S 复用。
+            // 数值等价：exp(S−m)、行和与逐元素除法与旧表达式逐步同序，CPU 端
+            // 与旧路径逐字节一致（归约方向均为列升序）。
+            const auto build_scores = [&]() -> Result<Tensor> {
                 if (use_slopes && use_doc)
                     return dsl::compute(engine,
-                        dsl::exp(masked_alibi_doc_(
-                            dsl::matmul(Q, K, true, false, BH), seq)
-                            - dsl::row_broadcast(m_t)) / dsl::row_broadcast(l_t),
+                        masked_alibi_doc_(
+                            dsl::matmul(Q, K, true, false, BH), seq),
                         BH * seq, seq);
                 if (use_slopes)
                     return dsl::compute(engine,
-                        dsl::exp(masked_alibi_(
-                            dsl::matmul(Q, K, true, false, BH), seq)
-                            - dsl::row_broadcast(m_t)) / dsl::row_broadcast(l_t),
+                        masked_alibi_(
+                            dsl::matmul(Q, K, true, false, BH), seq),
                         BH * seq, seq);
                 if (use_doc)
                     return dsl::compute(engine,
-                        dsl::exp(masked_doc_(
-                            dsl::matmul(Q, K, true, false, BH), seq)
-                            - dsl::row_broadcast(m_t)) / dsl::row_broadcast(l_t),
+                        masked_doc_(
+                            dsl::matmul(Q, K, true, false, BH), seq),
                         BH * seq, seq);
                 return dsl::compute(engine,
-                    dsl::exp(masked_causal_(
-                        dsl::matmul(Q, K, true, false, BH), seq)
-                        - dsl::row_broadcast(m_t)) / dsl::row_broadcast(l_t),
+                    masked_causal_(
+                        dsl::matmul(Q, K, true, false, BH), seq),
                     BH * seq, seq);
             };
-            // m = row_max(scale·Q·K^T + mask)
-            auto m = compute_m();
+            auto S_res = build_scores();
+            if (!S_res) return std::unexpected(S_res.error());
+            Tensor S = std::move(*S_res);
+
+            // m = row_max(S) → (BH*seq, 1)
+            auto m = engine.row_reduce_max(S);
             if (!m) return std::unexpected(m.error());
-            // l = row_sum(exp(scale·Q·K^T + mask − m))
-            auto l = compute_l(*m);
+            // S ← exp(S − m)（未归一化权重；原地）
+            auto wp = dsl::compute_into(engine,
+                dsl::exp(dsl::leaf(S) - dsl::row_broadcast(*m)), S);
+            if (!wp) return std::unexpected(wp.error());
+            // l = row_sum(S) → (BH*seq, 1)
+            auto l = engine.row_reduce_sum(S);
             if (!l) return std::unexpected(l.error());
-            // W = exp(scale·Q·K^T + mask − m) / l（物化，backward 复用）
-            auto W = compute_W(*m, *l);
-            if (!W) return std::unexpected(W.error());
+            // S ← S / l → W（softmax 归一化权重；原地）
+            auto wn = dsl::compute_into(engine,
+                dsl::leaf(S) / dsl::row_broadcast(*l), S);
+            if (!wn) return std::unexpected(wn.error());
+            Tensor W = std::move(S);
+            if (!W.valid()) return std::unexpected(Error{"attention: W invalid"});
             // V 需 (BH*seq, d_k) 布局：V (BH*d_k, seq) 是 per-batch (d_k, seq)，
             // 按 batch 转置：transpose → (seq, BH*d_k) → rearrange_3d → (BH*seq, d_k)
             auto V_T_full = engine.transpose(V);
@@ -600,7 +573,7 @@ public:
             auto V_t = engine.rearrange_3d(*V_T_full, seq, BH, d_k_, false);
             if (!V_t) return std::unexpected(V_t.error());
             // O = W × V_t（普通 batched_matmul 原语）
-            auto O_t = engine.batched_matmul(*W, *V_t, BH, false, false);
+            auto O_t = engine.batched_matmul(W, *V_t, BH, false, false);
             if (!O_t) return std::unexpected(O_t.error());
             // O_t: (BH*seq, d_k) → 按 batch 转置回 (BH*d_k, seq) 供后续 rearrange：
             //   transpose → (d_k, BH*seq) → rearrange_3d(d_k, BH, seq) → (BH*d_k, seq)

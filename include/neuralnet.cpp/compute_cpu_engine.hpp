@@ -34,6 +34,14 @@ namespace nn
 // ══════════════════════════════════════════════════════════════════════════
 // CpuEngine — CPU 计算引擎
 // ══════════════════════════════════════════════════════════════════════════
+
+// 解释器并行门控（eval_expr_impl / 归约预计算共用）。
+// 解释执行的 per-element 成本比向量化逐元素高约一个数量级
+// （docs/development/11 §2.4：解释器 vs 等价串行标量 ~9x），而并行区启动
+// 开销约 100µs，因此门控远低于 nn::PARALLEL_THRESHOLD(524288)：
+// 65536 元素 × ~10ns/element ≈ 0.65ms ≫ 0.1ms，稳赚。
+inline constexpr std::size_t kExprParallelThreshold = 65536;
+
 class CpuEngine final : public ComputeEngine
 {
 public:
@@ -1243,7 +1251,8 @@ public:
         UnaryOp op, const Tensor& A) override
     {
         const Matrix& m = A.cpu_matrix();
-        Matrix result(m.rows(), m.cols());
+        // compute::apply 会写满全部元素 → 未初始化构造，省掉一遍全尺寸零写
+        Matrix result = Matrix::make_uninitialized(m.rows(), m.cols());
         ConstSpan in = m.span();
         Span out = result.span();
 
@@ -1269,7 +1278,7 @@ public:
 
         const Matrix& ma = A.cpu_matrix();
         const Matrix& mb = B.cpu_matrix();
-        Matrix result(ma.rows(), ma.cols());
+        Matrix result = Matrix::make_uninitialized(ma.rows(), ma.cols());
         ConstSpan a = ma.span();
         ConstSpan b = mb.span();
         Span out = result.span();
@@ -1291,7 +1300,7 @@ public:
         BinaryOp op, const Tensor& A, Scalar s, bool scalar_first) override
     {
         const Matrix& m = A.cpu_matrix();
-        Matrix result(m.rows(), m.cols());
+        Matrix result = Matrix::make_uninitialized(m.rows(), m.cols());
         ConstSpan a = m.span();
         Span out = result.span();
 
@@ -1338,7 +1347,8 @@ public:
 
         const Matrix& ma = A.cpu_matrix();
         const Matrix& mt = then_t.cpu_matrix();
-        Matrix result(ma.rows(), ma.cols());
+        // 每个分支都写满 n 个元素 → 未初始化构造
+        Matrix result = Matrix::make_uninitialized(ma.rows(), ma.cols());
         auto a = ma.span();
         auto t = mt.span();
         auto out = result.span();
@@ -1389,7 +1399,9 @@ public:
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols) override
     {
-        Tensor out = Tensor::cpu(rows, cols);
+        // 输出会被下面的输出循环完整覆盖（每个下标恰好写一次）→ 未初始化构造，
+        // 省掉一遍全尺寸零写（见 Tensor::cpu_uninitialized）
+        Tensor out = Tensor::cpu_uninitialized(rows, cols);
         auto r = eval_expr_impl(spec, inputs, rows, cols, /*vector_out=*/false, out);
         if (!r) return std::unexpected(r.error());
         return out;
@@ -1407,7 +1419,9 @@ public:
     {
         const bool vec_is_row =
             (expr_spec_reduce_axis(canonicalize_expr_spec(spec)) == 0);
-        Tensor out = vec_is_row ? Tensor::cpu(rows, 1) : Tensor::cpu(1, cols);
+        // 归约向量输出同样被完整写满 → 未初始化构造
+        Tensor out = vec_is_row ? Tensor::cpu_uninitialized(rows, 1)
+                                : Tensor::cpu_uninitialized(1, cols);
         auto r = eval_expr_impl(spec, inputs, rows, cols, /*vector_out=*/true, out);
         if (!r) return std::unexpected(r.error());
         return out;
@@ -1560,6 +1574,9 @@ public:
 
         // ── 归约视图预计算：每行/每列一个标量，供广播读取 ──────────────
         // 仅在 views[k] 为归约视图时填充 view_reduce[k]（长度 rows 或 cols）。
+        // 每个输出槽（行或列）的累加完全独立、且累加方向固定（行→沿 c 升序，
+        // 列→沿 r 升序）→ 按输出槽分片并行与串行**逐字节一致**（铁律 8），
+        // 无需归并。
         std::vector<std::vector<Scalar>> view_reduce(inputs.size());
         for (std::size_t k = 0; k < inputs.size(); ++k)
         {
@@ -1574,19 +1591,36 @@ public:
             const std::size_t len = is_row ? rows : cols;
             std::vector<Scalar>& acc = view_reduce[k];
             acc.assign(len, is_max ? std::numeric_limits<Scalar>::lowest() : Scalar{0});
+
             if (is_row)
             {
-                for (std::size_t r = 0; r < rows; ++r)
+                auto kernel = [&acc, &s, is_max, cols = cols](std::size_t r) noexcept
+                {
+                    Scalar a = is_max ? std::numeric_limits<Scalar>::lowest() : Scalar{0};
                     for (std::size_t c = 0; c < cols; ++c)
-                        acc[r] = is_max ? std::max(acc[r], s[r * cols + c])
-                                        : acc[r] + s[r * cols + c];
+                        a = is_max ? std::max(a, s[r * cols + c]) : a + s[r * cols + c];
+                    acc[r] = a;
+                };
+                if (rows * cols >= kExprParallelThreshold && rows > 1)
+                    nn::parallel_for_samples(rows, kernel);
+                else
+                    for (std::size_t r = 0; r < rows; ++r)
+                        kernel(r);
             }
             else
             {
-                for (std::size_t c = 0; c < cols; ++c)
+                auto kernel = [&acc, &s, is_max, cols = cols, rows = rows](std::size_t c) noexcept
+                {
+                    Scalar a = is_max ? std::numeric_limits<Scalar>::lowest() : Scalar{0};
                     for (std::size_t r = 0; r < rows; ++r)
-                        acc[c] = is_max ? std::max(acc[c], s[r * cols + c])
-                                        : acc[c] + s[r * cols + c];
+                        a = is_max ? std::max(a, s[r * cols + c]) : a + s[r * cols + c];
+                    acc[c] = a;
+                };
+                if (rows * cols >= kExprParallelThreshold && cols > 1)
+                    nn::parallel_for_samples(cols, kernel);
+                else
+                    for (std::size_t c = 0; c < cols; ++c)
+                        kernel(c);
             }
         }
 
@@ -1744,11 +1778,12 @@ public:
 
             // 逐元素重放 [0, ri) 前缀（跳过归约指令，Reduce 操作数读已完整向量），
             // 求 R.a 的值并累加——归约指令的源允许引用更早归约结果。
-            for (std::size_t i = 0; i < n; ++i)
+            //
+            // 并行化：**每个输出槽独立累加**（行归约→按行；列归约→按列），槽内
+            // 沿归约轴的累加顺序与串行完全一致 → 结果逐字节相同（铁律 8），
+            // 不需要 per-thread 局部累加器与归并。
+            auto replay_prefix = [&, ri](std::size_t r, std::size_t c) -> Scalar
             {
-                const std::size_t r = i / cols;
-                const std::size_t c = i % cols;
-
                 Scalar regs[EXPR_MAX_REGS] = {};
                 const auto eval_op = [&](const ExprOperand& op) -> Scalar
                 {
@@ -1810,11 +1845,44 @@ public:
                     }
                 }
 
-                const Scalar v = eval_op(R.a);
-                if (is_col)
-                    acc[c] = is_max ? std::max(acc[c], v) : acc[c] + v;
+                return eval_op(R.a);
+            };
+
+            if (is_col)
+            {
+                auto col_kernel = [&](std::size_t c) noexcept
+                {
+                    Scalar a = is_max ? std::numeric_limits<Scalar>::lowest() : Scalar{0};
+                    for (std::size_t r = 0; r < rows; ++r)
+                    {
+                        const Scalar v = replay_prefix(r, c);
+                        a = is_max ? std::max(a, v) : a + v;
+                    }
+                    acc[c] = a;
+                };
+                if (n >= kExprParallelThreshold && cols > 1)
+                    nn::parallel_for_samples(cols, col_kernel);
                 else
-                    acc[r] = is_max ? std::max(acc[r], v) : acc[r] + v;
+                    for (std::size_t c = 0; c < cols; ++c)
+                        col_kernel(c);
+            }
+            else
+            {
+                auto row_kernel = [&](std::size_t r) noexcept
+                {
+                    Scalar a = is_max ? std::numeric_limits<Scalar>::lowest() : Scalar{0};
+                    for (std::size_t c = 0; c < cols; ++c)
+                    {
+                        const Scalar v = replay_prefix(r, c);
+                        a = is_max ? std::max(a, v) : a + v;
+                    }
+                    acc[r] = a;
+                };
+                if (n >= kExprParallelThreshold && rows > 1)
+                    nn::parallel_for_samples(rows, row_kernel);
+                else
+                    for (std::size_t r = 0; r < rows; ++r)
+                        row_kernel(r);
             }
         }
 
@@ -1969,21 +2037,37 @@ public:
                     }
                 }
             }
-            for (std::size_t k = 0; k < len; ++k)
+            // 向量输出槽数多时（如 BH*seq 很大）也并行：槽间独立。
+            if (len >= kExprParallelThreshold && len > 1)
             {
-                const std::size_t r = vec_is_row ? k : 0;
-                const std::size_t c = vec_is_row ? 0 : k;
-                o[k] = eval_element(r, c);
+                auto slot_kernel = [&](std::size_t k) noexcept
+                {
+                    const std::size_t r = vec_is_row ? k : 0;
+                    const std::size_t c = vec_is_row ? 0 : k;
+                    o[k] = eval_element(r, c);
+                };
+                nn::parallel_for_samples(len, slot_kernel);
+            }
+            else
+            {
+                for (std::size_t k = 0; k < len; ++k)
+                {
+                    const std::size_t r = vec_is_row ? k : 0;
+                    const std::size_t c = vec_is_row ? 0 : k;
+                    o[k] = eval_element(r, c);
+                }
             }
             return {};
         }
 
         // ── 广播输出（常规 eval_expr）：每元素求值，输出 (rows, cols) ──
         // 逐元素无跨元素依赖（归约/matmul 段均已预计算且此处只读）→ 并行与
-        // 串行逐字节一致；用与其他逐元素路径相同的 PARALLEL_THRESHOLD 门控。
-        auto indices = std::views::iota(std::size_t{0}, n);
-        nn::for_each(indices.begin(), indices.end(),
-            [&](std::size_t i)
+        // 串行逐字节一致。门控用解释器自己的阈值 kExprParallelThreshold
+        // （远低于 PARALLEL_THRESHOLD）：解释执行 per-element 成本高一个数量级，
+        // 且典型层形状（如 768×512=393216）在旧门控下根本不并行。
+        if (n >= kExprParallelThreshold)
+        {
+            auto elem_kernel = [&](std::size_t i) noexcept
             {
                 const std::size_t r = i / cols;
                 const std::size_t c = i % cols;
@@ -1994,7 +2078,23 @@ public:
                     return;
                 }
                 out[i] = eval_element(r, c);
-            });
+            };
+            nn::parallel_for_samples(n, elem_kernel);
+        }
+        else
+        {
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                const std::size_t r = i / cols;
+                const std::size_t c = i % cols;
+                if (last_is_reduce)
+                {
+                    out[i] = reduce_vec[last.dst][reduce_axis[last.dst] ? c : r];
+                    continue;
+                }
+                out[i] = eval_element(r, c);
+            }
+        }
 
         return {};
     }

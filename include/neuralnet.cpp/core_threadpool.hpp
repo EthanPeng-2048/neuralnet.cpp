@@ -113,10 +113,21 @@ namespace nn
         // 等待方（wait_for_latch 的无超时 wait / worker 主循环）都挂在
         // condition_ 上，latch 归零必须通知，否则等待者会永久睡眠。
         // 用 notify_all：等待者可能同时包含调用者与空闲 worker。
+        //
+        // ⚠ 必须持 queue_mutex_ 再 notify（丢唤醒 / lost wakeup 修复）：
+        // wait_for_latch 用 wait(lock, [&]{ return latch == 0; }) 等待，谓词
+        // 在同一把锁下求值。若归零+notify 不持锁，就会出现
+        //   等待者判谓词=false → 通知者置零并 notify（此刻无注册等待者，信号丢失）
+        //   → 等待者真正进入 wait() → 永久阻塞
+        // 空并行区压测（build/perfprobe/probe_pool2.cpp，32 核）实测：不持锁
+        // 数万次 region 内必死锁；持锁后 3×50000 次稳定通过。
         void finish_chunk(std::atomic<int>& latch) noexcept
         {
             if (latch.fetch_sub(1, std::memory_order_release) == 1)
+            {
+                std::lock_guard lock(queue_mutex_);
                 condition_.notify_all();
+            }
         }
 
         // ── work-stealing 等待：调用者不空转，帮忙处理队列任务 ─────────
