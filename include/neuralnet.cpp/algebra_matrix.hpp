@@ -408,26 +408,42 @@ namespace nn
                 const std::size_t j_end = std::min(j_start + BLOCK_SIZE, N);
                 for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE)
                 {
-                    const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
-                    const std::size_t k_len = k_end - k_start;
+                    const std::size_t k_len = std::min(BLOCK_SIZE, K - k_start);
                     const std::size_t j_len = j_end - j_start;
-                    std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_block{};
-                    for (std::size_t jj = 0; jj < j_len; ++jj)
-                        for (std::size_t kk = 0; kk < k_len; ++kk)
-                            b_block[jj * k_len + kk] = bt[(j_start + jj) * K + (k_start + kk)];
-                    const auto b_block_span = std::span<const element>(b_block.data(), k_len * j_len);
-                    for (std::size_t i = i_start; i < i_end; ++i)
-                    {
-                        const auto a_row = a.subspan(i * K + k_start);
-                        auto r_row = r.subspan(i * N + j_start);
+                    // B^T 打包成 k-major（固定 kk 时 j 连续）：
+                    //   b_pack[kk * j_len + j] = bt[(j_start + j) * K + (k_start + kk)]
+                    std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_pack{};
+                    for (std::size_t kk = 0; kk < k_len; ++kk)
                         for (std::size_t j = 0; j < j_len; ++j)
+                            b_pack[kk * j_len + j] = bt[(j_start + j) * K + (k_start + kk)];
+
+                    for (std::size_t i0 = i_start; i0 < i_end; i0 += MK_NI)
+                    {
+                        const std::size_t ni = std::min(MK_NI, i_end - i0);
+                        const element *ap = a.data() + i0 * K + k_start;
+                        for (std::size_t j0 = 0; j0 < j_len; j0 += MK_RB)
                         {
-                            const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                            acc_type sum = acc_type{0};
-                            NN_VECTORIZE_PRAGMA
-                            for (std::size_t kk = 0; kk < k_len; ++kk)
-                                sum += static_cast<acc_type>(a_row[kk]) * static_cast<acc_type>(b_col[kk]);
-                            r_row[j] += static_cast<element>(sum);
+                            const std::size_t nj = std::min(MK_RB, j_len - j0);
+                            element *rp = r.data() + i0 * N + j_start + j0;
+                            if (ni == MK_NI && nj == MK_RB && k_len == BLOCK_SIZE)
+                            {
+                                gemm_microkernel_<MK_NI>(ap, K, b_pack.data() + j0, j_len,
+                                                         rp, N);
+                            }
+                            else
+                            {
+                                // 尾块：kk 在最内层 → 归约可向量化
+                                for (std::size_t ii = 0; ii < ni; ++ii)
+                                    for (std::size_t jj = 0; jj < nj; ++jj)
+                                    {
+                                        acc_type sum = acc_type{0};
+                                        NN_VECTORIZE_PRAGMA
+                                        for (std::size_t kk = 0; kk < k_len; ++kk)
+                                            sum += static_cast<acc_type>(ap[ii * K + kk])
+                                                 * static_cast<acc_type>(b_pack[kk * j_len + j0 + jj]);
+                                        rp[ii * N + jj] += static_cast<element>(sum);
+                                    }
+                            }
                         }
                     }
                 }
@@ -467,31 +483,49 @@ namespace nn
                 const std::size_t j_end = std::min(j_start + BLOCK_SIZE, N);
                 for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE)
                 {
-                    const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
-                    const std::size_t k_len = k_end - k_start;
+                    const std::size_t k_len = std::min(BLOCK_SIZE, K - k_start);
                     const std::size_t j_len = j_end - j_start;
                     const std::size_t i_len = i_end - i_start;
-                    std::array<element, BLOCK_SIZE * BLOCK_SIZE> a_block{};
+                    // A 存储为 (K, M)：按 (i, k) 打包成行内 k 连续的块，
+                    // 微内核以 k_len 为行步长读它（避免 stride=a_cols 的跨行访问）
+                    std::array<element, BLOCK_SIZE * BLOCK_SIZE> a_pack{};
                     for (std::size_t ii = 0; ii < i_len; ++ii)
                         for (std::size_t kk = 0; kk < k_len; ++kk)
-                            a_block[ii * k_len + kk] = a[(k_start + kk) * a_cols + (i_start + ii)];
-                    std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_block{};
-                    for (std::size_t jj = 0; jj < j_len; ++jj)
-                        for (std::size_t kk = 0; kk < k_len; ++kk)
-                            b_block[jj * k_len + kk] = b[(k_start + kk) * b_cols + (j_start + jj)];
-                    const auto b_block_span = std::span<const element>(b_block.data(), k_len * j_len);
-                    for (std::size_t i = 0; i < i_len; ++i)
-                    {
-                        const auto a_row = std::span<const element>(a_block.data() + i * k_len, k_len);
-                        auto r_row = r.subspan((i_start + i) * N + j_start);
+                            a_pack[ii * k_len + kk] = a[(k_start + kk) * a_cols + (i_start + ii)];
+                    // B 打包成 k-major（固定 kk 时 j 连续）
+                    std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_pack{};
+                    for (std::size_t kk = 0; kk < k_len; ++kk)
                         for (std::size_t j = 0; j < j_len; ++j)
+                            b_pack[kk * j_len + j] = b[(k_start + kk) * b_cols + (j_start + j)];
+
+                    for (std::size_t ii0 = 0; ii0 < i_len; ii0 += MK_NI)
+                    {
+                        const std::size_t ni = std::min(MK_NI, i_len - ii0);
+                        const element *ap = a_pack.data() + ii0 * k_len;
+                        element *rbase = r.data() + (i_start + ii0) * N + j_start;
+                        for (std::size_t j0 = 0; j0 < j_len; j0 += MK_RB)
                         {
-                            const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                            acc_type sum = acc_type{0};
-                            NN_VECTORIZE_PRAGMA
-                            for (std::size_t kk = 0; kk < k_len; ++kk)
-                                sum += static_cast<acc_type>(a_row[kk]) * static_cast<acc_type>(b_col[kk]);
-                            r_row[j] += static_cast<element>(sum);
+                            const std::size_t nj = std::min(MK_RB, j_len - j0);
+                            element *rp = rbase + j0;
+                            if (ni == MK_NI && nj == MK_RB && k_len == BLOCK_SIZE)
+                            {
+                                gemm_microkernel_<MK_NI>(ap, k_len, b_pack.data() + j0, j_len,
+                                                         rp, N);
+                            }
+                            else
+                            {
+                                // 尾块：kk 在最内层 → 归约可向量化
+                                for (std::size_t ii = 0; ii < ni; ++ii)
+                                    for (std::size_t jj = 0; jj < nj; ++jj)
+                                    {
+                                        acc_type sum = acc_type{0};
+                                        NN_VECTORIZE_PRAGMA
+                                        for (std::size_t kk = 0; kk < k_len; ++kk)
+                                            sum += static_cast<acc_type>(ap[ii * k_len + kk])
+                                                 * static_cast<acc_type>(b_pack[kk * j_len + j0 + jj]);
+                                        rp[ii * N + jj] += static_cast<element>(sum);
+                                    }
+                            }
                         }
                     }
                 }
@@ -530,6 +564,9 @@ namespace nn
         // 
         // 维度要求：this=(M,K), b_trans=(N,K) → result=(M,N)
         // 即 C[m][n] = Σ_k A[m][k] * B[n][k]
+        // ── 矩阵乘法（B 转置）到预分配缓冲区 ─────────────────────────
+        // result = this * B^T，其中 B 存储为 (N, K) 行主序；C[m][n] = Σ_k A[m][k] * B[n][k]。
+        // 委托给 span 版内核：GEMM 内核只保留一份，避免两处实现漂移。
         void multiply_transposed_to(MatrixT &result, const MatrixT &b_trans) const
         {
             NN_ASSERT(&result != this && &result != &b_trans, "multiply_transposed_to: self-referencing not supported");
@@ -539,91 +576,9 @@ namespace nn
             const std::size_t N = b_trans.rows_;
             result.resize(M, N);
             if (M == 0 || N == 0 || K == 0) return;
-
             result.zero();
-
-            const auto a = span();
-            const auto bt = b_trans.span();
-            auto r = result.span();
-
-            const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
-            const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
-            const auto n_blocks = i_blocks * j_blocks;
-
-            if (n_blocks <= 1)
-            {
-                const std::size_t i_start = 0, i_end = M;
-                const std::size_t j_start = 0, j_end = N;
-                for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE)
-                {
-                    const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
-                    const std::size_t k_len = k_end - k_start;
-                    const std::size_t j_len = j_end - j_start;
-                    // B^T 块加载：B[n][k] 从 bt[n * K + k] 读取
-                    std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_block{};
-                    for (std::size_t jj = 0; jj < j_len; ++jj)
-                        for (std::size_t kk = 0; kk < k_len; ++kk)
-                            b_block[jj * k_len + kk] = bt[(j_start + jj) * K + (k_start + kk)];
-                    const auto b_block_span = std::span<const element>(b_block.data(), k_len * j_len);
-                    for (std::size_t i = i_start; i < i_end; ++i)
-                    {
-                        const auto a_row = a.subspan(i * K + k_start);
-                        auto r_row = r.subspan(i * N + j_start);
-                        for (std::size_t j = 0; j < j_len; ++j)
-                        {
-                            const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                            acc_type sum = acc_type{0};
-                            NN_VECTORIZE_PRAGMA
-                            for (std::size_t kk = 0; kk < k_len; ++kk)
-                                sum += static_cast<acc_type>(a_row[kk]) * static_cast<acc_type>(b_col[kk]);
-                            r_row[j] += static_cast<element>(sum);
-                        }
-                    }
-                }
-            }
-            else
-            {
-                auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
-                nn::parallel_for_blocks(
-                    block_indices.begin(), block_indices.end(),
-                    [a, bt, r, M, N, K, j_blocks](std::size_t block_idx) noexcept
-                    {
-                        const std::size_t i_block = block_idx / j_blocks;
-                        const std::size_t j_block = block_idx % j_blocks;
-                        const std::size_t i_start = i_block * BLOCK_SIZE;
-                        const std::size_t i_end = std::min(i_start + BLOCK_SIZE, M);
-                        const std::size_t j_start = j_block * BLOCK_SIZE;
-                        const std::size_t j_end = std::min(j_start + BLOCK_SIZE, N);
-
-                        for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE)
-                        {
-                            const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
-                            const std::size_t k_len = k_end - k_start;
-                            const std::size_t j_len = j_end - j_start;
-
-                            std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_block{};
-                            for (std::size_t jj = 0; jj < j_len; ++jj)
-                                for (std::size_t kk = 0; kk < k_len; ++kk)
-                                    b_block[jj * k_len + kk] = bt[(j_start + jj) * K + (k_start + kk)];
-                            const auto b_block_span = std::span<const element>(b_block.data(), k_len * j_len);
-
-                            for (std::size_t i = i_start; i < i_end; ++i)
-                            {
-                                const auto a_row = a.subspan(i * K + k_start);
-                                auto r_row = r.subspan(i * N + j_start);
-                                for (std::size_t j = 0; j < j_len; ++j)
-                                {
-                                    const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                                    acc_type sum = acc_type{0};
-                                    NN_VECTORIZE_PRAGMA
-                                    for (std::size_t kk = 0; kk < k_len; ++kk)
-                                        sum += static_cast<acc_type>(a_row[kk]) * static_cast<acc_type>(b_col[kk]);
-                                    r_row[j] += static_cast<element>(sum);
-                                }
-                            }
-                        }
-                    });
-            }
+            multiply_transposed_to_span(result.span(), M, N, span(), M, K,
+                                        b_trans.span(), N, K);
         }
 
         // ── 矩阵乘法（A 转置）到预分配缓冲区 ─────────────────────────
@@ -632,6 +587,7 @@ namespace nn
         //
         // 维度要求：this=(K,M), b=(K,N) → result=(M,N)
         // 即 C[m][n] = Σ_k A[k][m] * B[k][n]
+        // 委托给 span 版内核：GEMM 内核只保留一份，避免两处实现漂移。
         void transpose_multiply_to(MatrixT &result, const MatrixT &b) const
         {
             NN_ASSERT(&result != this && &result != &b, "transpose_multiply_to: self-referencing not supported");
@@ -641,108 +597,9 @@ namespace nn
             const std::size_t N = b.cols_;
             result.resize(M, N);
             if (M == 0 || N == 0 || K == 0) return;
-
             result.zero();
-
-            const auto a = span();  // this stored as (K, M)
-            const auto b_data = b.span();  // b stored as (K, N)
-            auto r = result.span();
-
-            const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
-            const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
-            const auto n_blocks = i_blocks * j_blocks;
-
-            if (n_blocks <= 1)
-            {
-                const std::size_t i_start = 0, i_end = M;
-                const std::size_t j_start = 0, j_end = N;
-                for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE)
-                {
-                    const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
-                    const std::size_t k_len = k_end - k_start;
-                    const std::size_t j_len = j_end - j_start;
-                    const std::size_t i_len = i_end - i_start;
-
-                    // A^T 块加载：A^T[m][k] = A[k][m] 从 a[k * M + m] 读取
-                    std::array<element, BLOCK_SIZE * BLOCK_SIZE> a_block{};
-                    for (std::size_t ii = 0; ii < i_len; ++ii)
-                        for (std::size_t kk = 0; kk < k_len; ++kk)
-                            a_block[ii * k_len + kk] = a[(k_start + kk) * M + (i_start + ii)];
-
-                    // B 块加载：B[k][n] 从 b_data[k * N + n] 读取
-                    std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_block{};
-                    for (std::size_t jj = 0; jj < j_len; ++jj)
-                        for (std::size_t kk = 0; kk < k_len; ++kk)
-                            b_block[jj * k_len + kk] = b_data[(k_start + kk) * N + (j_start + jj)];
-                    const auto b_block_span = std::span<const element>(b_block.data(), k_len * j_len);
-
-                    for (std::size_t i = 0; i < i_len; ++i)
-                    {
-                        const auto a_row = std::span<const element>(a_block.data() + i * k_len, k_len);
-                        auto r_row = r.subspan((i_start + i) * N + j_start);
-                        for (std::size_t j = 0; j < j_len; ++j)
-                        {
-                            const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                            acc_type sum = acc_type{0};
-                            NN_VECTORIZE_PRAGMA
-                            for (std::size_t kk = 0; kk < k_len; ++kk)
-                                sum += static_cast<acc_type>(a_row[kk]) * static_cast<acc_type>(b_col[kk]);
-                            r_row[j] += static_cast<element>(sum);
-                        }
-                    }
-                }
-            }
-            else
-            {
-                auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
-                nn::parallel_for_blocks(
-                    block_indices.begin(), block_indices.end(),
-                    [a, b_data, r, M, N, K, j_blocks](std::size_t block_idx) noexcept
-                    {
-                        const std::size_t i_block = block_idx / j_blocks;
-                        const std::size_t j_block = block_idx % j_blocks;
-                        const std::size_t i_start = i_block * BLOCK_SIZE;
-                        const std::size_t i_end = std::min(i_start + BLOCK_SIZE, M);
-                        const std::size_t j_start = j_block * BLOCK_SIZE;
-                        const std::size_t j_end = std::min(j_start + BLOCK_SIZE, N);
-                        const std::size_t i_len = i_end - i_start;
-
-                        for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE)
-                        {
-                            const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
-                            const std::size_t k_len = k_end - k_start;
-                            const std::size_t j_len = j_end - j_start;
-
-                            // A^T 块加载
-                            std::array<element, BLOCK_SIZE * BLOCK_SIZE> a_block{};
-                            for (std::size_t ii = 0; ii < i_len; ++ii)
-                                for (std::size_t kk = 0; kk < k_len; ++kk)
-                                    a_block[ii * k_len + kk] = a[(k_start + kk) * M + (i_start + ii)];
-
-                            // B 块加载
-                            std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_block{};
-                            for (std::size_t jj = 0; jj < j_len; ++jj)
-                                for (std::size_t kk = 0; kk < k_len; ++kk)
-                                    b_block[jj * k_len + kk] = b_data[(k_start + kk) * N + (j_start + jj)];
-                            const auto b_block_span = std::span<const element>(b_block.data(), k_len * j_len);
-
-                            for (std::size_t i = 0; i < i_len; ++i)
-                            {
-                                const auto a_row = std::span<const element>(a_block.data() + i * k_len, k_len);
-                                auto r_row = r.subspan((i_start + i) * N + j_start);
-                                for (std::size_t j = 0; j < j_len; ++j)
-                                {
-                                    const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                                    acc_type sum = acc_type{0};
-                                    NN_VECTORIZE_PRAGMA
-                                    for (std::size_t kk = 0; kk < k_len; ++kk)
-                                        sum += static_cast<acc_type>(a_row[kk]) * static_cast<acc_type>(b_col[kk]);
-                                    r_row[j] += static_cast<element>(sum);
-                                }
-                            }
-                        }
-                    });
-            }
+            transpose_multiply_to_span(result.span(), M, N, span(), K, cols_,
+                                       b.span(), K, b.cols());
         }
 
         // ── 累加矩阵乘法（A * B^T，结果累加到 result） ─────────────
@@ -758,87 +615,10 @@ namespace nn
             const std::size_t N = b_trans.rows_;
             if (M == 0 || N == 0 || K == 0) return;
 
-            const auto a = span();
-            const auto bt = b_trans.span();
-            auto r = result.span();
-
-            const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
-            const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
-            const auto n_blocks = i_blocks * j_blocks;
-
-            if (n_blocks <= 1)
-            {
-                const std::size_t i_start = 0, i_end = M;
-                const std::size_t j_start = 0, j_end = N;
-                for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE)
-                {
-                    const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
-                    const std::size_t k_len = k_end - k_start;
-                    const std::size_t j_len = j_end - j_start;
-                    std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_block{};
-                    for (std::size_t jj = 0; jj < j_len; ++jj)
-                        for (std::size_t kk = 0; kk < k_len; ++kk)
-                            b_block[jj * k_len + kk] = bt[(j_start + jj) * K + (k_start + kk)];
-                    const auto b_block_span = std::span<const element>(b_block.data(), k_len * j_len);
-                    for (std::size_t i = i_start; i < i_end; ++i)
-                    {
-                        const auto a_row = a.subspan(i * K + k_start);
-                        auto r_row = r.subspan(i * N + j_start);
-                        for (std::size_t j = 0; j < j_len; ++j)
-                        {
-                            const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                            acc_type sum = acc_type{0};
-                            NN_VECTORIZE_PRAGMA
-                            for (std::size_t kk = 0; kk < k_len; ++kk)
-                                sum += static_cast<acc_type>(a_row[kk]) * static_cast<acc_type>(b_col[kk]);
-                            r_row[j] += static_cast<element>(sum);
-                        }
-                    }
-                }
-            }
-            else
-            {
-                auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
-                nn::parallel_for_blocks(
-                    block_indices.begin(), block_indices.end(),
-                    [a, bt, r, M, N, K, j_blocks](std::size_t block_idx) noexcept
-                    {
-                        const std::size_t i_block = block_idx / j_blocks;
-                        const std::size_t j_block = block_idx % j_blocks;
-                        const std::size_t i_start = i_block * BLOCK_SIZE;
-                        const std::size_t i_end = std::min(i_start + BLOCK_SIZE, M);
-                        const std::size_t j_start = j_block * BLOCK_SIZE;
-                        const std::size_t j_end = std::min(j_start + BLOCK_SIZE, N);
-
-                        for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE)
-                        {
-                            const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
-                            const std::size_t k_len = k_end - k_start;
-                            const std::size_t j_len = j_end - j_start;
-
-                            std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_block{};
-                            for (std::size_t jj = 0; jj < j_len; ++jj)
-                                for (std::size_t kk = 0; kk < k_len; ++kk)
-                                    b_block[jj * k_len + kk] = bt[(j_start + jj) * K + (k_start + kk)];
-                            const auto b_block_span = std::span<const element>(b_block.data(), k_len * j_len);
-
-                            for (std::size_t i = i_start; i < i_end; ++i)
-                            {
-                                const auto a_row = a.subspan(i * K + k_start);
-                                auto r_row = r.subspan(i * N + j_start);
-                                for (std::size_t j = 0; j < j_len; ++j)
-                                {
-                                    const auto b_col = b_block_span.subspan(j * k_len, k_len);
-                                    acc_type sum = acc_type{0};
-                                    NN_VECTORIZE_PRAGMA
-                                    for (std::size_t kk = 0; kk < k_len; ++kk)
-                                        sum += static_cast<acc_type>(a_row[kk]) * static_cast<acc_type>(b_col[kk]);
-                                    r_row[j] += static_cast<element>(sum);
-                                }
-                            }
-                        }
-                    });
-            }
+            // span 内核本身就是"累加到 r"的语义（不清零）→ 语义完全一致，
+            // 直接委托。注意：本方法全库无调用者（死代码），一并消除第三份重复内核。
+            multiply_transposed_to_span(result.span(), M, N, span(), M, K,
+                                        b_trans.span(), N, K);
         }
 
         void scale_inplace(Scalar scalar) noexcept
