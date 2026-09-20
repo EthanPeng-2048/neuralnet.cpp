@@ -556,7 +556,9 @@ public:
                     " transB=" + (transB ? "1" : "0") +
                     " K=" + std::to_string(K) + " K2=" + std::to_string(K2)});
 
-            Matrix result(M, N);
+            // 未初始化：multiply_to 内部会先 result.zero() 再累加，
+            // 构造函数里的全尺寸零填充是**重复**的（本机单线程写满一遍 6MB ~2ms）
+            Matrix result = Matrix::make_uninitialized(M, N);
             if (!transA && !transB) {
                 a.multiply_to(result, b);
             } else if (!transA && transB) {
