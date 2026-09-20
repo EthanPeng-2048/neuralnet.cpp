@@ -304,6 +304,22 @@ namespace nn
                     rp[ii * r_stride + jj] += static_cast<element>(acc[ii][jj]);
         }
 
+        // ── 定长点积（尾块 / 窄 N 专用）─────────────────────────────────
+        // 必须独立成函数：NN_VECTORIZE_PRAGMA（loop vectorize(assume_safety)）
+        // 若与其它循环同处一个函数，会让整函数的向量化一起失败（实测同结构
+        // 374 -> 95 GFLOPS）。尾块在窄 N（如 Linear 的 batch=1，N=1）时是唯一
+        // 路径，这一段不隔离就会退化。
+        static acc_type dot_span_(const element *x, std::size_t x_stride,
+                                  const element *y, std::size_t y_stride,
+                                  std::size_t len) noexcept
+        {
+            acc_type s = acc_type{0};
+            NN_VECTORIZE_PRAGMA
+            for (std::size_t k = 0; k < len; ++k)
+                s += static_cast<acc_type>(x[k * x_stride]) * static_cast<acc_type>(y[k * y_stride]);
+            return s;
+        }
+
         // ── 基于 span 的矩阵乘法（零拷贝，供 batched_matmul 等场景使用） ──
         // 从 a/b 的子区间直接计算，无需构造临时 Matrix 拷贝
         static void multiply_to_span(
@@ -315,6 +331,26 @@ namespace nn
             (void)b_rows;  // NN_ASSERT 在 Release 模式下展开为空，参数仅用于断言
             const std::size_t K = a_cols;
             if (M == 0 || N == 0 || K == 0) return;
+
+            // ── 窄 N 专用路径（N < MK_RB）────────────────────────────────
+            // 典型是 Linear 的 batch=1（N=1）。主路径此处恒走尾块，且每个
+            // (输出块, k 步) 都要把 B 打包进 16KB 栈块（值初始化）——GEMV 的
+            // 计算量与之同量级，打包的零填充把内存流量翻倍。窄 N 下 B 很小
+            // （N*K），直接按步长读、完全不打包更快。
+            if (N < MK_RB)
+            {
+                const std::size_t nb = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                nn::parallel_for_samples(nb, [a, b, r, M, N, K, b_cols](std::size_t ib) noexcept
+                {
+                    const std::size_t i0 = ib * BLOCK_SIZE;
+                    const std::size_t i1 = std::min(i0 + BLOCK_SIZE, M);
+                    for (std::size_t i = i0; i < i1; ++i)
+                        for (std::size_t j = 0; j < N; ++j)
+                            r[i * N + j] += dot_span_(a.data() + i * K, 1,
+                                                      b.data() + j, b_cols, K);
+                });
+                return;
+            }
 
             // 直接复用 blocked matmul 内核
             const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -394,6 +430,23 @@ namespace nn
             const std::size_t K = a_cols;
             if (M == 0 || N == 0 || K == 0) return;
 
+            // 窄 N 专用路径（见 multiply_to_span 处的说明）。此形态 B^T 存为
+            // (N, K)，固定 n 时 k 连续 → 点积两侧都连续。
+            if (N < MK_RB)
+            {
+                const std::size_t nb = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                nn::parallel_for_samples(nb, [a, bt, r, M, N, K](std::size_t ib) noexcept
+                {
+                    const std::size_t i0 = ib * BLOCK_SIZE;
+                    const std::size_t i1 = std::min(i0 + BLOCK_SIZE, M);
+                    for (std::size_t i = i0; i < i1; ++i)
+                        for (std::size_t j = 0; j < N; ++j)
+                            r[i * N + j] += dot_span_(a.data() + i * K, 1,
+                                                      bt.data() + j * K, 1, K);
+                });
+                return;
+            }
+
             const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const auto n_blocks = i_blocks * j_blocks;
@@ -468,6 +521,23 @@ namespace nn
             (void)b_rows;  // NN_ASSERT 在 Release 模式下展开为空，参数仅用于断言
             const std::size_t K = a_rows;  // a is (K, M) stored
             if (M == 0 || N == 0 || K == 0) return;
+
+            // 窄 N 专用路径（见 multiply_to_span 处的说明）。此形态 A 存为 (K, M)
+            // → 固定 m 时以 a_cols 为步长读列（这是本形态的固有代价，无法避免）。
+            if (N < MK_RB)
+            {
+                const std::size_t nb = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                nn::parallel_for_samples(nb, [a, b, r, M, N, K, a_cols, b_cols](std::size_t ib) noexcept
+                {
+                    const std::size_t i0 = ib * BLOCK_SIZE;
+                    const std::size_t i1 = std::min(i0 + BLOCK_SIZE, M);
+                    for (std::size_t i = i0; i < i1; ++i)
+                        for (std::size_t j = 0; j < N; ++j)
+                            r[i * N + j] += dot_span_(a.data() + i, a_cols,
+                                                      b.data() + j, b_cols, K);
+                });
+                return;
+            }
 
             const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
