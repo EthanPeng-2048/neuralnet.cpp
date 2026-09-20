@@ -137,6 +137,16 @@ public:
         return Tensor(std::make_shared<Matrix>(rows, cols));
     }
 
+    // ── 创建 CPU 未初始化张量（f32）───────────────────────────────────────
+    // 语义契约：调用方必须在任何读取之前把**全部**元素写满。
+    // 用于"输出会被完整覆盖"的引擎内部路径（eval_expr / elementwise_* 的
+    // 输出缓冲）：省掉"分配 + 写满一遍零 + 马上被全覆盖"里的那一遍零写。
+    // 实测本机单线程写满 1.57MB 要 0.50ms（~3.2 GB/s），是纯浪费。
+    [[nodiscard]] static Tensor cpu_uninitialized(std::size_t rows, std::size_t cols)
+    {
+        return Tensor(std::make_shared<Matrix>(rows, cols, Matrix::uninitialized_tag{}));
+    }
+
     // ── 创建 CPU 空张量（显式 P，§6.4）───────────────────────────────────
     // compile-time P；BF16/F64 → static_assert 报错
     template <Precision P>

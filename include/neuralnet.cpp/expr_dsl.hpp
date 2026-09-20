@@ -41,6 +41,14 @@
 namespace nn::dsl
 {
 
+// ── DSL 逐元素模板路径的并行门控 ────────────────────────────────────────
+// 低于全局 nn::PARALLEL_THRESHOLD(524288)。全局值按"裸逐元素 add 的内存
+// 带宽回本点"标定；而本路径折叠的是多算子融合表达式（每元素 2~6 次算术，
+// 还可能含 exp/tanh/sqrt），per-element 成本更高，回本点更低。
+// LayerNorm/RMSNorm 的典型形状 768×512 = 393216 恰在旧门控之外 → 整段串行。
+// 131072 元素 × ~2ns ≈ 0.26ms，远超并行区启动开销（实测 ~100µs）。
+inline constexpr std::size_t kDslParallelThreshold = 131072;
+
 // ══════════════════════════════════════════════════════════════════════════
 // 内部求值/折叠构建器：把编译期表达式折叠成扁平 ExprSpec + 输入张量列表
 // ══════════════════════════════════════════════════════════════════════════
@@ -165,8 +173,8 @@ template <typename E>
 // eval_into_span — 把逐元素表达式写进既有 span（eval_cpu / compute_into 共用）
 //
 // 与逐元素原语（algebra_matrix 的 apply/transform/原地运算）**同构**：
-//   - n < PARALLEL_THRESHOLD：串行计数循环 + NN_VECTORIZE_PRAGMA
-//   - n ≥ PARALLEL_THRESHOLD：自建分块并行，块内同样是**带向量化提示的裸
+//   - n < kDslParallelThreshold：串行计数循环 + NN_VECTORIZE_PRAGMA
+//   - n ≥ kDslParallelThreshold：自建分块并行，块内同样是**带向量化提示的裸
 //     指针计数循环**（不用 nn::for_each(iota)：其分块内层在池里，无法为该
 //     循环单独加向量化提示——池被多种读写模式复用，不能全局 assume_safety；
 //     实测大张量下慢 1.3–1.5 倍）
@@ -176,6 +184,12 @@ template <typename E>
 // 语义安全性：本循环是纯 map —— 每个输出元素只依赖**同一下标**的输入，
 // 先读完再写回。无论目标是否与某输入同 buffer，向量化后的"载入同下标向量
 // →计算→存回"与串行逐一读改写逐字节一致（无跨下标依赖）。
+//
+// 门控说明：这里用 kDslParallelThreshold（131072）而非全局 PARALLEL_THRESHOLD
+// （524288）。全局值是按"裸 add 的内存带宽回本点"标的；而本路径折叠的是
+// 多算子融合表达式（每元素 2~6 次算术 + 可能的 exp/tanh），per-element 成本
+// 更高，回本点更低。典型 LayerNorm/RMSNorm 形状 768×512=393216 旧门控下
+// **整段串行**（正好低于 524288），是本项目 CPU 归一化层只用 ~1 核的直接原因。
 // ══════════════════════════════════════════════════════════════════════════
 template <typename E>
 inline void eval_into_span(const E& e, Span d_span, std::size_t cols) noexcept
@@ -184,7 +198,7 @@ inline void eval_into_span(const E& e, Span d_span, std::size_t cols) noexcept
     const std::size_t n = d_span.size();
     if (n == 0)
         return;
-    if (n < PARALLEL_THRESHOLD)
+    if (n < kDslParallelThreshold)
     {
         NN_VECTORIZE_PRAGMA
         for (std::size_t i = 0; i < n; ++i)
@@ -387,7 +401,36 @@ struct MatmulRef
     bool transB = false;
     std::uint32_t batch = 1;  // S7：批量数（形状参数，不进 key）
 
+    // ── CPU 模板求值路径的预绑定状态（引擎内部，Layer 无感知）───────────
+    // C 由引擎通用 matmul 原语物化一次并绑定指针；随后尾链（如 +bias）在
+    // 编译期模板路径内联求值 → 编译器融合 + 向量化，不再经 ExprSpec 解释器。
+    // 详见本节末尾 "CPU 预绑定" 一节的说明。GPU/scan 不使用本状态。
+    mutable Tensor c_cache_{};
+    mutable const Scalar* c_data_ = nullptr;
+
+    [[nodiscard]] Result<void> prepare_cpu(ComputeEngine& eng) const
+    {
+        if (c_data_ != nullptr)
+            return {};  // 幂等：同一棵树重复求值只物化一次
+        constexpr Precision P = Precision::F32;
+        Result<Tensor> c = (batch > 1)
+            ? eng.batched_matmul(a, b, batch, transA, transB, Scalar{1}, P)
+            : eng.matmul(a, b, transA, transB, P);
+        if (!c)
+            return std::unexpected(c.error());
+        if (!c->is_cpu())
+            return std::unexpected(Error{"dsl matmul prepare: result not on CPU"});
+        c_cache_ = std::move(*c);
+        c_data_ = c_cache_.cpu_matrix().span().data();
+        return {};
+    }
+
     [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
+    // CPU 模板路径（2 参）：读预绑定的 C（形状与输出网格一致）
+    [[nodiscard]] Scalar eval(std::size_t i, std::size_t) const noexcept
+    {
+        return c_data_ != nullptr ? c_data_[i] : Scalar{0};
+    }
     ExprOperand to_spec(SpecBuilder& sb) const
     {
         // 显式固定登记顺序（A 先 B 后），保证跨编译器确定（同 Binary 约定）
@@ -780,12 +823,96 @@ template <typename E>
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+// CPU 预绑定（cpu_prepare）—— 让"含 matmul/归约"的表达式也走编译期内联
+//
+// 背景：has_reduction_v 仅用于 CPU 分支分流（GPU/scan 一律 to_expr_spec）。
+// matmul / 归约视图 / 归约指令 / 网格索引这类"需要 GEMM 或全行全列才能算出"
+// 的节点，此前把**整棵表达式**丢给运行时 ExprSpec 解释器（逐元素
+// Scalar regs[16]={} + switch(op) + lambda 间接调用）。
+//
+// 本节与文件头 §1 的既有设计意图一致（"CPU 直接把表达式当作编译期 AST，
+// 逐元素求值 → 编译器内联 + SIMD 融合，等价手写 for 循环"）：把真正需要
+// 全局信息的节点**先算出来并绑定**，其余部分仍交给 eval_into_span 内联求值。
+// 即：融合交给编译器，而不是运行时解释器。
+//
+// 红线：本节只做"通用结构"的预绑定（matmul / 归约 / 索引映射），不含任何
+// 算法名或算法逻辑；公式文本仍只在 Layer。GPU 路径完全不经过本段。
+//
+// ⚠ 白名单必须**fail-safe**：占位 eval() 的节点（ReduceViewRef/ReduceRef/
+//   RowIdxLeaf/ColIdxLeaf/BatchIdxLeaf/RowGatherRef/BatchModRef/BatchColRef 的
+//   eval 目前返回占位值，真实语义只由解释器提供）一旦被放进模板路径就会
+//   **静默算错**。因此：默认只有 has_reduction_v 为假（本就是模板路径原生
+//   节点）才可预绑定，含归约的节点必须逐个显式加入白名单。
+//   教训：曾把默认值设为 true，导致 SwiGLU::backward 的 select(row()<d_ff,…)
+//   在模板路径下 row() 恒为 0，两半梯度选错（layer_gradcheck 的 fc1.w 全红）。
+// ══════════════════════════════════════════════════════════════════════════
+
+// 含归约节点的白名单：已确认可"预绑定 + 模板内联"的才列在此（逐个迁移）
+template <typename T> inline constexpr bool cpu_preparable_leaf_v = false;
+
+// matmul：用引擎通用 GEMM 原语物化 C 后绑定指针，尾链交模板路径内联
+template <> inline constexpr bool cpu_preparable_leaf_v<MatmulRef> = true;
+
+// 树级判定：不含归约的节点本就是模板路径原生节点，可直接预绑定（no-op）；
+// 含归约的节点只有白名单内的才可预绑定
+template <typename T>
+inline constexpr bool cpu_preparable_v = !has_reduction_v<T> || cpu_preparable_leaf_v<T>;
+
+template <typename Op, nn::Expression C>
+inline constexpr bool cpu_preparable_v<Unary<Op, C>> = cpu_preparable_v<C>;
+template <typename Op, nn::Expression L, nn::Expression R>
+inline constexpr bool cpu_preparable_v<Binary<Op, L, R>>
+    = cpu_preparable_v<L> && cpu_preparable_v<R>;
+template <nn::BoolExpression C, nn::Expression T, nn::Expression E>
+inline constexpr bool cpu_preparable_v<Select<C, T, E>>
+    = cpu_preparable_v<C> && cpu_preparable_v<T> && cpu_preparable_v<E>;
+
+// 默认：普通叶子 / 视图 / 索引叶子无需预绑定
+template <typename T>
+[[nodiscard]] inline Result<void> cpu_prepare(const T&, ComputeEngine&,
+                                              std::size_t, std::size_t)
+{ return {}; }
+
+template <typename Op, nn::Expression C>
+[[nodiscard]] inline Result<void> cpu_prepare(const Unary<Op, C>& u, ComputeEngine& eng,
+                                              std::size_t rows, std::size_t cols)
+{ return cpu_prepare(u.child, eng, rows, cols); }
+
+template <typename Op, nn::Expression L, nn::Expression R>
+[[nodiscard]] inline Result<void> cpu_prepare(const Binary<Op, L, R>& b, ComputeEngine& eng,
+                                              std::size_t rows, std::size_t cols)
+{
+    if (auto r = cpu_prepare(b.l, eng, rows, cols); !r)
+        return r;
+    return cpu_prepare(b.r, eng, rows, cols);
+}
+
+template <nn::BoolExpression C, nn::Expression T, nn::Expression E>
+[[nodiscard]] inline Result<void> cpu_prepare(const Select<C, T, E>& s, ComputeEngine& eng,
+                                              std::size_t rows, std::size_t cols)
+{
+    if (auto r = cpu_prepare(s.cond, eng, rows, cols); !r)
+        return r;
+    if (auto r = cpu_prepare(s.then_e, eng, rows, cols); !r)
+        return r;
+    return cpu_prepare(s.else_e, eng, rows, cols);
+}
+
+// matmul：把 C 物化一次（引擎通用 GEMM 原语）并绑定指针
+[[nodiscard]] inline Result<void> cpu_prepare(const MatmulRef& m, ComputeEngine& eng,
+                                              std::size_t, std::size_t)
+{ return m.prepare_cpu(eng); }
+
+// ══════════════════════════════════════════════════════════════════════════
 // CPU：编译期模板直接求值（编译器内联 + SIMD 融合，等价手写循环）
 // ══════════════════════════════════════════════════════════════════════════
 template <typename E>
 [[nodiscard]] Tensor eval_cpu(const E& e, std::size_t rows, std::size_t cols)
 {
-    Matrix out(rows, cols);
+    // 输出会被 eval_into_span 完整覆盖（每个下标恰好写一次）→ 用未初始化构造，
+    // 省掉"分配 + 写满一遍零 + 马上被全覆盖"里的那一遍全尺寸零写。
+    // 实测本机单线程写满 1.57MB 要 0.50ms（~3.2 GB/s），是纯浪费。
+    Matrix out = Matrix::make_uninitialized(rows, cols);
     // 与 eager 逐元素原语同构（串行+向量化提示 / 阈值以上并行）→ 同门控下
     // DSL 取代 elementwise_* 时 CPU 性能不倒退。
     eval_into_span(e, out.span(), cols);
@@ -817,8 +944,16 @@ template <typename E>
     {
         if constexpr (nn::dsl::has_reduction_v<E>)
         {
-            // 含归约：模板求值无法表达"全行/全列归约"，折叠成 ExprSpec 走
-            // 引擎 eval_expr（CPU 扩展语义处理归约视图/指令，先正确后优化）
+            if constexpr (nn::dsl::cpu_preparable_v<E>)
+            {
+                // 可预绑定：先物化需要全局信息的节点（如 matmul C），
+                // 其余交编译期模板内联求值（同一个 eval_into_span 循环）。
+                if (auto r = cpu_prepare(e, eng, rows, cols); !r)
+                    return std::unexpected(r.error());
+                return eval_cpu(e, rows, cols);
+            }
+            // 含归约且暂不可预绑定：模板求值无法表达"全行/全列归约"，
+            // 折叠成 ExprSpec 走引擎 eval_expr（CPU 扩展语义处理归约视图/指令）
             auto [spec, inputs] = to_expr_spec(e);
             if (auto v = validate_expr_spec(spec, inputs.size()); !v)
                 return std::unexpected(v.error());
@@ -869,6 +1004,15 @@ template <typename E>
             return std::unexpected(Error{"dsl::compute_into: dst not on CPU"});
         if constexpr (nn::dsl::has_reduction_v<E>)
         {
+            if constexpr (nn::dsl::cpu_preparable_v<E>)
+            {
+                // 可预绑定：物化需要全局信息的节点后，直接内联写进 dst
+                // （与上面纯逐元素分支同一循环结构；dst 与输入同 buffer 安全）
+                if (auto r = cpu_prepare(e, eng, dst.rows(), dst.cols()); !r)
+                    return std::unexpected(r.error());
+                eval_into_span(e, dst.cpu_matrix().span(), dst.cols());
+                return {};
+            }
             // 含归约：折叠成 ExprSpec 走引擎（与 compute() 的 CPU 分支一致）
             auto [spec, inputs] = to_expr_spec(e);
             if (auto v = validate_expr_spec(spec, inputs.size()); !v)
