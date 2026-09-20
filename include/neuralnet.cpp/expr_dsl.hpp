@@ -209,8 +209,17 @@ inline void eval_into_span(const E& e, Span d_span, std::size_t cols) noexcept
     }
 
     const std::size_t hw = static_cast<std::size_t>(std::thread::hardware_concurrency());
-    // 分块数：以 ~64K 元素/块为目标（≈256KB，L2 友好），上限 hw*4 以保证
-    // 负载均衡（块太少会让大量线程闲置，实测 2.36M 元素时退化近 10 倍）。
+    // 分块数：以 ~64K 元素/块为目标，上限 hw*4 以保证负载均衡。
+    //
+    // 关于这个值的一次实测记录（probe_par_break_even / probe_chunk_at_shape，
+    // 本机 32 逻辑核）——结论是**保持不变**：
+    //   · 并行区固定开销实测 ~100µs（32 线程）/ ~3~16µs（≤16 线程）；
+    //   · 隔离内核上，计算型 body（exp）在 n=393216 时 nch=48 比 nch=6 快 1.4x，
+    //     带宽型 body（x-mean）在任何 nch 下都不如串行；
+    //   · 但把 TARGET_CHUNK 改成 4096 / 16384（→ 96/24 块）后，**层级别反而变差**：
+    //     layernorm 2.8→3.2ms、rmsnorm 1.7→1.9ms（softmax 1.99→1.7 改善），
+    //     transformer/gpt_block 合计下降。隔离内核的收益**没有传递到层**。
+    //   · 故维持 65536；要再动必须先拿到层级别的证据。
     constexpr std::size_t TARGET_CHUNK = std::size_t{1} << 16;
     const std::size_t n_chunks = std::clamp(n / TARGET_CHUNK, std::size_t{1},
                                            std::max<std::size_t>(hw, 1) * 4);
