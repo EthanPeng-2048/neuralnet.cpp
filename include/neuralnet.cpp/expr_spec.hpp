@@ -301,6 +301,12 @@ struct FoldSpec
     std::uint32_t                vec_state_len = 0;  // 行向量态长度（0=无；输出列数）
     std::optional<MatmulSpec>    matmul;   // 键域内层收缩段（块局部，N=k 全轴）
     std::optional<VecAccSpec>    vecacc;   // 行向量态块更新
+    // causal 整块跳过（仅 make_fold_attn_o 非 Plain 置位；进 key——结构/
+    //   codegen 分歧点）：生成器把块内 valid 钳到
+    //   min(BLOCK, fold_k-k0, qt+1-k0)，k0>qt 的整块空转。被跳过的 j 恰为
+    //   链内 select 屏蔽项（-inf/0）→ max 加 -inf、sum 加 0、w=0 时 +0·V=+0
+    //   均为恒等 → 与全量计算逐位一致。CPU 不钳（全量算，等价性同上）。
+    bool                            causal_skip = false;
 
     friend bool operator==(const FoldSpec&, const FoldSpec&) = default;
 };
@@ -640,6 +646,8 @@ struct ExprSpec
             feed(&s.fold->vecacc->scale_reg, 1);
             feed(&s.fold->vecacc->has_scale, 1);
         }
+        // causal 跳块：codegen 分歧点 → 结构进 key（同 vecacc 槽位先例）
+        feed(&s.fold->causal_skip, 1);
     }
 
     char buf[17];
@@ -663,10 +671,10 @@ inline constexpr std::uint32_t FOLD_MAX_MMK   = 1024;  // fold mm 段内层 k �
     // （Q 行预载 shared Qsh[1024] 的编译期尺寸——d_k 超限在 validate 静态拒）
 // fold 块大小：CPU 执行器与 GPU 生成器**共用**的常量（不进 key——分块是
 // 实现细节，但两侧必须同值以保证浮点结合序一致 → 对拍可走紧容差）。
-// 32→64（profile 归因：attention fold 6.9ms = 理想 69×，主耗散=每块协议
-// （5 barrier+双归约+链）×块数；BLOCK=64 块数减半=协议减半，shared 仅
-// +1.3KB 不及第二轮 +3KB 掉档重——bench 验证若 occupancy 反噬回退到 48）
-inline constexpr std::uint32_t EXPR_FOLD_BLOCK = 64;
+// 历次调整均以交错 bench 实测裁决：32→64（每块协议减半，fwd −6%）；64→128
+// （协议再减半 + 链/归约活跃线程翻倍（tid<BLOCK）；shared 6.75→~8.9KB、驻留
+// 8→7 WG 的占用代价被收益盖过——mha fwd 5.77→5.41，18/18 绿）
+inline constexpr std::uint32_t EXPR_FOLD_BLOCK = 128;
 // fold v2 每 WG 行数（NR）：把"按 WG 数计费"的固定成本（Qsh 预载、入退场、
 //   调度人头）摊到 NR 行——四形状拟合实测该类占 fold ~54%（γ·rows）。
 //   生成器行循环与后端 dispatch ceil(rows/NR) **同源共用**；结构常量不进

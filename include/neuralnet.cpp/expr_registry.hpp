@@ -77,7 +77,7 @@ struct ExprRegistry
 //                    vecacc: has(u8)；1 时 {vec_state,weight_reg,b_input,
 //                           scale_reg,has_scale(5B)}}
 //  v2 起支持 matmul 段（v1 无 matmul，读 v1 等价 has=0）；v3 起支持 rparams。
-inline constexpr std::uint8_t kExprBinVersion = 7;  // v5：MatmulSpec 补 batch；v6：FoldSpec；v7：FoldSpec 双域字段（vec_state_len/matmul/vecacc——丢段=结构损坏）
+inline constexpr std::uint8_t kExprBinVersion = 8;  // v5：MatmulSpec 补 batch；v6：FoldSpec；v7：FoldSpec 双域字段（vec_state_len/matmul/vecacc——丢段=结构损坏）；v8：causal_skip（causal 跳块 codegen 标志——不对称=静默不跳或错位读废）
 
 [[nodiscard]] inline bool write_registry(const std::string& path,
                                          const ExprRegistry& reg)
@@ -177,6 +177,9 @@ inline constexpr std::uint8_t kExprBinVersion = 7;  // v5：MatmulSpec 补 batch
                                            va.has_scale };
                 if (!write_pod_span(f, std::span(vbytes, 5))) return false;
             }
+            // v8：causal_skip（1B，与 read 对称）
+            const std::uint8_t cskip = s.fold->causal_skip ? 1u : 0u;
+            if (!write_pod(f, cskip)) return false;
         }
     }
     return static_cast<bool>(f);
@@ -301,6 +304,12 @@ inline constexpr std::uint8_t kExprBinVersion = 7;  // v5：MatmulSpec 补 batch
                 va.b_input    = vbytes[2]; va.scale_reg  = vbytes[3];
                 va.has_scale  = vbytes[4];
                 fs.vecacc = va;
+            }
+            // v8：causal_skip 读回（与 write 对称——错一位=后续全错位）
+            {
+                std::uint8_t cskip = 0;
+                if (!read_pod(f, cskip)) return false;
+                fs.causal_skip = cskip != 0;
             }
             s.fold = fs;
         }

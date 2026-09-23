@@ -158,7 +158,8 @@ namespace
               << static_cast<int>(f.vecacc->scale_reg) << ", "
               << static_cast<int>(f.vecacc->has_scale) << " }";
         }
-        o << "} }";
+        // FoldSpec 声明序末位 = causal_skip（聚合初始化 positional，字段加结构尾）
+        o << "} , " << (f.causal_skip ? "true" : "false") << " }";
     }
     o << "} }";
     return o.str();

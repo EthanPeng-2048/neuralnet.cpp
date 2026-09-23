@@ -190,6 +190,7 @@ enum class FoldAttnMask
     const bool has_doc   = (mask == FoldAttnMask::Doc ||
                             mask == FoldAttnMask::AlibiDoc);
     const bool has_causal = (mask != FoldAttnMask::Plain);
+    f.causal_skip = has_causal;   // 生成器据此钳 valid（整块/边界跳过 -inf 区）
     s.views = { linear(), linear(), linear() };
     std::uint8_t slot_slope = 0, slot_dc = 0, slot_ids = 0;
     if (has_slope)
