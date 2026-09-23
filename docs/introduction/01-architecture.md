@@ -264,19 +264,23 @@ class Tensor {
 
 | 类别 | 原语 |
 |------|------|
-| 矩阵级 | `matmul`, `batched_matmul`, `transpose`, `add_inplace`, `scale_inplace`, `zero`, `axpy_inplace` |
-| 归约级 | `row_reduce_sum`, `col_reduce_sum`, `row_reduce_max`, `col_reduce_max` |
+| 矩阵级 | `matmul`, `batched_matmul`, `matmul_with_bias`, `transpose`, `add_inplace`, `accumulate`, `scale_inplace`, `zero`, `axpy_inplace` |
+| 归约级 | `row_reduce_sum/max`, `col_reduce_sum/max`, `grouped_reduce_sum/max`（沿行按固定长度 R 分组归约） |
 | 广播级 | `broadcast_row_inplace`, `broadcast_col_inplace` |
 | 逐元素 | `elementwise_unary`, `elementwise_binary`, `elementwise_binary_scalar` |
 | 条件选择 | `elementwise_select_scalar_cond` |
-| 数据操作 | `slice_rows`, `insert_rows`, `gather_rows`, `scatter_add_rows`, `rearrange_3d`, `clone` |
+| 数据操作 | `slice_rows`, `insert_rows`, `gather_rows`, `scatter_add_rows`, `rearrange_3d`, `im2col`, `col2im`, `clone`, `copy_from`, `cast` |
+| 扫描级 | `scan_prefix_outer`, `scan_suffix_outer`, `outer_col`（RLA/RAPT，dk≤64） |
+| 表达式 | `eval_expr`, `eval_expr_reduce`（AOT 融合 shader 入口，闭合世界硬报错） |
 | 批控制 | `begin_batch` / `end_batch`（CPU: no-op; GPU: command buffer） |
+| 内存 | `release_idle_pool_blocks`, `pool_stats` |
+| offload | `offload_store/load`, `create_offload_buffer`, `offload_save/restore`（activation offload） |
 
 **表达式统一入口：**
 
 | 文件 | 职责 |
 |------|------|
-| `expr_spec.hpp` | `ExprSpec` 逐元素表达式扁平 IR（纯数据结构，跨后端可序列化，GPU AOT 契约）+ `expr_spec_key`（规范结构 key，AOT 收集/匹配依据） |
+| `expr_spec.hpp` | `ExprSpec` 逐元素表达式扁平 IR（纯数据结构，跨后端可序列化，GPU AOT 契约）+ 可选 `fold` 段（`FoldSpec` 分块状态归约——注意力 forward 的结构载体，含 `causal_skip`、`EXPR_FOLD_BLOCK/ROWS_PER_WG` 共享常量）+ `expr_spec_key`（规范结构 key，AOT 收集/匹配依据） |
 | `expr_dsl.hpp` | 统一表达式 DSL（`nn::dsl`）：编译期模板，普通数学写法；`compute` / `compute_reduce` / `compute_into`（原地目标传递）。CPU 直接求值（内联+SIMD）；GPU 经 `to_expr_spec` 折叠出 `ExprSpec` → 按 `expr_spec_key` 匹配预编译融合 shader。（`start_expr/end_expr` 块式融合已于 2026-09-19 随 IR-C 移除） |
 | `expr_registry.hpp` | 构建期表达式注册表（`scan_exprs` 收集折叠出的结构，按 key 去重；二进制 dump/load 供 `gen_fused` 消费） |
 | `fused_registry.hpp` | **生成物**（构建期 `gen_fused` 产出）：`key → {ExprSpec 结构, 内联 SPIR-V}` 融合 shader 注册表；运行时按 key 精确匹配 |
@@ -285,7 +289,7 @@ class Tensor {
 | `eval_expr` | `ComputeEngine` 虚接口：CPU 编译期模板求值（经 `dsl::compute`）；Vulkan 按 `expr_spec_key` 查 `fused_registry`（闭合世界，未命中硬报错，无 eager、无运行时编译） |
 | `dsl::compute(engine, expr, rows, cols)` | 统一求值入口：CPU 走编译期模板；GPU 折叠成 `ExprSpec` → `eval_expr` 按 key AOT 分发 |
 
-> **AOT 收集原则**：表达式**文本只出现在 Layer**（内联写进 `forward/backward`）。构建期 `scan_exprs` dry-run 执行 Layer 代码触达它们，把折叠后的 `ExprSpec` 结构（派生物，非手写定义）收集进注册表；`gen_fused` 据此合成融合 shader 并内联进 `fused_registry.hpp`。运行时按 key 精确匹配 dispatch，最终程序自包含、无运行时编译器。
+> **AOT 收集原则**：表达式**文本只出现在 Layer**（内联写进 `forward/backward`）。构建期 `scan_exprs` dry-run 执行 Layer 代码触达它们，把折叠后的 `ExprSpec` 结构（派生物，非手写定义）收集进注册表；`gen_fused` 据此合成融合 shader 并内联进 `fused_registry.hpp`。运行时按 key 精确匹配 dispatch，最终程序自包含、无运行时编译器。**例外通道**：注意力 fold spec 由 `make_fold_attn_o`（`expr_fold.hpp`）构造、层直调 `engine.eval_expr` 不经 DSL 钩子——其登记来自 `scan_exprs` 的显式块，5 个掩码变体必须全部列出（漏登记 = GPU 闭合世界硬报错）。
 
 ### L3 实现层
 

@@ -17,6 +17,7 @@
 // ───────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>
+#include <neuralnet.cpp/expr_fold.hpp>   // P-C1 fold 样例（与 scan_exprs 同源 → key 一致）
 
 #include <cmath>
 #include <iomanip>
@@ -537,6 +538,196 @@ int run_reduce_consts(nn::ComputeEngine& cpu, nn::ComputeEngine& gpu)
     return ok ? 0 : 1;
 }
 
+// ── P-C1 fold 分块状态归约：CPU vs GPU 对拍 ──────────────────────────────
+// 同 spec → 同 key → 命中 scan 收集的 fold shader；同分块(EXPR_FOLD_BLOCK)、
+// 同指令序、每线程一行与 CPU 执行器逐指令同构 → rowmax 期望**逐位一致**；
+// rowsum/denom 给小容差（fp 加法结合序驱动差异 / exp 软硬件实现差异）。
+// K 族覆盖单列 / 非块整除 / 整除 / 尾块（EXPR_FOLD_BLOCK=128 边界两侧——
+// 256/260 补多块+尾块；BLOCK 升 128 后 K≤100 会静默退化单块）。
+int run_fold_gpu(CpuEngine& cpu, GpuEngine& gpu)
+{
+    int fail = 0;
+    std::mt19937 rng(9013);
+    std::uniform_real_distribution<Scalar> dist(-2.0f, 2.0f);
+    for (const std::size_t K : {std::size_t{1}, std::size_t{7}, std::size_t{32},
+                                std::size_t{33}, std::size_t{100},
+                                std::size_t{256}, std::size_t{260}})
+    {
+        const std::size_t rows = 6;
+        Tensor x = Tensor::cpu(rows, K);
+        {
+            auto sp = x.cpu_matrix().span();
+            for (auto& v : sp) v = dist(rng);
+        }
+        const std::vector<Tensor> ins{x};
+
+        const auto one = [&](const char* tag, const nn::ExprSpec& spec, Scalar tol)
+        {
+            auto c = cpu.eval_expr(spec, ins, rows, 1);
+            auto g = gpu.eval_expr(spec, ins, rows, 1);
+            if (!c)
+            {
+                std::cout << "  [FAIL] fold " << tag << " K=" << K
+                          << " CPU: " << c.error().message << "\n";
+                ++fail; return;
+            }
+            if (!g)
+            {
+                std::cout << "  [FAIL] fold " << tag << " K=" << K
+                          << " GPU: " << g.error().message << "\n";
+                ++fail; return;
+            }
+            auto gm = gpu.to_matrix(*g);
+            if (!gm)
+            {
+                std::cout << "  [FAIL] fold " << tag << " K=" << K
+                          << " GPU 下载失败\n";
+                ++fail; return;
+            }
+            const auto cs = c->cpu_matrix().span();
+            const auto gs = gm->span();
+            Scalar err = 0;
+            for (std::size_t i = 0; i < rows; ++i)
+                err = std::fmax(err, std::fabs(cs[i] - gs[i]) /
+                                     std::fmax(Scalar{1}, std::fabs(cs[i])));
+            const bool ok = err <= tol;
+            std::cout << "[" << (ok ? "PASS" : "FAIL") << "] fold " << tag
+                      << " K=" << K << "  err=" << std::scientific
+                      << std::setprecision(2) << err << std::defaultfloat
+                      << (tol == 0 ? " (exact)" : "") << "\n";
+            if (!ok)
+            {
+                // 诊断：打印全部行的 CPU/GPU 实值（行同值/巨值形态定位）
+                std::cout << "      cpu:";
+                for (std::size_t i = 0; i < rows; ++i)
+                    std::cout << " " << cs[i];
+                std::cout << "\n      gpu:";
+                for (std::size_t i = 0; i < rows; ++i)
+                    std::cout << " " << gs[i];
+                std::cout << "\n";
+                ++fail;
+            }
+        };
+
+        one("rowmax", nn::expr::make_fold_rowmax(
+                static_cast<std::uint32_t>(K)), Scalar{0});
+        one("rowsum", nn::expr::make_fold_rowsum(
+                static_cast<std::uint32_t>(K)), Scalar{1e-6});
+        one("softmax_denom", nn::expr::make_fold_softmax_denom(
+                static_cast<std::uint32_t>(K)), Scalar{1e-5});
+    }
+    return fail;
+}
+
+// ── P-C2 attention fold（v2 双域）GPU 对拍 ──────────────────────────────
+// 与 scan 登记的 spec 同源（vec_state_len 不进 key——形状参数经 PC
+// vector_out 槽填充，dk 族登记是同 key 去重）；v2 与 CPU 执行器同分块/
+// 同指令序——max 类逐位；sum/vecacc 类 GPU 蝶形结合序异于 CPU 串行、exp
+// 软硬件有差 → 走容差 1e-4（非全逐位）。
+// 覆盖 mm 段/5 掩码/vecacc/向量域 finalize/dispatch(ceil(rows/NR))、
+// seq>EXPR_FOLD_BLOCK 多块流式 + causal 整块跳过、GPU rows=1。
+int run_fold_attn_gpu(CpuEngine& cpu, GpuEngine& gpu)
+{
+    int fail = 0;
+    std::mt19937 rng(9024);
+    std::uniform_real_distribution<Scalar> dist(-1.5f, 1.5f);
+    struct Sh { std::uint32_t bh, seq, dk; };
+    for (const auto mk : {nn::expr::FoldAttnMask::Plain,
+                          nn::expr::FoldAttnMask::Causal,
+                          nn::expr::FoldAttnMask::Alibi,
+                          nn::expr::FoldAttnMask::Doc,
+                          nn::expr::FoldAttnMask::AlibiDoc})
+    {
+        const char* mname = mk == nn::expr::FoldAttnMask::Plain    ? "plain"
+                         : mk == nn::expr::FoldAttnMask::Causal    ? "causal"
+                         : mk == nn::expr::FoldAttnMask::Alibi     ? "alibi"
+                         : mk == nn::expr::FoldAttnMask::Doc       ? "doc"
+                                                                 : "alibidoc";
+        // {2,133,4}：seq > EXPR_FOLD_BLOCK(128) → GPU 多块流式 + causal
+        //   整块跳过分支（k0>qt）；{1,1,4}：GPU 最小 rows=1（clamp+row_ok）
+        for (const Sh sh : {Sh{2, 9, 4}, Sh{1, 33, 8}, Sh{3, 5, 2},
+                            Sh{2, 133, 4}, Sh{1, 1, 4}})
+        {
+            const std::size_t rows_out = static_cast<std::size_t>(sh.bh) * sh.seq;
+            Tensor Q = Tensor::cpu(static_cast<std::size_t>(sh.bh) * sh.dk, sh.seq);
+            Tensor K = Tensor::cpu(static_cast<std::size_t>(sh.bh) * sh.dk, sh.seq);
+            Tensor Vt = Tensor::cpu(rows_out, sh.dk);
+            Tensor slopes = Tensor::cpu(1, sh.bh);
+            // doc 输入（与 expr_fold_test / Layer 同构）：doc_col (rows,1) 行
+            //   文档 id；doc_ids (1, bh*seq) 按 (b,h) 块重复（BatchCol(seq)）
+            const std::uint32_t sseq = sh.seq;
+            Tensor doc_col = Tensor::cpu(rows_out, 1);
+            Tensor doc_ids_t = Tensor::cpu(
+                1, static_cast<std::size_t>(sh.bh) * sh.seq);
+            const auto doc_of = [sseq](std::uint32_t pos) -> Scalar
+            { return pos < sseq / 2 ? Scalar{1} : Scalar{2}; };
+            for (std::size_t r = 0; r < rows_out; ++r)
+                doc_col.cpu_matrix().span()[r] =
+                    doc_of(static_cast<std::uint32_t>(r % sh.seq));
+            for (std::uint32_t blk = 0; blk < sh.bh; ++blk)
+                for (std::uint32_t j = 0; j < sh.seq; ++j)
+                    doc_ids_t.cpu_matrix().span()
+                        [static_cast<std::size_t>(blk) * sh.seq + j] = doc_of(j);
+            for (auto& v : Q.cpu_matrix().span()) v = dist(rng);
+            for (auto& v : K.cpu_matrix().span()) v = dist(rng);
+            for (auto& v : Vt.cpu_matrix().span()) v = dist(rng);
+            for (auto& v : slopes.cpu_matrix().span()) v = dist(rng) * Scalar{0.1};
+            const bool alibi = (mk == nn::expr::FoldAttnMask::Alibi ||
+                                mk == nn::expr::FoldAttnMask::AlibiDoc);
+            const bool docm  = (mk == nn::expr::FoldAttnMask::Doc ||
+                                mk == nn::expr::FoldAttnMask::AlibiDoc);
+            std::vector<Tensor> ins{Q, K, Vt};
+            if (alibi) ins.push_back(slopes);
+            if (docm) { ins.push_back(doc_col); ins.push_back(doc_ids_t); }
+
+            nn::ExprSpec spec = nn::expr::make_fold_attn_o(sh.seq, sh.dk, sh.bh, mk);
+            auto c = cpu.eval_expr(spec, ins, rows_out, sh.dk);
+            auto g = gpu.eval_expr(spec, ins, rows_out, sh.dk);
+            const std::string tag = std::string("attn-fold ") + mname +
+                " bh=" + std::to_string(sh.bh) + " seq=" + std::to_string(sh.seq) +
+                " dk=" + std::to_string(sh.dk);
+            if (!c)
+            {
+                std::cout << "  [FAIL] " << tag << " CPU: "
+                          << c.error().message << "\n";
+                ++fail; continue;
+            }
+            if (!g)
+            {
+                std::cout << "  [FAIL] " << tag << " GPU: "
+                          << g.error().message << "\n";
+                ++fail; continue;
+            }
+            auto gm = gpu.to_matrix(*g);
+            if (!gm)
+            {
+                std::cout << "  [FAIL] " << tag << " GPU 下载失败\n";
+                ++fail; continue;
+            }
+            const auto cs = c->cpu_matrix().span();
+            const auto gs = gm->span();
+            Scalar err = 0;
+            for (std::size_t i = 0; i < rows_out * sh.dk; ++i)
+                err = std::fmax(err, std::fabs(cs[i] - gs[i]) /
+                                     std::fmax(Scalar{1}, std::fabs(cs[i])));
+            const bool ok = err <= Scalar{1e-4};
+            std::cout << "[" << (ok ? "PASS" : "FAIL") << "] " << tag
+                      << "  err=" << std::scientific << std::setprecision(2)
+                      << err << std::defaultfloat << "\n";
+            if (!ok)
+            {
+                std::cout << "      cpu[0..3]:";
+                for (std::size_t i = 0; i < 4; ++i) std::cout << " " << cs[i];
+                std::cout << "\n      gpu[0..3]:";
+                for (std::size_t i = 0; i < 4; ++i) std::cout << " " << gs[i];
+                std::cout << "\n";
+                ++fail;
+            }
+        }
+    }
+    return fail;
+}
+
 int main()
 {
     std::cout << "========================================\n"
@@ -570,6 +761,8 @@ int main()
     fail += run_norm<nn::RMSNorm>("rmsnorm", *cpu_engine, *gpu_engine);
     fail += run_norm<nn::LayerNorm>("layernorm", *cpu_engine, *gpu_engine);
     fail += run_reduce_consts(*cpu_engine, *gpu_engine);
+    fail += run_fold_gpu(*cpu_engine, *gpu_engine);
+    fail += run_fold_attn_gpu(*cpu_engine, *gpu_engine);
     fail += run_fallback(*cpu_engine, *gpu_engine);
 
     std::cout << (fail == 0 ? "ALL PASS\n" : "FAILED\n");

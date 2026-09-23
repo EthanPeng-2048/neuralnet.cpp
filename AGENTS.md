@@ -168,11 +168,12 @@ GPT 序列展平: 列序 i = b*seq + t（batch-major，全局唯一约定）
 
 - Layer 内用 `nn::dsl`（`expr_dsl.hpp`）写普通数学表达式；CPU 编译期模板直接求值（内联+SIMD），GPU 折叠成 `ExprSpec`（扁平 IR，`expr_spec.hpp`）→ 按 key 查预编译融合 shader。
 - 主要入口：`dsl::compute(engine, expr)`（一行表达式，最常用）；把结果写进既有张量（原地更新，零分配）用 `dsl::compute_into(engine, expr, dst)`；归约语义用 `dsl::compute_reduce`。**跨表达式融合（`start_expr/end_expr`、`begin_expr/end_expr`、`expr_graph.hpp`）已于 2026-09-19 移除**——理由与重新立项前提见 `docs/development/03-ir-optimization.md` §5.3。
+- **fold 段（P-C1/C2，注意力的结构载体）**：`ExprSpec.fold = FoldSpec`（分块状态归约：键域逐块 body + 行标量态跨块进位 + `vecacc` 行向量态块累加 + 向量域 finalize）。注意力 forward 直调 `engine.eval_expr(make_fold_attn_o(...))`（**不经 DSL 钩子——scan 显式登记块是 fold spec 唯一注册来源**）；5 掩码变体 `FoldAttnMask`（Plain/Causal/Alibi/Doc/AlibiDoc，漏登记即 GPU 闭合世界硬报错）；`FoldSpec.causal_skip` 进 key（codegen 分歧点）；`EXPR_FOLD_BLOCK=128`/`EXPR_FOLD_ROWS_PER_WG=2` 为 CPU/GPU 共享常量（改则两侧同改）。详见 `expr_fold.hpp` 与 `expr_spec.hpp` 的 FoldSpec 注释。
 - **构建期两步**（CMake 自动编排，改 Layer 内联表达式后重跑构建即可）：
   1. `scan_exprs`：dry-run 跑 Layer forward/backward，收集折叠出的 `ExprSpec` 结构（去重）→ `build/generated/expr_specs.bin`
   2. `gen_fused`：读 bin → 经 `emitter_registry` 选后端（默认 `"glsl"` = `GlslEmitter`）生成 GLSL → glslc → 内联 SPIR-V → `build/generated/fused_registry.hpp`
 - **IR-D emitter 抽象**（`expr_emitter.hpp`）：把后端代码生成从 GLSL 专用抽象为 emitter 接口（一份 canonical IR → 多后端代码），`--list-backends` 可列出注册后端。目前仅 `glsl` 后端注册；`CpuEmitter`（已删除）与 `CudaEmitter`（随 CUDA 后端一并移除）均**不存在**，勿引用。
-- 手写原语 shader 在 `shaders/*.comp`（matmul、matmul_tiled、batched_matmul、reduce、broadcast、elementwise_v2、transpose、gather、scatter_add、rearrange_3d、scan_prefix_outer、scan_suffix_outer、outer_col、cast），构建期 glslc 编译并嵌入 C++ 头文件。
+- 手写原语 shader 在 `shaders/*.comp`（matmul、matmul_tiled、matmul_gemv、batched_matmul、reduce、broadcast、elementwise_v2、transpose、gather、scatter_add、rearrange_3d、im2col、col2im、group_reduce、scan_prefix_outer、scan_suffix_outer、outer_col、cast），构建期 glslc 编译并嵌入 C++ 头文件。
 - IR 优化 pass（canonicalize/CSE/寄存器分配）见 `expr_opt.hpp`，设计文档 `docs/development/03-ir-optimization.md`（含 IR-C 图融合的取舍记录 §5.3）。
 
 ## 8. 训练循环范式（写新入口时照抄）
@@ -256,7 +257,7 @@ optimizer.step();
 | `usage/04-train-package.md` | `.nnpkg` 训练包 |
 
 
-## 12. 当前状态（截至 2026-09-19，最新提交 96a3675 + 本次 IR-C 移除）
+## 12. 当前状态（截至 2026-09-24；早期条目按日期标注，最新提交以 `git log` 为准）
 
 ### 已交付能力
 
@@ -275,6 +276,8 @@ optimizer.step();
   - **评估分块（CNN 全量评估 OOM 修复）**（2026-09-20）：`evaluate_mnist` 新增 `eval_batch`（默认 1000）分块前向 + 每块 `release_idle_pool_blocks()`；`mnist_train` 传 `cfg.batch_size`。此前 CNN/MLP 走 `N = x.cols()` 全量单次 forward，CNN 的 im2col 是 k²·C_in 倍 → 60000 样本需 ~6.4 GB → `vkAllocateMemory failed: -2`（训练步其实只多 130 MB）。见 `docs/development/08-pitfalls-and-lessons.md` §3.7。
   - **坑（已修，2026-09-20）**：`run_fused_gpu` 的 push-constant **固定头长度必须逐形态**与生成器 PC 声明一致（逐元素 2 / 逐元素+matmul 5 / 归约 4 / 归约+matmul 6）。历史 bug 把"归约但无 matmul"按 **5** 算 → 常量池整体后移一个 uint → **GPU 上"带常量的归约"静默错值而 CPU 正常**（表现为 `col_reduce_sum(select(x == col_broadcast(max), 1, 0))` 恒返回 kk-1 而非真实并列数）。教训：这类"只有 GPU 错"的问题要**先打印生成的 GLSL/IR 再猜成因**——本轮最初误判成"广播视图内联"并写了错误规避。见 `docs/development/08-pitfalls-and-lessons.md` §4.10。
   - **坑**：复合层 override `forward_recompute` 必须调用**虚函数** `set_checkpoint_mode` 关闭子层；基类默认实现只改本块标志位 → 子层缓存不重建（stride>1 时被上一轮陈旧缓存掩盖，表现为部分 stride 通过）。模式开关（checkpoint/offload/doc-mask）的缓存契约见 `docs/development/08-pitfalls-and-lessons.md` 模式 H。
+  - **GPU 算子性能优化（2026-09-23）**：① `matmul_tiled.comp` 改 BK=16+双缓冲（共享保持 16KB 占用率不变），op 级 matmul +11~20%（**教训：BK=32 双缓冲要 32KB → blocks/SM 砍半，流水收益被占用率损失抵消净 0**）；② 融合生成器 `generate_glsl_matmul` 最终采用 **BK=32+双缓冲（32KB）**，四点多样本 A/B 实测（% = vs 单缓冲原版的**耗时**变化，负=更快）：浅网格 linear 1024³ **-1.9%**、batch512 **-4.9%**，深网格 feedforward/batch4096 **±0**，18/18 测试绿。**trade-off 表（融合侧调参必读）**：BK=16 双缓冲虽保 16KB 占用率，但 barrier 频率翻倍在深网格**真回退 -2%**（深网格延迟已被跨块调度掩盖，流水只剩 barrier 成本、只在浅网格是正收益）；BK=32 保住原版 barrier 节奏，32KB 占用率砍半被深网格 WG 余量吸收 → 全点最优。融合侧改动一律用 `layer --layer linear` 浅/深两点 + 每点 ≥3 样本测（单样本会被 ±3% 噪声骗）；③ `submit_and_wait` 改 solo fence/cmd 复用（`initialize` 预分配、submit 前 reset）+ 新增 `NN_GPU_PROFILE=1` stderr 分段计时（record/end/submit/wait/cleanup），逐元素固定开销 0.16→0.143ms；剖面显示余量 submit≈70µs + wait≈75µs 属驱动/唤醒延迟，kernel 本身 4096² 已达 370-440GB/s（峰值 448）**无优化空间**；④ **bench 方法论**：`layer_bench` 短跑必须 `--warmup ≥20` 等时钟爬坡（空闲 300MHz→1470→2070MHz，best-of 短跑双峰如 batched 4.57/5.9ms 即爬坡所致）；torch 用 CUDA event 只测 kernel、`layer_bench` 是 wall-clock 含提交开销，跨栈对比须先扣固定项。40HX 理论峰值 FP32 9.14 TFLOPS / 448 GB/s（34 SM×64×2×2.1GHz）。⑤ **待查异常**：`mha/causal_attn` batch=32 fwd 2.78s，远超线性扩展（batch=1 仅 8.8ms），疑似跨样本 T² 结构，transformer 层 97% 时间耗在 attention（记录于 fold 优化同日、系 fold 前量级；fold 落地后是否仍复现待重测）。
+  - **fold 分块流式求值 + GPU 注意力全链优化（2026-09-24，7cdb41c+fd68573）**：注意力 forward 改单 fold kernel（`FoldSpec`：QKᵀ/掩码/online softmax/ΣwV 逐 `EXPR_FOLD_BLOCK=128` 块完成，S 绝不物化；`causal_skip` 整块跳过被屏蔽区；NR=2 每 WG 两行；subgroup 蝶式归约 + vecacc 4 路软件流水）；旧物化/两趟 forward 与 `build_attention_mask`/`mask_cache_`/`m/l/attn_cache_` 等死码删除。**实测 vs main 基线 7.9/20.3：mha fwd 5.41（−31.5%）、causal fwd 4.75（−40%）、train 17.5~17.7（−13%）**，18/18 绿。质量门禁轮补：Doc/AlibiDoc fold 注册与测试矩阵全覆盖、ALiBi slopes 表 `(1, batch·H)` 越界修复、GEMV subgroup≥4 门禁、causal_skip bin v8 往返断言。
 
 ### 融合二期（`docs/development/02-operator-fusion.md`）完成：S1-S5、S7
 
@@ -285,7 +288,7 @@ S7 关键教训（改融合/IR 代码前必读）：
 3. **RowGather 主输入行数≠网格行数**（loss_vec 在 (1,N) 读 (C,N) logits），校验只查 cols。
 4. `gen_fused` `emit_spec` 的 ±inf 常量必须用 `numeric_limits`。
 5. matmul + 列归约不支持（gen_fused 跳过）。
-6. **IR 扩展**：MatmulSpec.batch（不进 key，dispatch z）、Row/Col/Batch 操作数(6/7/8)、RowGather(9)/BatchMod(10)/BatchCol(11)；注意力 fwd=m/l/W 表达式+bm(W,V_t)，bwd=R/X 表达式+3 个 bm；CE 稠密 `denom=col_sum(exp(logits-cb(col_max)))`，稀疏 grad/loss_vec 用 Row+RowGather。
+6. **IR 扩展**：MatmulSpec.batch（不进 key，dispatch z）、Row/Col/Batch 操作数(6/7/8)、RowGather(9)/BatchMod(10)/BatchCol(11)；注意力 forward 现为单 fold kernel（`FoldSpec`，5 掩码变体经 `fold_mask_variant_`——m/l/W 表达式+bm(W,V_t) 的 S7 forward 结构已删），bwd=R/X 表达式+3 个 `batched_matmul`；CE 稠密 `denom=col_sum(exp(logits-cb(col_max)))`，稀疏 grad/loss_vec 用 Row+RowGather。
 
 ### 全库审查（`docs/development/09-code-review-2026-09-04.md`，2026-09-04 完成）
 

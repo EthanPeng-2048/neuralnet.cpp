@@ -78,6 +78,9 @@ private:
     std::string device_name_;   // 所选物理设备名（诊断用）
     std::string device_selector_;  // 手动指定设备（空 = 自动选择）
     bool timeline_semaphores_ = false;  // 设备支持时间线信号量（见 initialize）
+    uint32_t subgroup_size_ = 4;  // 计算队列 subgroup 尺寸——matmul_gemv 的
+                                  // red[..][64] 容量前提（256/subgroup≤64）；
+                                  // VK1.1 查询失败按 4 兜底，见 initialize
 
 public:
     VulkanDevice() = default;
@@ -308,6 +311,22 @@ public:
                 timeline_semaphores_ = false;
         }
 
+        // 计算 subgroup 尺寸（VK1.1 核心，查询链式同上方 features2 模式）：
+        //   matmul_gemv 的部分和表 red[ROWS][MAX_N][64] 容量前提 = 256 线程
+        //   / subgroup ≥ 4 → ≤64 个 subgroup；查询失败按 4 兜底（前提视为
+        //   成立），实测 <4 时后端会关掉 GEMV 分派——否则 subgroup ≥64 不
+        //   落表、tid0 只和前 64 个 → 静默错值（4.10 同类"只有 GPU 错"）
+        if (app_info.apiVersion >= VK_API_VERSION_1_1)
+        {
+            VkPhysicalDeviceSubgroupProperties sg{};
+            sg.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+            VkPhysicalDeviceProperties2 props2{};
+            props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            props2.pNext = &sg;
+            vkGetPhysicalDeviceProperties2(physical_device_, &props2);
+            if (sg.subgroupSize > 0) subgroup_size_ = sg.subgroupSize;
+        }
+
         float queue_priority = 1.0f;
         VkDeviceQueueCreateInfo queue_info{};
         queue_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -340,6 +359,8 @@ public:
     [[nodiscard]] bool is_initialized() const noexcept { return initialized_; }
     // 所选物理设备名（"NVIDIA CMP 40HX" 等；初始化前为空）
     [[nodiscard]] const std::string& device_name() const noexcept { return device_name_; }
+    // 计算队列 subgroup 尺寸（初始化前 = 兜底值 4；GEMV 分派门禁用）
+    [[nodiscard]] uint32_t subgroup_size() const noexcept { return subgroup_size_; }
     // 已启用时间线信号量（决定跨 submit 依赖走信号量还是 host 等 fence）
     [[nodiscard]] bool has_timeline_semaphores() const noexcept
     {

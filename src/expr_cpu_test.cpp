@@ -56,6 +56,9 @@
 #undef g_fail
 #undef main
 
+// ── expr_fold_test（P-C1 分块状态归约；独立函数，无宏重命名）───────────────
+#include "expr_fold_test.cpp"
+
 int main()
 {
     int failures = 0;
@@ -71,6 +74,9 @@ int main()
 
     std::puts("=== expr_opt (canonicalize + CSE + regalloc) ===");
     failures += test_expr_opt();
+
+    std::puts("=== expr_fold (P-C1 block-state reduction) ===");
+    failures += test_expr_fold();
 
     std::printf("\nexpr_cpu_test: %d failure(s)\n", failures);
     return failures != 0 ? 1 : 0;

@@ -69,20 +69,21 @@ IR 属于"引擎/工具内部"，**完全落在红线允许区**，且强化"引
 
 ## IR 结构（阶段 A：规范化 ExprSpec）
 
-沿用现有 `ExprSpec` 数据结构，不改变其形态，仅确立为 IR 并加 canonicalization 层：
+沿用现有 `ExprSpec` 数据结构，仅确立为 IR 并加 canonicalization 层（下为**核心四字段节选**——当前完整结构还含 `rparams` 运行时标量池、可选 `matmul` 段（S1）与可选 `fold` 段（P-C1/C2 `FoldSpec`，分块状态归约，注意力 forward 即此结构），见 `expr_spec.hpp`）：
 
 ```cpp
-struct ExprSpec {
+struct ExprSpec {                      // 节选：核心字段
     std::vector<ExprInstr> instrs;   // SSA 式指令表
     std::vector<ExprView>  views;    // 与 inputs 一一对应（索引映射）
     std::vector<Scalar>    consts;   // 常量池
     std::uint32_t          num_regs;
+    // + rparams / std::optional<MatmulSpec> matmul / std::optional<FoldSpec> fold
 };
 ```
 
-- 指令：`ExprInstr{ op, dst, a, b, c }`，操作数 kind 为 `Reg/Input/Const/Fanout/Reduce`。
-- 视图：`Linear/RotateHalf/RowMod/RowBroadcast/ColBroadcast` + 归约视图。
-- 上限：`EXPR_MAX_INPUTS=8 / REGS=16 / INSTRS=64 / CONSTS=16`。
+- 指令：`ExprInstr{ op, dst, a, b, c }`，操作数 kind 为 `Reg/Input/Const/Fanout/Reduce`（S7 起增网格索引 `Row/Col/Batch` 与 `Matmul`；`VecState` 仅 fold finalize 可用）。
+- 视图：`Linear/RotateHalf/RowMod/RowBroadcast/ColBroadcast` + 归约视图（S7 起增 `RowGather/BatchMod/BatchCol`，后又有 `RowAccess`）。
+- 上限：`EXPR_MAX_INPUTS=16 / REGS=32 / INSTRS=64 / CONSTS=16`；fold 段另有独立上限 `FOLD_MAX_BODY/FINALIZE/STATE/VEC`。
 
 ### 4.1 canonical IR 定义
 

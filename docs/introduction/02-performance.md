@@ -123,11 +123,12 @@ for i_block in range(0, M, BLOCK_SIZE):
 
 ### Release 模式编译标志
 
-> **不使用 `-ffast-math`**：为保证 NaN/Inf 传播与训练数值稳定性，项目明确禁用 `-ffast-math`（也禁用 `-funroll-loops`）。实际 Release 标志为 `-O3 -march=native -fno-exceptions -Wall -Wextra -Wpedantic -Werror`（见 `CMakeLists.txt` / `AGENTS.md` §9）。
+> **不使用 `-ffast-math`**：为保证 NaN/Inf 传播与训练数值稳定性，项目明确禁用 `-ffast-math`。实际 Release 标志（Clang/GCC，权威来源 `CMakeLists.txt:74/76`）为 `-O3 -fno-math-errno -fno-trapping-math -funroll-loops -march=native`，另加工程告警集 `-fno-exceptions -Wall -Wextra -Wpedantic -Werror`（注意 **`-funroll-loops` 是启用的**；MSVC 分支为 `/O2 /fp:fast`）。
 
 ```cmake
-# CMakeLists.txt
-set(RELEASE_FLAGS -O3 -march=native -fno-exceptions -Wall -Wextra -Wpedantic -Werror)
+# CMakeLists.txt（Clang/GCC；NN_ENABLE_NATIVE=ON 时含 -march=native）
+set(RELEASE_FLAGS -O3 -fno-math-errno -fno-trapping-math -funroll-loops -march=native)
+# 工程告警集另行附加：-fno-exceptions -Wall -Wextra -Wpedantic -Werror
 ```
 
 | 标志 | 作用 |
@@ -137,7 +138,7 @@ set(RELEASE_FLAGS -O3 -march=native -fno-exceptions -Wall -Wextra -Wpedantic -We
 | `-fno-exceptions` | 禁用异常（配合 `Result<T>` 错误处理铁律） |
 | `-Wall -Wextra -Wpedantic -Werror` | 严格告警，告警即错误 |
 
-> 说明：项目**刻意不用** `-ffast-math`（允许浮点重排序、忽略 NaN/Infinity 会破坏训练稳定性）与 `-funroll-loops`（由 `-O3` 自动处理）。
+> 说明：项目**刻意不用** `-ffast-math`（允许浮点重排序、忽略 NaN/Infinity 会破坏训练稳定性）。`-funroll-loops` **显式启用**（与 `-O3` 叠加）；`-fno-math-errno`/`-fno-trapping-math` 关闭数学错误域/陷阱语义以利向量化，不涉及 NaN 语义。
 
 ---
 
@@ -246,7 +247,7 @@ for (size_t h = 0; h < num_heads; ++h) {   // N 次循环
 output = concat(O_0, O_1, ..., O_{H-1});
 ```
 
-### 新版：批量 dispatch
+### 批量 dispatch（forward 现为 fold 单 kernel；本节结构存于 backward）
 
 ```
 rearrange_3d → (batch*H*d_k, seq)  // 头维度在行方向
@@ -254,33 +255,27 @@ batched_matmul → 单次 dispatch 处理所有样本和所有头
 rearrange_3d_back → (H*d_k, batch*seq)
 ```
 
-**性能提升**：将 H 次 matmul 融合为 1 次 `batched_matmul`。
+**性能提升**：将 H 次 matmul 融合为 1 次 `batched_matmul`。（P-C2-7 起 forward 进一步收敛为 `eval_expr(fold)` 单 dispatch——QKᵀ/掩码/softmax/ΣwV 全在 kernel 内；上述批量结构现用于 backward 的 `batched_matmul` 与 recompute 路径。）
 
 ---
 
-## 9. 因果掩码缓存
+## 9. 因果掩码缓存【历史：已随 fold 迁移删除】
 
-### 问题
+> **状态（P-C2-7，2026-09-23）**：掩码物化与缓存路径整体删除——现行单 fold kernel
+> 在 body 内以 select 链表达掩码（`causal_skip` 把被屏蔽块整块钳成空转），**掩码
+> 矩阵从不存在、无需缓存**。下文保留作历史设计记录；且示例中
+> `(batch << 16) | seq_len` 位打包键正是 `08-pitfalls-and-lessons.md` §3.3 记录的
+> 溢出缺陷写法——该缺陷随整段删除一并消失。
+
+### 问题（历史）
 
 GPT 训练中，每个 forward 都需要创建因果掩码矩阵 `(batch*H*seq, seq)`。
 
-### 优化
+### 优化（历史）
 
-```cpp
-class CausalSelfAttention {
-    Tensor mask_cache_;
-    std::size_t mask_cached_key_ = 0;  // (batch << 16) | seq_len
+曾以 `mask_cache_` + `ensure_mask(engine, batch, seq_len)` 按 `(batch, seq_len)` 键缓存掩码矩阵（完整代码见 git 历史 `compute_layer_attention.hpp`，已随 fold 迁移删除）。
 
-    void ensure_mask(engine, batch, seq_len) {
-        const std::size_t key = (batch << 16) | seq_len;
-        if (mask_cached_key_ == key) return;  // 已缓存，跳过
-        // ... 构造掩码 ...
-        mask_cached_key_ = key;
-    }
-};
-```
-
-**收益**：相同 `(batch, seq_len)` 组合只构造一次掩码。
+**收益（历史）**：相同 `(batch, seq_len)` 组合只构造一次掩码。
 
 ---
 
@@ -349,7 +344,8 @@ compute::apply(span, expr);
 | GPU 批量提交 | GPU 推理/训练 | 减少 kernel launch 开销 |
 | Tensor 零拷贝 | Layer 间传递 | 消除数据拷贝 |
 | 融合 axpy | 优化器更新 | 减少 600 次 buffer 分配/step |
-| 注意力批量化 | MHA | H 次 matmul → 1 次 |
-| 掩码/编码缓存 | GPT 训练 | 避免重复构造 |
+| 注意力批量化 / fold 单遍 | MHA | H 次 → 1 次；forward 现为 fold 单 kernel 单 dispatch（S 绝不物化） |
+| 掩码/编码缓存 | GPT 训练 | 避免重复构造（掩码物化缓存已随 fold 删除，见 §9） |
 | 表达式模板 | 逐元素运算 | 消除临时矩阵 |
 | 分块转置 | 转置操作 | L1 友好 + 并行 |
+| GPU 注意力 fold 流式（2026-09-24） | GPU mha/causal | fwd 7.9→5.41ms（−31.5%）、causal −40%、train −13%（40HX 交错 bench） |
