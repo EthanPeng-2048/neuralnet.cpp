@@ -273,6 +273,8 @@ if(Vulkan_FOUND)
     set(GPU_SHADER_HPPS "")
 
     # 便捷函数：glslc → .spv → embed_spirv.cmake → C++ 头文件
+    # 可选附加 glslc 参数走 ARGN（如 --target-env=...；不传则保持默认，
+    # 现有 shader 的编译参数完全不变）
     function(nn_embed_shader SHADER_NAME SRC_FILE)
         set(SPV ${CMAKE_BINARY_DIR}/${SHADER_NAME}.spv)
         set(HPP ${CMAKE_BINARY_DIR}/generated/${SHADER_NAME}_spv.hpp)
@@ -283,7 +285,7 @@ if(Vulkan_FOUND)
         # 编译 GLSL → SPIR-V
         add_custom_command(
             OUTPUT ${SPV}
-            COMMAND ${GLSLC} -o ${SPV} ${SRC_FILE}
+            COMMAND ${GLSLC} ${ARGN} -o ${SPV} ${SRC_FILE}
             DEPENDS ${SRC_FILE}
             COMMENT "[GPU] Compiling ${SHADER_NAME}.comp → ${SHADER_NAME}.spv"
         )
@@ -305,6 +307,11 @@ if(Vulkan_FOUND)
     foreach(SHADER_NAME ${GPU_SHADERS})
         nn_embed_shader(${SHADER_NAME} ${CMAKE_SOURCE_DIR}/shaders/${SHADER_NAME}.comp)
     endforeach()
+
+    # 1b. 小 N GEMV（matmul_gemv）：用 subgroup 归约（GL_KHR_shader_subgroup_*）
+    #     需 SPIR-V ≥1.3 → 显式 --target-env=vulkan1.2（与 gen_fused 一致）；
+    #     其余 shader 编译参数不变。
+    nn_embed_shader(matmul_gemv ${CMAKE_SOURCE_DIR}/shaders/matmul_gemv.comp --target-env=vulkan1.2)
 
     # 2. AOT 融合 shader：scan_exprs + gen_fused
     set(NN_EXPR_SCAN_BIN     ${CMAKE_BINARY_DIR}/generated/expr_specs.bin)

@@ -1,0 +1,287 @@
+// ── matmul_gemv.comp ──────────────────────────────────────────────────────
+// 小 N 专用矩阵乘：C[M][N] = op(A) × op(B)，后端仅在 N ≤ 8 时分派本 kernel
+// （借鉴 llama.cpp/ggml mul_mat_vec：线程沿 K 分片 + 寄存器累加 + subgroup
+//   归约；tiled 版在小 N 下 64×64 块 56/64 列空转，本 kernel 每线程只算
+//   真实的 N 列）。
+//
+// 结构：
+//   - WorkGroup：256 线程（1D），覆盖 ROWS=4 个输出行 × N 列
+//     （后端 dispatch grid.x = ceil(M/4)，两侧 ROWS 常量必须一致）
+//   - 每线程持 k 步长 4 的分片（vec4 粒度），寄存器累加 acc[4][8]
+//   - k 循环内零 barrier（各线程分片互不依赖），结束后一次归约写出
+//   - 归约：subgroupAdd 每元素 → lane0 写 shared[num_subgroups] →
+//     tid0 跨 subgroup 求和写出（同 gen_fused 归约 shader 先例；
+//     shared 树形归约需 32KB partial/WG ≈ 每 WG 120KB 额外流量，
+//     会吃掉 GEMV 的带宽收益，故不用）
+//
+// A 加载（按 trans 选连续维，vec4 对齐条件为 uniform 分支；未对齐走同
+// 分组标量 + 边界判零，覆盖一致）：
+//   transA=0：A[m][k] 行主序沿 k 连续 → K%4==0 时每行一条 vec4
+//   transA=1：A 存储 (K,M) 沿 m 连续 → M%4==0 时每 k 一条 vec4（4 行同取）
+// B 加载：
+//   transB=0：块 [k0..k0+3][0..N) 扁平连续（k0%4 ⇒ k0*N%4==0 恒成立）
+//     → k0+4≤K 即可 vec4；N%4==0 时按行 vec4 直取，否则扁平 vec4 拆分
+//   transB=1：B 存储 (N,K) 沿 k 连续 → K%4==0 时每列一条 vec4
+// 基址 16B 对齐由 MemoryPool 分配对齐 ≥16 保证（compute_memory_pool.hpp）
+//
+// push constants / descriptor 布局与 matmul.comp 完全一致（5×4B，3 binding），
+// 复用 VulkanPipeline::create_matmul。
+// ─────────────────────────────────────────────────────────────────────────
+
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer  BufferA { float A[]; };
+layout(std430, binding = 1) readonly buffer  BufferB { float B[]; };
+layout(std430, binding = 2) writeonly buffer BufferC { float C[]; };
+
+// vec4 别名视图（同 binding 双声明；仅在元素下标 %4==0 的快路径使用）
+layout(std430, binding = 0) readonly buffer  BufferAv4 { vec4 Av4[]; };
+layout(std430, binding = 1) readonly buffer  BufferBv4 { vec4 Bv4[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;      // C 的行数
+    uint N;      // C 的列数（后端保证 ≤ MAX_N）
+    uint K;      // 求和维度
+    uint transA; // 1 = A 存储为 (K,M)，按 A^T 使用
+    uint transB; // 1 = B 存储为 (N,K)，按 B^T 使用
+};
+
+// 每 WG 覆盖的输出行数 —— 后端 dispatch（grid.x = ceil(M/ROWS)）必须同步
+const uint ROWS = 4u;
+// 支持的最大列数 —— 后端仅在 N ≤ MAX_N 时分派（acc/red 第二维）
+const uint MAX_N = 8u;
+
+// subgroup 部分和：256 线程 / subgroup ≥4 ⇒ 至多 64 个 subgroup
+shared float red[ROWS][MAX_N][64];
+
+void main()
+{
+    const uint tid = gl_LocalInvocationID.x;   // 0..255（沿 K 分片）
+    const uint m0  = gl_WorkGroupID.x * ROWS;
+
+    // ── 形状对齐标志（push 常量，uniform 分支零开销）─────────────────
+    // 沿 k 连续：元素下标 m*K+k0%4==0 ∀m ⇔ K%4==0（k0 恒 %4）
+    const bool a_vec_k = (transA == 0u) && ((K & 3u) == 0u);
+    // 沿 m 连续（A 存 K×M）：(k*M+m0)%4==0 ∀k ⇔ M%4==0（m0=4*wg 恒 %4）
+    // M%4==0 且 m0<M ⇒ m0+4≤M ⇒ 整组 4 行必在界内
+    const bool a_vec_m = (transA != 0u) && ((M & 3u) == 0u);
+    // B 存 (N,K) 沿 k 连续：n*K%4==0 ∀n ⇔ K%4==0（k0%4）
+    const bool b_vec_k = (transB != 0u) && ((K & 3u) == 0u);
+
+    // 行有效性（M%4≠0 时末 WG 行尾；M%4==0 时 m0<M ⇒ 全有效）
+    bool row_ok[ROWS];
+    [[unroll]] for (uint r = 0u; r < ROWS; ++r)
+        row_ok[r] = (m0 + r < M);
+
+    // ── 累加器（寄存器常驻；n≥N 恒 0，归约维度按 MAX_N 统一）────────
+    float acc[ROWS][MAX_N];
+    [[unroll]] for (uint r = 0u; r < ROWS; ++r)
+        [[unroll]] for (uint n = 0u; n < MAX_N; ++n)
+            acc[r][n] = 0.0;
+
+    // 元素数上限（双重守卫：后端契约 N≤MAX_N，防越界 UB）
+    const uint ncols = (N < MAX_N) ? N : MAX_N;
+
+    // ── K 分片主循环：每线程步进 4*256=1024，分片互不依赖，零 barrier ──
+    for (uint k0 = tid * 4u; k0 < K; k0 += 1024u)
+    {
+        // ── A 加载 → a[ROWS][4]（每线程持 4 个连续 k × ROWS 行）──────
+        float a[ROWS][4];
+        [[unroll]] for (uint r = 0u; r < ROWS; ++r)
+            [[unroll]] for (uint i = 0u; i < 4u; ++i)
+                a[r][i] = 0.0;
+
+        if (transA == 0u)
+        {
+            if (a_vec_k)
+            {
+                // K%4==0 且 k0<K ⇒ k0+4≤K，整组 k 必在行内；行界单独判
+                [[unroll]] for (uint r = 0u; r < ROWS; ++r)
+                {
+                    if (row_ok[r])
+                    {
+                        const vec4 v = Av4[((m0 + r) * K + k0) >> 2];
+                        a[r][0] = v.x; a[r][1] = v.y;
+                        a[r][2] = v.z; a[r][3] = v.w;
+                    }
+                }
+            }
+            else
+            {
+                [[unroll]] for (uint r = 0u; r < ROWS; ++r)
+                {
+                    if (!row_ok[r]) continue;
+                    const uint base = (m0 + r) * K;
+                    [[unroll]] for (uint i = 0u; i < 4u; ++i)
+                        if (k0 + i < K) a[r][i] = A[base + k0 + i];
+                }
+            }
+        }
+        else
+        {
+            // A 存储 (K,M)：元素 (k,m) = A[k*M + m]
+            if (a_vec_m)
+            {
+                // M%4==0 ⇒ 下标对齐且 m0+4≤M；k 逐个判界（K 可为奇数）
+                [[unroll]] for (uint i = 0u; i < 4u; ++i)
+                {
+                    if (k0 + i < K)
+                    {
+                        const vec4 v = Av4[((k0 + i) * M + m0) >> 2];
+                        [[unroll]] for (uint r = 0u; r < ROWS; ++r)
+                            a[r][i] = v[r];
+                    }
+                }
+            }
+            else
+            {
+                [[unroll]] for (uint r = 0u; r < ROWS; ++r)
+                {
+                    if (!row_ok[r]) continue;
+                    const uint m = m0 + r;
+                    [[unroll]] for (uint i = 0u; i < 4u; ++i)
+                        if (k0 + i < K) a[r][i] = A[(k0 + i) * M + m];
+                }
+            }
+        }
+
+        // ── B 加载 → b[4][MAX_N] ──────────────────────────────────────
+        float b[4][MAX_N];
+        [[unroll]] for (uint i = 0u; i < 4u; ++i)
+            [[unroll]] for (uint n = 0u; n < MAX_N; ++n)
+                b[i][n] = 0.0;
+
+        if (transB == 0u)
+        {
+            // B 存储 (K,N)：元素 (k,n) = B[k*N + n]
+            if (k0 + 4u <= K)
+            {
+                // 整组 k 在界内 ⇒ 扁平块 [k0*N, k0*N+4N) 连续且
+                // k0*N%4==0（k0%4）⇒ 全部 vec4 对齐
+                if ((N & 3u) == 0u)
+                {
+                    // N%4==0：按行 vec4 直取（(k0+i)*N%4==0 ⇔ N%4==0）
+                    [[unroll]] for (uint i = 0u; i < 4u; ++i)
+                    {
+                        [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                        {
+                            if (j * 4u >= ncols) break;
+                            const vec4 v = Bv4[((k0 + i) * N + j * 4u) >> 2];
+                            b[i][j * 4u + 0u] = v.x;
+                            b[i][j * 4u + 1u] = v.y;
+                            b[i][j * 4u + 2u] = v.z;
+                            b[i][j * 4u + 3u] = v.w;
+                        }
+                    }
+                }
+                else
+                {
+                    // N%4≠0（1,2,3,5,6,7）：扁平 vec4 装入本地 cb，
+                    // 按 p=i*N+n 拆分（N==1 时 cb[0] 即 4 个 k 的向量）
+                    const uint flatn = (ncols * 4u + 3u) / 4u; // = ncols
+                    vec4 cb[MAX_N];
+                    [[unroll]] for (uint j = 0u; j < MAX_N; ++j)
+                        cb[j] = vec4(0.0);
+                    for (uint j = 0u; j < flatn; ++j)
+                        cb[j] = Bv4[(k0 * N + j * 4u) >> 2];
+                    [[unroll]] for (uint i = 0u; i < 4u; ++i)
+                        [[unroll]] for (uint n = 0u; n < MAX_N; ++n)
+                        {
+                            if (n >= ncols) break;
+                            const uint p = i * N + n;
+                            b[i][n] = cb[p >> 2][p & 3u];
+                        }
+                }
+            }
+            else
+            {
+                // k 尾块（K%4≠0 的末段）：标量 + k 判界
+                [[unroll]] for (uint i = 0u; i < 4u; ++i)
+                {
+                    if (k0 + i >= K) break;
+                    [[unroll]] for (uint n = 0u; n < MAX_N; ++n)
+                    {
+                        if (n >= ncols) break;
+                        b[i][n] = B[(k0 + i) * N + n];
+                    }
+                }
+            }
+        }
+        else
+        {
+            // B 存储 (N,K)：元素 (k,n) = B[n*K + k]
+            if (b_vec_k)
+            {
+                // K%4==0 且 k0<K ⇒ k0+4≤K；n<ncols≤N 恒在存储列界内
+                [[unroll]] for (uint n = 0u; n < MAX_N; ++n)
+                {
+                    if (n >= ncols) break;
+                    const vec4 v = Bv4[(n * K + k0) >> 2];
+                    b[0][n] = v.x; b[1][n] = v.y;
+                    b[2][n] = v.z; b[3][n] = v.w;
+                }
+            }
+            else
+            {
+                [[unroll]] for (uint i = 0u; i < 4u; ++i)
+                {
+                    if (k0 + i >= K) break;
+                    [[unroll]] for (uint n = 0u; n < MAX_N; ++n)
+                    {
+                        if (n >= ncols) break;
+                        b[i][n] = B[n * K + k0 + i];
+                    }
+                }
+            }
+        }
+
+        // ── 累加（外积 4×ncols，每元素 1 FMA）────────────────────────
+        [[unroll]] for (uint r = 0u; r < ROWS; ++r)
+        {
+            if (!row_ok[r]) continue;
+            [[unroll]] for (uint i = 0u; i < 4u; ++i)
+            {
+                const float av = a[r][i];
+                [[unroll]] for (uint n = 0u; n < MAX_N; ++n)
+                {
+                    if (n >= ncols) break;
+                    acc[r][n] = fma(av, b[i][n], acc[r][n]);
+                }
+            }
+        }
+    }
+
+    // ── 归约：subgroupAdd 每元素（全 WG 同源收敛点，无发散）──────────
+    [[unroll]] for (uint r = 0u; r < ROWS; ++r)
+        [[unroll]] for (uint n = 0u; n < MAX_N; ++n)
+        {
+            acc[r][n] = subgroupAdd(acc[r][n]);
+            if (gl_SubgroupInvocationID == 0u && gl_SubgroupID < 64u)
+                red[r][n][gl_SubgroupID] = acc[r][n];
+        }
+    barrier();
+
+    // ── 跨 subgroup 求和 + 写出（仅 tid0）────────────────────────────
+    if (tid == 0u)
+    {
+        const uint nsub = (gl_NumSubgroups < 64u) ? gl_NumSubgroups : 64u;
+        [[unroll]] for (uint r = 0u; r < ROWS; ++r)
+        {
+            if (m0 + r >= M) break;
+            [[unroll]] for (uint n = 0u; n < MAX_N; ++n)
+            {
+                if (n >= ncols) break;
+                float s = 0.0;
+                for (uint g = 0u; g < nsub; ++g)
+                    s += red[r][n][g];
+                C[(m0 + r) * N + n] = s;
+            }
+        }
+    }
+}
