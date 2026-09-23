@@ -142,7 +142,12 @@ RAPT（ReLULinearAttention）是项目内对上述 ReLU 线性注意力的命名
 
 ## 4. 两趟式等价 FlashAttention 的实现分析
 
-本项目**没有传统的单一 Flash Attention kernel**，而是通过 **AOT 算子融合 + 两趟式（Two-Pass）注意力** 实现等效功能。注意力的 Flash Attention 语义分布在**多个独立融合 kernel** 中，按 S7 两趟式路径（`two_pass_active_ = true`）组合执行。
+> **状态（P-C2-7 起）**：本节描述的 S7 两趟式多 kernel 路径**已删除**——现行实现为
+> 单 fold kernel 分块流式（QKᵀ/掩码/online softmax/ΣwV 逐块完成，S 矩阵绝不物化，
+> 见 `08-pitfalls-and-lessons.md` §4 与 `compute_layer_attention.hpp` 头注释）。
+> 下文保留作历史设计分析。
+
+（历史）本项目曾通过 **AOT 算子融合 + 两趟式（Two-Pass）注意力** 实现等效功能：注意力的 Flash Attention 语义分布在**多个独立融合 kernel** 中，按 S7 两趟式路径组合执行。
 
 ### 4.1 两趟式注意力（Two-Pass Attention）
 

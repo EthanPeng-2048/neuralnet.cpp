@@ -26,6 +26,23 @@
 #include "compute_loss.hpp"
 #include "compute_optimizer.hpp"
 #include "expr_registry.hpp"
+#include "neuralnet.cpp/expr_fold.hpp"
+
+#include <csignal>
+#include <stacktrace>
+
+// abort（NN_ASSERT）时打印调用栈：NN_ASSERT 只有断言点行号，缺"谁调的"——
+// MSVC 侧也只见 abort 无栈。scan 是本机构建工具（clang + MSVC STL、带 -g），
+// 单文件装钩、不动全库 core_assert（GCC/CI 的 <stacktrace> 链接风险规避）。
+namespace {
+void on_abort(int)
+{
+    std::fprintf(stderr, "[scan] abort captured — call stack:\n%s\n",
+                 std::to_string(std::stacktrace::current()).c_str());
+    std::fflush(stderr);
+    std::_Exit(3);   // 不回 abort（避免二次 abort 丢输出）
+}
+} // namespace
 
 int main(int argc, char* argv[])
 {
@@ -35,6 +52,7 @@ int main(int argc, char* argv[])
         return 2;
     }
     const std::string out_path = argv[1];
+    std::signal(SIGABRT, &on_abort);   // NN_ASSERT → abort 带栈（见文件头）
 
     nn::CpuEngine engine;
 
@@ -355,9 +373,25 @@ int main(int argc, char* argv[])
         const auto run_csa = [&](nn::CausalSelfAttention& attn) {
             (void)attn.init(engine);
             nn::Tensor x = nn::Tensor::cpu(d_model, batch * seq);
-            (void)attn.forward(engine, x);   // 填 Q/K/V/W 缓存 + 登记 m/l/W
+            // 不再 (void) 吞错：forward 失败会让缓存为空，backward 直接
+            //   在 batched_matmul 读空张量上 NN_ASSERT（栈无上下文难定位）
+            auto fr = attn.forward(engine, x);
+            if (!fr)
+            {
+                std::fprintf(stderr, "[scan] CSA forward FAILED: %s\n",
+                             fr.error().message.c_str());
+                std::fflush(stderr);
+                std::abort();   // 带栈停在真凶处
+            }
             nn::Tensor grad = nn::Tensor::cpu(d_model, batch * seq);
-            (void)attn.backward(engine, grad);  // 登记 R/X
+            auto br = attn.backward(engine, grad);
+            if (!br)
+            {
+                std::fprintf(stderr, "[scan] CSA backward FAILED: %s\n",
+                             br.error().message.c_str());
+                std::fflush(stderr);
+                std::abort();
+            }
         };
         for (const auto enc : {nn::PosEncodingType::Learned,
                                nn::PosEncodingType::ALiBi})
@@ -380,6 +414,35 @@ int main(int argc, char* argv[])
                                             nn::PosEncodingType::ALiBi);
             attn_ad.set_doc_ids(doc_ids);
             run_csa(attn_ad);
+        }
+    }
+
+    // ── MultiHeadAttention（P-C2-7：MHA=Plain 双向无掩码）───────────────
+    //   forward fold 的 Plain 变体 + **backward recompute 的裸 S 表达式**
+    //   （无掩码 dsl::compute(matmul)——该结构此前只存在于 masked 分支，
+    //   MHA dry-run 是它唯一的闭合世界注册来源）；R/X 与 grad 累加与
+    //   CSA 同构同 key。
+    {
+        const std::size_t d_model = 16, heads = 2, seq = 4, batch = 2;
+        nn::MultiHeadAttention attn(d_model, heads, /*seq_len=*/seq);
+        (void)attn.init(engine);
+        nn::Tensor x = nn::Tensor::cpu(d_model, batch * seq);
+        auto fr = attn.forward(engine, x);
+        if (!fr)
+        {
+            std::fprintf(stderr, "[scan] MHA forward FAILED: %s\n",
+                         fr.error().message.c_str());
+            std::fflush(stderr);
+            std::abort();
+        }
+        nn::Tensor grad = nn::Tensor::cpu(d_model, batch * seq);
+        auto br = attn.backward(engine, grad);
+        if (!br)
+        {
+            std::fprintf(stderr, "[scan] MHA backward FAILED: %s\n",
+                         br.error().message.c_str());
+            std::fflush(stderr);
+            std::abort();
         }
     }
 
@@ -444,6 +507,49 @@ int main(int argc, char* argv[])
                 nn::dsl::leaf(x) == nn::dsl::col_broadcast(mx),
                 nn::Scalar{1}, nn::Scalar{0})),
             kk, cols);
+    }
+
+    // ── P-C1 fold 分块状态归约（表达式集合登记）──────────────────────────
+    // 三个共享样例（expr_fold.hpp——与 fused_gpu_test 对拍**同源构造** →
+    // key 一致、闭合世界命中）：rowmax / rowsum / softmax_denom(online 双
+    // 状态)。k 不进 key → 任意收缩长度共享同一 shader；此处取代表值。
+    // 构造即 validate：结构违规在构建期直接失败，不带病进 registry。
+    {
+        const nn::ExprSpec fold_specs[] = {
+            nn::expr::make_fold_rowmax(64),
+            nn::expr::make_fold_rowsum(64),
+            nn::expr::make_fold_softmax_denom(64),
+        };
+        auto& reg_all = nn::fused::global_registry();
+        for (const auto& fs : fold_specs)
+        {
+            if (auto v = nn::validate_expr_spec(fs, fs.views.size()); !v)
+            {
+                std::fprintf(stderr, "[FAIL] fold 样例 validate 失败: %s\n",
+                             v.error().message.c_str());
+                return 1;
+            }
+            reg_all.add(fs);
+        }
+        // P-C2 attention fold（双域）：vec_state_len 进 key → **每个 dk 一个
+        // shader**；k/batch/掩码外形状不进。测试形状族 dk∈{2,4,8} 逐个登记
+        // （模型层 d_k 由 Layer dry-run 覆盖，见 CausalSelfAttention 分支）。
+        for (const auto mk : {nn::expr::FoldAttnMask::Plain,
+                              nn::expr::FoldAttnMask::Causal,
+                              nn::expr::FoldAttnMask::Alibi})
+        {
+            for (const std::uint32_t dk : {2u, 4u, 8u})
+            {
+                const nn::ExprSpec as = nn::expr::make_fold_attn_o(64, dk, 2, mk);
+                if (auto v = nn::validate_expr_spec(as, as.views.size()); !v)
+                {
+                    std::fprintf(stderr, "[FAIL] attn fold 样例 validate 失败: %s\n",
+                                 v.error().message.c_str());
+                    return 1;
+                }
+                reg_all.add(as);
+            }
+        }
     }
 
     auto& reg = nn::fused::global_registry();

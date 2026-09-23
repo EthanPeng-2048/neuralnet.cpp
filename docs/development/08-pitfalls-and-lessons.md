@@ -212,6 +212,17 @@
   **push-constant 布局是生成器与打包器的隐式契约**，任何"按形态分支"的长度计算都
   必须逐形态与声明比对；③ 每条"层内表达式"都应有一个 CPU/GPU 对比用例，
   否则这类"只有 GPU 错"的缺陷只能靠端到端测试偶然撞上。
+- **复发（2026-09-23，P-C1 fold 形态，已修复）**：pc_base 公式其实有**两处**——
+  ①写入侧 `run_fused_gpu`（4.10 修的那处）②**创建侧** `compute_vk_backend.hpp`
+  注册 fused pipeline 时的 `push_constant_size`（`VulkanPipeline::create_generic`
+  的 range 参数）。新增 fold 形态（5 uint 头）时只改了写入侧 → range 仍按逐元素
+  2 uint 算 = 12 字节，`vkCmdPushConstants` 超 range 部分被驱动丢弃 →
+  **`fold_k` 读未定义残留**：残留值随前序 push 的 shader 漂移，表现为"时对时错"
+  （前一轮残留恰=K 造成假 PASS，下一轮残留=6 变成滑窗错值）。行守卫/cols 恰好在
+  前 12 字节内所以前 3 槽看起来正常，极具迷惑性。**定案方法**：K=1 打印全部行的
+  CPU/GPU 实值，`rowsum gpu[0] ≈ 全行总和` 直接钉死"fold_k=滑窗长度"。
+  **规则：改 PC 形态必须同改三处——生成器声明 / run_fused_gpu pc_base /
+  pipeline 注册 push_constant_size；诊断时先算 range 是否覆盖到最末字段。**
 
 ### 4.11 重排原语必须写清行/列主序（2026-09-20）
 
