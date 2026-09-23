@@ -2915,7 +2915,7 @@ public:
 
         // dispatch：逐元素 = ceil(count/(256*vec_width))；行归约 = rows 个工作组；
         // 列归约(tile) = ceil(cols/256) 个工作组（每工作组 256 列）；
-        // matmul 分块（S5）= (ceil(cols/BLOCK), ceil(rows/BLOCK), matmul_batch)，
+        // matmul 分块（S5）= (ceil(cols/BLOCK), ceil(m_per/BLOCK), matmul_batch)，
         // BLOCK 与 glsl_gen 生成的输出块一致（EXPR_MATMUL_BLOCK=64：每工作组
         // 64×64 输出块、16×16 线程、每线程 4×4 寄存器分块）
         const std::uint32_t vec_width = fused_vec_width_.count(shader_name)
@@ -2925,9 +2925,16 @@ public:
             const std::uint32_t wg_x =
                 (static_cast<std::uint32_t>(cols) + nn::EXPR_MATMUL_BLOCK - 1u)
                 / nn::EXPR_MATMUL_BLOCK;
+            // batch（S7）：dispatch z = 批次，A/B 按 batch 垂直切分 → y 只覆盖
+            // **批内**行 m_per = rows/mm_batch（生成器 main/load_tiles 均以 m_per
+            // 为界、写回守卫 rr < m_per）。按总 rows 派 y 会把 batch 在 y/z 数
+            // 两遍 → 工作量 ∝ batch²：多余 (BH−1)/BH 的 WG 跑完整条 mm_k 流水
+            // 后整块丢弃（结果仍正确 → 对拍测不出；AGENTS §12 ⑤ batch=32
+            // train 异常的根因）。rows = batch*M 按契约整除。
+            const std::uint32_t rows_u = static_cast<std::uint32_t>(rows);
+            const std::uint32_t m_per  = rows_u / matmul_batch;
             const std::uint32_t wg_y =
-                (static_cast<std::uint32_t>(rows) + nn::EXPR_MATMUL_BLOCK - 1u)
-                / nn::EXPR_MATMUL_BLOCK;
+                (m_per + nn::EXPR_MATMUL_BLOCK - 1u) / nn::EXPR_MATMUL_BLOCK;
             // batch（S7）：dispatch z = 批次，A/B 按 batch 垂直切分
             vkCmdDispatch(cmd, wg_x, wg_y, matmul_batch);
         }
