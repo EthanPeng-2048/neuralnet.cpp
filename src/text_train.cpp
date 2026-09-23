@@ -881,8 +881,8 @@ int main(int argc, char *argv[])
                   << flow_doc_ids.back() << " 篇文档，已删除 BOS/EOS）\n";
 
     // 切窗口：每个窗口 = 一个训练样本（长度 seq_len，末窗不足则 PAD）。
-    // 保留全部窗口（含跨文档）；文档感知经 M7 AttnBias 块对角掩码在两趟式
-    // 融合路径内生效（不物化 (BH·seq,seq)），无需再丢弃跨文档窗口。
+    // 保留全部窗口（含跨文档）；文档感知掩码在单 fold 融合 kernel 内生效
+    // （fold body 逐块 select 屏蔽，不物化 (BH·seq,seq)），无需再丢弃跨文档窗口。
     std::vector<std::size_t> window_offsets;  // 每个窗口在 token_flow 中的起始偏移
     window_offsets.reserve(token_flow.size() / stride + 1);
     for (std::size_t pos = 0; pos < token_flow.size(); pos += stride)
@@ -1177,7 +1177,7 @@ int main(int argc, char *argv[])
                                     test_flow, test_flow_doc_ids);
         }
 
-        // 测试窗口：保留全部窗口（与训练一致，含跨文档；文档感知两趟式生效）
+        // 测试窗口：保留全部窗口（与训练一致，含跨文档；文档感知掩码 kernel 内生效）
         for (std::size_t pos = 0; pos < test_flow.size(); pos += stride)
         {
             test_window_offsets.push_back(pos);
@@ -1376,8 +1376,8 @@ int main(int argc, char *argv[])
 
             // ── 文档感知 ────────────────────────────────────────
             // 行边界即文档边界（每行 = 一篇文档，见 build_flow_doc_ids）。
-            // 为每窗口设 doc_ids 施加块对角掩码；M7 AttnBias 使该路径走两趟式
-            //（不物化 (BH·seq,seq)），无需再丢弃跨文档窗口。
+            // 为每窗口设 doc_ids 施加块对角掩码；fold 掩码变体（Doc/AlibiDoc）
+            // 使该掩码在 kernel 内生效（不物化 (BH·seq,seq)），无需再丢弃跨文档窗口。
             std::vector<std::size_t> doc_ids;
             if (!flow_doc_ids.empty())
             {
@@ -1699,7 +1699,7 @@ int main(int argc, char *argv[])
                 auto x_tensor_r = engine->from_matrix(x_tokens);
                 if (!x_tensor_r) { std::cerr << "  测试 from_matrix 失败: " << x_tensor_r.error().message << '\n'; break; }
 
-                // 文档感知：与训练一致；为每窗口设 doc_ids（M7 两趟式块对角掩码）
+                // 文档感知：与训练一致；为每窗口设 doc_ids（fold 块对角掩码）
                 {
                     std::vector<std::size_t> test_doc_ids;
                     if (!test_flow_doc_ids.empty())

@@ -3,6 +3,7 @@
 #include "compute_layer_base.hpp"
 #include "compute_layer_mlp.hpp"
 #include "compute_layer_softmax.hpp"
+#include "expr_fold.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -151,23 +152,23 @@ public:
 //
 // 提取 MultiHeadAttention 与 CausalSelfAttention 的公共逻辑：
 //   - 完全相同的成员变量、参数/梯度接口
-//   - forward/backward 仅在「scores 之后、softmax 之前」是否施加掩码上有差异
+//   - MHA/CSA 的差异只在 fold 掩码变体（fold_mask_variant_：MHA=Plain 双向
+//     无掩码 / CSA=causal[+alibi/doc]），掩码恒在 fold body 内表达、绝不物化
 //
 // 算法（只在此处，不在 Engine/Shader）：
 //   Q = W_q × x, K = W_k × x, V = W_v × x  (三个 Linear 投影)
 //   Q/K/V: (H*d_k, batch*seq) — 头维度在行方向，batch 在列方向
 //
 //   批量化关键：用 rearrange_3d 把 (H*d_k, batch*seq) 重排为 (batch*H*d_k, seq)，
-//   使 batched_matmul 能按 batch*H 切分行块，单次 dispatch 处理所有样本和所有头。
+//   单次处理所有样本和所有头。
 //
-//   Q_re = rearrange_3d(Q, H*d_k, batch, seq) → (batch*H*d_k, seq)
-//   S = batched_matmul(Q_re, K_re, batch*H, transA=true, alpha=scale) → (batch*H*seq, seq)
-//     （scale = 1/sqrt(d_k) 通过 matmul 的 alpha 系数折进写出，省去独立 scale pass）
-//   S = apply_mask_(S)         ← 子类钩子（默认 no-op = MHA 行为）
-//   A = softmax(S)  — 行级归一化，堆叠布局下天然正确
-//   O_re = batched_matmul(V_re, A, batch*H) → (batch*H*d_k, seq)
-//   O = rearrange_3d(O_re, H*d_k, batch, seq, inverse=true) → (H*d_k, batch*seq)
-//   out = W_o × O
+//   forward（P-C2-7 单 fold 路径，S 不物化）：
+//   Q/K = rearrange_3d → (batch*H*d_k, seq)；[RoPE]；Q *= scale（S7 折进 Q）
+//   V_t = transpose + rearrange → (BH*seq, d_k)
+//   O_t = eval_expr(make_fold_attn_o(...), {Q, K, V_t, [掩码输入]}, BH*seq, d_k)
+//     —— QKᵀ/掩码/online softmax/ΣwV 全在单个 fold kernel 内逐块完成
+//   O = transpose + rearrange 回 (H*d_k, batch*seq)；out = W_o × O
+//   backward：W 由 recompute_W_ 按同掩码树重算，R/X 表达式 + batched_matmul
 //
 // 输入形状: (d_model, batch * seq_len)，输出形状: (d_model, batch * seq_len)
 //   seq_len 由构造函数指定，batch = input.cols() / seq_len 在 forward 时推断
@@ -192,14 +193,9 @@ protected:
     bool use_rope_ = false;
     RotaryEmbedding rope_;
 
-    // forward 缓存（rearranged 版本，供 backward 直接使用）
+    // forward 缓存（rearranged 版本，供 backward 直接使用；得分矩阵类缓存
+    // 随单 fold 路径全部取消——W/m/l/attn 均不物化，W 在 backward 重算）
     Tensor Q_cache_, K_cache_, V_cache_;  // (batch*H*d_k, seq) rearranged
-    Tensor attn_cache_;                    // (batch*H*seq, seq) 旧路径缓存
-
-    // 两趟式缓存（M6→S7）：m/l 替代 attn_cache_（不物化得分矩阵）；
-    // P0-5：W_cache_ 已删除（backward 改为从 Q/K/m/l 重算，省 6.4G）
-    Tensor m_cache_, l_cache_;   // (batch*H*seq, 1)：行 max / softmax 分母
-    bool two_pass_active_ = false;  // forward 是否走了两趟式路径（backward 读取）
 
     // ── S7：掩码输入张量钩子（IR 掩码表达式用；空 = 无该分量）──────────
     //   mask_slopes_   — ALiBi 按头斜率 (1, num_heads)，batch_mod(num_heads) 索引
@@ -216,6 +212,16 @@ protected:
     const Scalar kNegInf_ = -std::numeric_limits<Scalar>::infinity();
     [[nodiscard]] bool use_alibi_mask_() const { return mask_slopes_() != nullptr; }
     [[nodiscard]] bool use_doc_mask_() const { return mask_doc_col_() != nullptr; }
+
+    // ── fold 掩码变体选择（P-C2-7 正确性修复）──────────────────────────
+    //   类级语义，fail-safe 默认 = 无掩码：MHA（基类默认）双向不掩蔽——
+    //   与迁移前 apply_mask_ 默认 no-op 同义；CSA override 返回四分支
+    //   掩码树（causal 恒有 + alibi/doc 按钩子）。forward fold 与
+    //   recompute_W_ 的掩码树都经此选择（两者同构同序）。
+    [[nodiscard]] virtual nn::expr::FoldAttnMask fold_mask_variant_() const
+    {
+        return nn::expr::FoldAttnMask::Plain;
+    }
     template <typename E>
     auto masked_causal_(const E& scores, std::size_t /*seq*/) const
     {
@@ -255,66 +261,71 @@ protected:
         return scores + dsl::select(blocked != Scalar{0}, kNegInf_, alibi);
     }
 
-    // ── P0-5：从 Q/K/m/l 重算 W（消除 W_cache_ 的 6.4G 显存占用）──────
-    // 与 forward 的 compute_W 使用同一 DSL 表达式（闭合世界 key 一致）；
-    // attention FLOPs ×1.5–2（QK^T 在 backward 重算），训练可接受。
-    // 返回 (BH*seq, seq) 的 softmax 归一化权重。
+    // ── P0-5：从 Q/K 重算 W（P-C2-7：m/l 缓存已随 forward fold 迁移删除，
+    //   softmax 单表达式在 kernel 内部归一化，m/l 不再外溢）。两步均走既有
+    //   快路径：1) S = masked(Q·Kᵀ)（generate_glsl_matmul 分块；掩码树与
+    //   forward fold 的变体同构）2) W = softmax(S)（M3 归约快路径）。
+    // 返回 (BH*seq, seq) 的 softmax 归一化权重；attention FLOPs ×1.5–2
+    // （QK^T 在 backward 重算），训练可接受。
     [[nodiscard]] Result<Tensor> recompute_W_(
         ComputeEngine& engine,
         const Tensor& Q, const Tensor& K,
-        const Tensor& m_t, const Tensor& l_t,
         std::size_t BH, std::size_t seq) const
     {
         const bool use_slopes = use_alibi_mask_();
         const bool use_doc = use_doc_mask_();
-        if (use_slopes && use_doc)
+        // 1) S = masked(Q·Kᵀ)（四分支掩码树与 forward fold 的变体同构；
+        //    generate_glsl_matmul 分块快路径，S 瞬时物化一次）
+        Result<Tensor> sres = [&]() -> Result<Tensor> {
+            // MHA（Plain）：S 不施加任何掩码——与 forward fold 的 Plain
+            //   变体同构；裸 matmul 表达式由 scan_exprs 的 MHA dry-run
+            //   注册（闭合世界：该结构此前从未被 dry-run 覆盖）
+            if (fold_mask_variant_() == nn::expr::FoldAttnMask::Plain)
+                return dsl::compute(engine,
+                    dsl::matmul(Q, K, true, false, BH), BH * seq, seq);
+            if (use_slopes && use_doc)
+                return dsl::compute(engine,
+                    masked_alibi_doc_(dsl::matmul(Q, K, true, false, BH), seq),
+                    BH * seq, seq);
+            if (use_slopes)
+                return dsl::compute(engine,
+                    masked_alibi_(dsl::matmul(Q, K, true, false, BH), seq),
+                    BH * seq, seq);
+            if (use_doc)
+                return dsl::compute(engine,
+                    masked_doc_(dsl::matmul(Q, K, true, false, BH), seq),
+                    BH * seq, seq);
             return dsl::compute(engine,
-                dsl::exp(masked_alibi_doc_(
-                    dsl::matmul(Q, K, true, false, BH), seq)
-                    - dsl::row_broadcast(m_t)) / dsl::row_broadcast(l_t),
+                masked_causal_(dsl::matmul(Q, K, true, false, BH), seq),
                 BH * seq, seq);
-        if (use_slopes)
-            return dsl::compute(engine,
-                dsl::exp(masked_alibi_(
-                    dsl::matmul(Q, K, true, false, BH), seq)
-                    - dsl::row_broadcast(m_t)) / dsl::row_broadcast(l_t),
-                BH * seq, seq);
-        if (use_doc)
-            return dsl::compute(engine,
-                dsl::exp(masked_doc_(
-                    dsl::matmul(Q, K, true, false, BH), seq)
-                    - dsl::row_broadcast(m_t)) / dsl::row_broadcast(l_t),
-                BH * seq, seq);
+        }();
+        if (!sres) return std::unexpected(sres.error());
+        Tensor S = std::move(*sres);
+        // 2) W = softmax(S)（M3 单表达式归约快路径——与 Softmax::forward
+        //    同构：ReduceRef 直接参与算术按行广播；m/l 在 kernel 内部归一化，
+        //    不再作为输入/缓存存在）
         return dsl::compute(engine,
-            dsl::exp(masked_causal_(
-                dsl::matmul(Q, K, true, false, BH), seq)
-                - dsl::row_broadcast(m_t)) / dsl::row_broadcast(l_t),
+            dsl::exp(dsl::leaf(S) - dsl::row_reduce_max(S))
+            / dsl::row_reduce_sum(
+                dsl::exp(dsl::leaf(S) - dsl::row_reduce_max(S))),
             BH * seq, seq);
     }
 
-    // ── 两趟式（M6→S7）决策钩子 ──────────────────────────────────────
-    // 决定是否用两趟式注意力（S7 起恒 true：IR 融合路径不物化得分矩阵；
-    // 掩码分量经 mask_slopes_/mask_doc_col_/mask_doc_ids_ 钩子读取）。
-    struct TwoPassMask
-    {
-        bool use_two_pass = true;
-    };
-    [[nodiscard]] virtual Result<TwoPassMask> two_pass_mask_(
+    // ── 掩码输入准备钩子（P-C2-7 前身 = two_pass_mask_ 决策钩子）─────────
+    // forward 恒走单 fold 路径（旧物化/两趟分支已删，不保留旧路径）；本钩子
+    // 仅做"掩码输入张量准备"（CSA 覆写构建 slopes/doc_col/doc_ids 缓存），
+    // 掩码分量经 mask_slopes_/mask_doc_col_/mask_doc_ids_ 钩子供 fold/recompute
+    // 表达式读取。默认 no-op（MHA/AttentionBase 无掩码分量）。
+    [[nodiscard]] virtual Result<void> prepare_mask_inputs_(
         ComputeEngine& engine, std::size_t batch, std::size_t seq)
     {
         (void)engine; (void)batch; (void)seq;
-        return TwoPassMask{true};  // MHA：无偏置，两趟式
+        return {};
     }
 
-    // 掩码钩子：子类重写以施加掩码，默认 no-op（MHA 行为）
-    // 在 forward 中 scores（已含 alpha=scale 缩放）之后、softmax 之前调用
-    [[nodiscard]] virtual Result<Tensor> apply_mask_(
-        ComputeEngine& engine, Tensor&& scores,
-        std::size_t batch, std::size_t seq)
-    {
-        (void)engine; (void)batch; (void)seq;
-        return std::move(scores);
-    }
+    // （P-C2-7：apply_mask_ 物化路径钩子已删除——掩码恒在 fold body /
+    //   recompute_W_ 掩码树内表达，绝不物化 (BH·seq, seq) 掩码矩阵；
+    //   增量推理的 apply_mask_step_ 独立保留，见下。）
 
     // 增量推理掩码钩子：在 forward_step 中 scale 之后、softmax 之前调用。
     // 默认 no-op：MHA 无掩码；CSA 因果掩码在增量推理中天然满足
@@ -327,11 +338,6 @@ protected:
         (void)engine; (void)cur_len;
         return std::move(scores);
     }
-
-    // 在 backward 中 softmax 反向之后调用（掩码为常数，梯度直接穿透，默认 no-op）
-    virtual void mask_backward_(
-        ComputeEngine& /*engine*/, Tensor& /*grad_S*/,
-        std::size_t /*batch*/, std::size_t /*seq*/) {}
 
 public:
     AttentionBase(std::size_t d_model, std::size_t num_heads,
@@ -405,10 +411,7 @@ public:
         Q_cache_ = Tensor{};
         K_cache_ = Tensor{};
         V_cache_ = Tensor{};
-        attn_cache_ = Tensor{};
-        m_cache_ = Tensor{};
-        l_cache_ = Tensor{};
-        // 掩码/偏置描述子（two_pass_bias_ 指向子类 doc_ids/slopes 缓存）小而常驻，
+        // 掩码/偏置描述子（指向子类 doc_ids/slopes 缓存）小而常驻，
         // 不随激活清理
         w_q_.clear_cache();
         w_k_.clear_cache();
@@ -423,8 +426,6 @@ public:
         if (Q_cache_.valid()) r.emplace_back(Q_cache_);
         if (K_cache_.valid()) r.emplace_back(K_cache_);
         if (V_cache_.valid()) r.emplace_back(V_cache_);
-        if (m_cache_.valid()) r.emplace_back(m_cache_);
-        if (l_cache_.valid()) r.emplace_back(l_cache_);
         auto wq = w_q_.activation_cache(); r.insert(r.end(), wq.begin(), wq.end());
         auto wk = w_k_.activation_cache(); r.insert(r.end(), wk.begin(), wk.end());
         auto wv = w_v_.activation_cache(); r.insert(r.end(), wv.begin(), wv.end());
@@ -496,134 +497,54 @@ public:
         // 实测该点比 scale_inplace 慢（见 build/perfprobe 的原地/表达式对照）。
         { auto qs = engine.scale_inplace(Q, scale_); if (!qs) return std::unexpected(qs.error()); }
 
-        // 3-7. 注意力主体：两趟式 vs 旧路径（由掩码钩子决策）
+        // ── 注意力主体：单 fold 路径（P-C2-7，不保留旧路径）────────────
         const std::size_t BH = batch * num_heads_;
-        auto tpm = two_pass_mask_(engine, batch, seq);
-        if (!tpm) return std::unexpected(tpm.error());
-        Tensor concat_out;  // (batch*H*d_k, seq)
-        if (tpm->use_two_pass)
+        //   掩码输入张量准备（CSA 覆写钩子构建 slopes/doc_col/doc_ids）
         {
-            // ── 两趟式注意力（S7 IR 融合 + 单遍 Q·Kᵀ）─────────────────────
-            //   S = masked(scale·Q·K^T)               → (BH*seq, seq)，物化一遍
-            //   m = row_max(S)                        → (BH*seq, 1)
-            //   l = row_sum(exp(S − m))               → (BH*seq, 1)
-            //   W = exp(S − m)/l（在 S 上原地完成）    → (BH*seq, seq)，供 O = W·V_t
-            // 注意：S 是**瞬时**物化的（与旧实现里 W 的那份缓冲同形、同生命周期），
-            // 并非持久驻留；backward 仍按 P0-5 从 Q/K/m/l 重算 W。
-            const bool use_slopes = use_alibi_mask_();
-            const bool use_doc = use_doc_mask_();
-            // ── 得分矩阵 S = masked(scale·Q·K^T)：**只算一遍** ────────────
-            // 旧实现把同一份 Q·Kᵀ 折进 m / l / W 三个表达式，解释器于是把
-            // 全网格（BH*seq × seq）跑三遍（3 次 GEMM + 3 次逐元素解释）——
-            // 这是 CPU 上 MHA 的最大热点，也是 GPU 上白算的 Q·Kᵀ。
-            // 现在：S 物化一次 → m/l 交给引擎归约原语 → W 原地在 S 上完成。
-            //   m = row_max(S)                    （原语，row_reduce）
-            //   S ← exp(S − m)                    （DSL 纯逐元素，原地）
-            //   l = row_sum(S)                    （原语；此时 S 即未归一化权重）
-            //   S ← S / l                         （DSL 纯逐元素，原地）→ W
-            // 峰值内存不变：旧实现同样要在 forward 里物化 W（与 S 同形，均
-            // (BH*seq, seq)），此处只是把那份缓冲提前到 S 复用。
-            // 数值等价：exp(S−m)、行和与逐元素除法与旧表达式逐步同序，CPU 端
-            // 与旧路径逐字节一致（归约方向均为列升序）。
-            const auto build_scores = [&]() -> Result<Tensor> {
-                if (use_slopes && use_doc)
-                    return dsl::compute(engine,
-                        masked_alibi_doc_(
-                            dsl::matmul(Q, K, true, false, BH), seq),
-                        BH * seq, seq);
-                if (use_slopes)
-                    return dsl::compute(engine,
-                        masked_alibi_(
-                            dsl::matmul(Q, K, true, false, BH), seq),
-                        BH * seq, seq);
-                if (use_doc)
-                    return dsl::compute(engine,
-                        masked_doc_(
-                            dsl::matmul(Q, K, true, false, BH), seq),
-                        BH * seq, seq);
-                return dsl::compute(engine,
-                    masked_causal_(
-                        dsl::matmul(Q, K, true, false, BH), seq),
-                    BH * seq, seq);
-            };
-            auto S_res = build_scores();
-            if (!S_res) return std::unexpected(S_res.error());
-            Tensor S = std::move(*S_res);
-
-            // m = row_max(S) → (BH*seq, 1)
-            auto m = engine.row_reduce_max(S);
-            if (!m) return std::unexpected(m.error());
-            // S ← exp(S − m)（未归一化权重；原地）
-            auto wp = dsl::compute_into(engine,
-                dsl::exp(dsl::leaf(S) - dsl::row_broadcast(*m)), S);
-            if (!wp) return std::unexpected(wp.error());
-            // l = row_sum(S) → (BH*seq, 1)
-            auto l = engine.row_reduce_sum(S);
-            if (!l) return std::unexpected(l.error());
-            // S ← S / l → W（softmax 归一化权重；原地）
-            auto wn = dsl::compute_into(engine,
-                dsl::leaf(S) / dsl::row_broadcast(*l), S);
-            if (!wn) return std::unexpected(wn.error());
-            Tensor W = std::move(S);
-            if (!W.valid()) return std::unexpected(Error{"attention: W invalid"});
-            // V 需 (BH*seq, d_k) 布局：V (BH*d_k, seq) 是 per-batch (d_k, seq)，
-            // 按 batch 转置：transpose → (seq, BH*d_k) → rearrange_3d → (BH*seq, d_k)
-            auto V_T_full = engine.transpose(V);
-            if (!V_T_full) return std::unexpected(V_T_full.error());
-            auto V_t = engine.rearrange_3d(*V_T_full, seq, BH, d_k_, false);
-            if (!V_t) return std::unexpected(V_t.error());
-            // O = W × V_t（普通 batched_matmul 原语）
-            auto O_t = engine.batched_matmul(W, *V_t, BH, false, false);
-            if (!O_t) return std::unexpected(O_t.error());
-            // O_t: (BH*seq, d_k) → 按 batch 转置回 (BH*d_k, seq) 供后续 rearrange：
-            //   transpose → (d_k, BH*seq) → rearrange_3d(d_k, BH, seq) → (BH*d_k, seq)
-            auto O_T_full = engine.transpose(*O_t);
-            if (!O_T_full) return std::unexpected(O_T_full.error());
-            auto co = engine.rearrange_3d(*O_T_full, d_k_, BH, seq, false);
-            if (!co) return std::unexpected(co.error());
-            concat_out = std::move(*co);
-            if (!checkpoint_mode_)
-            {
-                Q_cache_ = std::move(Q);
-                K_cache_ = std::move(K);
-                V_cache_ = std::move(V);
-                m_cache_ = std::move(*m);
-                l_cache_ = std::move(*l);
-                // P0-5：不缓存 W（6.4G），backward 改为从 Q/K/m/l 重算
-            }
-            two_pass_active_ = true;
+            auto pm = prepare_mask_inputs_(engine, batch, seq);
+            if (!pm) return std::unexpected(pm.error());
         }
-        else
+        // 掩码变体（类级语义：MHA=Plain 双向无掩码 / CSA=四分支树，见
+        //   fold_mask_variant_；与 recompute_W_ 的掩码树同构同序）
+        const auto fmask = fold_mask_variant_();
+        Tensor concat_out;  // (batch*H*d_k, seq)——fold 输出 O_t 经转置/重排得到
+        // V 需 (BH*seq, d_k) 布局：V_t 构建（原位于 W 之后，fold 需前置）
+        auto V_T_full = engine.transpose(V);
+        if (!V_T_full) return std::unexpected(V_T_full.error());
+        auto V_t = engine.rearrange_3d(*V_T_full, seq, BH, d_k_, false);
+        if (!V_t) return std::unexpected(V_t.error());
+        // ── 单 fold 表达式：S 不物化、online 单遍 ──────────────────────
+        //   6 趟 (BH·seq, seq) 物化流量归零；掩码在 fold body 内逐块生效，
+        //   causal_skip 把被屏蔽块钳成空转（被跳过的恰是 -inf/0 恒等项 →
+        //   与全量计算逐位一致，见 FoldSpec::causal_skip 注释）。
+        //   inputs 顺序 = make_fold_attn_o 的 views 顺序：Q,K,V_t,[slope],[dc],[ids]
+        std::vector<Tensor> fold_in{Q, K, *V_t};
+        if (const Tensor* sl = mask_slopes_())  fold_in.push_back(*sl);
+        if (const Tensor* dc = mask_doc_col_()) fold_in.push_back(*dc);
+        if (const Tensor* di = mask_doc_ids_()) fold_in.push_back(*di);
+        const nn::ExprSpec fold_spec =
+            nn::expr::make_fold_attn_o(seq, d_k_, BH, fmask);
+        if (auto fv = nn::validate_expr_spec(fold_spec, fold_in.size()); !fv)
+            return std::unexpected(fv.error());
+        // scale 已折进 Q（scale_inplace，S7 教训）——fold 的 mm 段直接消费
+        auto O_t_r = engine.eval_expr(fold_spec, fold_in, BH * seq, d_k_);
+        if (!O_t_r) return std::unexpected(O_t_r.error());
+        Tensor O_t = std::move(*O_t_r);
+        // O_t: (BH*seq, d_k) → 按 batch 转置回 (BH*d_k, seq) 供后续 rearrange：
+        //   transpose → (d_k, BH*seq) → rearrange_3d(d_k, BH, seq) → (BH*d_k, seq)
+        auto O_T_full = engine.transpose(O_t);
+        if (!O_T_full) return std::unexpected(O_T_full.error());
+        auto co = engine.rearrange_3d(*O_T_full, d_k_, BH, seq, false);
+        if (!co) return std::unexpected(co.error());
+        concat_out = std::move(*co);
+        if (!checkpoint_mode_)
         {
-            // ── 旧路径：物化得分矩阵（ALiBi/doc_ids 等共享掩码不适用时回退） ──
-            two_pass_active_ = false;
-            // S = batched_matmul(Q, K, batch*H, transA=true) → (batch*H*seq, seq)
-            // scale (1/sqrt(d_k)) 通过 alpha 系数折进 matmul 写出（cuBLAS sgemm 语义），
-            // 省去一次全矩阵 scale pass + 额外 barrier
-            auto scores = engine.batched_matmul(
-                Q, K, BH, true, false, scale_);
-            if (!scores) return std::unexpected(scores.error());
-            // 施加掩码（钩子：MHA 默认 no-op，CSA 施加因果/ALiBi 掩码）
-            auto masked = apply_mask_(engine, std::move(*scores), batch, seq);
-            if (!masked) return std::unexpected(masked.error());
-            // A = softmax(S_masked)
-            auto attn = softmax_.forward(engine, *masked);
-            if (!attn) return std::unexpected(attn.error());
-            Tensor A = std::move(*attn);
-            // O_re = batched_matmul(V, A, batch*H, transB=true) → (batch*H*d_k, seq)
-            // 标准 attention: O[:,i] = sum_j V[:,j] * A[i,j] = (V × A^T)[:,i]
-            auto co = engine.batched_matmul(V, A, BH, false, true);
-            if (!co) return std::unexpected(co.error());
-            concat_out = std::move(*co);
-            if (!checkpoint_mode_)
-            {
-                // 注意力概率由 softmax_.output_cache() 单一持有（A 与其共享 buffer），
-                // 不再另存 attn_cache_（避免旧路径重复存一份 (BH*seq, seq) 大矩阵）
-                Q_cache_ = std::move(Q);
-                K_cache_ = std::move(K);
-                V_cache_ = std::move(V);
-            }
+            Q_cache_ = std::move(Q);
+            K_cache_ = std::move(K);
+            V_cache_ = std::move(V);
+            // P-C2-7：m/l 不再缓存（recompute_W_ 内部 softmax 归一化，见 P0-5 区）
         }
+        // 掩码恒在 fold body 内生效（fold_mask_variant_ 选变体），绝不物化
 
         // 8. rearrange back: (batch*H*d_k, seq) → (H*d_k, batch*seq)
         Tensor concat;
@@ -669,9 +590,8 @@ public:
             grad_concat_re = std::move(*gc);
         }
 
-        // 3-7. 注意力反向：两趟式（M6，重算 W 不物化 grad_S）vs 旧路径
+        // 3-7. 注意力反向：S7 R/X 路径（P-C2-7：旧 softmax.backward 分支不保留）
         Tensor grad_Q_re, grad_K_re, grad_V_re;  // 均 (batch*H*d_k, seq)
-        if (two_pass_active_)
         {
             // P = grad_A = batched_matmul(grad_concat^T, V, BH, true, false)
             // forward: O = V × A^T → grad_A = grad_O^T × V（两趟式反向的 P 输入）
@@ -685,10 +605,10 @@ public:
             auto G = engine.rearrange_3d(*G_T_full, seq, BH, d_k_, false);
             if (!G) return std::unexpected(G.error());
             // ── S7 IR 路径（M6 → R/X 表达式 + 普通 batched_matmul）──
-            //   从 Q/K/m/l 重算 W（P0-5：消除 W_cache_ 的 6.4G 显存占用）；
+            //   从 Q/K 重算 W（P0-5：不缓存 W；P-C2-7 起 m/l 也不缓存——
+            //   recompute_W_ 内部 softmax 单表达式归一化）；
             //   FLOPs ×1.5-2（QK^T 重算），训练可接受。
-            auto W_re = recompute_W_(engine, Q_cache_, K_cache_,
-                                     m_cache_, l_cache_, BH, seq);
+            auto W_re = recompute_W_(engine, Q_cache_, K_cache_, BH, seq);
             if (!W_re) return std::unexpected(W_re.error());
             //   R  = row_sum(W·P)                     → (BH*seq, 1)
             //   X  = scale·W·(P − R)                  → (BH*seq, seq)（物化）
@@ -722,38 +642,6 @@ public:
             grad_Q_re = std::move(*gq);
             grad_K_re = std::move(*gk);
             grad_V_re = std::move(*gv_re);
-        }
-        else
-        {
-            // grad_V_re = batched_matmul(grad_concat, A, BH, false, false)
-            // forward: O = V × A^T → grad_V = grad_O × A
-            // A 由 softmax.output_cache() 单一持有（避免 attn_cache_ 重复存一份）
-            auto gvr = engine.batched_matmul(
-                grad_concat_re, softmax_.output_cache(), BH, false, false);
-            if (!gvr) return std::unexpected(gvr.error());
-            grad_V_re = std::move(*gvr);
-            // grad_A = batched_matmul(grad_concat^T, V, BH, true, false)
-            // forward: O = V × A^T → grad_A = grad_O^T × V
-            auto grad_A = engine.batched_matmul(
-                grad_concat_re, V_cache_, BH, true, false);
-            if (!grad_A) return std::unexpected(grad_A.error());
-            // grad_S = softmax.backward(grad_A) — 掩码/偏置为常数，梯度直接穿透
-            auto grad_S = softmax_.backward(engine, *grad_A);
-            if (!grad_S) return std::unexpected(grad_S.error());
-            mask_backward_(engine, *grad_S, batch, seq);
-            // grad_Q_re = batched_matmul(K, grad_S, BH, false, true) × scale
-            // 前向 S = scale·Q^T·K → ∂L/∂Q = scale·K·grad_S^T，
-            // scale 通过 alpha 折进 matmul 写出（省去两次全矩阵 scale pass）
-            auto gq = engine.batched_matmul(
-                K_cache_, *grad_S, BH, false, true, scale_);
-            if (!gq) return std::unexpected(gq.error());
-            grad_Q_re = std::move(*gq);
-            // grad_K_re = batched_matmul(Q, grad_S, BH, false, false) × scale
-            // ∂L/∂K = scale·Q·grad_S，同样折进 alpha
-            auto gk = engine.batched_matmul(
-                Q_cache_, *grad_S, BH, false, false, scale_);
-            if (!gk) return std::unexpected(gk.error());
-            grad_K_re = std::move(*gk);
         }
 
         // 7.5 RoPE backward：对 Q/K 梯度施加反角旋转
@@ -932,66 +820,6 @@ public:
 //   每个 tile_size 列块为同一份编码，对应一个样本。
 // ══════════════════════════════════════════════════════════════════════════
 
-// ── 扁平化注意力掩码构建（纯函数，可独立单测） ─────────────────────────
-//
-// 返回 (BH*seq, seq) 的掩码，其中 BH = batch*num_heads。
-// 行 (b, h, t) 位于 (b*num_heads + h)*seq + t，列 j = key 位置（0..seq-1）。
-//
-// doc_ids（可选，batch-major：b*seq+t → 文档 id）非空时启用块对角文档感知：
-//   - 跨文档位置禁止相互注意（值 = -inf）
-//   - 同文档内仍施加因果掩码（未来位置 j>i 为 -inf）
-// doc_ids 为空时退化为纯因果掩码（与现有行为一致）。
-//
-// use_alibi 时，在允许注意的位置叠加 ALiBi 线性偏置 -m_h*(i-j)。
-[[nodiscard]] Matrix build_attention_mask(
-    std::size_t batch, std::size_t seq_len, std::size_t num_heads,
-    bool use_alibi, std::span<const Scalar> slopes,
-    std::span<const std::size_t> doc_ids = {})
-{
-    NN_ASSERT(!use_alibi || slopes.size() >= num_heads,
-              "build_attention_mask: slopes too small for num_heads");
-    NN_ASSERT(doc_ids.empty() || doc_ids.size() >= batch * seq_len,
-              "build_attention_mask: doc_ids too small for batch*seq_len");
-
-    const Scalar neg_inf = -std::numeric_limits<Scalar>::infinity();
-    const std::size_t BH = batch * num_heads;
-    Matrix mask(BH * seq_len, seq_len);
-    for (std::size_t b = 0; b < batch; ++b)
-    {
-        for (std::size_t h = 0; h < num_heads; ++h)
-        {
-            const std::size_t head_idx = b * num_heads + h;
-            const Scalar slope = use_alibi ? slopes[h] : Scalar{0};
-
-            for (std::size_t i = 0; i < seq_len; ++i)
-            {
-                for (std::size_t j = 0; j < seq_len; ++j)
-                {
-                    bool allowed = (j <= i);
-                    if (allowed && !doc_ids.empty())
-                    {
-                        // 块对角文档感知：仅同文档内的因果位置可注意
-                        allowed = (doc_ids[b * seq_len + i]
-                                   == doc_ids[b * seq_len + j]);
-                    }
-                    if (allowed)
-                    {
-                        const Scalar bias = use_alibi
-                            ? -slope * static_cast<Scalar>(i - j)
-                            : Scalar{0};
-                        mask.set_value_unchecked(head_idx * seq_len + i, j, bias);
-                    }
-                    else
-                    {
-                        mask.set_value_unchecked(head_idx * seq_len + i, j, neg_inf);
-                    }
-                }
-            }
-        }
-    }
-    return mask;
-}
-
 // ══════════════════════════════════════════════════════════════════════════
 // CausalSelfAttention — 因果自注意力（继承 AttentionBase，仅重写掩码钩子）
 //
@@ -1023,16 +851,15 @@ class CausalSelfAttention final : public AttentionBase
 private:
     bool use_alibi_;        // true = ALiBi 模式（因果掩码 + 线性偏置）
 
-    // 掩码缓存（平铺为 batch*H*seq × seq 以匹配堆叠 scores 布局）
-    // ALiBi 模式下包含因果掩码 + 线性偏置；普通模式下仅因果掩码
-    Tensor mask_cache_;
-    std::size_t mask_cached_batch_ = 0;  // 缓存键：batch（独立字段，避免位打包溢出）
-    std::size_t mask_cached_seq_ = 0;    // 缓存键：seq_len
-
-    // 两趟式（M6→S7）组合偏置小张量缓存（AttnBias 描述子指向它们；
-    // S7 IR 掩码表达式经 mask_slopes_/mask_doc_col_/mask_doc_ids_ 读取）
-    Tensor slopes_cache_;   // (1, num_heads) ALiBi 按头斜率（惰性构建）
-    Tensor doc_ids_cache_;  // (1, batch*seq) 每位置文档 id（每步重建）
+    // 掩码输入张量缓存（fold body / recompute_W_ 掩码树经
+    // mask_slopes_/mask_doc_col_/mask_doc_ids_ 钩子读取）
+    // ALiBi 斜率表 (1, batch*num_heads)：按 (b,h) 块重复 slopes_[h]——fold 的
+    //   batch_mod(BH) 按网格下标 b*H+h 直读（旧 (1,H) 表 batch≥2 时 b≥1 越界
+    //   读、ALiBi 静默错；batch=1 恰好掩蔽）。旧 recompute 的 batch_mod(%H)
+    //   与增量推理按 h∈[0,H) 读均落首块 → 语义不变。batch 变化时重建。
+    Tensor slopes_cache_;
+    std::size_t slopes_cached_batch_ = 0;  // slopes_cache_ 形状键（batch 变更重建）
+    Tensor doc_ids_cache_;  // (1, batch*H*seq) 每位置文档 id 按 (b,h) 块重复（每步重建）
     Tensor doc_col_;        // (BH*seq, 1) 每行文档 id（每步重建，S7 掩码用）
 
     // ALiBi 斜率：m_h = 2^(-8h/H)（仅 use_alibi_ = true 时使用）
@@ -1053,23 +880,6 @@ private:
         }
     }
 
-    [[nodiscard]] Result<void> ensure_mask_(ComputeEngine& engine, std::size_t batch, std::size_t seq_len)
-    {
-        // 用 (batch, seq_len) 作为缓存键
-        if (mask_cached_batch_ == batch && mask_cached_seq_ == seq_len)
-            return {};
-
-        // 纯因果掩码：委托 build_attention_mask（doc_ids 为空）
-        auto mask = build_attention_mask(batch, seq_len, num_heads_,
-                                         use_alibi_, slopes_);
-        auto r = engine.from_matrix(mask);
-        if (!r) return std::unexpected(r.error());
-        mask_cache_ = std::move(*r);
-        mask_cached_batch_ = batch;
-        mask_cached_seq_ = seq_len;
-        return {};
-    }
-
 public:
     // 设置当前 step 的每样本文档 id（batch-major b*seq+t → doc id）。
     // 传入空 span 会清除文档感知，退化为纯因果掩码。
@@ -1086,48 +896,28 @@ public:
     }
 
 protected:
-    // 重写掩码钩子：在 scale 之后、softmax 之前施加因果/ALiBi 掩码
-    [[nodiscard]] Result<Tensor> apply_mask_(
-        ComputeEngine& engine, Tensor&& scores,
-        std::size_t batch, std::size_t seq) override
-    {
-        if (has_doc_ids_)
-        {
-            // 文档感知：doc_ids_ 每 batch 变化，掩码不可缓存，每步重建
-            // 块对角（跨文档 -inf）∧ 因果（同文档内未来 -inf）
-            auto m = build_attention_mask(batch, seq, num_heads_,
-                                          use_alibi_, slopes_, doc_ids_);
-            auto mt = engine.from_matrix(m);
-            if (!mt) return std::unexpected(mt.error());
-            return dsl::compute(engine,
-                dsl::leaf(scores) + dsl::leaf(*mt),
-                scores.rows(), scores.cols());
-        }
-        {
-            auto r = ensure_mask_(engine, batch, seq);
-            if (!r) return std::unexpected(r.error());
-        }
-        return dsl::compute(engine,
-            dsl::leaf(scores) + dsl::leaf(mask_cache_),
-            scores.rows(), scores.cols());
-    }
-
-    // 重写两趟式决策：组合式 AttnBias 描述子统一 因果/ALiBi/doc_ids（及其组合），
-    // 全部走两趟式（不物化 (BH·seq, seq) 得分矩阵），不再回退旧路径。
-    [[nodiscard]] Result<TwoPassMask> two_pass_mask_(
+    // 掩码输入张量准备（原 two_pass_mask_ 的构建体原样保留、职责纯化）：
+    //   slopes_cache_ / doc_ids_cache_ / doc_col_ 由本钩子构建，
+    //   掩码分量经 mask_slopes_/mask_doc_col_/mask_doc_ids_ 钩子读取。
+    [[nodiscard]] Result<void> prepare_mask_inputs_(
         ComputeEngine& engine, std::size_t batch, std::size_t seq) override
     {
         // 掩码分量由 mask_slopes_/mask_doc_col_/mask_doc_ids_ 钩子读取（IR 表达式）
         if (use_alibi_)
         {
-            if (!slopes_cache_.valid())
+            // fold 契约：batch_mod(BH) 直读 b*H+h → 表长必须 = batch*H。
+            //   旧 (1,num_heads) 表在 batch≥2 越界读/ALiBi 静默丢（batch=1
+            //   掩蔽，历史单样本测试未暴露）；按 (b,h) 块重复 slopes_[h]。
+            if (!slopes_cache_.valid() || slopes_cached_batch_ != batch)
             {
-                Matrix s(1, num_heads_);
-                for (std::size_t h = 0; h < num_heads_; ++h)
-                    s.set_value_unchecked(0, h, slopes_[h]);
+                Matrix s(1, batch * num_heads_);
+                for (std::size_t b = 0; b < batch; ++b)
+                    for (std::size_t h = 0; h < num_heads_; ++h)
+                        s.set_value_unchecked(0, b * num_heads_ + h, slopes_[h]);
                 auto t = engine.from_matrix(s);
                 if (!t) return std::unexpected(t.error());
                 slopes_cache_ = std::move(*t);
+                slopes_cached_batch_ = batch;
             }
         }
         if (has_doc_ids_)
@@ -1163,7 +953,7 @@ protected:
             }
 
         }
-        return TwoPassMask{/*use_two_pass=*/true};
+        return {};
     }
 
     // ── S7 掩码输入张量钩子（IR 掩码表达式读取）──────────────────────
@@ -1173,6 +963,17 @@ protected:
     { return has_doc_ids_ ? &doc_col_ : nullptr; }
     [[nodiscard]] const Tensor* mask_doc_ids_() const override
     { return has_doc_ids_ ? &doc_ids_cache_ : nullptr; }
+
+    // fold 掩码变体 override：CSA = 因果恒有 + alibi/doc 按钩子（四分支
+    //   与旧 apply_mask_ override 语义同构）
+    [[nodiscard]] nn::expr::FoldAttnMask fold_mask_variant_() const override
+    {
+        return use_doc_mask_()
+            ? (use_alibi_mask_() ? nn::expr::FoldAttnMask::AlibiDoc
+                                : nn::expr::FoldAttnMask::Doc)
+            : (use_alibi_mask_() ? nn::expr::FoldAttnMask::Alibi
+                                : nn::expr::FoldAttnMask::Causal);
+    }
 
     // 重写增量推理掩码钩子：ALiBi 模式下施加线性距离偏置。
     // 普通因果模式（use_alibi_ = false）：no-op，因 cache 只含前文，因果天然满足。

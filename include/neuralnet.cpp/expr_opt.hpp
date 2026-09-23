@@ -599,6 +599,15 @@ namespace nn
 // ═══════════════════════════════════════════════════════════════════════════
 [[nodiscard]] inline ExprSpec canonicalize_expr_spec(const ExprSpec& spec)
 {
+    // fold 段（P-C1）：整段不参与 IR-A/B——所有 pass 只作用于顶层 instrs
+    // （fold spec 顶层恒空），且它们构造 out 时逐字段拷贝、不认识 fold 字段
+    // （静默丢段 → registry key 撞车 + gen_fused 收到空 instrs spec 崩溃，
+    //   实测 0xC00000FD）。原样返回同时保证 scan / runtime / key 三端一致
+    // （canonical 不变式：expr_spec_key(spec) ≡ expr_spec_key(canonical(spec))，
+    //   对 fold spec 退化为恒等——P-C2 若要在 body 上跑 DCE/CSE，须先给
+    //   各 pass 补 fold 字段透传再放开，勿直接删本行）。
+    if (spec.fold)
+        return spec;
     ExprSpec s = fold_constants_and_algebra(spec);
     s = dead_code_elimination(s);
     s = renumber_registers(s);

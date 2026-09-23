@@ -226,6 +226,50 @@ int main(int argc, char* argv[])
         else { std::cout << "  ❌ A * B^T 失败\n"; ++failures; }
     }
 
+    // ── 3c. 小 N matmul（GEMV 快路径，N ≤ 8 → matmul_gemv）────────────
+    // 覆盖：N=1/5/8（vec4 与 N%4≠0 标量回退）、奇数 M/K（行尾+k 尾块）、
+    // transA=1（沿 m vec4）、transB=1（沿 k vec4）及其标量回退组合。
+    std::cout << "[3c] 小 N matmul（GEMV 路径）...\n";
+    {
+        struct GemvCase { std::size_t Am, Ak, Bk, Bn; bool tA, tB; };
+        // 字段 = 存储形状（行×列）。维度反推：tA ⇒ M=A.cols, K=A.rows；
+        // tB ⇒ N=B.rows, K=B.cols。故非转置需 Ak==Bk，tA 需 Am==Bk，
+        // tB 需 Bn==Ak。以下用例均已按此校验。
+        const GemvCase cases[] = {
+            {256, 512, 512,  1, false, false},  // N=1 纯 GEMV（B 沿 k 扁平 vec4）
+            {256, 512, 512,  5, false, false},  // N%4≠0 → 扁平 vec4 拆分
+            {256, 512, 512,  8, false, false},  // N%4==0 → 按行 vec4
+            {255, 513, 513,  7, false, false},  // 奇数 M/K：行尾 + k 尾块标量
+            {256,  64, 256,  8, true,  false},  // tA：M=64,K=256（M%4==0 → 沿 m vec4）
+            {257,  65, 257,  6, true,  false},  // tA：M=65,K=257 奇数 → 标量回退
+            {128, 384,   8, 384, false, true},  // tB：N=8,K=384（K%4==0 → 沿 k vec4）
+            {130, 386,   3, 386, false, true},  // tB：N=3,K=386 奇数 K → 标量回退
+            {257,  64,   4, 257, true,  true},   // 双转置：M=64,K=257,N=4
+        };
+        for (const auto& c : cases)
+        {
+            Matrix a(c.Am, c.Ak), b(c.Bk, c.Bn);
+            for (auto& v : a.span()) v = dist(rng);
+            for (auto& v : b.span()) v = dist(rng);
+
+            auto cpu_r = engine_matmul(*cpu_engine, a, b, c.tA, c.tB);
+            auto gpu_r = engine_matmul(*gpu_engine, a, b, c.tA, c.tB);
+            if (cpu_r && gpu_r)
+            {
+                Scalar err = max_abs_diff(*cpu_r, *gpu_r);
+                const bool ok = err < 1e-2f;
+                if (!ok) ++failures;
+                // N 由存储形状反推：tB ⇒ N=B.rows，否则 N=B.cols
+                const std::size_t n_out = c.tB ? c.Bk : c.Bn;
+                std::cout << "  A(" << c.Am << "x" << c.Ak << ") B(" << c.Bk << "x" << c.Bn
+                          << ") tA=" << c.tA << " tB=" << c.tB
+                          << " N=" << n_out << " err=" << std::scientific << std::setprecision(4) << err
+                          << (ok ? " ✅" : " ❌") << "\n";
+            }
+            else { std::cout << "  ❌ GEMV case 执行失败\n"; ++failures; }
+        }
+    }
+
     // ── 4. roundtrip + 逐元素 + 归约测试 ─────────────────────────
     std::cout << "\n[4/6] roundtrip + 逐元素 + 归约测试...\n";
     {
