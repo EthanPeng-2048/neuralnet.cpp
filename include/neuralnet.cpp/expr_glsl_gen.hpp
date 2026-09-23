@@ -965,8 +965,22 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
     // ── 块循环 + body 段扫描发射 ─────────────────────────────────────────
     L << "\n    for (uint k0 = 0u; k0 < fold_k; k0 += " << EXPR_FOLD_BLOCK
       << "u) {\n";
-    L << "        const uint valid = min(" << EXPR_FOLD_BLOCK
-      << "u, fold_k - k0);\n";
+    if (f.causal_skip)
+    {
+        // causal 整块/边界跳过（qt = row%m_per，与链内 select 谓词同源）：
+        //   k0>qt 整块 valid=0 空转（smm/链/归约/vecacc 全由 valid 门控），边界
+        //   块钳到 qt+1-k0。跳过项恰为链内 -inf/0 屏蔽值 → 恒等，与 CPU 全量
+        //   逐位一致；valid 仅依赖 row/k0 → 全 WG 均匀，体内屏障无发散。
+        //   注：causal_skip 只由 make_fold_attn_o（恒带 mm）置位，m_per 必有定义。
+        L << "        const uint qt = row % m_per;\n";
+        L << "        const uint valid = min(min(" << EXPR_FOLD_BLOCK
+          << "u, fold_k - k0), (k0 > qt ? 0u : qt + 1u - k0));\n";
+    }
+    else
+    {
+        L << "        const uint valid = min(" << EXPR_FOLD_BLOCK
+          << "u, fold_k - k0);\n";
+    }
     if (has_mm)
     {
         // QKᵀ 协作化（映射随 BLOCK 参数化，见 shared 声明处注释）
