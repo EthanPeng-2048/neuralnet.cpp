@@ -1,5 +1,5 @@
 // ── matmul_tiled.comp ─────────────────────────────────────────────────────
-// vec4 向量化分块矩阵乘法：C[M][N] = A × B（借鉴 llama.cpp GEMM 思路）
+// vec4 向量化分块矩阵乘法：C[M][N] = A × B（借鉴 llama.cpp/ggml mul_mm 思路）
 //
 // 支持转置（同 matmul.comp）：
 //   - transA=0, transB=0: C[M][N] = A[M][K] × B[K][N]
@@ -12,7 +12,24 @@
 //   - vec4 共享内存：Ash[k][m]（A 转置）/ Bsh[k][n]，每线程每 k 仅 2 次
 //     vec4 LDS + 16 FMA（8:1 计算:加载比），消除旧版标量读的 bank 冲突
 //   - vec4 累加器：acc[4]（4×4 = 16 个累加值），寄存器常驻
-//   - 共享内存 8KB（4KB A + 4KB B），远低于 V100 96KB 上限
+//
+// v2（双缓冲流水，BK=16）：Ash/Bsh 各分 2 个 stage，tile t+1 的全局加载与
+//   tile t 的计算并行发射；每 tile 的 barrier 由 2 次减为 1 次，全局内存
+//   延迟（~600 周期）被计算覆盖。共享内存总计 16KB
+//   （Ash[2][16][16]vec4 8KB + Bsh 8KB）——与单缓冲 BK=32 版相同的占用率；
+//   BK=32 双缓冲需 32KB，会砍半 blocks/SM 抵消流水收益（实测净 0）。
+//
+// v3（vec4 全局加载/写出，借鉴 ggml mul_mm 的 ALIGNED/LOAD_VEC 快路径）：
+//   - 每线程 EPT 个元素按「转置形态选连续维」分组，对齐时一条 vec4 全局
+//     访问替代 4 次标量 + 逐元素边界判断；形状条件为 uniform 分支零开销
+//   - 对齐条件（元素下标 %4==0 且组内连续 ⇔）：
+//       A: transA=0 需 K%4==0（沿 k 连续）；transA=1 需 M%4==0（沿 m 连续）
+//       B: transB=0 需 N%4==0（沿 n 连续）；transB=1 需 K%4==0（沿 k 连续）
+//       C: 写出需 N%4==0（沿列连续）
+//     基址 16B 对齐由 MemoryPool 分配对齐 ≥16 保证（compute_memory_pool.hpp）
+//   - 未对齐（奇数形状）或线程持边界组：回退同组标量 + 边界判零，
+//     覆盖分组与 vec4 路径完全一致 → 每个 (k,m) 恰被写一次，语义不变
+//   - A/B 全局缓冲以 vec4 别名视图访问（同 binding 双声明，std430）
 // ─────────────────────────────────────────────────────────────────────────
 
 #version 450
@@ -22,6 +39,11 @@ layout(local_size_x = 16, local_size_y = 16) in;
 layout(std430, binding = 0) readonly buffer  BufferA { float A[]; };
 layout(std430, binding = 1) readonly buffer  BufferB { float B[]; };
 layout(std430, binding = 2) writeonly buffer BufferC { float C[]; };
+
+// vec4 别名视图（同 binding 双声明；仅在元素下标 %4==0 的快路径使用）
+layout(std430, binding = 0) readonly buffer  BufferAv4 { vec4 Av4[]; };
+layout(std430, binding = 1) readonly buffer  BufferBv4 { vec4 Bv4[]; };
+layout(std430, binding = 2) writeonly buffer BufferCv4 { vec4 Cv4[]; };
 
 layout(push_constant) uniform PushConstants {
     uint M;      // C 的行数
@@ -34,27 +56,150 @@ layout(push_constant) uniform PushConstants {
 // 分块维度常量
 const uint BM = 64u;  // 输出块行数
 const uint BN = 64u;  // 输出块列数
-const uint BK = 32u;  // K 维度分块宽度（32：barrier 次数减半，共享内存 16KB）
+// BK=16 + 双缓冲：Ash[2][16][16]vec4 = 8KB + Bsh 8KB = **16KB 共享内存**，
+// 与单缓冲 BK=32 版完全相同的占用率（blocks/SM），但保留流水重叠。
+// （BK=32 双缓冲需 32KB，会把 blocks/SM 砍半抵消流水收益——实测净 0。）
+const uint BK = 16u;  // K 维度分块宽度
 
-// Shared Memory（vec4 布局，16B 对齐）：
-//   Ash[k][m]：A^T 分块 —— A[m][k]（转置写共享内存，内层按行连续读）
-//   Bsh[k][n]：B 分块 —— B[k][n]（内层按行连续读）
-// 每个 vec4 = 4 个 float（64 行/列的 1/4）
-shared vec4 Ash[BK][BM / 4];
-shared vec4 Bsh[BK][BN / 4];
+// 每线程协作加载元素数（BM*BK/256）。下方按 4 元素组取 groups=EPT/4 →
+// 仅 BK%16==0 才铺满整 tile（BK=8 → groups=0 全不加载；BK=24 → 缺 1/3
+// 垃圾值）——当前 BK=16 安全，改 BK 前先验 EPT%4==0。
+const uint EPT_A = (BM * BK) / 256u;  // BK=16 → 4
+const uint EPT_B = (BK * BN) / 256u;  // BK=16 → 4
 
-// ── 访问 A 元素（转置感知）─────────────────────────────────────────────
-// transA=0: A[m][k] = A[m * K + k]  （标准行主序 (M,K)）
-// transA=1: A[m][k] = A[k * M + m]  （转置存储 (K,M)）
-float getA(uint m, uint k) {
-    return (transA != 0u) ? A[k * M + m] : A[m * K + k];
+// Shared Memory（vec4 布局，16B 对齐，双缓冲 [2][...]）：
+//   Ash[stage][k][m]：A^T 分块 —— A[m][k]（转置写共享内存，内层按行连续读）
+//   Bsh[stage][k][n]：B 分块 —— B[k][n]（内层按行连续读）
+// 每个 vec4 = 4 个 float（64 行/列的 1/4）；stage 交替：tile t 用 t&1
+shared vec4 Ash[2][BK][BM / 4];
+shared vec4 Bsh[2][BK][BN / 4];
+
+// ── 协作加载 A 分块 BM×BK → 指定 stage ────────────────────────────────────
+// 线程分组：EPT_A/4 个「4 元素组」，组索引 g = tid*(EPT_A/4) + vv。
+// 按 transA 选连续维（全局地址连续 ⇒ vec4 快路径）：
+//   transA=0：A[m][k] 行主序，组 = 同行连续 4 个 k（g ↔ m=(4g)/BK, k0=(4g)%BK）
+//   transA=1：A 存储 (K,M)，组 = 同 k 连续 4 个 m（g ↔ k=g/(BM/4), mq=g%(BM/4)）
+// 未对齐/边界回退走**同一分组**的标量循环 → 覆盖恰好一致。
+void load_A_tile(uint t, uint stage, uint tid, uint block_row)
+{
+    const uint a_base_col = t * BK;
+    const bool k_contig = (transA == 0u);
+    // vec4 元素下标 %4==0 的形状条件（uniform 分支）：
+    //   沿 k 连续：gr*K%4==0 ∀gr ⇔ K%4==0；沿 m 连续：k*M%4==0 ∀k ⇔ M%4==0
+    const bool aligned = k_contig ? ((K & 3u) == 0u) : ((M & 3u) == 0u);
+    const uint groups = EPT_A / 4u;
+
+    for (uint vv = 0u; vv < groups; ++vv)
+    {
+        const uint g = tid * groups + vv;
+        if (k_contig)
+        {
+            // ── 沿 k 连续：4 个连续 k，同一行 m ──────────────────────────
+            const uint m  = (4u * g) / BK;
+            const uint k0 = (4u * g) % BK;
+            const uint gr = block_row + m;
+            const uint gc = a_base_col + k0;   // k0%4==0、a_base_col%4==0 ⇒ gc%4==0
+            if (aligned && gr < M && gc < K)
+            {
+                // K%4==0 且 gc<K ⇒ gc+3<K，vec4 整组在行内；下标 %4==0 ⇒ 16B 对齐
+                const vec4 v = Av4[(gr * K + gc) >> 2];
+                Ash[stage][k0    ][m >> 2][m & 3u] = v.x;
+                Ash[stage][k0 + 1u][m >> 2][m & 3u] = v.y;
+                Ash[stage][k0 + 2u][m >> 2][m & 3u] = v.z;
+                Ash[stage][k0 + 3u][m >> 2][m & 3u] = v.w;
+            }
+            else
+            {
+                for (uint j = 0u; j < 4u; ++j)
+                {
+                    const float v = (gr < M && gc + j < K) ? A[gr * K + gc + j] : 0.0;
+                    Ash[stage][k0 + j][m >> 2][m & 3u] = v;
+                }
+            }
+        }
+        else
+        {
+            // ── 沿 m 连续（A 存储 K×M）：4 个连续 m，同一 k ─────────────
+            const uint mq = g % (BM / 4u);
+            const uint k  = g / (BM / 4u);
+            const uint gc = a_base_col + k;
+            const uint gr = block_row + mq * 4u;  // block_row%4==0（BM%4==0）
+            if (aligned && gc < K && gr < M)
+            {
+                // M%4==0 且 gr<M ⇒ gr+3<M；下标 = gc*M+gr，两因子均 %4==0
+                Ash[stage][k][mq] = Av4[(gc * M + gr) >> 2];
+            }
+            else
+            {
+                for (uint j = 0u; j < 4u; ++j)
+                {
+                    const float v = (gr + j < M && gc < K) ? A[gc * M + gr + j] : 0.0;
+                    Ash[stage][k][mq][j] = v;
+                }
+            }
+        }
+    }
 }
 
-// ── 访问 B 元素（转置感知）─────────────────────────────────────────────
-// transB=0: B[k][n] = B[k * N + n]  （标准行主序 (K,N)）
-// transB=1: B[k][n] = B[n * K + k]  （转置存储 (N,K)）
-float getB(uint k, uint n) {
-    return (transB != 0u) ? B[n * K + k] : B[k * N + n];
+// ── 协作加载 B 分块 BK×BN → 指定 stage ────────────────────────────────────
+// 按 transB 选连续维：
+//   transB=0：B[k][n] 行主序，组 = 同 k 连续 4 个 n（g ↔ k=(4g)/BN, n0=(4g)%BN）
+//   transB=1：B 存储 (N,K)，组 = 同 n 连续 4 个 k（g ↔ n=g/4, k0=(g%4)*4）
+void load_B_tile(uint t, uint stage, uint tid, uint block_col)
+{
+    const uint b_base_row = t * BK;
+    const bool n_contig = (transB == 0u);
+    // 沿 n 连续：k*N%4==0 ∀k ⇔ N%4==0；沿 k 连续：n*K%4==0 ∀n ⇔ K%4==0
+    const bool aligned = n_contig ? ((N & 3u) == 0u) : ((K & 3u) == 0u);
+    const uint groups = EPT_B / 4u;
+
+    for (uint vv = 0u; vv < groups; ++vv)
+    {
+        const uint g = tid * groups + vv;
+        if (n_contig)
+        {
+            // ── 沿 n 连续：4 个连续 n，同一行 k ──────────────────────────
+            const uint k  = (4u * g) / BN;
+            const uint n0 = (4u * g) % BN;
+            const uint gr = b_base_row + k;
+            const uint gc = block_col + n0;     // n0%4==0、block_col%4==0 ⇒ gc%4==0
+            if (aligned && gr < K && gc < N)
+            {
+                const vec4 v = Bv4[(gr * N + gc) >> 2];
+                Bsh[stage][k][n0 >> 2] = v;     // vec4 沿 n ↔ [k][n>>2] 整槽
+            }
+            else
+            {
+                for (uint j = 0u; j < 4u; ++j)
+                {
+                    const float v = (gr < K && gc + j < N) ? B[gr * N + gc + j] : 0.0;
+                    Bsh[stage][k][(n0 + j) >> 2][(n0 + j) & 3u] = v;
+                }
+            }
+        }
+        else
+        {
+            // ── 沿 k 连续（B 存储 N×K）：4 个连续 k，同一 n ─────────────
+            const uint n  = g / 4u;
+            const uint k0 = (g % 4u) * 4u;
+            const uint gc = block_col + n;
+            const uint gr = b_base_row + k0;    // b_base_row%4==0（t*BK%4==0）
+            if (aligned && gc < N && gr < K)
+            {
+                const vec4 v = Bv4[(gc * K + gr) >> 2];
+                for (uint j = 0u; j < 4u; ++j)
+                    Bsh[stage][k0 + j][n >> 2][n & 3u] = v[j];
+            }
+            else
+            {
+                for (uint j = 0u; j < 4u; ++j)
+                {
+                    const float v = (gr + j < K && gc < N) ? B[gc * K + gr + j] : 0.0;
+                    Bsh[stage][k0 + j][n >> 2][n & 3u] = v;
+                }
+            }
+        }
+    }
 }
 
 void main()
@@ -74,47 +219,33 @@ void main()
 
     const uint num_tiles = (K + BK - 1u) / BK;
 
+    // ── 前奏：加载 tile 0 → stage 0，同步一次 ───────────────────────
+    load_A_tile(0u, 0u, tid, block_row);
+    load_B_tile(0u, 0u, tid, block_col);
+    barrier();
+
+    // ── 流水循环：发射 tile t+1 的加载（stage^1），同时计算 tile t ────
+    //   每 tile 仅 1 次 barrier（旧版 2 次）；barrier 同时保证
+    //   ① tile t+1 的全局加载在下一迭代被读取前完成
+    //   ② tile t 的计算在 stage^1 被覆盖前完成（与 ①天然错开 stage）
+    uint stage = 0u;
     for (uint t = 0u; t < num_tiles; ++t)
     {
-        // ── 协作加载 A 分块 → Ash（转置写）：64×32 = 2048 元素，每线程 8 ──
+        const uint nxt = t + 1u;
+        const uint nstage = stage ^ 1u;
+        if (nxt < num_tiles)
         {
-            const uint a_base_col = t * BK;
-            for (uint load = 0u; load < 8u; ++load)
-            {
-                const uint elem = tid * 8u + load;   // 0..2047
-                const uint m = elem / BK;             // 行 0..63
-                const uint k = elem % BK;             // k 0..31
-                const uint gr = block_row + m;
-                const uint gc = a_base_col + k;
-                const float v = (gr < M && gc < K) ? getA(gr, gc) : 0.0;
-                Ash[k][m >> 2][m & 3u] = v;
-            }
+            load_A_tile(nxt, nstage, tid, block_row);
+            load_B_tile(nxt, nstage, tid, block_col);
         }
-
-        // ── 协作加载 B 分块 → Bsh：32×64 = 2048 元素，每线程 8 ──
-        {
-            const uint b_base_row = t * BK;
-            for (uint load = 0u; load < 8u; ++load)
-            {
-                const uint elem = tid * 8u + load;
-                const uint k = elem / BN;             // k 0..31
-                const uint n = elem % BN;             // 列 0..63
-                const uint gr = b_base_row + k;
-                const uint gc = block_col + n;
-                const float v = (gr < K && gc < N) ? getB(gr, gc) : 0.0;
-                Bsh[k][n >> 2][n & 3u] = v;
-            }
-        }
-
-        barrier();
 
         // ── vec4 外积累加（每 k：2 次 vec4 LDS + 16 FMA = 8:1） ──────
         #pragma unroll 4
         for (uint k = 0u; k < BK; ++k)
         {
             // 本线程负责的 4 行（ty*4..ty*4+3）与 4 列（tx*4..tx*4+3）
-            const vec4 a_vec = Ash[k][ty];
-            const vec4 b_vec = Bsh[k][tx];
+            const vec4 a_vec = Ash[stage][k][ty];
+            const vec4 b_vec = Bsh[stage][k][tx];
 
             acc[0] += a_vec.x * b_vec;
             acc[1] += a_vec.y * b_vec;
@@ -123,22 +254,34 @@ void main()
         }
 
         barrier();
+        stage = nstage;
     }
 
     // ── 写入结果 ──────────────────────────────────────────────────────
+    // vec4 快路径（N%4==0，uniform）：out_col0%4==0 且 out_col0<N
+    //   ⇒ out_col0+3<N（整组在行内），单条 vec4 写出免 3 次边界判断。
+    // 否则逐标量 + 边界判断（列尾残余 / 奇数形状）。
+    const bool c_vec4 = ((N & 3u) == 0u);
     for (uint i = 0u; i < 4u; ++i)
     {
         const uint out_row = block_row + ty * 4u + i;
         if (out_row >= M) continue;
         const uint out_col0 = block_col + tx * 4u;
-        if (out_col0 >= N) continue;
-        C[out_row * N + out_col0 + 0u] = acc[i].x;
-        if (out_col0 + 1u < N)
-            C[out_row * N + out_col0 + 1u] = acc[i].y;
-        if (out_col0 + 2u < N)
-            C[out_row * N + out_col0 + 2u] = acc[i].z;
-        if (out_col0 + 3u < N)
-            C[out_row * N + out_col0 + 3u] = acc[i].w;
+        if (c_vec4)
+        {
+            if (out_col0 < N)
+                Cv4[(out_row * N + out_col0) >> 2] = acc[i];
+        }
+        else
+        {
+            if (out_col0 >= N) continue;
+            C[out_row * N + out_col0 + 0u] = acc[i].x;
+            if (out_col0 + 1u < N)
+                C[out_row * N + out_col0 + 1u] = acc[i].y;
+            if (out_col0 + 2u < N)
+                C[out_row * N + out_col0 + 2u] = acc[i].z;
+            if (out_col0 + 3u < N)
+                C[out_row * N + out_col0 + 3u] = acc[i].w;
+        }
     }
 }
-

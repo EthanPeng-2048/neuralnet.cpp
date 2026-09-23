@@ -996,6 +996,41 @@ public:
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols) override
     {
+        // ── fold 段（P-C1）：canonicalize 对 fold 恒等（expr_opt 入口
+        //    early-return），scan/runtime 两端 key 同源 → 直接用 raw_spec 查表。
+        //    PC/分派形态由 run_fused_gpu 的 fold_k 参数走（见其形态校验）。
+        if (raw_spec.fold)
+        {
+            const std::string fkey = nn::expr_spec_key(raw_spec);
+#ifdef NN_FUSED_REGISTRY_EMBEDDED
+            const nn::fused::FusedShader* ffs = nn::fused::find_fused(fkey);
+            if (ffs && backend_.has_fused_shader(fkey))
+            {
+                std::vector<GpuTensor> gpu_inputs;
+                gpu_inputs.reserve(inputs.size());
+                for (const auto& t : inputs)
+                {
+                    auto g = ensure_gpu(t);
+                    if (!g) return std::unexpected(g.error());
+                    gpu_inputs.push_back(g->gpu_tensor());
+                }
+                const auto fvp = nn::expr_spec_runtime_view_params(raw_spec);
+                auto out = backend_.run_fused_gpu(
+                    fkey, gpu_inputs, raw_spec.consts, rows, cols,
+                    /*vector_out=*/false, fvp, raw_spec.rparams,
+                    /*output_override=*/nullptr,
+                    // P-C2：fold 自带 matmul 段的 k/batch（7 槽 PC 的 slot5/6）
+                    nn::expr_spec_runtime_matmul_k(raw_spec),
+                    nn::expr_spec_runtime_matmul_batch(raw_spec),
+                    nn::expr_spec_runtime_fold_k(raw_spec));
+                if (!out) return std::unexpected(out.error());
+                return Tensor::from_gpu(std::move(*out));
+            }
+#endif
+            return std::unexpected(Error{
+                "GpuEngine::eval_expr: fold 表达式未命中 AOT 融合 shader"
+                "（闭合世界）；请将该 fold 结构纳入 scan_exprs"});
+        }
         // ── canonical IR：canonicalize 为引擎内部优化（IR-A/IR-B），
         //    key 与 shader 合成两端一致；dispatch 用 canonical 的 consts ──
         const ExprSpec spec = nn::canonicalize_expr_spec(raw_spec);
@@ -1042,6 +1077,11 @@ public:
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols) override
     {
+        // fold 形态只经 eval_expr（PC 需 fold_k，本入口不传）——显式拒绝，
+        //   否则落到 run_fused_gpu 的通用缺参错误，误导排查方向
+        if (raw_spec.fold)
+            return std::unexpected(Error{
+                "GpuEngine::eval_expr_reduce: fold 表达式请走 eval_expr（需 fold_k 形态参数）"});
         // canonical IR：与 eval_expr 同（canonicalize 为引擎内部优化）
         const ExprSpec spec = nn::canonicalize_expr_spec(raw_spec);
 
@@ -1106,6 +1146,10 @@ public:
         if (dst.rows() != rows || dst.cols() != cols)
             return std::unexpected(Error{"eval_expr_into: dst shape mismatch"});
 
+        // fold 形态只经 eval_expr（PC 需 fold_k，本入口不传）——显式拒绝
+        if (raw_spec.fold)
+            return std::unexpected(Error{
+                "GpuEngine::eval_expr_into: fold 表达式请走 eval_expr（需 fold_k 形态参数）"});
         const ExprSpec spec = nn::canonicalize_expr_spec(raw_spec);
         if (nn::expr_spec_reduce_axis(spec) != -1)
             return std::unexpected(Error{

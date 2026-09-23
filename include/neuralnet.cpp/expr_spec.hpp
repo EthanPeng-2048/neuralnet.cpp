@@ -112,7 +112,7 @@ enum class ExprOperandKind : uint8_t
     Row   = 6,
     Col   = 7,
     Batch = 8,
-    // ── 新增：运行时标量参数（RParam，形状无关融合的标量推广）──
+    // 运行时标量参数（RParam，形状无关融合的标量推广）──
     // 引用 spec.rparams 第 idx 项。与视图参数（RowMod 周期 / RotateHalf
     // 块大小）同思想：**值本身是运行时数据**（如优化器的 lr/eps/β、偏差
     // 修正系数），不是表达式结构 → 不进 expr_spec_key；同结构不同值的
@@ -121,6 +121,10 @@ enum class ExprOperandKind : uint8_t
     // 与 Const 的区别：Const 值进 key（结构）、编译期不变；RParam 值不进
     // key（运行时）、CPU 求值用 spec.rparams[idx]、GPU 经 PC 传入。
     RParam = 9,
+    // ── fold 行向量态操作数（P-C2）：按当前输出列 d 读行向量态[idx][d]──
+    // 仅允许出现在 fold 的 finalize（向量域逐列求值）；idx 恒 0（单槽，
+    // 多槽留位）。veclen=0（P-C1 fold）时校验拒绝。
+    VecState = 10,
 };
 
 // 操作数：2 字节（kind + idx），指令布局紧凑、可序列化、未来可入 push constant
@@ -246,6 +250,138 @@ struct MatmulSpec
     friend bool operator==(const MatmulSpec&, const MatmulSpec&) = default;
 };
 
+// ── 行向量状态的块内更新（VecAccSpec：通用"双线性块累加"，P-C2）──────────
+// 语义（每个收缩块执行一次，键域完成后）：
+//   if (has_scale) vec[row][:] *= scale_reg(row);      // 行标量广播 rescale
+//   vec[row][d] += Σ_{j∈valid} weight(row, j0+j) * b(j0+j, d);
+// 其中 weight 是 body 产出的 (row, j) 网格寄存器，b_input 是 (k, vec_state_len)
+// 布局的收缩侧输入。**通用结构**（流式线性组合 / 带 rescale 的加权累加），
+// 引擎只认此结构、不认任何算法名。
+struct VecAccSpec
+{
+    std::uint8_t vec_state  = 0;  // 目标行向量态槽（P-C2 恒 0；多槽留位）
+    std::uint8_t weight_reg = 0;  // body 产出的 (row, j) 权重寄存器号
+    std::uint8_t b_input    = 0;  // 收缩侧输入槽（(k, vec_state_len) 行主序）
+    std::uint8_t scale_reg  = 0;  // 行标量缩放寄存器（rescale α）
+    std::uint8_t has_scale  = 1;  // 0=仅累加；1=先 vec*=scale 再累加
+
+    friend bool operator==(const VecAccSpec&, const VecAccSpec&) = default;
+};
+
+// ── 分块状态归约段（FoldSpec：分块流式求值地基，P-C1 起，P-C2 双域）──────
+// 抽象：一切计算 = 沿某轴迭代 + 跨迭代状态（分块/硬件友好思想的通用承载，
+// 不针对任何具体算法）。
+// 域结构（P-C2 起）：
+//   **键域**（收缩轴 k，块循环）：
+//     每块在网格 (row, j∈[j0, j0+valid)) 上执行 body：
+//       - 可选 matmul 段（内层收缩：网格 (row, j) 上求值 C(row,j)=Σ_d…，
+//         经 Matmul 操作数引用——块局部、j 为**全局**列；a/b 索引与既有
+//         MatmulSpec 宥全一致：cols=PC cols=k、batch 分解同 batched_matmul）
+//       - 寄存器 0..num_state-1 = 行标量态（跨块持久，初值 inits[]）
+//       - 归约指令 = 沿块内 j 归约（每行一块值，Reduce 操作数按行广播）
+//       - Row/Col/Batch 操作数（需 matmul 段存在；语义与既有 batched 网格
+//         一致：Row=row%（rows/batch)、Col=全局 j、Batch=row/(rows/batch)）
+//       - Body 可写行标量态（源须全行标量——类别分析静态保证）
+//     键域后执行 vecacc（若在）：行向量态按上式块更新（rescale + 双线性累加）
+//   **向量域**（输出列 ∈ [0, out_cols)，out_cols = vec_state_len 或 1）：
+//     finalize 指令序列逐 (row, d) 求值：可读行标量态、行向量态（VecState
+//     操作数按当前 d 读）→ 末指令 dst = 输出元素；输出网格 (rows, out_cols)。
+// P-C1 兼容：vec_state_len=0（无 vecacc/matmul/VecState）时退化为单列标量
+//   fold，语义与行为逐字节不变。
+// key：结构字段全进（inits/两段指令/matmul 转置与槽位/vecacc/causal_skip）；
+//   k、matmul 的 k/batch、vec_state_len 不进（形状参数 → 运行时 push
+//   constant；veclen 进 key 会让每个 dk 一个 shader，见 expr_spec_key 注释）。
+struct FoldSpec
+{
+    std::uint8_t        num_state = 1;  // 行标量态数（前缀寄存器 0..num_state-1）
+    std::uint32_t       k = 0;          // 收缩轴长度（形状参数，运行时 push constant）
+    std::vector<Scalar> inits;          // 标量态初值，size == num_state（进 key）
+    std::vector<ExprInstr> body;        // 键域块指令序列
+    std::vector<ExprInstr> finalize;    // 向量域收尾指令（veclen=0 时单列执行）
+    // ── P-C2 双域扩展（默认值 = 纯 P-C1 行为）──
+    std::uint32_t                vec_state_len = 0;  // 行向量态长度（0=无；输出列数）
+    std::optional<MatmulSpec>    matmul;   // 键域内层收缩段（块局部，N=k 全轴）
+    std::optional<VecAccSpec>    vecacc;   // 行向量态块更新
+    // causal 整块跳过（仅 make_fold_attn_o 非 Plain 置位；进 key——结构/
+    //   codegen 分歧点）：生成器把块内 valid 钳到
+    //   min(BLOCK, fold_k-k0, qt+1-k0)，k0>qt 的整块空转。被跳过的 j 恰为
+    //   链内 select 屏蔽项（-inf/0）→ max 加 -inf、sum 加 0、w=0 时 +0·V=+0
+    //   均为恒等 → 与全量计算逐位一致。CPU 不钳（全量算，等价性同上）。
+    bool                            causal_skip = false;
+
+    friend bool operator==(const FoldSpec&, const FoldSpec&) = default;
+};
+
+// ── fold body 寄存器类别流分析（校验 / CPU 执行 / GLSL 生成共用）──────────
+// 类别：**行标量**（每行一值：状态、块归约 dst、纯标量源派生）vs **元素**
+// （依赖块内列 kb：Input 或元素类派生）。写入状态（或行标量寄存器）的指令
+// 源必须全为行标量——否则同一状态被各 kb/各线程覆盖（未定义）。静态单遍
+// 传递即可判定（指令序内 src 类别已知）。
+// 返回 reg_elem[r]（1=元素类）；状态收到元素源 → unexpected。
+[[nodiscard]] inline Result<std::vector<uint8_t>> expr_fold_classify(
+    const FoldSpec& f, std::uint32_t num_regs)
+{
+    std::vector<uint8_t> is_elem(num_regs, 0);
+    std::vector<uint8_t> is_reduce_dst(num_regs, 0);
+    const auto src_elem = [&](const ExprOperand& op) -> int
+    {
+        const auto k = static_cast<ExprOperandKind>(op.kind);
+        if (k == ExprOperandKind::Input)
+            return 1;
+        // P-C2：依赖网格列（=块内 kb）的都算元素类——Matmul 段（N=全轴列）、
+        //   Col（全局列索引）。Row / Batch 派生自行号（行固定 → 行标量）。
+        //   BatchMod/BatchCol 是**视图 kind**（经 Input 操作数访问，Input 已=1，
+        //   保守偏元素类：掩码链只进权重/归约源、不直接写状态，无碍）。
+        //   VecState 不允许出现在 body（validate 拒）。
+        if (k == ExprOperandKind::Matmul || k == ExprOperandKind::Col)
+            return 1;
+        if (k == ExprOperandKind::Row || k == ExprOperandKind::Batch ||
+            k == ExprOperandKind::Const || k == ExprOperandKind::RParam)
+            return 0;
+        if (k == ExprOperandKind::VecState)
+            return -1;
+        if (k == ExprOperandKind::Reg || k == ExprOperandKind::Fanout)
+        {
+            if (op.idx >= num_regs) return -1;
+            if (is_reduce_dst[op.idx]) return 0;   // 块归约 dst = 行标量
+            return is_elem[op.idx];
+        }
+        if (k == ExprOperandKind::Reduce)
+            return (op.idx < num_regs) ? 0 : -1;   // 归约结果 = 行标量
+        return -1;                                 // 未知 kind → 域错误
+    };
+    for (const auto& ins : f.body)
+    {
+        const ExprOp op = static_cast<ExprOp>(ins.op);
+        const std::size_t nops = expr_op_is_reduce(op) ? 1
+            : expr_instr_num_operands(op);
+        const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
+        int e = 0;
+        for (std::size_t oi = 0; oi < nops; ++oi)
+        {
+            const int se = src_elem(*ops[oi]);
+            if (se < 0)
+                return std::unexpected(Error{"expr_fold_classify: operand domain error"});
+            if (se > e) e = se;
+        }
+        if (ins.dst >= num_regs)
+            return std::unexpected(Error{"expr_fold_classify: dst out of range"});
+        if (expr_op_is_reduce(op))
+        {
+            is_reduce_dst[ins.dst] = 1;
+            is_elem[ins.dst] = 0;                  // 归约输出恒为行标量
+        }
+        else
+        {
+            if (ins.dst < f.num_state && e != 0)
+                return std::unexpected(Error{
+                    "expr_fold_classify: state written from element-class source (kb-dependent overwrite)"});
+            if (e != 0) is_elem[ins.dst] = 1;      // 类别单调升为元素（跨指令保守）
+        }
+    }
+    return is_elem;
+}
+
 // ── 表达式规格（运行时可序列化，跨后端）─────────────────────────────────
 // 语义：
 //   - 所有输入 Tensor 同形状 (rows, cols)，views[i] 与 inputs[i] 一一对应
@@ -254,6 +390,7 @@ struct MatmulSpec
 //   - matmul 段（可选）：若存在，先计算 C = op(A,B)（输出网格 (rows,cols)），
 //     逐元素链经 Matmul 操作数读取（matmul 不消耗逐元素寄存器）；
 //     instrs 可为空（输出 = matmul 结果本身）。
+//   - fold 段（可选）：见 FoldSpec；存在时 instrs 必须为空，输出 = fold 输出。
 // 上限（校验保证，亦约束 GPU 路径资源）：
 //   - 指令 ≤ 64，寄存器 ≤ 16，输入 ≤ 8，常量 ≤ 16
 struct ExprSpec
@@ -264,23 +401,38 @@ struct ExprSpec
     std::vector<Scalar>         rparams; // 运行时标量参数（不进 key，运行时按实际值填充）
     std::uint32_t               num_regs = 0;
     std::optional<MatmulSpec>   matmul;  // 前置 matmul 段（可选；缺省=无）
+    std::optional<FoldSpec>     fold;    // 分块状态归约段（可选；缺省=无）
 };
 
 // ── matmul 段辅助（引擎/校验/生成器共用）──────────────────────────────
 [[nodiscard]] inline bool expr_spec_has_matmul(const ExprSpec& s) noexcept
 { return s.matmul.has_value(); }
+// fold 段（P-C1）：存在时该 spec 走分块状态归约求值路径
+[[nodiscard]] inline bool expr_spec_has_fold(const ExprSpec& s) noexcept
+{ return s.fold.has_value(); }
 // 运行时 matmul 形状参数（k：求和维度；batch：批量数）。形状无关融合：
 // k/batch 不进 key，作为 push constant 运行时填充（同 P2-13 的
-// RowMod/RotateHalf 处理）。
+// RowMod/RotateHalf 处理）。**P-C2：fold 自带 matmul 段同语义**（spec.fold
+// 的段优先于顶层——fold spec 顶层恒无 matmul，两处不冲突）。
 [[nodiscard]] inline std::optional<std::uint32_t> expr_spec_runtime_matmul_k(
     const ExprSpec& s) noexcept
 {
-    return s.matmul ? std::optional<std::uint32_t>{s.matmul->k} : std::nullopt;
+    if (s.matmul) return s.matmul->k;
+    if (s.fold && s.fold->matmul) return s.fold->matmul->k;
+    return std::nullopt;
 }
 [[nodiscard]] inline std::uint32_t expr_spec_runtime_matmul_batch(
     const ExprSpec& s) noexcept
 {
-    return s.matmul ? s.matmul->batch : 1u;
+    if (s.matmul) return s.matmul->batch;
+    if (s.fold && s.fold->matmul) return s.fold->matmul->batch;
+    return 1u;
+}
+// fold 收缩轴长度（形状参数，不进 key → push constant 运行时填充）
+[[nodiscard]] inline std::optional<std::uint32_t> expr_spec_runtime_fold_k(
+    const ExprSpec& s) noexcept
+{
+    return s.fold ? std::optional<std::uint32_t>{s.fold->k} : std::nullopt;
 }
 // batched 网格的"每 batch 行数"（M）：rows 为输出总行（batch*M）
 [[nodiscard]] inline std::size_t expr_spec_rows_per_batch(const ExprSpec& s,
@@ -374,7 +526,8 @@ struct ExprSpec
     return a.instrs == b.instrs && a.views == b.views &&
            a.consts == b.consts && a.rparams == b.rparams &&
            a.num_regs == b.num_regs &&
-           a.matmul == b.matmul;
+           a.matmul == b.matmul &&
+           a.fold == b.fold;
 }
 
 // 该 spec 的运行时标量参数个数（= 融合 shader 的 push constant 浮点 p 槽位数）
@@ -450,6 +603,53 @@ struct ExprSpec
         feed(&s.matmul->transA, 1);
         feed(&s.matmul->transB, 1);
     }
+    // fold 段（P-C1）：结构字段全进 key（num_state、inits 初值——-inf/0 属
+    // 结构、body/finalize 指令序列）；k 是形状参数不进（同 matmul.k 处理，
+    // 运行时 push constant）。指令喂法与顶层 instrs 一致（字节级 POD）。
+    if (s.fold)
+    {
+        feed(&s.fold->num_state, 1);
+        feed_u32(static_cast<std::uint32_t>(s.fold->inits.size()));
+        for (const auto& v : s.fold->inits)
+            feed(&v, sizeof(v));
+        const auto feed_seq = [&](const std::vector<ExprInstr>& seq)
+        {
+            feed_u32(static_cast<std::uint32_t>(seq.size()));
+            for (const auto& in : seq)
+            {
+                feed(&in.op, 1);
+                feed(&in.dst, 1);
+                feed(&in.a, sizeof(in.a));
+                feed(&in.b, sizeof(in.b));
+                feed(&in.c, sizeof(in.c));
+            }
+        };
+        feed_seq(s.fold->body);
+        feed_seq(s.fold->finalize);
+        // P-C2 双域字段：matmul 段（tA/tB/槽位进 key，k/batch 形状参数不进
+        //   ——同顶层 MatmulSpec 规则）、vecacc（全进：weight/scale 槽位是结构）。
+        //   **vec_state_len 不进 key**（形状参数——输出列数=模型 d_k，进 key 会让
+        //   每个 dk 一个 shader、闭合世界永远缺登记（offload/attn 测试 dk miss
+        //   实证）；运行时经 PC 的 vector_out 槽填充——同 k/batch/vp 形状无关
+        //   融合先例）。vecacc 的存在性（⇔veclen>0，成对校验）由 if 包裹隐式编码。
+        if (s.fold->matmul)
+        {
+            feed(&s.fold->matmul->a_input, 1);
+            feed(&s.fold->matmul->b_input, 1);
+            feed(&s.fold->matmul->transA, 1);
+            feed(&s.fold->matmul->transB, 1);
+        }
+        if (s.fold->vecacc)
+        {
+            feed(&s.fold->vecacc->vec_state, 1);
+            feed(&s.fold->vecacc->weight_reg, 1);
+            feed(&s.fold->vecacc->b_input, 1);
+            feed(&s.fold->vecacc->scale_reg, 1);
+            feed(&s.fold->vecacc->has_scale, 1);
+        }
+        // causal 跳块：codegen 分歧点 → 结构进 key（同 vecacc 槽位先例）
+        feed(&s.fold->causal_skip, 1);
+    }
 
     char buf[17];
     std::snprintf(buf, sizeof(buf), "%016llx",
@@ -462,6 +662,29 @@ inline constexpr std::size_t EXPR_MAX_INPUTS = 16;  // 树型 DSL 重复叶子�
 inline constexpr std::size_t EXPR_MAX_CONSTS = 16;
 inline constexpr std::size_t EXPR_MAX_REGS   = 32;  // 全融合分支 select 表达式（如 SwiGLU backward）所需；shader 仅声明实际 num_regs
 inline constexpr std::size_t EXPR_MAX_INSTRS = 64;
+// fold 段上限（P-C1：body/finalize 独立计数，不占顶层 instrs 预算——
+//   两者在 GPU 上分别生成块循环体与收尾段，资源约束与主链解耦）
+inline constexpr std::size_t FOLD_MAX_BODY    = 48;
+inline constexpr std::size_t FOLD_MAX_FINALIZE = 16;
+inline constexpr std::size_t FOLD_MAX_STATE   = 8;
+inline constexpr std::size_t FOLD_MAX_VEC     = 1024;  // 行向量态长度上限（=输出列数）
+inline constexpr std::uint32_t FOLD_MAX_MMK   = 1024;  // fold mm 段内层 k 上限
+    // （Q 行预载 shared Qsh[1024] 的编译期尺寸——d_k 超限在 validate 静态拒）
+// fold 块大小：CPU 执行器与 GPU 生成器**共用**的常量（不进 key——分块是
+// 实现细节，但两侧必须同值以对齐分块边界与 max 类逐位；sum 类 GPU subgroup
+// 蝶形结合序异于 CPU 串行 → 对拍仍走小容差（1e-4~1e-6），并非全逐位）。
+// 历次调整均以交错 bench 实测裁决：32→64（每块协议减半，fwd −6%）；64→128
+// （协议再减半 + 链/归约活跃线程翻倍（tid<BLOCK）；shared 6.75→~8.9KB、驻留
+// 8→7 WG 的占用代价被收益盖过——mha fwd 5.77→5.41，18/18 绿）
+inline constexpr std::uint32_t EXPR_FOLD_BLOCK = 128;
+// fold v2 每 WG 行数（NR）：把"按 WG 数计费"的固定成本（Qsh 预载、入退场、
+//   调度人头）摊到 NR 行——四形状拟合实测该类占 fold ~54%（γ·rows）。
+//   生成器行循环与后端 dispatch ceil(rows/NR) **同源共用**；结构常量不进
+//   key（两侧同值即可，shader 同 key 重生成，闭合世界无感）。行序外层循环
+//   复用全部 shared（零增长 → 占用不掉档，Qsh-shrink 探针已证 shared 非
+//   约束）；越界行 clamp 到末行重复算、写回由 row_ok 统一挡（末 WG 尾部
+//   padding；ri 循环全 WG 均匀 → 体内屏障无发散）。
+inline constexpr std::uint32_t EXPR_FOLD_ROWS_PER_WG = 2;
 
 // ── matmul 融合分块尺寸（S5：glsl_gen 生成与后端 dispatch 共用）─────────
 // 生成器把 matmul 段展开为共享内存分块 kernel：
@@ -479,8 +702,9 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
 [[nodiscard]] inline Result<void> validate_expr_spec(const ExprSpec& spec,
                                                      std::size_t num_inputs)
 {
-    // matmul 段存在时允许空指令表（输出 = matmul 结果本身）
-    if (spec.instrs.empty() && !spec.matmul)
+    // matmul 段或 fold 段存在时允许空指令表（输出 = 段结果本身；
+    //   fold 的 finalize 序列即其尾链）
+    if (spec.instrs.empty() && !spec.matmul && !spec.fold)
         return std::unexpected(Error{"validate_expr_spec: empty instruction list"});
     if (spec.instrs.size() > EXPR_MAX_INSTRS)
         return std::unexpected(Error{"validate_expr_spec: too many instructions"});
@@ -502,6 +726,241 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
             return std::unexpected(Error{"validate_expr_spec: matmul input out of range"});
         if (spec.matmul->batch == 0)
             return std::unexpected(Error{"validate_expr_spec: matmul batch must be > 0"});
+    }
+
+    // ── fold 段校验（P-C1 起；P-C2 双域：可带自带 matmul 段/行向量态）────
+    if (spec.fold)
+    {
+        const FoldSpec& f = *spec.fold;
+        if (spec.matmul)
+            return std::unexpected(Error{
+                "validate_expr_spec: fold + 顶层 matmul not allowed（fold 用自带段 f.matmul）"});
+        if (!spec.instrs.empty())
+            return std::unexpected(Error{
+                "validate_expr_spec: fold requires empty top-level instrs"});
+        if (f.num_state == 0 || f.num_state > FOLD_MAX_STATE ||
+            f.inits.size() != static_cast<std::size_t>(f.num_state))
+            return std::unexpected(Error{
+                "validate_expr_spec: fold state count/init mismatch"});
+        if (f.k == 0)
+            return std::unexpected(Error{"validate_expr_spec: fold k must be > 0"});
+        if (f.body.empty() || f.body.size() > FOLD_MAX_BODY)
+            return std::unexpected(Error{"validate_expr_spec: fold body size out of range"});
+        if (f.finalize.empty() || f.finalize.size() > FOLD_MAX_FINALIZE)
+            return std::unexpected(Error{"validate_expr_spec: fold finalize size out of range"});
+        if (spec.num_regs < f.num_state)
+            return std::unexpected(Error{"validate_expr_spec: fold num_regs < num_state"});
+        // P-C2 双域字段
+        if (f.vec_state_len > FOLD_MAX_VEC)
+            return std::unexpected(Error{"validate_expr_spec: fold vec_state_len out of range"});
+        if ((f.vec_state_len > 0) != f.vecacc.has_value())
+            return std::unexpected(Error{
+                "validate_expr_spec: fold vec_state_len 与 vecacc 必须成对"});
+        if (f.matmul)
+        {
+            if (f.matmul->a_input >= num_inputs || f.matmul->b_input >= num_inputs)
+                return std::unexpected(Error{"validate_expr_spec: fold matmul input out of range"});
+            if (f.matmul->batch == 0)
+                return std::unexpected(Error{"validate_expr_spec: fold matmul batch must be > 0"});
+            if (f.matmul->k > FOLD_MAX_MMK)
+                return std::unexpected(Error{
+                    "validate_expr_spec: fold matmul k exceeds Qsh shared preload cap (1024)"});
+        }
+        // causal_skip 的 Row/m_per 网格语义取自 mm.batch——无 mm 段时生成器
+        //   会引用未声明的 m_per（glslc 报错但定位差），此处静态拒绝
+        if (f.causal_skip && !f.matmul)
+            return std::unexpected(Error{
+                "validate_expr_spec: fold causal_skip requires fold matmul segment"});
+        if (f.vecacc)
+        {
+            const VecAccSpec& va = *f.vecacc;
+            if (va.vec_state != 0)
+                return std::unexpected(Error{"validate_expr_spec: fold vecacc: multi vec slot unsupported"});
+            if (va.weight_reg >= spec.num_regs)
+                return std::unexpected(Error{"validate_expr_spec: fold vecacc weight_reg out of range"});
+            if (va.b_input >= num_inputs)
+                return std::unexpected(Error{"validate_expr_spec: fold vecacc b_input out of range"});
+            if (va.scale_reg >= spec.num_regs)
+                return std::unexpected(Error{"validate_expr_spec: fold vecacc scale_reg out of range"});
+        }
+
+        const bool has_mm = f.matmul.has_value();
+        const auto check_operand_domain = [&](const ExprOperand& opnd) -> Result<void>
+        {
+            const auto k = static_cast<ExprOperandKind>(opnd.kind);
+            // Matmul 段操作数 / 网格索引操作数：P-C2 起随 fold 自带 matmul 段
+            //   放开（掩码折叠与内层收缩消费；语义与既有 batched 网格一致）
+            if (k == ExprOperandKind::Matmul && !has_mm)
+                return std::unexpected(Error{"validate_expr_spec: fold: Matmul operand without fold matmul segment"});
+            if ((k == ExprOperandKind::Row || k == ExprOperandKind::Col ||
+                 k == ExprOperandKind::Batch) && !has_mm)
+                return std::unexpected(Error{
+                    "validate_expr_spec: fold: index operands require fold matmul segment (batch 网格语义)"});
+            // VecState 的 body/finalize 区分不在这里做：本 lambda 两处共用——
+            //   body 侧由 expr_fold_classify 拒（src_elem(VecState) = -1 域错误），
+            //   finalize 侧由下方主链做域校验（veclen/单槽）。
+            return {};
+        };
+
+        // body：归约限行轴、Reduce 访问顺序规则、寄存器域、临时 def-before-use
+        //   （状态前缀恒 defined；归约 dst 只能经 Reduce 操作数访问——沿用
+        //   全局归约语义规则，此处对 fold body 独立执行）
+        std::vector<uint8_t> defined(spec.num_regs, 0);
+        for (std::uint8_t s = 0; s < f.num_state; ++s)
+            defined[s] = 1;
+        std::vector<uint8_t> body_reduce_dst(spec.num_regs, 0);
+        for (const auto& ins : f.body)
+        {
+            const ExprOp op = static_cast<ExprOp>(ins.op);
+            if (expr_op_is_reduce(op) && expr_op_reduces_cols(op))
+                return std::unexpected(Error{
+                    "validate_expr_spec: fold body: col-reduce not allowed (block axis is the row-reduce axis)"});
+            if (ins.dst >= spec.num_regs)
+                return std::unexpected(Error{"validate_expr_spec: fold body dst out of range"});
+            const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
+            const std::size_t nops = expr_op_is_reduce(op) ? 1
+                : expr_instr_num_operands(op);
+            for (std::size_t oi = 0; oi < nops; ++oi)
+            {
+                const ExprOperand& opnd = *ops[oi];
+                const auto k = static_cast<ExprOperandKind>(opnd.kind);
+                if (auto d = check_operand_domain(opnd); !d)
+                    return std::unexpected(d.error());
+                if (k == ExprOperandKind::Reduce)
+                {
+                    if (opnd.idx >= spec.num_regs || opnd.idx == ins.dst)
+                        return std::unexpected(Error{"validate_expr_spec: fold body reduce ref invalid"});
+                    if (!body_reduce_dst[opnd.idx])
+                        return std::unexpected(Error{
+                            "validate_expr_spec: fold body Reduce operand must reference a prior block-reduce instr"});
+                }
+                else if (k == ExprOperandKind::Reg || k == ExprOperandKind::Fanout)
+                {
+                    if (opnd.idx >= spec.num_regs)
+                        return std::unexpected(Error{"validate_expr_spec: fold body reg out of range"});
+                    if (body_reduce_dst[opnd.idx])
+                        return std::unexpected(Error{
+                            "validate_expr_spec: fold body reg ref to block-reduce dst (use Reduce operand)"});
+                    if (!defined[opnd.idx])
+                        return std::unexpected(Error{
+                            "validate_expr_spec: fold body use before def (or block-local reg read)"});
+                }
+                else if (k == ExprOperandKind::Input)
+                {
+                    if (opnd.idx >= num_inputs)
+                        return std::unexpected(Error{"validate_expr_spec: fold body input out of range"});
+                    const auto vk = static_cast<ExprViewKind>(spec.views[opnd.idx].kind);
+                    if (expr_view_is_reduce(vk))
+                        return std::unexpected(Error{
+                            "validate_expr_spec: fold body: reduce-view input not allowed"});
+                    if (vk == ExprViewKind::Linear || vk == ExprViewKind::RowMod ||
+                        vk == ExprViewKind::RowBroadcast)
+                        ;  // P-C1 恒允许；RowBroadcast = 行参数向量（b[row]，
+                           //   无列依赖——doc_col 等行级掩码参数恒可用）
+                    else if ((vk == ExprViewKind::BatchMod ||
+                              vk == ExprViewKind::BatchCol) && has_mm)
+                        ;  // P-C2：掩码钩子消费（ALiBi 斜率 / doc_ids），需 batch 网格
+                    else
+                        return std::unexpected(Error{
+                            "validate_expr_spec: fold body: view kind outside supported scope"});
+                }
+                else if (k == ExprOperandKind::Const)
+                {
+                    if (opnd.idx >= spec.consts.size())
+                        return std::unexpected(Error{"validate_expr_spec: fold body const out of range"});
+                }
+                else if (k == ExprOperandKind::RParam)
+                {
+                    if (opnd.idx >= spec.rparams.size())
+                        return std::unexpected(Error{"validate_expr_spec: fold body rparam out of range"});
+                }
+            }
+            if (expr_op_is_reduce(op))
+                body_reduce_dst[ins.dst] = 1;
+            defined[ins.dst] = 1;
+        }
+
+        // finalize：只读状态/常量/rparam/Row——禁归约、禁 Input、禁块内临时
+        for (const auto& ins : f.finalize)
+        {
+            const ExprOp op = static_cast<ExprOp>(ins.op);
+            if (expr_op_is_reduce(op))
+                return std::unexpected(Error{"validate_expr_spec: fold finalize: reduce not allowed"});
+            if (ins.dst >= spec.num_regs)
+                return std::unexpected(Error{"validate_expr_spec: fold finalize dst out of range"});
+            const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
+            const std::size_t nops = expr_instr_num_operands(op);
+            for (std::size_t oi = 0; oi < nops; ++oi)
+            {
+                const ExprOperand& opnd = *ops[oi];
+                const auto k = static_cast<ExprOperandKind>(opnd.kind);
+                if (auto d = check_operand_domain(opnd); !d)
+                    return std::unexpected(d.error());
+                if (k == ExprOperandKind::Reduce)
+                    return std::unexpected(Error{"validate_expr_spec: fold finalize: Reduce operand not allowed"});
+                if (k == ExprOperandKind::Input)
+                    return std::unexpected(Error{"validate_expr_spec: fold finalize cannot read inputs"});
+                if (k == ExprOperandKind::VecState)
+                {
+                    if (f.vec_state_len == 0)
+                        return std::unexpected(Error{
+                            "validate_expr_spec: fold finalize: VecState without vec_state_len"});
+                    if (opnd.idx != 0)
+                        return std::unexpected(Error{
+                            "validate_expr_spec: fold finalize: VecState multi-slot unsupported"});
+                    continue;  // 单槽域校验通过
+                }
+                if (k == ExprOperandKind::Reg || k == ExprOperandKind::Fanout)
+                {
+                    if (opnd.idx >= spec.num_regs)
+                        return std::unexpected(Error{"validate_expr_spec: fold finalize reg out of range"});
+                    if (opnd.idx >= f.num_state)
+                        return std::unexpected(Error{
+                            "validate_expr_spec: fold finalize reads block-local register"});
+                }
+                else if (k == ExprOperandKind::Const && opnd.idx >= spec.consts.size())
+                    return std::unexpected(Error{"validate_expr_spec: fold finalize const out of range"});
+                else if (k == ExprOperandKind::RParam && opnd.idx >= spec.rparams.size())
+                    return std::unexpected(Error{"validate_expr_spec: fold finalize rparam out of range"});
+            }
+        }
+
+        // 类别流分析：状态不得从元素类（kb 依赖）源更新
+        auto cls = expr_fold_classify(f, spec.num_regs);
+        if (!cls)
+            return std::unexpected(cls.error());
+        // vecacc 缩放必须是行标量（广播 rescale；吃元素源=跨 kb 覆盖）
+        if (f.vecacc && (*cls)[f.vecacc->scale_reg] != 0)
+            return std::unexpected(Error{
+                "validate_expr_spec: fold vecacc: scale_reg must be row-scalar class"});
+        // 向量域多列循环的**写后读跨迭代污染**静态拒：finalize 被写的寄存器
+        //   不得再被任何源读取（如 dst 复用被读状态 l——首列输出覆盖除数，
+        //   次列起全错，实测 0.4=10/25）。单列输出（vec_state_len=0）无跨迭代，
+        //   不受限（P-C1 的状态自复制 finalize 合法）。
+        if (f.vec_state_len > 0)
+        {
+            std::vector<uint8_t> fin_written(spec.num_regs, 0);
+            std::vector<uint8_t> fin_read(spec.num_regs, 0);
+            for (const auto& ins : f.finalize)
+            {
+                fin_written[ins.dst] = 1;
+                const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
+                const std::size_t nops = expr_instr_num_operands(
+                    static_cast<ExprOp>(ins.op));
+                for (std::size_t oi = 0; oi < nops; ++oi)
+                {
+                    const auto k = static_cast<ExprOperandKind>(ops[oi]->kind);
+                    if ((k == ExprOperandKind::Reg ||
+                         k == ExprOperandKind::Fanout) && ops[oi]->idx < spec.num_regs)
+                        fin_read[ops[oi]->idx] = 1;
+                }
+            }
+            for (std::uint32_t i = 0; i < spec.num_regs; ++i)
+                if (fin_written[i] && fin_read[i])
+                    return std::unexpected(Error{
+                        "validate_expr_spec: fold finalize: written reg also read "
+                        "(multi-column loop would read its own prior output)"});
+        }
     }
     // S7 视图：RowGather 的标签槽（param）必须在输入范围内
     for (std::size_t k = 0; k < spec.views.size(); ++k)
@@ -590,6 +1049,8 @@ namespace expr
     inline constexpr ExprOperand batch()               { return {8, 0}; }  // 当前批次下标
     // 运行时标量参数（RParam）：运行时按实际 spec.rparams[idx] 填充
     inline constexpr ExprOperand rval(std::uint8_t r)  { return {9, r}; }
+    // fold 行向量态（P-C2）：按向量域当前输出列读单槽向量态
+    inline constexpr ExprOperand vec_state(std::uint8_t slot = 0) { return {10, slot}; }
     inline constexpr ExprView linear()                 { return {0, 0, 0}; }
     inline constexpr ExprView rotate_half(std::uint32_t block_rows, bool negate_first_half = true)
     { return {1, negate_first_half ? std::uint8_t{1} : std::uint8_t{0}, block_rows}; }
