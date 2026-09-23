@@ -659,8 +659,15 @@ int run_fold_attn_gpu(CpuEngine& cpu, GpuEngine& gpu)
             Tensor doc_col = Tensor::cpu(rows_out, 1);
             Tensor doc_ids_t = Tensor::cpu(
                 1, static_cast<std::size_t>(sh.bh) * sh.seq);
-            const auto doc_of = [sseq](std::uint32_t pos) -> Scalar
-            { return pos < sseq / 2 ? Scalar{1} : Scalar{2}; };
+            // doc 分段边界：seq > EXPR_FOLD_BLOCK(128) 时越过 128（133→129），
+            //   让 i≥129 的行首 fold 块被 doc 掩码**全屏蔽**——钉住 2026-09
+            //   GPU -nan 根因（max init=-inf → dm=−inf−−inf=NaN）；
+            //   旧固定 seq/2=66<128 首块永留有效项 → 对拍漏抓该 bug。
+            const std::uint32_t doc_boundary =
+                sseq > nn::EXPR_FOLD_BLOCK ? nn::EXPR_FOLD_BLOCK + 1u
+                                           : sseq / 2u;
+            const auto doc_of = [doc_boundary](std::uint32_t pos) -> Scalar
+            { return pos < doc_boundary ? Scalar{1} : Scalar{2}; };
             for (std::size_t r = 0; r < rows_out; ++r)
                 doc_col.cpu_matrix().span()[r] =
                     doc_of(static_cast<std::uint32_t>(r % sh.seq));
@@ -708,8 +715,16 @@ int run_fold_attn_gpu(CpuEngine& cpu, GpuEngine& gpu)
             const auto gs = gm->span();
             Scalar err = 0;
             for (std::size_t i = 0; i < rows_out * sh.dk; ++i)
-                err = std::fmax(err, std::fabs(cs[i] - gs[i]) /
-                                     std::fmax(Scalar{1}, std::fabs(cs[i])));
+            {
+                // NaN 守卫：GPU 输出 NaN → diff=NaN → IEEE fmax(err,NaN)=err
+                //   会静默吞掉 → err 保持正常值照样 PASS（2026-09 fold doc
+                //   -nan 回归双层漏抓之一，红验证实证）→ 记 inf 必超容差
+                const Scalar diff = std::fabs(cs[i] - gs[i]) /
+                                    std::fmax(Scalar{1}, std::fabs(cs[i]));
+                err = std::isfinite(diff) ? std::fmax(err, diff)
+                                          : std::numeric_limits<Scalar>::infinity();
+                if (!std::isfinite(err)) break;
+            }
             const bool ok = err <= Scalar{1e-4};
             std::cout << "[" << (ok ? "PASS" : "FAIL") << "] " << tag
                       << "  err=" << std::scientific << std::setprecision(2)

@@ -769,10 +769,15 @@ inline std::string generate_glsl_fold(const std::string& name, const ExprSpec& s
         if (expr_op_is_reduce(op))
         {
             const bool is_max = (op == ExprOp::RowMax || op == ExprOp::ColMax);
-            // max 恒等元 = -inf 直出（0xff800000 即 -inf 位型）——**禁加负号**：
-            // -(-inf)=+inf 会让 acc 恒为 +inf（曾致 rowmax 全部输出 inf）
+            // max 恒等元 = lowest() 直出（0xFF7FFFFF 即 -FLT_MAX 位型，**禁加
+            // 负号**：-(-FLT_MAX)=+FLT_MAX 会让 acc 恒为 inf；亦**禁用 -inf**）：
+            //   与 CPU 基准逐位对齐（eval_fold_impl 一律 numeric_limits::lowest()）。
+            //   -inf 会在「块内元素全 -inf（如文档掩码屏蔽整块）且状态 m_old=-inf」
+            //   时算出 blk_m=-inf → dm = m_old − m = −inf−−inf = **NaN** →
+            //   l/O 全污染（fold 分块状态进位特有；两趟式对整行求 m 不触发）。
+            //   lowest() 有限 → dm=−inf → exp(−inf)=0，全屏蔽块贡献恒 0，语义正确。
             L << "        { float acc = "
-              << (is_max ? "uintBitsToFloat(0xff800000u)" : "0.0")
+              << (is_max ? "uintBitsToFloat(0xFF7FFFFFu)" : "0.0")
               << ";\n";
             L << "          for (uint kb = 0u; kb < valid; ++kb) {\n";
             const std::string src = operand(ins.a, "kb");
@@ -1151,8 +1156,12 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
                 //   数值：浮点求和结合序异于 CPU 串行 → run_fold_attn_gpu
                 //   容差 1e-4 兜；max 结合序无关，位级一致。
                 L << "        {\n";
+                // max 恒等元 = lowest()（0xFF7FFFFF）而非 -inf：与 CPU 基准
+                //   eval_fold_impl(numeric_limits::lowest()) 对齐——块内全 -inf
+                //   （doc 掩码整块屏蔽）时 m_old=blk_m=-inf 会让 dm=−inf−−inf
+                //   =NaN 污染 l/O（2026-09 训练 -nan 根因），见 fold v1 同款注释。
                 const std::string init =
-                    is_max ? "uintBitsToFloat(0xff800000u)" : "0.0";
+                    is_max ? "uintBitsToFloat(0xFF7FFFFFu)" : "0.0";
                 const std::string eis = std::to_string(eidx[ins.a.idx]);
                 L << "          float v = " << init << ";\n";
                 L << "          if (tid < " << EXPR_FOLD_BLOCK << "u) {\n";
@@ -1176,8 +1185,10 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
             {
                 // 标量源归约（罕见路径）：保持原串行扫描语义
                 L << "        {\n";
+                // max init = lowest()（0xFF7FFFFF），对齐 CPU 基准/防 −inf−−inf=NaN
+                //   ——与上面元素源路径同款理由，两处必须同改
                 L << "          float acc = "
-                  << (is_max ? "uintBitsToFloat(0xff800000u)" : "0.0") << ";\n";
+                  << (is_max ? "uintBitsToFloat(0xFF7FFFFFu)" : "0.0") << ";\n";
                 L << "          for (uint j = 0u; j < valid; ++j) {\n";
                 const std::string src = operand(ins.a, 'R', "j");
                 L << "            acc = "
@@ -1845,7 +1856,8 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
     {
         const std::string s = "s_red[" + std::to_string(slot) + "]";
         const char* sub = is_max ? "subgroupMax" : "subgroupAdd";
-        const std::string idt = is_max ? "uintBitsToFloat(0xff800000u)" : "0.0";
+        // max init = lowest()（0xFF7FFFFF）对齐 CPU 基准，理由同归约视图处注释
+        const std::string idt = is_max ? "uintBitsToFloat(0xFF7FFFFFu)" : "0.0";
         const std::string vn = "v" + std::to_string(slot);   // 按槽唯一命名，避免重定义
         const std::string wn = "w" + std::to_string(slot);
         L << "    barrier();\n";
@@ -1883,7 +1895,11 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
                 continue;
             const int slot = slot_of_view[k];
             const bool is_max = slot_is_max[static_cast<std::size_t>(slot)];
-            const std::string init = is_max ? "uintBitsToFloat(0xff800000u)" : "0.0";
+            // max init = lowest()（0xFF7FFFFF）对齐 CPU 基准（全库归约一律
+            //   numeric_limits::lowest()）：-inf 作恒等元在全 -inf 输入下与
+            //   状态进位/减法组合会出 −inf−−inf=NaN（2026-09 fold doc 掩码
+            //   GPU -nan 同类根因），全库统一 lowest 根除该风险类
+            const std::string init = is_max ? "uintBitsToFloat(0xFF7FFFFFu)" : "0.0";
             L << "\n    // 归约视图 " << k << " (槽 " << slot << ")\n";
             L << "    {\n";
             L << "        float acc0 = " << init << ", acc1 = " << init
@@ -1919,7 +1935,11 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
                  R.a.kind == static_cast<uint8_t>(ExprOperandKind::Fanout));
             const std::string src = src_is_reg
                 ? "r" + std::to_string(static_cast<int>(R.a.idx)) : operand(R.a);
-            const std::string init = is_max ? "uintBitsToFloat(0xff800000u)" : "0.0";
+            // max init = lowest()（0xFF7FFFFF）对齐 CPU 基准（全库归约一律
+            //   numeric_limits::lowest()）：-inf 作恒等元在全 -inf 输入下与
+            //   状态进位/减法组合会出 −inf−−inf=NaN（2026-09 fold doc 掩码
+            //   GPU -nan 同类根因），全库统一 lowest 根除该风险类
+            const std::string init = is_max ? "uintBitsToFloat(0xFF7FFFFFu)" : "0.0";
             L << "\n    // 归约指令 " << ri << " (槽 " << slot << ")\n";
             L << "    {\n";
             L << "        float acc0 = " << init << ", acc1 = " << init
@@ -1989,7 +2009,11 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
                 continue;
             const int slot = slot_of_view[k];
             const bool is_max = slot_is_max[static_cast<std::size_t>(slot)];
-            const std::string init = is_max ? "uintBitsToFloat(0xff800000u)" : "0.0";
+            // max init = lowest()（0xFF7FFFFF）对齐 CPU 基准（全库归约一律
+            //   numeric_limits::lowest()）：-inf 作恒等元在全 -inf 输入下与
+            //   状态进位/减法组合会出 −inf−−inf=NaN（2026-09 fold doc 掩码
+            //   GPU -nan 同类根因），全库统一 lowest 根除该风险类
+            const std::string init = is_max ? "uintBitsToFloat(0xFF7FFFFFu)" : "0.0";
             L << "\n    // 归约视图 " << k << " (槽 " << slot << ")\n";
             L << "    {\n";
             L << "        float acc0 = " << init << ", acc1 = " << init
@@ -2022,7 +2046,11 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
                  R.a.kind == static_cast<uint8_t>(ExprOperandKind::Fanout));
             const std::string src = src_is_reg
                 ? "r" + std::to_string(static_cast<int>(R.a.idx)) : operand(R.a);
-            const std::string init = is_max ? "uintBitsToFloat(0xff800000u)" : "0.0";
+            // max init = lowest()（0xFF7FFFFF）对齐 CPU 基准（全库归约一律
+            //   numeric_limits::lowest()）：-inf 作恒等元在全 -inf 输入下与
+            //   状态进位/减法组合会出 −inf−−inf=NaN（2026-09 fold doc 掩码
+            //   GPU -nan 同类根因），全库统一 lowest 根除该风险类
+            const std::string init = is_max ? "uintBitsToFloat(0xFF7FFFFFu)" : "0.0";
             L << "\n    // 归约指令 " << ri << " (槽 " << slot << ")\n";
             L << "    {\n";
             L << "        float acc0 = " << init << ", acc1 = " << init

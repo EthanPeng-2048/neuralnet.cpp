@@ -237,6 +237,33 @@
 - **教训**：涉及布局重排的新原语，测试必须同时包含 ① 独立参考的逐元素比对、
   ② 伴随/结构与性质校验、③ 打印小案例。三者任一单独都不足以快速定位。
 
+### 4.12 fold 归约 max 恒等元 GPU 用 -inf：doc 掩码首块全屏蔽 → −inf−−inf=NaN（2026-09-26，已修复）
+
+- **症状**：GPU 训练（transformer + 文档掩码 + seq>128）step 1 起 loss=-nan；
+  seq≤128 正常、单文档语料正常、CPU 同规格正常、ctest 18/18 全绿——四重掩护。
+- **根因**：GPU fold 生成器的 RowMax 恒等元写成 `-inf`（`0xff800000`），而 CPU
+  `eval_fold_impl` 全库归约基准一律 `numeric_limits::lowest()`（-FLT_MAX，有限）。
+  fold 是**分块状态进位**（m_old 跨块携带，首块初值 -inf）：查询位置 i≥128 且其
+  文档起始于 128 之后时，首个键块被 doc 掩码全置 -inf → blk_m=-inf →
+  `dm = m_old − m = −inf − −inf = NaN` → l/O 全污染。旧两趟式对**整行**求 m
+  （self 项永不被 doc 屏蔽 → m 恒有限），故 1.3.0 无此问题；seq≤128 时首块
+  必含 j=i 自身，同样安全。
+- **为什么 ctest 全绿（双层漏抓）**：① fold 对拍的 doc 分段边界固定
+  `seq/2=66<128`，首块永远留有有效项 → 输入根本不触发；② 对拍比较用
+  `err = fmax(err, |cpu-gpu|)`，**IEEE `fmax(x, NaN)=x` 静默吞掉 NaN diff** →
+  即便触发也照样 PASS。红验证实证：revert 修复后补边界仍绿，加 NaN 守卫才转红
+  （`[FAIL] attn-fold doc seq=133 err=inf`）。
+- **修复**：① `expr_glsl_gen.hpp` 归约 max 恒等元全库统一 `0xFF7FFFFF`
+  （lowest，对齐 CPU 基准，根除整类 −inf−−inf 风险）；② 两个 fold 测试的
+  doc 分段边界改为 `seq>EXPR_FOLD_BLOCK ? BLOCK+1 : seq/2`（钉住触发形态）；
+  ③ 对拍比较加 NaN 守卫（非有限 diff → err=inf 必超容差）。
+- **教训**：a) CPU/GPU 双实现的**恒等元/初值**这类语义细节必须对齐且进对拍
+  范围——两边各自"看起来对"（-inf 是教科书 max 恒等元）但对状态进位语义不等价；
+  b) **对拍比较器本身要测**：`fmax(err, NaN)` 吞 NaN 是"全绿但全错"的温床，
+  任何误差累积都应先 `isfinite` 守卫；c) 触发形态要**推到边界之外**（分段边界
+  越过 BLOCK），"seq 跨块"≠"块内被全屏蔽"；d) 修复类 bug 必须做红验证
+  （revert 后测试要红），否则"补的测试"可能本来就是绿的假覆盖。
+
 ---
 
 ## 5. 工具链与 UI 坑
