@@ -63,21 +63,36 @@ namespace
     return v;
 }
 
-// ExprSpec → 生成头里的聚合初始化（ExprSpec{ instrs, views, consts, num_regs, matmul }）
+// ExprSpec → 生成头里的聚合初始化
+// （ExprSpec{ instrs, views, consts, rparams, num_regs, matmul, fold }——
+//   字段必须与 ExprSpec 声明序逐一对应，否则 -Wmissing-field-initializers）
 [[nodiscard]] std::string emit_spec(const nn::ExprSpec& spec)
 {
     std::ostringstream o;
+    const auto emit_seq = [&](const std::vector<nn::ExprInstr>& seq)
+    {
+        for (std::size_t i = 0; i < seq.size(); ++i)
+        {
+            const auto& in = seq[i];
+            if (i) o << ",";
+            o << " {" << static_cast<int>(in.op) << ", " << static_cast<int>(in.dst)
+              << ", {" << static_cast<int>(in.a.kind) << ", " << static_cast<int>(in.a.idx) << "}"
+              << ", {" << static_cast<int>(in.b.kind) << ", " << static_cast<int>(in.b.idx) << "}"
+              << ", {" << static_cast<int>(in.c.kind) << ", " << static_cast<int>(in.c.idx) << "}}";
+        }
+    };
+    const auto emit_scalar = [&](nn::Scalar v)
+    {
+        // ±inf（掩码屏蔽 / fold 状态初值）不能直接流输出（C++ 无 inf 字面量）
+        if (std::isinf(v))
+            o << (v < 0 ? " -std::numeric_limits<Scalar>::infinity()"
+                        : " std::numeric_limits<Scalar>::infinity()");
+        else
+            o << " static_cast<Scalar>(" << v << ")";
+    };
     o << "ExprSpec{ \n";
     o << "        std::vector<ExprInstr>{";
-    for (std::size_t i = 0; i < spec.instrs.size(); ++i)
-    {
-        const auto& in = spec.instrs[i];
-        if (i) o << ",";
-        o << " {" << static_cast<int>(in.op) << ", " << static_cast<int>(in.dst)
-          << ", {" << static_cast<int>(in.a.kind) << ", " << static_cast<int>(in.a.idx) << "}"
-          << ", {" << static_cast<int>(in.b.kind) << ", " << static_cast<int>(in.b.idx) << "}"
-          << ", {" << static_cast<int>(in.c.kind) << ", " << static_cast<int>(in.c.idx) << "}}";
-    }
+    emit_seq(spec.instrs);
     o << "},\n        std::vector<ExprView>{";
     for (std::size_t i = 0; i < spec.views.size(); ++i)
     {
@@ -91,13 +106,7 @@ namespace
     for (std::size_t i = 0; i < spec.consts.size(); ++i)
     {
         if (i) o << ",";
-        const nn::Scalar v = spec.consts[i];
-        // ±inf（掩码屏蔽常量）不能直接流输出（C++ 无 inf 字面量）
-        if (std::isinf(v))
-            o << (v < 0 ? " -std::numeric_limits<Scalar>::infinity()"
-                        : " std::numeric_limits<Scalar>::infinity()");
-        else
-            o << " static_cast<Scalar>(" << v << ")";
+        emit_scalar(spec.consts[i]);
     }
     o << "},\n        std::vector<Scalar>{";   // rparams（运行时标量参数，值本身不参与 key）
     for (std::size_t i = 0; i < spec.rparams.size(); ++i)
@@ -114,6 +123,42 @@ namespace
           << static_cast<int>(spec.matmul->transB) << ", "
           << spec.matmul->k << "u, "
           << spec.matmul->batch << "u}";  // batch 必须显式生成（漏则退化为默认 1，registry spec 失真）
+    }
+    o << "}, \n        std::optional<FoldSpec>{";
+    if (spec.fold)
+    {
+        const nn::FoldSpec& f = *spec.fold;
+        o << "FoldSpec{ " << static_cast<int>(f.num_state) << ", " << f.k << "u, "
+          << "std::vector<Scalar>{";
+        for (std::size_t i = 0; i < f.inits.size(); ++i)
+        {
+            if (i) o << ",";
+            emit_scalar(f.inits[i]);   // -inf 状态初值（rowmax 型）走 limits 字面量
+        }
+        o << "}, std::vector<ExprInstr>{";
+        emit_seq(f.body);
+        o << "}, std::vector<ExprInstr>{";
+        emit_seq(f.finalize);
+        // P-C2 双域字段（声明序：vec_state_len, matmul, vecacc）
+        o << "}, " << f.vec_state_len << "u, std::optional<MatmulSpec>{";
+        if (f.matmul)
+        {
+            o << "MatmulSpec{" << static_cast<int>(f.matmul->a_input) << ", "
+              << static_cast<int>(f.matmul->b_input) << ", "
+              << static_cast<int>(f.matmul->transA) << ", "
+              << static_cast<int>(f.matmul->transB) << ", "
+              << f.matmul->k << "u, " << f.matmul->batch << "u}";
+        }
+        o << "}, std::optional<VecAccSpec>{";
+        if (f.vecacc)
+        {
+            o << "VecAccSpec{ " << static_cast<int>(f.vecacc->vec_state) << ", "
+              << static_cast<int>(f.vecacc->weight_reg) << ", "
+              << static_cast<int>(f.vecacc->b_input) << ", "
+              << static_cast<int>(f.vecacc->scale_reg) << ", "
+              << static_cast<int>(f.vecacc->has_scale) << " }";
+        }
+        o << "} }";
     }
     o << "} }";
     return o.str();
@@ -198,6 +243,15 @@ int main(int argc, char* argv[])
                          nn::expr_spec_key(spec).c_str());
             continue;
         }
+        // 防御：空指令表且无 matmul/fold 段 = 结构损坏（如 canonicalize 曾静默
+        //   丢 fold 段）→ 跳过而非让逐元素生成器对空表 back() UB 崩溃
+        //   （实测 0xC00000FD 栈崩溃）。正常管线到不了这里。
+        if (spec.instrs.empty() && !spec.matmul && !spec.fold)
+        {
+            std::fprintf(stderr, "[skip] 空指令表且无 matmul/fold 段（结构损坏）: %s\n",
+                         nn::expr_spec_key(spec).c_str());
+            continue;
+        }
         // matmul+归约（S5，注意力结构）：generate_glsl_reduce 支持 Matmul
         // 操作数（内联点积，不物化 (batch*M,N) 中间矩阵），不再跳过。
         const std::string key = nn::expr_spec_key(spec);
@@ -253,9 +307,13 @@ int main(int argc, char* argv[])
         const int raxis = nn::expr_spec_reduce_axis(spec);
         if (raxis == -2 || (raxis == 1 && spec.matmul))
             continue;  // 与上方跳过保持一致（混合轴 / matmul+列归约）
+        if (spec.instrs.empty() && !spec.matmul && !spec.fold)
+            continue;  // 结构损坏（同上：生成循环已 skip，元数据保持一致）
         const std::string key = nn::expr_spec_key(spec);
         const std::uint32_t vecw =
-            (raxis < 0 && nn::glsl_vec4_eligible(spec)) ? 4u : 1u;
+            (!spec.fold && raxis < 0 && nn::glsl_vec4_eligible(spec)) ? 4u : 1u;
+        // fold 形态恒 vecw=1（每线程一行标量状态机，无 vec4 路径）；fold 判定
+        // 走 FusedShader.spec.fold（后端同源判断，不加结构字段）。
         H << "    { \"" << key << "\",\n        " << emit_spec(spec) << ",\n"
           << "        kSpirv_" << key
           << ", sizeof(kSpirv_" << key << ")/sizeof(std::uint32_t), "

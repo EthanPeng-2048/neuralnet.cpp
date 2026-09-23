@@ -264,6 +264,12 @@ public:
             return std::unexpected(Error{"No suitable GPU memory type found"});
 
         VkDeviceSize alignment = requirements.alignment > 0 ? requirements.alignment : 1;
+        // matmul_tiled 等 vec4 SSBO 快路径要求基址 16B 对齐（std430 vec4 读的
+        // 对齐门槛）。buffer requirements 可能小于 16，这里统一抬到 ≥16；
+        // 仍保持 2 的幂，find_best 的位掩码取整不受影响。代价：每次分配
+        // 最多 12B padding。
+        if (alignment < 16u)
+            alignment = 16u;
         const VkDeviceSize alloc_size = requirements.size;
         // 尺寸分类分池：超大分配独占整块；小分配走小块池；其余走大块池。
         // 顺序：alloc > 大块阈值 → 独占超大块；alloc < 小块阈值 → 小块池。

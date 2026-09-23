@@ -7,10 +7,12 @@
 //   - 管理 StagingRing 环形缓冲区
 //   - 提供 GPU 操作 API（matmul、elementwise）
 //
-// 同步机制：
-//   - 每个 matmul_gpu/elementwise_gpu 调用都创建 fence
+// 同步机制（独立/非 batch 模式）：
+//   - 复用 initialize() 预分配的 solo fence + command buffer（submit 前
+//     vkResetFences；旧实现每算子 create/destroy fence + alloc/free cmd
+//     是逐元素算子 ≈0.16ms 固定开销的主要构成之一）
 //   - 提交后立即等待 fence，确保 GPU 计算完成
-//   - 完成后清理资源（command buffer、descriptor set）
+//   - 完成后仅归还 descriptor set（gpu_tensor_pool_ 池化复用）
 //
 // 双轨制架构：
 //   - Staging Path：CPU span → Staging → GPU → 计算 → GPU → Staging → CPU span
@@ -24,8 +26,11 @@
 #include <vulkan/vulkan.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <list>
@@ -53,6 +58,11 @@
 #if __has_include("matmul_tiled_spv.hpp")
 #include "matmul_tiled_spv.hpp"
 #define NN_MATMUL_TILED_SPV_EMBEDDED
+#endif
+
+#if __has_include("matmul_gemv_spv.hpp")
+#include "matmul_gemv_spv.hpp"
+#define NN_MATMUL_GEMV_SPV_EMBEDDED
 #endif
 
 #if __has_include("batched_matmul_spv.hpp")
@@ -370,6 +380,7 @@ private:
     VulkanDevice device_;
     VulkanPipeline matmul_pipeline_;
     VulkanPipeline matmul_tiled_pipeline_;
+    VulkanPipeline matmul_gemv_pipeline_;
     VulkanPipeline batched_matmul_pipeline_;
     VulkanPipeline elementwise_v2_pipeline_;
     VulkanPipeline reduce_pipeline_;
@@ -398,6 +409,13 @@ private:
     std::unordered_map<std::string, int> fused_reduce_axis_;
     // 是否含前置 matmul 段（push constants 多 rows + mm_k 两个 uint）
     std::unordered_map<std::string, bool> fused_has_matmul_;
+    // fold 形态元数据（P-C1/P-C2，与生成器分派同源判定）：
+    //   out       = 输出列数（vec_state_len 或 1）——调用约定 cols==out 校验
+    //   per_thread_row = 1 → v1 标量 fold：每线程一行（local 256，wg=ceil(rows/256)）；
+    //               0 → v2 双域 fold：每 WG 一行（row=gl_WorkGroupID.x，wg=rows）
+    //               ——dispatch 公式两者不同（v2 若按 ceil(count/256) 会丢行！）
+    struct FoldMeta { std::uint32_t out; std::uint8_t per_thread_row; };
+    std::unordered_map<std::string, FoldMeta> fused_fold_meta_;
     // 运行时视图参数个数（RowMod/RotateHalf 的 vp push constant 槽数）
     std::unordered_map<std::string, std::uint32_t> fused_view_param_counts_;
     // 运行时标量参数个数（优化器 lr/eps/β 等的 rp push constant 槽数）
@@ -472,6 +490,16 @@ private:
     };
     std::vector<ScalarReadbackSlot> rb_slots_;
 
+    // ── 独立（非 batch）模式复用资源 ────────────────────────────────────
+    // 逐元素算子固定开销实测 ≈0.16ms/次（4096² kernel 本身已达 370GB/s，
+    // 瓶颈全在 host 侧）：每算子 vkCreateFence/vkDestroyFence +
+    // vkAllocateCommandBuffers/vkFreeCommandBuffers 是可消除项 →
+    // initialize() 预分配，acquire_cmd/submit_and_wait 内 reset 复用。
+    // 独立模式「录制→提交→等待」严格串行（等完才返回）→ 单实例安全；
+    // batch 模式走 frames_ 环，不经过这里。单线程录制假设同 batch_cmd_。
+    VkFence solo_fence_ = VK_NULL_HANDLE;        // 创建即 unsignaled
+    VkCommandBuffer solo_cmd_ = VK_NULL_HANDLE;   // 每次 reset + begin 复用
+
     std::mutex init_mutex_;
     std::mutex queue_mutex_;
     bool initialized_ = false;
@@ -528,6 +556,16 @@ private:
     {
 #ifdef NN_MATMUL_TILED_SPV_EMBEDDED
         return nn_matmul_tiled_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_matmul_gemv_spirv()
+    {
+#ifdef NN_MATMUL_GEMV_SPV_EMBEDDED
+        return nn_matmul_gemv_spirv_bytecode();
 #else
         static const std::vector<uint32_t> empty;
         return empty;
@@ -725,6 +763,13 @@ public:
             {
                 if (f.fence != VK_NULL_HANDLE)
                     vkDestroyFence(device_.device(), f.fence, nullptr);
+            }
+
+            // 独立模式复用 fence（solo command buffer 随 command pool 释放）
+            if (solo_fence_ != VK_NULL_HANDLE)
+            {
+                vkDestroyFence(device_.device(), solo_fence_, nullptr);
+                solo_fence_ = VK_NULL_HANDLE;
             }
 
             if (gpu_tensor_pool_ != VK_NULL_HANDLE)
@@ -979,6 +1024,30 @@ public:
         frame_next_ = 0;
         last_active_frame_ = 0;
 
+        // 7c. 独立模式复用 fence + command buffer（见成员注释；省去
+        //     每算子 create/destroy + alloc/free 的 host/driver 开销）
+        {
+            VkCommandBufferAllocateInfo cmd_alloc{};
+            cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cmd_alloc.commandPool = command_pool_;
+            cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cmd_alloc.commandBufferCount = 1;
+            r = detail::vk_check(
+                vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &solo_cmd_),
+                __FILE__, __LINE__);
+            if (!r)
+                return r;
+
+            VkFenceCreateInfo fence_info{};
+            fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            // 初始 unsignaled：vkQueueSubmit 要求 fence 未 signal
+            r = detail::vk_check(
+                vkCreateFence(device_.device(), &fence_info, nullptr, &solo_fence_),
+                __FILE__, __LINE__);
+            if (!r)
+                return r;
+        }
+
         // 9. 创建 tiled matmul pipeline（可选）
         const auto& tiled_spirv = get_matmul_tiled_spirv();
         if (!tiled_spirv.empty())
@@ -986,6 +1055,16 @@ public:
             auto tp_r = VulkanPipeline::create_matmul(device_.device(), tiled_spirv);
             if (tp_r)
                 matmul_tiled_pipeline_ = std::move(*tp_r);
+        }
+
+        // 9a. 创建小 N GEMV pipeline（可选；与 tiled 同 5×4B push / 3 binding，
+        //     复用 create_matmul 布局）
+        const auto& gemv_spirv = get_matmul_gemv_spirv();
+        if (!gemv_spirv.empty())
+        {
+            auto gp_r = VulkanPipeline::create_matmul(device_.device(), gemv_spirv);
+            if (gp_r)
+                matmul_gemv_pipeline_ = std::move(*gp_r);
         }
 
         // 9b. 创建 batched matmul pipeline（3 bindings, 6*4=24B push constants）
@@ -1159,9 +1238,17 @@ public:
             // 归约 kernel 的 push constants 多 uint rows + uint vector_out；
             // matmul 融合 kernel 多 uint rows + uint mm_k + uint mm_batch；
             // matmul+归约组合再多 uint mm_k + uint mm_batch（6 槽）；
+            // fold（P-C1）= count, cols, rows, vector_out, fold_k（5 槽）——
+            //   **必须与 run_fused_gpu 的 pc_base 逐形态一致**：漏分支会让
+            //   range 少算，vkCmdPushConstants 超 range 部分被驱动丢弃 →
+            //   fold_k 读未定义残留（曾致滑窗式错值，且残留随前序 op 漂移、
+            //   表现为时对时错的假 PASS——教训 4.10 同类，改动 PC 形态时
+            //   创建侧(本处)与写入侧(run_fused_gpu)必须同改）；
             // 另加 fs.view_param_count 个运行时视图参数槽（RowMod/RotateHalf）
             const std::uint32_t pc_base =
-                (fs.reduce_axis >= 0 && fs.has_matmul) ? 6u
+                (fs.spec.fold && fs.spec.fold->matmul)    ? 7u  // fold+mm 7 槽
+              : (fs.spec.fold)                            ? 5u
+              : (fs.reduce_axis >= 0 && fs.has_matmul)    ? 6u
               : ((fs.reduce_axis >= 0 || fs.has_matmul) ? 5u : 2u);
             const std::uint32_t pc_uints = pc_base + fs.view_param_count;
             const std::uint32_t pc_size =
@@ -1176,6 +1263,14 @@ public:
                 fused_pipelines_.emplace(fs.key, std::move(*fp_r));
                 fused_reduce_axis_.emplace(fs.key, fs.reduce_axis);
                 fused_has_matmul_.emplace(fs.key, fs.has_matmul != 0);
+                fused_fold_meta_.emplace(fs.key, FoldMeta{
+                    fs.spec.fold
+                        ? (fs.spec.fold->vec_state_len > 0 ? fs.spec.fold->vec_state_len : 1u)
+                        : 0u,
+                    // per_thread_row 判据与 generate_glsl 分派同源（v2 = 有
+                    // vec 态或 mm 段；v1 = 纯标量）
+                    static_cast<std::uint8_t>(fs.spec.fold &&
+                        !(fs.spec.fold->vec_state_len > 0 || fs.spec.fold->matmul))});
                 fused_view_param_counts_.emplace(fs.key, fs.view_param_count);
                 fused_rparam_counts_.emplace(fs.key, fs.rparam_count);
                 fused_vec_width_.emplace(fs.key, fs.vec_width);
@@ -1206,6 +1301,7 @@ public:
     [[nodiscard]] bool is_initialized() const noexcept { return initialized_; }
     [[nodiscard]] bool gpu_available() const noexcept { return initialized_; }
     [[nodiscard]] bool has_tiled_pipeline() const noexcept { return matmul_tiled_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_gemv_pipeline() const noexcept { return matmul_gemv_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_batched_matmul_pipeline() const noexcept { return batched_matmul_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_rearrange_3d_pipeline() const noexcept { return rearrange_3d_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_elementwise_v2_pipeline() const noexcept { return elementwise_v2_pipeline_.handle() != VK_NULL_HANDLE; }
@@ -1798,6 +1894,7 @@ public:
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
+        const auto t_disp_start = std::chrono::steady_clock::now();
         auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
         if (!ds_r) return std::unexpected(ds_r.error());
         VkDescriptorSet desc_set = *ds_r;
@@ -1846,7 +1943,14 @@ public:
 
         if (owns_cmd)
         {
+            const bool prof = profile_ops_enabled();
+            const auto t_rec = std::chrono::steady_clock::now();
             auto r = submit_and_wait(cmd, desc_set);
+            if (prof)
+                std::fprintf(stderr,
+                    "[gpu-profile] record+setup=%lldus（提交/等待分段见上一条 solo_op）\n",
+                    static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+                        t_rec - t_disp_start).count()));
             if (!r) return std::unexpected(r.error());
         }
         return {};
@@ -1877,23 +1981,40 @@ public:
             return std::unexpected(C_res.error());
         GpuTensor C = std::move(*C_res);
 
-        // 2. 选择 Pipeline（优先使用粗化分块版本）
-        const bool use_tiled = has_tiled_pipeline();
-        auto& pipeline = use_tiled ? matmul_tiled_pipeline_ : matmul_pipeline_;
+        // 2. 选择 Pipeline（优先级：小 N GEMV > 粗化分块 > naive）
+        //   GEMV：N ≤ GEMV_MAX_N（shader ROWS=4 行/WG，grid.x=ceil(M/4)）。
+        //   tiled 在小 N 下 64×64 块 (64-N)/64 列空转，GEMV 每线程只算
+        //   真实 N 列（借鉴 ggml mul_mat_vec 分派）。
+        constexpr uint32_t GEMV_MAX_N = 8;
+        constexpr uint32_t GEMV_ROWS = 4;   // 与 matmul_gemv.comp 的 ROWS 一致
+        const bool use_gemv = has_gemv_pipeline() && N <= GEMV_MAX_N;
+        const bool use_tiled = has_tiled_pipeline() && !use_gemv;
+        auto& pipeline = use_gemv ? matmul_gemv_pipeline_
+                       : use_tiled ? matmul_tiled_pipeline_
+                                   : matmul_pipeline_;
 
         // 3. 复用通用 dispatch：2 输入 + 1 输出，push {M,N,K,transA,transB}
         //   Dispatch：按 shader 输出块尺寸计算工作组数
         //     matmul.comp（naive）：16×16 线程网格 = 16×16 输出块
         //     matmul_tiled.comp：64×64 输出块（BM/BN）
+        //     matmul_gemv.comp：每 WG ROWS=4 行 × N 列（单维 grid.x）
         //   ⚠ 曾误用 WORKGROUP_SIZE=16 统一计算 → tiled 版 dispatch 出 16 倍
         //   冗余工作组（每 16×16 一个组而非 64×64），GPU 做 16 倍无效计算，
         //   matmul 峰值只剩 ~4%（0.7/15.7 TFLOPS）。此处按实际块尺寸修复。
-        const uint32_t tile = use_tiled ? 64u : 16u;
         const uint32_t push_data[5] = {M, N, K, transA, transB};
         std::vector<std::uint8_t> pc(sizeof(push_data));
         std::memcpy(pc.data(), push_data, sizeof(push_data));
 
         std::vector<GpuTensor> inputs{A, B};
+        if (use_gemv)
+        {
+            auto r = dispatch_compute(pipeline, inputs, C, pc,
+                (M + GEMV_ROWS - 1u) / GEMV_ROWS, 1u, 1u);
+            if (!r)
+                return std::unexpected(r.error());
+            return C;
+        }
+        const uint32_t tile = use_tiled ? 64u : 16u;
         auto r = dispatch_compute(pipeline, inputs, C, pc,
             (N + tile - 1u) / tile, (M + tile - 1u) / tile, 1u);
         if (!r)
@@ -2242,6 +2363,18 @@ public:
     }
 
     // ── 辅助：获取 command buffer（batch 或独立）──────────────────────
+    // ── 算子 host 开销剖析开关（NN_GPU_PROFILE=1 时 stderr 打印分段耗时；
+    //    未设置时进程内仅查询一次，之后纯 bool 读取）────────────────────
+    [[nodiscard]] static bool profile_ops_enabled()
+    {
+        static const bool on = []() {
+            // 复用 VulkanDevice::get_env（MSVC 下 _dupenv_s，绕开 getenv 弃用）
+            const std::string v = VulkanDevice::get_env("NN_GPU_PROFILE");
+            return !v.empty() && v[0] != '0';
+        }();
+        return on;
+    }
+
     // 返回 (cmd, owns_cmd)。owns_cmd=true 时调用方需 submit_and_wait。
     [[nodiscard]] Result<std::pair<VkCommandBuffer, bool>> acquire_cmd()
     {
@@ -2251,16 +2384,16 @@ public:
             return std::make_pair(batch_cmd_, false);
         }
 
-        VkCommandBufferAllocateInfo cmd_alloc{};
-        cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cmd_alloc.commandPool = command_pool_;
-        cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cmd_alloc.commandBufferCount = 1;
+        // 独立模式复用 initialize() 预分配的 solo_cmd_：reset + begin，
+        // 免去每算子 vkAllocateCommandBuffers/vkFreeCommandBuffers。
+        // solo_cmd_ 仅在 submit_and_wait 等完 fence 后才会被再次取用，
+        // 不存在 pending 期 reset；begin 失败时 buffer 留在 reset 后初态
+        // （规范允许 reset 从错误态恢复），下次调用可重试。
+        VkCommandBuffer cmd = solo_cmd_;
+        if (cmd == VK_NULL_HANDLE)
+            return std::unexpected(Error{"acquire_cmd: solo_cmd_ not initialized"});
 
-        VkCommandBuffer cmd = VK_NULL_HANDLE;
-        auto r = detail::vk_check(
-            vkAllocateCommandBuffers(device_.device(), &cmd_alloc, &cmd),
-            __FILE__, __LINE__);
+        auto r = detail::vk_check(vkResetCommandBuffer(cmd, 0), __FILE__, __LINE__);
         if (!r) return std::unexpected(r.error());
 
         VkCommandBufferBeginInfo begin_info{};
@@ -2268,37 +2401,41 @@ public:
         begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         r = detail::vk_check(vkBeginCommandBuffer(cmd, &begin_info), __FILE__, __LINE__);
         if (!r)
-        {
-            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
             return std::unexpected(r.error());
-        }
         return std::make_pair(cmd, true);
     }
 
-    // ── 辅助：独立模式提交+等待+清理 ──────────────────────────────────
-    // owns_cmd=true 时调用：end → submit → wait → free cmd + desc_set
+    // ── 辅助：独立模式提交+等待（solo fence/cmd 复用，仅归还描述符集）────
+    // cmd：acquire_cmd 返回的 solo_cmd_（非 batch 模式才会走到这里）
     // desc_set 可为 VK_NULL_HANDLE（fill_zero/copy_buffer 无描述符集）
+    // NN_GPU_PROFILE=1：stderr 打印 host 分段耗时（µs）用于开销归因
     [[nodiscard]] Result<void> submit_and_wait(
         VkCommandBuffer cmd, VkDescriptorSet desc_set)
     {
+        const bool prof = profile_ops_enabled();
+        const auto t_begin = std::chrono::steady_clock::now();
+
         auto r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
         if (!r)
         {
-            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
             if (desc_set != VK_NULL_HANDLE)
                 vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
             return std::unexpected(r.error());
         }
+        const auto t_end = std::chrono::steady_clock::now();
 
-        VkFenceCreateInfo fence_info{};
-        fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        VkFence fence = VK_NULL_HANDLE;
+        if (solo_fence_ == VK_NULL_HANDLE)
+        {
+            if (desc_set != VK_NULL_HANDLE)
+                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            return std::unexpected(Error{"submit_and_wait: solo_fence_ not initialized"});
+        }
+        // 上一次 submit 已 wait 到 signaled → 这里 reset 回 unsignaled 复用
+        //（首次调用时是 init 创建的 fresh unsignaled，reset 为合法 no-op）
         r = detail::vk_check(
-            vkCreateFence(device_.device(), &fence_info, nullptr, &fence),
-            __FILE__, __LINE__);
+            vkResetFences(device_.device(), 1, &solo_fence_), __FILE__, __LINE__);
         if (!r)
         {
-            vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
             if (desc_set != VK_NULL_HANDLE)
                 vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
             return std::unexpected(r.error());
@@ -2318,28 +2455,41 @@ public:
             VkTimelineSemaphoreSubmitInfo timeline_info{};
             attach_staging_waits(submit_info, sw, timeline_info);
             r = detail::vk_check(
-                vkQueueSubmit(device_.compute_queue(), 1, &submit_info, fence),
+                vkQueueSubmit(device_.compute_queue(), 1, &submit_info, solo_fence_),
                 __FILE__, __LINE__);
             if (!r)
             {
-                vkDestroyFence(device_.device(), fence, nullptr);
-                vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
                 if (desc_set != VK_NULL_HANDLE)
                     vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
                 return std::unexpected(r.error());
             }
         }
+        const auto t_submit = std::chrono::steady_clock::now();
 
         // 30 秒超时（单个原语，比 batch 短）
         constexpr uint64_t kSingleOpTimeoutNs = 30'000'000'000ULL;
         r = detail::vk_check(
-            vkWaitForFences(device_.device(), 1, &fence, VK_TRUE, kSingleOpTimeoutNs),
+            vkWaitForFences(device_.device(), 1, &solo_fence_, VK_TRUE, kSingleOpTimeoutNs),
             __FILE__, __LINE__);
+        const auto t_wait = std::chrono::steady_clock::now();
 
-        vkDestroyFence(device_.device(), fence, nullptr);
-        vkFreeCommandBuffers(device_.device(), command_pool_, 1, &cmd);
+        // 只归还描述符集；solo fence/cmd 留待下次复用（不销毁/不释放）
         if (desc_set != VK_NULL_HANDLE)
             vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+        const auto t_done = std::chrono::steady_clock::now();
+
+        if (prof)
+        {
+            const auto us = [](auto a, auto b) {
+                return static_cast<long long>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
+            };
+            std::fprintf(stderr,
+                "[gpu-profile] solo_op: end=%lldus submit=%lldus wait=%lldus "
+                "cleanup=%lldus total=%lldus\n",
+                us(t_begin, t_end), us(t_end, t_submit), us(t_submit, t_wait),
+                us(t_wait, t_done), us(t_begin, t_done));
+        }
         return r;
     }
 
@@ -2522,10 +2672,13 @@ public:
         std::span<const Scalar> rparams = {},
         GpuTensor* output_override = nullptr,
         std::optional<std::uint32_t> matmul_k = std::nullopt,
-        std::uint32_t matmul_batch = 1)
+        std::uint32_t matmul_batch = 1,
+        // fold 收缩轴长度（P-C1：fold shader 传入填 fold_k 槽；非 fold 传 nullopt）
+        std::optional<std::uint32_t> fold_k = std::nullopt)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
+        const auto prof_t0 = std::chrono::steady_clock::now();
         const auto it = fused_pipelines_.find(shader_name);
         if (it == fused_pipelines_.end())
             return std::unexpected(Error{"fused shader not registered: " + shader_name});
@@ -2536,6 +2689,12 @@ public:
         // 是否含前置 matmul 段（push constants 多 rows + mm_k）
         const bool has_mm = fused_has_matmul_.count(shader_name)
             ? fused_has_matmul_.at(shader_name) : false;
+        // fold 形态（注册时从 FusedShader.spec.fold 取，与生成器同源）
+        const bool has_fold_meta = fused_fold_meta_.count(shader_name) > 0;
+        const FoldMeta fmeta = has_fold_meta
+            ? fused_fold_meta_.at(shader_name) : FoldMeta{0u, 0u};
+        const std::uint32_t fold_out = fmeta.out;
+        const bool is_fold = has_fold_meta && fold_out > 0;
         // 运行时视图参数个数（RowMod/RotateHalf 的 vp 槽）
         const std::uint32_t n_vp = fused_view_param_counts_.count(shader_name)
             ? fused_view_param_counts_.at(shader_name) : 0u;
@@ -2556,9 +2715,28 @@ public:
         if (has_mm && !matmul_k)
             return std::unexpected(Error{
                 "run_fused_gpu: matmul shader 缺少 matmul_k（求和维度）"});
-        if (!has_mm && matmul_k)
+        if (!has_mm && matmul_k && !is_fold)
             return std::unexpected(Error{
                 "run_fused_gpu: 非 matmul shader 收到了 matmul_k"});
+        // fold 形态校验（与 matmul_k 同款对称防呆 + 调用约定）：
+        //   fold 输出网格 = (rows, out_cols)，out_cols = vec_state_len（或 1），
+        //   cols 参数必须等于它（GpuEngine/层调用约定）；PC cols 槽填 fold_k
+        //   （视图/块轴列数=键长，见下方 cols32），不填输出列。
+        //   fold+matmul 时 matmul_k/matmul_batch 同传（PC slot5/6）。
+        if (is_fold && !fold_k)
+            return std::unexpected(Error{
+                "run_fused_gpu: fold shader 缺少 fold_k（收缩轴长度）"});
+        if (!is_fold && fold_k)
+            return std::unexpected(Error{
+                "run_fused_gpu: 非 fold shader 收到了 fold_k"});
+        if (is_fold && vector_out)
+            return std::unexpected(Error{
+                "run_fused_gpu: fold shader 以 vector_out 调度（应走 eval_expr）"});
+        if (is_fold && cols == 0)
+            return std::unexpected(Error{
+                "run_fused_gpu: fold 调用约定 cols（=输出列数 out_cols）必须 > 0"});
+        // （形状无关：out_cols 不做 shader 侧比对——veclen 不进 key，同一
+        //   shader 服务任意 d_k，PC vector_out 槽按调用方 cols 运行时填充）
         // matmul+归约（S5）：raxis >= 0 时 mm_k 填入 PC 第 5 槽（见下方填充）
 
         // count 以 uint32 传入 shader（gl_GlobalInvocationID / push constant），
@@ -2648,7 +2826,9 @@ public:
         //   整体后移一个 uint → shader 从错位处读常量（实测把 select(cond,1,0) 的
         //   常量读成垃圾，GPU 上归约结果静默错值，而 CPU 正常）。
         const std::uint32_t pc_base =
-            (raxis >= 0 && has_mm) ? 6u   // count, cols, rows, vector_out, mm_k, mm_batch
+            (is_fold && matmul_k)       ? 7u   // fold+mm: …, fold_k, mm_k, mm_batch
+          : (is_fold)                   ? 5u   // fold: count,cols,rows,vector_out,fold_k
+          : (raxis >= 0 && has_mm) ? 6u   // count, cols, rows, vector_out, mm_k, mm_batch
           : (raxis >= 0)           ? 4u   // count, cols, rows, vector_out
           : (has_mm)               ? 5u   // count, cols, rows, mm_k, mm_batch
           :                          2u;  // count, cols
@@ -2657,7 +2837,10 @@ public:
             (pc_uints + n_vp) * sizeof(std::uint32_t) + sizeof(Scalar) * consts.size()
             + sizeof(Scalar) * rparams.size());
         std::memcpy(pc.data(), &count, sizeof(std::uint32_t));
-        const std::uint32_t cols32 = static_cast<std::uint32_t>(cols);
+        // fold：PC cols 槽 = fold_k（生成器视图/块轴用输入列数 K 索引；
+        //   输出网格列恒 1 不进 PC）。其余形态 = 调用方 cols。
+        const std::uint32_t cols32 = is_fold
+            ? *fold_k : static_cast<std::uint32_t>(cols);
         std::memcpy(pc.data() + sizeof(std::uint32_t), &cols32, sizeof(std::uint32_t));
         if (raxis >= 0)
         {
@@ -2688,6 +2871,28 @@ public:
             std::memcpy(pc.data() + 4 * sizeof(std::uint32_t), &matmul_batch,
                         sizeof(std::uint32_t));
         }
+        else if (is_fold)
+        {
+            // fold（P-C1/P-C2）：rows + **vector_out = 调用方输出列数**
+            //   （形状无关——veclen 不进 key，PC 运行时填充；P-C1 v1 生成器
+            //   不读此槽、填 1 无害）+ fold_k + [mm_k, mm_batch]（7 槽形态）。
+            //   与生成器 PC 声明逐字段一致（4.10：创建侧 range 必须同改）
+            const std::uint32_t rows32 = static_cast<std::uint32_t>(rows);
+            const std::uint32_t vo = static_cast<std::uint32_t>(cols);
+            std::memcpy(pc.data() + 2 * sizeof(std::uint32_t), &rows32,
+                        sizeof(std::uint32_t));
+            std::memcpy(pc.data() + 3 * sizeof(std::uint32_t), &vo,
+                        sizeof(std::uint32_t));
+            std::memcpy(pc.data() + 4 * sizeof(std::uint32_t), &*fold_k,
+                        sizeof(std::uint32_t));
+            if (matmul_k)
+            {
+                std::memcpy(pc.data() + 5 * sizeof(std::uint32_t), &*matmul_k,
+                            sizeof(std::uint32_t));
+                std::memcpy(pc.data() + 6 * sizeof(std::uint32_t), &matmul_batch,
+                            sizeof(std::uint32_t));
+            }
+        }
         // 运行时视图参数（RowMod 周期 / RotateHalf 块大小），置于固定头之后、常量池之前
         for (std::uint32_t i = 0; i < n_vp; ++i)
             std::memcpy(pc.data() + (pc_uints + i) * sizeof(std::uint32_t),
@@ -2710,7 +2915,7 @@ public:
         // 32×32 输出块、16×16 线程、每线程 2×2 寄存器分块）
         const std::uint32_t vec_width = fused_vec_width_.count(shader_name)
             ? fused_vec_width_.at(shader_name) : 1u;
-        if (has_mm && raxis < 0)
+        if (has_mm && raxis < 0 && !is_fold)
         {
             const std::uint32_t wg_x =
                 (static_cast<std::uint32_t>(cols) + nn::EXPR_MATMUL_BLOCK - 1u)
@@ -2723,8 +2928,18 @@ public:
         }
         else
         {
+            // fold 的 dispatch 分两种（FoldMeta，与生成器分派同源）：
+            //   v1 标量 fold（每线程一行，row=gl_GlobalInvocationID.x）：
+            //     count=rows×1 → ceil(count/256) 恰 = ceil(rows/256) ✓
+            //   v2 双域 fold（每 WG NR 行，row=wg*NR+ri，EXPR_FOLD_ROWS_PER_WG
+            //     与生成器行循环同源）：**wg = ceil(rows/NR)**
+            //     （按 ceil(count/256)=ceil(rows×out/256) 派会丢行！）
             const std::uint32_t wg_count =
-                (raxis == 0) ? static_cast<std::uint32_t>(rows)
+                (is_fold && !fmeta.per_thread_row)
+                    ? (static_cast<std::uint32_t>(rows)
+                       + nn::EXPR_FOLD_ROWS_PER_WG - 1u)
+                        / nn::EXPR_FOLD_ROWS_PER_WG
+                : (raxis == 0) ? static_cast<std::uint32_t>(rows)
                 : (raxis == 1) ? (static_cast<std::uint32_t>(cols) + 255u) / 256u
                 : (count + 256u * vec_width - 1u) / (256u * vec_width);
             vkCmdDispatch(cmd, wg_count, 1, 1);
@@ -2736,6 +2951,15 @@ public:
         {
             auto r = submit_and_wait(cmd, desc_set);
             if (!r) return std::unexpected(r.error());
+        }
+        if (profile_ops_enabled())
+        {
+            const long long dt = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - prof_t0).count();
+            std::fprintf(stderr,
+                "[gpu-profile] fused fold=%d out=%u total=%lldus key=%.16s\n",
+                static_cast<int>(fmeta.per_thread_row == 0 && has_fold_meta),
+                fold_out, dt, shader_name.c_str());
         }
         return output;
     }
