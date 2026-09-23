@@ -2,7 +2,7 @@
 
 > 本文档汇总项目开发至今踩过的所有坑，按严重度分级，提炼跨领域的根因模式，并提供开发活动的防坑清单。**每次踩新坑，先补充到本文档，再修复代码。**
 >
-> 更新频率：随开发持续追加。最近更新：2026-08-19
+> 更新频率：随开发持续追加。最近更新：2026-09-24
 
 ---
 
@@ -215,8 +215,9 @@
 - **复发（2026-09-23，P-C1 fold 形态，已修复）**：pc_base 公式其实有**两处**——
   ①写入侧 `run_fused_gpu`（4.10 修的那处）②**创建侧** `compute_vk_backend.hpp`
   注册 fused pipeline 时的 `push_constant_size`（`VulkanPipeline::create_generic`
-  的 range 参数）。新增 fold 形态（5 uint 头）时只改了写入侧 → range 仍按逐元素
-  2 uint 算 = 12 字节，`vkCmdPushConstants` 超 range 部分被驱动丢弃 →
+  的 range 参数）。新增 fold 形态（5 uint 头）时只改了写入侧 → 创建侧仍按逐元素
+  形态算（2 uint 头 8B + 4B 常量/rparam 尾 = 12 字节），`vkCmdPushConstants` 超
+  range 部分被驱动丢弃 →
   **`fold_k` 读未定义残留**：残留值随前序 push 的 shader 漂移，表现为"时对时错"
   （前一轮残留恰=K 造成假 PASS，下一轮残留=6 变成滑窗错值）。行守卫/cols 恰好在
   前 12 字节内所以前 3 槽看起来正常，极具迷惑性。**定案方法**：K=1 打印全部行的
@@ -354,7 +355,7 @@ GPU-resident 单算子对、链式错；attn batch=1 对、batch=2 错；gradche
 
 ## 8. 相关文档
 
-- `DEVELOPMENT_STANDARDS.md`（本开发类）— 分层职责规范（"每层只能负责每层的事"）
-- `01-architecture.md` — 架构分层
-- `06-cuda-backend.md` — CUDA 构建与版本匹配（已停用，恢复参考）
-- `07-train-package.md` — 训练包格式
+- `10-development-standards.md`（同目录）— 分层职责规范（"每层只能负责每层的事"）
+- `../introduction/01-architecture.md` — 架构分层
+- `07-zipt-algorithm.md` — 当前 06 号文档（原 `06-cuda-backend.md` 已随 CUDA 移除不复存在）
+- `../usage/04-train-package.md` — 训练包格式（原 07 号位置）

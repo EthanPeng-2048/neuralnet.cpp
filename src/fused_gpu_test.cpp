@@ -542,14 +542,16 @@ int run_reduce_consts(nn::ComputeEngine& cpu, nn::ComputeEngine& gpu)
 // 同 spec → 同 key → 命中 scan 收集的 fold shader；同分块(EXPR_FOLD_BLOCK)、
 // 同指令序、每线程一行与 CPU 执行器逐指令同构 → rowmax 期望**逐位一致**；
 // rowsum/denom 给小容差（fp 加法结合序驱动差异 / exp 软硬件实现差异）。
-// K 族覆盖单列 / 非块整除 / 整除 / 尾块（32 边界两侧）。
+// K 族覆盖单列 / 非块整除 / 整除 / 尾块（EXPR_FOLD_BLOCK=128 边界两侧——
+// 256/260 补多块+尾块；BLOCK 升 128 后 K≤100 会静默退化单块）。
 int run_fold_gpu(CpuEngine& cpu, GpuEngine& gpu)
 {
     int fail = 0;
     std::mt19937 rng(9013);
     std::uniform_real_distribution<Scalar> dist(-2.0f, 2.0f);
     for (const std::size_t K : {std::size_t{1}, std::size_t{7}, std::size_t{32},
-                                std::size_t{33}, std::size_t{100}})
+                                std::size_t{33}, std::size_t{100},
+                                std::size_t{256}, std::size_t{260}})
     {
         const std::size_t rows = 6;
         Tensor x = Tensor::cpu(rows, K);
@@ -561,9 +563,6 @@ int run_fold_gpu(CpuEngine& cpu, GpuEngine& gpu)
 
         const auto one = [&](const char* tag, const nn::ExprSpec& spec, Scalar tol)
         {
-            if (K == 1)
-                std::cout << "      [dbg] " << tag << " key="
-                          << nn::expr_spec_key(spec) << "\n";
             auto c = cpu.eval_expr(spec, ins, rows, 1);
             auto g = gpu.eval_expr(spec, ins, rows, 1);
             if (!c)
@@ -610,14 +609,6 @@ int run_fold_gpu(CpuEngine& cpu, GpuEngine& gpu)
             }
         };
 
-        if (K == 1)
-        {
-            std::cout << "      [dbg] x =";
-            const auto xs = x.cpu_matrix().span();
-            for (std::size_t i = 0; i < rows; ++i) std::cout << " " << xs[i];
-            std::cout << "\n";
-        }
-
         one("rowmax", nn::expr::make_fold_rowmax(
                 static_cast<std::uint32_t>(K)), Scalar{0});
         one("rowsum", nn::expr::make_fold_rowsum(
@@ -629,9 +620,12 @@ int run_fold_gpu(CpuEngine& cpu, GpuEngine& gpu)
 }
 
 // ── P-C2 attention fold（v2 双域）GPU 对拍 ──────────────────────────────
-// 与 scan 登记的 spec 同源（vec_state_len 进 key → dk∈{2,4,8} 恰为登记集）；
-// v2 与 CPU 执行器同分块/同指令序/同归约结合序 → 期望近逐位；容差 1e-4
-// （exp 软硬件实现差）。覆盖 mm 段/掩码/vecacc/向量域 finalize/dispatch(wg=rows)。
+// 与 scan 登记的 spec 同源（vec_state_len 不进 key——形状参数经 PC
+// vector_out 槽填充，dk 族登记是同 key 去重）；v2 与 CPU 执行器同分块/
+// 同指令序——max 类逐位；sum/vecacc 类 GPU 蝶形结合序异于 CPU 串行、exp
+// 软硬件有差 → 走容差 1e-4（非全逐位）。
+// 覆盖 mm 段/5 掩码/vecacc/向量域 finalize/dispatch(ceil(rows/NR))、
+// seq>EXPR_FOLD_BLOCK 多块流式 + causal 整块跳过、GPU rows=1。
 int run_fold_attn_gpu(CpuEngine& cpu, GpuEngine& gpu)
 {
     int fail = 0;
@@ -640,25 +634,51 @@ int run_fold_attn_gpu(CpuEngine& cpu, GpuEngine& gpu)
     struct Sh { std::uint32_t bh, seq, dk; };
     for (const auto mk : {nn::expr::FoldAttnMask::Plain,
                           nn::expr::FoldAttnMask::Causal,
-                          nn::expr::FoldAttnMask::Alibi})
+                          nn::expr::FoldAttnMask::Alibi,
+                          nn::expr::FoldAttnMask::Doc,
+                          nn::expr::FoldAttnMask::AlibiDoc})
     {
-        const char* mname = mk == nn::expr::FoldAttnMask::Plain ? "plain"
-                         : mk == nn::expr::FoldAttnMask::Causal ? "causal" : "alibi";
-        for (const Sh sh : {Sh{2, 9, 4}, Sh{1, 33, 8}, Sh{3, 5, 2}})
+        const char* mname = mk == nn::expr::FoldAttnMask::Plain    ? "plain"
+                         : mk == nn::expr::FoldAttnMask::Causal    ? "causal"
+                         : mk == nn::expr::FoldAttnMask::Alibi     ? "alibi"
+                         : mk == nn::expr::FoldAttnMask::Doc       ? "doc"
+                                                                 : "alibidoc";
+        // {2,133,4}：seq > EXPR_FOLD_BLOCK(128) → GPU 多块流式 + causal
+        //   整块跳过分支（k0>qt）；{1,1,4}：GPU 最小 rows=1（clamp+row_ok）
+        for (const Sh sh : {Sh{2, 9, 4}, Sh{1, 33, 8}, Sh{3, 5, 2},
+                            Sh{2, 133, 4}, Sh{1, 1, 4}})
         {
             const std::size_t rows_out = static_cast<std::size_t>(sh.bh) * sh.seq;
             Tensor Q = Tensor::cpu(static_cast<std::size_t>(sh.bh) * sh.dk, sh.seq);
             Tensor K = Tensor::cpu(static_cast<std::size_t>(sh.bh) * sh.dk, sh.seq);
             Tensor Vt = Tensor::cpu(rows_out, sh.dk);
             Tensor slopes = Tensor::cpu(1, sh.bh);
+            // doc 输入（与 expr_fold_test / Layer 同构）：doc_col (rows,1) 行
+            //   文档 id；doc_ids (1, bh*seq) 按 (b,h) 块重复（BatchCol(seq)）
+            const std::uint32_t sseq = sh.seq;
+            Tensor doc_col = Tensor::cpu(rows_out, 1);
+            Tensor doc_ids_t = Tensor::cpu(
+                1, static_cast<std::size_t>(sh.bh) * sh.seq);
+            const auto doc_of = [sseq](std::uint32_t pos) -> Scalar
+            { return pos < sseq / 2 ? Scalar{1} : Scalar{2}; };
+            for (std::size_t r = 0; r < rows_out; ++r)
+                doc_col.cpu_matrix().span()[r] =
+                    doc_of(static_cast<std::uint32_t>(r % sh.seq));
+            for (std::uint32_t blk = 0; blk < sh.bh; ++blk)
+                for (std::uint32_t j = 0; j < sh.seq; ++j)
+                    doc_ids_t.cpu_matrix().span()
+                        [static_cast<std::size_t>(blk) * sh.seq + j] = doc_of(j);
             for (auto& v : Q.cpu_matrix().span()) v = dist(rng);
             for (auto& v : K.cpu_matrix().span()) v = dist(rng);
             for (auto& v : Vt.cpu_matrix().span()) v = dist(rng);
             for (auto& v : slopes.cpu_matrix().span()) v = dist(rng) * Scalar{0.1};
-            const bool alibi = (mk == nn::expr::FoldAttnMask::Alibi);
-            const std::vector<Tensor> ins = alibi
-                ? std::vector<Tensor>{Q, K, Vt, slopes}
-                : std::vector<Tensor>{Q, K, Vt};
+            const bool alibi = (mk == nn::expr::FoldAttnMask::Alibi ||
+                                mk == nn::expr::FoldAttnMask::AlibiDoc);
+            const bool docm  = (mk == nn::expr::FoldAttnMask::Doc ||
+                                mk == nn::expr::FoldAttnMask::AlibiDoc);
+            std::vector<Tensor> ins{Q, K, Vt};
+            if (alibi) ins.push_back(slopes);
+            if (docm) { ins.push_back(doc_col); ins.push_back(doc_ids_t); }
 
             nn::ExprSpec spec = nn::expr::make_fold_attn_o(sh.seq, sh.dk, sh.bh, mk);
             auto c = cpu.eval_expr(spec, ins, rows_out, sh.dk);

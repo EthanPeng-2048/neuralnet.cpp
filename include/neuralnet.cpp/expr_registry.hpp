@@ -59,7 +59,7 @@ struct ExprRegistry
 
 // ── 二进制序列化（dump/load 共用同一格式）───────────────────────────────
 // 格式（小端，x86/ARM 通用）：
-//   magic "NNEXP" (5B) + version (u8=3)
+//   magic "NNEXP" (5B) + version (u8=8)
 //   count (u32)
 //   每 spec：num_regs(u32)
 //            instrs: count(u32) × {op(u8) dst(u8) a.kind a.idx b.kind b.idx c.kind c.idx}
@@ -75,7 +75,8 @@ struct ExprRegistry
 //                    -- v7 追加：vec_state_len(u32),
 //                    matmul: has(u8)；1 时 {a,b,tA,tB(4B) k(u32) batch(u32)},
 //                    vecacc: has(u8)；1 时 {vec_state,weight_reg,b_input,
-//                           scale_reg,has_scale(5B)}}
+//                           scale_reg,has_scale(5B)}
+//                    -- v8 追加：causal_skip(u8)}
 //  v2 起支持 matmul 段（v1 无 matmul，读 v1 等价 has=0）；v3 起支持 rparams。
 inline constexpr std::uint8_t kExprBinVersion = 8;  // v5：MatmulSpec 补 batch；v6：FoldSpec；v7：FoldSpec 双域字段（vec_state_len/matmul/vecacc——丢段=结构损坏）；v8：causal_skip（causal 跳块 codegen 标志——不对称=静默不跳或错位读废）
 
