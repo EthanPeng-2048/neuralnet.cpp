@@ -288,8 +288,9 @@ struct VecAccSpec
 //     操作数按当前 d 读）→ 末指令 dst = 输出元素；输出网格 (rows, out_cols)。
 // P-C1 兼容：vec_state_len=0（无 vecacc/matmul/VecState）时退化为单列标量
 //   fold，语义与行为逐字节不变。
-// key：结构字段全进（inits/两段指令/vec 长度/matmul 转置与槽位/vecacc）；
-//   k、matmul 的 k/batch 不进（形状参数 → 运行时 push constant）。
+// key：结构字段全进（inits/两段指令/matmul 转置与槽位/vecacc/causal_skip）；
+//   k、matmul 的 k/batch、vec_state_len 不进（形状参数 → 运行时 push
+//   constant；veclen 进 key 会让每个 dk 一个 shader，见 expr_spec_key 注释）。
 struct FoldSpec
 {
     std::uint8_t        num_state = 1;  // 行标量态数（前缀寄存器 0..num_state-1）
@@ -670,7 +671,8 @@ inline constexpr std::size_t FOLD_MAX_VEC     = 1024;  // 行向量态长度上�
 inline constexpr std::uint32_t FOLD_MAX_MMK   = 1024;  // fold mm 段内层 k 上限
     // （Q 行预载 shared Qsh[1024] 的编译期尺寸——d_k 超限在 validate 静态拒）
 // fold 块大小：CPU 执行器与 GPU 生成器**共用**的常量（不进 key——分块是
-// 实现细节，但两侧必须同值以保证浮点结合序一致 → 对拍可走紧容差）。
+// 实现细节，但两侧必须同值以对齐分块边界与 max 类逐位；sum 类 GPU subgroup
+// 蝶形结合序异于 CPU 串行 → 对拍仍走小容差（1e-4~1e-6），并非全逐位）。
 // 历次调整均以交错 bench 实测裁决：32→64（每块协议减半，fwd −6%）；64→128
 // （协议再减半 + 链/归约活跃线程翻倍（tid<BLOCK）；shared 6.75→~8.9KB、驻留
 // 8→7 WG 的占用代价被收益盖过——mha fwd 5.77→5.41，18/18 绿）
@@ -764,6 +766,11 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
                 return std::unexpected(Error{
                     "validate_expr_spec: fold matmul k exceeds Qsh shared preload cap (1024)"});
         }
+        // causal_skip 的 Row/m_per 网格语义取自 mm.batch——无 mm 段时生成器
+        //   会引用未声明的 m_per（glslc 报错但定位差），此处静态拒绝
+        if (f.causal_skip && !f.matmul)
+            return std::unexpected(Error{
+                "validate_expr_spec: fold causal_skip requires fold matmul segment"});
         if (f.vecacc)
         {
             const VecAccSpec& va = *f.vecacc;

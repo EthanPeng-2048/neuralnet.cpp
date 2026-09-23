@@ -412,7 +412,8 @@ private:
     // fold 形态元数据（P-C1/P-C2，与生成器分派同源判定）：
     //   out       = 输出列数（vec_state_len 或 1）——调用约定 cols==out 校验
     //   per_thread_row = 1 → v1 标量 fold：每线程一行（local 256，wg=ceil(rows/256)）；
-    //               0 → v2 双域 fold：每 WG 一行（row=gl_WorkGroupID.x，wg=rows）
+    //               0 → v2 双域 fold：每 WG EXPR_FOLD_ROWS_PER_WG 行
+    //               （row = wg*NR + ri，wg = ceil(rows/NR)，行循环同生成器）
     //               ——dispatch 公式两者不同（v2 若按 ceil(count/256) 会丢行！）
     struct FoldMeta { std::uint32_t out; std::uint8_t per_thread_row; };
     std::unordered_map<std::string, FoldMeta> fused_fold_meta_;
@@ -1987,7 +1988,11 @@ public:
         //   真实 N 列（借鉴 ggml mul_mat_vec 分派）。
         constexpr uint32_t GEMV_MAX_N = 8;
         constexpr uint32_t GEMV_ROWS = 4;   // 与 matmul_gemv.comp 的 ROWS 一致
-        const bool use_gemv = has_gemv_pipeline() && N <= GEMV_MAX_N;
+        // subgroup≥4 门禁：shader red[..][64] 的容量假设（256/4 = 64 槽）——
+        //   更小 subgroup 会溢出 64 槽上限、部分和不落表 → 静默错值
+        //   （4.10 同类"只有 GPU 错"；实测桌面卡恒 ≥8，门禁是保险丝）
+        const bool use_gemv = has_gemv_pipeline() && N <= GEMV_MAX_N
+                              && device_.subgroup_size() >= 4u;
         const bool use_tiled = has_tiled_pipeline() && !use_gemv;
         auto& pipeline = use_gemv ? matmul_gemv_pipeline_
                        : use_tiled ? matmul_tiled_pipeline_
@@ -2910,9 +2915,9 @@ public:
 
         // dispatch：逐元素 = ceil(count/(256*vec_width))；行归约 = rows 个工作组；
         // 列归约(tile) = ceil(cols/256) 个工作组（每工作组 256 列）；
-        // matmul 分块（S5）= (ceil(cols/BLOCK), ceil(rows/BLOCK), 1)，
-        // BLOCK 与 glsl_gen 生成的输出块一致（EXPR_MATMUL_BLOCK：每工作组
-        // 32×32 输出块、16×16 线程、每线程 2×2 寄存器分块）
+        // matmul 分块（S5）= (ceil(cols/BLOCK), ceil(rows/BLOCK), matmul_batch)，
+        // BLOCK 与 glsl_gen 生成的输出块一致（EXPR_MATMUL_BLOCK=64：每工作组
+        // 64×64 输出块、16×16 线程、每线程 4×4 寄存器分块）
         const std::uint32_t vec_width = fused_vec_width_.count(shader_name)
             ? fused_vec_width_.at(shader_name) : 1u;
         if (has_mm && raxis < 0 && !is_fold)
@@ -2956,10 +2961,13 @@ public:
         {
             const long long dt = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - prof_t0).count();
+            // fold 按形态如实打印（is_fold；旧表达式对 v1 fold 打 0、对非
+            // fold 打 1）；out= 运行时列数（veclen 不进 key，注册侧值可能
+            // 与调用方实际 cols 不同——按注册侧打印曾误导归因）
             std::fprintf(stderr,
                 "[gpu-profile] fused fold=%d out=%u total=%lldus key=%.16s\n",
-                static_cast<int>(fmeta.per_thread_row == 0 && has_fold_meta),
-                fold_out, dt, shader_name.c_str());
+                static_cast<int>(is_fold),
+                static_cast<std::uint32_t>(cols), dt, shader_name.c_str());
         }
         return output;
     }

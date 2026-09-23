@@ -129,7 +129,7 @@ list(APPEND NN_APP_TARGETS layer_bench)
 if(NN_ENABLE_TESTS)
 
     # ══════════════════════════════════════════════════════════════════════
-    # 测试目标（15 个，按功能域分组合并；原 35 个独立目标已精简）
+    # 测试目标（18 个，按功能域分组合并；原 35 个独立目标已精简）
     # 合并策略：wrapper .cpp 通过 #define main + #include 聚合原测试源文件
     # ══════════════════════════════════════════════════════════════════════
 
@@ -174,7 +174,8 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(rapt_offload_test src/rapt_offload_test.cpp)
     list(APPEND NN_TEST_TARGETS rapt_offload_test)
 
-    # ── 文档感知注意力（掩码构建 + 端到端不变性）────────────────────────
+    # ── 文档感知注意力（端到端不变性 + 灵敏度/跨样本隔离对照；掩码构建
+    #    单测已随 build_attention_mask 删除）────────────────────────────────
     nn_add_executable(doc_attn_test src/doc_attn_test.cpp)
     list(APPEND NN_TEST_TARGETS doc_attn_test)
 

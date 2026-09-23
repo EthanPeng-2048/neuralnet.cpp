@@ -192,18 +192,21 @@ grad_x = out ⊙ gmd
 
 **可学习参数：** 4 个 Linear 层（`w_q`, `w_k`, `w_v`, `w_o`），每个 `(d_model, d_model)`
 
-**Forward（批量化）：**
+**Forward（P-C2-7 单 fold 路径，S 不物化）：**
 
 1. 线性投影：`Q = W_q·x`, `K = W_k·x`, `V = W_v·x` → `(H·d_k, batch·seq)`
-2. 重排：`Q_re = rearrange_3d(Q, H·d_k, batch, seq)` → `(batch·H·d_k, seq)`
-3. 注意力分数：`S = batched_matmul(Q_re, K_re, batch·H, transA=true)` → `(batch·H·seq, seq)`
-4. 缩放：`S *= scale`，其中 `scale = 1/√d_k`
-5. Softmax：`A = softmax(S)`
-6. 注意力输出：`O_re = batched_matmul(V_re, A, batch·H)` → `(batch·H·d_k, seq)`
-7. 反重排：`O = rearrange_3d(O_re, H·d_k, batch, seq, inverse=true)` → `(H·d_k, batch·seq)`
-8. 输出投影：`out = W_o·O`
+2. 重排：`Q/K → rearrange_3d → (batch·H·d_k, seq)`；`V → transpose+rearrange → V_t (batch·H·seq, d_k)`
+3. 缩放折进 Q：`Q *= scale`（`scale = 1/√d_k`，S7 起折进 Q 免独立 pass）
+4. **单 fold kernel**：`O_t = eval_expr(make_fold_attn_o(...), {Q, K, V_t, [掩码输入]})`
+   —— QKᵀ、掩码（因果/ALiBi/doc 变体在 body 内 select 链表达）、online softmax、
+   `Σw·V` 在同一 kernel 内按 `EXPR_FOLD_BLOCK=128` 逐块完成，`(batch·H·seq, seq)`
+   的 S/W 矩阵**绝不物化**；`causal_skip` 把被屏蔽的整块钳成空转
+5. 反重排：`O = transpose + rearrange_3d 回 (H·d_k, batch·seq)`
+6. 输出投影：`out = W_o·O`
 
-**性能关键：** `rearrange_3d` + `batched_matmul` 将 H 个 per-head matmul 融合为 1 次 batch dispatch。
+**Backward：** `recompute_W_` 两步重算 `W = softmax(masked(Q·Kᵀ))`（掩码树与 forward 的 fold 变体同构同序），随后 R/X 表达式 + `batched_matmul` 得 grad_Q/K/V——不缓存 W/m/l。
+
+**性能关键：** fold 单 kernel 一次 dispatch 处理全部样本与头，无 `(batch·H·seq, seq)` 中间张量往返。（历史路径为 `rearrange_3d` + `batched_matmul` 把 H 个 per-head matmul 融合为 1 次 batch dispatch，该结构现仅存于 backward。）
 
 ---
 
@@ -298,16 +301,14 @@ grad_x[:, b·P + p] = (1/P) · grad_out[:, b]
 
 **参数：** `d_model`, `num_heads`, `max_len`, `seq_len`
 
-与 `MultiHeadAttention` 相同的批量化策略，额外施加因果掩码：
+forward 同为单 fold 路径；因果掩码在 fold body 内以 select 链表达（语义等价）：
 
 ```
 mask[i][j] = 0     if j ≤ i
            = -∞    if j > i
 ```
 
-掩码在 softmax 前施加：`S += mask`
-
-**掩码缓存：** 相同 `(batch, seq_len)` 组合只构造一次。
+**掩码绝不物化**：`j > i` 的屏蔽项在 kernel 内直接选择 -inf（`causal_skip` 进一步把被屏蔽的整块钳成空转）——没有 `S += mask` 矩阵，**也没有掩码缓存**（历史物化式掩码缓存已随 fold 迁移删除）。
 
 ---
 

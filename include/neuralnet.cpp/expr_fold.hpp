@@ -3,10 +3,11 @@
 // ═══════════════════════════════════════════════════════════════════════════
 //  expr_fold.hpp — 分块状态归约（FoldSpec）样例构造：P-C1 地基
 //
-//  这些构造函数是 scan_exprs（AOT 收集 dry-run）与 fused_gpu_test（GPU 对拍）
-//  的**共享唯一来源**——两侧必须构造出结构完全一致的 spec（key 一致），
-//  否则闭合世界查表未命中。P-C2 迁移注意力时 Layer 级 DSL combinator 再引入，
-//  届时 Layer 表达式接管、本文件的样例保留为回归锚点。
+//  这些构造函数是 scan_exprs（AOT 收集 dry-run）、fused_gpu_test（GPU 对拍）
+//  与注意力 Layer（AttentionBase::forward 直调 make_fold_attn_o，P-C2-7 起
+//  单 fold 路径）的**共享唯一来源**——各方必须构造出结构完全一致的 spec
+//  （key 一致），否则闭合世界查表未命中。rowmax/rowsum/softmax_denom 三个
+//  P-C1 样例不被 Layer 使用，保留为状态语义回归锚点。
 //
 //  共同形状契约：输入 (rows, K)，输出 (rows, 1)；fold.k = K（形状参数）。
 //  三个样例的语义增量：
@@ -51,8 +52,8 @@ namespace nn::expr
     b0.op  = static_cast<uint8_t>(ExprOp::RowMax);
     b0.dst = 1;
     b0.a   = input(0);
-    ExprInstr b1;                    // m = max(m, Reduce(blk))
     b0.b   = {};
+    ExprInstr b1;                    // m = max(m, Reduce(blk))
     b1.op  = static_cast<uint8_t>(ExprOp::Max);
     b1.dst = 0;
     b1.a   = reg(0);
@@ -156,7 +157,8 @@ namespace nn::expr
 //  布局：Q/K (bh·dk, seq) 行主序；V_t (bh·seq, dk)；输出 (bh·seq, dk)。
 //  掩码语义与既有 masked_causal_ / masked_alibi_ 对齐（Row/Col 按 batched
 //  网格：Row = 行%(rows/batch) = 查询位置 i、Col = 全局键位置 j）。
-//  scan_exprs 与 fused_gpu/expr_cpu 对拍共用本构造 → key 一致。
+//  scan_exprs dry-run、fused_gpu/expr_cpu 对拍与 AttentionBase::forward
+//  共用本构造 → key 一致。
 // ═══════════════════════════════════════════════════════════════════════════
 namespace nn::expr
 {

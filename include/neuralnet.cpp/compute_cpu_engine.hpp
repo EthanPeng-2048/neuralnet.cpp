@@ -23,15 +23,6 @@ namespace nn
 {
 
 // ══════════════════════════════════════════════════════════════════════════
-// AttnBias 组合偏置求值（CPU 参考实现，与 GPU shader 语义一致）
-//
-// 返回 {偏置值 mv, 是否屏蔽}。语义见 compute_engine.hpp 的 AttnBias 注释：
-//   mv(bb,i,j) = dense(i,j) + (causal && j>i ? -inf) + (doc ? -inf)
-//              + (slopes ? -slope[h]*(i-j))
-// bb = 两趟式原语的 batch 索引 = b*num_heads + h；i = query 行，j = key 列。
-// ══════════════════════════════════════════════════════════════════════════
-
-// ══════════════════════════════════════════════════════════════════════════
 // CpuEngine — CPU 计算引擎
 // ══════════════════════════════════════════════════════════════════════════
 
@@ -1538,6 +1529,24 @@ public:
             if (is_tag_table && t.rows() != 1)
                 return std::unexpected(Error{
                     "eval_fold: tag table (BatchMod/BatchCol) must be (1, n)"});
+            // 标签表列数守卫（此前只查 rows → 形状违约静默越界读）：
+            //   BatchMod 读 [batch_idx % param] → cols ≥ param（param==0 无
+            //   定义直接拒）；BatchCol 读 [batch_idx*param + gk] →
+            //   cols ≥ (batch-1)*param + K
+            if (is_tag_table)
+            {
+                const std::uint32_t vparam = spec.views[k].param;
+                if (vparam == 0)
+                    return std::unexpected(Error{
+                        "eval_fold: BatchMod/BatchCol param must be > 0"});
+                const std::size_t batch_n = f.matmul ? f.matmul->batch : 1;
+                const std::size_t need = vk == ExprViewKind::BatchMod
+                    ? static_cast<std::size_t>(vparam)
+                    : (batch_n - 1) * static_cast<std::size_t>(vparam) + K;
+                if (t.cols() < need)
+                    return std::unexpected(Error{
+                        "eval_fold: tag table cols out of range (BatchMod/BatchCol)"});
+            }
             if (is_rowvec && !(t.rows() == rows && t.cols() == 1))
                 return std::unexpected(Error{
                     "eval_fold: RowBroadcast input must be (rows, 1)"});

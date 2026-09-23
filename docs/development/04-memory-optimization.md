@@ -81,13 +81,13 @@ FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU �
 
 ### 数值精度
 
-`config.hpp` 中 `using Scalar = float`，全项目纯 fp32。激活、梯度、权重、优化器态全部 4B。**不引入 f16（bf16/fp16）半精度训练**——数值统一 fp32，避免触及"单套 fp32"精度红线。
+`config.hpp` 中 `using Scalar = float`，**本文档数字均为纯 fp32 基线**（立项时口径；v1.2.0 起已引入 f16 混合精度——`Precision`/`PrecisionProfile`，见 05-mixed-precision）。fp32 基线下激活、梯度、权重、优化器态全部 4B。（历史红线"不引入 f16"已随混合精度修订。）
 
 ### 激活缓存策略（核心问题 L1）
 
 - 层内 forward 为 backward 保留中间结果：如 `compute_layer.hpp` 的 `input_cache_`（Linear）、`sigmoid_cache_`（SiLU）、注意力保留的 Q/K/V 与 norm 输入等。
 - `Model::forward` → `Model::backward`（`model_container.hpp`）是**逐层顺序**执行，层间不丢弃激活。
-- 每层驻留约 8 个 `B·seq·d` 与 2 个 `B·seq·d_ff` 的 fp32 副本（d_ff=4096 每张 100MB 是重要大头），16 层累加 ~6.4G。**无梯度重计算（activation checkpointing）**。
+- 每层驻留约 8 个 `B·seq·d` 与 2 个 `B·seq·d_ff` 的 fp32 副本（d_ff=4096 每张 100MB 是重要大头），16 层累加 ~6.4G。**本节是 L1 实施前的基线口径（当时无梯度重计算）**——L1 checkpointing 后文已标【已实施】。
 
 ### 内存池碎片化 + 不归还（问题 L2）
 
@@ -97,7 +97,7 @@ FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU �
 
 ### 注意力形态（L3，语义复杂）
 
-原 `batched_matmul_reduce/max → denom → apply` 两趟式 forward 与 `batched_matmul_softmax_backward_q/kv` backward 重算 `W` 方案，已被 IR 融合替代（算子融合文档 S7）。该路径已消除 `BH·seq²` 物化，剩余驻留为逐层 Q/K/V 激活集（属 L1 激活重计算可覆盖范围）。**不手写** flash-attention 类融合 kernel：沿用现有自动融合/算子生成路径，由 L3 的自动融合优化统一推进。
+原 `batched_matmul_reduce/max → denom → apply` 两趟式 forward 与 `batched_matmul_softmax_backward_q/kv` backward 重算 `W` 方案，已被 IR 融合替代（算子融合文档 S7；**2026-09-23 起 forward 进一步换单 fold kernel**——`FoldSpec` 分块流式，S 在 kernel 内逐块存在、从不落显存，见算子融合文档"关键算法"章状态横幅）。该路径已消除 `BH·seq²` 物化，剩余驻留为逐层 Q/K/V 激活集（属 L1 激活重计算可覆盖范围）。**不手写** flash-attention 类融合 kernel：沿用现有自动融合/算子生成路径（fold 生成器即 AOT 结构驱动生成，非手写 kernel），由 L3 的自动融合优化统一推进。
 
 ### 分布式分片（超长序列，远期）
 

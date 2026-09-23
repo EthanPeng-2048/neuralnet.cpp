@@ -4,7 +4,7 @@
 //       是否真的有反向 bug（batched_matmul / softmax backward / 掩码）。
 //       batch=1 时绕过 rearrange_3d，若仍 FAIL 则是 attention 内部问题。
 //
-// 用法：attn_gradcheck [--gpu] [--batch N] [--seq N] [--tol <f>]
+// 用法：attn_gradcheck [--gpu] [--batch N] [--seq N] [--tol <f>] [--doc]
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>
@@ -108,6 +108,7 @@ int main(int argc, char* argv[])
     std::size_t batch = 2;
     std::size_t seq = 8;
     std::string pos_enc_name = "learned";
+    bool use_doc = false;
     for (int i = 1; i < argc; ++i)
     {
         std::string a = argv[i];
@@ -115,10 +116,11 @@ int main(int argc, char* argv[])
         else if (a == "--batch" && i + 1 < argc) batch = static_cast<std::size_t>(std::atoi(argv[++i]));
         else if (a == "--seq" && i + 1 < argc) seq = static_cast<std::size_t>(std::atoi(argv[++i]));
         else if (a == "--pos-enc" && i + 1 < argc) pos_enc_name = argv[++i];
+        else if (a == "--doc") use_doc = true;
         else if (a == "--gpu") use_gpu = true;
         else if (a == "--help")
         {
-            std::cout << "用法: attn_gradcheck [--gpu] [--batch N] [--seq N] [--tol <f>] [--pos-enc learned|sinusoidal|alibi|rope]\n";
+            std::cout << "用法: attn_gradcheck [--gpu] [--batch N] [--seq N] [--tol <f>] [--pos-enc learned|sinusoidal|alibi|rope] [--doc]\n";
             return 0;
         }
     }
@@ -143,10 +145,23 @@ int main(int argc, char* argv[])
     std::cout << "========================================\n";
     std::cout << "  d_model=" << d_model << " heads=" << num_heads
               << " seq=" << seq << " batch=" << batch << " tol=" << tol
-              << " pos_enc=" << pos_enc_name << "\n";
+              << " pos_enc=" << pos_enc_name << " doc=" << (use_doc ? 1 : 0)
+              << "\n";
 
     CausalSelfAttention attn(d_model, num_heads, seq, seq, pos_enc);
     { auto r = attn.init(eng); if (!r) { std::cerr << "CausalSelfAttention init 失败: " << r.error().message << "\n"; return 1; } }
+    if (use_doc)
+    {
+        // 文档感知：每样本两文档（前/后半）、样本错开基线 → 覆盖 backward
+        //   的 masked_doc_ 分支（Doc；叠加 --pos-enc alibi 即 AlibiDoc）——
+        //   该分支此前零执行覆盖（forward 对、梯度串文档抓不住）
+        std::vector<std::size_t> ids(batch * seq, 0);
+        for (std::size_t b = 0; b < batch; ++b)
+            for (std::size_t t = 0; t < seq; ++t)
+                ids[b * seq + t] = b * 2 + (t < seq / 2 ? std::size_t{0}
+                                                        : std::size_t{1});
+        attn.set_doc_ids(ids);
+    }
 
     std::mt19937_64 rng(123);
     std::uniform_real_distribution<Scalar> dist(-1, 1);
