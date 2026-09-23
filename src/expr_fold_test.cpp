@@ -40,6 +40,12 @@ int test_expr_fold()
         std::cout << (ok ? "[PASS] " : "[FAIL] ") << msg << "\n";
         if (!ok) ++fail;
     };
+    // NaN 守卫：diff 为 NaN/Inf（被测端输出 NaN）时误差记为 inf → 必超容差。
+    //   IEEE fmax(err, NaN) = err 会静默吞掉 NaN diff——2026-09 fold doc 掩码
+    //   GPU -nan 回归曾因此在对拍中漏抓（红验证实证：revert 后仍 PASS）。
+    const auto err_of = [](Scalar err, Scalar diff) -> Scalar
+    { return std::isfinite(diff) ? std::fmax(err, diff)
+                                 : std::numeric_limits<Scalar>::infinity(); };
 
     nn::CpuEngine engine;
     std::mt19937 rng(20260923);
@@ -74,7 +80,7 @@ int test_expr_fold()
                     Scalar ref = -std::numeric_limits<Scalar>::infinity();
                     for (std::size_t k = 0; k < K; ++k)
                         ref = std::fmax(ref, xs[r * K + k]);
-                    err = std::fmax(err, std::fabs(os[r] - ref));
+                    err = err_of(err, std::fabs(os[r] - ref));
                 }
                 check(err <= kTol, "rowmax vs ref K=" + std::to_string(K) +
                        " err=" + std::to_string(err));
@@ -97,7 +103,7 @@ int test_expr_fold()
                 {
                     Scalar ref = 0;
                     for (std::size_t k = 0; k < K; ++k) ref += xs[r * K + k];
-                    err = std::fmax(err, std::fabs(os[r] - ref) / std::fmax(Scalar{1}, std::fabs(ref)));
+                    err = err_of(err, std::fabs(os[r] - ref) / std::fmax(Scalar{1}, std::fabs(ref)));
                 }
                 check(err <= kTol, "rowsum vs ref K=" + std::to_string(K) +
                        " err=" + std::to_string(err));
@@ -124,7 +130,7 @@ int test_expr_fold()
                     Scalar ref = 0;
                     for (std::size_t k = 0; k < K; ++k)
                         ref += std::exp(xs[r * K + k] - m);
-                    err = std::fmax(err, std::fabs(os[r] - ref) / std::fmax(Scalar{1}, std::fabs(ref)));
+                    err = err_of(err, std::fabs(os[r] - ref) / std::fmax(Scalar{1}, std::fabs(ref)));
                 }
                 check(err <= kTol, "softmax_denom vs ref K=" + std::to_string(K) +
                        " err=" + std::to_string(err));
@@ -305,8 +311,17 @@ int test_expr_fold()
             nn::Tensor doc_col = nn::Tensor::cpu(rows_out, 1);
             nn::Tensor doc_ids_t = nn::Tensor::cpu(
                 1, static_cast<std::size_t>(sh.bh) * sh.seq);
-            const auto doc_of = [sseq](std::uint32_t pos) -> Scalar
-            { return pos < sseq / 2 ? Scalar{1} : Scalar{2}; };
+            // doc 分段边界：seq > EXPR_FOLD_BLOCK(128) 时放在 **128 之后**
+            //   （如 133 → 129），使查询位置 i ≥ 边界的行其首个 fold 块
+            //   (j<128) 被文档掩码**全部**屏蔽——这正是 2026-09 GPU 训练
+            //   -nan 的触发形态（max init=-inf 时 m_old=blk_m=-inf →
+            //   dm=−inf−−inf=NaN）。旧固定 seq/2=66<128 永远让首块留有
+            //   有效项 → ctest 全绿漏抓。seq ≤ 128 时保持原二分段。
+            const std::uint32_t doc_boundary =
+                sseq > nn::EXPR_FOLD_BLOCK ? nn::EXPR_FOLD_BLOCK + 1u
+                                           : sseq / 2u;
+            const auto doc_of = [doc_boundary](std::uint32_t pos) -> Scalar
+            { return pos < doc_boundary ? Scalar{1} : Scalar{2}; };
             for (std::size_t r = 0; r < rows_out; ++r)
                 doc_col.cpu_matrix().span()[r] =
                     doc_of(static_cast<std::uint32_t>(r % sh.seq));
@@ -365,8 +380,8 @@ int test_expr_fold()
                         if (mk != nn::expr::FoldAttnMask::Plain && j > i)
                             acc = -std::numeric_limits<Scalar>::infinity();
                         // 文档块对角：跨文档 -inf（fold body 内 causal→doc→alibi
-                        //   链序；-inf 加有限斜率项不改值）
-                        if (docm && ((i < sh.seq / 2) != (j < sh.seq / 2)))
+                        //   链序；-inf 加有限斜率项不改值）——边界与 doc_of 同源
+                        if (docm && ((i < doc_boundary) != (j < doc_boundary)))
                             acc = -std::numeric_limits<Scalar>::infinity();
                         if (alibi)
                             acc += sl[b] * static_cast<Scalar>(
@@ -389,7 +404,7 @@ int test_expr_fold()
                         const std::size_t oi =
                             static_cast<std::size_t>(b) * sh.seq + i;
                         ref_out[oi * sh.dk + d] = ref;
-                        err = std::fmax(err, std::fabs(os[oi * sh.dk + d] - ref) /
+                        err = err_of(err, std::fabs(os[oi * sh.dk + d] - ref) /
                                              std::fmax(Scalar{1}, std::fabs(ref)));
                     }
                 }
