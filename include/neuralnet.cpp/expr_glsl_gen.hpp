@@ -260,7 +260,18 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
         L << "layout(std430, binding = " << i << ") readonly buffer Buf" << i
           << " { float b" << i << "[]; };\n";
     L << "layout(std430, binding = " << n_inputs
-      << ") writeonly buffer BufOut { float bout[]; };\n\n";
+      << ") writeonly buffer BufOut { float bout[]; };\n";
+    // vec4 别名视图（A/B 全局快路径专用；同 binding 双声明 std430，op 级
+    // matmul_tiled 同款）。a_slot==b_slot 时不发别名、快路径整体关闭。
+    const bool vec4_ok = (a_slot != b_slot);
+    if (vec4_ok)
+    {
+        L << "layout(std430, binding = " << a_slot << ") readonly buffer BufAv4 { vec4 b"
+          << a_slot << "v4[]; };\n";
+        L << "layout(std430, binding = " << b_slot << ") readonly buffer BufBv4 { vec4 b"
+          << b_slot << "v4[]; };\n";
+    }
+    L << "\n";
     L << "layout(push_constant) uniform PC {\n";
     L << "    uint count;\n";
     L << "    uint cols;\n";
@@ -276,18 +287,20 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     for (std::uint32_t i = 0; i < n_rp; ++i)
         L << "    float rp" << i << ";\n";
     L << "};\n\n";
-    // 共享内存分块（vec4 布局，16B 对齐，转置 [k4][m] 消除 bank 冲突，双缓冲 [stage]）：
-    //   AshT[stage][k4][m]：A 分块（64 行 × BK k，BK4 个 vec4/行），k4 在前 → 内层
-    //     读 AshT[stage][k4][ty*4+i] 时同一 k4 下连续线程读连续 m（无 bank 冲突）；
-    //     加载写 AshT[stage][k4][m] 时 tid 连续 → k4 连续（8 路写冲突，一次/块，
-    //     远小于内层 k4 循环的读冲突代价）。
-    //   BK=32 + 双缓冲：[2][8][64]vec4×2 矩阵 = 32KB（>原版单缓冲 16KB，
-    //   blocks/SM 砍半——深网格靠 WG 余量补、浅网格靠流水补，实测定夺）；
+    // 共享内存分块（op 级 matmul_tiled 配方：vec4 沿 m/n，16B 对齐，双缓冲 [stage]）：
+    //   Ash[stage][k][m/4]：vec4 = 同 k 的 4 个连续行（Bsh 同构沿列）→ 主循环
+    //     每 k 仅 2 次 LDS + 4 VFMA.128。旧版 vec4 沿 k + 16 dot ≈5× 指令发射，
+    //     是融合 matmul 实测落后 op 级 ~2× 的主因（2026-09-24 由 fused_49fa
+    //     与 op 级同形状对拍 7.2 vs 3.15ms 定位）；同 ty/tx 广播读无 bank 冲突。
+    //   BK=32 + 双缓冲：[2][32][16]vec4×2 = 32KB（布局改向后**总量不变**，
+    //   旧 [2][8][64]vec4 同为 32KB；BK16 变体已 A/B 深网格 -2% 不取，
+    //   barrier 节奏保持原版）；>原版单缓冲 16KB → blocks/SM 砍半，
+    //   深网格靠 WG 余量补、浅网格靠流水补，实测定夺；
     //   需设备 maxComputeSharedMemorySize ≥ 32KB（Vulkan 规范下限仅 16KB，
     //   合规低端设备会在 pipeline 创建时响亮失败——40HX 等目标卡无虞）；
     //   stage 交替：tile t 用 t&1。
-    L << "shared vec4 AshT[2][" << BK4 << "][" << B << "];\n";
-    L << "shared vec4 BshT[2][" << BK4 << "][" << B << "];\n\n";
+    L << "shared vec4 Ash[2][" << BK << "][" << B / 4u << "];\n";
+    L << "shared vec4 Bsh[2][" << BK << "][" << B / 4u << "];\n\n";
 
     // transA/transB 感知的全局内存加载表达式（S7 batch：A/B 按 batch 垂直
     // 切分，batch*m_per 为 A 行偏移 / batch*mm_k 为 B k 偏移；row/col 为
@@ -426,6 +439,11 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     // ── load_tiles：协作加载 A/B 分块（BK×B）→ 指定 stage。双缓冲流水的
     //    发射端：前奏调 load_tiles(0,0)，主循环内 if (t+1<num_tiles)
     //    load_tiles(t+1, nstage) 与 tile t 的计算并行 ─────────────────────
+    //    分组 = 沿内存连续维取 vec4（op 级 matmul_tiled v3 同款，但 trans 进
+    //    key → 生成期定死单路径、无运行时 trans 分支）；%4 对齐与边界是
+    //    uniform 分支（mm_k/m_per/cols 运行时才知道），未对齐/尾块走同分组
+    //    标量回退 → 每个 (k,m) 恰被写一次，语义与旧版一致。共享槽位恒用
+    //    tile 内坐标，越界判/全局地址才用 block_row/col + tile 偏移。
     L << "void load_tiles(uint t, uint stage)\n{\n";
     L << "    const uint tid = gl_LocalInvocationID.y * " << T
       << "u + gl_LocalInvocationID.x;\n";
@@ -433,33 +451,91 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     L << "    const uint m_per = rows / mm_batch;\n";
     L << "    const uint block_row = gl_WorkGroupID.y * " << B << "u;\n";
     L << "    const uint block_col = gl_WorkGroupID.x * " << B << "u;\n";
-    // B×BK4 slots / 256 线程 = VPT 个 vec4/线程/矩阵（BK=32 → 2）
     L << "    for (uint l = 0u; l < " << VPT << "u; ++l)\n";
     L << "    {\n";
     L << "    const uint e = tid * " << VPT << "u + l;\n";
-    L << "    const uint k4 = e % " << BK4 << "u;\n";
-    L << "    const uint m  = e / " << BK4 << "u;\n";
-    L << "    const uint kk = t * " << BK << "u + k4 * 4u;\n";
-    L << "    const uint ar = block_row + m;\n";
-    L << "    const uint bc = block_col + m;\n";
-    L << "    vec4 av = vec4(0.0);\n";
-    L << "    if (ar < m_per && kk < mm_k)\n";
-    L << "    {\n";
-    L << "        av.x = " << a_load("ar", "kk") << ";\n";
-    L << "        if (kk + 1u < mm_k) av.y = " << a_load("ar", "kk + 1u") << ";\n";
-    L << "        if (kk + 2u < mm_k) av.z = " << a_load("ar", "kk + 2u") << ";\n";
-    L << "        if (kk + 3u < mm_k) av.w = " << a_load("ar", "kk + 3u") << ";\n";
-    L << "    }\n";
-    L << "    vec4 bv = vec4(0.0);\n";
-    L << "    if (bc < cols && kk < mm_k)\n";
-    L << "    {\n";
-    L << "        bv.x = " << b_load("bc", "kk") << ";\n";
-    L << "        if (kk + 1u < mm_k) bv.y = " << b_load("bc", "kk + 1u") << ";\n";
-    L << "        if (kk + 2u < mm_k) bv.z = " << b_load("bc", "kk + 2u") << ";\n";
-    L << "        if (kk + 3u < mm_k) bv.w = " << b_load("bc", "kk + 3u") << ";\n";
-    L << "    }\n";
-    L << "    AshT[stage][k4][m] = av;\n";
-    L << "    BshT[stage][k4][m] = bv;\n";
+    if (trA)
+    {
+        // A 存 (K,M)：沿行连续 → vec4 整读 4 行同 k，直写共享
+        L << "    const uint kAL = e / " << (B / 4u) << "u;\n";
+        L << "    const uint kAG = t * " << BK << "u + kAL;\n";
+        L << "    const uint mA4 = e % " << (B / 4u) << "u;\n";
+        L << "    const uint arG = block_row + mA4 * 4u;\n";
+        L << "    if (" << (vec4_ok ? "((m_per & 3u) == 0u)" : "false")
+          << " && kAG < mm_k && arG < m_per)\n";
+        L << "    {\n";
+        L << "        Ash[stage][kAL][mA4] = b" << a_slot
+          << "v4[(((batch*mm_k + (kAG))*m_per + (arG))) >> 2];\n";
+        L << "    }\n    else\n    {\n";
+        L << "        for (uint j = 0u; j < 4u; ++j)\n        {\n";
+        L << "            const float v = (arG + j < m_per && kAG < mm_k) ? "
+          << a_load("arG + j", "kAG") << " : 0.0;\n";
+        L << "            Ash[stage][kAL][mA4][j] = v;\n";
+        L << "        }\n    }\n";
+    }
+    else
+    {
+        // A 行主序：沿 k 连续 → vec4 散写 4 个共享行（op 级 k_contig 同构）
+        L << "    const uint kAL = (e % " << BK4 << "u) * 4u;\n";
+        L << "    const uint kAG = t * " << BK << "u + kAL;\n";
+        L << "    const uint arT = e / " << BK4 << "u;\n";
+        L << "    const uint arG = block_row + arT;\n";
+        L << "    if (" << (vec4_ok ? "((mm_k & 3u) == 0u)" : "false")
+          << " && arG < m_per && kAG < mm_k)\n";
+        L << "    {\n";
+        L << "        const vec4 v = b" << a_slot
+          << "v4[(((batch*m_per + (arG))*mm_k + (kAG))) >> 2];\n";
+        L << "        Ash[stage][kAL    ][arT >> 2][arT & 3u] = v.x;\n";
+        L << "        Ash[stage][kAL + 1u][arT >> 2][arT & 3u] = v.y;\n";
+        L << "        Ash[stage][kAL + 2u][arT >> 2][arT & 3u] = v.z;\n";
+        L << "        Ash[stage][kAL + 3u][arT >> 2][arT & 3u] = v.w;\n";
+        L << "    }\n    else\n    {\n";
+        L << "        for (uint j = 0u; j < 4u; ++j)\n        {\n";
+        L << "            const float v = (arG < m_per && kAG + j < mm_k) ? "
+          << a_load("arG", "kAG + j") << " : 0.0;\n";
+        L << "            Ash[stage][kAL + j][arT >> 2][arT & 3u] = v;\n";
+        L << "        }\n    }\n";
+    }
+    if (trB)
+    {
+        // B 存 (N,K)：沿 k 连续 → vec4 散写 4 个共享行
+        L << "    const uint kBL = (e % " << BK4 << "u) * 4u;\n";
+        L << "    const uint kBG = t * " << BK << "u + kBL;\n";
+        L << "    const uint nT = e / " << BK4 << "u;\n";
+        L << "    const uint bcG = block_col + nT;\n";
+        L << "    if (" << (vec4_ok ? "((mm_k & 3u) == 0u)" : "false")
+          << " && bcG < cols && kBG < mm_k)\n";
+        L << "    {\n";
+        L << "        const vec4 v = b" << b_slot
+          << "v4[(((batch*cols + (bcG))*mm_k + (kBG))) >> 2];\n";
+        L << "        for (uint j = 0u; j < 4u; ++j)\n";
+        L << "            Bsh[stage][kBL + j][nT >> 2][nT & 3u] = v[j];\n";
+        L << "    }\n    else\n    {\n";
+        L << "        for (uint j = 0u; j < 4u; ++j)\n        {\n";
+        L << "            const float v = (bcG < cols && kBG + j < mm_k) ? "
+          << b_load("bcG", "kBG + j") << " : 0.0;\n";
+        L << "            Bsh[stage][kBL + j][nT >> 2][nT & 3u] = v;\n";
+        L << "        }\n    }\n";
+    }
+    else
+    {
+        // B (K,N) 行主序：沿列连续 → vec4 整读 4 列同 k，直写共享
+        L << "    const uint kBL = e / " << (B / 4u) << "u;\n";
+        L << "    const uint kBG = t * " << BK << "u + kBL;\n";
+        L << "    const uint nB4 = e % " << (B / 4u) << "u;\n";
+        L << "    const uint bcG = block_col + nB4 * 4u;\n";
+        L << "    if (" << (vec4_ok ? "((cols & 3u) == 0u)" : "false")
+          << " && kBG < mm_k && bcG < cols)\n";
+        L << "    {\n";
+        L << "        Bsh[stage][kBL][nB4] = b" << b_slot
+          << "v4[(((batch*mm_k + (kBG))*cols + (bcG))) >> 2];\n";
+        L << "    }\n    else\n    {\n";
+        L << "        for (uint j = 0u; j < 4u; ++j)\n        {\n";
+        L << "            const float v = (kBG < mm_k && bcG + j < cols) ? "
+          << b_load("bcG + j", "kBG") << " : 0.0;\n";
+        L << "            Bsh[stage][kBL][nB4][j] = v;\n";
+        L << "        }\n    }\n";
+    }
     L << "    }\n";
     L << "}\n\n";
 
@@ -472,10 +548,11 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     L << "    const uint m_per = rows / mm_batch;    // 每批输出行数\n";
     L << "    const uint block_row = gl_WorkGroupID.y * " << B << "u;\n";
     L << "    const uint block_col = gl_WorkGroupID.x * " << B << "u;\n";
-    // 4×4 寄存器累加器（本线程负责 16 个输出元素；dot() = 4 FMA）
-    L << "    float acc[4][4];\n";
+    // 4×4 寄存器累加器（本线程负责 16 个输出元素；vec4 acc[i] = 第 i 行的
+    // 4 列 → 内层每 k 4 条 VFMA.128，尾链 acc[i][j] 索引语义不变）
+    L << "    vec4 acc[4];\n";
     L << "    for (uint i = 0u; i < 4u; ++i)\n";
-    L << "        for (uint j = 0u; j < 4u; ++j) acc[i][j] = 0.0;\n";
+    L << "        acc[i] = vec4(0.0);\n";
 
     // 前奏：加载 tile 0 → stage 0；此后每迭代发射 t+1 的加载（stage^1），
     // 与 tile t 的计算并行，单 barrier 收口（与 matmul_tiled.comp v2 同构：
@@ -489,22 +566,16 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     L << "        const uint nstage = stage ^ 1u;\n";
     L << "        if (t + 1u < num_tiles)\n";
     L << "            load_tiles(t + 1u, nstage);\n";
-    // 内层：每 k4 读 8 个 vec4（4 行 A × 4 列 B）+ 16 dot（64 FMA）；
-    // 转置布局下同一 k4 的连续线程读连续 m → 无 bank 冲突
-    L << "        for (uint k4 = 0u; k4 < " << BK4 << "u; ++k4)\n";
+    // 内层：每 k 读 2 个 vec4（Ash[k][ty] = 4 行、Bsh[k][tx] = 4 列）+ 4
+    // VFMA.128（op 级 matmul_tiled 同款；同槽广播读无 bank 冲突）
+    L << "        for (uint k = 0u; k < " << BK << "u; ++k)\n";
     L << "        {\n";
-    L << "            vec4 a[4];\n";
-    L << "            #pragma unroll\n";
-    L << "            for (uint i = 0u; i < 4u; ++i)\n";
-    L << "                a[i] = AshT[stage][k4][ty * 4u + i];\n";
-    L << "            vec4 b[4];\n";
-    L << "            #pragma unroll\n";
-    L << "            for (uint j = 0u; j < 4u; ++j)\n";
-    L << "                b[j] = BshT[stage][k4][tx * 4u + j];\n";
-    L << "            #pragma unroll\n";
-    L << "            for (uint i = 0u; i < 4u; ++i)\n";
-    L << "                for (uint j = 0u; j < 4u; ++j)\n";
-    L << "                    acc[i][j] += dot(a[i], b[j]);\n";
+    L << "            const vec4 av = Ash[stage][k][ty];\n";
+    L << "            const vec4 bv = Bsh[stage][k][tx];\n";
+    L << "            acc[0] += av.x * bv;\n";
+    L << "            acc[1] += av.y * bv;\n";
+    L << "            acc[2] += av.z * bv;\n";
+    L << "            acc[3] += av.w * bv;\n";
     L << "        }\n";
     L << "        barrier();\n";
     L << "        stage = nstage;\n";
