@@ -1077,6 +1077,11 @@ public:
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols) override
     {
+        // fold 形态只经 eval_expr（PC 需 fold_k，本入口不传）——显式拒绝，
+        //   否则落到 run_fused_gpu 的通用缺参错误，误导排查方向
+        if (raw_spec.fold)
+            return std::unexpected(Error{
+                "GpuEngine::eval_expr_reduce: fold 表达式请走 eval_expr（需 fold_k 形态参数）"});
         // canonical IR：与 eval_expr 同（canonicalize 为引擎内部优化）
         const ExprSpec spec = nn::canonicalize_expr_spec(raw_spec);
 
@@ -1141,6 +1146,10 @@ public:
         if (dst.rows() != rows || dst.cols() != cols)
             return std::unexpected(Error{"eval_expr_into: dst shape mismatch"});
 
+        // fold 形态只经 eval_expr（PC 需 fold_k，本入口不传）——显式拒绝
+        if (raw_spec.fold)
+            return std::unexpected(Error{
+                "GpuEngine::eval_expr_into: fold 表达式请走 eval_expr（需 fold_k 形态参数）"});
         const ExprSpec spec = nn::canonicalize_expr_spec(raw_spec);
         if (nn::expr_spec_reduce_axis(spec) != -1)
             return std::unexpected(Error{

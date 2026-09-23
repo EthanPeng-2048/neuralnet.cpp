@@ -514,8 +514,9 @@ public:
         auto V_t = engine.rearrange_3d(*V_T_full, seq, BH, d_k_, false);
         if (!V_t) return std::unexpected(V_t.error());
         // ── 单 fold 表达式：S 不物化、online 单遍 ──────────────────────
-        //   6 趟 (BH·seq, seq) 物化流量归零；掩码在 fold body 内逐块生效
-        //   （-inf 屏蔽块照样走归约，数值与物化式一致）。
+        //   6 趟 (BH·seq, seq) 物化流量归零；掩码在 fold body 内逐块生效，
+        //   causal_skip 把被屏蔽块钳成空转（被跳过的恰是 -inf/0 恒等项 →
+        //   与全量计算逐位一致，见 FoldSpec::causal_skip 注释）。
         //   inputs 顺序 = make_fold_attn_o 的 views 顺序：Q,K,V_t,[slope],[dc],[ids]
         std::vector<Tensor> fold_in{Q, K, *V_t};
         if (const Tensor* sl = mask_slopes_())  fold_in.push_back(*sl);
@@ -852,8 +853,13 @@ private:
 
     // 掩码输入张量缓存（fold body / recompute_W_ 掩码树经
     // mask_slopes_/mask_doc_col_/mask_doc_ids_ 钩子读取）
-    Tensor slopes_cache_;   // (1, num_heads) ALiBi 按头斜率（惰性构建）
-    Tensor doc_ids_cache_;  // (1, batch*seq) 每位置文档 id（每步重建）
+    // ALiBi 斜率表 (1, batch*num_heads)：按 (b,h) 块重复 slopes_[h]——fold 的
+    //   batch_mod(BH) 按网格下标 b*H+h 直读（旧 (1,H) 表 batch≥2 时 b≥1 越界
+    //   读、ALiBi 静默错；batch=1 恰好掩蔽）。旧 recompute 的 batch_mod(%H)
+    //   与增量推理按 h∈[0,H) 读均落首块 → 语义不变。batch 变化时重建。
+    Tensor slopes_cache_;
+    std::size_t slopes_cached_batch_ = 0;  // slopes_cache_ 形状键（batch 变更重建）
+    Tensor doc_ids_cache_;  // (1, batch*H*seq) 每位置文档 id 按 (b,h) 块重复（每步重建）
     Tensor doc_col_;        // (BH*seq, 1) 每行文档 id（每步重建，S7 掩码用）
 
     // ALiBi 斜率：m_h = 2^(-8h/H)（仅 use_alibi_ = true 时使用）
@@ -899,14 +905,19 @@ protected:
         // 掩码分量由 mask_slopes_/mask_doc_col_/mask_doc_ids_ 钩子读取（IR 表达式）
         if (use_alibi_)
         {
-            if (!slopes_cache_.valid())
+            // fold 契约：batch_mod(BH) 直读 b*H+h → 表长必须 = batch*H。
+            //   旧 (1,num_heads) 表在 batch≥2 越界读/ALiBi 静默丢（batch=1
+            //   掩蔽，历史单样本测试未暴露）；按 (b,h) 块重复 slopes_[h]。
+            if (!slopes_cache_.valid() || slopes_cached_batch_ != batch)
             {
-                Matrix s(1, num_heads_);
-                for (std::size_t h = 0; h < num_heads_; ++h)
-                    s.set_value_unchecked(0, h, slopes_[h]);
+                Matrix s(1, batch * num_heads_);
+                for (std::size_t b = 0; b < batch; ++b)
+                    for (std::size_t h = 0; h < num_heads_; ++h)
+                        s.set_value_unchecked(0, b * num_heads_ + h, slopes_[h]);
                 auto t = engine.from_matrix(s);
                 if (!t) return std::unexpected(t.error());
                 slopes_cache_ = std::move(*t);
+                slopes_cached_batch_ = batch;
             }
         }
         if (has_doc_ids_)

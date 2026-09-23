@@ -8,13 +8,18 @@
 //    3. softmax_denom fold（online 双状态：m 跨块更新 + l = l·α + Σexp(x−m')）
 //                          vs 独立 Σ_k exp(x − max_k x) 参考
 //    4. K 边界族：{1, 7, 32, 33, 100, 1000}——单列 / 非块整除 / 整除 / 尾块
-//    5. validate 负例：状态吃元素源 / fold+顶层 instrs / fold+matmul /
+//    5. attention fold：5 掩码变体（含 Doc/AlibiDoc）× 4 形状族 vs 独立公式
+//       参考；{2,133,4} 跨 EXPR_FOLD_BLOCK=128 → 多块流式 + causal 整块跳过
+//    6. validate 负例：状态吃元素源 / fold+顶层 instrs / fold+matmul /
 //       finalize 读输入 —— 四类违规必须被拒绝（静态拒而非静默错算）
+//    7. registry bin roundtrip：v8 causal_skip 写读对称（key 含该位 →
+//       往返 key 全等即证未丢；丢失=静默退化全量算、其余测试仍会绿）
 //  纯 CPU；输出 (rows,1)（eval_expr 的 cols 参数 = 1 调用约定）。
 // ───────────────────────────────────────────────────────────────────────────
 
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <iostream>
 #include <limits>
 #include <random>
@@ -127,7 +132,7 @@ int test_expr_fold()
         }
     }
 
-    // ── 5) validate 负例（静态拒绝）──
+    // ── 6) validate 负例（静态拒绝）──
     {
         const auto rejects = [&](nn::ExprSpec spec, const char* msg)
         {
@@ -179,7 +184,7 @@ int test_expr_fold()
         }
     }
 
-    // ── P-C2 attention fold 对拍（独立公式参考；3 掩码 × 3 形状族）────────
+    // ── P-C2 attention fold 对拍（独立公式参考；5 掩码 × 4 形状族）────────
     // 确定性迷你 case：seq=dk=bh=1，Q=2 K=3 Vt=5 → s=6, softmax=1, O=5
     {
         nn::Tensor Q = nn::Tensor::cpu(1, 1), K = nn::Tensor::cpu(1, 1),
@@ -201,8 +206,7 @@ int test_expr_fold()
         {
             const std::uint32_t bh2 = ab == 0 ? 1u : 2u;
             const std::uint32_t seq2 = ab == 0 ? 4u : 1u;
-            nn::Tensor Q2 = nn::Tensor::cpu(bh2 * 1 * seq2 ? bh2 * 1 : 1, seq2);
-            Q2 = nn::Tensor::cpu(static_cast<std::size_t>(bh2) * 1, seq2);
+            nn::Tensor Q2 = nn::Tensor::cpu(static_cast<std::size_t>(bh2) * 1, seq2);
             nn::Tensor K2 = nn::Tensor::cpu(static_cast<std::size_t>(bh2) * 1, seq2);
             nn::Tensor V2 = nn::Tensor::cpu(static_cast<std::size_t>(bh2) * seq2, 1);
             for (std::size_t i = 0; i < Q2.cpu_matrix().span().size(); ++i)
@@ -257,35 +261,70 @@ int test_expr_fold()
                 std::string vals;
                 for (std::size_t i = 0; i < 8; ++i)
                     vals += " " + std::to_string(s3[i]);
-                bool okc = std::fabs(s3[0] - 25) < 1e-4f &&
-                           std::fabs(s3[1] - 2.5f) < 1e-4f;
-                check(okc, "mini-C O=" + vals + " expect row0: 25 2.5");
+                // Q=K=0 → S 全 0 → p 均匀 1/4：全部 4 行输出相同
+                //   d0 = (10+20+30+40)/4 = 25；d1 = (1+2+3+4)/4 = 2.5（全量比对）
+                bool okc = true;
+                for (std::size_t i = 0; i < 8; ++i)
+                {
+                    const Scalar want = (i % 2 == 0) ? Scalar{25} : Scalar{2.5};
+                    if (std::fabs(s3[i] - want) >= Scalar{1e-4}) okc = false;
+                }
+                check(okc, "mini-C O=" + vals + " expect 4×(25 2.5)");
             }
         }
     }
 
     for (const auto mk : {nn::expr::FoldAttnMask::Plain,
                           nn::expr::FoldAttnMask::Causal,
-                          nn::expr::FoldAttnMask::Alibi})
+                          nn::expr::FoldAttnMask::Alibi,
+                          nn::expr::FoldAttnMask::Doc,
+                          nn::expr::FoldAttnMask::AlibiDoc})
     {
-        const char* mname = mk == nn::expr::FoldAttnMask::Plain ? "plain"
-                         : mk == nn::expr::FoldAttnMask::Causal ? "causal" : "alibi";
+        const char* mname = mk == nn::expr::FoldAttnMask::Plain    ? "plain"
+                         : mk == nn::expr::FoldAttnMask::Causal    ? "causal"
+                         : mk == nn::expr::FoldAttnMask::Alibi     ? "alibi"
+                         : mk == nn::expr::FoldAttnMask::Doc       ? "doc"
+                                                                 : "alibidoc";
         struct Sh { std::uint32_t bh, seq, dk; };
-        for (const Sh sh : {Sh{2, 9, 4}, Sh{1, 33, 8}, Sh{3, 5, 2}})
+        // {2,133,4}：seq > EXPR_FOLD_BLOCK(128) → 跨块流式（m/l 进位 + vecacc
+        //   rescale）与 causal 整块跳过分支（k0>qt 空块）首次被执行；
+        //   其余形状覆盖单块与奇数行（clamp + row_ok）
+        for (const Sh sh : {Sh{2, 9, 4}, Sh{1, 33, 8}, Sh{3, 5, 2},
+                            Sh{2, 133, 4}})
         {
             const std::size_t rows_out = static_cast<std::size_t>(sh.bh) * sh.seq;
             nn::Tensor Q = nn::Tensor::cpu(static_cast<std::size_t>(sh.bh) * sh.dk, sh.seq);
             nn::Tensor K = nn::Tensor::cpu(static_cast<std::size_t>(sh.bh) * sh.dk, sh.seq);
             nn::Tensor Vt = nn::Tensor::cpu(rows_out, sh.dk);
             nn::Tensor slopes = nn::Tensor::cpu(1, sh.bh);
+            // doc 输入（与 Layer 组包同序：Q,K,Vt,[slopes],doc_col,doc_ids）：
+            //   doc_col (rows,1) = 行（查询位置）文档 id；doc_ids (1, bh*seq)
+            //   按 (b,h) 块重复——BatchCol(seq) 读 [块*seq+j]，heads>1 时
+            //   (1, batch*seq) 会越界（AGENTS S7 教训 #2）
+            const std::uint32_t sseq = sh.seq;
+            nn::Tensor doc_col = nn::Tensor::cpu(rows_out, 1);
+            nn::Tensor doc_ids_t = nn::Tensor::cpu(
+                1, static_cast<std::size_t>(sh.bh) * sh.seq);
+            const auto doc_of = [sseq](std::uint32_t pos) -> Scalar
+            { return pos < sseq / 2 ? Scalar{1} : Scalar{2}; };
+            for (std::size_t r = 0; r < rows_out; ++r)
+                doc_col.cpu_matrix().span()[r] =
+                    doc_of(static_cast<std::uint32_t>(r % sh.seq));
+            for (std::uint32_t blk = 0; blk < sh.bh; ++blk)
+                for (std::uint32_t j = 0; j < sh.seq; ++j)
+                    doc_ids_t.cpu_matrix().span()
+                        [static_cast<std::size_t>(blk) * sh.seq + j] = doc_of(j);
             for (auto& v : Q.cpu_matrix().span()) v = dist(rng);
             for (auto& v : K.cpu_matrix().span()) v = dist(rng);
             for (auto& v : Vt.cpu_matrix().span()) v = dist(rng);
             for (auto& v : slopes.cpu_matrix().span()) v = dist(rng) * Scalar{0.1};
-            const bool alibi = (mk == nn::expr::FoldAttnMask::Alibi);
-            const std::vector<nn::Tensor> ins = alibi
-                ? std::vector<nn::Tensor>{Q, K, Vt, slopes}
-                : std::vector<nn::Tensor>{Q, K, Vt};
+            const bool alibi = (mk == nn::expr::FoldAttnMask::Alibi ||
+                                mk == nn::expr::FoldAttnMask::AlibiDoc);
+            const bool docm  = (mk == nn::expr::FoldAttnMask::Doc ||
+                                mk == nn::expr::FoldAttnMask::AlibiDoc);
+            std::vector<nn::Tensor> ins{Q, K, Vt};
+            if (alibi) ins.push_back(slopes);
+            if (docm) { ins.push_back(doc_col); ins.push_back(doc_ids_t); }
 
             nn::ExprSpec spec = nn::expr::make_fold_attn_o(sh.seq, sh.dk, sh.bh, mk);
             if (auto v = nn::validate_expr_spec(spec, ins.size()); !v)
@@ -324,6 +363,10 @@ int test_expr_fold()
                             acc += qs[(b * sh.dk + d) * sh.seq + i] *
                                    ks[(b * sh.dk + d) * sh.seq + j];
                         if (mk != nn::expr::FoldAttnMask::Plain && j > i)
+                            acc = -std::numeric_limits<Scalar>::infinity();
+                        // 文档块对角：跨文档 -inf（fold body 内 causal→doc→alibi
+                        //   链序；-inf 加有限斜率项不改值）
+                        if (docm && ((i < sh.seq / 2) != (j < sh.seq / 2)))
                             acc = -std::numeric_limits<Scalar>::infinity();
                         if (alibi)
                             acc += sl[b] * static_cast<Scalar>(
@@ -365,6 +408,39 @@ int test_expr_fold()
                     std::cout << " " << ref_out[i];
                 std::cout << "\n";
             }
+        }
+    }
+
+    // ── 7) bin 序列化 roundtrip（v8 causal_skip 写读对称）─────────────────
+    {
+        const std::string tmp = "nn_expr_fold_roundtrip.tmp.bin";
+        nn::fused::ExprRegistry reg;
+        reg.add(nn::expr::make_fold_attn_o(
+            64, 4, 2, nn::expr::FoldAttnMask::Causal));   // causal_skip=true
+        reg.add(nn::expr::make_fold_attn_o(
+            64, 4, 2, nn::expr::FoldAttnMask::Plain));    // causal_skip=false
+        reg.add(nn::expr::make_fold_rowsum(64));
+        const bool wok = nn::fused::write_registry(tmp, reg);
+        nn::fused::ExprRegistry back;
+        const bool rok = wok && nn::fused::read_registry(tmp, back);
+        std::remove(tmp.c_str());
+        check(wok && rok && back.specs.size() == reg.specs.size(),
+              "registry roundtrip 写读成功 n=" + std::to_string(back.specs.size()));
+        if (wok && rok && back.specs.size() == reg.specs.size())
+        {
+            // key 含 causal_skip 位 → 往返 key 全等即证该位与整段结构未丢
+            bool keys_ok = true;
+            bool saw_skip = false;
+            for (std::size_t i = 0; i < reg.specs.size(); ++i)
+            {
+                if (nn::expr_spec_key(back.specs[i]) !=
+                    nn::expr_spec_key(reg.specs[i]))
+                    keys_ok = false;
+                if (back.specs[i].fold && back.specs[i].fold->causal_skip)
+                    saw_skip = true;
+            }
+            check(keys_ok, "registry roundtrip key 全等（结构+causal_skip 未丢）");
+            check(saw_skip, "registry roundtrip causal_skip=true 读回仍 true");
         }
     }
 

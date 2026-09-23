@@ -191,6 +191,18 @@ int main(int argc, char* argv[])
 
     std::puts("=== attn_gradcheck (CausalSelfAttention numerical) ===");
     add(test_attn_gradcheck(argc, argv));
+    { // Doc / AlibiDoc backward 覆盖（masked_doc_ / masked_alibi_doc_ 分支此前
+        //   零执行——forward 对、梯度串文档抓不住；默认 learned+doc 与
+        //   alibi+doc 各跑一遍数值梯度）
+        char n0[] = "attn_gradcheck", n1[] = "--doc", n2[] = "--pos-enc",
+             n3[] = "alibi";
+        char* av_doc[]  = {n0, n1};
+        char* av_adoc[] = {n0, n2, n3, n1};
+        std::puts("--- gradcheck: doc variant ---");
+        add(test_attn_gradcheck(2, av_doc));
+        std::puts("--- gradcheck: alibi+doc variant ---");
+        add(test_attn_gradcheck(4, av_adoc));
+    }
 
     std::puts("=== attn_consistency (forward vs forward_step) ===");
     add(test_attn_consistency(argc, argv));

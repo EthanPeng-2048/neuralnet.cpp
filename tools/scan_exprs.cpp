@@ -29,16 +29,26 @@
 #include "neuralnet.cpp/expr_fold.hpp"
 
 #include <csignal>
-#include <stacktrace>
+#if __has_include(<stacktrace>)
+  #include <stacktrace>
+  #define NN_SCAN_HAS_STACKTRACE 1
+#endif
 
 // abort（NN_ASSERT）时打印调用栈：NN_ASSERT 只有断言点行号，缺"谁调的"——
 // MSVC 侧也只见 abort 无栈。scan 是本机构建工具（clang + MSVC STL、带 -g），
-// 单文件装钩、不动全库 core_assert（GCC/CI 的 <stacktrace> 链接风险规避）。
+// 单文件装钩、不动全库 core_assert（GCC/CI 的 <stacktrace> 链接风险规避）；
+// 老编译器无 <stacktrace> 时降级为无栈消息（__has_include 守卫）。注：
+// handler 内 to_string(stacktrace) 会分配、严格说非异步信号安全——abort
+// 路径本已终止进程，这里只求尽力打印，不保证死锁免疫。
 namespace {
 void on_abort(int)
 {
+#ifdef NN_SCAN_HAS_STACKTRACE
     std::fprintf(stderr, "[scan] abort captured — call stack:\n%s\n",
                  std::to_string(std::stacktrace::current()).c_str());
+#else
+    std::fprintf(stderr, "[scan] abort captured（本机无 <stacktrace>，无调用栈）\n");
+#endif
     std::fflush(stderr);
     std::_Exit(3);   // 不回 abort（避免二次 abort 丢输出）
 }
@@ -531,12 +541,17 @@ int main(int argc, char* argv[])
             }
             reg_all.add(fs);
         }
-        // P-C2 attention fold（双域）：vec_state_len 进 key → **每个 dk 一个
-        // shader**；k/batch/掩码外形状不进。测试形状族 dk∈{2,4,8} 逐个登记
-        // （模型层 d_k 由 Layer dry-run 覆盖，见 CausalSelfAttention 分支）。
+        // P-C2 attention fold（双域）：vec_state_len/k/batch/view param 均不
+        // 进 key → dk 族登记是同 key 去重。**5 个掩码变体必须全登记**——层
+        // forward 直调 engine.eval_expr(make_fold_attn_o)，不经 dsl::compute
+        // 的 NN_EXPR_SCAN 钩子，本块是 fold spec 唯一注册来源；漏 Doc/
+        // AlibiDoc → GPU doc 训练闭合世界硬报错（曾漏，fused 对拍加 Doc/
+        // AlibiDoc 用例后暴露）。
         for (const auto mk : {nn::expr::FoldAttnMask::Plain,
                               nn::expr::FoldAttnMask::Causal,
-                              nn::expr::FoldAttnMask::Alibi})
+                              nn::expr::FoldAttnMask::Alibi,
+                              nn::expr::FoldAttnMask::Doc,
+                              nn::expr::FoldAttnMask::AlibiDoc})
         {
             for (const std::uint32_t dk : {2u, 4u, 8u})
             {

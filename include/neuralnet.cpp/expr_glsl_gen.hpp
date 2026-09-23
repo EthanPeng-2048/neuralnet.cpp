@@ -211,11 +211,13 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
 //        的计算并行发射、每 tile 单 barrier——暴露的加载延迟被计算覆盖。
 //        40HX 变体实测 trade-off（深=feedforward/大 batch 训练，浅=小 batch 推理）：
 //          · 原版 BK=32 单缓冲(16KB)：深网格基线，浅网格无流水
-//          · BK=16 双缓冲(16KB占用率不变)：浅 +2~6%，深 -2%（barrier 频率翻倍
+//          · BK=16 双缓冲(16KB占用率不变)（% = vs 原版**收益**，正=更快，
+//            故深点 -2% 即回退）：浅 +2~6%，深 -2%（barrier 频率翻倍
 //            而深网格延迟已被跨块调度掩盖 → 流水无用只剩 barrier 成本）
 //          · BK=32 双缓冲(32KB)：barrier 节奏=原版，32KB 占用率砍半由深网格
-//            WG 余量吸收——**四点 A/B 最终采用**：浅 linear 1024³ -1.9%、
-//            batch512 -4.9%，深 feedforward/batch4096 ±0（18/18 测试绿）
+//            WG 余量吸收——**四点 A/B 最终采用**（对照=单缓冲原版；数字为
+//            **耗时**变化、负=更快；与 AGENTS §12 ② 同口径）：浅 linear
+//            1024³ -1.9%、batch512 -4.9%，深 feedforward/batch4096 ±0（18/18 测试绿）
 //    - 尾逐元素链编译为 eval_tail(mm, row, col) 函数（GLSL 内联零开销），
 //      写回时每个输出元素调用一次（Matmul 操作数 → mm，"虚拟寄存器 0"）。
 //    - transA/transB 是**结构**（进 key）→ 索引表达式硬编码进 shader；
@@ -223,8 +225,8 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
 //      （同结构不同 K 共享一个融合 shader）。
 //    - 布局：bindings 输入 0..N-1 + 输出 N（A/B 就是其中的两个输入槽）；
 //      push constants: uint count, uint cols, uint rows, uint mm_k,
-//                      [uint vp0..], [float c0..]；
-//      dispatch: (ceil(cols/BLOCK), ceil(rows/BLOCK), 1)（见
+//                      uint mm_batch, [uint vp0..], [float c0..], [float rp0..]；
+//      dispatch: (ceil(cols/BLOCK), ceil(rows/BLOCK), mm_batch)（见
 //      EXPR_MATMUL_TILE/BLOCK，后端 run_fused_gpu 与生成器共用）。
 //    - 归约指令（RowSum/RowMax/...）出现在尾链时属 S5 归约组合，由
 //      generate_glsl_reduce 处理（本生成器遇到归约指令返回空 → 上层报错）。
@@ -281,6 +283,8 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     //     远小于内层 k4 循环的读冲突代价）。
     //   BK=32 + 双缓冲：[2][8][64]vec4×2 矩阵 = 32KB（>原版单缓冲 16KB，
     //   blocks/SM 砍半——深网格靠 WG 余量补、浅网格靠流水补，实测定夺）；
+    //   需设备 maxComputeSharedMemorySize ≥ 32KB（Vulkan 规范下限仅 16KB，
+    //   合规低端设备会在 pipeline 创建时响亮失败——40HX 等目标卡无虞）；
     //   stage 交替：tile t 用 t&1。
     L << "shared vec4 AshT[2][" << BK4 << "][" << B << "];\n";
     L << "shared vec4 BshT[2][" << BK4 << "][" << B << "];\n\n";
@@ -770,7 +774,9 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
     int ne = 0;
     for (std::uint32_t r = 0; r < spec.num_regs; ++r)
         if (is_elem[r]) eidx[r] = ne++;
-    const std::uint32_t OUTC_MAX = 4;  // 步进分片 oi 上界 = ceil(FOLD_MAX_VEC/256)
+    // OUTC_MAX 由单一事实源 FOLD_MAX_VEC 派生（1024/256=4；手写 4 会在
+    //   抬高 FOLD_MAX_VEC 时让生成的 o[(dd-tid)/256] 静默越界）
+    constexpr std::uint32_t OUTC_MAX = (FOLD_MAX_VEC + 255u) / 256u;
     const std::size_t n_inputs = spec.views.size();
     const bool has_mm = f.matmul.has_value();
     // 输出列数 **运行时读 PC 的 vector_out 槽**（形状无关：同 key 服务任意
@@ -780,8 +786,11 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
     L << "// ── 自动生成（AOT 算子融合 · fold v2 双域），请勿手动编辑 ──\n";
     L << "// 表达式: " << name << "\n";
     L << "#version 450\n";
-    L << "#extension GL_KHR_shader_subgroup_basic : enable\n";              // gl_SubgroupSize
-    L << "#extension GL_KHR_shader_subgroup_shuffle_relative : enable\n\n"; // subgroupShuffleDown
+    // 前提：gl_SubgroupSize 为 2 的幂（桌面 wave32/64 恒真）——非 2 幂时
+    //   shuffleDown 蝶形 off>>=1 折叠不全会漏部分和（无运行时守护，记为
+    //   书面前提）；`: require` 与 matmul_gemv 的限定符口径统一
+    L << "#extension GL_KHR_shader_subgroup_basic : require\n";              // gl_SubgroupSize
+    L << "#extension GL_KHR_shader_subgroup_shuffle_relative : require\n\n"; // subgroupShuffleDown
     L << "layout(local_size_x = 256) in;\n\n";
     for (std::size_t i = 0; i < n_inputs; ++i)
         L << "layout(std430, binding = " << i << ") readonly buffer Buf" << i
@@ -820,9 +829,11 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
 
     L << "void main()\n{\n";
     L << "    const uint tid = gl_LocalInvocationID.x;\n";
-    // 标量寄存器声明（一次；状态初值/o 初始化下沉到行循环内按行重置）
+    // 标量寄存器声明（一次；仅行标量类——元素类寄存器在链 j 循环内就地
+    //   声明（float r{n} = sreg[..][j]），validate 保证 S/F 上下文不读元素
+    //   寄存器 → 外层声明必成死变量；状态初值/o 初始化下沉到行循环内按行重置）
     for (std::uint32_t r = 0; r < spec.num_regs; ++r)
-        L << "    float r" << r << ";\n";
+        if (!is_elem[r]) L << "    float r" << r << ";\n";
     // ── NR 行/WG 外层循环（同一行结构原样按 ri 重放；Qsh/sreg/spart/smm
     //    跨行复用 → shared 零增长。ri 循环边界对全 WG 均匀（体内含屏障，
     //    禁分支发散）；越界行 clamp 到末行重复算、写回由 row_ok 挡掉。──
@@ -863,7 +874,7 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
     }
 
     // ── 操作数 → GLSL 片段。ctx：'E'=链(j 上下文) 'R'=归约源(内层 j)
-    //    'S'=标量行(无 j) 'F'=finalize(dd 上下文)。pre=物化前言（mm 段）。──
+    //    'S'=标量行(无 j) 'F'=finalize(dd 上下文)。──
     const auto vp_of = [&](std::size_t k) -> std::uint32_t
     {
         std::uint32_t vp = 0;
@@ -877,7 +888,6 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
     // （QKᵀ 的 mm 物化已上移为块首 smm[] 协作计算——原 mm_prelude 现场
     //   串行 Σ_d 结构删除，见块循环头）
     const auto operand = [&](const ExprOperand& op, char ctx,
-                             std::string& /*pre 物化前言已上移 smm，不再写*/,
                              const std::string& jv) -> std::string
     {
         switch (op.kind)
@@ -920,46 +930,45 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
         }
         }
     };
-    // 指令 → 赋值语句（dst_str = 目标表达式）；物化前言经 pre 累积后一并发射
+    // 指令 → 赋值语句（dst_str = 目标表达式）
     const auto emit_assign = [&](const ExprInstr& ins, const std::string& dst_str,
                                  char ctx, const std::string& jv) -> std::string
     {
-        std::string pre;
         const ExprOp op = static_cast<ExprOp>(ins.op);
-        const std::string a = operand(ins.a, ctx, pre, jv);
+        const std::string a = operand(ins.a, ctx, jv);
         std::ostringstream s;
         if (op == ExprOp::Select)
         {
-            const std::string bt = operand(ins.b, ctx, pre, jv);
-            const std::string ce = operand(ins.c, ctx, pre, jv);
+            const std::string bt = operand(ins.b, ctx, jv);
+            const std::string ce = operand(ins.c, ctx, jv);
             s << dst_str << " = (" << a << " != 0.0) ? " << bt << " : " << ce << ";";
-            return pre + "          " + s.str() + "\n";
+            return "          " + s.str() + "\n";
         }
         if (op == ExprOp::Max || op == ExprOp::Min)
         {
             s << dst_str << " = " << (op == ExprOp::Max ? "max" : "min")
-              << "(" << a << ", " << operand(ins.b, ctx, pre, jv) << ");";
-            return pre + "          " + s.str() + "\n";
+              << "(" << a << ", " << operand(ins.b, ctx, jv) << ");";
+            return "          " + s.str() + "\n";
         }
         bool cmp = false;
         const char* bin = glsl_binary_op(op, cmp);
         if (bin && *bin)
         {
-            const std::string bv = operand(ins.b, ctx, pre, jv);
+            const std::string bv = operand(ins.b, ctx, jv);
             if (cmp)
                 s << dst_str << " = (" << a << " " << bin << " " << bv
                   << ") ? 1.0 : 0.0;";
             else
                 s << dst_str << " = " << a << " " << bin << " " << bv << ";";
-            return pre + "          " + s.str() + "\n";
+            return "          " + s.str() + "\n";
         }
         if (op == ExprOp::Neg)
         {
             s << dst_str << " = -(" << a << ");";
-            return pre + "          " + s.str() + "\n";
+            return "          " + s.str() + "\n";
         }
         s << dst_str << " = " << glsl_unary_op(op) << "(" << a << ");";
-        return pre + "          " + s.str() + "\n";
+        return "          " + s.str() + "\n";
     };
 
     // ── 块循环 + body 段扫描发射 ─────────────────────────────────────────
@@ -1099,9 +1108,7 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
                 L << "          float acc = "
                   << (is_max ? "uintBitsToFloat(0xff800000u)" : "0.0") << ";\n";
                 L << "          for (uint j = 0u; j < valid; ++j) {\n";
-                std::string pre;
-                const std::string src = operand(ins.a, 'R', pre, "j");
-                L << pre;
+                const std::string src = operand(ins.a, 'R', "j");
                 L << "            acc = "
                   << (is_max ? ("max(acc, " + src + ")") : ("(acc + " + src + ")"))
                   << ";\n";
