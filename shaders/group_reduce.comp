@@ -43,7 +43,10 @@ void main()
     const uint n = idx % N;
     const bool is_max = (reduce_op == 1u);
 
-    float acc = is_max ? uintBitsToFloat(0xff800000u) : 0.0;   // -inf : 0
+    // max 恒等元 = numeric_limits::lowest()（0xFF7FFFFF，2026-09-24 与
+    // reduce.comp / DSL / CPU 全库统一；旧 -inf 在全 -inf 输入下与减法
+    // 组合会出 −inf−−inf=NaN）
+    float acc = is_max ? uintBitsToFloat(0xFF7FFFFFu) : 0.0;
     const uint base = g * R * N + n;
     for (uint i = 0u; i < R; ++i)
     {

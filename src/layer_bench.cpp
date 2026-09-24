@@ -259,17 +259,38 @@ void setup_matmul(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
     ctx.a = make_input(e, c.m, c.k);
     ctx.b = make_input(e, c.k, c.n);
 }
+// transB=1：B 存储为 (N,K) 按 B^T 使用 → 操作数必须建 (n,k)。
+// （旧版与 plain 共用 (k,n)：k==n 时正方形掩盖，k≠n 时 backend 返回
+//  K mismatch 错误，而 run 里 *expected 不查错 → UB 垃圾时长 0.000ms。）
+void setup_matmul_bt(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
+{
+    ctx.a = make_input(e, c.m, c.k);
+    ctx.b = make_input(e, c.n, c.k);
+}
+// transA=1：A 存储为 (K,M) 按 A^T 使用 → 操作数必须建 (k,m)
+void setup_matmul_at(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
+{
+    ctx.a = make_input(e, c.k, c.m);
+    ctx.b = make_input(e, c.k, c.n);
+}
+// matmul 系 run：检查 Result（错误时打印并中止，杜绝 *expected UB 静默垃圾值）
 void run_matmul(ComputeEngine& e, const BenchConfig&, OpCtx& ctx)
 {
-    ctx.c = *e.matmul(ctx.a, ctx.b);
+    auto r = e.matmul(ctx.a, ctx.b);
+    if (!r) { std::printf("matmul error: %s\n", r.error().message.c_str()); std::abort(); }
+    ctx.c = std::move(*r);
 }
 void run_matmul_bt(ComputeEngine& e, const BenchConfig&, OpCtx& ctx)
 {
-    ctx.c = *e.matmul(ctx.a, ctx.b, false, true);
+    auto r = e.matmul(ctx.a, ctx.b, false, true);
+    if (!r) { std::printf("matmul_bt error: %s\n", r.error().message.c_str()); std::abort(); }
+    ctx.c = std::move(*r);
 }
 void run_matmul_at(ComputeEngine& e, const BenchConfig&, OpCtx& ctx)
 {
-    ctx.c = *e.matmul(ctx.a, ctx.b, true, false);
+    auto r = e.matmul(ctx.a, ctx.b, true, false);
+    if (!r) { std::printf("matmul_at error: %s\n", r.error().message.c_str()); std::abort(); }
+    ctx.c = std::move(*r);
 }
 double work_matmul(const BenchConfig& c) { return 2.0 * c.m * c.n * c.k; }
 
@@ -280,7 +301,9 @@ void setup_batched(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
 }
 void run_batched(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
 {
-    ctx.c = *e.batched_matmul(ctx.a, ctx.b, c.batch);
+    auto r = e.batched_matmul(ctx.a, ctx.b, c.batch);
+    if (!r) { std::printf("batched_matmul error: %s\n", r.error().message.c_str()); std::abort(); }
+    ctx.c = std::move(*r);
 }
 double work_batched(const BenchConfig& c) { return 2.0 * c.batch * c.m * c.n * c.k; }
 
@@ -327,7 +350,11 @@ void run_col_reduce(ComputeEngine& e, const BenchConfig&, OpCtx& ctx)
 {
     ctx.c = *e.col_reduce_sum(ctx.a);
 }
-double bytes_reduce(const BenchConfig& c) { return 2.0 * c.m * c.n * sizeof(Scalar); }
+// 归约实际搬运 = 读全矩阵 (m*n) + 写输出（row_reduce 输出 (m,1) → m 个；
+// col_reduce 输出 (1,n) → n 个）。**不能记 2*m*n**——输出只有向量级，按全量
+// 记会把 GB/s 虚高 ~2×（5244² 下虚报 440 GB/s，超过 448 理论峰值，物理不可能）。
+double bytes_row_reduce(const BenchConfig& c) { return (c.m * c.n + c.m) * sizeof(Scalar); }
+double bytes_col_reduce(const BenchConfig& c) { return (c.m * c.n + c.n) * sizeof(Scalar); }
 
 void run_transpose(ComputeEngine& e, const BenchConfig&, OpCtx& ctx)
 {
@@ -344,14 +371,14 @@ const std::vector<OpSpec>& op_registry()
 {
     static const std::vector<OpSpec> reg = {
         {"matmul", setup_matmul, run_matmul, work_matmul, true},
-        {"matmul_bt", setup_matmul, run_matmul_bt, work_matmul, true},
-        {"matmul_at", setup_matmul, run_matmul_at, work_matmul, true},
+        {"matmul_bt", setup_matmul_bt, run_matmul_bt, work_matmul, true},
+        {"matmul_at", setup_matmul_at, run_matmul_at, work_matmul, true},
         {"batched_matmul", setup_batched, run_batched, work_batched, true},
         {"add_inplace", setup_add, run_add, bytes_add, false},
         {"elementwise_exp", setup_exp, run_exp, bytes_binary, false},
         {"broadcast_col", setup_bcast_col, run_bcast_col, bytes_bcast_col, false},
-        {"row_reduce_sum", setup_exp, run_row_reduce, bytes_reduce, false},
-        {"col_reduce_sum", setup_exp, run_col_reduce, bytes_reduce, false},
+        {"row_reduce_sum", setup_exp, run_row_reduce, bytes_row_reduce, false},
+        {"col_reduce_sum", setup_exp, run_col_reduce, bytes_col_reduce, false},
         {"transpose", setup_exp, run_transpose, bytes_transpose, false},
         {"scale_inplace", setup_exp, run_scale, bytes_binary, false},
     };

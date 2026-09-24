@@ -246,7 +246,10 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     //   BK=16+双缓冲(16KB)：浅网格 +2~6%，深网格 barrier 频率翻倍 -2%（真回退）
     //   BK=32+双缓冲(32KB)：barrier 节奏=原版单缓冲，代价是共享 32KB
     //   → blocks/SM 砍半（原版 16KB 单缓冲 = 深网格基线）
-    constexpr std::uint32_t BK = 32;                 // K 分块宽度
+    // 2026-09-24 OP/融合统一 A/B：BK=32 (32KB) vs BK=16 (16KB)，四点取
+    // best（3 样本）——融合侧 linear 浅(b1024)/深(b4096 fwd+train) 与
+    // OP 级四点一并复测（历史"深网格 BK16 -2%"结论本轮推翻）：
+    constexpr std::uint32_t BK = 16;                 // K 分块宽度
     constexpr std::uint32_t BK4 = BK / 4;            // vec4 数/行（8）
     // 每线程协作加载 vec4 数/矩阵（B×BK4 slots / 256 线程）
     constexpr std::uint32_t VPT = (B * BK4) / (T * T);  // BK=32 → 2；BK=16 → 1
@@ -1705,8 +1708,8 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
     L << "void main()\n{\n";
     L << "    const uint tid = gl_LocalInvocationID.x;\n";
     L << "    const uint idx = gl_WorkGroupID.x;\n";
-    // 行归约：工作组=单行，idx<rows 守卫。列归约(tile)：工作组=256 列 tile，
-    // 每线程一列，守卫/列号在 else 分支内给出（col = idx*256 + tid）。
+    // 行归约：工作组=单行，idx<rows 守卫。列归约：工作组=32 列 tile，
+    // lane=列内偏移、warp=行块（col = idx*32 + l；越界列不早退、读写守卫）。
     L << (is_row ? "    if (idx >= rows) return;\n" : "");
     // matmul+行归约（S7 batch）：idx 为全局行（batch*m_per + row），
     // m_per = rows/mm_batch；列归约+matmul 组合不支持（注意力只用行归约）
@@ -1997,9 +2000,41 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
     }
     else
     {
-        // ═══ 列归约 tile（合并访问）：每工作组 256 列、每线程一整列，无需跨线程归约 ═══
-        L << "    const uint col = idx * 256u + tid;\n";
-        L << "    if (col >= cols) return;\n";
+        // ═══ 列归约（2026-09-24 重构，与 OP 级 reduce.comp 列模式同构）═══
+        // 旧结构「每 WG 256 列、每线程一整列」：读取按行合并，但 WG 数 =
+        // ceil(cols/256)——CE 场景 cols = total 常为数百 → 仅个位数 WG，
+        // 行循环串行度极高；且与 OP 级（WG=单列、lane 跨行步进、完全不
+        // 合并）算法不一致。两路现统一为 OP 级重写版结构：
+        //   lane = 列内偏移 l（同 32 连续列 → 同行读 128B 合并事务）
+        //   warp = 行块 wb（8 个，row = wb 步进 8）→ 每 WG 覆盖 32 列
+        //   部分和 s_red[slot][tid]（tid = wb*32+l）→ 跨 8 行块合并就地覆写
+        //   dispatch：ceil(cols/32)（backend raxis==1 同源改）
+        //   4 路累加器跨步 32（8 行 × 4），ILP 形态与行 pass 一致
+        // 越界列**不早退**（barrier 需全 WG 参与）：读跳过、部分和置恒等元、
+        // 输出写守卫。
+        // emit_col_merge：每个归约 pass 后跨 8 行块合并本槽（与行 pass 的
+        // emit_tree_reduce 调用位置契约一致——后续 pass/输出读到的都是
+        // 整列值；s_red[w*32+l] 跨 lane 连续读、[tid] 连续写，零 bank 冲突）
+        const auto emit_col_merge = [&](int slot, bool is_max)
+        {
+            const std::string s = "s_red[" + std::to_string(slot) + "]";
+            const std::string init = is_max ? "uintBitsToFloat(0xFF7FFFFFu)" : "0.0";
+            const std::string m = "m" + std::to_string(slot);
+            L << "    barrier();\n";   // ① 各行块部分和写完
+            L << "    { float " << m << " = " << init << ";\n";
+            L << "        for (uint w = 0u; w < 8u; ++w)\n";
+            L << "            " << m << " = "
+              << combine(is_max, m, s + "[w*32u + l]") << ";\n";
+            // ② 读/写分离：所有 lane 读完 8 项后才允许覆写自身槽位
+            //    （写 s_red[tid=(wb*32+l)] 与他 lane 读 [w*32+l] 同址，
+            //     无此 barrier 会读到已覆写值 → sum 双计）
+            L << "        barrier();\n";
+            L << "        " << s << "[tid] = " << m << "; }\n";
+            L << "    barrier();\n";   // ③ 覆写完成，后续 pass/输出才可读
+        };
+        L << "    const uint l  = tid & 31u;\n";
+        L << "    const uint wb = tid >> 5u;\n";
+        L << "    const uint col = idx * 32u + l;\n";
 
         // ── 归约视图 pass（tile：每线程一整列，多累加器跨行顺序读，合并访问）──
         for (std::size_t k = 0; k < n_inputs; ++k)
@@ -2018,18 +2053,21 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
             L << "    {\n";
             L << "        float acc0 = " << init << ", acc1 = " << init
               << ", acc2 = " << init << ", acc3 = " << init << ";\n";
-            L << "        uint i = 0u;\n";
-            L << "        for (; i + 3u < rows; i += 4u) {\n";
-            L << "            acc0 = " << combine(is_max, "acc0", "b" + std::to_string(k) + "[i*cols + col]") << ";\n";
-            L << "            acc1 = " << combine(is_max, "acc1", "b" + std::to_string(k) + "[(i+1u)*cols + col]") << ";\n";
-            L << "            acc2 = " << combine(is_max, "acc2", "b" + std::to_string(k) + "[(i+2u)*cols + col]") << ";\n";
-            L << "            acc3 = " << combine(is_max, "acc3", "b" + std::to_string(k) + "[(i+3u)*cols + col]") << ";\n";
+            L << "        if (col < cols) {\n";
+            L << "            uint i = wb;\n";
+            L << "            for (; i + 24u < rows; i += 32u) {\n";
+            L << "                acc0 = " << combine(is_max, "acc0", "b" + std::to_string(k) + "[i*cols + col]") << ";\n";
+            L << "                acc1 = " << combine(is_max, "acc1", "b" + std::to_string(k) + "[(i+8u)*cols + col]") << ";\n";
+            L << "                acc2 = " << combine(is_max, "acc2", "b" + std::to_string(k) + "[(i+16u)*cols + col]") << ";\n";
+            L << "                acc3 = " << combine(is_max, "acc3", "b" + std::to_string(k) + "[(i+24u)*cols + col]") << ";\n";
+            L << "            }\n";
+            L << "            for (; i < rows; i += 8u)\n";
+            L << "                acc0 = " << combine(is_max, "acc0", "b" + std::to_string(k) + "[i*cols + col]") << ";\n";
             L << "        }\n";
-            L << "        for (; i < rows; ++i)\n";
-            L << "            acc0 = " << combine(is_max, "acc0", "b" + std::to_string(k) + "[i*cols + col]") << ";\n";
             L << "        s_red[" << slot << "][tid] = "
               << combine4(is_max, "acc0", "acc1", "acc2", "acc3") << ";\n";
             L << "    }\n";
+            emit_col_merge(slot, is_max);
         }
 
         // ── 归约指令 pass（tile：多累加器，跨行顺序读，合并访问）──
@@ -2055,55 +2093,58 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec)
             L << "    {\n";
             L << "        float acc0 = " << init << ", acc1 = " << init
               << ", acc2 = " << init << ", acc3 = " << init << ";\n";
-            L << "        uint i = 0u;\n";
-            L << "        for (; i + 3u < rows; i += 4u) {\n";
+            L << "        if (col < cols) {\n";
+            L << "            uint i = wb;\n";
+            L << "            for (; i + 24u < rows; i += 32u) {\n";
             for (int k = 0; k < 4; ++k)
             {
-                L << "            { const uint row = i + " << std::to_string(k) << "u; ";
+                L << "                { const uint row = i + " << std::to_string(8 * k)
+                  << "u; ";
                 emit_reg_decl();
                 emit_instrs(0, ri);
                 L << " acc" << k << " = " << combine(is_max, "acc" + std::to_string(k), src)
                   << "; }\n";
             }
-            L << "        }\n";
-            L << "        for (; i < rows; ++i) {\n";
-            L << "            { const uint row = i; ";
+            L << "            }\n";
+            L << "            for (; i < rows; i += 8u) {\n";
+            L << "                { const uint row = i; ";
             emit_reg_decl();
             emit_instrs(0, ri);
             L << " acc0 = " << combine(is_max, "acc0", src) << "; }\n";
+            L << "            }\n";
             L << "        }\n";
             L << "        s_red[" << slot << "][tid] = "
               << combine4(is_max, "acc0", "acc1", "acc2", "acc3") << ";\n";
             L << "    }\n";
+            emit_col_merge(slot, is_max);
         }
 
-        // ── 输出 pass（列 tile）──
+        // ── 输出 pass（列：lane=列 / warp=行块，只写自己行块的行）──
         L << "\n    // 输出\n";
         L << "    if (vector_out == 1u) {\n";
         if (last_is_reduce)
-            L << "        bout[col] = s_red[" << slot_of_instr[spec.instrs.back().dst] << "][tid];\n";
+            L << "        if (col < cols) bout[col] = s_red[" << slot_of_instr[spec.instrs.back().dst] << "][tid];\n";
         else
         {
-            L << "        const uint row = 0u;\n";
+            L << "        if (col < cols) {\n";
+            L << "            const uint row = 0u;\n";
             emit_reg_decl();
             emit_instrs(0, spec.instrs.size());
-            L << "        bout[col] = r" << static_cast<int>(spec.instrs.back().dst) << ";\n";
+            L << "            bout[col] = r" << static_cast<int>(spec.instrs.back().dst) << ";\n";
+            L << "        }\n";
         }
         L << "        return;\n";
         L << "    }\n";
+        L << "    if (col < cols) for (uint row = wb; row < rows; row += 8u) {\n";
         if (last_is_reduce)
-        {
-            L << "    for (uint row = 0u; row < rows; ++row)\n";
             L << "        bout[row*cols + col] = s_red[" << slot_of_instr[spec.instrs.back().dst] << "][tid];\n";
-        }
         else
         {
-            L << "    for (uint row = 0u; row < rows; ++row) {\n";
             emit_reg_decl();
             emit_instrs(0, spec.instrs.size());
             L << "        bout[row*cols + col] = r" << static_cast<int>(spec.instrs.back().dst) << ";\n";
-            L << "    }\n";
         }
+        L << "    }\n";
     }
     L << "}\n";
     return L.str();
