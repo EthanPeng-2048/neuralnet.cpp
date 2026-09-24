@@ -56,10 +56,12 @@ layout(push_constant) uniform PushConstants {
 // 分块维度常量
 const uint BM = 64u;  // 输出块行数
 const uint BN = 64u;  // 输出块列数
-// BK=16 + 双缓冲：Ash[2][16][16]vec4 = 8KB + Bsh 8KB = **16KB 共享内存**，
-// 与单缓冲 BK=32 版完全相同的占用率（blocks/SM），但保留流水重叠。
-// （BK=32 双缓冲需 32KB，会把 blocks/SM 砍半抵消流水收益——实测净 0。）
-const uint BK = 16u;  // K 维度分块宽度
+// BK=16 + 双缓冲（2026-09-24 OP/融合统一 A/B 定案）：Ash[2][16][16]vec4
+//   8KB + Bsh 8KB = 16KB 共享。曾试与融合侧同参 BK=32 (32KB)：OP 级四点
+//   **全回退**（512³ +9%、1024³ +26%、4096³ +29%、batched b8 +29%，
+//   3 样本 best）——32KB 每 SM 只驻 2 个 WG，浅深网格都被占用率卡死；
+//   OP 级恒取 16（下轮再统一须四点复测）。
+const uint BK = 16u; // K 维度分块宽度
 
 // 每线程协作加载元素数（BM*BK/256）。下方按 4 元素组取 groups=EPT/4 →
 // 仅 BK%16==0 才铺满整 tile（BK=8 → groups=0 全不加载；BK=24 → 缺 1/3

@@ -18,102 +18,207 @@
 //   binding 1: 输出 OUT (writeonly)
 //
 // Push Constants：
-//   uint rows      — 输入行数
+//   uint rows      — 输入行数（两段式 pass2 = nchunk）
 //   uint cols      — 输入列数
 //   uint mode      — 0=row_reduce, 1=col_reduce
 //   uint reduce_op — 0=sum, 1=max
+//   uint chunk_rows — >0: 列归约两段式 pass1（WG.y = 行块序号，输出 = partials
+//                    [y*cols + col]）；0 = 整表单段（输出 = result[col]）
 //
-// Dispatch：
-//   row_reduce: (rows, 1, 1) — 每个工作组（256线程）协作归约一行
-//   col_reduce: (cols, 1, 1) — 每个工作组（256线程）协作归约一列
+// Dispatch（backend 侧，与下方各模式的 WG 结构契约同源）：
+//   row_reduce: (rows, 1, 1)      — 每 WG 256 线程协作归约一行
+//   col_reduce 单段: ((cols+31)/32, 1) — 每 WG 覆盖 32 列 tile
+//   col_reduce 两段式（rows 大、单段 WG 数不足喂满机器时）：
+//     pass1: ((cols+31)/32, nchunk, 1)，chunk_rows = ceil(rows/nchunk)
+//     pass2: ((cols+31)/32, 1, 1)，输入 = partials(nchunk, cols)
+//     两 pass 录入同一 cmd 单次提交（固定提交开销 ×1）——ggml
+//     rms_norm_partials 的 partials-buffer 模式；动机：单段 WG 数 =
+//     ceil(cols/32)（5244² 仅 164 vs 136 并发槽 → 1.2 波，末波只剩 ~20%
+//     机器喂内存，实测带宽被尾部压约两成；对照 8192² 256 WG 尾部小带宽高）。
 //
-// 优化：工作组级共享内存并行归约。
-//   旧实现每线程串行扫描整行/整列（O(cols) 或 O(rows)），大矩阵严重超时。
-//   新实现每工作组 256 线程 strided loop + shared memory tree reduce，
-//   每线程工作量降至 O(cols/256)，避免 TDR 超时。
+// ── 2026-09-24：与 DSL 生成归约（expr_glsl_gen generate_glsl_reduce）同步 ──
+// 差异分解（此前两条路算法不一致，OP 级是慢的那条）：
+//   ① 列归约访存：旧版「WG=单列、256 线程按行号跨步」——lane 间地址步进
+//     cols×4B，完全不合并（每 warp 32 笔独立事务）；4096² 实测 159 GB/s
+//     （同形状 row_reduce 482、add 412）。新版按列合并：lane = 列内偏移
+//     （同一行 32 连续列 = 128B 单事务），行方向切成 8 个行块（warp id）
+//     保并行度，跨行块部分和经 shared 合并（8 项，读写均合并、零 bank 冲突）。
+//   ② max 恒等元：旧版 -inf（0xff800000）。全库统一 numeric_limits::lowest()
+//     （0xFF7FFFFF，DSL/CPU 侧 2026-09 已改）——-inf 恒等元在全 -inf 输入
+//     下与状态进位/减法组合会出 −inf−−inf=NaN（fold doc 掩码 GPU -nan 同类
+//     根因）。
+//   ③ 行归约归约树：旧版 shared 串行树（8 次 barrier）；同步为 DSL 的
+//     subgroup 蝶式（3 次 barrier，subgroupAdd/subgroupMax → 跨 subgroup
+//     收拢 → lane0 广播）。
+//   4 路独立标量累加器（acc0..3，跨步 4*stride）与 DSL 行/列 pass 同款，
+//   打破累加依赖链提升 ILP；归约结合序与单线程不同（测试容差覆盖，与
+//   DSL 路径同等地位）。
 // ─────────────────────────────────────────────────────────────────────────
 
 #version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer  BufIn  { float data[]; };
 layout(std430, binding = 1) writeonly buffer BufOut { float result[]; };
+// vec4 别名视图（同 binding 双声明；行归约 cols%4==0 快路径，16B 对齐由
+// MemoryPool 保证）
+layout(std430, binding = 0) readonly buffer  BufIn4 { vec4 data4[]; };
 
 layout(push_constant) uniform PushConstants {
     uint rows;
     uint cols;
     uint mode;
     uint reduce_op;
+    uint chunk_rows; // >0: 列归约两段式 pass1（WG.y = 行块序号）；0 = 整表单段
 };
 
+// 行模式：subgroup 蝶式归约暂存（256 线程 → ≤64 subgroup 部分和）
 shared float sdata[256];
+// 列模式：跨行块合并 [row_block 0..7][col_in_tile 0..31]
+shared float sred[8][32];
+
+// 恒等元：sum=0；max=lowest()（0xFF7FFFFF，全库统一，见文件头 ②）
+float identity()
+{
+    return (reduce_op == 0u) ? 0.0 : uintBitsToFloat(0xFF7FFFFFu);
+}
+
+float combine(float a, float b)
+{
+    return (reduce_op == 0u) ? (a + b) : max(a, b);
+}
+vec4 combine(vec4 a, vec4 b)
+{
+    return (reduce_op == 0u) ? (a + b) : max(a, b);
+}
 
 void main()
 {
     const uint tid = gl_LocalInvocationID.x;
 
-    // ── 行归约：工作组 ID = 行索引，256 线程协作归约一行 ──
+    // ── 行归约：工作组 ID = 行索引，256 线程协作归约一行（合并访问）──
     if (mode == 0u)
     {
         const uint row = gl_WorkGroupID.x;
         if (row >= rows) return;
 
-        // strided loop：每个线程累加 cols/256 个元素
-        float acc = (reduce_op == 0u) ? 0.0 : uintBitsToFloat(0xff800000u); // sum=0, max=-Inf
-        const uint base = row * cols;
-        for (uint c = tid; c < cols; c += 256u)
+        const float init = identity();
+        float v;
+
+        if ((cols & 3u) == 0u)
         {
-            float v = data[base + c];
-            if (reduce_op == 0u) acc += v;
-            else acc = max(acc, v);
+            // ── vec4 快路径（2026-09-24）：每线程 4 组 vec4 累加器，
+            //    组内 4 元素连续 → 跨 lane 512B 连铺、指令数 ÷4。
+            //    横折 4 分量后进 subgroup 蝶式（与标量回退同构）。
+            const uint g4 = (row * cols) >> 2;
+            const uint n4 = cols >> 2;
+            vec4 acc0 = vec4(init), acc1 = vec4(init);
+            vec4 acc2 = vec4(init), acc3 = vec4(init);
+            uint g = tid;
+            for (; g + 3u * 256u < n4; g += 4u * 256u)
+            {
+                acc0 = combine(acc0, data4[g4 + g]);
+                acc1 = combine(acc1, data4[g4 + g + 256u]);
+                acc2 = combine(acc2, data4[g4 + g + 512u]);
+                acc3 = combine(acc3, data4[g4 + g + 768u]);
+            }
+            for (; g < n4; g += 256u)
+                acc0 = combine(acc0, data4[g4 + g]);
+            const vec4 s = combine(combine(acc0, acc1), combine(acc2, acc3));
+            v = combine(combine(s.x, s.y), combine(s.z, s.w));
         }
-        sdata[tid] = acc;
+        else
+        {
+            // 标量回退：4 路独立累加器（跨步 4*256），与 DSL 行 pass 同款 ILP
+            float acc0 = init, acc1 = init, acc2 = init, acc3 = init;
+            uint c = tid;
+            for (; c + 3u * 256u < cols; c += 4u * 256u)
+            {
+                const uint base = row * cols;
+                acc0 = combine(acc0, data[base + c]);
+                acc1 = combine(acc1, data[base + c + 256u]);
+                acc2 = combine(acc2, data[base + c + 512u]);
+                acc3 = combine(acc3, data[base + c + 768u]);
+            }
+            for (; c < cols; c += 256u)
+                acc0 = combine(acc0, data[row * cols + c]);
+            v = combine(combine(acc0, acc1), combine(acc2, acc3));
+        }
+
+        sdata[tid] = v;
         barrier();
 
-        // 共享内存树形归约
-        for (uint s = 128u; s > 0u; s >>= 1u)
+        // ── subgroup 蝶式归约（与 DSL emit_tree_reduce 同构）──────────
+        v = sdata[tid];
+        v = (reduce_op == 0u) ? subgroupAdd(v) : subgroupMax(v);
+        if (gl_SubgroupInvocationID == 0u)
+            sdata[gl_SubgroupID] = v;
+        barrier();
+        if (gl_SubgroupID == 0u)
         {
-            if (tid < s)
-            {
-                if (reduce_op == 0u) sdata[tid] += sdata[tid + s];
-                else sdata[tid] = max(sdata[tid], sdata[tid + s]);
-            }
-            barrier();
+            float w = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? sdata[gl_SubgroupInvocationID] : identity();
+            w = (reduce_op == 0u) ? subgroupAdd(w) : subgroupMax(w);
+            if (gl_SubgroupInvocationID == 0u)
+                sdata[0] = w;
         }
+        barrier();
 
         if (tid == 0u) result[row] = sdata[0];
         return;
     }
 
-    // ── 列归约：工作组 ID = 列索引，256 线程协作归约一列 ──
+    // ── 列归约：WG = 32 列 tile；lane = 列内偏移（同 32 连续列 →
+    //    同一行读地址连续 = 128B 合并事务），warp = 行块（8 个，r 步进 8）；
+    //    跨行块部分和经 sred[8][32] 合并（写 wb*32+l 连续、读 w*32+l 连续）──
     if (mode == 1u)
     {
-        const uint col = gl_WorkGroupID.x;
-        if (col >= cols) return;
+        const uint l  = tid & 31u;          // 列内偏移 0..31
+        const uint wb = tid >> 5u;          // 行块 0..7
+        const uint col0 = gl_WorkGroupID.x * 32u;
+        const uint col = col0 + l;
 
-        // strided loop：每个线程累加 rows/256 个元素
-        float acc = (reduce_op == 0u) ? 0.0 : uintBitsToFloat(0xff800000u);
-        for (uint r = tid; r < rows; r += 256u)
+        // 行窗口：chunk_rows>0（两段式 pass1）时 WG.y = 行块序号，本 WG 只
+        // 归约 [rows_lo, rows_hi) 并写 partials[y*cols + col]；pass2 以
+        // partials 为输入、rows=nchunk、chunk_rows=0 复用整表路径合并。
+        const uint rows_lo = (chunk_rows == 0u) ? 0u : gl_WorkGroupID.y * chunk_rows;
+        const uint rows_hi = (chunk_rows == 0u) ? rows
+                                               : min(rows_lo + chunk_rows, rows);
+
+        const float init = identity();
+        float acc0 = init, acc1 = init, acc2 = init, acc3 = init;
+        if (col < cols)
         {
-            float v = data[r * cols + col];
-            if (reduce_op == 0u) acc += v;
-            else acc = max(acc, v);
+            // 4 路累加器：跨步 4*8（与 DSL 列 pass 同款 ILP 形态）
+            uint r = rows_lo + wb;
+            for (; r + 3u * 8u < rows_hi; r += 4u * 8u)
+            {
+                acc0 = combine(acc0, data[r * cols + col]);
+                acc1 = combine(acc1, data[(r + 8u) * cols + col]);
+                acc2 = combine(acc2, data[(r + 16u) * cols + col]);
+                acc3 = combine(acc3, data[(r + 24u) * cols + col]);
+            }
+            for (; r < rows_hi; r += 8u)
+                acc0 = combine(acc0, data[r * cols + col]);
         }
-        sdata[tid] = acc;
+        sred[wb][l] = combine(combine(acc0, acc1), combine(acc2, acc3));
         barrier();
 
-        for (uint s = 128u; s > 0u; s >>= 1u)
-        {
-            if (tid < s)
-            {
-                if (reduce_op == 0u) sdata[tid] += sdata[tid + s];
-                else sdata[tid] = max(sdata[tid], sdata[tid + s]);
-            }
-            barrier();
-        }
+        // 跨 8 行块合并（跨 lane 地址连续 = 合并读）
+        float res = init;
+        for (uint w = 0u; w < 8u; ++w)
+            res = combine(res, sred[w][l]);
 
-        if (tid == 0u) result[col] = sdata[0];
+        if (wb == 0u && col < cols)
+        {
+            const uint out_idx = (chunk_rows == 0u) ? col
+                                                   : gl_WorkGroupID.y * cols + col;
+            result[out_idx] = res;
+        }
         return;
     }
 }

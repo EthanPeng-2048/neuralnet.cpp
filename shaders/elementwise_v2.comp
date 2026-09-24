@@ -48,6 +48,19 @@
 // 比较算子（cmp_op）：
 //   0=Lt, 1=Le, 2=Gt, 3=Ge, 4=Eq, 5=Ne
 //
+// ── vec4 kernel（2026-09-24，与 DSL 融合逐元素 vec4 路径同步）──────────────
+// DSL 侧（expr_glsl_gen glsl_vec4_eligible + vec4 kernel）早已按「每线程 4 个
+// 相邻元素」发射 vec4 加载/运算/存储，dispatch 宽度 4；OP 级此前是标量
+// 每线程 1 元素。本 shader 现镜像同一契约：
+//   - main：base = gid*4，base >= count 返回；
+//   - 快路径（count%4==0 且 base+3 < count）→ 全 vec4（索引 flat、4 相邻
+//     元素连续 ⇒ vec4 别名视图整读整写；16B 对齐由 MemoryPool 保证）；
+//   - 回退：同 kernel 内 4 次标量迭代（count%4≠0 的尾组/奇数 count），
+//     快路径与回退覆盖完全一致 → 每个元素恰被处理一次；
+//   - backend dispatch：ceil(count / (256*4))（与 run_fused_gpu 的
+//     count/(256*vec_width) 同口径）。
+// vec4 运算用 GLSL 内建重载（exp(vec4)、mix(vec4,vec4,bvec4) 等），
+// 语义与标量路径逐位同构（exp 等超越数按 lane 独立求值）。
 // ─────────────────────────────────────────────────────────────────────────
 
 #version 450
@@ -58,6 +71,12 @@ layout(std430, binding = 0) readonly buffer  BufA   { float buf_a[]; };
 layout(std430, binding = 1) readonly buffer  BufB   { float buf_b[]; };
 layout(std430, binding = 2) readonly buffer  BufC   { float buf_c[]; };
 layout(std430, binding = 3) writeonly buffer BufOut { float buf_out[]; };
+
+// vec4 别名视图（同 binding 双声明，std430；仅 count%4==0 快路径使用）
+layout(std430, binding = 0) readonly buffer  BufAv4 { vec4 buf_a4[]; };
+layout(std430, binding = 1) readonly buffer  BufBv4 { vec4 buf_b4[]; };
+layout(std430, binding = 2) readonly buffer  BufCv4 { vec4 buf_c4[]; };
+layout(std430, binding = 3) writeonly buffer BufOut4 { vec4 buf_out4[]; };
 
 layout(push_constant) uniform PushConstants {
     uint  count;
@@ -70,7 +89,7 @@ layout(push_constant) uniform PushConstants {
     float scalar_else;
 };
 
-// ── 一元运算 ──────────────────────────────────────────────────────────────
+// ── 一元运算（标量 / vec4 同名重载，语义逐 lane 同构）─────────────────────
 float apply_unary(uint op, float x)
 {
     if (op == 0u) return -x;                          // Neg
@@ -81,6 +100,17 @@ float apply_unary(uint op, float x)
     if (op == 5u) return abs(x);                      // Abs
     if (op == 6u) return tanh(x);                     // Tanh
     return 0.0;
+}
+vec4 apply_unary(uint op, vec4 x)
+{
+    if (op == 0u) return -x;
+    if (op == 1u) return exp(x);
+    if (op == 2u) return log(x);
+    if (op == 3u) return sqrt(x);
+    if (op == 4u) return 1.0 / sqrt(x);
+    if (op == 5u) return abs(x);
+    if (op == 6u) return tanh(x);
+    return vec4(0.0);
 }
 
 // ── 二元运算 ──────────────────────────────────────────────────────────────
@@ -94,8 +124,18 @@ float apply_binary(uint op, float a, float b)
     if (op == 5u) return min(a, b);                   // Min
     return 0.0;
 }
+vec4 apply_binary(uint op, vec4 a, vec4 b)
+{
+    if (op == 0u) return a + b;
+    if (op == 1u) return a - b;
+    if (op == 2u) return a * b;
+    if (op == 3u) return a / b;
+    if (op == 4u) return max(a, b);
+    if (op == 5u) return min(a, b);
+    return vec4(0.0);
+}
 
-// ── 比较运算 ──────────────────────────────────────────────────────────────
+// ── 比较运算（vec4 返回 bvec4，供 mix 按 lane 选择）────────────────────────
 bool apply_compare(uint op, float a, float b)
 {
     if (op == 0u) return a <  b;                      // Lt
@@ -106,30 +146,34 @@ bool apply_compare(uint op, float a, float b)
     if (op == 5u) return a != b;                      // Ne
     return false;
 }
-
-void main()
+bvec4 apply_compare(uint op, vec4 a, vec4 b)
 {
-    const uint idx = gl_GlobalInvocationID.x;
-    if (idx >= count) return;
+    if (op == 0u) return lessThan(a, b);
+    if (op == 1u) return lessThanEqual(a, b);
+    if (op == 2u) return greaterThan(a, b);
+    if (op == 3u) return greaterThanEqual(a, b);
+    if (op == 4u) return equal(a, b);
+    if (op == 5u) return notEqual(a, b);
+    return bvec4(false);
+}
 
+// ── 标量主路径（回退：每元素一次；idx 由调用方给出）───────────────────────
+float eval_scalar(uint idx)
+{
     const float a = buf_a[idx];
 
     // ── 模式 0：一元运算 ──
     if (mode == 0u)
-    {
-        buf_out[idx] = apply_unary(op, a);
-        return;
-    }
+        return apply_unary(op, a);
 
     // ── 模式 1：二元运算 ──
     if (mode == 1u)
     {
         const float b = ((flags & 1u) != 0u) ? scalar_b : buf_b[idx];
         if ((flags & 8u) != 0u)
-            buf_out[idx] = apply_binary(op, b, a);   // 标量在前
+            return apply_binary(op, b, a);            // 标量在前
         else
-            buf_out[idx] = apply_binary(op, a, b);   // 张量在前
-        return;
+            return apply_binary(op, a, b);            // 张量在前
     }
 
     // ── 模式 2：条件选择 ──
@@ -138,15 +182,66 @@ void main()
         const float b      = ((flags & 1u) != 0u) ? scalar_b      : buf_b[idx];
         const float then_v = ((flags & 2u) != 0u) ? scalar_then   : buf_b[idx];
         const float else_v = ((flags & 4u) != 0u) ? scalar_else   : buf_c[idx];
-        buf_out[idx] = apply_compare(cmp_op, a, b) ? then_v : else_v;
+        return apply_compare(cmp_op, a, b) ? then_v : else_v;
+    }
+
+    // ── 模式 3：AXPY ──
+    if (mode == 3u)
+        return a + scalar_b * buf_b[idx];
+
+    return 0.0;
+}
+
+// ── vec4 快路径（count%4==0 的整组 4 元素）────────────────────────────────
+vec4 eval_vec4(uint base)
+{
+    const vec4 a = buf_a4[base >> 2];
+
+    if (mode == 0u)
+        return apply_unary(op, a);
+
+    if (mode == 1u)
+    {
+        const vec4 b = ((flags & 1u) != 0u) ? vec4(scalar_b) : buf_b4[base >> 2];
+        if ((flags & 8u) != 0u)
+            return apply_binary(op, b, a);
+        else
+            return apply_binary(op, a, b);
+    }
+
+    if (mode == 2u)
+    {
+        const vec4 b      = ((flags & 1u) != 0u) ? vec4(scalar_b)    : buf_b4[base >> 2];
+        const vec4 then_v = ((flags & 2u) != 0u) ? vec4(scalar_then) : buf_b4[base >> 2];
+        const vec4 else_v = ((flags & 4u) != 0u) ? vec4(scalar_else) : buf_c4[base >> 2];
+        // mix(else, then, cond)：cond = compare(a, b)（bvec4 按 lane 选择）
+        return mix(else_v, then_v, apply_compare(cmp_op, a, b));
+    }
+
+    if (mode == 3u)
+        return a + scalar_b * buf_b4[base >> 2];
+
+    return vec4(0.0);
+}
+
+void main()
+{
+    const uint i = gl_GlobalInvocationID.x;
+    const uint base = i * 4u;
+    if (base >= count) return;
+
+    // 快路径：整组 4 元素齐全且 count 对齐 → vec4 整读整写
+    if ((count & 3u) == 0u && base + 3u < count)
+    {
+        buf_out4[base >> 2] = eval_vec4(base);
         return;
     }
 
-    // ── 模式 3：AXPY（融合 axpy：out = a + scalar_b * b）──
-    if (mode == 3u)
+    // 回退：同组 4 次标量迭代（尾组 / 奇数 count），覆盖与快路径一致
+    for (uint j = 0u; j < 4u; ++j)
     {
-        const float b = buf_b[idx];
-        buf_out[idx] = a + scalar_b * b;
-        return;
+        const uint e = base + j;
+        if (e >= count) break;
+        buf_out[e] = eval_scalar(e);
     }
 }

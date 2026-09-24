@@ -384,6 +384,10 @@ private:
     VulkanPipeline batched_matmul_pipeline_;
     VulkanPipeline elementwise_v2_pipeline_;
     VulkanPipeline reduce_pipeline_;
+    // 列归约两段式 partials scratch（成员复用：batch 录制期被 cmd 引用，
+    // 局部销毁会踩铁律 6；形状变化时旧缓冲走 pending_destroys_ 延迟销毁，
+    // 对在飞录制安全。同一 batch 内多次使用由 cmd 内屏障串行化）
+    std::optional<GpuTensor> reduce_partial_;
     VulkanPipeline broadcast_pipeline_;
     VulkanPipeline rearrange_3d_pipeline_;
     VulkanPipeline transpose_pipeline_;
@@ -1099,12 +1103,14 @@ public:
                 elementwise_v2_pipeline_ = std::move(*ep_r);
         }
 
-        // 11. 创建 reduce pipeline（2 bindings, 16B push constants）
+        // 11. 创建 reduce pipeline（2 bindings, 20B push constants：
+        //     rows/cols/mode/reduce_op/chunk_rows——chunk_rows>0 触发列归约
+        //     两段式 pass1，见 reduce_gpu）
         const auto& reduce_spirv = get_reduce_spirv();
         if (!reduce_spirv.empty())
         {
             auto rp_r = VulkanPipeline::create_generic(
-                device_.device(), reduce_spirv, 2, 4 * sizeof(uint32_t));
+                device_.device(), reduce_spirv, 2, 5 * sizeof(uint32_t));
             if (rp_r)
                 reduce_pipeline_ = std::move(*rp_r);
         }
@@ -2636,7 +2642,8 @@ public:
         vkCmdPushConstants(cmd, elementwise_v2_pipeline_.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
 
-        const uint32_t wg_count = (count + 255) / 256;
+        // vec4 kernel（与 DSL count/(256*vec_width) 同口径）：每线程 4 元素
+        const uint32_t wg_count = (count + 256u * 4u - 1u) / (256u * 4u);
         vkCmdDispatch(cmd, wg_count, 1, 1);
         record_output_barrier(cmd, output.buffer().impl());
 
@@ -2914,7 +2921,8 @@ public:
             VK_SHADER_STAGE_COMPUTE_BIT, 0, static_cast<std::uint32_t>(pc.size()), pc.data());
 
         // dispatch：逐元素 = ceil(count/(256*vec_width))；行归约 = rows 个工作组；
-        // 列归约(tile) = ceil(cols/256) 个工作组（每工作组 256 列）；
+        // 列归约 = ceil(cols/32) 个工作组（每工作组 32 列 tile、warp=行块，
+        // 与生成器 l/wb/col 结构及 OP 级 reduce.comp 契约同源）；
         // matmul 分块（S5）= (ceil(cols/BLOCK), ceil(m_per/BLOCK), matmul_batch)，
         // BLOCK 与 glsl_gen 生成的输出块一致（EXPR_MATMUL_BLOCK=64：每工作组
         // 64×64 输出块、16×16 线程、每线程 4×4 寄存器分块）
@@ -2952,7 +2960,7 @@ public:
                        + nn::EXPR_FOLD_ROWS_PER_WG - 1u)
                         / nn::EXPR_FOLD_ROWS_PER_WG
                 : (raxis == 0) ? static_cast<std::uint32_t>(rows)
-                : (raxis == 1) ? (static_cast<std::uint32_t>(cols) + 255u) / 256u
+                : (raxis == 1) ? (static_cast<std::uint32_t>(cols) + 31u) / 32u
                 : (count + 256u * vec_width - 1u) / (256u * vec_width);
             vkCmdDispatch(cmd, wg_count, 1, 1);
         }
@@ -2988,10 +2996,11 @@ public:
     // ══════════════════════════════════════════════════════════════════
     // reduce_gpu — 行/列归约原语（sum/max）
     //
-    // Push Constants (16 bytes): rows, cols, mode, reduce_op
+    // Push Constants (20 bytes): rows, cols, mode, reduce_op, chunk_rows
     // Bindings: In(0), Out(1)
     // mode: 0=row_reduce → out(rows,1), 1=col_reduce → out(1,cols)
     // reduce_op: 0=sum, 1=max
+    // 列归约大行数走两段式 partials（同 cmd 双 dispatch 单次提交，见分支内注释）
     // ══════════════════════════════════════════════════════════════════
     [[nodiscard]] Result<GpuTensor> reduce_gpu(
         const GpuTensor& input, uint32_t mode, uint32_t reduce_op)
@@ -3010,6 +3019,119 @@ public:
         auto output_res = GpuTensor::create_empty(out_rows, out_cols, *this);
         if (!output_res) return std::unexpected(output_res.error());
         GpuTensor output = std::move(*output_res);
+
+        // ── 列归约大行数：两段式 partials（ggml rms_norm_partials 模式）──
+        // 单段 dispatch = ceil(cols/32) 个 WG（5244² 仅 164 vs 136 并发槽 →
+        // 1.2 波，末波只剩 ~20% 机器喂内存 → 带宽被波尾压约两成）。
+        // pass1 把行向切 nchunk 块（dispatch y = nchunk）→ WG 数 ×nchunk，
+        // 每 WG 归约一行块写 partials(nchunk, cols)；pass2 复用整表路径合并
+        // （行数 = nchunk ≤ 8，成本可忽略）。两 pass 录进同一 cmd 单次提交
+        // → 固定提交开销不翻倍。小行数保持单段（零开销）。
+        uint32_t nchunk = 1u;
+        if (mode == 1u)
+        {
+            const uint32_t tiles = (cols + 31u) / 32u;
+            nchunk = (rows + 1023u) / 1024u;
+            if (nchunk > 8u) nchunk = 8u;
+            const uint32_t want = (512u + tiles - 1u) / tiles;   // ≥512 WG ≈ 4 波
+            if (want > nchunk) nchunk = want;
+            if (nchunk > 8u) nchunk = 8u;
+            // 小形状回落单段：512² 交错 A/B 实测两段 −16%（第二遍+屏障对
+            // ~10µs kernel 净亏），1024² 起两者持平或两段转优 → 边界 512K 元素
+            if (rows < 256u ||
+                static_cast<std::uint64_t>(rows) * cols < 524'288ull)
+                nchunk = 1u;
+        }
+        // 两段式启用条件（同负载窗交错 A/B 定案：TP/SP 两二进制逐轮换序、
+        // warmup 30、best-of-10；同码对照噪声地板 ±5%）：
+        //   5244² TP 4/5 胜（中位 0.405 vs 0.430，−6%；单段 1.2 波尾欠喂被消除）
+        //   4096² SP 5/5 胜 ~2%（0.277 vs 0.283；单波本已喂满，TP 纯付 ~6µs）
+        //   512² TP −16%（对 ~10µs kernel 第二遍+屏障净亏）→ 尺寸护栏只排除它
+        const bool two_pass = (nchunk > 1u);
+        const uint32_t chunk_rows = two_pass ? (rows + nchunk - 1u) / nchunk : 0u;
+
+        if (two_pass)
+        {
+            if (!reduce_partial_ ||
+                static_cast<uint32_t>(reduce_partial_->rows()) != nchunk ||
+                static_cast<uint32_t>(reduce_partial_->cols()) != cols)
+            {
+                auto pres = GpuTensor::create_empty(nchunk, cols, *this);
+                if (!pres) return std::unexpected(pres.error());
+                reduce_partial_ = std::move(*pres);
+            }
+            const GpuTensor& partial = *reduce_partial_;
+
+            auto ds1_r = alloc_desc_set(reduce_pipeline_.descriptor_layout());
+            if (!ds1_r) return std::unexpected(ds1_r.error());
+            VkDescriptorSet ds1 = *ds1_r;
+            auto ds2_r = alloc_desc_set(reduce_pipeline_.descriptor_layout());
+            if (!ds2_r) return std::unexpected(ds2_r.error());
+            VkDescriptorSet ds2 = *ds2_r;
+
+            VkDescriptorBufferInfo infos1[2]{
+                {input.buffer().impl(), 0, VK_WHOLE_SIZE},
+                {partial.buffer().impl(), 0, VK_WHOLE_SIZE},
+            };
+            VkDescriptorBufferInfo infos2[2]{
+                {partial.buffer().impl(), 0, VK_WHOLE_SIZE},
+                {output.buffer().impl(), 0, VK_WHOLE_SIZE},
+            };
+            VkWriteDescriptorSet writes[4]{};
+            for (int i = 0; i < 2; ++i)
+            {
+                writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[i].dstSet = ds1;
+                writes[i].dstBinding = static_cast<uint32_t>(i);
+                writes[i].descriptorCount = 1;
+                writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                writes[i].pBufferInfo = &infos1[i];
+                writes[2 + i] = writes[i];
+                writes[2 + i].dstSet = ds2;
+                writes[2 + i].pBufferInfo = &infos2[i];
+            }
+            vkUpdateDescriptorSets(device_.device(), 4, writes, 0, nullptr);
+
+            auto cmd_r = acquire_cmd();
+            if (!cmd_r)
+            {
+                VkDescriptorSet free_sets[2] = {ds1, ds2};
+                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 2, free_sets);
+                return std::unexpected(cmd_r.error());
+            }
+            auto [cmd, owns_cmd] = *cmd_r;
+
+            // pass1：行块级部分归约 → partials
+            record_input_barriers(cmd, {input.buffer().impl()});
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                reduce_pipeline_.handle());
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                reduce_pipeline_.pipeline_layout(), 0, 1, &ds1, 0, nullptr);
+            const uint32_t push1[5] = {rows, cols, 1u, reduce_op, chunk_rows};
+            vkCmdPushConstants(cmd, reduce_pipeline_.pipeline_layout(),
+                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push1), push1);
+            vkCmdDispatch(cmd, (cols + 31u) / 32u, nchunk, 1);
+
+            // partials：写 → 读（同 cmd 内跨 dispatch 依赖）
+            record_input_barriers(cmd, {partial.buffer().impl()});
+
+            // pass2：合并 partials（rows = nchunk ≤ 8，复用 mode1 整表路径）
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                reduce_pipeline_.pipeline_layout(), 0, 1, &ds2, 0, nullptr);
+            const uint32_t push2[5] = {nchunk, cols, 1u, reduce_op, 0u};
+            vkCmdPushConstants(cmd, reduce_pipeline_.pipeline_layout(),
+                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push2), push2);
+            vkCmdDispatch(cmd, (cols + 31u) / 32u, 1, 1);
+            record_output_barrier(cmd, output.buffer().impl());
+
+            if (owns_cmd)
+            {
+                auto r = submit_and_wait(cmd, ds1);   // 等 fence 后归还 ds1
+                if (!r) return std::unexpected(r.error());
+                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &ds2);
+            }
+            return output;
+        }
 
         // 2. 分配描述符集
         auto ds_r = alloc_desc_set(reduce_pipeline_.descriptor_layout());
@@ -3049,12 +3171,14 @@ public:
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             reduce_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
 
-        const uint32_t push_data[4] = {rows, cols, mode, reduce_op};
+        const uint32_t push_data[5] = {rows, cols, mode, reduce_op, 0u};
         vkCmdPushConstants(cmd, reduce_pipeline_.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
 
-        // 每个工作组 256 线程协作归约一行/一列
-        const uint32_t workgroups = (mode == 0) ? rows : cols;
+        // 行：每 WG 256 线程协作归约一行 → rows 个 WG；
+        // 列：每 WG 32 列 tile（lane=列、warp=行块，合并访问；与
+        //     reduce.comp 的 WG 结构契约同源）→ (cols+31)/32 个 WG
+        const uint32_t workgroups = (mode == 0) ? rows : (cols + 31u) / 32u;
         vkCmdDispatch(cmd, workgroups, 1, 1);
         record_output_barrier(cmd, output.buffer().impl());
 
@@ -3147,8 +3271,9 @@ public:
         vkCmdPushConstants(cmd, broadcast_pipeline_.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
 
+        // vec4 kernel（与 elementwise_v2 / DSL 同口径）：每线程 4 元素
         const uint32_t total = rows * cols;
-        const uint32_t wg_count = (total + 255) / 256;
+        const uint32_t wg_count = (total + 256u * 4u - 1u) / (256u * 4u);
         vkCmdDispatch(cmd, wg_count, 1, 1);
         record_output_barrier(cmd, output.buffer().impl());
 
@@ -3855,9 +3980,14 @@ public:
         vkCmdPushConstants(cmd, transpose_pipeline_.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
 
-        const uint32_t total = R * C;
-        const uint32_t wg_count = (total + 255) / 256;
-        vkCmdDispatch(cmd, wg_count, 1, 1);
+        // 砖块化 dispatch：(8, 8, n_bricks)——每 WG 覆盖 64×64 输出块，
+        // 8×8 个 WG 组成一砖（并发足迹聚集，见 transpose.comp 头注释）。
+        // 越界 tile 由 shader 早退（dispatch 固定 8×8，末砖可不满）。
+        const uint32_t tx = (C + 63u) / 64u;
+        const uint32_t ty = (R + 63u) / 64u;
+        const uint32_t bx = (tx + 15u) / 16u;
+        const uint32_t by = (ty + 7u) / 8u;
+        vkCmdDispatch(cmd, 16, 8, bx * by);
         record_output_barrier(cmd, output.buffer().impl());
 
         if (owns_cmd)
@@ -4180,7 +4310,8 @@ public:
             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
 
         const uint32_t total = num * D;
-        const uint32_t wg_count = (total + 255) / 256;
+        // vec4 kernel（与 elementwise/broadcast/DSL 同口径）：每线程 4 元素
+        const uint32_t wg_count = (total + 256u * 4u - 1u) / (256u * 4u);
         vkCmdDispatch(cmd, wg_count, 1, 1);
         record_output_barrier(cmd, output.buffer().impl());
 

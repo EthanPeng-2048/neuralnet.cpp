@@ -249,7 +249,6 @@ if(Vulkan_FOUND)
         batched_matmul
         rearrange_3d
         elementwise_v2
-        reduce
         broadcast
         transpose
         gather
@@ -313,6 +312,10 @@ if(Vulkan_FOUND)
     #     需 SPIR-V ≥1.3 → 显式 --target-env=vulkan1.2（与 gen_fused 一致）；
     #     其余 shader 编译参数不变。
     nn_embed_shader(matmul_gemv ${CMAKE_SOURCE_DIR}/shaders/matmul_gemv.comp --target-env=vulkan1.2)
+
+    # 1c. reduce：行列归约用 subgroup 蝶式（GL_KHR_shader_subgroup_*，与
+    #     DSL 融合归约同配方）→ 同样需 SPIR-V ≥1.3 → --target-env=vulkan1.2
+    nn_embed_shader(reduce ${CMAKE_SOURCE_DIR}/shaders/reduce.comp --target-env=vulkan1.2)
 
     # 2. AOT 融合 shader：scan_exprs + gen_fused
     set(NN_EXPR_SCAN_BIN     ${CMAKE_BINARY_DIR}/generated/expr_specs.bin)

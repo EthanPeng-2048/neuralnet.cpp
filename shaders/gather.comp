@@ -4,7 +4,7 @@
 // 语义：
 //   table: (vocab, D) — 行主序存储
 //   indices: (num,)   — 行索引（float 编码的整数）
-//   output: (num, D)  — output[i] = table[indices[i]]
+//   output: (num, D) — output[i] = table[indices[i]]
 //
 // 越界索引返回零行（防御性，与 CPU fallback 行为一致）。
 //
@@ -17,6 +17,16 @@
 //   uint vocab — table 行数
 //   uint D     — 列宽（每行元素数）
 //   uint num   — indices 元素个数
+//
+// ── vec4 + 按组求商（2026-09-24，与 DSL 侧「索引按组派生、免逐元素除模」
+//    及 vec4 kernel 契约同步）────────────────────────────────────────────────
+// 旧版每线程 1 元素、每元素一次 i=idx/D、d=idx%D 两笔整数除模 + 4 次标量
+// 表读。现：
+//   - 快路径（D%4==0 且 base+3<total）：base = gid*4 → i/d0 每组一次除模
+//     （D%4 ⇒ d0%4 且 row*D 对齐 16B）→ indices[i] 一次、table vec4 整读、
+//     out vec4 整写；越界行整组置零（同组同 i ⇒ 与逐元素置零语义一致）。
+//   - 回退：同组 4 次标量迭代（奇数 D / 尾组），覆盖完全一致。
+//   - dispatch：ceil(total/(256*4))（backend 侧同口径）。
 // ─────────────────────────────────────────────────────────────────────────
 
 #version 450
@@ -27,6 +37,10 @@ layout(std430, binding = 0) readonly buffer  BufTable   { float table[];   };
 layout(std430, binding = 1) readonly buffer  BufIndices { float indices[]; };
 layout(std430, binding = 2) writeonly buffer BufOut     { float out_data[]; };
 
+// vec4 别名视图（同 binding 双声明，std430；仅 D%4==0 快路径使用）
+layout(std430, binding = 0) readonly buffer  BufTable4 { vec4 table4[];  };
+layout(std430, binding = 2) writeonly buffer BufOut4   { vec4 out4[];    };
+
 layout(push_constant) uniform PushConstants {
     uint vocab;
     uint D;
@@ -35,17 +49,35 @@ layout(push_constant) uniform PushConstants {
 
 void main()
 {
-    const uint flat_idx = gl_GlobalInvocationID.x;
+    const uint i = gl_GlobalInvocationID.x;
+    const uint base = i * 4u;
     const uint total = num * D;
-    if (flat_idx >= total) return;
+    if (base >= total) return;
 
-    const uint i = flat_idx / D;  // 第 i 个索引
-    const uint d = flat_idx % D;  // 第 d 列
+    // ── 快路径：D%4==0 ⇒ 组内 4 元素同行、d0 对齐 16B ──
+    if ((D & 3u) == 0u && base + 3u < total)
+    {
+        const uint ii  = base / D;                   // 索引数组下标（每组一次除法）
+        const uint d0  = base - ii * D;
+        const uint row = uint(indices[ii]);          // ← 表行号来自 indices[ii]
+        if (row < vocab)
+            out4[base >> 2] = table4[(row * D + d0) >> 2];
+        else
+            out4[base >> 2] = vec4(0.0);             // 越界行整组置零
+        return;
+    }
 
-    const uint row_idx = uint(indices[i]);
-
-    if (row_idx < vocab)
-        out_data[flat_idx] = table[row_idx * D + d];
-    else
-        out_data[flat_idx] = 0.0;  // 越界返回零
+    // ── 回退：标量（每元素求 i/d；与旧版逐位同构）──
+    for (uint j = 0u; j < 4u; ++j)
+    {
+        const uint e = base + j;
+        if (e >= total) break;
+        const uint ii = e / D;
+        const uint d  = e % D;
+        const uint row_idx = uint(indices[ii]);
+        if (row_idx < vocab)
+            out_data[e] = table[row_idx * D + d];
+        else
+            out_data[e] = 0.0;
+    }
 }
