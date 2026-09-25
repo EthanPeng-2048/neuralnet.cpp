@@ -246,6 +246,7 @@ optimizer.step();
 | `development/08-pitfalls-and-lessons.md` | **踩坑警示录，改代码前读** |
 | `development/10-development-standards.md` | C++ 编码规范全文 |
 | `development/12-compute-engine-inventory.md` | **引擎接口盘点（2026-09 复核）：58 个 virtual、Layer 直调 35 个、四套表达式求值机制、遗留物清单** |
+| `development/13-refactor-backlog.md` | **重构与性能机会清单（2026-09-25 审查）：只记录方案不实施；含"已核对为误报/已修复的审查项"对照表，重复立项前先读 §6** |
 
 ### 使用类（docs/usage/）
 
