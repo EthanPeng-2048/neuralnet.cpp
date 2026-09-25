@@ -3,7 +3,13 @@
 > 本文把算子融合两期工作整合为一条完整主线：一期（M1-M7）用**手写 op 级融合原语**解决 GPT+Vulkan 训练显存/开销问题；二期（S1-S7）把 **matmul 纳入 IR 融合**、实现跨 kernel 自动融合（原规划的图级缓存落地方案已随 IR-C 于 2026-09-19 删除），最终删除一期手写融合原语。两期均服务于同一目标：减少 GPT+Vulkan 训练显存，同时严格遵循分层铁律。
 >
 > 状态：一期已实施完成（M4-M6 手写原语已由二期 IR 融合取代）；二期 S1-S5、S7 已实施，S6 自动窗口因用户决策搁置（其替代方案 P2-12 图级缓存亦随 IR-C 删除）；**P-C2-7 起注意力 forward 进一步改为单 fold kernel（FoldSpec 分块流式求值）——见"关键算法"章状态横幅，S7 的 IR 链现仅存于 backward**。
-> 关联文档：`../development/03-ir-optimization.md`（IR-A/B/C/D）、`../13-optimize-proposal-list.md`（P2-05 / P2-10 / P7-01）。
+> 关联文档：`03-ir-optimization.md`（IR-A/B/D；IR-C 已移除）。
+
+**怎么读本文（3 条路径）**：
+
+- **只想知道"融合现在怎么工作"** → §总体架构与核心机制 + §构建工具链与闭合世界（现在的机制）；
+- **要改融合/IR 代码** → §合规红线 + §二期关键教训（改前必读） + `03-ir-optimization.md` §5.3；
+- **查历史决策/为什么这么走** → §里程碑与实施记录 + §关键算法（两趟式部分已标注"历史"）。
 
 ## 目录
 
@@ -180,11 +186,11 @@ struct MatmulSpec {
 > **状态（P-C2-7，2026-09-23 起）**：本章"两趟式注意力（Forward）"描述的多 kernel
 > 路径**已删除**——现行 forward 为**单 fold kernel 分块流式求值**（`FoldSpec`：
 > QKᵀ/掩码/online softmax/ΣwV 在同一 kernel 内逐 `EXPR_FOLD_BLOCK=128` 块完成，
-> S 矩阵绝不物化；`causal_skip` 把被屏蔽块钳成空转）。backward 仍是 S7 的 R/X
+> S 矩阵绝不物化；`tri_skip` 把被屏蔽块钳成空转）。backward 仍是 S7 的 R/X
 > 结构（`recompute_W_`：掩码 matmul → softmax 归约表达式，m/l 不再外溢缓存）。
 > 掩码经 `fold_mask_variant_()` 虚钩子选 5 变体（Plain/Causal/Alibi/Doc/AlibiDoc），
 > 引擎只认结构、绝不认算法名。现行实现见 `compute_layer_attention.hpp` 头注释
-> 与 `expr_fold.hpp`；下文两趟式 forward 与旧原语调用保留作历史设计分析，
+> 及其内的 `make_fold_attn_o` 构造（通用 fold 样例仍在 `expr_fold.hpp`）；下文两趟式 forward 与旧原语调用保留作历史设计分析，
 > 稀疏交叉熵部分现状不变。
 
 ### 两趟式注意力（Forward）【历史：已由单 fold kernel 取代】
@@ -316,7 +322,7 @@ IR-C 一起**于 2026-09-19 删除**（见 §表达式录制与融合边界（�
 6. **PS 删大文件段行号易漂移**、`-replace` 多行静默失败——先 read 再 edit，删前 `git diff` 核对。
 7. `dispatch_compute` 误删后从调用点重建。
 8. **IR 扩展**：MatmulSpec.batch（不进 key，dispatch z）、Row/Col/Batch 操作数(6/7/8)、RowGather(9)/BatchMod(10)/BatchCol(11)；注意力 forward 现为单 fold kernel（`FoldSpec`，5 掩码变体经 `fold_mask_variant_`），bwd=R/X 表达式+3 个 `batched_matmul`（m/l/W 表达式+bm(W,V_t) 的 S7 forward 结构已删）；CE 稠密 `denom=col_sum(exp(logits-cb(col_max)))`，稀疏 grad/loss_vec 用 Row+RowGather。
-9. **CpuEmitter 产物从不编译**（gen_fused 硬编码 glsl），缺陷全隐性（见多精度文档 §11）。
+9. ~~CpuEmitter 产物从不编译~~（`cpu_emitter.hpp` 已删除，现仅 `GlslEmitter` 登记；该缺陷随文件消失）。
 
 ---
 
@@ -332,7 +338,7 @@ IR-C 一起**于 2026-09-19 删除**（见 §表达式录制与融合边界（�
 | M4 ✅ | 三个 matmul 融合原语（bmm_reduce/bmm_denom/bmm_apply，CPU+GPU，可选掩码） | `matmul_fusion_test`（CPU err=0 / GPU err≤1.9e-6） |
 | M5 ✅ | CrossEntropyLoss 稀疏融合（不物化全 softmax） | `ce_fusion_test`（CPU err=0 / GPU err≤4.8e-7） |
 | M6 ✅ | Attention 两趟式（forward + 反向重算 W，不物化 `(BH·seq, seq)`） | `matmul_fusion_test` 扩展（8 用例）+ gradcheck + 训练 |
-| M7 ✅ | 文档与 `DEVELOPMENT_STANDARDS.md` 补"原语可专、不叫算法名"约定 | 全套测试 |
+| M7 ✅ | 文档与 `10-development-standards.md` 补"原语可专、不叫算法名"约定 | 全套测试 |
 
 ### 一期关键实施细节与坑
 

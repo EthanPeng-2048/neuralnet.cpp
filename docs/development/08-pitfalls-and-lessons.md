@@ -355,7 +355,7 @@ GPU-resident 单算子对、链式错；attn batch=1 对、batch=2 错；gradche
 
 ### 修改 GPU 相关
 - [ ] batch 模式：录制期引用的张量存活到 end_batch 之后
-- [ ] TDR：DEVICE_LOST 保存 checkpoint 退出，TIMEOUT 才减半 batch 重试
+- [ ] TDR：DEVICE_LOST 保存 checkpoint 退出；TIMEOUT 的"减半 batch 重试"**尚未实现**（无任何 CLI 配置，勿声称支持），需要时按此方向补
 - [ ] 影子一致性：CPU 写后 invalidate，`const span()` 自动同步
 - [ ] 内存预算：矩阵尺寸 × 4B × 张量个数，超 staging 走分块
 
@@ -384,5 +384,5 @@ GPU-resident 单算子对、链式错；attn batch=1 对、batch=2 错；gradche
 
 - `10-development-standards.md`（同目录）— 分层职责规范（"每层只能负责每层的事"）
 - `../introduction/01-architecture.md` — 架构分层
-- `07-zipt-algorithm.md` — 当前 06 号文档（原 `06-cuda-backend.md` 已随 CUDA 移除不复存在）
-- `../usage/04-train-package.md` — 训练包格式（原 07 号位置）
+- `06-rapt-algorithm.md` / `07-zipt-algorithm.md` — 两个算法层的设计与工程约束
+- `../usage/04-train-package.md` — 训练包格式

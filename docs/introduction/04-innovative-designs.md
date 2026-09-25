@@ -144,7 +144,7 @@ RoPE 的 `RowMod/RotateHalf` 参数如果以**结构常量**折进 key，每个 
 
 `FoldSpec` 把 `QKᵀ → 掩码 → online softmax → ΣwV` 全部放进**一个 kernel**：按
 `EXPR_FOLD_BLOCK=128` 逐块推进——行标量态（m/l）跨块进位、行向量态（O）经 `vecacc`
-块内 rescale + 累加、`causal_skip` 把被屏蔽块整块钳成空转（跳过项恰为 -inf/0 恒等项，
+块内 rescale + 累加、`tri_skip`（原名 `causal_skip`）把被屏蔽块整块钳成空转（跳过项恰为 -inf/0 恒等项，
 与全量计算逐位一致）。**S 矩阵从不存在**，`m/l/O` 均不外溢显存（O 在寄存器/shared
 分片内）。掩码 5 变体（Plain/Causal/Alibi/Doc/AlibiDoc）在 fold body 内以 select
 链表达，由 `fold_mask_variant_()` 虚钩子选择——引擎只认 `FoldSpec` 结构、不认算法名。
@@ -242,8 +242,8 @@ canonicalize 不改变 views/inputs 的顺序与内容，只优化 instrs/consts
 `BLOCK_SIZE=64`（64×64×4B=16KB 装入 L1），B 块预取转置，b_block 栈分配零堆分配。
 
 ### 8.4 算子融合（原语级）
-- `axpy_inplace`：`clone+scale+add` 三步并一步。
-- `elementwise_select_scalar_cond`：条件选择融合（ReLU backward）。
+- 单算子级融合原语（`axpy_inplace` = `clone+scale+add` 三步并一步、`elementwise_select_scalar_cond` = 条件选择）——**现均为接口保留、无生产调用方**，这类融合已升级为下一条的表达式级融合。
+- **表达式级融合（当前主力）**：`dsl::compute` 把整条链折叠为单个 kernel（见 §3）。
 - 多头注意力**批量化**：fold 单 kernel 按 `batch*H` 网格一次 dispatch 处理所有样本与头（历史：`rearrange_3d → 单次 batched_matmul → 转回` 把 H 次融为 1 次，该结构现仅存于 backward）。
 - 因果掩码物化缓存**已随 fold 迁移删除**（掩码在 fold body 内以 select 链表达、绝不物化）；位置编码缓存保留：相同 `(batch,seq)` 只构造一次。
 
