@@ -597,6 +597,7 @@ public:
         // 1. 输出投影反向 → grad_concat: (H*d_k, batch*seq)
         auto gc = w_o_.backward(engine, grad_output);
         if (!gc) return gc;
+        nn_dbg_scan("attn.gc", engine, *gc);
 
         // 2. rearrange grad_concat → (batch*H*d_k, seq)
         Tensor grad_concat_re;
@@ -619,6 +620,7 @@ public:
             auto grad_A = engine.batched_matmul(
                 grad_concat_re, V_cache_, BH, true, false, Scalar{1}, p_.compute);
             if (!grad_A) return std::unexpected(grad_A.error());
+            nn_dbg_scan("attn.grad_A", engine, *grad_A);
             // G = grad_concat_re^T 按 batch 转置 → (BH*seq, d_k)，
             // 供 grad_V[j][k] = Σ_i W·G[i][k]（同 V 的布局转换）
             auto G_T_full = engine.transpose(grad_concat_re);
@@ -631,6 +633,7 @@ public:
             //   FLOPs ×1.5-2（QK^T 重算），训练可接受。
             auto W_re = recompute_W_(engine, Q_cache_, K_cache_, BH, seq);
             if (!W_re) return std::unexpected(W_re.error());
+            nn_dbg_scan("attn.W_re", engine, *W_re);
             //   R  = row_sum(W·P)                     → (BH*seq, 1)
             //   X  = scale·W·(P − R)                  → (BH*seq, seq)（物化）
             //   grad_Q = K × X^T；grad_K = Q × X；grad_V = W^T × G
@@ -638,20 +641,24 @@ public:
                 dsl::row_reduce_sum(dsl::leaf(*W_re) * dsl::leaf(*grad_A)),
                 BH * seq, seq);
             if (!R) return std::unexpected(R.error());
+            nn_dbg_scan("attn.R", engine, *R);
             auto X = dsl::compute(engine,
                 dsl::leaf(*W_re)
                     * (dsl::leaf(*grad_A) - dsl::row_broadcast(*R)),
                 BH * seq, seq, p_.compute);
             if (!X) return std::unexpected(X.error());
+            nn_dbg_scan("attn.X", engine, *X);
             // grad_Q = K × X^T（K_b (d_k,seq)，X_b (seq,seq) 按 X^T 使用）
             auto gq = engine.batched_matmul(K_cache_, *X, BH, false, true, Scalar{1}, p_.compute);
             if (!gq) return std::unexpected(gq.error());
+            nn_dbg_scan("attn.gq(pre-scale)", engine, *gq);
             // grad_Q 补乘 scale（forward 把 scale 折进了 Q）：用就地原语（同 forward
             // 的说明——DSL 表达式要多分配一整块缓冲，实测更慢）
             { auto gqs = engine.scale_inplace(*gq, scale_); if (!gqs) return std::unexpected(gqs.error()); }
             // grad_K = Q × X
             auto gk = engine.batched_matmul(Q_cache_, *X, BH, false, false, Scalar{1}, p_.compute);
             if (!gk) return std::unexpected(gk.error());
+            nn_dbg_scan("attn.gk", engine, *gk);
             // grad_V = W^T × G（W_b (seq,seq) 按 W^T 使用，G_b (seq,d_k)）→ (BH*seq, d_k)
             auto gv_t = engine.batched_matmul(*W_re, *G, BH, true, false, Scalar{1}, p_.compute);
             if (!gv_t) return std::unexpected(gv_t.error());
@@ -660,6 +667,7 @@ public:
             if (!gv_T) return std::unexpected(gv_T.error());
             auto gv_re = engine.rearrange_3d(*gv_T, d_k_, BH, seq, false);
             if (!gv_re) return std::unexpected(gv_re.error());
+            nn_dbg_scan("attn.gv_re", engine, *gv_re);
             grad_Q_re = std::move(*gq);
             grad_K_re = std::move(*gk);
             grad_V_re = std::move(*gv_re);
@@ -701,10 +709,13 @@ public:
         // 9. 投影层反向 + 累加输入梯度
         auto giq = w_q_.backward(engine, grad_Q);
         if (!giq) return giq;
+        nn_dbg_scan("attn.giq", engine, *giq);
         auto gik = w_k_.backward(engine, grad_K);
         if (!gik) return gik;
+        nn_dbg_scan("attn.gik", engine, *gik);
         auto giv = w_v_.backward(engine, grad_V);
         if (!giv) return giv;
+        nn_dbg_scan("attn.giv", engine, *giv);
 
         // grad_input = grad_Q + grad_K + grad_V：三路累加**原地**融合为单趟
         // （目标传递，不额外分配；取代 clone + 两次 add_inplace）。加法结合

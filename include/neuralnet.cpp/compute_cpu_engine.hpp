@@ -582,6 +582,26 @@ public:
         if (A.is_gpu() || B.is_gpu())
             return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
 
+        // ── 精度与存储不匹配时不可直读（cpu_matrix<P> 对错位存储返回空 → UB；
+        //    实测 CPU f16 训练 step0 即 NaN）→ 先统一到 f32 空间计算，输出按 P
+        //    舍入（§7.2 f32 参考语义）。两端同 f16 才走下方原生 f16 GEMM。
+        {
+            const bool a16 = A.precision() == Precision::F16;
+            const bool b16 = B.precision() == Precision::F16;
+            if ((P == Precision::F32 && (a16 || b16)) ||
+                (P == Precision::F16 && !(a16 && b16)))
+            {
+                auto a32 = a16 ? cast(A, Precision::F32) : Result<Tensor>{A};
+                if (!a32) return std::unexpected(a32.error());
+                auto b32 = b16 ? cast(B, Precision::F32) : Result<Tensor>{B};
+                if (!b32) return std::unexpected(b32.error());
+                auto r = matmul(*a32, *b32, transA, transB, Precision::F32);
+                if (!r) return std::unexpected(r.error());
+                if (P == Precision::F32) return r;
+                return cast(*r, Precision::F16);
+            }
+        }
+
         // ── F32 路径（现状，零改动）─────────────────────────────────────
         if (P == Precision::F32)
         {
@@ -686,6 +706,25 @@ public:
             return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
         if (batch == 0)
             return std::unexpected(Error{"batched_matmul: batch must be > 0"});
+
+        // ── 精度与存储不匹配：统一到 f32 空间计算 + 按 P 舍入（同 matmul）──
+        {
+            const bool a16 = A.precision() == Precision::F16;
+            const bool b16 = B.precision() == Precision::F16;
+            if ((P == Precision::F32 && (a16 || b16)) ||
+                (P == Precision::F16 && !(a16 && b16)))
+            {
+                auto a32 = a16 ? cast(A, Precision::F32) : Result<Tensor>{A};
+                if (!a32) return std::unexpected(a32.error());
+                auto b32 = b16 ? cast(B, Precision::F32) : Result<Tensor>{B};
+                if (!b32) return std::unexpected(b32.error());
+                auto r = batched_matmul(*a32, *b32, batch, transA, transB, alpha,
+                                        Precision::F32);
+                if (!r) return std::unexpected(r.error());
+                if (P == Precision::F32) return r;
+                return cast(*r, Precision::F16);
+            }
+        }
 
         // ── F16 路径（Phase 1：逐 batch 调用单 matmul，正确性优先）───────
         if (P == Precision::F16)
@@ -1885,6 +1924,11 @@ public:
             const Tensor& t = inputs[k];
             if (!t.is_cpu())
                 return std::unexpected(Error{"eval_expr: input not CPU"});
+            // CPU 解释器按 f32 存储读取 span：f16 输入直读 = 空指针 UB（曾是
+            // CPU f16 训练 NaN/AV 家族成员）→ 响亮报错，让误用立刻暴露。
+            if (t.precision() != Precision::F32)
+                return std::unexpected(Error{
+                    "eval_expr: CPU 解释器仅支持 f32 输入（f16 须经 PrecisionEngine 边界 cast）"});
             const ExprView& v = spec.views[k];
             if (mm && (k == static_cast<std::size_t>(mm->a_input) ||
                        k == static_cast<std::size_t>(mm->b_input)))
@@ -1958,6 +2002,9 @@ public:
 
         // 输出 span 由调用方预分配；n 恒为**网格**元素数（vector_out 时输出
         // span 更小，而下述归约重放循环仍按网格遍历）。
+        if (output.precision() != Precision::F32)
+            return std::unexpected(Error{
+                "eval_expr: CPU 解释器输出须为 f32 存储（f16 输出须经 PrecisionEngine 落回）"});
         Span out = output.cpu_matrix().span();
         const std::size_t n = rows * cols;
         if (n == 0)
