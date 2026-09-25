@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -17,6 +18,30 @@
 
 namespace nn
 {
+
+// ── NN_F16_DEBUG：中间量扫描（CPU f16 发散定位诊断；未设环境变量时零开销）──
+inline void nn_dbg_scan(const char* tag, ComputeEngine& eng, const Tensor& t)
+{
+    static const bool on = nn::dsl::env_flag("NN_F16_DEBUG");
+    if (!on) return;
+    auto m = eng.to_matrix(t, Precision::F32);
+    if (!m)
+    {
+        std::fprintf(stderr, "[bwd][%s] to_matrix fail: %s\n", tag,
+                     m.error().message.c_str());
+        return;
+    }
+    double mx = 0.0;
+    bool bad = false;
+    for (auto v : m->span())
+    {
+        if (!std::isfinite(v)) bad = true;
+        else mx = std::max(mx, std::fabs(static_cast<double>(v)));
+    }
+    std::fprintf(stderr, "[bwd][%s] %s max=%.6g%s\n", tag, t.shape_str().c_str(),
+                 mx, bad ? "  <<< NONFINITE" : "");
+    std::fflush(stderr);
+}
 
 // ══════════════════════════════════════════════════════════════════════════
 // Layer — 引擎化计算层基类

@@ -39,6 +39,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -49,6 +50,7 @@
 #include <vector>
 
 #include "compute_engine.hpp"
+#include "expr_dsl.hpp"     // dsl::env_flag（NN_F16_DEBUG 诊断开关）
 #include "expr_opt.hpp"   // canonicalize_expr_spec（与 gen_fused 同源 key）
 
 namespace nn
@@ -608,10 +610,34 @@ public:
     // 梯度累加：dst += src（dst 存储精度不可变，§8.3）
     [[nodiscard]] Result<void> accumulate(Tensor& dst, const Tensor& src) override
     {
-        return inplace2_(dst, src, [this](Tensor& d, const Tensor& s)
+        const bool dbg = nn::dsl::env_flag("NN_F16_DEBUG");
+        const auto mx = [this](const Tensor& t)
+        {
+            auto m = to_matrix(t, Precision::F32);
+            if (!m) return -1.0;
+            double x = 0.0;
+            for (auto v : m->span())
+            {
+                if (!std::isfinite(v)) return -2.0;
+                x = std::max(x, std::fabs(static_cast<double>(v)));
+            }
+            return x;
+        };
+        const double pre_d = dbg ? mx(dst) : 0.0;
+        const double pre_s = dbg ? mx(src) : 0.0;
+        auto r = inplace2_(dst, src, [this](Tensor& d, const Tensor& s)
         {
             return inner_.add_inplace(d, s);
         });
+        if (dbg)
+        {
+            const double post_d = mx(dst);
+            if (pre_d > 10.0 || pre_s > 10.0 || post_d > 10.0)
+                std::fprintf(stderr,
+                             "[dbg][accumulate] %s pre_dst=%.6g pre_src=%.6g post_dst=%.6g\n",
+                             dst.shape_str().c_str(), pre_d, pre_s, post_d);
+        }
+        return r;
     }
 
     [[nodiscard]] Result<void> add_inplace(Tensor& A, const Tensor& B) override

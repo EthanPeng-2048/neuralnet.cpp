@@ -11,6 +11,7 @@
 // f32 路径则做逐字节比对（回归护栏）。
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <string>
 #include <vector>
@@ -43,6 +44,21 @@ int g_failures = 0;
     } while (0)
 
 const char* g_label = "?";
+
+// 环境变量开关（MSVC 下 getenv 被标 deprecated/-Werror → 走 _dupenv_s）
+bool env_flag(const char* name)
+{
+#ifdef _MSC_VER
+    char* buf = nullptr;
+    std::size_t len = 0;
+    const bool on = (_dupenv_s(&buf, &len, name) == 0 && buf != nullptr && buf[0] != '\0');
+    std::free(buf);
+    return on;
+#else
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] != '\0';
+#endif
+}
 
 nn::Matrix make_rand(std::size_t rows, std::size_t cols, unsigned seed,
                      float lo = -1.0f, float hi = 1.0f)
@@ -492,6 +508,10 @@ TrainResult train_tiny_gpt(nn::ComputeEngine& eng, const nn::PrecisionProfile& p
             }
     };
 
+    // 固定初值后先扫一遍参数：确认 NaN 不是初始化引入的
+    if (verbose)
+        for (auto& p : model.parameters()) scan("init-param", p.get());
+
     for (int s = 0; s < steps; ++s)
     {
         g_step = s;
@@ -512,7 +532,6 @@ TrainResult train_tiny_gpt(nn::ComputeEngine& eng, const nn::PrecisionProfile& p
         if (auto r = opt->step(); !r) { CHECK(false, "optimizer.step"); return out; }
         if (s == 0) out.first = *loss;
         out.last = *loss;
-        out.losses.push_back(*loss);
         out.losses.push_back(*loss);
         if (verbose)
         {
@@ -561,21 +580,24 @@ void test_f16_model_e2e(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
         CHECK(r32.losses.back() <= r32.losses.front(), "profile_f32（原生引擎）loss 不增");
 
     // profile_f16：param + compute f16（CLI --f16 语义）
-    const auto r16 = train_tiny_gpt(eng, nn::profile_f16(), STEPS, LR, false);
+    // NN_F16_DEBUG=1 → 逐 step loss + 逐阶段非有限值扫描（定位 CPU f16 发散用）
+    const bool dbg = env_flag("NN_F16_DEBUG");
+    const auto r16 = train_tiny_gpt(eng, nn::profile_f16(), STEPS, LR, dbg);
     CHECK(r16.ok, "profile_f16 训练完成");
     if (!r16.ok) return;
 
     if (!std::isfinite(r16.losses.back()))
     {
-        // ── 已知问题（未定位，2026-09）：CPU 侧 f16 全模型训练发散 ──────────
-        // 现象：同初值/同超参下 CPU 上 5~7 步后 loss NaN（GPU 稳定收敛），
-        // f32 对照组两种设备都收敛；中间配方（仅 param f16 / 仅 compute f16）
-        // 在 CPU 上同样 NaN → 与优化器状态精度无关，指向 CPU 侧 f16 存储/求值
-        // 路径（详见 docs/development/05-mixed-precision.md §12.5）。
-        // GPU（本功能的实际目标）不受影响；此处不判失败但明确打印。
-        std::fprintf(stderr, "    [%s] [已知问题] f16 训练出现 NaN（GPU 正常，CPU 待定位）"
+        // 历史"已知问题"（CPU 侧 f16 训练发散）已修复并转为**硬失败**：
+        //   根因1 = DSL 预绑定把 f16 操作数喂给 f32 GEMM（cpu_matrix<F32>()
+        //   拿到空指针）；根因2 = float_to_half_bits 次正规分支 exp<=-46 的
+        //   移位 UB（|v| ∈ [2.8e-14, 1.2e-10] 的梯度被写成垃圾 half）。
+        //   详见 docs/development/05-mixed-precision.md §12.12。
+        std::fprintf(stderr, "  FAIL %s: f16 训练出现非有限 loss（回归！）"
                              " 轨迹: %.4f → %.4f\n",
-                     g_label, r32.ok ? r32.losses.front() : 0.0f, r16.losses.back());
+                     g_label, r16.losses.empty() ? 0.0 : r16.losses.front(),
+                     r16.losses.back());
+        ++g_failures;
         return;
     }
 
@@ -633,6 +655,34 @@ void test_f16_model_e2e(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
     }
 }
 
+// ── 8. NN_F16_DEBUG：profile 单字段矩阵诊断（CPU f16 发散定位用）────────
+// 逐字段拆开跑同一个小 GPT：哪个字段单独开就 NaN，根因就在该字段触达的路径。
+void debug_profile_matrix(nn::ComputeEngine& eng)
+{
+    using P = nn::Precision;
+    struct Case { const char* name; nn::PrecisionProfile prof; };
+    const Case cases[] = {
+        {"f32",       nn::profile_f32()},
+        {"param=f16", {P::F16, P::F32, P::F32, P::F32}},
+        {"compute=f16", {P::F32, P::F16, P::F32, P::F32}},
+        {"stable=f16", {P::F32, P::F32, P::F16, P::F32}},
+        {"opt=f16",   {P::F32, P::F32, P::F32, P::F16}},
+        {"f16(CLI)",  nn::profile_f16()},
+    };
+    const char* saved = g_label;
+    for (const auto& c : cases)
+    {
+        g_label = c.name;
+        const auto r = train_tiny_gpt(eng, c.prof, 20, 3e-3f, /*verbose=*/true);
+        std::printf("  [dbg %-11s] ok=%d traj:", c.name, r.ok ? 1 : 0);
+        for (std::size_t i = 0; i < r.losses.size(); ++i)
+            std::printf(" %.4f", r.losses[i]);
+        std::printf("\n");
+        std::fflush(stdout);
+    }
+    g_label = saved;
+}
+
 void run_suite(const char* label, nn::ComputeEngine& raw, nn::ComputeEngine& adapter,
                bool allow_arbitrary_expr)
 {
@@ -667,6 +717,11 @@ int main()
         nn::CpuEngine cpu;
         nn::PrecisionEngine adapter(cpu);
         run_suite("cpu", cpu, adapter, /*allow_arbitrary_expr=*/true);
+        if (env_flag("NN_F16_DEBUG"))
+        {
+            std::printf("── NN_F16_DEBUG: CPU profile 单字段矩阵 ──\n");
+            debug_profile_matrix(adapter);
+        }
     }
 
 #ifdef NN_HAS_VULKAN

@@ -129,6 +129,10 @@ list(APPEND NN_APP_TARGETS layer_bench)
 nn_add_executable(mem_probe src/mem_probe.cpp)
 list(APPEND NN_APP_TARGETS mem_probe)
 
+# ── CPU f16 组件级诊断探针（A-I 阶段定位发散；NN_F16_DEBUG=1 开逐中间量扫描）──
+nn_add_executable(f16_cpu_probe src/f16_cpu_probe.cpp)
+list(APPEND NN_APP_TARGETS f16_cpu_probe)
+
 # ── 测试 / 验证目标（默认关闭，NN_ENABLE_TESTS=ON 时构建）─────────────
 if(NN_ENABLE_TESTS)
 
