@@ -60,14 +60,17 @@ endif()
 # Release: -O3 -funroll-loops -march=native（最大性能）
 # Debug:   -O0 -g（调试优先）
 # 注意：不使用 -ffast-math，因为它会禁用 NaN/Infinity 支持，影响训练稳定性
-# MSVC 用 /O2 /fp:fast（近似 -O3 + 宽松浮点）；Clang/GCC 用 -O3 + 向量化。
+# MSVC 对应 /fp:fast 同样禁用 NaN 语义（实测：precision_type_test 的
+# "NaN != NaN" / "NaN 比较均为 false" 断言在 /fp:fast 下被编译器折叠为
+# false → 假失败；/fp:precise 下全绿）→ 按同一铁律用 /fp:precise。
+# Clang/GCC 用 -O3 + 向量化（自带 -fno-math-errno/-fno-trapping-math）。
 #
 # -march=native 会让二进制只能在编译机同代 CPU 上运行，分发/换机可能 SIGILL。
 # 默认开启（本地追求最大性能）；发布/CI 构建请用 -DNN_ENABLE_NATIVE=OFF 生成
 # 通用可移植基线（见 .github/workflows 的 Configure 步骤）。
 option(NN_ENABLE_NATIVE "Enable -march=native (max perf, non-portable binary)" ON)
 if(MSVC)
-    set(RELEASE_FLAGS /O2 /fp:fast)
+    set(RELEASE_FLAGS /O2 /fp:precise)
     set(DEBUG_FLAGS /Od /Zi)
 else()
     if(NN_ENABLE_NATIVE)
@@ -133,6 +136,10 @@ list(APPEND NN_APP_TARGETS mem_probe)
 nn_add_executable(f16_cpu_probe src/f16_cpu_probe.cpp)
 list(APPEND NN_APP_TARGETS f16_cpu_probe)
 
+# ── GPU f16 参数写回探针（issue #13 P0-②：MSVC 下权重冻结定位）──────────────
+nn_add_executable(f16_writeback_probe src/f16_writeback_probe.cpp)
+list(APPEND NN_APP_TARGETS f16_writeback_probe)
+
 # ── 测试 / 验证目标（默认关闭，NN_ENABLE_TESTS=ON 时构建）─────────────
 if(NN_ENABLE_TESTS)
 
@@ -144,6 +151,11 @@ if(NN_ENABLE_TESTS)
     # ── GPU 集成测试（需要 Vulkan）────────────────────────────────────────
     nn_add_executable(gpu_test src/gpu_test.cpp)
     list(APPEND NN_TEST_TARGETS gpu_test)
+
+    # ── GPU f16 参数写回回归（issue #13 P0-②：MSVC 下权重冻结）───────────
+    # 复用 app 目标 f16_writeback_probe（已在 NN_APP_TARGETS 构建）：
+    # 断言 in-place f16 写回值正确 + 8 步 Adam 后参数必须移动（防"静默冻结"）
+    list(APPEND NN_TEST_TARGETS f16_writeback_probe)
 
     # ── GPU f16 能力检查 + cast/matmul 验证 ──────────────────────────────
     nn_add_executable(gpu_f16_test src/gpu_f16_test.cpp)

@@ -6,15 +6,16 @@
 //  对应文档 `docs/development/03-ir-optimization.md` IR-D：把后端代码生成从 GLSL 专用
 //  抽象为 emitter 接口，实现"一份 canonical IR → 多后端代码"：
 //
-//      IR (canonical ExprSpec) → GlslEmitter / CudaEmitter / …
+//      IR (canonical ExprSpec) → GlslEmitter（当前唯一注册后端）
 //
 //  设计：
 //    - ExprEmitter 是纯接口：给定 name + canonical ExprSpec，产出目标后端
 //      源码字符串（失败返回空串，语义与 glsl_gen 的约定一致）。
 //    - 现有 generate_glsl / generate_glsl_reduce 成为 GlslEmitter 的实现
-//      （见 glsl_gen.hpp），gen_fused 等消费方经接口调用，不再与 GLSL 绑定。
-//    - 具体 emitter 类在各自头文件（glsl_gen.hpp / cpu_emitter.hpp）提供，
+//      （见 expr_glsl_gen.hpp），gen_fused 等消费方经接口调用，不再与 GLSL 绑定。
+//    - 具体 emitter 类在各自头文件（expr_glsl_gen.hpp）提供，
 //      本头只定义接口 + 注册表（按后端名选择 emitter 工厂）。
+//      （历史上的 CpuEmitter / CudaEmitter 均已随各自后端删除。）
 //  注意：本头供构建期生成器/工具使用，运行时无需包含（与 glsl_gen 一致）。
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -40,7 +41,7 @@ class ExprEmitter
 public:
     virtual ~ExprEmitter() = default;
 
-    // 后端名（"glsl" / "cpu" / ...），供注册表/日志识别
+    // 后端名（如 "glsl"），供注册表/日志识别
     [[nodiscard]] virtual std::string_view name() const noexcept = 0;
 
     // 逐元素 kernel 源码；失败返回空串（调用方报错）

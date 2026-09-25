@@ -108,7 +108,8 @@ enum class ExprOperandKind : uint8_t
     //   Row   = 输出元素在 batch 内的行号（batched 网格 r % m_per；非 batched = r）
     //   Col   = 输出列号 c
     //   Batch = 批次下标（batched matmul 段网格的 batch 维；无 matmul 段 = 0）
-    // 用于 causal 掩码 select(Col > Row, -inf, 0)、ALiBi -slope*(Row-Col) 等。
+    // 用于上三角掩码 select(Col > Row, -inf, 0)、按 batch 取斜率的线性偏置
+    //   -slope*(Col-Row) 等位置相关的键域改写。
     Row   = 6,
     Col   = 7,
     Batch = 8,
@@ -288,7 +289,7 @@ struct VecAccSpec
 //     操作数按当前 d 读）→ 末指令 dst = 输出元素；输出网格 (rows, out_cols)。
 // P-C1 兼容：vec_state_len=0（无 vecacc/matmul/VecState）时退化为单列标量
 //   fold，语义与行为逐字节不变。
-// key：结构字段全进（inits/两段指令/matmul 转置与槽位/vecacc/causal_skip）；
+// key：结构字段全进（inits/两段指令/matmul 转置与槽位/vecacc/tri_skip）；
 //   k、matmul 的 k/batch、vec_state_len 不进（形状参数 → 运行时 push
 //   constant；veclen 进 key 会让每个 dk 一个 shader，见 expr_spec_key 注释）。
 struct FoldSpec
@@ -302,12 +303,13 @@ struct FoldSpec
     std::uint32_t                vec_state_len = 0;  // 行向量态长度（0=无；输出列数）
     std::optional<MatmulSpec>    matmul;   // 键域内层收缩段（块局部，N=k 全轴）
     std::optional<VecAccSpec>    vecacc;   // 行向量态块更新
-    // causal 整块跳过（仅 make_fold_attn_o 非 Plain 置位；进 key——结构/
-    //   codegen 分歧点）：生成器把块内 valid 钳到
-    //   min(BLOCK, fold_k-k0, qt+1-k0)，k0>qt 的整块空转。被跳过的 j 恰为
-    //   链内 select 屏蔽项（-inf/0）→ max 加 -inf、sum 加 0、w=0 时 +0·V=+0
-    //   均为恒等 → 与全量计算逐位一致。CPU 不钳（全量算，等价性同上）。
-    bool                            causal_skip = false;
+    // 行界整块跳过 / tri_skip（上三角类掩码的 codegen 恒等优化；仅注意力
+    //   fold 构造非 Plain 置位；进 key——结构/codegen 分歧点）：生成器把块内
+    //   valid 钳到 min(BLOCK, fold_k-k0, qt+1-k0)，qt = row%m_per（行在
+    //   batched 网格内的位置），k0>qt 的整块空转。被跳过的 j 恰为链内 select
+    //   屏蔽项（-inf/0）→ max 加 -inf、sum 加 0、w=0 时 +0·V=+0 均为恒等
+    //   → 与全量计算逐位一致。CPU 不钳（全量算，等价性同上）。
+    bool                            tri_skip = false;
 
     friend bool operator==(const FoldSpec&, const FoldSpec&) = default;
 };
@@ -647,8 +649,8 @@ struct ExprSpec
             feed(&s.fold->vecacc->scale_reg, 1);
             feed(&s.fold->vecacc->has_scale, 1);
         }
-        // causal 跳块：codegen 分歧点 → 结构进 key（同 vecacc 槽位先例）
-        feed(&s.fold->causal_skip, 1);
+        // tri_skip 跳块：codegen 分歧点 → 结构进 key（同 vecacc 槽位先例）
+        feed(&s.fold->tri_skip, 1);
     }
 
     char buf[17];
@@ -728,7 +730,7 @@ inline constexpr std::size_t FOLD_MAX_FINALIZE = 16;
 inline constexpr std::size_t FOLD_MAX_STATE   = 8;
 inline constexpr std::size_t FOLD_MAX_VEC     = 1024;  // 行向量态长度上限（=输出列数）
 inline constexpr std::uint32_t FOLD_MAX_MMK   = 1024;  // fold mm 段内层 k 上限
-    // （Q 行预载 shared Qsh[1024] 的编译期尺寸——d_k 超限在 validate 静态拒）
+    // （A 操作数行预载 shared Ash[1024] 的编译期尺寸——d_k 超限在 validate 静态拒）
 // fold 块大小：CPU 执行器与 GPU 生成器**共用**的常量（不进 key——分块是
 // 实现细节，但两侧必须同值以对齐分块边界与 max 类逐位；sum 类 GPU subgroup
 // 蝶形结合序异于 CPU 串行 → 对拍仍走小容差（1e-4~1e-6），并非全逐位）。
@@ -736,11 +738,11 @@ inline constexpr std::uint32_t FOLD_MAX_MMK   = 1024;  // fold mm 段内层 k �
 // （协议再减半 + 链/归约活跃线程翻倍（tid<BLOCK）；shared 6.75→~8.9KB、驻留
 // 8→7 WG 的占用代价被收益盖过——mha fwd 5.77→5.41，18/18 绿）
 inline constexpr std::uint32_t EXPR_FOLD_BLOCK = 128;
-// fold v2 每 WG 行数（NR）：把"按 WG 数计费"的固定成本（Qsh 预载、入退场、
+// fold v2 每 WG 行数（NR）：把"按 WG 数计费"的固定成本（Ash 预载、入退场、
 //   调度人头）摊到 NR 行——四形状拟合实测该类占 fold ~54%（γ·rows）。
 //   生成器行循环与后端 dispatch ceil(rows/NR) **同源共用**；结构常量不进
 //   key（两侧同值即可，shader 同 key 重生成，闭合世界无感）。行序外层循环
-//   复用全部 shared（零增长 → 占用不掉档，Qsh-shrink 探针已证 shared 非
+//   复用全部 shared（零增长 → 占用不掉档，Ash-shrink 探针已证 shared 非
 //   约束）；越界行 clamp 到末行重复算、写回由 row_ok 统一挡（末 WG 尾部
 //   padding；ri 循环全 WG 均匀 → 体内屏障无发散）。
 inline constexpr std::uint32_t EXPR_FOLD_ROWS_PER_WG = 2;
@@ -823,13 +825,13 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
                 return std::unexpected(Error{"validate_expr_spec: fold matmul batch must be > 0"});
             if (f.matmul->k > FOLD_MAX_MMK)
                 return std::unexpected(Error{
-                    "validate_expr_spec: fold matmul k exceeds Qsh shared preload cap (1024)"});
+                    "validate_expr_spec: fold matmul k exceeds shared preload cap (1024)"});
         }
-        // causal_skip 的 Row/m_per 网格语义取自 mm.batch——无 mm 段时生成器
+        // tri_skip 的 Row/m_per 网格语义取自 mm.batch——无 mm 段时生成器
         //   会引用未声明的 m_per（glslc 报错但定位差），此处静态拒绝
-        if (f.causal_skip && !f.matmul)
+        if (f.tri_skip && !f.matmul)
             return std::unexpected(Error{
-                "validate_expr_spec: fold causal_skip requires fold matmul segment"});
+                "validate_expr_spec: fold tri_skip requires fold matmul segment"});
         if (f.vecacc)
         {
             const VecAccSpec& va = *f.vecacc;

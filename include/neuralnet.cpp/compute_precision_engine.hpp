@@ -898,14 +898,27 @@ public:
     {
         trace_variant_(spec, inputs, out.precision());
         if (out.precision() == Precision::F32 && all_f32(inputs))
+        {
+            if (prec_trace_enabled_())
+                std::fprintf(stderr, "[into] branch=native_f32\n");
             return inner_.eval_expr_into(spec, inputs, rows, cols, out);
+        }
         // in-kernel f16 优先：目标传递 + 带类型变体 = 直接读写原存储，零临时量
         if (inner_.supports_expr_precision_variant(spec, inputs, out.precision()))
+        {
+            if (prec_trace_enabled_())
+                std::fprintf(stderr, "[into] branch=native_variant out_p=%d\n",
+                             static_cast<int>(out.precision()));
             return inner_.eval_expr_into(spec, inputs, rows, cols, out);
+        }
         // 目标可能是 f16：在 f32 空间求值后 cast_into 写回 out 的原存储
         // （out 常同时是输入之一——in32 里的 f32 拷贝即"读旧值"，语义正确）
         if (prec_trace_enabled_())
+        {
             trace_miss_(spec, inputs, out.precision());
+            std::fprintf(stderr, "[into] branch=cast_fallback out_p=%d\n",
+                         static_cast<int>(out.precision()));
+        }
         auto in32 = to_f32_all(inputs);
         if (!in32)
             return std::unexpected(in32.error());
