@@ -1,7 +1,8 @@
 // ───────────────────────────────────────────────────────────────────────────
 //  expr_fold_test.cpp — P-C1 分块状态归约（FoldSpec）CPU 语义对拍
 //
-//  覆盖（全部走共享构造 expr_fold.hpp —— 与 scan_exprs AOT 收集同源，
+//  覆盖（通用样例走共享构造 expr_fold.hpp、注意力样例走
+//  compute_layer_attention.hpp —— 均与 scan_exprs AOT 收集同源，
 //  保证 key/结构一致）：
 //    1. rowmax fold        vs 独立逐行 max 参考
 //    2. rowsum fold        vs 独立逐行 sum 参考
@@ -12,7 +13,7 @@
 //       参考；{2,133,4} 跨 EXPR_FOLD_BLOCK=128 → 多块流式 + causal 整块跳过
 //    6. validate 负例：状态吃元素源 / fold+顶层 instrs / fold+matmul /
 //       finalize 读输入 —— 四类违规必须被拒绝（静态拒而非静默错算）
-//    7. registry bin roundtrip：v8 causal_skip 写读对称（key 含该位 →
+//    7. registry bin roundtrip：v8 tri_skip 写读对称（key 含该位 →
 //       往返 key 全等即证未丢；丢失=静默退化全量算、其余测试仍会绿）
 //  纯 CPU；输出 (rows,1)（eval_expr 的 cols 参数 = 1 调用约定）。
 // ───────────────────────────────────────────────────────────────────────────
@@ -29,6 +30,7 @@
 #include <neuralnet.cpp/compute_tensor.hpp>
 #include <neuralnet.cpp/compute_cpu_engine.hpp>
 #include <neuralnet.cpp/expr_fold.hpp>
+#include <neuralnet.cpp/compute_layer_attention.hpp>   // 注意力 fold 构造（已从 expr_fold.hpp 归位到 Layer）
 
 using nn::Scalar;
 
@@ -426,14 +428,14 @@ int test_expr_fold()
         }
     }
 
-    // ── 7) bin 序列化 roundtrip（v8 causal_skip 写读对称）─────────────────
+    // ── 7) bin 序列化 roundtrip（v8 tri_skip 写读对称）─────────────────
     {
         const std::string tmp = "nn_expr_fold_roundtrip.tmp.bin";
         nn::fused::ExprRegistry reg;
         reg.add(nn::expr::make_fold_attn_o(
-            64, 4, 2, nn::expr::FoldAttnMask::Causal));   // causal_skip=true
+            64, 4, 2, nn::expr::FoldAttnMask::Causal));   // tri_skip=true
         reg.add(nn::expr::make_fold_attn_o(
-            64, 4, 2, nn::expr::FoldAttnMask::Plain));    // causal_skip=false
+            64, 4, 2, nn::expr::FoldAttnMask::Plain));    // tri_skip=false
         reg.add(nn::expr::make_fold_rowsum(64));
         const bool wok = nn::fused::write_registry(tmp, reg);
         nn::fused::ExprRegistry back;
@@ -443,7 +445,7 @@ int test_expr_fold()
               "registry roundtrip 写读成功 n=" + std::to_string(back.specs.size()));
         if (wok && rok && back.specs.size() == reg.specs.size())
         {
-            // key 含 causal_skip 位 → 往返 key 全等即证该位与整段结构未丢
+            // key 含 tri_skip 位 → 往返 key 全等即证该位与整段结构未丢
             bool keys_ok = true;
             bool saw_skip = false;
             for (std::size_t i = 0; i < reg.specs.size(); ++i)
@@ -451,11 +453,11 @@ int test_expr_fold()
                 if (nn::expr_spec_key(back.specs[i]) !=
                     nn::expr_spec_key(reg.specs[i]))
                     keys_ok = false;
-                if (back.specs[i].fold && back.specs[i].fold->causal_skip)
+                if (back.specs[i].fold && back.specs[i].fold->tri_skip)
                     saw_skip = true;
             }
-            check(keys_ok, "registry roundtrip key 全等（结构+causal_skip 未丢）");
-            check(saw_skip, "registry roundtrip causal_skip=true 读回仍 true");
+            check(keys_ok, "registry roundtrip key 全等（结构+tri_skip 未丢）");
+            check(saw_skip, "registry roundtrip tri_skip=true 读回仍 true");
         }
     }
 
