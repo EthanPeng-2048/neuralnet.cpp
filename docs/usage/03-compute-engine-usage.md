@@ -81,7 +81,7 @@ auto matrix = engine.to_matrix(*result);
 | 特性 | CPU 引擎 | GPU 引擎 |
 |------|----------|----------|
 | **设备** | CPU 内存 | GPU 显存 |
-| **并行性** | 多核 CPU | 数千 CUDA 核心 |
+| **并行性** | 多核 CPU | 数千 Vulkan 计算核心 |
 | **内存带宽** | ~50 GB/s | ~1 TB/s |
 | **延迟** | 低 | 高（PCIe 传输） |
 | **适用场景** | 小模型、调试 | 大模型、训练 |
@@ -214,7 +214,9 @@ engine.scale_inplace(*a, 0.1f);
 engine.axpy_inplace(*a, 0.01f, *grad);
 ```
 
-**优势**：比 `clone + scale + add` 更高效
+**优势**：比 `clone + scale + add` 更高效。**注**：项目内当前更推荐一条 DSL 表达式
+（`dsl::compute_into(engine, leaf(a) + leaf(b) * rparam(s), a)`）——optimizer 即此写法，
+`axpy_inplace` 目前无生产调用方（见 `development/12-compute-engine-inventory.md` §2.2）。
 
 ### 置零
 
@@ -276,6 +278,9 @@ engine.broadcast_col_inplace(*output, *scale, BinaryOp::Mul);
 ---
 
 ## 逐元素运算
+
+> 单步调试/小工具用下面的 eager 原语即可；**生产代码组合多个运算时优先写一条
+> `dsl::compute` 表达式**（见"表达式融合"）——一次 dispatch、无中间 Tensor。
 
 ### 一元运算
 
@@ -345,7 +350,9 @@ auto relu_grad = engine.elementwise_select_scalar_cond(
     CompareOp::Gt, *x, 0.0f, *grad, 0.0f);
 ```
 
-**典型用途**：ReLU 反向传播
+**典型用途**：ReLU 反向传播。
+**注**：ReLU 层实际写法是 DSL `dsl::select(leaf(x) > 0, leaf(g), 0)`（单表达式融合）；
+本原语当前无生产调用方，接口保留。
 
 ---
 
@@ -425,18 +432,19 @@ auto transposed = engine.transpose(*tensor);
 
 ## 表达式融合
 
+> **签名**：`nn::dsl::compute(engine, expr, rows, cols[, P])` —— `expr` 由 `dsl::leaf(tensor)`
+> 引用输入张量、`dsl::rparam(v)` 引用标量常量拼成普通数学表达式（没有 lambda + 输入列表的写法）。
+> CPU 编译期内联求值，GPU 折叠为 `ExprSpec` 匹配预编译融合 shader。
+
 ### 基本用法
 
 ```cpp
 #include <neuralnet.cpp/expr_dsl.hpp>
 
-// 使用表达式 DSL 融合多个操作
+// out = a + b * c  →  单个融合 kernel，中间量不落显存
 auto result = nn::dsl::compute(
     engine,
-    [](auto a, auto b, auto c) {
-        return a + b * c;  // 融合为单个 kernel
-    },
-    {tensor_a, tensor_b, tensor_c},
+    nn::dsl::leaf(tensor_a) + nn::dsl::leaf(tensor_b) * nn::dsl::leaf(tensor_c),
     rows, cols
 );
 ```
@@ -459,29 +467,20 @@ nn::dsl::compute_into(engine, nn::dsl::leaf(dst) + nn::dsl::leaf(other) * nn::ds
 #### GeLU 激活
 
 ```cpp
-auto gelu = nn::dsl::compute(
-    engine,
-    [](auto x) {
-        return 0.5f * x * (1.0f + nn::dsl::tanh(
-            0.7978845608f * (x + 0.044715f * x * x * x)));
-    },
-    {input},
-    rows, cols
-);
+using namespace nn::dsl;
+auto gelu = compute(engine,
+    leaf(input) / (Scalar{1} + exp(-(leaf(input) * 1.702f))),
+    rows, cols);
 ```
 
 #### RoPE 位置编码
 
 ```cpp
-auto rope = nn::dsl::compute(
-    engine,
-    [](auto q, auto cos, auto sin) {
-        auto q_rotated = q * cos + nn::dsl::rotate_half(q) * sin;
-        return q_rotated;
-    },
-    {q, cos_cache, sin_cache},
-    rows, cols
-);
+using namespace nn::dsl;
+// LLaMA half-swap：out = q·cos + rotate_half(q)·sin（dk = d_k，行表按 dk 交错）
+auto rope = compute(engine,
+    leaf(q) * row_mod(cos_cache, dk) + rotate_half(q, dk) * row_mod(sin_cache, dk),
+    rows, cols);
 ```
 
 ---
@@ -520,105 +519,57 @@ engine.end_batch();
 
 ## 实际示例
 
+> 以下对应层的**真实实现**见 `include/neuralnet.cpp/compute_layer_mlp.hpp`。
+
 ### 示例 1：线性层前向传播
 
 ```cpp
-class Linear {
-public:
-    Tensor forward(ComputeEngine& engine, const Tensor& input) {
-        // output = input × weight^T + bias
-        auto weight_t = engine.transpose(*weight_);
-        auto output = engine.matmul(input, *weight_t);
-        engine.broadcast_row_inplace(*output, *bias_, BinaryOp::Add);
-        return output;
-    }
-};
+// out = W × x + b —— matmul + 按行广播 bias 一条原语
+auto output = engine.matmul_with_bias(*weight_, input, *bias_, /*transA=*/false, /*transB=*/false);
 ```
 
 ### 示例 2：ReLU 激活
 
 ```cpp
-class ReLU {
-public:
-    Tensor forward(ComputeEngine& engine, const Tensor& input) {
-        // output = max(input, 0)
-        return engine.elementwise_binary(
-            BinaryOp::Max, input, 
-            engine.create_tensor(input.rows(), input.cols()));
-    }
-};
+// 单表达式融合：out = max(x, 0)
+auto output = nn::dsl::compute(engine, nn::dsl::max(nn::dsl::leaf(input), Scalar{0}),
+                               input.rows(), input.cols());
+// backward 同理：grad = select(leaf(x) > 0, leaf(grad_out), 0)
 ```
 
 ### 示例 3：LayerNorm
 
+真实实现（`compute_layer_mlp.hpp`）拆成 4 条 DSL 表达式（每条一个融合 kernel）：
+
 ```cpp
-class LayerNorm {
-public:
-    Tensor forward(ComputeEngine& engine, const Tensor& input) {
-        // 1. 计算均值
-        auto mean = engine.row_reduce_sum(input);
-        engine.scale_inplace(*mean, 1.0f / input.cols());
-        
-        // 2. 减去均值
-        auto centered = engine.clone(input);
-        engine.broadcast_col_inplace(*centered, *mean, BinaryOp::Sub);
-        
-        // 3. 计算方差
-        auto variance = engine.elementwise_binary(
-            BinaryOp::Mul, *centered, *centered);
-        auto var = engine.row_reduce_sum(*variance);
-        engine.scale_inplace(*var, 1.0f / input.cols());
-        
-        // 4. 归一化
-        auto normalized = engine.elementwise_binary(
-            BinaryOp::Div, *centered, 
-            engine.elementwise_unary(UnaryOp::Sqrt, 
-                engine.elementwise_binary_scalar(BinaryOp::Add, *var, eps_)));
-        
-        // 5. 缩放和平移
-        engine.broadcast_col_inplace(*normalized, *gamma_, BinaryOp::Mul);
-        engine.broadcast_row_inplace(*normalized, *beta_, BinaryOp::Add);
-        
-        return normalized;
-    }
-};
+// 1) mean / diff（归约视图）
+// 2) var = col_reduce_sum(diff*diff) / F
+// 3) normalized = diff * rsqrt(var + eps)      ← 一条 compute
+// 4) out = normalized * row_broadcast(gamma) + row_broadcast(beta)
+// backward：gy = grad*gamma；grad_x = (gy - mean(gy) - norm*mean(gy*norm)) * rsqrt(var+eps)
+```
+
+用旧式多原语逐步写（能跑，但每步一次 dispatch + 一个中间 Tensor，仅作对照）：
+
+```cpp
+auto mean = engine.row_reduce_sum(input);
+engine.scale_inplace(*mean, 1.0f / input.cols());
+auto centered = engine.clone(input);
+engine.broadcast_col_inplace(*centered, *mean, BinaryOp::Sub);
+// ...（后续方差/归一化/仿射变换同理）
 ```
 
 ### 示例 4：多头注意力
 
+> **真实实现已演进**：注意力 forward 现为**单 fold kernel**（QKᵀ/掩码/online softmax/ΣwV
+> 分块流式，S 矩阵绝不物化，见 `compute_layer_attention.hpp`），不再是下面这条
+> "batched_matmul → softmax → batched_matmul" 的物化链。下例保留作**结构示意**：
+
 ```cpp
-class MultiHeadAttention {
-public:
-    Tensor forward(ComputeEngine& engine, const Tensor& input) {
-        // 1. 线性投影
-        auto q = engine.matmul(input, *q_weight_);
-        auto k = engine.matmul(input, *k_weight_);
-        auto v = engine.matmul(input, *v_weight_);
-        
-        // 2. 重排维度: (H*d_k, batch*seq) → (batch*H*d_k, seq)
-        auto q_r = engine.rearrange_3d(*q, heads_ * d_k_, batch_, seq_);
-        auto k_r = engine.rearrange_3d(*k, heads_ * d_k_, batch_, seq_);
-        auto v_r = engine.rearrange_3d(*v, heads_ * d_k_, batch_, seq_);
-        
-        // 3. 批量注意力分数
-        auto scores = engine.batched_matmul(*q_r, *k_r, batch_ * heads_,
-                                            /*transA=*/true);
-        engine.scale_inplace(*scores, 1.0f / std::sqrt(d_k_));
-        
-        // 4. Softmax
-        auto attn = softmax(engine, *scores);
-        
-        // 5. 注意力加权
-        auto context = engine.batched_matmul(*attn, *v_r, batch_ * heads_);
-        
-        // 6. 重排回去
-        auto context_r = engine.rearrange_3d(*context, batch_, heads_ * d_k_, seq_,
-                                             /*inverse=*/true);
-        
-        // 7. 输出投影
-        return engine.matmul(*context_r, *o_weight_);
-    }
-};
+// 1. 线性投影 Q/K/V → 2. rearrange_3d 到 (batch*H*d_k, seq)
+// 3. QKᵀ（transA）+ 1/√d_k 缩放 → 4. softmax → 5. ×V → 6. rearrange 回去 → 7. 输出投影
+// 真实 forward 由 AttentionBase::forward 走 fold 表达式完成；
+// backward = R/X 两条 DSL 表达式 + 3 个 batched_matmul。
 ```
 
 ---
@@ -634,13 +585,9 @@ auto temp2 = engine.elementwise_binary(BinaryOp::Add, *temp1, *y);
 auto result = engine.elementwise_binary(BinaryOp::Mul, *temp2, *z);
 
 // ✅ 推荐：融合为单次调用
-auto result = nn::dsl::compute(
-    engine,
-    [](auto x, auto y, auto z) {
-        return (nn::dsl::exp(x) + y) * z;
-    },
-    {x, y, z}, rows, cols
-);
+auto result = nn::dsl::compute(engine,
+    (nn::dsl::exp(nn::dsl::leaf(x)) + nn::dsl::leaf(y)) * nn::dsl::leaf(z),
+    rows, cols);
 ```
 
 ### 2. 避免不必要的拷贝
@@ -754,5 +701,4 @@ auto& t = *tensor;  // 解引用
 
 ---
 
-*最后更新：2026-08-31*
-*维护者：Ethan*
+*最后更新：2026-09-25（DSL 签名与示例对齐当前代码；接口清单见 `docs/development/12-compute-engine-inventory.md`）*

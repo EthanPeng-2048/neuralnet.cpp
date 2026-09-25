@@ -607,7 +607,7 @@ python gui.py
 │                                                    │
 │  ▶ 高级选项（学习率调度 / TDR 防护 / 梯度日志 / 梯度裁剪） │
 │    - 调度: fixed / cosine / step_cosine + 预热 + min-lr │
-│    - TDR 重试 + flush 间隔；梯度裁剪 max-norm       │
+│    - flush 间隔（中间提交防 TDR）；梯度裁剪 max-norm       │
 │                                                    │
 │  ☑ 显示梯度统计                                    │
 │                                                    │

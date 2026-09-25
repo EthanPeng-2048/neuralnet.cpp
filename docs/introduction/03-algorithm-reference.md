@@ -9,7 +9,7 @@
 - **矩阵布局**：行主序 `(rows, cols)`，`data_[row * cols + col]`
 - **批处理布局**：列主序 batch-major `(feature_dim, batch_size)`
 - **标量类型**：`Scalar = float`
-- **引擎原语**：所有算法通过 `ComputeEngine` 的 op-level 原语组合表达
+- **引擎原语 + DSL**：算法写在 Layer 里——多数 Layer 用 `dsl::compute*` 单表达式融合，少数结构算子（matmul / scan / 归约 / 数据搬运）直调 `ComputeEngine` 原语
 
 ---
 
@@ -29,10 +29,9 @@
 out = W × x + b
 ```
 
-引擎原语分解：
+实现（`compute_layer_mlp.hpp`，一行原语）：
 ```
-out = engine.matmul(W, x)                        // 矩阵乘法
-engine.broadcast_row_inplace(out, b, Add)         // 按行广播加法
+out = engine.matmul_with_bias(W, x, b)   // matmul + 按行广播加 bias 一次完成
 ```
 
 **Backward：**
@@ -43,11 +42,11 @@ grad_W += grad_out × x^T
 grad_b += Σ_batch grad_out
 ```
 
-引擎原语分解：
+实现（`compute_layer_mlp.hpp`）：
 ```
-grad_input = engine.matmul(W, grad_out, transA=true)
-grad_W += engine.matmul(grad_out, input, transB=true)
-grad_b += engine.row_reduce_sum(grad_out)
+grad_input = engine.matmul(W, grad_out, /*transA=*/true)
+grad_W    ← dsl::compute_into(leaf(grad_W) + matmul(grad_out, x, transB))  // 融合累加，单次 dispatch
+grad_b   += engine.accumulate(engine.row_reduce_sum(grad_out))             // 归约向量输出无法并入表达式，两步
 ```
 
 ---
@@ -62,9 +61,7 @@ grad_b += engine.row_reduce_sum(grad_out)
 out = max(x, 0)
 ```
 
-```
-out = engine.elementwise_binary_scalar(Max, x, 0)
-```
+实现：`dsl::compute(engine, dsl::max(dsl::leaf(x), 0))`
 
 **Backward：**
 
@@ -73,9 +70,7 @@ grad_x = grad_out   if x > 0
          0           otherwise
 ```
 
-```
-grad_input = engine.elementwise_select_scalar_cond(Gt, x, 0, grad_out, 0)
-```
+实现：`dsl::compute(engine, dsl::select(dsl::leaf(x) > 0, dsl::leaf(grad_out), 0))`
 
 ---
 
@@ -89,14 +84,12 @@ grad_input = engine.elementwise_select_scalar_cond(Gt, x, 0, grad_out, 0)
 out = x · σ(βx) = x · 1/(1 + e^(−βx))
 ```
 
-引擎原语分解（6 次调用）：
+实现：单表达式 DSL 融合（forward/backward 各一条 `dsl::compute`，全折叠为单个 GPU kernel）：
 ```
-t1 = engine.elementwise_binary_scalar(Mul, x, β)      // βx
-t2 = engine.elementwise_unary(Neg, t1)                 // -βx
-t3 = engine.elementwise_unary(Exp, t2)                 // exp(-βx)
-t4 = engine.elementwise_binary_scalar(Add, t3, 1)      // 1 + exp(-βx)
-s  = engine.elementwise_binary_scalar(Div, t4, 1)      // sigmoid(βx) 的倒数
-out = engine.elementwise_binary(Mul, x, s)
+// forward
+out = x / (1 + exp(-β·x))
+// backward，s = σ(βx) 由 input_cache_ 重算（不缓存，省显存）
+grad_x = grad_out · s · (1 + β·x · (1 − s))
 ```
 
 **Backward：**
@@ -104,16 +97,6 @@ out = engine.elementwise_binary(Mul, x, s)
 ```
 factor = s · (1 + βx · (1 − s)),   其中 s = σ(βx)
 grad_x = grad_out · factor
-```
-
-引擎原语分解（6 次调用）：
-```
-one_minus_s = engine.elementwise_binary_scalar(Sub, s, 1)
-bx = engine.elementwise_binary_scalar(Mul, x, β)
-inner = engine.elementwise_binary(Mul, bx, one_minus_s)
-paren = engine.elementwise_binary_scalar(Add, inner, 1)
-factor = engine.elementwise_binary(Mul, s, paren)
-grad_input = engine.elementwise_binary(Mul, grad_out, factor)
 ```
 
 ---
@@ -164,15 +147,9 @@ row_sum_r = Σ_c exp_shift_{r,c}
 out_{r,c} = exp_shift_{r,c} / row_sum_r
 ```
 
-引擎原语分解：
+实现：单表达式 DSL 融合（`compute_layer_softmax.hpp`，中间 Tensor 全部由融合 kernel 消解）：
 ```
-row_max = engine.row_reduce_max(input)
-shifted = engine.clone(input)
-engine.broadcast_row_inplace(shifted, row_max, Sub)
-exp_shift = engine.elementwise_unary(Exp, shifted)
-row_sum = engine.row_reduce_sum(exp_shift)
-output = engine.clone(exp_shift)
-engine.broadcast_row_inplace(output, row_sum, Div)
+out = exp(x − row_max(x)) / row_sum(exp(x − row_max(x)))
 ```
 
 **Backward：**
@@ -183,6 +160,8 @@ dot_r = Σ_c ep_{r,c}
 gmd = grad_out − dot
 grad_x = out ⊙ gmd
 ```
+
+实现：同样单表达式 `out * (grad_out − row_sum(out * grad_out))`。
 
 ---
 
@@ -200,7 +179,7 @@ grad_x = out ⊙ gmd
 4. **单 fold kernel**：`O_t = eval_expr(make_fold_attn_o(...), {Q, K, V_t, [掩码输入]})`
    —— QKᵀ、掩码（因果/ALiBi/doc 变体在 body 内 select 链表达）、online softmax、
    `Σw·V` 在同一 kernel 内按 `EXPR_FOLD_BLOCK=128` 逐块完成，`(batch·H·seq, seq)`
-   的 S/W 矩阵**绝不物化**；`causal_skip` 把被屏蔽的整块钳成空转
+   的 S/W 矩阵**绝不物化**；`tri_skip` 把被屏蔽的整块钳成空转
 5. 反重排：`O = transpose + rearrange_3d 回 (H·d_k, batch·seq)`
 6. 输出投影：`out = W_o·O`
 
@@ -308,7 +287,7 @@ mask[i][j] = 0     if j ≤ i
            = -∞    if j > i
 ```
 
-**掩码绝不物化**：`j > i` 的屏蔽项在 kernel 内直接选择 -inf（`causal_skip` 进一步把被屏蔽的整块钳成空转）——没有 `S += mask` 矩阵，**也没有掩码缓存**（历史物化式掩码缓存已随 fold 迁移删除）。
+**掩码绝不物化**：`j > i` 的屏蔽项在 kernel 内直接选择 -inf（`tri_skip` 进一步把被屏蔽的整块钳成空转）——没有 `S += mask` 矩阵，**也没有掩码缓存**（历史物化式掩码缓存已随 fold 迁移删除）。
 
 ---
 
@@ -388,6 +367,10 @@ loss      = −(1/batch) Σ target · log_sm
 
 ## Optimizer 篇
 
+> **实现方式**：优化器全部用 `dsl::compute` / `dsl::compute_into`（`compute_optimizer.hpp`），
+> 一次表达式 = 一条融合 kernel；不再直调 `axpy_inplace`/`elementwise_*` 这类 eager 原语。
+> 下面每条 "DSL 表达式" 即 `step()` 里的真实写法（`leaf` = 输入张量，`rparam` = 标量常量）。
+
 ### 1. SGD — 随机梯度下降
 
 **算法：**
@@ -396,7 +379,7 @@ loss      = −(1/batch) Σ target · log_sm
 p ← p − η·g
 ```
 
-**引擎原语：** `scale_add_(p, -lr, g)` — 单次 axpy
+**DSL：** `compute_into(p, leaf(p) + leaf(g) * rparam(-lr))`
 
 ---
 
@@ -409,12 +392,11 @@ v ← β·v + (1−β)·g
 p ← p − η·v
 ```
 
-**引擎原语：**
+**DSL（两条 `compute_into`）：**
 
 ```
-engine.scale_inplace(v, β)           // v *= β
-scale_add_(v, 1-β, g)                // v += (1-β)*g
-scale_add_(p, -lr, v)                // p -= lr*v
+v ← leaf(v)*rparam(β) + leaf(g)*rparam(1-β)     // v *= β 后 += (1-β)*g 合并为一条
+p ← leaf(p) + leaf(v)*rparam(-lr)
 ```
 
 **参数：** `lr`（学习率）, `beta = 0.9`（动量系数）
@@ -432,26 +414,14 @@ m̂ = m / (1 − β₁ᵗ),   v̂ = v / (1 − β₂ᵗ)
 p ← p − η·(m̂ / (√v̂ + ε))
 ```
 
-**引擎原语：**
+**DSL（`compute` 出新张量，最后 `compute_into` 落回参数）：**
 
 ```
-// m = β1*m + (1-β1)*g
-engine.scale_inplace(m, β1)
-scale_add_(m, 1-β1, g)
-
-// v = β2*v + (1-β2)*g²
-engine.scale_inplace(v, β2)
-auto g_sq = engine.elementwise_binary(Mul, g, g)
-scale_add_(v, 1-β2, g_sq)
-
-// 偏差修正 + 更新
-auto m_hat = engine.scale(m, inv_bc1)
-auto v_hat = engine.scale(v, inv_bc2)
-auto sqrt_v = engine.elementwise_unary(Sqrt, v_hat)
-auto denom = engine.elementwise_binary_scalar(Add, sqrt_v, eps)
-auto step = engine.elementwise_binary(Div, m_hat, denom)
-engine.scale_inplace(step, -lr)
-engine.add_inplace(p, step)
+m_new = compute(leaf(m)*rparam(β1) + leaf(g)*rparam(1-β1))
+v_new = compute(leaf(v)*rparam(β2) + leaf(g)*leaf(g)*rparam(1-β2))
+delta = compute(-rparam(lr) * ((leaf(m)*rparam(inv_bc1))
+                             / (sqrt(leaf(v)*rparam(inv_bc2)) + rparam(eps))))
+p    ← compute_into(leaf(p) + leaf(delta))
 ```
 
 **参数：** `lr`, `β1=0.9`, `β2=0.999`, `ε=1e-8`
@@ -516,14 +486,14 @@ X = G / (‖G‖_F + ε)
 - Keller Jordan et al., "Muon: An optimizer for hidden layers in neural networks"
 - https://kellerjordan.github.io/posts/muon/
 
-**引擎原语（每步）：**
+**DSL / 原语（每步，`compute_optimizer.hpp`）：**
 
 ```
-A = engine.matmul(X, X, transB=true)    // X × X^T
-A_sq = engine.matmul(A, A)              // A²
-B = engine.scale(A, b) + engine.scale(A_sq, c)
-BX = engine.matmul(B, X)
-X = engine.scale(X, a) + BX
+A   = engine.matmul(X, X, /*transB=*/true)      // X × X^T
+A_sq= engine.matmul(A, A)                        // A²
+accA= compute_into(leaf(A)*rparam(b) + leaf(A_sq)*rparam(c))   // B = b·A + c·A²
+BX  = engine.matmul(accA, X)                     // B·X
+accX= compute_into(leaf(X)*rparam(a) + leaf(BX)) // X = a·X + BX
 ```
 
 **参数：** `lr`, `momentum=0.95`, `nesterov=true`, `ns_steps=5`, `ns_eps=1e-7`
