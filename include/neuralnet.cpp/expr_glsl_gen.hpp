@@ -220,18 +220,17 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
 //    - 共享内存分块矩阵乘（结构驱动，复用 matmul_tiled.comp 思路）：
 //        WorkGroup = TILE×TILE 线程（16×16 = 256），计算 BLOCK×BLOCK 输出块
 //        （64×64，每线程 4×4 寄存器分块 acc[4][4]，dot() = 4 FMA）；
-//        K 方向按 BK=32 分块（双缓冲）：load_tiles 协作加载 A/B 分块到
+//        K 方向按 BK=16 分块（双缓冲）：load_tiles 协作加载 A/B 分块到
 //        vec4 共享内存（转置感知、合并访问），tile t+1 的全局加载与 tile t
 //        的计算并行发射、每 tile 单 barrier——暴露的加载延迟被计算覆盖。
-//        40HX 变体实测 trade-off（深=feedforward/大 batch 训练，浅=小 batch 推理）：
-//          · 原版 BK=32 单缓冲(16KB)：深网格基线，浅网格无流水
-//          · BK=16 双缓冲(16KB占用率不变)（% = vs 原版**收益**，正=更快，
-//            故深点 -2% 即回退）：浅 +2~6%，深 -2%（barrier 频率翻倍
-//            而深网格延迟已被跨块调度掩盖 → 流水无用只剩 barrier 成本）
-//          · BK=32 双缓冲(32KB)：barrier 节奏=原版，32KB 占用率砍半由深网格
-//            WG 余量吸收——**四点 A/B 最终采用**（对照=单缓冲原版；数字为
-//            **耗时**变化、负=更快；与 AGENTS §12 ② 同口径）：浅 linear
-//            1024³ -1.9%、batch512 -4.9%，深 feedforward/batch4096 ±0（18/18 测试绿）
+//        40HX 变体 trade-off（深=feedforward/大 batch 训练，浅=小 batch
+//        推理；% = vs 单缓冲原版**耗时**变化，负=更快）：
+//          · BK=32 单缓冲(16KB)：深网格基线，浅网格无流水
+//          · BK=32 双缓冲(32KB)：barrier 节奏同原版但占用率砍半；浅点收益
+//            （linear 1024³ -1.9%、batch512 -4.9%）深点 ±0——曾判"最终采用"
+//          · **2026-09-24 OP/融合统一 A/B 复测推翻上条**（同参数对照，
+//            见 AGENTS §12 ⑥）：融合侧 BK32→16 反超，浅 -24%、深 fwd -24%、
+//            深 train -17% → **最终 BK=16，与 OP 级同参**（下方 constexpr）
 //    - 尾逐元素链编译为 eval_tail(mm, row, col) 函数（GLSL 内联零开销），
 //      写回时每个输出元素调用一次（Matmul 操作数 → mm，"虚拟寄存器 0"）。
 //    - transA/transB 是**结构**（进 key）→ 索引表达式硬编码进 shader；

@@ -799,11 +799,11 @@ public:
     // 重计算路径）。梯度检查点（激活重计算）需要 forward_recompute 才能在
     // backward 时重建缓存；若被请求，明确中止而非静默产生错误结果。
     // 已知限制：见 docs/introduction/04-innovative-designs.md §10。
-    void set_checkpoint_every(std::size_t /*stride*/) override
+    void set_checkpoint_every(std::size_t stride) override
     {
         std::fprintf(stderr, "FATAL: ZiPTModel does not support gradient checkpointing "
                              "(no forward_recompute); requested stride=%zu\n",
-                     static_cast<std::size_t>(-1));
+                     stride);
         std::abort();
     }
 

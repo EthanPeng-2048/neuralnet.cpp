@@ -788,18 +788,27 @@ int main(int argc, char *argv[])
             auto eb = engine->end_batch();
             if (!eb) { std::cerr << "\nend_batch failed: " << eb.error().message << '\n'; return 1; }
 
-            // ── 优化器 step + 梯度清零 ──
+            // ── 优化器 step + 梯度清零（整段包进单次 begin/end_batch，
+            //    与 text_train 一致；否则 GPU 下逐原语同步提交，铁律 6）──
+            auto obb = engine->begin_batch();
+            if (!obb) { std::cerr << "\nbegin_batch (optimizer) failed: " << obb.error().message << '\n'; return 1; }
+
             auto step_result = optimizer->step();
             if (!step_result) {
                 std::cerr << "\n优化器 step 失败: " << step_result.error().message << '\n';
+                (void)engine->end_batch();
                 return 1;
             }
 
             auto zero_result = optimizer->zero_grad();
             if (!zero_result) {
                 std::cerr << "\n优化器 zero_grad 失败: " << zero_result.error().message << '\n';
+                (void)engine->end_batch();
                 return 1;
             }
+
+            auto oeb = engine->end_batch();
+            if (!oeb) { std::cerr << "\nend_batch (optimizer) failed: " << oeb.error().message << '\n'; return 1; }
 
             // ── 进度显示 ──
             if ((batch + 1) % 10 == 0 || batch + 1 == num_batches)

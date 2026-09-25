@@ -52,10 +52,10 @@ inline constexpr uint32_t MODEL_MAGIC    = 0x4E4E4E4E;  // "NNNN"
 inline constexpr uint32_t MODEL_VERSION  = 5;            // v5: per-tensor precision tags
 
 // ── 序列化待办（1.1，代码审查项 S3 / M1 / M2）────────────────────────────
-// S3: read_spec_header / read_tokenizer 直接用文件里的 uint64 长度预分配
-//     std::string(len,'\0')，无上限校验；配合 -fno-exceptions，恶意/损坏文件
-//     可触发 bad_alloc → 进程崩溃。恢复前需加长度上限与读取完整性校验。
-//     （1.0 决定暂不处理：仅影响本地加载自己/下载的模型，用户自行把关。）
+// S3: ~~read_spec_header / read_tokenizer 无长度上限~~ **已修复**：两处均
+//     经 kMaxSerializedStringBytes（64 MiB）校验后才预分配
+//     （见 :400 read_spec_header、:481 read_tokenizer），损坏/恶意文件
+//     返回 Error 而非 bad_alloc → terminate。
 // M1: .bin 全文件无校验和（.nnpkg 有 sha256）。内容损坏会被静默载入错误权重
 //     且无感知。建议 MODEL_VERSION 5 增加整文件校验和与尾部完整性标记。
 // M2: extra_state 的注释称"旧文件读到 EOF 保持默认（running_mean=0 等）"，
