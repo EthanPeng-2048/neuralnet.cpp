@@ -1432,10 +1432,36 @@ public:
             std::vector<const GpuBuffer*>& gpu_inputs = fi_r->bufs;   // owners 随 fi_r 存活到本作用域末
             auto dst_gpu = ensure_gpu(dst);
             if (!dst_gpu) return std::unexpected(dst_gpu.error());
+            // ── output_override 必须按目标存储精度取视图（issue #13 P0-②）────
+            // 曾写死默认 F32 的 gpu_tensor()：f16 目标 → gpu_get<F32>() 空
+            // shared_ptr → Debug NN_ASSERT 引爆；Release 空解引用 = UB：
+            // MSVC 得到空 override → 结果落临时 buffer 被丢弃 → **参数静默
+            // 冻结（loss 恒 ln V）**；clang 早先"正常"只是 UB 代码生成运气。
+            // 修复：f16 目标经 f16_view 包 f16 buffer（同 run_fused_gpu 的
+            // out_f16 做法）；存储/标签不一致时显式报错，绝不静默。
+            std::optional<GpuTensor> dst_view;
+            GpuTensor* dst_override = nullptr;
+            if (dst_gpu->precision() == Precision::F16)
+            {
+                if (!dst_gpu->gpu_shared<Precision::F16>())
+                    return std::unexpected(Error{
+                        "eval_expr_into: f16 目标缺少 f16 GPU 存储"
+                        "（precision 标签与 variant 存储不一致）"});
+                dst_view = f16_view(*dst_gpu);
+                dst_override = &*dst_view;
+            }
+            else
+            {
+                if (!dst_gpu->gpu_shared<Precision::F32>())
+                    return std::unexpected(Error{
+                        "eval_expr_into: f32 目标缺少 f32 GPU 存储"
+                        "（precision 标签与 variant 存储不一致）"});
+                dst_override = &dst_gpu->gpu_tensor();
+            }
             const auto vp = nn::expr_spec_runtime_view_params(spec);
             auto out = backend_.run_fused_gpu(
                 fs->key, gpu_inputs, spec.consts, rows, cols, /*vector_out=*/false, vp,
-                spec.rparams, &dst_gpu->gpu_tensor(),
+                spec.rparams, dst_override,
                 nn::expr_spec_runtime_matmul_k(spec),
                 nn::expr_spec_runtime_matmul_batch(spec));
             if (!out) return std::unexpected(out.error());

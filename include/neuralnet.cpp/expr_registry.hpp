@@ -105,9 +105,9 @@ struct ExprRegistry
 //                    matmul: has(u8)；1 时 {a,b,tA,tB(4B) k(u32) batch(u32)},
 //                    vecacc: has(u8)；1 时 {vec_state,weight_reg,b_input,
 //                           scale_reg,has_scale(5B)}
-//                    -- v8 追加：causal_skip(u8)}
+//                    -- v8 追加：tri_skip(u8)}
 //  v2 起支持 matmul 段（v1 无 matmul，读 v1 等价 has=0）；v3 起支持 rparams。
-inline constexpr std::uint8_t kExprBinVersion = 9;  // v5：MatmulSpec 补 batch；v6：FoldSpec；v7：FoldSpec 双域字段（vec_state_len/matmul/vecacc——丢段=结构损坏）；v8：causal_skip（causal 跳块 codegen 标志——不对称=静默不跳或错位读废）；v9：**精度变体段**（Phase 2 in-kernel f16：每个变体 {sig, 基础结构下标}——变体与基础结构**同结构同 key**，故只存 sig + 下标，不重复存 spec 体）
+inline constexpr std::uint8_t kExprBinVersion = 9;  // v5：MatmulSpec 补 batch；v6：FoldSpec；v7：FoldSpec 双域字段（vec_state_len/matmul/vecacc——丢段=结构损坏）；v8：tri_skip（行界跳块 codegen 标志——不对称=静默不跳或错位读废）；v9：**精度变体段**（Phase 2 in-kernel f16：每个变体 {sig, 基础结构下标}——变体与基础结构**同结构同 key**，故只存 sig + 下标，不重复存 spec 体）
 
 [[nodiscard]] inline bool write_registry(const std::string& path,
                                          const ExprRegistry& reg)
@@ -207,8 +207,8 @@ inline constexpr std::uint8_t kExprBinVersion = 9;  // v5：MatmulSpec 补 batch
                                            va.has_scale };
                 if (!write_pod_span(f, std::span(vbytes, 5))) return false;
             }
-            // v8：causal_skip（1B，与 read 对称）
-            const std::uint8_t cskip = s.fold->causal_skip ? 1u : 0u;
+            // v8：tri_skip（1B，与 read 对称）
+            const std::uint8_t cskip = s.fold->tri_skip ? 1u : 0u;
             if (!write_pod(f, cskip)) return false;
         }
     }
@@ -354,11 +354,11 @@ inline constexpr std::uint8_t kExprBinVersion = 9;  // v5：MatmulSpec 补 batch
                 va.has_scale  = vbytes[4];
                 fs.vecacc = va;
             }
-            // v8：causal_skip 读回（与 write 对称——错一位=后续全错位）
+            // v8：tri_skip 读回（与 write 对称——错一位=后续全错位）
             {
                 std::uint8_t cskip = 0;
                 if (!read_pod(f, cskip)) return false;
-                fs.causal_skip = cskip != 0;
+                fs.tri_skip = cskip != 0;
             }
             s.fold = fs;
         }

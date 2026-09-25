@@ -3,7 +3,7 @@
 #include "compute_layer_base.hpp"
 #include "compute_layer_mlp.hpp"
 #include "compute_layer_softmax.hpp"
-#include "expr_fold.hpp"
+#include "expr_spec.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -153,7 +153,177 @@ public:
     }
 };
 
-// ══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+//  注意力 fold 构造（P-C2 双域旗舰样例）：fold attention 输出 O
+//  （S 不物化，online 单遍）
+//
+//  这是**注意力 Layer 自己的表达式文本**（AOT 收集原则：表达式只出现在
+//  Layer），原先放在 expr_fold.hpp——fold 头因此染上了 attn 命名与掩码
+//  设计；现归位到注意力层，expr_fold.hpp 只保留与注意力无关的通用样例。
+//  scan_exprs dry-run、fused_gpu/expr_cpu 对拍与 AttentionBase::forward
+//  共用本构造 → key 一致。
+//
+//  数学：O = softmax_masked(Q·Kᵀ) · V_t
+//    键域每块：S_tile = mm(Q,K)（内层 dk 收缩）→ [掩码] →
+//      m' = max(m, 块 max)；α = e^{m−m'}；e = e^{S−m'}；
+//      l = l·α + Σ_块 e；（块尾 vecacc：O *= α；O += Σ_块 e·V_t）
+//    向量域：out[d] = O[d] / l
+//  布局：Q/K (bh·dk, seq) 行主序；V_t (bh·seq, dk)；输出 (bh·seq, dk)。
+//  掩码语义与既有 masked_causal_ / masked_alibi_ 对齐（Row/Col 按 batched
+//  网格：Row = 行%(rows/batch) = 查询位置 i、Col = 全局键位置 j）。
+// ═══════════════════════════════════════════════════════════════════════════
+namespace expr
+{
+
+enum class FoldAttnMask
+{
+    Plain,      // 无掩码（仅测试/数学对拍用——Layer 恒因果系）
+    Causal,     // 因果（j>i → -inf）
+    Alibi,      // 因果 + ALiBi 线性偏置（slopes 经 BatchMod 视图）
+    Doc,        // 因果 + 文档块对角（doc_col 经 RowBroadcast、doc_ids 经 BatchCol）
+    AlibiDoc,   // 因果 + ALiBi + 文档
+};
+
+[[nodiscard]] inline ExprSpec make_fold_attn_o(std::uint32_t seq, std::uint32_t dk,
+                                               std::uint32_t bh, FoldAttnMask mask)
+{
+    ExprSpec s;
+    FoldSpec f;
+    f.k             = seq;
+    f.num_state     = 2;                       // 0 = m, 1 = l
+    f.inits         = { -std::numeric_limits<Scalar>::infinity(), Scalar{0} };
+    f.vec_state_len = dk;
+    f.matmul        = MatmulSpec{ 0, 1, 1, 0, dk, bh };  // A=Q(trans), B=K, k=dk, batch=bh
+    // 常量：c0 = 0（拷贝/中性元）、c1 = -inf（掩码屏蔽）
+    s.consts = { Scalar{0}, -std::numeric_limits<Scalar>::infinity() };
+    // 输入/视图槽位（与 Layer 组包顺序约定一致）：
+    //   0=Q 1=K 2=V_t；[slopes (1,bh)→BatchMod]；[doc_col (BH*seq,1)→RowBroadcast]；
+    //   [doc_ids (1,bh*seq)→BatchCol(seq)]
+    const bool has_slope = (mask == FoldAttnMask::Alibi ||
+                            mask == FoldAttnMask::AlibiDoc);
+    const bool has_doc   = (mask == FoldAttnMask::Doc ||
+                            mask == FoldAttnMask::AlibiDoc);
+    const bool has_causal = (mask != FoldAttnMask::Plain);
+    f.tri_skip = has_causal;   // 生成器据此钳 valid（整块/边界跳过 -inf 区）
+    s.views = { linear(), linear(), linear() };
+    std::uint8_t slot_slope = 0, slot_dc = 0, slot_ids = 0;
+    if (has_slope)
+    {
+        slot_slope = static_cast<std::uint8_t>(s.views.size());
+        s.views.push_back(batch_mod(bh));
+    }
+    if (has_doc)
+    {
+        slot_dc = static_cast<std::uint8_t>(s.views.size());
+        s.views.push_back(row_broadcast());          // doc_col (rows,1)：b[row]
+        slot_ids = static_cast<std::uint8_t>(s.views.size());
+        s.views.push_back(batch_col(seq));           // doc_ids：b[batch*seq + col]
+    }
+
+    const auto ins = [](ExprOp op, std::uint8_t dst, ExprOperand a,
+                        ExprOperand b = {}) {
+        ExprInstr i;
+        i.op  = static_cast<uint8_t>(op);
+        i.dst = dst;
+        i.a   = a;
+        i.b   = b;
+        return i;
+    };
+    std::uint8_t nreg = 2;                     // 状态占 0..1，临时从 2 递增
+    std::vector<ExprInstr> body;
+
+    // ── 键域前段：S = masked(mm) ──
+    const uint8_t s0 = nreg++;                 // S 经 nreg 分配（防与掩码临时撞号）
+    body.push_back(ins(ExprOp::Add, s0, matmul_op(), cst(0)));  // r{s0} = S
+    std::uint8_t S = s0;
+    if (has_causal)
+    {
+        const uint8_t gt = nreg++;             // Gt(Col, Row)
+        body.push_back(ins(ExprOp::Gt, gt, col(), row()));
+        const uint8_t sel = nreg++;            // Select(gt, c1=-inf, c0=0)
+        {
+            ExprInstr isel;                     // 三操作数指令：手填 c 字段
+            isel.op  = static_cast<uint8_t>(ExprOp::Select);
+            isel.dst = sel;
+            isel.a   = reg(gt);
+            isel.b   = cst(1);
+            isel.c   = cst(0);
+            body.push_back(isel);
+        }
+        const uint8_t sm = nreg++;             // S + 屏蔽项
+        body.push_back(ins(ExprOp::Add, sm, reg(S), reg(sel)));
+        S = sm;
+    }
+    if (has_doc)
+    {
+        // 文档块对角：Ne(doc_col[row], doc_ids[batch,col]) → 屏蔽 -inf
+        //   （与既有 masked_doc_ 同构：两层 select 合并因果后统一 -inf）
+        const uint8_t ne = nreg++;
+        body.push_back(ins(ExprOp::Ne, ne, input(slot_dc), input(slot_ids)));
+        const uint8_t ds = nreg++;
+        {
+            ExprInstr isel;
+            isel.op  = static_cast<uint8_t>(ExprOp::Select);
+            isel.dst = ds;
+            isel.a   = reg(ne);
+            isel.b   = cst(1);
+            isel.c   = cst(0);
+            body.push_back(isel);
+        }
+        const uint8_t sm = nreg++;
+        body.push_back(ins(ExprOp::Add, sm, reg(S), reg(ds)));
+        S = sm;
+    }
+    if (has_slope)
+    {
+        const uint8_t off = nreg++;            // slope[batch] * (Col - Row)
+        body.push_back(ins(ExprOp::Sub, off, col(), row()));
+        const uint8_t sl = nreg++;
+        body.push_back(ins(ExprOp::Mul, sl, input(slot_slope), reg(off)));
+        const uint8_t sa = nreg++;
+        body.push_back(ins(ExprOp::Add, sa, reg(S), reg(sl)));
+        S = sa;
+    }
+
+    // ── 键域中段：online m / α / e / l ──
+    const uint8_t m_old = nreg++;              // m 拷贝
+    body.push_back(ins(ExprOp::Add, m_old, reg(0), cst(0)));
+    const uint8_t blk_m = nreg++;              // 块内 S max（归约）
+    body.push_back(ins(ExprOp::RowMax, blk_m, reg(S)));
+    body.push_back(ins(ExprOp::Max, 0, reg(m_old), reduce(blk_m)));   // m ← 状态更新
+    const uint8_t dm = nreg++;                 // m_old − m'
+    body.push_back(ins(ExprOp::Sub, dm, reg(m_old), reg(0)));
+    const uint8_t alpha = nreg++;              // α（行标量 → vecacc.scale）
+    body.push_back(ins(ExprOp::Exp, alpha, reg(dm)));
+    const uint8_t es = nreg++;                 // S − m'
+    body.push_back(ins(ExprOp::Sub, es, reg(S), reg(0)));
+    const uint8_t weight = nreg++;             // e = e^{S−m'}（元素 → vecacc.weight）
+    body.push_back(ins(ExprOp::Exp, weight, reg(es)));
+    const uint8_t blk_l = nreg++;              // 块内 Σe（归约）
+    body.push_back(ins(ExprOp::RowSum, blk_l, reg(weight)));
+    const uint8_t la = nreg++;                 // l·α
+    body.push_back(ins(ExprOp::Mul, la, reg(1), reg(alpha)));
+    body.push_back(ins(ExprOp::Add, 1, reg(la), reduce(blk_l)));      // l ← 状态更新
+
+    // ── vecacc：O *= α；O += Σ_块 e·V_t ──
+    f.vecacc  = VecAccSpec{ 0, weight, 2, alpha, 1 };
+    f.body    = std::move(body);
+    // ── 向量域 finalize：out[d] = O[d] / l ──
+    // dst 必须用**临时寄存器**（新号）：向量域逐列循环执行，若 dst 复用被读
+    // 状态（如 l），第 1 列的输出会覆盖除数 → 第 2 列起读到被污染的值
+    // （实测 0.4 = 10/25：l=4 被首列输出 25 覆盖）。
+    {
+        const uint8_t fout = nreg++;
+        f.finalize = { ins(ExprOp::Div, fout, nn::expr::vec_state(0), reg(1)) };
+    }
+    s.fold     = std::move(f);
+    s.num_regs = nreg;
+    return s;
+}
+
+} // namespace expr
+
+// ═══════════════════════════════════════════════════════════════════════════
 // AttentionBase — 多头注意力基类（批量化：消除 per-head 和 per-sample 循环）
 //
 // 提取 MultiHeadAttention 与 CausalSelfAttention 的公共逻辑：
@@ -536,8 +706,8 @@ public:
         if (!V_t) return std::unexpected(V_t.error());
         // ── 单 fold 表达式：S 不物化、online 单遍 ──────────────────────
         //   6 趟 (BH·seq, seq) 物化流量归零；掩码在 fold body 内逐块生效，
-        //   causal_skip 把被屏蔽块钳成空转（被跳过的恰是 -inf/0 恒等项 →
-        //   与全量计算逐位一致，见 FoldSpec::causal_skip 注释）。
+        //   tri_skip 把被屏蔽块钳成空转（被跳过的恰是 -inf/0 恒等项 →
+        //   与全量计算逐位一致，见 FoldSpec::tri_skip 注释）。
         //   inputs 顺序 = make_fold_attn_o 的 views 顺序：Q,K,V_t,[slope],[dc],[ids]
         std::vector<Tensor> fold_in{Q, K, *V_t};
         if (const Tensor* sl = mask_slopes_())  fold_in.push_back(*sl);

@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <functional>
 #include <memory>
 #include <string>
@@ -249,6 +250,13 @@ public:
         static_assert(P == Precision::F16 || P == Precision::F32,
                       "Phase 1 仅支持 F16/F32");
         auto p = gpu_get<P>();
+        if (!p)
+            std::fprintf(stderr,
+                         "[gpu_tensor-fail] P=%d precision_=%d gpu_slot=%zu "
+                         "dev=%d %zux%zu\n",
+                         static_cast<int>(P), static_cast<int>(precision_),
+                         gpu_data_.index(), static_cast<int>(device_),
+                         rows_, cols_);
         NN_ASSERT(device_ == Device::GPU && p,
                   "gpu_tensor<P>(): tensor has no P-precision GPU storage");
         return *p;
