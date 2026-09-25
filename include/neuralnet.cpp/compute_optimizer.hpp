@@ -47,6 +47,13 @@ protected:
     std::vector<TensorRef> params_;      // 非拥有引用（永不为空）
     std::vector<TensorRef> grads_;       // 非拥有引用（永不为空）
 
+    // 多精度（§9.1 / D8）：优化器**状态**（m / v / momentum）的存储精度。
+    // 默认全 F32 = 现状（零回归）。f16 训练下状态留在 f32 是更稳的配方
+    // （f16 舍入会污染二阶矩），但 profile_all_f16（CLI --f16）按字面语义
+    // 取 F16 —— 用户显式选择全 f16 时不予阻拦，只如实报告数值表现。
+    // 参数更新（p -= ...）走 in-place，存储精度不可变（§8.3）。
+    PrecisionProfile p_;
+
     // 校验 params/grads 数量一致（各子类 step() 开头调用）
     [[nodiscard]] Result<void> validate_sizes_() const
     {
@@ -56,13 +63,15 @@ protected:
     }
 
     // 为每个参数创建同形状的零初始化 Tensor（供 Momentum/Adam/Muon 复用）
+    // 精度 = p_.optimizer（状态存储精度，§9.1）
     [[nodiscard]] Result<std::vector<Tensor>> create_zero_buffers_() const
     {
         std::vector<Tensor> buffers;
         buffers.reserve(params_.size());
         for (auto& p : params_)
         {
-            auto buf = engine_.create_tensor(p.get().rows(), p.get().cols());
+            auto buf = engine_.create_tensor(p.get().rows(), p.get().cols(),
+                                             p_.optimizer);
             auto r = engine_.zero(buf);
             if (!r) return std::unexpected(r.error());
             buffers.push_back(std::move(buf));
@@ -89,12 +98,18 @@ protected:
 public:
     Optimizer(ComputeEngine& engine,
               std::vector<TensorRef> params,
-              std::vector<TensorRef> grads)
+              std::vector<TensorRef> grads,
+              PrecisionProfile precision = PrecisionProfile{})
         : engine_(engine),
           params_(std::move(params)),
-          grads_(std::move(grads)) {}
+          grads_(std::move(grads)),
+          p_(precision) {}
 
     virtual ~Optimizer() = default;
+
+    // ── D7：精度配置注入（工厂 create_optimizer 在构造时透传）──────────
+    void set_precision_profile(const PrecisionProfile& p) { p_ = p; }
+    [[nodiscard]] const PrecisionProfile& precision_profile() const noexcept { return p_; }
 
     // 动态调整学习率（供 OscillationGuard 等自适应调度器使用）
     virtual void set_lr(Scalar lr) = 0;
@@ -185,8 +200,9 @@ public:
     SGD(ComputeEngine& engine,
         std::vector<TensorRef> params,
         std::vector<TensorRef> grads,
-        Scalar lr)
-        : Optimizer(engine, std::move(params), std::move(grads)), lr_(lr) {}
+        Scalar lr,
+        PrecisionProfile precision = PrecisionProfile{})
+        : Optimizer(engine, std::move(params), std::move(grads), precision), lr_(lr) {}
 
     void set_lr(Scalar lr) override { lr_ = lr; }
 
@@ -222,8 +238,9 @@ public:
     SGDWithMomentum(ComputeEngine& engine,
                      std::vector<TensorRef> params,
                      std::vector<TensorRef> grads,
-                     Scalar lr, Scalar beta = 0.9)
-        : Optimizer(engine, std::move(params), std::move(grads)),
+                     Scalar lr, Scalar beta = 0.9,
+                     PrecisionProfile precision = PrecisionProfile{})
+        : Optimizer(engine, std::move(params), std::move(grads), precision),
           lr_(lr), beta_(beta)
     {
         auto v_r = create_zero_buffers_();
@@ -300,31 +317,32 @@ protected:
         const Tensor& g = grads_[i];
         const std::size_t rows = g.rows(), cols = g.cols();
 
-        // K1: m = β1*m + (1-β1)*g（单 kernel 融合）
+        // K1: m = β1*m + (1-β1)*g（单 kernel 融合；状态精度 = p_.optimizer）
         auto m_new = dsl::compute(engine_,
             dsl::leaf(m_[i]) * dsl::rparam(beta1_) +
                 dsl::leaf(g) * dsl::rparam(one_minus_beta1),
-            rows, cols);
+            rows, cols, p_.optimizer);
         if (!m_new) return std::unexpected(m_new.error());
         m_[i] = std::move(*m_new);
 
-        // K2: v = β2*v + (1-β2)*g²（单 kernel 融合）
+        // K2: v = β2*v + (1-β2)*g²（单 kernel 融合；状态精度 = p_.optimizer）
         auto v_new = dsl::compute(engine_,
             dsl::leaf(v_[i]) * dsl::rparam(beta2_) +
                 dsl::leaf(g) * dsl::leaf(g) * dsl::rparam(one_minus_beta2),
-            rows, cols);
+            rows, cols, p_.optimizer);
         if (!v_new) return std::unexpected(v_new.error());
         v_[i] = std::move(*v_new);
 
         // K3: p -= lr * (inv_bc1*m) / (sqrt(inv_bc2*v)+eps)（全链单 kernel 融合；
         //     依赖刚更新的 m_[i]/v_[i]，偏置修正系数 inv_bc1/inv_bc2 逐步变化
         //     由 RParam 承载，不进 key → 共享 shader）
+        //     更新量精度 = p_.param（与目标参数存储精度一致，省一次 cast）
         auto delta = dsl::compute(engine_,
               -dsl::rparam(lr_)
               * ((dsl::leaf(m_[i]) * dsl::rparam(inv_bc1))
                  / (dsl::sqrt(dsl::leaf(v_[i]) * dsl::rparam(inv_bc2))
                     + dsl::rparam(eps_))),
-            rows, cols);
+            rows, cols, p_.param);
         if (!delta) return std::unexpected(delta.error());
         // p += delta（目标传递：原地、单 dispatch，不额外分配）
         auto r = dsl::compute_into(engine_,
@@ -367,8 +385,9 @@ public:
          Scalar lr,
          Scalar beta1 = 0.9,
          Scalar beta2 = 0.999,
-         Scalar eps = 1e-8)
-        : Optimizer(engine, std::move(params), std::move(grads)),
+         Scalar eps = 1e-8,
+         PrecisionProfile precision = PrecisionProfile{})
+        : Optimizer(engine, std::move(params), std::move(grads), precision),
           lr_(lr), beta1_(beta1), beta2_(beta2), eps_(eps), t_(0)
     {
         init_moments_();
@@ -421,9 +440,10 @@ public:
           Scalar beta1 = 0.9,
           Scalar beta2 = 0.999,
           Scalar eps = 1e-8,
-          Scalar weight_decay = 0.01)
+          Scalar weight_decay = 0.01,
+          PrecisionProfile precision = PrecisionProfile{})
         : Adam(engine, std::move(params), std::move(grads),
-               lr, beta1, beta2, eps),
+               lr, beta1, beta2, eps, precision),
           wd_(weight_decay) {}
 
     // set_lr 复用 Adam::set_lr（lr_ 为 protected，无需 override）
@@ -473,7 +493,8 @@ public:
 // 参考：Keller Jordan et al., "Muon: An optimizer for hidden layers in neural networks"
 // ══════════════════════════════════════════════════════════════════════════
 [[nodiscard]] inline Result<Tensor> newton_schulz_orthogonalize(
-    ComputeEngine& engine, const Tensor& G, std::size_t steps = 5, Scalar eps = 1e-7f)
+    ComputeEngine& engine, const Tensor& G, std::size_t steps = 5, Scalar eps = 1e-7f,
+    Precision prec = Precision::F32)
 {
     // 调优后的 quintic 多项式系数（使 φ^N(x) → 1 for x ∈ [0,1]）
     constexpr Scalar a = 3.4445f;
@@ -484,9 +505,9 @@ public:
     // 逐元素链与行归约**融合为单 dispatch**（不物化 norm_sq 中间张量），
     // 再对 (rows,1) 小向量做列归约 → (1,1)
     auto row_sum_norm = dsl::compute_reduce(engine,
-        dsl::row_reduce_sum(dsl::leaf(G) * dsl::leaf(G)), G.rows(), G.cols());
+        dsl::row_reduce_sum(dsl::leaf(G) * dsl::leaf(G)), G.rows(), G.cols(), prec);
     if (!row_sum_norm) return std::unexpected(row_sum_norm.error());
-    auto total_norm_sq = engine.col_reduce_sum(*row_sum_norm);
+    auto total_norm_sq = engine.col_reduce_sum(*row_sum_norm, prec);
     if (!total_norm_sq) return std::unexpected(total_norm_sq.error());
 
     // 从 (1,1) Tensor 提取标量值
@@ -499,7 +520,7 @@ public:
     // X = G * inv_norm_scalar（归一化）：单表达式（取代 clone 整块拷贝 + scale
     // 两次 dispatch；GPU 上 1 个融合 kernel + 1 次分配）
     auto X = dsl::compute(engine,
-        dsl::leaf(G) * dsl::rparam(inv_norm_scalar), G.rows(), G.cols());
+        dsl::leaf(G) * dsl::rparam(inv_norm_scalar), G.rows(), G.cols(), prec);
     if (!X) return std::unexpected(X.error());
 
     // 选更小一侧构造母矩阵，避免显存爆炸（Muon 显存 > AdamW 的根因）：
@@ -522,9 +543,9 @@ public:
         //   一次原地目标传递）
         for (std::size_t t = 0; t < steps; ++t)
         {
-            auto A = engine.matmul(*X, *X, false, true);     // A = X·X^T
+            auto A = engine.matmul(*X, *X, false, true, prec);     // A = X·X^T
             if (!A) return std::unexpected(A.error());
-            auto A_sq = engine.matmul(*A, *A, false, false); // A²
+            auto A_sq = engine.matmul(*A, *A, false, false, prec); // A²
             if (!A_sq) return std::unexpected(A_sq.error());
 
             // A = b·A + c·A²：原为 scale(A²,c) + scale(A,b) + add(A,A²) 三次
@@ -533,7 +554,7 @@ public:
                 dsl::leaf(*A) * dsl::rparam(b) + dsl::leaf(*A_sq) * dsl::rparam(c), *A);
             if (!accA) return std::unexpected(accA.error());
 
-            auto BX = engine.matmul(*A, *X, false, false);   // B·X
+            auto BX = engine.matmul(*A, *X, false, false, prec);   // B·X
             if (!BX) return std::unexpected(BX.error());
             // BX += a·X（原地目标传递：单 dispatch，不额外分配）
             auto accBX = dsl::compute_into(engine,
@@ -550,9 +571,9 @@ public:
         // 母矩阵恒为 n×n，高窄时远小于 m×m。
         for (std::size_t t = 0; t < steps; ++t)
         {
-            auto Gr = engine.matmul(*X, *X, true, false);    // G = X^T·X（n×n）
+            auto Gr = engine.matmul(*X, *X, true, false, prec);    // G = X^T·X（n×n）
             if (!Gr) return std::unexpected(Gr.error());
-            auto Gr_sq = engine.matmul(*Gr, *Gr, false, false); // G²
+            auto Gr_sq = engine.matmul(*Gr, *Gr, false, false, prec); // G²
             if (!Gr_sq) return std::unexpected(Gr_sq.error());
 
             // G = b·G + c·G²（同上：三次 dispatch 融合为一次原地目标传递）
@@ -560,7 +581,7 @@ public:
                 dsl::leaf(*Gr) * dsl::rparam(b) + dsl::leaf(*Gr_sq) * dsl::rparam(c), *Gr);
             if (!accG) return std::unexpected(accG.error());
 
-            auto XM = engine.matmul(*X, *Gr, false, false);  // X·G
+            auto XM = engine.matmul(*X, *Gr, false, false, prec);  // X·G
             if (!XM) return std::unexpected(XM.error());
             // XM += a·X（原地目标传递：单 dispatch）
             auto accXM = dsl::compute_into(engine,
@@ -609,8 +630,9 @@ public:
          Scalar momentum = 0.95f,
          bool nesterov = true,
          std::size_t ns_steps = 5,
-         Scalar ns_eps = 1e-7f)
-        : Optimizer(engine, std::move(params), std::move(grads)),
+         Scalar ns_eps = 1e-7f,
+         PrecisionProfile precision = PrecisionProfile{})
+        : Optimizer(engine, std::move(params), std::move(grads), precision),
           lr_(lr), momentum_(momentum), nesterov_(nesterov),
           ns_steps_(ns_steps), ns_eps_(ns_eps)
     {
@@ -646,7 +668,7 @@ public:
                 // 取代 clone(整块拷贝) + axpy 两次 dispatch）
                 auto buf = dsl::compute(engine_,
                     dsl::leaf(g) + dsl::leaf(velocities_[i]) * dsl::rparam(momentum_),
-                    g.rows(), g.cols());
+                    g.rows(), g.cols(), p_.optimizer);
                 if (!buf) return std::unexpected(buf.error());
                 nesterov_buf = std::move(*buf);
             }
@@ -656,7 +678,7 @@ public:
             if (params_[i].get().rows() > 1 && params_[i].get().cols() > 1)
             {
                 auto ortho_update = newton_schulz_orthogonalize(
-                    engine_, update, ns_steps_, ns_eps_);
+                    engine_, update, ns_steps_, ns_eps_, p_.optimizer);
                 if (!ortho_update) return std::unexpected(ortho_update.error());
 
                 // 3. 参数更新: p -= lr * 0.2 * sqrt(max(m,n)) * NS(update)
@@ -689,25 +711,32 @@ public:
 // ── 优化器工厂函数 ────────────────────────────────────────────────────────
 // 根据名称创建对应优化器，支持: "sgd", "sgd_momentum", "adam", "adamw", "muon"。
 // 未知名称返回 nullptr，由调用方处理。
+// precision：模型级精度配置（§9.1）——状态张量按 p.optimizer 创建，参数更新
+// 走 in-place（存储精度不可变）。默认全 F32 = 现状（零回归）。
 [[nodiscard]] inline std::unique_ptr<Optimizer> create_optimizer(
     std::string_view name,
     ComputeEngine& engine,
     std::vector<TensorRef> params,
     std::vector<TensorRef> grads,
     Scalar lr,
-    Scalar weight_decay = 0)
+    Scalar weight_decay = 0,
+    PrecisionProfile precision = PrecisionProfile{})
 {
     if (name == "sgd")
-        return std::make_unique<SGD>(engine, std::move(params), std::move(grads), lr);
+        return std::make_unique<SGD>(engine, std::move(params), std::move(grads), lr,
+                                     precision);
     if (name == "sgd_momentum")
-        return std::make_unique<SGDWithMomentum>(engine, std::move(params), std::move(grads), lr);
+        return std::make_unique<SGDWithMomentum>(engine, std::move(params),
+                                                 std::move(grads), lr, 0.9, precision);
     if (name == "adam")
-        return std::make_unique<Adam>(engine, std::move(params), std::move(grads), lr);
+        return std::make_unique<Adam>(engine, std::move(params), std::move(grads), lr,
+                                      0.9, 0.999, 1e-8, precision);
     if (name == "adamw")
         return std::make_unique<AdamW>(engine, std::move(params), std::move(grads), lr,
-                                       0.9, 0.999, 1e-8, weight_decay);
+                                       0.9, 0.999, 1e-8, weight_decay, precision);
     if (name == "muon")
-        return std::make_unique<Muon>(engine, std::move(params), std::move(grads), lr);
+        return std::make_unique<Muon>(engine, std::move(params), std::move(grads), lr,
+                                      0.95f, true, 5, 1e-7f, precision);
     return nullptr;  // 未知名称，调用方应处理
 }
 

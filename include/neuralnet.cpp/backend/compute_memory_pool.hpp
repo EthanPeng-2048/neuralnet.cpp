@@ -20,6 +20,7 @@
 
 #include <vulkan/vulkan.h>
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -38,7 +39,18 @@ namespace nn
 class MemoryPool
 {
 public:
-    static constexpr VkDeviceSize DEFAULT_BLOCK_SIZE = 128ull * 1024 * 1024; // 128MB
+    // ── 底材尺寸（2026-09 探针实测调参，跨负载数据见下）─────────────────
+    // 128MB → 12MB。实测峰值对块尺寸在 8–32MB 是平台区、最优 ≈12MB，且
+    // **与模型规模无关**（真正的"自适应"是另一条规则：>底材的分配自动独占
+    // 精确尺寸块，不产生内部碎片）。跨负载实测（MiB）：
+    //   GPT d64/L4/b64 : 8MB=3411 12MB=3399 16MB=3411 32MB=3427 128MB=3523
+    //   GPT d128/L8/b32: 8MB=4449 12MB=4445 16MB=4457 32MB=4457 128MB=4557
+    //   MNIST MLP      : 8MB=82   12MB=94   16MB=90   32MB=122  128MB=314
+    //   MNIST CNN      :          12MB=142  16MB=154            128MB=314
+    // 另测过"最小 2 的幂阶梯类"（NN_POOL_LADDER_MAX_MB 启用）：d128 上
+    // ladder16=4497 比 fixed16=4457 差 40MB（配对 3/3），故阶梯默认关闭。
+    // 可用 NN_POOL_BLOCK_MB 覆盖做调参。
+    static constexpr VkDeviceSize DEFAULT_BLOCK_SIZE = 12ull * 1024 * 1024; // 12MB
     // 尺寸分类分池（抗碎片，P3）：大块底材只服务大分配，小块底材只服务小分配，
     // 避免大量高频的小临时分配在 128MB 底材里切出不可复用碎片、破坏大分配的
     // 连续性（见《显存&负载不均衡分析》）。
@@ -132,10 +144,27 @@ private:
     // L2：整块归还时保留的最小空闲字节数（避免频繁整块释放/重建抖动）
     VkDeviceSize retain_free_bytes_ = 0;
 
+    // 自适应阶梯上限（0 = 关闭，走固定 block_size_ 单类别路径）：
+    // 启用时中等分配按"最小 2 的幂类别"分池，见 allocate()。
+    VkDeviceSize ladder_max_ = 0;
+
     // 使用 unique_ptr 避免 vector 扩容/删除时触发 Block 的移动和析构
     std::vector<std::unique_ptr<Block>> blocks_;
     std::unordered_map<SuballocKey, VkDeviceSize, SuballocKeyHash> active_allocs_;
     mutable std::mutex mutex_;
+
+    // ── 诊断计数器（NN_MEM_STATS / pool_stats 打印；每条只是整数自增）──────
+    // 用途：把"池粒度调细后耗时翻倍"归因到具体机制（线性扫描 vs 底材申请），
+    // 而不是靠猜。c_block_scans_ = allocate 里被检查的 block 数（Σ），
+    // c_region_scans_ = find_best 里被检查的空闲区数（Σ），
+    // c_blocks_created_ / c_vkalloc_ms_ = vkAllocateMemory 次数与累计耗时。
+    mutable std::size_t c_alloc_calls_ = 0;
+    mutable std::size_t c_free_calls_ = 0;
+    mutable std::size_t c_block_scans_ = 0;
+    mutable std::size_t c_region_scans_ = 0;
+    mutable std::size_t c_blocks_created_ = 0;
+    mutable std::size_t c_blocks_released_ = 0;
+    mutable double c_vkalloc_ms_ = 0.0;
 
     // 空闲区查找：best-fit（P3 抗碎片）。
     // 在候选块内选"对齐后剩余碎片最小 && 对齐 padding 不超预算"的空闲区。
@@ -202,9 +231,13 @@ private:
         alloc_info.memoryTypeIndex = memory_type_index;
 
         VkDeviceMemory memory = VK_NULL_HANDLE;
+        const auto t0 = std::chrono::steady_clock::now();
         VkResult res = vkAllocateMemory(device_, &alloc_info, nullptr, &memory);
+        c_vkalloc_ms_ += std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - t0).count();
         if (res != VK_SUCCESS)
             return std::unexpected(Error{"vkAllocateMemory failed: " + std::to_string(res)});
+        c_blocks_created_++;
 
         Block block;
         block.owning_device = device_;
@@ -237,9 +270,11 @@ private:
 public:
     MemoryPool(VkDevice device, VkPhysicalDevice physical_device,
                VkDeviceSize block_size = DEFAULT_BLOCK_SIZE,
-               VkDeviceSize small_block_size = DEFAULT_SMALL_BLOCK_SIZE)
+               VkDeviceSize small_block_size = DEFAULT_SMALL_BLOCK_SIZE,
+               VkDeviceSize ladder_max = 0)
         : device_(device), physical_device_(physical_device), block_size_(block_size),
-          small_block_size_(small_block_size), retain_free_bytes_(0)
+          small_block_size_(small_block_size), retain_free_bytes_(0),
+          ladder_max_(ladder_max)
     {
         vkGetPhysicalDeviceMemoryProperties(physical_device_, &mem_props_);
     }
@@ -258,6 +293,7 @@ public:
         VkMemoryPropertyFlags fallback_flags = 0)
     {
         std::lock_guard lock(mutex_);
+        c_alloc_calls_++;
 
         auto mem_type = find_memory_type(requirements.memoryTypeBits, preferred_flags, fallback_flags);
         if (!mem_type)
@@ -274,7 +310,18 @@ public:
         // 尺寸分类分池：超大分配独占整块；小分配走小块池；其余走大块池。
         // 顺序：alloc > 大块阈值 → 独占超大块；alloc < 小块阈值 → 小块池。
         VkDeviceSize pool_size;
-        if (alloc_size > block_size_)
+        if (ladder_max_ > 0 && alloc_size >= SMALL_ALLOC_THRESHOLD)
+        {
+            // ── 自适应阶梯（2026-09 实测调参）──────────────────────────
+            // 固定类别无法同时服务大小负载：小负载要细（抗内部碎片），大
+            // 负载要粗（少 vkAllocateMemory）。改为"类别 = 不小于分配尺寸的
+            // 最小 2 的幂"，夹在 [small_block_size_, ladder_max_]；超出上限
+            // 则独占精确尺寸块。等价于把原来的单一中等类别拆成一串类别。
+            VkDeviceSize c = small_block_size_;
+            while (c < alloc_size && c < ladder_max_) c <<= 1;
+            pool_size = (alloc_size > ladder_max_) ? alloc_size : c;
+        }
+        else if (alloc_size > block_size_)
             pool_size = alloc_size;                 // 超出大块底材：独占整块
         else if (alloc_size < SMALL_ALLOC_THRESHOLD)
             pool_size = small_block_size_;          // 小分配：小块底材池（抗碎片）
@@ -285,10 +332,12 @@ public:
         for (auto& block_ptr : blocks_)
         {
             auto& block = *block_ptr;
+            c_block_scans_++;
             if (block.memory_type_index != *mem_type)
                 continue;
             if (block.size != pool_size)
                 continue;  // 只服务同尺寸分类的块，保持大块连续性
+            c_region_scans_ += block.free_regions.size();
             auto best = find_best(block, alignment, alloc_size);
             if (best)
             {
@@ -323,6 +372,7 @@ public:
             return;
 
         std::lock_guard lock(mutex_);
+        c_free_calls_++;
         SuballocKey key{alloc.memory, alloc.offset};
         auto active_it = active_allocs_.find(key);
         if (active_it == active_allocs_.end())
@@ -405,6 +455,15 @@ public:
         VkDeviceSize device_bytes = 0;     // DEVICE_LOCAL 块（真实显存）
         VkDeviceSize host_bytes = 0;       // HOST_VISIBLE 块（host RAM，offload 用）
 
+        // 池账本计数器（诊断，见 MemoryPool::c_* 注释）
+        std::size_t c_alloc_calls = 0;
+        std::size_t c_free_calls = 0;
+        std::size_t c_block_scans = 0;
+        std::size_t c_region_scans = 0;
+        std::size_t c_blocks_created = 0;
+        std::size_t c_blocks_released = 0;
+        double vkalloc_ms = 0.0;
+
         [[nodiscard]] std::string to_string() const
         {
             constexpr std::size_t MB = 1024 * 1024;
@@ -416,6 +475,14 @@ public:
             s += " host=" + std::to_string(host_bytes / MB) + "MB";
             s += " free=" + std::to_string(free_bytes / MB) + "MB";
             s += " frag=" + std::to_string(fragmentation);
+            // 池账本计数器（诊断；把"粒度变细 → 耗时翻倍"归因到线性扫描/底材申请）
+            s += " | calls a/f=" + std::to_string(c_alloc_calls) + "/" +
+                 std::to_string(c_free_calls);
+            s += " scans blk=" + std::to_string(c_block_scans) + " reg=" +
+                 std::to_string(c_region_scans);
+            s += " blk_new/free=" + std::to_string(c_blocks_created) + "/" +
+                 std::to_string(c_blocks_released);
+            s += " vkalloc=" + std::to_string(vkalloc_ms) + "ms";
             return s;
         }
     };
@@ -425,6 +492,13 @@ public:
         std::lock_guard lock(mutex_);
         PoolStats s;
         s.block_count = blocks_.size();
+        s.c_alloc_calls = c_alloc_calls_;
+        s.c_free_calls = c_free_calls_;
+        s.c_block_scans = c_block_scans_;
+        s.c_region_scans = c_region_scans_;
+        s.c_blocks_created = c_blocks_created_;
+        s.c_blocks_released = c_blocks_released_;
+        s.vkalloc_ms = c_vkalloc_ms_;
         for (const auto& bp : blocks_)
         {
             const auto& b = *bp;
@@ -446,6 +520,22 @@ public:
             s.fragmentation = 1.0 - static_cast<double>(s.max_contiguous_free)
                                    / static_cast<double>(s.free_bytes);
         return s;
+    }
+
+    // ── 活跃分配逐项尺寸（探针归因用）：降序返回每个在用分配的字节数 ──
+    // 供 mem_probe 在阶段采样点打印 top-N 张量，把池增量精确落到具体分配。
+    [[nodiscard]] std::vector<VkDeviceSize> live_alloc_sizes() const
+    {
+        std::lock_guard lock(mutex_);
+        std::vector<VkDeviceSize> sizes;
+        sizes.reserve(active_allocs_.size());
+        for (const auto& [key, sz] : active_allocs_)
+        {
+            (void)key;
+            sizes.push_back(sz);
+        }
+        std::sort(sizes.rbegin(), sizes.rend());
+        return sizes;
     }
 
     // ── 整块归还（L2）───────────────────────────────────────────────
@@ -479,6 +569,7 @@ public:
                     total_free -= b.size;
                     // 通过 erase 触发 Block 析构（析构中 vkFreeMemory）
                     it = blocks_.erase(it);
+                    c_blocks_released_++;
                     continue;
                 }
             }

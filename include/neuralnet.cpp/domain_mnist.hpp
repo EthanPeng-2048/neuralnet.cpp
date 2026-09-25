@@ -98,12 +98,14 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
 [[nodiscard]] inline Result<Model> build_mnist_mlp_model(
     ComputeEngine& engine,
     const std::vector<std::size_t> &layer_dims = MNIST_LAYER_DIMS,
-    NormType norm_type = NormType::LayerNorm)
+    NormType norm_type = NormType::LayerNorm,
+    PrecisionProfile precision = PrecisionProfile{})
 {
     if (layer_dims.size() < 2)
         return std::unexpected(Error{"MLP layer_dims must have at least 2 elements"});
 
     Model model(engine);
+    model.set_default_precision_profile(precision);   // 须在 add 之前：权重按精度创建
     for (std::size_t i = 0; i < layer_dims.size() - 1; ++i)
     {
         std::size_t in_dim  = layer_dims[i];
@@ -141,7 +143,8 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
     std::size_t d_model    = MNIST_TF_D_MODEL,
     std::size_t num_heads  = MNIST_TF_NUM_HEADS,
     std::size_t d_ff       = MNIST_TF_D_FF,
-    std::size_t num_layers = MNIST_TF_NUM_LAYERS)
+    std::size_t num_layers = MNIST_TF_NUM_LAYERS,
+    PrecisionProfile precision = PrecisionProfile{})
 {
     if (img_size % patch_size != 0)
         return std::unexpected(Error{"MNIST Transformer: img_size must be divisible by patch_size"});
@@ -154,6 +157,7 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
     const std::size_t num_patches = grid_size * grid_size;
 
     Model model(engine);
+    model.set_default_precision_profile(precision);   // 须在 add 之前：权重按精度创建
     {
         auto r = model.add<PatchEmbedding>(img_size, patch_size, d_model);
         if (!r) return std::unexpected(r.error());
@@ -192,11 +196,13 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
 // ── 从 ModelSpec 构建模型 ─────────────────────────────────────────────────
 // 用于从二进制文件加载时自动还原架构（支持 MLP 和 Transformer）
 [[nodiscard]] inline Result<Model> build_mnist_model_from_spec(
-    ComputeEngine& engine, const ModelSpec &spec)
+    ComputeEngine& engine, const ModelSpec &spec,
+    PrecisionProfile precision = PrecisionProfile{})
 {
     if (spec.is_mlp())
     {
-        auto model = build_mnist_mlp_model(engine, spec.layer_dims, spec.norm_type);
+        auto model = build_mnist_mlp_model(engine, spec.layer_dims, spec.norm_type,
+                                           precision);
         if (model)
             model->set_spec(spec);  // 记录架构规格，供 load_model 校验
         return model;
@@ -207,7 +213,7 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
         const std::size_t patch_size = spec.patch_size != 0 ? spec.patch_size : MNIST_PATCH_SIZE;
         auto model = build_mnist_transformer_model(
             engine, MNIST_IMG_SIZE, patch_size,
-            spec.d_model, spec.num_heads, spec.d_ff, spec.num_layers);
+            spec.d_model, spec.num_heads, spec.d_ff, spec.num_layers, precision);
         if (model)
             model->set_spec(spec);  // 记录架构规格，供 load_model 校验
         return model;

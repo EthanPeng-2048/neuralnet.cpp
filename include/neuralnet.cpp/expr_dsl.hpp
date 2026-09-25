@@ -255,10 +255,28 @@ struct CpuViewCache
     const Scalar* data = nullptr;
     std::size_t cols = 0;
 
+    // f16 源：§7.2 定义下 f16 的逐元素语义 = "f32 参考计算 + 输出舍入"，故
+    // 求值前把 f16 叶子**一次性**抬到 f32 副本，at() 仍是无分支的 f32 读。
+    // （把 f16 转换塞进 at() 会给 f32 热路径引入每元素分支 → 实测同类分支
+    //   使模板路径慢 3-5 倍，不可接受；这里用一次 O(n) 转换换零热路径代价。）
+    std::shared_ptr<Matrix> f32_view;
+
     void cache_cpu_view(const Tensor& t)
     {
         if (!t.is_cpu())
             return;
+        if (t.precision() == Precision::F16)
+        {
+            auto m = std::make_shared<Matrix>(t.rows(), t.cols());
+            const auto s = t.cpu_matrix<Precision::F16>().span();
+            auto d = m->span();
+            for (std::size_t i = 0; i < s.size(); ++i)
+                d[i] = static_cast<Scalar>(s[i]);   // 升 cast：精确无损
+            f32_view = std::move(m);
+            data = f32_view->span().data();
+            cols = t.cols();
+            return;
+        }
         const auto& m = t.cpu_matrix();
         data = m.span().data();
         cols = t.cols();
@@ -1099,7 +1117,8 @@ template <typename C, ExprOp Rop>
 // CPU：编译期模板直接求值（编译器内联 + SIMD 融合，等价手写循环）
 // ══════════════════════════════════════════════════════════════════════════
 template <typename E>
-[[nodiscard]] Tensor eval_cpu(const E& e, std::size_t rows, std::size_t cols)
+[[nodiscard]] Tensor eval_cpu(const E& e, std::size_t rows, std::size_t cols,
+                              Precision P = Precision::F32)
 {
     // 输出会被 eval_into_span 完整覆盖（每个下标恰好写一次）→ 用未初始化构造，
     // 省掉"分配 + 写满一遍零 + 马上被全覆盖"里的那一遍全尺寸零写。
@@ -1108,18 +1127,36 @@ template <typename E>
     // 与 eager 逐元素原语同构（串行+向量化提示 / 阈值以上并行）→ 同门控下
     // DSL 取代 elementwise_* 时 CPU 性能不倒退。
     eval_into_span(e, out.span(), cols);
+    // 多精度：f16 目标 = f32 参考求值 + 输出舍入到 f16（§7.2；round-half-to-even
+    // 由 f16 赋值语义保证）。f32 目标 = 直通，与迁移前逐字节一致。
+    if (P == Precision::F16)
+    {
+        MatrixT<Precision::F16> h(rows, cols);
+        const auto s = out.span();
+        auto d = h.span();
+        for (std::size_t i = 0; i < s.size(); ++i)
+            d[i] = s[i];
+        return Tensor::from_matrix(std::move(h));
+    }
     return Tensor::from_matrix(std::move(out));
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// 统一入口：engine.compute(expr, rows, cols)
+// 统一入口：engine.compute(expr, rows, cols[, P])
 //   CPU：编译期模板求值（SIMD 融合）。
 //   GPU：闭合世界 AOT —— to_expr_spec 折叠 → engine.eval_expr 匹配预生成
 //        shader；未命中由 eval_expr 硬报错（无 eager）。
+//
+// P = **输出存储精度**（多精度，docs/development/05-mixed-precision.md §8.1）。
+//   · 默认 F32 = 现状（零回归）；Layer 按 §8.5 约定显式传 p_.compute / p_.stable。
+//   · f16：CPU 侧 f16 叶子一次性抬到 f32 求值、输出舍入回 f16（§7.2）；
+//     GPU 侧由 PrecisionEngine 适配层做同样的边界 cast（Adapter 消费 P）。
+//   · **不做 Auto 推导**：P 是唯一可见实参，来源可追溯（§8.5 G4）。
 // ══════════════════════════════════════════════════════════════════════════
 template <typename E>
 [[nodiscard]] Result<Tensor> compute(ComputeEngine& eng, const E& e,
-                                     std::size_t rows, std::size_t cols)
+                                     std::size_t rows, std::size_t cols,
+                                     Precision P = Precision::F32)
 {
 #ifdef NN_EXPR_SCAN
     // 构建期扫描模式：折叠内联表达式的**结构**并登记进全局注册表，
@@ -1129,8 +1166,13 @@ template <typename E>
     auto [spec, inputs] = to_expr_spec(e);
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)
         return std::unexpected(v.error());
-    fused::global_registry().add(spec);
-    return Tensor::cpu(rows, cols);
+    // 精度签名（结构 key 不含精度）：同一结构可登记多个带类型变体
+    // （in-kernel f16 = 半精度直读直写）。占位张量按目标精度返回 —— 否则
+    // dry-run 下游层看到的是 f32，f16 变体永远发现不到。
+    const ExprPrecSig sig = expr_prec_sig_of(inputs, P);
+    fused::global_registry().add(spec, sig);
+    return P == Precision::F16 ? Tensor::cpu<Precision::F16>(rows, cols)
+                               : Tensor::cpu(rows, cols);
 #else
     if (eng.device() == Device::CPU)
     {
@@ -1143,7 +1185,7 @@ template <typename E>
                 // 预绑定只是**优化**：任何前置条件不满足（形状/设备不符等）就
                 // 回退解释器，与迁移前逐位一致，不引入正确性风险。
                 if (auto r = cpu_prepare(e, eng, rows, cols); r)
-                    return eval_cpu(e, rows, cols);
+                    return eval_cpu(e, rows, cols, P);
             }
             // 含归约且不可预绑定（或预绑定失败）：模板求值无法表达"全行/全列
             // 归约"，折叠成 ExprSpec 走引擎 eval_expr（CPU 扩展语义处理归约
@@ -1151,16 +1193,34 @@ template <typename E>
             auto [spec, inputs] = to_expr_spec(e);
             if (auto v = validate_expr_spec(spec, inputs.size()); !v)
                 return std::unexpected(v.error());
-            return eng.eval_expr(spec, inputs, rows, cols);
+            return eng.eval_expr(spec, inputs, rows, cols, P);
         }
-        return eval_cpu(e, rows, cols);
+        return eval_cpu(e, rows, cols, P);
     }
 
     auto [spec, inputs] = to_expr_spec(e);
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)
         return std::unexpected(v.error());
-    return eng.eval_expr(spec, inputs, rows, cols);  // 闭合世界：GPU 未命中即报错
+    return eng.eval_expr(spec, inputs, rows, cols, P);  // 闭合世界：GPU 未命中即报错
 #endif
+}
+
+// ── CPU 侧"写进目标张量"（f16 目标 → f32 参考求值 + 舍入写回，§7.2）────────
+// f32 目标 = 与迁移前逐字节一致（直通 span，零额外拷贝）。
+template <typename E>
+inline void eval_into_tensor_cpu(const E& e, Tensor& dst)
+{
+    if (dst.precision() == Precision::F16)
+    {
+        Matrix tmp = Matrix::make_uninitialized(dst.rows(), dst.cols());
+        eval_into_span(e, tmp.span(), dst.cols());
+        const auto s = tmp.span();
+        auto d = dst.cpu_matrix<Precision::F16>().span();
+        for (std::size_t i = 0; i < s.size(); ++i)
+            d[i] = s[i];
+        return;
+    }
+    eval_into_span(e, dst.cpu_matrix().span(), dst.cols());
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1175,6 +1235,9 @@ template <typename E>
 //   dst += row_broadcast(v)→ compute_into(eng, leaf(dst) + row_broadcast(v), dst)
 // dst 与某个输入是同一 buffer 是安全的（逐元素先读后写）。
 //
+// 多精度（§8.3 in-place 特例）：**输出精度 = dst 的存储精度**（不可变）。
+// 故本入口没有 P 形参——想改精度必须显式 cast（唯一"变精度"算子）。
+//
 // CPU 走编译期模板求值（与 compute() 的 eval_cpu 同一路径 + 同一并行门控），
 // 因此"原地"不引入任何分配/拷贝；GPU 走 AOT 融合 shader 的 output_override。
 // 仅支持逐元素表达式（无归约）；归约向量输出用 compute_reduce。
@@ -1188,8 +1251,10 @@ template <typename E>
     auto [spec, inputs] = to_expr_spec(e);
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)
         return std::unexpected(v.error());
+    // 原地语义：输出精度 = dst 的存储精度（§8.3）→ 签名输出位取 dst
+    const ExprPrecSig sig = expr_prec_sig_of(inputs, dst.precision());
     (void)dst;
-    fused::global_registry().add(spec);
+    fused::global_registry().add(spec, sig);
     return {};
 #else
     if (eng.device() == Device::CPU)
@@ -1210,7 +1275,7 @@ template <typename E>
                 // 同 compute()：预绑定失败即回退，不引入正确性风险。
                 if (auto r = cpu_prepare(e, eng, dst.rows(), dst.cols()); r)
                 {
-                    eval_into_span(e, dst.cpu_matrix().span(), dst.cols());
+                    eval_into_tensor_cpu(e, dst);   // f16 dst → f32 参考 + 舍入写回
                     return {};
                 }
             }
@@ -1222,7 +1287,7 @@ template <typename E>
         }
         // 纯逐元素：编译期模板直接写进 dst 的 span（零解释器开销、零分配），
         // 与 eval_cpu / 逐元素原语同一循环结构 + 同一并行门控。
-        eval_into_span(e, dst.cpu_matrix().span(), dst.cols());
+        eval_into_tensor_cpu(e, dst);
         return {};
     }
 
@@ -1234,16 +1299,18 @@ template <typename E>
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// 归约向量原生形状输出：compute_reduce(engine, expr, rows, cols)
+// 归约向量原生形状输出：compute_reduce(engine, expr, rows, cols[, P])
 //
 // 与 compute() 等价，但输出为归约向量本身（(rows,1)/(1,cols)），而非广播到
 // (rows,cols)。用于 LayerNorm/RMSNorm 的 (1,B) 统计量缓存（mean/var/rms_inv）
 // 与 (F,1) 梯度归约（grad_gamma/grad_beta）——只产出小向量，避免写全尺寸广播。
 // 要求表达式归约轴为 0/1（否则引擎报错）。
+// P：输出向量精度（§8.1；归约恒 f32 累加 + 输出舍入到 P，§7.3）。
 // ══════════════════════════════════════════════════════════════════════════
 template <typename E>
 [[nodiscard]] Result<Tensor> compute_reduce(ComputeEngine& eng, const E& e,
-                                            std::size_t rows, std::size_t cols)
+                                            std::size_t rows, std::size_t cols,
+                                            Precision P = Precision::F32)
 {
 #ifdef NN_EXPR_SCAN
     // 构建期扫描：同 compute()，登记结构（归约轴由 gen_fused 判定）。
@@ -1254,7 +1321,13 @@ template <typename E>
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)
         return std::unexpected(v.error());
     const int raxis = expr_spec_reduce_axis(spec);
-    fused::global_registry().add(spec);
+    // 精度签名（同 compute()）：占位张量按目标精度返回，供下游 dry-run 继续
+    const ExprPrecSig sig = expr_prec_sig_of(inputs, P);
+    fused::global_registry().add(spec, sig);
+    if (P == Precision::F16)
+        return (raxis == 0) ? Tensor::cpu<Precision::F16>(rows, 1)
+             : (raxis == 1) ? Tensor::cpu<Precision::F16>(1, cols)
+             : Tensor::cpu<Precision::F16>(rows, cols);
     return (raxis == 0) ? Tensor::cpu(rows, 1)
          : (raxis == 1) ? Tensor::cpu(1, cols)
          : Tensor::cpu(rows, cols);
@@ -1267,13 +1340,19 @@ template <typename E>
             // 预绑定路径：根节点是纯归约 → 归约向量已算好，直接拷成
             // (rows,1)/(1,cols)，不必经 ExprSpec 解释器。失败即回退。
             if (auto r = cpu_prepare(e, eng, rows, cols); r)
-                return reduce_vector_tensor(e, rows, cols);
+            {
+                auto v = reduce_vector_tensor(e, rows, cols);
+                if (P == Precision::F32)
+                    return v;
+                // f16 目标：归约向量求值在 f32 参考空间，结果舍入到 f16（§7.3）
+                return eng.cast(v, P);
+            }
         }
     }
     auto [spec, inputs] = to_expr_spec(e);
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)
         return std::unexpected(v.error());
-    return eng.eval_expr_reduce(spec, inputs, rows, cols);
+    return eng.eval_expr_reduce(spec, inputs, rows, cols, P);
 #endif
 }
 

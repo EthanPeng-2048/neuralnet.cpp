@@ -629,6 +629,70 @@ int main()
             if (!ok) fail += mismatches;
         }
     }
+    // ── CE 梯度原地复用（grad_reuse=&logits）必须与非复用路径逐位一致 ──
+    // 原地写复用 logits 的缓冲（训练峰值优化）；若表达式存在跨行读取或
+    // 读后写顺序问题，两边梯度会立刻出现差异。
+    {
+        std::cout << std::endl << "── CE 梯度原地复用 vs 独立缓冲 ──" << std::endl;
+        constexpr std::size_t C = 37, N = 64;
+        nn::Matrix logits(C, N), lm(1, N);
+        std::mt19937 rng(999);
+        std::uniform_real_distribution<Scalar> dist(-2.0f, 2.0f);
+        for (std::size_t r = 0; r < C; ++r)
+            for (std::size_t c = 0; c < N; ++c)
+                logits.set_value_unchecked(r, c, dist(rng));
+        std::vector<std::size_t> labels(N);
+        for (std::size_t i = 0; i < N; ++i)
+            labels[i] = static_cast<std::size_t>(rng() % C);
+        for (std::size_t i = 0; i < N; ++i)
+            lm.set_value_unchecked(0, i, (i % 5 == 0) ? Scalar{0} : Scalar{1});
+        const std::span<const Scalar> mask_span(lm.span());
+
+        auto a_logits = gpu_engine.from_matrix(logits);
+        auto b_logits = gpu_engine.from_matrix(logits);
+        bool ok = (bool)a_logits && (bool)b_logits;
+        Scalar grad_diff = -1.0f;
+        if (!ok)
+        {
+            std::cout << "[FAIL] grad_reuse: from_matrix 失败" << std::endl;
+            ++fail;
+        }
+        else
+        {
+            nn::CrossEntropyLoss ce_a, ce_b;
+            std::size_t nv_a = 0, nv_b = 0;
+            auto bb = gpu_engine.begin_batch();
+            auto sa = ce_a.forward_sparse_sum(gpu_engine, *a_logits, labels,
+                                              mask_span, C, nv_a);
+            auto sb = ce_b.forward_sparse_sum(gpu_engine, *b_logits, labels,
+                                              mask_span, C, nv_b,
+                                              /*grad_reuse=*/&(*b_logits));
+            ok = (bool)bb && (bool)sa && (bool)sb;
+            if (ok)
+            {
+                auto ga = ce_a.backward();
+                auto gb = ce_b.backward();
+                ok = (bool)ga && (bool)gb;
+                if (ok)
+                {
+                    auto ma = gpu_engine.to_matrix(*ga);
+                    auto mb = gpu_engine.to_matrix(*gb);
+                    ok = (bool)ma && (bool)mb;
+                    if (ok)
+                    {
+                        grad_diff = max_abs_diff(*ma, *mb);
+                        ok = (grad_diff == Scalar{0});
+                    }
+                }
+            }
+            auto eb = gpu_engine.end_batch();
+            if (!eb) ok = false;
+            std::cout << (ok ? "[PASS] " : "[FAIL] ")
+                      << "CE 梯度原地复用（loss 一致 + grad max_diff="
+                      << grad_diff << "）" << std::endl;
+            if (!ok) ++fail;
+        }
+    }
 #endif
 
     std::cout << (fail == 0 ? "\nALL PASS\n" : "\nFAILED\n");
