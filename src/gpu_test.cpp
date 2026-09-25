@@ -270,6 +270,69 @@ int main(int argc, char* argv[])
         }
     }
 
+    // ── 3d. transpose 逐元素对拍（issue #13 P0-① 回归）────────────────
+    // 历史 bug：backend 派发 (16,8,n_bricks) 而 transpose.comp 按 8 宽砖
+    // 解算（假定 gl_WorkGroupID.x ∈ [0,8)）→ 行>512 且 列>512 时静默只写
+    // 前 512 行。旧测试形状最大 64×256，永远单边 ≤512，故漏检。
+    // 形状表覆盖：单边 ≤512（旧代码 PASS）/ 双边 >512（旧代码 FAIL 50%）/
+    // 奇数边界（513、1000 非 tile 整倍数）/ 非方阵。
+    std::cout << "[3d] transpose 正确性 (GPU vs CPU 参考, 逐元素)...\n";
+    {
+        struct TpCase { std::size_t R, C; };
+        const TpCase cases[] = {
+            {  64,   64}, { 512,  512}, { 513,  513},   // 方阵 / 奇数边界
+            { 256, 1024}, {1024,  256},                  // 单边 ≤512
+            { 512, 1024}, {1024,  512},                  // 单边恰好 512
+            {1000, 2000}, {2000, 1000},                  // 非 tile 整倍数双边 >512
+            {1024, 1024}, {1024, 4096}, {4096, 1024},    // 双边 >512
+            {2048, 2048}, {4096, 4096},                  // 大方阵
+        };
+        for (const auto& c : cases)
+        {
+            Matrix a(c.R, c.C);
+            for (auto& v : a.span()) v = dist(rng);
+
+            auto a_t = gpu_engine->from_matrix(a);
+            auto r_t = a_t ? gpu_engine->transpose(*a_t) : nn::Result<Tensor>{std::unexpected(a_t.error())};
+            auto out_r = r_t ? gpu_engine->to_matrix(*r_t) : nn::Result<Matrix>{std::unexpected(r_t.error())};
+            if (!out_r)
+            {
+                std::cout << "  " << c.R << "x" << c.C << " 执行失败: "
+                          << out_r.error().message << "\n";
+                ++failures;
+                continue;
+            }
+
+            // 转置是纯数据搬运 → 逐位比对（0 容差）；统计失配率与首个错误下标
+            const Matrix& out = *out_r;
+            const bool shape_ok = (out.rows() == c.C && out.cols() == c.R);
+            std::size_t bad = 0, first_r = 0, first_c = 0;
+            bool found_first = false;
+            if (shape_ok)
+            {
+                auto as = a.span();
+                auto os = out.span();
+                for (std::size_t r = 0; r < c.R; ++r)
+                    for (std::size_t col = 0; col < c.C; ++col)
+                        if (os[col * c.R + r] != as[r * c.C + col])
+                        {
+                            if (!found_first) { first_r = r; first_c = col; found_first = true; }
+                            ++bad;
+                        }
+            }
+            const std::size_t total = c.R * c.C;
+            const double pct = total ? 100.0 * static_cast<double>(bad) / static_cast<double>(total) : 0.0;
+            const bool ok = shape_ok && bad == 0;
+            if (!ok) ++failures;
+            std::cout << "  " << c.R << "x" << c.C
+                      << (shape_ok ? "" : " 形状错误(out=" + std::to_string(out.rows()) + "x" + std::to_string(out.cols()) + ")")
+                      << " 失配 " << std::fixed << std::setprecision(1) << pct << "%";
+            if (found_first)
+                std::cout << " 首个错误下标 r=" << first_r << " c=" << first_c;
+            std::cout << (ok ? " ✅" : " ❌") << "\n";
+        }
+    }
+
     // ── 4. roundtrip + 逐元素 + 归约测试 ─────────────────────────
     std::cout << "\n[4/6] roundtrip + 逐元素 + 归约测试...\n";
     {

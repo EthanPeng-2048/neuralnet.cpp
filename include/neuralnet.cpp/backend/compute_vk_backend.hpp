@@ -4173,11 +4173,15 @@ public:
         // 砖块化 dispatch：(8, 8, n_bricks)——每 WG 覆盖 64×64 输出块，
         // 8×8 个 WG 组成一砖（并发足迹聚集，见 transpose.comp 头注释）。
         // 越界 tile 由 shader 早退（dispatch 固定 8×8，末砖可不满）。
+        // ⚠️ x 必须是 8 而非 16：shader 按 8 宽砖解算 tile_c =
+        // (bz%bx_count)*8 + gl_WorkGroupID.x，假定 gl_WorkGroupID.x ∈ [0,8)。
+        // 曾误派发 16 宽 → tile_c 跨两砖且越界 tile 只早退一半，
+        // 行>512 且列>512 时静默只写前 512 行（issue #13 P0-①）。
         const uint32_t tx = (C + 63u) / 64u;
         const uint32_t ty = (R + 63u) / 64u;
-        const uint32_t bx = (tx + 15u) / 16u;
+        const uint32_t bx = (tx + 7u) / 8u;
         const uint32_t by = (ty + 7u) / 8u;
-        vkCmdDispatch(cmd, 16, 8, bx * by);
+        vkCmdDispatch(cmd, 8, 8, bx * by);
         record_output_barrier(cmd, output.buffer().impl());
 
         if (owns_cmd)
