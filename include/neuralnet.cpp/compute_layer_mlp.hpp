@@ -121,6 +121,11 @@ public:
         // compute_into 无需 P：§8.3 in-place 存储精度不可变）
         auto grad_input = engine.matmul(w_, grad_output, true, false, p_.compute);
         if (!grad_input) return std::unexpected(grad_input.error());
+        nn_dbg_scan("lin.grad_out", engine, grad_output);
+        nn_dbg_scan("lin.cache", engine, input_cache_);
+        nn_dbg_scan("lin.grad_w(pre)", engine, grad_w_);
+        nn_dbg_scan("lin.grad_b(pre)", engine, grad_b_);
+        nn_dbg_scan("lin.grad_in", engine, *grad_input);
 
         // grad_w += grad_output × input^T：matmul 段与累加**融合为单次 dispatch**
         // 并原地写入 grad_w_（GPU 上 1 个融合 kernel：不物化 gw (out,in)，也不额外
@@ -130,6 +135,7 @@ public:
             dsl::leaf(grad_w_) + dsl::matmul(grad_output, input_cache_, false, true),
             grad_w_);
         if (!grad_w_acc) return std::unexpected(grad_w_acc.error());
+        nn_dbg_scan("lin.grad_w(post-accum)", engine, grad_w_);
 
         // grad_b += Σ grad_output（行归约，默认 f32）
         // 注：此项**无法**并入表达式——归约向量输出契约要求输出链只经归约/
@@ -138,8 +144,10 @@ public:
         // "归约原语 + 累加原语"两步。
         auto gb = engine.row_reduce_sum(grad_output, p_.compute);
         if (!gb) return std::unexpected(gb.error());
+        nn_dbg_scan("lin.row_sum(grad_out)", engine, *gb);
         auto r2 = engine.accumulate(grad_b_, *gb);
         if (!r2) return std::unexpected(r2.error());
+        nn_dbg_scan("lin.grad_b(post-accum)", engine, grad_b_);
 
         return grad_input;
     }

@@ -557,7 +557,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 
 **已知问题**
 
-1. **CPU 侧 f16 全模型训练发散（未定位）**：同初值/同超参下 CPU 5~7 步后 loss NaN，GPU 稳定收敛；f32 对照组两种设备都收敛；仅 param f16 / 仅 compute f16（master-weights）在 CPU 上同样 NaN → 与优化器状态精度无关，指向 CPU 侧 f16 存储/求值路径。CPU 单算子级 f16（DSL / matmul / 归约 / 搬运 / in-place）测试全部通过；`f16_precision_test` 对 CPU 打印该问题而不判失败。
+1. ~~**CPU 侧 f16 全模型训练发散（未定位）**~~ **已修复（2026-09-25，§12.12）**：双根因 = ① DSL 预绑定把 f16 操作数喂给 f32 GEMM（空指针 UB）；② `float_to_half_bits` 次正规分支 `exp <= -46` 守卫错误导致 exp ∈ [-45,-33] 移位 UB（小梯度被写成垃圾 half）。修复后 CPU f16 全模型训练与 f32 逐 step 贴合，`f16_precision_test` 的容忍分支已改为硬失败。
 2. 边界 cast 的 transient 膨胀（见上）；根治需 in-kernel f16。
 3. RAPT / ZiPT / CNN 的层内 DSL 调用**未接线**（仍 F32）→ 这些架构下 f16 基本无效（正确性无虞，只是不省）。
 4. `--activation-offload` 下 f16 激活写入 slab 前被抬为 f32（正确，但该份激活不再减半）。
@@ -919,6 +919,60 @@ nn_embed_shader(matmul_tiled_f16   ${CMAKE_SOURCE_DIR}/shaders/matmul_tiled.comp
 - 7 条"扫描预测不到的运行时签名"（fold 1 / matmul 段 run-only sig 3 / 含归约 `[f32,f16]→f32` 2 / 逐元素 2）
   —— 需要在 scan 的 f16 dry-run 里覆盖"f32 梯度输入 + f16 激活"这类混合组合。
 - fold（注意力 forward）的带类型变体仍未做。
+
+---
+
+### 12.12 CPU 侧 f16 训练发散的双根因与修复（2026-09-25）
+
+§12.5 已知问题 1（"CPU f16 全模型训练 5~7 步 NaN，未定位；单算子测试全过"）已定位并修复。
+实为**两个独立缺陷叠加**，且两者都被测试盲区掩盖：
+
+#### 根因 1：DSL 预绑定把 f16 操作数喂给 f32 GEMM（空指针 UB）
+
+- `MatmulRef::prepare_cpu` 固定以 `P=F32` 物化 C，而 `CpuEngine::matmul` 的 f32 路径按
+  f32 存储直读 `A.cpu_matrix()` —— f16 张量上 `cpu_get_ptr<F32>()` 返回**空指针**
+  （`NN_ASSERT` 在 NDEBUG 下为空）→ Debug 构建 fail-fast、Release 读空/垃圾。
+  **症状**：`text_train --f16`（CPU）0xC0000005 访问违例；组件探针 A1 阶段断言
+  `cpu_matrix<P>() const: tensor has no P-precision CPU storage`。
+- 同族缺陷：`ReduceViewRef::prepare` 直读 `r.t.cpu_matrix()`；适配层 `matmul/batched_matmul`
+  把 `P != F32` 无条件下传（操作数混合精度时内层按单一精度直读）；CPU 解释器
+  `eval_expr_impl` 输入/输出未校验精度。
+- **修复**：`prepare_cpu` 先把非 f32 操作数抬到 f32 再物化（C 按 f32 绑定）；
+  `ReduceViewRef` f16 输入一次性镜像；`CpuEngine::matmul/batched_matmul` 精度与存储不匹配时
+  统一回退 f32 空间计算 + 输出按 P 舍入（两端同 f16 才走原生 f16 GEMM）；
+  `eval_expr_impl` 加精度 `NN_REQUIRE`（把静默 UB 变成响亮报错）。
+
+#### 根因 2：`float_to_half_bits` 次正规分支移位 UB（真正的"NaN 制造机"）
+
+- `precision.hpp` 的 f32→f16 转换在 `exp < -14` 分支的守卫写成 `exp <= -46`，但其注释
+  自己的公式只对 **exp ∈ [-25,-15]**（shift = -exp-1 ∈ [14,24]）成立：
+  **exp ∈ [-45,-33] 时 shift ≥ 32 → uint32 移位 UB**（x86 按 5 位掩码 →
+  `d = full >> (shift&31)` 取到大数 → 低 16 位回绕成垃圾 half）。
+- **症状**：`|v| ∈ [2.8e-14, 1.2e-10]`（2⁻⁴⁵~2⁻³³）的值被转成 `0x4000`(=2.0)、`0xCCCD`、
+  512、8192、11776、18432，随机落进 e=31 时是 NaN。**梯度正是这个量级**（前向激活 ~0.1
+  从不落入该窗口）→ 损坏只出现在 f16 梯度/参数写回 → 若干步后更新爆炸、loss NaN。
+  GPU 走硬件 f16 转换（`packHalf2x16`/`half()`）故全程正常 —— 与"只有 CPU 错"完全吻合。
+- **为什么既有测试没抓住**：① 全位域往返测试（h→f32→f16）的输入全部来自 half→float，
+  exp ≥ -24，进不了窗口；② `ref_ulp` 写成 `2^(e-10)`（应为 `2^(e-25)`，**大 2¹⁵ 倍**）→
+  RHE 容差比被测值本身还大 → 垃圾值（如 f=2.0 vs v=1e-12，容差 32）**全部放行**。
+- **修复**：守卫改 `exp <= -26`（≤-26 按公式 D < 0.5 恒 flush 到 0，与注释一致）；
+  测试 `ref_ulp` 改 `2^(e-25)`；新增 exp ∈ [-60,-26] 全网格断言（必须恒 0）+ 两个历史
+  垃圾代表值（1.14e-12、8.44e-11）定点断言。
+
+#### 验证
+
+- 组件探针 `f16_cpu_probe`（阶段 A–I，可独立编译也可走 CMake 目标）：修复前
+  param/compute/f16(CLI) 三组 profile 在 6 步内出现 11776/512/8192 级垃圾梯度
+  （`NN_F16_DEBUG=1` 逐中间量扫描把故障钉到 `lin.grad_w(post-accum)` 与 `accumulate`
+  的 `0 + 8.7e-13 → 18432`）；修复后 **bad=0，三组轨迹与 f32 逐位一致**
+  （3.4776→3.4640→3.4508→3.4381→…）。
+- `f16_precision_test` 的"已知问题"容忍分支改为**硬失败**（未来回归直接红）。
+- 诊断开关沉淀（默认零开销）：`NN_F16_DEBUG=1` → 层内 `nn_dbg_scan` 逐中间量 max/非有限
+  扫描 + `compute_into` 预绑定失败打印 + `accumulate`/`eval_into`/`prepare` 异常打印。
+- profile 单字段矩阵（f16_precision_test `NN_F16_DEBUG=1`）：param/compute/stable/CLI
+  四组均收敛且贴合 f32；仅 optimizer=F16 仍发散 —— §12.5 记录的**数值性**限制
+  （Adam v≈g²~1e-10 在 f16 下溢 → 更新爆炸），与本节两个缺陷无关。
+- ctest 全绿（含新增断言）；`text_train --f16` CPU 可正常训练。
 
 ---
 

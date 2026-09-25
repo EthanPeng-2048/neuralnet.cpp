@@ -25,9 +25,30 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <ranges>
+
+namespace nn::dsl
+{
+// 环境变量开关（MSVC 下 getenv 标记 deprecated → -Werror 会炸；走 _dupenv_s）
+inline bool env_flag(const char* name)
+{
+#ifdef _MSC_VER
+    char* buf = nullptr;
+    std::size_t len = 0;
+    const bool on = (_dupenv_s(&buf, &len, name) == 0 && buf != nullptr && buf[0] != '\0');
+    std::free(buf);
+    return on;
+#else
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] != '\0';
+#endif
+}
+} // namespace nn::dsl
 #include <utility>
 #include <vector>
 
@@ -462,14 +483,59 @@ struct MatmulRef
     {
         if (c_data_ != nullptr)
             return {};  // 幂等：同一棵树重复求值只物化一次
+        // ── 精度安全（§7.2 f32 参考；CPU f16 训练 NaN 根因修复）────────────
+        // C 固定以 P=F32 物化，而操作数可能带 **f16 存储**（profile_f16 的
+        // Linear 权重/激活）：内层 GEMM 的 f32 路径按 f32 存储直接读
+        // （cpu_matrix<F32>() 对 f16 存储返回空指针 → Release 读空 UB、
+        // Debug 断言）→ 实测 CPU f16 训练 step0 forward 即 NaN、text_train
+        // 0xC0000005。先把非 f32 操作数抬到 f32 再物化，C 按 f32 绑定。
+        const Tensor* pa = &a;
+        const Tensor* pb = &b;
+        Tensor ca, cb;
+        if (a.precision() != Precision::F32)
+        {
+            auto r = eng.cast(a, Precision::F32);
+            if (!r) return std::unexpected(r.error());
+            ca = std::move(*r);
+            pa = &ca;
+        }
+        if (b.precision() != Precision::F32)
+        {
+            auto r = eng.cast(b, Precision::F32);
+            if (!r) return std::unexpected(r.error());
+            cb = std::move(*r);
+            pb = &cb;
+        }
         constexpr Precision P = Precision::F32;
         Result<Tensor> c = (batch > 1)
-            ? eng.batched_matmul(a, b, batch, transA, transB, Scalar{1}, P)
-            : eng.matmul(a, b, transA, transB, P);
+            ? eng.batched_matmul(*pa, *pb, batch, transA, transB, Scalar{1}, P)
+            : eng.matmul(*pa, *pb, transA, transB, P);
         if (!c)
             return std::unexpected(c.error());
         if (!c->is_cpu())
             return std::unexpected(Error{"dsl matmul prepare: result not on CPU"});
+        if (c->precision() != Precision::F32)
+            return std::unexpected(Error{"dsl matmul prepare: result not f32"});
+        if (env_flag("NN_F16_DEBUG"))
+        {
+            const auto sp = c->cpu_matrix().span();
+            double mx = 0.0;
+            bool bad = false;
+            for (auto v : sp)
+            {
+                if (!std::isfinite(v)) bad = true;
+                else mx = std::max(mx, std::fabs(static_cast<double>(v)));
+            }
+            if (bad || mx > 10.0)
+                std::fprintf(stderr,
+                             "[dbg][prepare] C=(%zux%zu) A=(%zux%zu)%s B=(%zux%zu)%s "
+                             "max(C)=%.6g%s <<< 异常\n",
+                             c->rows(), c->cols(), pa->rows(), pa->cols(),
+                             pa->precision() == Precision::F16 ? "f16" : "f32",
+                             pb->rows(), pb->cols(),
+                             pb->precision() == Precision::F16 ? "f16" : "f32",
+                             mx, bad ? " NONFINITE" : "");
+        }
         c_cache_ = std::move(*c);
         c_data_ = c_cache_.cpu_matrix().span().data();
         return {};
@@ -1013,7 +1079,28 @@ template <ExprViewKind K>
         return std::unexpected(Error{"dsl reduce-view prepare: shape mismatch"});
 
     using R = ReduceViewRef<K>;
-    const auto s = r.t.cpu_matrix().span();
+    // f16 输入 → 归约在 f32 参考空间做（§7.2）：一次性镜像后读。直接
+    // cpu_matrix() 读 f16 存储 = 空指针 UB（与 MatmulRef::prepare_cpu 同源
+    // 的 CPU f16 NaN 根因家族）。
+    Matrix mirror;
+    std::span<const Scalar> s;
+    if (r.t.precision() == Precision::F32)
+    {
+        s = r.t.cpu_matrix().span();
+    }
+    else if (r.t.precision() == Precision::F16)
+    {
+        const auto s16 = r.t.template cpu_matrix<Precision::F16>().span();
+        mirror = Matrix(r.t.rows(), r.t.cols());
+        auto d = mirror.span();
+        for (std::size_t i = 0; i < s16.size(); ++i)
+            d[i] = static_cast<Scalar>(s16[i]);
+        s = mirror.span();
+    }
+    else
+    {
+        return std::unexpected(Error{"dsl reduce-view prepare: unsupported precision"});
+    }
     const Scalar init = R::reduces_max ? std::numeric_limits<Scalar>::lowest() : Scalar{0};
     const std::size_t len = R::reduces_rows ? rows : cols;
     r.vec_.assign(len, init);
@@ -1210,10 +1297,29 @@ template <typename E>
 template <typename E>
 inline void eval_into_tensor_cpu(const E& e, Tensor& dst)
 {
+    static const auto dbg_max = [](const Matrix& m)
+    {
+        double mx = 0.0;
+        bool bad = false;
+        for (auto v : m.span())
+        {
+            if (!std::isfinite(v)) bad = true;
+            else mx = std::max(mx, std::fabs(static_cast<double>(v)));
+        }
+        return std::pair<double, bool>{mx, bad};
+    };
     if (dst.precision() == Precision::F16)
     {
         Matrix tmp = Matrix::make_uninitialized(dst.rows(), dst.cols());
         eval_into_span(e, tmp.span(), dst.cols());
+        if (env_flag("NN_F16_DEBUG"))
+        {
+            const auto [mx, bad] = dbg_max(tmp);
+            if (bad || mx > 10.0)
+                std::fprintf(stderr,
+                             "[dbg][eval_into] tmp=(%zux%zu) max=%.6g%s <<< f16 写回前异常\n",
+                             dst.rows(), dst.cols(), mx, bad ? " NONFINITE" : "");
+        }
         const auto s = tmp.span();
         auto d = dst.cpu_matrix<Precision::F16>().span();
         for (std::size_t i = 0; i < s.size(); ++i)
@@ -1277,6 +1383,11 @@ template <typename E>
                 {
                     eval_into_tensor_cpu(e, dst);   // f16 dst → f32 参考 + 舍入写回
                     return {};
+                }
+                else if (nn::dsl::env_flag("NN_F16_DEBUG"))
+                {
+                    std::fprintf(stderr, "[dbg] compute_into prepare FAILED -> 解释器: %s\n",
+                                 r.error().message.c_str());
                 }
             }
             // 含归约：折叠成 ExprSpec 走引擎（与 compute() 的 CPU 分支一致）

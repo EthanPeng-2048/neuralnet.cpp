@@ -190,13 +190,16 @@ namespace detail
     {
         // 结果 < 2^-14：规格化前区或 0。
         // D = round(value * 2^24) = round((2^23 + M) * 2^(exp+1))
-        // 通用公式（shift = -exp-1）覆盖 exp ∈ [-46, -15]：
+        // 通用公式（shift = -exp-1）只对 exp ∈ [-25, -15]（shift 14..24）合法：
         //   exp = -25：shift = 24，2^-25（M=0）为 0 与 2^-24 的中点 → tie-to-even → 0；
         //              M>0（v > 2^-25）→ D ∈ (0.5, 1) → 1
         //   exp ≤ -26：D < 0.5（无 tie 可能）→ 恒 0
-        if (exp <= -46)
+        // ⚠ 曾误写成 exp <= -46：exp ∈ [-45,-33] 时 shift ≥ 32 → uint32 移位 UB
+        //   （x86 按 5 位掩码 → d 取到满 24 位尾数 → 指数字段回绕成垃圾 half：
+        //   实测 f16 训练中 ~1e-12 量级的梯度被写成 512/8192/11776/18432 甚至
+        //   NaN → CPU f16 训练发散；前向激活 ~0.1 从不落入该区间故测不出）。
+        if (exp <= -26)
         {
-            // |v| ≤ 2^-46 → D < 2^-22 → 0；同时避免 shift ≥ 32 的 UB
             return static_cast<std::uint16_t>(sign);
         }
         const std::uint32_t full = 0x800000u | mant;          // 24 位尾数（隐含 1）

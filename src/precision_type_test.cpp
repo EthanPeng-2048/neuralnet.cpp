@@ -56,7 +56,10 @@ float ref_half_to_float(std::uint16_t h)
          * (sign ? -1.0f : 1.0f);
 }
 
-// f16 位型的 ulp（normal: 2^(e-10)；denormal: 2^-24）
+// f16 位型的 ulp（normal: 2^((e-15)-10) = 2^(e-25)；denormal: 2^-24）
+// ⚠ 曾误写成 2^(e-10)（大 2^15 倍）→ RHE 容差比被测值本身还大，
+//   float_to_half_bits 的次正规 UB 窗口（exp ∈ [-45,-33]，已在 precision.hpp
+//   修复）产出的垃圾 half（如 0x4000=2.0）在该容差下**永远测不出来**。
 double ref_ulp(std::uint16_t h)
 {
     const std::uint32_t e = (h >> 10) & 0x1Fu;
@@ -64,7 +67,7 @@ double ref_ulp(std::uint16_t h)
         return std::ldexp(1.0, -24);
     if (e == 31)
         return 0.0;
-    return std::ldexp(1.0, static_cast<int>(e) - 10);
+    return std::ldexp(1.0, static_cast<int>(e) - 25);
 }
 
 constexpr bool is_f16_nan(std::uint16_t h)
@@ -194,6 +197,30 @@ void test_edge_values()
           "2^-25 + 2^-48 → 2^-24");
     // 2^-26（远小于中点）→ 0
     CHECK(bits_of(std::ldexp(1.0f, -26)) == 0, "2^-26 → 0");
+    // ── 次正规 UB 窗口回归（precision.hpp 的 exp<=-46 → exp<=-26 修复）──────
+    // exp ∈ [-45,-33]（|v| ≈ 2.8e-14 ~ 1.2e-10）曾走 shift ≥ 32 的移位 UB →
+    // 指数字段回绕成垃圾 half（0x4000=2.0、0xCCCD…）→ CPU f16 训练梯度被写成
+    // 512/8192/11776/18432/NaN。这个区间**必须恒 flush 到 0**。
+    for (int e = -60; e <= -26; ++e)
+    {
+        for (double frac = 0.0; frac < 1.0; frac += 0.05)
+        {
+            const float v = static_cast<float>(std::ldexp(1.0, e) * (0.5 + frac));
+            const std::uint16_t b = bits_of(v);
+            if (b != 0)
+            {
+                std::fprintf(stderr, "    v=%g (2^%d 区) → bits=0x%04X，应为 0\n", v, e, b);
+                ++g_failures;
+            }
+            if (bits_of(-v) != 0x8000)
+                ++g_failures;
+        }
+    }
+    // 修复窗口上沿的两个代表值（曾分别产出 0x4000=2.0 与 0x3333）
+    CHECK(bits_of(1.13687e-12f) == 0, "1.14e-12 → 0");
+    CHECK(bits_of(8.44011e-11f) == 0, "8.44e-11 → 0");
+    // 次正规区仍在窗口上方：2^-24 精确、2^-25 tie→0（上面已断言），再补 2^-26±
+    CHECK(bits_of(std::ldexp(1.0f, -26) * 1.5f) == 0, "1.5×2^-26 → 0");
     // ±0
     CHECK(bits_of(0.0f) == 0, "+0 → 0");
     CHECK(bits_of(-0.0f) == 0x8000, "-0 → 0x8000");
