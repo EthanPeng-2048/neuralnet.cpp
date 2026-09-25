@@ -30,6 +30,7 @@ private:
     std::size_t pos_offset_ = 0;   // 绝对位置偏移（滑动窗生成时用，0=从 0 起）
     Tensor cos_cache_;             // (d_k, seq_cached_)
     Tensor sin_cache_;             // (d_k, seq_cached_)
+    PrecisionProfile p_;           // 多精度（§9.2）：由持有它的注意力层下传
 
     // 把单个位置 pos 的 cos/sin 写入指定列（rebuild/apply_step 共用）。
     // LLaMA 式：cos 沿 d 维 = cat(freqs, freqs)（前后半相同），
@@ -81,6 +82,11 @@ public:
 
     [[nodiscard]] Result<void> init(ComputeEngine& /*engine*/) { return {}; }
 
+    // 多精度（§9.2）：RoPE 是辅助对象（非 Layer），由持有它的注意力层下传
+    // profile（否则 RoPE 的 DSL 求值退回 F32，f16 配置下 Q/K 存储不减半）
+    void set_precision_profile(const PrecisionProfile& p) { p_ = p; }
+    [[nodiscard]] const PrecisionProfile& precision_profile() const noexcept { return p_; }
+
     [[nodiscard]] std::size_t d_k() const noexcept { return d_k_; }
 
     // 设置绝对位置偏移（滑动窗生成：输入截断到窗口，位置从真实起点算起）。
@@ -114,11 +120,11 @@ public:
             return dsl::compute(engine,
                 dsl::leaf(q) * dsl::row_mod(cos_cache_, dk)
                 - dsl::rotate_half(q, dk) * dsl::row_mod(sin_cache_, dk),
-                q.rows(), q.cols());
+                q.rows(), q.cols(), p_.compute);
         return dsl::compute(engine,
             dsl::leaf(q) * dsl::row_mod(cos_cache_, dk)
             + dsl::rotate_half(q, dk) * dsl::row_mod(sin_cache_, dk),
-            q.rows(), q.cols());
+            q.rows(), q.cols(), p_.compute);
     }
 
     // 增量推理：q 为 (H*d_k, 1)，位置 = pos（cur_len）
@@ -139,11 +145,11 @@ public:
             return dsl::compute(engine,
                 dsl::leaf(q) * dsl::row_mod(*cr, dk)
                 - dsl::rotate_half(q, dk) * dsl::row_mod(*sr, dk),
-                q.rows(), q.cols());
+                q.rows(), q.cols(), p_.compute);
         return dsl::compute(engine,
             dsl::leaf(q) * dsl::row_mod(*cr, dk)
             + dsl::rotate_half(q, dk) * dsl::row_mod(*sr, dk),
-            q.rows(), q.cols());
+            q.rows(), q.cols(), p_.compute);
     }
 };
 
@@ -282,22 +288,22 @@ protected:
             //   注册（闭合世界：该结构此前从未被 dry-run 覆盖）
             if (fold_mask_variant_() == nn::expr::FoldAttnMask::Plain)
                 return dsl::compute(engine,
-                    dsl::matmul(Q, K, true, false, BH), BH * seq, seq);
+                    dsl::matmul(Q, K, true, false, BH), BH * seq, seq, p_.compute);
             if (use_slopes && use_doc)
                 return dsl::compute(engine,
                     masked_alibi_doc_(dsl::matmul(Q, K, true, false, BH), seq),
-                    BH * seq, seq);
+                    BH * seq, seq, p_.compute);
             if (use_slopes)
                 return dsl::compute(engine,
                     masked_alibi_(dsl::matmul(Q, K, true, false, BH), seq),
-                    BH * seq, seq);
+                    BH * seq, seq, p_.compute);
             if (use_doc)
                 return dsl::compute(engine,
                     masked_doc_(dsl::matmul(Q, K, true, false, BH), seq),
-                    BH * seq, seq);
+                    BH * seq, seq, p_.compute);
             return dsl::compute(engine,
                 masked_causal_(dsl::matmul(Q, K, true, false, BH), seq),
-                BH * seq, seq);
+                BH * seq, seq, p_.compute);
         }();
         if (!sres) return std::unexpected(sres.error());
         Tensor S = std::move(*sres);
@@ -308,7 +314,7 @@ protected:
             dsl::exp(dsl::leaf(S) - dsl::row_reduce_max(S))
             / dsl::row_reduce_sum(
                 dsl::exp(dsl::leaf(S) - dsl::row_reduce_max(S))),
-            BH * seq, seq);
+            BH * seq, seq, p_.compute);
     }
 
     // ── 掩码输入准备钩子（P-C2-7 前身 = two_pass_mask_ 决策钩子）─────────
@@ -356,6 +362,21 @@ public:
     {
         NN_ASSERT(d_model % num_heads == 0,
                   "AttentionBase: d_model must be divisible by num_heads");
+    }
+
+    // ── D7：精度配置下传（§9.2）──────────────────────────────────────────
+    // 注意力是复合层（4 个投影 Linear + Softmax + RoPE）；子层/辅助对象必须
+    // 一起拿到 profile，否则它们的 p_ 停在默认 F32：参数仍按 F32 创建、
+    // DSL 求值退回 F32 —— f16 配置下静默失效（历史缺陷：此前无人下传）。
+    void set_precision_profile(const PrecisionProfile& profile) override
+    {
+        Layer::set_precision_profile(profile);
+        w_q_.set_precision_profile(profile);
+        w_k_.set_precision_profile(profile);
+        w_v_.set_precision_profile(profile);
+        w_o_.set_precision_profile(profile);
+        softmax_.set_precision_profile(profile);
+        rope_.set_precision_profile(profile);
     }
 
     [[nodiscard]] Result<void> init(ComputeEngine& engine) override
@@ -527,7 +548,7 @@ public:
         if (auto fv = nn::validate_expr_spec(fold_spec, fold_in.size()); !fv)
             return std::unexpected(fv.error());
         // scale 已折进 Q（scale_inplace，S7 教训）——fold 的 mm 段直接消费
-        auto O_t_r = engine.eval_expr(fold_spec, fold_in, BH * seq, d_k_);
+        auto O_t_r = engine.eval_expr(fold_spec, fold_in, BH * seq, d_k_, p_.compute);
         if (!O_t_r) return std::unexpected(O_t_r.error());
         Tensor O_t = std::move(*O_t_r);
         // O_t: (BH*seq, d_k) → 按 batch 转置回 (BH*d_k, seq) 供后续 rearrange：
@@ -596,7 +617,7 @@ public:
             // P = grad_A = batched_matmul(grad_concat^T, V, BH, true, false)
             // forward: O = V × A^T → grad_A = grad_O^T × V（两趟式反向的 P 输入）
             auto grad_A = engine.batched_matmul(
-                grad_concat_re, V_cache_, BH, true, false);
+                grad_concat_re, V_cache_, BH, true, false, Scalar{1}, p_.compute);
             if (!grad_A) return std::unexpected(grad_A.error());
             // G = grad_concat_re^T 按 batch 转置 → (BH*seq, d_k)，
             // 供 grad_V[j][k] = Σ_i W·G[i][k]（同 V 的布局转换）
@@ -620,19 +641,19 @@ public:
             auto X = dsl::compute(engine,
                 dsl::leaf(*W_re)
                     * (dsl::leaf(*grad_A) - dsl::row_broadcast(*R)),
-                BH * seq, seq);
+                BH * seq, seq, p_.compute);
             if (!X) return std::unexpected(X.error());
             // grad_Q = K × X^T（K_b (d_k,seq)，X_b (seq,seq) 按 X^T 使用）
-            auto gq = engine.batched_matmul(K_cache_, *X, BH, false, true);
+            auto gq = engine.batched_matmul(K_cache_, *X, BH, false, true, Scalar{1}, p_.compute);
             if (!gq) return std::unexpected(gq.error());
             // grad_Q 补乘 scale（forward 把 scale 折进了 Q）：用就地原语（同 forward
             // 的说明——DSL 表达式要多分配一整块缓冲，实测更慢）
             { auto gqs = engine.scale_inplace(*gq, scale_); if (!gqs) return std::unexpected(gqs.error()); }
             // grad_K = Q × X
-            auto gk = engine.batched_matmul(Q_cache_, *X, BH, false, false);
+            auto gk = engine.batched_matmul(Q_cache_, *X, BH, false, false, Scalar{1}, p_.compute);
             if (!gk) return std::unexpected(gk.error());
             // grad_V = W^T × G（W_b (seq,seq) 按 W^T 使用，G_b (seq,d_k)）→ (BH*seq, d_k)
-            auto gv_t = engine.batched_matmul(*W_re, *G, BH, true, false);
+            auto gv_t = engine.batched_matmul(*W_re, *G, BH, true, false, Scalar{1}, p_.compute);
             if (!gv_t) return std::unexpected(gv_t.error());
             // grad_V 转置回 (BH*d_k, seq)（与 forward 的 V_t→V 逆变换一致）
             auto gv_T = engine.transpose(*gv_t);
@@ -769,7 +790,7 @@ public:
         //    堆叠: (H, new_len)
         //    scale (1/sqrt(d_k)) 通过 alpha 折进 matmul 写出
         auto scores = engine.batched_matmul(
-            *q_res, *K_T, num_heads_, true, false, scale_);
+            *q_res, *K_T, num_heads_, true, false, scale_, p_.compute);
         if (!scores) return std::unexpected(scores.error());
 
         // 6. 施加增量推理掩码钩子（默认 no-op；ALiBi 施加线性偏置）
@@ -786,7 +807,7 @@ public:
         //    每头: (d_k, new_len) × (new_len, 1) = (d_k, 1)
         //    堆叠: (H*d_k, 1)
         auto attn_out = engine.batched_matmul(
-            *V_T, *attn, num_heads_, false, true);
+            *V_T, *attn, num_heads_, false, true, Scalar{1}, p_.compute);
         if (!attn_out) return std::unexpected(attn_out.error());
 
         // 9. 输出投影 → (d_model, 1)
@@ -1004,7 +1025,7 @@ protected:
         if (!bias_t) return std::unexpected(bias_t.error());
         return dsl::compute(engine,
             dsl::leaf(scores) + dsl::leaf(*bias_t),
-            scores.rows(), scores.cols());
+            scores.rows(), scores.cols(), p_.compute);
     }
 
 public:

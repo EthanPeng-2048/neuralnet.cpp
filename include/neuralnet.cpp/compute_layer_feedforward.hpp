@@ -69,6 +69,19 @@ public:
         swiglu_.set_checkpoint_mode(enabled);
     }
 
+    // ── D7：精度配置下传（§9.2）──────────────────────────────────────────
+    // FeedForward 是复合层（fc1/fc2 + GeLU/SwiGLU）：不下传则子层 p_ 停在
+    // 默认全 F32 —— FFN 是 d_ff=4·d_model 量级的最大激活生产者，f16 配置下
+    // 静默失效（与 AttentionBase 同一类历史缺陷）。
+    void set_precision_profile(const PrecisionProfile& profile) override
+    {
+        Layer::set_precision_profile(profile);
+        fc1_.set_precision_profile(profile);
+        fc2_.set_precision_profile(profile);
+        gelu_.set_precision_profile(profile);
+        swiglu_.set_precision_profile(profile);
+    }
+
     void clear_cache() override
     {
         fc1_.clear_cache();

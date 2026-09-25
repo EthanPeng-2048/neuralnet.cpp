@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -339,7 +340,7 @@ void print_usage(const char *prog)
         << "  --max-norm <f>    梯度裁剪最大全局 L2 范数 (默认: 0=不裁剪)\n"
         << "\n"
         << "混合精度 (docs/development/05-mixed-precision.md):\n"
-        << "  --f16              快捷方式：master-weights 配方 (param=f32,compute=f16,stable=f32,optimizer=f32)\n"
+        << "  --f16              快捷方式：全 f16（param/compute/stable/optimizer 全 f16）\n"
         << "  --precision-param <f16|f32>\n"
         << "                     权重/参数存储精度 (默认: f32)\n"
         << "  --precision-compute <f16|f32>\n"
@@ -388,11 +389,11 @@ struct TrainConfig
     nn::NormType norm_type = nn::NormType::LayerNorm;           // 归一化层类型
 
     // batch 录制粒度：在 Transformer block 间按间隔 flush，拆分大提交
-    // P0-4（报告 §3A）：默认 0→2——按层切 batch 把 D1 延迟销毁锁窗从
-    // "整个 backward" 缩短到 "单 block"（显存峰值关键项），同时拆分大
-    // 提交防 TDR；P0-1 非阻塞提交后细粒度 flush 的额外 submit 代价不在
-    // 关键路径，--flush-interval 0 仍可回退旧行为
-    std::size_t flush_interval = 2;          // 0=不间断，>0=每 N 个 block flush
+    // 2026-09 探针实测（显存取舍重估）：flush 粒度是显存与速度的双重杠杆——
+    // 帧越细，"已析构但等帧 reap"的死内存越少（中途 reap 更早生效）。
+    //   flush1 = 3914MiB/4.6s，flush2 = 4170MiB/4.8s，flush4 = 5488MiB/6.2s
+    // 故默认 2→1（更省显存且更快；TDR 拆分粒度也更细）。
+    std::size_t flush_interval = 1;          // 0=不间断，>0=每 N 个 block flush
 
     // 梯度检查点（激活重计算 L1）：每 N 个 GPTBlock 重算一次
     std::size_t checkpoint_every = 0;        // 0=不启用（默认），>0=每 N 个 block 重算
@@ -572,8 +573,14 @@ TrainConfig parse_args(int argc, char *argv[])
             cfg.no_cache = true;
         else if (arg == "--f16")
         {
-            // 快捷方式：master-weights 配方（param=F32, compute=F16, stable=F32, optimizer=F32）
-            cfg.precision = nn::profile_master_weights();
+            // 快捷方式：**f16 存储**（param=F16 + compute=F16；stable/optimizer
+            // 留 F32）。这是"全 f16"的本意——与 profile_master_weights()（f32
+            // 主权重混合）的区别正是 param 由 F32 变 F16。stable/optimizer 留
+            // f32 有实测依据（f16 的 softmax/loss 链 ~200 步 NaN、Adam 的 m/v
+            // f16 下溢发散）：见 precision.hpp profile_f16() 注释。
+            // 想要四字段全 f16（实验性）：--f16 --precision-stable f16
+            //                                  --precision-optimizer f16
+            cfg.precision = nn::profile_f16();
         }
         else if (arg == "--precision-param" && i + 1 < argc)
         {
@@ -948,7 +955,52 @@ int main(int argc, char *argv[])
         std::cerr << "引擎创建失败: " << engine_res.error().message << "\n";
         return 1;
     }
-    auto engine = std::move(*engine_res);
+    auto raw_engine = std::move(*engine_res);
+
+    // ── 多精度适配层（Phase 2：f16 存储真正生效）────────────────────────
+    // 非全 f32 配置（--f16 / --precision-*）时把内层引擎包进 PrecisionEngine：
+    // f16 的边界 cast（f16 抬到 f32 计算 → 按目标精度落回）全部集中在该层，
+    // 手写 shader 与 AOT 闭合世界保持全 f32（expr_spec_key 不含精度维度）。
+    // 层内的 p_.param/compute/stable/optimizer 是唯一精度来源（§8.5 G4）。
+    // 全 f32 时**不包**：直接走原生引擎，行为与迁移前逐字节一致（零回归）。
+    std::optional<nn::PrecisionEngine> precision_adapter;
+    if (!nn::is_profile_f32(cfg.precision))
+    {
+        precision_adapter.emplace(*raw_engine);
+        std::cout << "[精度] f16 存储已启用（PrecisionEngine 适配层 + in-kernel f16 逐元素变体）\n"
+                     "  [提示] f16 路径会造出大量**小**临时块 → 池底材粒度直接决定峰值："
+                     "实测（batch32）默认 12MB 块峰值 3445MiB，\n"
+                     "         设 NN_POOL_LADDER_MAX_MB=16（按尺寸分档）可降至 2705MiB（−21%），"
+                     "代价是池记账变慢（5.8s→11.3s）。\n"
+                     "         详见 docs/development/05-mixed-precision.md §12.9。\n";
+    }
+    nn::ComputeEngine* engine = precision_adapter
+        ? static_cast<nn::ComputeEngine*>(&*precision_adapter)
+        : raw_engine.get();
+
+    // ── 显存阶段采样（NN_MEM_STATS=1，诊断用，默认关闭）─────────────────
+    // 在真实训练负载的各生命周期阶段打印池统计 + 延迟销毁字节，用于把
+    // 峰值归因到具体阶段（与 src/mem_probe.cpp 的口径一致）。
+    const bool mem_stats = [] {
+        // MSVC CRT 弃用 getenv（-Werror）：按平台用 _dupenv_s / getenv。
+#if defined(_MSC_VER)
+        char* buf = nullptr;
+        std::size_t len = 0;
+        _dupenv_s(&buf, &len, "NN_MEM_STATS");
+        const bool on = (buf != nullptr && buf[0] != '\0' && buf[0] != '0');
+        std::free(buf);
+        return on;
+#else
+        const char* v = std::getenv("NN_MEM_STATS");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+#endif
+    }();
+    const auto mem_mark = [&](const char* tag) {
+        if (!mem_stats) return;
+        std::cout << "[mem] " << std::left << std::setw(16) << tag << std::right
+                  << " " << engine->pool_stats() << std::endl;
+    };
+    mem_mark("engine-init");
 
     // ── 构建模型（绑定引擎） ─────────────────────────────────
     nn::Result<nn::Model> model_build;
@@ -983,6 +1035,7 @@ int main(int argc, char *argv[])
         return 1;
     }
     auto model = std::move(*model_build);
+    mem_mark("model-built");
 
     // ── 打印精度配置 ──
     {
@@ -990,10 +1043,19 @@ int main(int argc, char *argv[])
         if (pp.param != nn::Precision::F32 || pp.compute != nn::Precision::F32 ||
             pp.stable != nn::Precision::F32 || pp.optimizer != nn::Precision::F32)
         {
-            std::cout << "混合精度配置: param=" << nn::precision_name(pp.param)
+            std::cout << "精度配置: param=" << nn::precision_name(pp.param)
                       << " compute=" << nn::precision_name(pp.compute)
                       << " stable=" << nn::precision_name(pp.stable)
                       << " optimizer=" << nn::precision_name(pp.optimizer) << "\n";
+            // 消费方说明（2026-09 Phase 2 起）：
+            //   · param/compute 由 Layer 的 p_.param/p_.compute 传给引擎原语与
+            //     dsl::compute，经 PrecisionEngine 适配层落成 f16 **存储**
+            //     （融合世界保持 f32 的边界 cast；见 compute_precision_engine.hpp）；
+            //   · stable 用于 softmax/LayerNorm/loss 链；optimizer 用于 Adam m/v。
+            // 局限：边界 cast 对"被多个算子读取的大张量"（如 vocab 级 logits）
+            // 会各算子各物化一份 f32 副本 → LM head 已固定走 stable（见 GPTModel
+            // 注释）；真正的 f16 融合 kernel（in-kernel f16 / typed IR）是
+            // docs/development/05-mixed-precision.md §12.3 的下一步。
         }
     }
 
@@ -1109,10 +1171,12 @@ int main(int argc, char *argv[])
     }
 
     // ── 优化器 ─────────────────────────────────────────────
+    // 精度配置透传：状态张量（m/v/momentum）按 profile.optimizer 创建，
+    // 参数更新走 in-place（存储精度不可变，§8.3）
     auto optimizer = nn::create_optimizer(
         cfg.optimizer_name, *engine,
         model.parameters(), model.param_gradients(), cfg.lr,
-        cfg.weight_decay);
+        cfg.weight_decay, cfg.precision);
     if (!optimizer)
     {
         std::cerr << "错误：未知优化器名称: " << cfg.optimizer_name << "\n";
@@ -1120,6 +1184,7 @@ int main(int argc, char *argv[])
     }
 
     Scalar optimizer_current_lr = cfg.lr;
+    mem_mark("optimizer-created");
 
     // ── 学习率调度配置（委托给 nn::cli::compute_epoch_lr） ──
     nn::cli::LrScheduleConfig lr_sched_cfg;
@@ -1131,6 +1196,9 @@ int main(int argc, char *argv[])
     lr_sched_cfg.lr_per_epoch = cfg.lr_per_epoch;
 
     nn::CrossEntropyLoss ce_loss;
+    // loss 链精度 = profile.stable（§9.1 / D9：softmax/log/大词表归约的溢出防线；
+    // 默认 F32 → 与迁移前逐字节一致）
+    ce_loss.set_precision_profile(cfg.precision);
 
     // ── 训练循环 ─────────────────────────────────────────────
     // 每样本 = 一个 seq_len 滑动窗口（可能跨行），目标 = 输入左移一位。
@@ -1432,6 +1500,7 @@ int main(int argc, char *argv[])
             auto fwd_result = model.forward(*x_tensor_r);
             if (!fwd_result) { std::cerr << "Error: " << fwd_result.error().message << '\n'; return 1; }
             auto logits = std::move(*fwd_result);
+            mem_mark("step/forward");
             // logits: (vocab_size, seq_len × batch_size)
 
             // ── 损失（稀疏标签，避免 one-hot 爆显存）────────
@@ -1444,7 +1513,7 @@ int main(int argc, char *argv[])
             std::size_t loss_num_valid = 0;
             auto loss_sum_t = ce_loss.forward_sparse_sum(
                 *engine, logits, flat_targets, mask_span,
-                tokenizer->vocab_size(), loss_num_valid);
+                tokenizer->vocab_size(), loss_num_valid, /*grad_reuse=*/&logits);
             if (!loss_sum_t) {
                 std::cerr << "Error: " << loss_sum_t.error().message << '\n';
                 return 1;
@@ -1457,10 +1526,21 @@ int main(int argc, char *argv[])
                 return 1;
             }
 
+            // ── 显存优化：logits 已消费完毕，立即释放（必须在 flush 之前）──
+            //   延迟销毁按"当前录制帧"打标签：flush 前释放 → 标签为 forward
+            //   帧，其 fence 在 backward 录制期间即完成，可被中途 reap 回收；
+            //   若放在 flush 之后释放，标签落到 backward 帧，513MB
+            //   （vocab×seq×batch）要等整个 backward 提交完成才还池（探针实测
+            //   pending 主项）。此时 loss 已算出，LM Head 的 backward 只需
+            //   input + grad_output，且 forward 帧已录完对 logits 的引用。
+            logits = {};
+            mem_mark("step/logits-free");
+
             // ── 中点刷新：提交 forward+loss，拆分为两次 GPU 提交 ──
             // 大词表 + 长序列时 forward+backward 单次提交可能触发 TDR 超时。
             // 在 forward 与 backward 之间 flush，将一次大提交拆为两次小提交。
             auto flush_r = engine->flush_batch();
+            mem_mark("step/loss-fwd");
             if (!flush_r) {
                 std::cerr << "\nflush_batch (forward) failed: " << flush_r.error().message << '\n';
                 return 1;
@@ -1499,11 +1579,6 @@ int main(int argc, char *argv[])
                 pending_loss.push_back(std::move(pl));
             }
 
-            // ── 显存优化：logits 已消费完毕，立即释放 ──
-            //   loss 已算出，LM Head 的 backward 只需 input + grad_output（CE 已提供），
-            //   不再需要 logits 本身。若不释放，1.6GB（vocab×seq*batch）会在整个
-            //   backward 期间驻留设备显存。flush 之后 forward 已执行完，释放安全。
-            logits = {};
             // ── 反向传播（梯度已含 mask，无需额外处理） ────────
             auto grad_result = ce_loss.backward();
             if (!grad_result) { std::cerr << "\nLoss backward failed: " << grad_result.error().message << '\n'; return 1; }
@@ -1520,10 +1595,12 @@ int main(int argc, char *argv[])
             }
 
             auto bwd_result = model.backward(*grad_result);
+            mem_mark("step/backward");
             if (!bwd_result) { std::cerr << "Error: " << bwd_result.error().message << '\n'; return 1; }
 
             // ── 提交 backward batch（单独一次提交，已与 forward 拆分） ──
             auto bwd_end = engine->end_batch();
+            mem_mark("step/end-batch");
             if (!bwd_end) {
                 std::cerr << "\nend_batch (backward) failed: " << bwd_end.error().message << '\n';
                 return 1;
@@ -1543,6 +1620,7 @@ int main(int argc, char *argv[])
             // ── 显存回收（L2）：end_batch 提交完成、延迟销毁已 flush，
             //    归还完全空闲的内存池底材（GPU 引擎有效，CPU/CUDA no-op） ──
             auto rel_r = engine->release_idle_pool_blocks();
+            mem_mark("step/released");
             if (!rel_r) { std::cerr << "\n显存回收失败: " << rel_r.error().message << '\n'; return 1; }
 
             // ── 显存优化：logits 梯度已消费完毕，立即释放 ──

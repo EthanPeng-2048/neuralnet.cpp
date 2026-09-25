@@ -31,23 +31,52 @@
 namespace nn::fused
 {
 
+// ── 精度变体（Phase 2 in-kernel f16）：同一结构 + 精度签名 ────────────────
+struct ExprVariant
+{
+    ExprSpec    spec;
+    ExprPrecSig sig = 0;
+};
+
 // ── 注册表：收集折叠出的 ExprSpec 结构，按规范 key 去重 ─────────────────
 struct ExprRegistry
 {
+    // sig == 0（全 f32，旧行为）：按结构 key 去重 —— bin / 生成头沿用旧格式，
+    // 运行时行为逐字节不变（零回归）。
     std::vector<ExprSpec>       specs;
     std::unordered_set<std::string> keys;
+    // sig != 0（带类型变体）：按 (结构 key, 精度签名) 去重。**不写进 bin**——
+    // 只有生成器支持该变体（带类型 GLSL）后才需要序列化；在此之前这些条目
+    // 仅用于构建期诊断（"哪些精度组合真实存在"）。
+    std::vector<ExprVariant>    variants;
+    std::unordered_set<std::string> variant_keys;
 
-    void add(const ExprSpec& s)
+    void add(const ExprSpec& s, ExprPrecSig sig = 0)
     {
         // 登记 canonical IR：canonicalize 为引擎内部优化（IR-A/IR-B），
         // bin 与 key 建立在 canonical 形态上（scan 与 runtime 两端一致）。
         const ExprSpec canon = canonicalize_expr_spec(s);
         const std::string k = expr_spec_key(canon);
-        if (keys.insert(k).second)
-            specs.push_back(canon);
+        if (sig == 0u)
+        {
+            if (keys.insert(k).second)
+                specs.push_back(canon);
+            return;
+        }
+        const std::string vk = expr_prec_sig_key(k, sig);
+        if (variant_keys.insert(vk).second)
+            variants.push_back(ExprVariant{canon, sig});
     }
     [[nodiscard]] bool contains(const ExprSpec& s) const
     { return keys.count(expr_spec_key(canonicalize_expr_spec(s))) != 0; }
+    // 该 (结构, 签名) 是否已登记（sig==0 走结构表）
+    [[nodiscard]] bool contains_variant(const ExprSpec& s, ExprPrecSig sig) const
+    {
+        const std::string k = expr_spec_key(canonicalize_expr_spec(s));
+        if (sig == 0u)
+            return keys.count(k) != 0;
+        return variant_keys.count(expr_prec_sig_key(k, sig)) != 0;
+    }
 };
 
 // 全局注册表（scan_exprs 记录模式写入；普通构建不含 NN_EXPR_SCAN，零开销）
@@ -78,7 +107,7 @@ struct ExprRegistry
 //                           scale_reg,has_scale(5B)}
 //                    -- v8 追加：causal_skip(u8)}
 //  v2 起支持 matmul 段（v1 无 matmul，读 v1 等价 has=0）；v3 起支持 rparams。
-inline constexpr std::uint8_t kExprBinVersion = 8;  // v5：MatmulSpec 补 batch；v6：FoldSpec；v7：FoldSpec 双域字段（vec_state_len/matmul/vecacc——丢段=结构损坏）；v8：causal_skip（causal 跳块 codegen 标志——不对称=静默不跳或错位读废）
+inline constexpr std::uint8_t kExprBinVersion = 9;  // v5：MatmulSpec 补 batch；v6：FoldSpec；v7：FoldSpec 双域字段（vec_state_len/matmul/vecacc——丢段=结构损坏）；v8：causal_skip（causal 跳块 codegen 标志——不对称=静默不跳或错位读废）；v9：**精度变体段**（Phase 2 in-kernel f16：每个变体 {sig, 基础结构下标}——变体与基础结构**同结构同 key**，故只存 sig + 下标，不重复存 spec 体）
 
 [[nodiscard]] inline bool write_registry(const std::string& path,
                                          const ExprRegistry& reg)
@@ -183,6 +212,23 @@ inline constexpr std::uint8_t kExprBinVersion = 8;  // v5：MatmulSpec 补 batch
             if (!write_pod(f, cskip)) return false;
         }
     }
+    // v9：精度变体段（{sig, 基础结构下标}）—— 变体与其基础结构同 key（精度不进
+    // expr_spec_key），故只需下标引用，避免重复序列化 spec 体（也免除读写不对称
+    // 的风险：spec 体的读写已在上面单一实现）。找不到基础结构 → 写 0xFFFFFFFF
+    // （gen_fused 会跳过并告警，运行时不命中即回退边界 cast，正确性不受影响）。
+    {
+        const std::uint32_t nvar = static_cast<std::uint32_t>(reg.variants.size());
+        if (!write_pod(f, nvar)) return false;
+        for (const auto& v : reg.variants)
+        {
+            if (!write_pod(f, v.sig)) return false;
+            std::uint32_t base = 0xFFFFFFFFu;
+            const std::string k = expr_spec_key(v.spec);
+            for (std::uint32_t i = 0; i < reg.specs.size(); ++i)
+                if (expr_spec_key(reg.specs[i]) == k) { base = i; break; }
+            if (!write_pod(f, base)) return false;
+        }
+    }
     return static_cast<bool>(f);
 }
 
@@ -201,6 +247,8 @@ inline constexpr std::uint8_t kExprBinVersion = 8;  // v5：MatmulSpec 补 batch
     if (!read_pod(f, count)) return false;
     out.specs.clear();
     out.keys.clear();
+    out.variants.clear();
+    out.variant_keys.clear();
     out.specs.reserve(count);
     for (std::uint32_t i = 0; i < count; ++i)
     {
@@ -315,6 +363,23 @@ inline constexpr std::uint8_t kExprBinVersion = 8;  // v5：MatmulSpec 补 batch
             s.fold = fs;
         }
         out.add(s);
+    }
+    // v9：精度变体段读回（与 write 对称）
+    std::uint32_t nvar = 0;
+    if (!read_pod(f, nvar)) return false;
+    for (std::uint32_t i = 0; i < nvar; ++i)
+    {
+        ExprPrecSig sig = 0;
+        std::uint32_t base = 0xFFFFFFFFu;
+        if (!read_pod(f, sig)) return false;
+        if (!read_pod(f, base)) return false;
+        if (base < out.specs.size())
+        {
+            const ExprSpec& bs = out.specs[base];
+            out.variants.push_back(ExprVariant{bs, sig});
+            out.variant_keys.insert(
+                expr_prec_sig_key(expr_spec_key(bs), sig));
+        }
     }
     return true;
 }

@@ -225,6 +225,8 @@ int main(int argc, char* argv[])
     H << "    std::uint32_t view_param_count;  // 运行时视图参数个数（RowMod/RotateHalf 的 push constant vp 槽）\n";
     H << "    std::uint32_t rparam_count;    // 运行时标量参数个数（优化器 lr/eps/β 等的 push constant rp 槽）\n";
     H << "    std::uint32_t vec_width;    // 每线程处理元素数（1=标量, 4=vec4）\n";
+    H << "    std::uint32_t prec_sig;     // 精度签名（Phase 2 in-kernel f16；0 = 全 f32）\n";
+    H << "                                //   位 i = 第 i 个输入 f16，bit16 = 输出 f16\n";
     H << "};\n\n";
 
     for (const auto& spec : reg.specs)
@@ -302,6 +304,74 @@ int main(int argc, char* argv[])
         H << std::dec << "\n};\n\n";
     }
 
+    // ── 精度变体（Phase 2 in-kernel f16）：同一结构 + 非零精度签名 → 独立 shader
+    // 注册键 = key#sig（expr_prec_sig_key），文件名/标识符用 key_sighex（标识符
+    // 不能含 '#'）。生成器不支持该形态（reduce/matmul/fold 的带类型变体尚未实现）
+    // 时返回空串 → **跳过而非失败**：运行时不命中即回退边界 cast，正确性不变。
+    struct VariantEmit
+    {
+        const nn::ExprSpec* spec;
+        nn::ExprPrecSig sig;
+        std::string     vkey;     // "key#sig"（注册表键）
+        std::string     suffix;   // "key_sighex"（标识符/文件名）
+    };
+    std::vector<VariantEmit> emitted_variants;
+    for (const auto& v : reg.variants)
+    {
+        const nn::ExprSpec& spec = v.spec;
+        const int raxis = nn::expr_spec_reduce_axis(spec);
+        if (raxis == -2 || (raxis == 1 && spec.matmul))
+            continue;
+        if (spec.instrs.empty() && !spec.matmul && !spec.fold)
+            continue;
+        const std::string key = nn::expr_spec_key(spec);
+        char sigbuf[8];
+        std::snprintf(sigbuf, sizeof(sigbuf), "%04x", static_cast<unsigned>(v.sig));
+        const std::string vkey = nn::expr_prec_sig_key(key, v.sig);
+        const std::string suffix = key + "_" + sigbuf;
+        const std::string comp_path = out_dir + "/fused_" + suffix + ".comp";
+        const std::string spv_path  = out_dir + "/fused_" + suffix + ".spv";
+        auto emitter = nn::emitter_registry::make("glsl");
+        if (!emitter)
+        {
+            std::fprintf(stderr, "[FAIL] 无法创建 GLSL emitter（IR-D 注册表异常）\n");
+            return 1;
+        }
+        const std::string glsl = (raxis >= 0)
+            ? emitter->generate_reduce("fused_" + suffix, spec, v.sig)
+            : emitter->generate("fused_" + suffix, spec, v.sig);
+        if (glsl.empty())
+        {
+            std::fprintf(stderr, "[skip] 精度变体 %s（sig=%s）暂不支持带类型生成\n",
+                         key.c_str(), sigbuf);
+            continue;
+        }
+        {
+            std::ofstream f(comp_path);
+            if (!f) { std::fprintf(stderr, "[FAIL] 无法写入 %s\n", comp_path.c_str()); return 1; }
+            f << glsl;
+        }
+        if (!run_glslc(glslc, comp_path, spv_path))
+        {
+            std::fprintf(stderr, "[FAIL] glslc 编译精度变体 %s 失败\n", vkey.c_str());
+            return 1;
+        }
+        const auto spv = read_spv(spv_path);
+        if (spv.empty())
+        {
+            std::fprintf(stderr, "[FAIL] 读取 %s 失败\n", spv_path.c_str());
+            return 1;
+        }
+        H << "inline constexpr std::uint32_t kSpirv_" << suffix << "[] = {";
+        for (std::size_t i = 0; i < spv.size(); ++i)
+        {
+            if (i % 8 == 0) H << "\n    ";
+            H << "0x" << std::hex << spv[i] << "u, ";
+        }
+        H << std::dec << "\n};\n\n";
+        emitted_variants.push_back(VariantEmit{&spec, v.sig, vkey, suffix});
+    }
+
     H << "inline const FusedShader kFusedShaders[] = {\n";
     for (const auto& spec : reg.specs)
     {
@@ -320,7 +390,23 @@ int main(int argc, char* argv[])
           << ", sizeof(kSpirv_" << key << ")/sizeof(std::uint32_t), "
           << raxis << ", " << (spec.matmul ? 1 : 0) << ", "
           << nn::expr_spec_runtime_view_param_count(spec) << ", "
-          << nn::expr_spec_runtime_param_count(spec) << ", " << vecw << " },\n";
+          << nn::expr_spec_runtime_param_count(spec) << ", " << vecw
+          << ", 0u },\n";
+    }
+    // 精度变体行（键 = key#sig；元数据与基础结构同源——精度不进结构）
+    for (const auto& ve : emitted_variants)
+    {
+        const nn::ExprSpec& spec = *ve.spec;
+        const int raxis = nn::expr_spec_reduce_axis(spec);
+        const std::uint32_t vecw =
+            (!spec.fold && raxis < 0 && nn::glsl_vec4_eligible(spec)) ? 4u : 1u;
+        H << "    { \"" << ve.vkey << "\",\n        " << emit_spec(spec) << ",\n"
+          << "        kSpirv_" << ve.suffix
+          << ", sizeof(kSpirv_" << ve.suffix << ")/sizeof(std::uint32_t), "
+          << raxis << ", " << (spec.matmul ? 1 : 0) << ", "
+          << nn::expr_spec_runtime_view_param_count(spec) << ", "
+          << nn::expr_spec_runtime_param_count(spec) << ", " << vecw
+          << ", " << ve.sig << "u },\n";
     }
     H << "};\n";
     H << "inline constexpr std::size_t kFusedShaderCount =\n"
@@ -340,6 +426,7 @@ int main(int argc, char* argv[])
         if (!f) { std::fprintf(stderr, "[FAIL] 无法写入 %s\n", reg_path.c_str()); return 1; }
         f << H.str();
     }
-    std::printf("[gen] %zu 条融合表达式 -> %s\n", reg.specs.size(), reg_path.c_str());
+    std::printf("[gen] %zu 条融合表达式 + %zu 条精度变体 -> %s\n",
+                reg.specs.size(), emitted_variants.size(), reg_path.c_str());
     return 0;
 }

@@ -50,7 +50,7 @@ public:
             dsl::exp(dsl::leaf(input) - dsl::row_reduce_max(input))
             / dsl::row_reduce_sum(
                 dsl::exp(dsl::leaf(input) - dsl::row_reduce_max(input))),
-            input.rows(), input.cols());
+            input.rows(), input.cols(), p_.stable);
         if (!out) return std::unexpected(out.error());
         if (checkpoint_mode_)
             return out;
@@ -69,7 +69,7 @@ public:
             * (dsl::leaf(grad_output)
                - dsl::row_reduce_sum(dsl::leaf(output_cache_)
                                      * dsl::leaf(grad_output))),
-            output_cache_.rows(), output_cache_.cols());
+            output_cache_.rows(), output_cache_.cols(), p_.stable);
         return out;
     }
 };

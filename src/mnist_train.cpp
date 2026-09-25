@@ -363,7 +363,7 @@ TrainConfig parse_args(int argc, char *argv[])
         }
         else if (arg == "--f16")
         {
-            cfg.precision = nn::profile_master_weights();
+            cfg.precision = nn::profile_f16();   // param+compute f16（stable/optimizer f32）
         }
         else if (arg == "--precision-param" && i + 1 < argc)
         {
@@ -599,7 +599,20 @@ int main(int argc, char *argv[])
         std::cerr << "引擎创建失败: " << engine_res.error().message << "\n";
         return 1;
     }
-    auto engine = std::move(*engine_res);
+    auto raw_engine = std::move(*engine_res);
+
+    // ── 多精度适配层（同 text_train：非全 f32 时启用，见 docs 05 §11.1）──
+    std::optional<nn::PrecisionEngine> precision_adapter;
+    if (!nn::is_profile_f32(cfg.precision))
+    {
+        precision_adapter.emplace(*raw_engine);
+        std::cout << "[精度] f16 存储已启用（PrecisionEngine 适配层）\n"
+                     "  [注意] 边界 cast 的 transient 放大：峰值可能高于 f32，"
+                     "见 docs/development/05-mixed-precision.md §12.5\n";
+    }
+    nn::ComputeEngine* engine = precision_adapter
+        ? static_cast<nn::ComputeEngine*>(&*precision_adapter)
+        : raw_engine.get();
 
     // ── 加载数据 ─────────────────────────────────────────────
     std::cout << "加载数据: " << cfg.dataset_path << " ..." << std::endl;
@@ -615,7 +628,7 @@ int main(int argc, char *argv[])
     std::cout << "训练集: " << train_x.cols() << " 样本, 测试集: " << test_x.cols() << " 样本\n" << std::endl;
 
     // ── 构建模型（绑定引擎） ─────────────────────────────────
-    auto model_result = nn::build_mnist_model_from_spec(*engine, spec);
+    auto model_result = nn::build_mnist_model_from_spec(*engine, spec, cfg.precision);
     if (!model_result)
     {
         std::cerr << "构建模型失败: " << model_result.error().message << '\n';
@@ -631,7 +644,7 @@ int main(int argc, char *argv[])
         if (pp.param != nn::Precision::F32 || pp.compute != nn::Precision::F32 ||
             pp.stable != nn::Precision::F32 || pp.optimizer != nn::Precision::F32)
         {
-            std::cout << "混合精度配置: param=" << nn::precision_name(pp.param)
+            std::cout << "精度配置: param=" << nn::precision_name(pp.param)
                       << " compute=" << nn::precision_name(pp.compute)
                       << " stable=" << nn::precision_name(pp.stable)
                       << " optimizer=" << nn::precision_name(pp.optimizer) << "\n";
@@ -656,7 +669,7 @@ int main(int argc, char *argv[])
     auto optimizer = nn::create_optimizer(
         cfg.optimizer_name, *engine,
         model.parameters(), model.param_gradients(), cfg.lr,
-        cfg.weight_decay);
+        cfg.weight_decay, cfg.precision);
     if (!optimizer)
     {
         std::cerr << "错误：未知优化器名称: " << cfg.optimizer_name << "\n";
@@ -675,6 +688,7 @@ int main(int argc, char *argv[])
     lr_sched_cfg.lr_per_epoch = cfg.lr_per_epoch;
 
     nn::CrossEntropyLoss ce_loss;
+    ce_loss.set_precision_profile(cfg.precision);   // loss 链 = profile.stable（§9.1）
     const std::size_t num_batches = train_x.cols() / cfg.batch_size;
     if (num_batches == 0)
     {

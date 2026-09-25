@@ -37,8 +37,18 @@ namespace nn
 // ══════════════════════════════════════════════════════════════════════════
 class Loss
 {
+protected:
+    // 多精度（§9.1 / D9）：loss 前向 + backward 输出**同一精度**（默认 F32）。
+    // 用 stable 字段而非 compute：f16 范围溢出（65504）风险集中在
+    // softmax / log / 大词表归约，故 loss 链默认留在参考精度。
+    PrecisionProfile p_;
+
 public:
     virtual ~Loss() = default;
+
+    // ── D7/D9：精度配置注入（工厂/CLI 在构造后调用）────────────────────
+    void set_precision_profile(const PrecisionProfile& p) { p_ = p; }
+    [[nodiscard]] const PrecisionProfile& precision_profile() const noexcept { return p_; }
 
     // forward 计算损失标量，并缓存 backward 所需中间结果
     [[nodiscard]] virtual Result<Scalar> forward(
@@ -78,7 +88,7 @@ public:
         // diff = pred - target（逐元素融合）
         auto diff = dsl::compute(engine,
             dsl::leaf(pred) - dsl::leaf(target),
-            pred.rows(), pred.cols());
+            pred.rows(), pred.cols(), p_.stable);
         if (!diff) return std::unexpected(diff.error());
 
         // Σ diff²：逐元素链与列归约融合为**单次** dispatch（GPU 上 1 个融合
@@ -86,9 +96,9 @@ public:
         // 必须在下面"就地缩放 diff"之前完成（缩放与 diff 共享缓冲）。
         auto col_sum = dsl::compute_reduce(engine,
             dsl::col_reduce_sum(dsl::leaf(*diff) * dsl::leaf(*diff)),
-            diff->rows(), diff->cols());
+            diff->rows(), diff->cols(), p_.stable);
         if (!col_sum) return std::unexpected(col_sum.error());
-        auto total_t = engine.row_reduce_sum(*col_sum);
+        auto total_t = engine.row_reduce_sum(*col_sum, p_.stable);
         if (!total_t) return std::unexpected(total_t.error());
         auto m = engine.to_matrix(*total_t);
         if (!m) return std::unexpected(m.error());
@@ -146,10 +156,10 @@ private:
     //   直接 log(softmax) 在极负 logits/大词表下 softmax→0 → log→-inf，
     //   与 target=0 相乘得 0*(-inf)=NaN；稳定形式中 shifted 与 log(col_sum)
     //   均有限，可避免该 NaN（稠密/软标签路径，稀疏 kernel 已用稳定形式）。
-    [[nodiscard]] static Result<DenseSoftmax> softmax_cols_(
-        ComputeEngine& engine, const Tensor& logits)
+    [[nodiscard]] Result<DenseSoftmax> softmax_cols_(
+        ComputeEngine& engine, const Tensor& logits) const
     {
-        auto col_max = engine.col_reduce_max(logits);
+        auto col_max = engine.col_reduce_max(logits, p_.stable);
         if (!col_max) return std::unexpected(col_max.error());
 
         // S7：denom = Σ_r exp(logits[r][c] - col_max[c]) 用 IR 表达式
@@ -157,7 +167,7 @@ private:
         auto col_sum = dsl::compute_reduce(engine,
             dsl::col_reduce_sum(
                 dsl::exp(dsl::leaf(logits) - dsl::col_broadcast(*col_max))),
-            logits.rows(), logits.cols());
+            logits.rows(), logits.cols(), p_.stable);
         if (!col_sum) return std::unexpected(col_sum.error());
 
         // shifted / softmax / log_softmax 全部用**列广播表达式**：GPU 上各为 1 个
@@ -165,24 +175,24 @@ private:
         // 整块 vkCmdCopyBuffer + 3 次就地广播 dispatch）。
         auto shifted = dsl::compute(engine,
             dsl::leaf(logits) - dsl::col_broadcast(*col_max),
-            logits.rows(), logits.cols());
+            logits.rows(), logits.cols(), p_.stable);
         if (!shifted) return std::unexpected(shifted.error());
 
         auto softmax = dsl::compute(engine,
             dsl::exp(dsl::leaf(*shifted)) / dsl::col_broadcast(*col_sum),
-            shifted->rows(), shifted->cols());
+            shifted->rows(), shifted->cols(), p_.stable);
         if (!softmax) return std::unexpected(softmax.error());
 
         // 稳定 log_softmax = shifted - log(col_sum)
         // col_sum ≥ 1（因 max 元素 shifted=0 → exp=1），故 log(col_sum) 有限
         auto log_col_sum = dsl::compute(engine,
             dsl::log(dsl::leaf(*col_sum)),
-            col_sum->rows(), col_sum->cols());
+            col_sum->rows(), col_sum->cols(), p_.stable);
         if (!log_col_sum) return std::unexpected(log_col_sum.error());
 
         auto log_softmax = dsl::compute(engine,
             dsl::leaf(*shifted) - dsl::col_broadcast(*log_col_sum),
-            shifted->rows(), shifted->cols());
+            shifted->rows(), shifted->cols(), p_.stable);
         if (!log_softmax) return std::unexpected(log_softmax.error());
 
         return DenseSoftmax{/*softmax=*/std::move(*softmax),
@@ -217,7 +227,7 @@ public:
         auto grad = dsl::compute(engine,
             (dsl::leaf(sm->softmax) - dsl::leaf(target))
                 * dsl::rparam(Scalar{1} / static_cast<Scalar>(batch)),
-            sm->softmax.rows(), sm->softmax.cols());
+            sm->softmax.rows(), sm->softmax.cols(), p_.stable);
         if (!grad) return std::unexpected(grad.error());
         grad_input_ = std::move(*grad);
 
@@ -228,9 +238,9 @@ public:
         //      列归约融合为单次 dispatch（GPU 上 1 个融合 kernel）
         auto col_s = dsl::compute_reduce(engine,
             dsl::col_reduce_sum(dsl::leaf(target) * dsl::leaf(sm->log_softmax)),
-            target.rows(), target.cols());
+            target.rows(), target.cols(), p_.stable);
         if (!col_s) return std::unexpected(col_s.error());
-        auto total_t = engine.row_reduce_sum(*col_s);
+        auto total_t = engine.row_reduce_sum(*col_s, p_.stable);
         if (!total_t) return std::unexpected(total_t.error());
 
         // 6. loss = -total / batch — 下载标量
@@ -272,7 +282,8 @@ public:
         std::span<const std::size_t> labels,
         std::span<const Scalar> loss_mask,
         std::size_t vocab_size,
-        std::size_t& num_valid_out)
+        std::size_t& num_valid_out,
+        Tensor* grad_reuse = nullptr)
     {
         const std::size_t classes = logits.rows();
         const std::size_t total   = logits.cols();
@@ -287,7 +298,7 @@ public:
 
         // ── M5 融合路径（不物化全 softmax；失败直接透传错误，不回退） ──
         return fused_forward_sparse_(engine, logits, labels, loss_mask, vocab_size,
-                                     num_valid_out);
+                                     num_valid_out, grad_reuse);
     }
 
     // 同步版稀疏 CE（测试/评估等非热路径）：内部 to_matrix 下载标量。
@@ -319,7 +330,8 @@ public:
         std::span<const std::size_t> labels,
         std::span<const Scalar> loss_mask,
         std::size_t vocab_size,
-        std::size_t& num_valid_out)
+        std::size_t& num_valid_out,
+        Tensor* grad_reuse = nullptr)
     {
         const std::size_t classes = logits.rows();
         const std::size_t total = logits.cols();
@@ -358,37 +370,55 @@ public:
             ? Scalar{1} / static_cast<Scalar>(num_valid) : Scalar{0};
 
         // 4. col_max → denom（IR）→ loss_vec / grad（IR）
-        auto col_max = engine.col_reduce_max(logits);
+        auto col_max = engine.col_reduce_max(logits, p_.stable);
         if (!col_max) return std::unexpected(col_max.error());
         auto denom = dsl::compute_reduce(engine,
             dsl::col_reduce_sum(
                 dsl::exp(dsl::leaf(logits) - dsl::col_broadcast(*col_max))),
-            classes, total);
+            classes, total, p_.stable);
         if (!denom) return std::unexpected(denom.error());
         // loss_vec[c] = (logits[label[c]][c] - col_max[c] - log(denom[c])) * mask[c]
         auto loss_vec = dsl::compute(engine,
             (dsl::row_gather(logits, *labels_t) - dsl::col_broadcast(*col_max)
              - dsl::log(dsl::leaf(*denom))) * dsl::col_broadcast(*mask_t),
-            1, total);
+            1, total, p_.stable);
         if (!loss_vec) return std::unexpected(loss_vec.error());
         // grad[r][c] = (exp(logits-col_max)/denom - [r==label[c]]) * mask[c] / num_valid
         // 1/num_valid 由 RParam 承载（运行时值、不进 expr_spec_key）→ 与整个
         // 逐元素链融合为单 kernel，取代表达式后的 scale_inplace
-        auto grad = dsl::compute(engine,
+        auto grad_expr =
             (dsl::exp(dsl::leaf(logits) - dsl::col_broadcast(*col_max))
                 / dsl::col_broadcast(*denom)
              - dsl::select(dsl::row() == dsl::col_broadcast(*labels_t),
                            Scalar{1}, Scalar{0}))
             * dsl::col_broadcast(*mask_t)
-            * dsl::rparam(inv_num_valid),
-            classes, total);
-        if (!grad) return std::unexpected(grad.error());
-        grad_input_ = std::move(*grad);
+            * dsl::rparam(inv_num_valid);
+
+        // 显存优化：grad_reuse 与 logits 同形同精度时把梯度**原地**写进该
+        // 缓冲（典型用法：传 &logits）——省一份 (vocab×total) 显存，训练峰值
+        // 第二大单项（bench 配置实测 513MB）。安全性：本表达式对输入只有
+        // 逐元素读取 + 列/标量广播（row() 是隐式行下标，不是跨行 gather），
+        // 每个元素读后写同址；唯一的跨行 row_gather(logits) 在上方 loss_vec
+        // 中，且 loss_vec 已算入独立缓冲。
+        if (grad_reuse != nullptr && grad_reuse->valid()
+            && grad_reuse->rows() == classes && grad_reuse->cols() == total
+            && grad_reuse->precision() == logits.precision())
+        {
+            auto w = dsl::compute_into(engine, grad_expr, *grad_reuse);
+            if (!w) return std::unexpected(w.error());
+            grad_input_ = *grad_reuse;
+        }
+        else
+        {
+            auto grad = dsl::compute(engine, grad_expr, classes, total, p_.stable);
+            if (!grad) return std::unexpected(grad.error());
+            grad_input_ = std::move(*grad);
+        }
 
         // 5. loss_sum = Σ loss_vec（无效列已乘 0）——**不下载**：
         //    热路径由调用方经 engine.submit_scalar_readback 异步取回；
         //    同步版 forward_sparse 在此之后 to_matrix。
-        auto total_t = engine.row_reduce_sum(*loss_vec);   // (1, total) → (1, 1)
+        auto total_t = engine.row_reduce_sum(*loss_vec, p_.stable);   // (1, total) → (1, 1)
         if (!total_t) return std::unexpected(total_t.error());
         num_valid_out = num_valid;
         return total_t;

@@ -34,16 +34,42 @@
 
 #version 450
 
+// ── 精度变体（编译期开关：glslc -DNN_SHADER_F16=1）────────────────────────
+// 默认（无宏）= 全 f32，**f32 分支文本逐字未改**（零回归）。
+// 带宏 = f16 存储变体：缓冲声明 float16_t（GL_EXT_shader_16bit_storage），
+//   别名槽改 uvec2（4×half = 8B，std430 步长恰好 8）→ unpackHalf2x16 解出
+//   vec4；全局读处统一 float(...) 转 f32、写出处统一 float16_t(...)。
+//   **共享 tile / vec4 外积累加 / 分块 / 双缓冲 / barrier 节奏与 f32 同构**，
+//   只有全局加载/写出的元素类型变了（§7.2「f32 参考累加 + 输出舍入」）。
+//   vec4 快路径的对齐条件不变：f16 下 uvec2 需 8B 对齐 ⇔ 元素下标 %4==0
+//   （与 f32 的 vec4 16B 对齐条件同源，故 aligned 判据完全复用）。
+#if defined(NN_SHADER_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#define NN_ETYPE float16_t
+#define NN_V4    uvec2
+#define NN_LOADV4(arr, i) vec4(unpackHalf2x16(arr[i].x), unpackHalf2x16(arr[i].y))
+#define NN_RD(x) float(x)
+#define NN_WR(x) float16_t(x)
+#else
+#define NN_ETYPE float
+#define NN_V4    vec4
+#define NN_LOADV4(arr, i) arr[i]
+#define NN_RD(x) x
+#define NN_WR(x) x
+#endif
+
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(std430, binding = 0) readonly buffer  BufferA { float A[]; };
-layout(std430, binding = 1) readonly buffer  BufferB { float B[]; };
-layout(std430, binding = 2) writeonly buffer BufferC { float C[]; };
+layout(std430, binding = 0) readonly buffer  BufferA { NN_ETYPE A[]; };
+layout(std430, binding = 1) readonly buffer  BufferB { NN_ETYPE B[]; };
+layout(std430, binding = 2) writeonly buffer BufferC { NN_ETYPE C[]; };
 
 // vec4 别名视图（同 binding 双声明；仅在元素下标 %4==0 的快路径使用）
-layout(std430, binding = 0) readonly buffer  BufferAv4 { vec4 Av4[]; };
-layout(std430, binding = 1) readonly buffer  BufferBv4 { vec4 Bv4[]; };
+layout(std430, binding = 0) readonly buffer  BufferAv4 { NN_V4 Av4[]; };
+layout(std430, binding = 1) readonly buffer  BufferBv4 { NN_V4 Bv4[]; };
+#if !defined(NN_SHADER_F16)
 layout(std430, binding = 2) writeonly buffer BufferCv4 { vec4 Cv4[]; };
+#endif
 
 layout(push_constant) uniform PushConstants {
     uint M;      // C 的行数
@@ -104,7 +130,7 @@ void load_A_tile(uint t, uint stage, uint tid, uint block_row)
             if (aligned && gr < M && gc < K)
             {
                 // K%4==0 且 gc<K ⇒ gc+3<K，vec4 整组在行内；下标 %4==0 ⇒ 16B 对齐
-                const vec4 v = Av4[(gr * K + gc) >> 2];
+                const vec4 v = NN_LOADV4(Av4, (gr * K + gc) >> 2);
                 Ash[stage][k0    ][m >> 2][m & 3u] = v.x;
                 Ash[stage][k0 + 1u][m >> 2][m & 3u] = v.y;
                 Ash[stage][k0 + 2u][m >> 2][m & 3u] = v.z;
@@ -114,7 +140,7 @@ void load_A_tile(uint t, uint stage, uint tid, uint block_row)
             {
                 for (uint j = 0u; j < 4u; ++j)
                 {
-                    const float v = (gr < M && gc + j < K) ? A[gr * K + gc + j] : 0.0;
+                    const float v = (gr < M && gc + j < K) ? NN_RD(A[gr * K + gc + j]) : 0.0;
                     Ash[stage][k0 + j][m >> 2][m & 3u] = v;
                 }
             }
@@ -129,13 +155,13 @@ void load_A_tile(uint t, uint stage, uint tid, uint block_row)
             if (aligned && gc < K && gr < M)
             {
                 // M%4==0 且 gr<M ⇒ gr+3<M；下标 = gc*M+gr，两因子均 %4==0
-                Ash[stage][k][mq] = Av4[(gc * M + gr) >> 2];
+                Ash[stage][k][mq] = NN_LOADV4(Av4, (gc * M + gr) >> 2);
             }
             else
             {
                 for (uint j = 0u; j < 4u; ++j)
                 {
-                    const float v = (gr + j < M && gc < K) ? A[gc * M + gr + j] : 0.0;
+                    const float v = (gr + j < M && gc < K) ? NN_RD(A[gc * M + gr + j]) : 0.0;
                     Ash[stage][k][mq][j] = v;
                 }
             }
@@ -167,14 +193,14 @@ void load_B_tile(uint t, uint stage, uint tid, uint block_col)
             const uint gc = block_col + n0;     // n0%4==0、block_col%4==0 ⇒ gc%4==0
             if (aligned && gr < K && gc < N)
             {
-                const vec4 v = Bv4[(gr * N + gc) >> 2];
+                const vec4 v = NN_LOADV4(Bv4, (gr * N + gc) >> 2);
                 Bsh[stage][k][n0 >> 2] = v;     // vec4 沿 n ↔ [k][n>>2] 整槽
             }
             else
             {
                 for (uint j = 0u; j < 4u; ++j)
                 {
-                    const float v = (gr < K && gc + j < N) ? B[gr * N + gc + j] : 0.0;
+                    const float v = (gr < K && gc + j < N) ? NN_RD(B[gr * N + gc + j]) : 0.0;
                     Bsh[stage][k][(n0 + j) >> 2][(n0 + j) & 3u] = v;
                 }
             }
@@ -188,7 +214,7 @@ void load_B_tile(uint t, uint stage, uint tid, uint block_col)
             const uint gr = b_base_row + k0;    // b_base_row%4==0（t*BK%4==0）
             if (aligned && gc < N && gr < K)
             {
-                const vec4 v = Bv4[(gc * K + gr) >> 2];
+                const vec4 v = NN_LOADV4(Bv4, (gc * K + gr) >> 2);
                 for (uint j = 0u; j < 4u; ++j)
                     Bsh[stage][k0 + j][n >> 2][n & 3u] = v[j];
             }
@@ -196,7 +222,7 @@ void load_B_tile(uint t, uint stage, uint tid, uint block_col)
             {
                 for (uint j = 0u; j < 4u; ++j)
                 {
-                    const float v = (gr + j < K && gc < N) ? B[gc * K + gr + j] : 0.0;
+                    const float v = (gr + j < K && gc < N) ? NN_RD(B[gc * K + gr + j]) : 0.0;
                     Bsh[stage][k0 + j][n >> 2][n & 3u] = v;
                 }
             }
@@ -260,6 +286,23 @@ void main()
     }
 
     // ── 写入结果 ──────────────────────────────────────────────────────
+#if defined(NN_SHADER_F16)
+    // f16 输出：逐标量写出（C 无 vec4 别名视图），与 f32 的 N%4!=0 分支同构
+    for (uint i = 0u; i < 4u; ++i)
+    {
+        const uint out_row = block_row + ty * 4u + i;
+        if (out_row >= M) continue;
+        const uint out_col0 = block_col + tx * 4u;
+        if (out_col0 >= N) continue;
+        C[out_row * N + out_col0 + 0u] = NN_WR(acc[i].x);
+        if (out_col0 + 1u < N)
+            C[out_row * N + out_col0 + 1u] = NN_WR(acc[i].y);
+        if (out_col0 + 2u < N)
+            C[out_row * N + out_col0 + 2u] = NN_WR(acc[i].z);
+        if (out_col0 + 3u < N)
+            C[out_row * N + out_col0 + 3u] = NN_WR(acc[i].w);
+    }
+#else
     // vec4 快路径（N%4==0，uniform）：out_col0%4==0 且 out_col0<N
     //   ⇒ out_col0+3<N（整组在行内），单条 vec4 写出免 3 次边界判断。
     // 否则逐标量 + 边界判断（列尾残余 / 奇数形状）。
@@ -286,4 +329,5 @@ void main()
                 C[out_row * N + out_col0 + 3u] = acc[i].w;
         }
     }
+#endif
 }
