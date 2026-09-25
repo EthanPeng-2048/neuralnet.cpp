@@ -4,6 +4,8 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>   // require_same_shape fail-fast 诊断输出
+#include <cstdlib>  // require_same_shape fail-fast std::abort
 #include <execution>
 #include <functional>
 #include <memory>
@@ -82,11 +84,20 @@ namespace nn
         [[nodiscard]] const element *ptr() const noexcept { return data_.get(); }
         [[nodiscard]] element *ptr() noexcept { return data_.get(); }
 
-        static void require_same_shape(const MatrixT &lhs, const MatrixT &rhs, [[maybe_unused]] std::string_view message)
+        static void require_same_shape(const MatrixT &lhs, const MatrixT &rhs, std::string_view message)
         {
             if (lhs.rows_ != rhs.rows_ || lhs.cols_ != rhs.cols_)
             {
+                // Debug：NN_ASSERT 打印 file:line 后 abort。
+                // Release（NN_ASSERT 展开为空）：**绝不静默 OOB**——形状不匹配
+                // 在 L1 是编程错误（用户输入已在引擎入口经 Result 校验，
+                // 见 ComputeEngine::add_inplace），此处 fail-fast 中止，
+                // 代价为两次 size_t 比较，不影响热路径。
                 NN_ASSERT(false, message.data());
+                std::fprintf(stderr, "FATAL: Matrix 形状不匹配: %.*s (%zux%zu vs %zux%zu)\n",
+                             static_cast<int>(message.size()), message.data(),
+                             lhs.rows_, lhs.cols_, rhs.rows_, rhs.cols_);
+                std::abort();
             }
         }
 

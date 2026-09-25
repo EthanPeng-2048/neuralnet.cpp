@@ -74,26 +74,10 @@ namespace nn
             }
         }
 
-        // ── 通用单任务提交（保留给非性能敏感路径） ──────────────────────
-        template<typename F, typename... Args>
-        [[nodiscard]] auto submit(F&& f, Args&&... args)
-            -> std::future<std::invoke_result_t<F, Args...>>
-        {
-            using return_type = std::invoke_result_t<F, Args...>;
-
-            auto task = std::make_shared<std::packaged_task<return_type()>>(
-                std::bind(std::forward<F>(f), std::forward<Args>(args)...)
-            );
-
-            std::future<return_type> result = task->get_future();
-            {
-                std::unique_lock lock(queue_mutex_);
-                NN_ASSERT(!stop_.load(std::memory_order_acquire), "submit on stopped ThreadPool");
-                tasks_.emplace([task]() { (*task)(); });
-            }
-            condition_.notify_one();
-            return result;
-        }
+        // ── 通用单任务提交（submit）已删除：全库无调用方（审查 P1-3），
+        //    且每次调用 make_shared<packaged_task> 堆分配，违背本池
+        //    "零分配 latch" 设计。需要 future 语义时应在调用方分块后
+        //    用 parallel_* 系列原语。 ──────────────────────────────────
 
     private:
         // ── 分块辅助：计算合理的分块数 ──────────────────────────────────
@@ -552,6 +536,38 @@ namespace nn
             wait_for_latch(latch);
         }
 
+        // ── 归约分块（确定性契约，铁律 8）──────────────────────────────────
+        // 分段边界必须**只由 total 决定**，与 worker 数 / 机器核数无关：
+        // 旧实现 n_chunks = chunk_count(total) 依赖 workers_.size()，
+        // 同一输入在 1-worker 与 N-worker 下走不同折叠结构 → 浮点非结合律
+        // 导致字节不一致（跨机也不一致）。修复后 1-worker 与 N-worker、
+        // 任何机器都走完全相同的分段，部分和按**固定块下标**存放与合并，
+        // 线程只决定"谁算哪块"，不参与边界与合并顺序。
+        //
+        // 借鉴 ATen::parallel_reduce（torch/include/ATen/Parallel-inl.h）：
+        // 其部分和按 results[tid] 存放、边界由 get_num_threads() 决定 →
+        // 跨线程数不可复现（PyTorch 亦声明 CPU 归约不保证跨线程数一致）；
+        // 本库铁律 8 要求逐字节一致，故与 ATen 反向：边界固定、弃用
+        // per-thread 部分和下标。
+        //
+        // 分段语义（串/并行共用的唯一定义）：
+        //   块 0 以 init 为种子，块 c>0 以块内首元素为种子（init 恰好计入
+        //   一次，旧实现每块都加 init、合并时再加一次，init≠0 时数学错误）；
+        //   块内从左到右折叠；结果按块下标升序合并。
+        //   n_chunks==1 时退化为纯左折叠，与 n < PARALLEL_THRESHOLD 的
+        //   串行路径（core_config::transform_reduce）逐字节一致。
+        // 块大小下限保证 n_chunks≥2 时每块至少 MIN_CHUNK 个元素（非空，
+        // c>0 块取首元素作种子安全）；MAX_CHUNKS 限制任务/partials 数量，
+        // 任务开销 ∝ 块数，实际调用方（text_train 梯度统计，log 间隔一次）
+        // 对任务数不敏感。
+        [[nodiscard]] static std::size_t reduce_chunk_count(std::size_t total) noexcept
+        {
+            constexpr std::size_t MIN_CHUNK  = 16384;   // 元素数（64KB f32）
+            constexpr std::size_t MAX_CHUNKS = 512;
+            if (total < MIN_CHUNK * 2) return 1;
+            return std::min(MAX_CHUNKS, total / MIN_CHUNK);
+        }
+
         // ── 并行 transform_reduce（一元 transform）──────────────────────
         template<typename InputIt, typename T, typename BinaryOp, typename UnaryOp>
         T parallel_transform_reduce(InputIt first, InputIt last, T init,
@@ -560,19 +576,22 @@ namespace nn
             const auto total = static_cast<std::size_t>(std::ranges::distance(first, last));
             if (total == 0) return init;
 
-            const auto n_chunks = chunk_count(total);
-            if (n_chunks <= 1)
+            const auto n_chunks = reduce_chunk_count(total);
+            if (n_chunks == 1)
             {
-                return std::transform_reduce(first, last, init,
-                                            std::forward<BinaryOp>(reduce_op),
-                                            std::forward<UnaryOp>(transform_op));
+                // 纯左折叠（= 单块语义）。显式循环而非 std::transform_reduce：
+                // 后者归约顺序标准未定义，不能作确定性基准。
+                T local = init;
+                for (auto it = first; it != last; ++it)
+                    local = reduce_op(local, transform_op(*it));
+                return local;
             }
 
             const std::size_t base = total / n_chunks;
             const std::size_t rem  = total % n_chunks;
             std::atomic<int> latch{static_cast<int>(n_chunks)};
 
-            // 预分配结果数组（栈上小 vector），避免 future 堆分配
+            // 部分和按固定块下标存放（与调度无关 → 确定性）
             std::vector<T> partials(n_chunks);
 
             {
@@ -587,25 +606,44 @@ namespace nn
                     std::ranges::advance(end, static_cast<std::ptrdiff_t>(len));
                     off += len;
 
-                    tasks_.emplace([this, beg, end, &reduce_op, &transform_op, &partials, &latch, c, init]()
+                    if (c == 0)
                     {
-                        T local = init;  // 以调用者 init 为单位元（不能用 T{}）
-                        for (auto it = beg; it != end; ++it)
-                            local = reduce_op(local, transform_op(*it));
-                        partials[c] = std::move(local);
-                        finish_chunk(latch);
-                    });
+                        // 块 0：以 init 为种子（init 在整个归约恰好计入一次）
+                        tasks_.emplace([this, beg, end, &reduce_op, &transform_op, &partials, &latch, init]()
+                        {
+                            T local = init;
+                            for (auto it = beg; it != end; ++it)
+                                local = reduce_op(local, transform_op(*it));
+                            partials[0] = std::move(local);
+                            finish_chunk(latch);
+                        });
+                    }
+                    else
+                    {
+                        // 块 c>0：以块内首元素为种子（len ≥ MIN_CHUNK ≥ 1 保证非空）
+                        tasks_.emplace([this, beg, end, &reduce_op, &transform_op, &partials, &latch, c]()
+                        {
+                            auto it = beg;
+                            T local = transform_op(*it);
+                            for (++it; it != end; ++it)
+                                local = reduce_op(local, transform_op(*it));
+                            partials[c] = std::move(local);
+                            finish_chunk(latch);
+                        });
+                    }
                     condition_.notify_one();
                 }
             }
 
             {
+                // 末段由调用者执行（n_chunks ≥ 2 ⇒ 末块下标 ≥ 1 ⇒ 首元素种子）
                 const std::size_t c = n_chunks - 1;
                 const std::size_t off = total - (base + (c < rem ? 1 : 0));
                 auto beg = first;
                 std::ranges::advance(beg, static_cast<std::ptrdiff_t>(off));
-                T local = init;  // 以调用者 init 为单位元（不能用 T{}）
-                for (auto it = beg; it != last; ++it)
+                auto it = beg;
+                T local = transform_op(*it);
+                for (++it; it != last; ++it)
                     local = reduce_op(local, transform_op(*it));
                 partials[c] = std::move(local);
                 finish_chunk(latch);
@@ -613,13 +651,15 @@ namespace nn
 
             wait_for_latch(latch);
 
-            T result = init;
-            for (auto& p : partials)
-                result = reduce_op(result, p);
+            T result = std::move(partials[0]);
+            for (std::size_t c = 1; c < n_chunks; ++c)
+                result = reduce_op(result, partials[c]);
             return result;
         }
 
         // ── 并行 transform_reduce（二元输入范围）────────────────────────
+        // 与一元版共享同一确定性契约（铁律 8）：分段边界只由 total 决定、
+        // 块 0 以 init 为种子、其余块以首元素为种子、按块下标升序合并。
         template<typename InputIt1, typename InputIt2, typename T, typename BinaryOp, typename UnaryOp>
         T parallel_transform_reduce(InputIt1 first1, InputIt1 last1, InputIt2 first2,
                                     T init, BinaryOp&& reduce_op, UnaryOp&& transform_op)
@@ -627,17 +667,21 @@ namespace nn
             const auto total = static_cast<std::size_t>(std::ranges::distance(first1, last1));
             if (total == 0) return init;
 
-            const auto n_chunks = chunk_count(total);
-            if (n_chunks <= 1)
+            const std::size_t n_chunks = reduce_chunk_count(total);
+            if (n_chunks == 1)
             {
-                return std::transform_reduce(first1, last1, first2, init,
-                                            std::forward<BinaryOp>(reduce_op),
-                                            std::forward<UnaryOp>(transform_op));
+                T local = init;
+                auto i1 = first1;
+                auto i2 = first2;
+                for (; i1 != last1; ++i1, ++i2)
+                    local = reduce_op(local, transform_op(*i1, *i2));
+                return local;
             }
 
             const std::size_t base = total / n_chunks;
             const std::size_t rem  = total % n_chunks;
             std::atomic<int> latch{static_cast<int>(n_chunks)};
+            // 部分和按固定块下标存放（边界 = f(total)，与调度无关）
             std::vector<T> partials(n_chunks);
 
             {
@@ -654,29 +698,48 @@ namespace nn
                     std::ranges::advance(i1_end, static_cast<std::ptrdiff_t>(len));
                     off += len;
 
-                    tasks_.emplace([this, i1, i1_end, i2, &reduce_op, &transform_op, &partials, &latch, c, init]()
+                    if (c == 0)
                     {
-                        T local = init;  // 以调用者 init 为单位元（不能用 T{}）
-                        auto it1 = i1;
-                        auto it2 = i2;
-                        for (; it1 != i1_end; ++it1, ++it2)
-                            local = reduce_op(local, transform_op(*it1, *it2));
-                        partials[c] = std::move(local);
-                        finish_chunk(latch);
-                    });
+                        // 块 0：以 init 为种子（init 在整个归约恰好计入一次）
+                        tasks_.emplace([this, i1, i1_end, i2, &reduce_op, &transform_op, &partials, &latch, init]()
+                        {
+                            T local = init;
+                            auto it1 = i1;
+                            auto it2 = i2;
+                            for (; it1 != i1_end; ++it1, ++it2)
+                                local = reduce_op(local, transform_op(*it1, *it2));
+                            partials[0] = std::move(local);
+                            finish_chunk(latch);
+                        });
+                    }
+                    else
+                    {
+                        // 块 c>0：以块内首元素为种子（len ≥ MIN_CHUNK ≥ 1 保证非空）
+                        tasks_.emplace([this, i1, i1_end, i2, &reduce_op, &transform_op, &partials, &latch, c]()
+                        {
+                            auto it1 = i1;
+                            auto it2 = i2;
+                            T local = transform_op(*it1, *it2);
+                            for (++it1, ++it2; it1 != i1_end; ++it1, ++it2)
+                                local = reduce_op(local, transform_op(*it1, *it2));
+                            partials[c] = std::move(local);
+                            finish_chunk(latch);
+                        });
+                    }
                     condition_.notify_one();
                 }
             }
 
             {
+                // 末段由调用者执行（n_chunks ≥ 2 ⇒ 末块下标 ≥ 1 ⇒ 首元素种子）
                 const std::size_t c = n_chunks - 1;
                 const std::size_t off = total - (base + (c < rem ? 1 : 0));
                 auto i1 = first1;
                 auto i2 = first2;
                 std::ranges::advance(i1, static_cast<std::ptrdiff_t>(off));
                 std::ranges::advance(i2, static_cast<std::ptrdiff_t>(off));
-                T local = init;  // 以调用者 init 为单位元（不能用 T{}）
-                for (; i1 != last1; ++i1, ++i2)
+                T local = transform_op(*i1, *i2);
+                for (++i1, ++i2; i1 != last1; ++i1, ++i2)
                     local = reduce_op(local, transform_op(*i1, *i2));
                 partials[c] = std::move(local);
                 finish_chunk(latch);
@@ -684,9 +747,9 @@ namespace nn
 
             wait_for_latch(latch);
 
-            T result = init;
-            for (auto& p : partials)
-                result = reduce_op(result, p);
+            T result = std::move(partials[0]);
+            for (std::size_t c = 1; c < n_chunks; ++c)
+                result = reduce_op(result, partials[c]);
             return result;
         }
 

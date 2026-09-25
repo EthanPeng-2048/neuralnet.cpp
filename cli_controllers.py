@@ -204,7 +204,7 @@ class CLIController(ABC):
         finally:
             try:
                 stream.close()
-            except:
+            except Exception:
                 pass
     
     def _process_output(self):
@@ -358,7 +358,8 @@ class CLIController(ABC):
                     self.process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     self.process.kill()
-            except:
+            except Exception:
+                # 只吞进程清理异常；不得用裸 except 吞掉 KeyboardInterrupt/SystemExit
                 pass
     
     def get_last_output(self, n: int = 10) -> List[str]:
