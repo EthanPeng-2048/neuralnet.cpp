@@ -64,7 +64,7 @@ private:
                 }
             }
         }
-        auto r = engine.from_matrix(enc);
+        auto r = engine.from_matrix(enc, p_.param);
         if (!r) return std::unexpected(r.error());
         encoding_cache_ = std::move(*r);
         cached_total_ = total_len;
@@ -97,7 +97,7 @@ public:
 
         return dsl::compute(engine,
             dsl::leaf(input) + dsl::leaf(encoding_cache_),
-            input.rows(), input.cols());
+            input.rows(), input.cols(), p_.compute);
     }
 
     [[nodiscard]] Result<Tensor> backward(
@@ -141,6 +141,16 @@ public:
         auto r3 = ff_.init(engine); if (!r3) return std::unexpected(r3.error());
         auto r4 = norm2_.init(engine); if (!r4) return std::unexpected(r4.error());
         return {};
+    }
+
+    // ── D7：精度配置下传（§9.2）：复合层必须把 profile 给到全部子层 ──────
+    void set_precision_profile(const PrecisionProfile& profile) override
+    {
+        Layer::set_precision_profile(profile);
+        self_attn_.set_precision_profile(profile);
+        norm1_.set_precision_profile(profile);
+        ff_.set_precision_profile(profile);
+        norm2_.set_precision_profile(profile);
     }
 
     std::vector<TensorRef> parameters() override
@@ -223,7 +233,7 @@ public:
         // r2 = input + a
         auto r2 = dsl::compute(engine,
             dsl::leaf(input) + dsl::leaf(*a),
-            input.rows(), input.cols());
+            input.rows(), input.cols(), p_.compute);
         if (!r2) return std::unexpected(r2.error());
         Tensor res2 = std::move(*r2);
         if (!checkpoint_mode_)
@@ -240,7 +250,7 @@ public:
         // out = res2 + f
         return dsl::compute(engine,
             dsl::leaf(res2) + dsl::leaf(*f),
-            res2.rows(), res2.cols());
+            res2.rows(), res2.cols(), p_.compute);
     }
 
     [[nodiscard]] Result<Tensor> backward(
@@ -254,7 +264,7 @@ public:
 
         auto grad_r1 = dsl::compute(engine,
             dsl::leaf(grad_output) + dsl::leaf(*b_n2),
-            grad_output.rows(), grad_output.cols());
+            grad_output.rows(), grad_output.cols(), p_.compute);
         if (!grad_r1) return std::unexpected(grad_r1.error());
 
         // 残差1 反向: 分流到 input + SelfAttn
@@ -265,7 +275,7 @@ public:
 
         return dsl::compute(engine,
             dsl::leaf(*grad_r1) + dsl::leaf(*b_n1),
-            grad_r1->rows(), grad_r1->cols());
+            grad_r1->rows(), grad_r1->cols(), p_.compute);
     }
 };
 
@@ -328,6 +338,14 @@ public:
         return {};
     }
 
+    // ── D7：精度配置下传（§9.2）：逐层 EncoderLayer + 位置编码 ──────────
+    void set_precision_profile(const PrecisionProfile& profile) override
+    {
+        Layer::set_precision_profile(profile);
+        for (auto& l : layers_) l.set_precision_profile(profile);
+        pos_encoding_.set_precision_profile(profile);
+    }
+
     std::vector<TensorRef> parameters() override
     {
         std::vector<TensorRef> p;
@@ -381,7 +399,7 @@ public:
         //   再 rearrange_3d inverse 回 (d_model, batch)。
         auto re = engine.rearrange_3d(x, d_model_, batch_size_, num_patches_, false);
         if (!re) return std::unexpected(re.error());
-        auto row_sum = engine.row_reduce_sum(*re);
+        auto row_sum = engine.row_reduce_sum(*re, p_.compute);
         if (!row_sum) return std::unexpected(row_sum.error());
         auto rs_re = engine.rearrange_3d(*row_sum, d_model_, batch_size_, 1, true);
         if (!rs_re) return std::unexpected(rs_re.error());
@@ -407,7 +425,7 @@ public:
         auto r = engine.scale_inplace(*g_re, inv_num_patches_);
         if (!r) return std::unexpected(r.error());
         // (*g_re): (batch*d_model, 1) × ones_row_ (1, num_patches) → (batch*d_model, num_patches)
-        auto unpooled = engine.matmul(*g_re, ones_row_, false, false);
+        auto unpooled = engine.matmul(*g_re, ones_row_, false, false, p_.compute);
         if (!unpooled) return std::unexpected(unpooled.error());
         auto grad = engine.rearrange_3d(*unpooled, d_model_, batch_size_, num_patches_, true);
         if (!grad) return std::unexpected(grad.error());
@@ -468,6 +486,13 @@ public:
     [[nodiscard]] Result<void> init(ComputeEngine& engine) override
     {
         return projection_.init(engine);
+    }
+
+    // ── D7：精度配置下传（§9.2）：投影层是复合层的唯一子层 ───────────────
+    void set_precision_profile(const PrecisionProfile& profile) override
+    {
+        Layer::set_precision_profile(profile);
+        projection_.set_precision_profile(profile);
     }
 
     [[nodiscard]] std::size_t num_patches() const noexcept { return num_patches_; }

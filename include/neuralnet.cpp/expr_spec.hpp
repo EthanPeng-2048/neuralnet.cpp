@@ -657,6 +657,65 @@ struct ExprSpec
     return std::string(buf);
 }
 
+// ── 精度签名（多精度 AOT 变体索引，Phase 2 in-kernel f16）─────────────────
+// 同一个**结构** ExprSpec 可以按不同精度组合求值：第 i 个输入张量是 f16、
+// 输出是 f16。AOT 以 (结构 key, 精度签名) 为索引 → 同一结构可生成多个**带类型**
+// 的 shader 变体（in-kernel f16 = 半精度直读直写 + f32 参考算术），从而取代
+// "边界 cast 适配层"为每个算子物化 f32 副本的做法（实测后者使训练 transient
+// 膨胀 2.4×，见 docs/development/05-mixed-precision.md §12.5）。
+//
+// 位布局（uint32）：
+//   bit 0..15  第 i 个输入是 F16（i = 输入槽位，与 views 顺序一一对应）
+//   bit 16     输出是 F16
+//   全 0 = 全 f32 = **旧行为**：key 不加后缀、registry 不生成额外变体（零回归）。
+inline constexpr std::uint32_t EXPR_PREC_SIG_OUT_BIT    = 16u;
+inline constexpr std::uint32_t EXPR_PREC_SIG_INPUT_MASK = 0xFFFFu;
+using ExprPrecSig = std::uint32_t;
+
+[[nodiscard]] inline constexpr ExprPrecSig expr_prec_sig_make(
+    std::uint32_t input_bits, bool out_f16) noexcept
+{
+    return (out_f16 ? (1u << EXPR_PREC_SIG_OUT_BIT) : 0u)
+         | (input_bits & EXPR_PREC_SIG_INPUT_MASK);
+}
+
+// 全 f32（旧行为）？
+[[nodiscard]] inline constexpr bool expr_prec_sig_is_f32(ExprPrecSig s) noexcept
+{ return s == 0u; }
+
+// 第 i 个输入是否为 f16 / 输出是否为 f16
+[[nodiscard]] inline constexpr bool expr_prec_sig_in_f16(ExprPrecSig s,
+                                                         std::size_t i) noexcept
+{ return i < 32u && ((s >> i) & 1u) != 0u; }
+[[nodiscard]] inline constexpr bool expr_prec_sig_out_f16(ExprPrecSig s) noexcept
+{ return ((s >> EXPR_PREC_SIG_OUT_BIT) & 1u) != 0u; }
+
+// 变体索引 key：全 f32 → 结构 key 本身（逐字节等同旧行为）；否则加 "#xxxx"
+[[nodiscard]] inline std::string expr_prec_sig_key(const std::string& spec_key,
+                                                   ExprPrecSig sig)
+{
+    if (sig == 0u)
+        return spec_key;
+    char buf[8];
+    std::snprintf(buf, sizeof(buf), "#%04x", static_cast<unsigned>(sig));
+    return spec_key + buf;
+}
+
+// 诊断用：把签名渲染成 "in=[f16,f32,...] out=f16"
+[[nodiscard]] inline std::string expr_prec_sig_str(ExprPrecSig sig,
+                                                   std::size_t num_inputs)
+{
+    std::string s = "in=[";
+    for (std::size_t i = 0; i < num_inputs; ++i)
+    {
+        if (i) s += ",";
+        s += expr_prec_sig_in_f16(sig, i) ? "f16" : "f32";
+    }
+    s += "] out=";
+    s += expr_prec_sig_out_f16(sig) ? "f16" : "f32";
+    return s;
+}
+
 // ── 上限（GPU 资源 / 校验共用）───────────────────────────────────────────
 inline constexpr std::size_t EXPR_MAX_INPUTS = 16;  // 树型 DSL 重复叶子上限（绑定按 spec 实际 views 动态创建，非固定）
 inline constexpr std::size_t EXPR_MAX_CONSTS = 16;

@@ -435,7 +435,7 @@ inline constexpr PrecisionProfile profile_f32() noexcept
     return PrecisionProfile{};  // 全 F32 = 现状
 }
 
-// master-weights（经典混合精度，推荐的 f16 配方）：
+// master-weights（经典混合精度）：
 // f32 主权重 + f16 计算 + f32 稳定算子 + f32 优化器状态
 inline constexpr PrecisionProfile profile_master_weights() noexcept
 {
@@ -444,6 +444,50 @@ inline constexpr PrecisionProfile profile_master_weights() noexcept
         /*compute=*/   Precision::F16,
         /*stable=*/    Precision::F32,
         /*optimizer=*/ Precision::F32};
+}
+
+// ── f16 训练配方（CLI `--f16` 的语义）─────────────────────────────────────
+// {param=F16, compute=F16, stable=F32, optimizer=F32} = docs 05 §9.4 的
+// "全 f16（激进）"行：**参数与激活全部 f16 存储**（这是"全 f16"的本意——
+// 与 profile_master_weights 的区别正是 param 由 F32 变 F16），而数值敏感链
+// （softmax / LayerNorm / loss）与优化器状态留在 f32。
+//
+// 为什么不把 stable / optimizer 也设成 F16 —— 有实测证据（本机 40HX，
+// GPT d64/h4/L4/ff256、vocab 8208、seq 256、batch 8、adam lr 1e-3）：
+//   · optimizer=F16（Adam 的 m/v 存 f16）：v ≈ g² ~ 1e-10 **下溢到 0** →
+//     delta = lr·m/(√0+eps) 爆炸 → loss 从 7.9 发散到 3.6e4；
+//   · stable=F16：CE 链在 f16 下 ~200 步后出现 NaN（f16 范围 65504 / 10 位
+//     尾数不足以承载 vocab 级 log-sum-exp 与 log_softmax）；
+//   · 两者同时 F16（profile_all_f16）：loss 恒定在 32.1（更新被 f16 舍入吃光）。
+// 全四字段 f16 需要 loss scaling + in-kernel f16 归约（docs 05 §12.3），
+// 当前不具备 → 保留 profile_all_f16() 供显式实验，不作 CLI 默认。
+inline constexpr PrecisionProfile profile_f16() noexcept
+{
+    return PrecisionProfile{
+        /*param=*/     Precision::F16,
+        /*compute=*/   Precision::F16,
+        /*stable=*/    Precision::F32,
+        /*optimizer=*/ Precision::F32};
+}
+
+// 全 f16：四个字段全部 F16（激进实验配方；见上：当前数值上不可用于训练）。
+// 注意：与 profile_master_weights（f32 主权重混合）区分——后者是旧的
+// `--f16` 语义，曾造成"传了 --f16 却是混合精度"的误解。
+inline constexpr PrecisionProfile profile_all_f16() noexcept
+{
+    return PrecisionProfile{
+        /*param=*/     Precision::F16,
+        /*compute=*/   Precision::F16,
+        /*stable=*/    Precision::F16,
+        /*optimizer=*/ Precision::F16};
+}
+
+// 便捷判定：全 F32 配置（= 迁移前行为）。CLI 用它决定是否启用
+// PrecisionEngine 适配层（全 f32 时直通原生引擎，零开销零回归）。
+[[nodiscard]] constexpr bool is_profile_f32(const PrecisionProfile& p) noexcept
+{
+    return p.param == Precision::F32 && p.compute == Precision::F32 &&
+           p.stable == Precision::F32 && p.optimizer == Precision::F32;
 }
 
 } // namespace nn

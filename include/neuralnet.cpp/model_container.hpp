@@ -38,6 +38,12 @@ private:
     // 校验文件头部与模型架构是否一致。为空表示未记录（跳过校验，向后兼容）。
     std::optional<ModelSpec> spec_;
 
+    // 默认精度配置（§9.2）：**设过**才在 add()/add_layer() 的 init 之前注入。
+    // 未设 = nullopt → 不动层自己的 profile（否则会把工厂在构造器里已注入的
+    // 精度用默认 f32 覆盖掉：GPTModel 等复合层就是"构造器注入 + init 创建权重"
+    // 的顺序，覆盖会导致 token_emb 等权重退回 f32）。
+    std::optional<PrecisionProfile> default_precision_;
+
 public:
     Model() = default;
     explicit Model(ComputeEngine& engine) : engine_(engine) {}
@@ -66,6 +72,7 @@ public:
     Result<void> add(Args&&... args)
     {
         auto layer = std::make_unique<LayerType>(std::forward<Args>(args)...);
+        if (default_precision_) layer->set_precision_profile(*default_precision_);
         auto r = layer->init(engine());
         if (!r) return std::unexpected(r.error());
         layers_.emplace_back(std::move(layer));
@@ -75,10 +82,22 @@ public:
     // 添加已由工厂构造的 Layer（如 make_norm_layer 按 NormType 创建归一化层）
     Result<void> add_layer(std::unique_ptr<Layer> layer)
     {
+        if (default_precision_) layer->set_precision_profile(*default_precision_);
         auto r = layer->init(engine());
         if (!r) return std::unexpected(r.error());
         layers_.emplace_back(std::move(layer));
         return {};
+    }
+
+    // ── 默认精度配置（§9.2）：须在 add()/add_layer() 之前调用 ─────────────
+    void set_default_precision_profile(const PrecisionProfile& profile)
+    {
+        default_precision_ = profile;
+    }
+    [[nodiscard]] const PrecisionProfile& default_precision_profile() const noexcept
+    {
+        static const PrecisionProfile f32{};
+        return default_precision_ ? *default_precision_ : f32;
     }
 
     // ── 访问 ─────────────────────────────────────────────────────────────

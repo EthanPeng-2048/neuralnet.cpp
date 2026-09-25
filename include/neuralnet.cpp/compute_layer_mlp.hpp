@@ -55,19 +55,19 @@ public:
 
         Matrix b_cpu(out_features_, 1);  // 零初始化
 
-        // ── 通过 engine 上传到目标设备 ──
-        // Phase 1：权重始终 F32 存储（master-weights），精度控制留给 Phase 2
-        auto w_res = engine.from_matrix(w_cpu);
+        // ── 通过 engine 上传到目标设备（精度 = p_.param，§9.2）──────────────
+        // 全 F32 配置下与迁移前逐字节一致（零回归）；f16 配置 = 权重存储减半
+        auto w_res = engine.from_matrix(w_cpu, p_.param);
         if (!w_res) return std::unexpected(w_res.error());
         w_ = std::move(*w_res);
 
-        auto b_res = engine.from_matrix(b_cpu);
+        auto b_res = engine.from_matrix(b_cpu, p_.param);
         if (!b_res) return std::unexpected(b_res.error());
         b_ = std::move(*b_res);
 
-        // ── 梯度张量始终 f32（master-weights 策略）──
-        grad_w_ = engine.create_tensor(out_features_, in_features_, Precision::F32);
-        grad_b_ = engine.create_tensor(out_features_, 1, Precision::F32);
+        // ── 梯度张量精度 = p_.param（与参数同精度；§8.3 存储精度不可变）──
+        grad_w_ = engine.create_tensor(out_features_, in_features_, p_.param);
+        grad_b_ = engine.create_tensor(out_features_, 1, p_.param);
         auto r1 = engine.zero(grad_w_);
         auto r2 = engine.zero(grad_b_);
         if (!r1) return std::unexpected(r1.error());
@@ -105,8 +105,9 @@ public:
         if (!checkpoint_mode_)
             input_cache_ = input;
 
-        // Phase 1：计算始终 F32（引擎 F16 路径的 to_matrix 未正确转换，见 bug fix）
-        return engine.matmul_with_bias(w_, input, b_, false, false);
+        // 计算精度 = p_.compute（引擎内部处理 matmul + broadcast bias 的精度：
+        // f16 存储经 PrecisionEngine 边界 cast 走 f32 GEMM）
+        return engine.matmul_with_bias(w_, input, b_, false, false, p_.compute);
     }
 
     // ── backward: 同样简洁，精度由引擎处理 ────────────────────────────
@@ -116,8 +117,9 @@ public:
         if (grad_output.rows() != w_.rows())
             return std::unexpected(Error{"linear backward: grad_output shape mismatch"});
 
-        // Phase 1：计算始终 F32
-        auto grad_input = engine.matmul(w_, grad_output, true, false);
+        // 计算精度 = p_.compute（in-place 累加的目标精度 = grad_w_ 的存储精度，
+        // compute_into 无需 P：§8.3 in-place 存储精度不可变）
+        auto grad_input = engine.matmul(w_, grad_output, true, false, p_.compute);
         if (!grad_input) return std::unexpected(grad_input.error());
 
         // grad_w += grad_output × input^T：matmul 段与累加**融合为单次 dispatch**
@@ -134,7 +136,7 @@ public:
         // 广播视图访问输入，而此处必须同时引用外部累加张量 grad_b_（Linear
         // 视图），两者的语义冲突（见 eval_expr_reduce 的前置校验）。故保留
         // "归约原语 + 累加原语"两步。
-        auto gb = engine.row_reduce_sum(grad_output);
+        auto gb = engine.row_reduce_sum(grad_output, p_.compute);
         if (!gb) return std::unexpected(gb.error());
         auto r2 = engine.accumulate(grad_b_, *gb);
         if (!r2) return std::unexpected(r2.error());
@@ -170,7 +172,7 @@ public:
             input_cache_ = input;
         return dsl::compute(engine,
             dsl::max(dsl::leaf(input), Scalar{0}),
-            input.rows(), input.cols());
+            input.rows(), input.cols(), p_.compute);
     }
 
     // ── backward: grad_x = (x > 0) ? grad_out : 0 ────────────────────────
@@ -186,7 +188,7 @@ public:
         return dsl::compute(engine,
             dsl::select(dsl::leaf(input_cache_) > Scalar{0},
                         dsl::leaf(grad_output), Scalar{0}),
-            grad_output.rows(), grad_output.cols());
+            grad_output.rows(), grad_output.cols(), p_.compute);
     }
 };
 
@@ -236,7 +238,7 @@ public:
         // out = x * sigmoid(βx) = x / (1 + exp(-β·x))
         return dsl::compute(engine,
             dsl::leaf(input) / (Scalar{1} + dsl::exp(-(dsl::leaf(input) * beta))),
-            input.rows(), input.cols());
+            input.rows(), input.cols(), p_.compute);
     }
 
     // ── backward: grad_x = grad_out * factor ─────────────────────────────
@@ -257,7 +259,7 @@ public:
         auto factor = s * (Scalar{1} + bx * (Scalar{1} - s));       // 1+βx(1-s)
         return dsl::compute(engine,
             dsl::leaf(grad_output) * factor,
-            grad_output.rows(), grad_output.cols());
+            grad_output.rows(), grad_output.cols(), p_.compute);
     }
 };
 
@@ -319,7 +321,7 @@ public:
         // out = gate · σ(gate) · up；σ(g) = 1/(1+exp(-g))
         return dsl::compute(engine,
             gv * (Scalar{1} / (Scalar{1} + dsl::exp(-gv))) * uv,
-            d_ff_, cols);
+            d_ff_, cols, p_.compute);
     }
 
     // ── backward: 单 kernel 融合，消去 create+zero+2×insert_rows ──────────
@@ -360,7 +362,7 @@ public:
         const auto gu = go * gate * s;
         return dsl::compute(engine,
             dsl::select(dsl::row() < dsl::rparam(static_cast<nn::Scalar>(d_ff_)), gg, gu),
-            rows, cols);
+            rows, cols, p_.compute);
     }
 };
 
@@ -411,16 +413,16 @@ public:
         Matrix gamma_cpu(normalized_shape_, 1, Scalar{1});
         Matrix beta_cpu(normalized_shape_, 1, Scalar{0});
 
-        auto g = engine.from_matrix(gamma_cpu);
+        auto g = engine.from_matrix(gamma_cpu, p_.param);
         if (!g) return std::unexpected(g.error());
         gamma_ = std::move(*g);
 
-        auto bv = engine.from_matrix(beta_cpu);
+        auto bv = engine.from_matrix(beta_cpu, p_.param);
         if (!bv) return std::unexpected(bv.error());
         beta_ = std::move(*bv);
 
-        grad_gamma_ = engine.create_tensor(normalized_shape_, 1);
-        grad_beta_ = engine.create_tensor(normalized_shape_, 1);
+        grad_gamma_ = engine.create_tensor(normalized_shape_, 1, p_.param);
+        grad_beta_ = engine.create_tensor(normalized_shape_, 1, p_.param);
         { auto r1 = engine.zero(grad_gamma_); if (!r1) return std::unexpected(r1.error()); }
         { auto r2 = engine.zero(grad_beta_);  if (!r2) return std::unexpected(r2.error()); }
         return {};
@@ -473,7 +475,7 @@ public:
 
         // 1. mean_raw = col_reduce_sum(x) → (1,B)
         auto mean_raw = dsl::compute_reduce(engine,
-            dsl::col_reduce_sum(dsl::leaf(input)), F, B);
+            dsl::col_reduce_sum(dsl::leaf(input)), F, B, p_.stable);
         if (!mean_raw) return std::unexpected(mean_raw.error());
 
         // 2. mean = mean_raw*(1/F) → (1,B)
@@ -481,17 +483,17 @@ public:
         //   融合表达式保持 F 无关 → 不同归一化维度共享同一 AOT 融合 shader）
         auto mean = dsl::compute(engine,
             dsl::leaf(*mean_raw) * dsl::rparam(inv_features),
-            mean_raw->rows(), mean_raw->cols());
+            mean_raw->rows(), mean_raw->cols(), p_.stable);
         if (!mean) return std::unexpected(mean.error());
 
         // 3. diff = x - mean (col 广播) → (F,B)
         auto diff = dsl::compute(engine,
-            dsl::leaf(input) - dsl::col_broadcast(*mean), F, B);
+            dsl::leaf(input) - dsl::col_broadcast(*mean), F, B, p_.stable);
         if (!diff) return std::unexpected(diff.error());
 
         // 4. var_raw = col_reduce_sum(diff²) → (1,B)
         auto var_raw = dsl::compute_reduce(engine,
-            dsl::col_reduce_sum(dsl::leaf(*diff) * dsl::leaf(*diff)), F, B);
+            dsl::col_reduce_sum(dsl::leaf(*diff) * dsl::leaf(*diff)), F, B, p_.stable);
         if (!var_raw) return std::unexpected(var_raw.error());
 
         // 5. std_inv = rsqrt(var_raw*(1/F) + ε) → (1,B)
@@ -500,7 +502,7 @@ public:
         auto std_inv = dsl::compute(engine,
             dsl::rsqrt(dsl::leaf(*var_raw) * dsl::rparam(inv_features)
                        + dsl::rparam(epsilon_)),
-            var_raw->rows(), var_raw->cols());
+            var_raw->rows(), var_raw->cols(), p_.stable);
         if (!std_inv) return std::unexpected(std_inv.error());
         Tensor std_inv_t = std::move(*std_inv);
         if (!checkpoint_mode_)
@@ -508,7 +510,7 @@ public:
 
         // 6. normalized = diff * std_inv (col 广播) → (F,B)
         auto normalized = dsl::compute(engine,
-            dsl::leaf(*diff) * dsl::col_broadcast(std_inv_t), F, B);
+            dsl::leaf(*diff) * dsl::col_broadcast(std_inv_t), F, B, p_.stable);
         if (!normalized) return std::unexpected(normalized.error());
         Tensor normalized_t = std::move(*normalized);
         if (!checkpoint_mode_)
@@ -518,7 +520,7 @@ public:
         return dsl::compute(engine,
             dsl::leaf(normalized_t) * dsl::row_broadcast(gamma_)
             + dsl::row_broadcast(beta_),
-            F, B);
+            F, B, p_.stable);
     }
 
     // ── backward ──────────────────────────────────────────────────────────
@@ -541,11 +543,11 @@ public:
         auto mg_raw = dsl::compute_reduce(engine,
             dsl::col_reduce_sum(
                 dsl::leaf(grad_output) * dsl::row_broadcast(gamma_)),
-            F, B);
+            F, B, p_.stable);
         if (!mg_raw) return std::unexpected(mg_raw.error());
         auto mean_g = dsl::compute(engine,
             dsl::leaf(*mg_raw) * dsl::rparam(inv_features),
-            mg_raw->rows(), mg_raw->cols());
+            mg_raw->rows(), mg_raw->cols(), p_.stable);
         if (!mean_g) return std::unexpected(mean_g.error());
 
         // 2. mean_gn_raw = col_reduce_sum(gy ⊙ normalized) → (1,B)
@@ -553,11 +555,11 @@ public:
             dsl::col_reduce_sum(
                 dsl::leaf(grad_output) * dsl::row_broadcast(gamma_)
                 * dsl::leaf(normalized_cache_)),
-            F, B);
+            F, B, p_.stable);
         if (!mgn_raw) return std::unexpected(mgn_raw.error());
         auto mean_gn = dsl::compute(engine,
             dsl::leaf(*mgn_raw) * dsl::rparam(inv_features),
-            mgn_raw->rows(), mgn_raw->cols());
+            mgn_raw->rows(), mgn_raw->cols(), p_.stable);
         if (!mean_gn) return std::unexpected(mean_gn.error());
 
         // 3. grad_x = (gy - mean_g - normalized*mean_gn) * std_inv → (F,B)
@@ -566,7 +568,7 @@ public:
              - dsl::col_broadcast(*mean_g)
              - dsl::leaf(normalized_cache_) * dsl::col_broadcast(*mean_gn))
             * dsl::col_broadcast(std_cache_),
-            F, B);
+            F, B, p_.stable);
         if (!grad_x) return std::unexpected(grad_x.error());
 
         // 4. grad_gamma += row_reduce_sum(gy ⊙ normalized) → (F,1)
@@ -575,7 +577,7 @@ public:
             dsl::row_reduce_sum(
                 dsl::leaf(grad_output)
                 * dsl::leaf(normalized_cache_)),
-            F, B);
+            F, B, p_.stable);
         if (!gg) return std::unexpected(gg.error());
         auto grad_gamma_acc = dsl::compute_into(engine,
             dsl::leaf(grad_gamma_) + dsl::leaf(*gg), grad_gamma_);
@@ -583,7 +585,7 @@ public:
 
         // 5. grad_beta += row_reduce_sum(grad_out) → (F,1)
         auto gb = dsl::compute_reduce(engine,
-            dsl::row_reduce_sum(dsl::leaf(grad_output)), F, B);
+            dsl::row_reduce_sum(dsl::leaf(grad_output)), F, B, p_.stable);
         if (!gb) return std::unexpected(gb.error());
         auto grad_beta_acc = dsl::compute_into(engine,
             dsl::leaf(grad_beta_) + dsl::leaf(*gb), grad_beta_);
@@ -633,11 +635,11 @@ public:
     {
         // gamma 初始化为 1（无 beta）
         Matrix gamma_cpu(normalized_shape_, 1, Scalar{1});
-        auto g = engine.from_matrix(gamma_cpu);
+        auto g = engine.from_matrix(gamma_cpu, p_.param);
         if (!g) return std::unexpected(g.error());
         gamma_ = std::move(*g);
 
-        grad_gamma_ = engine.create_tensor(normalized_shape_, 1);
+        grad_gamma_ = engine.create_tensor(normalized_shape_, 1, p_.param);
         { auto r1 = engine.zero(grad_gamma_); if (!r1) return std::unexpected(r1.error()); }
         return {};
     }
@@ -686,7 +688,7 @@ public:
 
         // 1. s_raw = col_reduce_sum(x*x) → (1,B)
         auto s_raw = dsl::compute_reduce(engine,
-            dsl::col_reduce_sum(dsl::leaf(input) * dsl::leaf(input)), F, B);
+            dsl::col_reduce_sum(dsl::leaf(input) * dsl::leaf(input)), F, B, p_.stable);
         if (!s_raw) return std::unexpected(s_raw.error());
 
         // 2. rms_inv = rsqrt(s_raw*(1/F) + ε) → (1,B)
@@ -695,7 +697,7 @@ public:
         auto rms_inv = dsl::compute(engine,
             dsl::rsqrt(dsl::leaf(*s_raw) * dsl::rparam(inv_features)
                        + dsl::rparam(epsilon_)),
-            s_raw->rows(), s_raw->cols());
+            s_raw->rows(), s_raw->cols(), p_.stable);
         if (!rms_inv) return std::unexpected(rms_inv.error());
         Tensor rms_inv_t = std::move(*rms_inv);
         if (!checkpoint_mode_)
@@ -703,7 +705,7 @@ public:
 
         // 3. normed = x * rms_inv (col 广播) → (F,B)
         auto normed = dsl::compute(engine,
-            dsl::leaf(input) * dsl::col_broadcast(rms_inv_t), F, B);
+            dsl::leaf(input) * dsl::col_broadcast(rms_inv_t), F, B, p_.stable);
         if (!normed) return std::unexpected(normed.error());
         Tensor normed_t = std::move(*normed);
         if (!checkpoint_mode_)
@@ -711,7 +713,7 @@ public:
 
         // 4. out = normed * gamma (row 广播) → (F,B)
         return dsl::compute(engine,
-            dsl::leaf(normed_t) * dsl::row_broadcast(gamma_), F, B);
+            dsl::leaf(normed_t) * dsl::row_broadcast(gamma_), F, B, p_.stable);
     }
 
     // ── backward ──────────────────────────────────────────────────────────
@@ -733,11 +735,11 @@ public:
             dsl::col_reduce_sum(
                 dsl::leaf(grad_output) * dsl::row_broadcast(gamma_)
                 * dsl::leaf(normed_cache_)),
-            F, B);
+            F, B, p_.stable);
         if (!m_raw) return std::unexpected(m_raw.error());
         auto m = dsl::compute(engine,
             dsl::leaf(*m_raw) * dsl::rparam(inv_features),
-            m_raw->rows(), m_raw->cols());
+            m_raw->rows(), m_raw->cols(), p_.stable);
         if (!m) return std::unexpected(m.error());
 
         // 2. grad_x = (gy - m*normed) * rms_inv → (F,B)
@@ -745,7 +747,7 @@ public:
             (dsl::leaf(grad_output) * dsl::row_broadcast(gamma_)
              - dsl::col_broadcast(*m) * dsl::leaf(normed_cache_))
             * dsl::col_broadcast(rms_inv_cache_),
-            F, B);
+            F, B, p_.stable);
         if (!grad_x) return std::unexpected(grad_x.error());
 
         // 3. grad_gamma += row_reduce_sum(gy ⊙ normed) → (F,1)
@@ -754,7 +756,7 @@ public:
             dsl::row_reduce_sum(
                 dsl::leaf(grad_output)
                 * dsl::leaf(normed_cache_)),
-            F, B);
+            F, B, p_.stable);
         if (!gg) return std::unexpected(gg.error());
         auto grad_gamma_acc = dsl::compute_into(engine,
             dsl::leaf(grad_gamma_) + dsl::leaf(*gg), grad_gamma_);

@@ -35,7 +35,9 @@ public:
     virtual ~Layer() = default;
 
     // ── D7：精度配置注入（§9.2）─────────────────────────────────────────
-    void set_precision_profile(const PrecisionProfile& profile) { p_ = profile; }
+    // virtual：复合层/持有辅助对象（RoPE、位置编码器）的层需要把 profile 继续
+    // 下传（否则辅助对象内的 DSL 求值退回 F32，静默丢掉 f16 存储收益）。
+    virtual void set_precision_profile(const PrecisionProfile& profile) { p_ = profile; }
     [[nodiscard]] const PrecisionProfile& precision_profile() const noexcept { return p_; }
 
     // forward/backward 接收 ComputeEngine 引用，自动适配 CPU/GPU
@@ -166,14 +168,18 @@ public:
         refs_ = std::move(refs);
         offsets_.clear();
         shapes_.clear();
-        // 惰性创建持久 slab（大小 = 本层激活总 float 数，跨 step 复用）
-        if (!slab_.valid())
+        // slab 容量校验（缺陷修复）：原先只在 !slab_.valid() 时按**当时**的
+        // 激活总量分配，之后永不增长。若后续 step 的激活总量更大（批大小/
+        // 序列长度变化、--resume 后续训、最后一个不满 batch 之后的 step 等），
+        // offload_save 会按新 offset 越界写 slab → 缓冲区破坏/设备丢失。
+        // 现在每次导出都按当前总量校验，不足则重建。
+        std::size_t needed = 0;
+        for (auto& ref : refs_)
+            if (ref.get().valid()) needed += ref.get().size();
+        if (needed == 0) { offloaded_ = false; return {}; }
+        if (!slab_.valid() || slab_.size() < needed)
         {
-            std::size_t total = 0;
-            for (auto& ref : refs_)
-                if (ref.get().valid()) total += ref.get().size();
-            if (total == 0) { offloaded_ = false; return {}; }
-            auto slab = engine.create_offload_buffer(total);
+            auto slab = engine.create_offload_buffer(needed);
             if (!slab) return std::unexpected(slab.error());
             slab_ = std::move(*slab);
         }

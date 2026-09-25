@@ -125,6 +125,10 @@ list(APPEND NN_APP_TARGETS text_train text_infer tokenizer_train tokenizer_infer
 nn_add_executable(layer_bench src/layer_bench.cpp)
 list(APPEND NN_APP_TARGETS layer_bench)
 
+# ── 运行时显存分项探针（双池采样 + nvidia-smi + 逻辑分项归因） ─────────────
+nn_add_executable(mem_probe src/mem_probe.cpp)
+list(APPEND NN_APP_TARGETS mem_probe)
+
 # ── 测试 / 验证目标（默认关闭，NN_ENABLE_TESTS=ON 时构建）─────────────
 if(NN_ENABLE_TESTS)
 
@@ -144,6 +148,10 @@ if(NN_ENABLE_TESTS)
     # ── 多精度类型系统（f16 转换 / 舍入 / 张量精度 / f16 计算）──────────
     nn_add_executable(precision_test src/precision_test.cpp)
     list(APPEND NN_TEST_TARGETS precision_test)
+
+    # ── 多精度适配层（f16 存储真正生效：PrecisionEngine + DSL + 端到端）──
+    nn_add_executable(f16_precision_test src/f16_precision_test.cpp)
+    list(APPEND NN_TEST_TARGETS f16_precision_test)
 
     # ── 分词器正确性（BPE pre_tokenize 对拍 + 标记往返）─────────────────
     nn_add_executable(tokenizer_test src/tokenizer_test.cpp)
@@ -316,6 +324,14 @@ if(Vulkan_FOUND)
     # 1c. reduce：行列归约用 subgroup 蝶式（GL_KHR_shader_subgroup_*，与
     #     DSL 融合归约同配方）→ 同样需 SPIR-V ≥1.3 → --target-env=vulkan1.2
     nn_embed_shader(reduce ${CMAKE_SOURCE_DIR}/shaders/reduce.comp --target-env=vulkan1.2)
+
+    # 1d. 精度变体（Phase 2 in-kernel f16）：**同一份原语 shader** 用
+    #     -DNN_SHADER_F16=1 编出第二份 SPIR-V（缓冲声明 float16_t + 别名槽
+    #     uvec2/unpackHalf2x16，f32 累加，f16 写出）。后端按操作数精度选
+    #     pipeline；设备无 storageBuffer16BitAccess 时不创建（回退 f32 边界
+    #     cast，正确性不变）。f32 分支文本逐字未改 → 零回归。
+    nn_embed_shader(batched_matmul_f16 ${CMAKE_SOURCE_DIR}/shaders/batched_matmul.comp -DNN_SHADER_F16=1)
+    nn_embed_shader(matmul_tiled_f16 ${CMAKE_SOURCE_DIR}/shaders/matmul_tiled.comp -DNN_SHADER_F16=1)
 
     # 2. AOT 融合 shader：scan_exprs + gen_fused
     set(NN_EXPR_SCAN_BIN     ${CMAKE_BINARY_DIR}/generated/expr_specs.bin)

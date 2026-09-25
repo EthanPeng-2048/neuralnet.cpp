@@ -149,6 +149,59 @@ public:
         return std::unexpected(Error{"cast: unsupported precision conversion"});
     }
 
+    // ── cast_into / copy_into（多精度适配层的"写回原存储"路径，§6.5）──────
+    // 与 cast 的区别是**落点**：保留 dst 的对象身份与底层存储（in-place
+    // 语义必需——若替换 dst 对象，其它持有同一张量句柄的缓存会静默失联）。
+    [[nodiscard]] Result<void> copy_into(Tensor& dst, const Tensor& src) override
+    {
+        if (!dst.is_cpu() || !src.is_cpu())
+            return std::unexpected(Error{"copy_into: CPU engine only supports CPU tensors"});
+        if (dst.rows() != src.rows() || dst.cols() != src.cols())
+            return std::unexpected(Error{"copy_into: shape mismatch"});
+        if (dst.precision() != src.precision())
+            return std::unexpected(Error{"copy_into: precision mismatch"});
+        if (dst.precision() == Precision::F16)
+        {
+            const auto s = src.cpu_matrix<Precision::F16>().span();
+            auto d = dst.cpu_matrix<Precision::F16>().span();
+            for (std::size_t i = 0; i < s.size(); ++i) d[i] = s[i];
+        }
+        else
+        {
+            const auto s = src.cpu_matrix().span();
+            auto d = dst.cpu_matrix().span();
+            for (std::size_t i = 0; i < s.size(); ++i) d[i] = s[i];
+        }
+        return {};
+    }
+
+    [[nodiscard]] Result<void> cast_into(const Tensor& src, Tensor& dst) override
+    {
+        if (!dst.is_cpu() || !src.is_cpu())
+            return std::unexpected(Error{"cast_into: CPU engine only supports CPU tensors"});
+        if (dst.rows() != src.rows() || dst.cols() != src.cols())
+            return std::unexpected(Error{"cast_into: shape mismatch"});
+        if (src.precision() == dst.precision())
+            return copy_into(dst, src);
+        if (src.precision() == Precision::F16 && dst.precision() == Precision::F32)
+        {
+            const auto s = src.cpu_matrix<Precision::F16>().span();
+            auto d = dst.cpu_matrix().span();
+            for (std::size_t i = 0; i < s.size(); ++i)
+                d[i] = static_cast<float>(s[i]);   // 升 cast：精确无损
+            return {};
+        }
+        if (src.precision() == Precision::F32 && dst.precision() == Precision::F16)
+        {
+            const auto s = src.cpu_matrix().span();
+            auto d = dst.cpu_matrix<Precision::F16>().span();
+            for (std::size_t i = 0; i < s.size(); ++i)
+                d[i] = s[i];                       // 降 cast：round-half-to-even
+            return {};
+        }
+        return std::unexpected(Error{"cast_into: unsupported precision conversion"});
+    }
+
     [[nodiscard]] Result<void> copy_from(Tensor& dst, const Matrix& src) override
     {
         if (!dst.is_cpu())
@@ -605,15 +658,18 @@ public:
         bool transA = false, bool transB = false,
         Precision P = Precision::F32) override
     {
-        (void)P;  // 精度由张量原生类型决定（现调用方均为 F32）
         if (A.is_gpu() || B.is_gpu())
             return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
         const std::size_t rows = transA ? A.cols() : A.rows();
         const std::size_t cols = transB ? B.rows() : B.cols();
+        // P 必须下传（不能 (void)P）：scan 的 f16 dry-run 靠 dsl::compute 的
+        // NN_EXPR_SCAN 钩子按**真实操作数精度 + P** 登记 (结构, 签名)——吞掉 P
+        // 就会只登记全 f32 签名，GPU 侧带类型 matmul 段变体永远发现不到
+        // （Linear::forward 每个 Linear 一次，是 cast 临时量最大的单一来源）。
         return nn::dsl::compute(*this,
             nn::dsl::matmul(A, B, transA, transB, 1)
                 + nn::dsl::row_broadcast(bias),
-            rows, cols);
+            rows, cols, P);
     }
 
     // ── 批量矩阵乘法：按 batch 切分行块，逐 batch 矩阵乘 ──
@@ -809,7 +865,8 @@ public:
         const Tensor& K, const Tensor& V, const Tensor& P, const Tensor& R,
         const Tensor& A0, const Tensor& B0, bool has_state,
         std::size_t dk, std::size_t heads, bool causal,
-        const Tensor& boundary, bool has_bnd) override
+        const Tensor& boundary, bool has_bnd,
+        Precision = Precision::F32) override
     {
         for (const auto& t : {K, V, P, R, A0, B0, boundary})
             if (t.is_gpu())
@@ -956,7 +1013,8 @@ public:
     [[nodiscard]] Result<Tensor> scan_suffix_outer(
         const Tensor& D, const Tensor& X, const Tensor& Y,
         std::size_t dk, std::size_t heads, bool causal,
-        const Tensor& boundary, bool has_bnd) override
+        const Tensor& boundary, bool has_bnd,
+        Precision = Precision::F32) override
     {
         for (const auto& t : {D, X, Y, boundary})
             if (t.is_gpu())
@@ -1048,7 +1106,8 @@ public:
     // ── 逐列外积（backward 的 dL/dA、dL/dB 物化）─────────────────────────
     [[nodiscard]] Result<Tensor> outer_col(
         const Tensor& P, const Tensor& R, const Tensor& S,
-        std::size_t dk, bool has_scale) override
+        std::size_t dk, bool has_scale,
+        Precision = Precision::F32) override
     {
         for (const auto& t : {P, R, S})
             if (t.is_gpu())
@@ -1097,7 +1156,7 @@ public:
     // 归约原语
     // ══════════════════════════════════════════════════════════════════════
 
-    [[nodiscard]] Result<Tensor> row_reduce_sum(const Tensor& A) override
+    [[nodiscard]] Result<Tensor> row_reduce_sum(const Tensor& A, Precision = Precision::F32) override
     {
         const Matrix& m = A.cpu_matrix();
         Matrix result = m.row_reduce(Scalar{0},
@@ -1106,7 +1165,7 @@ public:
         return Tensor::from_matrix(std::move(result));
     }
 
-    [[nodiscard]] Result<Tensor> col_reduce_sum(const Tensor& A) override
+    [[nodiscard]] Result<Tensor> col_reduce_sum(const Tensor& A, Precision = Precision::F32) override
     {
         const Matrix& m = A.cpu_matrix();
         Matrix result = m.col_reduce(Scalar{0},
@@ -1115,7 +1174,7 @@ public:
         return Tensor::from_matrix(std::move(result));
     }
 
-    [[nodiscard]] Result<Tensor> row_reduce_max(const Tensor& A) override
+    [[nodiscard]] Result<Tensor> row_reduce_max(const Tensor& A, Precision = Precision::F32) override
     {
         const Matrix& m = A.cpu_matrix();
         Matrix result = m.row_reduce(
@@ -1125,7 +1184,7 @@ public:
         return Tensor::from_matrix(std::move(result));
     }
 
-    [[nodiscard]] Result<Tensor> col_reduce_max(const Tensor& A) override
+    [[nodiscard]] Result<Tensor> col_reduce_max(const Tensor& A, Precision = Precision::F32) override
     {
         const Matrix& m = A.cpu_matrix();
         Matrix result = m.col_reduce(
@@ -1186,13 +1245,15 @@ public:
     }
 
     [[nodiscard]] Result<Tensor> grouped_reduce_sum(
-        const Tensor& x, std::size_t G, std::size_t R) override
+        const Tensor& x, std::size_t G, std::size_t R,
+        Precision = Precision::F32) override
     {
         return grouped_reduce_cpu_<false>(x, G, R);
     }
 
     [[nodiscard]] Result<Tensor> grouped_reduce_max(
-        const Tensor& x, std::size_t G, std::size_t R) override
+        const Tensor& x, std::size_t G, std::size_t R,
+        Precision = Precision::F32) override
     {
         return grouped_reduce_cpu_<true>(x, G, R);
     }
@@ -1241,7 +1302,7 @@ public:
     // ══════════════════════════════════════════════════════════════════════
 
     [[nodiscard]] Result<Tensor> elementwise_unary(
-        UnaryOp op, const Tensor& A) override
+        UnaryOp op, const Tensor& A, Precision = Precision::F32) override
     {
         const Matrix& m = A.cpu_matrix();
         // compute::apply 会写满全部元素 → 未初始化构造，省掉一遍全尺寸零写
@@ -1264,7 +1325,8 @@ public:
     }
 
     [[nodiscard]] Result<Tensor> elementwise_binary(
-        BinaryOp op, const Tensor& A, const Tensor& B) override
+        BinaryOp op, const Tensor& A, const Tensor& B,
+        Precision = Precision::F32) override
     {
         if (A.rows() != B.rows() || A.cols() != B.cols())
             return std::unexpected(Error{"elementwise_binary: shape mismatch"});
@@ -1290,7 +1352,8 @@ public:
     }
 
     [[nodiscard]] Result<Tensor> elementwise_binary_scalar(
-        BinaryOp op, const Tensor& A, Scalar s, bool scalar_first) override
+        BinaryOp op, const Tensor& A, Scalar s, bool scalar_first,
+        Precision = Precision::F32) override
     {
         const Matrix& m = A.cpu_matrix();
         Matrix result = Matrix::make_uninitialized(m.rows(), m.cols());
@@ -1333,7 +1396,8 @@ public:
 
     [[nodiscard]] Result<Tensor> elementwise_select_scalar_cond(
         CompareOp cmp, const Tensor& A, Scalar scalar_b,
-        const Tensor& then_t, Scalar scalar_else) override
+        const Tensor& then_t, Scalar scalar_else,
+        Precision = Precision::F32) override
     {
         if (A.rows() != then_t.rows() || A.cols() != then_t.cols())
             return std::unexpected(Error{"elementwise_select: A and then shape mismatch"});
@@ -1390,7 +1454,8 @@ public:
     [[nodiscard]] Result<Tensor> eval_expr(
         const ExprSpec& spec,
         std::span<const Tensor> inputs,
-        std::size_t rows, std::size_t cols) override
+        std::size_t rows, std::size_t cols,
+        Precision = Precision::F32) override
     {
         // 输出会被下面的输出循环完整覆盖（每个下标恰好写一次）→ 未初始化构造，
         // 省掉一遍全尺寸零写（见 Tensor::cpu_uninitialized）
@@ -1408,7 +1473,8 @@ public:
     [[nodiscard]] Result<Tensor> eval_expr_reduce(
         const ExprSpec& spec,
         std::span<const Tensor> inputs,
-        std::size_t rows, std::size_t cols) override
+        std::size_t rows, std::size_t cols,
+        Precision = Precision::F32) override
     {
         const bool vec_is_row =
             (expr_spec_reduce_axis(canonicalize_expr_spec(spec)) == 0);

@@ -22,6 +22,7 @@
 #include <cstddef>
 
 #include "compute_cpu_engine.hpp"
+#include "compute_precision_engine.hpp"   // f16 dry-run pass 用适配层（多精度）
 #include "compute_layer.hpp"
 #include "compute_loss.hpp"
 #include "compute_optimizer.hpp"
@@ -54,6 +55,19 @@ void on_abort(int)
 }
 } // namespace
 
+// ── 扫描期精度配置（Phase 2：in-kernel f16 变体收集）──────────────────────
+// dry-run 收集的是**结构**（与形状/精度无关）；但精度签名（哪些输入/输出是
+// f16）取决于 profile，故整段 dry-run 跑两遍：profile_f32（旧行为，sig=0）与
+// profile_f16（带类型变体）。输入张量按当前 profile 的 compute 创建，使 f16
+// pass 与运行时（激活即 f16）**同源**——否则会收集到运行时永不使用的签名。
+static nn::PrecisionProfile g_scan_prof{};
+
+[[nodiscard]] static nn::Tensor scan_tensor(std::size_t rows, std::size_t cols)
+{
+    return (g_scan_prof.compute == nn::Precision::F16)
+        ? nn::Tensor::cpu<nn::Precision::F16>(rows, cols)
+        : nn::Tensor::cpu(rows, cols);
+}
 int main(int argc, char* argv[])
 {
     if (argc < 2)
@@ -64,8 +78,15 @@ int main(int argc, char* argv[])
     const std::string out_path = argv[1];
     std::signal(SIGABRT, &on_abort);   // NN_ASSERT → abort 带栈（见文件头）
 
-    nn::CpuEngine engine;
+    nn::CpuEngine raw_engine;
 
+    // ── dry-run 主体：对给定 profile 跑一遍（f32 = 旧行为；f16 = 收集带类型变体）
+    // engine 是**形参**（遮蔽外层 raw_engine）：f32 pass 传原生引擎（逐字节旧行为），
+    // f16 pass 传 PrecisionEngine 适配层——原生 CpuEngine 只实现 f32 存储，把 f16
+    // 张量直接交给它属 UB（实测 heap corruption 0xC0000374）。
+    const auto dry_run = [&](nn::ComputeEngine& engine, const nn::PrecisionProfile& prof)
+    {
+        g_scan_prof = prof;
     // ── RoPE：forward + backward ─────────────────────────────────────────
     // （apply 与 apply_step 折叠出的结构相同，会自动去重）
     //
@@ -78,10 +99,11 @@ int main(int argc, char* argv[])
                                  std::size_t{64}, std::size_t{128}})
     {
         nn::RotaryEmbedding rope(dk);
-        nn::Tensor q = nn::Tensor::cpu(2 * dk, 8);   // rows 为 dk 的整数倍
+        rope.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+        nn::Tensor q = scan_tensor(2 * dk, 8);   // rows 为 dk 的整数倍
         (void)rope.apply(engine, q, /*seq=*/8, /*backward=*/false);
         (void)rope.apply(engine, q, /*seq=*/8, /*backward=*/true);
-        nn::Tensor q1 = nn::Tensor::cpu(dk, 1);      // 增量推理（单位置）
+        nn::Tensor q1 = scan_tensor(dk, 1);      // 增量推理（单位置）
         (void)rope.apply_step(engine, q1, /*pos=*/3, /*backward=*/false);
         (void)rope.apply_step(engine, q1, /*pos=*/3, /*backward=*/true);
     }
@@ -92,9 +114,10 @@ int main(int argc, char* argv[])
     {
         const std::size_t R = 6, C = 9;
         nn::ReLU relu;
-        nn::Tensor input = nn::Tensor::cpu(R, C);
+        relu.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+        nn::Tensor input = scan_tensor(R, C);
         (void)relu.forward(engine, input);
-        nn::Tensor grad = nn::Tensor::cpu(R, C);
+        nn::Tensor grad = scan_tensor(R, C);
         (void)relu.backward(engine, grad);
     }
 
@@ -103,9 +126,10 @@ int main(int argc, char* argv[])
     {
         const std::size_t d_ff = 8;
         nn::SwiGLU swiglu(d_ff);
-        nn::Tensor input = nn::Tensor::cpu(2 * d_ff, 5);
+        swiglu.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+        nn::Tensor input = scan_tensor(2 * d_ff, 5);
         (void)swiglu.forward(engine, input);
-        nn::Tensor grad = nn::Tensor::cpu(d_ff, 5);
+        nn::Tensor grad = scan_tensor(d_ff, 5);
         (void)swiglu.backward(engine, grad);
     }
 
@@ -116,9 +140,10 @@ int main(int argc, char* argv[])
     {
         const std::size_t R = 6, C = 9;
         nn::GeLU gelu;
-        nn::Tensor input = nn::Tensor::cpu(R, C);
+        gelu.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+        nn::Tensor input = scan_tensor(R, C);
         (void)gelu.forward(engine, input);
-        nn::Tensor grad = nn::Tensor::cpu(R, C);
+        nn::Tensor grad = scan_tensor(R, C);
         (void)gelu.backward(engine, grad);
     }
 
@@ -129,9 +154,10 @@ int main(int argc, char* argv[])
     {
         const std::size_t R = 6, C = 9;
         nn::Softmax softmax;
-        nn::Tensor input = nn::Tensor::cpu(R, C);
+        softmax.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+        nn::Tensor input = scan_tensor(R, C);
         (void)softmax.forward(engine, input);   // 填充 output_cache_ + 登记 fwd 结构
-        nn::Tensor grad = nn::Tensor::cpu(R, C);
+        nn::Tensor grad = scan_tensor(R, C);
         (void)softmax.backward(engine, grad);   // 登记 bwd 结构
     }
 
@@ -141,10 +167,11 @@ int main(int argc, char* argv[])
     {
         const std::size_t F = 8, B = 5;
         nn::RMSNorm rms(F);
+        rms.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
         (void)rms.init(engine);
-        nn::Tensor input = nn::Tensor::cpu(F, B);
+        nn::Tensor input = scan_tensor(F, B);
         (void)rms.forward(engine, input);       // 填充 normed/rms_inv 缓存 + 登记 fwd 结构
-        nn::Tensor grad = nn::Tensor::cpu(F, B);
+        nn::Tensor grad = scan_tensor(F, B);
         (void)rms.backward(engine, grad);       // 登记 bwd 结构
     }
 
@@ -154,10 +181,11 @@ int main(int argc, char* argv[])
     {
         const std::size_t F = 8, B = 5;
         nn::LayerNorm ln(F);
+        ln.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
         (void)ln.init(engine);
-        nn::Tensor input = nn::Tensor::cpu(F, B);
+        nn::Tensor input = scan_tensor(F, B);
         (void)ln.forward(engine, input);
-        nn::Tensor grad = nn::Tensor::cpu(F, B);
+        nn::Tensor grad = scan_tensor(F, B);
         (void)ln.backward(engine, grad);
     }
 
@@ -171,10 +199,11 @@ int main(int argc, char* argv[])
         const std::size_t d_model = 8, heads = 2, seq = 4, batch = 2;
         nn::ReLULinearAttention attn(d_model, heads, seq, /*causal=*/true,
                                      nn::PosEncodingType::RoPE);
+        attn.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
         (void)attn.init(engine);
-        nn::Tensor x = nn::Tensor::cpu(d_model, batch * seq);
+        nn::Tensor x = scan_tensor(d_model, batch * seq);
         (void)attn.forward(engine, x);                       // 填 cache + 登记 fwd 结构
-        nn::Tensor grad = nn::Tensor::cpu(d_model, batch * seq);
+        nn::Tensor grad = scan_tensor(d_model, batch * seq);
         (void)attn.backward(engine, grad);                   // 登记 bwd 结构
     }
 
@@ -186,10 +215,11 @@ int main(int argc, char* argv[])
         const std::size_t d_model = 8, heads = 2, seq = 4, batch = 2;
         nn::ReLULinearAttention attn_nc(d_model, heads, seq, /*causal=*/false,
                                        nn::PosEncodingType::RoPE);
+        attn_nc.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
         (void)attn_nc.init(engine);
-        nn::Tensor x = nn::Tensor::cpu(d_model, batch * seq);
+        nn::Tensor x = scan_tensor(d_model, batch * seq);
         (void)attn_nc.forward(engine, x);
-        nn::Tensor grad = nn::Tensor::cpu(d_model, batch * seq);
+        nn::Tensor grad = scan_tensor(d_model, batch * seq);
         (void)attn_nc.backward(engine, grad);
     }
 
@@ -199,10 +229,11 @@ int main(int argc, char* argv[])
         nn::GPTBlock block(d_model, heads, d_ff, /*max_len=*/1024, /*seq_len=*/seq,
                            nn::PosEncodingType::Learned, nn::ActivationType::GeLU,
                            nn::NormType::LayerNorm);
+        block.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
         (void)block.init(engine);
-        nn::Tensor x = nn::Tensor::cpu(d_model, batch * seq);
+        nn::Tensor x = scan_tensor(d_model, batch * seq);
         (void)block.forward(engine, x);
-        nn::Tensor grad = nn::Tensor::cpu(d_model, batch * seq);
+        nn::Tensor grad = scan_tensor(d_model, batch * seq);
         (void)block.backward(engine, grad);
     }
 
@@ -210,10 +241,11 @@ int main(int argc, char* argv[])
     {
         const std::size_t d_model = 16, heads = 2, d_ff = 32, seq = 4, batch = 2;
         nn::TransformerEncoderLayer enc(d_model, heads, d_ff, seq);
+        enc.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
         (void)enc.init(engine);
-        nn::Tensor x = nn::Tensor::cpu(d_model, batch * seq);
+        nn::Tensor x = scan_tensor(d_model, batch * seq);
         (void)enc.forward(engine, x);
-        nn::Tensor grad = nn::Tensor::cpu(d_model, batch * seq);
+        nn::Tensor grad = scan_tensor(d_model, batch * seq);
         (void)enc.backward(engine, grad);
     }
 
@@ -222,10 +254,11 @@ int main(int argc, char* argv[])
         const std::size_t d_model = 16, heads = 2, d_ff = 32, win = 4, mem = 2;
         nn::ZiPTBlock zipt(d_model, heads, d_ff, win, mem,
                            nn::NormType::LayerNorm, nn::ActivationType::GeLU);
+        zipt.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
         (void)zipt.init(engine);
-        nn::Tensor x = nn::Tensor::cpu(d_model, win);
+        nn::Tensor x = scan_tensor(d_model, win);
         (void)zipt.forward(engine, x);
-        nn::Tensor grad = nn::Tensor::cpu(d_model, win);
+        nn::Tensor grad = scan_tensor(d_model, win);
         (void)zipt.backward(engine, grad);
     }
 
@@ -233,8 +266,9 @@ int main(int argc, char* argv[])
     {
         const std::size_t R = 8, C = 5;
         nn::MSELoss mse;
-        nn::Tensor pred = nn::Tensor::cpu(R, C);
-        nn::Tensor target = nn::Tensor::cpu(R, C);
+        mse.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+        nn::Tensor pred = scan_tensor(R, C);
+        nn::Tensor target = scan_tensor(R, C);
         (void)mse.forward(engine, pred, target);
     }
 
@@ -243,8 +277,9 @@ int main(int argc, char* argv[])
     {
         const std::size_t C = 8, B = 5;
         nn::CrossEntropyLoss ce;
-        nn::Tensor logits = nn::Tensor::cpu(C, B);
-        nn::Tensor target = nn::Tensor::cpu(C, B);
+        ce.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+        nn::Tensor logits = scan_tensor(C, B);
+        nn::Tensor target = scan_tensor(C, B);
         (void)ce.forward(engine, logits, target);
     }
 
@@ -262,8 +297,8 @@ int main(int argc, char* argv[])
         const std::size_t R = 8, C = 5;
         for (const char* name : {"sgd", "sgd_momentum", "adam", "adamw", "muon"})
         {
-            nn::Tensor p = nn::Tensor::cpu(R, C);
-            nn::Tensor g = nn::Tensor::cpu(R, C);
+            nn::Tensor p = scan_tensor(R, C);
+            nn::Tensor g = scan_tensor(R, C);
             auto opt = nn::create_optimizer(name, engine,
                                             std::vector<nn::TensorRef>{p},
                                             std::vector<nn::TensorRef>{g},
@@ -286,10 +321,11 @@ int main(int argc, char* argv[])
     {
         const std::size_t in_f = 8, out_f = 5, B = 4;
         nn::Linear linear(in_f, out_f);
+        linear.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
         (void)linear.init(engine);
-        nn::Tensor input = nn::Tensor::cpu(in_f, B);
+        nn::Tensor input = scan_tensor(in_f, B);
         (void)linear.forward(engine, input);
-        nn::Tensor grad_out = nn::Tensor::cpu(out_f, B);
+        nn::Tensor grad_out = scan_tensor(out_f, B);
         (void)linear.backward(engine, grad_out);   // 登记 grad_w 融合结构
     }
 
@@ -382,7 +418,7 @@ int main(int argc, char* argv[])
         const std::size_t d_model = 16, heads = 2, seq = 4, batch = 2;
         const auto run_csa = [&](nn::CausalSelfAttention& attn) {
             (void)attn.init(engine);
-            nn::Tensor x = nn::Tensor::cpu(d_model, batch * seq);
+            nn::Tensor x = scan_tensor(d_model, batch * seq);
             // 不再 (void) 吞错：forward 失败会让缓存为空，backward 直接
             //   在 batched_matmul 读空张量上 NN_ASSERT（栈无上下文难定位）
             auto fr = attn.forward(engine, x);
@@ -393,7 +429,7 @@ int main(int argc, char* argv[])
                 std::fflush(stderr);
                 std::abort();   // 带栈停在真凶处
             }
-            nn::Tensor grad = nn::Tensor::cpu(d_model, batch * seq);
+            nn::Tensor grad = scan_tensor(d_model, batch * seq);
             auto br = attn.backward(engine, grad);
             if (!br)
             {
@@ -408,6 +444,7 @@ int main(int argc, char* argv[])
         {
             nn::CausalSelfAttention attn(d_model, heads, /*max_len=*/1024,
                                          /*seq_len=*/seq, enc);
+            attn.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
             run_csa(attn);
         }
         // doc 变体（doc_ids 每位置文档 id，长度 = batch*seq）
@@ -415,6 +452,7 @@ int main(int argc, char* argv[])
             const std::size_t doc_ids[8] = {0, 0, 1, 1, 0, 0, 1, 1};
             nn::CausalSelfAttention attn_d(d_model, heads, 1024, seq,
                                            nn::PosEncodingType::Learned);
+            attn_d.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
             attn_d.set_doc_ids(doc_ids);
             run_csa(attn_d);
         }
@@ -422,6 +460,7 @@ int main(int argc, char* argv[])
             const std::size_t doc_ids[8] = {0, 0, 1, 1, 0, 0, 1, 1};
             nn::CausalSelfAttention attn_ad(d_model, heads, 1024, seq,
                                             nn::PosEncodingType::ALiBi);
+            attn_ad.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
             attn_ad.set_doc_ids(doc_ids);
             run_csa(attn_ad);
         }
@@ -435,8 +474,9 @@ int main(int argc, char* argv[])
     {
         const std::size_t d_model = 16, heads = 2, seq = 4, batch = 2;
         nn::MultiHeadAttention attn(d_model, heads, /*seq_len=*/seq);
+        attn.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
         (void)attn.init(engine);
-        nn::Tensor x = nn::Tensor::cpu(d_model, batch * seq);
+        nn::Tensor x = scan_tensor(d_model, batch * seq);
         auto fr = attn.forward(engine, x);
         if (!fr)
         {
@@ -445,7 +485,7 @@ int main(int argc, char* argv[])
             std::fflush(stderr);
             std::abort();
         }
-        nn::Tensor grad = nn::Tensor::cpu(d_model, batch * seq);
+        nn::Tensor grad = scan_tensor(d_model, batch * seq);
         auto br = attn.backward(engine, grad);
         if (!br)
         {
@@ -461,7 +501,8 @@ int main(int argc, char* argv[])
     {
         const std::size_t C = 8, B = 5;
         nn::CrossEntropyLoss ce;
-        nn::Tensor logits = nn::Tensor::cpu(C, B);
+        ce.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+        nn::Tensor logits = scan_tensor(C, B);
         std::vector<std::size_t> labels(B, 1);
         std::vector<nn::Scalar> mask(B, 1.0f);
         (void)ce.forward_sparse(engine, logits, labels, mask, C);
@@ -479,11 +520,12 @@ int main(int argc, char* argv[])
     {
         const std::size_t c_in = 1, c_out = 2, k = 3, in_h = 5, in_w = 5, batch = 2;
         nn::Conv2D conv(c_in, c_out, k, /*stride=*/1, /*padding=*/0, in_h, in_w);
+        conv.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
         (void)conv.init(engine);
         const std::size_t oh = in_h - k + 1, ow = in_w - k + 1;
-        nn::Tensor x = nn::Tensor::cpu(c_in * in_h * in_w, batch);
+        nn::Tensor x = scan_tensor(c_in * in_h * in_w, batch);
         (void)conv.forward(engine, x);
-        nn::Tensor grad = nn::Tensor::cpu(c_out * oh * ow, batch);
+        nn::Tensor grad = scan_tensor(c_out * oh * ow, batch);
         (void)conv.backward(engine, grad);
     }
 
@@ -495,11 +537,12 @@ int main(int argc, char* argv[])
     {
         const std::size_t c = 2, in_h = 6, in_w = 6, pool = 2, stride = 2, batch = 2;
         nn::MaxPool2D mp(c, in_h, in_w, pool, stride);
+        mp.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
         const std::size_t oh = (in_h - pool) / stride + 1;
         const std::size_t ow = (in_w - pool) / stride + 1;
-        nn::Tensor x = nn::Tensor::cpu(c * in_h * in_w, batch);
+        nn::Tensor x = scan_tensor(c * in_h * in_w, batch);
         (void)mp.forward(engine, x);
-        nn::Tensor grad = nn::Tensor::cpu(c * oh * ow, batch);
+        nn::Tensor grad = scan_tensor(c * oh * ow, batch);
         (void)mp.backward(engine, grad);
     }
 
@@ -510,8 +553,8 @@ int main(int argc, char* argv[])
     // （CPU 正常）。fused_gpu_test 的 run_reduce_consts 做 CPU/GPU 对比覆盖。
     {
         const std::size_t kk = 4, cols = 3;
-        nn::Tensor x = nn::Tensor::cpu(kk, cols);
-        nn::Tensor mx = nn::Tensor::cpu(1, cols);
+        nn::Tensor x = scan_tensor(kk, cols);
+        nn::Tensor mx = scan_tensor(1, cols);
         (void)nn::dsl::compute_reduce(engine,
             nn::dsl::col_reduce_sum(nn::dsl::select(
                 nn::dsl::leaf(x) == nn::dsl::col_broadcast(mx),
@@ -519,6 +562,12 @@ int main(int argc, char* argv[])
             kk, cols);
     }
 
+    };   // dry_run 结束
+    dry_run(raw_engine, nn::profile_f32());   // 旧行为：sig == 0（结构表，bin 不变）
+    {
+        nn::PrecisionEngine adapter(raw_engine);   // f16 边界 cast 适配层
+        dry_run(adapter, nn::profile_f16());       // Phase 2：收集 (结构, 精度签名)
+    }
     // ── P-C1 fold 分块状态归约（表达式集合登记）──────────────────────────
     // 三个共享样例（expr_fold.hpp——与 fused_gpu_test 对拍**同源构造** →
     // key 一致、闭合世界命中）：rowmax / rowsum / softmax_denom(online 双
@@ -575,5 +624,26 @@ int main(int argc, char* argv[])
     }
     std::printf("[scan] 收集到 %zu 条融合表达式 -> %s\n",
                 reg.specs.size(), out_path.c_str());
+    // 带类型变体（in-kernel f16）：结构相同、精度签名不同 —— 每个 (结构, 签名)
+    // 需要一个独立 shader；打印分类统计便于确认扫描覆盖（哪些是纯逐元素、
+    // 含 matmul 段或 fold 段）。
+    if (!reg.variants.empty())
+    {
+        std::size_t plain = 0, with_mm = 0, with_fold = 0, out_f16 = 0;
+        for (const auto& v : reg.variants)
+        {
+            if (v.spec.fold) ++with_fold;
+            else if (v.spec.matmul) ++with_mm;
+            else ++plain;
+            if (nn::expr_prec_sig_out_f16(v.sig)) ++out_f16;
+        }
+        std::printf("[scan] 精度变体 %zu 条（纯逐元素 %zu / 含 matmul 段 %zu / fold %zu；"
+                    "输出 f16 者 %zu）\n",
+                    reg.variants.size(), plain, with_mm, with_fold, out_f16);
+    }
+    else
+    {
+        std::printf("[scan] 精度变体 0 条（f16 pass 未产生非零签名）\n");
+    }
     return 0;
 }

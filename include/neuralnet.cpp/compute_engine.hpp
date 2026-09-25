@@ -21,6 +21,20 @@
 // 批处理控制：
 //   - begin_batch / end_batch：CPU 引擎为 no-op；GPU 引擎录制到
 //     command buffer，end_batch 时统一提交。
+//
+// 多精度（docs/development/05-mixed-precision.md §8）：
+//   - **运算类**原语（逐元素 / 归约 / 扫描 / eval_expr）带显式形参
+//     `Precision P = Precision::F32`：P = 该算子输出（及计算）精度。
+//   - **纯数据搬运**原语（transpose / slice_rows / insert_rows / gather_rows /
+//     scatter_add_rows / rearrange_3d / im2col / col2im / clone）**不带 P**：
+//     输出精度 = 源精度（§8.4 的自然语义）。
+//   - **in-place** 原语（add_inplace / scale_inplace / axpy_inplace / zero /
+//     broadcast_*_inplace / eval_expr_into）**存储精度不可变**（§8.3）。
+//   - P 的消费方是 `PrecisionEngine`（compute_precision_engine.hpp，f16 边界
+//     cast 适配层）。**CpuEngine / GpuEngine 的原生实现只支持 F32 存储**：
+//     f16 存储张量必须经适配层运算（适配层把所有操作数抬到 f32 跑既有
+//     f32 实现，再按目标精度落回）。理由：AOT 融合世界保持全 f32（闭合世界
+//     key 不含精度维度），f16 只改变**存储**，不改变算子语义（§11.1 Phase 1）。
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <cstddef>
@@ -219,6 +233,28 @@ public:
         if (src.precision() == dst)
             return src;  // 同精度 = 返回共享所有权（零拷贝）
         return std::unexpected(Error{"cast: 该引擎不支持跨精度转换"});
+    }
+
+    // ── cast_into：把 src 按精度转换后写入 **dst 的既有存储**（不替换对象）
+    // 与 cast 的区别是"落点"：cast 返回新张量，cast_into 保留 dst 的
+    // 对象身份与底层 buffer（in-place 语义必需——适配层做 f16 原地更新时，
+    // 若替换 dst 对象，其它持有同一张量句柄的缓存会静默失联）。
+    // 要求 rows/cols 一致。默认实现：同精度走 copy_into，跨精度报错。
+    [[nodiscard]] virtual Result<void> cast_into(const Tensor& src, Tensor& dst)
+    {
+        if (src.rows() != dst.rows() || src.cols() != dst.cols())
+            return std::unexpected(Error{"cast_into: shape mismatch"});
+        if (src.precision() == dst.precision())
+            return copy_into(dst, src);
+        return std::unexpected(Error{"cast_into: 该引擎不支持跨精度转换"});
+    }
+
+    // ── copy_into：同精度同形状拷贝（dst 的既有存储被完整覆盖，不替换对象）
+    // 用于 cast_into 的同精度分支与适配层的"写回原存储"路径。
+    [[nodiscard]] virtual Result<void> copy_into(Tensor& dst, const Tensor& src)
+    {
+        (void)dst; (void)src;
+        return std::unexpected(Error{"copy_into: 该引擎未实现"});
     }
 
     // ── 深拷贝 Tensor（CPU 矩阵拷贝 / GPU buffer 拷贝，无 PCIe 传输） ──
@@ -431,7 +467,8 @@ public:
         const Tensor& K, const Tensor& V, const Tensor& P, const Tensor& R,
         const Tensor& A0, const Tensor& B0, bool has_state,
         std::size_t dk, std::size_t heads, bool causal,
-        const Tensor& boundary, bool has_bnd) = 0;
+        const Tensor& boundary, bool has_bnd,
+        Precision prec = Precision::F32) = 0;
 
     // 后缀扫描（RLA 反向 pass 2）：
     //   causal=true : S_i = Σ_{t≥i, 与 i 同文档} D_t（i+1 为文档起点时
@@ -442,7 +479,8 @@ public:
     [[nodiscard]] virtual Result<Tensor> scan_suffix_outer(
         const Tensor& D, const Tensor& X, const Tensor& Y,
         std::size_t dk, std::size_t heads, bool causal,
-        const Tensor& boundary, bool has_bnd) = 0;
+        const Tensor& boundary, bool has_bnd,
+        Precision prec = Precision::F32) = 0;
 
     // 逐列外积（RLA 反向的 dL/dA、dL/dB 物化）：
     //   out[(b,h): (a,b'), t] = P[a,t]·R[b',t] (· S[t] if has_scale)
@@ -451,7 +489,8 @@ public:
     // 输出: (B·H·d_k², seq)
     [[nodiscard]] virtual Result<Tensor> outer_col(
         const Tensor& P, const Tensor& R, const Tensor& S,
-        std::size_t dk, bool has_scale) = 0;
+        std::size_t dk, bool has_scale,
+        Precision prec = Precision::F32) = 0;
 
     // ══════════════════════════════════════════════════════════════════════
     // 归约原语
@@ -459,19 +498,24 @@ public:
 
     // 按行求和：A (rows, cols) → out (rows, 1)
     // out[r] = Σ_c A[r][c]
-    [[nodiscard]] virtual Result<Tensor> row_reduce_sum(const Tensor& A) = 0;
+    // P：输出（与累加）精度（§7.3：归约恒 f32 累加 + 输出舍入到 P）
+    [[nodiscard]] virtual Result<Tensor> row_reduce_sum(
+        const Tensor& A, Precision P = Precision::F32) = 0;
 
     // 按列求和：A (rows, cols) → out (1, cols)
     // out[c] = Σ_r A[r][c]
-    [[nodiscard]] virtual Result<Tensor> col_reduce_sum(const Tensor& A) = 0;
+    [[nodiscard]] virtual Result<Tensor> col_reduce_sum(
+        const Tensor& A, Precision P = Precision::F32) = 0;
 
     // 按行求最大值：A (rows, cols) → out (rows, 1)
     // out[r] = max_c A[r][c]
-    [[nodiscard]] virtual Result<Tensor> row_reduce_max(const Tensor& A) = 0;
+    [[nodiscard]] virtual Result<Tensor> row_reduce_max(
+        const Tensor& A, Precision P = Precision::F32) = 0;
 
     // 按列求最大值：A (rows, cols) → out (1, cols)
     // out[c] = max_r A[r][c]
-    [[nodiscard]] virtual Result<Tensor> col_reduce_max(const Tensor& A) = 0;
+    [[nodiscard]] virtual Result<Tensor> col_reduce_max(
+        const Tensor& A, Precision P = Precision::F32) = 0;
 
     // ── 分组归约（segmented reduce，沿行方向按固定长度分组）───────────────
     // 与 row/col_reduce 的区别：归约轴不是"整行/整列"，而是**每连续 R 行为一组**。
@@ -481,9 +525,11 @@ public:
     // 用途：把"逐通道/逐头一次 dispatch"的层内循环压成**单次**原语调用
     //   （池化窗口归约、多头分组统计、分组归一化等）。
     [[nodiscard]] virtual Result<Tensor> grouped_reduce_sum(
-        const Tensor& x, std::size_t G, std::size_t R) = 0;
+        const Tensor& x, std::size_t G, std::size_t R,
+        Precision P = Precision::F32) = 0;
     [[nodiscard]] virtual Result<Tensor> grouped_reduce_max(
-        const Tensor& x, std::size_t G, std::size_t R) = 0;
+        const Tensor& x, std::size_t G, std::size_t R,
+        Precision P = Precision::F32) = 0;
 
     // ══════════════════════════════════════════════════════════════════════
     // 广播原语
@@ -504,17 +550,20 @@ public:
     // ══════════════════════════════════════════════════════════════════════
 
     // out = unary_op(A)
+    // P：输出精度（默认 F32；f16 存储需经 PrecisionEngine 适配层）
     [[nodiscard]] virtual Result<Tensor> elementwise_unary(
-        UnaryOp op, const Tensor& A) = 0;
+        UnaryOp op, const Tensor& A, Precision P = Precision::F32) = 0;
 
     // out = binary_op(A, B)
     [[nodiscard]] virtual Result<Tensor> elementwise_binary(
-        BinaryOp op, const Tensor& A, const Tensor& B) = 0;
+        BinaryOp op, const Tensor& A, const Tensor& B,
+        Precision P = Precision::F32) = 0;
 
     // out = binary_op(A, scalar) 或 binary_op(scalar, A)
     // scalar_first=true: out = op(scalar, A)；false: out = op(A, scalar)
     [[nodiscard]] virtual Result<Tensor> elementwise_binary_scalar(
-        BinaryOp op, const Tensor& A, Scalar s, bool scalar_first = false) = 0;
+        BinaryOp op, const Tensor& A, Scalar s, bool scalar_first = false,
+        Precision P = Precision::F32) = 0;
 
     // ══════════════════════════════════════════════════════════════════════
     // 条件选择原语
@@ -525,7 +574,8 @@ public:
     // 典型用途：ReLU 反向 (x > 0) ? grad : 0
     [[nodiscard]] virtual Result<Tensor> elementwise_select_scalar_cond(
         CompareOp cmp, const Tensor& A, Scalar scalar_b,
-        const Tensor& then_t, Scalar scalar_else) = 0;
+        const Tensor& then_t, Scalar scalar_else,
+        Precision P = Precision::F32) = 0;
 
     // ══════════════════════════════════════════════════════════════════════
     // 表达式求值（逐元素融合的统一入口）
@@ -542,7 +592,8 @@ public:
     [[nodiscard]] virtual Result<Tensor> eval_expr(
         const ExprSpec& spec,
         std::span<const Tensor> inputs,
-        std::size_t rows, std::size_t cols) = 0;
+        std::size_t rows, std::size_t cols,
+        Precision P = Precision::F32) = 0;
 
     // ── 归约向量原生形状输出（LayerNorm/RMSNorm 小向量缓存等） ──────────
     // 语义同 eval_expr，但输出为归约向量本身（非广播）：
@@ -552,9 +603,10 @@ public:
     [[nodiscard]] virtual Result<Tensor> eval_expr_reduce(
         const ExprSpec& spec,
         std::span<const Tensor> inputs,
-        std::size_t rows, std::size_t cols)
+        std::size_t rows, std::size_t cols,
+        Precision P = Precision::F32)
     {
-        (void)spec; (void)inputs; (void)rows; (void)cols;
+        (void)spec; (void)inputs; (void)rows; (void)cols; (void)P;
         return std::unexpected(Error{"eval_expr_reduce: 该引擎不支持归约向量输出"});
     }
 
@@ -575,11 +627,46 @@ public:
             "eval_expr_into: 该引擎不支持原地表达式求值"});
     }
 
+    // ── 原生 f16 数据搬运能力（Phase 2）────────────────────────────────────
+    // 纯数据搬运原语（clone/slice_rows/insert_rows/zero）在 GPU 上是**模板化
+    // <P> 实现**（字节拷贝 / vkCmdFillBuffer）→ 无需 shader 变体即可原生处理 f16。
+    // 返回 true 时 PrecisionEngine 直接放行 f16 张量（省掉"抬 f32 → 搬运 →
+    // 落回 f16"的 2 份全尺寸临时量与 3 倍流量）。
+    [[nodiscard]] virtual bool supports_native_data_move() const noexcept { return false; }
+    // ── 精度变体能力查询（Phase 2 in-kernel f16）──────────────────────────
+    // 该 (结构, 输入精度, 目标输出精度) 是否有预生成的**带类型**融合 shader？
+    // 默认 false（原生引擎无变体概念）→ PrecisionEngine 退回边界 cast
+    // （把 f16 输入抬成 f32 副本再调用本引擎）：正确性不变，只多花带宽。
+    // 返回 true 的引擎承诺 `eval_expr(spec, inputs, rows, cols, P)` 能直接消费
+    // 非 f32 存储的 inputs（读 f16 / 写 f16，算术仍在 f32）。
+    [[nodiscard]] virtual bool supports_expr_precision_variant(
+        const ExprSpec& spec, std::span<const Tensor> inputs,
+        Precision P = Precision::F32) const
+    {
+        (void)spec; (void)inputs; (void)P;
+        return false;
+    }
+
 private:
     // 默认（CPU / 同步引擎）标量回读槽：submit 立即存值，poll 立即就绪。
     // GPU 引擎覆写为异步槽位（见 GpuEngine / GpuBackend::rb_slots_）。
     std::vector<Scalar> sync_readback_slots_;
 };
+
+// ── 多精度变体签名（AOT in-kernel f16 索引；类型见 expr_spec.hpp）────────
+// 由**实际张量精度** + 目标输出精度算出：位 i = 第 i 个输入是 f16，
+// bit16 = 输出是 f16。全 0 = 全 f32 = **旧行为**（融合世界保持 f32）。
+// 运行时用它选 (结构 key, 签名) 对应的带类型 shader；构建期 scan/gen 两端同源。
+[[nodiscard]] inline ExprPrecSig expr_prec_sig_of(
+    std::span<const Tensor> inputs, Precision P = Precision::F32) noexcept
+{
+    std::uint32_t bits = 0;
+    const std::size_t n = inputs.size() < 32u ? inputs.size() : 32u;
+    for (std::size_t i = 0; i < n; ++i)
+        if (inputs[i].precision() == Precision::F16)
+            bits |= (1u << i);
+    return expr_prec_sig_make(bits, P == Precision::F16);
+}
 
 } // namespace nn
 

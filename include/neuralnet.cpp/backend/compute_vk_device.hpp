@@ -78,6 +78,10 @@ private:
     std::string device_name_;   // 所选物理设备名（诊断用）
     std::string device_selector_;  // 手动指定设备（空 = 自动选择）
     bool timeline_semaphores_ = false;  // 设备支持时间线信号量（见 initialize）
+    // 设备支持 SSBO 里存 16 位（float16_t）+ 已启用 storageBuffer16BitAccess：
+    // Phase 2 in-kernel f16 的带类型融合 shader 前提。不支持 → 后端跳过带类型
+    // 变体，运行时回退"边界 cast 适配层"（正确性不受影响）。
+    bool has_16bit_storage_ = false;
     uint32_t subgroup_size_ = 4;  // 计算队列 subgroup 尺寸——matmul_gemv 的
                                   // red[..][64] 容量前提（256/subgroup≤64）；
                                   // VK1.1 查询失败按 4 兜底，见 initialize
@@ -327,6 +331,23 @@ public:
             if (sg.subgroupSize > 0) subgroup_size_ = sg.subgroupSize;
         }
 
+        // 16 位存储（Phase 2 in-kernel f16）：**查询 + 启用** storageBuffer16BitAccess，
+        // 使融合 shader 能把 SSBO 声明为 float16_t（算术仍 f32，见 glsl_gen）。
+        // 不支持 → has_16bit_storage_ = false → 后端跳过带类型变体（回退边界 cast）。
+        VkPhysicalDevice16BitStorageFeatures storage16{};
+        storage16.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+        if (app_info.apiVersion >= VK_API_VERSION_1_1)
+        {
+            VkPhysicalDeviceFeatures2 f16q{};
+            f16q.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            f16q.pNext = &storage16;
+            vkGetPhysicalDeviceFeatures2(physical_device_, &f16q);
+            has_16bit_storage_ = (storage16.storageBuffer16BitAccess == VK_TRUE);
+        }
+        // 逃生阀：某些驱动/校验层对 16 位存储支持不佳时强制走边界 cast 路径
+        if (!get_env("NN_VULKAN_NO_16BIT_STORAGE").empty())
+            has_16bit_storage_ = false;
+
         float queue_priority = 1.0f;
         VkDeviceQueueCreateInfo queue_info{};
         queue_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -336,8 +357,20 @@ public:
 
         VkDeviceCreateInfo device_info{};
         device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        // pNext 链：16 位存储（若支持）→ 时间线信号量（若支持）
+        VkBaseInStructure* chain = nullptr;
+        storage16.pNext = nullptr;
         if (timeline_semaphores_)
-            device_info.pNext = &timeline_features;
+        {
+            timeline_features.pNext = nullptr;
+            // Vulkan 的 pNext 为 void*（非 const）→ 用非 const 指针链入
+            storage16.pNext = reinterpret_cast<VkBaseInStructure*>(&timeline_features);
+        }
+        if (has_16bit_storage_)
+            chain = reinterpret_cast<VkBaseInStructure*>(&storage16);
+        else if (timeline_semaphores_)
+            chain = reinterpret_cast<VkBaseInStructure*>(&timeline_features);
+        device_info.pNext = chain;
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;
 
@@ -357,6 +390,8 @@ public:
     [[nodiscard]] VkQueue compute_queue() const noexcept { return compute_queue_; }
     [[nodiscard]] uint32_t queue_family_index() const noexcept { return queue_family_index_; }
     [[nodiscard]] bool is_initialized() const noexcept { return initialized_; }
+    // SSBO 16 位存储（float16_t）是否已启用：in-kernel f16 带类型融合 shader 前提
+    [[nodiscard]] bool has_16bit_storage() const noexcept { return has_16bit_storage_; }
     // 所选物理设备名（"NVIDIA CMP 40HX" 等；初始化前为空）
     [[nodiscard]] const std::string& device_name() const noexcept { return device_name_; }
     // 计算队列 subgroup 尺寸（初始化前 = 兜底值 4；GEMV 分派门禁用）

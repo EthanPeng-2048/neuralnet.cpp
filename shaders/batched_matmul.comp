@@ -44,16 +44,41 @@
 
 #version 450
 
+// ── 精度变体（编译期开关：glslc -DNN_SHADER_F16=1）────────────────────────
+// 默认（无宏）= 全 f32，**下方 f32 分支文本逐字未改**（零回归）。
+// 带宏 = f16 存储变体：缓冲声明 float16_t（GL_EXT_shader_16bit_storage），
+//   别名槽改 uvec2（4×half = 8B，std430 步长恰好 8）→ unpackHalf2x16 解出
+//   vec4；全局读处统一 float(...) 转 f32、写出处统一 float16_t(...)。
+//   **共享 tile / vec4 外积累加 / 分块 / 双缓冲 / barrier 节奏与 f32 完全同构**
+//   ——只有全局加载/写出的元素类型变了，符合 §7.2「f32 参考累加 + 输出舍入」。
+//   C 不提供 vec4 别名（f16 走逐标量写出，与 N%4!=0 的回退路径同构）。
+#if defined(NN_SHADER_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#define NN_ETYPE float16_t
+#define NN_V4    uvec2
+#define NN_LOADV4(arr, i) vec4(unpackHalf2x16(arr[i].x), unpackHalf2x16(arr[i].y))
+#define NN_RD(x) float(x)
+#define NN_WR(x) float16_t(x)
+#else
+#define NN_ETYPE float
+#define NN_V4    vec4
+#define NN_LOADV4(arr, i) arr[i]
+#define NN_RD(x) x
+#define NN_WR(x) x
+#endif
+
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(std430, binding = 0) readonly buffer  BufferA { float A[]; };
-layout(std430, binding = 1) readonly buffer  BufferB { float B[]; };
-layout(std430, binding = 2) writeonly buffer BufferC { float C[]; };
+layout(std430, binding = 0) readonly buffer  BufferA { NN_ETYPE A[]; };
+layout(std430, binding = 1) readonly buffer  BufferB { NN_ETYPE B[]; };
+layout(std430, binding = 2) writeonly buffer BufferC { NN_ETYPE C[]; };
 
 // vec4 别名视图（同 binding 双声明；仅在元素下标 %4==0 的快路径使用）
-layout(std430, binding = 0) readonly buffer  BufferAv4 { vec4 Av4[]; };
-layout(std430, binding = 1) readonly buffer  BufferBv4 { vec4 Bv4[]; };
+layout(std430, binding = 0) readonly buffer  BufferAv4 { NN_V4 Av4[]; };
+layout(std430, binding = 1) readonly buffer  BufferBv4 { NN_V4 Bv4[]; };
+#if !defined(NN_SHADER_F16)
 layout(std430, binding = 2) writeonly buffer BufferCv4 { vec4 Cv4[]; };
+#endif
 
 // Push constants：单 batch 逻辑维度 + 转置标志 + 输出缩放（batch 步长可推导）
 layout(push_constant) uniform PushConstants {
@@ -102,7 +127,7 @@ void load_A_tile(uint t, uint stage, uint tid, uint block_row, uint base)
             const uint gc = a_base_col + k0;
             if (aligned && gr < M && gc < K)
             {
-                const vec4 v = Av4[(base + gr * K + gc) >> 2];
+                const vec4 v = NN_LOADV4(Av4, (base + gr * K + gc) >> 2);
                 Ash[stage][k0    ][m >> 2][m & 3u] = v.x;
                 Ash[stage][k0 + 1u][m >> 2][m & 3u] = v.y;
                 Ash[stage][k0 + 2u][m >> 2][m & 3u] = v.z;
@@ -112,7 +137,7 @@ void load_A_tile(uint t, uint stage, uint tid, uint block_row, uint base)
             {
                 for (uint j = 0u; j < 4u; ++j)
                 {
-                    const float v = (gr < M && gc + j < K) ? A[base + gr * K + gc + j] : 0.0;
+                    const float v = (gr < M && gc + j < K) ? NN_RD(A[base + gr * K + gc + j]) : 0.0;
                     Ash[stage][k0 + j][m >> 2][m & 3u] = v;
                 }
             }
@@ -126,13 +151,13 @@ void load_A_tile(uint t, uint stage, uint tid, uint block_row, uint base)
             const uint gr = block_row + mq * 4u;
             if (aligned && gc < K && gr < M)
             {
-                Ash[stage][k][mq] = Av4[(base + gc * M + gr) >> 2];
+                Ash[stage][k][mq] = NN_LOADV4(Av4, (base + gc * M + gr) >> 2);
             }
             else
             {
                 for (uint j = 0u; j < 4u; ++j)
                 {
-                    const float v = (gr + j < M && gc < K) ? A[base + gc * M + gr + j] : 0.0;
+                    const float v = (gr + j < M && gc < K) ? NN_RD(A[base + gc * M + gr + j]) : 0.0;
                     Ash[stage][k][mq][j] = v;
                 }
             }
@@ -161,14 +186,14 @@ void load_B_tile(uint t, uint stage, uint tid, uint block_col, uint base)
             const uint gc = block_col + n0;
             if (aligned && gr < K && gc < N)
             {
-                const vec4 v = Bv4[(base + gr * N + gc) >> 2];
+                const vec4 v = NN_LOADV4(Bv4, (base + gr * N + gc) >> 2);
                 Bsh[stage][k][n0 >> 2] = v;
             }
             else
             {
                 for (uint j = 0u; j < 4u; ++j)
                 {
-                    const float v = (gr < K && gc + j < N) ? B[base + gr * N + gc + j] : 0.0;
+                    const float v = (gr < K && gc + j < N) ? NN_RD(B[base + gr * N + gc + j]) : 0.0;
                     Bsh[stage][k][(n0 + j) >> 2][(n0 + j) & 3u] = v;
                 }
             }
@@ -182,7 +207,7 @@ void load_B_tile(uint t, uint stage, uint tid, uint block_col, uint base)
             const uint gr = b_base_row + k0;
             if (aligned && gc < N && gr < K)
             {
-                const vec4 v = Bv4[(base + gc * K + gr) >> 2];
+                const vec4 v = NN_LOADV4(Bv4, (base + gc * K + gr) >> 2);
                 for (uint j = 0u; j < 4u; ++j)
                     Bsh[stage][k0 + j][n >> 2][n & 3u] = v[j];
             }
@@ -190,7 +215,7 @@ void load_B_tile(uint t, uint stage, uint tid, uint block_col, uint base)
             {
                 for (uint j = 0u; j < 4u; ++j)
                 {
-                    const float v = (gr + j < K && gc < N) ? B[base + gc * K + gr + j] : 0.0;
+                    const float v = (gr + j < K && gc < N) ? NN_RD(B[base + gc * K + gr + j]) : 0.0;
                     Bsh[stage][k0 + j][n >> 2][n & 3u] = v;
                 }
             }
@@ -254,6 +279,23 @@ void main()
     }
 
     // ── 写入结果（batch 偏移 = b * M * N，含 alpha 缩放）────────────
+#if defined(NN_SHADER_F16)
+    // f16 输出：逐标量写出（C 无 vec4 别名视图），与 f32 的 N%4!=0 回退同构
+    for (uint i = 0u; i < 4u; ++i)
+    {
+        const uint out_row = block_row + ty * 4u + i;
+        if (out_row >= M) continue;
+        const uint out_col0 = block_col + tx * 4u;
+        if (out_col0 >= N) continue;
+        C[base_c + out_row * N + out_col0 + 0u] = NN_WR(alpha * acc[i].x);
+        if (out_col0 + 1u < N)
+            C[base_c + out_row * N + out_col0 + 1u] = NN_WR(alpha * acc[i].y);
+        if (out_col0 + 2u < N)
+            C[base_c + out_row * N + out_col0 + 2u] = NN_WR(alpha * acc[i].z);
+        if (out_col0 + 3u < N)
+            C[base_c + out_row * N + out_col0 + 3u] = NN_WR(alpha * acc[i].w);
+    }
+#else
     const bool c_vec4 = ((N & 3u) == 0u);
     for (uint i = 0u; i < 4u; ++i)
     {
@@ -277,4 +319,5 @@ void main()
                 C[base_c + out_row * N + out_col0 + 3u] = alpha * acc[i].w;
         }
     }
+#endif
 }

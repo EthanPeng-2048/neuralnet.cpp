@@ -32,6 +32,8 @@
 #ifdef NN_HAS_VULKAN
 #include "compute_gpu_engine.hpp"
 #endif
+// 多精度适配层（f16 边界 cast：把 CpuEngine/GpuEngine 包装成支持 f16 存储的引擎）
+#include "compute_precision_engine.hpp"
 #include "compute_layer.hpp"
 #include "compute_loss.hpp"
 #include "compute_optimizer.hpp"

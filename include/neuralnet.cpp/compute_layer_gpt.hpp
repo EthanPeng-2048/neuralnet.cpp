@@ -172,7 +172,7 @@ public:
 
         auto r2 = dsl::compute(engine,
             dsl::leaf(input) + dsl::leaf(*a),
-            input.rows(), input.cols());
+            input.rows(), input.cols(), p_.compute);
         if (!r2) return std::unexpected(r2.error());
         Tensor res2 = std::move(*r2);
         if (!checkpoint_mode_)
@@ -186,7 +186,7 @@ public:
 
         return dsl::compute(engine,
             dsl::leaf(res2) + dsl::leaf(*f),
-            res2.rows(), res2.cols());
+            res2.rows(), res2.cols(), p_.compute);
     }
 
     [[nodiscard]] Result<Tensor> backward(
@@ -206,7 +206,7 @@ public:
 
         auto grad_r1 = dsl::compute(engine,
             dsl::leaf(grad_output) + dsl::leaf(*b_n2),
-            grad_output.rows(), grad_output.cols());
+            grad_output.rows(), grad_output.cols(), p_.compute);
         if (!grad_r1) return std::unexpected(grad_r1.error());
 
         auto b_sa = self_attn_.backward(engine, *grad_r1);
@@ -216,7 +216,7 @@ public:
 
         return dsl::compute(engine,
             dsl::leaf(*grad_r1) + dsl::leaf(*b_n1),
-            grad_r1->rows(), grad_r1->cols());
+            grad_r1->rows(), grad_r1->cols(), p_.compute);
     }
 
     // ── 增量推理（KV cache）──────────────────────────────────────────
@@ -240,7 +240,7 @@ public:
 
         auto r2 = dsl::compute(engine,
             dsl::leaf(x_new) + dsl::leaf(*a),
-            x_new.rows(), x_new.cols());
+            x_new.rows(), x_new.cols(), p_.compute);
         if (!r2) return std::unexpected(r2.error());
 
         auto n2 = norm2_->forward(engine, *r2);
@@ -251,7 +251,7 @@ public:
 
         return dsl::compute(engine,
             dsl::leaf(*r2) + dsl::leaf(*f),
-            r2->rows(), r2->cols());
+            r2->rows(), r2->cols(), p_.compute);
     }
 };
 
@@ -274,8 +274,17 @@ public:
 // ══════════════════════════════════════════════════════════════════════════
 class PositionEncoder
 {
+protected:
+    // 多精度（§9.2）：由 GPTModel 在注入自身 profile 时一并下传（否则位置
+    // 编码 / 正弦表的 DSL 求值退回 F32，f16 配置下静默丢失存储收益）。
+    // 本类是辅助对象（非 Layer），故单独提供同名 setter。
+    PrecisionProfile p_;
+
 public:
     virtual ~PositionEncoder() = default;
+
+    void set_precision_profile(const PrecisionProfile& p) { p_ = p; }
+    [[nodiscard]] const PrecisionProfile& precision_profile() const noexcept { return p_; }
 
     // 全量前向：token_emb_T 为 (d_model, batch*seq)，返回 x = token_emb_T (+ pos_emb)
     [[nodiscard]] virtual Result<Tensor> apply(
@@ -319,12 +328,12 @@ protected:
         const std::size_t rows = pe.rows();
         const std::size_t cols = pe.cols();
         learnable_ = learnable;
-        auto pe_r = engine.from_matrix(pe);
+        auto pe_r = engine.from_matrix(pe, p_.param);
         if (!pe_r) return std::unexpected(pe_r.error());
         pos_emb_ = std::move(*pe_r);
         if (learnable_)
         {
-            grad_pos_emb_ = engine.create_tensor(rows, cols);
+            grad_pos_emb_ = engine.create_tensor(rows, cols, p_.param);
             auto r = engine.zero(grad_pos_emb_);
             if (!r) return std::unexpected(r.error());
         }
@@ -367,7 +376,7 @@ public:
         if (!pos_T) return std::unexpected(pos_T.error());
         auto x_with_pos = dsl::compute(engine,
             dsl::leaf(token_emb_T) + dsl::leaf(*pos_T),
-            token_emb_T.rows(), token_emb_T.cols());
+            token_emb_T.rows(), token_emb_T.cols(), p_.compute);
         if (!x_with_pos) return std::unexpected(x_with_pos.error());
         return std::move(*x_with_pos);
     }
@@ -385,7 +394,7 @@ public:
         if (!pos_T) return std::unexpected(pos_T.error());
         auto x_wp = dsl::compute(engine,
             dsl::leaf(x) + dsl::leaf(*pos_T),
-            x.rows(), x.cols());
+            x.rows(), x.cols(), p_.compute);
         if (!x_wp) return std::unexpected(x_wp.error());
         return std::move(*x_wp);
     }
@@ -548,7 +557,19 @@ public:
         // D7：将精度配置注入自身和所有子层（§9.2）
         set_precision_profile(precision);
         if (ln_f_) ln_f_->set_precision_profile(precision);
-        lm_head_.set_precision_profile(precision);
+        // ── LM head（词表投影）：计算精度强制 = stable ────────────────────
+        // logits 是 (vocab, batch·seq) —— 全模型最大的张量，且被 loss 链**多次**
+        // 读取（col_max / denom / loss_vec / grad …）。若 head 留在 compute 精度
+        // （f16），边界 cast 适配层会为 loss 的每个算子各物化一份 f32 副本：
+        // 实测 vocab=8208 / batch=64 / seq=256 下 = 6×512MB → vkAllocateMemory
+        // OOM（探针 transient 桶 6 项/3.1GB）。head 用 stable 后 logits 与 f32
+        // 基线同构（零 cast），f16 的收益集中在隐藏层激活（体积小、生命周期短）。
+        // 真正的 f16 logits 需要 in-kernel f16（typed IR，docs 05 §12.3 Phase 2）。
+        {
+            PrecisionProfile head_prof = precision;
+            head_prof.compute = precision.stable;
+            lm_head_.set_precision_profile(head_prof);
+        }
 
         blocks_.reserve(num_layers);
         for (std::size_t i = 0; i < num_layers; ++i)
@@ -570,6 +591,9 @@ public:
                 pos_encoder_ = std::make_unique<NoPositionEncoder>();
                 break;
         }
+        // 位置编码器是辅助对象（非 Layer）→ profile 需单独下传：
+        // 否则其内部 DSL 求值（gather→transpose→加性融合）退回 F32。
+        if (pos_encoder_) pos_encoder_->set_precision_profile(precision);
     }
 
     [[nodiscard]] Result<void> init(ComputeEngine& engine) override
@@ -582,11 +606,11 @@ public:
         auto te_s = te.span();
         for (std::size_t i = 0; i < te.size(); ++i) te_s[i] = dist(rng);
 
-        auto te_r = engine.from_matrix(te);
+        auto te_r = engine.from_matrix(te, p_.param);
         if (!te_r) return std::unexpected(te_r.error());
         token_emb_ = std::move(*te_r);
 
-        grad_token_emb_ = engine.create_tensor(vocab_size_, d_model_);
+        grad_token_emb_ = engine.create_tensor(vocab_size_, d_model_, p_.param);
         { auto r1 = engine.zero(grad_token_emb_); if (!r1) return std::unexpected(r1.error()); }
 
         // 初始化子层
@@ -775,14 +799,13 @@ public:
                 auto br = blocks_[idx].backward(engine, grad_x);
                 if (!br) return br;
                 grad_x = std::move(*br);
-                // 梯度检查点：backward 后立即释放该块的重算激活缓存，
-                // 避免跨块累积（否则所有块缓存会在 backward 末尾同时驻留，
-                // 抵消检查点的显存收益）。非 checkpoint 模式下不清理。
-                if (checkpoint_every_ > 0)
-                    blocks_[idx].clear_cache();
-                // activation offload：backward 后释放恢复的激活缓存（掩码常驻不清理）
-                if (activation_offload_)
-                    blocks_[idx].clear_cache();
+                // 显存：backward 后**立即释放该块已消费的激活缓存**。
+                // 原先只在 checkpoint / offload 模式清理（默认路径不清理），
+                // 于是每块激活一直驻留、累积到整个 backward 结束才被下一轮
+                // forward 覆盖——探针实测这是 backward 段峰值主项（torch 的
+                // 等价行为是"用完即释放"）。清掉后该块的内存可被后续块的
+                // backward 临时量复用；下一轮 forward 会重新填充缓存。
+                blocks_[idx].clear_cache();
                 if (flush_interval_ > 0 && (bi + 1) % flush_interval_ == 0 && bi + 1 < n)
                 {
                     auto fr = engine.flush_batch();
@@ -940,8 +963,8 @@ public:
         v_caches.reserve(blocks_.size());
         for (std::size_t i = 0; i < blocks_.size(); ++i)
         {
-            k_caches.push_back(engine.create_tensor(seq_len_, d_model_));
-            v_caches.push_back(engine.create_tensor(seq_len_, d_model_));
+            k_caches.push_back(engine.create_tensor(seq_len_, d_model_, p_.compute));
+            v_caches.push_back(engine.create_tensor(seq_len_, d_model_, p_.compute));
         }
 
         // ── prefill: 截断到 seq_len_ 长度（滑动窗口初始） ──────────────
@@ -1083,7 +1106,7 @@ public:
     if (!aT) return std::unexpected(aT.error());
     auto bT = engine.transpose(b);   // (c2, rows)
     if (!bT) return std::unexpected(bT.error());
-    Tensor dstT = engine.create_tensor(a.cols() + b.cols(), a.rows());
+    Tensor dstT = engine.create_tensor(a.cols() + b.cols(), a.rows(), a.precision());
     auto r1 = engine.insert_rows(dstT, 0, *aT);
     if (!r1) return std::unexpected(r1.error());
     auto r2 = engine.insert_rows(dstT, a.cols(), *bT);

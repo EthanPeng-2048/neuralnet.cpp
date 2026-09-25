@@ -44,12 +44,17 @@ public:
     [[nodiscard]] virtual std::string_view name() const noexcept = 0;
 
     // 逐元素 kernel 源码；失败返回空串（调用方报错）
+    // sig（可选）：存储精度签名（0 = 全 f32，输出与迁移前逐字节相同；
+    // 见 expr_spec.hpp 的 ExprPrecSig）。带类型变体（in-kernel f16）不支持时
+    // 返回空串 → 上层跳过该变体，运行时回退边界 cast。
     [[nodiscard]] virtual std::string generate(
-        const std::string& name_, const ExprSpec& spec) = 0;
+        const std::string& name_, const ExprSpec& spec,
+        ExprPrecSig sig = 0) = 0;
 
-    // 归约 kernel 源码；不支持（混合轴/超槽）返回空串
+    // 归约 kernel 源码；不支持（混合轴/超槽/带类型变体）返回空串
     [[nodiscard]] virtual std::string generate_reduce(
-        const std::string& name_, const ExprSpec& spec) = 0;
+        const std::string& name_, const ExprSpec& spec,
+        ExprPrecSig sig = 0) = 0;
 };
 
 // ── 简单注册表：按后端名选择 emitter 工厂 ────────────────────────────────
