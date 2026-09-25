@@ -123,7 +123,7 @@ for i_block in range(0, M, BLOCK_SIZE):
 
 ### Release 模式编译标志
 
-> **不使用 `-ffast-math`**：为保证 NaN/Inf 传播与训练数值稳定性，项目明确禁用 `-ffast-math`。实际 Release 标志（Clang/GCC，权威来源 `CMakeLists.txt:74/76`）为 `-O3 -fno-math-errno -fno-trapping-math -funroll-loops -march=native`，另加工程告警集 `-fno-exceptions -Wall -Wextra -Wpedantic -Werror`（注意 **`-funroll-loops` 是启用的**；MSVC 分支为 `/O2 /fp:fast`）。
+> **不使用 `-ffast-math`**：为保证 NaN/Inf 传播与训练数值稳定性，项目明确禁用 `-ffast-math`。实际 Release 标志（Clang/GCC，权威来源 `CMakeLists.txt:74/76`）为 `-O3 -fno-math-errno -fno-trapping-math -funroll-loops -march=native`，另加工程告警集 `-fno-exceptions -Wall -Wextra -Wpedantic -Werror`（注意 **`-funroll-loops` 是启用的**；MSVC 分支为 `/O2 /fp:precise`——早期为 `/fp:fast`，但其禁用 NaN 语义与本铁律冲突，实测 `precision_type_test` 的 NaN 断言在 `/fp:fast` 下被编译器折叠为假失败，故对齐为 precise）。
 
 ```cmake
 # CMakeLists.txt（Clang/GCC；NN_ENABLE_NATIVE=ON 时含 -march=native）
@@ -174,9 +174,9 @@ engine.end_batch();             // 一次性提交 + fence wait
 
 #### 5.3 算子融合
 
-- `axpy_inplace`：融合 `clone + scale + add` 三步为一次 dispatch
-- `elementwise_select_scalar_cond`：融合条件选择（ReLU backward）
-- `broadcast_row_inplace` / `broadcast_col_inplace`：融合广播 + 逐元素操作
+- **表达式 DSL（当前主力）**：`dsl::compute` 把整条逐元素/归约/matmul 链折叠为**单个** GPU 融合 kernel（见 `04-innovative-designs.md` §3）
+- `broadcast_row_inplace` / `broadcast_col_inplace`：单算子级的广播 + 逐元素融合
+- （`axpy_inplace`、`elementwise_select_scalar_cond` 仍在接口中，但已无生产调用方——优化器/ReLU 反向均改为 DSL 表达式）
 
 ---
 
@@ -206,29 +206,20 @@ engine.broadcast_col_inplace(*diff, mean, BinaryOp::Sub);
 
 ---
 
-## 7. 融合 Axpy（scale + add）
+## 7. 融合 axpy（`dst += scalar * src`）
 
 ### 问题
 
-旧实现中 `dst += scalar * src` 需要 3 步：
+三步写法 `clone → scale_inplace → add_inplace` = 3 次 dispatch + 3 个临时 buffer。
 
-```
-clone_tensor → scale_inplace → add_inplace
-= 3 个 GPU 原语 + 3 个临时 buffer
-```
-
-### 优化
+### 现行做法
 
 ```cpp
-// 新实现：单次 dispatch
+// 首选：一条 DSL 表达式 = 单个融合 kernel（optimizer 就是这么写的）
+dsl::compute_into(engine, leaf(dst) + leaf(src) * rparam(scalar), dst);
+
+// 或单算子原语（接口保留，当前无生产调用方）
 engine.axpy_inplace(dst, scalar, src);
-// = 1 个 GPU 原语 + 1 个临时 buffer
-```
-
-### 性能收益
-
-```
-100 个参数 × 每 step 调用 ~3 次 = 减少 600 次 GPU buffer 分配/step
 ```
 
 ---
@@ -262,7 +253,7 @@ rearrange_3d_back → (H*d_k, batch*seq)
 ## 9. 因果掩码缓存【历史：已随 fold 迁移删除】
 
 > **状态（P-C2-7，2026-09-23）**：掩码物化与缓存路径整体删除——现行单 fold kernel
-> 在 body 内以 select 链表达掩码（`causal_skip` 把被屏蔽块整块钳成空转），**掩码
+> 在 body 内以 select 链表达掩码（`tri_skip` 把被屏蔽块整块钳成空转），**掩码
 > 矩阵从不存在、无需缓存**。下文保留作历史设计记录；且示例中
 > `(batch << 16) | seq_len` 位打包键正是 `08-pitfalls-and-lessons.md` §3.3 记录的
 > 溢出缺陷写法——该缺陷随整段删除一并消失。

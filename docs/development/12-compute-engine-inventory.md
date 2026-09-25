@@ -1,15 +1,17 @@
-# 计算引擎现状盘点（2026-09-18）
+# 计算引擎现状盘点（2026-09-18；2026-09-25 复核）
 
 > ⚠️ **更新（2026-09-19）：本文中的 IR-C 部分已执行完毕——IR-C 被整体删除。**
 > `expr_graph.hpp`、`ComputeEngine::begin_expr/end_expr`、`dsl::start_expr/end_expr`、
 > `FusedChainLayer`、`Tensor::virtual_tag_` 均已从代码移除；取舍依据与重新立项前提见
 > `03-ir-optimization.md` §5.3。§4.2/§4.3/§5/§8 保留原文作为**决策前的证据快照**（其中"IR-C 该接上"
 > 的判断已被 §8.9 的实测结论推翻），阅读时请以本横幅与 §8 末的"决策已执行"为准。
-> 另：§3 表第 2 行（DSL 模板路径"串行"）与 §7.5 第 1 项（"DSL 没有 `compute_into`"）**已过时**，
-> 已在原位更正。
 >
-> 目的：在讨论"只保留 `dsl::compute` + 纯算子"之前，先把**今天代码里实际并存的东西**列清楚。
-> 全部结论来自当前工作树（HEAD `f5e5e85`）的源码与构建配置，未做改动。
+> **2026-09-25 复核**：接口数字已按当前 HEAD 重测——**58 个 virtual（Phase 2 加入
+> `cast_into`/`copy_into`/`supports_*`/`eval_expr_*` 等）、Layer/Loss/Optimizer 直调 35 个**。
+> 复现命令见 `bench/doc_inventory.ps1` 与 §9。
+>
+> 目的：先把**当前代码里实际并存的计算 API 与遗留物**列清楚，作为收敛讨论的事实底座。
+> 全部结论来自当前工作树的源码与构建配置，未做改动。
 
 ---
 
@@ -22,7 +24,7 @@
 |------|------|
 | 纯 Matrix（无 Tensor） | `algebra_*` 仍在，是 `Tensor` 的底层存储 + CPU 手写 kernel |
 | `forward_gpu` / `backward_gpu` 双实现 | ✅ **已彻底移除**（仅注释残留） |
-| eager（直接调引擎算子） | ⚠️ **仍是 Layer 的一部分主力**（32 个算子被直接调用） |
+| eager（直接调引擎算子） | ⚠️ **仍是 Layer 的一部分主力**（35 个算子被直接调用，2026-09-25 复核） |
 | `begin_expr` / `end_expr`（IR-C 录制图） | 🗑️ **已移除**（2026-09-19：无收益点且无生产调用方，见 `03-ir-optimization.md` §5.3） |
 | `dsl::compute` | ✅ 当前主推，被 Layer 大量使用 |
 
@@ -48,43 +50,51 @@
 
 ---
 
-## 2. `ComputeEngine` 接口：50 个 virtual 成员
+## 2. `ComputeEngine` 接口：58 个 virtual 成员
 
-文件：`compute_engine.hpp`（2026-09-19 复核；原 52 个，`begin_expr`/`end_expr` 已随 IR-C 删除）
+文件：`compute_engine.hpp`（2026-09-25 复核，`bench/doc_inventory.ps1` 可复现；
+多精度 Phase 2 新增 `cast_into`/`copy_into`/`supports_native_data_move`/
+`supports_expr_precision_variant` 与 `Precision P` 参数的运算类原语。）
 
-### 2.1 被 Layer / Loss / Optimizer **直接调用**的算子：30 个
+### 2.1 被 Layer / Loss / Optimizer **直接调用**的算子：35 个
 
-（统计口径：`compute_layer*.hpp` + `compute_loss.hpp` + `compute_optimizer.hpp` 中出现的 `engine.<op>(`；
-2026-09-19 复核，`begin_expr`/`end_expr` 已随 IR-C 删除）
+（统计口径：`compute_layer*.hpp` + `compute_loss.hpp` + `compute_optimizer.hpp` +
+`model_container.hpp` 中出现的 `engine.<op>(`，排除 `engine_.reset(...)` 这类非算子调用）
 
 ```
 accumulate, add_inplace, batched_matmul, begin_batch, clone,
-col_reduce_max, col_reduce_sum, create_offload_buffer, create_tensor,
-elementwise_binary, end_batch, flush_batch, from_matrix, gather_rows,
-grouped_reduce_max, grouped_reduce_sum, im2col, col2im, insert_rows,
-matmul, matmul_with_bias, offload_restore, offload_save, outer_col,
-rearrange_3d, row_reduce_sum, scale_inplace, scan_prefix_outer,
-scan_suffix_outer, scatter_add_rows, slice_rows, to_matrix, transpose, zero
+col_reduce_max, col_reduce_sum, col2im, create_offload_buffer,
+create_tensor, elementwise_binary, end_batch, eval_expr, flush_batch,
+from_matrix, gather_rows, grouped_reduce_max, grouped_reduce_sum,
+im2col, insert_rows, matmul, matmul_with_bias, offload_restore,
+offload_save, outer_col, rearrange_3d, row_reduce_sum, scale_inplace,
+scan_prefix_outer, scan_suffix_outer, scatter_add_rows, slice_rows,
+to_matrix, transpose, zero
 ```
 （`im2col`/`col2im` 于 2026-09-20 新增：卷积/池化窗口展开与伴随散射，
 纯数据搬运、无算法语义；`grouped_reduce_max/sum` 同期新增：沿行方向按固定长度
 分组归约，用来把"逐通道一次 dispatch"的层内循环压成单次原语调用。
 Conv2D 与 MaxPool2D 已**全引擎化**，不再有 `to_matrix/from_matrix` 往返、
-CPU 标量循环或逐通道循环。）
+CPU 标量循环或逐通道循环。`eval_expr` 的 Layer 直调点是注意力 fold
+——fold 显式登记是 FoldSpec 唯一注册来源，属 AOT 设计而非旁路。）
 
-### 2.2 不被 Layer 直接调用（其余 20 个：引擎内部 / DSL / readback / 测试）
+### 2.2 不被 Layer 直接调用（其余 23 个：DSL / 序列化 / CLI / 适配层 / 测试）
 
 | 算子 | 实际调用方 |
 |------|-----------|
-| `eval_expr` / `eval_expr_reduce` / `eval_expr_into` | `dsl::compute` / `compute_reduce` / `compute_into` + 引擎内部（`matmul_with_bias`） |
-| `cast` | `model_serialization.hpp:646` + f16 测试 |
-| `copy_from` | `model_serialization.hpp`（上传路径） |
+| `eval_expr_into` / `eval_expr_reduce` | `dsl::compute_into` / `dsl::compute_reduce`（`expr_dsl.hpp`）+ `PrecisionEngine` 转发 |
+| `cast` / `copy_from` | `model_serialization.hpp` + f16 测试 / gradcheck |
+| `cast_into` / `copy_into` / `supports_*` | 仅 `compute_precision_engine.hpp` 内部（Phase 2 管道，非死代码） |
 | `offload_store` / `offload_load` | 仅 `offload_primitive_test.cpp`（**Layer 用的是 `offload_save`/`offload_restore`**） |
-| `row_reduce_max` | 仅引擎实现存在；Layer 走的是 `dsl::row_reduce_max`（DSL 叶子，非此算子） |
-| `elementwise_select_scalar_cond` | 仅引擎实现；**无调用点** |
-| `release_idle_pool_blocks` | `src/text_train.cpp:1463` |
-| `pool_stats` | **无任何调用点**（死接口） |
-| `submit_scalar_readback` / `poll_scalar_readback` / `scalar_readback_slots` | 标量回读（loss 用），Layer 不直调 |
+| `elementwise_unary` / `elementwise_binary_scalar` | 仅 f16/gpu 测试与 `layer_bench`；`elementwise_binary` 另有 1 处生产调用（`compute_layer_rapt.hpp:866` Div） |
+| `broadcast_row_inplace` | **无根调用方**（仅 `CpuEngine` 实现 + `PrecisionEngine` 转发） |
+| `broadcast_col_inplace` | 仅 `f16_precision_test` / `layer_bench` |
+| `axpy_inplace` | **无根调用方**（仅 `PrecisionEngine` 转发；optimizer 已迁 `dsl::compute_into`） |
+| `row_reduce_max`（引擎算子） | 仅 `PrecisionEngine` 转发；Layer 走的是 `dsl::row_reduce_max`（DSL 叶子，非此算子） |
+| `elementwise_select_scalar_cond` | **全仓无调用点**（接口 + 3 份引擎实现） |
+| `pool_stats` | `src/text_train.cpp`（池账本统计） |
+| `release_idle_pool_blocks` | `cli/cli_mnist_io.hpp`、`src/text_train.cpp`、`mem_probe.cpp` |
+| `submit_scalar_readback` / `poll_scalar_readback` / `scalar_readback_slots` | 标量回读（loss / `ce_fusion_test`），Layer 不直调 |
 | `device` | 引擎外部少量判断 |
 
 ---
@@ -106,14 +116,14 @@ CPU 标量循环或逐通道循环。）
 
 **死/重复**：
 - 机制 1（旧代数 AST）与机制 2（DSL 模板）是**两套并行的表达式模板 AST**，做同一件事（逐元素求值）。
-- 机制 2 与机制 3 是 DSL 在 CPU 上的两条路，一条内联、一条解释；机制 3（解释器）比等价原语慢 1.5–3.8 倍（见 `11-cpu-performance-diagnosis.md`）。
+- 机制 2 与机制 3 是 DSL 在 CPU 上的两条路，一条内联、一条解释；机制 3（解释器）逐元素 switch 分派 + 归约前缀重放，实测比等价原语慢 1.5–3.8 倍（2026-09-18 诊断实测；原诊断报告已删除，本行保留结论）。
 
 ---
 
 ## 4. 融合世代：**eager** 与 **DSL/IR 栈（含未接线的 IR-C）** 并存
 
 ### 4.1 eager（直接调引擎算子）
-没有"被移除"，而是**仍然是 Layer 的主力**：§2.1 的 37 个算子。
+没有"被移除"，而是**仍然是 Layer 的主力**：§2.1 的 35 个算子。
 GPU 侧每个都是独立的 backend kernel dispatch（`compute_gpu_engine.hpp:485` matmul、
 `:843` elementwise_unary、`:615` add_inplace…），即当初"kernel 开销大"的那条路。
 
@@ -196,8 +206,8 @@ ExprSpec ──► IR-A/B (expr_opt.hpp: canonicalize/CSE/寄存器分配)      
 | **GPU** | 真录制 + `execute_fused_graph(g)`（`compute_gpu_engine.hpp:184/194/201`）→ **确实融合**（测试里 3 节点 → 1 kernel） |
 | **CPU** | `#ifdef NN_EXPR_SCAN` 才动作；注释明写"**普通 CPU 运行：no-op（各表达式直接求值，行为不变——融合是 GPU 优化）**"（`compute_cpu_engine.hpp:41-45, 58`） |
 
-**推论：接 IR-C 对 CPU 的收益是零。** CPU 的病不是 kernel 数量，而是串行标量解释
-（见 `11-cpu-performance-diagnosis.md`）。所以在 CPU 侧讨论"IR-C vs dsl::compute"没有意义。
+**推论：接 IR-C 对 CPU 的收益是零。** CPU 的瓶颈不是 kernel 数量，而是含归约/matmul 的
+表达式走串行标量解释（§3 机制 3）。所以在 CPU 侧讨论"IR-C vs dsl::compute"没有意义。
 
 ### 4.3 `dsl::start_expr` / `end_expr`（块式融合 API）🗑️ 已移除
 - 原 `expr_dsl.hpp` 的 `ExprBlock`；**仅被测试使用**
@@ -214,10 +224,16 @@ ExprSpec ──► IR-A/B (expr_opt.hpp: canonicalize/CSE/寄存器分配)      
 |----|------|------|
 | ~~CUDA 引擎 + backend + `cuda/` + 10 处 `#ifdef`~~ | ~100 KB | 🗑️ **已移除**（快照见 `legacy/cuda`） |
 | 旧代数 AST：`algebra_expr.hpp` + `algebra_ops.hpp` + `algebra_compute.hpp` | 27.6 KB | ⚠️ 仅 CPU elementwise 用，与 DSL 模板路径重复 |
-| IR-D 的 `CpuEmitter` 残留 | 注释 | ⚠️ `cpu_emitter.hpp` 已删（现仅 `GlslEmitter` 登记）；`expr_emitter.hpp:16` 仍引用它；文档 03 的「`factory_cpu()` 返回 GlslEmitter」说明已过时（该函数现不存在） |
+| IR-D 的 `CpuEmitter` 残留 | 注释 | ✅ **已清理**（2026-09-25）：`cpu_emitter.hpp` 已删、`expr_emitter.hpp` 头注释已更正为"仅 GlslEmitter 注册"；文档 03 对应说明同步修正 |
 | ~~`FusedChainLayer`（IR-C 演示层）~~ | ~60 行 | 🗑️ **已移除**（2026-09-19） |
 | ~~`begin_expr`/`end_expr` + `expr_graph.hpp` + `Tensor::virtual_tag_`~~ | ~24 KB | 🗑️ **已移除**（2026-09-19） |
-| `pool_stats()` | 接口 1 个 | ❌ 无调用点 |
+| ~~`eval_cpu` 串行模板路径~~ | — | ✅ **已修复**：`eval_into_span` 已并行化 + 向量化（机制 2，见 §3） |
+| `axpy_inplace` | 接口 + 3 引擎实现 | ❌ **无根调用方**（仅 `PrecisionEngine` 转发；optimizer 已迁 `dsl::compute_into`） |
+| `broadcast_row_inplace` | 接口 + 3 引擎实现 | ❌ **无根调用方**（仅实现 + 转发） |
+| `broadcast_col_inplace` | 接口 + 3 引擎实现 | ⚠️ 仅测试/bench 用 |
+| `nn::one_hot`（`nn.hpp`） | 1 函数 | ❌ 无调用点，且与铁律 9（大词表禁物化 one-hot）冲突 |
+| `Matrix::multiply_transposed_add_to`（`algebra_matrix.hpp`） | 1 方法 | ❌ 注释自述"全库无调用者（死代码）"，实测 0 调用 |
+| `pool_stats()` | 接口 1 个 | ✅ 活（`src/text_train.cpp` 池账本统计） |
 | `elementwise_select_scalar_cond` | 接口 + 3 引擎实现 | ❌ 无调用点 |
 | `offload_store` / `offload_load` | 接口 + GPU 实现 | ⚠️ 仅测试用（Layer 用 `offload_save/restore`） |
 | `row_reduce_max`（引擎算子，非 DSL 叶子） | 接口 + 3 引擎实现 | ⚠️ 无 Layer 调用点 |
@@ -233,7 +249,7 @@ ExprSpec ──► IR-A/B (expr_opt.hpp: canonicalize/CSE/寄存器分配)      
 ## 6. 与"只保留 `dsl::compute` + 纯算子"的差距
 
 目标形态：
-1. Layer 只写 `dsl::compute` / `compute_reduce`（不再直接调 37 个 eager 算子）；
+1. Layer 只写 `dsl::compute` / `compute_reduce`（不再直接调 35 个 eager 算子）；
 2. 引擎保留一组"纯算子"，但**只服务于 DSL 的 lowering**，不再作为 Layer 的公开 API；
 3. 干掉重复的代际产物。
 
@@ -241,7 +257,7 @@ ExprSpec ──► IR-A/B (expr_opt.hpp: canonicalize/CSE/寄存器分配)      
 
 | 差距 | 现状 | 说明 |
 |------|------|------|
-| A. Layer 直调算子 | 30 个（2026-09-19 复核） | 要收敛到"只写表达式"，包括 `matmul`/`batched_matmul`/`transpose`/`gather_rows`/`scan_*`/`offload_*` |
+| A. Layer 直调算子 | 35 个（2026-09-25 复核） | 要收敛到"只写表达式"，包括 `matmul`/`batched_matmul`/`transpose`/`gather_rows`/`scan_*`/`offload_*` |
 | B. 四套求值机制 | 4 套 | 目标只剩 DSL + 引擎 lowering；旧代数 AST、`eval_cpu`、解释器都要重定义为 lowering |
 | C. 融合世代 | eager / dsl | **只有 eager 是待收敛的旧世代**；IR-C 已于 2026-09-19 移除（设计无收益点，见 §8.9 + `03-ir-optimization.md` §5.3） |
 | D. 死代码 | 无调用点接口（CUDA 全链 ~100 KB、IR-C ~24 KB 已清） | 与目标无关，已清理 |
@@ -295,7 +311,7 @@ L3  后端     : SIMD / 线程池 / GLSL kernel
 1. 每次直调 = 一次 kernel dispatch（GPU）/ 一次 Tensor 物化——**这正是 DSL 被造出来要消灭的东西**
    （对比 `eval_expr` 一次 dispatch 完成整条链）。
 2. 保留与 DSL 重复的逐元素路径 → 就是今天 CPU 上"旧代数 AST / DSL 模板 / 解释器"三套并存、
-   层直调 37 个算子的直接来源。
+   层直调 35 个算子的直接来源。
 
 好处（必须承认）：
 - **eager 是闭合世界的逃生舱**。GPU 的 DSL 未命中 AOT 就**硬报错**（`compute_gpu_engine.hpp:996`），
@@ -310,8 +326,9 @@ L3  后端     : SIMD / 线程池 / GLSL kernel
 2. ~~**跨表达式融合没接线**：`begin_expr`/`end_expr` + `expr_graph.hpp`（IR-C）无生产调用方~~
    → 🗑️ **已判定为无收益并移除**（2026-09-19）：需要融合的层都以归约为骨架、且要为 backward 缓存
    中间量（§8.9），能融的表达式本就可写成单个 `dsl::compute`。见 `03-ir-optimization.md` §5.3。
-3. **CPU lowering**：见 `11-cpu-performance-diagnosis.md` §8 —— 逐元素路径已向量化+并行（机制 2），
-   但**含归约/matmul 的表达式仍走串行解释器**（机制 3，比等价原语慢 1.5–3.8 倍）。这是剩下的一项。
+3. **CPU lowering**（剩下的一项）—— 逐元素路径已向量化+并行（机制 2），
+   但**含归约/matmul 的表达式仍走串行解释器**（机制 3，2026-09-18 实测比等价原语慢 1.5–3.8 倍；
+   原诊断报告已删除，结论保留在 §3 与本条）。
 
 ### 7.6 结论
 
@@ -492,13 +509,6 @@ backward 保留、且长到单个 `dsl::compute` 写不下**的链。届时按"�
 ## 9. 盘点用到的命令
 
 ```powershell
-# 引擎接口算子
-Select-String -Path include\neuralnet.cpp\compute_engine.hpp -Pattern 'virtual'
-
-# Layer 直接调用的算子
-Select-String -Path (Get-ChildItem include\neuralnet.cpp\compute_layer*.hpp, `
-    include\neuralnet.cpp\compute_loss.hpp, include\neuralnet.cpp\compute_optimizer.hpp) `
-    -Pattern 'engine_?\.([a-z0-9_]+)\(' -AllMatches |
-  % { $_.Matches } | % { $_.Groups[1].Value } | Sort-Object -Unique
-
+# 一键复现本文 §2 的两个数字（virtual 数 / Layer 直调集合 / 未直调集合）：
+pwsh -File bench\doc_inventory.ps1
 ```

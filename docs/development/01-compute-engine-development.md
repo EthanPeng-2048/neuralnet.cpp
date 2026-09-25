@@ -298,7 +298,7 @@ engine.end_batch();  // 提交并等待
 
 **形状约定**：batch-major `i = b*seq+t`；头 (b,h) 行块起点 `r0=(b*H+h)*d_k`；K/V/P/R（X/Y）`(B·H·d_k, seq)`、D `(B·H·d_k², seq)`、A0/B0 `(H·d_k, d_k)`；boundary `(1, B·seq)`（1=文档起点）；空参数用 (1,1) dummy + bool 标志（规避 0 字节 GPU buffer）；`d_k ≤ 64`（GPU MAX_DK）；标量块 s/r 头内逐行重复（实现写全部行，调用方读任一行）。
 
-**使用方**：`ReLULinearAttention`（RAPT 层）——shader 只含"带状态的顺序归约 + matvec 读出 / 外积"，算法（L2 分母 / ReLU 门控 / 梯度公式 / 文档重置）全部由 Layer 用原语组合表达（见 `../16-zipt-algorithm.md` 与 RLA 算法文档 §7）。
+**使用方**：`ReLULinearAttention`（RAPT 层）——shader 只含"带状态的顺序归约 + matvec 读出 / 外积"，算法（L2 分母 / ReLU 门控 / 梯度公式 / 文档重置）全部由 Layer 用原语组合表达（见 `06-rapt-algorithm.md` §4）。
 
 ---
 

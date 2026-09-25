@@ -27,15 +27,15 @@
 | [算法解析](docs/introduction/03-algorithm-reference.md) | 每个 Layer/Loss/Optimizer 的数学原理与原语分解 |
 | [创新设计](docs/introduction/04-innovative-designs.md) | 引擎化、AOT 融合、多精度等创新全景 |
 | [计算引擎开发](docs/development/01-compute-engine-development.md) | ComputeEngine 接口详解、实现模式、添加新原语 |
-| [算子融合](docs/development/02-operator-fusion.md) | IR 扩展 → 表达式录制 → matmul 参与 IR 融合 → 跨 kernel 自动融合 |
-| [IR 优化](docs/development/03-ir-optimization.md) | IR-A/B/C/D 优化 pass |
+| [算子融合](docs/development/02-operator-fusion.md) | 归约语义 IR → 表达式录制 → matmul 融合 → 手写算子收敛为 IR 融合 |
+| [IR 优化](docs/development/03-ir-optimization.md) | IR-A/B/D 优化 pass（IR-C 已评估并移除，§5.3 是取舍记录） |
 | [显存优化](docs/development/04-memory-optimization.md) | 激活重计算、内存池归还 |
 | [多精度计算](docs/development/05-mixed-precision.md) | f16/混合精度设计：Precision 类型系统、PrecisionProfile |
-| [线性注意力](docs/development/06-rapt-algorithm.md) | RLA / RAPT / RLA-2 + 两趟式/flash 等价 + GPU 落地 |
+| [线性注意力](docs/development/06-rapt-algorithm.md) | RLA → RAPT → RLA-2 演进 + GPU 扫描原语落地 |
 | [ZiPT 记忆压缩](docs/development/07-zipt-algorithm.md) | AttnZip / ZiPT 解码器算法 |
 | [踩坑警示录](docs/development/08-pitfalls-and-lessons.md) | **改代码前读**，历史 bug 分级与根因模式 |
-| [代码审查报告](docs/development/09-code-review-2026-09-04.md) | 全库 C++ 审查结果与修复建议 |
 | [开发规范](docs/development/10-development-standards.md) | C++ 编码规范、模块隔离、内存管理 |
+| [计算引擎盘点](docs/development/12-compute-engine-inventory.md) | 引擎接口全景、表达式求值机制、遗留物清单 |
 | [快速上手：构建模型](docs/usage/01-quickstart-model.md) | ComputeEngine/Layer/Model 三件套使用教程 |
 | [快速上手：训练与推理](docs/usage/02-quickstart-train-infer.md) | MNIST/GPT 训练推理命令行 + C++ API 示例 + GUI 操作指南 |
 | [计算引擎使用](docs/usage/03-compute-engine-usage.md) | 张量操作、矩阵运算、表达式融合 |
@@ -62,8 +62,8 @@ neuralnet.cpp/
 │   │   ├── 06-rapt-algorithm.md          ← RLA / RAPT / RLA-2 算法
 │   │   ├── 07-zipt-algorithm.md          ← AttnZip / ZiPT 算法
 │   │   ├── 08-pitfalls-and-lessons.md    ← 踩坑警示录
-│   │   ├── 09-code-review-2026-09-04.md  ← 代码审查报告
-│   │   └── 10-development-standards.md   ← 开发规范
+│   │   ├── 10-development-standards.md   ← 开发规范
+│   │   └── 12-compute-engine-inventory.md ← 引擎接口盘点
 │   └── usage/                 ← 使用类
 │       ├── 01-quickstart-model.md        ← 模型构建教程
 │       ├── 02-quickstart-train-infer.md  ← 训练推理教程
@@ -287,7 +287,7 @@ python gui.py
 
 ## 📐 开发规范
 
-本项目遵循严格的 C++ 开发规范，详见 [DEVELOPMENT_STANDARDS.md](DEVELOPMENT_STANDARDS.md)。
+本项目遵循严格的 C++ 开发规范，详见 [开发规范](docs/development/10-development-standards.md)。
 
 ### 核心原则
 

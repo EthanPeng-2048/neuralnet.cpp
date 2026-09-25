@@ -2,7 +2,7 @@
 
 > 目标：在**不推翻现有 AOT 闭合世界**的前提下，把 `ExprSpec` 从"直通轻量 IR"演进为带优化 pass 的规范 IR，分阶段提升开发便利与代码质量。
 > 状态：**IR-A（canonicalize：DCE/常量折叠/代数化简/稳定重编号）+ IR-B（CSE + 寄存器分配 liveness）已实施（2026-08-23）**；**IR-D（后端 emitter 抽象）已实施（2026-08-24）**；**IR-C（图 IR + `begin_expr/end_expr` 融合分析，基础版 2026-08-24 实施）已于 2026-09-19 整体移除**——因归约边界 + backward 缓存逃逸，当前层集合里无处可安全接入（详见 §5.3）。
-> 关联文档：`../development/02-operator-fusion.md`（算子融合）、`DEVELOPMENT_STANDARDS.md`（分层铁律）、`../08-pitfalls-and-lessons.md`。
+> 关联文档：`02-operator-fusion.md`（算子融合）、`10-development-standards.md`（分层铁律）、`08-pitfalls-and-lessons.md`。
 
 ## 目录
 
@@ -178,14 +178,16 @@ CSE 需处理 `Input/Const/Reduce` 操作数的等价性（视图相同 + 输入
 把 `glsl_gen.hpp` 的 GLSL 专用生成抽象为 emitter 接口（`expr_emitter.hpp`）：
 
 ```
-IR → GlslEmitter / CpuEmitter
+IR → GlslEmitter（当前唯一注册后端）
 ```
 
 - `ExprEmitter` 纯接口（name/generate/generate_reduce）+ `emitter_registry`（按后端名选择工厂）。
-- `GlslEmitter`（glsl_gen.hpp 现有 generate_glsl/generate_glsl_reduce 封装）；`CpuEmitter`（生成可编译 C++ 直线代码，验证"一份 IR 多后端"，数值与 CPU 解释器一致）。
-- `gen_fused` 经 emitter 注册表选择后端（默认 glsl）；`--list-backends` 展示可用后端（glsl/cpu）。
+- `GlslEmitter`（`expr_glsl_gen.hpp` 的 generate_glsl/generate_glsl_reduce 封装）。
+- `gen_fused` 经 emitter 注册表选择后端（默认 glsl）；`--list-backends` 展示可用后端。
 
-> **注意**：`cpu_emitter.hpp` 已删除（P1-26 修正）。`CpuEmitter` 的逻辑已合并到 `GlslEmitter`，`expr_emitter.hpp` 的 `factory_cpu()` 现在返回 `GlslEmitter` 实例。CpuEmitter 产物从不参与编译（gen_fused 硬编码 glsl），其缺陷全隐性（BatchMod/BatchCol 未声明 batch、操作数走 default 错语义等），是后续多精度 Phase 2 的前置条件。
+> **注意**：历史上的 `CpuEmitter`（`cpu_emitter.hpp`，生成可编译 C++ 直线代码）**已删除**——
+> 其产物从不参与编译（gen_fused 硬编码 glsl），缺陷全隐性，随文件一并移除。
+> 现在只剩 `glsl` 一个注册后端；`expr_emitter.hpp:16` 的注释仍提到 `cpu_emitter.hpp`（已知残留）。
 
 ---
 

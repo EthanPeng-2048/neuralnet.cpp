@@ -1,12 +1,12 @@
 # 多精度计算改造（f16 / 混合精度）设计
 
 > **状态**：Phase 1 已落地（存储类型化 / cast / matmul-f16 / 类型化 Tensor）；
-> Phase 2 部分落地（2026-09：PrecisionEngine 边界 cast 适配层 + DSL/Layer/
-> Loss/Optimizer 全链精度接线 + `f16_precision_test`；**in-kernel f16 未做**）——
-> 实施记录、实测与已知问题见 §12.5。
+> Phase 2 已落地（2026-09：PrecisionEngine 边界 cast 适配层 + DSL/Layer/
+> Loss/Optimizer 全链精度接线 + **in-kernel f16 带类型变体（逐元素/归约/matmul 段）**
+> + **op-level f16 GEMM**，`--f16` 峰值显存首次低于 f32）——
+> 实施记录、实测与已知问题见 §12.5 起。
 > **范围**：f16 + f32（bf16 / f64 仅枚举占位）。
-> **来源**：docs/13 P4-03「半精度训练」（显存减半 + 带宽翻倍）。
-> **配套**：`../development/01-compute-engine-development.md`（引擎开发）、`../28-compute-engine-usage.md`（引擎使用）、`../08-pitfalls-and-lessons.md`（踩坑）、`../30-code-review-2026-09-04.md`（CpuEmitter 隐性缺陷与本文 §11.1 相关）。
+> **配套**：`01-compute-engine-development.md`（引擎开发）、`../usage/03-compute-engine-usage.md`（引擎使用）、`08-pitfalls-and-lessons.md`（踩坑）。
 
 ## 目录
 
@@ -423,7 +423,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 ### 11.1 AOT 闭合世界（铁律 7，Q6 分期）
 
 - **Phase 1：`expr_spec_key` 不变。** 融合世界保持全 f32：f16 张量进出融合链时走**显式边界 cast**（cast 可融入首/尾 kernel 的 load/store，或独立小 kernel——工程选择）；f16 GEMM 是手写原语，不进 spec。GPU f16 训练在 Phase 1 的收益 = 显存减半 + 带宽减半 + GEMM 提速，**逐元素链的 in-kernel f16 收益 Phase 2 再拿**。
-- **Phase 2**：in-kernel f16 融合 → key 加 1B 精度维度；`glsl_gen` 生成 f16 变体（GLSL `f16vec*`，explicit arithmetic 扩展）；`CpuEmitter` 产物必须可编译并按 P 实例化——**CpuEmitter 现有隐性缺陷（BatchMod/BatchCol 未声明 batch、操作数走 default 等）必须在 Phase 2 前修复**，否则 f16 CPU 融合链不可信。
+- **Phase 2（已落地，见 §12.6–§12.11）**：in-kernel f16 融合 → key 加精度签名 `ExprPrecSig`（逐输入 bit + 输出 bit，0 = f32 旧行为）；`GlslEmitter` 按签名生成 `float16_t` 变体；手写 GEMM 用 `-DNN_SHADER_F16` 编第二份 SPIR-V。`CpuEmitter` 已删除（现仅 `GlslEmitter` 登记），当年"Phase 2 前必须先修 CpuEmitter 缺陷"的前置条件随之作废。
 
 ### 11.2 确定性契约（修订版）
 
@@ -498,9 +498,9 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 9. **序列化**：v5 f16 模型 save/load 往返逐字节；v4 文件按全 f32 读入；tag 互锁校验生效。
 10. **错误路径**：BF16 / F64 使用 → 清晰 `Result` 报错（"精度未实现"）。
 
-### 12.3 Phase 2（列出，不在本期）
+### 12.3 Phase 2（原始清单；1、2 已落地，余下为待办）
 
-1. in-kernel f16 融合：`expr_spec_key` 加精度维度、`glsl_gen` f16 变体、CpuEmitter 按 P 实例化（**前提：先修 CpuEmitter 既有缺陷**）。
+1. ✅ in-kernel f16 融合：`ExprPrecSig` 精度签名 + `GlslEmitter` f16 变体 + 手写 GEMM `-D` 双份 SPIR-V（见 §12.6–§12.11）。
 2. per-layer `PrecisionProfile` 覆盖（`p_` 成员已就位，纯增量）。
 3. bf16（兼容路径精度，§7.1 注）。
 4. f16 权重镜像缓存（消除按 op cast 的带宽开销）。
@@ -636,100 +636,29 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 
 ### 12.8 剩余开销归因（2026-09-25，探针逐阶段，batch 32）
 
-拿 `mem_probe` 对同一配置跑 f32 与 f16(in-kernel) 两遍，逐阶段比对（见下表），结论与
-"再补一类 shader 变体"的直觉不同——**f16 的额外开销是"每个算子一次边界 cast"造成的
-*临时块数量*膨胀，不是单个张量变大**：
+`mem_probe` 同配置 f32 vs f16(in-kernel) 逐阶段比对——**f16 的额外开销是"每算子一次边界
+cast"造成的临时块（transient）数量膨胀，不是驻留张量变大**：
 
-| 阶段（稳态 step） | f32 | f16 in-kernel | 差 |
-|---|---|---|---|
-| forward committed / live | 524.5 / 513.7 MB（<10MB：143 项/260MB） | 656.5 / 651.6 MB（<10MB：262 项/**400MB**） | +132 MB |
-| loss-fwd | 781 / 770 MB | 913 / 908 MB | +132 MB |
-| **backward（峰值）** | **1401 / 1397 MB**（10-100MB：**16 项/512MB**；<10MB：234 项/370MB） | **2877 / 2869 MB**（10-100MB：**52 项/1600MB**；<10MB：**587 项/760MB**） | **+1476 MB** |
-| end-batch live | 702 MB | 1440 MB | — |
-| step 末 released | 272.5 MB | 288.5 MB | **+16 MB（持平）** |
+- **步末 released 持平**（272.5 → 288.5 MB）→ 多出来的全是临时块，与"f16 存储减半"预期一致；
+- backward 峰值 1397 → 2869 MB，其中 10–100MB 中块 **16 → 52 项**、<10MB 小块 234 → 587 项
+  → 大头是每个非逐元素算子物化 2~3 份 f16→f32 副本（matmul/归约/fold，以及**全部非 DSL 原语**
+  `slice_rows/insert_rows/clone/zero/gather_rows/transpose/...`——它们都走适配层 cast）；
+- 同窗交错 3 样本：f32 **1588/1588/1588（稳定）**、f16 **4514/4582/3448（双峰）** → f16 贵 2.2~2.9×；
+  f16 transient 分配次数多（119 块 vs 50 块）使池回收时序成为峰值决定因素。
+- 已实现 `supports_native_data_move()`（clone/slice_rows/insert_rows/zero 对 f16 直接放行，
+  省 2 份全尺寸临时量）——探针复核逐项相同 → **GPT 路径峰值中性**（数据量小），保留但非主攻方向。
 
-关键读数：
+（本节只是过程归因；**裁决与最终数字见 §12.10**——真正的大头是形状级 op-level cast。）
 
-1. **步末显存几乎持平**（272.5 → 288.5 MB）→ 多出来的全是**临时块**（transient），不是长期驻留
-   —— 与"f16 存储减半"的设计预期一致，问题在 cast 路径的临时量。
-2. **中块数量 16 → 52 项（+1088MB）是小块 234 → 587 项（+390MB）** 的 3 倍量级 → 最大头是
-   **每个非逐元素算子物化 2~3 份 f16→f32 副本**（matmul / 归约 / fold / 以及**非 DSL 原语**：
-   `slice_rows/insert_rows/clone/zero/gather_rows/transpose/rearrange_3d/scatter_add_rows/
-   add_inplace/scale_inplace/broadcast_*`——它们至今**全部**走适配层 cast）。
-3. 因此下一期的收益排序应为（按"每次调用省下的临时量 × 调用频次"）：
-   ① **非 DSL 原语的 f16 原生路径**——`slice_rows/insert_rows/clone/zero` 后端**已是模板化
-      `<P>` 实现**（`slice_rows_gpu<P>`/`insert_rows_gpu<P>`/`clone_gpu<P>`），只需引擎按张量
-      精度分派 + 适配层放行，**无需任何新 shader**；`transpose/gather/scatter/rearrange_3d`
-      需要 shader 的 f16 变体（字节搬运，改造量小）。这一类的调用频次远高于 matmul 段。
-   ② **matmul 段变体**（10 条）：f16 读 + f32 累加 + f16 写，省掉 GEMM 的 f32 结果 + 输入的
-      逐算子 f32 副本——GPT 每个 Linear（含注意力的 Q/K/V/O 与 FFN 两个）forward/backward 各一次。
-   ③ **含归约指令的逐元素（13 条）**：Norm 统计量链；张量尺寸小（(F,B) 级）但频次高。
-   ④ fold（注意力，1 条）。
+### 12.9 池底材粒度 A/B（结论已被 §12.10 推翻，保留为方法论反面教材）
 
-**本轮实测复核（同窗交错 3 样本，batch 32）**
-
-| 采样 | f32 | f16 in-kernel |
-|---|---|---|
-| 1 / 2 / 3 | 1588 / 1588 / 1588 MiB（**完全稳定**） | 4514 / 4582 / **3448** MiB（**双峰**，中位 4514） |
-
-- f16 峰值**双峰**（3.45GB 低模 / 4.55GB 高模）——与历史上"reap 时序竞态导致双峰"同族：
-  f16 路径的 transient 分配次数远多（探针 backward 119 块 vs f32 的 50 块），池的复用/回收
-  时序变成峰值的决定因素。**f32 侧完全稳定说明这不是采样噪声，而是 f16 路径自身的时序敏感性。**
-- 因此 f16 相对 f32 基线仍贵 **2.2~2.9×**；`§12.8` 的归因（每算子 cast 的临时块数量）成立。
-
-**已实现的"原生 f16 数据搬运"（测量后判定：GPT 峰值中性）**
-
-`clone / slice_rows / insert_rows / zero` 在 GPU 后端本就是模板化 `<P>` 实现（字节拷贝 /
-`vkCmdFillBuffer`），故给引擎加 `supports_native_data_move()`、适配层对 f16 直接放行
-（省掉"抬 f32 → 搬运 → 落回 f16"的 2 份全尺寸临时量）。**探针复核：backward
-committed/live/块数/pending 与改动前逐项相同（2877MB / 2869MB / 119 块 / 2.9e3MB）**
-→ 这几类原语在 GPT 路径上**不是**开销大头（它们的数据量小、调用虽多但每次只有 MB 级）。
-保留该路径（正确性经 19/19 与轨迹对拍验证，且对其它 workload 仍是净收益），但**不作为
-峰值的主攻方向**：下一期必须直接做 **matmul 段 + 含归约的逐元素 + fold** 三类带类型变体。
-
-**验证状态**：`f16_precision_test` GPU 轨迹对拍 max_rel **6e-4**（原生搬运后进一步收敛）、
-19/19 ctest 绿。
-
-### 12.9 真正的峰值决定因素：池底材粒度 × 分配次数（2026-09-25，修正 §12.8 的结论）
-
-> **⚠️ 本节结论已在 §12.10 被同窗交错复测推翻**：表中的"4MB/阶梯 ≤16MB → 2716/2705 MiB、
-> 耗时 11.1/11.3s"**无法复现**（同窗交错 3 轮实测三档配置峰值 3513/3509/3141~3509 MiB、
-> 耗时全部 ≈5.7s）。本节保留作方法论反面教材：**跨会话单点 + 不同时段的对照组会被系统漂移
-> 骗**（f32 同码对照在本轮实测 1753 MiB，而本节记的是 1588 MiB，漂移 ~10%）。结论以 §12.10 为准。
-
-§12.8 把 f16 的 extra 归给"每算子 cast 的临时量"，方向对但**量级解释错了**。本轮做了两件事，
-把真正的杠杆找出来了：
-
-**① 把"静默回退 cast"变成可见清单**（新增 `NN_PREC_TRACE=1` 的 `[prec][miss]` 打印，
-适配层在每个回退点去重打印 `(key, sig, 形态)`）。实测真实 GPT 配置：**38 个非零签名请求里只有
-6 个未命中**（2×`0x10000` 全 f32 输入 + f16 输出、1×`0x0002`、1×含归约 `0x1000f`、
-1×fold `0x10007`、1×matmul 段 `0x10003`）——即 **eval_expr 路径上 84% 已是原生**，
-剩余 cast 不在那里。
-
-**② 关键否证：cast 不是大头，"分配次数 × 块粒度"才是。** 本配置 d_model=64、batch·seq=8192
-的激活只有 1~4MB 级，f16 却比 f32 多 1.4GB —— 若真是 cast 副本，量级对不上。于是直接对
-**池底材粒度**做 A/B（`NN_POOL_BLOCK_MB` / `NN_POOL_LADDER_MAX_MB` 是既有旋钮）：
-
-| 池配置（f16, batch32） | 峰值 | 耗时 | avg_loss |
-|---|---|---|---|
-| 默认（12MB 固定块） | 3445 MiB | 5.8s | 6.7034 |
-| 32MB 固定块 | 3468 MiB | 5.8s | 6.7259 |
-| **4MB 固定块** | **2716 MiB** | 11.1s | 6.7061 |
-| **1MB 固定块** | **2614 MiB** | 23.1s | 6.7114 |
-| **阶梯 ≤16MB** | **2705 MiB** | 11.3s | 6.7226 |
-| 阶梯 ≤64MB | 3064 MiB | 11.0s | 6.7222 |
-| f32 + 阶梯 ≤16MB（对照） | **1588 MiB（不变）** | 4.8s | 6.6905 |
-
-- 结论：**默认 12MB 底材在"大量小分配"的 f16 路径上浪费接近一个整块/次**；换成 4MB 或
-  按尺寸分档（≤16MB）→ **峰值 −21%（3445→2705MiB）**，数值不变（6.70~6.72，均在 f16 容差内），
-  **f32 侧完全不受影响（1588 不变）**。
-- 代价：耗时 5.8s→11.3s（约 2×），且只惩罚 f16（f32 仍 4.8s）→ 与分配次数成正比的**池记账成本**
-  （块数变多后 best-fit 线性扫描/vkAllocateMemory 次数上升），**不是 GPU 计算变慢**。
-- 因此本轮的产出是**一个此前未知的大杠杆 + 明确的下一步工程项**：把池的小分配路径做快
-  （按尺寸类的空闲链表 + 批量/延迟块申请），就能既拿 −21% 峰值又不付 2× 时间；
-  在此之前 `NN_POOL_LADDER_MAX_MB=16` 作为**显式可选项**（CLI 在 `--f16` 时打印提示）。
-- 仍与 f32 基线差 1.7×（2705 vs 1588）→ 继续做 matmul 段 / 含归约 / fold 三类带类型变体
-  依然必要，但它们不再是唯一手段。
+> **⚠️ 本节"4MB/阶梯 ≤16MB → 2705 MiB、耗时 11.3s"无法复现**（同窗交错 3 轮实测三档配置
+> 峰值 3513/3509/3141~3509 MiB、耗时全部 ≈5.7s；f32 同码对照也从 1588 漂到 1753，漂移 ~10%）。
+> 教训：**跨会话单点 + 不同时段的对照组会被系统漂移骗**；机制之争必须用形状/尺寸归因表裁决
+> （§12.10），不要用总量推理。结论一律以 §12.10 为准。
+>
+> 本节仍有效的副产物：`NN_PREC_TRACE=1` 的 `[prec][miss]` 打印——实测真实 GPT 配置 38 个
+> 非零签名请求只 6 个未命中（即 eval_expr 路径 84% 已原生），证明 cast 大头不在融合路径上。
 
 ---
 
@@ -1003,7 +932,6 @@ nn_embed_shader(matmul_tiled_f16   ${CMAKE_SOURCE_DIR}/shaders/matmul_tiled.comp
 | `shaderFloat16` 设备覆盖不全 | 低 | 无特性 = 兼容路径，功能正确（Q4），平滑降级 |
 | AOT 世界被破坏 | 低 | Phase 1 key 不变（f16 GEMM 手写原语）；Phase 2 的 key 扩展单独评审 |
 | f16 溢出导致训练发散 | 中 | `stable = F32` + §12.4 明示 + 训练 inf/nan 监控；loss scaling 留 Phase 2 |
-| CpuEmitter 既有隐性缺陷拖累 Phase 2 | 中 | 列 Phase 2 前置条件 |
 | f16 容差取值不当（过松掩盖 bug / 过紧误报） | 中 | T4/T5 实测校准后定默认，gradcheck 按 P 表分级 |
 
 ---
