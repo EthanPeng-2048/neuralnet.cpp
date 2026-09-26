@@ -108,17 +108,6 @@ public:
         softmax_.clear_cache(); batch_cache_ = 0; seq_cache_ = 0;
     }
 
-    std::vector<TensorRef> activation_cache() override
-    {
-        std::vector<TensorRef> r;
-        if (Q_re_cache_.valid()) r.emplace_back(Q_re_cache_);
-        if (K_re_cache_.valid()) r.emplace_back(K_re_cache_);
-        if (V_re_cache_.valid()) r.emplace_back(V_re_cache_);
-        auto s = softmax_.activation_cache();
-        r.insert(r.end(), s.begin(), s.end());
-        return r;
-    }
-
     // 前向：输入 X (d_model, batch·L) → 输出 C (d_model, batch·M)
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override

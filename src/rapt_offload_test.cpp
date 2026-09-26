@@ -37,6 +37,7 @@ int main()
 }
 #else
 #include <neuralnet.cpp/backend/compute_vk_backend.hpp>
+#include "test_common.hpp"
 
 using nn::ActivationType;
 using nn::GpuBackend;
@@ -48,27 +49,6 @@ using nn::RAPTModel;
 namespace
 {
 
-bool off_close_to(const Matrix& a, const Matrix& b, Scalar tol,
-                  const std::string& name, std::size_t idx)
-{
-    Scalar max_abs = 0;
-    Scalar max_rel = 0;
-    const auto& sa = a.span();
-    const auto& sb = b.span();
-    for (std::size_t i = 0; i < a.size(); ++i)
-    {
-        const Scalar diff = std::fabs(sa[i] - sb[i]);
-        if (diff > max_abs) max_abs = diff;
-        const Scalar denom = std::fabs(sb[i]) > 1e-30f ? std::fabs(sb[i]) : 1.0f;
-        const Scalar rel = diff / denom;
-        if (rel > max_rel) max_rel = rel;
-    }
-    const bool pass = (max_abs <= tol) || (max_rel <= tol);
-    std::cout << "    [" << idx << "] " << name
-              << "  max_abs=" << max_abs << "  max_rel=" << max_rel
-              << (pass ? "  ✅" : "  ❌") << "\n";
-    return pass;
-}
 
 int off_run_test()
 {
@@ -154,7 +134,7 @@ int off_run_test()
     if (!lm) { std::cerr << "to_matrix(logits) failed\n"; return 1; }
     std::cout << "  offload slab: " << (model.offload_ram_bytes() / 1024) << " KB\n";
 
-    all_pass &= off_close_to(*lm, baseline_logits, tol, "logits", 0);
+    all_pass &= close_to(*lm, baseline_logits, tol, "logits", 0);
 
     for (auto& g : model.param_gradients())
     {
@@ -170,7 +150,7 @@ int off_run_test()
         auto gm = eng.to_matrix(grads[p].get());
         if (!gm) { std::cerr << "to_matrix(grad) failed\n"; return 1; }
         std::string name = "grad[" + std::to_string(p) + "]";
-        all_pass &= off_close_to(*gm, baseline_grads[p], tol, name, p);
+        all_pass &= close_to(*gm, baseline_grads[p], tol, name, p);
     }
 
     std::cout << "\n----------------------------------------\n";

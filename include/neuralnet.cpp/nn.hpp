@@ -4,7 +4,8 @@
 // 包含所有核心模块，用户只需 #include "nn.hpp"
 //
 // 包含顺序按依赖关系排列：L0 → L1 → L2 → L3 → L4
-// 注意：algebra_matrix.hpp 已传递包含 algebra_span/ops/expr/compute.hpp，
+// 注意：algebra_span.hpp 由 algebra_matrix.hpp 传递包含；algebra_ops.hpp 由
+//       expr_dsl.hpp 引入（旧 algebra_expr/algebra_compute 已随逐元素算子移除），
 //       core_config.hpp 已传递包含 core_errors.hpp，
 //       此处显式列出所有头文件是为了清晰展示模块结构。
 //
@@ -50,25 +51,4 @@
 #include "domain_rla.hpp"
 #include "domain_cnn.hpp"
 #include "domain_tokenizer.hpp"
-
-namespace nn
-{
-    // one_hot 工具：将类别索引向量转为 one-hot 矩阵（列主序，每列一个样本）
-    [[nodiscard]] inline Result<Matrix> one_hot(const std::vector<std::size_t> &true_i, std::size_t mat_size)
-    {
-        const std::size_t batch_size = true_i.size();
-        Matrix result(mat_size, batch_size);
-
-        for (std::size_t i = 0; i < batch_size; ++i)
-        {
-            if (true_i[i] >= mat_size)
-            {
-                return std::unexpected(Error{"one_hot index out of range"});
-            }
-            result.set_value_unchecked(true_i[i], i, 1.0);
-        }
-
-        return result;
-    }
-} // namespace nn
 

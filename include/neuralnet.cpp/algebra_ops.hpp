@@ -83,35 +83,10 @@ struct Rsqrt
     static constexpr ExprOp op_id() noexcept { return ExprOp::Rsqrt; }
 };
 
-struct Sigmoid
-{
-    // ── 数值稳定实现：大正数直接返回 1，大负数返回 0，避免 exp 上溢 ──
-    // 原 1/(1+exp(-a)) 在 a 为大负数时 exp(-a) 会溢出为 inf → 结果为 0
-    // 但 NaN/Inf 可能传播；此处分支保证全区间有界且无 NaN。
-    [[nodiscard]] static Scalar apply(Scalar a) noexcept
-    {
-        if (a >= Scalar{0})
-        {
-            const Scalar z = std::exp(-a);
-            return Scalar{1} / (Scalar{1} + z);
-        }
-        else
-        {
-            const Scalar z = std::exp(a);
-            return z / (Scalar{1} + z);
-        }
-    }
-};
-
 struct Tanh
 {
     [[nodiscard]] static Scalar apply(Scalar a) noexcept { return std::tanh(a); }
     static constexpr ExprOp op_id() noexcept { return ExprOp::Tanh; }
-};
-
-struct ReLU
-{
-    [[nodiscard]] static constexpr Scalar apply(Scalar a) noexcept { return a > Scalar{0} ? a : Scalar{0}; }
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -171,4 +146,3 @@ struct Min
 };
 
 } // namespace nn::ops
-

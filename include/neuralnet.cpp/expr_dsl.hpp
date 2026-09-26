@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <concepts>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -57,9 +58,24 @@ inline bool env_flag(const char* name)
 #include "core_assert.hpp"
 #include "expr_spec.hpp"
 #include "expr_registry.hpp"
-#include "algebra_expr.hpp"   // nn::Expression / nn::BoolExpression 概念
 #include "algebra_ops.hpp"    // nn::ops（唯一算子来源，含 op_id()）
 #include "algebra_matrix.hpp" // Matrix
+
+// ── 表达式概念（原 algebra_expr.hpp；旧代数 AST 移除后归位到唯一使用者 DSL）──
+namespace nn
+{
+/// 表达式：可按索引求值为 Scalar 的类型（Span/ConstSpan 与所有 DSL 节点满足）
+template <typename T>
+concept Expression = requires(const T &t, std::size_t i) {
+    { t.eval(i) } -> std::convertible_to<Scalar>;
+};
+
+/// 布尔表达式：可按索引求值为 bool 的类型（用于条件选择 select）
+template <typename T>
+concept BoolExpression = requires(const T &t, std::size_t i) {
+    { t.eval(i) } -> std::convertible_to<bool>;
+};
+} // namespace nn
 
 namespace nn::dsl
 {
@@ -1334,7 +1350,7 @@ inline void eval_into_tensor_cpu(const E& e, Tensor& dst)
 //
 // 与 compute() 共用同一前端/同一 IR/同一 AOT 匹配，唯一差别是**输出落点**：
 // 结果直接写进调用方提供的 dst。用于把"原地更新"语义纳入 DSL（此前只能靠
-// 引擎的原地原语 add_inplace / scale_inplace / axpy_inplace / broadcast_*）：
+// 引擎的原地原语 add_inplace / scale_inplace 等）：
 //   dst += expr            → compute_into(eng, leaf(dst) + expr, dst)
 //   dst *= k               → compute_into(eng, leaf(dst) * rparam(k), dst)
 //   dst += k * other       → compute_into(eng, leaf(dst) + leaf(other) * rparam(k), dst)

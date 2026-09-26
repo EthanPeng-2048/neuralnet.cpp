@@ -23,7 +23,7 @@
 //   to_matrix/from_matrix 会打断 batch（flush 后自动重新 begin_batch）。
 //
 // 原地操作语义（2026-09 起已全部改为真原地，此前的 copy-on-write 描述已作废）：
-//   add_inplace / scale_inplace / axpy_inplace / broadcast_*_inplace 均直接写回
+//   add_inplace / scale_inplace 均直接写回
 //   A 自己的 buffer（逐元素 kernel 每线程只读写自己下标一次，read-before-write
 //   天然成立；同一 command buffer 内按录制顺序执行）。zero 用 vkCmdFillBuffer。
 //   目的：消除「分配新 buffer + 全量写出」在优化器/梯度累积路径上的分配风暴。
@@ -94,39 +94,6 @@ public:
         const std::string pd =
             " pending=" + std::to_string(backend_.pending_destroy_bytes() / (1024 * 1024)) + "MB";
         return "persist{" + p + "} transient{" + t + "}" + pd;
-    }
-
-    // ── 激活 offload（L1-offload）─────────────────────────────────────
-    // GPU 激活 → host-visible 存储（录制式，batch 内不提交；数据由 GPU 写、
-    // 仅作中转，主机不读）。返回封装 host-visible GpuBuffer 的 Tensor 句柄。
-    [[nodiscard]] Result<Tensor> offload_store(const Tensor& src) override
-    {
-        if (src.is_cpu())
-            return src;
-        const auto& g = src.gpu_tensor();
-        auto host = GpuTensor::create_host_visible_empty(g.rows(), g.cols(), backend_);
-        if (!host) return std::unexpected(host.error());
-        const VkDeviceSize size =
-            static_cast<VkDeviceSize>(g.rows() * g.cols() * sizeof(float));
-        auto r = backend_.copy_buffer_gpu(g.buffer().impl(), host->buffer().impl(), size);
-        if (!r) return std::unexpected(r.error());
-        return Tensor::from_gpu(std::move(*host));
-    }
-
-    // 从 host-visible 句柄复制回 GPU，恢复为 (rows, cols)（录制式）
-    [[nodiscard]] Result<Tensor> offload_load(
-        const Tensor& handle, std::size_t rows, std::size_t cols) override
-    {
-        if (handle.is_cpu())
-            return handle.reshape(rows, cols);
-        auto dst = GpuTensor::create_empty(rows, cols, backend_);
-        if (!dst) return std::unexpected(dst.error());
-        const VkDeviceSize size =
-            static_cast<VkDeviceSize>(rows * cols * sizeof(float));
-        auto r = backend_.copy_buffer_gpu(
-            handle.gpu_tensor().buffer().impl(), dst->buffer().impl(), size);
-        if (!r) return std::unexpected(r.error());
-        return Tensor::from_gpu(std::move(*dst));
     }
 
     // ── activation offload slab（持久复用缓冲） ───────────────────────
@@ -878,31 +845,6 @@ public:
         return {};
     }
 
-    // 融合 axpy：A += scalar * B（mode=3，单次 dispatch 替代 clone+scale+add 三步）
-    // 真原地，直接写回 A 的 buffer（与 CpuEngine 语义一致）
-    [[nodiscard]] Result<void> axpy_inplace(Tensor& A, Scalar scalar, const Tensor& B) override
-    {
-        if (A.rows() != B.rows() || A.cols() != B.cols())
-            return std::unexpected(Error{"axpy_inplace: shape mismatch"});
-
-        auto a_gpu = ensure_gpu(A);
-        if (!a_gpu) return std::unexpected(a_gpu.error());
-        auto b_gpu = ensure_gpu(B);
-        if (!b_gpu) return std::unexpected(b_gpu.error());
-
-        const uint32_t count = static_cast<uint32_t>(A.rows() * A.cols());
-        // AXPY 模式 (mode=3): out = A + scalar_b * B，原地写回 A
-        auto r = backend_.elementwise_v2_gpu(
-            a_gpu->gpu_tensor(), &b_gpu->gpu_tensor(), nullptr,
-            count, 3u, 0u, 0u, 0u, static_cast<float>(scalar), 0.0f, 0.0f,
-            &a_gpu->gpu_tensor());
-        if (!r)
-            return std::unexpected(r.error());
-        if (A.is_cpu())
-            A = std::move(*a_gpu);
-        return {};
-    }
-
     // A = 0：使用 vkCmdFillBuffer 真原地清零（不分配新 buffer）
     [[nodiscard]] Result<void> zero(Tensor& A) override
     {
@@ -1009,156 +951,11 @@ public:
         return Tensor::from_gpu(std::move(*r));
     }
 
-    [[nodiscard]] Result<Tensor> row_reduce_max(const Tensor& A, Precision = Precision::F32) override
-    {
-        auto a_gpu = ensure_gpu(A);
-        if (!a_gpu) return std::unexpected(a_gpu.error());
-        auto r = backend_.reduce_gpu(a_gpu->gpu_tensor(), 0u, 1u);  // row, max
-        if (!r) return std::unexpected(r.error());
-        return Tensor::from_gpu(std::move(*r));
-    }
-
     [[nodiscard]] Result<Tensor> col_reduce_max(const Tensor& A, Precision = Precision::F32) override
     {
         auto a_gpu = ensure_gpu(A);
         if (!a_gpu) return std::unexpected(a_gpu.error());
         auto r = backend_.reduce_gpu(a_gpu->gpu_tensor(), 1u, 1u);  // col, max
-        if (!r) return std::unexpected(r.error());
-        return Tensor::from_gpu(std::move(*r));
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 广播原语
-    // ══════════════════════════════════════════════════════════════════════
-
-    // A[r][c] = op(A[r][c], row_vec[r])：真原地，直接写回 A 的 buffer
-    [[nodiscard]] Result<void> broadcast_row_inplace(
-        Tensor& A, const Tensor& row_vec, BinaryOp op) override
-    {
-        auto a_gpu = ensure_gpu(A);
-        if (!a_gpu) return std::unexpected(a_gpu.error());
-        auto rv_gpu = ensure_gpu(row_vec);
-        if (!rv_gpu) return std::unexpected(rv_gpu.error());
-
-        auto r = backend_.broadcast_gpu(
-            a_gpu->gpu_tensor(), rv_gpu->gpu_tensor(),
-            0u, static_cast<uint32_t>(op),
-            &a_gpu->gpu_tensor());  // row_broadcast，原地写回 A
-        if (!r) return std::unexpected(r.error());
-        if (A.is_cpu())
-            A = std::move(*a_gpu);
-        return {};
-    }
-
-    // A[r][c] = op(A[r][c], col_vec[c])：真原地，直接写回 A 的 buffer
-    [[nodiscard]] Result<void> broadcast_col_inplace(
-        Tensor& A, const Tensor& col_vec, BinaryOp op) override
-    {
-        auto a_gpu = ensure_gpu(A);
-        if (!a_gpu) return std::unexpected(a_gpu.error());
-        auto cv_gpu = ensure_gpu(col_vec);
-        if (!cv_gpu) return std::unexpected(cv_gpu.error());
-
-        auto r = backend_.broadcast_gpu(
-            a_gpu->gpu_tensor(), cv_gpu->gpu_tensor(),
-            1u, static_cast<uint32_t>(op),
-            &a_gpu->gpu_tensor());  // col_broadcast，原地写回 A
-        if (!r) return std::unexpected(r.error());
-        if (A.is_cpu())
-            A = std::move(*a_gpu);
-        return {};
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 逐元素原语
-    // ══════════════════════════════════════════════════════════════════════
-
-    // out = unary_op(A)
-    [[nodiscard]] Result<Tensor> elementwise_unary(
-        UnaryOp op, const Tensor& A, Precision = Precision::F32) override
-    {
-        auto a_gpu = ensure_gpu(A);
-        if (!a_gpu) return std::unexpected(a_gpu.error());
-
-        const uint32_t count = static_cast<uint32_t>(A.rows() * A.cols());
-        auto r = backend_.elementwise_v2_gpu(
-            a_gpu->gpu_tensor(), nullptr, nullptr,
-            count, 0u, static_cast<uint32_t>(op), 0u, 0u,
-            0.0f, 0.0f, 0.0f);  // UNARY
-        if (!r) return std::unexpected(r.error());
-        return Tensor::from_gpu(std::move(*r));
-    }
-
-    // out = binary_op(A, B)
-    [[nodiscard]] Result<Tensor> elementwise_binary(
-        BinaryOp op, const Tensor& A, const Tensor& B,
-        Precision = Precision::F32) override
-    {
-        if (A.rows() != B.rows() || A.cols() != B.cols())
-            return std::unexpected(Error{"elementwise_binary: shape mismatch"});
-
-        auto a_gpu = ensure_gpu(A);
-        if (!a_gpu) return std::unexpected(a_gpu.error());
-        auto b_gpu = ensure_gpu(B);
-        if (!b_gpu) return std::unexpected(b_gpu.error());
-
-        const uint32_t count = static_cast<uint32_t>(A.rows() * A.cols());
-        auto r = backend_.elementwise_v2_gpu(
-            a_gpu->gpu_tensor(), &b_gpu->gpu_tensor(), nullptr,
-            count, 1u, static_cast<uint32_t>(op), 0u, 0u,
-            0.0f, 0.0f, 0.0f);  // BINARY
-        if (!r) return std::unexpected(r.error());
-        return Tensor::from_gpu(std::move(*r));
-    }
-
-    // out = binary_op(A, s) 或 binary_op(s, A)
-    [[nodiscard]] Result<Tensor> elementwise_binary_scalar(
-        BinaryOp op, const Tensor& A, Scalar s, bool scalar_first,
-        Precision = Precision::F32) override
-    {
-        auto a_gpu = ensure_gpu(A);
-        if (!a_gpu) return std::unexpected(a_gpu.error());
-
-        const uint32_t count = static_cast<uint32_t>(A.rows() * A.cols());
-        // flags: bit0 = B is scalar, bit3 = scalar first
-        const uint32_t flags = 1u | (scalar_first ? 8u : 0u);
-        auto r = backend_.elementwise_v2_gpu(
-            a_gpu->gpu_tensor(), nullptr, nullptr,
-            count, 1u, static_cast<uint32_t>(op), 0u, flags,
-            static_cast<float>(s), 0.0f, 0.0f);  // BINARY with scalar
-        if (!r) return std::unexpected(r.error());
-        return Tensor::from_gpu(std::move(*r));
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 条件选择原语
-    // ══════════════════════════════════════════════════════════════════════
-
-    // out = compare_op(A, scalar_b) ? then_t : scalar_else
-    [[nodiscard]] Result<Tensor> elementwise_select_scalar_cond(
-        CompareOp cmp, const Tensor& A, Scalar scalar_b,
-        const Tensor& then_t, Scalar scalar_else,
-        Precision = Precision::F32) override
-    {
-        if (A.rows() != then_t.rows() || A.cols() != then_t.cols())
-            return std::unexpected(Error{"elementwise_select: A and then shape mismatch"});
-
-        auto a_gpu = ensure_gpu(A);
-        if (!a_gpu) return std::unexpected(a_gpu.error());
-        auto t_gpu = ensure_gpu(then_t);
-        if (!t_gpu) return std::unexpected(t_gpu.error());
-
-        const uint32_t count = static_cast<uint32_t>(A.rows() * A.cols());
-        // SELECT mode:
-        //   b = scalar_b (flags bit0 = 1)
-        //   then_v = B[idx] = then_t (flags bit1 = 0, uses binding 1)
-        //   else_v = scalar_else (flags bit2 = 1)
-        const uint32_t flags = 1u | 4u;  // bit0: b is scalar, bit2: else is scalar
-        auto r = backend_.elementwise_v2_gpu(
-            a_gpu->gpu_tensor(), &t_gpu->gpu_tensor(), nullptr,
-            count, 2u, 0u, static_cast<uint32_t>(cmp), flags,
-            static_cast<float>(scalar_b), 0.0f,
-            static_cast<float>(scalar_else));  // SELECT
         if (!r) return std::unexpected(r.error());
         return Tensor::from_gpu(std::move(*r));
     }
@@ -1512,4 +1309,3 @@ private:
 } // namespace nn
 
 #endif // NN_HAS_VULKAN
-

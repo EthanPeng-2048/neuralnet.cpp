@@ -1820,6 +1820,10 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
             ? "(batch*cols + col)*mm_k + kk"
             : "(batch*mm_k + kk)*cols + col";
         L << "        const uint row_in_batch = row % m_per;\n";
+        // 列归约：batch 无顶层分解（idx 是列 tile）→ 按当前 row 就地分解；
+        // 行归约：顶层已有 batch（= idx/m_per），此处不重复声明（保持逐字节不变）
+        if (!is_row)
+            L << "        const uint batch = row / m_per;\n";
         L << "        float mm = 0.0;\n";
         L << "        for (uint kk = 0u; kk < mm_k; ++kk)\n";
         L << "            mm += " << rd(a_slot, a_idx) << " * " << rd(b_slot, b_idx) << ";\n";
@@ -1831,14 +1835,17 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
     // 行归约：工作组=单行，idx<rows 守卫。列归约：工作组=32 列 tile，
     // lane=列内偏移、warp=行块（col = idx*32 + l；越界列不早退、读写守卫）。
     L << (is_row ? "    if (idx >= rows) return;\n" : "");
-    // matmul+行归约（S7 batch）：idx 为全局行（batch*m_per + row），
-    // m_per = rows/mm_batch；列归约+matmul 组合不支持（注意力只用行归约）
+    // matmul+归约（S5/S7）：m_per = rows / mm_batch（形状参数，PC 填充）。
+    //   行归约：idx 是全局行（batch*m_per + 批内行）→ batch 在顶层一次性分解；
+    //   列归约：idx 是 32 列 tile、行在归约循环内逐个出现 → 顶层**不能**按 idx
+    //     分解 batch，由 emit_mm_decl 按当前 row 就地分解（batch = row/m_per），
+    //     归约循环遍历全部 rows（= batch*m_per，含所有 batch）——与 CPU 端
+    //     matmul_out（batch 切片堆叠的 (rows, N)）逐列 max/sum 语义一致。
     if (mm)
     {
-        if (!is_row)
-            return {};  // matmul+列归约：不支持（生成器保守放弃 → 上层报错）
         L << "    const uint m_per = rows / mm_batch;\n";
-        L << "    const uint batch = idx / m_per;\n";
+        if (is_row)
+            L << "    const uint batch = idx / m_per;\n";
     }
 
     // 归约结果索引：行=工作组单行（s_red[slot][0]）；列 tile=每线程一列（s_red[slot][tid]）
@@ -1868,7 +1875,10 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
         case static_cast<uint8_t>(ExprOperandKind::Col):
             return "float(col)";
         case static_cast<uint8_t>(ExprOperandKind::Batch):
-            return mm ? "float(batch)" : "0.0";
+            if (!mm)
+                return "0.0";
+            // 行归约读顶层 batch（idx 分解）；列归约按当前 row 就地分解
+            return is_row ? "float(batch)" : "float(row / m_per)";
         case static_cast<uint8_t>(ExprOperandKind::Input):
         {
             const ExprView& v = spec.views[op.idx];

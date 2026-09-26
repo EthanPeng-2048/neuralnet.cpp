@@ -15,8 +15,6 @@
 
 // ── swiglu_gradcheck ───────────────────────────────────────────────────────
 #define main test_swiglu_gradcheck
-#define dot dot_swiglu
-#define approx approx_swiglu
 #include "swiglu_gradcheck.cpp"
 #undef approx
 #undef dot
@@ -24,8 +22,6 @@
 
 // ── rmsnorm_gradcheck ──────────────────────────────────────────────────────
 #define main test_rmsnorm_gradcheck
-#define dot dot_rmsnorm
-#define approx approx_rmsnorm
 #include "rmsnorm_gradcheck.cpp"
 #undef approx
 #undef dot
@@ -33,8 +29,6 @@
 
 // ── softmax_gradcheck ──────────────────────────────────────────────────────
 #define main test_softmax_gradcheck
-#define dot dot_softmax
-#define approx approx_softmax
 #include "softmax_gradcheck.cpp"
 #undef approx
 #undef dot

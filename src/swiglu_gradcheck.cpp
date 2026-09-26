@@ -22,6 +22,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "test_common.hpp"
 
 using nn::Scalar;
 using nn::Matrix;
@@ -34,16 +35,6 @@ using nn::FeedForward;
 
 namespace {
 
-// L = Σ a*b（逐元素乘后求和）
-Scalar dot(const Matrix &a, const Matrix &b)
-{
-    Scalar s{0};
-    const auto sa = a.span();
-    const auto sb = b.span();
-    for (std::size_t i = 0; i < a.size(); ++i)
-        s += sa[i] * sb[i];
-    return s;
-}
 
 // 用当前参数前向，返回 L = Σ y*go
 Scalar eval_loss(ComputeEngine &engine, FeedForward &ff,
@@ -55,11 +46,6 @@ Scalar eval_loss(ComputeEngine &engine, FeedForward &ff,
     return dot(*y_m, *go_m);
 }
 
-bool approx(Scalar num, Scalar ana, Scalar tol)
-{
-    return std::fabs(num - ana) <=
-           tol * (Scalar{1} + std::fabs(num) + std::fabs(ana));
-}
 
 // 验证单个张量参数/输入的梯度（逐元素中心差分）
 //   fwd_input: 前向传播使用的输入。参数验证时传固定 x；输入梯度验证时

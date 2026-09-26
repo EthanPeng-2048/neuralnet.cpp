@@ -9,50 +9,34 @@
 // ── expr_dsl_test ──────────────────────────────────────────────────────────
 #define main test_expr_dsl
 #define g_fail g_fail_dsl
-#define make_tensor make_tensor_dsl
-#undef CHECK
 #include "expr_dsl_test.cpp"
-#undef make_tensor
 #undef g_fail
 #undef main
 
 // ── expr_reduce_test ───────────────────────────────────────────────────────
 #define main test_expr_reduce
 #define g_fail g_fail_reduce
-#define make_tensor make_tensor_reduce
-#define check_close check_close_reduce
 #define test_validation test_validation_reduce
-#undef CHECK
 #include "expr_reduce_test.cpp"
 #undef test_validation
-#undef check_close
-#undef make_tensor
 #undef g_fail
 #undef main
 
 // ── expr_matmul_test ───────────────────────────────────────────────────────
 #define main test_expr_matmul
 #define g_fail g_fail_matmul
-#define make_tensor make_tensor_matmul
-#define check_close check_close_matmul
 #define test_validation test_validation_matmul
-#undef CHECK
 #include "expr_matmul_test.cpp"
 #undef test_validation
-#undef check_close
-#undef make_tensor
 #undef g_fail
 #undef main
 
 // ── expr_opt_test ──────────────────────────────────────────────────────────
 #define main test_expr_opt
 #define g_fail g_fail_opt
-#define make_tensor make_tensor_opt
 #define test_determinism test_determinism_opt
-#undef CHECK
 #include "expr_opt_test.cpp"
 #undef test_determinism
-#undef make_tensor
 #undef g_fail
 #undef main
 

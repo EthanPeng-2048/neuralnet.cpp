@@ -17,19 +17,14 @@
 #include <vector>
 
 #include "neuralnet.cpp/nn.hpp"
+#define NN_TEST_COUNTER g_failures
+#include "test_common.hpp"
 
 namespace
 {
 
 int g_failures = 0;
 
-#define CHECK(cond, msg) \
-    do { \
-        if (!(cond)) { \
-            std::fprintf(stderr, "  FAIL %s:%d: %s\n", g_label, __LINE__, (msg)); \
-            ++g_failures; \
-        } \
-    } while (0)
 
 #define CHECK_NEAR(a, b, tol, msg) \
     do { \
@@ -95,13 +90,8 @@ void test_f32_zero_regression(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
     CHECK(ta && tb, "from_matrix");
     if (!ta || !tb) return;
 
-    // 逐元素 / 归约 / 搬运 三类代表原语：适配层必须逐字节等于内层引擎
-    auto ref_sum = raw.elementwise_binary(nn::BinaryOp::Add, *ta, *tb);
-    auto got_sum = eng.elementwise_binary(nn::BinaryOp::Add, *ta, *tb);
-    CHECK(ref_sum && got_sum, "elementwise_binary");
-    auto ref_scl = raw.elementwise_binary_scalar(nn::BinaryOp::Mul, *ta, 0.25f, false);
-    auto got_scl = eng.elementwise_binary_scalar(nn::BinaryOp::Mul, *ta, 0.25f, false);
-    CHECK(ref_scl && got_scl, "elementwise_binary_scalar");
+    // 归约 / 搬运 两类代表原语：适配层必须逐字节等于内层引擎
+    // （逐元素原语已整体移除；逐元素路径的 f32 零回归见 test_f32_zero_regression_dsl）
     auto ref_red = raw.col_reduce_sum(*ta);
     auto got_red = eng.col_reduce_sum(*ta);
     CHECK(ref_red && got_red, "col_reduce_sum");
@@ -109,9 +99,9 @@ void test_f32_zero_regression(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
     auto got_tr = eng.transpose(*ta);
     CHECK(ref_tr && got_tr, "transpose");
 
-    const nn::Tensor* refs[4] = {&*ref_sum, &*ref_scl, &*ref_red, &*ref_tr};
-    const nn::Tensor* gots[4] = {&*got_sum, &*got_scl, &*got_red, &*got_tr};
-    for (int k = 0; k < 4; ++k)
+    const nn::Tensor* refs[2] = {&*ref_red, &*ref_tr};
+    const nn::Tensor* gots[2] = {&*got_red, &*got_tr};
+    for (int k = 0; k < 2; ++k)
     {
         const nn::Matrix mr = read_f32(raw, *refs[k]);
         const nn::Matrix mg = read_f32(raw, *gots[k]);
@@ -347,18 +337,6 @@ void test_f16_reduce_matmul(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
             if (max_err >= 5e-3) std::fprintf(stderr, "    matmul max_err=%.3g\n", max_err);
         }
     }
-
-    // 逐元素原语 + 广播（f16 存储）
-    auto eu = eng.elementwise_unary(nn::UnaryOp::Tanh, *ta, nn::Precision::F16);
-    CHECK(eu && eu->precision() == nn::Precision::F16, "elementwise_unary f16");
-    auto eb = eng.elementwise_binary(nn::BinaryOp::Add, *ta, *ta, nn::Precision::F16);
-    CHECK(eb && eb->precision() == nn::Precision::F16, "elementwise_binary f16");
-    auto ebs = eng.elementwise_binary_scalar(nn::BinaryOp::Mul, *ta, 2.0f, false,
-                                             nn::Precision::F16);
-    CHECK(ebs && ebs->precision() == nn::Precision::F16, "elementwise_binary_scalar f16");
-    auto br = eng.broadcast_col_inplace(*ta, *cs, nn::BinaryOp::Add);
-    CHECK(br.has_value(), "broadcast_col_inplace(f16)");
-    CHECK(ta->precision() == nn::Precision::F16, "broadcast 后精度不变");
 }
 
 // ── 6. 端到端：全 f16 训练的 loss 下降 + 与 f32 对照 ─────────────────────
