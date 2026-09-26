@@ -453,7 +453,7 @@ public:
         VkDeviceSize max_contiguous_free = 0;  // 最大连续空闲块
         double fragmentation = 0.0;        // 1 - 最大连续空闲/总空闲
         VkDeviceSize device_bytes = 0;     // DEVICE_LOCAL 块（真实显存）
-        VkDeviceSize host_bytes = 0;       // HOST_VISIBLE 块（host RAM，offload 用）
+        VkDeviceSize host_bytes = 0;       // HOST_VISIBLE 块（host RAM，offload/staging 用）
 
         // 池账本计数器（诊断，见 MemoryPool::c_* 注释）
         std::size_t c_alloc_calls = 0;

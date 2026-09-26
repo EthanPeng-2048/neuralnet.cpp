@@ -141,9 +141,6 @@ engine.end_batch();  // 提交并等待
 // 就地缩放
 [[nodiscard]] virtual Result<void> scale_inplace(Tensor& A, Scalar s) = 0;
 
-// 融合 axpy: A += scalar * B
-[[nodiscard]] virtual Result<void> axpy_inplace(Tensor& A, Scalar scalar, const Tensor& B) = 0;
-
 // 置零
 [[nodiscard]] virtual Result<void> zero(Tensor& A) = 0;
 ```
@@ -171,58 +168,30 @@ engine.end_batch();  // 提交并等待
 // 按列求和: (rows, cols) → (1, cols)
 [[nodiscard]] virtual Result<Tensor> col_reduce_sum(const Tensor& A) = 0;
 
-// 按行求最大值: (rows, cols) → (rows, 1)
-[[nodiscard]] virtual Result<Tensor> row_reduce_max(const Tensor& A) = 0;
-
 // 按列求最大值: (rows, cols) → (1, cols)
 [[nodiscard]] virtual Result<Tensor> col_reduce_max(const Tensor& A) = 0;
 ```
 
-### 6. 广播原语
+> ⚠️ **2026-09 收敛**：`row_reduce_max`（引擎算子）已删除——按行求最大走 DSL 归约叶子
+> `dsl::row_reduce_max(...)`（详见 `expr_dsl.hpp`；AGENTS §4.3 有完整删除清单）。
+
+### 6. 广播 / 逐元素 / 条件选择原语（2026-09 已整体删除）
+
+`broadcast_row_inplace`、`broadcast_col_inplace`、`elementwise_unary`、`elementwise_binary`、
+`elementwise_binary_scalar`、`elementwise_select_scalar_cond`（连同 `UnaryOp`/`BinaryOp`/`CompareOp` 枚举）
+**已全部删除**。逐元素运算、广播与条件选择一律用表达式 DSL 表达（单 kernel、无中间张量）：
 
 ```cpp
-// 按行广播: A (R, C) op= row_vec (R, 1)
-[[nodiscard]] virtual Result<void> broadcast_row_inplace(
-    Tensor& A, const Tensor& row_vec, BinaryOp op) = 0;
-
-// 按列广播: A (R, C) op= col_vec (1, C)
-[[nodiscard]] virtual Result<void> broadcast_col_inplace(
-    Tensor& A, const Tensor& col_vec, BinaryOp op) = 0;
+auto y  = dsl::compute(engine, dsl::exp(dsl::leaf(*a)), a->rows(), a->cols());          // 一元
+auto z  = dsl::compute(engine, dsl::leaf(*a) + dsl::leaf(*b), a->rows(), a->cols());   // 二元
+auto w  = dsl::compute_into(engine, dsl::leaf(*a) * dsl::rparam(0.1f), *a);            // 原地+标量
+auto rg = dsl::compute(engine,                                                          // 条件选择
+    dsl::select(dsl::leaf(*x) > Scalar{0}, dsl::leaf(*g), dsl::rparam(0)),
+    x->rows(), x->cols());
 ```
 
-### 7. 逐元素原语
-
-```cpp
-// 一元运算: out = unary_op(A)
-[[nodiscard]] virtual Result<Tensor> elementwise_unary(
-    UnaryOp op, const Tensor& A) = 0;
-
-// 二元运算: out = binary_op(A, B)
-[[nodiscard]] virtual Result<Tensor> elementwise_binary(
-    BinaryOp op, const Tensor& A, const Tensor& B) = 0;
-
-// 标量二元运算: out = op(A, scalar) 或 op(scalar, A)
-[[nodiscard]] virtual Result<Tensor> elementwise_binary_scalar(
-    BinaryOp op, const Tensor& A, Scalar s, bool scalar_first = false) = 0;
-```
-
-**支持的运算**：
-
-| 类型 | 运算 |
-|------|------|
-| UnaryOp | Neg, Exp, Log, Sqrt, Rsqrt, Abs, Tanh |
-| BinaryOp | Add, Sub, Mul, Div, Max, Min |
-
-### 8. 条件选择原语
-
-```cpp
-// out = compare_op(A, scalar_b) ? then_t : scalar_else
-[[nodiscard]] virtual Result<Tensor> elementwise_select_scalar_cond(
-    CompareOp cmp, const Tensor& A, Scalar scalar_b,
-    const Tensor& then_t, Scalar scalar_else) = 0;
-```
-
-**典型用途**：ReLU 反向 `(x > 0) ? grad : 0`
+> 为什么删？这些算子在 DSL 落地后已无生产调用方，且与表达式能力完全重复（详见
+> `development/12-compute-engine-inventory.md` 顶部收敛横幅与 `13-refactor-backlog.md` §9）。
 
 ### 9. 数据操作原语
 
@@ -696,10 +665,11 @@ TEST_CASE("linear_gradcheck") {
 
 ### 3. 性能测试
 
-使用 `perf_smoke.cpp` 验证性能：
+使用 `layer_bench`（`src/layer_bench.cpp`）验证性能：
 
 ```bash
-./build/perf_smoke --matmul 1024
+# 单算子（默认 CPU，--gpu 走 Vulkan）；调参前务必 --warmup 等时钟爬坡（见 AGENTS §12）
+./build/layer_bench --op matmul --m 1024 --n 1024 --k 1024 --warmup 20
 ```
 
 ### 4. GPU 特定测试
@@ -740,7 +710,7 @@ TEST_CASE("linear_gradcheck") {
 1. 使用 `matmul_tiled` shader（分块优化）
 2. 调整 `BLOCK_SIZE`（缓存分块大小）
 3. 使用 `batched_matmul`（批量运算）
-4. 启用 `SmartPolicy`（自适应并行）
+4. 启用 `自适应并行`（自适应并行）
 
 ### Q5: 为什么 `begin_batch/end_batch` 在 CPU 上是 no-op？
 

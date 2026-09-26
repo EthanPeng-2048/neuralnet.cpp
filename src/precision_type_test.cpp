@@ -17,19 +17,14 @@
 #include <string>
 
 #include "neuralnet.cpp/precision.hpp"
+#define NN_TEST_COUNTER g_failures
+#include "test_common.hpp"
 
 namespace
 {
 
 int g_failures = 0;
 
-#define CHECK(cond, msg) \
-    do { \
-        if (!(cond)) { \
-            std::fprintf(stderr, "  FAIL line %d: %s\n", __LINE__, (msg)); \
-            ++g_failures; \
-        } \
-    } while (0)
 
 // f16 位型 → f32（测试内独立引用实现，不复用被测代码）
 float ref_half_to_float(std::uint16_t h)

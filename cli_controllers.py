@@ -864,7 +864,8 @@ class GptTrainController(CLIController):
         if "checkpoint_every" in kwargs:
             args.extend(["--checkpoint-every", self._format_arg_value(kwargs["checkpoint_every"])])
 
-        # activation offload（L1-offload）：把激活搬 host-visible（与 checkpoint 互斥）
+        # activation offload（L1-offload）：把激活搬 host-visible
+        # （可与 checkpoint 混合：checkpoint 块重算、其余块 offload；仅 GPU 有效）
         if kwargs.get("activation_offload", False):
             args.append("--activation-offload")
 

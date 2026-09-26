@@ -325,7 +325,8 @@ void print_usage(const char *prog)
         << "    (激活重计算，默认: 0=不启用)。1=每块都重算，显存收益最大，\n"
         << "    以约 1 次额外前向 FLOPs 为代价省去整层激活驻留。\n"
         << "  --activation-offload  把每块激活搬 host-visible，backward 拷回\n"
-        << "    (不重算，FLOPs 保持 1.0×，代价是 PCIe 传输；与 --checkpoint-every 互斥)\n"
+        << "    (不重算，FLOPs 保持 1.0×，代价是 PCIe 传输；可与 --checkpoint-every\n"
+        << "     混合使用：checkpoint 块重算、其余块 offload；仅 GPU 有效)\n"
         << "  GPU 训练每 step 末尾自动归还完全空闲的内存池底材（L2 整块释放）。\n"
         << "\n"
         << "学习率调度:\n"
@@ -727,20 +728,6 @@ TrainConfig parse_args(int argc, char *argv[])
     return cfg;
 }
 
-// ==================== One-Hot 编码 ====================
-nn::Matrix one_hot_labels(const std::vector<std::size_t> &tokens, std::size_t vocab_size)
-{
-    const std::size_t n = tokens.size();
-    nn::Matrix result(vocab_size, n);
-    result.zero();
-    for (std::size_t i = 0; i < n; ++i)
-    {
-        if (tokens[i] < vocab_size)
-            result.set_value_unchecked(tokens[i], i, 1.0);
-    }
-    return result;
-}
-
 // ==================== 梯度统计 ====================
 // 计算并打印全局梯度统计：L2 范数、绝对值最大值、均值。
 // GPU 模式下自动通过 engine.to_matrix() 下载张量到 CPU。
@@ -1073,12 +1060,24 @@ int main(int argc, char *argv[])
     // 兼顾：checkpoint 块省显存但 FLOPs 2×；offload 块省显存但 PCIe 开销。
     if (cfg.activation_offload)
     {
-        model.set_activation_offload(true);
-        std::cout << "activation offload 已启用: 每块激活搬 host-visible，backward 拷回（不重算）\n";
-        if (cfg.checkpoint_every > 0)
-            std::cout << "  （混合模式）与 checkpoint 共存：checkpoint 块重算，其余块 offload\n";
-        std::cout << "  理论 offload RAM: " << (model.offload_ram_bytes() / (1024*1024))
-                  << " MB（实际含驱动/对齐可能更高）\n";
+        if (!cfg.gpu_enabled)
+        {
+            // CPU 引擎的 offload 原语是 no-op（restore 返回 1×1），启用只会毒化 backward
+            std::cout << "[警告] --activation-offload 在 CPU 引擎上无效（no-op），已忽略。\n";
+        }
+        else if (cfg.model_type == "zipt")
+        {
+            // ZiPT 未接线 set_activation_offload（无 override）→ 静默 no-op，必须明说
+            std::cout << "[警告] ZiPT 未接线 activation offload（无 setter override），已忽略。\n";
+        }
+        else
+        {
+            model.set_activation_offload(true);
+            std::cout << "activation offload 已启用: 每块激活搬 host-visible，backward 拷回（不重算）\n";
+            if (cfg.checkpoint_every > 0)
+                std::cout << "  （混合模式）与 checkpoint 共存：checkpoint 块重算，其余块 offload\n";
+            std::cout << "  offload slab 在首次 forward 时按激活形状分配（RAM ≈ 激活实际体积）\n";
+        }
     }
 
     // ── 构建规格（用于保存） ─────────────────────────────────

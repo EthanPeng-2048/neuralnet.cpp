@@ -15,7 +15,7 @@
 | **架构** | 分层引擎化 | 一次编写 Layer，CPU/GPU 零修改双跑 |
 | **架构** | 铁律式职责划分 | 算法留 Layer、原语进引擎、Shader 是内部实现 |
 | **编译** | AOT 闭合世界表达系统 | 表达式文本唯一、构建期扫描生成、运行时按 key 精确分发 |
-| **性能** | SmartPolicy + 零分配线程池 | 自适应并行、消除每次任务的堆分配 |
+| **性能** | 自适应并行 + 零分配线程池 | 自适应并行、消除每次任务的堆分配 |
 | **性能** | 表达式模板零临时矩阵 | `a + b * c` 不物化中间结果 |
 | **显存** | 结构融合（而非手写 kernel） | 三粒度融合：逐元素链 / matmul+归约 / fold 流式注意力 |
 | **显存** | fold 单遍流式注意力 + 反向重算 | 不物化 `O(seq²)` 分数矩阵（原两趟式已演进） |
@@ -232,7 +232,7 @@ canonicalize 不改变 views/inputs 的顺序与内容，只优化 instrs/consts
 
 ## 8. CPU 性能优化（L1/L2 层）
 
-### 8.1 SmartPolicy 自适应并行
+### 8.1 自适应并行
 根据数据规模自动决定串行/并行，避免小数据量时线程调度开销（约 50~200μs）大于计算收益。实测在 ~512K 元素处首次稳定 >1.5x，此前串行更优。
 
 ### 8.2 线程池 latch 零分配
@@ -242,7 +242,7 @@ canonicalize 不改变 views/inputs 的顺序与内容，只优化 instrs/consts
 `BLOCK_SIZE=64`（64×64×4B=16KB 装入 L1），B 块预取转置，b_block 栈分配零堆分配。
 
 ### 8.4 算子融合（原语级）
-- 单算子级融合原语（`axpy_inplace` = `clone+scale+add` 三步并一步、`elementwise_select_scalar_cond` = 条件选择）——**现均为接口保留、无生产调用方**，这类融合已升级为下一条的表达式级融合。
+- 单算子级融合原语（`axpy_inplace` = `clone+scale+add` 三步并一步、`elementwise_select_scalar_cond` = 条件选择）——**2026-09 已随算子收敛整体删除**：这类融合升级为下一条的表达式级融合（`dsl::compute_into` / `dsl::select`）。
 - **表达式级融合（当前主力）**：`dsl::compute` 把整条链折叠为单个 kernel（见 §3）。
 - 多头注意力**批量化**：fold 单 kernel 按 `batch*H` 网格一次 dispatch 处理所有样本与头（历史：`rearrange_3d → 单次 batched_matmul → 转回` 把 H 次融为 1 次，该结构现仅存于 backward）。
 - 因果掩码物化缓存**已随 fold 迁移删除**（掩码在 fold body 内以 select 链表达、绝不物化）；位置编码缓存保留：相同 `(batch,seq)` 只构造一次。
@@ -330,7 +330,7 @@ Softmax 行和为 1 的归一化本质，使模型天然获得 `M` 个"注意力
 | 稀疏 CE | 全 softmax `(vocab×seq)` 物化 → 仅标签 gather |
 | 算子融合 + 显存体系 | GPT 训练峰值 ~29GB → ~27GB（并持续下探） |
 | IR CSE + 寄存器分配 | 消除"手工拆表达式"，`num_regs` 受控在 16 内 |
-| SmartPolicy | 小矩阵 0.3x 退化 → 串行；大矩阵最高 ~7.8x 加速 |
+| 自适应并行 | 小矩阵 0.3x 退化 → 串行；大矩阵最高 ~7.8x 加速 |
 | 融合 axpy | 每 step 减少 ~600 次 GPU buffer 分配 |
 | 注意力批量化 | H 次 matmul → 1 次 batched_matmul（现为 fold 单 kernel 单 dispatch） |
 

@@ -175,7 +175,7 @@ CSE 需处理 `Input/Const/Reduce` 操作数的等价性（视图相同 + 输入
 
 ## 后端 emitter 抽象（阶段 D）
 
-把 `glsl_gen.hpp` 的 GLSL 专用生成抽象为 emitter 接口（`expr_emitter.hpp`）：
+把 `expr_glsl_gen.hpp` 的 GLSL 专用生成抽象为 emitter 接口（`expr_emitter.hpp`）：
 
 ```
 IR → GlslEmitter（当前唯一注册后端）

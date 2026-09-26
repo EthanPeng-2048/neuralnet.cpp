@@ -23,6 +23,7 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include "test_common.hpp"
 
 using nn::Scalar;
 using nn::Matrix;
@@ -37,16 +38,6 @@ using nn::NormType;
 
 namespace {
 
-// L = Σ a*b（逐元素乘后求和）
-Scalar dot(const Matrix& a, const Matrix& b)
-{
-    Scalar s{0};
-    const auto sa = a.span();
-    const auto sb = b.span();
-    for (std::size_t i = 0; i < a.size(); ++i)
-        s += sa[i] * sb[i];
-    return s;
-}
 
 // 用当前参数前向，返回 L = Σ logits*go
 Scalar eval_loss(ComputeEngine& engine, GPTModel& model,
@@ -59,11 +50,6 @@ Scalar eval_loss(ComputeEngine& engine, GPTModel& model,
     return dot(*y_m, *go_m);
 }
 
-bool approx(Scalar num, Scalar ana, Scalar tol)
-{
-    return std::fabs(num - ana) <=
-           tol * (Scalar{1} + std::fabs(num) + std::fabs(ana));
-}
 
 // 验证单个参数张量梯度（逐元素中心差分）
 bool check_grad_tensor(

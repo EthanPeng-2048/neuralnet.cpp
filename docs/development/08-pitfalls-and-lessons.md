@@ -102,7 +102,7 @@
 
 ### 3.6 除零/越界防护缺失（2026-08-14 code review 批量发现）
 
-- `steps=0`（mnist_train/text_train）、`--topk>10`、tokenizer_infer 空输入、`--iters 0`、`evaluate_mnist` 空数据集、`mnist_io.hpp` 末行无换行符丢样本、SGF 坐标跳 i/嵌套括号。
+- `steps=0`（mnist_train/text_train）、`--topk>10`、tokenizer_infer 空输入、`--iters 0`、`evaluate_mnist` 空数据集、`cli/cli_mnist_io.hpp` 末行无换行符丢样本、SGF 坐标跳 i/嵌套括号。
 - **教训**：CLI 入口的参数防护是一次性成本，review 时逐参数过一遍。
 
 ### 3.7 CNN 全量评估撑爆显存（2026-09-20，已修复）
@@ -339,8 +339,8 @@ GPU-resident 单算子对、链式错；attn batch=1 对、batch=2 错；gradche
 
 ### 添加新引擎原语（最高成本操作，5 处）
 - [ ] `compute_engine.hpp` 接口 + 文档注释（shape/转置语义）
-- [ ] `cpu_engine.hpp` 实现（注意 AVX2 可向量化，不要退化成裸指针循环）
-- [ ] Vulkan：shader + SPIR-V 嵌入 + `vk_backend.hpp` 管线
+- [ ] `compute_cpu_engine.hpp` 实现（注意 AVX2 可向量化，不要退化成裸指针循环）
+- [ ] Vulkan：shader + SPIR-V 嵌入 + `backend/compute_vk_backend.hpp` 管线
 - [ ] gradcheck / 一致性测试（forward+backward，CPU/GPU 双后端对比）
 - [ ] 检查缓存 key（强哈希）、batch 模式生命周期（pending_destroys）
 

@@ -22,7 +22,6 @@
 #include "core_threadpool.hpp"
 #include "core_config.hpp"
 #include "algebra_span.hpp"
-#include "algebra_compute.hpp"
 
 // GPU 加速支持（可选，由 CMake 的 NN_HAS_VULKAN 宏控制）
 #ifdef NN_HAS_VULKAN
@@ -683,25 +682,6 @@ namespace nn
                                        b.span(), K, b.cols());
         }
 
-        // ── 累加矩阵乘法（A * B^T，结果累加到 result） ─────────────
-        // 计算 result += this * B^T
-        // 用于梯度累加：grad_w += grad_output * input^T
-        void multiply_transposed_add_to(MatrixT &result, const MatrixT &b_trans) const
-        {
-            NN_ASSERT(&result != this && &result != &b_trans, "multiply_transposed_add_to: self-referencing");
-            NN_ASSERT(cols_ == b_trans.cols_, "multiply_transposed_add_to: inner dimensions mismatch");
-            NN_ASSERT(result.rows() == rows_ && result.cols() == b_trans.rows_, "multiply_transposed_add_to: result shape mismatch");
-            const std::size_t M = rows_;
-            const std::size_t K = cols_;
-            const std::size_t N = b_trans.rows_;
-            if (M == 0 || N == 0 || K == 0) return;
-
-            // span 内核本身就是"累加到 r"的语义（不清零）→ 语义完全一致，
-            // 直接委托。注意：本方法全库无调用者（死代码），一并消除第三份重复内核。
-            multiply_transposed_to_span(result.span(), M, N, span(), M, K,
-                                        b_trans.span(), N, K);
-        }
-
         void scale_inplace(Scalar scalar) noexcept
         {
             auto s = span();
@@ -877,56 +857,6 @@ namespace nn
             return result;
         }
 
-        // ── 按行广播（通用数学原语，不是算法） ──────────────────────────
-        // this[r][c] = op(this[r][c], row_vec[r][0])，row_vec 形状必须为 (rows_, 1)
-        // 上层可基于此表达 softmax 减行最大值、除行求和等算法。
-        template <typename F>
-        void broadcast_row_inplace(const MatrixT& row_vec, F&& op)
-        {
-            NN_ASSERT(row_vec.rows_ == rows_ && row_vec.cols_ == 1, "row_vec shape mismatch");
-            const auto v = row_vec.span();
-            const std::size_t R = rows_;
-            const std::size_t C = cols_;
-            auto d = span();
-            // 按行处理：v[r] 每行只取一次（替代逐元素 i/C 除法），行内连续访问可向量化。
-            // 并行阈值与旧实现一致（元素数 >= PARALLEL_THRESHOLD），仅并行粒度由元素改为行。
-            auto process_row = [&d, &v, C, op = std::forward<F>(op)](std::size_t r) noexcept {
-                const element vr = v[r];
-                auto row = d.subspan(r * C, C);
-                for (std::size_t c = 0; c < C; ++c)
-                    row[c] = static_cast<element>(op(row[c], vr));
-            };
-            if (R * C >= PARALLEL_THRESHOLD && R > 1)
-                nn::parallel_for_samples(R, process_row);
-            else
-                for (std::size_t r = 0; r < R; ++r)
-                    process_row(r);
-        }
-
-        // ── 按列广播（通用数学原语，不是算法） ──────────────────────────
-        // this[r][c] = op(this[r][c], col_vec[0][c])，col_vec 形状必须为 (1, cols_)
-        // 上层可基于此表达 LayerNorm 减列均值、乘列标准差等算法。
-        template <typename F>
-        void broadcast_col_inplace(const MatrixT& col_vec, F&& op)
-        {
-            NN_ASSERT(col_vec.rows_ == 1 && col_vec.cols_ == cols_, "col_vec shape mismatch");
-            const auto v = col_vec.span();
-            const std::size_t R = rows_;
-            const std::size_t C = cols_;
-            auto d = span();
-            // 按行处理：行内直接用 v[c]（替代逐元素 i%C 取模），行内连续访问可向量化。
-            // 并行阈值与旧实现一致（元素数 >= PARALLEL_THRESHOLD），仅并行粒度由元素改为行。
-            auto process_row = [&d, &v, C, op = std::forward<F>(op)](std::size_t r) noexcept {
-                auto row = d.subspan(r * C, C);
-                for (std::size_t c = 0; c < C; ++c)
-                    row[c] = static_cast<element>(op(row[c], v[c]));
-            };
-            if (R * C >= PARALLEL_THRESHOLD && R > 1)
-                nn::parallel_for_samples(R, process_row);
-            else
-                for (std::size_t r = 0; r < R; ++r)
-                    process_row(r);
-        }
     };
 
     // ── 便捷类型别名 ────────────────────────────────────────────────────
@@ -934,61 +864,9 @@ namespace nn
     using MatrixF32 = MatrixT<Precision::F32>;
     using MatrixF16 = MatrixT<Precision::F16>;
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // detail 命名空间：逐元素变换的自由函数（原 Matrix 成员方法）
-    //
-    // 这些函数仅是 nn::transform 的薄包装，放在 detail 命名空间而非 Matrix 类内，
-    // 避免 Matrix 接口膨胀。compute_bench 等基准测试直接调用。
-    // ═══════════════════════════════════════════════════════════════════════
-    namespace detail
-    {
-        // ── 逐元素一元变换（返回新矩阵） ────────────────────────────────
-        // out[i] = func(in[i])，内部自动选择串行/并行。
-        template <Precision P, typename F>
-        [[nodiscard]] MatrixT<P> apply(const MatrixT<P>& mat, F&& func)
-        {
-            MatrixT<P> result(mat.rows(), mat.cols());
-            auto s = mat.span();
-            auto r = result.span();
-            nn::transform(s.begin(), s.end(),
-                           r.begin(), std::forward<F>(func));
-            return result;
-        }
-
-        // ── 逐元素二元变换（返回新矩阵） ────────────────────────────────
-        // out[i] = func(a[i], b[i])
-        template <Precision P, typename F>
-        [[nodiscard]] MatrixT<P> binary_apply(const MatrixT<P>& a, const MatrixT<P>& b, F&& func)
-        {
-            NN_ASSERT(a.rows() == b.rows() && a.cols() == b.cols(),
-                       "binary_apply dimension mismatch");
-            MatrixT<P> result(a.rows(), a.cols());
-            auto s = a.span();
-            auto o = b.span();
-            auto r = result.span();
-            nn::transform(s.begin(), s.end(),
-                           o.begin(), r.begin(),
-                           std::forward<F>(func));
-            return result;
-        }
-
-        // ── 逐元素二元变换（就地修改） ──────────────────────────────────
-        template <Precision P, typename F>
-        void binary_apply_inplace(MatrixT<P>& a, const MatrixT<P>& b, F&& func)
-        {
-            NN_ASSERT(a.rows() == b.rows() && a.cols() == b.cols(),
-                       "binary_apply_inplace dimension mismatch");
-            auto s = a.span();
-            auto o = b.span();
-            nn::transform(s.begin(), s.end(),
-                           o.begin(), s.begin(),
-                           std::forward<F>(func));
-        }
-    } // namespace detail
 } // namespace nn
 
 // ── GpuTensor 方法实现（需要 Matrix 和 GpuBackend 的完整定义）──────────
 #ifdef NN_HAS_VULKAN
 #include "backend/compute_gpu_tensor_impl.hpp"
 #endif
-

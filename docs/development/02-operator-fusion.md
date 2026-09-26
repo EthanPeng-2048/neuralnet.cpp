@@ -235,8 +235,8 @@ Backward **现状（P-C2-7）**：`recompute_W_` 两步重算 W——① `S = ma
 
 | 后端 | 文件 | 实现 |
 |------|------|------|
-| CPU | `cpu_engine.hpp` | `eval_expr` 扩展归约语义与 matmul 段（matmul 预计算 + 逐元素链，`eval_expr_reduce` 经归约指令消费 matmul 输出）；`dsl::compute` 的纯逐元素路径走编译期模板内联 |
-| GPU (Vulkan) | `gpu_engine.hpp` + `shaders/*.comp` + `vk_backend.hpp` | `eval_expr` 查 `fused_registry`；`glsl_gen` 生成归约 / fold（分块流式）/ matmul 结构 shader |
+| CPU | `compute_cpu_engine.hpp` | `eval_expr` 扩展归约语义与 matmul 段（matmul 预计算 + 逐元素链，`eval_expr_reduce` 经归约指令消费 matmul 输出）；`dsl::compute` 的纯逐元素路径走编译期模板内联 |
+| GPU (Vulkan) | `compute_gpu_engine.hpp` + `shaders/*.comp` + `backend/compute_vk_backend.hpp` | `eval_expr` 查 `fused_registry`；`glsl_gen` 生成归约 / fold（分块流式）/ matmul 结构 shader |
 
 > 注：CUDA 后端已停用（v1.0.0），此处不再列为后端。
 
@@ -300,7 +300,7 @@ IR-C 一起**于 2026-09-19 删除**（见 §表达式录制与融合边界（�
 
 | 阶段 | 内容 | 交付物 / 验证 |
 |------|------|----------------|
-| **S1 IR 地基** | `ExprSpec` 增加 `MatmulSpec` + `ExprOperandKind::Matmul`；`validate_expr_spec`/`expr_spec_key`/`expr_spec_reduce_axis` 兼容 matmul 段；key 与形状无关（`k` 不进 key，`transA/transB/a_input/b_input` 进 key） | 构建通过；`expr_spec_test`/`expr_opt_test` 回归绿 |
+| **S1 IR 地基** | `ExprSpec` 增加 `MatmulSpec` + `ExprOperandKind::Matmul`；`validate_expr_spec`/`expr_spec_key`/`expr_spec_reduce_axis` 兼容 matmul 段；key 与形状无关（`k` 不进 key，`transA/transB/a_input/b_input` 进 key） | 构建通过；`expr_spec_test`/`expr_opt_test` 回归绿（这两个子测试后并入聚合目标 `expr_cpu_test`，独立名不再存在） |
 | **S2 CPU 正确性** | `CpuEngine::eval_expr` 支持 matmul 段（matmul 预计算 + 逐元素链，`eval_expr_reduce` 经归约指令消费 matmul 输出） | 新增 `expr_matmul_test`：`matmul+bias` 融合 vs 参考；CPU err=0 |
 | **S3 GLSL 生成** | `generate_glsl_matmul`（共享内存分块 + vec4）；`gen_fused`/`scan_exprs`/`run_fused_gpu` 接入 | `fused_gpu_test` matmul 融合用例（GPU vs CPU）；AOT 命中 |
 | **S4 Layer 迁移（线性）** | `Linear`/`FeedForward` 的 `matmul+bias+activation` 改走 `dsl::compute`（含 matmul 段） | `gpt_gradcheck` / MNIST/GPT 训练回归 |
@@ -318,7 +318,7 @@ IR-C 一起**于 2026-09-19 删除**（见 §表达式录制与融合边界（�
 2. **BatchCol 视图要求 `(1, BH*seq)`**（doc_ids 按 (b,h) 块重复），`(1, batch*seq)` 会越界。
 3. **RowGather 主输入行数≠网格行数**（loss_vec 在 (1,N) 读 (C,N) logits），校验只查 cols。
 4. `gen_fused` `emit_spec` 的 ±inf 常量必须用 `numeric_limits`。
-5. matmul + 列归约不支持（gen_fused 跳过）。
+5. ~~matmul + 列归约不支持（gen_fused 跳过）~~ **已补齐（2026-09-26）**：`generate_glsl_reduce` 列归约分支按元素分解 batch（`batch = row/m_per`，列归约遍历全部 `rows = batch*m_per` 行，与 CPU `matmul_out` 逐列归约语义一致），`gen_fused` 三处跳过删除（74 条 spec 全生成）；`expr_cpu_test::col_max(matmul)`（独立标量参考，batch=2）+ `expr_gpu_test::col_max(matmul)` 广播/归约向量/batch=2 对拍锁死（err≈1e-7）。
 6. **PS 删大文件段行号易漂移**、`-replace` 多行静默失败——先 read 再 edit，删前 `git diff` 核对。
 7. `dispatch_compute` 误删后从调用点重建。
 8. **IR 扩展**：MatmulSpec.batch（不进 key，dispatch z）、Row/Col/Batch 操作数(6/7/8)、RowGather(9)/BatchMod(10)/BatchCol(11)；注意力 forward 现为单 fold kernel（`FoldSpec`，5 掩码变体经 `fold_mask_variant_`），bwd=R/X 表达式+3 个 `batched_matmul`（m/l/W 表达式+bm(W,V_t) 的 S7 forward 结构已删）；CE 稠密 `denom=col_sum(exp(logits-cb(col_max)))`，稀疏 grad/loss_vec 用 Row+RowGather。
@@ -339,6 +339,10 @@ IR-C 一起**于 2026-09-19 删除**（见 §表达式录制与融合边界（�
 | M5 ✅ | CrossEntropyLoss 稀疏融合（不物化全 softmax） | `ce_fusion_test`（CPU err=0 / GPU err≤4.8e-7） |
 | M6 ✅ | Attention 两趟式（forward + 反向重算 W，不物化 `(BH·seq, seq)`） | `matmul_fusion_test` 扩展（8 用例）+ gradcheck + 训练 |
 | M7 ✅ | 文档与 `10-development-standards.md` 补"原语可专、不叫算法名"约定 | 全套测试 |
+
+> 注：表内测试名是**当时的目标名**——`matmul_fusion_test` 现已无同名目标（用例在 `expr_cpu_test` / `expr_gpu_test` 聚合目标内），
+> `expr_dsl_test`/`expr_reduce_test`/`expr_matmul_test`/`expr_opt_test` 已并入 `expr_cpu_test`，
+> `fused_gpu_test`/`tensor_expr_test` 已并入 `expr_gpu_test`。
 
 ### 一期关键实施细节与坑
 

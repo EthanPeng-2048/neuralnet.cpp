@@ -12,19 +12,15 @@
 #include "neuralnet.cpp/precision.hpp"
 #include "neuralnet.cpp/compute_tensor.hpp"
 #include "neuralnet.cpp/compute_cpu_engine.hpp"
+#include "neuralnet.cpp/expr_dsl.hpp"
+#define NN_TEST_COUNTER g_failures
+#include "test_common.hpp"
 
 namespace
 {
 
 int g_failures = 0;
 
-#define CHECK(cond, msg) \
-    do { \
-        if (!(cond)) { \
-            std::fprintf(stderr, "  FAIL line %d: %s\n", __LINE__, (msg)); \
-            ++g_failures; \
-        } \
-    } while (0)
 
 // ── T1：f16 matmul vs f32 参考 ─────────────────────────────────────────
 void test_f16_matmul_vs_f32()
@@ -173,11 +169,13 @@ void test_f16_linear_training()
         CHECK(t_pred32_r->is_cpu(), "cast result is CPU");
 
         // loss = mean((pred - y)^2) — 在 f32 融合世界中计算
-        auto t_diff_r = engine.elementwise_binary(
-            nn::BinaryOp::Sub, *t_pred32_r, t_y32);
+        auto t_diff_r = nn::dsl::compute(engine,
+            nn::dsl::leaf(*t_pred32_r) - nn::dsl::leaf(t_y32),
+            t_pred32_r->rows(), t_pred32_r->cols());
         CHECK(t_diff_r.has_value(), "sub");
-        auto t_loss_r = engine.elementwise_binary(
-            nn::BinaryOp::Mul, *t_diff_r, *t_diff_r);
+        auto t_loss_r = nn::dsl::compute(engine,
+            nn::dsl::leaf(*t_diff_r) * nn::dsl::leaf(*t_diff_r),
+            t_diff_r->rows(), t_diff_r->cols());
         CHECK(t_loss_r.has_value(), "sqr");
         // 简化：取所有元素的平均作为 loss（通过 to_matrix 读回 CPU）
         auto loss_mat = engine.to_matrix(*t_loss_r);
@@ -188,8 +186,9 @@ void test_f16_linear_training()
 
         // 反向：grad_w = 2/N * X @ (pred - y)  (f16 matmul)
         // scale 在 f32 融合世界完成，然后 cast 回 f16 做 matmul
-        auto t_scale_r = engine.elementwise_binary_scalar(
-            nn::BinaryOp::Mul, *t_diff_r, 2.0f / static_cast<float>(N), false);
+        auto t_scale_r = nn::dsl::compute(engine,
+            nn::dsl::leaf(*t_diff_r) * nn::dsl::rparam(2.0f / static_cast<float>(N)),
+            t_diff_r->rows(), t_diff_r->cols());
         CHECK(t_scale_r.has_value(), "scale grad");
         // grad_w = X @ scaled_diff: X(D,N)^T * scaled_diff(N,1) = (D,1)
         auto t_scale16_r = engine.cast(*t_scale_r, nn::Precision::F16);

@@ -8,10 +8,25 @@
 >
 > **2026-09-25 复核**：接口数字已按当前 HEAD 重测——**58 个 virtual（Phase 2 加入
 > `cast_into`/`copy_into`/`supports_*`/`eval_expr_*` 等）、Layer/Loss/Optimizer 直调 35 个**。
+> （该数字随后被 **2026-09-26 收敛更新为 49 个 virtual / Layer 直调 32 个**，见顶部横幅与 §2。）
 > 复现命令见 `bench/doc_inventory.ps1` 与 §9。
 >
 > 目的：先把**当前代码里实际并存的计算 API 与遗留物**列清楚，作为收敛讨论的事实底座。
 > 全部结论来自当前工作树的源码与构建配置，未做改动。
+
+> ## 🗑️ 2026-09-26：本文档 §5 遗留物清单已**执行完毕**（收敛记录）
+>
+> - **旧代数 AST 整体移除**：`algebra_expr.hpp`、`algebra_compute.hpp`（`nn::compute::apply`）删除；`Expression`/`BoolExpression`
+>   概念迁入 `expr_dsl.hpp`（唯一使用者）；`algebra_span.hpp`/`algebra_matrix.hpp`/`compute_cpu_engine.hpp` 的相关 include 清除；
+>   `Matrix::detail::{apply,binary_apply,binary_apply_inplace}`（零调用者）一并删除。
+> - **无根/测试-only operator 全部删除**：`axpy_inplace`、`broadcast_row_inplace`、`broadcast_col_inplace`（连带 `shaders/broadcast.comp`
+>   + `broadcast_gpu` + `broadcast_pipeline_` + `has_broadcast_pipeline` 全链）、`elementwise_unary/binary/binary_scalar`、
+>   `elementwise_select_scalar_cond`、引擎 `row_reduce_max`、offload B 组 `offload_store/offload_load`，
+>   以及 `UnaryOp`/`BinaryOp`/`CompareOp` 三个枚举。
+> - **数字更新**：引擎 virtual **58 → 49**；CPU 求值机制 **4 → 2**（① DSL 模板路径 ② IR 解释器；旧代数 AST 与 `eval_cpu` 串行模板分支已不复存在）。
+> - **随行清理**：`src/test_common.hpp`（测试公共工具唯一副本）、死的 `activation_cache()` override（ViT/ZiPT）、
+>   重复的 `offload_test` 聚合目标（ctest 20 → 19）、`gpt_offload_test` 补 batch 录制包裹。
+> - 下文 §2.2/§3/§5 的行内标注即为逐项对照；**§3 表格中的"机制 1（旧代数 AST）"整体作废**。
 
 ---
 
@@ -50,7 +65,7 @@
 
 ---
 
-## 2. `ComputeEngine` 接口：58 个 virtual 成员
+## 2. `ComputeEngine` 接口：49 个 virtual 成员（2026-09-26 收敛后；原 58）
 
 文件：`compute_engine.hpp`（2026-09-25 复核，`bench/doc_inventory.ps1` 可复现；
 多精度 Phase 2 新增 `cast_into`/`copy_into`/`supports_native_data_move`/
@@ -105,7 +120,7 @@ CPU 标量循环或逐通道循环。`eval_expr` 的 Layer 直调点是注意力
 
 | # | 机制 | 实现位置 | 并行度（实测） | 谁在用 |
 |---|------|----------|----------------|--------|
-| 1 | **旧代数 AST** `compute::apply(span, expr)` | `algebra_compute.hpp:38`（`nn::compute`）<br>AST 在 `algebra_expr.hpp` + `algebra_ops.hpp`（`nn::ops`） | 并行（走 `nn::for_each`） | **仅 `CpuEngine` 的 `elementwise_unary/binary/binary_scalar`**（`compute_cpu_engine.hpp:1094-1163`）+ `Matrix` 的 `detail::apply` |
+| 1 | ~~**旧代数 AST** `compute::apply(span, expr)`~~ | 🗑️ **2026-09-26 已整体删除**（`algebra_compute.hpp`/`algebra_expr.hpp`/`Matrix::detail::*`；概念迁入 `expr_dsl.hpp`） | — | 无（原仅 `CpuEngine` elementwise，该算子亦已删） |
 | 2 | **DSL 模板路径** `eval_cpu(e, rows, cols)` → `eval_into_span` | `expr_dsl.hpp:181` | **并行 + 向量化**（2026-09-19 复核：`n≥PARALLEL_THRESHOLD` 走 `nn::parallel_for_samples` 分块，块内 `NN_VECTORIZE_PRAGMA`；不再 per-element 重导 `cpu_matrix().span()`） | `dsl::compute` 的**无归约**分支 + `dsl::compute_into` 的逐元素分支 |
 | 3 | **DSL IR 解释器** `eval_expr_impl` | `compute_cpu_engine.hpp:1251-1789` | **串行**（逐元素 switch 分派 + 归约前缀重放） | `dsl::compute` 的**含归约/广播/matmul/索引视图**分支（`expr_dsl.hpp:680`）+ `compute_reduce` |
 | 4 | **GPU AOT 融合** `eval_expr` | `compute_gpu_engine.hpp:942` | shader 并行 | GPU 全部表达式 |
@@ -114,9 +129,8 @@ CPU 标量循环或逐通道循环。`eval_expr` 的 Layer 直调点是注意力
 （`:462-464`），所以连 matmul 都被推进了解释器。DSL 在 Layer 中的用量：
 `dsl::compute(` 88 处、`dsl::compute_reduce(` 20 处（其中相当一部分含 `matmul`/`broadcast`/归约，落到机制 3）。
 
-**死/重复**：
-- 机制 1（旧代数 AST）与机制 2（DSL 模板）是**两套并行的表达式模板 AST**，做同一件事（逐元素求值）。
-- 机制 2 与机制 3 是 DSL 在 CPU 上的两条路，一条内联、一条解释；机制 3（解释器）逐元素 switch 分派 + 归约前缀重放，实测比等价原语慢 1.5–3.8 倍（2026-09-18 诊断实测；原诊断报告已删除，本行保留结论）。
+**死/重复**（2026-09-26 更新）：
+- 机制 1（旧代数 AST）**已整体删除**；机制 2（DSL 模板）与机制 3（DSL IR 解释器）是 DSL 在 CPU 上的两条路，一条内联、一条解释——**这是收敛后的全部 CPU 求值路径**。机制 3 逐元素 switch 分派 + 归约前缀重放，实测比等价原语慢 1.5–3.8 倍（2026-09-18 诊断实测；原诊断报告已删除，本行保留结论）。
 
 ---
 

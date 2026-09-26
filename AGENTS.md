@@ -36,13 +36,14 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 | 加/改引擎原语（GPU 实现） | `compute_gpu_engine.hpp` + `backend/compute_vk_backend.hpp` + `backend/compute_vk_device.hpp` + `shaders/*.comp` |
 | 张量/设备抽象 | `compute_tensor.hpp` |
 | 混合精度 / f16 类型系统 | `precision.hpp`（Precision 枚举、`nn::f16`、`PrecisionProfile`） |
-| 矩阵/表达式模板（CPU 代数层） | `algebra_matrix.hpp` / `algebra_span.hpp` / `algebra_expr.hpp` / `algebra_ops.hpp` / `algebra_compute.hpp` |
+| 矩阵/代数层（CPU 存储与手写内核） | `algebra_matrix.hpp` / `algebra_span.hpp` / `algebra_ops.hpp`（旧代数 AST `algebra_expr.hpp`/`algebra_compute.hpp` 已于 2026-09 移除，`Expression`/`BoolExpression` 概念迁入 `expr_dsl.hpp`） |
 | 表达式 DSL / 融合 IR | `expr_dsl.hpp` / `expr_spec.hpp` / `expr_opt.hpp` / `expr_registry.hpp`（`expr_graph.hpp`/IR-C 已于 2026-09-19 移除） |
 | 后端代码生成（IR-D emitter 抽象） | `expr_emitter.hpp`（注册表）+ `expr_glsl_gen.hpp`（GlslEmitter） |
 | 模型容器/规格/序列化 | `model_container.hpp` / `model_spec.hpp` / `model_serialization.hpp` / `model_keyvalue_record.hpp` |
 | MNIST / GPT / CNN / RLA / ZiPT / 分词器 模型工厂 | `domain_mnist.hpp` / `domain_gpt.hpp` / `domain_cnn.hpp` / `domain_rla.hpp` / `domain_zipt.hpp` / `domain_tokenizer{,_base,_bpe,_charbpe}.hpp` |
 | 训练/推理 CLI 入口 | `src/mnist_train.cpp` 等；公共 CLI 逻辑在 `include/neuralnet.cpp/cli/` |
 | 构建期工具（AOT 融合） | `tools/scan_exprs.cpp` / `tools/gen_fused.cpp`（另有 `tools/decode_fused.py` 调试用） |
+| 批量改写 / 一致性审计（改多处时用，均带 `-DryRun`） | `tools/edit_ranges.ps1`（行区间删除：四重断言 + **花括号平衡护栏**）/ `tools/test_refactor.ps1`（删定义块 / 插 include / 正则替换）/ `tools/doc_rename.ps1`（文档词法改名）/ `bench/doc_align_audit.ps1`（文档↔代码对齐审计：文件/符号/CLI/数字/测试名） |
 | 与 PyTorch 对拍 | `compare_with_torch/`（model.py / text_train.py / text_infer.py） |
 
 ## 4. 分层架构（L0→L5，严格单向依赖，上层只依赖下层公有接口）
@@ -83,7 +84,7 @@ graph TB
     
     subgraph "L1 代数层"
         Q["algebra_matrix.hpp"]
-        R["algebra_expr.hpp"]
+        R["algebra_span.hpp"]
         S["algebra_ops.hpp"]
     end
     
@@ -124,15 +125,18 @@ Matrix → engine.from_matrix → Tensor[GPU] → forward/loss/optimizer 全程�
 
 | 类别 | 原语 |
 |------|------|
-| 矩阵级 | `matmul/batched_matmul/matmul_with_bias/transpose/add_inplace/accumulate/scale_inplace/axpy_inplace/zero` |
-| 归约级 | `row_reduce_sum/max`、`col_reduce_sum/max`、`grouped_reduce_sum/max`（沿行方向按固定长度 R 分组归约，池化/多头等场景免逐通道循环） |
-| 广播级 | `broadcast_row_inplace/broadcast_col_inplace` |
-| 逐元素 | `elementwise_unary/binary/binary_scalar/select_scalar_cond` |
+| 矩阵级 | `matmul/batched_matmul/matmul_with_bias/transpose/add_inplace/accumulate/scale_inplace/zero` |
+| 归约级 | `row_reduce_sum`、`col_reduce_sum/max`、`grouped_reduce_sum/max`（沿行方向按固定长度 R 分组归约，池化/多头等场景免逐通道循环） |
 | 数据操作 | `slice_rows/insert_rows/gather_rows/scatter_add_rows/rearrange_3d/im2col/col2im/clone/copy_from/cast`（`im2col/col2im`：卷积/池化窗口展开与伴随散射，纯数据搬运） |
 | 扫描级 | `scan_prefix_outer/scan_suffix_outer/outer_col`（RLA/RAPT，dk≤64，见 docs/development/06 §扫描原语） |
-| 表达式 | `eval_expr/eval_expr_reduce`（AOT 融合 shader 入口） |
+| 表达式 | `eval_expr/eval_expr_into/eval_expr_reduce`（AOT 融合 shader 入口） |
 | 批次/内存 | `begin_batch/end_batch/flush_batch/release_idle_pool_blocks/pool_stats` |
-| offload | `offload_store/offload_load/create_offload_buffer/offload_save/offload_restore`（activation offload） |
+| offload | `create_offload_buffer/offload_save/offload_restore`（activation offload） |
+
+> **2026-09 收敛**：`axpy_inplace`、`broadcast_row_inplace`、`broadcast_col_inplace`、`elementwise_unary/binary/binary_scalar`、
+> `elementwise_select_scalar_cond`、`row_reduce_max`（引擎算子）、`offload_store/offload_load` 以及 `UnaryOp/BinaryOp/CompareOp`
+> 枚举**已全部删除**（逐元素/广播一律走表达式 DSL；`dsl::row_reduce_max` 是 DSL 叶子，与已删的引擎算子无关）。
+> 引擎 virtual 由 58 → **49**；CRLF/`scan_exprs` AOT 键规则见 §7。
 
 ### 4.4 理解优先级（建议学习顺序）
 
@@ -167,13 +171,13 @@ GPT 序列展平: 列序 i = b*seq + t（batch-major，全局唯一约定）
 ## 7. 表达式 DSL 与 AOT 融合管线（GPU 开发必读）
 
 - Layer 内用 `nn::dsl`（`expr_dsl.hpp`）写普通数学表达式；CPU 编译期模板直接求值（内联+SIMD），GPU 折叠成 `ExprSpec`（扁平 IR，`expr_spec.hpp`）→ 按 key 查预编译融合 shader。
-- 主要入口：`dsl::compute(engine, expr)`（一行表达式，最常用）；把结果写进既有张量（原地更新，零分配）用 `dsl::compute_into(engine, expr, dst)`；归约语义用 `dsl::compute_reduce`。**跨表达式融合（`start_expr/end_expr`、`begin_expr/end_expr`、`expr_graph.hpp`）已于 2026-09-19 移除**——理由与重新立项前提见 `docs/development/03-ir-optimization.md` §5.3。
+- 主要入口：`dsl::compute(engine, expr, rows, cols)`（一行表达式，最常用——**必带输出形状**，没有 2 参重载）；把结果写进既有张量（原地更新，零分配）用 `dsl::compute_into(engine, expr, dst)`；归约语义用 `dsl::compute_reduce`。**跨表达式融合（`start_expr/end_expr`、`begin_expr/end_expr`、`expr_graph.hpp`）已于 2026-09-19 移除**——理由与重新立项前提见 `docs/development/03-ir-optimization.md` §5.3。
 - **fold 段（P-C1/C2）**：`ExprSpec.fold = FoldSpec`（分块状态归约：键域逐块 body + 行标量态跨块进位 + `vecacc` 行向量态块累加 + 向量域 finalize）——**通用折叠表达式机制，不含任何注意力专属语义**（与注意力无关的通用样例 rowmax/rowsum/softmax_denom 在 `expr_fold.hpp`）。注意力 forward 直调 `engine.eval_expr(make_fold_attn_o(...))`（**不经 DSL 钩子——scan 显式登记块是 fold spec 唯一注册来源**）；该构造与 5 掩码变体 `FoldAttnMask`（Plain/Causal/Alibi/Doc/AlibiDoc，漏登记即 GPU 闭合世界硬报错）**定义在 `compute_layer_attention.hpp`**（按 AOT 原则"表达式文本只出现在 Layer"归位，2026-09-25 前在 `expr_fold.hpp`）；`FoldSpec.tri_skip`（行界整块跳过，原名 `causal_skip`）进 key（codegen 分歧点）；`EXPR_FOLD_BLOCK=128`/`EXPR_FOLD_ROWS_PER_WG=2` 为 CPU/GPU 共享常量（改则两侧同改）。详见 `expr_fold.hpp` 与 `expr_spec.hpp` 的 FoldSpec 注释。
 - **构建期两步**（CMake 自动编排，改 Layer 内联表达式后重跑构建即可）：
   1. `scan_exprs`：dry-run 跑 Layer forward/backward，收集折叠出的 `ExprSpec` 结构（去重）→ `build/generated/expr_specs.bin`
   2. `gen_fused`：读 bin → 经 `emitter_registry` 选后端（默认 `"glsl"` = `GlslEmitter`）生成 GLSL → glslc → 内联 SPIR-V → `build/generated/fused_registry.hpp`
 - **IR-D emitter 抽象**（`expr_emitter.hpp`）：把后端代码生成从 GLSL 专用抽象为 emitter 接口（一份 canonical IR → 多后端代码），`--list-backends` 可列出注册后端。目前仅 `glsl` 后端注册；`CpuEmitter`（已删除）与 `CudaEmitter`（随 CUDA 后端一并移除）均**不存在**，勿引用。
-- 手写原语 shader 在 `shaders/*.comp`（matmul、matmul_tiled、matmul_gemv、batched_matmul、reduce、broadcast、elementwise_v2、transpose、gather、scatter_add、rearrange_3d、im2col、col2im、group_reduce、scan_prefix_outer、scan_suffix_outer、outer_col、cast），构建期 glslc 编译并嵌入 C++ 头文件。
+- 手写原语 shader 在 `shaders/*.comp`（matmul、matmul_tiled、matmul_gemv、batched_matmul、reduce、elementwise_v2、transpose、gather、scatter_add、rearrange_3d、im2col、col2im、group_reduce、scan_prefix_outer、scan_suffix_outer、outer_col、cast；`broadcast.comp` 随 `broadcast_*_inplace` 算子于 2026-09 删除），构建期 glslc 编译并嵌入 C++ 头文件。
 - IR 优化 pass（canonicalize/CSE/寄存器分配）见 `expr_opt.hpp`，设计文档 `docs/development/03-ir-optimization.md`（含 IR-C 图融合的取舍记录 §5.3）。
 
 ## 8. 训练循环范式（写新入口时照抄）
@@ -207,7 +211,7 @@ optimizer.step();
 
 ## 9. 关键常量与配置（`core_config.hpp`）
 
-- `Scalar = float`；`BLOCK_SIZE = 64`（matmul 分块，b_block 栈预算 64KB）；`PARALLEL_THRESHOLD = 524288`（SmartPolicy 并行阈值）。
+- `Scalar = float`；`BLOCK_SIZE = 64`（matmul 分块，b_block 栈预算 64KB）；`PARALLEL_THRESHOLD = 524288`（自适应并行阈值，由 `nn::parallel_for_blocks/parallel_for_samples` 门控）。
 - 不使用 `-ffast-math`（保 NaN/Inf，训练稳定性）。
 
 ## 10. 高频坑（Top 8，详见 `docs/development/08-pitfalls-and-lessons.md`）
@@ -228,7 +232,7 @@ optimizer.step();
 | 文档 | 何时读 |
 |------|--------|
 | `introduction/01-architecture.md` | 需要完整分层/数据流/模块详解时（**含快速理解指南和理解路线图**；CUDA 已移除备注见篇末） |
-| `introduction/02-performance.md` | 性能优化（SmartPolicy、缓存分块、GPU） |
+| `introduction/02-performance.md` | 性能优化（自适应并行、缓存分块、GPU） |
 | `introduction/03-algorithm-reference.md` | 每个 Layer/Loss/Optimizer 的数学与原语分解 |
 | `introduction/04-innovative-designs.md` | 创新设计全景 |
 
@@ -245,7 +249,7 @@ optimizer.step();
 | `development/07-zipt-algorithm.md` | AttnZip / ZiPT：记忆压缩解码器算法设计 |
 | `development/08-pitfalls-and-lessons.md` | **踩坑警示录，改代码前读** |
 | `development/10-development-standards.md` | C++ 编码规范全文 |
-| `development/12-compute-engine-inventory.md` | **引擎接口盘点（2026-09 复核）：58 个 virtual、Layer 直调 35 个、四套表达式求值机制、遗留物清单** |
+| `development/12-compute-engine-inventory.md` | **引擎接口盘点（后附 2026-09 收敛记录）：49 个 virtual（原 58，删 9 个无根/测试-only 算子）、Layer 直调 32 个、两套 CPU 求值机制（模板 + IR 解释器）** |
 | `development/13-refactor-backlog.md` | **重构与性能机会清单（2026-09-25 审查）：只记录方案不实施；含"已核对为误报/已修复的审查项"对照表，重复立项前先读 §6** |
 
 ### 使用类（docs/usage/）
@@ -266,7 +270,8 @@ optimizer.step();
 - **v1.1.0**：GPT 训练错误修复、算子融合优化、ZiPT/RAPT 掩码。
 - **后续提交**（v1.2.0 之后）：
   - **Vulkan 设备选择**（15eb731）：`--gpu` 参数指定设备（`cli/cli_gpu_option.hpp`、`backend/compute_vk_device.hpp`）。
-  - **activation offload**（ee11e29）：相较梯度检查点更省时（实测 18s vs 26s / 5 step），推荐优先使用；`GPTModel::set_offload_enabled` + `ComputeEngine::offload_*` 原语。
+  - **activation offload**（初现 `42c0883`/v0.2.0、GPT 接线 `26d8eb4`/v1.1.0、`ActivationOffloader` 抽取 `8f2990f`）：相较梯度检查点更省时（文档记载 18s vs 26s / 5 step，**仓库内无原始计时**）；API 为 `GPTModel::set_activation_offload`（**`set_offload_enabled` 不存在**）+ `ComputeEngine::create_offload_buffer/offload_save/offload_restore`（`offload_store/load` 已于 2026-09 删除）。两者**可混合**（checkpoint 块重算、其余块 offload），此前帮助文本"互斥"是错的。
+  - **代码缩减重构：算子收敛 + 测试结构 + AST 移除（2026-09-26，本轮）**：① 删 A 档死码（`elementwise_select_scalar_cond` / `axpy_inplace` / `broadcast_row_inplace` / `nn::one_hot` / `one_hot_labels` / `Matrix::multiply_transposed_add_to` / `nn::sigmoid`·`relu` / `ops::Sigmoid`·`ReLU`）；② 新增测试公共头 `src/test_common.hpp`（`CHECK`/`make_tensor`/`check_close`/`approx`/`dot`/`close_to` 收敛一份，聚合器不再逐符号 `#define` 重命名；`max_abs_diff` 因 9 份副本语义有分叉**暂不收编**）；③ RAPT `forward_step` 的 `num/den` 除法迁 DSL，写成与 `forward:491` **同构**的 `leaf/(leaf+Scalar{1e-4})` → 复用已注册 AOT 键（**无需改 scan_exprs**）；④ 删 `elementwise_unary/binary/binary_scalar`、`broadcast_col_inplace`（连带 `broadcast.comp` / `broadcast_gpu` / pipeline / `has_*` / 成员全链）、引擎 `row_reduce_max`、offload B 组 `offload_store/load`、`UnaryOp/BinaryOp/CompareOp` 枚举（**引擎 virtual 58 → 49**）；⑤ **旧代数 AST 整体移除**：`algebra_expr.hpp`/`algebra_compute.hpp` 删除，`Expression`/`BoolExpression` 概念迁入 `expr_dsl.hpp`，`Matrix::detail::{apply,binary_apply,binary_apply_inplace}` 死函数删除 → **CPU 求值只剩「DSL 模板路径 + IR 解释器」两套**；⑥ 删死 `activation_cache()` override（ViT/ZiPT，20 行）与重复的 `offload_test` 聚合目标（**ctest 20 → 19**），并给 `gpt_offload_test` 包 `begin_batch/end_batch`（补上 offload save/restore 的**训练真实录制路径**覆盖，此前无任何自动化测试）；`--activation-offload` 对 CPU/ZiPT 改为显式警告（原为静默 no-op 却打印"已启用"）。**两条教训**：`dsl::compute` **无 2 参重载**（必带 `rows, cols`）；eager→DSL 迁移**先确认目标表达式结构已被 `scan_exprs` 覆盖**，否则 GPU 闭合世界运行期硬报错。
   - **CPU 逐元素优化 + `dsl::compute_into`**（c0d3298）：DSL 模板路径向量化/并行、`Tensor::cpu_get_ptr`、零分配原地目标传递（optimizer/layer/loss 已迁移）。
   - **CUDA 后端整体移除**（96a3675）：`cuda/`、`compute_cuda_engine.hpp`、`backend/compute_cuda_backend.hpp`、全库 `NN_HAS_CUDA`/`--cuda`。快照见分支 `legacy/cuda`。
   - **IR-C 整体移除**（本次）：`expr_graph.hpp`、`compute_engine` 的 `begin_expr/end_expr`、`dsl::start_expr/end_expr`、`FusedChainLayer`、`Tensor::virtual_tag_`。取舍记录见 `docs/development/03-ir-optimization.md` §5.3。
@@ -294,13 +299,13 @@ S7 关键教训（改融合/IR 代码前必读）：
 2. **BatchCol 视图要求 `(1, BH*seq)`**（doc_ids 按 (b,h) 块重复），`(1, batch*seq)` 会越界。
 3. **RowGather 主输入行数≠网格行数**（loss_vec 在 (1,N) 读 (C,N) logits），校验只查 cols。
 4. `gen_fused` `emit_spec` 的 ±inf 常量必须用 `numeric_limits`。
-5. matmul + 列归约不支持（gen_fused 跳过）。
+5. matmul + 列归约**已支持（2026-09-26 补齐）**：`generate_glsl_reduce` 列分支按元素分解 batch（`batch = row/m_per`，遍历全部 `rows = batch*m_per` 行）、`gen_fused` 三处跳过删除；覆盖 = `expr_cpu_test::col_max(matmul)`（batch=2 独立标量参考）+ `expr_gpu_test` col 对拍（广播/向量/batch=2）。
 6. **IR 扩展**：MatmulSpec.batch（不进 key，dispatch z）、Row/Col/Batch 操作数(6/7/8)、RowGather(9)/BatchMod(10)/BatchCol(11)；注意力 forward 现为单 fold kernel（`FoldSpec`，5 掩码变体经 `fold_mask_variant_`——m/l/W 表达式+bm(W,V_t) 的 S7 forward 结构已删），bwd=R/X 表达式+3 个 `batched_matmul`；CE 稠密 `denom=col_sum(exp(logits-cb(col_max)))`，稀疏 grad/loss_vec 用 Row+RowGather。
 
 ### 已过时的历史说明
 
 - **全库代码审查报告（2026-09-04）**：一次性审查文档已删除（git 历史可查）。仍在册的未修项以本文件与 `08-pitfalls-and-lessons.md` 为准；其中 `--tdr-retry`/`--max-tdr-retries` 选项已从代码移除（当年"被解析但从未使用"的问题不复存在）。
-- **CPU 性能诊断报告（2026-09-18）与路线选择建议（2026-09-18）**：临时诊断/决策文档已删除，结论已并入 `12-compute-engine-inventory.md`（CPU 侧四套求值机制与解释器开销）与 `03-ir-optimization.md` §5.3（IR-C 取舍）。
+- **CPU 性能诊断报告（2026-09-18）与路线选择建议（2026-09-18）**：临时诊断/决策文档已删除，结论已并入 `12-compute-engine-inventory.md`（CPU 侧求值机制与解释器开销；**2026-09-26 起只剩两套：DSL 模板路径 + IR 解释器**）与 `03-ir-optimization.md` §5.3（IR-C 取舍）。
 - **CpuEmitter**：`cpu_emitter.hpp` 与 CpuEmitter 实现**已删除**（`expr_emitter.hpp` 的历史注释已于本轮清理）。早期"待修 CpuEmitter 隐性缺陷"问题已随之消失，勿再引用。
 - **融合三期 S6**：未列入当前计划；其替代方案 P2-12 图级缓存亦随 IR-C 于 2026-09-19 删除。
 - **IR-C（图 IR / 跨表达式融合）**：已评估并整体移除，`expr_graph.hpp` / `begin_expr`/`end_expr` / `start_expr`/`end_expr` / `FusedChainLayer` 均**不存在**，勿引用或重新发明——重新立项前提见 `docs/development/03-ir-optimization.md` §5.3 末段。

@@ -17,6 +17,7 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include "test_common.hpp"
 
 using nn::Scalar;
 using nn::Matrix;
@@ -28,15 +29,6 @@ using nn::PosEncodingType;
 
 namespace {
 
-Scalar dot(const Matrix& a, const Matrix& b)
-{
-    Scalar s{0};
-    const auto sa = a.span();
-    const auto sb = b.span();
-    for (std::size_t i = 0; i < a.size(); ++i)
-        s += sa[i] * sb[i];
-    return s;
-}
 
 Scalar eval_loss(ComputeEngine& engine, CausalSelfAttention& attn,
                  const Tensor& x, const Tensor& go)
@@ -48,11 +40,6 @@ Scalar eval_loss(ComputeEngine& engine, CausalSelfAttention& attn,
     return dot(*y_m, *go_m);
 }
 
-bool approx(Scalar num, Scalar ana, Scalar tol)
-{
-    return std::fabs(num - ana) <=
-           tol * (Scalar{1} + std::fabs(num) + std::fabs(ana));
-}
 
 bool check_grad_tensor(
     ComputeEngine& engine, CausalSelfAttention& attn,

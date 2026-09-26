@@ -190,8 +190,6 @@ if(NN_ENABLE_TESTS)
     list(APPEND NN_TEST_TARGETS gpt_test)
 
     # ── Activation Offload（原语往返 + GPT/RAPT 模型级一致性）──────────
-    nn_add_executable(offload_test src/offload_test.cpp)
-    list(APPEND NN_TEST_TARGETS offload_test)
     # 模型级 offload 一致性（GPU-only：无 Vulkan 构建时自身返回 77 = SKIP）
     nn_add_executable(gpt_offload_test src/gpt_offload_test.cpp)
     list(APPEND NN_TEST_TARGETS gpt_offload_test)
@@ -273,7 +271,6 @@ if(Vulkan_FOUND)
         batched_matmul
         rearrange_3d
         elementwise_v2
-        broadcast
         transpose
         gather
         scatter_add

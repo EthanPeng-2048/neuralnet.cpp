@@ -133,8 +133,8 @@ graph TB
 
     subgraph "L2 计算层（引擎化）"
         K["compute_engine.hpp — 引擎抽象接口"]
-        L["cpu_engine.hpp — CPU 引擎"]
-        M["gpu_engine.hpp — GPU 引擎 (Vulkan)"]
+        L["compute_cpu_engine.hpp — CPU 引擎"]
+        M["compute_gpu_engine.hpp — GPU 引擎 (Vulkan)"]
         N["compute_layer.hpp — Layer 基类 + 所有层"]
         O["compute_loss.hpp — 损失函数"]
         P["compute_optimizer.hpp — 优化器"]
@@ -142,14 +142,12 @@ graph TB
 
     subgraph "L1 代数层"
         Q["algebra_matrix.hpp — 矩阵类 + 运算原语"]
-        R["algebra_expr.hpp — 表达式模板"]
+        R["algebra_span.hpp — Span 抽象"]
         S["algebra_ops.hpp — 逐元素算子"]
-        T["algebra_compute.hpp — 计算分派"]
-        U["algebra_span.hpp — Span 抽象"]
     end
 
     subgraph "L0 硬件层"
-        V["config.hpp — SmartPolicy / BLOCK_SIZE"]
+        V["core_config.hpp — 自适应并行 / BLOCK_SIZE"]
         W["core_threadpool.hpp — 全局线程池"]
         X["core_errors.hpp — Result<T> = std::expected<T, Error>"]
         Y["core_assert.hpp — 断言宏"]
@@ -161,7 +159,7 @@ graph TB
     H & I & J --> K & N & O & P
     K --> L & M
     N & O & P --> Q
-    Q --> R & S & T & U
+    Q --> R & S
     Q --> V & W & X & Y
 ```
 
@@ -207,7 +205,7 @@ Matrix(x_batch)
 |------|------|------|
 | **ComputeEngine** (L2) | 只提供 op-level 原语 | `matmul`, `add`, `exp`, `max`, `reduce` |
 | **Layer** (L2) | 通过组合原语表达算法 | `ReLU = max(x, 0)`, `GeLU = 5 次原语组合` |
-| **Shader** (GPU) | 引擎内部实现，用户不可见 | `matmul.comp`, `elementwise.comp` |
+| **Shader** (GPU) | 引擎内部实现，用户不可见 | `matmul.comp`, `elementwise_v2.comp` |
 
 这意味着 **Engine/Shader 不知道 "ReLU" 是什么**，它只提供 `max` 原语。Layer 用 `max(x, 0)` 表达 ReLU 算法。
 
@@ -242,7 +240,7 @@ class Tensor {
 
 | 文件 | 职责 |
 |------|------|
-| `config.hpp` | `Scalar` 类型定义、`BLOCK_SIZE=64`、`PARALLEL_THRESHOLD`、SmartPolicy 自适应策略 |
+| `core_config.hpp` | `Scalar` 类型定义、`BLOCK_SIZE=64`、`PARALLEL_THRESHOLD`、自适应并行策略 |
 | `core_threadpool.hpp` | 全局线程池，latch 零分配设计，`parallel_for_each` / `parallel_transform` |
 | `core_errors.hpp` | `struct Error { std::string message; }` + `using Result<T> = std::expected<T, Error>` |
 | `core_assert.hpp` | `NN_ASSERT` 宏（L1 层形状校验使用，L2+ 层使用 Result） |
@@ -252,11 +250,10 @@ class Tensor {
 
 | 文件 | 职责 |
 |------|------|
-| `algebra_matrix.hpp` | `Matrix` 类：行主序存储 `(rows, cols)`，矩阵乘法（缓存分块 + SmartPolicy 并行），加法、转置、归约 |
-| `algebra_expr.hpp` | 表达式模板（AST），实现编译期零开销逐元素运算 |
-| `algebra_ops.hpp` | 逐元素算子：`ReLU`, `GeLU`, `Neg`, `Exp`, `Add`, `Mul` 等 |
-| `algebra_span.hpp` | `Span` 抽象，提供对矩阵数据的安全视图 |
-| `algebra_compute.hpp` | `compute::apply(span, expr)` — AST 统一入口 |
+| `algebra_matrix.hpp` | `Matrix` 类：行主序存储 `(rows, cols)`，矩阵乘法（缓存分块 + 自适应并行 并行），加法、转置、归约 |
+| `algebra_span.hpp` | `Span` / `ConstSpan`：矩阵数据的安全视图，同时作为 DSL 叶子的数据载体 |
+| `algebra_ops.hpp` | 逐元素算子定义（`ops::Add/Exp/Max/...` + `op_id()` → `ExprOp`），**表达式 DSL 的唯一算子来源** |
+| ~~`algebra_expr.hpp`~~ / ~~`algebra_compute.hpp`~~ | 🗑️ **2026-09 已移除**：旧代数 AST 与 `compute::apply`；`Expression`/`BoolExpression` 概念迁入 `expr_dsl.hpp` |
 
 ### L2 计算层（引擎化）
 
@@ -264,20 +261,19 @@ class Tensor {
 
 | 类别 | 原语 |
 |------|------|
-| 矩阵级 | `matmul`, `batched_matmul`, `matmul_with_bias`, `transpose`, `add_inplace`, `accumulate`, `scale_inplace`, `zero`, `axpy_inplace` |
-| 归约级 | `row_reduce_sum/max`, `col_reduce_sum/max`, `grouped_reduce_sum/max`（沿行按固定长度 R 分组归约） |
-| 广播级 | `broadcast_row_inplace`, `broadcast_col_inplace` |
-| 逐元素 | `elementwise_unary`, `elementwise_binary`, `elementwise_binary_scalar` |
-| 条件选择 | `elementwise_select_scalar_cond` |
+| 矩阵级 | `matmul`, `batched_matmul`, `matmul_with_bias`, `transpose`, `add_inplace`, `accumulate`, `scale_inplace`, `zero` |
+| 归约级 | `row_reduce_sum`, `col_reduce_sum/max`, `grouped_reduce_sum/max`（沿行按固定长度 R 分组归约） |
 | 数据操作 | `slice_rows`, `insert_rows`, `gather_rows`, `scatter_add_rows`, `rearrange_3d`, `im2col`, `col2im`, `clone`, `copy_from`, `cast` |
 | 扫描级 | `scan_prefix_outer`, `scan_suffix_outer`, `outer_col`（RLA/RAPT，dk≤64） |
 | 表达式 | `eval_expr`, `eval_expr_reduce`（AOT 融合 shader 入口，闭合世界硬报错） |
 | 批控制 | `begin_batch` / `end_batch`（CPU: no-op; GPU: command buffer） |
 | 内存 | `release_idle_pool_blocks`, `pool_stats` |
-| offload | `offload_store/load`, `create_offload_buffer`, `offload_save/restore`（activation offload） |
+| offload | `create_offload_buffer`, `offload_save/restore`（activation offload） |
 
-> 注：表中 `axpy_inplace`、`elementwise_select_scalar_cond`、`broadcast_row_inplace` 等
-> 当前**无生产调用方**（接口保留，调用点现状见 `development/12-compute-engine-inventory.md` §2）。
+> **2026-09 收敛**：`axpy_inplace`、`broadcast_row_inplace/col_inplace`、`elementwise_unary/binary/binary_scalar`、
+> `elementwise_select_scalar_cond`、引擎 `row_reduce_max`、`offload_store/load` 与 `UnaryOp/BinaryOp/CompareOp`
+> 枚举**已全部删除**（逐元素/广播/条件选择一律走表达式 DSL），**引擎 virtual 58 → 49**；
+> 逐项清单见 `development/12-compute-engine-inventory.md` 顶部收敛横幅。
 
 **表达式统一入口：**
 
@@ -403,7 +399,7 @@ cmake --build build --parallel
 ```
 nn.hpp（统一入口）
 ├── L0: core_errors → config → core_threadpool
-├── L1: algebra_matrix → algebra_span / algebra_ops / algebra_expr / algebra_compute
+├── L1: algebra_matrix → algebra_span / algebra_ops（旧 algebra_expr / algebra_compute 已于 2026-09 移除）
 ├── L2: tensor → compute_engine → cpu_engine [→ gpu_engine]
 │       → compute_layer → compute_loss → compute_optimizer
 ├── L3: model_container → model_spec → model_serialization

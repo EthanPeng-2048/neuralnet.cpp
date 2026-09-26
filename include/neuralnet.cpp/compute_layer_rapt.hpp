@@ -682,8 +682,8 @@ public:
             // 双向：A/B 为全集常数 → dB 在所有位置广播相同值
             auto dB_sum_r = engine.row_reduce_sum(*dB_r);
             if (!dB_sum_r) return std::unexpected(dB_sum_r.error());
-            // Bb = broadcast_row(dB_sum)：单条表达式取代 create_tensor + zero +
-            // broadcast_row_inplace（GPU 上 3 → 1 次 dispatch）。
+            // Bb = row_broadcast(dB_sum)：单条表达式取代 create_tensor + zero +
+            // 逐元素按行广播三步（GPU 上 3 → 1 次 dispatch）。
             // 注：IR 规定"输出 = 最后一条指令的 dst"，故**单视图表达式不合法**
             // （指令表为空会被 validate_expr_spec 拒绝）。这里与一个**运行时 0**
             // （RParam，编译期无法被常量折叠掉）相加，使表达式合法且语义不变。
@@ -837,7 +837,8 @@ public:
         auto num_r = engine.batched_matmul(B_state, *Qp, H, false, false);
         if (!num_r) return std::unexpected(num_r.error());
 
-        // den = q'·z + ε：逐头标量点积（通过 to_matrix 在 CPU 上计算）
+        // den = q'·z：逐头标量点积（通过 to_matrix 在 CPU 上计算；
+        // ε 由下面的除法表达式统一添加，与 forward 的写法保持同构）
         // forward_step 是逐 token 串行的，CPU round-trip 可接受。
         auto q_mat = engine.to_matrix(*Qp);
         if (!q_mat) return std::unexpected(q_mat.error());
@@ -850,7 +851,7 @@ public:
             for (std::size_t j = 0; j < dk; ++j)
                 dot += q_mat->at_unchecked(h * dk + j, 0) *
                        z_mat->at_unchecked(h * dk + j, 0);
-            den_mat.set_value_unchecked(h, 0, dot + Scalar{1e-4});
+            den_mat.set_value_unchecked(h, 0, dot);
         }
         // 广播到 (H*dk, 1)：每头标量重复 dk 次
         Matrix den_full(H * dk, 1);
@@ -863,7 +864,12 @@ public:
         auto den_t = engine.from_matrix(den_full);
         if (!den_t) return std::unexpected(den_t.error());
 
-        auto out_r = engine.elementwise_binary(BinaryOp::Div, *num_r, *den_t);
+        // out = num / (den + ε)：与 forward 的除法（:491）**逐 token 同构**——
+        // 同一个 AOT 键已被 scan_exprs 的 ReLULinearAttention dry-run 覆盖，
+        // GPU 闭合世界可命中（此前的 eager elementwise_binary 已退役）。
+        auto out_r = dsl::compute(engine,
+            dsl::leaf(*num_r) / (dsl::leaf(*den_t) + Scalar{1e-4}),
+            (*num_r).rows(), (*num_r).cols());
         if (!out_r) return std::unexpected(out_r.error());
         return w_o_.forward(engine, *out_r);
     }

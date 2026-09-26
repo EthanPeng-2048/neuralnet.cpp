@@ -85,19 +85,19 @@ matrix.add_inplace(other);              // Matrix 自己封装算术操作
 > **核心口号：每层只能负责每层的事，Matrix 不能写算法，Layer 不能写底层计算。**
 
 ```cpp
-// ── L1 代数层（matrix.hpp）的职责边界 ──
-// ✅ Matrix 负责：数学运算原语（矩阵乘、逐元素变换、broadcast add、归约）、SmartPolicy 自动并行分派
+// ── L1 代数层（algebra_matrix.hpp）的职责边界 ──
+// ✅ Matrix 负责：数学运算原语（矩阵乘、逐元素变换、broadcast add、归约）、自适应并行 自动并行分派
 // ❌ Matrix 禁止：定义神经网络算法逻辑（如 forward/backward 流程、损失函数、梯度更新策略、
 //                 ReLU/GeLU/Softmax/LayerNorm/CrossEntropy/Adam/SGD 等具体算法）
 
-// ── L2 计算层（layer.hpp / loss.hpp / optimizer.hpp）的职责边界 ──
+// ── L2 计算层（layer.hpp / compute_loss.hpp / optimizer.hpp）的职责边界 ──
 // ✅ Layer 负责：神经网络算法逻辑（forward/backward 公式、参数管理、缓存中间结果）
 // ✅ Layer 可以：组合使用其他 Layer（如 MultiHeadAttention 内部使用 Softmax、FeedForward 内部使用 Linear+GeLU）
-// ✅ Layer 可以：通过 Matrix::span() 取得 Span 后调用 compute::apply(span, expr) 表达逐元素算法
+// ✅ Layer 可以：用表达式 DSL（`dsl::compute` / `dsl::compute_into`）表达逐元素算法
+//    （旧 `compute::apply(span, expr)` 代数 AST 已于 2026-09 整体移除）
 
-// ── 正确示例：Layer 通过 AST 表达逐元素算法 ──
-Span x = result.span();
-compute::apply(x, max(x, Scalar{0}));   // 直接调用 AST 入口，底层自动并行
+// ── 正确示例：Layer 用 DSL 表达逐元素算法 ──
+auto y = dsl::compute(engine, dsl::max(dsl::leaf(*x), dsl::rparam(0)), rows, cols);
 
 // ── 正确示例：Layer 之间组合 ──
 auto sm_res = softmax_.forward(attn_[h]);  // Layer 调用 Layer
@@ -108,7 +108,7 @@ auto sm_res = softmax_.forward(attn_[h]);  // Layer 调用 Layer
 | **Matrix 不写算法** | Matrix 提供纯数学运算原语，不包含神经网络的前向/反向传播逻辑、激活函数、损失函数、优化器等具体算法 |
 | **Layer 表达算法** | Layer 通过 Matrix 语义 API 或 `compute::apply(span, expr)` 表达算法 |
 | **Layer 可组合** | Layer 可以包含并调用其他 Layer（如 Attention 内部使用 Softmax） |
-| **并行对上层透明** | 并行策略是 SmartPolicy 的内部实现细节，上层通过 Matrix API 或 compute::apply 间接享受并行加速 |
+| **并行对上层透明** | 并行策略是内部实现细节，上层通过 Matrix API 或 compute::apply 间接享受并行加速 |
 
 ---
 
@@ -238,7 +238,7 @@ graph TB
         ALG["algebra_expr/ops/span/compute.hpp"]
     end
     subgraph "L0 硬件层"
-        CFG["config.hpp"]
+        CFG["core_config.hpp"]
         TP["core_threadpool.hpp"]
     end
 
@@ -251,8 +251,8 @@ graph TB
     LAY -->|"Matrix API / compute::apply"| MAT & ALG
     LOSS -->|"Matrix API"| MAT
     OPT -->|"Matrix API"| MAT
-    MAT -->|"SmartPolicy"| CFG
-    ALG -->|"SmartPolicy::for_each"| CFG
+    MAT -->|"自适应并行"| CFG
+    ALG -->|"nn::parallel_for_blocks"| CFG
     CFG --> TP
 ```
 
@@ -263,7 +263,7 @@ graph TB
 | **L3 实现层** | `model_container.hpp`, `model_spec.hpp`, `model_serialization.hpp` | 模型容器 + 序列化 |
 | **L2 计算层** | `compute_layer.hpp`, `compute_loss.hpp`, `compute_optimizer.hpp` | 层/损失/优化器定义（**算法所在层**） |
 | **L1 代数层** | `algebra_matrix.hpp`, `algebra_*.hpp` | 矩阵运算原语 + AST 表达式模板（**不含任何算法**） |
-| **L0 硬件层** | `config.hpp`, `core_threadpool.hpp` | 并行策略 |
+| **L0 硬件层** | `core_config.hpp`, `core_threadpool.hpp` | 并行策略 |
 
 > 层级仅供参考，不强制限制调用方向。**唯一硬约束：Matrix 不得包含任何神经网络算法**（ReLU/GeLU/Softmax/LayerNorm/CrossEntropy/Adam/SGD 等必须放在 L2 计算层）。
 
@@ -275,11 +275,10 @@ graph TB
 // 禁止：Optimizer 直接获取 Matrix 的底层 vector 并迭代
 auto &p_vec = p.data();       // 泄露 std::vector<Scalar>&！
 auto &g_vec = g.data();
-SmartPolicy::for_each(zip_view.begin(), zip_view.end(), [...]);
+nn::parallel_for_blocks(zip_view.begin(), zip_view.end(), [...]);
 
-// 正确：通过 Matrix 语义化操作（apply / binary_apply_inplace）表达算法
-p.binary_apply_inplace(g,
-    [lr](Scalar pv, Scalar gv) noexcept { return pv - lr * gv; });
+// 正确：用表达式 DSL 的原地目标传递表达算法（零分配、单 kernel）
+dsl::compute_into(engine, dsl::leaf(p) + dsl::leaf(g) * dsl::rparam(-lr), p);
 ```
 
 #### 4.2.2 Matrix 中写入神经网络算法
@@ -319,27 +318,21 @@ public:
     template <typename T, typename R, typename F> [[nodiscard]] Matrix row_reduce(T init, R&&, F&&) const;
     template <typename T, typename R, typename F> [[nodiscard]] Matrix col_reduce(T init, R&&, F&&) const;
 
-    // ── 广播原语 ──
-    template <typename F> void broadcast_row_inplace(const Matrix& row_vec, F&& op);
-    template <typename F> void broadcast_col_inplace(const Matrix& col_vec, F&& op);
-    void add_bias_broadcast_inplace(const Matrix& bias);
-
-    // ── Span 视图（供 compute::apply 使用） ──
+    // ── Span 视图（供 Matrix 内核 / 表达式 DSL 叶子使用） ──
+    //    注：旧 compute::apply 代数 AST 与广播/逐元素算子在 2026-09 已移除
     std::span<Scalar> span() noexcept;
     std::span<const Scalar> span() const;
 };
 ```
 
-#### 4.3.2 Layer 通过 AST 表达逐元素算法
+#### 4.3.2 Layer 用表达式 DSL 表达逐元素算法
 
 ```cpp
-// ReLU::forward 通过 AST 入口
-Result<Matrix> ReLU::forward(const Matrix& input) override {
-    input_cache_ = input;
-    Matrix result = input;
-    Span x = result.span();
-    compute::apply(x, max(x, Scalar{0}));
-    return result;
+// ReLU::forward —— 一条 DSL 表达式（旧 compute::apply 代数 AST 已于 2026-09 移除）
+Result<Tensor> ReLU::forward(ComputeEngine& engine, const Tensor& x) override {
+    input_cache_ = x;
+    return dsl::compute(engine, dsl::max(dsl::leaf(x), dsl::rparam(0)),
+                        x.rows(), x.cols());
 }
 ```
 
@@ -379,10 +372,10 @@ m.binary_apply_inplace(g,
 | 修改场景 | 预期只改 | 当前状态 |
 |----------|----------|----------|
 | Matrix 换存储格式（如 `vector` → 自定义 allocator） | `algebra_matrix.hpp` | 已满足（上层只通过 `span()` / 语义 API 访问） |
-| SmartPolicy 换并行策略（如线程池 → TBB） | `config.hpp` | 已满足（上层不直接调 SmartPolicy） |
+| 自适应并行策略更换（如线程池 → TBB） | `core_config.hpp` | 已满足（上层不直接调 `nn::parallel_for_blocks` / `nn::parallel_for_samples`） |
 | Layer 新增一种激活函数 | `compute_layer.hpp` | 已满足 |
 | Optimizer 新增一种优化器 | `compute_optimizer.hpp` | 已满足 |
-| 新增一种模型架构 | 新增 `domain_xxx.hpp` (L4) | 已满足 |
+| 新增一种模型架构 | 新增 `domain_<name>.hpp`（L4，示意） | 已满足 |
 | 修改 GPT 超参数默认值 | `domain_gpt.hpp` | 已满足 |
 | 修改 MNIST 数据集路径 | `domain_mnist.hpp` | 已满足 |
 
@@ -396,17 +389,16 @@ m.binary_apply_inplace(g,
 include/neuralnet.cpp/
 │
 │  ┌─ L0 硬件层 ──────────────────────────────────────┐
-├── config.hpp           # 全局配置、Scalar 类型、SmartPolicy（仅 CPU）
+├── core_config.hpp           # 全局配置、Scalar 类型、自适应并行（仅 CPU）
 ├── core_threadpool.hpp  # 线程池实现
 ├── core_errors.hpp      # Result<T> = std::expected<T, Error>
 ├── core_assert.hpp      # 断言宏
 │
 │  ┌─ L1 代数层 ──────────────────────────────────────┐
 ├── algebra_matrix.hpp       # 矩阵运算（内部自动并行分派，上层无感）
-├── algebra_expr.hpp         # 表达式模板
-├── algebra_ops.hpp          # 逐元素算子
+├── algebra_ops.hpp          # 逐元素算子定义（表达式 DSL 复用）
 ├── algebra_span.hpp         # Span 抽象
-├── algebra_compute.hpp      # 计算分派（compute::apply 统一入口）
+├── （algebra_expr.hpp / algebra_compute.hpp 已于 2026-09 移除）
 │
 │  ┌─ L2 计算层 ──────────────────────────────────────┐
 ├── compute_layer.hpp      # 层基类和实现（Linear/ReLU/GeLU/GPT...）
@@ -435,9 +427,9 @@ include/neuralnet.cpp/
 
 ```cpp
 // 每个头文件只负责一个功能模块
-// matrix.hpp - 矩阵运算
+// algebra_matrix.hpp - 矩阵运算
 // layer.hpp  - 层定义
-// loss.hpp   - 损失函数
+// compute_loss.hpp   - 损失函数
 // 避免大而全的头文件
 ```
 
@@ -607,18 +599,15 @@ void matrix_multiply(Matrix& result, const Matrix& a, const Matrix& b) {
 #### 6.2.4 并行化
 
 ```cpp
-// 使用自定义 SmartPolicy 进行并行化
-void SmartPolicy::apply(Iterator begin, Iterator end, Func func) {
-    const auto distance = std::distance(begin, end);
-    if (distance < PARALLEL_THRESHOLD) {
-        // 小数据量：串行执行
-        std::for_each(std::execution::seq, begin, end, func);
-    } else {
-        // 大数据量：并行执行
-        std::for_each(std::execution::par_unseq, begin, end, func);
-    }
-}
+// 并行策略内置于 core_config.hpp / core_threadpool.hpp，**没有用户可替换的 policy 类型**：
+//   小数据（< PARALLEL_THRESHOLD=524288）串行；大数据走全局线程池。
+// 上层只需调用（样本级 / 块级两个入口）：
+nn::parallel_for_samples(n, [&](std::size_t i) noexcept { /* 第 i 个样本 */ });
+nn::parallel_for_blocks(idx.begin(), idx.end(), [&](std::size_t b) noexcept { /* 第 b 块 */ });
 ```
+
+> 历史说明：早期文档把该策略命名为「SmartPolicy」并给出用户可替换 policy 的扩展示例，
+> 该类型**在代码中从不存在**（只有上述自由函数 + 阈值门控），示例已按实际 API 更正。
 
 ### 6.3 性能注解
 
@@ -714,7 +703,7 @@ const std::vector<int>& vec;  // 推荐
 
 ```cpp
 // 1. 对应的头文件（如适用）
-#include "matrix.hpp"
+#include "algebra_matrix.hpp"
 
 // 2. C++ 标准库
 #include <vector>
@@ -725,7 +714,7 @@ const std::vector<int>& vec;  // 推荐
 #include <fmt/format.h>
 
 // 4. 项目内头文件
-#include <neuralnet.cpp/nn_config.hpp>
+#include <neuralnet.cpp/nn_core_config.hpp>
 ```
 
 ---
@@ -736,7 +725,7 @@ const std::vector<int>& vec;  // 推荐
 
 **全项目禁止使用 throw/try/catch**，统一使用 C++23 的 `std::expected<T, E>` 进行错误传播。
 
-#### 基础类型定义（nn_config.hpp）
+#### 基础类型定义（nn_core_config.hpp）
 
 ```cpp
 struct Error {

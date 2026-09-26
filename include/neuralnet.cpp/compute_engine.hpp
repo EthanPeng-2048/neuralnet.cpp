@@ -14,22 +14,20 @@
 // 原语分类：
 //   - 矩阵级：matmul, batched_matmul, transpose, add_inplace, scale_inplace, zero
 //   - 归约级：row_reduce_sum, col_reduce_sum
-//   - 广播级：broadcast_row_inplace, broadcast_col_inplace
-//   - 逐元素：elementwise_unary, elementwise_binary, elementwise_binary_scalar
-//   - 条件选择：elementwise_select_scalar_cond
+//   - 分组归约：grouped_reduce_sum, grouped_reduce_max
+//   - 条件选择：由表达式 DSL 的 select 承担（engine 不再暴露该原语）
 //
 // 批处理控制：
 //   - begin_batch / end_batch：CPU 引擎为 no-op；GPU 引擎录制到
 //     command buffer，end_batch 时统一提交。
 //
 // 多精度（docs/development/05-mixed-precision.md §8）：
-//   - **运算类**原语（逐元素 / 归约 / 扫描 / eval_expr）带显式形参
+//   - **运算类**原语（归约 / 扫描 / eval_expr）带显式形参
 //     `Precision P = Precision::F32`：P = 该算子输出（及计算）精度。
 //   - **纯数据搬运**原语（transpose / slice_rows / insert_rows / gather_rows /
 //     scatter_add_rows / rearrange_3d / im2col / col2im / clone）**不带 P**：
 //     输出精度 = 源精度（§8.4 的自然语义）。
-//   - **in-place** 原语（add_inplace / scale_inplace / axpy_inplace / zero /
-//     broadcast_*_inplace / eval_expr_into）**存储精度不可变**（§8.3）。
+//   - **in-place** 原语（add_inplace / scale_inplace / zero / eval_expr_into）**存储精度不可变**（§8.3）。
 //   - P 的消费方是 `PrecisionEngine`（compute_precision_engine.hpp，f16 边界
 //     cast 适配层）。**CpuEngine / GpuEngine 的原生实现只支持 F32 存储**：
 //     f16 存储张量必须经适配层运算（适配层把所有操作数抬到 f32 跑既有
@@ -53,40 +51,6 @@ namespace nn
 // ══════════════════════════════════════════════════════════════════════════
 // 算子枚举（op-level，不含算法语义）
 // ══════════════════════════════════════════════════════════════════════════
-
-// 一元算子
-enum class UnaryOp : uint32_t
-{
-    Neg   = 0,  // -x
-    Exp   = 1,  // e^x
-    Log   = 2,  // ln(x)
-    Sqrt  = 3,  // √x
-    Rsqrt = 4,  // 1/√x
-    Abs   = 5,  // |x|
-    Tanh  = 6,  // tanh(x)
-};
-
-// 二元算子
-enum class BinaryOp : uint32_t
-{
-    Add = 0,  // a + b
-    Sub = 1,  // a - b
-    Mul = 2,  // a * b
-    Div = 3,  // a / b
-    Max = 4,  // max(a, b)
-    Min = 5,  // min(a, b)
-};
-
-// 比较算子（用于条件选择）
-enum class CompareOp : uint32_t
-{
-    Lt = 0,  // a <  b
-    Le = 1,  // a <= b
-    Gt = 2,  // a >  b
-    Ge = 3,  // a >= b
-    Eq = 4,  // a == b
-    Ne = 5,  // a != b
-};
 
 // 归约算子（matmul 融合原语用，op-level 无算法语义）
 enum class ReduceOp : uint32_t
@@ -131,19 +95,6 @@ public:
     [[nodiscard]] virtual std::string pool_stats() const { return {}; }
 
     // ── 激活 offload（L1-offload）───────────────────────────────────
-    // offload_store：把 GPU 激活复制到 host-visible 存储（释放 device-local
-    //    VRAM），返回一个 opaque 句柄。GPU 引擎录制式（batch 内不提交）；
-    //    CPU 引擎 no-op（返回 src 本身）。
-    // offload_load：从 offload_store 的句柄复制回 GPU，恢复为 (rows, cols)。
-    //    CPU 引擎 no-op（返回句柄 reshape 为 rows×cols）。
-    [[nodiscard]] virtual Result<Tensor> offload_store(const Tensor& src) { return src; }
-
-    [[nodiscard]] virtual Result<Tensor> offload_load(
-        const Tensor& handle, std::size_t rows, std::size_t cols)
-    {
-        return handle.reshape(rows, cols);
-    }
-
     // ── activation offload slab（L1-offload，持久复用缓冲） ────────────
     // 每个 GPTBlock / RAPTBlock 持有一块持久 host-visible slab，所有激活按
     // float 偏移写入/读出，跨 step 复用 → RAM = 激活实际体积（避免每 tensor
@@ -424,10 +375,6 @@ public:
     // A *= scalar
     [[nodiscard]] virtual Result<void> scale_inplace(Tensor& A, Scalar s) = 0;
 
-    // A += scalar * B（融合 axpy：单次 dispatch 替代 clone+scale+add 三步）
-    // 用于 Optimizer 的 scale_add_ 辅助方法，减少 2 个临时 GPU buffer 分配
-    [[nodiscard]] virtual Result<void> axpy_inplace(Tensor& A, Scalar scalar, const Tensor& B) = 0;
-
     // A = 0
     [[nodiscard]] virtual Result<void> zero(Tensor& A) = 0;
 
@@ -507,11 +454,6 @@ public:
     [[nodiscard]] virtual Result<Tensor> col_reduce_sum(
         const Tensor& A, Precision P = Precision::F32) = 0;
 
-    // 按行求最大值：A (rows, cols) → out (rows, 1)
-    // out[r] = max_c A[r][c]
-    [[nodiscard]] virtual Result<Tensor> row_reduce_max(
-        const Tensor& A, Precision P = Precision::F32) = 0;
-
     // 按列求最大值：A (rows, cols) → out (1, cols)
     // out[c] = max_r A[r][c]
     [[nodiscard]] virtual Result<Tensor> col_reduce_max(
@@ -529,52 +471,6 @@ public:
         Precision P = Precision::F32) = 0;
     [[nodiscard]] virtual Result<Tensor> grouped_reduce_max(
         const Tensor& x, std::size_t G, std::size_t R,
-        Precision P = Precision::F32) = 0;
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 广播原语
-    // ══════════════════════════════════════════════════════════════════════
-
-    // 按行广播：A (R, C) op= row_vec (R, 1)
-    // A[r][c] = op(A[r][c], row_vec[r][0])
-    [[nodiscard]] virtual Result<void> broadcast_row_inplace(
-        Tensor& A, const Tensor& row_vec, BinaryOp op) = 0;
-
-    // 按列广播：A (R, C) op= col_vec (1, C)
-    // A[r][c] = op(A[r][c], col_vec[0][c])
-    [[nodiscard]] virtual Result<void> broadcast_col_inplace(
-        Tensor& A, const Tensor& col_vec, BinaryOp op) = 0;
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 逐元素原语
-    // ══════════════════════════════════════════════════════════════════════
-
-    // out = unary_op(A)
-    // P：输出精度（默认 F32；f16 存储需经 PrecisionEngine 适配层）
-    [[nodiscard]] virtual Result<Tensor> elementwise_unary(
-        UnaryOp op, const Tensor& A, Precision P = Precision::F32) = 0;
-
-    // out = binary_op(A, B)
-    [[nodiscard]] virtual Result<Tensor> elementwise_binary(
-        BinaryOp op, const Tensor& A, const Tensor& B,
-        Precision P = Precision::F32) = 0;
-
-    // out = binary_op(A, scalar) 或 binary_op(scalar, A)
-    // scalar_first=true: out = op(scalar, A)；false: out = op(A, scalar)
-    [[nodiscard]] virtual Result<Tensor> elementwise_binary_scalar(
-        BinaryOp op, const Tensor& A, Scalar s, bool scalar_first = false,
-        Precision P = Precision::F32) = 0;
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 条件选择原语
-    // ══════════════════════════════════════════════════════════════════════
-
-    // out = compare_op(A, scalar_b) ? then_t : scalar_else
-    // 条件操作数 2 为标量，then 为张量，else 为标量。
-    // 典型用途：ReLU 反向 (x > 0) ? grad : 0
-    [[nodiscard]] virtual Result<Tensor> elementwise_select_scalar_cond(
-        CompareOp cmp, const Tensor& A, Scalar scalar_b,
-        const Tensor& then_t, Scalar scalar_else,
         Precision P = Precision::F32) = 0;
 
     // ══════════════════════════════════════════════════════════════════════
@@ -669,4 +565,3 @@ private:
 }
 
 } // namespace nn
-

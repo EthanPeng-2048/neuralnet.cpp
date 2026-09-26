@@ -9,7 +9,6 @@
 // ── precision_type_test (f16 类型系统) ─────────────────────────────────────
 #define main test_precision_type
 #define g_failures g_fail_precision_type
-#undef CHECK
 #include "precision_type_test.cpp"
 #undef g_failures
 #undef main
@@ -17,7 +16,6 @@
 // ── tensor_precision_test (variant 存储) ───────────────────────────────────
 #define main test_tensor_precision
 #define g_failures g_fail_tensor_precision
-#undef CHECK
 #include "tensor_precision_test.cpp"
 #undef g_failures
 #undef main
@@ -26,7 +24,6 @@
 #define main test_f16_compute
 #define g_failures g_fail_f16_compute
 #define test_error_paths test_f16_error_paths
-#undef CHECK
 #include "f16_compute_test.cpp"
 #undef test_error_paths
 #undef g_failures
@@ -35,7 +32,6 @@
 // ── precision_profile_test (PrecisionProfile 配方语义：--f16 = 全 f16) ─────
 #define main test_precision_profile
 #define g_failures g_fail_precision_profile
-#undef CHECK
 #include "precision_profile_test.cpp"
 #undef g_failures
 #undef main

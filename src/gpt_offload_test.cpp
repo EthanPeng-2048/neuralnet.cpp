@@ -33,6 +33,7 @@ int main()
 }
 #else
 #include <neuralnet.cpp/backend/compute_vk_backend.hpp>
+#include "test_common.hpp"
 
 using nn::ActivationType;
 using nn::GPTModel;
@@ -44,27 +45,6 @@ using nn::PosEncodingType;
 namespace
 {
 
-bool close_to(const Matrix& a, const Matrix& b, Scalar tol,
-              const std::string& name, std::size_t idx)
-{
-    Scalar max_abs = 0;
-    Scalar max_rel = 0;
-    const auto& sa = a.span();
-    const auto& sb = b.span();
-    for (std::size_t i = 0; i < a.size(); ++i)
-    {
-        const Scalar diff = std::fabs(sa[i] - sb[i]);
-        if (diff > max_abs) max_abs = diff;
-        const Scalar denom = std::fabs(sb[i]) > 1e-30f ? std::fabs(sb[i]) : 1.0f;
-        const Scalar rel = diff / denom;
-        if (rel > max_rel) max_rel = rel;
-    }
-    const bool pass = (max_abs <= tol) || (max_rel <= tol);
-    std::cout << "    [" << idx << "] " << name
-              << "  max_abs=" << max_abs << "  max_rel=" << max_rel
-              << (pass ? "  ✅" : "  ❌") << "\n";
-    return pass;
-}
 
 int run_test()
 {
@@ -142,10 +122,17 @@ int run_test()
     bool all_pass = true;
 
     // ── 开启 offload，重跑并对比 ──
+    // 训练真实路径是 batch 录制模式（begin_batch → forward+backward → end_batch）：
+    // activation offload 的 save/restore 必须在同一录制窗口内正确工作，故这里显式
+    // 包一层录制（rapt_offload_test 保持非录制路径，两者互补覆盖）。
     model.set_activation_offload(true);
+    {
+        auto bb = eng.begin_batch();
+        if (!bb) { std::cerr << "begin_batch failed: " << bb.error().message << "\n"; return 1; }
+    }
     auto r = model.forward(eng, *x);
     if (!r) { std::cerr << "offload forward failed: " << r.error().message << "\n"; return 1; }
-    auto lm = eng.to_matrix(*r);
+    auto lm = eng.to_matrix(*r);  // to_matrix 会打断 batch（flush 后自动重新 begin）
     if (!lm) { std::cerr << "to_matrix(logits) failed\n"; return 1; }
 
     bool fwd_pass = close_to(*lm, baseline_logits, tol, "logits", 0);
@@ -158,6 +145,10 @@ int run_test()
     }
     auto b = model.backward(eng, *go);
     if (!b) { std::cerr << "offload backward failed: " << b.error().message << "\n"; return 1; }
+    {
+        auto eb = eng.end_batch();
+        if (!eb) { std::cerr << "end_batch failed: " << eb.error().message << "\n"; return 1; }
+    }
 
     const auto& grads = model.param_gradients();
     for (std::size_t p = 0; p < grads.size(); ++p)

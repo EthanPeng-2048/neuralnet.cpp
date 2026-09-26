@@ -186,7 +186,7 @@ enum class Precision : uint8_t
 
 - `std::vector<elem<P>> data_`；现有全部运算代码**模板化到 P**（代数层是纯 CPU、无虚接口，模板化零成本）。
 - Phase 1 只实例化 **F32 / F16**；**F32 实例化必须与现状逐字节一致**（验收 A/B 测试，§13.1）。
-- dsl / 表达式模板链（`algebra_expr.hpp` / `expr_dsl.hpp`）随 P 实例化。
+- dsl / 表达式模板链（`expr_dsl.hpp`；旧 `algebra_expr.hpp` 已于 2026-09 移除）随 P 实例化。
 
 ### 6.3 GpuTensor&lt;P&gt;（L0 GPU 存储）
 
@@ -307,7 +307,7 @@ engine.cast(const Tensor& src, Precision dst) → Result<Tensor>
 
 ### 8.3 in-place 算子特例（必须写进 API 注释）
 
-in-place 算子（`add_inplace` / `scale_inplace` / `axpy_inplace` / `zero`…）的输出即操作数本身，**存储精度不可变**。显式 P 只改变**计算/累加路径**，结果舍回原存储精度。例：`add_inplace(A_f16, B, P = F32)` = f32 计算、结果舍回 f16。想改变张量精度 = 显式 `cast`。
+in-place 算子（`add_inplace` / `scale_inplace` / `zero`…）的输出即操作数本身，**存储精度不可变**。显式 P 只改变**计算/累加路径**，结果舍回原存储精度。例：`add_inplace(A_f16, B, P = F32)` = f32 计算、结果舍回 f16。想改变张量精度 = 显式 `cast`。
 
 ### 8.4 数据操作类算子
 
@@ -409,7 +409,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 | FFN | `matmul(…, p_.compute)` | F16 | f16 |
 | loss 及梯度 | `forward_sparse(…, p_.stable)` | F32 | loss f32，grad f32（D9） |
 | 反向 matmul | `matmul(grad_f32, x_f16, p_.compute)` | F16 | grad 降 cast f16（经典 f16 训练形态） |
-| 优化器 | `axpy_inplace(m_f32, β, g)` | F32（optimizer） | 权重 f32 更新 |
+| 优化器 | `dsl::compute_into(p + g·rparam(-lr), p)` | F32（optimizer） | 权重 f32 更新（原 `axpy_inplace` 已于 2026-09 删除） |
 
 **两个可见的推论**（写入文档防止误解）：
 
@@ -948,7 +948,7 @@ nn_embed_shader(matmul_tiled_f16   ${CMAKE_SOURCE_DIR}/shaders/matmul_tiled.comp
 | `backend/compute_vk_backend.hpp` | `GpuTensor<P>`、`GpuBuffer` 字节数参数化、`shaderFloat16` 查询、f16 GEMM pipeline |
 | `compute_engine.hpp` + `compute_cpu_engine.hpp` + `compute_gpu_engine.hpp` | 原语 `P` 参数、`cast`、`from/to_matrix` 重载、f16 实现、能力分派表 |
 | `shaders/` | `matmul_f16*.comp`（手写原语，仿 `matmul_tiled`） |
-| `algebra_expr.hpp` / `expr_dsl.hpp` / `expr_*` | 按 P 实例化（F32 不变 + F16）；Phase 2 的 key 扩展另行评审 |
+| `expr_dsl.hpp` / `expr_*`（原 `algebra_expr.hpp` 已于 2026-09 移除） | 按 P 实例化（F32 不变 + F16）；Phase 2 的 key 扩展另行评审 |
 | `compute_layer_*.hpp` | `p_` 成员 + 全部原语调用显式 P |
 | `compute_loss.hpp` / `compute_optimizer.hpp` | 显式 P（loss = stable；状态 = optimizer；参数 = param） |
 | `model_container.hpp` / `model_spec.hpp` | `PrecisionProfile` 持有与透传 |

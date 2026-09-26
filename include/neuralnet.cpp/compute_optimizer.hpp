@@ -5,8 +5,8 @@
 // 架构铁律：
 //   1. Optimizer 的 step/zero_grad 只写一次，通过 ComputeEngine 参数自动适配
 //      CPU/GPU 设备。
-//   2. 优化器算法只通过 engine 原语（scale_inplace / add_inplace /
-//      elementwise_binary / elementwise_unary 等）表达，不直接操作 Matrix。
+//   2. 优化器算法只通过 engine 原语 + 表达式 DSL（dsl::compute_into /
+//      scale_inplace / add_inplace 等）表达，不直接操作 Matrix。
 //   3. 参数与梯度均为 Tensor*（指向 Layer 持有的参数/梯度张量）。
 //
 // 算法表达示例（原语组合）：
@@ -190,7 +190,7 @@ public:
 // SGD — 随机梯度下降
 //
 // 算法：p -= lr * g
-// 原语：axpy_inplace(p, -lr, g)
+// 实现：dsl::compute_into(leaf(p) + leaf(g) * rparam(-lr), p)
 // ══════════════════════════════════════════════════════════════════════════
 class SGD : public Optimizer
 {
@@ -226,7 +226,7 @@ public:
 // SGDWithMomentum — 带动量的 SGD
 //
 // 算法：v = β*v + (1-β)*g;  p -= lr*v
-// 原语：axpy_inplace(v, 1-β, g)  →  axpy_inplace(p, -lr, v)
+// 实现：dsl::compute_into 两步（v = β·v + (1-β)·g；p -= lr·v）
 // ══════════════════════════════════════════════════════════════════════════
 class SGDWithMomentum : public Optimizer
 {

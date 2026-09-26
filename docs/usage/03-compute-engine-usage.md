@@ -207,16 +207,16 @@ engine.add_inplace(*a, *b);
 engine.scale_inplace(*a, 0.1f);
 ```
 
-### 融合 axpy
+### 融合 axpy（2026-09 已移除该原语）
+
+`engine.axpy_inplace` 已删除——原地融合一律走表达式目标传递：
 
 ```cpp
-// A += scalar * B
-engine.axpy_inplace(*a, 0.01f, *grad);
+// A += scalar * B（单条融合表达式 + 零分配原地写回）
+(void)dsl::compute_into(engine, dsl::leaf(*a) + dsl::leaf(*b) * dsl::rparam(s), *a);
 ```
 
-**优势**：比 `clone + scale + add` 更高效。**注**：项目内当前更推荐一条 DSL 表达式
-（`dsl::compute_into(engine, leaf(a) + leaf(b) * rparam(s), a)`）——optimizer 即此写法，
-`axpy_inplace` 目前无生产调用方（见 `development/12-compute-engine-inventory.md` §2.2）。
+optimizer 即此写法（见 `compute_optimizer.hpp`）。
 
 ### 置零
 
@@ -237,8 +237,8 @@ auto row_sum = engine.row_reduce_sum(*tensor);
 // 按列求和: (rows, cols) → (1, cols)
 auto col_sum = engine.col_reduce_sum(*tensor);
 
-// 按行求最大值: (rows, cols) → (rows, 1)
-auto row_max = engine.row_reduce_max(*tensor);
+// 按行求最大值：引擎算子已于 2026-09 删除，请用 DSL 归约叶子
+//   auto row_max = dsl::compute_reduce(engine, dsl::row_reduce_max(*tensor), rows, cols);
 
 // 按列求最大值: (rows, cols) → (1, cols)
 auto col_max = engine.col_reduce_max(*tensor);
@@ -255,24 +255,26 @@ engine.scale_inplace(*mean, 1.0f / x->cols());
 auto max_val = engine.col_reduce_max(*logits);
 ```
 
-### 广播操作
+### 广播操作（2026-09 已移除两个原语）
+
+`broadcast_row_inplace` / `broadcast_col_inplace` 已删除，广播一律在表达式里表达：
 
 ```cpp
-// 按行广播: A (R, C) op= row_vec (R, 1)
-engine.broadcast_row_inplace(*a, *row_vec, BinaryOp::Add);
+// 按行广播：A += row_vec（row_vec 每行一个值）
+(void)dsl::compute_into(engine, dsl::leaf(*a) + dsl::row_broadcast(*row_vec), *a);
 
-// 按列广播: A (R, C) op= col_vec (1, C)
-engine.broadcast_col_inplace(*a, *col_vec, BinaryOp::Mul);
+// 按列广播：A *= col_vec（col_vec 每列一个值）
+(void)dsl::compute_into(engine, dsl::leaf(*a) * dsl::col_broadcast(*col_vec), *a);
 ```
 
 **典型用途**：
 
 ```cpp
 // 加偏置: output += bias (每行加同一个偏置)
-engine.broadcast_row_inplace(*output, *bias, BinaryOp::Add);
+(void)dsl::compute_into(engine, dsl::leaf(*output) + dsl::row_broadcast(*bias), *output);
 
 // 缩放: output *= scale (每列乘同一个缩放)
-engine.broadcast_col_inplace(*output, *scale, BinaryOp::Mul);
+(void)dsl::compute_into(engine, dsl::leaf(*output) * dsl::col_broadcast(*scale), *output);
 ```
 
 ---
@@ -282,77 +284,38 @@ engine.broadcast_col_inplace(*output, *scale, BinaryOp::Mul);
 > 单步调试/小工具用下面的 eager 原语即可；**生产代码组合多个运算时优先写一条
 > `dsl::compute` 表达式**（见"表达式融合"）——一次 dispatch、无中间 Tensor。
 
-### 一元运算
+### 一元运算（2026-09：原语已删除，改用表达式）
 
 ```cpp
-// out = -a
-auto neg = engine.elementwise_unary(UnaryOp::Neg, *a);
-
-// out = exp(a)
-auto exp = engine.elementwise_unary(UnaryOp::Exp, *a);
-
-// out = log(a)
-auto log = engine.elementwise_unary(UnaryOp::Log, *a);
-
-// out = sqrt(a)
-auto sqrt = engine.elementwise_unary(UnaryOp::Sqrt, *a);
-
-// out = 1/sqrt(a)
-auto rsqrt = engine.elementwise_unary(UnaryOp::Rsqrt, *a);
-
-// out = abs(a)
-auto abs = engine.elementwise_unary(UnaryOp::Abs, *a);
-
-// out = tanh(a)
-auto tanh = engine.elementwise_unary(UnaryOp::Tanh, *a);
+// neg / exp / log / sqrt / rsqrt / abs / tanh 都是 DSL 一元叶子
+auto exp_t = dsl::compute(engine, dsl::exp(dsl::leaf(*a)), a->rows(), a->cols());
+auto neg_t = dsl::compute(engine, -dsl::leaf(*a),           a->rows(), a->cols());
 ```
 
-### 二元运算
+### 二元运算（2026-09：原语已删除，改用表达式）
 
 ```cpp
-// out = a + b
-auto add = engine.elementwise_binary(BinaryOp::Add, *a, *b);
-
-// out = a - b
-auto sub = engine.elementwise_binary(BinaryOp::Sub, *a, *b);
-
-// out = a * b
-auto mul = engine.elementwise_binary(BinaryOp::Mul, *a, *b);
-
-// out = a / b
-auto div = engine.elementwise_binary(BinaryOp::Div, *a, *b);
-
-// out = max(a, b)
-auto max = engine.elementwise_binary(BinaryOp::Max, *a, *b);
-
-// out = min(a, b)
-auto min = engine.elementwise_binary(BinaryOp::Min, *a, *b);
+// + - * / 与 max/min 直接写在表达式里（运算符重载）
+auto sum_t = dsl::compute(engine, dsl::leaf(*a) + dsl::leaf(*b), a->rows(), a->cols());
+auto mx_t  = dsl::compute(engine, dsl::max(dsl::leaf(*a), dsl::leaf(*b)), a->rows(), a->cols());
 ```
 
-### 标量二元运算
+### 标量二元运算（2026-09：原语已删除，改用表达式）
 
 ```cpp
-// out = a + scalar
-auto add = engine.elementwise_binary_scalar(BinaryOp::Add, *a, 1.0f);
-
-// out = scalar + a
-auto add = engine.elementwise_binary_scalar(BinaryOp::Add, *a, 1.0f, /*scalar_first=*/true);
-
-// out = a * scalar
-auto mul = engine.elementwise_binary_scalar(BinaryOp::Mul, *a, 0.1f);
+// 标量在右 / 在左皆可；dsl::rparam 承载运行时标量（不进 AOT key）
+auto y = dsl::compute(engine, dsl::leaf(*a) * dsl::rparam(0.1f), a->rows(), a->cols());
+auto z = dsl::compute(engine, dsl::rparam(1.0f) + dsl::leaf(*a), a->rows(), a->cols());
 ```
 
-### 条件选择
+### 条件选择（2026-09：原语已删除）
 
 ```cpp
-// out = (a > 0) ? then_t : 0.0f
-auto relu_grad = engine.elementwise_select_scalar_cond(
-    CompareOp::Gt, *x, 0.0f, *grad, 0.0f);
+// ReLU 反向等条件选择用 dsl::select(cond, then, else)
+auto relu_grad = dsl::compute(engine,
+    dsl::select(dsl::leaf(*x) > Scalar{0}, dsl::leaf(*g), dsl::rparam(0)),
+    x->rows(), x->cols());
 ```
-
-**典型用途**：ReLU 反向传播。
-**注**：ReLU 层实际写法是 DSL `dsl::select(leaf(x) > 0, leaf(g), 0)`（单表达式融合）；
-本原语当前无生产调用方，接口保留。
 
 ---
 

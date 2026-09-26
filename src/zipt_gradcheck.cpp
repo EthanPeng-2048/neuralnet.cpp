@@ -16,6 +16,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "test_common.hpp"
 
 using nn::Scalar;
 using nn::Matrix;
@@ -27,21 +28,7 @@ using nn::ZiPTBlock;
 
 namespace {
 
-Scalar dot(const Matrix& a, const Matrix& b)
-{
-    Scalar s{0};
-    const auto sa = a.span();
-    const auto sb = b.span();
-    for (std::size_t i = 0; i < a.size(); ++i)
-        s += sa[i] * sb[i];
-    return s;
-}
 
-bool approx(Scalar num, Scalar ana, Scalar tol)
-{
-    return std::fabs(num - ana) <=
-           tol * (Scalar{1} + std::fabs(num) + std::fabs(ana));
-}
 
 // 对单个参数张量做中心差分梯度检查。
 // eval_loss：在参数被 perturb 后求标量损失的闭包；base/ana 为参数基准与解析梯度。

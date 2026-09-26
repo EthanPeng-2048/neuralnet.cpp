@@ -93,3 +93,25 @@ f32→f16→f32 双趟 cast 再返回 f32（量化模拟语义）。热路径上
   现有 `f16_writeback_probe` 已覆盖 f16 写回子集，可扩展为通用训练 N 步
   参数变化校验。
 - MSVC Debug 大 TU（text_train.cpp）可能需 `/bigobj`（C1128），未复现前不加。
+
+## 9. 已执行：代码缩减轮（2026-09-26）
+
+> 依据：全仓"悬空设计"审计（A/B/C 三档）+ activation offload 只读评估。逐项均已 build + ctest 验证（**20 → 19 个目标，19/19 全绿**）。
+
+| 项 | 内容 | 验证 |
+|---|---|---|
+| A 档死码 | `elementwise_select_scalar_cond`、`axpy_inplace`、`broadcast_row_inplace`、`nn::one_hot`、`text_train::one_hot_labels`、`Matrix::multiply_transposed_add_to`、`nn::sigmoid`·`relu`、`ops::Sigmoid`·`ReLU` 全删 | ctest 19/19 |
+| 测试结构 | 新增 `src/test_common.hpp`：`CHECK`/`make_tensor`/`check_close`/`approx`/`dot`/`close_to` 收敛唯一副本；聚合器不再逐符号 `#define` 重命名。**保留聚合编译**（`#define main`），子测试不再各自复制工具 | ctest 19/19 |
+| RAPT→DSL | `compute_layer_rapt.hpp` `forward_step` 的 `num/den` 除法改 `dsl::compute(engine, leaf/(leaf+Scalar{1e-4}), rows, cols)`，与 `forward` 表达式**同构** → 复用已注册 AOT 键 | rapt_test / rapt_offload_test |
+| 算子收敛 | 删 `elementwise_unary/binary/binary_scalar`、`broadcast_col_inplace`（+`broadcast.comp`/`broadcast_gpu`/pipeline/成员/查询全链）、引擎 `row_reduce_max`、`offload_store/load`、`UnaryOp/BinaryOp/CompareOp`；**引擎 virtual 58 → 49** | ctest 19/19 |
+| AST 移除 | `algebra_expr.hpp` + `algebra_compute.hpp` 删除；`Expression`/`BoolExpression` 迁入 `expr_dsl.hpp`；`Matrix::detail::*` 死函数删除 → **CPU 求值只剩两套** | ctest 19/19 |
+| offload 评估 | 结论：**保留 A 组生产链，删除 B 组**（`offload_store/load` + `offload_primitive_test` + 重复聚合器）；`gpt_offload_test` 补 `begin_batch/end_batch` 覆盖训练录制路径；CPU/ZiPT 由静默 no-op 改显式警告；帮助文本"互斥"更正为"可混合" | gpt_offload_test / rapt_offload_test |
+| 死 override | `TransformerEncoderLayer` / `ZiPTBlock` 的 `activation_cache()`（20 行，无调用者）删除 | ctest 19/19 |
+
+**本轮教训（进 §10 高频坑候选）**
+1. `dsl::compute` **没有 2 参重载**——签名是 `(engine, expr, rows, cols[, P])`；旧文档写的"`dsl::compute(engine, expr)` 最常用"是错的（已在 AGENTS §7 更正）。
+2. **eager → DSL 迁移前必须确认目标表达式结构已被 `scan_exprs` 覆盖**：否则 GPU 闭合世界运行期硬报错。本轮通过"写成与已扫描表达式同构"（RAPT 除法加 ε 位置对齐）零成本复用键。
+3. 改测试公共头后，**聚合器的 `#undef CHECK` 必须同步删除**（pragma once 之下 `#undef` 会让后续子文件失去宏定义）。
+4. **未收集**：`max_abs_diff`（9 份副本，其中 conv2d 版多形状守卫语义）——统一前需逐点确认语义，留待单独立项。
+5. **未收集**：`gpt_test` 偶发失败（本轮 62 次直跑仅 1 次失败、日志被覆盖未定位；疑似资源/竞争，非本轮改动引入，登记观察）。
+

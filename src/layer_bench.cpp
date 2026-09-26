@@ -322,25 +322,7 @@ void setup_exp(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
 {
     ctx.a = make_input(e, c.m, c.n);
 }
-void run_exp(ComputeEngine& e, const BenchConfig&, OpCtx& ctx)
-{
-    ctx.c = *e.elementwise_unary(nn::UnaryOp::Exp, ctx.a);
-}
 double bytes_binary(const BenchConfig& c) { return 2.0 * c.m * c.n * sizeof(Scalar); }
-
-void setup_bcast_col(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
-{
-    ctx.a = make_input(e, c.m, c.n);
-    ctx.aux = make_input(e, 1, c.n);
-}
-void run_bcast_col(ComputeEngine& e, const BenchConfig&, OpCtx& ctx)
-{
-    (void)e.broadcast_col_inplace(ctx.a, ctx.aux, nn::BinaryOp::Add);
-}
-double bytes_bcast_col(const BenchConfig& c)
-{
-    return (2.0 * c.m * c.n + c.n) * sizeof(Scalar);
-}
 
 void run_row_reduce(ComputeEngine& e, const BenchConfig&, OpCtx& ctx)
 {
@@ -375,8 +357,6 @@ const std::vector<OpSpec>& op_registry()
         {"matmul_at", setup_matmul_at, run_matmul_at, work_matmul, true},
         {"batched_matmul", setup_batched, run_batched, work_batched, true},
         {"add_inplace", setup_add, run_add, bytes_add, false},
-        {"elementwise_exp", setup_exp, run_exp, bytes_binary, false},
-        {"broadcast_col", setup_bcast_col, run_bcast_col, bytes_bcast_col, false},
         {"row_reduce_sum", setup_exp, run_row_reduce, bytes_row_reduce, false},
         {"col_reduce_sum", setup_exp, run_col_reduce, bytes_col_reduce, false},
         {"transpose", setup_exp, run_transpose, bytes_transpose, false},
@@ -497,8 +477,8 @@ void print_help(const char* prog)
     std::printf("  --m/--n/--k      算子尺寸（matmul: (m,k)·(k,n)；逐元素/归约: (m,n)）\n");
     std::printf("层名: linear swiglu layernorm rmsnorm softmax mha causal_attn\n");
     std::printf("      feedforward transformer gpt_block conv2d maxpool\n");
-    std::printf("算子: matmul matmul_bt matmul_at batched_matmul add_inplace elementwise_exp\n");
-    std::printf("      broadcast_col row_reduce_sum col_reduce_sum transpose scale_inplace\n");
+    std::printf("算子: matmul matmul_bt matmul_at batched_matmul add_inplace\n");
+    std::printf("      row_reduce_sum col_reduce_sum transpose scale_inplace\n");
 }
 
 size_t parse_size(const char* val)

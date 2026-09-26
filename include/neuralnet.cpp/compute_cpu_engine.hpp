@@ -1,10 +1,11 @@
 #pragma once
 
 // ── compute_cpu_engine.hpp — CPU 计算引擎实现 ─────────────────────────────────────
-// CpuEngine 封装现有 Matrix 方法和 AST（compute::apply），实现
-// ComputeEngine 接口。所有操作同步执行，begin_batch/end_batch 为 no-op。
+// CpuEngine 实现 ComputeEngine 接口（Matrix 存储 + 手写内核）。所有操作同步执行，
+// begin_batch/end_batch 为 no-op。
 //
-// 逐元素运算通过 switch 分发到编译期 AST，保持零开销抽象。
+// 逐元素/融合表达式统一由 expr_dsl.hpp 的 dsl::compute 分派：无归约走模板路径
+// （并行 + 向量化），含归约/matmul/索引视图走 IR 解释器（eval_expr_impl）。
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <algorithm>
@@ -13,8 +14,6 @@
 #include <optional>
 
 #include "compute_engine.hpp"
-#include "algebra_compute.hpp"
-#include "algebra_expr.hpp"
 #include "expr_opt.hpp"
 #include "expr_registry.hpp" // scan 模式融合 kernel 登记（NN_EXPR_SCAN）
 #include "expr_dsl.hpp"      // P3-3：matmul_with_bias 经 DSL 融合（单一事实源）
@@ -867,24 +866,6 @@ public:
         return {};
     }
 
-    // 融合 axpy：A += scalar * B（单次循环，避免 clone+scale+add 三步）
-    // 使用 nn::transform 二元并行版本，与 add_inplace/scale_inplace 一致：
-    //   - n >= PARALLEL_THRESHOLD 时自动并行，否则串行
-    //   - 单次循环 + 内联 lambda，零开销抽象
-    [[nodiscard]] Result<void> axpy_inplace(Tensor& A, Scalar scalar, const Tensor& B) override
-    {
-        if (A.rows() != B.rows() || A.cols() != B.cols())
-            return std::unexpected(Error{"axpy_inplace: shape mismatch"});
-        auto& a = A.cpu_matrix();
-        const auto& b = B.cpu_matrix();
-        auto a_span = a.span();
-        const auto b_span = b.span();
-        nn::transform(a_span.begin(), a_span.end(), b_span.begin(),
-                       a_span.begin(),
-                       [scalar](Scalar x, Scalar y) noexcept { return x + scalar * y; });
-        return {};
-    }
-
     [[nodiscard]] Result<void> zero(Tensor& A) override
     {
         A.cpu_matrix().zero();
@@ -1213,16 +1194,6 @@ public:
         return Tensor::from_matrix(std::move(result));
     }
 
-    [[nodiscard]] Result<Tensor> row_reduce_max(const Tensor& A, Precision = Precision::F32) override
-    {
-        const Matrix& m = A.cpu_matrix();
-        Matrix result = m.row_reduce(
-            std::numeric_limits<Scalar>::lowest(),
-            [](Scalar a, Scalar b) noexcept { return std::max(a, b); },
-            [](Scalar x) noexcept { return x; });
-        return Tensor::from_matrix(std::move(result));
-    }
-
     [[nodiscard]] Result<Tensor> col_reduce_max(const Tensor& A, Precision = Precision::F32) override
     {
         const Matrix& m = A.cpu_matrix();
@@ -1298,191 +1269,6 @@ public:
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 广播原语
-    // ══════════════════════════════════════════════════════════════════════
-
-    [[nodiscard]] Result<void> broadcast_row_inplace(
-        Tensor& A, const Tensor& row_vec, BinaryOp op) override
-    {
-        // 使用具体 lambda（非 std::function）以允许内联和向量化
-        auto& a = A.cpu_matrix();
-        const auto& rv = row_vec.cpu_matrix();
-        switch (op)
-        {
-        case BinaryOp::Add: a.broadcast_row_inplace(rv, [](Scalar x, Scalar y) noexcept { return x + y; }); break;
-        case BinaryOp::Sub: a.broadcast_row_inplace(rv, [](Scalar x, Scalar y) noexcept { return x - y; }); break;
-        case BinaryOp::Mul: a.broadcast_row_inplace(rv, [](Scalar x, Scalar y) noexcept { return x * y; }); break;
-        case BinaryOp::Div: a.broadcast_row_inplace(rv, [](Scalar x, Scalar y) noexcept { return x / y; }); break;
-        case BinaryOp::Max: a.broadcast_row_inplace(rv, [](Scalar x, Scalar y) noexcept { return std::max(x, y); }); break;
-        case BinaryOp::Min: a.broadcast_row_inplace(rv, [](Scalar x, Scalar y) noexcept { return std::min(x, y); }); break;
-        }
-        return {};
-    }
-
-    [[nodiscard]] Result<void> broadcast_col_inplace(
-        Tensor& A, const Tensor& col_vec, BinaryOp op) override
-    {
-        auto& a = A.cpu_matrix();
-        const auto& cv = col_vec.cpu_matrix();
-        switch (op)
-        {
-        case BinaryOp::Add: a.broadcast_col_inplace(cv, [](Scalar x, Scalar y) noexcept { return x + y; }); break;
-        case BinaryOp::Sub: a.broadcast_col_inplace(cv, [](Scalar x, Scalar y) noexcept { return x - y; }); break;
-        case BinaryOp::Mul: a.broadcast_col_inplace(cv, [](Scalar x, Scalar y) noexcept { return x * y; }); break;
-        case BinaryOp::Div: a.broadcast_col_inplace(cv, [](Scalar x, Scalar y) noexcept { return x / y; }); break;
-        case BinaryOp::Max: a.broadcast_col_inplace(cv, [](Scalar x, Scalar y) noexcept { return std::max(x, y); }); break;
-        case BinaryOp::Min: a.broadcast_col_inplace(cv, [](Scalar x, Scalar y) noexcept { return std::min(x, y); }); break;
-        }
-        return {};
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 逐元素原语（通过 AST switch 分发）
-    // ══════════════════════════════════════════════════════════════════════
-
-    [[nodiscard]] Result<Tensor> elementwise_unary(
-        UnaryOp op, const Tensor& A, Precision = Precision::F32) override
-    {
-        const Matrix& m = A.cpu_matrix();
-        // compute::apply 会写满全部元素 → 未初始化构造，省掉一遍全尺寸零写
-        Matrix result = Matrix::make_uninitialized(m.rows(), m.cols());
-        ConstSpan in = m.span();
-        Span out = result.span();
-
-        switch (op)
-        {
-        case UnaryOp::Neg:   compute::apply(out, neg(in));   break;
-        case UnaryOp::Exp:   compute::apply(out, exp(in));   break;
-        case UnaryOp::Log:   compute::apply(out, log(in));   break;
-        case UnaryOp::Sqrt:  compute::apply(out, sqrt(in));  break;
-        case UnaryOp::Rsqrt: compute::apply(out, rsqrt(in)); break;
-        case UnaryOp::Abs:   compute::apply(out, abs(in));   break;
-        case UnaryOp::Tanh:  compute::apply(out, tanh(in));  break;
-        }
-
-        return Tensor::from_matrix(std::move(result));
-    }
-
-    [[nodiscard]] Result<Tensor> elementwise_binary(
-        BinaryOp op, const Tensor& A, const Tensor& B,
-        Precision = Precision::F32) override
-    {
-        if (A.rows() != B.rows() || A.cols() != B.cols())
-            return std::unexpected(Error{"elementwise_binary: shape mismatch"});
-
-        const Matrix& ma = A.cpu_matrix();
-        const Matrix& mb = B.cpu_matrix();
-        Matrix result = Matrix::make_uninitialized(ma.rows(), ma.cols());
-        ConstSpan a = ma.span();
-        ConstSpan b = mb.span();
-        Span out = result.span();
-
-        switch (op)
-        {
-        case BinaryOp::Add: compute::apply(out, a + b); break;
-        case BinaryOp::Sub: compute::apply(out, a - b); break;
-        case BinaryOp::Mul: compute::apply(out, a * b); break;
-        case BinaryOp::Div: compute::apply(out, a / b); break;
-        case BinaryOp::Max: compute::apply(out, max(a, b)); break;
-        case BinaryOp::Min: compute::apply(out, min(a, b)); break;
-        }
-
-        return Tensor::from_matrix(std::move(result));
-    }
-
-    [[nodiscard]] Result<Tensor> elementwise_binary_scalar(
-        BinaryOp op, const Tensor& A, Scalar s, bool scalar_first,
-        Precision = Precision::F32) override
-    {
-        const Matrix& m = A.cpu_matrix();
-        Matrix result = Matrix::make_uninitialized(m.rows(), m.cols());
-        ConstSpan a = m.span();
-        Span out = result.span();
-
-        if (scalar_first)
-        {
-            // out = op(scalar, A)
-            switch (op)
-            {
-            case BinaryOp::Add: compute::apply(out, s + a); break;
-            case BinaryOp::Sub: compute::apply(out, s - a); break;
-            case BinaryOp::Mul: compute::apply(out, s * a); break;
-            case BinaryOp::Div: compute::apply(out, s / a); break;
-            case BinaryOp::Max: compute::apply(out, max(Val{s}, a)); break;
-            case BinaryOp::Min: compute::apply(out, min(Val{s}, a)); break;
-            }
-        }
-        else
-        {
-            // out = op(A, scalar)
-            switch (op)
-            {
-            case BinaryOp::Add: compute::apply(out, a + s); break;
-            case BinaryOp::Sub: compute::apply(out, a - s); break;
-            case BinaryOp::Mul: compute::apply(out, a * s); break;
-            case BinaryOp::Div: compute::apply(out, a / s); break;
-            case BinaryOp::Max: compute::apply(out, max(a, s)); break;
-            case BinaryOp::Min: compute::apply(out, min(a, s)); break;
-            }
-        }
-
-        return Tensor::from_matrix(std::move(result));
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 条件选择原语
-    // ══════════════════════════════════════════════════════════════════════
-
-    [[nodiscard]] Result<Tensor> elementwise_select_scalar_cond(
-        CompareOp cmp, const Tensor& A, Scalar scalar_b,
-        const Tensor& then_t, Scalar scalar_else,
-        Precision = Precision::F32) override
-    {
-        if (A.rows() != then_t.rows() || A.cols() != then_t.cols())
-            return std::unexpected(Error{"elementwise_select: A and then shape mismatch"});
-
-        const Matrix& ma = A.cpu_matrix();
-        const Matrix& mt = then_t.cpu_matrix();
-        // 每个分支都写满 n 个元素 → 未初始化构造
-        Matrix result = Matrix::make_uninitialized(ma.rows(), ma.cols());
-        auto a = ma.span();
-        auto t = mt.span();
-        auto out = result.span();
-        const std::size_t n = a.size();
-
-        // 手动循环避免 AST 对 == / != 的 ConstSpan 支持缺失
-        switch (cmp)
-        {
-        case CompareOp::Lt:
-            for (std::size_t i = 0; i < n; ++i)
-                out[i] = (a[i] < scalar_b) ? t[i] : scalar_else;
-            break;
-        case CompareOp::Le:
-            for (std::size_t i = 0; i < n; ++i)
-                out[i] = (a[i] <= scalar_b) ? t[i] : scalar_else;
-            break;
-        case CompareOp::Gt:
-            for (std::size_t i = 0; i < n; ++i)
-                out[i] = (a[i] > scalar_b) ? t[i] : scalar_else;
-            break;
-        case CompareOp::Ge:
-            for (std::size_t i = 0; i < n; ++i)
-                out[i] = (a[i] >= scalar_b) ? t[i] : scalar_else;
-            break;
-        case CompareOp::Eq:
-            for (std::size_t i = 0; i < n; ++i)
-                out[i] = (a[i] == scalar_b) ? t[i] : scalar_else;
-            break;
-        case CompareOp::Ne:
-            for (std::size_t i = 0; i < n; ++i)
-                out[i] = (a[i] != scalar_b) ? t[i] : scalar_else;
-            break;
-        }
-
-        return Tensor::from_matrix(std::move(result));
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
     // 表达式求值（融合解释器）
     //
     // 对 ExprSpec 一次遍历求值：每个输出元素按指令序列计算，中间结果存
@@ -1527,13 +1313,11 @@ public:
 
     // ── 目标传递（destination-passing）：结果直接写入已有张量 ─────────────
     // 语义同 eval_expr，但**不分配新张量**：dst = f(dst, ...)。
-    // 用于把"原地更新"语义（累加/缩放/axpy/按行按列广播就地）纳入 DSL：
+    // 用于把"原地更新"语义（累加/缩放/按行按列广播就地）纳入 DSL：
     //   add_inplace(A,B)        → eval_expr_into(leaf(A) + leaf(B), A)
     //   scale_inplace(A,s)      → eval_expr_into(leaf(A) * rparam(s), A)
-    //   axpy_inplace(A,s,B)     → eval_expr_into(leaf(A) + leaf(B)*rparam(s), A)
-    //   broadcast_row_inplace(A,v,Add) → eval_expr_into(leaf(A) + row_broadcast(v), A)
     // dst 允许与某个输入是同一 buffer：每个元素先读完全部输入再写 out[i]
-    // （与 nn::compute::apply 的就地安全前提相同；GPU 同一 buffer 绑定为
+    // （就地安全前提：每个元素先读完全部输入再写 out[i]；GPU 同一 buffer 绑定为
     // readonly 输入 + writeonly 输出的逐元素同索引读写亦无跨调用危害）。
     // 仅支持逐元素表达式（无归约）；归约向量输出用 eval_expr_reduce。
     [[nodiscard]] Result<void> eval_expr_into(
@@ -2085,7 +1869,7 @@ public:
             for (std::size_t b = 0; b < mm_batch; ++b)
             {
                 // 每批切片：A 存储 (M,K) 或 (K,M)，元素数恒为 M*K；B 同理恒为 K*N。
-                // ConstSpan/Span 是 AST 视图（无到 std::span 的隐式转换），
+                // ConstSpan/Span 是 DSL 数据视图（无到 std::span 的隐式转换），
                 // 与 batched_matmul 一致，用 data()+偏移显式构造 std::span 子区间。
                 const std::size_t a_off = b * M * K;
                 const std::size_t b_off = b * K * N;
@@ -2540,4 +2324,3 @@ public:
 };
 
 } // namespace nn
-

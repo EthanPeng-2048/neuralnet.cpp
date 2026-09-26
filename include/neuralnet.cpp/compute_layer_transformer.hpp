@@ -208,17 +208,6 @@ public:
         residual2_cache_ = Tensor{};
     }
 
-    std::vector<TensorRef> activation_cache() override
-    {
-        std::vector<TensorRef> r;
-        auto a = self_attn_.activation_cache(); r.insert(r.end(), a.begin(), a.end());
-        auto n1 = norm1_.activation_cache(); r.insert(r.end(), n1.begin(), n1.end());
-        auto f = ff_.activation_cache(); r.insert(r.end(), f.begin(), f.end());
-        auto n2 = norm2_.activation_cache(); r.insert(r.end(), n2.begin(), n2.end());
-        if (residual2_cache_.valid()) r.emplace_back(residual2_cache_);
-        return r;
-    }
-
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
