@@ -336,18 +336,6 @@ public:
     // ── 激活 offload：slab 统一按 f32 存（offset 以 float 为单位）──────────
     // f16 激活在写入 slab 前抬到 f32：restore 出来是 f32，后续运算由本层
     // 适配（正确性不受影响，只是该份激活不再享 f16 存储折半）。
-    [[nodiscard]] Result<Tensor> offload_store(const Tensor& src) override
-    {
-        auto s = to_f32(src);
-        if (!s)
-            return std::unexpected(s.error());
-        return inner_.offload_store(*s);
-    }
-    [[nodiscard]] Result<Tensor> offload_load(
-        const Tensor& handle, std::size_t rows, std::size_t cols) override
-    {
-        return inner_.offload_load(handle, rows, cols);
-    }
     [[nodiscard]] Result<Tensor> create_offload_buffer(std::size_t bytes) override
     {
         return inner_.create_offload_buffer(bytes);
@@ -653,15 +641,6 @@ public:
         return inplace1_(A, [this, s](Tensor& a) { return inner_.scale_inplace(a, s); });
     }
 
-    [[nodiscard]] Result<void> axpy_inplace(
-        Tensor& A, Scalar scalar, const Tensor& B) override
-    {
-        return inplace2_(A, B, [this, scalar](Tensor& a, const Tensor& b)
-        {
-            return inner_.axpy_inplace(a, scalar, b);
-        });
-    }
-
     [[nodiscard]] Result<void> zero(Tensor& A) override
     {
         // 原生 f16 清零：fill_zero 是字节级原语（每步 zero_grad 调用 N 次）
@@ -745,11 +724,6 @@ public:
     {
         return unary_(A, P, [this](const Tensor& a) { return inner_.col_reduce_sum(a); });
     }
-    [[nodiscard]] Result<Tensor> row_reduce_max(
-        const Tensor& A, Precision P = Precision::F32) override
-    {
-        return unary_(A, P, [this](const Tensor& a) { return inner_.row_reduce_max(a); });
-    }
     [[nodiscard]] Result<Tensor> col_reduce_max(
         const Tensor& A, Precision P = Precision::F32) override
     {
@@ -771,71 +745,6 @@ public:
         return unary_(x, P, [this, G, R](const Tensor& t)
         {
             return inner_.grouped_reduce_max(t, G, R);
-        });
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 广播原语（in-place：A 的存储精度不变）
-    // ══════════════════════════════════════════════════════════════════════
-    [[nodiscard]] Result<void> broadcast_row_inplace(
-        Tensor& A, const Tensor& row_vec, BinaryOp op) override
-    {
-        return inplace2_(A, row_vec, [this, op](Tensor& a, const Tensor& v)
-        {
-            return inner_.broadcast_row_inplace(a, v, op);
-        });
-    }
-    [[nodiscard]] Result<void> broadcast_col_inplace(
-        Tensor& A, const Tensor& col_vec, BinaryOp op) override
-    {
-        return inplace2_(A, col_vec, [this, op](Tensor& a, const Tensor& v)
-        {
-            return inner_.broadcast_col_inplace(a, v, op);
-        });
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 逐元素原语
-    // ══════════════════════════════════════════════════════════════════════
-    [[nodiscard]] Result<Tensor> elementwise_unary(
-        UnaryOp op, const Tensor& A, Precision P = Precision::F32) override
-    {
-        return unary_(A, P, [this, op](const Tensor& a)
-        {
-            return inner_.elementwise_unary(op, a);
-        });
-    }
-
-    [[nodiscard]] Result<Tensor> elementwise_binary(
-        BinaryOp op, const Tensor& A, const Tensor& B,
-        Precision P = Precision::F32) override
-    {
-        return binary_(A, B, P, [this, op](const Tensor& a, const Tensor& b)
-        {
-            return inner_.elementwise_binary(op, a, b);
-        });
-    }
-
-    [[nodiscard]] Result<Tensor> elementwise_binary_scalar(
-        BinaryOp op, const Tensor& A, Scalar s, bool scalar_first = false,
-        Precision P = Precision::F32) override
-    {
-        return unary_(A, P, [this, op, s, scalar_first](const Tensor& a)
-        {
-            return inner_.elementwise_binary_scalar(op, a, s, scalar_first);
-        });
-    }
-
-    [[nodiscard]] Result<Tensor> elementwise_select_scalar_cond(
-        CompareOp cmp, const Tensor& A, Scalar scalar_b,
-        const Tensor& then_t, Scalar scalar_else,
-        Precision P = Precision::F32) override
-    {
-        return binary_(A, then_t, P,
-            [this, cmp, scalar_b, scalar_else](const Tensor& a, const Tensor& t)
-        {
-            return inner_.elementwise_select_scalar_cond(cmp, a, scalar_b, t,
-                                                         scalar_else);
         });
     }
 

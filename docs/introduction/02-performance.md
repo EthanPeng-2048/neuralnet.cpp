@@ -10,24 +10,24 @@
 ┌─────────────────────────────────────────────────────────────┐
 │                    性能优化层次                               │
 ├─────────────────────────────────────────────────────────────┤
-│  L5 算法级    │ 批量化注意力、融合算子、axpy 融合             │
+│  L5 算法级    │ 批量化注意力、表达式级融合（DSL，单 kernel）  │
 │  L4 GPU 加速  │ Vulkan Compute、批量提交、Command Buffer     │
 │  L3 内存级    │ 缓存分块、零分配热路径、Tensor 零拷贝         │
-│  L2 并行级    │ SmartPolicy 自适应并行、线程池 latch 零分配   │
+│  L2 并行级    │ 自适应并行、线程池 latch 零分配   │
 │  L1 指令级    │ AVX2 SIMD、-march=native（不使用 -ffast-math）│
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 1. SmartPolicy 自适应并行策略
+## 1. 自适应并行策略（旧文档称「SmartPolicy」）
 
 ### 原理
 
 根据数据规模自动决定串行还是并行执行，避免小数据量时线程调度开销（约 50~200μs）大于计算收益。
 
 ```cpp
-// config.hpp
+// core_config.hpp
 inline constexpr std::size_t PARALLEL_THRESHOLD = 524288;  // 512K 元素
 ```
 
@@ -46,7 +46,7 @@ inline constexpr std::size_t PARALLEL_THRESHOLD = 524288;  // 512K 元素
 所有顶层并行函数自动判断：
 
 ```cpp
-// config.hpp — 顶层并行算法函数
+// core_config.hpp — 顶层并行算法函数
 template<typename Iterator, typename Func>
 inline void for_each(Iterator first, Iterator last, Func&& func)
 {
@@ -95,7 +95,7 @@ inline void for_each(Iterator first, Iterator last, Func&& func)
 将矩阵乘法分解为 BLOCK_SIZE × BLOCK_SIZE 的小块，确保每块的工作集装入 CPU L1 缓存（32KB）。
 
 ```cpp
-// config.hpp
+// core_config.hpp
 inline constexpr std::size_t BLOCK_SIZE = 64;
 // 64 × 64 × 8 bytes = 32KB — 安全装入大多数 CPU 的 L1 缓存
 ```
@@ -175,8 +175,7 @@ engine.end_batch();             // 一次性提交 + fence wait
 #### 5.3 算子融合
 
 - **表达式 DSL（当前主力）**：`dsl::compute` 把整条逐元素/归约/matmul 链折叠为**单个** GPU 融合 kernel（见 `04-innovative-designs.md` §3）
-- `broadcast_row_inplace` / `broadcast_col_inplace`：单算子级的广播 + 逐元素融合
-- （`axpy_inplace`、`elementwise_select_scalar_cond` 仍在接口中，但已无生产调用方——优化器/ReLU 反向均改为 DSL 表达式）
+- ~~`broadcast_row_inplace` / `broadcast_col_inplace`、`axpy_inplace`、`elementwise_select_scalar_cond`~~：**2026-09 已全部删除**——单算子级广播/融合被表达式级融合取代（`dsl::row_broadcast` / `dsl::col_broadcast` / `dsl::select` / `dsl::compute_into`）
 
 ---
 
@@ -200,8 +199,8 @@ class Tensor {
 ```cpp
 // 仅在需要修改但不影响原 Tensor 时使用
 auto diff = clone_tensor(engine, input);  // 深拷贝
-// 原地修改 diff，input 不受影响
-engine.broadcast_col_inplace(*diff, mean, BinaryOp::Sub);
+// 原地修改 diff，input 不受影响（广播减法用 DSL）
+(void)dsl::compute_into(engine, dsl::leaf(*diff) - dsl::col_broadcast(*mean), *diff);
 ```
 
 ---
@@ -215,11 +214,8 @@ engine.broadcast_col_inplace(*diff, mean, BinaryOp::Sub);
 ### 现行做法
 
 ```cpp
-// 首选：一条 DSL 表达式 = 单个融合 kernel（optimizer 就是这么写的）
+// 一条 DSL 表达式 = 单个融合 kernel（optimizer 就是这么写的）
 dsl::compute_into(engine, leaf(dst) + leaf(src) * rparam(scalar), dst);
-
-// 或单算子原语（接口保留，当前无生产调用方）
-engine.axpy_inplace(dst, scalar, src);
 ```
 
 ---
@@ -307,15 +303,13 @@ class PositionalEncoding {
 
 ## 12. 编译期零开销抽象
 
-### 表达式模板（AST）
+### 表达式模板（DSL；旧代数 AST 已于 2026-09 移除）
 
 ```cpp
-// algebra_expr.hpp — 编译期构造计算树
-auto expr = max(x, Scalar{0});          // ReLU AST
-auto expr2 = a + b * c;                 // 融合乘加 AST
-
-// 统一执行：单次遍历，无临时矩阵
-compute::apply(span, expr);
+// expr_dsl.hpp — 表达式写在 Layer 内；CPU 编译期模板求值 / GPU AOT 融合
+// 单次遍历、无临时矩阵（GPU 侧折叠成一条融合 kernel）
+auto y = dsl::compute(engine, dsl::max(dsl::leaf(*x), dsl::rparam(0)), rows, cols);
+auto z = dsl::compute(engine, dsl::leaf(*a) + dsl::leaf(*b) * dsl::leaf(*c), rows, cols);
 ```
 
 **收益**：
@@ -328,7 +322,7 @@ compute::apply(span, expr);
 
 | 优化手段 | 场景 | 预期收益 |
 |----------|------|----------|
-| SmartPolicy | 小数据串行、大数据并行 | 避免小数据 0.3x 退化 |
+| 自适应并行 | 小数据串行、大数据并行 | 避免小数据 0.3x 退化 |
 | 线程池 latch | 所有并行操作 | 消除 N 次堆分配/加锁 |
 | 缓存分块 | 矩阵乘法 | L1 命中率 → 3-8x 加速 |
 | -march=native | 所有计算 | AVX2/AVX-512 SIMD（不使用 -ffast-math，保数值稳定） |

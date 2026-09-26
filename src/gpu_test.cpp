@@ -37,8 +37,6 @@ using nn::CpuEngine;
 using nn::GpuEngine;
 using nn::GpuBackend;
 using nn::Tensor;
-using nn::BinaryOp;
-using nn::UnaryOp;
 
 void print_usage(const char* prog)
 {
@@ -353,48 +351,11 @@ int main(int argc, char* argv[])
         }
         else { std::cout << "  ❌ roundtrip upload 失败\n"; ++failures; }
 
-        // 4b. 逐元素二元: Max(A, B) ≈ elementwise (CPU 参考用 CPU 计算)
+        // 4b. CPU/GPU 张量准备（逐元素算子已移除；元素级 DSL 对拍见 expr_gpu_test）
         auto a_cpu_t = cpu_engine->from_matrix(A);
-        auto b_cpu_t = cpu_engine->from_matrix(B);
         auto a_gpu_t = gpu_engine->from_matrix(A);
-        auto b_gpu_t = gpu_engine->from_matrix(B);
-        if (a_cpu_t && b_cpu_t && a_gpu_t && b_gpu_t)
+        if (a_cpu_t && a_gpu_t)
         {
-            // Max(A, B)
-            auto max_cpu_r = cpu_engine->elementwise_binary(BinaryOp::Max, *a_cpu_t, *b_cpu_t);
-            auto max_gpu_r = gpu_engine->elementwise_binary(BinaryOp::Max, *a_gpu_t, *b_gpu_t);
-            if (max_cpu_r && max_gpu_r)
-            {
-                auto mc = cpu_engine->to_matrix(*max_cpu_r);
-                auto mg = gpu_engine->to_matrix(*max_gpu_r);
-                if (mc && mg)
-                {
-                    Scalar err = max_abs_diff(*mc, *mg);
-                    if (err >= 1e-5f) ++failures;
-                    std::cout << "  elementwise Max(A,B) 最大误差: "
-                              << std::scientific << std::setprecision(4) << err
-                              << (err < 1e-5f ? " ✅" : " ❌") << "\n";
-                }
-            }
-            else { std::cout << "  ❌ elementwise Max 失败\n"; ++failures; }
-
-            // 4c. 逐元素一元: Exp(A)
-            auto exp_cpu_r = cpu_engine->elementwise_unary(UnaryOp::Exp, *a_cpu_t);
-            auto exp_gpu_r = gpu_engine->elementwise_unary(UnaryOp::Exp, *a_gpu_t);
-            if (exp_cpu_r && exp_gpu_r)
-            {
-                auto ec = cpu_engine->to_matrix(*exp_cpu_r);
-                auto eg = gpu_engine->to_matrix(*exp_gpu_r);
-                if (ec && eg)
-                {
-                    Scalar err = max_abs_diff(*ec, *eg);
-                    if (err >= 1e-4f) ++failures;
-                    std::cout << "  elementwise Exp(A) 最大误差: "
-                              << std::scientific << std::setprecision(4) << err
-                              << (err < 1e-4f ? " ✅" : " ❌") << "\n";
-                }
-            }
-            else { std::cout << "  ❌ elementwise Exp 失败\n"; ++failures; }
 
             // 4d. 归约: col_reduce_sum(A) → (1, N)
             auto csum_cpu_r = cpu_engine->col_reduce_sum(*a_cpu_t);
@@ -502,18 +463,17 @@ int main(int argc, char* argv[])
             else { std::cout << "  ❌ begin_batch failed: " << batch_r.error().message << "\n"; ++failures; }
         }
 
-        // 链式: matmul(A, B) → elementwise Exp → col_reduce_sum
+        // 链式: matmul(A, B) → col_reduce_sum（Exp 级已随逐元素算子移除）
         // 诊断日志：逐步对比 CPU vs GPU，定位误差来源
         if (a_t && b_t)
         {
-            std::cout << "\n  ── 链式诊断: matmul→Exp→col_reduce_sum ──\n";
+            std::cout << "\n  ── 链式诊断: matmul→col_reduce_sum ──\n";
 
             // ── Step 0: CPU 参考计算 ──
             auto a_cpu = cpu_engine->from_matrix(A);
             auto b_cpu = cpu_engine->from_matrix(B);
             auto c_cpu = cpu_engine->matmul(*a_cpu, *b_cpu, false, false);
-            auto exp_cpu = c_cpu ? cpu_engine->elementwise_unary(UnaryOp::Exp, *c_cpu) : nn::Result<Tensor>{};
-            auto sum_cpu = exp_cpu ? cpu_engine->col_reduce_sum(*exp_cpu) : nn::Result<Tensor>{};
+            auto sum_cpu = c_cpu ? cpu_engine->col_reduce_sum(*c_cpu) : nn::Result<Tensor>{};
             auto res_cpu = sum_cpu ? cpu_engine->to_matrix(*sum_cpu) : nn::Result<Matrix>{};
 
             // ── Step 1: matmul(A, B) on GPU ──
@@ -540,17 +500,17 @@ int main(int argc, char* argv[])
                     std::cout << "      matmul CPU vs GPU 最大误差: " << std::scientific << std::setprecision(4)
                               << mm_err << "\n";
 
-                    // ── Step 2: Exp(matmul) on GPU ──
-                    auto exp_t = gpu_engine->elementwise_unary(UnaryOp::Exp, *c_t);
-                    if (!exp_t) { std::cout << "  ❌ Exp failed\n"; }
-                    else if (exp_cpu)
+                    // ── Step 2: 直接复用 matmul 输出（Exp 级已随逐元素算子移除）──
+                    auto exp_t = c_t;
+                    if (!exp_t) { std::cout << "  ❌ matmul 张量缺失\n"; }
+                    else if (true)
                     {
                         auto exp_gpu_m = gpu_engine->to_matrix(*exp_t);
-                        auto exp_cpu_m = cpu_engine->to_matrix(*exp_cpu);
+                        auto exp_cpu_m = cpu_engine->to_matrix(*c_cpu);
                         if (exp_gpu_m && exp_cpu_m)
                         {
                             Scalar exp_err = max_abs_diff(*exp_cpu_m, *exp_gpu_m);
-                            // 统计 exp 输出范围
+                            // 统计 matmul 输出范围
                             Scalar e_min = std::numeric_limits<Scalar>::max();
                             Scalar e_max = std::numeric_limits<Scalar>::lowest();
                             Scalar e_abs_max = 0;
@@ -559,13 +519,12 @@ int main(int argc, char* argv[])
                                 e_max = std::max(e_max, v);
                                 e_abs_max = std::max(e_abs_max, std::fabs(v));
                             }
-                            std::cout << "  [2] exp() 输出范围: [" << std::scientific << std::setprecision(4)
+                            std::cout << "  [2] matmul 输出范围: [" << std::scientific << std::setprecision(4)
                                       << e_min << ", " << e_max << "]  |max|=" << e_abs_max << "\n";
-                            Scalar amplify = (mm_err > 0) ? (exp_err / mm_err) : 0;
-                            std::cout << "      exp() CPU vs GPU 最大误差: " << std::scientific << std::setprecision(4)
-                                      << exp_err << "  (放大 " << std::fixed << std::setprecision(0) << amplify << "x)\n";
+                            std::cout << "      matmul CPU vs GPU 最大误差: " << std::scientific << std::setprecision(4)
+                                      << exp_err << "\n";
 
-                            // ── Step 3: col_reduce_sum(exp) on GPU ──
+                            // ── Step 3: col_reduce_sum(matmul) on GPU ──
                             auto sum_t = gpu_engine->col_reduce_sum(*exp_t);
                             if (!sum_t) { std::cout << "  ❌ col_reduce_sum failed\n"; }
                             else
@@ -592,9 +551,8 @@ int main(int argc, char* argv[])
                                     Scalar rel_err = (ref_abs_max > 0) ? (final_err / ref_abs_max) : 0;
                                     std::cout << "      相对误差: " << std::scientific << std::setprecision(4)
                                               << rel_err << (rel_err < 1e-3f ? " OK" : " FAIL") << "\n";
-                                    std::cout << "  结论: exp() 将 matmul 的 " << std::scientific << std::setprecision(2)
-                                              << mm_err << " 误差放大为 " << final_err
-                                              << " (数学预期行为，非传递异常)\n";
+                                    std::cout << "  结论: 归约链最终误差 " << std::scientific << std::setprecision(2)
+                                              << final_err << "（Exp 级已随逐元素算子移除）\n";
                                 }
                             }
                         }

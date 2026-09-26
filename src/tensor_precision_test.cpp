@@ -15,19 +15,14 @@
 
 #include "neuralnet.cpp/precision.hpp"
 #include "neuralnet.cpp/compute_tensor.hpp"
+#define NN_TEST_COUNTER g_failures
+#include "test_common.hpp"
 
 namespace
 {
 
 int g_failures = 0;
 
-#define CHECK(cond, msg) \
-    do { \
-        if (!(cond)) { \
-            std::fprintf(stderr, "  FAIL line %d: %s\n", __LINE__, (msg)); \
-            ++g_failures; \
-        } \
-    } while (0)
 
 // T1：默认 Tensor — precision=F32，valid=false
 void test_default_tensor()

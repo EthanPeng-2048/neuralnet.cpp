@@ -6,7 +6,6 @@
 #include <iostream>
 
 #define main test_tokenizer
-#undef CHECK
 #include "tokenizer_consistency_test.cpp"
 #undef main
 

@@ -23,6 +23,7 @@
 #include <neuralnet.cpp/expr_dsl.hpp>
 #include <neuralnet.cpp/expr_spec.hpp>
 #include <neuralnet.cpp/compute_cpu_engine.hpp>
+#include "test_common.hpp"
 
 // 测试写在全局作用域（非 namespace nn），避免与旧代数运算符的 ADL 歧义。
 using namespace nn::dsl;
@@ -33,50 +34,8 @@ namespace
 {
 
 int g_fail = 0;
-#define CHECK(cond, msg)                                                     \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            std::printf("[FAIL] %s\n", msg);                                 \
-            ++g_fail;                                                        \
-        }                                                                    \
-    } while (0)
 
-nn::Tensor make_tensor(std::size_t rows, std::size_t cols, float base = 0.0f, float step = 0.01f)
-{
-    nn::Tensor t = nn::Tensor::cpu(rows, cols);
-    auto sp = t.cpu_matrix().span();
-    for (std::size_t i = 0; i < sp.size(); ++i)
-        sp[i] = base + static_cast<float>(i) * step;
-    return t;
-}
 
-// 逐元素比对（容差 1e-4，Scalar=float）
-void check_close(const nn::Tensor& got, const nn::Tensor& ref, const char* msg)
-{
-    if (got.rows() != ref.rows() || got.cols() != ref.cols())
-    {
-        std::printf("[FAIL] %s: shape mismatch got %zux%zu ref %zux%zu\n",
-                    msg, got.rows(), got.cols(), ref.rows(), ref.cols());
-        ++g_fail;
-        return;
-    }
-    const auto g = got.cpu_matrix().span();
-    const auto r = ref.cpu_matrix().span();
-    bool ok = true;
-    for (std::size_t i = 0; i < g.size(); ++i)
-    {
-        const float d = std::fabs(g[i] - r[i]);
-        const float scale = std::max(1.0f, std::fabs(r[i]));
-        if (d > 1e-4f * scale)
-        {
-            std::printf("[FAIL] %s: [%zu] got %.6f ref %.6f\n", msg, i, g[i], r[i]);
-            ok = false;
-            break;
-        }
-    }
-    if (ok) std::printf("[ OK ] %s\n", msg);
-    else    ++g_fail;
-}
 
 // ── 测试 1：归约视图——按行求和广播 x / row_sum ─────────────────────────
 void test_row_sum_broadcast()
@@ -98,7 +57,7 @@ void test_row_sum_broadcast()
         for (std::size_t c = 0; c < C; ++c) sum += xs[r * C + c];
         for (std::size_t c = 0; c < C; ++c) rs[r * C + c] = xs[r * C + c] / sum;
     }
-    check_close(*out, ref, "row_reduce_sum 广播 (x / row_sum)");
+    check_close(*out, ref, "row_reduce_sum 广播 (x / row_sum)", g_fail);
 }
 
 // ── 测试 2：归约视图——按行 max 平移 x - row_max ────────────────────────
@@ -120,7 +79,7 @@ void test_row_max_shift()
         for (std::size_t c = 1; c < C; ++c) mx = std::max(mx, xs[r * C + c]);
         for (std::size_t c = 0; c < C; ++c) rs[r * C + c] = xs[r * C + c] - mx;
     }
-    check_close(*out, ref, "row_reduce_max 广播 (x - row_max)");
+    check_close(*out, ref, "row_reduce_max 广播 (x - row_max)", g_fail);
 }
 
 // ── 测试 3：Softmax（归约视图 + 归约指令混合）──────────────────────────
@@ -148,7 +107,7 @@ void test_softmax_mixed()
         for (std::size_t c = 0; c < C; ++c) sum += std::exp(xs[r * C + c] - mx);
         for (std::size_t c = 0; c < C; ++c) rs[r * C + c] = std::exp(xs[r * C + c] - mx) / sum;
     }
-    check_close(*out, ref, "Softmax（视图 row_max + 指令 row_sum）");
+    check_close(*out, ref, "Softmax（视图 row_max + 指令 row_sum）", g_fail);
 }
 
 // ── 测试 4：归约指令——输出即归约结果（广播）row_sum(exp(x)) ───────────
@@ -171,7 +130,7 @@ void test_reduce_instr_output()
         for (std::size_t c = 0; c < C; ++c) sum += std::exp(xs[r * C + c]);
         for (std::size_t c = 0; c < C; ++c) rs[r * C + c] = sum;
     }
-    check_close(*out, ref, "归约指令 row_sum(exp(x)) 输出广播");
+    check_close(*out, ref, "归约指令 row_sum(exp(x)) 输出广播", g_fail);
 }
 
 // ── 测试 5：列归约 max 广播 x * col_max ─────────────────────────────────
@@ -193,7 +152,7 @@ void test_col_max_broadcast()
         for (std::size_t r = 1; r < R; ++r) mx = std::max(mx, xs[r * C + c]);
         for (std::size_t r = 0; r < R; ++r) rs[r * C + c] = xs[r * C + c] * mx;
     }
-    check_close(*out, ref, "col_reduce_max 广播 (x * col_max)");
+    check_close(*out, ref, "col_reduce_max 广播 (x * col_max)", g_fail);
 }
 
 // ── 测试 6：归约指令叠加归约视图——row_sum(col_sum(x)) = 全局和 ─────────
@@ -212,7 +171,7 @@ void test_reduce_of_reduce_view()
     nn::Tensor ref = nn::Tensor::cpu(R, C);
     for (auto& v : ref.cpu_matrix().span()) v = total;
 
-    check_close(*out, ref, "归约指令叠加归约视图 row_sum(col_sum(x)) = 全局和");
+    check_close(*out, ref, "归约指令叠加归约视图 row_sum(col_sum(x)) = 全局和", g_fail);
 }
 
 // ── 测试 7：归约与标量混合（均值平移）x - row_mean ─────────────────────
@@ -238,7 +197,7 @@ void test_reduce_with_scalar()
         const float mean = sum * inv;
         for (std::size_t c = 0; c < C; ++c) rs[r * C + c] = xs[r * C + c] - mean;
     }
-    check_close(*out, ref, "归约视图 + 标量 (x - row_mean)");
+    check_close(*out, ref, "归约视图 + 标量 (x - row_mean)", g_fail);
 }
 
 // ── 测试 8：to_expr_spec 折叠结构正确性 ─────────────────────────────────

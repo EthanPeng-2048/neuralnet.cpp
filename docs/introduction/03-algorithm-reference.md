@@ -368,7 +368,7 @@ loss      = −(1/batch) Σ target · log_sm
 ## Optimizer 篇
 
 > **实现方式**：优化器全部用 `dsl::compute` / `dsl::compute_into`（`compute_optimizer.hpp`），
-> 一次表达式 = 一条融合 kernel；不再直调 `axpy_inplace`/`elementwise_*` 这类 eager 原语。
+> 一次表达式 = 一条融合 kernel；不再直调 `axpy_inplace`/`elementwise_*` 这类 eager 原语（**这些原语已于 2026-09 整体删除**，引擎现有 49 个 virtual）。
 > 下面每条 "DSL 表达式" 即 `step()` 里的真实写法（`leaf` = 输入张量，`rparam` = 标量常量）。
 
 ### 1. SGD — 随机梯度下降

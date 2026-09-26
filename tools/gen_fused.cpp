@@ -239,13 +239,9 @@ int main(int argc, char* argv[])
                          nn::expr_spec_key(spec).c_str());
             continue;
         }
-        if (raxis == 1 && spec.matmul)
-        {
-            // matmul+列归约：batch 分解未实现（注意力只用行归约），保守跳过
-            std::fprintf(stderr, "[skip] matmul+列归约组合暂不支持: %s\n",
-                         nn::expr_spec_key(spec).c_str());
-            continue;
-        }
+        // matmul+列归约（S5 列方向，如 col_max(matmul)）已支持：生成器按
+        // 元素分解 batch（batch = row/m_per），归约遍历全部 rows（含所有
+        // batch），与 CPU 端 matmul_out 语义一致 → 不再跳过。
         // 防御：空指令表且无 matmul/fold 段 = 结构损坏（如 canonicalize 曾静默
         //   丢 fold 段）→ 跳过而非让逐元素生成器对空表 back() UB 崩溃
         //   （实测 0xC00000FD 栈崩溃）。正常管线到不了这里。
@@ -320,8 +316,8 @@ int main(int argc, char* argv[])
     {
         const nn::ExprSpec& spec = v.spec;
         const int raxis = nn::expr_spec_reduce_axis(spec);
-        if (raxis == -2 || (raxis == 1 && spec.matmul))
-            continue;
+        if (raxis == -2)
+            continue;   // 混合归约轴（与基础结构 skip 一致）
         if (spec.instrs.empty() && !spec.matmul && !spec.fold)
             continue;
         const std::string key = nn::expr_spec_key(spec);
@@ -376,8 +372,8 @@ int main(int argc, char* argv[])
     for (const auto& spec : reg.specs)
     {
         const int raxis = nn::expr_spec_reduce_axis(spec);
-        if (raxis == -2 || (raxis == 1 && spec.matmul))
-            continue;  // 与上方跳过保持一致（混合轴 / matmul+列归约）
+        if (raxis == -2)
+            continue;  // 与上方跳过保持一致（混合轴）
         if (spec.instrs.empty() && !spec.matmul && !spec.fold)
             continue;  // 结构损坏（同上：生成循环已 skip，元数据保持一致）
         const std::string key = nn::expr_spec_key(spec);

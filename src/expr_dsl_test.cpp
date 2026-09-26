@@ -22,6 +22,7 @@
 #include <neuralnet.cpp/expr_dsl.hpp>
 #include <neuralnet.cpp/expr_spec.hpp>
 #include <neuralnet.cpp/compute_cpu_engine.hpp>
+#include "test_common.hpp"
 
 // 测试写在全局作用域（非 namespace nn），避免与旧代数运算符的 ADL 歧义。
 using namespace nn::dsl;
@@ -31,22 +32,7 @@ namespace
 {
 
 int g_fail = 0;
-#define CHECK(cond, msg)                                                     \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            std::printf("[FAIL] %s\n", msg);                                 \
-            ++g_fail;                                                        \
-        }                                                                    \
-    } while (0)
 
-nn::Tensor make_tensor(std::size_t rows, std::size_t cols, float base = 0.0f, float step = 0.01f)
-{
-    nn::Tensor t = nn::Tensor::cpu(rows, cols);
-    auto sp = t.cpu_matrix().span();
-    for (std::size_t i = 0; i < sp.size(); ++i)
-        sp[i] = base + static_cast<float>(i) * step;
-    return t;
-}
 
 // 手写 RoPE forward 参考（与 RotateHalfRef/RowModRef 语义一致）
 float rope_ref(const nn::Tensor& q, const nn::Tensor& cos, const nn::Tensor& sin,

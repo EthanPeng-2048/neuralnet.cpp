@@ -450,7 +450,76 @@ int run_matmul_reduce(CpuEngine& cpu, GpuEngine& gpu)
     std::cout << "[" << (ok2 ? "PASS" : "FAIL") << "] denom row_sum(exp(matmul-rm)) 融合 (5x7x4)"
               << "  err=" << std::scientific << std::setprecision(2) << err2 << "\n";
 
-    return (ok1 && ok2) ? 0 : 1;
+    // col_max(matmul(Q,K^T))：列归约 + matmul 组合（S5 列方向）。
+    // 该组合曾被 gen_fused 跳过（"matmul+列归约组合暂不支持"），生成器补齐
+    // 按元素 batch 分解后，此对拍锁死 GPU 与 CPU 语义一致（列归约遍历全部
+    // rows，含所有 batch）。广播输出（dsl::compute → vector_out=0）：
+    auto ccol = nn::dsl::compute(cpu,
+        nn::dsl::col_reduce_max(nn::dsl::matmul(Qt, Kt, false, true)), M, N);
+    auto gcol = nn::dsl::compute(gpu,
+        nn::dsl::col_reduce_max(nn::dsl::matmul(Qt, Kt, false, true)), M, N);
+    if (!ccol || !gcol)
+    {
+        std::cerr << "  col_max(matmul) 求值失败（CPU/GPU）: "
+                  << (!ccol ? ccol.error().message : gcol.error().message) << "\n";
+        return 1;
+    }
+    auto gcolm = gpu.to_matrix(*gcol);
+    if (!gcolm) { std::cerr << "  GPU col_max(matmul) 下载失败\n"; return 1; }
+    const Scalar err3 = max_abs_diff(ccol->cpu_matrix(), *gcolm);
+    const bool ok3 = err3 < 1e-4f;
+    std::cout << "[" << (ok3 ? "PASS" : "FAIL") << "] col_max(matmul(Q,K^T)) 广播融合 (5x7x4)"
+              << "  err=" << std::scientific << std::setprecision(2) << err3 << "\n";
+
+    // 归约向量输出（dsl::compute_reduce → vector_out=1，输出 (1,N)）
+    auto ccvr = nn::dsl::compute_reduce(cpu,
+        nn::dsl::col_reduce_max(nn::dsl::matmul(Qt, Kt, false, true)), M, N);
+    auto gcvr = nn::dsl::compute_reduce(gpu,
+        nn::dsl::col_reduce_max(nn::dsl::matmul(Qt, Kt, false, true)), M, N);
+    if (!ccvr || !gcvr)
+    {
+        std::cerr << "  col_max(matmul) 归约向量求值失败（CPU/GPU）: "
+                  << (!ccvr ? ccvr.error().message : gcvr.error().message) << "\n";
+        return 1;
+    }
+    auto gcvm = gpu.to_matrix(*gcvr);
+    if (!gcvm) { std::cerr << "  GPU col_max(matmul) 向量下载失败\n"; return 1; }
+    const Scalar err4 = max_abs_diff(ccvr->cpu_matrix(), *gcvm);
+    const bool ok4 = err4 < 1e-4f;
+    std::cout << "[" << (ok4 ? "PASS" : "FAIL") << "] col_max(matmul) 归约向量 (1x4)"
+              << "  err=" << std::scientific << std::setprecision(2) << err4 << "\n";
+
+    // batch=2（S7 batch 分解）：A 堆叠 (2M,K)、K 存储 (2N,K) —— 列归约须
+    // 遍历全部 2M 行，每行按 row/m_per 就地分解 batch
+    {
+        Matrix Q2m(M * 2, K), K2m(N * 2, K);
+        for (auto& v : Q2m.span()) v = dist(rng);
+        for (auto& v : K2m.span()) v = dist(rng);
+        const Tensor Q2t = Tensor::from_matrix(Matrix(Q2m));
+        const Tensor K2t = Tensor::from_matrix(Matrix(K2m));
+        auto cb2 = nn::dsl::compute_reduce(cpu,
+            nn::dsl::col_reduce_max(
+                nn::dsl::matmul(Q2t, K2t, false, true, /*batch=*/2)), M * 2, N);
+        auto gb2 = nn::dsl::compute_reduce(gpu,
+            nn::dsl::col_reduce_max(
+                nn::dsl::matmul(Q2t, K2t, false, true, /*batch=*/2)), M * 2, N);
+        if (!cb2 || !gb2)
+        {
+            std::cerr << "  col_max(matmul) batch=2 求值失败（CPU/GPU）: "
+                      << (!cb2 ? cb2.error().message : gb2.error().message) << "\n";
+            return 1;
+        }
+        auto gb2m = gpu.to_matrix(*gb2);
+        if (!gb2m) { std::cerr << "  GPU col_max(matmul) batch=2 下载失败\n"; return 1; }
+        const Scalar err5 = max_abs_diff(cb2->cpu_matrix(), *gb2m);
+        const bool ok5 = err5 < 1e-4f;
+        std::cout << "[" << (ok5 ? "PASS" : "FAIL")
+                  << "] col_max(matmul) batch=2 归约向量 (1x4)"
+                  << "  err=" << std::scientific << std::setprecision(2) << err5 << "\n";
+        if (!ok5) return 1;
+    }
+
+    return (ok1 && ok2 && ok3 && ok4) ? 0 : 1;
 }
 
 // ── 闭合世界：未扫描表达式 → GPU 硬报错（绝不静默回退） ─────────────────

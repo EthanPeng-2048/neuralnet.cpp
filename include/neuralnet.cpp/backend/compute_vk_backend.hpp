@@ -97,11 +97,6 @@
 #define NN_REDUCE_SPV_EMBEDDED
 #endif
 
-#if __has_include("broadcast_spv.hpp")
-#include "broadcast_spv.hpp"
-#define NN_BROADCAST_SPV_EMBEDDED
-#endif
-
 #if __has_include("transpose_spv.hpp")
 #include "transpose_spv.hpp"
 #define NN_TRANSPOSE_SPV_EMBEDDED
@@ -407,7 +402,6 @@ private:
     // 局部销毁会踩铁律 6；形状变化时旧缓冲走 pending_destroys_ 延迟销毁，
     // 对在飞录制安全。同一 batch 内多次使用由 cmd 内屏障串行化）
     std::optional<GpuTensor> reduce_partial_;
-    VulkanPipeline broadcast_pipeline_;
     VulkanPipeline rearrange_3d_pipeline_;
     VulkanPipeline transpose_pipeline_;
     VulkanPipeline gather_pipeline_;
@@ -652,16 +646,6 @@ private:
     {
 #ifdef NN_REDUCE_SPV_EMBEDDED
         return nn_reduce_spirv_bytecode();
-#else
-        static const std::vector<uint32_t> empty;
-        return empty;
-#endif
-    }
-
-    [[nodiscard]] static const std::vector<uint32_t>& get_broadcast_spirv()
-    {
-#ifdef NN_BROADCAST_SPV_EMBEDDED
-        return nn_broadcast_spirv_bytecode();
 #else
         static const std::vector<uint32_t> empty;
         return empty;
@@ -1206,16 +1190,6 @@ public:
                 reduce_pipeline_ = std::move(*rp_r);
         }
 
-        // 12. 创建 broadcast pipeline（3 bindings, 16B push constants）
-        const auto& broadcast_spirv = get_broadcast_spirv();
-        if (!broadcast_spirv.empty())
-        {
-            auto bp_r = VulkanPipeline::create_generic(
-                device_.device(), broadcast_spirv, 3, 4 * sizeof(uint32_t));
-            if (bp_r)
-                broadcast_pipeline_ = std::move(*bp_r);
-        }
-
         // 13. 创建 transpose pipeline（2 bindings, 8B push constants）
         const auto& transpose_spirv = get_transpose_spirv();
         if (!transpose_spirv.empty())
@@ -1412,7 +1386,6 @@ public:
     [[nodiscard]] bool has_rearrange_3d_pipeline() const noexcept { return rearrange_3d_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_elementwise_v2_pipeline() const noexcept { return elementwise_v2_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_reduce_pipeline() const noexcept { return reduce_pipeline_.handle() != VK_NULL_HANDLE; }
-    [[nodiscard]] bool has_broadcast_pipeline() const noexcept { return broadcast_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_transpose_pipeline() const noexcept { return transpose_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_im2col_pipeline() const noexcept { return im2col_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_col2im_pipeline() const noexcept { return col2im_pipeline_.handle() != VK_NULL_HANDLE; }
@@ -3382,101 +3355,6 @@ public:
     }
 
     // ══════════════════════════════════════════════════════════════════
-    // broadcast_gpu — 行/列广播原语
-    //
-    // Push Constants (16 bytes): rows, cols, mode, op
-    // Bindings: A(0), Vec(1), Out(2)
-    // mode: 0=row_broadcast (vec indexed by row), 1=col_broadcast (vec indexed by col)
-    // op: 0=Add, 1=Sub, 2=Mul, 3=Div, 4=Max, 5=Min
-    //
-    // out != nullptr 时为原地模式：Out 直接绑定 out 的 buffer（通常即 A），
-    // 每线程只读写自己下标一次，别名安全。
-    // ══════════════════════════════════════════════════════════════════
-    [[nodiscard]] Result<GpuTensor> broadcast_gpu(
-        const GpuTensor& A, const GpuTensor& vec,
-        uint32_t mode, uint32_t op,
-        const GpuTensor* out = nullptr)
-    {
-        if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
-        if (!has_broadcast_pipeline())
-            return std::unexpected(Error{"broadcast pipeline not available"});
-
-        const uint32_t rows = static_cast<uint32_t>(A.rows());
-        const uint32_t cols = static_cast<uint32_t>(A.cols());
-
-        // 1. 输出 Tensor：原地模式直接复用 out 的 buffer，否则新分配
-        GpuTensor output;
-        if (out)
-        {
-            output = GpuTensor(*out);
-        }
-        else
-        {
-            auto output_res = GpuTensor::create_empty(A.rows(), A.cols(), *this);
-            if (!output_res) return std::unexpected(output_res.error());
-            output = std::move(*output_res);
-        }
-
-        // 2. 分配描述符集
-        auto ds_r = alloc_desc_set(broadcast_pipeline_.descriptor_layout());
-        if (!ds_r) return std::unexpected(ds_r.error());
-        VkDescriptorSet desc_set = *ds_r;
-
-        // 3. 写入描述符集
-        VkDescriptorBufferInfo buf_infos[3]{
-            {A.buffer().impl(), 0, VK_WHOLE_SIZE},
-            {vec.buffer().impl(), 0, VK_WHOLE_SIZE},
-            {output.buffer().impl(), 0, VK_WHOLE_SIZE},
-        };
-        VkWriteDescriptorSet writes[3]{};
-        for (int i = 0; i < 3; ++i)
-        {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = desc_set;
-            writes[i].dstBinding = static_cast<uint32_t>(i);
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &buf_infos[i];
-        }
-        vkUpdateDescriptorSets(device_.device(), 3, writes, 0, nullptr);
-
-        // 4. 获取 command buffer
-        auto cmd_r = acquire_cmd();
-        if (!cmd_r)
-        {
-            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-            return std::unexpected(cmd_r.error());
-        }
-        auto [cmd, owns_cmd] = *cmd_r;
-
-        // 5. 录制
-        record_input_barriers(cmd, {A.buffer().impl(), vec.buffer().impl()});
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            broadcast_pipeline_.handle());
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            broadcast_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
-
-        const uint32_t push_data[4] = {rows, cols, mode, op};
-        vkCmdPushConstants(cmd, broadcast_pipeline_.pipeline_layout(),
-            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
-
-        // vec4 kernel（与 elementwise_v2 / DSL 同口径）：每线程 4 元素
-        const uint32_t total = rows * cols;
-        const uint32_t wg_count = (total + 256u * 4u - 1u) / (256u * 4u);
-        vkCmdDispatch(cmd, wg_count, 1, 1);
-        record_output_barrier(cmd, output.buffer().impl());
-
-        // 6. 独立模式提交
-        if (owns_cmd)
-        {
-            auto r = submit_and_wait(cmd, desc_set);
-            if (!r) return std::unexpected(r.error());
-        }
-        return output;
-    }
-
-    // ══════════════════════════════════════════════════════════════════
     // rearrange_3d_gpu — 3D 维度转置 (M, B, N) ↔ (B, M, N)
     //
     // Push Constants (20 bytes): M, B, N, inverse, total
@@ -3608,7 +3486,7 @@ public:
     }
 
     // ══════════════════════════════════════════════════════════════════
-    // copy_buffer_region_gpu — 带偏移的 buffer 拷贝（activation offload slab 用）
+    // copy_buffer_region_gpu — 带偏移的 buffer 拷贝（offload slab / 通用区域拷贝）
     // 从 src[src_offset, src_offset+size) 拷到 dst[dst_offset, dst_offset+size)。
     // batch 模式只录制不提交；非 batch 独立提交等待。
     // ══════════════════════════════════════════════════════════════════

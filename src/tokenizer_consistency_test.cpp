@@ -23,6 +23,7 @@
 #include <vector>
 
 #include <neuralnet.cpp/domain_tokenizer.hpp>
+#include "test_common.hpp"
 
 using nn::BPETokenizer;
 
@@ -30,10 +31,6 @@ namespace
 {
 
 int g_fail = 0;
-#define CHECK(cond, msg)                                                          \
-    do {                                                                          \
-        if (!(cond)) { std::printf("[FAIL] %s\n", msg); ++g_fail; }               \
-    } while (0)
 
 // ── 参考实现：完整旧版 pre_tokenize（标记切分 + 纯文本 sregex_iterator） ──
 // 逐字复刻优化前 domain_tokenizer_bpe.hpp 的实现，作为手写状态机的对拍基准。

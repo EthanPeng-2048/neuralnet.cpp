@@ -256,8 +256,10 @@ int main() {
                   << "  loss=" << epoch_loss / num_batches << "\n";
     }
 
-    // 4. 保存模型
-    auto spec = nn::make_mlp_spec({784, 512, 256, 128, 64, 10});
+    // 4. 保存模型（MLP 的 spec 直接构造：type + layer_dims；无 make_mlp_spec 工厂）
+    nn::ModelSpec spec;
+    spec.type = nn::ModelType::MLP;
+    spec.layer_dims = {784, 512, 256, 128, 64, 10};
     auto save_result = nn::save_model("mnist_model.bin", model, spec);
 }
 ```

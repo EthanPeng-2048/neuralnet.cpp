@@ -15,18 +15,13 @@
 #include <string>
 
 #include "neuralnet.cpp/precision.hpp"
+#define NN_TEST_COUNTER g_failures
+#include "test_common.hpp"
 
 namespace
 {
 int g_failures = 0;
 
-#define CHECK(cond, msg) \
-    do { \
-        if (!(cond)) { \
-            std::fprintf(stderr, "  FAIL line %d: %s\n", __LINE__, (msg)); \
-            ++g_failures; \
-        } \
-    } while (0)
 
 bool is_all(nn::PrecisionProfile p, nn::Precision v)
 {
@@ -78,5 +73,3 @@ int main()
         std::puts("  [PASS] PrecisionProfile 配方语义（--f16 = param/compute f16）");
     return g_failures;
 }
-
-#undef CHECK

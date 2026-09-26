@@ -23,7 +23,7 @@
 | 文档 | 说明 |
 |------|------|
 | [架构设计](docs/introduction/01-architecture.md) | 项目分层架构、引擎化设计、数据流、模块详解 |
-| [性能优化](docs/introduction/02-performance.md) | SmartPolicy、线程池、缓存分块、GPU 加速、算子融合等 |
+| [性能优化](docs/introduction/02-performance.md) | 自适应并行、线程池、缓存分块、GPU 加速、算子融合等 |
 | [算法解析](docs/introduction/03-algorithm-reference.md) | 每个 Layer/Loss/Optimizer 的数学原理与原语分解 |
 | [创新设计](docs/introduction/04-innovative-designs.md) | 引擎化、AOT 融合、多精度等创新全景 |
 | [计算引擎开发](docs/development/01-compute-engine-development.md) | ComputeEngine 接口详解、实现模式、添加新原语 |
@@ -72,7 +72,7 @@ neuralnet.cpp/
 ├── gui.py                       ← 图形化操作界面 (CustomTkinter)
 ├── include/neuralnet.cpp/
 │   ├── nn.hpp                   ← 统一入口头文件
-│   ├── core_config.hpp          ← SmartPolicy、BLOCK_SIZE
+│   ├── core_config.hpp          ← 自适应并行、BLOCK_SIZE
 │   ├── compute_tensor.hpp       ← 统一跨设备张量
 │   ├── compute_engine.hpp       ← 引擎抽象接口
 │   ├── compute_cpu_engine.hpp   ← CPU 引擎
@@ -89,10 +89,8 @@ neuralnet.cpp/
 │   ├── domain_gpt.hpp           ← GPT 模型工厂
 │   ├── domain_tokenizer.hpp     ← 分词器
 │   ├── algebra_matrix.hpp       ← 矩阵类
-│   ├── algebra_expr.hpp         ← 表达式模板
-│   ├── algebra_ops.hpp          ← 逐元素算子
+│   ├── algebra_ops.hpp          ← 逐元素算子定义（DSL 复用）
 │   ├── algebra_span.hpp         ← Span 抽象
-│   ├── algebra_compute.hpp      ← 计算分派
 │   ├── core_threadpool.hpp      ← 全局线程池
 │   ├── core_errors.hpp          ← Result<T>
 │   ├── core_assert.hpp          ← 断言宏
@@ -143,7 +141,7 @@ cmake -B build -G Ninja
 ./build/mnist_train
 
 # 训练 Transformer 模型
-./build/mnist_train --model-type transformer --epochs 20
+./build/mnist_train --arch transformer --epochs 20
 
 # 从已有模型恢复训练
 ./build/mnist_train --resume pretrained/mnist_model.bin
@@ -164,8 +162,8 @@ cmake -B build -G Ninja
 # 批量推理目录下所有 CSV
 ./build/mnist_infer datasets/test/0/
 
-# 指定模型文件和类型
-./build/mnist_infer image.csv --model pretrained/model.bin --model-type transformer
+# 指定模型文件（架构由模型内自描述的 spec 决定，无需再传类型）
+./build/mnist_infer image.csv --model pretrained/model.bin --topk 3
 
 # 显示 Top-5 预测结果
 ./build/mnist_infer image.csv --topk 5
@@ -229,7 +227,7 @@ python gui.py
 
 ## 网络结构
 
-支持两种模型架构（通过 `--model-type` 切换），定义在 `mnist_common.hpp`：
+支持三种模型架构（通过 `--arch mlp|transformer|cnn` 切换，实现见 `domain_mnist.hpp`）；下面详述 MLP 与 Transformer（CNN 见 `--cnn-*` 系列参数）：
 
 ### MLP（默认）
 
@@ -277,11 +275,11 @@ python gui.py
 | `nn::MultiHeadAttention` | 多头注意力层（Transformer 用，`d_model × seq_len` 输入输出） |
 | `nn::PositionalEncoding` | 正弦/余弦位置编码（Transformer 用） |
 | `nn::MSELoss` | 均方误差损失 |
-| `nn::CrossEntropyLoss` | 交叉熵损失（含数值稳定 Softmax，`loss.hpp` 中定义） |
+| `nn::CrossEntropyLoss` | 交叉熵损失（含数值稳定 Softmax，`compute_loss.hpp` 中定义） |
 | `nn::SGD` | 随机梯度下降优化器 |
 | `nn::SGDWithMomentum` | 动量 SGD 优化器 |
 | `nn::Adam` | Adam 优化器（一阶/二阶矩估计） |
-| `nn::SmartPolicy` | 自适应并行策略：小矩阵串行，大矩阵线程池并行 |
+| `nn::parallel_for_blocks` / `nn::parallel_for_samples` | 自适应并行分发（`PARALLEL_THRESHOLD = 524288` 门控；旧文档称「SmartPolicy」） |
 | `nn::ThreadPool` | 全局单例线程池（懒初始化） |
 | `nn::save_model` / `nn::load_model` | 二进制模型序列化 |
 

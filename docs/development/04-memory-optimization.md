@@ -81,7 +81,7 @@ FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU �
 
 ### 数值精度
 
-`config.hpp` 中 `using Scalar = float`，**本文档数字均为纯 fp32 基线**（立项时口径；v1.2.0 起已引入 f16 混合精度——`Precision`/`PrecisionProfile`，见 05-mixed-precision）。fp32 基线下激活、梯度、权重、优化器态全部 4B。（历史红线"不引入 f16"已随混合精度修订。）
+`core_config.hpp` 中 `using Scalar = float`，**本文档数字均为纯 fp32 基线**（立项时口径；v1.2.0 起已引入 f16 混合精度——`Precision`/`PrecisionProfile`，见 05-mixed-precision）。fp32 基线下激活、梯度、权重、优化器态全部 4B。（历史红线"不引入 f16"已随混合精度修订。）
 
 ### 激活缓存策略（核心问题 L1）
 
@@ -91,7 +91,7 @@ FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU �
 
 ### 内存池碎片化 + 不归还（问题 L2）
 
-- `memory_pool.hpp` 已实现 **first-fit 子分配 + 相邻 free region 自动前后合并**（O(log n)、O(1) 合并）。
+- `backend/compute_memory_pool.hpp` 已实现 **first-fit 子分配 + 相邻 free region 自动前后合并**（O(log n)、O(1) 合并）。
 - 但：**从未将整个空 Block 归还 GPU**（`blocks_.clear()` 仅在析构时触发），block 底材按需 128MB（或超尺寸单块）申请后不回收 ⇒ 峰值生命周期等于整个进程/测试生命周期，碎片与闲置块长期累积。
 - 算子融合文档将"内存池 first-fit 碎片化 + 永不归还"列为**独立跟踪项、不随融合解决**。
 

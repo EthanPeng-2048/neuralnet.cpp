@@ -15,6 +15,7 @@
 #include <iostream>
 #include <random>
 #include <string>
+#include "test_common.hpp"
 
 using nn::Scalar;
 using nn::Matrix;
@@ -24,14 +25,6 @@ using nn::Softmax;
 
 namespace {
 
-Scalar dot(const Matrix& a, const Matrix& b)
-{
-    Scalar s{0};
-    const auto sa = a.span();
-    const auto sb = b.span();
-    for (std::size_t i = 0; i < a.size(); ++i) s += sa[i] * sb[i];
-    return s;
-}
 
 Scalar eval_loss(ComputeEngine& engine, Softmax& sm, const Tensor& x, const Tensor& go)
 {
@@ -41,10 +34,6 @@ Scalar eval_loss(ComputeEngine& engine, Softmax& sm, const Tensor& x, const Tens
     return dot(*y_m, *go_m);
 }
 
-bool approx(Scalar num, Scalar ana, Scalar tol)
-{
-    return std::fabs(num - ana) <= tol * (Scalar{1} + std::fabs(num) + std::fabs(ana));
-}
 
 bool check_input_grad(ComputeEngine& engine, Softmax& sm,
                       const Tensor& go, const Tensor& grad_x,

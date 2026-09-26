@@ -1,20 +1,18 @@
 #pragma once
 
-// ── span.hpp — 可构建 AST 的智能视图 ─────────────────────────────────────
-// 替代 std::span<Scalar> 作为逐元素操作的载体。
-// Span 同时是：
+// ── span.hpp — 智能数据视图 ──────────────────────────────────────────────
+// 替代 std::span<Scalar> 作为逐元素操作的载体。Span 同时是：
 //   1. 数据视图（指向 Matrix 内部数据）
-//   2. 表达式树叶子节点（eval(i) 返回 data_[i]）
-//   3. compute::apply 的输出目标（被写入）
+//   2. 表达式叶子（eval(i) 返回 data_[i]，满足 nn::Expression 概念）
 //
-// 运算符重载在幕后构建 AST，上层与具体执行路径解耦。
+// 注：旧代数 AST（自由运算符 + compute::apply 入口）已随逐元素算子移除；
+//     Span 现作为 Matrix 的底层存储视图与 DSL 叶子的数据载体。
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <cstddef>
 #include <span>
 
 #include "core_config.hpp"
-#include "algebra_expr.hpp"
 
 namespace nn
 {
@@ -61,9 +59,8 @@ public:
         return Span{data_ + offset, size_ - offset};
     }
 
-    // 注：Span 不定义成员运算符，所有 AST 构造由 expr.hpp 中的
-    // 自由函数模板 operator+/-/*/>/< 等（基于 Expression 概念）统一处理。
-    // 这保证 Span 与 ConstSpan/Val/任意 Expression 都能自然组合。
+    // 注：Span 不定义成员运算符；逐元素算法一律通过表达式 DSL
+    // （nn::dsl，见 expr_dsl.hpp）表达，不再有"运算符构建 AST"的旧路径。
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -73,7 +70,7 @@ public:
 //   - 内部存储 const Scalar*（不可写入）
 //   - 可从 const Matrix::span() 构造（std::span<const Scalar>）
 //   - 可从 Span 隐式构造（Span → ConstSpan 单向转换）
-//   - 仅满足 Expression 概念（作为 AST 输入），不能作为 compute::apply 输出
+//   - 满足 nn::Expression 概念（可作为 DSL 叶子/视图输入）
 //
 // 设计理由：
 //   上层 Layer/Loss/Optimizer 在 const Matrix& 上调用 .span() 时，
