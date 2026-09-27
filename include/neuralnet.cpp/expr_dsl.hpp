@@ -1303,6 +1303,28 @@ template <typename E>
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+// 扫描期（NN_EXPR_SCAN）校验闸门：折叠出的 ExprSpec 非法 → 立即中止构建
+//
+// 层侧 dry-run 大多以 (void) 调用，返回的错误会被静默吞掉：若结构本身非法
+// （例：裸分组归约视图做根节点 → 空指令表），扫描会"跑完"却不登记任何结构，
+// 直到 GPU 运行期才暴露 validate_expr_spec / 闭合世界报错——CPU 模板路径不校验，
+// 于是这类问题只在 GPU 上出现。扫描模式下统一在此硬失败，把运行期错误前移到构建期。
+//
+// 退出方式必须是 _Exit 而非 abort：扫描 dry-run 期间线程池 worker 存活，实测
+// std::abort() → SIGABRT handler（scan_exprs 装的栈打印，内部做 stacktrace 分配）
+// 会**卡死不退出**，构建随之挂死（单线程探针可正常退出 3，问题只在多线程上下文出现）。
+// _Exit 立即终止、不碰信号处理器与堆，ninja 拿到非零退出码即判构建失败。
+// ══════════════════════════════════════════════════════════════════════════
+#ifdef NN_EXPR_SCAN
+[[noreturn]] inline void scan_reject(const nn::Error& e)
+{
+    std::fprintf(stderr, "[scan] validate_expr_spec 失败: %s\n", e.message.c_str());
+    std::fflush(nullptr);
+    std::_Exit(3);
+}
+#endif
+
+// ══════════════════════════════════════════════════════════════════════════
 // 统一入口：engine.compute(expr, rows, cols[, P])
 //   CPU：编译期模板求值（SIMD 融合）。
 //   GPU：闭合世界 AOT —— to_expr_spec 折叠 → engine.eval_expr 匹配预生成
@@ -1326,7 +1348,7 @@ template <typename E>
     (void)eng;
     auto [spec, inputs] = to_expr_spec(e);
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)
-        return std::unexpected(v.error());
+        scan_reject(v.error());
     // 精度签名（结构 key 不含精度）：同一结构可登记多个带类型变体
     // （in-kernel f16 = 半精度直读直写）。占位张量按目标精度返回 —— 否则
     // dry-run 下游层看到的是 f32，f16 变体永远发现不到。
@@ -1430,7 +1452,7 @@ template <typename E>
     (void)eng;
     auto [spec, inputs] = to_expr_spec(e);
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)
-        return std::unexpected(v.error());
+        scan_reject(v.error());
     // 原地语义：输出精度 = dst 的存储精度（§8.3）→ 签名输出位取 dst
     const ExprPrecSig sig = expr_prec_sig_of(inputs, dst.precision());
     (void)dst;
@@ -1504,7 +1526,7 @@ template <typename E>
     (void)eng;
     auto [spec, inputs] = to_expr_spec(e);
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)
-        return std::unexpected(v.error());
+        scan_reject(v.error());
     const int raxis = expr_spec_reduce_axis(spec);
     // 精度签名（同 compute()）：占位张量按目标精度返回，供下游 dry-run 继续
     const ExprPrecSig sig = expr_prec_sig_of(inputs, P);
