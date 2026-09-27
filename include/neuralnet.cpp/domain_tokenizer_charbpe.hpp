@@ -599,7 +599,7 @@ private:
 // ═══════════════════════════════════════════════════════════════════════════
 //  Tokenizer 工厂：根据 JSON 的 "type" 字段创建对应分词器实例
 // ═══════════════════════════════════════════════════════════════════════════
-//  自动识别 BBPE / CharBPE 两种分词器（WordZip / Space 已于 2026 清理移除）。
+//  自动识别 BBPE / CharBPE 两种分词器。
 //  训练/推理入口统一使用此工厂，无需手动判断类型。
 
 [[nodiscard]] inline std::string peek_tokenizer_type(const std::string &json_content)

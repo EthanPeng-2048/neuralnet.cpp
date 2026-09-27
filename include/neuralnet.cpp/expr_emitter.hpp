@@ -12,10 +12,9 @@
 //    - ExprEmitter 是纯接口：给定 name + canonical ExprSpec，产出目标后端
 //      源码字符串（失败返回空串，语义与 glsl_gen 的约定一致）。
 //    - 现有 generate_glsl / generate_glsl_reduce 成为 GlslEmitter 的实现
-//      （见 expr_glsl_gen.hpp），gen_fused 等消费方经接口调用，不再与 GLSL 绑定。
+//      （见 expr_glsl_gen.hpp），gen_fused 等消费方经接口调用，与具体后端解耦。
 //    - 具体 emitter 类在各自头文件（expr_glsl_gen.hpp）提供，
 //      本头只定义接口 + 注册表（按后端名选择 emitter 工厂）。
-//      （历史上的 CpuEmitter / CudaEmitter 均已随各自后端删除。）
 //  注意：本头供构建期生成器/工具使用，运行时无需包含（与 glsl_gen 一致）。
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -45,12 +44,16 @@ public:
     [[nodiscard]] virtual std::string_view name() const noexcept = 0;
 
     // 逐元素 kernel 源码；失败返回空串（调用方报错）
-    // sig（可选）：存储精度签名（0 = 全 f32，输出与迁移前逐字节相同；
+    // sig（可选）：存储精度签名（0 = 全 f32 变体；
     // 见 expr_spec.hpp 的 ExprPrecSig）。带类型变体（in-kernel f16）不支持时
     // 返回空串 → 上层跳过该变体，运行时回退边界 cast。
+    // native16：原生 f16 算术变体（GL_EXT_shader_explicit_arithmetic_types_
+    // float16，全链 float16_t 计算）。仅当 expr_prec_sig_native16(spec, sig)
+    // 为真时请求；否则返回空串（上层跳过）。f32 算术变体（native16=false）
+    // 与 native16 变体**并存**——设备按 shaderFloat16 能力选 pipeline。
     [[nodiscard]] virtual std::string generate(
         const std::string& name_, const ExprSpec& spec,
-        ExprPrecSig sig = 0) = 0;
+        ExprPrecSig sig = 0, bool native16 = false) = 0;
 
     // 归约 kernel 源码；不支持（混合轴/超槽/带类型变体）返回空串
     [[nodiscard]] virtual std::string generate_reduce(

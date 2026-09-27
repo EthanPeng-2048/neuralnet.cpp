@@ -42,7 +42,7 @@ python train_pkg.py new --task mnist -o runs/mnist.json
   "format_version": 1,
   "name": "gpt-tiny",
   "task": "gpt",                // gpt | mnist
-  "device": "cpu",              // cpu | gpu（CUDA 已停用；train 时可用 --device 覆盖）
+  "device": "cpu",              // cpu | gpu（train 时可用 --device 覆盖）
   "data": {                     // 训练集路径（相对本配置所在目录）
     "train": "datasets/tinystories_20k.txt",
     "test": "",
@@ -90,7 +90,7 @@ python train_pkg.py pack runs/gpt.json -o runs/gpt.nnpkg --compress zstd
 ```bash
 python train_pkg.py info runs/gpt.nnpkg     # 查看包内配置/数据/校验和
 python train_pkg.py train runs/gpt.nnpkg    # 自动解包 + 校验 + 训练
-python train_pkg.py train runs/gpt.nnpkg --device gpu    # 按设备覆盖（CUDA 已停用）
+python train_pkg.py train runs/gpt.nnpkg --device gpu    # 按设备覆盖
 python train_pkg.py train runs/gpt.nnpkg --save runs/gpt.bin
 ```
 
@@ -128,3 +128,4 @@ MNIST 与 GPT 各自独立导出，互不影响。
 - `hyperparameters` 的键名直接对应 `cli_controllers` 各控制器参数
   （`MnistTrainController` / `GptTrainController`），未知键会被忽略。
 - 依赖：仅 `cli_controllers.py`（同目录）；zstd 为可选增强。
+- `--device` 取值 `cpu` / `gpu`（默认取配置里的 `device`）；CLI 同时接受 `cuda`，但引擎没有 CUDA 后端，该值不会启用 GPU，效果等同 `cpu`。

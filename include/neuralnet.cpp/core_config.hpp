@@ -8,7 +8,7 @@
 #include "core_errors.hpp"
 #include "precision.hpp"
 
-// 放在 algebra_matrix.hpp 或一个通用的 config.h 里
+// NN_VECTORIZE_PRAGMA：循环向量化提示的编译器分支实现，统一定义在 core_config.hpp
 #if defined(__clang__)
     #define NN_VECTORIZE_PRAGMA _Pragma("clang loop vectorize(assume_safety)")
 #elif defined(__GNUC__) || defined(__GNUG__)
@@ -44,7 +44,7 @@ namespace nn
     // 元素数 >= 此值时启用线程池并行；低于则串行执行（避免调度开销）。
     // 线程池调度开销约 50-200μs（Windows mutex+cv），仅当计算量足够时并行才有收益。
     //
-    // bench_thresholds 实测结果（32 核 CPU, Release -O3, 2026-07-25）：
+    // 实测结果（32 核 CPU, Release -O3）：
     //   元素数   串行μs  并行μs  加速比   建议
     //   16384     9.6    9.8     0.98x   无差别
     //   32768    18.8   19.9     0.94x   无差别

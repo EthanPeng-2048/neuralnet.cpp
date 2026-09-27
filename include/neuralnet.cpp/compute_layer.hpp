@@ -7,7 +7,7 @@
 //
 // 架构铁律：
 //   1. Layer 的 forward/backward 只写一次，通过 ComputeEngine 参数自动适配
-//      CPU/GPU 设备。不再有 forward_gpu / backward_gpu。
+//      CPU/GPU 设备，不设按后端分裂的 forward_gpu / backward_gpu 接口。
 //   2. 算法只在 Layer（通过组合 engine 原语表达），绝不在 Engine/Shader 中。
 //   3. Engine/Shader 只提供 op-level 原语（matmul, add, exp, max, reduce 等）。
 //

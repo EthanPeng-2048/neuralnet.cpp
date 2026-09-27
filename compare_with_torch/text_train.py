@@ -136,9 +136,9 @@ def build_batch(
 ):
     """按给定索引取一个 batch 并构造 (x, y) 张量。
 
-    改造点（相对 C++ 版）：
-      - 不再每 step 独立随机采样，而是由调用方传入本 step 的样本索引列表
-        （通常来自 epoch 级别的 shuffle 队列），保证每个样本每 epoch 只被访问一次
+    构造约定：
+      - 本 step 的样本索引由调用方传入（来自 epoch 级别的 shuffle 队列），
+        保证每个样本每 epoch 只被访问一次
       - x[t] = sample[t], y[t] = sample[t+1]（next-token prediction）
       - 样本长度 > seq_len+1: 截断（取前 seq_len+1 个 token）
       - 样本长度 <= seq_len:  不足部分用 pad_id 填充
@@ -265,8 +265,7 @@ def main():
             print(f"已加载模型: {cfg.resume} (从 epoch {start_epoch} 继续)\n")
 
     # ── 训练循环 ─────────────────────────────────────────────
-    # 改造：每个样本每 epoch 被访问一次（按 shuffle 后的顺序切片），
-    # 不再每 step 独立随机采样。
+    # 每个样本每 epoch 恰被访问一次（按 shuffle 后的顺序切片取 batch）。
     import random as _random
 
     n_samples = len(valid_samples)
@@ -290,7 +289,7 @@ def main():
         rng_epoch.shuffle(indices)
 
         for step in range(steps_per_epoch):
-            # 取本 step 的样本索引（顺序切片，不再独立采样）
+            # 取本 step 的样本索引（顺序切片）
             batch_indices = indices[step * cfg.batch_size : (step + 1) * cfg.batch_size]
             # 末尾不足一个 batch 时按实际样本数构建（避免索引越界）
             this_bs = len(batch_indices)

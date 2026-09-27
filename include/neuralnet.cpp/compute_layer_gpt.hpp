@@ -33,7 +33,7 @@ private:
     Tensor residual2_cache_;
 
     // ── activation offload（L1-offload）状态 ──
-    // 实现已抽到 compute_layer_base.hpp 的 ActivationOffloader（与 RAPTBlock 共用）
+    // 实现见 compute_layer_base.hpp 的 ActivationOffloader（与 RAPTBlock 共用）
     ActivationOffloader offloader_;
 
 public:
@@ -259,9 +259,8 @@ public:
 // ══════════════════════════════════════════════════════════════════════════
 // PositionEncoder — 位置编码抽象基类
 //
-// 把 GPTModel 中原本按 PosEncodingType 散落的 if-else 位置编码逻辑
-// （可学习 / 正弦波 / 无）抽离为独立的多态层次，GPTModel 通过基类指针使用，
-// 消除 use_pos_emb_ / pos_emb_learnable_ 等标志位分支的耦合。
+// 按 PosEncodingType 把位置编码逻辑（可学习 / 正弦波 / 无）组织为独立的多态
+// 层次，GPTModel 通过基类指针使用，不依赖标志位分支。
 //
 // 接口：
 //   - apply(engine, token_emb_T, batch, seq)   全量前向，返回已加位置信息的 x
@@ -423,7 +422,7 @@ public:
 };
 
 // 可学习位置编码（GPT 默认）：N(0, 0.02) 随机初始化。
-// 与 token_emb_ 共享同一 rng 序列（保持与旧实现完全一致的可复现性）。
+// 与 token_emb_ 共享同一 rng 序列，保证跨 run 可复现。
 class LearnedPositionEncoder final : public AdditivePositionEncoder
 {
     std::size_t d_model_;
@@ -503,9 +502,9 @@ public:
 //   - Sinusoidal: 正弦波固定位置编码（冻结）
 //   - ALiBi:      无位置嵌入，通过 CausalSelfAttention 的线性偏置注入位置信息
 //
-// 注意: token embedding 查表 + 位置 embedding 相加涉及按 token ID 的
-//       稀疏写入，此处用 to_matrix/from_matrix 在 CPU 端完成
-//       （batch 边界，PCIe 传输符合纯 GPU 架构约定）。
+// 注意: token embedding 查表（gather_rows）与位置 embedding 相加全程由
+//       引擎原语在设备端完成；反向用 scatter_add_rows 稀疏累加回嵌入表，
+//       无 CPU 中间拷贝。
 // ══════════════════════════════════════════════════════════════════════════
 class GPTModel final : public Layer
 {
@@ -799,12 +798,10 @@ public:
                 auto br = blocks_[idx].backward(engine, grad_x);
                 if (!br) return br;
                 grad_x = std::move(*br);
-                // 显存：backward 后**立即释放该块已消费的激活缓存**。
-                // 原先只在 checkpoint / offload 模式清理（默认路径不清理），
-                // 于是每块激活一直驻留、累积到整个 backward 结束才被下一轮
-                // forward 覆盖——探针实测这是 backward 段峰值主项（torch 的
-                // 等价行为是"用完即释放"）。清掉后该块的内存可被后续块的
-                // backward 临时量复用；下一轮 forward 会重新填充缓存。
+                // 显存：backward 后**立即释放该块已消费的激活缓存**——否则每块
+                // 激活会驻留到整个 backward 结束（探针实测为 backward 段峰值
+                // 主项；torch 的等价行为是"用完即释放"）。释放后该块的内存可被
+                // 后续块的 backward 临时量复用；下一轮 forward 会重新填充缓存。
                 blocks_[idx].clear_cache();
                 if (flush_interval_ > 0 && (bi + 1) % flush_interval_ == 0 && bi + 1 < n)
                 {
@@ -938,7 +935,7 @@ public:
     //   P0: begin_batch/end_batch 包裹 forward_step，单次 GPU 提交。
     //   P1: 每步只上传 1 个 token ID，无需重传整个 seq_len。
     //   KV cache: 每步 attention 只计算 Q×K_history（O(seq_len) 而非 O(seq_len²)），
-    //             历文 K/V 不再重复投影。
+    //             历史 K/V 复用缓存，不重复投影。
     //   logits 直接是 (vocab_size, 1)，无需 transpose+slice。
     //
     // 滑动窗口: 当 cur_len 达到 seq_len_ 时，丢弃最旧 token 重建 cache
@@ -1113,25 +1110,5 @@ public:
     if (!r2) return std::unexpected(r2.error());
     return engine.transpose(dstT);
 }
-
-// ══════════════════════════════════════════════════════════════════════════
-// CrossAttention — 阶段一：全局上下文重要性压缩（AttnZip Memory Queries）
-//
-// 算法（AttnZip 文档 §3.2，单头，忠实还原）：
-//   K = X·W_K, V = X·W_V                     X: (d_model, batch·L)
-//   A = Softmax(P·K^T / sqrt(d))             P: (d_model, M) 可学习记忆查询
-//   C = A·V                                  C: (d_model, batch·M)
-//
-// 批量化（batch=batch，单头，d_k = d_model）：
-//   Q_re = P 沿 batch 平铺 → (batch·d_model, M)
-//   K_re = rearrange_3d(K, d_model, batch, L) → (batch·d_model, L)
-//   S    = batched_matmul(Q_re, K_re, batch, transA=true, alpha=scale) → (batch·M, L)
-//   A    = softmax(S)
-//   C_re = batched_matmul(V_re, A, batch, false, true) → (batch·d_model, M)
-//   C    = rearrange_3d(C_re, d_model, batch, M, true) → (d_model, batch·M)
-//
-// 参数：P (d_model, M) 可学习 + w_k + w_v（无 w_o：C = A·V 直接输出）
-// 复杂度：对序列长度 L 线性（O(M·L·d)），是 AttnZip 消除 O(L²) 的核心。
-// ══════════════════════════════════════════════════════════════════════════
 } // namespace nn
 

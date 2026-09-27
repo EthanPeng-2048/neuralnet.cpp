@@ -2,7 +2,7 @@
 // 合并：attn_gradcheck + attn_consistency_test + attn_w_batch_test
 // 覆盖：CausalSelfAttention 梯度检查 / forward vs forward_step 一致性 /
 //       多头多 batch W 表达式行号回归 /
-//       MHA 双向语义探针（P-C2-7 fold 掩码回归钉子）+ CPU/GPU 一致性
+//       MHA 双向语义探针（fold 掩码回归钉子）+ CPU/GPU 一致性
 // ───────────────────────────────────────────────────────────────────────────
 
 #include <cstdio>
@@ -20,10 +20,10 @@
 #include "attn_w_batch_test.cpp"
 #undef main
 
-// ── MHA 双向语义探针（P-C2-7 回归钉子）──────────────────────────────────
-// 回归背景：fold 迁移曾把 fmask 默认树设为 Causal → MultiHeadAttention
-// （本应双向无掩码，旧 apply_mask_ 默认 no-op）被静默因果遮蔽；层级此前
-// 只测 CSA，未被抓住。
+// ── MHA 双向语义探针（回归钉子）──────────────────────────────────
+// ⚠ 约束：MHA 默认掩码必须为 Plain（双向）；默认树设为 Causal 会静默
+//   因果遮蔽双向注意力（MultiHeadAttention 本应双向无掩码）。本探针钉住
+//   该约束。
 // 探针：仅扰动输入的"未来"列（同 batch 内 t=seq-1），位置 0 的输出必须
 //   变化（双向可见）；因果掩码下位置 0 只见自己 → 输出逐位不变 → 失败。
 // CSA 阴性对照：同一扰动下因果层位置 0 输出必须**不变**（证明探针本身
@@ -191,9 +191,10 @@ int main(int argc, char* argv[])
 
     std::puts("=== attn_gradcheck (CausalSelfAttention numerical) ===");
     add(test_attn_gradcheck(argc, argv));
-    { // Doc / AlibiDoc backward 覆盖（masked_doc_ / masked_alibi_doc_ 分支此前
-        //   零执行——forward 对、梯度串文档抓不住；默认 learned+doc 与
-        //   alibi+doc 各跑一遍数值梯度）
+    { // Doc / AlibiDoc backward 覆盖：本段专门跑 masked_doc_ /
+        //   masked_alibi_doc_ 分支的梯度（仅 forward 通过不足以验证——
+        //   梯度跨文档串扰 forward 抓不住）；默认 learned+doc 与
+        //   alibi+doc 各跑一遍数值梯度
         char n0[] = "attn_gradcheck", n1[] = "--doc", n2[] = "--pos-enc",
              n3[] = "alibi";
         char* av_doc[]  = {n0, n1};
@@ -210,7 +211,7 @@ int main(int argc, char* argv[])
     std::puts("=== attn_w_batch (multi-head multi-batch regression) ===");
     add(test_attn_w_batch(argc, argv));
 
-    std::puts("=== mha_bidirectional (P-C2-7 fold mask regression pin) ===");
+    std::puts("=== mha_bidirectional (fold mask regression pin) ===");
     failures += mha_bidirectional_probe();
 
     std::printf("\nattn_test: %d failure(s)\n", failures);

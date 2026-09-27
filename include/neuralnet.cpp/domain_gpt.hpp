@@ -66,7 +66,7 @@ struct GptConfig {
     return model;
 }
 
-// ── 构建 GPT 模型（位置参数版本，转发至 GptConfig 版本，向后兼容） ───────
+// ── 构建 GPT 模型（位置参数版本，转发至 GptConfig 版本） ───────
 [[nodiscard]] inline Result<Model> build_gpt_model(
     ComputeEngine& engine,
     std::size_t vocab_size  = GPT_VOCAB_SIZE,
@@ -93,7 +93,7 @@ struct GptConfig {
     ComputeEngine& engine, const ModelSpec &spec,
     PrecisionProfile precision = PrecisionProfile{})
 {
-    // 接受 GPT 类型，或旧格式 ALiBi_GPT 类型（向后兼容旧模型文件）
+    // 接受 GPT 类型，或 ALiBi_GPT 类型（两种 spec 类型走同一构建路径）
     if (!spec.is_gpt() && !spec.is_alibi_gpt())
         return std::unexpected(Error{"Invalid ModelSpec type for GPT: expected GPT or ALiBi_GPT"});
 

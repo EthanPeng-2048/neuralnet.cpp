@@ -39,21 +39,21 @@ namespace nn
 class MemoryPool
 {
 public:
-    // ── 底材尺寸（2026-09 探针实测调参，跨负载数据见下）─────────────────
-    // 128MB → 12MB。实测峰值对块尺寸在 8–32MB 是平台区、最优 ≈12MB，且
+    // ── 底材尺寸（探针实测调参，跨负载数据见下）──────────────────────────
+    // 默认 12MB：实测峰值对块尺寸在 8–32MB 是平台区、最优 ≈12MB，且
     // **与模型规模无关**（真正的"自适应"是另一条规则：>底材的分配自动独占
-    // 精确尺寸块，不产生内部碎片）。跨负载实测（MiB）：
+    // 精确尺寸块，不产生内部碎片）。跨负载实测峰值（MiB）：
     //   GPT d64/L4/b64 : 8MB=3411 12MB=3399 16MB=3411 32MB=3427 128MB=3523
     //   GPT d128/L8/b32: 8MB=4449 12MB=4445 16MB=4457 32MB=4457 128MB=4557
     //   MNIST MLP      : 8MB=82   12MB=94   16MB=90   32MB=122  128MB=314
     //   MNIST CNN      :          12MB=142  16MB=154            128MB=314
-    // 另测过"最小 2 的幂阶梯类"（NN_POOL_LADDER_MAX_MB 启用）：d128 上
-    // ladder16=4497 比 fixed16=4457 差 40MB（配对 3/3），故阶梯默认关闭。
+    // 阶梯分类（"最小 2 的幂"尺寸类，NN_POOL_LADDER_MAX_MB 启用）默认关闭：
+    // d128 上 ladder16=4497 比 fixed16=4457 差 40MB。
     // 可用 NN_POOL_BLOCK_MB 覆盖做调参。
     static constexpr VkDeviceSize DEFAULT_BLOCK_SIZE = 12ull * 1024 * 1024; // 12MB
     // 尺寸分类分池（抗碎片，P3）：大块底材只服务大分配，小块底材只服务小分配，
-    // 避免大量高频的小临时分配在 128MB 底材里切出不可复用碎片、破坏大分配的
-    // 连续性（见《显存&负载不均衡分析》）。
+    // 避免大量高频的小临时分配在大块底材里切出不可复用碎片、破坏大分配的
+    // 连续性。
     static constexpr VkDeviceSize DEFAULT_SMALL_BLOCK_SIZE = 4ull * 1024 * 1024;  // 4MB
     // 小于该阈值视为"小分配"，走小块底材池。
     static constexpr VkDeviceSize SMALL_ALLOC_THRESHOLD = 256ull * 1024;           // 256KB
@@ -312,7 +312,7 @@ public:
         VkDeviceSize pool_size;
         if (ladder_max_ > 0 && alloc_size >= SMALL_ALLOC_THRESHOLD)
         {
-            // ── 自适应阶梯（2026-09 实测调参）──────────────────────────
+            // ── 自适应阶梯（尺寸类 = 不小于分配尺寸的最小 2 的幂）──────
             // 固定类别无法同时服务大小负载：小负载要细（抗内部碎片），大
             // 负载要粗（少 vkAllocateMemory）。改为"类别 = 不小于分配尺寸的
             // 最小 2 的幂"，夹在 [small_block_size_, ladder_max_]；超出上限

@@ -36,20 +36,15 @@
 //     ceil(cols/32)（5244² 仅 164 vs 136 并发槽 → 1.2 波，末波只剩 ~20%
 //     机器喂内存，实测带宽被尾部压约两成；对照 8192² 256 WG 尾部小带宽高）。
 //
-// ── 2026-09-24：与 DSL 生成归约（expr_glsl_gen generate_glsl_reduce）同步 ──
-// 差异分解（此前两条路算法不一致，OP 级是慢的那条）：
-//   ① 列归约访存：旧版「WG=单列、256 线程按行号跨步」——lane 间地址步进
-//     cols×4B，完全不合并（每 warp 32 笔独立事务）；4096² 实测 159 GB/s
-//     （同形状 row_reduce 482、add 412）。新版按列合并：lane = 列内偏移
-//     （同一行 32 连续列 = 128B 单事务），行方向切成 8 个行块（warp id）
-//     保并行度，跨行块部分和经 shared 合并（8 项，读写均合并、零 bank 冲突）。
-//   ② max 恒等元：旧版 -inf（0xff800000）。全库统一 numeric_limits::lowest()
-//     （0xFF7FFFFF，DSL/CPU 侧 2026-09 已改）——-inf 恒等元在全 -inf 输入
-//     下与状态进位/减法组合会出 −inf−−inf=NaN（fold doc 掩码 GPU -nan 同类
-//     根因）。
-//   ③ 行归约归约树：旧版 shared 串行树（8 次 barrier）；同步为 DSL 的
-//     subgroup 蝶式（3 次 barrier，subgroupAdd/subgroupMax → 跨 subgroup
-//     收拢 → lane0 广播）。
+// ── 与 DSL 生成归约（expr_glsl_gen generate_glsl_reduce）同结构 ──────────
+//   ① 列归约访存（按列合并）：lane = 列内偏移（同一行 32 连续列 = 128B 单
+//     事务），行方向切成 8 个行块（warp id）保并行度，跨行块部分和经 shared
+//     合并（8 项，读写均合并、零 bank 冲突）。
+//   ② max 恒等元：numeric_limits::lowest()（0xFF7FFFFF，全库统一——
+//     reduce.comp / DSL / CPU 同值）——-inf 不能作恒等元：全 -inf 输入下
+//     与状态进位/减法组合会出 −inf−−inf=NaN。
+//   ③ 行归约归约树：subgroup 蝶式（3 次 barrier，subgroupAdd/subgroupMax →
+//     跨 subgroup 收拢 → lane0 广播），与 DSL emit_tree_reduce 同构。
 //   4 路独立标量累加器（acc0..3，跨步 4*stride）与 DSL 行/列 pass 同款，
 //   打破累加依赖链提升 ILP；归约结合序与单线程不同（测试容差覆盖，与
 //   DSL 路径同等地位）。
@@ -60,13 +55,36 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
+// -DNN_SHADER_F16=1 → f16 存储变体（Phase C2 op-level in-kernel f16）：
+//   输入缓冲 float16_t（直读、f32 累加——shared/归约算术全 float 不变，
+//   消灭边界 cast 的整份 f32 输入副本：归因大头 Linear::backward grad_bias
+//   的 (64,8192)×38）。输出 OUT 仍 float（(rows,1)/(1,cols) 归约向量极小，
+//   保持 f32 → backend 无需改输出分配）。vec4 别名 uvec2（4×half=8B，
+//   std430 步长恰好 4 元素，索引语义与 f32 vec4 同；行偏移对齐：cols%4==0
+//   ⇒ row*cols%4==0 ⇒ 8B 对齐成立）。宏零成本：f32 分支宏展开与裸写 f32
+//   代码逐字同形 → SPIR-V 字节零差异。
+#if defined(NN_SHADER_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
 layout(local_size_x = 256) in;
 
+#if defined(NN_SHADER_F16)
+layout(std430, binding = 0) readonly buffer  BufIn  { float16_t data[]; };
+#define NN_RD(x) (float(x))
+#define NN_V4 uvec2
+#define NN_LOADV4(i) (vec4(unpackHalf2x16(data4[i].x), unpackHalf2x16(data4[i].y)))
+#else
 layout(std430, binding = 0) readonly buffer  BufIn  { float data[]; };
+#define NN_RD(x) x
+#define NN_V4 vec4
+#define NN_LOADV4(i) (data4[i])
+#endif
 layout(std430, binding = 1) writeonly buffer BufOut { float result[]; };
 // vec4 别名视图（同 binding 双声明；行归约 cols%4==0 快路径，16B 对齐由
 // MemoryPool 保证）
-layout(std430, binding = 0) readonly buffer  BufIn4 { vec4 data4[]; };
+layout(std430, binding = 0) readonly buffer  BufIn4 { NN_V4 data4[]; };
 
 layout(push_constant) uniform PushConstants {
     uint rows;
@@ -111,7 +129,7 @@ void main()
 
         if ((cols & 3u) == 0u)
         {
-            // ── vec4 快路径（2026-09-24）：每线程 4 组 vec4 累加器，
+            // ── vec4 快路径：每线程 4 组 vec4 累加器，
             //    组内 4 元素连续 → 跨 lane 512B 连铺、指令数 ÷4。
             //    横折 4 分量后进 subgroup 蝶式（与标量回退同构）。
             const uint g4 = (row * cols) >> 2;
@@ -121,13 +139,13 @@ void main()
             uint g = tid;
             for (; g + 3u * 256u < n4; g += 4u * 256u)
             {
-                acc0 = combine(acc0, data4[g4 + g]);
-                acc1 = combine(acc1, data4[g4 + g + 256u]);
-                acc2 = combine(acc2, data4[g4 + g + 512u]);
-                acc3 = combine(acc3, data4[g4 + g + 768u]);
+                acc0 = combine(acc0, NN_LOADV4(g4 + g));
+                acc1 = combine(acc1, NN_LOADV4(g4 + g + 256u));
+                acc2 = combine(acc2, NN_LOADV4(g4 + g + 512u));
+                acc3 = combine(acc3, NN_LOADV4(g4 + g + 768u));
             }
             for (; g < n4; g += 256u)
-                acc0 = combine(acc0, data4[g4 + g]);
+                acc0 = combine(acc0, NN_LOADV4(g4 + g));
             const vec4 s = combine(combine(acc0, acc1), combine(acc2, acc3));
             v = combine(combine(s.x, s.y), combine(s.z, s.w));
         }
@@ -139,13 +157,13 @@ void main()
             for (; c + 3u * 256u < cols; c += 4u * 256u)
             {
                 const uint base = row * cols;
-                acc0 = combine(acc0, data[base + c]);
-                acc1 = combine(acc1, data[base + c + 256u]);
-                acc2 = combine(acc2, data[base + c + 512u]);
-                acc3 = combine(acc3, data[base + c + 768u]);
+                acc0 = combine(acc0, NN_RD(data[base + c]));
+                acc1 = combine(acc1, NN_RD(data[base + c + 256u]));
+                acc2 = combine(acc2, NN_RD(data[base + c + 512u]));
+                acc3 = combine(acc3, NN_RD(data[base + c + 768u]));
             }
             for (; c < cols; c += 256u)
-                acc0 = combine(acc0, data[row * cols + c]);
+                acc0 = combine(acc0, NN_RD(data[row * cols + c]));
             v = combine(combine(acc0, acc1), combine(acc2, acc3));
         }
 
@@ -197,13 +215,13 @@ void main()
             uint r = rows_lo + wb;
             for (; r + 3u * 8u < rows_hi; r += 4u * 8u)
             {
-                acc0 = combine(acc0, data[r * cols + col]);
-                acc1 = combine(acc1, data[(r + 8u) * cols + col]);
-                acc2 = combine(acc2, data[(r + 16u) * cols + col]);
-                acc3 = combine(acc3, data[(r + 24u) * cols + col]);
+                acc0 = combine(acc0, NN_RD(data[r * cols + col]));
+                acc1 = combine(acc1, NN_RD(data[(r + 8u) * cols + col]));
+                acc2 = combine(acc2, NN_RD(data[(r + 16u) * cols + col]));
+                acc3 = combine(acc3, NN_RD(data[(r + 24u) * cols + col]));
             }
             for (; r < rows_hi; r += 8u)
-                acc0 = combine(acc0, data[r * cols + col]);
+                acc0 = combine(acc0, NN_RD(data[r * cols + col]));
         }
         sred[wb][l] = combine(combine(acc0, acc1), combine(acc2, acc3));
         barrier();

@@ -207,12 +207,12 @@ engine.add_inplace(*a, *b);
 engine.scale_inplace(*a, 0.1f);
 ```
 
-### 融合 axpy（2026-09 已移除该原语）
+### 融合 axpy（`dst += scalar * B`）
 
-`engine.axpy_inplace` 已删除——原地融合一律走表达式目标传递：
+引擎不提供 axpy 原语，原地融合一律走表达式目标传递（单条融合表达式 + 零分配原地写回）：
 
 ```cpp
-// A += scalar * B（单条融合表达式 + 零分配原地写回）
+// A += scalar * B
 (void)dsl::compute_into(engine, dsl::leaf(*a) + dsl::leaf(*b) * dsl::rparam(s), *a);
 ```
 
@@ -237,7 +237,7 @@ auto row_sum = engine.row_reduce_sum(*tensor);
 // 按列求和: (rows, cols) → (1, cols)
 auto col_sum = engine.col_reduce_sum(*tensor);
 
-// 按行求最大值：引擎算子已于 2026-09 删除，请用 DSL 归约叶子
+// 按行求最大值: 没有对应的引擎算子，用 DSL 归约叶子
 //   auto row_max = dsl::compute_reduce(engine, dsl::row_reduce_max(*tensor), rows, cols);
 
 // 按列求最大值: (rows, cols) → (1, cols)
@@ -247,17 +247,17 @@ auto col_max = engine.col_reduce_max(*tensor);
 **典型用途**：
 
 ```cpp
-// LayerNorm: 归一化每行
-auto mean = engine.row_reduce_sum(*x);
-engine.scale_inplace(*mean, 1.0f / x->cols());
+// LayerNorm: 沿特征维（行）求均值 → (1, batch)，再乘 1/F
+auto mean = engine.col_reduce_sum(*x);
+engine.scale_inplace(*mean, 1.0f / x->rows());
 
-// Softmax: 归一化每列
+// Softmax: 沿列求最大值（数值稳定的减法基准）
 auto max_val = engine.col_reduce_max(*logits);
 ```
 
-### 广播操作（2026-09 已移除两个原语）
+### 广播操作（表达式写法）
 
-`broadcast_row_inplace` / `broadcast_col_inplace` 已删除，广播一律在表达式里表达：
+广播没有独立原语，一律在表达式里表达：
 
 ```cpp
 // 按行广播：A += row_vec（row_vec 每行一个值）
@@ -281,10 +281,10 @@ auto max_val = engine.col_reduce_max(*logits);
 
 ## 逐元素运算
 
-> 单步调试/小工具用下面的 eager 原语即可；**生产代码组合多个运算时优先写一条
-> `dsl::compute` 表达式**（见"表达式融合"）——一次 dispatch、无中间 Tensor。
+> 下面全部是表达式写法：单步调试可以每步各写一条 `dsl::compute`，**生产代码组合多个
+> 运算时优先写成一条表达式**（见"表达式融合"）——一次 dispatch、无中间 Tensor。
 
-### 一元运算（2026-09：原语已删除，改用表达式）
+### 一元运算（DSL 叶子）
 
 ```cpp
 // neg / exp / log / sqrt / rsqrt / abs / tanh 都是 DSL 一元叶子
@@ -292,7 +292,7 @@ auto exp_t = dsl::compute(engine, dsl::exp(dsl::leaf(*a)), a->rows(), a->cols())
 auto neg_t = dsl::compute(engine, -dsl::leaf(*a),           a->rows(), a->cols());
 ```
 
-### 二元运算（2026-09：原语已删除，改用表达式）
+### 二元运算（表达式运算符）
 
 ```cpp
 // + - * / 与 max/min 直接写在表达式里（运算符重载）
@@ -300,7 +300,7 @@ auto sum_t = dsl::compute(engine, dsl::leaf(*a) + dsl::leaf(*b), a->rows(), a->c
 auto mx_t  = dsl::compute(engine, dsl::max(dsl::leaf(*a), dsl::leaf(*b)), a->rows(), a->cols());
 ```
 
-### 标量二元运算（2026-09：原语已删除，改用表达式）
+### 标量二元运算（`dsl::rparam`）
 
 ```cpp
 // 标量在右 / 在左皆可；dsl::rparam 承载运行时标量（不进 AOT key）
@@ -308,12 +308,12 @@ auto y = dsl::compute(engine, dsl::leaf(*a) * dsl::rparam(0.1f), a->rows(), a->c
 auto z = dsl::compute(engine, dsl::rparam(1.0f) + dsl::leaf(*a), a->rows(), a->cols());
 ```
 
-### 条件选择（2026-09：原语已删除）
+### 条件选择（`dsl::select`）
 
 ```cpp
 // ReLU 反向等条件选择用 dsl::select(cond, then, else)
 auto relu_grad = dsl::compute(engine,
-    dsl::select(dsl::leaf(*x) > Scalar{0}, dsl::leaf(*g), dsl::rparam(0)),
+    dsl::select(dsl::leaf(*x) > Scalar{0}, dsl::leaf(*g), Scalar{0}),
     x->rows(), x->cols());
 ```
 
@@ -419,11 +419,12 @@ auto result = nn::dsl::compute(
 nn::dsl::compute_into(engine, nn::dsl::leaf(dst) + nn::dsl::leaf(other) * nn::dsl::rparam(k), dst);
 ```
 
-### ~~块式融合~~（已移除）
+### 多步变换：写成一个表达式
 
-> 2026-09-19：`engine.begin_expr()` / `engine.end_expr()` 已随 IR-C 整体删除（无收益点，见
-> `docs/development/03-ir-optimization.md` §5.3）。需要多步逐元素变换时，直接写成**一个**
-> `dsl::compute` 表达式即可（单个 GPU 融合 kernel）。
+多步逐元素变换直接写成**一条** `dsl::compute` 表达式（单个 GPU 融合 kernel，
+中间量不落显存）：跨张量引用用 `dsl::leaf`、运行时标量用 `dsl::rparam`、
+结果写进既有张量用 `dsl::compute_into`。表达式之间没有"块式录制"入口，
+融合粒度就是单条表达式。
 
 ### 典型应用
 
@@ -487,9 +488,13 @@ engine.end_batch();
 ### 示例 1：线性层前向传播
 
 ```cpp
-// out = W × x + b —— matmul + 按行广播 bias 一条原语
-auto output = engine.matmul_with_bias(*weight_, input, *bias_, /*transA=*/false, /*transB=*/false);
+// 真实实现（compute_layer_mlp.hpp）：matmul 段 + 按行广播 bias 融合为单 kernel
+auto output = nn::dsl::compute(engine,
+    nn::dsl::matmul(*weight_, input) + nn::dsl::row_broadcast(*bias_),
+    weight_->rows(), input.cols());
 ```
+
+（引擎级 `engine.matmul_with_bias(A, B, bias, transA, transB)` 也可用，等价语义。）
 
 ### 示例 2：ReLU 激活
 
@@ -502,31 +507,27 @@ auto output = nn::dsl::compute(engine, nn::dsl::max(nn::dsl::leaf(input), Scalar
 
 ### 示例 3：LayerNorm
 
-真实实现（`compute_layer_mlp.hpp`）拆成 4 条 DSL 表达式（每条一个融合 kernel）：
+真实实现（`compute_layer_mlp.hpp`）拆成 7 条 DSL 表达式（归约输出 `(1,B)` 小向量，
+逐元素步用 col/row 广播把小向量并入全尺寸张量；每条一个融合 kernel）：
 
 ```cpp
-// 1) mean / diff（归约视图）
-// 2) var = col_reduce_sum(diff*diff) / F
-// 3) normalized = diff * rsqrt(var + eps)      ← 一条 compute
-// 4) out = normalized * row_broadcast(gamma) + row_broadcast(beta)
+// 1) mean_raw = compute_reduce(col_reduce_sum(leaf(x)), F, B)          → (1,B)
+// 2) mean     = compute(leaf(mean_raw) * rparam(1/F), 1, B)
+// 3) diff     = compute(leaf(x) - col_broadcast(mean), F, B)
+// 4) var_raw  = compute_reduce(col_reduce_sum(leaf(diff)*leaf(diff)), F, B)
+// 5) std_inv  = compute(rsqrt(leaf(var_raw) * rparam(1/F) + rparam(eps)), 1, B)
+// 6) norm     = compute(leaf(diff) * col_broadcast(std_inv), F, B)
+// 7) out      = compute(leaf(norm)*row_broadcast(gamma) + row_broadcast(beta), F, B)
 // backward：gy = grad*gamma；grad_x = (gy - mean(gy) - norm*mean(gy*norm)) * rsqrt(var+eps)
 ```
 
-用旧式多原语逐步写（能跑，但每步一次 dispatch + 一个中间 Tensor，仅作对照）：
-
-```cpp
-auto mean = engine.row_reduce_sum(input);
-engine.scale_inplace(*mean, 1.0f / input.cols());
-auto centered = engine.clone(input);
-engine.broadcast_col_inplace(*centered, *mean, BinaryOp::Sub);
-// ...（后续方差/归一化/仿射变换同理）
-```
+（每步的完整实参形如 `dsl::compute(engine, expr, rows, cols, p_.stable)`。）
 
 ### 示例 4：多头注意力
 
-> **真实实现已演进**：注意力 forward 现为**单 fold kernel**（QKᵀ/掩码/online softmax/ΣwV
-> 分块流式，S 矩阵绝不物化，见 `compute_layer_attention.hpp`），不再是下面这条
-> "batched_matmul → softmax → batched_matmul" 的物化链。下例保留作**结构示意**：
+> 注意力 forward 为**单 fold kernel**（QKᵀ/掩码/online softmax/ΣwV 分块流式，
+> S 矩阵绝不物化，见 `compute_layer_attention.hpp`）；下面这条
+> "batched_matmul → softmax → batched_matmul" 的链式写法只用于说明**结构语义**：
 
 ```cpp
 // 1. 线性投影 Q/K/V → 2. rearrange_3d 到 (batch*H*d_k, seq)
@@ -542,12 +543,12 @@ engine.broadcast_col_inplace(*centered, *mean, BinaryOp::Sub);
 ### 1. 使用表达式融合
 
 ```cpp
-// ❌ 不推荐：多次 kernel launch
-auto temp1 = engine.elementwise_unary(UnaryOp::Exp, *x);
-auto temp2 = engine.elementwise_binary(BinaryOp::Add, *temp1, *y);
-auto result = engine.elementwise_binary(BinaryOp::Mul, *temp2, *z);
+// ❌ 不推荐：拆成多次调用（每个中间量落显存，每个中间量一次 dispatch）
+auto t1 = nn::dsl::compute(engine, nn::dsl::exp(nn::dsl::leaf(x)), rows, cols);
+auto t2 = nn::dsl::compute(engine, nn::dsl::leaf(*t1) + nn::dsl::leaf(y), rows, cols);
+auto result = nn::dsl::compute(engine, nn::dsl::leaf(*t2) * nn::dsl::leaf(z), rows, cols);
 
-// ✅ 推荐：融合为单次调用
+// ✅ 推荐：一条表达式 = 一个融合 kernel
 auto result = nn::dsl::compute(engine,
     (nn::dsl::exp(nn::dsl::leaf(x)) + nn::dsl::leaf(y)) * nn::dsl::leaf(z),
     rows, cols);
@@ -664,4 +665,4 @@ auto& t = *tensor;  // 解引用
 
 ---
 
-*最后更新：2026-09-25（DSL 签名与示例对齐当前代码；接口清单见 `docs/development/12-compute-engine-inventory.md`）*
+*本文示例与当前代码签名一致；引擎接口全量清单见 `docs/development/12-compute-engine-inventory.md`。*

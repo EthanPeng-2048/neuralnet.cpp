@@ -1,5 +1,5 @@
 // ── tensor_precision_test.cpp — D3：Tensor 精度属性 + variant 存储 + 显式 API ────
-// 验收标准（docs/23 §13）：
+// 验收标准（docs/development/05-mixed-precision.md §13）：
 //   1. Tensor precision() 返回正确的 Precision
 //   2. f32 CPU Tensor：cpu_matrix() 返回 MatrixT<F32>（= Matrix&），数据正确
 //   3. f16 CPU Tensor：cpu_matrix<F16>() 返回 MatrixT<F16>&，数据正确

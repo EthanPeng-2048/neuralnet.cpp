@@ -18,6 +18,16 @@
 namespace nn
 {
 
+// ══════════════════════════════════════════════════════════════════════════
+// Softmax — 按行 softmax（用于注意力权重）
+//
+// 算法（只在此处，不在 Engine/Shader），两次调用各为单个融合表达式：
+//   forward:  out[r][c] = exp(x[r][c] - row_max[r]) / row_sum[r]
+//             其中 row_max[r] = max_c x[r][c]，row_sum[r] = Σ_c exp(x[r][c]-row_max[r])
+//   backward: grad_x[r][c] = out[r][c] * (grad_out[r][c] - row_dot[r])
+//             其中 row_dot[r] = Σ_c out[r][c] * grad_out[r][c]
+// 中间量（shifted/exp/row_max/row_sum）全部由融合 kernel 消解，不落显存。
+// ══════════════════════════════════════════════════════════════════════════
 class Softmax final : public Layer
 {
 private:
@@ -42,9 +52,9 @@ public:
         ComputeEngine& engine, const Tensor& input) override
     {
         // 行 softmax（数值稳定）：out = exp(x - row_max) / Σ_c exp(x - row_max)
-        // 单表达式融合（M3）：row_max/row_sum 为归约视图/归约指令，中间全尺寸
+        // 单表达式融合：row_max/row_sum 为归约视图/归约指令，中间全尺寸
         // Tensor（shifted/exp_shift/row_max/row_sum 的物化）由融合 kernel 消解，
-        // 仅 input 与 output 落显存。算法公式与旧多次原语完全一致。
+        // 仅 input 与 output 落显存。
         // 表达式文本只写在本 Layer；AOT 收集由 scan_exprs dry-run 本方法完成。
         auto out = dsl::compute(engine,
             dsl::exp(dsl::leaf(input) - dsl::row_reduce_max(input))
@@ -63,7 +73,7 @@ public:
         ComputeEngine& engine, const Tensor& grad_output) override
     {
         // grad_x = out ⊙ (grad_output - row_dot(out ⊙ grad_output))
-        // 单表达式融合（M3）：row_dot 为归约指令，消除 ep/gmd 等全尺寸中间 Tensor。
+        // 单表达式融合：row_dot 为归约指令，消除 ep/gmd 等全尺寸中间 Tensor。
         auto out = dsl::compute(engine,
             dsl::leaf(output_cache_)
             * (dsl::leaf(grad_output)

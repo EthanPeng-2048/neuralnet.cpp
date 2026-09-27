@@ -48,8 +48,8 @@ protected:
     std::vector<TensorRef> grads_;       // 非拥有引用（永不为空）
 
     // 多精度（§9.1 / D8）：优化器**状态**（m / v / momentum）的存储精度。
-    // 默认全 F32 = 现状（零回归）。f16 训练下状态留在 f32 是更稳的配方
-    // （f16 舍入会污染二阶矩），但 profile_all_f16（CLI --f16）按字面语义
+    // 默认全 F32。f16 训练下状态留在 f32 是更稳的配方
+    // （f16 舍入会污染二阶矩），但 profile_all_f16（四字段全 F16 的实验配方）按字面语义
     // 取 F16 —— 用户显式选择全 f16 时不予阻拦，只如实报告数值表现。
     // 参数更新（p -= ...）走 in-place，存储精度不可变（§8.3）。
     PrecisionProfile p_;
@@ -79,7 +79,7 @@ protected:
         return buffers;
     }
 
-    // ── 构造期资源分配失败记录（替代 std::abort）─────────────────────────
+    // ── 构造期资源分配失败记录 ────────────────────────────────────────
     // 构造函数无法返回 Result，故把首次失败原因存下，由 step() 开头经
     // check_ready_() 上抛（铁律 1：禁止 throw/abort，错误一律走 Result）。
     std::optional<Error> init_error_;
@@ -134,11 +134,15 @@ public:
             auto g_sq_r = dsl::compute(engine_, dsl::leaf(g) * dsl::leaf(g),
                                        g.rows(), g.cols());
             if (!g_sq_r) return std::unexpected(g_sq_r.error());
-            // 按行求和 → (rows, 1)
-            auto row_sums_r = engine_.row_reduce_sum(*g_sq_r);
+            // 按行求和 → (rows, 1)（dsl::compute_reduce）
+            auto row_sums_r = dsl::compute_reduce(engine_,
+                dsl::row_reduce_sum(dsl::leaf(*g_sq_r)),
+                g_sq_r->rows(), g_sq_r->cols());
             if (!row_sums_r) return std::unexpected(row_sums_r.error());
-            // 按列求和 → (1, 1) 标量张量
-            auto col_sum_r = engine_.col_reduce_sum(*row_sums_r);
+            // 按列求和 → (1, 1) 标量张量（dsl::compute_reduce）
+            auto col_sum_r = dsl::compute_reduce(engine_,
+                dsl::col_reduce_sum(dsl::leaf(*row_sums_r)),
+                row_sums_r->rows(), row_sums_r->cols());
             if (!col_sum_r) return std::unexpected(col_sum_r.error());
 
             if (acc.valid())
@@ -297,18 +301,16 @@ protected:
     std::vector<Tensor> m_;  // 一阶矩
     std::vector<Tensor> v_;  // 二阶矩
 
-    // Adam 核心更新（提取为 protected，AdamW 复用）
+    // Adam 核心更新（protected，AdamW 复用）
     // inv_bc1/inv_bc2 由 step() 提前计算（每步仅一次 pow），失败时不推进 t。
     //
-    // 融合改造（消除 GPU Copy / 中间缓冲）：
-    //   旧实现对 m/v 各做一次 clone_tensor（整份模型尺寸 vkCmdCopyBuffer，逐
-    //   步 2×model_size 的 Copy）+ 多次逐元素原语 + 多个中间张量。现改为三个
-    //   DSL 融合 kernel，全部超参（β1/β2/eps/lr/inv_bc1/inv_bc2）经 RParam
-    //   （运行时标量）承载——值不进 expr_spec_key，同结构共享 fusion shader，
-    //   引擎适应计算。无任何 clone、无 m_hat/v_hat/sqrt_v/denom/ratio 物化：
+    // 实现（三个 DSL 融合 kernel，零中间缓冲物化）：全部超参
+    // （β1/β2/eps/lr/inv_bc1/inv_bc2）经 RParam（运行时标量）承载——值不进
+    // expr_spec_key，同结构共享 fusion shader，引擎适应计算。不物化任何
+    // m_hat/v_hat/sqrt_v/denom/ratio 中间张量：
     //     K1  m = β1*m + (1-β1)*g            （m_ owned，直接重赋值）
     //     K2  v = β2*v + (1-β2)*g²           （v_ owned，直接重赋值）
-    //     K3  p -= lr * (inv_bc1*m) / (sqrt(inv_bc2*v)+eps)（p 为模型张量，add_inplace 就地）
+    //     K3  p -= lr * (inv_bc1*m) / (sqrt(inv_bc2*v)+eps)（p 为模型张量，目标传递原地更新）
     [[nodiscard]] Result<void> adam_update_(
         std::size_t i, Scalar inv_bc1, Scalar inv_bc2)
     {
@@ -507,7 +509,10 @@ public:
     auto row_sum_norm = dsl::compute_reduce(engine,
         dsl::row_reduce_sum(dsl::leaf(G) * dsl::leaf(G)), G.rows(), G.cols(), prec);
     if (!row_sum_norm) return std::unexpected(row_sum_norm.error());
-    auto total_norm_sq = engine.col_reduce_sum(*row_sum_norm, prec);
+    // 二级归约（(rows,1) → (1,1)）用 dsl::compute_reduce
+    auto total_norm_sq = dsl::compute_reduce(engine,
+        dsl::col_reduce_sum(dsl::leaf(*row_sum_norm)),
+        row_sum_norm->rows(), row_sum_norm->cols(), prec);
     if (!total_norm_sq) return std::unexpected(total_norm_sq.error());
 
     // 从 (1,1) Tensor 提取标量值
@@ -517,8 +522,8 @@ public:
     Scalar norm_sq_val = total_norm_sq_mat->at(0, 0);
     Scalar inv_norm_scalar = Scalar{1} / std::sqrt(norm_sq_val + eps * eps);
 
-    // X = G * inv_norm_scalar（归一化）：单表达式（取代 clone 整块拷贝 + scale
-    // 两次 dispatch；GPU 上 1 个融合 kernel + 1 次分配）
+    // X = G * inv_norm_scalar（归一化）：单表达式（GPU 上 1 个融合 kernel +
+    // 1 次分配）
     auto X = dsl::compute(engine,
         dsl::leaf(G) * dsl::rparam(inv_norm_scalar), G.rows(), G.cols(), prec);
     if (!X) return std::unexpected(X.error());
@@ -526,8 +531,8 @@ public:
     // 选更小一侧构造母矩阵，避免显存爆炸（Muon 显存 > AdamW 的根因）：
     //   - 短宽/方阵（m ≤ n）：行正交化，母矩阵 A = X·X^T（m×m，m 为短边）
     //   - 高窄矩阵（m > n）：列正交化，母矩阵 G = X^T·X（n×n，n 为短边）
-    // 故母矩阵恒为 min(m,n)² 而非 max(m,n)²。对高窄大参数（如 50257×1024 的
-    // 词嵌入），旧实现构造 50257² 的 A/A²（≈10GB/个）会 OOM；新实现降至
+    // 故母矩阵恒为 min(m,n)² 而非 max(m,n)²：对高窄大参数（如 50257×1024 的
+    // 词嵌入），沿长边构造 50257² 的 A/A²（≈10GB/个）必 OOM，沿短边只需
     // 1024²（≈4MB）。且列正交化要求 n ≤ m，高窄时"列"是唯一可达的近正交目标，
     // 数学上与参考实现（对短边一侧正交化）一致。
     const std::size_t m = G.rows();
@@ -539,22 +544,23 @@ public:
         // 行正交化：X ← (a + bA + cA²)·X，A = X·X^T（m×m）
         // 每步 5 次 dispatch：matmul(A) + matmul(A²) + 融合原地 A=bA+cA²
         //                  + matmul(BX) + 融合原地 BX+=aX
-        // （原实现 7 次：多出 scale(A²,c)/scale(A,b)/add(A,A²) 三次，现合并为
-        //   一次原地目标传递）
         for (std::size_t t = 0; t < steps; ++t)
         {
-            auto A = engine.matmul(*X, *X, false, true, prec);     // A = X·X^T
+            // 纯 matmul 经 DSL 直写（scan 的 optimizer dry-run 自动登记结构）
+            auto A = dsl::compute(engine,           // A = X·X^T
+                dsl::matmul(*X, *X, false, true), m, m, prec);
             if (!A) return std::unexpected(A.error());
-            auto A_sq = engine.matmul(*A, *A, false, false, prec); // A²
+            auto A_sq = dsl::compute(engine,         // A²
+                dsl::matmul(*A, *A, false, false), m, m, prec);
             if (!A_sq) return std::unexpected(A_sq.error());
 
-            // A = b·A + c·A²：原为 scale(A²,c) + scale(A,b) + add(A,A²) 三次
-            // dispatch，融合为一次原地目标传递（GPU 上 1 个 kernel）
+            // A = b·A + c·A²：一次原地目标传递（GPU 上 1 个 kernel）
             auto accA = dsl::compute_into(engine,
                 dsl::leaf(*A) * dsl::rparam(b) + dsl::leaf(*A_sq) * dsl::rparam(c), *A);
             if (!accA) return std::unexpected(accA.error());
 
-            auto BX = engine.matmul(*A, *X, false, false, prec);   // B·X
+            auto BX = dsl::compute(engine,           // B·X
+                dsl::matmul(*A, *X, false, false), m, n, prec);
             if (!BX) return std::unexpected(BX.error());
             // BX += a·X（原地目标传递：单 dispatch，不额外分配）
             auto accBX = dsl::compute_into(engine,
@@ -571,17 +577,21 @@ public:
         // 母矩阵恒为 n×n，高窄时远小于 m×m。
         for (std::size_t t = 0; t < steps; ++t)
         {
-            auto Gr = engine.matmul(*X, *X, true, false, prec);    // G = X^T·X（n×n）
+            // 纯 matmul 经 DSL 直写（同上，scan optimizer dry-run 登记）
+            auto Gr = dsl::compute(engine,           // G = X^T·X（n×n）
+                dsl::matmul(*X, *X, true, false), n, n, prec);
             if (!Gr) return std::unexpected(Gr.error());
-            auto Gr_sq = engine.matmul(*Gr, *Gr, false, false, prec); // G²
+            auto Gr_sq = dsl::compute(engine,        // G²
+                dsl::matmul(*Gr, *Gr, false, false), n, n, prec);
             if (!Gr_sq) return std::unexpected(Gr_sq.error());
 
-            // G = b·G + c·G²（同上：三次 dispatch 融合为一次原地目标传递）
+            // G = b·G + c·G²（同上：一次原地目标传递，单 kernel）
             auto accG = dsl::compute_into(engine,
                 dsl::leaf(*Gr) * dsl::rparam(b) + dsl::leaf(*Gr_sq) * dsl::rparam(c), *Gr);
             if (!accG) return std::unexpected(accG.error());
 
-            auto XM = engine.matmul(*X, *Gr, false, false, prec);  // X·G
+            auto XM = dsl::compute(engine,           // X·G
+                dsl::matmul(*X, *Gr, false, false), m, n, prec);
             if (!XM) return std::unexpected(XM.error());
             // XM += a·X（原地目标传递：单 dispatch）
             auto accXM = dsl::compute_into(engine,
@@ -664,8 +674,7 @@ public:
             std::optional<Tensor> nesterov_buf;
             if (nesterov_)
             {
-                // Nesterov: update = g + μ*v（单表达式：一次 dispatch + 一次分配，
-                // 取代 clone(整块拷贝) + axpy 两次 dispatch）
+                // Nesterov: update = g + μ*v（单表达式：一次 dispatch + 一次分配）
                 auto buf = dsl::compute(engine_,
                     dsl::leaf(g) + dsl::leaf(velocities_[i]) * dsl::rparam(momentum_),
                     g.rows(), g.cols(), p_.optimizer);
@@ -712,7 +721,7 @@ public:
 // 根据名称创建对应优化器，支持: "sgd", "sgd_momentum", "adam", "adamw", "muon"。
 // 未知名称返回 nullptr，由调用方处理。
 // precision：模型级精度配置（§9.1）——状态张量按 p.optimizer 创建，参数更新
-// 走 in-place（存储精度不可变）。默认全 F32 = 现状（零回归）。
+// 走 in-place（存储精度不可变）。默认全 F32。
 [[nodiscard]] inline std::unique_ptr<Optimizer> create_optimizer(
     std::string_view name,
     ComputeEngine& engine,

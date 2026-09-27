@@ -1,0 +1,30 @@
+# gen_fused 精度变体回填清单（Phase D3：run-only 签名回填）
+#
+# scan_exprs 的 dry-run 预测不到的**运行时签名**（如 Linear matmul 段的
+# in=[f16,f32,f32] 混合签名、Norm 归约链的 [f32,f16] 输入）——这类结构只有
+# 真实训练跑起来才暴露，miss 时适配层走边界 cast（to_f32_all 物化输入副本）。
+#
+# 行格式：  <expr_spec_key> <sig 十六进制>     （空白分隔；# 起始为注释）
+# 来源：    NN_PREC_TRACE=1 mem_probe 的 [prec][miss] 输出
+# 机制：    gen_fused 读本清单，对命中的 (结构, 签名) 额外发射变体
+#           （键 key#sig，谓词通过时另发 key#sig#a）——与 scan 预测的变体
+#           同一代码路径，重复条目自动去重。
+#
+# 维护：miss 复现 → 追加一行 → 重跑构建即可；生成后不再需要的行可留着
+#       （幂等去重，不影响产物）。
+
+# Linear matmul 段 run-only 混合签名（miss 时 (64,8192)/(256,8192) 物化大头）
+644a67003cf02a4d 10001
+644a67003cf02a4d 10005
+
+# Norm 归约链（raxis=1/含归约逐元素）：输入 f16 统计量、输出 f32
+e21f87a71850cc6d 0002
+c0006fc8ea6a0e6b 0002
+237bfb5805bbf52c 0002
+
+# 逐元素：全 f32 输入、f16 输出（scan 预测不到的 runtime-only 签名）
+79f355d6f8d1d247 10000
+
+# 注意力 forward 单 fold kernel（Phase D2：fold 带类型变体；3 输入全 f16、
+# 输出 f16 = Q/K/V 直读 + O 落回，算术/状态进位全 f32）
+9396eb8a1f95352c 10007

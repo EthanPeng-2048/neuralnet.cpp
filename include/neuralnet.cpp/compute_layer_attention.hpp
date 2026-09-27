@@ -154,12 +154,12 @@ public:
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  注意力 fold 构造（P-C2 双域旗舰样例）：fold attention 输出 O
+//  注意力 fold 构造（双域旗舰样例）：fold attention 输出 O
 //  （S 不物化，online 单遍）
 //
 //  这是**注意力 Layer 自己的表达式文本**（AOT 收集原则：表达式只出现在
-//  Layer），原先放在 expr_fold.hpp——fold 头因此染上了 attn 命名与掩码
-//  设计；现归位到注意力层，expr_fold.hpp 只保留与注意力无关的通用样例。
+//  Layer）：本文件是 make_fold_attn_o 构造与 FoldAttnMask 掩码变体的定义
+//  来源，expr_fold.hpp 只含与注意力无关的通用折叠样例。
 //  scan_exprs dry-run、fused_gpu/expr_cpu 对拍与 AttentionBase::forward
 //  共用本构造 → key 一致。
 //
@@ -338,8 +338,8 @@ enum class FoldAttnMask
 //   批量化关键：用 rearrange_3d 把 (H*d_k, batch*seq) 重排为 (batch*H*d_k, seq)，
 //   单次处理所有样本和所有头。
 //
-//   forward（P-C2-7 单 fold 路径，S 不物化）：
-//   Q/K = rearrange_3d → (batch*H*d_k, seq)；[RoPE]；Q *= scale（S7 折进 Q）
+//   forward（单 fold 路径，S 不物化）：
+//   Q/K = rearrange_3d → (batch*H*d_k, seq)；[RoPE]；Q *= scale（折进 Q）
 //   V_t = transpose + rearrange → (BH*seq, d_k)
 //   O_t = eval_expr(make_fold_attn_o(...), {Q, K, V_t, [掩码输入]}, BH*seq, d_k)
 //     —— QKᵀ/掩码/online softmax/ΣwV 全在单个 fold kernel 内逐块完成
@@ -369,19 +369,19 @@ protected:
     bool use_rope_ = false;
     RotaryEmbedding rope_;
 
-    // forward 缓存（rearranged 版本，供 backward 直接使用；得分矩阵类缓存
-    // 随单 fold 路径全部取消——W/m/l/attn 均不物化，W 在 backward 重算）
+    // forward 缓存（rearranged 版本，供 backward 直接使用；得分矩阵类量
+    // 不作缓存——W/m/l/attn 均不物化，W 在 backward 重算）
     Tensor Q_cache_, K_cache_, V_cache_;  // (batch*H*d_k, seq) rearranged
 
-    // ── S7：掩码输入张量钩子（IR 掩码表达式用；空 = 无该分量）──────────
+    // ── 掩码输入张量钩子（IR 掩码表达式用；空 = 无该分量）──────────
     //   mask_slopes_   — ALiBi 按头斜率 (1, num_heads)，batch_mod(num_heads) 索引
     //   mask_doc_col_  — 每行文档 id (BH*seq, 1)，row_broadcast（doc_col[b*H*seq+h*seq+i]）
-    //   mask_doc_ids_  — 每位置文档 id (1, batch*seq)，batch_col(seq) 切片
+    //   mask_doc_ids_  — 每位置文档 id (1, batch*H*seq)，batch_col(seq) 切片
     [[nodiscard]] virtual const Tensor* mask_slopes_() const { return nullptr; }
     [[nodiscard]] virtual const Tensor* mask_doc_col_() const { return nullptr; }
     [[nodiscard]] virtual const Tensor* mask_doc_ids_() const { return nullptr; }
 
-    // ── S7：掩码 DSL 表达式（causal 恒有 + alibi/doc 按钩子）──────────
+    // ── 掩码 DSL 表达式（causal 恒有 + alibi/doc 按钩子）──────────
     // 4 种组合（causal / causal+alibi / causal+doc / causal+alibi+doc）各自
     // 生成确定结构（scan dry-run 覆盖全部组合，闭合世界两端一致）。
     // blocked≠0 的位置屏蔽（-inf）。
@@ -389,11 +389,10 @@ protected:
     [[nodiscard]] bool use_alibi_mask_() const { return mask_slopes_() != nullptr; }
     [[nodiscard]] bool use_doc_mask_() const { return mask_doc_col_() != nullptr; }
 
-    // ── fold 掩码变体选择（P-C2-7 正确性修复）──────────────────────────
-    //   类级语义，fail-safe 默认 = 无掩码：MHA（基类默认）双向不掩蔽——
-    //   与迁移前 apply_mask_ 默认 no-op 同义；CSA override 返回四分支
-    //   掩码树（causal 恒有 + alibi/doc 按钩子）。forward fold 与
-    //   recompute_W_ 的掩码树都经此选择（两者同构同序）。
+    // ── fold 掩码变体选择 ───────────────────────────────────────────────
+    //   类级语义，fail-safe 默认 = 无掩码：MHA（基类默认）双向不掩蔽；
+    //   CSA override 返回四分支掩码树（causal 恒有 + alibi/doc 按钩子）。
+    //   forward fold 与 recompute_W_ 的掩码树都经此选择（两者同构同序）。
     [[nodiscard]] virtual nn::expr::FoldAttnMask fold_mask_variant_() const
     {
         return nn::expr::FoldAttnMask::Plain;
@@ -437,10 +436,10 @@ protected:
         return scores + dsl::select(blocked != Scalar{0}, kNegInf_, alibi);
     }
 
-    // ── P0-5：从 Q/K 重算 W（P-C2-7：m/l 缓存已随 forward fold 迁移删除，
-    //   softmax 单表达式在 kernel 内部归一化，m/l 不再外溢）。两步均走既有
-    //   快路径：1) S = masked(Q·Kᵀ)（generate_glsl_matmul 分块；掩码树与
-    //   forward fold 的变体同构）2) W = softmax(S)（M3 归约快路径）。
+    // ── 从 Q/K 重算 W ──────────────────────────────────────────────────
+    //   W 与 m/l 均不作缓存：softmax 单表达式在 kernel 内部归一化，m/l 不外溢。
+    //   两步均走既有快路径：1) S = masked(Q·Kᵀ)（generate_glsl_matmul 分块；
+    //   掩码树与 forward fold 的变体同构）2) W = softmax(S)（归约快路径）。
     // 返回 (BH*seq, seq) 的 softmax 归一化权重；attention FLOPs ×1.5–2
     // （QK^T 在 backward 重算），训练可接受。
     [[nodiscard]] Result<Tensor> recompute_W_(
@@ -455,7 +454,7 @@ protected:
         Result<Tensor> sres = [&]() -> Result<Tensor> {
             // MHA（Plain）：S 不施加任何掩码——与 forward fold 的 Plain
             //   变体同构；裸 matmul 表达式由 scan_exprs 的 MHA dry-run
-            //   注册（闭合世界：该结构此前从未被 dry-run 覆盖）
+            //   注册（闭合世界：该结构必须有 dry-run 覆盖）
             if (fold_mask_variant_() == nn::expr::FoldAttnMask::Plain)
                 return dsl::compute(engine,
                     dsl::matmul(Q, K, true, false, BH), BH * seq, seq, p_.compute);
@@ -477,9 +476,9 @@ protected:
         }();
         if (!sres) return std::unexpected(sres.error());
         Tensor S = std::move(*sres);
-        // 2) W = softmax(S)（M3 单表达式归约快路径——与 Softmax::forward
+        // 2) W = softmax(S)（单表达式归约快路径——与 Softmax::forward
         //    同构：ReduceRef 直接参与算术按行广播；m/l 在 kernel 内部归一化，
-        //    不再作为输入/缓存存在）
+        //    不作为输入/缓存存在）
         return dsl::compute(engine,
             dsl::exp(dsl::leaf(S) - dsl::row_reduce_max(S))
             / dsl::row_reduce_sum(
@@ -487,11 +486,11 @@ protected:
             BH * seq, seq, p_.compute);
     }
 
-    // ── 掩码输入准备钩子（P-C2-7 前身 = two_pass_mask_ 决策钩子）─────────
-    // forward 恒走单 fold 路径（旧物化/两趟分支已删，不保留旧路径）；本钩子
-    // 仅做"掩码输入张量准备"（CSA 覆写构建 slopes/doc_col/doc_ids 缓存），
-    // 掩码分量经 mask_slopes_/mask_doc_col_/mask_doc_ids_ 钩子供 fold/recompute
-    // 表达式读取。默认 no-op（MHA/AttentionBase 无掩码分量）。
+    // ── 掩码输入准备钩子 ──────────────────────────────────────────────
+    // forward 恒走单 fold 路径；本钩子仅做"掩码输入张量准备"（CSA 覆写构建
+    // slopes/doc_col/doc_ids 缓存），掩码分量经 mask_slopes_/mask_doc_col_/
+    // mask_doc_ids_ 钩子供 fold/recompute 表达式读取。默认 no-op
+    //（MHA/AttentionBase 无掩码分量）。
     [[nodiscard]] virtual Result<void> prepare_mask_inputs_(
         ComputeEngine& engine, std::size_t batch, std::size_t seq)
     {
@@ -499,9 +498,9 @@ protected:
         return {};
     }
 
-    // （P-C2-7：apply_mask_ 物化路径钩子已删除——掩码恒在 fold body /
-    //   recompute_W_ 掩码树内表达，绝不物化 (BH·seq, seq) 掩码矩阵；
-    //   增量推理的 apply_mask_step_ 独立保留，见下。）
+    // 掩码恒在 fold body / recompute_W_ 掩码树内表达，绝不物化
+    //   (BH·seq, seq) 掩码矩阵；增量推理另有独立的 apply_mask_step_
+    //   钩子，见下。
 
     // 增量推理掩码钩子：在 forward_step 中 scale 之后、softmax 之前调用。
     // 默认 no-op：MHA 无掩码；CSA 因果掩码在增量推理中天然满足
@@ -537,7 +536,7 @@ public:
     // ── D7：精度配置下传（§9.2）──────────────────────────────────────────
     // 注意力是复合层（4 个投影 Linear + Softmax + RoPE）；子层/辅助对象必须
     // 一起拿到 profile，否则它们的 p_ 停在默认 F32：参数仍按 F32 创建、
-    // DSL 求值退回 F32 —— f16 配置下静默失效（历史缺陷：此前无人下传）。
+    // DSL 求值退回 F32 —— f16 配置下静默失效。
     void set_precision_profile(const PrecisionProfile& profile) override
     {
         Layer::set_precision_profile(profile);
@@ -681,14 +680,19 @@ public:
             if (!kr2) return std::unexpected(kr2.error());
             K = std::move(*kr2);
         }
-        // 2.6 S7：scale（1/sqrt(d_k)）折进 Q（Q *= scale）：注意力表达式不含
+        // 2.6 scale（1/sqrt(d_k)）折进 Q（Q *= scale）：注意力表达式不含
         // scale 常量 → 结构与 d_k 无关（不同 d_k 共享融合 shader，闭合世界
         // key 稳定）。backward 的 grad_Q 相应补乘 scale。
-        // 注：保留就地原语——DSL 表达式会多分配一整块 (BH·d_k, seq) 缓冲，
-        // 实测该点比 scale_inplace 慢（见 build/perfprobe 的原地/表达式对照）。
-        { auto qs = engine.scale_inplace(Q, scale_); if (!qs) return std::unexpected(qs.error()); }
+        // 写法用 dsl::compute_into（零分配原地写）；dsl::compute 是分配版
+        // （另分配一整块缓冲），此处不适用。
+        // scale_ 用 rparam 承载 → 值不进 expr_spec_key（融合二期教训 1）。
+        {
+            auto qs = dsl::compute_into(engine,
+                dsl::leaf(Q) * dsl::rparam(scale_), Q);
+            if (!qs) return std::unexpected(qs.error());
+        }
 
-        // ── 注意力主体：单 fold 路径（P-C2-7，不保留旧路径）────────────
+        // ── 注意力主体：单 fold 路径 ────────────────────────────────────
         const std::size_t BH = batch * num_heads_;
         //   掩码输入张量准备（CSA 覆写钩子构建 slopes/doc_col/doc_ids）
         {
@@ -699,13 +703,13 @@ public:
         //   fold_mask_variant_；与 recompute_W_ 的掩码树同构同序）
         const auto fmask = fold_mask_variant_();
         Tensor concat_out;  // (batch*H*d_k, seq)——fold 输出 O_t 经转置/重排得到
-        // V 需 (BH*seq, d_k) 布局：V_t 构建（原位于 W 之后，fold 需前置）
+        // V 需 (BH*seq, d_k) 布局：V_t 构建须在 fold 求值之前完成（fold 直接消费 V_t）
         auto V_T_full = engine.transpose(V);
         if (!V_T_full) return std::unexpected(V_T_full.error());
         auto V_t = engine.rearrange_3d(*V_T_full, seq, BH, d_k_, false);
         if (!V_t) return std::unexpected(V_t.error());
         // ── 单 fold 表达式：S 不物化、online 单遍 ──────────────────────
-        //   6 趟 (BH·seq, seq) 物化流量归零；掩码在 fold body 内逐块生效，
+        //   无 (BH·seq, seq) 中间张量流量；掩码在 fold body 内逐块生效，
         //   tri_skip 把被屏蔽块钳成空转（被跳过的恰是 -inf/0 恒等项 →
         //   与全量计算逐位一致，见 FoldSpec::tri_skip 注释）。
         //   inputs 顺序 = make_fold_attn_o 的 views 顺序：Q,K,V_t,[slope],[dc],[ids]
@@ -717,7 +721,7 @@ public:
             nn::expr::make_fold_attn_o(seq, d_k_, BH, fmask);
         if (auto fv = nn::validate_expr_spec(fold_spec, fold_in.size()); !fv)
             return std::unexpected(fv.error());
-        // scale 已折进 Q（scale_inplace，S7 教训）——fold 的 mm 段直接消费
+        // scale 已折进 Q（见上 2.6；运行时值不进 expr_spec_key）——fold 的 mm 段直接消费
         auto O_t_r = engine.eval_expr(fold_spec, fold_in, BH * seq, d_k_, p_.compute);
         if (!O_t_r) return std::unexpected(O_t_r.error());
         Tensor O_t = std::move(*O_t_r);
@@ -733,7 +737,7 @@ public:
             Q_cache_ = std::move(Q);
             K_cache_ = std::move(K);
             V_cache_ = std::move(V);
-            // P-C2-7：m/l 不再缓存（recompute_W_ 内部 softmax 归一化，见 P0-5 区）
+            // m/l 不作缓存（recompute_W_ 内部 softmax 归一化，见其注释）
         }
         // 掩码恒在 fold body 内生效（fold_mask_variant_ 选变体），绝不物化
 
@@ -782,13 +786,16 @@ public:
             grad_concat_re = std::move(*gc);
         }
 
-        // 3-7. 注意力反向：S7 R/X 路径（P-C2-7：旧 softmax.backward 分支不保留）
+        // 3-7. 注意力反向：R/X 路径
         Tensor grad_Q_re, grad_K_re, grad_V_re;  // 均 (batch*H*d_k, seq)
         {
             // P = grad_A = batched_matmul(grad_concat^T, V, BH, true, false)
-            // forward: O = V × A^T → grad_A = grad_O^T × V（两趟式反向的 P 输入）
-            auto grad_A = engine.batched_matmul(
-                grad_concat_re, V_cache_, BH, true, false, Scalar{1}, p_.compute);
+            // forward: O = V × A^T → grad_A = grad_O^T × V（后续 R/X 分解的 P 输入）
+            // dsl::matmul(batch)（结构经 scan 的 CSA/MHA backward dry-run 登记）；
+            // 输出形状：transA=true → rows=BH*A.cols()；transB=false → cols=B.cols()
+            auto grad_A = dsl::compute(engine,
+                dsl::matmul(grad_concat_re, V_cache_, true, false, BH),
+                BH * grad_concat_re.cols(), V_cache_.cols(), p_.compute);
             if (!grad_A) return std::unexpected(grad_A.error());
             nn_dbg_scan("attn.grad_A", engine, *grad_A);
             // G = grad_concat_re^T 按 batch 转置 → (BH*seq, d_k)，
@@ -797,9 +804,9 @@ public:
             if (!G_T_full) return std::unexpected(G_T_full.error());
             auto G = engine.rearrange_3d(*G_T_full, seq, BH, d_k_, false);
             if (!G) return std::unexpected(G.error());
-            // ── S7 IR 路径（M6 → R/X 表达式 + 普通 batched_matmul）──
-            //   从 Q/K 重算 W（P0-5：不缓存 W；P-C2-7 起 m/l 也不缓存——
-            //   recompute_W_ 内部 softmax 单表达式归一化）；
+            // ── IR 路径（R/X 表达式 + batched matmul）──
+            //   从 Q/K 重算 W（W 与 m/l 均不缓存——recompute_W_ 内部
+            //   softmax 单表达式归一化）；
             //   FLOPs ×1.5-2（QK^T 重算），训练可接受。
             auto W_re = recompute_W_(engine, Q_cache_, K_cache_, BH, seq);
             if (!W_re) return std::unexpected(W_re.error());
@@ -819,18 +826,30 @@ public:
             if (!X) return std::unexpected(X.error());
             nn_dbg_scan("attn.X", engine, *X);
             // grad_Q = K × X^T（K_b (d_k,seq)，X_b (seq,seq) 按 X^T 使用）
-            auto gq = engine.batched_matmul(K_cache_, *X, BH, false, true, Scalar{1}, p_.compute);
+            // dsl::matmul(batch)（transA=F,transB=T → rows=K.rows(), cols=X.rows()/BH）
+            auto gq = dsl::compute(engine,
+                dsl::matmul(K_cache_, *X, false, true, BH),
+                K_cache_.rows(), X->rows() / BH, p_.compute);
             if (!gq) return std::unexpected(gq.error());
             nn_dbg_scan("attn.gq(pre-scale)", engine, *gq);
-            // grad_Q 补乘 scale（forward 把 scale 折进了 Q）：用就地原语（同 forward
-            // 的说明——DSL 表达式要多分配一整块缓冲，实测更慢）
-            { auto gqs = engine.scale_inplace(*gq, scale_); if (!gqs) return std::unexpected(gqs.error()); }
-            // grad_K = Q × X
-            auto gk = engine.batched_matmul(Q_cache_, *X, BH, false, false, Scalar{1}, p_.compute);
+            // grad_Q 补乘 scale（forward 把 scale 折进了 Q）：compute_into 原地
+            // （同 forward 2.6 的写法；rparam 承载 scale 值不进 key）
+            {
+                auto gqs = dsl::compute_into(engine,
+                    dsl::leaf(*gq) * dsl::rparam(scale_), *gq);
+                if (!gqs) return std::unexpected(gqs.error());
+            }
+            // grad_K = Q × X（dsl::matmul(batch)：false,false → rows=Q.rows(), cols=X.cols()）
+            auto gk = dsl::compute(engine,
+                dsl::matmul(Q_cache_, *X, false, false, BH),
+                Q_cache_.rows(), X->cols(), p_.compute);
             if (!gk) return std::unexpected(gk.error());
             nn_dbg_scan("attn.gk", engine, *gk);
             // grad_V = W^T × G（W_b (seq,seq) 按 W^T 使用，G_b (seq,d_k)）→ (BH*seq, d_k)
-            auto gv_t = engine.batched_matmul(*W_re, *G, BH, true, false, Scalar{1}, p_.compute);
+            // dsl::matmul(batch)：transA=T,transB=F → rows=BH*W.cols(), cols=G.cols()
+            auto gv_t = dsl::compute(engine,
+                dsl::matmul(*W_re, *G, true, false, BH),
+                BH * W_re->cols(), G->cols(), p_.compute);
             if (!gv_t) return std::unexpected(gv_t.error());
             // grad_V 转置回 (BH*d_k, seq)（与 forward 的 V_t→V 逆变换一致）
             auto gv_T = engine.transpose(*gv_t);
@@ -888,8 +907,8 @@ public:
         nn_dbg_scan("attn.giv", engine, *giv);
 
         // grad_input = grad_Q + grad_K + grad_V：三路累加**原地**融合为单趟
-        // （目标传递，不额外分配；取代 clone + 两次 add_inplace）。加法结合
-        // 顺序与原实现一致（(giq + gik) + giv）→ 逐字节等价。
+        // （dsl::compute_into 目标传递，不额外分配）。结合顺序固定为
+        // (giq + gik) + giv —— 求和顺序确定，结果可复现。
         auto acc = dsl::compute_into(engine,
             dsl::leaf(*giq) + dsl::leaf(*gik) + dsl::leaf(*giv), *giq);
         if (!acc) return std::unexpected(acc.error());
@@ -969,9 +988,11 @@ public:
         //    K_T: (H*d_k, new_len) — 每头 (d_k, new_len)，transB=F，N=new_len
         //    每头: (1, d_k) × (d_k, new_len) = (1, new_len)
         //    堆叠: (H, new_len)
-        //    scale (1/sqrt(d_k)) 通过 alpha 折进 matmul 写出
-        auto scores = engine.batched_matmul(
-            *q_res, *K_T, num_heads_, true, false, scale_, p_.compute);
+        //    scale (1/sqrt(d_k)) 经 rparam 尾链乘在 matmul 结果上（不进 expr_spec_key）
+        // dsl::matmul(batch)：{1,0}+Mul(rparam) 与 ZiPTBlock 的 S 同 key
+        auto scores = dsl::compute(engine,
+            dsl::matmul(*q_res, *K_T, true, false, num_heads_) * dsl::rparam(scale_),
+            num_heads_ * q_res->cols(), K_T->cols(), p_.compute);
         if (!scores) return std::unexpected(scores.error());
 
         // 6. 施加增量推理掩码钩子（默认 no-op；ALiBi 施加线性偏置）
@@ -987,8 +1008,10 @@ public:
         //    attn: (H, new_len) — 每头 (1, new_len)，转置后 (new_len, 1)，N=1
         //    每头: (d_k, new_len) × (new_len, 1) = (d_k, 1)
         //    堆叠: (H*d_k, 1)
-        auto attn_out = engine.batched_matmul(
-            *V_T, *attn, num_heads_, false, true, Scalar{1}, p_.compute);
+        // dsl::matmul(batch)：纯 {0,1} 结构（attention backward 已登记同 key）
+        auto attn_out = dsl::compute(engine,
+            dsl::matmul(*V_T, *attn, false, true, num_heads_),
+            V_T->rows(), attn->rows() / num_heads_, p_.compute);
         if (!attn_out) return std::unexpected(attn_out.error());
 
         // 9. 输出投影 → (d_model, 1)
@@ -1041,8 +1064,9 @@ public:
 //   3. 计算开销极小（仅添加预计算的偏置）
 //
 // 算法差异（相对于 AttentionBase）：
-//   在 forward 的 scale 之后、softmax 之前，施加预计算的掩码：
-//     S += mask (batch*H*seq, seq) — 因果掩码（按 batch*H 平铺，ALiBi 模式下含线性偏置）
+//   掩码恒在 fold body（forward）与 recompute_W_ 掩码树（backward）内逐块
+//   表达，绝不物化 (BH·seq, seq) 掩码矩阵：因果项恒有，ALiBi 模式叠加线性
+//   偏置，文档模式叠加块对角（变体由 fold_mask_variant_ 选择）。
 //   backward 无需特殊处理（掩码为常数，softmax.backward 已处理梯度穿透）
 //
 //   seq_len 由构造函数指定，batch = input.cols() / seq_len 在 forward 时推断。
@@ -1056,13 +1080,13 @@ private:
     // 掩码输入张量缓存（fold body / recompute_W_ 掩码树经
     // mask_slopes_/mask_doc_col_/mask_doc_ids_ 钩子读取）
     // ALiBi 斜率表 (1, batch*num_heads)：按 (b,h) 块重复 slopes_[h]——fold 的
-    //   batch_mod(BH) 按网格下标 b*H+h 直读（旧 (1,H) 表 batch≥2 时 b≥1 越界
-    //   读、ALiBi 静默错；batch=1 恰好掩蔽）。旧 recompute 的 batch_mod(%H)
-    //   与增量推理按 h∈[0,H) 读均落首块 → 语义不变。batch 变化时重建。
+    //   batch_mod(BH) 按网格下标 b*H+h 直读，表长必须 = batch*H；若用 (1, H)
+    //   表，batch≥2 时 b≥1 越界读、ALiBi 静默错（batch=1 时下标恒 <H，掩盖
+    //   该错误）。batch 变化时重建。
     Tensor slopes_cache_;
     std::size_t slopes_cached_batch_ = 0;  // slopes_cache_ 形状键（batch 变更重建）
     Tensor doc_ids_cache_;  // (1, batch*H*seq) 每位置文档 id 按 (b,h) 块重复（每步重建）
-    Tensor doc_col_;        // (BH*seq, 1) 每行文档 id（每步重建，S7 掩码用）
+    Tensor doc_col_;        // (BH*seq, 1) 每行文档 id（每步重建，掩码用）
 
     // ALiBi 斜率：m_h = 2^(-8h/H)（仅 use_alibi_ = true 时使用）
     std::vector<Scalar> slopes_;
@@ -1098,7 +1122,7 @@ public:
     }
 
 protected:
-    // 掩码输入张量准备（原 two_pass_mask_ 的构建体原样保留、职责纯化）：
+    // 掩码输入张量准备：
     //   slopes_cache_ / doc_ids_cache_ / doc_col_ 由本钩子构建，
     //   掩码分量经 mask_slopes_/mask_doc_col_/mask_doc_ids_ 钩子读取。
     [[nodiscard]] Result<void> prepare_mask_inputs_(
@@ -1107,9 +1131,9 @@ protected:
         // 掩码分量由 mask_slopes_/mask_doc_col_/mask_doc_ids_ 钩子读取（IR 表达式）
         if (use_alibi_)
         {
-            // fold 契约：batch_mod(BH) 直读 b*H+h → 表长必须 = batch*H。
-            //   旧 (1,num_heads) 表在 batch≥2 越界读/ALiBi 静默丢（batch=1
-            //   掩蔽，历史单样本测试未暴露）；按 (b,h) 块重复 slopes_[h]。
+            // fold 契约：batch_mod(BH) 直读 b*H+h → 表长必须 = batch*H，
+            //   按 (b,h) 块重复 slopes_[h]；(1,num_heads) 表在 batch≥2 会
+            //   越界读/ALiBi 静默错（batch=1 时下标恒 <H，掩盖该错误）。
             if (!slopes_cache_.valid() || slopes_cached_batch_ != batch)
             {
                 Matrix s(1, batch * num_heads_);
@@ -1125,9 +1149,9 @@ protected:
         if (has_doc_ids_)
         {
             // 文档感知：doc_ids_ 每 batch 变化，每步重建（小张量 O(BH*seq)）。
-            // S7：doc_ids_cache_ 为 (1, BH*seq) 布局——每 (b,h) 块重复
-            // doc_ids[b*seq..]（BatchCol 视图的 batch 下标 = BH 网格下标；
-            // 旧 M5 AttnBias 的 (1, batch*seq) 布局 S7 起不再适用）
+            // doc_ids_cache_ 为 (1, BH*seq) 布局——每 (b,h) 块重复
+            // doc_ids[b*seq..]（BatchCol 视图的 batch 下标 = BH 网格下标，
+            // 故不能用 (1, batch*seq) 布局）
             Matrix d(1, batch * num_heads_ * seq);
             for (std::size_t b = 0; b < batch; ++b)
                 for (std::size_t h = 0; h < num_heads_; ++h)
@@ -1138,7 +1162,7 @@ protected:
             if (!t) return std::unexpected(t.error());
             doc_ids_cache_ = std::move(*t);
 
-            // S7：doc_col_（(BH*seq,1)）每行文档 id：doc_col[b*H*seq+h*seq+i]
+            // doc_col_（(BH*seq,1)）每行文档 id：doc_col[b*H*seq+h*seq+i]
             // = doc_ids[b*seq+i]（跨 head 重复；IR 掩码按行广播读取）
             {
                 const std::size_t BH = batch * num_heads_;
@@ -1158,7 +1182,7 @@ protected:
         return {};
     }
 
-    // ── S7 掩码输入张量钩子（IR 掩码表达式读取）──────────────────────
+    // ── 掩码输入张量钩子（IR 掩码表达式读取）──────────────────────
     [[nodiscard]] const Tensor* mask_slopes_() const override
     { return use_alibi_ ? &slopes_cache_ : nullptr; }
     [[nodiscard]] const Tensor* mask_doc_col_() const override
@@ -1167,7 +1191,7 @@ protected:
     { return has_doc_ids_ ? &doc_ids_cache_ : nullptr; }
 
     // fold 掩码变体 override：CSA = 因果恒有 + alibi/doc 按钩子（四分支
-    //   与旧 apply_mask_ override 语义同构）
+    //   与 masked_causal_/masked_alibi_/masked_doc_/masked_alibi_doc_ 一一对应）
     [[nodiscard]] nn::expr::FoldAttnMask fold_mask_variant_() const override
     {
         return use_doc_mask_()

@@ -56,7 +56,7 @@ parse_csv_line(const std::string &line)
 // ── 从 CSV 行加载单张 MNIST 图片 ───────────────────────────────────────────
 // 输入：784 个逗号分隔的像素值（0~255 或归一化后的 0~1）
 // 输出：(784, 1) 列向量 Matrix
-// 保留作为底层解析实现；新代码应优先使用 load_image_tensor_from_csv_line
+// 底层解析实现；上层代码应优先使用 load_image_tensor_from_csv_line
 // （上层统一用 Tensor）。
 [[nodiscard]] inline Result<Matrix>
 load_image_from_csv_line(const std::string &csv_line)

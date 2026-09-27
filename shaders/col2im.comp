@@ -18,10 +18,23 @@
 
 #version 450
 
+// -DNN_SHADER_F16=1 → f16 存储变体（Phase C2：数据搬运，输入输出均 half；
+//   窗口累加在 f32 完成后落回 half。仅需 storageBuffer16BitAccess）
+#if defined(NN_SHADER_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#define NN_ETYPE float16_t
+#define NN_RD(x) float(x)
+#define NN_WR(x) float16_t(x)
+#else
+#define NN_ETYPE float
+#define NN_RD(x) (x)
+#define NN_WR(x) (x)
+#endif
+
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly  buffer BufIn  { float in_data[];  };
-layout(std430, binding = 1) writeonly buffer BufOut { float out_data[]; };
+layout(std430, binding = 0) readonly  buffer BufIn  { NN_ETYPE in_data[];  };
+layout(std430, binding = 1) writeonly buffer BufOut { NN_ETYPE out_data[]; };
 
 layout(push_constant) uniform PushConstants {
     uint C;
@@ -67,8 +80,8 @@ void main()
             const int ow = s / s_stride;
             if (ow >= int(OW)) continue;
             const uint r = (ci * k + kh) * k + kw;
-            acc += in_data[r * (B * P) + (uint(oh) * OW + uint(ow)) * B + b];
+            acc += NN_RD(in_data[r * (B * P) + (uint(oh) * OW + uint(ow)) * B + b]);
         }
     }
-    out_data[idx] = acc;
+    out_data[idx] = NN_WR(acc);
 }

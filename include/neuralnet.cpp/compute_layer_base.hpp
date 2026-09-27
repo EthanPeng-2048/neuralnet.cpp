@@ -193,11 +193,11 @@ public:
         refs_ = std::move(refs);
         offsets_.clear();
         shapes_.clear();
-        // slab 容量校验（缺陷修复）：原先只在 !slab_.valid() 时按**当时**的
-        // 激活总量分配，之后永不增长。若后续 step 的激活总量更大（批大小/
-        // 序列长度变化、--resume 后续训、最后一个不满 batch 之后的 step 等），
-        // offload_save 会按新 offset 越界写 slab → 缓冲区破坏/设备丢失。
-        // 现在每次导出都按当前总量校验，不足则重建。
+        // slab 容量校验：slab 必须容纳**本次**导出的激活总量（批大小/
+        // 序列长度变化、--resume 后续训、最后一个不满 batch 之后的 step 等
+        // 都会改变总量）；若容量不足，offload_save 会按新 offset 越界写
+        // slab → 缓冲区破坏/设备丢失。因此每次导出都按当前总量校验，
+        // 不足则重建。
         std::size_t needed = 0;
         for (auto& ref : refs_)
             if (ref.get().valid()) needed += ref.get().size();

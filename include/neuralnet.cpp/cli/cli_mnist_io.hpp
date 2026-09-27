@@ -1,6 +1,6 @@
-// ── cli_cli_mnist_io.hpp — MNIST 数据加载与评估工具 ─────────────────────────────────
+// ── cli_mnist_io.hpp — MNIST 数据加载与评估工具 ─────────────────────────────────
 //
-// 抽取自 mnist_train/mnist_bench 中重复的 load_csv 与 evaluate 函数。
+// 收拢 mnist_train/mnist_bench 共用的 load_csv 与 evaluate 函数。
 //
 // load_mnist_csv:
 //   - 一次性读取整个 CSV 文件到内存，再以 from_chars 快速解析
@@ -13,9 +13,9 @@
 //   - GPU 模式下使用 begin_batch/end_batch 包裹 forward，消除 per-primitive 提交开销
 //   - eval_samples > 0 时只评估前 N 个样本（Transformer 评估成本较高）
 //
-// 注：用户原始签名 evaluate_mnist(nn::Layer&, ...) 实际不可行，因为 nn::Model
-// 不是 nn::Layer 的派生类，且 Model::forward 自带 engine 绑定（签名不同）。
-// 这里改为 nn::Model&，与现有调用点 model.forward(...) 一致，行为完全等价。
+// 注：签名取 nn::Model& 而非 nn::Layer&，因为 nn::Model 不是 nn::Layer 的派生类，
+// 且 Model::forward 自带 engine 绑定（签名不同于 Layer::forward(engine, ...)），
+// 与调用点 model.forward(...) 一致。
 // ─────────────────────────────────────────────────────────────────────────
 
 #pragma once
@@ -67,7 +67,7 @@ namespace nn::cli
 
         const char *ptr = buffer.data();
         // std::string::iterator 是 __wrap_iter 类（libc++），不能当 const char* 用；
-        // from_chars 需要裸指针，data()+size() 是唯一边界（docs/17 §3.3 仅适用于 string_view）
+        // from_chars 需要裸指针，data()+size() 是唯一边界
         const char *end = buffer.data() + buffer.size();
 
         // 探测第一行以确定特征维度
@@ -149,12 +149,12 @@ namespace nn::cli
     // eval_batch   > 0 时每块 N 个样本前向（**CNN 必须分块**）：
     //   卷积层的 im2col 展开是 k²×C_in 倍，全量评估 60000 样本单次 forward 需
     //   ~6.4 GB 显存（实测 `vkAllocateMemory failed: -2`）；分块后峰值 ≈ 1/块数，
-    //   每块结束归还空闲池块（release_idle_pool_blocks），不再留高水位。
-    //   0 = 不分块（等价旧行为，仅适合 MLP 等小激活模型）。
+    //   每块结束归还空闲池块（release_idle_pool_blocks），显存池不留高水位。
+    //   0 = 不分块（整批单次前向，仅适合 MLP 等小激活模型）。
     //
-    // 注：原 evaluate 签名 (nn::Layer&, ...) 不可行 —— nn::Model 不派生自 nn::Layer，
-    //     且 Model::forward 自带 engine 绑定，签名不同于 Layer::forward(engine, ...)。
-    //     此处使用 nn::Model&，与现有调用点 model.forward(...) 一致。
+    // 注：签名用 nn::Model& —— nn::Model 不派生自 nn::Layer，且 Model::forward
+    //     自带 engine 绑定，签名不同于 Layer::forward(engine, ...)；
+    //     与调用点 model.forward(...) 一致。
     [[nodiscard]] inline nn::Result<nn::Scalar>
     evaluate_mnist(nn::Model &model, nn::ComputeEngine &engine,
                    const nn::Matrix &x, const nn::Matrix &y_onehot,

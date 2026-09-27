@@ -24,7 +24,7 @@
 #include <neuralnet.cpp/compute_cpu_engine.hpp>
 #include "test_common.hpp"
 
-// 测试写在全局作用域（非 namespace nn），避免与旧代数运算符的 ADL 歧义。
+// 测试写在全局作用域（非 namespace nn），避免 ADL 把匹配拉进 nn 命名空间。
 using namespace nn::dsl;
 using nn::Scalar;
 

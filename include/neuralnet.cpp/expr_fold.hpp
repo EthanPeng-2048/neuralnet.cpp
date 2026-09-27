@@ -1,12 +1,12 @@
 #pragma once
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  expr_fold.hpp — 分块状态归约（FoldSpec）通用样例构造：P-C1 地基
+//  expr_fold.hpp — 分块状态归约（FoldSpec）通用样例构造：fold v1（标量域）地基
 //
 //  本头只承载**与注意力无关**的通用 fold 样例，是 scan_exprs（AOT 收集
 //  dry-run）与 fused_gpu_test / expr_fold_test 对拍的**共享唯一来源**——
 //  各方必须构造出结构完全一致的 spec（key 一致），否则闭合世界查表未命中。
-//  rowmax/rowsum/softmax_denom 三个 P-C1 样例不被 Layer 使用，保留为状态
+//  rowmax/rowsum/softmax_denom 三个 fold v1 样例不被 Layer 使用，保留为状态
 //  语义回归锚点。
 //
 //  注意力的 fold 构造（make_fold_attn_o / FoldAttnMask）属于 Layer 侧的
@@ -15,11 +15,11 @@
 //
 //  共同形状契约：输入 (rows, K)，输出 (rows, 1)；fold.k = K（形状参数）。
 //  三个样例的语义增量：
-//    1. rowmax  —— 单状态 max 累加（对拍 engine.row_reduce_max）
-//    2. rowsum  —— 单状态 sum 累加（对拍 engine.row_reduce_sum）
+//    1. rowmax  —— 单状态 max 累加（对拍独立逐行标量 max 参考）
+//    2. rowsum  —— 单状态 sum 累加（对拍独立逐行标量 sum 参考）
 //    3. softmax_denom —— 双状态 online rescale（m 跨块更新 + l = l*α +
 //       Σexp(x−m')）：验证状态读写序、拷贝旧状态技巧、body 链内状态广播、
-//       两个块归约指令——P-C1 状态语义的全覆盖锚点。
+//       两个块归约指令——fold v1 状态语义的全覆盖锚点。
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include <limits>

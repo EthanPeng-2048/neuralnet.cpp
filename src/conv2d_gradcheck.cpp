@@ -1,7 +1,7 @@
 // ── Conv2D 正确性检查（独立参考实现比对） ─────────────────────────────────
 //
-// 目的：Conv2D 此前**没有任何测试覆盖**。本片段把层实现与一份独立写法的直接
-//       卷积（含 im2col 索引、grad_w/grad_b 解析式）逐元素比对，覆盖：
+// 目的：本片段把层实现与一份独立写法的直接卷积（含 im2col 索引、
+//       grad_w/grad_b 解析式）逐元素比对，覆盖：
 //         forward : Z = matmul(W, im2col(x)) + b（matmul 段融合行广播偏置）
 //         backward: grad_w += matmul(gZ, col^T)（matmul 段融合原地累加）
 //                   grad_b += row_sum(gZ)

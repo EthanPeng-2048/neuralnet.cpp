@@ -1,7 +1,7 @@
 // ───────────────────────────────────────────────────────────────────────────
-//  expr_reduce_test.cpp — M1：ExprSpec 归约语义（归约视图 + 归约指令）CPU 验证
+//  expr_reduce_test.cpp — ExprSpec 归约语义（归约视图 + 归约指令）CPU 验证
 //
-//  对应 docs/development/02-operator-fusion.md 阶段一（M1）：
+//  对应 docs/development/02-operator-fusion.md 阶段一：
 //    1. 归约视图：对输入 Tensor 直接归约出 (rows,1)/(1,cols) 标量向量，参与
 //       算术时自动按行/按列广播（ExprViewKind::RowReduceSum/Max、ColReduceSum/Max）。
 //    2. 归约指令：对表达式结果归约（ExprOp::RowSum/RowMax/ColSum/ColMax），
@@ -25,7 +25,7 @@
 #include <neuralnet.cpp/compute_cpu_engine.hpp>
 #include "test_common.hpp"
 
-// 测试写在全局作用域（非 namespace nn），避免与旧代数运算符的 ADL 歧义。
+// 测试写在全局作用域（非 namespace nn），避免 ADL 把匹配拉进 nn 命名空间。
 using namespace nn::dsl;
 namespace dsl = nn::dsl;   // 别名：全局作用域可用 dsl::leaf 等限定调用
 using nn::Scalar;

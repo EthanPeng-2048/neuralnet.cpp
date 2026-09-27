@@ -32,7 +32,7 @@ namespace nn
 //   out_t = num_t / den_t
 //   其中 S_t = { i<=t }（causal）或 { 全部 }（bidirectional）。
 //
-// 与原版 RLA 的关键差异（§3 文档 22）：
+// 与原版 RLA 的关键差异（06-rapt-algorithm.md §3 家族演进）：
 //   * 分母：Sum 归一化（加权平均）替代 L2 归一化（余弦约束）
 //     → 输出量级恒定（不随 √L 增长），梯度流更平稳。
 //   * 无 A 状态（Σ k'k'^T）：分母仅依赖 z = Σk'，无需二次型。
@@ -115,7 +115,7 @@ private:
 
     // 确保 V_ones / e_0 缓存与当前 BH·dk × seq 尺寸匹配。
     // 返回 Result：from_matrix 失败（常见为显存不足）时传播真实错误，
-    // 不再吞错后让后续 scan/outer_col 对空张量报 "ensure_gpu: invalid tensor"。
+    // 避免后续 scan/outer_col 对空张量报 "ensure_gpu: invalid tensor" 掩盖根因。
     [[nodiscard]] Result<void> ensure_ones_(
         ComputeEngine& engine, std::size_t BH, std::size_t dk, std::size_t seq)
     {
@@ -171,7 +171,7 @@ private:
         {
             auto x = engine.slice_rows(input, bh * dk, dk);
             if (!x) return std::unexpected(x.error());
-            // 原"乘 x² → 列归约 → 乘 1/dk → 加 eps → rsqrt"五步压成两步 DSL：
+            // "乘 x² → 列归约 → 乘 1/dk → 加 eps → rsqrt"按两步 DSL 执行：
             //   ① 归约出 (1,seq) 向量；② 在 (1,seq) 小向量上做后处理。
             // 必须分两步：归约融合 shader 尚不支持"归约后仍有逐元素后处理"
             // 的形态（GPU 侧会静默错值，见 GpuEngine::eval_expr_reduce 的显式
@@ -235,8 +235,7 @@ private:
                 dsl::leaf(*m_raw) * dsl::rparam(inv_dk),
                 m_raw->rows(), m_raw->cols());
             if (!m) return std::unexpected(m.error());
-            // grad_x = (gy − m·y) · rms_inv：三式合一（原为 term/diff/gx 三个
-            // 独立 kernel + 一个逐元素原语），单次遍历、无中间张量
+            // grad_x = (gy − m·y) · rms_inv：三式合一，单次遍历、无中间张量
             auto gx = dsl::compute(engine,
                 (dsl::leaf(*gy) - dsl::col_broadcast(*m) * dsl::leaf(*y))
                     * dsl::col_broadcast(*ri),
@@ -349,8 +348,8 @@ public:
         if (Qp_cache_.valid()) r.emplace_back(Qp_cache_);
         if (Kp_cache_.valid()) r.emplace_back(Kp_cache_);
         if (V_re_cache_.valid()) r.emplace_back(V_re_cache_);
-        // RLA-2 的 RMSNorm 反向缓存（此前漏在 activation_cache 之外 → offload
-        // 无法覆盖它们；补齐后 offload 覆盖 backward 所需的全部激活）
+        // RLA-2 的 RMSNorm 反向缓存（契约：activation_cache 必须覆盖 backward
+        // 所需的全部激活，offload 才能完整换出并恢复）
         if (Q_normed_cache_.valid()) r.emplace_back(Q_normed_cache_);
         if (K_normed_cache_.valid()) r.emplace_back(K_normed_cache_);
         if (Q_rms_inv_cache_.valid()) r.emplace_back(Q_rms_inv_cache_);
@@ -408,7 +407,7 @@ public:
         }
 
         // RLA-2：RMSNorm on Q and K（per-head, dk blocks）
-        // 稳定数值分布，减少神经元死亡，保持 ReLU 硬截断纯粹性（文档 22 §4.3）。
+        // 稳定数值分布，减少神经元死亡，保持 ReLU 硬截断纯粹性（06-rapt-algorithm.md §3）。
         // checkpoint 模式：不驻留任何 backward 缓存，交由 forward_recompute 重建。
         {
             const std::size_t BHrms = batch * num_heads_;
@@ -538,8 +537,8 @@ public:
         ComputeEngine& engine, const Tensor& grad_output) override
     {
         // 缓存前置校验：checkpoint 模式（尚未 forward_recompute）或 offload
-        // （尚未 import）下缓存为空，旧行为会把问题推到某个 matmul 里甚至算出
-        // 垃圾梯度；这里立刻返回明确错误。
+        // （尚未 import）下缓存为空，backward 必须立刻返回明确错误——否则空
+        // 张量会流进 matmul 报出无关错误，甚至静默算出垃圾梯度。
         if (seq_cache_ == 0 || batch_cache_ == 0 ||
             !Qp_cache_.valid() || !Kp_cache_.valid() || !V_re_cache_.valid() ||
             !Q_normed_cache_.valid() || !K_normed_cache_.valid() ||
@@ -680,10 +679,13 @@ public:
         else
         {
             // 双向：A/B 为全集常数 → dB 在所有位置广播相同值
-            auto dB_sum_r = engine.row_reduce_sum(*dB_r);
+            // 归约步用 dsl::compute_reduce
+            auto dB_sum_r = dsl::compute_reduce(engine,
+                dsl::row_reduce_sum(dsl::leaf(*dB_r)),
+                dB_r->rows(), dB_r->cols());
             if (!dB_sum_r) return std::unexpected(dB_sum_r.error());
-            // Bb = row_broadcast(dB_sum)：单条表达式取代 create_tensor + zero +
-            // 逐元素按行广播三步（GPU 上 3 → 1 次 dispatch）。
+            // Bb = row_broadcast(dB_sum)：单条表达式一次 dispatch 完成，
+            // 不物化中间张量。
             // 注：IR 规定"输出 = 最后一条指令的 dst"，故**单视图表达式不合法**
             // （指令表为空会被 validate_expr_spec 拒绝）。这里与一个**运行时 0**
             // （RParam，编译期无法被常量折叠掉）相加，使表达式合法且语义不变。
@@ -707,8 +709,8 @@ public:
                 dsl::row_reduce_sum(dsl::leaf(*scale_r) * dsl::leaf(Qp_cache_)),
                 BHdk, seq);
             if (!tsq_r) return std::unexpected(tsq_r.error());
-            // gk = gK_B + row_broadcast(tsq)：单条表达式（原 zero + broadcast_row_
-            // inplace + elementwise Add 三次 dispatch → 1 次）
+            // gk = gK_B + row_broadcast(tsq)：单条表达式一次 dispatch 完成
+            // （不物化中间张量）
             auto gk_r = dsl::compute(engine,
                 dsl::leaf(*gK_B_r) + dsl::row_broadcast(*tsq_r),
                 gK_B_r->rows(), gK_B_r->cols());
@@ -776,7 +778,7 @@ public:
         auto giv = w_v_.backward(engine, gv_r);
         if (!giv) return giv;
         // grad_input = gq + gk + gv：三路累加**原地**融合为单趟（目标传递，
-        // 不额外分配）；结合顺序与原实现一致 → 逐字节等价
+        // 不额外分配）；求和按 (gq + gk) + gv 的固定顺序结合，跨 run 确定
         auto acc = dsl::compute_into(engine,
             dsl::leaf(*giq) + dsl::leaf(*gik) + dsl::leaf(*giv), *giq);
         if (!acc) return std::unexpected(acc.error());
@@ -825,16 +827,24 @@ public:
         const std::size_t H = num_heads_;
         const std::size_t dk = d_k_;
 
-        // 更新运行态：B += k' ⊗ v，z += k'
-        auto B_add_r = engine.batched_matmul(V, *Kp, H, false, true);  // v·k'^T → (H*dk, dk)
+        // 更新运行态：B += k' ⊗ v，z += k'（原地累加，dsl::compute_into）
+        // dsl::matmul(batch)：纯 {0,1} 结构（attention backward 已登记同 key）
+        auto B_add_r = dsl::compute(engine,        // v·k'^T → (H*dk, dk)
+            dsl::matmul(V, *Kp, false, true, H),
+            V.rows(), Kp->rows() / H);
         if (!B_add_r) return std::unexpected(B_add_r.error());
-        { auto r = engine.add_inplace(B_state, *B_add_r);
+        { auto r = dsl::compute_into(engine,
+              dsl::leaf(B_state) + dsl::leaf(*B_add_r), B_state);
           if (!r) return std::unexpected(r.error()); }
-        { auto r = engine.add_inplace(z_state, *Kp);  // z += k'（(H*dk, 1)）
+        { auto r = dsl::compute_into(engine,               // z += k'（(H*dk, 1)）
+              dsl::leaf(z_state) + dsl::leaf(*Kp), z_state);
           if (!r) return std::unexpected(r.error()); }
 
         // num = B·q'：batched_matmul(B_state, Qp, H) → (H*dk, 1)
-        auto num_r = engine.batched_matmul(B_state, *Qp, H, false, false);
+        // dsl::matmul(batch)：纯 {0,0} 结构（scan 手工登记同 key）
+        auto num_r = dsl::compute(engine,
+            dsl::matmul(B_state, *Qp, false, false, H),
+            B_state.rows(), Qp->cols());
         if (!num_r) return std::unexpected(num_r.error());
 
         // den = q'·z：逐头标量点积（通过 to_matrix 在 CPU 上计算；
@@ -865,8 +875,8 @@ public:
         if (!den_t) return std::unexpected(den_t.error());
 
         // out = num / (den + ε)：与 forward 的除法（:491）**逐 token 同构**——
-        // 同一个 AOT 键已被 scan_exprs 的 ReLULinearAttention dry-run 覆盖，
-        // GPU 闭合世界可命中（此前的 eager elementwise_binary 已退役）。
+        // 同一个 AOT 键由 scan_exprs 的 ReLULinearAttention dry-run 覆盖，
+        // GPU 闭合世界可命中。
         auto out_r = dsl::compute(engine,
             dsl::leaf(*num_r) / (dsl::leaf(*den_t) + Scalar{1e-4}),
             (*num_r).rows(), (*num_r).cols());

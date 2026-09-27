@@ -1,5 +1,5 @@
 // ── tokenizer_test — 分词器正确性测试 ───────────────────────────────────────
-// 原 tokenizer_consistency_test：BPE pre_tokenize 对拍 + 标记往返
+// 聚合 tokenizer_consistency_test：BPE pre_tokenize 对拍 + 标记往返
 // ───────────────────────────────────────────────────────────────────────────
 
 #include <cstdio>

@@ -1,6 +1,6 @@
-// ── cli_cli_lr_scheduler.hpp — 学习率调度器 ─────────────────────────────────────────
+// ── cli_lr_scheduler.hpp — 学习率调度器 ─────────────────────────────────────────
 //
-// 抽取自 mnist_train/text_train 中逐字重复的 compute_epoch_lr lambda。
+// 收拢 mnist_train/text_train 共用的 compute_epoch_lr 调度实现。
 //
 // 调度优先级：
 //   1. lr_per_epoch 非空 → 直接索引；epoch 超出范围时使用最后一个值

@@ -30,7 +30,7 @@ struct ZiPTConfig {
     std::size_t vocab_size    = GPT_VOCAB_SIZE;
     std::size_t d_model       = GPT_D_MODEL;
     std::size_t seq_len       = GPT_SEQ_LEN;        // L：总上下文长度（一次 forward 处理的最大长度）
-    std::size_t window        = 0;                  // W：局部窗口（直接注意力；0=默认=seq_len，旧行为 W=L 无压缩）
+    std::size_t window        = 0;                  // W：局部窗口（直接注意力；0=默认=seq_len，即 W=L 无压缩）
     std::size_t num_heads     = GPT_NUM_HEADS;
     std::size_t d_ff          = GPT_D_FF;
     std::size_t num_layers    = GPT_NUM_LAYERS;
@@ -55,7 +55,7 @@ struct ZiPTConfig {
     if (cfg.memory_tokens > cfg.seq_len)
         return std::unexpected(Error{"ZiPT memory_tokens must be <= seq_len"});
     ZiPTConfig c = cfg;
-    if (c.window == 0) c.window = c.seq_len;   // 默认 W=L（旧行为，向后兼容）
+    if (c.window == 0) c.window = c.seq_len;   // 默认 W=L（全上下文，无压缩）
     if (c.window > c.seq_len)
         return std::unexpected(Error{"ZiPT window must be <= seq_len"});
 

@@ -116,7 +116,8 @@ int main(int argc, char* argv[])
     // batch=2（铁律 5：注意力测试必须覆盖 batch>1）：
     //   样本0 = 文档窗口（doc A 占 0..3、doc B 占 4..7）；
     //   样本1 = 固定序列（两次运行完全相同）→ 其 logits 只可能因跨样本
-    //   串扰而变（position-major 类历史 bug 在 batch=1 下不可见）。
+    //   串扰而变。batch>1 是必须的：batch=1 时 position-major 与
+    //   batch-major 布局重合，串扰不可见。
     const std::vector<std::size_t> doc_ids0{1, 1, 1, 1, 2, 2, 2, 2};
     const std::vector<std::size_t> doc_ids1{3, 3, 3, 3, 4, 4, 4, 4};
     // 变体1 / 变体2：仅样本0 的 doc A token 不同，doc B 与样本1 相同

@@ -15,7 +15,7 @@
 //   - 矩阵级：matmul, batched_matmul, transpose, add_inplace, scale_inplace, zero
 //   - 归约级：row_reduce_sum, col_reduce_sum
 //   - 分组归约：grouped_reduce_sum, grouped_reduce_max
-//   - 条件选择：由表达式 DSL 的 select 承担（engine 不再暴露该原语）
+//   - 条件选择：由表达式 DSL 的 select 承担（engine 不暴露该原语）
 //
 // 批处理控制：
 //   - begin_batch / end_batch：CPU 引擎为 no-op；GPU 引擎录制到
@@ -28,11 +28,11 @@
 //     scatter_add_rows / rearrange_3d / im2col / col2im / clone）**不带 P**：
 //     输出精度 = 源精度（§8.4 的自然语义）。
 //   - **in-place** 原语（add_inplace / scale_inplace / zero / eval_expr_into）**存储精度不可变**（§8.3）。
-//   - P 的消费方是 `PrecisionEngine`（compute_precision_engine.hpp，f16 边界
-//     cast 适配层）。**CpuEngine / GpuEngine 的原生实现只支持 F32 存储**：
-//     f16 存储张量必须经适配层运算（适配层把所有操作数抬到 f32 跑既有
-//     f32 实现，再按目标精度落回）。理由：AOT 融合世界保持全 f32（闭合世界
-//     key 不含精度维度），f16 只改变**存储**，不改变算子语义（§11.1 Phase 1）。
+//   - P 的消费方是 `PrecisionEngine`（compute_precision_engine.hpp，f16 精度
+//     边界适配层）：内层有带类型 f16 变体 / 原生 f16 钩子时直接下传 f16 张量；
+//     无变体路径（如 CPU 解释器只读 f32 存储）则由适配层把 f16 操作数抬到
+//     f32 跑既有 f32 实现，再按 P 落回。理由：f16 只改变**存储**，不改变
+//     算子语义——P 精度算术 = f32 参考计算 + 每算子输出舍入到 P（§11.1）。
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <cstddef>
@@ -86,11 +86,11 @@ public:
 
     // ── 显存回收（L2）─────────────────────────────────────────────────
     // GPU 引擎：在 end_batch（提交完成、延迟销毁已 flush）之后归还完全
-    // 空闲的内存池底材给 GPU。CPU/CUDA 引擎：no-op。
+    // 空闲的内存池底材给 GPU。CPU 引擎：no-op。
     [[nodiscard]] virtual Result<void> release_idle_pool_blocks() { return {}; }
 
     // ── 显存池统计（L2 仪器化）──────────────────────────────────────
-    // GPU 引擎返回池统计字符串（块数/占用/空闲/碎片）；CPU/CUDA 返回空。
+    // GPU 引擎返回池统计字符串（块数/占用/空闲/碎片）；CPU 引擎返回空。
     // 用于训练中显存采样与逐项归因。
     [[nodiscard]] virtual std::string pool_stats() const { return {}; }
 
@@ -117,7 +117,7 @@ public:
         return Tensor::cpu(1, 1);
     }
 
-    // ── 异步标量回读（P0-2：非阻塞取 loss）──────────────────────────────
+    // ── 异步标量回读（非阻塞取 loss）──────────────────────────────
     // 动机：若用 to_matrix 取每步 loss，GPU 引擎会 end_batch + wait_in_flight
     // （等全部在飞帧）→ 每 step 一次全流水线 drain，host/GPU 无法重叠。
     //
@@ -176,9 +176,9 @@ public:
     [[nodiscard]] virtual Result<Tensor> from_matrix(const Matrix& m, Precision P = Precision::F32) = 0;
     [[nodiscard]] virtual Result<Matrix> to_matrix(const Tensor& t, Precision P = Precision::F32) = 0;
 
-    // ── D5：cast 原语（§7.5，唯一"变精度"算子，永远显式）────────────────
+    // ── cast 原语（§7.5，唯一"变精度"算子，永远显式）────────────────
     // 升 cast（f16→f32）精确无损；降 cast（f32→f16）round-half-to-even。
-    // 默认实现：同精度 = 返回 src 拷贝；跨精度 = 错误（引擎覆盖）。
+    // 默认实现：同精度 = 返回 src（共享所有权，零拷贝）；跨精度 = 错误（引擎覆盖）。
     [[nodiscard]] virtual Result<Tensor> cast(const Tensor& src, Precision dst)
     {
         if (src.precision() == dst)
@@ -294,11 +294,10 @@ public:
     // 矩阵级原语
     // ══════════════════════════════════════════════════════════════════════
 
-    // C = A × B（支持转置标志 + 精度参数，D5 §8.1）
+    // C = A × B（支持转置标志 + 精度参数，§8.1）
     // transA: 使用 A^T，transB: 使用 B^T
-    // P: 计算精度（F32 = 现状；F16 = f16 GEMM，§7.4）
-    //   - Auto 推导（P=F32 默认）：操作数中最高精度
-    //   - 显式 P：Layer 通过 PrecisionProfile.compute 传入
+    // P: 计算精度（F32 = 默认；F16 = f16 GEMM，§7.4）：由 Layer 显式传入
+    //   （PrecisionProfile.compute；无隐式推导，§8.5）
     [[nodiscard]] virtual Result<Tensor> matmul(
         const Tensor& A, const Tensor& B,
         bool transA = false, bool transB = false,
@@ -312,7 +311,7 @@ public:
     //   transB=0: B_b 为 (K, N)，transB=1: B_b 存储为 (N, K) 按 B_b^T 使用
     // alpha: 输出缩放系数（cuBLAS sgemm 语义），GPU 在 shader 写出时一次完成，
     //   供上层折叠 1/sqrt(d_k) 等系数，省去额外全矩阵 scale pass
-    // P: 计算精度（D5 §8.1，同 matmul）
+    // P: 计算精度（§8.1，同 matmul）
     // 典型用途：多头注意力的 Q^T×K 和 V×A 批量化（消除 per-head 循环）
     [[nodiscard]] virtual Result<Tensor> batched_matmul(
         const Tensor& A, const Tensor& B,
@@ -321,7 +320,7 @@ public:
         Scalar alpha = Scalar{1},
         Precision P = Precision::F32) = 0;
 
-    // ── 新增：matmul + broadcast bias（统一精度处理）────────────────────
+    // ── matmul + broadcast bias（统一精度处理）────────────────────────────
     // out = A × B + bias（broadcast add，bias (out,1) → (out,batch)）
     // 引擎内部处理精度：P 指定 matmul 精度，bias add 在 P 精度下完成
     // Layer 无需判断精度，直接调用即可
@@ -352,7 +351,7 @@ public:
         return from_matrix(*res_mat, P);
     }
 
-    // ── 新增：梯度累加（自动 cast 到目标精度）────────────────────────────
+    // ── 梯度累加（自动 cast 到目标精度）────────────────────────────────────
     // dst += src（dst 始终 f32，src 可能是 f16）
     // 引擎内部 cast src 到 f32 后累加
     [[nodiscard]] virtual Result<void> accumulate(Tensor& dst, const Tensor& src)
@@ -523,12 +522,25 @@ public:
             "eval_expr_into: 该引擎不支持原地表达式求值"});
     }
 
-    // ── 原生 f16 数据搬运能力（Phase 2）────────────────────────────────────
-    // 纯数据搬运原语（clone/slice_rows/insert_rows/zero）在 GPU 上是**模板化
-    // <P> 实现**（字节拷贝 / vkCmdFillBuffer）→ 无需 shader 变体即可原生处理 f16。
-    // 返回 true 时 PrecisionEngine 直接放行 f16 张量（省掉"抬 f32 → 搬运 →
-    // 落回 f16"的 2 份全尺寸临时量与 3 倍流量）。
+    // ── 原生 f16 数据路径能力（Phase 2 / C1 钩子）──────────────────────────
+    // GPU 引擎为 true：数据搬运原语（clone/slice/insert/zero = 模板化字节
+    // 拷贝；transpose/rearrange/gather/im2col/col2im = f16 pipeline 或引擎内
+    // cast 回退）与原地算术（add_inplace/scale_inplace = f16 pipeline 或
+    // 引擎内回退）都能**直接消费 f16 张量**——无 pipeline 时引擎内部完成
+    // 边界 cast，PrecisionEngine 无需物化 f32 副本（归因表搬运/inplace
+    // 大头由此消灭）。
+    // CPU 引擎为 false：其原语基于 f32 Matrix → PrecisionEngine 维持边界 cast。
+    // 返回 true 时 PrecisionEngine 直接放行 f16 张量（省掉"抬 f32 → 算 →
+    // 落回 f16"的全尺寸临时量与 3 倍流量）。
     [[nodiscard]] virtual bool supports_native_data_move() const noexcept { return false; }
+    // ── 原生 f16 归约能力（Phase C2）────────────────────────────────────────
+    // GPU 引擎为 true：row/col_reduce_sum/max 可直接消费 f16 输入张量
+    // （reduce.comp f16 变体：输入 float16_t 直读、f32 归约、输出 f32 向量；
+    // 设备无 16bit 存储时引擎内部 cast 回退）。PrecisionEngine 据此跳过
+    // "抬 f32 副本 → 归约" 的全尺寸临时量（归因 L756 大头：
+    // Linear::backward grad_bias 直调 row_reduce_sum 的 (64,8192)×38）。
+    // CPU 引擎为 false：其归约基于 f32 Matrix → PrecisionEngine 维持边界 cast。
+    [[nodiscard]] virtual bool supports_native_f16_reduce() const noexcept { return false; }
     // ── 精度变体能力查询（Phase 2 in-kernel f16）──────────────────────────
     // 该 (结构, 输入精度, 目标输出精度) 是否有预生成的**带类型**融合 shader？
     // 默认 false（原生引擎无变体概念）→ PrecisionEngine 退回边界 cast
@@ -551,8 +563,9 @@ private:
 
 // ── 多精度变体签名（AOT in-kernel f16 索引；类型见 expr_spec.hpp）────────
 // 由**实际张量精度** + 目标输出精度算出：位 i = 第 i 个输入是 f16，
-// bit16 = 输出是 f16。全 0 = 全 f32 = **旧行为**（融合世界保持 f32）。
-// 运行时用它选 (结构 key, 签名) 对应的带类型 shader；构建期 scan/gen 两端同源。
+// bit16 = 输出是 f16。全 0 = 全 f32：不追加变体后缀，与基础结构共用同一条目
+// （融合算术保持 f32）。运行时用它选 (结构 key, 签名) 对应的带类型 shader；
+// 构建期 scan/gen 两端同源。
 [[nodiscard]] inline ExprPrecSig expr_prec_sig_of(
     std::span<const Tensor> inputs, Precision P = Precision::F32) noexcept
 {

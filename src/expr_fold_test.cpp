@@ -1,5 +1,5 @@
 // ───────────────────────────────────────────────────────────────────────────
-//  expr_fold_test.cpp — P-C1 分块状态归约（FoldSpec）CPU 语义对拍
+//  expr_fold_test.cpp — 分块状态归约（FoldSpec）CPU 语义对拍
 //
 //  覆盖（通用样例走共享构造 expr_fold.hpp、注意力样例走
 //  compute_layer_attention.hpp —— 均与 scan_exprs AOT 收集同源，
@@ -30,7 +30,7 @@
 #include <neuralnet.cpp/compute_tensor.hpp>
 #include <neuralnet.cpp/compute_cpu_engine.hpp>
 #include <neuralnet.cpp/expr_fold.hpp>
-#include <neuralnet.cpp/compute_layer_attention.hpp>   // 注意力 fold 构造（已从 expr_fold.hpp 归位到 Layer）
+#include <neuralnet.cpp/compute_layer_attention.hpp>   // 注意力 fold 构造（定义于 Layer：表达式文本只写在 Layer）
 
 using nn::Scalar;
 
@@ -43,8 +43,8 @@ int test_expr_fold()
         if (!ok) ++fail;
     };
     // NaN 守卫：diff 为 NaN/Inf（被测端输出 NaN）时误差记为 inf → 必超容差。
-    //   IEEE fmax(err, NaN) = err 会静默吞掉 NaN diff——2026-09 fold doc 掩码
-    //   GPU -nan 回归曾因此在对拍中漏抓（红验证实证：revert 后仍 PASS）。
+    //   IEEE fmax(err, NaN) = err 会静默吞掉 NaN diff——若无此守卫，被测端
+    //   输出 NaN 时对拍仍可能 PASS，故此处直接把非有限 diff 记为 inf。
     const auto err_of = [](Scalar err, Scalar diff) -> Scalar
     { return std::isfinite(diff) ? std::fmax(err, diff)
                                  : std::numeric_limits<Scalar>::infinity(); };
@@ -192,7 +192,7 @@ int test_expr_fold()
         }
     }
 
-    // ── P-C2 attention fold 对拍（独立公式参考；5 掩码 × 4 形状族）────────
+    // ── attention fold 对拍（独立公式参考；5 掩码 × 4 形状族）────────
     // 确定性迷你 case：seq=dk=bh=1，Q=2 K=3 Vt=5 → s=6, softmax=1, O=5
     {
         nn::Tensor Q = nn::Tensor::cpu(1, 1), K = nn::Tensor::cpu(1, 1),
@@ -308,17 +308,17 @@ int test_expr_fold()
             // doc 输入（与 Layer 组包同序：Q,K,Vt,[slopes],doc_col,doc_ids）：
             //   doc_col (rows,1) = 行（查询位置）文档 id；doc_ids (1, bh*seq)
             //   按 (b,h) 块重复——BatchCol(seq) 读 [块*seq+j]，heads>1 时
-            //   (1, batch*seq) 会越界（AGENTS S7 教训 #2）
+            //   (1, batch*seq) 会越界（AGENTS 教训 #2）
             const std::uint32_t sseq = sh.seq;
             nn::Tensor doc_col = nn::Tensor::cpu(rows_out, 1);
             nn::Tensor doc_ids_t = nn::Tensor::cpu(
                 1, static_cast<std::size_t>(sh.bh) * sh.seq);
             // doc 分段边界：seq > EXPR_FOLD_BLOCK(128) 时放在 **128 之后**
             //   （如 133 → 129），使查询位置 i ≥ 边界的行其首个 fold 块
-            //   (j<128) 被文档掩码**全部**屏蔽——这正是 2026-09 GPU 训练
-            //   -nan 的触发形态（max init=-inf 时 m_old=blk_m=-inf →
-            //   dm=−inf−−inf=NaN）。旧固定 seq/2=66<128 永远让首块留有
-            //   有效项 → ctest 全绿漏抓。seq ≤ 128 时保持原二分段。
+            //   (j<128) 被文档掩码**全部**屏蔽——触发首块全屏蔽的分支
+            //   （max init=-inf 时 m_old=blk_m=-inf → dm=−inf−−inf=NaN）。
+            //   边界若落在 128 之内（如 seq/2），首块永远留有有效项，
+            //   该分支测不到。seq ≤ 128 时用 seq/2 二分段。
             const std::uint32_t doc_boundary =
                 sseq > nn::EXPR_FOLD_BLOCK ? nn::EXPR_FOLD_BLOCK + 1u
                                            : sseq / 2u;

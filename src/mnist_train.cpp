@@ -159,7 +159,7 @@ struct TrainConfig
     std::vector<Scalar> lr_per_epoch;   // 手动指定每轮 lr（为空则自动计算）
 
     // 混合精度控制（docs/development/05-mixed-precision.md §9.1）
-    nn::PrecisionProfile precision;     // 默认全 F32（D10：零回归）
+    nn::PrecisionProfile precision;     // 默认全 F32（零回归）
 };
 
 TrainConfig parse_args(int argc, char *argv[])

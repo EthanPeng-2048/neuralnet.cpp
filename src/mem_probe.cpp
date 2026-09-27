@@ -19,8 +19,8 @@
 //             [--num-heads N] [--num-layers N] [--d-ff N] [--optimizer name]
 //             [--no-kv] [--kv-steps N]
 //
-// 默认参数 = docs/benchmarks/2026-09-25 的 bench 配置（vocab 8208 / d64 /
-// h4 / L4 / ff256 / seq256 / batch64），与已知"峰值 5.7GB"场景对齐。
+// 默认参数 = docs/benchmarks/2026-09-25-vulkan-vs-cuda.md 的 bench 配置
+// （vocab 8208 / d64 / h4 / L4 / ff256 / seq256 / batch64），与基准对拍场景对齐。
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>
@@ -264,7 +264,8 @@ void print_usage(const char* prog)
         << "运行时显存分项探针\n\n用法: " << prog << " [选项]\n\n"
         << "选项:\n"
         << "  --gpu=<设备>            指定 Vulkan 设备（索引或名称子串，如 40HX）\n"
-        << "  --f16                   全 f16（param/compute/stable/optimizer 全 F16）\n"
+        << "  --f16                   f16 存储（param/compute=F16，stable/optimizer=F32）\n"
+        << "  --f16-all               四字段全 F16（实验配方，见 precision.hpp）\n"
         << "  --checkpoint-every <n>  梯度检查点（每 n 个 block 重算）\n"
         << "  --activation-offload    激活搬 host-visible\n"
         << "  --doc-mask              启用文档感知掩码（复刻 text_train doc_ids 路径）\n"
@@ -278,7 +279,7 @@ void print_usage(const char* prog)
 
 int main(int argc, char* argv[])
 {
-    // 默认 = bench 配置（docs/benchmarks/2026-09-25，已知峰值 5.7GB 场景）
+    // 默认 = bench 配置（docs/benchmarks/2026-09-25-vulkan-vs-cuda.md）
     std::size_t vocab = 8208;
     std::size_t d_model = 64;
     std::size_t seq = 256;
@@ -345,7 +346,8 @@ int main(int argc, char* argv[])
               << "  配置: vocab=" << vocab << " d_model=" << d_model << " heads=" << heads
               << " layers=" << layers << " d_ff=" << d_ff << " seq=" << seq
               << " batch=" << batch << "\n"
-              << "  优化器: " << opt_name << "  精度: " << (f16 ? "全f16" : "f32")
+              << "  优化器: " << opt_name << "  精度: "
+              << (f16 ? (f16_all ? "全f16" : "f16存储") : "f32")
               << "  checkpoint-every=" << checkpoint_every
               << "  offload=" << (activation_offload ? "on" : "off") << "\n"
               << "========================================\n\n";

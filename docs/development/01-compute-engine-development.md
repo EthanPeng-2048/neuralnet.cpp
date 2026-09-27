@@ -106,15 +106,16 @@ engine.end_batch();  // 提交并等待
 ### 3. 张量工厂
 
 ```cpp
-[[nodiscard]] virtual Tensor create_tensor(std::size_t rows, std::size_t cols) = 0;
-[[nodiscard]] virtual Result<Tensor> from_matrix(const Matrix& m) = 0;
-[[nodiscard]] virtual Result<Matrix> to_matrix(const Tensor& t) = 0;
+[[nodiscard]] virtual Tensor create_tensor(std::size_t rows, std::size_t cols,
+                                           Precision P = Precision::F32) = 0;
+[[nodiscard]] virtual Result<Tensor> from_matrix(const Matrix& m, Precision P = Precision::F32) = 0;
+[[nodiscard]] virtual Result<Matrix> to_matrix(const Tensor& t, Precision P = Precision::F32) = 0;
 ```
 
 **作用**：
-- `create_tensor`：创建空张量
-- `from_matrix`：CPU Matrix → Tensor（可能拷贝）
-- `to_matrix`：Tensor → CPU Matrix（可能下载）
+- `create_tensor`：创建指定存储精度的空张量
+- `from_matrix`：CPU Matrix → Tensor（按 P 分配存储；可能拷贝）
+- `to_matrix`：Tensor → CPU Matrix（按 P 转换；可能下载）
 
 **实现注意**：
 - `from_matrix` 应返回拷贝，避免外部修改影响
@@ -126,20 +127,31 @@ engine.end_batch();  // 提交并等待
 // 矩阵乘法
 [[nodiscard]] virtual Result<Tensor> matmul(
     const Tensor& A, const Tensor& B,
-    bool transA = false, bool transB = false) = 0;
+    bool transA = false, bool transB = false,
+    Precision P = Precision::F32) = 0;
 
 // 批量矩阵乘法
 [[nodiscard]] virtual Result<Tensor> batched_matmul(
     const Tensor& A, const Tensor& B,
     std::size_t batch,
     bool transA = false, bool transB = false,
-    Scalar alpha = Scalar{1}) = 0;
+    Scalar alpha = Scalar{1},
+    Precision P = Precision::F32) = 0;
+
+// 矩阵乘 + bias 广播（默认实现 = matmul + 逐行加 bias）
+[[nodiscard]] virtual Result<Tensor> matmul_with_bias(
+    const Tensor& A, const Tensor& B, const Tensor& bias,
+    bool transA = false, bool transB = false,
+    Precision P = Precision::F32);
 
 // 就地加法
 [[nodiscard]] virtual Result<void> add_inplace(Tensor& A, const Tensor& B) = 0;
 
 // 就地缩放
 [[nodiscard]] virtual Result<void> scale_inplace(Tensor& A, Scalar s) = 0;
+
+// 梯度累加（dst 恒 f32，src 为 f16 时引擎先 cast 再累加；默认实现）
+[[nodiscard]] virtual Result<void> accumulate(Tensor& dst, const Tensor& src);
 
 // 置零
 [[nodiscard]] virtual Result<void> zero(Tensor& A) = 0;
@@ -153,6 +165,7 @@ engine.end_batch();  // 提交并等待
 | `transB` | 是否转置 B |
 | `batch` | 批量大小（batched_matmul） |
 | `alpha` | 输出缩放系数（batched_matmul） |
+| `P` | 计算精度（F32 默认；F16 走 f16 GEMM），由 Layer 按 `PrecisionProfile.compute` 显式传入 |
 
 **batched_matmul 语义**：
 - A: `(batch * A_rows, A_cols)` 按 batch 切分
@@ -163,23 +176,28 @@ engine.end_batch();  // 提交并等待
 
 ```cpp
 // 按行求和: (rows, cols) → (rows, 1)
-[[nodiscard]] virtual Result<Tensor> row_reduce_sum(const Tensor& A) = 0;
+[[nodiscard]] virtual Result<Tensor> row_reduce_sum(const Tensor& A, Precision P = Precision::F32) = 0;
 
 // 按列求和: (rows, cols) → (1, cols)
-[[nodiscard]] virtual Result<Tensor> col_reduce_sum(const Tensor& A) = 0;
+[[nodiscard]] virtual Result<Tensor> col_reduce_sum(const Tensor& A, Precision P = Precision::F32) = 0;
 
 // 按列求最大值: (rows, cols) → (1, cols)
-[[nodiscard]] virtual Result<Tensor> col_reduce_max(const Tensor& A) = 0;
+[[nodiscard]] virtual Result<Tensor> col_reduce_max(const Tensor& A, Precision P = Precision::F32) = 0;
+
+// 分组归约（segmented reduce，沿行方向每连续 R 行为一组）：
+//   x: (G*R, N) → out: (G, N)，把"逐通道/逐头一次 dispatch"的层内循环压成单次调用
+[[nodiscard]] virtual Result<Tensor> grouped_reduce_sum(
+    const Tensor& x, std::size_t G, std::size_t R, Precision P = Precision::F32) = 0;
+[[nodiscard]] virtual Result<Tensor> grouped_reduce_max(
+    const Tensor& x, std::size_t G, std::size_t R, Precision P = Precision::F32) = 0;
 ```
 
-> ⚠️ **2026-09 收敛**：`row_reduce_max`（引擎算子）已删除——按行求最大走 DSL 归约叶子
-> `dsl::row_reduce_max(...)`（详见 `expr_dsl.hpp`；AGENTS §4.3 有完整删除清单）。
+> 按行求最大值**不走引擎算子**——用 DSL 归约叶子 `dsl::row_reduce_max(...)`（详见 `expr_dsl.hpp`）。
+> 归约表达式在 Layer 里统一走 `dsl::compute_reduce`。
 
-### 6. 广播 / 逐元素 / 条件选择原语（2026-09 已整体删除）
+### 6. 广播 / 逐元素 / 条件选择：一律走表达式 DSL
 
-`broadcast_row_inplace`、`broadcast_col_inplace`、`elementwise_unary`、`elementwise_binary`、
-`elementwise_binary_scalar`、`elementwise_select_scalar_cond`（连同 `UnaryOp`/`BinaryOp`/`CompareOp` 枚举）
-**已全部删除**。逐元素运算、广播与条件选择一律用表达式 DSL 表达（单 kernel、无中间张量）：
+引擎**没有**逐元素/广播/条件选择类原语（`UnaryOp`/`BinaryOp`/`CompareOp` 枚举也不存在）——这类运算统一用表达式 DSL 表达（单 kernel、无中间张量）：
 
 ```cpp
 auto y  = dsl::compute(engine, dsl::exp(dsl::leaf(*a)), a->rows(), a->cols());          // 一元
@@ -190,8 +208,9 @@ auto rg = dsl::compute(engine,                                                  
     x->rows(), x->cols());
 ```
 
-> 为什么删？这些算子在 DSL 落地后已无生产调用方，且与表达式能力完全重复（详见
-> `development/12-compute-engine-inventory.md` 顶部收敛横幅与 `13-refactor-backlog.md` §9）。
+> 理由：DSL 与逐元素算子能力完全重叠，且天然融合为单 kernel。
+> 引擎原语盘点见 `development/12-compute-engine-inventory.md`；
+> 逐元素算子收敛的历史演进记录见 `docs/history.md`。
 
 ### 9. 数据操作原语
 
@@ -220,6 +239,19 @@ auto rg = dsl::compute(engine,                                                  
 // 转置
 [[nodiscard]] virtual Result<Tensor> transpose(const Tensor& A) = 0;
 
+// 卷积/池化窗口展开与其伴随散射（纯数据搬运）
+[[nodiscard]] virtual Result<Tensor> im2col(
+    const Tensor& x, std::size_t C, std::size_t H, std::size_t W,
+    std::size_t k, std::size_t stride, std::size_t pad,
+    std::size_t OH, std::size_t OW) = 0;
+[[nodiscard]] virtual Result<Tensor> col2im(
+    const Tensor& col, std::size_t C, std::size_t H, std::size_t W,
+    std::size_t k, std::size_t stride, std::size_t pad,
+    std::size_t OH, std::size_t OW) = 0;
+
+// CPU Matrix → 已有张量（序列化加载、优化器参数写回）
+[[nodiscard]] virtual Result<void> copy_from(Tensor& dst, const Matrix& src) = 0;
+
 // 深拷贝
 [[nodiscard]] virtual Result<Tensor> clone(const Tensor& src) = 0;
 ```
@@ -227,14 +259,25 @@ auto rg = dsl::compute(engine,                                                  
 ### 10. 表达式求值
 
 ```cpp
-// 逐元素表达式融合
+// 逐元素表达式融合（输出 (rows, cols)，P 为输出精度）
 [[nodiscard]] virtual Result<Tensor> eval_expr(
     const ExprSpec& spec,
     std::span<const Tensor> inputs,
-    std::size_t rows, std::size_t cols) = 0;
+    std::size_t rows, std::size_t cols,
+    Precision P = Precision::F32) = 0;
+
+// 目标传递：结果直接写入 out（不分配新张量，表达"原地更新"）
+[[nodiscard]] virtual Result<void> eval_expr_into(
+    const ExprSpec& spec, std::span<const Tensor> inputs,
+    std::size_t rows, std::size_t cols, Tensor& out);
+
+// 归约向量原生形状输出（行归约 → (rows,1)；列归约 → (1,cols)）
+[[nodiscard]] virtual Result<Tensor> eval_expr_reduce(
+    const ExprSpec& spec, std::span<const Tensor> inputs,
+    std::size_t rows, std::size_t cols, Precision P = Precision::F32);
 ```
 
-**作用**：将多个逐元素操作合并为一次调用，减少临时张量
+**作用**：将多个逐元素操作合并为一次调用，减少临时张量。Layer 侧一般经 `dsl::compute` / `dsl::compute_into` / `dsl::compute_reduce` 间接使用，不手写 `ExprSpec`。
 
 ### 11. 扫描级原语（RLA / RAPT）
 
@@ -449,6 +492,11 @@ public:
 
 ## 添加新原语
 
+> 前置判断：新需求若是**逐元素 / 广播 / 条件选择**类，不要加引擎原语——用表达式 DSL（§6），
+> 融合为单 kernel、零临时张量。值得新增原语的是**数据搬运 / 结构类**能力（如 `im2col`、
+> `grouped_reduce_*` 这类"一次 dispatch 消灭层内循环"的原语）。
+> 下文以假想原语为例，仅演示"接口 → CPU → GPU → shader → 测试 → 文档"的接线模式。
+
 ### 步骤 1：在接口中声明
 
 在 `compute_engine.hpp` 中添加纯虚函数：
@@ -579,15 +627,10 @@ class GpuEngine {
 
 **解决方案**：
 ```cpp
-// 使用表达式 DSL
-auto result = dsl::compute(
-    engine,
-    [](auto a, auto b, auto c) {
-        return a + b * c;  // 融合为单个 kernel
-    },
-    {tensor_a, tensor_b, tensor_c},
-    rows, cols
-);
+// 使用表达式 DSL：一条表达式 = 一个融合 kernel（无中间张量）
+auto result = dsl::compute(engine,
+    dsl::leaf(*a) + dsl::leaf(*b) * dsl::leaf(*c),
+    rows, cols);
 ```
 
 ### 3. 并行化
@@ -699,10 +742,10 @@ TEST_CASE("linear_gradcheck") {
 ### Q3: 如何添加新的激活函数？
 
 **A**:
-1. 在 `UnaryOp` 或 `BinaryOp` 中添加枚举值
-2. 在 `CpuEngine` 中实现逐元素运算
-3. 在 `GpuEngine` 中实现 shader
-4. 在 Layer 中组合使用
+1. 在 Layer 中用表达式 DSL 组合表达（绝大多数激活 = 一条表达式，参照 `ReLU::forward`：`dsl::max(dsl::leaf(x), Scalar{0})`）
+2. 在 Layer 中实现 forward/backward（backward 同样是 DSL 表达式）
+3. 添加 gradcheck 测试
+4. 引擎与 shader 不认识"激活函数"——**绝不**在引擎侧加算法名算子（铁律 3）
 
 ### Q4: 如何优化矩阵乘法？
 

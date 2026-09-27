@@ -15,7 +15,7 @@
 //
 //  闭合世界（closed-world）约定：代码里用到的表达式集合 = AOT 生成的 shader 集合。
 //  运行时若遇到未预生成 shader 的表达式，GPU 直接**硬报错**，绝不静默回退
-//  （即彻底删除 eager 路径，把"难以察觉的漂移"变成"立即暴露的错误"）。
+//  （设计上不设 eager 回退路径，把"难以察觉的漂移"变成"立即暴露的错误"）。
 //
 //  设计要点：
 //    - 算子复用 nn::ops（唯一的算子来源，op_id() 统一映射到 ExprOp）。
@@ -61,7 +61,7 @@ inline bool env_flag(const char* name)
 #include "algebra_ops.hpp"    // nn::ops（唯一算子来源，含 op_id()）
 #include "algebra_matrix.hpp" // Matrix
 
-// ── 表达式概念（原 algebra_expr.hpp；旧代数 AST 移除后归位到唯一使用者 DSL）──
+// ── 表达式概念（定义于本头；DSL 是其唯一使用者）──────────────────────────
 namespace nn
 {
 /// 表达式：可按索引求值为 Scalar 的类型（Span/ConstSpan 与所有 DSL 节点满足）
@@ -84,7 +84,8 @@ namespace nn::dsl
 // 低于全局 nn::PARALLEL_THRESHOLD(524288)。全局值按"裸逐元素 add 的内存
 // 带宽回本点"标定；而本路径折叠的是多算子融合表达式（每元素 2~6 次算术，
 // 还可能含 exp/tanh/sqrt），per-element 成本更高，回本点更低。
-// LayerNorm/RMSNorm 的典型形状 768×512 = 393216 恰在旧门控之外 → 整段串行。
+// LayerNorm/RMSNorm 的典型形状 768×512 = 393216 低于全局门控 → 若按全局
+// 门控判定会整段串行，故本路径需要更低的专属门控。
 // 131072 元素 × ~2ns ≈ 0.26ms，远超并行区启动开销（实测 ~100µs）。
 inline constexpr std::size_t kDslParallelThreshold = 131072;
 
@@ -131,6 +132,19 @@ struct SpecBuilder
     ExprOperand add_input_rowaccess(const Tensor& t, std::uint32_t offset, std::uint32_t mod)
     {
         spec.views.push_back(expr::row_access(offset, mod));
+        inputs.push_back(t);
+        return expr::input(static_cast<std::uint8_t>(inputs.size() - 1));
+    }
+    // 分组归约视图输入：输出 (G,N)、输入 (G*R,N)，out[r][c] = Σ/max over
+    // t<R of in[(r*R+t)][c]。R = 组长度（结构参数 → 进 expr_spec_key，
+    // glsl_gen 编译期展开 R 次读取链；见 ExprViewKind::GroupedReduce* 注释）。
+    ExprOperand add_input_grouped_reduce(const Tensor& t, std::uint32_t R, bool is_max)
+    {
+        ExprView v;
+        v.kind = static_cast<std::uint8_t>(is_max ? ExprViewKind::GroupedReduceMax
+                                                   : ExprViewKind::GroupedReduceSum);
+        v.param = R;
+        spec.views.push_back(v);
         inputs.push_back(t);
         return expr::input(static_cast<std::uint8_t>(inputs.size() - 1));
     }
@@ -227,8 +241,9 @@ template <typename E>
 // 门控说明：这里用 kDslParallelThreshold（131072）而非全局 PARALLEL_THRESHOLD
 // （524288）。全局值是按"裸 add 的内存带宽回本点"标的；而本路径折叠的是
 // 多算子融合表达式（每元素 2~6 次算术 + 可能的 exp/tanh），per-element 成本
-// 更高，回本点更低。典型 LayerNorm/RMSNorm 形状 768×512=393216 旧门控下
-// **整段串行**（正好低于 524288），是本项目 CPU 归一化层只用 ~1 核的直接原因。
+// 更高，回本点更低。典型 LayerNorm/RMSNorm 形状 768×512=393216 正好低于
+// 524288——按全局门控会**整段串行**（归一化层将只用 ~1 核），故本路径
+// 取更低的专属门控。
 // ══════════════════════════════════════════════════════════════════════════
 template <typename E>
 inline void eval_into_span(const E& e, Span d_span, std::size_t cols) noexcept
@@ -247,16 +262,10 @@ inline void eval_into_span(const E& e, Span d_span, std::size_t cols) noexcept
 
     const std::size_t hw = static_cast<std::size_t>(std::thread::hardware_concurrency());
     // 分块数：以 ~64K 元素/块为目标，上限 hw*4 以保证负载均衡。
-    //
-    // 关于这个值的一次实测记录（probe_par_break_even / probe_chunk_at_shape，
-    // 本机 32 逻辑核）——结论是**保持不变**：
-    //   · 并行区固定开销实测 ~100µs（32 线程）/ ~3~16µs（≤16 线程）；
-    //   · 隔离内核上，计算型 body（exp）在 n=393216 时 nch=48 比 nch=6 快 1.4x，
-    //     带宽型 body（x-mean）在任何 nch 下都不如串行；
-    //   · 但把 TARGET_CHUNK 改成 4096 / 16384（→ 96/24 块）后，**层级别反而变差**：
-    //     layernorm 2.8→3.2ms、rmsnorm 1.7→1.9ms（softmax 1.99→1.7 改善），
-    //     transformer/gpt_block 合计下降。隔离内核的收益**没有传递到层**。
-    //   · 故维持 65536；要再动必须先拿到层级别的证据。
+    // 65536 的取值依据（层级别实测裁决）：更小的分块（4096/16384）在隔离
+    // kernel 上有收益但层级别反而变差（layernorm 2.8→3.2ms、rmsnorm
+    // 1.7→1.9ms）——隔离内核的收益不会传递到层；再调整必须先有层级别证据。
+    // 并行区固定开销实测 ~100µs（32 线程）/ ~3~16µs（≤16 线程）。
     constexpr std::size_t TARGET_CHUNK = std::size_t{1} << 16;
     const std::size_t n_chunks = std::clamp(n / TARGET_CHUNK, std::size_t{1},
                                            std::max<std::size_t>(hw, 1) * 4);
@@ -420,6 +429,47 @@ struct RowAccessRef : CpuViewCache
     ExprOperand to_spec(SpecBuilder& b) const { return b.add_input_rowaccess(t, offset, mod); }
 };
 
+// 视图：GroupedReduce —— 沿行按固定长度 R 分组归约（segmented reduce）
+//   输出网格 (G, N)，输入 (G*R, N)（G = 输入行数 / R；列数两侧相同）：
+//     out[g][c] = Σ_{t<R} in[(g*R + t)][c]          （sum）
+//     out[g][c] = max_{t<R} in[(g*R + t)][c]         （max）
+//   用途：MaxPool2D 的窗口归约（R = pool 窗口 k*k，G = 通道数）。
+//
+// 求值路径：**非归约**（has_reduction_v = false）——每输出元素只读 R 个
+//   相邻输入行、元素间零依赖，CPU 走编译期模板路径（并行+向量化），GPU 走
+//   elementwise 生成（glsl_view_read 展开 R 次读取链）。不触发
+//   expr_spec_reduce_axis / reduce-shader 分派（输出是全网格而非归约向量）。
+//   累加顺序：t 升序左结合链，CPU/GPU/解释器三端一致（铁律 8）。
+struct GroupedReduceRef : CpuViewCache
+{
+    Tensor t;
+    std::uint32_t r_len;   // 组长度 R（进 expr_spec_key 的结构参数）
+    bool is_max;
+
+    GroupedReduceRef(Tensor tt, std::uint32_t R, bool mx)
+        : t(std::move(tt)), r_len(R), is_max(mx)
+    { cache_cpu_view(t); }
+
+    // 输入 cols = 输出 cols（分组只沿行方向）→ 缓存 cols 即可分解 (g, c)
+    [[nodiscard]] Scalar eval(std::size_t i) const
+    {
+        const std::size_t g = i / cols, c = i % cols;
+        Scalar acc = is_max ? std::numeric_limits<Scalar>::lowest() : Scalar{0};
+        const std::size_t base = g * static_cast<std::size_t>(r_len);
+        for (std::uint32_t tt = 0; tt < r_len; ++tt)
+        {
+            const Scalar v = at((base + tt) * cols + c);
+            if (is_max) { if (v > acc) acc = v; }
+            else         { acc += v; }
+        }
+        return acc;
+    }
+    // 2 参版本：cols 语义与 1 参相同（输入/输出同列），转发即可
+    [[nodiscard]] Scalar eval(std::size_t i, std::size_t) const { return eval(i); }
+    ExprOperand to_spec(SpecBuilder& b) const
+    { return b.add_input_grouped_reduce(t, r_len, is_max); }
+};
+
 // ══════════════════════════════════════════════════════════════════════════
 // 归约叶子：把"按行/按列归约出标量向量"接入表达式
 //
@@ -469,7 +519,7 @@ using ColReduceSumRef = ReduceViewRef<ExprViewKind::ColReduceSum>;
 using ColReduceMaxRef = ReduceViewRef<ExprViewKind::ColReduceMax>;
 
 // ══════════════════════════════════════════════════════════════════════════
-// matmul 叶子（算子融合二期 S1/S2：matmul 参与 IR 融合）
+// matmul 叶子（算子融合二期：matmul 参与 IR 融合）
 //
 // matmul(A, B) 折叠成 ExprSpec 的**前置 matmul 段**（MatmulSpec）：
 //   逐元素链经 Matmul 操作数按 (r,c) 读取 C = op(A,B)，中间结果不物化。
@@ -486,11 +536,11 @@ struct MatmulRef
     Tensor a, b;
     bool transA = false;
     bool transB = false;
-    std::uint32_t batch = 1;  // S7：批量数（形状参数，不进 key）
+    std::uint32_t batch = 1;  // 批量数（形状参数，不进 key）
 
     // ── CPU 模板求值路径的预绑定状态（引擎内部，Layer 无感知）───────────
     // C 由引擎通用 matmul 原语物化一次并绑定指针；随后尾链（如 +bias）在
-    // 编译期模板路径内联求值 → 编译器融合 + 向量化，不再经 ExprSpec 解释器。
+    // 编译期模板路径内联求值 → 编译器融合 + 向量化，不经 ExprSpec 解释器。
     // 详见本节末尾 "CPU 预绑定" 一节的说明。GPU/scan 不使用本状态。
     mutable Tensor c_cache_{};
     mutable const Scalar* c_data_ = nullptr;
@@ -499,12 +549,11 @@ struct MatmulRef
     {
         if (c_data_ != nullptr)
             return {};  // 幂等：同一棵树重复求值只物化一次
-        // ── 精度安全（§7.2 f32 参考；CPU f16 训练 NaN 根因修复）────────────
+        // ── 精度安全（§7.2 f32 参考）────────────────────────────────────
         // C 固定以 P=F32 物化，而操作数可能带 **f16 存储**（profile_f16 的
         // Linear 权重/激活）：内层 GEMM 的 f32 路径按 f32 存储直接读
         // （cpu_matrix<F32>() 对 f16 存储返回空指针 → Release 读空 UB、
-        // Debug 断言）→ 实测 CPU f16 训练 step0 forward 即 NaN、text_train
-        // 0xC0000005。先把非 f32 操作数抬到 f32 再物化，C 按 f32 绑定。
+        // Debug 断言）。故先把非 f32 操作数抬到 f32 再物化，C 按 f32 绑定。
         const Tensor* pa = &a;
         const Tensor* pb = &b;
         Tensor ca, cb;
@@ -581,7 +630,7 @@ struct MatmulRef
 };
 
 // ══════════════════════════════════════════════════════════════════════════
-// 网格索引叶子（S7）：行号/列号/批次下标作为标量参与算术
+// 网格索引叶子：行号/列号/批次下标作为标量参与算术
 //
 //   row()   = 当前输出元素在 batch 内的行号
 //   col()   = 当前输出列号
@@ -594,7 +643,7 @@ struct ColIdxLeaf  { [[nodiscard]] constexpr Scalar eval(std::size_t) const noex
 struct BatchIdxLeaf{ [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; } ExprOperand to_spec(SpecBuilder&) const { return expr::batch(); } };
 
 // ══════════════════════════════════════════════════════════════════════════
-// S7 视图叶子：标签行收集 / 按批次索引
+// 视图叶子：标签行收集 / 按批次索引
 //   row_gather(logits, labels)：读取 logits[label[c]][c]（稀疏 CE loss 收集）；
 //     labels 登记为 ColBroadcast 视图（(1,cols)），RowGather 视图的 param
 //     指向 labels 输入槽。
@@ -632,7 +681,7 @@ struct BatchModRef
     }
 };
 
-// 按 (batch, col) 切片（S7）：doc_ids (1, batch*seq) → data[batch*seq + col]
+// 按 (batch, col) 切片：doc_ids (1, batch*seq) → data[batch*seq + col]
 struct BatchColRef
 {
     Tensor t;
@@ -691,9 +740,10 @@ using ColBroadcastRef = BroadcastRef<ExprViewKind::ColBroadcast>;
 // ══════════════════════════════════════════════════════════════════════════
 // DSL 表达式概念（比 nn::Expression 更严格：额外要求可折叠成 ExprSpec）
 //
-// 用于让 DSL 运算符在约束偏序上严格优先于旧代数 nn::operator* 等，从而
-// 在 namespace nn（Layer）里**直接写内联数学表达式**时消除重载歧义（旧
-// 代数与 DSL 共用 nn::Expression；若不区分二者，二者对 DSL 叶子同为候选）。
+// 用于让 DSL 运算符以更严的约束参与重载解析，从而在 namespace nn（Layer）
+// 里**直接写内联数学表达式**时重载唯一确定：只有可折叠节点（带 to_spec）
+// 参与 + - * / 与比较，非折叠的 nn::Expression（Span/ConstSpan 等）不成为
+// 候选，误用在编译期即暴露。
 // ══════════════════════════════════════════════════════════════════════════
 template <typename T>
 concept DslExpr = nn::Expression<T> && requires(SpecBuilder& b, const T& t)
@@ -808,10 +858,14 @@ inline constexpr bool has_reduction_v<ReduceViewRef<K>> = true;
 // eval_with_cols）→ 留在编译期模板路径（内联 + 并行）。
 template <ExprViewKind K>
 inline constexpr bool has_reduction_v<BroadcastRef<K>> = false;
+// 分组归约视图：每输出元素独立归约 R 行、元素间零依赖 → 非归约（留
+// 编译期模板路径；fail-safe 显式声明，防默认值漂移把它推进解释器）
+template <>
+inline constexpr bool has_reduction_v<GroupedReduceRef> = false;
 // matmul 叶子同样需走 eval_expr（matmul 预计算 + 逐元素链，引擎实现）
 template <>
 inline constexpr bool has_reduction_v<MatmulRef> = true;
-// 索引/收集叶子（S7）：行/列/批次下标与标签收集由引擎按网格推导
+// 索引/收集叶子：行/列/批次下标与标签收集由引擎按网格推导
 template <>
 inline constexpr bool has_reduction_v<RowIdxLeaf> = true;
 template <>
@@ -843,20 +897,20 @@ inline constexpr bool has_reduction_v<Select<C, T, E>>
 // 用于优化器超参（lr/eps/β）、偏差修正系数等每步会变但结构不变的标量。
 [[nodiscard]] inline constexpr RParamLeaf rparam(Scalar v) { return RParamLeaf{v}; }
 
-// matmul 叶子（S1/S2）：C = op(A,B)，折叠为 ExprSpec 的前置 matmul 段。
+// matmul 叶子：C = op(A,B)，折叠为 ExprSpec 的前置 matmul 段。
 // 逐元素链（如 +bias、激活）自动与 matmul 融合成一个 kernel（GPU AOT）。
-// batch（S7）：A/B 按 batch 垂直切分（batched_matmul 同布局），形状参数。
+// batch：A/B 按 batch 垂直切分（batched_matmul 同布局），形状参数。
 [[nodiscard]] inline MatmulRef matmul(Tensor a, Tensor b,
                                       bool transA = false, bool transB = false,
                                       std::uint32_t batch = 1)
 { return MatmulRef{std::move(a), std::move(b), transA, transB, batch}; }
 
-// 网格索引叶子（S7）：行号/列号/批次下标
+// 网格索引叶子：行号/列号/批次下标
 [[nodiscard]] inline RowIdxLeaf row()   { return {}; }
 [[nodiscard]] inline ColIdxLeaf col()   { return {}; }
 [[nodiscard]] inline BatchIdxLeaf batch() { return {}; }
 
-// S7 视图叶子：标签行收集（稀疏 CE loss）/ 按批次取模索引（ALiBi 斜率）/
+// 视图叶子：标签行收集（稀疏 CE loss）/ 按批次取模索引（ALiBi 斜率）/
 // 按 (batch,col) 切片（doc_ids）
 [[nodiscard]] inline RowGatherRef row_gather(Tensor t, Tensor labels)
 { return RowGatherRef{std::move(t), std::move(labels)}; }
@@ -874,6 +928,12 @@ inline constexpr bool has_reduction_v<Select<C, T, E>>
 // 行偏移+取模访问（SwiGLU 半切分等）：data[(offset + r % mod)*cols + c]
 [[nodiscard]] inline RowAccessRef row_access(Tensor t, std::uint32_t offset, std::uint32_t mod)
 { return RowAccessRef{std::move(t), offset, mod}; }
+
+// 分组归约（MaxPool 窗口归约等）：输入 (G*R, N) → 输出 (G, N)
+[[nodiscard]] inline GroupedReduceRef grouped_reduce_sum(Tensor t, std::uint32_t R)
+{ return GroupedReduceRef{std::move(t), R, /*is_max=*/false}; }
+[[nodiscard]] inline GroupedReduceRef grouped_reduce_max(Tensor t, std::uint32_t R)
+{ return GroupedReduceRef{std::move(t), R, /*is_max=*/true}; }
 
 // ══════════════════════════════════════════════════════════════════════════
 // 归约自由函数：对输入 Tensor 直接归约 → 归约**视图**（GPU 融合更友好）；
@@ -977,8 +1037,8 @@ template <typename E>
 //
 // 背景：has_reduction_v 仅用于 CPU 分支分流（GPU/scan 一律 to_expr_spec）。
 // matmul / 归约视图 / 归约指令 / 网格索引这类"需要 GEMM 或全行全列才能算出"
-// 的节点，此前把**整棵表达式**丢给运行时 ExprSpec 解释器（逐元素
-// Scalar regs[16]={} + switch(op) + lambda 间接调用）。
+// 的节点无法逐元素内联——不预绑定就会把**整棵表达式**丢给运行时 ExprSpec
+// 解释器（逐元素 Scalar regs[16]={} + switch(op) + lambda 间接调用）。
 //
 // 本节与文件头 §1 的既有设计意图一致（"CPU 直接把表达式当作编译期 AST，
 // 逐元素求值 → 编译器内联 + SIMD 融合，等价手写 for 循环"）：把真正需要
@@ -993,11 +1053,9 @@ template <typename E>
 //   eval 目前返回占位值，真实语义只由解释器提供）一旦被放进模板路径就会
 //   **静默算错**。因此：默认只有 has_reduction_v 为假（本就是模板路径原生
 //   节点）才可预绑定，含归约的节点必须逐个显式加入白名单。
-//   教训：曾把默认值设为 true，导致 SwiGLU::backward 的 select(row()<d_ff,…)
-//   在模板路径下 row() 恒为 0，两半梯度选错（layer_gradcheck 的 fc1.w 全红）。
 // ══════════════════════════════════════════════════════════════════════════
 
-// 含归约节点的白名单：已确认可"预绑定 + 模板内联"的才列在此（逐个迁移）
+// 含归约节点的白名单：只列已确认可"预绑定 + 模板内联"的节点（逐个确认后加入）
 template <typename T> inline constexpr bool cpu_preparable_leaf_v = false;
 
 // ── 表达式是否含"真正的行/列归约" ───────────────────────────────────────
@@ -1096,8 +1154,8 @@ template <ExprViewKind K>
 
     using R = ReduceViewRef<K>;
     // f16 输入 → 归约在 f32 参考空间做（§7.2）：一次性镜像后读。直接
-    // cpu_matrix() 读 f16 存储 = 空指针 UB（与 MatmulRef::prepare_cpu 同源
-    // 的 CPU f16 NaN 根因家族）。
+    // cpu_matrix() 读 f16 存储 = 空指针 UB（MatmulRef::prepare_cpu 同款
+    // 精度-存储不匹配约束）。
     Matrix mirror;
     std::span<const Scalar> s;
     if (r.t.precision() == Precision::F32)
@@ -1227,11 +1285,11 @@ template <typename E>
     // 省掉"分配 + 写满一遍零 + 马上被全覆盖"里的那一遍全尺寸零写。
     // 实测本机单线程写满 1.57MB 要 0.50ms（~3.2 GB/s），是纯浪费。
     Matrix out = Matrix::make_uninitialized(rows, cols);
-    // 与 eager 逐元素原语同构（串行+向量化提示 / 阈值以上并行）→ 同门控下
-    // DSL 取代 elementwise_* 时 CPU 性能不倒退。
+    // eval_into_span 与 algebra_matrix 的逐元素原语（apply/transform）同构：
+    // 串行 + 向量化提示 / 阈值以上分块并行，向量化与并行结构一致。
     eval_into_span(e, out.span(), cols);
     // 多精度：f16 目标 = f32 参考求值 + 输出舍入到 f16（§7.2；round-half-to-even
-    // 由 f16 赋值语义保证）。f32 目标 = 直通，与迁移前逐字节一致。
+    // 由 f16 赋值语义保证）。f32 目标 = 直通写入，无额外转换。
     if (P == Precision::F16)
     {
         MatrixT<Precision::F16> h(rows, cols);
@@ -1251,7 +1309,7 @@ template <typename E>
 //        shader；未命中由 eval_expr 硬报错（无 eager）。
 //
 // P = **输出存储精度**（多精度，docs/development/05-mixed-precision.md §8.1）。
-//   · 默认 F32 = 现状（零回归）；Layer 按 §8.5 约定显式传 p_.compute / p_.stable。
+//   · 默认 F32：未显式指定即按 f32 求值；Layer 按 §8.5 约定显式传 p_.compute / p_.stable。
 //   · f16：CPU 侧 f16 叶子一次性抬到 f32 求值、输出舍入回 f16（§7.2）；
 //     GPU 侧由 PrecisionEngine 适配层做同样的边界 cast（Adapter 消费 P）。
 //   · **不做 Auto 推导**：P 是唯一可见实参，来源可追溯（§8.5 G4）。
@@ -1286,7 +1344,7 @@ template <typename E>
                 // 可预绑定：先物化需要全局信息的节点（如 matmul C、归约向量），
                 // 其余交编译期模板内联求值（同一个 eval_into_span 循环）。
                 // 预绑定只是**优化**：任何前置条件不满足（形状/设备不符等）就
-                // 回退解释器，与迁移前逐位一致，不引入正确性风险。
+                // 回退解释器（同一表达式的等价求值路径），不引入正确性风险。
                 if (auto r = cpu_prepare(e, eng, rows, cols); r)
                     return eval_cpu(e, rows, cols, P);
             }
@@ -1309,7 +1367,7 @@ template <typename E>
 }
 
 // ── CPU 侧"写进目标张量"（f16 目标 → f32 参考求值 + 舍入写回，§7.2）────────
-// f32 目标 = 与迁移前逐字节一致（直通 span，零额外拷贝）。
+// f32 目标 = 直通 span 写入（零额外拷贝）。
 template <typename E>
 inline void eval_into_tensor_cpu(const E& e, Tensor& dst)
 {
@@ -1349,8 +1407,8 @@ inline void eval_into_tensor_cpu(const E& e, Tensor& dst)
 // compute_into — 目标传递入口：dst = expr（不分配新张量）
 //
 // 与 compute() 共用同一前端/同一 IR/同一 AOT 匹配，唯一差别是**输出落点**：
-// 结果直接写进调用方提供的 dst。用于把"原地更新"语义纳入 DSL（此前只能靠
-// 引擎的原地原语 add_inplace / scale_inplace 等）：
+// 结果直接写进调用方提供的 dst。用于把"原地更新"语义纳入 DSL（无需逐操作
+// 调用引擎原地原语 add_inplace / scale_inplace 等）：
 //   dst += expr            → compute_into(eng, leaf(dst) + expr, dst)
 //   dst *= k               → compute_into(eng, leaf(dst) * rparam(k), dst)
 //   dst += k * other       → compute_into(eng, leaf(dst) + leaf(other) * rparam(k), dst)

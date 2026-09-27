@@ -259,9 +259,10 @@ void setup_matmul(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
     ctx.a = make_input(e, c.m, c.k);
     ctx.b = make_input(e, c.k, c.n);
 }
-// transB=1：B 存储为 (N,K) 按 B^T 使用 → 操作数必须建 (n,k)。
-// （旧版与 plain 共用 (k,n)：k==n 时正方形掩盖，k≠n 时 backend 返回
-//  K mismatch 错误，而 run 里 *expected 不查错 → UB 垃圾时长 0.000ms。）
+// transB=1：B 存储为 (N,K) 按 B^T 使用 → 每个变体独立建自己的操作数（此处
+// (n,k)，不可与 plain 共用 (k,n)）。形状错配的坑：k==n 时方阵恰好掩盖错配，
+// k≠n 时 backend 返回 K mismatch，run 若不查 Result（*expected 不查错 = UB）
+// 就会测出 0.000ms / 超物理 GFLOPS 的垃圾值——故 run 必须查错并中止。
 void setup_matmul_bt(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
 {
     ctx.a = make_input(e, c.m, c.k);

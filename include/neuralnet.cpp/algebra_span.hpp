@@ -5,8 +5,7 @@
 //   1. 数据视图（指向 Matrix 内部数据）
 //   2. 表达式叶子（eval(i) 返回 data_[i]，满足 nn::Expression 概念）
 //
-// 注：旧代数 AST（自由运算符 + compute::apply 入口）已随逐元素算子移除；
-//     Span 现作为 Matrix 的底层存储视图与 DSL 叶子的数据载体。
+// 注：Span 作为 Matrix 的底层存储视图与 DSL 叶子的数据载体。
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <cstddef>
@@ -18,7 +17,7 @@ namespace nn
 {
 
 // ══════════════════════════════════════════════════════════════════════════
-// Span：可构建 AST 的智能视图
+// Span：可写智能数据视图（DSL 叶子的数据载体）
 // ══════════════════════════════════════════════════════════════════════════
 
 class Span
@@ -60,7 +59,7 @@ public:
     }
 
     // 注：Span 不定义成员运算符；逐元素算法一律通过表达式 DSL
-    // （nn::dsl，见 expr_dsl.hpp）表达，不再有"运算符构建 AST"的旧路径。
+    // （nn::dsl，见 expr_dsl.hpp）表达。
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -122,9 +121,9 @@ public:
         return ConstSpan{data_ + offset, size_ - offset};
     }
 
-    // 注：ConstSpan 不定义成员运算符，所有 AST 构造由 expr.hpp 中的
-    // 自由函数模板 operator+/-/*/>/< 等（基于 Expression 概念）统一处理。
-    // 这保证 ConstSpan 与 Span/Val/任意 Expression 都能自然组合。
+    // 注：ConstSpan 不定义成员运算符；逐元素算法一律通过表达式 DSL
+    // （nn::dsl，见 expr_dsl.hpp）表达，DSL 运算符只接受可折叠节点
+    // （DslExpr），ConstSpan 本身仅作为数据视图/叶子输入。
 };
 
 } // namespace nn

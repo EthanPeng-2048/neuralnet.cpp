@@ -48,10 +48,10 @@
 // 比较算子（cmp_op）：
 //   0=Lt, 1=Le, 2=Gt, 3=Ge, 4=Eq, 5=Ne
 //
-// ── vec4 kernel（2026-09-24，与 DSL 融合逐元素 vec4 路径同步）──────────────
-// DSL 侧（expr_glsl_gen glsl_vec4_eligible + vec4 kernel）早已按「每线程 4 个
-// 相邻元素」发射 vec4 加载/运算/存储，dispatch 宽度 4；OP 级此前是标量
-// 每线程 1 元素。本 shader 现镜像同一契约：
+// ── vec4 kernel（与 DSL 融合逐元素 vec4 路径同契约）────────────────────────
+// DSL 侧（expr_glsl_gen glsl_vec4_eligible + vec4 kernel）按「每线程 4 个
+// 相邻元素」发射 vec4 加载/运算/存储，dispatch 宽度 4；本 shader 镜像同一
+// 契约：
 //   - main：base = gid*4，base >= count 返回；
 //   - 快路径（count%4==0 且 base+3 < count）→ 全 vec4（索引 flat、4 相邻
 //     元素连续 ⇒ vec4 别名视图整读整写；16B 对齐由 MemoryPool 保证）；
@@ -65,18 +65,42 @@
 
 #version 450
 
+// -DNN_SHADER_F16=1 → f16 存储变体（Phase C1b）：
+//   缓冲 float16_t、算术 f32（load→float() → 计算 → float16_t() 落回，
+//   与 Phase 2 in-kernel f16 同语义——消灭边界 cast 的整份 f32 副本，
+//   中间值精度反而更高）。vec4 别名改 uvec2（4×half=8B，std430 步长恰 8；
+//   unpackHalf2x16/packHalf2x16 与 matmul_tiled 的 NN_V4 同款）。
+//   只需 storageBuffer16BitAccess（f16↔f32 转换不需 Float16 capability，
+//   既有56个融合变体的 OpFConvert 同证）。
+#if defined(NN_SHADER_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#define NN_ETYPE float16_t
+#define NN_V4   uvec2
+#define NN_LOADV4(arr, i) vec4(unpackHalf2x16(arr[i].x), unpackHalf2x16(arr[i].y))
+#define NN_PACK4(v) uvec2(packHalf2x16(v.xy), packHalf2x16(v.zw))
+#define NN_RD(x) float(x)
+#define NN_WR(x) float16_t(x)
+#else
+#define NN_ETYPE float
+#define NN_V4   vec4
+#define NN_LOADV4(arr, i) arr[i]
+#define NN_PACK4(v) (v)
+#define NN_RD(x) (x)
+#define NN_WR(x) (x)
+#endif
+
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly buffer  BufA   { float buf_a[]; };
-layout(std430, binding = 1) readonly buffer  BufB   { float buf_b[]; };
-layout(std430, binding = 2) readonly buffer  BufC   { float buf_c[]; };
-layout(std430, binding = 3) writeonly buffer BufOut { float buf_out[]; };
+layout(std430, binding = 0) readonly buffer  BufA   { NN_ETYPE buf_a[]; };
+layout(std430, binding = 1) readonly buffer  BufB   { NN_ETYPE buf_b[]; };
+layout(std430, binding = 2) readonly buffer  BufC   { NN_ETYPE buf_c[]; };
+layout(std430, binding = 3) writeonly buffer BufOut { NN_ETYPE buf_out[]; };
 
 // vec4 别名视图（同 binding 双声明，std430；仅 count%4==0 快路径使用）
-layout(std430, binding = 0) readonly buffer  BufAv4 { vec4 buf_a4[]; };
-layout(std430, binding = 1) readonly buffer  BufBv4 { vec4 buf_b4[]; };
-layout(std430, binding = 2) readonly buffer  BufCv4 { vec4 buf_c4[]; };
-layout(std430, binding = 3) writeonly buffer BufOut4 { vec4 buf_out4[]; };
+layout(std430, binding = 0) readonly buffer  BufAv4 { NN_V4 buf_a4[]; };
+layout(std430, binding = 1) readonly buffer  BufBv4 { NN_V4 buf_b4[]; };
+layout(std430, binding = 2) readonly buffer  BufCv4 { NN_V4 buf_c4[]; };
+layout(std430, binding = 3) writeonly buffer BufOut4 { NN_V4 buf_out4[]; };
 
 layout(push_constant) uniform PushConstants {
     uint  count;
@@ -160,7 +184,9 @@ bvec4 apply_compare(uint op, vec4 a, vec4 b)
 // ── 标量主路径（回退：每元素一次；idx 由调用方给出）───────────────────────
 float eval_scalar(uint idx)
 {
-    const float a = buf_a[idx];
+    // f16 缓冲 → float：显式 float() 转换（与既有56个融合变体同款；
+    // 隐式宽化未被既有编译路径覆盖，不引入未验证语法）
+    const float a = NN_RD(buf_a[idx]);
 
     // ── 模式 0：一元运算 ──
     if (mode == 0u)
@@ -169,7 +195,7 @@ float eval_scalar(uint idx)
     // ── 模式 1：二元运算 ──
     if (mode == 1u)
     {
-        const float b = ((flags & 1u) != 0u) ? scalar_b : buf_b[idx];
+        const float b = ((flags & 1u) != 0u) ? scalar_b : float(buf_b[idx]);
         if ((flags & 8u) != 0u)
             return apply_binary(op, b, a);            // 标量在前
         else
@@ -179,15 +205,15 @@ float eval_scalar(uint idx)
     // ── 模式 2：条件选择 ──
     if (mode == 2u)
     {
-        const float b      = ((flags & 1u) != 0u) ? scalar_b      : buf_b[idx];
-        const float then_v = ((flags & 2u) != 0u) ? scalar_then   : buf_b[idx];
-        const float else_v = ((flags & 4u) != 0u) ? scalar_else   : buf_c[idx];
+        const float b      = ((flags & 1u) != 0u) ? scalar_b      : float(buf_b[idx]);
+        const float then_v = ((flags & 2u) != 0u) ? scalar_then   : float(buf_b[idx]);
+        const float else_v = ((flags & 4u) != 0u) ? scalar_else   : float(buf_c[idx]);
         return apply_compare(cmp_op, a, b) ? then_v : else_v;
     }
 
     // ── 模式 3：AXPY ──
     if (mode == 3u)
-        return a + scalar_b * buf_b[idx];
+        return a + scalar_b * float(buf_b[idx]);
 
     return 0.0;
 }
@@ -195,14 +221,16 @@ float eval_scalar(uint idx)
 // ── vec4 快路径（count%4==0 的整组 4 元素）────────────────────────────────
 vec4 eval_vec4(uint base)
 {
-    const vec4 a = buf_a4[base >> 2];
+    // f16 变体：uvec2(4×half) 解包为 vec4（NN_LOADV4 宏分派）；f32 直读
+    const vec4 a = NN_LOADV4(buf_a4, base >> 2);
 
     if (mode == 0u)
         return apply_unary(op, a);
 
     if (mode == 1u)
     {
-        const vec4 b = ((flags & 1u) != 0u) ? vec4(scalar_b) : buf_b4[base >> 2];
+        const vec4 b = ((flags & 1u) != 0u) ? vec4(scalar_b)
+                                            : NN_LOADV4(buf_b4, base >> 2);
         if ((flags & 8u) != 0u)
             return apply_binary(op, b, a);
         else
@@ -211,15 +239,18 @@ vec4 eval_vec4(uint base)
 
     if (mode == 2u)
     {
-        const vec4 b      = ((flags & 1u) != 0u) ? vec4(scalar_b)    : buf_b4[base >> 2];
-        const vec4 then_v = ((flags & 2u) != 0u) ? vec4(scalar_then) : buf_b4[base >> 2];
-        const vec4 else_v = ((flags & 4u) != 0u) ? vec4(scalar_else) : buf_c4[base >> 2];
+        const vec4 b      = ((flags & 1u) != 0u) ? vec4(scalar_b)
+                                                 : NN_LOADV4(buf_b4, base >> 2);
+        const vec4 then_v = ((flags & 2u) != 0u) ? vec4(scalar_then)
+                                                 : NN_LOADV4(buf_b4, base >> 2);
+        const vec4 else_v = ((flags & 4u) != 0u) ? vec4(scalar_else)
+                                                 : NN_LOADV4(buf_c4, base >> 2);
         // mix(else, then, cond)：cond = compare(a, b)（bvec4 按 lane 选择）
         return mix(else_v, then_v, apply_compare(cmp_op, a, b));
     }
 
     if (mode == 3u)
-        return a + scalar_b * buf_b4[base >> 2];
+        return a + scalar_b * NN_LOADV4(buf_b4, base >> 2);
 
     return vec4(0.0);
 }
@@ -233,7 +264,8 @@ void main()
     // 快路径：整组 4 元素齐全且 count 对齐 → vec4 整读整写
     if ((count & 3u) == 0u && base + 3u < count)
     {
-        buf_out4[base >> 2] = eval_vec4(base);
+        // f16：vec4 → uvec2 打包（packHalf2x16）；f32 恒等透传
+        buf_out4[base >> 2] = NN_PACK4(eval_vec4(base));
         return;
     }
 
@@ -242,6 +274,7 @@ void main()
     {
         const uint e = base + j;
         if (e >= count) break;
-        buf_out[e] = eval_scalar(e);
+        // f16：float → float16_t 显式窄化；f32 恒等
+        buf_out[e] = NN_WR(eval_scalar(e));
     }
 }

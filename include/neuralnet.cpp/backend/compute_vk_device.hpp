@@ -82,6 +82,11 @@ private:
     // Phase 2 in-kernel f16 的带类型融合 shader 前提。不支持 → 后端跳过带类型
     // 变体，运行时回退"边界 cast 适配层"（正确性不受影响）。
     bool has_16bit_storage_ = false;
+    // 设备支持 f16 ALU（shaderFloat16 / VK_KHR_shader_float16_int8）+ 已在设备
+    // 创建时启用：原生 f16 算术 shader（GL_EXT_shader_explicit_arithmetic_types_float16）
+    // 的前提。与 has_16bit_storage_ 独立：只有存储没 ALU 的设备仍走"f16 存储 +
+    // f32 算术"变体；两者齐备才启用"f16 直算"变体。
+    bool has_shader_float16_ = false;
     uint32_t subgroup_size_ = 4;  // 计算队列 subgroup 尺寸——matmul_gemv 的
                                   // red[..][64] 容量前提（256/subgroup≤64）；
                                   // VK1.1 查询失败按 4 兜底，见 initialize
@@ -171,13 +176,13 @@ public:
         std::vector<VkPhysicalDevice> devices(device_count);
         vkEnumeratePhysicalDevices(instance_, &device_count, devices.data());
 
-        // ── 物理设备选择：按能力打分取最优，而不是"取第一个独显" ─────────
-        // 实测教训（本机枚举顺序）：
+        // ── 物理设备选择：按能力打分取最优，不按枚举序取首个独显 ─────────
+        // 本机枚举顺序（打分规则必须覆盖的现实情况）：
         //   [0] AMD Radeon R5 240      独显 / 老专有驱动, api 1.2.170
         //   [1] Microsoft Direct3D12 (AMD R5 240)   ← Mesa Dozen 转译层
         //   [2] NVIDIA CMP 40HX        独显 / 驱动 616.92, api 1.4.351
-        // 旧的"第一个 VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU"会选中 [0]：
-        // 该驱动的 maxComputeSharedMemorySize 仅 32768（matmul 分块要 34560，
+        // 不按枚举序取首个 discrete 会选中 [0]：该驱动的
+        // maxComputeSharedMemorySize 仅 32768（matmul 分块要 34560，
         // 校验层直接报 VUID-RuntimeSpirv-Workgroup-06530），且对跨 submit
         // 信号量的重复 wait 直接死锁（vkWaitForFences 超时 → "Vulkan error 2"）。
         // 打分 = (设备类型权重, apiVersion)，同分取先枚举者；D3D12 转译层
@@ -310,7 +315,7 @@ public:
             }
             // 逃生阀：某些驱动的 timeline 实现有问题时，用
             // NN_VULKAN_NO_TIMELINE=1 强制走"host 等在飞上传"回退路径
-            // （正确性优先，牺牲 P0-1 非阻塞流水线）。
+            // （正确性优先，牺牲非阻塞流水线）。
             if (!get_env("NN_VULKAN_NO_TIMELINE").empty())
                 timeline_semaphores_ = false;
         }
@@ -348,6 +353,29 @@ public:
         if (!get_env("NN_VULKAN_NO_16BIT_STORAGE").empty())
             has_16bit_storage_ = false;
 
+        // f16 ALU（Phase 3 原生 f16 算术）：查询 + 启用 shaderFloat16
+        // （Vulkan 1.2 核心特性 / VK_KHR_shader_float16_int8 扩展）。
+        // 与 storageBuffer16BitAccess 同款流程：查不到 → 不启用 → 后端不创建
+        // f16 算术 pipeline → 运行时回退"f32 算术 + f16 存储"变体（正确性不变）。
+        VkPhysicalDeviceShaderFloat16Int8Features f16alu{};
+        f16alu.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
+        if (app_info.apiVersion >= VK_API_VERSION_1_2)
+        {
+            VkPhysicalDeviceFeatures2 f16q{};
+            f16q.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            f16q.pNext = &f16alu;
+            vkGetPhysicalDeviceFeatures2(physical_device_, &f16q);
+            has_shader_float16_ = (f16alu.shaderFloat16 == VK_TRUE);
+        }
+        // 逃生阀：强制回退 f32 算术变体（对照实验 / 驱动问题）
+        if (!get_env("NN_VULKAN_NO_16BIT_ALU").empty())
+            has_shader_float16_ = false;
+        if (!has_shader_float16_)
+            f16alu.shaderFloat16 = VK_FALSE;
+        // 查询阶段把整个结构体清零后可能置 VK_TRUE；非启用分支必须显式关掉，
+        // 避免把未启用的特性声明进 pNext（校验层 VUID-VkDeviceCreateInfo 系列）。
+        f16alu.shaderInt8 = VK_FALSE;   // 本库不用 int8 ALU，恒不启用
+
         float queue_priority = 1.0f;
         VkDeviceQueueCreateInfo queue_info{};
         queue_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -357,7 +385,7 @@ public:
 
         VkDeviceCreateInfo device_info{};
         device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-        // pNext 链：16 位存储（若支持）→ 时间线信号量（若支持）
+        // pNext 链：16 位 ALU（若启用）→ 16 位存储（若支持）→ 时间线信号量（若支持）
         VkBaseInStructure* chain = nullptr;
         storage16.pNext = nullptr;
         if (timeline_semaphores_)
@@ -366,7 +394,18 @@ public:
             // Vulkan 的 pNext 为 void*（非 const）→ 用非 const 指针链入
             storage16.pNext = reinterpret_cast<VkBaseInStructure*>(&timeline_features);
         }
-        if (has_16bit_storage_)
+        f16alu.pNext = nullptr;
+        if (has_shader_float16_)
+        {
+            // f16 ALU 头：其后接 storage16（若启用）或 timeline（若启用）
+            f16alu.pNext = has_16bit_storage_
+                ? reinterpret_cast<VkBaseInStructure*>(&storage16)
+                : (timeline_semaphores_
+                       ? reinterpret_cast<VkBaseInStructure*>(&timeline_features)
+                       : nullptr);
+            chain = reinterpret_cast<VkBaseInStructure*>(&f16alu);
+        }
+        else if (has_16bit_storage_)
             chain = reinterpret_cast<VkBaseInStructure*>(&storage16);
         else if (timeline_semaphores_)
             chain = reinterpret_cast<VkBaseInStructure*>(&timeline_features);
@@ -392,6 +431,8 @@ public:
     [[nodiscard]] bool is_initialized() const noexcept { return initialized_; }
     // SSBO 16 位存储（float16_t）是否已启用：in-kernel f16 带类型融合 shader 前提
     [[nodiscard]] bool has_16bit_storage() const noexcept { return has_16bit_storage_; }
+    // f16 ALU（shaderFloat16）是否已启用：原生 f16 算术 shader 前提
+    [[nodiscard]] bool has_shader_float16() const noexcept { return has_shader_float16_; }
     // 所选物理设备名（"NVIDIA CMP 40HX" 等；初始化前为空）
     [[nodiscard]] const std::string& device_name() const noexcept { return device_name_; }
     // 计算队列 subgroup 尺寸（初始化前 = 兜底值 4；GEMV 分派门禁用）

@@ -65,8 +65,8 @@ auto m_span = matrix.span();            // 泄露了内部 std::span 视图
 matrix.data().begin();                  // 泄露了内部 std::vector&
 
 // 遵循隔离：上层模块只调用 Matrix 暴露的语义化操作
-matrix.apply_relu();                    // Matrix 自己封装逐元素操作
 matrix.add_inplace(other);              // Matrix 自己封装算术操作
+matrix.multiply_to(result, other);      // Matrix 自己封装矩阵乘
 // 并行策略由 Matrix 内部决定，上层不感知
 ```
 
@@ -90,14 +90,13 @@ matrix.add_inplace(other);              // Matrix 自己封装算术操作
 // ❌ Matrix 禁止：定义神经网络算法逻辑（如 forward/backward 流程、损失函数、梯度更新策略、
 //                 ReLU/GeLU/Softmax/LayerNorm/CrossEntropy/Adam/SGD 等具体算法）
 
-// ── L2 计算层（layer.hpp / compute_loss.hpp / optimizer.hpp）的职责边界 ──
+// ── L2 计算层（compute_layer.hpp / compute_loss.hpp / compute_optimizer.hpp）的职责边界 ──
 // ✅ Layer 负责：神经网络算法逻辑（forward/backward 公式、参数管理、缓存中间结果）
 // ✅ Layer 可以：组合使用其他 Layer（如 MultiHeadAttention 内部使用 Softmax、FeedForward 内部使用 Linear+GeLU）
 // ✅ Layer 可以：用表达式 DSL（`dsl::compute` / `dsl::compute_into`）表达逐元素算法
-//    （旧 `compute::apply(span, expr)` 代数 AST 已于 2026-09 整体移除）
 
 // ── 正确示例：Layer 用 DSL 表达逐元素算法 ──
-auto y = dsl::compute(engine, dsl::max(dsl::leaf(*x), dsl::rparam(0)), rows, cols);
+auto y = dsl::compute(engine, dsl::max(dsl::leaf(*x), Scalar{0}), rows, cols);
 
 // ── 正确示例：Layer 之间组合 ──
 auto sm_res = softmax_.forward(attn_[h]);  // Layer 调用 Layer
@@ -106,9 +105,9 @@ auto sm_res = softmax_.forward(attn_[h]);  // Layer 调用 Layer
 | 规则 | 说明 |
 |------|------|
 | **Matrix 不写算法** | Matrix 提供纯数学运算原语，不包含神经网络的前向/反向传播逻辑、激活函数、损失函数、优化器等具体算法 |
-| **Layer 表达算法** | Layer 通过 Matrix 语义 API 或 `compute::apply(span, expr)` 表达算法 |
+| **Layer 表达算法** | Layer 通过表达式 DSL（`dsl::compute` / `dsl::compute_into` / `dsl::compute_reduce`）或 Matrix 语义 API 表达算法 |
 | **Layer 可组合** | Layer 可以包含并调用其他 Layer（如 Attention 内部使用 Softmax） |
-| **并行对上层透明** | 并行策略是内部实现细节，上层通过 Matrix API 或 compute::apply 间接享受并行加速 |
+| **并行对上层透明** | 并行策略是内部实现细节，上层通过 Matrix API 或表达式 DSL 间接享受并行加速 |
 
 ---
 
@@ -175,8 +174,7 @@ auto func = [data](std::size_t i) noexcept {
     return data[i] * 2.0;
 };
 
-// 避免：使用已废弃的 data_ptr()
-double* ptr = matrix.data_ptr();  // [[deprecated]]
+// 不要找 data_ptr()——接口只有 span()（零开销抽象，覆盖所有裸指针访问场景）
 ```
 
 #### 3.2.5 预分配缓冲区模式
@@ -235,7 +233,7 @@ graph TB
     end
     subgraph "L1 代数层"
         MAT["algebra_matrix.hpp"]
-        ALG["algebra_expr/ops/span/compute.hpp"]
+        ALG["algebra_ops/span.hpp"]
     end
     subgraph "L0 硬件层"
         CFG["core_config.hpp"]
@@ -248,7 +246,7 @@ graph TB
     GPT & MNIST -->|"ModelSpec"| MS
     MDL -->|"Layer::forward()"| LAY
     IO --> MDL & MS
-    LAY -->|"Matrix API / compute::apply"| MAT & ALG
+    LAY -->|"Matrix API / dsl"| MAT & ALG
     LOSS -->|"Matrix API"| MAT
     OPT -->|"Matrix API"| MAT
     MAT -->|"自适应并行"| CFG
@@ -262,7 +260,7 @@ graph TB
 | **L4 构建层** | `domain_gpt.hpp`, `domain_mnist.hpp` | 模型工厂（组装层为模型） |
 | **L3 实现层** | `model_container.hpp`, `model_spec.hpp`, `model_serialization.hpp` | 模型容器 + 序列化 |
 | **L2 计算层** | `compute_layer.hpp`, `compute_loss.hpp`, `compute_optimizer.hpp` | 层/损失/优化器定义（**算法所在层**） |
-| **L1 代数层** | `algebra_matrix.hpp`, `algebra_*.hpp` | 矩阵运算原语 + AST 表达式模板（**不含任何算法**） |
+| **L1 代数层** | `algebra_matrix.hpp`, `algebra_ops/span.hpp` | 矩阵运算原语（**不含任何算法**） |
 | **L0 硬件层** | `core_config.hpp`, `core_threadpool.hpp` | 并行策略 |
 
 > 层级仅供参考，不强制限制调用方向。**唯一硬约束：Matrix 不得包含任何神经网络算法**（ReLU/GeLU/Softmax/LayerNorm/CrossEntropy/Adam/SGD 等必须放在 L2 计算层）。
@@ -292,13 +290,14 @@ class Matrix {
 };
 
 // 正确：Matrix 只提供通用数学原语，算法在 Layer / Optimizer / Loss 中表达
-// layer.hpp 中 ReLU::forward：
-Span x = result.span();
-compute::apply(x, max(x, Scalar{0}));
+// compute_layer_mlp.hpp 中 ReLU::forward（一条 DSL 表达式）：
+return dsl::compute(engine,
+    dsl::max(dsl::leaf(input), Scalar{0}),
+    input.rows(), input.cols(), p_.compute);
 
-// optimizer.hpp 中 SGD::step：
-p.binary_apply_inplace(g,
-    [lr](Scalar pv, Scalar gv) noexcept { return pv - lr * gv; });
+// compute_optimizer.hpp 中 SGD::step（原地目标传递，零分配）：
+dsl::compute_into(engine,
+    dsl::leaf(p) + dsl::leaf(g) * dsl::rparam(-lr), p);
 ```
 
 ### 4.3 推荐的接口设计
@@ -308,18 +307,12 @@ p.binary_apply_inplace(g,
 ```cpp
 class Matrix {
 public:
-    // ── 逐元素变换 ──
-    template <typename F> [[nodiscard]] Matrix apply(F&& func) const;
-    template <typename F> [[nodiscard]] Matrix binary_apply(const Matrix& other, F&& func) const;
-    template <typename F> void binary_apply_inplace(const Matrix& other, F&& func);
-
     // ── 归约原语 ──
     template <typename T, typename R, typename F> [[nodiscard]] T reduce(T init, R&&, F&&) const;
     template <typename T, typename R, typename F> [[nodiscard]] Matrix row_reduce(T init, R&&, F&&) const;
     template <typename T, typename R, typename F> [[nodiscard]] Matrix col_reduce(T init, R&&, F&&) const;
 
     // ── Span 视图（供 Matrix 内核 / 表达式 DSL 叶子使用） ──
-    //    注：旧 compute::apply 代数 AST 与广播/逐元素算子在 2026-09 已移除
     std::span<Scalar> span() noexcept;
     std::span<const Scalar> span() const;
 };
@@ -328,11 +321,12 @@ public:
 #### 4.3.2 Layer 用表达式 DSL 表达逐元素算法
 
 ```cpp
-// ReLU::forward —— 一条 DSL 表达式（旧 compute::apply 代数 AST 已于 2026-09 移除）
-Result<Tensor> ReLU::forward(ComputeEngine& engine, const Tensor& x) override {
-    input_cache_ = x;
-    return dsl::compute(engine, dsl::max(dsl::leaf(x), dsl::rparam(0)),
-                        x.rows(), x.cols());
+// ReLU::forward —— 一条 DSL 表达式（compute_layer_mlp.hpp）
+[[nodiscard]] Result<Tensor> ReLU::forward(ComputeEngine& engine, const Tensor& input) override {
+    if (!checkpoint_mode_)
+        input_cache_ = input;
+    return dsl::compute(engine, dsl::max(dsl::leaf(input), Scalar{0}),
+                        input.rows(), input.cols(), p_.compute);
 }
 ```
 
@@ -355,14 +349,18 @@ class FeedForward : public Layer {
 };
 ```
 
-#### 4.3.4 Optimizer 通过 Matrix 通用接口表达更新公式
+#### 4.3.4 Optimizer 通过表达式 DSL 表达更新公式
 
 ```cpp
-// Adam::step 通过 binary_apply_inplace 表达
-m.binary_apply_inplace(g,
-    [beta1, one_minus_beta1](Scalar mv, Scalar gv) noexcept {
-        return beta1 * mv + one_minus_beta1 * gv;
-    });
+// Adam::step —— 每个状态一条 DSL 表达式（compute_optimizer.hpp）
+// K1: m = β₁·m + (1-β₁)·g
+auto m_new = dsl::compute(engine_,
+    dsl::leaf(m_[i]) * dsl::rparam(beta1_) +
+        dsl::leaf(g) * dsl::rparam(one_minus_beta1),
+    rows, cols, p_.optimizer);
+// K2: v = β₂·v + (1-β₂)·g²（单 kernel 融合）
+// K3: p += -lr · (inv_bc1·m) / (sqrt(inv_bc2·v) + eps)（全链单 kernel，
+//     偏置修正系数走 rparam 不进 key → 共享 shader；结果经 compute_into 原地写回 p）
 ```
 
 ### 4.4 模块化自检清单
@@ -398,7 +396,6 @@ include/neuralnet.cpp/
 ├── algebra_matrix.hpp       # 矩阵运算（内部自动并行分派，上层无感）
 ├── algebra_ops.hpp          # 逐元素算子定义（表达式 DSL 复用）
 ├── algebra_span.hpp         # Span 抽象
-├── （algebra_expr.hpp / algebra_compute.hpp 已于 2026-09 移除）
 │
 │  ┌─ L2 计算层 ──────────────────────────────────────┐
 ├── compute_layer.hpp      # 层基类和实现（Linear/ReLU/GeLU/GPT...）
@@ -428,7 +425,7 @@ include/neuralnet.cpp/
 ```cpp
 // 每个头文件只负责一个功能模块
 // algebra_matrix.hpp - 矩阵运算
-// layer.hpp  - 层定义
+// compute_layer.hpp  - 层定义
 // compute_loss.hpp   - 损失函数
 // 避免大而全的头文件
 ```
@@ -463,25 +460,27 @@ namespace nn {
 
 ### 5.3 接口设计模式
 
-#### 5.3.1 流式 API（Fluent API）
+#### 5.3.1 构建接口（Result 传播）
 
 ```cpp
-// 支持链式调用
-Model model;
-model.add<Linear>(784, 64)
-    .add<ReLU>()
-    .add<Linear>(64, 10)
-    .add<CrossEntropyLoss>();
+// Model::add 返回 Result<void>（逐个添加、失败即传播；不使用链式 fluent 风格）
+Model model(engine);
+if (auto r = model.add<Linear>(784, 64); !r) return std::unexpected(r.error());
+if (auto r = model.add<ReLU>();          !r) return std::unexpected(r.error());
+if (auto r = model.add<Linear>(64, 10);   !r) return std::unexpected(r.error());
 ```
 
-#### 5.3.2 类型安全的工厂函数
+#### 5.3.2 类型安全的模板构建
 
 ```cpp
-// 使用模板参数推导
+// model_container.hpp：模板参数推导 + 构造后自动 init + 精度 profile 注入
 template <typename LayerType, typename... Args>
-Model& add(Args&&... args) {
-    layers_.push_back(std::make_unique<LayerType>(std::forward<Args>(args)...));
-    return *this;
+Result<void> add(Args&&... args) {
+    auto layer = std::make_unique<LayerType>(std::forward<Args>(args)...);
+    if (default_precision_) layer->set_precision_profile(*default_precision_);
+    if (auto r = layer->init(engine()); !r) return std::unexpected(r.error());
+    layers_.emplace_back(std::move(layer));
+    return {};
 }
 ```
 
@@ -511,7 +510,7 @@ void update(std::vector<std::reference_wrapper<Matrix>> params,
 - [ ] 每个头文件是否只负责一个功能？
 - [ ] 是否最小化头文件依赖？
 - [ ] 接口是否简洁直观？
-- [ ] 是否支持链式调用？
+- [ ] 构建类接口是否返回 `Result` 并在失败时传播（不静默继续）？
 - [ ] 是否提供安全和快速两种访问方式？
 
 ---
@@ -606,9 +605,6 @@ nn::parallel_for_samples(n, [&](std::size_t i) noexcept { /* 第 i 个样本 */ 
 nn::parallel_for_blocks(idx.begin(), idx.end(), [&](std::size_t b) noexcept { /* 第 b 块 */ });
 ```
 
-> 历史说明：早期文档把该策略命名为「SmartPolicy」并给出用户可替换 policy 的扩展示例，
-> 该类型**在代码中从不存在**（只有上述自由函数 + 阈值门控），示例已按实际 API 更正。
-
 ### 6.3 性能注解
 
 ```cpp
@@ -653,10 +649,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 |------|------|------|
 | `std::expected<T, E>` | C++23 | 所有 API 的错误传播，替代 throw/try/catch |
 | `std::span` | C++20 | 非拥有型连续内存视图，替代裸指针 |
-| `std::ranges` | C++20 | 数据处理管道（如 `ranges::generate` Xavier 初始化） |
+| `std::ranges` | C++20 | 范围工具（`ranges::distance`/`ranges::advance` 切分并行区间、`ranges::sort`） |
 | `std::views::iota` | C++20 | 延迟整数序列（并行索引生成） |
-| `std::views::zip` | C++20 | 多范围并行迭代（优化器参数更新） |
-| `std::execution::par_unseq` | C++17 | 并行执行策略（矩阵运算） |
 
 ### 7.3 标准跟进检查清单
 
@@ -710,11 +704,8 @@ const std::vector<int>& vec;  // 推荐
 #include <memory>
 #include <algorithm>
 
-// 3. 第三方库
-#include <fmt/format.h>
-
-// 4. 项目内头文件
-#include <neuralnet.cpp/nn_core_config.hpp>
+// 3. 项目内头文件
+#include <neuralnet.cpp/core_config.hpp>
 ```
 
 ---
@@ -725,7 +716,7 @@ const std::vector<int>& vec;  // 推荐
 
 **全项目禁止使用 throw/try/catch**，统一使用 C++23 的 `std::expected<T, E>` 进行错误传播。
 
-#### 基础类型定义（nn_core_config.hpp）
+#### 基础类型定义（core_errors.hpp）
 
 ```cpp
 struct Error {
@@ -743,9 +734,9 @@ Result<Matrix> forward(const Matrix& input);
 Result<void> save_model(const std::string& path, Model& model);
 Result<ModelSpec> peek_model_spec(const std::string& path);
 
-// 禁止抛异常
-Matrix forward(const Matrix& input);  // 旧方式
-void save_model(...);                  // 旧方式
+// ❌ 禁止：不带错误通道的裸返回
+Matrix forward(const Matrix& input);
+void save_model(...);
 ```
 
 #### 错误返回模式
@@ -857,11 +848,9 @@ if constexpr (std::is_same_v<Policy, SeqPolicy>) {
  * @brief 计算前向传播
  *
  * @param input 输入数据矩阵
- * @return 计算结果矩阵
- *
- * @throws std::invalid_argument 如果维度不匹配
+ * @return 计算结果矩阵；维度不匹配时返回 Error（本项目无异常，不使用 @throws）
  */
-[[nodiscard]] Matrix forward(const Matrix& input) const;
+[[nodiscard]] Result<Matrix> forward(const Matrix& input) const;
 ```
 
 ### 10.3 文档检查清单

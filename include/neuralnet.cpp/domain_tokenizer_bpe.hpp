@@ -94,8 +94,8 @@ public:
         const bool show_p = config.show_progress;
 
         // ── 预分词 + 字符串层去重计数（可并行，map-reduce） ──────
-        // 边按 regex 切分边填 word_freq，不产生全部 chunk 列表：
-        //   1) 内存：不再持有数亿个 string chunk（节省数 GB）
+        // 边按 regex 切分边填 word_freq，不物化全部 chunk 列表：
+        //   1) 内存：避免同时持有数亿个 string chunk（节省数 GB）
         //   2) 性能：经全局线程池在安全切分点并行，结果与单线程完全一致
         std::unordered_map<std::string, std::size_t> word_freq;
         {

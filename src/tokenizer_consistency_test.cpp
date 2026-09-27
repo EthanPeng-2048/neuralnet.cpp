@@ -32,8 +32,8 @@ namespace
 
 int g_fail = 0;
 
-// ── 参考实现：完整旧版 pre_tokenize（标记切分 + 纯文本 sregex_iterator） ──
-// 逐字复刻优化前 domain_tokenizer_bpe.hpp 的实现，作为手写状态机的对拍基准。
+// ── 参考实现：pre_tokenize 的独立朴素实现（标记切分 + 纯文本 sregex_iterator）─
+// 正则切分路径独立于被测的手写状态机（pre_match_len），作为逐字节对拍的基准。
 std::vector<std::string> old_pre_tokenize(std::string_view text)
 {
     static const std::vector<std::string> markers = [] {

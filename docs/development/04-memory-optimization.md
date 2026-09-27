@@ -18,24 +18,24 @@
 
 ## 背景与目标
 
-### 实施进度（2026-08-22）
+### 实施状态（L1/L2 已实施，L3 待立项）
 
-**L1 激活重计算（梯度检查点）— 已实施**
-- 接口：`Layer` 新增 `set_checkpoint_mode / recompute_supported / forward_recompute / set_checkpoint_every` 契约；`Model::set_checkpoint_every` 逐层分发；`GPTModel` override 实现块级检查点（每 N 个 GPTBlock 存一次输入，backward 重算）。
+**L1 激活重计算（梯度检查点）**
+- 接口：`Layer` 的 `set_checkpoint_mode / recompute_supported / forward_recompute / set_checkpoint_every` 契约；`Model::set_checkpoint_every` 逐层分发；`GPTModel` override 实现块级检查点（每 N 个 GPTBlock 存一次输入，backward 重算）。
 - 实现：`AttentionBase`/`FeedForward`/`GPTBlock`/`TransformerEncoderLayer` 传播 checkpoint 模式；`Linear/ReLU/GeLU/SwiGLU/LayerNorm/RMSNorm/Softmax/AttentionBase` 在 checkpoint 模式下跳过中间激活缓存写入（forward 改用局部变量承载计算，避免空缓存读取）。
-- 验证：新增 `src/gpt_checkpoint_test.cpp`（`gpt_checkpoint_test`），stride∈{1,2} 与全存基线**逐位一致（max_abs=0）**；`gpt_gradcheck/rmsnorm/swiglu/softmax/attn_gradcheck`、`matmul_fusion_test`、`ce_fusion_test` 全绿；`text_train --checkpoint-every N` CPU 端到端训练正常（loss 正常下降、exit=0）。
+- 验收：`src/gpt_checkpoint_test.cpp`（`gpt_checkpoint_test`）stride∈{1,2} 与全存基线**逐位一致（max_abs=0）**；`gpt_gradcheck/rmsnorm/swiglu/softmax/attn_gradcheck`、`matmul_fusion_test`、`ce_fusion_test` 全绿；`text_train --checkpoint-every N` CPU 端到端训练正常（loss 正常下降、exit=0）。
 
-**L1 续：RLA/RAPT 接入（2026-09-19）**
-- `RAPTBlock` 新增 `forward_recompute` + `activation_cache()`；`RAPTModel` 新增块级检查点/offload/flush 管线（此前 `set_checkpoint_every`/`set_activation_offload`/`set_flush_interval` 对 RAPT 是静默 no-op，而 CLI 会打印"已启用"）。
-- `ReLULinearAttention` 在 checkpoint 模式下跳过全部 7 项 backward 缓存（Qp/Kp/V_re/Q_normed/K_normed/Q_rms_inv/K_rms_inv），并在 `backward` 缺缓存时**硬报错**而非用空/陈旧张量算垃圾梯度；`activation_cache()` 补齐此前遗漏的 4 项（否则 offload 覆盖不全）。
+**L1：RLA/RAPT 接入**
+- `RAPTBlock` 提供 `forward_recompute` + `activation_cache()`；`RAPTModel` 提供块级检查点/offload/flush 管线（`set_checkpoint_every` / `set_activation_offload` / `set_flush_interval`，与 GPT 同档）。
+- `ReLULinearAttention` 在 checkpoint 模式下不写全部 7 项 backward 缓存（Qp/Kp/V_re/Q_normed/K_normed/Q_rms_inv/K_rms_inv），并在 `backward` 缺缓存时**硬报错**而非用空/陈旧张量算垃圾梯度；`activation_cache()` 列出本层全部缓存 + 4 个子层缓存（offload 完整覆盖）。
 - **坑**：复合层重写 `forward_recompute` 必须调用**虚函数** `set_checkpoint_mode`（基类默认实现只改自身标志位，子层不重建缓存；stride>1 时会被上一步的陈旧缓存掩盖，表现为"某些 stride 能过、某些过不了"）。
-- 验证：`src/rapt_checkpoint_test.cpp` 并入 `rapt_test`，stride∈{1,2} 与全存基线**逐位一致（max_abs=0）**；新增 GPU 侧 `rapt_offload_test`（与全存基线逐位一致）。
+- 验收：`src/rapt_checkpoint_test.cpp` 并入 `rapt_test`，stride∈{1,2} 与全存基线**逐位一致（max_abs=0）**；GPU 侧 `rapt_offload_test` 与全存基线逐位一致。
 
-**L2 内存池整块归还 + 统计 — 已实施**
-- `MemoryPool`：新增 `PoolStats` + `pool_debug_stats()`（块数/占用/空闲/碎片）、`release_idle_blocks()`（整块 `vkFreeMemory` + 从 `blocks_` 移除，带 `retain_free_bytes_` 保留阈值防抖动）、`set_retain_free_bytes()`。
-- `GpuBackend::release_idle_pool_blocks()`（先 `flush_pending_destroys()` 再归还）；`ComputeEngine` 新增 `release_idle_pool_blocks()` / `pool_stats()`（CPU no-op；CUDA 已停用）；`GpuEngine` override。
-- 接入：`text_train` 新增 `--checkpoint-every N` 与每 step 末尾 `release_idle_pool_blocks()`（end_batch 提交完成、延迟销毁已 flush 后调用，安全）。
-- 数值/性能回归：仅 GPU 内存管理路径，不影响 CPU 数值；L1 相关 gradcheck 全绿。
+**L2 内存池整块归还 + 统计**
+- `MemoryPool`：`PoolStats` + `pool_debug_stats()`（块数/占用/空闲/碎片）、`release_idle_blocks()`（整块 `vkFreeMemory` + 从 `blocks_` 移除，带 `retain_free_bytes_` 保留阈值防抖动）、`set_retain_free_bytes()`。
+- `GpuBackend::release_idle_pool_blocks()`（先 `flush_pending_destroys()` 再归还）；`ComputeEngine` 提供 `release_idle_pool_blocks()` / `pool_stats()`（CPU 为 no-op）；`GpuEngine` override。
+- 接入：`text_train` 的 `--checkpoint-every N` 与每 step 末尾 `release_idle_pool_blocks()`（end_batch 提交完成、延迟销毁已 flush 后调用，安全）。
+- 回归：仅 GPU 内存管理路径，不影响 CPU 数值；L1 相关 gradcheck 全绿。
 
 **L3（自动融合 + 优化器降内存）— 待立项**
 
@@ -48,9 +48,9 @@
 FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU 启用
 ```
 
-该配置下 **训练峰值显存 ≈ 27 GB**（已含 M5/M6 融合收益），此前 **29 GB**（融合前）。
+该配置下 **训练峰值显存 ≈ 27 GB**（已含 M5/M6 融合收益）。
 
-- 融合（M4/M5/M6）已把**非线性象限**（`seq²` 注意力、`vocab×seq` 全 softmax）从 ~3× 砍到几近为 0。
+- 融合（M4/M5/M6）后，**非线性象限**（`seq²` 注意力、`vocab×seq` 全 softmax）不再物化，≈ 0。
 - 剩余 27 GB 的构成与融合无关，**集中在激活缓存、优化器状态、内存池碎片化三处**。
 
 ### 显存总账（估算，单位 GB）
@@ -61,7 +61,7 @@ FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU �
 | ② | 逐层激活缓存（16 层） | 每层 ~0.4 ≈ **6.4** | ~24% |
 | ③ | seq² 注意力分数/p | 融合已清除，≈ 0 | — |
 | ④ | logits（LM head 输出） | 6×1024×32782×4B ≈ 0.8 | ~3% |
-| ⑤ | 反向临时 + 内存池碎片/不归还 | 其余 | ~59% |
+| ⑤ | 反向临时 + 内存池碎片（step 内不归还） | 其余 | ~59% |
 
 > 注：①≈3.7、②≈6.4、④≈0.8 为**可推导的硬性下限**；⑤ 为反算残差，需实测采样确认真实构成（见"验证与回归"）。
 
@@ -73,7 +73,7 @@ FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU �
 | **L2 回收** | 内存池复用/归还 + 生命周期边界 | ⑤ 中碎片部分，省 ~2-4G | 否（后端内存管理）|
 | **L3 算法** | 自动融合优化（替代手写注意力）+ 优化器降内存 | ③+① 二次缩减 | 否（复用现有自动融合路径）|
 
-优先级按此从 L1 做起，L1/L2 不影响数值正确性与分层铁律，风险最低、收益可立即验证。
+优先级按收益/风险排序：L1/L2 不影响数值正确性与分层铁律，风险最低、收益可立即验证。
 
 ---
 
@@ -81,23 +81,25 @@ FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU �
 
 ### 数值精度
 
-`core_config.hpp` 中 `using Scalar = float`，**本文档数字均为纯 fp32 基线**（立项时口径；v1.2.0 起已引入 f16 混合精度——`Precision`/`PrecisionProfile`，见 05-mixed-precision）。fp32 基线下激活、梯度、权重、优化器态全部 4B。（历史红线"不引入 f16"已随混合精度修订。）
+`core_config.hpp` 中 `using Scalar = float`，**本文档数字均为纯 fp32 基线**（v1.2.0 起另有
+f16 混合精度——`Precision`/`PrecisionProfile`，见 05-mixed-precision；本文档的显存账不适用于 f16 路径）。
+fp32 基线下激活、梯度、权重、优化器态全部 4B。
 
 ### 激活缓存策略（核心问题 L1）
 
 - 层内 forward 为 backward 保留中间结果：如 `compute_layer.hpp` 的 `input_cache_`（Linear）、`sigmoid_cache_`（SiLU）、注意力保留的 Q/K/V 与 norm 输入等。
 - `Model::forward` → `Model::backward`（`model_container.hpp`）是**逐层顺序**执行，层间不丢弃激活。
-- 每层驻留约 8 个 `B·seq·d` 与 2 个 `B·seq·d_ff` 的 fp32 副本（d_ff=4096 每张 100MB 是重要大头），16 层累加 ~6.4G。**本节是 L1 实施前的基线口径（当时无梯度重计算）**——L1 checkpointing 后文已标【已实施】。
+- 每层驻留约 8 个 `B·seq·d` 与 2 个 `B·seq·d_ff` 的 fp32 副本（d_ff=4096 每张 100MB 是重要大头），16 层累加 ~6.4G。**本节是"未启用梯度检查点"时的口径**——启用 L1 checkpoint 后仅存块边界输入（见下文 L1）。
 
-### 内存池碎片化 + 不归还（问题 L2）
+### 内存池碎片化（问题 L2，已由整块归还缓解）
 
-- `backend/compute_memory_pool.hpp` 已实现 **first-fit 子分配 + 相邻 free region 自动前后合并**（O(log n)、O(1) 合并）。
-- 但：**从未将整个空 Block 归还 GPU**（`blocks_.clear()` 仅在析构时触发），block 底材按需 128MB（或超尺寸单块）申请后不回收 ⇒ 峰值生命周期等于整个进程/测试生命周期，碎片与闲置块长期累积。
-- 算子融合文档将"内存池 first-fit 碎片化 + 永不归还"列为**独立跟踪项、不随融合解决**。
+- `backend/compute_memory_pool.hpp`：**first-fit 子分配 + 相邻 free region 自动前后合并**（O(log n)、O(1) 合并）。
+- 整块回收：空闲 Block 可经 `release_idle_blocks()` 整块 `vkFreeMemory` 并移出 `blocks_`（`retain_free_bytes_` 阈值防抖动）；`text_train` 每 step 末尾调用 `release_idle_pool_blocks()`。block 底材按需 128MB（或超尺寸单块）申请。
+- 残余风险：碎片与闲置块在 step 内仍会累积（归还只发生在 step 边界），峰值生命周期仍是"一步之内"。
 
 ### 注意力形态（L3，语义复杂）
 
-原 `batched_matmul_reduce/max → denom → apply` 两趟式 forward 与 `batched_matmul_softmax_backward_q/kv` backward 重算 `W` 方案，已被 IR 融合替代（算子融合文档 S7；**2026-09-23 起 forward 进一步换单 fold kernel**——`FoldSpec` 分块流式，S 在 kernel 内逐块存在、从不落显存，见算子融合文档"关键算法"章状态横幅）。该路径已消除 `BH·seq²` 物化，剩余驻留为逐层 Q/K/V 激活集（属 L1 激活重计算可覆盖范围）。**不手写** flash-attention 类融合 kernel：沿用现有自动融合/算子生成路径（fold 生成器即 AOT 结构驱动生成，非手写 kernel），由 L3 的自动融合优化统一推进。
+注意力 forward 为**单 fold kernel**（`FoldSpec` 分块流式：QKᵀ/掩码/online softmax/ΣwV 逐块完成，S 在 kernel 内逐块存在、从不落显存，见算子融合文档"关键算法"章状态横幅），backward 为 R/X 表达式 + `batched_matmul`。该路径已消除 `BH·seq²` 物化，剩余驻留为逐层 Q/K/V 激活集（属 L1 激活重计算可覆盖范围）。**不手写** flash-attention 类融合 kernel：沿用现有自动融合/算子生成路径（fold 生成器即 AOT 结构驱动生成，非手写 kernel），由 L3 的自动融合优化统一推进。
 
 ### 分布式分片（超长序列，远期）
 
@@ -136,11 +138,11 @@ FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU �
 - **范围**：仅 `backend/compute_memory_pool.hpp` 与 Tensor 分配/销毁路径，不涉及算法。
 - **风险**：低；需 benchmark 分配总时长与碎片比变化。
 
-> **已核对（2026-08-24）**：中间 Tensor 的归还路径是安全的，无需修改即可维持正确性。
+> **内存池复用安全约定（新增原语必须遵守）**：中间 Tensor 的归还路径由以下两点保证正确性：
 > - batch 模式下 `GpuBuffer::~GpuBuffer` **立即 `pool_->free()`**（内存可复用）+ **延迟 `vkDestroyBuffer`**（经 `pending_destroys_` 到 `end_batch` 提交并同步等待后统一销毁），满足 `VUID-vkDestroyBuffer-buffer-00922`。
 > - 安全性由两点保证：① 每个原语 op 录制时都包裹全内存屏障（input: `MEMORY_WRITE→SHADER_READ` + output: `SHADER_WRITE→MEMORY_READ`，src/dstStage 含 COMPUTE），保证 batch 命令缓冲内前序 op 的写入先完成并对后续可见；② 复用只发生在命令缓冲中更靠后的 op，且被复用的 scratch 在读取前总会先被该 op 写满。
-> - 注意：该安全性**依赖每个 op 都插入输出屏障**——新增原语若漏写 output barrier 会重新引入此风险；新增 op 时须照此约定。
-> - 另注意：内存池复用不保证清零，任何"读取前期望为 0"的 op 必须显式 `zero()`（现有模式）。
+> - **该安全性依赖每个 op 都插入输出屏障**——新增原语若漏写 output barrier 会重新引入风险；新增 op 时须照此约定。
+> - 内存池复用不保证清零，任何"读取前期望为 0"的 op 必须显式 `zero()`（现有模式）。
 
 ### L3 — 自动融合优化 + 优化器降内存（远期）
 
@@ -166,7 +168,7 @@ FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU �
 1. **显存采样**：在训练 step 间记录 `pool_stats`（块数/已分配/空闲/碎片比）与 GPU 总占用曲线，标出 step 内峰值出现阶段（forward/backward/optimizer）。
 2. **逐项归因**：跑一次 step，分别关闭激活缓存（假想）、池归还、自动融合，量化每项独立贡献——修正总账的⑤残差。
 3. **数值回归**：`gpt_gradcheck`、`rmsnorm_gradcheck`、`swiglu_gradcheck`、`softmax_gradcheck`、`matmul_fusion_test`、`ce_fusion_test` 保持全绿；训练 loss 曲线与参考一致。
-4. **性能回归**：确认"省显存"未以显著耗时退化为代价（重计算倍率、池复用消耗），用训练 step 耗时采样替代（bench 工具已移除）。
+4. **性能回归**：确认"省显存"未以显著耗时退化为代价（重计算倍率、池复用消耗），用训练 step 耗时采样衡量。
 
 ---
 
@@ -184,10 +186,9 @@ FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU �
 
 ## 落地顺序建议
 
-1. **先 L1（激活重计算）**：纯 Layer/Model 级，不动分层与精度，收益最大、风险最低，立即用 `text_train` + `gpt_gradcheck` 验证。
-2. **再 L2（内存池归还/复用）**：接入统计，确认 ⑤ 真实构成后回收碎片。
-3. 若仍不足 → 立项 **L3（自动融合 + 优化器降内存）** 独立里程碑。
-4. 分布式按需远期推进。
+1. **L1（激活重计算）与 L2（内存池归还/复用）已就位**：验证渠道固定为 `text_train` + `gpt_gradcheck`/`rapt_test` + `pool_stats` 采样。
+2. **下一步 = 立项 L3（自动融合 + 优化器降内存）** 独立里程碑。
+3. 分布式按需远期推进。
 
 ---
 
@@ -195,4 +196,4 @@ FFN 维度 4096 · 序列长度 1024 · 优化器 adamw · 批大小 6 · GPU �
 
 - **不破坏分层铁律**：L1/L2 只在 `Model`/`Layer` 契约与 `backend` 内存管理内实现，`ComputeEngine` 原语与 `expr_dsl` 不动。
 - **不破坏闭合世界/AOT**：L1/L2 不引入新 shader、不删改 `expr_registry`；不在运行期进入"未预生成表达式"分支。
-- **不违背确定性**：全部路径保持定点、可复现；不引入 f16（bf16/fp16）低精度训练。
+- **不违背确定性**：全部路径保持定点、可复现；L1/L2 与精度设置正交（f16 混合精度另行记录在 05-mixed-precision，本文档账目为 fp32 口径）。

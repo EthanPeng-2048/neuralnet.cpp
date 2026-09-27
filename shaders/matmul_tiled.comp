@@ -7,19 +7,20 @@
 //   - transA=0, transB=1: C[M][N] = A[M][K] × B^T[N,K]
 //   - transA=1, transB=1: C[M][N] = A^T[K,M] × B^T[N,K]
 //
-// 优化策略（对比旧标量 4×4 版：内层每 k 8 次标量 LDS + 16 FMA，2:1）：
+// 优化策略：
 //   - WorkGroup：16×16 线程，计算 64×64 输出块（每线程 4×4 元素）
 //   - vec4 共享内存：Ash[k][m]（A 转置）/ Bsh[k][n]，每线程每 k 仅 2 次
-//     vec4 LDS + 16 FMA（8:1 计算:加载比），消除旧版标量读的 bank 冲突
+//     vec4 LDS + 16 FMA（8:1 计算:加载比），vec4 读沿 lane 连续、消除
+//     标量读的 bank 冲突
 //   - vec4 累加器：acc[4]（4×4 = 16 个累加值），寄存器常驻
 //
-// v2（双缓冲流水，BK=16）：Ash/Bsh 各分 2 个 stage，tile t+1 的全局加载与
-//   tile t 的计算并行发射；每 tile 的 barrier 由 2 次减为 1 次，全局内存
-//   延迟（~600 周期）被计算覆盖。共享内存总计 16KB
-//   （Ash[2][16][16]vec4 8KB + Bsh 8KB）——与单缓冲 BK=32 版相同的占用率；
-//   BK=32 双缓冲需 32KB，会砍半 blocks/SM 抵消流水收益（实测净 0）。
+// 双缓冲流水（BK=16）：Ash/Bsh 各分 2 个 stage，tile t+1 的全局加载与
+//   tile t 的计算并行发射；每 tile 仅 1 次 barrier，全局内存延迟
+//   （~600 周期）被计算覆盖。共享内存总计 16KB（Ash[2][16][16]vec4 8KB
+//   + Bsh 8KB），占用率与单缓冲 BK=32 相同（32KB 变体的实测代价见下方
+//   BK 常量注释）。
 //
-// v3（vec4 全局加载/写出，借鉴 ggml mul_mm 的 ALIGNED/LOAD_VEC 快路径）：
+// vec4 全局加载/写出（借鉴 ggml mul_mm 的 ALIGNED/LOAD_VEC 快路径）：
 //   - 每线程 EPT 个元素按「转置形态选连续维」分组，对齐时一条 vec4 全局
 //     访问替代 4 次标量 + 逐元素边界判断；形状条件为 uniform 分支零开销
 //   - 对齐条件（元素下标 %4==0 且组内连续 ⇔）：
@@ -35,7 +36,8 @@
 #version 450
 
 // ── 精度变体（编译期开关：glslc -DNN_SHADER_F16=1）────────────────────────
-// 默认（无宏）= 全 f32，**f32 分支文本逐字未改**（零回归）。
+// 默认（无宏）= 全 f32（f32 分支宏展开与裸写 f32 代码逐字同形 →
+//   SPIR-V 字节零差异）。
 // 带宏 = f16 存储变体：缓冲声明 float16_t（GL_EXT_shader_16bit_storage），
 //   别名槽改 uvec2（4×half = 8B，std430 步长恰好 8）→ unpackHalf2x16 解出
 //   vec4；全局读处统一 float(...) 转 f32、写出处统一 float16_t(...)。
@@ -82,11 +84,10 @@ layout(push_constant) uniform PushConstants {
 // 分块维度常量
 const uint BM = 64u;  // 输出块行数
 const uint BN = 64u;  // 输出块列数
-// BK=16 + 双缓冲（2026-09-24 OP/融合统一 A/B 定案）：Ash[2][16][16]vec4
-//   8KB + Bsh 8KB = 16KB 共享。曾试与融合侧同参 BK=32 (32KB)：OP 级四点
-//   **全回退**（512³ +9%、1024³ +26%、4096³ +29%、batched b8 +29%，
-//   3 样本 best）——32KB 每 SM 只驻 2 个 WG，浅深网格都被占用率卡死；
-//   OP 级恒取 16（下轮再统一须四点复测）。
+// BK=16 + 双缓冲：Ash[2][16][16]vec4 8KB + Bsh 8KB = 16KB 共享，保占用率
+//   （BK=32 双缓冲需 32KB，每 SM 只驻 2 个 WG，浅深网格都被占用率卡死——
+//   四点实测全回退：512³ +9%、1024³ +26%、4096³ +29%、batched b8 +29%，
+//   3 样本 best）；OP 级恒取 16，改 BK 前须四点复测。
 const uint BK = 16u; // K 维度分块宽度
 
 // 每线程协作加载元素数（BM*BK/256）。下方按 4 元素组取 groups=EPT/4 →
@@ -253,7 +254,7 @@ void main()
     barrier();
 
     // ── 流水循环：发射 tile t+1 的加载（stage^1），同时计算 tile t ────
-    //   每 tile 仅 1 次 barrier（旧版 2 次）；barrier 同时保证
+    //   每 tile 仅 1 次 barrier；barrier 同时保证
     //   ① tile t+1 的全局加载在下一迭代被读取前完成
     //   ② tile t 的计算在 stage^1 被覆盖前完成（与 ①天然错开 stage）
     uint stage = 0u;

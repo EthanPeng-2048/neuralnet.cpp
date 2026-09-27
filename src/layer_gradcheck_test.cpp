@@ -6,7 +6,7 @@
 #include <cstdio>
 #include <iostream>
 
-// ── conv2d_gradcheck（独立参考实现比对；Conv2D 此前无任何覆盖）─────────────
+// ── conv2d_gradcheck（独立参考实现比对）────────────────────────────────────
 #define main test_conv2d_gradcheck
 #define max_abs_diff max_abs_diff_conv2d
 #include "conv2d_gradcheck.cpp"

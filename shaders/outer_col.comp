@@ -6,12 +6,24 @@
 // 输出 (B*H*dk², seq)；扁平并行，无 shared memory。
 // ─────────────────────────────────────────────────────────────────────
 #version 450
+// -DNN_SHADER_F16=1 → f16 存储变体（Phase C2f：输入输出均 half、乘积在
+//   f32 完成后落回；仅需 storageBuffer16BitAccess）。
+#if defined(NN_SHADER_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#define NN_ETYPE float16_t
+#define NN_RD(x) float(x)
+#define NN_WR(x) float16_t(x)
+#else
+#define NN_ETYPE float
+#define NN_RD(x) (x)
+#define NN_WR(x) (x)
+#endif
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly  buffer BufP   { float P[]; };
-layout(std430, binding = 1) readonly  buffer BufR   { float R[]; };
-layout(std430, binding = 2) readonly  buffer BufS   { float S[]; };
-layout(std430, binding = 3) writeonly buffer BufOut { float Out[]; };
+layout(std430, binding = 0) readonly  buffer BufP   { NN_ETYPE P[]; };
+layout(std430, binding = 1) readonly  buffer BufR   { NN_ETYPE R[]; };
+layout(std430, binding = 2) readonly  buffer BufS   { NN_ETYPE S[]; };
+layout(std430, binding = 3) writeonly buffer BufOut { NN_ETYPE Out[]; };
 
 layout(push_constant) uniform Push {
     uint dk, seq, rows, has_scale;
@@ -29,6 +41,6 @@ void main() {
     const uint c  = rem % dk;
     const uint r0 = bh * dk;
 
-    const float p = P[(r0 + a) * seq + t] * R[(r0 + c) * seq + t];
-    Out[idx] = (has_scale == 1u) ? (p * S[r0 * seq + t]) : p;
+    const float p = NN_RD(P[(r0 + a) * seq + t]) * NN_RD(R[(r0 + c) * seq + t]);
+    Out[idx] = NN_WR((has_scale == 1u) ? (p * NN_RD(S[r0 * seq + t])) : p);
 }

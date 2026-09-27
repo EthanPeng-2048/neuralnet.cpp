@@ -1,12 +1,12 @@
 // ── MaxPool2D 正确性检查（独立参考实现比对）───────────────────────────────
 //
-// 目的：MaxPool2D 此前**没有任何测试覆盖**（Conv2D 由 conv2d_gradcheck 覆盖）。
-//       本片段把层实现与一份独立写法的窗口 max + argmax 散射逐元素比对，覆盖：
+// 目的：把层实现与一份独立写法的窗口 max + argmax 散射逐元素比对，覆盖：
 //         forward : 每窗口取 max
 //         backward: 梯度散射回 argmax（窗口重叠时在同一位置累加）
-//       并覆盖两条防御性契约（修复前的两个静默失效点）：
-//         ① clear_cache() 后直接 backward 必须报错 —— 旧行为是越界读空 vector
-//            （UB；因 vector::clear() 保留容量，表现为"静默沿用陈旧索引"不报错）
+//       并覆盖两条防御性契约（不显式断言就会静默通过的陷阱）：
+//         ① clear_cache() 后直接 backward 必须报错 —— 缓存为空时不得读取；
+//            警告：vector::clear() 保留容量，越界读未必崩溃（表现为"静默
+//            沿用陈旧索引"而不报错），只有断言"必须报错"才抓得住
 //         ② checkpoint 模式 forward 不驻留 argmax → backward 必须报错；
 //            先 forward_recompute 重建缓存后必须与参考一致
 //

@@ -26,9 +26,8 @@
 namespace nn
 {
     // ── 简易线程池（latch 零分配设计）──────────────────────────────────────
-    // 核心改进：将原来的 "N 次 submit + N 个 future + N 次加锁" 替换为
-    //   "1 次批量入队 + 1 个原子计数器 + 调用者参与处理"
-    // 消除每分块一次 shared_ptr<packaged_task> 堆分配和 future 同步开销
+    // 提交模型：1 次批量入队 + 1 个原子计数器 + 调用者参与处理，
+    //   每分块零次 shared_ptr<packaged_task> 堆分配、零次 future 同步开销。
     class ThreadPool
     {
     private:
@@ -74,15 +73,15 @@ namespace nn
             }
         }
 
-        // ── 通用单任务提交（submit）已删除：全库无调用方（审查 P1-3），
-        //    且每次调用 make_shared<packaged_task> 堆分配，违背本池
-        //    "零分配 latch" 设计。需要 future 语义时应在调用方分块后
-        //    用 parallel_* 系列原语。 ──────────────────────────────────
+        // ── 提交模型只有分块原语：本池是"零分配 latch"设计，不提供单任务
+        //    submit（其每次调用需 make_shared<packaged_task> 堆分配）。
+        //    需要 future 语义时应在调用方分块后用 parallel_* 系列原语。 ───
 
     private:
         // ── 分块辅助：计算合理的分块数 ──────────────────────────────────
         // 每分块至少 1024 个元素（Scalar=float 时约 4 KB），可装入 L1 缓存。
-        // 4096→1024：降低阈值使 MNIST 小隐藏层（64×batch）也能触发多核并行。
+        // 下限取 1024（而非更大值）：使 MNIST 小隐藏层（64×batch）也能
+        // 分出多个分块、触发多核并行。
         [[nodiscard]] std::size_t chunk_count(std::size_t total) const noexcept
         {
             constexpr std::size_t MIN_CHUNK = 1024;
@@ -98,12 +97,12 @@ namespace nn
         // condition_ 上，latch 归零必须通知，否则等待者会永久睡眠。
         // 用 notify_all：等待者可能同时包含调用者与空闲 worker。
         //
-        // ⚠ 必须持 queue_mutex_ 再 notify（丢唤醒 / lost wakeup 修复）：
+        // ⚠ 必须持 queue_mutex_ 再 notify（否则丢唤醒 / lost wakeup）：
         // wait_for_latch 用 wait(lock, [&]{ return latch == 0; }) 等待，谓词
         // 在同一把锁下求值。若归零+notify 不持锁，就会出现
         //   等待者判谓词=false → 通知者置零并 notify（此刻无注册等待者，信号丢失）
         //   → 等待者真正进入 wait() → 永久阻塞
-        // 空并行区压测（build/perfprobe/probe_pool2.cpp，32 核）实测：不持锁
+        // 空并行区压测（32 核）实测：不持锁
         // 数万次 region 内必死锁；持锁后 3×50000 次稳定通过。
         void finish_chunk(std::atomic<int>& latch) noexcept
         {
@@ -115,14 +114,12 @@ namespace nn
         }
 
         // ── work-stealing 等待：调用者不空转，帮忙处理队列任务 ─────────
-        // 优化（依据性能审查报告）：
-        //   - 旧实现：spin 64 次 + yield，64 次 spin 中反复原子读取消耗电量
-        //     CPU 占用率显示 100% 但实际有效计算比例低（调用者空转）
-        //   - 新实现：
-        //     1) 短自旋（16 次 pause）快速检测 latch 归零——典型情况无 yield 开销
-        //     2) 自旋失败后 work-steal：尝试从队列取任务执行（参与计算）
-        //     3) 队列为空时阻塞等待 condition_variable（无超时轮询），
-        //        由 finish_chunk 在 latch 归零时通知唤醒
+        // 等待分三阶段（依据实测：长时间自旋反复原子读取，CPU 占用率显示
+        // 100% 但实际有效计算比例低，纯自旋/空转不可取）：
+        //   1) 短自旋（16 次 pause）快速检测 latch 归零——典型情况无 yield 开销
+        //   2) 自旋失败后 work-steal：尝试从队列取任务执行（参与计算）
+        //   3) 队列为空时阻塞等待 condition_variable（无超时轮询），
+        //      由 finish_chunk 在 latch 归零时通知唤醒
         // 线程索引约定：调用者线程帮忙执行偷来的任务时，临时将
         // tl_worker_index 置为 workers_.size()（调用者 slot），避免
         // parallel_for_each_indexed 的任务体与 worker 0 撞同一 slot；
@@ -184,7 +181,7 @@ namespace nn
 
     public:
         // ── 并行 for_each（latch + 调用者参与） ─────────────────────────
-        // 与旧版相比：零 future 分配、一次加锁入队、调用者不空等
+        // 特点：零 future 分配、一次加锁入队、调用者不空等
         template<typename Iterator, typename Func>
         void parallel_for_each(Iterator first, Iterator last, Func&& func)
         {
@@ -538,21 +535,21 @@ namespace nn
 
         // ── 归约分块（确定性契约，铁律 8）──────────────────────────────────
         // 分段边界必须**只由 total 决定**，与 worker 数 / 机器核数无关：
-        // 旧实现 n_chunks = chunk_count(total) 依赖 workers_.size()，
-        // 同一输入在 1-worker 与 N-worker 下走不同折叠结构 → 浮点非结合律
-        // 导致字节不一致（跨机也不一致）。修复后 1-worker 与 N-worker、
+        // 浮点加法非结合律使求和顺序直接决定字节结果，若分段依赖
+        // workers_.size()，同一输入在 1-worker 与 N-worker 下会走不同折叠
+        // 结构 → 字节不一致（跨机也不一致）。因此 1-worker 与 N-worker、
         // 任何机器都走完全相同的分段，部分和按**固定块下标**存放与合并，
         // 线程只决定"谁算哪块"，不参与边界与合并顺序。
         //
         // 借鉴 ATen::parallel_reduce（torch/include/ATen/Parallel-inl.h）：
         // 其部分和按 results[tid] 存放、边界由 get_num_threads() 决定 →
         // 跨线程数不可复现（PyTorch 亦声明 CPU 归约不保证跨线程数一致）；
-        // 本库铁律 8 要求逐字节一致，故与 ATen 反向：边界固定、弃用
+        // 本库铁律 8 要求逐字节一致，故与 ATen 反向：边界固定、不用
         // per-thread 部分和下标。
         //
         // 分段语义（串/并行共用的唯一定义）：
         //   块 0 以 init 为种子，块 c>0 以块内首元素为种子（init 恰好计入
-        //   一次，旧实现每块都加 init、合并时再加一次，init≠0 时数学错误）；
+        //   一次——若每块各加 init、合并时再加一次，init≠0 时结果错误）；
         //   块内从左到右折叠；结果按块下标升序合并。
         //   n_chunks==1 时退化为纯左折叠，与 n < PARALLEL_THRESHOLD 的
         //   串行路径（core_config::transform_reduce）逐字节一致。

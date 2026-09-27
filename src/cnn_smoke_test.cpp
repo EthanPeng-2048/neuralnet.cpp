@@ -1,8 +1,7 @@
 // ── CNN 端到端冒烟 + 规格往返（LeNet 风格，Conv2D + MaxPool2D + Linear）────
 //
-// 目的：CNN 此前只有单层 Conv2D 参考比对（conv2d_gradcheck），**没有端到端覆盖**
-//       ——最大池化的反向、以及整链 forward/backward/optimizer 只能靠手工跑
-//       `mnist_train --arch cnn` 验证。本片段补上：
+// 目的：CNN 端到端验证。单层参考比对（conv2d_gradcheck / maxpool_gradcheck）
+//       不覆盖规格序列化、层组成与整链 forward/backward/optimizer，本片段验证：
 //         1. make_cnn_spec / build_cnn_model_from_spec / spec_matches /
 //            cnn_config_from_spec 规格往返
 //         2. 层组成核对（Conv2D / MaxPool2D / Linear 都真的在模型里）

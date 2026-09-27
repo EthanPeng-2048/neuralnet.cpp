@@ -9,8 +9,8 @@
 //   3. 开启 offload：重跑 forward（记 logits）→ zero → backward，与基线逐张量对比。
 //
 // 与 gpt_offload_test 的差异：RLA 的 backward 缓存比 GPT 多（RMSNorm 后 Q/K、
-// 逐头 1/rms），且此前不在 activation_cache() 内——本测试覆盖补齐后的
-// 导出/恢复集合是否完整（缺一项就会在 backward 报缓存缺失或数值不一致）。
+// 逐头 1/rms）——本测试核对这些缓存全部在 activation_cache() 的导出/恢复集合内
+// （缺一项就会在 backward 报缓存缺失或数值不一致）。
 //
 // 用法：rapt_offload_test（无 Vulkan / 无可用设备 → 返回 77 = ctest SKIP）
 // ───────────────────────────────────────────────────────────────────────────

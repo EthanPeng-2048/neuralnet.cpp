@@ -12,17 +12,13 @@
 //   transB=0: B_b 为 (K, N)，B_b[k][n] = B[b*K*N + k*N + n]
 //   transB=1: B_b 存储为 (N, K) 按 B_b^T 使用，B_b[k][n] = B[b*K*N + n*K + k]
 //
-// ── 与 matmul_tiled.comp 同配方（v3 移植，2026-09-24）─────────────────────
-// 本 shader 长期停留在最初的标量 4×4 版（每 k 8 次标量 LDS + 每 tile 2 次
-// barrier + 标量全局访问带逐元素 /,% 与边界分支），而 matmul_tiled 已演进到
-// v3 —— 同形状下 batched 比 matmul 慢 1.85×（1024³ 实测 1.51 vs 0.81ms）。
-// 移植的三重配方（逐项与旧版的差异）：
+// ── 与 matmul_tiled.comp 同配方 ────────────────────────────────────────────
 //   ① vec4 共享 Ash[k][m]/Bsh[k][n]：每线程每 k 仅 2 次 vec4 LDS + 16 FMA
-//      （8:1 计算:加载比，旧版标量 2:1）
+//      （8:1 计算:加载比）
 //   ② BK=16 双缓冲：tile t+1 的全局加载与 tile t 的计算并行发射，每 tile
-//      barrier 2→1 次，全局延迟（~600 周期）被计算覆盖
+//      仅 1 次 barrier，全局延迟（~600 周期）被计算覆盖
 //   ③ vec4 全局快路径：按转置形态选连续维分组，对齐时整组一条 vec4 访问
-//      （旧版每元素 1 次标量 ldg/stg + /,% + 边界判断）
+//      （免逐元素 /,% 与边界判断）
 //
 // vec4 对齐条件（含 batch 基址 b*step：step%4==0 由下列条件蕴含）：
 //   A: transA=0 需 K%4==0（step=M*K ⇒ K%4⇒step%4）；transA=1 需 M%4==0
@@ -45,7 +41,8 @@
 #version 450
 
 // ── 精度变体（编译期开关：glslc -DNN_SHADER_F16=1）────────────────────────
-// 默认（无宏）= 全 f32，**下方 f32 分支文本逐字未改**（零回归）。
+// 默认（无宏）= 全 f32（f32 分支宏展开与裸写 f32 代码逐字同形 →
+// SPIR-V 字节零差异）。
 // 带宏 = f16 存储变体：缓冲声明 float16_t（GL_EXT_shader_16bit_storage），
 //   别名槽改 uvec2（4×half = 8B，std430 步长恰好 8）→ unpackHalf2x16 解出
 //   vec4；全局读处统一 float(...) 转 f32、写出处统一 float16_t(...)。
@@ -90,8 +87,8 @@ layout(push_constant) uniform PushConstants {
     float alpha; // 输出缩放系数：C_b = alpha * op(A_b, B_b)
 };
 
-// 分块维度常量（与 matmul_tiled 保持同步；2026-09-24 OP/融合统一 A/B：
-// OP 级 BK=32 四点全回退 → 定案 BK=16 双缓冲 16KB）
+// 分块维度常量（与 matmul_tiled 同步）：BK=16 双缓冲，16KB 共享保占用率
+// （BK=32 变体四点实测回退，数据见 matmul_tiled 的 BK 常量注释）
 const uint BM = 64u;
 const uint BN = 64u;
 const uint BK = 16u;

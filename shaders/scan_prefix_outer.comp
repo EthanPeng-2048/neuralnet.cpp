@@ -5,16 +5,30 @@
 // 1 workgroup/头，256 线程；A/B 驻 shared 64×65×2≈33.3KB ≤ 850M 48KB
 // ──────────────────────────────────────────────────────────────────────
 #version 450
+// -DNN_SHADER_F16=1 → f16 存储变体（Phase C2f：RLA 扫描原语，输入输出均
+//   half——输出 (B*H*5*dk, seq) 全尺寸，f16 落回即消灭适配层全尺寸 f32
+//   副本；shared/累加算术保持 float，读处 NN_RD 显式转、写处 NN_WR 落回。
+//   仅需 storageBuffer16BitAccess）。
+#if defined(NN_SHADER_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#define NN_ETYPE float16_t
+#define NN_RD(x) float(x)
+#define NN_WR(x) float16_t(x)
+#else
+#define NN_ETYPE float
+#define NN_RD(x) (x)
+#define NN_WR(x) (x)
+#endif
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly  buffer BufK  { float K[]; };
-layout(std430, binding = 1) readonly  buffer BufV  { float V[]; };
-layout(std430, binding = 2) readonly  buffer BufP  { float P[]; };
-layout(std430, binding = 3) readonly  buffer BufR  { float R[]; };
-layout(std430, binding = 4) readonly  buffer BufA0 { float A0[]; };
-layout(std430, binding = 5) readonly  buffer BufB0 { float B0[]; };
-layout(std430, binding = 6) readonly  buffer BufBnd{ float Bnd[]; };
-layout(std430, binding = 7) writeonly buffer BufOut{ float Out[]; };
+layout(std430, binding = 0) readonly  buffer BufK  { NN_ETYPE K[]; };
+layout(std430, binding = 1) readonly  buffer BufV  { NN_ETYPE V[]; };
+layout(std430, binding = 2) readonly  buffer BufP  { NN_ETYPE P[]; };
+layout(std430, binding = 3) readonly  buffer BufR  { NN_ETYPE R[]; };
+layout(std430, binding = 4) readonly  buffer BufA0 { NN_ETYPE A0[]; };
+layout(std430, binding = 5) readonly  buffer BufB0 { NN_ETYPE B0[]; };
+layout(std430, binding = 6) readonly  buffer BufBnd{ NN_ETYPE Bnd[]; };
+layout(std430, binding = 7) writeonly buffer BufOut{ NN_ETYPE Out[]; };
 
 layout(push_constant) uniform Push {
     uint dk, heads, seq, causal, has_state, has_bnd, rows;
@@ -38,8 +52,8 @@ void main() {
         float va = 0.0, vb = 0.0;
         if (has_state == 1u) {
             const uint sr = h * dk + a;
-            va = A0[sr * dk + c];
-            vb = B0[sr * dk + c];
+            va = NN_RD(A0[sr * dk + c]);
+            vb = NN_RD(B0[sr * dk + c]);
         }
         sA[a][c] = va;
         sB[a][c] = vb;
@@ -50,8 +64,8 @@ void main() {
     if (causal == 0u) {
         for (uint t = 0u; t < seq; ++t) {
             if (tid < dk) {
-                s_kv[tid] = K[(r0 + tid) * seq + t];
-                s_vv[tid] = V[(r0 + tid) * seq + t];
+                s_kv[tid] = NN_RD(K[(r0 + tid) * seq + t]);
+                s_vv[tid] = NN_RD(V[(r0 + tid) * seq + t]);
             }
             barrier();
             for (uint idx = tid; idx < dk * dk; idx += 256u) {
@@ -66,16 +80,16 @@ void main() {
     // 3) 逐 t 顺序扫描 + 读出
     for (uint t = 0u; t < seq; ++t) {
         if (tid < dk) {
-            s_qv[tid] = P[(r0 + tid) * seq + t];
-            s_kv[tid] = K[(r0 + tid) * seq + t];
-            s_vv[tid] = V[(r0 + tid) * seq + t];
+            s_qv[tid] = NN_RD(P[(r0 + tid) * seq + t]);
+            s_kv[tid] = NN_RD(K[(r0 + tid) * seq + t]);
+            s_vv[tid] = NN_RD(V[(r0 + tid) * seq + t]);
         }
         barrier();
 
         if (causal == 1u) {
             uint reset = 0u;
             if (has_bnd == 1u)
-                reset = (Bnd[b * seq + t] != 0.0) ? 1u : 0u;
+                reset = (NN_RD(Bnd[b * seq + t]) != 0.0) ? 1u : 0u;
             for (uint idx = tid; idx < dk * dk; idx += 256u) {
                 const uint a = idx / dk, c = idx % dk;
                 if (reset == 1u) { sA[a][c] = 0.0; sB[a][c] = 0.0; }
@@ -101,24 +115,24 @@ void main() {
             float s = 0.0;
             for (uint j = 0u; j < dk; ++j)
                 s += s_qv[j] * s_Aq[j];
-            Out[(r0 + tid) * seq + t]              = s_num[tid]; // [0) B·P
-            Out[(rows + r0 + tid) * seq + t]        = s_Aq[tid]; // [1) A·P
-            Out[(3u * rows + r0 + tid) * seq + t]   = s;         // [3) s
+            Out[(r0 + tid) * seq + t]              = NN_WR(s_num[tid]); // [0) B·P
+            Out[(rows + r0 + tid) * seq + t]        = NN_WR(s_Aq[tid]); // [1) A·P
+            Out[(3u * rows + r0 + tid) * seq + t]   = NN_WR(s);         // [3) s
         }
         // [2) B^T·R
         if (tid < dk) {
             float acc = 0.0;
             for (uint i = 0u; i < dk; ++i)
-                acc += sB[i][tid] * R[(r0 + i) * seq + t];
-            Out[(2u * rows + r0 + tid) * seq + t] = acc;
+                acc += sB[i][tid] * NN_RD(R[(r0 + i) * seq + t]);
+            Out[(2u * rows + r0 + tid) * seq + t] = NN_WR(acc);
         }
         // [4) r = R·(B·P)，标量，线程 0 写全部行
         if (tid == 0u) {
             float r = 0.0;
             for (uint j = 0u; j < dk; ++j)
-                r += R[(r0 + j) * seq + t] * s_num[j];
+                r += NN_RD(R[(r0 + j) * seq + t]) * s_num[j];
             for (uint i = 0u; i < dk; ++i)
-                Out[(4u * rows + r0 + i) * seq + t] = r;
+                Out[(4u * rows + r0 + i) * seq + t] = NN_WR(r);
         }
         barrier();
     }

@@ -56,7 +56,7 @@ public:
         Matrix b_cpu(out_features_, 1);  // 零初始化
 
         // ── 通过 engine 上传到目标设备（精度 = p_.param，§9.2）──────────────
-        // 全 F32 配置下与迁移前逐字节一致（零回归）；f16 配置 = 权重存储减半
+        // f16 配置 = 权重按 p_.param 舍入存储（体积减半）；f32 配置保持原值
         auto w_res = engine.from_matrix(w_cpu, p_.param);
         if (!w_res) return std::unexpected(w_res.error());
         w_ = std::move(*w_res);
@@ -105,9 +105,13 @@ public:
         if (!checkpoint_mode_)
             input_cache_ = input;
 
-        // 计算精度 = p_.compute（引擎内部处理 matmul + broadcast bias 的精度：
-        // f16 存储经 PrecisionEngine 边界 cast 走 f32 GEMM）
-        return engine.matmul_with_bias(w_, input, b_, false, false, p_.compute);
+        // 计算精度 = p_.compute。Layer 直写该表达式：matmul 段 + row_broadcast
+        // bias 融合为单 kernel（与 engine.matmul_with_bias 的 DSL 融合结构一致，
+        // 见 compute_cpu_engine.hpp）；f16 存储经 PrecisionEngine eval_expr 路径
+        // （边界 cast 或 in-kernel f16 变体，内部按 f32 计算、输出按目标精度舍入）。
+        return dsl::compute(engine,
+            dsl::matmul(w_, input, false, false) + dsl::row_broadcast(b_),
+            w_.rows(), input.cols(), p_.compute);
     }
 
     // ── backward: 同样简洁，精度由引擎处理 ────────────────────────────
@@ -119,7 +123,11 @@ public:
 
         // 计算精度 = p_.compute（in-place 累加的目标精度 = grad_w_ 的存储精度，
         // compute_into 无需 P：§8.3 in-place 存储精度不可变）
-        auto grad_input = engine.matmul(w_, grad_output, true, false, p_.compute);
+        // grad_input = W^T × grad_output：纯 matmul 段（无尾链），由 dsl::compute
+        // 直写（scan 的 Linear backward dry-run 自动登记该结构）。
+        auto grad_input = dsl::compute(engine,
+            dsl::matmul(w_, grad_output, true, false),
+            w_.cols(), grad_output.cols(), p_.compute);
         if (!grad_input) return std::unexpected(grad_input.error());
         nn_dbg_scan("lin.grad_out", engine, grad_output);
         nn_dbg_scan("lin.cache", engine, input_cache_);
@@ -128,8 +136,8 @@ public:
         nn_dbg_scan("lin.grad_in", engine, *grad_input);
 
         // grad_w += grad_output × input^T：matmul 段与累加**融合为单次 dispatch**
-        // 并原地写入 grad_w_（GPU 上 1 个融合 kernel：不物化 gw (out,in)，也不额外
-        // 分配输出缓冲；取代 matmul + accumulate 两次 dispatch）。
+        // 并原地写入 grad_w_（GPU 上 1 个融合 kernel：不物化 gw (out,in)，
+        // 也不额外分配输出缓冲）。
         // k（求和维度 = batch 大小）是形状参数，不进 key → 同一 shader 适配任意 batch。
         auto grad_w_acc = dsl::compute_into(engine,
             dsl::leaf(grad_w_) + dsl::matmul(grad_output, input_cache_, false, true),
@@ -138,14 +146,19 @@ public:
         nn_dbg_scan("lin.grad_w(post-accum)", engine, grad_w_);
 
         // grad_b += Σ grad_output（行归约，默认 f32）
-        // 注：此项**无法**并入表达式——归约向量输出契约要求输出链只经归约/
-        // 广播视图访问输入，而此处必须同时引用外部累加张量 grad_b_（Linear
-        // 视图），两者的语义冲突（见 eval_expr_reduce 的前置校验）。故保留
-        // "归约原语 + 累加原语"两步。
-        auto gb = engine.row_reduce_sum(grad_output, p_.compute);
+        // 注：归约与累加**无法并入同一表达式**——归约向量输出契约要求输出链
+        // 只经归约/广播视图访问输入，而此处必须同时引用外部累加张量 grad_b_
+        // （Linear 视图），两者的语义冲突（见 eval_expr_reduce 的前置校验）。
+        // 故保留"归约 + 累加"两步：累加步用 dsl::compute_into（原地 dst += src，
+        // f16 src 由叶子精度签名处理），归约步用 dsl::compute_reduce（输出
+        // (out,1) 归约向量同形）。
+        auto gb = dsl::compute_reduce(engine,
+            dsl::row_reduce_sum(dsl::leaf(grad_output)),
+            grad_output.rows(), grad_output.cols(), p_.compute);
         if (!gb) return std::unexpected(gb.error());
         nn_dbg_scan("lin.row_sum(grad_out)", engine, *gb);
-        auto r2 = engine.accumulate(grad_b_, *gb);
+        auto r2 = dsl::compute_into(engine,
+            dsl::leaf(grad_b_) + dsl::leaf(*gb), grad_b_);
         if (!r2) return std::unexpected(r2.error());
         nn_dbg_scan("lin.grad_b(post-accum)", engine, grad_b_);
 
@@ -276,8 +289,7 @@ public:
 //
 // 算法（只在此处，不在 Engine/Shader）：
 //   forward:  输入 (2*d_ff, batch)，前 d_ff 行为 gate，后 d_ff 行为 up
-//             gate = slice_rows(x, 0, d_ff)
-//             up   = slice_rows(x, d_ff, d_ff)
+//             gate/up 经 row_access 行视图读取（零拷贝，不物化半张量）
 //             sw = SiLU(gate) = gate * sigmoid(gate)
 //             out = sw ⊙ up                       → (d_ff, batch)
 //   backward: grad_up   = grad_out ⊙ sw
@@ -288,7 +300,7 @@ public:
 // 原语分解（Engine/Shader 只知道标量原语）：
 //   SiLU forward:  Neg → Exp → Add(1) → Div(1/x) → Mul(x*s)
 //   SiLU backward: Sub → Mul → Mul → Add → Mul
-//   split/merge 用 slice_rows / insert_rows
+//   split/merge：gate/up/s 经 RowAccess 行视图定位，两半由 select 一次写出
 // ══════════════════════════════════════════════════════════════════════════
 class SwiGLU final : public Layer
 {
@@ -315,7 +327,7 @@ public:
     // ── forward: out = SiLU(gate) ⊙ up = gate·σ(gate)·up ────────────────────
     // 单表达式 DSL 融合：gate/up 用 RowAccess 行视图读取同一 (2*d_ff, batch)
     // 输入（gate = row_access(in, 0, d_ff)，up = row_access(in, d_ff, d_ff)），
-    // 不再 slice_rows 物化半张量 → 消去 2 次 D2D 拷贝。输出 (d_ff, batch)。
+    // 行视图零拷贝、不物化半张量（无 D2D 拷贝）。输出 (d_ff, batch)。
     [[nodiscard]] Result<Tensor> forward(
         ComputeEngine& engine, const Tensor& input) override
     {
@@ -332,7 +344,7 @@ public:
             d_ff_, cols, p_.compute);
     }
 
-    // ── backward: 单 kernel 融合，消去 create+zero+2×insert_rows ──────────
+    // ── backward: 单表达式融合，直接写出整张 grad_input (2*d_ff, batch) ──────
     //
     // 数学：
     //   s(node)     = σ(gate[node])
@@ -461,7 +473,7 @@ public:
     }
 
     // ── forward ───────────────────────────────────────────────────────────
-    // M3 融合（算法公式不变，diff_sq (F,B) 由归约 kernel 内部消解）：
+    // 单表达式融合（算法公式不变，diff_sq (F,B) 由归约 kernel 内部消解）：
     //   融合表达式保持 F 无关结构（不含 1/F、ε 常量）；形状相关标量在
     //   (1,B) 小向量上用引擎原语施加：
     //   1. mean_raw = col_reduce_sum(x)                    → (1,B) 归约向量输出
@@ -538,7 +550,7 @@ public:
     //   mean_gn = col_reduce_sum(gy * normalized) * invF
     // grad_gamma += row_sum(gy ⊙ normalized)
     // grad_beta  += row_sum(grad_out)
-    // M3 融合（融合表达式 F 无关，1/F 在 (1,B) 上用原语施加）：
+    // 单表达式融合（融合表达式 F 无关，1/F 在 (1,B) 上用原语施加）：
     //   mean_g/mean_gn 为列归约向量输出；(F,B) 全尺寸中间量由融合 kernel 消解。
     [[nodiscard]] Result<Tensor> backward(
         ComputeEngine& engine, const Tensor& grad_output) override
@@ -677,7 +689,7 @@ public:
     }
 
     // ── forward ───────────────────────────────────────────────────────────
-    // M3 融合（算法公式不变，中间 x_sq (F,B) 由归约 kernel 内部消解）：
+    // 单表达式融合（算法公式不变，中间 x_sq (F,B) 由归约 kernel 内部消解）：
     //   融合表达式保持 F 无关结构（不含 1/F、ε 常量，避免闭合世界 key 随
     //   归一化维度漂移）；形状相关标量在 (1,B) 小向量上用引擎原语施加：
     //   1. s_raw  = col_reduce_sum(x*x)                    → (1,B) 归约向量输出
@@ -725,7 +737,7 @@ public:
     }
 
     // ── backward ──────────────────────────────────────────────────────────
-    // M3 融合（融合表达式 F 无关，1/F 在 (1,B) 小向量上用原语施加）：
+    // 单表达式融合（融合表达式 F 无关，1/F 在 (1,B) 小向量上用原语施加）：
     //   gy       = grad * gamma
     //   m_raw    = col_reduce_sum(gy ⊙ normed)             → (1,B) 归约向量输出
     //   m        = m_raw * (1/F)
@@ -782,27 +794,5 @@ public:
         return std::make_unique<RMSNorm>(d_model);
     return std::make_unique<LayerNorm>(d_model);
 }
-
-// ══════════════════════════════════════════════════════════════════════════
-// Conv2D — 二维卷积层（引擎化：im2col + matmul 复用矩阵乘内核）
-//
-// 布局约定（与项目 batch-major 列布局一致）：
-//   输入  Tensor: (C_in * H_in * W_in, batch)
-//   输出  Tensor: (C_out * H_out * W_out, batch)
-//   权重  w_: (C_out, C_in * k * k)
-//   偏置  b_: (C_out, 1)
-//
-// 算法（只在此处，不在 Engine/Shader）：
-//   forward:  im2col(x) → col (C_in*k*k, batch*OH*OW)
-//             Z = W × col + b  → (C_out, batch*OH*OW)
-//             重排 → (C_out*OH*OW, batch)   （恢复 batch-major 列布局）
-//   backward: grad_W += gZ × col^T
-//             grad_b += row_reduce_sum(gZ)
-//             grad_col = W^T × gZ
-//             col2im → (C_in*H*W, batch)
-//
-// 说明：im2col/col2im 涉及复杂重排，沿用 PatchEmbedding 的先例在 CPU 端完成
-//       （to_matrix/from_matrix），GEMM 仍复用引擎 matmul 内核。
-//       MNIST 尺度下 CPU↔设备往返开销可忽略；GPU 融合卷积内核留作后续优化。
 } // namespace nn
 

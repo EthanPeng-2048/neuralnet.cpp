@@ -18,11 +18,10 @@
 //   uint D     — 列宽（每行元素数）
 //   uint num   — indices 元素个数
 //
-// ── vec4 + 按组求商（2026-09-24，与 DSL 侧「索引按组派生、免逐元素除模」
-//    及 vec4 kernel 契约同步）────────────────────────────────────────────────
-// 旧版每线程 1 元素、每元素一次 i=idx/D、d=idx%D 两笔整数除模 + 4 次标量
-// 表读。现：
-//   - 快路径（D%4==0 且 base+3<total）：base = gid*4 → i/d0 每组一次除模
+// ── vec4 + 按组求商（与 DSL 侧「索引按组派生、免逐元素除模」及 vec4 kernel
+//    契约一致）──────────────────────────────────────────────────────────────
+// 每线程处理 1 个 4 元素组（base = gid*4），组级求商替代逐元素两次除模：
+//   - 快路径（D%4==0 且 base+3<total）：每组一次 i/d0 求商
 //     （D%4 ⇒ d0%4 且 row*D 对齐 16B）→ indices[i] 一次、table vec4 整读、
 //     out vec4 整写；越界行整组置零（同组同 i ⇒ 与逐元素置零语义一致）。
 //   - 回退：同组 4 次标量迭代（奇数 D / 尾组），覆盖完全一致。
@@ -31,8 +30,26 @@
 
 #version 450
 
-layout(local_size_x = 256) in;
-
+// -DNN_SHADER_F16=1 → f16 存储变体（Phase C1）：
+//   table/out 为 float16_t（纯位拷贝）；**indices 保持 float**——行号是
+//   整数值（可达 vocab > 2048），f16 整数精度不足会静默丢索引，禁止转换。
+//   vec4 快路径别名改用 uvec2（4×half = 8B，std430 步长恰 8；
+//   (row*D+d0)%4==0 ⇒ 字节偏移 8 对齐 ✓；与 matmul_tiled 的 NN_V4=uvec2 同款）。
+//   只需 storageBuffer16BitAccess（拷贝无算术）。
+#if defined(NN_SHADER_F16)
+#extension GL_EXT_shader_16bit_storage : require
+layout(std430, binding = 0) readonly buffer  BufTable   { float16_t table[];   };
+layout(std430, binding = 1) readonly buffer  BufIndices { float indices[]; };
+layout(std430, binding = 2) writeonly buffer BufOut     { float16_t out_data[]; };
+// uvec2 别名视图（同 binding 双声明，std430；仅 D%4==0 快路径使用）
+layout(std430, binding = 0) readonly buffer  BufTable2 { uvec2 table2[];  };
+layout(std430, binding = 2) writeonly buffer BufOut2   { uvec2 out2[];    };
+#define NN_T4 uvec2
+#define NN_TBL4 table2
+#define NN_OUT4 out2
+#define NN_ZERO4 uvec2(0u)
+#define NN_ZERO  float16_t(0.0)
+#else
 layout(std430, binding = 0) readonly buffer  BufTable   { float table[];   };
 layout(std430, binding = 1) readonly buffer  BufIndices { float indices[]; };
 layout(std430, binding = 2) writeonly buffer BufOut     { float out_data[]; };
@@ -40,6 +57,14 @@ layout(std430, binding = 2) writeonly buffer BufOut     { float out_data[]; };
 // vec4 别名视图（同 binding 双声明，std430；仅 D%4==0 快路径使用）
 layout(std430, binding = 0) readonly buffer  BufTable4 { vec4 table4[];  };
 layout(std430, binding = 2) writeonly buffer BufOut4   { vec4 out4[];    };
+#define NN_T4 vec4
+#define NN_TBL4 table4
+#define NN_OUT4 out4
+#define NN_ZERO4 vec4(0.0)
+#define NN_ZERO  0.0
+#endif
+
+layout(local_size_x = 256) in;
 
 layout(push_constant) uniform PushConstants {
     uint vocab;
@@ -54,20 +79,20 @@ void main()
     const uint total = num * D;
     if (base >= total) return;
 
-    // ── 快路径：D%4==0 ⇒ 组内 4 元素同行、d0 对齐 16B ──
+    // ── 快路径：D%4==0 ⇒ 组内 4 元素同行；d0 对齐（f32:16B / f16:8B）──
     if ((D & 3u) == 0u && base + 3u < total)
     {
         const uint ii  = base / D;                   // 索引数组下标（每组一次除法）
         const uint d0  = base - ii * D;
         const uint row = uint(indices[ii]);          // ← 表行号来自 indices[ii]
         if (row < vocab)
-            out4[base >> 2] = table4[(row * D + d0) >> 2];
+            NN_OUT4[base >> 2] = NN_TBL4[(row * D + d0) >> 2];
         else
-            out4[base >> 2] = vec4(0.0);             // 越界行整组置零
+            NN_OUT4[base >> 2] = NN_ZERO4;           // 越界行整组置零
         return;
     }
 
-    // ── 回退：标量（每元素求 i/d；与旧版逐位同构）──
+    // ── 回退：标量（每元素求 i/d；与 vec4 快路径逐位一致）──
     for (uint j = 0u; j < 4u; ++j)
     {
         const uint e = base + j;
@@ -78,6 +103,6 @@ void main()
         if (row_idx < vocab)
             out_data[e] = table[row_idx * D + d];
         else
-            out_data[e] = 0.0;
+            out_data[e] = NN_ZERO;
     }
 }

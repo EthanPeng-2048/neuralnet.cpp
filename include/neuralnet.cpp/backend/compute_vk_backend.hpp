@@ -9,8 +9,8 @@
 //
 // 同步机制（独立/非 batch 模式）：
 //   - 复用 initialize() 预分配的 solo fence + command buffer（submit 前
-//     vkResetFences；旧实现每算子 create/destroy fence + alloc/free cmd
-//     是逐元素算子 ≈0.16ms 固定开销的主要构成之一）
+//     vkResetFences）——fence/cmd 整个后端生命周期只创建一次，host 侧每算子
+//     固定开销里没有创建/销毁项
 //   - 提交后立即等待 fence，确保 GPU 计算完成
 //   - 完成后仅归还 descriptor set（gpu_tensor_pool_ 池化复用）
 //
@@ -65,6 +65,12 @@
 #define NN_MATMUL_GEMV_SPV_EMBEDDED
 #endif
 
+// Phase C2e 小 N GEMV 的 f16 存储变体（f16 直读直写 + f32 累加）
+#if __has_include("matmul_gemv_f16_spv.hpp")
+#include "matmul_gemv_f16_spv.hpp"
+#define NN_MATMUL_GEMV_F16_SPV_EMBEDDED
+#endif
+
 #if __has_include("batched_matmul_spv.hpp")
 #include "batched_matmul_spv.hpp"
 #define NN_BATCHED_MATMUL_SPV_EMBEDDED
@@ -97,6 +103,13 @@
 #define NN_REDUCE_SPV_EMBEDDED
 #endif
 
+// Phase C2 op-level f16 归约变体（输入 float16_t 直读、f32 归约；capability
+// 仅 StorageBuffer16BitAccess，无 Float16 → 只需 16bit 存储门控）
+#if __has_include("reduce_f16_spv.hpp")
+#include "reduce_f16_spv.hpp"
+#define NN_REDUCE_F16_SPV_EMBEDDED
+#endif
+
 #if __has_include("transpose_spv.hpp")
 #include "transpose_spv.hpp"
 #define NN_TRANSPOSE_SPV_EMBEDDED
@@ -107,9 +120,20 @@
 #define NN_IM2COL_SPV_EMBEDDED
 #endif
 
+// Phase C2d f16 卷积窗口变体（数据搬运，in/out 均 half；仅 16bit 存储）
+#if __has_include("im2col_f16_spv.hpp")
+#include "im2col_f16_spv.hpp"
+#define NN_IM2COL_F16_SPV_EMBEDDED
+#endif
+
 #if __has_include("col2im_spv.hpp")
 #include "col2im_spv.hpp"
 #define NN_COL2IM_SPV_EMBEDDED
+#endif
+
+#if __has_include("col2im_f16_spv.hpp")
+#include "col2im_f16_spv.hpp"
+#define NN_COL2IM_F16_SPV_EMBEDDED
 #endif
 
 #if __has_include("group_reduce_spv.hpp")
@@ -117,9 +141,36 @@
 #define NN_GROUP_REDUCE_SPV_EMBEDDED
 #endif
 
+// Phase C2c f16 分组归约变体（输入 half 直读、输出 float；仅 16bit 存储）
+#if __has_include("group_reduce_f16_spv.hpp")
+#include "group_reduce_f16_spv.hpp"
+#define NN_GROUP_REDUCE_F16_SPV_EMBEDDED
+#endif
+
 #if __has_include("gather_spv.hpp")
 #include "gather_spv.hpp"
 #define NN_GATHER_SPV_EMBEDDED
+#endif
+
+// Phase C1 op-level f16 变体（-DNN_SHADER_F16=1 第二份 SPIR-V；纯位拷贝搬运）
+#if __has_include("transpose_f16_spv.hpp")
+#include "transpose_f16_spv.hpp"
+#define NN_TRANSPOSE_F16_SPV_EMBEDDED
+#endif
+
+#if __has_include("rearrange_3d_f16_spv.hpp")
+#include "rearrange_3d_f16_spv.hpp"
+#define NN_REARRANGE_3D_F16_SPV_EMBEDDED
+#endif
+
+#if __has_include("gather_f16_spv.hpp")
+#include "gather_f16_spv.hpp"
+#define NN_GATHER_F16_SPV_EMBEDDED
+#endif
+
+#if __has_include("elementwise_v2_f16_spv.hpp")
+#include "elementwise_v2_f16_spv.hpp"
+#define NN_ELEMENTWISE_V2_F16_SPV_EMBEDDED
 #endif
 
 #if __has_include("scatter_add_spv.hpp")
@@ -127,9 +178,22 @@
 #define NN_SCATTER_ADD_SPV_EMBEDDED
 #endif
 
+// Phase C2b f16 原子累加变体（dst 打包 half CAS + grad half 直读；
+// capability 仅 StorageBuffer16BitAccess）
+#if __has_include("scatter_add_f16_spv.hpp")
+#include "scatter_add_f16_spv.hpp"
+#define NN_SCATTER_ADD_F16_SPV_EMBEDDED
+#endif
+
 #if __has_include("scan_prefix_outer_spv.hpp")
 #include "scan_prefix_outer_spv.hpp"
 #define NN_SCAN_PREFIX_OUTER_SPV_EMBEDDED
+#endif
+
+// Phase C2f RLA 扫描原语的 f16 存储变体（输入输出均 half；仅 16bit 存储）
+#if __has_include("scan_prefix_outer_f16_spv.hpp")
+#include "scan_prefix_outer_f16_spv.hpp"
+#define NN_SCAN_PREFIX_OUTER_F16_SPV_EMBEDDED
 #endif
 
 #if __has_include("scan_suffix_outer_spv.hpp")
@@ -137,9 +201,19 @@
 #define NN_SCAN_SUFFIX_OUTER_SPV_EMBEDDED
 #endif
 
+#if __has_include("scan_suffix_outer_f16_spv.hpp")
+#include "scan_suffix_outer_f16_spv.hpp"
+#define NN_SCAN_SUFFIX_OUTER_F16_SPV_EMBEDDED
+#endif
+
 #if __has_include("scan_prefix_outer_gen_spv.hpp")
 #include "scan_prefix_outer_gen_spv.hpp"
 #define NN_SCAN_PREFIX_OUTER_GEN_SPV_EMBEDDED
+#endif
+
+#if __has_include("scan_prefix_outer_gen_f16_spv.hpp")
+#include "scan_prefix_outer_gen_f16_spv.hpp"
+#define NN_SCAN_PREFIX_OUTER_GEN_F16_SPV_EMBEDDED
 #endif
 
 #if __has_include("scan_suffix_outer_gen_spv.hpp")
@@ -147,9 +221,19 @@
 #define NN_SCAN_SUFFIX_OUTER_GEN_SPV_EMBEDDED
 #endif
 
+#if __has_include("scan_suffix_outer_gen_f16_spv.hpp")
+#include "scan_suffix_outer_gen_f16_spv.hpp"
+#define NN_SCAN_SUFFIX_OUTER_GEN_F16_SPV_EMBEDDED
+#endif
+
 #if __has_include("outer_col_spv.hpp")
 #include "outer_col_spv.hpp"
 #define NN_OUTER_COL_SPV_EMBEDDED
+#endif
+
+#if __has_include("outer_col_f16_spv.hpp")
+#include "outer_col_f16_spv.hpp"
+#define NN_OUTER_COL_F16_SPV_EMBEDDED
 #endif
 
 #if __has_include("cast_spv.hpp")
@@ -325,7 +409,7 @@ public:
 };
 
 // ══════════════════════════════════════════════════════════════════════════
-// GpuTensorT<P> — GPU 矩阵抽象（多精度，docs/23 §6.3）
+// GpuTensorT<P> — GPU 矩阵抽象（多精度，docs/development/05-mixed-precision.md §6.3）
 // buffer 字节数 = rows * cols * sizeof(elem<P>)（f32=4B / f16=2B）
 // 别名：GpuTensor = GpuTensorT<F32>（现有调用点零改动）
 // ══════════════════════════════════════════════════════════════════════════
@@ -392,12 +476,15 @@ private:
     VulkanPipeline matmul_pipeline_;
     VulkanPipeline matmul_tiled_pipeline_;
     VulkanPipeline matmul_gemv_pipeline_;
+    VulkanPipeline matmul_gemv_f16_pipeline_;   // Phase C2e 小 N GEMV f16
     VulkanPipeline batched_matmul_pipeline_;
     // 精度变体（f16 存储；设备无 storageBuffer16BitAccess 时保持空句柄）
     VulkanPipeline batched_matmul_f16_pipeline_;
     VulkanPipeline matmul_tiled_f16_pipeline_;
     VulkanPipeline elementwise_v2_pipeline_;
+    VulkanPipeline elementwise_v2_f16_pipeline_;   // Phase C1b f16 存储变体
     VulkanPipeline reduce_pipeline_;
+    VulkanPipeline reduce_f16_pipeline_;           // Phase C2 f16 归约变体
     // 列归约两段式 partials scratch（成员复用：batch 录制期被 cmd 引用，
     // 局部销毁会踩铁律 6；形状变化时旧缓冲走 pending_destroys_ 延迟销毁，
     // 对在飞录制安全。同一 batch 内多次使用由 cmd 内屏障串行化）
@@ -405,18 +492,34 @@ private:
     VulkanPipeline rearrange_3d_pipeline_;
     VulkanPipeline transpose_pipeline_;
     VulkanPipeline gather_pipeline_;
+    // Phase C1 op-level f16 变体（纯位拷贝搬运；设备能力不足时保持空句柄
+    // → 引擎回退边界 cast）。门控分层：gather/rearrange 只需 16 位存储；
+    // transpose 的 shared float16_t 需 SPIR-V Float16 → 还需 shaderFloat16。
+    VulkanPipeline rearrange_3d_f16_pipeline_;
+    VulkanPipeline transpose_f16_pipeline_;
+    VulkanPipeline gather_f16_pipeline_;
     VulkanPipeline scatter_add_pipeline_;
+    VulkanPipeline scatter_add_f16_pipeline_;   // Phase C2b f16 打包 half CAS
     // 卷积/池化窗口展开（纯数据搬运；Conv2D/MaxPool2D 的 im2col/col2im）
     VulkanPipeline im2col_pipeline_;
     VulkanPipeline col2im_pipeline_;
+    VulkanPipeline im2col_f16_pipeline_;   // Phase C2d f16 窗口变体
+    VulkanPipeline col2im_f16_pipeline_;
     // 分组归约（沿行方向按固定长度 R 分组求和/求最大）
     VulkanPipeline group_reduce_pipeline_;
+    VulkanPipeline group_reduce_f16_pipeline_;   // Phase C2c f16 输入变体
     // RLA 扫描原语（手写原语，不进 AOT 融合注册表；铁律 3：shader 不含算法）
     VulkanPipeline scan_prefix_outer_pipeline_;
     VulkanPipeline scan_suffix_outer_pipeline_;
     VulkanPipeline scan_prefix_outer_gen_pipeline_;  // 通用 d_k（>64）前缀扫描
     VulkanPipeline scan_suffix_outer_gen_pipeline_;  // 通用 d_k（>64）后缀扫描
     VulkanPipeline outer_col_pipeline_;
+    // Phase C2f f16 扫描变体（输入输出均 half；St scratch 仍 f32）
+    VulkanPipeline scan_prefix_outer_f16_pipeline_;
+    VulkanPipeline scan_suffix_outer_f16_pipeline_;
+    VulkanPipeline scan_prefix_outer_gen_f16_pipeline_;
+    VulkanPipeline scan_suffix_outer_gen_f16_pipeline_;
+    VulkanPipeline outer_col_f16_pipeline_;
     // 通用精度转换原语（engine.cast 的 GPU 实现；f16↔f32，kind 分派精度对）
     VulkanPipeline cast_pipeline_;
     // AOT 融合 shader pipelines（key = expr_spec_key → pipeline；由构建期
@@ -426,7 +529,7 @@ private:
     std::unordered_map<std::string, int> fused_reduce_axis_;
     // 是否含前置 matmul 段（push constants 多 rows + mm_k 两个 uint）
     std::unordered_map<std::string, bool> fused_has_matmul_;
-    // fold 形态元数据（P-C1/P-C2，与生成器分派同源判定）：
+    // fold 形态元数据（与生成器分派同源判定）：
     //   out       = 输出列数（vec_state_len 或 1）——调用约定 cols==out 校验
     //   per_thread_row = 1 → v1 标量 fold：每线程一行（local 256，wg=ceil(rows/256)）；
     //               0 → v2 双域 fold：每 WG EXPR_FOLD_ROWS_PER_WG 行
@@ -442,7 +545,7 @@ private:
     std::unordered_map<std::string, std::uint32_t> fused_vec_width_;
 
     std::unique_ptr<MemoryPool> memory_pool_;
-    // 第二阶段（P3-2）：瞬态/持久分池。batch 录制期（batch_mode_=true）创建的
+    // 第二阶段：瞬态/持久分池。batch 录制期（batch_mode_=true）创建的
     // 张量（融合临时、每步激活、输入上传等）走 transient_pool_，参数/梯度/权重
     // （构建期 batch_mode_=false）走 memory_pool_。此拆分**纯组织性**——两池均
     // 不强制释放，仅按生命周期隔离，避免频繁临时分配在参数常驻块里切出碎片。
@@ -452,13 +555,12 @@ private:
     VkCommandPool command_pool_ = VK_NULL_HANDLE;
     VkDescriptorPool gpu_tensor_pool_ = VK_NULL_HANDLE;
 
-    // ── Command Buffer Batching + 多帧流水线（P0-1）─────────────────────
-    // 旧实现：单一 batch_cmd_ + 单 fence，end_batch/flush_batch 每次
-    // vkQueueSubmit + 阻塞 vkWaitForFences——GPU 执行 step N 时 host 被 fence
-    // 卡死无法录制 step N+1（GPU 占用率 = GPU 忙时间 / (GPU 忙 + 全部 host
-    // 录制 + 传输)，见《显存 & 负载不均衡分析报告》§2.1）。
+    // ── Command Buffer Batching + 多帧流水线─────────────────────
+    // 单帧模型（一次提交 + 阻塞等待）会让 GPU 执行 step N 时 host 卡在 fence 上、
+    // 录不了 step N+1——GPU 占用率 = GPU 忙时间 / (GPU 忙 + 全部 host 录制 +
+    // 传输)，host 录制越长 GPU 空转越多。故 end_batch/flush_batch 提交不等待。
     //
-    // 新模型（N 帧环）：
+    // N 帧环：
     //   - PIPELINE_FRAMES 个 (command buffer + fence) 在 initialize() 预分配，
     //     轮转复用；描述符集按帧归属（帧的 fence 信号后才可释放）
     //   - begin_batch：取下一帧；该帧若仍在飞行则等其 fence（**只在环槽
@@ -470,7 +572,7 @@ private:
     //   - release_idle_pool_blocks：非阻塞 reap 已完成帧 + 归还空闲块
     // 效果：host 录制 step N+1 与 GPU 执行 step N 重叠；host 只在真正要
     // 读 GPU 数据（logits 探针 / loss 标量 / 日志采样）时阻塞。
-    static constexpr std::size_t PIPELINE_FRAMES = 6;  // 环深度（P0-1: 3→6，加深流水线提重叠度）
+    static constexpr std::size_t PIPELINE_FRAMES = 6;  // 环深度（加深流水线提 host/GPU 重叠度）
     struct Frame
     {
         VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -488,7 +590,7 @@ private:
     bool early_reap_enabled_ = true;
     VkCommandBuffer batch_cmd_ = VK_NULL_HANDLE;  // 当前帧的 command buffer
 
-    // ── 异步标量回读（P0-2：非阻塞 loss 取值）─────────────────────────
+    // ── 异步标量回读（非阻塞 loss 取值）─────────────────────────
     // 动机：forward 末尾下载 loss 标量若走 to_matrix，会 end_batch +
     // wait_in_flight（等全部在飞帧）→ 每个 step 一次全流水线 drain，host 与
     // GPU 无法重叠（锯齿）。这里给标量回读一条"不等"的路径：
@@ -511,9 +613,8 @@ private:
     std::vector<ScalarReadbackSlot> rb_slots_;
 
     // ── 独立（非 batch）模式复用资源 ────────────────────────────────────
-    // 逐元素算子固定开销实测 ≈0.16ms/次（4096² kernel 本身已达 370GB/s，
-    // 瓶颈全在 host 侧）：每算子 vkCreateFence/vkDestroyFence +
-    // vkAllocateCommandBuffers/vkFreeCommandBuffers 是可消除项 →
+    // 逐元素算子固定开销实测 ≈0.14ms/次，几乎全在 host 侧（4096² kernel
+    // 本身已达 370GB/s，计算远快于提交）：故 fence/cmd 不按算子新建，而是
     // initialize() 预分配，acquire_cmd/submit_and_wait 内 reset 复用。
     // 独立模式「录制→提交→等待」严格串行（等完才返回）→ 单实例安全；
     // batch 模式走 frames_ 环，不经过这里。单线程录制假设同 batch_cmd_。
@@ -524,7 +625,7 @@ private:
     std::mutex queue_mutex_;
     bool initialized_ = false;
 
-    // ── f16 硬件能力（D4，§7.1）────────────────────────────────────────
+    // ── f16 硬件能力（§7.1）────────────────────────────────────────
     // GPU shaderFloat16：运行期一次查定，运行期不变。
     // true  → f16 GEMM 变体②（f16vec 加载，需该特性）
     // false → f16 GEMM 变体①（u8 软件解码，设备无关，默认路径）
@@ -532,9 +633,11 @@ private:
 
     // ── 延迟销毁：batch 录制期间 copy-on-write 替换旧 buffer 时，旧 buffer
     // 仍被已录制的 descriptor set 引用，不能立即 vkDestroyBuffer。
-    // end_batch/flush_batch 提交完成并释放 descriptor sets 后统一销毁。
+    // 待引用它的帧执行完（该帧 fence 信号 → reap_frame，descriptor set 同帧
+    // 释放）后销毁并归还内存；drain 点（wait_in_flight / 析构）走
+    // flush_pending_destroys() 一次性清空。
     //
-    // ⚠ 内存归还也须延迟到 vkDestroyBuffer 之后（D1 修复）：
+    // ⚠ 内存归还也须延迟到 vkDestroyBuffer 之后：
     //   若立即 pool_->free()，新 buffer 可能分配到旧 buffer 尚未销毁的
     //   同一区间 → 两个存活 buffer 内存重叠，违反 Vulkan 规范
     //   （VUID-vkBindBufferMemory-memory-01988 类约束）。
@@ -543,9 +646,9 @@ private:
     //   但规范合规要求 buffer 对象本身不得重叠，故内存归还必须等 buffer
     //   销毁完成。
     //
-    //   多帧流水线（P0-1）：锁窗从"整个 batch"缩短到"所属帧"——每条延迟
-    //   销毁打上帧标签（frame），该帧的 fence 信号后（环槽复用 / drain /
-    //   非阻塞 reap）即销毁并归还内存。
+    //   多帧流水线：每条延迟销毁打上帧标签（frame），该帧的 fence
+    //   信号后（环槽复用 / drain / 非阻塞 reap）即销毁并归还内存——锁窗
+    //   只到所属帧，不跨越整个 batch。
     struct PendingDestroy
     {
         VkDevice device = VK_NULL_HANDLE;
@@ -586,6 +689,16 @@ private:
     {
 #ifdef NN_MATMUL_GEMV_SPV_EMBEDDED
         return nn_matmul_gemv_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_matmul_gemv_f16_spirv()
+    {
+#ifdef NN_MATMUL_GEMV_F16_SPV_EMBEDDED
+        return nn_matmul_gemv_f16_spirv_bytecode();
 #else
         static const std::vector<uint32_t> empty;
         return empty;
@@ -642,6 +755,16 @@ private:
 #endif
     }
 
+    [[nodiscard]] static const std::vector<uint32_t>& get_elementwise_v2_f16_spirv()
+    {
+#ifdef NN_ELEMENTWISE_V2_F16_SPV_EMBEDDED
+        return nn_elementwise_v2_f16_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
     [[nodiscard]] static const std::vector<uint32_t>& get_reduce_spirv()
     {
 #ifdef NN_REDUCE_SPV_EMBEDDED
@@ -652,10 +775,52 @@ private:
 #endif
     }
 
+    [[nodiscard]] static const std::vector<uint32_t>& get_reduce_f16_spirv()
+    {
+#ifdef NN_REDUCE_F16_SPV_EMBEDDED
+        return nn_reduce_f16_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
     [[nodiscard]] static const std::vector<uint32_t>& get_transpose_spirv()
     {
 #ifdef NN_TRANSPOSE_SPV_EMBEDDED
         return nn_transpose_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    // Phase C1 op-level f16 变体 SPIR-V（纯位拷贝；transpose 的 shared
+    // float16_t 版另需 Float16 capability → 运行时 has_shader_float16 门控）
+    [[nodiscard]] static const std::vector<uint32_t>& get_transpose_f16_spirv()
+    {
+#ifdef NN_TRANSPOSE_F16_SPV_EMBEDDED
+        return nn_transpose_f16_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_rearrange_3d_f16_spirv()
+    {
+#ifdef NN_REARRANGE_3D_F16_SPV_EMBEDDED
+        return nn_rearrange_3d_f16_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_gather_f16_spirv()
+    {
+#ifdef NN_GATHER_F16_SPV_EMBEDDED
+        return nn_gather_f16_spirv_bytecode();
 #else
         static const std::vector<uint32_t> empty;
         return empty;
@@ -682,10 +847,40 @@ private:
 #endif
     }
 
+    [[nodiscard]] static const std::vector<uint32_t>& get_im2col_f16_spirv()
+    {
+#ifdef NN_IM2COL_F16_SPV_EMBEDDED
+        return nn_im2col_f16_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_col2im_f16_spirv()
+    {
+#ifdef NN_COL2IM_F16_SPV_EMBEDDED
+        return nn_col2im_f16_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
     [[nodiscard]] static const std::vector<uint32_t>& get_group_reduce_spirv()
     {
 #ifdef NN_GROUP_REDUCE_SPV_EMBEDDED
         return nn_group_reduce_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_group_reduce_f16_spirv()
+    {
+#ifdef NN_GROUP_REDUCE_F16_SPV_EMBEDDED
+        return nn_group_reduce_f16_spirv_bytecode();
 #else
         static const std::vector<uint32_t> empty;
         return empty;
@@ -706,6 +901,16 @@ private:
     {
 #ifdef NN_SCATTER_ADD_SPV_EMBEDDED
         return nn_scatter_add_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_scatter_add_f16_spirv()
+    {
+#ifdef NN_SCATTER_ADD_F16_SPV_EMBEDDED
+        return nn_scatter_add_f16_spirv_bytecode();
 #else
         static const std::vector<uint32_t> empty;
         return empty;
@@ -756,6 +961,53 @@ private:
     {
 #ifdef NN_OUTER_COL_SPV_EMBEDDED
         return nn_outer_col_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    // Phase C2f f16 扫描变体 SPIR-V
+    [[nodiscard]] static const std::vector<uint32_t>& get_scan_prefix_outer_f16_spirv()
+    {
+#ifdef NN_SCAN_PREFIX_OUTER_F16_SPV_EMBEDDED
+        return nn_scan_prefix_outer_f16_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+    [[nodiscard]] static const std::vector<uint32_t>& get_scan_suffix_outer_f16_spirv()
+    {
+#ifdef NN_SCAN_SUFFIX_OUTER_F16_SPV_EMBEDDED
+        return nn_scan_suffix_outer_f16_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+    [[nodiscard]] static const std::vector<uint32_t>& get_scan_prefix_outer_gen_f16_spirv()
+    {
+#ifdef NN_SCAN_PREFIX_OUTER_GEN_F16_SPV_EMBEDDED
+        return nn_scan_prefix_outer_gen_f16_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+    [[nodiscard]] static const std::vector<uint32_t>& get_scan_suffix_outer_gen_f16_spirv()
+    {
+#ifdef NN_SCAN_SUFFIX_OUTER_GEN_F16_SPV_EMBEDDED
+        return nn_scan_suffix_outer_gen_f16_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+    [[nodiscard]] static const std::vector<uint32_t>& get_outer_col_f16_spirv()
+    {
+#ifdef NN_OUTER_COL_F16_SPV_EMBEDDED
+        return nn_outer_col_f16_spirv_bytecode();
 #else
         static const std::vector<uint32_t> empty;
         return empty;
@@ -838,7 +1090,7 @@ public:
     //   - batch 录制中：延迟，打当前帧标签（buffer 仍被本帧已录制命令引用）
     //   - 非 batch：最近一次提交的帧若仍在飞行则延迟（buffer 可能被该帧
     //     命令引用，帧 fence 信号即可证明安全）；否则立即销毁
-    // 内存归还与 buffer 销毁同批（D1）：buffer 销毁前不得把区间还给池。
+    // 内存归还与 buffer 销毁同批：buffer 销毁前不得把区间还给池。
     [[nodiscard]] bool needs_deferred_destroy() const noexcept
     {
         if (batch_mode_)
@@ -860,7 +1112,7 @@ public:
     }
 
     // ── 统一执行延迟销毁（必须在对应帧的 fence 信号之后调用）─────────
-    // 先 vkDestroyBuffer 再归还内存到池（D1）：保证 buffer 对象销毁后
+    // 先 vkDestroyBuffer 再归还内存到池：保证 buffer 对象销毁后
     // 其区间才可被新分配复用，杜绝存活 buffer 间的内存重叠。
     // flush 全部：用于"所有帧已完成"的 drain 点（wait_in_flight / 析构）。
     void flush_pending_destroys()
@@ -876,7 +1128,7 @@ public:
         pending_destroys_.clear();
     }
 
-    // ── reap 单帧（多帧流水线 P0-1）──────────────────────────────────
+    // ── reap 单帧（多帧流水线）──────────────────────────────────
     // 等待该帧 fence（wait=true；wait=false 要求调用方已用零超时
     // vkWaitForFences 确认 VK_SUCCESS）→ 销毁该帧的延迟 buffer 并归还
     // 内存 → 释放该帧描述符集（帧提交期间被已录制命令引用，fence 信号
@@ -906,7 +1158,7 @@ public:
                     "\n建议：减小 --batch-size 或 --seq-len，或增大 Windows TDR 超时"
                     " (注册表 TdrDelay)"});
         }
-        // 该帧的延迟销毁：先 vkDestroyBuffer 再归还内存（D1）
+        // 该帧的延迟销毁：先 vkDestroyBuffer 再归还内存
         {
             std::lock_guard lock(pending_mutex_);
             std::vector<PendingDestroy> rest;
@@ -1018,7 +1270,7 @@ public:
         if (!st_r)
             return st_r;
 
-        // 6.5 异步标量回读槽（P0-2）：非阻塞取 loss 标量，避免每 step drain
+        // 6.5 异步标量回读槽：非阻塞取 loss 标量，避免每 step drain
         auto rb_r = init_scalar_readback_slots();
         if (!rb_r)
             return rb_r;
@@ -1048,9 +1300,9 @@ public:
         if (!r)
             return r;
 
-        // 7b. 预分配流水线帧环（P0-1）：N 个 command buffer + N 个 fence。
-        //     旧实现每步 vkAllocateCommandBuffers + vkCreateFence（host 侧
-        //     每步固定开销）；现在环内复用，全程零分配。
+        // 7b. 预分配流水线帧环：N 个 command buffer + N 个 fence，
+        //     环内轮转复用、全程零分配——录制/提交路径不触碰
+        //     vkAllocateCommandBuffers / vkCreateFence。
         frames_.resize(PIPELINE_FRAMES);
         {
             VkCommandBufferAllocateInfo cmd_alloc{};
@@ -1141,6 +1393,14 @@ public:
         //   cast 回退（正确性不变，只是拿不到存储折半的带宽/显存收益）。
         if (device_.has_16bit_storage())
         {
+            // Phase C2e：小 N GEMV f16 变体（与 f32 同 create_matmul 布局）
+            const auto& gv16 = get_matmul_gemv_f16_spirv();
+            if (!gv16.empty())
+            {
+                auto gp16 = VulkanPipeline::create_matmul(device_.device(), gv16);
+                if (gp16)
+                    matmul_gemv_f16_pipeline_ = std::move(*gp16);
+            }
             const auto& b16 = get_batched_matmul_f16_spirv();
             if (!b16.empty())
             {
@@ -1168,6 +1428,40 @@ public:
                 rearrange_3d_pipeline_ = std::move(*rp_r);
         }
 
+        // 9c'. Phase C1 f16 变体（纯位拷贝；仅需 16 位存储门控）
+        if (device_.has_16bit_storage())
+        {
+            const auto& r16 = get_rearrange_3d_f16_spirv();
+            if (!r16.empty())
+            {
+                auto rp_r = VulkanPipeline::create_generic(
+                    device_.device(), r16, 2, 5 * sizeof(uint32_t));
+                if (rp_r)
+                    rearrange_3d_f16_pipeline_ = std::move(*rp_r);
+            }
+            const auto& g16 = get_gather_f16_spirv();
+            if (!g16.empty())
+            {
+                auto gp_r = VulkanPipeline::create_generic(
+                    device_.device(), g16, 3, 3 * sizeof(uint32_t));
+                if (gp_r)
+                    gather_f16_pipeline_ = std::move(*gp_r);
+            }
+        }
+        // transpose_f16：shared float16_t → SPIR-V Float16 capability →
+        // 额外要求 shaderFloat16 特性（否则 pipeline 创建即违 VUID）
+        if (device_.has_16bit_storage() && device_.has_shader_float16())
+        {
+            const auto& t16 = get_transpose_f16_spirv();
+            if (!t16.empty())
+            {
+                auto tp_r = VulkanPipeline::create_generic(
+                    device_.device(), t16, 2, 2 * sizeof(uint32_t));
+                if (tp_r)
+                    transpose_f16_pipeline_ = std::move(*tp_r);
+            }
+        }
+
         // 10. 创建 elementwise_v2 pipeline（4 bindings, 32B push constants）
         const auto& elem_v2_spirv = get_elementwise_v2_spirv();
         if (!elem_v2_spirv.empty())
@@ -1176,6 +1470,20 @@ public:
                 device_.device(), elem_v2_spirv, 4, 8 * sizeof(uint32_t));
             if (ep_r)
                 elementwise_v2_pipeline_ = std::move(*ep_r);
+        }
+
+        // 10b. Phase C1b f16 存储变体（add/scale/accumulate inplace 归因大头；
+        //      纯位拷贝 + f16↔f32 转换 → 仅需 16 位存储门控）
+        if (device_.has_16bit_storage())
+        {
+            const auto& ev16 = get_elementwise_v2_f16_spirv();
+            if (!ev16.empty())
+            {
+                auto ep_r = VulkanPipeline::create_generic(
+                    device_.device(), ev16, 4, 8 * sizeof(uint32_t));
+                if (ep_r)
+                    elementwise_v2_f16_pipeline_ = std::move(*ep_r);
+            }
         }
 
         // 11. 创建 reduce pipeline（2 bindings, 20B push constants：
@@ -1188,6 +1496,20 @@ public:
                 device_.device(), reduce_spirv, 2, 5 * sizeof(uint32_t));
             if (rp_r)
                 reduce_pipeline_ = std::move(*rp_r);
+        }
+        // 11b. Phase C2 f16 归约变体（输入 float16_t 直读、输出 f32 归约向量；
+        //      capability 仅 StorageBuffer16BitAccess → 只需 16bit 存储门控，
+        //      无 Float16 要求）。push/绑定与 f32 版同构。
+        if (device_.has_16bit_storage())
+        {
+            const auto& rf16 = get_reduce_f16_spirv();
+            if (!rf16.empty())
+            {
+                auto rp16 = VulkanPipeline::create_generic(
+                    device_.device(), rf16, 2, 5 * sizeof(uint32_t));
+                if (rp16)
+                    reduce_f16_pipeline_ = std::move(*rp16);
+            }
         }
 
         // 13. 创建 transpose pipeline（2 bindings, 8B push constants）
@@ -1224,6 +1546,32 @@ public:
                 if (r) group_reduce_pipeline_ = std::move(*r);
             }
         }
+        // Phase C2c f16 分组归约变体（输入 half 直读；仅 16bit 存储门控）
+        if (device_.has_16bit_storage())
+        {
+            const auto& gr16 = get_group_reduce_f16_spirv();
+            if (!gr16.empty())
+            {
+                auto r = VulkanPipeline::create_generic(
+                    device_.device(), gr16, 2, 4 * sizeof(uint32_t));
+                if (r) group_reduce_f16_pipeline_ = std::move(*r);
+            }
+            // Phase C2d f16 卷积窗口变体（in/out 均 half；9 uint push 同构）
+            const auto& im16 = get_im2col_f16_spirv();
+            if (!im16.empty())
+            {
+                auto r = VulkanPipeline::create_generic(
+                    device_.device(), im16, 2, 9 * sizeof(uint32_t));
+                if (r) im2col_f16_pipeline_ = std::move(*r);
+            }
+            const auto& c216 = get_col2im_f16_spirv();
+            if (!c216.empty())
+            {
+                auto r = VulkanPipeline::create_generic(
+                    device_.device(), c216, 2, 9 * sizeof(uint32_t));
+                if (r) col2im_f16_pipeline_ = std::move(*r);
+            }
+        }
 
         // 14. 创建 gather pipeline（3 bindings, 12B push constants）
         const auto& gather_spirv = get_gather_spirv();
@@ -1243,6 +1591,19 @@ public:
                 device_.device(), scatter_add_spirv, 3, 3 * sizeof(uint32_t));
             if (sp_r)
                 scatter_add_pipeline_ = std::move(*sp_r);
+        }
+        // 15b. Phase C2b f16 打包 half CAS 变体（仅需 16bit 存储——CAS 对
+        //      uint word，无 f16 原子/Float16 capability）
+        if (device_.has_16bit_storage())
+        {
+            const auto& saf16 = get_scatter_add_f16_spirv();
+            if (!saf16.empty())
+            {
+                auto sp16 = VulkanPipeline::create_generic(
+                    device_.device(), saf16, 3, 3 * sizeof(uint32_t));
+                if (sp16)
+                    scatter_add_f16_pipeline_ = std::move(*sp16);
+            }
         }
 
         // 16. 创建 RLA 扫描原语 pipelines（手写原语，不进融合注册表）
@@ -1287,6 +1648,45 @@ public:
             if (oc_r)
                 outer_col_pipeline_ = std::move(*oc_r);
         }
+        // 16c. Phase C2f f16 扫描变体（输入输出均 half；仅 16bit 存储门控）
+        if (device_.has_16bit_storage())
+        {
+            const auto& spf16 = get_scan_prefix_outer_f16_spirv();
+            if (!spf16.empty())
+            {
+                auto r = VulkanPipeline::create_generic(
+                    device_.device(), spf16, 8, 7 * sizeof(uint32_t));
+                if (r) scan_prefix_outer_f16_pipeline_ = std::move(*r);
+            }
+            const auto& sfs16 = get_scan_suffix_outer_f16_spirv();
+            if (!sfs16.empty())
+            {
+                auto r = VulkanPipeline::create_generic(
+                    device_.device(), sfs16, 5, 6 * sizeof(uint32_t));
+                if (r) scan_suffix_outer_f16_pipeline_ = std::move(*r);
+            }
+            const auto& spfg16 = get_scan_prefix_outer_gen_f16_spirv();
+            if (!spfg16.empty())
+            {
+                auto r = VulkanPipeline::create_generic(
+                    device_.device(), spfg16, 9, 7 * sizeof(uint32_t));
+                if (r) scan_prefix_outer_gen_f16_pipeline_ = std::move(*r);
+            }
+            const auto& sfsg16 = get_scan_suffix_outer_gen_f16_spirv();
+            if (!sfsg16.empty())
+            {
+                auto r = VulkanPipeline::create_generic(
+                    device_.device(), sfsg16, 6, 6 * sizeof(uint32_t));
+                if (r) scan_suffix_outer_gen_f16_pipeline_ = std::move(*r);
+            }
+            const auto& oc16 = get_outer_col_f16_spirv();
+            if (!oc16.empty())
+            {
+                auto r = VulkanPipeline::create_generic(
+                    device_.device(), oc16, 4, 4 * sizeof(uint32_t));
+                if (r) outer_col_f16_pipeline_ = std::move(*r);
+            }
+        }
         // 15. 通用精度转换 pipeline（f16↔f32；2 缓冲 + push{count,kind}）
         const auto& cast_spirv = get_cast_spirv();
         if (!cast_spirv.empty())
@@ -1310,17 +1710,23 @@ public:
             if (std::string_view(fs.key).find('#') != std::string_view::npos &&
                 !device_.has_16bit_storage())
                 continue;
+            // ALU 变体（key 以 "#a" 结尾，native16 原生 f16 算术）额外需要
+            // shaderFloat16 特性；未启用 → 跳过 → 运行时回退同签名的 f32 算术
+            // 变体（其 pipeline 独立存在）或边界 cast——正确性不变。
+            if (std::string_view(fs.key).ends_with("#a") &&
+                !device_.has_shader_float16())
+                continue;
             const std::uint32_t num_bindings =
                 static_cast<std::uint32_t>(fs.spec.views.size()) + 1;  // 输入 + 输出
             // 归约 kernel 的 push constants 多 uint rows + uint vector_out；
             // matmul 融合 kernel 多 uint rows + uint mm_k + uint mm_batch；
             // matmul+归约组合再多 uint mm_k + uint mm_batch（6 槽）；
-            // fold（P-C1）= count, cols, rows, vector_out, fold_k（5 槽）——
+            // fold v1（标量域）= count, cols, rows, vector_out, fold_k（5 槽）——
             //   **必须与 run_fused_gpu 的 pc_base 逐形态一致**：漏分支会让
             //   range 少算，vkCmdPushConstants 超 range 部分被驱动丢弃 →
-            //   fold_k 读未定义残留（曾致滑窗式错值，且残留随前序 op 漂移、
-            //   表现为时对时错的假 PASS——教训 4.10 同类，改动 PC 形态时
-            //   创建侧(本处)与写入侧(run_fused_gpu)必须同改）；
+            //   fold_k 读到未定义残留（残留随前序 op 漂移，表现为时对时错的
+            //   假 PASS，"全绿"验不出）；改动 PC 形态时创建侧(本处)与写入侧
+            //   (run_fused_gpu)必须同改）；
             // 另加 fs.view_param_count 个运行时视图参数槽（RowMod/RotateHalf）
             const std::uint32_t pc_base =
                 (fs.spec.fold && fs.spec.fold->matmul)    ? 7u  // fold+mm 7 槽
@@ -1355,21 +1761,12 @@ public:
         }
 #endif
 
-        // ── D4：查询 GPU f16 硬件能力（§7.1）─────────────────────────────
+        // ── 查询 GPU f16 硬件能力（§7.1）─────────────────────────────
         // shaderFloat16：Vulkan 1.2 核心特性 / VK_KHR_shader_float16_int8 扩展。
-        // 查询 VkPhysicalDeviceShaderFloat16Int8Features（扩展 pNext 链）。
-        // 未找到扩展 → has_shader_float16_ = false（兼容路径，变体①）。
-        {
-            VkPhysicalDeviceShaderFloat16Int8Features f16_features{};
-            f16_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
-
-            VkPhysicalDeviceFeatures2 device_features{};
-            device_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-            device_features.pNext = &f16_features;
-
-            vkGetPhysicalDeviceFeatures2(device_.physical_device(), &device_features);
-            has_shader_float16_ = (f16_features.shaderFloat16 == VK_TRUE);
-        }
+        // 以**设备侧已启用**状态为准（VulkanDevice::initialize 查询 + 启用 +
+        // NN_VULKAN_NO_16BIT_ALU 逃生阀）——只查物理特性不启用 = pipeline 创建
+        // 时校验失败，故此处不独立查询。
+        has_shader_float16_ = device_.has_shader_float16();
 
         initialized_ = true;
         return {};
@@ -1379,27 +1776,46 @@ public:
     [[nodiscard]] bool gpu_available() const noexcept { return initialized_; }
     [[nodiscard]] bool has_tiled_pipeline() const noexcept { return matmul_tiled_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_gemv_pipeline() const noexcept { return matmul_gemv_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_gemv_f16_pipeline() const noexcept { return matmul_gemv_f16_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_batched_matmul_pipeline() const noexcept { return batched_matmul_pipeline_.handle() != VK_NULL_HANDLE; }
     // 精度变体（f16 存储）可用性：引擎据此决定"直读 f16"还是"边界 cast 回退"
     [[nodiscard]] bool has_batched_matmul_f16_pipeline() const noexcept { return batched_matmul_f16_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_matmul_tiled_f16_pipeline() const noexcept { return matmul_tiled_f16_pipeline_.handle() != VK_NULL_HANDLE; }
+    // Phase C1 op-level f16 搬运变体可用性（能力门控后可能为空 → 引擎回退边界 cast）
+    [[nodiscard]] bool has_rearrange_3d_f16_pipeline() const noexcept { return rearrange_3d_f16_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_transpose_f16_pipeline() const noexcept { return transpose_f16_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_gather_f16_pipeline() const noexcept { return gather_f16_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_elementwise_v2_f16_pipeline() const noexcept { return elementwise_v2_f16_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_rearrange_3d_pipeline() const noexcept { return rearrange_3d_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_elementwise_v2_pipeline() const noexcept { return elementwise_v2_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_reduce_pipeline() const noexcept { return reduce_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_reduce_f16_pipeline() const noexcept { return reduce_f16_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_transpose_pipeline() const noexcept { return transpose_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_im2col_pipeline() const noexcept { return im2col_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_col2im_pipeline() const noexcept { return col2im_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_im2col_f16_pipeline() const noexcept { return im2col_f16_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_col2im_f16_pipeline() const noexcept { return col2im_f16_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_group_reduce_pipeline() const noexcept { return group_reduce_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_group_reduce_f16_pipeline() const noexcept { return group_reduce_f16_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_gather_pipeline() const noexcept { return gather_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_scatter_add_pipeline() const noexcept { return scatter_add_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_scatter_add_f16_pipeline() const noexcept { return scatter_add_f16_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_scan_prefix_outer_pipeline() const noexcept { return scan_prefix_outer_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_scan_suffix_outer_pipeline() const noexcept { return scan_suffix_outer_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_scan_f16_pipelines() const noexcept
+    {
+        return scan_prefix_outer_f16_pipeline_.handle() != VK_NULL_HANDLE &&
+               scan_suffix_outer_f16_pipeline_.handle() != VK_NULL_HANDLE &&
+               scan_prefix_outer_gen_f16_pipeline_.handle() != VK_NULL_HANDLE &&
+               scan_suffix_outer_gen_f16_pipeline_.handle() != VK_NULL_HANDLE;
+    }
     [[nodiscard]] bool has_scan_prefix_outer_gen_pipeline() const noexcept { return scan_prefix_outer_gen_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_scan_suffix_outer_gen_pipeline() const noexcept { return scan_suffix_outer_gen_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_outer_col_pipeline() const noexcept { return outer_col_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_outer_col_f16_pipeline() const noexcept { return outer_col_f16_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_cast_pipeline() const noexcept { return cast_pipeline_.handle() != VK_NULL_HANDLE; }
 
-    // ── D4：f16 硬件能力查询（§7.1）────────────────────────────────────
+    // ── f16 硬件能力查询（§7.1）────────────────────────────────────
     [[nodiscard]] bool has_shader_float16() const noexcept { return has_shader_float16_; }
 
     [[nodiscard]] VulkanDevice& device() noexcept { return device_; }
@@ -1421,7 +1837,7 @@ public:
     {
         return batch_mode_ ? *transient_pool_ : *memory_pool_;
     }
-    // 异步标量回读槽位数（P0-2）：供 GpuEngine 暴露给调用方做环形复用。
+    // 异步标量回读槽位数：供 GpuEngine 暴露给调用方做环形复用。
     [[nodiscard]] static constexpr std::size_t scalar_readback_slot_count() noexcept
     {
         return SCALAR_READBACK_SLOTS;
@@ -1431,11 +1847,11 @@ public:
     [[nodiscard]] VkDescriptorPool gpu_tensor_pool() const noexcept { return gpu_tensor_pool_; }
 
     // ── 非阻塞收割所有已完成帧（不含空闲块归还）────────────────────
-    // 显存峰值关键项（2026-09 探针实测）：原先只在 step 边界调用本逻辑，
-    // 步内已析构中间张量的延迟销毁一直挂在"已完成但未被收割"的帧上，
-    // 内存不还池 → backward 只能继续申请新底材；bench 配置实测 transient
-    // live 3837MB 里 pending（已析构未还池）高达 3000MB，步内峰值 ≈ 稳态
-    // 2.8×。故把收割逻辑提前到每个帧提交点（submit_frame_no_wait）。
+    // 显存峰值关键项：收割必须紧随每个帧提交点（submit_frame_no_wait）。
+    // 收割若推迟到 step 边界，步内已析构中间张量的延迟销毁会一直挂在
+    // "已完成但未被收割"的帧上、内存不还池 → backward 只能继续申请新底材
+    // （实测 bench 配置 transient live 3837MB 里 pending（已析构未还池）
+    //  高达 3000MB，步内峰值 ≈ 稳态 2.8×）。
     [[nodiscard]] Result<void> reap_completed_frames()
     {
         if (!initialized_)
@@ -1491,7 +1907,7 @@ public:
 
 
     // ══════════════════════════════════════════════════════════════════
-    // Command Buffer Batching API（多帧流水线 P0-1）
+    // Command Buffer Batching API（多帧流水线）
     // ══════════════════════════════════════════════════════════════════
     // 用法：
     //   backend.begin_batch();
@@ -1591,7 +2007,7 @@ public:
         return start_frame();
     }
 
-    // ── 结束 batch：提交当前帧，**不等待**（P0-1）─────────────────────
+    // ── 结束 batch：提交当前帧，**不等待**─────────────────────
     // 帧在队列上执行；其延迟销毁 / 描述符集在 reap 时释放。
     // 设备丢失等错误在 wait_in_flight / 环槽复用 reap 时浮出。
     [[nodiscard]] Result<void> end_batch()
@@ -1613,7 +2029,7 @@ public:
         return r;
     }
 
-    // ── 批处理中点刷新（防 TDR，P0-1 不等待版）────────────────────────
+    // ── 批处理中点刷新（防 TDR，提交不等待）────────────────────────
     // 提交当前帧（不等待），然后开始录制下一帧。用于拆分大 batch（如
     // forward 与 backward 之间），避免单次提交时间过长触发 Windows TDR。
     // 当前帧为空（无 op 录制）时 no-op——不提交、不换帧（避免浪费环槽
@@ -1643,7 +2059,7 @@ public:
         return start_frame();
     }
 
-    // ── "真正要结果"的阻塞点（P0-1）───────────────────────────────────
+    // ── "真正要结果"的阻塞点───────────────────────────────────
     // 等待所有在飞帧完成并 reap（延迟销毁 + 描述符集释放）。
     // to_matrix / copy_from 读 GPU 内存前必须调用：要读的数据可能刚由
     // 在飞帧写入，队列 FIFO 只保证顺序、不保证完成。
@@ -1685,11 +2101,11 @@ public:
         const std::size_t staging_cap = staging_ring_->region_size();
 
         // ── 小矩阵快速路径：单次传输 ──────────────────────────────────
-        // region 专属 command buffer（P0-1 修复）：不再每次上传
-        // vkAllocateCommandBuffers + 提交后立即可复用/释放——VUID-
+        // region 专属 command buffer：上传 copy 录在 region 自己的
+        // cmd 上，提交后既不 free 也不立刻复用——VUID-
         // vkFreeCommandBuffers-pCommandBuffers-00058 禁止释放 pending
-        // （已提交、fence 未 signal）的 command buffer；旧代码"submit 后
-        // 立即 free"是规范违规（实测导致驱动通道排序失效、fence 提前
+        // （已提交、fence 未 signal）的 command buffer；"submit 后立即
+        // free"是规范违规（实测导致驱动通道排序失效、fence 提前
         // signal、跨 submit 乱序）。acquire 已等在飞 fence → 该 cmd 的
         // 上一次使用完成（invalid 状态）→ vkResetCommandBuffer 复用合法。
         if (total_bytes <= staging_cap)
@@ -1726,7 +2142,7 @@ public:
                 submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
                 submit_info.commandBufferCount = 1;
                 submit_info.pCommandBuffers = &cmd;
-                // 跨 submit 数据依赖（P0-1 修复）：时间线信号量 signal 本次
+                // 跨 submit 数据依赖：时间线信号量 signal 本次
                 // 上传的 value。读取"本 copy 写入的 buffer"的后续 submit 必须
                 // wait 该 value（见 collect_staging_waits）。
                 VkTimelineSemaphoreSubmitInfo timeline_info{};
@@ -1741,7 +2157,7 @@ public:
             }
             if (!r) return r;
 
-            // P0-1：提交后不等待——host 可立即继续录制。标记 region
+            // 提交后不等待——host 可立即继续录制。标记 region
             // in use：下次 acquire 到该 region 时等其 fence（staging 安全
             // + 等待后该 cmd 离开 pending，可 reset 复用）。**不释放 cmd**
             // （pending 状态，见上方 VUID 注释）。
@@ -1788,7 +2204,7 @@ public:
             r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
             if (!r) return r;
 
-            // 3. 提交（P0-1：不等待；region 标记 in use，下次 acquire 到该
+            // 3. 提交（不等待；region 标记 in use，下次 acquire 到该
             //    region 时等其 fence；不释放 cmd——pending 状态）+ 信号本
             //    region 信号量（跨 submit 数据依赖，见 collect_staging_waits）
             auto fence = staging_ring_->fence(ri);
@@ -1987,7 +2403,7 @@ public:
         return {};
     }
 
-    // ── 通用 compute dispatch（P1-13 matmul 去重核心）──────────────────
+    // ── 通用 compute dispatch（matmul 去重核心）──────────────────
     // 统一的 descriptor/cmd/barrier/dispatch/submit 样板，供 matmul /
     // batched_matmul / rearrange 等所有"N 输入 + 1 输出"的 compute kernel 复用。
     //
@@ -2089,7 +2505,13 @@ public:
         // 1. 分配输出 Tensor（f16_io：按 2B/元素分配 + 纯绑定视图，见
         //    batched_matmul_gpu 的同款做法）
         const bool use_f16 = f16_io;
-        if (use_f16 && !has_matmul_tiled_f16_pipeline())
+        // f16 可用性：N≤8 走 GEMV（C2e，仅需 gemv_f16），否则 tiled_f16
+        if (use_f16 && N <= 8u && !has_matmul_tiled_f16_pipeline() &&
+            has_gemv_f16_pipeline())
+        {
+            // gemv_f16 可用 → 下方分派走 GEMV，无需 tiled_f16
+        }
+        else if (use_f16 && !has_matmul_tiled_f16_pipeline())
             return std::unexpected(Error{
                 "matmul_gpu: f16 pipeline 不可用（设备无 SSBO 16 位存储？）"});
         std::optional<GpuTensor> owned;
@@ -2117,12 +2539,18 @@ public:
         constexpr uint32_t GEMV_ROWS = 4;   // 与 matmul_gemv.comp 的 ROWS 一致
         // subgroup≥4 门禁：shader red[..][64] 的容量假设（256/4 = 64 槽）——
         //   更小 subgroup 会溢出 64 槽上限、部分和不落表 → 静默错值
-        //   （4.10 同类"只有 GPU 错"；实测桌面卡恒 ≥8，门禁是保险丝）
-        const bool use_gemv = !use_f16 && has_gemv_pipeline() && N <= GEMV_MAX_N
-                              && device_.subgroup_size() >= 4u;
+        //   （"只有 GPU 错"一类，见 docs/development/08-pitfalls-and-lessons.md
+        //   §4.10；实测桌面卡恒 ≥8，门禁是保险丝）
+        // Phase C2e：f16 也可走 GEMV（f16 变体 pipeline 存在时）——小 N
+        //   （n_out≤8）f16 GEMM 直读直写；变体 pipeline 缺失时引擎回退
+        //   边界 cast。
+        const bool use_gemv = has_gemv_pipeline() && N <= GEMV_MAX_N
+                              && device_.subgroup_size() >= 4u
+                              && (!use_f16 || has_gemv_f16_pipeline());
         const bool use_tiled = (use_f16 || has_tiled_pipeline()) && !use_gemv;
-        auto& pipeline = use_f16 ? matmul_tiled_f16_pipeline_
-                       : use_gemv ? matmul_gemv_pipeline_
+        auto& pipeline = use_gemv ? (use_f16 ? matmul_gemv_f16_pipeline_
+                                             : matmul_gemv_pipeline_)
+                       : use_f16 ? matmul_tiled_f16_pipeline_
                        : use_tiled ? matmul_tiled_pipeline_
                                    : matmul_pipeline_;
 
@@ -2131,9 +2559,10 @@ public:
         //     matmul.comp（naive）：16×16 线程网格 = 16×16 输出块
         //     matmul_tiled.comp：64×64 输出块（BM/BN）
         //     matmul_gemv.comp：每 WG ROWS=4 行 × N 列（单维 grid.x）
-        //   ⚠ 曾误用 WORKGROUP_SIZE=16 统一计算 → tiled 版 dispatch 出 16 倍
-        //   冗余工作组（每 16×16 一个组而非 64×64），GPU 做 16 倍无效计算，
-        //   matmul 峰值只剩 ~4%（0.7/15.7 TFLOPS）。此处按实际块尺寸修复。
+        //   ⚠ dispatch 必须按各 shader 的实际输出块尺寸计算（naive 16×16 /
+        //   tiled 64×64 / GEMV ROWS=4 行），不可按 WORKGROUP_SIZE=16 统一算：
+        //   那会让 tiled 版多派 16 倍冗余工作组（每 16×16 一个组而非 64×64），
+        //   GPU 做 16 倍无效计算，实测 matmul 峰值只剩 ~4%（0.7/15.7 TFLOPS）。
         const uint32_t push_data[5] = {M, N, K, transA, transB};
         std::vector<std::uint8_t> pc(sizeof(push_data));
         std::memcpy(pc.data(), push_data, sizeof(push_data));
@@ -2247,17 +2676,25 @@ public:
     // ══════════════════════════════════════════════════════════════════
 
     // ── 前缀扫描 + matvec 读出：输出 (rows*5, seq) ─────────────────────
+    // f16_io（Phase C2f）：输入输出均 half（f16 pipeline）；scratch St 仍
+    // f32（引擎分配）。无 f16 pipeline 时硬报错，调用方走引擎内 cast 回退。
     [[nodiscard]] Result<GpuTensor> scan_prefix_outer_gpu(
         const GpuTensor& K, const GpuTensor& V, const GpuTensor& P, const GpuTensor& R,
         const GpuTensor& A0, const GpuTensor& B0, bool has_state,
         uint32_t dk, uint32_t heads, bool causal,
-        const GpuTensor& boundary, bool has_bnd)
+        const GpuTensor& boundary, bool has_bnd,
+        bool f16_io = false)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
         if (dk == 0u || heads == 0u)
             return std::unexpected(Error{"scan_prefix_outer_gpu: dk/heads must be > 0"});
         const bool generic = dk > 64u;  // 通用路径（状态驻全局 scratch，无 dk 上限）
+        if (f16_io && !has_scan_f16_pipelines())
+            return std::unexpected(Error{"scan_prefix_outer_gpu: f16 pipelines not available"});
+        VulkanPipeline& pipe = generic
+            ? (f16_io ? scan_prefix_outer_gen_f16_pipeline_ : scan_prefix_outer_gen_pipeline_)
+            : (f16_io ? scan_prefix_outer_f16_pipeline_ : scan_prefix_outer_pipeline_);
         if (!generic && !has_scan_prefix_outer_pipeline())
             return std::unexpected(Error{"scan_prefix_outer_gpu: pipeline not available"});
         if (generic && !has_scan_prefix_outer_gen_pipeline())
@@ -2279,10 +2716,22 @@ public:
                 return std::unexpected(Error{"scan_prefix_outer_gpu: boundary must be (1, B*seq)"});
         }
         const auto BH = rows / dk;
-        auto C_res = GpuTensor::create_empty(static_cast<std::size_t>(rows) * 5, seq, *this);
-        if (!C_res)
-            return std::unexpected(C_res.error());
-        GpuTensor C = std::move(*C_res);
+        const std::size_t out_rows = static_cast<std::size_t>(rows) * 5;
+        GpuTensor C;
+        if (f16_io)
+        {
+            auto f16r = GpuTensorF16::create_empty(out_rows, seq, *this);
+            if (!f16r)
+                return std::unexpected(f16r.error());
+            C = GpuTensor(f16r->shared_buffer(), out_rows, seq);
+        }
+        else
+        {
+            auto C_res = GpuTensor::create_empty(out_rows, seq, *this);
+            if (!C_res)
+                return std::unexpected(C_res.error());
+            C = std::move(*C_res);
+        }
         struct PushPrefix { uint32_t dk, heads, seq, causal, has_state, has_bnd, rows; };
         PushPrefix push{dk, heads, seq, causal ? 1u : 0u, has_state ? 1u : 0u,
                         has_bnd ? 1u : 0u, rows};
@@ -2299,29 +2748,36 @@ public:
                 return std::unexpected(St_res.error());
             GpuTensor St = std::move(*St_res);
             std::vector<GpuTensor> inputs{K, V, P, R, A0, B0, boundary, St};
-            auto r = dispatch_compute(scan_prefix_outer_gen_pipeline_, inputs, C, pc, 1u, BH, 1u);
+            auto r = dispatch_compute(pipe, inputs, C, pc, 1u, BH, 1u);
             if (!r)
                 return std::unexpected(r.error());
             return C;
         }
         std::vector<GpuTensor> inputs{K, V, P, R, A0, B0, boundary};
-        auto r = dispatch_compute(scan_prefix_outer_pipeline_, inputs, C, pc, 1u, BH, 1u);
+        auto r = dispatch_compute(pipe, inputs, C, pc, 1u, BH, 1u);
         if (!r)
             return std::unexpected(r.error());
         return C;
     }
 
     // ── 后缀扫描 + matvec 读出：输出 (rows*3, seq) ─────────────────────
+    // f16_io 同 scan_prefix_outer_gpu（Phase C2c→C2f）。
     [[nodiscard]] Result<GpuTensor> scan_suffix_outer_gpu(
         const GpuTensor& D, const GpuTensor& X, const GpuTensor& Y,
         uint32_t dk, uint32_t heads, bool causal,
-        const GpuTensor& boundary, bool has_bnd)
+        const GpuTensor& boundary, bool has_bnd,
+        bool f16_io = false)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
         if (dk == 0u || heads == 0u)
             return std::unexpected(Error{"scan_suffix_outer_gpu: dk/heads must be > 0"});
         const bool generic = dk > 64u;  // 通用路径（状态驻全局 scratch，无 dk 上限）
+        if (f16_io && !has_scan_f16_pipelines())
+            return std::unexpected(Error{"scan_suffix_outer_gpu: f16 pipelines not available"});
+        VulkanPipeline& pipe = generic
+            ? (f16_io ? scan_suffix_outer_gen_f16_pipeline_ : scan_suffix_outer_gen_pipeline_)
+            : (f16_io ? scan_suffix_outer_f16_pipeline_ : scan_suffix_outer_pipeline_);
         if (!generic && !has_scan_suffix_outer_pipeline())
             return std::unexpected(Error{"scan_suffix_outer_gpu: pipeline not available"});
         if (generic && !has_scan_suffix_outer_gen_pipeline())
@@ -2339,10 +2795,22 @@ public:
                 return std::unexpected(Error{"scan_suffix_outer_gpu: boundary must be (1, B*seq)"});
         }
         const auto BH = rows / dk;
-        auto C_res = GpuTensor::create_empty(static_cast<std::size_t>(rows) * 3, seq, *this);
-        if (!C_res)
-            return std::unexpected(C_res.error());
-        GpuTensor C = std::move(*C_res);
+        const std::size_t out_rows = static_cast<std::size_t>(rows) * 3;
+        GpuTensor C;
+        if (f16_io)
+        {
+            auto f16r = GpuTensorF16::create_empty(out_rows, seq, *this);
+            if (!f16r)
+                return std::unexpected(f16r.error());
+            C = GpuTensor(f16r->shared_buffer(), out_rows, seq);
+        }
+        else
+        {
+            auto C_res = GpuTensor::create_empty(out_rows, seq, *this);
+            if (!C_res)
+                return std::unexpected(C_res.error());
+            C = std::move(*C_res);
+        }
         struct PushSuffix { uint32_t dk, heads, seq, causal, has_bnd, rows; };
         PushSuffix push{dk, heads, seq, causal ? 1u : 0u, has_bnd ? 1u : 0u, rows};
         std::vector<std::uint8_t> pc(sizeof(push));
@@ -2355,27 +2823,32 @@ public:
                 return std::unexpected(St_res.error());
             GpuTensor St = std::move(*St_res);
             std::vector<GpuTensor> inputs{D, X, Y, boundary, St};
-            auto r = dispatch_compute(scan_suffix_outer_gen_pipeline_, inputs, C, pc, 1u, BH, 1u);
+            auto r = dispatch_compute(pipe, inputs, C, pc, 1u, BH, 1u);
             if (!r)
                 return std::unexpected(r.error());
             return C;
         }
         std::vector<GpuTensor> inputs{D, X, Y, boundary};
-        auto r = dispatch_compute(scan_suffix_outer_pipeline_, inputs, C, pc, 1u, BH, 1u);
+        auto r = dispatch_compute(pipe, inputs, C, pc, 1u, BH, 1u);
         if (!r)
             return std::unexpected(r.error());
         return C;
     }
 
     // ── 逐列外积：输出 (rows*dk, seq) ──────────────────────────────────
+    // f16_io 同 scan_prefix_outer_gpu（Phase C2f）。
     [[nodiscard]] Result<GpuTensor> outer_col_gpu(
         const GpuTensor& P, const GpuTensor& R, const GpuTensor& S,
-        uint32_t dk, bool has_scale)
+        uint32_t dk, bool has_scale,
+        bool f16_io = false)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
         if (!has_outer_col_pipeline())
             return std::unexpected(Error{"outer_col_gpu: pipeline not available"});
+        if (f16_io && outer_col_f16_pipeline_.handle() == VK_NULL_HANDLE)
+            return std::unexpected(Error{"outer_col_gpu: f16 pipeline not available"});
+        VulkanPipeline& pipe = f16_io ? outer_col_f16_pipeline_ : outer_col_pipeline_;
         if (dk == 0u)
             return std::unexpected(Error{"outer_col_gpu: dk must be > 0"});
         const auto rows = static_cast<uint32_t>(P.rows());
@@ -2386,17 +2859,29 @@ public:
         if (has_scale && (S.rows() != rows || S.cols() != P.cols()))
             return std::unexpected(Error{"outer_col_gpu: S must be (B*H*dk, seq)"});
         const auto seq = static_cast<uint32_t>(P.cols());
-        auto C_res = GpuTensor::create_empty(static_cast<std::size_t>(rows) * dk, seq, *this);
-        if (!C_res)
-            return std::unexpected(C_res.error());
-        GpuTensor C = std::move(*C_res);
+        const std::size_t out_rows = static_cast<std::size_t>(rows) * dk;
+        GpuTensor C;
+        if (f16_io)
+        {
+            auto f16r = GpuTensorF16::create_empty(out_rows, seq, *this);
+            if (!f16r)
+                return std::unexpected(f16r.error());
+            C = GpuTensor(f16r->shared_buffer(), out_rows, seq);
+        }
+        else
+        {
+            auto C_res = GpuTensor::create_empty(out_rows, seq, *this);
+            if (!C_res)
+                return std::unexpected(C_res.error());
+            C = std::move(*C_res);
+        }
         struct PushOuter { uint32_t dk, seq, rows, has_scale; };
         PushOuter push{dk, seq, rows, has_scale ? 1u : 0u};
         std::vector<std::uint8_t> pc(sizeof(push));
         std::memcpy(pc.data(), &push, sizeof(push));
         std::vector<GpuTensor> inputs{P, R, S};
         const auto total = static_cast<uint32_t>(rows) * dk * seq;
-        auto r = dispatch_compute(outer_col_pipeline_, inputs, C, pc,
+        auto r = dispatch_compute(pipe, inputs, C, pc,
             (total + 255u) / 256u, 1u, 1u);
         if (!r)
             return std::unexpected(r.error());
@@ -2434,7 +2919,7 @@ public:
         return desc_set;
     }
 
-    // ── 辅助：跨 submit 数据依赖（P0-1 修复核心）────────────────────────
+    // ── 辅助：跨 submit 数据依赖（多帧流水线核心）────────────────────────
     // 背景：单队列 FIFO 只是执行顺序保证。实测本驱动（NVIDIA + Windows）
     // 下，消费方 submit（download/matmul/batch 帧）紧跟上传 submit
     // （<~2ms）时，消费方 GPU 操作会读到上传写入的旧值（零）；host 侧
@@ -2450,7 +2935,7 @@ public:
     // 的 value 是 no-op。二进制信号量一次 signal 只能被一个 wait 消费，第二
     // 个消费者会永久阻塞（VUID-vkQueueSubmit-pWaitSemaphores-03238），AMD
     // 老驱动实测直接死锁。
-    // host 永不阻塞（P0-1 流水线收益保留），GPU 在队列内等待数据就绪。
+    // host 永不阻塞（多帧流水线收益保留），GPU 在队列内等待数据就绪。
     // 设备不支持时间线信号量时不创建信号量，改由 drain_in_flight() 在 host
     // 侧阻塞兜底（正确性优先）。
     struct StagingWait
@@ -2540,7 +3025,7 @@ public:
     {
         if (batch_mode_)
         {
-            batch_has_ops_ = true;  // P0-1：当前帧已含 op（空帧不提交）
+            batch_has_ops_ = true;  // 当前帧已含 op（空帧不提交）
             return std::make_pair(batch_cmd_, false);
         }
 
@@ -2722,18 +3207,32 @@ public:
         const GpuTensor& A, const GpuTensor* B, const GpuTensor* C,
         uint32_t count, uint32_t mode, uint32_t op, uint32_t cmp_op,
         uint32_t flags, float scalar_b, float scalar_then, float scalar_else,
-        const GpuTensor* out = nullptr)
+        const GpuTensor* out = nullptr, bool f16_io = false)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
         if (!has_elementwise_v2_pipeline())
             return std::unexpected(Error{"elementwise_v2 pipeline not available"});
+        // Phase C1b f16 变体（仅需 16 位存储门控）；请求但无 pipeline →
+        // 报错由引擎层回退边界 cast
+        if (f16_io && !has_elementwise_v2_f16_pipeline())
+            return std::unexpected(Error{
+                "elementwise_v2_gpu: f16 pipeline 不可用（设备无16位存储）"});
+        auto& pipeline = f16_io ? elementwise_v2_f16_pipeline_
+                                : elementwise_v2_pipeline_;
 
         // 1. 输出 Tensor：原地模式直接复用 out 的 buffer，否则新分配
+        //    （f16_io：按 2B/元素分配 + 纯绑定视图，同 matmul_gpu）
         GpuTensor output;
         if (out)
         {
             output = GpuTensor(*out);
+        }
+        else if (f16_io)
+        {
+            auto f16r = GpuTensorF16::create_empty(A.rows(), A.cols(), *this);
+            if (!f16r) return std::unexpected(f16r.error());
+            output = GpuTensor(f16r->shared_buffer(), f16r->rows(), f16r->cols());
         }
         else
         {
@@ -2743,7 +3242,7 @@ public:
         }
 
         // 2. 分配描述符集
-        auto ds_r = alloc_desc_set(elementwise_v2_pipeline_.descriptor_layout());
+        auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
         if (!ds_r) return std::unexpected(ds_r.error());
         VkDescriptorSet desc_set = *ds_r;
 
@@ -2779,16 +3278,16 @@ public:
         // 5. 录制
         record_input_barriers(cmd, {a_buf});
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            elementwise_v2_pipeline_.handle());
+            pipeline.handle());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            elementwise_v2_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+            pipeline.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
 
         // Push constants: count, mode, op, cmp_op, flags (5×uint32) + scalar_b, scalar_then, scalar_else (3×float)
         struct PushData {
             uint32_t count, mode, op, cmp_op, flags;
             float scalar_b, scalar_then, scalar_else;
         } push{count, mode, op, cmp_op, flags, scalar_b, scalar_then, scalar_else};
-        vkCmdPushConstants(cmd, elementwise_v2_pipeline_.pipeline_layout(),
+        vkCmdPushConstants(cmd, pipeline.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
 
         // vec4 kernel（与 DSL count/(256*vec_width) 同口径）：每线程 4 元素
@@ -2836,7 +3335,7 @@ public:
         GpuTensor* output_override = nullptr,
         std::optional<std::uint32_t> matmul_k = std::nullopt,
         std::uint32_t matmul_batch = 1,
-        // fold 收缩轴长度（P-C1：fold shader 传入填 fold_k 槽；非 fold 传 nullopt）
+        // fold 收缩轴长度（fold shader 传入填 fold_k 槽；非 fold 传 nullopt）
         std::optional<std::uint32_t> fold_k = std::nullopt,
         // 输出存储精度（Phase 2 in-kernel f16）：true → 分配 f16 字节布局的
         // 输出缓冲（返回的 GpuTensor 仅是**占位标签**，调用方按此标志重贴
@@ -2904,7 +3403,7 @@ public:
                 "run_fused_gpu: fold 调用约定 cols（=输出列数 out_cols）必须 > 0"});
         // （形状无关：out_cols 不做 shader 侧比对——veclen 不进 key，同一
         //   shader 服务任意 d_k，PC vector_out 槽按调用方 cols 运行时填充）
-        // matmul+归约（S5）：raxis >= 0 时 mm_k 填入 PC 第 5 槽（见下方填充）
+        // matmul+归约：raxis >= 0 时 mm_k 填入 PC 第 5 槽（见下方填充）
 
         // count 以 uint32 传入 shader（gl_GlobalInvocationID / push constant），
         // 必须保证 rows*cols 不溢出 uint32，否则分派与索引会静默截断。
@@ -2996,10 +3495,11 @@ public:
         //   matmul: count, cols, rows, mm_k, mm_batch, [vp0..], c0..
         //   matmul+归约: count, cols, rows, vector_out, mm_k, mm_batch, [vp0..], c0..
         //
-        // ⚠ 固定头长度必须**逐形态**与生成器的 PC 声明一致（下面四档）。历史 bug：
-        //   "归约但无 matmul" 曾按 5 个 uint 计算（真实头部只有 4 个），导致常量池
-        //   整体后移一个 uint → shader 从错位处读常量（实测把 select(cond,1,0) 的
-        //   常量读成垃圾，GPU 上归约结果静默错值，而 CPU 正常）。
+        // ⚠ 固定头长度必须**逐形态**与生成器的 PC 声明一致：逐元素 2 /
+        //   逐元素+matmul 5 / 归约 4 / 归约+matmul 6 / fold 5 / fold+matmul 7。
+        //   错一个 uint 即常量池整体后移 → shader 从错位处读常量，GPU 上带
+        //   常量的归约静默错值而 CPU 正常（实测把 select(cond,1,0) 的常量
+        //   读成垃圾）。
         const std::uint32_t pc_base =
             (is_fold && matmul_k)       ? 7u   // fold+mm: …, fold_k, mm_k, mm_batch
           : (is_fold)                   ? 5u   // fold: count,cols,rows,vector_out,fold_k
@@ -3027,7 +3527,7 @@ public:
                         sizeof(std::uint32_t));
             if (has_mm)
             {
-                // matmul+归约（S5/S7）：mm_k + mm_batch（形状参数，运行时填充）
+                // matmul+归约：mm_k + mm_batch（形状参数，运行时填充）
                 std::memcpy(pc.data() + 4 * sizeof(std::uint32_t), &*matmul_k,
                             sizeof(std::uint32_t));
                 std::memcpy(pc.data() + 5 * sizeof(std::uint32_t), &matmul_batch,
@@ -3048,8 +3548,8 @@ public:
         }
         else if (is_fold)
         {
-            // fold（P-C1/P-C2）：rows + **vector_out = 调用方输出列数**
-            //   （形状无关——veclen 不进 key，PC 运行时填充；P-C1 v1 生成器
+            // fold：rows + **vector_out = 调用方输出列数**
+            //   （形状无关——veclen 不进 key，PC 运行时填充；v1 生成器
             //   不读此槽、填 1 无害）+ fold_k + [mm_k, mm_batch]（7 槽形态）。
             //   与生成器 PC 声明逐字段一致（4.10：创建侧 range 必须同改）
             const std::uint32_t rows32 = static_cast<std::uint32_t>(rows);
@@ -3086,7 +3586,7 @@ public:
         // dispatch：逐元素 = ceil(count/(256*vec_width))；行归约 = rows 个工作组；
         // 列归约 = ceil(cols/32) 个工作组（每工作组 32 列 tile、warp=行块，
         // 与生成器 l/wb/col 结构及 OP 级 reduce.comp 契约同源）；
-        // matmul 分块（S5）= (ceil(cols/BLOCK), ceil(m_per/BLOCK), matmul_batch)，
+        // matmul 分块 = (ceil(cols/BLOCK), ceil(m_per/BLOCK), matmul_batch)，
         // BLOCK 与 glsl_gen 生成的输出块一致（EXPR_MATMUL_BLOCK=64：每工作组
         // 64×64 输出块、16×16 线程、每线程 4×4 寄存器分块）
         const std::uint32_t vec_width = fused_vec_width_.count(shader_name)
@@ -3096,17 +3596,17 @@ public:
             const std::uint32_t wg_x =
                 (static_cast<std::uint32_t>(cols) + nn::EXPR_MATMUL_BLOCK - 1u)
                 / nn::EXPR_MATMUL_BLOCK;
-            // batch（S7）：dispatch z = 批次，A/B 按 batch 垂直切分 → y 只覆盖
+            // batch：dispatch z = 批次，A/B 按 batch 垂直切分 → y 只覆盖
             // **批内**行 m_per = rows/mm_batch（生成器 main/load_tiles 均以 m_per
             // 为界、写回守卫 rr < m_per）。按总 rows 派 y 会把 batch 在 y/z 数
             // 两遍 → 工作量 ∝ batch²：多余 (BH−1)/BH 的 WG 跑完整条 mm_k 流水
-            // 后整块丢弃（结果仍正确 → 对拍测不出；AGENTS §12 ⑤ batch=32
-            // train 异常的根因）。rows = batch*M 按契约整除。
+            // 后整块丢弃——结果仍正确、对拍永远测不出，只有计时能发现。rows =
+            // batch*M 按契约整除。
             const std::uint32_t rows_u = static_cast<std::uint32_t>(rows);
             const std::uint32_t m_per  = rows_u / matmul_batch;
             const std::uint32_t wg_y =
                 (m_per + nn::EXPR_MATMUL_BLOCK - 1u) / nn::EXPR_MATMUL_BLOCK;
-            // batch（S7）：dispatch z = 批次，A/B 按 batch 垂直切分
+            // batch：dispatch z = 批次，A/B 按 batch 垂直切分
             vkCmdDispatch(cmd, wg_x, wg_y, matmul_batch);
         }
         else
@@ -3139,9 +3639,9 @@ public:
         {
             const long long dt = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - prof_t0).count();
-            // fold 按形态如实打印（is_fold；旧表达式对 v1 fold 打 0、对非
-            // fold 打 1）；out= 运行时列数（veclen 不进 key，注册侧值可能
-            // 与调用方实际 cols 不同——按注册侧打印曾误导归因）
+            // fold 按形态如实打印（is_fold = 本形态是否 fold）；out= 运行时
+            // 列数（veclen 不进 key，注册侧值可能与调用方实际 cols 不同——
+            // 打印注册侧列数会误导归因）
             std::fprintf(stderr,
                 "[gpu-profile] fused fold=%d out=%u total=%lldus key=%.16s\n",
                 static_cast<int>(is_fold),
@@ -3164,14 +3664,23 @@ public:
     // mode: 0=row_reduce → out(rows,1), 1=col_reduce → out(1,cols)
     // reduce_op: 0=sum, 1=max
     // 列归约大行数走两段式 partials（同 cmd 双 dispatch 单次提交，见分支内注释）
+    // f16_in（Phase C2）：输入缓冲按 float16_t 读（reduce_f16_pipeline_）；
+    // 输出/ partials 恒 f32 → 两段式 pass2 输入是 f32 partials，恒用 f32
+    // pipeline（ds/layout 各随所属 pipeline）。f16 pipeline 未创建时硬报错，
+    // 由调用方（GpuEngine）提前查 has_reduce_f16_pipeline 走引擎内 cast 回退。
     // ══════════════════════════════════════════════════════════════════
     [[nodiscard]] Result<GpuTensor> reduce_gpu(
-        const GpuTensor& input, uint32_t mode, uint32_t reduce_op)
+        const GpuTensor& input, uint32_t mode, uint32_t reduce_op,
+        bool f16_in = false)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
         if (!has_reduce_pipeline())
             return std::unexpected(Error{"reduce pipeline not available"});
+        if (f16_in && !has_reduce_f16_pipeline())
+            return std::unexpected(Error{"reduce f16 pipeline not available"});
+        // 输入侧 pipeline（pass1 / 单段）；输出侧与 pass2 恒 f32 pipeline
+        VulkanPipeline& in_pipe = f16_in ? reduce_f16_pipeline_ : reduce_pipeline_;
 
         const uint32_t rows = static_cast<uint32_t>(input.rows());
         const uint32_t cols = static_cast<uint32_t>(input.cols());
@@ -3199,17 +3708,16 @@ public:
             const uint32_t want = (512u + tiles - 1u) / tiles;   // ≥512 WG ≈ 4 波
             if (want > nchunk) nchunk = want;
             if (nchunk > 8u) nchunk = 8u;
-            // 小形状回落单段：512² 交错 A/B 实测两段 −16%（第二遍+屏障对
-            // ~10µs kernel 净亏），1024² 起两者持平或两段转优 → 边界 512K 元素
+            // 小形状回落单段：512² 实测两段 −16%（第二遍+屏障对
+            // ~10µs kernel 净亏），1024² 起两段持平或转优 → 边界 512K 元素
             if (rows < 256u ||
                 static_cast<std::uint64_t>(rows) * cols < 524'288ull)
                 nchunk = 1u;
         }
-        // 两段式启用条件（同负载窗交错 A/B 定案：TP/SP 两二进制逐轮换序、
-        // warmup 30、best-of-10；同码对照噪声地板 ±5%）：
-        //   5244² TP 4/5 胜（中位 0.405 vs 0.430，−6%；单段 1.2 波尾欠喂被消除）
-        //   4096² SP 5/5 胜 ~2%（0.277 vs 0.283；单波本已喂满，TP 纯付 ~6µs）
-        //   512² TP −16%（对 ~10µs kernel 第二遍+屏障净亏）→ 尺寸护栏只排除它
+        // 两段式启用条件（同窗交错 A/B 实测，同码对照噪声地板 ±5%）：
+        //   5244² 两段 −6%（0.405 vs 0.430；单段 1.2 波尾欠喂被消除）
+        //   4096² 两段 ~2%（0.277 vs 0.283；单波本已喂满，第二段纯付 ~6µs）
+        //   512² 两段 −16%（对 ~10µs kernel 第二遍+屏障净亏）→ 尺寸护栏只排除它
         const bool two_pass = (nchunk > 1u);
         const uint32_t chunk_rows = two_pass ? (rows + nchunk - 1u) / nchunk : 0u;
 
@@ -3225,7 +3733,10 @@ public:
             }
             const GpuTensor& partial = *reduce_partial_;
 
-            auto ds1_r = alloc_desc_set(reduce_pipeline_.descriptor_layout());
+            // pass1 读输入（f16_in → f16 pipeline，ds/layout 随之）；
+            // pass2 读 f32 partials → 恒 f32 pipeline（f16 shader 读 f32
+            // partials = 静默错值，必须分开）
+            auto ds1_r = alloc_desc_set(in_pipe.descriptor_layout());
             if (!ds1_r) return std::unexpected(ds1_r.error());
             VkDescriptorSet ds1 = *ds1_r;
             auto ds2_r = alloc_desc_set(reduce_pipeline_.descriptor_layout());
@@ -3264,21 +3775,24 @@ public:
             }
             auto [cmd, owns_cmd] = *cmd_r;
 
-            // pass1：行块级部分归约 → partials
+            // pass1：行块级部分归约 → partials（读输入 → in_pipe）
             record_input_barriers(cmd, {input.buffer().impl()});
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                reduce_pipeline_.handle());
+                in_pipe.handle());
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                reduce_pipeline_.pipeline_layout(), 0, 1, &ds1, 0, nullptr);
+                in_pipe.pipeline_layout(), 0, 1, &ds1, 0, nullptr);
             const uint32_t push1[5] = {rows, cols, 1u, reduce_op, chunk_rows};
-            vkCmdPushConstants(cmd, reduce_pipeline_.pipeline_layout(),
+            vkCmdPushConstants(cmd, in_pipe.pipeline_layout(),
                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push1), push1);
             vkCmdDispatch(cmd, (cols + 31u) / 32u, nchunk, 1);
 
             // partials：写 → 读（同 cmd 内跨 dispatch 依赖）
             record_input_barriers(cmd, {partial.buffer().impl()});
 
-            // pass2：合并 partials（rows = nchunk ≤ 8，复用 mode1 整表路径）
+            // pass2：合并 partials（rows = nchunk ≤ 8，复用 mode1 整表路径；
+            // 输入 = f32 partials → 恒 f32 pipeline）
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                reduce_pipeline_.handle());
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                 reduce_pipeline_.pipeline_layout(), 0, 1, &ds2, 0, nullptr);
             const uint32_t push2[5] = {nchunk, cols, 1u, reduce_op, 0u};
@@ -3296,8 +3810,8 @@ public:
             return output;
         }
 
-        // 2. 分配描述符集
-        auto ds_r = alloc_desc_set(reduce_pipeline_.descriptor_layout());
+        // 2. 分配描述符集（随 in_pipe：f16_in 时输入按 float16_t 读）
+        auto ds_r = alloc_desc_set(in_pipe.descriptor_layout());
         if (!ds_r) return std::unexpected(ds_r.error());
         VkDescriptorSet desc_set = *ds_r;
 
@@ -3330,12 +3844,12 @@ public:
         // 5. 录制
         record_input_barriers(cmd, {input.buffer().impl()});
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            reduce_pipeline_.handle());
+            in_pipe.handle());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            reduce_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+            in_pipe.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
 
         const uint32_t push_data[5] = {rows, cols, mode, reduce_op, 0u};
-        vkCmdPushConstants(cmd, reduce_pipeline_.pipeline_layout(),
+        vkCmdPushConstants(cmd, in_pipe.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
 
         // 行：每 WG 256 线程协作归约一行 → rows 个 WG；
@@ -3364,26 +3878,43 @@ public:
     // ══════════════════════════════════════════════════════════════════
     [[nodiscard]] Result<GpuTensor> rearrange_3d_gpu(
         const GpuTensor& input,
-        uint32_t M, uint32_t B, uint32_t N, uint32_t inverse)
+        uint32_t M, uint32_t B, uint32_t N, uint32_t inverse,
+        bool f16_io = false)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
         if (!has_rearrange_3d_pipeline())
             return std::unexpected(Error{"rearrange_3d pipeline not available"});
+        if (f16_io && !has_rearrange_3d_f16_pipeline())
+            return std::unexpected(Error{
+                "rearrange_3d_gpu: f16 pipeline 不可用（设备无16位存储）"});
+        auto& pipeline = f16_io ? rearrange_3d_f16_pipeline_
+                                : rearrange_3d_pipeline_;
 
         const uint32_t total = M * B * N;
         if (total != input.rows() * input.cols())
             return std::unexpected(Error{"rearrange_3d: element count mismatch"});
 
-        // 1. 分配输出 Tensor
+        // 1. 分配输出 Tensor（f16：2B/元素 + 纯绑定视图，同 matmul_gpu）
         const std::size_t out_rows = inverse ? M : (static_cast<std::size_t>(B) * M);
         const std::size_t out_cols = inverse ? (static_cast<std::size_t>(B) * N) : N;
-        auto output_res = GpuTensor::create_empty(out_rows, out_cols, *this);
-        if (!output_res) return std::unexpected(output_res.error());
-        GpuTensor output = std::move(*output_res);
+        std::optional<GpuTensor> owned;
+        if (f16_io)
+        {
+            auto f16r = GpuTensorF16::create_empty(out_rows, out_cols, *this);
+            if (!f16r) return std::unexpected(f16r.error());
+            owned.emplace(f16r->shared_buffer(), f16r->rows(), f16r->cols());
+        }
+        else
+        {
+            auto output_res = GpuTensor::create_empty(out_rows, out_cols, *this);
+            if (!output_res) return std::unexpected(output_res.error());
+            owned.emplace(std::move(*output_res));
+        }
+        GpuTensor output = *owned;
 
         // 2. 分配描述符集
-        auto ds_r = alloc_desc_set(rearrange_3d_pipeline_.descriptor_layout());
+        auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
         if (!ds_r) return std::unexpected(ds_r.error());
         VkDescriptorSet desc_set = *ds_r;
 
@@ -3416,12 +3947,12 @@ public:
         // 5. 录制
         record_input_barriers(cmd, {input.buffer().impl()});
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            rearrange_3d_pipeline_.handle());
+            pipeline.handle());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            rearrange_3d_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+            pipeline.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
 
         const uint32_t push_data[5] = {M, B, N, inverse, total};
-        vkCmdPushConstants(cmd, rearrange_3d_pipeline_.pipeline_layout(),
+        vkCmdPushConstants(cmd, pipeline.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
 
         const uint32_t wg_count = (total + 255) / 256;
@@ -3528,7 +4059,7 @@ public:
     }
 
     // ══════════════════════════════════════════════════════════════════
-    // 异步标量回读（P0-2）—— 语义见成员声明处
+    // 异步标量回读—— 语义见成员声明处
     // ══════════════════════════════════════════════════════════════════
     [[nodiscard]] Result<void> init_scalar_readback_slots()
     {
@@ -3991,23 +4522,41 @@ public:
     // Push Constants (8 bytes): rows, cols
     // Bindings: In(0), Out(1)
     // ══════════════════════════════════════════════════════════════════
-    [[nodiscard]] Result<GpuTensor> transpose_gpu(const GpuTensor& A)
+    [[nodiscard]] Result<GpuTensor> transpose_gpu(const GpuTensor& A,
+                                                  bool f16_io = false)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
         if (!has_transpose_pipeline())
             return std::unexpected(Error{"transpose pipeline not available"});
+        // Phase C1 f16 变体：f16_io 请求但设备无 f16 pipeline（能力门控未过）
+        // → 显式报错，引擎层回退边界 cast（不静默绑错类型）
+        if (f16_io && !has_transpose_f16_pipeline())
+            return std::unexpected(Error{
+                "transpose_gpu: f16 pipeline 不可用（需16位存储 + shaderFloat16）"});
+        auto& pipeline = f16_io ? transpose_f16_pipeline_ : transpose_pipeline_;
 
         const uint32_t R = static_cast<uint32_t>(A.rows());
         const uint32_t C = static_cast<uint32_t>(A.cols());
 
-        // 输出 (C, R)
-        auto out_res = GpuTensor::create_empty(C, R, *this);
-        if (!out_res) return std::unexpected(out_res.error());
-        GpuTensor output = std::move(*out_res);
+        // 输出 (C, R)：f16 按 2B/元素分配 + 纯绑定视图（同 matmul_gpu 做法）
+        std::optional<GpuTensor> owned;
+        if (f16_io)
+        {
+            auto f16r = GpuTensorF16::create_empty(C, R, *this);
+            if (!f16r) return std::unexpected(f16r.error());
+            owned.emplace(f16r->shared_buffer(), f16r->rows(), f16r->cols());
+        }
+        else
+        {
+            auto out_res = GpuTensor::create_empty(C, R, *this);
+            if (!out_res) return std::unexpected(out_res.error());
+            owned.emplace(std::move(*out_res));
+        }
+        GpuTensor output = *owned;
 
         // 分配描述符集
-        auto ds_r = alloc_desc_set(transpose_pipeline_.descriptor_layout());
+        auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
         if (!ds_r) return std::unexpected(ds_r.error());
         VkDescriptorSet desc_set = *ds_r;
 
@@ -4040,21 +4589,21 @@ public:
         // 录制
         record_input_barriers(cmd, {A.buffer().impl()});
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            transpose_pipeline_.handle());
+            pipeline.handle());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            transpose_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+            pipeline.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
 
         const uint32_t push_data[2] = {R, C};
-        vkCmdPushConstants(cmd, transpose_pipeline_.pipeline_layout(),
+        vkCmdPushConstants(cmd, pipeline.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
 
         // 砖块化 dispatch：(8, 8, n_bricks)——每 WG 覆盖 64×64 输出块，
         // 8×8 个 WG 组成一砖（并发足迹聚集，见 transpose.comp 头注释）。
         // 越界 tile 由 shader 早退（dispatch 固定 8×8，末砖可不满）。
         // ⚠️ x 必须是 8 而非 16：shader 按 8 宽砖解算 tile_c =
-        // (bz%bx_count)*8 + gl_WorkGroupID.x，假定 gl_WorkGroupID.x ∈ [0,8)。
-        // 曾误派发 16 宽 → tile_c 跨两砖且越界 tile 只早退一半，
-        // 行>512 且列>512 时静默只写前 512 行（issue #13 P0-①）。
+        // (bz%bx_count)*8 + gl_WorkGroupID.x，假定 gl_WorkGroupID.x ∈ [0,8)；
+        // 派发 16 宽会让 tile_c 跨两砖、越界 tile 只早退一半，行>512 且列>512
+        // 时静默只写前 512 行。
         const uint32_t tx = (C + 63u) / 64u;
         const uint32_t ty = (R + 63u) / 64u;
         const uint32_t bx = (tx + 7u) / 8u;
@@ -4080,26 +4629,41 @@ public:
         const GpuTensor& x,
         std::size_t C, std::size_t H, std::size_t W,
         std::size_t k, std::size_t stride, std::size_t pad,
-        std::size_t OH, std::size_t OW)
+        std::size_t OH, std::size_t OW,
+        bool f16_io = false)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
         if (!has_im2col_pipeline())
             return std::unexpected(Error{"im2col pipeline not available"});
+        if (f16_io && !has_im2col_f16_pipeline())
+            return std::unexpected(Error{"im2col f16 pipeline not available"});
         if (C == 0 || H == 0 || W == 0 || k == 0 || stride == 0 || OH == 0 || OW == 0)
             return std::unexpected(Error{"im2col_gpu: C/H/W/k/stride/OH/OW must be > 0"});
         if (x.rows() != C * H * W)
             return std::unexpected(Error{"im2col_gpu: x must be (C*H*W, B)"});
+        VulkanPipeline& pipe = f16_io ? im2col_f16_pipeline_ : im2col_pipeline_;
 
         const std::size_t B    = x.cols();
         const std::size_t rows = C * k * k;
         const std::size_t cols = B * OH * OW;
 
-        auto out_res = GpuTensor::create_empty(rows, cols, *this);
-        if (!out_res) return std::unexpected(out_res.error());
-        GpuTensor output = std::move(*out_res);
+        // f16 输出按 2B/元素分配 + 纯绑定视图（同 matmul_gpu/elementwise f16_io）
+        GpuTensor output;
+        if (f16_io)
+        {
+            auto f16r = GpuTensorF16::create_empty(rows, cols, *this);
+            if (!f16r) return std::unexpected(f16r.error());
+            output = GpuTensor(f16r->shared_buffer(), rows, cols);
+        }
+        else
+        {
+            auto out_res = GpuTensor::create_empty(rows, cols, *this);
+            if (!out_res) return std::unexpected(out_res.error());
+            output = std::move(*out_res);
+        }
 
-        auto ds_r = alloc_desc_set(im2col_pipeline_.descriptor_layout());
+        auto ds_r = alloc_desc_set(pipe.descriptor_layout());
         if (!ds_r) return std::unexpected(ds_r.error());
         VkDescriptorSet desc_set = *ds_r;
 
@@ -4129,9 +4693,9 @@ public:
 
         record_input_barriers(cmd, {x.buffer().impl()});
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            im2col_pipeline_.handle());
+            pipe.handle());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            im2col_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+            pipe.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
 
         const uint32_t push_data[9] = {
             static_cast<uint32_t>(C),      static_cast<uint32_t>(H),
@@ -4139,7 +4703,7 @@ public:
             static_cast<uint32_t>(stride), static_cast<uint32_t>(pad),
             static_cast<uint32_t>(OH),     static_cast<uint32_t>(OW),
             static_cast<uint32_t>(B)};
-        vkCmdPushConstants(cmd, im2col_pipeline_.pipeline_layout(),
+        vkCmdPushConstants(cmd, pipe.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
 
         const std::size_t total = rows * cols;
@@ -4159,27 +4723,41 @@ public:
         const GpuTensor& col,
         std::size_t C, std::size_t H, std::size_t W,
         std::size_t k, std::size_t stride, std::size_t pad,
-        std::size_t OH, std::size_t OW)
+        std::size_t OH, std::size_t OW,
+        bool f16_io = false)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
         if (!has_col2im_pipeline())
             return std::unexpected(Error{"col2im pipeline not available"});
+        if (f16_io && !has_col2im_f16_pipeline())
+            return std::unexpected(Error{"col2im f16 pipeline not available"});
         if (C == 0 || H == 0 || W == 0 || k == 0 || stride == 0 || OH == 0 || OW == 0)
             return std::unexpected(Error{"col2im_gpu: C/H/W/k/stride/OH/OW must be > 0"});
         const std::size_t P = OH * OW;
         if (col.rows() != C * k * k || col.cols() == 0 || col.cols() % P != 0)
             return std::unexpected(Error{"col2im_gpu: col must be (C*k*k, B*OH*OW)"});
+        VulkanPipeline& pipe = f16_io ? col2im_f16_pipeline_ : col2im_pipeline_;
 
         const std::size_t B    = col.cols() / P;
         const std::size_t rows = C * H * W;
         const std::size_t cols = B;
 
-        auto out_res = GpuTensor::create_empty(rows, cols, *this);
-        if (!out_res) return std::unexpected(out_res.error());
-        GpuTensor output = std::move(*out_res);
+        GpuTensor output;
+        if (f16_io)
+        {
+            auto f16r = GpuTensorF16::create_empty(rows, cols, *this);
+            if (!f16r) return std::unexpected(f16r.error());
+            output = GpuTensor(f16r->shared_buffer(), rows, cols);
+        }
+        else
+        {
+            auto out_res = GpuTensor::create_empty(rows, cols, *this);
+            if (!out_res) return std::unexpected(out_res.error());
+            output = std::move(*out_res);
+        }
 
-        auto ds_r = alloc_desc_set(col2im_pipeline_.descriptor_layout());
+        auto ds_r = alloc_desc_set(pipe.descriptor_layout());
         if (!ds_r) return std::unexpected(ds_r.error());
         VkDescriptorSet desc_set = *ds_r;
 
@@ -4209,9 +4787,9 @@ public:
 
         record_input_barriers(cmd, {col.buffer().impl()});
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            col2im_pipeline_.handle());
+            pipe.handle());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            col2im_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+            pipe.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
 
         const uint32_t push_data[9] = {
             static_cast<uint32_t>(C),      static_cast<uint32_t>(H),
@@ -4219,7 +4797,7 @@ public:
             static_cast<uint32_t>(stride), static_cast<uint32_t>(pad),
             static_cast<uint32_t>(OH),     static_cast<uint32_t>(OW),
             static_cast<uint32_t>(B)};
-        vkCmdPushConstants(cmd, col2im_pipeline_.pipeline_layout(),
+        vkCmdPushConstants(cmd, pipe.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
 
         const std::size_t total = rows * cols;
@@ -4240,14 +4818,20 @@ public:
     //   x (G*R, N) → out (G, N)
     //   Push Constants (16 bytes): G, R, N, reduce_op
     //   Bindings: In(0), Out(1)；Dispatch: ceil(G*N / 256)
+    //   f16_in（Phase C2c）：x 按 half 读、输出恒 f32（CNN 调用 P=F32）；
+    //   pipeline 未创建时硬报错，调用方提前查 has_group_reduce_f16_pipeline
+    //   走引擎内 cast 回退。
     // ══════════════════════════════════════════════════════════════════
     [[nodiscard]] Result<GpuTensor> grouped_reduce_gpu(
-        const GpuTensor& x, std::size_t G, std::size_t R, bool is_max)
+        const GpuTensor& x, std::size_t G, std::size_t R, bool is_max,
+        bool f16_in = false)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
         if (!has_group_reduce_pipeline())
             return std::unexpected(Error{"group_reduce pipeline not available"});
+        if (f16_in && !has_group_reduce_f16_pipeline())
+            return std::unexpected(Error{"group_reduce f16 pipeline not available"});
         if (G == 0 || R == 0)
             return std::unexpected(Error{"grouped_reduce_gpu: G/R must be > 0"});
         if (x.rows() != G * R)
@@ -4255,12 +4839,14 @@ public:
         const std::size_t N = x.cols();
         if (N == 0)
             return std::unexpected(Error{"grouped_reduce_gpu: N must be > 0"});
+        VulkanPipeline& pipe = f16_in ? group_reduce_f16_pipeline_
+                                       : group_reduce_pipeline_;
 
         auto out_res = GpuTensor::create_empty(G, N, *this);
         if (!out_res) return std::unexpected(out_res.error());
         GpuTensor output = std::move(*out_res);
 
-        auto ds_r = alloc_desc_set(group_reduce_pipeline_.descriptor_layout());
+        auto ds_r = alloc_desc_set(pipe.descriptor_layout());
         if (!ds_r) return std::unexpected(ds_r.error());
         VkDescriptorSet desc_set = *ds_r;
 
@@ -4290,14 +4876,14 @@ public:
 
         record_input_barriers(cmd, {x.buffer().impl()});
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            group_reduce_pipeline_.handle());
+            pipe.handle());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            group_reduce_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+            pipe.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
 
         const uint32_t push_data[4] = {
             static_cast<uint32_t>(G), static_cast<uint32_t>(R),
             static_cast<uint32_t>(N), is_max ? 1u : 0u};
-        vkCmdPushConstants(cmd, group_reduce_pipeline_.pipeline_layout(),
+        vkCmdPushConstants(cmd, pipe.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
 
         const std::size_t total = G * N;
@@ -4322,24 +4908,42 @@ public:
     // Bindings: Table(0), Indices(1), Output(2)
     // ══════════════════════════════════════════════════════════════════
     [[nodiscard]] Result<GpuTensor> gather_gpu(
-        const GpuTensor& table, const GpuTensor& indices)
+        const GpuTensor& table, const GpuTensor& indices,
+        bool f16_io = false)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
         if (!has_gather_pipeline())
             return std::unexpected(Error{"gather pipeline not available"});
+        // Phase C1 f16 变体：table/out f16；**indices 恒 f32**（行号整数值
+        // 精度要求，shader 内 float indices 槽不变）
+        if (f16_io && !has_gather_f16_pipeline())
+            return std::unexpected(Error{
+                "gather_gpu: f16 pipeline 不可用（设备无16位存储）"});
+        auto& pipeline = f16_io ? gather_f16_pipeline_ : gather_pipeline_;
 
         const uint32_t vocab = static_cast<uint32_t>(table.rows());
         const uint32_t D = static_cast<uint32_t>(table.cols());
         const uint32_t num = static_cast<uint32_t>(indices.rows() * indices.cols());
 
-        // 输出 (num, D)
-        auto out_res = GpuTensor::create_empty(num, D, *this);
-        if (!out_res) return std::unexpected(out_res.error());
-        GpuTensor output = std::move(*out_res);
+        // 输出 (num, D)（f16：2B/元素 + 纯绑定视图，同 matmul_gpu）
+        std::optional<GpuTensor> owned;
+        if (f16_io)
+        {
+            auto f16r = GpuTensorF16::create_empty(num, D, *this);
+            if (!f16r) return std::unexpected(f16r.error());
+            owned.emplace(f16r->shared_buffer(), f16r->rows(), f16r->cols());
+        }
+        else
+        {
+            auto out_res = GpuTensor::create_empty(num, D, *this);
+            if (!out_res) return std::unexpected(out_res.error());
+            owned.emplace(std::move(*out_res));
+        }
+        GpuTensor output = *owned;
 
         // 分配描述符集
-        auto ds_r = alloc_desc_set(gather_pipeline_.descriptor_layout());
+        auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
         if (!ds_r) return std::unexpected(ds_r.error());
         VkDescriptorSet desc_set = *ds_r;
 
@@ -4373,12 +4977,12 @@ public:
         // 录制
         record_input_barriers(cmd, {table.buffer().impl(), indices.buffer().impl()});
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            gather_pipeline_.handle());
+            pipeline.handle());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            gather_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+            pipeline.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
 
         const uint32_t push_data[3] = {vocab, D, num};
-        vkCmdPushConstants(cmd, gather_pipeline_.pipeline_layout(),
+        vkCmdPushConstants(cmd, pipeline.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
 
         const uint32_t total = num * D;
@@ -4407,21 +5011,30 @@ public:
     //
     // 注意：dst buffer 内容以 uint 视角访问用于 atomicCompSwap。
     // dst 初始值必须为合法 float 位模式（如 0x00000000 = 0.0f）。
+    // f16_io（Phase C2b）：dst/grad 为 f16 存储——f16 shader 里 dst 每 uint
+    // word 打包 2 个 half（CAS 覆盖整 word）、grad half 直读；indices 恒
+    // float（行号 >2048 禁 f16）。pipeline 未创建时硬报错，调用方提前查
+    // has_scatter_add_f16_pipeline 走引擎内 cast 回退。
     // ══════════════════════════════════════════════════════════════════
     [[nodiscard]] Result<void> scatter_add_gpu(
-        GpuTensor& dst, const GpuTensor& indices, const GpuTensor& grad)
+        GpuTensor& dst, const GpuTensor& indices, const GpuTensor& grad,
+        bool f16_io = false)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
         if (!has_scatter_add_pipeline())
             return std::unexpected(Error{"scatter_add pipeline not available"});
+        VulkanPipeline& pipe = f16_io ? scatter_add_f16_pipeline_
+                                       : scatter_add_pipeline_;
+        if (f16_io && !has_scatter_add_f16_pipeline())
+            return std::unexpected(Error{"scatter_add f16 pipeline not available"});
 
         const uint32_t vocab = static_cast<uint32_t>(dst.rows());
         const uint32_t D = static_cast<uint32_t>(dst.cols());
         const uint32_t num = static_cast<uint32_t>(indices.rows() * indices.cols());
 
         // 分配描述符集
-        auto ds_r = alloc_desc_set(scatter_add_pipeline_.descriptor_layout());
+        auto ds_r = alloc_desc_set(pipe.descriptor_layout());
         if (!ds_r) return std::unexpected(ds_r.error());
         VkDescriptorSet desc_set = *ds_r;
 
@@ -4478,12 +5091,12 @@ public:
         }
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            scatter_add_pipeline_.handle());
+            pipe.handle());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            scatter_add_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+            pipe.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
 
         const uint32_t push_data[3] = {vocab, D, num};
-        vkCmdPushConstants(cmd, scatter_add_pipeline_.pipeline_layout(),
+        vkCmdPushConstants(cmd, pipe.pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
 
         const uint32_t total = num * D;
@@ -4534,9 +5147,9 @@ GpuBuffer::~GpuBuffer()
         //   2. 非 batch 但最近提交的帧仍在飞行：本 buffer 可能被该帧命令
         //      引用（fence 信号即可证明安全）
         // 延迟销毁打上帧标签，该帧完成（环槽复用 / drain / 非阻塞 reap）
-        // 时立即销毁 + 归还内存——锁窗从"整个 batch"缩短到"所属帧"
-        // （P0-1）。
-        // D1 修复：内存归还也一并延迟到 buffer 销毁之后。若此处立即
+        // 时立即销毁 + 归还内存——锁窗只到所属帧，不跨越整个 batch
+        // （多帧流水线）。
+        // 内存归还也一并延迟到 buffer 销毁之后。若此处立即
         // pool_->free()，新 buffer 可能分配到本 buffer 尚未销毁的同一区间
         // → 两个存活 buffer 内存重叠，违反 Vulkan 规范。
         // GpuBuffer 只经 MemoryPool 创建（create_device_local /

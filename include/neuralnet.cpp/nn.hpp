@@ -5,8 +5,7 @@
 //
 // 包含顺序按依赖关系排列：L0 → L1 → L2 → L3 → L4
 // 注意：algebra_span.hpp 由 algebra_matrix.hpp 传递包含；algebra_ops.hpp 由
-//       expr_dsl.hpp 引入（旧 algebra_expr/algebra_compute 已随逐元素算子移除），
-//       core_config.hpp 已传递包含 core_errors.hpp，
+//       expr_dsl.hpp 引入，core_config.hpp 已传递包含 core_errors.hpp，
 //       此处显式列出所有头文件是为了清晰展示模块结构。
 //
 // 新架构（引擎化）：

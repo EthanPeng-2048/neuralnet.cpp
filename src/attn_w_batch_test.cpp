@@ -1,9 +1,9 @@
 // ── attn_w_batch_test.cpp — GPU 注意力 W 表达式 batch 行号回归测试（ctest）──
 //
-// 背景：GPU 融合 matmul 尾链曾按 **batch 内行号**读取 (rows,1) 全网格输入
-// （注意力的 m/l），导致 batch>1 或多头（BH>1）时 m/l 读错 → GPU 前向错误
-// （2026-08-27 审查发现，P0-1）。本测试用同一随机权重、同一输入对比
-// CausalSelfAttention 的 CPU/GPU forward，覆盖 4 组配置
+// 守什么：GPU 融合 matmul 尾链必须按**全局行号**（而非 batch 内行号）读取
+// (rows,1) 全网格输入（注意力的 m/l）——按 batch 内行号读会在 batch>1 或
+// 多头（BH>1）时读错 m/l → GPU 前向错误。本测试用同一随机权重、同一输入
+// 对比 CausalSelfAttention 的 CPU/GPU forward，覆盖 4 组配置
 // (batch, heads) = (1,1)(2,1)(1,2)(2,2)（BH 最大 4），
 // 任一 max_abs > 1e-3 判失败。
 //
@@ -104,7 +104,7 @@ int main(int argc, char** argv)
     }
     else
     {
-        // ctest 默认：4 组配置全跑（任一组 BH>1 即可复现原 batch 内行号 bug）
+        // ctest 默认：4 组配置全跑（任一组 BH>1 即可暴露 batch 内行号读错）
         const std::size_t cfgs[4][2] = {{1, 1}, {2, 1}, {1, 2}, {2, 2}};
         for (auto& c : cfgs)
             if (!run_cfg(c[0], c[1])) ++failed;

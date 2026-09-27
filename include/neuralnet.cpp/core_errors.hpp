@@ -52,7 +52,7 @@ template <typename T>
     if constexpr (std::is_floating_point_v<T>)
     {
         // 浮点：libc++ 部分版本缺少浮点 std::from_chars（__charconv/from_chars_integral.h
-        // 只有整型版），会选中被删除的 bool 重载而编译失败。改用 C 的 strtoX
+        // 只有整型版），会选中被删除的 bool 重载而编译失败。故用 C 的 strtoX
         // （全平台/全标准库都有、不抛异常）。s 已去除首尾空白，要求整串被解析。
         std::string tmp(s);  // strtoX 需要 null 结尾
         char* p = nullptr;

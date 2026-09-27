@@ -144,7 +144,7 @@ list(APPEND NN_APP_TARGETS f16_writeback_probe)
 if(NN_ENABLE_TESTS)
 
     # ══════════════════════════════════════════════════════════════════════
-    # 测试目标（18 个，按功能域分组合并；原 35 个独立目标已精简）
+    # 测试目标（19 个，按功能域分组合并）
     # 合并策略：wrapper .cpp 通过 #define main + #include 聚合原测试源文件
     # ══════════════════════════════════════════════════════════════════════
 
@@ -345,6 +345,43 @@ if(Vulkan_FOUND)
     #     cast，正确性不变）。f32 分支文本逐字未改 → 零回归。
     nn_embed_shader(batched_matmul_f16 ${CMAKE_SOURCE_DIR}/shaders/batched_matmul.comp -DNN_SHADER_F16=1)
     nn_embed_shader(matmul_tiled_f16 ${CMAKE_SOURCE_DIR}/shaders/matmul_tiled.comp -DNN_SHADER_F16=1)
+    # C2e：小 N GEMV 的 f16 变体（n_out≤8 推理热路径；subgroup → vulkan1.2）
+    nn_embed_shader(matmul_gemv_f16 ${CMAKE_SOURCE_DIR}/shaders/matmul_gemv.comp --target-env=vulkan1.2 -DNN_SHADER_F16=1)
+    # C2f：RLA 扫描原语的 f16 存储变体（输入输出均 half；输出 (·,seq) 全
+    # 尺寸——消灭适配层 scan 的全尺寸 f32 副本；scratch St 仍 f32）。
+    nn_embed_shader(scan_prefix_outer_f16 ${CMAKE_SOURCE_DIR}/shaders/scan_prefix_outer.comp -DNN_SHADER_F16=1)
+    nn_embed_shader(scan_suffix_outer_f16 ${CMAKE_SOURCE_DIR}/shaders/scan_suffix_outer.comp -DNN_SHADER_F16=1)
+    nn_embed_shader(scan_prefix_outer_gen_f16 ${CMAKE_SOURCE_DIR}/shaders/scan_prefix_outer_gen.comp -DNN_SHADER_F16=1)
+    nn_embed_shader(scan_suffix_outer_gen_f16 ${CMAKE_SOURCE_DIR}/shaders/scan_suffix_outer_gen.comp -DNN_SHADER_F16=1)
+    nn_embed_shader(outer_col_f16 ${CMAKE_SOURCE_DIR}/shaders/outer_col.comp -DNN_SHADER_F16=1)
+
+    # 1e. Phase C1 op-level f16 变体（消灭边界 cast 的搬运大头）：
+    #     transpose / rearrange_3d / gather 的 f16 存储版（纯位拷贝零算术）。
+    #     - gather：indices 保持 float（行号整数值 > f16 精度，禁转）；
+    #     - transpose：shared float16_t → SPIR-V Float16 capability →
+    #       运行时要求 shaderFloat16（否则后端跳过该 pipeline，回退边界 cast）；
+    #     - rearrange_3d：仅 StorageBuffer16BitAccess。
+    #     与 matmul 同款：f32 分支逐字未改 → 零回归。
+    nn_embed_shader(transpose_f16 ${CMAKE_SOURCE_DIR}/shaders/transpose.comp -DNN_SHADER_F16=1)
+    nn_embed_shader(rearrange_3d_f16 ${CMAKE_SOURCE_DIR}/shaders/rearrange_3d.comp -DNN_SHADER_F16=1)
+    nn_embed_shader(gather_f16 ${CMAKE_SOURCE_DIR}/shaders/gather.comp -DNN_SHADER_F16=1)
+    # C1b：add_inplace/scale_inplace/accumulate 的 f16 存储变体
+    # （归因表 (256,8192)/(64,8192)/(2048,256) inplace 大头；仅需16位存储）
+    nn_embed_shader(elementwise_v2_f16 ${CMAKE_SOURCE_DIR}/shaders/elementwise_v2.comp -DNN_SHADER_F16=1)
+    # C2：行列归约的 f16 存储变体（归因 L756 大头：Linear::backward grad_bias
+    # 直调 row_reduce_sum 的 (64,8192)×38 + (256,8192)×8 = 140MB；输入直读
+    # f16、输出归约向量保持 float）。subgroup → 同 reduce 需 vulkan1.2。
+    nn_embed_shader(reduce_f16 ${CMAKE_SOURCE_DIR}/shaders/reduce.comp --target-env=vulkan1.2 -DNN_SHADER_F16=1)
+    # C2b：embedding 梯度原子累加的 f16 存储变体（dst 打包 half CAS、
+    # grad half 直读、indices 保持 float）——归因 L518/521 (8208,64)×2 +
+    # (8192,64)×4；仅需 16bit 存储（CAS 对 uint word，无 f16 原子）。
+    nn_embed_shader(scatter_add_f16 ${CMAKE_SOURCE_DIR}/shaders/scatter_add.comp -DNN_SHADER_F16=1)
+    # C2c：分组归约的 f16 存储变体（CNN 池化路径：输入 half 直读、输出
+    # float——调用方 P=F32；仅需 16bit 存储）
+    nn_embed_shader(group_reduce_f16 ${CMAKE_SOURCE_DIR}/shaders/group_reduce.comp -DNN_SHADER_F16=1)
+    # C2d：卷积窗口展开/伴随散射的 f16 存储变体（数据搬运，in/out 均 half）
+    nn_embed_shader(im2col_f16 ${CMAKE_SOURCE_DIR}/shaders/im2col.comp -DNN_SHADER_F16=1)
+    nn_embed_shader(col2im_f16 ${CMAKE_SOURCE_DIR}/shaders/col2im.comp -DNN_SHADER_F16=1)
 
     # 2. AOT 融合 shader：scan_exprs + gen_fused
     set(NN_EXPR_SCAN_BIN     ${CMAKE_BINARY_DIR}/generated/expr_specs.bin)
@@ -376,7 +413,9 @@ if(Vulkan_FOUND)
         # 同 scan_exprs：gen_fused 也是原生可执行文件，需先确保输出目录存在
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/generated
         COMMAND gen_fused ${CMAKE_BINARY_DIR}/generated ${GLSLC} ${NN_EXPR_SCAN_BIN}
+                ${CMAKE_SOURCE_DIR}/tools/prec_backfill.txt
         DEPENDS gen_fused ${FUSED_GEN_SRC} ${NN_EXPR_SCAN_BIN}
+                ${CMAKE_SOURCE_DIR}/tools/prec_backfill.txt
         COMMENT "[GPU] Synthesizing fused shaders (gen_fused) → fused_registry.hpp"
     )
 

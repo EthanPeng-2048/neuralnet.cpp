@@ -3,31 +3,26 @@
 //
 // out[c * R + r] = in[r * C + c]
 //
-// ── 64×64 分块 + 8×8 WG 砖块化 dispatch（2026-09-24 二轮定稿）─────────────
-// 一轮（32×32 tile / 线性 dispatch）5244² 实测 0.958ms；二轮经三步消融定案：
+// ── 64×64 分块 + 8×8 WG 砖块化 dispatch ───────────────────────────────────
+// dispatch 形态的依据：转置 kernel 的瓶颈是**并发 WG 的访存足迹聚集度**——
+//   不是 bank 冲突（全程零冲突）、不是段宽、不是共享读写方向（落位交换两方向
+//   代价对称）。转置输出行 = 输入列（block_c），若按行线性派发，并发 WG 的
+//   写散布在整块缓冲（5244² ≈ 180MB，每行仅写 256B、行距 21KB）→ DRAM/L2
+//   写合并恶化；砖块化让连续 64 个 WG 填满一砖、两侧足迹收敛到 ~1MB，
+//   5244² 实测 0.942→0.798ms（−15%；wall，warmup 30 best-of-10）。
 //
-//   消融链（5244²，wall，warmup 30 best-of-10）：
-//     scale 纯拷贝（2N 连续流）                0.736
-//     过 shared+barrier 恒等拷贝               0.754  ← shared/barrier 仅 ~2%
-//     真转置 + 线性 dispatch                   0.942  ← +25% 来自写侧足迹散布
-//     真转置 + 8×8 砖块化 dispatch             0.798  ← 本版本，−15%
-//   结论：瓶颈不是 bank 冲突（全程零冲突）、不是段宽（64×64 vs 32×32 仅 2%）、
-//   不是共享散布读写方向（落位交换 A/B 持平），而是**并发 WG 的访存足迹聚集度**：
-//   转置输出行 = 输入列（block_c），线性 dispatch 下 136 个并发 WG 的写散布在
-//   整块缓冲（5244² ≈ 180MB，每行仅写 256B、行距 21KB）→ DRAM/L2 写合并恶化。
-//
-//   砖块化：dispatch 网格 = (16→8, 8, n_bricks)，bz → 砖坐标，(x,y) → 砖内
+//   砖块化：dispatch 网格 = (8, 8, n_bricks)，bz → 砖坐标，(x,y) → 砖内
 //   tile。硬件按 x 最快线性调度 ⇒ 连续 64 个 WG 恰好填满一个 8×8 砖：
 //     读侧每个砖行 = 64 输入行 × 8 段×256B 连铺；写侧每个砖列同构
 //     → 两侧足迹 ~1MB 聚集（16×8 砖实测持平 8×8，取对称 8×8）。
 //
-//   其余定案（A/B 均已验证）：
-//   - 64×64 tile（vs 32×32）：段宽 128B→256B、每线程 8→16 元素摊薄 barrier；
+//   设计要点：
+//   - 64×64 tile：段宽 256B、每线程 16 元素摊薄 barrier；
 //   - 共享落位 tile[c_loc][r_loc]（阶段 2 连续读 + 连续写全局；阶段 1 散布写）：
-//     两方向代价对称（A/B 持平），取阶段 2 全连续；
+//     两方向代价对称，取阶段 2 全连续；
 //   - bank 零冲突：行 padding 65，gcd(65,32)=1 ⇒ 列向跨 lane 步进命中 32 个
 //     不同 bank；行向天然连续（阶段 1 散布写 addr=65x+常量 → bank=x+常量）；
-//   - 无除/模（砖坐标一处 div/mod 每 WG 一次）；越界 tile 早退 + 元素守卫
+//   - 免逐元素除模（砖坐标一处 div/mod 每 WG 一次）；越界 tile 早退 + 元素守卫
 //     读入/写出同构（r<rows && c<cols），未写共享槽必不被读。
 //
 // 共享内存：65 × 64 × 4B = 16.3KB。
@@ -45,10 +40,24 @@
 
 #version 450
 
+// -DNN_SHADER_F16=1 → f16 存储变体（Phase C1 op-level in-kernel f16）：
+//   缓冲 + shared tile 均 float16_t —— 值全链 f16、零转换，shared 占用
+//   减半（16.3KB → 8.15KB）。
+//   shared float16_t 需 SPIR-V Float16 capability → 运行时要求
+//   shaderFloat16 特性（VulkanDevice 已启用；否则后端跳过该 pipeline）。
+//   索引数学/砖块化 dispatch 与 f32 版逐字节同构（与元素宽度无关）。
+#if defined(NN_SHADER_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#define NN_ETYPE float16_t
+#else
+#define NN_ETYPE float
+#endif
+
 layout(local_size_x = 32, local_size_y = 8) in;
 
-layout(std430, binding = 0) readonly buffer  BufIn  { float in_data[];  };
-layout(std430, binding = 1) writeonly buffer BufOut { float out_data[]; };
+layout(std430, binding = 0) readonly buffer  BufIn  { NN_ETYPE in_data[];  };
+layout(std430, binding = 1) writeonly buffer BufOut { NN_ETYPE out_data[]; };
 
 layout(push_constant) uniform PushConstants {
     uint rows;
@@ -56,7 +65,7 @@ layout(push_constant) uniform PushConstants {
 };
 
 // 65 列 padding：gcd(65, 32) = 1 ⇒ 列向步进跨 32 lane 命中 32 个不同 bank
-shared float tile[64][65];
+shared NN_ETYPE tile[64][65];
 
 void main()
 {

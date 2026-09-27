@@ -9,8 +9,8 @@
 //    - 使用 std::istreambuf_iterator 读取，避免 tellg 失败风险
 //    - 二进制 I/O 的字节级转换（std::as_bytes + 唯一一处 reinterpret_cast）
 //      收敛在本头的 write_pod / read_pod / write_pod_span / read_pod_span
-//      四个函数内，库内其它位置不再出现 reinterpret_cast 字节 cast
-//      （docs/17 §2.1 指针审查结论：二进制 I/O 是合法边界，收敛而非消灭）
+//      四个函数内，库内其它位置不出现 reinterpret_cast 字节 cast
+//      （设计取向：二进制 I/O 是合法边界，收敛到本头而非消灭）
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include <concepts>
@@ -39,7 +39,7 @@ namespace nn
 // ── 二进制 POD 读写（全库 reinterpret_cast 字节边界的唯一收敛点）───────
 // std::basic_istream/ostream 的 char 接口与 C++ 对象字节表示之间的转换
 // 走 std::as_bytes / std::as_writable_bytes + 本段内唯一的
-// reinterpret_cast；其它模块一律调用这四个函数（docs/17 §2.1）。
+// reinterpret_cast；其它模块一律调用这四个函数。
 // 返回值：流的 good 状态（false = 读/写失败，调用方决定错误语义）。
 
 // 写单个平凡可拷贝对象（定长 POD / 整数 / float 等）
