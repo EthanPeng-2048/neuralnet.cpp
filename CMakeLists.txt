@@ -90,9 +90,49 @@ add_compile_options(
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
+# ── std::stacktrace 运行时库探测（GCC 14+）────────────────────────────────
+# GCC 把 std::stacktrace 的实现放进独立的 libstdc++exp（或较老的
+# libstdc++_libbacktrace），默认不自动链接 → 否则扫描工具报
+# undefined reference to `std::__stacktrace_impl::_S_current`。
+# 探测一次，成功后通过 nn_core INTERFACE 传播给所有目标。
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    include(CheckCXXSourceCompiles)
+
+    set(CMAKE_REQUIRED_LIBRARIES stdc++exp)
+    check_cxx_source_compiles("
+        #include <stacktrace>
+        int main() { return std::stacktrace::current().empty() ? 1 : 0; }
+    " NN_HAS_STDCXXEXP)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+
+    if(NN_HAS_STDCXXEXP)
+        set(NN_STACKTRACE_LIB stdc++exp)
+    else()
+        # 回退：老一些的 GCC 用 libstdc++_libbacktrace
+        set(CMAKE_REQUIRED_LIBRARIES stdc++_libbacktrace)
+        check_cxx_source_compiles("
+            #include <stacktrace>
+            int main() { return std::stacktrace::current().empty() ? 1 : 0; }
+        " NN_HAS_STDCXX_LIBBACKTRACE)
+        unset(CMAKE_REQUIRED_LIBRARIES)
+        if(NN_HAS_STDCXX_LIBBACKTRACE)
+            set(NN_STACKTRACE_LIB stdc++_libbacktrace)
+        else()
+            message(FATAL_ERROR
+                "std::stacktrace 需要 stdc++exp 或 stdc++_libbacktrace，但两者都不可用。")
+        endif()
+    endif()
+    message(STATUS "std::stacktrace link library: ${NN_STACKTRACE_LIB}")
+endif()
+
 # ── 公共 INTERFACE 库：所有目标共享 include 目录和链接库 ──────────────
 # 通过 INTERFACE 库消除 7 个目标的重复设置
 add_library(nn_core INTERFACE)
+target_include_directories(nn_core INTERFACE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(nn_core INTERFACE Threads::Threads)
+if(NN_STACKTRACE_LIB)
+    target_link_libraries(nn_core INTERFACE ${NN_STACKTRACE_LIB})
+endif()
 target_include_directories(nn_core INTERFACE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(nn_core INTERFACE Threads::Threads)
 
