@@ -622,6 +622,8 @@ nn::parallel_for_blocks(idx.begin(), idx.end(), [&](std::size_t b) noexcept { /*
 [[nodiscard]] constexpr std::size_t cols() const noexcept { return cols_; }
 ```
 
+- **`NN_VECTORIZE_PRAGMA` 必须收进独立的微内核函数**：放进包含其它循环的大函数会拖垮同函数内其它循环的优化（GEMM 4×8 微内核 A/B 教训，数据见 `docs/history.md`）。
+
 ### 6.4 性能检查清单
 
 - [ ] 热路径中是否预分配缓冲区？

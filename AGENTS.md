@@ -19,6 +19,7 @@ cmake -B build -G Ninja && cmake --build build
 cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --test-dir build
 ```
 
+- 链接报 `permission denied`（`build/` 下 exe 正在运行被占用 → 构建中止，易误判为"未改动"）：追加 `-- -k 0` 让 ninja 跳过失败目标继续构建其余目标；被占用目标仍需关掉进程后重链。
 - 编译器与标准库：**CMakeLists 不指定**（编译器由 CMake 默认探测或调用方 `CXX=...` / `-DCMAKE_CXX_COMPILER` 决定，标准库跟随编译器默认）；**CI 显式指定 clang++**（Linux/Windows，避免 GCC 独有警告在 `-Werror` 下失败）。标准库编译/链接两侧必须一致（否则链接期大量 `std::__cxx11::*` 未定义）。CMake 3.30+；已验证 Clang 22+（C++26）、g++ 15.2、MSVC（走 `/std:c++latest`）均可构建。
 - 构建选项：`NN_ENABLE_NATIVE`（默认 ON，开启 `-march=native`，分发/CI 用 `OFF` 生成可移植基线）；`NN_ENABLE_TESTS`（默认 OFF）。
 - Vulkan 可选：CMake 自动探测 Vulkan + glslc，找到则定义 `NN_HAS_VULKAN` 启用 GPU，否则纯 CPU。支持多 Vulkan 设备选择（`--gpu` 参数，见 `cli/cli_gpu_option.hpp`）。
@@ -154,6 +155,7 @@ Matrix → engine.from_matrix → Tensor[GPU] → forward/loss/optimizer 全程�
 7. **AOT 闭合世界**：GPU 表达式 shader 全部构建期生成，运行时按 `expr_spec_key` 精确匹配，**未命中硬报错**，无 eager、无运行时编译。
 8. **确定性**：任何"依赖容器迭代顺序"的决策点（BPE 平局打破、ID 分配等）必须显式排序/按 key 打破平局；并行化后结果必须与单线程逐字节一致。
 9. **大词表禁止物化 one-hot**：用 `CrossEntropyLoss::forward_sparse`（整数标签 + loss_mask）。
+10. **`//` 注释中禁止出现 `\` 反斜杠**（尤其行尾）：GCC 行拼接会把下一行并入当前注释——轻则 `-Wcomment -Werror` 编译失败，重则下一行代码被静默吞掉。
 
 ## 6. 数据布局约定
 
