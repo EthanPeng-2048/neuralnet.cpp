@@ -19,7 +19,7 @@ cmake -B build -G Ninja && cmake --build build
 cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --test-dir build
 ```
 
-- 编译器：Clang++ 22.1+（C++26）；CMake 3.30+。CMake 在 Linux 上若 PATH 中能找到 `clang++` 会优先选它（自动向量化优于 g++），可用 `CXX=g++` 或 `-DCMAKE_CXX_COMPILER` 覆盖；MSVC 走 `/std:c++latest`。
+- 编译器与 C++ 标准库一律使用默认，本仓（CMakeLists/CI）不指定：编译器由 CMake 默认探测或调用方 `CXX=...` / `-DCMAKE_CXX_COMPILER` 决定；标准库跟随编译器默认（Linux clang/gcc = libstdc++），**禁止编译/链接两侧标准库不一致**（链接期大量 `std::__cxx11::*` 未定义）。CMake 3.30+；已验证 Clang 22+（C++26）、g++ 15.2、MSVC（走 `/std:c++latest`）均可构建。
 - 构建选项：`NN_ENABLE_NATIVE`（默认 ON，开启 `-march=native`，分发/CI 用 `OFF` 生成可移植基线）；`NN_ENABLE_TESTS`（默认 OFF）。
 - Vulkan 可选：CMake 自动探测 Vulkan + glslc，找到则定义 `NN_HAS_VULKAN` 启用 GPU，否则纯 CPU。支持多 Vulkan 设备选择（`--gpu` 参数，见 `cli/cli_gpu_option.hpp`）。
 - **本项目不支持 CUDA**：后端仅 CPU / Vulkan，CLI 无 `--cuda` 参数；文档勿声称支持 CUDA。

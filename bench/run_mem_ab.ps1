@@ -1,6 +1,6 @@
 # run_mem_ab.ps1 — 显存峰值 A/B 同窗交错配对实测
 #   A = 默认（帧提交后立即非阻塞收割已完成帧）
-#   B = NN_NO_EARLY_REAP=1（关闭该优化，等价旧行为）
+#   B = NN_NO_EARLY_REAP=1（关闭该优化，即优化前的收割时机作为对照基线）
 # 每侧 N 轮，交错执行（ABAB...），避免跨时段漂移；输出配对差与胜负数。
 # 用法: .\bench\run_mem_ab.ps1 [-Rounds 3] [-Exe .\build\text_train.exe] [-UseProbe]
 param(
