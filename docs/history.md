@@ -26,6 +26,7 @@
 - [docs/development 02 · 03 · 05](#docs/development 02 · 03 · 05)（19 条）
 - [docs/development 01 · 04 · 06 · 07 · 10 · 14](#docs/development 01 · 04 · 06 · 07 · 10 · 14)（25 条）
 - [docs/introduction · usage · benchmarks](#docs/introduction · usage · benchmarks)（46 条）
+- [构建系统 / CI（CMakeLists.txt、.github/workflows）](#构建系统 / CI（CMakeLists.txt、.github/workflows）)（1 条）
 - [AGENTS.md](#AGENTS.md)（24 条）
 
 ---
@@ -1545,9 +1546,18 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 
 ---
 
+# 构建系统 / CI（CMakeLists.txt、.github/workflows）
+
+## 编译器与标准库一律默认（2026-09-27，原位置 .github/workflows/cmake-single-platform.yml 原 2/53-60/71-73/182-215/281 行、AGENTS.md:22、src/expr_dsl_test.cpp:13、src/expr_opt_test.cpp:13）
+
+- 类型：bug 根因 / 演进记录
+- 内容：Linux 云端构建复现历史链接失败（`tokenizer_train` FAILED，大量 `std::__cxx11::*`/`std::__throw_*`/`std::thread` undefined reference）：链接命令带两处 `-stdlib=libc++`（分处 CMAKE_CXX_FLAGS 与 CMAKE_EXE_LINKER_FLAGS 槽位），而 .o 是 libstdc++ ABI——clang 带 `-stdlib=libc++` 但系统无 libc++ 头时**静默回退 libstdc++ 头**，链接却切到 libc++ → ABI 分叉。演进三段：① 旧 workflow 曾传 `-DCMAKE_CXX_FLAGS/-DCMAKE_EXE_LINKER_FLAGS=-stdlib=libc++`，与 CMakeLists 当时的 `NN_STDLIB`（Linux+Clang 默认 libstdc++，`add_compile_options/add_link_options(-stdlib=...)`）冲突（68565b0 曾统一 libstdc++ 缓解）；② 1b415bf 从 CMakeLists 移除 NN_STDLIB 及「PATH 有 clang++ 即设为默认」块，仓库自此无任何编译器/标准库指定；③ 本轮云端**在干净源码上仍复现** → 残留载体：workflow build 目录缓存（`restore-keys` 跨 sha 恢复旧 `CMakeCache.txt`，configure 不清除未重传的 `-D` 缓存变量，历史 `-stdlib` 因此永久驻留）或调用方环境（`CXXFLAGS`/`LDFLAGS`/旧 configure 命令/旧 tag）。整改（2026-09-27）：workflow 删 build 目录缓存步骤（ccache 保留，注释记明原因）、删 `-DCMAKE_CXX_COMPILER/-DCMAKE_C_COMPILER` 与 `env CC/CXX`、删与 CMakeLists 重复的 `-DCMAKE_CXX_STANDARD*`，名称 `CMake (Clang Latest, C++26)`→`CMake (C++26)`、release 说明改「平台默认」、NN_STDLIB 陈旧注释改写；AGENTS.md:22 撤回「PATH 有 clang++ 会自动优先选」（1b415bf 已删该机制）并改写为默认策略；src/expr_{dsl,opt}_test.cpp:13 手动编译建议去掉 `-stdlib=libc++`。当前事实：编译器与标准库一律默认（CMake 探测或调用方 `CXX`/`-DCMAKE_CXX_COMPILER`），编译/链接两侧标准库必须一致；云端若仍复现，先查环境变量与删除陈旧 `build/CMakeCache.txt`（GitHub Actions 还应清理历史 cache）。
+
+---
+
 # AGENTS.md
 
-> 来源：AGENTS.md（AI 开发速览）整改摘录（2026-09-27）。AGENTS.md 自此只记录当前状态；演进记录、已修复勘误、被否决方案与性能 A/B 过程归档于此，合并目标 `docs/history.md`。
+> 来源：AGENTS.md（AI 开发速览）整改摘录（2026-09-27）。AGENTS.md 自此只记录当前状态；演进记录、已修复勘误、被否决方案与性能 A/B 过程统一归档于本文档。
 
 ## 版本交付内容（原位置 AGENTS.md 头部版本行 + §12「已交付能力」v1.1.0/v1.2.0）
 
