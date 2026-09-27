@@ -337,7 +337,7 @@ int main(int argc, char* argv[])
         if (alu && !nn::expr_prec_sig_native16(spec, sig))
             return false;   // 谓词不通过 → 不发 ALU 变体（f32 算术变体仍覆盖）
         const std::string key = nn::expr_spec_key(spec);
-        char sigbuf[8];
+        char sigbuf[16];
         std::snprintf(sigbuf, sizeof(sigbuf), "%04x", static_cast<unsigned>(sig));
         const std::string vkey = alu ? nn::expr_prec_sig_alu_key(key, sig)
                                      : nn::expr_prec_sig_key(key, sig);

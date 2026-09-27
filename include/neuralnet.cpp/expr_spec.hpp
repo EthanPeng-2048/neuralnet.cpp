@@ -711,7 +711,7 @@ using ExprPrecSig = std::uint32_t;
 {
     if (sig == 0u)
         return spec_key;
-    char buf[8];
+    char buf[16];
     std::snprintf(buf, sizeof(buf), "#%04x", static_cast<unsigned>(sig));
     return spec_key + buf;
 }
