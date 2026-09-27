@@ -386,8 +386,13 @@ public:
         // 2) 分组归约求窗口 max：每 kk 行一组 → (C, P*B)。
         //    单表达式单 dispatch 完成全通道分组归约（grouped_reduce_max 视图，
         //    R = 窗口面积 kk）。
+        //    ⚠ 不能作为裸视图根：IR 规定"输出 = 最后一条指令的 dst"，空指令表
+        //    会被 validate_expr_spec 拒绝（CPU 模板路径不校验 → 只在 GPU 暴露）。
+        //    与 RAPT 的 row_broadcast(x) + rparam(0) 同一处理：与一个**运行时 0**
+        //    相加使表达式合法，语义不变（rparam 值不进 expr_spec_key）。
         auto pooled = dsl::compute(engine,
-            dsl::grouped_reduce_max(*col, static_cast<std::uint32_t>(kk)),
+            dsl::grouped_reduce_max(*col, static_cast<std::uint32_t>(kk))
+                + dsl::rparam(Scalar{0}),
             channels_, col->cols());
         if (!pooled) return std::unexpected(pooled.error());
 
@@ -450,8 +455,10 @@ public:
                         Scalar{1}, Scalar{0}),
             channels_ * kk, P * batch);                                   // (C*kk, P*B)
         if (!eq) return std::unexpected(eq.error());
+        //    同 forward：裸分组归约视图根 = 空指令表（GPU 校验拒绝）→ + rparam(0)
         auto cnt = dsl::compute(engine,
-            dsl::grouped_reduce_sum(*eq, static_cast<std::uint32_t>(kk)),
+            dsl::grouped_reduce_sum(*eq, static_cast<std::uint32_t>(kk))
+                + dsl::rparam(Scalar{0}),
             channels_, P * batch);
         if (!cnt) return std::unexpected(cnt.error());
 

@@ -545,14 +545,27 @@ int main(int argc, char* argv[])
         (void)conv.init(engine);
         const std::size_t oh = in_h - k + 1, ow = in_w - k + 1;
         nn::Tensor x = scan_tensor(c_in * in_h * in_w, batch);
-        (void)conv.forward(engine, x);
+        if (auto fr = conv.forward(engine, x); !fr)
+        {
+            std::fprintf(stderr, "[scan] Conv2D forward FAILED: %s\n",
+                         fr.error().message.c_str());
+            std::fflush(stderr);
+            std::abort();
+        }
         nn::Tensor grad = scan_tensor(c_out * oh * ow, batch);
-        (void)conv.backward(engine, grad);
+        if (auto br = conv.backward(engine, grad); !br)
+        {
+            std::fprintf(stderr, "[scan] Conv2D backward FAILED: %s\n",
+                         br.error().message.c_str());
+            std::fflush(stderr);
+            std::abort();
+        }
     }
 
-    // ── MaxPool2D forward + backward（窗口 mask 表达式）──────────────────
-    // forward : 全原语（im2col / col_reduce_max / rearrange_3d / gather），无 dsL 表达式
-    // backward: mask = select(窗口 == col_broadcast(窗口max), col_broadcast(grad), 0)
+    // ── MaxPool2D forward + backward（分组归约视图 + 窗口 mask 表达式）────────
+    // forward : im2col → grouped_reduce_max 视图（+ rparam(0) 使根节点合法）
+    // backward: mask = select(窗口 == 广播(窗口max), 广播(g/cnt), 0)，
+    //           cnt = grouped_reduce_sum 视图（同样 + rparam(0)）
     //           —— **必须 dry-run**：该表达式未被扫描覆盖时
     //           GPU 运行到它会因闭合世界未命中而硬报错。
     {
@@ -562,9 +575,21 @@ int main(int argc, char* argv[])
         const std::size_t oh = (in_h - pool) / stride + 1;
         const std::size_t ow = (in_w - pool) / stride + 1;
         nn::Tensor x = scan_tensor(c * in_h * in_w, batch);
-        (void)mp.forward(engine, x);
+        if (auto fr = mp.forward(engine, x); !fr)
+        {
+            std::fprintf(stderr, "[scan] MaxPool2D forward FAILED: %s\n",
+                         fr.error().message.c_str());
+            std::fflush(stderr);
+            std::abort();
+        }
         nn::Tensor grad = scan_tensor(c * oh * ow, batch);
-        (void)mp.backward(engine, grad);
+        if (auto br = mp.backward(engine, grad); !br)
+        {
+            std::fprintf(stderr, "[scan] MaxPool2D backward FAILED: %s\n",
+                         br.error().message.c_str());
+            std::fflush(stderr);
+            std::abort();
+        }
     }
 
     // ── 归约表达式内联常量（push-constant 头长度回归）────────────────────

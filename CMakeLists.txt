@@ -319,6 +319,13 @@ if(NN_ENABLE_TESTS)
         # 记 Skipped 而非 FAILED，否则 CPU-only 构建/CI 出现假红。
         set_tests_properties(${TARGET} PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
+    # CNN 的 GPU 变体：DSL 表达式校验只在 GPU/scan 路径发生（CPU 模板路径不校验），
+    # 默认的纯 CPU cnn_test 测不出"只在 GPU 触发"的表达式结构回归
+    # （如 MaxPool2D 裸视图根 → 空指令表）。无 Vulkan 构建下返回 77 = SKIP。
+    if(TARGET cnn_test)
+        add_test(NAME cnn_test_gpu COMMAND cnn_test --gpu)
+        set_tests_properties(cnn_test_gpu PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
     # 基准工具已移除（2026 清理：无法在 -Werror 下编译，且无 ctest 覆盖）
     foreach(TARGET ${NN_BENCH_TARGETS})
         set_target_properties(${TARGET} PROPERTIES
