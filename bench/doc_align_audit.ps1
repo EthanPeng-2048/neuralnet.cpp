@@ -38,7 +38,11 @@ $historicalFiles = @('compute_cuda_engine.hpp','compute_cuda_backend.hpp','cuda_
 
 # ── [A] 文档引用的文件是否存在 ──────────────────────────────────────────
 Write-Host '=== [A] 文档引用但仓库中不存在的文件 ==='
-$docs = @('AGENTS.md','README.md') + (Get-ChildItem -Recurse docs -Filter *.md | ForEach-Object { $_.FullName })
+# docs/history.md 是全仓唯一的历史归档，按设计记录已删符号/已删文件 → 整体豁免
+$docs = @('AGENTS.md','README.md') +
+        (Get-ChildItem -Recurse docs -Filter *.md |
+            Where-Object { $_.Name -ne 'history.md' } |
+            ForEach-Object { $_.FullName })
 $missCount = 0
 $histCount = 0
 foreach ($d in $docs) {
@@ -69,14 +73,31 @@ $dead = @('axpy_inplace','broadcast_row_inplace','broadcast_col_inplace','elemen
           'elementwise_binary_scalar','elementwise_select_scalar_cond','offload_store','offload_load',
           'multiply_transposed_add_to','compute::apply','algebra_expr','algebra_compute',
           'set_offload_enabled','UnaryOp','CompareOp')
+$docLines = @{}   # 惰性缓存：按文件读一次，供跨行否定窗口判断复用
 foreach ($s in $dead) {
-    $all = Select-String -Path @($docs) -Pattern $s -SimpleMatch -ErrorAction SilentlyContinue
-    if ($all.Count -gt 0) {
-        Write-Host ("  -- {0}: {1} 处" -f $s, $all.Count)
-        $all | Select-Object -First $MaxPerFile | ForEach-Object {
+    # 命中行（及其后 2 行，覆盖跨行的"……均不存在"陈述）若是在说明该符号不存在/
+    # 已删除/已归档，属当前事实而非残留
+    $all = @(Select-String -Path @($docs) -Pattern $s -SimpleMatch -ErrorAction SilentlyContinue)
+    $negPat = '不存在|已删除|已移除|没有|无此|已归档|归档于|历史'
+    $negCount = 0
+    $remain = @()
+    foreach ($m in $all) {
+        if (-not $docLines.ContainsKey($m.Path)) { $docLines[$m.Path] = @(Get-Content $m.Path) }
+        $lines = $docLines[$m.Path]
+        $win = @($m.Line)
+        foreach ($k in 1, 2) {
+            $idx = $m.LineNumber - 1 + $k
+            if ($idx -lt $lines.Count) { $win += $lines[$idx] }
+        }
+        if (($win -join ' ') -match $negPat) { $negCount++ } else { $remain += $m }
+    }
+    if ($remain.Count -gt 0) {
+        Write-Host ("  -- {0}: {1} 处" -f $s, $remain.Count)
+        $remain | Select-Object -First $MaxPerFile | ForEach-Object {
             Write-Host ("     {0}:{1}: {2}" -f (Split-Path $_.Path -Leaf), $_.LineNumber, $_.Line.Trim().Substring(0,[Math]::Min(78,$_.Line.Trim().Length)))
         }
     }
+    if ($negCount -gt 0) { Write-Host ("     （另有 {0} 处为「该符号不存在/已删除」的当前事实陈述，跳过）" -f $negCount) }
 }
 Write-Host ''
 

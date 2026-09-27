@@ -1,5 +1,5 @@
 # .github/workflows/cmake-single-platform.yml
-name: CMake (Clang Latest, C++26)
+name: CMake (C++26)
 
 on:
   push:
@@ -50,14 +50,9 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-ccache-
 
-    # ========== 缓存：CMake 构建目录（配合 ccache 加速增量构建） ==========
-    - name: Cache CMake build directory
-      uses: actions/cache@v4
-      with:
-        path: ${{ github.workspace }}/build
-        key: ${{ runner.os }}-cmake-build-${{ github.sha }}
-        restore-keys: |
-          ${{ runner.os }}-cmake-build-
+    # 注意：不缓存整个 build 目录——旧 CMakeCache.txt 会跨运行携带已移除的
+    # -D 设置（如历史上的 CMAKE_CXX_FLAGS=-stdlib=libc++），导致编译/链接
+    # 标准库 ABI 不匹配（std::__cxx11::* 未定义）。编译产物由 ccache 缓存。
 
     # ========== Linux: 安装 LLVM Clang + Ninja ==========
     - name: Install Clang & Ninja (Linux)
@@ -68,9 +63,9 @@ jobs:
         sudo ./llvm.sh all
         sudo ln -sf $(ls /usr/bin/clang-[0-9]* | sort -V | tail -n1) /usr/bin/clang
         sudo ln -sf $(ls /usr/bin/clang++-[0-9]* | sort -V | tail -n1) /usr/bin/clang++
-        # 统一使用 libstdc++（CMakeLists 的 NN_STDLIB 默认；libstdc++ 线程开销更小、
-        # 内存带宽类原语更快）。不装/不用 libc++：编译与链接标准库不一致会在链接期
-        # 产生大量 std 符号 ABI 不匹配（std::__cxx11::* 未定义）。
+        # 不安装/不指定 libc++：标准库一律使用编译器默认（Linux clang/gcc 默认
+        # libstdc++）。若编译与链接两侧标准库不一致，链接期会出现大量 std 符号
+        # ABI 不匹配（std::__cxx11::* 未定义）。
         # ccache：缓存编译产物，加速跨运行增量构建
         sudo apt-get install -y ninja-build p7zip-full ccache
 
@@ -184,17 +179,10 @@ jobs:
       run: |
         cmake -B ${{github.workspace}}/build \
           -G Ninja \
-          -DCMAKE_CXX_COMPILER=clang++ \
-          -DCMAKE_C_COMPILER=clang \
           -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
-          -DCMAKE_CXX_STANDARD=26 \
-          -DCMAKE_CXX_STANDARD_REQUIRED=ON \
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
           -DCMAKE_C_COMPILER_LAUNCHER=ccache \
           -DNN_ENABLE_NATIVE=OFF
-      env:
-        CC: clang
-        CXX: clang++
 
     - name: Configure CMake (Windows)
       if: runner.os == 'Windows'
@@ -202,17 +190,10 @@ jobs:
       run: |
         cmake -B ${{github.workspace}}/build `
           -G Ninja `
-          -DCMAKE_CXX_COMPILER=clang++ `
-          -DCMAKE_C_COMPILER=clang `
           -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} `
-          -DCMAKE_CXX_STANDARD=26 `
-          -DCMAKE_CXX_STANDARD_REQUIRED=ON `
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
           -DCMAKE_C_COMPILER_LAUNCHER=ccache `
           -DNN_ENABLE_NATIVE=OFF
-      env:
-        CC: clang
-        CXX: clang++
 
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}}
@@ -278,7 +259,7 @@ jobs:
           自动构建版本，commit: ${{ github.sha }}
 
           ### 构建环境
-          - Compiler: Clang (Latest)
+          - Compiler: 平台默认（构建配置不指定编译器/标准库）
           - C++ Standard: C++26
 
           | 平台 | 产物 |
