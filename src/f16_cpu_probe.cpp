@@ -406,12 +406,17 @@ int main()
         auto y = ln2.forward(ad, *x);
         if (!y) { std::printf("    fwd ERR\n"); ++g_bad; }
 
-        const auto& w = ln2.parameters()[0].get();
-        const auto& cache = ln2.activation_cache()[0].get();
+        auto params = ln2.parameters();
+        auto caches = ln2.activation_cache();
+        const auto& w     = params[0].get();
+        const auto& cache = caches[0].get();
         std::printf("    w=%s %s | cache=%s %s\n", w.shape_str().c_str(),
                     w.precision() == nn::Precision::F16 ? "f16" : "f32",
                     cache.shape_str().c_str(),
                     cache.precision() == nn::Precision::F16 ? "f16" : "f32");
+
+        // ── 把两个临时 vector 显式化，避免 -Wdangling-reference ──
+        auto grads = ln2.param_gradients();   // 拷贝出一个 vector，里面的 reference_wrapper 仍指向真实张量
 
         // step1: grad_input = matmul(w, g, transA, P=compute=F32)
         auto gi = ad.matmul(w, *g, true, false, P::F32);
@@ -419,7 +424,7 @@ int main()
         else scan(ad, *gi, "I grad_input");
 
         // step2: grad_w += matmul(g, cache^T) （compute_into, dst=f16）
-        auto& gw = ln2.param_gradients()[0].get();
+        auto& gw = grads[0].get();
         auto r2 = nn::dsl::compute_into(ad,
             nn::dsl::leaf(gw) + nn::dsl::matmul(*g, cache, false, true), gw);
         if (!r2) { std::printf("    compute_into ERR: %s\n", r2.error().message.c_str()); ++g_bad; }
@@ -431,13 +436,13 @@ int main()
         else
         {
             scan(ad, *gb, "I row_reduce(g)");
-            auto& gbb = ln2.param_gradients()[1].get();
+            auto& gbb = grads[1].get();
             if (auto r3 = ad.accumulate(gbb, *gb); !r3)
             { std::printf("    accumulate ERR\n"); ++g_bad; }
             else scan(ad, gbb, "I grad_b (accumulate 后)");
         }
     }
-
     std::printf("\nf16_cpu_probe: bad=%d\n", g_bad);
+
     return g_bad == 0 ? 0 : 1;
 }
