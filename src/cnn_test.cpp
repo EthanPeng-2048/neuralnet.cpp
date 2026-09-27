@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <iostream>
+#include <string>
 
 // ── maxpool_gradcheck（独立参考实现比对）──────────────────────────────────
 #define main test_maxpool_gradcheck
@@ -21,6 +22,27 @@
 
 int main(int argc, char* argv[])
 {
+    // --gpu 用例的可用性预检：GPU 不可用（未编译 Vulkan / 初始化失败）→ 77，
+    // 依 ctest SKIP 约定记 Skipped 而非假红（与 gpu_test 等同一约定；
+    // 子测试本身在引擎创建失败时返回 1，没有 77 语义，故在这里统一预检）。
+    //
+    // 为什么必须有 GPU 用例：DSL 表达式的 ExprSpec 校验只发生在 GPU / scan
+    // 路径，CPU 走编译期模板求值、**不校验**——结构非法的表达式（如裸视图根
+    // → 空指令表）只会在 GPU 运行期暴露，纯 CPU 跑一遍测不出来。
+    for (int i = 1; i < argc; ++i)
+    {
+        if (std::string(argv[i]) != "--gpu") continue;
+        nn::cli::EngineConfig ec;
+        ec.use_gpu = true;
+        auto probe = nn::cli::create_engine(ec);
+        if (!probe)
+        {
+            std::cout << "GPU 不可用，跳过: " << probe.error().message << "\n";
+            return 77;
+        }
+        break;
+    }
+
     int failures = 0;
 
     std::puts("=== maxpool_gradcheck (independent reference) ===");

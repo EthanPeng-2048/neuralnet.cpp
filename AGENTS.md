@@ -255,7 +255,7 @@ optimizer.step();
 | `development/07-zipt-algorithm.md` | AttnZip / ZiPT：记忆压缩解码器算法设计 |
 | `development/08-pitfalls-and-lessons.md` | **踩坑警示录，改代码前读** |
 | `development/10-development-standards.md` | C++ 编码规范全文 |
-| `development/12-compute-engine-inventory.md` | **引擎接口盘点（复现：`bench/doc_inventory.ps1`）：49 个 virtual、Layer 直调 23 个（基础设施/数据搬运/状态扫描/fold 登记）、两套 CPU 求值机制（DSL 模板 + IR 解释器）、ctest 19 个目标；演进记录见 `docs/history.md`** |
+| `development/12-compute-engine-inventory.md` | **引擎接口盘点（复现：`bench/doc_inventory.ps1`）：49 个 virtual、Layer 直调 23 个（基础设施/数据搬运/状态扫描/fold 登记）、两套 CPU 求值机制（DSL 模板 + IR 解释器）、ctest 20 个测试；演进记录见 `docs/history.md`** |
 | `development/13-refactor-backlog.md` | **重构与性能机会清单（2026-09-25 审查）：只记录方案不实施；误报/已修复项对照表与已执行记录在 `docs/history.md`，重复立项前先读本文件** |
 | `development/14-f16-stable-gpu-loss-frozen.md` | **故障报告（2026-09-26，未修）：GPU `stable=f16` 训练 loss 打印冻结（权重不冻结）——触发矩阵、测试覆盖缺口、证据与复现** |
 
@@ -274,7 +274,7 @@ optimizer.step();
 
 ### 已知问题
 
-- **GPU `stable=f16` 训练 loss 打印冻结（未修）**：`text_train --precision-stable f16` 时 step 恒 4.0137、跨 epoch/跨进程逐位相同；**权重照常更新**（同进程跨 epoch 模型快照 63% 参数字节不同，冻结仅在 loss 回读链）；CPU 同配置健康；ctest 19/19 全绿但**无 GPU+stable=f16 用例**。触发矩阵、覆盖缺口与证据见 `docs/development/14-f16-stable-gpu-loss-frozen.md`。推荐路径 `--f16`（stable/optimizer=f32）实测健康。
+- **GPU `stable=f16` 训练 loss 打印冻结（未修）**：`text_train --precision-stable f16` 时 step 恒 4.0137、跨 epoch/跨进程逐位相同；**权重照常更新**（同进程跨 epoch 模型快照 63% 参数字节不同，冻结仅在 loss 回读链）；CPU 同配置健康；ctest 20/20 全绿但**无 GPU+stable=f16 用例**。触发矩阵、覆盖缺口与证据见 `docs/development/14-f16-stable-gpu-loss-frozen.md`。推荐路径 `--f16`（stable/optimizer=f32）实测健康。
 - **数值性限制**：四字段全 f16 不可训练——`optimizer=f16` 单独即令 Adam 更新爆炸、`stable=f16` 链约 200 步 NaN，见 `docs/development/05-mixed-precision.md` §12.5；常规 f32 训练健康收敛。
 - **不存在的 CLI 参数**：`--tdr-retry`/`--max-tdr-retries`（勿引用）。
 
@@ -290,7 +290,7 @@ optimizer.step();
 - **CNN 全引擎化**：`im2col`/`col2im` 数据搬运原语 + `rearrange_3d` 布局置换，Conv2D/MaxPool2D 前反向为「引擎原语 + DSL」，无 PCIe 往返；池化反向为窗口并列最大值均分梯度。
 - **评估分块**：`evaluate_mnist` 的 `eval_batch`（默认 1000）分块前向 + 每块 `release_idle_pool_blocks()`，防大 batch 评估 OOM。
 - **CPU 性能**：DSL 模板路径向量化/并行、`dsl::compute_into` 零分配原地更新、`Tensor::cpu_get_ptr`、分块 GEMM 内核（BLOCK_SIZE=64）。
-- **测试**：ctest 注册 19 个目标（`-DNN_ENABLE_TESTS=ON`；需 Vulkan 的用例退出码 77 = skip）。
+- **测试**：ctest 注册 20 个测试（19 个测试目标 + `cnn_test_gpu` = `cnn_test --gpu`；`-DNN_ENABLE_TESTS=ON`；需 Vulkan 的用例退出码 77 = skip）。
 
 ### 融合二期状态与 IR 编码约束（改融合/IR 代码前必读）
 

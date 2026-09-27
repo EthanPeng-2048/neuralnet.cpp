@@ -12,7 +12,7 @@
 |------|------|------|----------|
 | 灾难级 | 4 | 数据损坏 / 设备永久失效 / 训练白费数小时 | GPT 布局混用、GPU-resident 10% 正确率 |
 | 高危 | 6 | 内存爆炸 / 崩溃 / 断言失败 | BPE 60-80GB、reshape 视图断言 |
-| 中危 | 11 | 结果偏差 / 性能退化 / 并行不确定 | BPE 迭代序泄漏、one-hot 3.2GB、scatter_add 非确定性 |
+| 中危 | 13 | 结果偏差 / 性能退化 / 并行不确定 | BPE 迭代序泄漏、one-hot 3.2GB、scatter_add 非确定性 |
 | 低危 | 15+ | 构建失败 / UI 异常 / 兼容性 | CRLF、MSVC 编译器版本、tkinter 保留属性 |
 
 **一句话预警**：本项目最大的两类风险是 **① 布局/索引约定不一致** 和 **② GPU 资源生命周期**，历史上所有灾难级 bug 都出自这两类。改代码前先读第 6 节的根因模式。
@@ -251,6 +251,28 @@
   越过 BLOCK），"seq 跨块"≠"块内被全屏蔽"；d) 修复类 bug 必须做红验证
   （revert 后测试要红），否则"补的测试"可能本来就是绿的假覆盖。
 
+### 4.13 DSL 裸视图根 → 空指令表：只在 GPU 爆（CPU 模板路径不校验）
+
+- **症状**：CNN 前向在 GPU 上硬报错 `validate_expr_spec: empty instruction list`；
+  同规格 CPU 完全正常、ctest 全绿（MaxPool2D 事故，2026-09-27 修复）。
+- **根因**：IR 规定"输出 = 最后一条指令的 dst"，`dsl::compute` 的**根节点是裸视图**
+  （`grouped_reduce_max(x, R)`、`row_broadcast(v)` 这类只登记 view/input、不产生指令的
+  节点）时，折叠出的 `ExprSpec` 指令表为空 → `validate_expr_spec` 直接拒绝。而 CPU 走
+  编译期模板求值**根本不做这项校验** → 同一份表达式 CPU 合法、GPU 非法，校验集合不对称。
+- **为什么测试没拦住（三层盲区）**：① ctest 的 `cnn_test` 不带 `--gpu`，CNN 从不在 GPU 上跑；
+  ② `scan_exprs` 的 Conv/MaxPool dry-run 用 `(void)` 调用，校验错误被静默吞掉、结构也没登记，
+  构建照常通过；③ 生成器 `expr_glsl_gen` 假定 `instrs.back()` 非空，根本没有 view 根的代码路径。
+- **修法**：与 RAPT 既有先例一致——根视图与一个**运行时 0** 相加
+  （`grouped_reduce_max(x, R) + dsl::rparam(Scalar{0})`）：rparam 编译期不可被常量折叠，
+  表达式合法、语义不变，且 rparam 的值不进 `expr_spec_key`（闭合世界不受影响）。
+- **防复发**：① 扫描模式下 `validate_expr_spec` 失败即硬退出（`dsl::scan_reject` →
+  `std::_Exit(3)`），把这类错误从 GPU 运行期前移到**构建期**；② `scan_exprs` 的
+  Conv/MaxPool dry-run 改为显式检查返回值（同 MHA 段）；③ ctest 新增 `cnn_test_gpu`
+  （`cnn_test --gpu`，无 Vulkan 时返回 77 = SKIP），GPU 侧 CNN 进入默认测试集。
+- **教训**：**"CPU 测试通过"不覆盖 GPU 的校验/分发路径**——凡两条求值路径的校验集合
+  不对称（GPU/scan 校验、CPU 模板不校验），测试必须两侧都跑，否则非法结构只会在
+  GPU 运行期以莫名其妙的报错现身。
+
 ---
 
 ## 5. 工具链与 UI 坑
@@ -263,6 +285,7 @@
 | QProcess `self._proc` 在 start() 后才赋值，启动瞬间输出丢失 | GUI | `self._proc` 必须在 `proc.start()` **前**赋值 |
 | `_feed` 残留重复 `self._current += ch`，逐字符翻倍 | GUI | 编辑前先读一遍旧代码 |
 | QSettings Windows 读回字符串需按参数 kind 强转 | GUI | `cli.coerce_values` 统一处理 |
+| 构建工具（scan_exprs）失败路径用 `std::abort()` → SIGABRT handler 里做 stacktrace 分配，线程池 worker 存活时**卡死不退出**，ninja 构建挂死到超时 | 构建 | 本工具是构建步骤：失败路径用 `std::_Exit(非零码)`（不碰信号处理器/堆），别用 abort |
 | `gui.py infer_gpu_var` 字符串恒真，恒传 `--gpu` | GUI | 字符串判真 ≠ 布尔判真 |
 | `_connect_deps` 只扫可见参数，隐藏参数依赖不连接 | GUI | 依赖扫描必须覆盖**全部**参数 |
 | Gradio `gr.Sketchpad` 输入是 dict，PIL composite 是对象非路径 | GUI | `_to_gray()` 兼容 dict/PIL/路径/图层 |
@@ -336,12 +359,14 @@ GPU-resident 单算子对、链式错；attn batch=1 对、batch=2 错；gradche
 - [ ] 参数/梯度注册、`extra_state()`（BatchNorm 的 running 统计）
 - [ ] 序列化：model_spec 新字段走 `apply_spec_version_defaults` 版本默认表
 - [ ] 推理模式：`set_training(false)` 路径（batch=1 场景必须正确）
+- [ ] 新内联表达式：进 `scan_exprs` 对应 dry-run（漏登记 = GPU 闭合世界未命中）；根节点不得是**裸视图**（空指令表只有 GPU 报错，见 §4.13）
 
 ### 修改 GPU 相关
 - [ ] batch 模式：录制期引用的张量存活到 end_batch 之后
 - [ ] TDR：DEVICE_LOST 保存 checkpoint 退出；TIMEOUT 的"减半 batch 重试"**尚未实现**（无任何 CLI 配置，勿声称支持），需要时按此方向补
 - [ ] 双份状态：新增任何 CPU/GPU 双份张量状态时，同步点收敛到单一方法并配 invalidate 测试（旧影子一致性机制已随 GPU-resident 路径移除，勿重新引入分散同步；见 §4.4/模式 A）
 - [ ] 内存预算：矩阵尺寸 × 4B × 张量个数，超 staging 走分块
+- [ ] 校验集合不对称：ExprSpec 校验只在 GPU/scan 路径（CPU 模板路径不校验）→ 新表达式必须跑 GPU 用例（如 `cnn_test --gpu`），CPU 绿不作数（§4.13）
 
 ### 修改 BPE/Tokenizer
 - [ ] 确定性：所有 ID 分配显式排序，平局按 key 打破
