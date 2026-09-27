@@ -11,7 +11,9 @@
 //   4. 无 spec 模型（build_gpt_model 直接构建）：跳过校验，向后兼容。
 // ─────────────────────────────────────────────────────────────────────────
 
+#include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -167,6 +169,66 @@ int run_test()
         else
             expect(false, "无 spec 模型应加载成功: " + lr.error().message, all);
         std::remove(file.c_str());
+    }
+
+    // ── 5. v5 矩阵形状未信任输入防御（内存安全审计 2026-09）────────────
+    // rows/cols 直接来自文件字节：溢出回绕（小缓冲+巨大元数据 → 后续按行列
+    // 索引越界）与巨量分配（内存耗尽）必须在分配前被拒绝；正常矩阵不得误杀。
+    std::cout << "\n── v5 未信任形状防御（应拒绝恶意、放行正常） ──\n";
+    {
+        // 5.1 rows*cols 溢出回绕（2^40 × 2^40），无矩阵数据
+        {
+            const std::string file = "arch_bad_overflow.bin";
+            std::ofstream ofs(file, std::ios::binary);
+            const std::uint8_t tag = 0;  // f32
+            const std::uint64_t rows = 1ULL << 40, cols = 1ULL << 40;
+            ofs.write(reinterpret_cast<const char*>(&tag), 1);
+            ofs.write(reinterpret_cast<const char*>(&rows), 8);
+            ofs.write(reinterpret_cast<const char*>(&cols), 8);
+            ofs.close();
+            std::ifstream ifs(file, std::ios::binary);
+            auto r = nn::detail::read_matrix_v5(ifs);
+            expect(!r, "溢出形状 2^40x2^40 被拒绝", all);
+            std::remove(file.c_str());
+        }
+        // 5.2 形状声明 4x4 但数据只剩 4 字节（远小于 64B）
+        {
+            const std::string file = "arch_bad_short.bin";
+            std::ofstream ofs(file, std::ios::binary);
+            const std::uint8_t tag = 0;
+            const std::uint64_t rows = 4, cols = 4;
+            const float one = 1.0f;
+            ofs.write(reinterpret_cast<const char*>(&tag), 1);
+            ofs.write(reinterpret_cast<const char*>(&rows), 8);
+            ofs.write(reinterpret_cast<const char*>(&cols), 8);
+            ofs.write(reinterpret_cast<const char*>(&one), 4);
+            ofs.close();
+            std::ifstream ifs(file, std::ios::binary);
+            auto r = nn::detail::read_matrix_v5(ifs);
+            expect(!r, "数据不足的形状被拒绝", all);
+            std::remove(file.c_str());
+        }
+        // 5.3 正常 2x3 f32（数据恰好用满剩余字节）→ 接受且数值正确
+        {
+            const std::string file = "arch_ok_matrix.bin";
+            std::ofstream ofs(file, std::ios::binary);
+            const std::uint8_t tag = 0;
+            const std::uint64_t rows = 2, cols = 3;
+            const float vals[6] = {1.f, 2.f, 3.f, 4.f, 5.f, 6.f};
+            ofs.write(reinterpret_cast<const char*>(&tag), 1);
+            ofs.write(reinterpret_cast<const char*>(&rows), 8);
+            ofs.write(reinterpret_cast<const char*>(&cols), 8);
+            ofs.write(reinterpret_cast<const char*>(vals), sizeof(vals));
+            ofs.close();
+            std::ifstream ifs(file, std::ios::binary);
+            auto r = nn::detail::read_matrix_v5(ifs);
+            bool ok = r && r->second.rows() == 2 && r->second.cols() == 3;
+            if (ok)
+                for (std::size_t i = 0; i < 6; ++i)
+                    if (r->second.span()[i] != vals[i]) ok = false;
+            expect(ok, "正常矩阵读回（形状+数值，无误杀）", all);
+            std::remove(file.c_str());
+        }
     }
 
     std::cout << "\n----------------------------------------\n";

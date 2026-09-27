@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "core_assert.hpp"
+#include "core_observer_ptr.hpp"
 #include "compute_layer.hpp"
 #include "model_spec.hpp"
 
@@ -72,7 +73,8 @@ public:
     Result<void> add(Args&&... args)
     {
         auto layer = std::make_unique<LayerType>(std::forward<Args>(args)...);
-        if (default_precision_) layer->set_precision_profile(*default_precision_);
+        if (default_precision_.has_value())
+            layer->set_precision_profile(default_precision_.value());
         auto r = layer->init(engine());
         if (!r) return std::unexpected(r.error());
         layers_.emplace_back(std::move(layer));
@@ -82,7 +84,8 @@ public:
     // 添加已由工厂构造的 Layer（如 make_norm_layer 按 NormType 创建归一化层）
     Result<void> add_layer(std::unique_ptr<Layer> layer)
     {
-        if (default_precision_) layer->set_precision_profile(*default_precision_);
+        if (default_precision_.has_value())
+            layer->set_precision_profile(default_precision_.value());
         auto r = layer->init(engine());
         if (!r) return std::unexpected(r.error());
         layers_.emplace_back(std::move(layer));

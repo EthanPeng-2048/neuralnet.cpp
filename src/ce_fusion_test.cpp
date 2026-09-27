@@ -125,7 +125,9 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
     const std::size_t vocab_size = 6;
     std::vector<std::size_t> labels(N);
     for (std::size_t i = 0; i < N; ++i)
-        labels[i] = static_cast<std::size_t>(dist(rng) * 3.0f + 3.0f);  // 0..5
+        // dist ∈ [-1.5, 1.5) → ×2+3 ∈ [0, 6)：非负且 <6，避免负浮点转
+        // size_t 的未定义行为（UBSan: 负值 outside representable range）
+        labels[i] = static_cast<std::size_t>(dist(rng) * 2.0f + 3.0f);  // 0..5
     labels[2] = 6;  // 越界
     labels[9] = 7;  // 越界
 
