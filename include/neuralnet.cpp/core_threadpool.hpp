@@ -751,10 +751,17 @@ namespace nn
         }
 
         // ── 析构 ────────────────────────────────────────────────────────
+        // ⚠ 与 finish_chunk 同一条丢唤醒规则（见其注释）：置 stop_ 必须
+        // 持 queue_mutex_ 再 notify。否则 worker 可能刚判完谓词 stop_=false、
+        // 尚未真正进入 wait()，本次 notify 信号丢失且之后再无人通知 →
+        // worker 永久睡眠 → 下方 join 永久阻塞（退出期死锁）。
         ~ThreadPool()
         {
-            stop_.store(true, std::memory_order_release);
-            condition_.notify_all();
+            {
+                std::lock_guard lock(queue_mutex_);
+                stop_.store(true, std::memory_order_release);
+                condition_.notify_all();
+            }
             for (auto& worker : workers_)
             {
                 if (worker.joinable())

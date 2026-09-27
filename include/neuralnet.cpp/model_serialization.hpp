@@ -199,6 +199,32 @@ template <typename... Ts>
     const auto rows = static_cast<std::size_t>(*rows_r);
     const auto cols = static_cast<std::size_t>(*cols_r);
 
+    // ── 未信任形状防御（与 kMaxSerializedStringBytes 同一威胁模型）──────
+    // rows/cols 直接来自文件，必须在任何分配前校验，否则两类事故：
+    //   ① rows*cols 不溢出但巨量 → 先物化巨缓冲 → 内存耗尽，
+    //      -fno-exceptions 下 bad_alloc 直接 terminate，连 Result 都回不去；
+    //   ② rows*cols 溢出回绕成小值 → 小缓冲 + 巨大 rows_/cols_ 元数据，
+    //      后续按行列索引（row*cols_+col）越界读写。
+    // 判据：矩阵数据字节数不得超过文件剩余字节数（用除法比较，
+    // 全程不产生 rows*cols 或 ×elem 的乘法溢出）。
+    {
+        const std::streampos pos = ifs.tellg();
+        ifs.seekg(0, std::ios::end);
+        const std::streampos end = ifs.tellg();
+        if (pos < 0 || end < pos)
+            return std::unexpected(Error{"Cannot determine file size while reading matrix"});
+        ifs.seekg(pos);
+        if (!ifs)
+            return std::unexpected(Error{"Stream seek failed while reading matrix"});
+        const auto remaining = static_cast<std::uint64_t>(end - pos);
+        const std::uint64_t elem_bytes = (p == Precision::F16) ? 2u : 4u;
+        const std::uint64_t max_elems = remaining / elem_bytes;
+        if (rows != 0 && cols != 0 && static_cast<std::uint64_t>(rows) > max_elems / cols)
+            return std::unexpected(Error{
+                "Matrix shape " + std::to_string(rows) + "x" + std::to_string(cols)
+                + " exceeds remaining file bytes; file is corrupt or malicious"});
+    }
+
     if (p == Precision::F16)
     {
         // 读取 f16 数据到临时 buffer，然后转为 f32 Matrix
