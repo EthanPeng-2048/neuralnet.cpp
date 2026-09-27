@@ -7,7 +7,7 @@
 #include <cstdio>
 #include <iostream>
 
-// ── maxpool_gradcheck（独立参考实现比对；MaxPool2D 此前无任何覆盖）─────────
+// ── maxpool_gradcheck（独立参考实现比对）──────────────────────────────────
 #define main test_maxpool_gradcheck
 #define max_abs_diff max_abs_diff_maxpool
 #include "maxpool_gradcheck.cpp"

@@ -16,7 +16,7 @@
 #include "compute_engine.hpp"
 #include "expr_opt.hpp"
 #include "expr_registry.hpp" // scan 模式融合 kernel 登记（NN_EXPR_SCAN）
-#include "expr_dsl.hpp"      // P3-3：matmul_with_bias 经 DSL 融合（单一事实源）
+#include "expr_dsl.hpp"      // matmul_with_bias 经 DSL 融合（单一事实源）
 
 namespace nn
 {
@@ -601,7 +601,7 @@ public:
             }
         }
 
-        // ── F32 路径（现状，零改动）─────────────────────────────────────
+        // ── F32 路径 ─────────────────────────────────────────────────────
         if (P == Precision::F32)
         {
             const Matrix& a = A.cpu_matrix();
@@ -635,7 +635,7 @@ public:
             return Tensor::from_matrix(std::move(result));
         }
 
-        // ── F16 路径（D6：f16 读 / f32 累加 / f16 写，§7.2）───────────
+        // ── F16 路径（f16 读 / f32 累加 / f16 写，§7.2）───────────
         // f16 无原生 SIMD → 向量化失败是预期行为，抑制 -Wpass-failed
         if (P == Precision::F16)
         {
@@ -667,11 +667,10 @@ public:
         return std::unexpected(Error{"matmul: unsupported precision"});
     }
 
-    // ── matmul + 行广播 bias（P3-3）：经 DSL 融合（单一事实源）──────────────
-    // 重写基类默认的"matmul + CPU 往返加 bias"：CPU 走模板求值，GPU 走 AOT
-    // 融合 shader；且 scan_exprs dry-run 会收集该结构→gen_fused 生成融合 kernel
-    // （此前 GPU Linear 每步做 to_matrix/from_matrix CPU 往返，且该 DSL 结构
-    // 从未被扫描，导致"Linear 结构"融合测试 AOT 未命中）。
+    // ── matmul + 行广播 bias：经 DSL 融合（单一事实源）──────────────
+    // 覆盖基类默认的"matmul + host 端 to_matrix 往返加 bias"：CPU 走模板求值，
+    // GPU 走 AOT 融合 shader；scan_exprs dry-run 经本路径收集该结构 → gen_fused
+    // 生成融合 kernel（结构没被收集 = GPU 闭合世界里没有对应 key）。
     [[nodiscard]] Result<Tensor> matmul_with_bias(
         const Tensor& A, const Tensor& B, const Tensor& bias,
         bool transA = false, bool transB = false,
@@ -681,8 +680,8 @@ public:
             return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
         const std::size_t rows = transA ? A.cols() : A.rows();
         const std::size_t cols = transB ? B.rows() : B.cols();
-        // P 必须下传（不能 (void)P）：scan 的 f16 dry-run 靠 dsl::compute 的
-        // NN_EXPR_SCAN 钩子按**真实操作数精度 + P** 登记 (结构, 签名)——吞掉 P
+        // P 必须下传（不可丢弃）：scan 的 f16 dry-run 靠 dsl::compute 的
+        // NN_EXPR_SCAN 钩子按**真实操作数精度 + P** 登记 (结构, 签名)——丢掉 P
         // 就会只登记全 f32 签名，GPU 侧带类型 matmul 段变体永远发现不到
         // （Linear::forward 每个 Linear 一次，是 cast 临时量最大的单一来源）。
         return nn::dsl::compute(*this,
@@ -693,7 +692,7 @@ public:
 
     // ── 批量矩阵乘法：按 batch 切分行块，逐 batch 矩阵乘 ──
     // C_b = alpha * op(A_b, B_b)（alpha 为 cuBLAS sgemm 语义的输出缩放系数）
-    // P: 计算精度（D5 §8.1，同 matmul）
+    // P: 计算精度（§8.1，同 matmul）
     [[nodiscard]] Result<Tensor> batched_matmul(
         const Tensor& A, const Tensor& B,
         std::size_t batch,
@@ -776,7 +775,7 @@ public:
             return Tensor::from_matrix(std::move(result));
         }
 
-        // ── F32 路径（现状，零改动）─────────────────────────────────────
+        // ── F32 路径 ─────────────────────────────────────────────────────
         const Matrix& a = A.cpu_matrix();
         const Matrix& b = B.cpu_matrix();
 
@@ -1290,7 +1289,7 @@ public:
         return out;
     }
 
-    // ── 归约向量原生形状输出（M3：LayerNorm/RMSNorm 小向量缓存用） ──────
+    // ── 归约向量原生形状输出（LayerNorm/RMSNorm 小向量缓存用） ──────
     // 语义：表达式在 (rows,cols) 网格上求值，但输出为归约向量本身：
     //   行归约轴 → (rows,1)，列归约轴 → (1,cols)（而非广播到 (rows,cols)）。
     // 要求：表达式归约轴为 0/1；末指令为归约时直接取归约向量，否则按代表
@@ -1333,7 +1332,7 @@ public:
         return eval_expr_impl(spec, inputs, rows, cols, /*vector_out=*/false, dst);
     }
 
-    // ── fold 段求值（P-C1 标量域 + P-C2 双域；CPU 正确性基准）─────────────
+    // ── fold 段求值（标量域 + 双域；CPU 正确性基准）─────────────
     // 调用约定：经 eval_expr 进入——输出网格 (rows, out_cols)（out_cols =
     //   vec_state_len 或 1，cols 参数必须等于它）；普通输入 (rows, K)、
     //   fold.matmul 的 A/B 按 MatmulSpec 布局、vecacc.b 按 (K, vec) 行主序。
@@ -1403,9 +1402,8 @@ public:
                 spans.push_back(t.cpu_matrix().span());
                 continue;
             }
-            // 视图白名单（与 expr_spec 的 fold validate 同步——两处曾漏同步
-            //   致 RowBroadcast(doc_col) 被拒、forward 报错被 scan (void) 吞、
-            //   backward 拿空缓存 NN_ASSERT）
+            // 视图白名单（与 expr_spec 的 fold validate **同步维护**——两处清单
+            //   必须一致，否则合法视图在一侧被拒、fold forward 直接报错）
             if (vk != ExprViewKind::Linear && vk != ExprViewKind::RowMod &&
                 vk != ExprViewKind::RowBroadcast &&
                 !((vk == ExprViewKind::BatchMod || vk == ExprViewKind::BatchCol) &&
@@ -1418,7 +1416,7 @@ public:
             if (is_tag_table && t.rows() != 1)
                 return std::unexpected(Error{
                     "eval_fold: tag table (BatchMod/BatchCol) must be (1, n)"});
-            // 标签表列数守卫（此前只查 rows → 形状违约静默越界读）：
+            // 标签表列数守卫（必须连 cols 一起查，否则形状违约静默越界读）：
             //   BatchMod 读 [batch_idx % param] → cols ≥ param（param==0 无
             //   定义直接拒）；BatchCol 读 [batch_idx*param + gk] →
             //   cols ≥ (batch-1)*param + K
@@ -1464,7 +1462,7 @@ public:
         const std::size_t m_per = (fmm && mm_batch > 0 && rows % mm_batch == 0)
             ? rows / mm_batch : rows;
 
-        // 输入视图读（列 = 全局收缩下标 gk；P-C2 加 BatchMod/BatchCol 掩码钩子）
+        // 输入视图读（列 = 全局收缩下标 gk；双域 fold 加 BatchMod/BatchCol 掩码钩子）
         const auto view_read = [&](std::size_t k, std::size_t r, std::size_t gk) -> Scalar
         {
             const ExprView& v = spec.views[k];
@@ -1586,8 +1584,8 @@ public:
         Span out = output.cpu_matrix().span();
         for (std::size_t r = 0; r < rows; ++r)
         {
-            // 状态初值 + 临时/归约槽/行向量态复位（每行独立——vecd 曾漏在
-            //   循环外声明导致跨行残留累加，err 随行数滚雪球）
+            // 状态初值 + 临时/归约槽/行向量态复位（每行独立——vecd 等槽若跨行
+            //   残留会累积，err 随行数滚雪球）
             for (std::uint8_t s = 0; s < f.num_state; ++s)
                 reg[s] = f.inits[s];
             for (std::size_t d = 0; d < spec.num_regs; ++d)
@@ -1649,7 +1647,7 @@ public:
             }
 
             // finalize（向量域）：逐输出列求值（cur_d 驱动 VecState 读），
-            //   out_cols=1（P-C1 标量 fold）时退化为原单列行为
+            //   out_cols=1（标量 fold）时退化为原单列行为
             for (std::size_t d = 0; d < out_cols; ++d)
             {
                 cur_d = d;
@@ -1673,7 +1671,7 @@ public:
         // 结构统一在 canonical 形态上，与 scan/gen_fused 两端一致。
         if (auto v = validate_expr_spec(raw_spec, inputs.size()); !v)
             return std::unexpected(v.error());
-        // fold 段（P-C1）：独立执行路径——跳过 canonicalize（IR-A/B 不作用于
+        // fold 段：独立执行路径——跳过 canonicalize（IR-A/B 不作用于
         //   body/finalize 序列）与空指令表检查（fold 的 finalize 即尾链）
         if (raw_spec.fold)
             return eval_fold_impl(raw_spec, inputs, rows, cols, vector_out, output);
@@ -1693,7 +1691,7 @@ public:
 
         std::vector<ConstSpan> spans;
         spans.reserve(inputs.size());
-        // matmul 段（S1/S2，S7 加 batch）：A/B 输入按 matmul 形状解释（与
+        // matmul 段（matmul 融合落地 + batch 扩展）：A/B 输入按 matmul 形状解释（与
         // 逐元素网格 (rows,cols) 不同），其余输入仍按视图语义校验。
         //   A 存储：transA=0 → (batch*M, K)；transA=1 → (batch*K, M)
         //   B 存储：transB=0 → (batch*K, N)；transB=1 → (batch*N, K)
@@ -1708,8 +1706,8 @@ public:
             const Tensor& t = inputs[k];
             if (!t.is_cpu())
                 return std::unexpected(Error{"eval_expr: input not CPU"});
-            // CPU 解释器按 f32 存储读取 span：f16 输入直读 = 空指针 UB（曾是
-            // CPU f16 训练 NaN/AV 家族成员）→ 响亮报错，让误用立刻暴露。
+            // CPU 解释器按 f32 存储读取 span：f16 输入直读 = 空指针 UB →
+            // 响亮报错，让误用立刻暴露。
             if (t.precision() != Precision::F32)
                 return std::unexpected(Error{
                     "eval_expr: CPU 解释器仅支持 f32 输入（f16 须经 PrecisionEngine 边界 cast）"});
@@ -1780,6 +1778,13 @@ public:
                 if (t.rows() != 1 || t.cols() != mm_batch * v.param)
                     return std::unexpected(Error{"eval_expr: BatchCol input must be (1,batch*param)"});
                 break;
+            case static_cast<uint8_t>(ExprViewKind::GroupedReduceSum):
+            case static_cast<uint8_t>(ExprViewKind::GroupedReduceMax):
+                // 输入 (rows*R, cols)：输出行 r 读组行 [r*R, (r+1)*R)
+                if (v.param == 0 || t.cols() != cols || t.rows() != rows * v.param)
+                    return std::unexpected(Error{
+                        "eval_expr: GroupedReduce input shape invalid (expect (rows*R, cols))"});
+                break;
             }
             spans.push_back(t.cpu_matrix().span());
         }
@@ -1846,7 +1851,7 @@ public:
             }
         }
 
-        // ── matmul 段预计算（S2 + S7 batch）：C = op(A,B) → (batch*M, N) ──
+        // ── matmul 段预计算（含 batch 扩展）：C = op(A,B) → (batch*M, N) ──
         // matmul 输出作为"虚拟寄存器 0"，逐元素链经 Matmul 操作数按 (r,c) 读取。
         // 与 batched_matmul 原语语义一致（A/B 按 batch 垂直切分，转置标志按
         // MatmulSpec 解释），再执行逐元素链（同现有归约预计算模式）。
@@ -1972,6 +1977,28 @@ public:
                 return s[b_idx % v.param];  // 按批次取模索引（ALiBi 斜率等）
             case static_cast<uint8_t>(ExprViewKind::BatchCol):
                 return s[b_idx * v.param + c];  // 按 (batch, col) 切片（doc_ids 等）
+            case static_cast<uint8_t>(ExprViewKind::GroupedReduceSum):
+            case static_cast<uint8_t>(ExprViewKind::GroupedReduceMax):
+            {
+                // 分组归约：输出行 r → 输入组行 [r*R, (r+1)*R)，t 升序累加
+                //（与 DSL 模板路径 / GLSL 展开链同序，铁律 8）
+                const std::size_t Rlen = v.param;
+                const std::size_t base = r * Rlen;
+                if (v.kind == static_cast<uint8_t>(ExprViewKind::GroupedReduceMax))
+                {
+                    Scalar m = std::numeric_limits<Scalar>::lowest();
+                    for (std::size_t tt = 0; tt < Rlen; ++tt)
+                    {
+                        const Scalar v2 = s[(base + tt) * cols + c];
+                        if (v2 > m) m = v2;
+                    }
+                    return m;
+                }
+                Scalar acc{0};
+                for (std::size_t tt = 0; tt < Rlen; ++tt)
+                    acc += s[(base + tt) * cols + c];
+                return acc;
+            }
             }
         };
 
@@ -2239,7 +2266,7 @@ public:
                                  op.kind == static_cast<uint8_t>(ExprOperandKind::Batch))
                         {
                             // 索引操作数沿归约轴的恒定性由生成器/引擎按轴判定；
-                            // 这里保守拒绝（S7 实际表达式不触发此路径）
+                            // 这里保守拒绝（实际表达式不触发此路径）
                             return std::unexpected(Error{
                                 "eval_expr_reduce: 输出链经 Row/Col/Batch 索引，输出不沿归约轴恒定"});
                         }
@@ -2286,7 +2313,7 @@ public:
         // 逐元素无跨元素依赖（归约/matmul 段均已预计算且此处只读）→ 并行与
         // 串行逐字节一致。门控用解释器自己的阈值 kExprParallelThreshold
         // （远低于 PARALLEL_THRESHOLD）：解释执行 per-element 成本高一个数量级，
-        // 且典型层形状（如 768×512=393216）在旧门控下根本不并行。
+        // 且典型层形状（如 768×512=393216）低于全局阈值、按其门控不会并行。
         if (n >= kExprParallelThreshold)
         {
             auto elem_kernel = [&](std::size_t i) noexcept

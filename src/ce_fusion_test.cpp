@@ -1,10 +1,12 @@
 // ───────────────────────────────────────────────────────────────────────────
-//  ce_fusion_test.cpp — M5：列式 softmax 融合原语 + 稀疏交叉熵端到端
+//  ce_fusion_test.cpp — 列式 softmax 融合表达式 + 稀疏交叉熵端到端
 //
 //  验证：
-//    - col_softmax_denom：denom[c] = Σ_r exp(logits[r][c] - col_max[c]) → 已删除（IR 融合替代）
-//    - col_softmax_sparse_forward：单 kernel 稠密梯度 + 标签位置 loss_vec → 已删除（IR 融合替代）
-//      （不物化全 softmax），含 mask / 越界标签处理
+//    - IR denom：denom[c] = Σ_r exp(logits[r][c] - col_max[c])，组合
+//      col_reduce_sum(exp(logits - cb(col_max)))，对照手写参考
+//    - loss_vec / grad：RowGather + Row 操作数组合（不物化全 softmax），
+//      含 mask / 越界标签处理
+//    - 归约 + 后处理（reduce(...) * k + c）：CPU 正确求值、GPU 必须硬报错
 //    - CrossEntropyLoss::forward_sparse 端到端（loss + grad vs 参考）
 //  CPU 引擎 vs 手写参考；GPU（Vulkan）融合 shader vs CPU 参考。
 //
@@ -35,8 +37,8 @@ Scalar max_abs_diff(const nn::Matrix& a, const nn::Matrix& b)
     return e;
 }
 
-// 返回是否通过：调用方必须把 false 计入失败数（此前只累加 g_fail 而不影响
-// run_case 返回值/进程退出码，导致 [FAIL] 行被 "ALL PASS" 掩盖 —— 修）。
+// 返回是否通过：调用方必须把 false 计入失败数——只累加 g_fail 而不影响
+// run_case 返回值/进程退出码时，[FAIL] 行会被 "ALL PASS" 掩盖。
 bool check_matrix(const nn::Matrix& got, const nn::Matrix& ref, const char* msg)
 {
     const Scalar err = max_abs_diff(got, ref);
@@ -154,7 +156,7 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
     const nn::Tensor t_logits = nn::Tensor::from_matrix(nn::Matrix(logits));
     const nn::Tensor t_colmax = nn::Tensor::from_matrix(nn::Matrix(col_max));
 
-    // ── S7 IR 组合：denom = col_sum(exp(logits - cb(col_max))) ──
+    // ── IR 组合：denom = col_sum(exp(logits - cb(col_max))) ──
     {
         char nm[128];
         std::snprintf(nm, sizeof(nm), "%s IR denom", tag);
@@ -166,16 +168,15 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
         check(nm, std::move(r), ref);
     }
 
-    // ── 回归：带"归约 + 后处理"的归约向量表达式（reduce(...) * k + c）──
+    // ── 归约 + 后处理的归约向量表达式（reduce(...) * k + c）────────
     //   rsqrt(col_sum(x²)/C + ε) → (1,N)
-    // 背景一（CPU）：eval_expr_reduce 的"输出沿归约轴恒定"前置校验原本按
-    // **寄存器号**传播所需指令（needed[reg]），而寄存器分配器按 liveness 复用
-    // 逐元素寄存器号 —— 后处理指令的 dst 与归约前的 Mul 同号时，归约前的定义
-    // 被误判为输出链的一部分（Linear 访问），该类表达式被错误拒绝。现改为按
-    // **指令下标**反向切片，CPU 正确求值。
-    // 背景二（GPU）：归约融合 shader 尚未正确实现"归约后仍有逐元素后处理"的
-    // 形态（实测静默错值），故 GPU 必须**硬报错**而非返回错值；本用例断言
-    // 这一点，防止将来退化为静默错误。
+    // CPU：eval_expr_reduce 的"输出沿归约轴恒定"前置校验按**指令下标**反向
+    //   切片——寄存器分配器按 liveness 复用寄存器号，若按**寄存器号**传播
+    //   所需指令，后处理指令的 dst 与归约前的 Mul 同号时会把归约前的定义
+    //   误判为输出链的一部分（Linear 访问）→ 此类表达式被错误拒绝。
+    // GPU：归约融合 shader 不支持"归约后仍有逐元素后处理"的形态（只会静默
+    //   错值），故必须**硬报错**而非返回错值；本用例断言这一点，防止退化
+    //   为静默错误。
     {
         char nm[128];
         std::snprintf(nm, sizeof(nm), "%s IR 归约+后处理 (reduce*k+c)", tag);
@@ -300,12 +301,12 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
         }
     }
 
-    // ── S7 IR 组合：loss_vec / grad（RowGather + Row 操作数）──
+    // ── IR 组合：loss_vec / grad（RowGather + Row 操作数）──
     //   loss_vec = (rg(logits) - cb(col_max) - log(denom)) * cb(mask)  （(1,N)）
     //   grad     = (exp(logits-cb(col_max))/cb(denom)
     //               - select(Row==cb(labels),1,0)) * cb(mask) * rp(inv)  （(C,N)）
     // 注：inv_num_valid 由 RParam 承载（运行时标量，不进 expr_spec_key）→ 与
-    //     整条逐元素链融合为单 kernel（原先在表达式后补一次 scale_inplace）。
+    //     整条逐元素链融合为单 kernel。
     {
         nn::Matrix labels_m(1, N);
         for (std::size_t i = 0; i < N; ++i)
@@ -318,7 +319,7 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
             nn::Matrix lv_ref;
             const nn::Matrix g_ref = ref_sparse_forward(
                 logits, labels, nullptr, vocab_size, inv_num_valid, lv_ref);
-            // S7 Layer 行为：mask = valid 修正（越界 label → 0）
+            // Layer 行为：mask = valid 修正（越界 label → 0）
             nn::Matrix mask_m(1, N);
             for (std::size_t i = 0; i < N; ++i)
                 mask_m.set_value_unchecked(0, i,
@@ -479,7 +480,7 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
 int main()
 {
     std::cout << "========================================\n"
-              << "  M5 列式 softmax 融合 + 稀疏交叉熵验证\n"
+              << "  列式 softmax 融合 + 稀疏交叉熵验证\n"
               << "========================================\n";
 
     nn::CpuEngine cpu_engine;
@@ -498,14 +499,14 @@ int main()
     nn::GpuEngine gpu_engine(backend);
     fail += run_case(gpu_engine, "GPU");
 
-    // ── P0-2：异步标量回读（submit/poll）与同步下载必须逐值一致 ─────────
+    // ── 异步标量回读（submit/poll）与同步下载必须逐值一致 ─────────
     // 同一组 logits 反复求 loss，按训练热循环的真实调用序：
     //   begin_batch → forward_sparse_sum（录制）→ cast(F32) → flush_batch（提交）
     //   → submit_scalar_readback（主帧提交后，不等待）→ poll 就绪后取回。
     // 与 forward_sparse（同步 to_matrix）逐值比较；迭代 24 轮 > 槽位数（8），
     // 覆盖槽位环形复用——若回读串槽/读到陈旧值，此处必现差异。
     {
-        std::cout << "\n── P0-2 异步标量回读 vs 同步下载 ──\n";
+        std::cout << "\n── 异步标量回读 vs 同步下载 ──\n";
         constexpr std::size_t C = 37, N = 64;
         nn::Matrix logits(C, N), lm(1, N);
         std::mt19937 rng(12345);

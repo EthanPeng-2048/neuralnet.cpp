@@ -5,27 +5,31 @@
 //
 //  设计依据：docs/development/05-mixed-precision.md（Q3-A / Q4 / Q6 / §8 / §11.1）
 //
-//  一句话：**f16 只改变"数据存哪儿"，不改变"算子怎么算"**。融合世界（AOT
-//  闭合世界 + 手写 shader）保持全 f32，f16 的边界 cast 全部集中在本层：
+//  一句话：**f16 只改变"数据存哪儿"，不改变"算子怎么算"**——算术始终以 f32
+//  为参考精度，f16 的精度边界处理全部集中在本层。每个原语先问内层有没有
+//  该 (结构, 输入精度, 输出精度) 的**带类型** f16 变体，没有才走边界 cast：
 //
-//      入：把 f16 操作数抬到 f32（cast；已是 f32 则零拷贝直通）
-//      算：调用内层引擎的既有 f32 实现（零改动、零分歧、零 shader 变体）
-//      出：结果按目标精度落回（f16 写出 = round-half-to-even，与硬件一致）
+//      变体优先：内层有带类型融合 shader → 直接把 f16 原张量交给它
+//              （读 f16 / 写 f16，算术 f32），零边界临时量；
+//      边界 cast：入 = 把 f16 操作数抬到 f32（已是 f32 则零拷贝直通），
+//              算 = 调用内层引擎的既有 f32 实现（零分歧），
+//              出 = 结果按目标精度落回（f16 写出 = round-half-to-even，与硬件一致）。
 //
-//  in-place 原语（add/scale/axpy/zero/broadcast_*/eval_expr_into）用
+//  in-place 原语（add_inplace/scale_inplace/zero/eval_expr_into）用
 //  `cast_into` 写回**原存储**：保留张量对象身份与底层 buffer，避免"替换对象"
 //  导致其它持有同一句柄的缓存静默失联（§8.3：in-place 存储精度不可变）。
 //
-//  为什么不做"引擎内逐原语 f16 分支"（§11.1 的 Phase 2 才做）：
-//    · 需要 CPU/GPU 各写一遍（两份易漂移的实现，违背"改一处只改一个头文件"）；
-//    · 手写 shader（elementwise/reduce/broadcast/matmul_tiled/gather…）全是 f32
-//      类型，逐条改 f16 变体会让 shader 与 AOT 注册表规模翻倍（每个 ExprSpec
-//      都要两份），而收益仅在带宽（显存占用由**存储**决定，边界 cast 已拿到）。
-//  边界 cast 以"设备内多一次带宽"换"零 shader 变体、零注册表膨胀、零回归"。
+//  为什么边界 cast 仍是无变体时的**通用回退**（而不是逐原语手写 f16 分支）：
+//    · 逐原语分支需要 CPU/GPU 各写一遍（两份易漂移的实现，违背"改一处只改
+//      一个头文件"）；
+//    · 手写 shader 逐条补 f16 变体使 shader 与 AOT 注册表规模翻倍——带类型
+//      变体只按归因表确认的大头（逐元素 / 归约 / matmul 段）生成。
+//  边界 cast 保证任何 (结构, 签名) 组合都有正确路径，代价是"设备内多一次
+//  带宽 + 全尺寸 f32 临时量"；全 f32 配置下本层纯直通、零额外开销。
 //
 //  精度语义（本层的唯一规则，显式、可预测）：
 //    · 带 P 形参的运算类原语：输出/计算精度 = P（**不做 Auto 推导**；Layer 按
-//      §8.5 约定总是显式传 `p_.compute` / `p_.stable`，未传 = F32 = 现状）。
+//      §8.5 约定总是显式传 `p_.compute` / `p_.stable`，未传 = F32）。
 //    · 不带 P 的纯数据搬运原语（transpose/slice/insert/gather/scatter/
 //      rearrange_3d/im2col/col2im/clone）：输出精度 = 源精度（§8.4）。
 //    · in-place 原语：存储精度不可变，显式 P 只改计算路径（§8.3）。
@@ -41,8 +45,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <source_location>
 #include <span>
 #include <string>
 #include <unordered_set>
@@ -72,31 +78,39 @@ private:
     }
 
     // 抬到 f32：已是 f32 → 共享所有权直通（零拷贝）；f16 → 引擎 cast
-    [[nodiscard]] Result<Tensor> to_f32(const Tensor& t)
+    // loc：调用点（source_location 默认参在**调用处**求值 → 归因表能落到
+    // 具体算子行号，而非统一落在本函数）。
+    [[nodiscard]] Result<Tensor> to_f32(const Tensor& t,
+                                        std::source_location loc = std::source_location::current())
     {
         if (t.precision() == Precision::F32)
             return t;
-        note_temp_(t.rows(), t.cols(), /*to_f32=*/true);
+        note_temp_(t.rows(), t.cols(), /*to_f32=*/true,
+                   static_cast<std::uint32_t>(loc.line()));
         return inner_.cast(t, Precision::F32);
     }
 
     // 落回目标精度：目标 f32 或已同精度 → 原样返回
-    [[nodiscard]] Result<Tensor> to_prec(Tensor t, Precision P)
+    [[nodiscard]] Result<Tensor> to_prec(Tensor t, Precision P,
+                                         std::source_location loc = std::source_location::current())
     {
         if (P == Precision::F32 || t.precision() == P)
             return t;
-        note_temp_(t.rows(), t.cols(), /*to_f32=*/false);
+        note_temp_(t.rows(), t.cols(), /*to_f32=*/false,
+                   static_cast<std::uint32_t>(loc.line()));
         return inner_.cast(std::move(t), P);
     }
 
     // 一批操作数抬到 f32（顺序与输入一致；ExprSpec 的 views 依赖该顺序）
-    [[nodiscard]] Result<std::vector<Tensor>> to_f32_all(std::span<const Tensor> ts)
+    [[nodiscard]] Result<std::vector<Tensor>> to_f32_all(
+        std::span<const Tensor> ts,
+        std::source_location loc = std::source_location::current())
     {
         std::vector<Tensor> out;
         out.reserve(ts.size());
         for (const auto& t : ts)
         {
-            auto c = to_f32(t);
+            auto c = to_f32(t, loc);
             if (!c)
                 return std::unexpected(c.error());
             out.push_back(std::move(*c));
@@ -105,17 +119,24 @@ private:
     }
 
     // in-place 双操作数通用：抬 f32 → 算 → 必要时 cast_into 写回 A 的原存储
+    // loc：转发给 to_f32/to_prec（归因落到调用本模板的算子行）。
     template <typename Fn>
-    [[nodiscard]] Result<void> inplace2_(Tensor& A, const Tensor& B, Fn&& fn)
+    [[nodiscard]] Result<void> inplace2_(Tensor& A, const Tensor& B, Fn&& fn,
+                                         std::source_location loc = std::source_location::current())
     {
         if (A.precision() == Precision::F32 && B.precision() == Precision::F32)
             return fn(A, B);
-        auto b = to_f32(B);
+        // Phase C1b：内层原生支持 f16（GPU：f16 pipeline 原地直加/缩放，
+        // 无 pipeline 引擎内回退）→ 直通，A 不物化 f32 副本（inplace 归因
+        // 大头由此消灭）。CPU 引擎钩子 false → 维持边界 cast。
+        if (inner_.supports_native_data_move())
+            return fn(A, B);
+        auto b = to_f32(B, loc);
         if (!b)
             return std::unexpected(b.error());
         if (A.precision() == Precision::F32)
             return fn(A, *b);
-        auto a = to_f32(A);
+        auto a = to_f32(A, loc);
         if (!a)
             return std::unexpected(a.error());
         auto r = fn(*a, *b);
@@ -126,11 +147,16 @@ private:
 
     // in-place 单操作数通用
     template <typename Fn>
-    [[nodiscard]] Result<void> inplace1_(Tensor& A, Fn&& fn)
+    [[nodiscard]] Result<void> inplace1_(Tensor& A, Fn&& fn,
+                                         std::source_location loc = std::source_location::current())
     {
         if (A.precision() == Precision::F32)
             return fn(A);
-        auto a = to_f32(A);
+        // Phase C1b：同 inplace2_——GPU 原生 f16 原地（scale_inplace 的
+        // (2048,256) 归因大头由此消灭）；CPU 钩子 false → 维持边界 cast
+        if (inner_.supports_native_data_move())
+            return fn(A);
+        auto a = to_f32(A, loc);
         if (!a)
             return std::unexpected(a.error());
         auto r = fn(*a);
@@ -141,74 +167,86 @@ private:
 
     // 运算类通用：抬 f32 → 算 → 按 P 落回（单操作数）
     template <typename Fn>
-    [[nodiscard]] Result<Tensor> unary_(const Tensor& A, Precision P, Fn&& fn)
+    [[nodiscard]] Result<Tensor> unary_(const Tensor& A, Precision P, Fn&& fn,
+                                        std::source_location loc = std::source_location::current())
     {
         if (P == Precision::F32 && A.precision() == Precision::F32)
             return fn(A);
-        auto a = to_f32(A);
+        auto a = to_f32(A, loc);
         if (!a)
             return std::unexpected(a.error());
         auto r = fn(*a);
         if (!r)
             return std::unexpected(r.error());
-        return to_prec(std::move(*r), P);
+        return to_prec(std::move(*r), P, loc);
     }
 
     // 运算类通用：抬 f32 → 算 → 按 P 落回（双操作数）
     template <typename Fn>
     [[nodiscard]] Result<Tensor> binary_(const Tensor& A, const Tensor& B,
-                                         Precision P, Fn&& fn)
+                                         Precision P, Fn&& fn,
+                                         std::source_location loc = std::source_location::current())
     {
         if (P == Precision::F32 && A.precision() == Precision::F32 &&
             B.precision() == Precision::F32)
             return fn(A, B);
-        auto a = to_f32(A);
+        auto a = to_f32(A, loc);
         if (!a)
             return std::unexpected(a.error());
-        auto b = to_f32(B);
+        auto b = to_f32(B, loc);
         if (!b)
             return std::unexpected(b.error());
         auto r = fn(*a, *b);
         if (!r)
             return std::unexpected(r.error());
-        return to_prec(std::move(*r), P);
+        return to_prec(std::move(*r), P, loc);
     }
 
     // 数据搬运类通用：输出精度 = 源精度（§8.4，无 P 形参）
     template <typename Fn>
-    [[nodiscard]] Result<Tensor> move_(const Tensor& A, Fn&& fn)
+    [[nodiscard]] Result<Tensor> move_(const Tensor& A, Fn&& fn,
+                                       std::source_location loc = std::source_location::current())
     {
         const Precision out_p = A.precision();
         if (out_p == Precision::F32)
             return fn(A);
-        auto a = to_f32(A);
+        // Phase C1：内层引擎原生支持 f16 数据搬运（GPU：f16 pipeline 直读
+        // 直写；无 pipeline 时引擎内自行 cast 回退）→ 直通，**不物化
+        // f32 副本**（归因表 transpose/rearrange/gather 大头由此消灭）。
+        // CPU 引擎此钩子为 false → 维持边界 cast（其原语基于 f32 Matrix）。
+        if (inner_.supports_native_data_move())
+            return fn(A);
+        auto a = to_f32(A, loc);
         if (!a)
             return std::unexpected(a.error());
         auto r = fn(*a);
         if (!r)
             return std::unexpected(r.error());
-        return to_prec(std::move(*r), out_p);
+        return to_prec(std::move(*r), out_p, loc);
     }
 
     // ── 多精度变体发现 / 边界 cast 归因（诊断；NN_PREC_TRACE=1）────────────
-    // 打印每个 (结构 key, 精度签名) —— 这就是 in-kernel f16 需要生成的变体集合。
-    // 只有适配层看得到**真实输入精度**（内层引擎收到的永远是 f32 副本），故
-    // 变体发现必须放在这里（scan 的 f16 dry-run 是另一条同源路径）。
-    // ── 多精度变体发现 / 边界 cast 归因（诊断；NN_PREC_TRACE=1）────────────
-    // 记录一次"物化临时量"（形状 → 次数/字节）；见 dump_temp_stats()。
-    static void note_temp_(std::size_t rows, std::size_t cols, bool to_f32)
+    // trace_variant_：打印每个 (结构 key, 精度签名) —— 这就是 in-kernel f16
+    // 需要生成的变体集合。本层是所有原语调用的必经点、能看到每次调用的
+    // **真实输入精度**，故变体发现放在这里（scan 的 f16 dry-run 是另一条同源路径）。
+    // note_temp_：记录一次"物化临时量"（形状 + 调用点行号 → 次数/字节）；见
+    // dump_temp_stats()。
+    // line = source_location 行号（区分同一形状来自哪个算子路径——只有形状
+    // 时 matmul/unary_/eval_expr 的 cast 无法分辨）。
+    static void note_temp_(std::size_t rows, std::size_t cols, bool to_f32,
+                           std::uint32_t line = 0)
     {
         if (!prec_trace_enabled_())
             return;
         const std::size_t bytes = rows * cols * (to_f32 ? 4u : 2u);
         for (auto& e : temp_stats())
-            if (e.rows == rows && e.cols == cols && e.to_f32 == to_f32)
+            if (e.rows == rows && e.cols == cols && e.to_f32 == to_f32 && e.line == line)
             {
                 e.count++;
                 e.bytes += bytes;
                 return;
             }
-        temp_stats().push_back(TempStat{rows, cols, to_f32, 1, bytes});
+        temp_stats().push_back(TempStat{rows, cols, to_f32, 1, bytes, line});
     }
 
     [[nodiscard]] static bool prec_trace_enabled_()
@@ -282,6 +320,7 @@ public:
         bool to_f32 = true;       // true = 抬到 f32 的副本；false = 输出落回
         std::size_t count = 0;
         std::size_t bytes = 0;    // 临时量实际字节（f16 副本按 2B/元素）
+        std::uint32_t line = 0;   // 调用点行号（source_location，见 note_temp_）
     };
 
     [[nodiscard]] static std::vector<TempStat>& temp_stats()
@@ -305,10 +344,11 @@ public:
         {
             char buf[256];
             std::snprintf(buf, sizeof(buf),
-                          "  %-11s (%zu,%zu)  x%-5zu %8.1f MB\n",
+                          "  %-11s (%zu,%zu)  x%-5zu %8.1f MB  L%u\n",
                           e->to_f32 ? "->f32 副本" : "->按P落回",
                           e->rows, e->cols, e->count,
-                          static_cast<double>(e->bytes) / (1024.0 * 1024.0));
+                          static_cast<double>(e->bytes) / (1024.0 * 1024.0),
+                          static_cast<unsigned>(e->line));
             s += buf;
         }
         return s;
@@ -335,7 +375,7 @@ public:
 
     // ── 激活 offload：slab 统一按 f32 存（offset 以 float 为单位）──────────
     // f16 激活在写入 slab 前抬到 f32：restore 出来是 f32，后续运算由本层
-    // 适配（正确性不受影响，只是该份激活不再享 f16 存储折半）。
+    // 适配（正确性不受影响，代价是该份激活按 f32 存、不享 f16 存储折半）。
     [[nodiscard]] Result<Tensor> create_offload_buffer(std::size_t bytes) override
     {
         return inner_.create_offload_buffer(bytes);
@@ -479,6 +519,12 @@ public:
     {
         if (dst.precision() == Precision::F32 && grad.precision() == Precision::F32)
             return inner_.scatter_add_rows(dst, indices, grad);
+        // Phase C2b：内层原生支持 f16（GPU：打包 half CAS 变体；无 pipeline
+        // 时引擎内 cast 回退）→ 直通，不为 dst/grad 物化 f32 副本
+        //（归因 L518/521 (8208,64)+(8192,64) 大头由此消灭）。CPU 钩子 false →
+        // 维持边界 cast（其原语基于 f32 Matrix）。
+        if (inner_.supports_native_data_move())
+            return inner_.scatter_add_rows(dst, indices, grad);
         auto d = to_f32(dst);
         if (!d)
             return std::unexpected(d.error());
@@ -534,9 +580,10 @@ public:
     // 矩阵级原语
     // ══════════════════════════════════════════════════════════════════════
     // 非 f32 直接下传（不经本层 cast）：内层有 **f16 存储版 GEMM**
-    // （f16 直读 + f32 累加 + f16 写出）→ 不再为每个操作数物化整份 f32 副本
-    // （实测这是训练 transient 膨胀的头号来源）。内层在"f16 pipeline 不可用 /
-    // 小 N GEMV / 操作数精度混合"时自行回退 f32 空间 + 边界 cast，正确性不变。
+    // （f16 直读 + f32 累加 + f16 写出）→ 不为每个操作数物化整份 f32 副本
+    // （逐操作数物化 f32 副本是训练 transient 膨胀的头号来源）。内层在
+    // "f16 pipeline 不可用 / 小 N GEMV / 操作数精度混合"时自行回退 f32 空间 +
+    // 边界 cast，正确性不变。
     [[nodiscard]] Result<Tensor> matmul(
         const Tensor& A, const Tensor& B,
         bool transA = false, bool transB = false,
@@ -652,6 +699,10 @@ public:
     // ══════════════════════════════════════════════════════════════════════
     // 扫描级原语（RLA/RAPT）
     // ══════════════════════════════════════════════════════════════════════
+    // Phase C2f：内层原生支持 f16（GPU：全 f16 走 f16 扫描变体、混合精度
+    // 引擎内 cast）→ f16 输入直接下传，**不物化全尺寸 f32 输入副本**
+    //（scan 输出 (rows*5/3/dk, seq) 是 RLA 训练的大头临时量）。CPU 钩子
+    // false → 维持边界 cast。输出按 prec 落回。
     [[nodiscard]] Result<Tensor> scan_prefix_outer(
         const Tensor& K, const Tensor& V, const Tensor& P, const Tensor& R,
         const Tensor& A0, const Tensor& B0, bool has_state,
@@ -665,6 +716,13 @@ public:
             B0.precision() == Precision::F32 && boundary.precision() == Precision::F32)
             return inner_.scan_prefix_outer(K, V, P, R, A0, B0, has_state, dk, heads,
                                             causal, boundary, has_bnd);
+        if (inner_.supports_native_data_move())
+        {
+            auto r = inner_.scan_prefix_outer(K, V, P, R, A0, B0, has_state, dk, heads,
+                                              causal, boundary, has_bnd, prec);
+            if (!r) return std::unexpected(r.error());
+            return to_prec(std::move(*r), prec);
+        }
         const std::vector<Tensor> ts{K, V, P, R, A0, B0, boundary};
         auto c = to_f32_all(ts);
         if (!c) return std::unexpected(c.error());
@@ -686,6 +744,13 @@ public:
             boundary.precision() == Precision::F32)
             return inner_.scan_suffix_outer(D, X, Y, dk, heads, causal, boundary,
                                             has_bnd);
+        if (inner_.supports_native_data_move())
+        {
+            auto r = inner_.scan_suffix_outer(D, X, Y, dk, heads, causal, boundary,
+                                              has_bnd, prec);
+            if (!r) return std::unexpected(r.error());
+            return to_prec(std::move(*r), prec);
+        }
         const std::vector<Tensor> ts{D, X, Y, boundary};
         auto c = to_f32_all(ts);
         if (!c) return std::unexpected(c.error());
@@ -703,6 +768,12 @@ public:
         if (prec == Precision::F32 && P.precision() == Precision::F32 &&
             R.precision() == Precision::F32 && S.precision() == Precision::F32)
             return inner_.outer_col(P, R, S, dk, has_scale);
+        if (inner_.supports_native_data_move())
+        {
+            auto r = inner_.outer_col(P, R, S, dk, has_scale, prec);
+            if (!r) return std::unexpected(r.error());
+            return to_prec(std::move(*r), prec);
+        }
         const std::vector<Tensor> ts{P, R, S};
         auto c = to_f32_all(ts);
         if (!c) return std::unexpected(c.error());
@@ -714,25 +785,55 @@ public:
     // ══════════════════════════════════════════════════════════════════════
     // 归约原语（§7.3：累加恒 f32，输出舍入到 P）
     // ══════════════════════════════════════════════════════════════════════
+    // Phase C2：内层原生吃 f16 输入（GPU reduce f16 变体，归约全程 f32、
+    // 输出 f32 向量）→ f16 输入直接下传，**不物化整份 f32 输入副本**
+    // （归因 L756 大头：Linear::backward grad_bias 直调 row_reduce_sum 的
+    // (64,8192)×38 + (256,8192)×8 = 140MB）。CPU 钩子 false → 边界 cast。
+    // 输出仍按 P 落回（(rows,1)/(1,cols) 归约向量极小，开销可忽略）。
     [[nodiscard]] Result<Tensor> row_reduce_sum(
         const Tensor& A, Precision P = Precision::F32) override
     {
+        if (A.precision() != Precision::F32 && inner_.supports_native_f16_reduce())
+        {
+            auto r = inner_.row_reduce_sum(A, P);
+            if (!r) return std::unexpected(r.error());
+            return to_prec(std::move(*r), P);
+        }
         return unary_(A, P, [this](const Tensor& a) { return inner_.row_reduce_sum(a); });
     }
     [[nodiscard]] Result<Tensor> col_reduce_sum(
         const Tensor& A, Precision P = Precision::F32) override
     {
+        if (A.precision() != Precision::F32 && inner_.supports_native_f16_reduce())
+        {
+            auto r = inner_.col_reduce_sum(A, P);
+            if (!r) return std::unexpected(r.error());
+            return to_prec(std::move(*r), P);
+        }
         return unary_(A, P, [this](const Tensor& a) { return inner_.col_reduce_sum(a); });
     }
     [[nodiscard]] Result<Tensor> col_reduce_max(
         const Tensor& A, Precision P = Precision::F32) override
     {
+        if (A.precision() != Precision::F32 && inner_.supports_native_f16_reduce())
+        {
+            auto r = inner_.col_reduce_max(A, P);
+            if (!r) return std::unexpected(r.error());
+            return to_prec(std::move(*r), P);
+        }
         return unary_(A, P, [this](const Tensor& a) { return inner_.col_reduce_max(a); });
     }
     [[nodiscard]] Result<Tensor> grouped_reduce_sum(
         const Tensor& x, std::size_t G, std::size_t R,
         Precision P = Precision::F32) override
     {
+        // Phase C2c：内层原生吃 f16（GPU f16 分组归约变体）→ 直通
+        if (x.precision() != Precision::F32 && inner_.supports_native_f16_reduce())
+        {
+            auto r = inner_.grouped_reduce_sum(x, G, R, P);
+            if (!r) return std::unexpected(r.error());
+            return to_prec(std::move(*r), P);
+        }
         return unary_(x, P, [this, G, R](const Tensor& t)
         {
             return inner_.grouped_reduce_sum(t, G, R);
@@ -742,6 +843,12 @@ public:
         const Tensor& x, std::size_t G, std::size_t R,
         Precision P = Precision::F32) override
     {
+        if (x.precision() != Precision::F32 && inner_.supports_native_f16_reduce())
+        {
+            auto r = inner_.grouped_reduce_max(x, G, R, P);
+            if (!r) return std::unexpected(r.error());
+            return to_prec(std::move(*r), P);
+        }
         return unary_(x, P, [this, G, R](const Tensor& t)
         {
             return inner_.grouped_reduce_max(t, G, R);
@@ -762,8 +869,8 @@ public:
             return inner_.eval_expr(spec, inputs, rows, cols);
         // ── in-kernel f16 优先（Phase 2）────────────────────────────────────
         // 内层引擎有该 (结构, 输入精度, 输出精度) 的**带类型**融合 shader →
-        // 直接把原张量交给它（读 f16 / 写 f16，算术 f32）：不再为每个算子物化
-        // f32 副本（那正是训练 transient 膨胀 2.4× 的根因）。
+        // 直接把原张量交给它（读 f16 / 写 f16，算术 f32）：不为每个算子物化
+        // f32 副本（逐算子物化 f32 副本会使训练 transient 膨胀约 2.4×）。
         if (inner_.supports_expr_precision_variant(spec, inputs, P))
             return inner_.eval_expr(spec, inputs, rows, cols, P);
         if (prec_trace_enabled_())

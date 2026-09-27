@@ -67,11 +67,11 @@ cmake --build build --parallel
 ### 推理
 
 ```bash
-# 使用已训练的模型推理
-./build/mnist_infer --model mnist_model.bin --image datasets/mnist_data/test/0_1.csv
+# 使用已训练的模型推理（图片路径是位置参数）
+./build/mnist_infer datasets/mnist_data/test/0_1.csv --model mnist_model.bin
 
-# 交互模式（输入文件路径）
-./build/mnist_infer --interactive
+# 批量推理整个目录下的 CSV
+./build/mnist_infer datasets/mnist_data/test --model mnist_model.bin --topk 5
 ```
 
 ---
@@ -185,7 +185,7 @@ cmake --build build --parallel
 | BPE | `"bpe"` | Byte-Pair Encoding |
 | CharBPE | `"charbpe"` | 字符级 BPE |
 
-V4 格式模型文件会自动嵌入分词器，推理时无需单独指定 `--vocab`。
+V4 及以上格式的模型文件会自动嵌入分词器，推理时无需单独指定 `--vocab`。
 
 ---
 
@@ -244,7 +244,7 @@ int main() {
 
             // 反向传播
             auto grad = loss_fn.backward();
-            model.backward(engine, *grad);
+            model.backward(*grad);
 
             // 参数更新
             optimizer->step();
@@ -326,7 +326,7 @@ int main() {
 
             // 反向传播 + 更新
             auto grad = loss_fn.backward();
-            model.backward(engine, *grad);
+            model.backward(*grad);
             optimizer->step();
 
             std::cout << "Step " << step << "  loss=" << *loss << "\n";
@@ -334,9 +334,9 @@ int main() {
     }
 
     // 6. 保存模型（含嵌入词表）
-    // 注意：v4 格式将 ModelSpec 和 tokenizer 的 JSON 嵌入文件头部，
+    // 注意：自描述格式（v4+，当前写入 v5）将 ModelSpec 和 tokenizer 的 JSON 嵌入文件头部，
     // 推理时无需单独指定 --vocab 参数。
-    nn::save_model("gpt_model.bin", model, model.spec(), tokenizer_json);
+    nn::save_model("gpt_model.bin", model, *model.spec(), tokenizer_json);
 }
 ```
 
@@ -350,7 +350,7 @@ int main() {
 int main() {
     nn::CpuEngine engine;
 
-    // 1. 加载模型（v4 格式：文件头部含 spec + tokenizer；Model 需预先构建以提供 spec 用于校验）
+    // 1. 加载模型（v4+ 自描述格式：文件头部含 spec + tokenizer；Model 需预先构建以提供 spec 用于校验）
     auto load_result = nn::load_model("gpt_model.bin", model);
     auto tokenizer_json = std::move(*load_result);
     auto tokenizer = nn::load_tokenizer_from_string(tokenizer_json);
@@ -422,14 +422,14 @@ int main() {
 
 | 版本 | 格式 | 说明 |
 |------|------|------|
-| V4 | `[magic][version][precision][spec_len][spec: KeyValueRecord][matrices...][extra state][tokenizer]` | 当前自描述格式 |
-| V1/V2/V3 | 旧偏移量定长格式 | 已移除支持 |
+| V5 | `[magic][version][precision][spec_len][spec: KeyValueRecord][matrices...][extra state][tokenizer]`，每个矩阵前带 1B 精度标签（f32/f16） | `save_model` 当前写入版本 |
+| V4 | 同上布局，矩阵无精度标签（按 f32 读取） | 仍可读取 |
+| V1/V2/V3 | 旧偏移量定长格式 | 不支持（header 校验阶段即拒绝，提示重新训练保存） |
 
-- `load_model` 仅支持 v4 自描述格式（v1/v2/v3 旧文件会提示重新训练保存）
-- `save_model` 统一写入 v4 格式
+- `save_model` 统一写入 v5；`load_model` 接受 v4 及以上自描述格式（v1/v2/v3 会提示重新训练保存）
 - 规格头为长度前缀 KeyValueRecord（自描述、无偏移量假设）；
   版本默认值表保证字段缺失时回落默认（如 norm_type 缺失 → LayerNorm）
-- v4 模型推理时无需单独指定 `--vocab` 参数（嵌入词表随模型保存）
+- v4/v5 模型推理时无需单独指定 `--vocab` 参数（嵌入词表随模型保存）
 
 ---
 
@@ -515,7 +515,7 @@ python gui.py
    - `transformer`：可配置模型维度、注意力头数、FFN 维度、层数、Patch 大小
 5. **可选功能**：
    - ✅ 恢复训练 — 从已有模型继续训练
-   - ✅ GPU 加速 — 支持 Vulkan（下拉选择；CUDA 已停用）
+   - ✅ GPU 加速 — 支持 Vulkan（下拉选择设备）
    - ✅ 评估样本数 — 仅 Transformer 架构生效，限制评估样本以加快训练（0=自动）
    - ✅ 学习率调度 — 支持 cosine 衰减（含预热）和手动指定每轮 lr
 6. **点击 "▶ 开始训练"** — 日志面板实时输出训练进度，下方曲线图实时绘制 step_loss、epoch_loss、train_acc、test_acc、lr
@@ -648,7 +648,7 @@ python gui.py
 **可选项：**
 - ✅ **交互式生成模式** — 启用后通过 stdin 进行多轮对话式生成
 - ✅ **显示 Token ID** — 调试用，显示每个 token 的 ID
-- ✅ **GPU 加速** — 支持 Vulkan（下拉选择；CUDA 已停用）
+- ✅ **GPU 加速** — 支持 Vulkan（下拉选择设备）
 
 ---
 

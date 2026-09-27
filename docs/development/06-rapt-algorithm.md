@@ -10,7 +10,7 @@
 [2 RLA 数学](#2-rla原始的-relu-linear-attention) ·
 [3 家族演进](#3-家族演进) ·
 [4 RAPT 工程落地](#4-rapt引擎化扫描原语gpu-落地) ·
-[5 历史：两趟式注意力](#5-历史两趟式注意力已删除) ·
+[5 注意力实现形态](#5-注意力实现形态fold-流式) ·
 [6 训练显存](#6-训练期显存激活重计算与-offload)
 
 ---
@@ -85,7 +85,7 @@ Output_t = Σ_{i=1..L} σ(q_t)ᵀ σ(k_i) · v_i / ( sqrt( Σ_{i=1..L} ( σ(q_t)
 | 维度 | RLA（原版） | RLA-2（修正版，2026-09-04） | LRLA（扩展版） |
 | :--- | :--- | :--- | :--- |
 | 归一化分母 | `sqrt(Σ score²) + ε`（L2） | `Σ score + ε`（Sum，输出=加权平均，幅值恒定） | 同 RLA-2 |
-| 分数定义 | 推理/训练曾不一致 | **统一为逐维 ReLU 后点积** | 同左 |
+| 分数定义 | 推理/训练定义不一致（原版缺陷） | **统一为逐维 ReLU 后点积** | 同左 |
 | 防神经元死亡 | 残差 `ReLU(x)+0.1x`（泄漏破坏硬截断） | **RMSNorm 前置**（无泄漏） | MLP 内 LayerNorm |
 | 位置衰减 | 可加 γ^(t-i)（可选） | **无 γ**，纯 RoPE 提供位置信息 | 同左 |
 | 特征映射 φ | 固定 ReLU | 固定 ReLU | **可学习多层网络**（末层必须 ReLU，保证非负） |
@@ -114,9 +114,8 @@ Output_t = q_t' S_t / ( q_t' · z_t + ε )     （ε = 1e-4）
 
 ## 4. RAPT：引擎化扫描原语（GPU 落地）
 
-RAPT 是上述算法的工程实现。2026-09-04 的**引擎化**改造删掉了 Layer 内的
-`scan_forward_/scan_backward_` 纯 CPU 标量循环（PCIe 往返），改为 3 个 op-level
-扫描原语，由 Layer 用原语 + 逐元素原语组合表达算法（铁律 3：shader 永不含算法）。
+RAPT 是上述算法的工程实现：Layer 用 3 个 op-level 扫描原语 + DSL 表达式组合出整个算法
+（铁律 3：shader 永不含算法——shader 只做"带状态的顺序归约 + matvec 读出 / 外积"）。
 
 ### 4.1 三个扫描原语（`compute_engine.hpp` 纯虚）
 
@@ -143,47 +142,45 @@ RAPT 是上述算法的工程实现。2026-09-04 的**引擎化**改造删掉了
      分母项 `gK += suffix(scale·q)`：causal 走 `outer_col(Qp, e_0, scale, has_scale=true)` + 后缀扫描；
      双向走 `row_reduce_sum(dB)` → 单条 `row_broadcast + rparam(0)` 表达式广播 → `scan_suffix_outer(causal=false)`；
   4. `select(Qp > 0, gQ, 0)` 反传过 ReLU → RoPE 反向 → RMSNorm 反向 → 各投影 `w_*.backward`。
-- **forward_step（推理逐 token，KV cache）**：`Q/K/V → RMSNorm → RoPE → ReLU` → **先更新状态**（`batched_matmul(V, Kp, transB)` → `add_inplace(B_state)`；`add_inplace(z_state, Kp)`）→ `num = B·q'`（batched_matmul）→ `den = q·z + ε`（逐头点积，CPU round-trip 可接受）→ `out = num/den`。
+- **forward_step（推理逐 token，KV cache）**：`Q/K/V → RMSNorm → RoPE → ReLU` → **先更新状态**（`dsl::matmul(V, Kp, transB, batch=H)` 求 `v·k'ᵀ` → `dsl::compute_into` 累加进 `B_state`；`dsl::compute_into` 累加 `z_state += k'`）→ `num = B·q'`（`dsl::matmul(batch=H)`）→ `den = q·z + ε`（逐头点积，CPU round-trip 可接受）→ `out = num/den`（与 forward 的除法表达式同构）。
 
 ### 4.3 改这段代码前必读的坑
 
 1. **RLA-2 无 A 状态**（`Σk'k'ᵀ`）：分母只依赖 `z = Σk'`，`scan_prefix_outer` 的 A 行块在 RLA-2 路径上以 dummy 传入；**别按原版 RLA 的 `2·ds·Aq` 项去改 backward**。
 2. **双向分支的广播技巧**：单视图表达式不合法（IR 规定输出=最后一条指令的 dst，空指令表被 `validate_expr_spec` 拒绝），故必须写成 `row_broadcast(x) + rparam(0)`；这是**刻意的 hack，不是冗余**。
-3. **boundary 形状契约是 `(1, B·seq)`**（shader 索引 `Bnd[b*seq+t]`），不是 `(rows/dk, seq)`；写错则 doc-aware gradcheck 才会暴露（历史已踩过）。
-4. **backward 缓存前置校验**：checkpoint/offload 模式下缓存为空必须**立刻报错**，不能让空张量流进 matmul（旧行为 = 静默算出垃圾梯度）。
+3. **boundary 形状契约是 `(1, B·seq)`**（shader 索引 `Bnd[b*seq+t]`），不是 `(rows/dk, seq)`；写错只有 doc-aware gradcheck 能暴露，改动后必跑。
+4. **backward 缓存前置校验**：checkpoint/offload 模式下缓存为空必须**立刻报错**，不能让空张量流进 matmul（静默算出的垃圾梯度比崩溃危险得多）。
 5. 标量块 s/r 头内逐行重复，Layer 读任一行即可；空参数一律 `(1,1) dummy + bool 标志`（规避 0 字节 GPU buffer）。
 
-### 4.4 验证基线（2026-09-04，GTX 850M）
+### 4.4 验收基线（参考硬件 GTX 850M）
 
 | 验证 | 结果 |
 |---|---|
-| `rapt_gradcheck`（CPU / --gpu） | 14/14、3 段全 OK，max_err 与改造前基线一致（causal 0.0290 / bidir 0.2554 / doc-aware 0.00868） |
+| `rapt_gradcheck`（CPU / --gpu） | 14/14、3 段全 OK，max_err 基线：causal 0.0290 / bidir 0.2554 / doc-aware 0.00868 |
 | `rapt_smoke_test`（CPU / --gpu） | KV-cache 一致性 max_diff = 0 / 2.98e-08（= 1 ulp，加法顺序不同） |
 | `text_train --model rapt --gpu` | 319 步：loss 6.3→3.9，10.3s，无 TDR |
 | `text_infer --model rapt --gpu` | 16 token 0.4s；forward_step GPU 录制路径验证通过 |
 
-> 手写原语不进融合注册表（闭合世界未破坏，AOT 收集条数不变）；6 处 Vulkan 接线细节沉淀在
-> `01-compute-engine-development.md`。
+> 扫描原语是手写 shader，不进融合注册表（闭合世界不受影响，AOT 收集条数不变）；
+> GPU 侧接线实现见 `compute_gpu_engine.hpp` 与 `backend/compute_vk_backend.hpp`。
 
 ---
 
-## 5. 历史：两趟式注意力（已删除）
+## 5. 注意力实现形态（fold 流式）
 
-> S7 的"两趟式多 kernel 注意力"（forward 3 个融合 kernel m→l→W × 4 种掩码变体、
-> backward 3 个，W 物化供复用）**已删除**——2026-09-24 起注意力 forward 为**单 fold kernel**
-> 分块流式（QKᵀ/掩码/online softmax/ΣwV 逐 `EXPR_FOLD_BLOCK=128` 块完成，S 矩阵绝不物化，
-> 见 `08-pitfalls-and-lessons.md` §4 与 `compute_layer_attention.hpp` 头注释）。
->
-> 保留的结论：本项目**不存在单一 "flash-attn" kernel**——FlashAttention 的核心思想
-> （online softmax + 不物化 S）由 fold 流式求值实现；掩码变体（Plain/Causal/Alibi/Doc/AlibiDoc）
-> 经 `FoldSpec` 登记，漏登记即 GPU 闭合世界硬报错。与传统 Flash Attention 的对照分析
-> （kernel 数量、IO 复杂度、掩码扩展方式）见 git 历史中本节原文。
+本项目**不存在单一 "flash-attn" kernel**——FlashAttention 的核心思想（online softmax + 不物化 S）
+由注意力 forward 的**单 fold kernel 分块流式**实现（`FoldSpec`：QKᵀ/掩码/online softmax/ΣwV 逐
+`EXPR_FOLD_BLOCK=128` 块完成，S 矩阵绝不物化，见 `08-pitfalls-and-lessons.md` §4 与
+`compute_layer_attention.hpp` 头注释）。掩码变体（Plain/Causal/Alibi/Doc/AlibiDoc）经 `FoldSpec`
+登记，漏登记即 GPU 闭合世界硬报错。backward 为 R/X 表达式 + 3 个 `batched_matmul`。
+
+> 与传统两趟式多 kernel 注意力（W 物化供复用）的对照分析已移入 `docs/history.md`。
 
 ---
 
 ## 6. 训练期显存：激活重计算与 offload
 
-RAPT 与 GPT 同档支持三种开关（2026-09-19 补齐；此前 RAPT 侧是**静默 no-op** 而 CLI 会打印"已启用"）：
+RAPT 与 GPT 同档支持三种开关：
 
 | 能力 | 入口 | 实现要点 |
 |------|------|----------|
@@ -193,11 +190,7 @@ RAPT 与 GPT 同档支持三种开关（2026-09-19 补齐；此前 RAPT 侧是**
 
 **为什么 RLA 的重算特别划算**：RLA 前向是 O(L·d_k²)，GPT 注意力重算含 QKᵀ 是 O(L²)——同一 `stride` 下 RLA 重算代价约为 GPT 的 1/L。因此 RAPT **优先用检查点**，offload 次之。
 
-`ReLULinearAttention` 在 checkpoint 模式下不写任何 backward 缓存（Qp/Kp/V_re/Q_normed/K_normed/逐头 1/rms），backward 缺缓存直接报错而非拿空张量算梯度；`activation_cache()` 列出全部本层缓存 + 4 个子层（Q_normed/K_normed/Q_rms_inv/K_rms_inv 曾漏列 → offload 漏搬，已补）。
-
-**已修的两个前置缺陷**（不修则静默毁模型）：
-1. `RAPTModel::clear_cache()` 曾清空 `token_emb_`（**模型参数**）——检查点每块 backward 后都调它，等于毁掉词嵌入。
-2. `RAPTModel::forward` 曾只在 `doc_ids` 非空时下发文档 id → `set_doc_ids({})` 关不掉文档感知，跨 step 残留边界重置（跨样本串扰）。
+`ReLULinearAttention` 在 checkpoint 模式下不写任何 backward 缓存（Qp/Kp/V_re/Q_normed/K_normed/逐头 1/rms），backward 缺缓存直接报错而非拿空张量算梯度；`activation_cache()` 列出全部本层缓存 + 4 个子层缓存（offload 完整覆盖）。
 
 **坑**：复合层 override `forward_recompute` 必须调用**虚函数** `set_checkpoint_mode` 关闭子层——基类默认实现只改本块标志位，子层缓存不重建，表现为"stride=1 能过、stride=2 过不了"（见 `08-pitfalls-and-lessons.md` 模式 H）。
 

@@ -1,7 +1,7 @@
 // ── scan_prefix_outer_gen.comp ───────────────────────────────────────────
 // RLA 前缀扫描原语（**通用 d_k** 版本，dk 无 64 上限）：
-//   当 d_k > 64 时后端走本 shader，A/B 运行态不再驻 shared（shared 是
-//   O(dk²) 且受 48KB 预算限制），改驻**全局显存** scratch（B*H*2*dk*dk）。
+//   当 d_k > 64 时后端走本 shader，A/B 运行态驻**全局显存** scratch
+//   （B*H*2*dk*dk）——shared 是 O(dk²) 且受 48KB 预算限制，无法驻留。
 //   共享内存只在 barrier 之间做进程同步，占用 O(1)，对任意 dk 安全。
 // 语义与 scan_prefix_outer.comp 完全一致：
 //   A_t = A0 + Σ_{i≤t,同文档} k_i·k_i^T,  B_t = B0 + Σ v_i·k_i^T
@@ -9,17 +9,30 @@
 // 1 workgroup/头，256 线程。性能弱于共享内存版本，优先保证正确性（任意 dk）。
 // ─────────────────────────────────────────────────────────────────────────
 #version 450
+// -DNN_SHADER_F16=1 → f16 存储变体（Phase C2f：输入输出均 half；scratch
+//   St 是引擎按 f32 分配的 R/W 中间缓冲 → 保持 float（读写点显式转换），
+//   运行态累加精度不变。仅需 storageBuffer16BitAccess）。
+#if defined(NN_SHADER_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#define NN_ETYPE float16_t
+#define NN_RD(x) float(x)
+#define NN_WR(x) float16_t(x)
+#else
+#define NN_ETYPE float
+#define NN_RD(x) (x)
+#define NN_WR(x) (x)
+#endif
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly  buffer BufK   { float K[]; };
-layout(std430, binding = 1) readonly  buffer BufV   { float V[]; };
-layout(std430, binding = 2) readonly  buffer BufP   { float P[]; };
-layout(std430, binding = 3) readonly  buffer BufR   { float R[]; };
-layout(std430, binding = 4) readonly  buffer BufA0  { float A0[]; };
-layout(std430, binding = 5) readonly  buffer BufB0  { float B0[]; };
-layout(std430, binding = 6) readonly  buffer BufBnd { float Bnd[]; };
+layout(std430, binding = 0) readonly  buffer BufK   { NN_ETYPE K[]; };
+layout(std430, binding = 1) readonly  buffer BufV   { NN_ETYPE V[]; };
+layout(std430, binding = 2) readonly  buffer BufP   { NN_ETYPE P[]; };
+layout(std430, binding = 3) readonly  buffer BufR   { NN_ETYPE R[]; };
+layout(std430, binding = 4) readonly  buffer BufA0  { NN_ETYPE A0[]; };
+layout(std430, binding = 5) readonly  buffer BufB0  { NN_ETYPE B0[]; };
+layout(std430, binding = 6) readonly  buffer BufBnd { NN_ETYPE Bnd[]; };
 layout(std430, binding = 7)           buffer BufSt  { float St[]; };  // R/W scratch (B*H*2*dk*dk)
-layout(std430, binding = 8) writeonly buffer BufOut { float Out[]; };
+layout(std430, binding = 8) writeonly buffer BufOut { NN_ETYPE Out[]; };
 
 layout(push_constant) uniform Push {
     uint dk, heads, seq, causal, has_state, has_bnd, rows;
@@ -38,8 +51,8 @@ void main() {
         const uint a = idx / dk, c = idx % dk;
         float va = 0.0, vb = 0.0;
         if (has_state == 1u) {
-            va = A0[(h * dk + a) * dk + c];
-            vb = B0[(h * dk + a) * dk + c];
+            va = NN_RD(A0[(h * dk + a) * dk + c]);
+            vb = NN_RD(B0[(h * dk + a) * dk + c]);
         }
         St[base + idx]           = va;
         St[base + dk * dk + idx] = vb;
@@ -51,20 +64,20 @@ void main() {
         if (causal == 1u) {
             uint reset = 0u;
             if (has_bnd == 1u)
-                reset = (Bnd[b * seq + t] != 0.0) ? 1u : 0u;
+                reset = (NN_RD(Bnd[b * seq + t]) != 0.0) ? 1u : 0u;
             for (uint idx = tid; idx < dk * dk; idx += 256u) {
                 const uint a = idx / dk, c = idx % dk;
                 const uint Aofs = base + idx, Bofs = base + dk * dk + idx;
                 if (reset == 1u) { St[Aofs] = 0.0; St[Bofs] = 0.0; }
-                St[Aofs] += K[(r0 + a) * seq + t] * K[(r0 + c) * seq + t];
-                St[Bofs] += V[(r0 + a) * seq + t] * K[(r0 + c) * seq + t];
+                St[Aofs] += NN_RD(K[(r0 + a) * seq + t]) * NN_RD(K[(r0 + c) * seq + t]);
+                St[Bofs] += NN_RD(V[(r0 + a) * seq + t]) * NN_RD(K[(r0 + c) * seq + t]);
             }
         } else {
             for (uint idx = tid; idx < dk * dk; idx += 256u) {
                 const uint a = idx / dk, c = idx % dk;
                 const uint Aofs = base + idx, Bofs = base + dk * dk + idx;
-                St[Aofs] += K[(r0 + a) * seq + t] * K[(r0 + c) * seq + t];
-                St[Bofs] += V[(r0 + a) * seq + t] * K[(r0 + c) * seq + t];
+                St[Aofs] += NN_RD(K[(r0 + a) * seq + t]) * NN_RD(K[(r0 + c) * seq + t]);
+                St[Bofs] += NN_RD(V[(r0 + a) * seq + t]) * NN_RD(K[(r0 + c) * seq + t]);
             }
         }
         barrier();
@@ -73,15 +86,16 @@ void main() {
         if (tid < dk) {
             float num = 0.0, aq = 0.0;
             for (uint j = 0u; j < dk; ++j) {
-                num += St[base + dk * dk + tid * dk + j] * P[(r0 + j) * seq + t];
-                aq  += St[base + tid * dk + j]          * P[(r0 + j) * seq + t];
+                const float pj = NN_RD(P[(r0 + j) * seq + t]);
+                num += St[base + dk * dk + tid * dk + j] * pj;
+                aq  += St[base + tid * dk + j]          * pj;
             }
             float btr = 0.0;
             for (uint i = 0u; i < dk; ++i)
-                btr += St[base + dk * dk + i * dk + tid] * R[(r0 + i) * seq + t];
-            Out[(r0 + tid) * seq + t]            = num;   // [0) B·P
-            Out[(rows + r0 + tid) * seq + t]      = aq;   // [1) A·P
-            Out[(2u * rows + r0 + tid) * seq + t] = btr;  // [2) B^T·R
+                btr += St[base + dk * dk + i * dk + tid] * NN_RD(R[(r0 + i) * seq + t]);
+            Out[(r0 + tid) * seq + t]            = NN_WR(num);   // [0) B·P
+            Out[(rows + r0 + tid) * seq + t]      = NN_WR(aq);   // [1) A·P
+            Out[(2u * rows + r0 + tid) * seq + t] = NN_WR(btr);  // [2) B^T·R
         }
         barrier();
 
@@ -90,17 +104,19 @@ void main() {
             float s = 0.0, r = 0.0;
             for (uint j = 0u; j < dk; ++j) {
                 float aqj = 0.0, numj = 0.0;
+                const float pj = NN_RD(P[(r0 + j) * seq + t]);
                 for (uint l = 0u; l < dk; ++l) {
-                    aqj  += St[base + j * dk + l]          * P[(r0 + l) * seq + t];
-                    numj += St[base + dk * dk + j * dk + l] * P[(r0 + l) * seq + t];
+                    const float pl = NN_RD(P[(r0 + l) * seq + t]);
+                    aqj  += St[base + j * dk + l]          * pl;
+                    numj += St[base + dk * dk + j * dk + l] * pl;
                 }
-                s += P[(r0 + j) * seq + t] * aqj;
-                r += R[(r0 + j) * seq + t] * numj;
+                s += pj * aqj;
+                r += NN_RD(R[(r0 + j) * seq + t]) * numj;
             }
             for (uint i = 0u; i < dk; ++i)
-                Out[(3u * rows + r0 + i) * seq + t] = s;   // [3) 头内逐行重复
+                Out[(3u * rows + r0 + i) * seq + t] = NN_WR(s);   // [3) 头内逐行重复
             for (uint i = 0u; i < dk; ++i)
-                Out[(4u * rows + r0 + i) * seq + t] = r;   // [4) 头内逐行重复
+                Out[(4u * rows + r0 + i) * seq + t] = NN_WR(r);   // [4) 头内逐行重复
         }
         barrier();
     }

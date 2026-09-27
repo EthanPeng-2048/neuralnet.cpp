@@ -7,13 +7,25 @@
 // 1 workgroup/头，256 线程；S 驻 shared 64×65≈16.6KB
 // ─────────────────────────────────────────────────────────────────────
 #version 450
+// -DNN_SHADER_F16=1 → f16 存储变体（Phase C2f，同 scan_prefix：输入输出均
+//   half、shared/算术 float；仅需 storageBuffer16BitAccess）。
+#if defined(NN_SHADER_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#define NN_ETYPE float16_t
+#define NN_RD(x) float(x)
+#define NN_WR(x) float16_t(x)
+#else
+#define NN_ETYPE float
+#define NN_RD(x) (x)
+#define NN_WR(x) (x)
+#endif
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly  buffer BufD   { float D[]; };
-layout(std430, binding = 1) readonly  buffer BufX   { float X[]; };
-layout(std430, binding = 2) readonly  buffer BufY   { float Y[]; };
-layout(std430, binding = 3) readonly  buffer BufBnd { float Bnd[]; };
-layout(std430, binding = 4) writeonly buffer BufOut { float Out[]; };
+layout(std430, binding = 0) readonly  buffer BufD   { NN_ETYPE D[]; };
+layout(std430, binding = 1) readonly  buffer BufX   { NN_ETYPE X[]; };
+layout(std430, binding = 2) readonly  buffer BufY   { NN_ETYPE Y[]; };
+layout(std430, binding = 3) readonly  buffer BufBnd { NN_ETYPE Bnd[]; };
+layout(std430, binding = 4) writeonly buffer BufOut { NN_ETYPE Out[]; };
 
 layout(push_constant) uniform Push {
     uint dk, heads, seq, causal, has_bnd, rows;
@@ -39,21 +51,21 @@ void main() {
         if (causal == 1u) {
             uint reset = 0u;
             if (has_bnd == 1u && i + 1u < seq)
-                reset = (Bnd[b * seq + i + 1u] != 0.0) ? 1u : 0u;
+                reset = (NN_RD(Bnd[b * seq + i + 1u]) != 0.0) ? 1u : 0u;
             for (uint idx = tid; idx < dk * dk; idx += 256u) {
                 const uint a = idx / dk, c = idx % dk;
                 if (reset == 1u) sS[a][c] = 0.0;
-                sS[a][c] += D[(dbase + a * dk + c) * seq + i];
+                sS[a][c] += NN_RD(D[(dbase + a * dk + c) * seq + i]);
             }
         } else {
             for (uint idx = tid; idx < dk * dk; idx += 256u) {
                 const uint a = idx / dk, c = idx % dk;
-                sS[a][c] = D[(dbase + a * dk + c) * seq + i];
+                sS[a][c] = NN_RD(D[(dbase + a * dk + c) * seq + i]);
             }
         }
         if (tid < dk) {
-            s_xv[tid] = X[(r0 + tid) * seq + i];
-            s_yv[tid] = Y[(r0 + tid) * seq + i];
+            s_xv[tid] = NN_RD(X[(r0 + tid) * seq + i]);
+            s_yv[tid] = NN_RD(Y[(r0 + tid) * seq + i]);
         }
         barrier();
 
@@ -65,9 +77,9 @@ void main() {
             }
             for (uint r = 0u; r < dk; ++r)
                 syt += sS[r][tid] * s_yv[r];
-            Out[(r0 + tid) * seq + i]               = sx;  // [0) S·X
-            Out[(rows + r0 + tid) * seq + i]          = sy;  // [1) S·Y
-            Out[(2u * rows + r0 + tid) * seq + i]     = syt; // [2) S^T·Y
+            Out[(r0 + tid) * seq + i]               = NN_WR(sx);  // [0) S·X
+            Out[(rows + r0 + tid) * seq + i]          = NN_WR(sy);  // [1) S·Y
+            Out[(2u * rows + r0 + tid) * seq + i]     = NN_WR(syt); // [2) S^T·Y
         }
         barrier();
     }

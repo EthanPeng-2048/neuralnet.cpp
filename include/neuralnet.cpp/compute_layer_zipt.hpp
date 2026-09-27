@@ -21,6 +21,26 @@
 #include "expr_dsl.hpp"
 
 namespace nn {
+
+// ══════════════════════════════════════════════════════════════════════════
+// CrossAttention — 阶段一：全局上下文重要性压缩（AttnZip Memory Queries）
+//
+// 算法（AttnZip 文档 §3.2，单头，忠实还原）：
+//   K = X·W_K, V = X·W_V                     X: (d_model, batch·L)
+//   A = Softmax(P·K^T / sqrt(d))             P: (d_model, M) 可学习记忆查询
+//   C = A·V                                  C: (d_model, batch·M)
+//
+// 批量化（batch=batch，单头，d_k = d_model）：
+//   Q_re = P 沿 batch 平铺 → (batch·d_model, M)
+//   K_re = rearrange_3d(K, d_model, batch, L) → (batch·d_model, L)
+//   S    = batched_matmul(Q_re, K_re, batch, transA=true, alpha=scale) → (batch·M, L)
+//   A    = softmax(S)
+//   C_re = batched_matmul(V_re, A, batch, false, true) → (batch·d_model, M)
+//   C    = rearrange_3d(C_re, d_model, batch, M, true) → (d_model, batch·M)
+//
+// 参数：P (d_model, M) 可学习 + w_k + w_v（无 w_o：C = A·V 直接输出）
+// 复杂度：对序列长度 L 线性（O(M·L·d)），是 AttnZip 消除 O(L²) 的核心。
+// ══════════════════════════════════════════════════════════════════════════
 class CrossAttention final : public Layer
 {
 private:
@@ -128,14 +148,21 @@ public:
         auto V_re = engine.rearrange_3d(*V, d_model_, batch, L, false);
         if (!V_re) return std::unexpected(V_re.error());
 
-        // S = batched_matmul(Q_re, K_re, batch, transA=true, alpha=scale) → (batch·M, L)
-        auto S = engine.batched_matmul(*Q_re, *K_re, batch, true, false, scale_);
+        // S = batched_matmul(Q_re, K_re, batch, transA=true, alpha=scale)
+        //   → (batch·M, L)。经 dsl::matmul(batch) + rparam(alpha) 尾链求值
+        //   （结构与 ZiPTBlock 的 S 同 key，闭合世界经其 dry-run 覆盖）
+        auto S = dsl::compute(engine,
+            dsl::matmul(*Q_re, *K_re, true, false, batch) * dsl::rparam(scale_),
+            batch * Q_re->cols(), K_re->cols());
         if (!S) return std::unexpected(S.error());
         // A = softmax(S)
         auto attn = softmax_.forward(engine, *S);
         if (!attn) return std::unexpected(attn.error());
         // C_re = batched_matmul(V_re, A, batch, false, true) → (batch·d_model, M)
-        auto C_re = engine.batched_matmul(*V_re, *attn, batch, false, true);
+        // dsl::matmul(batch)：纯 {0,1} 结构（attention backward 已登记同 key）
+        auto C_re = dsl::compute(engine,
+            dsl::matmul(*V_re, *attn, false, true, batch),
+            V_re->rows(), attn->rows() / batch);
         if (!C_re) return std::unexpected(C_re.error());
         // C = rearrange back → (d_model, batch·M)
         auto C = engine.rearrange_3d(*C_re, d_model_, batch, memory_, true);
@@ -166,28 +193,39 @@ public:
         const Tensor& A = softmax_.output_cache();
 
         // grad_V_re = batched_matmul(grad_C, A, batch, false, false) → (batch·d_model, L)
-        auto grad_V_re = engine.batched_matmul(*grad_C_re, A, batch, false, false);
+        auto grad_V_re = dsl::compute(engine,
+            dsl::matmul(*grad_C_re, A, false, false, batch),
+            grad_C_re->rows(), A.cols());   // 纯 {0,0} 结构（scan 手工登记同 key）
         if (!grad_V_re) return std::unexpected(grad_V_re.error());
         // grad_A = batched_matmul(grad_C, V, batch, true, false) → (batch·M, L)
-        auto grad_A = engine.batched_matmul(*grad_C_re, V_re_cache_, batch, true, false);
+        auto grad_A = dsl::compute(engine,
+            dsl::matmul(*grad_C_re, V_re_cache_, true, false, batch),
+            batch * grad_C_re->cols(), V_re_cache_.cols());   // 纯 {1,0}（Linear 同 key）
         if (!grad_A) return std::unexpected(grad_A.error());
         // grad_S = softmax.backward(grad_A)
         auto grad_S = softmax_.backward(engine, *grad_A);
         if (!grad_S) return std::unexpected(grad_S.error());
 
         // grad_Q_re = batched_matmul(K, grad_S, batch, false, true, scale) → (batch·d_model, M)
-        auto grad_Q_re = engine.batched_matmul(K_re_cache_, *grad_S, batch, false, true, scale_);
+        auto grad_Q_re = dsl::compute(engine,
+            dsl::matmul(K_re_cache_, *grad_S, false, true, batch) * dsl::rparam(scale_),
+            K_re_cache_.rows(), grad_S->rows() / batch);   // 与 ZiPTBlock grad_Q_re 同 key
         if (!grad_Q_re) return std::unexpected(grad_Q_re.error());
         // grad_P = Σ_b grad_Q_re[b]（Q 是 P 沿 batch 的平铺，需按 batch 累加）
         for (std::size_t b = 0; b < batch; ++b)
         {
             auto slice = engine.slice_rows(*grad_Q_re, b * d_model_, d_model_);
             if (!slice) return std::unexpected(slice.error());
-            auto ar = engine.add_inplace(grad_P_, *slice);
+            auto ar = dsl::compute_into(engine,
+                dsl::leaf(grad_P_) + dsl::leaf(*slice), grad_P_);
             if (!ar) return std::unexpected(ar.error());
         }
         // grad_K_re = batched_matmul(Q, grad_S, batch, false, false, scale) → (batch·d_model, L)
-        auto grad_K_re = engine.batched_matmul(Q_re_cache_, *grad_S, batch, false, false, scale_);
+        // {0,0}+Mul(rparam) 结构与 ZiPTBlock 的 grad_K_cat 同 key
+        auto grad_K_re = dsl::compute(engine,
+            dsl::matmul(Q_re_cache_, *grad_S, false, false, batch)
+                * dsl::rparam(scale_),
+            Q_re_cache_.rows(), grad_S->cols());
         if (!grad_K_re) return std::unexpected(grad_K_re.error());
 
         // 还原到 (d_model, batch·L) 并喂给 w_k / w_v
@@ -455,19 +493,28 @@ public:
         auto V_cat = concat_cols(engine, *Vc_re, *Vy_re);
         if (!V_cat) return std::unexpected(V_cat.error());
 
-        // S = batched_matmul(Q_re, K_cat, BH, transA=true, alpha=scale) → (batch*H*W, M+W)
-        auto S = engine.batched_matmul(*Q_re, *K_cat, BH, true, false, scale_);
+        // S = batched_matmul(Q_re, K_cat, BH, transA=true, alpha=scale)
+        //   → (batch*H*W, M+W)。经 dsl::matmul(batch) + rparam(alpha) 尾链
+        //   （matmul 累加完成后乘 alpha；rparam 不进 expr_spec_key；
+        //     结构经 scan 的 ZiPTBlock dry-run 登记）
+        auto S = dsl::compute(engine,
+            dsl::matmul(*Q_re, *K_cat, true, false, BH) * dsl::rparam(scale_),
+            BH * Q_re->cols(), K_cat->cols());
         if (!S) return std::unexpected(S.error());
-        // 施加记忆-局部联合掩码
+        // 施加记忆-局部联合掩码（dsl::compute_into 原地加，不额外分配）
         auto mask = build_mask_(engine, batch);
         if (!mask) return std::unexpected(mask.error());
-        auto ma = engine.add_inplace(*S, *mask);
+        auto ma = dsl::compute_into(engine,
+            dsl::leaf(*S) + dsl::leaf(*mask), *S);
         if (!ma) return std::unexpected(ma.error());
         // A = softmax(S)
         auto attn = softmax_.forward(engine, *S);
         if (!attn) return std::unexpected(attn.error());
         // O_re = batched_matmul(V_cat, A, BH, false, true) → (batch*H*d_k, W)
-        auto O_re = engine.batched_matmul(*V_cat, *attn, BH, false, true);
+        // dsl::matmul(batch)：false,true → rows=V.rows(), cols=A.rows()/BH
+        auto O_re = dsl::compute(engine,
+            dsl::matmul(*V_cat, *attn, false, true, BH),
+            V_cat->rows(), attn->rows() / BH);
         if (!O_re) return std::unexpected(O_re.error());
         // O = rearrange back → (d_model, batch·W)
         auto O = engine.rearrange_3d(*O_re, H_dk, batch, window_, true);
@@ -517,7 +564,7 @@ public:
             grad_output.rows(), grad_output.cols());
         if (!grad_r1) return std::unexpected(grad_r1.error());
 
-        // ── 联合注意力反向（materialized 路径，镜像 AttentionBase 旧路径） ──
+        // ── 联合注意力反向（materialized 路径） ──
         auto grad_O = w_o_.backward(engine, *grad_r1);   // (d_model, batch·W)
         if (!grad_O) return grad_O;
         auto grad_concat_re = engine.rearrange_3d(*grad_O, H_dk, batch, window_, false);
@@ -525,18 +572,30 @@ public:
         const Tensor& A = softmax_.output_cache();
 
         // grad_V_cat = batched_matmul(grad_O, A, BH, false, false) → (batch*H*d_k, M+W)
-        auto grad_V_cat = engine.batched_matmul(*grad_concat_re, A, BH, false, false);
+        // dsl::matmul(batch)（结构经 scan 的 ZiPTBlock backward dry-run 登记）
+        auto grad_V_cat = dsl::compute(engine,
+            dsl::matmul(*grad_concat_re, A, false, false, BH),
+            grad_concat_re->rows(), A.cols());
         if (!grad_V_cat) return std::unexpected(grad_V_cat.error());
         // grad_A = batched_matmul(grad_O, V_cat, BH, true, false) → (batch*H*W, M+W)
-        auto grad_A = engine.batched_matmul(*grad_concat_re, V_cat_cache_, BH, true, false);
+        auto grad_A = dsl::compute(engine,
+            dsl::matmul(*grad_concat_re, V_cat_cache_, true, false, BH),
+            BH * grad_concat_re->cols(), V_cat_cache_.cols());
         if (!grad_A) return std::unexpected(grad_A.error());
         auto grad_S = softmax_.backward(engine, *grad_A);
         if (!grad_S) return std::unexpected(grad_S.error());
         // grad_Q_re = batched_matmul(K_cat, grad_S, BH, false, true, scale) → (batch*H*d_k, W)
-        auto grad_Q_re = engine.batched_matmul(K_cat_cache_, *grad_S, BH, false, true, scale_);
+        //   alpha 经 rparam 尾链（matmul 累加后乘；不进 expr_spec_key）
+        auto grad_Q_re = dsl::compute(engine,
+            dsl::matmul(K_cat_cache_, *grad_S, false, true, BH)
+                * dsl::rparam(scale_),
+            K_cat_cache_.rows(), grad_S->rows() / BH);
         if (!grad_Q_re) return std::unexpected(grad_Q_re.error());
         // grad_K_cat = batched_matmul(Q_re, grad_S, BH, false, false, scale) → (batch*H*d_k, M+W)
-        auto grad_K_cat = engine.batched_matmul(Q_re_cache_, *grad_S, BH, false, false, scale_);
+        auto grad_K_cat = dsl::compute(engine,
+            dsl::matmul(Q_re_cache_, *grad_S, false, false, BH)
+                * dsl::rparam(scale_),
+            Q_re_cache_.rows(), grad_S->cols());
         if (!grad_K_cat) return std::unexpected(grad_K_cat.error());
 
         // 沿序列维拆分 grad_K/grad_V 的记忆与局部部分（transpose → slice_rows → transpose）
@@ -598,8 +657,8 @@ public:
         if (!grad_Vc) return std::unexpected(grad_Vc.error());
         auto gvc = w_vc_.backward(engine, *grad_Vc);
         if (!gvc) return gvc;
-        // grad_C_out += gkc + gvc：两趟累加融合为单趟**原地**（目标传递；
-        // grad_C_out 是调用方持有的累加缓冲，原地写符合其语义且不额外分配）
+        // grad_C_out += gkc + gvc：两路累加在单个 compute_into 表达式中原地完成
+        // （目标传递；grad_C_out 是调用方持有的累加缓冲，原地写符合其语义且不额外分配）
         auto acc = dsl::compute_into(engine,
             dsl::leaf(grad_C_out) + dsl::leaf(*gkc) + dsl::leaf(*gvc), grad_C_out);
         if (!acc) return std::unexpected(acc.error());
@@ -614,10 +673,10 @@ public:
 //   token_emb → (+pos_enc) → [历史 H 压缩为记忆 C] → N × ZiPTBlock(窗口 W, C)
 //   → LN → LM Head
 //
-// 两种模式（由 window 参数决定，W=seq_len 为旧行为向后兼容）：
-//   * W = L（window==seq_len，旧行为）：压缩整条序列 X → C，块对 [C;X] 联合注意力。
+// 两种模式（由 window 参数决定；W=seq_len 是保持兼容的无压缩路径）：
+//   * W = L（window==seq_len，兼容模式）：压缩整条序列 X → C，块对 [C;X] 联合注意力。
 //     注意：此时块注意力键 = M+L，复杂度 O(L²)，实际上「无压缩」。
-//   * W < L（L = W + C，新行为）：把输入 X(长度 L) 按 batch 拆为
+//   * W < L（L = W + C，split 模式）：把输入 X(长度 L) 按 batch 拆为
 //       历史 H = X[0 : L-W]（长度 C = L-W）→ 压缩为记忆 C (M 个 token)
 //       窗口 W_seq = X[L-W : L]（长度 W）→ 块直接注意力
 //     每块对 [M 记忆 ; W 窗口] 联合注意力，键数 = M+W（注意力预算）。
@@ -633,10 +692,10 @@ private:
     std::size_t vocab_size_;
     std::size_t d_model_;
     std::size_t seq_len_;    // L：总上下文长度
-    std::size_t window_;     // W：局部窗口（=seq_len 时为旧行为 W=L 无压缩）
+    std::size_t window_;     // W：局部窗口（=seq_len 即 W=L，无压缩）
     std::size_t hist_len_;   // C = L - W：历史长度（被压缩，split 模式 >0）
     std::size_t memory_;     // M
-    bool split_;             // true = W<L 新行为（历史/窗口分离）；false = 旧行为 W=L
+    bool split_;             // true = W<L（历史/窗口分离）；false = W=L（无压缩）
 
     Tensor token_emb_;
     Tensor grad_token_emb_;
@@ -724,7 +783,7 @@ public:
         if (ln_f_) ln_f_->set_precision_profile(precision);
         lm_head_.set_precision_profile(precision);
 
-        // 归约 W：W==0 或 W>seq_len → 回退到 W=L（旧行为）
+        // 归约 W：W==0 或 W>seq_len → 回退到 W=L（缺省/越界时无压缩）
         if (window_ == 0 || window_ > seq_len_) window_ = seq_len_;
         hist_len_ = seq_len_ - window_;
         split_    = (window_ < seq_len_);
@@ -880,7 +939,7 @@ public:
         }
         else
         {
-            auto c_res = compressor_.forward(engine, x);              // 旧行为：压缩整条 X
+            auto c_res = compressor_.forward(engine, x);              // W=L 模式：压缩整条 X
             if (!c_res) return c_res;
             C = std::move(*c_res);
             block_input = x;
@@ -947,7 +1006,7 @@ public:
         }
         else
         {
-            // 旧行为：压缩器对整条 X 的梯度与块梯度同形状，直接累加
+            // W=L 模式：压缩器对整条 X 的梯度与块梯度同形状，直接累加
             auto gxc = compressor_.backward(engine, grad_C);
             if (!gxc) return gxc;
             auto gx_sum = dsl::compute(engine,
@@ -993,8 +1052,8 @@ public:
             const std::size_t n = context.size() - start;
 
             // 输入 (seq_len_, 1)：使 forward 始终处理整窗（压缩机/块按固定长度构建）。
-            // 旧行为 (W=L)：前 n 个为上下文，其余 pad_id=0 填充；末位 logits 取 n-1。
-            // 新行为 (W<L)：右对齐，末位真实 token 落到窗口末（位置 seq_len_-1），
+            // W=L 模式：前 n 个为上下文，其余 pad_id=0 填充；末位 logits 取 n-1。
+            // W<L（split）模式：右对齐，末位真实 token 落到窗口末（位置 seq_len_-1），
             //   forward 输出仅覆盖窗口 (vocab, W)，logits 取窗口末列 window_-1。
             const std::size_t pred_col = split_ ? (window_ - 1) : (n - 1);
             Matrix in(seq_len_, 1);

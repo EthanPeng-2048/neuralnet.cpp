@@ -41,13 +41,13 @@ struct ExprVariant
 // ── 注册表：收集折叠出的 ExprSpec 结构，按规范 key 去重 ─────────────────
 struct ExprRegistry
 {
-    // sig == 0（全 f32，旧行为）：按结构 key 去重 —— bin / 生成头沿用旧格式，
-    // 运行时行为逐字节不变（零回归）。
+    // sig == 0（全 f32）：按结构 key 去重进基础表 specs —— bin / 生成头的
+    // 基础段只承载这些条目（key 不加后缀）。
     std::vector<ExprSpec>       specs;
     std::unordered_set<std::string> keys;
-    // sig != 0（带类型变体）：按 (结构 key, 精度签名) 去重。**不写进 bin**——
-    // 只有生成器支持该变体（带类型 GLSL）后才需要序列化；在此之前这些条目
-    // 仅用于构建期诊断（"哪些精度组合真实存在"）。
+    // sig != 0（带类型变体）：按 (结构 key, 精度签名) 去重。bin 只序列化
+    // {sig, 基础结构下标}（见 write_registry 的变体段）：变体与基础结构
+    // 同结构同 key，spec 体复用基础表条目，不重复落盘。
     std::vector<ExprVariant>    variants;
     std::unordered_set<std::string> variant_keys;
 
@@ -88,26 +88,26 @@ struct ExprRegistry
 
 // ── 二进制序列化（dump/load 共用同一格式）───────────────────────────────
 // 格式（小端，x86/ARM 通用）：
-//   magic "NNEXP" (5B) + version (u8=8)
+//   magic "NNEXP" (5B) + version (u8=kExprBinVersion，读回时严格相等匹配)
 //   count (u32)
 //   每 spec：num_regs(u32)
 //            instrs: count(u32) × {op(u8) dst(u8) a.kind a.idx b.kind b.idx c.kind c.idx}
 //            views:  count(u32) × {kind(u8) negate(u8) param(u32)}
 //            consts: count(u32) × Scalar
-//            rparams: count(u32) × Scalar   （v3 起支持运行时标量参数）
+//            rparams: count(u32) × Scalar   （运行时标量参数，不进 key）
 //            matmul: has(u8=0/1)；1 时 {a_input(u8) b_input(u8) transA(u8)
 //                    transB(u8) k(u32) batch(u32)}
-//            fold:   has(u8=0/1)（v6 起）；1 时 {num_state(u8), k(u32),
+//            fold:   has(u8=0/1)；1 时 {num_state(u8), k(u32),
 //                    inits: count(u32) × Scalar,
 //                    body: count(u32) × 指令(8B),
 //                    finalize: count(u32) × 指令(8B)
-//                    -- v7 追加：vec_state_len(u32),
+//                    -- vec_state_len(u32),
 //                    matmul: has(u8)；1 时 {a,b,tA,tB(4B) k(u32) batch(u32)},
 //                    vecacc: has(u8)；1 时 {vec_state,weight_reg,b_input,
 //                           scale_reg,has_scale(5B)}
-//                    -- v8 追加：tri_skip(u8)}
-//  v2 起支持 matmul 段（v1 无 matmul，读 v1 等价 has=0）；v3 起支持 rparams。
-inline constexpr std::uint8_t kExprBinVersion = 9;  // v5：MatmulSpec 补 batch；v6：FoldSpec；v7：FoldSpec 双域字段（vec_state_len/matmul/vecacc——丢段=结构损坏）；v8：tri_skip（行界跳块 codegen 标志——不对称=静默不跳或错位读废）；v9：**精度变体段**（Phase 2 in-kernel f16：每个变体 {sig, 基础结构下标}——变体与基础结构**同结构同 key**，故只存 sig + 下标，不重复存 spec 体）
+//                    -- tri_skip(u8)}
+//  各段读写必须逐字段对称（不对称 = 后续 spec 全部错位读废）。
+inline constexpr std::uint8_t kExprBinVersion = 9;  // 读回严格要求与该值相等，否则拒绝；当前格式 = 基础 spec 表 + 尾部精度变体段（每个变体 {sig, 基础结构下标}——变体与基础结构**同结构同 key**，故只存 sig + 下标，不重复存 spec 体）；丢段 / 读写不对称 = 结构损坏（fold 段丢段 → 读回 spec 变"空指令表无段"，多个 fold key 撞车合并 + gen_fused 对空表 UB 崩溃；tri_skip 不对称 → 静默不跳或错位读废）
 
 [[nodiscard]] inline bool write_registry(const std::string& path,
                                          const ExprRegistry& reg)
@@ -136,7 +136,7 @@ inline constexpr std::uint8_t kExprBinVersion = 9;  // v5：MatmulSpec 补 batch
             if (!write_pod(f, v.kind)) return false;
             if (!write_pod(f, v.negate_first_half)) return false;
             if (!write_pod(f, v.param)) return false;
-            if (!write_pod(f, v.param2)) return false;  // v4：RowAccess offset
+            if (!write_pod(f, v.param2)) return false;  // param2：RowAccess offset
         }
         n = static_cast<std::uint32_t>(s.consts.size());
         if (!write_pod(f, n)) return false;
@@ -154,9 +154,9 @@ inline constexpr std::uint8_t kExprBinVersion = 9;  // v5：MatmulSpec 补 batch
                                        s.matmul->transA, s.matmul->transB };
             if (!write_pod_span(f, std::span(mbytes, 4))) return false;
             if (!write_pod(f, s.matmul->k)) return false;
-            if (!write_pod(f, s.matmul->batch)) return false;  // v5：batch 必须持久化
+            if (!write_pod(f, s.matmul->batch)) return false;  // batch 必须持久化
         }
-        // v6：fold 段（P-C1）——丢段会让读回 spec 变"空指令表无段"，
+        // fold 段——丢段会让读回 spec 变"空指令表无段"，
         //     多个 fold key 撞车合并 + gen_fused 对空表 UB 崩溃
         const auto write_instr_seq = [&](const std::vector<ExprInstr>& seq) -> bool
         {
@@ -182,8 +182,8 @@ inline constexpr std::uint8_t kExprBinVersion = 9;  // v5：MatmulSpec 补 batch
                 if (!write_pod(f, iv)) return false;
             if (!write_instr_seq(s.fold->body)) return false;
             if (!write_instr_seq(s.fold->finalize)) return false;
-            // v7：双域字段（vec_state_len + 自带 matmul 段 + vecacc）——
-            //   与 struct 声明序一致；漏写=读回结构损坏（同 v6 教训）
+            // 双域字段（vec_state_len + 自带 matmul 段 + vecacc）——
+            //   与 struct 声明序一致；漏写=读回结构损坏
             if (!write_pod(f, s.fold->vec_state_len)) return false;
             const std::uint8_t has_fmm = s.fold->matmul ? 1 : 0;
             if (!write_pod(f, has_fmm)) return false;
@@ -207,12 +207,12 @@ inline constexpr std::uint8_t kExprBinVersion = 9;  // v5：MatmulSpec 补 batch
                                            va.has_scale };
                 if (!write_pod_span(f, std::span(vbytes, 5))) return false;
             }
-            // v8：tri_skip（1B，与 read 对称）
+            // tri_skip（1B，与 read 对称）
             const std::uint8_t cskip = s.fold->tri_skip ? 1u : 0u;
             if (!write_pod(f, cskip)) return false;
         }
     }
-    // v9：精度变体段（{sig, 基础结构下标}）—— 变体与其基础结构同 key（精度不进
+    // 精度变体段（{sig, 基础结构下标}）—— 变体与其基础结构同 key（精度不进
     // expr_spec_key），故只需下标引用，避免重复序列化 spec 体（也免除读写不对称
     // 的风险：spec 体的读写已在上面单一实现）。找不到基础结构 → 写 0xFFFFFFFF
     // （gen_fused 会跳过并告警，运行时不命中即回退边界 cast，正确性不受影响）。
@@ -273,7 +273,7 @@ inline constexpr std::uint8_t kExprBinVersion = 9;  // v5：MatmulSpec 补 batch
             if (!read_pod(f, v.kind)) return false;
             if (!read_pod(f, v.negate_first_half)) return false;
             if (!read_pod(f, v.param)) return false;
-            if (!read_pod(f, v.param2)) return false;  // v4：RowAccess offset
+            if (!read_pod(f, v.param2)) return false;  // param2：RowAccess offset
         }
         if (!read_pod(f, n)) return false;
         s.consts.resize(n);
@@ -293,10 +293,10 @@ inline constexpr std::uint8_t kExprBinVersion = 9;  // v5：MatmulSpec 补 batch
             mm.a_input = mbytes[0]; mm.b_input = mbytes[1];
             mm.transA  = mbytes[2]; mm.transB  = mbytes[3];
             if (!read_pod(f, mm.k)) return false;
-            if (!read_pod(f, mm.batch)) return false;  // v5：batch 必须读回
+            if (!read_pod(f, mm.batch)) return false;  // batch 必须读回
             s.matmul = mm;
         }
-        // v6：fold 段读回（与 write 对称——不对称会让后续 spec 错位读废）
+        // fold 段读回（与 write 对称——不对称会让后续 spec 错位读废）
         std::uint8_t has_fold = 0;
         if (!read_pod(f, has_fold)) return false;
         if (has_fold)
@@ -327,7 +327,7 @@ inline constexpr std::uint8_t kExprBinVersion = 9;  // v5：MatmulSpec 补 batch
             };
             if (!read_instr_seq(fs.body)) return false;
             if (!read_instr_seq(fs.finalize)) return false;
-            // v7：双域字段读回（与 write 对称——不对称=后续 spec 错位读废）
+            // 双域字段读回（与 write 对称——不对称=后续 spec 错位读废）
             if (!read_pod(f, fs.vec_state_len)) return false;
             std::uint8_t has_fmm = 0;
             if (!read_pod(f, has_fmm)) return false;
@@ -354,7 +354,7 @@ inline constexpr std::uint8_t kExprBinVersion = 9;  // v5：MatmulSpec 补 batch
                 va.has_scale  = vbytes[4];
                 fs.vecacc = va;
             }
-            // v8：tri_skip 读回（与 write 对称——错一位=后续全错位）
+            // tri_skip 读回（与 write 对称——错一位=后续全错位）
             {
                 std::uint8_t cskip = 0;
                 if (!read_pod(f, cskip)) return false;
@@ -364,7 +364,7 @@ inline constexpr std::uint8_t kExprBinVersion = 9;  // v5：MatmulSpec 补 batch
         }
         out.add(s);
     }
-    // v9：精度变体段读回（与 write 对称）
+    // 精度变体段读回（与 write 对称）
     std::uint32_t nvar = 0;
     if (!read_pod(f, nvar)) return false;
     for (std::uint32_t i = 0; i < nvar; ++i)

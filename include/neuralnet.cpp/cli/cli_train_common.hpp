@@ -1,6 +1,6 @@
-// ── cli_cli_train_common.hpp — 通用训练参数解析 ─────────────────────────────────────
+// ── cli_train_common.hpp — 通用训练参数解析 ─────────────────────────────────────
 //
-// 抽取自 mnist_train/text_train 中重复的 flag 解析逻辑。
+// 收拢 mnist_train/text_train 共用的 flag 解析逻辑。
 // 覆盖以下通用 flag：
 //   --epochs <n>            训练轮数（正整数）
 //   --lr <lr>               学习率
@@ -143,7 +143,7 @@ namespace nn::cli
         if (arg == "--lr-schedule" && i + 1 < argc)
         {
             cfg.lr_schedule = argv[++i];
-            // "fixed" 与 "constant" 等价（历史兼容）；"cosine" 为余弦退火
+            // "fixed" 与 "constant" 等价（同一调度分支）；"cosine" 为余弦退火
             if (cfg.lr_schedule != "fixed" && cfg.lr_schedule != "constant" &&
                 cfg.lr_schedule != "cosine")
             {

@@ -7,7 +7,7 @@
 //  （key → {ExprSpec, SPIR-V}）。
 //
 //  IR-D 落地：本工具经 nn::emitter_registry 选择后端（默认 "glsl" =
-//  GlslEmitter），不再直接绑定 GLSL 生成函数——同一份 canonical IR 可由
+//  GlslEmitter），不直接绑定 GLSL 生成函数——同一份 canonical IR 可由
 //  其它后端展开（--list-backends 查看已登记后端）。
 //
 //  表达式**文本只出现在 Layer**；本工具只消费折叠后的结构（派生物）。
@@ -28,6 +28,8 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "expr_spec.hpp"
@@ -139,7 +141,7 @@ namespace
         emit_seq(f.body);
         o << "}, std::vector<ExprInstr>{";
         emit_seq(f.finalize);
-        // P-C2 双域字段（声明序：vec_state_len, matmul, vecacc）
+        // fold v2 双域字段（声明序：vec_state_len, matmul, vecacc）
         o << "}, " << f.vec_state_len << "u, std::optional<MatmulSpec>{";
         if (f.matmul)
         {
@@ -181,7 +183,9 @@ int main(int argc, char* argv[])
 
     if (argc < 4)
     {
-        std::fprintf(stderr, "用法: gen_fused <out_dir> <glslc_path> <expr_specs.bin> [--list-backends]\n");
+        std::fprintf(stderr,
+                     "用法: gen_fused <out_dir> <glslc_path> <expr_specs.bin> "
+                     "[<prec_backfill.txt>] [--list-backends]\n");
         return 2;
     }
     const std::string out_dir  = argv[1];
@@ -239,20 +243,20 @@ int main(int argc, char* argv[])
                          nn::expr_spec_key(spec).c_str());
             continue;
         }
-        // matmul+列归约（S5 列方向，如 col_max(matmul)）已支持：生成器按
+        // matmul+列归约（列方向，如 col_max(matmul)）：生成器按
         // 元素分解 batch（batch = row/m_per），归约遍历全部 rows（含所有
-        // batch），与 CPU 端 matmul_out 语义一致 → 不再跳过。
-        // 防御：空指令表且无 matmul/fold 段 = 结构损坏（如 canonicalize 曾静默
-        //   丢 fold 段）→ 跳过而非让逐元素生成器对空表 back() UB 崩溃
-        //   （实测 0xC00000FD 栈崩溃）。正常管线到不了这里。
+        // batch），与 CPU 端 matmul_out 语义一致 → 正常生成，不跳过。
+        // 防御：空指令表且无 matmul/fold 段 = 结构损坏（上游变换丢掉 fold 段
+        //   即此形态）→ 跳过而非让逐元素生成器对空表 back() UB 崩溃
+        //   （表现为 0xC00000FD 栈崩溃）。正常管线到不了这里。
         if (spec.instrs.empty() && !spec.matmul && !spec.fold)
         {
             std::fprintf(stderr, "[skip] 空指令表且无 matmul/fold 段（结构损坏）: %s\n",
                          nn::expr_spec_key(spec).c_str());
             continue;
         }
-        // matmul+归约（S5，注意力结构）：generate_glsl_reduce 支持 Matmul
-        // 操作数（内联点积，不物化 (batch*M,N) 中间矩阵），不再跳过。
+        // matmul+归约（注意力结构）：generate_glsl_reduce 支持 Matmul
+        // 操作数（内联点积，不物化 (batch*M,N) 中间矩阵），该形态正常生成（不跳过）。
         const std::string key = nn::expr_spec_key(spec);
         const std::string comp_path = out_dir + "/fused_" + key + ".comp";
         const std::string spv_path  = out_dir + "/fused_" + key + ".spv";
@@ -302,61 +306,78 @@ int main(int argc, char* argv[])
 
     // ── 精度变体（Phase 2 in-kernel f16）：同一结构 + 非零精度签名 → 独立 shader
     // 注册键 = key#sig（expr_prec_sig_key），文件名/标识符用 key_sighex（标识符
-    // 不能含 '#'）。生成器不支持该形态（reduce/matmul/fold 的带类型变体尚未实现）
+    // 不能含 '#'）。生成器不支持该形态（超出当前带类型生成能力）
     // 时返回空串 → **跳过而非失败**：运行时不命中即回退边界 cast，正确性不变。
+    //
+    // ALU 变体（native16 原生 f16 算术）：谓词 expr_prec_sig_native16 通过时
+    // 额外发射一份（键 = key#sig#a，标识符后缀 _a）。与 f32 算术变体并存——
+    // 后端按设备 shaderFloat16 能力创建 pipeline，运行时优先命中 #a 键。
+    // ALU 变体恒为**标量 kernel**（generate_glsl native16 分支不走 vec4），
+    // vec_width 必须写 1（与生成器同源，否则 dispatch 宽度失配 → 静默算 1/4）。
     struct VariantEmit
     {
         const nn::ExprSpec* spec;
         nn::ExprPrecSig sig;
-        std::string     vkey;     // "key#sig"（注册表键）
-        std::string     suffix;   // "key_sighex"（标识符/文件名）
+        std::string     vkey;     // "key#sig" 或 "key#sig#a"（注册表键）
+        std::string     suffix;   // "key_sighex" 或 "key_sighex_a"（标识符/文件名）
+        bool            alu = false;   // native16 变体（vec_width 恒 1）
     };
     std::vector<VariantEmit> emitted_variants;
-    for (const auto& v : reg.variants)
-    {
-        const nn::ExprSpec& spec = v.spec;
+    // 去重：scan 预测变体与 run-only 回填清单可能重叠 —— 重复
+    // 发射会生成重复的 kSpirv_ 标识符与注册行（重定义编译错误）。
+    std::unordered_set<std::string> emitted_vkeys;
+    // 单个 (spec, sig) 的发射：kind = "f32" | "a"（ALU）
+    const auto emit_one = [&](const nn::ExprSpec& spec, nn::ExprPrecSig sig,
+                              bool alu) -> bool {
         const int raxis = nn::expr_spec_reduce_axis(spec);
         if (raxis == -2)
-            continue;   // 混合归约轴（与基础结构 skip 一致）
+            return false;   // 混合归约轴（与基础结构 skip 一致）
         if (spec.instrs.empty() && !spec.matmul && !spec.fold)
-            continue;
+            return false;
+        if (alu && !nn::expr_prec_sig_native16(spec, sig))
+            return false;   // 谓词不通过 → 不发 ALU 变体（f32 算术变体仍覆盖）
         const std::string key = nn::expr_spec_key(spec);
         char sigbuf[8];
-        std::snprintf(sigbuf, sizeof(sigbuf), "%04x", static_cast<unsigned>(v.sig));
-        const std::string vkey = nn::expr_prec_sig_key(key, v.sig);
-        const std::string suffix = key + "_" + sigbuf;
+        std::snprintf(sigbuf, sizeof(sigbuf), "%04x", static_cast<unsigned>(sig));
+        const std::string vkey = alu ? nn::expr_prec_sig_alu_key(key, sig)
+                                     : nn::expr_prec_sig_key(key, sig);
+        const std::string suffix = key + "_" + sigbuf + (alu ? "_a" : "");
+        if (!emitted_vkeys.insert(vkey).second)
+            return false;   // 已发射（scan 预测 ∩ 回填清单重叠）→ 幂等跳过
         const std::string comp_path = out_dir + "/fused_" + suffix + ".comp";
         const std::string spv_path  = out_dir + "/fused_" + suffix + ".spv";
         auto emitter = nn::emitter_registry::make("glsl");
         if (!emitter)
         {
             std::fprintf(stderr, "[FAIL] 无法创建 GLSL emitter（IR-D 注册表异常）\n");
-            return 1;
+            std::exit(1);
         }
         const std::string glsl = (raxis >= 0)
-            ? emitter->generate_reduce("fused_" + suffix, spec, v.sig)
-            : emitter->generate("fused_" + suffix, spec, v.sig);
+            ? emitter->generate_reduce("fused_" + suffix, spec, sig)
+            : emitter->generate("fused_" + suffix, spec, sig, alu);
         if (glsl.empty())
         {
+            if (alu)
+                return false;   // ALU 谓词/形态不支持 → 静默跳过（f32 变体已覆盖）
             std::fprintf(stderr, "[skip] 精度变体 %s（sig=%s）暂不支持带类型生成\n",
                          key.c_str(), sigbuf);
-            continue;
+            return false;
         }
         {
             std::ofstream f(comp_path);
-            if (!f) { std::fprintf(stderr, "[FAIL] 无法写入 %s\n", comp_path.c_str()); return 1; }
+            if (!f) { std::fprintf(stderr, "[FAIL] 无法写入 %s\n", comp_path.c_str()); std::exit(1); }
             f << glsl;
         }
         if (!run_glslc(glslc, comp_path, spv_path))
         {
             std::fprintf(stderr, "[FAIL] glslc 编译精度变体 %s 失败\n", vkey.c_str());
-            return 1;
+            std::exit(1);
         }
         const auto spv = read_spv(spv_path);
         if (spv.empty())
         {
             std::fprintf(stderr, "[FAIL] 读取 %s 失败\n", spv_path.c_str());
-            return 1;
+            std::exit(1);
         }
         H << "inline constexpr std::uint32_t kSpirv_" << suffix << "[] = {";
         for (std::size_t i = 0; i < spv.size(); ++i)
@@ -365,7 +386,66 @@ int main(int argc, char* argv[])
             H << "0x" << std::hex << spv[i] << "u, ";
         }
         H << std::dec << "\n};\n\n";
-        emitted_variants.push_back(VariantEmit{&spec, v.sig, vkey, suffix});
+        emitted_variants.push_back(VariantEmit{&spec, sig, vkey, suffix, alu});
+        return true;
+    };
+    for (const auto& v : reg.variants)
+    {
+        emit_one(v.spec, v.sig, /*alu=*/false);
+        emit_one(v.spec, v.sig, /*alu=*/true);   // 谓词不通过时内部静默跳过
+    }
+
+    // ── run-only 签名回填────────────────────────────────────────
+    // scan 的 dry-run 预测不到的运行时签名（Linear matmul 段混合签名 / Norm
+    // 归约链 / 全 f32 入 + f16 出等），miss 时适配层走边界 cast 物化输入副本
+    // （归因大头 (64,8192)/(256,8192) 即此）。清单 = 实测 [prec][miss] 输出
+    // （tools/prec_backfill.txt，NN_PREC_TRACE=1 mem_probe 复现），对命中的
+    // (结构, 签名) 走与 scan 变体完全相同的 emit_one 发射（含 ALU 谓词、
+    // 重复去重）；结构不在 bin 中 / 生成器不支持时告警跳过（不失败）。
+    if (argc >= 5)
+    {
+        const std::string manifest = argv[4];
+        std::ifstream mf(manifest);
+        if (!mf)
+        {
+            std::fprintf(stderr, "[gen][backfill] 清单不可读，跳过回填: %s\n",
+                         manifest.c_str());
+        }
+        else
+        {
+            std::unordered_map<std::string, const nn::ExprSpec*> spec_by_key;
+            for (const auto& s : reg.specs)
+                spec_by_key.emplace(nn::expr_spec_key(s), &s);
+            std::string line;
+            std::size_t n_ok = 0, n_total = 0;
+            while (std::getline(mf, line))
+            {
+                std::istringstream ln(line);
+                std::string k;
+                unsigned sig = 0;
+                if (!(ln >> k) || k.front() == '#')
+                    continue;                       // 空行 / 注释
+                if (!(ln >> std::hex >> sig))
+                {
+                    std::fprintf(stderr, "[gen][backfill] 无法解析行: %s\n", line.c_str());
+                    continue;
+                }
+                ++n_total;
+                const auto it = spec_by_key.find(k);
+                if (it == spec_by_key.end())
+                {
+                    std::fprintf(stderr, "[gen][backfill] 结构不在 bin 中（scan 未覆盖？）: %s\n",
+                                 k.c_str());
+                    continue;
+                }
+                const nn::ExprPrecSig psig = static_cast<nn::ExprPrecSig>(sig);
+                if (emit_one(*it->second, psig, /*alu=*/false))
+                    ++n_ok;
+                emit_one(*it->second, psig, /*alu=*/true);   // 谓词不通过静默跳过
+            }
+            std::printf("[gen][backfill] 回填清单 %s: %zu/%zu 条命中发射\n",
+                        manifest.c_str(), n_ok, n_total);
+        }
     }
 
     H << "inline const FusedShader kFusedShaders[] = {\n";
@@ -389,13 +469,16 @@ int main(int argc, char* argv[])
           << nn::expr_spec_runtime_param_count(spec) << ", " << vecw
           << ", 0u },\n";
     }
-    // 精度变体行（键 = key#sig；元数据与基础结构同源——精度不进结构）
+    // 精度变体行（键 = key#sig 或 key#sig#a；元数据与基础结构同源——精度不进结构）
     for (const auto& ve : emitted_variants)
     {
         const nn::ExprSpec& spec = *ve.spec;
         const int raxis = nn::expr_spec_reduce_axis(spec);
+        // ALU（native16）变体恒标量 kernel → vec_width 必须 1（与 generate_glsl
+        // 的 native16 分支同源）；f32 算术变体维持原 vec4 资格判定。
         const std::uint32_t vecw =
-            (!spec.fold && raxis < 0 && nn::glsl_vec4_eligible(spec)) ? 4u : 1u;
+            (!ve.alu && !spec.fold && raxis < 0 && nn::glsl_vec4_eligible(spec))
+                ? 4u : 1u;
         H << "    { \"" << ve.vkey << "\",\n        " << emit_spec(spec) << ",\n"
           << "        kSpirv_" << ve.suffix
           << ", sizeof(kSpirv_" << ve.suffix << ")/sizeof(std::uint32_t), "

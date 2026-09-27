@@ -1,8 +1,9 @@
 // ── CausalSelfAttention 数值梯度检查（gradcheck） ──────────────────────────
 //
-// 目的：GPT 整链 gradcheck 显示 wo OK 但 wq/wk/wv FAIL，定位 attention 内部
-//       是否真的有反向 bug（batched_matmul / softmax backward / 掩码）。
-//       batch=1 时绕过 rearrange_3d，若仍 FAIL 则是 attention 内部问题。
+// 目的：数值梯度检查 attention 内部的反向路径（batched_matmul / softmax
+//       backward / 掩码），与 GPT 整链 gradcheck 分层定位问题来源。
+//       batch=1 时绕过 rearrange_3d：若 batch=1 仍失败，问题在 attention
+//       内部而非布局重排路径。
 //
 // 用法：attn_gradcheck [--gpu] [--batch N] [--seq N] [--tol <f>] [--doc]
 // ─────────────────────────────────────────────────────────────────────────
@@ -140,8 +141,9 @@ int main(int argc, char* argv[])
     if (use_doc)
     {
         // 文档感知：每样本两文档（前/后半）、样本错开基线 → 覆盖 backward
-        //   的 masked_doc_ 分支（Doc；叠加 --pos-enc alibi 即 AlibiDoc）——
-        //   该分支此前零执行覆盖（forward 对、梯度串文档抓不住）
+        //   的 masked_doc_ 分支（Doc；叠加 --pos-enc alibi 即 AlibiDoc）。
+        //   本用例专门验证该分支的梯度：仅 forward 通过不足以验证
+        //   （梯度跨文档串扰 forward 抓不住）
         std::vector<std::size_t> ids(batch * seq, 0);
         for (std::size_t b = 0; b < batch; ++b)
             for (std::size_t t = 0; t < seq; ++t)

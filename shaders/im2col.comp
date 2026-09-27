@@ -16,10 +16,21 @@
 
 #version 450
 
+// -DNN_SHADER_F16=1 → f16 存储变体（Phase C2：数据搬运，输入输出均 half；
+//   越界补 0 的 float 0.0 显式转 half。仅需 storageBuffer16BitAccess）
+#if defined(NN_SHADER_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#define NN_ETYPE float16_t
+#define NN_WR(x) float16_t(x)
+#else
+#define NN_ETYPE float
+#define NN_WR(x) (x)
+#endif
+
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly  buffer BufIn  { float in_data[];  };
-layout(std430, binding = 1) writeonly buffer BufOut { float out_data[]; };
+layout(std430, binding = 0) readonly  buffer BufIn  { NN_ETYPE in_data[];  };
+layout(std430, binding = 1) writeonly buffer BufOut { NN_ETYPE out_data[]; };
 
 layout(push_constant) uniform PushConstants {
     uint C;
@@ -60,6 +71,6 @@ void main()
     float v = 0.0;
     if (ih >= 0 && ih < int(H) && iw >= 0 && iw < int(W))
         // 行主序：(row, b) → row * B + b
-        v = in_data[(ci * H * W + uint(ih) * W + uint(iw)) * B + b];
-    out_data[idx] = v;
+        v = float(in_data[(ci * H * W + uint(ih) * W + uint(iw)) * B + b]);
+    out_data[idx] = NN_WR(v);
 }

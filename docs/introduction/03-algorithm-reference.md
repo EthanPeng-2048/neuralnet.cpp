@@ -29,9 +29,11 @@
 out = W × x + b
 ```
 
-实现（`compute_layer_mlp.hpp`，一行原语）：
+实现（`compute_layer_mlp.hpp`，一条 DSL 表达式 = 单 kernel）：
 ```
-out = engine.matmul_with_bias(W, x, b)   // matmul + 按行广播加 bias 一次完成
+out = dsl::compute(engine,
+    dsl::matmul(W, x) + dsl::row_broadcast(b),
+    out_features, batch)                 // matmul 段 + 按行广播 bias 融合为单 kernel
 ```
 
 **Backward：**
@@ -44,9 +46,13 @@ grad_b += Σ_batch grad_out
 
 实现（`compute_layer_mlp.hpp`）：
 ```
-grad_input = engine.matmul(W, grad_out, /*transA=*/true)
-grad_W    ← dsl::compute_into(leaf(grad_W) + matmul(grad_out, x, transB))  // 融合累加，单次 dispatch
-grad_b   += engine.accumulate(engine.row_reduce_sum(grad_out))             // 归约向量输出无法并入表达式，两步
+grad_input = dsl::compute(engine,
+    dsl::matmul(W, grad_out, /*transA=*/true), in_features, batch)   // 纯 matmul 段
+grad_W    ← dsl::compute_into(engine,                                // 融合累加，单次 dispatch
+    dsl::leaf(grad_W) + dsl::matmul(grad_out, x, false, true), grad_W)
+grad_b   ← dsl::compute_reduce(engine,                               // 归约向量输出无法并入
+    dsl::row_reduce_sum(dsl::leaf(grad_out)), grad_out.rows(), grad_out.cols())  // 同一表达式，故两步：
+            → dsl::compute_into(engine, dsl::leaf(grad_b) + dsl::leaf(*gb), grad_b)
 ```
 
 ---
@@ -61,7 +67,7 @@ grad_b   += engine.accumulate(engine.row_reduce_sum(grad_out))             // �
 out = max(x, 0)
 ```
 
-实现：`dsl::compute(engine, dsl::max(dsl::leaf(x), 0))`
+实现：`dsl::compute(engine, dsl::max(dsl::leaf(x), Scalar{0}), rows, cols)`
 
 **Backward：**
 
@@ -70,7 +76,7 @@ grad_x = grad_out   if x > 0
          0           otherwise
 ```
 
-实现：`dsl::compute(engine, dsl::select(dsl::leaf(x) > 0, dsl::leaf(grad_out), 0))`
+实现：`dsl::compute(engine, dsl::select(dsl::leaf(x) > Scalar{0}, dsl::leaf(grad_out), Scalar{0}), rows, cols)`
 
 ---
 
@@ -171,11 +177,11 @@ grad_x = out ⊙ gmd
 
 **可学习参数：** 4 个 Linear 层（`w_q`, `w_k`, `w_v`, `w_o`），每个 `(d_model, d_model)`
 
-**Forward（P-C2-7 单 fold 路径，S 不物化）：**
+**Forward（单 fold 路径，S 不物化）：**
 
 1. 线性投影：`Q = W_q·x`, `K = W_k·x`, `V = W_v·x` → `(H·d_k, batch·seq)`
 2. 重排：`Q/K → rearrange_3d → (batch·H·d_k, seq)`；`V → transpose+rearrange → V_t (batch·H·seq, d_k)`
-3. 缩放折进 Q：`Q *= scale`（`scale = 1/√d_k`，S7 起折进 Q 免独立 pass）
+3. 缩放折进 Q：`Q *= scale`（`scale = 1/√d_k`，随表达式融合、免独立 pass）
 4. **单 fold kernel**：`O_t = eval_expr(make_fold_attn_o(...), {Q, K, V_t, [掩码输入]})`
    —— QKᵀ、掩码（因果/ALiBi/doc 变体在 body 内 select 链表达）、online softmax、
    `Σw·V` 在同一 kernel 内按 `EXPR_FOLD_BLOCK=128` 逐块完成，`(batch·H·seq, seq)`
@@ -185,7 +191,7 @@ grad_x = out ⊙ gmd
 
 **Backward：** `recompute_W_` 两步重算 `W = softmax(masked(Q·Kᵀ))`（掩码树与 forward 的 fold 变体同构同序），随后 R/X 表达式 + `batched_matmul` 得 grad_Q/K/V——不缓存 W/m/l。
 
-**性能关键：** fold 单 kernel 一次 dispatch 处理全部样本与头，无 `(batch·H·seq, seq)` 中间张量往返。（历史路径为 `rearrange_3d` + `batched_matmul` 把 H 个 per-head matmul 融合为 1 次 batch dispatch，该结构现仅存于 backward。）
+**性能关键：** fold 单 kernel 一次 dispatch 处理全部样本与头，无 `(batch·H·seq, seq)` 中间张量往返。（backward 使用 `rearrange_3d` + `batched_matmul` 把 H 个 per-head matmul 合并为 1 次 batch dispatch。）
 
 ---
 
@@ -287,7 +293,7 @@ mask[i][j] = 0     if j ≤ i
            = -∞    if j > i
 ```
 
-**掩码绝不物化**：`j > i` 的屏蔽项在 kernel 内直接选择 -inf（`tri_skip` 进一步把被屏蔽的整块钳成空转）——没有 `S += mask` 矩阵，**也没有掩码缓存**（历史物化式掩码缓存已随 fold 迁移删除）。
+**掩码绝不物化**：`j > i` 的屏蔽项在 kernel 内直接选择 -inf（`tri_skip` 进一步把被屏蔽的整块钳成空转）——没有 `S += mask` 矩阵，也没有掩码缓存。
 
 ---
 
@@ -368,7 +374,8 @@ loss      = −(1/batch) Σ target · log_sm
 ## Optimizer 篇
 
 > **实现方式**：优化器全部用 `dsl::compute` / `dsl::compute_into`（`compute_optimizer.hpp`），
-> 一次表达式 = 一条融合 kernel；不再直调 `axpy_inplace`/`elementwise_*` 这类 eager 原语（**这些原语已于 2026-09 整体删除**，引擎现有 49 个 virtual）。
+> 一次表达式 = 一条融合 kernel；逐元素计算不走 eager 原语——引擎只提供 49 个 virtual，
+> 逐元素/广播/条件选择一律经表达式 DSL 执行。
 > 下面每条 "DSL 表达式" 即 `step()` 里的真实写法（`leaf` = 输入张量，`rparam` = 标量常量）。
 
 ### 1. SGD — 随机梯度下降
@@ -379,7 +386,7 @@ loss      = −(1/batch) Σ target · log_sm
 p ← p − η·g
 ```
 
-**DSL：** `compute_into(p, leaf(p) + leaf(g) * rparam(-lr))`
+**DSL：** `dsl::compute_into(engine, dsl::leaf(p) + dsl::leaf(g) * dsl::rparam(-lr), p)`
 
 ---
 
@@ -395,8 +402,8 @@ p ← p − η·v
 **DSL（两条 `compute_into`）：**
 
 ```
-v ← leaf(v)*rparam(β) + leaf(g)*rparam(1-β)     // v *= β 后 += (1-β)*g 合并为一条
-p ← leaf(p) + leaf(v)*rparam(-lr)
+v ← dsl::compute_into(engine, dsl::leaf(v)*dsl::rparam(β) + dsl::leaf(g)*dsl::rparam(1-β), v)
+p ← dsl::compute_into(engine, dsl::leaf(p) + dsl::leaf(v)*dsl::rparam(-lr), p)
 ```
 
 **参数：** `lr`（学习率）, `beta = 0.9`（动量系数）
@@ -417,11 +424,12 @@ p ← p − η·(m̂ / (√v̂ + ε))
 **DSL（`compute` 出新张量，最后 `compute_into` 落回参数）：**
 
 ```
-m_new = compute(leaf(m)*rparam(β1) + leaf(g)*rparam(1-β1))
-v_new = compute(leaf(v)*rparam(β2) + leaf(g)*leaf(g)*rparam(1-β2))
-delta = compute(-rparam(lr) * ((leaf(m)*rparam(inv_bc1))
-                             / (sqrt(leaf(v)*rparam(inv_bc2)) + rparam(eps))))
-p    ← compute_into(leaf(p) + leaf(delta))
+m_new = dsl::compute(engine, dsl::leaf(m)*dsl::rparam(β1) + dsl::leaf(g)*dsl::rparam(1-β1), rows, cols)
+v_new = dsl::compute(engine, dsl::leaf(v)*dsl::rparam(β2) + dsl::leaf(g)*dsl::leaf(g)*dsl::rparam(1-β2), rows, cols)
+delta = dsl::compute(engine, -dsl::rparam(lr) * ((dsl::leaf(m)*dsl::rparam(inv_bc1))
+                              / (dsl::sqrt(dsl::leaf(v)*dsl::rparam(inv_bc2)) + dsl::rparam(eps))),
+                     rows, cols)
+p    ← dsl::compute_into(engine, dsl::leaf(p) + dsl::leaf(delta), p)
 ```
 
 **参数：** `lr`, `β1=0.9`, `β2=0.999`, `ε=1e-8`
@@ -458,10 +466,12 @@ p ← p − η·(m̂ / (√v̂ + ε))
 对于每个 2D 参数 `p`（权重矩阵）：
 
 1. **SGD-Momentum：** `v ← μ·v + g`
-2. **Newton-Schulz 正交化：** `update = NS_5(v)`
-3. **参数更新：** `p ← p − η·update`
+2. **方向选择：** Nesterov 时 `update = g + μ·v`（否则 `update = v`）
+3. **Newton-Schulz 正交化：** `ortho = NS_5(update)`（仅 rows>1 且 cols>1 的参数）
+4. **参数更新：** `p ← p − η · 0.2·√max(m,n) · ortho`
+   （形状缩放：NS 输出谱范数为 1，不缩放则等效学习率随形状偏移）
 
-对于非 2D 参数（bias 等）：标准 SGD 更新。
+对于非 2D 参数（bias 等）：`p ← p − η·update`（标准 SGD 更新）。
 
 #### Newton-Schulz 正交化
 
@@ -481,6 +491,8 @@ X = G / (‖G‖_F + ε)
 **调优系数：** `a = 3.4445`, `b = -4.7750`, `c = 2.0315`
 
 这些系数使 quintic 多项式 `φ^N(x) → 1` for `x ∈ [0,1]`，5 步内收敛。
+母矩阵取**短边**一侧（`m ≤ n` 走行正交化 `A = X·Xᵀ`（m×m）；`m > n` 走列正交化
+`G = Xᵀ·X`（n×n）），显存恒为 `min(m,n)²`。
 
 **参考：**
 - Keller Jordan et al., "Muon: An optimizer for hidden layers in neural networks"
@@ -489,11 +501,13 @@ X = G / (‖G‖_F + ε)
 **DSL / 原语（每步，`compute_optimizer.hpp`）：**
 
 ```
-A   = engine.matmul(X, X, /*transB=*/true)      // X × X^T
-A_sq= engine.matmul(A, A)                        // A²
-accA= compute_into(leaf(A)*rparam(b) + leaf(A_sq)*rparam(c))   // B = b·A + c·A²
-BX  = engine.matmul(accA, X)                     // B·X
-accX= compute_into(leaf(X)*rparam(a) + leaf(BX)) // X = a·X + BX
+A   = dsl::compute(engine, dsl::matmul(X, X, /*transB=*/true), m, m)   // X × X^T
+A_sq= dsl::compute(engine, dsl::matmul(A, A), m, m)                    // A²
+B   ← dsl::compute_into(engine,                                        // B = b·A + c·A²
+        dsl::leaf(A) * dsl::rparam(b) + dsl::leaf(A_sq) * dsl::rparam(c), A)
+BX  = dsl::compute(engine, dsl::matmul(B, X), m, n)                    // B·X
+X   ← dsl::compute_into(engine,                                        // X = BX + a·X
+        dsl::leaf(BX) + dsl::leaf(X) * dsl::rparam(a), BX)
 ```
 
 **参数：** `lr`, `momentum=0.95`, `nesterov=true`, `ns_steps=5`, `ns_eps=1e-7`

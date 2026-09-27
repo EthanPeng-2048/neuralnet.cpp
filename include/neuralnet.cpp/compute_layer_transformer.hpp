@@ -388,11 +388,15 @@ public:
         //   再 rearrange_3d inverse 回 (d_model, batch)。
         auto re = engine.rearrange_3d(x, d_model_, batch_size_, num_patches_, false);
         if (!re) return std::unexpected(re.error());
-        auto row_sum = engine.row_reduce_sum(*re, p_.compute);
+        // 归约步走 dsl::compute_reduce（输出与输入同形）
+        auto row_sum = dsl::compute_reduce(engine,
+            dsl::row_reduce_sum(dsl::leaf(*re)), re->rows(), re->cols(), p_.compute);
         if (!row_sum) return std::unexpected(row_sum.error());
         auto rs_re = engine.rearrange_3d(*row_sum, d_model_, batch_size_, 1, true);
         if (!rs_re) return std::unexpected(rs_re.error());
-        auto r = engine.scale_inplace(*rs_re, inv_num_patches_);
+        // 原地缩放走 dsl::compute_into（inv_num_patches_ 走 rparam，值不进 key）
+        auto r = dsl::compute_into(engine,
+            dsl::leaf(*rs_re) * dsl::rparam(inv_num_patches_), *rs_re);
         if (!r) return std::unexpected(r.error());
         return *rs_re;
     }
@@ -406,15 +410,20 @@ public:
         //   每个样本的池化梯度广播到 num_patches 列：
         //   grad_x[d, b*num_patches + p] = grad_out[d, b] * inv_num_patches
         //   实现：rearrange_3d(grad, d_model, batch, 1, false) → (batch*d_model, 1)
-        //         scale(inv_n) → matmul(ones_row_, result_T) ... 直接：
-        //         matmul(grad_col_vec, ones_row_) → (batch*d_model, num_patches)
+        //         原地 scale(inv_n) → matmul(grad_col_vec, ones_row_) → (batch*d_model, num_patches)
         //         rearrange_3d(result, d_model, batch, num_patches, true) → (d_model, batch*num_patches)
         auto g_re = engine.rearrange_3d(grad_output, d_model_, batch_size_, 1, false);
         if (!g_re) return std::unexpected(g_re.error());
-        auto r = engine.scale_inplace(*g_re, inv_num_patches_);
+        // 原地缩放走 dsl::compute_into（inv_num_patches_ 走 rparam，值不进 key）
+        auto r = dsl::compute_into(engine,
+            dsl::leaf(*g_re) * dsl::rparam(inv_num_patches_), *g_re);
         if (!r) return std::unexpected(r.error());
         // (*g_re): (batch*d_model, 1) × ones_row_ (1, num_patches) → (batch*d_model, num_patches)
-        auto unpooled = engine.matmul(*g_re, ones_row_, false, false, p_.compute);
+        // 纯 matmul 走 DSL 直写（结构经 scan 的 TransformerEncoderLayer dry-run 登记；
+        // 注意该调用在 pooling 路径，scan 的 enc dry-run 覆盖 forward/backward）
+        auto unpooled = dsl::compute(engine,
+            dsl::matmul(*g_re, ones_row_, false, false),
+            g_re->rows(), ones_row_.cols(), p_.compute);
         if (!unpooled) return std::unexpected(unpooled.error());
         auto grad = engine.rearrange_3d(*unpooled, d_model_, batch_size_, num_patches_, true);
         if (!grad) return std::unexpected(grad.error());
@@ -570,34 +579,6 @@ public:
         return engine.from_matrix(grad_input);
     }
 };
-
-
-// ══════════════════════════════════════════════════════════════════════════
-// CausalSelfAttention — 因果自注意力（继承 AttentionBase，仅重写掩码钩子）
-//
-// 通过 PosEncodingType 参数支持两种掩码模式：
-//   - Learned / Sinusoidal: 仅施加因果掩码（mask[i][j] = 0 if j<=i, -inf if j>i）
-//   - ALiBi: 因果掩码 + ALiBi 线性偏置
-//
-// ALiBi (Attention with Linear Biases) 原理：
-//   不使用位置嵌入，而是在注意力分数上添加线性偏置：
-//   attention_score = Q*K^T + bias
-//   其中 bias[i][j] = -m_h * (i - j) for j <= i
-//   斜率 m_h = 2^(-8h/H)，h 是头索引，H 是总头数
-//
-// 优点（ALiBi 模式）：
-//   1. 无需位置嵌入，减少参数
-//   2. 天然支持长度外推（训练短序列，推理长序列）
-//   3. 计算开销极小（仅添加预计算的偏置）
-//
-// 算法差异（相对于 AttentionBase）：
-//   在 forward 的 scale 之后、softmax 之前，施加预计算的掩码：
-//     S += mask (batch*H*seq, seq) — 因果掩码（按 batch*H 平铺，ALiBi 模式下含线性偏置）
-//   backward 无需特殊处理（掩码为常数，softmax.backward 已处理梯度穿透）
-//
-//   seq_len 由构造函数指定，batch = input.cols() / seq_len 在 forward 时推断。
-//   seq_len=0 表示单样本模式（cols 即 seq），保持向后兼容。
-// ══════════════════════════════════════════════════════════════════════════
 
 } // namespace nn
 

@@ -1,8 +1,9 @@
 // ── GPT 文本生成训练程序（引擎化架构） ──────────────────────────────────────
 //
 // 数据流（滑动窗口，GPT 预训练标准做法）：
-//   文本 → 逐行 Tokenizer.encode → 每行编码为 [BOS]+tokens+[EOS] 后拼接成连续
-//     token 流（行边界通过 EOS 编码进流，窗口可跨行，上下文连续）
+//   文本 → 逐行 Tokenizer.encode → 各行 token 纯拼接成连续 token 流
+//     （行间无分隔符、不插入 BOS/EOS；行边界由 doc_ids 记录，窗口可跨行，
+//       上下文连续）
 //   按 stride 对 token 流滑动切 seq_len 窗口 → 每窗口 = 一个训练样本
 //   每 batch：窗口 → Matrix(seq_len, batch) → engine.from_matrix → Tensor
 //     → GPTModel.forward(Tensor) → Tensor(vocab_size, seq_len×batch)
@@ -95,7 +96,7 @@ struct FileContent {
 }
 
 // ── 并行 tokenize + 文档 id：每行 = 一篇文档 ───────────────────────
-// 不再插入 BOS/EOS（base 模式纯拼接，行间无分隔符）。
+// base 模式纯拼接：行间无分隔符，不插入 BOS/EOS。
 // 输出 token_flow 与等长的 doc_ids：每 token 的文档 id = 所在行号 + 1
 //（1 起，0 保留给 PAD/无效位置，便于块对角掩码隔离）。
 void parallel_tokenize(
@@ -317,7 +318,7 @@ void print_usage(const char *prog)
         << "Batch 录制粒度:\n"
         << "  --flush-interval <n>  每 N 个 Transformer block flush 一次 (默认: 2)\n"
         << "  按层切 batch 缩短 D1 延迟销毁锁窗、拆分大提交防 TDR；\n"
-        << "  P0-1 非阻塞提交后细粒度 flush 的额外 submit 代价不在关键路径，\n"
+        << "  非阻塞提交后细粒度 flush 的额外 submit 代价不在关键路径，\n"
         << "  不影响 batch_size 和训练质量\n"
         << "\n"
         << "显存优化:\n"
@@ -341,7 +342,7 @@ void print_usage(const char *prog)
         << "  --max-norm <f>    梯度裁剪最大全局 L2 范数 (默认: 0=不裁剪)\n"
         << "\n"
         << "混合精度 (docs/development/05-mixed-precision.md):\n"
-        << "  --f16              快捷方式：全 f16（param/compute/stable/optimizer 全 f16）\n"
+        << "  --f16              快捷方式：f16 存储（param/compute=F16，stable/optimizer=F32）\n"
         << "  --precision-param <f16|f32>\n"
         << "                     权重/参数存储精度 (默认: f32)\n"
         << "  --precision-compute <f16|f32>\n"
@@ -377,7 +378,7 @@ struct TrainConfig
     std::size_t d_ff = nn::GPT_D_FF;
     std::string model_type = "gpt";   // gpt / zipt（AttnZip 记忆压缩）
     std::size_t memory_tokens = nn::ZIPT_MEMORY_TOKENS;  // ZiPT 记忆 token 数 M
-    std::size_t window = 0;           // ZiPT 局部窗口 W（0=默认=seq-len，旧行为 W=L 无压缩）
+    std::size_t window = 0;           // ZiPT 局部窗口 W（0=默认=seq-len，即 W=L、不启用压缩）
     std::size_t log_interval = 50;
     std::size_t save_interval = 100;  // checkpoint 保存间隔（独立于 log_interval）
     bool load_existing = false;
@@ -389,11 +390,11 @@ struct TrainConfig
     nn::ActivationType activation = nn::ActivationType::GeLU;  // FFN 激活
     nn::NormType norm_type = nn::NormType::LayerNorm;           // 归一化层类型
 
-    // batch 录制粒度：在 Transformer block 间按间隔 flush，拆分大提交
-    // 2026-09 探针实测（显存取舍重估）：flush 粒度是显存与速度的双重杠杆——
+    // batch 录制粒度：在 Transformer block 间按间隔 flush，拆分大提交。
+    // 探针实测：flush 粒度是显存与速度的双重杠杆——
     // 帧越细，"已析构但等帧 reap"的死内存越少（中途 reap 更早生效）。
     //   flush1 = 3914MiB/4.6s，flush2 = 4170MiB/4.8s，flush4 = 5488MiB/6.2s
-    // 故默认 2→1（更省显存且更快；TDR 拆分粒度也更细）。
+    // 故默认 flush_interval = 1（更省显存且更快；TDR 拆分粒度也更细）。
     std::size_t flush_interval = 1;          // 0=不间断，>0=每 N 个 block flush
 
     // 梯度检查点（激活重计算 L1）：每 N 个 GPTBlock 重算一次
@@ -413,7 +414,7 @@ struct TrainConfig
     Scalar max_norm = 0.0f;             // 0 = 不裁剪
 
     // 混合精度控制（docs/development/05-mixed-precision.md §9.1）
-    nn::PrecisionProfile precision;     // 默认全 F32（D10：零回归）
+    nn::PrecisionProfile precision;     // 默认全 F32（零回归）
 };
 
 TrainConfig parse_args(int argc, char *argv[])
@@ -575,10 +576,10 @@ TrainConfig parse_args(int argc, char *argv[])
         else if (arg == "--f16")
         {
             // 快捷方式：**f16 存储**（param=F16 + compute=F16；stable/optimizer
-            // 留 F32）。这是"全 f16"的本意——与 profile_master_weights()（f32
-            // 主权重混合）的区别正是 param 由 F32 变 F16。stable/optimizer 留
-            // f32 有实测依据（f16 的 softmax/loss 链 ~200 步 NaN、Adam 的 m/v
-            // f16 下溢发散）：见 precision.hpp profile_f16() 注释。
+            // 留 F32）。与 profile_master_weights()（f32 主权重混合）的区别正是
+            // param 由 F32 变 F16。stable/optimizer 留 f32 有实测依据（f16 的
+            // softmax/loss 链 ~200 步 NaN、Adam 的 m/v f16 下溢发散）：见
+            // precision.hpp profile_f16() 注释。
             // 想要四字段全 f16（实验性）：--f16 --precision-stable f16
             //                                  --precision-optimizer f16
             cfg.precision = nn::profile_f16();
@@ -805,7 +806,7 @@ int main(int argc, char *argv[])
                   << "请检查 JSON 文件是否包含有效的 \"type\" 字段" << std::endl;
         return 1;
     }
-    // 注意：base 模式已删除 BOS/EOS 插入（纯拼接，行间无分隔符），
+    // 注意：base 模式纯拼接、不插入 BOS/EOS（行间无分隔符），
     // 文档边界由 parallel_tokenize 产出的 doc_ids 表示（每行 = 一篇文档）。
     const std::size_t pad_id = tokenizer->pad_id();
 
@@ -872,7 +873,7 @@ int main(int argc, char *argv[])
     // 文档感知：doc_ids 非空（每行 = 一篇文档）即启用块对角掩码。
     if (!flow_doc_ids.empty())
         std::cout << "文档感知掩码已启用（每行 = 一篇文档，"
-                  << flow_doc_ids.back() << " 篇文档，已删除 BOS/EOS）\n";
+                  << flow_doc_ids.back() << " 篇文档）\n";
 
     // 切窗口：每个窗口 = 一个训练样本（长度 seq_len，末窗不足则 PAD）。
     // 保留全部窗口（含跨文档）；文档感知掩码在单 fold 融合 kernel 内生效
@@ -944,22 +945,21 @@ int main(int argc, char *argv[])
     }
     auto raw_engine = std::move(*engine_res);
 
-    // ── 多精度适配层（Phase 2：f16 存储真正生效）────────────────────────
+    // ── 多精度适配层（f16 存储）────────────────────────────────
     // 非全 f32 配置（--f16 / --precision-*）时把内层引擎包进 PrecisionEngine：
-    // f16 的边界 cast（f16 抬到 f32 计算 → 按目标精度落回）全部集中在该层，
-    // 手写 shader 与 AOT 闭合世界保持全 f32（expr_spec_key 不含精度维度）。
+    // f16 的边界 cast（f16 抬到 f32 计算 → 按目标精度落回）集中在该层；
+    // 引擎提供 f16 变体的算子直读写 f16，其余算子走 f32 边界 cast
+    //（expr_spec_key 本身不含精度维度，f16 变体按 (key, 精度签名) 另行注册）。
     // 层内的 p_.param/compute/stable/optimizer 是唯一精度来源（§8.5 G4）。
-    // 全 f32 时**不包**：直接走原生引擎，行为与迁移前逐字节一致（零回归）。
+    // 全 f32 时**不包**：直接走原生引擎，省掉适配层的逐原语分支判断。
     std::optional<nn::PrecisionEngine> precision_adapter;
     if (!nn::is_profile_f32(cfg.precision))
     {
         precision_adapter.emplace(*raw_engine);
-        std::cout << "[精度] f16 存储已启用（PrecisionEngine 适配层 + in-kernel f16 逐元素变体）\n"
-                     "  [提示] f16 路径会造出大量**小**临时块 → 池底材粒度直接决定峰值："
-                     "实测（batch32）默认 12MB 块峰值 3445MiB，\n"
-                     "         设 NN_POOL_LADDER_MAX_MB=16（按尺寸分档）可降至 2705MiB（−21%），"
-                     "代价是池记账变慢（5.8s→11.3s）。\n"
-                     "         详见 docs/development/05-mixed-precision.md §12.9。\n";
+        std::cout << "[精度] f16 存储已启用（PrecisionEngine 适配层 + in-kernel f16 变体 + f16 GEMM）\n"
+                     "  [提示] 池底材粒度可用 NN_POOL_BLOCK_MB / NN_POOL_LADDER_MAX_MB 调参"
+                     "（探针/实验用），\n"
+                     "         详见 docs/development/05-mixed-precision.md §12.10。\n";
     }
     nn::ComputeEngine* engine = precision_adapter
         ? static_cast<nn::ComputeEngine*>(&*precision_adapter)
@@ -1034,15 +1034,15 @@ int main(int argc, char *argv[])
                       << " compute=" << nn::precision_name(pp.compute)
                       << " stable=" << nn::precision_name(pp.stable)
                       << " optimizer=" << nn::precision_name(pp.optimizer) << "\n";
-            // 消费方说明（2026-09 Phase 2 起）：
+            // 消费方说明：
             //   · param/compute 由 Layer 的 p_.param/p_.compute 传给引擎原语与
             //     dsl::compute，经 PrecisionEngine 适配层落成 f16 **存储**
-            //     （融合世界保持 f32 的边界 cast；见 compute_precision_engine.hpp）；
+            //     （引擎提供 f16 变体的算子直读写，其余走 f32 边界 cast；见
+            //     compute_precision_engine.hpp）；
             //   · stable 用于 softmax/LayerNorm/loss 链；optimizer 用于 Adam m/v。
-            // 局限：边界 cast 对"被多个算子读取的大张量"（如 vocab 级 logits）
-            // 会各算子各物化一份 f32 副本 → LM head 已固定走 stable（见 GPTModel
-            // 注释）；真正的 f16 融合 kernel（in-kernel f16 / typed IR）是
-            // docs/development/05-mixed-precision.md §12.3 的下一步。
+            // 局限：走边界 cast 时，"被多个算子读取的大张量"（如 vocab 级 logits）
+            // 会各算子各物化一份 f32 副本 → LM head 固定走 stable（见 GPTModel
+            // 注释）。
         }
     }
 
@@ -1135,7 +1135,7 @@ int main(int argc, char *argv[])
                 spec = file_spec;
             }
             // 统一的 GPTModel 通过 pos_encoding 区分 Learned/Sinusoidal/ALiBi，
-            // 因此 GPT 和旧格式 ALiBi_GPT 文件都走同一条构建路径。
+            // GPT 与 ALiBi_GPT 走同一条构建路径。
             else if (file_spec.is_gpt() || file_spec.is_alibi_gpt())
             {
                 if (file_spec.pos_encoding == nn::PosEncodingType::ALiBi)
@@ -1196,7 +1196,7 @@ int main(int argc, char *argv[])
 
     nn::CrossEntropyLoss ce_loss;
     // loss 链精度 = profile.stable（§9.1 / D9：softmax/log/大词表归约的溢出防线；
-    // 默认 F32 → 与迁移前逐字节一致）
+    // 默认 F32 = loss 链全程 f32）
     ce_loss.set_precision_profile(cfg.precision);
 
     // ── 训练循环 ─────────────────────────────────────────────
@@ -1334,10 +1334,11 @@ int main(int argc, char *argv[])
         // 梯度累积：距上次参数更新的步数（每 accum_steps 步更新一次）
         std::size_t steps_since_update = 0;
 
-        // ── 非阻塞 loss 回读（P0-2）─────────────────────────────────────
+        // ── 非阻塞 loss 回读 ──────────────────────────────────────
         // 每步把设备端 loss_sum 排入一个异步回读槽位（**不等待**），稍后就绪
-        // 即取。host 不再因取 loss 而 end_batch + wait_in_flight（旧路径每步
-        // drain 整条流水线，GPU 在 host 录制期间空转 → 占用率锯齿）。
+        // 即取。取 loss 不做 end_batch + wait_in_flight：loss 走 device 侧异步
+        // 回读，host 录制的帧不被打断——host 一旦在录制中途等待，就会 drain
+        // 整条流水线，GPU 在 host 录制期间空转 → 占用率锯齿。
         // 稳定态下第 N 步即可取到第 N-1 步的 loss，打印仍是每步一条。
         struct PendingLoss
         {
@@ -1503,11 +1504,11 @@ int main(int argc, char *argv[])
             // logits: (vocab_size, seq_len × batch_size)
 
             // ── 损失（稀疏标签，避免 one-hot 爆显存）────────
-            // P0-2：不再在此同步读回 loss。forward_sparse_sum 只算出设备端
+            // 此处不做同步读回 loss：forward_sparse_sum 只算出设备端
             // (1,1) loss 和（Σ loss_vec，未归一化）；flush 提交 forward 帧后
             // 把它排入异步回读槽位，host 立刻继续录制 backward——全程不 drain。
-            // NaN 跳步已移除（loss 不再在 host 侧判定；数值稳定性改由
-            // --max-norm 梯度裁剪 + 观察 loss 曲线负责）。
+            // loss 只在 device 侧回读、不在 host 侧判定；数值稳定性由
+            // --max-norm 梯度裁剪 + 观察 loss 曲线负责。
             auto mask_span = std::span<const Scalar>(flat_mask);
             std::size_t loss_num_valid = 0;
             auto loss_sum_t = ce_loss.forward_sparse_sum(
@@ -1617,14 +1618,14 @@ int main(int argc, char *argv[])
             }
 
             // ── 显存回收（L2）：end_batch 提交完成、延迟销毁已 flush，
-            //    归还完全空闲的内存池底材（GPU 引擎有效，CPU/CUDA no-op） ──
+            //    归还完全空闲的内存池底材（GPU 引擎有效，CPU 引擎 no-op） ──
             auto rel_r = engine->release_idle_pool_blocks();
             mem_mark("step/released");
             if (!rel_r) { std::cerr << "\n显存回收失败: " << rel_r.error().message << '\n'; return 1; }
 
             // ── 显存优化：logits 梯度已消费完毕，立即释放 ──
             //   model.backward 已把 grad 传播到各参数梯度，grad_result（1.6GB）
-            //   不再需要。end_batch 之后 backward 已提交执行完，释放安全。
+            //   已消费完毕。end_batch 之后 backward 已提交执行完，释放安全。
             grad_result = {};
 
             // ── 梯度累积：每 accum_steps 步才更新一次参数 ──
@@ -1637,7 +1638,7 @@ int main(int argc, char *argv[])
             if (do_update)
             {
                 // ── 梯度裁剪（在 step() 之前，backward() 之后） ──
-                // P0-2：clip_grad_norm 逐原语在 batch **外**会各自
+                // clip_grad_norm 逐原语在 batch **外**会各自
                 // submit_and_wait（约 200 次 host↔GPU 往返/次裁剪）；包进
                 // 一个 batch 后只剩一次范数下载同步（每 accum_steps 步一次，
                 // 而非每步）。这是范数的数据依赖，无法异步化。
@@ -1705,7 +1706,7 @@ int main(int argc, char *argv[])
                     std::cerr << "\n  [ckpt] 保存失败: " << save_r.error().message << "\n";
             }
 
-            // 进度显示已移到 harvest_loss（loss 走异步回读）：按"值就绪即打印"，
+            // 进度显示在 harvest_loss 内完成（loss 走异步回读）：按"值就绪即打印"，
             // 稳定态仍是每步一条，且 host 全程不等 GPU。
         }
 

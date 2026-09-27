@@ -1,7 +1,7 @@
 // ───────────────────────────────────────────────────────────────────────────
-//  expr_matmul_test.cpp — 算子融合二期（docs/development/02）：matmul 参与 IR 融合（S1+S2）
+//  expr_matmul_test.cpp — 算子融合二期（docs/development/02）：matmul 参与 IR 融合
 //
-//  对应 docs/development/02-operator-fusion.md 阶段 S1（IR 地基）与 S2（CPU 正确性）：
+//  对应 docs/development/02-operator-fusion.md（IR 地基 + CPU 正确性两步）：
 //    1. ExprSpec 增加 MatmulSpec（前置 matmul 段）+ ExprOperandKind::Matmul：
 //       C = op(A,B) 作为逐元素链的"虚拟寄存器 0"，链内按 (r,c) 读取。
 //    2. CpuEngine::eval_expr 支持 matmul 段（matmul 预计算 + 逐元素链），
@@ -27,7 +27,7 @@
 #include <neuralnet.cpp/compute_cpu_engine.hpp>
 #include "test_common.hpp"
 
-// 测试写在全局作用域（非 namespace nn），避免与旧代数运算符的 ADL 歧义。
+// 测试写在全局作用域（非 namespace nn），避免 ADL 把匹配拉进 nn 命名空间。
 using namespace nn::dsl;
 namespace dsl = nn::dsl;   // 别名：全局作用域可用 dsl::leaf 等限定调用
 using nn::Scalar;
@@ -266,8 +266,7 @@ void test_matmul_reduce_instr()
 }
 
 // ── 6b) 列归约 + matmul：col_max(matmul(x))（CPU 参考路径；含 batch 分解）
-//    该结构曾被 gen_fused 跳过（"matmul+列归约组合暂不支持"），生成器补齐
-//    按元素 batch 分解后，此处锁死其语义：列归约遍历全部 rows（= batch*M），
+//    覆盖 matmul+列归约组合：列归约遍历全部 rows（= batch*M），
 //    与独立标量参考（逐 batch matmul → 垂直堆叠 → 列 max）一致。
 void test_col_matmul_reduce_instr()
 {

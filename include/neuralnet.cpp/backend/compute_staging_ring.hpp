@@ -6,10 +6,11 @@
 //   - 环形分配，避免频繁创建/销毁
 //   - Fence 同步确保数据安全
 //
-// 设计（依据性能审查报告优化）：
-//   - 预分配 N 个 region（默认 2 个，每个 64MB → 总 128MB）
-//   - 旧默认 4×256MB=1GB 预分配过大；实际训练单次 PCIe 传输量
-//     通常 << 64MB（最大 token_emb 上传约 5MB）
+// 设计：
+//   - 预分配 N 个 region（默认 4 个，每个 ≥64MB；实际大小由 initialize()
+//     按 host-visible 显存动态计算）
+//   - 单次 PCIe 传输量通常 << 64MB（最大 token_emb 上传约 5MB），region
+//     不必按整机预算放大
 //   - 内存预算上限保留 max_host_visible / 16，避免在小显存机器上过度分配
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -34,18 +35,18 @@ namespace nn
 class StagingRing
 {
 public:
-    // 默认 64MB × 2 region（实际分配大小由 initialize() 动态计算，
-    // 会根据 host-visible 显存大小自动扩容，此值仅作为下限参考）
+    // 默认 64MB/region × DEFAULT_NUM_REGIONS=4（实际分配大小由 initialize()
+    // 动态计算，会根据 host-visible 显存大小自动扩容，此值仅作为下限参考）
     static constexpr std::size_t DEFAULT_REGION_SIZE = 64ull * 1024 * 1024; // 64MB
-    static constexpr std::size_t DEFAULT_NUM_REGIONS = 4;  // 2→4：降低 acquire 阻塞概率
+    static constexpr std::size_t DEFAULT_NUM_REGIONS = 4;  // region 轮转深度，降低 acquire 阻塞概率
     // host-visible 显存预算占比的倒数（实际取 1/HOST_VISIBLE_FRACTION）
     static constexpr VkDeviceSize HOST_VISIBLE_FRACTION = 16;
     // 动态计算 staging 大小的下限，避免小显存机器分配过小
     static constexpr VkDeviceSize MIN_REGION_SIZE = 32ull * 1024 * 1024;
     // 动态计算 staging 大小的上限（借鉴 llama.cpp 按需小 staging）：
     // 大上传/下载已由分块逻辑（每块 ≤ region）自动切分，故 staging 无需按
-    // 整机 host heap 的 1/16 常驻（V100 上曾达 2×2GB=4GB host 预算）。
-    // 封顶 256MB/region → 2 regions 共 512MB，共享显存架构下大幅释放预算。
+    // 整机 host heap 的 1/16 常驻（不设上限时该规则给出的是 GB 级预算）。
+    // 封顶 256MB/region，共享显存架构下大幅释放预算。
     static constexpr VkDeviceSize MAX_REGION_SIZE = 256ull * 1024 * 1024;
 
 private:
@@ -56,7 +57,7 @@ private:
         VkBuffer buffer = VK_NULL_HANDLE;
         void* mapped_ptr = nullptr;
         VkFence fence = VK_NULL_HANDLE;
-        // 跨 submit 数据依赖（P0-1 修复）：本 region 的上传 copy 以该信号量
+        // 跨 submit 数据依赖（多帧流水线）：本 region 的上传 copy 以该信号量
         // 为提交期信号；后续读取"由该上传写入的 buffer"的 submit（download /
         // matmul / batch 帧）在 VkSubmitInfo.pWaitSemaphores 中等它。
         // 背景：单队列 FIFO 只是执行顺序保证，实测本驱动（NVIDIA + Windows）
@@ -71,14 +72,14 @@ private:
         //   - 等待已达成/更小的 value 是 no-op，重复等待天然幂等。
         // 设备不支持时间线信号量时（timeline_=false）不创建信号量，改由
         // collect_staging_waits() → drain_in_flight() 在 host 侧阻塞等待，
-        // 正确性优先、放弃 P0-1 的非阻塞流水线。
+        // 正确性优先、放弃非阻塞流水线。
         VkSemaphore semaphore = VK_NULL_HANDLE;
         // 本 region 最近一次上传的信号 value（时间线信号量用；单调递增）
         std::uint64_t signal_value = 0;
-        // 专属 command buffer（P0-1 修复）：上传 copy 命令录在这里，**永不
+        // 专属 command buffer：上传 copy 命令录在这里，**永不
         // 在 pending 状态释放**——VUID-vkFreeCommandBuffers-pCommandBuffers-
-        // 00058 禁止释放 pending（已提交未 signal）的 command buffer。旧实
-        // 现"submit 后立即可复用/释放"是规范违规：实测导致驱动通道排序失
+        // 00058 禁止释放 pending（已提交未 signal）的 command buffer。
+        // "submit 后立即 free/复用"是规范违规：实测导致驱动通道排序失
         // 效（fence 提前 signal、跨 submit 乱序执行）。acquire 等完 fence
         // 后该 cmd 离开 pending（invalid），vkResetCommandBuffer 复用合法。
         // 新分配时为 invalid 状态，首次使用前 vkResetCommandBuffer。
@@ -258,8 +259,8 @@ public:
     }
 
     // 非时间线回退：host 阻塞等待所有在飞上传完成并释放 region。
-    // 等完之后"后续 submit 读上传 buffer"不再构成跨 submit 依赖，消费者
-    // 无需等信号量。代价是 host 阻塞（正是 P0-1 想避免的路径），仅在设备
+    // 等完之后"后续 submit 读上传 buffer"即不构成跨 submit 依赖，消费者
+    // 无需等信号量。代价是 host 阻塞（正是多帧流水线想避免的路径），仅在设备
     // 不支持时间线信号量时启用——正确性优先。
     void drain_in_flight()
     {

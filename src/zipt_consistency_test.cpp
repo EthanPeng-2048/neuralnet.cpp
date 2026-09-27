@@ -102,7 +102,9 @@ int main(int argc, char* argv[])
     {
         auto lc = model_cpu->forward(*x_cpu);
         auto lg = model_gpu->forward(*x_gpu);
-        if (!lc || !lg) { std::cerr << "forward failed\n"; return 1; }
+        // 打印真实 error message（闭合世界未命中/形状校验失败等只有 message 能区分）
+        if (!lc) { std::cerr << "CPU forward failed: " << lc.error().message << "\n"; return 1; }
+        if (!lg) { std::cerr << "GPU forward failed: " << lg.error().message << "\n"; return 1; }
         auto lc_m = cpu.to_matrix(*lc);
         auto lg_m = gpu.to_matrix(*lg);
         if (!lc_m || !lg_m) return 1;

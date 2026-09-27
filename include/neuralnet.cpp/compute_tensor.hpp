@@ -1,13 +1,13 @@
 #pragma once
 
-// ── compute_tensor.hpp — 统一张量类型（多精度，docs/23 §6.1）──────────────────
+// ── compute_tensor.hpp — 统一张量类型（多精度，docs/development/05-mixed-precision.md §6.1）──
 // Tensor 是跨设备的统一数据容器：CPU 持有 Matrix<P>，GPU 持有 GpuTensorT<P>。
 // Layer 和 ComputeEngine 只操作 Tensor，不关心底层存储设备或精度。
 //
-// 设计要点（docs/23 §6.1 Q2）：
+// 设计要点（docs/development/05-mixed-precision.md §6.1 Q2）：
 //   - Tensor 非模板：运行时 precision_ + 类型擦除存储（std::variant）
 //   - Matrix<P> / GpuTensorT<P> 为存储/代数层模板（模板化到设备）
-//   - 访问器按 P 模板化（默认 F32 → 现有调用点零改动）
+//   - 访问器按 P 模板化（P 默认 F32）
 //   - precision_ 与 device_ 共同唯一确定存储的有效类型
 //   - 使用 shared_ptr 内部持有存储，拷贝廉价（零拷贝传递）
 // ─────────────────────────────────────────────────────────────────────────
@@ -40,7 +40,7 @@ enum class Device : uint8_t
 };
 
 // ══════════════════════════════════════════════════════════════════════════
-// Tensor — 统一跨设备张量（多精度，docs/23 §6.1）
+// Tensor — 统一跨设备张量（多精度，docs/development/05-mixed-precision.md §6.1）
 //
 // 内存布局（variant 交替表）：
 //   cpu_data_ : variant< shared_ptr<MatrixT<F16>>,  shared_ptr<MatrixT<F32>> >
@@ -108,31 +108,31 @@ private:
 public:
     Tensor() = default;
 
-    // ── CPU 构造（f32，现有 API 零改动）──────────────────────────────────
+    // ── CPU 构造（f32）────────────────────────────────────────────────────
     explicit Tensor(std::shared_ptr<Matrix> m)
         : device_(Device::CPU), precision_(Precision::F32),
           rows_(m->rows()), cols_(m->cols()),
           cpu_data_(std::in_place_index<1>, std::move(m)) {}
 
-    // ── CPU 构造（f16，新，§6.4）─────────────────────────────────────────
+    // ── CPU 构造（f16，§6.4）──────────────────────────────────────────────
     explicit Tensor(std::shared_ptr<MatrixT<Precision::F16>> m)
         : device_(Device::CPU), precision_(Precision::F16),
           rows_(m->rows()), cols_(m->cols()),
           cpu_data_(std::in_place_index<0>, std::move(m)) {}
 
-    // ── 从 Matrix 创建（f32 by-value，现有 API）──────────────────────────
+    // ── 从 Matrix 创建（f32 by-value）─────────────────────────────────────
     static Tensor from_matrix(Matrix m)
     {
         return Tensor(std::make_shared<Matrix>(std::move(m)));
     }
 
-    // ── 从 MatrixT<F16> 创建（f16 by-value，新，§6.4）───────────────────
+    // ── 从 MatrixT<F16> 创建（f16 by-value，§6.4）────────────────────────
     static Tensor from_matrix(MatrixT<Precision::F16> m)
     {
         return Tensor(std::make_shared<MatrixT<Precision::F16>>(std::move(m)));
     }
 
-    // ── 创建 CPU 空张量（f32，现有 API）──────────────────────────────────
+    // ── 创建 CPU 空张量（f32）─────────────────────────────────────────────
     static Tensor cpu(std::size_t rows, std::size_t cols)
     {
         return Tensor(std::make_shared<Matrix>(rows, cols));
@@ -140,7 +140,7 @@ public:
 
     // ── 创建 CPU 未初始化张量（f32）───────────────────────────────────────
     // 语义契约：调用方必须在任何读取之前把**全部**元素写满。
-    // 用于"输出会被完整覆盖"的引擎内部路径（eval_expr / elementwise_* 的
+    // 用于"输出会被完整覆盖"的引擎内部路径（eval_expr 等逐元素求值的
     // 输出缓冲）：省掉"分配 + 写满一遍零 + 马上被全覆盖"里的那一遍零写。
     // 实测本机单线程写满 1.57MB 要 0.50ms（~3.2 GB/s），是纯浪费。
     [[nodiscard]] static Tensor cpu_uninitialized(std::size_t rows, std::size_t cols)
@@ -159,25 +159,25 @@ public:
     }
 
 #ifdef NN_HAS_VULKAN
-    // ── GPU 构造（f32，现有 API）──────────────────────────────────────────
+    // ── GPU 构造（f32）────────────────────────────────────────────────────
     explicit Tensor(std::shared_ptr<GpuTensor> t)
         : device_(Device::GPU), precision_(Precision::F32),
           rows_(t->rows()), cols_(t->cols()),
           gpu_data_(std::in_place_index<1>, std::move(t)) {}
 
-    // ── GPU 构造（f16，新，§6.4）─────────────────────────────────────────
+    // ── GPU 构造（f16，§6.4）──────────────────────────────────────────────
     explicit Tensor(std::shared_ptr<GpuTensorT<Precision::F16>> t)
         : device_(Device::GPU), precision_(Precision::F16),
           rows_(t->rows()), cols_(t->cols()),
           gpu_data_(std::in_place_index<0>, std::move(t)) {}
 
-    // ── 从 GpuTensor 创建（f32，现有 API）────────────────────────────────
+    // ── 从 GpuTensor 创建（f32）───────────────────────────────────────────
     static Tensor from_gpu(GpuTensor t)
     {
         return Tensor(std::make_shared<GpuTensor>(std::move(t)));
     }
 
-    // ── 从 GpuTensorT<F16> 创建（f16，新）────────────────────────────────
+    // ── 从 GpuTensorT<F16> 创建（f16）─────────────────────────────────────
     static Tensor from_gpu(GpuTensorT<Precision::F16> t)
     {
         return Tensor(std::make_shared<GpuTensorT<Precision::F16>>(std::move(t)));
@@ -211,7 +211,7 @@ public:
 #endif
     }
 
-    // ── CPU 存储访问（模板化，默认 F32 → 现有调用点零改动，§6.1）───────
+    // ── CPU 存储访问（模板化，P 默认 F32，§6.1）──────────────────────────
     template <Precision P = Precision::F32>
     [[nodiscard]] MatrixT<P>& cpu_matrix()
     {
@@ -243,7 +243,7 @@ public:
     }
 
 #ifdef NN_HAS_VULKAN
-    // ── GPU 存储访问（模板化，默认 F32 → 现有调用点零改动，§6.1）───────
+    // ── GPU 存储访问（模板化，P 默认 F32，§6.1）──────────────────────────
     template <Precision P = Precision::F32>
     [[nodiscard]] GpuTensorT<P>& gpu_tensor()
     {
@@ -288,8 +288,10 @@ public:
              + precision_name(precision_);
     }
 
-    // ── 零拷贝 reshape（共享底层 buffer，仅改变形状元数据）────────────────
-    // 后端无关：CPU/Vulkan 均适用，避免上层代码直接访问 gpu_tensor()
+    // ── reshape（GPU 共享底层 buffer；CPU 复制数据）──────────────────────
+    // 后端无关入口：上层无需直接访问 gpu_tensor() / cpu_matrix() 即可调整形状。
+    // GPU：共享底层 buffer，仅改形状元数据（零拷贝）；CPU：Matrix 无"零拷贝
+    // 视图"能力，按 precision_ 复制数据到新形状的 Matrix（§6.1）。
     [[nodiscard]] Tensor reshape(std::size_t new_rows, std::size_t new_cols) const
     {
         NN_ASSERT(rows_ * cols_ == new_rows * new_cols,
@@ -304,8 +306,7 @@ public:
 #endif
         if (device_ == Device::CPU)
         {
-            // CPU 的 Matrix 无"零拷贝视图"能力：reshape 需复制数据到新形状的 Matrix。
-            // 按 precision_ 选择正确的 variant 槽位（§6.1）。
+            // 复制数据到新形状的 Matrix：按 precision_ 选择正确的 variant 槽位（§6.1）。
             if (precision_ == Precision::F16)
             {
                 auto m = std::make_shared<MatrixT<Precision::F16>>(new_rows, new_cols);

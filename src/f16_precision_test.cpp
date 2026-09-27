@@ -91,7 +91,7 @@ void test_f32_zero_regression(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
     if (!ta || !tb) return;
 
     // 归约 / 搬运 两类代表原语：适配层必须逐字节等于内层引擎
-    // （逐元素原语已整体移除；逐元素路径的 f32 零回归见 test_f32_zero_regression_dsl）
+    // （逐元素路径的 f32 零回归见 test_f32_zero_regression_dsl）
     auto ref_red = raw.col_reduce_sum(*ta);
     auto got_red = eng.col_reduce_sum(*ta);
     CHECK(ref_red && got_red, "col_reduce_sum");
@@ -566,11 +566,8 @@ void test_f16_model_e2e(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
 
     if (!std::isfinite(r16.losses.back()))
     {
-        // 历史"已知问题"（CPU 侧 f16 训练发散）已修复并转为**硬失败**：
-        //   根因1 = DSL 预绑定把 f16 操作数喂给 f32 GEMM（cpu_matrix<F32>()
-        //   拿到空指针）；根因2 = float_to_half_bits 次正规分支 exp<=-46 的
-        //   移位 UB（|v| ∈ [2.8e-14, 1.2e-10] 的梯度被写成垃圾 half）。
-        //   详见 docs/development/05-mixed-precision.md §12.12。
+        // 硬失败判据：f16 训练 loss 必须全程有限（轨迹与 f32 对齐是本测试
+        // 前提）——出现非有限值即发散，直接失败，不做任何容忍分支。
         std::fprintf(stderr, "  FAIL %s: f16 训练出现非有限 loss（回归！）"
                              " 轨迹: %.4f → %.4f\n",
                      g_label, r16.losses.empty() ? 0.0 : r16.losses.front(),

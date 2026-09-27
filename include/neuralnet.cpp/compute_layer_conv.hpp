@@ -68,6 +68,24 @@ namespace conv_engine {
 
 } // namespace conv_engine
 
+// ══════════════════════════════════════════════════════════════════════════
+// Conv2D — 二维卷积层（引擎化：im2col + matmul 复用矩阵乘内核）
+//
+// 布局约定（与项目 batch-major 列布局一致）：
+//   输入  Tensor: (C_in * H_in * W_in, batch)
+//   输出  Tensor: (C_out * H_out * W_out, batch)
+//   权重  w_: (C_out, C_in * k * k)
+//   偏置  b_: (C_out, 1)
+//
+// 算法（只在此处，不在 Engine/Shader）：
+//   forward:  im2col(x) → col (C_in*k*k, batch*OH*OW)
+//             Z = W × col + b  → (C_out, batch*OH*OW)
+//             重排 → (C_out*OH*OW, batch)   （恢复 batch-major 列布局）
+//   backward: grad_W += gZ × col^T
+//             grad_b += row_reduce_sum(gZ)
+//             grad_col = W^T × gZ
+//             col2im → (C_in*H*W, batch)
+// ══════════════════════════════════════════════════════════════════════════
 class Conv2D final : public Layer
 {
 private:
@@ -188,8 +206,8 @@ public:
         col_cache_ = checkpoint_mode_ ? Tensor{} : *col;
 
         // 2) Z = W × col + b → (C_out, P*B)：matmul 段与行广播偏置**融合为单次
-        //    dispatch**（GPU 上 2 → 1，且不物化 matmul 中间结果；与
-        //    Linear::forward / matmul_with_bias 同一结构）。
+        //    dispatch**（不物化 matmul 中间结果；与 Linear::forward /
+        //    matmul_with_bias 同一结构）。
         auto Z = dsl::compute(engine,
             dsl::matmul(w_, *col, false, false) + dsl::row_broadcast(b_),
             out_channels_, batch * P);
@@ -213,7 +231,7 @@ public:
         const std::size_t kk = kernel_ * kernel_;
         const std::size_t P = out_h_ * out_w_;
         // 缓存前置校验：checkpoint 模式（尚未 forward_recompute）下 forward 不驻留
-        // col_cache_；不校验会拿空/上一 batch 的陈旧 im2col 静默算出错误梯度。
+        // col_cache_；backward 必须校验缓存命中且形状匹配，否则会静默算出错误梯度。
         if (col_cache_.rows() != in_channels_ * kk || col_cache_.cols() != P * batch)
             return std::unexpected(Error{
                 "conv backward: im2col 缓存缺失或不匹配"
@@ -226,19 +244,25 @@ public:
         if (!gZ) return std::unexpected(gZ.error());
 
         // 2) grad_W += gZ × col^T → (C_out, C_in*k*k)：matmul 段与累加**融合为单次
-        //    dispatch**并原地写入 grad_w_（GPU 上 2 → 1，且不物化 gw）
+        //    dispatch**并原地写入 grad_w_（不物化 gw 中间结果）
         auto r1 = dsl::compute_into(engine,
             dsl::leaf(grad_w_) + dsl::matmul(*gZ, col_cache_, false, true), grad_w_);
         if (!r1) return std::unexpected(r1.error());
 
         // 3) grad_b += row_reduce_sum(gZ) → (C_out, 1)（对全部位置与样本求和）
-        auto gb = engine.row_reduce_sum(*gZ);
+        //    归约步用 dsl::compute_reduce、累加步用 dsl::compute_into（同 Linear）
+        auto gb = dsl::compute_reduce(engine,
+            dsl::row_reduce_sum(dsl::leaf(*gZ)), gZ->rows(), gZ->cols());
         if (!gb) return std::unexpected(gb.error());
-        auto r2 = engine.add_inplace(grad_b_, *gb);
+        auto r2 = dsl::compute_into(engine,
+            dsl::leaf(grad_b_) + dsl::leaf(*gb), grad_b_);
         if (!r2) return std::unexpected(r2.error());
 
         // 4) gcol = W^T × gZ → (C_in*k*k, P*B) ；5) grad_x = col2im(gcol)
-        auto gcol = engine.matmul(w_, *gZ, true, false);
+        //    纯 matmul 段由 dsl::compute 直写（scan 的 Conv2D backward dry-run 自动登记）
+        auto gcol = dsl::compute(engine,
+            dsl::matmul(w_, *gZ, true, false),
+            w_.cols(), gZ->cols());
         if (!gcol) return std::unexpected(gcol.error());
         return engine.col2im(*gcol, in_channels_, in_h_, in_w_,
                              kernel_, stride_, padding_, out_h_, out_w_);
@@ -246,25 +270,26 @@ public:
 };
 
 // ══════════════════════════════════════════════════════════════════════════
-// MaxPool2D — 二维最大池化（记录 argmax 供 backward）
+// MaxPool2D — 二维最大池化（缓存窗口 max 供 backward 判据）
 //
 // 布局约定（batch-major 列布局）：
 //   输入  Tensor: (C * H * W, batch)
 //   输出  Tensor: (C * Hp * Wp, batch)，Hp=(H-pool)/stride+1，Wp 同理
 //
 // 算法（只在此处，不在 Engine/Shader）：
-//   forward:  每个 (pool×pool) 窗口取最大值，记录 argmax 位置
-//   backward: 把梯度散射回 argmax 位置（其余位置为 0）
+//   forward:  每个 (pool×pool) 窗口取最大值，缓存窗口 max（backward 判据）
+//   backward: 梯度写回窗口内等于窗口 max 的位置（其余为 0；并列时均分）
 //
-// 实现（全引擎化，2026-09-20）：
+// 实现（纯引擎原语 + DSL）：
 //   forward:  im2col(k=pool, stride=stride, pad=0) 展开窗口
-//             → 每通道 col_reduce_max → (C, P*B) → rearrange_3d + gather 转 samples 布局
+//             → grouped_reduce_max（每窗口 pool*pool 行一组）→ (C, P*B)
+//             → rearrange_3d + gather 转 samples 布局
 //   backward: (C*P, B) → scatter_add + rearrange_3d 回 (C, P*B)
-//             → 每通道 mask=(窗口 == 窗口 max) 的单次融合 DSL → col2im 散射
+//             → mask=(窗口 == 窗口 max) 的单次融合 DSL → col2im 散射
 // 语义说明：反向按「窗口内并列最大值**均分**该窗口梯度」处理（总梯度守恒）。
-//   无并列最大值时与原 argmax-first 实现逐位一致；出现并列最大值时按 1/cnt 均分
-//   （合法次梯度；PyTorch 取首个 argmax，TensorFlow 历史上给所有并列元素全量梯度，
-//   三者只在并列时不同）。maxpool_gradcheck 同时覆盖 tie-free 与并列用例。
+//   无并列最大值时（cnt=1）梯度全部落在唯一的最大值位置；出现并列时按 1/cnt
+//   均分（合法次梯度；PyTorch 取首个 argmax，TensorFlow 给所有并列元素全量
+//   梯度，三者只在并列时不同）。maxpool_gradcheck 同时覆盖 tie-free 与并列用例。
 // ══════════════════════════════════════════════════════════════════════════
 class MaxPool2D final : public Layer
 {
@@ -359,9 +384,11 @@ public:
         if (!col) return std::unexpected(col.error());
 
         // 2) 分组归约求窗口 max：每 kk 行一组 → (C, P*B)。
-        //    用 grouped_reduce_max 单次原语完成（早期版本按通道循环
-        //    slice_rows + col_reduce_max + insert_rows，C 次 dispatch）。
-        auto pooled = engine.grouped_reduce_max(*col, channels_, kk);
+        //    单表达式单 dispatch 完成全通道分组归约（grouped_reduce_max 视图，
+        //    R = 窗口面积 kk）。
+        auto pooled = dsl::compute(engine,
+            dsl::grouped_reduce_max(*col, static_cast<std::uint32_t>(kk)),
+            channels_, col->cols());
         if (!pooled) return std::unexpected(pooled.error());
 
         // 3) checkpoint 模式不驻留：显式清空（避免 size 相同静默用陈旧数据）
@@ -407,21 +434,25 @@ public:
                                                      channels_, P, batch, perm_cache_);
         if (!g_pooled) return std::unexpected(g_pooled.error());
 
-        // 2) 并列均分（无逐通道循环，全部为整张量原语 + DSL）
+        // 2) 并列均分（全部为整张量原语 + DSL，无逐通道循环）
         //    mx_exp = 组内广播(pooled)：gather_rows 把每个通道的 max 复制 kk 次
-        //    总梯度守恒（Σ share = 窗口梯度）；无并列时与 argmax 散射逐位一致。
+        //    总梯度守恒（Σ share = 窗口梯度）；无并列时（cnt=1）全部梯度落在该
+        //    唯一最大值位置。
         { auto r = ensure_expand_(engine); if (!r) return std::unexpected(r.error()); }
 
         auto mx_exp = engine.gather_rows(pooled_cache_, expand_cache_);   // (C*kk, P*B)
         if (!mx_exp) return std::unexpected(mx_exp.error());
 
         // 并列个数 cnt = 分组求和([x == 窗口 max]) → (C, P*B)
+        // （grouped_reduce_sum 视图，同 forward）
         auto eq = dsl::compute(engine,
             dsl::select(dsl::leaf(col_cache_) == dsl::leaf(*mx_exp),
                         Scalar{1}, Scalar{0}),
             channels_ * kk, P * batch);                                   // (C*kk, P*B)
         if (!eq) return std::unexpected(eq.error());
-        auto cnt = engine.grouped_reduce_sum(*eq, channels_, kk);
+        auto cnt = dsl::compute(engine,
+            dsl::grouped_reduce_sum(*eq, static_cast<std::uint32_t>(kk)),
+            channels_, P * batch);
         if (!cnt) return std::unexpected(cnt.error());
 
         // 每个并列元素分到的梯度 g/cnt → 再广播回窗口内
@@ -443,18 +474,5 @@ public:
                              pool_, stride_, 0, out_h_, out_w_);
     }
 };
-
-// ══════════════════════════════════════════════════════════════════════════
-// Softmax — 按行 softmax（用于注意力权重）
-//
-// 算法（只在此处，不在 Engine/Shader）：
-//   forward:  row_max[r] = max_c x[r][c]               (row_reduce_max)
-//             shifted[r][c] = x[r][c] - row_max[r]    (broadcast_row Sub)
-//             exp_shift[r][c] = exp(shifted[r][c])     (unary Exp)
-//             row_sum[r] = Σ_c exp_shift[r][c]         (row_reduce_sum)
-//             out[r][c] = exp_shift[r][c] / row_sum[r] (broadcast_row Div)
-//   backward: grad_x = out ⊙ (grad_out - row_dot(out ⊙ grad_out))
-//             row_dot[r] = Σ_c out[r][c] * grad_out[r][c]
-// ══════════════════════════════════════════════════════════════════════════
 } // namespace nn
 

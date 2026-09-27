@@ -283,7 +283,7 @@ class GPTModel(nn.Module):
                 num_valid = mask_flat.sum().clamp(min=1.0)
                 loss = masked_loss.sum() / num_valid
             else:
-                # 无 mask：对所有位置计算 loss（旧行为）
+                # 无 mask：对所有位置计算 loss（reduction="mean"，逐位置等权）
                 loss = F.cross_entropy(
                     logits.view(-1, self.vocab_size),
                     targets.view(-1),

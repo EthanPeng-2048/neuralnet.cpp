@@ -20,7 +20,7 @@
 
 ---
 
-## 1. 自适应并行策略（旧文档称「SmartPolicy」）
+## 1. 自适应并行策略
 
 ### 原理
 
@@ -62,14 +62,13 @@ inline void for_each(Iterator first, Iterator last, Func&& func)
 
 ## 2. 线程池 latch 零分配设计
 
-### 旧版问题
+### 设计目标
 
-每次 `submit` 需要：
-1. 构造 `shared_ptr<packaged_task>` → **堆分配**
-2. 获取 `future` → **同步开销**
-3. 加锁入队 → **互斥开销**
+并行分块不能按"每任务一次堆分配 + 一次加锁 + 一个 future 同步"的方式提交——
+N 个分块会带来 N 次堆分配、N 次互斥开销与 N 次 future 同步，在中等粒度任务上
+调度成本超过计算收益。
 
-### 新版优化
+### 当前实现
 
 - **一次加锁批量入队**：N 个分块仅 1 次 `lock_guard`
 - **原子计数器替代 future**：`std::atomic<int> latch` 替代 N 个 future
@@ -79,11 +78,10 @@ inline void for_each(Iterator first, Iterator last, Func&& func)
   2. Work-stealing：尝试从队列取任务执行
   3. `condition_variable` 短超时等待（100μs），避免 CPU 空转
 
-### 性能收益
+### 开销构成
 
 ```
-旧版：N 分块 = N 次堆分配 + N 次加锁 + N 个 future 同步
-新版：N 分块 = 1 次加锁 + 0 次堆分配 + 1 个原子计数器
+N 分块 = 1 次加锁 + 0 次堆分配 + 1 个原子计数器
 ```
 
 ---
@@ -123,7 +121,7 @@ for i_block in range(0, M, BLOCK_SIZE):
 
 ### Release 模式编译标志
 
-> **不使用 `-ffast-math`**：为保证 NaN/Inf 传播与训练数值稳定性，项目明确禁用 `-ffast-math`。实际 Release 标志（Clang/GCC，权威来源 `CMakeLists.txt:74/76`）为 `-O3 -fno-math-errno -fno-trapping-math -funroll-loops -march=native`，另加工程告警集 `-fno-exceptions -Wall -Wextra -Wpedantic -Werror`（注意 **`-funroll-loops` 是启用的**；MSVC 分支为 `/O2 /fp:precise`——早期为 `/fp:fast`，但其禁用 NaN 语义与本铁律冲突，实测 `precision_type_test` 的 NaN 断言在 `/fp:fast` 下被编译器折叠为假失败，故对齐为 precise）。
+> **不使用 `-ffast-math`**：为保证 NaN/Inf 传播与训练数值稳定性，项目明确禁用 `-ffast-math`。实际 Release 标志（Clang/GCC，权威来源 `CMakeLists.txt:77/79`）为 `-O3 -fno-math-errno -fno-trapping-math -funroll-loops -march=native`，另加工程告警集 `-fno-exceptions -Wall -Wextra -Wpedantic -Werror`（注意 **`-funroll-loops` 是启用的**；MSVC 分支为 `/O2 /fp:precise`——`/fp:fast` 会禁用 NaN 语义，实测 `precision_type_test` 的 NaN 断言在 `/fp:fast` 下被编译器折叠为假失败，与本铁律冲突，故 MSVC 固定用 precise）。
 
 ```cmake
 # CMakeLists.txt（Clang/GCC；NN_ENABLE_NATIVE=ON 时含 -march=native）
@@ -157,10 +155,10 @@ GPU 加速遵循引擎化架构铁律：
 
 ```cpp
 // GPU 引擎：begin_batch 开始录制，end_batch 统一提交
-engine.begin_batch();           // 开始录制
-engine.matmul(A, B);            // 不立即执行
-engine.elementwise_binary(...); // 不立即执行
-engine.end_batch();             // 一次性提交 + fence wait
+engine.begin_batch();                       // 开始录制
+auto mm = engine.matmul(A, B);              // 不立即执行
+auto tr = engine.transpose(*mm);            // 不立即执行
+engine.end_batch();                         // 一次性提交 + fence wait
 ```
 
 - CPU 引擎：`begin_batch/end_batch` 为 no-op（同步执行）
@@ -175,7 +173,7 @@ engine.end_batch();             // 一次性提交 + fence wait
 #### 5.3 算子融合
 
 - **表达式 DSL（当前主力）**：`dsl::compute` 把整条逐元素/归约/matmul 链折叠为**单个** GPU 融合 kernel（见 `04-innovative-designs.md` §3）
-- ~~`broadcast_row_inplace` / `broadcast_col_inplace`、`axpy_inplace`、`elementwise_select_scalar_cond`~~：**2026-09 已全部删除**——单算子级广播/融合被表达式级融合取代（`dsl::row_broadcast` / `dsl::col_broadcast` / `dsl::select` / `dsl::compute_into`）
+- **广播 / 条件选择 / axpy 类原地运算**：一律写进表达式（`dsl::row_broadcast` / `dsl::col_broadcast` / `dsl::select` / `dsl::compute_into`），随所在表达式融合成同一条 kernel，不单独 dispatch
 
 ---
 
@@ -215,14 +213,14 @@ auto diff = clone_tensor(engine, input);  // 深拷贝
 
 ```cpp
 // 一条 DSL 表达式 = 单个融合 kernel（optimizer 就是这么写的）
-dsl::compute_into(engine, leaf(dst) + leaf(src) * rparam(scalar), dst);
+dsl::compute_into(engine, dsl::leaf(dst) + dsl::leaf(src) * dsl::rparam(scalar), dst);
 ```
 
 ---
 
 ## 8. 多头注意力批量化
 
-### 旧版：per-head 循环
+### 朴素写法：per-head 循环（不批量化时的形态）
 
 ```cpp
 for (size_t h = 0; h < num_heads; ++h) {   // N 次循环
@@ -234,7 +232,7 @@ for (size_t h = 0; h < num_heads; ++h) {   // N 次循环
 output = concat(O_0, O_1, ..., O_{H-1});
 ```
 
-### 批量 dispatch（forward 现为 fold 单 kernel；本节结构存于 backward）
+### 当前做法：单 fold kernel（forward）+ 批量 dispatch（backward）
 
 ```
 rearrange_3d → (batch*H*d_k, seq)  // 头维度在行方向
@@ -242,27 +240,18 @@ batched_matmul → 单次 dispatch 处理所有样本和所有头
 rearrange_3d_back → (H*d_k, batch*seq)
 ```
 
-**性能提升**：将 H 次 matmul 融合为 1 次 `batched_matmul`。（P-C2-7 起 forward 进一步收敛为 `eval_expr(fold)` 单 dispatch——QKᵀ/掩码/softmax/ΣwV 全在 kernel 内；上述批量结构现用于 backward 的 `batched_matmul` 与 recompute 路径。）
+**性能提升**：将 H 次 matmul 融合为 1 次 `batched_matmul`；forward 进一步收敛为
+`eval_expr(fold)` 单 dispatch——QKᵀ/掩码/softmax/ΣwV 全在 kernel 内。上述批量结构
+现用于 backward 的 `batched_matmul` 与 recompute 路径。
 
 ---
 
-## 9. 因果掩码缓存【历史：已随 fold 迁移删除】
+## 9. 因果掩码：不物化、无缓存
 
-> **状态（P-C2-7，2026-09-23）**：掩码物化与缓存路径整体删除——现行单 fold kernel
-> 在 body 内以 select 链表达掩码（`tri_skip` 把被屏蔽块整块钳成空转），**掩码
-> 矩阵从不存在、无需缓存**。下文保留作历史设计记录；且示例中
-> `(batch << 16) | seq_len` 位打包键正是 `08-pitfalls-and-lessons.md` §3.3 记录的
-> 溢出缺陷写法——该缺陷随整段删除一并消失。
-
-### 问题（历史）
-
-GPT 训练中，每个 forward 都需要创建因果掩码矩阵 `(batch*H*seq, seq)`。
-
-### 优化（历史）
-
-曾以 `mask_cache_` + `ensure_mask(engine, batch, seq_len)` 按 `(batch, seq_len)` 键缓存掩码矩阵（完整代码见 git 历史 `compute_layer_attention.hpp`，已随 fold 迁移删除）。
-
-**收益（历史）**：相同 `(batch, seq_len)` 组合只构造一次掩码。
+当前因果掩码**不生成矩阵、也没有缓存路径**：单 fold kernel 在 body 内以 select 链
+表达掩码（`tri_skip` 把被屏蔽的整块钳成空转），掩码在每次前向于寄存器/shared 分片内
+即时判定。因此不存在"按 `(batch, seq_len)` 缓存掩码矩阵"这类状态——训练热路径中
+需要跨步复用的只有位置编码（§10）。
 
 ---
 
@@ -303,12 +292,12 @@ class PositionalEncoding {
 
 ## 12. 编译期零开销抽象
 
-### 表达式模板（DSL；旧代数 AST 已于 2026-09 移除）
+### 表达式模板（DSL）
 
 ```cpp
 // expr_dsl.hpp — 表达式写在 Layer 内；CPU 编译期模板求值 / GPU AOT 融合
 // 单次遍历、无临时矩阵（GPU 侧折叠成一条融合 kernel）
-auto y = dsl::compute(engine, dsl::max(dsl::leaf(*x), dsl::rparam(0)), rows, cols);
+auto y = dsl::compute(engine, dsl::max(dsl::leaf(*x), Scalar{0}), rows, cols);
 auto z = dsl::compute(engine, dsl::leaf(*a) + dsl::leaf(*b) * dsl::leaf(*c), rows, cols);
 ```
 
@@ -330,7 +319,7 @@ auto z = dsl::compute(engine, dsl::leaf(*a) + dsl::leaf(*b) * dsl::leaf(*c), row
 | Tensor 零拷贝 | Layer 间传递 | 消除数据拷贝 |
 | 融合 axpy | 优化器更新 | 减少 600 次 buffer 分配/step |
 | 注意力批量化 / fold 单遍 | MHA | H 次 → 1 次；forward 现为 fold 单 kernel 单 dispatch（S 绝不物化） |
-| 掩码/编码缓存 | GPT 训练 | 避免重复构造（掩码物化缓存已随 fold 删除，见 §9） |
+| 位置编码缓存 | GPT 训练 | 相同 `(batch,seq)` 只构造一次（掩码不物化、无需缓存，见 §9） |
 | 表达式模板 | 逐元素运算 | 消除临时矩阵 |
 | 分块转置 | 转置操作 | L1 友好 + 并行 |
-| GPU 注意力 fold 流式（2026-09-24） | GPU mha/causal | fwd 7.9→5.41ms（−31.5%）、causal −40%、train −13%（40HX 交错 bench） |
+| GPU 注意力 fold 流式 | GPU mha/causal | fwd 5.41ms（mha）/ 4.75ms（causal）、train 17.5ms（40HX 交错 bench 实测） |

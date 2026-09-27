@@ -8,10 +8,10 @@
 //   - elem<P>：P → 元素类型（f16 / float）
 //   - PrecisionProfile：模型级精度配置（param / compute / stable / optimizer）
 //
-// P 精度算术的形式化定义（docs/23 §7.2，本文最核心的语义锚）：
+// P 精度算术的形式化定义（docs/development/05-mixed-precision.md §7.2，本文最核心的语义锚）：
 //   对 P ≠ F32：P 精度算术 := 以 f32 参考精度计算 + 每个算子输出舍入到 P
 //                （round-half-to-even）；matmul / 归约类算子额外：累加精度 = max(P, f32) = f32
-//   对 P = F32：参考即自身，不舍入（= 现状行为）
+//   对 P = F32：参考即自身，不舍入
 //
 // 该定义使硬件路径与兼容路径**语义等价**（Q4）：硬件 f16 运算的输出本来就
 // 舍入到 f16；tensor core 点积用 f32 累加。差异仅在归约内累加顺序 →
@@ -32,7 +32,7 @@ namespace nn
 {
 
 // ══════════════════════════════════════════════════════════════════════════
-// Precision — 精度枚举（D11：F16 < F32 提升序；BF16 / F64 保留）
+// Precision — 精度枚举（F16 < F32 提升序；BF16 / F64 保留）
 // ══════════════════════════════════════════════════════════════════════════
 enum class Precision : std::uint8_t
 {
@@ -44,7 +44,7 @@ enum class Precision : std::uint8_t
 
 // ── 精度工具 ────────────────────────────────────────────────────────────────
 
-// 提升序 F16 < F32（D11）：Auto 推导 = max(操作数精度)（§8.1）
+// 提升序 F16 < F32：返回两者中更高的精度（§8.1 的精度序）
 [[nodiscard]] constexpr Precision max_precision(Precision a, Precision b) noexcept
 {
     return a > b ? a : b;
@@ -73,7 +73,7 @@ enum class Precision : std::uint8_t
     return "?";
 }
 
-// Phase 1 支持检查（D11）：BF16 / F64 → 清晰 Result 报错"精度未实现"
+// Phase 1 支持检查：BF16 / F64 → 清晰 Result 报错"精度未实现"
 // 用于一切"精度作为运行期输入"的入口（张量创建、cast、序列化 tag 回读…）
 [[nodiscard]] inline Result<void> check_precision_supported(Precision p)
 {
@@ -190,14 +190,13 @@ namespace detail
     {
         // 结果 < 2^-14：规格化前区或 0。
         // D = round(value * 2^24) = round((2^23 + M) * 2^(exp+1))
-        // 通用公式（shift = -exp-1）只对 exp ∈ [-25, -15]（shift 14..24）合法：
+        // 通用公式（shift = -exp-1）只对 exp ∈ [-25, -15]（shift 14..24，均 < 32、
+        //   uint32 移位安全）合法：
         //   exp = -25：shift = 24，2^-25（M=0）为 0 与 2^-24 的中点 → tie-to-even → 0；
         //              M>0（v > 2^-25）→ D ∈ (0.5, 1) → 1
-        //   exp ≤ -26：D < 0.5（无 tie 可能）→ 恒 0
-        // ⚠ 曾误写成 exp <= -46：exp ∈ [-45,-33] 时 shift ≥ 32 → uint32 移位 UB
-        //   （x86 按 5 位掩码 → d 取到满 24 位尾数 → 指数字段回绕成垃圾 half：
-        //   实测 f16 训练中 ~1e-12 量级的梯度被写成 512/8192/11776/18432 甚至
-        //   NaN → CPU f16 训练发散；前向激活 ~0.1 从不落入该区间故测不出）。
+        //   exp ≤ -26：D < 0.5（无 tie 可能）→ 恒 0（守卫先行 flush，不做移位——
+        //   对这些指数 shift = -exp-1 ≥ 25 已越过公式合法区间，exp ≤ -33 时
+        //   shift ≥ 32 即 uint32 移位 UB）
         if (exp <= -26)
         {
             return static_cast<std::uint16_t>(sign);
@@ -407,22 +406,22 @@ template <Precision P>
 using elem = typename Elem<P>::type;
 
 // 累加类型（§7.2：matmul / 归约累加 = max(P, f32)）：
-// F32 → float（现状）；F16 → float（f32 累加）
+// F32 → float；F16 → float（f32 累加）
 template <Precision P>
 using acc = float;
 
 // ══════════════════════════════════════════════════════════════════════════
-// PrecisionProfile — 模型级精度配置（§9.1，D10：默认全 F32 = 现状，零回归）
+// PrecisionProfile — 模型级精度配置（§9.1，默认全 F32）
 //
-// 参数映射（D8）：
+// 参数映射：
 //   param     — 权重 / 嵌入表 / 参数存储精度（工厂创建 / 上传时指定）
 //   compute   — 常规算子的显式 P（matmul / 逐元素 / gather / scan / 数据操作…）
 //   stable    — 数值敏感算子的显式 P（softmax / LayerNorm / RMSNorm / loss，
-//               含 loss backward 输出，D9；f16 溢出风险防线）
+//               含 loss backward 输出；f16 溢出风险防线）
 //   optimizer — 优化器状态（m / v / momentum）创建精度（f16 训练下必须 f32）
 //
-// 激活 / 梯度**不设独立参数**：按 Q3-A，算子输出存储精度 = 该算子的 P，
-// 已被 compute / stable 完全决定（D8）。
+// 激活 / 梯度**不设独立参数**：算子输出存储精度 = 该算子的 P，
+// 已被 compute / stable 完全决定。
 // ══════════════════════════════════════════════════════════════════════════
 struct PrecisionProfile
 {
@@ -435,7 +434,7 @@ struct PrecisionProfile
 // 典型配方（§9.4）
 inline constexpr PrecisionProfile profile_f32() noexcept
 {
-    return PrecisionProfile{};  // 全 F32 = 现状
+    return PrecisionProfile{};  // 全 F32
 }
 
 // master-weights（经典混合精度）：
@@ -474,8 +473,10 @@ inline constexpr PrecisionProfile profile_f16() noexcept
 }
 
 // 全 f16：四个字段全部 F16（激进实验配方；见上：当前数值上不可用于训练）。
-// 注意：与 profile_master_weights（f32 主权重混合）区分——后者是旧的
-// `--f16` 语义，曾造成"传了 --f16 却是混合精度"的误解。
+// 注意与其它两种 f16 相关 profile 区分——CLI `--f16` = profile_f16()
+// （param:F16, compute:F16, stable:F32, optimizer:F32），profile_master_weights()
+// （f32 主权重混合 = param:F32, compute:F16, stable:F32, optimizer:F32），
+// 两者均与本配方（四字段全 F16）不同。
 inline constexpr PrecisionProfile profile_all_f16() noexcept
 {
     return PrecisionProfile{
@@ -485,8 +486,9 @@ inline constexpr PrecisionProfile profile_all_f16() noexcept
         /*optimizer=*/ Precision::F16};
 }
 
-// 便捷判定：全 F32 配置（= 迁移前行为）。CLI 用它决定是否启用
-// PrecisionEngine 适配层（全 f32 时直通原生引擎，零开销零回归）。
+// 便捷判定：全 F32 配置。CLI 用它决定是否启用
+// PrecisionEngine 适配层（全 f32 时直通原生引擎，零额外开销，结果与直接
+// 使用原生引擎逐字节一致）。
 [[nodiscard]] constexpr bool is_profile_f32(const PrecisionProfile& p) noexcept
 {
     return p.param == Precision::F32 && p.compute == Precision::F32 &&

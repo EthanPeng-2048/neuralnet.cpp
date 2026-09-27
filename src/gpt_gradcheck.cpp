@@ -1,9 +1,9 @@
 // ── GPTModel 整链数值梯度检查（gradcheck） ────────────────────────────────
 //
 // 目的：验证 GPTModel 完整 forward/backward 链路的梯度正确性。
-//       单层 gradcheck（rmsnorm/swiglu）已验证层内数学，但多层堆叠 +
-//       learned 位置编码 + token_emb scatter 的整链路径从未验证。
-//       用户现象：浅层 GPT 正常、深层 GPT loss 卡平台 → 疑似链路级 bug。
+//       单层 gradcheck（rmsnorm/swiglu）只覆盖层内数学；多层堆叠 +
+//       learned 位置编码 + token_emb scatter 的整链路径由本测试专门验证
+//       （链路级错误只有整链梯度对拍才抓得住）。
 //
 // 原理：
 //   L(θ) = Σ_ij logits_ij * go_ij   （go 为固定"输出权重"）

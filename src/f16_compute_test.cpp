@@ -1,5 +1,5 @@
 // ── f16_compute_test.cpp — D6：f16 计算验证（CPU matmul + cast 往返）───────
-// 验收标准（docs/23 §13）：
+// 验收标准（docs/development/05-mixed-precision.md §13）：
 //   1. f16 matmul 结果与 f32 参考在容差内一致（§7.2：f32 累加 + f16 舍入）
 //   2. cast 往返：f32 → f16 → f32 的精度损失在 f16 ulp 内
 //   3. f16 线性模型训练：3 步后 loss 下降（端到端正确性）

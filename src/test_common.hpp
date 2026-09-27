@@ -2,21 +2,20 @@
 //
 // 背景：本仓测试用「#define main test_xxx + #include 子测试.cpp」的聚合编译
 // 模式（见 expr_cpu_test.cpp / precision_test.cpp / layer_gradcheck_test.cpp）。
-// 历史上每个子测试都自带一份 CHECK / make_tensor / check_close / approx /
-// dot / close_to，聚合器被迫用一长串 #define 逐符号重命名来规避 ODR 冲突
-// （漏一个就是重定义或静默绑错）。本头把**同构可复用**的部分收敛为一份；
-// 聚合器只需重命名 main、失败计数器与各测试独有的函数名。
+// CHECK / make_tensor / check_close / approx / dot / close_to 收敛于本头
+// （唯一副本），子测试通过 `#define` 重命名计数器接入聚合器；聚合器只需
+// 重命名 main、失败计数器与各测试独有的函数名（避免 ODR 冲突）。
 //
 // 约定：
-//   1. 失败计数器仍由各子测试自带（`int g_fail = 0;` 或 `int g_failures = 0;`），
-//      聚合器照旧 `#define g_fail g_fail_xxx` 重命名——计数器是"文件私有"的，
+//   1. 失败计数器由各子测试自带（`int g_fail = 0;` 或 `int g_failures = 0;`），
+//      聚合器用 `#define g_fail g_fail_xxx` 重命名——计数器是"文件私有"的，
 //      这样每个子测试的 main 返回值只统计自己的失败（聚合器 += 各自返回值）。
 //   2. CHECK 经 NN_TEST_COUNTER 间接引用计数器（默认 g_fail）；计数器叫
 //      g_failures 的文件在 include 前加一行 `#define NN_TEST_COUNTER g_failures`。
 //      （宏体在**使用点**展开，聚合器对 g_fail/g_failures 的重命名照样生效。）
 //   3. 本头的函数均为 inline 单份定义；子测试**不得**再定义同名函数。
 //
-// 刻意不收编（2026-09 审查）：
+// 刻意不收编：
 //   · max_abs_diff —— 9 份副本语义有分叉（conv2d 版多形状守卫返回 1e9，
 //     其余无守卫），统一前需逐点确认语义，另案处理；
 //   · check_grad_tensor / eval_loss —— 按被测层类型特化，本就不可共享。
