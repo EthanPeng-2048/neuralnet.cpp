@@ -29,7 +29,7 @@
 #undef g_failures
 #undef main
 
-// ── precision_profile_test (PrecisionProfile 配方语义：--f16 = 全 f16) ─────
+// ── precision_profile_test (PrecisionProfile 配方语义：--f16 = param/compute f16) ─
 #define main test_precision_profile
 #define g_failures g_fail_precision_profile
 #include "precision_profile_test.cpp"
@@ -49,7 +49,7 @@ int main()
     std::puts("=== f16_compute (f16 matmul + cast + training) ===");
     failures += test_f16_compute();
 
-    std::puts("=== precision_profile (--f16 = 全 f16 语义) ===");
+    std::puts("=== precision_profile (--f16 = param/compute f16) ===");
     failures += test_precision_profile();
 
     std::printf("\nprecision_test: %d failure(s)\n", failures);

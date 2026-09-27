@@ -38,15 +38,15 @@ namespace nn
     //    - L2+ 计算层使用 Result<T> 进行运行时错误处理（用户输入校验）
     //    - 原因：Matrix 是底层原语，assert 不影响 Release 性能；
     //            上层需要向用户报告错误，故使用 Result<T>
-    //    - 参见 DEVELOPMENT_STANDARDS.md "分层职责单一" 章节
+    //    - 参见 docs/development/10-development-standards.md "分层职责单一" 章节
     // ═══════════════════════════════════════════════════════════════════════
-    // ── MatrixT<P> — 类型化矩阵存储（docs/23 D2：存储精度是 P）─────────────
-    // element = elem<P>（f16 / f32）；F32 实例与旧 Matrix 逐字节一致（T1 零回归）。
+    // ── MatrixT<P> — 类型化矩阵存储（docs/development/05-mixed-precision.md D2：存储精度是 P）──
+    // element = elem<P>（f16 / f32）；F32 实例即按 float 连续存储的普通矩阵。
     // F16 实例遵循 §7.2 形式化定义：
     //   matmul / 归约：f16 载入 / f32 累加 / f16 写出（acc_type = f32）
     //   逐元素：f32 参考计算 + 每算子输出舍入到 f16（f16 运算符语义）
     // 注意：C++ 不允许模板与同名的 using 别名共存，故模板名为 MatrixT，
-    //       f32 便捷别名保持 Matrix 不变（所有既有代码零改动）。
+    //       f32 便捷别名保持 Matrix。
     template <Precision P>
     class MatrixT
     {
@@ -274,18 +274,17 @@ namespace nn
         }
 
         // ── GEMM 微内核：NI 行 × RB 列寄存器分块 ───────────────────────────
-        // 为何这样写（实测依据）：
-        //   旧内核每个 (i,j) 用一个标量累加器、每次 FMA 要 2 次 load（受 load port
-        //   限制），且编译日志显示内层循环**未被向量化**（-Wpass-failed=transform-
-        //   warning）。本微内核一次处理 4 行 × 8 列（一个 AVX2 向量宽度的列块）：
+        // 为何这样写（实测依据）：若每个 (i,j) 只用一个标量累加器，每次 FMA 要
+        //   2 次 load（受 load port 限制），且内层循环难以向量化。本微内核一次
+        //   处理 4 行 × 8 列（一个 AVX2 向量宽度的列块）：
         //     · B 以 k-major 打包（b_pack[kk * j_len + j]）→ 固定 kk 时 j 连续，
         //       j 方向是一次连续向量 load；
         //     · 每个 k 只从 A 广播 4 个标量、做 4 次向量 FMA → FMA/load 比大幅改善；
         //     · k 维走**编译期常量** BLOCK_SIZE → 循环可完整向量化/展开。
         //   实测 GFLOPS（3072x768x512 / 768x3072x512 / 1024^3 / 512^3）：
-        //   140→401 / 155→407 / 163→354 / 82→281。
-        //   累加分组不变（块内 kk 升序、块间 k_start 升序）→ 与旧内核**逐位一致**
-        //   （对拍 max_abs_diff = 0）。
+        //   401 / 407 / 354 / 281。
+        //   累加分组固定（块内 kk 升序、块间 k_start 升序）→ 求和顺序确定，
+        //   结果可复现。
         static constexpr std::size_t MK_NI = 4;   // 微内核行数
         static constexpr std::size_t MK_RB = 8;   // 微内核列数
 
@@ -401,7 +400,7 @@ namespace nn
                             }
                             else
                             {
-                                // 尾块：kk 放在**最内层** → 归约可向量化（与旧内核同构）。
+                                // 尾块：kk 放在**最内层** → 归约可向量化。
                                 // 对 N 很小（典型是 Linear 的 batch=1，N=1）这是关键路径：
                                 // 若把 kk 放外层，jj 只有 1 次迭代，归约无法向量化 → 慢 2x。
                                 for (std::size_t ii = 0; ii < ni; ++ii)
@@ -740,10 +739,9 @@ namespace nn
                 out[r] = static_cast<element>(acc);
             };
 
-            // 并行门控按**元素数**（R*C），与 broadcast_* 一致。
-            // 旧实现用 nn::for_each(row_indices)：它把"行数"当元素数与
-            // PARALLEL_THRESHOLD 比较 → 行数永远达不到 512K → **恒定串行**
-            // （见 docs/development/11 §R3）。改为按行分片。
+            // 并行门控按**元素数**（R*C），与 broadcast_* 一致：行数本身远低于
+            // PARALLEL_THRESHOLD（512K），按行数比较会让本原语**恒定串行**，
+            // 故必须按 R*C 分片触发。
             // 每行独立累加、行内顺序不变 → 并行与串行逐字节一致（铁律 8）。
             if (rows_ * cols_ >= PARALLEL_THRESHOLD && rows_ > 1)
                 nn::parallel_for_samples(rows_, process_row);
@@ -759,9 +757,8 @@ namespace nn
         // 上层可基于此表达 LayerNorm 列均值/列方差等算法。
         //
         // 实现策略：cache-friendly blocked + 行块并行。
-        // bench_thresholds 实测：blocked 全面优于 naive（按列跨行扫描），
-        // 行块并行仅在 R >= 256 且 R*C >= PARALLEL_THRESHOLD 时启用，
-        // 详见 bench_thresholds.cpp 测试 2/3。
+        // 实测：blocked 全面优于 naive（按列跨行扫描），
+        // 行块并行仅在 R >= 256 且 R*C >= PARALLEL_THRESHOLD 时启用。
         template <typename T, typename ReduceOp, typename TransformOp>
         [[nodiscard]] MatrixT col_reduce(T init, ReduceOp&& reduce_op, TransformOp&& transform_op) const
         {
@@ -787,7 +784,7 @@ namespace nn
             }
 
             // 行块并行启用条件：R >= COL_REDUCE_PARALLEL_ROWS 且 R*C >= PARALLEL_THRESHOLD。
-            // 门槛由 1024 降至 256：R*C >= 512K 时即使 R=256 每线程也有 >=16K 元素
+            // 行数门槛取 256：R*C >= 512K 时即使 R=256 每线程也有 >=16K 元素
             // 的工作量（32 线程假设），同步开销不占主导；256 覆盖常见 d_model=768 场景。
             constexpr std::size_t COL_REDUCE_PARALLEL_ROWS = 256;      // 行数门槛
             const std::size_t hw_threads = std::thread::hardware_concurrency();

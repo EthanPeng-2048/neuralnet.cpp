@@ -12,7 +12,7 @@
 //      expr_spec_key(spec) ≡ expr_spec_key(canonicalize_expr_spec(spec))
 //  （scan 构建期与 runtime 运行期都必须先 canonicalize 再算 key，两端一致。）
 //
-//  关键不变量（架构红线内，参考 09/11 文档）：
+//  关键不变量（架构红线，详见 `docs/development/03-ir-optimization.md`）：
 //    1. **不改变 views/inputs**（顺序、内容）——只优化 instrs/consts/num_regs。
 //       运行时 dispatch 的输入绑定顺序不变（融合 shader binding 布局不变），
 //       gpu_inputs 按原 inputs 传递即可。
@@ -216,7 +216,7 @@ namespace nn
         const bool is_output = (idx + 1 == spec.instrs.size());
 
         // 只重映射实际使用的操作数（未使用的 b/c 是默认哨兵 {0,0}，
-        // 不得当 Reg(0) 重编号——记忆库 operator-fusion M1 坑 5）
+        // 不得当 Reg(0) 重编号——见 docs/development/03-ir-optimization.md 关键坑 ②）
         const std::size_t nops = expr_instr_num_operands(op);
         const ExprOperand a = remap_op(ins.a);
         const ExprOperand b = (nops >= 2) ? remap_op(ins.b) : ins.b;
@@ -599,12 +599,12 @@ namespace nn
 // ═══════════════════════════════════════════════════════════════════════════
 [[nodiscard]] inline ExprSpec canonicalize_expr_spec(const ExprSpec& spec)
 {
-    // fold 段（P-C1）：整段不参与 IR-A/B——所有 pass 只作用于顶层 instrs
+    // fold 段：整段不参与 IR-A/B——所有 pass 只作用于顶层 instrs
     // （fold spec 顶层恒空），且它们构造 out 时逐字段拷贝、不认识 fold 字段
-    // （静默丢段 → registry key 撞车 + gen_fused 收到空 instrs spec 崩溃，
-    //   实测 0xC00000FD）。原样返回同时保证 scan / runtime / key 三端一致
+    // （放行即静默丢段 → registry key 撞车 + gen_fused 收到空 instrs spec
+    //   栈溢出崩溃 0xC00000FD）。原样返回同时保证 scan / runtime / key 三端一致
     // （canonical 不变式：expr_spec_key(spec) ≡ expr_spec_key(canonical(spec))，
-    //   对 fold spec 退化为恒等——P-C2 若要在 body 上跑 DCE/CSE，须先给
+    //   对 fold spec 退化为恒等——双域 fold 若要在 body 上跑 DCE/CSE，须先给
     //   各 pass 补 fold 字段透传再放开，勿直接删本行）。
     if (spec.fold)
         return spec;

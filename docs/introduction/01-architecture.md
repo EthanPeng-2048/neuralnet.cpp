@@ -50,7 +50,7 @@
 **目标**：理解如何组合层
 - **文件**：`model_container.hpp`
 - **关键概念**：链式构建、参数管理
-- **验证**：能解释 `model.add_linear(784,256)` 的作用
+- **验证**：能解释 `model.add<nn::Linear>(784,256)` 的作用
 
 ### 第五步：理解训练流程（2-3 天）
 **目标**：理解端到端训练
@@ -173,7 +173,7 @@ graph TB
 
 ```
 Layer 的 forward/backward 只写一次，通过 ComputeEngine 参数自动适配 CPU/GPU。
-不再有 forward_gpu / backward_gpu。
+每个 Layer 只有一份与后端无关的 forward/backward 实现。
 ```
 
 ```cpp
@@ -250,10 +250,9 @@ class Tensor {
 
 | 文件 | 职责 |
 |------|------|
-| `algebra_matrix.hpp` | `Matrix` 类：行主序存储 `(rows, cols)`，矩阵乘法（缓存分块 + 自适应并行 并行），加法、转置、归约 |
+| `algebra_matrix.hpp` | `Matrix` 类：行主序存储 `(rows, cols)`，矩阵乘法（缓存分块 + 自适应并行），加法、转置、归约 |
 | `algebra_span.hpp` | `Span` / `ConstSpan`：矩阵数据的安全视图，同时作为 DSL 叶子的数据载体 |
 | `algebra_ops.hpp` | 逐元素算子定义（`ops::Add/Exp/Max/...` + `op_id()` → `ExprOp`），**表达式 DSL 的唯一算子来源** |
-| ~~`algebra_expr.hpp`~~ / ~~`algebra_compute.hpp`~~ | 🗑️ **2026-09 已移除**：旧代数 AST 与 `compute::apply`；`Expression`/`BoolExpression` 概念迁入 `expr_dsl.hpp` |
 
 ### L2 计算层（引擎化）
 
@@ -270,17 +269,16 @@ class Tensor {
 | 内存 | `release_idle_pool_blocks`, `pool_stats` |
 | offload | `create_offload_buffer`, `offload_save/restore`（activation offload） |
 
-> **2026-09 收敛**：`axpy_inplace`、`broadcast_row_inplace/col_inplace`、`elementwise_unary/binary/binary_scalar`、
-> `elementwise_select_scalar_cond`、引擎 `row_reduce_max`、`offload_store/load` 与 `UnaryOp/BinaryOp/CompareOp`
-> 枚举**已全部删除**（逐元素/广播/条件选择一律走表达式 DSL），**引擎 virtual 58 → 49**；
-> 逐项清单见 `development/12-compute-engine-inventory.md` 顶部收敛横幅。
+> 引擎共 **49 个 virtual** 接口；逐元素/广播/条件选择不设 eager 原语，一律经表达式 DSL
+>（`dsl::compute` / `compute_into` / `compute_reduce`）执行。接口全量清单见
+> `development/12-compute-engine-inventory.md`。
 
 **表达式统一入口：**
 
 | 文件 | 职责 |
 |------|------|
 | `expr_spec.hpp` | `ExprSpec` 逐元素表达式扁平 IR（纯数据结构，跨后端可序列化，GPU AOT 契约）+ 可选 `fold` 段（`FoldSpec` 分块状态归约——通用折叠表达式机制，含 `tri_skip`、`EXPR_FOLD_BLOCK/ROWS_PER_WG` 共享常量）+ `expr_spec_key`（规范结构 key，AOT 收集/匹配依据） |
-| `expr_dsl.hpp` | 统一表达式 DSL（`nn::dsl`）：编译期模板，普通数学写法；`compute` / `compute_reduce` / `compute_into`（原地目标传递）。CPU 直接求值（内联+SIMD）；GPU 经 `to_expr_spec` 折叠出 `ExprSpec` → 按 `expr_spec_key` 匹配预编译融合 shader。（`start_expr/end_expr` 块式融合已于 2026-09-19 随 IR-C 移除） |
+| `expr_dsl.hpp` | 统一表达式 DSL（`nn::dsl`）：编译期模板，普通数学写法；`compute` / `compute_reduce` / `compute_into`（原地目标传递）。CPU 直接求值（内联+SIMD）；GPU 经 `to_expr_spec` 折叠出 `ExprSpec` → 按 `expr_spec_key` 匹配预编译融合 shader。 |
 | `expr_registry.hpp` | 构建期表达式注册表（`scan_exprs` 收集折叠出的结构，按 key 去重；二进制 dump/load 供 `gen_fused` 消费） |
 | `fused_registry.hpp` | **生成物**（构建期 `gen_fused` 产出）：`key → {ExprSpec 结构, 内联 SPIR-V}` 融合 shader 注册表；运行时按 key 精确匹配 |
 | `tools/scan_exprs.cpp` | 构建期工具：dry-run 跑 Layer 的 forward/backward，收集内联表达式的结构（派生物）→ `expr_specs.bin` |
@@ -294,9 +292,9 @@ class Tensor {
 
 | 文件 | 职责 |
 |------|------|
-| `model_container.hpp` | `Model` 容器：持有 `vector<unique_ptr<Layer>>` + `ComputeEngine*`，链式构建，`forward`/`backward` 委托 |
+| `model_container.hpp` | `Model` 容器：持有 `vector<unique_ptr<Layer>>` + `ComputeEngine*`，`add<T>(...)` 逐层构建（返回 `Result<void>`），`forward`/`backward` 委托 |
 | `model_spec.hpp` | `ModelSpec` 纯数据结构：`ModelType` 枚举 + MLP/Transformer/GPT 参数 |
-| `model_serialization.hpp` | 二进制序列化 v4 自描述格式（KeyValueRecord 规格头），`save_model` / `load_model` / `peek_model_spec` |
+| `model_serialization.hpp` | 二进制序列化自描述格式（KeyValueRecord 规格头；写入 v5 = 每张量精度标签，读取 v4+），`save_model` / `load_model` / `peek_model_spec` |
 
 ### L4 领域构建层
 
@@ -345,7 +343,7 @@ sequenceDiagram
     U->>O: create optimizer(engine, params)
 
     loop Each Training Step
-        U->>M: zero_grad(engine)
+        U->>M: zero_grad()
         U->>E: from_matrix(batch) → Tensor
         M->>L: forward(engine, Tensor) → Tensor
         L-->>M: output Tensor
@@ -353,13 +351,13 @@ sequenceDiagram
 
         U->>F: forward(engine, logits, target) → Scalar
         U->>F: backward() → grad Tensor
-        U->>M: backward(engine, grad) → grad (discard)
+        U->>M: backward(grad) → grad (discard)
 
         U->>O: step()
-        O->>E: scale_inplace / add_inplace / ...
+        O->>E: dsl::compute_into / dsl::compute / ...
     end
 
-    U->>M: forward(engine, test_input) → Tensor
+    U->>M: forward(test_input) → Tensor
     U->>E: to_matrix(Tensor) → Matrix
     U->>U: argmax → predict
 ```
@@ -390,7 +388,8 @@ cmake --build build --parallel
 | `text_infer` | GPT 文本推理 |
 | `tokenizer_train` | BPE 分词器训练 |
 | `tokenizer_infer` | BPE 分词器推理 |
-| `gpu_test` | GPU 后端测试 |
+| `layer_bench` | 算子 / Layer 性能基准 |
+| `gpu_test` | GPU 后端集成测试（需 `-DNN_ENABLE_TESTS=ON`） |
 
 ---
 
@@ -399,24 +398,9 @@ cmake --build build --parallel
 ```
 nn.hpp（统一入口）
 ├── L0: core_errors → config → core_threadpool
-├── L1: algebra_matrix → algebra_span / algebra_ops（旧 algebra_expr / algebra_compute 已于 2026-09 移除）
+├── L1: algebra_matrix → algebra_span / algebra_ops
 ├── L2: tensor → compute_engine → cpu_engine [→ gpu_engine]
 │       → compute_layer → compute_loss → compute_optimizer
 ├── L3: model_container → model_spec → model_serialization
 └── L4: domain_mnist → domain_gpt → domain_tokenizer
 ```
-
----
-
-## 备注：CUDA 后端已移除
-
-**CUDA 后端已整体移除**：`cuda/` 目录（`cuda_kernels.cu` / `.h` / `CMakeLists.txt`）、
-`compute_cuda_engine.hpp`、`backend/compute_cuda_backend.hpp`，以及全库 `NN_HAS_CUDA`
-条件分支（`compute_tensor.hpp` 6 处、`nn.hpp`、`cli/cli_engine_factory.hpp`、
-`cli/cli_train_common.hpp`、`CMakeLists.txt`）均已删除。
-
-移除原因：融合原语（M4/M5/M6）与 DSL 表达式在 CUDA 上未实现且无真实回退，导致 CUDA 上
-GPT/MNIST 训练推理均无法运行，属"文档声称支持但实际损坏"的死代码（且含隐藏编译错误）。
-
-引擎只支持 CPU（`CpuEngine`）与 Vulkan GPU（`GpuEngine`）两个后端。CLI 不再接受
-`--cuda`（传入会报"未知参数"）。带 CUDA 的历史快照保存在 git 分支 `legacy/cuda`。

@@ -15,12 +15,12 @@ Model          — 层容器，管理 Layer 的 forward/backward 链
 **关系：**
 
 ```cpp
-Model model(engine);             // Model 绑定一个 Engine
-model.add_linear(784, 128);     // 添加 Layer（内部持有 engine 引用）
-model.add_relu();
-model.add_linear(128, 10);
+nn::Model model(engine);              // Model 绑定一个 Engine
+model.add<nn::Linear>(784, 128);      // 添加 Layer（add<T>(args...) 返回 Result<void>，
+model.add<nn::ReLU>();                //   构造后自动 init(engine)）
+model.add<nn::Linear>(128, 10);
 
-auto result = model.forward(input);  // engine 在 Model 内部自动传递
+auto result = model.forward(input);   // engine 在 Model 内部自动传递
 ```
 
 ---
@@ -41,17 +41,20 @@ nn::CpuEngine engine;
 
 ## 第二步：构建 Model
 
-### 方式一：链式构建（推荐，适合 MLP）
+### 方式一：模板 add（推荐，适合 MLP）
 
 ```cpp
 nn::Model model(engine);
 
-model.add_linear(784, 256)     // 输入层: 784 → 256
-     .add_relu()                // 激活函数
-     .add_linear(256, 128)     // 隐藏层: 256 → 128
-     .add_relu()
-     .add_linear(128, 10);     // 输出层: 128 → 10
+model.add<nn::Linear>(784, 256);   // 输入层: 784 → 256
+model.add<nn::ReLU>();             // 激活函数
+model.add<nn::Linear>(256, 128);   // 隐藏层: 256 → 128
+model.add<nn::ReLU>();
+model.add<nn::Linear>(128, 10);    // 输出层: 128 → 10
 ```
+
+> `add<LayerType>(args...)` 返回 `Result<void>`（层构造后自动调用 `Layer::init(engine)`，
+> 失败经 Result 上抛）；它不返回 `*this`，**不能点链调用**——逐行添加、需要时逐个检查错误。
 
 ### 方式二：使用工厂函数（MNIST/GPT 预设）
 
@@ -77,12 +80,10 @@ auto model_result = nn::build_gpt_model(
 nn::Model model = std::move(*model_result);
 ```
 
-### 方式三：模板 add（自定义层）
+### 方式三：添加其他内置层
 
 ```cpp
 nn::Model model(engine);
-model.add<nn::Linear>(784, 256);        // 等价于 add_linear
-model.add<nn::ReLU>();                  // 等价于 add_relu
 model.add<nn::GeLU>();                  // QuickGeLU 激活
 model.add<nn::LayerNorm>(256);          // 层归一化
 model.add<nn::Softmax>();               // Softmax
@@ -101,23 +102,23 @@ model.add<nn::GPTBlock>(128, 4, 512, 1024);        // GPT 块
 
 ```cpp
 // 创建 CPU 张量
-nn::Tensor t = nn::Tensor::cpu(784, 32);  // 784×32，零初始化
+nn::Tensor t1 = nn::Tensor::cpu(784, 32);  // 784×32，零初始化
 
 // 从 Matrix 创建（共享所有权）
 nn::Matrix m(784, 32);
-nn::Tensor t = nn::Tensor::from_matrix(std::move(m));
+nn::Tensor t2 = nn::Tensor::from_matrix(std::move(m));
 
 // 通过 Engine 创建（自动分配到目标设备）
-nn::Tensor t = engine.create_tensor(784, 32);
-engine.zero(t);  // 清零
+nn::Tensor t3 = engine.create_tensor(784, 32);
+(void)engine.zero(t3);  // 清零
 
-// 转换为 Matrix（仅 CPU 张量）
-auto m_result = engine.to_matrix(t);
-nn::Matrix m = std::move(*m_result);
+// 转换为 Matrix（GPU 张量会先等待在飞命令完成，再下载回 CPU）
+auto m_result = engine.to_matrix(t3);
+nn::Matrix m2 = std::move(*m_result);
 
 // 从 Matrix 上传到 Engine
-auto t_result = engine.from_matrix(m);
-nn::Tensor t = std::move(*t_result);
+auto t_result = engine.from_matrix(m2);
+nn::Tensor t4 = std::move(*t_result);
 ```
 
 **张量布局（重要！）：**
@@ -144,9 +145,9 @@ int main() {
 
     // 1. 构建模型
     nn::Model model(engine);
-    model.add_linear(784, 256)
-         .add_relu()
-         .add_linear(256, 10);
+    model.add<nn::Linear>(784, 256);
+    model.add<nn::ReLU>();
+    model.add<nn::Linear>(256, 10);
 
     // 2. 准备输入 (784 像素, 32 样本)
     nn::Tensor input = nn::Tensor::cpu(784, 32);
@@ -186,25 +187,36 @@ private:
     nn::Tensor weight_;
     nn::Tensor grad_weight_;
     nn::Tensor input_cache_;
+    std::size_t in_dim_;
+    std::size_t out_dim_;
 
 public:
-    MyLayer(nn::ComputeEngine& engine, std::size_t in_dim, std::size_t out_dim)
+    // 构造函数只存形状（Model::add 构造后会自动调用 init(engine)）
+    MyLayer(std::size_t in_dim, std::size_t out_dim)
+        : in_dim_(in_dim), out_dim_(out_dim) {}
+
+    // 权重初始化：在 CPU 上填好，再经 engine 上传到目标设备
+    [[nodiscard]] nn::Result<void> init(nn::ComputeEngine& engine) override
     {
-        // 在 CPU 初始化权重，通过 engine 上传
-        nn::Matrix w_cpu = nn::Matrix::random(out_dim, in_dim);  // 假设有此方法
+        nn::Matrix w_cpu(out_dim_, in_dim_);   // 行主序 (out, in)
+        // ... 填充初始化值（如 Xavier 均匀分布）...
+
         auto w = engine.from_matrix(w_cpu);
+        if (!w) return std::unexpected(w.error());
         weight_ = std::move(*w);
 
-        grad_weight_ = engine.create_tensor(out_dim, in_dim);
-        engine.zero(grad_weight_);
+        grad_weight_ = engine.create_tensor(out_dim_, in_dim_);
+        auto z = engine.zero(grad_weight_);
+        if (!z) return std::unexpected(z.error());
+        return {};
     }
 
-    // 参数访问（供 Optimizer 使用）
-    std::vector<nn::Tensor*> parameters() override {
-        return {&weight_};
+    // 参数访问（供 Optimizer 使用）：TensorRef = reference_wrapper<Tensor>
+    std::vector<nn::TensorRef> parameters() override {
+        return {weight_};
     }
-    std::vector<nn::Tensor*> param_gradients() override {
-        return {&grad_weight_};
+    std::vector<nn::TensorRef> param_gradients() override {
+        return {grad_weight_};
     }
 
     // 前向传播
@@ -221,11 +233,13 @@ public:
         nn::ComputeEngine& engine, const nn::Tensor& grad_output) override
     {
         // grad_input = weight^T × grad_output
-        auto grad_input = engine.matmul(weight_, grad_output, true, false);
+        auto grad_input = engine.matmul(weight_, grad_output, /*transA=*/true);
 
         // grad_weight += grad_output × input^T
-        auto gw = engine.matmul(grad_output, input_cache_, false, true);
+        auto gw = engine.matmul(grad_output, input_cache_, /*transA=*/false, /*transB=*/true);
+        if (!gw) return std::unexpected(gw.error());
         auto r = engine.add_inplace(grad_weight_, *gw);
+        if (!r) return std::unexpected(r.error());
 
         return grad_input;
     }
@@ -259,25 +273,25 @@ nn::Tensor input = nn::Tensor::cpu(784, 32);
 
 ```cpp
 // ❌ 错误：Model 未绑定 Engine
-nn::Model model;
-model.add_linear(784, 10);  // 崩溃：engine_ == nullptr
+nn::Model model;                    // 默认构造
+model.add<nn::Linear>(784, 10);     // NN_ASSERT(engine_, "Model: engine not bound") 断言失败
 
 // ✅ 正确
 nn::CpuEngine engine;
 nn::Model model(engine);
-model.add_linear(784, 10);
+model.add<nn::Linear>(784, 10);
 ```
 
-### 3. 跨设备操作
+### 3. 跨设备操作绕过 Engine
 
 ```cpp
-// ❌ 错误：GPU 张量调用 to_matrix
-nn::GpuEngine engine;
+// ❌ 错误：直接取 GPU 张量的 CPU 存储
+nn::GpuEngine engine;                       // 需 NN_HAS_VULKAN
 nn::Tensor t = engine.create_tensor(10, 10);
-auto m = engine.to_matrix(t);  // 错误：tensor is not GPU
+auto& m = t.cpu_matrix();                   // NN_ASSERT: tensor has no CPU storage
 
-// ✅ 正确：先下载到 CPU
-auto m = engine.to_matrix(t);  // 错误信息会告诉你
+// ✅ 正确：跨设备读写统一走 engine（to_matrix 下载，GPU 会等待在飞命令完成）
+auto m_result = engine.to_matrix(t);
 ```
 
 ### 4. 梯度清零遗漏
@@ -285,18 +299,18 @@ auto m = engine.to_matrix(t);  // 错误信息会告诉你
 ```cpp
 // ❌ 错误：忘记清零梯度
 auto out = model.forward(input);
-auto loss = loss_fn.forward(engine, out, target);
+auto loss = loss_fn.forward(engine, *out, target);
 auto grad = loss_fn.backward();
-model.backward(engine, grad);
-optimizer.step();  // 梯度累积！
+model.backward(*grad);
+optimizer->step();  // 梯度累积！
 
 // ✅ 正确：每步清零
-optimizer.zero_grad();  // 或 model.zero_grad(engine)
+optimizer->zero_grad();   // 或 model.zero_grad()（两者都不带 engine 参数）
 auto out = model.forward(input);
-auto loss = loss_fn.forward(engine, out, target);
+auto loss = loss_fn.forward(engine, *out, target);
 auto grad = loss_fn.backward();
-model.backward(engine, grad);
-optimizer.step();
+model.backward(*grad);
+optimizer->step();
 ```
 
 ---

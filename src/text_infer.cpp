@@ -168,7 +168,7 @@ void interactive_mode(nn::Model &model, nn::ComputeEngine &engine,
         {
             // 对话模式：直接用 tokenizer 暴露的标记 ID 构建（不硬编码字符串，
             // 以后改标记只需改 domain_tokenizer.hpp）。
-            // 训练格式:
+            // prompt 构建顺序（BOS 前缀 + 标记序列）:
             //   [BOS]<|system|>...</|end_of_system|><|user|>...</|end_of_user|><|assistant|>...
             const auto push_marker = [&](std::size_t id) {
                 if (id != nn::Tokenizer::npos) prompt_tokens.push_back(id);
@@ -190,7 +190,7 @@ void interactive_mode(nn::Model &model, nn::ComputeEngine &engine,
         }
         else
         {
-            // 普通模式：仅 BOS + 编码文本（与训练时每行格式一致）
+            // 普通模式：BOS 前缀 + 编码文本
             auto text_tokens = tokenizer.encode(prompt);
             prompt_tokens.insert(prompt_tokens.end(), text_tokens.begin(), text_tokens.end());
         }
@@ -359,7 +359,7 @@ int main(int argc, char *argv[])
     const std::size_t bos_id = tokenizer->bos_id();
     const std::size_t eos_id = tokenizer->eos_id();
     auto prompt_tokens = tokenizer->encode(cfg.prompt);
-    // 添加 BOS 前缀，使推理输入格式与训练时一致（训练时每行以 BOS 开头）
+    // 添加 BOS 前缀：tokenizer 提供 bos_id 时，用作 prompt 的起始标记
     if (bos_id != nn::Tokenizer::npos)
         prompt_tokens.insert(prompt_tokens.begin(), bos_id);
     std::cout << "提示: \"" << cfg.prompt << "\"\n";

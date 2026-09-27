@@ -57,7 +57,7 @@ void on_abort(int)
 
 // ── 扫描期精度配置（Phase 2：in-kernel f16 变体收集）──────────────────────
 // dry-run 收集的是**结构**（与形状/精度无关）；但精度签名（哪些输入/输出是
-// f16）取决于 profile，故整段 dry-run 跑两遍：profile_f32（旧行为，sig=0）与
+// f16）取决于 profile，故整段 dry-run 跑两遍：profile_f32（sig=0，登记基础结构表）与
 // profile_f16（带类型变体）。输入张量按当前 profile 的 compute 创建，使 f16
 // pass 与运行时（激活即 f16）**同源**——否则会收集到运行时永不使用的签名。
 static nn::PrecisionProfile g_scan_prof{};
@@ -80,8 +80,8 @@ int main(int argc, char* argv[])
 
     nn::CpuEngine raw_engine;
 
-    // ── dry-run 主体：对给定 profile 跑一遍（f32 = 旧行为；f16 = 收集带类型变体）
-    // engine 是**形参**（遮蔽外层 raw_engine）：f32 pass 传原生引擎（逐字节旧行为），
+    // ── dry-run 主体：对给定 profile 跑一遍（f32 pass 收集 sig=0 基础结构；f16 pass 收集带类型变体）
+    // engine 是**形参**（遮蔽外层 raw_engine）：f32 pass 传原生引擎（登记 sig=0 结构表），
     // f16 pass 传 PrecisionEngine 适配层——原生 CpuEngine 只实现 f32 存储，把 f16
     // 张量直接交给它属 UB（实测 heap corruption 0xC0000374）。
     const auto dry_run = [&](nn::ComputeEngine& engine, const nn::PrecisionProfile& prof)
@@ -147,7 +147,7 @@ int main(int argc, char* argv[])
         (void)gelu.backward(engine, grad);
     }
 
-    // ── Softmax forward + backward（M3 行归约融合）────────────────────────
+    // ── Softmax forward + backward（行归约融合）────────────────────────
     // forward:  exp(x - row_max) / row_sum(exp(x - row_max))
     // backward: out * (grad - row_dot(out * grad))
     // 结构不依赖形状，任取一个 R×C 即可。
@@ -161,7 +161,7 @@ int main(int argc, char* argv[])
         (void)softmax.backward(engine, grad);   // 登记 bwd 结构
     }
 
-    // ── RMSNorm forward + backward（M3 列/行归约融合）────────────────────
+    // ── RMSNorm forward + backward（融合）────────────────────
     // forward:  s=col_sum(x²)*invF+eps → rms_inv=rsqrt(s) → normed=x*rms_inv → out=normed*gamma
     // backward: grad_x 列归约表达式 + grad_gamma 行归约表达式
     {
@@ -175,7 +175,7 @@ int main(int argc, char* argv[])
         (void)rms.backward(engine, grad);       // 登记 bwd 结构
     }
 
-    // ── LayerNorm forward + backward（M3 列/行归约融合）──────────────────
+    // ── LayerNorm forward + backward（融合）──────────────────
     // forward: mean → diff → var → std_inv → normalized → out=normalized*gamma+beta
     // backward: grad_x 列归约表达式 + grad_gamma/grad_beta 行归约表达式
     {
@@ -249,17 +249,38 @@ int main(int argc, char* argv[])
         (void)enc.backward(engine, grad);
     }
 
-    // ── ZiPTBlock forward + backward（残差相加 + 注意力梯度累加）─────────
+    // ── ZiPTBlock forward + backward（双输入块：残差相加 + 注意力梯度累加）──
+    // ⚠ dry-run 调用必须使用真实签名并检查返回值：这里必须调**双参**
+    //   forward(engine, input, memory_input)，单参版返回错误
+    //   （"use forward(engine, input, memory_input)"）。用 (void) 吞错会让
+    //   dry-run 静默跑不到真实路径，块内新表达式在 GPU 上闭合世界硬报错才暴露。
+    // 失败带栈 abort（同 CSA 风格）。
     {
         const std::size_t d_model = 16, heads = 2, d_ff = 32, win = 4, mem = 2;
         nn::ZiPTBlock zipt(d_model, heads, d_ff, win, mem,
                            nn::NormType::LayerNorm, nn::ActivationType::GeLU);
         zipt.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
         (void)zipt.init(engine);
-        nn::Tensor x = scan_tensor(d_model, win);
-        (void)zipt.forward(engine, x);
+        nn::Tensor x = scan_tensor(d_model, win);        // 局部窗口输入（batch=1）
+        nn::Tensor mem_in = scan_tensor(d_model, mem);   // 记忆输入
+        auto fr = zipt.forward(engine, x, mem_in);
+        if (!fr)
+        {
+            std::fprintf(stderr, "[scan] ZiPTBlock forward FAILED: %s\n",
+                         fr.error().message.c_str());
+            std::fflush(stderr);
+            std::abort();
+        }
         nn::Tensor grad = scan_tensor(d_model, win);
-        (void)zipt.backward(engine, grad);
+        nn::Tensor grad_C = scan_tensor(d_model, mem);   // 记忆梯度累加目标
+        auto br = zipt.backward(engine, grad, grad_C);
+        if (!br)
+        {
+            std::fprintf(stderr, "[scan] ZiPTBlock backward FAILED: %s\n",
+                         br.error().message.c_str());
+            std::fflush(stderr);
+            std::abort();
+        }
     }
 
     // ── MSELoss forward（diff = pred-target；diff_sq = diff*diff）────────
@@ -284,7 +305,7 @@ int main(int argc, char* argv[])
     }
 
     // ── 优化器 step + 梯度裁剪（全部变体）────────────────────────────────
-    // 各优化器已迁移为 DSL 融合表达式 / 目标传递（dsl::compute_into）：
+    // 各优化器均为 DSL 融合表达式 / 目标传递（dsl::compute_into）：
     //   sgd          : p += -lr*g
     //   sgd_momentum : v = β*v + (1-β)*g ; p += -lr*v
     //   adam         : m/v 更新 + p += delta
@@ -312,9 +333,9 @@ int main(int argc, char* argv[])
     }
 
     // ── Linear forward + backward（算子融合二期 S4：matmul+bias 融合路径）──
-    // Linear::forward 已迁移为 dsl::compute(matmul(W,x) + row_broadcast(b))：
+    // Linear::forward 实现为 dsl::compute(matmul(W,x) + row_broadcast(b))：
     // 折叠出前置 matmul 段 + 尾逐元素链（Add + RowBroadcast 视图）。
-    // Linear::backward 的 grad_w 累加已迁移为
+    // Linear::backward 的 grad_w 累加实现为
     // dsl::compute(grad_w + matmul(grad_out, input^T))（matmul 段 + Add 融合）。
     // 两者都必须 dry-run 覆盖：GPU 运行时同一结构命中 AOT 融合 shader（闭合
     // 世界两端一致）。结构不依赖形状，任取一个 in/out/batch 即可。
@@ -329,14 +350,14 @@ int main(int argc, char* argv[])
         (void)linear.backward(engine, grad_out);   // 登记 grad_w 融合结构
     }
 
-    // ── 算子融合二期（docs/14 S1-S3）：matmul 参与 IR 融合 ───────────────
+    // ── 算子融合二期（docs/development/02-operator-fusion.md）：matmul 参与 IR 融合 ──
     // 结构 = Layer 内 dsl::matmul(A,B)+bias+relu 折叠后的派生物：
     //   前置 matmul 段（MatmulSpec）+ 尾逐元素链（Add + Max）。
     // 这里直接构造折叠后的结构并登记（与 dsl::compute 登记 spec 是同一机制），
     // 保证 GPU 运行时同一结构命中 AOT 融合 shader（闭合世界）。
     //   - transA/transB 是结构 → 分别登记（4 种组合各一个 shader）
     //   - k（求和维度）是形状参数 → 不进 key：任取一个 K 登记，运行时任何 K
-    //     都命中同一融合 shader（同 P2-13 的 RowMod/RotateHalf 处理）
+    //     都命中同一融合 shader（同 RowMod/RotateHalf 的视图参数处理：不进 key，运行时填充）
     {
         const auto make_spec = [](std::uint8_t trA, std::uint8_t trB) {
             nn::ExprSpec s;
@@ -366,7 +387,7 @@ int main(int argc, char* argv[])
         }
     }
 
-    // ── 算子融合二期（docs/14 S5）：matmul+归约组合（注意力结构）──────
+    // ── 算子融合二期（docs/development/02-operator-fusion.md S5）：matmul+归约组合（注意力结构）
     // bmm_reduce / bmm_denom 的 IR 等价物：matmul 段被归约指令消费，
     // 不物化 (M,N) 得分矩阵（kernel 内联点积重算）。结构不依赖形状。
     //   Q (M,K)，K 存储 (N,K)（transB=1）：QK^T = matmul(Q, K, transB)
@@ -410,7 +431,7 @@ int main(int argc, char* argv[])
         nn::fused::global_registry().add(sd);
     }
 
-    // ── CausalSelfAttention（S7：IR 掩码组合 forward/backward）──────────
+    // ── CausalSelfAttention（IR 掩码组合 forward/backward）──────────
     // 掩码表达式 4 配置（causal / causal+alibi / causal+doc / causal+alibi+doc）
     // 各产生确定结构：m/l/W（matmul 段 + Row/Col/Batch 操作数 + 视图）与
     // backward 的 R/X（纯逐元素）。必须全部 dry-run 覆盖（闭合世界）。
@@ -419,7 +440,7 @@ int main(int argc, char* argv[])
         const auto run_csa = [&](nn::CausalSelfAttention& attn) {
             (void)attn.init(engine);
             nn::Tensor x = scan_tensor(d_model, batch * seq);
-            // 不再 (void) 吞错：forward 失败会让缓存为空，backward 直接
+            // 禁止 (void) 吞错：forward 失败会让缓存为空，backward 直接
             //   在 batched_matmul 读空张量上 NN_ASSERT（栈无上下文难定位）
             auto fr = attn.forward(engine, x);
             if (!fr)
@@ -466,10 +487,10 @@ int main(int argc, char* argv[])
         }
     }
 
-    // ── MultiHeadAttention（P-C2-7：MHA=Plain 双向无掩码）───────────────
+    // ── MultiHeadAttention（MHA=Plain 双向无掩码）───────────────
     //   forward fold 的 Plain 变体 + **backward recompute 的裸 S 表达式**
-    //   （无掩码 dsl::compute(matmul)——该结构此前只存在于 masked 分支，
-    //   MHA dry-run 是它唯一的闭合世界注册来源）；R/X 与 grad 累加与
+    //   （无掩码 dsl::compute(matmul)，MHA dry-run 是该结构唯一的
+    //   闭合世界注册来源）；R/X 与 grad 累加与
     //   CSA 同构同 key。
     {
         const std::size_t d_model = 16, heads = 2, seq = 4, batch = 2;
@@ -496,7 +517,7 @@ int main(int argc, char* argv[])
         }
     }
 
-    // ── CrossEntropyLoss 稀疏 forward（S7：IR 组合 denom/loss_vec/grad）──
+    // ── CrossEntropyLoss 稀疏 forward（IR 组合 denom/loss_vec/grad）──
     // 结构不依赖形状；含 mask 与 label 越界修正的统一 mask 构造。
     {
         const std::size_t C = 8, B = 5;
@@ -532,8 +553,8 @@ int main(int argc, char* argv[])
     // ── MaxPool2D forward + backward（窗口 mask 表达式）──────────────────
     // forward : 全原语（im2col / col_reduce_max / rearrange_3d / gather），无 dsL 表达式
     // backward: mask = select(窗口 == col_broadcast(窗口max), col_broadcast(grad), 0)
-    //           —— **必须 dry-run**：这是 Conv/Pool 引擎化后新增的结构，未覆盖时
-    //           GPU 运行到该表达式会因闭合世界未命中而硬报错。
+    //           —— **必须 dry-run**：该表达式未被扫描覆盖时
+    //           GPU 运行到它会因闭合世界未命中而硬报错。
     {
         const std::size_t c = 2, in_h = 6, in_w = 6, pool = 2, stride = 2, batch = 2;
         nn::MaxPool2D mp(c, in_h, in_w, pool, stride);
@@ -549,8 +570,9 @@ int main(int argc, char* argv[])
     // ── 归约表达式内联常量（push-constant 头长度回归）────────────────────
     // `col_reduce_sum(select(cond, 1, 0))` 是**带常量池的归约**结构：GPU 侧
     // push-constant 固定头长度必须按形态算（归约且无 matmul = 4 个 uint）。
-    // 历史 bug 曾按 5 个 uint 打包 → 常量池整体后移一个 uint → GPU 静默错值
-    // （CPU 正常）。fused_gpu_test 的 run_reduce_consts 做 CPU/GPU 对比覆盖。
+    // ⚠ 固定头长度必须与生成器 PC 声明**逐形态一致**：错一个 uint 即常量池
+    // 整体后移 → GPU 静默错值而 CPU 正常。fused_gpu_test 的 run_reduce_consts
+    // 做 CPU/GPU 对比覆盖。
     {
         const std::size_t kk = 4, cols = 3;
         nn::Tensor x = scan_tensor(kk, cols);
@@ -563,12 +585,12 @@ int main(int argc, char* argv[])
     }
 
     };   // dry_run 结束
-    dry_run(raw_engine, nn::profile_f32());   // 旧行为：sig == 0（结构表，bin 不变）
+    dry_run(raw_engine, nn::profile_f32());   // f32 pass：sig == 0（基础结构表）
     {
         nn::PrecisionEngine adapter(raw_engine);   // f16 边界 cast 适配层
         dry_run(adapter, nn::profile_f16());       // Phase 2：收集 (结构, 精度签名)
     }
-    // ── P-C1 fold 分块状态归约（表达式集合登记）──────────────────────────
+    // ── fold v1（标量域）分块状态归约（表达式集合登记）──────────────────────────
     // 三个共享样例（expr_fold.hpp——与 fused_gpu_test 对拍**同源构造** →
     // key 一致、闭合世界命中）：rowmax / rowsum / softmax_denom(online 双
     // 状态)。k 不进 key → 任意收缩长度共享同一 shader；此处取代表值。
@@ -590,12 +612,12 @@ int main(int argc, char* argv[])
             }
             reg_all.add(fs);
         }
-        // P-C2 attention fold（双域）：vec_state_len/k/batch/view param 均不
+        // attention fold（双域）：vec_state_len/k/batch/view param 均不
         // 进 key → dk 族登记是同 key 去重。**5 个掩码变体必须全登记**——层
         // forward 直调 engine.eval_expr(make_fold_attn_o)，不经 dsl::compute
         // 的 NN_EXPR_SCAN 钩子，本块是 fold spec 唯一注册来源；漏 Doc/
-        // AlibiDoc → GPU doc 训练闭合世界硬报错（曾漏，fused 对拍加 Doc/
-        // AlibiDoc 用例后暴露）。
+        // AlibiDoc → GPU doc 训练闭合世界硬报错（fused 对拍以 Doc/AlibiDoc
+        // 用例作 CPU/GPU 对照覆盖）。
         for (const auto mk : {nn::expr::FoldAttnMask::Plain,
                               nn::expr::FoldAttnMask::Causal,
                               nn::expr::FoldAttnMask::Alibi,

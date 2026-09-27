@@ -17,7 +17,7 @@
 // ───────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>
-#include <neuralnet.cpp/expr_fold.hpp>   // P-C1 fold 样例（与 scan_exprs 同源 → key 一致）
+#include <neuralnet.cpp/expr_fold.hpp>   // fold v1 样例（与 scan_exprs 同源 → key 一致）
 
 #include <cmath>
 #include <iomanip>
@@ -178,7 +178,7 @@ int run_gelu(CpuEngine& cpu, GpuEngine& gpu)
     return (ok_f && ok_b) ? 0 : 1;
 }
 
-// ── Softmax forward/backward：GPU（M3 行归约融合 shader）vs CPU ───────────
+// ── Softmax forward/backward：GPU（行归约融合 shader）vs CPU ───────────
 // forward:  exp(x - row_max) / row_sum(exp(x - row_max))
 // backward: out * (grad - row_dot(out * grad))
 // 归约融合 shader 未命中（未扫描）时 GPU 端 eval_expr 硬报错。
@@ -228,7 +228,7 @@ int run_softmax(CpuEngine& cpu, GpuEngine& gpu)
     return (ok_f && ok_b) ? 0 : 1;
 }
 
-// ── 归一化层通用：GPU（M3 归约融合 shader）vs CPU ────────────────────────
+// ── 归一化层通用：GPU（归约融合 shader）vs CPU ────────────────────────
 // 驱动同一个 Layer（RMSNorm/LayerNorm）在 CPU 与 GPU 引擎上，对比
 // forward/backward 输出。未命中融合 shader 时 GPU 端 eval_expr 硬报错。
 template <typename NormT>
@@ -280,7 +280,7 @@ int run_norm(const char* name, CpuEngine& cpu, GpuEngine& gpu)
     return (ok_f && ok_b) ? 0 : 1;
 }
 
-// ── matmul 融合（二期 S3）：matmul(A,B)+bias+relu 单 kernel vs CPU ────────
+// ── matmul 融合：matmul(A,B)+bias+relu 单 kernel vs CPU ────────
 // DSL 折叠出前置 matmul 段（MatmulSpec）+ 尾逐元素链，GPU 命中 AOT 合成
 // 的 matmul 融合 shader（scan_exprs 已登记该结构）；k（求和维度）是形状
 // 参数不进 key：不同 K 共享同一融合 shader（mm_k push constant 运行时填充）。
@@ -363,7 +363,7 @@ int run_matmul(CpuEngine& cpu, GpuEngine& gpu)
     std::cout << "[" << (ok3 ? "PASS" : "FAIL") << "] matmul 融合 形状无关 K=6 (3x6x2)"
               << "  err=" << std::scientific << std::setprecision(2) << err3 << "\n";
 
-    // Linear 结构（S4）：matmul(W,x) + row_broadcast(b)（W (out,in)、x (in,batch)、
+    // Linear 结构：matmul(W,x) + row_broadcast(b)（W (out,in)、x (in,batch)、
     // b (out,1) 行广播 → 输出 (out,batch)）。与 Linear::forward 完全相同的表达式。
     const std::size_t in_f = 6, out_f = 4, batch = 3;
     Matrix Wm(out_f, in_f), Xm(in_f, batch), bm(out_f, 1);
@@ -392,11 +392,11 @@ int run_matmul(CpuEngine& cpu, GpuEngine& gpu)
     return (ok1 && ok2 && ok3 && ok4) ? 0 : 1;
 }
 
-// ── matmul+归约（S5）：注意力 forward 结构，GPU（归约融合 shader 内联
+// ── matmul+归约：注意力 forward 结构，GPU（归约融合 shader 内联
 //    点积，不物化 (M,N) 得分矩阵）vs CPU ─────────────────────────────────
-//   row_max(QK^T)（bmm_reduce Max 等价）与 denom = row_sum(exp(QK^T - rm))
-//   （bmm_denom 等价）均为"matmul 段 + 归约指令"单表达式，GPU 经
-//   generate_glsl_reduce 的 matmul 支持单 kernel 完成。
+//   row_max(QK^T) 与 denom = row_sum(exp(QK^T - rm)) 均为"matmul 段 +
+//   归约指令"单表达式，GPU 经 generate_glsl_reduce 的 matmul 支持单
+//   kernel 完成。
 int run_matmul_reduce(CpuEngine& cpu, GpuEngine& gpu)
 {
     std::mt19937 rng(31415);
@@ -450,10 +450,10 @@ int run_matmul_reduce(CpuEngine& cpu, GpuEngine& gpu)
     std::cout << "[" << (ok2 ? "PASS" : "FAIL") << "] denom row_sum(exp(matmul-rm)) 融合 (5x7x4)"
               << "  err=" << std::scientific << std::setprecision(2) << err2 << "\n";
 
-    // col_max(matmul(Q,K^T))：列归约 + matmul 组合（S5 列方向）。
-    // 该组合曾被 gen_fused 跳过（"matmul+列归约组合暂不支持"），生成器补齐
-    // 按元素 batch 分解后，此对拍锁死 GPU 与 CPU 语义一致（列归约遍历全部
-    // rows，含所有 batch）。广播输出（dsl::compute → vector_out=0）：
+    // col_max(matmul(Q,K^T))：列归约 + matmul 组合（列方向）。
+    // 覆盖 matmul+列归约组合（生成器按元素 batch 分解），此对拍锁死 GPU 与
+    // CPU 语义一致（列归约遍历全部 rows，含所有 batch）。广播输出
+    // （dsl::compute → vector_out=0）：
     auto ccol = nn::dsl::compute(cpu,
         nn::dsl::col_reduce_max(nn::dsl::matmul(Qt, Kt, false, true)), M, N);
     auto gcol = nn::dsl::compute(gpu,
@@ -489,7 +489,7 @@ int run_matmul_reduce(CpuEngine& cpu, GpuEngine& gpu)
     std::cout << "[" << (ok4 ? "PASS" : "FAIL") << "] col_max(matmul) 归约向量 (1x4)"
               << "  err=" << std::scientific << std::setprecision(2) << err4 << "\n";
 
-    // batch=2（S7 batch 分解）：A 堆叠 (2M,K)、K 存储 (2N,K) —— 列归约须
+    // batch=2（batch 分解）：A 堆叠 (2M,K)、K 存储 (2N,K) —— 列归约须
     // 遍历全部 2M 行，每行按 row/m_per 就地分解 batch
     {
         Matrix Q2m(M * 2, K), K2m(N * 2, K);
@@ -553,12 +553,13 @@ int run_fallback(CpuEngine& cpu, GpuEngine& gpu)
     return ok ? 0 : 1;
 }
 
-// ── 归约表达式内联常量：CPU vs GPU（push-constant 头长度回归）─────────────
+// ── 归约表达式内联常量：CPU vs GPU（push-constant 固定头长度按形态算）─────
 // 结构（与 tools/scan_exprs.cpp 的对应 dry-run 完全一致）：
 //   col_reduce_sum(select(x == col_broadcast(mx), 1, 0))
-// 该结构带**常量池**。GPU 侧 push-constant 固定头长度必须按形态算；历史上
-// "归约但无 matmul" 曾多算 1 个 uint（5 vs 4）→ 常量池整体后移一个 uint →
-// shader 读错常量 → **GPU 静默错值而 CPU 正常**。本用例锁死该回归。
+// 该结构带**常量池**。⚠ GPU 侧 push-constant 固定头长度必须逐形态与
+//   生成器 PC 声明一致（逐元素 2 / 逐元素+matmul 5 / 归约 4 /
+//   归约+matmul 6）；按错档则常量池整体错位 → shader 读错常量 →
+//   **GPU 静默错值而 CPU 正常**。本用例锁死该约束。
 int run_reduce_consts(nn::ComputeEngine& cpu, nn::ComputeEngine& gpu)
 {
     const std::size_t kk = 4, cols = 3;
@@ -607,12 +608,12 @@ int run_reduce_consts(nn::ComputeEngine& cpu, nn::ComputeEngine& gpu)
     return ok ? 0 : 1;
 }
 
-// ── P-C1 fold 分块状态归约：CPU vs GPU 对拍 ──────────────────────────────
+// ── fold v1 分块状态归约：CPU vs GPU 对拍 ──────────────────────────────
 // 同 spec → 同 key → 命中 scan 收集的 fold shader；同分块(EXPR_FOLD_BLOCK)、
 // 同指令序、每线程一行与 CPU 执行器逐指令同构 → rowmax 期望**逐位一致**；
 // rowsum/denom 给小容差（fp 加法结合序驱动差异 / exp 软硬件实现差异）。
 // K 族覆盖单列 / 非块整除 / 整除 / 尾块（EXPR_FOLD_BLOCK=128 边界两侧——
-// 256/260 补多块+尾块；BLOCK 升 128 后 K≤100 会静默退化单块）。
+// 256/260 补多块+尾块；K≤100 全落 128 以内的单块区间，测不到多块/尾块）。
 int run_fold_gpu(CpuEngine& cpu, GpuEngine& gpu)
 {
     int fail = 0;
@@ -688,7 +689,7 @@ int run_fold_gpu(CpuEngine& cpu, GpuEngine& gpu)
     return fail;
 }
 
-// ── P-C2 attention fold（v2 双域）GPU 对拍 ──────────────────────────────
+// ── attention fold（v2 双域）GPU 对拍 ──────────────────────────────
 // 与 scan 登记的 spec 同源（vec_state_len 不进 key——形状参数经 PC
 // vector_out 槽填充，dk 族登记是同 key 去重）；v2 与 CPU 执行器同分块/
 // 同指令序——max 类逐位；sum/vecacc 类 GPU 蝶形结合序异于 CPU 串行、exp
@@ -729,9 +730,9 @@ int run_fold_attn_gpu(CpuEngine& cpu, GpuEngine& gpu)
             Tensor doc_ids_t = Tensor::cpu(
                 1, static_cast<std::size_t>(sh.bh) * sh.seq);
             // doc 分段边界：seq > EXPR_FOLD_BLOCK(128) 时越过 128（133→129），
-            //   让 i≥129 的行首 fold 块被 doc 掩码**全屏蔽**——钉住 2026-09
-            //   GPU -nan 根因（max init=-inf → dm=−inf−−inf=NaN）；
-            //   旧固定 seq/2=66<128 首块永留有效项 → 对拍漏抓该 bug。
+            //   让 i≥129 的行首 fold 块被 doc 掩码**全屏蔽**，触发
+            //   max init=-inf → dm=−inf−−inf=NaN 的分支；边界若落在 128 之内
+            //   （如 seq/2），首块永留有效项，该分支测不到。
             const std::uint32_t doc_boundary =
                 sseq > nn::EXPR_FOLD_BLOCK ? nn::EXPR_FOLD_BLOCK + 1u
                                            : sseq / 2u;
@@ -786,8 +787,8 @@ int run_fold_attn_gpu(CpuEngine& cpu, GpuEngine& gpu)
             for (std::size_t i = 0; i < rows_out * sh.dk; ++i)
             {
                 // NaN 守卫：GPU 输出 NaN → diff=NaN → IEEE fmax(err,NaN)=err
-                //   会静默吞掉 → err 保持正常值照样 PASS（2026-09 fold doc
-                //   -nan 回归双层漏抓之一，红验证实证）→ 记 inf 必超容差
+                //   会静默吞掉 → err 保持正常值照样 PASS，故此处记 inf
+                //   必超容差（NaN 输出必须硬失败）
                 const Scalar diff = std::fabs(cs[i] - gs[i]) /
                                     std::fmax(Scalar{1}, std::fabs(cs[i]));
                 err = std::isfinite(diff) ? std::fmax(err, diff)

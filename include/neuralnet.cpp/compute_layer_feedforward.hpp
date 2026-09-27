@@ -70,9 +70,9 @@ public:
     }
 
     // ── D7：精度配置下传（§9.2）──────────────────────────────────────────
-    // FeedForward 是复合层（fc1/fc2 + GeLU/SwiGLU）：不下传则子层 p_ 停在
-    // 默认全 F32 —— FFN 是 d_ff=4·d_model 量级的最大激活生产者，f16 配置下
-    // 静默失效（与 AttentionBase 同一类历史缺陷）。
+    // FeedForward 是复合层（fc1/fc2 + GeLU/SwiGLU）：必须把 profile 下传给
+    // 所有子层，否则子层 p_ 停在默认全 F32 —— FFN 是 d_ff=4·d_model 量级的
+    // 最大激活生产者，f16 配置下静默失效。
     void set_precision_profile(const PrecisionProfile& profile) override
     {
         Layer::set_precision_profile(profile);

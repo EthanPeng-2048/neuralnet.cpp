@@ -30,19 +30,39 @@
 
 #version 450
 
+// -DNN_SHADER_F16=1 → f16 存储变体（Phase C2：小 N GEMV 的 f16 直读直写，
+//   累加/归约/shared 全 f32——与 matmul_tiled f16 同语义；消灭小 N GEMM
+//   （n_out≤8，推理 GEMV 热路径）的边界 cast）。vec4 别名 uvec2（4×half=8B，
+//   std430 步长恰 4 元素 → 下标 >>2 语义与 f32 vec4 完全一致，K%4/M%4
+//   对齐判据不变：f16 需 8B ⇔ 元素下标 %4==0，与 f32 的 16B 同条件）。
+#if defined(NN_SHADER_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#define NN_ETYPE float16_t
+#define NN_V4   uvec2
+#define NN_LOADV4(v) vec4(unpackHalf2x16((v).x), unpackHalf2x16((v).y))
+#define NN_RD(x) float(x)
+#define NN_WR(x) float16_t(x)
+#else
+#define NN_ETYPE float
+#define NN_V4   vec4
+#define NN_LOADV4(v) (v)
+#define NN_RD(x) (x)
+#define NN_WR(x) (x)
+#endif
+
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-layout(std430, binding = 0) readonly buffer  BufferA { float A[]; };
-layout(std430, binding = 1) readonly buffer  BufferB { float B[]; };
-layout(std430, binding = 2) writeonly buffer BufferC { float C[]; };
+layout(std430, binding = 0) readonly buffer  BufferA { NN_ETYPE A[]; };
+layout(std430, binding = 1) readonly buffer  BufferB { NN_ETYPE B[]; };
+layout(std430, binding = 2) writeonly buffer BufferC { NN_ETYPE C[]; };
 
 // vec4 别名视图（同 binding 双声明；仅在元素下标 %4==0 的快路径使用）
-layout(std430, binding = 0) readonly buffer  BufferAv4 { vec4 Av4[]; };
-layout(std430, binding = 1) readonly buffer  BufferBv4 { vec4 Bv4[]; };
+layout(std430, binding = 0) readonly buffer  BufferAv4 { NN_V4 Av4[]; };
+layout(std430, binding = 1) readonly buffer  BufferBv4 { NN_V4 Bv4[]; };
 
 layout(push_constant) uniform PushConstants {
     uint M;      // C 的行数
@@ -106,7 +126,7 @@ void main()
                 {
                     if (row_ok[r])
                     {
-                        const vec4 v = Av4[((m0 + r) * K + k0) >> 2];
+                        const vec4 v = NN_LOADV4(Av4[((m0 + r) * K + k0) >> 2]);
                         a[r][0] = v.x; a[r][1] = v.y;
                         a[r][2] = v.z; a[r][3] = v.w;
                     }
@@ -119,7 +139,7 @@ void main()
                     if (!row_ok[r]) continue;
                     const uint base = (m0 + r) * K;
                     [[unroll]] for (uint i = 0u; i < 4u; ++i)
-                        if (k0 + i < K) a[r][i] = A[base + k0 + i];
+                        if (k0 + i < K) a[r][i] = NN_RD(A[base + k0 + i]);
                 }
             }
         }
@@ -133,7 +153,7 @@ void main()
                 {
                     if (k0 + i < K)
                     {
-                        const vec4 v = Av4[((k0 + i) * M + m0) >> 2];
+                        const vec4 v = NN_LOADV4(Av4[((k0 + i) * M + m0) >> 2]);
                         [[unroll]] for (uint r = 0u; r < ROWS; ++r)
                             a[r][i] = v[r];
                     }
@@ -146,7 +166,7 @@ void main()
                     if (!row_ok[r]) continue;
                     const uint m = m0 + r;
                     [[unroll]] for (uint i = 0u; i < 4u; ++i)
-                        if (k0 + i < K) a[r][i] = A[(k0 + i) * M + m];
+                        if (k0 + i < K) a[r][i] = NN_RD(A[(k0 + i) * M + m]);
                 }
             }
         }
@@ -172,7 +192,7 @@ void main()
                         [[unroll]] for (uint j = 0u; j < 4u; ++j)
                         {
                             if (j * 4u >= ncols) break;
-                            const vec4 v = Bv4[((k0 + i) * N + j * 4u) >> 2];
+                            const vec4 v = NN_LOADV4(Bv4[((k0 + i) * N + j * 4u) >> 2]);
                             b[i][j * 4u + 0u] = v.x;
                             b[i][j * 4u + 1u] = v.y;
                             b[i][j * 4u + 2u] = v.z;
@@ -189,7 +209,7 @@ void main()
                     [[unroll]] for (uint j = 0u; j < MAX_N; ++j)
                         cb[j] = vec4(0.0);
                     for (uint j = 0u; j < flatn; ++j)
-                        cb[j] = Bv4[(k0 * N + j * 4u) >> 2];
+                        cb[j] = NN_LOADV4(Bv4[(k0 * N + j * 4u) >> 2]);
                     [[unroll]] for (uint i = 0u; i < 4u; ++i)
                         [[unroll]] for (uint n = 0u; n < MAX_N; ++n)
                         {
@@ -208,7 +228,7 @@ void main()
                     [[unroll]] for (uint n = 0u; n < MAX_N; ++n)
                     {
                         if (n >= ncols) break;
-                        b[i][n] = B[(k0 + i) * N + n];
+                        b[i][n] = NN_RD(B[(k0 + i) * N + n]);
                     }
                 }
             }
@@ -222,7 +242,7 @@ void main()
                 [[unroll]] for (uint n = 0u; n < MAX_N; ++n)
                 {
                     if (n >= ncols) break;
-                    const vec4 v = Bv4[(n * K + k0) >> 2];
+                    const vec4 v = NN_LOADV4(Bv4[(n * K + k0) >> 2]);
                     b[0][n] = v.x; b[1][n] = v.y;
                     b[2][n] = v.z; b[3][n] = v.w;
                 }
@@ -235,7 +255,7 @@ void main()
                     [[unroll]] for (uint n = 0u; n < MAX_N; ++n)
                     {
                         if (n >= ncols) break;
-                        b[i][n] = B[n * K + k0 + i];
+                        b[i][n] = NN_RD(B[n * K + k0 + i]);
                     }
                 }
             }
@@ -280,7 +300,7 @@ void main()
                 float s = 0.0;
                 for (uint g = 0u; g < nsub; ++g)
                     s += red[r][n][g];
-                C[(m0 + r) * N + n] = s;
+                C[(m0 + r) * N + n] = NN_WR(s);
             }
         }
     }

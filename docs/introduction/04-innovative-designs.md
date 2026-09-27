@@ -18,8 +18,8 @@
 | **性能** | 自适应并行 + 零分配线程池 | 自适应并行、消除每次任务的堆分配 |
 | **性能** | 表达式模板零临时矩阵 | `a + b * c` 不物化中间结果 |
 | **显存** | 结构融合（而非手写 kernel） | 三粒度融合：逐元素链 / matmul+归约 / fold 流式注意力 |
-| **显存** | fold 单遍流式注意力 + 反向重算 | 不物化 `O(seq²)` 分数矩阵（原两趟式已演进） |
-| **显存** | 稀疏 CE + 梯度检查点 + 池归还 | 把显存峰值从 29GB 压到 27GB（并持续下探） |
+| **显存** | fold 单遍流式注意力 + 反向重算 | 不物化 `O(seq²)` 分数矩阵 |
+| **显存** | 稀疏 CE + 梯度检查点 + 池归还 | GPT 训练峰值显存压至 ~27GB 量级 |
 | **IR** | 带确定性 pass 的规范 IR | DCE/常量折叠/CSE/寄存器分配，key 定义在 canonical IR 上 |
 | **算法** | 纯 BPE + 兜底词表自举 | 小模型也能稳定启动、支持中文 |
 | **算法** | ZiPT 注意力压缩（AttnZip） | 可学习记忆查询把长上下文压成记忆 token，O(L²)→O(L) |
@@ -33,7 +33,7 @@
 
 ### 1.1 引擎化架构（Engine-Based）
 
-**创新点**：让 `Layer::forward/backward` 只写一次，通过传入的 `ComputeEngine` 自动适配 CPU / GPU 双后端（CUDA 已停用），而不是像多数教学框架那样为每后端各写一份。
+**创新点**：让 `Layer::forward/backward` 只写一次，通过传入的 `ComputeEngine` 自动适配 CPU / GPU 双后端，而不是像多数教学框架那样为每后端各写一份。
 
 ```cpp
 class Layer {
@@ -92,7 +92,7 @@ Layer 内联表达式 → to_expr_spec 折叠 → ExprSpec（扁平 SSA IR）
 
 ### 2.3 确定性 key 铁律
 
-key 定义在 **canonical（优化后）IR** 上，scan 与 runtime 两端必须先 canonicalize 再算 key。且 pass 遍历顺序固定、CSE 胜利者选择固定、寄存器分配固定——避免跨编译器（Clang/MSVC）漂移。这条铁律来自一次真实事故：C++ 实参求值顺序未指定曾导致 key 跨编译器不稳定。
+key 定义在 **canonical（优化后）IR** 上，scan 与 runtime 两端必须先 canonicalize 再算 key。且 pass 遍历顺序固定、CSE 胜利者选择固定、寄存器分配固定——避免跨编译器（Clang/MSVC）漂移（C++ 实参求值顺序未指定是这类漂移的常见来源，属必须规避的坑）。
 
 ---
 
@@ -113,18 +113,20 @@ key 定义在 **canonical（优化后）IR** 上，scan 与 runtime 两端必须
 | **matmul + 归约** | softmax 分子分母、norm 统计 | `A·B` 全尺寸物化 |
 | **fold 流式注意力 / 稀疏 CE** | attention、大词表交叉熵 | `O(seq²)` / `O(vocab×seq)` 物化 |
 
-### 3.3 三个 matmul 融合原语【历史：已随 S7 删除】
+### 3.3 matmul 参与表达式融合（"原语可专、但不叫算法名"）
 
-> 下列原语（含反向两个）均已删除——现行注意力 forward 为单 fold kernel（见 §4）。
-> 本节保留作"原语可专、但不叫算法名"的设计范例。
+matmul 不是孤立原语，而是表达式的**一段**：`dsl::matmul(a, b[, transA, transB, batch])`
+折叠为 `ExprSpec` 的前置 matmul 段，与尾随的逐元素链/归约视图（`+bias`、激活、
+`col_reduce_max`、softmax 分母）融合成**单个 kernel**。于是"matmul 后接结构"这类需求
+不需要专用原语，也不需要在引擎接口上开算法名：
 
-为承载（当年的）两趟注意力，曾新增一组**通用、可复用**的原语（不是 "attention"，而是 "matmul 后接结构"）：
+- softmax 分子分母 = `matmul` 段 + `col_reduce_*` 归约段，一条 `dsl::compute_reduce`；
+- 注意力 forward = `FoldSpec`（QKᵀ/掩码/online softmax/ΣwV 分块流式，见 §4）；
+- 运行时参数不进 AOT key：`batch`（dispatch z）、`rparam` 标量（如 `1/√d_k`、alpha）；
+  转置标志进 key（生成期按分组定死）。
 
-- `batched_matmul_reduce`：matmul 后沿输出维度归约，不物化中间 `A·B`。
-- `batched_matmul_softmax_denom`：减行 max → exp → 按列求和（softmax 分母，数值稳定）。
-- `batched_matmul_softmax_apply`：行 softmax 归一化后与 V 相乘累加，逐 tile 流式、不物化权重矩阵。
-
-反向曾有 `..._softmax_backward_q` / `..._softmax_backward_kv`，kernel 内部重算权重矩阵。
+引擎原语只暴露结构语义（matmul / 归约 / 数据搬运），`ComputeEngine` 接口里不会出现
+attention / softmax / layernorm 这类算法名。
 
 ### 3.4 形状无关融合（关键创新）
 
@@ -134,17 +136,17 @@ RoPE 的 `RowMod/RotateHalf` 参数如果以**结构常量**折进 key，每个 
 
 ---
 
-## 4. 注意力内存高效化（fold 单遍流式；原两趟式）
+## 4. 注意力内存高效化（fold 单遍流式）
 
 ### 4.1 问题
 
 传统 `scores/masked/attn_cache_` 各占一份 `H·batch·seq²`，且 `attn_cache_` 永久缓存用于反向。这是 GPT+Vulkan 训练显存高的元凶之一。
 
-### 4.2 现行方案（P-C2-7，2026-09-23）：单 fold kernel 分块流式
+### 4.2 现行方案：单 fold kernel 分块流式
 
 `FoldSpec` 把 `QKᵀ → 掩码 → online softmax → ΣwV` 全部放进**一个 kernel**：按
 `EXPR_FOLD_BLOCK=128` 逐块推进——行标量态（m/l）跨块进位、行向量态（O）经 `vecacc`
-块内 rescale + 累加、`tri_skip`（原名 `causal_skip`）把被屏蔽块整块钳成空转（跳过项恰为 -inf/0 恒等项，
+块内 rescale + 累加、`tri_skip` 把被屏蔽块整块钳成空转（跳过项恰为 -inf/0 恒等项，
 与全量计算逐位一致）。**S 矩阵从不存在**，`m/l/O` 均不外溢显存（O 在寄存器/shared
 分片内）。掩码 5 变体（Plain/Causal/Alibi/Doc/AlibiDoc）在 fold body 内以 select
 链表达，由 `fold_mask_variant_()` 虚钩子选择——引擎只认 `FoldSpec` 结构、不认算法名。
@@ -152,16 +154,9 @@ RoPE 的 `RowMod/RotateHalf` 参数如果以**结构常量**折进 key，每个 
 - **Backward**：`recompute_W_` 两步重算 W（掩码 matmul → softmax 归约表达式），
   不缓存 W/m/l；backward 多算一遍 QKᵀ，换整份 `BH·seq²` 缓存。
 
-### 4.3【历史】原两趟式方案（已删除）
+### 4.3 收益
 
-把 `scores → mask → softmax → ×V` 拆成不物化 `seq²` 矩阵的多 kernel 流程：
-
-- **Forward**：`m = max of QᵀK`（bmm_reduce）→ `l = Σ exp(QᵀK − m)`（bmm_denom）→ `O = W·V` 逐 tile（bmm_apply）——三个原语已随 S7 删除。
-- **Backward**：反向重算 W（`bmm_softmax_backward_q/kv`，同样已删）。
-
-### 4.4 收益
-
-每层从 ~3×`BH·seq²` 降到 `O(BH·seq·d_k)`。fold 化后连原两趟式"用计算换显存"的 2× QKᵀ 代价也消失——forward 的 QKᵀ 只算一遍。
+每层从 ~3×`BH·seq²` 降到 `O(BH·seq·d_k)`；forward 的 QKᵀ 只计算一遍，没有用计算换显存的额外重算代价。
 
 ---
 
@@ -173,7 +168,7 @@ RoPE 的 `RowMod/RotateHalf` 参数如果以**结构常量**折进 key，每个 
 
 ### 5.2 方案
 
-原为两个 op-level 原语（`col_softmax_denom` / `col_softmax_sparse_forward`，**已随 S7 删除**），现行由 IR 结构表达——`col_reduce_max + exp + row_gather` 融合表达式，同样单 kernel 完成全部计算：产出**稠密梯度**（每列只对合法列施加）与**标签位置的 log_softmax loss**，不从整张 softmax gather。
+现行由融合表达式结构承载——`col_reduce_max + exp + row_gather` 一条表达式，单 kernel 完成全部计算：产出**稠密梯度**（每列只对合法列施加）与**标签位置的 log_softmax loss**，不从整张 softmax gather。
 
 **创新点**：labels 以 `(1,N)` 浮点打包上传（`vocab ≤ 2²⁴` 时 float 可精确表示类别索引），kernel 内转 `uint` 读取；非法/被屏蔽列整列置 0，与 CPU 参考完全一致。显存从 ~3-4×`(classes,total)` 降到 ~2×。
 
@@ -183,8 +178,8 @@ RoPE 的 `RowMod/RotateHalf` 参数如果以**结构常量**折进 key，每个 
 
 ### 6.1 动机
 
-`ExprSpec` 已是事实上的轻量 IR（SSA、扁平、可序列化、确定性 key），但没有优化 pass，直接导致真实问题：
-- 子表达式 `grad*gamma` 重复 3 次 → 超 `EXPR_MAX_INPUTS=8`，被迫手工拆表达式。
+`ExprSpec` 已是事实上的轻量 IR（SSA、扁平、可序列化、确定性 key）；不做优化会直接带来：
+- 子表达式 `grad*gamma` 重复 3 次 → 超 `EXPR_MAX_INPUTS=8`，只能手工拆表达式。
 - 无 DCE/常量折叠，shader 携带冗余计算。
 - 无寄存器分配，`num_regs` 受 `EXPR_MAX_REGS=16` 约束。
 
@@ -192,8 +187,8 @@ RoPE 的 `RowMod/RotateHalf` 参数如果以**结构常量**折进 key，每个 
 
 - **IR-A canonicalize**：DCE + 常量折叠 + 代数化简 + 稳定重编号（保守、不改变浮点语义）。
 - **IR-B CSE + 寄存器分配**：哈希指令去重，liveness 线性扫描确定性贪心分配寄存器。
-- **IR-C 图 IR + 融合分析**：~~`begin_expr/end_expr` 录制虚拟寄存器 DAG；逐元素链拼接~~ → **已评估并整体移除（2026-09-19）**：当前层集合里没有可安全融合的纯逐元素链（归约是硬边界、且需要融的层都要为 backward 缓存中间量），设计无收益点。取舍见 `docs/development/03-ir-optimization.md` §5.3。
-- **IR-D emitter 抽象**：`ExprEmitter` 接口 + 注册表，一份 canonical IR 产出 GLSL/CPU 多后端（验证"一份 IR 多后端"）。
+- **IR-C 图 IR + 融合分析**：不采用——当前层集合里没有可安全融合的纯逐元素链（归约是硬边界、且需要融的层都要为 backward 缓存中间量），设计无收益点。评估记录与重新立项前提见 `docs/development/03-ir-optimization.md` §5.3。
+- **IR-D emitter 抽象**：`ExprEmitter` 接口 + 注册表，一份 canonical IR 可产出多后端代码（后端实现按接口注册；当前注册的只有 `glsl` 后端）。
 
 ### 6.3 关键不变量
 
@@ -203,7 +198,7 @@ canonicalize 不改变 views/inputs 的顺序与内容，只优化 instrs/consts
 
 ## 7. 显存优化体系（三级）
 
-围绕 GPT 训练峰值显存（29GB → 27GB，持续下探）的三条独立路径：
+围绕 GPT 训练峰值显存（~27GB 量级，随三级体系持续下探）的三条独立路径：
 
 ### L1 激活重计算（梯度检查点）
 - `Layer` 契约扩展 `recompute_supported / forward_recompute`；`GPTModel` 与 `RAPTModel` 均实现**块级检查点**（每 N 个 Block 存一次输入，backward 重算中间）。
@@ -211,7 +206,7 @@ canonicalize 不改变 views/inputs 的顺序与内容，只优化 instrs/consts
 - 注意：复合层 override `forward_recompute` 时必须走**虚函数** `set_checkpoint_mode` 关闭子层——基类默认实现只改本块标志位，子层仍处 checkpoint 模式会导致缓存不重建、backward 误用上一 step 的陈旧缓存。
 
 ### L1-offload（activation offload）
-- 通用 `ActivationOffloader`（`compute_layer_base.hpp`）把 `Layer::activation_cache()` 枚举的全部激活写入持久 host-visible slab（释放 device-local 显存），backward 前恢复；`GPTBlock` / `RAPTBlock` 共用同一实现，不再各写一份。
+- 通用 `ActivationOffloader`（`compute_layer_base.hpp`）把 `Layer::activation_cache()` 枚举的全部激活写入持久 host-visible slab（释放 device-local 显存），backward 前恢复；`GPTBlock` / `RAPTBlock` 共用同一实现。
 - 与全存基线**逐位一致（max_abs=0）**（`gpt_offload_test` / `rapt_offload_test`，GPU-only）。
 - 与梯度检查点可共存：checkpoint 块走重算（不驻留），其余块走 offload（不重算）。
 - 仅 GPU 有意义：CPU 引擎的 `create_offload_buffer / offload_restore` 是 no-op，开启会得到 1×1 张量 → 不要对 CPU 引擎启用。
@@ -223,29 +218,30 @@ canonicalize 不改变 views/inputs 的顺序与内容，只优化 instrs/consts
 ### L3（远期）
 - 自动融合 + 无 m/v 优化器（Adafactor 类）降参数状态内存。
 
-### 设计红线（立项时基线，v1.2.0 起修订）
-~~全程**不引入 f16/bf16**（数值统一 fp32）~~——**已修订**：v1.2.0 起引入 f16 混合精度
-（`Precision` 类型系统 + `PrecisionProfile`，compute/stable 档可保 fp32；BF16 仍为
-"使用即报错"的保留值）。fp32-only 是立项时的取舍记录，不再是现行红线。
+### 精度红线（当前）
+
+支持 **f16 混合精度**（`Precision` 类型系统 + `PrecisionProfile`，compute/stable 档可保
+f32 以控制数值风险；BF16/F64 为"使用即报错"的保留值）。数值稳定性靠精度分档配置保证，
+而不是靠"全库锁死 fp32"。
 
 ---
 
 ## 8. CPU 性能优化（L1/L2 层）
 
 ### 8.1 自适应并行
-根据数据规模自动决定串行/并行，避免小数据量时线程调度开销（约 50~200μs）大于计算收益。实测在 ~512K 元素处首次稳定 >1.5x，此前串行更优。
+根据数据规模自动决定串行/并行，避免小数据量时线程调度开销（约 50~200μs）大于计算收益。实测在 ~512K 元素处首次稳定 >1.5x；低于该规模时串行更快。
 
 ### 8.2 线程池 latch 零分配
-旧版每任务 = N 次堆分配 + N 次加锁 + N 个 future 同步；新版 = 1 次加锁 + 0 次堆分配 + 1 个原子计数器，配合三阶段等待（短自旋 → work-stealing → 条件变量短超时）与"调用者参与计算"。
+每个并行调用 = 1 次加锁 + 0 次堆分配 + 1 个原子计数器（N 分块批量入队），配合三阶段等待（短自旋 → work-stealing → 条件变量短超时）与"调用者参与计算"。
 
 ### 8.3 缓存分块 + 栈分配
 `BLOCK_SIZE=64`（64×64×4B=16KB 装入 L1），B 块预取转置，b_block 栈分配零堆分配。
 
 ### 8.4 算子融合（原语级）
-- 单算子级融合原语（`axpy_inplace` = `clone+scale+add` 三步并一步、`elementwise_select_scalar_cond` = 条件选择）——**2026-09 已随算子收敛整体删除**：这类融合升级为下一条的表达式级融合（`dsl::compute_into` / `dsl::select`）。
+- 单算子级的原地运算/条件选择以表达式表达：`dsl::compute_into`（`dst ±= src`、缩放）、`dsl::select`（条件选择）——与所在表达式链融合为同一条 kernel，不单独 dispatch。
 - **表达式级融合（当前主力）**：`dsl::compute` 把整条链折叠为单个 kernel（见 §3）。
-- 多头注意力**批量化**：fold 单 kernel 按 `batch*H` 网格一次 dispatch 处理所有样本与头（历史：`rearrange_3d → 单次 batched_matmul → 转回` 把 H 次融为 1 次，该结构现仅存于 backward）。
-- 因果掩码物化缓存**已随 fold 迁移删除**（掩码在 fold body 内以 select 链表达、绝不物化）；位置编码缓存保留：相同 `(batch,seq)` 只构造一次。
+- 多头注意力**批量化**：forward 由 fold 单 kernel 按 `batch*H` 网格一次 dispatch 处理所有样本与头；backward 用 `rearrange_3d → 单次 batched_matmul → 转回` 把 H 次 matmul 合并为 1 次 batch dispatch。
+- 因果掩码在 fold body 内以 select 链表达、绝不物化，因而无掩码缓存；位置编码缓存：相同 `(batch,seq)` 只构造一次。
 
 ### 8.5 表达式模板零临时矩阵
 `a + b * c` 在编译期构造 AST，单次遍历执行，不创建 `b*c` 中间矩阵，编译器可整体内联向量化。
@@ -313,11 +309,11 @@ Softmax 行和为 1 的归一化本质，使模型天然获得 `M` 个"注意力
 
 | 方法 | 体现 |
 |------|------|
-| **合规红线先行** | 每次演进（融合/IR/显存）都先写"不可逾越红线"表，再谈实现 |
+| **合规红线先行** | 每次设计与改动（融合/IR/显存）都先写"不可逾越红线"表，再谈实现 |
 | **结构 > 命名的哲学** | 引擎认结构不认算法名，是融合与 IR 能落地的共同前提 |
 | **闭合世界 + 硬报错** | 不静默降级，宁可报错暴露覆盖缺口 |
 | **恶意保守的正确性安全网** | GPU 融合未命中 = 硬报错（铁律 7，暴露扫描覆盖缺口、绝不静默降级）；融合路径与 CPU 参考数值一致并互相验证 |
-| **数值确定性** | 全程 fp32、定点可复现，优化 pass 不改变浮点语义 |
+| **数值确定性** | 定点可复现、优化 pass 不改变浮点语义；默认 f32，f16 须显式 `PrecisionProfile` |
 | **可验证增量里程碑** | M1-M6 每步有独立测试验证（gradcheck / CPU 对照），先小层数回归再全面放开 |
 
 ---
@@ -326,12 +322,12 @@ Softmax 行和为 1 的归一化本质，使模型天然获得 `M` 个"注意力
 
 | 设计 | 量化收益（示例配置） |
 |------|---------------------|
-| fold 流式注意力（原两趟） | 每层 `~3×BH·seq²` → `O(BH·seq·d_k)` |
+| fold 流式注意力 | 每层 `~3×BH·seq²` → `O(BH·seq·d_k)` |
 | 稀疏 CE | 全 softmax `(vocab×seq)` 物化 → 仅标签 gather |
-| 算子融合 + 显存体系 | GPT 训练峰值 ~29GB → ~27GB（并持续下探） |
+| 算子融合 + 显存体系 | GPT 训练峰值显存 ~27GB 量级 |
 | IR CSE + 寄存器分配 | 消除"手工拆表达式"，`num_regs` 受控在 16 内 |
 | 自适应并行 | 小矩阵 0.3x 退化 → 串行；大矩阵最高 ~7.8x 加速 |
-| 融合 axpy | 每 step 减少 ~600 次 GPU buffer 分配 |
-| 注意力批量化 | H 次 matmul → 1 次 batched_matmul（现为 fold 单 kernel 单 dispatch） |
+| 融合 axpy（`dst += s·src` 一条表达式） | 每 step 省去 ~600 次 GPU buffer 分配 |
+| 注意力批量化 | H 次 matmul → 1 次 batch dispatch（backward）；forward 为 fold 单 kernel 单 dispatch |
 
 > 本文档为创新设计的**全景速览**，不替代各专项文档的细节。想要深入的读者请跳转文首的关联文档。

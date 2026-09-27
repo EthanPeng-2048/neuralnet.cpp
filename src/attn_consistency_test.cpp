@@ -1,8 +1,7 @@
 // ── Attention 一致性验证：forward vs forward_step ──────────────────────────
 //
 // 目的：验证 KV cache 增量推理（forward_step）与整段推理（forward）在相同
-//       输入下产生相同的输出。若一致则证明 Attention 语义修复正确，
-//       生成乱码是旧模型权重的问题（用 buggy 代码训练得到），需重训。
+//       输入下产生相同的输出——两者一致即证明两条推理路径语义等价。
 //
 // 原理：
 //   - forward: 输入整段 token 序列，带因果掩码，输出 (vocab, seq) logits

@@ -21,7 +21,7 @@
 #include <vector>
 
 #include "core_config.hpp"
-#include "core_file.hpp"    // 二进制 POD 读写（cast 边界收敛点，docs/17 §2.1）
+#include "core_file.hpp"    // 二进制 POD 读写（cast 边界收敛点）
 #include "model_spec.hpp"
 #include "model_keyvalue_record.hpp"
 #include "compute_layer.hpp"
@@ -43,7 +43,8 @@ namespace nn
 //    [tokenizer_len 8B]         0 = 未嵌入
 //    [tokenizer data...]        分词表数据
 //
-//  v1/v2/v3 为旧的偏移量定长格式，已移除支持（无有意义的旧模型）。
+//  文件格式 v4+ 自描述（长度前缀 + KeyValueRecord）；v1/v2/v3 偏移量定长
+//  格式在 header 校验阶段（read_and_validate_header）即拒绝。
 //
 //  precision 字节: 0 = f32, 1 = f64（用于校验保存时与加载时的 Scalar 类型一致）
 // ═══════════════════════════════════════════════════════════════════════════
@@ -51,15 +52,9 @@ namespace nn
 inline constexpr uint32_t MODEL_MAGIC    = 0x4E4E4E4E;  // "NNNN"
 inline constexpr uint32_t MODEL_VERSION  = 5;            // v5: per-tensor precision tags
 
-// ── 序列化待办（1.1，代码审查项 S3 / M1 / M2）────────────────────────────
-// S3: ~~read_spec_header / read_tokenizer 无长度上限~~ **已修复**：两处均
-//     经 kMaxSerializedStringBytes（64 MiB）校验后才预分配
-//     （见 :400 read_spec_header、:481 read_tokenizer），损坏/恶意文件
-//     返回 Error 而非 bad_alloc → terminate。
-// M1: .bin 全文件无校验和（.nnpkg 有 sha256）。内容损坏会被静默载入错误权重
-//     且无感知。建议 MODEL_VERSION 5 增加整文件校验和与尾部完整性标记。
-// M2: extra_state 的注释称"旧文件读到 EOF 保持默认（running_mean=0 等）"，
-//     但实现是直接返回错误，注释与实现不符。需统一为按版本回退默认值。
+// ── 已知缺口：.bin 全文件无校验和 ─────────────────────────────────────────
+// 内容损坏会被静默载入错误权重且无感知（.nnpkg 有 sha256，模型 .bin 没有）。
+// 若引入整文件校验和与尾部完整性标记，需升 MODEL_VERSION。
 // ═══════════════════════════════════════════════════════════════════════
 
 // ── 精度标记（写入文件头，加载时校验） ──────────────────────────────────
@@ -79,7 +74,7 @@ namespace detail
 {
 
 // ── 安全二进制 I/O 辅助（转发 L0 收敛点 core_file.hpp::write_pod/read_pod）
-// 字节级 reinterpret_cast 只出现在 core_file.hpp（docs/17 §2.1）。
+// 字节级 reinterpret_cast 只出现在 core_file.hpp。
 
 template <typename T>
     requires std::is_trivially_copyable_v<T>
@@ -101,7 +96,7 @@ template <typename T>
 }
 
 // ── 基础类型读写 ──────────────────────────────────────────────────────
-// 直接使用 write_bytes<T> / read_bytes<T>，不再提供 write_u32/u64 等冗余包装。
+// 统一使用 write_bytes<T> / read_bytes<T>，不另设 write_u32/u64 等冗余包装。
 
 // variadic 字段批量写入：依次写入每个字段，遇错即停
 template <typename... Ts>
@@ -282,9 +277,9 @@ template <typename... Ts>
     kv.set("pos_encoding", static_cast<uint64_t>(spec.pos_encoding));
     kv.set("activation",   static_cast<uint64_t>(spec.activation));
     kv.set("norm_type",    static_cast<uint64_t>(spec.norm_type));
-    // ZiPT 记忆 token 数（可选字段：GPT/旧文件缺失时回落 0，不影响加载）
+    // ZiPT 记忆 token 数（可选字段：缺失时回落 0，不影响加载）
     kv.set("memory_tokens", static_cast<uint64_t>(spec.memory_tokens));
-    // ZiPT 局部窗口 W（可选字段：缺失时回落 0 = 旧行为 W=L，即无压缩）
+    // ZiPT 局部窗口 W（可选字段：缺失时回落 0 = W=L，即无压缩）
     kv.set("window", static_cast<uint64_t>(spec.window));
 
     // ── CNN ──
@@ -317,7 +312,7 @@ template <typename... Ts>
 inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
 {
     // norm_type 于 v4 引入；更早版本缺失时默认 LayerNorm。
-    // 注：v1/v2/v3 旧偏移量格式已在 read_and_validate_header 拒绝，此处为语义兜底。
+    // 注：v1/v2/v3 偏移量格式在 read_and_validate_header 已拒绝，此处为语义兜底。
     if (version < 4 && !kv.has("norm_type"))
         kv.set("norm_type", static_cast<uint64_t>(NormType::LayerNorm));
     // ── 未来字段在此追加，例如：
@@ -427,7 +422,7 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
 }
 
 // 返回读到的 version，同时校验 magic number、格式版本和精度
-// v1/v2/v3 为旧的偏移量定长格式（已移除支持），仅接受自描述格式 v4+。
+// 仅接受自描述格式 v4+；v1/v2/v3 偏移量定长格式在此处拒绝。
 [[nodiscard]] inline Result<uint32_t> read_and_validate_header(std::ifstream &ifs)
 {
     auto magic_r = read_bytes<uint32_t>(ifs);
@@ -459,7 +454,7 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
     return version;
 }
 
-// ── Tokenizer JSON 读写（V3 新增） ──────────────────────────────────
+// ── Tokenizer JSON 读写 ──────────────────────────────────────────────
 
 [[nodiscard]] inline Result<void> write_tokenizer(std::ofstream &ofs, const std::string &json)
 {

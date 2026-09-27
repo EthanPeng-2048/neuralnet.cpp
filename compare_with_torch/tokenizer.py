@@ -1,6 +1,6 @@
 # ── tokenizer.py — 分词器 (基于 tokenizers 库) ─────────────────────────────
 #
-# 直接使用 HuggingFace tokenizers 库，不再手写 BPE 算法。
+# 直接使用 HuggingFace tokenizers 库，不手写 BPE 算法。
 # 仅提供统一适配器，包装 tokenizers.Tokenizer 暴露与 C++ 项目相近的接口。
 #
 # 接口：

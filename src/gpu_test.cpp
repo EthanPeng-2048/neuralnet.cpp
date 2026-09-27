@@ -3,8 +3,9 @@
 //   --size N   矩阵维度（默认 256，即 256×256 方阵）
 //   --iters N  性能测试迭代次数（默认 10）
 //
-// 验证 CpuEngine 与 GpuEngine 在 matmul / 转置 matmul / 逐元素 / 归约 /
-// roundtrip 等原语上的一致性，并对比 GPU vs CPU matmul 性能。
+// 验证 CpuEngine 与 GpuEngine 在 matmul / 转置 matmul / 归约 /
+// roundtrip 等原语上的一致性（元素级表达式对拍见 expr_gpu_test），并对比
+// GPU vs CPU matmul 性能。
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>
@@ -268,11 +269,11 @@ int main(int argc, char* argv[])
         }
     }
 
-    // ── 3d. transpose 逐元素对拍（issue #13 P0-① 回归）────────────────
-    // 历史 bug：backend 派发 (16,8,n_bricks) 而 transpose.comp 按 8 宽砖
-    // 解算（假定 gl_WorkGroupID.x ∈ [0,8)）→ 行>512 且 列>512 时静默只写
-    // 前 512 行。旧测试形状最大 64×256，永远单边 ≤512，故漏检。
-    // 形状表覆盖：单边 ≤512（旧代码 PASS）/ 双边 >512（旧代码 FAIL 50%）/
+    // ── 3d. transpose 逐元素对拍 ────────────────────────────────
+    // ⚠ backend 必须按 (8,8,n_bricks) 派发，而 transpose.comp 按 8 宽砖
+    // 解算（假定 gl_WorkGroupID.x ∈ [0,8)）——两者不同源时，行>512 且
+    // 列>512 的形状会静默只写前 512 行；单边 ≤512 的形状测不出该错误。
+    // 形状表覆盖：单边 ≤512（基线）/ 双边 >512（触发砖块跨界路径）/
     // 奇数边界（513、1000 非 tile 整倍数）/ 非方阵。
     std::cout << "[3d] transpose 正确性 (GPU vs CPU 参考, 逐元素)...\n";
     {
@@ -331,7 +332,7 @@ int main(int argc, char* argv[])
         }
     }
 
-    // ── 4. roundtrip + 逐元素 + 归约测试 ─────────────────────────
+    // ── 4. roundtrip + 归约测试（打印标签为固定文案「roundtrip + 逐元素 + 归约测试」）
     std::cout << "\n[4/6] roundtrip + 逐元素 + 归约测试...\n";
     {
         // 4a. Upload→Download roundtrip
@@ -351,7 +352,7 @@ int main(int argc, char* argv[])
         }
         else { std::cout << "  ❌ roundtrip upload 失败\n"; ++failures; }
 
-        // 4b. CPU/GPU 张量准备（逐元素算子已移除；元素级 DSL 对拍见 expr_gpu_test）
+        // 4b. CPU/GPU 张量准备（元素级表达式对拍见 expr_gpu_test）
         auto a_cpu_t = cpu_engine->from_matrix(A);
         auto a_gpu_t = gpu_engine->from_matrix(A);
         if (a_cpu_t && a_gpu_t)
@@ -463,7 +464,7 @@ int main(int argc, char* argv[])
             else { std::cout << "  ❌ begin_batch failed: " << batch_r.error().message << "\n"; ++failures; }
         }
 
-        // 链式: matmul(A, B) → col_reduce_sum（Exp 级已随逐元素算子移除）
+        // 链式: matmul(A, B) → col_reduce_sum
         // 诊断日志：逐步对比 CPU vs GPU，定位误差来源
         if (a_t && b_t)
         {
@@ -500,7 +501,7 @@ int main(int argc, char* argv[])
                     std::cout << "      matmul CPU vs GPU 最大误差: " << std::scientific << std::setprecision(4)
                               << mm_err << "\n";
 
-                    // ── Step 2: 直接复用 matmul 输出（Exp 级已随逐元素算子移除）──
+                    // ── Step 2: 直接复用 matmul 输出 ──
                     auto exp_t = c_t;
                     if (!exp_t) { std::cout << "  ❌ matmul 张量缺失\n"; }
                     else if (true)

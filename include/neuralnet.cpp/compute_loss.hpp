@@ -98,7 +98,10 @@ public:
             dsl::col_reduce_sum(dsl::leaf(*diff) * dsl::leaf(*diff)),
             diff->rows(), diff->cols(), p_.stable);
         if (!col_sum) return std::unexpected(col_sum.error());
-        auto total_t = engine.row_reduce_sum(*col_sum, p_.stable);
+        // 归约步用 dsl::compute_reduce（col_sum (1,B) → 行归约 (1,1)）
+        auto total_t = dsl::compute_reduce(engine,
+            dsl::row_reduce_sum(dsl::leaf(*col_sum)),
+            col_sum->rows(), col_sum->cols(), p_.stable);
         if (!total_t) return std::unexpected(total_t.error());
         auto m = engine.to_matrix(*total_t);
         if (!m) return std::unexpected(m.error());
@@ -106,8 +109,8 @@ public:
 
         // grad = diff * (2/N)：2/N 由 RParam 承载（值不进 expr_spec_key，同一
         // 结构跨形状共享 AOT shader）。**就地**缩放在 diff 自己的缓冲上完成
-        // （零额外分配；guard 已用完 diff²，且 grad_input_ 与原实现一样与 diff
-        // 共享缓冲——但此时 diff² 已取用，故不产生"平方被缩放值"的污染）。
+        // （零额外分配；guard 已用完 diff²，且 grad_input_ 与 diff 共享缓冲
+        // ——但此时 diff² 已取用，故不产生"平方被缩放值"的污染）。
         auto grad = dsl::compute_into(engine,
             dsl::leaf(*diff) * dsl::rparam(scale), *diff);
         if (!grad) return std::unexpected(grad.error());
@@ -128,12 +131,12 @@ public:
 // 算法（只在此处，不在 Engine/Shader）：
 //   对每列（batch 样本）独立做 softmax + cross entropy：
 //     col_max   = max_c logits[c][i]                  (col_reduce_max)
-//     shifted   = logits - col_max                    (broadcast_col Sub)
-//     exp_shift = exp(shifted)                        (unary Exp)
+//     shifted   = logits - col_max                    (列广播表达式)
+//     exp_shift = exp(shifted)                        (exp 表达式)
 //     col_sum   = Σ_c exp_shift[c][i]                 (col_reduce_sum)
-//     softmax   = exp_shift / col_sum                 (broadcast_col Div)
-//     grad      = softmax - target_onehot             (elementwise Sub)
-//     log_sm    = shifted - log(col_sum)              (broadcast_col Sub)
+//     softmax   = exp_shift / col_sum                 (列广播表达式)
+//     grad      = softmax - target_onehot             (逐元素表达式)
+//     log_sm    = shifted - log(col_sum)              (列广播表达式)
 //     loss      = -(1/batch) * Σ target * log_sm
 // ══════════════════════════════════════════════════════════════════════════
 class CrossEntropyLoss final : public Loss
@@ -142,7 +145,7 @@ private:
     Tensor grad_input_;
 
     // ── 按列 softmax 的稠密结果：既给 grad（softmax），也给数值稳定的
-    //    log_softmax（= shifted - log(col_sum)，避免 0*log(0)=NaN，见 M3）。
+    //    log_softmax（= shifted - log(col_sum)，避免 0*log(0)=NaN）。
     struct DenseSoftmax
     {
         Tensor softmax;     // (classes, batch)
@@ -150,7 +153,8 @@ private:
     };
 
     // ── 按列 softmax（稠密 forward 使用）──────────────────────────────
-    // col_max → col_sum = col_softmax_denom（M5 融合，不物化 exp 中间张量）
+    // col_max → col_sum = 列内 Σ exp(logits - col_max)（denom 融合结构：
+    //         列归约 + exp 单 kernel，不物化 exp 中间张量）
     //         → softmax = exp(logits - col_max) / col_sum
     // 同时计算数值稳定的 log_softmax = (logits - col_max) - log(col_sum)：
     //   直接 log(softmax) 在极负 logits/大词表下 softmax→0 → log→-inf，
@@ -159,10 +163,13 @@ private:
     [[nodiscard]] Result<DenseSoftmax> softmax_cols_(
         ComputeEngine& engine, const Tensor& logits) const
     {
-        auto col_max = engine.col_reduce_max(logits, p_.stable);
+        // col_max 用 dsl::compute_reduce（归约向量 (1,cols)，供下面 col_broadcast）
+        auto col_max = dsl::compute_reduce(engine,
+            dsl::col_reduce_max(dsl::leaf(logits)),
+            logits.rows(), logits.cols(), p_.stable);
         if (!col_max) return std::unexpected(col_max.error());
 
-        // S7：denom = Σ_r exp(logits[r][c] - col_max[c]) 用 IR 表达式
+        // denom = Σ_r exp(logits[r][c] - col_max[c]) 用 IR 表达式
         // （列归约 + ColBroadcast 视图 + exp，单 kernel，不物化 exp 张量）
         auto col_sum = dsl::compute_reduce(engine,
             dsl::col_reduce_sum(
@@ -171,8 +178,8 @@ private:
         if (!col_sum) return std::unexpected(col_sum.error());
 
         // shifted / softmax / log_softmax 全部用**列广播表达式**：GPU 上各为 1 个
-        // 融合 kernel，且不再需要 clone 一份 (classes,batch)（旧路径 = clone
-        // 整块 vkCmdCopyBuffer + 3 次就地广播 dispatch）。
+        // 融合 kernel，不产生 (classes,batch) 的中间拷贝（列广播是表达式内的一次
+        // 读取，不额外分配、不额外 dispatch）。
         auto shifted = dsl::compute(engine,
             dsl::leaf(logits) - dsl::col_broadcast(*col_max),
             logits.rows(), logits.cols(), p_.stable);
@@ -213,7 +220,7 @@ public:
         if (classes == 0 || batch == 0)
             return std::unexpected(Error{"cross_entropy loss: empty input"});
 
-        // 1. softmax / log_softmax = softmax_cols(logits)（稳定形式，见 M3）
+        // 1. softmax / log_softmax = softmax_cols(logits)（稳定形式）
         auto sm = softmax_cols_(engine, logits);
         if (!sm) return std::unexpected(sm.error());
 
@@ -222,8 +229,8 @@ public:
         //    d(loss)/d(logits) = (softmax - one_hot) / batch。
         //    缺少 1/batch 缩放会使 SGD/动量、梯度裁剪与 PyTorch 不一致
         //    （Adam 的二阶矩会抵消常数缩放，但其他优化器不会）。
-        //    1/batch 由 RParam 承载（值不进 expr_spec_key）→ 单 kernel，
-        //    取代 elementwise + scale_inplace。
+        //    1/batch 由 RParam 承载（值不进 expr_spec_key）→ 与整个逐元素链
+        //    融合为单 kernel。
         auto grad = dsl::compute(engine,
             (dsl::leaf(sm->softmax) - dsl::leaf(target))
                 * dsl::rparam(Scalar{1} / static_cast<Scalar>(batch)),
@@ -232,7 +239,7 @@ public:
         grad_input_ = std::move(*grad);
 
         // 3. log_softmax 已在 softmax_cols_ 内以数值稳定形式算出
-        //    （= shifted - log(col_sum)，避免 0*log(0)=NaN，见 M3）
+        //    （= shifted - log(col_sum)，避免 0*log(0)=NaN）
 
         // 4+5. Σ target ⊙ log_softmax（先列归约再行归约 → (1,1)）：逐元素链与
         //      列归约融合为单次 dispatch（GPU 上 1 个融合 kernel）
@@ -240,7 +247,10 @@ public:
             dsl::col_reduce_sum(dsl::leaf(target) * dsl::leaf(sm->log_softmax)),
             target.rows(), target.cols(), p_.stable);
         if (!col_s) return std::unexpected(col_s.error());
-        auto total_t = engine.row_reduce_sum(*col_s, p_.stable);
+        // 归约步用 dsl::compute_reduce（(1,B) → (1,1)）
+        auto total_t = dsl::compute_reduce(engine,
+            dsl::row_reduce_sum(dsl::leaf(*col_s)),
+            col_s->rows(), col_s->cols(), p_.stable);
         if (!total_t) return std::unexpected(total_t.error());
 
         // 6. loss = -total / batch — 下载标量
@@ -260,19 +270,19 @@ public:
     // 解决大词表（vocab_size≈25k）+ 大 batch 时 one-hot 矩阵
     // (vocab_size, total_tokens) 爆显存的问题。
     //
-    // M5 融合路径（唯一路径，不做旧路径回退）：
+    // 融合路径（唯一路径）：
     //   1. 上传 labels / loss_mask 为 (1, total) 浮点张量（小传输）
-    //   2. col_softmax_sparse_forward 单 kernel：列内 max + denom + 稠密梯度
-    //      + 标签位置 log_softmax（loss_vec）——不物化 (classes, total) 全 softmax
+    //   2. 融合表达式链：列内 max + denom + 稠密梯度 + 标签位置
+    //      log_softmax（loss_vec）——不物化 (classes, total) 全 softmax
     //   3. loss = -(1/num_valid)·Σ loss_vec（下载标量）
-    // 融合原语不可用（如 CUDA 未对齐返回"未实现"、vocab_size>2^24 浮点标签
-    // 不可精确表示）时**直接报错**，绝不静默回退旧路径（保持"硬报错、不降级"）。
+    // 前置条件：vocab_size ≤ 2^24（labels 按 (1,total) 浮点打包，超出则标签
+    // 不可精确表示）。路径内任何失败直接透传错误、不降级（"硬报错、不降级"）。
     //
     // 参数：
     //   labels     — 平坦标签数组，大小 = logits.cols()，值域 [0, vocab_size)
     //   loss_mask  — 可选，平坦 mask 数组，>0.5 表示参与 loss，否则清零梯度
     //   vocab_size — 词表大小，用于越界检查
-    // ── 稀疏 CE：设备端 loss 和（P0-2 非阻塞热路径入口）─────────────────
+    // ── 稀疏 CE：设备端 loss 和（非阻塞热路径入口）─────────────────
     // 返回 (1,1) 设备张量 = Σ loss_vec（**未归一化，不下载**）。
     // num_valid_out 回传有效 token 数；loss = -sum / num_valid。
     // 训练热循环用本接口 + engine.submit_scalar_readback 异步取 loss，
@@ -296,7 +306,7 @@ public:
         if (classes == 0 || total == 0)
             return std::unexpected(Error{"sparse CE: empty input"});
 
-        // ── M5 融合路径（不物化全 softmax；失败直接透传错误，不回退） ──
+        // ── 融合路径（不物化全 softmax；失败直接透传错误，不降级） ──
         return fused_forward_sparse_(engine, logits, labels, loss_mask, vocab_size,
                                      num_valid_out, grad_reuse);
     }
@@ -319,8 +329,8 @@ public:
             : Scalar{0};
     }
 
-    // ── M5→S7 融合路径实现（IR 组合：col_max 原语 + denom/loss_vec/grad 表达式）──
-    // 不物化 (classes, total) 全 softmax；与旧 col_softmax_sparse_forward 语义一致：
+    // ── 融合路径实现（IR 组合：col_max 原语 + denom/loss_vec/grad 表达式）──
+    // 不物化 (classes, total) 全 softmax：
     //   col_max  = 列内 max（原语）
     //   denom    = col_sum(exp(logits - cb(col_max)))          （IR 表达式）
     //   loss_vec = (rg(logits) - cb(col_max) - log(denom)) * cb(mask)  （IR，(1,total)）
@@ -370,7 +380,10 @@ public:
             ? Scalar{1} / static_cast<Scalar>(num_valid) : Scalar{0};
 
         // 4. col_max → denom（IR）→ loss_vec / grad（IR）
-        auto col_max = engine.col_reduce_max(logits, p_.stable);
+        //    col_max 用 dsl::compute_reduce（归约向量，输出 (1,total) 同形）
+        auto col_max = dsl::compute_reduce(engine,
+            dsl::col_reduce_max(dsl::leaf(logits)),
+            classes, total, p_.stable);
         if (!col_max) return std::unexpected(col_max.error());
         auto denom = dsl::compute_reduce(engine,
             dsl::col_reduce_sum(
@@ -385,7 +398,7 @@ public:
         if (!loss_vec) return std::unexpected(loss_vec.error());
         // grad[r][c] = (exp(logits-col_max)/denom - [r==label[c]]) * mask[c] / num_valid
         // 1/num_valid 由 RParam 承载（运行时值、不进 expr_spec_key）→ 与整个
-        // 逐元素链融合为单 kernel，取代表达式后的 scale_inplace
+        // 逐元素链融合为单 kernel
         auto grad_expr =
             (dsl::exp(dsl::leaf(logits) - dsl::col_broadcast(*col_max))
                 / dsl::col_broadcast(*denom)
@@ -418,7 +431,10 @@ public:
         // 5. loss_sum = Σ loss_vec（无效列已乘 0）——**不下载**：
         //    热路径由调用方经 engine.submit_scalar_readback 异步取回；
         //    同步版 forward_sparse 在此之后 to_matrix。
-        auto total_t = engine.row_reduce_sum(*loss_vec, p_.stable);   // (1, total) → (1, 1)
+        // 归约步用 dsl::compute_reduce（(1,total) → (1,1)）
+        auto total_t = dsl::compute_reduce(engine,
+            dsl::row_reduce_sum(dsl::leaf(*loss_vec)),
+            loss_vec->rows(), loss_vec->cols(), p_.stable);
         if (!total_t) return std::unexpected(total_t.error());
         num_valid_out = num_valid;
         return total_t;

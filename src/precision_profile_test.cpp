@@ -1,10 +1,9 @@
 // ── precision_profile_test — PrecisionProfile 配方语义 ──────────────────────
-// 验收：CLI `--f16` 必须映射到 **f16 存储**（param + compute 全 F16），而不是
-// master-weights 混合配方（F32 主权重 + f16 计算）。
-// 历史问题：`--f16` 曾等价于 profile_master_weights()，用户以为开了全 f16，
-// 实际**参数**仍是 F32——本测试把该语义钉死。
+// 验收：CLI `--f16` = profile_f16() {param/compute = F16, stable/optimizer = F32}
+// —— 即 f16 存储配方，而不是 master-weights 混合配方（F32 主权重 + f16 计算）。
+// 与 profile_master_weights() 是不同 profile，本测试把该语义钉死（三个配方两两
+// 可区分，见文件末）。
 //
-// 2026-09 修订：`--f16` 的语义为 profile_f16() = {F16, F16, F32, F32}。
 // 为何 stable/optimizer 不取 F16（实测证据，见 precision.hpp 注释）：
 //   · optimizer=F16：Adam 的 v ≈ g² ~ 1e-10 在 f16 下溢到 0 → 更新爆炸
 //     （loss 7.9 → 3.6e4）；
@@ -54,7 +53,7 @@ int main()
           mw.stable == Precision::F32 && mw.optimizer == Precision::F32,
           "profile_master_weights 应为 F32/F16/F32/F32（混合，参数仍 f32）");
 
-    // 三个配方两两可区分：防止日后有人把 --f16 又改回混合/全 f16
+    // 三个配方两两可区分：锁定 --f16 = f16 存储配方，不被改成混合/全 f16
     const auto same = [](const PrecisionProfile& a, const PrecisionProfile& b)
     {
         return a.param == b.param && a.compute == b.compute &&

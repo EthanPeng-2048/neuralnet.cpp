@@ -81,7 +81,7 @@ struct ModelSpec
 
     // ── ZiPT ──
     std::size_t memory_tokens = 0;   // 记忆 token 数 M（AttnZip 瓶颈大小）
-    std::size_t window       = 0;   // 局部窗口 W（0=默认回退 seq_len，即旧行为 W=L 无压缩）
+    std::size_t window       = 0;   // 局部窗口 W（0=默认回退 seq_len，即 W=L 无压缩）
 
     // ── CNN ──
     std::size_t cnn_in_channels = 0;         // 输入通道数（MNIST=1）
@@ -108,8 +108,8 @@ struct ModelSpec
 // 与模型自身（Model::spec()）做一致性校验，防止把不匹配的参数加载进模型。
 //
 // 兼容规则：
-//   * GPT 与旧格式 ALiBi_GPT 视为同一家族（统一由 GPTModel 承载，用
-//     pos_encoding 区分 Learned/Sinusoidal/ALiBi/RoPE），type 不要求严格相等。
+//   * ALiBi_GPT 与 GPT 同族，统一由 GPTModel 承载，用
+//     pos_encoding 区分 Learned/Sinusoidal/ALiBi/RoPE，type 不要求严格相等。
 //   * 其余模型类型要求 type 严格相等，再逐字段比较该类型的关键维度。
 // 纯布尔返回，保持本头文件为纯数据结构、无 L2 依赖。
 [[nodiscard]] inline bool spec_matches(const ModelSpec& a, const ModelSpec& b) noexcept

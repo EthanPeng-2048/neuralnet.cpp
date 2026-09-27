@@ -27,7 +27,7 @@ $results | Sort-Object ExtRefs | Format-Table -AutoSize
 
 Write-Host "== [2] 死码候选符号调用点（代码文件，排除定义行注释）=="
 $symbols = @(
-    # 2026-09 重构已整体删除（本清单兼作"不得复活"回归守卫，命中应为 0）：
+    # 重构已整体删除（本清单兼作"不得复活"回归守卫，命中应为 0）：
     'axpy_inplace', 'broadcast_row_inplace', 'broadcast_col_inplace',
     'elementwise_select_scalar_cond', 'elementwise_unary', 'elementwise_binary_scalar',
     'multiply_transposed_add_to', 'offload_store', 'offload_load', 'one_hot',

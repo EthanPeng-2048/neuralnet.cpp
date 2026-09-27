@@ -1,8 +1,8 @@
 // ── Softmax 数值梯度检查（gradcheck） ─────────────────────────────────────
 //
-// 目的：attention gradcheck 显示 grad_Q/grad_K FAIL 但 grad_V OK，
-//       共同差异是 grad_S = softmax.backward(grad_A)。本测试单独验证
-//       Softmax 的 forward/backward 是否与中心差分一致。
+// 目的：单独验证 Softmax 的 forward/backward 与中心差分一致。attention
+//       反向链中 grad_Q/grad_K 均由 grad_S = softmax.backward(grad_A) 派生
+//       （grad_V 不经 Softmax），单独隔离验证便于分层定位问题来源。
 //
 // 用法：softmax_gradcheck [--gpu] [--rows N] [--cols N] [--tol <f>]
 // ─────────────────────────────────────────────────────────────────────────

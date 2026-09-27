@@ -1,7 +1,7 @@
-// ── cli_cli_engine_factory.hpp — 计算引擎选择工厂 ──────────────────────────────────
+// ── cli_engine_factory.hpp — 计算引擎选择工厂 ──────────────────────────────────
 //
-// 抽取自 mnist_train/mnist_infer/text_train/text_infer/mnist_bench 中重复约 50 行的
-// `#ifdef NN_HAS_VULKAN` 两段式样板。
+// 收拢 mnist_train/mnist_infer/text_train/text_infer/mnist_bench 等入口共用的
+// 引擎选择逻辑，免去各自重复写 `#ifdef NN_HAS_VULKAN` 两段式样板。
 //
 // 选择优先级：--gpu > CPU
 //   - Vulkan 路径：要求编译期 NN_HAS_VULKAN，运行时 backend.initialize() 成功

@@ -10,14 +10,26 @@
 // 1 workgroup/头，256 线程。性能弱于共享内存版本，优先保证正确性（任意 dk）。
 // ─────────────────────────────────────────────────────────────────────────
 #version 450
+// -DNN_SHADER_F16=1 → f16 存储变体（Phase C2f：输入输出均 half；scratch
+//   St 是引擎按 f32 分配的 R/W 中间缓冲 → 保持 float。仅需 16bit 存储）。
+#if defined(NN_SHADER_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#define NN_ETYPE float16_t
+#define NN_RD(x) float(x)
+#define NN_WR(x) float16_t(x)
+#else
+#define NN_ETYPE float
+#define NN_RD(x) (x)
+#define NN_WR(x) (x)
+#endif
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly  buffer BufD   { float D[]; };
-layout(std430, binding = 1) readonly  buffer BufX   { float X[]; };
-layout(std430, binding = 2) readonly  buffer BufY   { float Y[]; };
-layout(std430, binding = 3) readonly  buffer BufBnd { float Bnd[]; };
+layout(std430, binding = 0) readonly  buffer BufD   { NN_ETYPE D[]; };
+layout(std430, binding = 1) readonly  buffer BufX   { NN_ETYPE X[]; };
+layout(std430, binding = 2) readonly  buffer BufY   { NN_ETYPE Y[]; };
+layout(std430, binding = 3) readonly  buffer BufBnd { NN_ETYPE Bnd[]; };
 layout(std430, binding = 4)           buffer BufSt  { float St[]; };  // R/W scratch (B*H*dk*dk)
-layout(std430, binding = 5) writeonly buffer BufOut { float Out[]; };
+layout(std430, binding = 5) writeonly buffer BufOut { NN_ETYPE Out[]; };
 
 layout(push_constant) uniform Push {
     uint dk, heads, seq, causal, has_bnd, rows;
@@ -40,16 +52,16 @@ void main() {
         if (causal == 1u) {
             uint reset = 0u;
             if (has_bnd == 1u && i + 1u < seq)
-                reset = (Bnd[b * seq + i + 1u] != 0.0) ? 1u : 0u;
+                reset = (NN_RD(Bnd[b * seq + i + 1u]) != 0.0) ? 1u : 0u;
             for (uint idx = tid; idx < dk * dk; idx += 256u) {
                 const uint a = idx / dk, c = idx % dk;
                 if (reset == 1u) St[base + idx] = 0.0;
-                St[base + idx] += D[(dbase + a * dk + c) * seq + i];
+                St[base + idx] += NN_RD(D[(dbase + a * dk + c) * seq + i]);
             }
         } else {
             for (uint idx = tid; idx < dk * dk; idx += 256u) {
                 const uint a = idx / dk, c = idx % dk;
-                St[base + idx] = D[(dbase + a * dk + c) * seq + i];
+                St[base + idx] = NN_RD(D[(dbase + a * dk + c) * seq + i]);
             }
         }
         barrier();
@@ -57,14 +69,14 @@ void main() {
         if (tid < dk) {
             float sx = 0.0, sy = 0.0, syt = 0.0;
             for (uint c = 0u; c < dk; ++c) {
-                sx  += St[base + tid * dk + c] * X[(r0 + c) * seq + i];
-                sy  += St[base + tid * dk + c] * Y[(r0 + c) * seq + i];
+                sx  += St[base + tid * dk + c] * NN_RD(X[(r0 + c) * seq + i]);
+                sy  += St[base + tid * dk + c] * NN_RD(Y[(r0 + c) * seq + i]);
             }
             for (uint r = 0u; r < dk; ++r)
-                syt += St[base + r * dk + tid] * Y[(r0 + r) * seq + i];
-            Out[(r0 + tid) * seq + i]               = sx;  // [0) S·X
-            Out[(rows + r0 + tid) * seq + i]          = sy;  // [1) S·Y
-            Out[(2u * rows + r0 + tid) * seq + i]     = syt; // [2) S^T·Y
+                syt += St[base + r * dk + tid] * NN_RD(Y[(r0 + r) * seq + i]);
+            Out[(r0 + tid) * seq + i]               = NN_WR(sx);  // [0) S·X
+            Out[(rows + r0 + tid) * seq + i]          = NN_WR(sy);  // [1) S·Y
+            Out[(2u * rows + r0 + tid) * seq + i]     = NN_WR(syt); // [2) S^T·Y
         }
         barrier();
     }

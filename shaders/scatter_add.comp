@@ -32,13 +32,31 @@
 
 #version 450
 
+// -DNN_SHADER_F16=1 → f16 存储变体（Phase C2）：
+//   dst = f16 存储 → 每 uint word 打包相邻 2 个 half（字节布局 half_idx*2
+//   = word*4 + sel*2，与线性 half 序一致），CAS 对整 word、并发更新靠重试
+//   收敛（每次重读 word 最新值；同 word 两 half 被不同线程写也正确）。
+//   每次成功写按 f16 舍入——dst 本就是 f16 存储，与"物化 f32 副本累加后
+//   一次性落回"相比只多中间舍入（梯度累加通常每行 <2 次命中，可忽略）。
+//   grad = float16_t 直读（f16→f32 精确）；indices 保持 float——行号
+//   （vocab 8208 > 2048）超出 f16 整数精度，禁转（同 gather 先例）。
+//   只需 storageBuffer16BitAccess（无 f16 算术/原子）。
+#if defined(NN_SHADER_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#endif
+
 layout(local_size_x = 256) in;
 
 // dst 以 uint 声明，用于 atomicCompSwap 操作
-// float 数据位模式直接存储为 uint（IEEE 754 位兼容）
+// f32 变体：float 数据位模式直接存储为 uint（IEEE 754 位兼容）
+// f16 变体：每 uint 打包 2 个 half（见上）
 layout(std430, binding = 0) coherent buffer BufDst     { uint  dst[];     };
 layout(std430, binding = 1) readonly buffer BufIndices  { float indices[]; };
+#if defined(NN_SHADER_F16)
+layout(std430, binding = 2) readonly buffer BufGrad     { float16_t grad[]; };
+#else
 layout(std430, binding = 2) readonly buffer BufGrad     { float grad[];    };
+#endif
 
 layout(push_constant) uniform PushConstants {
     uint vocab;
@@ -61,6 +79,28 @@ void atomicAddFloat(uint idx, float val)
     }
 }
 
+#if defined(NN_SHADER_F16)
+// f16 打包版：hidx = 线性 half 下标；word = hidx>>1（含 2 个 half），
+// sel = hidx&1（word 内半区）。CAS 覆盖整 word → 与相邻 half 的并发更新
+// 经重试收敛。
+void atomicAddHalf(uint hidx, float val)
+{
+    uint word = hidx >> 1;
+    uint sel = hidx & 1u;
+    uint old_v = dst[word];
+    uint new_v;
+    while (true)
+    {
+        vec2 h = unpackHalf2x16(old_v);
+        if (sel == 0u) h.x += val; else h.y += val;
+        new_v = packHalf2x16(h);
+        uint prev = atomicCompSwap(dst[word], old_v, new_v);
+        if (prev == old_v) break;
+        old_v = prev;
+    }
+}
+#endif
+
 void main()
 {
     const uint flat_idx = gl_GlobalInvocationID.x;
@@ -73,5 +113,9 @@ void main()
     const uint row_idx = uint(indices[i]);
     if (row_idx >= vocab) return;  // 越界跳过
 
+#if defined(NN_SHADER_F16)
+    atomicAddHalf(row_idx * D + d, float(grad[flat_idx]));
+#else
     atomicAddFloat(row_idx * D + d, grad[flat_idx]);
+#endif
 }
