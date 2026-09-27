@@ -90,14 +90,14 @@ add_compile_options(
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
-# ── std::stacktrace 运行时库探测（GCC 14+）────────────────────────────────
-# GCC 把 std::stacktrace 的实现放进独立的 libstdc++exp（或较老的
-# libstdc++_libbacktrace），默认不自动链接 → 否则扫描工具报
-# undefined reference to `std::__stacktrace_impl::_S_current`。
+# ── std::stacktrace 运行时库探测 (GCC & Clang) ──────────────────────────
+# GCC 14+ 和 Clang (使用 libstdc++) 都需要链接实验性库才能使用 std::stacktrace。
+# GCC 使用 stdc++exp，Clang 可能需要 stdc++exp 或 stdc++_libbacktrace。
 # 探测一次，成功后通过 nn_core INTERFACE 传播给所有目标。
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    include(CheckCXXSourceCompiles)
 
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # ── GCC 探测逻辑 ──────────────────────────────────────────────
+    include(CheckCXXSourceCompiles)
     set(CMAKE_REQUIRED_LIBRARIES stdc++exp)
     check_cxx_source_compiles("
         #include <stacktrace>
@@ -108,7 +108,6 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     if(NN_HAS_STDCXXEXP)
         set(NN_STACKTRACE_LIB stdc++exp)
     else()
-        # 回退：老一些的 GCC 用 libstdc++_libbacktrace
         set(CMAKE_REQUIRED_LIBRARIES stdc++_libbacktrace)
         check_cxx_source_compiles("
             #include <stacktrace>
@@ -118,11 +117,45 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         if(NN_HAS_STDCXX_LIBBACKTRACE)
             set(NN_STACKTRACE_LIB stdc++_libbacktrace)
         else()
-            message(FATAL_ERROR
-                "std::stacktrace 需要 stdc++exp 或 stdc++_libbacktrace，但两者都不可用。")
+            message(FATAL_ERROR "std::stacktrace 需要 stdc++exp 或 stdc++_libbacktrace")
         endif()
     endif()
+
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # ── Clang 探测逻辑 ─────────────────────────────────────────────
+    # Clang 可能链接 libstdc++ 或 libc++。我们通过尝试链接来探测。
+    # 如果 Clang 使用 libc++ 且其版本尚不支持 stacktrace，则此处会失败。
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_LIBRARIES stdc++exp)
+    check_cxx_source_compiles("
+        #include <stacktrace>
+        int main() { return std::stacktrace::current().empty() ? 1 : 0; }
+    " NN_CLANG_HAS_STDCXXEXP)
+
+    if(NN_CLANG_HAS_STDCXXEXP)
+        set(NN_STACKTRACE_LIB stdc++exp)
+    else()
+        # 回退尝试旧版 libbacktrace 库
+        set(CMAKE_REQUIRED_LIBRARIES stdc++_libbacktrace)
+        check_cxx_source_compiles("
+            #include <stacktrace>
+            int main() { return std::stacktrace::current().empty() ? 1 : 0; }
+        " NN_CLANG_HAS_STDCXX_LIBBACKTRACE)
+        unset(CMAKE_REQUIRED_LIBRARIES)
+        if(NN_CLANG_HAS_STDCXX_LIBBACKTRACE)
+            set(NN_STACKTRACE_LIB stdc++_libbacktrace)
+        else()
+            # Clang 可能在使用 libc++，其 stacktrace 支持可能不完整。
+            message(WARNING "Clang 无法链接 std::stacktrace。如果使用 libc++，请确保版本 >= 18。CI 构建可能会失败。")
+            set(NN_STACKTRACE_LIB "")
+        endif()
+    endif()
+endif()
+
+if(NN_STACKTRACE_LIB)
     message(STATUS "std::stacktrace link library: ${NN_STACKTRACE_LIB}")
+else()
+    message(STATUS "std::stacktrace link library: (none found,可能链接失败)")
 endif()
 
 # ── 公共 INTERFACE 库：所有目标共享 include 目录和链接库 ──────────────
