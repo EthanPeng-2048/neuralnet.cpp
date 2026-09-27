@@ -1,5 +1,5 @@
 # .github/workflows/cmake-single-platform.yml
-name: CMake (C++26)
+name: CMake (Clang, C++26)
 
 on:
   push:
@@ -179,10 +179,15 @@ jobs:
       run: |
         cmake -B ${{github.workspace}}/build \
           -G Ninja \
+          -DCMAKE_CXX_COMPILER=clang++ \
+          -DCMAKE_C_COMPILER=clang \
           -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
           -DCMAKE_C_COMPILER_LAUNCHER=ccache \
           -DNN_ENABLE_NATIVE=OFF
+      env:
+        CC: clang
+        CXX: clang++
 
     - name: Configure CMake (Windows)
       if: runner.os == 'Windows'
@@ -190,10 +195,15 @@ jobs:
       run: |
         cmake -B ${{github.workspace}}/build `
           -G Ninja `
+          -DCMAKE_CXX_COMPILER=clang++ `
+          -DCMAKE_C_COMPILER=clang `
           -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} `
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
           -DCMAKE_C_COMPILER_LAUNCHER=ccache `
           -DNN_ENABLE_NATIVE=OFF
+      env:
+        CC: clang
+        CXX: clang++
 
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}}
@@ -259,7 +269,7 @@ jobs:
           自动构建版本，commit: ${{ github.sha }}
 
           ### 构建环境
-          - Compiler: 平台默认（构建配置不指定编译器/标准库）
+          - Compiler: Clang（CI 指定 clang++；标准库用编译器默认）
           - C++ Standard: C++26
 
           | 平台 | 产物 |
