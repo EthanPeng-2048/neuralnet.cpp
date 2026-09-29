@@ -13,7 +13,7 @@
 - [GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）](#GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）)（17 条）
 - [注意力 / ZiPT / Transformer / FeedForward 层](#注意力 / ZiPT / Transformer / FeedForward 层)（15 条）
 - [RAPT / CNN / MLP / Softmax / GPT 层](#RAPT / CNN / MLP / Softmax / GPT 层)（11 条）
-- [引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器](#引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器)（16 条）
+- [引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器](#引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器)（17 条）
 - [代数层 / 基础设施 / 模型容器与序列化](#代数层 / 基础设施 / 模型容器与序列化)（12 条）
 - [领域模型工厂与 CLI 公共头](#领域模型工厂与 CLI 公共头)（1 条）
 - [src 应用入口（text/mnist/tokenizer/bench）](#src 应用入口（text/mnist/tokenizer/bench）)（4 条）
@@ -447,6 +447,10 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 ## ComputeEngine Refresh P-1：PrecisionEngine 装饰器删除与 NVI 下沉（原位置 include/neuralnet.cpp/compute_precision_engine.hpp 整文件（948 行，46 override）；compute_engine.hpp 类结构）
 - 类型：演进记录 / 性能 A/B
 - 内容：P-1（2026-09-29，方案见 docs/development/15 §4.1）把 f16 边界 cast 装饰器 `PrecisionEngine`（每次现问内层 `inner_` 要不要 cast、49 方法全量委托）下沉为 `ComputeEngine` 基类 NVI：公有非虚入口承载边界 cast 逻辑（变体优先 / 全 f32 快速直通 / 抬 f32→算→按 P 落回），protected 虚 `*_impl` 只管算；CPU 33 / GPU 29 处 override 机械改名 `*_impl`（基类 virtual 总数仍 49，仅公有虚变非虚 + 新增 `_impl`）；`text_train` / `mnist_train` / `mem_probe` / `f16_*` / `scan_exprs` 等 7 处使用方迁移（`optional<PrecisionEngine>` 舞步与 `dump_temp_stats` 静态调用点改指基类），`compute_precision_engine.hpp` 整文件删除。验收：dev1 ctest 20/20（含 f16_precision/gpu_f16/writeback 4 个 f16 用例）、CPU 稳定性探针与 P0 基线逐字节、scan 产物（expr_specs.bin / fused_registry.hpp）hash 不变。**性能 A/B**：layer_bench 单轮小算子 ±30% 摆动且方向不一（linear/layernorm +25% vs mha -7%）→ 交错 4 轮复测方向翻转（layernorm +25%→-7%）→ 判定手机 DVFS/调度噪声主导、未测得系统性回退；精确数字留待桌面平台复测。整改后代码/注释只保留"基类 NVI 边界 cast 入口"的当前结构，适配层叙事仅存于本文与 docs 15/05。
+
+## ComputeEngine Refresh P1：张量出生绑定与跨引擎检查（原位置 compute_tensor.hpp 类结构、compute_engine.hpp 公共入口集、expr_dsl.hpp compute/compute_reduce 出口）
+- 类型：演进记录 / 性能 A/B
+- 内容：P1（2026-09-29，方案见 docs/development/15 §3.1/§4.2/§4.3/§7.2）按"只加检查、不删形参"落地：① `Tensor` 加 8B `observer_ptr<ComputeEngine> engine_`（friend ComputeEngine）+ `bound()`/`engine()`（未绑定 `NN_ASSERT`）；拷贝/`reshape` 传播绑定，`Tensor{}` 空槽与库外直构保持不绑定。② 工厂与单操作数虚入口 NVI 化——`create_tensor`/`from_matrix`/`cast`/`create_offload_buffer`/`offload_restore` 改为公共非虚包装（尾部 `stamp_`），CpuEngine/GpuEngine 各 3+5 处 override 改名 `*_impl`（基类 virtual 总数仍 49，与 P-1 口径一致）。③ 20 个返回 Tensor 的公共入口逐个包 `return stamp_(...)`（含 `to_prec` 出口统一行替换）：未绑定才补、已绑定沿用 src 绑定（传播规则）、无效空槽不 stamp。④ 跨引擎检查 `bind_check_` 按 D3 字面：操作数指针判等，**双方都 bound 且不同 → Result 硬错误**；单侧未绑定按库外豁免放行（P1 零行为变化，ctest 不红）；`NN_BIND_DEBUG=1` 时"未绑定输入进引擎"也报错（带 source_location 与张量形状）；插入约 28 个公共入口顶部。⑤ 库内 stamp 通道 `ComputeEngine::adopt(Tensor&&)`：friend 限定给 `nn::dsl::compute`/`compute_reduce`（compute_engine.hpp 前置声明 dsl 模板——**默认实参必须写在前置声明处，C++ 不允许在后续声明追加**），覆盖 `eval_cpu` 出口、扫描占位张量、`reduce_vector_tensor` 归约向量出口（15 §4.2 片段 A/B）。验收（本机 Debug+Ninja+clang）：ctest 20/20 两轮全绿；scan 产物 hash 不变（`expr_specs.bin`=bdc3a442…a58360 与 15 锚点一致、`fused_registry.hpp`=7a10412c…；后者含 SPIR-V 字节，仅本机 pre/post 可比）；`gpu_stability_probe` CPU 两轮输出与 P0 基线**逐字节**；**性能 A/B（stash 往返重建）**：layer_bench linear/layernorm/mha/transformer 全部 ±6% 内（linear 反而 -6%，其余 ±1%，噪声内无回退），`text_train` 9 步 244.7s（基线）vs 245.0s（P1）持平。`NN_BIND_DEBUG=1` 诊断：mnist MLP（CPU/GPU）/CNN/Transformer、text_train gpt/rapt、zipt_test 全部零漏网（库内产物出生即绑定成立）。顺带修复既有构建失败：`src/gpu_stability_probe.cpp` 的 `std::getenv` 在 MSVC CRT `-Wdeprecated-declarations -Werror` 下编译不过（照仓库 `_dupenv_s` 模式改写）。观察到的既有问题（基线同现、非 P1 引入，未修）：`gpu_stability_probe --gpu` 首个 `vkCreateBuffer` 即崩（16 §7-2 未决）；`text_train --model zipt` 启动即 `set_checkpoint_every(0)` 无条件 abort 且 abort 后挂死（compute_layer_zipt.hpp:850 未判 stride==0）。整改后叙事收敛为当前结构：绑定字段/`stamp_`/`bind_check_`/`adopt` 各就其位，实施过程仅存于本文与 15。
 
 ---
 

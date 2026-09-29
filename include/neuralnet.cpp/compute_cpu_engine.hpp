@@ -44,14 +44,14 @@ public:
 
     // ── 张量工厂（统一接口，§6.4, §6.5）────────────────────────────────
     // P 由调用方显式指定（§8.5）：无隐式推导，无 Auto
-    [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols, Precision P = Precision::F32) override
+    [[nodiscard]] Tensor create_tensor_impl(std::size_t rows, std::size_t cols, Precision P) override
     {
         if (P == Precision::F16)
             return Tensor::cpu<Precision::F16>(rows, cols);
         return Tensor::cpu(rows, cols);
     }
 
-    [[nodiscard]] Result<Tensor> from_matrix(const Matrix& m, Precision P = Precision::F32) override
+    [[nodiscard]] Result<Tensor> from_matrix_impl(const Matrix& m, Precision P) override
     {
         if (P == Precision::F16)
         {
@@ -115,7 +115,7 @@ public:
     }
 
     // ── cast 原语（§7.5，唯一"变精度"算子）──────────────────────────────
-    [[nodiscard]] Result<Tensor> cast(const Tensor& src, Precision dst) override
+    [[nodiscard]] Result<Tensor> cast_impl(const Tensor& src, Precision dst) override
     {
         if (src.precision() == dst)
             return src;

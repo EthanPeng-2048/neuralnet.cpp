@@ -59,6 +59,22 @@
 namespace nn
 {
 
+namespace dsl
+{
+    // 前置声明（compute_engine.hpp 不能反向 include expr_dsl.hpp）：
+    // nn::dsl::compute / compute_reduce 是 ComputeEngine::adopt 的 friend
+    // 调用方——DSL 静态工厂产物的库内 stamp 通道（15 §4.2 D2）。
+    // 默认实参（P = F32）在 expr_dsl.hpp 的定义处。
+    template <typename E>
+    [[nodiscard]] Result<Tensor> compute(ComputeEngine& eng, const E& e,
+                                         std::size_t rows, std::size_t cols,
+                                         Precision P = Precision::F32);
+    template <typename E>
+    [[nodiscard]] Result<Tensor> compute_reduce(ComputeEngine& eng, const E& e,
+                                                std::size_t rows, std::size_t cols,
+                                                Precision P = Precision::F32);
+} // namespace nn::dsl
+
 // ══════════════════════════════════════════════════════════════════════════
 // 算子枚举（op-level，不含算法语义）
 // ══════════════════════════════════════════════════════════════════════════
@@ -132,9 +148,9 @@ public:
     // 每个 GPTBlock / RAPTBlock 持有一块持久 host-visible slab，所有激活按
     // float 偏移写入/读出，跨 step 复用 → RAM = 激活实际体积（避免每 tensor
     // 独立 128MB 块导致的碎片膨胀）。CPU 引擎 no-op（开启只会得到 1×1 张量）。
-    [[nodiscard]] virtual Result<Tensor> create_offload_buffer(std::size_t /*bytes*/)
+    [[nodiscard]] Result<Tensor> create_offload_buffer(std::size_t bytes)
     {
-        return Tensor::cpu(1, 1);
+        return stamp_(create_offload_buffer_impl(bytes));
     }
     // 把 src 复制到 buffer 的 offset（float 单位）处
     // ── 边界 cast 入口：f16 激活在写入 slab 前抬到 f32（slab 恒 f32 存）──
@@ -143,17 +159,19 @@ public:
     [[nodiscard]] Result<void> offload_save(
         const Tensor& buffer, std::size_t offset, const Tensor& src)
     {
+        if (auto ec = bind_check_({&buffer, &src}); !ec)
+            return std::unexpected(ec.error());
         auto s = to_f32(src);
         if (!s)
             return std::unexpected(s.error());
         return offload_save_impl(buffer, offset, *s);
     }
     // 从 buffer 的 offset（float 单位）处复制 rows×cols 到新 GPU tensor
-    [[nodiscard]] virtual Result<Tensor> offload_restore(
-        const Tensor& /*buffer*/, std::size_t /*offset*/,
-        std::size_t /*rows*/, std::size_t /*cols*/)
+    [[nodiscard]] Result<Tensor> offload_restore(
+        const Tensor& buffer, std::size_t offset,
+        std::size_t rows, std::size_t cols)
     {
-        return Tensor::cpu(1, 1);
+        return stamp_(offload_restore_impl(buffer, offset, rows, cols));
     }
 
     // ── 异步标量回读（非阻塞取 loss）──────────────────────────────
@@ -170,6 +188,8 @@ public:
     // scalar_readback_slots()：可用槽位数（调用方据此做环形复用）。
     [[nodiscard]] Result<void> submit_scalar_readback(std::size_t slot, const Tensor& t)
     {
+        if (auto ec = bind_check_({&t}); !ec)
+            return std::unexpected(ec.error());
         auto s = to_f32(t);
         if (!s)
             return std::unexpected(s.error());
@@ -189,18 +209,27 @@ public:
 
     // ── 张量工厂（统一接口，§6.4, §6.5）────────────────────────────────
     // P 由调用方显式指定（§8.5）：无隐式推导，无 Auto
-    [[nodiscard]] virtual Tensor create_tensor(std::size_t rows, std::size_t cols, Precision P = Precision::F32) = 0;
-    [[nodiscard]] virtual Result<Tensor> from_matrix(const Matrix& m, Precision P = Precision::F32) = 0;
+    // P1（docs/development/15 §3.1）：公共非虚入口在尾部统一 stamp 出生绑定，
+    // 引擎只实现 create_tensor_impl / from_matrix_impl（protected）——避免
+    // 每个 override 各自漏 stamp。to_matrix 输出 Matrix（宿主），不参与 stamp。
+    [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols, Precision P = Precision::F32)
+    {
+        return stamp_(create_tensor_impl(rows, cols, P));
+    }
+    [[nodiscard]] Result<Tensor> from_matrix(const Matrix& m, Precision P = Precision::F32)
+    {
+        return stamp_(from_matrix_impl(m, P));
+    }
     [[nodiscard]] virtual Result<Matrix> to_matrix(const Tensor& t, Precision P = Precision::F32) = 0;
 
     // ── cast 原语（§7.5，唯一"变精度"算子，永远显式）────────────────
     // 升 cast（f16→f32）精确无损；降 cast（f32→f16）round-half-to-even。
     // 默认实现：同精度 = 返回 src（共享所有权，零拷贝）；跨精度 = 错误（引擎覆盖）。
-    [[nodiscard]] virtual Result<Tensor> cast(const Tensor& src, Precision dst)
+    [[nodiscard]] Result<Tensor> cast(const Tensor& src, Precision dst)
     {
-        if (src.precision() == dst)
-            return src;  // 同精度 = 返回共享所有权（零拷贝）
-        return std::unexpected(Error{"cast: 该引擎不支持跨精度转换"});
+        if (auto ec = bind_check_({&src}); !ec)
+            return std::unexpected(ec.error());
+        return stamp_(cast_impl(src, dst));
     }
 
     // ── cast_into：把 src 按精度转换后写入 **dst 的既有存储**（不替换对象）
@@ -300,11 +329,13 @@ public:
     // 用于需要修改中间结果但不影响原 Tensor 的场景
     [[nodiscard]] Result<Tensor> clone(const Tensor& src)
     {
+        if (auto ec = bind_check_({&src}); !ec)
+            return std::unexpected(ec.error());
         // 原生 f16 数据搬运：引擎的 clone 是模板化字节拷贝 → 直接放行，
         // 省掉"抬 f32 → 拷贝 → 落回 f16"的 2 份全尺寸临时量。
         if (src.precision() != Precision::F32 && supports_native_data_move())
-            return clone_impl(src);
-        return move_(src, [this](const Tensor& s) { return clone_impl(s); });
+            return stamp_(clone_impl(src));
+        return stamp_(move_(src, [this](const Tensor& s) { return clone_impl(s); }));
     }
 
     // 将 CPU Matrix 数据写入已有 Tensor（CPU 拷贝 / GPU 上传）
@@ -312,6 +343,8 @@ public:
     // f16 目标：先按 f32 上传，再 cast_into 写进 dst 的原存储
     [[nodiscard]] Result<void> copy_from(Tensor& dst, const Matrix& src)
     {
+        if (auto ec = bind_check_({&dst}); !ec)
+            return std::unexpected(ec.error());
         if (dst.precision() == Precision::F32)
             return copy_from_impl(dst, src);
         auto t = from_matrix(src, Precision::F32);
@@ -326,12 +359,14 @@ public:
     [[nodiscard]] Result<Tensor> slice_rows(
         const Tensor& src, std::size_t start_row, std::size_t count)
     {
+        if (auto ec = bind_check_({&src}); !ec)
+            return std::unexpected(ec.error());
         if (src.precision() != Precision::F32 && supports_native_data_move())
-            return slice_rows_impl(src, start_row, count);
-        return move_(src, [this, start_row, count](const Tensor& s)
+            return stamp_(slice_rows_impl(src, start_row, count));
+        return stamp_(move_(src, [this, start_row, count](const Tensor& s)
         {
             return slice_rows_impl(s, start_row, count);
-        });
+        }));
     }
 
     // 将 src 的所有行写入 dst 的行 [dst_start_row, dst_start_row + src.rows())。
@@ -341,6 +376,8 @@ public:
     [[nodiscard]] Result<void> insert_rows(
         Tensor& dst, std::size_t dst_start_row, const Tensor& src)
     {
+        if (auto ec = bind_check_({&dst, &src}); !ec)
+            return std::unexpected(ec.error());
         if (dst.precision() != Precision::F32 && dst.precision() == src.precision() &&
             supports_native_data_move())
             return insert_rows_impl(dst, dst_start_row, src);
@@ -370,10 +407,12 @@ public:
     [[nodiscard]] Result<Tensor> gather_rows(
         const Tensor& table, const Tensor& indices)
     {
-        return move_(table, [this, &indices](const Tensor& t)
+        if (auto ec = bind_check_({&table, &indices}); !ec)
+            return std::unexpected(ec.error());
+        return stamp_(move_(table, [this, &indices](const Tensor& t)
         {
             return gather_rows_impl(t, indices);
-        });
+        }));
     }
 
     // scatter_add_rows: 按 indices 把 grad 的行原子累加到 dst 的对应行
@@ -386,6 +425,8 @@ public:
     [[nodiscard]] Result<void> scatter_add_rows(
         Tensor& dst, const Tensor& indices, const Tensor& grad)
     {
+        if (auto ec = bind_check_({&dst, &indices, &grad}); !ec)
+            return std::unexpected(ec.error());
         if (dst.precision() == Precision::F32 && grad.precision() == Precision::F32)
             return scatter_add_rows_impl(dst, indices, grad);
         // 原生 f16（GPU：打包 half CAS 变体；无 pipeline 时引擎内 cast 回退）
@@ -417,17 +458,21 @@ public:
         const Tensor& x, std::size_t M, std::size_t B, std::size_t N,
         bool inverse = false)
     {
-        return move_(x, [this, M, B, N, inverse](const Tensor& t)
+        if (auto ec = bind_check_({&x}); !ec)
+            return std::unexpected(ec.error());
+        return stamp_(move_(x, [this, M, B, N, inverse](const Tensor& t)
         {
             return rearrange_3d_impl(t, M, B, N, inverse);
-        });
+        }));
     }
 
     // ── 矩阵转置：A (R, C) → out (C, R) ──
     // 纯 layout 操作，零算法语义。用于 embedding 列布局转换等场景。
     [[nodiscard]] Result<Tensor> transpose(const Tensor& A)
     {
-        return move_(A, [this](const Tensor& t) { return transpose_impl(t); });
+        if (auto ec = bind_check_({&A}); !ec)
+            return std::unexpected(ec.error());
+        return stamp_(move_(A, [this](const Tensor& t) { return transpose_impl(t); }));
     }
 
     // ── 卷积/池化窗口展开原语（op-level 数据搬运，零算法语义）─────────────
@@ -447,10 +492,12 @@ public:
         std::size_t k, std::size_t stride, std::size_t pad,
         std::size_t OH, std::size_t OW)
     {
-        return move_(x, [this, C, H, W, k, stride, pad, OH, OW](const Tensor& t)
+        if (auto ec = bind_check_({&x}); !ec)
+            return std::unexpected(ec.error());
+        return stamp_(move_(x, [this, C, H, W, k, stride, pad, OH, OW](const Tensor& t)
         {
             return im2col_impl(t, C, H, W, k, stride, pad, OH, OW);
-        });
+        }));
     }
 
     // col2im：im2col 的伴随（adjoint / 反向散射）。
@@ -466,10 +513,12 @@ public:
         std::size_t k, std::size_t stride, std::size_t pad,
         std::size_t OH, std::size_t OW)
     {
-        return move_(col, [this, C, H, W, k, stride, pad, OH, OW](const Tensor& t)
+        if (auto ec = bind_check_({&col}); !ec)
+            return std::unexpected(ec.error());
+        return stamp_(move_(col, [this, C, H, W, k, stride, pad, OH, OW](const Tensor& t)
         {
             return col2im_impl(t, C, H, W, k, stride, pad, OH, OW);
-        });
+        }));
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -489,12 +538,14 @@ public:
         bool transA = false, bool transB = false,
         Precision P = Precision::F32)
     {
+        if (auto ec = bind_check_({&A, &B}); !ec)
+            return std::unexpected(ec.error());
         if (P != Precision::F32)
-            return matmul_impl(A, B, transA, transB, P);
-        return binary_(A, B, P, [this, transA, transB](const Tensor& a, const Tensor& b)
+            return stamp_(matmul_impl(A, B, transA, transB, P));
+        return stamp_(binary_(A, B, P, [this, transA, transB](const Tensor& a, const Tensor& b)
         {
             return matmul_impl(a, b, transA, transB, Precision::F32);
-        });
+        }));
     }
 
     // 批量矩阵乘法：对每个 batch b 计算 C_b = alpha * op(A_b, B_b)，结果垂直堆叠
@@ -514,14 +565,16 @@ public:
         Scalar alpha = Scalar{1},
         Precision P = Precision::F32)
     {
+        if (auto ec = bind_check_({&A, &B}); !ec)
+            return std::unexpected(ec.error());
         if (P != Precision::F32)
-            return batched_matmul_impl(A, B, batch, transA, transB, alpha, P);
-        return binary_(A, B, P,
+            return stamp_(batched_matmul_impl(A, B, batch, transA, transB, alpha, P));
+        return stamp_(binary_(A, B, P,
             [this, batch, transA, transB, alpha](const Tensor& a, const Tensor& b)
         {
             return batched_matmul_impl(a, b, batch, transA, transB, alpha,
                                        Precision::F32);
-        });
+        }));
     }
 
     // ── matmul + broadcast bias（统一精度处理）────────────────────────────
@@ -534,15 +587,17 @@ public:
         bool transA = false, bool transB = false,
         Precision P = Precision::F32)
     {
+        if (auto ec = bind_check_({&A, &B, &bias}); !ec)
+            return std::unexpected(ec.error());
         if (P != Precision::F32 &&
             (A.precision() != Precision::F32 || B.precision() != Precision::F32 ||
              bias.precision() != Precision::F32))
-            return matmul_with_bias_impl(A, B, bias, transA, transB, P);
+            return stamp_(matmul_with_bias_impl(A, B, bias, transA, transB, P));
 
         if (P == Precision::F32 && A.precision() == Precision::F32 &&
             B.precision() == Precision::F32 && bias.precision() == Precision::F32)
-            return matmul_with_bias_impl(A, B, bias, transA, transB,
-                                         Precision::F32);
+            return stamp_(matmul_with_bias_impl(A, B, bias, transA, transB,
+                                         Precision::F32));
         auto a = to_f32(A);
         if (!a) return std::unexpected(a.error());
         auto b = to_f32(B);
@@ -552,12 +607,14 @@ public:
         auto r = matmul_with_bias_impl(*a, *b, *bi, transA, transB,
                                        Precision::F32);
         if (!r) return std::unexpected(r.error());
-        return to_prec(std::move(*r), P);
+        return stamp_(to_prec(std::move(*r), P));
     }
 
     // 梯度累加：dst += src（dst 存储精度不可变，§8.3）
     [[nodiscard]] Result<void> accumulate(Tensor& dst, const Tensor& src)
     {
+        if (auto ec = bind_check_({&dst, &src}); !ec)
+            return std::unexpected(ec.error());
         const bool dbg = prec_env_flag("NN_F16_DEBUG");
         const auto mx = [this](const Tensor& t)
         {
@@ -591,6 +648,8 @@ public:
     // A += B（逐元素，同形状）
     [[nodiscard]] Result<void> add_inplace(Tensor& A, const Tensor& B)
     {
+        if (auto ec = bind_check_({&A, &B}); !ec)
+            return std::unexpected(ec.error());
         return inplace2_(A, B, [this](Tensor& a, const Tensor& b)
         {
             return add_inplace_impl(a, b);
@@ -600,12 +659,16 @@ public:
     // A *= scalar
     [[nodiscard]] Result<void> scale_inplace(Tensor& A, Scalar s)
     {
+        if (auto ec = bind_check_({&A}); !ec)
+            return std::unexpected(ec.error());
         return inplace1_(A, [this, s](Tensor& a) { return scale_inplace_impl(a, s); });
     }
 
     // A = 0
     [[nodiscard]] Result<void> zero(Tensor& A)
     {
+        if (auto ec = bind_check_({&A}); !ec)
+            return std::unexpected(ec.error());
         // 原生 f16 清零：fill_zero 是字节级原语（每步 zero_grad 调用 N 次）
         if (A.precision() != Precision::F32 && supports_native_data_move())
             return zero_impl(A);
@@ -655,19 +718,21 @@ public:
         const Tensor& boundary, bool has_bnd,
         Precision prec = Precision::F32)
     {
+        if (auto ec = bind_check_({&K, &V, &P, &R, &A0, &B0, &boundary}); !ec)
+            return std::unexpected(ec.error());
         if (prec == Precision::F32 && K.precision() == Precision::F32 &&
             V.precision() == Precision::F32 && P.precision() == Precision::F32 &&
             R.precision() == Precision::F32 && A0.precision() == Precision::F32 &&
             B0.precision() == Precision::F32 && boundary.precision() == Precision::F32)
-            return scan_prefix_outer_impl(K, V, P, R, A0, B0, has_state, dk, heads,
+            return stamp_(scan_prefix_outer_impl(K, V, P, R, A0, B0, has_state, dk, heads,
                                           causal, boundary, has_bnd,
-                                          Precision::F32);
+                                          Precision::F32));
         if (supports_native_data_move())
         {
             auto r = scan_prefix_outer_impl(K, V, P, R, A0, B0, has_state, dk, heads,
                                             causal, boundary, has_bnd, prec);
             if (!r) return std::unexpected(r.error());
-            return to_prec(std::move(*r), prec);
+            return stamp_(to_prec(std::move(*r), prec));
         }
         const std::vector<Tensor> ts{K, V, P, R, A0, B0, boundary};
         auto c = to_f32_all(ts);
@@ -676,7 +741,7 @@ public:
                                         (*c)[4], (*c)[5], has_state, dk, heads,
                                         causal, (*c)[6], has_bnd, Precision::F32);
         if (!r) return std::unexpected(r.error());
-        return to_prec(std::move(*r), prec);
+        return stamp_(to_prec(std::move(*r), prec));
     }
 
     // 后缀扫描（RLA 反向 pass 2）：
@@ -691,17 +756,19 @@ public:
         const Tensor& boundary, bool has_bnd,
         Precision prec = Precision::F32)
     {
+        if (auto ec = bind_check_({&D, &X, &Y, &boundary}); !ec)
+            return std::unexpected(ec.error());
         if (prec == Precision::F32 && D.precision() == Precision::F32 &&
             X.precision() == Precision::F32 && Y.precision() == Precision::F32 &&
             boundary.precision() == Precision::F32)
-            return scan_suffix_outer_impl(D, X, Y, dk, heads, causal, boundary,
-                                          has_bnd, Precision::F32);
+            return stamp_(scan_suffix_outer_impl(D, X, Y, dk, heads, causal, boundary,
+                                          has_bnd, Precision::F32));
         if (supports_native_data_move())
         {
             auto r = scan_suffix_outer_impl(D, X, Y, dk, heads, causal, boundary,
                                             has_bnd, prec);
             if (!r) return std::unexpected(r.error());
-            return to_prec(std::move(*r), prec);
+            return stamp_(to_prec(std::move(*r), prec));
         }
         const std::vector<Tensor> ts{D, X, Y, boundary};
         auto c = to_f32_all(ts);
@@ -709,7 +776,7 @@ public:
         auto r = scan_suffix_outer_impl((*c)[0], (*c)[1], (*c)[2], dk, heads,
                                         causal, (*c)[3], has_bnd, Precision::F32);
         if (!r) return std::unexpected(r.error());
-        return to_prec(std::move(*r), prec);
+        return stamp_(to_prec(std::move(*r), prec));
     }
 
     // 逐列外积（RLA 反向的 dL/dA、dL/dB 物化）：
@@ -722,14 +789,16 @@ public:
         std::size_t dk, bool has_scale,
         Precision prec = Precision::F32)
     {
+        if (auto ec = bind_check_({&P, &R, &S}); !ec)
+            return std::unexpected(ec.error());
         if (prec == Precision::F32 && P.precision() == Precision::F32 &&
             R.precision() == Precision::F32 && S.precision() == Precision::F32)
-            return outer_col_impl(P, R, S, dk, has_scale, Precision::F32);
+            return stamp_(outer_col_impl(P, R, S, dk, has_scale, Precision::F32));
         if (supports_native_data_move())
         {
             auto r = outer_col_impl(P, R, S, dk, has_scale, prec);
             if (!r) return std::unexpected(r.error());
-            return to_prec(std::move(*r), prec);
+            return stamp_(to_prec(std::move(*r), prec));
         }
         const std::vector<Tensor> ts{P, R, S};
         auto c = to_f32_all(ts);
@@ -737,7 +806,7 @@ public:
         auto r = outer_col_impl((*c)[0], (*c)[1], (*c)[2], dk, has_scale,
                                 Precision::F32);
         if (!r) return std::unexpected(r.error());
-        return to_prec(std::move(*r), prec);
+        return stamp_(to_prec(std::move(*r), prec));
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -754,16 +823,18 @@ public:
     [[nodiscard]] Result<Tensor> row_reduce_sum(
         const Tensor& A, Precision P = Precision::F32)
     {
+        if (auto ec = bind_check_({&A}); !ec)
+            return std::unexpected(ec.error());
         if (A.precision() != Precision::F32 && supports_native_f16_reduce())
         {
             auto r = row_reduce_sum_impl(A, P);
             if (!r) return std::unexpected(r.error());
-            return to_prec(std::move(*r), P);
+            return stamp_(to_prec(std::move(*r), P));
         }
-        return unary_(A, P, [this](const Tensor& a)
+        return stamp_(unary_(A, P, [this](const Tensor& a)
         {
             return row_reduce_sum_impl(a, Precision::F32);
-        });
+        }));
     }
 
     // 按列求和：A (rows, cols) → out (1, cols)
@@ -771,16 +842,18 @@ public:
     [[nodiscard]] Result<Tensor> col_reduce_sum(
         const Tensor& A, Precision P = Precision::F32)
     {
+        if (auto ec = bind_check_({&A}); !ec)
+            return std::unexpected(ec.error());
         if (A.precision() != Precision::F32 && supports_native_f16_reduce())
         {
             auto r = col_reduce_sum_impl(A, P);
             if (!r) return std::unexpected(r.error());
-            return to_prec(std::move(*r), P);
+            return stamp_(to_prec(std::move(*r), P));
         }
-        return unary_(A, P, [this](const Tensor& a)
+        return stamp_(unary_(A, P, [this](const Tensor& a)
         {
             return col_reduce_sum_impl(a, Precision::F32);
-        });
+        }));
     }
 
     // 按列求最大值：A (rows, cols) → out (1, cols)
@@ -788,16 +861,18 @@ public:
     [[nodiscard]] Result<Tensor> col_reduce_max(
         const Tensor& A, Precision P = Precision::F32)
     {
+        if (auto ec = bind_check_({&A}); !ec)
+            return std::unexpected(ec.error());
         if (A.precision() != Precision::F32 && supports_native_f16_reduce())
         {
             auto r = col_reduce_max_impl(A, P);
             if (!r) return std::unexpected(r.error());
-            return to_prec(std::move(*r), P);
+            return stamp_(to_prec(std::move(*r), P));
         }
-        return unary_(A, P, [this](const Tensor& a)
+        return stamp_(unary_(A, P, [this](const Tensor& a)
         {
             return col_reduce_max_impl(a, Precision::F32);
-        });
+        }));
     }
 
     // ── 分组归约（segmented reduce，沿行方向按固定长度分组）───────────────
@@ -811,31 +886,35 @@ public:
         const Tensor& x, std::size_t G, std::size_t R,
         Precision P = Precision::F32)
     {
+        if (auto ec = bind_check_({&x}); !ec)
+            return std::unexpected(ec.error());
         if (x.precision() != Precision::F32 && supports_native_f16_reduce())
         {
             auto r = grouped_reduce_sum_impl(x, G, R, P);
             if (!r) return std::unexpected(r.error());
-            return to_prec(std::move(*r), P);
+            return stamp_(to_prec(std::move(*r), P));
         }
-        return unary_(x, P, [this, G, R](const Tensor& t)
+        return stamp_(unary_(x, P, [this, G, R](const Tensor& t)
         {
             return grouped_reduce_sum_impl(t, G, R, Precision::F32);
-        });
+        }));
     }
     [[nodiscard]] Result<Tensor> grouped_reduce_max(
         const Tensor& x, std::size_t G, std::size_t R,
         Precision P = Precision::F32)
     {
+        if (auto ec = bind_check_({&x}); !ec)
+            return std::unexpected(ec.error());
         if (x.precision() != Precision::F32 && supports_native_f16_reduce())
         {
             auto r = grouped_reduce_max_impl(x, G, R, P);
             if (!r) return std::unexpected(r.error());
-            return to_prec(std::move(*r), P);
+            return stamp_(to_prec(std::move(*r), P));
         }
-        return unary_(x, P, [this, G, R](const Tensor& t)
+        return stamp_(unary_(x, P, [this, G, R](const Tensor& t)
         {
             return grouped_reduce_max_impl(t, G, R, Precision::F32);
-        });
+        }));
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -859,12 +938,14 @@ public:
         std::size_t rows, std::size_t cols,
         Precision P = Precision::F32)
     {
+        if (auto ec = bind_check_(inputs); !ec)
+            return std::unexpected(ec.error());
         trace_variant_(spec, inputs, P);
         if (P == Precision::F32 && all_f32(inputs))
-            return eval_expr_impl(spec, inputs, rows, cols, Precision::F32);
+            return stamp_(eval_expr_impl(spec, inputs, rows, cols, Precision::F32));
         // ── in-kernel f16 优先（Phase 2）────────────────────────────────────
         if (supports_expr_precision_variant(spec, inputs, P))
-            return eval_expr_impl(spec, inputs, rows, cols, P);
+            return stamp_(eval_expr_impl(spec, inputs, rows, cols, P));
         if (prec_trace_enabled_())
             trace_miss_(spec, inputs, P);
         auto in32 = to_f32_all(inputs);
@@ -873,7 +954,7 @@ public:
         auto r = eval_expr_impl(spec, *in32, rows, cols, Precision::F32);
         if (!r)
             return std::unexpected(r.error());
-        return to_prec(std::move(*r), P);
+        return stamp_(to_prec(std::move(*r), P));
     }
 
     // ── 归约向量原生形状输出（LayerNorm/RMSNorm 小向量缓存等） ──────────
@@ -886,12 +967,14 @@ public:
         std::size_t rows, std::size_t cols,
         Precision P = Precision::F32)
     {
+        if (auto ec = bind_check_(inputs); !ec)
+            return std::unexpected(ec.error());
         trace_variant_(spec, inputs, P);
         if (P == Precision::F32 && all_f32(inputs))
-            return eval_expr_reduce_impl(spec, inputs, rows, cols, Precision::F32);
+            return stamp_(eval_expr_reduce_impl(spec, inputs, rows, cols, Precision::F32));
         // in-kernel f16 优先（与 eval_expr 同款；归约带类型变体由 gen_fused 生成）
         if (supports_expr_precision_variant(spec, inputs, P))
-            return eval_expr_reduce_impl(spec, inputs, rows, cols, P);
+            return stamp_(eval_expr_reduce_impl(spec, inputs, rows, cols, P));
         if (prec_trace_enabled_())
             trace_miss_(spec, inputs, P);
         auto in32 = to_f32_all(inputs);
@@ -900,7 +983,7 @@ public:
         auto r = eval_expr_reduce_impl(spec, *in32, rows, cols, Precision::F32);
         if (!r)
             return std::unexpected(r.error());
-        return to_prec(std::move(*r), P);
+        return stamp_(to_prec(std::move(*r), P));
     }
 
     // ── 目标传递（destination-passing）：结果写入已有张量 ────────────────
@@ -914,6 +997,10 @@ public:
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols, Tensor& out)
     {
+        if (auto ec = bind_check_(inputs); !ec)
+            return std::unexpected(ec.error());
+        if (auto ec = bind_check_({&out}); !ec)
+            return std::unexpected(ec.error());
         trace_variant_(spec, inputs, out.precision());
         if (out.precision() == Precision::F32 && all_f32(inputs))
         {
@@ -985,6 +1072,28 @@ public:
     // 默认实现仅覆盖"引擎未提供"的少数入口；其余为纯虚。
     // ══════════════════════════════════════════════════════════════════════
 protected:
+    // ── P1 NVI 的引擎侧实现（原公共虚入口下沉至此，stamp 在公共入口统一做）──
+    [[nodiscard]] virtual Tensor create_tensor_impl(std::size_t rows, std::size_t cols, Precision P) = 0;
+    [[nodiscard]] virtual Result<Tensor> from_matrix_impl(const Matrix& m, Precision P) = 0;
+    // cast 默认实现：同精度 = 返回 src（共享所有权，零拷贝）；跨精度 = 错误（引擎覆盖）
+    [[nodiscard]] virtual Result<Tensor> cast_impl(const Tensor& src, Precision dst)
+    {
+        if (src.precision() == dst)
+            return src;  // 同精度 = 返回共享所有权（零拷贝）
+        return std::unexpected(Error{"cast: 该引擎不支持跨精度转换"});
+    }
+    // offload 占位默认（激活 offload 是 GPU 特性；CPU 开启只得到 1×1 张量）
+    [[nodiscard]] virtual Result<Tensor> create_offload_buffer_impl(std::size_t /*bytes*/)
+    {
+        return Tensor::cpu(1, 1);
+    }
+    [[nodiscard]] virtual Result<Tensor> offload_restore_impl(
+        const Tensor& /*buffer*/, std::size_t /*offset*/,
+        std::size_t /*rows*/, std::size_t /*cols*/)
+    {
+        return Tensor::cpu(1, 1);
+    }
+
     // ── offload / 回读 ────────────────────────────────────────────────────
     // CPU no-op 默认（激活 offload 是 GPU 特性；CPU 开启只得到 1×1 张量）
     [[nodiscard]] virtual Result<void> offload_save_impl(
@@ -1147,6 +1256,115 @@ protected:
     }
 
 private:
+    // 库内 stamp 通道（15 §4.2 D2）：有引擎在场、但产物走静态工厂的位置
+    // （dsl::compute 的 eval_cpu 出口与扫描占位、compute_reduce 的归约向量
+    // 出口）统一经此补绑定。非用户 API——friend 限定给 nn::dsl 两个入口。
+    template <typename E>
+    friend Result<Tensor> dsl::compute(ComputeEngine&, const E&, std::size_t,
+                                       std::size_t, Precision);
+    template <typename E>
+    friend Result<Tensor> dsl::compute_reduce(ComputeEngine&, const E&, std::size_t,
+                                              std::size_t, Precision);
+    [[nodiscard]] Tensor adopt(Tensor t) { return stamp_(std::move(t)); }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // P1 出生 stamp（docs/development/15 §3.1）：未绑定的产物补上 this；
+    // 已绑定 → 原样（cast 同精度返回 src 等传播场景沿用 src 绑定，不改写）。
+    // 只 stamp 有效张量：失败路径返回的 Tensor() 空槽保持不绑定
+    // （§3.1：库内非绑定态仅剩空槽；库外直构不受本函数管辖）。
+    // ══════════════════════════════════════════════════════════════════════
+    [[nodiscard]] Tensor stamp_(Tensor t)
+    {
+        if (t.valid() && !t.engine_)
+            t.engine_ = make_observer(*this);
+        return t;
+    }
+    [[nodiscard]] Result<Tensor> stamp_(Result<Tensor>&& r)
+    {
+        if (r && r->valid() && !r->engine_)
+            r->engine_ = make_observer(*this);
+        return std::move(r);
+    }
+
+    // ── P1 跨引擎检查（15 §4.3 D3）──────────────────────────────────────
+    // 判定（D3 字面）：操作数指针判等——**双方都 bound 且不同 → Result 硬错误**；
+    // 单侧未绑定按库外豁免放行（P1 只加检查、零行为变化，ctest 不红）。
+    // NN_BIND_DEBUG=1（进程启动前设置）时"未绑定输入进引擎"也报错：用于抓
+    // 库内 stamp 漏网 + 产出 P2 库外迁移清单；P3 视情况转默认开并升 import。
+    // 错误带调用点 source_location（默认参在调用处求值）与张量形状。
+    [[nodiscard]] static bool bind_debug_enabled_()
+    {
+        static const bool on = [] {
+#if defined(_MSC_VER)
+            char* buf = nullptr; std::size_t len = 0;
+            _dupenv_s(&buf, &len, "NN_BIND_DEBUG");
+            const bool v = (buf != nullptr && buf[0] != '\0' && buf[0] != '0');
+            std::free(buf);
+            return v;
+#else
+            const char* v = std::getenv("NN_BIND_DEBUG");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+#endif
+        }();
+        return on;
+    }
+
+    [[nodiscard]] static Error bind_error_(const char* kind, const Tensor* t,
+                                           const Tensor* other,
+                                           std::source_location loc)
+    {
+        std::string s = std::string("bind_check_ ") + kind + " at "
+                      + loc.file_name() + ":" + std::to_string(loc.line()) + "  "
+                      + (t ? t->shape_str() : std::string("?"));
+        if (t && other)
+            s += " vs " + other->shape_str();
+        return Error{std::move(s)};
+    }
+
+    // 单操作数判定核心：维护"首个 bound 引擎"基准 ref，后续 bound 必须与之相等
+    [[nodiscard]] Result<void> bind_check_one_(const Tensor*& ref, const Tensor* t,
+                                               std::source_location loc) const
+    {
+        if (!t)
+            return {};
+        if (!t->bound())
+        {
+            if (bind_debug_enabled_())
+                return std::unexpected(
+                    bind_error_("unbound input into engine", t, nullptr, loc));
+            return {};   // 库外豁免（D3）
+        }
+        if (!ref)
+        {
+            ref = t;
+            return {};
+        }
+        if (t->engine_.get() != ref->engine_.get())
+            return std::unexpected(
+                bind_error_("mixed engines (both bound, pointers differ)", ref, t, loc));
+        return {};
+    }
+
+    [[nodiscard]] Result<void> bind_check_(std::initializer_list<const Tensor*> ts,
+                                           std::source_location loc = std::source_location::current()) const
+    {
+        const Tensor* ref = nullptr;
+        for (const Tensor* t : ts)
+            if (auto r = bind_check_one_(ref, t, loc); !r)
+                return r;
+        return {};
+    }
+
+    [[nodiscard]] Result<void> bind_check_(std::span<const Tensor> ts,
+                                           std::source_location loc = std::source_location::current()) const
+    {
+        const Tensor* ref = nullptr;
+        for (const Tensor& t : ts)
+            if (auto r = bind_check_one_(ref, &t, loc); !r)
+                return r;
+        return {};
+    }
+
     // ══════════════════════════════════════════════════════════════════════
     // 边界 cast 内部辅助（原 PrecisionEngine 私有工具，随下沉迁入基类）
     // ══════════════════════════════════════════════════════════════════════

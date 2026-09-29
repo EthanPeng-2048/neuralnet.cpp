@@ -34,7 +34,8 @@ $historicalFiles = @('compute_cuda_engine.hpp','compute_cuda_backend.hpp','cuda_
                      'expr_graph.hpp','cpu_emitter.hpp','algebra_expr.hpp','algebra_compute.hpp',
                      'perf_smoke.cpp','mnist_common.hpp','train_bytebpe.py',
                      'expr_fuse_test.cpp','expr_graph_test.cpp','expr_spec_test.cpp','matmul_fusion_test.cpp',
-                     'offload_primitive_test.cpp','offload_test.cpp','broadcast.comp')
+                     'offload_primitive_test.cpp','offload_test.cpp','broadcast.comp',
+                     'compute_precision_engine.hpp')   # P-1（2026-09-29）随 PrecisionEngine 下沉删除
 
 # ── [A] 文档引用的文件是否存在 ──────────────────────────────────────────
 Write-Host '=== [A] 文档引用但仓库中不存在的文件 ==='
@@ -118,7 +119,9 @@ $cmText = Get-Content CMakeLists.txt -Raw
 
 # 外部工具参数白名单（非本项目 CLI：ctest/cmake/glslc/torch 脚本等）
 $externalFlags = @('--test-dir','--parallel','--target-env','--dtype','--adam-eps','--device',
-                   '--task','--compress','--list','--image','--list-backends')
+                   '--task','--compress','--list','--image','--list-backends',
+                   '--summary',   # vulkaninfo（16 §复现命令）
+                   '--include')   # grep（16 §复现命令）
 # 已在文档中明确标注"已移除"的历史参数
 $removedFlags  = @('--cuda','--tdr-retry','--max-tdr-retries')
 

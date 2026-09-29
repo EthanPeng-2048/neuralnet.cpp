@@ -257,7 +257,7 @@ optimizer.step();
 | `development/10-development-standards.md` | C++ 编码规范全文 |
 | `development/12-compute-engine-inventory.md` | **引擎接口盘点（复现：`bench/doc_inventory.ps1`）：49 个 virtual、Layer 直调 23 个（基础设施/数据搬运/状态扫描/fold 登记）、两套 CPU 求值机制（DSL 模板 + IR 解释器）、ctest 20 个测试；演进记录见 `docs/history.md`** |
 | `development/13-refactor-backlog.md` | **重构与性能机会清单（2026-09-25 审查）：只记录方案不实施；误报/已修复项对照表与已执行记录在 `docs/history.md`，重复立项前先读本文件** |
-| `development/15-computeengine-refresh.md` | **ComputeEngine Refresh 详细设计（13 §10 展开）：张量出生绑定 + `import` + 存储多态；含 P-1（PrecisionEngine 下沉删除，**已实施 2026-09-29**）与 D1-D9 未决点裁定，立项前先读** |
+| `development/15-computeengine-refresh.md` | **ComputeEngine Refresh 详细设计（13 §10 展开）：张量出生绑定 + `import` + 存储多态；含 P-1（PrecisionEngine 下沉删除）与 P1（出生绑定 + `bind_check_` 跨引擎检查 + `adopt` 内部通道，**两项均已实施 2026-09-29**）与 D1-D9 未决点裁定，立项前先读** |
 | `development/16-computeengine-p0-inventory.md` | **Refresh P0 盘点结果（2026-09-28）：ensure_gpu 43 分类 / ComputeEngine& 175 打标 / 宿主中转 381 清单 / ctest 双基线（Lavapipe 20 20、Mali offload 非确定）/ GPU 稳定性探针与未决 7 项** |
 | `development/14-f16-stable-gpu-loss-frozen.md` | **故障报告（2026-09-26，未修）：GPU `stable=f16` 训练 loss 打印冻结（权重不冻结）——触发矩阵、测试覆盖缺口、证据与复现** |
 
@@ -279,11 +279,13 @@ optimizer.step();
 - **GPU `stable=f16` 训练 loss 打印冻结（未修）**：`text_train --precision-stable f16` 时 step 恒 4.0137、跨 epoch/跨进程逐位相同；**权重照常更新**（同进程跨 epoch 模型快照 63% 参数字节不同，冻结仅在 loss 回读链）；CPU 同配置健康；ctest 20/20 全绿但**无 GPU+stable=f16 用例**。触发矩阵、覆盖缺口与证据见 `docs/development/14-f16-stable-gpu-loss-frozen.md`。推荐路径 `--f16`（stable/optimizer=f32）实测健康。
 - **数值性限制**：四字段全 f16 不可训练——`optimizer=f16` 单独即令 Adam 更新爆炸、`stable=f16` 链约 200 步 NaN，见 `docs/development/05-mixed-precision.md` §12.5；常规 f32 训练健康收敛。
 - **不存在的 CLI 参数**：`--tdr-retry`/`--max-tdr-retries`（勿引用）。
+- **`text_train --model zipt` 启动即中止（未修）**：CLI 调 `set_checkpoint_every(0)`，而 `compute_layer_zipt.hpp` 的该 override 不判 `stride==0` 直接 abort、且 abort 后进程挂死；zipt 运行期覆盖当前靠 `zipt_test`（2026-09-29 记录，详见 15 §7.3 与 `docs/history.md`）。
 
 ### 已交付能力（当前功能清单）
 
 - **混合精度**：`precision.hpp` 的 `Precision`/`PrecisionProfile{param/compute/stable/optimizer}`；CPU/GPU f16 路径 = 边界 cast（`ComputeEngine` 基类 NVI 入口，**原 `PrecisionEngine` 装饰器已删除下沉**，见 15 §4.1）+ in-kernel f16 带类型变体 + op-level f16 GEMM（一份 .comp 用 `-DNN_SHADER_F16=1` 编第二份 SPIR-V）；`--f16` = `profile_f16()` = {param:F16, compute:F16, stable:F32, optimizer:F32}，实测峰值显存低于 f32（`docs/development/05` §12.11）。
 - **线性注意力**：RLA-2 / RAPT（`docs/development/06`）。
+- **张量出生绑定（Refresh P1，2026-09-29）**：`Tensor::engine_` observer + `bound()`/`engine()`；库内产物出生即绑定——引擎公共入口（含 `create_tensor`/`from_matrix`/`cast` 等已 NVI 化的工厂）统一 `stamp_`，`dsl::compute`/`compute_reduce` 静态工厂出口经内部 `adopt` 通道；公共入口带 `bind_check_` 跨引擎检查（**双方都绑定且指针不同 → 硬错误**，单侧未绑定放行；`NN_BIND_DEBUG=1` 时未绑定输入也报错，用于抓库内漏网与 P2 库外迁移清单）。**库内新增 Tensor 出生点必须走引擎入口或 `adopt`，新引擎入口须带 `bind_check_`+`stamp_`**（模板见 `docs/development/01` 步骤 1，取舍见 15 §3.1/§4.3）。
 - **训练稳定性**：防 NaN 跳步。
 - **训练显存开关（GPT 与 RAPT 同档）**：梯度检查点 `set_checkpoint_every`、activation offload `set_activation_offload`、文档掩码 `set_doc_ids`、batch flush 粒度 `set_flush_interval`；检查点与 offload **可混合**（checkpoint 块重算、其余块 offload）。引擎侧 API 为 `create_offload_buffer`/`offload_save`/`offload_restore`（`set_offload_enabled` 不存在）。
 - **Vulkan 多设备选择**：`--gpu` 参数与 `NN_VULKAN_DEVICE` 环境变量（`cli/cli_gpu_option.hpp`、`backend/compute_vk_device.hpp`）。
