@@ -5,7 +5,7 @@
 //       而 clang 是 3.1822；AOT 产物逐字节相同 → 差异在 MSVC 编译的 host 侧。
 // 本探针把「参数更新」缩到单表达式：
 //   K3 模式 = dsl::compute_into(engine, leaf(p) + leaf(delta), p)
-//   p 为 f16 存储（PrecisionEngine 适配层路径），逐步打印写入前后值。
+//   p 为 f16 存储（基类边界 cast 入口，原 PrecisionEngine 已下沉），逐步打印写入前后值。
 // 期望：写后 p == p_before + delta。若不变 → 写回路径坏（host 侧）；
 //       若变化 → 上层（optimizer 接线）问题。
 // 用法：f16_writeback_probe [--gpu[=名称]]
@@ -224,7 +224,7 @@ int main(int argc, char* argv[])
     // CPU 对照（始终跑）
     {
         nn::CpuEngine cpu;
-        nn::PrecisionEngine padapter(cpu);
+        nn::ComputeEngine& padapter = cpu;   // P-1：原 PrecisionEngine 已下沉
         std::printf("── CPU ──\n");
         probe_inplace(padapter, "cpu", false);
         probe_optimizer_steps(padapter, "cpu", false);
@@ -240,7 +240,7 @@ int main(int argc, char* argv[])
             return 77;  // ctest SKIP
         }
         nn::GpuEngine gpu(backend);
-        nn::PrecisionEngine adapter(gpu);
+        nn::ComputeEngine& adapter = gpu;   // P-1：原 PrecisionEngine 已下沉
         std::printf("── GPU（%s）──\n", backend.device().device_name().c_str());
         probe_inplace(adapter, "gpu", true);
         probe_optimizer_steps(adapter, "gpu", true);

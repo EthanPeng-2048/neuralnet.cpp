@@ -374,8 +374,8 @@ int main(int argc, char* argv[])
     take_sample("engine-init");
 
     // ── 精度配置 ────────────────────────────────────────────────────────
-    // f16 存储必须经 PrecisionEngine 适配层（边界 cast）—— 原生引擎只实现
-    // f32 存储（见 compute_engine.hpp 的多精度说明）。
+    // f16 存储由基类边界 cast 入口处理（NVI，原 PrecisionEngine；见
+    // compute_engine.hpp 的多精度说明）。
     nn::PrecisionProfile prof;
     if (f16)
     {
@@ -386,12 +386,7 @@ int main(int argc, char* argv[])
             prof.optimizer = nn::Precision::F16;
         }
     }
-    std::optional<nn::PrecisionEngine> precision_adapter;
-    if (!nn::is_profile_f32(prof))
-        precision_adapter.emplace(*raw_engine);
-    nn::ComputeEngine* engine = precision_adapter
-        ? static_cast<nn::ComputeEngine*>(&*precision_adapter)
-        : raw_engine.get();
+    nn::ComputeEngine* engine = raw_engine.get();
 
     // ── 构建模型 ────────────────────────────────────────────────────────
     auto model_r = nn::build_gpt_model(*engine, nn::GptConfig{
@@ -664,7 +659,7 @@ int main(int argc, char* argv[])
     std::cout << "════════════════════════════════\n";
 
     // 边界 cast 临时量归因（NN_PREC_TRACE=1 时才有数据；f16 路径专用）
-    std::cout << nn::PrecisionEngine::dump_temp_stats();
+    std::cout << nn::ComputeEngine::dump_temp_stats();
 
     return 0;
 }
