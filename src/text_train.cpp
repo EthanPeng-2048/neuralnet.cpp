@@ -945,25 +945,20 @@ int main(int argc, char *argv[])
     }
     auto raw_engine = std::move(*engine_res);
 
-    // ── 多精度适配层（f16 存储）────────────────────────────────
-    // 非全 f32 配置（--f16 / --precision-*）时把内层引擎包进 PrecisionEngine：
-    // f16 的边界 cast（f16 抬到 f32 计算 → 按目标精度落回）集中在该层；
-    // 引擎提供 f16 变体的算子直读写 f16，其余算子走 f32 边界 cast
-    //（expr_spec_key 本身不含精度维度，f16 变体按 (key, 精度签名) 另行注册）。
+    // ── 多精度：边界 cast 已下沉基类（NVI，原 PrecisionEngine，f16 存储）────────────────────────────────
+    // f16 存储（--f16 / --precision-*）直接由引擎入口处理：有 in-kernel f16
+    // 变体/f16 GEMM 的算子直读写 f16，其余算子在入口抬 f32 计算 → 按目标精度
+    // 落回（expr_spec_key 本身不含精度维度，f16 变体按 (key, 精度签名) 另行注册）。
+    // 全 f32 时入口为快速直通分支，与原生引擎逐字节一致。
     // 层内的 p_.param/compute/stable/optimizer 是唯一精度来源（§8.5 G4）。
-    // 全 f32 时**不包**：直接走原生引擎，省掉适配层的逐原语分支判断。
-    std::optional<nn::PrecisionEngine> precision_adapter;
     if (!nn::is_profile_f32(cfg.precision))
     {
-        precision_adapter.emplace(*raw_engine);
-        std::cout << "[精度] f16 存储已启用（PrecisionEngine 适配层 + in-kernel f16 变体 + f16 GEMM）\n"
+        std::cout << "[精度] f16 存储已启用（基类边界 cast + in-kernel f16 变体 + f16 GEMM）\n"
                      "  [提示] 池底材粒度可用 NN_POOL_BLOCK_MB / NN_POOL_LADDER_MAX_MB 调参"
                      "（探针/实验用），\n"
                      "         详见 docs/development/05-mixed-precision.md §12.10。\n";
     }
-    nn::ComputeEngine* engine = precision_adapter
-        ? static_cast<nn::ComputeEngine*>(&*precision_adapter)
-        : raw_engine.get();
+    nn::ComputeEngine* engine = raw_engine.get();
 
     // ── 显存阶段采样（NN_MEM_STATS=1，诊断用，默认关闭）─────────────────
     // 在真实训练负载的各生命周期阶段打印池统计 + 延迟销毁字节，用于把
@@ -1036,9 +1031,9 @@ int main(int argc, char *argv[])
                       << " optimizer=" << nn::precision_name(pp.optimizer) << "\n";
             // 消费方说明：
             //   · param/compute 由 Layer 的 p_.param/p_.compute 传给引擎原语与
-            //     dsl::compute，经 PrecisionEngine 适配层落成 f16 **存储**
+            //     dsl::compute，经基类边界 cast 入口落成 f16 **存储**
             //     （引擎提供 f16 变体的算子直读写，其余走 f32 边界 cast；见
-            //     compute_precision_engine.hpp）；
+            //     compute_engine.hpp 的 NVI 边界 cast 层）；
             //   · stable 用于 softmax/LayerNorm/loss 链；optimizer 用于 Adam m/v。
             // 局限：走边界 cast 时，"被多个算子读取的大张量"（如 vocab 级 logits）
             // 会各算子各物化一份 f32 副本 → LM head 固定走 stable（见 GPTModel

@@ -130,7 +130,7 @@ bench/raw/f16_ep2.bin  (2,971,754 B)  ← epoch2 结束时
 
 ## 7. 建议下一步（只记录，不实施）
 
-1. **最小复现收窄**：绕过 text_train，直接用小张量 + `PrecisionEngine(GpuEngine)` 复现 `forward_sparse_sum`（stable=f16）输出恒定——把嫌疑从 CLI 压到单个原语。
+1. **最小复现收窄**：绕过 text_train，直接用小张量 + `GpuEngine` 复现 `forward_sparse_sum`（stable=f16）输出恒定（P-1 后边界 cast 在基类 NVI 入口，无需适配层）——把嫌疑从 CLI 压到单个原语。
 2. **补 GPU profile 矩阵用例**：把 `debug_profile_matrix` 的 stable=f16 形态搬到 GPU 分支并加入默认 ctest（或至少 `{F16,F16,F16,F16}` 端到端轨迹对拍），关闭 §3 的覆盖缺口。
 3. **回读二分**：在 `harvest_loss` 打印 `sum` 原始值 + 槽位号，验证「提交前 vs 读回」哪一侧为常数（`NN_F16_DEBUG` 风格开关，默认零开销）。
 4. 若确认权重更新健康，考虑给 `--precision-stable f16` 组合加启动期告警（与 `--activation-offload` 的 CPU 警告同风格）。

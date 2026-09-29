@@ -201,7 +201,7 @@ public:
         return std::unexpected(Error{"cast_into: unsupported precision conversion"});
     }
 
-    [[nodiscard]] Result<void> copy_from(Tensor& dst, const Matrix& src) override
+    [[nodiscard]] Result<void> copy_from_impl(Tensor& dst, const Matrix& src) override
     {
         if (!dst.is_cpu())
             return std::unexpected(Error{"copy_from: dst tensor is not CPU"});
@@ -211,7 +211,7 @@ public:
         return {};
     }
 
-    [[nodiscard]] Result<Tensor> clone(const Tensor& src) override
+    [[nodiscard]] Result<Tensor> clone_impl(const Tensor& src) override
     {
         if (!src.is_cpu())
             return std::unexpected(Error{"clone: src tensor is not CPU"});
@@ -219,7 +219,7 @@ public:
     }
 
     // ── 行切片：拷贝 src 的行 [start_row, start_row + count) 到新 Tensor ──
-    [[nodiscard]] Result<Tensor> slice_rows(
+    [[nodiscard]] Result<Tensor> slice_rows_impl(
         const Tensor& src, std::size_t start_row, std::size_t count) override
     {
         if (!src.is_cpu())
@@ -239,7 +239,7 @@ public:
     }
 
     // ── 行插入：将 src 的所有行写入 dst 的行 [dst_start_row, ...) ──
-    [[nodiscard]] Result<void> insert_rows(
+    [[nodiscard]] Result<void> insert_rows_impl(
         Tensor& dst, std::size_t dst_start_row, const Tensor& src) override
     {
         if (!dst.is_cpu() || !src.is_cpu())
@@ -269,7 +269,7 @@ public:
     //   - num * D >= PARALLEL_THRESHOLD 时启用行块并行
     //   - 否则串行（小批量查表的 D 通常较小，并行调度开销不划算）
     //   - 行块并行避免跨行数据竞争（每行独立写入）
-    [[nodiscard]] Result<Tensor> gather_rows(
+    [[nodiscard]] Result<Tensor> gather_rows_impl(
         const Tensor& table, const Tensor& indices) override
     {
         if (!table.is_cpu() || !indices.is_cpu())
@@ -328,7 +328,7 @@ public:
     // ── scatter_add_rows: 按 indices 把 grad 的行原子累加到 dst ──
     //   dst: (vocab, D) 原地修改, indices: 任意形状（按 flat 遍历）, grad: (num_indices, D)
     //   语义: dst[flat_indices[i]] += grad[i]
-    [[nodiscard]] Result<void> scatter_add_rows(
+    [[nodiscard]] Result<void> scatter_add_rows_impl(
         Tensor& dst, const Tensor& indices, const Tensor& grad) override
     {
         if (!dst.is_cpu() || !indices.is_cpu() || !grad.is_cpu())
@@ -370,7 +370,7 @@ public:
     //   - total >= PARALLEL_THRESHOLD 时启用块级并行
     //   - 每块仅一次 std::copy_n(N)，cache 友好
     //   - 典型场景：MHA 中 d_model=128, batch=32, seq=256 → 1M 元素，明显受益
-    [[nodiscard]] Result<Tensor> rearrange_3d(
+    [[nodiscard]] Result<Tensor> rearrange_3d_impl(
         const Tensor& x, std::size_t M, std::size_t B, std::size_t N,
         bool inverse) override
     {
@@ -426,7 +426,7 @@ public:
     }
 
     // ── 矩阵转置：A (R, C) → out (C, R) ──
-    [[nodiscard]] Result<Tensor> transpose(const Tensor& A) override
+    [[nodiscard]] Result<Tensor> transpose_impl(const Tensor& A) override
     {
         if (A.is_gpu())
             return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
@@ -436,7 +436,7 @@ public:
     // ── 卷积/池化窗口展开（详见 compute_engine.hpp 契约）───────────────
     // 并行策略：按输出行（im2col 的 r / col2im 的输入像素行）切块，块间无竞争；
     //   两个方向的写入都是**连续行**，读取按窗口散布。
-    [[nodiscard]] Result<Tensor> im2col(
+    [[nodiscard]] Result<Tensor> im2col_impl(
         const Tensor& x,
         std::size_t C, std::size_t H, std::size_t W,
         std::size_t k, std::size_t stride, std::size_t pad,
@@ -505,7 +505,7 @@ public:
         return Tensor::from_matrix(std::move(out));
     }
 
-    [[nodiscard]] Result<Tensor> col2im(
+    [[nodiscard]] Result<Tensor> col2im_impl(
         const Tensor& col,
         std::size_t C, std::size_t H, std::size_t W,
         std::size_t k, std::size_t stride, std::size_t pad,
@@ -573,7 +573,7 @@ public:
     // 矩阵级原语
     // ══════════════════════════════════════════════════════════════════════
 
-    [[nodiscard]] Result<Tensor> matmul(
+    [[nodiscard]] Result<Tensor> matmul_impl(
         const Tensor& A, const Tensor& B,
         bool transA, bool transB,
         Precision P = Precision::F32) override
@@ -671,7 +671,7 @@ public:
     // 覆盖基类默认的"matmul + host 端 to_matrix 往返加 bias"：CPU 走模板求值，
     // GPU 走 AOT 融合 shader；scan_exprs dry-run 经本路径收集该结构 → gen_fused
     // 生成融合 kernel（结构没被收集 = GPU 闭合世界里没有对应 key）。
-    [[nodiscard]] Result<Tensor> matmul_with_bias(
+    [[nodiscard]] Result<Tensor> matmul_with_bias_impl(
         const Tensor& A, const Tensor& B, const Tensor& bias,
         bool transA = false, bool transB = false,
         Precision P = Precision::F32) override
@@ -693,7 +693,7 @@ public:
     // ── 批量矩阵乘法：按 batch 切分行块，逐 batch 矩阵乘 ──
     // C_b = alpha * op(A_b, B_b)（alpha 为 cuBLAS sgemm 语义的输出缩放系数）
     // P: 计算精度（§8.1，同 matmul）
-    [[nodiscard]] Result<Tensor> batched_matmul(
+    [[nodiscard]] Result<Tensor> batched_matmul_impl(
         const Tensor& A, const Tensor& B,
         std::size_t batch,
         bool transA, bool transB,
@@ -851,7 +851,7 @@ public:
         return Tensor::from_matrix(std::move(result));
     }
 
-    [[nodiscard]] Result<void> add_inplace(Tensor& A, const Tensor& B) override
+    [[nodiscard]] Result<void> add_inplace_impl(Tensor& A, const Tensor& B) override
     {
         if (A.rows() != B.rows() || A.cols() != B.cols())
             return std::unexpected(Error{"add_inplace: shape mismatch"});
@@ -859,13 +859,13 @@ public:
         return {};
     }
 
-    [[nodiscard]] Result<void> scale_inplace(Tensor& A, Scalar s) override
+    [[nodiscard]] Result<void> scale_inplace_impl(Tensor& A, Scalar s) override
     {
         A.cpu_matrix().scale_inplace(s);
         return {};
     }
 
-    [[nodiscard]] Result<void> zero(Tensor& A) override
+    [[nodiscard]] Result<void> zero_impl(Tensor& A) override
     {
         A.cpu_matrix().zero();
         return {};
@@ -880,7 +880,7 @@ public:
     // ══════════════════════════════════════════════════════════════════════
 
     // ── 前缀扫描（forward / backward pass 1 / forward_step）──────────────
-    [[nodiscard]] Result<Tensor> scan_prefix_outer(
+    [[nodiscard]] Result<Tensor> scan_prefix_outer_impl(
         const Tensor& K, const Tensor& V, const Tensor& P, const Tensor& R,
         const Tensor& A0, const Tensor& B0, bool has_state,
         std::size_t dk, std::size_t heads, bool causal,
@@ -1029,7 +1029,7 @@ public:
     }
 
     // ── 后缀扫描（backward pass 2：gK/gV）────────────────────────────────
-    [[nodiscard]] Result<Tensor> scan_suffix_outer(
+    [[nodiscard]] Result<Tensor> scan_suffix_outer_impl(
         const Tensor& D, const Tensor& X, const Tensor& Y,
         std::size_t dk, std::size_t heads, bool causal,
         const Tensor& boundary, bool has_bnd,
@@ -1123,7 +1123,7 @@ public:
     }
 
     // ── 逐列外积（backward 的 dL/dA、dL/dB 物化）─────────────────────────
-    [[nodiscard]] Result<Tensor> outer_col(
+    [[nodiscard]] Result<Tensor> outer_col_impl(
         const Tensor& P, const Tensor& R, const Tensor& S,
         std::size_t dk, bool has_scale,
         Precision = Precision::F32) override
@@ -1175,7 +1175,7 @@ public:
     // 归约原语
     // ══════════════════════════════════════════════════════════════════════
 
-    [[nodiscard]] Result<Tensor> row_reduce_sum(const Tensor& A, Precision = Precision::F32) override
+    [[nodiscard]] Result<Tensor> row_reduce_sum_impl(const Tensor& A, Precision = Precision::F32) override
     {
         const Matrix& m = A.cpu_matrix();
         Matrix result = m.row_reduce(Scalar{0},
@@ -1184,7 +1184,7 @@ public:
         return Tensor::from_matrix(std::move(result));
     }
 
-    [[nodiscard]] Result<Tensor> col_reduce_sum(const Tensor& A, Precision = Precision::F32) override
+    [[nodiscard]] Result<Tensor> col_reduce_sum_impl(const Tensor& A, Precision = Precision::F32) override
     {
         const Matrix& m = A.cpu_matrix();
         Matrix result = m.col_reduce(Scalar{0},
@@ -1193,7 +1193,7 @@ public:
         return Tensor::from_matrix(std::move(result));
     }
 
-    [[nodiscard]] Result<Tensor> col_reduce_max(const Tensor& A, Precision = Precision::F32) override
+    [[nodiscard]] Result<Tensor> col_reduce_max_impl(const Tensor& A, Precision = Precision::F32) override
     {
         const Matrix& m = A.cpu_matrix();
         Matrix result = m.col_reduce(
@@ -1253,14 +1253,14 @@ public:
         return Tensor::from_matrix(std::move(out));
     }
 
-    [[nodiscard]] Result<Tensor> grouped_reduce_sum(
+    [[nodiscard]] Result<Tensor> grouped_reduce_sum_impl(
         const Tensor& x, std::size_t G, std::size_t R,
         Precision = Precision::F32) override
     {
         return grouped_reduce_cpu_<false>(x, G, R);
     }
 
-    [[nodiscard]] Result<Tensor> grouped_reduce_max(
+    [[nodiscard]] Result<Tensor> grouped_reduce_max_impl(
         const Tensor& x, std::size_t G, std::size_t R,
         Precision = Precision::F32) override
     {
@@ -1275,7 +1275,7 @@ public:
     // 纯索引映射，无物化。性能与等价手写循环一致。
     // ══════════════════════════════════════════════════════════════════════
 
-    [[nodiscard]] Result<Tensor> eval_expr(
+    [[nodiscard]] Result<Tensor> eval_expr_impl(
         const ExprSpec& spec,
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols,
@@ -1294,7 +1294,7 @@ public:
     //   行归约轴 → (rows,1)，列归约轴 → (1,cols)（而非广播到 (rows,cols)）。
     // 要求：表达式归约轴为 0/1；末指令为归约时直接取归约向量，否则按代表
     //   元素求值（所有 Input 须经归约/广播视图访问，保证沿归约轴恒定）。
-    [[nodiscard]] Result<Tensor> eval_expr_reduce(
+    [[nodiscard]] Result<Tensor> eval_expr_reduce_impl(
         const ExprSpec& spec,
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols,
@@ -1319,7 +1319,7 @@ public:
     // （就地安全前提：每个元素先读完全部输入再写 out[i]；GPU 同一 buffer 绑定为
     // readonly 输入 + writeonly 输出的逐元素同索引读写亦无跨调用危害）。
     // 仅支持逐元素表达式（无归约）；归约向量输出用 eval_expr_reduce。
-    [[nodiscard]] Result<void> eval_expr_into(
+    [[nodiscard]] Result<void> eval_expr_into_impl(
         const ExprSpec& spec,
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols, Tensor& dst) override
@@ -1710,7 +1710,7 @@ public:
             // 响亮报错，让误用立刻暴露。
             if (t.precision() != Precision::F32)
                 return std::unexpected(Error{
-                    "eval_expr: CPU 解释器仅支持 f32 输入（f16 须经 PrecisionEngine 边界 cast）"});
+                    "eval_expr: CPU 解释器仅支持 f32 输入（f16 须由基类 NVI 入口先抬到 f32（直调 eval_expr_impl 才会到这里））"});
             const ExprView& v = spec.views[k];
             if (mm && (k == static_cast<std::size_t>(mm->a_input) ||
                        k == static_cast<std::size_t>(mm->b_input)))
@@ -1793,7 +1793,7 @@ public:
         // span 更小，而下述归约重放循环仍按网格遍历）。
         if (output.precision() != Precision::F32)
             return std::unexpected(Error{
-                "eval_expr: CPU 解释器输出须为 f32 存储（f16 输出须经 PrecisionEngine 落回）"});
+                "eval_expr: CPU 解释器输出须为 f32 存储（f16 输出须由基类 NVI 入口落回）"});
         Span out = output.cpu_matrix().span();
         const std::size_t n = rows * cols;
         if (n == 0)

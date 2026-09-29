@@ -66,7 +66,7 @@ int main()
 {
     std::printf("f16_cpu_probe（profile_f16 组件级定位）\n");
     nn::CpuEngine raw;
-    nn::PrecisionEngine ad(raw);
+    nn::ComputeEngine& ad = raw;   // P-1：边界 cast 已下沉基类（原 PrecisionEngine）
     const auto prof = nn::profile_f16();
 
     constexpr std::size_t D = 16, OUT = 32, SEQ = 4, BATCH = 2, TOTAL = SEQ * BATCH;

@@ -486,9 +486,9 @@ inline constexpr PrecisionProfile profile_all_f16() noexcept
         /*optimizer=*/ Precision::F16};
 }
 
-// 便捷判定：全 F32 配置。CLI 用它决定是否启用
-// PrecisionEngine 适配层（全 f32 时直通原生引擎，零额外开销，结果与直接
-// 使用原生引擎逐字节一致）。
+// 便捷判定：全 F32 配置。CLI 用它决定是否打印精度启用提示（边界 cast
+// 入口常驻 ComputeEngine 基类 NVI：全 f32 时快速直通，零额外开销，结果与
+// 直接使用原生引擎逐字节一致；非 f32 profile 由该入口自动接管）。
 [[nodiscard]] constexpr bool is_profile_f32(const PrecisionProfile& p) noexcept
 {
     return p.param == Precision::F32 && p.compute == Precision::F32 &&
