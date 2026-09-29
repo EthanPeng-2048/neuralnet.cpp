@@ -202,9 +202,21 @@ int main(int argc, char **argv)
     }
     if (gpu)
     {
-        const char *env = std::getenv("NN_VULKAN_DEVICE");
+        // MSVC CRT 弃用 getenv（-Werror）：按平台用 _dupenv_s / getenv。
+        const char *env = nullptr;
+#if defined(_MSC_VER)
+        char *buf = nullptr;
+        std::size_t len = 0;
+        _dupenv_s(&buf, &len, "NN_VULKAN_DEVICE");
+        env = buf;
+#else
+        env = std::getenv("NN_VULKAN_DEVICE");
+#endif
         std::printf("CONFIG device=%s (NN_VULKAN_DEVICE=%s) steps=%zu\n",
                     device_desc.c_str(), env ? env : "<unset>", steps);
+#if defined(_MSC_VER)
+        std::free(buf);
+#endif
     }
     else
     {

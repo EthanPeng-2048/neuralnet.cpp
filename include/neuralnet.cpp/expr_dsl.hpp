@@ -1339,7 +1339,7 @@ template <typename E>
 template <typename E>
 [[nodiscard]] Result<Tensor> compute(ComputeEngine& eng, const E& e,
                                      std::size_t rows, std::size_t cols,
-                                     Precision P = Precision::F32)
+                                     Precision P)   // 默认实参在 compute_engine.hpp 前置声明处
 {
 #ifdef NN_EXPR_SCAN
     // 构建期扫描模式：折叠内联表达式的**结构**并登记进全局注册表，
@@ -1354,8 +1354,8 @@ template <typename E>
     // dry-run 下游层看到的是 f32，f16 变体永远发现不到。
     const ExprPrecSig sig = expr_prec_sig_of(inputs, P);
     fused::global_registry().add(spec, sig);
-    return P == Precision::F16 ? Tensor::cpu<Precision::F16>(rows, cols)
-                               : Tensor::cpu(rows, cols);
+    return eng.adopt(P == Precision::F16 ? Tensor::cpu<Precision::F16>(rows, cols)
+                                         : Tensor::cpu(rows, cols));
 #else
     if (eng.device() == Device::CPU)
     {
@@ -1368,7 +1368,7 @@ template <typename E>
                 // 预绑定只是**优化**：任何前置条件不满足（形状/设备不符等）就
                 // 回退解释器（同一表达式的等价求值路径），不引入正确性风险。
                 if (auto r = cpu_prepare(e, eng, rows, cols); r)
-                    return eval_cpu(e, rows, cols, P);
+                    return eng.adopt(eval_cpu(e, rows, cols, P));
             }
             // 含归约且不可预绑定（或预绑定失败）：模板求值无法表达"全行/全列
             // 归约"，折叠成 ExprSpec 走引擎 eval_expr（CPU 扩展语义处理归约
@@ -1378,7 +1378,7 @@ template <typename E>
                 return std::unexpected(v.error());
             return eng.eval_expr(spec, inputs, rows, cols, P);
         }
-        return eval_cpu(e, rows, cols, P);
+        return eng.adopt(eval_cpu(e, rows, cols, P));
     }
 
     auto [spec, inputs] = to_expr_spec(e);
@@ -1517,7 +1517,7 @@ template <typename E>
 template <typename E>
 [[nodiscard]] Result<Tensor> compute_reduce(ComputeEngine& eng, const E& e,
                                             std::size_t rows, std::size_t cols,
-                                            Precision P = Precision::F32)
+                                            Precision P)   // 默认实参在 compute_engine.hpp 前置声明处
 {
 #ifdef NN_EXPR_SCAN
     // 构建期扫描：同 compute()，登记结构（归约轴由 gen_fused 判定）。
@@ -1532,12 +1532,12 @@ template <typename E>
     const ExprPrecSig sig = expr_prec_sig_of(inputs, P);
     fused::global_registry().add(spec, sig);
     if (P == Precision::F16)
-        return (raxis == 0) ? Tensor::cpu<Precision::F16>(rows, 1)
+        return eng.adopt((raxis == 0) ? Tensor::cpu<Precision::F16>(rows, 1)
              : (raxis == 1) ? Tensor::cpu<Precision::F16>(1, cols)
-             : Tensor::cpu<Precision::F16>(rows, cols);
-    return (raxis == 0) ? Tensor::cpu(rows, 1)
+             : Tensor::cpu<Precision::F16>(rows, cols));
+    return eng.adopt((raxis == 0) ? Tensor::cpu(rows, 1)
          : (raxis == 1) ? Tensor::cpu(1, cols)
-         : Tensor::cpu(rows, cols);
+         : Tensor::cpu(rows, cols));
 #else
     if (eng.device() == Device::CPU)
     {
@@ -1550,7 +1550,7 @@ template <typename E>
             {
                 auto v = reduce_vector_tensor(e, rows, cols);
                 if (P == Precision::F32)
-                    return v;
+                    return eng.adopt(std::move(v));
                 // f16 目标：归约向量求值在 f32 参考空间，结果舍入到 f16（§7.3）
                 return eng.cast(v, P);
             }

@@ -10,6 +10,8 @@
 //   - 访问器按 P 模板化（P 默认 F32）
 //   - precision_ 与 device_ 共同唯一确定存储的有效类型
 //   - 使用 shared_ptr 内部持有存储，拷贝廉价（零拷贝传递）
+//   - 出生绑定（P1）：engine_ 观察创建本张量的引擎；库内产物出生即绑定，
+//     绑定随拷贝/reshape 传播（docs/development/15 §3.1）
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <algorithm>
@@ -22,6 +24,7 @@
 
 #include "core_config.hpp"
 #include "core_errors.hpp"
+#include "core_observer_ptr.hpp"
 #include "precision.hpp"
 #include "algebra_matrix.hpp"
 
@@ -31,6 +34,10 @@
 
 namespace nn
 {
+
+// ComputeEngine 前置声明：Tensor 持有非拥有绑定（observer_ptr，P1 出生绑定，
+// docs/development/15-computeengine-refresh.md §3.1），不能反向 include。
+class ComputeEngine;
 
 // ── 计算设备 ──────────────────────────────────────────────────────────────
 enum class Device : uint8_t
@@ -55,6 +62,16 @@ private:
     Precision precision_ = Precision::F32;
     std::size_t rows_ = 0;
     std::size_t cols_ = 0;
+
+    // ── 出生绑定（P1，docs/development/15 §3.1）──────────────────────────
+    // 创建本张量的引擎（非拥有观察者；+8B）。未绑定 = nullptr（非绑定态仅剩
+    // 库外直构：Tensor{} 空槽、src/ 测试的 Tensor::from_matrix/from_host 之前
+    // 的宿主直构）。库内产物出生即绑定——由引擎工厂/算子出口 stamp 或
+    // ComputeEngine::adopt 内部通道补绑定。engine 生命周期必须长于其创建的
+    // Tensor（一期不加析构探测，13 §10.3 第 3 条）。
+    observer_ptr<ComputeEngine> engine_ = nullptr;
+
+    friend class ComputeEngine;
 
     // ── CPU 存储：类型擦除（std::variant，§6.1）──────────────────────────
     // Phase 1：F16（index 0）/ F32（index 1）
@@ -193,6 +210,17 @@ public:
     [[nodiscard]] bool is_cpu() const noexcept { return device_ == Device::CPU; }
     [[nodiscard]] bool is_gpu() const noexcept { return device_ == Device::GPU; }
 
+    // ── 出生绑定（P1，§3.1）──────────────────────────────────────────────
+    // bound()：是否已 stamp 到某个引擎（未绑定输入在 P1 检查中按库外豁免放行，
+    //   仅 NN_BIND_DEBUG=1 时报错——见 ComputeEngine::bind_check_）。
+    // engine()：取绑定引擎；未绑定 → NN_ASSERT 硬失败（勿在未绑定张量上调用）。
+    [[nodiscard]] bool bound() const noexcept { return static_cast<bool>(engine_); }
+    [[nodiscard]] ComputeEngine& engine() const
+    {
+        NN_ASSERT(engine_, "Tensor::engine(): tensor is not bound to any engine");
+        return *engine_;
+    }
+
     // ── valid：存储匹配 precision_ 且非空 ────────────────────────────────
     [[nodiscard]] bool valid() const noexcept
     {
@@ -301,6 +329,7 @@ public:
         t.precision_ = precision_;
         t.rows_ = new_rows;
         t.cols_ = new_cols;
+        t.engine_ = engine_;  // 传播：reshape 沿用 src 绑定（§3.1）
 #ifdef NN_HAS_VULKAN
         t.gpu_data_ = gpu_data_;
 #endif

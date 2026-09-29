@@ -103,13 +103,25 @@ engine.begin_batch();
 engine.end_batch();  // 提交并等待
 ```
 
+> **接口分层（NVI，P-1/P1 之后）**：引擎的**公共入口全部非虚**——承载边界 cast
+> （f16 抬 f32 算→按 P 落回，15 §4.1）、`bind_check_`（跨引擎检查，15 §4.3 D3）
+> 与 `stamp_`（张量出生绑定，15 §3.1）；**引擎实现侧是 protected 的虚 `*_impl`**。
+> 下文各"原语"清单列出的就是引擎需要实现的 `*_impl` 签名；调用方（Layer/测试）
+> 永远调用**同名公共入口**（不带 `_impl`）。
+
 ### 3. 张量工厂
 
 ```cpp
-[[nodiscard]] virtual Tensor create_tensor(std::size_t rows, std::size_t cols,
-                                           Precision P = Precision::F32) = 0;
-[[nodiscard]] virtual Result<Tensor> from_matrix(const Matrix& m, Precision P = Precision::F32) = 0;
+// 公共非虚入口（包装在尾部统一 stamp 出生绑定，15 §3.1）：
+[[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols,
+                                   Precision P = Precision::F32);
+[[nodiscard]] Result<Tensor> from_matrix(const Matrix& m, Precision P = Precision::F32);
+// to_matrix 输出宿主 Matrix，仍为纯虚（不参与 stamp）：
 [[nodiscard]] virtual Result<Matrix> to_matrix(const Tensor& t, Precision P = Precision::F32) = 0;
+
+// 引擎实现侧（protected 虚；默认实参只写在公共入口上）：
+[[nodiscard]] virtual Tensor create_tensor_impl(std::size_t rows, std::size_t cols, Precision P) = 0;
+[[nodiscard]] virtual Result<Tensor> from_matrix_impl(const Matrix& m, Precision P) = 0;
 ```
 
 **作用**：
@@ -118,44 +130,46 @@ engine.end_batch();  // 提交并等待
 - `to_matrix`：Tensor → CPU Matrix（按 P 转换；可能下载）
 
 **实现注意**：
-- `from_matrix` 应返回拷贝，避免外部修改影响
+- `from_matrix_impl` 应返回拷贝，避免外部修改影响
 - `to_matrix` 应返回拷贝，避免内部状态泄露
+- `create_tensor_impl` 失败时可返回 `Tensor()` 空槽——公共入口的 `stamp_`
+  只 stamp 有效张量，空槽保持不绑定（15 §3.1）
 
 ### 4. 矩阵级原语
 
 ```cpp
-// 矩阵乘法
-[[nodiscard]] virtual Result<Tensor> matmul(
+// 矩阵乘法（实现侧；公共入口 matmul 带 bind_check_ + stamp_，下同）
+[[nodiscard]] virtual Result<Tensor> matmul_impl(
     const Tensor& A, const Tensor& B,
-    bool transA = false, bool transB = false,
-    Precision P = Precision::F32) = 0;
+    bool transA, bool transB,
+    Precision P) = 0;
 
 // 批量矩阵乘法
-[[nodiscard]] virtual Result<Tensor> batched_matmul(
+[[nodiscard]] virtual Result<Tensor> batched_matmul_impl(
     const Tensor& A, const Tensor& B,
     std::size_t batch,
-    bool transA = false, bool transB = false,
-    Scalar alpha = Scalar{1},
-    Precision P = Precision::F32) = 0;
+    bool transA, bool transB,
+    Scalar alpha,
+    Precision P) = 0;
 
 // 矩阵乘 + bias 广播（默认实现 = matmul + 逐行加 bias）
-[[nodiscard]] virtual Result<Tensor> matmul_with_bias(
+[[nodiscard]] virtual Result<Tensor> matmul_with_bias_impl(
     const Tensor& A, const Tensor& B, const Tensor& bias,
-    bool transA = false, bool transB = false,
-    Precision P = Precision::F32);
+    bool transA, bool transB,
+    Precision P);
 
 // 就地加法
-[[nodiscard]] virtual Result<void> add_inplace(Tensor& A, const Tensor& B) = 0;
+[[nodiscard]] virtual Result<void> add_inplace_impl(Tensor& A, const Tensor& B) = 0;
 
 // 就地缩放
-[[nodiscard]] virtual Result<void> scale_inplace(Tensor& A, Scalar s) = 0;
-
-// 梯度累加（dst 恒 f32，src 为 f16 时引擎先 cast 再累加；默认实现）
-[[nodiscard]] virtual Result<void> accumulate(Tensor& dst, const Tensor& src);
+[[nodiscard]] virtual Result<void> scale_inplace_impl(Tensor& A, Scalar s) = 0;
 
 // 置零
-[[nodiscard]] virtual Result<void> zero(Tensor& A) = 0;
+[[nodiscard]] virtual Result<void> zero_impl(Tensor& A) = 0;
 ```
+
+> 梯度累加 `accumulate` **不是引擎实现接口**——它是公共入口，内部经
+> `add_inplace_impl` 完成（f16 时基类先做边界 cast）。
 
 **矩阵乘法细节**：
 
@@ -176,20 +190,20 @@ engine.end_batch();  // 提交并等待
 
 ```cpp
 // 按行求和: (rows, cols) → (rows, 1)
-[[nodiscard]] virtual Result<Tensor> row_reduce_sum(const Tensor& A, Precision P = Precision::F32) = 0;
+[[nodiscard]] virtual Result<Tensor> row_reduce_sum_impl(const Tensor& A, Precision P) = 0;
 
 // 按列求和: (rows, cols) → (1, cols)
-[[nodiscard]] virtual Result<Tensor> col_reduce_sum(const Tensor& A, Precision P = Precision::F32) = 0;
+[[nodiscard]] virtual Result<Tensor> col_reduce_sum_impl(const Tensor& A, Precision P) = 0;
 
 // 按列求最大值: (rows, cols) → (1, cols)
-[[nodiscard]] virtual Result<Tensor> col_reduce_max(const Tensor& A, Precision P = Precision::F32) = 0;
+[[nodiscard]] virtual Result<Tensor> col_reduce_max_impl(const Tensor& A, Precision P) = 0;
 
 // 分组归约（segmented reduce，沿行方向每连续 R 行为一组）：
 //   x: (G*R, N) → out: (G, N)，把"逐通道/逐头一次 dispatch"的层内循环压成单次调用
-[[nodiscard]] virtual Result<Tensor> grouped_reduce_sum(
-    const Tensor& x, std::size_t G, std::size_t R, Precision P = Precision::F32) = 0;
-[[nodiscard]] virtual Result<Tensor> grouped_reduce_max(
-    const Tensor& x, std::size_t G, std::size_t R, Precision P = Precision::F32) = 0;
+[[nodiscard]] virtual Result<Tensor> grouped_reduce_sum_impl(
+    const Tensor& x, std::size_t G, std::size_t R, Precision P) = 0;
+[[nodiscard]] virtual Result<Tensor> grouped_reduce_max_impl(
+    const Tensor& x, std::size_t G, std::size_t R, Precision P) = 0;
 ```
 
 > 按行求最大值**不走引擎算子**——用 DSL 归约叶子 `dsl::row_reduce_max(...)`（详见 `expr_dsl.hpp`）。
@@ -216,65 +230,65 @@ auto rg = dsl::compute(engine,                                                  
 
 ```cpp
 // 行切片
-[[nodiscard]] virtual Result<Tensor> slice_rows(
+[[nodiscard]] virtual Result<Tensor> slice_rows_impl(
     const Tensor& src, std::size_t start_row, std::size_t count) = 0;
 
 // 行插入
-[[nodiscard]] virtual Result<void> insert_rows(
+[[nodiscard]] virtual Result<void> insert_rows_impl(
     Tensor& dst, std::size_t dst_start_row, const Tensor& src) = 0;
 
 // 行收集（embedding 查表）
-[[nodiscard]] virtual Result<Tensor> gather_rows(
+[[nodiscard]] virtual Result<Tensor> gather_rows_impl(
     const Tensor& table, const Tensor& indices) = 0;
 
 // 行散列累加（embedding 梯度）
-[[nodiscard]] virtual Result<void> scatter_add_rows(
+[[nodiscard]] virtual Result<void> scatter_add_rows_impl(
     Tensor& dst, const Tensor& indices, const Tensor& grad) = 0;
 
 // 3D 重排
-[[nodiscard]] virtual Result<Tensor> rearrange_3d(
+[[nodiscard]] virtual Result<Tensor> rearrange_3d_impl(
     const Tensor& x, std::size_t M, std::size_t B, std::size_t N,
-    bool inverse = false) = 0;
+    bool inverse) = 0;
 
 // 转置
-[[nodiscard]] virtual Result<Tensor> transpose(const Tensor& A) = 0;
+[[nodiscard]] virtual Result<Tensor> transpose_impl(const Tensor& A) = 0;
 
 // 卷积/池化窗口展开与其伴随散射（纯数据搬运）
-[[nodiscard]] virtual Result<Tensor> im2col(
+[[nodiscard]] virtual Result<Tensor> im2col_impl(
     const Tensor& x, std::size_t C, std::size_t H, std::size_t W,
     std::size_t k, std::size_t stride, std::size_t pad,
     std::size_t OH, std::size_t OW) = 0;
-[[nodiscard]] virtual Result<Tensor> col2im(
+[[nodiscard]] virtual Result<Tensor> col2im_impl(
     const Tensor& col, std::size_t C, std::size_t H, std::size_t W,
     std::size_t k, std::size_t stride, std::size_t pad,
     std::size_t OH, std::size_t OW) = 0;
 
 // CPU Matrix → 已有张量（序列化加载、优化器参数写回）
-[[nodiscard]] virtual Result<void> copy_from(Tensor& dst, const Matrix& src) = 0;
+[[nodiscard]] virtual Result<void> copy_from_impl(Tensor& dst, const Matrix& src) = 0;
 
 // 深拷贝
-[[nodiscard]] virtual Result<Tensor> clone(const Tensor& src) = 0;
+[[nodiscard]] virtual Result<Tensor> clone_impl(const Tensor& src) = 0;
 ```
 
 ### 10. 表达式求值
 
 ```cpp
 // 逐元素表达式融合（输出 (rows, cols)，P 为输出精度）
-[[nodiscard]] virtual Result<Tensor> eval_expr(
+[[nodiscard]] virtual Result<Tensor> eval_expr_impl(
     const ExprSpec& spec,
     std::span<const Tensor> inputs,
     std::size_t rows, std::size_t cols,
-    Precision P = Precision::F32) = 0;
+    Precision P) = 0;
 
 // 目标传递：结果直接写入 out（不分配新张量，表达"原地更新"）
-[[nodiscard]] virtual Result<void> eval_expr_into(
+[[nodiscard]] virtual Result<void> eval_expr_into_impl(
     const ExprSpec& spec, std::span<const Tensor> inputs,
     std::size_t rows, std::size_t cols, Tensor& out);
 
 // 归约向量原生形状输出（行归约 → (rows,1)；列归约 → (1,cols)）
-[[nodiscard]] virtual Result<Tensor> eval_expr_reduce(
+[[nodiscard]] virtual Result<Tensor> eval_expr_reduce_impl(
     const ExprSpec& spec, std::span<const Tensor> inputs,
-    std::size_t rows, std::size_t cols, Precision P = Precision::F32);
+    std::size_t rows, std::size_t cols, Precision P);
 ```
 
 **作用**：将多个逐元素操作合并为一次调用，减少临时张量。Layer 侧一般经 `dsl::compute` / `dsl::compute_into` / `dsl::compute_reduce` 间接使用，不手写 `ExprSpec`。
@@ -286,26 +300,29 @@ auto rg = dsl::compute(engine,                                                  
 //   causal=true : A_t = A0 + Σ_{i≤t, 同文档} k_i·k_i^T（文档边界处清零）
 //   causal=false: 全集常数（无边界重置）
 // 输出 (B·H·5·d_k, seq)：[0) B·P  [1) A·P  [2) B^T·R  [3) s  [4) r
-[[nodiscard]] virtual Result<Tensor> scan_prefix_outer(
+[[nodiscard]] virtual Result<Tensor> scan_prefix_outer_impl(
     const Tensor& K, const Tensor& V, const Tensor& P, const Tensor& R,
     const Tensor& A0, const Tensor& B0, bool has_state,
     std::size_t dk, std::size_t heads, bool causal,
-    const Tensor& boundary, bool has_bnd) = 0;
+    const Tensor& boundary, bool has_bnd,
+    Precision prec) = 0;
 
 // 后缀扫描（RLA backward pass 2）：
 //   causal=true : S_i = Σ_{t≥i, 同文档} D_t
 //   causal=false: S_i = D_i（Layer 已把全集梯度沿 seq 广播）
 // 输出 (B·H·3·d_k, seq)：[0) S·X  [1) S·Y  [2) S^T·Y
-[[nodiscard]] virtual Result<Tensor> scan_suffix_outer(
+[[nodiscard]] virtual Result<Tensor> scan_suffix_outer_impl(
     const Tensor& D, const Tensor& X, const Tensor& Y,
     std::size_t dk, std::size_t heads, bool causal,
-    const Tensor& boundary, bool has_bnd) = 0;
+    const Tensor& boundary, bool has_bnd,
+    Precision prec) = 0;
 
 // 逐列外积（RLA backward 物化 dL/dA、dL/dB）：
 // 输出 (B·H·d_k², seq)：out = P·R^T（has_scale 时逐列乘 S[t]）
-[[nodiscard]] virtual Result<Tensor> outer_col(
+[[nodiscard]] virtual Result<Tensor> outer_col_impl(
     const Tensor& P, const Tensor& R, const Tensor& S,
-    std::size_t dk, bool has_scale) = 0;
+    std::size_t dk, bool has_scale,
+    Precision prec) = 0;
 ```
 
 **形状约定**：batch-major `i = b*seq+t`；头 (b,h) 行块起点 `r0=(b*H+h)*d_k`；K/V/P/R（X/Y）`(B·H·d_k, seq)`、D `(B·H·d_k², seq)`、A0/B0 `(H·d_k, d_k)`；boundary `(1, B·seq)`（1=文档起点）；空参数用 (1,1) dummy + bool 标志（规避 0 字节 GPU buffer）；`d_k ≤ 64`（GPU MAX_DK）；标量块 s/r 头内逐行重复（实现写全部行，调用方读任一行）。
@@ -334,15 +351,16 @@ public:
     [[nodiscard]] Result<void> begin_batch() override { return {}; }
     [[nodiscard]] Result<void> end_batch() override { return {}; }
 
-    // 3. 张量工厂
-    [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols) override {
+    // 3. 张量工厂（实现侧；公共入口 create_tensor 负责 stamp 出生绑定）
+    [[nodiscard]] Tensor create_tensor_impl(std::size_t rows, std::size_t cols, Precision P) override {
+        if (P == Precision::F16) return Tensor::cpu<Precision::F16>(rows, cols);
         return Tensor::cpu(rows, cols);
     }
 
-    // 4. 矩阵乘法（委托给 Matrix::multiply）
-    [[nodiscard]] Result<Tensor> matmul(
+    // 4. 矩阵乘法（委托给 Matrix::multiply；公共入口 matmul 带 bind_check_+stamp_）
+    [[nodiscard]] Result<Tensor> matmul_impl(
         const Tensor& A, const Tensor& B,
-        bool transA, bool transB) override {
+        bool transA, bool transB, Precision P) override {
         // 实现细节...
     }
 };
@@ -353,7 +371,7 @@ public:
 #### 1. 错误处理
 
 ```cpp
-[[nodiscard]] Result<Tensor> matmul(...) override {
+[[nodiscard]] Result<Tensor> matmul_impl(...) override {
     if (!A.is_cpu() || !B.is_cpu())
         return std::unexpected(Error{"matmul: tensors are not CPU"});
     // ...
@@ -368,7 +386,7 @@ public:
 #### 2. 并行化
 
 ```cpp
-[[nodiscard]] Result<Tensor> gather_rows(...) override {
+[[nodiscard]] Result<Tensor> gather_rows_impl(...) override {
     const std::size_t total = num * D;
     if (total >= PARALLEL_THRESHOLD && num > 1) {
         // 行块并行
@@ -389,12 +407,12 @@ public:
 #### 3. 表达式求值
 
 ```cpp
-[[nodiscard]] Result<Tensor> eval_expr(
+[[nodiscard]] Result<Tensor> eval_expr_impl(
     const ExprSpec& spec,
     std::span<const Tensor> inputs,
-    std::size_t rows, std::size_t cols) override {
-    // CPU 走编译期模板求值
-    return dsl::compute(spec, inputs, rows, cols);
+    std::size_t rows, std::size_t cols, Precision P) override {
+    // CPU：IR 解释器求值（含归约/matmul 视图）；
+    // 逐元素模板路径在公共 dsl::compute 的 CPU 分支，不经过本函数
 }
 ```
 
@@ -429,7 +447,7 @@ public:
     }
 
     // 3. 矩阵乘法（dispatch shader）
-    [[nodiscard]] Result<Tensor> matmul(...) override {
+    [[nodiscard]] Result<Tensor> matmul_impl(...) override {
         // 选择 matmul shader（naive/tiled/batched）
         // dispatch compute shader
     }
@@ -461,7 +479,7 @@ public:
 #### 2. Shader 选择
 
 ```cpp
-[[nodiscard]] Result<Tensor> matmul(...) override {
+[[nodiscard]] Result<Tensor> matmul_impl(...) override {
     // 根据矩阵大小选择 shader
     if (M < 64 || N < 64 || K < 64) {
         // 小矩阵：naive shader
@@ -476,10 +494,10 @@ public:
 #### 3. 内存管理
 
 ```cpp
-[[nodiscard]] Result<Tensor> create_tensor(std::size_t rows, std::size_t cols) override {
+[[nodiscard]] Tensor create_tensor_impl(std::size_t rows, std::size_t cols, Precision P) override {
     // 从显存池分配
     auto buffer = backend_.allocate_buffer(rows * cols * sizeof(Scalar));
-    return Tensor::gpu(rows, cols, std::move(buffer));
+    return Tensor::from_gpu(std::move(buffer));
 }
 ```
 
@@ -499,11 +517,22 @@ public:
 
 ### 步骤 1：在接口中声明
 
-在 `compute_engine.hpp` 中添加纯虚函数：
+在 `compute_engine.hpp` 中按 NVI 模式声明**两件套**：公共非虚入口
+（`bind_check_` 跨引擎检查 + `stamp_` 出生绑定）+ protected 纯虚实现
+（引擎真正 `override` 的）：
 
 ```cpp
-// 新原语：逐元素绝对值差
-[[nodiscard]] virtual Result<Tensor> elementwise_abs_diff(
+// 新原语（示意；逐元素类需求见上方前置判断，一律走 DSL）
+// 1) 公共入口（非虚）
+[[nodiscard]] Result<Tensor> elementwise_abs_diff(
+    const Tensor& A, const Tensor& B)
+{
+    if (auto ec = bind_check_({&A, &B}); !ec)
+        return std::unexpected(ec.error());
+    return stamp_(elementwise_abs_diff_impl(A, B));
+}
+// 2) protected 虚实现（引擎侧实现这个）
+[[nodiscard]] virtual Result<Tensor> elementwise_abs_diff_impl(
     const Tensor& A, const Tensor& B) = 0;
 ```
 
@@ -512,7 +541,7 @@ public:
 在 `compute_cpu_engine.hpp` 中添加实现：
 
 ```cpp
-[[nodiscard]] Result<Tensor> elementwise_abs_diff(
+[[nodiscard]] Result<Tensor> elementwise_abs_diff_impl(
     const Tensor& A, const Tensor& B) override {
     if (!A.is_cpu() || !B.is_cpu())
         return std::unexpected(Error{"elementwise_abs_diff: tensors are not CPU"});
@@ -537,7 +566,7 @@ public:
 在 `compute_gpu_engine.hpp` 中添加实现：
 
 ```cpp
-[[nodiscard]] Result<Tensor> elementwise_abs_diff(
+[[nodiscard]] Result<Tensor> elementwise_abs_diff_impl(
     const Tensor& A, const Tensor& B) override {
     // 1. 选择或创建 shader
     // 2. 准备 push constants
@@ -614,9 +643,9 @@ TEST_CASE("elementwise_abs_diff") {
 class GpuEngine {
     MemoryPool pool_;  // 显存池
 
-    [[nodiscard]] Result<Tensor> create_tensor(std::size_t rows, std::size_t cols) {
+    [[nodiscard]] Tensor create_tensor_impl(std::size_t rows, std::size_t cols, Precision P) {
         auto buffer = pool_.allocate(rows * cols * sizeof(Scalar));
-        return Tensor::gpu(rows, cols, std::move(buffer));
+        return Tensor::from_gpu(std::move(buffer));
     }
 };
 ```
