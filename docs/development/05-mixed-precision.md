@@ -1,7 +1,8 @@
 # 多精度计算改造（f16 / 混合精度）设计
 
-> **状态**：Phase 1（存储类型化 / cast / f16 GEMM / 类型化 Tensor）与 Phase 2（`PrecisionEngine`
-> 边界 cast 适配层 + DSL/Layer/Loss/Optimizer 全链精度接线 + **in-kernel f16 带类型变体（逐元素 /
+> **状态**：Phase 1（存储类型化 / cast / f16 GEMM / 类型化 Tensor）与 Phase 2（f16 边界 cast
+>（**P-1 已下沉为 `ComputeEngine` 基类 NVI 入口**，原 `PrecisionEngine` 装饰器已删除，见
+> `docs/development/15` §4.1）+ DSL/Layer/Loss/Optimizer 全链精度接线 + **in-kernel f16 带类型变体（逐元素 /
 > 归约 / matmul 段 / fold）** + **op-level f16 GEMM**）均为**当前实现**；当前 `--f16` 实测峰值显存
 > 低于 f32（§12.11）。当前状态、实测结论与已知问题见 **§12**；各轮实施过程与 A/B 流水见
 > `docs/history.md`。
@@ -419,7 +420,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 ### 11.1 AOT 闭合世界（铁律 7，Q6 分期）
 
 - **精度不进结构 key。** `expr_spec_key` 保持无精度维度；f16 变体按 **`(key, ExprPrecSig)`** 注册（签名 = 逐输入 bit + 输出 bit，`sig == 0` = 全 f32 → 键就是结构 key 本身）——故全 f32 路径的注册表 key、bin 内容、生成器产物逐字节不变（**全 f32 = 零回归**，`f16_precision_test` 逐字节断言）。变体段在 bin v9（`kExprBinVersion = 9`，每变体只存 `{sig, 基础结构下标}`，见 §12.6）。
-- **三条 f16 执行路径**（当前）：① in-kernel f16 变体——`GlslEmitter` 按签名把缓冲声明为 `float16_t`、读写点转换（算术默认 f32，§7.2）；同一 `(key, sig)` 另可生成 **native16** 变体（f16 ALU 算术，键 `key#sig#a`），按设备 `shaderFloat16` 能力选择 pipeline、运行时优先命中 native16、回退 f32 算术变体；② op-level f16 GEMM——手写 GEMM shader 用 `-DNN_SHADER_F16` 编出第二份 SPIR-V，按操作数精度选 pipeline；③ 无变体可命中时回退 **边界 cast**（`PrecisionEngine` 抬 f32 计算、按 P 落回）。
+- **三条 f16 执行路径**（当前）：① in-kernel f16 变体——`GlslEmitter` 按签名把缓冲声明为 `float16_t`、读写点转换（算术默认 f32，§7.2）；同一 `(key, sig)` 另可生成 **native16** 变体（f16 ALU 算术，键 `key#sig#a`），按设备 `shaderFloat16` 能力选择 pipeline、运行时优先命中 native16、回退 f32 算术变体；② op-level f16 GEMM——手写 GEMM shader 用 `-DNN_SHADER_F16` 编出第二份 SPIR-V，按操作数精度选 pipeline；③ 无变体可命中时回退 **边界 cast**（`ComputeEngine` 基类 NVI 入口抬 f32 计算、按 P 落回）。
 - **emitter**：IR-D 只有 `GlslEmitter` 一个注册后端。
 
 ### 11.2 确定性契约（修订版）
@@ -527,7 +528,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 | 组件 | 现状 |
 |---|---|
 | 引擎接口 | 运算类原语（逐元素 / 归约 / 分组归约 / 扫描 / outer_col / `eval_expr*`）带 `Precision P = F32` 形参；`cast_into`（写入**既有存储**、保留张量对象身份）与 `copy_into`（同精度就地覆盖）。纯数据搬运原语不带 P（输出 = 源精度，§8.4） |
-| 适配层 | `PrecisionEngine`（`compute_precision_engine.hpp`）：f16 边界 cast **集中一处** —— 入参抬 f32 → 调内层引擎既有 f32 实现 → 输出按 P 落回；in-place 原语走 `cast_into` 写回原存储（§8.3）。全 f32 配置为**纯直通**（与原生引擎逐字节一致，`f16_precision_test` 断言） |
+| 边界 cast 入口 | `ComputeEngine` 基类 NVI（**P-1：原 `PrecisionEngine` 装饰器已删除下沉至此**）：f16 边界 cast **集中一处** —— 入参抬 f32 → 调引擎 `*_impl` 既有 f32 实现 → 输出按 P 落回；in-place 原语走 `cast_into` 写回原存储（§8.3）。全 f32 配置为**纯直通**（与原生引擎逐字节一致，`f16_precision_test` 断言） |
 | DSL | `dsl::compute / compute_reduce` 带 `Precision P`（输出精度）；`compute_into` 取 dst 存储精度；CPU 侧 f16 叶子一次性转 f32 镜像（`CpuViewCache`，`at()` 保持无分支 → 热路径零回归）、`eval_cpu`/`eval_into_tensor_cpu` 支持 f16 输出 |
 | Layer 接线 | `Linear`（param + compute）、`ReLU/GeLU/SwiGLU`（compute）、`LayerNorm/RMSNorm`（stable + param）、`AttentionBase`（4 投影 + Softmax + RoPE 一并下传）、`FeedForward`、`GPTModel`（位置编码器下传；**LM head 强制 stable**，见下）、`TransformerEncoderLayer/Encoder/PatchEmbedding/PositionalEncoding` |
 | Loss / Optimizer | `Loss` 基类带 `p_`（loss 链 = stable，D9）；`Optimizer` 构造器接 `PrecisionProfile`，状态张量按 `p.optimizer` 创建，参数更新 in-place |
@@ -557,7 +558,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 - `expr_prec_sig_of(inputs, P)`（`compute_engine.hpp`）：由**实际张量精度** + 目标输出精度算签名。
 - `ExprRegistry` 的 `variants` / `add(spec, sig)`：`sig == 0` 仍进旧的 `specs` 表；`sig != 0` 进变体表。bin（`kExprBinVersion = 9`）在规格表之后有**变体段**：每个变体只存 `{sig, 基础结构下标}`（变体与基础结构同 key，不重复序列化 spec 体）。
 - `dsl::compute/compute_reduce/compute_into` 的扫描分支登记 `(结构, 签名)`，占位张量按目标精度返回（f16 占位让 dry-run 下游继续看到 f16，否则变体发现不到）。
-- `PrecisionEngine` 的 `NN_PREC_TRACE=1` 变体发现与 `contains_variant()`：**只有适配层看得到真实输入精度**（内层引擎收到的永远是 f32 副本），故变体发现放在这里。
+- `ComputeEngine` 基类 NVI 入口的 `NN_PREC_TRACE=1` 变体发现与 `trace_miss_()`：**只有入口看得到真实输入精度**（引擎 `*_impl` 收到的要么是原张量、要么已是 f32 副本），故变体发现放在这里。
 
 **实测变体空间**（GPT d64/h4/L4/ff256、seq64、`profile_f16`、真实训练一步）
 
@@ -575,7 +576,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 
 | 组件 | 当前实现 |
 |---|---|
-| `scan_exprs` 双 pass | 整段 dry-run 收进 `dry_run(engine, profile)`：`profile_f32`（sig==0，旧行为）与 `profile_f16`（输入张量按 compute 精度创建 → 与运行时同源）。f16 pass **必须走 `PrecisionEngine` 适配层**——原生 `CpuEngine` 只实现 f32 存储，直接喂 f16 张量 = heap corruption（0xC0000374，实测）。 |
+| `scan_exprs` 双 pass | 整段 dry-run 收进 `dry_run(engine, profile)`：`profile_f32`（sig==0，旧行为）与 `profile_f16`（输入张量按 compute 精度创建 → 与运行时同源）。f16 pass **直接传原生引擎即可**——P-1 后 f16 边界 cast 由基类 NVI 入口统一处理（历史上直喂原生 `CpuEngine` = heap corruption（0xC0000374，实测）；适配层已删除、职责并入基类）。 |
 | bin v9 | 规格表之后的**变体段**：每个变体只存 `{sig, 基础结构下标}`——变体与基础结构同 key（精度不进 `expr_spec_key`），故不重复序列化 spec 体（也免读写不对称风险）。 |
 | `GlslEmitter` | `generate/generate_reduce` 带 `sig` 形参（默认 0 → **GLSL 与不带变体时逐字节相同**）。带类型输出 = 缓冲声明 `float16_t` + `#extension GL_EXT_shader_16bit_storage` + 读 `float(x)` / 写 `float16_t(v)`；算术默认全 f32（§7.2）。视图内部有算术的分支（RotateHalf 的取负、RowGather 的 `uint(...)` 索引）必须**在叶子处**转换——否则 glslc 报 `'-' : wrong operand type ... float16_t`。 |
 | `gen_fused` | 每变体独立 shader（文件名/标识符 `key_sighex`，注册键 `key#sig`），`FusedShader` 带 `prec_sig`；生成器不支持的形态 → **跳过并告警**（不是失败）。 |
@@ -586,7 +587,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 
 ### 12.8 剩余开销归因（当前结论）
 
-**归因手段（当前工具）**：`mem_probe` 逐阶段探针（transient live / pending / 池分桶）+ `PrecisionEngine` 的**形状级 cast 归因**（`NN_PREC_TRACE=1` → `note_temp_()` 记录每次"物化临时量"的 `(rows, cols, 方向)` → 次数/字节，`dump_temp_stats()` 在 mem_probe 末尾按字节降序打印）。
+**归因手段（当前工具）**：`mem_probe` 逐阶段探针（transient live / pending / 池分桶）+ `ComputeEngine` 基类入口的**形状级 cast 归因**（`NN_PREC_TRACE=1` → `note_temp_()` 记录每次"物化临时量"的 `(rows, cols, 方向)` → 次数/字节，`dump_temp_stats()` 在 mem_probe 末尾按字节降序打印）。
 
 **结论（当前有效）**：
 
@@ -614,7 +615,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 
 #### ② 归因工具：形状级 cast 归因
 
-`PrecisionEngine::note_temp_()`（`NN_PREC_TRACE=1` 时记录每次"物化临时量"的 `(rows, cols, 方向)` → 次数/字节）+ `PrecisionEngine::dump_temp_stats()`（mem_probe 末尾按字节降序打印）。这份表把 GB 级 cast **直接落到具体形状**——判定"哪些 cast 还在、哪些已被变体消掉"的当前手段（如注意力反向物化的 `(32768,256)` W / grad_A，曾是单项最大头，补齐 matmul 段变体后该项消失，见 §12.11）。
+`ComputeEngine::note_temp_()`（`NN_PREC_TRACE=1` 时记录每次"物化临时量"的 `(rows, cols, 方向)` → 次数/字节）+ `ComputeEngine::dump_temp_stats()`（mem_probe 末尾按字节降序打印）。这份表把 GB 级 cast **直接落到具体形状**——判定"哪些 cast 还在、哪些已被变体消掉"的当前手段（如注意力反向物化的 `(32768,256)` W / grad_A，曾是单项最大头，补齐 matmul 段变体后该项消失，见 §12.11）。
 
 #### ③ 落地的三类带类型变体（当前）
 
@@ -799,7 +800,7 @@ matmul 段 / 归约 / 目标传递三类变体落地后的同窗交错实测（f
 
 ## 16. 开放问题
 
-（第 3、4 项已定：边界 cast = `PrecisionEngine` 集中处理的适配层路径（§12.5）；CLI 标志 = `--f16` + `--precision-*`（§9.3）。其余仍开放：）
+（第 3、4 项已定：边界 cast = `ComputeEngine` 基类 NVI 入口（原 PrecisionEngine 已下沉，§12.5）；CLI 标志 = `--f16` + `--precision-*`（§9.3）。其余仍开放：）
 
 1. f16 容差默认值（当前建议 rtol 1e-2 / atol 1e-2）——T4/T5 实测后校准。
 2. f16 GEMM 分块尺寸：复用 `BLOCK_SIZE = 64` 还是放大（f16 同块 ×2 元素，64KB 预算下可 128）——bench 定。

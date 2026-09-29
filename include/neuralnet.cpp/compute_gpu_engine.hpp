@@ -109,7 +109,7 @@ public:
     }
 
     // 把 src 复制到 buffer 的 offset（float 单位）处（录制式）
-    [[nodiscard]] Result<void> offload_save(
+    [[nodiscard]] Result<void> offload_save_impl(
         const Tensor& buffer, std::size_t offset, const Tensor& src) override
     {
         if (src.is_cpu())
@@ -143,7 +143,7 @@ public:
     // 把 (1,1) F32 标量排入一次 D2H 拷贝并提交，不等待。调用时机：产出该
     // 标量的主帧（flush_batch/end_batch）已提交之后——同队列 FIFO 保证拷贝
     // 执行在生产命令之后。poll 非阻塞，就绪即取（见 compute_engine.hpp）。
-    [[nodiscard]] Result<void> submit_scalar_readback(
+    [[nodiscard]] Result<void> submit_scalar_readback_impl(
         std::size_t slot, const Tensor& t) override
     {
         if (t.is_cpu())
@@ -402,7 +402,7 @@ public:
         return std::unexpected(Error{"cast_into: unsupported precision conversion"});
     }
 
-    [[nodiscard]] Result<void> copy_from(Tensor& dst, const Matrix& src) override
+    [[nodiscard]] Result<void> copy_from_impl(Tensor& dst, const Matrix& src) override
     {
         if (dst.rows() != src.rows() || dst.cols() != src.cols())
             return std::unexpected(Error{"copy_from: shape mismatch"});
@@ -429,7 +429,7 @@ public:
         return backend_.upload_blocking(dst.gpu_tensor(), src.span());
     }
 
-    [[nodiscard]] Result<Tensor> clone(const Tensor& src) override
+    [[nodiscard]] Result<Tensor> clone_impl(const Tensor& src) override
     {
         if (src.is_cpu())
         {
@@ -449,7 +449,7 @@ public:
     }
 
     // ── 行切片：GPU 内拷贝连续行区间 ──
-    [[nodiscard]] Result<Tensor> slice_rows(
+    [[nodiscard]] Result<Tensor> slice_rows_impl(
         const Tensor& src, std::size_t start_row, std::size_t count) override
     {
         auto src_gpu = ensure_gpu(src);
@@ -468,7 +468,7 @@ public:
 
     // ── 行插入：GPU 内就地写入连续行区间 ──
     // 纯 GPU 架构：dst 必须为 GPU Tensor，传 CPU Tensor 直接报错（无 CPU 回退路径）。
-    [[nodiscard]] Result<void> insert_rows(
+    [[nodiscard]] Result<void> insert_rows_impl(
         Tensor& dst, std::size_t dst_start_row, const Tensor& src) override
     {
         if (dst.is_cpu())
@@ -485,7 +485,7 @@ public:
     // ── gather_rows: 按 indices 从 table 中按行查表 ──
     // GPU-native 实现：全程在 GPU 执行，无 PCIe 传输。
     // indices 支持任意形状，按 flat 遍历所有元素。
-    [[nodiscard]] Result<Tensor> gather_rows(
+    [[nodiscard]] Result<Tensor> gather_rows_impl(
         const Tensor& table, const Tensor& indices) override
     {
         auto tbl_gpu = ensure_gpu(table);
@@ -533,7 +533,7 @@ public:
     // （dst 每 word 2 个 half、grad half 直读；indices 恒 float），免去为
     // dst/grad 物化 f32 副本。任一非 f16 或无 pipeline → 引擎内边界 cast
     // 回退（正确性不变）。
-    [[nodiscard]] Result<void> scatter_add_rows(
+    [[nodiscard]] Result<void> scatter_add_rows_impl(
         Tensor& dst, const Tensor& indices, const Tensor& grad) override
     {
         if (!dst.is_gpu())
@@ -583,7 +583,7 @@ private:
 public:
 
     // ── 3D 维度转置：(M, B, N) ↔ (B, M, N) ──
-    [[nodiscard]] Result<Tensor> rearrange_3d(
+    [[nodiscard]] Result<Tensor> rearrange_3d_impl(
         const Tensor& x, std::size_t M, std::size_t B, std::size_t N,
         bool inverse) override
     {
@@ -625,7 +625,7 @@ public:
     }
 
     // ── 矩阵转置：A (R, C) → out (C, R) ──
-    [[nodiscard]] Result<Tensor> transpose(const Tensor& A) override
+    [[nodiscard]] Result<Tensor> transpose_impl(const Tensor& A) override
     {
         auto a_gpu = ensure_gpu(A);
         if (!a_gpu) return std::unexpected(a_gpu.error());
@@ -654,7 +654,7 @@ public:
     }
 
     // ── 卷积/池化窗口展开（纯数据搬运，无算法；契约见 compute_engine.hpp）──
-    [[nodiscard]] Result<Tensor> im2col(
+    [[nodiscard]] Result<Tensor> im2col_impl(
         const Tensor& x,
         std::size_t C, std::size_t H, std::size_t W,
         std::size_t k, std::size_t stride, std::size_t pad,
@@ -690,7 +690,7 @@ public:
         return Tensor::from_gpu(std::move(*r));
     }
 
-    [[nodiscard]] Result<Tensor> col2im(
+    [[nodiscard]] Result<Tensor> col2im_impl(
         const Tensor& col,
         std::size_t C, std::size_t H, std::size_t W,
         std::size_t k, std::size_t stride, std::size_t pad,
@@ -754,14 +754,14 @@ public:
         return Tensor::from_gpu(std::move(*r));
     }
 
-    [[nodiscard]] Result<Tensor> grouped_reduce_sum(
+    [[nodiscard]] Result<Tensor> grouped_reduce_sum_impl(
         const Tensor& x, std::size_t G, std::size_t R,
         Precision = Precision::F32) override
     {
         return grouped_reduce_f16_or_cast_(x, G, R, /*is_max=*/false);
     }
 
-    [[nodiscard]] Result<Tensor> grouped_reduce_max(
+    [[nodiscard]] Result<Tensor> grouped_reduce_max_impl(
         const Tensor& x, std::size_t G, std::size_t R,
         Precision = Precision::F32) override
     {
@@ -772,7 +772,7 @@ public:
     // 矩阵级原语
     // ══════════════════════════════════════════════════════════════════════
 
-    [[nodiscard]] Result<Tensor> matmul(
+    [[nodiscard]] Result<Tensor> matmul_impl(
         const Tensor& A, const Tensor& B,
         bool transA, bool transB,
         Precision P = Precision::F32) override
@@ -862,7 +862,7 @@ public:
     // （f16 直读 / f32 累加 / f16 写回，零边界 cast：Linear::forward 是 cast
     // 临时量最大的单一来源），无变体才在本函数内回退"抬 f32 → f32 融合 →
     // 落回"（**绝不把缺变体变成硬报错**，闭合世界原则只在 f32 结构缺失时适用）。
-    [[nodiscard]] Result<Tensor> matmul_with_bias(
+    [[nodiscard]] Result<Tensor> matmul_with_bias_impl(
         const Tensor& A, const Tensor& B, const Tensor& bias,
         bool transA = false, bool transB = false,
         Precision P = Precision::F32) override
@@ -907,7 +907,7 @@ public:
     // ── 批量矩阵乘法：按 batch 切分行块，单次 dispatch 处理所有 batch ──
     // alpha 在 shader 写出时一次完成（如注意力 1/sqrt(d_k) 缩放）
     // P: 计算精度（§8.1，同 matmul）
-    [[nodiscard]] Result<Tensor> batched_matmul(
+    [[nodiscard]] Result<Tensor> batched_matmul_impl(
         const Tensor& A, const Tensor& B,
         std::size_t batch,
         bool transA, bool transB,
@@ -979,7 +979,7 @@ public:
     // A += B：真原地，直接写回 A 的 buffer（与 CpuEngine 语义一致）
     // 逐元素 kernel 每线程只读写自己下标一次，read-before-write 天然成立。
     // 免去新 buffer 分配 + 全量写出，消除优化器/梯度累积路径的分配风暴。
-    [[nodiscard]] Result<void> add_inplace(Tensor& A, const Tensor& B) override
+    [[nodiscard]] Result<void> add_inplace_impl(Tensor& A, const Tensor& B) override
     {
         if (A.rows() != B.rows() || A.cols() != B.cols())
             return std::unexpected(Error{"add_inplace: shape mismatch"});
@@ -1070,7 +1070,7 @@ public:
     }
 
     // A *= s：真原地，直接写回 A 的 buffer（与 CpuEngine 语义一致）
-    [[nodiscard]] Result<void> scale_inplace(Tensor& A, Scalar s) override
+    [[nodiscard]] Result<void> scale_inplace_impl(Tensor& A, Scalar s) override
     {
         auto a_gpu = ensure_gpu(A);
         if (!a_gpu) return std::unexpected(a_gpu.error());
@@ -1115,7 +1115,7 @@ public:
     }
 
     // A = 0：使用 vkCmdFillBuffer 真原地清零（不分配新 buffer）
-    [[nodiscard]] Result<void> zero(Tensor& A) override
+    [[nodiscard]] Result<void> zero_impl(Tensor& A) override
     {
         auto a_gpu = ensure_gpu(A);
         if (!a_gpu) return std::unexpected(a_gpu.error());
@@ -1155,7 +1155,7 @@ public:
     // half，消灭适配层全尺寸 f32 副本——输出 (rows*5/3/dk, seq) 是大头）；
     // 混合精度（如 boundary 仍 f32）→ 引擎内把 f16 侧 cast 到 f32 走 f32
     // pipeline（正确性不变）。输出重贴 GpuTensorF16（缓冲按 2B/元素分配）。
-    [[nodiscard]] Result<Tensor> scan_prefix_outer(
+    [[nodiscard]] Result<Tensor> scan_prefix_outer_impl(
         const Tensor& K, const Tensor& V, const Tensor& P, const Tensor& R,
         const Tensor& A0, const Tensor& B0, bool has_state,
         std::size_t dk, std::size_t heads, bool causal,
@@ -1204,7 +1204,7 @@ public:
         return Tensor::from_gpu(std::move(*res));
     }
 
-    [[nodiscard]] Result<Tensor> scan_suffix_outer(
+    [[nodiscard]] Result<Tensor> scan_suffix_outer_impl(
         const Tensor& D, const Tensor& X, const Tensor& Y,
         std::size_t dk, std::size_t heads, bool causal,
         const Tensor& boundary, bool has_bnd,
@@ -1239,7 +1239,7 @@ public:
         return Tensor::from_gpu(std::move(*res));
     }
 
-    [[nodiscard]] Result<Tensor> outer_col(
+    [[nodiscard]] Result<Tensor> outer_col_impl(
         const Tensor& P, const Tensor& R, const Tensor& S,
         std::size_t dk, bool has_scale,
         Precision prec = Precision::F32) override
@@ -1298,21 +1298,21 @@ public:
         return backend_.reduce_gpu(a_gpu->gpu_tensor(), mode, reduce_op);
     }
 
-    [[nodiscard]] Result<Tensor> row_reduce_sum(const Tensor& A, Precision = Precision::F32) override
+    [[nodiscard]] Result<Tensor> row_reduce_sum_impl(const Tensor& A, Precision = Precision::F32) override
     {
         auto r = reduce_f16_or_cast_(A, /*mode=*/0u, /*reduce_op=*/0u);
         if (!r) return std::unexpected(r.error());
         return Tensor::from_gpu(std::move(*r));
     }
 
-    [[nodiscard]] Result<Tensor> col_reduce_sum(const Tensor& A, Precision = Precision::F32) override
+    [[nodiscard]] Result<Tensor> col_reduce_sum_impl(const Tensor& A, Precision = Precision::F32) override
     {
         auto r = reduce_f16_or_cast_(A, /*mode=*/1u, /*reduce_op=*/0u);
         if (!r) return std::unexpected(r.error());
         return Tensor::from_gpu(std::move(*r));
     }
 
-    [[nodiscard]] Result<Tensor> col_reduce_max(const Tensor& A, Precision = Precision::F32) override
+    [[nodiscard]] Result<Tensor> col_reduce_max_impl(const Tensor& A, Precision = Precision::F32) override
     {
         auto r = reduce_f16_or_cast_(A, /*mode=*/1u, /*reduce_op=*/1u);
         if (!r) return std::unexpected(r.error());
@@ -1389,7 +1389,7 @@ public:
 #endif
     // ══════════════════════════════════════════════════════════════════════
 
-    [[nodiscard]] Result<Tensor> eval_expr(
+    [[nodiscard]] Result<Tensor> eval_expr_impl(
         const ExprSpec& raw_spec,
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols,
@@ -1443,7 +1443,7 @@ public:
         // **真实输入精度** + 目标输出精度取变体——native16（原生 f16 算术）
         // 优先，f32 算术变体回退（find_prec_variant_）。命中即 shader 直接
         // 半精度读/写，无需边界 cast；未命中则退回全 f32 key —— 此时输入必须
-        // 已全 f32（由 PrecisionEngine 适配层 cast）。
+        // 已全 f32（由基类 NVI 入口 cast）。
         const nn::ExprPrecSig psig = nn::expr_prec_sig_of(inputs, P);
         const nn::fused::FusedShader* fs = find_prec_variant_(key, psig);
         if (fs && backend_.has_fused_shader(fs->key))
@@ -1475,12 +1475,12 @@ public:
 #endif
 
         // f16 存储进了原生引擎却没命中带类型变体：**不能**把 f16 buffer 绑到
-        // f32 shader 上（静默错值）→ 明确报错，引导调用方走 PrecisionEngine
-        // 适配层（边界 cast 回退）。
+        // f32 shader 上（静默错值）→ 明确报错，明确报错（NVI 入口本应已拦截——能力查询
+        // 与 shader 查询不一致时才会到这里）。
         if (psig != 0)
             return std::unexpected(Error{
                 "GpuEngine::eval_expr: 该 (结构,精度) 变体未预生成（in-kernel f16 覆盖不足）"
-                "；请经 PrecisionEngine 适配层调用（边界 cast 回退）"});
+                "；NVI 入口本应在此前抬到 f32（supports_expr_precision_variant 与 shader 查询不一致）"});
         // ── 闭合世界：未命中任何 AOT 融合 shader → 硬报错（绝不静默回退） ──
         return std::unexpected(Error{
             "GpuEngine::eval_expr: 未找到该内联表达式的 AOT 融合 shader（闭合世界）；"
@@ -1529,7 +1529,7 @@ public:
     }
     // 与 eval_expr 相同，但以 vector_out=1 调度归约融合 shader（thread 0 写
     // (rows,1)/(1,cols) 归约向量，不写全尺寸广播）。
-    [[nodiscard]] Result<Tensor> eval_expr_reduce(
+    [[nodiscard]] Result<Tensor> eval_expr_reduce_impl(
         const ExprSpec& raw_spec,
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols,
@@ -1597,7 +1597,7 @@ public:
         if (psig != 0)
             return std::unexpected(Error{
                 "GpuEngine::eval_expr_reduce: 该 (结构,精度) 变体未预生成（in-kernel f16 覆盖不足）"
-                "；请经 PrecisionEngine 适配层调用（边界 cast 回退）"});
+                "；NVI 入口本应在此前抬到 f32（supports_expr_precision_variant 与 shader 查询不一致）"});
         // ── 闭合世界：未命中归约融合 shader → 硬报错（绝不静默回退） ──
         return std::unexpected(Error{
             "GpuEngine::eval_expr_reduce: 未找到该归约表达式的 AOT 融合 shader（闭合世界）；"
@@ -1609,7 +1609,7 @@ public:
     // 若表达式引用了 leaf(dst) 则同一 buffer 同时作为 readonly 输入绑定：
     // 逐元素同索引"先读后写"，无跨调用危害（与 GPU 原地原语的既有做法一致）。
     // 语义与限制同 CpuEngine::eval_expr_into（仅逐元素表达式；无分配）。
-    [[nodiscard]] Result<void> eval_expr_into(
+    [[nodiscard]] Result<void> eval_expr_into_impl(
         const ExprSpec& raw_spec,
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols, Tensor& dst) override
@@ -1683,7 +1683,7 @@ public:
         if (psig != 0)
             return std::unexpected(Error{
                 "GpuEngine::eval_expr_into: 该 (结构,精度) 变体未预生成（in-kernel f16 覆盖不足）"
-                "；请经 PrecisionEngine 适配层调用（边界 cast 回退）"});
+                "；NVI 入口本应在此前抬到 f32（supports_expr_precision_variant 与 shader 查询不一致）"});
         // ── 闭合世界：未命中 AOT 融合 shader → 硬报错（绝不静默回退） ──
         return std::unexpected(Error{
             "GpuEngine::eval_expr_into: 未找到该表达式的 AOT 融合 shader（闭合世界）；"

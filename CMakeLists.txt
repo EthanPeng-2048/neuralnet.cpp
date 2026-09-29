@@ -213,6 +213,11 @@ list(APPEND NN_APP_TARGETS f16_cpu_probe)
 nn_add_executable(f16_writeback_probe src/f16_writeback_probe.cpp)
 list(APPEND NN_APP_TARGETS f16_writeback_probe)
 
+# ── CPU/GPU 训练 run-to-run 确定性探针（ComputeEngine Refresh P0 / D9 实测；
+#    手动运行不注册 ctest，退出码 0=逐位一致 1=非确定 2=运行错误）──────────
+nn_add_executable(gpu_stability_probe src/gpu_stability_probe.cpp)
+list(APPEND NN_APP_TARGETS gpu_stability_probe)
+
 # ── 测试 / 验证目标（默认关闭，NN_ENABLE_TESTS=ON 时构建）─────────────
 if(NN_ENABLE_TESTS)
 

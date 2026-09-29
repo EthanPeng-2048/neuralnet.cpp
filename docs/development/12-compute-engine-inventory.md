@@ -91,15 +91,15 @@ scan_suffix_outer/outer_col——顺序状态机，DSL 无此语义）、`eval_e
 
 这 26 个正是 §7.3 的"eager 算子 = DSL 的内部 lowering 目标"形态：计算类原语只被
 **DSL lowering 内部**（`MatmulRef::prepare*` 调 `eng.matmul/batched_matmul`、
-`ReduceViewRef::prepare` 调各 reduce）、**适配层转发**（`PrecisionEngine`）与
+`ReduceViewRef::prepare` 调各 reduce）、**基类 NVI 边界 cast 入口转发**（原 `PrecisionEngine`，P-1 已下沉）与
 **测试/bench**（`f16_*_test`/`gpu_f16_test`/`layer_bench`/`f16_cpu_probe` 等）使用。
 
 | 算子 | 实际调用方 |
 |------|-----------|
-| `eval_expr_into` / `eval_expr_reduce` | `dsl::compute_into` / `dsl::compute_reduce`（`expr_dsl.hpp`）+ `PrecisionEngine` 转发 |
-| `matmul` / `matmul_with_bias` / `batched_matmul` | DSL lowering（`MatmulRef::prepare*`）+ `PrecisionEngine` 转发 + 测试/bench |
-| `row_reduce_sum` / `col_reduce_sum` / `col_reduce_max` / `grouped_reduce_sum` / `grouped_reduce_max` | DSL lowering（`ReduceViewRef::prepare`）+ `PrecisionEngine` 转发 + 测试 |
-| `add_inplace` / `scale_inplace` / `accumulate` | `PrecisionEngine` 转发 + 测试/bench/probe |
+| `eval_expr_into` / `eval_expr_reduce` | `dsl::compute_into` / `dsl::compute_reduce`（`expr_dsl.hpp`）+ 基类 NVI 入口转发 |
+| `matmul` / `matmul_with_bias` / `batched_matmul` | DSL lowering（`MatmulRef::prepare*`）+ 基类 NVI 入口转发 + 测试/bench |
+| `row_reduce_sum` / `col_reduce_sum` / `col_reduce_max` / `grouped_reduce_sum` / `grouped_reduce_max` | DSL lowering（`ReduceViewRef::prepare`）+ 基类 NVI 入口转发 + 测试 |
+| `add_inplace` / `scale_inplace` / `accumulate` | 基类 NVI 入口（accumulate 为非虚入口本体，无 `_impl`）+ 测试/bench/probe |
 | `cast` / `copy_from` | `model_serialization.hpp` + f16 测试 / gradcheck |
 | `cast_into` / `copy_into` / `supports_*` | 仅 `compute_precision_engine.hpp` 内部（Phase 2 精度管道，非死代码） |
 | `pool_stats` | `src/text_train.cpp`（池账本统计） |

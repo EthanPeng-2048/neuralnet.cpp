@@ -22,7 +22,6 @@
 #include <cstddef>
 
 #include "compute_cpu_engine.hpp"
-#include "compute_precision_engine.hpp"   // f16 dry-run pass 用适配层（多精度）
 #include "compute_layer.hpp"
 #include "compute_loss.hpp"
 #include "compute_optimizer.hpp"
@@ -81,9 +80,10 @@ int main(int argc, char* argv[])
     nn::CpuEngine raw_engine;
 
     // ── dry-run 主体：对给定 profile 跑一遍（f32 pass 收集 sig=0 基础结构；f16 pass 收集带类型变体）
-    // engine 是**形参**（遮蔽外层 raw_engine）：f32 pass 传原生引擎（登记 sig=0 结构表），
-    // f16 pass 传 PrecisionEngine 适配层——原生 CpuEngine 只实现 f32 存储，把 f16
-    // 张量直接交给它属 UB（实测 heap corruption 0xC0000374）。
+    // engine 是**形参**（遮蔽外层 raw_engine）：f16 pass 直接传原生引擎即可——
+    // P-1 下沉后 f16 边界 cast 由基类 NVI 入口统一处理（原 PrecisionEngine
+    // 适配层已删除，见 docs/development/15 §4.1）；原生 CpuEngine 从未见过
+    // f16 张量（历史上直交属 UB，实测 heap corruption 0xC0000374）。
     const auto dry_run = [&](nn::ComputeEngine& engine, const nn::PrecisionProfile& prof)
     {
         g_scan_prof = prof;
@@ -611,10 +611,8 @@ int main(int argc, char* argv[])
 
     };   // dry_run 结束
     dry_run(raw_engine, nn::profile_f32());   // f32 pass：sig == 0（基础结构表）
-    {
-        nn::PrecisionEngine adapter(raw_engine);   // f16 边界 cast 适配层
-        dry_run(adapter, nn::profile_f16());       // Phase 2：收集 (结构, 精度签名)
-    }
+    dry_run(raw_engine, nn::profile_f16());   // Phase 2：收集 (结构, 精度签名)；
+    // f16 安全由基类边界 cast 入口保证（原 PrecisionEngine 适配层已下沉删除）
     // ── fold v1（标量域）分块状态归约（表达式集合登记）──────────────────────────
     // 三个共享样例（expr_fold.hpp——与 fused_gpu_test 对拍**同源构造** →
     // key 一致、闭合世界命中）：rowmax / rowsum / softmax_denom(online 双

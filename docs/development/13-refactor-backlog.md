@@ -108,6 +108,9 @@ ZiPT stored_tokens 门控——含各自核对结论与代码位置）。**重�
 ## 10. Tensor 绑定引擎 + 存储多态（提案，2026-09-28 设计讨论）
 
 > 状态：**方案未实施**。选型已定（见 §10.8），重新立项时先读本节 + 源码现状。
+> **详细设计、代码片段与未决点裁定见 `docs/development/15-computeengine-refresh.md`**：
+> 其中 D1（PrecisionEngine 下沉删除，**P-1 已实施 2026-09-29**）与 D9（字节基线分层）已裁定，§10.3 第 1 条
+> 按 15 §4.2 补"库内不变量 + 库外测试豁免"脚注。
 > 范围（2026-09-28 复审扩充）：① 绑定与传参解耦（P1-P4）② 跨设备互传协议 `import`（§10.6）
 > ③ 存储多态与访问器（P5-P6，兑现"简化后期开发新后端"）。
 > **不采用**：`Tensor` 抽象基类 + `CPUTensor/GPUTensor` 句柄指针化（理由 §10.8）；
@@ -206,7 +209,7 @@ for (auto& p_tensor : params) {
 | **P1** 加绑定，不删参数 | `observer_ptr` + `bound()/engine()` + 跨引擎一致性检查（只加不改） | build 全绿 + ctest 全绿（`ctest -N` 实测 20 个用例，含 `cnn_test_gpu`）+ **字节基线逐字节一致** + scan 产物 hash 零 diff（不一致 = 暴露了暗中跨引擎路径，本身就是发现 bug 的手段） |
 | **P2** 删形参 + 宿主动词改名 | 按 P0 打标：Layer → Loss → 辅助函数 → CLI；编译器报错驱动，漏不掉；DSL 入口不改。同步改名（§10.6 表）：`to_matrix→to_host`、`from_matrix→from_host`、`copy_from→upload`，旧名全仓消失 | 同 P1 + `layer_bench` 无回退（警戒线：`Tensor::cpu_get_ptr` 注释实测 8-70×、`expr_dsl` `CpuViewCache` 1.5-4×） |
 | **P3** 收紧语义 | 跨引擎混用升 `Result` 硬错误；43 处 `ensure_gpu` 按 P0 分类改为显式 `import`；序列化改 `p_tensor.get().to_host()`，L3 去 `model.engine()` 依赖 | 同 P1 + GPU 用例结果如实记录（退出码 77 = skip） |
-| **P4** 正交轨道，**另案勿混入** | `Matrix` 宿主格式契约修复：`model_serialization.hpp:651-674` 同精度路径丢弃 `from_matrix` 结果（每个参数白做一次全量上传）、跨精度路径 5 次设备操作；`CpuEngine::copy_from`（`compute_cpu_engine.hpp:210`）`dst.cpu_matrix()` 硬编码 F32 槽（f16 dst 在 `NDEBUG` 下空指针，现靠 CLI 层"非全 f32 才包 PrecisionEngine"兜底：`text_train.cpp:949-959` / `mnist_train.cpp:605-609`）；`ComputeEngine::matmul_with_bias`（`compute_engine.hpp:327-352`）host 往返兜底为死码（三引擎均 override） | 单独立项、单独验收；绑定解决"谁执行传输"，不解决"传输格式契约" |
+| **P4** 正交轨道，**另案勿混入** | `Matrix` 宿主格式契约修复：`model_serialization.hpp:651-674` 同精度路径丢弃 `from_matrix` 结果（每个参数白做一次全量上传）、跨精度路径 5 次设备操作；`CpuEngine::copy_from`（`compute_cpu_engine.hpp:210`）`dst.cpu_matrix()` 硬编码 F32 槽（f16 dst 在 `NDEBUG` 下空指针；P-1 后由基类 `copy_from` NVI 入口兜底——f16 dst 走 from_matrix(F32)+cast_into，不再触达硬编码槽，原"非全 f32 才包 PrecisionEngine"CLI 兜底已随装饰器删除）；`ComputeEngine::matmul_with_bias`（`compute_engine.hpp:327-352`）host 往返兜底为死码（三引擎均 override） | 单独立项、单独验收；绑定解决"谁执行传输"，不解决"传输格式契约" |
 | **P5** 存储多态（P1-P4 之后独立做） | `compute_tensor.hpp` 引入 `TensorStorage` 抽象 + `CpuStorage`/`GpuStorage`；**storage 由引擎工厂造**（§10.3 第 7 条）；`reshape` 下沉 virtual（第 8 条）；消 7 处 `#ifdef NN_HAS_VULKAN` 与 backend include | build 全绿 + ctest 全绿 + **字节基线逐字节一致** + scan 产物 hash 零 diff（改的是容器内部，靠字基线验收，不靠编译器） |
 | **P6** 访问器（纯加法） | `as_cpu()/as_gpu()` 检查式 downcast 返回子类引用（非虚，句柄仍值类型） | 纯加法：ctest 全绿即可 |
 

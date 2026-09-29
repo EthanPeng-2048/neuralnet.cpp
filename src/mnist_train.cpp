@@ -601,18 +601,14 @@ int main(int argc, char *argv[])
     }
     auto raw_engine = std::move(*engine_res);
 
-    // ── 多精度适配层（同 text_train：非全 f32 时启用，见 docs 05 §11.1）──
-    std::optional<nn::PrecisionEngine> precision_adapter;
+    // ── 多精度：边界 cast 已下沉基类（NVI，原 PrecisionEngine；同 text_train）──
     if (!nn::is_profile_f32(cfg.precision))
     {
-        precision_adapter.emplace(*raw_engine);
-        std::cout << "[精度] f16 存储已启用（PrecisionEngine 适配层）\n"
+        std::cout << "[精度] f16 存储已启用（基类边界 cast）\n"
                      "  [注意] 边界 cast 的 transient 放大：峰值可能高于 f32，"
                      "见 docs/development/05-mixed-precision.md §12.5\n";
     }
-    nn::ComputeEngine* engine = precision_adapter
-        ? static_cast<nn::ComputeEngine*>(&*precision_adapter)
-        : raw_engine.get();
+    nn::ComputeEngine* engine = raw_engine.get();
 
     // ── 加载数据 ─────────────────────────────────────────────
     std::cout << "加载数据: " << cfg.dataset_path << " ..." << std::endl;

@@ -1333,7 +1333,7 @@ template <typename E>
 // P = **输出存储精度**（多精度，docs/development/05-mixed-precision.md §8.1）。
 //   · 默认 F32：未显式指定即按 f32 求值；Layer 按 §8.5 约定显式传 p_.compute / p_.stable。
 //   · f16：CPU 侧 f16 叶子一次性抬到 f32 求值、输出舍入回 f16（§7.2）；
-//     GPU 侧由 PrecisionEngine 适配层做同样的边界 cast（Adapter 消费 P）。
+//     GPU 侧由基类 NVI 入口做同样的边界 cast（入口消费 P）。
 //   · **不做 Auto 推导**：P 是唯一可见实参，来源可追溯（§8.5 G4）。
 // ══════════════════════════════════════════════════════════════════════════
 template <typename E>

@@ -1,7 +1,7 @@
 // ── f16_precision_test.cpp — Phase 2：f16 存储真正生效（适配层 + DSL + 端到端）
 //
 // 验收（docs/development/05-mixed-precision.md §12.2 的子集，Phase 1 边界 cast）：
-//   1. **f32 零回归**：全 f32 配置下 PrecisionEngine 与内层引擎逐字节一致（G5）
+//   1. **f32 零回归**：全 f32 配置下边界 cast 入口为快速直通，与原生引擎逐字节一致（G5；P-1 后入口即引擎本身）
 //   2. f16 存储：张量 precision() == F16，且 f32 值在 f16 容差内
 //   3. f16 DSL 求值 / 原地更新 / 归约 / 数据搬运 / matmul / 逐元素原语
 //   4. **in-place 存储精度不可变**（§8.3）且张量对象身份保持不变
@@ -685,12 +685,12 @@ void run_suite(const char* label, nn::ComputeEngine& raw, nn::ComputeEngine& ada
 
 int main()
 {
-    std::printf("f16_precision_test（Phase 2：f16 存储经 PrecisionEngine 生效）\n");
+    std::printf("f16_precision_test（Phase 2：f16 存储经基类边界 cast 生效）\n");
 
     // CPU（始终运行；任意 DSL 表达式不受 AOT 闭合世界约束）
     {
         nn::CpuEngine cpu;
-        nn::PrecisionEngine adapter(cpu);
+        nn::ComputeEngine& adapter = cpu;   // P-1：原 PrecisionEngine 已下沉
         run_suite("cpu", cpu, adapter, /*allow_arbitrary_expr=*/true);
         if (env_flag("NN_F16_DEBUG"))
         {
@@ -706,7 +706,7 @@ int main()
         if (backend.initialize())
         {
             nn::GpuEngine gpu(backend);
-            nn::PrecisionEngine adapter(gpu);
+            nn::ComputeEngine& adapter = gpu;   // P-1：原 PrecisionEngine 已下沉
             run_suite("gpu", gpu, adapter, /*allow_arbitrary_expr=*/false);
         }
         else

@@ -770,7 +770,7 @@ using ExprPrecSig = std::uint32_t;
 //
 // 设备要求：shaderFloat16（VulkanDevice 已查询 + 启用，NN_VULKAN_NO_16BIT_ALU
 // 逃生阀可关）。不支持 → 后端跳过该变体 pipeline → supports_expr_precision_
-// variant=false → PrecisionEngine 回退边界 cast（正确性不变，拿不到原生收益）。
+// variant=false → 基类 NVI 入口回退边界 cast（正确性不变，拿不到原生收益）。
 [[nodiscard]] inline bool expr_prec_sig_native16(const ExprSpec& spec,
                                                  ExprPrecSig sig)
 {

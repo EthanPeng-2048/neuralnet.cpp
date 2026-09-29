@@ -107,7 +107,7 @@ public:
 
         // 计算精度 = p_.compute。Layer 直写该表达式：matmul 段 + row_broadcast
         // bias 融合为单 kernel（与 engine.matmul_with_bias 的 DSL 融合结构一致，
-        // 见 compute_cpu_engine.hpp）；f16 存储经 PrecisionEngine eval_expr 路径
+        // 见 compute_cpu_engine.hpp）；f16 存储经基类边界 cast 入口（NVI）
         // （边界 cast 或 in-kernel f16 变体，内部按 f32 计算、输出按目标精度舍入）。
         return dsl::compute(engine,
             dsl::matmul(w_, input, false, false) + dsl::row_broadcast(b_),

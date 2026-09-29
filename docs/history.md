@@ -13,7 +13,7 @@
 - [GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）](#GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）)（17 条）
 - [注意力 / ZiPT / Transformer / FeedForward 层](#注意力 / ZiPT / Transformer / FeedForward 层)（15 条）
 - [RAPT / CNN / MLP / Softmax / GPT 层](#RAPT / CNN / MLP / Softmax / GPT 层)（11 条）
-- [引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器](#引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器)（15 条）
+- [引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器](#引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器)（16 条）
 - [代数层 / 基础设施 / 模型容器与序列化](#代数层 / 基础设施 / 模型容器与序列化)（12 条）
 - [领域模型工厂与 CLI 公共头](#领域模型工厂与 CLI 公共头)（1 条）
 - [src 应用入口（text/mnist/tokenizer/bench）](#src 应用入口（text/mnist/tokenizer/bench）)（4 条）
@@ -443,6 +443,10 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 ## Tensor reshape 头注释与实现不符（原位置 include/neuralnet.cpp/compute_tensor.hpp:291）
 - 类型：错误注释（文档失真）
 - 内容：头注释原称"零拷贝 reshape（共享底层 buffer）——CPU/Vulkan 均适用"，但 CPU 分支并无零拷贝视图能力、实际复制数据（与 AGENTS §10.6 记载一致）。整改后改为如实记录当前语义：GPU 共享 buffer（零拷贝）、CPU 复制到新形状 Matrix。
+
+## ComputeEngine Refresh P-1：PrecisionEngine 装饰器删除与 NVI 下沉（原位置 include/neuralnet.cpp/compute_precision_engine.hpp 整文件（948 行，46 override）；compute_engine.hpp 类结构）
+- 类型：演进记录 / 性能 A/B
+- 内容：P-1（2026-09-29，方案见 docs/development/15 §4.1）把 f16 边界 cast 装饰器 `PrecisionEngine`（每次现问内层 `inner_` 要不要 cast、49 方法全量委托）下沉为 `ComputeEngine` 基类 NVI：公有非虚入口承载边界 cast 逻辑（变体优先 / 全 f32 快速直通 / 抬 f32→算→按 P 落回），protected 虚 `*_impl` 只管算；CPU 33 / GPU 29 处 override 机械改名 `*_impl`（基类 virtual 总数仍 49，仅公有虚变非虚 + 新增 `_impl`）；`text_train` / `mnist_train` / `mem_probe` / `f16_*` / `scan_exprs` 等 7 处使用方迁移（`optional<PrecisionEngine>` 舞步与 `dump_temp_stats` 静态调用点改指基类），`compute_precision_engine.hpp` 整文件删除。验收：dev1 ctest 20/20（含 f16_precision/gpu_f16/writeback 4 个 f16 用例）、CPU 稳定性探针与 P0 基线逐字节、scan 产物（expr_specs.bin / fused_registry.hpp）hash 不变。**性能 A/B**：layer_bench 单轮小算子 ±30% 摆动且方向不一（linear/layernorm +25% vs mha -7%）→ 交错 4 轮复测方向翻转（layernorm +25%→-7%）→ 判定手机 DVFS/调度噪声主导、未测得系统性回退；精确数字留待桌面平台复测。整改后代码/注释只保留"基类 NVI 边界 cast 入口"的当前结构，适配层叙事仅存于本文与 docs 15/05。
 
 ---
 
