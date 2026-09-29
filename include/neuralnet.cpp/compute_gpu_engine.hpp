@@ -101,7 +101,7 @@ public:
     }
 
     // ── activation offload slab（持久复用缓冲） ───────────────────────
-    [[nodiscard]] Result<Tensor> create_offload_buffer(std::size_t bytes) override
+    [[nodiscard]] Result<Tensor> create_offload_buffer_impl(std::size_t bytes) override
     {
         auto g = GpuTensor::create_host_visible_empty(1, bytes, backend_);
         if (!g) return std::unexpected(g.error());
@@ -123,7 +123,7 @@ public:
     }
 
     // 从 buffer 的 offset（float 单位）处复制 rows×cols 到新 GPU tensor（录制式）
-    [[nodiscard]] Result<Tensor> offload_restore(
+    [[nodiscard]] Result<Tensor> offload_restore_impl(
         const Tensor& buffer, std::size_t offset,
         std::size_t rows, std::size_t cols) override
     {
@@ -185,7 +185,7 @@ public:
     // P 由调用方显式指定（§8.5）：无隐式推导，无 Auto
     // ══════════════════════════════════════════════════════════════════════
 
-    [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols, Precision P = Precision::F32) override
+    [[nodiscard]] Tensor create_tensor_impl(std::size_t rows, std::size_t cols, Precision P) override
     {
         if (P == Precision::F16)
         {
@@ -198,7 +198,7 @@ public:
         return Tensor::from_gpu(std::move(*r));
     }
 
-    [[nodiscard]] Result<Tensor> from_matrix(const Matrix& m, Precision P = Precision::F32) override
+    [[nodiscard]] Result<Tensor> from_matrix_impl(const Matrix& m, Precision P) override
     {
         if (P == Precision::F16)
         {
@@ -260,7 +260,7 @@ public:
     }
 
     // ── cast 原语（§7.5，统一接口；GPU 原生转换，无 PCIe 往返）─────────────
-    [[nodiscard]] Result<Tensor> cast(const Tensor& src, Precision dst) override
+    [[nodiscard]] Result<Tensor> cast_impl(const Tensor& src, Precision dst) override
     {
         if (src.precision() == dst)
             return src;
