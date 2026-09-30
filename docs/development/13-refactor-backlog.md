@@ -255,7 +255,7 @@ class ComputeEngine {
 
 | 步骤 | 现状要改哪里 | P1-P6 之后 |
 |---|---|---|
-| 1. 实现引擎接口 | `ComputeEngine` **49 个 virtual 成员**（`compute_engine.hpp` 共 50 处 `virtual`，:69 是析构——文档"49"与审计脚本"50"的差异来源） | 不变；传输面收敛为 `import` + 两个宿主特例 |
+| 1. 实现引擎接口 | `ComputeEngine` **49 个 virtual 方法**（`bench/doc_inventory.ps1` 口径；2026-09-30 M6 新增 `import_impl` 后由 48 → 49。`grep -c "\bvirtual\b"` 原始 51 处 = 49 方法 + 析构 1 + 注释里的 "Non-Virtual" 1——历史口径"49/50"把注释也算进去了，现已按脚本口径统一） | 不变；传输面收敛为 `import` + 两个宿主特例（**M6 已落地 `import`**） |
 | 2. 提供存储类型 | **改 `compute_tensor.hpp`**：加 variant 槽 + `#ifdef`（现有 7 处再加 1）+ include 新后端头 | **`compute_tensor.hpp` 零改动**：只写 `XxxStorage : TensorStorage`（P5） |
 | 3. 创建入口 | 各自实现 `create_tensor` | 同左，返回值**出生即绑定**自己（P1） |
 | 4. 条件编译 | `NN_HAS_XXX` 渗入容器头 | 只出现在新后端自己的头 + CMake（P5） |

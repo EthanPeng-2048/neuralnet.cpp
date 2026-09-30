@@ -28,9 +28,18 @@
 
 复现：`vulkaninfo --summary`；选卡逻辑 `backend/compute_vk_device.hpp:188-258`。
 
-## 2. `ensure_gpu` 43 处分类（P3 → `import` 的迁移清单）
+## 2. `ensure_gpu` 43 处分类（P3 → `import` 的迁移清单）——**已于 M6 段 B 迁完（2026-09-30）**
 
-复现：`grep -n "= ensure_gpu(" include/neuralnet.cpp/compute_gpu_engine.hpp`
+> **当前状态**：`ensure_gpu` 已从 `compute_gpu_engine.hpp` 删除，48 处命中（43 调用 + 定义/注释）
+> 全部改为公共入口 `import(...)`（17 §4.3）。原分类表保留为迁移依据；**复现命令已失效**
+> （`grep "= ensure_gpu("` = 0 处），改用 `grep -n "= import(" include/neuralnet.cpp/compute_gpu_engine.hpp`。
+> 语义落点：`GpuEngine::import_impl` = 原 A/C 类的宿主直传快路径；**B 类 6 处的"调用方句柄重绑定"
+> 保持原样但显式化**（`if (A.is_cpu()) A = std::move(*import(A));` 的形态不变，`import` 本身
+> **返回新句柄、不改写 src**——与 `cast_into` 不替换红线一致）；D4/D5 由 17 §3 D11 之外的
+> "同设备别名只在同绑定张量之间"由 `bind_check_` 承担。顺带修复：原 `ensure_gpu` 硬取
+> `cpu_matrix()`（F32 槽）对 f16 源会取到空指针，现 f16 源走宿主中转分支。
+
+复现（迁移前口径，2026-09-28）：`grep -n "= ensure_gpu(" include/neuralnet.cpp/compute_gpu_engine.hpp`
 
 | 类 | 数 | 形态 | P3 含义 |
 |---|---|---|---|
