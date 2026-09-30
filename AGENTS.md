@@ -305,6 +305,7 @@ optimizer.step();
 - **位置编码统一为多态基类，所有权按注入点划分**：`compute_position_encoding.hpp` 的 `PositionEncoder`（基类 + `Learned/Sinusoidal/RoPE/ALiBi/None` 子类），注入点分三组（嵌入侧 `apply`、Q/K 侧 `apply_qk`、分数侧 `apply_score_bias`），各子类只覆写自己那组。**谁拥有 = 谁负责**：模型侧（`GPTModel`/`ZiPTModel`/`RAPTModel`）持有嵌入侧编码器（`make_embedding_position_encoder`），注意力层（`CausalSelfAttention`/`ReLULinearAttention`）**自持**注意力侧编码器（`make_attention_position_encoder`）；同一策略类型只在其中一个工厂里实做，另一个映射为恒等。`PosEncodingType` 的分发只剩这两个工厂，层间无位置编码对象传递（RoPE 的 cos/sin 表随层构建，默认配置 ≈64KB/层）。ALiBi 的偏置不融进掩码表达式，而是掩码之后的独立一步（见上面 `row()` 的告警）。
 - **CNN 全引擎化**：`im2col`/`col2im` 数据搬运原语 + `rearrange_3d` 布局置换，Conv2D/MaxPool2D 前反向为「引擎原语 + DSL」，无 PCIe 往返；池化反向为窗口并列最大值均分梯度。
 - **评估分块**：`evaluate_mnist` 的 `eval_batch`（默认 1000）分块前向 + 每块 `release_idle_pool_blocks()`，防大 batch 评估 OOM。
+- **BPE 保序并行 encode**：`Tokenizer::set_encode_threads`（0=自动/1=顺序/>1=指定）+ `encode_segments_`——按空白安全切分点分段、段内经全局线程池并发编码、**按段下标升序拼接**，任意并行度与顺序执行**逐字节一致**（铁律 #8；切分点必为 chunk 边界、标记不含空白不会被切断）；文本 < 256 KiB 或找不到切分点回退顺序路径。`bpe_merge_impl_` 改 thread_local `BpeMergeScratch` + 手写堆，每 chunk 合并**零堆分配**。`text_train::parallel_tokenize` 收编到 `nn::parallel_for_samples`，`tokenizer_infer` 新增 `--threads`。实测 8 MiB 多样文本 `encode` 0.93s→0.134s（32 线程，7.0x）；`.tokcache` 重新生成 SHA256 与旧实现一致。**训练期合并循环仍不可并行**（链式依赖，见 `docs/development/08` §4.2）。
 - **CPU 性能**：DSL 模板路径向量化/并行、`dsl::compute_into` 零分配原地更新、`Tensor::cpu_get_ptr`、分块 GEMM 内核（BLOCK_SIZE=64）。
 - **测试**：ctest 注册 20 个测试（19 个测试目标 + `cnn_test_gpu` = `cnn_test --gpu`；`-DNN_ENABLE_TESTS=ON`；需 Vulkan 的用例退出码 77 = skip）。
 

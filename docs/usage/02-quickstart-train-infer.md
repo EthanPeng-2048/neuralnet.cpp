@@ -176,7 +176,12 @@ cmake --build build --parallel
 
 # 解码 token IDs
 ./build/tokenizer_infer --vocab gpt_bpe.json --decode "72,101,108,108,111"
+
+# 编码整个文件（长文本自动保序并行编码，可用 --threads 指定并行度）
+./build/tokenizer_infer --vocab gpt_bpe.json --encode-file corpus.txt --threads 8
 ```
+
+`--threads`：单次 encode 的并行度，`0`=自动（默认，使用线程池全部核心），`1`=顺序，`>1`=指定并行度（上限为线程池大小）。**任意并行度下输出与顺序执行逐字节一致**（按空白安全切分点分段、段内并发编码、按段序拼接）；文本小于 256 KiB 或找不到切分点时自动回退顺序路径。
 
 ### 支持的分词器类型
 

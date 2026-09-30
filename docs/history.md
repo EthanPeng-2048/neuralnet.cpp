@@ -15,8 +15,8 @@
 - [RAPT / CNN / MLP / Softmax / GPT 层](#RAPT / CNN / MLP / Softmax / GPT 层)（12 条）
 - [引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器](#引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器)（19 条）
 - [代数层 / 基础设施 / 模型容器与序列化](#代数层 / 基础设施 / 模型容器与序列化)（12 条）
-- [领域模型工厂与 CLI 公共头](#领域模型工厂与 CLI 公共头)（1 条）
-- [src 应用入口（text/mnist/tokenizer/bench）](#src 应用入口（text/mnist/tokenizer/bench）)（4 条）
+- [领域模型工厂与 CLI 公共头](#领域模型工厂与 CLI 公共头)（3 条）
+- [src 应用入口（text/mnist/tokenizer/bench）](#src 应用入口（text/mnist/tokenizer/bench）)（5 条）
 - [GPU 手写原语 shader（shaders/*.comp）](#GPU 手写原语 shader（shaders/*.comp）)（12 条）
 - [构建期工具 / 基准脚本 / 对拍脚本](#构建期工具 / 基准脚本 / 对拍脚本)（12 条）
 - [表达式与融合测试](#表达式与融合测试)（18 条）
@@ -595,6 +595,14 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 
 # 领域模型工厂与 CLI 公共头
 
+## BPE encode 每 chunk 的 4 次堆分配（原位置 include/neuralnet.cpp/domain_tokenizer_base.hpp bpe_merge_impl_）
+- 类型：性能 A/B
+- 内容：旧实现每处理一个 chunk 分配 4 次（`ll_prev` / `ll_next` / `std::vector<bool> alive` / `std::priority_queue` 内部 vector），输入 `ids` 与返回结果各再分配一次。现改为 thread_local `BpeMergeScratch` 复用容量、结果**追加**到调用方 `out`、堆用 `std::push_heap/pop_heap` 手工维护（与 `std::priority_queue` 同算法，弹出顺序逐位相同）。实测 34MB 语料 `tokenizer_infer --encode-file` 单线程 18.4s → 9.2s（本机 32 核，2026-10-01；旧二进制基线取自本会话）。输出逐字节不变：`text_train` 的 `.tokcache` 重新生成后 SHA256 = `9E1F6DD4CC6B00F057BB04654E62E6CD4665410ED76E2BAEF578639341CC326E`（与旧实现产出的缓存完全相同）。
+
+## BPE encode 保序并行（原位置 include/neuralnet.cpp/domain_tokenizer_{base,bpe,charbpe}.hpp 的 encode）
+- 类型：演进记录 / 性能 A/B
+- 内容：`encode` 从「单线程顺序处理整段文本」改为 `encode_segments_`：按空白串起点（`find_safe_splits`）分段 → 各段经全局线程池并发编码 → **按段下标升序拼接**。正确性依据（已作为当前契约写进代码注释）：安全切分点对 BPE/CharBPE 的预分词**必然是 chunk 边界**、标记不含空白故不会被切断、预分词与合并都是 chunk 局部操作，因此任意并行度与顺序执行逐字节一致（铁律 #8）。文本 < 256 KiB（`PARALLEL_ENCODE_MIN_BYTES`）或找不到切分点时回退顺序路径；新增 `Tokenizer::set_encode_threads`（0=自动/1=顺序/>1=指定）。实测 8 MiB 多样文本 `encode` 0.93s → 0.134s（32 线程，7.0x；本机 32 核，2026-10-01）。此前「BPE 不能并行」的结论只适用于训练期合并循环（见 `docs/development/08` §4.2）。
+
 ## evaluate_mnist 原始签名否决（cli/cli_mnist_io.hpp:16-18 头注释与 evaluate_mnist 函数注释，整改前行号）
 - 类型：否决方案
 - 内容：曾按「用户原始签名 evaluate_mnist(nn::Layer&, ...)」设计，实际不可行——nn::Model 不是 nn::Layer 的派生类，且 Model::forward 自带 engine 绑定（签名不同于 Layer::forward(engine, ...)）；最终改用 nn::Model&，原注释还附带「与原签名行为完全等价」的等价性论证。技术理由已改写为当前注释（签名为何取 nn::Model&），原始签名叙事与等价性论证移至本条。
@@ -618,6 +626,10 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 ## layer_bench transB/transA 变体与 plain 共用操作数（原位置 src/layer_bench.cpp:263-264，整改前行号）
 - 类型：bug 根因
 - 内容：旧版 setup 让 transB/transA 变体与 plain 共用 `(k,n)` 操作数：`k==n` 时方阵形状掩盖错配，`k≠n` 时 backend 返回 K mismatch 而 run 内 `*expected` 不查错 → UB，测出 0.000ms 垃圾时长 / 超物理 GFLOPS。已改为 per-variant 独立 setup + run 查 Result 失败即打印并中止；注释保留现行契约（每变体自建操作数、run 必须查错）与形状错配的坑。
+
+## text_train::parallel_tokenize 换用全局线程池（原位置 src/text_train.cpp parallel_tokenize）
+- 类型：演进记录
+- 内容：旧实现用 `std::async(std::launch::async)` 每块起一个 future、按块顺序 `get()` 后拼接（保序但每次调用有 future 堆分配与共享状态）。现改为按块下标写 `parts[c]` + `nn::parallel_for_samples` + 顺序拼接；块边界仍是 `(n + n_threads - 1) / n_threads`，token 流与 doc_ids **逐字节不变**（`.tokcache` 重新生成 SHA256 一致）。同批 `tokenizer_infer` 新增 `--threads`（单次 encode 并行度）。
 
 ---
 

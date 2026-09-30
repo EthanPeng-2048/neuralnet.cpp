@@ -63,6 +63,16 @@ public:
     // 子类重写此方法以支持从 JSON 字符串直接加载词表。
     [[nodiscard]] virtual Result<void> load_from_string(const std::string &json_content) = 0;
 
+    // ── encode 并行度（保序并行，机制见 protected encode_segments_） ──────
+    //   0 = 自动（全局线程池全部核心；文本小于阈值时仍走顺序路径）
+    //   1 = 强制顺序（测试对拍 / 避免与调用方自身的行级并行嵌套）
+    //  >1 = 指定并行度（上限 = 线程池大小）
+    // 只影响单次 encode 内部的分段并行，不改变任何输出字节。
+    // ⚠ 须在并发 encode 之前调用（encode 本身可被多线程并发调用——内部状态
+    //   全部只读、合并暂存为 thread_local）。
+    void set_encode_threads(std::size_t n) noexcept { encode_threads_ = n; }
+    [[nodiscard]] std::size_t encode_threads() const noexcept { return encode_threads_; }
+
     // ── 对话标记集合（基类持有，子类直接复用，无需各自重定义） ──────
     struct DialogueMarkers {
         std::size_t system = npos, user = npos, assistant = npos;
@@ -125,6 +135,9 @@ public:
 protected:
     // 对话标记 ID 集合（子类直接读取，无需各自定义 6 个字段）
     DialogueMarkers markers_;
+
+    // encode 并行度（0=自动，1=顺序，>1=指定；见 set_encode_threads）
+    std::size_t encode_threads_ = 0;
 
     // 额外保留 token → id 查找表（按字符串长度降序，供 try_match_marker 最长匹配）
     std::vector<std::pair<std::string, std::size_t>> reserved_ids_;
@@ -360,32 +373,74 @@ protected:
             finish_progress_("合并");
     }
 
-    // 共享 BPE 合并：对单个 ID 序列应用合并规则（优先队列驱动，O(n log n)）。
-    // 使用基类的 merges_ 与 merge_priority_。
-    [[nodiscard]] std::vector<std::size_t>
-    bpe_merge_impl_(std::vector<std::size_t> ids) const
+    // ── 合并暂存（thread_local）─────────────────────────────────────────
+    // encode 可被多线程并发调用（text_train 的行级并行），故暂存必须 per-thread。
+    // 复用容量使每个 chunk 的合并**零堆分配**（原实现每 chunk 4 次分配：
+    // ll_prev / ll_next / alive / 优先队列内部 vector）。
+    struct BpeMergeScratch
     {
-        if (ids.size() <= 1) return ids;
+        std::vector<std::size_t> ids;       // 调用方填充的输入（合并时原地改写）
+        std::vector<std::size_t> ll_prev;
+        std::vector<std::size_t> ll_next;
+        std::vector<std::uint8_t> alive;
+        std::vector<std::pair<std::size_t, std::size_t>> heap;
+    };
 
+    [[nodiscard]] static BpeMergeScratch &bpe_merge_scratch_()
+    {
+        thread_local BpeMergeScratch s;
+        return s;
+    }
+
+    // 共享 BPE 合并：对 ids 应用合并规则（优先队列驱动，O(n log n)），
+    // 结果**追加**到 out（不预清空，由调用方负责）。ids 被原地改写，
+    // 调用方可用 bpe_merge_scratch_().ids 作输入缓冲以复用容量。
+    // 使用基类的 merges_ 与 merge_priority_；堆用 std::push_heap/pop_heap
+    // 手工维护（与 std::priority_queue 同一算法，弹出顺序逐位相同）。
+    void bpe_merge_impl_(std::vector<std::size_t> &ids,
+                         std::vector<std::size_t> &out) const
+    {
         const std::size_t n = ids.size();
-        std::vector<std::size_t> ll_prev(n), ll_next(n);
+        if (n == 0) return;
+        if (n == 1) { out.push_back(ids[0]); return; }
+
+        auto &scratch = bpe_merge_scratch_();
+        auto &ll_prev = scratch.ll_prev;
+        auto &ll_next = scratch.ll_next;
+        auto &alive   = scratch.alive;
+        auto &heap    = scratch.heap;
+
+        ll_prev.resize(n);
+        ll_next.resize(n);
+        alive.assign(n, 1);
+        heap.clear();
+
         for (std::size_t j = 0; j < n; ++j)
         {
             ll_prev[j] = (j == 0) ? n : j - 1;
             ll_next[j] = (j + 1 == n) ? n : j + 1;
         }
-        std::vector<bool> alive(n, true);
 
         using HeapEntry = std::pair<std::size_t, std::size_t>;
-        std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
+        const auto heap_cmp = std::greater<HeapEntry>{};
+        auto push_entry = [&](HeapEntry e) {
+            heap.push_back(e);
+            std::push_heap(heap.begin(), heap.end(), heap_cmp);
+        };
+        auto pop_entry = [&]() {
+            std::pop_heap(heap.begin(), heap.end(), heap_cmp);
+            const HeapEntry e = heap.back();
+            heap.pop_back();
+            return e;
+        };
 
         auto push_pair = [&](std::size_t pos) {
-            std::size_t nxt = ll_next[pos];
+            const std::size_t nxt = ll_next[pos];
             if (nxt < n && alive[pos] && alive[nxt])
             {
-                std::size_t prio = merge_priority_(ids[pos], ids[nxt]);
+                const std::size_t prio = merge_priority_(ids[pos], ids[nxt]);
                 if (prio < merges_.size())
-                    heap.push({prio, pos});
+                    push_entry({prio, pos});
             }
         };
 
@@ -394,19 +449,18 @@ protected:
 
         while (!heap.empty())
         {
-            auto [prio, pos] = heap.top();
-            heap.pop();
+            const auto [prio, pos] = pop_entry();
 
             if (!alive[pos]) continue;
-            std::size_t nxt = ll_next[pos];
+            const std::size_t nxt = ll_next[pos];
             if (nxt >= n || !alive[nxt]) continue;
             if (merge_priority_(ids[pos], ids[nxt]) != prio) continue;
 
             ids[pos] = merges_[prio].new_id;
-            alive[nxt] = false;
+            alive[nxt] = 0;
 
-            std::size_t prev = ll_prev[pos];
-            std::size_t after = ll_next[nxt];
+            const std::size_t prev  = ll_prev[pos];
+            const std::size_t after = ll_next[nxt];
             ll_next[pos] = after;
             if (after < n) ll_prev[after] = pos;
 
@@ -415,14 +469,9 @@ protected:
             push_pair(pos);
         }
 
-        // 按链表顺序收集结果
-        std::vector<std::size_t> result;
-        std::size_t cur = 0;
-        do {
-            result.push_back(ids[cur]);
-            cur = ll_next[cur];
-        } while (cur < n);
-        return result;
+        // 按链表顺序收集结果（位置 0 永不被合并吃掉，可作链表头）
+        for (std::size_t cur = 0; cur < n; cur = ll_next[cur])
+            out.push_back(ids[cur]);
     }
 
     // BPE 子类共享的合并规则表与查找表（BPE/CharBPE 使用，其他子类不访问）
@@ -629,6 +678,71 @@ protected:
                 splits.push_back(best);
         }
         return splits;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  保序并行 encode（A + C 落地；铁律 8 确定性）
+    // ═══════════════════════════════════════════════════════════════════════
+    //  encode 并行门槛：小于该字节数走顺序路径——既省掉短文本的线程开销，
+    //  也避免与调用方自身的行级并行（text_train::parallel_tokenize）嵌套。
+    static constexpr std::size_t PARALLEL_ENCODE_MIN_BYTES = 1u << 18;  // 256 KiB
+    //  与 parallel_pretokenize 同一思路：分段 → 各段独立编码 → 按段序拼接。
+    //  为什么结果与单线程**逐字节一致**：
+    //    1) 切分点取"空白串起点"（find_safe_splits）；对 BPE/CharBPE 的预分词
+    //       它**必然是 chunk 边界**——含空白的 chunk（BPE 的 " ?[a-zA-Z]+"/
+    //       " ?[0-9]+"/"\s+"、CharBPE 的"前导空白并入后词"）都以空白串起点开头；
+    //    2) 预分词与 BPE 合并都是 chunk 局部的上下文无关操作，段内输出与
+    //       连续处理整段文本时该段对应的输出完全相同；
+    //    3) 对话标记不含空白，故任何切分点都不可能落在标记中间；
+    //    4) 输出按段下标升序拼接，与调度/线程数无关。
+    //  encode_segment(seg, out) 把一段文本编码并**追加**到 out。
+    //  文本小于 PARALLEL_ENCODE_MIN_BYTES 或找不到切分点时回退顺序路径。
+    template<typename SegmentFn>
+    [[nodiscard]] std::vector<std::size_t>
+    encode_segments_(std::string_view text, SegmentFn &&encode_segment) const
+    {
+        std::vector<std::size_t> all_ids;
+        if (text.empty()) return all_ids;
+
+        auto &pool = global_thread_pool();
+        const std::size_t n_threads = (encode_threads_ == 0)
+            ? pool.size()
+            : std::min<std::size_t>(encode_threads_, pool.size());
+        if (n_threads <= 1 || text.size() < PARALLEL_ENCODE_MIN_BYTES)
+        {
+            encode_segment(text, all_ids);
+            return all_ids;
+        }
+
+        const auto splits = find_safe_splits(text, n_threads);
+        if (splits.empty())
+        {
+            encode_segment(text, all_ids);
+            return all_ids;
+        }
+
+        std::vector<std::pair<std::size_t, std::size_t>> ranges;
+        ranges.reserve(splits.size() + 1);
+        std::size_t begin = 0;
+        for (auto sp : splits) { ranges.emplace_back(begin, sp); begin = sp; }
+        ranges.emplace_back(begin, text.size());
+
+        // 每段独立输出槽位（无共享写），段内编码由线程池分发
+        const std::size_t n = ranges.size();
+        std::vector<std::vector<std::size_t>> locals(n);
+        pool.parallel_for_samples(n, [&](std::size_t k) {
+            const std::string_view seg(text.data() + ranges[k].first,
+                                       ranges[k].second - ranges[k].first);
+            encode_segment(seg, locals[k]);
+        });
+
+        // 按段下标升序拼接（保序）
+        std::size_t total = 0;
+        for (const auto &v : locals) total += v.size();
+        all_ids.reserve(total);
+        for (auto &v : locals)
+            all_ids.insert(all_ids.end(), v.begin(), v.end());
+        return all_ids;
     }
 
     // 并行预分词框架（map-reduce，复用项目全局线程池）：

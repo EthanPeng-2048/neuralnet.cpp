@@ -186,7 +186,18 @@ public:
 
     [[nodiscard]] std::vector<std::size_t> encode(const std::string &text) const override
     {
-        std::vector<std::size_t> all_ids;
+        // 保序并行：按安全切分点分段 → 段内顺序编码 → 按段序拼接
+        // （结果为单线程逐字节一致；见基类 encode_segments_）。
+        return encode_segments_(text, [this](std::string_view seg, std::vector<std::size_t> &out)
+        {
+            encode_segment_(seg, out);
+        });
+    }
+
+private:
+    // ── 顺序编码一段文本：把 ids **追加**到 all_ids ──────────────────
+    void encode_segment_(std::string_view text, std::vector<std::size_t> &all_ids) const
+    {
         std::size_t pos = 0;
         while (pos < text.size())
         {
@@ -205,23 +216,25 @@ public:
                 { auto [mid, mlen] = try_match_marker(text, pos); if (mid != Tokenizer::npos) break; }
                 ++pos;
             }
-            std::string segment(text, seg_start, pos - seg_start);
+            std::string segment(text.substr(seg_start, pos - seg_start));
             // 正常 BPE 编码
             auto chunks = pre_tokenize(segment);
+            // 每 chunk 复用 thread_local 输入缓冲 → 合并全程零堆分配
+            auto &ids = bpe_merge_scratch_().ids;
             for (const auto &chunk : chunks)
             {
-                std::vector<std::size_t> ids;
+                ids.clear();
                 ids.reserve(chunk.size());
                 for (unsigned char b : chunk)
                     ids.push_back(static_cast<std::size_t>(b));
 
                 // 共享 BPE 合并算法（基类 bpe_merge_impl_）
-                auto merged = bpe_merge_impl_(std::move(ids));
-                all_ids.insert(all_ids.end(), merged.begin(), merged.end());
+                bpe_merge_impl_(ids, all_ids);
             }
         }
-        return all_ids;
     }
+
+public:
 
     [[nodiscard]] std::string decode(std::span<const std::size_t> ids) const override
     {
