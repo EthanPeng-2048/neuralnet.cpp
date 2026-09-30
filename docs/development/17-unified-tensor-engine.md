@@ -248,8 +248,9 @@ CPU 字节基线 + scan 产物 hash + layer_bench（定义见 §6）。
 5. **测试迁移量**：src 127 处 `cpu_matrix` 集中在 `expr_*_test`（填数 + 对拍），
    迁移模板化——填数：构造 Matrix → `from_matrix`；对拍 → `to_matrix`；D7 裁定同期完成，
    一次编译红海换一次性收口。
-6. **既有故障不混入**：f16 loss 冻结（14）、`text_train --model zipt` abort、
-   `gpu_stability_probe --gpu` 崩溃均非本范围——验收时按既有状态如实记录，不得当回归。
+6. **既有故障不混入**：f16 loss 冻结（14）、`gpu_stability_probe --gpu` 崩溃均非本范围——
+   验收时按既有状态如实记录，不得当回归。（原列的 `text_train --model zipt` abort 已随
+   ZiPT 于 2026-10-01 整体移除而消失，见 `docs/history.md`。）
 
 ## 8. 与既有文档关系 / 未决点
 

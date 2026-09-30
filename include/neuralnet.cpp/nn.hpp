@@ -45,7 +45,6 @@
 // L4 构建层
 #include "domain_mnist.hpp"
 #include "domain_gpt.hpp"
-#include "domain_zipt.hpp"
 #include "domain_rla.hpp"
 #include "domain_cnn.hpp"
 #include "domain_tokenizer.hpp"

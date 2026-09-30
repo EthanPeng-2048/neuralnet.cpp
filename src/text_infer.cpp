@@ -126,13 +126,10 @@ nn::Result<std::vector<std::size_t>> generate_text(
     if (auto *gpt_ptr = dynamic_cast<nn::GPTModel *>(&layer_ref))
         return gpt_ptr->generate(engine, prompt_tokens, max_new_tokens, temperature,
                                  eos_token_id, min_new);
-    if (auto *zipt_ptr = dynamic_cast<nn::ZiPTModel *>(&layer_ref))
-        return zipt_ptr->generate(engine, prompt_tokens, max_new_tokens, temperature,
-                                  eos_token_id, min_new);
     if (auto *rapt_ptr = dynamic_cast<nn::RAPTModel *>(&layer_ref))
         return rapt_ptr->generate(engine, prompt_tokens, max_new_tokens, temperature,
                                   eos_token_id, min_new);
-    return std::unexpected(nn::Error{"Model does not contain a GPTModel, ZiPTModel or RAPTModel layer"});
+    return std::unexpected(nn::Error{"Model does not contain a GPTModel or RAPTModel layer"});
 }
 
 // ==================== 交互模式 ====================
@@ -248,9 +245,9 @@ int main(int argc, char *argv[])
         return 1;
     }
     nn::ModelSpec spec = spec_result.value();
-    if (!spec.is_gpt() && !spec.is_zipt() && !spec.is_rapt())
+    if (!spec.is_gpt() && !spec.is_rapt())
     {
-        std::cerr << "模型文件不是 GPT/ZiPT/RAPT 类型 (type="
+        std::cerr << "模型文件不是 GPT/RAPT 类型 (type="
                   << static_cast<uint32_t>(spec.type) << ")\n";
         return 1;
     }
@@ -274,15 +271,7 @@ int main(int argc, char *argv[])
               << " layers=" << spec.num_layers
               << " d_ff=" << spec.d_ff
               << " seq_len=" << spec.seq_len;
-    if (spec.is_zipt())
-    {
-        std::cout << " memory_tokens=" << spec.memory_tokens;
-        const std::size_t win = (spec.window == 0) ? spec.seq_len : spec.window;
-        std::cout << " window=" << win
-                  << (win < spec.seq_len ? " [压缩模式 L=W+C]" : " [W=L 无压缩]")
-                  << " [ZiPT]";
-    }
-    else if (spec.is_rapt())
+    if (spec.is_rapt())
     {
         std::cout << " [RAPT (ReLU 线性注意力)]";
     }
@@ -299,8 +288,6 @@ int main(int argc, char *argv[])
     nn::Result<nn::Model> model_result;
     if (spec.is_rapt())
         model_result = nn::build_rapt_model_from_spec(*engine, spec);
-    else if (spec.is_zipt())
-        model_result = nn::build_zipt_model_from_spec(*engine, spec);
     else  // 统一的 GPTModel 通过 pos_encoding 区分 Learned/Sinusoidal/ALiBi
         model_result = nn::build_gpt_model_from_spec(*engine, spec);
     if (!model_result)
