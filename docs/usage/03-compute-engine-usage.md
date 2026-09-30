@@ -164,6 +164,14 @@ engine.set_index(*t, 0, 0, 0.5f);       // f16 存储按 round-half-to-even 舍�
 > 录制窗口内 `read/write` 的调用约定（隐含 flush、写入张量须存活到 `end_batch` 之后）见
 > `compute_engine.hpp` I/O 分组注释。
 
+> **写 Layer / Loss / Optimizer 时（铁律 #12，M4）**：这些头文件里不许出现 `Matrix`，
+> 也不许调 `from_matrix/to_matrix/copy_from`。层自算的小规模辅助数据（索引、位置编码表、
+> 掩码、斜率……）用宿主桥：`detail::upload_span(engine, rows, cols, P, std::span(buf))`
+> 建张量、`detail::download_vector(engine, t)` 取值（f16 语义与 `from_matrix`/`to_matrix`
+> 逐位一致）；零张量直接 `engine.create_tensor(r, c, P, InitSpec::zero())`。
+> 数据集/权重/对拍/落盘等大批量 I/O 仍在 I/O 层用 `from_matrix/to_matrix`。
+> 分层审计：`pwsh -File bench\doc_inventory.ps1` 第 [4] 节（`L2-VIOLATIONS` 必须为 0）。
+
 ### 深拷贝
 
 ```cpp
