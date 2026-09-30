@@ -47,6 +47,7 @@
 #include <source_location>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -323,6 +324,187 @@ public:
         return stamp_(from_matrix_impl(m, P));
     }
     [[nodiscard]] virtual Result<Matrix> to_matrix(const Tensor& t, Precision P = Precision::F32) = 0;
+
+    // ══════════════════════════════════════════════════════════════════════
+    // I/O 分组（M3，docs/development/17 §4.3 D3/D9）：
+    //   from_matrix / to_matrix / read / write / get_index / set_index
+    // 宿主数据进出张量只准经本组动词；D9：from_matrix/to_matrix 保留原名
+    // （Matrix = 宿主 I/O 载体），新增批量 read/write 为**本体**，索引级
+    // get_index/set_index 是语法糖。审计口径（M4 分层审计接线）：库外
+    // （tests/tools/CLI）只准出现本组动词；计算路径（Layer/Loss/Optimizer/
+    // Model）禁用本组（序列化编解码层除外）。
+    //
+    // 调用约定（17 §7-1/§7-4，铁律 #6）：
+    //   - read 在 GPU 上**隐含 flush + 同步**（与 to_matrix 同路）：录制窗口
+    //     内调用会 end_batch 提交 → wait_in_flight → 开新帧。逐 step loss
+    //     回读继续走 submit_scalar_readback 快路，不被 read 取代。
+    //   - write 覆盖 t 的**既有存储、不替换对象**（沿 copy_into 红线）；GPU
+    //     录制窗口内走 copy_from 的既有 drain 语义。写入的张量必须存活到
+    //     end_batch() 之后（铁律 #6）。
+    //   - U2 元素类型：span<T> 的 T 必须与 t.precision() 精确匹配（float↔F32、
+    //     f16↔F16），错配 = 运行期错误，类型本身非法 = 编译期 static_assert
+    //     ——防 f16/f32 槽错位。f16/f32 换算由引擎边界做（RHE），不经调用方。
+    //   - 批量是本体，index API 不给热循环承诺（GPU 上每次调用 = 一整轮
+    //     staging 往返；热路径请攒批量）。
+    // ══════════════════════════════════════════════════════════════════════
+
+    // 批量读：张量全量 → dst（行主序），GPU 隐含 flush + 同步。
+    template <class T>
+    [[nodiscard]] Result<void> read(const Tensor& t, std::span<T> dst)
+    {
+        static_assert(!std::is_const_v<T> &&
+                          (std::is_same_v<T, Scalar> || std::is_same_v<T, f16>),
+                      "read: span 元素类型必须是 nn::Scalar(float) 或 nn::f16（U2 精确匹配）");
+        if (auto ec = bind_check_({&t}); !ec)
+            return std::unexpected(ec.error());
+        constexpr Precision want =
+            std::is_same_v<T, f16> ? Precision::F16 : Precision::F32;
+        if (t.precision() != want)
+            return std::unexpected(
+                Error{"read: span 元素类型与张量精度不匹配（U2 精确匹配）"});
+        if (dst.size() != t.rows() * t.cols())
+            return std::unexpected(Error{"read: 元素数与张量形状不匹配"});
+        // 统一经 to_matrix（GPU 分支自带 flush + wait_in_flight；f16 存储
+        // 升 f32 精确无损，T=f16 时下面再 RHE 落回——往返位不变）。
+        auto m = to_matrix(t, Precision::F32);
+        if (!m)
+            return std::unexpected(m.error());
+        const auto src = m->span();
+        if constexpr (std::is_same_v<T, Scalar>)
+        {
+            std::copy(src.begin(), src.end(), dst.begin());
+        }
+        else
+        {
+            for (std::size_t i = 0; i < src.size(); ++i)
+                dst[i] = static_cast<f16>(src[i]);
+        }
+        return {};
+    }
+
+    // 批量写：src 覆盖 t 的既有存储（不替换对象、不改形状/精度）。
+    // 与 copy_from 的分工：copy_from 收 f32 Matrix（含 f32→f16 转换填充，
+    // 序列化加载用）；write 收与张量精度严格一致的 span（U2）。
+    // 形参用 span<T> 而非 span<const T>：模板实参推导中 "const T" 无法与
+    // 非 const 的 span<Scalar> 匹配（推导失败），故这里收 span<T>、静态断言
+    // 只校验去 cv 后的元素类型；src 只读。
+    template <class T>
+    [[nodiscard]] Result<void> write(Tensor& t, std::span<T> src)
+    {
+        using Elem = std::remove_cv_t<T>;
+        static_assert(std::is_same_v<Elem, Scalar> || std::is_same_v<Elem, f16>,
+                      "write: span 元素类型必须是 nn::Scalar(float) 或 nn::f16（U2 精确匹配）");
+        if (auto ec = bind_check_({&t}); !ec)
+            return std::unexpected(ec.error());
+        constexpr Precision want =
+            std::is_same_v<Elem, f16> ? Precision::F16 : Precision::F32;
+        if (t.precision() != want)
+            return std::unexpected(
+                Error{"write: span 元素类型与张量精度不匹配（U2 精确匹配）"});
+        if (src.size() != t.rows() * t.cols())
+            return std::unexpected(Error{"write: 元素数与张量形状不匹配"});
+
+        if (t.is_cpu())
+        {
+            // 宿主张量直写既有存储（保留对象身份）。不走 copy_from：GPU 引擎
+            // 的 copy_from CPU 回退分支会替换 dst 对象，不满足 write 红线；
+            // CPU 引擎的 F16 目标则要经 f32 转换，而 write 的 T 已与存储
+            // 精确一致（U2），此处按存储元素类型直拷，零换算。
+            if constexpr (std::is_same_v<Elem, f16>)
+            {
+                MatrixT<Precision::F16> m16(t.rows(), t.cols(),
+                                            MatrixT<Precision::F16>::uninitialized_tag{});
+                std::copy(src.begin(), src.end(), m16.span().begin());
+                t.cpu_matrix<Precision::F16>() = std::move(m16);
+            }
+            else
+            {
+                Matrix m(t.rows(), t.cols(), Matrix::uninitialized_tag{});
+                std::copy(src.begin(), src.end(), m.span().begin());
+                t.cpu_matrix() = std::move(m);
+            }
+            return {};
+        }
+
+        // GPU 目标：经 copy_from（既有录制窗口 drain 语义；F16 目标 =
+        // f32 上传 + cast_into 写回 dst 原存储，对象身份不替换）。
+        // f16 → f32 提升精确无损，落回 dst 时 RHE，与边界 cast 同口径。
+        Matrix m(t.rows(), t.cols(), Matrix::uninitialized_tag{});
+        const auto d = m.span();
+        if constexpr (std::is_same_v<Elem, Scalar>)
+        {
+            std::copy(src.begin(), src.end(), d.begin());
+        }
+        else
+        {
+            for (std::size_t i = 0; i < src.size(); ++i)
+                d[i] = static_cast<Scalar>(src[i]);
+        }
+        return copy_from(t, m);
+    }
+
+    // 索引读（语法糖：宿主直读 / GPU = 一次批量 read）。行主序 (row, col)；
+    // f16 存储提升为 Scalar（精确无损）。GPU 每次调用一整轮 staging 往返，
+    // 不承诺热循环性能（17 §7-1）——热路径请攒批量用 read。
+    [[nodiscard]] Result<Scalar> get_index(const Tensor& t, std::size_t row,
+                                           std::size_t col)
+    {
+        if (auto ec = bind_check_({&t}); !ec)
+            return std::unexpected(ec.error());
+        if (row >= t.rows() || col >= t.cols())
+            return std::unexpected(Error{"get_index: (row, col) 越界"});
+        const std::size_t idx = row * t.cols() + col;
+        if (t.is_cpu())
+        {
+            if (t.precision() == Precision::F16)
+                return static_cast<Scalar>(t.cpu_matrix<Precision::F16>().span()[idx]);
+            return t.cpu_matrix().span()[idx];
+        }
+        if (t.precision() == Precision::F16)
+        {
+            std::vector<f16> buf(t.rows() * t.cols());
+            if (auto r = read(t, std::span<f16>(buf)); !r)
+                return std::unexpected(r.error());
+            return static_cast<Scalar>(buf[idx]);
+        }
+        std::vector<Scalar> buf(t.rows() * t.cols());
+        if (auto r = read(t, std::span<Scalar>(buf)); !r)
+            return std::unexpected(r.error());
+        return buf[idx];
+    }
+
+    // 索引写（语法糖：宿主直写 / GPU = read → 改一格 → write）。
+    // f16 存储：Scalar 值经 RHE 舍入（与 from_matrix/边界 cast 同口径）。
+    [[nodiscard]] Result<void> set_index(Tensor& t, std::size_t row, std::size_t col,
+                                         Scalar v)
+    {
+        if (auto ec = bind_check_({&t}); !ec)
+            return std::unexpected(ec.error());
+        if (row >= t.rows() || col >= t.cols())
+            return std::unexpected(Error{"set_index: (row, col) 越界"});
+        const std::size_t idx = row * t.cols() + col;
+        if (t.is_cpu())
+        {
+            if (t.precision() == Precision::F16)
+                t.cpu_matrix<Precision::F16>().span()[idx] = static_cast<f16>(v);
+            else
+                t.cpu_matrix().span()[idx] = v;
+            return {};
+        }
+        if (t.precision() == Precision::F16)
+        {
+            std::vector<f16> buf(t.rows() * t.cols());
+            if (auto r = read(t, std::span<f16>(buf)); !r)
+                return std::unexpected(r.error());
+            buf[idx] = static_cast<f16>(v);
+            return write(t, std::span<const f16>(buf));
+        }
+        std::vector<Scalar> buf(t.rows() * t.cols());
+        if (auto r = read(t, std::span<Scalar>(buf)); !r)
+            return std::unexpected(r.error());
+        buf[idx] = v;
+        return write(t, std::span<const Scalar>(buf));
+    }
 
     // ── reshape（M1，docs/development/17 §3 D10：修改类操作一律引擎方法）──
     // 语义同原 Tensor::reshape：GPU 共享底层 buffer（零拷贝视图）、CPU 按
