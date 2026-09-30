@@ -368,9 +368,10 @@ public:
 // ══════════════════════════════════════════════════════════════════════════
 // 采样：temperature 缩放 → 数值稳定 softmax → 随机采样 / 贪心（argmax）
 //
-// GPTModel / RAPTModel / ZiPTModel 的 generate() 各自逐 token 维护不同的
-// 运行态（KV cache / RLA 运行态 / 无状态整窗前向），但"从末位 logits 选下一
-// token"这一步三者**逐字相同** → 收敛到本函数（曾有三份拷贝，改一处要改三处）。
+// GPTModel / RAPTModel 的 generate() 各自逐 token 维护不同的运行态
+// （KV cache / RLA 运行态），但"从末位 logits 选下一 token"这一步两者
+// **逐字相同** → 收敛到本函数（曾有三份拷贝，改一处要改三处；第三份属
+// 于已移除的 ZiPTModel，见 docs/history.md）。
 //
 //   logits        就地变为概率（调用方不需要原值）
 //   temperature   >0 随机采样（1.0 = 不缩放但仍采样）；<=0 贪心

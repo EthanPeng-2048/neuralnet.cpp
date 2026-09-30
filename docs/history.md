@@ -28,6 +28,7 @@
 - [docs/introduction · usage · benchmarks](#docs/introduction · usage · benchmarks)（46 条）
 - [构建系统 / CI（CMakeLists.txt、.github/workflows）](#构建系统 / CI（CMakeLists.txt、.github/workflows）)（1 条）
 - [AGENTS.md](#AGENTS.md)（24 条）
+- [ZiPT（AttnZip）移除](#ZiPT（AttnZip）移除（2026-10-01）)（1 条）
 
 ---
 
@@ -1805,3 +1806,86 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 
 - 类型：已修复勘误
 - 内容：原文写 `model.add_linear(784,256).add_relu().add_linear(256,10)`——**全仓不存在 `add_linear`/`add_relu`**（grep 仅命中 AGENTS.md 自身）。`Model::add` 是模板方法 `template <typename LayerType, typename... Args> Result<void> add(Args&&...)`（`include/neuralnet.cpp/model_container.hpp:71-72`），无链式 API，层构造后自动 `init(engine)`。已改为逐层写法 `model.add<nn::Linear>(784,256); model.add<nn::ReLU>(); model.add<nn::Linear>(256,10);`，与 `docs/usage/01-quickstart-model.md:19-21` 一致。
+
+---
+
+# ZiPT（AttnZip）移除（2026-10-01）
+
+> 本文是全仓唯一归档处；`AGENTS.md` §12、`docs/introduction/04` §10、`docs/development/15` §7.3
+> 现只保留「已移除 + 指针」。**代码本体完整保留在 `legacy/zipt` 分支**（`git show legacy/zipt:<path>`）。
+
+## ZiPT 移除裁决与恢复前提（2026-10-01）
+
+- 类型：删除清单 / 否决方案（附**恢复前提**）
+- 决定：**AttnZip（ZiPT）整体移出主线**（`main`），代码与文档归档到 `legacy/zipt` 分支。
+- 依据（代码事实，非文档声明）：
+  1. **默认路径严格劣于既有 GPT 路径**：`ZiPTConfig.window = 0` → `W = L` → `split_ = false`
+     （`domain_zipt.hpp:58`、`compute_layer_zipt.hpp:740-743`），此时块输入就是整条序列，
+     块内仍做 `W = L` 的联合注意力（**O(L²)**），并额外物化并缓存一张
+     `BH·W·(M+W)` 的 F32 掩码（`mask_cache_`，`compute_layer_zipt.hpp:286-316`）。
+     同样的计算量下，比 fold 流式注意力多一张显式掩码 + 物化 scores + 一个压缩器 pass。
+  2. **压缩器只有模型级一份、且作用在嵌入上**（`compressor_.forward(x)`，x = embedding + pos，
+     `compute_layer_zipt.hpp:850-861`）；`07-zipt-algorithm.md`（已删）§6.2 承诺的
+     "每隔几层重复压缩" 从未实现。
+  3. **算法层未闭环**：缺省模式下压缩器压缩**整条含未来 token 的序列**（非因果）；
+     项目自己的文档承认 "严格因果需压缩 prefix-only（待做）"（`04-innovative-designs.md` §10.4，已删）。
+  4. **训练显存开关全缺**：无 `forward_recompute` → 不支持梯度检查点（override 直接
+     `std::abort()`，`compute_layer_zipt.hpp:785-795`）；activation offload 未接线。
+     而 "长上下文" 恰恰是它唯一的卖点——最需要这两项的场景它一项都没有。
+  5. **零质量/成本数据**：全仓（`bench/`、`docs/benchmarks/`）没有任何 ZiPT 的
+     loss / perplexity / 显存 / 吞吐对比；`04` 的"里程碑通过"仅为冒烟级"loss 下降"。
+  6. **CLI 不可用且无人使用**：`text_train --model zipt` 自 2026-09-29 起启动即 abort
+     （`Model::set_checkpoint_every(0)` 无条件下发 → ZiPT override 不判 `stride==0`），
+     长期无人发现 = 无实际使用者。
+  7. **持续重构税**：M1–M6、位置编码策略化、`NN_TRY` 收敛每一轮都把 ziPT 纳入迁移范围
+     （约 1200 行 + 33 个文件的引用）；`compute_layer_zipt.hpp` 1026 行 + `domain_zipt.hpp` 121 行
+     + 测试 812 行。
+- 生态位判断：ZiPT 想占的是 "窗口内精确 + 全局压缩记忆" 这一点，**该生态位真实存在**
+  （NSA / MoBA / gist-token 一族），但当前实现离卖点差三件关键事（因果压缩、有信息量的
+  压缩层级、可训练长上下文）；对照之下 fold 流式注意力（精确、O(L) 显存）与
+  RLA-2/RAPT（O(L) 时间、已实测）都已成立并接入。
+- **恢复前提（两条同时满足才允许恢复）**：
+  1. **算法层**：压缩向量必须**因果**——压缩器只能看到当前位置之前的内容；
+     并明确压缩发生在哪一层（嵌入层 vs 逐层）及其依据。
+  2. **代码层**：实现质量对齐 RAPT/GPT——`forward_recompute`（梯度检查点）+ activation offload
+     接线、CLI/`ModelSpec`/序列化/ctest 覆盖齐备、且**有与 GPT/RAPT 同参同等墙钟预算的
+     对比数据**（否则仍是不可裁决的设计）。
+- 删除清单：
+  - 文件：`include/neuralnet.cpp/compute_layer_zipt.hpp`、`include/neuralnet.cpp/domain_zipt.hpp`、
+    `src/zipt_{test,gradcheck,smoke_test,consistency_test,doc_test}.cpp`、
+    `docs/development/07-zipt-algorithm.md`。
+  - 符号：`CrossAttention`、`ZiPTBlock`、`ZiPTModel`、`build_zipt_model`、
+    `build_zipt_model_from_spec`、`make_zipt_spec`、`ZiPTConfig`、`ZIPT_MEMORY_TOKENS`、
+    `ModelSpec::is_zipt()`、`concat_cols`（仅 ZiPT 使用的死函数）。
+  - 字段 / CLI：`ModelSpec::memory_tokens`、`ModelSpec::window` 及序列化中的两个可选键；
+    `text_train` 的 `--window` / `--memory-tokens`（ZiPT 专用；滑动窗口步长是既有的 `--stride`）；
+    `ModelType` 的 `zipt` 取值。
+  - 测试/探针：ctest 目标 `zipt_test`（20 → 19 用例）；
+    `gpu_stability_probe --init-hash` 六类模型 → **五类**（mlp/cnn/transformer/gpt/rapt）。
+- 文件格式兼容：`ModelType` 的 6 号取值**保留为 `Reserved_ZiPT` 占位**（不删除枚举值），
+  `spec_from_kv` 对 `type=6` 返回明确错误（"ZiPT 架构已移除…见 legacy/zipt"），
+  而不是含糊的 `Unknown`；`spec_summary` 对该值输出 `ZiPT(removed)`。
+  旧 `.bin`（含 `memory_tokens`/`window` 键）因此得到可读的拒绝信息而非静默误解。
+- 复用与复用边界：`concat_cols` 已删除（唯一调用方是 ZiPT 的 K/V 拼接）；
+  其实现方式（`transpose + insert_rows + transpose`）如需复用，可在 `legacy/zipt` 分支取回。
+- 验收（本轮实测）：build 195/195 步、零告警（`-Werror`）；**ctest 19/19**（20 → 19，
+  `zipt_test` 退出）；`gpu_stability_probe --steps 20` CPU 字节锚
+  **`6f8849f14da23110` 逐位不变**；L2 分层审计 `L2-VIOLATIONS: 0`
+  （`matrix_type_hits: 0 / io_verb_hits: 0 / host_bridge_uses: 40` → 41，ZiPT 的宿主桥用量消失）；
+  引擎 virtual 仍 **49/49**、Layer 直调仍 **21**（删除的是层与领域代码，不动引擎接口）。
+- **计划内锚点变化**：`gpu_stability_probe --init-hash` 由六类降为五类，且 **rapt 锚变化**
+  `b037632f75b7159c` → **`d1998412d41ef2a0`**。原因不是 rapt 本身改了，而是探针**在同一引擎上
+  顺序构建**模型、`InitSpec` 分布初始化按引擎内**创建序号**混流 seed
+  （`17 §4.4` / M2 U1 裁定）——ZiPT 退出后 rapt 的序号前移。前四类
+  （mnist_mlp `a22e807ee05ec3ac` / cnn `4020958a14160bbd` / mnist_transformer
+  `04a72d865624042a` / gpt `8efa936ac5c8c9b2`）构建在 ZiPT 之前，**锚逐位不变**，
+  与上述解释一致（若前四类也变了，说明改动越界）。真实用户单独构建 rapt 不受影响
+  （序号从 1 起）。
+
+## ZiPT 评测历史（供恢复时对照）
+
+- **无实测数据可归档**：项目内从未记录过 ZiPT 与 GPT/RAPT 的同参对比（唯一记载是
+  `04-innovative-designs.md` §10.3 的 "gradcheck + CPU/GPU 一致性 + 端到端 loss 下降，全部通过"，
+  属冒烟级）。因此本次移除是"**未被证据支撑的设计退出**"，与 CUDA 后端、旧代数 AST、
+  IR-C 图融合、`CpuEmitter` 同属一类处置。
+- 与已修缺陷的关系：issue #13 P1-10（"ZiPT stored_tokens 无门控"，低优先）随之作废。

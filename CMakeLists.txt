@@ -279,9 +279,8 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(doc_attn_test src/doc_attn_test.cpp)
     list(APPEND NN_TEST_TARGETS doc_attn_test)
 
-    # ── ZiPT / AttnZip（梯度 + 冒烟 + 一致性 + 文档掩码）────────────────
-    nn_add_executable(zipt_test src/zipt_test.cpp)
-    list(APPEND NN_TEST_TARGETS zipt_test)
+    # ── ZiPT / AttnZip 已于 2026-10-01 移除（保留在 legacy/zipt 分支）──
+    #     恢复前提见 docs/history.md「ZiPT 移除」条。
 
     # ── RAPT / ReLU 线性注意力（梯度 + 冒烟 + 梯度检查点）──────────────
     nn_add_executable(rapt_test src/rapt_test.cpp)

@@ -11,7 +11,7 @@
 //     InitSpec（17 §4.4），此处**仍用固定公式覆写全部参数**——彻底隔离
 //     init 变量，只测后端执行的确定性（输运路径不受初值影响）。
 //   --init-hash：只建模型、不训练，比**初值**本身的确定性（M2 专属验收：
-//     两次运行初值逐字节同）。覆盖 mlp/cnn/transformer/gpt/zipt/rapt 六类
+//     两次运行初值逐字节同）。覆盖 mlp/cnn/transformer/gpt/rapt 五类
 //     模型的全部 init 路径；输出 INIT1/INIT2 固定前缀行，跨进程比对：
 //     两次启动后 `grep '^INIT1' 各自输出 | diff`。
 //   --io-roundtrip：M3 专属验收——批量 read/write/get_index/set_index 语义
@@ -194,9 +194,11 @@ namespace
         return {};
     }
 
-    // 六类模型 = 全部 init 路径（Linear/Conv/Norm 常数/token_emb/位置编码/
-    // CrossAttention P/ones_row_）。同一引擎顺序构建：创建序号（InitSpec
-    // 混流）按构造顺序推进，跨进程同序 → 初值逐字节确定。
+    // 五类模型 = 全部 init 路径（Linear/Conv/Norm 常数/token_emb/位置编码/
+    // ones_row_）。同一引擎顺序构建：创建序号（InitSpec 混流）按构造顺序推进，
+    // 跨进程同序 → 初值逐字节确定。
+    // （原第 6 类 ZiPT 已随 AttnZip 于 2026-10-01 移除；CrossAttention P 的
+    //   uniform 初始化路径随之消失。锚点表见 AGENTS.md §12 / docs/history.md。）
     nn::Result<InitHashes> run_init_hash(bool gpu)
     {
         auto eng_r = make_engine(gpu);
@@ -225,17 +227,6 @@ namespace
         gcfg.d_ff        = 128;
         gcfg.num_layers  = 2;
         if (auto r = hash_model(e, "gpt", nn::build_gpt_model(e, gcfg), out); !r)
-            return std::unexpected(r.error());
-
-        nn::ZiPTConfig zcfg;
-        zcfg.vocab_size    = 257;
-        zcfg.d_model       = 32;
-        zcfg.seq_len       = 16;
-        zcfg.num_heads     = 4;
-        zcfg.d_ff          = 64;
-        zcfg.num_layers    = 2;
-        zcfg.memory_tokens = 8;
-        if (auto r = hash_model(e, "zipt", nn::build_zipt_model(e, zcfg), out); !r)
             return std::unexpected(r.error());
 
         nn::RAPTConfig rcfg;

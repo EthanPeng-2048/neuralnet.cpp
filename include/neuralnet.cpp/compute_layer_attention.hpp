@@ -880,7 +880,6 @@ public:
         //    每头: (1, d_k) × (d_k, new_len) = (1, new_len)
         //    堆叠: (H, new_len)
         //    scale (1/sqrt(d_k)) 经 rparam 尾链乘在 matmul 结果上（不进 expr_spec_key）
-        // dsl::matmul(batch)：{1,0}+Mul(rparam) 与 ZiPTBlock 的 S 同 key
         auto scores = dsl::compute(engine,
             dsl::matmul(*q_res, *K_T, true, false, num_heads_) * dsl::rparam(scale_),
             num_heads_ * q_res->cols(), K_T->cols(), p_.compute);

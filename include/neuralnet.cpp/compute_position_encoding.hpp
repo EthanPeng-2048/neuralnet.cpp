@@ -15,7 +15,7 @@
 //    └────────────────────┴──────────────────────────────────────────────┘
 //
 //  所有权按**注入点**划分（谁拥有 = 谁负责）：
-//    · 模型侧（GPTModel/ZiPTModel/RAPTModel）持有嵌入侧编码器，构造期
+//    · 模型侧（GPTModel/RAPTModel）持有嵌入侧编码器，构造期
 //      `make_embedding_position_encoder(type, d_model, seq_len)`；forward 开头
 //      `apply(...)` / 增量 `apply_step(...)` 注入（RoPE/ALiBi 映射为恒等）。
 //    · 注意力层（CausalSelfAttention / ReLULinearAttention）**自持**注意力侧
@@ -608,7 +608,7 @@ public:
 //  位置编码的两类注入点归属不同主体，故工厂也分开；同一策略类型只在一个
 //  工厂里是"实做"，在另一个里映射为无位置编码（NoPositionEncoder）：
 //
-//    · make_embedding_position_encoder（**模型侧**，GPTModel/ZiPTModel/RAPTModel
+//    · make_embedding_position_encoder（**模型侧**，GPTModel/RAPTModel
 //      持有并在嵌入侧 apply）：Learned / Sinusoidal 实做；ALiBi / RoPE → 恒等。
 //    · make_attention_position_encoder（**注意力层自持**，CausalSelfAttention /
 //      ReLULinearAttention 持有）：ALiBi / RoPE 实做；Learned / Sinusoidal → 恒等。

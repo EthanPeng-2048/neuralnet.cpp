@@ -303,10 +303,8 @@ template <typename... Ts>
     kv.set("pos_encoding", static_cast<uint64_t>(spec.pos_encoding));
     kv.set("activation",   static_cast<uint64_t>(spec.activation));
     kv.set("norm_type",    static_cast<uint64_t>(spec.norm_type));
-    // ZiPT 记忆 token 数（可选字段：缺失时回落 0，不影响加载）
-    kv.set("memory_tokens", static_cast<uint64_t>(spec.memory_tokens));
-    // ZiPT 局部窗口 W（可选字段：缺失时回落 0 = W=L，即无压缩）
-    kv.set("window", static_cast<uint64_t>(spec.window));
+    // ZiPT（AttnZip）已于 2026-10-01 整体移除：不再写 memory_tokens / window 字段。
+    // 旧文件（含这两个键）由 spec_from_kv 的 type 分支给出明确错误。
 
     // ── CNN ──
     kv.set("cnn_in_channels", static_cast<uint64_t>(spec.cnn_in_channels));
@@ -369,8 +367,7 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
     if (kv.get("pos_encoding", v)) spec.pos_encoding = static_cast<PosEncodingType>(v);
     if (kv.get("activation", v))  spec.activation   = static_cast<ActivationType>(v);
     if (kv.get("norm_type", v))   spec.norm_type    = static_cast<NormType>(v);
-    if (kv.get("memory_tokens", v)) spec.memory_tokens = static_cast<std::size_t>(v);
-    if (kv.get("window", v))       spec.window       = static_cast<std::size_t>(v);
+    // 旧文件的 memory_tokens / window（ZiPT 专用）不再读取，随 type=6 一并拒绝。
 
     // ── CNN ──
     if (kv.get("cnn_in_channels", v)) spec.cnn_in_channels = static_cast<std::size_t>(v);
@@ -390,6 +387,10 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
 
     if (spec.type == ModelType::Unknown)
         return std::unexpected(Error{"模型文件规格缺少有效的 type 字段"});
+    if (spec.type == ModelType::Reserved_ZiPT)
+        return std::unexpected(Error{
+            "该模型文件为 AttnZip/ZiPT 架构，已于 2026-10-01 整体移除"
+            "（代码保留在 legacy/zipt 分支；恢复前提见 docs/history.md）"});
     return spec;
 }
 

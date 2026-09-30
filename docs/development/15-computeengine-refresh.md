@@ -349,10 +349,9 @@ P0 的"字节基线"因此拆成两半：**同设备 pre/post 锚点**（不变�
 ### 7.3 搜置与未决（后续期处理，均不阻塞 P2）
 
 - **GPU 档位未定**：`gpu_stability_probe --gpu` 首个 `vkCreateBuffer` 即崩（16 §7-2，同设备同构建下既有测试全部正常 → 差异在探针路径，未定位；**Windows 本机同样复现**，2026-09-29 P1 验收时记录）。修好后回填 16 §6 GPU 行，D9 的 GPU 验收档位（逐字节 vs 容差）才有结论。
-- **`text_train --model zipt` 既有故障（非 Refresh 范围，未修）**：启动即调
-  `set_checkpoint_every(0)` → `compute_layer_zipt.hpp` 该 override 不判
-  `stride==0` 直接 abort，且 abort 后进程挂死（基线构建同现，2026-09-29 记录）；
-  zipt 路径的运行期覆盖当前靠 `zipt_test`。
+- ~~**`text_train --model zipt` 既有故障（非 Refresh 范围，未修）**~~：**已随 ZiPT 整体移除
+  而消失**（2026-10-01，见 `docs/history.md`）——原故障 = 启动即调 `set_checkpoint_every(0)`
+  → `compute_layer_zipt.hpp` 该 override 不判 `stride==0` 直接 abort，且 abort 后进程挂死。
 - **Mali（GPU0）offload 非确定失败**（16 §5/§7-1）：设备级问题，另立 issue，不阻塞 refresh；**ctest 基线以 `NN_VULKAN_DEVICE=1`（Lavapipe 20/20）为准**（Termux 口径；Windows 本机 ctest 20/20 默认选卡即可）。
 - P0 遗留：`ComputeEngine&` REVIEW 7 处待 P2 逐条判定（16 §3）；宿主中转口径勘误 596→381，P2 改名清单按 381（16 §4）。
 - layer_bench 精确性能复测：P-1 时本机为手机（DVFS/调度噪声 ±30%）；Windows 桌面 P1 A/B 已完成（±6% 噪声内，见 §7.1），但为 Debug 构建口径，Release 精确数字仍待补。

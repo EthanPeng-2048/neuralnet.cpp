@@ -254,40 +254,6 @@ int main(int argc, char* argv[])
         (void)enc.backward(grad);
     }
 
-    // ── ZiPTBlock forward + backward（双输入块：残差相加 + 注意力梯度累加）──
-    // ⚠ dry-run 调用必须使用真实签名并检查返回值：这里必须调**双参**
-    //   forward(input, memory_input)，单参版返回错误
-    //   （"use forward(input, memory_input)"）。用 (void) 吞错会让
-    //   dry-run 静默跑不到真实路径，块内新表达式在 GPU 上闭合世界硬报错才暴露。
-    // 失败带栈 abort（同 CSA 风格）。
-    {
-        const std::size_t d_model = 16, heads = 2, d_ff = 32, win = 4, mem = 2;
-        nn::ZiPTBlock zipt(d_model, heads, d_ff, win, mem,
-                           nn::NormType::LayerNorm, nn::ActivationType::GeLU);
-        zipt.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
-        (void)zipt.init(engine);
-        nn::Tensor x = scan_tensor(d_model, win);        // 局部窗口输入（batch=1）
-        nn::Tensor mem_in = scan_tensor(d_model, mem);   // 记忆输入
-        auto fr = zipt.forward(x, mem_in);
-        if (!fr)
-        {
-            std::fprintf(stderr, "[scan] ZiPTBlock forward FAILED: %s\n",
-                         fr.error().message.c_str());
-            std::fflush(stderr);
-            std::abort();
-        }
-        nn::Tensor grad = scan_tensor(d_model, win);
-        nn::Tensor grad_C = scan_tensor(d_model, mem);   // 记忆梯度累加目标
-        auto br = zipt.backward(grad, grad_C);
-        if (!br)
-        {
-            std::fprintf(stderr, "[scan] ZiPTBlock backward FAILED: %s\n",
-                         br.error().message.c_str());
-            std::fflush(stderr);
-            std::abort();
-        }
-    }
-
     // ── MSELoss forward（diff = pred-target；diff_sq = diff*diff）────────
     {
         const std::size_t R = 8, C = 5;

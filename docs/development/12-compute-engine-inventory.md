@@ -6,7 +6,8 @@
 >
 > **当前数字**：引擎 virtual **49 个方法**（`bench/doc_inventory.ps1` 口径；M6 新增 `import_impl` 使其由 48 → 49。注意 `grep -c "\bvirtual\b"` 原始计 **51** 处 = 49 方法 + 析构 1 + 注释里的 "Non-Virtual" 1，勿混用口径）；Layer/Loss/Optimizer 直调 **21 个**（其余 28 个
 > 只服务 DSL lowering / 序列化 / CLI / 适配层 / 测试，见 §2）；CPU 求值机制 **2 套**
-> （DSL 模板路径 + IR 解释器，见 §3）；ctest **20** 个测试（19 个测试目标 + `cnn_test_gpu`）。
+> （DSL 模板路径 + IR 解释器，见 §3）；ctest **19** 个测试（18 个测试目标 + `cnn_test_gpu`；
+> `zipt_test` 随 ZiPT 于 2026-10-01 移除，见 `docs/history.md`）。
 >
 > 历史演进与收敛记录（2026-09-27 计算类原语全量迁 DSL、2026-09-26 算子收敛与遗留物
 > 清理、2026-09-19 IR-C 删除、接口数字 58→49 / 直调 35→23 的过程）已移入
@@ -197,7 +198,7 @@ IR-A/B/D（`expr_opt.hpp` / `expr_emitter.hpp` + `expr_glsl_gen.hpp`）；IR-A/B
 **注意**：A 与 C 不是纯删除——`scan_prefix_outer` / `outer_col`（RLA/RAPT）、`offload_*`（activation offload）、
 `begin_batch/end_batch`（GPU 命令录制）这些**不是普通逐元素/矩阵算子**，DSL 目前表达不了。
 所以"只保留 dsl::compute + 纯算子"需要先给这几类定去向（DSL 内建？独立子系统？），
-否则会卡在 RLA/ZiPT/offload 上。
+否则会卡在 RLA/offload 上。
 
 ---
 

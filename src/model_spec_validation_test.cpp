@@ -231,6 +231,27 @@ int run_test()
         }
     }
 
+    // ── 6. 已移除模型类型（ZiPT，type=6）必须被明确拒绝 ────────────────
+    // 2026-10-01 AttnZip/ZiPT 整体移除；ModelType 的 6 号取值保留为
+    // Reserved_ZiPT 占位，旧 .bin（type=6）应得到**可读的**错误
+    // （而非含糊的 "Unknown" 或静默误解）。见 docs/history.md「ZiPT 移除」。
+    std::cout << "\n── 已移除模型类型（type=6）拒绝 ──\n";
+    {
+        nn::KeyValueRecord kv;
+        kv.set("type", static_cast<uint64_t>(6));
+        auto r = nn::detail::spec_from_kv(kv);
+        if (r)
+        {
+            expect(false, "type=6（ZiPT）应被拒绝（但解析成功了）", all);
+        }
+        else
+        {
+            const bool readable = r.error().message.find("ZiPT") != std::string::npos;
+            expect(readable, "type=6 拒绝信息含 'ZiPT'（可读）", all);
+            std::cout << "      错误信息: " << r.error().message << "\n";
+        }
+    }
+
     std::cout << "\n----------------------------------------\n";
     std::cout << "  结果: " << (all ? "✅ 全部通过" : "❌ 存在失败") << "\n";
     return all ? 0 : 1;

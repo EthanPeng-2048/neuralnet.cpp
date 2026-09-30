@@ -120,7 +120,7 @@ public:
     [[nodiscard]] const std::optional<ModelSpec>& spec() const noexcept { return spec_; }
 
     // ── D7：精度配置注入（§9.2）：设置所有顶层 Layer 的精度 ──
-    // 对 GPTModel/ZiPTModel/RAPTModel 等复合层，精度在构造时已传播到子层；
+    // 对 GPTModel/RAPTModel 等复合层，精度在构造时已传播到子层；
     // 对 MLP/Transformer/CNN 等简单层列表，精度直接设置。
     void set_precision_profile(const PrecisionProfile& profile)
     {
