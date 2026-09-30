@@ -222,6 +222,20 @@ public:
     }
     [[nodiscard]] virtual Result<Matrix> to_matrix(const Tensor& t, Precision P = Precision::F32) = 0;
 
+    // ── reshape（M1，docs/development/17 §3 D10：修改类操作一律引擎方法）──
+    // 语义同原 Tensor::reshape：GPU 共享底层 buffer（零拷贝视图）、CPU 按
+    // precision_ 复制数据到新形状；绑定随 src 传播（15 §3.1），未出生绑定
+    // 的输入由 stamp_ 补绑定。元素数不匹配返回错误（原 NN_ASSERT 升级）。
+    [[nodiscard]] Result<Tensor> reshape(const Tensor& t, std::size_t new_rows,
+                                          std::size_t new_cols)
+    {
+        if (auto ec = bind_check_({&t}); !ec)
+            return std::unexpected(ec.error());
+        if (t.rows() * t.cols() != new_rows * new_cols)
+            return std::unexpected(Error{"reshape: element count mismatch"});
+        return stamp_(t.reshape(new_rows, new_cols));
+    }
+
     // ── cast 原语（§7.5，唯一"变精度"算子，永远显式）────────────────
     // 升 cast（f16→f32）精确无损；降 cast（f32→f16）round-half-to-even。
     // 默认实现：同精度 = 返回 src（共享所有权，零拷贝）；跨精度 = 错误（引擎覆盖）。

@@ -543,27 +543,17 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
         Precision p = p_tensor.get().precision();
         if (p == Precision::F16)
         {
-            // f16 参数：写入带 f16 tag
-            // 对于 CPU f16 tensor，直接访问底层 f16 数据
-            if (p_tensor.get().is_cpu())
-            {
-                const auto& m16 = p_tensor.get().cpu_matrix<Precision::F16>();
-                if (auto r = detail::write_matrix_fp16(ofs, m16); !r)
-                    return std::unexpected(r.error());
-            }
-            else
-            {
-                // GPU f16：download 到 CPU（f32 升 cast），再写 f16
-                auto m32_r = engine.to_matrix(p_tensor, Precision::F32);
-                if (!m32_r) return std::unexpected(m32_r.error());
-                MatrixT<Precision::F16> m16(m32_r->rows(), m32_r->cols());
-                const auto src = m32_r->span();
-                auto dst = m16.span();
-                for (std::size_t i = 0; i < src.size(); ++i)
-                    dst[i] = src[i];
-                if (auto r = detail::write_matrix_fp16(ofs, m16); !r)
-                    return std::unexpected(r.error());
-            }
+            // f16 参数（M1：不再直读存储，统一经引擎下载——CPU/GPU 同路）：
+            // 下载为 f32（f16 升位精确无损）→ 转回 f16 落盘，字节与直读一致。
+            auto m32_r = engine.to_matrix(p_tensor, Precision::F32);
+            if (!m32_r) return std::unexpected(m32_r.error());
+            MatrixT<Precision::F16> m16(m32_r->rows(), m32_r->cols());
+            const auto src = m32_r->span();
+            auto dst = m16.span();
+            for (std::size_t i = 0; i < src.size(); ++i)
+                dst[i] = src[i];
+            if (auto r = detail::write_matrix_fp16(ofs, m16); !r)
+                return std::unexpected(r.error());
         }
         else
         {
