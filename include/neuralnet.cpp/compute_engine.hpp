@@ -1398,15 +1398,17 @@ protected:
         return std::unexpected(Error{"cast: 该引擎不支持跨精度转换"});
     }
     // offload 占位默认（激活 offload 是 GPU 特性；CPU 开启只得到 1×1 张量）
+    // D8（15 §4.8）：走 `create_tensor` 而非 `Tensor::cpu` 静态工厂——出生即经
+    // 引擎入口（P1 出生绑定），形状/语义不变（仍是 1×1 占位）。
     [[nodiscard]] virtual Result<Tensor> create_offload_buffer_impl(std::size_t /*bytes*/)
     {
-        return Tensor::cpu(1, 1);
+        return create_tensor(1, 1);
     }
     [[nodiscard]] virtual Result<Tensor> offload_restore_impl(
         const Tensor& /*buffer*/, std::size_t /*offset*/,
         std::size_t /*rows*/, std::size_t /*cols*/)
     {
-        return Tensor::cpu(1, 1);
+        return create_tensor(1, 1);
     }
 
     // ── offload / 回读 ────────────────────────────────────────────────────
@@ -1484,29 +1486,13 @@ protected:
         Precision P) = 0;
 
     // 默认实现：matmul + 逐行 add bias（兼容所有引擎）
+    // D6-3（15 §4.6-3，M6 裁定=删除宿主兜底）：原默认实现是
+    // `to_matrix → 主机逐列加 bias → from_matrix` 的 PCIe 往返兜底，两引擎
+    // （CpuEngine/GpuEngine）均已 override，属死码且会在第三后端上静默退化。
+    // 改为纯虚：新引擎必须给出真现值（编译期强制）。
     [[nodiscard]] virtual Result<Tensor> matmul_with_bias_impl(
         const Tensor& A, const Tensor& B, const Tensor& bias,
-        bool transA, bool transB, Precision P)
-    {
-        auto result = matmul(A, B, transA, transB, P);
-        if (!result) return std::unexpected(result.error());
-
-        // broadcast bias: (out,1) → (out,batch)
-        auto bias_mat = to_matrix(bias, P);
-        if (!bias_mat) return std::unexpected(bias_mat.error());
-
-        auto res_mat = to_matrix(*result, P);
-        if (!res_mat) return std::unexpected(res_mat.error());
-
-        for (std::size_t row = 0; row < A.rows(); ++row)
-        {
-            float b_val = bias_mat->at(row, 0);
-            for (std::size_t col = 0; col < B.cols(); ++col)
-                res_mat->set_value(row, col, res_mat->at(row, col) + b_val);
-        }
-
-        return from_matrix(*res_mat, P);
-    }
+        bool transA, bool transB, Precision P) = 0;
 
     [[nodiscard]] virtual Result<void> add_inplace_impl(Tensor& A, const Tensor& B) = 0;
     [[nodiscard]] virtual Result<void> scale_inplace_impl(Tensor& A, Scalar s) = 0;
@@ -1671,6 +1657,10 @@ private:
                       + (t ? t->shape_str() : std::string("?"));
         if (t && other)
             s += " vs " + other->shape_str();
+        // M6 门禁化（17 §5 M6）：错误若只藏在 Result 里，ctest 门禁失败时
+        // 无从定位——NN_BIND_DEBUG 下同步打到 stderr，带调用点与形状。
+        if (bind_debug_enabled_())
+            std::fprintf(stderr, "[NN_BIND_DEBUG] %s\n", s.c_str());
         return Error{std::move(s)};
     }
 
@@ -1752,7 +1742,12 @@ private:
             return t;
         note_temp_(t.rows(), t.cols(), /*to_f32=*/false,
                    static_cast<std::uint32_t>(loc.line()));
-        return cast(std::move(t), P);
+        // 入参常是 `*_impl` 的产物（unary_/binary_/move_ 等）——它在本基类内
+        // 还没走到调用方的 stamp_。先把出生绑定补上再进 `cast`（内部有
+        // bind_check_），否则 NN_BIND_DEBUG 门禁会把"基类内部中转"误判成
+        // 库内漏网（M6 门禁化前的既有现象，17 §5 M6）。
+        t = stamp_(std::move(t));
+        return stamp_(cast(std::move(t), P));
     }
 
     // 一批操作数抬到 f32（顺序与输入一致；ExprSpec 的 views 依赖该顺序）

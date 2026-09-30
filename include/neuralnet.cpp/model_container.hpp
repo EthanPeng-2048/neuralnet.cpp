@@ -56,7 +56,9 @@ public:
     Model& operator=(Model&&) noexcept = default;
 
     // ── 引擎绑定 ─────────────────────────────────────────────────────────
-    void set_engine(ComputeEngine& engine) { engine_.reset(&engine); }
+    // D7（15 §4.7，M6 裁定=删除死码）：原 `set_engine(ComputeEngine&)` 全仓
+    // 零调用方，且"绑定后换引擎"与"层已在 add() 时 init 绑定"冲突——绑定只经
+    // 构造函数 `Model(ComputeEngine&)`（或移动后沿用既有绑定）。
     [[nodiscard]] ComputeEngine& engine() const noexcept
     {
         NN_ASSERT(engine_, "Model: engine not bound");

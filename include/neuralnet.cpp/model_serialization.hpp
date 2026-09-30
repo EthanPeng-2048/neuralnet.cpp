@@ -636,32 +636,19 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
         {
             auto result_r = detail::read_matrix_v5(ifs);
             if (!result_r) return std::unexpected(result_r.error());
-            auto& [file_prec, file_matrix] = *result_r;
+            // file_prec 由 read_matrix_v5 校验（F32/F16）；值路径不再分精度
+            // 分支，故只取矩阵本体（file_matrix 恒为 f32 宿主值）。
+            const Matrix& file_matrix = result_r->second;
 
-            // 统一接口：from_matrix(m, P) 上传到目标精度
-            Precision target_p = p_tensor.get().precision();
-            if (file_prec == target_p)
-            {
-                // 同精度：直接上传
-                auto uploaded = engine.from_matrix(file_matrix, target_p);
-                if (!uploaded) return std::unexpected(uploaded.error());
-                // copy_from 从上传结果写入目标 tensor
-                if (auto r = engine.copy_from(p_tensor, file_matrix); !r)
-                    return std::unexpected(r.error());
-            }
-            else
-            {
-                // 跨精度：cast 后上传
-                auto uploaded = engine.from_matrix(file_matrix, file_prec);
-                if (!uploaded) return std::unexpected(uploaded.error());
-                auto casted = engine.cast(*uploaded, target_p);
-                if (!casted) return std::unexpected(casted.error());
-                // 从 cast 结果下载为 f32，再 copy_from
-                auto m32 = engine.to_matrix(*casted, Precision::F32);
-                if (!m32) return std::unexpected(m32.error());
-                if (auto r = engine.copy_from(p_tensor, *m32); !r)
-                    return std::unexpected(r.error());
-            }
+            // 统一接口：`copy_from` 把宿主 Matrix 写进目标张量。
+            // M6 D6-1（15 §4.6-1）整改：原实现分两支且都白做——同精度支
+            // `from_matrix(file_matrix, target_p)` 上传后**丢弃结果**再 copy_from
+            // （每参数一次全量上传白做）；跨精度支 `上传→cast→to_matrix 下载→
+            // 再 copy_from` （多两个 PCIe 往返）。file_matrix 恒为 f32 宿主值
+            // （f16 文件数据读入时已精确升 f32，f16→f32→f16 位不变），故四种
+            // (file_prec × target) 组合与原路径逐位一致，收敛为一行。
+            if (auto r = engine.copy_from(p_tensor, file_matrix); !r)
+                return std::unexpected(r.error());
         }
     }
     else
