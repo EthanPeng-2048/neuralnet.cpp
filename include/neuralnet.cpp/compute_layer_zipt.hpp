@@ -297,24 +297,26 @@ private:
             return mask_cache_;
         const std::size_t BH = batch * num_heads_;
         const std::size_t total_keys = memory_ + window_;
-        Matrix mask(BH * window_, total_keys, Scalar{0});
+        std::vector<Scalar> mask(BH * window_ * total_keys, Scalar{0});  // 宿主桥 D11
         const Scalar NEG = Scalar{-1e30};
         for (std::size_t bb = 0; bb < BH; ++bb)
         {
             const std::size_t b = bb / num_heads_;
             for (std::size_t t = 0; t < window_; ++t)
             {
+                const std::size_t row = bb * window_ + t;
                 // 局部因果：未来位置（j_local > t）屏蔽
                 for (std::size_t jl = t + 1; jl < window_; ++jl)
-                    mask.set_value_unchecked(bb * window_ + t, memory_ + jl, NEG);
+                    mask[row * total_keys + memory_ + jl] = NEG;
                 // 文档边界：跨文档（含 PAD，doc=0）屏蔽
                 if (has_doc_ids_)
                     for (std::size_t jl = 0; jl < window_; ++jl)
                         if (doc_ids_[b * window_ + jl] != doc_ids_[b * window_ + t])
-                            mask.set_value_unchecked(bb * window_ + t, memory_ + jl, NEG);
+                            mask[row * total_keys + memory_ + jl] = NEG;
             }
         }
-        auto mr = engine.from_matrix(mask);
+        auto mr = detail::upload_span(engine, BH * window_, total_keys, Precision::F32,
+                                      std::span(mask));
         if (!mr) return std::unexpected(mr.error());
         mask_cache_ = std::move(*mr);
         mask_batch_ = batch;
@@ -1020,8 +1022,11 @@ public:
         auto sr = engine.scatter_add_rows(grad_token_emb_, stored_tokens_tensor_, *grad_T);
         if (!sr) return std::unexpected(sr.error());
 
-        Matrix grad_input(seq_len, batch, Scalar{0});
-        return engine.from_matrix(grad_input);
+        Tensor grad_input = engine.create_tensor(seq_len, batch, Precision::F32,
+                                                 InitSpec::zero());
+        if (!grad_input.valid())
+            return std::unexpected(Error{"ZiPT token_emb backward: 梯度张量分配失败"});
+        return grad_input;
     }
 
     // ── 采样生成（重计算式，无 KV cache） ────────────────────────
@@ -1053,31 +1058,32 @@ public:
             // W<L（split）模式：右对齐，末位真实 token 落到窗口末（位置 seq_len_-1），
             //   forward 输出仅覆盖窗口 (vocab, W)，logits 取窗口末列 window_-1。
             const std::size_t pred_col = split_ ? (window_ - 1) : (n - 1);
-            Matrix in(seq_len_, 1);
+            std::vector<Scalar> in(seq_len_);          // 宿主桥（17 §3 D11）
             if (split_)
             {
                 const std::size_t pad_head = seq_len_ - n;
                 for (std::size_t i = 0; i < seq_len_; ++i)
-                    in.set_value_unchecked(i, 0,
-                        static_cast<Scalar>((i >= pad_head) ? context[start + (i - pad_head)] : 0));
+                    in[i] = static_cast<Scalar>(
+                        (i >= pad_head) ? context[start + (i - pad_head)] : 0);
             }
             else
             {
                 for (std::size_t i = 0; i < seq_len_; ++i)
-                    in.set_value_unchecked(i, 0,
-                        static_cast<Scalar>((i < n) ? context[start + i] : 0));
+                    in[i] = static_cast<Scalar>((i < n) ? context[start + i] : 0);
             }
-            auto in_t = engine.from_matrix(in);
+            auto in_t = detail::upload_span(engine, seq_len_, 1, Precision::F32,
+                                            std::span(in));
             if (!in_t) return std::unexpected(in_t.error());
             auto logits = forward(engine, *in_t);
             if (!logits) return std::unexpected(logits.error());
-            auto lm = engine.to_matrix(*logits);
-            if (!lm) return std::unexpected(lm.error());
+            auto lm_v = detail::download_vector(engine, *logits);
+            if (!lm_v) return std::unexpected(lm_v.error());
+            const std::size_t lm_cols = logits->cols();
 
             // 末位（最后真实位置）logits
             std::vector<Scalar> last(vocab_size_);
             for (std::size_t v = 0; v < vocab_size_; ++v)
-                last[v] = lm->at_unchecked(v, pred_col);
+                last[v] = (*lm_v)[v * lm_cols + pred_col];
 
             if (temperature > 0.0 && temperature != 1.0)
                 for (auto& x : last) x /= temperature;

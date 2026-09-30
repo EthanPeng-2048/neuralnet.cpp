@@ -36,7 +36,7 @@ private:
         const std::size_t base_len = (tile_size_ > 0) ? tile_size_ : total_len;
         const std::size_t batch    = (tile_size_ > 0) ? total_len / tile_size_ : 1;
 
-        Matrix enc(d_model_, total_len);
+        std::vector<Scalar> enc(d_model_ * total_len);   // 宿主桥（17 §3 D11）
         const std::size_t half = d_model_ / 2;
         std::vector<Scalar> freqs(half);
         for (std::size_t i = 0; i < half; ++i)
@@ -45,7 +45,6 @@ private:
 
         for (std::size_t b = 0; b < batch; ++b)
         {
-            auto span = enc.span();
             const std::size_t col_off = b * base_len;
             for (std::size_t pos = 0; pos < base_len; ++pos)
             {
@@ -53,18 +52,18 @@ private:
                 for (std::size_t i = 0; i < half; ++i)
                 {
                     const Scalar angle = pos_d * freqs[i];
-                    span[(2 * i)     * total_len + col_off + pos] = std::sin(angle);
-                    span[(2 * i + 1) * total_len + col_off + pos] = std::cos(angle);
+                    enc[(2 * i)     * total_len + col_off + pos] = std::sin(angle);
+                    enc[(2 * i + 1) * total_len + col_off + pos] = std::cos(angle);
                 }
                 if (d_model_ % 2 == 1)
                 {
                     const Scalar freq_last = Scalar{1} / std::pow(Scalar{10000},
                         static_cast<Scalar>(2 * half) / static_cast<Scalar>(d_model_));
-                    span[(d_model_ - 1) * total_len + col_off + pos] = std::sin(pos_d * freq_last);
+                    enc[(d_model_ - 1) * total_len + col_off + pos] = std::sin(pos_d * freq_last);
                 }
             }
         }
-        auto r = engine.from_matrix(enc, p_.param);
+        auto r = detail::upload_span(engine, d_model_, total_len, p_.param, std::span(enc));
         if (!r) return std::unexpected(r.error());
         encoding_cache_ = std::move(*r);
         cached_total_ = total_len;
@@ -513,11 +512,13 @@ public:
         //   样本 b 占连续列块 [b*num_patches, (b+1)*num_patches)，
         //   便于下游 MHA 的 rearrange_3d 按 batch 切分列块。
         // （patch 提取是 PatchEmbedding 的算法职责，无对应 op-level 原语；
-        //  此处为 batch 边界的合法 CPU 预处理，与 GPTModel 的 gather_rows 同性质）
-        auto in_m = engine.to_matrix(input);
-        if (!in_m) return std::unexpected(in_m.error());
+        //  此处为 batch 边界的合法 CPU 预处理，与 GPTModel 的 gather_rows 同性质；
+        //  宿主桥走 span，不经 Matrix——17 §3 D11）
+        auto in_v = detail::download_vector(engine, input);
+        if (!in_v) return std::unexpected(in_v.error());
+        const std::size_t in_cols = input.cols();
 
-        Matrix all_patches(patch_dim_, batch * num_patches_);
+        std::vector<Scalar> all_patches(patch_dim_ * batch * num_patches_);
         for (std::size_t b = 0; b < batch; ++b)
         {
             for (std::size_t p = 0; p < num_patches_; ++p)
@@ -530,13 +531,14 @@ public:
                     {
                         const std::size_t flat = pr * patch_size_ + pc;
                         const std::size_t pix  = (gr + pr) * img_size_ + (gc + pc);
-                        all_patches.set_value_unchecked(flat, col_idx,
-                            in_m->at_unchecked(pix, b));
+                        all_patches[flat * (batch * num_patches_) + col_idx] =
+                            (*in_v)[pix * in_cols + b];
                     }
             }
         }
 
-        auto ap_t = engine.from_matrix(all_patches);
+        auto ap_t = detail::upload_span(engine, patch_dim_, batch * num_patches_,
+                                        Precision::F32, std::span(all_patches));
         if (!ap_t) return std::unexpected(ap_t.error());
 
         // Step 2: 投影 → (d_model, batch * num_patches) — 已是 batch-major，无需重排
@@ -554,10 +556,11 @@ public:
         if (!bp) return bp;
 
         // Step 2: 散射梯度回输入 → (img_size², batch)
-        auto gp_m = engine.to_matrix(*bp);
-        if (!gp_m) return std::unexpected(gp_m.error());
+        auto gp_v = detail::download_vector(engine, *bp);   // 宿主桥（17 §3 D11）
+        if (!gp_v) return std::unexpected(gp_v.error());
+        const std::size_t gp_cols = bp->cols();
 
-        Matrix grad_input(img_size_ * img_size_, batch);
+        std::vector<Scalar> grad_input(img_size_ * img_size_ * batch);
         for (std::size_t b = 0; b < batch; ++b)
         {
             for (std::size_t p = 0; p < num_patches_; ++p)
@@ -570,13 +573,14 @@ public:
                     {
                         const std::size_t flat = pr * patch_size_ + pc;
                         const std::size_t pix  = (gr + pr) * img_size_ + (gc + pc);
-                        const Scalar val = grad_input.at_unchecked(pix, b)
-                                         + gp_m->at_unchecked(flat, col_idx);
-                        grad_input.set_value_unchecked(pix, b, val);
+                        const std::size_t gi   = pix * batch + b;
+                        grad_input[gi] = grad_input[gi]
+                                       + (*gp_v)[flat * gp_cols + col_idx];
                     }
             }
         }
-        return engine.from_matrix(grad_input);
+        return detail::upload_span(engine, img_size_ * img_size_, batch,
+                                   Precision::F32, std::span(grad_input));
     }
 };
 

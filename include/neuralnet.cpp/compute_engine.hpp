@@ -1965,4 +1965,70 @@ private:
     std::uint64_t init_seq_ = 0;
 };
 
+namespace detail {
+
+// ── L2+ 宿主桥（docs/development/17 §3 D11 / §4.6，AGENTS.md 铁律 #12）────
+// L2（Layer/Loss/Optimizer/Model）计算路径**不得出现 Matrix 类型**，因此层自算
+// 的辅助数据（索引/位置/掩码/斜率/编码表等——没有对应的引擎侧生成原语）以 span
+// 形态经这三个函数进出；它们内部走 M3 的批量 `write` / `read`（GPU 自动 staging、
+// 隐含 flush + 同步），不新增任何原语，也不进引擎虚表（49 个虚函数骨架不变）。
+//
+//   upload_span  ：标量缓冲 → 新建 (rows, cols, P) 张量。f16 目标按
+//                  round-half-to-even 舍入，与 `from_matrix(m, P)` 逐位同口径
+//                  ——它是 L2 里 `from_matrix` 的 span 形态对应物。
+//   download_span：张量 → 既有标量缓冲；f16 存储先升 f32，与
+//                  `to_matrix(t, F32)` 同值（升 cast 精确无损）。
+//   download_vector：download_span 的取值便捷形态（返回值语义缓冲）。
+//
+// 适用范围仅限**层自算的小规模辅助数据**；数据集、预训练权重、对拍/落盘等大批量
+// I/O 仍走 I/O 层的 `from_matrix` / `to_matrix`（那是宿主 I/O 载体的职责）。
+[[nodiscard]] inline Result<Tensor> upload_span(ComputeEngine& engine, std::size_t rows,
+                                                std::size_t cols, Precision P,
+                                                std::span<const Scalar> src)
+{
+    if (src.size() != rows * cols)
+        return std::unexpected(Error{"upload_span: 元素数与形状不匹配"});
+    Tensor t = engine.create_tensor(rows, cols, P);
+    if (!t.valid())
+        return std::unexpected(Error{"upload_span: 张量分配失败"});
+    if (P == Precision::F32)
+    {
+        if (auto r = engine.write(t, std::span<const Scalar>(src)); !r)
+            return std::unexpected(r.error());
+        return t;
+    }
+    std::vector<f16> buf(src.size());
+    for (std::size_t i = 0; i < src.size(); ++i)
+        buf[i] = f16{src[i]};   // RHE 舍入，与 from_matrix 的 f32→f16 同路径
+    if (auto r = engine.write(t, std::span<f16>(buf)); !r)
+        return std::unexpected(r.error());
+    return t;
+}
+
+[[nodiscard]] inline Result<void> download_span(ComputeEngine& engine, const Tensor& t,
+                                                std::span<Scalar> dst)
+{
+    if (dst.size() != t.rows() * t.cols())
+        return std::unexpected(Error{"download_span: 元素数与张量形状不匹配"});
+    if (t.precision() == Precision::F32)
+        return engine.read(t, dst);
+    std::vector<f16> buf(dst.size());
+    if (auto r = engine.read(t, std::span<f16>(buf)); !r)
+        return std::unexpected(r.error());
+    for (std::size_t i = 0; i < dst.size(); ++i)
+        dst[i] = static_cast<Scalar>(buf[i]);
+    return {};
+}
+
+[[nodiscard]] inline Result<std::vector<Scalar>> download_vector(ComputeEngine& engine,
+                                                                const Tensor& t)
+{
+    std::vector<Scalar> v(t.rows() * t.cols());
+    if (auto r = download_span(engine, t, std::span(v)); !r)
+        return std::unexpected(r.error());
+    return v;
+}
+
+} // namespace detail
+
 } // namespace nn
