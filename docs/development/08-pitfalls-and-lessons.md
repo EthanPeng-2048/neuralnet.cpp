@@ -139,8 +139,9 @@
 
 ### 4.2 BPE 合并循环并行化失败
 
-- `pair_freq` 增量更新，neighbor 变化影响下轮选择；delta 合并改变更新时序 → 结果偏差（207→194 tokens）。BPE 本质是**依赖链式迭代**，不是数据并行问题。
-- **教训**：数据并行基础设施（parallel_for_samples）适合矩阵运算，不适合链式迭代算法；预分词（重 IO/正则）才适合并行化（34.2s→16.2s，约 2.1x）。
+- 训练期的合并循环**不可并行**：`pair_freq` 增量更新，neighbor 变化影响下轮选择；delta 合并改变更新时序 → 结果偏差（207→194 tokens）。BPE 合并循环本质是**依赖链式迭代**，不是数据并行问题。当年为它加的 per-worker slot 原语（`ThreadPool::parallel_for_each_indexed`）至今无调用方，是这次失败尝试的遗留基础设施。
+- **但 encode（预分词 → 逐 chunk 合并）可以并行**：每个 chunk 的合并相互独立、无跨 chunk 状态，只要求输出保序。现行做法见 `Tokenizer::encode_segments_`（空白安全切分点分段 → 段内并发编码 → 按段下标升序拼接），任意并行度与顺序执行逐字节一致。
+- **教训**：数据并行基础设施（parallel_for_samples）适合矩阵运算，不适合链式迭代算法；预分词（重 IO/正则，34.2s→16.2s，约 2.1x）与 encode（逐 chunk 独立）才适合并行化。
 
 ### 4.3 one-hot 3.2GB 撑爆 staging
 

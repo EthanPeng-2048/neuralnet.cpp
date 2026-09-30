@@ -237,6 +237,137 @@ void test_marker_roundtrip()
     }
 }
 
+// ── 保序并行 encode：任意并行度与顺序执行逐字节一致（铁律 8） ──────────
+//  构造 > PARALLEL_ENCODE_MIN_BYTES(256 KiB) 的文本触发并行路径，覆盖：
+//  标记穿插 / 缩写 / 数字 / 标点 / CJK / 连续空白 / 行首行尾空白。
+std::string make_large_text(const std::vector<std::string> &lines, std::size_t target)
+{
+    std::string t;
+    t.reserve(target + 4096);
+    while (t.size() < target)
+        for (const auto &l : lines) t += l;
+    return t;
+}
+
+void check_encode_paths(nn::Tokenizer &tok, const std::string &text,
+                        const char *label, bool roundtrip)
+{
+    const bool have_pool = nn::global_thread_pool().size() >= 2;
+
+    // 顺序基准
+    tok.set_encode_threads(1);
+    const auto seq = tok.encode(text);
+
+    // 多线程：显式并行度 + 自动
+    tok.set_encode_threads(8);
+    const auto par8 = tok.encode(text);
+    tok.set_encode_threads(0);
+    const auto par0 = tok.encode(text);
+
+    if (par8 != seq)
+    {
+        ++g_fail;
+        std::size_t at = 0;
+        while (at < par8.size() && at < seq.size() && par8[at] == seq[at]) ++at;
+        std::printf("[FAIL] parallel encode (threads=8) != sequential (%s): "
+                    "seq=%zu par=%zu first_diff=%zu\n",
+                    label, seq.size(), par8.size(), at);
+    }
+    if (par0 != seq)
+    {
+        ++g_fail;
+        std::printf("[FAIL] parallel encode (auto) != sequential (%s)\n", label);
+    }
+    if (!have_pool)
+        std::printf("  [note] thread pool size < 2，并行路径未实际触发 (%s)\n", label);
+
+    if (roundtrip)
+    {
+        const std::string decoded = tok.decode(par8);
+        if (decoded != text)
+        {
+            ++g_fail;
+            std::printf("[FAIL] parallel decode(encode(text)) != text (%s): "
+                        "orig=%zu decoded=%zu\n", label, text.size(), decoded.size());
+        }
+    }
+    std::printf("parallel encode determinism (%s): seq=%zu tokens%s\n",
+                label, seq.size(), have_pool ? "" : " [pool<2]");
+}
+
+void test_parallel_encode_determinism()
+{
+    // ── BPE（字节级）──
+    {
+        nn::BPETokenizer tok;
+        nn::BPETokenizer::Config cfg;
+        cfg.vocab_size = 512;
+        cfg.min_freq = 1;
+        std::string corpus =
+            "hello world this is a tokenizer test 123 456 7890\n"
+            "don't can't I'm you're we'll it'd the quick brown fox\n"
+            "<|system|> system text <|user|> user text <|assistant|> assistant text "
+            "<|tool_result|> 42 <|sep|> end\n"
+            "leading spaces and   multiple   gaps\tand\ttabs\n";
+        const auto tr = tok.train(corpus, cfg);
+        CHECK(tr.has_value(), "parallel-encode: BPE train ok");
+        if (!tr) return;
+
+        const std::vector<std::string> lines = {
+            "hello world this is a tokenizer test 123 456 7890\n",
+            "don't can't I'm you're we'll it'd the quick brown fox jumps over 42 dogs.\n",
+            "<|system|> system text <|user|> user text <|assistant|> assistant text\n",
+            "<|tool_result|> 42 <|sep|> end and more words here  \n",
+            "   leading    spaces\tand\t tabs, punctuation!!! ??? ;;;\n",
+        };
+        const std::string text = make_large_text(lines, (1u << 19));  // 512 KiB
+        check_encode_paths(tok, text, "BPE 512KiB", true);
+
+        // 无安全切分点（无任何空白）→ 必须回退顺序路径且结果一致
+        std::string nows;
+        nows.reserve(1u << 19);
+        while (nows.size() < (1u << 19)) nows += "abcdefghijklmnopqrstuvwxyz0123456789";
+        check_encode_paths(tok, nows, "BPE no-whitespace", false);
+    }
+
+    // ── CharBPE（字符级，含 CJK）──
+    {
+        nn::CharBPETokenizer tok;
+        nn::CharBPETokenizer::Config cfg;
+        cfg.vocab_size = 512;
+        cfg.min_freq = 1;
+        std::string corpus =
+            "你好世界 人工智能 深度学习 这是一个分词器测试\n"
+            "系统提示 用户提问 助手回答 混合 和 标点 ， ！ ？\n"
+            "hello world 123 don't can't\n"
+            "<|system|> 系统 <|user|> 用户 <|assistant|> 助手\n";
+        const auto tr = tok.train(corpus, cfg);
+        CHECK(tr.has_value(), "parallel-encode: CharBPE train ok");
+        if (!tr) return;
+
+        const std::vector<std::string> lines = {
+            "你好世界 人工智能 深度学习 这是一个分词器测试 42\n",
+            "hello world 123 don't can't the quick brown fox\n",
+            "<|system|> 系统提示 <|user|> 用户提问 <|assistant|> 助手回答\n",
+            "   混合  spaces\t和\t tabs，标点！？   \n",
+        };
+        const std::string text = make_large_text(lines, (1u << 19));  // 512 KiB
+        // 含标记文本只对拍"并行 == 顺序"：CharBPE 的预分词会把标记前/段尾
+        // 空白并入前词或丢弃（encode 分段以标记为界），往返对空白本身有损，
+        // 属既有语义、与本改动无关。
+        check_encode_paths(tok, text, "CharBPE 512KiB(含标记)", false);
+
+        // 无标记 + 结尾非空白的文本：往返必须逐字节无损
+        const std::vector<std::string> rt_lines = {
+            "你好世界 人工智能 深度学习 这是一个分词器测试 42 ",
+            "hello world 123 don't can't the quick brown fox ",
+            "混合 spaces 和 tabs，标点！？",
+        };
+        const std::string rt_text = make_large_text(rt_lines, (1u << 19));
+        check_encode_paths(tok, rt_text, "CharBPE 512KiB(往返)", true);
+    }
+}
+
 } // namespace
 
 int main()
@@ -247,6 +378,7 @@ int main()
     test_random_bytes();
     test_contraction_whitespace_grid();
     test_marker_roundtrip();
+    test_parallel_encode_determinism();
 
     if (g_fail == 0)
     {

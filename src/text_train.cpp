@@ -131,13 +131,19 @@ void parallel_tokenize(
         return;
     }
 
-    // 分块并行：每 chunk 返回 (tokens, doc_ids) 对
+    // 分块并行：每块独立编码，结果按块下标升序拼接
+    //（顺序契约：与单线程逐字节一致，故块边界只由 n/chunk 决定）。
     struct Chunk { std::vector<std::size_t> toks; std::vector<std::size_t> doc; };
     const std::size_t chunk = (n + n_threads - 1) / n_threads;
-    auto worker = [&](std::size_t begin, std::size_t end) -> Chunk {
-        Chunk c;
-        c.toks.reserve((end - begin) * 8);
-        c.doc.reserve((end - begin) * 8);
+    const std::size_t n_chunks = (n + chunk - 1) / chunk;
+    std::vector<Chunk> parts(n_chunks);
+
+    nn::parallel_for_samples(n_chunks, [&](std::size_t c) {
+        const std::size_t begin = c * chunk;
+        const std::size_t end = std::min(begin + chunk, n);
+        auto &cc = parts[c];
+        cc.toks.reserve((end - begin) * 8);
+        cc.doc.reserve((end - begin) * 8);
         for (std::size_t i = begin; i < end; ++i)
         {
             auto toks = tokenizer.encode(std::string(lines[i].data, lines[i].len));
@@ -145,36 +151,18 @@ void parallel_tokenize(
             const std::size_t doc = i + 1;   // 文档 id（1 起，全局行号）
             for (const auto tk : toks)
             {
-                c.toks.push_back(tk);
-                c.doc.push_back(doc);
+                cc.toks.push_back(tk);
+                cc.doc.push_back(doc);
             }
         }
-        return c;
-    };
+    });
 
-    std::vector<std::future<Chunk>> futures;
-    for (std::size_t t = 0; t < n_threads; ++t)
-    {
-        std::size_t begin = t * chunk;
-        std::size_t end = std::min(begin + chunk, n);
-        if (begin >= end) break;
-        futures.push_back(std::async(std::launch::async, worker, begin, end));
-    }
-
-    // 汇总各线程结果（按 chunk 顺序拼接，doc_ids 保持单调递增）
-    // 注意：每个 future 只能 get() 一次（get() 会消费共享状态），
-    // 先全部取回存到 parts，再合并，避免二次 get() 的未定义行为。
-    std::vector<Chunk> parts;
-    parts.reserve(futures.size());
+    // 汇总：按 chunk 下标升序拼接（doc_ids 保持单调递增）
     std::size_t total = 0;
-    for (auto& f : futures)
-    {
-        parts.push_back(f.get());
-        total += parts.back().toks.size();
-    }
+    for (const auto& c : parts) total += c.toks.size();
     token_flow.reserve(total);
     doc_ids.reserve(total);
-    for (auto& c : parts)
+    for (const auto& c : parts)
     {
         token_flow.insert(token_flow.end(), c.toks.begin(), c.toks.end());
         doc_ids.insert(doc_ids.end(), c.doc.begin(), c.doc.end());

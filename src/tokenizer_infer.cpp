@@ -41,6 +41,8 @@ void print_usage(const char *prog)
         << "  --encode-file <path> 编码整个文件（同时自动统计最长行 token 数）\n"
         << "  <text-file>          位置参数：直接给文本文件即自动统计最长行 token 数\n"
         << "  --top <n>            最长行排行榜行数 (默认: 10)\n"
+        << "  --threads <n>        encode 并行度: 0=自动(默认, 全部核心) 1=顺序 >1=指定\n"
+        << "                       （保序并行：任何并行度下输出与顺序执行逐字节一致）\n"
         << "  --interactive        交互模式 (输入 'quit' 退出)\n"
         << "  --show-bytes         显示原始字节 (调试用)\n"
         << "  --help               显示此帮助信息\n";
@@ -55,6 +57,7 @@ struct Config
     std::string encode_file;
     std::string text_path;   // 位置参数：文本文件 → 自动统计最长行
     std::size_t top = 10;    // 最长行排行榜行数
+    std::uint32_t threads = 0;   // encode 并行度: 0=自动, 1=顺序, >1=指定
     bool interactive = false;
     bool show_bytes = false;
 };
@@ -91,6 +94,16 @@ Config parse_args(int argc, char *argv[])
                 std::exit(1);
             }
             cfg.top = *v;
+        }
+        else if (arg == "--threads" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<std::uint32_t>(argv[++i]);
+            if (!v)
+            {
+                std::cerr << "无效 --threads: " << argv[i] << "\n";
+                std::exit(1);
+            }
+            cfg.threads = *v;
         }
         else if (!arg.starts_with("--"))
             cfg.text_path = arg;
@@ -348,6 +361,7 @@ int main(int argc, char *argv[])
         return 1;
     }
     std::cout << "词表已加载: " << tokenizer->vocab_size() << " 词" << std::endl;
+    tokenizer->set_encode_threads(cfg.threads);
 
     // ── 交互模式 ─────────────────────────────────────────────
     if (cfg.interactive)
