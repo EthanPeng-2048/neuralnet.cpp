@@ -141,6 +141,29 @@ auto gpu_tensor = engine.from_matrix(cpu_matrix);
 auto cpu_matrix = engine.to_matrix(*gpu_tensor);
 ```
 
+### 批量读写（I/O 分组本体，M3）
+
+```cpp
+// 批量写：覆盖张量既有存储（不替换对象）；span 元素类型必须与张量精度精确匹配
+std::vector<float> data(rows * cols);   // 填好数据
+engine.write(*t, std::span(data));      // F32 张量收 float；F16 张量收 nn::f16
+
+// 批量读：张量 → span（GPU 上隐含 flush + 同步，与 to_matrix 同路）
+std::vector<float> back(rows * cols);
+engine.read(*t, std::span(back));
+
+// 索引级是语法糖：宿主直读写；GPU = 整张批量往返
+auto v = engine.get_index(*t, 0, 0);    // → Scalar（f16 存储精确提升）
+engine.set_index(*t, 0, 0, 0.5f);       // f16 存储按 round-half-to-even 舍入
+```
+
+> **U2 精确匹配**：`span<float>` 只配 F32 张量、`span<nn::f16>` 只配 F16 张量——错配返回
+> `Result` 错误，元素类型非 float/f16 是编译期错误（防 f16/f32 槽错位）。`from_matrix/to_matrix`
+> 仍用于 Matrix 宿主载体的整批进出（数据集/对拍/落盘）；`copy_from` 保留 f32 Matrix 转换填充
+> （序列化加载）。**热路径请攒批量**，逐元素循环不要用 index API（GPU 每次一整轮 staging 往返）。
+> 录制窗口内 `read/write` 的调用约定（隐含 flush、写入张量须存活到 `end_batch` 之后）见
+> `compute_engine.hpp` I/O 分组注释。
+
 ### 深拷贝
 
 ```cpp

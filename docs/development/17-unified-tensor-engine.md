@@ -4,7 +4,8 @@
 > 并对 `13-refactor-backlog.md` §10.8 增补"访问不变量"注脚。历史归档见 `docs/history.md`。
 > 状态：**设计裁定已完成（§3 共 10 项）；M1 访问收口已实施（2026-09-30，验收与
 > 过程见 §5 M1 行 + `docs/history.md`）；M2 声明式初始化已实施（2026-09-30，
-> 见 §5 M2 行），M3-M7 未实施**。实施立项时读本文 + §5 分期 + 源码现状。
+> 见 §5 M2 行）；M3 批量读写 API 已实施（2026-09-30，见 §5 M3 行），M4-M7 未实施**。
+> 实施立项时读本文 + §5 分期 + 源码现状。
 > 前置工程成果保留不动：15 的 P-1（PrecisionEngine 下沉）、P1（张量出生绑定）已落地（15 §7.1）。
 
 ## 0. 一句话
@@ -79,7 +80,7 @@ M2 落地后 init RNG 已收编，下表保留为动机证据，复现命令仍�
 > **一切 Tensor 的创建、访问、修改必须经由 ComputeEngine。**
 > Tensor 存储是私有实现细节；静态直构工厂与公开存储访问器从公共 API 消失。
 > 库内豁免仅两条：`ComputeEngine::adopt`（已有，出生绑定通道）与引擎域内 friend
-> （DSL 求值器、引擎内核）。库外（测试/tools/CLI）一律 `from_matrix/read/to_matrix`。
+> （DSL 求值器、引擎内核）。库外（测试/tools/CLI）一律 `from_matrix/read/write/to_matrix`。
 
 关键性质：**编译期强制**。访问器删除/私有化后，绕过 = 编译错误，比 `NN_BIND_DEBUG`
 运行期检查更硬；P1 的出生绑定检查（`bind_check_`）继续作为运行期第二道网。
@@ -103,9 +104,9 @@ M2 落地后 init RNG 已收编，下表保留为动机证据，复现命令仍�
 | 创建（含初始化） | `create_tensor(rows, cols, P, InitSpec)` | 扩展现有 `create_tensor`（`compute_engine.hpp:215`）；**M2 实施口径**：3 参重载保持既有纯分配语义（CPU 分配零填充 / GPU 分配未初始化，需零显式 `zero`），初值一律显式走 `InitSpec`（Zero/Constant/…）；`Uninitialized` 契约沿用 `cpu_uninitialized` 注释 |
 | 上传（I/O 分组） | `from_matrix(const Matrix&, P) -> Result<Tensor>` | 保留现名（D9）；数据集/预训练模型入口 |
 | 下载（I/O 分组） | `to_matrix(const Tensor&, P) -> Result<Matrix>` | 保留现名（D9）；对拍/落盘出口 |
-| 批量读 | `read(const Tensor&, std::span<T>) -> Result<void>` | 元素类型与 `precision()` 匹配；GPU 隐含 flush + 同步 |
-| 批量写 | `write(const Tensor&, std::span<const T>) -> Result<void>` | 覆盖既有存储、**不替换对象**（沿 `copy_into` 红线） |
-| 索引读/写 | `get_index / set_index` | 语法糖，允许同步；GPU 上不承诺热循环性能 |
+| 批量读 | `read(const Tensor&, std::span<T>) -> Result<void>` | **M3 实施**：元素类型与 `precision()` **精确匹配**（U2——float↔F32、f16↔F16，错配运行期错误、类型非法编译期 static_assert，防 f16/f32 槽错位）；GPU 隐含 flush + 同步（走 `to_matrix` 同路） |
+| 批量写 | `write(Tensor&, std::span<T>) -> Result<void>` | **M3 实施**（形参 `Tensor&`，与 `zero/copy_from` 的存储变更约定同，非提案中的 const）：覆盖既有存储、**不替换对象**（宿主直写既有存储；GPU 经 `copy_from` 的既有 drain 语义，f16 目标 = f32 上传 + `cast_into` 写回原存储）；span 形参为 `span<T>` 以同时承接 const/非 const 实参（模板推导中 `const T` 无法匹配非 const span），断言按去 cv 后元素类型校验 |
+| 索引读/写 | `get_index / set_index` | **M3 实施**：宿主直读写、GPU = 批量 read/write 的语法糖（一整轮 staging 往返）；允许同步，不承诺热循环性能 |
 | 变形 | `reshape(const Tensor&, r, c) -> Result<Tensor>` | 语义同现状 `Tensor::reshape` |
 | 跨设备/引擎 | `import(const Tensor&, P)` | 吸收 15 P3；43 处 `ensure_gpu` → `import` |
 | 内存池 | `pool_stats()` / `release_idle_pool_blocks()` | 语义补齐见 §4.5 |
@@ -114,7 +115,7 @@ M2 落地后 init RNG 已收编，下表保留为动机证据，复现命令仍�
   create_offload_buffer/...`（49 个 virtual 骨架不变，新增均为 NVI 扩展）。
 - `read` 在 GPU 上隐含 flush + 同步（与现 `to_matrix` 同）；**逐 step loss 回读继续走
   `submit_scalar_readback` 快路**，不被 `read` 取代。
-- `from_matrix/to_matrix` 只准出现在 I/O/测试代码；库内计算路径出现即审计违规（§4.6）。
+- I/O 分组动词（`from_matrix/to_matrix/read/write`）只准出现在 I/O/测试代码；库内计算路径出现即审计违规（§4.6）。
 
 ### 4.4 声明式初始化 InitSpec
 
@@ -182,7 +183,7 @@ CPU 字节基线 + scan 产物 hash + layer_bench（定义见 §6）。
 |---|---|---|---|
 | **M1** ✅（2026-09-30） | **访问收口**：存储私有化、静态工厂收编、`reshape` 引擎化（`ComputeEngine::reshape`，D10）、库外同期全迁（D7） | `compute_tensor.hpp`；`detail::TensorAccess`（DSL 19 处改道）；`model_serialization.hpp` f16 分支；src 9 测试 + `text_train.cpp:756` + `tools/scan_exprs.cpp`（commits `3d76478`/`c8f308f`） | **四件套全过**：build 122/122；ctest 20/20；CPU 探针 `6f8849f14da23110` 与 pre 逐位一致；scan 双 hash 不变；layer_bench 配对 A/B（pre=HEAD~2 worktree 二进制，feedforward/swiglu/linear 各 4 轮交错，分布重叠无回退）；**编译期强制**：`grep \.cpu_matrix` 库外零命中（详见 `docs/history.md` M1 条） |
 | **M2** ✅（2026-09-30） | **声明式创建/初始化**：`InitSpec` + `Layer::init` 迁移 + RNG 收编 | `create_tensor` NVI 扩展；`compute_layer_*.hpp` 的 init（mlp/conv/gpt/zipt/rapt…）（commits `8bd6bd5` 核心、`4492098` 层迁移） | **四件套全过** + **初值跨进程确定性**：build 122/122 零告警；ctest 20/20；`gpu_stability_probe --init-hash` 六模型两进程 `INIT1` 行全同（**新锚**：mnist_mlp `a22e807ee05ec3ac`、cnn `4020958a14160bbd`、mnist_transformer `04a72d865624042a`、gpt `8efa936ac5c8c9b2`、zipt `f90bf8c8783c2f89`、rapt `b037632f75b7159c`）；mnist 三架构（`--shuffle-steps false`）双进程 loss 序列 + 模型文件逐字节一致（**新训练锚**，仅墙钟行异）；`--steps 20` hash=`6f8849f14da23110` 与 M1 锚点逐位一致（覆写隔离下后端执行零变化）；scan 双 hash 不变（`expr_specs.bin`=bdc3a442…a58360、`fused_registry.hpp`=7a10412c…）；layer_bench 配对 4 轮 + feedforward 逆序 4 轮复测均 < ±6% 无系统性回退；`NN_BIND_DEBUG=1` 冒烟零诊断（详见 `docs/history.md` M2 条） |
-| **M3** | **批量读写 API**：`read/write/get_index/set_index` + I/O 分组审计口径（D9） | `compute_engine.hpp` + CPU/GPU 两引擎；测试读写路径 | 四件套 + GPU staging 批量语义探针（写后读回对拍） |
+| **M3** ✅（2026-09-30） | **批量读写 API**：`read/write/get_index/set_index` + I/O 分组审计口径（D9；U2 精确匹配） | `compute_engine.hpp` I/O 分组（基类非虚模板，复用 `to_matrix`/`copy_from`）+ CPU/GPU 两引擎；测试 f32 填充/恢复路径迁 `write`；探针 `--io-roundtrip`（commits `e0338d9` 核心、`4977a29` 探针、`3ddb13c` 测试） | **四件套全过**：build 全绿零告警；ctest 20/20；`gpu_stability_probe --io-roundtrip` CPU + GPU 全过（`f32_roundtrip`/`f16_roundtrip`/`batch_window` 三用例含录制窗口 write→read→end_batch→复读）；CPU 字节锚 `--steps 20` hash=`6f8849f14da23110` 不变；scan 双 hash 不变（`expr_specs.bin`=bdc3a442…a58360、`fused_registry.hpp`=7a10412c…）；**顺带修复 16 §7-2**（探针漏 `backend.initialize()` 的 GPU 崩溃，根因回填 16 §6/§7）——dev0/dev2/dev4 进程内两轮 + 跨进程 loss/hash 逐字节（详见 `docs/history.md` M3 条） |
 | **M4** | **Matrix 降级收口**：L2+ 禁用规则成文 + 分层审计脚本 | 规则进 AGENTS.md 铁律；审计脚本（U5） | 审计脚本零违规 |
 | **M5** | **内存池契约统一**：CPU `pool_stats` 语义补齐 | `compute_engine.hpp` 默认实现 + `CpuEngine` | 两引擎 `pool_stats` 非空且口径文档化 |
 | **M6** | **吸收 15 P2/P3**：删每调用 engine 形参；43 处 `ensure_gpu`→`import`；跨引擎硬错误默认开 | 175 处 `ComputeEngine&` 打标清单（16 §3）；`NN_BIND_DEBUG` 门禁化 | 四件套 + `NN_BIND_DEBUG=1` ctest 门禁；顺带裁 15 D6/D7/D8 |
@@ -209,12 +210,17 @@ CPU 字节基线 + scan 产物 hash + layer_bench（定义见 §6）。
 1. **逐元素 API 性能陷阱**：GPU 上 `get_index/set_index` 若直译 = 每元素一次 staging 往返
    （连 `submit_scalar_readback` 都要专门排 D2H 队列），完全不可用。设计与注释双重标注
    "批量 read/write 是本体"，index API 不给热循环承诺。
+   （**M3 已落地**：`compute_engine.hpp` I/O 分组注释双重标注；宿主张量 index 直读写零往返，
+   GPU 走批量 read/write——每次调用一整轮 staging。）
 2. **热点路径回退**：内部通道若拷 `shared_ptr`/加虚调用 → 8-70× 教训重演（§4.7）。
    M1 验收必含 layer_bench。
 3. **计划内字节变化**：RNG 收编（M2）、设备端 RNG（未来）→ 按 §6 例外流程重立锚点，
    防止把计划内变化误判成回归。
 4. **录制期生命周期**（铁律 #6）：`read/write` 可能进入 batch 录制窗口，M3 必须明确
    "read 隐含 flush/同步"与"写入张量须存活到 `end_batch` 之后"的调用约定。
+   （**M3 已成文**：`compute_engine.hpp` I/O 分组注释——read 走 `to_matrix` 同路隐含
+   end_batch → wait_in_flight → 新帧；write 走 `copy_from` 既有 drain 语义。验收探针
+   `--io-roundtrip` 含 `batch_window` 用例：录制窗口内 write → read → end_batch → 复读值不变。）
 5. **测试迁移量**：src 127 处 `cpu_matrix` 集中在 `expr_*_test`（填数 + 对拍），
    迁移模板化——填数：构造 Matrix → `from_matrix`；对拍 → `to_matrix`；D7 裁定同期完成，
    一次编译红海换一次性收口。
@@ -238,7 +244,7 @@ CPU 字节基线 + scan 产物 hash + layer_bench（定义见 §6）。
 | # | 问题 | 倾向 |
 |---|---|---|
 | U1 | `InitSpec::seed` 是否必填 | **已裁（M2 实施）**：分布类工厂签名 seed 必填（漏传 = 编译错误），层传显式默认值 `kInitSeed = 42`；引擎内按创建序号混流防同 seed 撞流 |
-| U2 | `read/write` 元素类型形态：`span<T>` 精度精确匹配，还是按 `precision()` 重载 | 精确匹配 + 静态断言（防 f16/f32 槽错位） |
+| U2 | `read/write` 元素类型形态：`span<T>` 精度精确匹配，还是按 `precision()` 重载 | **已裁（M3 实施）**：精确匹配 + 静态断言（防 f16/f32 槽错位）——错配运行期错误、元素类型非 float/f16 编译期报错；`read` 的 T 须非 const，`write` 形参 `span<T>` 去 cv 后校验（模板推导中 `const T` 无法匹配非 const span，需同时承接 const/非 const 实参） |
 | U3 | CPU 真内存池立项与否 | 先分配剖析量化，另案 |
 | U4 | 15 D6/D7/D8（宿主格式契约定序 / `Model::set_engine` 死码 / dummy 张量） | 随 M6 一并裁定 |
 | U5 | 分层审计脚本落点：扩展 `bench/doc_inventory.ps1` vs 新建 audit | 倾向扩展 doc_inventory（已有文档↔代码对齐审计体系） |
