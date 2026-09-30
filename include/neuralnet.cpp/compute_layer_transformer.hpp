@@ -78,8 +78,9 @@ public:
     }
 
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) override
+        const Tensor& input) override
     {
+        ComputeEngine& engine = engine_ref();
         if (input.rows() != d_model_)
             return std::unexpected(Error{"PE forward: d_model mismatch"});
         const std::size_t total_len = input.cols();
@@ -100,7 +101,7 @@ public:
     }
 
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& /*engine*/, const Tensor& grad_output) override
+        const Tensor& grad_output) override
     {
         return grad_output;  // 位置编码不可学习，梯度直接穿透
     }
@@ -133,7 +134,7 @@ public:
           ff_(d_model, d_ff),
           norm2_(d_model) {}
 
-    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
         auto r1 = self_attn_.init(engine); if (!r1) return std::unexpected(r1.error());
         auto r2 = norm1_.init(engine); if (!r2) return std::unexpected(r2.error());
@@ -189,11 +190,11 @@ public:
     [[nodiscard]] bool recompute_supported() const override { return true; }
 
     [[nodiscard]] Result<Tensor> forward_recompute(
-        ComputeEngine& engine, const Tensor& saved_input) override
+        const Tensor& saved_input) override
     {
         // 临时关闭本层及其子层的 checkpoint 模式，使 forward 重建缓存
         set_checkpoint_mode(false);
-        auto r = forward(engine, saved_input);
+        auto r = forward(saved_input);
         set_checkpoint_mode(true);
         return r;
     }
@@ -208,14 +209,15 @@ public:
     }
 
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) override
+        const Tensor& input) override
     {
+        ComputeEngine& engine = engine_ref();
         // x1 = LN₁(input)
-        auto n1 = norm1_.forward(engine, input);
+        auto n1 = norm1_.forward(input);
         if (!n1) return n1;
 
         // a = SelfAttn(x1)
-        auto a = self_attn_.forward(engine, *n1);
+        auto a = self_attn_.forward(*n1);
         if (!a) return a;
 
         // r2 = input + a
@@ -228,11 +230,11 @@ public:
             residual2_cache_ = res2;
 
         // x2 = LN₂(res2)
-        auto n2 = norm2_.forward(engine, res2);
+        auto n2 = norm2_.forward(res2);
         if (!n2) return n2;
 
         // f = FFN(x2)
-        auto f = ff_.forward(engine, *n2);
+        auto f = ff_.forward(*n2);
         if (!f) return f;
 
         // out = res2 + f
@@ -242,12 +244,13 @@ public:
     }
 
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output) override
+        const Tensor& grad_output) override
     {
+        ComputeEngine& engine = engine_ref();
         // 残差2 反向: 分流到 residual1 + FFN
-        auto grad_ff = ff_.backward(engine, grad_output);
+        auto grad_ff = ff_.backward(grad_output);
         if (!grad_ff) return grad_ff;
-        auto b_n2 = norm2_.backward(engine, *grad_ff);
+        auto b_n2 = norm2_.backward(*grad_ff);
         if (!b_n2) return b_n2;
 
         auto grad_r1 = dsl::compute(engine,
@@ -256,9 +259,9 @@ public:
         if (!grad_r1) return std::unexpected(grad_r1.error());
 
         // 残差1 反向: 分流到 input + SelfAttn
-        auto b_sa = self_attn_.backward(engine, *grad_r1);
+        auto b_sa = self_attn_.backward(*grad_r1);
         if (!b_sa) return b_sa;
-        auto b_n1 = norm1_.backward(engine, *b_sa);
+        auto b_n1 = norm1_.backward(*b_sa);
         if (!b_n1) return b_n1;
 
         return dsl::compute(engine,
@@ -311,11 +314,16 @@ public:
             layers_.emplace_back(d_model, num_heads, d_ff, num_patches);
     }
 
-    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
         for (auto& layer : layers_)
         {
             auto r = layer.init(engine);
+            if (!r) return std::unexpected(r.error());
+        }
+        // M6 段 C：pos_encoding_ 是子 Layer，engine 由 init 绑定
+        {
+            auto r = pos_encoding_.init(engine);
             if (!r) return std::unexpected(r.error());
         }
         // 预创建 ones_row_ (1, num_patches) 全1，用于 backward 广播
@@ -357,8 +365,9 @@ public:
     }
 
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) override
+        const Tensor& input) override
     {
+        ComputeEngine& engine = engine_ref();
         // input: (d_model, batch * num_patches)
         if (input.rows() != d_model_)
             return std::unexpected(Error{"TransformerEncoder: row count mismatch"});
@@ -367,14 +376,14 @@ public:
         batch_size_ = input.cols() / num_patches_;
 
         // 1. 添加 tiled 位置编码 → (d_model, batch * num_patches)
-        auto pe = pos_encoding_.forward(engine, input);
+        auto pe = pos_encoding_.forward(input);
         if (!pe) return pe;
         Tensor x = std::move(*pe);
 
         // 2. 一次性通过所有 EncoderLayer [全批量化 GPU]
         for (auto& layer : layers_)
         {
-            auto lr = layer.forward(engine, x);
+            auto lr = layer.forward(x);
             if (!lr) return lr;
             x = std::move(*lr);
         }
@@ -401,8 +410,9 @@ public:
     }
 
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output) override
+        const Tensor& grad_output) override
     {
+        ComputeEngine& engine = engine_ref();
         // grad_output: (d_model, batch) — 来自下游 Linear.backward
 
         // 1. 反向池化：(d_model, batch) → (d_model, batch * num_patches)
@@ -431,7 +441,7 @@ public:
         // 2. 反向通过所有 EncoderLayer [全批量化 GPU]
         for (auto it = layers_.rbegin(); it != layers_.rend(); ++it)
         {
-            auto br = it->backward(engine, grad_x);
+            auto br = it->backward(grad_x);
             if (!br) return br;
             grad_x = std::move(*br);
         }
@@ -480,7 +490,7 @@ public:
                   "PatchEmbedding: img_size must be divisible by patch_size");
     }
 
-    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
         return projection_.init(engine);
     }
@@ -502,8 +512,9 @@ public:
     { return projection_.param_gradients(); }
 
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) override
+        const Tensor& input) override
     {
+        ComputeEngine& engine = engine_ref();
         input_cache_ = input;
         const std::size_t batch = input.cols();
 
@@ -542,17 +553,18 @@ public:
         if (!ap_t) return std::unexpected(ap_t.error());
 
         // Step 2: 投影 → (d_model, batch * num_patches) — 已是 batch-major，无需重排
-        return projection_.forward(engine, *ap_t);
+        return projection_.forward(*ap_t);
     }
 
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output) override
+        const Tensor& grad_output) override
     {
+        ComputeEngine& engine = engine_ref();
         // grad_output: (d_model, batch * num_patches) — batch-major
         const std::size_t batch = grad_output.cols() / num_patches_;
 
         // Step 1: 投影层反向 → (patch_dim, batch * num_patches) — batch-major
-        auto bp = projection_.backward(engine, grad_output);
+        auto bp = projection_.backward(grad_output);
         if (!bp) return bp;
 
         // Step 2: 散射梯度回输入 → (img_size², batch)

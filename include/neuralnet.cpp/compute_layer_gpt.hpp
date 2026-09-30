@@ -57,7 +57,7 @@ public:
         if (norm2_) norm2_->set_precision_profile(precision);
     }
 
-    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
         auto r1 = self_attn_.init(engine); if (!r1) return std::unexpected(r1.error());
         if (norm1_) { auto r = norm1_->init(engine); if (!r) return std::unexpected(r.error()); }
@@ -110,11 +110,11 @@ public:
     [[nodiscard]] bool recompute_supported() const override { return true; }
 
     [[nodiscard]] Result<Tensor> forward_recompute(
-        ComputeEngine& engine, const Tensor& saved_input) override
+        const Tensor& saved_input) override
     {
         // 临时关闭本块及其子层的 checkpoint 模式，使 forward 重建缓存
         set_checkpoint_mode(false);
-        auto r = forward(engine, saved_input);
+        auto r = forward(saved_input);
         set_checkpoint_mode(true);
         return r;
     }
@@ -162,12 +162,13 @@ public:
     }
 
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) override
+        const Tensor& input) override
     {
-        auto n1 = norm1_->forward(engine, input);
+        ComputeEngine& engine = engine_ref();
+        auto n1 = norm1_->forward(input);
         if (!n1) return n1;
 
-        auto a = self_attn_.forward(engine, *n1);
+        auto a = self_attn_.forward(*n1);
         if (!a) return a;
 
         auto r2 = dsl::compute(engine,
@@ -178,10 +179,10 @@ public:
         if (!checkpoint_mode_)
             residual2_cache_ = res2;
 
-        auto n2 = norm2_->forward(engine, res2);
+        auto n2 = norm2_->forward(res2);
         if (!n2) return n2;
 
-        auto f = ff_.forward(engine, *n2);
+        auto f = ff_.forward(*n2);
         if (!f) return f;
 
         return dsl::compute(engine,
@@ -190,8 +191,9 @@ public:
     }
 
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output) override
+        const Tensor& grad_output) override
     {
+        ComputeEngine& engine = engine_ref();
         // activation offload：从 host 恢复激活再反向（替代重计算）
         if (offloader_.offloaded())
         {
@@ -199,9 +201,9 @@ public:
             if (!im) return std::unexpected(im.error());
         }
 
-        auto grad_ff = ff_.backward(engine, grad_output);
+        auto grad_ff = ff_.backward(grad_output);
         if (!grad_ff) return grad_ff;
-        auto b_n2 = norm2_->backward(engine, *grad_ff);
+        auto b_n2 = norm2_->backward(*grad_ff);
         if (!b_n2) return b_n2;
 
         auto grad_r1 = dsl::compute(engine,
@@ -209,9 +211,9 @@ public:
             grad_output.rows(), grad_output.cols(), p_.compute);
         if (!grad_r1) return std::unexpected(grad_r1.error());
 
-        auto b_sa = self_attn_.backward(engine, *grad_r1);
+        auto b_sa = self_attn_.backward(*grad_r1);
         if (!b_sa) return b_sa;
-        auto b_n1 = norm1_->backward(engine, *b_sa);
+        auto b_n1 = norm1_->backward(*b_sa);
         if (!b_n1) return b_n1;
 
         return dsl::compute(engine,
@@ -232,7 +234,7 @@ public:
         Tensor& v_cache,
         std::size_t cur_len)
     {
-        auto n1 = norm1_->forward(engine, x_new);
+        auto n1 = norm1_->forward(x_new);
         if (!n1) return n1;
 
         auto a = self_attn_.forward_step(engine, *n1, k_cache, v_cache, cur_len);
@@ -243,10 +245,10 @@ public:
             x_new.rows(), x_new.cols(), p_.compute);
         if (!r2) return std::unexpected(r2.error());
 
-        auto n2 = norm2_->forward(engine, *r2);
+        auto n2 = norm2_->forward(*r2);
         if (!n2) return n2;
 
-        auto f = ff_.forward(engine, *n2);
+        auto f = ff_.forward(*n2);
         if (!f) return f;
 
         return dsl::compute(engine,
@@ -265,7 +267,7 @@ public:
 // 接口：
 //   - apply(engine, token_emb_T, batch, seq)   全量前向，返回已加位置信息的 x
 //   - apply_step(engine, x, pos)               增量单 token 前向
-//   - backward(engine, grad_T, batch, seq)     累计位置梯度（仅可学习有意义）
+//   - backward(grad_T, batch, seq)     累计位置梯度（仅可学习有意义）
 //   - parameters() / param_gradients()         可学习参数（仅 Learned 返回非空）
 //
 // 注意：ALiBi / RoPE 的位置信息由注意力层注入（CausalSelfAttention 线性偏置 /
@@ -295,6 +297,8 @@ public:
         ComputeEngine& engine, const Tensor& x, std::size_t pos) = 0;
 
     // 反向：累计位置梯度到 grad_pos_emb_（默认 no-op）
+    // （PositionEncoder 是**辅助对象、非 Layer**——M6 段 C 只删 Layer 四个虚接口的
+    //   engine 形参，位置编码器/RoPE 这类辅助函数保留 engine 形参，17 §8 交接）
     [[nodiscard]] virtual Result<void> backward(
         ComputeEngine& engine, const Tensor& grad_T,
         std::size_t batch, std::size_t seq) = 0;
@@ -600,7 +604,7 @@ public:
         if (pos_encoder_) pos_encoder_->set_precision_profile(precision);
     }
 
-    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
         // 初始化 token_emb_——M2 声明式：N(0, 0.02) 层算参数、引擎填数
         constexpr Scalar emb_init_std = 0.02;
@@ -678,8 +682,9 @@ public:
     }
 
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) override
+        const Tensor& input) override
     {
+        ComputeEngine& engine = engine_ref();
         const std::size_t seq_len = input.rows();
         batch_size_ = input.cols();
         // ── 1. gather 所有 token 的 embedding（统一采用 batch-major 列序） ──
@@ -729,7 +734,7 @@ public:
             {
                 blocks_[bi].set_checkpoint_mode(false);
             }
-            auto r = blocks_[bi].forward(engine, x);
+            auto r = blocks_[bi].forward(x);
             if (!r) return r;
             x = std::move(*r);
             // activation offload：forward 后把本块内部激活搬 host-visible，释放 GPU 显存。
@@ -750,18 +755,19 @@ public:
         }
 
         // ── 5. 最终 LayerNorm/RMSNorm ──
-        auto ln = ln_f_->forward(engine, x);
+        auto ln = ln_f_->forward(x);
         if (!ln) return ln;
         x = std::move(*ln);
 
         // ── 6. LM Head → (vocab_size, seq*batch) batch-major ──
-        auto lm_out = lm_head_.forward(engine, x);
+        auto lm_out = lm_head_.forward(x);
         return lm_out;
     }
 
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output) override
+        const Tensor& grad_output) override
     {
+        ComputeEngine& engine = engine_ref();
         const std::size_t seq_len = seq_len_;
 
         // ⚠ 注意：不用在这里 zero grad_token_emb_！
@@ -772,12 +778,12 @@ public:
         // (void)engine.zero(grad_token_emb_);
 
         // ── 1. LM Head 反向 → (d_model, seq*batch) ──
-        auto b_lm = lm_head_.backward(engine, grad_output);
+        auto b_lm = lm_head_.backward(grad_output);
         if (!b_lm) return b_lm;
         Tensor grad_x = std::move(*b_lm);
 
         // ── 2. LayerNorm/RMSNorm 反向 ──
-        auto b_ln = ln_f_->backward(engine, grad_x);
+        auto b_ln = ln_f_->backward(grad_x);
         if (!b_ln) return b_ln;
         grad_x = std::move(*b_ln);
 
@@ -793,10 +799,10 @@ public:
                     const std::size_t seg = idx / checkpoint_every_;
                     NN_ASSERT(seg < checkpoint_inputs_.size(),
                               "GPTModel backward: checkpoint input missing");
-                    auto cr = blocks_[idx].forward_recompute(engine, checkpoint_inputs_[seg]);
+                    auto cr = blocks_[idx].forward_recompute(checkpoint_inputs_[seg]);
                     if (!cr) return cr;
                 }
-                auto br = blocks_[idx].backward(engine, grad_x);
+                auto br = blocks_[idx].backward(grad_x);
                 if (!br) return br;
                 grad_x = std::move(*br);
                 // 显存：backward 后**立即释放该块已消费的激活缓存**——否则每块
@@ -929,9 +935,9 @@ public:
         }
 
         // 4. 最终 LayerNorm + LM Head → (vocab_size, 1)
-        auto ln = ln_f_->forward(engine, x);
+        auto ln = ln_f_->forward(x);
         if (!ln) return ln;
-        return lm_head_.forward(engine, *ln);
+        return lm_head_.forward(*ln);
     }
 
     // ── 采样生成（KV cache 增量推理）────────────────────────────────

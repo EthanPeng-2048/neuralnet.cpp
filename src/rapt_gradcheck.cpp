@@ -165,16 +165,16 @@ int main(int argc, char* argv[])
         if (!go_t) return 1;
 
         auto eval_loss = [&]() -> Scalar {
-            auto y = attn.forward(eng, *x_t);
+            auto y = attn.forward(*x_t);
             auto ym = eng.to_matrix(*y);
             return dot(*ym, go_m);
         };
 
         auto grads = attn.param_gradients();
         for (auto& g : grads) { if (!eng.zero(g)) return 1; }
-        auto y0 = attn.forward(eng, *x_t);
+        auto y0 = attn.forward(*x_t);
         if (!y0) { std::cerr << "  fwd failed\n"; return 1; }
-        auto gx = attn.backward(eng, *go_t);
+        auto gx = attn.backward(*go_t);
         if (!gx) { std::cerr << "  bwd failed\n"; return 1; }
 
         auto params = attn.parameters();
@@ -202,16 +202,16 @@ int main(int argc, char* argv[])
         if (!go_t) return 1;
 
         auto eval_loss = [&]() -> Scalar {
-            auto y = attn.forward(eng, *x_t);
+            auto y = attn.forward(*x_t);
             auto ym = eng.to_matrix(*y);
             return dot(*ym, go_m);
         };
 
         auto grads = attn.param_gradients();
         for (auto& g : grads) { if (!eng.zero(g)) return 1; }
-        auto y0 = attn.forward(eng, *x_t);
+        auto y0 = attn.forward(*x_t);
         if (!y0) { std::cerr << "  fwd failed\n"; return 1; }
-        auto gx = attn.backward(eng, *go_t);
+        auto gx = attn.backward(*go_t);
         if (!gx) { std::cerr << "  bwd failed\n"; return 1; }
 
         auto params = attn.parameters();
@@ -247,16 +247,16 @@ int main(int argc, char* argv[])
         if (!go_t) return 1;
 
         auto eval_loss = [&]() -> Scalar {
-            auto y = attn.forward(eng, *x_t);
+            auto y = attn.forward(*x_t);
             auto ym = eng.to_matrix(*y);
             return dot(*ym, go_m);
         };
 
         auto grads = attn.param_gradients();
         for (auto& g : grads) { if (!eng.zero(g)) return 1; }
-        auto y0 = attn.forward(eng, *x_t);
+        auto y0 = attn.forward(*x_t);
         if (!y0) { std::cerr << "  fwd failed\n"; return 1; }
-        auto gx = attn.backward(eng, *go_t);
+        auto gx = attn.backward(*go_t);
         if (!gx) { std::cerr << "  bwd failed\n"; return 1; }
 
         auto params = attn.parameters();

@@ -147,7 +147,7 @@ bool test_consistency(
             return false;
         }
     }
-    auto fwd_r = model.forward(engine, *tok_t);
+    auto fwd_r = model.forward(*tok_t);
     if (!fwd_r)
     {
         std::cout << "\n  ❌ forward 失败: " << fwd_r.error().message << "\n";

@@ -550,12 +550,14 @@ public:
         rope_.set_precision_profile(profile);
     }
 
-    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
         auto r1 = w_q_.init(engine); if (!r1) return std::unexpected(r1.error());
         auto r2 = w_k_.init(engine); if (!r2) return std::unexpected(r2.error());
         auto r3 = w_v_.init(engine); if (!r3) return std::unexpected(r3.error());
         auto r4 = w_o_.init(engine); if (!r4) return std::unexpected(r4.error());
+        // M6 段 C：softmax_ 是子 Layer（engine 由 init 绑定），否则 forward 内 fail-fast
+        { auto r6 = softmax_.init(engine); if (!r6) return std::unexpected(r6.error()); }
         if (use_rope_)
         {
             auto r5 = rope_.init(engine); if (!r5) return std::unexpected(r5.error());
@@ -627,8 +629,9 @@ public:
     }
 
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) override
+        const Tensor& input) override
     {
+        ComputeEngine& engine = engine_ref();
         if (input.rows() != d_model_)
             return std::unexpected(Error{"AttentionBase forward: input shape mismatch"});
 
@@ -639,11 +642,11 @@ public:
             return std::unexpected(Error{"AttentionBase forward: cols not divisible by seq_len"});
 
         // 1. 线性投影 → Q/K/V: (H*d_k, batch*seq)
-        auto q_res = w_q_.forward(engine, input);
+        auto q_res = w_q_.forward(input);
         if (!q_res) return q_res;
-        auto k_res = w_k_.forward(engine, input);
+        auto k_res = w_k_.forward(input);
         if (!k_res) return k_res;
-        auto v_res = w_v_.forward(engine, input);
+        auto v_res = w_v_.forward(input);
         if (!v_res) return v_res;
 
         // 2. rearrange: (H*d_k, batch*seq) → (batch*H*d_k, seq)
@@ -757,12 +760,13 @@ public:
         }
 
         // 9. 输出投影
-        return w_o_.forward(engine, concat);
+        return w_o_.forward(concat);
     }
 
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output) override
+        const Tensor& grad_output) override
     {
+        ComputeEngine& engine = engine_ref();
         // 推断 batch/seq（与 forward 一致）
         const std::size_t total_seq = grad_output.cols();
         const std::size_t seq      = (seq_len_ > 0) ? seq_len_ : total_seq;
@@ -771,7 +775,7 @@ public:
         const std::size_t BH = batch * num_heads_;
 
         // 1. 输出投影反向 → grad_concat: (H*d_k, batch*seq)
-        auto gc = w_o_.backward(engine, grad_output);
+        auto gc = w_o_.backward(grad_output);
         if (!gc) return gc;
         nn_dbg_scan("attn.gc", engine, *gc);
 
@@ -898,13 +902,13 @@ public:
         }
 
         // 9. 投影层反向 + 累加输入梯度
-        auto giq = w_q_.backward(engine, grad_Q);
+        auto giq = w_q_.backward(grad_Q);
         if (!giq) return giq;
         nn_dbg_scan("attn.giq", engine, *giq);
-        auto gik = w_k_.backward(engine, grad_K);
+        auto gik = w_k_.backward(grad_K);
         if (!gik) return gik;
         nn_dbg_scan("attn.gik", engine, *gik);
-        auto giv = w_v_.backward(engine, grad_V);
+        auto giv = w_v_.backward(grad_V);
         if (!giv) return giv;
         nn_dbg_scan("attn.giv", engine, *giv);
 
@@ -940,11 +944,11 @@ public:
             return std::unexpected(Error{"AttentionBase forward_step: x_new must be (d_model, 1)"});
 
         // 1. Q/K/V 投影 → (H*d_k, 1)
-        auto q_res = w_q_.forward(engine, x_new);
+        auto q_res = w_q_.forward(x_new);
         if (!q_res) return q_res;
-        auto k_new = w_k_.forward(engine, x_new);
+        auto k_new = w_k_.forward(x_new);
         if (!k_new) return k_new;
-        auto v_new = w_v_.forward(engine, x_new);
+        auto v_new = w_v_.forward(x_new);
         if (!v_new) return v_new;
 
         // 1.5 RoPE：对 Q/K 施加当前位置 (cur_len) 的旋转后写入 KV cache
@@ -1002,7 +1006,7 @@ public:
         if (!masked) return std::unexpected(masked.error());
 
         // 7. softmax（行级归一化，每头独立）
-        auto attn = softmax_.forward(engine, *masked);
+        auto attn = softmax_.forward(*masked);
         if (!attn) return std::unexpected(attn.error());
 
         // 8. attn_out = batched_matmul(V_T, attn, H, transA=F, transB=T)
@@ -1017,7 +1021,7 @@ public:
         if (!attn_out) return std::unexpected(attn_out.error());
 
         // 9. 输出投影 → (d_model, 1)
-        return w_o_.forward(engine, *attn_out);
+        return w_o_.forward(*attn_out);
     }
 };
 

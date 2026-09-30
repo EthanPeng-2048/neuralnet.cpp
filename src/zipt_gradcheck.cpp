@@ -136,7 +136,7 @@ int main(int argc, char* argv[])
         if (!go_t) return 1;
 
         auto eval_loss = [&]() -> Scalar {
-            auto y = ca.forward(eng, *x_t);
+            auto y = ca.forward(*x_t);
             auto ym = eng.to_matrix(*y);
             return dot(*ym, go_m);
         };
@@ -144,9 +144,9 @@ int main(int argc, char* argv[])
         // 解析梯度：zero → forward → backward
         auto grads = ca.param_gradients();
         for (auto& g : grads) { if (!eng.zero(g)) return 1; }
-        auto y0 = ca.forward(eng, *x_t);
+        auto y0 = ca.forward(*x_t);
         if (!y0) { std::cerr << "  CrossAttention fwd failed\n"; return 1; }
-        auto gx = ca.backward(eng, *go_t);
+        auto gx = ca.backward(*go_t);
         if (!gx) { std::cerr << "  CrossAttention bwd failed\n"; return 1; }
 
         auto params = ca.parameters();
@@ -178,18 +178,18 @@ int main(int argc, char* argv[])
         if (!go_t) return 1;
 
         auto eval_loss = [&]() -> Scalar {
-            auto y = blk.forward(eng, *x_t, *c_t);
+            auto y = blk.forward(*x_t, *c_t);
             auto ym = eng.to_matrix(*y);
             return dot(*ym, go_m);
         };
 
         auto grads = blk.param_gradients();
         for (auto& g : grads) { if (!eng.zero(g)) return 1; }
-        auto y0 = blk.forward(eng, *x_t, *c_t);
+        auto y0 = blk.forward(*x_t, *c_t);
         if (!y0) { std::cerr << "  ZiPTBlock fwd failed\n"; return 1; }
         Tensor grad_C = eng.create_tensor(d_model, batch * memory);
         { auto z = eng.zero(grad_C); if (!z) return 1; }
-        auto gx = blk.backward(eng, *go_t, grad_C);
+        auto gx = blk.backward(*go_t, grad_C);
         if (!gx) { std::cerr << "  ZiPTBlock bwd failed\n"; return 1; }
 
         auto params = blk.parameters();

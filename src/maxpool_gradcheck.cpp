@@ -149,6 +149,7 @@ int main(int argc, char* argv[])
                     cs.C, cs.H, cs.W, cs.P, cs.S, cs.B, OH, OW);
 
         MaxPool2D pool(cs.C, cs.H, cs.W, cs.P, cs.S);
+        (void)pool.init(eng);   // M6 段 C：层由 init 绑定引擎
         Matrix xm(cs.C * cs.H * cs.W, cs.B);
         for (std::size_t i = 0; i < xm.size(); ++i) xm.span()[i] = dist(rng);
         Matrix gom(cs.C * OH * OW, cs.B);
@@ -168,19 +169,19 @@ int main(int argc, char* argv[])
         };
 
         // ① forward / backward 与独立参考一致
-        auto out = pool.forward(eng, *x);
+        auto out = pool.forward(*x);
         if (!out) { std::cerr << "  forward 失败: " << out.error().message << "\n"; return 1; }
         auto om = eng.to_matrix(*out);
         report("forward", *om, ref.fwd());
 
-        auto gx = pool.backward(eng, *go);
+        auto gx = pool.backward(*go);
         if (!gx) { std::cerr << "  backward 失败: " << gx.error().message << "\n"; return 1; }
         auto gxm = eng.to_matrix(*gx);
         report("backward(grad_x)", *gxm, ref.bwd(gom));
 
         // ② clear_cache 后直接 backward 必须被拒绝
         pool.clear_cache();
-        auto gx2 = pool.backward(eng, *go);
+        auto gx2 = pool.backward(*go);
         std::printf("  %-22s %s\n", "clear_cache→backward",
                     gx2 ? "FAIL（未拦截）" : "OK（已拒绝）");
         if (gx2) ++failures;
@@ -188,16 +189,16 @@ int main(int argc, char* argv[])
         // ③ checkpoint 模式：forward 不驻留 → backward 必须被拒绝；
         //    forward_recompute 重建缓存后必须与参考一致
         pool.set_checkpoint_mode(true);
-        auto out3 = pool.forward(eng, *x);
+        auto out3 = pool.forward(*x);
         if (!out3) { std::cerr << "  ckpt forward 失败\n"; return 1; }
-        auto gx3 = pool.backward(eng, *go);
+        auto gx3 = pool.backward(*go);
         std::printf("  %-22s %s\n", "ckpt→backward",
                     gx3 ? "FAIL（未拦截）" : "OK（已拒绝）");
         if (gx3) ++failures;
 
-        auto rec = pool.forward_recompute(eng, *x);
+        auto rec = pool.forward_recompute(*x);
         if (!rec) { std::cerr << "  forward_recompute 失败: " << rec.error().message << "\n"; return 1; }
-        auto gx4 = pool.backward(eng, *go);
+        auto gx4 = pool.backward(*go);
         if (!gx4)
         {
             std::cerr << "  recompute 后 backward 失败: " << gx4.error().message << "\n";
@@ -219,6 +220,7 @@ int main(int argc, char* argv[])
         const std::size_t C = 1, H = 2, W = 2, P = 2, S = 2, B = 1;
         std::printf("── 平局用例：C=1 H=2 W=2 pool=2 stride=2（窗口 [1,1;1,0]）──\n");
         MaxPool2D pool(C, H, W, P, S);
+        (void)pool.init(eng);   // M6 段 C：层由 init 绑定引擎
         Matrix xm(C * H * W, B);
         xm.span()[0] = 1; xm.span()[1] = 1; xm.span()[2] = 1; xm.span()[3] = 0;
         Matrix gom(C * 1 * 1, B);
@@ -227,7 +229,7 @@ int main(int argc, char* argv[])
         auto go = eng.from_matrix(gom);
         if (!x || !go) { std::cerr << "  上传失败\n"; return 1; }
 
-        auto out = pool.forward(eng, *x);
+        auto out = pool.forward(*x);
         if (!out)
         {
             std::cerr << "  平局用例 forward 失败: " << out.error().message << "\n";
@@ -236,7 +238,7 @@ int main(int argc, char* argv[])
         else
         {
             auto om = eng.to_matrix(*out);
-            auto gx = pool.backward(eng, *go);
+            auto gx = pool.backward(*go);
             if (!gx || !om)
             {
                 std::cerr << "  平局用例 backward 失败\n";

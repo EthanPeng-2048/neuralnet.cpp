@@ -36,10 +36,14 @@ public:
           swiglu_(d_ff),
           use_swiglu_(activation == ActivationType::SwiGLU) {}
 
-    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
         auto r1 = fc1_.init(engine); if (!r1) return std::unexpected(r1.error());
         auto r2 = fc2_.init(engine); if (!r2) return std::unexpected(r2.error());
+        // M6 段 C：激活子层也是 Layer（engine 由 init 绑定），必须一并 init——
+        // 否则 forward 里调 gelu_/swiglu_.forward() 会在 engine_ref() 处 fail-fast。
+        { auto r = gelu_.init(engine);   if (!r) return std::unexpected(r.error()); }
+        { auto r = swiglu_.init(engine); if (!r) return std::unexpected(r.error()); }
         return {};
     }
 
@@ -101,35 +105,35 @@ public:
     }
 
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) override
+        const Tensor& input) override
     {
-        auto h1 = fc1_.forward(engine, input);
+        auto h1 = fc1_.forward(input);
         if (!h1) return h1;
         if (use_swiglu_)
         {
-            auto h2 = swiglu_.forward(engine, *h1);
+            auto h2 = swiglu_.forward(*h1);
             if (!h2) return h2;
-            return fc2_.forward(engine, *h2);
+            return fc2_.forward(*h2);
         }
-        auto h2 = gelu_.forward(engine, *h1);
+        auto h2 = gelu_.forward(*h1);
         if (!h2) return h2;
-        return fc2_.forward(engine, *h2);
+        return fc2_.forward(*h2);
     }
 
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output) override
+        const Tensor& grad_output) override
     {
-        auto b2 = fc2_.backward(engine, grad_output);
+        auto b2 = fc2_.backward(grad_output);
         if (!b2) return b2;
         if (use_swiglu_)
         {
-            auto bg = swiglu_.backward(engine, *b2);
+            auto bg = swiglu_.backward(*b2);
             if (!bg) return bg;
-            return fc1_.backward(engine, *bg);
+            return fc1_.backward(*bg);
         }
-        auto bg = gelu_.backward(engine, *b2);
+        auto bg = gelu_.backward(*b2);
         if (!bg) return bg;
-        return fc1_.backward(engine, *bg);
+        return fc1_.backward(*bg);
     }
 };
 

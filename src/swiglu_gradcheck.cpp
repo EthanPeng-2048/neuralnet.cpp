@@ -40,7 +40,7 @@ namespace {
 Scalar eval_loss(ComputeEngine &engine, FeedForward &ff,
                  const Tensor &x, const Tensor &go)
 {
-    auto y = ff.forward(engine, x);
+    auto y = ff.forward(x);
     auto y_m = engine.to_matrix(*y);
     auto go_m = engine.to_matrix(go);
     return dot(*y_m, *go_m);
@@ -160,7 +160,7 @@ int main(int argc, char *argv[])
     if (!go) { std::cerr << "from_matrix(go) failed\n"; return 1; }
 
     // ── 前向一次：填充各层 input_cache_（backward 依赖 forward 缓存） ──
-    auto y_fwd = ff.forward(eng, *x);
+    auto y_fwd = ff.forward(*x);
     if (!y_fwd) { std::cerr << "forward failed: " << y_fwd.error().message << "\n"; return 1; }
 
     // ── 清零梯度并 backward ──
@@ -171,7 +171,7 @@ int main(int argc, char *argv[])
         auto rz = eng.zero(g.get());
         if (!rz) { std::cerr << "zero failed\n"; return 1; }
     }
-    auto gx = ff.backward(eng, *go);
+    auto gx = ff.backward(*go);
     if (!gx) { std::cerr << "backward failed: " << gx.error().message << "\n"; return 1; }
 
     // ── 验证参数梯度 ──

@@ -83,7 +83,7 @@ int run_test()
     std::vector<nn::Matrix> baseline_grads;
     {
         model.set_checkpoint_every(0);
-        auto r = model.forward(eng, *x);
+        auto r = model.forward(*x);
         if (!r) { std::cerr << "baseline forward failed: " << r.error().message << "\n"; return 1; }
         auto lm = eng.to_matrix(*r);
         if (!lm) { std::cerr << "to_matrix(logits) failed\n"; return 1; }
@@ -94,7 +94,7 @@ int run_test()
             auto rz = eng.zero(g.get());
             if (!rz) { std::cerr << "baseline zero failed\n"; return 1; }
         }
-        auto b = model.backward(eng, *go);
+        auto b = model.backward(*go);
         if (!b) { std::cerr << "baseline backward failed: " << b.error().message << "\n"; return 1; }
         for (auto& g : model.param_gradients())
         {
@@ -112,7 +112,7 @@ int run_test()
     {
         std::cout << "\n── 检查点 stride=" << stride << " ──\n";
         model.set_checkpoint_every(stride);
-        auto r = model.forward(eng, *x);
+        auto r = model.forward(*x);
         if (!r) { std::cerr << "checkpoint forward failed: " << r.error().message << "\n"; return 1; }
         auto lm = eng.to_matrix(*r);
         if (!lm) { std::cerr << "to_matrix(logits) failed\n"; return 1; }
@@ -127,7 +127,7 @@ int run_test()
             auto rz = eng.zero(g.get());
             if (!rz) { std::cerr << "zero failed\n"; return 1; }
         }
-        auto b = model.backward(eng, *go);
+        auto b = model.backward(*go);
         if (!b) { std::cerr << "checkpoint backward failed: " << b.error().message << "\n"; return 1; }
 
         const auto& grads = model.param_gradients();

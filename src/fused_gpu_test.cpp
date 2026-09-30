@@ -110,17 +110,18 @@ int run_swiglu(CpuEngine& cpu, GpuEngine& gpu)
     for (auto& v : grad.span()) v = dist(rng);
 
     nn::SwiGLU sg_cpu(d_ff), sg_gpu(d_ff);
+    (void)sg_cpu.init(cpu); (void)sg_gpu.init(gpu);   // M6 段 C：层由 init 绑定引擎
     const Tensor in_cpu = upload(cpu, input);
     const Tensor in_gpu = upload(gpu, input);
-    auto fc = sg_cpu.forward(cpu, in_cpu);
-    auto fg = sg_gpu.forward(gpu, in_gpu);
+    auto fc = sg_cpu.forward(in_cpu);
+    auto fg = sg_gpu.forward(in_gpu);
     if (!fc) { std::cerr << "  CPU forward 失败: " << fc.error().message << "\n"; return 1; }
     if (!fg) { std::cerr << "  GPU forward 失败: " << fg.error().message << "\n"; return 1; }
 
     const Tensor gd_cpu = upload(cpu, grad);
     const Tensor gd_gpu = upload(gpu, grad);
-    auto bc = sg_cpu.backward(cpu, gd_cpu);
-    auto bg = sg_gpu.backward(gpu, gd_gpu);
+    auto bc = sg_cpu.backward(gd_cpu);
+    auto bg = sg_gpu.backward(gd_gpu);
     if (!bc) { std::cerr << "  CPU backward 失败: " << bc.error().message << "\n"; return 1; }
     if (!bg)
     {
@@ -151,10 +152,11 @@ int run_gelu(CpuEngine& cpu, GpuEngine& gpu)
     for (auto& v : grad.span()) v = dist(rng);
 
     nn::GeLU gl_cpu, gl_gpu;
+    (void)gl_cpu.init(cpu); (void)gl_gpu.init(gpu);   // M6 段 C：层由 init 绑定引擎
     const Tensor in_cpu = upload(cpu, x);
     const Tensor in_gpu = upload(gpu, x);
-    auto fc = gl_cpu.forward(cpu, in_cpu);
-    auto fg = gl_gpu.forward(gpu, in_gpu);
+    auto fc = gl_cpu.forward(in_cpu);
+    auto fg = gl_gpu.forward(in_gpu);
     if (!fc) { std::cerr << "  CPU gelu forward 失败: " << fc.error().message << "\n"; return 1; }
     if (!fg)
     {
@@ -166,8 +168,8 @@ int run_gelu(CpuEngine& cpu, GpuEngine& gpu)
 
     const Tensor gd_cpu = upload(cpu, grad);
     const Tensor gd_gpu = upload(gpu, grad);
-    auto bc = gl_cpu.backward(cpu, gd_cpu);
-    auto bg = gl_gpu.backward(gpu, gd_gpu);
+    auto bc = gl_cpu.backward(gd_cpu);
+    auto bg = gl_gpu.backward(gd_gpu);
     if (!bc) { std::cerr << "  CPU gelu backward 失败: " << bc.error().message << "\n"; return 1; }
     if (!bg)
     {
@@ -200,10 +202,11 @@ int run_softmax(CpuEngine& cpu, GpuEngine& gpu)
     for (auto& v : grad.span()) v = dist(rng);
 
     nn::Softmax sm_cpu, sm_gpu;
+    (void)sm_cpu.init(cpu); (void)sm_gpu.init(gpu);   // M6 段 C：层由 init 绑定引擎
     const Tensor in_cpu = upload(cpu, x);
     const Tensor in_gpu = upload(gpu, x);
-    auto fc = sm_cpu.forward(cpu, in_cpu);
-    auto fg = sm_gpu.forward(gpu, in_gpu);
+    auto fc = sm_cpu.forward(in_cpu);
+    auto fg = sm_gpu.forward(in_gpu);
     if (!fc) { std::cerr << "  CPU softmax forward 失败: " << fc.error().message << "\n"; return 1; }
     if (!fg)
     {
@@ -220,8 +223,8 @@ int run_softmax(CpuEngine& cpu, GpuEngine& gpu)
 
     const Tensor gd_cpu = upload(cpu, grad);
     const Tensor gd_gpu = upload(gpu, grad);
-    auto bc = sm_cpu.backward(cpu, gd_cpu);
-    auto bg = sm_gpu.backward(gpu, gd_gpu);
+    auto bc = sm_cpu.backward(gd_cpu);
+    auto bg = sm_gpu.backward(gd_gpu);
     if (!bc) { std::cerr << "  CPU softmax backward 失败: " << bc.error().message << "\n"; return 1; }
     if (!bg)
     {
@@ -256,8 +259,8 @@ int run_norm(const char* name, CpuEngine& cpu, GpuEngine& gpu)
     { auto r = n_gpu.init(gpu); if (!r) { std::cerr << "  GPU " << name << " init 失败: " << r.error().message << "\n"; return 1; } }
     const Tensor in_cpu = upload(cpu, x);
     const Tensor in_gpu = upload(gpu, x);
-    auto fc = n_cpu.forward(cpu, in_cpu);
-    auto fg = n_gpu.forward(gpu, in_gpu);
+    auto fc = n_cpu.forward(in_cpu);
+    auto fg = n_gpu.forward(in_gpu);
     if (!fc) { std::cerr << "  CPU " << name << " forward 失败: " << fc.error().message << "\n"; return 1; }
     if (!fg)
     {
@@ -274,8 +277,8 @@ int run_norm(const char* name, CpuEngine& cpu, GpuEngine& gpu)
 
     const Tensor gd_cpu = upload(cpu, grad);
     const Tensor gd_gpu = upload(gpu, grad);
-    auto bc = n_cpu.backward(cpu, gd_cpu);
-    auto bg = n_gpu.backward(gpu, gd_gpu);
+    auto bc = n_cpu.backward(gd_cpu);
+    auto bg = n_gpu.backward(gd_gpu);
     if (!bc) { std::cerr << "  CPU " << name << " backward 失败: " << bc.error().message << "\n"; return 1; }
     if (!bg)
     {

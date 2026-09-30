@@ -67,8 +67,8 @@ static int mha_bidirectional_probe()
     auto t1 = cpu.from_matrix(x1);
     auto t2 = cpu.from_matrix(x2);
     if (!t1 || !t2) { std::cerr << "MHA probe: from_matrix failed\n"; return 1; }
-    auto y1 = attn_c.forward(cpu, *t1);
-    auto y2 = attn_c.forward(cpu, *t2);
+    auto y1 = attn_c.forward(*t1);
+    auto y2 = attn_c.forward(*t2);
     if (!y1 || !y2) { std::cerr << "MHA probe forward: "
                                 << (!y1 ? y1.error().message : y2.error().message) << "\n"; return 1; }
     auto m1 = cpu.to_matrix(*y1);
@@ -82,8 +82,8 @@ static int mha_bidirectional_probe()
 
     nn::CausalSelfAttention attn_cs_c(d_model, heads, seq, seq, nn::PosEncodingType::Learned);
     { auto r = attn_cs_c.init(cpu); if (!r) { std::cerr << "CSA cpu init: " << r.error().message << "\n"; return 1; } }
-    auto cy1 = attn_cs_c.forward(cpu, *t1);
-    auto cy2 = attn_cs_c.forward(cpu, *t2);
+    auto cy1 = attn_cs_c.forward(*t1);
+    auto cy2 = attn_cs_c.forward(*t2);
     if (!cy1 || !cy2) { std::cerr << "CSA probe forward failed\n"; return 1; }
     auto cm1 = cpu.to_matrix(*cy1);
     auto cm2 = cpu.to_matrix(*cy2);
@@ -120,8 +120,8 @@ static int mha_bidirectional_probe()
     auto g1 = gpu.from_matrix(x1);
     auto g2 = gpu.from_matrix(x2);
     if (!g1 || !g2) { std::cerr << "MHA probe gpu from_matrix failed\n"; return 1; }
-    auto gy1 = attn_g.forward(gpu, *g1);     // 覆盖 GPU Plain fold key
-    auto gy2 = attn_g.forward(gpu, *g2);     // GPU 双向探针
+    auto gy1 = attn_g.forward(*g1);     // 覆盖 GPU Plain fold key
+    auto gy2 = attn_g.forward(*g2);     // GPU 双向探针
     if (!gy1 || !gy2)
     {
         std::cerr << "MHA GPU forward FAILED: "
@@ -150,16 +150,16 @@ static int mha_bidirectional_probe()
 
     // backward 一致性：两侧最后 forward 对齐为同一输入后反传同一梯度
     // （GPU 侧触发 MHA 裸 S 重算表达式——scan 闭合世界注册的验针）
-    auto b1c = attn_c.forward(cpu, *t1);
-    auto b1g = attn_g.forward(gpu, *g1);
+    auto b1c = attn_c.forward(*t1);
+    auto b1g = attn_g.forward(*g1);
     if (!b1c || !b1g) { std::cerr << "MHA re-forward failed\n"; return 1; }
     nn::Matrix gm(d_model, total);
     for (std::size_t i = 0; i < gm.size(); ++i) gm.span()[i] = dist(rng);
     auto tg_c = cpu.from_matrix(gm);
     auto tg_g = gpu.from_matrix(gm);
     if (!tg_c || !tg_g) { std::cerr << "grad from_matrix failed\n"; return 1; }
-    auto bc = attn_c.backward(cpu, *tg_c);
-    auto bg = attn_g.backward(gpu, *tg_g);
+    auto bc = attn_c.backward(*tg_c);
+    auto bg = attn_g.backward(*tg_g);
     if (!bc || !bg)
     {
         std::cerr << "MHA backward FAILED: "
