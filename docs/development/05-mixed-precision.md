@@ -545,7 +545,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 
 1. **CPU 侧 f16 全模型训练曾发散，已修复**（双根因与验证见 §12.12）；`f16_precision_test` 对应的容忍分支已改为硬失败。
 2. 边界 cast 的 transient 膨胀（见上）：**未命中变体的算子**仍走该路径，剩余归因与下一步见 §12.8 / §12.11。
-3. RAPT / ZiPT / CNN 的层内 DSL 调用**未显式传 P**（默认 F32）→ 这些链不参与 f16（正确性无虞，只是不省）。
+3. RAPT / CNN 的层内 DSL 调用**未显式传 P**（默认 F32）→ 这些链不参与 f16（正确性无虞，只是不省）。
 4. `--activation-offload` 下 f16 激活写入 slab 前被抬为 f32（正确，但该份激活不再减半）。
 
 ---

@@ -392,5 +392,6 @@ GPU-resident 单算子对、链式错；attn batch=1 对、batch=2 错；gradche
 
 - `10-development-standards.md`（同目录）— 分层职责规范（"每层只能负责每层的事"）
 - `../introduction/01-architecture.md` — 架构分层
-- `06-rapt-algorithm.md` / `07-zipt-algorithm.md` — 两个算法层的设计与工程约束
+- `06-rapt-algorithm.md` — 线性注意力家族（RLA / RAPT / RLA-2）的设计与工程约束
+  （原 `07-zipt-algorithm.md` 随 AttnZip 于 2026-10-01 移除，见 `docs/history.md`）
 - `../usage/04-train-package.md` — 训练包格式

@@ -721,26 +721,5 @@ public:
         return generated;
     }
 };
-
-// ══════════════════════════════════════════════════════════════════════════
-// concat_cols — 沿列方向拼接两个张量（列主序激活：拼接序列/记忆维度）
-//   a: (rows, c1), b: (rows, c2) → out: (rows, c1+c2)
-// 用 transpose + insert_rows + transpose 组合实现（纯引擎原语，CPU/GPU 均可，
-// 无需新增 shader 或 AOT 融合）。用于 ZiPT 阶段二把记忆 K/V 与局部 K/V 拼接。
-// ══════════════════════════════════════════════════════════════════════════
-[[nodiscard]] inline Result<Tensor> concat_cols(
-    ComputeEngine& engine, const Tensor& a, const Tensor& b)
-{
-    if (a.rows() != b.rows())
-        return std::unexpected(Error{"concat_cols: row count mismatch"});
-    auto aT = engine.transpose(a);   // (c1, rows)
-    NN_TRY_CHECK(aT);
-    auto bT = engine.transpose(b);   // (c2, rows)
-    NN_TRY_CHECK(bT);
-    Tensor dstT = engine.create_tensor(a.cols() + b.cols(), a.rows(), a.precision());
-    NN_TRY(r1, engine.insert_rows(dstT, 0, *aT));
-    NN_TRY(r2, engine.insert_rows(dstT, a.cols(), *bT));
-    return engine.transpose(dstT);
-}
 } // namespace nn
 

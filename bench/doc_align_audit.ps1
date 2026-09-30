@@ -181,7 +181,7 @@ $tests = @{}
 foreach ($d in $docs) {
     $lines = Get-Content $d
     for ($i = 0; $i -lt $lines.Count; $i++) {
-        foreach ($m in [regex]::Matches($lines[$i], '\b([a-z0-9_]{3,}_test|maxpool_gradcheck|conv2d_gradcheck|rmsnorm_gradcheck|softmax_gradcheck|swiglu_gradcheck|attn_gradcheck|gpt_gradcheck|rapt_gradcheck|zipt_gradcheck|f16_cpu_probe|f16_writeback_probe|mem_probe|layer_bench)\b')) {
+        foreach ($m in [regex]::Matches($lines[$i], '\b([a-z0-9_]{3,}_test|maxpool_gradcheck|conv2d_gradcheck|rmsnorm_gradcheck|softmax_gradcheck|swiglu_gradcheck|attn_gradcheck|gpt_gradcheck|rapt_gradcheck|f16_cpu_probe|f16_writeback_probe|mem_probe|layer_bench)\b')) {
             $t = $m.Groups[1].Value
             if (-not $tests.ContainsKey($t)) { $tests[$t] = @() }
             if ($tests[$t].Count -lt 3) { $tests[$t] += ("{0}:{1}" -f (Split-Path $d -Leaf), ($i + 1)) }
