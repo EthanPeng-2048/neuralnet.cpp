@@ -440,7 +440,12 @@ class MnistTrainController(CLIController):
             args.extend(["--max-samples", self._format_arg_value(kwargs["max_samples"])])
         
         if "shuffle_steps" in kwargs:
-            args.extend(["--shuffle-steps", self._format_arg_value(kwargs["shuffle_steps"])])
+            # CLI 取 true/false 字面量（--shuffle-steps 是带值选项，不是开关标志）；
+            # 同时兼容调用方直接传 bool。
+            v = kwargs["shuffle_steps"]
+            if isinstance(v, bool):
+                v = "true" if v else "false"
+            args.extend(["--shuffle-steps", self._format_arg_value(v)])
         
         # MLP专用参数
         if "layer_dims" in kwargs:
@@ -481,16 +486,9 @@ class MnistTrainController(CLIController):
         if "cnn_fc" in kwargs:
             args.extend(["--cnn-fc", self._format_arg_value(kwargs["cnn_fc"])])
         
-        # 振荡检测
-        if "osc_guard" in kwargs:
-            args.extend(["--osc-guard", self._format_arg_value(kwargs["osc_guard"])])
-
-        if "osc_window" in kwargs:
-            args.extend(["--osc-window", self._format_arg_value(kwargs["osc_window"])])
-
-        if "osc_threshold" in kwargs:
-            args.extend(["--osc-threshold", self._format_arg_value(kwargs["osc_threshold"])])
-
+        # 振荡检测（--osc-*）**已从 CLI 移除**：mnist_train 帮助曾声明这三个选项，
+        # 但解析分支与实现均不存在（传入即"未知参数"退出）。详见 docs/history.md。
+        
         # 混合精度
         if kwargs.get("f16", False):
             args.append("--f16")
@@ -651,6 +649,10 @@ class TokenizerTrainController(CLIController):
         if "min_freq" in kwargs:
             args.extend(["--min-freq", self._format_arg_value(kwargs["min_freq"])])
         
+        # 预分词并行线程数（0=自动, 1=顺序, >1=指定）
+        if "threads" in kwargs:
+            args.extend(["--threads", self._format_arg_value(kwargs["threads"])])
+        
         return args
     
     def _parse_metric(self, line: str) -> Optional[Union[Metric, List[Metric]]]:
@@ -715,6 +717,18 @@ class TokenizerInferController(CLIController):
         if "encode_file" in kwargs:
             args.extend(["--encode-file", self._format_arg_value(kwargs["encode_file"])])
         
+        # 位置参数：直接给文本文件即统计每行 token 数（配合 --top）
+        if "text_file" in kwargs:
+            args.append(self._format_arg_value(kwargs["text_file"]))
+        
+        # 最长行排行榜行数
+        if "top" in kwargs:
+            args.extend(["--top", self._format_arg_value(kwargs["top"])])
+        
+        # encode 并行度（0=自动, 1=顺序, >1=指定；保序并行，输出与顺序执行逐字节一致）
+        if "threads" in kwargs:
+            args.extend(["--threads", self._format_arg_value(kwargs["threads"])])
+        
         # 交互模式
         if kwargs.get("interactive", False):
             args.append("--interactive")
@@ -769,9 +783,15 @@ class GptTrainController(CLIController):
         if "save" in kwargs:
             args.extend(["--save", self._format_arg_value(kwargs["save"])])
         
-        # 恢复路径
+        # 恢复路径（--resume-epoch / --resume-step 需配合 --resume）
         if "resume" in kwargs:
             args.extend(["--resume", self._format_arg_value(kwargs["resume"])])
+        
+        if "resume_epoch" in kwargs:
+            args.extend(["--resume-epoch", self._format_arg_value(kwargs["resume_epoch"])])
+        
+        if "resume_step" in kwargs:
+            args.extend(["--resume-step", self._format_arg_value(kwargs["resume_step"])])
         
         # 词表路径
         if "vocab" in kwargs:
@@ -835,15 +855,9 @@ class GptTrainController(CLIController):
         if "norm" in kwargs:
             args.extend(["--norm", self._format_arg_value(kwargs["norm"])])
         
-        # 模型架构（gpt/zipt AttnZip 记忆压缩）
+        # 模型架构（gpt / rapt；zipt(AttnZip) 已于 2026-10-01 移除）
         if "model" in kwargs:
             args.extend(["--model", self._format_arg_value(kwargs["model"])])
-        
-        if "memory_tokens" in kwargs:
-            args.extend(["--memory-tokens", self._format_arg_value(kwargs["memory_tokens"])])
-        
-        if "window" in kwargs:
-            args.extend(["--window", self._format_arg_value(kwargs["window"])])
         
         # 日志和保存间隔
         if "log_interval" in kwargs:
@@ -855,6 +869,10 @@ class GptTrainController(CLIController):
         # 梯度日志
         if kwargs.get("grad_log", False):
             args.append("--grad-log")
+        
+        # 禁用 tokenize 缓存（每次重新分词，不写 .tokcache）
+        if kwargs.get("no_cache", False):
+            args.append("--no-cache")
         
         # Batch录制粒度
         if "flush_interval" in kwargs:

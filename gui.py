@@ -50,7 +50,8 @@ BUILD_DIR = PROJECT_DIR / "build"
 # ---------- 枚举选项 ----------
 ARCH_OPTIONS = ["mlp", "transformer", "cnn"]
 OPTIMIZER_OPTIONS = ["sgd", "sgd_momentum", "adam", "adamw", "muon"]
-ENGINE_OPTIONS = ["CPU", "GPU (Vulkan)", "CUDA"]
+# 后端仅 CPU / Vulkan，**本项目不支持 CUDA**（AGENTS §2）→ 不提供 CUDA 选项
+ENGINE_OPTIONS = ["CPU", "GPU (Vulkan)"]
 LR_SCHEDULE_OPTIONS = ["fixed", "cosine"]
 GPT_LR_SCHEDULE_OPTIONS = ["fixed", "cosine", "step_cosine"]
 TOKENIZER_OPTIONS = ["bpe", "charbpe"]
@@ -59,6 +60,8 @@ ACTIVATION_OPTIONS = ["gelu", "swiglu"]
 NORM_OPTIONS = ["layernorm", "rmsnorm", "batchnorm"]
 GPT_NORM_OPTIONS = ["layernorm", "rmsnorm"]  # GPT 仅支持 LayerNorm/RMSNorm
 PRECISION_OPTIONS = ["f32", "f16"]  # 混合精度选项
+# 模型架构：zipt(AttnZip) 已于 2026-10-01 移除（恢复前提见 docs/history.md / AGENTS §12）
+GPT_MODEL_OPTIONS = ["gpt", "rapt"]
 
 
 # ---------- 工具函数 ----------
@@ -749,7 +752,7 @@ class MnistTrainTab(TabBase):
         r = 0
 
         # --- 基本参数 ---
-        self.arch = _make_option_row(p, "架构", r, ARCH_OPTIONS, "transformer"); r += 1
+        self.arch = _make_option_row(p, "架构", r, ARCH_OPTIONS, "mlp"); r += 1
         self.dataset = _make_dir_row(p, "数据集目录", r)
         self.dataset.delete(0, "end")
         self.dataset.insert(0, str(DATASETS_DIR / "mnist_data"))
@@ -759,9 +762,9 @@ class MnistTrainTab(TabBase):
         self.resume_path = _make_file_row(p, "恢复路径", r,
                                            filetypes=[("模型文件", "*.bin")]); r += 1
         self.epochs = _make_entry_row(p, "轮数 (epochs)", r, "10"); r += 1
-        self.batch_size = _make_entry_row(p, "批大小", r, "32"); r += 1
+        self.batch_size = _make_entry_row(p, "批大小", r, "64"); r += 1
         self.optimizer = _make_option_row(p, "优化器", r, OPTIMIZER_OPTIONS, "adam"); r += 1
-        self.weight_decay = _make_entry_row(p, "权重衰减", r, "0.0"); r += 1
+        self.weight_decay = _make_entry_row(p, "权重衰减", r, "0.01"); r += 1
         self.engine = _make_option_row(p, "计算引擎", r, ENGINE_OPTIONS, "CPU"); r += 1
         self.max_samples = _make_entry_row(p, "最大样本数 (0=全部)", r, "0"); r += 1
 
@@ -771,6 +774,11 @@ class MnistTrainTab(TabBase):
         self.lr_schedule = _make_option_row(p, "调度类型", r, LR_SCHEDULE_OPTIONS, "fixed"); r += 1
         self.min_lr = _make_entry_row(p, "最小学习率 (min_lr)", r, "1e-6"); r += 1
         self.warmup_epochs = _make_entry_row(p, "预热轮数", r, "0"); r += 1
+        self.lr_per_epoch = _make_entry_row(p, "每轮 lr (逗号分隔, 可选)", r, ""); r += 1
+
+        # --- 训练控制 ---
+        _make_label(p, "── 训练控制 ──", r); r += 1
+        self.shuffle_steps = _make_checkbox_row(p, "每 epoch 打乱 batch", r, True); r += 1
 
         # --- 混合精度 ---
         self.mp_sep_label = _make_label(p, "── 混合精度 ──", r); r += 1
@@ -792,12 +800,12 @@ class MnistTrainTab(TabBase):
 
         # --- Transformer 专用参数 ---
         self.tf_sep_label = _make_label(p, "── Transformer 参数 ──", r); r += 1
-        self.d_model = _make_entry_row(p, "d_model", r, "128"); r += 1
+        self.d_model = _make_entry_row(p, "d_model", r, "64"); r += 1
         self.num_heads = _make_entry_row(p, "num_heads", r, "4"); r += 1
-        self.num_layers = _make_entry_row(p, "num_layers", r, "4"); r += 1
-        self.d_ff = _make_entry_row(p, "d_ff", r, "512"); r += 1
-        self.patch_size = _make_entry_row(p, "patch_size", r, ""); r += 1
-        self.eval_samples = _make_entry_row(p, "eval_samples", r, "100"); r += 1
+        self.num_layers = _make_entry_row(p, "num_layers", r, "2"); r += 1
+        self.d_ff = _make_entry_row(p, "d_ff", r, "128"); r += 1
+        self.patch_size = _make_entry_row(p, "patch_size", r, "7"); r += 1
+        self.eval_samples = _make_entry_row(p, "eval_samples", r, "200"); r += 1
         self._tf_widgets = [self.tf_sep_label, self.d_model, self.num_heads,
                             self.num_layers, self.d_ff, self.patch_size, self.eval_samples]
 
@@ -832,8 +840,6 @@ class MnistTrainTab(TabBase):
         dev = "cpu"
         if args.pop("gpu", False):
             dev = "gpu"
-        if args.pop("cuda", False):
-            dev = "cuda"
         name = Path(args.get("save", "mnist_model.bin")).stem or "mnist_run"
         return {"format_version": 1, "name": name, "task": "mnist",
                 "device": dev, "data": data, "hyperparameters": args}
@@ -890,12 +896,14 @@ class MnistTrainTab(TabBase):
         engine = self.engine.get()
         if engine == "GPU (Vulkan)":
             args["gpu"] = True
-        elif engine == "CUDA":
-            args["cuda"] = True
         if self.max_samples.get(): args["max_samples"] = int(self.max_samples.get())
         if self.lr_schedule.get(): args["lr_schedule"] = self.lr_schedule.get()
         if self.min_lr.get(): args["min_lr"] = float(self.min_lr.get())
         if self.warmup_epochs.get(): args["warmup_epochs"] = int(self.warmup_epochs.get())
+        # 手动每轮 lr（逗号分隔字符串，CLI --lr-per-epoch，优先级最高）
+        if self.lr_per_epoch.get(): args["lr_per_epoch"] = self.lr_per_epoch.get()
+        # 训练控制：--shuffle-steps 需要 true/false 字面量（不是开关标志）
+        args["shuffle_steps"] = "true" if self.shuffle_steps.get() else "false"
         # 混合精度
         if "f16" in self.precision_preset.get():
             args["f16"] = True
@@ -1247,8 +1255,6 @@ class MnistInferTab(TabBase):
         engine = self.engine.get()
         if engine == "GPU (Vulkan)":
             args["gpu"] = True
-        elif engine == "CUDA":
-            args["cuda"] = True
         return args
 
 
@@ -1270,6 +1276,7 @@ class TokenizerTrainTab(TabBase):
                                            filetypes=[("JSON", "*.json")]); r += 1
         self.vocab_size = _make_entry_row(p, "词表大小", r, "5000"); r += 1
         self.min_freq = _make_entry_row(p, "最小频率", r, "2"); r += 1
+        self.threads = _make_entry_row(p, "预分词线程数 (0=自动)", r, "0"); r += 1
 
     def collect_args(self):
         args = {}
@@ -1278,6 +1285,7 @@ class TokenizerTrainTab(TabBase):
         if self.output_path.get(): args["output"] = self.output_path.get()
         if self.vocab_size.get(): args["vocab_size"] = int(self.vocab_size.get())
         if self.min_freq.get(): args["min_freq"] = int(self.min_freq.get())
+        if self.threads.get(): args["threads"] = int(self.threads.get())
         return args
 
 
@@ -1296,6 +1304,10 @@ class TokenizerInferTab(TabBase):
         self.decode_ids = _make_entry_row(p, "解码ID列表", r, "", width=200); r += 1
         self.encode_file = _make_file_row(p, "编码文件", r,
                                            filetypes=[("文本文件", "*.txt")]); r += 1
+        self.stats_file = _make_file_row(p, "统计文件 (最长行 token 数)", r,
+                                          filetypes=[("文本文件", "*.txt")]); r += 1
+        self.top = _make_entry_row(p, "最长行排行榜 (top)", r, "10"); r += 1
+        self.threads = _make_entry_row(p, "encode 线程数 (0=自动)", r, "0"); r += 1
         self.show_bytes_var = _make_checkbox_row(p, "显示字节", r); r += 1
 
     def collect_args(self):
@@ -1304,6 +1316,10 @@ class TokenizerInferTab(TabBase):
         if self.encode_text.get(): args["encode"] = self.encode_text.get()
         if self.decode_ids.get(): args["decode"] = self.decode_ids.get()
         if self.encode_file.get(): args["encode_file"] = self.encode_file.get()
+        # 位置参数：直接给文本文件即统计每行 token 数（--top 控制排行榜行数）
+        if self.stats_file.get(): args["text_file"] = self.stats_file.get()
+        if self.top.get(): args["top"] = int(self.top.get())
+        if self.threads.get(): args["threads"] = int(self.threads.get())
         args["show_bytes"] = self.show_bytes_var.get()
         return args
 
@@ -1329,6 +1345,8 @@ class GptTrainTab(TabBase):
                                          default_name="gpt_model.bin"); r += 1
         self.resume_path = _make_file_row(p, "恢复路径", r,
                                            filetypes=[("模型文件", "*.bin *.nnpkg")]); r += 1
+        self.resume_epoch = _make_entry_row(p, "续训起始 epoch (0-based)", r, "0"); r += 1
+        self.resume_step = _make_entry_row(p, "续训起始 step (0-based)", r, "0"); r += 1
         self.test_file = _make_file_row(p, "测试集 (可选)", r,
                                          filetypes=[("文本文件", "*.txt")]); r += 1
         self.vocab_path = _make_file_row(p, "词表路径", r,
@@ -1337,7 +1355,7 @@ class GptTrainTab(TabBase):
         # --- 训练参数 ---
         _make_label(p, "── 训练参数 ──", r); r += 1
         self.epochs = _make_entry_row(p, "轮数", r, "10"); r += 1
-        self.batch_size = _make_entry_row(p, "批大小", r, "4"); r += 1
+        self.batch_size = _make_entry_row(p, "批大小", r, "32"); r += 1
         self.accum_steps = _make_entry_row(p, "梯度累积步数", r, "1"); r += 1
         self.seq_len = _make_entry_row(p, "序列长度", r, "256"); r += 1
         self.stride = _make_entry_row(p, "滑动窗口步长 (0=seq_len)", r, "0"); r += 1
@@ -1354,6 +1372,7 @@ class GptTrainTab(TabBase):
         self.warmup_epochs = _make_entry_row(p, "预热轮数 (cosine)", r, "0"); r += 1
         self.warmup_steps = _make_entry_row(p, "预热步数 (step_cosine)", r, "0"); r += 1
         self.max_norm = _make_entry_row(p, "梯度裁剪 (0=不裁剪)", r, "0"); r += 1
+        self.lr_per_epoch = _make_entry_row(p, "每轮 lr (逗号分隔, 可选)", r, ""); r += 1
 
         # LR 调度相关控件（fixed 时隐藏）
         self._lr_schedule_widgets = [self.min_lr, self.warmup_epochs,
@@ -1364,7 +1383,7 @@ class GptTrainTab(TabBase):
         # --- 混合精度 ---
         _make_label(p, "── 混合精度 ──", r); r += 1
         self.precision_preset = _make_option_row(p, "精度预设", r,
-            ["f32 (默认)", "f16 (master-weights)"], "f32 (默认)"); r += 1
+            ["f32 (默认)", "f16 (存储)"], "f32 (默认)"); r += 1
         self.precision_param = _make_option_row(p, "参数精度 (param)", r, PRECISION_OPTIONS, "f32"); r += 1
         self.precision_compute = _make_option_row(p, "计算精度 (compute)", r, PRECISION_OPTIONS, "f32"); r += 1
         self.precision_stable = _make_option_row(p, "稳定精度 (stable)", r, PRECISION_OPTIONS, "f32"); r += 1
@@ -1374,10 +1393,10 @@ class GptTrainTab(TabBase):
 
         # --- 模型参数 ---
         _make_label(p, "── 模型参数 ──", r); r += 1
-        self.d_model = _make_entry_row(p, "d_model", r, "256"); r += 1
+        self.d_model = _make_entry_row(p, "d_model", r, "128"); r += 1
         self.num_heads = _make_entry_row(p, "num_heads", r, "4"); r += 1
         self.num_layers = _make_entry_row(p, "num_layers", r, "4"); r += 1
-        self.d_ff = _make_entry_row(p, "d_ff", r, "1024"); r += 1
+        self.d_ff = _make_entry_row(p, "d_ff", r, "512"); r += 1
 
         # --- 架构细节 ---
         _make_label(p, "── 架构细节 ──", r); r += 1
@@ -1388,15 +1407,11 @@ class GptTrainTab(TabBase):
         self.norm_type = _make_option_row(p, "归一化层", r,
                                            GPT_NORM_OPTIONS, "layernorm"); r += 1
         self.model_type = _make_option_row(p, "模型架构", r,
-                                            ["gpt", "zipt", "rapt"], "gpt"); r += 1
-        self.memory_tokens = _make_entry_row(p, "记忆 token 数 (M)", r, "32"); r += 1
-        self.window = _make_entry_row(p, "局部窗口 (W)", r, "0"); r += 1
-        self.model_type.trace_add("write", self._on_model_type_change)
-        self._on_model_type_change()
+                                            GPT_MODEL_OPTIONS, "gpt"); r += 1
 
         # --- GPU 保护 ---
         _make_label(p, "── GPU 保护 ──", r); r += 1
-        self.flush_interval = _make_entry_row(p, "flush 间隔", r, "0"); r += 1
+        self.flush_interval = _make_entry_row(p, "flush 间隔", r, "1"); r += 1
         self.checkpoint_every = _make_entry_row(p, "梯度检查点间隔", r, "0"); r += 1
         self.activation_offload_var = _make_checkbox_row(p, "activation offload", r); r += 1
 
@@ -1405,6 +1420,7 @@ class GptTrainTab(TabBase):
         self.log_interval = _make_entry_row(p, "日志间隔 (steps)", r, "50"); r += 1
         self.save_interval = _make_entry_row(p, "保存间隔 (steps)", r, "100"); r += 1
         self.grad_log_var = _make_checkbox_row(p, "梯度日志", r); r += 1
+        self.no_cache_var = _make_checkbox_row(p, "禁用 tokenize 缓存", r); r += 1
 
         self._add_export_button()
 
@@ -1418,21 +1434,9 @@ class GptTrainTab(TabBase):
         dev = "cpu"
         if args.pop("gpu", False):
             dev = "gpu"
-        if args.pop("cuda", False):
-            dev = "cuda"
         name = Path(args.get("save", "gpt_model.bin")).stem or "gpt_run"
         return {"format_version": 1, "name": name, "task": "gpt",
                 "device": dev, "data": data, "hyperparameters": args}
-
-    def _on_model_type_change(self, *args):
-        """zipt 架构下显示记忆 token 数/窗口控件"""
-        is_zipt = self.model_type.get() == "zipt"
-        for w in (self.memory_tokens, self.window):
-            w = getattr(w, "widget", w)
-            if is_zipt:
-                w.grid()
-            else:
-                w.grid_remove()
 
     def _on_lr_schedule_change(self, *args):
         """fixed 调度下隐藏 min_lr / warmup / grad_clip"""
@@ -1455,10 +1459,15 @@ class GptTrainTab(TabBase):
                 self.warmup_steps.grid()
 
     def _on_precision_preset_change(self, *args):
-        """精度预设切换时自动填充各精度字段"""
+        """精度预设切换时自动填充各精度字段。
+
+        与 CLI 语义严格对齐（text_train --help / precision.hpp）：
+        `--f16` = profile_f16() = {param:F16, compute:F16, stable:F32, optimizer:F32}，
+        即"f16 存储"，**不是** mnist_train 的 master-weights 配方（{f32,f16,f32,f32}）。
+        """
         preset = self.precision_preset.get()
         if "f16" in preset:
-            self.precision_param.widget.set("f32")
+            self.precision_param.widget.set("f16")
             self.precision_compute.widget.set("f16")
             self.precision_stable.widget.set("f32")
             self.precision_optimizer.widget.set("f32")
@@ -1491,6 +1500,8 @@ class GptTrainTab(TabBase):
         args.update(_str(self.text_file, "text_file"))
         args.update(_str(self.save_path, "save"))
         args.update(_str(self.resume_path, "resume"))
+        args.update(_int(self.resume_epoch, "resume_epoch"))
+        args.update(_int(self.resume_step, "resume_step"))
         args.update(_str(self.test_file, "test_file"))
         args.update(_str(self.vocab_path, "vocab"))
         args.update(_int(self.epochs, "epochs"))
@@ -1503,8 +1514,6 @@ class GptTrainTab(TabBase):
         engine = self.engine.get()
         if engine == "GPU (Vulkan)":
             args["gpu"] = True
-        elif engine == "CUDA":
-            args["cuda"] = True
         # 学习率
         args.update(_float(self.lr, "lr"))
         sched = self.lr_schedule.get()
@@ -1516,6 +1525,7 @@ class GptTrainTab(TabBase):
             elif sched == "step_cosine":
                 args.update(_int(self.warmup_steps, "warmup_steps"))
             args.update(_float(self.max_norm, "max_norm"))
+        args.update(_str(self.lr_per_epoch, "lr_per_epoch"))
         # 模型
         args.update(_int(self.d_model, "d_model"))
         args.update(_int(self.num_heads, "num_heads"))
@@ -1534,8 +1544,6 @@ class GptTrainTab(TabBase):
         args["activation"] = self.activation.get()
         args["norm"] = self.norm_type.get()
         args["model"] = self.model_type.get()
-        args.update(_int(self.memory_tokens, "memory_tokens"))
-        args.update(_int(self.window, "window", skip_vals=()))
         # GPU 保护
         args.update(_int(self.flush_interval, "flush_interval", skip_vals=()))
         args.update(_int(self.checkpoint_every, "checkpoint_every", skip_vals=()))
@@ -1544,6 +1552,7 @@ class GptTrainTab(TabBase):
         args.update(_int(self.log_interval, "log_interval", skip_vals=()))
         args.update(_int(self.save_interval, "save_interval", skip_vals=()))
         args["grad_log"] = self.grad_log_var.get()
+        args["no_cache"] = self.no_cache_var.get()
         return args
 
 
@@ -1558,8 +1567,10 @@ class GptInferTab(TabBase):
         r = 0
         self.model_path = _make_file_row(p, "模型路径", r,
                                           filetypes=[("模型文件", "*.bin *.pt *.nnpkg")]); r += 1
+        self.vocab_path = _make_file_row(p, "词表路径 (模型未嵌入时)", r,
+                                          filetypes=[("JSON", "*.json")]); r += 1
         self.max_tokens = _make_entry_row(p, "最大生成token数", r, "200"); r += 1
-        self.temperature = _make_entry_row(p, "温度 (0=贪心)", r, "0.8"); r += 1
+        self.temperature = _make_entry_row(p, "温度 (0=贪心)", r, "1.0"); r += 1
         self.engine = _make_option_row(p, "计算引擎", r, ENGINE_OPTIONS, "CPU"); r += 1
         self.show_tokens_var = _make_checkbox_row(p, "显示token", r); r += 1
 
@@ -1574,6 +1585,7 @@ class GptInferTab(TabBase):
     def collect_args(self):
         args = {}
         if self.model_path.get(): args["model"] = self.model_path.get()
+        if self.vocab_path.get(): args["vocab"] = self.vocab_path.get()
         prompt = self.prompt_box.get("1.0", "end").strip()
         if prompt:
             args["prompt"] = prompt
@@ -1582,8 +1594,6 @@ class GptInferTab(TabBase):
         engine = self.engine.get()
         if engine == "GPU (Vulkan)":
             args["gpu"] = True
-        elif engine == "CUDA":
-            args["cuda"] = True
         args["show_tokens"] = self.show_tokens_var.get()
         return args
 

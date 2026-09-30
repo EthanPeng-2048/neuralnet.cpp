@@ -454,12 +454,12 @@ python gui.py
 
 | Tab | 功能 |
 |-----|------|
-| **MNIST 训练** | MNIST 模型训练：支持 MLP / Transformer 架构切换、超参数调节、恢复训练、学习率调度（fixed / cosine）、GPU 加速、评估样本数；实时 loss / acc 曲线 |
+| **MNIST 训练** | MNIST 模型训练：支持 MLP / Transformer / CNN 架构切换、超参数调节、恢复训练、学习率调度（fixed / cosine）、每轮 lr 覆盖、batch 打乱开关、GPU 加速、评估样本数；实时 loss / acc 曲线 |
 | **MNIST 推理** | MNIST 图片推理 + 图片查看：推理某张图片自动显示该图、Top-K 置信度条形图、目录翻页导航；内置**手写板**，鼠标书写数字即刻识别 |
-| **GPT 训练** | GPT 语言模型训练：位置编码（learned / sinusoidal / alibi）、激活（GeLU / SwiGLU）、归一化（LayerNorm / RMSNorm）、梯度累积、滑动窗口 stride、学习率调度（fixed / cosine / step_cosine）、TDR 防护、梯度裁剪；实时 loss 曲线 |
-| **GPT 推理** | GPT 文本生成：温度调节、交互模式、Token ID 调试输出 |
-| **分词器训练** | 训练 BPE / CharBPE 分词器，配置词表大小和最小合并频率 |
-| **分词器推理** | 分词器编码/解码测试，支持文本编码、ID 解码、文件编码 |
+| **GPT 训练** | GPT / RAPT 语言模型训练：位置编码（learned / sinusoidal / alibi / rope）、激活（GeLU / SwiGLU）、归一化（LayerNorm / RMSNorm）、梯度累积、滑动窗口 stride、学习率调度（fixed / cosine / step_cosine）、续训定位（resume-epoch / resume-step）、batch flush 粒度、梯度检查点、activation offload、tokenize 缓存开关；实时 loss 曲线 |
+| **GPT 推理** | GPT 文本生成：模型 + 词表选择、温度调节、Token ID 调试输出 |
+| **分词器训练** | 训练 BPE / CharBPE 分词器，配置词表大小、最小合并频率与预分词并行线程数 |
+| **分词器推理** | 分词器编码/解码测试：文本编码、ID 解码、文件编码、最长行统计（top-N）、encode 并行度 |
 
 ---
 
@@ -646,14 +646,16 @@ python gui.py
 
 1. **选择模型** — 指定训练好的 GPT 模型 `.bin` 文件
 2. **选择词表** — 指定对应的词表 JSON
-3. **设置生成参数** — 最大 token 数（默认 200）、温度（0=贪心，>1=更随机，默认 0.8）
+3. **设置生成参数** — 最大 token 数（默认 200）、温度（0=贪心，>1=更随机，默认 1.0）
 4. **输入提示文本** — 在输入框中输入起始文本（如 "Hello"）
 5. **点击 "▶ 生成文本"** — 在输出区域显示生成结果
 
 **可选项：**
-- ✅ **交互式生成模式** — 启用后通过 stdin 进行多轮对话式生成
 - ✅ **显示 Token ID** — 调试用，显示每个 token 的 ID
 - ✅ **GPU 加速** — 支持 Vulkan（下拉选择设备）
+
+> **CLI 专属**：多轮 stdin 交互模式（`text_infer --interactive`）不在 GUI 内暴露——
+> GUI 本身就是交互外壳。
 
 ---
 

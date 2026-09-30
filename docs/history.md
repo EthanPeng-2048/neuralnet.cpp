@@ -29,6 +29,7 @@
 - [构建系统 / CI（CMakeLists.txt、.github/workflows）](#构建系统 / CI（CMakeLists.txt、.github/workflows）)（1 条）
 - [AGENTS.md](#AGENTS.md)（24 条）
 - [ZiPT（AttnZip）移除](#ZiPT（AttnZip）移除（2026-10-01）)（1 条）
+- [GUI / CLI 参数一致性清理](#GUI / CLI 参数一致性清理（2026-10-01）)（1 条）
 
 ---
 
@@ -1889,3 +1890,104 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
   属冒烟级）。因此本次移除是"**未被证据支撑的设计退出**"，与 CUDA 后端、旧代数 AST、
   IR-C 图融合、`CpuEmitter` 同属一类处置。
 - 与已修缺陷的关系：issue #13 P1-10（"ZiPT stored_tokens 无门控"，低优先）随之作废。
+
+---
+
+# GUI / CLI 参数一致性清理（2026-10-01）
+
+> 触发：ZiPT 移除后 `gui.py` 仍在无条件发 `--window 0` / `--memory-tokens 32`，
+> 而 `text_train` 对未知参数直接 `exit(1)` —— 即 **GPT 训练页彼时已整页不可用**。
+> 借此把 GUI / `cli_controllers.py` / 各 CLI 的"缺失·多余·默认值"三类偏差一次收敛。
+> **门禁**：`python bench/gui_cli_audit.py`（三节：GUI→CLI flag 差集 + 反向缺失清单、
+> 幽灵选项=帮助声明 vs 解析分支、`gui.py` 的 `self.X` 赋值静态校验；退出码 0 = 无偏差）。
+
+## 一、多余项（GUI/控制器发出、CLI 不存在）
+
+- **CUDA 残留（CUDA 移除时漏网的一半）**：`gui.py` 的 `ENGINE_OPTIONS` 仍列 `"CUDA"`，
+  4 处 `collect_args` 里有 `elif engine == "CUDA": args["cuda"] = True`，
+  两个 `build_pack_config` 还会据此写 `device: "cuda"`；`train_pkg.py` 甚至有
+  `--device cuda` 与 `hyper["cuda"] = True`。而 CUDA 后端早已整体移除
+  （见上文"CUDA 后端移除备注"），CLI 传入 `--cuda` 即"未知参数"；
+  控制器侧对 `cuda` 键也从不消费（静默丢弃）→ 用户选了 CUDA 实际按 CPU 跑且无任何提示。
+  本轮：`ENGINE_OPTIONS` 去掉 CUDA、4 处分支删除、`train_pkg.py` 的 `--device`
+  只留 `cpu/gpu`（旧包里的 `cuda` 字段改为**显式忽略**而非报错）。
+- **ZiPT 残留**：`model_type` 选项列表含 `"zipt"`、`memory_tokens` / `window` 两个控件
+  与 `_on_model_type_change` 显隐回调；`cli_controllers.py` 的 `--memory-tokens`/`--window`
+  映射。其中 `window` 用了 `skip_vals=()` → **每次运行都无条件发 `--window 0`**，
+  在 ZiPT 移除当刻就会让 `text_train` 报"未知参数"退出。
+  本轮全数删除，`model_type` 收敛为 `["gpt", "rapt"]`（列表提为常量 `GPT_MODEL_OPTIONS`）。
+
+## 二、幽灵选项（帮助声明了、解析分支根本不存在）
+
+- **`mnist_train --osc-guard <on|off>` / `--osc-window <n>` / `--osc-threshold <f>`**：
+  三个选项只在 `--help` 的打印链里存在，**解析分支为零**（`grep -n 'osc' src/ include/`
+  只命中帮助三行 + `compute_optimizer.hpp:114` 一句"供 OscillationGuard 等自适应调度器使用"的注释）；
+  实测 `mnist_train --osc-guard on` → `未知参数: --osc-guard` + exit(1)。
+  即：自"振荡检测自动降 lr"这一功能被删除起，帮助文本与 `cli_controllers.py`
+  （`MnistTrainController` 的 `osc_guard/osc_window/osc_threshold` 三条映射）就一直是悬空的。
+  本轮按"文档不得声明不存在的选项"处理：**帮助文本 + 控制器映射 + GUI 控件三层一起删**
+  （不补实现——与仓库近期"移除自适应启发式"的取向一致，如 NaN 跳步的移除）。
+  复现判据：`build/cli_phantom_option_audit.py` 六入口全 OK。
+
+## 三、缺失项（CLI 有、GUI 无）
+
+| 入口 | 本轮补上的参数 |
+|---|---|
+| `mnist_train` | `--shuffle-steps`（勾选框，默认 true）、`--lr-per-epoch` |
+| `text_train` | `--resume-epoch` / `--resume-step`（续训定位）、`--no-cache`、`--lr-per-epoch` |
+| `tokenizer_train` | `--threads`（0=自动，对应 BPE 保序并行） |
+| `tokenizer_infer` | `--top`、`--threads`、**位置参数"文本文件"= 统计每行 token 数模式** |
+| `text_infer` | `--vocab`（模型未嵌入 tokenizer 时必填） |
+
+- 对应地在 `cli_controllers.py` 新增 `resume_epoch` / `resume_step` / `no_cache`（GptTrain）、
+  `threads`（TokenizerTrain）、`top` / `threads` / 位置参数 `text_file`（TokenizerInfer）映射；
+  并把 GptTrain 的 `memory_tokens` / `window` 映射删除。
+- **有意不暴露**：`text_infer --interactive` 与 `tokenizer_infer --interactive`——
+  GUI 本身就是交互外壳，再套一个 stdin 交互循环没有意义（审计脚本将其列为预期缺失）。
+
+## 四、默认值与 CLI 不一致（对齐 CLI / 实现）
+
+| 页 | 项 | 原 GUI 默认 | 现默认（= CLI/实现） |
+|---|---|---|---|
+| MNIST 训练 | 架构 | transformer | **mlp** |
+| MNIST 训练 | 批大小 / 权重衰减 | 32 / 0.0 | **64 / 0.01** |
+| MNIST 训练 | d_model / num_layers / d_ff | 128 / 4 / 512 | **64 / 2 / 128** |
+| MNIST 训练 | patch_size / eval_samples | 空 / 100 | **7 / 200** |
+| MNIST 训练 | 每 epoch 打乱 batch | 未暴露 | **true**（新控件） |
+| GPT 训练 | 批大小 | 4 | **32** |
+| GPT 训练 | d_model / d_ff | 256 / 1024 | **128 / 512** |
+| GPT 训练 | flush 间隔 | 0（=不间断） | **1**（实现默认；帮助文本同时由 2 订正为 1） |
+| GPT 训练 | 精度预设 f16 的回填值 | param=f32/compute=f16（**master-weights 配方**） | **param=f16/compute=f16/stable=f32/opt=f32**（= `text_train --f16` 的真实语义 `profile_f16()`；原回填值与实际发出的 `--f16` 语义不符，属误导） |
+| GPT 推理 | 温度 | 0.8 | **1.0** |
+
+- **控制器侧顺带修复**：`--shuffle-steps` 是**带值**选项（CLI 接受 `true/false/1/0`），
+  但 `CLIController._format_arg_value` 对 `bool` 返回空串（bool 一律当开关标志）→
+  控制器把 `shuffle_steps=True` 渲染成 `--shuffle-steps ""`，必然触发
+  `无效 --shuffle-steps`。现 `shuffle_steps` 分支对 bool 显式转 `"true"/"false"`，
+  字符串原样透传（GUI 侧也改为直接传字面量）。
+- **保留的有意差异**：MNIST 保存路径默认 `pretrained/mnist_model.bin`（CLI 为 `mnist_model.bin`），
+  与 `mnist_infer` 的默认模型路径 `pretrained/model.bin` 一致，属 GUI 的有意选择。
+
+## 五、本轮验收（全部实测）
+
+- `python -m py_compile gui.py cli_controllers.py train_pkg.py` 通过。
+- `python bench/gui_cli_audit.py`：三节全 PASS——11 个用例覆盖六个 Tab 的每条可选分支，
+  **GUI 发出的 flag 全部存在于对应 CLI 的 `--help`**；反向缺失仅 `--interactive`（有意）；
+  六入口**幽灵选项 0**；11 个类**未定义自读属性 0**。
+- 真实运行（新参数逐个实跑，非仅 flag 名比对）：
+  - `mnist_train` MLP（`--shuffle-steps true` + `--lr-schedule cosine` + `--warmup-epochs`）exit 0；
+    Transformer（`--lr-per-epoch` + 全套 TF 参数）exit 0；
+  - `text_train` GPT（`--no-cache --flush-interval 1 --grad-log`）exit 0；
+    `--resume … --resume-epoch 0 --resume-step 0` exit 0；`--model rapt` exit 0；
+  - `tokenizer_train --threads 0` exit 0；`tokenizer_infer --encode … --threads 0` exit 0；
+    `tokenizer_infer <text-file> --top 3 --threads 0`（统计模式）exit 0；
+  - `text_infer --vocab … --temperature 1.0` exit 0。
+- 反证（说明修复必要）：旧 GUI 会发的 `--window 0` 现在报
+  `未知参数: --window` + exit(1)。
+
+## 六、未处理（另案）
+
+- `13-refactor-backlog.md` §4 的"五 Tab 声明式字段表"（dataclass + 字段元数据自动生成 UI 与
+  collect 函数）**仍未做**——本轮只做一致性修正，字段仍是手工罗列；
+  但三个校验脚本已可作为该重构的回归护栏（改完跑一遍即可验证零漂移）。
+- GUI 画布节流（13 §5.3）未动。

@@ -298,7 +298,7 @@ void print_usage(const char *prog)
         << "  --no-cache         禁用 tokenize 缓存（默认自动缓存到 .tokcache 文件）\n"
         << "\n"
         << "Batch 录制粒度:\n"
-        << "  --flush-interval <n>  每 N 个 Transformer block flush 一次 (默认: 2)\n"
+        << "  --flush-interval <n>  每 N 个 Transformer block flush 一次 (默认: 1)\n"
         << "  按层切 batch 缩短 D1 延迟销毁锁窗、拆分大提交防 TDR；\n"
         << "  非阻塞提交后细粒度 flush 的额外 submit 代价不在关键路径，\n"
         << "  不影响 batch_size 和训练质量\n"
