@@ -139,6 +139,12 @@ ZiPT stored_tokens 门控——含各自核对结论与代码位置）。**重�
 
 ### 10.2 目标用法（选型依据，代码为准）
 
+> **2026-09-30 勘注（M1 落地后）**：下例两处已与现状不符——① `t.cpu_matrix` 访问器
+> 已私有化（17 §4.1 访问不变量），库外读写一律 `engine.to_matrix/from_matrix`；
+> ② `from_host/to_host/upload` 改名方案已由 17 §3 D9 **取消**（保留 `from_matrix/
+> to_matrix` 名称 + I/O 分组）。其余目标用法（创建唯一入口、出生绑定、import、
+> Layer 删形参）仍有效，分别由 17 的 M1/M6 推进。
+
 ```cpp
 // ── 创建：唯一入口 = 引擎方法，engine + precision 出生一次到位，返回值类型 ──
 auto t = engine.create_tensor(128, 64, nn::Precision::F16);

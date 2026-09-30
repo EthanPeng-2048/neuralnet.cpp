@@ -101,24 +101,22 @@ model.add<nn::GPTBlock>(128, 4, 512, 1024);        // GPT 块
 `Tensor` 是所有数据的统一容器：
 
 ```cpp
-// 创建 CPU 张量
-nn::Tensor t1 = nn::Tensor::cpu(784, 32);  // 784×32，零初始化
+// M1（docs/development/17 §4.1）起：创建/读写张量一律经 Engine——
+// Tensor 的静态工厂与存储访问器已私有化，绕过引擎 = 编译错误。
 
-// 从 Matrix 创建（共享所有权）
-nn::Matrix m(784, 32);
-nn::Tensor t2 = nn::Tensor::from_matrix(std::move(m));
-
-// 通过 Engine 创建（自动分配到目标设备）
+// 通过 Engine 创建（统一入口：自动分配、出生绑定到引擎）
+nn::Tensor t1 = engine.create_tensor(784, 32);  // 784×32，零初始化
 nn::Tensor t3 = engine.create_tensor(784, 32);
 (void)engine.zero(t3);  // 清零
+
+// 从 Matrix 上传（Matrix = 宿主 I/O 载体）
+nn::Matrix m(784, 32);
+auto t_result = engine.from_matrix(m);
+nn::Tensor t2 = std::move(*t_result);
 
 // 转换为 Matrix（GPU 张量会先等待在飞命令完成，再下载回 CPU）
 auto m_result = engine.to_matrix(t3);
 nn::Matrix m2 = std::move(*m_result);
-
-// 从 Matrix 上传到 Engine
-auto t_result = engine.from_matrix(m2);
-nn::Tensor t4 = std::move(*t_result);
 ```
 
 **张量布局（重要！）：**
@@ -150,7 +148,7 @@ int main() {
     model.add<nn::Linear>(256, 10);
 
     // 2. 准备输入 (784 像素, 32 样本)
-    nn::Tensor input = nn::Tensor::cpu(784, 32);
+    nn::Tensor input = engine.create_tensor(784, 32);
     // ... 填充数据 ...
 
     // 3. 前向传播
@@ -263,10 +261,10 @@ model.add<MyLayer>(256, 10);
 
 ```cpp
 // ❌ 错误：(batch, feature) — 行主序 batch-major
-nn::Tensor input = nn::Tensor::cpu(32, 784);
+nn::Tensor input = engine.create_tensor(32, 784);
 
 // ✅ 正确：(feature, batch) — 列主序 batch-major
-nn::Tensor input = nn::Tensor::cpu(784, 32);
+nn::Tensor input = engine.create_tensor(784, 32);
 ```
 
 ### 2. 忘记绑定 Engine
@@ -285,10 +283,10 @@ model.add<nn::Linear>(784, 10);
 ### 3. 跨设备操作绕过 Engine
 
 ```cpp
-// ❌ 错误：直接取 GPU 张量的 CPU 存储
+// ❌ 错误：直接摸 GPU 张量的 CPU 存储（M1 起存储访问器已私有 → 这行编译不过）
 nn::GpuEngine engine;                       // 需 NN_HAS_VULKAN
 nn::Tensor t = engine.create_tensor(10, 10);
-auto& m = t.cpu_matrix();                   // NN_ASSERT: tensor has no CPU storage
+auto& m = t.cpu_matrix();                   // 编译错误：cpu_matrix 是私有成员
 
 // ✅ 正确：跨设备读写统一走 engine（to_matrix 下载，GPU 会等待在飞命令完成）
 auto m_result = engine.to_matrix(t);

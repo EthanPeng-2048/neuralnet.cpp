@@ -156,6 +156,7 @@ Matrix → engine.from_matrix → Tensor[GPU] → forward/loss/optimizer 全程�
 8. **确定性**：任何"依赖容器迭代顺序"的决策点（BPE 平局打破、ID 分配等）必须显式排序/按 key 打破平局；并行化后结果必须与单线程逐字节一致。
 9. **大词表禁止物化 one-hot**：用 `CrossEntropyLoss::forward_sparse`（整数标签 + loss_mask）。
 10. **`//` 注释中禁止出现 `\` 反斜杠**（尤其行尾）：GCC 行拼接会把下一行并入当前注释——轻则 `-Wcomment -Werror` 编译失败，重则下一行代码被静默吞掉。
+11. **张量存储不可绕过引擎（M1，docs/development/17 §4.1）**：一切 Tensor 的创建/读写/reshape 必须经 ComputeEngine（`create_tensor/from_matrix/to_matrix/reshape` 等）；存储访问器（`cpu_matrix/cpu_shared/gpu_tensor/gpu_shared`）与静态直构工厂（`Tensor::from_matrix/cpu/...`）**已私有**，绕过 = 编译错误。库内豁免仅两条：引擎 friend（ComputeEngine/CpuEngine/GpuEngine）与 `detail::TensorAccess`（DSL 求值器专用通道，**库外禁用**，违反靠 grep 审计抓）。
 
 ## 6. 数据布局约定
 
@@ -259,7 +260,7 @@ optimizer.step();
 | `development/13-refactor-backlog.md` | **重构与性能机会清单（2026-09-25 审查）：只记录方案不实施；误报/已修复项对照表与已执行记录在 `docs/history.md`，重复立项前先读本文件** |
 | `development/15-computeengine-refresh.md` | **ComputeEngine Refresh 详细设计（13 §10 展开）：张量出生绑定 + `import` + 存储多态；含 P-1（PrecisionEngine 下沉删除）与 P1（出生绑定 + `bind_check_` 跨引擎检查 + `adopt` 内部通道，**两项均已实施 2026-09-29**）与 D1-D9 未决点裁定；**未实施的 P2-P6 已被 17 吸收改期（M1-M7），后续立项读 17** |
 | `development/16-computeengine-p0-inventory.md` | **Refresh P0 盘点结果（2026-09-28）：ensure_gpu 43 分类 / ComputeEngine& 175 打标 / 宿主中转 381 清单 / ctest 双基线（Lavapipe 20 20、Mali offload 非确定）/ GPU 稳定性探针与未决 7 项** |
-| `development/17-unified-tensor-engine.md` | **统一 Tensor/ComputeEngine/MemoryPool 底层架构总纲（2026-09-30，裁定完成、未实施）：访问不变量（Tensor 存储私有、一切经引擎）、InitSpec 声明式初始化、批量 read/write、Matrix 降级为宿主 I/O 载体、内存池契约统一；吸收 15 未实施的 P2-P6（改期 M1-M7）。立项前先读本文件 + §5 分期** |
+| `development/17-unified-tensor-engine.md` | **统一 Tensor/ComputeEngine/MemoryPool 底层架构总纲（2026-09-30 裁定；M1 访问收口已实施 2026-09-30，M2-M7 未实施）：访问不变量（Tensor 存储私有、一切经引擎，已立为铁律 #11）、InitSpec 声明式初始化、批量 read/write、Matrix 降级为宿主 I/O 载体、内存池契约统一；吸收 15 未实施的 P2-P6（改期 M1-M7）。立项前先读本文件 + §5 分期** |
 | `development/14-f16-stable-gpu-loss-frozen.md` | **故障报告（2026-09-26，未修）：GPU `stable=f16` 训练 loss 打印冻结（权重不冻结）——触发矩阵、测试覆盖缺口、证据与复现** |
 
 ### 使用类（docs/usage/）
@@ -286,7 +287,8 @@ optimizer.step();
 
 - **混合精度**：`precision.hpp` 的 `Precision`/`PrecisionProfile{param/compute/stable/optimizer}`；CPU/GPU f16 路径 = 边界 cast（`ComputeEngine` 基类 NVI 入口，**原 `PrecisionEngine` 装饰器已删除下沉**，见 15 §4.1）+ in-kernel f16 带类型变体 + op-level f16 GEMM（一份 .comp 用 `-DNN_SHADER_F16=1` 编第二份 SPIR-V）；`--f16` = `profile_f16()` = {param:F16, compute:F16, stable:F32, optimizer:F32}，实测峰值显存低于 f32（`docs/development/05` §12.11）。
 - **线性注意力**：RLA-2 / RAPT（`docs/development/06`）。
-- **张量出生绑定（Refresh P1，2026-09-29）**：`Tensor::engine_` observer + `bound()`/`engine()`；库内产物出生即绑定——引擎公共入口（含 `create_tensor`/`from_matrix`/`cast` 等已 NVI 化的工厂）统一 `stamp_`，`dsl::compute`/`compute_reduce` 静态工厂出口经内部 `adopt` 通道；公共入口带 `bind_check_` 跨引擎检查（**双方都绑定且指针不同 → 硬错误**，单侧未绑定放行；`NN_BIND_DEBUG=1` 时未绑定输入也报错，用于抓库内漏网与 P2 库外迁移清单）。**库内新增 Tensor 出生点必须走引擎入口或 `adopt`，新引擎入口须带 `bind_check_`+`stamp_`**（模板见 `docs/development/01` 步骤 1，取舍见 15 §3.1/§4.3）。
+- **张量出生绑定（Refresh P1，2026-09-29）**：`Tensor::engine_` observer + `bound()`/`engine()`；库内产物出生即绑定——引擎公共入口（含 `create_tensor`/`from_matrix`/`cast` 等已 NVI 化的工厂）统一 `stamp_`，`dsl::compute`/`compute_reduce` 静态工厂出口经内部 `adopt` 通道；公共入口带 `bind_check_` 跨引擎检查（**双方都绑定且指针不同 → 硬错误**，单侧未绑定放行；`NN_BIND_DEBUG=1` 时未绑定输入也报错，用于抓库内漏网与库外迁移清单）。**库内新增 Tensor 出生点必须走引擎入口或 `adopt`，新引擎入口须带 `bind_check_`+`stamp_`**（模板见 `docs/development/01` 步骤 1，取舍见 15 §3.1/§4.3）。
+- **访问收口（统一总纲 M1，2026-09-30）**：Tensor 存储访问器与静态直构工厂**私有化**（铁律 #11），库外（9 测试文件 + text_train + scan_exprs）全部迁 `engine.create_tensor/from_matrix/to_matrix`；`ComputeEngine::reshape` 落地（D10，元素数不匹配返回 Result 错误）；DSL 求值器经 `detail::TensorAccess` 域内通道。验收：ctest 20/20 + CPU 探针逐位一致 + scan 双 hash 不变（详见 17 §5 M1 行与 `docs/history.md`）。
 - **训练稳定性**：防 NaN 跳步。
 - **训练显存开关（GPT 与 RAPT 同档）**：梯度检查点 `set_checkpoint_every`、activation offload `set_activation_offload`、文档掩码 `set_doc_ids`、batch flush 粒度 `set_flush_interval`；检查点与 offload **可混合**（checkpoint 块重算、其余块 offload）。引擎侧 API 为 `create_offload_buffer`/`offload_save`/`offload_restore`（`set_offload_enabled` 不存在）。
 - **Vulkan 多设备选择**：`--gpu` 参数与 `NN_VULKAN_DEVICE` 环境变量（`cli/cli_gpu_option.hpp`、`backend/compute_vk_device.hpp`）。

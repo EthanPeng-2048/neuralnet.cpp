@@ -2,7 +2,8 @@
 
 > **本文是新总纲**：吸收并取代 `15-computeengine-refresh.md` 未实施的 P2-P6（本文 §5 分期），
 > 并对 `13-refactor-backlog.md` §10.8 增补"访问不变量"注脚。历史归档见 `docs/history.md`。
-> 状态：**设计裁定已完成（§3 共 10 项），未实施**。实施立项时读本文 + §5 分期 + 源码现状。
+> 状态：**设计裁定已完成（§3 共 10 项）；M1 访问收口已实施（2026-09-30，验收与
+> 过程见 §5 M1 行 + `docs/history.md`），M2-M7 未实施**。实施立项时读本文 + §5 分期 + 源码现状。
 > 前置工程成果保留不动：15 的 P-1（PrecisionEngine 下沉）、P1（张量出生绑定）已落地（15 §7.1）。
 
 ## 0. 一句话
@@ -19,7 +20,8 @@
 3. 底层因此双轨并行：上层（Layer/Model/Loss）已用父类+继承收口，底层（Tensor/存储/内存）
    却是"静态工厂直构 + 公开存储访问 + GPU 专属内存池"的松散组合。
 
-**现状事实**（可复现，2026-09-30 核对）：
+**现状事实**（可复现，2026-09-30 核对；**M1 实施前口径**——M1 落地后库外直构/直读已归零，
+下表保留为动机证据，复现命令仍可跑但库外命中应为 0）：
 
 | 事实 | 数字 | 复现 |
 |---|---|---|
@@ -71,7 +73,7 @@
 
 ## 4. 目标架构
 
-### 4.1 访问不变量（拟立为铁律新增条）
+### 4.1 访问不变量（已立为铁律——AGENTS.md §5 第 11 条，M1 落地 2026-09-30）
 
 > **一切 Tensor 的创建、访问、修改必须经由 ComputeEngine。**
 > Tensor 存储是私有实现细节；静态直构工厂与公开存储访问器从公共 API 消失。
@@ -174,7 +176,7 @@ CPU 字节基线 + scan 产物 hash + layer_bench（定义见 §6）。
 
 | 期 | 内容 | 关键改动面 | 专属验收 |
 |---|---|---|---|
-| **M1** | **访问收口**：存储私有化、静态工厂收编、`reshape` 引擎化、库外同期全迁（D7） | `compute_tensor.hpp`；引擎/DSL 内部通道（include 5 文件）；src 127 处 + `text_train.cpp:756` | 四件套 + **编译期强制**（旧 API 已不存在，`grep cpu_matrix` 仅剩引擎内部） |
+| **M1** ✅（2026-09-30） | **访问收口**：存储私有化、静态工厂收编、`reshape` 引擎化（`ComputeEngine::reshape`，D10）、库外同期全迁（D7） | `compute_tensor.hpp`；`detail::TensorAccess`（DSL 19 处改道）；`model_serialization.hpp` f16 分支；src 9 测试 + `text_train.cpp:756` + `tools/scan_exprs.cpp`（commits `3d76478`/`c8f308f`） | **四件套全过**：build 122/122；ctest 20/20；CPU 探针 `6f8849f14da23110` 与 pre 逐位一致；scan 双 hash 不变；layer_bench 配对 A/B（pre=HEAD~2 worktree 二进制，feedforward/swiglu/linear 各 4 轮交错，分布重叠无回退）；**编译期强制**：`grep \.cpu_matrix` 库外零命中（详见 `docs/history.md` M1 条） |
 | **M2** | **声明式创建/初始化**：`InitSpec` + `Layer::init` 迁移 + RNG 收编 | `create_tensor` NVI 扩展；`compute_layer_*.hpp` 的 init（mlp/conv/gpt/zipt/rapt…） | 四件套 + **初值跨进程确定性**（两次运行初值逐字节同；`random_device` 层改造属计划内字节变化，先立新锚） |
 | **M3** | **批量读写 API**：`read/write/get_index/set_index` + I/O 分组审计口径（D9） | `compute_engine.hpp` + CPU/GPU 两引擎；测试读写路径 | 四件套 + GPU staging 批量语义探针（写后读回对拍） |
 | **M4** | **Matrix 降级收口**：L2+ 禁用规则成文 + 分层审计脚本 | 规则进 AGENTS.md 铁律；审计脚本（U5） | 审计脚本零违规 |
@@ -224,8 +226,8 @@ CPU 字节基线 + scan 产物 hash + layer_bench（定义见 §6）。
 - `13-refactor-backlog.md` §10.8：句柄指针化**维持否决**，增补注脚"访问诉求由本文
   §4.1 不变量承接"。
 - `16-computeengine-p0-inventory.md`：M0 证据沿用（175 打标 / 43 ensure_gpu / 381 宿主中转）。
-- `AGENTS.md`：M1 起新增铁律条（访问必须过引擎）、M4 起新增 Matrix 分层禁用条；
-  文档索引已同步。
+- `AGENTS.md`：**M1 已新增铁律第 11 条**（张量存储不可绕过引擎，2026-09-30）；M4 起新增
+  Matrix 分层禁用条（未实施）；文档索引已同步。
 
 **未决点（实施时裁定）**
 
