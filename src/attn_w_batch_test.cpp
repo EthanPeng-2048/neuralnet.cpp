@@ -59,8 +59,8 @@ int main(int argc, char** argv)
             {
                 auto cm = cpu.to_matrix(pc[i].get());
                 if (!cm) { std::cerr << "to_matrix cpu failed\n"; return false; }
-                auto cp = gpu.copy_from(pg[i].get(), *cm);
-                if (!cp) { std::cerr << "copy_from gpu failed: " << cp.error().message << "\n"; return false; }
+                auto cp = gpu.write(pg[i].get(), cm->span());
+                if (!cp) { std::cerr << "write gpu failed: " << cp.error().message << "\n"; return false; }
             }
         }
 

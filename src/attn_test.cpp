@@ -113,8 +113,8 @@ static int mha_bidirectional_probe()
         {
             auto cm = cpu.to_matrix(pc[i].get());
             if (!cm) { std::cerr << "to_matrix cpu failed\n"; return 1; }
-            auto cp = gpu.copy_from(pg[i].get(), *cm);
-            if (!cp) { std::cerr << "copy_from gpu failed: " << cp.error().message << "\n"; return 1; }
+            auto cp = gpu.write(pg[i].get(), cm->span());
+            if (!cp) { std::cerr << "write gpu failed: " << cp.error().message << "\n"; return 1; }
         }
     }
     auto g1 = gpu.from_matrix(x1);

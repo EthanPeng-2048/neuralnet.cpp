@@ -145,8 +145,8 @@ int main(int argc, char* argv[])
     // init 是随机初始化 → 用确定性权重覆盖，参考实现才可比
     Matrix wm = fill(C_out, C_in * K * K);
     Matrix bm = fill(C_out, 1);
-    if (auto r = eng.copy_from(conv.parameters()[0].get(), wm); !r) return 1;
-    if (auto r = eng.copy_from(conv.parameters()[1].get(), bm); !r) return 1;
+    if (auto r = eng.write(conv.parameters()[0].get(), wm.span()); !r) return 1;
+    if (auto r = eng.write(conv.parameters()[1].get(), bm.span()); !r) return 1;
 
     ConvRef ref{C_in, C_out, K, H, W, OH, OW, B, fill(C_in * H * W, B), wm, bm};
 

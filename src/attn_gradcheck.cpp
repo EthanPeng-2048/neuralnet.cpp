@@ -58,15 +58,15 @@ bool check_grad_tensor(
             const Scalar orig = base.at_unchecked(r, c);
             Matrix pp = base;
             pp.set_value_unchecked(r, c, orig + eps);
-            auto r_p = engine.copy_from(param, pp);
+            auto r_p = engine.write(param, pp.span());
             if (!r_p) return false;
             const Scalar lp = eval_loss(engine, attn, x, go);
             Matrix pm = base;
             pm.set_value_unchecked(r, c, orig - eps);
-            auto r_m = engine.copy_from(param, pm);
+            auto r_m = engine.write(param, pm.span());
             if (!r_m) return false;
             const Scalar lm = eval_loss(engine, attn, x, go);
-            auto r_r = engine.copy_from(param, base);
+            auto r_r = engine.write(param, base.span());
             if (!r_r) return false;
             const Scalar num = (lp - lm) / (Scalar{2} * eps);
             const Scalar ana = grad_analytical.at_unchecked(r, c);
