@@ -63,8 +63,7 @@ private:
                 }
             }
         }
-        auto r = detail::upload_span(engine, d_model_, total_len, p_.param, std::span(enc));
-        if (!r) return std::unexpected(r.error());
+        NN_TRY(r, detail::upload_span(engine, d_model_, total_len, p_.param, std::span(enc)));
         encoding_cache_ = std::move(*r);
         cached_total_ = total_len;
         return {};
@@ -91,8 +90,7 @@ public:
 
         if (cached_total_ != total_len)
         {
-            auto r = rebuild_encoding(engine, total_len);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY(r, rebuild_encoding(engine, total_len));
         }
 
         return dsl::compute(engine,
@@ -136,10 +134,10 @@ public:
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
-        auto r1 = self_attn_.init(engine); if (!r1) return std::unexpected(r1.error());
-        auto r2 = norm1_.init(engine); if (!r2) return std::unexpected(r2.error());
-        auto r3 = ff_.init(engine); if (!r3) return std::unexpected(r3.error());
-        auto r4 = norm2_.init(engine); if (!r4) return std::unexpected(r4.error());
+        NN_TRY(r1, self_attn_.init(engine));
+        NN_TRY(r2, norm1_.init(engine));
+        NN_TRY(r3, ff_.init(engine));
+        NN_TRY(r4, norm2_.init(engine));
         return {};
     }
 
@@ -155,26 +153,18 @@ public:
 
     std::vector<TensorRef> parameters() override
     {
-        auto p = self_attn_.parameters();
-        auto n1 = norm1_.parameters();
-        auto f  = ff_.parameters();
-        auto n2 = norm2_.parameters();
-        p.insert(p.end(), n1.begin(), n1.end());
-        p.insert(p.end(), f.begin(), f.end());
-        p.insert(p.end(), n2.begin(), n2.end());
-        return p;
+        return collect_refs(self_attn_.parameters(),
+                            norm1_.parameters(),
+                            ff_.parameters(),
+                            norm2_.parameters());
     }
 
     std::vector<TensorRef> param_gradients() override
     {
-        auto g = self_attn_.param_gradients();
-        auto gn1 = norm1_.param_gradients();
-        auto gf  = ff_.param_gradients();
-        auto gn2 = norm2_.param_gradients();
-        g.insert(g.end(), gn1.begin(), gn1.end());
-        g.insert(g.end(), gf.begin(), gf.end());
-        g.insert(g.end(), gn2.begin(), gn2.end());
-        return g;
+        return collect_refs(self_attn_.param_gradients(),
+                            norm1_.param_gradients(),
+                            ff_.param_gradients(),
+                            norm2_.param_gradients());
     }
 
     // 梯度检查点：把模式传播给内部注意力/归一化/FFN
@@ -212,61 +202,23 @@ public:
         const Tensor& input) override
     {
         ComputeEngine& engine = engine_ref();
-        // x1 = LN₁(input)
-        auto n1 = norm1_.forward(input);
-        if (!n1) return n1;
-
-        // a = SelfAttn(x1)
-        auto a = self_attn_.forward(*n1);
-        if (!a) return a;
-
-        // r2 = input + a
-        auto r2 = dsl::compute(engine,
-            dsl::leaf(input) + dsl::leaf(*a),
-            input.rows(), input.cols(), p_.compute);
-        if (!r2) return std::unexpected(r2.error());
+        // 残差分支 1（Pre-Norm + 自注意力），与 GPTBlock/RAPTBlock 同骨架
+        NN_TRY(r2, prenorm_residual_forward_(engine, input, norm1_, self_attn_, p_.compute));
         Tensor res2 = std::move(*r2);
         if (!checkpoint_mode_)
             residual2_cache_ = res2;
-
-        // x2 = LN₂(res2)
-        auto n2 = norm2_.forward(res2);
-        if (!n2) return n2;
-
-        // f = FFN(x2)
-        auto f = ff_.forward(*n2);
-        if (!f) return f;
-
-        // out = res2 + f
-        return dsl::compute(engine,
-            dsl::leaf(res2) + dsl::leaf(*f),
-            res2.rows(), res2.cols(), p_.compute);
+        // 残差分支 2（Pre-Norm + FFN）
+        return prenorm_residual_forward_(engine, res2, norm2_, ff_, p_.compute);
     }
 
     [[nodiscard]] Result<Tensor> backward(
         const Tensor& grad_output) override
     {
         ComputeEngine& engine = engine_ref();
-        // 残差2 反向: 分流到 residual1 + FFN
-        auto grad_ff = ff_.backward(grad_output);
-        if (!grad_ff) return grad_ff;
-        auto b_n2 = norm2_.backward(*grad_ff);
-        if (!b_n2) return b_n2;
-
-        auto grad_r1 = dsl::compute(engine,
-            dsl::leaf(grad_output) + dsl::leaf(*b_n2),
-            grad_output.rows(), grad_output.cols(), p_.compute);
-        if (!grad_r1) return std::unexpected(grad_r1.error());
-
-        // 残差1 反向: 分流到 input + SelfAttn
-        auto b_sa = self_attn_.backward(*grad_r1);
-        if (!b_sa) return b_sa;
-        auto b_n1 = norm1_.backward(*b_sa);
-        if (!b_n1) return b_n1;
-
-        return dsl::compute(engine,
-            dsl::leaf(*grad_r1) + dsl::leaf(*b_n1),
-            grad_r1->rows(), grad_r1->cols(), p_.compute);
+        // 两处残差分流 + 子层反向（与 GPTBlock / RAPTBlock 同一骨架）
+        return prenorm_residual_backward_(engine, grad_output,
+                                          norm1_, self_attn_, norm2_, ff_,
+                                          p_.compute);
     }
 };
 
@@ -318,13 +270,11 @@ public:
     {
         for (auto& layer : layers_)
         {
-            auto r = layer.init(engine);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY(r, layer.init(engine));
         }
         // M6 段 C：pos_encoding_ 是子 Layer，engine 由 init 绑定
         {
-            auto r = pos_encoding_.init(engine);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY(r, pos_encoding_.init(engine));
         }
         // 预创建 ones_row_ (1, num_patches) 全1，用于 backward 广播
         // （M2 声明式：引擎填数，原 from_matrix 口径 = F32）
@@ -344,24 +294,12 @@ public:
 
     std::vector<TensorRef> parameters() override
     {
-        std::vector<TensorRef> p;
-        for (auto& l : layers_)
-        {
-            auto lp = l.parameters();
-            p.insert(p.end(), lp.begin(), lp.end());
-        }
-        return p;
+        return collect_block_refs_(layers_, &TransformerEncoderLayer::parameters);
     }
 
     std::vector<TensorRef> param_gradients() override
     {
-        std::vector<TensorRef> g;
-        for (auto& l : layers_)
-        {
-            auto lg = l.param_gradients();
-            g.insert(g.end(), lg.begin(), lg.end());
-        }
-        return g;
+        return collect_block_refs_(layers_, &TransformerEncoderLayer::param_gradients);
     }
 
     [[nodiscard]] Result<Tensor> forward(
@@ -376,15 +314,13 @@ public:
         batch_size_ = input.cols() / num_patches_;
 
         // 1. 添加 tiled 位置编码 → (d_model, batch * num_patches)
-        auto pe = pos_encoding_.forward(input);
-        if (!pe) return pe;
+        NN_TRY(pe, pos_encoding_.forward(input));
         Tensor x = std::move(*pe);
 
         // 2. 一次性通过所有 EncoderLayer [全批量化 GPU]
         for (auto& layer : layers_)
         {
-            auto lr = layer.forward(x);
-            if (!lr) return lr;
+            NN_TRY(lr, layer.forward(x));
             x = std::move(*lr);
         }
         // x: (d_model, batch * num_patches)
@@ -394,18 +330,16 @@ public:
         //   (batch*d_model, num_patches)，每行块对应一个样本，
         //   row_reduce_sum 后得到 (batch*d_model, 1)，
         //   再 rearrange_3d inverse 回 (d_model, batch)。
-        auto re = engine.rearrange_3d(x, d_model_, batch_size_, num_patches_, false);
-        if (!re) return std::unexpected(re.error());
+        NN_TRY(re, engine.rearrange_3d(x, d_model_, batch_size_, num_patches_, false));
         // 归约步走 dsl::compute_reduce（输出与输入同形）
         auto row_sum = dsl::compute_reduce(engine,
             dsl::row_reduce_sum(dsl::leaf(*re)), re->rows(), re->cols(), p_.compute);
-        if (!row_sum) return std::unexpected(row_sum.error());
-        auto rs_re = engine.rearrange_3d(*row_sum, d_model_, batch_size_, 1, true);
-        if (!rs_re) return std::unexpected(rs_re.error());
+        NN_TRY_CHECK(row_sum);
+        NN_TRY(rs_re, engine.rearrange_3d(*row_sum, d_model_, batch_size_, 1, true));
         // 原地缩放走 dsl::compute_into（inv_num_patches_ 走 rparam，值不进 key）
         auto r = dsl::compute_into(engine,
             dsl::leaf(*rs_re) * dsl::rparam(inv_num_patches_), *rs_re);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return *rs_re;
     }
 
@@ -421,28 +355,25 @@ public:
         //   实现：rearrange_3d(grad, d_model, batch, 1, false) → (batch*d_model, 1)
         //         原地 scale(inv_n) → matmul(grad_col_vec, ones_row_) → (batch*d_model, num_patches)
         //         rearrange_3d(result, d_model, batch, num_patches, true) → (d_model, batch*num_patches)
-        auto g_re = engine.rearrange_3d(grad_output, d_model_, batch_size_, 1, false);
-        if (!g_re) return std::unexpected(g_re.error());
+        NN_TRY(g_re, engine.rearrange_3d(grad_output, d_model_, batch_size_, 1, false));
         // 原地缩放走 dsl::compute_into（inv_num_patches_ 走 rparam，值不进 key）
         auto r = dsl::compute_into(engine,
             dsl::leaf(*g_re) * dsl::rparam(inv_num_patches_), *g_re);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         // (*g_re): (batch*d_model, 1) × ones_row_ (1, num_patches) → (batch*d_model, num_patches)
         // 纯 matmul 走 DSL 直写（结构经 scan 的 TransformerEncoderLayer dry-run 登记；
         // 注意该调用在 pooling 路径，scan 的 enc dry-run 覆盖 forward/backward）
         auto unpooled = dsl::compute(engine,
             dsl::matmul(*g_re, ones_row_, false, false),
             g_re->rows(), ones_row_.cols(), p_.compute);
-        if (!unpooled) return std::unexpected(unpooled.error());
-        auto grad = engine.rearrange_3d(*unpooled, d_model_, batch_size_, num_patches_, true);
-        if (!grad) return std::unexpected(grad.error());
+        NN_TRY_CHECK(unpooled);
+        NN_TRY(grad, engine.rearrange_3d(*unpooled, d_model_, batch_size_, num_patches_, true));
         Tensor grad_x = std::move(*grad);
 
         // 2. 反向通过所有 EncoderLayer [全批量化 GPU]
         for (auto it = layers_.rbegin(); it != layers_.rend(); ++it)
         {
-            auto br = it->backward(grad_x);
-            if (!br) return br;
+            NN_TRY(br, it->backward(grad_x));
             grad_x = std::move(*br);
         }
 
@@ -525,8 +456,7 @@ public:
         // （patch 提取是 PatchEmbedding 的算法职责，无对应 op-level 原语；
         //  此处为 batch 边界的合法 CPU 预处理，与 GPTModel 的 gather_rows 同性质；
         //  宿主桥走 span，不经 Matrix——17 §3 D11）
-        auto in_v = detail::download_vector(engine, input);
-        if (!in_v) return std::unexpected(in_v.error());
+        NN_TRY(in_v, detail::download_vector(engine, input));
         const std::size_t in_cols = input.cols();
 
         std::vector<Scalar> all_patches(patch_dim_ * batch * num_patches_);
@@ -550,7 +480,7 @@ public:
 
         auto ap_t = detail::upload_span(engine, patch_dim_, batch * num_patches_,
                                         Precision::F32, std::span(all_patches));
-        if (!ap_t) return std::unexpected(ap_t.error());
+        NN_TRY_CHECK(ap_t);
 
         // Step 2: 投影 → (d_model, batch * num_patches) — 已是 batch-major，无需重排
         return projection_.forward(*ap_t);
@@ -564,12 +494,11 @@ public:
         const std::size_t batch = grad_output.cols() / num_patches_;
 
         // Step 1: 投影层反向 → (patch_dim, batch * num_patches) — batch-major
-        auto bp = projection_.backward(grad_output);
-        if (!bp) return bp;
+        NN_TRY(bp, projection_.backward(grad_output));
 
         // Step 2: 散射梯度回输入 → (img_size², batch)
         auto gp_v = detail::download_vector(engine, *bp);   // 宿主桥（17 §3 D11）
-        if (!gp_v) return std::unexpected(gp_v.error());
+        NN_TRY_CHECK(gp_v);
         const std::size_t gp_cols = bp->cols();
 
         std::vector<Scalar> grad_input(img_size_ * img_size_ * batch);

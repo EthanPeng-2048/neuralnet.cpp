@@ -141,7 +141,7 @@ int main(int argc, char* argv[])
     if (use_doc)
     {
         // 文档感知：每样本两文档（前/后半）、样本错开基线 → 覆盖 backward
-        //   的 masked_doc_ 分支（Doc；叠加 --pos-enc alibi 即 AlibiDoc）。
+        //   的 CausalDocScoreMask 分支（Doc；叠加 --pos-enc alibi 即 AlibiDoc）。
         //   本用例专门验证该分支的梯度：仅 forward 通过不足以验证
         //   （梯度跨文档串扰 forward 抓不住）
         std::vector<std::size_t> ids(batch * seq, 0);

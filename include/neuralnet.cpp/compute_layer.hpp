@@ -16,10 +16,12 @@
 //   compute_layer_mlp.hpp           Linear/ReLU/GeLU/SwiGLU/LayerNorm/RMSNorm
 //   compute_layer_conv.hpp          Conv2D / MaxPool2D
 //   compute_layer_softmax.hpp       Softmax
-//   compute_layer_attention.hpp     RotaryEmbedding / AttentionBase / MultiHeadAttention / CausalSelfAttention
+//   compute_position_encoding.hpp   PositionEncoder 家族（Learned/Sinusoidal/RoPE/ALiBi）
+//   compute_layer_attention.hpp     AttentionBase / MultiHeadAttention / CausalSelfAttention
+//                                   + AttnScoreMask 掩码策略族
 //   compute_layer_feedforward.hpp   FeedForward
 //   compute_layer_transformer.hpp   PositionalEncoding / TransformerEncoderLayer / TransformerEncoder / PatchEmbedding
-//   compute_layer_gpt.hpp           GPTBlock / PositionEncoder 家族 / GPTModel
+//   compute_layer_gpt.hpp           GPTBlock / GPTModel
 //   compute_layer_zipt.hpp          CrossAttention / ZiPTBlock / ZiPTModel
 //   compute_layer_rapt.hpp          ReLULinearAttention / RAPTBlock / RAPTModel
 // ─────────────────────────────────────────────────────────────────────────
@@ -29,6 +31,7 @@
 #include "compute_layer_mlp.hpp"
 #include "compute_layer_conv.hpp"
 #include "compute_layer_softmax.hpp"
+#include "compute_position_encoding.hpp"
 #include "compute_layer_attention.hpp"
 #include "compute_layer_feedforward.hpp"
 #include "compute_layer_transformer.hpp"

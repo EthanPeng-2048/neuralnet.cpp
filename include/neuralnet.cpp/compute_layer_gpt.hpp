@@ -4,6 +4,7 @@
 #include "compute_layer_mlp.hpp"
 #include "compute_layer_feedforward.hpp"
 #include "compute_layer_attention.hpp"
+#include "compute_position_encoding.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -59,23 +60,19 @@ public:
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
-        auto r1 = self_attn_.init(engine); if (!r1) return std::unexpected(r1.error());
+        NN_TRY(r1, self_attn_.init(engine));
         if (norm1_) { auto r = norm1_->init(engine); if (!r) return std::unexpected(r.error()); }
-        auto r2 = ff_.init(engine); if (!r2) return std::unexpected(r2.error());
+        NN_TRY(r2, ff_.init(engine));
         if (norm2_) { auto r = norm2_->init(engine); if (!r) return std::unexpected(r.error()); }
         return {};
     }
 
     std::vector<TensorRef> parameters() override
     {
-        auto p = self_attn_.parameters();
-        auto n1 = norm1_->parameters();
-        auto f  = ff_.parameters();
-        auto n2 = norm2_->parameters();
-        p.insert(p.end(), n1.begin(), n1.end());
-        p.insert(p.end(), f.begin(), f.end());
-        p.insert(p.end(), n2.begin(), n2.end());
-        return p;
+        return collect_refs(self_attn_.parameters(),
+                            norm1_->parameters(),
+                            ff_.parameters(),
+                            norm2_->parameters());
     }
 
     // 文档感知：把每样本文档 id 转发给内部自注意力（用于块对角掩码）
@@ -86,14 +83,10 @@ public:
 
     std::vector<TensorRef> param_gradients() override
     {
-        auto g = self_attn_.param_gradients();
-        auto gn1 = norm1_->param_gradients();
-        auto gf  = ff_.param_gradients();
-        auto gn2 = norm2_->param_gradients();
-        g.insert(g.end(), gn1.begin(), gn1.end());
-        g.insert(g.end(), gf.begin(), gf.end());
-        g.insert(g.end(), gn2.begin(), gn2.end());
-        return g;
+        return collect_refs(self_attn_.param_gradients(),
+                            norm1_->param_gradients(),
+                            ff_.param_gradients(),
+                            norm2_->param_gradients());
     }
 
     // 梯度检查点：把模式传播给内部注意力/归一化/FFN
@@ -165,29 +158,13 @@ public:
         const Tensor& input) override
     {
         ComputeEngine& engine = engine_ref();
-        auto n1 = norm1_->forward(input);
-        if (!n1) return n1;
-
-        auto a = self_attn_.forward(*n1);
-        if (!a) return a;
-
-        auto r2 = dsl::compute(engine,
-            dsl::leaf(input) + dsl::leaf(*a),
-            input.rows(), input.cols(), p_.compute);
-        if (!r2) return std::unexpected(r2.error());
+        // 残差分支 1（Pre-Norm + 自注意力），与 TransformerEncoderLayer/RAPTBlock 同骨架
+        NN_TRY(r2, prenorm_residual_forward_(engine, input, *norm1_, self_attn_, p_.compute));
         Tensor res2 = std::move(*r2);
         if (!checkpoint_mode_)
             residual2_cache_ = res2;
-
-        auto n2 = norm2_->forward(res2);
-        if (!n2) return n2;
-
-        auto f = ff_.forward(*n2);
-        if (!f) return f;
-
-        return dsl::compute(engine,
-            dsl::leaf(res2) + dsl::leaf(*f),
-            res2.rows(), res2.cols(), p_.compute);
+        // 残差分支 2（Pre-Norm + FFN）
+        return prenorm_residual_forward_(engine, res2, *norm2_, ff_, p_.compute);
     }
 
     [[nodiscard]] Result<Tensor> backward(
@@ -197,28 +174,13 @@ public:
         // activation offload：从 host 恢复激活再反向（替代重计算）
         if (offloader_.offloaded())
         {
-            auto im = import_activations(engine);
-            if (!im) return std::unexpected(im.error());
+            NN_TRY(im, import_activations(engine));
         }
 
-        auto grad_ff = ff_.backward(grad_output);
-        if (!grad_ff) return grad_ff;
-        auto b_n2 = norm2_->backward(*grad_ff);
-        if (!b_n2) return b_n2;
-
-        auto grad_r1 = dsl::compute(engine,
-            dsl::leaf(grad_output) + dsl::leaf(*b_n2),
-            grad_output.rows(), grad_output.cols(), p_.compute);
-        if (!grad_r1) return std::unexpected(grad_r1.error());
-
-        auto b_sa = self_attn_.backward(*grad_r1);
-        if (!b_sa) return b_sa;
-        auto b_n1 = norm1_->backward(*b_sa);
-        if (!b_n1) return b_n1;
-
-        return dsl::compute(engine,
-            dsl::leaf(*grad_r1) + dsl::leaf(*b_n1),
-            grad_r1->rows(), grad_r1->cols(), p_.compute);
+        // 两处残差分流 + 子层正反向（与 TransformerEncoderLayer / RAPTBlock 同一骨架）
+        return prenorm_residual_backward_(engine, grad_output,
+                                          *norm1_, self_attn_, *norm2_, ff_,
+                                          p_.compute);
     }
 
     // ── 增量推理（KV cache）──────────────────────────────────────────
@@ -234,269 +196,23 @@ public:
         Tensor& v_cache,
         std::size_t cur_len)
     {
-        auto n1 = norm1_->forward(x_new);
-        if (!n1) return n1;
+        NN_TRY(n1, norm1_->forward(x_new));
 
-        auto a = self_attn_.forward_step(engine, *n1, k_cache, v_cache, cur_len);
-        if (!a) return a;
+        NN_TRY(a, self_attn_.forward_step(engine, *n1, k_cache, v_cache, cur_len));
 
         auto r2 = dsl::compute(engine,
             dsl::leaf(x_new) + dsl::leaf(*a),
             x_new.rows(), x_new.cols(), p_.compute);
-        if (!r2) return std::unexpected(r2.error());
+        NN_TRY_CHECK(r2);
 
-        auto n2 = norm2_->forward(*r2);
-        if (!n2) return n2;
+        NN_TRY(n2, norm2_->forward(*r2));
 
-        auto f = ff_.forward(*n2);
-        if (!f) return f;
+        NN_TRY(f, ff_.forward(*n2));
 
         return dsl::compute(engine,
             dsl::leaf(*r2) + dsl::leaf(*f),
             r2->rows(), r2->cols(), p_.compute);
     }
-};
-
-// ══════════════════════════════════════════════════════════════════════════
-// ══════════════════════════════════════════════════════════════════════════
-// PositionEncoder — 位置编码抽象基类
-//
-// 按 PosEncodingType 把位置编码逻辑（可学习 / 正弦波 / 无）组织为独立的多态
-// 层次，GPTModel 通过基类指针使用，不依赖标志位分支。
-//
-// 接口：
-//   - apply(engine, token_emb_T, batch, seq)   全量前向，返回已加位置信息的 x
-//   - apply_step(engine, x, pos)               增量单 token 前向
-//   - backward(grad_T, batch, seq)     累计位置梯度（仅可学习有意义）
-//   - parameters() / param_gradients()         可学习参数（仅 Learned 返回非空）
-//
-// 注意：ALiBi / RoPE 的位置信息由注意力层注入（CausalSelfAttention 线性偏置 /
-//        AttentionBase 的 RotaryEmbedding），故其编码器为 no-op。
-// ══════════════════════════════════════════════════════════════════════════
-class PositionEncoder
-{
-protected:
-    // 多精度（§9.2）：由 GPTModel 在注入自身 profile 时一并下传（否则位置
-    // 编码 / 正弦表的 DSL 求值退回 F32，f16 配置下静默丢失存储收益）。
-    // 本类是辅助对象（非 Layer），故单独提供同名 setter。
-    PrecisionProfile p_;
-
-public:
-    virtual ~PositionEncoder() = default;
-
-    void set_precision_profile(const PrecisionProfile& p) { p_ = p; }
-    [[nodiscard]] const PrecisionProfile& precision_profile() const noexcept { return p_; }
-
-    // 全量前向：token_emb_T 为 (d_model, batch*seq)，返回 x = token_emb_T (+ pos_emb)
-    [[nodiscard]] virtual Result<Tensor> apply(
-        ComputeEngine& engine, const Tensor& token_emb_T,
-        std::size_t batch, std::size_t seq) = 0;
-
-    // 增量前向：x 为 (d_model, 1)，返回 x + pos_emb[pos]
-    [[nodiscard]] virtual Result<Tensor> apply_step(
-        ComputeEngine& engine, const Tensor& x, std::size_t pos) = 0;
-
-    // 反向：累计位置梯度到 grad_pos_emb_（默认 no-op）
-    // （PositionEncoder 是**辅助对象、非 Layer**——M6 段 C 只删 Layer 四个虚接口的
-    //   engine 形参，位置编码器/RoPE 这类辅助函数保留 engine 形参，17 §8 交接）
-    [[nodiscard]] virtual Result<void> backward(
-        ComputeEngine& engine, const Tensor& grad_T,
-        std::size_t batch, std::size_t seq) = 0;
-
-    // 初始化（引擎相关操作，如创建张量等）
-    [[nodiscard]] virtual Result<void> init(ComputeEngine& /*engine*/) { return {}; }
-
-    [[nodiscard]] virtual std::vector<TensorRef> parameters() { return {}; }
-    [[nodiscard]] virtual std::vector<TensorRef> param_gradients() { return {}; }
-};
-
-// 加性位置编码基类（Learned / Sinusoidal 共用）：
-// 通过 pos_emb_ 张量按位置 gather 并加到 token 嵌入上。
-class AdditivePositionEncoder : public PositionEncoder
-{
-protected:
-    bool learnable_ = false;
-
-    Tensor pos_emb_;        // (seq_len, d_model)
-    Tensor grad_pos_emb_;   // (seq_len, d_model)，仅 learnable_ 有效
-
-    // pos_indices 缓存（避免每 step 重建）— (total, 1) 值为 [0,..,0,1,..,1,...,seq-1,..]
-    Tensor pos_indices_cache_;
-    std::size_t pos_indices_batch_ = 0;  // 缓存键：batch_size
-    std::size_t pos_indices_seq_ = 0;    // 缓存键：seq_len
-
-    // 用给定的位置编码张量初始化 pos_emb_（learnable 时额外分配梯度）。
-    // M2：入参由 Matrix 改为 Tensor——调用方经引擎创建（InitSpec 填数或
-    // from_matrix 宿主公式），本函数只负责装配与梯度缓冲。
-    [[nodiscard]] Result<void> init_(ComputeEngine& engine, Tensor&& pe, bool learnable)
-    {
-        const std::size_t rows = pe.rows();
-        const std::size_t cols = pe.cols();
-        learnable_ = learnable;
-        pos_emb_ = std::move(pe);
-        if (!pos_emb_.valid())
-            return std::unexpected(Error{"PositionEncoder: 位置编码创建失败"});
-        if (learnable_)
-        {
-            grad_pos_emb_ = engine.create_tensor(rows, cols, p_.param, InitSpec::zero());
-            if (!grad_pos_emb_.valid())
-                return std::unexpected(Error{"PositionEncoder: 梯度缓冲初始化失败"});
-        }
-        return {};
-    }
-
-    // 确保 pos_indices 缓存有效（batch-major：i = b*seq + t → position=t）
-    [[nodiscard]] Result<void> ensure_pos_indices_(
-        ComputeEngine& engine, std::size_t batch, std::size_t seq)
-    {
-        if (pos_indices_batch_ == batch && pos_indices_seq_ == seq)
-            return {};
-        std::vector<Scalar> pidx(batch * seq);        // 宿主桥（17 §3 D11）：不经 Matrix
-        for (std::size_t b = 0; b < batch; ++b)
-            for (std::size_t t = 0; t < seq; ++t)
-                pidx[b * seq + t] = static_cast<Scalar>(t);
-        auto pidx_t = detail::upload_span(engine, batch * seq, 1, Precision::F32,
-                                          std::span(pidx));
-        if (!pidx_t) return std::unexpected(pidx_t.error());
-        pos_indices_cache_ = std::move(*pidx_t);
-        pos_indices_batch_ = batch;
-        pos_indices_seq_ = seq;
-        return {};
-    }
-
-public:
-    AdditivePositionEncoder() = default;
-
-    [[nodiscard]] bool learnable() const noexcept { return learnable_; }
-
-    [[nodiscard]] Result<Tensor> apply(
-        ComputeEngine& engine, const Tensor& token_emb_T,
-        std::size_t batch, std::size_t seq) override
-    {
-        auto ci = ensure_pos_indices_(engine, batch, seq);
-        if (!ci) return std::unexpected(ci.error());
-        auto pos_gathered = engine.gather_rows(pos_emb_, pos_indices_cache_);
-        if (!pos_gathered) return std::unexpected(pos_gathered.error());
-        auto pos_T = engine.transpose(*pos_gathered);
-        if (!pos_T) return std::unexpected(pos_T.error());
-        auto x_with_pos = dsl::compute(engine,
-            dsl::leaf(token_emb_T) + dsl::leaf(*pos_T),
-            token_emb_T.rows(), token_emb_T.cols(), p_.compute);
-        if (!x_with_pos) return std::unexpected(x_with_pos.error());
-        return std::move(*x_with_pos);
-    }
-
-    [[nodiscard]] Result<Tensor> apply_step(
-        ComputeEngine& engine, const Tensor& x, std::size_t pos) override
-    {
-        std::vector<Scalar> pos_v(1);                 // 宿主桥（17 §3 D11）
-        pos_v[0] = static_cast<Scalar>(pos);
-        auto pos_t = detail::upload_span(engine, 1, 1, Precision::F32, std::span(pos_v));
-        if (!pos_t) return std::unexpected(pos_t.error());
-        auto pos_emb_g = engine.gather_rows(pos_emb_, *pos_t);
-        if (!pos_emb_g) return std::unexpected(pos_emb_g.error());
-        auto pos_T = engine.transpose(*pos_emb_g);
-        if (!pos_T) return std::unexpected(pos_T.error());
-        auto x_wp = dsl::compute(engine,
-            dsl::leaf(x) + dsl::leaf(*pos_T),
-            x.rows(), x.cols(), p_.compute);
-        if (!x_wp) return std::unexpected(x_wp.error());
-        return std::move(*x_wp);
-    }
-
-    [[nodiscard]] Result<void> backward(
-        ComputeEngine& engine, const Tensor& grad_T,
-        std::size_t /*batch*/, std::size_t /*seq*/) override
-    {
-        if (!learnable_) return {};
-        // pos_indices 缓存由 apply() 建立，backward 直接复用（batch/seq 一致）。
-        auto pr = engine.scatter_add_rows(grad_pos_emb_, pos_indices_cache_, grad_T);
-        if (!pr) return std::unexpected(pr.error());
-        return {};
-    }
-
-    [[nodiscard]] std::vector<TensorRef> parameters() override
-    {
-        if (!learnable_) return {};
-        return { pos_emb_ };
-    }
-    [[nodiscard]] std::vector<TensorRef> param_gradients() override
-    {
-        if (!learnable_) return {};
-        return { grad_pos_emb_ };
-    }
-};
-
-// 可学习位置编码（GPT 默认）：N(0, 0.02) 随机初始化。
-// 与 token_emb_ 共享同一 rng 序列，保证跨 run 可复现。
-class LearnedPositionEncoder final : public AdditivePositionEncoder
-{
-    std::size_t d_model_;
-    std::size_t seq_len_;
-
-public:
-    LearnedPositionEncoder(std::size_t d_model, std::size_t seq_len)
-        : d_model_(d_model), seq_len_(seq_len) {}
-
-    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
-    {
-        // N(0, 0.02) 随机初始化——M2 声明式：层算分布参数、引擎填数，
-        // 分布 seed 显式传（U1）；不再自持 RNG。
-        auto pe = engine.create_tensor(seq_len_, d_model_, p_.param,
-                                       InitSpec::normal(0, 0.02, kInitSeed));
-        if (!pe.valid())
-            return std::unexpected(Error{"LearnedPositionEncoder: 初始化失败"});
-        return init_(engine, std::move(pe), /*learnable=*/true);
-    }
-};
-
-// 正弦波固定位置编码（冻结，不参与训练）：
-//   PE(pos, 2i) = sin(pos/10000^(2i/d)), PE(pos, 2i+1) = cos(...)
-class SinusoidalPositionEncoder final : public AdditivePositionEncoder
-{
-    std::size_t d_model_;
-    std::size_t seq_len_;
-
-public:
-    SinusoidalPositionEncoder(std::size_t d_model, std::size_t seq_len)
-        : d_model_(d_model), seq_len_(seq_len) {}
-
-    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
-    {
-        std::vector<Scalar> pe(seq_len_ * d_model_);   // 宿主桥（17 §3 D11）
-        for (std::size_t pos = 0; pos < seq_len_; ++pos)
-            for (std::size_t i = 0; i < d_model_; ++i)
-            {
-                Scalar angle = static_cast<Scalar>(pos) /
-                    std::pow(Scalar{10000}, static_cast<Scalar>(2 * (i / 2)) / static_cast<Scalar>(d_model_));
-                pe[pos * d_model_ + i] = (i % 2 == 0) ? std::sin(angle) : std::cos(angle);
-            }
-        // 闭式公式（非分布/常数）仍宿主计算 → span 上传进引擎（M2 裁定：InitSpec
-        // 只收分布与常数初始化；公式数据自 M4 起经 detail::upload_span，不经 Matrix）
-        auto pe_t = detail::upload_span(engine, seq_len_, d_model_, p_.param,
-                                        std::span(pe));
-        if (!pe_t) return std::unexpected(pe_t.error());
-        return init_(engine, std::move(*pe_t), /*learnable=*/false);
-    }
-};
-
-// 无位置编码（ALiBi / RoPE）：位置信息由注意力层注入，此处为 no-op。
-class NoPositionEncoder final : public PositionEncoder
-{
-public:
-    [[nodiscard]] Result<Tensor> apply(
-        ComputeEngine& /*engine*/, const Tensor& token_emb_T,
-        std::size_t /*batch*/, std::size_t /*seq*/) override
-    { return token_emb_T; }
-
-    [[nodiscard]] Result<Tensor> apply_step(
-        ComputeEngine& /*engine*/, const Tensor& x, std::size_t /*pos*/) override
-    { return x; }
-
-    [[nodiscard]] Result<void> backward(
-        ComputeEngine& /*engine*/, const Tensor& /*grad_T*/,
-        std::size_t /*batch*/, std::size_t /*seq*/) override
-    { return {}; }
 };
 
 // GPTModel — Decoder-only Transformer 语言模型
@@ -579,29 +295,22 @@ public:
             lm_head_.set_precision_profile(head_prof);
         }
 
+        // ── 位置编码器（**嵌入侧**）：模型只负责"加到 token 嵌入上"那一半 ────
+        // Learned / Sinusoidal 在此实做；RoPE / ALiBi 映射为恒等策略——它们的
+        // 注入点在注意力层（Q/K 旋转 / 分数偏置），由 CausalSelfAttention
+        // **自持**（经 make_attention_position_encoder），模型不再下发。
+        pos_encoder_ = make_embedding_position_encoder(pos_enc_type, d_model, seq_len);
+
         blocks_.reserve(num_layers);
         for (std::size_t i = 0; i < num_layers; ++i)
+        {
             blocks_.emplace_back(d_model, num_heads, d_ff, seq_len, seq_len,
                                  pos_enc_type, activation, norm_type, precision);
-
-        // 初始化位置编码器（Learned / Sinusoidal / ALiBi / RoPE）
-        switch (pos_enc_type)
-        {
-            case PosEncodingType::Learned:
-                pos_encoder_ = std::make_unique<LearnedPositionEncoder>(
-                    d_model, seq_len);
-                break;
-            case PosEncodingType::Sinusoidal:
-                pos_encoder_ = std::make_unique<SinusoidalPositionEncoder>(
-                    d_model, seq_len);
-                break;
-            default:  // ALiBi / RoPE：位置信息由注意力层注入
-                pos_encoder_ = std::make_unique<NoPositionEncoder>();
-                break;
         }
+
         // 位置编码器是辅助对象（非 Layer）→ profile 需单独下传：
         // 否则其内部 DSL 求值（gather→transpose→加性融合）退回 F32。
-        if (pos_encoder_) pos_encoder_->set_precision_profile(precision);
+        pos_encoder_->set_precision_profile(precision);
     }
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
@@ -620,18 +329,15 @@ public:
         // 初始化子层
         if (pos_encoder_)
         {
-            auto r = pos_encoder_->init(engine);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY(r, pos_encoder_->init(engine));
         }
         for (auto& block : blocks_)
         {
-            auto r = block.init(engine);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY(r, block.init(engine));
         }
         if (ln_f_)
         {
-            auto r = ln_f_->init(engine);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY(r, ln_f_->init(engine));
         }
         { auto r = lm_head_.init(engine); if (!r) return std::unexpected(r.error()); }
         return {};
@@ -639,38 +345,20 @@ public:
 
     std::vector<TensorRef> parameters() override
     {
-        std::vector<TensorRef> p;
-        p.push_back(token_emb_);
-        auto pp = pos_encoder_->parameters();
-        p.insert(p.end(), pp.begin(), pp.end());
-        for (auto& b : blocks_)
-        {
-            auto bp = b.parameters();
-            p.insert(p.end(), bp.begin(), bp.end());
-        }
-        auto lp = ln_f_->parameters();
-        p.insert(p.end(), lp.begin(), lp.end());
-        auto hp = lm_head_.parameters();
-        p.insert(p.end(), hp.begin(), hp.end());
-        return p;
+        return collect_refs(token_emb_,
+                            pos_encoder_->parameters(),
+                            collect_block_refs_(blocks_, &GPTBlock::parameters),
+                            ln_f_->parameters(),
+                            lm_head_.parameters());
     }
 
     std::vector<TensorRef> param_gradients() override
     {
-        std::vector<TensorRef> g;
-        g.push_back(grad_token_emb_);
-        auto gp = pos_encoder_->param_gradients();
-        g.insert(g.end(), gp.begin(), gp.end());
-        for (auto& b : blocks_)
-        {
-            auto bg = b.param_gradients();
-            g.insert(g.end(), bg.begin(), bg.end());
-        }
-        auto lg = ln_f_->param_gradients();
-        g.insert(g.end(), lg.begin(), lg.end());
-        auto hg = lm_head_.param_gradients();
-        g.insert(g.end(), hg.begin(), hg.end());
-        return g;
+        return collect_refs(grad_token_emb_,
+                            pos_encoder_->param_gradients(),
+                            collect_block_refs_(blocks_, &GPTBlock::param_gradients),
+                            ln_f_->param_gradients(),
+                            lm_head_.param_gradients());
     }
 
     // 文档感知：设置当前 step 每样本文档 id（batch-major b*seq+t → doc id）。
@@ -692,27 +380,23 @@ public:
         // 假定扁平列为 batch-major（b*seq + t）。因此先把输入 (seq, batch) 转置为
         // (batch, seq)，使 gather_rows 的 flat 序即为 batch-major：i = b*seq + t。
         auto input_T = engine.transpose(input);   // (batch, seq)，flat 索引 = b*seq+t
-        if (!input_T) return std::unexpected(input_T.error());
+        NN_TRY_CHECK(input_T);
 
         // gather_rows(token_emb_, input_T) → (batch*seq, d_model)
         //   row i = token_emb[input_T[i]], i 是 batch-major 索引 b*seq+t
-        auto all_emb = engine.gather_rows(token_emb_, *input_T);
-        if (!all_emb) return std::unexpected(all_emb.error());
+        NN_TRY(all_emb, engine.gather_rows(token_emb_, *input_T));
 
         // ── 2. 保存 token IDs 的 Tensor 拷贝（供 backward 的 scatter_add_rows） ──
         // 用 batch-major 序的 input_T，使 scatter 行号与 grad_T（transpose(grad_x)）对齐。
         // 全程 GPU：clone 在 GPU 内执行，无 PCIe 传输
-        auto st_t = engine.clone(*input_T);
-        if (!st_t) return std::unexpected(st_t.error());
+        NN_TRY(st_t, engine.clone(*input_T));
         stored_tokens_tensor_ = std::move(*st_t);
 
         // ── 3. 构造 x: (d_model, batch*seq)（batch-major 列序） ──
-        auto all_T = engine.transpose(*all_emb);
-        if (!all_T) return std::unexpected(all_T.error());
+        NN_TRY(all_T, engine.transpose(*all_emb));
 
         // ── 3. 施加位置编码（Learned/Sinusoidal 相加；ALiBi/RoPE 为 no-op） ──
-        auto x_result = pos_encoder_->apply(engine, *all_T, batch_size_, seq_len);
-        if (!x_result) return std::unexpected(x_result.error());
+        NN_TRY(x_result, pos_encoder_->apply(engine, *all_T, batch_size_, seq_len));
         // ── 4. 通过 Transformer 块（全批量化，无 per-sample 循环） ──
         Tensor x = std::move(*x_result);
         checkpoint_inputs_.clear();
@@ -725,8 +409,7 @@ public:
             // 该块及其子层以 checkpoint 模式运行（不驻留中间激活）
             if (ckpt && (bi % checkpoint_every_ == 0))
             {
-                auto save = engine.clone(x);
-                if (!save) return std::unexpected(save.error());
+                NN_TRY(save, engine.clone(x));
                 checkpoint_inputs_.push_back(std::move(*save));
                 blocks_[bi].set_checkpoint_mode(true);
             }
@@ -734,8 +417,7 @@ public:
             {
                 blocks_[bi].set_checkpoint_mode(false);
             }
-            auto r = blocks_[bi].forward(x);
-            if (!r) return r;
+            NN_TRY(r, blocks_[bi].forward(x));
             x = std::move(*r);
             // activation offload：forward 后把本块内部激活搬 host-visible，释放 GPU 显存。
             // 混合模式（offload + checkpoint 共存）：checkpoint 块 forward 不驻留激活
@@ -743,20 +425,17 @@ public:
             // 空 slab 而失败）；非 checkpoint 块才导出。
             if (activation_offload_ && !blocks_[bi].checkpoint_mode())
             {
-                auto ex = blocks_[bi].export_activations(engine);
-                if (!ex) return std::unexpected(ex.error());
+                NN_TRY(ex, blocks_[bi].export_activations(engine));
             }
             // 按间隔 flush，将大录制拆分为多个小提交（防 TDR）
             if (flush_interval_ > 0 && (bi + 1) % flush_interval_ == 0 && bi + 1 < blocks_.size())
             {
-                auto fr = engine.flush_batch();
-                if (!fr) return std::unexpected(fr.error());
+                NN_TRY(fr, engine.flush_batch());
             }
         }
 
         // ── 5. 最终 LayerNorm/RMSNorm ──
-        auto ln = ln_f_->forward(x);
-        if (!ln) return ln;
+        NN_TRY(ln, ln_f_->forward(x));
         x = std::move(*ln);
 
         // ── 6. LM Head → (vocab_size, seq*batch) batch-major ──
@@ -778,13 +457,11 @@ public:
         // (void)engine.zero(grad_token_emb_);
 
         // ── 1. LM Head 反向 → (d_model, seq*batch) ──
-        auto b_lm = lm_head_.backward(grad_output);
-        if (!b_lm) return b_lm;
+        NN_TRY(b_lm, lm_head_.backward(grad_output));
         Tensor grad_x = std::move(*b_lm);
 
         // ── 2. LayerNorm/RMSNorm 反向 ──
-        auto b_ln = ln_f_->backward(grad_x);
-        if (!b_ln) return b_ln;
+        NN_TRY(b_ln, ln_f_->backward(grad_x));
         grad_x = std::move(*b_ln);
 
         // ── 3. 逐块反向（全批量化） ──
@@ -799,11 +476,9 @@ public:
                     const std::size_t seg = idx / checkpoint_every_;
                     NN_ASSERT(seg < checkpoint_inputs_.size(),
                               "GPTModel backward: checkpoint input missing");
-                    auto cr = blocks_[idx].forward_recompute(checkpoint_inputs_[seg]);
-                    if (!cr) return cr;
+                    NN_TRY(cr, blocks_[idx].forward_recompute(checkpoint_inputs_[seg]));
                 }
-                auto br = blocks_[idx].backward(grad_x);
-                if (!br) return br;
+                NN_TRY(br, blocks_[idx].backward(grad_x));
                 grad_x = std::move(*br);
                 // 显存：backward 后**立即释放该块已消费的激活缓存**——否则每块
                 // 激活会驻留到整个 backward 结束（探针实测为 backward 段峰值
@@ -812,8 +487,7 @@ public:
                 blocks_[idx].clear_cache();
                 if (flush_interval_ > 0 && (bi + 1) % flush_interval_ == 0 && bi + 1 < n)
                 {
-                    auto fr = engine.flush_batch();
-                    if (!fr) return std::unexpected(fr.error());
+                    NN_TRY(fr, engine.flush_batch());
                 }
             }
         }
@@ -824,16 +498,13 @@ public:
         // ── 4. 转置 grad_x + pos_grad GPU 计算 ──
         //   grad_x: (d_model, batch*seq)（batch-major 列序）
         //   grad_T = transpose(grad_x) → (total, d_model) — 用于 scatter_add_rows
-        auto grad_T = engine.transpose(grad_x);
-        if (!grad_T) return std::unexpected(grad_T.error());
+        NN_TRY(grad_T, engine.transpose(grad_x));
 
         // 位置编码反向（Learned 累计 grad_pos_emb_；Sinusoidal/ALiBi/RoPE no-op）
-        auto pr = pos_encoder_->backward(engine, *grad_T, batch_size_, seq_len_);
-        if (!pr) return std::unexpected(pr.error());
+        NN_TRY(pr, pos_encoder_->backward(engine, *grad_T, batch_size_, seq_len_));
 
         // ── 5. scatter_add_rows: grad_token_emb_[tokens] += grad_T ──
-        auto sr = engine.scatter_add_rows(grad_token_emb_, stored_tokens_tensor_, *grad_T);
-        if (!sr) return std::unexpected(sr.error());
+        NN_TRY(sr, engine.scatter_add_rows(grad_token_emb_, stored_tokens_tensor_, *grad_T));
 
         // grad_input: token IDs 无梯度，返回零张量（仅用于接口一致性）
         Tensor grad_input = engine.create_tensor(seq_len, batch_size_, Precision::F32,
@@ -905,16 +576,12 @@ public:
         // 1. token embedding 查表 → (1, d_model) → transpose → (d_model, 1)
         std::vector<Scalar> id_v(1);                  // 宿主桥（17 §3 D11）
         id_v[0] = static_cast<Scalar>(token_id);
-        auto id_t = detail::upload_span(engine, 1, 1, Precision::F32, std::span(id_v));
-        if (!id_t) return std::unexpected(id_t.error());
-        auto emb = engine.gather_rows(token_emb_, *id_t);
-        if (!emb) return std::unexpected(emb.error());
-        auto x_new = engine.transpose(*emb);
-        if (!x_new) return std::unexpected(x_new.error());
+        NN_TRY(id_t, detail::upload_span(engine, 1, 1, Precision::F32, std::span(id_v)));
+        NN_TRY(emb, engine.gather_rows(token_emb_, *id_t));
+        NN_TRY(x_new, engine.transpose(*emb));
 
         // 2. 位置编码（Learned/Sinusoidal 相加；ALiBi/RoPE no-op）
-        auto x_wp = pos_encoder_->apply_step(engine, *x_new, pos);
-        if (!x_wp) return std::unexpected(x_wp.error());
+        NN_TRY(x_wp, pos_encoder_->apply_step(engine, *x_new, pos));
         x_new = std::move(*x_wp);
 
         // 3. 逐块增量前向
@@ -923,20 +590,18 @@ public:
         {
             auto r = blocks_[i].forward_step(
                 engine, x, k_caches[i], v_caches[i], cur_len);
-            if (!r) return r;
+            NN_TRY_CHECK(r);
             x = std::move(*r);
             // 按 flush_interval 拆分提交（防 TDR）
             if (flush_interval_ > 0 &&
                 (i + 1) % flush_interval_ == 0 && i + 1 < blocks_.size())
             {
-                auto fr = engine.flush_batch();
-                if (!fr) return std::unexpected(fr.error());
+                NN_TRY(fr, engine.flush_batch());
             }
         }
 
         // 4. 最终 LayerNorm + LM Head → (vocab_size, 1)
-        auto ln = ln_f_->forward(x);
-        if (!ln) return ln;
+        NN_TRY(ln, ln_f_->forward(x));
         return lm_head_.forward(*ln);
     }
 
@@ -988,8 +653,7 @@ public:
         // 且内部按 flush_interval_ 调用 flush_batch 防 TDR。
         auto fill_cache_ = [&](std::size_t start) -> Result<void>
         {
-            auto br = engine.begin_batch();
-            if (!br) return std::unexpected(br.error());
+            NN_TRY(br, engine.begin_batch());
             for (std::size_t i = start; i < context.size(); ++i)
             {
                 auto r = forward_step(engine, context[i], cur_len,
@@ -1002,14 +666,12 @@ public:
                 last_logits_t = *r;
                 ++cur_len;
             }
-            auto er = engine.end_batch();
-            if (!er) return std::unexpected(er.error());
+            NN_TRY(er, engine.end_batch());
             return {};
         };
 
         {
-            auto r = fill_cache_(start_init);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY(r, fill_cache_(start_init));
         }
 
         for (std::size_t step = 0; step < max_new_tokens; ++step)
@@ -1022,56 +684,20 @@ public:
                 cur_len = 0;
                 const std::size_t keep = seq_len_ - 1;
                 const std::size_t start_new = (context.size() > keep) ? (context.size() - keep) : 0;
-                auto r = fill_cache_(start_new);
-                if (!r) return std::unexpected(r.error());
+                NN_TRY(r, fill_cache_(start_new));
             }
 
             // Sample from last_logits_t (from prefill or previous step)
             auto logits_v = detail::download_vector(engine, last_logits_t);  // 宿主桥
-            if (!logits_v) return std::unexpected(logits_v.error());
+            NN_TRY_CHECK(logits_v);
 
             std::vector<Scalar> last_logits(vocab_size_);
             for (std::size_t v = 0; v < vocab_size_; ++v)
                 last_logits[v] = (*logits_v)[v];
 
-            // temperature
-            if (temperature > 0.0 && temperature != 1.0)
-                for (auto& v : last_logits) v /= temperature;
-
-            // softmax（数值稳定）
-            Scalar max_val = last_logits[0];
-            for (std::size_t v = 1; v < vocab_size_; ++v)
-                max_val = std::max(max_val, last_logits[v]);
-            Scalar sum_exp = 0.0;
-            for (auto& v : last_logits)
-            {
-                v = std::exp(v - max_val);
-                sum_exp += v;
-            }
-            for (auto& v : last_logits) v /= sum_exp;
-
-            // 采样
-            // temperature > 0: 随机采样（temperature 仅影响缩放，1.0 = 不缩放但仍然采样）
-            // temperature == 0: 贪心解码（argmax）
-            std::size_t next_token;
-            if (temperature > 0.0)
-            {
-                Scalar r = dist(rng);
-                Scalar cumulative = 0.0;
-                next_token = vocab_size_ - 1;
-                for (std::size_t v = 0; v < vocab_size_; ++v)
-                {
-                    cumulative += last_logits[v];
-                    if (r <= cumulative) { next_token = v; break; }
-                }
-            }
-            else
-            {
-                next_token = 0;
-                Scalar best = last_logits[0];
-                for (std::size_t v = 1; v < vocab_size_; ++v)
-                    if (last_logits[v] > best) { best = last_logits[v]; next_token = v; }
-            }
+            // temperature → softmax → 采样/贪心（三模型共用的采样器）
+            const std::size_t next_token =
+                sample_next_token_(last_logits, temperature, rng, dist);
 
             context.push_back(next_token);
 
@@ -1081,15 +707,13 @@ public:
             generated.push_back(next_token);
 
             // Run forward_step for next_token to write KV cache and get new logits
-            auto br = engine.begin_batch();
-            if (!br) return std::unexpected(br.error());
+            NN_TRY(br, engine.begin_batch());
 
             auto logits_res = forward_step(engine, next_token, cur_len,
                                            k_caches, v_caches, cur_len);
-            if (!logits_res) return std::unexpected(logits_res.error());
+            NN_TRY_CHECK(logits_res);
 
-            auto er = engine.end_batch();
-            if (!er) return std::unexpected(er.error());
+            NN_TRY(er, engine.end_batch());
 
             last_logits_t = std::move(*logits_res);
             ++cur_len;
@@ -1110,14 +734,12 @@ public:
     if (a.rows() != b.rows())
         return std::unexpected(Error{"concat_cols: row count mismatch"});
     auto aT = engine.transpose(a);   // (c1, rows)
-    if (!aT) return std::unexpected(aT.error());
+    NN_TRY_CHECK(aT);
     auto bT = engine.transpose(b);   // (c2, rows)
-    if (!bT) return std::unexpected(bT.error());
+    NN_TRY_CHECK(bT);
     Tensor dstT = engine.create_tensor(a.cols() + b.cols(), a.rows(), a.precision());
-    auto r1 = engine.insert_rows(dstT, 0, *aT);
-    if (!r1) return std::unexpected(r1.error());
-    auto r2 = engine.insert_rows(dstT, a.cols(), *bT);
-    if (!r2) return std::unexpected(r2.error());
+    NN_TRY(r1, engine.insert_rows(dstT, 0, *aT));
+    NN_TRY(r2, engine.insert_rows(dstT, a.cols(), *bT));
     return engine.transpose(dstT);
 }
 } // namespace nn

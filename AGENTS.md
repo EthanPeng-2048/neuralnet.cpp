@@ -31,6 +31,7 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 | 任务 | 文件 |
 |------|------|
 | 加/改神经网络层（Linear/Attention/Norm/激活…） | `compute_layer.hpp`（聚合头）+ `compute_layer_{base,mlp,conv,softmax,attention,feedforward,transformer,gpt,zipt,rapt}.hpp` |
+| 加/改位置编码（Learned/Sinusoidal/RoPE/ALiBi/无） | `compute_position_encoding.hpp`（`PositionEncoder` 基类 + 子类 + 按注入点分开的两个工厂）+ `compute_layer_attention.hpp` 的 `AttnScoreMask` 族（掩码语义） |
 | 加/改损失函数 | `compute_loss.hpp` |
 | 加/改优化器（SGD/Adam/AdamW/Muon） | `compute_optimizer.hpp` |
 | 加/改引擎原语（CPU 实现） | `compute_engine.hpp`（接口）+ `compute_cpu_engine.hpp` |
@@ -44,7 +45,7 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 | MNIST / GPT / CNN / RLA / ZiPT / 分词器 模型工厂 | `domain_mnist.hpp` / `domain_gpt.hpp` / `domain_cnn.hpp` / `domain_rla.hpp` / `domain_zipt.hpp` / `domain_tokenizer{,_base,_bpe,_charbpe}.hpp` |
 | 训练/推理 CLI 入口 | `src/mnist_train.cpp` 等；公共 CLI 逻辑在 `include/neuralnet.cpp/cli/` |
 | 构建期工具（AOT 融合） | `tools/scan_exprs.cpp` / `tools/gen_fused.cpp`（另有 `tools/decode_fused.py` 调试用） |
-| 批量改写 / 一致性审计（改多处时用，均带 `-DryRun`） | `tools/edit_ranges.ps1`（行区间删除：四重断言 + **花括号平衡护栏**）/ `tools/test_refactor.ps1`（删定义块 / 插 include / 正则替换）/ `tools/doc_rename.ps1`（文档词法改名）/ `bench/doc_align_audit.ps1`（文档↔代码对齐审计：文件/符号/CLI/数字/测试名）/ `bench/doc_inventory.ps1`（引擎接口盘点 + **第 [4] 节 L2+ 分层审计：`Matrix`/Matrix 型 I/O 动词零命中门禁，铁律 #12**） |
+| 批量改写 / 一致性审计（改多处时用，均带 `-DryRun`） | `tools/edit_ranges.ps1`（行区间删除：四重断言 + **花括号平衡护栏**）/ `tools/test_refactor.ps1`（删定义块 / 插 include / 正则替换）/ `tools/apply_nn_try.ps1`（`auto X = f(); if (!X) …` → `NN_TRY`/`NN_TRY_CHECK`，L2 层，带 `-DryRun` 计数）/ `tools/doc_rename.ps1`（文档词法改名）/ `bench/doc_align_audit.ps1`（文档↔代码对齐审计：文件/符号/CLI/数字/测试名）/ `bench/doc_inventory.ps1`（引擎接口盘点 + **第 [4] 节 L2+ 分层审计：`Matrix`/Matrix 型 I/O 动词零命中门禁，铁律 #12**） |
 | 与 PyTorch 对拍 | `compare_with_torch/`（model.py / text_train.py / text_infer.py） |
 
 ## 4. 分层架构（L0→L5，严格单向依赖，上层只依赖下层公有接口）
@@ -146,7 +147,7 @@ Matrix → engine.from_matrix → Tensor[GPU] → forward/loss/optimizer 全程�
 
 ## 5. 铁律（违反必出 bug）
 
-1. **禁止 throw/try/catch**：编译期 `-fno-exceptions` 强制。错误一律 `Result<T> = std::expected<T, Error>`（`core_errors.hpp`），调用方 `if (!r) return std::unexpected(...)` 传播。
+1. **禁止 throw/try/catch**：编译期 `-fno-exceptions` 强制。错误一律 `Result<T> = std::expected<T, Error>`（`core_errors.hpp`）。**传播写法统一走 `NN_TRY(decl, expr)` / `NN_TRY_CHECK(x)`**（L2 层 494 处已收敛，见 `core_errors.hpp` 宏注释）——展开后与手写 `auto r = expr; if (!r) return std::unexpected(r.error());` 逐字等价；新代码请沿用该形态。
 2. **禁止 new/delete/裸指针所有权**：`std::vector` / `std::unique_ptr` / `std::span`。
 3. **分层职责单一**：Matrix（L1）不写神经网络算法；Layer（L2）不写底层计算；原语 shader 永不含算法（ReLU/Softmax/Attention 等一律来自 Layer 或 DSL）。
 4. **不穿透接口**：上层不访问下层内部数据结构（`.data()` 等），改一个模块只改一个头文件。
@@ -174,7 +175,7 @@ GPT 序列展平: 列序 i = b*seq + t（batch-major，全局唯一约定）
 
 - Layer 内用 `nn::dsl`（`expr_dsl.hpp`）写普通数学表达式；CPU 编译期模板直接求值（内联+SIMD），GPU 折叠成 `ExprSpec`（扁平 IR，`expr_spec.hpp`）→ 按 key 查预编译融合 shader。
 - 主要入口：`dsl::compute(engine, expr, rows, cols)`（一行表达式，最常用——**必带输出形状**，没有 2 参重载）；把结果写进既有张量（原地更新，零分配）用 `dsl::compute_into(engine, expr, dst)`；归约语义用 `dsl::compute_reduce`。**跨表达式融合（IR-C：`start_expr/end_expr`、`begin_expr/end_expr`、`expr_graph.hpp`）未采用**，当前没有任何跨表达式录制机制——取舍记录与重新立项前提见 `docs/development/03-ir-optimization.md` §5.3。分组归约（MaxPool 窗口等）用 `dsl::grouped_reduce_sum/max(tensor, R)` 视图（R 进 key）；**alpha 缩放**写成 `dsl::matmul(..., batch) * dsl::rparam(alpha)` 尾链（rparam 值不进 key）。
-- **fold 段（P-C1/C2）**：`ExprSpec.fold = FoldSpec`（分块状态归约：键域逐块 body + 行标量态跨块进位 + `vecacc` 行向量态块累加 + 向量域 finalize）——**通用折叠表达式机制，不含任何注意力专属语义**（与注意力无关的通用样例 rowmax/rowsum/softmax_denom 在 `expr_fold.hpp`）。注意力 forward 直调 `engine.eval_expr(make_fold_attn_o(...))`（**不经 DSL 钩子——scan 显式登记块是 fold spec 唯一注册来源**）；该构造与 5 掩码变体 `FoldAttnMask`（Plain/Causal/Alibi/Doc/AlibiDoc，漏登记即 GPU 闭合世界硬报错）**定义在 `compute_layer_attention.hpp`**（按 AOT 原则"表达式文本只出现在 Layer"归位）；`FoldSpec.tri_skip`（行界整块跳过）进 key（codegen 分歧点）；`EXPR_FOLD_BLOCK=128`/`EXPR_FOLD_ROWS_PER_WG=2` 为 CPU/GPU 共享常量（改则两侧同改）。详见 `expr_fold.hpp` 与 `expr_spec.hpp` 的 FoldSpec 注释。
+- **fold 段（P-C1/C2）**：`ExprSpec.fold = FoldSpec`（分块状态归约：键域逐块 body + 行标量态跨块进位 + `vecacc` 行向量态块累加 + 向量域 finalize）——**通用折叠表达式机制，不含任何注意力专属语义**（与注意力无关的通用样例 rowmax/rowsum/softmax_denom 在 `expr_fold.hpp`）。注意力 forward 直调 `engine.eval_expr(make_fold_attn_o(...))`（**不经 DSL 钩子——scan 显式登记块是 fold spec 唯一注册来源**）；该构造与**掩码种类 `AttnMaskKind`（Plain/Causal/CausalDoc）定义在 `compute_layer_attention.hpp`**（按 AOT 原则"表达式文本只出现在 Layer"归位）——位置偏置是**正交的第二入参** `bool score_bias`（由 `PositionEncoder::has_score_bias()` 给出），实际登记 5 个组合（3 掩码 × 2 偏置 − 1；漏登记即 GPU 闭合世界硬报错）；`FoldSpec.tri_skip`（行界整块跳过）进 key（codegen 分歧点）；`EXPR_FOLD_BLOCK=128`/`EXPR_FOLD_ROWS_PER_WG=2` 为 CPU/GPU 共享常量（改则两侧同改）。详见 `expr_fold.hpp` 与 `expr_spec.hpp` 的 FoldSpec 注释。
 - **构建期两步**（CMake 自动编排，改 Layer 内联表达式后重跑构建即可）：
   1. `scan_exprs`：dry-run 跑 Layer forward/backward，收集折叠出的 `ExprSpec` 结构（去重）→ `build/generated/expr_specs.bin`
   2. `gen_fused`：读 bin → 经 `emitter_registry` 选后端（默认 `"glsl"` = `GlslEmitter`）生成 GLSL → glslc → 内联 SPIR-V → `build/generated/fused_registry.hpp`
@@ -300,7 +301,8 @@ optimizer.step();
 - **训练显存开关（GPT 与 RAPT 同档）**：梯度检查点 `set_checkpoint_every`、activation offload `set_activation_offload`、文档掩码 `set_doc_ids`、batch flush 粒度 `set_flush_interval`；检查点与 offload **可混合**（checkpoint 块重算、其余块 offload）。引擎侧 API 为 `create_offload_buffer`/`offload_save`/`offload_restore`（`set_offload_enabled` 不存在）。
 - **Vulkan 多设备选择**：`--gpu` 参数与 `NN_VULKAN_DEVICE` 环境变量（`cli/cli_gpu_option.hpp`、`backend/compute_vk_device.hpp`）。
 - **计算类原语全量走 DSL**：Layer 直调 21 个，全部是基础设施/数据搬运/状态扫描/fold 登记（`docs/development/12` §2.1；M4 后 `from_matrix/to_matrix` 已退出 L2 直调，宿主辅助数据走 `detail::upload_span/download_span`）；逐元素/归约/matmul 等一律经 `dsl::compute*`。
-- **注意力单 fold kernel**：`FoldSpec` 分块流式求值（分数矩阵 S 不物化），5 种掩码变体（Plain/Causal/Alibi/Doc/AlibiDoc），`tri_skip` 整块跳过被屏蔽区。
+- **注意力单 fold kernel**：`FoldSpec` 分块流式求值（分数矩阵 S 不物化），**掩码 × 位置偏置两个正交维度**：掩码 = `AttnMaskKind`（Plain/Causal/CausalDoc），偏置 = `bool score_bias`（ALiBi），共 5 个组合；`tri_skip` 整块跳过被屏蔽区。**两个维度各有策略对象、互不感知**：`AttnScoreMask` 族（`PlainScoreMask`/`CausalScoreMask`/`CausalDocScoreMask`，只做掩码）在**配置期**由 `make_score_mask_()` 定型；位置偏置由 `PositionEncoder::apply_score_bias()` 在"掩码之后、softmax 之前"独立叠加（非 ALiBi = no-op）。forward/backward 各两次虚调用，热路径里没有任何 `use_alibi_/use_doc/use_rope_` 标志位判断，掩码工厂也不再查询位置编码。
+- **位置编码统一为多态基类，所有权按注入点划分**：`compute_position_encoding.hpp` 的 `PositionEncoder`（基类 + `Learned/Sinusoidal/RoPE/ALiBi/None` 子类），注入点分三组（嵌入侧 `apply`、Q/K 侧 `apply_qk`、分数侧 `apply_score_bias`），各子类只覆写自己那组。**谁拥有 = 谁负责**：模型侧（`GPTModel`/`ZiPTModel`/`RAPTModel`）持有嵌入侧编码器（`make_embedding_position_encoder`），注意力层（`CausalSelfAttention`/`ReLULinearAttention`）**自持**注意力侧编码器（`make_attention_position_encoder`）；同一策略类型只在其中一个工厂里实做，另一个映射为恒等。`PosEncodingType` 的分发只剩这两个工厂，层间无位置编码对象传递（RoPE 的 cos/sin 表随层构建，默认配置 ≈64KB/层）。ALiBi 的偏置不融进掩码表达式，而是掩码之后的独立一步（见上面 `row()` 的告警）。
 - **CNN 全引擎化**：`im2col`/`col2im` 数据搬运原语 + `rearrange_3d` 布局置换，Conv2D/MaxPool2D 前反向为「引擎原语 + DSL」，无 PCIe 往返；池化反向为窗口并列最大值均分梯度。
 - **评估分块**：`evaluate_mnist` 的 `eval_batch`（默认 1000）分块前向 + 每块 `release_idle_pool_blocks()`，防大 batch 评估 OOM。
 - **CPU 性能**：DSL 模板路径向量化/并行、`dsl::compute_into` 零分配原地更新、`Tensor::cpu_get_ptr`、分块 GEMM 内核（BLOCK_SIZE=64）。
@@ -315,6 +317,9 @@ optimizer.step();
 3. **RowGather 主输入行数≠网格行数**（loss_vec 在 (1,N) 读 (C,N) logits），校验只查 cols。
 4. `gen_fused` `emit_spec` 的 ±inf 常量必须用 `numeric_limits`。
 5. **matmul + 列归约可用**：`generate_glsl_reduce` 列分支按元素分解 batch（`batch = row/m_per`，遍历全部 `rows = batch*m_per` 行）；覆盖 = `expr_cpu_test::col_max(matmul)`（batch=2 独立标量参考）+ `expr_gpu_test` col 对拍（广播/向量/batch=2）。
-6. **IR 扩展点**：MatmulSpec.batch（不进 key，dispatch z）、Row/Col/Batch 操作数(6/7/8)、RowGather(9)/BatchMod(10)/BatchCol(11)；注意力 forward = 单 fold kernel（`FoldSpec`，5 掩码变体经 `fold_mask_variant_`），bwd = R/X 表达式 + 3 个 `batched_matmul`；CE 稠密 `denom = col_sum(exp(logits-cb(col_max)))`，稀疏 grad/loss_vec 用 Row+RowGather。
+6. **IR 扩展点**：MatmulSpec.batch（不进 key，dispatch z）、Row/Col/Batch 操作数(6/7/8)、RowGather(9)/BatchMod(10)/BatchCol(11)；注意力 forward = 单 fold kernel（`FoldSpec`，掩码 `AttnScoreMask::mask_kind()` × 位置偏置 `PositionEncoder::has_score_bias()` 两个正交入参，构造期定型），bwd = 掩码 → 位置偏置（独立一步）→ softmax 的 R/X 表达式 + 3 个 `batched_matmul`；CE 稠密 `denom = col_sum(exp(logits-cb(col_max)))`，稀疏 grad/loss_vec 用 Row+RowGather。
+
+> ⚠ **`row()` 的批内语义依赖 `MatmulSpec.batch`**：`dsl::row()` 在 IR 里是"批内行号"，其分解来自**同一 ExprSpec 里的 matmul 段**。把原本融在 matmul 表达式里的项（如 ALiBi 的 `col − row`）拆成**独立一步**后，新 spec 没有 matmul → batch 退化为 1 → `row()` 变**全局行号** → 静默错值（alibi 实测 |偏置| 达 27，理论界 ≈7）。
+> 独立成步的表达式若需要"批内位置"，请用 **`(rows,1)` 行表 + `dsl::row_broadcast`**（按全局行号直读，与网格分解无关）——`AlibiPositionEncoder::apply_score_bias` 即此写法。凡是含占位 `eval()` 的节点（`RowIdxLeaf`/`ColIdxLeaf`/`RowGatherRef`/`BatchModRef`/`BatchColRef`）真实语义只由 IR 解释器提供，`dsl::compute_into` 的 `cpu_preparable_v` 白名单不会放它们进模板路径。
 
 > 变更此文件时务必同步 git 状态：`CMakeLists.txt` 的 `project(... VERSION ...)` 可能滞后于 git tag，以 git tag 为准。

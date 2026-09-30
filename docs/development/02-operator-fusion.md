@@ -170,8 +170,8 @@ struct MatmulSpec {
 
 现行 forward 是**单 fold kernel 分块流式求值**：QKᵀ / 掩码 / online softmax / ΣwV 在同一 kernel 内逐 `EXPR_FOLD_BLOCK=128` 块完成，`S` 矩阵绝不物化；`tri_skip` 把被屏蔽区整块钳成空转（NR=2，每 WG 两行）。
 
-- **构造位置**：`make_fold_attn_o` 与 5 掩码变体 `FoldAttnMask`（Plain/Causal/Alibi/Doc/AlibiDoc）定义在 `compute_layer_attention.hpp`（漏登记任一变体即 GPU 闭合世界硬报错）；通用 fold 样例在 `expr_fold.hpp`。注意力 forward 直调 `engine.eval_expr(make_fold_attn_o(...))`，**不经 DSL 钩子——scan 的显式登记块是 fold spec 唯一注册来源**。
-- **掩码处理**：因果掩码对 row-max 的修正是常数（`-inf` 屏蔽列）；ALiBi 线性偏置折进链内加项；文档块对角掩码按 doc_id 分组。掩码逻辑一律在 **Layer**——`fold_mask_variant_()` 虚钩子选变体 + `prepare_mask_inputs_()` 构建 slopes/doc_col/doc_ids 输入张量，引擎只认"matmul+reduce/fold"结构、绝不认算法名。
+- **构造位置**：`make_fold_attn_o` 与掩码种类 `AttnMaskKind`（Plain/Causal/CausalDoc）定义在 `compute_layer_attention.hpp`（漏登记任一组合即 GPU 闭合世界硬报错）；位置偏置（ALiBi）是**正交的第二入参** `bool score_bias`，实际登记 5 个组合（3 掩码 × 2 偏置 − 1）。通用 fold 样例在 `expr_fold.hpp`。注意力 forward 直调 `engine.eval_expr(make_fold_attn_o(...))`，**不经 DSL 钩子——scan 的显式登记块是 fold spec 唯一注册来源**。
+- **掩码处理**：因果掩码对 row-max 的修正是常数（`-inf` 屏蔽列）；文档块对角掩码按 doc_id 分组；ALiBi 线性偏置折进链内加项。**掩码与位置偏置是两件正交的事、各有策略对象**：`AttnScoreMask` 族（`PlainScoreMask`/`CausalScoreMask`/`CausalDocScoreMask`，**只做掩码**）各自实现 `mask_kind()`（类级常量）+ `prepare()`（构建 doc_col/doc_ids 输入张量）+ `masked_scores()`（反向重算 S 的 DSL 文本），由 `AttentionBase::make_score_mask_()` 在配置期工厂化定型；位置偏置由 `PositionEncoder::apply_score_bias()` 在 **backward** 的"掩码之后、softmax 之前"独立叠加（非 ALiBi = no-op）。引擎只认"matmul+reduce/fold"结构、绝不认算法名。
 - **显存**：`scores`/`masked`/`attn_cache_` 全部不物化，每层注意力激活从 ~3×`BH·seq²` 降到 `O(BH·seq·d_k)`（fold 单遍每块只算一次 QKᵀ，S 从不存在）。
 - **backward**：`recompute_W_` 两步重算 W——① `S = masked(Q·Kᵀ)`（掩码树与 forward 的 fold 变体同构，matmul 分块快路径，S 瞬时物化一遍）② `W = softmax(S)`（单归约表达式，m/l 在 kernel 内部归一化、不作为输入/缓存）；随后 R/X 表达式 + 3×`batched_matmul` 得 grad_Q/K/V，绝不物化概率矩阵。
 
@@ -235,7 +235,7 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 1. **`tools/scan_exprs.cpp`**：dry-run 跑各 Layer forward/backward，收集折叠出的 `ExprSpec` 结构（去重）→ `build/generated/expr_specs.bin`。
 2. **`tools/gen_fused.cpp`**：读 bin → `glsl_gen` 生成 GLSL → glslc → 内联 SPIR-V → `build/generated/fused_registry.hpp`。
 
-`scan_exprs` 需覆盖所有 Layer 的 DSL 路径（Softmax/LN/RMSNorm fwd+bwd、CrossEntropy softmax 结构、**Attention fold 结构**——层 forward 直调 `engine.eval_expr(make_fold_attn_o(...))` 不经 DSL 钩子，scan 的显式登记块（5 掩码变体）是 fold spec 唯一注册来源、漏变体即 GPU 闭合世界硬报错、Linear 的 matmul 段、optimizer 的 `compute_into` 原地表达式），使融合结构被收集。未命中 → `eval_expr` 现有"硬报错"逻辑，提示补进扫描（保持项目"GPU 硬报错、不降级"哲学）。
+`scan_exprs` 需覆盖所有 Layer 的 DSL 路径（Softmax/LN/RMSNorm fwd+bwd、CrossEntropy softmax 结构、**Attention fold 结构**——层 forward 直调 `engine.eval_expr(make_fold_attn_o(...))` 不经 DSL 钩子，scan 的显式登记块（3 掩码 × 2 偏置的 5 个组合）是 fold spec 唯一注册来源、漏组合即 GPU 闭合世界硬报错、Linear 的 matmul 段、optimizer 的 `compute_into` 原地表达式），使融合结构被收集。未命中 → `eval_expr` 现有"硬报错"逻辑，提示补进扫描（保持项目"GPU 硬报错、不降级"哲学）。
 
 ---
 
@@ -264,7 +264,8 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 5. **matmul + 列归约已支持**：`generate_glsl_reduce` 列归约分支按元素分解 batch（`batch = row/m_per`，列归约遍历全部 `rows = batch*m_per` 行，与 CPU `matmul_out` 逐列归约语义一致），`gen_fused` 不跳过该形态（扫描到的 spec 全部生成）；`expr_cpu_test::col_max(matmul)`（独立标量参考，batch=2）+ `expr_gpu_test::col_max(matmul)` 广播/归约向量/batch=2 对拍锁死（err≈1e-7）。
 6. **PS 删大文件段行号易漂移**、`-replace` 多行静默失败——先 read 再 edit，删前 `git diff` 核对。
 7. `dispatch_compute`（`compute_vk_backend.hpp` 的融合 dispatch 分发函数）有多处调用点——改签名或删除时按调用点逐一核对重建。
-8. **IR 扩展**：MatmulSpec.batch（不进 key，dispatch z）、Row/Col/Batch 操作数(6/7/8)、RowGather(9)/BatchMod(10)/BatchCol(11)；注意力 forward 现为单 fold kernel（`FoldSpec`，5 掩码变体经 `fold_mask_variant_`），bwd=R/X 表达式+3 个 `batched_matmul`（m/l/W 表达式+bm(W,V_t) 的 S7 forward 结构已删）；CE 稠密 `denom=col_sum(exp(logits-cb(col_max)))`，稀疏 grad/loss_vec 用 Row+RowGather。
+8. **IR 扩展**：MatmulSpec.batch（不进 key，dispatch z）、Row/Col/Batch 操作数(6/7/8)、RowGather(9)/BatchMod(10)/BatchCol(11)；注意力 forward 现为单 fold kernel（`FoldSpec`，掩码 `AttnScoreMask::mask_kind()` × 位置偏置 `PositionEncoder::has_score_bias()` 两个正交入参），bwd=掩码 → 位置偏置（独立一步）→ softmax 的 R/X 表达式+3 个 `batched_matmul`（m/l/W 表达式+bm(W,V_t) 的 S7 forward 结构已删）；CE 稠密 `denom=col_sum(exp(logits-cb(col_max)))`，稀疏 grad/loss_vec 用 Row+RowGather。
+   ⚠ `dsl::row()` 是"批内行号"，其分解来自**同一 spec 里的 matmul 段**；把原本融在 matmul 表达式里的项拆成独立一步后 batch 退化为 1、`row()` 变全局行号 → 静默错值。需要批内位置时用 `(rows,1)` 行表 + `dsl::row_broadcast`（`AlibiPositionEncoder::apply_score_bias` 即此写法）。
 9. **IR-D 现只有 `GlslEmitter` 一个注册后端**（`gen_fused --list-backends` 可列）；`cpu_emitter.hpp` 不存在。
 
 ---

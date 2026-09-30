@@ -29,6 +29,25 @@ template <typename T>
     return r;
 }
 
+// ── 错误传播（铁律 #1 的写法收敛）──────────────────────────────────────
+// `auto r = f(); if (!r) return std::unexpected(r.error());` 是本项目实施
+// 铁律 #1 的主形态，在 L2 层重复约 500 次、占 Layer 代码近 9%。收敛为：
+//
+//     NN_TRY(r, f());        // 声明 r 并检查（r 是 Result<T>）
+//     NN_TRY_CHECK(r);       // 检查已声明的 r
+//
+// 两者都只是**语法压缩**：展开后与手写形态逐字等价（错误消息、返回类型、
+// 语句结构都相同），不含任何控制流或所有权语义。展开为普通语句（不用
+// do{}while(0)），因此在 if/else 里的悬垂 else 行为与原 if 语句完全一致。
+//
+// 注意（铁律 #10）：续行反斜杠后面紧跟的是代码，绝不能出现 // 注释。
+#define NN_TRY(decl, ...) \
+    auto decl = (__VA_ARGS__); \
+    if (!decl) return std::unexpected(decl.error())
+
+#define NN_TRY_CHECK(x) \
+    if (!(x)) return std::unexpected((x).error())
+
 // ── 数字解析（std::from_chars，不抛异常） ────────────────────────────
 // 替代 std::stoi/stod/stoul/stoull 等会抛异常的函数。
 // 用法：auto v = nn::parse_number<int>("123");

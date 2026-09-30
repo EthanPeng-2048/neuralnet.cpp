@@ -97,14 +97,98 @@ public:
     [[nodiscard]] virtual std::vector<TensorRef> parameters() { return {}; }
     [[nodiscard]] virtual std::vector<TensorRef> param_gradients() { return {}; }
 
+protected:
+    // ── 复合层参数收集（消除各复合层 parameters()/param_gradients() 的同构级联）──
+    // 按实参顺序拼接若干列表；实参可以是 `Tensor`（隐式变成单元素）或
+    // `std::vector<TensorRef>`（子层级联结果）。用法：
+    //     return collect_refs(token_emb_, pos_encoder_->parameters(),
+    //                         forward_block_refs_(&GPTBlock::parameters),
+    //                         lm_head_.parameters());
+    // 语义与手写的 `p.insert(p.end(), x.begin(), x.end())` 序列完全一致
+    // （顺序就是实参顺序，不改变优化器看到的参数顺序）。
+    [[nodiscard]] static std::size_t ref_count_impl_(const Tensor&) noexcept { return 1; }
+    [[nodiscard]] static std::size_t ref_count_impl_(const std::vector<TensorRef>& v) noexcept
+    { return v.size(); }
+    static void append_refs_impl_(std::vector<TensorRef>& out, Tensor& t)
+    { out.push_back(t); }
+    static void append_refs_impl_(std::vector<TensorRef>& out, const std::vector<TensorRef>& v)
+    { out.insert(out.end(), v.begin(), v.end()); }
+
+    template <typename... Groups>
+    [[nodiscard]] static std::vector<TensorRef> collect_refs(Groups&&... groups)
+    {
+        std::vector<TensorRef> out;
+        out.reserve((std::size_t{0} + ... + ref_count_impl_(groups)));
+        (append_refs_impl_(out, std::forward<Groups>(groups)), ...);
+        return out;
+    }
+
+    // 把「对块容器逐块调用某成员函数」的结果拼起来（三个模型的 blocks_ 级联共用）。
+    //   RefGetter = 指向 Layer 子类 parameters / param_gradients 的成员函数指针。
+    template <typename Blocks, typename RefGetter>
+    [[nodiscard]] static std::vector<TensorRef> collect_block_refs_(
+        Blocks& blocks, RefGetter getter)
+    {
+        std::vector<TensorRef> out;
+        for (auto& b : blocks)
+        {
+            auto r = (b.*getter)();
+            out.insert(out.end(), r.begin(), r.end());
+        }
+        return out;
+    }
+
+    // ── Pre-Norm 残差块反向（GPTBlock / TransformerEncoderLayer / RAPTBlock 共用）──
+    // 前向：x2 = x1 + sub1(norm1(x))；out = x2 + sub2(norm2(x2))
+    // 反向：grad_s2  = sub2.bwd(grad_out)
+    //       grad_x2  = grad_out + norm2.bwd(grad_s2)     ← 残差 2 分流
+    //       grad_s1  = sub1.bwd(grad_x2)
+    //       grad_x1  = grad_x2 + norm1.bwd(grad_s1)      ← 残差 1 分流
+    // 返回 grad_x1。
+    //   add_prec = 两处残差相加的**表达式输出精度**。各块历史行为不同（GPT/
+    //   Transformer 传 p.compute；RAPT 的残差相加历史上未传 profile、恒 F32），
+    //   故显式传入以保持逐位不变——不要"顺手统一"成 p.compute。
+    [[nodiscard]] static Result<Tensor> prenorm_residual_backward_(
+        ComputeEngine& engine, const Tensor& grad_output,
+        Layer& norm1, Layer& sub1, Layer& norm2, Layer& sub2,
+        Precision add_prec)
+    {
+        NN_TRY(grad_s2, sub2.backward(grad_output));
+        NN_TRY(b_n2, norm2.backward(*grad_s2));
+        auto grad_x2 = dsl::compute(engine,
+            dsl::leaf(grad_output) + dsl::leaf(*b_n2),
+            grad_output.rows(), grad_output.cols(), add_prec);
+        NN_TRY_CHECK(grad_x2);
+        NN_TRY(grad_s1, sub1.backward(*grad_x2));
+        NN_TRY(b_n1, norm1.backward(*grad_s1));
+        return dsl::compute(engine,
+            dsl::leaf(*grad_x2) + dsl::leaf(*b_n1),
+            grad_x2->rows(), grad_x2->cols(), add_prec);
+    }
+
+    // ── Pre-Norm 残差块前向的一个残差分支 ─────────────────────────────────
+    // 返回 x + sub(norm(x))（GPT/Transformer/RAPT 三块的两个残差分支共用）。
+    //   add_prec 同上：显式传以保持各块历史精度行为逐位不变。
+    [[nodiscard]] static Result<Tensor> prenorm_residual_forward_(
+        ComputeEngine& engine, const Tensor& x, Layer& norm, Layer& sub,
+        Precision add_prec)
+    {
+        NN_TRY(n, norm.forward(x));
+        NN_TRY(s, sub.forward(*n));
+        return dsl::compute(engine,
+            dsl::leaf(x) + dsl::leaf(*s),
+            x.rows(), x.cols(), add_prec);
+    }
+
+public:
+
     // 梯度清零（每个训练 step 开始前调用）
     [[nodiscard]] virtual Result<void> zero_grad()
     {
         ComputeEngine& engine = engine_ref();
         for (auto& grad : param_gradients())
         {
-            auto r = engine.zero(grad);
-            if (!r) return r;
+            NN_TRY(r, engine.zero(grad));
         }
         return {};
     }
@@ -236,16 +320,14 @@ public:
         if (needed == 0) { offloaded_ = false; return {}; }
         if (!slab_.valid() || slab_.size() < needed)
         {
-            auto slab = engine.create_offload_buffer(needed);
-            if (!slab) return std::unexpected(slab.error());
+            NN_TRY(slab, engine.create_offload_buffer(needed));
             slab_ = std::move(*slab);
         }
         std::size_t offset = 0;
         for (auto& ref : refs_)
         {
             if (!ref.get().valid()) continue;
-            auto r = engine.offload_save(slab_, offset, ref.get());
-            if (!r) return std::unexpected(r.error());
+            NN_TRY(r, engine.offload_save(slab_, offset, ref.get()));
             shapes_.push_back({ref.get().rows(), ref.get().cols()});
             offsets_.push_back(offset);
             offset += ref.get().size();
@@ -263,7 +345,7 @@ public:
         {
             auto t = engine.offload_restore(slab_, offsets_[i],
                                             shapes_[i].first, shapes_[i].second);
-            if (!t) return std::unexpected(t.error());
+            NN_TRY_CHECK(t);
             refs_[i].get() = std::move(*t);
         }
         offloaded_ = false;
@@ -281,6 +363,57 @@ public:
     ComputeEngine& engine, const Tensor& src)
 {
     return engine.clone(src);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// 采样：temperature 缩放 → 数值稳定 softmax → 随机采样 / 贪心（argmax）
+//
+// GPTModel / RAPTModel / ZiPTModel 的 generate() 各自逐 token 维护不同的
+// 运行态（KV cache / RLA 运行态 / 无状态整窗前向），但"从末位 logits 选下一
+// token"这一步三者**逐字相同** → 收敛到本函数（曾有三份拷贝，改一处要改三处）。
+//
+//   logits        就地变为概率（调用方不需要原值）
+//   temperature   >0 随机采样（1.0 = 不缩放但仍采样）；<=0 贪心
+//   消耗恰好一次 dist(rng)（仅采样分支）——RNG 消耗序与旧实现逐位一致
+// ══════════════════════════════════════════════════════════════════════════
+[[nodiscard]] inline std::size_t sample_next_token_(
+    std::vector<Scalar>& logits, Scalar temperature,
+    std::mt19937_64& rng, std::uniform_real_distribution<Scalar>& dist)
+{
+    const std::size_t n = logits.size();
+    NN_ASSERT(n > 0, "sample_next_token_: empty logits");
+    if (temperature > 0.0 && temperature != 1.0)
+        for (auto& v : logits) v /= temperature;
+
+    // softmax（数值稳定）
+    Scalar max_val = logits[0];
+    for (std::size_t v = 1; v < n; ++v)
+        max_val = std::max(max_val, logits[v]);
+    Scalar sum_exp = 0.0;
+    for (auto& v : logits)
+    {
+        v = std::exp(v - max_val);
+        sum_exp += v;
+    }
+    for (auto& v : logits) v /= sum_exp;
+
+    if (temperature > 0.0)
+    {
+        const Scalar r = dist(rng);
+        Scalar cumulative = 0.0;
+        std::size_t next = n - 1;
+        for (std::size_t v = 0; v < n; ++v)
+        {
+            cumulative += logits[v];
+            if (r <= cumulative) { next = v; break; }
+        }
+        return next;
+    }
+    std::size_t next = 0;
+    Scalar best = logits[0];
+    for (std::size_t v = 1; v < n; ++v)
+        if (logits[v] > best) { best = logits[v]; next = v; }
+    return next;
 }
 
 } // namespace nn

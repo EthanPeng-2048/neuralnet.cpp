@@ -67,8 +67,7 @@ private:
         Tensor q = engine.create_tensor(batch * d_model_, memory_);
         for (std::size_t b = 0; b < batch; ++b)
         {
-            auto r = engine.insert_rows(q, b * d_model_, P_);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY(r, engine.insert_rows(q, b * d_model_, P_));
         }
         return q;
     }
@@ -94,8 +93,8 @@ public:
         if (!grad_P_.valid())
             return std::unexpected(Error{"CrossAttention: 梯度缓冲初始化失败"});
 
-        auto r1 = w_k_.init(engine); if (!r1) return std::unexpected(r1.error());
-        auto r2 = w_v_.init(engine); if (!r2) return std::unexpected(r2.error());
+        NN_TRY(r1, w_k_.init(engine));
+        NN_TRY(r2, w_v_.init(engine));
         // M6 段 C：softmax_ 是子 Layer（engine 由 init 绑定）
         { auto r3 = softmax_.init(engine); if (!r3) return std::unexpected(r3.error()); }
         return {};
@@ -138,16 +137,14 @@ public:
         const std::size_t batch = (seq_len_ > 0) ? (total / seq_len_) : 1;
 
         auto K = w_k_.forward(input);   // (d_model, batch·L)
-        if (!K) return K;
-        auto V = w_v_.forward(input);
-        if (!V) return V;
+        NN_TRY_CHECK(K);
+        NN_TRY(V, w_v_.forward(input));
 
         auto Q_re = build_q_re_(engine, batch);              // (batch·d_model, M)
-        if (!Q_re) return std::unexpected(Q_re.error());
+        NN_TRY_CHECK(Q_re);
         auto K_re = engine.rearrange_3d(*K, d_model_, batch, L, false);  // (batch·d_model, L)
-        if (!K_re) return std::unexpected(K_re.error());
-        auto V_re = engine.rearrange_3d(*V, d_model_, batch, L, false);
-        if (!V_re) return std::unexpected(V_re.error());
+        NN_TRY_CHECK(K_re);
+        NN_TRY(V_re, engine.rearrange_3d(*V, d_model_, batch, L, false));
 
         // S = batched_matmul(Q_re, K_re, batch, transA=true, alpha=scale)
         //   → (batch·M, L)。经 dsl::matmul(batch) + rparam(alpha) 尾链求值
@@ -155,19 +152,17 @@ public:
         auto S = dsl::compute(engine,
             dsl::matmul(*Q_re, *K_re, true, false, batch) * dsl::rparam(scale_),
             batch * Q_re->cols(), K_re->cols());
-        if (!S) return std::unexpected(S.error());
+        NN_TRY_CHECK(S);
         // A = softmax(S)
-        auto attn = softmax_.forward(*S);
-        if (!attn) return std::unexpected(attn.error());
+        NN_TRY(attn, softmax_.forward(*S));
         // C_re = batched_matmul(V_re, A, batch, false, true) → (batch·d_model, M)
         // dsl::matmul(batch)：纯 {0,1} 结构（attention backward 已登记同 key）
         auto C_re = dsl::compute(engine,
             dsl::matmul(*V_re, *attn, false, true, batch),
             V_re->rows(), attn->rows() / batch);
-        if (!C_re) return std::unexpected(C_re.error());
+        NN_TRY_CHECK(C_re);
         // C = rearrange back → (d_model, batch·M)
-        auto C = engine.rearrange_3d(*C_re, d_model_, batch, memory_, true);
-        if (!C) return std::unexpected(C.error());
+        NN_TRY(C, engine.rearrange_3d(*C_re, d_model_, batch, memory_, true));
 
         if (!checkpoint_mode_)
         {
@@ -188,8 +183,7 @@ public:
         const std::size_t batch = batch_cache_;
         const std::size_t L = seq_cache_;
 
-        auto grad_C_re = engine.rearrange_3d(grad_output, d_model_, batch, memory_, false);
-        if (!grad_C_re) return std::unexpected(grad_C_re.error());
+        NN_TRY(grad_C_re, engine.rearrange_3d(grad_output, d_model_, batch, memory_, false));
 
         // A 由 softmax.output_cache() 单一持有
         const Tensor& A = softmax_.output_cache();
@@ -198,29 +192,27 @@ public:
         auto grad_V_re = dsl::compute(engine,
             dsl::matmul(*grad_C_re, A, false, false, batch),
             grad_C_re->rows(), A.cols());   // 纯 {0,0} 结构（scan 手工登记同 key）
-        if (!grad_V_re) return std::unexpected(grad_V_re.error());
+        NN_TRY_CHECK(grad_V_re);
         // grad_A = batched_matmul(grad_C, V, batch, true, false) → (batch·M, L)
         auto grad_A = dsl::compute(engine,
             dsl::matmul(*grad_C_re, V_re_cache_, true, false, batch),
             batch * grad_C_re->cols(), V_re_cache_.cols());   // 纯 {1,0}（Linear 同 key）
-        if (!grad_A) return std::unexpected(grad_A.error());
+        NN_TRY_CHECK(grad_A);
         // grad_S = softmax.backward(grad_A)
-        auto grad_S = softmax_.backward(*grad_A);
-        if (!grad_S) return std::unexpected(grad_S.error());
+        NN_TRY(grad_S, softmax_.backward(*grad_A));
 
         // grad_Q_re = batched_matmul(K, grad_S, batch, false, true, scale) → (batch·d_model, M)
         auto grad_Q_re = dsl::compute(engine,
             dsl::matmul(K_re_cache_, *grad_S, false, true, batch) * dsl::rparam(scale_),
             K_re_cache_.rows(), grad_S->rows() / batch);   // 与 ZiPTBlock grad_Q_re 同 key
-        if (!grad_Q_re) return std::unexpected(grad_Q_re.error());
+        NN_TRY_CHECK(grad_Q_re);
         // grad_P = Σ_b grad_Q_re[b]（Q 是 P 沿 batch 的平铺，需按 batch 累加）
         for (std::size_t b = 0; b < batch; ++b)
         {
-            auto slice = engine.slice_rows(*grad_Q_re, b * d_model_, d_model_);
-            if (!slice) return std::unexpected(slice.error());
+            NN_TRY(slice, engine.slice_rows(*grad_Q_re, b * d_model_, d_model_));
             auto ar = dsl::compute_into(engine,
                 dsl::leaf(grad_P_) + dsl::leaf(*slice), grad_P_);
-            if (!ar) return std::unexpected(ar.error());
+            NN_TRY_CHECK(ar);
         }
         // grad_K_re = batched_matmul(Q, grad_S, batch, false, false, scale) → (batch·d_model, L)
         // {0,0}+Mul(rparam) 结构与 ZiPTBlock 的 grad_K_cat 同 key
@@ -228,17 +220,13 @@ public:
             dsl::matmul(Q_re_cache_, *grad_S, false, false, batch)
                 * dsl::rparam(scale_),
             Q_re_cache_.rows(), grad_S->cols());
-        if (!grad_K_re) return std::unexpected(grad_K_re.error());
+        NN_TRY_CHECK(grad_K_re);
 
         // 还原到 (d_model, batch·L) 并喂给 w_k / w_v
-        auto grad_K = engine.rearrange_3d(*grad_K_re, d_model_, batch, L, true);
-        if (!grad_K) return std::unexpected(grad_K.error());
-        auto grad_V = engine.rearrange_3d(*grad_V_re, d_model_, batch, L, true);
-        if (!grad_V) return std::unexpected(grad_V.error());
-        auto gk = w_k_.backward(*grad_K);
-        if (!gk) return gk;
-        auto gv = w_v_.backward(*grad_V);
-        if (!gv) return gv;
+        NN_TRY(grad_K, engine.rearrange_3d(*grad_K_re, d_model_, batch, L, true));
+        NN_TRY(grad_V, engine.rearrange_3d(*grad_V_re, d_model_, batch, L, true));
+        NN_TRY(gk, w_k_.backward(*grad_K));
+        NN_TRY(gv, w_v_.backward(*grad_V));
         return dsl::compute(engine,
             dsl::leaf(*gk) + dsl::leaf(*gv),
             gk->rows(), gk->cols());
@@ -321,7 +309,7 @@ private:
         }
         auto mr = detail::upload_span(engine, BH * window_, total_keys, Precision::F32,
                                       std::span(mask));
-        if (!mr) return std::unexpected(mr.error());
+        NN_TRY_CHECK(mr);
         mask_cache_ = std::move(*mr);
         mask_batch_ = batch;
         return mask_cache_;
@@ -360,15 +348,15 @@ public:
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
-        auto r1 = norm1_->init(engine); if (!r1) return std::unexpected(r1.error());
-        auto r2 = w_q_.init(engine);    if (!r2) return std::unexpected(r2.error());
-        auto r3 = w_k_.init(engine);    if (!r3) return std::unexpected(r3.error());
-        auto r4 = w_v_.init(engine);    if (!r4) return std::unexpected(r4.error());
-        auto r5 = w_o_.init(engine);    if (!r5) return std::unexpected(r5.error());
-        auto r6 = w_kc_.init(engine);   if (!r6) return std::unexpected(r6.error());
-        auto r7 = w_vc_.init(engine);   if (!r7) return std::unexpected(r7.error());
-        auto r8 = norm2_->init(engine); if (!r8) return std::unexpected(r8.error());
-        auto r9 = ff_.init(engine);     if (!r9) return std::unexpected(r9.error());
+        NN_TRY(r1, norm1_->init(engine));
+        NN_TRY(r2, w_q_.init(engine));
+        NN_TRY(r3, w_k_.init(engine));
+        NN_TRY(r4, w_v_.init(engine));
+        NN_TRY(r5, w_o_.init(engine));
+        NN_TRY(r6, w_kc_.init(engine));
+        NN_TRY(r7, w_vc_.init(engine));
+        NN_TRY(r8, norm2_->init(engine));
+        NN_TRY(r9, ff_.init(engine));
         // M6 段 C：softmax_ 是子 Layer（engine 由 init 绑定）
         { auto r10 = softmax_.init(engine); if (!r10) return std::unexpected(r10.error()); }
         return {};
@@ -376,31 +364,21 @@ public:
 
     std::vector<TensorRef> parameters() override
     {
-        std::vector<TensorRef> out;
-        auto n1 = norm1_->parameters(); out.insert(out.end(), n1.begin(), n1.end());
-        auto q = w_q_.parameters();     out.insert(out.end(), q.begin(), q.end());
-        auto k = w_k_.parameters();     out.insert(out.end(), k.begin(), k.end());
-        auto v = w_v_.parameters();     out.insert(out.end(), v.begin(), v.end());
-        auto o = w_o_.parameters();     out.insert(out.end(), o.begin(), o.end());
-        auto kc = w_kc_.parameters();   out.insert(out.end(), kc.begin(), kc.end());
-        auto vc = w_vc_.parameters();   out.insert(out.end(), vc.begin(), vc.end());
-        auto n2 = norm2_->parameters(); out.insert(out.end(), n2.begin(), n2.end());
-        auto f = ff_.parameters();      out.insert(out.end(), f.begin(), f.end());
-        return out;
+        return collect_refs(norm1_->parameters(),
+                            w_q_.parameters(), w_k_.parameters(),
+                            w_v_.parameters(), w_o_.parameters(),
+                            w_kc_.parameters(), w_vc_.parameters(),
+                            norm2_->parameters(),
+                            ff_.parameters());
     }
     std::vector<TensorRef> param_gradients() override
     {
-        std::vector<TensorRef> out;
-        auto n1 = norm1_->param_gradients(); out.insert(out.end(), n1.begin(), n1.end());
-        auto q = w_q_.param_gradients();     out.insert(out.end(), q.begin(), q.end());
-        auto k = w_k_.param_gradients();     out.insert(out.end(), k.begin(), k.end());
-        auto v = w_v_.param_gradients();     out.insert(out.end(), v.begin(), v.end());
-        auto o = w_o_.param_gradients();     out.insert(out.end(), o.begin(), o.end());
-        auto kc = w_kc_.param_gradients();   out.insert(out.end(), kc.begin(), kc.end());
-        auto vc = w_vc_.param_gradients();   out.insert(out.end(), vc.begin(), vc.end());
-        auto n2 = norm2_->param_gradients(); out.insert(out.end(), n2.begin(), n2.end());
-        auto f = ff_.param_gradients();      out.insert(out.end(), f.begin(), f.end());
-        return out;
+        return collect_refs(norm1_->param_gradients(),
+                            w_q_.param_gradients(), w_k_.param_gradients(),
+                            w_v_.param_gradients(), w_o_.param_gradients(),
+                            w_kc_.param_gradients(), w_vc_.param_gradients(),
+                            norm2_->param_gradients(),
+                            ff_.param_gradients());
     }
 
     void set_checkpoint_mode(bool enabled) override
@@ -470,37 +448,27 @@ public:
         const std::size_t H_dk = num_heads_ * d_k_;
         const std::size_t BH = batch * num_heads_;
 
-        auto n1 = norm1_->forward(input);
-        if (!n1) return n1;
+        NN_TRY(n1, norm1_->forward(input));
 
         auto Q = w_q_.forward(*n1);   // (d_model, batch·W)
-        if (!Q) return Q;
-        auto Ky = w_k_.forward(*n1);
-        if (!Ky) return Ky;
-        auto Vy = w_v_.forward(*n1);
-        if (!Vy) return Vy;
+        NN_TRY_CHECK(Q);
+        NN_TRY(Ky, w_k_.forward(*n1));
+        NN_TRY(Vy, w_v_.forward(*n1));
         auto Kc = w_kc_.forward(memory_input);   // (d_model, batch·M)
-        if (!Kc) return Kc;
-        auto Vc = w_vc_.forward(memory_input);
-        if (!Vc) return Vc;
+        NN_TRY_CHECK(Kc);
+        NN_TRY(Vc, w_vc_.forward(memory_input));
 
         // rearrange 为 (batch*H*d_k, ·) 批量化布局
-        auto Q_re = engine.rearrange_3d(*Q, H_dk, batch, window_, false);
-        if (!Q_re) return std::unexpected(Q_re.error());
-        auto Ky_re = engine.rearrange_3d(*Ky, H_dk, batch, window_, false);
-        if (!Ky_re) return std::unexpected(Ky_re.error());
-        auto Vy_re = engine.rearrange_3d(*Vy, H_dk, batch, window_, false);
-        if (!Vy_re) return std::unexpected(Vy_re.error());
-        auto Kc_re = engine.rearrange_3d(*Kc, H_dk, batch, memory_, false);
-        if (!Kc_re) return std::unexpected(Kc_re.error());
-        auto Vc_re = engine.rearrange_3d(*Vc, H_dk, batch, memory_, false);
-        if (!Vc_re) return std::unexpected(Vc_re.error());
+        NN_TRY(Q_re, engine.rearrange_3d(*Q, H_dk, batch, window_, false));
+        NN_TRY(Ky_re, engine.rearrange_3d(*Ky, H_dk, batch, window_, false));
+        NN_TRY(Vy_re, engine.rearrange_3d(*Vy, H_dk, batch, window_, false));
+        NN_TRY(Kc_re, engine.rearrange_3d(*Kc, H_dk, batch, memory_, false));
+        NN_TRY(Vc_re, engine.rearrange_3d(*Vc, H_dk, batch, memory_, false));
 
         // 序列维拼接：记忆在前，局部在后
         auto K_cat = concat_cols(engine, *Kc_re, *Ky_re);   // (batch*H*d_k, M+W)
-        if (!K_cat) return std::unexpected(K_cat.error());
-        auto V_cat = concat_cols(engine, *Vc_re, *Vy_re);
-        if (!V_cat) return std::unexpected(V_cat.error());
+        NN_TRY_CHECK(K_cat);
+        NN_TRY(V_cat, concat_cols(engine, *Vc_re, *Vy_re));
 
         // S = batched_matmul(Q_re, K_cat, BH, transA=true, alpha=scale)
         //   → (batch*H*W, M+W)。经 dsl::matmul(batch) + rparam(alpha) 尾链
@@ -509,39 +477,33 @@ public:
         auto S = dsl::compute(engine,
             dsl::matmul(*Q_re, *K_cat, true, false, BH) * dsl::rparam(scale_),
             BH * Q_re->cols(), K_cat->cols());
-        if (!S) return std::unexpected(S.error());
+        NN_TRY_CHECK(S);
         // 施加记忆-局部联合掩码（dsl::compute_into 原地加，不额外分配）
-        auto mask = build_mask_(engine, batch);
-        if (!mask) return std::unexpected(mask.error());
+        NN_TRY(mask, build_mask_(engine, batch));
         auto ma = dsl::compute_into(engine,
             dsl::leaf(*S) + dsl::leaf(*mask), *S);
-        if (!ma) return std::unexpected(ma.error());
+        NN_TRY_CHECK(ma);
         // A = softmax(S)
-        auto attn = softmax_.forward(*S);
-        if (!attn) return std::unexpected(attn.error());
+        NN_TRY(attn, softmax_.forward(*S));
         // O_re = batched_matmul(V_cat, A, BH, false, true) → (batch*H*d_k, W)
         // dsl::matmul(batch)：false,true → rows=V.rows(), cols=A.rows()/BH
         auto O_re = dsl::compute(engine,
             dsl::matmul(*V_cat, *attn, false, true, BH),
             V_cat->rows(), attn->rows() / BH);
-        if (!O_re) return std::unexpected(O_re.error());
+        NN_TRY_CHECK(O_re);
         // O = rearrange back → (d_model, batch·W)
-        auto O = engine.rearrange_3d(*O_re, H_dk, batch, window_, true);
-        if (!O) return std::unexpected(O.error());
-        auto out_attn = w_o_.forward(*O);
-        if (!out_attn) return out_attn;
+        NN_TRY(O, engine.rearrange_3d(*O_re, H_dk, batch, window_, true));
+        NN_TRY(out_attn, w_o_.forward(*O));
 
         auto r2 = dsl::compute(engine,
             dsl::leaf(input) + dsl::leaf(*out_attn),
             input.rows(), input.cols());
-        if (!r2) return std::unexpected(r2.error());
+        NN_TRY_CHECK(r2);
         if (!checkpoint_mode_)
             residual2_cache_ = *r2;
 
-        auto n2 = norm2_->forward(*r2);
-        if (!n2) return n2;
-        auto f = ff_.forward(*n2);
-        if (!f) return f;
+        NN_TRY(n2, norm2_->forward(*r2));
+        NN_TRY(f, ff_.forward(*n2));
 
         if (!checkpoint_mode_)
         {
@@ -565,20 +527,17 @@ public:
         const std::size_t H_dk = num_heads_ * d_k_;
         const std::size_t BH = batch * num_heads_;
 
-        auto grad_ff = ff_.backward(grad_output);
-        if (!grad_ff) return grad_ff;
-        auto b_n2 = norm2_->backward(*grad_ff);
-        if (!b_n2) return b_n2;
+        NN_TRY(grad_ff, ff_.backward(grad_output));
+        NN_TRY(b_n2, norm2_->backward(*grad_ff));
         auto grad_r1 = dsl::compute(engine,
             dsl::leaf(grad_output) + dsl::leaf(*b_n2),
             grad_output.rows(), grad_output.cols());
-        if (!grad_r1) return std::unexpected(grad_r1.error());
+        NN_TRY_CHECK(grad_r1);
 
         // ── 联合注意力反向（materialized 路径） ──
         auto grad_O = w_o_.backward(*grad_r1);   // (d_model, batch·W)
-        if (!grad_O) return grad_O;
-        auto grad_concat_re = engine.rearrange_3d(*grad_O, H_dk, batch, window_, false);
-        if (!grad_concat_re) return std::unexpected(grad_concat_re.error());
+        NN_TRY_CHECK(grad_O);
+        NN_TRY(grad_concat_re, engine.rearrange_3d(*grad_O, H_dk, batch, window_, false));
         const Tensor& A = softmax_.output_cache();
 
         // grad_V_cat = batched_matmul(grad_O, A, BH, false, false) → (batch*H*d_k, M+W)
@@ -586,92 +545,78 @@ public:
         auto grad_V_cat = dsl::compute(engine,
             dsl::matmul(*grad_concat_re, A, false, false, BH),
             grad_concat_re->rows(), A.cols());
-        if (!grad_V_cat) return std::unexpected(grad_V_cat.error());
+        NN_TRY_CHECK(grad_V_cat);
         // grad_A = batched_matmul(grad_O, V_cat, BH, true, false) → (batch*H*W, M+W)
         auto grad_A = dsl::compute(engine,
             dsl::matmul(*grad_concat_re, V_cat_cache_, true, false, BH),
             BH * grad_concat_re->cols(), V_cat_cache_.cols());
-        if (!grad_A) return std::unexpected(grad_A.error());
-        auto grad_S = softmax_.backward(*grad_A);
-        if (!grad_S) return std::unexpected(grad_S.error());
+        NN_TRY_CHECK(grad_A);
+        NN_TRY(grad_S, softmax_.backward(*grad_A));
         // grad_Q_re = batched_matmul(K_cat, grad_S, BH, false, true, scale) → (batch*H*d_k, W)
         //   alpha 经 rparam 尾链（matmul 累加后乘；不进 expr_spec_key）
         auto grad_Q_re = dsl::compute(engine,
             dsl::matmul(K_cat_cache_, *grad_S, false, true, BH)
                 * dsl::rparam(scale_),
             K_cat_cache_.rows(), grad_S->rows() / BH);
-        if (!grad_Q_re) return std::unexpected(grad_Q_re.error());
+        NN_TRY_CHECK(grad_Q_re);
         // grad_K_cat = batched_matmul(Q_re, grad_S, BH, false, false, scale) → (batch*H*d_k, M+W)
         auto grad_K_cat = dsl::compute(engine,
             dsl::matmul(Q_re_cache_, *grad_S, false, false, BH)
                 * dsl::rparam(scale_),
             Q_re_cache_.rows(), grad_S->cols());
-        if (!grad_K_cat) return std::unexpected(grad_K_cat.error());
+        NN_TRY_CHECK(grad_K_cat);
 
         // 沿序列维拆分 grad_K/grad_V 的记忆与局部部分（transpose → slice_rows → transpose）
         auto split_cols_ = [&](const Tensor& t)
             -> Result<std::pair<Tensor, Tensor>>
         {
             auto tT = engine.transpose(t);   // (M+W, batch*H*d_k)
-            if (!tT) return std::unexpected(tT.error());
+            NN_TRY_CHECK(tT);
             auto memT = engine.slice_rows(*tT, 0, memory_);       // (M, batch*H*d_k)
-            if (!memT) return std::unexpected(memT.error());
+            NN_TRY_CHECK(memT);
             auto locT = engine.slice_rows(*tT, memory_, window_); // (W, batch*H*d_k)
-            if (!locT) return std::unexpected(locT.error());
+            NN_TRY_CHECK(locT);
             auto mem = engine.transpose(*memT);   // (batch*H*d_k, M)
-            if (!mem) return std::unexpected(mem.error());
+            NN_TRY_CHECK(mem);
             auto loc = engine.transpose(*locT);   // (batch*H*d_k, W)
-            if (!loc) return std::unexpected(loc.error());
+            NN_TRY_CHECK(loc);
             return std::pair<Tensor, Tensor>{std::move(*mem), std::move(*loc)};
         };
 
-        auto k_split = split_cols_(*grad_K_cat);
-        if (!k_split) return std::unexpected(k_split.error());
-        auto v_split = split_cols_(*grad_V_cat);
-        if (!v_split) return std::unexpected(v_split.error());
+        NN_TRY(k_split, split_cols_(*grad_K_cat));
+        NN_TRY(v_split, split_cols_(*grad_V_cat));
 
         // ── 局部路径梯度 ──
-        auto grad_Q = engine.rearrange_3d(*grad_Q_re, H_dk, batch, window_, true);
-        if (!grad_Q) return std::unexpected(grad_Q.error());
-        auto gq = w_q_.backward(*grad_Q);
-        if (!gq) return gq;
-        auto grad_Ky = engine.rearrange_3d(k_split->second, H_dk, batch, window_, true);
-        if (!grad_Ky) return std::unexpected(grad_Ky.error());
-        auto gk = w_k_.backward(*grad_Ky);
-        if (!gk) return gk;
-        auto grad_Vy = engine.rearrange_3d(v_split->second, H_dk, batch, window_, true);
-        if (!grad_Vy) return std::unexpected(grad_Vy.error());
-        auto gv = w_v_.backward(*grad_Vy);
-        if (!gv) return gv;
+        NN_TRY(grad_Q, engine.rearrange_3d(*grad_Q_re, H_dk, batch, window_, true));
+        NN_TRY(gq, w_q_.backward(*grad_Q));
+        NN_TRY(grad_Ky, engine.rearrange_3d(k_split->second, H_dk, batch, window_, true));
+        NN_TRY(gk, w_k_.backward(*grad_Ky));
+        NN_TRY(grad_Vy, engine.rearrange_3d(v_split->second, H_dk, batch, window_, true));
+        NN_TRY(gv, w_v_.backward(*grad_Vy));
         auto g_attn = dsl::compute(engine,
             dsl::leaf(*gq) + dsl::leaf(*gk),
             gq->rows(), gq->cols());
-        if (!g_attn) return std::unexpected(g_attn.error());
+        NN_TRY_CHECK(g_attn);
         auto grad_n1 = dsl::compute(engine,
             dsl::leaf(*g_attn) + dsl::leaf(*gv),
             g_attn->rows(), g_attn->cols());
-        if (!grad_n1) return std::unexpected(grad_n1.error());
-        auto b_n1 = norm1_->backward(*grad_n1);
-        if (!b_n1) return b_n1;
+        NN_TRY_CHECK(grad_n1);
+        NN_TRY(b_n1, norm1_->backward(*grad_n1));
         auto grad_x = dsl::compute(engine,
             dsl::leaf(*grad_r1) + dsl::leaf(*b_n1),
             grad_r1->rows(), grad_r1->cols());
-        if (!grad_x) return std::unexpected(grad_x.error());
+        NN_TRY_CHECK(grad_x);
 
         // ── 记忆路径梯度（累加进 grad_C_out） ──
-        auto grad_Kc = engine.rearrange_3d(k_split->first, H_dk, batch, memory_, true);
-        if (!grad_Kc) return std::unexpected(grad_Kc.error());
-        auto gkc = w_kc_.backward(*grad_Kc);
-        if (!gkc) return gkc;
-        auto grad_Vc = engine.rearrange_3d(v_split->first, H_dk, batch, memory_, true);
-        if (!grad_Vc) return std::unexpected(grad_Vc.error());
-        auto gvc = w_vc_.backward(*grad_Vc);
-        if (!gvc) return gvc;
+        NN_TRY(grad_Kc, engine.rearrange_3d(k_split->first, H_dk, batch, memory_, true));
+        NN_TRY(gkc, w_kc_.backward(*grad_Kc));
+        NN_TRY(grad_Vc, engine.rearrange_3d(v_split->first, H_dk, batch, memory_, true));
+        NN_TRY(gvc, w_vc_.backward(*grad_Vc));
         // grad_C_out += gkc + gvc：两路累加在单个 compute_into 表达式中原地完成
         // （目标传递；grad_C_out 是调用方持有的累加缓冲，原地写符合其语义且不额外分配）
         auto acc = dsl::compute_into(engine,
             dsl::leaf(grad_C_out) + dsl::leaf(*gkc) + dsl::leaf(*gvc), grad_C_out);
-        if (!acc) return std::unexpected(acc.error());
+        NN_TRY_CHECK(acc);
 
         return grad_x;
     }
@@ -729,21 +674,21 @@ private:
                           std::size_t C, std::size_t W)
     {
         auto x_re = engine.rearrange_3d(x, d_model_, batch, L, false); // (batch·d, L)
-        if (!x_re) return std::unexpected(x_re.error());
+        NN_TRY_CHECK(x_re);
         auto xT = engine.transpose(*x_re);                            // (L, batch·d)
-        if (!xT) return std::unexpected(xT.error());
+        NN_TRY_CHECK(xT);
         auto hT = engine.slice_rows(*xT, 0, C);                       // (C, batch·d)
-        if (!hT) return std::unexpected(hT.error());
+        NN_TRY_CHECK(hT);
         auto wT = engine.slice_rows(*xT, C, W);                       // (W, batch·d)
-        if (!wT) return std::unexpected(wT.error());
+        NN_TRY_CHECK(wT);
         auto h_re = engine.transpose(*hT);                            // (batch·d, C)
-        if (!h_re) return std::unexpected(h_re.error());
+        NN_TRY_CHECK(h_re);
         auto w_re = engine.transpose(*wT);                            // (batch·d, W)
-        if (!w_re) return std::unexpected(w_re.error());
+        NN_TRY_CHECK(w_re);
         auto H = engine.rearrange_3d(*h_re, d_model_, batch, C, true);   // (d, batch·C)
-        if (!H) return std::unexpected(H.error());
+        NN_TRY_CHECK(H);
         auto Ws = engine.rearrange_3d(*w_re, d_model_, batch, W, true);  // (d, batch·W)
-        if (!Ws) return std::unexpected(Ws.error());
+        NN_TRY_CHECK(Ws);
         return std::pair<Tensor, Tensor>{std::move(*H), std::move(*Ws)};
     }
 
@@ -754,20 +699,18 @@ private:
                           std::size_t L, std::size_t C, std::size_t W)
     {
         auto h_re = engine.rearrange_3d(gradH, d_model_, batch, C, false); // (batch·d, C)
-        if (!h_re) return std::unexpected(h_re.error());
+        NN_TRY_CHECK(h_re);
         auto w_re = engine.rearrange_3d(gradW, d_model_, batch, W, false); // (batch·d, W)
-        if (!w_re) return std::unexpected(w_re.error());
+        NN_TRY_CHECK(w_re);
         auto hT = engine.transpose(*h_re);   // (C, batch·d)
-        if (!hT) return std::unexpected(hT.error());
+        NN_TRY_CHECK(hT);
         auto wT = engine.transpose(*w_re);   // (W, batch·d)
-        if (!wT) return std::unexpected(wT.error());
+        NN_TRY_CHECK(wT);
         Tensor dstT = engine.create_tensor(L, batch * d_model_);
-        auto r1 = engine.insert_rows(dstT, 0, *hT);
-        if (!r1) return std::unexpected(r1.error());
-        auto r2 = engine.insert_rows(dstT, C, *wT);
-        if (!r2) return std::unexpected(r2.error());
+        NN_TRY(r1, engine.insert_rows(dstT, 0, *hT));
+        NN_TRY(r2, engine.insert_rows(dstT, C, *wT));
         auto dst = engine.transpose(dstT);   // (batch·d, L)
-        if (!dst) return std::unexpected(dst.error());
+        NN_TRY_CHECK(dst);
         return engine.rearrange_3d(*dst, d_model_, batch, L, true);  // (d, batch·L)
     }
 
@@ -803,18 +746,9 @@ public:
         for (std::size_t i = 0; i < num_layers; ++i)
             blocks_.emplace_back(d_model, num_heads, d_ff, block_window, memory_tokens,
                                  norm_type, activation, precision);
-        switch (pos_enc_type)
-        {
-            case PosEncodingType::Learned:
-                pos_encoder_ = std::make_unique<LearnedPositionEncoder>(d_model, seq_len);
-                break;
-            case PosEncodingType::Sinusoidal:
-                pos_encoder_ = std::make_unique<SinusoidalPositionEncoder>(d_model, seq_len);
-                break;
-            default:
-                pos_encoder_ = std::make_unique<NoPositionEncoder>();
-                break;
-        }
+        // 位置编码器（嵌入侧）：Learned / Sinusoidal 实做；RoPE / ALiBi 恒等。
+        // ZiPTBlock 不接受位置编码参数（块内无 RoPE/ALiBi），故模型侧一份即可。
+        pos_encoder_ = make_embedding_position_encoder(pos_enc_type, d_model, seq_len);
     }
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
@@ -833,20 +767,16 @@ public:
 
         if (pos_encoder_)
         {
-            auto r = pos_encoder_->init(engine);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY(r, pos_encoder_->init(engine));
         }
-        auto r1 = compressor_.init(engine);
-        if (!r1) return std::unexpected(r1.error());
+        NN_TRY(r1, compressor_.init(engine));
         for (auto& b : blocks_)
         {
-            auto r = b.init(engine);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY(r, b.init(engine));
         }
         if (ln_f_)
         {
-            auto r = ln_f_->init(engine);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY(r, ln_f_->init(engine));
         }
         { auto r = lm_head_.init(engine); if (!r) return std::unexpected(r.error()); }
         return {};
@@ -874,41 +804,21 @@ public:
 
     std::vector<TensorRef> parameters() override
     {
-        std::vector<TensorRef> p;
-        p.push_back(token_emb_);
-        auto pp = pos_encoder_->parameters();
-        p.insert(p.end(), pp.begin(), pp.end());
-        auto cp = compressor_.parameters();
-        p.insert(p.end(), cp.begin(), cp.end());
-        for (auto& b : blocks_)
-        {
-            auto bp = b.parameters();
-            p.insert(p.end(), bp.begin(), bp.end());
-        }
-        auto lp = ln_f_->parameters();
-        p.insert(p.end(), lp.begin(), lp.end());
-        auto hp = lm_head_.parameters();
-        p.insert(p.end(), hp.begin(), hp.end());
-        return p;
+        return collect_refs(token_emb_,
+                            pos_encoder_->parameters(),
+                            compressor_.parameters(),
+                            collect_block_refs_(blocks_, &ZiPTBlock::parameters),
+                            ln_f_->parameters(),
+                            lm_head_.parameters());
     }
     std::vector<TensorRef> param_gradients() override
     {
-        std::vector<TensorRef> g;
-        g.push_back(grad_token_emb_);
-        auto gp = pos_encoder_->param_gradients();
-        g.insert(g.end(), gp.begin(), gp.end());
-        auto cg = compressor_.param_gradients();
-        g.insert(g.end(), cg.begin(), cg.end());
-        for (auto& b : blocks_)
-        {
-            auto bg = b.param_gradients();
-            g.insert(g.end(), bg.begin(), bg.end());
-        }
-        auto lg = ln_f_->param_gradients();
-        g.insert(g.end(), lg.begin(), lg.end());
-        auto hg = lm_head_.param_gradients();
-        g.insert(g.end(), hg.begin(), hg.end());
-        return g;
+        return collect_refs(grad_token_emb_,
+                            pos_encoder_->param_gradients(),
+                            compressor_.param_gradients(),
+                            collect_block_refs_(blocks_, &ZiPTBlock::param_gradients),
+                            ln_f_->param_gradients(),
+                            lm_head_.param_gradients());
     }
 
     [[nodiscard]] Result<Tensor> forward(
@@ -922,17 +832,13 @@ public:
         batch_size_ = batch;
 
         auto input_T = engine.transpose(input);   // (batch, seq) batch-major
-        if (!input_T) return std::unexpected(input_T.error());
-        auto all_emb = engine.gather_rows(token_emb_, *input_T);
-        if (!all_emb) return std::unexpected(all_emb.error());
-        auto st = engine.clone(*input_T);
-        if (!st) return std::unexpected(st.error());
+        NN_TRY_CHECK(input_T);
+        NN_TRY(all_emb, engine.gather_rows(token_emb_, *input_T));
+        NN_TRY(st, engine.clone(*input_T));
         stored_tokens_tensor_ = std::move(*st);
-        auto all_T = engine.transpose(*all_emb);
-        if (!all_T) return std::unexpected(all_T.error());
+        NN_TRY(all_T, engine.transpose(*all_emb));
 
-        auto x_res = pos_encoder_->apply(engine, *all_T, batch, seq_len);
-        if (!x_res) return std::unexpected(x_res.error());
+        NN_TRY(x_res, pos_encoder_->apply(engine, *all_T, batch, seq_len));
         Tensor x = std::move(*x_res);
 
         // 阶段一：历史压缩 → 记忆 C；阶段二：块对窗口联合注意力
@@ -940,17 +846,16 @@ public:
         Tensor block_input;
         if (split_)
         {
-            auto split = split_history_window_(engine, x, batch, seq_len_, hist_len_, window_);
-            if (!split) return std::unexpected(split.error());
+            NN_TRY(split, split_history_window_(engine, x, batch, seq_len_, hist_len_, window_));
             auto c_res = compressor_.forward(split->first);   // H → C (d, batch·M)
-            if (!c_res) return c_res;
+            NN_TRY_CHECK(c_res);
             C = std::move(*c_res);
             block_input = std::move(split->second);                   // W_seq (d, batch·W)
         }
         else
         {
             auto c_res = compressor_.forward(x);              // W=L 模式：压缩整条 X
-            if (!c_res) return c_res;
+            NN_TRY_CHECK(c_res);
             C = std::move(*c_res);
             block_input = x;
         }
@@ -969,13 +874,11 @@ public:
         }
         for (auto& b : blocks_)
         {
-            auto r = b.forward(block_input, C);
-            if (!r) return r;
+            NN_TRY(r, b.forward(block_input, C));
             block_input = std::move(*r);
         }
 
-        auto ln = ln_f_->forward(block_input);
-        if (!ln) return ln;
+        NN_TRY(ln, ln_f_->forward(block_input));
         return lm_head_.forward(*ln);
     }
 
@@ -986,10 +889,8 @@ public:
         const std::size_t seq_len = seq_len_;
         const std::size_t batch = batch_size_;
 
-        auto b_lm = lm_head_.backward(grad_output);
-        if (!b_lm) return b_lm;
-        auto b_ln = ln_f_->backward(*b_lm);
-        if (!b_ln) return b_ln;
+        NN_TRY(b_lm, lm_head_.backward(grad_output));
+        NN_TRY(b_ln, ln_f_->backward(*b_lm));
         Tensor grad_w = std::move(*b_ln);   // (d_model, batch·W) 块输出梯度
 
         // 记忆 C 梯度：跨块累加
@@ -998,8 +899,7 @@ public:
 
         for (std::size_t i = blocks_.size(); i-- > 0;)
         {
-            auto br = blocks_[i].backward(grad_w, grad_C);
-            if (!br) return br;
+            NN_TRY(br, blocks_[i].backward(grad_w, grad_C));
             grad_w = std::move(*br);
         }
 
@@ -1007,32 +907,27 @@ public:
         if (split_)
         {
             // 压缩器反向：grad_C → 对历史 H 的梯度 (d, batch·C)
-            auto gxh = compressor_.backward(grad_C);
-            if (!gxh) return gxh;
+            NN_TRY(gxh, compressor_.backward(grad_C));
             // 合并 [grad_H ; grad_W] → (d, batch·L)
             auto merged = merge_history_window_(engine, *gxh, grad_w,
                                                 batch, seq_len_, hist_len_, window_);
-            if (!merged) return std::unexpected(merged.error());
+            NN_TRY_CHECK(merged);
             grad_x = std::move(*merged);
         }
         else
         {
             // W=L 模式：压缩器对整条 X 的梯度与块梯度同形状，直接累加
-            auto gxc = compressor_.backward(grad_C);
-            if (!gxc) return gxc;
+            NN_TRY(gxc, compressor_.backward(grad_C));
             auto gx_sum = dsl::compute(engine,
                 dsl::leaf(grad_w) + dsl::leaf(*gxc),
                 grad_w.rows(), grad_w.cols());
-            if (!gx_sum) return std::unexpected(gx_sum.error());
+            NN_TRY_CHECK(gx_sum);
             grad_x = std::move(*gx_sum);
         }
 
-        auto grad_T = engine.transpose(grad_x);
-        if (!grad_T) return std::unexpected(grad_T.error());
-        auto pr = pos_encoder_->backward(engine, *grad_T, batch, seq_len);
-        if (!pr) return std::unexpected(pr.error());
-        auto sr = engine.scatter_add_rows(grad_token_emb_, stored_tokens_tensor_, *grad_T);
-        if (!sr) return std::unexpected(sr.error());
+        NN_TRY(grad_T, engine.transpose(grad_x));
+        NN_TRY(pr, pos_encoder_->backward(engine, *grad_T, batch, seq_len));
+        NN_TRY(sr, engine.scatter_add_rows(grad_token_emb_, stored_tokens_tensor_, *grad_T));
 
         Tensor grad_input = engine.create_tensor(seq_len, batch, Precision::F32,
                                                  InitSpec::zero());
@@ -1085,11 +980,9 @@ public:
             }
             auto in_t = detail::upload_span(engine, seq_len_, 1, Precision::F32,
                                             std::span(in));
-            if (!in_t) return std::unexpected(in_t.error());
-            auto logits = forward(*in_t);
-            if (!logits) return std::unexpected(logits.error());
-            auto lm_v = detail::download_vector(engine, *logits);
-            if (!lm_v) return std::unexpected(lm_v.error());
+            NN_TRY_CHECK(in_t);
+            NN_TRY(logits, forward(*in_t));
+            NN_TRY(lm_v, detail::download_vector(engine, *logits));
             const std::size_t lm_cols = logits->cols();
 
             // 末位（最后真实位置）logits
@@ -1097,35 +990,8 @@ public:
             for (std::size_t v = 0; v < vocab_size_; ++v)
                 last[v] = (*lm_v)[v * lm_cols + pred_col];
 
-            if (temperature > 0.0 && temperature != 1.0)
-                for (auto& x : last) x /= temperature;
-
-            Scalar max_val = last[0];
-            for (std::size_t v = 1; v < vocab_size_; ++v)
-                max_val = std::max(max_val, last[v]);
-            Scalar sum_exp = 0;
-            for (auto& x : last) { x = std::exp(x - max_val); sum_exp += x; }
-            for (auto& x : last) x /= sum_exp;
-
-            std::size_t next;
-            if (temperature > 0.0)
-            {
-                Scalar r = dist(rng);
-                Scalar cum = 0;
-                next = vocab_size_ - 1;
-                for (std::size_t v = 0; v < vocab_size_; ++v)
-                {
-                    cum += last[v];
-                    if (r <= cum) { next = v; break; }
-                }
-            }
-            else
-            {
-                next = 0;
-                Scalar best = last[0];
-                for (std::size_t v = 1; v < vocab_size_; ++v)
-                    if (last[v] > best) { best = last[v]; next = v; }
-            }
+            // temperature → softmax → 采样/贪心（三模型共用的采样器）
+            const std::size_t next = sample_next_token_(last, temperature, rng, dist);
 
             context.push_back(next);
             if (step >= min_new_tokens && next == eos_token_id) break;
