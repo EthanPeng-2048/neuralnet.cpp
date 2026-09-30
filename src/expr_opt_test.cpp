@@ -240,28 +240,29 @@ void test_regalloc()
 // ── 测试 5：确定性（多次 canonicalize 结果一致） ────────────────────────
 void test_determinism()
 {
+    nn::CpuEngine eng;
     std::vector<nn::ExprSpec> specs;
 
     // 1) RoPE forward（真实 DSL 折叠路径）
     {
         const std::size_t DK = 32;
-        nn::Tensor q = make_tensor(2 * DK, 4);
-        nn::Tensor cos = make_tensor(DK, 4);
-        nn::Tensor sin = make_tensor(DK, 4);
+        nn::Tensor q = make_tensor(eng, 2 * DK, 4);
+        nn::Tensor cos = make_tensor(eng, DK, 4);
+        nn::Tensor sin = make_tensor(eng, DK, 4);
         auto expr = leaf(q) * row_mod(cos, DK) + rotate_half(q, DK) * row_mod(sin, DK);
         specs.push_back(to_expr_spec(expr).first);
     }
     // 2) softmax 混合（归约视图 + 归约指令）
     {
-        nn::Tensor x = make_tensor(4, 6);
+        nn::Tensor x = make_tensor(eng, 4, 6);
         auto expr = exp(leaf(x) - row_reduce_max(x))
                   / row_reduce_sum(exp(leaf(x) - row_reduce_max(x)));
         specs.push_back(to_expr_spec(expr).first);
     }
     // 3) RMSNorm 风格（列归约 + 广播 + 标量）
     {
-        nn::Tensor x = make_tensor(8, 5);
-        nn::Tensor inv = make_tensor(1, 5);
+        nn::Tensor x = make_tensor(eng, 8, 5);
+        nn::Tensor inv = make_tensor(eng, 1, 5);
         auto expr = leaf(x) * col_reduce_sum(leaf(x) * leaf(x)) + leaf(inv);
         specs.push_back(to_expr_spec(expr).first);
     }
@@ -305,7 +306,7 @@ void test_semantic_equivalence()
     // 含归约的 softmax 表达式（走 eval_expr 路径）
     {
         const std::size_t R = 3, C = 7;
-        nn::Tensor x = make_tensor(R, C, -0.8f, 0.11f);
+        nn::Tensor x = make_tensor(eng, R, C, -0.8f, 0.11f);
         auto expr = exp(leaf(x) - row_reduce_max(x))
                   / row_reduce_sum(exp(leaf(x) - row_reduce_max(x)));
         auto [spec, inputs] = to_expr_spec(expr);
@@ -317,8 +318,10 @@ void test_semantic_equivalence()
               "semantic: softmax 原始/canonical 求值均成功");
         if (r_orig && r_canon)
         {
-            const auto a = r_orig->cpu_matrix().span();
-            const auto b = r_canon->cpu_matrix().span();
+            const nn::Matrix am = download(eng, *r_orig);
+            const nn::Matrix bm = download(eng, *r_canon);
+            const auto a = am.span();
+            const auto b = bm.span();
             bool ok = a.size() == b.size();
             for (std::size_t i = 0; ok && i < a.size(); ++i)
                 if (std::fabs(a[i] - b[i]) > 1e-5f) ok = false;
@@ -329,8 +332,8 @@ void test_semantic_equivalence()
     // 无归约表达式（eval_cpu 模板路径 vs canonical eval_expr 一致性）
     {
         const std::size_t R = 4, C = 5;
-        nn::Tensor a = make_tensor(R, C, 1.0f, 0.1f);
-        nn::Tensor b = make_tensor(R, C, 0.5f, 0.05f);
+        nn::Tensor a = make_tensor(eng, R, C, 1.0f, 0.1f);
+        nn::Tensor b = make_tensor(eng, R, C, 0.5f, 0.05f);
         auto expr = leaf(a) * Scalar{2} + leaf(b) * Scalar{3};
         auto [spec, inputs] = to_expr_spec(expr);
         const nn::ExprSpec canon = nn::canonicalize_expr_spec(spec);
@@ -340,8 +343,10 @@ void test_semantic_equivalence()
         CHECK(r_canon.has_value(), "semantic: 无归约 canonical 求值成功");
         if (r_canon)
         {
-            const auto a_ = r_canon->cpu_matrix().span();
-            const auto b_ = r_ref.cpu_matrix().span();
+            const nn::Matrix am = download(eng, *r_canon);
+            const nn::Matrix bm = download(eng, r_ref);
+            const auto a_ = am.span();
+            const auto b_ = bm.span();
             bool ok = a_.size() == b_.size();
             for (std::size_t i = 0; ok && i < a_.size(); ++i)
                 if (std::fabs(a_[i] - b_[i]) > 1e-5f) ok = false;
@@ -446,7 +451,8 @@ void test_output_invariant()
 void test_reduce_preserved()
 {
     // softmax 表达式：归约指令 dst 与逐元素 dst 区段分离，Reduce 引用正确
-    nn::Tensor x = make_tensor(3, 7, -0.8f, 0.11f);
+    nn::CpuEngine eng;
+    nn::Tensor x = make_tensor(eng, 3, 7, -0.8f, 0.11f);
     auto expr = exp(leaf(x) - row_reduce_max(x))
               / row_reduce_sum(exp(leaf(x) - row_reduce_max(x)));
     auto [spec, inputs] = to_expr_spec(expr);

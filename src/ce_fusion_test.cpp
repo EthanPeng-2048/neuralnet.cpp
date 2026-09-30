@@ -24,6 +24,8 @@
 #include <thread>
 #include <vector>
 
+#include "test_common.hpp"
+
 using nn::Scalar;
 
 int g_fail = 0;
@@ -155,8 +157,8 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
         if (!check_matrix(*dm, ref, nm)) ++fail;
     };
 
-    const nn::Tensor t_logits = nn::Tensor::from_matrix(nn::Matrix(logits));
-    const nn::Tensor t_colmax = nn::Tensor::from_matrix(nn::Matrix(col_max));
+    const nn::Tensor t_logits = upload(eng, logits);
+    const nn::Tensor t_colmax = upload(eng, col_max);
 
     // ── IR 组合：denom = col_sum(exp(logits - cb(col_max))) ──
     {
@@ -237,9 +239,9 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
 
         // (1) dst += other（dst 同时是输入）
         {
-            nn::Tensor dsl_t = nn::Tensor::from_matrix(nn::Matrix(am));
-            nn::Tensor prim_t = nn::Tensor::from_matrix(nn::Matrix(am));
-            nn::Tensor other = nn::Tensor::from_matrix(nn::Matrix(bm));
+            nn::Tensor dsl_t = upload(eng, am);
+            nn::Tensor prim_t = upload(eng, am);
+            nn::Tensor other = upload(eng, bm);
             auto r = nn::dsl::compute_into(eng,
                 nn::dsl::leaf(dsl_t) + nn::dsl::leaf(other), dsl_t);
             char nm[128];
@@ -266,8 +268,8 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
         }
         // (2) dst *= s（唯一输入即 dst：最强别名）
         {
-            nn::Tensor dsl_t = nn::Tensor::from_matrix(nn::Matrix(am));
-            nn::Tensor prim_t = nn::Tensor::from_matrix(nn::Matrix(am));
+            nn::Tensor dsl_t = upload(eng, am);
+            nn::Tensor prim_t = upload(eng, am);
             auto r = nn::dsl::compute_into(eng,
                 nn::dsl::leaf(dsl_t) * nn::dsl::rparam(s), dsl_t);
             char nm[128];
@@ -293,7 +295,7 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
         }
         // (3) 归约表达式必须被拒绝（compute_into 只支持逐元素）
         {
-            nn::Tensor dsl_t = nn::Tensor::from_matrix(nn::Matrix(am));
+            nn::Tensor dsl_t = upload(eng, am);
             auto r = nn::dsl::compute_into(eng,
                 nn::dsl::col_reduce_sum(nn::dsl::leaf(dsl_t)), dsl_t);
             const bool rejected = !r;
@@ -313,7 +315,7 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
         nn::Matrix labels_m(1, N);
         for (std::size_t i = 0; i < N; ++i)
             labels_m.set_value_unchecked(0, i, static_cast<Scalar>(labels[i]));
-        const nn::Tensor t_labels = nn::Tensor::from_matrix(std::move(labels_m));
+        const nn::Tensor t_labels = upload(eng, labels_m);
 
         // 无 mask
         {
@@ -326,7 +328,7 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
             for (std::size_t i = 0; i < N; ++i)
                 mask_m.set_value_unchecked(0, i,
                     labels[i] < vocab_size ? Scalar{1} : Scalar{0});
-            const nn::Tensor t_mask = nn::Tensor::from_matrix(std::move(mask_m));
+            const nn::Tensor t_mask = upload(eng, mask_m);
             auto denom = nn::dsl::compute_reduce(eng,
                 nn::dsl::col_reduce_sum(nn::dsl::exp(
                     nn::dsl::leaf(t_logits) - nn::dsl::col_broadcast(t_colmax))),
@@ -360,7 +362,7 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
                 mask_m.set_value_unchecked(0, i,
                     (loss_mask[i] >= Scalar{0.5} && labels[i] < vocab_size)
                         ? Scalar{1} : Scalar{0});
-            const nn::Tensor t_mask = nn::Tensor::from_matrix(std::move(mask_m));
+            const nn::Tensor t_mask = upload(eng, mask_m);
             nn::Matrix lv_ref;
             const nn::Matrix g_ref = ref_sparse_forward(
                 logits, labels, &loss_mask, vocab_size, inv_num_valid, lv_ref);
@@ -396,7 +398,7 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
             nn::Matrix bad_m(1, N);
             for (std::size_t i = 0; i < N; ++i)
                 bad_m.set_value_unchecked(0, i, static_cast<Scalar>(bad[i]));
-            const nn::Tensor t_bad = nn::Tensor::from_matrix(std::move(bad_m));
+            const nn::Tensor t_bad = upload(eng, bad_m);
             nn::Matrix lv_ref;
             const nn::Matrix g_ref = ref_sparse_forward(
                 logits, bad, nullptr, vocab_size, Scalar{0}, lv_ref);
@@ -404,7 +406,7 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
             nn::Matrix mask_m(1, N);
             for (std::size_t i = 0; i < N; ++i)
                 mask_m.set_value_unchecked(0, i, Scalar{0});
-            const nn::Tensor t_mask = nn::Tensor::from_matrix(std::move(mask_m));
+            const nn::Tensor t_mask = upload(eng, mask_m);
             auto denom = nn::dsl::compute_reduce(eng,
                 nn::dsl::col_reduce_sum(nn::dsl::exp(
                     nn::dsl::leaf(t_logits) - nn::dsl::col_broadcast(t_colmax))),
