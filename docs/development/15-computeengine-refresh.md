@@ -30,7 +30,7 @@ engine 形参**，用 `import` 收敛跨设备互传，用存储多态消掉容�
 | 宿主中转调用（from/to_matrix/copy_from，排除引擎自身） | ~596 处 | `grep` 后过滤引擎头 |
 | `Model::set_engine` | **零调用方 = 死码** | `grep -rn "set_engine(" src/` 空 |
 | `PrecisionEngine` | 独立装饰器类（>900 行），49 方法全量委托 `inner_` | `compute_precision_engine.hpp` |
-| 测试直构张量（`Tensor::from_matrix`/`Tensor::cpu`） | 90 处 / 8 文件 | `grep -c src/*_test.cpp` |
+| 测试直构张量（`Tensor::from_matrix`/`Tensor::cpu`） | 98 处 / 8 文件（2026-09-30 复核；09-28 原记 90） | `grep -c src/*_test.cpp` |
 | 三处绑定先例 | Model(observer_ptr)、Optimizer(`ComputeEngine&`)、`Layer::init` | 各头文件 |
 
 ## 2. 目标与非目标
@@ -219,7 +219,7 @@ const Tensor qc = Tensor::from_matrix(Matrix(q));  // 宿主直构，未绑定
 auto cr = rope_cpu.apply(cpu, qc, seq, backward);  // 喂 CPU
 auto gr = rope_gpu.apply(gpu, qc, seq, backward);  // 同一个 qc 再喂 GPU
 ```
-90 处测试直构张量是**库外**代码。若严格执行"非绑定不得参与计算"，全要改成
+98 处测试直构张量（2026-09-30 复核）是**库外**代码。若严格执行"非绑定不得参与计算"，全要改成
 `cpu.from_host(q)` + `gpu.from_host(q)`（或 `gpu.import(qc)`）。
 
 **片段 D：`compute_engine.hpp` :104/:117——基类默认实现**
