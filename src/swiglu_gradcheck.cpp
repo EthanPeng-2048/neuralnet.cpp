@@ -71,19 +71,19 @@ bool check_grad_tensor(
 
             Matrix pp = base;
             pp.set_value_unchecked(r, c, orig + eps);
-            auto r_p = engine.copy_from(param, pp);
-            if (!r_p) { std::cerr << "copy_from(+) failed\n"; return false; }
+            auto r_p = engine.write(param, pp.span());
+            if (!r_p) { std::cerr << "write(+) failed\n"; return false; }
             const Scalar lp = eval_loss(engine, ff, fwd_input, go);
 
             Matrix pm = base;
             pm.set_value_unchecked(r, c, orig - eps);
-            auto r_m = engine.copy_from(param, pm);
-            if (!r_m) { std::cerr << "copy_from(-) failed\n"; return false; }
+            auto r_m = engine.write(param, pm.span());
+            if (!r_m) { std::cerr << "write(-) failed\n"; return false; }
             const Scalar lm = eval_loss(engine, ff, fwd_input, go);
 
             // 恢复原值
-            auto r_r = engine.copy_from(param, base);
-            if (!r_r) { std::cerr << "copy_from(restore) failed\n"; return false; }
+            auto r_r = engine.write(param, base.span());
+            if (!r_r) { std::cerr << "write(restore) failed\n"; return false; }
 
             const Scalar num = (lp - lm) / (Scalar{2} * eps);
             const Scalar ana = grad_analytical.at_unchecked(r, c);

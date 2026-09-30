@@ -47,13 +47,13 @@ bool check_param(ComputeEngine& engine,
             const Scalar orig = base.at_unchecked(r, c);
             Matrix pp = base;
             pp.set_value_unchecked(r, c, orig + eps);
-            if (!engine.copy_from(param, pp)) return false;
+            if (!engine.write(param, pp.span())) return false;
             const Scalar lp = eval_loss();
             Matrix pm = base;
             pm.set_value_unchecked(r, c, orig - eps);
-            if (!engine.copy_from(param, pm)) return false;
+            if (!engine.write(param, pm.span())) return false;
             const Scalar lm = eval_loss();
-            if (!engine.copy_from(param, base)) return false;
+            if (!engine.write(param, base.span())) return false;
             const Scalar num = (lp - lm) / (Scalar{2} * eps);
             const Scalar ana_v = ana.at_unchecked(r, c);
             const Scalar err = std::fabs(num - ana_v);

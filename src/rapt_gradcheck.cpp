@@ -49,15 +49,15 @@ bool check_param(ComputeEngine& engine,
         for (std::size_t c = 0; c < base.cols(); ++c)
         {
             const Scalar orig = base.at_unchecked(r, c);
-            if (!engine.copy_from(param, base)) return false;
+            if (!engine.write(param, base.span())) return false;
             const Scalar f0 = eval_loss();
             Matrix pp = base; pp.set_value_unchecked(r, c, orig + eps);
-            if (!engine.copy_from(param, pp)) return false;
+            if (!engine.write(param, pp.span())) return false;
             const Scalar fp = eval_loss();
             Matrix pm = base; pm.set_value_unchecked(r, c, orig - eps);
-            if (!engine.copy_from(param, pm)) return false;
+            if (!engine.write(param, pm.span())) return false;
             const Scalar fm = eval_loss();
-            if (!engine.copy_from(param, base)) return false;
+            if (!engine.write(param, base.span())) return false;
             // ReLU 拐点：中心二阶差分大（±eps 跨断点）→ 有限差分无定义，跳过。
             // 也跳过 |ana| 极小的条目（analytic≈0 处若有限差分错，多为拐点伪影，非 bug）。
             const Scalar d2 = std::fabs(fp - Scalar{2} * f0 + fm);
@@ -119,7 +119,7 @@ bool reseed_params(ComputeEngine& engine, std::vector<TensorRef>& params,
         if (!m) return false;
         auto sp = m->span();
         for (auto& v : sp) v = dist(rng);
-        if (!engine.copy_from(p, *m)) return false;
+        if (!engine.write(p, m->span())) return false;
     }
     return true;
 }
