@@ -122,6 +122,11 @@ engine.end_batch();  // 提交并等待
 [[nodiscard]] Result<Tensor> from_matrix(const Matrix& m, Precision P = Precision::F32);
 // to_matrix 输出宿主 Matrix，仍为纯虚（不参与 stamp）：
 [[nodiscard]] virtual Result<Matrix> to_matrix(const Tensor& t, Precision P = Precision::F32) = 0;
+// M3（17 §4.3 D3/D9）：批量读写 I/O 分组——基类非虚，复用 to_matrix/copy_from：
+template <class T> Result<void> read(const Tensor& t, std::span<T> dst);
+template <class T> Result<void> write(Tensor& t, std::span<T> src);  // 覆盖既有存储、不替换对象
+Result<Scalar> get_index(const Tensor& t, std::size_t row, std::size_t col); // 语法糖
+Result<void> set_index(Tensor& t, std::size_t row, std::size_t col, Scalar v);
 
 // 引擎实现侧（protected 虚；默认实参只写在公共入口上）：
 [[nodiscard]] virtual Tensor create_tensor_impl(std::size_t rows, std::size_t cols, Precision P) = 0;
@@ -134,6 +139,11 @@ engine.end_batch();  // 提交并等待
   层算分布参数、引擎填数；策略（host 生成上传 vs 将来设备端原生）由引擎自选（17 §4.4 D6）
 - `from_matrix`：CPU Matrix → Tensor（按 P 分配存储；可能拷贝）
 - `to_matrix`：Tensor → CPU Matrix（按 P 转换；可能下载）
+- `read/write`：批量 span 进出**本体**——元素类型与 `precision()` 精确匹配（U2：错配运行期
+  错误、类型非法编译期 static_assert）；GPU `read` 隐含 flush + 同步（走 `to_matrix` 同路）、
+  `write` 走 `copy_from` 既有 drain 语义（17 §4.3/§7-4）
+- `get_index/set_index`：语法糖——宿主直读写、GPU 走批量 read/write（每次一整轮 staging，
+  不承诺热循环性能，17 §7-1）
 
 **实现注意**：
 - `from_matrix_impl` 应返回拷贝，避免外部修改影响

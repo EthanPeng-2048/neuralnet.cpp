@@ -15,7 +15,7 @@
 | 175 处 `ComputeEngine&` 打标 | ✅ | KEEP 58 / DROP 110 / REVIEW 7 |
 | 宿主中转调用盘点 | ✅ | 引擎外 381 处（include 71 + src 306 + 探针 4）；13 §10 的 596 为宽口径，见 §4 |
 | CPU 字节基线可行性 | ✅ | 探针实测：进程内两轮 + 跨进程两次启动，loss 序列与参数校验和**逐位一致** |
-| GPU run-to-run 稳定性（D9 档位） | ⏸ 未完成 | 探针在 GPU 上首个 `vkCreateBuffer` 即崩（见 §6/§7-2），**待查后补测** |
+| GPU run-to-run 稳定性（D9 档位） | ✅（2026-09-30 补测） | 崩溃根因 = 探针漏 `backend.initialize()`（§7-2，M3 期间定位并修复）；修复后 Windows 本机 dev0/dev2/dev4 进程内两轮 + 跨进程两次启动 loss 与 hash **逐字节一致**（§6） |
 | ctest 基线 | ✅（带发现） | 默认（自动选卡=Mali）18/20；`NN_VULKAN_DEVICE=1`（Lavapipe）20/20；Mali offload 失败**非确定**（§5） |
 
 ## 1. 环境（本机实测基线，2026-09-28）
@@ -105,6 +105,7 @@ M2 新增 `--init-hash` 模式：只建模型不训练，比 6 类模型（mlp/c
 ```bash
 build/gpu_stability_probe --steps 20            # CPU
 build/gpu_stability_probe --init-hash           # 初值确定性（M2；跨进程 grep '^INIT1' | diff）
+build/gpu_stability_probe --io-roundtrip [--gpu] # 批量读写语义对拍（M3；GPU 即 staging 验收）
 build/gpu_stability_probe --gpu 1 --steps 20    # 指定 GPU
 # 跨进程比对：两次启动后 grep -E '^(CONFIG|run1)' | diff -
 ```
@@ -112,15 +113,20 @@ build/gpu_stability_probe --gpu 1 --steps 20    # 指定 GPU
 | 设备 | 进程内两轮 | 跨进程两次启动 | 结论 |
 |---|---|---|---|
 | **CPU** | ✅ loss 序列 + 参数 hash 逐位一致（exit=0，两轮独立进程均 PASS） | ✅ 逐位一致 | **CPU 逐字节基线可行**——15 §4.9 第 1 行坐实 |
-| GPU（dev1 / dev0） | ⏸ 未测得 | ⏸ | **探针崩溃**（§7-2），GPU 档位待补 |
+| GPU（dev1 / dev0） | ⏸ 未测得 | ⏸ | **探针崩溃**（§7-2；2026-09-30 已修复，见下一行） |
+| GPU（2026-09-30 Windows 本机，修复后） | ✅ dev2 `8ef51b2927253c50`、dev0 `47977edc71a21a20`、dev4 `01b7192bd15a59d9`（各两轮 PASS） | ✅ 三设备 `CONFIG\|run1` 行逐字节一致 | **GPU 逐字节档位在本机三设备坐实**；dev1（MESA/D3D12 转译）初始化即报 DXIL container 校验错误、exit=2——设备级不可用，非探针/库问题 |
 
 ## 7. 未决问题（只记录，均不阻塞 P-1/P1 立项）
 
 1. **Mali（GPU0）offload 非确定失败**（§5）——设备级，另立 issue。
-2. **探针 GPU 首 buffer 即崩**：`vkCreateBuffer: Invalid device [VUID-...]`，
-   发生在 `CONFIG` 行打印后、run1 建引擎阶段；**同设备同构建下既有测试全部可跑**
-   （`gpu_test`/`gpt_offload_test` 在 dev1 正常），故差异在探针路径（新建引擎的方式
-   或时序），库侧无证据。**未定位，按约定暂缓**；修好后补 §6 的 GPU 档位实测。
+2. ~~**探针 GPU 首 buffer 即崩**~~ **已定位并修复（2026-09-30，M3 期间）**：根因
+   = `GpuBackend::instance()` 只是惰性单例，Vulkan 设备须显式 `backend.initialize()`
+   才建立——探针 `make_engine` 漏调（`cli_engine_factory` 与全部 GPU 测试入口都会
+   调它，这正是当时"差异在探针路径"的那一处），首个 `vkCreateBuffer` 拿到
+   VK_NULL_HANDLE 即 "Invalid device"。修复 = 探针建引擎前补 `initialize()`（空
+   selector 仍按 显式 > `NN_VULKAN_DEVICE` 环境变量 > 自动打分 选卡），commit
+   `4977a29`；§6 GPU 档位已回填（本机 dev0/dev2/dev4 逐字节一致；dev1 为
+   MESA/D3D12 设备级 DXIL 校验失败、exit=2，另记）。
 3. **REVIEW 7 处**（§3）：P2 立项时逐条判定。
 4. **13 §10 数字口径**（§4）：596 → 381，P2 改名清单按 381。
 5. **`Model::set_engine` 死码**（15 D7）：维持"删除"倾向，P2 定。
@@ -132,5 +138,6 @@ build/gpu_stability_probe --gpu 1 --steps 20    # 指定 GPU
 - ctest 双基线（§5：dev1 20/20 = Refresh 基线；dev0 记录在案）
 - 新增 `src/gpu_stability_probe.cpp` + CMake app 目标（ctest 仍为 20，数量未变）
 
-**P0 剩余**：§7-2（探针 GPU 崩溃）→ 修好后跑 dev0/dev1 各两次，回填 §6 表格，
-D9 的 GPU 档位（逐字节 vs 容差）即可定案。
+**P0 收尾（2026-09-30）**：§7-2 已修复（探针补 `backend.initialize()`，commit
+`4977a29`），§6 已回填本机三设备实测——D9 的 GPU 档位在本机坐实为**逐字节**；
+原机器（Mali）档位受 §5 Mali offload 非确定限制，维持"设备级另立 issue"。
