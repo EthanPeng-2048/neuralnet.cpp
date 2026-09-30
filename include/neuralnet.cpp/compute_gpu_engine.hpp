@@ -452,7 +452,7 @@ public:
     [[nodiscard]] Result<Tensor> slice_rows_impl(
         const Tensor& src, std::size_t start_row, std::size_t count) override
     {
-        auto src_gpu = ensure_gpu(src);
+        auto src_gpu = import(src);
         if (!src_gpu) return std::unexpected(src_gpu.error());
         if (src_gpu->precision() == Precision::F16)   // 原生 f16 行切片（纯字节拷贝）
         {
@@ -473,7 +473,7 @@ public:
     {
         if (dst.is_cpu())
             return std::unexpected(Error{"insert_rows: dst must be GPU tensor in pure-GPU architecture"});
-        auto src_gpu = ensure_gpu(src);
+        auto src_gpu = import(src);
         if (!src_gpu) return std::unexpected(src_gpu.error());
         if (dst.precision() == Precision::F16)   // 原生 f16 行插入（纯字节拷贝）
             return backend_.insert_rows_gpu(dst.gpu_tensor<Precision::F16>(),
@@ -488,9 +488,9 @@ public:
     [[nodiscard]] Result<Tensor> gather_rows_impl(
         const Tensor& table, const Tensor& indices) override
     {
-        auto tbl_gpu = ensure_gpu(table);
+        auto tbl_gpu = import(table);
         if (!tbl_gpu) return std::unexpected(tbl_gpu.error());
-        auto idx_gpu = ensure_gpu(indices);
+        auto idx_gpu = import(indices);
         if (!idx_gpu) return std::unexpected(idx_gpu.error());
 
         // Phase C1 f16 直读直写（table/out f16；indices 恒 f32——行号整数值
@@ -539,9 +539,9 @@ public:
         if (!dst.is_gpu())
             return std::unexpected(Error{"scatter_add_rows: dst must be GPU tensor"});
 
-        auto idx_gpu = ensure_gpu(indices);
+        auto idx_gpu = import(indices);
         if (!idx_gpu) return std::unexpected(idx_gpu.error());
-        auto grad_gpu = ensure_gpu(grad);
+        auto grad_gpu = import(grad);
         if (!grad_gpu) return std::unexpected(grad_gpu.error());
 
         const bool f16_io = dst.precision() == Precision::F16 &&
@@ -563,7 +563,7 @@ public:
             auto g32 = (grad_gpu->precision() == Precision::F16)
                 ? cast(*grad_gpu, Precision::F32) : Result<Tensor>(*grad_gpu);
             if (!g32) return std::unexpected(g32.error());
-            auto g32_gpu = ensure_gpu(*g32);
+            auto g32_gpu = import(*g32);
             if (!g32_gpu) return std::unexpected(g32_gpu.error());
             auto r = backend_.scatter_add_gpu(d32->gpu_tensor(), idx_gpu->gpu_tensor(),
                                               g32_gpu->gpu_tensor());
@@ -587,7 +587,7 @@ public:
         const Tensor& x, std::size_t M, std::size_t B, std::size_t N,
         bool inverse) override
     {
-        auto x_gpu = ensure_gpu(x);
+        auto x_gpu = import(x);
         if (!x_gpu) return std::unexpected(x_gpu.error());
 
         // Phase C1 f16 直读直写；无 f16 pipeline → 引擎内边界 cast 回退
@@ -627,7 +627,7 @@ public:
     // ── 矩阵转置：A (R, C) → out (C, R) ──
     [[nodiscard]] Result<Tensor> transpose_impl(const Tensor& A) override
     {
-        auto a_gpu = ensure_gpu(A);
+        auto a_gpu = import(A);
         if (!a_gpu) return std::unexpected(a_gpu.error());
         // Phase C1 f16 直读直写；无 f16 pipeline（设备能力不足）→ 引擎内
         // 边界 cast 回退（f16→f32→算→f16），正确性不变——绝不把 f16 buffer
@@ -660,7 +660,7 @@ public:
         std::size_t k, std::size_t stride, std::size_t pad,
         std::size_t OH, std::size_t OW) override
     {
-        auto x_gpu = ensure_gpu(x);
+        auto x_gpu = import(x);
         if (!x_gpu) return std::unexpected(x_gpu.error());
         // Phase C2d：f16 输入/输出 → f16 窗口变体（in/out 均 half，语义
         // "输出精度 = 源精度" §8.4）；无 pipeline → 引擎内边界 cast 回退
@@ -696,7 +696,7 @@ public:
         std::size_t k, std::size_t stride, std::size_t pad,
         std::size_t OH, std::size_t OW) override
     {
-        auto c_gpu = ensure_gpu(col);
+        auto c_gpu = import(col);
         if (!c_gpu) return std::unexpected(c_gpu.error());
         // Phase C2d：同 im2col——f16 窗口变体优先，无 pipeline 引擎内回退
         if (c_gpu->precision() == Precision::F16)
@@ -730,7 +730,7 @@ public:
     [[nodiscard]] Result<Tensor> grouped_reduce_f16_or_cast_(
         const Tensor& x, std::size_t G, std::size_t R, bool is_max)
     {
-        auto x_gpu = ensure_gpu(x);
+        auto x_gpu = import(x);
         if (!x_gpu) return std::unexpected(x_gpu.error());
         if (x_gpu->precision() == Precision::F16)
         {
@@ -743,7 +743,7 @@ public:
             }
             auto x32 = cast(*x_gpu, Precision::F32);
             if (!x32) return std::unexpected(x32.error());
-            auto x32_gpu = ensure_gpu(*x32);
+            auto x32_gpu = import(*x32);
             if (!x32_gpu) return std::unexpected(x32_gpu.error());
             auto r = backend_.grouped_reduce_gpu(x32_gpu->gpu_tensor(), G, R, is_max);
             if (!r) return std::unexpected(r.error());
@@ -778,9 +778,9 @@ public:
         Precision P = Precision::F32) override
     {
         // 确保 A、B 在 GPU 上
-        auto a_gpu = ensure_gpu(A);
+        auto a_gpu = import(A);
         if (!a_gpu) return std::unexpected(a_gpu.error());
-        auto b_gpu = ensure_gpu(B);
+        auto b_gpu = import(B);
         if (!b_gpu) return std::unexpected(b_gpu.error());
 
         // ── F32 路径（现状，零改动）─────────────────────────────────────
@@ -832,9 +832,9 @@ public:
             auto b32 = cast(*b_gpu, Precision::F32);
             if (!b32) return std::unexpected(b32.error());
 
-            auto a32_gpu = ensure_gpu(*a32);
+            auto a32_gpu = import(*a32);
             if (!a32_gpu) return std::unexpected(a32_gpu.error());
-            auto b32_gpu = ensure_gpu(*b32);
+            auto b32_gpu = import(*b32);
             if (!b32_gpu) return std::unexpected(b32_gpu.error());
 
             // f32 matmul
@@ -914,9 +914,9 @@ public:
         Scalar alpha,
         Precision P = Precision::F32) override
     {
-        auto a_gpu = ensure_gpu(A);
+        auto a_gpu = import(A);
         if (!a_gpu) return std::unexpected(a_gpu.error());
-        auto b_gpu = ensure_gpu(B);
+        auto b_gpu = import(B);
         if (!b_gpu) return std::unexpected(b_gpu.error());
 
         // ── F32 路径（现状，零改动）─────────────────────────────────────
@@ -956,9 +956,9 @@ public:
             auto b32 = cast(*b_gpu, Precision::F32);
             if (!b32) return std::unexpected(b32.error());
 
-            auto a32_gpu = ensure_gpu(*a32);
+            auto a32_gpu = import(*a32);
             if (!a32_gpu) return std::unexpected(a32_gpu.error());
-            auto b32_gpu = ensure_gpu(*b32);
+            auto b32_gpu = import(*b32);
             if (!b32_gpu) return std::unexpected(b32_gpu.error());
 
             auto r = backend_.batched_matmul_gpu(
@@ -984,9 +984,9 @@ public:
         if (A.rows() != B.rows() || A.cols() != B.cols())
             return std::unexpected(Error{"add_inplace: shape mismatch"});
 
-        auto a_gpu = ensure_gpu(A);
+        auto a_gpu = import(A);
         if (!a_gpu) return std::unexpected(a_gpu.error());
-        auto b_gpu = ensure_gpu(B);
+        auto b_gpu = import(B);
         if (!b_gpu) return std::unexpected(b_gpu.error());
 
         // Phase C1b：目标 A 是 f16 → f16 pipeline 原地直加（A 自身永不物化
@@ -1063,7 +1063,7 @@ public:
             &a_gpu->gpu_tensor());  // BINARY, Add, 原地写回 A
         if (!r)
             return std::unexpected(r.error());
-        // 原地模式下 A 的 buffer 已被更新；若 ensure_gpu 上传了新 Tensor（防御路径），替换 A
+        // 原地模式下 A 的 buffer 已被更新；若 import 上传了新 Tensor（防御路径），替换 A
         if (A.is_cpu())
             A = std::move(*a_gpu);
         return {};
@@ -1072,7 +1072,7 @@ public:
     // A *= s：真原地，直接写回 A 的 buffer（与 CpuEngine 语义一致）
     [[nodiscard]] Result<void> scale_inplace_impl(Tensor& A, Scalar s) override
     {
-        auto a_gpu = ensure_gpu(A);
+        auto a_gpu = import(A);
         if (!a_gpu) return std::unexpected(a_gpu.error());
 
         // Phase C1b：f16 → f16 pipeline 原地缩放（A 永不物化 f32 副本）；
@@ -1117,7 +1117,7 @@ public:
     // A = 0：使用 vkCmdFillBuffer 真原地清零（不分配新 buffer）
     [[nodiscard]] Result<void> zero_impl(Tensor& A) override
     {
-        auto a_gpu = ensure_gpu(A);
+        auto a_gpu = import(A);
         if (!a_gpu) return std::unexpected(a_gpu.error());
         if (a_gpu->precision() == Precision::F16)   // vkCmdFillBuffer 字节级 → f16 原生可用
         {
@@ -1130,7 +1130,7 @@ public:
         if (!r)
             return std::unexpected(r.error());
         // fill_zero 修改的是 GPU buffer 本身，Tensor 的 shared_ptr 不变
-        // 但若 ensure_gpu 上传了新 Tensor，需要替换 A
+        // 但若 import 上传了新 Tensor，需要替换 A
         if (A.is_cpu())
             A = std::move(*a_gpu);
         return {};
@@ -1162,13 +1162,13 @@ public:
         const Tensor& boundary, bool has_bnd,
         Precision prec = Precision::F32) override
     {
-        auto k = ensure_gpu(K); if (!k) return std::unexpected(k.error());
-        auto v = ensure_gpu(V); if (!v) return std::unexpected(v.error());
-        auto p = ensure_gpu(P); if (!p) return std::unexpected(p.error());
-        auto r = ensure_gpu(R); if (!r) return std::unexpected(r.error());
-        auto a = ensure_gpu(A0); if (!a) return std::unexpected(a.error());
-        auto b = ensure_gpu(B0); if (!b) return std::unexpected(b.error());
-        auto bn = ensure_gpu(boundary); if (!bn) return std::unexpected(bn.error());
+        auto k = import(K); if (!k) return std::unexpected(k.error());
+        auto v = import(V); if (!v) return std::unexpected(v.error());
+        auto p = import(P); if (!p) return std::unexpected(p.error());
+        auto r = import(R); if (!r) return std::unexpected(r.error());
+        auto a = import(A0); if (!a) return std::unexpected(a.error());
+        auto b = import(B0); if (!b) return std::unexpected(b.error());
+        auto bn = import(boundary); if (!bn) return std::unexpected(bn.error());
         const bool all_f16 = k->precision() == Precision::F16 &&
             v->precision() == Precision::F16 && p->precision() == Precision::F16 &&
             r->precision() == Precision::F16 && a->precision() == Precision::F16 &&
@@ -1210,10 +1210,10 @@ public:
         const Tensor& boundary, bool has_bnd,
         Precision prec = Precision::F32) override
     {
-        auto d = ensure_gpu(D); if (!d) return std::unexpected(d.error());
-        auto x = ensure_gpu(X); if (!x) return std::unexpected(x.error());
-        auto y = ensure_gpu(Y); if (!y) return std::unexpected(y.error());
-        auto bn = ensure_gpu(boundary); if (!bn) return std::unexpected(bn.error());
+        auto d = import(D); if (!d) return std::unexpected(d.error());
+        auto x = import(X); if (!x) return std::unexpected(x.error());
+        auto y = import(Y); if (!y) return std::unexpected(y.error());
+        auto bn = import(boundary); if (!bn) return std::unexpected(bn.error());
         const bool all_f16 = d->precision() == Precision::F16 &&
             x->precision() == Precision::F16 && y->precision() == Precision::F16 &&
             bn->precision() == Precision::F16;
@@ -1244,9 +1244,9 @@ public:
         std::size_t dk, bool has_scale,
         Precision prec = Precision::F32) override
     {
-        auto p = ensure_gpu(P); if (!p) return std::unexpected(p.error());
-        auto r = ensure_gpu(R); if (!r) return std::unexpected(r.error());
-        auto s = ensure_gpu(S); if (!s) return std::unexpected(s.error());
+        auto p = import(P); if (!p) return std::unexpected(p.error());
+        auto r = import(R); if (!r) return std::unexpected(r.error());
+        auto s = import(S); if (!s) return std::unexpected(s.error());
         const bool all_f16 = p->precision() == Precision::F16 &&
             r->precision() == Precision::F16 && s->precision() == Precision::F16;
         if (prec == Precision::F16 && all_f16 &&
@@ -1279,7 +1279,7 @@ public:
     [[nodiscard]] Result<GpuTensor> reduce_f16_or_cast_(
         const Tensor& A, uint32_t mode, uint32_t reduce_op)
     {
-        auto a_gpu = ensure_gpu(A);
+        auto a_gpu = import(A);
         if (!a_gpu) return std::unexpected(a_gpu.error());
         if (a_gpu->precision() == Precision::F16)
         {
@@ -1291,7 +1291,7 @@ public:
             // 引擎内边界 cast（无 f16 pipeline 的设备）
             auto a32 = cast(*a_gpu, Precision::F32);
             if (!a32) return std::unexpected(a32.error());
-            auto a32_gpu = ensure_gpu(*a32);
+            auto a32_gpu = import(*a32);
             if (!a32_gpu) return std::unexpected(a32_gpu.error());
             return backend_.reduce_gpu(a32_gpu->gpu_tensor(), mode, reduce_op);
         }
@@ -1349,7 +1349,7 @@ public:
         out.bufs.reserve(ts.size());
         for (const auto& t : ts)
         {
-            auto g = ensure_gpu(t);
+            auto g = import(t);
             if (!g) return std::unexpected(g.error());
             if (g->precision() == Precision::F16)
                 out.bufs.push_back(&g->gpu_tensor<Precision::F16>().buffer());
@@ -1638,7 +1638,7 @@ public:
             auto fi_r = fused_buffers_(inputs);
             if (!fi_r) return std::unexpected(fi_r.error());
             std::vector<const GpuBuffer*>& gpu_inputs = fi_r->bufs;   // owners 随 fi_r 存活到本作用域末
-            auto dst_gpu = ensure_gpu(dst);
+            auto dst_gpu = import(dst);
             if (!dst_gpu) return std::unexpected(dst_gpu.error());
             // ── output_override 必须按目标存储精度取视图 ──────────────────
             // f16 目标必须经 f16_view 包 f16 buffer（同 run_fused_gpu 的
@@ -1673,7 +1673,7 @@ public:
                 nn::expr_spec_runtime_matmul_k(spec),
                 nn::expr_spec_runtime_matmul_batch(spec));
             if (!out) return std::unexpected(out.error());
-            // dst 原为 CPU staging 时，ensure_gpu 上传了新 buffer（结果在它上面）
+            // dst 原为 CPU staging 时，import 上传了新 buffer（结果在它上面）
             // → 用 upload 后的张量替换 dst，保证调用方看到更新后的数据
             if (dst.is_cpu())
                 dst = std::move(*dst_gpu);
@@ -1704,16 +1704,35 @@ private:
     // ── 辅助：确保 Tensor 在 GPU 上 ──────────────────────────────────────
     // 若已是 GPU，返回共享拷贝（零开销）；若为 CPU，上传到 GPU。
     // 纯 GPU 架构下，所有 Tensor 应已是 GPU，此方法为防御性兜底。
-    [[nodiscard]] Result<Tensor> ensure_gpu(const Tensor& t)
+    // ── 跨设备拉取：CPU → 设备直传（M6，17 §4.3 / 15 §3.2 P3）────────────
+    // 原 `ensure_gpu`（16 §2 的 43 处调用点已全部改为公共入口 `import`）。
+    // 语义：
+    //   已在设备：同精度 = 零拷贝别名；异精度 = 引擎内 cast；
+    //   CPU 源 + f32→f32：直接从宿主存储上载（与原 ensure_gpu 同一条快路径，
+    //     不经额外宿主拷贝）；
+    //   其余精度组合（如 f16 源）：经宿主中转（升 f32 再按 P 落回）——
+    //     原 ensure_gpu 硬取 `cpu_matrix()`（F32 槽）对 f16 源会取到空指针。
+    [[nodiscard]] Result<Tensor> import_impl(const Tensor& src, Precision P) override
     {
-        if (t.is_gpu())
-            return t;  // 共享拷贝
-        if (!t.valid())
-            return std::unexpected(Error{"ensure_gpu: invalid tensor"});
-        auto r = GpuTensor::from_matrix(t.cpu_matrix(), backend_);
-        if (!r)
-            return std::unexpected(r.error());
-        return Tensor::from_gpu(std::move(*r));
+        if (src.is_gpu())
+        {
+            if (P == src.precision())
+                return src;                 // 同设备同精度 = 零拷贝别名（共享拷贝）
+            return cast(src, P);            // 同设备异精度 = 引擎内 cast
+        }
+        if (!src.valid())
+            return std::unexpected(Error{"import: invalid tensor"});
+        if (src.precision() == Precision::F32 && P == Precision::F32)
+        {
+            auto r = GpuTensor::from_matrix(src.cpu_matrix(), backend_);
+            if (!r)
+                return std::unexpected(r.error());
+            return Tensor::from_gpu(std::move(*r));
+        }
+        auto m = to_matrix(src, Precision::F32);
+        if (!m)
+            return std::unexpected(m.error());
+        return from_matrix(*m, P);
     }
 };
 
