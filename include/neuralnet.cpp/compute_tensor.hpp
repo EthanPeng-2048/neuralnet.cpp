@@ -38,6 +38,17 @@ namespace nn
 // ComputeEngine 前置声明：Tensor 持有非拥有绑定（observer_ptr，P1 出生绑定，
 // docs/development/15-computeengine-refresh.md §3.1），不能反向 include。
 class ComputeEngine;
+class CpuEngine;
+class GpuEngine;
+
+namespace detail
+{
+// 引擎域内通道（M1，docs/development/17 §4.1 豁免之一）：
+// Tensor 存储访问器与静态直构工厂私有化后，DSL 求值器（expr_dsl.hpp 的
+// eval_cpu / 扫描占位 / 求值叶子）经此创建与访问 Tensor 存储。
+// 库外（测试/tools/CLI）禁止使用——绕过引擎的编译期强制靠下方访问器私有化。
+struct TensorAccess;
+} // namespace detail
 
 // ── 计算设备 ──────────────────────────────────────────────────────────────
 enum class Device : uint8_t
@@ -71,7 +82,13 @@ private:
     // Tensor（一期不加析构探测，13 §10.3 第 3 条）。
     observer_ptr<ComputeEngine> engine_ = nullptr;
 
+    // ── M1 访问收口（docs/development/17 §4.1）：存储与创建只对引擎域内开放 ──
+    // 公共面只剩形状/精度/设备查询、bound()/engine()、valid()、shape_str()。
+    // 绕过引擎摸存储 = 编译错误（库内豁免：引擎 friend + detail::TensorAccess）。
     friend class ComputeEngine;
+    friend class CpuEngine;
+    friend class GpuEngine;
+    friend struct detail::TensorAccess;
 
     // ── CPU 存储：类型擦除（std::variant，§6.1）──────────────────────────
     // Phase 1：F16（index 0）/ F32（index 1）
@@ -125,6 +142,7 @@ private:
 public:
     Tensor() = default;
 
+private:
     // ── CPU 构造（f32）────────────────────────────────────────────────────
     explicit Tensor(std::shared_ptr<Matrix> m)
         : device_(Device::CPU), precision_(Precision::F32),
@@ -201,6 +219,7 @@ public:
     }
 #endif
 
+public:
     // ── 访问器 ────────────────────────────────────────────────────────────
     [[nodiscard]] Device device() const noexcept { return device_; }
     [[nodiscard]] Precision precision() const noexcept { return precision_; }
@@ -239,6 +258,7 @@ public:
 #endif
     }
 
+private:
     // ── CPU 存储访问（模板化，P 默认 F32，§6.1）──────────────────────────
     template <Precision P = Precision::F32>
     [[nodiscard]] MatrixT<P>& cpu_matrix()
@@ -308,6 +328,7 @@ public:
     }
 #endif
 
+public:
     // ── 形状描述（调试用） ────────────────────────────────────────────────
     [[nodiscard]] std::string shape_str() const
     {
@@ -316,7 +337,10 @@ public:
              + precision_name(precision_);
     }
 
+private:
     // ── reshape（GPU 共享底层 buffer；CPU 复制数据）──────────────────────
+    // M1（docs/development/17 §3 D10）：移入引擎——公共入口是
+    // ComputeEngine::reshape（bind_check + stamp），本实现只对引擎域内可见。
     // 后端无关入口：上层无需直接访问 gpu_tensor() / cpu_matrix() 即可调整形状。
     // GPU：共享底层 buffer，仅改形状元数据（零拷贝）；CPU：Matrix 无"零拷贝
     // 视图"能力，按 precision_ 复制数据到新形状的 Matrix（§6.1）。
@@ -358,6 +382,36 @@ public:
             t.cpu_data_ = cpu_data_;  // GPU 模式：CPU variant 为空（保持一致）
         }
         return t;
+    }
+};
+
+// ── 引擎域内访问通道（M1，docs/development/17 §4.1 豁免之一）──────────────
+// Tensor 的存储访问器/静态直构工厂已私有化；DSL 求值器（expr_dsl.hpp）在
+// friend 关系下经本结构创建与读写存储。库外（测试/tools/CLI）不得使用——
+// 绕过引擎摸张量的正道是 engine.from_matrix / to_matrix / create_tensor。
+struct detail::TensorAccess
+{
+    template <Precision P = Precision::F32>
+    [[nodiscard]] static MatrixT<P>& cpu_matrix(Tensor& t) { return t.cpu_matrix<P>(); }
+    template <Precision P = Precision::F32>
+    [[nodiscard]] static const MatrixT<P>& cpu_matrix(const Tensor& t) { return t.cpu_matrix<P>(); }
+
+    [[nodiscard]] static Tensor from_matrix(Matrix m) { return Tensor::from_matrix(std::move(m)); }
+    [[nodiscard]] static Tensor from_matrix(MatrixT<Precision::F16> m) { return Tensor::from_matrix(std::move(m)); }
+
+    [[nodiscard]] static Tensor cpu(std::size_t rows, std::size_t cols)
+    {
+        return Tensor::cpu(rows, cols);
+    }
+    template <Precision P>
+    [[nodiscard]] static Tensor cpu(std::size_t rows, std::size_t cols)
+    {
+        return Tensor::cpu<P>(rows, cols);
+    }
+
+    [[nodiscard]] static Tensor cpu_uninitialized(std::size_t rows, std::size_t cols)
+    {
+        return Tensor::cpu_uninitialized(rows, cols);
     }
 };
 
