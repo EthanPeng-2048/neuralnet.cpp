@@ -47,6 +47,7 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 | 构建期工具（AOT 融合） | `tools/scan_exprs.cpp` / `tools/gen_fused.cpp`（另有 `tools/decode_fused.py` 调试用） |
 | 批量改写 / 一致性审计（改多处时用，均带 `-DryRun`） | `tools/edit_ranges.ps1`（行区间删除：四重断言 + **花括号平衡护栏**）/ `tools/test_refactor.ps1`（删定义块 / 插 include / 正则替换）/ `tools/apply_nn_try.ps1`（`auto X = f(); if (!X) …` → `NN_TRY`/`NN_TRY_CHECK`，L2 层，带 `-DryRun` 计数）/ `tools/doc_rename.ps1`（文档词法改名）/ `bench/doc_align_audit.ps1`（文档↔代码对齐审计：文件/符号/CLI/数字/测试名）/ `bench/doc_inventory.ps1`（引擎接口盘点 + **第 [4] 节 L2+ 分层审计：`Matrix`/Matrix 型 I/O 动词零命中门禁，铁律 #12**） |
 | 与 PyTorch 对拍 | `compare_with_torch/`（model.py / text_train.py / text_infer.py） |
+| GUI ↔ CLI 一致性（改 `gui.py`/`cli_controllers.py`/任一 CLI 选项后跑） | `bench/gui_cli_audit.py`（三节：GUI→CLI flag 差集 + 反向缺失、幽灵选项=帮助声明 vs 解析分支、`gui.py` 的 `self.X` 赋值静态校验；退出码 0 = 无偏差。复现：`python bench/gui_cli_audit.py`） |
 
 ## 4. 分层架构（L0→L5，严格单向依赖，上层只依赖下层公有接口）
 
@@ -282,7 +283,7 @@ optimizer.step();
 
 - **GPU `stable=f16` 训练 loss 打印冻结（未修）**：`text_train --precision-stable f16` 时 step 恒 4.0137、跨 epoch/跨进程逐位相同；**权重照常更新**（同进程跨 epoch 模型快照 63% 参数字节不同，冻结仅在 loss 回读链）；CPU 同配置健康；ctest 全绿（19/19）但**无 GPU+stable=f16 用例**。触发矩阵、覆盖缺口与证据见 `docs/development/14-f16-stable-gpu-loss-frozen.md`。推荐路径 `--f16`（stable/optimizer=f32）实测健康。
 - **数值性限制**：四字段全 f16 不可训练——`optimizer=f16` 单独即令 Adam 更新爆炸、`stable=f16` 链约 200 步 NaN，见 `docs/development/05-mixed-precision.md` §12.5；常规 f32 训练健康收敛。
-- **不存在的 CLI 参数**：`--tdr-retry`/`--max-tdr-retries`（勿引用）。
+- **不存在的 CLI 参数**：`--tdr-retry`/`--max-tdr-retries` 与 `mnist_train --osc-guard`/`--osc-window`/`--osc-threshold`（**均已移除**：前两者从未实现，后三者属"帮助声明了、解析分支不存在"的幽灵选项，2026-10-01 已从帮助/控制器/GUI 三层清除，详见 `docs/history.md`「GUI / CLI 参数一致性清理」）。
 - **`text_train --model zipt` 启动即中止（未修）** → **已随 ZiPT 整体移除而消失（2026-10-01）**：AttnZip/ZiPT 已从主线移除（`--model zipt` 现在直接报"未知模型架构"并给出迁移提示），代码保留在 **`legacy/zipt` 分支**。**恢复前提（两条同时满足）**：① **算法层**——压缩向量必须因果（压缩器只能看当前位置之前的内容）；② **代码层**——实现质量对齐 RAPT/GPT（支持 `forward_recompute` 梯度检查点与 activation offload、CLI/序列化/测试齐备）。裁决依据见 `docs/history.md`「ZiPT 移除」条。已移除的 API：`ZiPTModel`/`ZiPTBlock`/`CrossAttention`、`build_zipt_model*`/`make_zipt_spec`/`ZiPTConfig`/`ZIPT_MEMORY_TOKENS`、`ModelSpec::is_zipt()` 与 `memory_tokens`/`window` 字段、CLI `--model zipt`/`--window`/`--memory-tokens`、`zipt_test`；`ModelType` 的 6 号枚举保留为 `Reserved_ZiPT` 占位，用于对旧 `.bin`（type=6）给出明确错误。
 
 ### 已交付能力（当前功能清单）

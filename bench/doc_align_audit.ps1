@@ -35,7 +35,8 @@ $historicalFiles = @('compute_cuda_engine.hpp','compute_cuda_backend.hpp','cuda_
                      'perf_smoke.cpp','mnist_common.hpp','train_bytebpe.py',
                      'expr_fuse_test.cpp','expr_graph_test.cpp','expr_spec_test.cpp','matmul_fusion_test.cpp',
                      'offload_primitive_test.cpp','offload_test.cpp','broadcast.comp',
-                     'compute_precision_engine.hpp')   # P-1（2026-09-29）随 PrecisionEngine 下沉删除
+                     'compute_precision_engine.hpp',   # P-1（2026-09-29）随 PrecisionEngine 下沉删除
+                     'compute_layer_zipt.hpp','domain_zipt.hpp')  # ZiPT 移除（2026-10-01，分支 legacy/zipt）
 
 # ── [A] 文档引用的文件是否存在 ──────────────────────────────────────────
 Write-Host '=== [A] 文档引用但仓库中不存在的文件 ==='
@@ -123,7 +124,11 @@ $externalFlags = @('--test-dir','--parallel','--target-env','--dtype','--adam-ep
                    '--summary',   # vulkaninfo（16 §复现命令）
                    '--include')   # grep（16 §复现命令）
 # 已在文档中明确标注"已移除"的历史参数
-$removedFlags  = @('--cuda','--tdr-retry','--max-tdr-retries')
+#   --memory-tokens / --window : ZiPT(AttnZip) 专用，随 ZiPT 于 2026-10-01 移除
+#   --osc-guard/-window/-threshold : mnist_train 的幽灵选项（帮助声明、解析不存在），同日清除
+$removedFlags  = @('--cuda','--tdr-retry','--max-tdr-retries',
+                   '--memory-tokens','--window',
+                   '--osc-guard','--osc-window','--osc-threshold')
 
 # ── [D] 文档里的 CLI 参数是否存在 ────────────────────────────────────────
 Write-Host '=== [D] 文档引用但代码中不存在的 CLI 参数（--flag）==='
@@ -191,7 +196,9 @@ foreach ($d in $docs) {
 $missTests = 0
 $histTests = 0
 # 历史/已并入的测试名（历史交付表中的当时目标名，勿再报警）
-$historicalTests = @('expr_fuse_test','expr_graph_test','expr_spec_test','matmul_fusion_test','offload_primitive_test')
+#   zipt_* : 随 ZiPT 于 2026-10-01 移除（历史文档提及属正常）
+$historicalTests = @('expr_fuse_test','expr_graph_test','expr_spec_test','matmul_fusion_test','offload_primitive_test',
+                    'zipt_test','zipt_gradcheck','zipt_smoke_test','zipt_consistency_test','zipt_doc_test')
 foreach ($t in ($tests.Keys | Sort-Object)) {
     $inCm = $cmText -match [regex]::Escape($t)
     $inSrc = $realFiles.ContainsKey("$t.cpp")

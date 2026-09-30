@@ -38,7 +38,7 @@ train_pkg.py - 训练包（配置 + 数据）制作与按超参训练
 
   # 训练：直接喂配置（本机）或压缩包（跨设备，自动解包并校验）
   python train_pkg.py train runs/gpt.json
-  python train_pkg.py train runs/gpt.nnpkg --device cuda
+  python train_pkg.py train runs/gpt.nnpkg --device gpu
   python train_pkg.py train runs/gpt.nnpkg --workdir runs/gpt_work --save runs/gpt.bin
 """
 
@@ -482,15 +482,14 @@ def train(config_src: Any, *,
             hyper[arg] = local
 
     # 2) 设备覆盖（CLI 优先，其次配置 device）
+    #    本项目后端仅 CPU / Vulkan，**不支持 CUDA**（AGENTS §2）。
     dev = device or manifest.get("device") or "cpu"
     hyper.pop("gpu", None)
-    hyper.pop("cuda", None)
+    hyper.pop("cuda", None)   # 兼容旧包：忽略历史 cuda 字段
     if dev == "gpu":
         hyper["gpu"] = True
-    elif dev == "cuda":
-        hyper["cuda"] = True
     elif dev != "cpu":
-        raise ValueError(f"未知设备: {dev}，可选 cpu/gpu/cuda")
+        raise ValueError(f"未知设备: {dev}，可选 cpu/gpu")
 
     # 3) 保存路径覆盖
     if save:
@@ -522,8 +521,8 @@ def train(config_src: Any, *,
 # ═══════════════════════════════════════════════════════════════════
 
 def _add_common(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--device", choices=["cpu", "gpu", "cuda"],
-                   help="覆盖训练设备（默认用配置里的 device）")
+    p.add_argument("--device", choices=["cpu", "gpu"],
+                   help="覆盖训练设备（默认用配置里的 device；后端仅 CPU / Vulkan）")
     p.add_argument("--workdir", help="解包/工作目录（默认 <包路径>.d）")
     p.add_argument("--save", help="覆盖模型保存路径")
 
