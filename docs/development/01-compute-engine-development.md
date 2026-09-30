@@ -115,6 +115,10 @@ engine.end_batch();  // 提交并等待
 // 公共非虚入口（包装在尾部统一 stamp 出生绑定，15 §3.1）：
 [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols,
                                    Precision P = Precision::F32);
+// M2（17 §4.4）：声明式创建/初始化——层算分布参数、引擎填数
+//（基类 host 生成 + from_matrix 上传；seed 与引擎内创建序号混流）：
+[[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols, Precision P,
+                                   const InitSpec& spec);
 [[nodiscard]] Result<Tensor> from_matrix(const Matrix& m, Precision P = Precision::F32);
 // to_matrix 输出宿主 Matrix，仍为纯虚（不参与 stamp）：
 [[nodiscard]] virtual Result<Matrix> to_matrix(const Tensor& t, Precision P = Precision::F32) = 0;
@@ -125,7 +129,9 @@ engine.end_batch();  // 提交并等待
 ```
 
 **作用**：
-- `create_tensor`：创建指定存储精度的空张量
+- `create_tensor`（3 参）：纯分配（CPU 分配零填充、GPU 分配未初始化——需要零的调用方显式 `zero`）
+- `create_tensor`（4 参，`InitSpec`）：声明式初值（Uninitialized/Zero/Constant/Uniform/Normal），
+  层算分布参数、引擎填数；策略（host 生成上传 vs 将来设备端原生）由引擎自选（17 §4.4 D6）
 - `from_matrix`：CPU Matrix → Tensor（按 P 分配存储；可能拷贝）
 - `to_matrix`：Tensor → CPU Matrix（按 P 转换；可能下载）
 
