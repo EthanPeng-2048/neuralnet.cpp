@@ -35,7 +35,9 @@ private:
     // 把单个位置 pos 的 cos/sin 写入指定列（rebuild/apply_step 共用）。
     // LLaMA 式：cos 沿 d 维 = cat(freqs, freqs)（前后半相同），
     // 配合 rotate_half（前后半交换+前半取负）构成 2×2 旋转块。
-    void fill_pos_column_(Matrix& c, Matrix& s, std::size_t pos, std::size_t col) const
+    // c/s 为行主序标量缓冲（cols 列），宿主桥（17 §3 D11）——不经 Matrix。
+    void fill_pos_column_(std::span<Scalar> c, std::span<Scalar> s, std::size_t cols,
+                          std::size_t pos, std::size_t col) const
     {
         const std::size_t half = d_k_ / 2;
         const Scalar pd = static_cast<Scalar>(pos);
@@ -45,10 +47,10 @@ private:
                 static_cast<Scalar>(2 * j) / static_cast<Scalar>(d_k_));
             const Scalar cv = std::cos(theta);
             const Scalar sv = std::sin(theta);
-            c.set_value_unchecked(j,        col, cv);
-            c.set_value_unchecked(half + j, col, cv);
-            s.set_value_unchecked(j,        col, sv);
-            s.set_value_unchecked(half + j, col, sv);
+            c[j        * cols + col] = cv;
+            c[(half + j) * cols + col] = cv;
+            s[j        * cols + col] = sv;
+            s[(half + j) * cols + col] = sv;
         }
     }
 
@@ -56,13 +58,13 @@ private:
     // （绝对位置偏移：滑动窗生成时，输入被截断到窗口，但位置应从真实起点算起）
     [[nodiscard]] Result<void> rebuild(ComputeEngine& engine, std::size_t seq)
     {
-        Matrix c(d_k_, seq), s(d_k_, seq);
+        std::vector<Scalar> c(d_k_ * seq), s(d_k_ * seq);
         for (std::size_t pos = 0; pos < seq; ++pos)
-            fill_pos_column_(c, s, pos + pos_offset_, pos);
-        auto cr = engine.from_matrix(c);
+            fill_pos_column_(c, s, seq, pos + pos_offset_, pos);
+        auto cr = detail::upload_span(engine, d_k_, seq, Precision::F32, std::span(c));
         if (!cr) return std::unexpected(cr.error());
         cos_cache_ = std::move(*cr);
-        auto sr = engine.from_matrix(s);
+        auto sr = detail::upload_span(engine, d_k_, seq, Precision::F32, std::span(s));
         if (!sr) return std::unexpected(sr.error());
         sin_cache_ = std::move(*sr);
         seq_cached_ = seq;
@@ -134,11 +136,11 @@ public:
     {
         if (d_k_ == 0 || d_k_ % 2 != 0)
             return std::unexpected(Error{"RotaryEmbedding::apply_step: d_k must be positive and even"});
-        Matrix c(d_k_, 1), s(d_k_, 1);
-        fill_pos_column_(c, s, pos, 0);
-        auto cr = engine.from_matrix(c);
+        std::vector<Scalar> c(d_k_), s(d_k_);       // 宿主桥（17 §3 D11）
+        fill_pos_column_(c, s, 1, pos, 0);
+        auto cr = detail::upload_span(engine, d_k_, 1, Precision::F32, std::span(c));
         if (!cr) return std::unexpected(cr.error());
-        auto sr = engine.from_matrix(s);
+        auto sr = detail::upload_span(engine, d_k_, 1, Precision::F32, std::span(s));
         if (!sr) return std::unexpected(sr.error());
         const std::uint32_t dk = static_cast<std::uint32_t>(d_k_);
         if (backward)
@@ -1136,11 +1138,12 @@ protected:
             //   越界读/ALiBi 静默错（batch=1 时下标恒 <H，掩盖该错误）。
             if (!slopes_cache_.valid() || slopes_cached_batch_ != batch)
             {
-                Matrix s(1, batch * num_heads_);
+                std::vector<Scalar> s(batch * num_heads_);   // 宿主桥（17 §3 D11）
                 for (std::size_t b = 0; b < batch; ++b)
                     for (std::size_t h = 0; h < num_heads_; ++h)
-                        s.set_value_unchecked(0, b * num_heads_ + h, slopes_[h]);
-                auto t = engine.from_matrix(s);
+                        s[b * num_heads_ + h] = slopes_[h];
+                auto t = detail::upload_span(engine, 1, batch * num_heads_,
+                                             Precision::F32, std::span(s));
                 if (!t) return std::unexpected(t.error());
                 slopes_cache_ = std::move(*t);
                 slopes_cached_batch_ = batch;
@@ -1152,13 +1155,14 @@ protected:
             // doc_ids_cache_ 为 (1, BH*seq) 布局——每 (b,h) 块重复
             // doc_ids[b*seq..]（BatchCol 视图的 batch 下标 = BH 网格下标，
             // 故不能用 (1, batch*seq) 布局）
-            Matrix d(1, batch * num_heads_ * seq);
+            std::vector<Scalar> d(batch * num_heads_ * seq);
             for (std::size_t b = 0; b < batch; ++b)
                 for (std::size_t h = 0; h < num_heads_; ++h)
                     for (std::size_t i = 0; i < seq; ++i)
-                        d.set_value_unchecked(0, (b * num_heads_ + h) * seq + i,
-                                              static_cast<Scalar>(doc_ids_[b * seq + i]));
-            auto t = engine.from_matrix(d);
+                        d[(b * num_heads_ + h) * seq + i] =
+                            static_cast<Scalar>(doc_ids_[b * seq + i]);
+            auto t = detail::upload_span(engine, 1, batch * num_heads_ * seq,
+                                         Precision::F32, std::span(d));
             if (!t) return std::unexpected(t.error());
             doc_ids_cache_ = std::move(*t);
 
@@ -1166,14 +1170,14 @@ protected:
             // = doc_ids[b*seq+i]（跨 head 重复；IR 掩码按行广播读取）
             {
                 const std::size_t BH = batch * num_heads_;
-                Matrix dc(BH * seq, 1);
+                std::vector<Scalar> dc(BH * seq);
                 for (std::size_t b = 0; b < batch; ++b)
                     for (std::size_t h = 0; h < num_heads_; ++h)
                         for (std::size_t i = 0; i < seq; ++i)
-                            dc.set_value_unchecked(
-                                (b * num_heads_ + h) * seq + i, 0,
-                                static_cast<Scalar>(doc_ids_[b * seq + i]));
-                auto tc = engine.from_matrix(dc);
+                            dc[(b * num_heads_ + h) * seq + i] =
+                                static_cast<Scalar>(doc_ids_[b * seq + i]);
+                auto tc = detail::upload_span(engine, BH * seq, 1, Precision::F32,
+                                              std::span(dc));
                 if (!tc) return std::unexpected(tc.error());
                 doc_col_ = std::move(*tc);
             }
@@ -1213,8 +1217,8 @@ protected:
         if (!use_alibi_) return std::move(scores);
 
         const std::size_t new_len = cur_len + 1;
-        // 构建 ALiBi 偏置矩阵 (H, new_len)
-        Matrix bias(num_heads_, new_len);
+        // 构建 ALiBi 偏置矩阵 (H, new_len)（宿主桥，17 §3 D11）
+        std::vector<Scalar> bias(num_heads_ * new_len);
         for (std::size_t h = 0; h < num_heads_; ++h)
         {
             const Scalar slope = slopes_[h];
@@ -1222,11 +1226,11 @@ protected:
             {
                 // j ∈ [0, cur_len]，距离 cur_len - j ∈ [0, cur_len]
                 const std::size_t dist = cur_len - j;
-                bias.set_value_unchecked(h, j,
-                    -slope * static_cast<Scalar>(dist));
+                bias[h * new_len + j] = -slope * static_cast<Scalar>(dist);
             }
         }
-        auto bias_t = engine.from_matrix(bias);
+        auto bias_t = detail::upload_span(engine, num_heads_, new_len, Precision::F32,
+                                          std::span(bias));
         if (!bias_t) return std::unexpected(bias_t.error());
         return dsl::compute(engine,
             dsl::leaf(scores) + dsl::leaf(*bias_t),

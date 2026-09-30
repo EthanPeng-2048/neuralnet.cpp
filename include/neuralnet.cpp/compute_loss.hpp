@@ -103,9 +103,9 @@ public:
             dsl::row_reduce_sum(dsl::leaf(*col_sum)),
             col_sum->rows(), col_sum->cols(), p_.stable);
         if (!total_t) return std::unexpected(total_t.error());
-        auto m = engine.to_matrix(*total_t);
-        if (!m) return std::unexpected(m.error());
-        const Scalar loss = m->at_unchecked(0, 0) / total;
+        auto total_v = detail::download_vector(engine, *total_t);   // 宿主桥（17 §3 D11）
+        if (!total_v) return std::unexpected(total_v.error());
+        const Scalar loss = (*total_v)[0] / total;
 
         // grad = diff * (2/N)：2/N 由 RParam 承载（值不进 expr_spec_key，同一
         // 结构跨形状共享 AOT shader）。**就地**缩放在 diff 自己的缓冲上完成
@@ -254,10 +254,10 @@ public:
         if (!total_t) return std::unexpected(total_t.error());
 
         // 6. loss = -total / batch — 下载标量
-        auto m = engine.to_matrix(*total_t);
-        if (!m) return std::unexpected(m.error());
+        auto total_v = detail::download_vector(engine, *total_t);   // 宿主桥（17 §3 D11）
+        if (!total_v) return std::unexpected(total_v.error());
 
-        return -m->at_unchecked(0, 0) / static_cast<Scalar>(batch);
+        return -(*total_v)[0] / static_cast<Scalar>(batch);
     }
 
     [[nodiscard]] Result<Tensor> backward() override
@@ -311,7 +311,7 @@ public:
                                      num_valid_out, grad_reuse);
     }
 
-    // 同步版稀疏 CE（测试/评估等非热路径）：内部 to_matrix 下载标量。
+    // 同步版稀疏 CE（测试/评估等非热路径）：内部下载标量（宿主桥，17 §3 D11）。
     [[nodiscard]] Result<Scalar> forward_sparse(
         ComputeEngine& engine, const Tensor& logits,
         std::span<const std::size_t> labels,
@@ -322,10 +322,10 @@ public:
         auto sum_t = forward_sparse_sum(engine, logits, labels, loss_mask,
                                         vocab_size, num_valid);
         if (!sum_t) return std::unexpected(sum_t.error());
-        auto m = engine.to_matrix(*sum_t);
-        if (!m) return std::unexpected(m.error());
+        auto sum_v = detail::download_vector(engine, *sum_t);
+        if (!sum_v) return std::unexpected(sum_v.error());
         return (num_valid > 0)
-            ? -m->at_unchecked(0, 0) / static_cast<Scalar>(num_valid)
+            ? -(*sum_v)[0] / static_cast<Scalar>(num_valid)
             : Scalar{0};
     }
 
@@ -348,34 +348,31 @@ public:
 
         // 1. 上传 labels（(1, total) 浮点打包；vocab_size ≤ 2^24 时可精确表示）。
         //    越界 label 修正为 0（GPU RowGather 无越界守卫，靠 mask 置零无效）
-        Matrix labels_m(1, total);
-        {
-            auto sp = labels_m.span();
-            for (std::size_t i = 0; i < total; ++i)
-                sp[i] = static_cast<Scalar>(
-                    (labels[i] < vocab_size) ? labels[i] : 0);
-        }
-        auto labels_t = engine.from_matrix(labels_m);
+        //    宿主桥（17 §3 D11）：L2 不出现 Matrix，标量缓冲直传引擎。
+        std::vector<Scalar> labels_v(total);
+        for (std::size_t i = 0; i < total; ++i)
+            labels_v[i] = static_cast<Scalar>(
+                (labels[i] < vocab_size) ? labels[i] : 0);
+        auto labels_t = detail::upload_span(engine, 1, total, Precision::F32,
+                                            std::span(labels_v));
         if (!labels_t) return std::unexpected(labels_t.error());
 
         // 2. 有效 mask（总是构造，(1,total) 0/1；含 mask 缺失与 label 越界修正）：
         //    valid = (loss_mask 空 || mask[i]>=0.5) && labels[i] < vocab_size
-        Matrix mask_m(1, total);
+        std::vector<Scalar> mask_v(total);
+        for (std::size_t i = 0; i < total; ++i)
         {
-            auto sp = mask_m.span();
-            for (std::size_t i = 0; i < total; ++i)
-            {
-                const bool masked = !loss_mask.empty() && loss_mask[i] < Scalar{0.5};
-                sp[i] = (!masked && labels[i] < vocab_size) ? Scalar{1} : Scalar{0};
-            }
+            const bool masked = !loss_mask.empty() && loss_mask[i] < Scalar{0.5};
+            mask_v[i] = (!masked && labels[i] < vocab_size) ? Scalar{1} : Scalar{0};
         }
-        auto mask_t = engine.from_matrix(mask_m);
+        auto mask_t = detail::upload_span(engine, 1, total, Precision::F32,
+                                          std::span(mask_v));
         if (!mask_t) return std::unexpected(mask_t.error());
 
         // 3. num_valid（与 mask 判定一致）
         std::size_t num_valid = 0;
         for (std::size_t i = 0; i < total; ++i)
-            if (mask_m.span()[i] >= Scalar{0.5}) ++num_valid;
+            if (mask_v[i] >= Scalar{0.5}) ++num_valid;
         const Scalar inv_num_valid = (num_valid > 0)
             ? Scalar{1} / static_cast<Scalar>(num_valid) : Scalar{0};
 

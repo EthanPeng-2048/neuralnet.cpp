@@ -35,11 +35,11 @@ namespace conv_engine {
 {
     if (C == 0 || P == 0)
         return std::unexpected(Error{"make_layout_perm: C/P must be > 0"});
-    Matrix m(C * P, 1);
+    std::vector<Scalar> perm(C * P);          // 宿主桥（17 §3 D11）：不经 Matrix
     for (std::size_t c = 0; c < C; ++c)
         for (std::size_t p = 0; p < P; ++p)
-            m.set_value_unchecked(c * P + p, 0, static_cast<Scalar>(p * C + c));
-    return engine.from_matrix(m);
+            perm[c * P + p] = static_cast<Scalar>(p * C + c);
+    return detail::upload_span(engine, C * P, 1, Precision::F32, std::span(perm));
 }
 
 // (C, B*P) → (C*P, B)：cols 布局转 samples 布局（Conv/Pool 层输出）
@@ -311,11 +311,12 @@ private:
     {
         if (expand_cache_.valid()) return {};
         const std::size_t kk = pool_ * pool_;
-        Matrix m(channels_ * kk, 1);
+        std::vector<Scalar> expand(channels_ * kk);    // 宿主桥（17 §3 D11）
         for (std::size_t c = 0; c < channels_; ++c)
             for (std::size_t i = 0; i < kk; ++i)
-                m.set_value_unchecked(c * kk + i, 0, static_cast<Scalar>(c));
-        auto t = engine.from_matrix(m);
+                expand[c * kk + i] = static_cast<Scalar>(c);
+        auto t = detail::upload_span(engine, channels_ * kk, 1, Precision::F32,
+                                     std::span(expand));
         if (!t) return std::unexpected(t.error());
         expand_cache_ = std::move(*t);
         return {};

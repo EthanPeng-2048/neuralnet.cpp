@@ -158,10 +158,11 @@ public:
             }
         }
 
-        // 仅一次下载获取全局平方和
-        auto m_r = engine_.to_matrix(acc);
-        if (!m_r) return std::unexpected(m_r.error());
-        const Scalar total_sq = m_r->at(0, 0);
+        // 仅一次下载获取全局平方和（宿主桥，17 §3 D11）
+        std::vector<Scalar> total_buf(acc.rows() * acc.cols());
+        auto dl_r = detail::download_span(engine_, acc, std::span(total_buf));
+        if (!dl_r) return std::unexpected(dl_r.error());
+        const Scalar total_sq = total_buf[0];
 
         Scalar norm = std::sqrt(total_sq);
         if (norm <= max_norm)
@@ -516,10 +517,11 @@ public:
     if (!total_norm_sq) return std::unexpected(total_norm_sq.error());
 
     // 从 (1,1) Tensor 提取标量值
-    // 使用 to_matrix 拉到 CPU 后取值（一次 PCIe 下载，可接受）
-    auto total_norm_sq_mat = engine.to_matrix(*total_norm_sq);
-    if (!total_norm_sq_mat) return std::unexpected(total_norm_sq_mat.error());
-    Scalar norm_sq_val = total_norm_sq_mat->at(0, 0);
+    // 使用宿主桥下载后取值（一次 PCIe 下载，可接受；17 §3 D11）
+    std::vector<Scalar> total_buf(total_norm_sq->rows() * total_norm_sq->cols());
+    auto dl_r = detail::download_span(engine, *total_norm_sq, std::span(total_buf));
+    if (!dl_r) return std::unexpected(dl_r.error());
+    Scalar norm_sq_val = total_buf[0];
     Scalar inv_norm_scalar = Scalar{1} / std::sqrt(norm_sq_val + eps * eps);
 
     // X = G * inv_norm_scalar（归一化）：单表达式（GPU 上 1 个融合 kernel +
