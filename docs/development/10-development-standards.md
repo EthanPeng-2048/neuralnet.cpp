@@ -322,7 +322,9 @@ public:
 
 ```cpp
 // ReLU::forward —— 一条 DSL 表达式（compute_layer_mlp.hpp）
-[[nodiscard]] Result<Tensor> ReLU::forward(ComputeEngine& engine, const Tensor& input) override {
+// M6 段 C：engine 不再是形参，函数首行取 init 绑定的局部引用，DSL 入口照旧收 engine
+[[nodiscard]] Result<Tensor> ReLU::forward(const Tensor& input) override {
+    ComputeEngine& engine = engine_ref();
     if (!checkpoint_mode_)
         input_cache_ = input;
     return dsl::compute(engine, dsl::max(dsl::leaf(input), Scalar{0}),

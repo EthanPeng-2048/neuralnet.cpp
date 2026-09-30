@@ -177,11 +177,14 @@ Layer 的 forward/backward 只写一次，通过 ComputeEngine 参数自动适�
 ```
 
 ```cpp
-// compute_layer.hpp — 所有 Layer 统一接口
+// compute_layer_base.hpp — 所有 Layer 统一接口（M6 段 C：engine 由 init 绑定）
 class Layer {
+protected:
+    ComputeEngine* engine_ = nullptr;               // init(engine) 时绑定
 public:
-    virtual Result<Tensor> forward(ComputeEngine& engine, const Tensor& input) = 0;
-    virtual Result<Tensor> backward(ComputeEngine& engine, const Tensor& grad_output) = 0;
+    Result<void> init(ComputeEngine& engine);       // NVI：绑定后转各层的 init_impl
+    virtual Result<Tensor> forward(const Tensor& input) = 0;
+    virtual Result<Tensor> backward(const Tensor& grad_output) = 0;
 };
 ```
 
@@ -346,7 +349,7 @@ sequenceDiagram
     loop Each Training Step
         U->>M: zero_grad()
         U->>E: from_matrix(batch) → Tensor
-        M->>L: forward(engine, Tensor) → Tensor
+        M->>L: forward(Tensor) → Tensor   // engine 由 init 绑定（M6 段 C）
         L-->>M: output Tensor
         M-->>U: logits
 
