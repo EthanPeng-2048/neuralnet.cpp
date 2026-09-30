@@ -104,8 +104,6 @@ private:
     Tensor perm_cache_;   // 布局置换索引 (C_out*P, 1)：形状相关、与数据无关
     bool shape_invalid_ = false; // 构造期守卫：kernel 过大（无符号下溢）→ init 报错
 
-    inline static thread_local std::mt19937_64 rng_{std::random_device{}()};
-
     // 惰性构建布局置换索引（形状不变则跨 forward/backward 复用）
     [[nodiscard]] Result<void> ensure_perm_(ComputeEngine& engine)
     {
@@ -145,27 +143,19 @@ public:
             return std::unexpected(Error{"Conv2D: kernel 过大 (kernel > in + 2*padding)"});
         const std::size_t fan_in = in_channels_ * kernel_ * kernel_;
 
-        // 权重 (C_out, C_in*k*k) — He 风格均匀初始化
-        Matrix w_cpu(out_channels_, fan_in);
+        // ── 声明式初始化（M2，17 §4.4）：He 风格均匀分布，层算 limit、引擎
+        // 填数。参数/梯度精度保持 F32（与原 from_matrix 默认口径一致）。
         const Scalar limit = std::sqrt(6.0 / static_cast<Scalar>(fan_in + out_channels_));
-        std::uniform_real_distribution<Scalar> dist(-limit, limit);
-        auto w_span = w_cpu.span();
-        for (std::size_t i = 0; i < w_cpu.size(); ++i)
-            w_span[i] = dist(rng_);
+        w_ = engine.create_tensor(out_channels_, fan_in, Precision::F32,
+                                  InitSpec::uniform(-limit, limit, kInitSeed));
+        if (!w_.valid()) return std::unexpected(Error{"Conv2D: 权重初始化失败"});
+        b_ = engine.create_tensor(out_channels_, 1, Precision::F32, InitSpec::zero());
+        if (!b_.valid()) return std::unexpected(Error{"Conv2D: 偏置初始化失败"});
 
-        Matrix b_cpu(out_channels_, 1);  // 零初始化
-
-        auto w_res = engine.from_matrix(w_cpu);
-        if (!w_res) return std::unexpected(w_res.error());
-        w_ = std::move(*w_res);
-        auto b_res = engine.from_matrix(b_cpu);
-        if (!b_res) return std::unexpected(b_res.error());
-        b_ = std::move(*b_res);
-
-        grad_w_ = engine.create_tensor(out_channels_, fan_in);
-        grad_b_ = engine.create_tensor(out_channels_, 1);
-        { auto r1 = engine.zero(grad_w_); if (!r1) return std::unexpected(r1.error()); }
-        { auto r2 = engine.zero(grad_b_); if (!r2) return std::unexpected(r2.error()); }
+        grad_w_ = engine.create_tensor(out_channels_, fan_in, Precision::F32, InitSpec::zero());
+        grad_b_ = engine.create_tensor(out_channels_, 1, Precision::F32, InitSpec::zero());
+        if (!grad_w_.valid() || !grad_b_.valid())
+            return std::unexpected(Error{"Conv2D: 梯度缓冲初始化失败"});
         return {};
     }
 
