@@ -43,6 +43,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <random>
 #include <source_location>
 #include <span>
 #include <string>
@@ -102,6 +103,74 @@ enum class ReduceOp : uint32_t
             bits |= (1u << i);
     return expr_prec_sig_make(bits, P == Precision::F16);
 }
+
+// ── InitSpec — 声明式张量初始化（M2，docs/development/17 §4.4）──────────────
+// 分工（铁律 #3）：**层算分布参数**（limit / mean / stddev 这类层语义留在
+// Layer），**引擎负责填数**（只管把 shape×precision×分布的数填出来）。
+// 初始化策略（host 生成后上传 vs 设备端原生生成）由引擎自选，调用方不可见
+// （D6）。seed 必填（17 §8 U1 裁定：层传显式默认值，漏传 = 编译错误）——
+// 引擎内部把 seed 与本次创建的序号混流，同 seed 的不同张量不撞流（同形状
+// 多层不互为镜像）；创建顺序 = 模型构造顺序 → 跨进程初值逐字节确定。
+struct InitSpec
+{
+    enum class Kind
+    {
+        Uninitialized, // 不写初值（契约沿用 cpu_uninitialized：读前必须全写满）
+        Zero,          // 全零
+        Constant,      // 全 value
+        Uniform,       // U[lo, hi]
+        Normal,        // N(mean, stddev)
+    };
+
+    Kind kind = Kind::Zero;
+    Scalar value = Scalar{0};                      // Constant
+    Scalar lo = Scalar{0}, hi = Scalar{0};         // Uniform
+    Scalar mean = Scalar{0}, stddev = Scalar{0};   // Normal
+    std::uint64_t seed = 42; // 分布种子（Uninitialized/Zero/Constant 不消费）
+
+    [[nodiscard]] static InitSpec uninitialized()
+    {
+        InitSpec s;
+        s.kind = Kind::Uninitialized;
+        return s;
+    }
+    [[nodiscard]] static InitSpec zero()
+    {
+        InitSpec s;
+        s.kind = Kind::Zero;
+        return s;
+    }
+    [[nodiscard]] static InitSpec constant(Scalar v)
+    {
+        InitSpec s;
+        s.kind = Kind::Constant;
+        s.value = v;
+        return s;
+    }
+    // 分布类 seed 必填（U1）
+    [[nodiscard]] static InitSpec uniform(Scalar lo, Scalar hi, std::uint64_t seed)
+    {
+        InitSpec s;
+        s.kind = Kind::Uniform;
+        s.lo = lo;
+        s.hi = hi;
+        s.seed = seed;
+        return s;
+    }
+    [[nodiscard]] static InitSpec normal(Scalar mean, Scalar stddev, std::uint64_t seed)
+    {
+        InitSpec s;
+        s.kind = Kind::Normal;
+        s.mean = mean;
+        s.stddev = stddev;
+        s.seed = seed;
+        return s;
+    }
+};
+
+// 层传的显式默认 seed（17 §8 U1：seed 必填、层传显式默认值）。
+// 同 seed 不同张量由引擎按创建序号混流，不撞流。
+inline constexpr std::uint64_t kInitSeed = 42;
 
 // ══════════════════════════════════════════════════════════════════════════
 // ComputeEngine — 计算引擎抽象接口
@@ -215,6 +284,39 @@ public:
     [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols, Precision P = Precision::F32)
     {
         return stamp_(create_tensor_impl(rows, cols, P));
+    }
+    // ── 声明式创建/初始化（M2，17 §4.3/§4.4）────────────────────────────
+    // InitSpec 指定初值；策略 = 引擎 host 生成后上传（D6：两设备同序列、
+    // 调用方不可见；将来设备端原生生成是引擎内部优化，不改本签名）。
+    // 失败返回空 Tensor（与 3 参 create_tensor 同契约，调用方查 valid()）。
+    // 语义分工：3 参 = 纯分配（沿用现状：CPU Matrix 零填充 / GPU 分配未初始
+    // 化，需要零的调用方显式 zero）；"要什么初值"一律走本重载显式声明。
+    [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols, Precision P,
+                                       const InitSpec& spec)
+    {
+        switch (spec.kind)
+        {
+        case InitSpec::Kind::Uninitialized:
+            return stamp_(create_tensor_impl(rows, cols, P));
+        case InitSpec::Kind::Zero:
+        {
+            // 分配 + 整张清零（GPU 分配未初始化，zero() 是必要写；CPU 分配
+            // 已零填充仍走一遍 zero() 统一契约）。
+            auto t = stamp_(create_tensor_impl(rows, cols, P));
+            if (!t.valid()) return t;
+            if (auto z = zero(t); !z) return Tensor{};
+            return t;
+        }
+        default:
+            break;
+        }
+        // Constant / Uniform / Normal：host 生成 + 上传（from_matrix 内部
+        // 自带 stamp_；f16 由 from_matrix 做 RHE 舍入，与层手填路径一致）。
+        Matrix m(rows, cols, Matrix::uninitialized_tag{});
+        fill_host_(m, spec, init_seq_++);
+        auto r = from_matrix(m, P);
+        if (!r) return Tensor{};
+        return std::move(*r);
     }
     [[nodiscard]] Result<Tensor> from_matrix(const Matrix& m, Precision P = Precision::F32)
     {
@@ -1300,6 +1402,44 @@ private:
         return std::move(r);
     }
 
+    // ── InitSpec host 填数（M2）：seed 与创建序号混流 ─────────────────────
+    // splitmix64 定点混淆：序号按模型构造顺序推进（每引擎独立、进程内从 0
+    // 起）→ 跨进程同序 → 初值逐字节确定；同 seed 的不同张量（同形状多层）
+    // 不撞流。单线程顺序填充，无并行不确定性（铁律 #8）。
+    static std::uint64_t mix_init_seed_(std::uint64_t seed, std::uint64_t seq)
+    {
+        std::uint64_t z = seed + 0x9E3779B97F4A7C15ull * (seq + 1);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        return z ^ (z >> 31);
+    }
+    static void fill_host_(Matrix& m, const InitSpec& spec, std::uint64_t seq)
+    {
+        std::mt19937_64 rng(mix_init_seed_(spec.seed, seq));
+        auto sp = m.span();
+        switch (spec.kind)
+        {
+        case InitSpec::Kind::Constant:
+            std::fill(sp.begin(), sp.end(), spec.value);
+            break;
+        case InitSpec::Kind::Uniform:
+        {
+            std::uniform_real_distribution<Scalar> dist(spec.lo, spec.hi);
+            for (std::size_t i = 0; i < sp.size(); ++i) sp[i] = dist(rng);
+            break;
+        }
+        case InitSpec::Kind::Normal:
+        {
+            std::normal_distribution<Scalar> dist(spec.mean, spec.stddev);
+            for (std::size_t i = 0; i < sp.size(); ++i) sp[i] = dist(rng);
+            break;
+        }
+        default:
+            std::fill(sp.begin(), sp.end(), Scalar{0});
+            break;
+        }
+    }
+
     // ── P1 跨引擎检查（15 §4.3 D3）──────────────────────────────────────
     // 判定（D3 字面）：操作数指针判等——**双方都 bound 且不同 → Result 硬错误**；
     // 单侧未绑定按库外豁免放行（P1 只加检查、零行为变化，ctest 不红）。
@@ -1638,6 +1778,9 @@ private:
     // 默认（CPU / 同步引擎）标量回读槽：submit 立即存值，poll 立即就绪。
     // GPU 引擎覆写为异步槽位（见 GpuEngine / GpuBackend::rb_slots_）。
     std::vector<Scalar> sync_readback_slots_;
+
+    // InitSpec 分布创建序号（M2）：每个引擎独立从 0 起，host 填数时混流用。
+    std::uint64_t init_seq_ = 0;
 };
 
 } // namespace nn
