@@ -73,7 +73,7 @@ int main(int argc, char* argv[])
     {
         auto m = cpu.to_matrix(cpu_params[i]);
         if (!m) return 1;
-        if (!gpu.copy_from(gpu_params[i], *m)) return 1;
+        if (!gpu.write(gpu_params[i], m->span())) return 1;
     }
 
     // 相同输入与标签
