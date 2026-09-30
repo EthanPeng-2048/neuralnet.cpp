@@ -42,22 +42,23 @@ void test_row_sum_broadcast()
 {
     nn::CpuEngine eng;
     const std::size_t R = 4, C = 5;
-    nn::Tensor x = make_tensor(R, C, 0.5f, 0.03f);
+    nn::Tensor x = make_tensor(eng, R, C, 0.5f, 0.03f);
 
     auto out = dsl::compute(eng, dsl::leaf(x) / dsl::row_reduce_sum(x), R, C);
     CHECK(out.has_value(), "row_sum_broadcast: compute failed");
 
     // 参考：out[r][c] = x[r][c] / Σ_c x[r][c]
-    nn::Tensor ref = nn::Tensor::cpu(R, C);
-    auto xs = x.cpu_matrix().span();
-    auto rs = ref.cpu_matrix().span();
+    nn::Matrix ref(R, C);
+    const nn::Matrix xm = download(eng, x);
+    auto xs = xm.span();
+    auto rs = ref.span();
     for (std::size_t r = 0; r < R; ++r)
     {
         float sum = 0.0f;
         for (std::size_t c = 0; c < C; ++c) sum += xs[r * C + c];
         for (std::size_t c = 0; c < C; ++c) rs[r * C + c] = xs[r * C + c] / sum;
     }
-    check_close(*out, ref, "row_reduce_sum 广播 (x / row_sum)", g_fail);
+    check_close(eng, *out, upload(eng, ref), "row_reduce_sum 广播 (x / row_sum)", g_fail);
 }
 
 // ── 测试 2：归约视图——按行 max 平移 x - row_max ────────────────────────
@@ -65,21 +66,22 @@ void test_row_max_shift()
 {
     nn::CpuEngine eng;
     const std::size_t R = 4, C = 6;
-    nn::Tensor x = make_tensor(R, C, -1.0f, 0.07f);
+    nn::Tensor x = make_tensor(eng, R, C, -1.0f, 0.07f);
 
     auto out = dsl::compute(eng, dsl::leaf(x) - dsl::row_reduce_max(x), R, C);
     CHECK(out.has_value(), "row_max_shift: compute failed");
 
-    nn::Tensor ref = nn::Tensor::cpu(R, C);
-    auto xs = x.cpu_matrix().span();
-    auto rs = ref.cpu_matrix().span();
+    nn::Matrix ref(R, C);
+    const nn::Matrix xm = download(eng, x);
+    auto xs = xm.span();
+    auto rs = ref.span();
     for (std::size_t r = 0; r < R; ++r)
     {
         float mx = xs[r * C];
         for (std::size_t c = 1; c < C; ++c) mx = std::max(mx, xs[r * C + c]);
         for (std::size_t c = 0; c < C; ++c) rs[r * C + c] = xs[r * C + c] - mx;
     }
-    check_close(*out, ref, "row_reduce_max 广播 (x - row_max)", g_fail);
+    check_close(eng, *out, upload(eng, ref), "row_reduce_max 广播 (x - row_max)", g_fail);
 }
 
 // ── 测试 3：Softmax（归约视图 + 归约指令混合）──────────────────────────
@@ -89,16 +91,17 @@ void test_softmax_mixed()
 {
     nn::CpuEngine eng;
     const std::size_t R = 3, C = 7;
-    nn::Tensor x = make_tensor(R, C, -0.8f, 0.11f);
+    nn::Tensor x = make_tensor(eng, R, C, -0.8f, 0.11f);
 
     auto expr = dsl::exp(dsl::leaf(x) - dsl::row_reduce_max(x))
               / dsl::row_reduce_sum(dsl::exp(dsl::leaf(x) - dsl::row_reduce_max(x)));
     auto out = dsl::compute(eng, expr, R, C);
     CHECK(out.has_value(), "softmax_mixed: compute failed");
 
-    nn::Tensor ref = nn::Tensor::cpu(R, C);
-    auto xs = x.cpu_matrix().span();
-    auto rs = ref.cpu_matrix().span();
+    nn::Matrix ref(R, C);
+    const nn::Matrix xm = download(eng, x);
+    auto xs = xm.span();
+    auto rs = ref.span();
     for (std::size_t r = 0; r < R; ++r)
     {
         float mx = xs[r * C];
@@ -107,7 +110,7 @@ void test_softmax_mixed()
         for (std::size_t c = 0; c < C; ++c) sum += std::exp(xs[r * C + c] - mx);
         for (std::size_t c = 0; c < C; ++c) rs[r * C + c] = std::exp(xs[r * C + c] - mx) / sum;
     }
-    check_close(*out, ref, "Softmax（视图 row_max + 指令 row_sum）", g_fail);
+    check_close(eng, *out, upload(eng, ref), "Softmax（视图 row_max + 指令 row_sum）", g_fail);
 }
 
 // ── 测试 4：归约指令——输出即归约结果（广播）row_sum(exp(x)) ───────────
@@ -115,22 +118,23 @@ void test_reduce_instr_output()
 {
     nn::CpuEngine eng;
     const std::size_t R = 4, C = 4;
-    nn::Tensor x = make_tensor(R, C, 0.1f, 0.05f);
+    nn::Tensor x = make_tensor(eng, R, C, 0.1f, 0.05f);
 
     // 纯归约指令：row_sum(exp(x))，输出 (rows,1) 向量广播到 (rows,cols)
     auto out = dsl::compute(eng, dsl::row_reduce_sum(dsl::exp(dsl::leaf(x))), R, C);
     CHECK(out.has_value(), "reduce_instr_output: compute failed");
 
-    nn::Tensor ref = nn::Tensor::cpu(R, C);
-    auto xs = x.cpu_matrix().span();
-    auto rs = ref.cpu_matrix().span();
+    nn::Matrix ref(R, C);
+    const nn::Matrix xm = download(eng, x);
+    auto xs = xm.span();
+    auto rs = ref.span();
     for (std::size_t r = 0; r < R; ++r)
     {
         float sum = 0.0f;
         for (std::size_t c = 0; c < C; ++c) sum += std::exp(xs[r * C + c]);
         for (std::size_t c = 0; c < C; ++c) rs[r * C + c] = sum;
     }
-    check_close(*out, ref, "归约指令 row_sum(exp(x)) 输出广播", g_fail);
+    check_close(eng, *out, upload(eng, ref), "归约指令 row_sum(exp(x)) 输出广播", g_fail);
 }
 
 // ── 测试 5：列归约 max 广播 x * col_max ─────────────────────────────────
@@ -138,21 +142,22 @@ void test_col_max_broadcast()
 {
     nn::CpuEngine eng;
     const std::size_t R = 5, C = 3;
-    nn::Tensor x = make_tensor(R, C, 0.2f, 0.09f);
+    nn::Tensor x = make_tensor(eng, R, C, 0.2f, 0.09f);
 
     auto out = dsl::compute(eng, dsl::leaf(x) * dsl::col_reduce_max(x), R, C);
     CHECK(out.has_value(), "col_max_broadcast: compute failed");
 
-    nn::Tensor ref = nn::Tensor::cpu(R, C);
-    auto xs = x.cpu_matrix().span();
-    auto rs = ref.cpu_matrix().span();
+    nn::Matrix ref(R, C);
+    const nn::Matrix xm = download(eng, x);
+    auto xs = xm.span();
+    auto rs = ref.span();
     for (std::size_t c = 0; c < C; ++c)
     {
         float mx = xs[c];
         for (std::size_t r = 1; r < R; ++r) mx = std::max(mx, xs[r * C + c]);
         for (std::size_t r = 0; r < R; ++r) rs[r * C + c] = xs[r * C + c] * mx;
     }
-    check_close(*out, ref, "col_reduce_max 广播 (x * col_max)", g_fail);
+    check_close(eng, *out, upload(eng, ref), "col_reduce_max 广播 (x * col_max)", g_fail);
 }
 
 // ── 测试 6：归约指令叠加归约视图——row_sum(col_sum(x)) = 全局和 ─────────
@@ -160,18 +165,19 @@ void test_reduce_of_reduce_view()
 {
     nn::CpuEngine eng;
     const std::size_t R = 3, C = 4;
-    nn::Tensor x = make_tensor(R, C, 1.0f, 0.02f);
+    nn::Tensor x = make_tensor(eng, R, C, 1.0f, 0.02f);
 
     // col_sum(x) 为归约视图 (1,C)；row_sum(该视图) 为归约指令 → 全局和
     auto out = dsl::compute(eng, dsl::row_reduce_sum(dsl::col_reduce_sum(x)), R, C);
     CHECK(out.has_value(), "reduce_of_reduce_view: compute failed");
 
+    const nn::Matrix xm = download(eng, x);
     float total = 0.0f;
-    for (auto v : x.cpu_matrix().span()) total += v;
-    nn::Tensor ref = nn::Tensor::cpu(R, C);
-    for (auto& v : ref.cpu_matrix().span()) v = total;
+    for (auto v : xm.span()) total += v;
+    nn::Matrix ref(R, C);
+    for (auto& v : ref.span()) v = total;
 
-    check_close(*out, ref, "归约指令叠加归约视图 row_sum(col_sum(x)) = 全局和", g_fail);
+    check_close(eng, *out, upload(eng, ref), "归约指令叠加归约视图 row_sum(col_sum(x)) = 全局和", g_fail);
 }
 
 // ── 测试 7：归约与标量混合（均值平移）x - row_mean ─────────────────────
@@ -179,7 +185,7 @@ void test_reduce_with_scalar()
 {
     nn::CpuEngine eng;
     const std::size_t R = 4, C = 5;
-    nn::Tensor x = make_tensor(R, C, -2.0f, 0.13f);
+    nn::Tensor x = make_tensor(eng, R, C, -2.0f, 0.13f);
     const float inv = 1.0f / static_cast<float>(C);
 
     // x - (row_sum(x) / C)   —— 归约视图 + 标量除法
@@ -187,9 +193,10 @@ void test_reduce_with_scalar()
         dsl::leaf(x) - (dsl::row_reduce_sum(x) * nn::dsl::ConstLeaf{inv}), R, C);
     CHECK(out.has_value(), "reduce_with_scalar: compute failed");
 
-    nn::Tensor ref = nn::Tensor::cpu(R, C);
-    auto xs = x.cpu_matrix().span();
-    auto rs = ref.cpu_matrix().span();
+    nn::Matrix ref(R, C);
+    const nn::Matrix xm = download(eng, x);
+    auto xs = xm.span();
+    auto rs = ref.span();
     for (std::size_t r = 0; r < R; ++r)
     {
         float sum = 0.0f;
@@ -197,13 +204,14 @@ void test_reduce_with_scalar()
         const float mean = sum * inv;
         for (std::size_t c = 0; c < C; ++c) rs[r * C + c] = xs[r * C + c] - mean;
     }
-    check_close(*out, ref, "归约视图 + 标量 (x - row_mean)", g_fail);
+    check_close(eng, *out, upload(eng, ref), "归约视图 + 标量 (x - row_mean)", g_fail);
 }
 
 // ── 测试 8：to_expr_spec 折叠结构正确性 ─────────────────────────────────
 void test_fold_structure()
 {
-    nn::Tensor x = nn::Tensor::cpu(4, 5);
+    nn::CpuEngine eng;
+    nn::Tensor x = eng.create_tensor(4, 5);
 
     // x / row_reduce_sum(x)：2 输入（Linear + RowReduceSum 视图），1 条 Div 指令
     {
@@ -285,7 +293,8 @@ void test_validation()
 // ── 测试 10：规范 key 确定性 ────────────────────────────────────────────
 void test_key_determinism()
 {
-    nn::Tensor x = nn::Tensor::cpu(4, 5);
+    nn::CpuEngine eng;
+    nn::Tensor x = eng.create_tensor(4, 5);
 
     auto key_row = nn::expr_spec_key(to_expr_spec(
         dsl::leaf(x) / dsl::row_reduce_sum(x)).first);

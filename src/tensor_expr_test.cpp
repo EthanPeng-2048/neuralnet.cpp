@@ -13,6 +13,8 @@
 
 #include <neuralnet.cpp/nn.hpp>
 
+#include "test_common.hpp"   // M1 访问收口：upload（宿主 Matrix 进引擎张量）
+
 #include <cmath>
 #include <iostream>
 #include <memory>
@@ -111,10 +113,10 @@ int main()
     fill_random(mA, rng, dist); fill_random(mB, rng, dist);
     fill_random(mC, rng, dist); fill_random(mD, rng, dist);
 
-    const Tensor ta = Tensor::from_matrix(Matrix(mA));
-    const Tensor tb = Tensor::from_matrix(Matrix(mB));
-    const Tensor tc = Tensor::from_matrix(Matrix(mC));
-    const Tensor td = Tensor::from_matrix(Matrix(mD));
+    const Tensor ta = upload(eng, mA);
+    const Tensor tb = upload(eng, mB);
+    const Tensor tc = upload(eng, mC);
+    const Tensor td = upload(eng, mD);
 
     // ── 1. 二元：A + B ────────────────────────────────────────────────
     {
@@ -172,12 +174,12 @@ int main()
                 for (std::size_t k = 0; k < 3; ++k) s += a2.span()[i * 3 + k] * b3.span()[k * 4 + j];
                 ref.span()[i * 4 + j] = s + c2.span()[i * 4 + j];
             }
-        auto mm = eng.matmul(Tensor::from_matrix(Matrix(a2)), Tensor::from_matrix(Matrix(b3)), false, false);
+        auto mm = eng.matmul(upload(eng, a2), upload(eng, b3), false, false);
         if (!mm) { std::cerr << "[FAIL] matmul 原语\n"; ++fail; }
         else
         {
             const Tensor mmt = std::move(*mm);
-            const Tensor c2t = Tensor::from_matrix(Matrix(c2));
+            const Tensor c2t = upload(eng, c2);
             fail += check(eng, "matmul(A,B)+C", leaf(mmt) + leaf(c2t), 2, 4, ref, kTol);
         }
     }
