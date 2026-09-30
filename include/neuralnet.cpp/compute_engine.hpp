@@ -205,13 +205,30 @@ public:
 
     // ── 显存回收（L2）─────────────────────────────────────────────────
     // GPU 引擎：在 end_batch（提交完成、延迟销毁已 flush）之后归还完全
-    // 空闲的内存池底材给 GPU。CPU 引擎：no-op。
+    // 空闲的内存池底材给 GPU。CPU 引擎：**语义成立的 no-op**——直配模式
+    // 没有可归还的整块（17 §4.5 D5），文档写明而非假装有池。
     [[nodiscard]] virtual Result<void> release_idle_pool_blocks() { return {}; }
 
-    // ── 显存池统计（L2 仪器化）──────────────────────────────────────
-    // GPU 引擎返回池统计字符串（块数/占用/空闲/碎片）；CPU 引擎返回空。
-    // 用于训练中显存采样与逐项归因。
-    [[nodiscard]] virtual std::string pool_stats() const { return {}; }
+    // ── 内存统计（L2 仪器化）──────────────────────────────────────
+    // GPU 引擎：池统计字符串（persist{…} transient{…} pending=…，见 GpuEngine）。
+    // **无池引擎（CPU）**：如实上报宿主直配账本 `nn::host_alloc_ledger()`
+    // （17 §4.5 D5"直配模式统计"）——活分配数/字节 + 峰值 + 累计，单位字节。
+    // 两引擎同一动词、都非空，GUI/训练日志一套代码读两个引擎。
+    // 用于训练中内存采样与逐项归因（`text_train` 的 NN_MEM_STATS 打点）。
+    [[nodiscard]] virtual std::string pool_stats() const
+    {
+        const auto& led = host_alloc_ledger();
+        return "direct{ blocks=" +
+               std::to_string(led.live_blocks.load(std::memory_order_relaxed)) +
+               " live_bytes=" +
+               std::to_string(led.live_bytes.load(std::memory_order_relaxed)) +
+               " peak_bytes=" +
+               std::to_string(led.peak_bytes.load(std::memory_order_relaxed)) +
+               " total_blocks=" +
+               std::to_string(led.total_blocks.load(std::memory_order_relaxed)) +
+               " total_bytes=" +
+               std::to_string(led.total_bytes.load(std::memory_order_relaxed)) + " }";
+    }
 
     // ── 激活 offload（L1-offload）───────────────────────────────────
     // ── activation offload slab（L1-offload，持久复用缓冲） ────────────
