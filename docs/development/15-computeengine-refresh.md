@@ -304,7 +304,7 @@ P0 的"字节基线"因此拆成两半：**同设备 pre/post 锚点**（不变�
 | P0 | 0 改动调研：43 ensure_gpu 分类 / 175 打标 / 字节+scan 基线 / 宿主中转盘点 / **GPU run-to-run 稳定性实测** | D9 实测、D6 调用方 |
 | **P-1** ✅（2026-09-29） | **PrecisionEngine 下沉删除（NVI）**：基类非虚入口 + protected `*_impl`（CPU 33 / GPU 29 处机械改名），`compute_precision_engine.hpp` 删除，7 处使用方迁移 | 验收全过：dev1 ctest 20/20（含 4 个 f16 用例）、CPU 探针与 P0 基线逐字节、scan 产物 hash 不变、layer_bench 交错 4 轮无系统性回退（A/B 过程归档 history.md） |
 | P1 | 加绑定 + 跨引擎检查（只加不改） | ✅（2026-09-29）D2（adopt 通道）、D3（指针判等）已落地，见 §7.2 交接 |
-| P2 | 删形参 + 宿主动词改名 + 测试 `from_host` 迁移 | D6 定序、D7、D8 —— **D6/D7/D8 已于 M6 段 A 裁定落地（2026-09-30，见 17 §8 U4）；宿主动词改名已由 17 D9 取消（保留 `from_matrix/to_matrix`）；"删形参"= 17 M6 段 C，未实施（交接见 17 §8）** |
+| P2 | 删形参 + 宿主动词改名 + 测试 `from_host` 迁移 | **M6 段 C ✅（2026-09-30，Layer 范围）**：`forward/backward/zero_grad/forward_recompute` 去 engine 形参 + `init` NVI 绑定；Loss/DSL/辅助对象保留形参（理由与清单见 17 §8）。**D6/D7/D8 已于 M6 段 A 裁定落地**（17 §8 U4）；宿主动词改名已由 17 D9 取消（保留 `from_matrix/to_matrix`） |
 | P3 | 检查升硬错误 + 43 处 ensure_gpu → import + 序列化去 `model.engine()` | D4、D5 —— **M6 段 B 已完成前两项（2026-09-30）**：跨引擎检查自 P1 起默认硬错误，`ensure_gpu`→`import` 全量迁移（17 §4.3，虚表 49→50）；第三项**裁定保留 `model.engine()`**（M1 后 save/load 的引擎来源只有"调用方显式传"或"模型回查"两条，改签名会破坏 `save_model(model, path)` 公开 API，收益为零） |
 | P4 | 宿主格式契约（**正交另案**） | — |
 | P5 | 存储多态 + reshape virtual | `layer_bench` 热点回归 |

@@ -6,10 +6,11 @@
 > 过程见 §5 M1 行 + `docs/history.md`）；M2 声明式初始化已实施（2026-09-30，
 > 见 §5 M2 行）；M3 批量读写 API 已实施（2026-09-30，见 §5 M3 行）；M4 Matrix
 > 降级收口已实施（2026-09-30，见 §3 D11 + §5 M4 行）；M5 内存池契约统一已实施
-> （2026-09-30，见 §4.5 + §5 M5 行）；M6 分三段：段 A（15 D6/D7/D8 落地 +
-> `NN_BIND_DEBUG` ctest 门禁）与段 B（43 处 `ensure_gpu`→`import`）已实施
-> （2026-09-30，见 §5 M6 行与 §8 交接），**段 C（删每调用 engine 形参）未实施；
-> M7 未实施**。
+> （2026-09-30，见 §4.5 + §5 M5 行）；M6 分三段**全部已实施（2026-09-30）**：段 A
+>（15 D6/D7/D8 落地 + `NN_BIND_DEBUG` ctest 门禁）、段 B（43 处 `ensure_gpu`→`import`）、
+> 段 C（**删 Layer 每调用 engine 形参**——`forward/backward/zero_grad/forward_recompute`
+> 改 `init` 绑定；Loss/DSL 入口/位置编码等辅助对象**保留形参**，理由与清单见 §8）；
+> **M7 未实施**。
 > 实施立项时读本文 + §5 分期 + 源码现状。
 > 前置工程成果保留不动：15 的 P-1（PrecisionEngine 下沉）、P1（张量出生绑定）已落地（15 §7.1）。
 
@@ -209,7 +210,7 @@ CPU 字节基线 + scan 产物 hash + layer_bench（定义见 §6）。
 | **M3** ✅（2026-09-30） | **批量读写 API**：`read/write/get_index/set_index` + I/O 分组审计口径（D9；U2 精确匹配） | `compute_engine.hpp` I/O 分组（基类非虚模板，复用 `to_matrix`/`copy_from`）+ CPU/GPU 两引擎；测试 f32 填充/恢复路径迁 `write`；探针 `--io-roundtrip`（commits `e0338d9` 核心、`4977a29` 探针、`3ddb13c` 测试） | **四件套全过**：build 全绿零告警；ctest 20/20；`gpu_stability_probe --io-roundtrip` CPU + GPU 全过（`f32_roundtrip`/`f16_roundtrip`/`batch_window` 三用例含录制窗口 write→read→end_batch→复读）；CPU 字节锚 `--steps 20` hash=`6f8849f14da23110` 不变；scan 双 hash 不变（`expr_specs.bin`=bdc3a442…a58360、`fused_registry.hpp`=7a10412c…）；**顺带修复 16 §7-2**（探针漏 `backend.initialize()` 的 GPU 崩溃，根因回填 16 §6/§7）——dev0/dev2/dev4 进程内两轮 + 跨进程 loss/hash 逐字节（详见 `docs/history.md` M3 条） |
 | **M4** ✅（2026-09-30） | **Matrix 降级收口**：L2+ 禁用规则成文（铁律 #12）+ D11 宿主桥裁定 + 分层审计脚本（U5） | L2 全量迁移：`compute_layer_{attention,base,conv,gpt,rapt,transformer,zipt}.hpp` + `compute_loss.hpp` + `compute_optimizer.hpp`（45 处 Matrix 型 I/O + 32 处 `Matrix` 类型）；`compute_engine.hpp` 尾部新增 `detail::upload_span/download_span/download_vector`（宿主桥，0 虚表项）；`bench/doc_inventory.ps1` 新增第 [4] 节 | **审计零违规**（`L2-VIOLATIONS: 0`，宿主桥 41 处仅披露）+ 四件套全过：build 122/122 零告警；ctest 20/20；**CPU 字节锚 `6f8849f14da23110` 与 GPU dev2 `8ef51b2927253c50` 均与迁移前逐位一致**（迁移是纯载体替换，数值路径零改动）；scan 双 hash 不变；layer_bench 配对 A/B（pre=HEAD worktree 二进制，feedforward/swiglu/linear 各 4 轮交错）：feedforward fwd/train **-1.2%/-1.6%**、linear +1.4%/-4.2%、swiglu fwd -6.2%（0.4ms 亚毫秒级，PRE 自身极差 0.38–0.47ms 即 ±10%）——全部在 ±6% 噪声带内无系统性回退（详见 `docs/history.md` M4 条） |
 | **M5** ✅（2026-09-30） | **内存池契约统一**：无池引擎 `pool_stats` 语义补齐 | `algebra_matrix.hpp`（`HostAllocLedger` + `MatrixT` 分配/释放记账三出口）+ `compute_engine.hpp` 基类默认 `pool_stats` | **两引擎 `pool_stats` 非空且口径文档化**（17 §4.5 + `04-memory-optimization.md` + `01-compute-engine-development.md`）：CPU `direct{ blocks/live_bytes/peak_bytes/total_blocks/total_bytes }` 实测随 model-built/optimizer-created 递增（`NN_MEM_STATS=1 text_train` 抓取），GPU `persist{…} transient{…} pending=…` 照旧；`release_idle_pool_blocks` CPU no-op 写明理由。四件套：build 122/122 零告警、ctest 20/20、CPU 锚 `6f8849f14da23110` 与 scan 双 hash 不变、`--io-roundtrip` CPU/GPU 全过、L2 审计仍 0 |
-| **M6**（段 A/B ✅ 2026-09-30；**段 C 未实施**） | **吸收 15 P2/P3** 分三段：**A** = 15 D6/D7/D8 落地 + `NN_BIND_DEBUG` 门禁化；**B** = 43 处 `ensure_gpu`→`import`（新增跨设备拉取契约，虚表 49→50）；**C** = 删每调用 engine 形参（175 打标清单里的 110 DROP + 7 REVIEW） | 段 A：`model_serialization.hpp`（D6-1 白做上传）、`compute_engine.hpp`（D6-3 改纯虚、`to_prec` 补绑定、`bind_error_` 打 stderr）、`model_container.hpp`（D7）、offload 占位（D8）、`expr_dsl.hpp`（归约向量 adopt）；段 B：`compute_engine.hpp` `import/import_impl` + `compute_gpu_engine.hpp` 48 处改名（commits `8ecf1bd` 段 A） | **段 A+B 四件套全过**：build 零告警；ctest 20/20 **且 `NN_BIND_DEBUG=1` 同样 20/20（门禁成立）**；CPU 锚 `6f8849f14da23110` 与 **GPU dev2 `8ef51b2927253c50`** 均与改前逐位一致；scan 双 hash 不变；`--io-roundtrip` CPU/GPU 全过；L2 审计 `L2-VIOLATIONS: 0`。另证 D6-1 正确性：save→load→save **SHA256 逐字节一致**（f32 与 f16 param 两种模型）。段 C 验收待其实施时补（见 §8 交接） |
+| **M6** ✅（2026-09-30，三段全落地） | **吸收 15 P2/P3**：**A** = 15 D6/D7/D8 落地 + `NN_BIND_DEBUG` 门禁；**B** = 43 处 `ensure_gpu`→`import`（新增跨设备拉取契约，virtual 48→49）；**C** = 删 Layer 每调用 engine 形参（175 打标清单里的 Layer 部分） | 段 A：`model_serialization.hpp`、`model_container.hpp`、`compute_engine.hpp`（D6-3 改纯虚、`to_prec` 补绑定、`bind_error_` 打 stderr）、offload 占位（D8）、`expr_dsl.hpp`；段 B：`compute_engine.hpp` `import/import_impl` + `compute_gpu_engine.hpp` 48 处改名；段 C：`compute_layer_base.hpp`（`engine_` 成员 + `init` NVI + 四虚接口去形参 + `engine_ref()` 带 source_location 诊断）、10 个层头 54 处定义 + 约 200 处调用点、复合层子层 init 补齐、scan/测试补 `init(engine)`（commits `8ecf1bd`/`8110f83`/`402b213`） | **三段四件套全过**：build 零告警；ctest 20/20 **且 `NN_BIND_DEBUG=1` 同样 20/20（门禁）**；CPU 锚 `6f8849f14da23110` 与 **GPU dev2 锚 `8ef51b2927253c50`** 均逐位不变；`--init-hash` 六模型与 M2 锚全同；scan 双 hash 不变；`--io-roundtrip` CPU/GPU 全过；L2 审计 0；D6-1 round-trip SHA256 逐字节一致（f32/f16 param）。**layer_bench 配对 A/B（pre=4ce5884 worktree）**：正序 feedforward fwd/train +4.1%/+4.5%、**逆序复测 -0.7%/+0.4%**（排除运行顺序偏置，判定为 -O0 二进制重排级小差，同 M2 结论）；linear fwd ±8%（0.8ms 亚毫秒、train 反向 -6.9%，M1/M2 已记录该点方差）——**无系统性回退** |
 | **M7** | （可选后置）15 P5/P6 存储多态 + `as_cpu/as_gpu` | `compute_tensor.hpp` | 第三后端出现前**不立项** |
 
 **顺序理由**：M1 先行——编译器立刻封锁一切绕路，后续各期都在不变量内做；M2 在 M3 前，
@@ -254,7 +255,7 @@ CPU 字节基线 + scan 产物 hash + layer_bench（定义见 §6）。
 
 **关系**
 
-- `15-computeengine-refresh.md`：P-1/P1 成果保留；**P2→M6 段 C（未实施）、P3→M6 段 B（2026-09-30 落地）、P5/P6→M7**，
+- `15-computeengine-refresh.md`：P-1/P1 成果保留；**P2→M6 段 C（2026-09-30 落地，Layer 范围）、P3→M6 段 B（2026-09-30 落地）、P5/P6→M7**，
   P4 正交另案；15 本文头部已标注被本文吸收。
 - `13-refactor-backlog.md` §10.8：句柄指针化**维持否决**，增补注脚"访问诉求由本文
   §4.1 不变量承接"。
@@ -263,25 +264,37 @@ CPU 字节基线 + scan 产物 hash + layer_bench（定义见 §6）。
   381 宿主中转中的 L2 部分已随 M4 归零（见 §5 M4 行）。
 - `AGENTS.md`：**M1 已新增铁律第 11 条**（张量存储不可绕过引擎，2026-09-30）；
   **M4 已新增铁律第 12 条**（L2+ 计算路径禁用 Matrix，含宿主桥与审计口径，2026-09-30）；
-  文档索引已同步。
+  **§8 签名细节已按 M6 段 C 更新**；文档索引已同步。
 
-**M6 段 C 交接（删每调用 engine 形参——本轮未实施，下一轮立项读此处 + 16 §3 + 15 §3.3）**
+**M6 段 C 实施记录（2026-09-30，commit `402b213`）与保留形参清单**
 
-1. **范围**：16 §3 的 DROP 110 处 + REVIEW 7 处（KEEP 58 处按定义不动：`init` 绑定入口、
-   Optimizer 构造、DSL 入口、Model 容器、domain 工厂）；`include` 内 `forward(engine,…)`
-   80 处 / `backward(engine,…)` 57 处，`src` 调用点约 155 处（编译器穷尽驱动）。
-2. **绑定设计**：`Layer` 需新增 `ComputeEngine* engine_`，并把 `init` 改成 **NVI
-   （公共 `init(engine)` 绑定后转 `init_impl`）**——否则各层 override 的 `init` 不会调基类、
-   `engine_` 留空。方法体内的 `engine` 用法保持不动的最小改法是函数首行加
-   `ComputeEngine& engine = *engine_;` 局部别名（DSL 入口按 15 §3.3 保留形参，层传 `*engine_`）。
-3. **未定点（需先裁定再动手）**：**Loss 没有天然绑定时机**（`nn::CrossEntropyLoss ce;` 默认
-   构造、同一对象在测试里可跨 CPU/GPU 复用）——要么改构造签名 `CrossEntropyLoss(engine)`
-   （src 约 19 处 + 文档范式 AGENTS §8），要么 Loss 保留 engine 形参并把 17 §5 M6 的
-   "删形参"范围收窄为 Layer/辅助函数；15 §3.3 只说"Loss 排在 Layer 之后"，未给绑定方案。
-   辅助函数（`RotaryEmbedding`/`PositionEncoder`/`ActivationOffloader`/`nn_dbg_scan`）同理：
-   由持有层在 `init` 时 `bind(*engine_)`，或保留形参。
-4. **验收**：四件套 + `NN_BIND_DEBUG=1` ctest 门禁（段 A 已打通）+ **layer_bench 配对 A/B**
-   （参数删除是纯 API 变更，字节锚须逐位不变）。
+1. **落地设计**：`Layer` 新增 `ComputeEngine* engine_`；`init` 改 **NVI**（公共
+   `init(engine)` 绑定后转 `init_impl`，17 处层 override 全部改名——编译器穷尽驱动）；
+   四个虚接口去 engine 形参（`forward/backward/zero_grad/forward_recompute`）；
+   方法体用函数首行 `ComputeEngine& engine = engine_ref();` 局部别名（DSL 入口按
+   15 §3.3 保留形参、层传该局部引用）；54 处定义 + 约 200 处调用点改写。
+   `engine_ref()` 带 `std::source_location`——未 init 就跑 forward 会先打印**调用点
+   file:line** 再 fail-fast（比裸 NN_ASSERT 好定位，本轮正是靠它找到漏网层）。
+2. **新不变量：复合层的 `init_impl` 必须 init 全部子层**（含无参量的 ReLU/GeLU/SwiGLU/
+   Softmax/激活子层/`pos_encoding_`）——这些子层以前靠 forward 形参拿引擎，删参后未 init
+   即 fail-fast。本轮补齐 5 处：`FeedForward::gelu_/swiglu_`、`AttentionBase::softmax_`、
+   `CrossAttention::softmax_`、`ZiPTBlock::softmax_`、`TransformerEncoder::pos_encoding_`。
+   **后续新增子层时照此办理**（漏了会在运行期带调用点报错，不会静默）。
+3. **库外配套**：`tools/scan_exprs`（9 处）与 `fused_gpu_test`/`softmax_gradcheck`/
+   `maxpool_gradcheck`（6 处）里"构造后直接 forward"的层补 `init(engine)`
+   ——手工构造的层必须先 init（`Model::add` 自动调，测试/工具里不自动）。
+4. **保留形参的部分（＝15 §3.3 里"Layer 之后"的两档，本轮不改，理由）**：
+   - `Loss::forward/forward_sparse`：**Loss 没有天然绑定时机**（默认构造、同一对象在
+     测试里可跨 CPU/GPU 复用，如 `zipt_consistency_test` 的 `ce_cpu/ce_gpu`）。要删形参须
+     先改构造签名 `CrossEntropyLoss(engine)`（src 约 19 处 + AGENTS §8 范式），或引入
+     `Loss::bind(engine)`；**下一轮立项先裁定**。
+   - DSL 入口（`dsl::compute/compute_into/compute_reduce`）：15 §3.3 明确保留。
+   - 辅助对象 `PositionEncoder`/`RotaryEmbedding`（`apply/apply_step/backward`）、
+     `ActivationOffloader`、`nn_dbg_scan`、层内私有 helper：由持有层在方法体里传局部
+     `engine`（helper 签名不变，改动面远小于收益；若将来统一，方式 = 持有层 init 时
+     `bind(*engine_)`）。
+5. **验收**：四件套 + `NN_BIND_DEBUG=1` ctest 门禁 + layer_bench 配对 A/B（正序 +4.1/+4.5%、
+   逆序 -0.7/+0.4%——判定 -O0 二进制重排级小差，同 M2 结论），见 §5 M6 行。
 
 **未决点（实施时裁定）**
 
