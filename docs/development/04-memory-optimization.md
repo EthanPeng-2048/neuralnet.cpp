@@ -33,7 +33,8 @@
 
 **L2 内存池整块归还 + 统计**
 - `MemoryPool`：`PoolStats` + `pool_debug_stats()`（块数/占用/空闲/碎片）、`release_idle_blocks()`（整块 `vkFreeMemory` + 从 `blocks_` 移除，带 `retain_free_bytes_` 保留阈值防抖动）、`set_retain_free_bytes()`。
-- `GpuBackend::release_idle_pool_blocks()`（先 `flush_pending_destroys()` 再归还）；`ComputeEngine` 提供 `release_idle_pool_blocks()` / `pool_stats()`（CPU 为 no-op）；`GpuEngine` override。
+- `GpuBackend::release_idle_pool_blocks()`（先 `flush_pending_destroys()` 再归还）；`ComputeEngine` 提供 `release_idle_pool_blocks()` / `pool_stats()`；`GpuEngine` override。
+  - **M5（2026-09-30）后口径**：`pool_stats()` 不再有"CPU 返回空串"的空档——无池引擎（CPU）默认返回**宿主直配账本** `direct{ blocks=… live_bytes=… peak_bytes=… total_blocks=… total_bytes=… }`（`nn::host_alloc_ledger()`，在 `algebra_matrix.hpp` 的 `MatrixT` 分配/释放路径记账，relaxed 原子、元素热循环零参与）；`release_idle_pool_blocks()` 对 CPU 是**语义成立的 no-op**（直配无整块可归还）。两引擎同一动词、都非空，训练日志一套代码读两个引擎（17 §4.5）。
 - 接入：`text_train` 的 `--checkpoint-every N` 与每 step 末尾 `release_idle_pool_blocks()`（end_batch 提交完成、延迟销毁已 flush 后调用，安全）。
 - 回归：仅 GPU 内存管理路径，不影响 CPU 数值；L1 相关 gradcheck 全绿。
 
