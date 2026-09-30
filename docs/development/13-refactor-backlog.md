@@ -263,4 +263,5 @@ class ComputeEngine {
 - **不采用：`Tensor` 抽象基类 + `CPUTensor/GPUTensor` 句柄指针化**（原"方案 A"）。它要解决的 device 互斥，收益与存储多态重叠，却要 `Result<Tensor>` **203 处**指针化 + `span/vector` 元素类型连锁 + `GpuEngine::copy_from:412` 句柄重绑定重写；且虚函数不能模板化，精度维度 variant 依旧要留（收益只覆盖一半），更关键的是**不解决 engine 传参耦合**（`forward(engine,...)` 一个都跑不掉）。
 - **收敛（复审）**：单一创建入口——删除原稿的 `Tensor::host` / `.to(engine)` 两步创建；宿主数据一律用 `Matrix` 表达。
 - **收敛（复审）**：`to_matrix/from_matrix/copy_from` 退出日常 API，仅作宿主中转特例（§10.6 表）；互传统一走 `import`，**没有 A<->B 快速互转时默认经宿主（CPU）中转**。
+- **2026-09-30 增补（`17-unified-tensor-engine.md`）**：上文"不采用句柄指针化"**维持**；"直接读写张量"的诉求改由**访问不变量**承接（一切 Tensor 创建/访问/修改经 ComputeEngine、存储私有，17 §4.1）。上一条"to_matrix/from_matrix 退出日常 API"的改名方案由 17 §3 D9 **改为**"保留名称 + I/O 分组 + grep 审计"（Matrix 裁定保留降级为宿主 I/O 载体）。本节整体由 17 吸收为历史引用。
 
