@@ -23,13 +23,13 @@
 
 | 事实 | 数字 | 复现 |
 |---|---|---|
-| `Matrix` 出现（include 213 + src 373 次命中） | 61 文件 / ~586 处 | `Select-String -Pattern '\bMatrix\b'` |
-| `cpu_matrix()/cpu_shared()` 调用 | include 5 文件（2 引擎 + DSL + 容器头）+ src 127 处（几乎全是测试） | `grep -rn "cpu_matrix()"` |
-| `gpu_tensor()` 调用 | **全部**在 `compute_gpu_engine.hpp` 内部（引擎自己，合规） | 同上换 pattern |
-| `Tensor` 静态直构工厂（`Tensor::from_matrix/cpu/...`） | 90 处 / 8 文件（库外为主，15 §1） | `grep -c src/*_test.cpp` |
-| 内存池 | 仅 Vulkan：`backend/compute_memory_pool.hpp`，`GpuBackend` 持双池（memory/transient） | `grep -rn MemoryPool include/` |
+| `Matrix` 出现（include 213 + src 373 次命中） | 61 文件 / 586 处 | `Select-String` 扫 `include/**/*.hpp` + `src/**/*.cpp`，pattern `\bMatrix\b`（命中行；src 若含 `.hpp` 另 +3 行/1 文件） |
+| `cpu_matrix()/cpu_shared()` 调用 | include 5 文件（CPU/GPU 引擎 + 引擎基类 + DSL + 容器头）+ src 127 处（126 测试 + `text_train.cpp:756`） | `grep -rn "cpu_matrix()"` |
+| `gpu_tensor()` 调用 | **全部**在 `compute_gpu_engine.hpp` 内部 59 处（引擎自己，合规）；`compute_tensor.hpp:276/294` 仅为访问器声明 | 同上换 pattern |
+| `Tensor` 静态直构工厂（`Tensor::from_matrix/cpu/...`） | 98 处 / 8 文件（2026-09-30 复核；库外为主，15 §1 口径同源） | `Select-String` 两个 pattern（`Tensor::from_matrix`、`Tensor::cpu\b`）扫 `src/*_test.cpp`，命中行和 = 98 |
+| 内存池 | 仅 Vulkan：`backend/compute_memory_pool.hpp`（`GpuBackend` 持双池 memory/transient）；`backend/compute_staging_ring.hpp:56/93/104/232` 与 `compute_vk_backend.hpp` 亦引用，均 Vulkan 后端 | `grep -rn MemoryPool include/` |
 | CPU 池 | **不存在**：`Matrix` 直接 `std::vector`；`pool_stats()` CPU 返回空串（`compute_engine.hpp:144`） | 读引擎默认实现 |
-| init RNG | 混乱：`compute_layer_gpt.hpp:432/603` 固定 seed 42；`mlp:40`、`conv:107`、`zipt:89/1044` 用 `std::random_device{}`（**跨进程不确定**） | `grep -rn mt19937 include/` |
+| init RNG | 混乱：固定 seed 42 = `gpt:432/603`、`rapt:1155`、`zipt:814`；`std::random_device{}`（**跨进程不确定**）= `gpt:953`、`mlp:40`、`conv:107`、`zipt:89/1044`、`rapt:1462` | `grep -rn mt19937 include/` |
 | 读 GPU 张量 | `to_matrix` 是唯一 PCIe 下载点；`ensure_gpu` 43 处隐式上传（15 §1） | `grep -n "= ensure_gpu(" compute_gpu_engine.hpp` |
 | Layer init 模式 | 层内 `Matrix` 填数 → `engine.from_matrix` 上传（如 `compute_layer_mlp.hpp:46-64`） | 读 `Layer::init` |
 
@@ -162,8 +162,9 @@ struct InitSpec {
   （`compute_tensor.hpp:98-102` 注释在案）——**内部通道必须保持裸指针零开销**，
   不得为"统一"引入每元素虚调用/原子操作。
 - 定位：DSL 求值器 = 引擎域内组件（`dsl::compute` 本就带 `ComputeEngine&`），
-  经 friend/内部通道拿 span；`EvalContext` 已是"求值前物化一次、热循环裸指针"
-  （`expr_dsl.hpp:605`），保持该结构。
+  经 friend/内部通道拿 span；既有结构已是"求值前物化一次、热循环裸指针"——
+  matmul 叶子的 `prepare_cpu`（`expr_dsl.hpp:548-607`）用引擎物化 `c_cache_`
+  后绑裸指针 `c_data_`（:605，幂等 :550），保持该结构。
 - 验收硬项：`layer_bench` 无回退（沿 15 P5 验收要求）。
 
 ## 5. 分期实施
