@@ -13,6 +13,8 @@ Write-Output "virtual methods: $($virts.Count) declarations, $($uv.Count) unique
 
 # 2) Layer/Loss/Optimizer 直调的算子
 $layerFiles = Get-ChildItem (Join-Path $root 'include\neuralnet.cpp') -Filter 'compute_layer*.hpp'
+# compute_position_encoding.hpp 是 L2 辅助对象（位置编码策略族）→ 同受铁律 #12 约束
+$layerFiles += Get-Item (Join-Path $root 'include\neuralnet.cpp\compute_position_encoding.hpp')
 $layerFiles += Get-Item (Join-Path $root 'include\neuralnet.cpp\compute_loss.hpp')
 $layerFiles += Get-Item (Join-Path $root 'include\neuralnet.cpp\compute_optimizer.hpp')
 $layerFiles += Get-Item (Join-Path $root 'include\neuralnet.cpp\model_container.hpp')

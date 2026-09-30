@@ -62,7 +62,7 @@ public:
             / dsl::row_reduce_sum(
                 dsl::exp(dsl::leaf(input) - dsl::row_reduce_max(input))),
             input.rows(), input.cols(), p_.stable);
-        if (!out) return std::unexpected(out.error());
+        NN_TRY_CHECK(out);
         if (checkpoint_mode_)
             return out;
         // 单缓冲：把结果移入 output_cache_（唯一持有者），返回共享同一 buffer

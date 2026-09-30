@@ -191,8 +191,8 @@ int main(int argc, char* argv[])
 
     std::puts("=== attn_gradcheck (CausalSelfAttention numerical) ===");
     add(test_attn_gradcheck(argc, argv));
-    { // Doc / AlibiDoc backward 覆盖：本段专门跑 masked_doc_ /
-        //   masked_alibi_doc_ 分支的梯度（仅 forward 通过不足以验证——
+    { // Doc / AlibiDoc backward 覆盖：本段专门跑 CausalDocScoreMask /
+        //   CausalAlibiDocScoreMask 分支的梯度（仅 forward 通过不足以验证——
         //   梯度跨文档串扰 forward 抓不住）；默认 learned+doc 与
         //   alibi+doc 各跑一遍数值梯度
         char n0[] = "attn_gradcheck", n1[] = "--doc", n2[] = "--pos-enc",

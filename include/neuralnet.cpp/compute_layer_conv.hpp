@@ -48,7 +48,7 @@ namespace conv_engine {
     std::size_t C, std::size_t P, std::size_t B, const Tensor& perm)
 {
     auto w = engine.rearrange_3d(Z, C, P, B, /*inverse=*/false);   // (P*C, B)
-    if (!w) return std::unexpected(w.error());
+    NN_TRY_CHECK(w);
     return engine.gather_rows(*w, perm);                          // (C*P, B)
 }
 
@@ -108,8 +108,7 @@ private:
     [[nodiscard]] Result<void> ensure_perm_(ComputeEngine& engine)
     {
         if (perm_cache_.valid()) return {};
-        auto p = conv_engine::make_layout_perm(engine, out_channels_, out_h_ * out_w_);
-        if (!p) return std::unexpected(p.error());
+        NN_TRY(p, conv_engine::make_layout_perm(engine, out_channels_, out_h_ * out_w_));
         perm_cache_ = std::move(*p);
         return {};
     }
@@ -192,7 +191,7 @@ public:
         // 1) 窗口展开（引擎原语）：x (C_in*H*W, B) → col (C_in*k*k, P*B)
         auto col = engine.im2col(input, in_channels_, in_h_, in_w_,
                                  kernel_, stride_, padding_, out_h_, out_w_);
-        if (!col) return std::unexpected(col.error());
+        NN_TRY_CHECK(col);
         // checkpoint 模式不驻留：显式清空，避免 size 相同导致静默用陈旧 im2col
         col_cache_ = checkpoint_mode_ ? Tensor{} : *col;
 
@@ -202,7 +201,7 @@ public:
         auto Z = dsl::compute(engine,
             dsl::matmul(w_, *col, false, false) + dsl::row_broadcast(b_),
             out_channels_, batch * P);
-        if (!Z) return std::unexpected(Z.error());
+        NN_TRY_CHECK(Z);
 
         // 3) 布局转换 (C_out, P*B) → (C_out*P, B)（rearrange_3d + gather 置换）
         return conv_engine::cols_to_samples(engine, *Z, out_channels_, P, batch, perm_cache_);
@@ -233,29 +232,29 @@ public:
         // 1) grad_output (C_out*P, B) → gZ (C_out, P*B)
         auto gZ = conv_engine::samples_to_cols(engine, grad_output,
                                                out_channels_, P, batch, perm_cache_);
-        if (!gZ) return std::unexpected(gZ.error());
+        NN_TRY_CHECK(gZ);
 
         // 2) grad_W += gZ × col^T → (C_out, C_in*k*k)：matmul 段与累加**融合为单次
         //    dispatch**并原地写入 grad_w_（不物化 gw 中间结果）
         auto r1 = dsl::compute_into(engine,
             dsl::leaf(grad_w_) + dsl::matmul(*gZ, col_cache_, false, true), grad_w_);
-        if (!r1) return std::unexpected(r1.error());
+        NN_TRY_CHECK(r1);
 
         // 3) grad_b += row_reduce_sum(gZ) → (C_out, 1)（对全部位置与样本求和）
         //    归约步用 dsl::compute_reduce、累加步用 dsl::compute_into（同 Linear）
         auto gb = dsl::compute_reduce(engine,
             dsl::row_reduce_sum(dsl::leaf(*gZ)), gZ->rows(), gZ->cols());
-        if (!gb) return std::unexpected(gb.error());
+        NN_TRY_CHECK(gb);
         auto r2 = dsl::compute_into(engine,
             dsl::leaf(grad_b_) + dsl::leaf(*gb), grad_b_);
-        if (!r2) return std::unexpected(r2.error());
+        NN_TRY_CHECK(r2);
 
         // 4) gcol = W^T × gZ → (C_in*k*k, P*B) ；5) grad_x = col2im(gcol)
         //    纯 matmul 段由 dsl::compute 直写（scan 的 Conv2D backward dry-run 自动登记）
         auto gcol = dsl::compute(engine,
             dsl::matmul(w_, *gZ, true, false),
             w_.cols(), gZ->cols());
-        if (!gcol) return std::unexpected(gcol.error());
+        NN_TRY_CHECK(gcol);
         return engine.col2im(*gcol, in_channels_, in_h_, in_w_,
                              kernel_, stride_, padding_, out_h_, out_w_);
     }
@@ -300,8 +299,7 @@ private:
     [[nodiscard]] Result<void> ensure_perm_(ComputeEngine& engine)
     {
         if (perm_cache_.valid()) return {};
-        auto p = conv_engine::make_layout_perm(engine, channels_, out_h_ * out_w_);
-        if (!p) return std::unexpected(p.error());
+        NN_TRY(p, conv_engine::make_layout_perm(engine, channels_, out_h_ * out_w_));
         perm_cache_ = std::move(*p);
         return {};
     }
@@ -319,7 +317,7 @@ private:
                 expand[c * kk + i] = static_cast<Scalar>(c);
         auto t = detail::upload_span(engine, channels_ * kk, 1, Precision::F32,
                                      std::span(expand));
-        if (!t) return std::unexpected(t.error());
+        NN_TRY_CHECK(t);
         expand_cache_ = std::move(*t);
         return {};
     }
@@ -375,7 +373,7 @@ public:
         // 1) 窗口展开（引擎原语）：x (C*H*W, B) → col (C*kk, P*B)
         auto col = engine.im2col(input, channels_, in_h_, in_w_,
                                  pool_, stride_, 0, out_h_, out_w_);
-        if (!col) return std::unexpected(col.error());
+        NN_TRY_CHECK(col);
 
         // 2) 分组归约求窗口 max：每 kk 行一组 → (C, P*B)。
         //    单表达式单 dispatch 完成全通道分组归约（grouped_reduce_max 视图，
@@ -388,7 +386,7 @@ public:
             dsl::grouped_reduce_max(*col, static_cast<std::uint32_t>(kk))
                 + dsl::rparam(Scalar{0}),
             channels_, col->cols());
-        if (!pooled) return std::unexpected(pooled.error());
+        NN_TRY_CHECK(pooled);
 
         // 3) checkpoint 模式不驻留：显式清空（避免 size 相同静默用陈旧数据）
         if (checkpoint_mode_)
@@ -432,7 +430,7 @@ public:
         // 1) grad_output (C*P, B) → g_pooled (C, P*B)
         auto g_pooled = conv_engine::samples_to_cols(engine, grad_output,
                                                      channels_, P, batch, perm_cache_);
-        if (!g_pooled) return std::unexpected(g_pooled.error());
+        NN_TRY_CHECK(g_pooled);
 
         // 2) 并列均分（全部为整张量原语 + DSL，无逐通道循环）
         //    mx_exp = 组内广播(pooled)：gather_rows 把每个通道的 max 复制 kk 次
@@ -441,7 +439,7 @@ public:
         { auto r = ensure_expand_(engine); if (!r) return std::unexpected(r.error()); }
 
         auto mx_exp = engine.gather_rows(pooled_cache_, expand_cache_);   // (C*kk, P*B)
-        if (!mx_exp) return std::unexpected(mx_exp.error());
+        NN_TRY_CHECK(mx_exp);
 
         // 并列个数 cnt = 分组求和([x == 窗口 max]) → (C, P*B)
         // （grouped_reduce_sum 视图，同 forward）
@@ -449,27 +447,27 @@ public:
             dsl::select(dsl::leaf(col_cache_) == dsl::leaf(*mx_exp),
                         Scalar{1}, Scalar{0}),
             channels_ * kk, P * batch);                                   // (C*kk, P*B)
-        if (!eq) return std::unexpected(eq.error());
+        NN_TRY_CHECK(eq);
         //    同 forward：裸分组归约视图根 = 空指令表（GPU 校验拒绝）→ + rparam(0)
         auto cnt = dsl::compute(engine,
             dsl::grouped_reduce_sum(*eq, static_cast<std::uint32_t>(kk))
                 + dsl::rparam(Scalar{0}),
             channels_, P * batch);
-        if (!cnt) return std::unexpected(cnt.error());
+        NN_TRY_CHECK(cnt);
 
         // 每个并列元素分到的梯度 g/cnt → 再广播回窗口内
         auto gdiv = dsl::compute(engine,
             dsl::leaf(*g_pooled) / dsl::leaf(*cnt),
             channels_, P * batch);                                        // (C, P*B)
-        if (!gdiv) return std::unexpected(gdiv.error());
+        NN_TRY_CHECK(gdiv);
         auto gdiv_exp = engine.gather_rows(*gdiv, expand_cache_);         // (C*kk, P*B)
-        if (!gdiv_exp) return std::unexpected(gdiv_exp.error());
+        NN_TRY_CHECK(gdiv_exp);
 
         auto gc = dsl::compute(engine,
             dsl::select(dsl::leaf(col_cache_) == dsl::leaf(*mx_exp),
                         dsl::leaf(*gdiv_exp), Scalar{0}),
             channels_ * kk, P * batch);                                   // (C*kk, P*B)
-        if (!gc) return std::unexpected(gc.error());
+        NN_TRY_CHECK(gc);
 
         // 3) 反向散射到输入像素（重叠窗口在 col2im 内累加）
         return engine.col2im(*gc, channels_, in_h_, in_w_,

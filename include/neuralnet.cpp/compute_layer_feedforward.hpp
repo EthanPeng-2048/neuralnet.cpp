@@ -38,8 +38,8 @@ public:
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
-        auto r1 = fc1_.init(engine); if (!r1) return std::unexpected(r1.error());
-        auto r2 = fc2_.init(engine); if (!r2) return std::unexpected(r2.error());
+        NN_TRY(r1, fc1_.init(engine));
+        NN_TRY(r2, fc2_.init(engine));
         // M6 段 C：激活子层也是 Layer（engine 由 init 绑定），必须一并 init——
         // 否则 forward 里调 gelu_/swiglu_.forward() 会在 engine_ref() 处 fail-fast。
         { auto r = gelu_.init(engine);   if (!r) return std::unexpected(r.error()); }
@@ -49,18 +49,12 @@ public:
 
     std::vector<TensorRef> parameters() override
     {
-        auto p = fc1_.parameters();
-        auto p2 = fc2_.parameters();
-        p.insert(p.end(), p2.begin(), p2.end());
-        return p;
+        return collect_refs(fc1_.parameters(), fc2_.parameters());
     }
 
     std::vector<TensorRef> param_gradients() override
     {
-        auto g = fc1_.param_gradients();
-        auto g2 = fc2_.param_gradients();
-        g.insert(g.end(), g2.begin(), g2.end());
-        return g;
+        return collect_refs(fc1_.param_gradients(), fc2_.param_gradients());
     }
 
     // 梯度检查点：把模式传播给内部 fc1/fc2/gelu/swiglu
@@ -107,32 +101,26 @@ public:
     [[nodiscard]] Result<Tensor> forward(
         const Tensor& input) override
     {
-        auto h1 = fc1_.forward(input);
-        if (!h1) return h1;
+        NN_TRY(h1, fc1_.forward(input));
         if (use_swiglu_)
         {
-            auto h2 = swiglu_.forward(*h1);
-            if (!h2) return h2;
+            NN_TRY(h2, swiglu_.forward(*h1));
             return fc2_.forward(*h2);
         }
-        auto h2 = gelu_.forward(*h1);
-        if (!h2) return h2;
+        NN_TRY(h2, gelu_.forward(*h1));
         return fc2_.forward(*h2);
     }
 
     [[nodiscard]] Result<Tensor> backward(
         const Tensor& grad_output) override
     {
-        auto b2 = fc2_.backward(grad_output);
-        if (!b2) return b2;
+        NN_TRY(b2, fc2_.backward(grad_output));
         if (use_swiglu_)
         {
-            auto bg = swiglu_.backward(*b2);
-            if (!bg) return bg;
+            NN_TRY(bg, swiglu_.backward(*b2));
             return fc1_.backward(*bg);
         }
-        auto bg = gelu_.backward(*b2);
-        if (!bg) return bg;
+        NN_TRY(bg, gelu_.backward(*b2));
         return fc1_.backward(*bg);
     }
 };

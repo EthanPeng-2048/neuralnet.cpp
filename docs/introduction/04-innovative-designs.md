@@ -149,7 +149,8 @@ RoPE 的 `RowMod/RotateHalf` 参数如果以**结构常量**折进 key，每个 
 块内 rescale + 累加、`tri_skip` 把被屏蔽块整块钳成空转（跳过项恰为 -inf/0 恒等项，
 与全量计算逐位一致）。**S 矩阵从不存在**，`m/l/O` 均不外溢显存（O 在寄存器/shared
 分片内）。掩码 5 变体（Plain/Causal/Alibi/Doc/AlibiDoc）在 fold body 内以 select
-链表达，由 `fold_mask_variant_()` 虚钩子选择——引擎只认 `FoldSpec` 结构、不认算法名。
+链表达，由 `AttnScoreMask` 策略族在构造期定型（`AttentionBase::make_score_mask_()` 工厂）
+——引擎只认 `FoldSpec` 结构、不认算法名。
 
 - **Backward**：`recompute_W_` 两步重算 W（掩码 matmul → softmax 归约表达式），
   不缓存 W/m/l；backward 多算一遍 QKᵀ，换整份 `BH·seq²` 缓存。
