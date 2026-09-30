@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>   // require_same_shape fail-fast 诊断输出
 #include <cstdlib>  // require_same_shape fail-fast std::abort
 #include <execution>
@@ -30,6 +32,50 @@
 
 namespace nn
 {
+    // ── 宿主直配账本（M5，docs/development/17 §4.5 D5）──────────────────────
+    // CPU 侧没有内存池：`MatrixT` 的存储走 `std::make_unique_for_overwrite`
+    // 直配。为了让 `ComputeEngine::pool_stats()` 在**所有**引擎上语义完整
+    // （17 §2 目标 4"内存契约统一"），这里把每一次宿主分配/释放记账：
+    // 活分配数/字节 + 峰值 + 累计——即"直配模式"的池统计口径。
+    // 只在分配/释放路径各做常数次 relaxed 原子操作，元素热循环零参与。
+    struct HostAllocLedger
+    {
+        std::atomic<std::uint64_t> live_blocks{0};   // 当前活分配数
+        std::atomic<std::uint64_t> live_bytes{0};    // 当前活字节
+        std::atomic<std::uint64_t> peak_bytes{0};    // 活字节历史峰值
+        std::atomic<std::uint64_t> total_blocks{0};  // 累计分配数
+        std::atomic<std::uint64_t> total_bytes{0};   // 累计分配字节
+
+        void on_alloc(std::size_t bytes) noexcept
+        {
+            const std::uint64_t b = static_cast<std::uint64_t>(bytes);
+            live_blocks.fetch_add(1, std::memory_order_relaxed);
+            const std::uint64_t now =
+                live_bytes.fetch_add(b, std::memory_order_relaxed) + b;
+            std::uint64_t pk = peak_bytes.load(std::memory_order_relaxed);
+            while (now > pk && !peak_bytes.compare_exchange_weak(
+                       pk, now, std::memory_order_relaxed,
+                       std::memory_order_relaxed))
+            {
+            }
+            total_blocks.fetch_add(1, std::memory_order_relaxed);
+            total_bytes.fetch_add(b, std::memory_order_relaxed);
+        }
+        void on_free(std::size_t bytes) noexcept
+        {
+            live_blocks.fetch_sub(1, std::memory_order_relaxed);
+            live_bytes.fetch_sub(static_cast<std::uint64_t>(bytes),
+                                 std::memory_order_relaxed);
+        }
+    };
+
+    // 全进程唯一账本（header-only：inline 函数内静态对象跨翻译单元同一实例）
+    [[nodiscard]] inline HostAllocLedger& host_alloc_ledger() noexcept
+    {
+        static HostAllocLedger led;
+        return led;
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     //  Matrix 类 — 矩阵存储与运算原语
     //
@@ -77,8 +123,18 @@ namespace nn
         // 只分配、不初始化（元素值不确定；调用方必须保证写满后才读）
         [[nodiscard]] static std::unique_ptr<element[]> allocate_(std::size_t n)
         {
-            return n == 0 ? std::unique_ptr<element[]>{}
-                          : std::make_unique_for_overwrite<element[]>(n);
+            if (n == 0) return {};
+            auto p = std::make_unique_for_overwrite<element[]>(n);
+            host_alloc_ledger().on_alloc(n * sizeof(element));   // 直配账本（M5）
+            return p;
+        }
+        // 释放并记账（直配账本的唯一出口；data_ 与 size_ 同步归零）
+        void release_storage_() noexcept
+        {
+            if (!data_) return;
+            host_alloc_ledger().on_free(size_ * sizeof(element));
+            data_.reset();
+            size_ = 0;
         }
         [[nodiscard]] const element *ptr() const noexcept { return data_.get(); }
         [[nodiscard]] element *ptr() noexcept { return data_.get(); }
@@ -162,6 +218,7 @@ namespace nn
         {
             if (this != &other)
             {
+                release_storage_();          // 旧缓冲先记账释放（M5 直配账本）
                 data_ = std::move(other.data_);
                 size_ = other.size_;
                 rows_ = other.rows_;
@@ -172,7 +229,7 @@ namespace nn
             }
             return *this;
         }
-        ~MatrixT() = default;
+        ~MatrixT() { release_storage_(); }
 
         // ── 就地调整大小（复用已有内存；新增部分零填充，与原 vector 语义一致）──
         void resize(std::size_t rows, std::size_t cols)
@@ -184,6 +241,7 @@ namespace nn
                 std::copy_n(ptr(), std::min(size_, n), nd.get());
             if (nd && n > size_)
                 std::fill_n(nd.get() + size_, n - size_, element{});
+            release_storage_();               // 旧缓冲记账释放（M5 直配账本）
             data_ = std::move(nd);
             size_ = n;
             rows_ = rows;
