@@ -14,9 +14,15 @@
 //     两次运行初值逐字节同）。覆盖 mlp/cnn/transformer/gpt/zipt/rapt 六类
 //     模型的全部 init 路径；输出 INIT1/INIT2 固定前缀行，跨进程比对：
 //     两次启动后 `grep '^INIT1' 各自输出 | diff`。
+//   --io-roundtrip：M3 专属验收——批量 read/write/get_index/set_index 语义
+//     对拍（f32/f16 × 写后读回 × read vs to_matrix × 索引往返 × 越界/U2
+//     错配错误路径 × 录制窗口内 write/read）。GPU 上即 staging 批量语义
+//     （上传 copy_from + 下载 to_matrix 隐含 flush/同步）。
+//     输出 IO 固定前缀行。
 //
-// 退出码：0 = 两轮逐位一致；1 = 不一致（run-to-run 非确定）；2 = 运行错误。
-// 用法：gpu_stability_probe [--steps N] [--init-hash] [--gpu [索引|--gpu=<名称>]] [--help]
+// 退出码：0 = 两轮逐位一致（io：全部用例过）；1 = 不一致；2 = 运行错误。
+// 用法：gpu_stability_probe [--steps N] [--init-hash] [--io-roundtrip]
+//       [--gpu [索引|--gpu=<名称>]] [--help]
 //   设备选择在首个 GpuBackend::instance() 之前注入 NN_VULKAN_DEVICE。
 // ────────────────────────────────────────────────────────────────────────
 
@@ -66,7 +72,7 @@ namespace
             for (std::size_t i = 0; i < sp.size(); ++i)
                 sp[i] = 0.05f * std::sin(0.61803398875f * static_cast<float>(i + 1) +
                                          0.017f * static_cast<float>(idx));
-            if (auto r = eng.copy_from(p, *pm); !r) return std::unexpected(r.error());
+            if (auto r = eng.write(p, pm->span()); !r) return std::unexpected(r.error());
             ++idx;
         }
         return {};
@@ -93,7 +99,15 @@ namespace
         if (gpu)
         {
 #ifdef NN_HAS_VULKAN
-            eng = std::make_unique<nn::GpuEngine>(nn::GpuBackend::instance());
+            auto &backend = nn::GpuBackend::instance();
+            // 修复（16 §7-2 根因）：instance() 只是惰性单例，Vulkan 设备要
+            // initialize() 才建立——本探针原先漏调，首个 vkCreateBuffer 拿到
+            // VK_NULL_HANDLE 即 "Invalid device" 崩溃。与 cli_engine_factory
+            // 及全部 GPU 测试入口同法。无显式 selector 时 initialize() 内部
+            // 仍按 "显式 > NN_VULKAN_DEVICE 环境变量 > 自动打分" 读设备选择。
+            if (auto ir = backend.initialize(); !ir)
+                return std::unexpected(ir.error());
+            eng = std::make_unique<nn::GpuEngine>(backend);
 #else
             return std::unexpected(nn::Error{"built without Vulkan (NN_HAS_VULKAN)"});
 #endif
@@ -236,6 +250,202 @@ namespace
 
         return out;
     }
+
+    // ── M3 批量读写语义对拍（17 §5 M3 专属验收）──────────────────────────
+    // 每个用例覆盖：write → read 逐元素往返（GPU = 上传 copy_from + 下载
+    // to_matrix 的 staging 链路）、read 与 to_matrix 两条下载路径逐位一致、
+    // get_index/set_index 往返、越界与 U2 精度错配的错误路径。
+    constexpr std::size_t kIoRows = 6, kIoCols = 7;
+
+    nn::Result<void> io_f32_case(nn::ComputeEngine &e, const char *tag)
+    {
+        auto t = e.create_tensor(kIoRows, kIoCols, nn::Precision::F32,
+                                 nn::InitSpec::zero());
+        if (!t.valid())
+            return std::unexpected(nn::Error{"io: create_tensor 失败"});
+        std::vector<nn::Scalar> pat(kIoRows * kIoCols);
+        for (std::size_t i = 0; i < pat.size(); ++i)
+            pat[i] = 0.001f * static_cast<nn::Scalar>((i * 37u) % 1000u) - 0.2f;
+
+        if (auto r = e.write(t, std::span<const nn::Scalar>(pat)); !r)
+            return std::unexpected(r.error());
+        std::vector<nn::Scalar> back(pat.size());
+        if (auto r = e.read(t, std::span<nn::Scalar>(back)); !r)
+            return std::unexpected(r.error());
+        if (back != pat)
+            return std::unexpected(nn::Error{std::string(tag) + ": write/read 往返不一致"});
+
+        // read vs to_matrix：两条下载路径逐位一致
+        auto m = e.to_matrix(t, nn::Precision::F32);
+        if (!m)
+            return std::unexpected(m.error());
+        if (m->span().size() != pat.size())
+            return std::unexpected(nn::Error{std::string(tag) + ": to_matrix 尺寸不一致"});
+        for (std::size_t i = 0; i < pat.size(); ++i)
+            if (m->span()[i] != pat[i])
+                return std::unexpected(
+                    nn::Error{std::string(tag) + ": read 与 to_matrix 结果不一致"});
+
+        // get_index 往返（含首尾角与中部）
+        const std::pair<std::size_t, std::size_t> pts[] = {
+            {0, 0}, {kIoRows - 1, kIoCols - 1}, {2, 3}};
+        for (const auto &rc : pts)
+        {
+            auto v = e.get_index(t, rc.first, rc.second);
+            if (!v)
+                return std::unexpected(v.error());
+            if (*v != pat[rc.first * kIoCols + rc.second])
+                return std::unexpected(nn::Error{std::string(tag) + ": get_index 不一致"});
+        }
+
+        // set_index → 批量 read 复核
+        if (auto r = e.set_index(t, 3, 4, -0.125f); !r)
+            return std::unexpected(r.error());
+        if (auto r = e.read(t, std::span<nn::Scalar>(back)); !r)
+            return std::unexpected(r.error());
+        if (back[3 * kIoCols + 4] != -0.125f)
+            return std::unexpected(nn::Error{std::string(tag) + ": set_index 未落盘"});
+
+        // 错误路径：越界 / U2 精度错配 / 尺寸错配必须报错
+        if (e.get_index(t, kIoRows, 0))
+            return std::unexpected(nn::Error{std::string(tag) + ": get_index 越界未报错"});
+        if (e.set_index(t, 0, kIoCols, 1.0f))
+            return std::unexpected(nn::Error{std::string(tag) + ": set_index 越界未报错"});
+        std::vector<nn::f16> wrong16(pat.size());
+        if (e.read(t, std::span<nn::f16>(wrong16)))
+            return std::unexpected(nn::Error{std::string(tag) + ": read f16 错配未报错"});
+        if (e.write(t, std::span<const nn::f16>(wrong16)))
+            return std::unexpected(nn::Error{std::string(tag) + ": write f16 错配未报错"});
+        std::vector<nn::Scalar> shortbuf(3);
+        if (e.read(t, std::span<nn::Scalar>(shortbuf)))
+            return std::unexpected(nn::Error{std::string(tag) + ": read 尺寸错配未报错"});
+        return {};
+    }
+
+    nn::Result<void> io_f16_case(nn::ComputeEngine &e, const char *tag)
+    {
+        auto t = e.create_tensor(kIoRows, kIoCols, nn::Precision::F16,
+                                 nn::InitSpec::zero());
+        if (!t.valid())
+            return std::unexpected(nn::Error{"io: create_tensor(f16) 失败"});
+        std::vector<nn::f16> pat(kIoRows * kIoCols);
+        for (std::size_t i = 0; i < pat.size(); ++i)
+            pat[i] = nn::f16(0.01f * static_cast<float>((i * 13u) % 200u) - 1.f);
+
+        if (auto r = e.write(t, std::span<const nn::f16>(pat)); !r)
+            return std::unexpected(r.error());
+        std::vector<nn::f16> back(pat.size());
+        if (auto r = e.read(t, std::span<nn::f16>(back)); !r)
+            return std::unexpected(r.error());
+        for (std::size_t i = 0; i < pat.size(); ++i)
+            if (static_cast<float>(back[i]) != static_cast<float>(pat[i]))
+                return std::unexpected(
+                    nn::Error{std::string(tag) + ": f16 write/read 往返不一致"});
+
+        // to_matrix（升 f32 精确无损）与 read(f16) 交叉对拍
+        auto m = e.to_matrix(t, nn::Precision::F32);
+        if (!m)
+            return std::unexpected(m.error());
+        for (std::size_t i = 0; i < pat.size(); ++i)
+            if (m->span()[i] != static_cast<float>(pat[i]))
+                return std::unexpected(
+                    nn::Error{std::string(tag) + ": f16 read 与 to_matrix 不一致"});
+
+        // 索引往返：set_index 的 Scalar 经 RHE 落 f16（0.5 可精确表示）
+        auto v = e.get_index(t, 1, 2);
+        if (!v)
+            return std::unexpected(v.error());
+        if (*v != static_cast<float>(pat[1 * kIoCols + 2]))
+            return std::unexpected(nn::Error{std::string(tag) + ": f16 get_index 不一致"});
+        if (auto r = e.set_index(t, 5, 6, 0.5f); !r)
+            return std::unexpected(r.error());
+        auto v2 = e.get_index(t, 5, 6);
+        if (!v2 || *v2 != 0.5f)
+            return std::unexpected(nn::Error{std::string(tag) + ": f16 set_index 未落盘"});
+
+        // U2：f32 span 配 f16 张量必须报错
+        std::vector<nn::Scalar> wrong32(pat.size());
+        if (e.read(t, std::span<nn::Scalar>(wrong32)))
+            return std::unexpected(nn::Error{std::string(tag) + ": read f32 错配未报错"});
+        if (e.write(t, std::span<const nn::Scalar>(wrong32)))
+            return std::unexpected(nn::Error{std::string(tag) + ": write f32 错配未报错"});
+        return {};
+    }
+
+    // 录制窗口子测（17 §7-4 调用约定）：begin_batch 内 write（覆盖既有存储、
+    // drain）→ read（隐含 flush + 同步）→ end_batch → 复读值不变；张量全程
+    // 存活到 end_batch 之后（铁律 #6）。
+    nn::Result<void> io_batch_window_case(nn::ComputeEngine &e, const char *tag)
+    {
+        auto t = e.create_tensor(4, 5, nn::Precision::F32, nn::InitSpec::zero());
+        if (!t.valid())
+            return std::unexpected(nn::Error{"io: create_tensor 失败"});
+        std::vector<nn::Scalar> pat(20);
+        for (std::size_t i = 0; i < pat.size(); ++i)
+            pat[i] = 0.5f + static_cast<nn::Scalar>(i);
+
+        if (auto r = e.begin_batch(); !r)
+            return std::unexpected(r.error());
+        if (auto r = e.write(t, std::span<const nn::Scalar>(pat)); !r)
+            return std::unexpected(r.error());
+        std::vector<nn::Scalar> back(pat.size());
+        if (auto r = e.read(t, std::span<nn::Scalar>(back)); !r)
+            return std::unexpected(r.error());
+        if (back != pat)
+            return std::unexpected(
+                nn::Error{std::string(tag) + ": 窗口内 write/read 不一致"});
+        if (auto r = e.end_batch(); !r)
+            return std::unexpected(r.error());
+        if (auto r = e.read(t, std::span<nn::Scalar>(back)); !r)
+            return std::unexpected(r.error());
+        if (back != pat)
+            return std::unexpected(
+                nn::Error{std::string(tag) + ": end_batch 后复读值变化"});
+        return {};
+    }
+
+    int run_io_roundtrip(bool gpu)
+    {
+        auto eng_r = make_engine(gpu);
+        if (!eng_r)
+        {
+            std::fprintf(stderr, "io-roundtrip 建引擎失败: %s\n",
+                         eng_r.error().message.c_str());
+            return 2;
+        }
+        nn::ComputeEngine &e = **eng_r;
+        using CaseFn = nn::Result<void> (*)(nn::ComputeEngine &, const char *);
+        const struct
+        {
+            const char *name;
+            CaseFn fn;
+        } cases[] = {
+            {"f32_roundtrip", io_f32_case},
+            {"f16_roundtrip", io_f16_case},
+            {"batch_window", io_batch_window_case},
+        };
+
+        int failures = 0;
+        for (const auto &c : cases)
+        {
+            auto r = c.fn(e, c.name);
+            if (r)
+            {
+                std::printf("IO %s ok=1\n", c.name);
+            }
+            else
+            {
+                std::printf("IO %s ok=0\n", c.name);
+                std::fprintf(stderr, "IO %s 失败: %s\n", c.name,
+                             r.error().message.c_str());
+                ++failures;
+            }
+        }
+        std::printf("RESULT io_cases=%zu io_failures=%d verdict=%s\n",
+                    sizeof(cases) / sizeof(cases[0]), failures,
+                    failures == 0 ? "PASS" : "FAIL");
+        return failures == 0 ? 0 : 1;
+    }
 } // namespace
 
 int main(int argc, char **argv)
@@ -243,6 +453,7 @@ int main(int argc, char **argv)
     std::size_t steps = 20;
     bool gpu = false;
     bool init_hash = false;
+    bool io_roundtrip = false;
     std::string device_desc = "cpu";
 
     for (int i = 1; i < argc;)
@@ -275,9 +486,15 @@ int main(int argc, char **argv)
             init_hash = true;
             ++i;
         }
+        else if (std::strcmp(argv[i], "--io-roundtrip") == 0)
+        {
+            io_roundtrip = true;
+            ++i;
+        }
         else if (std::strcmp(argv[i], "--help") == 0)
         {
-            std::printf("用法: %s [--steps N] [--init-hash] [--gpu [索引]]\n", argv[0]);
+            std::printf("用法: %s [--steps N] [--init-hash] [--io-roundtrip] [--gpu [索引]]\n",
+                        argv[0]);
             return 0;
         }
         else
@@ -313,6 +530,10 @@ int main(int argc, char **argv)
     {
         std::printf("CONFIG device=cpu steps=%zu\n", steps);
     }
+
+    // ── --io-roundtrip 模式（M3）：批量读写语义对拍（GPU 即 staging 验收）──
+    if (io_roundtrip)
+        return run_io_roundtrip(gpu);
 
     // ── --init-hash 模式（M2）：只建模型比初值，不训练 ────────────────────
     if (init_hash)
