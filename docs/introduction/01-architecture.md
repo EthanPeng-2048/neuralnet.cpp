@@ -268,8 +268,9 @@ class Tensor {
 | 批控制 | `begin_batch` / `end_batch`（CPU: no-op; GPU: command buffer） |
 | 内存 | `release_idle_pool_blocks`, `pool_stats` |
 | offload | `create_offload_buffer`, `offload_save/restore`（activation offload） |
+| I/O / 跨设备 | `from_matrix` / `to_matrix`（宿主 Matrix 载体）、`read` / `write` / `get_index` / `set_index`（批量本体 + 索引语法糖）、`import`（跨设备/引擎拉取，M6 新增，原 `ensure_gpu`） |
 
-> 引擎共 **49 个 virtual** 接口；逐元素/广播/条件选择不设 eager 原语，一律经表达式 DSL
+> 引擎共 **49 个 virtual 方法**（2026-09-30 M6 新增 `import_impl`，此前 48；复现 `bench/doc_inventory.ps1`）；逐元素/广播/条件选择不设 eager 原语，一律经表达式 DSL
 >（`dsl::compute` / `compute_into` / `compute_reduce`）执行。接口全量清单见
 > `development/12-compute-engine-inventory.md`。
 
