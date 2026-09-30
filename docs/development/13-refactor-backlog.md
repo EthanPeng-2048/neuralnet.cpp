@@ -105,6 +105,53 @@ ZiPT stored_tokens 门控——含各自核对结论与代码位置）。**重�
    ——统一前需逐点确认语义，留待单独立项。
 5. **`gpt_test` 偶发失败待观察**：62 次直跑 1 次失败、日志被覆盖未定位；疑似资源/竞争。
 
+## 9b. 已执行：Layer 层简化轮（2026-10-01）
+
+> 执行记录（注意力变体拆分 + 位置编码多态统一、参数收集 / Pre-Norm 残差反向 / 解码采样 /
+> 错误传播四处收敛）的完整叙述与验收数据已移入 `docs/history.md`。本节只保留结论与
+> **仍未做的部分**：
+
+**已做**（验收 = build 零告警、ctest 20/20 含 `NN_BIND_DEBUG=1`、scan 双 hash 与
+CPU/GPU 字节锚逐位不变、`--init-hash` 六模型全同、`--io-roundtrip` 全过、L2 审计 0）：
+
+- 位置编码：`PositionEncoder` 基类 + `Learned/Sinusoidal/RoPE/ALiBi/None` 子类
+  （新文件 `compute_position_encoding.hpp`）；`PosEncodingType` 只有两个分发点，
+  按注入点分开：`make_embedding_position_encoder`（模型侧持有）与
+  `make_attention_position_encoder`（注意力层**自持**）。层间无位置编码对象传递
+  （无 `set_position_encoder`），"谁拥有 = 谁负责"。
+  代价：RoPE 的 cos/sin 表随层构建（默认配置 ≈64KB/层、全模型 256KB）；层数极多
+  时若要回到共享，可考虑 `shared_ptr` 或模型侧持有 + 构造期传引用。
+- 注意力掩码：`AttnScoreMask` 族**只做掩码**（`PlainScoreMask` / `CausalScoreMask` /
+  `CausalDocScoreMask`，三个类），配置期由 `AttentionBase::make_score_mask_()` 定型；
+  `recompute_W_` 的变体判断链与三处 `if (use_rope_)` 全部消失。
+- 掩码 × 位置偏置**正交**：`expr::FoldAttnMask`（5 值融合枚举）拆成
+  `expr::AttnMaskKind{Plain,Causal,CausalDoc}` + `bool score_bias`；ALiBi 的偏置从
+  掩码表达式里摘出，由 `PositionEncoder::apply_score_bias()` 在 backward 的
+  "掩码之后、softmax 之前"独立叠加。掩码工厂不再查询位置编码。
+  **代价：backward 多一个逐元素 kernel；且 ALiBi 的行位置改用 `(rows,1)` 行表 +
+  `row_broadcast`（不能再用 `row()`——它在没有 matmul 段的新 spec 里会退化成全局行号，
+  见 `AGENTS.md` §7 的告警）。`expr_specs.bin`/`fused_registry.hpp` 的 hash 因此变化，
+  但 CPU/GPU 字节锚逐位不变。**
+- `Layer::collect_refs` / `collect_block_refs_` / `prenorm_residual_forward_` /
+  `prenorm_residual_backward_` / `sample_next_token_`（`compute_layer_base.hpp`）。
+- `NN_TRY` / `NN_TRY_CHECK`（`core_errors.hpp`）：L2 层 494 处错误传播收敛；
+  批量改写脚本 `tools/apply_nn_try.ps1 -DryRun` 可复现计数。
+
+**仍未做**（重新立项前先读本节）：
+
+- **H4 精度/形状三元组收敛**：`dsl::compute(engine, expr, rows, cols, p_.compute)` 的
+  尾部参数仍在每个调用点重复。可考虑 `Layer` 上的 `eval_like_(engine, expr, shape_ref)`
+  便捷入口，但需逐点确认每个调用点用的是 `p_.compute` 还是刻意的其他精度（RAPT 的残差
+  相加就是反例），故不适合机械改写。
+- **H5 掩码/索引构造**：注意力侧已随策略类收敛（`CausalDocScoreMask::prepare` 把原先
+  两份数值相同的宿主缓冲并为一份）；其余层（conv 置换、transformer patch 提取等）的
+  "CPU 循环 + `upload_span`" 仍未声明式化。
+- **H3 解码循环骨架**：仅采样段合并；三个 `generate()` 的循环体因运行态不同而保留
+  （理由见 `docs/history.md` 对应条目）。
+- **未评估**：`bench/doc_inventory.ps1` 的 `host_bridge_uses` 计数口径未随本轮新增文件
+  复核（当前 41，仅披露不判违规）。
+
+
 ## 10. Tensor 绑定引擎 + 存储多态（提案，2026-09-28 设计讨论）
 
 > 状态：**方案未实施**。选型已定（见 §10.8），重新立项时先读本节 + 源码现状。

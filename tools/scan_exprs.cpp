@@ -645,27 +645,33 @@ int main(int argc, char* argv[])
             reg_all.add(fs);
         }
         // attention fold（双域）：vec_state_len/k/batch/view param 均不
-        // 进 key → dk 族登记是同 key 去重。**5 个掩码变体必须全登记**——层
-        // forward 直调 engine.eval_expr(make_fold_attn_o)，不经 dsl::compute
-        // 的 NN_EXPR_SCAN 钩子，本块是 fold spec 唯一注册来源；漏 Doc/
-        // AlibiDoc → GPU doc 训练闭合世界硬报错（fused 对拍以 Doc/AlibiDoc
-        // 用例作 CPU/GPU 对照覆盖）。
-        for (const auto mk : {nn::expr::FoldAttnMask::Plain,
-                              nn::expr::FoldAttnMask::Causal,
-                              nn::expr::FoldAttnMask::Alibi,
-                              nn::expr::FoldAttnMask::Doc,
-                              nn::expr::FoldAttnMask::AlibiDoc})
+        // 进 key → dk 族登记是同 key 去重。**掩码 × 位置偏置的全部组合必须
+        // 登记**（3 种掩码 × 2 种偏置，其中 "Plain + 偏置" 不存在 → 共 5 个）——
+        // 层 forward 直调 engine.eval_expr(make_fold_attn_o)，不经 dsl::compute
+        // 的 NN_EXPR_SCAN 钩子，本块是 fold spec 唯一注册来源；漏 CausalDoc/
+        // 带偏置的组合 → GPU doc / ALiBi 训练闭合世界硬报错（fused 对拍以
+        // doc / alibi 用例作 CPU/GPU 对照覆盖）。
+        for (const auto mask : {nn::expr::AttnMaskKind::Plain,
+                                nn::expr::AttnMaskKind::Causal,
+                                nn::expr::AttnMaskKind::CausalDoc})
         {
-            for (const std::uint32_t dk : {2u, 4u, 8u})
+            for (const bool score_bias : {false, true})
             {
-                const nn::ExprSpec as = nn::expr::make_fold_attn_o(64, dk, 2, mk);
-                if (auto v = nn::validate_expr_spec(as, as.views.size()); !v)
+                if (mask == nn::expr::AttnMaskKind::Plain && score_bias)
+                    continue;   // 无掩码 + ALiBi 不是本仓会构造的组合
+                for (const std::uint32_t dk : {2u, 4u, 8u})
                 {
-                    std::fprintf(stderr, "[FAIL] attn fold 样例 validate 失败: %s\n",
-                                 v.error().message.c_str());
-                    return 1;
+                    const nn::ExprSpec as =
+                        nn::expr::make_fold_attn_o(64, dk, 2, mask, score_bias);
+                    if (auto v = nn::validate_expr_spec(as, as.views.size()); !v)
+                    {
+                        std::fprintf(stderr,
+                                     "[FAIL] attn fold 样例 validate 失败: %s\n",
+                                     v.error().message.c_str());
+                        return 1;
+                    }
+                    reg_all.add(as);
                 }
-                reg_all.add(as);
             }
         }
     }

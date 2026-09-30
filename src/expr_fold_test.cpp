@@ -210,8 +210,7 @@ int test_expr_fold()
         nn::Tensor Q = upload(engine, mQ);
         nn::Tensor K = upload(engine, mK);
         nn::Tensor Vt = upload(engine, mVt);
-        nn::ExprSpec sp = nn::expr::make_fold_attn_o(1, 1, 1,
-                            nn::expr::FoldAttnMask::Plain);
+        nn::ExprSpec sp = nn::expr::make_fold_attn_o(1, 1, 1, nn::expr::AttnMaskKind::Plain, /*score_bias=*/false);
         const std::vector<nn::Tensor> ii{Q, K, Vt};
         auto o = engine.eval_expr(sp, ii, 1, 1);
         Scalar got = Scalar{-999};
@@ -241,8 +240,7 @@ int test_expr_fold()
             nn::Tensor Q2 = upload(engine, mQ2);
             nn::Tensor K2 = upload(engine, mK2);
             nn::Tensor V2 = upload(engine, mV2);
-            nn::ExprSpec sp2 = nn::expr::make_fold_attn_o(seq2, 1, bh2,
-                                 nn::expr::FoldAttnMask::Plain);
+            nn::ExprSpec sp2 = nn::expr::make_fold_attn_o(seq2, 1, bh2, nn::expr::AttnMaskKind::Plain, /*score_bias=*/false);
             const std::vector<nn::Tensor> i2{Q2, K2, V2};
             auto o2 = engine.eval_expr(sp2, i2, bh2 * seq2, 1);
             std::string vals = "?";
@@ -280,8 +278,7 @@ int test_expr_fold()
             nn::Tensor Q3 = upload(engine, mQ3);
             nn::Tensor K3 = upload(engine, mK3);
             nn::Tensor V3 = upload(engine, mV3);
-            nn::ExprSpec sp3 = nn::expr::make_fold_attn_o(4, 2, 1,
-                                nn::expr::FoldAttnMask::Plain);
+            nn::ExprSpec sp3 = nn::expr::make_fold_attn_o(4, 2, 1, nn::expr::AttnMaskKind::Plain, /*score_bias=*/false);
             const std::vector<nn::Tensor> i3{Q3, K3, V3};
             auto o3 = engine.eval_expr(sp3, i3, 4, 2);
             check(o3.has_value(), "mini-C eval"
@@ -306,17 +303,14 @@ int test_expr_fold()
         }
     }
 
-    for (const auto mk : {nn::expr::FoldAttnMask::Plain,
-                          nn::expr::FoldAttnMask::Causal,
-                          nn::expr::FoldAttnMask::Alibi,
-                          nn::expr::FoldAttnMask::Doc,
-                          nn::expr::FoldAttnMask::AlibiDoc})
+    struct Mk { nn::expr::AttnMaskKind mask; bool score_bias; const char* name; };
+    for (const Mk mk : {Mk{nn::expr::AttnMaskKind::Plain, false, "plain"},
+                         Mk{nn::expr::AttnMaskKind::Causal, false, "causal"},
+                         Mk{nn::expr::AttnMaskKind::Causal, true, "alibi"},
+                         Mk{nn::expr::AttnMaskKind::CausalDoc, false, "doc"},
+                         Mk{nn::expr::AttnMaskKind::CausalDoc, true, "alibidoc"}})
     {
-        const char* mname = mk == nn::expr::FoldAttnMask::Plain    ? "plain"
-                         : mk == nn::expr::FoldAttnMask::Causal    ? "causal"
-                         : mk == nn::expr::FoldAttnMask::Alibi     ? "alibi"
-                         : mk == nn::expr::FoldAttnMask::Doc       ? "doc"
-                                                                 : "alibidoc";
+        const char* mname = mk.name;
         struct Sh { std::uint32_t bh, seq, dk; };
         // {2,133,4}：seq > EXPR_FOLD_BLOCK(128) → 跨块流式（m/l 进位 + vecacc
         //   rescale）与 causal 整块跳过分支（k0>qt 空块）首次被执行；
@@ -366,15 +360,13 @@ int test_expr_fold()
             nn::Tensor slopes = upload(engine, mslopes);
             nn::Tensor doc_col = upload(engine, mdoc_col);
             nn::Tensor doc_ids_t = upload(engine, mdoc_ids_t);
-            const bool alibi = (mk == nn::expr::FoldAttnMask::Alibi ||
-                                mk == nn::expr::FoldAttnMask::AlibiDoc);
-            const bool docm  = (mk == nn::expr::FoldAttnMask::Doc ||
-                                mk == nn::expr::FoldAttnMask::AlibiDoc);
+            const bool alibi = mk.score_bias;
+            const bool docm = (mk.mask == nn::expr::AttnMaskKind::CausalDoc);
             std::vector<nn::Tensor> ins{Q, K, Vt};
             if (alibi) ins.push_back(slopes);
             if (docm) { ins.push_back(doc_col); ins.push_back(doc_ids_t); }
 
-            nn::ExprSpec spec = nn::expr::make_fold_attn_o(sh.seq, sh.dk, sh.bh, mk);
+            nn::ExprSpec spec = nn::expr::make_fold_attn_o(sh.seq, sh.dk, sh.bh, mk.mask, mk.score_bias);
             if (auto v = nn::validate_expr_spec(spec, ins.size()); !v)
             {
                 check(false, std::string("attn fold ") + mname + " validate: "
@@ -415,7 +407,7 @@ int test_expr_fold()
                         for (std::uint32_t d = 0; d < sh.dk; ++d)
                             acc += qs[(b * sh.dk + d) * sh.seq + i] *
                                    ks[(b * sh.dk + d) * sh.seq + j];
-                        if (mk != nn::expr::FoldAttnMask::Plain && j > i)
+                        if (mk.mask != nn::expr::AttnMaskKind::Plain && j > i)
                             acc = -std::numeric_limits<Scalar>::infinity();
                         // 文档块对角：跨文档 -inf（fold body 内 causal→doc→alibi
                         //   链序；-inf 加有限斜率项不改值）——边界与 doc_of 同源
@@ -468,10 +460,8 @@ int test_expr_fold()
     {
         const std::string tmp = "nn_expr_fold_roundtrip.tmp.bin";
         nn::fused::ExprRegistry reg;
-        reg.add(nn::expr::make_fold_attn_o(
-            64, 4, 2, nn::expr::FoldAttnMask::Causal));   // tri_skip=true
-        reg.add(nn::expr::make_fold_attn_o(
-            64, 4, 2, nn::expr::FoldAttnMask::Plain));    // tri_skip=false
+        reg.add(nn::expr::make_fold_attn_o(64, 4, 2, nn::expr::AttnMaskKind::Causal, /*score_bias=*/false));   // tri_skip=true
+        reg.add(nn::expr::make_fold_attn_o(64, 4, 2, nn::expr::AttnMaskKind::Plain, /*score_bias=*/false));    // tri_skip=false
         reg.add(nn::expr::make_fold_rowsum(64));
         const bool wok = nn::fused::write_registry(tmp, reg);
         nn::fused::ExprRegistry back;

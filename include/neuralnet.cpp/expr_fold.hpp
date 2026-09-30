@@ -9,7 +9,7 @@
 //  rowmax/rowsum/softmax_denom 三个 fold v1 样例不被 Layer 使用，保留为状态
 //  语义回归锚点。
 //
-//  注意力的 fold 构造（make_fold_attn_o / FoldAttnMask）属于 Layer 侧的
+//  注意力的 fold 构造（make_fold_attn_o / AttnMaskKind）属于 Layer 侧的
 //  表达式文本（与 AOT 收集原则"表达式文本只出现在 Layer"一致），定义在
 //  compute_layer_attention.hpp，本头不包含任何注意力专属语义。
 //

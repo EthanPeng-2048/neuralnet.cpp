@@ -721,17 +721,14 @@ int run_fold_attn_gpu(CpuEngine& cpu, GpuEngine& gpu)
     std::mt19937 rng(9024);
     std::uniform_real_distribution<Scalar> dist(-1.5f, 1.5f);
     struct Sh { std::uint32_t bh, seq, dk; };
-    for (const auto mk : {nn::expr::FoldAttnMask::Plain,
-                          nn::expr::FoldAttnMask::Causal,
-                          nn::expr::FoldAttnMask::Alibi,
-                          nn::expr::FoldAttnMask::Doc,
-                          nn::expr::FoldAttnMask::AlibiDoc})
+    struct Mk { nn::expr::AttnMaskKind mask; bool score_bias; const char* name; };
+    for (const Mk mk : {Mk{nn::expr::AttnMaskKind::Plain, false, "plain"},
+                         Mk{nn::expr::AttnMaskKind::Causal, false, "causal"},
+                         Mk{nn::expr::AttnMaskKind::Causal, true, "alibi"},
+                         Mk{nn::expr::AttnMaskKind::CausalDoc, false, "doc"},
+                         Mk{nn::expr::AttnMaskKind::CausalDoc, true, "alibidoc"}})
     {
-        const char* mname = mk == nn::expr::FoldAttnMask::Plain    ? "plain"
-                         : mk == nn::expr::FoldAttnMask::Causal    ? "causal"
-                         : mk == nn::expr::FoldAttnMask::Alibi     ? "alibi"
-                         : mk == nn::expr::FoldAttnMask::Doc       ? "doc"
-                                                                 : "alibidoc";
+        const char* mname = mk.name;
         // {2,133,4}：seq > EXPR_FOLD_BLOCK(128) → GPU 多块流式 + causal
         //   整块跳过分支（k0>qt）；{1,1,4}：GPU 最小 rows=1（clamp+row_ok）
         for (const Sh sh : {Sh{2, 9, 4}, Sh{1, 33, 8}, Sh{3, 5, 2},
@@ -769,10 +766,8 @@ int run_fold_attn_gpu(CpuEngine& cpu, GpuEngine& gpu)
             for (auto& v : Km.span()) v = dist(rng);
             for (auto& v : Vtm.span()) v = dist(rng);
             for (auto& v : slopesm.span()) v = dist(rng) * Scalar{0.1};
-            const bool alibi = (mk == nn::expr::FoldAttnMask::Alibi ||
-                                mk == nn::expr::FoldAttnMask::AlibiDoc);
-            const bool docm  = (mk == nn::expr::FoldAttnMask::Doc ||
-                                mk == nn::expr::FoldAttnMask::AlibiDoc);
+            const bool alibi = mk.score_bias;
+            const bool docm = (mk.mask == nn::expr::AttnMaskKind::CausalDoc);
             // 出生绑定：绑 cpu 的张量喂 gpu 引擎是硬错误，输入各上传一份
             const Tensor Q_cpu = upload(cpu, Qm), Q_gpu = upload(gpu, Qm);
             const Tensor K_cpu = upload(cpu, Km), K_gpu = upload(gpu, Km);
@@ -796,7 +791,7 @@ int run_fold_attn_gpu(CpuEngine& cpu, GpuEngine& gpu)
                 ins_gpu.push_back(doc_col_gpu); ins_gpu.push_back(doc_ids_gpu);
             }
 
-            nn::ExprSpec spec = nn::expr::make_fold_attn_o(sh.seq, sh.dk, sh.bh, mk);
+            nn::ExprSpec spec = nn::expr::make_fold_attn_o(sh.seq, sh.dk, sh.bh, mk.mask, mk.score_bias);
             auto c = cpu.eval_expr(spec, ins_cpu, rows_out, sh.dk);
             auto g = gpu.eval_expr(spec, ins_gpu, rows_out, sh.dk);
             const std::string tag = std::string("attn-fold ") + mname +

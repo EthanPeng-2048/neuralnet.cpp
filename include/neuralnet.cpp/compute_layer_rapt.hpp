@@ -57,8 +57,8 @@ private:
     std::size_t d_k_;
     std::size_t seq_len_;    // 单样本序列长度（0 = 单样本，cols 即 seq）
     bool causal_;            // true=因果前缀和；false=全量双向
-    bool use_rope_;          // RoPE 施加在 Q/K 进 ReLU 之前（RLA-2 强约束）
-    RotaryEmbedding rope_;
+    // 位置编码策略（注意力层自持；非 RoPE 类型 = 恒等 → 热路径无标志位判断）
+    std::unique_ptr<PositionEncoder> pos_;
     Linear w_q_, w_k_, w_v_, w_o_;
 
     // forward 缓存（backward 用）
@@ -108,8 +108,7 @@ private:
         if (!d.valid())
             return std::unexpected(Error{
                 "make_dummy_: GPU 张量分配失败（显存不足或设备异常）"});
-        auto r = engine.zero(d);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY(r, engine.zero(d));
         return d;
     }
 
@@ -136,7 +135,7 @@ private:
                 e0[(bh * dk) * seq + t] = Scalar{1};
         auto e0t = detail::upload_span(engine, rows, seq, Precision::F32,
                                        std::span(e0));
-        if (!e0t) return std::unexpected(e0t.error());
+        NN_TRY_CHECK(e0t);
         e_0_cache_ = std::move(*e0t);
         ones_BH_  = BH;
         ones_seq_ = seq;
@@ -163,8 +162,7 @@ private:
         if (rms_inv_out) rms_v.assign(BH * seq, Scalar{0});
         for (std::size_t bh = 0; bh < BH; ++bh)
         {
-            auto x = engine.slice_rows(input, bh * dk, dk);
-            if (!x) return std::unexpected(x.error());
+            NN_TRY(x, engine.slice_rows(input, bh * dk, dk));
             // "乘 x² → 列归约 → 乘 1/dk → 加 eps → rsqrt"按两步 DSL 执行：
             //   ① 归约出 (1,seq) 向量；② 在 (1,seq) 小向量上做后处理。
             // 必须分两步：归约融合 shader 尚不支持"归约后仍有逐元素后处理"
@@ -172,29 +170,27 @@ private:
             // 拒绝）；1/dk、eps 由 RParam 承载 → 值不进 expr_spec_key。
             auto s = dsl::compute_reduce(engine,
                 dsl::col_reduce_sum(dsl::leaf(*x) * dsl::leaf(*x)), dk, seq);
-            if (!s) return std::unexpected(s.error());
+            NN_TRY_CHECK(s);
             auto ri = dsl::compute(engine,
                 dsl::rsqrt(dsl::leaf(*s) * dsl::rparam(inv_dk) + dsl::rparam(eps)),
                 s->rows(), s->cols());
-            if (!ri) return std::unexpected(ri.error());
+            NN_TRY_CHECK(ri);
             if (rms_inv_out)
             {
-                auto ri_v = detail::download_vector(engine, *ri);
-                if (!ri_v) return std::unexpected(ri_v.error());
+                NN_TRY(ri_v, detail::download_vector(engine, *ri));
                 for (std::size_t t = 0; t < seq; ++t)
                     rms_v[bh * seq + t] = (*ri_v)[t];
             }
             auto n = dsl::compute(engine,
                 dsl::leaf(*x) * dsl::col_broadcast(*ri), dk, seq);
-            if (!n) return std::unexpected(n.error());
-            auto ins = engine.insert_rows(output, bh * dk, *n);
-            if (!ins) return std::unexpected(ins.error());
+            NN_TRY_CHECK(n);
+            NN_TRY(ins, engine.insert_rows(output, bh * dk, *n));
         }
         if (rms_inv_out)
         {
             auto ri_t = detail::upload_span(engine, BH, seq, Precision::F32,
                                             std::span(rms_v));
-            if (!ri_t) return std::unexpected(ri_t.error());
+            NN_TRY_CHECK(ri_t);
             *rms_inv_out = std::move(*ri_t);
         }
         return output;
@@ -215,29 +211,25 @@ private:
                 "rms_norm_backward_: GPU 张量分配失败（显存不足或设备异常）"});
         for (std::size_t bh = 0; bh < BH; ++bh)
         {
-            auto gy = engine.slice_rows(grad, bh * dk, dk);
-            if (!gy) return std::unexpected(gy.error());
-            auto y = engine.slice_rows(normed, bh * dk, dk);
-            if (!y) return std::unexpected(y.error());
-            auto ri = engine.slice_rows(rms_inv, bh, 1);
-            if (!ri) return std::unexpected(ri.error());
+            NN_TRY(gy, engine.slice_rows(grad, bh * dk, dk));
+            NN_TRY(y, engine.slice_rows(normed, bh * dk, dk));
+            NN_TRY(ri, engine.slice_rows(rms_inv, bh, 1));
             // m = (1/dk) · col_reduce_sum(gy * y)  → (1, seq)
             // 归约与后处理分两步（原因同上：归约融合 shader 不支持归约后后处理）
             auto m_raw = dsl::compute_reduce(engine,
                 dsl::col_reduce_sum(dsl::leaf(*gy) * dsl::leaf(*y)), dk, seq);
-            if (!m_raw) return std::unexpected(m_raw.error());
+            NN_TRY_CHECK(m_raw);
             auto m = dsl::compute(engine,
                 dsl::leaf(*m_raw) * dsl::rparam(inv_dk),
                 m_raw->rows(), m_raw->cols());
-            if (!m) return std::unexpected(m.error());
+            NN_TRY_CHECK(m);
             // grad_x = (gy − m·y) · rms_inv：三式合一，单次遍历、无中间张量
             auto gx = dsl::compute(engine,
                 (dsl::leaf(*gy) - dsl::col_broadcast(*m) * dsl::leaf(*y))
                     * dsl::col_broadcast(*ri),
                 dk, seq);
-            if (!gx) return std::unexpected(gx.error());
-            auto ins = engine.insert_rows(output, bh * dk, *gx);
-            if (!ins) return std::unexpected(ins.error());
+            NN_TRY_CHECK(gx);
+            NN_TRY(ins, engine.insert_rows(output, bh * dk, *gx));
         }
         return output;
     }
@@ -250,8 +242,6 @@ public:
         : d_model_(d_model), num_heads_(num_heads),
           d_k_(d_model / num_heads),
           seq_len_(seq_len), causal_(causal),
-          use_rope_(pos_enc == PosEncodingType::RoPE),
-          rope_(d_model / num_heads),
           w_q_(d_model, d_model), w_k_(d_model, d_model),
           w_v_(d_model, d_model), w_o_(d_model, d_model)
     {
@@ -259,18 +249,17 @@ public:
                   "ReLULinearAttention: d_model must be divisible by num_heads");
         NN_ASSERT(d_model % num_heads == 0 && (d_model / num_heads) % 2 == 0,
                   "ReLULinearAttention: RoPE requires even d_k");
+        // 注意力侧位置编码由本层自持（Learned/Sinusoidal 在 Q/K 侧是恒等）
+        pos_ = make_attention_position_encoder(pos_enc, d_k_, num_heads_);
     }
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
-        auto r1 = w_q_.init(engine); if (!r1) return std::unexpected(r1.error());
-        auto r2 = w_k_.init(engine); if (!r2) return std::unexpected(r2.error());
-        auto r3 = w_v_.init(engine); if (!r3) return std::unexpected(r3.error());
-        auto r4 = w_o_.init(engine); if (!r4) return std::unexpected(r4.error());
-        if (use_rope_)
-        {
-            auto r5 = rope_.init(engine); if (!r5) return std::unexpected(r5.error());
-        }
+        NN_TRY(r1, w_q_.init(engine));
+        NN_TRY(r2, w_k_.init(engine));
+        NN_TRY(r3, w_v_.init(engine));
+        NN_TRY(r4, w_o_.init(engine));
+        // pos_ 不在此 init（注入的是模型级对象，由模型自己 init；RoPE 无需 init）
         return {};
     }
 
@@ -330,11 +319,11 @@ public:
         has_doc_ids_ = true;
     }
 
-    // 绝对位置偏移（滑动窗生成用）：转发给 RoPE，使重计算式生成的
-    // 位置从真实起点算起而非每次从 0 重置。
+    // 绝对位置偏移（滑动窗生成用）：转发给位置编码策略（RoPE 生效，其余 no-op），
+    // 使重计算式生成的位置从真实起点算起而非每次从 0 重置。
     void set_position_offset(std::size_t off)
     {
-        if (use_rope_) rope_.set_position_offset(off);
+        pos_->set_position_offset(off);
     }
 
     std::vector<TensorRef> activation_cache() override
@@ -378,21 +367,18 @@ public:
             return std::unexpected(Error{"ReLULinearAttention forward: cols not divisible by seq_len"});
         const std::size_t H_dk = num_heads_ * d_k_;
 
-        auto q_res = w_q_.forward(input);
-        if (!q_res) return q_res;
-        auto k_res = w_k_.forward(input);
-        if (!k_res) return k_res;
-        auto v_res = w_v_.forward(input);
-        if (!v_res) return v_res;
+        NN_TRY(q_res, w_q_.forward(input));
+        NN_TRY(k_res, w_k_.forward(input));
+        NN_TRY(v_res, w_v_.forward(input));
 
         Tensor Q, K, V;   // (BH*dk, seq) rearranged
         if (batch > 1)
         {
-            auto qr = engine.rearrange_3d(*q_res, H_dk, batch, seq, false); if (!qr) return std::unexpected(qr.error());
+            NN_TRY(qr, engine.rearrange_3d(*q_res, H_dk, batch, seq, false));
             Q = std::move(*qr);
-            auto kr = engine.rearrange_3d(*k_res, H_dk, batch, seq, false); if (!kr) return std::unexpected(kr.error());
+            NN_TRY(kr, engine.rearrange_3d(*k_res, H_dk, batch, seq, false));
             K = std::move(*kr);
-            auto vr = engine.rearrange_3d(*v_res, H_dk, batch, seq, false); if (!vr) return std::unexpected(vr.error());
+            NN_TRY(vr, engine.rearrange_3d(*v_res, H_dk, batch, seq, false));
             V = std::move(*vr);
         }
         else
@@ -409,30 +395,28 @@ public:
             const std::size_t BHrms = batch * num_heads_;
             auto rq = rms_norm_forward_(engine, Q, BHrms, d_k_, seq,
                                         checkpoint_mode_ ? nullptr : &Q_rms_inv_cache_);
-            if (!rq) return std::unexpected(rq.error());
+            NN_TRY_CHECK(rq);
             Q = std::move(*rq);
             if (!checkpoint_mode_) Q_normed_cache_ = Q;
             auto rk = rms_norm_forward_(engine, K, BHrms, d_k_, seq,
                                         checkpoint_mode_ ? nullptr : &K_rms_inv_cache_);
-            if (!rk) return std::unexpected(rk.error());
+            NN_TRY_CHECK(rk);
             K = std::move(*rk);
             if (!checkpoint_mode_) K_normed_cache_ = K;
         }
 
         // RoPE → ReLU（顺序必须：先旋转后截断，否则丢位置信息）
-        if (use_rope_)
+        // 非 RoPE 策略在此是恒等 → 无标志位判断
         {
-            auto qr = rope_.apply(engine, Q, seq, false); if (!qr) return std::unexpected(qr.error());
-            Q = std::move(*qr);
-            auto kr = rope_.apply(engine, K, seq, false); if (!kr) return std::unexpected(kr.error());
-            K = std::move(*kr);
+            NN_TRY(qr, pos_->apply_qk(engine, Q, seq, false));
+            NN_TRY(kr, pos_->apply_qk(engine, K, seq, false));
         }
         auto Qp = dsl::compute(engine,
             dsl::max(dsl::leaf(Q), Scalar{0}), Q.rows(), Q.cols());
-        if (!Qp) return std::unexpected(Qp.error());
+        NN_TRY_CHECK(Qp);
         auto Kp = dsl::compute(engine,
             dsl::max(dsl::leaf(K), Scalar{0}), K.rows(), K.cols());
-        if (!Kp) return std::unexpected(Kp.error());
+        NN_TRY_CHECK(Kp);
 
         // O(L·d_k²) 运行态前缀和扫描（消除 O(L²) 得分矩阵物化）。
         const std::size_t BH = batch * num_heads_;
@@ -447,53 +431,47 @@ public:
                 bm[i] = static_cast<Scalar>(boundary[i]);
             auto bt = detail::upload_span(engine, 1, batch * seq, Precision::F32,
                                           std::span(bm));
-            if (!bt) return std::unexpected(bt.error());
+            NN_TRY_CHECK(bt);
             boundary_t = std::move(*bt);
             has_bnd = true;
         }
         else
         {
-            auto bd = make_dummy_(engine);
-            if (!bd) return std::unexpected(bd.error());
+            NN_TRY(bd, make_dummy_(engine));
             boundary_t = std::move(*bd);
         }
-        auto dummy_r = make_dummy_(engine);
-        if (!dummy_r) return std::unexpected(dummy_r.error());
+        NN_TRY(dummy_r, make_dummy_(engine));
         const Tensor& dummy = *dummy_r;
 
         // 主扫描：读出 [0) B·P = num = B·q'（RLA-2 分子）
         auto Sc = engine.scan_prefix_outer(*Kp, V, *Qp, V, dummy, dummy, false,
                                            d_k_, num_heads_, causal_,
                                            boundary_t, has_bnd);
-        if (!Sc) return std::unexpected(Sc.error());
-        auto BP_r = engine.slice_rows(*Sc, 0, BHdk);
-        if (!BP_r) return std::unexpected(BP_r.error());
+        NN_TRY_CHECK(Sc);
+        NN_TRY(BP_r, engine.slice_rows(*Sc, 0, BHdk));
 
         // z-scan（RLA-2 核心）：V=ones → B_t = Σ 1·k'^T → B[*,c] = z[c]
         //   [0) B·P = q'·z（标量，头内逐行重复）
         //   [2) B^T·R = dk·z（向量，backward 用）
-        auto ones_r = ensure_ones_(engine, BH, d_k_, seq);
-        if (!ones_r) return std::unexpected(ones_r.error());
+        NN_TRY(ones_r, ensure_ones_(engine, BH, d_k_, seq));
         auto Z_sc = engine.scan_prefix_outer(*Kp, V_ones_cache_, *Qp, V_ones_cache_,
                                              dummy, dummy, false,
                                              d_k_, num_heads_, causal_,
                                              boundary_t, has_bnd);
-        if (!Z_sc) return std::unexpected(Z_sc.error());
-        auto u_r = engine.slice_rows(*Z_sc, 0, BHdk);
-        if (!u_r) return std::unexpected(u_r.error());
+        NN_TRY_CHECK(Z_sc);
+        NN_TRY(u_r, engine.slice_rows(*Z_sc, 0, BHdk));
 
         // den = q'·z + ε；out = num / den（逐元素链融合为单 kernel：num/(u+ε)）
         auto div_r = dsl::compute(engine,
             dsl::leaf(*BP_r) / (dsl::leaf(*u_r) + Scalar{1e-4}),
             (*BP_r).rows(), (*BP_r).cols());
-        if (!div_r) return std::unexpected(div_r.error());
+        NN_TRY_CHECK(div_r);
         Tensor out_t = std::move(*div_r);
 
         Tensor concat;
         if (batch > 1)
         {
-            auto cb = engine.rearrange_3d(out_t, H_dk, batch, seq, true);
-            if (!cb) return std::unexpected(cb.error());
+            NN_TRY(cb, engine.rearrange_3d(out_t, H_dk, batch, seq, true));
             concat = std::move(*cb);
         }
         else
@@ -550,13 +528,11 @@ public:
         const std::size_t batch = batch_cache_;
         const std::size_t H_dk = num_heads_ * d_k_;
 
-        auto gc = w_o_.backward(grad_output);
-        if (!gc) return gc;
+        NN_TRY(gc, w_o_.backward(grad_output));
         Tensor gcr;
         if (batch > 1)
         {
-            auto g = engine.rearrange_3d(*gc, H_dk, batch, seq, false);
-            if (!g) return std::unexpected(g.error());
+            NN_TRY(g, engine.rearrange_3d(*gc, H_dk, batch, seq, false));
             gcr = std::move(*g);
         }
         else
@@ -576,32 +552,29 @@ public:
                 bm[i] = static_cast<Scalar>(boundary[i]);
             auto bt = detail::upload_span(engine, 1, batch * seq, Precision::F32,
                                           std::span(bm));
-            if (!bt) return std::unexpected(bt.error());
+            NN_TRY_CHECK(bt);
             boundary_t = std::move(*bt);
             has_bnd = true;
         }
         else
         {
-            auto bd = make_dummy_(engine);
-            if (!bd) return std::unexpected(bd.error());
+            NN_TRY(bd, make_dummy_(engine));
             boundary_t = std::move(*bd);
         }
-        auto dummy_r = make_dummy_(engine);
-        if (!dummy_r) return std::unexpected(dummy_r.error());
+        NN_TRY(dummy_r, make_dummy_(engine));
         const Tensor& dummy = *dummy_r;
 
         // ── z-scan：获取 z 和 q·z（backward 需要 z 向量） ────────────
-        auto ones_r = ensure_ones_(engine, BH, d_k_, seq);
-        if (!ones_r) return std::unexpected(ones_r.error());
+        NN_TRY(ones_r, ensure_ones_(engine, BH, d_k_, seq));
         auto Z_sc = engine.scan_prefix_outer(Kp_cache_, V_ones_cache_, Qp_cache_, V_ones_cache_,
                                              dummy, dummy, false,
                                              d_k_, num_heads_, causal_,
                                              boundary_t, has_bnd);
-        if (!Z_sc) return std::unexpected(Z_sc.error());
+        NN_TRY_CHECK(Z_sc);
         auto u_r = engine.slice_rows(*Z_sc, 0, BHdk);         // q·z（标量重复 dk 次）
-        if (!u_r) return std::unexpected(u_r.error());
+        NN_TRY_CHECK(u_r);
         auto z2_r = engine.slice_rows(*Z_sc, 2 * BHdk, BHdk); // dk·z（向量）
-        if (!z2_r) return std::unexpected(z2_r.error());
+        NN_TRY_CHECK(z2_r);
         auto z_inv_r = dsl::compute(engine,
             dsl::leaf(*z2_r) * dsl::rparam(Scalar{1} / static_cast<Scalar>(d_k_)),
             z2_r->rows(), z2_r->cols());
@@ -612,11 +585,11 @@ public:
                                            dummy, dummy, false,
                                            d_k_, num_heads_, causal_,
                                            boundary_t, has_bnd);
-        if (!Sc) return std::unexpected(Sc.error());
+        NN_TRY_CHECK(Sc);
         auto BTR_r = engine.slice_rows(*Sc, 2 * BHdk, BHdk);  // B^T·g
-        if (!BTR_r) return std::unexpected(BTR_r.error());
+        NN_TRY_CHECK(BTR_r);
         auto r_r = engine.slice_rows(*Sc, 4 * BHdk, BHdk);    // r = g·(B·q)
-        if (!r_r) return std::unexpected(r_r.error());
+        NN_TRY_CHECK(r_r);
 
         // ── 公共中间量（逐元素链全融合为 DSL，消除 inv/den² 中间缓冲）──
         //   gnum = g/(u+ε)           （分子梯度，用于 outer→dB）
@@ -626,7 +599,7 @@ public:
         auto gnum_r = dsl::compute(engine,
             dsl::leaf(gcr) / (dsl::leaf(*u_r) + Scalar{1e-4}),
             cRows, cCols);
-        if (!gnum_r) return std::unexpected(gnum_r.error());
+        NN_TRY_CHECK(gnum_r);
         auto scale_r = dsl::compute(engine,
             dsl::neg(dsl::leaf(*r_r))
                 / ((dsl::leaf(*u_r) + Scalar{1e-4}) * (dsl::leaf(*u_r) + Scalar{1e-4})),
@@ -638,14 +611,13 @@ public:
             dsl::leaf(*BTR_r) / (dsl::leaf(*u_r) + Scalar{1e-4})
                 + dsl::leaf(*scale_r) * dsl::leaf(*z_inv_r),
             cRows, cCols);
-        if (!gQt_r) return std::unexpected(gQt_r.error());
+        NN_TRY_CHECK(gQt_r);
         Tensor gQt = std::move(*gQt_r);
 
         // ── gV 和 gK ─────────────────────────────────────────────────
         Tensor gKt, gVt;
         // dB = outer(gnum, q) — dL/dB 矩阵
-        auto dB_r = engine.outer_col(*gnum_r, Qp_cache_, dummy, d_k_, false);
-        if (!dB_r) return std::unexpected(dB_r.error());
+        NN_TRY(dB_r, engine.outer_col(*gnum_r, Qp_cache_, dummy, d_k_, false));
 
         if (causal_)
         {
@@ -653,26 +625,22 @@ public:
             auto SBc_r = engine.scan_suffix_outer(*dB_r, Kp_cache_, V_re_cache_,
                                                   d_k_, num_heads_, true,
                                                   boundary_t, has_bnd);
-            if (!SBc_r) return std::unexpected(SBc_r.error());
-            auto gv_r = engine.slice_rows(*SBc_r, 0, BHdk);
-            if (!gv_r) return std::unexpected(gv_r.error());
+            NN_TRY_CHECK(SBc_r);
+            NN_TRY(gv_r, engine.slice_rows(*SBc_r, 0, BHdk));
             gVt = std::move(*gv_r);
-            auto gK_B_r = engine.slice_rows(*SBc_r, 2 * BHdk, BHdk);
-            if (!gK_B_r) return std::unexpected(gK_B_r.error());
+            NN_TRY(gK_B_r, engine.slice_rows(*SBc_r, 2 * BHdk, BHdk));
 
             // suffix(scale·q)：D = outer(q, e_0, scale)，suffix(D)·e_0
-            auto D_zq_r = engine.outer_col(Qp_cache_, e_0_cache_, *scale_r, d_k_, true);
-            if (!D_zq_r) return std::unexpected(D_zq_r.error());
+            NN_TRY(D_zq_r, engine.outer_col(Qp_cache_, e_0_cache_, *scale_r, d_k_, true));
             auto SZ_r = engine.scan_suffix_outer(*D_zq_r, e_0_cache_, e_0_cache_,
                                                  d_k_, num_heads_, true,
                                                  boundary_t, has_bnd);
-            if (!SZ_r) return std::unexpected(SZ_r.error());
-            auto suffix_sq_r = engine.slice_rows(*SZ_r, 0, BHdk);
-            if (!suffix_sq_r) return std::unexpected(suffix_sq_r.error());
+            NN_TRY_CHECK(SZ_r);
+            NN_TRY(suffix_sq_r, engine.slice_rows(*SZ_r, 0, BHdk));
             auto gk_r = dsl::compute(engine,
                 dsl::leaf(*gK_B_r) + dsl::leaf(*suffix_sq_r),
                 gK_B_r->rows(), gK_B_r->cols());
-            if (!gk_r) return std::unexpected(gk_r.error());
+            NN_TRY_CHECK(gk_r);
             gKt = std::move(*gk_r);
         }
         else
@@ -682,7 +650,7 @@ public:
             auto dB_sum_r = dsl::compute_reduce(engine,
                 dsl::row_reduce_sum(dsl::leaf(*dB_r)),
                 dB_r->rows(), dB_r->cols());
-            if (!dB_sum_r) return std::unexpected(dB_sum_r.error());
+            NN_TRY_CHECK(dB_sum_r);
             // Bb = row_broadcast(dB_sum)：单条表达式一次 dispatch 完成，
             // 不物化中间张量。
             // 注：IR 规定"输出 = 最后一条指令的 dst"，故**单视图表达式不合法**
@@ -691,29 +659,27 @@ public:
             auto Bb_r = dsl::compute(engine,
                 dsl::row_broadcast(*dB_sum_r) + dsl::rparam(Scalar{0}),
                 BHdk * d_k_, seq);
-            if (!Bb_r) return std::unexpected(Bb_r.error());
+            NN_TRY_CHECK(Bb_r);
             auto SBc_r = engine.scan_suffix_outer(*Bb_r, Kp_cache_, V_re_cache_,
                                                   d_k_, num_heads_, false,
                                                   dummy, false);
-            if (!SBc_r) return std::unexpected(SBc_r.error());
-            auto gv_r = engine.slice_rows(*SBc_r, 0, BHdk);
-            if (!gv_r) return std::unexpected(gv_r.error());
+            NN_TRY_CHECK(SBc_r);
+            NN_TRY(gv_r, engine.slice_rows(*SBc_r, 0, BHdk));
             gVt = std::move(*gv_r);
-            auto gK_B_r = engine.slice_rows(*SBc_r, 2 * BHdk, BHdk);
-            if (!gK_B_r) return std::unexpected(gK_B_r.error());
+            NN_TRY(gK_B_r, engine.slice_rows(*SBc_r, 2 * BHdk, BHdk));
 
             // 双向 gK 的常数项：Σ_t scale_t · q_t（逐元素链与行归约融合为单次
             // dispatch，不物化 scale_q 中间张量）
             auto tsq_r = dsl::compute_reduce(engine,
                 dsl::row_reduce_sum(dsl::leaf(*scale_r) * dsl::leaf(Qp_cache_)),
                 BHdk, seq);
-            if (!tsq_r) return std::unexpected(tsq_r.error());
+            NN_TRY_CHECK(tsq_r);
             // gk = gK_B + row_broadcast(tsq)：单条表达式一次 dispatch 完成
             // （不物化中间张量）
             auto gk_r = dsl::compute(engine,
                 dsl::leaf(*gK_B_r) + dsl::row_broadcast(*tsq_r),
                 gK_B_r->rows(), gK_B_r->cols());
-            if (!gk_r) return std::unexpected(gk_r.error());
+            NN_TRY_CHECK(gk_r);
             gKt = std::move(*gk_r);
         }
 
@@ -722,22 +688,17 @@ public:
             dsl::select(dsl::leaf(Qp_cache_) > Scalar{0},
                         dsl::leaf(gQt), Scalar{0}),
             gQt.rows(), gQt.cols());
-        if (!gq_relu) return std::unexpected(gq_relu.error());
+        NN_TRY_CHECK(gq_relu);
         auto gk_relu = dsl::compute(engine,
             dsl::select(dsl::leaf(Kp_cache_) > Scalar{0},
                         dsl::leaf(gKt), Scalar{0}),
             gKt.rows(), gKt.cols());
-        if (!gk_relu) return std::unexpected(gk_relu.error());
+        NN_TRY_CHECK(gk_relu);
 
-        // ── RoPE 反向（旋转正交，逆 = 反角） ────────────────────────
-        if (use_rope_)
+        // ── RoPE 反向（旋转正交，逆 = 反角；非 RoPE 策略 = 恒等）──────
         {
-            auto gq = rope_.apply(engine, *gq_relu, seq, true);
-            if (!gq) return std::unexpected(gq.error());
-            gq_relu = std::move(*gq);
-            auto gk = rope_.apply(engine, *gk_relu, seq, true);
-            if (!gk) return std::unexpected(gk.error());
-            gk_relu = std::move(*gk);
+            NN_TRY(gq, pos_->apply_qk(engine, *gq_relu, seq, true));
+            NN_TRY(gk, pos_->apply_qk(engine, *gk_relu, seq, true));
         }
 
         // ── RLA-2 RMSNorm 反向（RoPE 反向之后、rearrange 之前） ──────
@@ -745,22 +706,22 @@ public:
             const std::size_t BHrms = batch * num_heads_;
             auto gq_rn = rms_norm_backward_(engine, *gq_relu, Q_normed_cache_,
                                             Q_rms_inv_cache_, BHrms, d_k_, seq);
-            if (!gq_rn) return std::unexpected(gq_rn.error());
+            NN_TRY_CHECK(gq_rn);
             gq_relu = std::move(*gq_rn);
             auto gk_rn = rms_norm_backward_(engine, *gk_relu, K_normed_cache_,
                                             K_rms_inv_cache_, BHrms, d_k_, seq);
-            if (!gk_rn) return std::unexpected(gk_rn.error());
+            NN_TRY_CHECK(gk_rn);
             gk_relu = std::move(*gk_rn);
         }
 
         Tensor gq_r, gk_r, gv_r;
         if (batch > 1)
         {
-            auto a = engine.rearrange_3d(*gq_relu, H_dk, batch, seq, true); if (!a) return std::unexpected(a.error());
+            NN_TRY(a, engine.rearrange_3d(*gq_relu, H_dk, batch, seq, true));
             gq_r = std::move(*a);
-            auto b = engine.rearrange_3d(*gk_relu, H_dk, batch, seq, true); if (!b) return std::unexpected(b.error());
+            NN_TRY(b, engine.rearrange_3d(*gk_relu, H_dk, batch, seq, true));
             gk_r = std::move(*b);
-            auto c = engine.rearrange_3d(gVt, H_dk, batch, seq, true); if (!c) return std::unexpected(c.error());
+            NN_TRY(c, engine.rearrange_3d(gVt, H_dk, batch, seq, true));
             gv_r = std::move(*c);
         }
         else
@@ -770,17 +731,14 @@ public:
             gv_r = std::move(gVt);
         }
 
-        auto giq = w_q_.backward(gq_r);
-        if (!giq) return giq;
-        auto gik = w_k_.backward(gk_r);
-        if (!gik) return gik;
-        auto giv = w_v_.backward(gv_r);
-        if (!giv) return giv;
+        NN_TRY(giq, w_q_.backward(gq_r));
+        NN_TRY(gik, w_k_.backward(gk_r));
+        NN_TRY(giv, w_v_.backward(gv_r));
         // grad_input = gq + gk + gv：三路累加**原地**融合为单趟（目标传递，
         // 不额外分配）；求和按 (gq + gk) + gv 的固定顺序结合，跨 run 确定
         auto acc = dsl::compute_into(engine,
             dsl::leaf(*giq) + dsl::leaf(*gik) + dsl::leaf(*giv), *giq);
-        if (!acc) return std::unexpected(acc.error());
+        NN_TRY_CHECK(acc);
         return giq;
     }
 
@@ -794,35 +752,28 @@ public:
         Tensor& B_state, Tensor& z_state, std::size_t pos)
     {
         auto q_res = w_q_.forward(input);   // (d_model, 1) = (H*dk, 1)
-        if (!q_res) return q_res;
-        auto k_res = w_k_.forward(input);
-        if (!k_res) return k_res;
-        auto v_res = w_v_.forward(input);
-        if (!v_res) return v_res;
+        NN_TRY_CHECK(q_res);
+        NN_TRY(k_res, w_k_.forward(input));
+        NN_TRY(v_res, w_v_.forward(input));
         Tensor Q = std::move(*q_res), K = std::move(*k_res), V = std::move(*v_res);
         // RLA-2：RMSNorm on Q and K（per-head, dk blocks）
         {
             Tensor dummy_ri;
-            auto rq = rms_norm_forward_(engine, Q, num_heads_, d_k_, 1, &dummy_ri);
-            if (!rq) return std::unexpected(rq.error());
+            NN_TRY(rq, rms_norm_forward_(engine, Q, num_heads_, d_k_, 1, &dummy_ri));
             Q = std::move(*rq);
-            auto rk = rms_norm_forward_(engine, K, num_heads_, d_k_, 1, &dummy_ri);
-            if (!rk) return std::unexpected(rk.error());
+            NN_TRY(rk, rms_norm_forward_(engine, K, num_heads_, d_k_, 1, &dummy_ri));
             K = std::move(*rk);
         }
-        if (use_rope_)
         {
-            auto qr = rope_.apply_step(engine, Q, pos, false); if (!qr) return std::unexpected(qr.error());
-            Q = std::move(*qr);
-            auto kr = rope_.apply_step(engine, K, pos, false); if (!kr) return std::unexpected(kr.error());
-            K = std::move(*kr);
+            NN_TRY(qr, pos_->apply_qk_step(engine, Q, pos, false));
+            NN_TRY(kr, pos_->apply_qk_step(engine, K, pos, false));
         }
         auto Qp = dsl::compute(engine,
             dsl::max(dsl::leaf(Q), Scalar{0}), Q.rows(), Q.cols());
-        if (!Qp) return std::unexpected(Qp.error());
+        NN_TRY_CHECK(Qp);
         auto Kp = dsl::compute(engine,
             dsl::max(dsl::leaf(K), Scalar{0}), K.rows(), K.cols());
-        if (!Kp) return std::unexpected(Kp.error());
+        NN_TRY_CHECK(Kp);
         const std::size_t H = num_heads_;
         const std::size_t dk = d_k_;
 
@@ -831,7 +782,7 @@ public:
         auto B_add_r = dsl::compute(engine,        // v·k'^T → (H*dk, dk)
             dsl::matmul(V, *Kp, false, true, H),
             V.rows(), Kp->rows() / H);
-        if (!B_add_r) return std::unexpected(B_add_r.error());
+        NN_TRY_CHECK(B_add_r);
         { auto r = dsl::compute_into(engine,
               dsl::leaf(B_state) + dsl::leaf(*B_add_r), B_state);
           if (!r) return std::unexpected(r.error()); }
@@ -844,15 +795,13 @@ public:
         auto num_r = dsl::compute(engine,
             dsl::matmul(B_state, *Qp, false, false, H),
             B_state.rows(), Qp->cols());
-        if (!num_r) return std::unexpected(num_r.error());
+        NN_TRY_CHECK(num_r);
 
         // den = q'·z：逐头标量点积（通过宿主桥在 CPU 上计算，17 §3 D11；
         // ε 由下面的除法表达式统一添加，与 forward 的写法保持同构）
         // forward_step 是逐 token 串行的，CPU round-trip 可接受。
-        auto q_v = detail::download_vector(engine, *Qp);
-        if (!q_v) return std::unexpected(q_v.error());
-        auto z_v = detail::download_vector(engine, z_state);
-        if (!z_v) return std::unexpected(z_v.error());
+        NN_TRY(q_v, detail::download_vector(engine, *Qp));
+        NN_TRY(z_v, detail::download_vector(engine, z_state));
         // 广播到 (H*dk, 1)：每头标量重复 dk 次
         std::vector<Scalar> den_full(H * dk);
         for (std::size_t h = 0; h < H; ++h)
@@ -865,7 +814,7 @@ public:
         }
         auto den_t = detail::upload_span(engine, H * dk, 1, Precision::F32,
                                          std::span(den_full));
-        if (!den_t) return std::unexpected(den_t.error());
+        NN_TRY_CHECK(den_t);
 
         // out = num / (den + ε)：与 forward 的除法（:491）**逐 token 同构**——
         // 同一个 AOT 键由 scan_exprs 的 ReLULinearAttention dry-run 覆盖，
@@ -873,7 +822,7 @@ public:
         auto out_r = dsl::compute(engine,
             dsl::leaf(*num_r) / (dsl::leaf(*den_t) + Scalar{1e-4}),
             (*num_r).rows(), (*num_r).cols());
-        if (!out_r) return std::unexpected(out_r.error());
+        NN_TRY_CHECK(out_r);
         return w_o_.forward(*out_r);
     }
 };
@@ -912,30 +861,26 @@ public:
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
-        auto r1 = norm1_->init(engine); if (!r1) return std::unexpected(r1.error());
-        auto r2 = attn_.init(engine);   if (!r2) return std::unexpected(r2.error());
-        auto r3 = norm2_->init(engine); if (!r3) return std::unexpected(r3.error());
-        auto r4 = ff_.init(engine);     if (!r4) return std::unexpected(r4.error());
+        NN_TRY(r1, norm1_->init(engine));
+        NN_TRY(r2, attn_.init(engine));
+        NN_TRY(r3, norm2_->init(engine));
+        NN_TRY(r4, ff_.init(engine));
         return {};
     }
 
     std::vector<TensorRef> parameters() override
     {
-        std::vector<TensorRef> p;
-        auto n1 = norm1_->parameters(); p.insert(p.end(), n1.begin(), n1.end());
-        auto a = attn_.parameters();    p.insert(p.end(), a.begin(), a.end());
-        auto n2 = norm2_->parameters(); p.insert(p.end(), n2.begin(), n2.end());
-        auto f = ff_.parameters();      p.insert(p.end(), f.begin(), f.end());
-        return p;
+        return collect_refs(norm1_->parameters(),
+                            attn_.parameters(),
+                            norm2_->parameters(),
+                            ff_.parameters());
     }
     std::vector<TensorRef> param_gradients() override
     {
-        std::vector<TensorRef> g;
-        auto n1 = norm1_->param_gradients(); g.insert(g.end(), n1.begin(), n1.end());
-        auto a = attn_.param_gradients();    g.insert(g.end(), a.begin(), a.end());
-        auto n2 = norm2_->param_gradients(); g.insert(g.end(), n2.begin(), n2.end());
-        auto f = ff_.param_gradients();      g.insert(g.end(), f.begin(), f.end());
-        return g;
+        return collect_refs(norm1_->param_gradients(),
+                            attn_.param_gradients(),
+                            norm2_->param_gradients(),
+                            ff_.param_gradients());
     }
 
     void set_checkpoint_mode(bool enabled) override
@@ -1011,21 +956,13 @@ public:
         const Tensor& input) override
     {
         ComputeEngine& engine = engine_ref();
-        auto n1 = norm1_->forward(input);
-        if (!n1) return n1;
-        auto a = attn_.forward(*n1);
-        if (!a) return a;
-        auto r1 = dsl::compute(engine,
-            dsl::leaf(input) + dsl::leaf(*a),
-            input.rows(), input.cols());
-        if (!r1) return std::unexpected(r1.error());
-        auto n2 = norm2_->forward(*r1);
-        if (!n2) return n2;
-        auto f = ff_.forward(*n2);
-        if (!f) return f;
-        return dsl::compute(engine,
-            dsl::leaf(*r1) + dsl::leaf(*f),
-            r1->rows(), r1->cols());
+        // 两个残差分支（与 GPTBlock/TransformerEncoderLayer 同骨架）。
+        // 残差相加历史上未传 profile（恒 F32）——显式传以保持逐位不变。
+        auto r1 = prenorm_residual_forward_(engine, input, *norm1_, attn_,
+                                            Precision::F32);
+        NN_TRY_CHECK(r1);
+        return prenorm_residual_forward_(engine, *r1, *norm2_, ff_,
+                                         Precision::F32);
     }
 
     [[nodiscard]] Result<Tensor> backward(
@@ -1035,24 +972,13 @@ public:
         // activation offload：从 host 恢复激活再反向（替代重计算）
         if (offloader_.offloaded())
         {
-            auto im = offloader_.import_activations(engine);
-            if (!im) return std::unexpected(im.error());
+            NN_TRY(im, offloader_.import_activations(engine));
         }
-        auto grad_ff = ff_.backward(grad_output);
-        if (!grad_ff) return grad_ff;
-        auto b_n2 = norm2_->backward(*grad_ff);
-        if (!b_n2) return b_n2;
-        auto grad_r1 = dsl::compute(engine,
-            dsl::leaf(grad_output) + dsl::leaf(*b_n2),
-            grad_output.rows(), grad_output.cols());
-        if (!grad_r1) return std::unexpected(grad_r1.error());
-        auto grad_a = attn_.backward(*grad_r1);
-        if (!grad_a) return grad_a;
-        auto b_n1 = norm1_->backward(*grad_a);
-        if (!b_n1) return b_n1;
-        return dsl::compute(engine,
-            dsl::leaf(*grad_r1) + dsl::leaf(*b_n1),
-            grad_r1->rows(), grad_r1->cols());
+        // 两处残差分流 + 子层反向（与 GPTBlock / TransformerEncoderLayer 同一骨架）。
+        // 残差相加历史上未传 profile（恒 F32）——显式传 Precision::F32 保持逐位不变。
+        return prenorm_residual_backward_(engine, grad_output,
+                                          *norm1_, attn_, *norm2_, ff_,
+                                          Precision::F32);
     }
 
     // 增量推理：单 token → norm1 → RLA-2 运行态注意力 → 残差 → norm2 → FFN → 残差
@@ -1061,18 +987,14 @@ public:
         ComputeEngine& engine, const Tensor& input,
         Tensor& B_state, Tensor& z_state, std::size_t pos)
     {
-        auto n1 = norm1_->forward(input);
-        if (!n1) return n1;
-        auto a = attn_.forward_step(engine, *n1, B_state, z_state, pos);
-        if (!a) return a;
+        NN_TRY(n1, norm1_->forward(input));
+        NN_TRY(a, attn_.forward_step(engine, *n1, B_state, z_state, pos));
         auto r1 = dsl::compute(engine,
             dsl::leaf(input) + dsl::leaf(*a),
             input.rows(), input.cols());
-        if (!r1) return std::unexpected(r1.error());
-        auto n2 = norm2_->forward(*r1);
-        if (!n2) return n2;
-        auto f = ff_.forward(*n2);
-        if (!f) return f;
+        NN_TRY_CHECK(r1);
+        NN_TRY(n2, norm2_->forward(*r1));
+        NN_TRY(f, ff_.forward(*n2));
         return dsl::compute(engine,
             dsl::leaf(*r1) + dsl::leaf(*f),
             r1->rows(), r1->cols());
@@ -1135,12 +1057,18 @@ public:
         if (ln_f_) ln_f_->set_precision_profile(precision);
         lm_head_.set_precision_profile(precision);
 
+        // ── 位置编码器（**嵌入侧**）：模型只负责"加到 token 嵌入上"那一半 ────
+        // RLA-2 强约束：必须 RoPE（v1 不支持 ALiBi）。RoPE 的注入点在注意力层
+        // （Q/K 进 ReLU 之前），由 ReLULinearAttention **自持**；嵌入侧是恒等。
+        pos_encoder_ = make_embedding_position_encoder(pos_enc, d_model, seq_len);
+
         blocks_.reserve(num_layers);
         for (std::size_t i = 0; i < num_layers; ++i)
+        {
             blocks_.emplace_back(d_model, num_heads, d_ff, seq_len, pos_enc,
                                  activation, norm_type, causal, precision);
-        // RLA-2 强约束：必须 RoPE（或 ALiBi）。v1 强制 RoPE，输入侧无位置嵌入。
-        pos_encoder_ = std::make_unique<NoPositionEncoder>();
+        }
+        pos_encoder_->set_precision_profile(precision);
     }
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
@@ -1159,18 +1087,15 @@ public:
 
         if (pos_encoder_)
         {
-            auto r = pos_encoder_->init(engine);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY(r, pos_encoder_->init(engine));
         }
         for (auto& b : blocks_)
         {
-            auto r = b.init(engine);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY(r, b.init(engine));
         }
         if (ln_f_)
         {
-            auto r = ln_f_->init(engine);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY(r, ln_f_->init(engine));
         }
         { auto r = lm_head_.init(engine); if (!r) return std::unexpected(r.error()); }
         return {};
@@ -1178,37 +1103,19 @@ public:
 
     std::vector<TensorRef> parameters() override
     {
-        std::vector<TensorRef> p;
-        p.push_back(token_emb_);
-        auto pp = pos_encoder_->parameters();
-        p.insert(p.end(), pp.begin(), pp.end());
-        for (auto& b : blocks_)
-        {
-            auto bp = b.parameters();
-            p.insert(p.end(), bp.begin(), bp.end());
-        }
-        auto lp = ln_f_->parameters();
-        p.insert(p.end(), lp.begin(), lp.end());
-        auto hp = lm_head_.parameters();
-        p.insert(p.end(), hp.begin(), hp.end());
-        return p;
+        return collect_refs(token_emb_,
+                            pos_encoder_->parameters(),
+                            collect_block_refs_(blocks_, &RAPTBlock::parameters),
+                            ln_f_->parameters(),
+                            lm_head_.parameters());
     }
     std::vector<TensorRef> param_gradients() override
     {
-        std::vector<TensorRef> g;
-        g.push_back(grad_token_emb_);
-        auto gp = pos_encoder_->param_gradients();
-        g.insert(g.end(), gp.begin(), gp.end());
-        for (auto& b : blocks_)
-        {
-            auto bg = b.param_gradients();
-            g.insert(g.end(), bg.begin(), bg.end());
-        }
-        auto lg = ln_f_->param_gradients();
-        g.insert(g.end(), lg.begin(), lg.end());
-        auto hg = lm_head_.param_gradients();
-        g.insert(g.end(), hg.begin(), hg.end());
-        return g;
+        return collect_refs(grad_token_emb_,
+                            pos_encoder_->param_gradients(),
+                            collect_block_refs_(blocks_, &RAPTBlock::param_gradients),
+                            ln_f_->param_gradients(),
+                            lm_head_.param_gradients());
     }
 
     void set_checkpoint_mode(bool enabled) override
@@ -1278,17 +1185,13 @@ public:
         batch_size_ = batch;
 
         auto input_T = engine.transpose(input);   // (batch, seq)
-        if (!input_T) return std::unexpected(input_T.error());
-        auto all_emb = engine.gather_rows(token_emb_, *input_T);
-        if (!all_emb) return std::unexpected(all_emb.error());
-        auto st = engine.clone(*input_T);
-        if (!st) return std::unexpected(st.error());
+        NN_TRY_CHECK(input_T);
+        NN_TRY(all_emb, engine.gather_rows(token_emb_, *input_T));
+        NN_TRY(st, engine.clone(*input_T));
         stored_tokens_tensor_ = std::move(*st);
-        auto all_T = engine.transpose(*all_emb);
-        if (!all_T) return std::unexpected(all_T.error());
+        NN_TRY(all_T, engine.transpose(*all_emb));
 
-        auto x_res = pos_encoder_->apply(engine, *all_T, batch, seq);
-        if (!x_res) return std::unexpected(x_res.error());
+        NN_TRY(x_res, pos_encoder_->apply(engine, *all_T, batch, seq));
         Tensor x = std::move(*x_res);
 
         checkpoint_inputs_.clear();
@@ -1302,8 +1205,7 @@ public:
             // 模式 forward（不驻留中间激活），backward 时用保存的输入重算
             if (ckpt && (bi % checkpoint_every_ == 0))
             {
-                auto save = engine.clone(x);
-                if (!save) return std::unexpected(save.error());
+                NN_TRY(save, engine.clone(x));
                 checkpoint_inputs_.push_back(std::move(*save));
                 b.set_checkpoint_mode(true);
             }
@@ -1311,26 +1213,22 @@ public:
             {
                 b.set_checkpoint_mode(false);
             }
-            auto r = b.forward(x);
-            if (!r) return r;
+            NN_TRY(r, b.forward(x));
             x = std::move(*r);
             // activation offload：forward 后把本块内部激活搬 host-visible（释放
             // 显存）。checkpoint 块 forward 不驻留激活 → 无可导出内容，必须跳过。
             if (activation_offload_ && !b.checkpoint_mode())
             {
-                auto ex = b.export_activations(engine);
-                if (!ex) return std::unexpected(ex.error());
+                NN_TRY(ex, b.export_activations(engine));
             }
             // 按间隔 flush，将大录制拆成多个小提交（防 TDR）
             if (flush_interval_ > 0 && (bi + 1) % flush_interval_ == 0
                 && bi + 1 < blocks_.size())
             {
-                auto fr = engine.flush_batch();
-                if (!fr) return std::unexpected(fr.error());
+                NN_TRY(fr, engine.flush_batch());
             }
         }
-        auto ln = ln_f_->forward(x);
-        if (!ln) return ln;
+        NN_TRY(ln, ln_f_->forward(x));
         return lm_head_.forward(*ln);
     }
 
@@ -1341,10 +1239,8 @@ public:
         const std::size_t seq = seq_len_;
         const std::size_t batch = batch_size_;
 
-        auto b_lm = lm_head_.backward(grad_output);
-        if (!b_lm) return b_lm;
-        auto b_ln = ln_f_->backward(*b_lm);
-        if (!b_ln) return b_ln;
+        NN_TRY(b_lm, lm_head_.backward(grad_output));
+        NN_TRY(b_ln, ln_f_->backward(*b_lm));
         Tensor grad_x = std::move(*b_ln);
 
         const std::size_t n = blocks_.size();
@@ -1357,8 +1253,7 @@ public:
                 const std::size_t seg = idx / checkpoint_every_;
                 NN_ASSERT(seg < checkpoint_inputs_.size(),
                           "RAPTModel backward: checkpoint input missing");
-                auto cr = blocks_[idx].forward_recompute(checkpoint_inputs_[seg]);
-                if (!cr) return cr;
+                NN_TRY(cr, blocks_[idx].forward_recompute(checkpoint_inputs_[seg]));
             }
             auto br = blocks_[idx].backward(grad_x);
             if (!br)
@@ -1371,18 +1266,14 @@ public:
                 blocks_[idx].clear_cache();
             if (flush_interval_ > 0 && (bi + 1) % flush_interval_ == 0 && bi + 1 < n)
             {
-                auto fr = engine.flush_batch();
-                if (!fr) return std::unexpected(fr.error());
+                NN_TRY(fr, engine.flush_batch());
             }
         }
         checkpoint_inputs_.clear();
 
-        auto grad_T = engine.transpose(grad_x);
-        if (!grad_T) return std::unexpected(grad_T.error());
-        auto pr = pos_encoder_->backward(engine, *grad_T, batch, seq);
-        if (!pr) return std::unexpected(pr.error());
-        auto sr = engine.scatter_add_rows(grad_token_emb_, stored_tokens_tensor_, *grad_T);
-        if (!sr) return std::unexpected(sr.error());
+        NN_TRY(grad_T, engine.transpose(grad_x));
+        NN_TRY(pr, pos_encoder_->backward(engine, *grad_T, batch, seq));
+        NN_TRY(sr, engine.scatter_add_rows(grad_token_emb_, stored_tokens_tensor_, *grad_T));
 
         Tensor grad_input = engine.create_tensor(seq, batch, Precision::F32,
                                                  InitSpec::zero());
@@ -1423,24 +1314,21 @@ public:
             idx_v[0] = static_cast<Scalar>(tok);
             auto idx_t = detail::upload_span(engine, 1, 1, Precision::F32,
                                              std::span(idx_v));
-            if (!idx_t) return std::unexpected(idx_t.error());
+            NN_TRY_CHECK(idx_t);
             auto emb = engine.gather_rows(token_emb_, *idx_t);   // (1, d_model)
-            if (!emb) return std::unexpected(emb.error());
+            NN_TRY_CHECK(emb);
             auto emb_t = engine.transpose(*emb);                  // (d_model, 1)
-            if (!emb_t) return std::unexpected(emb_t.error());
+            NN_TRY_CHECK(emb_t);
             Tensor h = std::move(*emb_t);
             for (std::size_t i = 0; i < blocks_.size(); ++i)
             {
-                auto r = blocks_[i].forward_step(engine, h, statesB[i], statesZ[i], pos);
-                if (!r) return std::unexpected(r.error());
+                NN_TRY(r, blocks_[i].forward_step(engine, h, statesB[i], statesZ[i], pos));
                 h = std::move(*r);
             }
-            auto ln = ln_f_->forward(h);
-            if (!ln) return std::unexpected(ln.error());
-            auto logits = lm_head_.forward(*ln);
-            if (!logits) return std::unexpected(logits.error());
+            NN_TRY(ln, ln_f_->forward(h));
+            NN_TRY(logits, lm_head_.forward(*ln));
             auto lm_v = detail::download_vector(engine, *logits);   // 宿主桥 D11
-            if (!lm_v) return std::unexpected(lm_v.error());
+            NN_TRY_CHECK(lm_v);
             const std::size_t lm_cols = logits->cols();
             std::vector<Scalar> last(vocab_size_);
             for (std::size_t v = 0; v < vocab_size_; ++v)
@@ -1453,8 +1341,7 @@ public:
         std::vector<Scalar> last;
         for (std::size_t i = 0; i < prompt.size(); ++i)
         {
-            auto r = step_one(prompt[i], pos++);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY(r, step_one(prompt[i], pos++));
             last = std::move(*r);
         }
 
@@ -1464,42 +1351,14 @@ public:
         std::uniform_real_distribution<Scalar> dist(0.0, 1.0);
         for (std::size_t step = 0; step < max_new_tokens; ++step)
         {
+            // temperature → softmax → 采样/贪心（三模型共用的采样器）
             std::vector<Scalar> lastv = last;
-            if (temperature > 0.0 && temperature != 1.0)
-                for (auto& x : lastv) x /= temperature;
-
-            Scalar max_val = lastv[0];
-            for (std::size_t v = 1; v < vocab_size_; ++v)
-                max_val = std::max(max_val, lastv[v]);
-            Scalar sum_exp = 0;
-            for (auto& x : lastv) { x = std::exp(x - max_val); sum_exp += x; }
-            for (auto& x : lastv) x /= sum_exp;
-
-            std::size_t next;
-            if (temperature > 0.0)
-            {
-                Scalar r = dist(rng);
-                Scalar cum = 0;
-                next = vocab_size_ - 1;
-                for (std::size_t v = 0; v < vocab_size_; ++v)
-                {
-                    cum += lastv[v];
-                    if (r <= cum) { next = v; break; }
-                }
-            }
-            else
-            {
-                next = 0;
-                Scalar best = lastv[0];
-                for (std::size_t v = 1; v < vocab_size_; ++v)
-                    if (lastv[v] > best) { best = lastv[v]; next = v; }
-            }
+            const std::size_t next = sample_next_token_(lastv, temperature, rng, dist);
 
             if (step >= min_new_tokens && next == eos_token_id) break;
             generated.push_back(next);
 
-            auto r = step_one(next, pos++);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY(r, step_one(next, pos++));
             last = std::move(*r);
         }
         return generated;

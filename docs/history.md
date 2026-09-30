@@ -11,8 +11,8 @@
 
 - [表达式 DSL / 融合 IR（expr_*.hpp）](#表达式 DSL / 融合 IR（expr_*.hpp）)（15 条）
 - [GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）](#GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）)（17 条）
-- [注意力 / ZiPT / Transformer / FeedForward 层](#注意力 / ZiPT / Transformer / FeedForward 层)（15 条）
-- [RAPT / CNN / MLP / Softmax / GPT 层](#RAPT / CNN / MLP / Softmax / GPT 层)（11 条）
+- [注意力 / ZiPT / Transformer / FeedForward 层](#注意力 / ZiPT / Transformer / FeedForward 层)（16 条）
+- [RAPT / CNN / MLP / Softmax / GPT 层](#RAPT / CNN / MLP / Softmax / GPT 层)（12 条）
 - [引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器](#引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器)（19 条）
 - [代数层 / 基础设施 / 模型容器与序列化](#代数层 / 基础设施 / 模型容器与序列化)（12 条）
 - [领域模型工厂与 CLI 公共头](#领域模型工厂与 CLI 公共头)（1 条）
@@ -325,6 +325,21 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 - 类型：删除清单
 - 内容：反向池化注释原列有"`scale(inv_n) → matmul(ones_row_, result_T)` … 直接：`matmul(grad_col_vec, ones_row_)`"的新旧两套写法，旧写法删除，只留现行管线（rearrange → 原地 scale(inv_n) → matmul(grad_col_vec, ones_row_) → rearrange 回）。
 
+## 注意力变体拆分 + 位置编码多态统一（2026-10-01，原位置 include/neuralnet.cpp/compute_layer_attention.hpp 整文件结构、compute_layer_gpt.hpp PositionEncoder 家族、compute_layer_rapt.hpp:60/253/270/335/423/733/813/1143、compute_layer_zipt.hpp:806-817）
+- 类型：演进记录
+- 内容：原 `AttentionBase` 一个类里同时用 `use_rope_` 布尔 + `use_alibi_`/`has_doc_ids_` 布尔 + `fold_mask_variant_()` 虚钩子 + 4 个 `masked_*_` 模板承载"多种注意力"，且 `recompute_W_` 每次反向都重跑 `if (fold_mask_variant_() == Plain) … if (use_slopes && use_doc) … if (use_slopes) … if (use_doc) …` 组合链（forward 每调用也重算变体，另有三处 `if (use_rope_)`）。整改为**两个正交策略对象、构造期定型**：
+  ① `AttnScoreMask` 族（`PlainScoreMask` / `CausalScoreMask` / `CausalDocScoreMask`，**只做掩码**）——每种掩码语义一个类，各自实现类级常量 `mask_kind()`、`prepare()`、`append_fold_inputs()`、`masked_scores()`（反向 DSL 文本）；由 `AttentionBase::make_score_mask_()` 在**配置期**（构造 / `set_doc_ids`）工厂化选定，forward/backward 各只做一次虚调用。文档掩码的"有/无"是运行期数据，其裁定落在 `set_doc_ids` 这一**配置调用**里（模式不变时零开销），不再是每步 forward 的判断。
+  **后续同一轮内又把 ALiBi 偏置从掩码策略里摘出去**：原 `CausalAlibiScoreMask` / `CausalAlibiDocScoreMask` 两个类把"掩码"和"位置偏置"融成同一条 select，掩码工厂因此必须查询 `pos_->has_score_bias()`。现在掩码族只保留三个纯掩码类，位置偏置由 `PositionEncoder::apply_score_bias()` 在 backward 的"掩码之后、softmax 之前"独立叠加（forward 仍融在同一个 fold kernel 内，由 `make_fold_attn_o` 的正交第二入参 `bool score_bias` 表达）。`expr::FoldAttnMask`（5 值融合枚举）随之改为 `expr::AttnMaskKind{Plain,Causal,CausalDoc}` + `bool score_bias`，`scan_exprs` 登记块改为 3×2 组合循环（跳过不存在的 "Plain + 偏置"），掩码策略类由 5 个降为 3 个。
+  ② `PositionEncoder` 族（新文件 `compute_position_encoding.hpp`）——`RotaryEmbedding` 从 attention 头迁出、由 `RopePositionEncoder` 持有；`use_rope_` 布尔消失，Q/K 旋转改走策略对象（非 RoPE 策略 = 恒等 no-op）。`PositionEncoder` 基类按**注入点**分三组（嵌入侧 `apply/apply_step/backward`、Q/K 侧 `apply_qk/apply_qk_step/set_position_offset`、分数侧 `has_score_bias/prepare_score_bias/apply_score_bias/apply_bias_step`），`Learned/Sinusoidal` 走嵌入侧、`RoPE` 走 Q/K 侧、`ALiBi` 走分数侧、`NoPositionEncoder` 恒等——各子类只覆写自己那组，其余继承基类 no-op。
+  ③ **⚠ 拆开时踩到的坑（`row()` 的批内语义）**：ALiBi 的偏置项原来是 `batch_mod(slopes, H) * (col − row)`，`row()` 是"批内行号"、其分解来自**同一 ExprSpec 里的 matmul 段**（`MatmulSpec.batch`）——旧实现把它融在掩码表达式里，那个表达式恰好含 `dsl::matmul(..., BH)`，所以正确。拆成独立一步后 spec 里没有 matmul → batch 退化为 1 → `row()` 变**全局行号** → 偏置静默错值（探针实测 |偏置| 达 27，理论界 (seq−1)·m_0≈7），`attn_test` 的 alibi+doc gradcheck 立刻失败。修法：把 `(col − row)` 换成**`(rows,1)` 行表 + `dsl::row_broadcast`**（按全局行号直读，与网格分解无关）——`AlibiPositionEncoder::prepare_score_bias` 建两张 O(B·H·seq) 行表（每行斜率 `m_{h(row)}` 与批内位置 `row % seq`），`apply_score_bias` 用 `leaf(S) + rb(slope_row) * (col() − rb(pos_row))`。该坑已写进 `AGENTS.md` §7 的告警与 `docs/development/02` §IR 扩展。
+  ④ **所有权按注入点划分（谁拥有 = 谁负责）**：`PosEncodingType` 的分发收敛为两个工厂，同一策略类型只在一个工厂里实做、在另一个里映射为恒等——
+     · 模型侧 `make_embedding_position_encoder(type, d_model, seq_len)`（Learned/Sinusoidal 实做），由 `GPTModel`/`ZiPTModel`/`RAPTModel` 持有并在 `apply`/`apply_step` 里施加；
+     · 注意力侧 `make_attention_position_encoder(type, d_k, num_heads)`（RoPE/ALiBi 实做），由 `CausalSelfAttention`/`ReLULinearAttention` **自持**（`AttentionBase::install_position_encoder`），在 `apply_qk`/`apply_score_bias` 上取数。
+     这样层间**没有任何位置编码对象传递**：删掉了 `AttentionBase::set_position_encoder(PositionEncoder&)`、`GPTBlock::set_position_encoder`、`RAPTBlock::set_position_encoder` 与两个模型的注入循环，也一并去掉了"非拥有指针指向模型对象的生命周期约束"（原先为规避层对象移动导致成员地址失效，兜底对象还得特意放堆上——现在 `pos_` 就是层自己的 `unique_ptr` 成员）。代价是 **RoPE 的 cos/sin 表随层构建**：每层 `2·d_k·seq·4B`，本仓默认配置（`d_model=128`/`H=4`/`layers=4`/`seq=256`）≈ 64KB/层、全模型 256KB，三角函数只在 `seq` 变化时算一次；层数极多的配置才需要回头考虑共享。
+     另外，`AttentionBase::init_impl` 改为**调用** `pos_->init(engine)`（三组策略的 init 都是 no-op）——符合 M6 段 C 的不变量"复合层 `init_impl` 必须 init 全部子对象"；此前"不 init"是"注入的模型级对象由模型自己 init"这一设计的副产物。`max_len` 参数保留仅为签名兼容，当前实现不使用。AOT 闭合世界不受影响：`make_fold_attn_o` 与 5 个组合的登记仍在 `scan_exprs` 的显式块中。
+- 验收：build 零告警（`-Werror`）；ctest 20/20（含 `NN_BIND_DEBUG=1` 一轮）；CPU 锚 `6f8849f14da23110` 与 GPU dev2 锚 `8ef51b2927253c50` 逐位不变；`--init-hash` 六模型与 M2 锚全同；`--io-roundtrip` CPU/GPU 全过；L2 审计 `L2-VIOLATIONS: 0`（`bench/doc_inventory.ps1` 的 L2 文件清单已补入 `compute_position_encoding.hpp`，否则新文件不在门禁内）；引擎 virtual 方法仍 49、Layer 直调算子仍 21。
+  **scan 双 hash 在本轮内变过两次**（`bdc3a442…`/`7a10412c…` → `74e02702…`/`bb03e5e2…` → `45edce4a…`/`15899056…`）：位置编码**所有权**调整那次（注入 → 自持）表达式文本未动、hash 逐字节不变；而把 ALiBi 偏置从掩码表达式里拆成独立一步那次**必然改变**backward 的表达式树（`scores + select(blocked,-inf,alibi)` → `(scores + select(blocked,-inf,0)) + bias`），故 hash 变化是设计结果、不是漂移。两次都做到了**数值逐位不变**（CPU/GPU 字节锚不动）——这正是"改结构不改数"的判据：hash 说明结构变了，字节锚说明值没变。
+
 ## ActivationOffloader slab 容量校验（原位置 include/neuralnet.cpp/compute_layer_base.hpp:196）
 - 类型：bug 根因
 - 内容：slab 原先只在 `!slab_.valid()` 时按当时的激活总量分配、之后永不增长；后续 step 激活总量变大（批大小/序列长度变化、--resume 后续训、最后一个不满 batch 之后的 step）时 `offload_save` 按新 offset 越界写 slab → 缓冲区破坏/设备丢失。修复为每次导出按当前总量校验、不足即重建。头文件只保留现行不变量与其后果。
@@ -335,6 +350,15 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 
 > 摘自 RAPT/RLA、CNN 卷积池化、MLP、Softmax、GPT 模型层头文件的历史状态类注释（本轮清理）。
 > 每条记录原位置、类型与内容；琐碎的一句话描述直接删除、未收录。
+
+## Layer 层四处收敛：参数收集 / Pre-Norm 残差反向 / 解码采样 / 错误传播（2026-10-01，原位置 compute_layer_{gpt,rapt,zipt,transformer,attention,feedforward,base}.hpp、core_errors.hpp）
+- 类型：演进记录
+- 内容：
+  ① **参数收集**：`parameters()` / `param_gradients()` 里 `p.insert(p.end(), x.begin(), x.end())` 的级联在三个模型 + 四个块层共 15 处同构重复 → `Layer::collect_refs(...)`（变参拼接：实参可以是单个 `Tensor` 或子层返回的 `std::vector<TensorRef>`）与 `Layer::collect_block_refs_(blocks, &Type::fn)`（块容器逐块取参）。拼接顺序即实参顺序，不改变优化器看到的参数序。
+  ② **Pre-Norm 残差**：`GPTBlock` / `TransformerEncoderLayer` / `RAPTBlock` 的两处残差分流（正/反向）逐字同构 → `Layer::prenorm_residual_forward_` / `Layer::prenorm_residual_backward_`。**残差相加的表达式输出精度显式传入**：GPT/Transformer 传 `p.compute`，RAPT 历史上未传 profile（恒 F32），故传 `Precision::F32`——"顺手统一成 p.compute"会改变 f16 路径的数值行为，因此不做，只把差异显式化。
+  ③ **解码采样**：`GPTModel/RAPTModel/ZiPTModel::generate()` 里"temperature 缩放 → 数值稳定 softmax → 随机采样 / 贪心"三段逐字相同 → `sample_next_token_()`（`compute_layer_base.hpp`）。RNG 消耗序（每步恰好一次 `dist(rng)`，仅采样分支）保持不变。**解码循环骨架刻意未合并**：三者运行态本质不同（GPT = KV cache 增量 + 滑窗重建、RAPT = RLA 运行态、ZiPT = 无状态整窗前向），用标志位强行统一会得到更难读的"上帝函数"，与"保持 Layer 简洁"的目标相反。
+  ④ **错误传播**：`auto r = f(); if (!r) return std::unexpected(r.error());` 在 L2 层重复 494 处、占 Layer 代码近 9% → `NN_TRY(decl, expr)` / `NN_TRY_CHECK(x)` 宏（`core_errors.hpp`）。展开与手写形态**逐字等价**（同样的错误消息、返回类型、语句数），不含控制流或所有权语义；实现用普通语句而非 `do{}while(0)`，以便在 `if/else` 里保持与原 `if` 语句一致的悬垂-else 行为。机械改写脚本 `tools/apply_nn_try.ps1`（带 `-DryRun` 计数，只改模式完全匹配的行）可复现。
+- 验收：build 零告警（`-Werror`）；ctest 20/20（含 `NN_BIND_DEBUG=1` 一轮）；scan 双 hash 与 CPU/GPU 字节锚逐位不变；`--init-hash` 六模型与 M2 锚全同；`--io-roundtrip` CPU/GPU 全过；L2 审计 `L2-VIOLATIONS: 0`。
 
 ## 缓存前置校验的修复过程叙述（原位置 include/neuralnet.cpp/compute_layer_conv.hpp:215-216、include/neuralnet.cpp/compute_layer_rapt.hpp:540-542）
 - 类型：bug 根因
