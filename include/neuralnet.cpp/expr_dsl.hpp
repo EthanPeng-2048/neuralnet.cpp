@@ -80,6 +80,10 @@ concept BoolExpression = requires(const T &t, std::size_t i) {
 namespace nn::dsl
 {
 
+// M1（docs/development/17 §4.1）：Tensor 存储访问已私有化，DSL 求值器经
+// 引擎域内通道 detail::TensorAccess 创建/读写张量（friend 关系，库外禁用）。
+using TensorAccess = ::nn::detail::TensorAccess;
+
 // ── DSL 逐元素模板路径的并行门控 ────────────────────────────────────────
 // 低于全局 nn::PARALLEL_THRESHOLD(524288)。全局值按"裸逐元素 add 的内存
 // 带宽回本点"标定；而本路径折叠的是多算子融合表达式（每元素 2~6 次算术，
@@ -314,7 +318,7 @@ struct CpuViewCache
         if (t.precision() == Precision::F16)
         {
             auto m = std::make_shared<Matrix>(t.rows(), t.cols());
-            const auto s = t.cpu_matrix<Precision::F16>().span();
+            const auto s = TensorAccess::cpu_matrix<Precision::F16>(t).span();
             auto d = m->span();
             for (std::size_t i = 0; i < s.size(); ++i)
                 d[i] = static_cast<Scalar>(s[i]);   // 升 cast：精确无损
@@ -323,7 +327,7 @@ struct CpuViewCache
             cols = t.cols();
             return;
         }
-        const auto& m = t.cpu_matrix();
+        const auto& m = TensorAccess::cpu_matrix(t);
         data = m.span().data();
         cols = t.cols();
     }
@@ -583,7 +587,7 @@ struct MatmulRef
             return std::unexpected(Error{"dsl matmul prepare: result not f32"});
         if (env_flag("NN_F16_DEBUG"))
         {
-            const auto sp = c->cpu_matrix().span();
+            const auto sp = TensorAccess::cpu_matrix(*c).span();
             double mx = 0.0;
             bool bad = false;
             for (auto v : sp)
@@ -602,7 +606,7 @@ struct MatmulRef
                              mx, bad ? " NONFINITE" : "");
         }
         c_cache_ = std::move(*c);
-        c_data_ = c_cache_.cpu_matrix().span().data();
+        c_data_ = TensorAccess::cpu_matrix(c_cache_).span().data();
         return {};
     }
 
@@ -1160,11 +1164,11 @@ template <ExprViewKind K>
     std::span<const Scalar> s;
     if (r.t.precision() == Precision::F32)
     {
-        s = r.t.cpu_matrix().span();
+        s = TensorAccess::cpu_matrix(r.t).span();
     }
     else if (r.t.precision() == Precision::F16)
     {
-        const auto s16 = r.t.template cpu_matrix<Precision::F16>().span();
+        const auto s16 = TensorAccess::cpu_matrix<Precision::F16>(r.t).span();
         mirror = Matrix(r.t.rows(), r.t.cols());
         auto d = mirror.span();
         for (std::size_t i = 0; i < s16.size(); ++i)
@@ -1261,7 +1265,7 @@ template <typename C, ExprOp Rop> inline constexpr bool cpu_reduce_root_v<Reduce
     const std::size_t len = reduces_rows ? rows : cols;
     for (std::size_t k = 0; k < len; ++k)
         out.span()[k] = v[k];
-    return Tensor::from_matrix(std::move(out));
+    return TensorAccess::from_matrix(std::move(out));
 }
 
 template <ExprViewKind K>
@@ -1297,9 +1301,9 @@ template <typename E>
         auto d = h.span();
         for (std::size_t i = 0; i < s.size(); ++i)
             d[i] = s[i];
-        return Tensor::from_matrix(std::move(h));
+        return TensorAccess::from_matrix(std::move(h));
     }
-    return Tensor::from_matrix(std::move(out));
+    return TensorAccess::from_matrix(std::move(out));
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1354,8 +1358,8 @@ template <typename E>
     // dry-run 下游层看到的是 f32，f16 变体永远发现不到。
     const ExprPrecSig sig = expr_prec_sig_of(inputs, P);
     fused::global_registry().add(spec, sig);
-    return eng.adopt(P == Precision::F16 ? Tensor::cpu<Precision::F16>(rows, cols)
-                                         : Tensor::cpu(rows, cols));
+    return eng.adopt(P == Precision::F16 ? TensorAccess::cpu<Precision::F16>(rows, cols)
+                                         : TensorAccess::cpu(rows, cols));
 #else
     if (eng.device() == Device::CPU)
     {
@@ -1417,12 +1421,12 @@ inline void eval_into_tensor_cpu(const E& e, Tensor& dst)
                              dst.rows(), dst.cols(), mx, bad ? " NONFINITE" : "");
         }
         const auto s = tmp.span();
-        auto d = dst.cpu_matrix<Precision::F16>().span();
+        auto d = TensorAccess::cpu_matrix<Precision::F16>(dst).span();
         for (std::size_t i = 0; i < s.size(); ++i)
             d[i] = s[i];
         return;
     }
-    eval_into_span(e, dst.cpu_matrix().span(), dst.cols());
+    eval_into_span(e, TensorAccess::cpu_matrix(dst).span(), dst.cols());
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1532,12 +1536,12 @@ template <typename E>
     const ExprPrecSig sig = expr_prec_sig_of(inputs, P);
     fused::global_registry().add(spec, sig);
     if (P == Precision::F16)
-        return eng.adopt((raxis == 0) ? Tensor::cpu<Precision::F16>(rows, 1)
-             : (raxis == 1) ? Tensor::cpu<Precision::F16>(1, cols)
-             : Tensor::cpu<Precision::F16>(rows, cols));
-    return eng.adopt((raxis == 0) ? Tensor::cpu(rows, 1)
-         : (raxis == 1) ? Tensor::cpu(1, cols)
-         : Tensor::cpu(rows, cols));
+        return eng.adopt((raxis == 0) ? TensorAccess::cpu<Precision::F16>(rows, 1)
+             : (raxis == 1) ? TensorAccess::cpu<Precision::F16>(1, cols)
+             : TensorAccess::cpu<Precision::F16>(rows, cols));
+    return eng.adopt((raxis == 0) ? TensorAccess::cpu(rows, 1)
+         : (raxis == 1) ? TensorAccess::cpu(1, cols)
+         : TensorAccess::cpu(rows, cols));
 #else
     if (eng.device() == Device::CPU)
     {
