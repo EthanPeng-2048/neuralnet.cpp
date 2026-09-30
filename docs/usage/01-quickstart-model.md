@@ -105,9 +105,16 @@ model.add<nn::GPTBlock>(128, 4, 512, 1024);        // GPT 块
 // Tensor 的静态工厂与存储访问器已私有化，绕过引擎 = 编译错误。
 
 // 通过 Engine 创建（统一入口：自动分配、出生绑定到引擎）
-nn::Tensor t1 = engine.create_tensor(784, 32);  // 784×32，零初始化
+nn::Tensor t1 = engine.create_tensor(784, 32);  // 纯分配
 nn::Tensor t3 = engine.create_tensor(784, 32);
-(void)engine.zero(t3);  // 清零
+(void)engine.zero(t3);  // 清零（分配后手动）
+
+// M2（docs/development/17 §4.4）：声明式初始化——层算分布参数，引擎填数；
+// 分布类 seed 必填（同 seed 不同张量由引擎混流，不撞流）
+nn::Tensor t_w = engine.create_tensor(32, 10, nn::Precision::F32,
+                                      nn::InitSpec::uniform(-0.1f, 0.1f, nn::kInitSeed));
+nn::Tensor t_b = engine.create_tensor(10, 1, nn::Precision::F32,
+                                      nn::InitSpec::zero());
 
 // 从 Matrix 上传（Matrix = 宿主 I/O 载体）
 nn::Matrix m(784, 32);
@@ -193,19 +200,20 @@ public:
     MyLayer(std::size_t in_dim, std::size_t out_dim)
         : in_dim_(in_dim), out_dim_(out_dim) {}
 
-    // 权重初始化：在 CPU 上填好，再经 engine 上传到目标设备
+    // 权重初始化：M2 声明式——层算分布参数（Xavier limit），引擎填数
     [[nodiscard]] nn::Result<void> init(nn::ComputeEngine& engine) override
     {
-        nn::Matrix w_cpu(out_dim_, in_dim_);   // 行主序 (out, in)
-        // ... 填充初始化值（如 Xavier 均匀分布）...
+        const nn::Scalar limit =
+            std::sqrt(6.0f / static_cast<nn::Scalar>(in_dim_ + out_dim_));
+        weight_ = engine.create_tensor(out_dim_, in_dim_, nn::Precision::F32,
+                                       nn::InitSpec::uniform(-limit, limit, nn::kInitSeed));
+        if (!weight_.valid())
+            return std::unexpected(nn::Error{"MyLayer: 权重初始化失败"});
 
-        auto w = engine.from_matrix(w_cpu);
-        if (!w) return std::unexpected(w.error());
-        weight_ = std::move(*w);
-
-        grad_weight_ = engine.create_tensor(out_dim_, in_dim_);
-        auto z = engine.zero(grad_weight_);
-        if (!z) return std::unexpected(z.error());
+        grad_weight_ = engine.create_tensor(out_dim_, in_dim_, nn::Precision::F32,
+                                            nn::InitSpec::zero());
+        if (!grad_weight_.valid())
+            return std::unexpected(nn::Error{"MyLayer: 梯度缓冲初始化失败"});
         return {};
     }
 
