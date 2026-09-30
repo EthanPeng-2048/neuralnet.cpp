@@ -196,12 +196,11 @@ enum class Precision : uint8_t
 ### 6.4 创建 API（P 显式；无 Auto——创建无操作数可推导）
 
 ```cpp
-Tensor::cpu(rows, cols, P)                    // CPU 空张量
-engine.create_tensor(rows, cols, P)           // 设备张量
+engine.create_tensor(rows, cols, P)           // 张量创建唯一入口（M1 起
+                                             // Tensor::cpu 等静态工厂收归引擎私有）
 GpuTensor<P>::create_empty(rows, cols, backend)
 Matrix<P>(rows, cols[, value])
-engine.from_matrix(const Matrix<P>& m)        // 每个支持的 P 一个重载；
-                                             // P 由 Matrix 类型带出，无二义
+engine.from_matrix(const Matrix& m, P)        // 宿主上传（I/O 分组）；P 显式
 ```
 
 ### 6.5 读取 / 传输 API
