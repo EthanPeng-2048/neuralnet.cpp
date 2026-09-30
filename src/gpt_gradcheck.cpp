@@ -43,7 +43,7 @@ namespace {
 Scalar eval_loss(ComputeEngine& engine, GPTModel& model,
                  const Tensor& input, const Tensor& go)
 {
-    auto y = model.forward(engine, input);
+    auto y = model.forward(input);
     if (!y) { std::cerr << "  [eval] forward failed: " << y.error().message << "\n"; std::abort(); }
     auto y_m = engine.to_matrix(*y);
     auto go_m = engine.to_matrix(go);
@@ -190,7 +190,7 @@ int main(int argc, char* argv[])
     if (!go) { std::cerr << "from_matrix(go) failed\n"; return 1; }
 
     // ── 前向一次：填充各层 forward 缓存 ──
-    auto y_fwd = model.forward(eng, *x);
+    auto y_fwd = model.forward(*x);
     if (!y_fwd) { std::cerr << "forward failed: " << y_fwd.error().message << "\n"; return 1; }
     std::cout << "  forward OK, logits: " << y_fwd->rows() << "x" << y_fwd->cols() << "\n";
 
@@ -208,7 +208,7 @@ int main(int argc, char* argv[])
         auto rz = eng.zero(g.get());
         if (!rz) { std::cerr << "zero failed\n"; return 1; }
     }
-    auto gx = model.backward(eng, *go);
+    auto gx = model.backward(*go);
     if (!gx) { std::cerr << "backward failed: " << gx.error().message << "\n"; return 1; }
     std::cout << "  参数总数: " << params.size() << "\n";
 

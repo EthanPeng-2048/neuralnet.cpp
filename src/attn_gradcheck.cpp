@@ -34,7 +34,7 @@ namespace {
 Scalar eval_loss(ComputeEngine& engine, CausalSelfAttention& attn,
                  const Tensor& x, const Tensor& go)
 {
-    auto y = attn.forward(engine, x);
+    auto y = attn.forward(x);
     if (!y) { std::cerr << "  [eval] forward failed: " << y.error().message << "\n"; std::abort(); }
     auto y_m = engine.to_matrix(*y);
     auto go_m = engine.to_matrix(go);
@@ -166,7 +166,7 @@ int main(int argc, char* argv[])
     auto go = eng.from_matrix(go_m);
     if (!go) { std::cerr << "from_matrix(go) failed\n"; return 1; }
 
-    auto y_fwd = attn.forward(eng, *x);
+    auto y_fwd = attn.forward(*x);
     if (!y_fwd) { std::cerr << "forward failed: " << y_fwd.error().message << "\n"; return 1; }
 
     auto params = attn.parameters();
@@ -176,7 +176,7 @@ int main(int argc, char* argv[])
         auto rz = eng.zero(g.get());
         if (!rz) { std::cerr << "zero failed\n"; return 1; }
     }
-    auto gx = attn.backward(eng, *go);
+    auto gx = attn.backward(*go);
     if (!gx) { std::cerr << "backward failed: " << gx.error().message << "\n"; return 1; }
 
     const Scalar eps = 1e-3f;

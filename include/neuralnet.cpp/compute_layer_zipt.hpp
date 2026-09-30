@@ -80,7 +80,7 @@ public:
           scale_(Scalar{1} / std::sqrt(static_cast<Scalar>(d_model))),
           w_k_(d_model, d_model), w_v_(d_model, d_model) {}
 
-    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
         // 初始化记忆查询 P（列主序 (d_model, M)，每列一个记忆查询）——
         // M2 声明式：层算 limit、引擎填数；分布 seed 显式（原 random_device
@@ -96,6 +96,8 @@ public:
 
         auto r1 = w_k_.init(engine); if (!r1) return std::unexpected(r1.error());
         auto r2 = w_v_.init(engine); if (!r2) return std::unexpected(r2.error());
+        // M6 段 C：softmax_ 是子 Layer（engine 由 init 绑定）
+        { auto r3 = softmax_.init(engine); if (!r3) return std::unexpected(r3.error()); }
         return {};
     }
 
@@ -128,15 +130,16 @@ public:
 
     // 前向：输入 X (d_model, batch·L) → 输出 C (d_model, batch·M)
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) override
+        const Tensor& input) override
     {
+        ComputeEngine& engine = engine_ref();
         const std::size_t total = input.cols();
         const std::size_t L = (seq_len_ > 0) ? seq_len_ : total;
         const std::size_t batch = (seq_len_ > 0) ? (total / seq_len_) : 1;
 
-        auto K = w_k_.forward(engine, input);   // (d_model, batch·L)
+        auto K = w_k_.forward(input);   // (d_model, batch·L)
         if (!K) return K;
-        auto V = w_v_.forward(engine, input);
+        auto V = w_v_.forward(input);
         if (!V) return V;
 
         auto Q_re = build_q_re_(engine, batch);              // (batch·d_model, M)
@@ -154,7 +157,7 @@ public:
             batch * Q_re->cols(), K_re->cols());
         if (!S) return std::unexpected(S.error());
         // A = softmax(S)
-        auto attn = softmax_.forward(engine, *S);
+        auto attn = softmax_.forward(*S);
         if (!attn) return std::unexpected(attn.error());
         // C_re = batched_matmul(V_re, A, batch, false, true) → (batch·d_model, M)
         // dsl::matmul(batch)：纯 {0,1} 结构（attention backward 已登记同 key）
@@ -178,8 +181,9 @@ public:
     }
 
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output) override
+        const Tensor& grad_output) override
     {
+        ComputeEngine& engine = engine_ref();
         // grad_output: (d_model, batch·M)
         const std::size_t batch = batch_cache_;
         const std::size_t L = seq_cache_;
@@ -201,7 +205,7 @@ public:
             batch * grad_C_re->cols(), V_re_cache_.cols());   // 纯 {1,0}（Linear 同 key）
         if (!grad_A) return std::unexpected(grad_A.error());
         // grad_S = softmax.backward(grad_A)
-        auto grad_S = softmax_.backward(engine, *grad_A);
+        auto grad_S = softmax_.backward(*grad_A);
         if (!grad_S) return std::unexpected(grad_S.error());
 
         // grad_Q_re = batched_matmul(K, grad_S, batch, false, true, scale) → (batch·d_model, M)
@@ -231,9 +235,9 @@ public:
         if (!grad_K) return std::unexpected(grad_K.error());
         auto grad_V = engine.rearrange_3d(*grad_V_re, d_model_, batch, L, true);
         if (!grad_V) return std::unexpected(grad_V.error());
-        auto gk = w_k_.backward(engine, *grad_K);
+        auto gk = w_k_.backward(*grad_K);
         if (!gk) return gk;
-        auto gv = w_v_.backward(engine, *grad_V);
+        auto gv = w_v_.backward(*grad_V);
         if (!gv) return gv;
         return dsl::compute(engine,
             dsl::leaf(*gk) + dsl::leaf(*gv),
@@ -354,7 +358,7 @@ public:
         ff_.set_precision_profile(precision);
     }
 
-    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
         auto r1 = norm1_->init(engine); if (!r1) return std::unexpected(r1.error());
         auto r2 = w_q_.init(engine);    if (!r2) return std::unexpected(r2.error());
@@ -365,6 +369,8 @@ public:
         auto r7 = w_vc_.init(engine);   if (!r7) return std::unexpected(r7.error());
         auto r8 = norm2_->init(engine); if (!r8) return std::unexpected(r8.error());
         auto r9 = ff_.init(engine);     if (!r9) return std::unexpected(r9.error());
+        // M6 段 C：softmax_ 是子 Layer（engine 由 init 绑定）
+        { auto r10 = softmax_.init(engine); if (!r10) return std::unexpected(r10.error()); }
         return {};
     }
 
@@ -440,39 +446,42 @@ public:
 
     // 基类单输入 forward/backward 不适用于双输入块（仅经 ZiPTModel 组合使用）
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& /*input*/) override
+        const Tensor& /*input*/) override
     {
+        ComputeEngine& engine = engine_ref();
         (void)engine;
-        return std::unexpected(Error{"ZiPTBlock: use forward(engine, input, memory_input)"});
+        return std::unexpected(Error{"ZiPTBlock: use forward(input, memory_input)"});
     }
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& /*grad_output*/) override
+        const Tensor& /*grad_output*/) override
     {
+        ComputeEngine& engine = engine_ref();
         (void)engine;
-        return std::unexpected(Error{"ZiPTBlock: use backward(engine, grad, grad_C_out)"});
+        return std::unexpected(Error{"ZiPTBlock: use backward(grad, grad_C_out)"});
     }
 
     // 前向：局部 Y (d_model, batch·W) + 记忆 C (d_model, batch·M) → (d_model, batch·W)
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input, const Tensor& memory_input)
+        const Tensor& input, const Tensor& memory_input)
     {
+        ComputeEngine& engine = engine_ref();
         const std::size_t total = input.cols();
         const std::size_t batch = (window_ > 0) ? (total / window_) : 1;
         const std::size_t H_dk = num_heads_ * d_k_;
         const std::size_t BH = batch * num_heads_;
 
-        auto n1 = norm1_->forward(engine, input);
+        auto n1 = norm1_->forward(input);
         if (!n1) return n1;
 
-        auto Q = w_q_.forward(engine, *n1);   // (d_model, batch·W)
+        auto Q = w_q_.forward(*n1);   // (d_model, batch·W)
         if (!Q) return Q;
-        auto Ky = w_k_.forward(engine, *n1);
+        auto Ky = w_k_.forward(*n1);
         if (!Ky) return Ky;
-        auto Vy = w_v_.forward(engine, *n1);
+        auto Vy = w_v_.forward(*n1);
         if (!Vy) return Vy;
-        auto Kc = w_kc_.forward(engine, memory_input);   // (d_model, batch·M)
+        auto Kc = w_kc_.forward(memory_input);   // (d_model, batch·M)
         if (!Kc) return Kc;
-        auto Vc = w_vc_.forward(engine, memory_input);
+        auto Vc = w_vc_.forward(memory_input);
         if (!Vc) return Vc;
 
         // rearrange 为 (batch*H*d_k, ·) 批量化布局
@@ -508,7 +517,7 @@ public:
             dsl::leaf(*S) + dsl::leaf(*mask), *S);
         if (!ma) return std::unexpected(ma.error());
         // A = softmax(S)
-        auto attn = softmax_.forward(engine, *S);
+        auto attn = softmax_.forward(*S);
         if (!attn) return std::unexpected(attn.error());
         // O_re = batched_matmul(V_cat, A, BH, false, true) → (batch*H*d_k, W)
         // dsl::matmul(batch)：false,true → rows=V.rows(), cols=A.rows()/BH
@@ -519,7 +528,7 @@ public:
         // O = rearrange back → (d_model, batch·W)
         auto O = engine.rearrange_3d(*O_re, H_dk, batch, window_, true);
         if (!O) return std::unexpected(O.error());
-        auto out_attn = w_o_.forward(engine, *O);
+        auto out_attn = w_o_.forward(*O);
         if (!out_attn) return out_attn;
 
         auto r2 = dsl::compute(engine,
@@ -529,9 +538,9 @@ public:
         if (!checkpoint_mode_)
             residual2_cache_ = *r2;
 
-        auto n2 = norm2_->forward(engine, *r2);
+        auto n2 = norm2_->forward(*r2);
         if (!n2) return n2;
-        auto f = ff_.forward(engine, *n2);
+        auto f = ff_.forward(*n2);
         if (!f) return f;
 
         if (!checkpoint_mode_)
@@ -549,15 +558,16 @@ public:
     // 反向：grad_output (d_model, batch·W)；grad_C_out 累加记忆 C 的梯度
     // 返回对局部输入 Y 的梯度 (d_model, batch·W)
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output, Tensor& grad_C_out)
+        const Tensor& grad_output, Tensor& grad_C_out)
     {
+        ComputeEngine& engine = engine_ref();
         const std::size_t batch = batch_cache_;
         const std::size_t H_dk = num_heads_ * d_k_;
         const std::size_t BH = batch * num_heads_;
 
-        auto grad_ff = ff_.backward(engine, grad_output);
+        auto grad_ff = ff_.backward(grad_output);
         if (!grad_ff) return grad_ff;
-        auto b_n2 = norm2_->backward(engine, *grad_ff);
+        auto b_n2 = norm2_->backward(*grad_ff);
         if (!b_n2) return b_n2;
         auto grad_r1 = dsl::compute(engine,
             dsl::leaf(grad_output) + dsl::leaf(*b_n2),
@@ -565,7 +575,7 @@ public:
         if (!grad_r1) return std::unexpected(grad_r1.error());
 
         // ── 联合注意力反向（materialized 路径） ──
-        auto grad_O = w_o_.backward(engine, *grad_r1);   // (d_model, batch·W)
+        auto grad_O = w_o_.backward(*grad_r1);   // (d_model, batch·W)
         if (!grad_O) return grad_O;
         auto grad_concat_re = engine.rearrange_3d(*grad_O, H_dk, batch, window_, false);
         if (!grad_concat_re) return std::unexpected(grad_concat_re.error());
@@ -582,7 +592,7 @@ public:
             dsl::matmul(*grad_concat_re, V_cat_cache_, true, false, BH),
             BH * grad_concat_re->cols(), V_cat_cache_.cols());
         if (!grad_A) return std::unexpected(grad_A.error());
-        auto grad_S = softmax_.backward(engine, *grad_A);
+        auto grad_S = softmax_.backward(*grad_A);
         if (!grad_S) return std::unexpected(grad_S.error());
         // grad_Q_re = batched_matmul(K_cat, grad_S, BH, false, true, scale) → (batch*H*d_k, W)
         //   alpha 经 rparam 尾链（matmul 累加后乘；不进 expr_spec_key）
@@ -623,15 +633,15 @@ public:
         // ── 局部路径梯度 ──
         auto grad_Q = engine.rearrange_3d(*grad_Q_re, H_dk, batch, window_, true);
         if (!grad_Q) return std::unexpected(grad_Q.error());
-        auto gq = w_q_.backward(engine, *grad_Q);
+        auto gq = w_q_.backward(*grad_Q);
         if (!gq) return gq;
         auto grad_Ky = engine.rearrange_3d(k_split->second, H_dk, batch, window_, true);
         if (!grad_Ky) return std::unexpected(grad_Ky.error());
-        auto gk = w_k_.backward(engine, *grad_Ky);
+        auto gk = w_k_.backward(*grad_Ky);
         if (!gk) return gk;
         auto grad_Vy = engine.rearrange_3d(v_split->second, H_dk, batch, window_, true);
         if (!grad_Vy) return std::unexpected(grad_Vy.error());
-        auto gv = w_v_.backward(engine, *grad_Vy);
+        auto gv = w_v_.backward(*grad_Vy);
         if (!gv) return gv;
         auto g_attn = dsl::compute(engine,
             dsl::leaf(*gq) + dsl::leaf(*gk),
@@ -641,7 +651,7 @@ public:
             dsl::leaf(*g_attn) + dsl::leaf(*gv),
             g_attn->rows(), g_attn->cols());
         if (!grad_n1) return std::unexpected(grad_n1.error());
-        auto b_n1 = norm1_->backward(engine, *grad_n1);
+        auto b_n1 = norm1_->backward(*grad_n1);
         if (!b_n1) return b_n1;
         auto grad_x = dsl::compute(engine,
             dsl::leaf(*grad_r1) + dsl::leaf(*b_n1),
@@ -651,11 +661,11 @@ public:
         // ── 记忆路径梯度（累加进 grad_C_out） ──
         auto grad_Kc = engine.rearrange_3d(k_split->first, H_dk, batch, memory_, true);
         if (!grad_Kc) return std::unexpected(grad_Kc.error());
-        auto gkc = w_kc_.backward(engine, *grad_Kc);
+        auto gkc = w_kc_.backward(*grad_Kc);
         if (!gkc) return gkc;
         auto grad_Vc = engine.rearrange_3d(v_split->first, H_dk, batch, memory_, true);
         if (!grad_Vc) return std::unexpected(grad_Vc.error());
-        auto gvc = w_vc_.backward(engine, *grad_Vc);
+        auto gvc = w_vc_.backward(*grad_Vc);
         if (!gvc) return gvc;
         // grad_C_out += gkc + gvc：两路累加在单个 compute_into 表达式中原地完成
         // （目标传递；grad_C_out 是调用方持有的累加缓冲，原地写符合其语义且不额外分配）
@@ -807,7 +817,7 @@ public:
         }
     }
 
-    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
         // 初始化 token_emb_——M2 声明式：N(0, 0.02) 层算参数、引擎填数
         constexpr Scalar emb_init_std = 0.02;
@@ -902,8 +912,9 @@ public:
     }
 
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) override
+        const Tensor& input) override
     {
+        ComputeEngine& engine = engine_ref();
         const std::size_t seq_len = seq_len_;   // ZiPT 固定 seq_len_；输入必须等于配置长度
         const std::size_t batch = input.cols();
         if (input.rows() != seq_len_)
@@ -931,14 +942,14 @@ public:
         {
             auto split = split_history_window_(engine, x, batch, seq_len_, hist_len_, window_);
             if (!split) return std::unexpected(split.error());
-            auto c_res = compressor_.forward(engine, split->first);   // H → C (d, batch·M)
+            auto c_res = compressor_.forward(split->first);   // H → C (d, batch·M)
             if (!c_res) return c_res;
             C = std::move(*c_res);
             block_input = std::move(split->second);                   // W_seq (d, batch·W)
         }
         else
         {
-            auto c_res = compressor_.forward(engine, x);              // W=L 模式：压缩整条 X
+            auto c_res = compressor_.forward(x);              // W=L 模式：压缩整条 X
             if (!c_res) return c_res;
             C = std::move(*c_res);
             block_input = x;
@@ -958,25 +969,26 @@ public:
         }
         for (auto& b : blocks_)
         {
-            auto r = b.forward(engine, block_input, C);
+            auto r = b.forward(block_input, C);
             if (!r) return r;
             block_input = std::move(*r);
         }
 
-        auto ln = ln_f_->forward(engine, block_input);
+        auto ln = ln_f_->forward(block_input);
         if (!ln) return ln;
-        return lm_head_.forward(engine, *ln);
+        return lm_head_.forward(*ln);
     }
 
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output) override
+        const Tensor& grad_output) override
     {
+        ComputeEngine& engine = engine_ref();
         const std::size_t seq_len = seq_len_;
         const std::size_t batch = batch_size_;
 
-        auto b_lm = lm_head_.backward(engine, grad_output);
+        auto b_lm = lm_head_.backward(grad_output);
         if (!b_lm) return b_lm;
-        auto b_ln = ln_f_->backward(engine, *b_lm);
+        auto b_ln = ln_f_->backward(*b_lm);
         if (!b_ln) return b_ln;
         Tensor grad_w = std::move(*b_ln);   // (d_model, batch·W) 块输出梯度
 
@@ -986,7 +998,7 @@ public:
 
         for (std::size_t i = blocks_.size(); i-- > 0;)
         {
-            auto br = blocks_[i].backward(engine, grad_w, grad_C);
+            auto br = blocks_[i].backward(grad_w, grad_C);
             if (!br) return br;
             grad_w = std::move(*br);
         }
@@ -995,7 +1007,7 @@ public:
         if (split_)
         {
             // 压缩器反向：grad_C → 对历史 H 的梯度 (d, batch·C)
-            auto gxh = compressor_.backward(engine, grad_C);
+            auto gxh = compressor_.backward(grad_C);
             if (!gxh) return gxh;
             // 合并 [grad_H ; grad_W] → (d, batch·L)
             auto merged = merge_history_window_(engine, *gxh, grad_w,
@@ -1006,7 +1018,7 @@ public:
         else
         {
             // W=L 模式：压缩器对整条 X 的梯度与块梯度同形状，直接累加
-            auto gxc = compressor_.backward(engine, grad_C);
+            auto gxc = compressor_.backward(grad_C);
             if (!gxc) return gxc;
             auto gx_sum = dsl::compute(engine,
                 dsl::leaf(grad_w) + dsl::leaf(*gxc),
@@ -1074,7 +1086,7 @@ public:
             auto in_t = detail::upload_span(engine, seq_len_, 1, Precision::F32,
                                             std::span(in));
             if (!in_t) return std::unexpected(in_t.error());
-            auto logits = forward(engine, *in_t);
+            auto logits = forward(*in_t);
             if (!logits) return std::unexpected(logits.error());
             auto lm_v = detail::download_vector(engine, *logits);
             if (!lm_v) return std::unexpected(lm_v.error());

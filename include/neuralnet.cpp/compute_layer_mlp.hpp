@@ -41,7 +41,7 @@ public:
     Linear(std::size_t in_features, std::size_t out_features)
         : in_features_(in_features), out_features_(out_features) {}
 
-    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
         // ── 声明式初始化（M2，17 §4.4）：层算分布参数，引擎填数 ──────────
         // Xavier 均匀分布；精度 = p_.param（§9.2：f16 配置按 p_.param 舍入
@@ -83,8 +83,9 @@ public:
     // ── forward: 一行代码，精度由 p_.compute 决定 ──────────────────────
     // 引擎内部处理 matmul + broadcast bias 的精度问题
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) override
+        const Tensor& input) override
     {
+        ComputeEngine& engine = engine_ref();
         if (input.rows() != w_.cols())
             return std::unexpected(Error{"linear forward: input shape mismatch"});
 
@@ -102,8 +103,9 @@ public:
 
     // ── backward: 同样简洁，精度由引擎处理 ────────────────────────────
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output) override
+        const Tensor& grad_output) override
     {
+        ComputeEngine& engine = engine_ref();
         if (grad_output.rows() != w_.rows())
             return std::unexpected(Error{"linear backward: grad_output shape mismatch"});
 
@@ -173,8 +175,9 @@ public:
     // ReLU 算法由 Layer 表达为 Max 原语 + 标量 0
     // Engine/Shader 只提供 Max 原语，不知道 "ReLU" 是什么
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) override
+        const Tensor& input) override
     {
+        ComputeEngine& engine = engine_ref();
         if (!checkpoint_mode_)
             input_cache_ = input;
         return dsl::compute(engine,
@@ -186,8 +189,9 @@ public:
     // ReLU 反向算法由 Layer 表达为 Select + Gt 原语
     // Engine/Shader 只提供 Select/Gt 原语，不知道 "ReLU backward" 是什么
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output) override
+        const Tensor& grad_output) override
     {
+        ComputeEngine& engine = engine_ref();
         if (input_cache_.rows() != grad_output.rows() ||
             input_cache_.cols() != grad_output.cols())
             return std::unexpected(Error{"relu backward: shape mismatch"});
@@ -237,8 +241,9 @@ public:
     // 单个 GPU 融合 kernel（仅 input/output 落显存，无中间 Tensor）。表达式
     // 文本只写在本 Layer；AOT 收集由 scan_exprs dry-run 本方法完成。
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) override
+        const Tensor& input) override
     {
+        ComputeEngine& engine = engine_ref();
         if (!checkpoint_mode_)
             input_cache_ = input;
         const Scalar beta = BETA;
@@ -253,8 +258,9 @@ public:
     // 单表达式 DSL 融合：sigmoid 用 input_cache_ 重算（不缓存，省显存），
     // βx 子表达式由 DSL 的 CSE 复用，消除中间 Tensor。
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output) override
+        const Tensor& grad_output) override
     {
+        ComputeEngine& engine = engine_ref();
         if (input_cache_.rows() != grad_output.rows() ||
             input_cache_.cols() != grad_output.cols())
             return std::unexpected(Error{"gelu backward: shape mismatch"});
@@ -315,8 +321,9 @@ public:
     // 输入（gate = row_access(in, 0, d_ff)，up = row_access(in, d_ff, d_ff)），
     // 行视图零拷贝、不物化半张量（无 D2D 拷贝）。输出 (d_ff, batch)。
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) override
+        const Tensor& input) override
     {
+        ComputeEngine& engine = engine_ref();
         const std::uint32_t dff = static_cast<std::uint32_t>(d_ff_);
         if (!checkpoint_mode_)
             input_cache_ = input;
@@ -346,8 +353,9 @@ public:
     // （共享的 gate/s 子表达式在树型 DSL 中会重复折叠，故 EXPR_MAX_REGS/INPUTS
     //   已相应放宽，换取零中间张量、零拷贝。）
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output) override
+        const Tensor& grad_output) override
     {
+        ComputeEngine& engine = engine_ref();
         const std::uint32_t dff = static_cast<std::uint32_t>(d_ff_);
         const std::size_t rows = 2 * d_ff_;
         const std::size_t cols = grad_output.cols();
@@ -413,7 +421,7 @@ public:
     explicit LayerNorm(std::size_t normalized_shape, Scalar epsilon = EPSILON)
         : normalized_shape_(normalized_shape), epsilon_(epsilon) {}
 
-    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
         // gamma 初始化为 1, beta 初始化为 0（M2 声明式：引擎填数）
         gamma_ = engine.create_tensor(normalized_shape_, 1, p_.param, InitSpec::constant(1));
@@ -464,8 +472,9 @@ public:
     //   6. normalized=diff * std_inv (col 广播)            → (F,B) 融合逐元素
     //   7. out      = normalized*gamma + beta (row 广播)   → (F,B) 融合逐元素
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) override
+        const Tensor& input) override
     {
+        ComputeEngine& engine = engine_ref();
         if (input.rows() != normalized_shape_)
             return std::unexpected(Error{"layernorm forward: input shape mismatch"});
 
@@ -533,8 +542,9 @@ public:
     // 单表达式融合（融合表达式 F 无关，1/F 在 (1,B) 上用原语施加）：
     //   mean_g/mean_gn 为列归约向量输出；(F,B) 全尺寸中间量由融合 kernel 消解。
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output) override
+        const Tensor& grad_output) override
     {
+        ComputeEngine& engine = engine_ref();
         const Scalar inv_features = Scalar{1} / static_cast<Scalar>(normalized_shape_);
         const std::size_t F = normalized_shape_;
         const std::size_t B = grad_output.cols();
@@ -631,7 +641,7 @@ public:
     explicit RMSNorm(std::size_t normalized_shape, Scalar epsilon = EPSILON)
         : normalized_shape_(normalized_shape), epsilon_(epsilon) {}
 
-    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
         // gamma 初始化为 1（无 beta）——M2 声明式：引擎填数
         gamma_ = engine.create_tensor(normalized_shape_, 1, p_.param, InitSpec::constant(1));
@@ -677,8 +687,9 @@ public:
     //   3. normed = x * rms_inv (col 广播)                 → (F,B) 融合逐元素
     //   4. out    = normed * gamma (row 广播)              → (F,B) 融合逐元素
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) override
+        const Tensor& input) override
     {
+        ComputeEngine& engine = engine_ref();
         if (input.rows() != normalized_shape_)
             return std::unexpected(Error{"rmsnorm forward: input shape mismatch"});
 
@@ -724,8 +735,9 @@ public:
     //   grad_x   = (gy - m*normed) * rms_inv               → (F,B) 融合逐元素
     //   grad_gamma += row_reduce_sum(gy ⊙ normed)          → (F,1) 归约向量输出
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output) override
+        const Tensor& grad_output) override
     {
+        ComputeEngine& engine = engine_ref();
         const Scalar inv_features = Scalar{1} / static_cast<Scalar>(normalized_shape_);
         const std::size_t F = normalized_shape_;
         const std::size_t B = grad_output.cols();

@@ -4,7 +4,7 @@
 //
 // 架构铁律：
 //   1. Model 持有 observer_ptr<ComputeEngine>（非拥有），所有 forward/backward 委托给
-//      Layer::forward(engine, Tensor) / Layer::backward(engine, Tensor)。
+//      Layer::forward(Tensor) / Layer::backward(Tensor)（M6 段 C 起 engine 由 init 绑定，不再作形参）。
 //   2. Model 不包含任何 GPU-resident 中间结果缓存或 forward_gpu/backward_gpu
 //      路径 —— 设备分发完全由 ComputeEngine 实现负责。
 //   3. forward/backward 操作 Tensor，单套实现适配 CPU/GPU。
@@ -190,7 +190,7 @@ public:
         Tensor x = input;
         for (auto& layer : layers_)
         {
-            auto r = layer->forward(*engine_, x);
+            auto r = layer->forward(x);
             if (!r) return std::unexpected(r.error());
             x = std::move(*r);
         }
@@ -208,7 +208,7 @@ public:
         Tensor g = grad_output;
         for (std::size_t i = layers_.size(); i-- > 0;)
         {
-            auto r = layers_[i]->backward(*engine_, g);
+            auto r = layers_[i]->backward(g);
             if (!r) return std::unexpected(r.error());
             g = std::move(*r);
         }
@@ -255,7 +255,7 @@ public:
     {
         for (auto& layer : layers_)
         {
-            auto r = layer->zero_grad(*engine_);
+            auto r = layer->zero_grad();
             if (!r) return r;
         }
         return {};

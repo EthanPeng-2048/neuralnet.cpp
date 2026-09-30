@@ -63,7 +63,7 @@ Matrix run_forward(ComputeEngine& eng, GPTModel& model,
     std::vector<std::size_t> ids(doc0);
     ids.insert(ids.end(), doc1.begin(), doc1.end());
     model.set_doc_ids(ids);
-    auto y = model.forward(eng, *x);
+    auto y = model.forward(*x);
     if (!y) { std::cerr << "  forward 失败: " << y.error().message << "\n"; std::abort(); }
 
     auto m = eng.to_matrix(*y);

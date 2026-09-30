@@ -100,6 +100,7 @@ int main(int argc, char* argv[])
     {
         nn::RotaryEmbedding rope(dk);
         rope.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+        (void)rope.init(engine);   // M6 段 C：层由 init 绑定引擎
         nn::Tensor q = scan_tensor(2 * dk, 8);   // rows 为 dk 的整数倍
         (void)rope.apply(engine, q, /*seq=*/8, /*backward=*/false);
         (void)rope.apply(engine, q, /*seq=*/8, /*backward=*/true);
@@ -115,10 +116,11 @@ int main(int argc, char* argv[])
         const std::size_t R = 6, C = 9;
         nn::ReLU relu;
         relu.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+        (void)relu.init(engine);   // M6 段 C：层由 init 绑定引擎
         nn::Tensor input = scan_tensor(R, C);
-        (void)relu.forward(engine, input);
+        (void)relu.forward(input);
         nn::Tensor grad = scan_tensor(R, C);
-        (void)relu.backward(engine, grad);
+        (void)relu.backward(grad);
     }
 
     // ── SwiGLU backward（grad_gate / grad_up 两条内联表达式）──────────────
@@ -127,10 +129,11 @@ int main(int argc, char* argv[])
         const std::size_t d_ff = 8;
         nn::SwiGLU swiglu(d_ff);
         swiglu.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+        (void)swiglu.init(engine);   // M6 段 C：层由 init 绑定引擎
         nn::Tensor input = scan_tensor(2 * d_ff, 5);
-        (void)swiglu.forward(engine, input);
+        (void)swiglu.forward(input);
         nn::Tensor grad = scan_tensor(d_ff, 5);
-        (void)swiglu.backward(engine, grad);
+        (void)swiglu.backward(grad);
     }
 
     // ── GeLU forward + backward（QuickGeLU 单表达式 DSL 融合）─────────────
@@ -141,10 +144,11 @@ int main(int argc, char* argv[])
         const std::size_t R = 6, C = 9;
         nn::GeLU gelu;
         gelu.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+        (void)gelu.init(engine);   // M6 段 C：层由 init 绑定引擎
         nn::Tensor input = scan_tensor(R, C);
-        (void)gelu.forward(engine, input);
+        (void)gelu.forward(input);
         nn::Tensor grad = scan_tensor(R, C);
-        (void)gelu.backward(engine, grad);
+        (void)gelu.backward(grad);
     }
 
     // ── Softmax forward + backward（行归约融合）────────────────────────
@@ -155,10 +159,11 @@ int main(int argc, char* argv[])
         const std::size_t R = 6, C = 9;
         nn::Softmax softmax;
         softmax.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+        (void)softmax.init(engine);   // M6 段 C：层由 init 绑定引擎
         nn::Tensor input = scan_tensor(R, C);
-        (void)softmax.forward(engine, input);   // 填充 output_cache_ + 登记 fwd 结构
+        (void)softmax.forward(input);   // 填充 output_cache_ + 登记 fwd 结构
         nn::Tensor grad = scan_tensor(R, C);
-        (void)softmax.backward(engine, grad);   // 登记 bwd 结构
+        (void)softmax.backward(grad);   // 登记 bwd 结构
     }
 
     // ── RMSNorm forward + backward（融合）────────────────────
@@ -170,9 +175,9 @@ int main(int argc, char* argv[])
         rms.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
         (void)rms.init(engine);
         nn::Tensor input = scan_tensor(F, B);
-        (void)rms.forward(engine, input);       // 填充 normed/rms_inv 缓存 + 登记 fwd 结构
+        (void)rms.forward(input);       // 填充 normed/rms_inv 缓存 + 登记 fwd 结构
         nn::Tensor grad = scan_tensor(F, B);
-        (void)rms.backward(engine, grad);       // 登记 bwd 结构
+        (void)rms.backward(grad);       // 登记 bwd 结构
     }
 
     // ── LayerNorm forward + backward（融合）──────────────────
@@ -184,9 +189,9 @@ int main(int argc, char* argv[])
         ln.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
         (void)ln.init(engine);
         nn::Tensor input = scan_tensor(F, B);
-        (void)ln.forward(engine, input);
+        (void)ln.forward(input);
         nn::Tensor grad = scan_tensor(F, B);
-        (void)ln.backward(engine, grad);
+        (void)ln.backward(grad);
     }
 
     // ── ReLULinearAttention forward + backward（RLA 原语组合版逐元素链）──
@@ -202,9 +207,9 @@ int main(int argc, char* argv[])
         attn.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
         (void)attn.init(engine);
         nn::Tensor x = scan_tensor(d_model, batch * seq);
-        (void)attn.forward(engine, x);                       // 填 cache + 登记 fwd 结构
+        (void)attn.forward(x);                       // 填 cache + 登记 fwd 结构
         nn::Tensor grad = scan_tensor(d_model, batch * seq);
-        (void)attn.backward(engine, grad);                   // 登记 bwd 结构
+        (void)attn.backward(grad);                   // 登记 bwd 结构
     }
 
     // ── ReLULinearAttention（**双向** causal=false）forward + backward ───
@@ -218,9 +223,9 @@ int main(int argc, char* argv[])
         attn_nc.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
         (void)attn_nc.init(engine);
         nn::Tensor x = scan_tensor(d_model, batch * seq);
-        (void)attn_nc.forward(engine, x);
+        (void)attn_nc.forward(x);
         nn::Tensor grad = scan_tensor(d_model, batch * seq);
-        (void)attn_nc.backward(engine, grad);
+        (void)attn_nc.backward(grad);
     }
 
     // ── GPTBlock forward + backward（残差相加 A+B）────────────────────────
@@ -232,9 +237,9 @@ int main(int argc, char* argv[])
         block.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
         (void)block.init(engine);
         nn::Tensor x = scan_tensor(d_model, batch * seq);
-        (void)block.forward(engine, x);
+        (void)block.forward(x);
         nn::Tensor grad = scan_tensor(d_model, batch * seq);
-        (void)block.backward(engine, grad);
+        (void)block.backward(grad);
     }
 
     // ── TransformerEncoderLayer forward + backward（残差相加 + 位置编码）──
@@ -244,15 +249,15 @@ int main(int argc, char* argv[])
         enc.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
         (void)enc.init(engine);
         nn::Tensor x = scan_tensor(d_model, batch * seq);
-        (void)enc.forward(engine, x);
+        (void)enc.forward(x);
         nn::Tensor grad = scan_tensor(d_model, batch * seq);
-        (void)enc.backward(engine, grad);
+        (void)enc.backward(grad);
     }
 
     // ── ZiPTBlock forward + backward（双输入块：残差相加 + 注意力梯度累加）──
     // ⚠ dry-run 调用必须使用真实签名并检查返回值：这里必须调**双参**
-    //   forward(engine, input, memory_input)，单参版返回错误
-    //   （"use forward(engine, input, memory_input)"）。用 (void) 吞错会让
+    //   forward(input, memory_input)，单参版返回错误
+    //   （"use forward(input, memory_input)"）。用 (void) 吞错会让
     //   dry-run 静默跑不到真实路径，块内新表达式在 GPU 上闭合世界硬报错才暴露。
     // 失败带栈 abort（同 CSA 风格）。
     {
@@ -263,7 +268,7 @@ int main(int argc, char* argv[])
         (void)zipt.init(engine);
         nn::Tensor x = scan_tensor(d_model, win);        // 局部窗口输入（batch=1）
         nn::Tensor mem_in = scan_tensor(d_model, mem);   // 记忆输入
-        auto fr = zipt.forward(engine, x, mem_in);
+        auto fr = zipt.forward(x, mem_in);
         if (!fr)
         {
             std::fprintf(stderr, "[scan] ZiPTBlock forward FAILED: %s\n",
@@ -273,7 +278,7 @@ int main(int argc, char* argv[])
         }
         nn::Tensor grad = scan_tensor(d_model, win);
         nn::Tensor grad_C = scan_tensor(d_model, mem);   // 记忆梯度累加目标
-        auto br = zipt.backward(engine, grad, grad_C);
+        auto br = zipt.backward(grad, grad_C);
         if (!br)
         {
             std::fprintf(stderr, "[scan] ZiPTBlock backward FAILED: %s\n",
@@ -345,9 +350,9 @@ int main(int argc, char* argv[])
         linear.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
         (void)linear.init(engine);
         nn::Tensor input = scan_tensor(in_f, B);
-        (void)linear.forward(engine, input);
+        (void)linear.forward(input);
         nn::Tensor grad_out = scan_tensor(out_f, B);
-        (void)linear.backward(engine, grad_out);   // 登记 grad_w 融合结构
+        (void)linear.backward(grad_out);   // 登记 grad_w 融合结构
     }
 
     // ── 算子融合二期（docs/development/02-operator-fusion.md）：matmul 参与 IR 融合 ──
@@ -442,7 +447,7 @@ int main(int argc, char* argv[])
             nn::Tensor x = scan_tensor(d_model, batch * seq);
             // 禁止 (void) 吞错：forward 失败会让缓存为空，backward 直接
             //   在 batched_matmul 读空张量上 NN_ASSERT（栈无上下文难定位）
-            auto fr = attn.forward(engine, x);
+            auto fr = attn.forward(x);
             if (!fr)
             {
                 std::fprintf(stderr, "[scan] CSA forward FAILED: %s\n",
@@ -451,7 +456,7 @@ int main(int argc, char* argv[])
                 std::abort();   // 带栈停在真凶处
             }
             nn::Tensor grad = scan_tensor(d_model, batch * seq);
-            auto br = attn.backward(engine, grad);
+            auto br = attn.backward(grad);
             if (!br)
             {
                 std::fprintf(stderr, "[scan] CSA backward FAILED: %s\n",
@@ -466,6 +471,7 @@ int main(int argc, char* argv[])
             nn::CausalSelfAttention attn(d_model, heads, /*max_len=*/1024,
                                          /*seq_len=*/seq, enc);
             attn.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+            (void)attn.init(engine);   // M6 段 C：层由 init 绑定引擎
             run_csa(attn);
         }
         // doc 变体（doc_ids 每位置文档 id，长度 = batch*seq）
@@ -474,6 +480,7 @@ int main(int argc, char* argv[])
             nn::CausalSelfAttention attn_d(d_model, heads, 1024, seq,
                                            nn::PosEncodingType::Learned);
             attn_d.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+            (void)attn_d.init(engine);   // M6 段 C：层由 init 绑定引擎
             attn_d.set_doc_ids(doc_ids);
             run_csa(attn_d);
         }
@@ -482,6 +489,7 @@ int main(int argc, char* argv[])
             nn::CausalSelfAttention attn_ad(d_model, heads, 1024, seq,
                                             nn::PosEncodingType::ALiBi);
             attn_ad.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+            (void)attn_ad.init(engine);   // M6 段 C：层由 init 绑定引擎
             attn_ad.set_doc_ids(doc_ids);
             run_csa(attn_ad);
         }
@@ -498,7 +506,7 @@ int main(int argc, char* argv[])
         attn.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
         (void)attn.init(engine);
         nn::Tensor x = scan_tensor(d_model, batch * seq);
-        auto fr = attn.forward(engine, x);
+        auto fr = attn.forward(x);
         if (!fr)
         {
             std::fprintf(stderr, "[scan] MHA forward FAILED: %s\n",
@@ -507,7 +515,7 @@ int main(int argc, char* argv[])
             std::abort();
         }
         nn::Tensor grad = scan_tensor(d_model, batch * seq);
-        auto br = attn.backward(engine, grad);
+        auto br = attn.backward(grad);
         if (!br)
         {
             std::fprintf(stderr, "[scan] MHA backward FAILED: %s\n",
@@ -545,7 +553,7 @@ int main(int argc, char* argv[])
         (void)conv.init(engine);
         const std::size_t oh = in_h - k + 1, ow = in_w - k + 1;
         nn::Tensor x = scan_tensor(c_in * in_h * in_w, batch);
-        if (auto fr = conv.forward(engine, x); !fr)
+        if (auto fr = conv.forward(x); !fr)
         {
             std::fprintf(stderr, "[scan] Conv2D forward FAILED: %s\n",
                          fr.error().message.c_str());
@@ -553,7 +561,7 @@ int main(int argc, char* argv[])
             std::abort();
         }
         nn::Tensor grad = scan_tensor(c_out * oh * ow, batch);
-        if (auto br = conv.backward(engine, grad); !br)
+        if (auto br = conv.backward(grad); !br)
         {
             std::fprintf(stderr, "[scan] Conv2D backward FAILED: %s\n",
                          br.error().message.c_str());
@@ -572,10 +580,11 @@ int main(int argc, char* argv[])
         const std::size_t c = 2, in_h = 6, in_w = 6, pool = 2, stride = 2, batch = 2;
         nn::MaxPool2D mp(c, in_h, in_w, pool, stride);
         mp.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+        (void)mp.init(engine);   // M6 段 C：层由 init 绑定引擎
         const std::size_t oh = (in_h - pool) / stride + 1;
         const std::size_t ow = (in_w - pool) / stride + 1;
         nn::Tensor x = scan_tensor(c * in_h * in_w, batch);
-        if (auto fr = mp.forward(engine, x); !fr)
+        if (auto fr = mp.forward(x); !fr)
         {
             std::fprintf(stderr, "[scan] MaxPool2D forward FAILED: %s\n",
                          fr.error().message.c_str());
@@ -583,7 +592,7 @@ int main(int argc, char* argv[])
             std::abort();
         }
         nn::Tensor grad = scan_tensor(c * oh * ow, batch);
-        if (auto br = mp.backward(engine, grad); !br)
+        if (auto br = mp.backward(grad); !br)
         {
             std::fprintf(stderr, "[scan] MaxPool2D backward FAILED: %s\n",
                          br.error().message.c_str());

@@ -137,7 +137,7 @@ public:
         }
     }
 
-    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
         if (shape_invalid_)
             return std::unexpected(Error{"Conv2D: kernel 过大 (kernel > in + 2*padding)"});
@@ -175,8 +175,9 @@ public:
     // 全程引擎原语 + DSL：窗口展开在 im2col 原语内完成（CPU/GPU 各自实现），
     // 无 to_matrix/from_matrix 往返、无 CPU 标量循环。
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) override
+        const Tensor& input) override
     {
+        ComputeEngine& engine = engine_ref();
         if (shape_invalid_)
             return std::unexpected(Error{"Conv2D: kernel 过大 (kernel > in + 2*padding)"});
         if (input.rows() != in_channels_ * in_h_ * in_w_)
@@ -209,8 +210,9 @@ public:
 
     // ── backward ───────────────────────────────────────────────────────
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output) override
+        const Tensor& grad_output) override
     {
+        ComputeEngine& engine = engine_ref();
         if (shape_invalid_)
             return std::unexpected(Error{"Conv2D: kernel 过大 (kernel > in + 2*padding)"});
         if (grad_output.rows() != out_channels_ * out_h_ * out_w_)
@@ -355,8 +357,9 @@ public:
 
     // ── forward ─────────────────────────────────────────────────────────
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) override
+        const Tensor& input) override
     {
+        ComputeEngine& engine = engine_ref();
         if (shape_invalid_)
             return std::unexpected(Error{"MaxPool2D: pool 窗口大于输入尺寸"});
         if (input.rows() != channels_ * in_h_ * in_w_)
@@ -405,8 +408,9 @@ public:
 
     // ── backward: 按窗口 mask 散射（重叠窗在 col2im 内累加）──────────────
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output) override
+        const Tensor& grad_output) override
     {
+        ComputeEngine& engine = engine_ref();
         if (shape_invalid_)
             return std::unexpected(Error{"MaxPool2D: pool 窗口大于输入尺寸"});
         if (grad_output.rows() != channels_ * out_h_ * out_w_)

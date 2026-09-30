@@ -102,7 +102,7 @@ int off_run_test()
     Matrix baseline_logits;
     std::vector<Matrix> baseline_grads;
     {
-        auto r = model.forward(eng, *x);
+        auto r = model.forward(*x);
         if (!r) { std::cerr << "baseline forward failed: " << r.error().message << "\n"; return 1; }
         auto lm = eng.to_matrix(*r);
         if (!lm) { std::cerr << "to_matrix(logits) failed\n"; return 1; }
@@ -113,7 +113,7 @@ int off_run_test()
             auto rz = eng.zero(g.get());
             if (!rz) { std::cerr << "baseline zero failed\n"; return 1; }
         }
-        auto b = model.backward(eng, *go);
+        auto b = model.backward(*go);
         if (!b) { std::cerr << "baseline backward failed: " << b.error().message << "\n"; return 1; }
         for (auto& g : model.param_gradients())
         {
@@ -128,7 +128,7 @@ int off_run_test()
 
     // ── 开启 offload，重跑并对比 ──
     model.set_activation_offload(true);
-    auto r = model.forward(eng, *x);
+    auto r = model.forward(*x);
     if (!r) { std::cerr << "offload forward failed: " << r.error().message << "\n"; return 1; }
     auto lm = eng.to_matrix(*r);
     if (!lm) { std::cerr << "to_matrix(logits) failed\n"; return 1; }
@@ -141,7 +141,7 @@ int off_run_test()
         auto rz = eng.zero(g.get());
         if (!rz) { std::cerr << "zero failed\n"; return 1; }
     }
-    auto b = model.backward(eng, *go);
+    auto b = model.backward(*go);
     if (!b) { std::cerr << "offload backward failed: " << b.error().message << "\n"; return 1; }
 
     const auto& grads = model.param_gradients();
