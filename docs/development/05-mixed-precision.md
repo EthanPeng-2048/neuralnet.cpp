@@ -198,6 +198,7 @@ enum class Precision : uint8_t
 ```cpp
 engine.create_tensor(rows, cols, P)           // 张量创建唯一入口（M1 起
                                              // Tensor::cpu 等静态工厂收归引擎私有）
+engine.create_tensor(rows, cols, P, InitSpec) // 声明式初值（M2 起，17 §4.4；分布 seed 必填）
 GpuTensor<P>::create_empty(rows, cols, backend)
 Matrix<P>(rows, cols[, value])
 engine.from_matrix(const Matrix& m, P)        // 宿主上传（I/O 分组）；P 显式

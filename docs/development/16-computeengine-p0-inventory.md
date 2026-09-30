@@ -96,11 +96,15 @@
 ## 6. run-to-run 稳定性实测（D9，探针 `gpu_stability_probe`）
 
 工具：`src/gpu_stability_probe.cpp`（新增，app 目标）。单进程内两轮完全相同的
-微型 GPT 训练（init 后固定公式覆写全部参数，绕开 `thread_local rng(random_device)`），
+微型 GPT 训练（init 后固定公式覆写全部参数——P0 时为绕开 `thread_local rng(random_device)`；
+M2（17 §5）起 init 已收编为确定性 InitSpec，覆写保留以**隔离 init 变量**、只测后端执行确定性），
 比对每步 loss（%.9g）与全参数 FNV-1a 校验和；退出码 0=逐位一致 / 1=非确定 / 2=错误。
+M2 新增 `--init-hash` 模式：只建模型不训练，比 6 类模型（mlp/cnn/transformer/gpt/zipt/rapt）
+的**初值**确定性（M2 专属验收，见 17 §5 M2 行）。
 
 ```bash
 build/gpu_stability_probe --steps 20            # CPU
+build/gpu_stability_probe --init-hash           # 初值确定性（M2；跨进程 grep '^INIT1' | diff）
 build/gpu_stability_probe --gpu 1 --steps 20    # 指定 GPU
 # 跨进程比对：两次启动后 grep -E '^(CONFIG|run1)' | diff -
 ```

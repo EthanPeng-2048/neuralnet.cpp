@@ -3,7 +3,8 @@
 > **本文是新总纲**：吸收并取代 `15-computeengine-refresh.md` 未实施的 P2-P6（本文 §5 分期），
 > 并对 `13-refactor-backlog.md` §10.8 增补"访问不变量"注脚。历史归档见 `docs/history.md`。
 > 状态：**设计裁定已完成（§3 共 10 项）；M1 访问收口已实施（2026-09-30，验收与
-> 过程见 §5 M1 行 + `docs/history.md`），M2-M7 未实施**。实施立项时读本文 + §5 分期 + 源码现状。
+> 过程见 §5 M1 行 + `docs/history.md`）；M2 声明式初始化已实施（2026-09-30，
+> 见 §5 M2 行），M3-M7 未实施**。实施立项时读本文 + §5 分期 + 源码现状。
 > 前置工程成果保留不动：15 的 P-1（PrecisionEngine 下沉）、P1（张量出生绑定）已落地（15 §7.1）。
 
 ## 0. 一句话
@@ -20,8 +21,8 @@
 3. 底层因此双轨并行：上层（Layer/Model/Loss）已用父类+继承收口，底层（Tensor/存储/内存）
    却是"静态工厂直构 + 公开存储访问 + GPU 专属内存池"的松散组合。
 
-**现状事实**（可复现，2026-09-30 核对；**M1 实施前口径**——M1 落地后库外直构/直读已归零，
-下表保留为动机证据，复现命令仍可跑但库外命中应为 0）：
+**现状事实**（可复现，2026-09-30 核对；**M1/M2 实施前口径**——M1 落地后库外直构/直读已归零、
+M2 落地后 init RNG 已收编，下表保留为动机证据，复现命令仍可跑但库外命中应为 0、init 站点应无 `random_device`）：
 
 | 事实 | 数字 | 复现 |
 |---|---|---|
@@ -31,7 +32,7 @@
 | `Tensor` 静态直构工厂（`Tensor::from_matrix/cpu/...`） | 98 处 / 8 文件（2026-09-30 复核；库外为主，15 §1 口径同源） | `Select-String` 两个 pattern（`Tensor::from_matrix`、`Tensor::cpu\b`）扫 `src/*_test.cpp`，命中行和 = 98 |
 | 内存池 | 仅 Vulkan：`backend/compute_memory_pool.hpp`（`GpuBackend` 持双池 memory/transient）；`backend/compute_staging_ring.hpp:56/93/104/232` 与 `compute_vk_backend.hpp` 亦引用，均 Vulkan 后端 | `grep -rn MemoryPool include/` |
 | CPU 池 | **不存在**：`Matrix` 直接 `std::vector`；`pool_stats()` CPU 返回空串（`compute_engine.hpp:144`） | 读引擎默认实现 |
-| init RNG | 混乱：固定 seed 42 = `gpt:432/603`、`rapt:1155`、`zipt:814`；`std::random_device{}`（**跨进程不确定**）= `gpt:953`、`mlp:40`、`conv:107`、`zipt:89/1044`、`rapt:1462` | `grep -rn mt19937 include/` |
+| init RNG | 混乱：固定 seed 42 = `gpt:432/603`、`rapt:1155`、`zipt:814`；`std::random_device{}`（**跨进程不确定**）= `gpt:953`、`mlp:40`、`conv:107`、`zipt:89/1044`、`rapt:1462`（**M2 已收编**：init 站点全迁 InitSpec + 显式 seed；余下 `gpt:953`/`zipt:1044`/`rapt:1462` 为 `generate()` **采样** RNG——运行期采样随机性非 init，M2 裁定不动） | `grep -rn mt19937 include/` |
 | 读 GPU 张量 | `to_matrix` 是唯一 PCIe 下载点；`ensure_gpu` 43 处隐式上传（15 §1） | `grep -n "= ensure_gpu(" compute_gpu_engine.hpp` |
 | Layer init 模式 | 层内 `Matrix` 填数 → `engine.from_matrix` 上传（如 `compute_layer_mlp.hpp:46-64`） | 读 `Layer::init` |
 
@@ -99,7 +100,7 @@
 
 | 能力 | 提议 API | 说明 |
 |---|---|---|
-| 创建（含初始化） | `create_tensor(rows, cols, P, InitSpec)` | 扩展现有 `create_tensor`（`compute_engine.hpp:215`）；默认语义对齐现状零填充，`Uninitialized` 契约沿用 `cpu_uninitialized` 注释 |
+| 创建（含初始化） | `create_tensor(rows, cols, P, InitSpec)` | 扩展现有 `create_tensor`（`compute_engine.hpp:215`）；**M2 实施口径**：3 参重载保持既有纯分配语义（CPU 分配零填充 / GPU 分配未初始化，需零显式 `zero`），初值一律显式走 `InitSpec`（Zero/Constant/…）；`Uninitialized` 契约沿用 `cpu_uninitialized` 注释 |
 | 上传（I/O 分组） | `from_matrix(const Matrix&, P) -> Result<Tensor>` | 保留现名（D9）；数据集/预训练模型入口 |
 | 下载（I/O 分组） | `to_matrix(const Tensor&, P) -> Result<Matrix>` | 保留现名（D9）；对拍/落盘出口 |
 | 批量读 | `read(const Tensor&, std::span<T>) -> Result<void>` | 元素类型与 `precision()` 匹配；GPU 隐含 flush + 同步 |
@@ -136,6 +137,9 @@ struct InitSpec {
 - **前置修复**：`mlp/conv/zipt` 的 `std::random_device{}` 播种跨进程不确定（违反铁律 #8 精神），
   M2 第一步先统一为显式默认 seed（行为变化单列验收），此后初值跨进程确定；
   各层散落的 `thread_local rng_` 随之消失，RNG 收归引擎。
+  （**M2 已实施**：`kInitSeed=42` + 引擎内按创建序号混流——同 seed 不同张量不撞流，
+  同形状多层不互为镜像；层手填 `Matrix` + `from_matrix` 的 init 路径一并清空。
+  `generate()` 采样 RNG 与 `text_train` 数据洗牌 RNG 属运行期随机性，**裁定不迁**。）
 
 ### 4.5 内存池统一（契约层，D5）
 
@@ -177,7 +181,7 @@ CPU 字节基线 + scan 产物 hash + layer_bench（定义见 §6）。
 | 期 | 内容 | 关键改动面 | 专属验收 |
 |---|---|---|---|
 | **M1** ✅（2026-09-30） | **访问收口**：存储私有化、静态工厂收编、`reshape` 引擎化（`ComputeEngine::reshape`，D10）、库外同期全迁（D7） | `compute_tensor.hpp`；`detail::TensorAccess`（DSL 19 处改道）；`model_serialization.hpp` f16 分支；src 9 测试 + `text_train.cpp:756` + `tools/scan_exprs.cpp`（commits `3d76478`/`c8f308f`） | **四件套全过**：build 122/122；ctest 20/20；CPU 探针 `6f8849f14da23110` 与 pre 逐位一致；scan 双 hash 不变；layer_bench 配对 A/B（pre=HEAD~2 worktree 二进制，feedforward/swiglu/linear 各 4 轮交错，分布重叠无回退）；**编译期强制**：`grep \.cpu_matrix` 库外零命中（详见 `docs/history.md` M1 条） |
-| **M2** | **声明式创建/初始化**：`InitSpec` + `Layer::init` 迁移 + RNG 收编 | `create_tensor` NVI 扩展；`compute_layer_*.hpp` 的 init（mlp/conv/gpt/zipt/rapt…） | 四件套 + **初值跨进程确定性**（两次运行初值逐字节同；`random_device` 层改造属计划内字节变化，先立新锚） |
+| **M2** ✅（2026-09-30） | **声明式创建/初始化**：`InitSpec` + `Layer::init` 迁移 + RNG 收编 | `create_tensor` NVI 扩展；`compute_layer_*.hpp` 的 init（mlp/conv/gpt/zipt/rapt…）（commits `8bd6bd5` 核心、`4492098` 层迁移） | **四件套全过** + **初值跨进程确定性**：build 122/122 零告警；ctest 20/20；`gpu_stability_probe --init-hash` 六模型两进程 `INIT1` 行全同（**新锚**：mnist_mlp `a22e807ee05ec3ac`、cnn `4020958a14160bbd`、mnist_transformer `04a72d865624042a`、gpt `8efa936ac5c8c9b2`、zipt `f90bf8c8783c2f89`、rapt `b037632f75b7159c`）；mnist 三架构（`--shuffle-steps false`）双进程 loss 序列 + 模型文件逐字节一致（**新训练锚**，仅墙钟行异）；`--steps 20` hash=`6f8849f14da23110` 与 M1 锚点逐位一致（覆写隔离下后端执行零变化）；scan 双 hash 不变（`expr_specs.bin`=bdc3a442…a58360、`fused_registry.hpp`=7a10412c…）；layer_bench 配对 4 轮 + feedforward 逆序 4 轮复测均 < ±6% 无系统性回退；`NN_BIND_DEBUG=1` 冒烟零诊断（详见 `docs/history.md` M2 条） |
 | **M3** | **批量读写 API**：`read/write/get_index/set_index` + I/O 分组审计口径（D9） | `compute_engine.hpp` + CPU/GPU 两引擎；测试读写路径 | 四件套 + GPU staging 批量语义探针（写后读回对拍） |
 | **M4** | **Matrix 降级收口**：L2+ 禁用规则成文 + 分层审计脚本 | 规则进 AGENTS.md 铁律；审计脚本（U5） | 审计脚本零违规 |
 | **M5** | **内存池契约统一**：CPU `pool_stats` 语义补齐 | `compute_engine.hpp` 默认实现 + `CpuEngine` | 两引擎 `pool_stats` 非空且口径文档化 |
@@ -197,7 +201,7 @@ CPU 字节基线 + scan 产物 hash + layer_bench（定义见 §6）。
 - **scan 产物 hash 恒定**：`expr_specs.bin` = `bdc3a442…a58360`；`fused_registry.hpp`
   本机 pre/post 锚点见 15 §7.1。
 - **layer_bench**：同窗交错 + 配对 A/B，无系统性回退（噪声 ±6% 口径）。
-- **计划内字节变化例外**：M2（RNG 收编）与将来设备端 RNG 落地——先立新锚，
+- **计划内字节变化例外**：M2（RNG 收编，**已按此立新锚 2026-09-30——见 §5 M2 行**）与将来设备端 RNG 落地——先立新锚，
   新锚两次独立运行之间仍须逐字节；变化条目在该期验收中显式记录。
 
 ## 7. 风险与陷阱
@@ -233,7 +237,7 @@ CPU 字节基线 + scan 产物 hash + layer_bench（定义见 §6）。
 
 | # | 问题 | 倾向 |
 |---|---|---|
-| U1 | `InitSpec::seed` 是否必填 | 必填，层传显式默认值 |
+| U1 | `InitSpec::seed` 是否必填 | **已裁（M2 实施）**：分布类工厂签名 seed 必填（漏传 = 编译错误），层传显式默认值 `kInitSeed = 42`；引擎内按创建序号混流防同 seed 撞流 |
 | U2 | `read/write` 元素类型形态：`span<T>` 精度精确匹配，还是按 `precision()` 重载 | 精确匹配 + 静态断言（防 f16/f32 槽错位） |
 | U3 | CPU 真内存池立项与否 | 先分配剖析量化，另案 |
 | U4 | 15 D6/D7/D8（宿主格式契约定序 / `Model::set_engine` 死码 / dummy 张量） | 随 M6 一并裁定 |
