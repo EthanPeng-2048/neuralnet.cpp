@@ -144,6 +144,13 @@ Result<void> set_index(Tensor& t, std::size_t row, std::size_t col, Scalar v);
   `write` 走 `copy_from` 既有 drain 语义（17 §4.3/§7-4）
 - `get_index/set_index`：语法糖——宿主直读写、GPU 走批量 read/write（每次一整轮 staging，
   不承诺热循环性能，17 §7-1）
+- **L2+ 宿主桥（M4，17 §3 D11 / AGENTS.md 铁律 #12）**：`nn::detail::upload_span(engine,
+  rows, cols, P, span)`（标量缓冲 → 新建张量，f16 目标按 RHE，等价 `from_matrix` 的
+  span 形态）、`download_span(engine, t, span)` 与 `download_vector(engine, t)`（张量 →
+  标量缓冲，f16 存储先升 f32，等价 `to_matrix(t, F32)`）。定义在 `compute_engine.hpp`
+  尾部，内部只用 `write/read`、不加虚函数。**Layer/Loss/Optimizer/Model 里只准用这三个
+  与 `create_tensor`+`InitSpec`/`zero`**，不得出现 `Matrix` 或 `from_matrix/to_matrix/copy_from`
+  ——审计：`pwsh -File bench\doc_inventory.ps1` 第 [4] 节，`L2-VIOLATIONS` 必须为 0。
 
 **实现注意**：
 - `from_matrix_impl` 应返回拷贝，避免外部修改影响
