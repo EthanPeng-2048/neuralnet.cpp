@@ -114,7 +114,7 @@ private:
     }
 
     // 确保 V_ones / e_0 缓存与当前 BH·dk × seq 尺寸匹配。
-    // 返回 Result：from_matrix 失败（常见为显存不足）时传播真实错误，
+    // 返回 Result：分配/upload 失败（常见为显存不足）时传播真实错误，
     // 避免后续 scan/outer_col 对空张量报 "ensure_gpu: invalid tensor" 掩盖根因。
     [[nodiscard]] Result<void> ensure_ones_(
         ComputeEngine& engine, std::size_t BH, std::size_t dk, std::size_t seq)
@@ -124,25 +124,18 @@ private:
             V_ones_cache_.valid() && e_0_cache_.valid())
             return {};
         const std::size_t rows = BH * dk;
-        // V_ones：全1
-        Matrix ones_mat(rows, seq);
-        {
-            auto sp = ones_mat.span();
-            std::fill(sp.begin(), sp.end(), Scalar{1});
-        }
-        auto ot = engine.from_matrix(ones_mat);
-        if (!ot) return std::unexpected(ot.error());
-        V_ones_cache_ = std::move(*ot);
+        // V_ones：全1（声明式常数初始化，M2 InitSpec）
+        V_ones_cache_ = engine.create_tensor(rows, seq, Precision::F32,
+                                             InitSpec::constant(Scalar{1}));
+        if (!V_ones_cache_.valid())
+            return std::unexpected(Error{"ensure_ones_: V_ones 分配失败"});
         // e_0：每头首行=1，其余=0（用于 suffix(scale·q) 的外积构造）
-        Matrix e0_mat(rows, seq);
-        e0_mat.zero();
-        {
-            auto sp = e0_mat.span();
-            for (std::size_t bh = 0; bh < BH; ++bh)
-                for (std::size_t t = 0; t < seq; ++t)
-                    sp[(bh * dk) * seq + t] = Scalar{1};
-        }
-        auto e0t = engine.from_matrix(e0_mat);
+        std::vector<Scalar> e0(rows * seq, Scalar{0});   // 宿主桥（17 §3 D11）
+        for (std::size_t bh = 0; bh < BH; ++bh)
+            for (std::size_t t = 0; t < seq; ++t)
+                e0[(bh * dk) * seq + t] = Scalar{1};
+        auto e0t = detail::upload_span(engine, rows, seq, Precision::F32,
+                                       std::span(e0));
         if (!e0t) return std::unexpected(e0t.error());
         e_0_cache_ = std::move(*e0t);
         ones_BH_  = BH;
@@ -165,8 +158,9 @@ private:
                 "rms_norm_forward_: GPU 张量分配失败（显存不足或设备异常）"});
         // rms_inv_out == nullptr（checkpoint 模式）：不收集逐头 1/rms 缓存，
         // backward 由 forward_recompute 重建；同时省掉 BH 次 GPU→CPU 下载。
-        Matrix rms_mat;
-        if (rms_inv_out) rms_mat = Matrix(BH, seq);
+        // 宿主桥（17 §3 D11）：标量缓冲收逐头 1/rms，不经 Matrix。
+        std::vector<Scalar> rms_v;
+        if (rms_inv_out) rms_v.assign(BH * seq, Scalar{0});
         for (std::size_t bh = 0; bh < BH; ++bh)
         {
             auto x = engine.slice_rows(input, bh * dk, dk);
@@ -185,10 +179,10 @@ private:
             if (!ri) return std::unexpected(ri.error());
             if (rms_inv_out)
             {
-                auto ri_m = engine.to_matrix(*ri);
-                if (!ri_m) return std::unexpected(ri_m.error());
+                auto ri_v = detail::download_vector(engine, *ri);
+                if (!ri_v) return std::unexpected(ri_v.error());
                 for (std::size_t t = 0; t < seq; ++t)
-                    rms_mat.set_value_unchecked(bh, t, ri_m->at_unchecked(0, t));
+                    rms_v[bh * seq + t] = (*ri_v)[t];
             }
             auto n = dsl::compute(engine,
                 dsl::leaf(*x) * dsl::col_broadcast(*ri), dk, seq);
@@ -198,7 +192,8 @@ private:
         }
         if (rms_inv_out)
         {
-            auto ri_t = engine.from_matrix(rms_mat);
+            auto ri_t = detail::upload_span(engine, BH, seq, Precision::F32,
+                                            std::span(rms_v));
             if (!ri_t) return std::unexpected(ri_t.error());
             *rms_inv_out = std::move(*ri_t);
         }
@@ -446,10 +441,11 @@ public:
         if (has_doc_ids_)
         {
             const auto boundary = build_boundary_(batch, seq);
-            Matrix bm(1, batch * seq, Scalar{0});
+            std::vector<Scalar> bm(batch * seq, Scalar{0});   // 宿主桥（17 §3 D11）
             for (std::size_t i = 0; i < boundary.size(); ++i)
-                bm.set_value_unchecked(0, i, static_cast<Scalar>(boundary[i]));
-            auto bt = engine.from_matrix(bm);
+                bm[i] = static_cast<Scalar>(boundary[i]);
+            auto bt = detail::upload_span(engine, 1, batch * seq, Precision::F32,
+                                          std::span(bm));
             if (!bt) return std::unexpected(bt.error());
             boundary_t = std::move(*bt);
             has_bnd = true;
@@ -573,10 +569,11 @@ public:
         if (has_doc_ids_)
         {
             const auto boundary = build_boundary_(batch, seq);
-            Matrix bm(1, batch * seq, Scalar{0});
+            std::vector<Scalar> bm(batch * seq, Scalar{0});   // 宿主桥（17 §3 D11）
             for (std::size_t i = 0; i < boundary.size(); ++i)
-                bm.set_value_unchecked(0, i, static_cast<Scalar>(boundary[i]));
-            auto bt = engine.from_matrix(bm);
+                bm[i] = static_cast<Scalar>(boundary[i]);
+            auto bt = detail::upload_span(engine, 1, batch * seq, Precision::F32,
+                                          std::span(bm));
             if (!bt) return std::unexpected(bt.error());
             boundary_t = std::move(*bt);
             has_bnd = true;
@@ -847,31 +844,25 @@ public:
             B_state.rows(), Qp->cols());
         if (!num_r) return std::unexpected(num_r.error());
 
-        // den = q'·z：逐头标量点积（通过 to_matrix 在 CPU 上计算；
+        // den = q'·z：逐头标量点积（通过宿主桥在 CPU 上计算，17 §3 D11；
         // ε 由下面的除法表达式统一添加，与 forward 的写法保持同构）
         // forward_step 是逐 token 串行的，CPU round-trip 可接受。
-        auto q_mat = engine.to_matrix(*Qp);
-        if (!q_mat) return std::unexpected(q_mat.error());
-        auto z_mat = engine.to_matrix(z_state);
-        if (!z_mat) return std::unexpected(z_mat.error());
-        Matrix den_mat(H, 1);
+        auto q_v = detail::download_vector(engine, *Qp);
+        if (!q_v) return std::unexpected(q_v.error());
+        auto z_v = detail::download_vector(engine, z_state);
+        if (!z_v) return std::unexpected(z_v.error());
+        // 广播到 (H*dk, 1)：每头标量重复 dk 次
+        std::vector<Scalar> den_full(H * dk);
         for (std::size_t h = 0; h < H; ++h)
         {
             Scalar dot = 0;
             for (std::size_t j = 0; j < dk; ++j)
-                dot += q_mat->at_unchecked(h * dk + j, 0) *
-                       z_mat->at_unchecked(h * dk + j, 0);
-            den_mat.set_value_unchecked(h, 0, dot);
-        }
-        // 广播到 (H*dk, 1)：每头标量重复 dk 次
-        Matrix den_full(H * dk, 1);
-        for (std::size_t h = 0; h < H; ++h)
-        {
-            const Scalar d = den_mat.at_unchecked(h, 0);
+                dot += (*q_v)[h * dk + j] * (*z_v)[h * dk + j];
             for (std::size_t j = 0; j < dk; ++j)
-                den_full.set_value_unchecked(h * dk + j, 0, d);
+                den_full[h * dk + j] = dot;
         }
-        auto den_t = engine.from_matrix(den_full);
+        auto den_t = detail::upload_span(engine, H * dk, 1, Precision::F32,
+                                         std::span(den_full));
         if (!den_t) return std::unexpected(den_t.error());
 
         // out = num / (den + ε)：与 forward 的除法（:491）**逐 token 同构**——
@@ -1387,8 +1378,11 @@ public:
         auto sr = engine.scatter_add_rows(grad_token_emb_, stored_tokens_tensor_, *grad_T);
         if (!sr) return std::unexpected(sr.error());
 
-        Matrix grad_input(seq, batch, Scalar{0});
-        return engine.from_matrix(grad_input);
+        Tensor grad_input = engine.create_tensor(seq, batch, Precision::F32,
+                                                 InitSpec::zero());
+        if (!grad_input.valid())
+            return std::unexpected(Error{"RAPT token_emb backward: 梯度张量分配失败"});
+        return grad_input;
     }
 
     // ── 采样生成（RLA-2 增量运行态，KV cache） ─────────────────────
@@ -1419,9 +1413,10 @@ public:
         auto step_one = [&](std::size_t tok, std::size_t pos)
             -> Result<std::vector<Scalar>>
         {
-            Matrix idx(1, 1);
-            idx.set_value_unchecked(0, 0, static_cast<Scalar>(tok));
-            auto idx_t = engine.from_matrix(idx);
+            std::vector<Scalar> idx_v(1);              // 宿主桥（17 §3 D11）
+            idx_v[0] = static_cast<Scalar>(tok);
+            auto idx_t = detail::upload_span(engine, 1, 1, Precision::F32,
+                                             std::span(idx_v));
             if (!idx_t) return std::unexpected(idx_t.error());
             auto emb = engine.gather_rows(token_emb_, *idx_t);   // (1, d_model)
             if (!emb) return std::unexpected(emb.error());
@@ -1438,11 +1433,12 @@ public:
             if (!ln) return std::unexpected(ln.error());
             auto logits = lm_head_.forward(engine, *ln);
             if (!logits) return std::unexpected(logits.error());
-            auto lm = engine.to_matrix(*logits);
-            if (!lm) return std::unexpected(lm.error());
+            auto lm_v = detail::download_vector(engine, *logits);   // 宿主桥 D11
+            if (!lm_v) return std::unexpected(lm_v.error());
+            const std::size_t lm_cols = logits->cols();
             std::vector<Scalar> last(vocab_size_);
             for (std::size_t v = 0; v < vocab_size_; ++v)
-                last[v] = lm->at_unchecked(v, 0);
+                last[v] = (*lm_v)[v * lm_cols];
             return last;
         };
 

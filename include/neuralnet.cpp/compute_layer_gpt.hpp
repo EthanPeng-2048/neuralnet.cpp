@@ -347,12 +347,12 @@ protected:
     {
         if (pos_indices_batch_ == batch && pos_indices_seq_ == seq)
             return {};
-        Matrix pidx_m(batch * seq, 1);
+        std::vector<Scalar> pidx(batch * seq);        // 宿主桥（17 §3 D11）：不经 Matrix
         for (std::size_t b = 0; b < batch; ++b)
             for (std::size_t t = 0; t < seq; ++t)
-                pidx_m.set_value_unchecked(b * seq + t, 0,
-                    static_cast<Scalar>(t));
-        auto pidx_t = engine.from_matrix(pidx_m);
+                pidx[b * seq + t] = static_cast<Scalar>(t);
+        auto pidx_t = detail::upload_span(engine, batch * seq, 1, Precision::F32,
+                                          std::span(pidx));
         if (!pidx_t) return std::unexpected(pidx_t.error());
         pos_indices_cache_ = std::move(*pidx_t);
         pos_indices_batch_ = batch;
@@ -385,9 +385,9 @@ public:
     [[nodiscard]] Result<Tensor> apply_step(
         ComputeEngine& engine, const Tensor& x, std::size_t pos) override
     {
-        Matrix pos_m(1, 1);
-        pos_m.set_value_unchecked(0, 0, static_cast<Scalar>(pos));
-        auto pos_t = engine.from_matrix(pos_m);
+        std::vector<Scalar> pos_v(1);                 // 宿主桥（17 §3 D11）
+        pos_v[0] = static_cast<Scalar>(pos);
+        auto pos_t = detail::upload_span(engine, 1, 1, Precision::F32, std::span(pos_v));
         if (!pos_t) return std::unexpected(pos_t.error());
         auto pos_emb_g = engine.gather_rows(pos_emb_, *pos_t);
         if (!pos_emb_g) return std::unexpected(pos_emb_g.error());
@@ -459,18 +459,18 @@ public:
 
     [[nodiscard]] Result<void> init(ComputeEngine& engine) override
     {
-        Matrix pe(seq_len_, d_model_);
-        auto pe_s = pe.span();
+        std::vector<Scalar> pe(seq_len_ * d_model_);   // 宿主桥（17 §3 D11）
         for (std::size_t pos = 0; pos < seq_len_; ++pos)
             for (std::size_t i = 0; i < d_model_; ++i)
             {
                 Scalar angle = static_cast<Scalar>(pos) /
                     std::pow(Scalar{10000}, static_cast<Scalar>(2 * (i / 2)) / static_cast<Scalar>(d_model_));
-                pe_s[pos * d_model_ + i] = (i % 2 == 0) ? std::sin(angle) : std::cos(angle);
+                pe[pos * d_model_ + i] = (i % 2 == 0) ? std::sin(angle) : std::cos(angle);
             }
-        // 闭式公式（非分布/常数）仍宿主计算 → from_matrix 进引擎（M2 裁定：
-        // InitSpec 只收分布与常数初始化；公式数据迁移属 M3 write API 范围）
-        auto pe_t = engine.from_matrix(pe, p_.param);
+        // 闭式公式（非分布/常数）仍宿主计算 → span 上传进引擎（M2 裁定：InitSpec
+        // 只收分布与常数初始化；公式数据自 M4 起经 detail::upload_span，不经 Matrix）
+        auto pe_t = detail::upload_span(engine, seq_len_, d_model_, p_.param,
+                                        std::span(pe));
         if (!pe_t) return std::unexpected(pe_t.error());
         return init_(engine, std::move(*pe_t), /*learnable=*/false);
     }
@@ -830,8 +830,11 @@ public:
         if (!sr) return std::unexpected(sr.error());
 
         // grad_input: token IDs 无梯度，返回零张量（仅用于接口一致性）
-        Matrix grad_input(seq_len, batch_size_, Scalar{0});
-        return engine.from_matrix(grad_input);
+        Tensor grad_input = engine.create_tensor(seq_len, batch_size_, Precision::F32,
+                                                 InitSpec::zero());
+        if (!grad_input.valid())
+            return std::unexpected(Error{"GPT token_emb backward: 梯度张量分配失败"});
+        return grad_input;
     }
 
     // ── batch 录制粒度控制 ──
@@ -894,9 +897,9 @@ public:
         std::size_t cur_len)
     {
         // 1. token embedding 查表 → (1, d_model) → transpose → (d_model, 1)
-        Matrix id_m(1, 1);
-        id_m.set_value_unchecked(0, 0, static_cast<Scalar>(token_id));
-        auto id_t = engine.from_matrix(id_m);
+        std::vector<Scalar> id_v(1);                  // 宿主桥（17 §3 D11）
+        id_v[0] = static_cast<Scalar>(token_id);
+        auto id_t = detail::upload_span(engine, 1, 1, Precision::F32, std::span(id_v));
         if (!id_t) return std::unexpected(id_t.error());
         auto emb = engine.gather_rows(token_emb_, *id_t);
         if (!emb) return std::unexpected(emb.error());
@@ -1018,12 +1021,12 @@ public:
             }
 
             // Sample from last_logits_t (from prefill or previous step)
-            auto logits_m = engine.to_matrix(last_logits_t);
-            if (!logits_m) return std::unexpected(logits_m.error());
+            auto logits_v = detail::download_vector(engine, last_logits_t);  // 宿主桥
+            if (!logits_v) return std::unexpected(logits_v.error());
 
             std::vector<Scalar> last_logits(vocab_size_);
             for (std::size_t v = 0; v < vocab_size_; ++v)
-                last_logits[v] = logits_m->at_unchecked(v, 0);
+                last_logits[v] = (*logits_v)[v];
 
             // temperature
             if (temperature > 0.0 && temperature != 1.0)
