@@ -61,12 +61,6 @@ void on_abort(int)
 // pass 与运行时（激活即 f16）**同源**——否则会收集到运行时永不使用的签名。
 static nn::PrecisionProfile g_scan_prof{};
 
-[[nodiscard]] static nn::Tensor scan_tensor(std::size_t rows, std::size_t cols)
-{
-    return (g_scan_prof.compute == nn::Precision::F16)
-        ? nn::Tensor::cpu<nn::Precision::F16>(rows, cols)
-        : nn::Tensor::cpu(rows, cols);
-}
 int main(int argc, char* argv[])
 {
     if (argc < 2)
@@ -87,6 +81,12 @@ int main(int argc, char* argv[])
     const auto dry_run = [&](nn::ComputeEngine& engine, const nn::PrecisionProfile& prof)
     {
         g_scan_prof = prof;
+        // M1（docs/development/17 §4.1）：库外不再直构 Tensor——scan 输入经
+        // 引擎创建（出生绑定与本段 dry-run 使用的 engine 一致）。
+        const auto scan_tensor = [&](std::size_t rows, std::size_t cols)
+        {
+            return engine.create_tensor(rows, cols, g_scan_prof.compute);
+        };
     // ── RoPE：forward + backward ─────────────────────────────────────────
     // （apply 与 apply_step 折叠出的结构相同，会自动去重）
     //

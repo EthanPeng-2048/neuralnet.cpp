@@ -31,6 +31,7 @@
 
 #include "neuralnet.cpp/algebra_matrix.hpp"  // Matrix / Scalar
 #include "neuralnet.cpp/compute_tensor.hpp"  // Tensor
+#include "neuralnet.cpp/compute_engine.hpp"  // ComputeEngine（M1：库外经引擎上传/下载）
 
 // ── 失败断言宏 ─────────────────────────────────────────────────────────────
 #ifndef NN_TEST_COUNTER
@@ -45,20 +46,53 @@
         }                                                                    \
     } while (0)
 
-// ── 构造确定性测试张量（base + i*step 填充）───────────────────────────────
-inline nn::Tensor make_tensor(std::size_t rows, std::size_t cols,
-                              float base = 0.0f, float step = 0.01f)
+// ── M1 访问收口（docs/development/17 §4.1）：库外一律经引擎上传/下载 ───────
+// Tensor 存储与静态直构工厂收归引擎私有后，测试的填数/对拍路径为：
+//   填数：宿主 Matrix 上写好 → upload(eng, m) 生成引擎张量
+//   对拍：download(eng, t) 取回宿主 Matrix（P=F32：f16 精确升位，不丢值）
+// NN_ASSERT 兜底（与 close_to 同款）：引擎 I/O 失败属测试环境错误，非数值失败。
+inline nn::Tensor upload(nn::ComputeEngine& e, const nn::Matrix& m,
+                         nn::Precision p = nn::Precision::F32)
 {
-    nn::Tensor t = nn::Tensor::cpu(rows, cols);
-    auto sp = t.cpu_matrix().span();
+    auto r = e.from_matrix(m, p);
+    NN_ASSERT(r, "upload: engine.from_matrix failed");
+    return std::move(*r);
+}
+
+// f16 宿主矩阵上传（f16→f32 逐元素升位后按 F16 落盘：往返精确无损）
+inline nn::Tensor upload(nn::ComputeEngine& e,
+                         const nn::MatrixT<nn::Precision::F16>& m)
+{
+    nn::Matrix m32(m.rows(), m.cols());
+    const auto s = m.span();
+    auto d = m32.span();
+    for (std::size_t i = 0; i < s.size(); ++i)
+        d[i] = static_cast<float>(s[i]);
+    return upload(e, m32, nn::Precision::F16);
+}
+
+inline nn::Matrix download(nn::ComputeEngine& e, const nn::Tensor& t)
+{
+    auto r = e.to_matrix(t);   // P=F32 默认：f16 存储精确升位
+    NN_ASSERT(r, "download: engine.to_matrix failed");
+    return std::move(*r);
+}
+
+// ── 构造确定性测试张量（base + i*step 填充；经引擎上传，出生即绑定）────────
+inline nn::Tensor make_tensor(nn::ComputeEngine& e, std::size_t rows,
+                              std::size_t cols, float base = 0.0f,
+                              float step = 0.01f)
+{
+    nn::Matrix m(rows, cols);
+    auto sp = m.span();
     for (std::size_t i = 0; i < sp.size(); ++i)
         sp[i] = base + static_cast<float>(i) * step;
-    return t;
+    return upload(e, m);
 }
 
 // ── 逐元素比对 Tensor（容差 1e-4 相对；失败计数进 fails = 调用方的 g_fail）──
-inline void check_close(const nn::Tensor& got, const nn::Tensor& ref,
-                        const char* msg, int& fails)
+inline void check_close(nn::ComputeEngine& e, const nn::Tensor& got,
+                        const nn::Tensor& ref, const char* msg, int& fails)
 {
     if (got.rows() != ref.rows() || got.cols() != ref.cols())
     {
@@ -67,8 +101,10 @@ inline void check_close(const nn::Tensor& got, const nn::Tensor& ref,
         ++fails;
         return;
     }
-    const auto g = got.cpu_matrix().span();
-    const auto r = ref.cpu_matrix().span();
+    const auto gm = download(e, got);
+    const auto rm = download(e, ref);
+    const auto g = gm.span();
+    const auto r = rm.span();
     bool ok = true;
     for (std::size_t i = 0; i < g.size(); ++i)
     {

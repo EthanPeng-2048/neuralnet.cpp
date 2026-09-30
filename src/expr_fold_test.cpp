@@ -31,6 +31,7 @@
 #include <neuralnet.cpp/compute_cpu_engine.hpp>
 #include <neuralnet.cpp/expr_fold.hpp>
 #include <neuralnet.cpp/compute_layer_attention.hpp>   // 注意力 fold 构造（定义于 Layer：表达式文本只写在 Layer）
+#include "test_common.hpp"                            // M1：upload/download（库外经引擎进出张量）
 
 using nn::Scalar;
 
@@ -58,11 +59,12 @@ int test_expr_fold()
                                 std::size_t{33}, std::size_t{100}, std::size_t{1000}})
     {
         const std::size_t rows = 5;
-        nn::Tensor x = nn::Tensor::cpu(rows, K);
+        nn::Matrix mx(rows, K);
         {
-            auto sp = x.cpu_matrix().span();
+            auto sp = mx.span();
             for (auto& v : sp) v = dist(rng);
         }
+        nn::Tensor x = upload(engine, mx);
         const std::array<nn::Tensor, 1> ins{x};
 
         // ── 1) rowmax ──
@@ -74,8 +76,10 @@ int test_expr_fold()
             if (!out) { check(false, "rowmax eval K=" + std::to_string(K) + ": " + out.error().message); }
             else
             {
-                const auto os = out->cpu_matrix().span();
-                const auto xs = x.cpu_matrix().span();
+                const auto om = download(engine, *out);
+                const auto xm = download(engine, x);
+                const auto os = om.span();
+                const auto xs = xm.span();
                 Scalar err = 0;
                 for (std::size_t r = 0; r < rows; ++r)
                 {
@@ -98,8 +102,10 @@ int test_expr_fold()
             if (!out) { check(false, "rowsum eval K=" + std::to_string(K) + ": " + out.error().message); }
             else
             {
-                const auto os = out->cpu_matrix().span();
-                const auto xs = x.cpu_matrix().span();
+                const auto om = download(engine, *out);
+                const auto xm = download(engine, x);
+                const auto os = om.span();
+                const auto xs = xm.span();
                 Scalar err = 0;
                 for (std::size_t r = 0; r < rows; ++r)
                 {
@@ -121,8 +127,10 @@ int test_expr_fold()
             if (!out) { check(false, "softmax_denom eval K=" + std::to_string(K) + ": " + out.error().message); }
             else
             {
-                const auto os = out->cpu_matrix().span();
-                const auto xs = x.cpu_matrix().span();
+                const auto om = download(engine, *out);
+                const auto xm = download(engine, x);
+                const auto os = om.span();
+                const auto xs = xm.span();
                 Scalar err = 0;
                 for (std::size_t r = 0; r < rows; ++r)
                 {
@@ -195,16 +203,23 @@ int test_expr_fold()
     // ── attention fold 对拍（独立公式参考；5 掩码 × 4 形状族）────────
     // 确定性迷你 case：seq=dk=bh=1，Q=2 K=3 Vt=5 → s=6, softmax=1, O=5
     {
-        nn::Tensor Q = nn::Tensor::cpu(1, 1), K = nn::Tensor::cpu(1, 1),
-                   Vt = nn::Tensor::cpu(1, 1);
-        Q.cpu_matrix().span()[0] = 2;
-        K.cpu_matrix().span()[0] = 3;
-        Vt.cpu_matrix().span()[0] = 5;
+        nn::Matrix mQ(1, 1), mK(1, 1), mVt(1, 1);
+        mQ.span()[0] = 2;
+        mK.span()[0] = 3;
+        mVt.span()[0] = 5;
+        nn::Tensor Q = upload(engine, mQ);
+        nn::Tensor K = upload(engine, mK);
+        nn::Tensor Vt = upload(engine, mVt);
         nn::ExprSpec sp = nn::expr::make_fold_attn_o(1, 1, 1,
                             nn::expr::FoldAttnMask::Plain);
         const std::vector<nn::Tensor> ii{Q, K, Vt};
         auto o = engine.eval_expr(sp, ii, 1, 1);
-        const Scalar got = o ? o->cpu_matrix().span()[0] : Scalar{-999};
+        Scalar got = Scalar{-999};
+        if (o)
+        {
+            const auto om = download(engine, *o);
+            got = om.span()[0];
+        }
         check(o.has_value() && std::fabs(got - Scalar{5}) < Scalar{1e-5},
               "attn fold mini(1x1) O=" + std::to_string(got) + " expect 5"
               + (o ? "" : (" err=" + o.error().message)));
@@ -214,15 +229,18 @@ int test_expr_fold()
         {
             const std::uint32_t bh2 = ab == 0 ? 1u : 2u;
             const std::uint32_t seq2 = ab == 0 ? 4u : 1u;
-            nn::Tensor Q2 = nn::Tensor::cpu(static_cast<std::size_t>(bh2) * 1, seq2);
-            nn::Tensor K2 = nn::Tensor::cpu(static_cast<std::size_t>(bh2) * 1, seq2);
-            nn::Tensor V2 = nn::Tensor::cpu(static_cast<std::size_t>(bh2) * seq2, 1);
-            for (std::size_t i = 0; i < Q2.cpu_matrix().span().size(); ++i)
-                Q2.cpu_matrix().span()[i] = Scalar{2};
-            for (std::size_t i = 0; i < K2.cpu_matrix().span().size(); ++i)
-                K2.cpu_matrix().span()[i] = Scalar{3};
-            for (std::size_t i = 0; i < V2.cpu_matrix().span().size(); ++i)
-                V2.cpu_matrix().span()[i] = Scalar{5};
+            nn::Matrix mQ2(static_cast<std::size_t>(bh2) * 1, seq2);
+            nn::Matrix mK2(static_cast<std::size_t>(bh2) * 1, seq2);
+            nn::Matrix mV2(static_cast<std::size_t>(bh2) * seq2, 1);
+            for (std::size_t i = 0; i < mQ2.span().size(); ++i)
+                mQ2.span()[i] = Scalar{2};
+            for (std::size_t i = 0; i < mK2.span().size(); ++i)
+                mK2.span()[i] = Scalar{3};
+            for (std::size_t i = 0; i < mV2.span().size(); ++i)
+                mV2.span()[i] = Scalar{5};
+            nn::Tensor Q2 = upload(engine, mQ2);
+            nn::Tensor K2 = upload(engine, mK2);
+            nn::Tensor V2 = upload(engine, mV2);
             nn::ExprSpec sp2 = nn::expr::make_fold_attn_o(seq2, 1, bh2,
                                  nn::expr::FoldAttnMask::Plain);
             const std::vector<nn::Tensor> i2{Q2, K2, V2};
@@ -231,7 +249,8 @@ int test_expr_fold()
             if (o2)
             {
                 vals.clear();
-                const auto sp2o = o2->cpu_matrix().span();
+                const auto om2 = download(engine, *o2);
+                const auto sp2o = om2.span();
                 for (std::size_t i = 0; i < bh2 * seq2; ++i)
                     vals += " " + std::to_string(sp2o[i]);
             }
@@ -241,7 +260,8 @@ int test_expr_fold()
             if (o2)
             {
                 bool okv = true;
-                const auto sp2o = o2->cpu_matrix().span();
+                const auto om2 = download(engine, *o2);
+                const auto sp2o = om2.span();
                 for (std::size_t i = 0; i < bh2 * seq2; ++i)
                     if (std::fabs(sp2o[i] - Scalar{5}) > Scalar{1e-5}) okv = false;
                 check(okv, std::string("mini-") + (ab ? "B(bh2seq1)" : "A(seq4)")
@@ -251,12 +271,15 @@ int test_expr_fold()
         // C: 非均匀 Vt、Q=K=0（s 全 0 → p=1/4 均匀）→ 手算期望：
         //   d0 = 0.25·(10+20+30+40) = 25；d1 = 0.25·(1+2+3+4) = 2.5
         {
-            nn::Tensor Q3 = nn::Tensor::cpu(2, 4), K3 = nn::Tensor::cpu(2, 4),
-                       V3 = nn::Tensor::cpu(4, 2);   // Q/K: (bh·dk, seq)=(2,4)
-            for (auto& v : Q3.cpu_matrix().span()) v = 0;
-            for (auto& v : K3.cpu_matrix().span()) v = 0;
+            nn::Matrix mQ3(2, 4), mK3(2, 4),
+                       mV3(4, 2);   // Q/K: (bh·dk, seq)=(2,4)
+            for (auto& v : mQ3.span()) v = 0;
+            for (auto& v : mK3.span()) v = 0;
             const Scalar vv[8] = {10, 1, 20, 2, 30, 3, 40, 4};
-            for (int i = 0; i < 8; ++i) V3.cpu_matrix().span()[i] = vv[i];
+            for (int i = 0; i < 8; ++i) mV3.span()[i] = vv[i];
+            nn::Tensor Q3 = upload(engine, mQ3);
+            nn::Tensor K3 = upload(engine, mK3);
+            nn::Tensor V3 = upload(engine, mV3);
             nn::ExprSpec sp3 = nn::expr::make_fold_attn_o(4, 2, 1,
                                 nn::expr::FoldAttnMask::Plain);
             const std::vector<nn::Tensor> i3{Q3, K3, V3};
@@ -265,7 +288,8 @@ int test_expr_fold()
                   + (o3 ? "" : (": " + o3.error().message)));
             if (o3)
             {
-                const auto s3 = o3->cpu_matrix().span();
+                const auto om3 = download(engine, *o3);
+                const auto s3 = om3.span();
                 std::string vals;
                 for (std::size_t i = 0; i < 8; ++i)
                     vals += " " + std::to_string(s3[i]);
@@ -301,17 +325,17 @@ int test_expr_fold()
                             Sh{2, 133, 4}})
         {
             const std::size_t rows_out = static_cast<std::size_t>(sh.bh) * sh.seq;
-            nn::Tensor Q = nn::Tensor::cpu(static_cast<std::size_t>(sh.bh) * sh.dk, sh.seq);
-            nn::Tensor K = nn::Tensor::cpu(static_cast<std::size_t>(sh.bh) * sh.dk, sh.seq);
-            nn::Tensor Vt = nn::Tensor::cpu(rows_out, sh.dk);
-            nn::Tensor slopes = nn::Tensor::cpu(1, sh.bh);
+            nn::Matrix mQ(static_cast<std::size_t>(sh.bh) * sh.dk, sh.seq);
+            nn::Matrix mK(static_cast<std::size_t>(sh.bh) * sh.dk, sh.seq);
+            nn::Matrix mVt(rows_out, sh.dk);
+            nn::Matrix mslopes(1, sh.bh);
             // doc 输入（与 Layer 组包同序：Q,K,Vt,[slopes],doc_col,doc_ids）：
             //   doc_col (rows,1) = 行（查询位置）文档 id；doc_ids (1, bh*seq)
             //   按 (b,h) 块重复——BatchCol(seq) 读 [块*seq+j]，heads>1 时
             //   (1, batch*seq) 会越界（AGENTS 教训 #2）
             const std::uint32_t sseq = sh.seq;
-            nn::Tensor doc_col = nn::Tensor::cpu(rows_out, 1);
-            nn::Tensor doc_ids_t = nn::Tensor::cpu(
+            nn::Matrix mdoc_col(rows_out, 1);
+            nn::Matrix mdoc_ids_t(
                 1, static_cast<std::size_t>(sh.bh) * sh.seq);
             // doc 分段边界：seq > EXPR_FOLD_BLOCK(128) 时放在 **128 之后**
             //   （如 133 → 129），使查询位置 i ≥ 边界的行其首个 fold 块
@@ -325,16 +349,23 @@ int test_expr_fold()
             const auto doc_of = [doc_boundary](std::uint32_t pos) -> Scalar
             { return pos < doc_boundary ? Scalar{1} : Scalar{2}; };
             for (std::size_t r = 0; r < rows_out; ++r)
-                doc_col.cpu_matrix().span()[r] =
+                mdoc_col.span()[r] =
                     doc_of(static_cast<std::uint32_t>(r % sh.seq));
             for (std::uint32_t blk = 0; blk < sh.bh; ++blk)
                 for (std::uint32_t j = 0; j < sh.seq; ++j)
-                    doc_ids_t.cpu_matrix().span()
+                    mdoc_ids_t.span()
                         [static_cast<std::size_t>(blk) * sh.seq + j] = doc_of(j);
-            for (auto& v : Q.cpu_matrix().span()) v = dist(rng);
-            for (auto& v : K.cpu_matrix().span()) v = dist(rng);
-            for (auto& v : Vt.cpu_matrix().span()) v = dist(rng);
-            for (auto& v : slopes.cpu_matrix().span()) v = dist(rng) * Scalar{0.1};
+            for (auto& v : mQ.span()) v = dist(rng);
+            for (auto& v : mK.span()) v = dist(rng);
+            for (auto& v : mVt.span()) v = dist(rng);
+            for (auto& v : mslopes.span()) v = dist(rng) * Scalar{0.1};
+            // 宿主矩阵全部写完后经引擎上传（出生绑定同一 engine）
+            nn::Tensor Q = upload(engine, mQ);
+            nn::Tensor K = upload(engine, mK);
+            nn::Tensor Vt = upload(engine, mVt);
+            nn::Tensor slopes = upload(engine, mslopes);
+            nn::Tensor doc_col = upload(engine, mdoc_col);
+            nn::Tensor doc_ids_t = upload(engine, mdoc_ids_t);
             const bool alibi = (mk == nn::expr::FoldAttnMask::Alibi ||
                                 mk == nn::expr::FoldAttnMask::AlibiDoc);
             const bool docm  = (mk == nn::expr::FoldAttnMask::Doc ||
@@ -360,11 +391,16 @@ int test_expr_fold()
 
             // 独立公式参考：per (b, i)：s_j = Σ_d Q[(b·dk+d),i]·K[(b·dk+d),j]
             //   [+掩码] → m → p=exp(s−m) → l → O[i,d] = Σ_j p_j·Vt[j,d] / l
-            const auto qs = Q.cpu_matrix().span();
-            const auto ks = K.cpu_matrix().span();
-            const auto vs = Vt.cpu_matrix().span();
-            const auto sl = slopes.cpu_matrix().span();
-            const auto os = out->cpu_matrix().span();
+            const auto Qm = download(engine, Q);
+            const auto Km = download(engine, K);
+            const auto Vtm = download(engine, Vt);
+            const auto Slm = download(engine, slopes);
+            const auto om = download(engine, *out);
+            const auto qs = Qm.span();
+            const auto ks = Km.span();
+            const auto vs = Vtm.span();
+            const auto sl = Slm.span();
+            const auto os = om.span();
             Scalar err = 0;
             std::vector<Scalar> srow(sh.seq), prow(sh.seq);
             std::vector<Scalar> ref_out(static_cast<std::size_t>(rows_out) * sh.dk, 0);

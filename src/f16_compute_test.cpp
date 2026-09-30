@@ -41,8 +41,8 @@ void test_f16_matmul_vs_f32()
     a32.multiply_to(c32_ref, b32);
 
     // f16 matmul：先 cast A/B 到 f16，再做 f16 matmul
-    auto t_a32 = nn::Tensor::from_matrix(a32);
-    auto t_b32 = nn::Tensor::from_matrix(b32);
+    auto t_a32 = upload(engine, a32);
+    auto t_b32 = upload(engine, b32);
 
     auto t_a16_r = engine.cast(t_a32, nn::Precision::F16);
     CHECK(t_a16_r.has_value(), "cast A to f16");
@@ -55,7 +55,7 @@ void test_f16_matmul_vs_f32()
     // cast 结果回 f32 比较
     auto t_c32_r = engine.cast(*t_c16_r, nn::Precision::F32);
     CHECK(t_c32_r.has_value(), "cast result to f32");
-    const auto& c32 = t_c32_r->cpu_matrix();
+    const auto c32 = download(engine, *t_c32_r);
 
     // 比较：f16 matmul 结果与 f32 参考的相对误差
     // §7.2：f16 matmul = f32 参考 + f16 舍入；误差来源 = f16 输入精度 + f16 输出舍入
@@ -87,7 +87,7 @@ void test_cast_roundtrip()
     std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
     for (auto& v : m32.span()) v = dist(rng);
 
-    auto t32 = nn::Tensor::from_matrix(m32);
+    auto t32 = upload(engine, m32);
 
     // f32 → f16 → f32
     auto t16_r = engine.cast(t32, nn::Precision::F16);
@@ -95,7 +95,7 @@ void test_cast_roundtrip()
     auto t32_back_r = engine.cast(*t16_r, nn::Precision::F32);
     CHECK(t32_back_r.has_value(), "cast back to f32");
 
-    const auto& result = t32_back_r->cpu_matrix();
+    const auto result = download(engine, *t32_back_r);
     float max_err = 0.0f;
     for (std::size_t i = 0; i < 3 * 4; ++i)
     {
@@ -154,9 +154,9 @@ void test_f16_linear_training()
     for (int step = 0; step < STEPS; ++step)
     {
         // Cast 到 f16
-        auto t_x16 = engine.cast(nn::Tensor::from_matrix(x_data), nn::Precision::F16);
-        auto t_w16 = engine.cast(nn::Tensor::from_matrix(w), nn::Precision::F16);
-        auto t_y32 = nn::Tensor::from_matrix(y_data);
+        auto t_x16 = engine.cast(upload(engine, x_data), nn::Precision::F16);
+        auto t_w16 = engine.cast(upload(engine, w), nn::Precision::F16);
+        auto t_y32 = upload(engine, y_data);
 
         // forward: pred = X @ w  (f16 matmul)
         auto t_pred_r = engine.matmul(*t_x16, *t_w16, true, false, nn::Precision::F16);
@@ -235,8 +235,8 @@ void test_f16_batched_matmul()
     for (auto& v : b32.span()) v = dist(rng);
 
     // f32 batched_matmul 参考
-    auto t_a32 = nn::Tensor::from_matrix(a32);
-    auto t_b32 = nn::Tensor::from_matrix(b32);
+    auto t_a32 = upload(engine, a32);
+    auto t_b32 = upload(engine, b32);
     auto t_c32_ref_r = engine.batched_matmul(t_a32, t_b32, batch, false, false, 1.0f);
     CHECK(t_c32_ref_r.has_value(), "f32 batched_matmul");
 
@@ -254,8 +254,8 @@ void test_f16_batched_matmul()
     auto t_c32_r = engine.cast(*t_c16_r, nn::Precision::F32);
     CHECK(t_c32_r.has_value(), "cast result to f32");
 
-    const auto& c32 = t_c32_r->cpu_matrix();
-    const auto& c32_ref = t_c32_ref_r->cpu_matrix();
+    const auto c32 = download(engine, *t_c32_r);
+    const auto c32_ref = download(engine, *t_c32_ref_r);
     float max_rel_err = 0.0f;
     for (std::size_t i = 0; i < c32.size(); ++i)
     {

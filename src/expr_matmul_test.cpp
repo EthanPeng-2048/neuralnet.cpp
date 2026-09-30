@@ -40,29 +40,31 @@ int g_fail = 0;
 
 
 // ── 参考：逐元素加 bias（CPU span 循环，**独立于**被测的 eval_expr/DSL 路径）──
-nn::Tensor add_bias(const nn::Tensor& a, const nn::Tensor& bias)
+nn::Tensor add_bias(nn::ComputeEngine& e, const nn::Tensor& a, const nn::Tensor& bias)
 {
     NN_ASSERT(a.rows() == bias.rows() && a.cols() == bias.cols(),
               "add_bias: shape mismatch");
-    nn::Tensor out = nn::Tensor::cpu(a.rows(), a.cols());
-    const auto sa = a.cpu_matrix().span();
-    const auto sb = bias.cpu_matrix().span();
-    auto so = out.cpu_matrix().span();
+    nn::Matrix out(a.rows(), a.cols());
+    const nn::Matrix ma = download(e, a);
+    const nn::Matrix mb = download(e, bias);
+    const auto sa = ma.span();
+    const auto sb = mb.span();
+    auto so = out.span();
     for (std::size_t i = 0; i < so.size(); ++i) so[i] = sa[i] + sb[i];
-    return out;
+    return upload(e, out);
 }
 
 // ── 参考实现：独立 matmul + bias + relu ──────────────────────────────────
-nn::Tensor ref_matmul_bias_relu(const nn::Tensor& A, const nn::Tensor& B,
-                                const nn::Tensor& bias)
+nn::Tensor ref_matmul_bias_relu(nn::ComputeEngine& e, const nn::Tensor& A,
+                                const nn::Tensor& B, const nn::Tensor& bias)
 {
-    nn::CpuEngine eng;
-    auto m = eng.matmul(A, B, false, false);
-    nn::Tensor t = add_bias(*m, bias);
-    auto sp = t.cpu_matrix().span();
+    auto m = e.matmul(A, B, false, false);
+    nn::Tensor t = add_bias(e, *m, bias);
+    nn::Matrix tm = download(e, t);
+    auto sp = tm.span();
     for (auto& v : sp)
         v = std::max(v, Scalar{0});
-    return t;
+    return upload(e, tm);
 }
 
 // ── 1) 纯 matmul（无逐元素链）：输出 = matmul 结果本身 ───────────────────
@@ -70,8 +72,8 @@ void test_pure_matmul()
 {
     const std::size_t M = 4, K = 5, N = 3;
     nn::CpuEngine eng;
-    const nn::Tensor A = make_tensor(M, K, 0.5f, 0.03f);
-    const nn::Tensor B = make_tensor(K, N, -0.5f, 0.02f);
+    const nn::Tensor A = make_tensor(eng, M, K, 0.5f, 0.03f);
+    const nn::Tensor B = make_tensor(eng, K, N, -0.5f, 0.02f);
 
     // 直接构造 spec（结构 = DSL 折叠产物）
     nn::ExprSpec s;
@@ -84,7 +86,7 @@ void test_pure_matmul()
     auto r = eng.eval_expr(s, std::vector<nn::Tensor>{A, B}, M, N);
     if (!r) { CHECK(false, "纯 matmul eval_expr 失败"); return; }
     auto ref = eng.matmul(A, B, false, false);
-    check_close(*r, *ref, "纯 matmul：eval_expr == 独立 matmul", g_fail);
+    check_close(eng, *r, *ref, "纯 matmul：eval_expr == 独立 matmul", g_fail);
 }
 
 // ── 2) matmul + bias（matmul 段 + 尾逐元素链 Add）───────────────────────
@@ -92,9 +94,9 @@ void test_matmul_bias()
 {
     const std::size_t M = 4, K = 5, N = 3;
     nn::CpuEngine eng;
-    const nn::Tensor A = make_tensor(M, K, 0.5f, 0.03f);
-    const nn::Tensor B = make_tensor(K, N, -0.5f, 0.02f);
-    const nn::Tensor bias = make_tensor(M, N, 0.2f, 0.01f);
+    const nn::Tensor A = make_tensor(eng, M, K, 0.5f, 0.03f);
+    const nn::Tensor B = make_tensor(eng, K, N, -0.5f, 0.02f);
+    const nn::Tensor bias = make_tensor(eng, M, N, 0.2f, 0.01f);
 
     nn::ExprSpec s;
     s.views    = {nn::expr::linear(), nn::expr::linear(), nn::expr::linear()};
@@ -108,13 +110,13 @@ void test_matmul_bias()
 
     auto r = eng.eval_expr(s, std::vector<nn::Tensor>{A, B, bias}, M, N);
     if (!r) { CHECK(false, "matmul+bias eval_expr 失败"); return; }
-    auto ref = add_bias(*eng.matmul(A, B, false, false), bias);
-    check_close(*r, ref, "matmul+bias：eval_expr == 参考", g_fail);
+    auto ref = add_bias(eng, *eng.matmul(A, B, false, false), bias);
+    check_close(eng, *r, ref, "matmul+bias：eval_expr == 参考", g_fail);
 
     // DSL 路径：dsl::matmul(A,B) + bias
     auto rd = nn::dsl::compute(eng, dsl::matmul(A, B) + dsl::leaf(bias), M, N);
     if (!rd) { CHECK(false, "DSL matmul+bias compute 失败"); return; }
-    check_close(*rd, ref, "DSL matmul+bias：dsl::compute == 参考", g_fail);
+    check_close(eng, *rd, ref, "DSL matmul+bias：dsl::compute == 参考", g_fail);
 }
 
 // ── 3) matmul + bias + relu（更长的尾链，经 canonicalize）────────────────
@@ -122,17 +124,17 @@ void test_matmul_bias_relu()
 {
     const std::size_t M = 3, K = 4, N = 5;
     nn::CpuEngine eng;
-    const nn::Tensor A = make_tensor(M, K, -0.3f, 0.05f);
-    const nn::Tensor B = make_tensor(K, N, 0.1f, -0.02f);
-    const nn::Tensor bias = make_tensor(M, N, -0.4f, 0.03f);
+    const nn::Tensor A = make_tensor(eng, M, K, -0.3f, 0.05f);
+    const nn::Tensor B = make_tensor(eng, K, N, 0.1f, -0.02f);
+    const nn::Tensor bias = make_tensor(eng, M, N, -0.4f, 0.03f);
 
     // DSL：max(matmul(A,B) + bias, 0) —— canonicalize 后与 scan 端一致
     auto r = nn::dsl::compute(eng,
         dsl::max(dsl::matmul(A, B) + dsl::leaf(bias), Scalar{0}), M, N);
     if (!r) { CHECK(false, "DSL matmul+bias+relu compute 失败"); return; }
 
-    auto ref = ref_matmul_bias_relu(A, B, bias);
-    check_close(*r, ref, "matmul+bias+relu：dsl::compute == 参考", g_fail);
+    auto ref = ref_matmul_bias_relu(eng, A, B, bias);
+    check_close(eng, *r, ref, "matmul+bias+relu：dsl::compute == 参考", g_fail);
 
     // 折叠出的 spec 应含 matmul 段
     auto [spec, inputs] = nn::dsl::to_expr_spec(
@@ -147,11 +149,11 @@ void test_transpose_variants()
     const std::size_t M = 4, K = 5, N = 3;
     nn::CpuEngine eng;
     // A0: (M,K)；At: A^T 存储 (K,M)；B0: (K,N)；Bt: B^T 存储 (N,K)
-    const nn::Tensor A0 = make_tensor(M, K, 0.2f, 0.04f);
-    const nn::Tensor At = make_tensor(K, M, 0.2f, 0.04f);   // A^T
-    const nn::Tensor B0 = make_tensor(K, N, -0.1f, 0.03f);
-    const nn::Tensor Bt = make_tensor(N, K, -0.1f, 0.03f);  // B^T
-    const nn::Tensor bias = make_tensor(M, N, 0.1f, 0.01f);
+    const nn::Tensor A0 = make_tensor(eng, M, K, 0.2f, 0.04f);
+    const nn::Tensor At = make_tensor(eng, K, M, 0.2f, 0.04f);   // A^T
+    const nn::Tensor B0 = make_tensor(eng, K, N, -0.1f, 0.03f);
+    const nn::Tensor Bt = make_tensor(eng, N, K, -0.1f, 0.03f);  // B^T
+    const nn::Tensor bias = make_tensor(eng, M, N, 0.1f, 0.01f);
 
     const auto run = [&](bool trA, bool trB) {
         nn::ExprSpec s;
@@ -167,8 +169,8 @@ void test_transpose_variants()
         const nn::Tensor& B = trB ? Bt : B0;
         auto r = eng.eval_expr(s, std::vector<nn::Tensor>{A, B, bias}, M, N);
         if (!r) { CHECK(false, "transpose variant eval_expr 失败"); return std::string{}; }
-        auto ref = add_bias(*eng.matmul(A, B, trA, trB), bias);
-        check_close(*r, ref, trA && trB ? "matmul(A^T,B^T)+bias == 参考"
+        auto ref = add_bias(eng, *eng.matmul(A, B, trA, trB), bias);
+        check_close(eng, *r, ref, trA && trB ? "matmul(A^T,B^T)+bias == 参考"
                                         : (trA ? "matmul(A^T,B)+bias == 参考"
                                                : (trB ? "matmul(A,B^T)+bias == 参考"
                                                       : "matmul(A,B)+bias == 参考")), g_fail);
@@ -214,14 +216,14 @@ void test_key_shape_invariance()
     // 不同 k 的实际求值正确（用 k=8 的 spec 在 K=8 输入上求值）
     nn::CpuEngine eng;
     const std::size_t M = 3, K = 8, N = 2;
-    const nn::Tensor A = make_tensor(M, K, 0.4f, 0.02f);
-    const nn::Tensor B = make_tensor(K, N, 0.3f, -0.01f);
-    const nn::Tensor bias = make_tensor(M, N, 0.0f, 0.05f);
+    const nn::Tensor A = make_tensor(eng, M, K, 0.4f, 0.02f);
+    const nn::Tensor B = make_tensor(eng, K, N, 0.3f, -0.01f);
+    const nn::Tensor bias = make_tensor(eng, M, N, 0.0f, 0.05f);
     auto r = eng.eval_expr(make_spec(static_cast<std::uint32_t>(K)),
                            std::vector<nn::Tensor>{A, B, bias}, M, N);
     if (!r) { CHECK(false, "K=8 求值失败"); return; }
-    auto ref = add_bias(*eng.matmul(A, B, false, false), bias);
-    check_close(*r, ref, "K=8 求值 == 参考（k 只影响形状，不影响结构）", g_fail);
+    auto ref = add_bias(eng, *eng.matmul(A, B, false, false), bias);
+    check_close(eng, *r, ref, "K=8 求值 == 参考（k 只影响形状，不影响结构）", g_fail);
 }
 
 // ── 6) matmul 输出被归约指令消费：row_sum(matmul(x))（CPU 参考路径）──────
@@ -229,8 +231,8 @@ void test_matmul_reduce_instr()
 {
     const std::size_t M = 3, K = 4, N = 5;
     nn::CpuEngine eng;
-    const nn::Tensor A = make_tensor(M, K, 0.2f, 0.03f);
-    const nn::Tensor B = make_tensor(K, N, -0.2f, 0.04f);
+    const nn::Tensor A = make_tensor(eng, M, K, 0.2f, 0.03f);
+    const nn::Tensor B = make_tensor(eng, K, N, -0.2f, 0.04f);
 
     // row_sum(matmul(A,B))：归约指令 RowSum 的源是 Matmul 操作数
     nn::ExprSpec s;
@@ -249,20 +251,22 @@ void test_matmul_reduce_instr()
     CHECK(r->rows() == M && r->cols() == 1, "row_sum(matmul) 输出形状应为 (M,1)");
     auto mm = eng.matmul(A, B, false, false);
     auto ref = eng.row_reduce_sum(*mm);
-    check_close(*r, *ref, "row_sum(matmul) == 参考 row_reduce_sum(matmul)", g_fail);
+    check_close(eng, *r, *ref, "row_sum(matmul) == 参考 row_reduce_sum(matmul)", g_fail);
 
     // 广播输出：eval_expr（非 vector_out）应广播归约结果
     auto rb = eng.eval_expr(s, std::vector<nn::Tensor>{A, B}, M, N);
     if (!rb) { CHECK(false, "row_sum(matmul) eval_expr 失败"); return; }
-    nn::Tensor refb = nn::Tensor::cpu(M, N);
+    nn::Matrix refb_m(M, N);
     {
-        auto d = refb.cpu_matrix().span();
-        const auto rr = ref->cpu_matrix().span();
+        const nn::Matrix rrm = download(eng, *ref);
+        auto d = refb_m.span();
+        const auto rr = rrm.span();
         for (std::size_t r = 0; r < M; ++r)
             for (std::size_t c = 0; c < N; ++c)
                 d[r * N + c] = rr[r];
     }
-    check_close(*rb, refb, "row_sum(matmul) 广播输出 == 参考", g_fail);
+    nn::Tensor refb = upload(eng, refb_m);
+    check_close(eng, *rb, refb, "row_sum(matmul) 广播输出 == 参考", g_fail);
 }
 
 // ── 6b) 列归约 + matmul：col_max(matmul(x))（CPU 参考路径；含 batch 分解）
@@ -273,8 +277,8 @@ void test_col_matmul_reduce_instr()
     const std::size_t K = 4, N = 5, batch = 2, M = 3;
     const std::size_t rows = batch * M;   // 6：覆盖 rows != M 的 batch 分解
     nn::CpuEngine eng;
-    const nn::Tensor A = make_tensor(rows, K, 0.2f, 0.03f);   // transA=0 → (rows, K)
-    const nn::Tensor B = make_tensor(batch * K, N, -0.2f, 0.04f); // transB=0 → (batch*K, N)
+    const nn::Tensor A = make_tensor(eng, rows, K, 0.2f, 0.03f);   // transA=0 → (rows, K)
+    const nn::Tensor B = make_tensor(eng, batch * K, N, -0.2f, 0.04f); // transB=0 → (batch*K, N)
 
     nn::ExprSpec s;
     s.views    = {nn::expr::linear(), nn::expr::linear()};
@@ -294,11 +298,13 @@ void test_col_matmul_reduce_instr()
 
     // 独立标量参考（不走引擎解释器，避免同源）：
     //   C[(b*M+i), j] = Σ_k A[(b*M+i),k] * B[(b*K+k),j]；ref[j] = max_i C[i,j]
-    nn::Tensor ref = nn::Tensor::cpu(1, N);
+    nn::Matrix ref_m(1, N);
     {
-        const auto as = A.cpu_matrix().span();
-        const auto bs = B.cpu_matrix().span();
-        auto rs = ref.cpu_matrix().span();
+        const nn::Matrix am = download(eng, A);
+        const nn::Matrix bm = download(eng, B);
+        const auto as = am.span();
+        const auto bs = bm.span();
+        auto rs = ref_m.span();
         for (std::size_t j = 0; j < N; ++j)
         {
             float mx = 0.0f;
@@ -314,20 +320,23 @@ void test_col_matmul_reduce_instr()
             rs[j] = mx;
         }
     }
-    check_close(*r, ref, "col_max(matmul) batch=2 == 独立标量参考", g_fail);
+    nn::Tensor ref = upload(eng, ref_m);
+    check_close(eng, *r, ref, "col_max(matmul) batch=2 == 独立标量参考", g_fail);
 
     // 广播输出：eval_expr（非 vector_out）按列广播归约结果
     auto rb = eng.eval_expr(s, std::vector<nn::Tensor>{A, B}, rows, N);
     if (!rb) { CHECK(false, "col_max(matmul) eval_expr 失败"); return; }
-    nn::Tensor refb = nn::Tensor::cpu(rows, N);
+    nn::Matrix refb_m(rows, N);
     {
-        auto db = refb.cpu_matrix().span();
-        const auto rs = ref.cpu_matrix().span();
+        const nn::Matrix rm = download(eng, ref);
+        auto db = refb_m.span();
+        const auto rs = rm.span();
         for (std::size_t i = 0; i < rows; ++i)
             for (std::size_t j = 0; j < N; ++j)
                 db[i * N + j] = rs[j];
     }
-    check_close(*rb, refb, "col_max(matmul) 广播输出 == 参考", g_fail);
+    nn::Tensor refb = upload(eng, refb_m);
+    check_close(eng, *rb, refb, "col_max(matmul) 广播输出 == 参考", g_fail);
 }
 
 // ── 7) 校验：Matmul 操作数无 matmul 段 → 拒绝 ───────────────────────────
@@ -356,12 +365,12 @@ void test_dsl_pure_matmul()
 {
     const std::size_t M = 4, K = 6, N = 2;
     nn::CpuEngine eng;
-    const nn::Tensor A = make_tensor(M, K, 0.3f, 0.02f);
-    const nn::Tensor B = make_tensor(K, N, 0.1f, 0.03f);
+    const nn::Tensor A = make_tensor(eng, M, K, 0.3f, 0.02f);
+    const nn::Tensor B = make_tensor(eng, K, N, 0.1f, 0.03f);
     auto r = nn::dsl::compute(eng, dsl::matmul(A, B), M, N);
     if (!r) { CHECK(false, "DSL 纯 matmul compute 失败"); return; }
     auto ref = eng.matmul(A, B, false, false);
-    check_close(*r, *ref, "DSL 纯 matmul == 独立 matmul", g_fail);
+    check_close(eng, *r, *ref, "DSL 纯 matmul == 独立 matmul", g_fail);
 }
 
 } // namespace

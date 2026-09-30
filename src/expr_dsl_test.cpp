@@ -35,13 +35,17 @@ int g_fail = 0;
 
 
 // 手写 RoPE forward 参考（与 RotateHalfRef/RowModRef 语义一致）
-float rope_ref(const nn::Tensor& q, const nn::Tensor& cos, const nn::Tensor& sin,
-               std::size_t r, std::size_t c, std::size_t dk, bool backward)
+float rope_ref(nn::ComputeEngine& eng, const nn::Tensor& q, const nn::Tensor& cos,
+               const nn::Tensor& sin, std::size_t r, std::size_t c, std::size_t dk,
+               bool backward)
 {
     const std::size_t cols = q.cols();
-    const auto qs = q.cpu_matrix().span();
-    const auto cs = cos.cpu_matrix().span();
-    const auto ss = sin.cpu_matrix().span();
+    const auto qm = download(eng, q);
+    const auto cm = download(eng, cos);
+    const auto sm = download(eng, sin);
+    const auto qs = qm.span();
+    const auto cs = cm.span();
+    const auto ss = sm.span();
     const std::size_t rl = r % dk;
     const std::size_t rr = (r / dk) * dk + ((rl < dk / 2) ? rl + dk / 2 : rl - dk / 2);
     const float qc = qs[r * cols + c] * cs[(r % dk) * cols + c];
@@ -63,21 +67,23 @@ auto rope_expr(const nn::Tensor& q, const nn::Tensor& cos, const nn::Tensor& sin
 
 void test_rope()
 {
+    nn::CpuEngine eng;
     constexpr std::size_t DK = 32, ROWS = 64, COLS = 4;
-    nn::Tensor q = make_tensor(ROWS, COLS, 0.5f, 0.001f);
-    nn::Tensor cos = make_tensor(DK, COLS, 0.9f, 0.0002f);
-    nn::Tensor sin = make_tensor(DK, COLS, 0.1f, 0.0001f);
+    nn::Tensor q = make_tensor(eng, ROWS, COLS, 0.5f, 0.001f);
+    nn::Tensor cos = make_tensor(eng, DK, COLS, 0.9f, 0.0002f);
+    nn::Tensor sin = make_tensor(eng, DK, COLS, 0.1f, 0.0001f);
 
     // forward
     {
         auto expr = rope_expr<false>(q, cos, sin, DK);
         nn::Tensor out = eval_cpu(expr, ROWS, COLS);
-        const auto os = out.cpu_matrix().span();
+        const auto om = download(eng, out);
+        const auto os = om.span();
         bool ok = true;
         for (std::size_t r = 0; r < ROWS && ok; ++r)
             for (std::size_t c = 0; c < COLS; ++c)
             {
-                const float want = rope_ref(q, cos, sin, r, c, DK, false);
+                const float want = rope_ref(eng, q, cos, sin, r, c, DK, false);
                 const float got = os[r * COLS + c];
                 if (std::fabs(want - got) > 1e-5f) { ok = false; break; }
             }
@@ -104,12 +110,13 @@ void test_rope()
     {
         auto expr = rope_expr<true>(q, cos, sin, DK);
         nn::Tensor out = eval_cpu(expr, ROWS, COLS);
-        const auto os = out.cpu_matrix().span();
+        const auto om = download(eng, out);
+        const auto os = om.span();
         bool ok = true;
         for (std::size_t r = 0; r < ROWS && ok; ++r)
             for (std::size_t c = 0; c < COLS; ++c)
             {
-                const float want = rope_ref(q, cos, sin, r, c, DK, true);
+                const float want = rope_ref(eng, q, cos, sin, r, c, DK, true);
                 if (std::fabs(want - os[r * COLS + c]) > 1e-5f) { ok = false; break; }
             }
         CHECK(ok, "RoPE backward CPU 求值与参考一致");
@@ -131,17 +138,21 @@ void test_rope()
 
 void test_elementwise()
 {
+    nn::CpuEngine eng;
     constexpr std::size_t R = 8, C = 5;
-    nn::Tensor a = make_tensor(R, C, 1.0f, 0.1f);
-    nn::Tensor b = make_tensor(R, C, 0.5f, 0.05f);
+    nn::Tensor a = make_tensor(eng, R, C, 1.0f, 0.1f);
+    nn::Tensor b = make_tensor(eng, R, C, 0.5f, 0.05f);
 
     // a * 2 + b（标量广播）
     {
         auto expr = leaf(a) * Scalar{2} + leaf(b);
         nn::Tensor out = eval_cpu(expr, R, C);
-        const auto os = out.cpu_matrix().span();
-        const auto as = a.cpu_matrix().span();
-        const auto bs = b.cpu_matrix().span();
+        const auto om = download(eng, out);
+        const auto os = om.span();
+        const auto am = download(eng, a);
+        const auto as = am.span();
+        const auto bm = download(eng, b);
+        const auto bs = bm.span();
         bool ok = true;
         for (std::size_t i = 0; i < R * C; ++i)
             if (std::fabs((as[i] * 2.0f + bs[i]) - os[i]) > 1e-5f) { ok = false; break; }
@@ -155,8 +166,10 @@ void test_elementwise()
     {
         auto expr = relu(leaf(a));
         nn::Tensor out = eval_cpu(expr, R, C);
-        const auto os = out.cpu_matrix().span();
-        const auto as = a.cpu_matrix().span();
+        const auto om = download(eng, out);
+        const auto os = om.span();
+        const auto am = download(eng, a);
+        const auto as = am.span();
         bool ok = true;
         for (std::size_t i = 0; i < R * C; ++i)
             if (std::fabs((as[i] > 0.0f ? as[i] : 0.0f) - os[i]) > 1e-5f) { ok = false; break; }
@@ -170,8 +183,10 @@ void test_elementwise()
     {
         auto expr = select(leaf(a) > Scalar{0}, leaf(a), Scalar{0});
         nn::Tensor out = eval_cpu(expr, R, C);
-        const auto os = out.cpu_matrix().span();
-        const auto as = a.cpu_matrix().span();
+        const auto om = download(eng, out);
+        const auto os = om.span();
+        const auto am = download(eng, a);
+        const auto as = am.span();
         bool ok = true;
         for (std::size_t i = 0; i < R * C; ++i)
             if (std::fabs((as[i] > 0.0f ? as[i] : 0.0f) - os[i]) > 1e-5f) { ok = false; break; }
@@ -186,9 +201,12 @@ void test_elementwise()
     {
         auto expr = tanh(leaf(a)) + exp(leaf(b));
         nn::Tensor out = eval_cpu(expr, R, C);
-        const auto os = out.cpu_matrix().span();
-        const auto as = a.cpu_matrix().span();
-        const auto bs = b.cpu_matrix().span();
+        const auto om = download(eng, out);
+        const auto os = om.span();
+        const auto am = download(eng, a);
+        const auto as = am.span();
+        const auto bm = download(eng, b);
+        const auto bs = bm.span();
         bool ok = true;
         for (std::size_t i = 0; i < R * C; ++i)
             if (std::fabs((std::tanh(as[i]) + std::exp(bs[i])) - os[i]) > 1e-4f) { ok = false; break; }
@@ -200,11 +218,12 @@ void test_elementwise()
 
 void test_swiglu()
 {
+    nn::CpuEngine eng;
     constexpr std::size_t R = 8, C = 5;
-    nn::Tensor g = make_tensor(R, C, 0.3f, 0.01f);
-    nn::Tensor s = make_tensor(R, C, 0.7f, 0.008f);
-    nn::Tensor gate = make_tensor(R, C, 0.5f, 0.006f);
-    nn::Tensor up = make_tensor(R, C, 1.2f, 0.004f);
+    nn::Tensor g = make_tensor(eng, R, C, 0.3f, 0.01f);
+    nn::Tensor s = make_tensor(eng, R, C, 0.7f, 0.008f);
+    nn::Tensor gate = make_tensor(eng, R, C, 0.5f, 0.006f);
+    nn::Tensor up = make_tensor(eng, R, C, 1.2f, 0.004f);
 
     // grad_gate = g*up*s*(1 + gate*(1-s))（内联，与 Layer 相同）
     {
@@ -212,11 +231,16 @@ void test_swiglu()
         auto expr = leaf(g) * leaf(up)
             * (leaf(s) * (one + leaf(gate) * (one - leaf(s))));
         nn::Tensor out = eval_cpu(expr, R, C);
-        const auto os = out.cpu_matrix().span();
-        const auto gs = g.cpu_matrix().span();
-        const auto ss = s.cpu_matrix().span();
-        const auto gts = gate.cpu_matrix().span();
-        const auto us = up.cpu_matrix().span();
+        const auto om = download(eng, out);
+        const auto os = om.span();
+        const auto gm = download(eng, g);
+        const auto gs = gm.span();
+        const auto sm = download(eng, s);
+        const auto ss = sm.span();
+        const auto gtm = download(eng, gate);
+        const auto gts = gtm.span();
+        const auto um = download(eng, up);
+        const auto us = um.span();
         bool ok = true;
         for (std::size_t i = 0; i < R * C; ++i)
         {
@@ -234,10 +258,14 @@ void test_swiglu()
     {
         auto expr = leaf(g) * leaf(gate) * leaf(s);
         nn::Tensor out = eval_cpu(expr, R, C);
-        const auto os = out.cpu_matrix().span();
-        const auto gs = g.cpu_matrix().span();
-        const auto ss = s.cpu_matrix().span();
-        const auto gts = gate.cpu_matrix().span();
+        const auto om = download(eng, out);
+        const auto os = om.span();
+        const auto gm = download(eng, g);
+        const auto gs = gm.span();
+        const auto sm = download(eng, s);
+        const auto ss = sm.span();
+        const auto gtm = download(eng, gate);
+        const auto gts = gtm.span();
         bool ok = true;
         for (std::size_t i = 0; i < R * C; ++i)
             if (std::fabs((gs[i] * gts[i] * ss[i]) - os[i]) > 1e-4f) { ok = false; break; }

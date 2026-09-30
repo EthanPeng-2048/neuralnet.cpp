@@ -743,17 +743,13 @@ void log_gradient_stats(nn::ComputeEngine &engine, const std::vector<nn::TensorR
     for (auto& grad_ref : grads)
     {
         const auto& grad = grad_ref.get();
-        // GPU 张量需要下载到 CPU
+        // M1（docs/development/17 §4.1）：张量读取一律经引擎下载到宿主
+        // （GPU 直接下载；CPU 同样走 to_matrix，f16 存储也安全）
         nn::Matrix mat;
-        if (grad.device() == nn::Device::GPU)
         {
             auto m = engine.to_matrix(grad);
             if (!m) continue;
             mat = std::move(*m);
-        }
-        else
-        {
-            mat = grad.cpu_matrix();
         }
 
         const Scalar sum_sq = mat.reduce(Scalar{0}, std::plus<>{},
