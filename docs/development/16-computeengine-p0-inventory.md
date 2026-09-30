@@ -1,6 +1,7 @@
 # ComputeEngine Refresh P0 盘点报告（2026-09-28）
 
-> 配套文档：方案见 `docs/development/15-computeengine-refresh.md`（分期 P0-P6），
+> 配套文档：方案见 `docs/development/15-computeengine-refresh.md`（分期 P0-P6；
+> 2026-09-30 起未实施的 P2-P6 由 `17-unified-tensor-engine.md` §5 改期 M1-M7），
 > 选型出处 `docs/development/13-refactor-backlog.md` §10。
 > **本文是 P0（0 代码改动调研）的实测结果**；未决点与失败项只记录、不修复。
 > 除新增探针 `src/gpu_stability_probe.cpp`（P0 工具，app 目标不注册 ctest）外，
