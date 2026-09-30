@@ -6,13 +6,18 @@
 //   FNV-1a 校验和是否**逐位一致**；同时输出固定前缀行，便于跨进程
 //   （两次启动二进制）用 grep + diff 比对。
 //
-// 退出码：0 = 两轮逐位一致；1 = 不一致（run-to-run 非确定）；2 = 运行错误。
-// 用法：gpu_stability_probe [--steps N] [--gpu [索引|--gpu=<名称>]] [--help]
-//   设备选择在首个 GpuBackend::instance() 之前注入 NN_VULKAN_DEVICE。
+// 两种模式：
+//   默认（--steps N）：如上两轮训练比对。init 已于 M2 收编为确定性
+//     InitSpec（17 §4.4），此处**仍用固定公式覆写全部参数**——彻底隔离
+//     init 变量，只测后端执行的确定性（输运路径不受初值影响）。
+//   --init-hash：只建模型、不训练，比**初值**本身的确定性（M2 专属验收：
+//     两次运行初值逐字节同）。覆盖 mlp/cnn/transformer/gpt/zipt/rapt 六类
+//     模型的全部 init 路径；输出 INIT1/INIT2 固定前缀行，跨进程比对：
+//     两次启动后 `grep '^INIT1' 各自输出 | diff`。
 //
-// 注意：Linear 等层 init 用 thread_local rng(std::random_device{})，权重
-//   起点天然跨轮不同——本探针在 init 后用固定公式**覆写全部参数**，
-//   保证两轮训练起点逐位一致，只测后端执行的确定性。
+// 退出码：0 = 两轮逐位一致；1 = 不一致（run-to-run 非确定）；2 = 运行错误。
+// 用法：gpu_stability_probe [--steps N] [--init-hash] [--gpu [索引|--gpu=<名称>]] [--help]
+//   设备选择在首个 GpuBackend::instance() 之前注入 NN_VULKAN_DEVICE。
 // ────────────────────────────────────────────────────────────────────────
 
 #include <cinttypes>
@@ -23,6 +28,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "neuralnet.cpp/cli/cli_gpu_option.hpp"
@@ -80,11 +86,9 @@ namespace
         return h;
     }
 
-    // 一轮完整训练：建引擎 → 建模型（覆写权重）→ N 步 AdamW → 回读校验和
-    nn::Result<RunResult> run_once(bool gpu, std::size_t steps)
+    // 设备引擎（GPU 在首个 GpuBackend::instance() 前已注入 NN_VULKAN_DEVICE）
+    nn::Result<std::unique_ptr<nn::ComputeEngine>> make_engine(bool gpu)
     {
-        RunResult out;
-
         std::unique_ptr<nn::ComputeEngine> eng;
         if (gpu)
         {
@@ -98,7 +102,17 @@ namespace
         {
             eng = std::make_unique<nn::CpuEngine>();
         }
-        nn::ComputeEngine &e = *eng;
+        return eng;
+    }
+
+    // 一轮完整训练：建引擎 → 建模型（覆写权重）→ N 步 AdamW → 回读校验和
+    nn::Result<RunResult> run_once(bool gpu, std::size_t steps)
+    {
+        RunResult out;
+
+        auto eng_r = make_engine(gpu);
+        if (!eng_r) return std::unexpected(eng_r.error());
+        nn::ComputeEngine &e = **eng_r;
 
         // 微型配置：两层 GPT，seq=16 batch=2，双轮各 40 次前反向，足够覆盖
         // matmul / attention / embedding / CE / 优化器全链路。
@@ -151,12 +165,84 @@ namespace
         out.param_hash = *h;
         return out;
     }
+
+    // ── 初值确定性（M2 专属验收）：建模型后立刻哈希参数（不覆写）────────
+    using InitHashes = std::vector<std::pair<std::string, std::uint64_t>>;
+
+    nn::Result<void> hash_model(nn::ComputeEngine &e, const char *name,
+                                nn::Result<nn::Model> &&mr, InitHashes &out)
+    {
+        if (!mr) return std::unexpected(mr.error());
+        nn::Model model = std::move(*mr);
+        auto h = hash_params(e, model);
+        if (!h) return std::unexpected(h.error());
+        out.emplace_back(name, *h);
+        return {};
+    }
+
+    // 六类模型 = 全部 init 路径（Linear/Conv/Norm 常数/token_emb/位置编码/
+    // CrossAttention P/ones_row_）。同一引擎顺序构建：创建序号（InitSpec
+    // 混流）按构造顺序推进，跨进程同序 → 初值逐字节确定。
+    nn::Result<InitHashes> run_init_hash(bool gpu)
+    {
+        auto eng_r = make_engine(gpu);
+        if (!eng_r) return std::unexpected(eng_r.error());
+        nn::ComputeEngine &e = **eng_r;
+        InitHashes out;
+
+        if (auto r = hash_model(e, "mnist_mlp", nn::build_mnist_mlp_model(e), out); !r)
+            return std::unexpected(r.error());
+
+        nn::CnnConfig ccfg;
+        ccfg.convs = nn::MNIST_CNN_CONVS;
+        ccfg.fc_dims = nn::MNIST_CNN_FC;
+        if (auto r = hash_model(e, "cnn", nn::build_cnn_model(e, ccfg), out); !r)
+            return std::unexpected(r.error());
+
+        if (auto r = hash_model(e, "mnist_transformer",
+                                nn::build_mnist_transformer_model(e), out); !r)
+            return std::unexpected(r.error());
+
+        nn::GptConfig gcfg{};
+        gcfg.vocab_size = 257;
+        gcfg.d_model     = 32;
+        gcfg.seq_len     = 16;
+        gcfg.num_heads   = 4;
+        gcfg.d_ff        = 128;
+        gcfg.num_layers  = 2;
+        if (auto r = hash_model(e, "gpt", nn::build_gpt_model(e, gcfg), out); !r)
+            return std::unexpected(r.error());
+
+        nn::ZiPTConfig zcfg;
+        zcfg.vocab_size    = 257;
+        zcfg.d_model       = 32;
+        zcfg.seq_len       = 16;
+        zcfg.num_heads     = 4;
+        zcfg.d_ff          = 64;
+        zcfg.num_layers    = 2;
+        zcfg.memory_tokens = 8;
+        if (auto r = hash_model(e, "zipt", nn::build_zipt_model(e, zcfg), out); !r)
+            return std::unexpected(r.error());
+
+        nn::RAPTConfig rcfg;
+        rcfg.vocab_size = 257;
+        rcfg.d_model    = 32;
+        rcfg.seq_len    = 16;
+        rcfg.num_heads  = 4;
+        rcfg.d_ff       = 64;
+        rcfg.num_layers = 2;
+        if (auto r = hash_model(e, "rapt", nn::build_rapt_model(e, rcfg), out); !r)
+            return std::unexpected(r.error());
+
+        return out;
+    }
 } // namespace
 
 int main(int argc, char **argv)
 {
     std::size_t steps = 20;
     bool gpu = false;
+    bool init_hash = false;
     std::string device_desc = "cpu";
 
     for (int i = 1; i < argc;)
@@ -184,9 +270,14 @@ int main(int argc, char **argv)
             steps = static_cast<std::size_t>(std::strtoull(argv[i + 1], nullptr, 10));
             i += 2;
         }
+        else if (std::strcmp(argv[i], "--init-hash") == 0)
+        {
+            init_hash = true;
+            ++i;
+        }
         else if (std::strcmp(argv[i], "--help") == 0)
         {
-            std::printf("用法: %s [--steps N] [--gpu [索引]]\n", argv[0]);
+            std::printf("用法: %s [--steps N] [--init-hash] [--gpu [索引]]\n", argv[0]);
             return 0;
         }
         else
@@ -221,6 +312,32 @@ int main(int argc, char **argv)
     else
     {
         std::printf("CONFIG device=cpu steps=%zu\n", steps);
+    }
+
+    // ── --init-hash 模式（M2）：只建模型比初值，不训练 ────────────────────
+    if (init_hash)
+    {
+        auto a = run_init_hash(gpu);
+        if (!a)
+        {
+            std::fprintf(stderr, "init-hash round1 失败: %s\n", a.error().message.c_str());
+            return 2;
+        }
+        auto b = run_init_hash(gpu);
+        if (!b)
+        {
+            std::fprintf(stderr, "init-hash round2 失败: %s\n", b.error().message.c_str());
+            return 2;
+        }
+        // 固定前缀行：跨进程比对用 `grep '^INIT1' <(两次启动输出) | diff`
+        for (const auto &kv : *a)
+            std::printf("INIT1 %s hash=%016" PRIx64 "\n", kv.first.c_str(), kv.second);
+        for (const auto &kv : *b)
+            std::printf("INIT2 %s hash=%016" PRIx64 "\n", kv.first.c_str(), kv.second);
+        const bool match = (*a == *b);
+        std::printf("RESULT init_in_process_match=%d verdict=%s\n",
+                    match ? 1 : 0, match ? "PASS" : "FAIL");
+        return match ? 0 : 1;
     }
 
     auto r1 = run_once(gpu, steps);

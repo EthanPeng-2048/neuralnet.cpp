@@ -82,19 +82,17 @@ public:
 
     [[nodiscard]] Result<void> init(ComputeEngine& engine) override
     {
-        // 初始化记忆查询 P（列主序 (d_model, M)，每列一个记忆查询）
-        Matrix p_cpu(d_model_, memory_);
+        // 初始化记忆查询 P（列主序 (d_model, M)，每列一个记忆查询）——
+        // M2 声明式：层算 limit、引擎填数；分布 seed 显式（原 random_device
+        // 跨进程不确定已收编）。参数精度保持 F32（与原 from_matrix 默认一致）。
         const Scalar limit = std::sqrt(6.0 / static_cast<Scalar>(d_model_ + memory_));
-        std::uniform_real_distribution<Scalar> dist(-limit, limit);
-        std::mt19937_64 rng{std::random_device{}()};
-        auto sp = p_cpu.span();
-        for (std::size_t i = 0; i < p_cpu.size(); ++i) sp[i] = dist(rng);
-        auto pr = engine.from_matrix(p_cpu);
-        if (!pr) return std::unexpected(pr.error());
-        P_ = std::move(*pr);
+        P_ = engine.create_tensor(d_model_, memory_, Precision::F32,
+                                  InitSpec::uniform(-limit, limit, kInitSeed));
+        if (!P_.valid()) return std::unexpected(Error{"CrossAttention: P 初始化失败"});
 
-        grad_P_ = engine.create_tensor(d_model_, memory_);
-        { auto r = engine.zero(grad_P_); if (!r) return std::unexpected(r.error()); }
+        grad_P_ = engine.create_tensor(d_model_, memory_, Precision::F32, InitSpec::zero());
+        if (!grad_P_.valid())
+            return std::unexpected(Error{"CrossAttention: 梯度缓冲初始化失败"});
 
         auto r1 = w_k_.init(engine); if (!r1) return std::unexpected(r1.error());
         auto r2 = w_v_.init(engine); if (!r2) return std::unexpected(r2.error());
@@ -809,18 +807,17 @@ public:
 
     [[nodiscard]] Result<void> init(ComputeEngine& engine) override
     {
-        Matrix te(vocab_size_, d_model_);
+        // 初始化 token_emb_——M2 声明式：N(0, 0.02) 层算参数、引擎填数
         constexpr Scalar emb_init_std = 0.02;
-        std::mt19937_64 rng{42};
-        std::normal_distribution<Scalar> dist(0.0, emb_init_std);
-        auto te_s = te.span();
-        for (std::size_t i = 0; i < te.size(); ++i) te_s[i] = dist(rng);
-        auto te_r = engine.from_matrix(te);
-        if (!te_r) return std::unexpected(te_r.error());
-        token_emb_ = std::move(*te_r);
+        token_emb_ = engine.create_tensor(vocab_size_, d_model_, Precision::F32,
+                                          InitSpec::normal(0, emb_init_std, kInitSeed));
+        if (!token_emb_.valid())
+            return std::unexpected(Error{"ZiPT: token_emb 初始化失败"});
 
-        grad_token_emb_ = engine.create_tensor(vocab_size_, d_model_);
-        { auto r = engine.zero(grad_token_emb_); if (!r) return std::unexpected(r.error()); }
+        grad_token_emb_ = engine.create_tensor(vocab_size_, d_model_, Precision::F32,
+                                               InitSpec::zero());
+        if (!grad_token_emb_.valid())
+            return std::unexpected(Error{"ZiPT: token_emb 梯度缓冲初始化失败"});
 
         if (pos_encoder_)
         {

@@ -1150,18 +1150,17 @@ public:
 
     [[nodiscard]] Result<void> init(ComputeEngine& engine) override
     {
-        Matrix te(vocab_size_, d_model_);
+        // 初始化 token_emb_——M2 声明式：N(0, 0.02) 层算参数、引擎填数
         constexpr Scalar emb_init_std = 0.02;
-        std::mt19937_64 rng{42};
-        std::normal_distribution<Scalar> dist(0.0, emb_init_std);
-        auto te_s = te.span();
-        for (std::size_t i = 0; i < te.size(); ++i) te_s[i] = dist(rng);
-        auto te_r = engine.from_matrix(te);
-        if (!te_r) return std::unexpected(te_r.error());
-        token_emb_ = std::move(*te_r);
+        token_emb_ = engine.create_tensor(vocab_size_, d_model_, Precision::F32,
+                                          InitSpec::normal(0, emb_init_std, kInitSeed));
+        if (!token_emb_.valid())
+            return std::unexpected(Error{"RAPTModel: token_emb 初始化失败"});
 
-        grad_token_emb_ = engine.create_tensor(vocab_size_, d_model_);
-        { auto r = engine.zero(grad_token_emb_); if (!r) return std::unexpected(r.error()); }
+        grad_token_emb_ = engine.create_tensor(vocab_size_, d_model_, Precision::F32,
+                                               InitSpec::zero());
+        if (!grad_token_emb_.valid())
+            return std::unexpected(Error{"RAPTModel: token_emb 梯度缓冲初始化失败"});
 
         if (pos_encoder_)
         {

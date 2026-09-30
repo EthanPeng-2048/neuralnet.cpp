@@ -37,41 +37,27 @@ private:
     Tensor grad_b_;      // 偏置梯度
     Tensor input_cache_; // forward 输入缓存（供 backward 使用）
 
-    inline static thread_local std::mt19937_64 rng_{std::random_device{}()};
-
 public:
     Linear(std::size_t in_features, std::size_t out_features)
         : in_features_(in_features), out_features_(out_features) {}
 
     [[nodiscard]] Result<void> init(ComputeEngine& engine) override
     {
-        // ── 在 CPU 上初始化权重（Xavier 均匀分布） ──
-        Matrix w_cpu(out_features_, in_features_);
+        // ── 声明式初始化（M2，17 §4.4）：层算分布参数，引擎填数 ──────────
+        // Xavier 均匀分布；精度 = p_.param（§9.2：f16 配置按 p_.param 舍入
+        // 存储、体积减半，f32 配置保持原值）。分布 seed 显式传（U1）。
         const Scalar limit = std::sqrt(6.0 / static_cast<Scalar>(in_features_ + out_features_));
-        std::uniform_real_distribution<Scalar> dist(-limit, limit);
-        auto w_span = w_cpu.span();
-        for (std::size_t i = 0; i < w_cpu.size(); ++i)
-            w_span[i] = dist(rng_);
-
-        Matrix b_cpu(out_features_, 1);  // 零初始化
-
-        // ── 通过 engine 上传到目标设备（精度 = p_.param，§9.2）──────────────
-        // f16 配置 = 权重按 p_.param 舍入存储（体积减半）；f32 配置保持原值
-        auto w_res = engine.from_matrix(w_cpu, p_.param);
-        if (!w_res) return std::unexpected(w_res.error());
-        w_ = std::move(*w_res);
-
-        auto b_res = engine.from_matrix(b_cpu, p_.param);
-        if (!b_res) return std::unexpected(b_res.error());
-        b_ = std::move(*b_res);
+        w_ = engine.create_tensor(out_features_, in_features_, p_.param,
+                                  InitSpec::uniform(-limit, limit, kInitSeed));
+        if (!w_.valid()) return std::unexpected(Error{"Linear: 权重初始化失败"});
+        b_ = engine.create_tensor(out_features_, 1, p_.param, InitSpec::zero());
+        if (!b_.valid()) return std::unexpected(Error{"Linear: 偏置初始化失败"});
 
         // ── 梯度张量精度 = p_.param（与参数同精度；§8.3 存储精度不可变）──
-        grad_w_ = engine.create_tensor(out_features_, in_features_, p_.param);
-        grad_b_ = engine.create_tensor(out_features_, 1, p_.param);
-        auto r1 = engine.zero(grad_w_);
-        auto r2 = engine.zero(grad_b_);
-        if (!r1) return std::unexpected(r1.error());
-        if (!r2) return std::unexpected(r2.error());
+        grad_w_ = engine.create_tensor(out_features_, in_features_, p_.param, InitSpec::zero());
+        grad_b_ = engine.create_tensor(out_features_, 1, p_.param, InitSpec::zero());
+        if (!grad_w_.valid() || !grad_b_.valid())
+            return std::unexpected(Error{"Linear: 梯度缓冲初始化失败"});
         return {};
     }
 
@@ -429,22 +415,16 @@ public:
 
     [[nodiscard]] Result<void> init(ComputeEngine& engine) override
     {
-        // gamma 初始化为 1, beta 初始化为 0
-        Matrix gamma_cpu(normalized_shape_, 1, Scalar{1});
-        Matrix beta_cpu(normalized_shape_, 1, Scalar{0});
+        // gamma 初始化为 1, beta 初始化为 0（M2 声明式：引擎填数）
+        gamma_ = engine.create_tensor(normalized_shape_, 1, p_.param, InitSpec::constant(1));
+        beta_ = engine.create_tensor(normalized_shape_, 1, p_.param, InitSpec::zero());
+        if (!gamma_.valid() || !beta_.valid())
+            return std::unexpected(Error{"LayerNorm: 参数初始化失败"});
 
-        auto g = engine.from_matrix(gamma_cpu, p_.param);
-        if (!g) return std::unexpected(g.error());
-        gamma_ = std::move(*g);
-
-        auto bv = engine.from_matrix(beta_cpu, p_.param);
-        if (!bv) return std::unexpected(bv.error());
-        beta_ = std::move(*bv);
-
-        grad_gamma_ = engine.create_tensor(normalized_shape_, 1, p_.param);
-        grad_beta_ = engine.create_tensor(normalized_shape_, 1, p_.param);
-        { auto r1 = engine.zero(grad_gamma_); if (!r1) return std::unexpected(r1.error()); }
-        { auto r2 = engine.zero(grad_beta_);  if (!r2) return std::unexpected(r2.error()); }
+        grad_gamma_ = engine.create_tensor(normalized_shape_, 1, p_.param, InitSpec::zero());
+        grad_beta_ = engine.create_tensor(normalized_shape_, 1, p_.param, InitSpec::zero());
+        if (!grad_gamma_.valid() || !grad_beta_.valid())
+            return std::unexpected(Error{"LayerNorm: 梯度缓冲初始化失败"});
         return {};
     }
 
@@ -653,14 +633,14 @@ public:
 
     [[nodiscard]] Result<void> init(ComputeEngine& engine) override
     {
-        // gamma 初始化为 1（无 beta）
-        Matrix gamma_cpu(normalized_shape_, 1, Scalar{1});
-        auto g = engine.from_matrix(gamma_cpu, p_.param);
-        if (!g) return std::unexpected(g.error());
-        gamma_ = std::move(*g);
+        // gamma 初始化为 1（无 beta）——M2 声明式：引擎填数
+        gamma_ = engine.create_tensor(normalized_shape_, 1, p_.param, InitSpec::constant(1));
+        if (!gamma_.valid())
+            return std::unexpected(Error{"RMSNorm: 参数初始化失败"});
 
-        grad_gamma_ = engine.create_tensor(normalized_shape_, 1, p_.param);
-        { auto r1 = engine.zero(grad_gamma_); if (!r1) return std::unexpected(r1.error()); }
+        grad_gamma_ = engine.create_tensor(normalized_shape_, 1, p_.param, InitSpec::zero());
+        if (!grad_gamma_.valid())
+            return std::unexpected(Error{"RMSNorm: 梯度缓冲初始化失败"});
         return {};
     }
 

@@ -321,20 +321,22 @@ protected:
     std::size_t pos_indices_batch_ = 0;  // 缓存键：batch_size
     std::size_t pos_indices_seq_ = 0;    // 缓存键：seq_len
 
-    // 用给定的位置编码矩阵初始化 pos_emb_（learnable 时额外分配梯度）
-    [[nodiscard]] Result<void> init_(ComputeEngine& engine, Matrix&& pe, bool learnable)
+    // 用给定的位置编码张量初始化 pos_emb_（learnable 时额外分配梯度）。
+    // M2：入参由 Matrix 改为 Tensor——调用方经引擎创建（InitSpec 填数或
+    // from_matrix 宿主公式），本函数只负责装配与梯度缓冲。
+    [[nodiscard]] Result<void> init_(ComputeEngine& engine, Tensor&& pe, bool learnable)
     {
         const std::size_t rows = pe.rows();
         const std::size_t cols = pe.cols();
         learnable_ = learnable;
-        auto pe_r = engine.from_matrix(pe, p_.param);
-        if (!pe_r) return std::unexpected(pe_r.error());
-        pos_emb_ = std::move(*pe_r);
+        pos_emb_ = std::move(pe);
+        if (!pos_emb_.valid())
+            return std::unexpected(Error{"PositionEncoder: 位置编码创建失败"});
         if (learnable_)
         {
-            grad_pos_emb_ = engine.create_tensor(rows, cols, p_.param);
-            auto r = engine.zero(grad_pos_emb_);
-            if (!r) return std::unexpected(r.error());
+            grad_pos_emb_ = engine.create_tensor(rows, cols, p_.param, InitSpec::zero());
+            if (!grad_pos_emb_.valid())
+                return std::unexpected(Error{"PositionEncoder: 梯度缓冲初始化失败"});
         }
         return {};
     }
@@ -427,10 +429,6 @@ class LearnedPositionEncoder final : public AdditivePositionEncoder
 {
     std::size_t d_model_;
     std::size_t seq_len_;
-    // 自持 RNG（seed=42、N(0,0.02)）：init() 延迟到构造之后调用，
-    // 不能持有指向构造函数局部变量的非拥有指针（会悬空）。
-    std::mt19937_64 rng_{42};
-    std::normal_distribution<Scalar> dist_{0.0, 0.02};
 
 public:
     LearnedPositionEncoder(std::size_t d_model, std::size_t seq_len)
@@ -438,9 +436,12 @@ public:
 
     [[nodiscard]] Result<void> init(ComputeEngine& engine) override
     {
-        Matrix pe(seq_len_, d_model_);
-        auto pe_s = pe.span();
-        for (std::size_t i = 0; i < pe.size(); ++i) pe_s[i] = dist_(rng_);
+        // N(0, 0.02) 随机初始化——M2 声明式：层算分布参数、引擎填数，
+        // 分布 seed 显式传（U1）；不再自持 RNG。
+        auto pe = engine.create_tensor(seq_len_, d_model_, p_.param,
+                                       InitSpec::normal(0, 0.02, kInitSeed));
+        if (!pe.valid())
+            return std::unexpected(Error{"LearnedPositionEncoder: 初始化失败"});
         return init_(engine, std::move(pe), /*learnable=*/true);
     }
 };
@@ -467,7 +468,11 @@ public:
                     std::pow(Scalar{10000}, static_cast<Scalar>(2 * (i / 2)) / static_cast<Scalar>(d_model_));
                 pe_s[pos * d_model_ + i] = (i % 2 == 0) ? std::sin(angle) : std::cos(angle);
             }
-        return init_(engine, std::move(pe), /*learnable=*/false);
+        // 闭式公式（非分布/常数）仍宿主计算 → from_matrix 进引擎（M2 裁定：
+        // InitSpec 只收分布与常数初始化；公式数据迁移属 M3 write API 范围）
+        auto pe_t = engine.from_matrix(pe, p_.param);
+        if (!pe_t) return std::unexpected(pe_t.error());
+        return init_(engine, std::move(*pe_t), /*learnable=*/false);
     }
 };
 
@@ -597,20 +602,16 @@ public:
 
     [[nodiscard]] Result<void> init(ComputeEngine& engine) override
     {
-        // 初始化 token_emb_
-        Matrix te(vocab_size_, d_model_);
+        // 初始化 token_emb_——M2 声明式：N(0, 0.02) 层算参数、引擎填数
         constexpr Scalar emb_init_std = 0.02;
-        std::mt19937_64 rng{42};
-        std::normal_distribution<Scalar> dist(0.0, emb_init_std);
-        auto te_s = te.span();
-        for (std::size_t i = 0; i < te.size(); ++i) te_s[i] = dist(rng);
+        token_emb_ = engine.create_tensor(vocab_size_, d_model_, p_.param,
+                                          InitSpec::normal(0, emb_init_std, kInitSeed));
+        if (!token_emb_.valid())
+            return std::unexpected(Error{"GPTModel: token_emb 初始化失败"});
 
-        auto te_r = engine.from_matrix(te, p_.param);
-        if (!te_r) return std::unexpected(te_r.error());
-        token_emb_ = std::move(*te_r);
-
-        grad_token_emb_ = engine.create_tensor(vocab_size_, d_model_, p_.param);
-        { auto r1 = engine.zero(grad_token_emb_); if (!r1) return std::unexpected(r1.error()); }
+        grad_token_emb_ = engine.create_tensor(vocab_size_, d_model_, p_.param, InitSpec::zero());
+        if (!grad_token_emb_.valid())
+            return std::unexpected(Error{"GPTModel: token_emb 梯度缓冲初始化失败"});
 
         // 初始化子层
         if (pos_encoder_)
