@@ -104,7 +104,7 @@ private:
     {
         Tensor d = engine.create_tensor(1, 1);
         // create_tensor 分配失败时返回空 Tensor（非 Result）；此处显式检查，
-        // 否则 zero→ensure_gpu 只会报笼统的 "invalid tensor"，掩盖真实原因（显存/设备）。
+        // 否则 zero→import 只会报笼统的 "invalid tensor"，掩盖真实原因（显存/设备）。
         if (!d.valid())
             return std::unexpected(Error{
                 "make_dummy_: GPU 张量分配失败（显存不足或设备异常）"});
@@ -115,7 +115,7 @@ private:
 
     // 确保 V_ones / e_0 缓存与当前 BH·dk × seq 尺寸匹配。
     // 返回 Result：分配/upload 失败（常见为显存不足）时传播真实错误，
-    // 避免后续 scan/outer_col 对空张量报 "ensure_gpu: invalid tensor" 掩盖根因。
+    // 避免后续 scan/outer_col 对空张量报 "import: invalid tensor" 掩盖根因。
     [[nodiscard]] Result<void> ensure_ones_(
         ComputeEngine& engine, std::size_t BH, std::size_t dk, std::size_t seq)
     {

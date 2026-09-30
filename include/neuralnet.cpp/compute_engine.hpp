@@ -342,14 +342,39 @@ public:
     }
     [[nodiscard]] virtual Result<Matrix> to_matrix(const Tensor& t, Precision P = Precision::F32) = 0;
 
+    // ── 跨设备/引擎拉取（M6，17 §4.3 / 15 §3.2 P3）────────────────────────
+    // 目标侧拉取语义（15 §3.2）：
+    //   同设备 + 同精度 = 零拷贝别名；同设备 + 异精度 = 引擎内 cast；
+    //   跨设备 = 经宿主中转（基类默认实现），引擎可 override 成原生上传
+    //   （GpuEngine = 原 `ensure_gpu` 的直接上载路径，省一次宿主拷贝）。
+    // 返回**新句柄**，绝不改写调用方的 `src`——需要就地重绑定必须在调用点
+    // 显式写 `t = std::move(*import(t))`（与 `cast_into` 的不替换红线同族）。
+    // 命名即防线：跨设备互传只准经 `import`（16 §2 的 43 处 ensure_gpu 已迁完）。
+    [[nodiscard]] Result<Tensor> import(const Tensor& src)
+    {
+        return import(src, src.precision());
+    }
+
+    [[nodiscard]] Result<Tensor> import(const Tensor& src, Precision P)
+    {
+        if (auto ec = bind_check_({&src}); !ec)
+            return std::unexpected(ec.error());
+        if (!src.valid())
+            return std::unexpected(Error{"import: invalid tensor"});
+        return stamp_(import_impl(src, P));
+    }
+
     // ══════════════════════════════════════════════════════════════════════
-    // I/O 分组（M3，docs/development/17 §4.3 D3/D9）：
-    //   from_matrix / to_matrix / read / write / get_index / set_index
+    // I/O 分组（M3，docs/development/17 §4.3 D3/D9 + §3 D11）：
+    //   from_matrix / to_matrix / import / read / write / get_index / set_index
     // 宿主数据进出张量只准经本组动词；D9：from_matrix/to_matrix 保留原名
-    // （Matrix = 宿主 I/O 载体），新增批量 read/write 为**本体**，索引级
-    // get_index/set_index 是语法糖。审计口径（M4 分层审计接线）：库外
-    // （tests/tools/CLI）只准出现本组动词；计算路径（Layer/Loss/Optimizer/
-    // Model）禁用本组（序列化编解码层除外）。
+    // （Matrix = 宿主 I/O 载体），批量 read/write 为**本体**，索引级
+    // get_index/set_index 是语法糖，`import` 是跨设备/引擎拉取入口（M6，
+    // 原 `ensure_gpu` 迁入并升为引擎契约）。
+    // 分层口径（M4 D11 / 铁律 #12）：库外（tests/tools/CLI）只准出现本组动词；
+    // 计算路径（Layer/Loss/Optimizer/Model）禁用 **Matrix 型三动词**
+    //（from_matrix/to_matrix/copy_from），span 级 read/write 与
+    // `detail::upload_span/download_span` 宿主桥受控可用；序列化编解码层除外。
     //
     // 调用约定（17 §7-1/§7-4，铁律 #6）：
     //   - read 在 GPU 上**隐含 flush + 同步**（与 to_matrix 同路）：录制窗口
@@ -1390,6 +1415,22 @@ protected:
     // ── P1 NVI 的引擎侧实现（原公共虚入口下沉至此，stamp 在公共入口统一做）──
     [[nodiscard]] virtual Tensor create_tensor_impl(std::size_t rows, std::size_t cols, Precision P) = 0;
     [[nodiscard]] virtual Result<Tensor> from_matrix_impl(const Matrix& m, Precision P) = 0;
+    // 跨设备/引擎拉取（M6；公共入口 `import` 带 bind_check_ + stamp_）。
+    // 默认实现 = 经宿主中转；同设备快路（别名 / 引擎内 cast）也在默认实现内。
+    // GpuEngine override 为"CPU → 设备直传"（原 ensure_gpu 路径）。
+    [[nodiscard]] virtual Result<Tensor> import_impl(const Tensor& src, Precision P)
+    {
+        if (src.device() == device())
+        {
+            if (P == src.precision())
+                return src;                 // 同设备同精度 = 零拷贝别名
+            return cast(src, P);            // 同设备异精度 = 引擎内 cast
+        }
+        auto m = to_matrix(src, Precision::F32);   // 跨设备：宿主中转
+        if (!m)
+            return std::unexpected(m.error());
+        return from_matrix(*m, P);
+    }
     // cast 默认实现：同精度 = 返回 src（共享所有权，零拷贝）；跨精度 = 错误（引擎覆盖）
     [[nodiscard]] virtual Result<Tensor> cast_impl(const Tensor& src, Precision dst)
     {
