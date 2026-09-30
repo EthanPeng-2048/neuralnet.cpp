@@ -49,8 +49,9 @@ public:
     }
 
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) override
+        const Tensor& input) override
     {
+        ComputeEngine& engine = engine_ref();
         // 行 softmax（数值稳定）：out = exp(x - row_max) / Σ_c exp(x - row_max)
         // 单表达式融合：row_max/row_sum 为归约视图/归约指令，中间全尺寸
         // Tensor（shifted/exp_shift/row_max/row_sum 的物化）由融合 kernel 消解，
@@ -70,8 +71,9 @@ public:
     }
 
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output) override
+        const Tensor& grad_output) override
     {
+        ComputeEngine& engine = engine_ref();
         // grad_x = out ⊙ (grad_output - row_dot(out ⊙ grad_output))
         // 单表达式融合：row_dot 为归约指令，消除 ep/gmd 等全尺寸中间 Tensor。
         auto out = dsl::compute(engine,

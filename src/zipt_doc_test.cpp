@@ -54,7 +54,7 @@ Matrix run_forward(CpuEngine& eng, ZiPTBlock& blk,
     if (!m) { std::cerr << "  from_matrix(mem) 失败\n"; std::abort(); }
 
     blk.set_doc_ids(doc_ids);   // 空 = 纯因果局部掩码
-    auto y = blk.forward(eng, *x, *m);
+    auto y = blk.forward(*x, *m);
     if (!y) { std::cerr << "  ZiPTBlock forward 失败: " << y.error().message << "\n"; std::abort(); }
     auto ym = eng.to_matrix(*y);
     if (!ym) { std::cerr << "  to_matrix 失败\n"; std::abort(); }

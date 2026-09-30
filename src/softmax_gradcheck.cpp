@@ -28,7 +28,7 @@ namespace {
 
 Scalar eval_loss(ComputeEngine& engine, Softmax& sm, const Tensor& x, const Tensor& go)
 {
-    auto y = sm.forward(engine, x);
+    auto y = sm.forward(x);
     auto y_m = engine.to_matrix(*y);
     auto go_m = engine.to_matrix(go);
     return dot(*y_m, *go_m);
@@ -108,6 +108,7 @@ int main(int argc, char* argv[])
     std::cout << "  rows=" << rows << " cols=" << cols << " tol=" << tol << "\n";
 
     Softmax sm;
+    (void)sm.init(eng);   // M6 段 C：层由 init 绑定引擎
     std::mt19937_64 rng(123);
     std::uniform_real_distribution<Scalar> dist(-2, 2);
     Matrix x_m(rows, cols);
@@ -117,8 +118,8 @@ int main(int argc, char* argv[])
 
     auto x = eng.from_matrix(x_m);
     auto go = eng.from_matrix(go_m);
-    auto y_fwd = sm.forward(eng, *x);
-    auto gx = sm.backward(eng, *go);
+    auto y_fwd = sm.forward(*x);
+    auto gx = sm.backward(*go);
 
     const Scalar eps = 1e-3f;
     bool all_pass = check_input_grad(eng, sm, *go, *gx, x_m, eps, tol);

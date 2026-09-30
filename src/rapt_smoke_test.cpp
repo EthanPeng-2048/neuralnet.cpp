@@ -159,7 +159,7 @@ int main(int argc, char* argv[])
         { auto sp = x_m.span(); for (auto& v : sp) v = dist(rng); }
         auto x_t = eng.from_matrix(x_m);
         if (!x_t) return 1;
-        auto full = attn.forward(eng, *x_t);
+        auto full = attn.forward(*x_t);
         if (!full) { std::cerr << "kv full forward failed\n"; return 1; }
         auto full_m = eng.to_matrix(*full);
         if (!full_m) return 1;

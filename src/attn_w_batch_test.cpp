@@ -72,8 +72,8 @@ int main(int argc, char** argv)
         auto xg = gpu.from_matrix(x_m);
         if (!xc || !xg) { std::cerr << "from_matrix failed\n"; return false; }
 
-        auto yc = attn_cpu.forward(cpu, *xc);
-        auto yg = attn_gpu.forward(gpu, *xg);
+        auto yc = attn_cpu.forward(*xc);
+        auto yg = attn_gpu.forward(*xg);
         if (!yc) { std::cout << "CPU forward 失败: " << yc.error().message << "\n"; return false; }
         if (!yg) { std::cout << "GPU forward 失败: " << yg.error().message << "\n"; return false; }
 

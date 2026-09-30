@@ -161,7 +161,7 @@ int main(int argc, char* argv[])
 
     auto x = eng.from_matrix(ref.x);
     if (!x) return 1;
-    auto out = conv.forward(eng, *x);
+    auto out = conv.forward(*x);
     if (!out) { std::cerr << "  forward 失败: " << out.error().message << "\n"; return 1; }
     auto om = eng.to_matrix(*out);
     if (!om) return 1;
@@ -170,7 +170,7 @@ int main(int argc, char* argv[])
     Matrix gm = fill(C_out * OH * OW, B);
     auto go = eng.from_matrix(gm);
     if (!go) return 1;
-    auto gx = conv.backward(eng, *go);
+    auto gx = conv.backward(*go);
     if (!gx) { std::cerr << "  backward 失败: " << gx.error().message << "\n"; return 1; }
 
     Matrix gw_ref, gb_ref;

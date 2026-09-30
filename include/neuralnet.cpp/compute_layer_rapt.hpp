@@ -261,7 +261,7 @@ public:
                   "ReLULinearAttention: RoPE requires even d_k");
     }
 
-    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
         auto r1 = w_q_.init(engine); if (!r1) return std::unexpected(r1.error());
         auto r2 = w_k_.init(engine); if (!r2) return std::unexpected(r2.error());
@@ -365,8 +365,9 @@ public:
     // 实现：两次 scan_prefix_outer（主扫描 + z-scan），z-scan 用 V=ones 获得 z。
     // ══════════════════════════════════════════════════════════════════════
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) override
+        const Tensor& input) override
     {
+        ComputeEngine& engine = engine_ref();
         if (input.rows() != d_model_)
             return std::unexpected(Error{"ReLULinearAttention forward: input shape mismatch"});
 
@@ -377,11 +378,11 @@ public:
             return std::unexpected(Error{"ReLULinearAttention forward: cols not divisible by seq_len"});
         const std::size_t H_dk = num_heads_ * d_k_;
 
-        auto q_res = w_q_.forward(engine, input);
+        auto q_res = w_q_.forward(input);
         if (!q_res) return q_res;
-        auto k_res = w_k_.forward(engine, input);
+        auto k_res = w_k_.forward(input);
         if (!k_res) return k_res;
-        auto v_res = w_v_.forward(engine, input);
+        auto v_res = w_v_.forward(input);
         if (!v_res) return v_res;
 
         Tensor Q, K, V;   // (BH*dk, seq) rearranged
@@ -510,7 +511,7 @@ public:
         batch_cache_ = batch;
         seq_cache_   = seq;
 
-        return w_o_.forward(engine, concat);
+        return w_o_.forward(concat);
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -530,8 +531,9 @@ public:
     //   gV = S_B·k,  gK = S_B^T·v + suffix(scale·q)
     // ══════════════════════════════════════════════════════════════════════
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output) override
+        const Tensor& grad_output) override
     {
+        ComputeEngine& engine = engine_ref();
         // 缓存前置校验：checkpoint 模式（尚未 forward_recompute）或 offload
         // （尚未 import）下缓存为空，backward 必须立刻返回明确错误——否则空
         // 张量会流进 matmul 报出无关错误，甚至静默算出垃圾梯度。
@@ -548,7 +550,7 @@ public:
         const std::size_t batch = batch_cache_;
         const std::size_t H_dk = num_heads_ * d_k_;
 
-        auto gc = w_o_.backward(engine, grad_output);
+        auto gc = w_o_.backward(grad_output);
         if (!gc) return gc;
         Tensor gcr;
         if (batch > 1)
@@ -768,11 +770,11 @@ public:
             gv_r = std::move(gVt);
         }
 
-        auto giq = w_q_.backward(engine, gq_r);
+        auto giq = w_q_.backward(gq_r);
         if (!giq) return giq;
-        auto gik = w_k_.backward(engine, gk_r);
+        auto gik = w_k_.backward(gk_r);
         if (!gik) return gik;
-        auto giv = w_v_.backward(engine, gv_r);
+        auto giv = w_v_.backward(gv_r);
         if (!giv) return giv;
         // grad_input = gq + gk + gv：三路累加**原地**融合为单趟（目标传递，
         // 不额外分配）；求和按 (gq + gk) + gv 的固定顺序结合，跨 run 确定
@@ -791,11 +793,11 @@ public:
         ComputeEngine& engine, const Tensor& input,
         Tensor& B_state, Tensor& z_state, std::size_t pos)
     {
-        auto q_res = w_q_.forward(engine, input);   // (d_model, 1) = (H*dk, 1)
+        auto q_res = w_q_.forward(input);   // (d_model, 1) = (H*dk, 1)
         if (!q_res) return q_res;
-        auto k_res = w_k_.forward(engine, input);
+        auto k_res = w_k_.forward(input);
         if (!k_res) return k_res;
-        auto v_res = w_v_.forward(engine, input);
+        auto v_res = w_v_.forward(input);
         if (!v_res) return v_res;
         Tensor Q = std::move(*q_res), K = std::move(*k_res), V = std::move(*v_res);
         // RLA-2：RMSNorm on Q and K（per-head, dk blocks）
@@ -872,7 +874,7 @@ public:
             dsl::leaf(*num_r) / (dsl::leaf(*den_t) + Scalar{1e-4}),
             (*num_r).rows(), (*num_r).cols());
         if (!out_r) return std::unexpected(out_r.error());
-        return w_o_.forward(engine, *out_r);
+        return w_o_.forward(*out_r);
     }
 };
 
@@ -908,7 +910,7 @@ public:
         ff_.set_precision_profile(precision);
     }
 
-    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
         auto r1 = norm1_->init(engine); if (!r1) return std::unexpected(r1.error());
         auto r2 = attn_.init(engine);   if (!r2) return std::unexpected(r2.error());
@@ -958,10 +960,10 @@ public:
     // 模式（基类默认实现只改本块的标志位，子层仍处于 checkpoint 模式 →
     // forward 不会重建子层缓存 → backward 要么报错、要么误用上一 step 的陈旧缓存）。
     [[nodiscard]] Result<Tensor> forward_recompute(
-        ComputeEngine& engine, const Tensor& saved_input) override
+        const Tensor& saved_input) override
     {
         set_checkpoint_mode(false);
-        auto r = forward(engine, saved_input);
+        auto r = forward(saved_input);
         set_checkpoint_mode(true);
         return r;
     }
@@ -1006,19 +1008,20 @@ public:
     }
 
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) override
+        const Tensor& input) override
     {
-        auto n1 = norm1_->forward(engine, input);
+        ComputeEngine& engine = engine_ref();
+        auto n1 = norm1_->forward(input);
         if (!n1) return n1;
-        auto a = attn_.forward(engine, *n1);
+        auto a = attn_.forward(*n1);
         if (!a) return a;
         auto r1 = dsl::compute(engine,
             dsl::leaf(input) + dsl::leaf(*a),
             input.rows(), input.cols());
         if (!r1) return std::unexpected(r1.error());
-        auto n2 = norm2_->forward(engine, *r1);
+        auto n2 = norm2_->forward(*r1);
         if (!n2) return n2;
-        auto f = ff_.forward(engine, *n2);
+        auto f = ff_.forward(*n2);
         if (!f) return f;
         return dsl::compute(engine,
             dsl::leaf(*r1) + dsl::leaf(*f),
@@ -1026,25 +1029,26 @@ public:
     }
 
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output) override
+        const Tensor& grad_output) override
     {
+        ComputeEngine& engine = engine_ref();
         // activation offload：从 host 恢复激活再反向（替代重计算）
         if (offloader_.offloaded())
         {
             auto im = offloader_.import_activations(engine);
             if (!im) return std::unexpected(im.error());
         }
-        auto grad_ff = ff_.backward(engine, grad_output);
+        auto grad_ff = ff_.backward(grad_output);
         if (!grad_ff) return grad_ff;
-        auto b_n2 = norm2_->backward(engine, *grad_ff);
+        auto b_n2 = norm2_->backward(*grad_ff);
         if (!b_n2) return b_n2;
         auto grad_r1 = dsl::compute(engine,
             dsl::leaf(grad_output) + dsl::leaf(*b_n2),
             grad_output.rows(), grad_output.cols());
         if (!grad_r1) return std::unexpected(grad_r1.error());
-        auto grad_a = attn_.backward(engine, *grad_r1);
+        auto grad_a = attn_.backward(*grad_r1);
         if (!grad_a) return grad_a;
-        auto b_n1 = norm1_->backward(engine, *grad_a);
+        auto b_n1 = norm1_->backward(*grad_a);
         if (!b_n1) return b_n1;
         return dsl::compute(engine,
             dsl::leaf(*grad_r1) + dsl::leaf(*b_n1),
@@ -1057,7 +1061,7 @@ public:
         ComputeEngine& engine, const Tensor& input,
         Tensor& B_state, Tensor& z_state, std::size_t pos)
     {
-        auto n1 = norm1_->forward(engine, input);
+        auto n1 = norm1_->forward(input);
         if (!n1) return n1;
         auto a = attn_.forward_step(engine, *n1, B_state, z_state, pos);
         if (!a) return a;
@@ -1065,9 +1069,9 @@ public:
             dsl::leaf(input) + dsl::leaf(*a),
             input.rows(), input.cols());
         if (!r1) return std::unexpected(r1.error());
-        auto n2 = norm2_->forward(engine, *r1);
+        auto n2 = norm2_->forward(*r1);
         if (!n2) return n2;
-        auto f = ff_.forward(engine, *n2);
+        auto f = ff_.forward(*n2);
         if (!f) return f;
         return dsl::compute(engine,
             dsl::leaf(*r1) + dsl::leaf(*f),
@@ -1139,7 +1143,7 @@ public:
         pos_encoder_ = std::make_unique<NoPositionEncoder>();
     }
 
-    [[nodiscard]] Result<void> init(ComputeEngine& engine) override
+    [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
         // 初始化 token_emb_——M2 声明式：N(0, 0.02) 层算参数、引擎填数
         constexpr Scalar emb_init_std = 0.02;
@@ -1266,8 +1270,9 @@ public:
     }
 
     [[nodiscard]] Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) override
+        const Tensor& input) override
     {
+        ComputeEngine& engine = engine_ref();
         const std::size_t seq = input.rows();
         const std::size_t batch = input.cols();
         batch_size_ = batch;
@@ -1306,7 +1311,7 @@ public:
             {
                 b.set_checkpoint_mode(false);
             }
-            auto r = b.forward(engine, x);
+            auto r = b.forward(x);
             if (!r) return r;
             x = std::move(*r);
             // activation offload：forward 后把本块内部激活搬 host-visible（释放
@@ -1324,20 +1329,21 @@ public:
                 if (!fr) return std::unexpected(fr.error());
             }
         }
-        auto ln = ln_f_->forward(engine, x);
+        auto ln = ln_f_->forward(x);
         if (!ln) return ln;
-        return lm_head_.forward(engine, *ln);
+        return lm_head_.forward(*ln);
     }
 
     [[nodiscard]] Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output) override
+        const Tensor& grad_output) override
     {
+        ComputeEngine& engine = engine_ref();
         const std::size_t seq = seq_len_;
         const std::size_t batch = batch_size_;
 
-        auto b_lm = lm_head_.backward(engine, grad_output);
+        auto b_lm = lm_head_.backward(grad_output);
         if (!b_lm) return b_lm;
-        auto b_ln = ln_f_->backward(engine, *b_lm);
+        auto b_ln = ln_f_->backward(*b_lm);
         if (!b_ln) return b_ln;
         Tensor grad_x = std::move(*b_ln);
 
@@ -1351,10 +1357,10 @@ public:
                 const std::size_t seg = idx / checkpoint_every_;
                 NN_ASSERT(seg < checkpoint_inputs_.size(),
                           "RAPTModel backward: checkpoint input missing");
-                auto cr = blocks_[idx].forward_recompute(engine, checkpoint_inputs_[seg]);
+                auto cr = blocks_[idx].forward_recompute(checkpoint_inputs_[seg]);
                 if (!cr) return cr;
             }
-            auto br = blocks_[idx].backward(engine, grad_x);
+            auto br = blocks_[idx].backward(grad_x);
             if (!br)
                 return std::unexpected(Error{
                     "RAPTModel::backward: block " + std::to_string(idx) + " failed: "
@@ -1429,9 +1435,9 @@ public:
                 if (!r) return std::unexpected(r.error());
                 h = std::move(*r);
             }
-            auto ln = ln_f_->forward(engine, h);
+            auto ln = ln_f_->forward(h);
             if (!ln) return std::unexpected(ln.error());
-            auto logits = lm_head_.forward(engine, *ln);
+            auto logits = lm_head_.forward(*ln);
             if (!logits) return std::unexpected(logits.error());
             auto lm_v = detail::download_vector(engine, *logits);   // 宿主桥 D11
             if (!lm_v) return std::unexpected(lm_v.error());

@@ -56,6 +56,29 @@ protected:
     // 默认全 F32 = 现状行为，零回归（G5）
     PrecisionProfile p_;
 
+    // ── M6 段 C（17 §5 M6 / 15 §3.3）：每调用 engine 形参删除 ─────────────
+    // 层在 `init(engine)` 时绑定（公共 init 是 NVI 包装，绑定后转 init_impl），
+    // forward/backward/zero_grad/forward_recompute 不再收 engine 形参。
+    // 方法体里继续用局部名 `engine`：函数首行 `ComputeEngine& engine = *engine_;`
+    // （DSL 入口按 15 §3.3 保留形参，层传的就是这个局部引用）。
+    ComputeEngine* engine_ = nullptr;
+
+    // 绑定读取：未 init 就跑 forward 是调用方错误 → fail-fast 前先打**调用点**
+    //（source_location 默认参在调用处求值 → 能直接定位到是哪个层的哪个方法）。
+    [[nodiscard]] ComputeEngine& engine_ref(
+        std::source_location loc = std::source_location::current()) const
+    {
+        if (!engine_)
+        {
+            std::fprintf(stderr,
+                         "[layer-init] Layer: engine 未绑定（init(engine) 未被调用）"
+                         " —— 调用点 %s:%d\n",
+                         loc.file_name(), static_cast<int>(loc.line()));
+            NN_ASSERT(false, "Layer: engine 未绑定——先调 init(engine)（Model::add 会自动调）");
+        }
+        return *engine_;
+    }
+
 public:
     virtual ~Layer() = default;
 
@@ -65,20 +88,19 @@ public:
     virtual void set_precision_profile(const PrecisionProfile& profile) { p_ = profile; }
     [[nodiscard]] const PrecisionProfile& precision_profile() const noexcept { return p_; }
 
-    // forward/backward 接收 ComputeEngine 引用，自动适配 CPU/GPU
-    [[nodiscard]] virtual Result<Tensor> forward(
-        ComputeEngine& engine, const Tensor& input) = 0;
+    // forward/backward 只写一次，CPU/GPU 由引擎实现自动分发（引擎来自 init 绑定）
+    [[nodiscard]] virtual Result<Tensor> forward(const Tensor& input) = 0;
 
-    [[nodiscard]] virtual Result<Tensor> backward(
-        ComputeEngine& engine, const Tensor& grad_output) = 0;
+    [[nodiscard]] virtual Result<Tensor> backward(const Tensor& grad_output) = 0;
 
     // 参数访问（供 optimizer 使用）— 使用 reference_wrapper 替代裸指针，明确表达非拥有语义
     [[nodiscard]] virtual std::vector<TensorRef> parameters() { return {}; }
     [[nodiscard]] virtual std::vector<TensorRef> param_gradients() { return {}; }
 
     // 梯度清零（每个训练 step 开始前调用）
-    [[nodiscard]] virtual Result<void> zero_grad(ComputeEngine& engine)
+    [[nodiscard]] virtual Result<void> zero_grad()
     {
+        ComputeEngine& engine = engine_ref();
         for (auto& grad : param_gradients())
         {
             auto r = engine.zero(grad);
@@ -100,9 +122,14 @@ public:
     [[nodiscard]] virtual std::vector<TensorRef> extra_state() { return {}; }
 
     // 引擎相关初始化（创建/上传权重张量），替换构造函数中的 NN_ASSERT 模式。
-    // 默认实现空操作；各层在构造后由 Model::add<T>() 调用。
-    // 返回 Result 以正确传播引擎错误，而非在 Release 下吞掉。
-    [[nodiscard]] virtual Result<void> init(ComputeEngine& /*engine*/) { return {}; }
+    // **NVI（M6 段 C）**：公共入口负责绑定 engine_，各层 override `init_impl`
+    //（层代码不感知绑定，改名由编译器穷尽驱动：`init(...) override` → `init_impl`）。
+    // 默认实现空操作；各层在构造后由 Model::add<T>() 调用（测试里也必须调一次）。
+    [[nodiscard]] Result<void> init(ComputeEngine& engine)
+    {
+        engine_ = &engine;
+        return init_impl(engine);
+    }
 
     // 梯度检查点（激活重计算）契约 ──────────────────────────────────
     // checkpoint_mode_ = true 时，forward 不保留中间激活（供 L1 激活重计算）；
@@ -126,15 +153,20 @@ public:
     // 从保存的输入重算 forward，重建本层 backward 所需的中间缓存。
     // 默认实现：临时关闭 checkpoint 模式重跑 forward（保留缓存）再恢复。
     // 复合层（GPTBlock 等）override 以同时关闭子层的 checkpoint 模式。
-    [[nodiscard]] virtual Result<Tensor> forward_recompute(
-        ComputeEngine& engine, const Tensor& saved_input)
+    [[nodiscard]] virtual Result<Tensor> forward_recompute(const Tensor& saved_input)
     {
         const bool prev = checkpoint_mode_;
         checkpoint_mode_ = false;
-        auto r = forward(engine, saved_input);
+        auto r = forward(saved_input);
         checkpoint_mode_ = prev;
         return r;
     }
+
+protected:
+    // 各层的初始化实现（原 `init(ComputeEngine&)` override 全部改名至此）
+    [[nodiscard]] virtual Result<void> init_impl(ComputeEngine& /*engine*/) { return {}; }
+
+public:
 
     // 梯度检查点粒度（默认 0 = 不启用；由 GPTModel 等 override）
     virtual void set_checkpoint_every(std::size_t /*stride*/) {}
