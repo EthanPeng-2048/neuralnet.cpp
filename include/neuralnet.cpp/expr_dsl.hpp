@@ -1556,7 +1556,9 @@ template <typename E>
                 if (P == Precision::F32)
                     return eng.adopt(std::move(v));
                 // f16 目标：归约向量求值在 f32 参考空间，结果舍入到 f16（§7.3）
-                return eng.cast(v, P);
+                // 先 adopt 补出生绑定再 cast（cast 内有 bind_check_）——否则
+                // NN_BIND_DEBUG 门禁会把这条库内中转判成未绑定输入（M6）。
+                return eng.cast(eng.adopt(std::move(v)), P);
             }
         }
     }
