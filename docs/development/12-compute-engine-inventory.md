@@ -4,7 +4,7 @@
 > 目的：把当前代码里实际并存的计算 API 与遗留物列清楚，作为事实底座；全部结论来自
 > 当前工作树的源码与构建配置，复现命令见 `bench/doc_inventory.ps1` 与 §9。
 >
-> **当前数字**：引擎 virtual **49 个**；Layer/Loss/Optimizer 直调 **21 个**（其余 28 个
+> **当前数字**：引擎 virtual **49 个方法**（`bench/doc_inventory.ps1` 口径；M6 新增 `import_impl` 使其由 48 → 49。注意 `grep -c "\bvirtual\b"` 原始计 **51** 处 = 49 方法 + 析构 1 + 注释里的 "Non-Virtual" 1，勿混用口径）；Layer/Loss/Optimizer 直调 **21 个**（其余 28 个
 > 只服务 DSL lowering / 序列化 / CLI / 适配层 / 测试，见 §2）；CPU 求值机制 **2 套**
 > （DSL 模板路径 + IR 解释器，见 §3）；ctest **20** 个测试（19 个测试目标 + `cnn_test_gpu`）。
 >
@@ -44,7 +44,7 @@
 
 ---
 
-## 2. `ComputeEngine` 接口：49 个 virtual 成员
+## 2. `ComputeEngine` 接口：49 个 virtual 方法
 
 文件：`compute_engine.hpp`；数字可用 `bench/doc_inventory.ps1` 复现（见 §9）。
 多精度 Phase 2 加入 `cast_into`/`copy_into`/`supports_native_data_move`/
@@ -105,6 +105,7 @@ scan_suffix_outer/outer_col——顺序状态机，DSL 无此语义）、`eval_e
 | `matmul` / `matmul_with_bias` / `batched_matmul` | DSL lowering（`MatmulRef::prepare*`）+ 基类 NVI 入口转发 + 测试/bench |
 | `row_reduce_sum` / `col_reduce_sum` / `col_reduce_max` / `grouped_reduce_sum` / `grouped_reduce_max` | DSL lowering（`ReduceViewRef::prepare`）+ 基类 NVI 入口转发 + 测试 |
 | `add_inplace` / `scale_inplace` / `accumulate` | 基类 NVI 入口（accumulate 为非虚入口本体，无 `_impl`）+ 测试/bench/probe |
+| `import` / `import_impl` | **跨设备/引擎拉取**（M6 新增，17 §4.3）：`GpuEngine::import_impl` = 原 `ensure_gpu` 的直传路径（16 §2 的 43 处调用点已全部改名 `import`）；基类默认 = 同设备别名/引擎内 cast + 跨设备宿主中转 |
 | `from_matrix` / `to_matrix` | **I/O 层**（`domain_*.hpp` 数据集与初值、`model_serialization.hpp`、`cli_*`、测试）——**M4 起 L2+ 禁用**（铁律 #12 / 17 §3 D11） |
 | `cast` / `copy_from` | `model_serialization.hpp` + f16 测试 / gradcheck |
 | `cast_into` / `copy_into` / `supports_*` | 基类 NVI 边界 cast 的"写回原存储"路径（`compute_engine.hpp`）+ 引擎实现互调（CPU `cast_into` 同精度分支转 `copy_into`）+ `write` 的 f16 目标（经 `copy_from` → f32 上传 + `cast_into`） |
@@ -212,7 +213,7 @@ IR-A/B/D（`expr_opt.hpp` / `expr_emitter.hpp` + `expr_glsl_gen.hpp`）；IR-A/B
   `Matrix::multiply_to_span`（`:1432`）；逐元素链用自己的循环。
 
 即 DSL 真正依赖的是 **`algebra_matrix.hpp` 的 Matrix 级内核 + `expr_spec.hpp` 的 IR**，
-不是 `ComputeEngine` 的 49 个 virtual。`dsl::matmul` 折成的是 `MatmulSpec`（IR 前置段），
+不是 `ComputeEngine` 的 49 个 virtual 方法。`dsl::matmul` 折成的是 `MatmulSpec`（IR 前置段），
 不是对 `engine.matmul` 的调用。
 
 > 所以"DSL 依赖 eager 算子"这句话，只在"eager 算子是 DSL 的 lowering 目标"这个意义上成立，
