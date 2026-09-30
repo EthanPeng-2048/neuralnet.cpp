@@ -5,7 +5,8 @@
 > 状态：**设计裁定已完成（§3 共 11 项）；M1 访问收口已实施（2026-09-30，验收与
 > 过程见 §5 M1 行 + `docs/history.md`）；M2 声明式初始化已实施（2026-09-30，
 > 见 §5 M2 行）；M3 批量读写 API 已实施（2026-09-30，见 §5 M3 行）；M4 Matrix
-> 降级收口已实施（2026-09-30，见 §3 D11 + §5 M4 行），M5-M7 未实施**。
+> 降级收口已实施（2026-09-30，见 §3 D11 + §5 M4 行）；M5 内存池契约统一已实施
+> （2026-09-30，见 §4.5 + §5 M5 行），M6-M7 未实施**。
 > 实施立项时读本文 + §5 分期 + 源码现状。
 > 前置工程成果保留不动：15 的 P-1（PrecisionEngine 下沉）、P1（张量出生绑定）已落地（15 §7.1）。
 
@@ -33,7 +34,7 @@ M2 落地后 init RNG 已收编，下表保留为动机证据，复现命令仍�
 | `gpu_tensor()` 调用 | **全部**在 `compute_gpu_engine.hpp` 内部 59 处（引擎自己，合规）；`compute_tensor.hpp:276/294` 仅为访问器声明 | 同上换 pattern |
 | `Tensor` 静态直构工厂（`Tensor::from_matrix/cpu/...`） | 98 处 / 8 文件（2026-09-30 复核；库外为主，15 §1 口径同源） | `Select-String` 两个 pattern（`Tensor::from_matrix`、`Tensor::cpu\b`）扫 `src/*_test.cpp`，命中行和 = 98 |
 | 内存池 | 仅 Vulkan：`backend/compute_memory_pool.hpp`（`GpuBackend` 持双池 memory/transient）；`backend/compute_staging_ring.hpp:56/93/104/232` 与 `compute_vk_backend.hpp` 亦引用，均 Vulkan 后端 | `grep -rn MemoryPool include/` |
-| CPU 池 | **不存在**：`Matrix` 直接 `std::vector`；`pool_stats()` CPU 返回空串（`compute_engine.hpp:144`） | 读引擎默认实现 |
+| CPU 池 | **不存在**：`Matrix` 直接 `std::vector`；`pool_stats()` CPU 返回空串（`compute_engine.hpp:144`） | 读引擎默认实现 |（**M5 已补齐 2026-09-30**：CPU 现返回宿主直配账本 `direct{…}`，本行保留为动机证据）
 | init RNG | 混乱：固定 seed 42 = `gpt:432/603`、`rapt:1155`、`zipt:814`；`std::random_device{}`（**跨进程不确定**）= `gpt:953`、`mlp:40`、`conv:107`、`zipt:89/1044`、`rapt:1462`（**M2 已收编**：init 站点全迁 InitSpec + 显式 seed；余下 `gpt:953`/`zipt:1044`/`rapt:1462` 为 `generate()` **采样** RNG——运行期采样随机性非 init，M2 裁定不动） | `grep -rn mt19937 include/` |
 | 读 GPU 张量 | `to_matrix` 是唯一 PCIe 下载点；`ensure_gpu` 43 处隐式上传（15 §1） | `grep -n "= ensure_gpu(" compute_gpu_engine.hpp` |
 | Layer init 模式 | 层内 `Matrix` 填数 → `engine.from_matrix` 上传（如 `compute_layer_mlp.hpp:46-64`） | 读 `Layer::init` |
@@ -148,17 +149,22 @@ struct InitSpec {
   同形状多层不互为镜像；层手填 `Matrix` + `from_matrix` 的 init 路径一并清空。
   `generate()` 采样 RNG 与 `text_train` 数据洗牌 RNG 属运行期随机性，**裁定不迁**。）
 
-### 4.5 内存池统一（契约层，D5）
+### 4.5 内存池统一（契约层，D5）——**M5 已落地 2026-09-30**
 
 - 统一的是**接口与语义**，不是实现：
-  - `pool_stats()`：GPU 返回现有池统计；CPU 返回"直配模式"统计（活分配数/字节）——
+  - `pool_stats()`：GPU 返回现有池统计（`persist{…} transient{…} pending=…`）；**无池引擎
+    （CPU）在基类默认实现里返回宿主直配账本**——
+    `direct{ blocks=<活分配数> live_bytes=<> peak_bytes=<> total_blocks=<> total_bytes=<> }`，
     **从空串变为有意义**，GUI/训练日志一套代码读两个引擎。
-  - `release_idle_pool_blocks()`：GPU 归还空闲整块（现状）；CPU 为语义成立的 no-op
-    （直配无整块可归还），文档写明。
+    账本 `nn::host_alloc_ledger()` 定义在 `algebra_matrix.hpp`：`MatrixT` 的
+    `allocate_`/`release_storage_`（析构、移动赋值、`resize` 三处释放出口）各记一次，
+    relaxed 原子、只在分配路径，元素热循环零参与。
+  - `release_idle_pool_blocks()`：GPU 归还空闲整块（现状）；CPU 为**语义成立的 no-op**
+    （直配无整块可归还），已写进 `compute_engine.hpp` 注释与 `04-memory-optimization.md`。
 - 池归属现状保持：GPU 双池（`memory_pool_`/`transient_pool_`）留在 `GpuBackend`，
   **引擎是唯一对外窗口**；上层永远不直接摸 `MemoryPool`。
 - CPU 是否建真池：**独立优化立项**（先用分配剖析量化 DSL 临时张量热点，再决定），
-  不阻塞任何上层统一。
+  不阻塞任何上层统一（U3 未决，维持）。
 
 ### 4.6 Matrix 降级（D4）
 
@@ -196,7 +202,7 @@ CPU 字节基线 + scan 产物 hash + layer_bench（定义见 §6）。
 | **M2** ✅（2026-09-30） | **声明式创建/初始化**：`InitSpec` + `Layer::init` 迁移 + RNG 收编 | `create_tensor` NVI 扩展；`compute_layer_*.hpp` 的 init（mlp/conv/gpt/zipt/rapt…）（commits `8bd6bd5` 核心、`4492098` 层迁移） | **四件套全过** + **初值跨进程确定性**：build 122/122 零告警；ctest 20/20；`gpu_stability_probe --init-hash` 六模型两进程 `INIT1` 行全同（**新锚**：mnist_mlp `a22e807ee05ec3ac`、cnn `4020958a14160bbd`、mnist_transformer `04a72d865624042a`、gpt `8efa936ac5c8c9b2`、zipt `f90bf8c8783c2f89`、rapt `b037632f75b7159c`）；mnist 三架构（`--shuffle-steps false`）双进程 loss 序列 + 模型文件逐字节一致（**新训练锚**，仅墙钟行异）；`--steps 20` hash=`6f8849f14da23110` 与 M1 锚点逐位一致（覆写隔离下后端执行零变化）；scan 双 hash 不变（`expr_specs.bin`=bdc3a442…a58360、`fused_registry.hpp`=7a10412c…）；layer_bench 配对 4 轮 + feedforward 逆序 4 轮复测均 < ±6% 无系统性回退；`NN_BIND_DEBUG=1` 冒烟零诊断（详见 `docs/history.md` M2 条） |
 | **M3** ✅（2026-09-30） | **批量读写 API**：`read/write/get_index/set_index` + I/O 分组审计口径（D9；U2 精确匹配） | `compute_engine.hpp` I/O 分组（基类非虚模板，复用 `to_matrix`/`copy_from`）+ CPU/GPU 两引擎；测试 f32 填充/恢复路径迁 `write`；探针 `--io-roundtrip`（commits `e0338d9` 核心、`4977a29` 探针、`3ddb13c` 测试） | **四件套全过**：build 全绿零告警；ctest 20/20；`gpu_stability_probe --io-roundtrip` CPU + GPU 全过（`f32_roundtrip`/`f16_roundtrip`/`batch_window` 三用例含录制窗口 write→read→end_batch→复读）；CPU 字节锚 `--steps 20` hash=`6f8849f14da23110` 不变；scan 双 hash 不变（`expr_specs.bin`=bdc3a442…a58360、`fused_registry.hpp`=7a10412c…）；**顺带修复 16 §7-2**（探针漏 `backend.initialize()` 的 GPU 崩溃，根因回填 16 §6/§7）——dev0/dev2/dev4 进程内两轮 + 跨进程 loss/hash 逐字节（详见 `docs/history.md` M3 条） |
 | **M4** ✅（2026-09-30） | **Matrix 降级收口**：L2+ 禁用规则成文（铁律 #12）+ D11 宿主桥裁定 + 分层审计脚本（U5） | L2 全量迁移：`compute_layer_{attention,base,conv,gpt,rapt,transformer,zipt}.hpp` + `compute_loss.hpp` + `compute_optimizer.hpp`（45 处 Matrix 型 I/O + 32 处 `Matrix` 类型）；`compute_engine.hpp` 尾部新增 `detail::upload_span/download_span/download_vector`（宿主桥，0 虚表项）；`bench/doc_inventory.ps1` 新增第 [4] 节 | **审计零违规**（`L2-VIOLATIONS: 0`，宿主桥 41 处仅披露）+ 四件套全过：build 122/122 零告警；ctest 20/20；**CPU 字节锚 `6f8849f14da23110` 与 GPU dev2 `8ef51b2927253c50` 均与迁移前逐位一致**（迁移是纯载体替换，数值路径零改动）；scan 双 hash 不变；layer_bench 配对 A/B（pre=HEAD worktree 二进制，feedforward/swiglu/linear 各 4 轮交错）：feedforward fwd/train **-1.2%/-1.6%**、linear +1.4%/-4.2%、swiglu fwd -6.2%（0.4ms 亚毫秒级，PRE 自身极差 0.38–0.47ms 即 ±10%）——全部在 ±6% 噪声带内无系统性回退（详见 `docs/history.md` M4 条） |
-| **M5** | **内存池契约统一**：CPU `pool_stats` 语义补齐 | `compute_engine.hpp` 默认实现 + `CpuEngine` | 两引擎 `pool_stats` 非空且口径文档化 |
+| **M5** ✅（2026-09-30） | **内存池契约统一**：无池引擎 `pool_stats` 语义补齐 | `algebra_matrix.hpp`（`HostAllocLedger` + `MatrixT` 分配/释放记账三出口）+ `compute_engine.hpp` 基类默认 `pool_stats` | **两引擎 `pool_stats` 非空且口径文档化**（17 §4.5 + `04-memory-optimization.md` + `01-compute-engine-development.md`）：CPU `direct{ blocks/live_bytes/peak_bytes/total_blocks/total_bytes }` 实测随 model-built/optimizer-created 递增（`NN_MEM_STATS=1 text_train` 抓取），GPU `persist{…} transient{…} pending=…` 照旧；`release_idle_pool_blocks` CPU no-op 写明理由。四件套：build 122/122 零告警、ctest 20/20、CPU 锚 `6f8849f14da23110` 与 scan 双 hash 不变、`--io-roundtrip` CPU/GPU 全过、L2 审计仍 0 |
 | **M6** | **吸收 15 P2/P3**：删每调用 engine 形参；43 处 `ensure_gpu`→`import`；跨引擎硬错误默认开 | 175 处 `ComputeEngine&` 打标清单（16 §3）；`NN_BIND_DEBUG` 门禁化 | 四件套 + `NN_BIND_DEBUG=1` ctest 门禁；顺带裁 15 D6/D7/D8 |
 | **M7** | （可选后置）15 P5/P6 存储多态 + `as_cpu/as_gpu` | `compute_tensor.hpp` | 第三后端出现前**不立项** |
 

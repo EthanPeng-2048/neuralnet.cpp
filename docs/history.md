@@ -438,7 +438,7 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 
 ## compute_engine 接口注释中的 CUDA 残留（原位置 include/neuralnet.cpp/compute_engine.hpp:89、93）
 - 类型：删除清单
-- 内容：`release_idle_pool_blocks` / `pool_stats` 注释曾写"CPU/CUDA 引擎"——CUDA 后端已整体移除（见 AGENTS §2），现仅 CPU（no-op/返回空）与 GPU。已改为当前引擎清单。
+- 内容：`release_idle_pool_blocks` / `pool_stats` 注释曾写"CPU/CUDA 引擎"——CUDA 后端已整体移除（见 AGENTS §2），现仅 CPU（no-op/返回空）与 GPU。已改为当前引擎清单。（**M5 2026-09-30 后**：CPU 不再返回空串，改报宿主直配账本，见下方"统一总纲 M5"条。）
 
 ## Tensor reshape 头注释与实现不符（原位置 include/neuralnet.cpp/compute_tensor.hpp:291）
 - 类型：错误注释（文档失真）
@@ -479,6 +479,15 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 - **教训（审计工具）**：给 `compute_engine.hpp` 的**注释**里写"49 virtual 骨架"会让 `bench/doc_align_audit.ps1` 的 `virtual_in_engine` 实测数 50→51、与文档 49/50 口径打架——注释里用中文"虚函数"即可；数字型断言的复现命令只看裸 token，不看语境。
 - **验收**（本机 Debug+Ninja+clang）：① **审计零违规**：`L2-VIOLATIONS: 0`，`host_bridge_uses: 41`（披露）；② build 122/122 零告警；③ ctest 20/20；④ **字节零变化**（迁移是纯载体替换：`Matrix(rows,cols)` 与 `std::vector(n)` 同为零填充、行主序 flat 下标 = `at_unchecked(r,c)`、f16 转换同一条 RHE 路径）——CPU `--steps 20` hash=`6f8849f14da23110`、GPU dev2 `8ef51b2927253c50` **均与迁移前逐位一致**；⑤ scan 双 hash 不变（`expr_specs.bin`=bdc3a442…a58360、`fused_registry.hpp`=7a10412c…）——`scan_exprs` 的 dry-run 走 Layer forward，表达式文本未动；⑥ **layer_bench 配对 A/B**（pre = `git worktree add` @ 48189d4 独立构建 layer_bench，feedforward/swiglu/linear 各 4 轮 PRE/POST 交错，`--iter 4`）：feedforward fwd/train **-1.2%/-1.6%**、linear +1.4%/-4.2%、swiglu fwd -6.2%/train +0.2%——swiglu fwd 为 0.38–0.47ms 亚毫秒项、PRE 自身极差即 ±10%，全部落在 ±6% 噪声带且方向混合，**无系统性回退**；⑦ `doc_align_audit.ps1` A/D/E/F 可行动项全 0、`virtual_in_engine` 仍 50。
 - **连带数字更新**：doc 12 的"Layer 直调 23 → **21**"（`from_matrix`/`to_matrix` 退出 L2；宿主桥是自由函数，不进 `engine.<op>(` 统计口径）与"其余 26 → 28"，§2.2 顺带修正 P-1 遗留的陈旧行 `cast_into/copy_into 仅 compute_precision_engine.hpp 内部`（该文件已删，实际调用方 = 基类 NVI 边界 cast + 引擎互调 + `write` 的 f16 目标）。AGENTS.md 新立**铁律 #12**（L2+ 禁用 Matrix + 宿主桥 + 审计口径），§3 审计表登记 `doc_inventory.ps1` 第 [4] 节。
+
+## 统一总纲 M5：内存池契约统一——无池引擎 pool_stats 补齐（2026-09-30，原位置 algebra_matrix.hpp 顶部账本与 MatrixT 分配/释放路径、compute_engine.hpp 基类 pool_stats/release_idle_pool_blocks 注释、docs/development/04-memory-optimization.md）
+- 类型：演进记录
+- 内容：M5（方案见 17 §4.5 / §5 M5 行）按"统一的是**接口与语义**、不是实现（D5）"落地，两段：
+  ① **宿主直配账本 `nn::HostAllocLedger`**（`algebra_matrix.hpp` 顶部，L1）：`live_blocks/live_bytes/peak_bytes/total_blocks/total_bytes` 五个 `std::atomic<std::uint64_t>`，全程 `memory_order_relaxed`，**只在分配/释放路径记账，元素热循环零参与**；峰值用 load + CAS 循环（只在变大时写）。全进程唯一实例由 `inline` 函数内静态对象提供（header-only，跨翻译单元同一地址）。
+  ② **`MatrixT` 三处释放出口收口**：分配在 `allocate_()` 成功后 `on_alloc(n * sizeof(element))`；释放统一走新增私有 `release_storage_()`（记账 + `data_.reset()` + `size_=0`），**析构 / 移动赋值 / `resize()`** 三处调用——移动赋值与 `resize` 原本是"直接覆盖 `data_`"的隐式释放，若只挂析构会漏记（账本越走越偏）。移动构造把源 `size_` 置 0（原实现已有），不重复记账。
+  ③ **`ComputeEngine::pool_stats()` 基类默认实现**：由返回空串改为返回 `direct{ blocks=<活分配数> live_bytes=<> peak_bytes=<> total_blocks=<> total_bytes=<> }`（单位字节，key 显式带 `_bytes` 避免与 GPU 的 `total=..MB` 混淆）；`GpuEngine` 的 `persist{…} transient{…} pending=…` override 不动。`release_idle_pool_blocks()` 保持 no-op，但把理由（"直配无整块可归还，语义成立"）写进 `compute_engine.hpp` 注释与 `04-memory-optimization.md`——M4 之前那句"CPU 为 no-op/返回空"的口径一并更正（history 的同名旧条目已加后注）。
+- **未做（保持 U3）**：CPU 真内存池是独立优化立项，需先分配剖析量化 DSL 临时张量热点；本期只补契约不改分配策略，`Matrix` 仍是 `std::unique_ptr<element[]>` 直配。
+- **验收**（本机 Debug+Ninja+clang）：① **两引擎 `pool_stats` 非空且口径已文档化**（17 §4.5 + `04-memory-optimization.md` + `01-compute-engine-development.md`）——`NN_MEM_STATS=1 text_train` 实测抓取：CPU `engine-init` 全 0 → `model-built` `direct{ blocks=44 live_bytes=9168512 peak_bytes=9168512 total_blocks=56 … }` → `optimizer-created` `blocks=88 live_bytes=18337024 …`（随生命周期单调反映），GPU dev2 `persist{blocks=5 allocs=12 total=1028MB …} transient{…} pending=0MB` 照旧；② build 122/122 零告警；③ ctest 20/20；④ CPU `--steps 20` hash=`6f8849f14da23110` **与 M1–M4 锚点逐位一致**（账本只读计数，不进任何数值路径）；⑤ scan 双 hash 不变；⑥ `--io-roundtrip` CPU + GPU(dev2) 三用例全 PASS；⑦ L2 审计仍 `L2-VIOLATIONS: 0`；⑧ **layer_bench 配对 A/B**（pre = `git worktree add` @ d28c899 独立构建，feedforward/swiglu/linear 各 4 轮 PRE/POST 交错 `--iter 4`）：feedforward fwd/train **+0.3%/+1.1%**（分配最密集的算例，说明 relaxed 原子开销不可测）、swiglu fwd -5.7%/train +0.1%、linear fwd -3.0%/train **-13.0%**（POST 更快；linear 单点方差 M1/M2 已记录在案 ±25%，且两组分布交叉），**方向混合、无系统性回退**。
 
 ---
 

@@ -352,6 +352,28 @@ auto rg = dsl::compute(engine,                                                  
 
 **使用方**：`ReLULinearAttention`（RAPT 层）——shader 只含"带状态的顺序归约 + matvec 读出 / 外积"，算法（L2 分母 / ReLU 门控 / 梯度公式 / 文档重置）全部由 Layer 用原语组合表达（见 `06-rapt-algorithm.md` §4）。
 
+### 12. 内存统计与回收（M5，17 §4.5）
+
+```cpp
+// 池/直配统计（非虚语义由 override 决定，但**返回值必须非空**）：
+[[nodiscard]] virtual std::string pool_stats() const;      // 基类默认 = 宿主直配账本
+[[nodiscard]] virtual Result<void> release_idle_pool_blocks();  // CPU = 语义成立的 no-op
+```
+
+**作用**：
+- **GPU（`GpuEngine` override）**：`persist{ blocks=… allocs=… total=…MB dev=… host=… free=… frag=… | … }
+  transient{ … } pending=…MB`——双池 + 已析构未 reap 的 pending 字节。
+- **无池引擎（CPU 走基类默认）**：`direct{ blocks=<> live_bytes=<> peak_bytes=<> total_blocks=
+  <> total_bytes=<> }`——账本 `nn::host_alloc_ledger()`（`algebra_matrix.hpp`）在 `MatrixT` 的
+  `allocate_` / `release_storage_`（析构、移动赋值、`resize` 三个释放出口）记账，
+  `memory_order_relaxed` 原子、只在分配路径，**元素热循环零参与**。
+- 两引擎同一动词、都非空 → 训练日志/GUI 一套代码读两个引擎。观测入口：
+  `NN_MEM_STATS=1 text_train …`（`[mem] engine-init / model-built / optimizer-created` 打点）。
+
+**实现注意**：新增后端若自带池，必须 override `pool_stats()`；基类默认值的语义是"没有池就是
+直配"，不是"没有统计"。`release_idle_pool_blocks()` 在直配模式无可归还整块，保持 no-op 并写明理由
+（不要为了"对称"返回假错误）。
+
 ---
 
 ## CPU 引擎实现
