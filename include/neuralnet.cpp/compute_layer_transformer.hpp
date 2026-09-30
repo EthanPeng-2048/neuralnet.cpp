@@ -320,10 +320,10 @@ public:
             if (!r) return std::unexpected(r.error());
         }
         // 预创建 ones_row_ (1, num_patches) 全1，用于 backward 广播
-        Matrix ones_cpu(1, num_patches_, Scalar{1});
-        auto or_t = engine.from_matrix(ones_cpu);
-        if (!or_t) return std::unexpected(or_t.error());
-        ones_row_ = std::move(*or_t);
+        // （M2 声明式：引擎填数，原 from_matrix 口径 = F32）
+        ones_row_ = engine.create_tensor(1, num_patches_, Precision::F32, InitSpec::constant(1));
+        if (!ones_row_.valid())
+            return std::unexpected(Error{"TransformerEncoder: ones_row_ 初始化失败"});
         return {};
     }
 
