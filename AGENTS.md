@@ -259,6 +259,7 @@ optimizer.step();
 | `development/13-refactor-backlog.md` | **重构与性能机会清单（2026-09-25 审查）：只记录方案不实施；误报/已修复项对照表与已执行记录在 `docs/history.md`，重复立项前先读本文件** |
 | `development/15-computeengine-refresh.md` | **ComputeEngine Refresh 详细设计（13 §10 展开）：张量出生绑定 + `import` + 存储多态；含 P-1（PrecisionEngine 下沉删除）与 P1（出生绑定 + `bind_check_` 跨引擎检查 + `adopt` 内部通道，**两项均已实施 2026-09-29**）与 D1-D9 未决点裁定，立项前先读** |
 | `development/16-computeengine-p0-inventory.md` | **Refresh P0 盘点结果（2026-09-28）：ensure_gpu 43 分类 / ComputeEngine& 175 打标 / 宿主中转 381 清单 / ctest 双基线（Lavapipe 20 20、Mali offload 非确定）/ GPU 稳定性探针与未决 7 项** |
+| `development/17-unified-tensor-engine.md` | **统一 Tensor/ComputeEngine/MemoryPool 底层架构总纲（2026-09-30，裁定完成、未实施）：访问不变量（Tensor 存储私有、一切经引擎）、InitSpec 声明式初始化、批量 read/write、Matrix 降级为宿主 I/O 载体、内存池契约统一；吸收 15 未实施的 P2-P6（改期 M1-M7）。立项前先读本文件 + §5 分期** |
 | `development/14-f16-stable-gpu-loss-frozen.md` | **故障报告（2026-09-26，未修）：GPU `stable=f16` 训练 loss 打印冻结（权重不冻结）——触发矩阵、测试覆盖缺口、证据与复现** |
 
 ### 使用类（docs/usage/）
