@@ -1395,7 +1395,18 @@ public:
         }
         // V1（运行期精度分派）：键 = key#x —— 一个 shader 覆盖任意签名，
         // 因此**任何非零签名都必定命中**（不再有 miss / 边界 cast 回退）。
-        return nn::fused::find_fused(key + nn::EXPR_PREC_DISPATCH_SUFFIX);
+        //
+        // 诊断（NN_PREC_TRACE=1）：**变体选择事件一律打日志**。此前只有上面的
+        // V2 分支打，V1 分支静默 —— 后果是"某结构实际按 V1 走"在 trace 里完全
+        // 不可见：实测库外样例（含 rparam ⇒ native16 结构谓词不通过 ⇒ 必然走
+        // V1）在 trace 下**一行 `[prec][alu-hit]` 都不打**，足以误导出"V1 从未被
+        // 使用、测试零覆盖"的结论（本分支加日志前作者就据此误判过一次）。
+        // 只记变体选择（V1/V2），不记 V0 默认路径——后者是 f32 热路径，逐调用
+        // 打日志会把输出淹没。
+        const std::string xkey = key + nn::EXPR_PREC_DISPATCH_SUFFIX;
+        if (nn::dsl::env_flag("NN_PREC_TRACE"))
+            std::fprintf(stderr, "[prec][alu-hit] %s\n", xkey.c_str());
+        return nn::fused::find_fused(xkey);
     }
 #endif
     // ══════════════════════════════════════════════════════════════════════
