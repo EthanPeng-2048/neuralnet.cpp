@@ -40,6 +40,16 @@ expr_opt / expr_registry / expr_spec）「历史状态类注释」摘录。整�
 原理、契约与理由；本文件保存被移出的历史叙事（bug 根因、被否决方案、性能 A/B 过程、
 删除清单），供追溯用。
 
+## 精度签名从构建期枚举 → 运行期参数（2026-10-01，分支 `feat/fused-runtime-prec-dispatch`）
+
+- 类型：演进记录 / 删除清单 / 性能 A/B
+- **背景（被取代的机制）**：精度签名（哪些输入/输出是 f16，`ExprPrecSig`）由运行期张量精度决定、类型层面不可见，因此"每个 (结构, 签名) 一份 shader"必须靠**执行**发现。旧链路 = `FusedAnchor` 只登记结构 + dry-run `profile_f32`/`profile_f16` **两遍** + 模型级配置矩阵两个 profile + `NN_PREC_TRACE=1` 的 `[prec][miss]` → 手工写 `tools/prec_backfill.txt` → 重新构建。清单曾有两批：注意力 fold 文档掩码 5 输入形态（`74a6eaacc0e5d766 10007`）、MNIST/CNN f16 训练 8 条"f32 入 + f16 出"混合签名（`59e079001367d11b 10000`、`fe93c0d99c16113f 10000/10002`、`cb3d830f25b84895 10001`、`b7e6d363af1963ac 10000/10002`、`8a29d02213a0e196 10003`、`27c7edd7a0a4f808 10007`）。旧注册表 84 结构 + 86 签名变体 = 170 条 / 3.43 MB。
+- **新机制**：V1「运行期精度分派」shader（键 `key#x`）对每个输入/输出各声明 f32 + `float16_t` **双视图**（同一 `VkBuffer` 绑两次，只解引用与真实元素类型一致的那一个），加载/存储按 push constant `uint prec` 走 uniform 分支；**索引数学逐字不变** ⇒ 与旧带类型变体数值等价。native16 改按**结构谓词**生成（键 `key#a`，代入"全输入 f16 + 输出 f16"常量签名）。新注册表 84 结构 + 84 分派 + 35 native16 = 203 条 / 4.36 MB。
+- **删除清单**：`tools/prec_backfill.txt`（整文件）、`scan_exprs` 的 f16 dry-run 遍与 f16 模型 pass、"没有带类型变体 / 用 NN_PREC_TRACE 回填"提示、`supports_expr_precision_variant` 里的 (key,sig) 探测、旧 `key#<sighex>` 变体发射与 run-only 回填分支。
+- **性能 A/B（决定 A 而非 B 的依据）**：曾实测「同质化 + 边界 cast」（方案 B，数值与混合变体等价）在 GPT f16 1 epoch / `tinystories_smoke` / 40HX 上为 4.1s vs 变体路径 4.0/3.9s（**≈+4%**，38 个签名落回 cast）；但 B 会给含 f16 输入的表达式造 f32 临时量、推高 f16 峰值显存，故最终选 A（运行期分派，显存不涨）。
+- **实测验收**：build 零告警；ctest 19/19；CPU 锚 `6f8849f14da23110` / GPU dev2 锚 `8ef51b2927253c50` 逐位不变；GPT f16 训练 `NN_PREC_TRACE=1` → `[prec][miss]=0`、边界 cast 归因表为空、`[prec][alu-hit]` 6670；**f16 扫描遍对结构贡献为 0**（`NN_SCAN_F32_ONLY` 探针：跳过它签名 66 → 0、结构恒 84）；**端到端**：Layer 头里新写一个 dry-run 覆盖不到的结构 → 锚点 59→60、结构 84→85、注册表 +`key`/`key#x`/`key#a`，**其他文件零改动**。
+- **未做（另案）**：把"收集 + 生成"做成库自带 CMake 能力 `nn_enable_gpu_fusion(target)`（下游自定义层）。**结构侧的关键约束已测明**：84 个结构里只有 13 个来自锚点，71 个来自 dry-run/模型 pass ⇒ 该收集器**必须保留模型 pass**，做不到"30 行纯锚点收集器"。
+
 ## 融合 matmul BK 取值 A/B 流水（原位置 include/neuralnet.cpp/expr_glsl_gen.hpp:262-269、303-310）
 - 类型：性能 A/B / 否决方案
 - 内容：40HX 变体 trade-off 记录（% = vs 单缓冲耗时，负=更快）：BK=32 单缓冲(16KB) 为深网格基线、
