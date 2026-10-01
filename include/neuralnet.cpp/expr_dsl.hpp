@@ -1371,6 +1371,16 @@ template <typename E>
 // 结构非法（裸视图作根 → 空指令表等）在构建期即 `_Exit(3)`，与 dry-run 同一闸门。
 //
 // 可用 `-DNN_SCAN_NO_ANCHOR` 关掉锚点做 A/B（只影响登记集合，不影响语义）。
+//
+// 锚点登记进**独立注册表**：scan_exprs 在结尾把两者合并并打印"锚点独有结构数"
+// —— 这是"结构覆盖已不依赖手写清单"的常驻台账（锚点独有 = 手写 dry-run 覆盖
+// 不到的调用点；该数突然变大通常意味着新增了未纳入 dry-run 的层路径）。
+[[nodiscard]] inline nn::fused::ExprRegistry& anchor_registry()
+{
+    static nn::fused::ExprRegistry reg;
+    return reg;
+}
+
 template <class Expr>
 struct FusedAnchor
 {
@@ -1380,7 +1390,7 @@ struct FusedAnchor
         (void)inputs;   // 符号实例：inputs 全是占位张量，注册只用结构
         if (auto v = validate_expr_spec(spec, spec.views.size()); !v)
             scan_reject(v.error());
-        nn::fused::global_registry().add(spec, 0u);
+        anchor_registry().add(spec, 0u);
         return 0;
     }();
 };

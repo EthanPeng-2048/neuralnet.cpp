@@ -643,6 +643,25 @@ int main(int argc, char* argv[])
     }
 
     auto& reg = nn::fused::global_registry();
+    // ── 合并自登记锚点的结构（"结构 = 表达式类型"，见 expr_dsl.hpp）─────────
+    // 锚点在静态初始化期按**类型**登记，覆盖"编译进来但 dry-run 未执行到"的
+    // 调用点（配置分支、未被 dry-run 造过的层路径）。两者合并后写盘。
+    {
+        auto& anchor = nn::dsl::anchor_registry();
+        const std::size_t dry_only = reg.specs.size();
+        for (const auto& s : anchor.specs)
+            reg.add(s, 0u);
+        std::printf("[scan] 结构来源：dry-run %zu + 锚点 %zu → 合并 %zu（锚点独有 %zu）\n",
+                    dry_only, anchor.specs.size(), reg.specs.size(),
+                    reg.specs.size() - dry_only);
+        // 锚点独有 = 手写 dry-run 覆盖不到的调用点（该数突然变大 → 有新层路径
+        // 没纳入 dry-run）。锚点只登记结构（sig=0），故这些结构默认没有 f16
+        // 带类型变体 —— 下面单独报告。
+        if (anchor.specs.empty() || dry_only == reg.specs.size())
+            std::fprintf(stderr,
+                "[scan][warn] 锚点未贡献任何结构：可能被 -DNN_SCAN_NO_ANCHOR 关闭，"
+                "或所有调用点都已被 dry-run 覆盖\n");
+    }
     if (!nn::fused::write_registry(out_path, reg))
     {
         std::fprintf(stderr, "[FAIL] 无法写入 %s\n", out_path.c_str());
@@ -650,6 +669,27 @@ int main(int argc, char* argv[])
     }
     std::printf("[scan] 收集到 %zu 条融合表达式 -> %s\n",
                 reg.specs.size(), out_path.c_str());
+    // ── 签名覆盖报告：哪些结构**没有任何带类型变体** ──────────────────────
+    // 自登记只能给结构（sig=0）：精度签名取决于运行期张量精度，类型层面推不出来
+    // → f16 带类型变体仍须 dry-run 的 f32/f16 两遍产生。缺变体不是错误
+    // （运行时回退边界 cast，正确但慢），但新增融合表达式时应当看到这一行。
+    {
+        std::size_t no_variant = 0;
+        for (const auto& s : reg.specs)
+        {
+            const std::string k = nn::expr_spec_key(s);
+            bool has = false;
+            for (const auto& v : reg.variants)
+                if (nn::expr_spec_key(v.spec) == k) { has = true; break; }
+            if (!has) ++no_variant;
+        }
+        if (no_variant)
+            std::printf("[scan][note] %zu/%zu 条结构没有带类型变体"
+                        "（缺 f16 时运行时回退边界 cast：正确但更慢；"
+                        "补法 = 让 dry-run 覆盖该 Layer 路径，或用 NN_PREC_TRACE "
+                        "收集后加进 tools/prec_backfill.txt）\n",
+                        no_variant, reg.specs.size());
+    }
     // 带类型变体（in-kernel f16）：结构相同、精度签名不同 —— 每个 (结构, 签名)
     // 需要一个独立 shader；打印分类统计便于确认扫描覆盖（哪些是纯逐元素、
     // 含 matmul 段或 fold 段）。
