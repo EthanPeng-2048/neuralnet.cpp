@@ -286,7 +286,7 @@ class Tensor {
 | `expr_registry.hpp` | 构建期表达式注册表（收集折叠出的结构 + 精度变体，按 key 去重；**不再有 bin 序列化**——收集与生成同一进程） |
 | `fused_registry.hpp` | **生成物**（构建期 生成阶段 产出）：`key → {ExprSpec 结构, 内联 SPIR-V}` 融合 shader 注册表；运行时按 key 精确匹配 |
 | `tools/scan_exprs.cpp` | 构建期工具（**单步** = 收集 + 生成）：`FusedAnchor` 按类型自登记结构 + dry-run/模型 pass 补签名，随后原地生成 `fused_registry.hpp` |
-| `tools/fused_generate.hpp` | 生成阶段（原 `gen_fused.cpp`，现为头文件）：注册表 → `glsl_gen` → glslc → 内联 SPIR-V → `fused_registry.hpp` |
+| `tools/fused_generate.hpp` | 生成阶段（原独立工具 `gen_fused`，现为 `scan_exprs` include 的头文件）：注册表 → `glsl_gen` → glslc → 内联 SPIR-V → `fused_registry.hpp` |
 | `eval_expr` | `ComputeEngine` 虚接口：CPU 编译期模板求值（经 `dsl::compute`）；Vulkan 按 `expr_spec_key` 查 `fused_registry`（闭合世界，未命中硬报错，无 eager、无运行时编译） |
 | `dsl::compute(engine, expr, rows, cols)` | 统一求值入口：CPU 走编译期模板；GPU 折叠成 `ExprSpec` → `eval_expr` 按 key AOT 分发 |
 
