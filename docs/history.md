@@ -1991,3 +1991,90 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
   collect 函数）**仍未做**——本轮只做一致性修正，字段仍是手工罗列；
   但三个校验脚本已可作为该重构的回归护栏（改完跑一遍即可验证零漂移）。
 - GUI 画布节流（13 §5.3）未动。
+
+---
+
+# docs/development 13（13 号清单合并归档，2026-10-01）
+
+## 13 号清单合并归档（原 docs/development/13-refactor-backlog.md，2026-10-01）
+- 类型：合并归档 / 演进记录 / 被否决方案
+- 内容：
+
+**合并说明**：`docs/development/13-refactor-backlog.md` 的未完成项与后续验证口径已迁入
+`docs/development/18-roadmap.md`（未来方向路线图）；13 号文件现在只是重定向 stub（指向 18 与本节）。
+本节归档它原有的两类内容——已完成 / 已被吸收的项，与 2026-10-01 裁定"不做"的项。
+13 文首「正确性缺陷已在同轮修复」清单、原 §6 误报对照表、原 §9 代码缩减轮执行表**早已归档在本文件**
+（三条既有条目见下），故本节只留指针、不复制正文。
+
+**已完成 / 已被吸收（只记坐标，正文见本文件既有条目）**：
+
+- 13 §10（Tensor 绑定引擎 + 存储多态提案）整体被 `docs/development/17-unified-tensor-engine.md`
+  吸收为 M1–M6，并于 2026-09-30 **全部实施**（访问收口 / InitSpec 声明式初始化 / 批量读写 /
+  Matrix 降级 / 内存池契约统一 / `import` + Layer 删 engine 形参）；**M7 未立项**。
+  逐期记录见本文件「统一总纲 M1…M6」诸条。
+- 13 §9（代码缩减轮）执行表见本文件既有条目「13 §9 已执行：代码缩减轮执行表
+  （原位置 docs/development/13-refactor-backlog.md §9）」。
+- 13 §9b 已执行部分——位置编码多态统一（`compute_position_encoding.hpp`）、`AttnScoreMask` 族拆分 /
+  掩码×位置偏置正交、`NN_TRY`/`NN_TRY_CHECK` 收敛——见本文件既有条目
+  「注意力变体拆分 + 位置编码多态统一（2026-10-01…）」与「Layer 层四处收敛…（2026-10-01…）」。
+- 13 文首「正确性缺陷已在同轮修复」清单、原 §6 误报对照表、原 §9 执行表分别对应本文件既有条目
+  「13 文首…」「13 §6…」「13 §9…」（标题均自称"原位置 docs/development/13-refactor-backlog.md"，
+  故 13 的 stub 必须继续声明这些归档条目的来源）。
+
+**2026-10-01 裁定"不做"的项**：
+
+1. **13 §1 线程池归约分块统一** —— 裁定：**不做**。`core_threadpool.hpp` 里 `reduce_chunk_count`
+   （确定性分段：边界只由 total 决定）与 `chunk_count`（依赖 `workers_.size()`）两套并存；
+   逐元素操作**结果与分块无关**，不存在确定性问题（铁律 #8 的逐字节一致性只约束归约）。
+   纯概念一致性收益 < 改动并行内核的风险。若将来仍要做：**禁止**走 PyTorch `ATen::parallel_reduce`
+   式"部分和按 `results[tid]` 存放、分块边界依赖线程数"的老路——那正是本项目
+   `parallel_transform_reduce` 明确修正过的反例。
+
+2. **13 §5.2 CPU 引擎 f32→f16→f32 冗余双趟** —— 裁定：**不做**。
+   `compute_cpu_engine.hpp` 的 `to_matrix` 分支（tensor=f32、请求 P=F16）做 f32→f16→f32 两趟 cast
+   再返回 f32，这是**量化模拟语义**（模拟落 f16 后的回读），直接删除会改变行为；收益
+   （热路径省一次全量转换）低于语义风险，且当前没有热路径调用方依赖它被消除。
+   触发条件：出现真实热路径调用方，且愿意承担语义变更（届时按 API 层显式区分"量化模拟 / 直接返回"）。
+
+3. **13 §9b H3/H4/H5** —— 裁定：**不做**（三条均低成本低收益）。
+   H3 解码循环骨架：仅剩三个 `generate()` 的循环体（采样段已合并），因运行态不同而保留；
+   H4 精度/形状三元组收敛：`dsl::compute(engine, expr, rows, cols, p_.compute)` 尾部精度参数不宜机械
+   改写——RAPT 残差相加用的是**刻意不同**的精度，是反例；H5 掩码/索引构造：注意力侧已随
+   `CausalDocScoreMask::prepare` 收敛（两份数值相同的宿主缓冲并为一份），conv 置换 / transformer
+   patch 提取仍是"CPU 循环 + `upload_span`"、未声明式化。H5 若将来做，随 header 拆分批次一起做。
+
+4. **13 §9.4 测试公共头 `max_abs_diff` 多份副本统一** —— 裁定：**择机，不单独立项**。
+   实测当前有 **7 份定义**（`attn_consistency_test` / `ce_fusion_test` / `conv2d_gradcheck` /
+   `fused_gpu_test` / `gpu_test` / `maxpool_gradcheck` / `tensor_expr_test`），其中 conv2d 版带多形状
+   守卫（越界返回 1e9），其余无守卫。统一前必须逐点确认每个调用点是否依赖该守卫语义，故
+   "不机械统一"是唯一安全前提；留待下次动测试公共头时顺带处理。
+
+5. **13 §10「Tensor 抽象基类 + `CPUTensor`/`GPUTensor` 句柄指针化」选型** —— 裁定：**维持否决**。
+   由 `docs/development/17-unified-tensor-engine.md` §4.2 与
+   `docs/development/15-computeengine-refresh.md` §4 裁定：它要解决的 device 互斥收益与存储多态
+   重叠，却要 `Result<Tensor>` 203 处指针化 + `span/vector` 元素类型连锁，且**不解决 engine 传参耦合**。
+
+6. **13 §10.6 宿主中转动词改名（`to_matrix`/`from_matrix`/`copy_from` → `to_host`/`from_host`/`upload`）**
+   —— 裁定：**方案作废，不再执行**。由 17 §3 D9 改为"**保留名称** + I/O 分组 + grep 审计"：
+   `Matrix` 被裁定降级为宿主 I/O 载体（L2+ 禁用即铁律 #12），动词名不再承担"命名即防线"的职责，
+   改由 `bench/doc_inventory.ps1` 第 [4] 节分层审计（L2 违规计数）兑现。
+
+**仍未做的项（已迁出本节）**：13 §2（超大 header 拆分）、§3（text_train.cpp 模块化）、§4（gui.py
+声明式字段表）、§5.1（F16C 半精度转换快路径）、§5.3（GUI 绘制节流）、§7（checkpoint 优化器状态）、
+§8（CI 冒烟）、§9 第 5 条（18 号文档记作 §9.5；`gpt_test` 偶发失败待观察：62 次直跑 1 次失败、
+日志被覆盖未定位，已列为 18 号文档 P1-4）、§9b 末尾未编号 bullet（`bench/doc_inventory.ps1` 的
+`host_bridge_uses` 计数口径未复核，13 与 17 记 41、18 号文档实测 40），以及 §10 吸收后的 **M7**，
+其行动项与触发条件见 `docs/development/18-roadmap.md`。13 原文件中"仍然生效的工程教训"类正文
+（§9 前四条约束、§9b 的 `dsl::compute` 无 2 参重载等）属当前状态说明，不在本节归档（避免与
+AGENTS §7、`docs/development/01-compute-engine-development.md` 等现行文档重复）。
+
+**「文档坐标已过期」事实记录（2026-10-01 实测，供后续纠偏）**：13 正文中的行数/份数是审查当时快照，
+现已过期——`include/neuralnet.cpp/backend/compute_vk_backend.hpp` **5174** 行（13 写 ≈4700）、
+`include/neuralnet.cpp/expr_glsl_gen.hpp` **2424** 行（写 2310）、
+`include/neuralnet.cpp/compute_cpu_engine.hpp` **2353** 行（写 2543）、
+`src/text_train.cpp` **1746** 行（写 1860）、`gui.py` **1646** 行（非空 1456；13 写 1636，
+且所谓"五 Tab"实为 **7** 个 `collect_args` 定义）；`max_abs_diff` 定义实测 **7** 份
+（13 与 `src/test_common.hpp:19` 注释均写 9，交接口径记 8——三处不一致，以本实测为准）。
+ctest 实测 **19**（本轮不做构建/ctest 复核，采信交接结论），而 `AGENTS.md` §12 与
+`docs/release-notes/v1.5.0.md`、`docs/development/17-unified-tensor-engine.md` 仍写 20——
+19 vs 20 的矛盾待 18 号文档与 AGENTS 修订统一。

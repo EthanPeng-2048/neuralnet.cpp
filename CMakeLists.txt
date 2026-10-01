@@ -467,40 +467,29 @@ if(Vulkan_FOUND)
     nn_embed_shader(im2col_f16 ${CMAKE_SOURCE_DIR}/shaders/im2col.comp -DNN_SHADER_F16=1)
     nn_embed_shader(col2im_f16 ${CMAKE_SOURCE_DIR}/shaders/col2im.comp -DNN_SHADER_F16=1)
 
-    # 2. AOT 融合 shader：scan_exprs + gen_fused
-    set(NN_EXPR_SCAN_BIN     ${CMAKE_BINARY_DIR}/generated/expr_specs.bin)
+    # 2. AOT 融合 shader：scan_exprs（**单步** = 收集 + 生成）
+    #    收集：FusedAnchor 自登记（按表达式类型）+ dry-run + 模型 pass
+    #    生成：expr_emitter（默认 GLSL）→ glslc → 内联 SPIR-V → fused_registry.hpp
+    #    原 gen_fused 已并入 scan_exprs 的生成阶段（tools/fused_generate.hpp），
+    #    不再经 expr_specs.bin 中间文件。
     set(NN_FUSED_REGISTRY_HPP ${CMAKE_BINARY_DIR}/generated/fused_registry.hpp)
 
-    # 2a. scan_exprs：dry-run Layer 收集内联表达式结构 → expr_specs.bin
-    set(SCAN_SRC ${CMAKE_SOURCE_DIR}/tools/scan_exprs.cpp)
+    set(SCAN_SRC      ${CMAKE_SOURCE_DIR}/tools/scan_exprs.cpp)
+    set(FUSED_GEN_SRC ${CMAKE_SOURCE_DIR}/tools/fused_generate.hpp)
     add_executable(scan_exprs ${SCAN_SRC})
     target_include_directories(scan_exprs PRIVATE ${CMAKE_SOURCE_DIR}/include/neuralnet.cpp)
     target_link_libraries(scan_exprs PRIVATE nn_core Vulkan::Vulkan)
     add_custom_command(
-        OUTPUT ${NN_EXPR_SCAN_BIN}
+        OUTPUT ${NN_FUSED_REGISTRY_HPP}
         # scan_exprs 是原生可执行文件，直接写文件、不会自建目录。
         # Ninja 会自动创建自定义命令的输出目录，但 Makefiles 生成器不会，
         # 全新构建时 generated/ 尚未存在会写入失败（见 08-pitfalls）。
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/generated
-        COMMAND scan_exprs ${NN_EXPR_SCAN_BIN}
-        DEPENDS scan_exprs ${SCAN_SRC}
-        COMMENT "[GPU] Scanning Layer expressions (scan_exprs) → expr_specs.bin"
-    )
-
-    # 2b. gen_fused：读 bin → glsl_gen → glslc → 内联 SPIR-V → fused_registry.hpp
-    set(FUSED_GEN_SRC ${CMAKE_SOURCE_DIR}/tools/gen_fused.cpp)
-    add_executable(gen_fused ${FUSED_GEN_SRC})
-    target_include_directories(gen_fused PRIVATE ${CMAKE_SOURCE_DIR}/include/neuralnet.cpp)
-    target_link_libraries(gen_fused PRIVATE nn_core)
-    add_custom_command(
-        OUTPUT ${NN_FUSED_REGISTRY_HPP}
-        # 同 scan_exprs：gen_fused 也是原生可执行文件，需先确保输出目录存在
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/generated
-        COMMAND gen_fused ${CMAKE_BINARY_DIR}/generated ${GLSLC} ${NN_EXPR_SCAN_BIN}
+        COMMAND scan_exprs ${CMAKE_BINARY_DIR}/generated ${GLSLC}
                 ${CMAKE_SOURCE_DIR}/tools/prec_backfill.txt
-        DEPENDS gen_fused ${FUSED_GEN_SRC} ${NN_EXPR_SCAN_BIN}
+        DEPENDS scan_exprs ${SCAN_SRC} ${FUSED_GEN_SRC}
                 ${CMAKE_SOURCE_DIR}/tools/prec_backfill.txt
-        COMMENT "[GPU] Synthesizing fused shaders (gen_fused) → fused_registry.hpp"
+        COMMENT "[GPU] Scan + synthesize fused shaders (scan_exprs) → fused_registry.hpp"
     )
 
     list(APPEND GPU_SHADER_HPPS ${NN_FUSED_REGISTRY_HPP})

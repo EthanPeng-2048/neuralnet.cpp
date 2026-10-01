@@ -97,6 +97,22 @@ expr_spec_key(spec) ≡ expr_spec_key(canonicalize_expr_spec(spec))
 
 即 **key 一定在 canonical IR 上计算**。scan（构建期折叠时）与 runtime（运行时折叠时）必须都先 canonicalize 再算 key，保证两端一致。
 
+**key 只描述"结构"，运行期数值一律不进 key**（进了会让每个取值组合各编译一份**逐字节相同**的 shader，并让"结构 = 表达式类型"不成立）：
+
+| 字段 | 进 key | 运行期载体 |
+|------|--------|-----------|
+| 指令 / 视图 / 寄存器数 | ✅ | — |
+| 常量池**个数** | ✅（决定 push constant 布局） | — |
+| 常量池**值** | ❌ | push constant `c<i>`（`ExprOperandKind::Const` 发射成 `c<idx>`） |
+| `rparams` 个数 / 值 | 个数 ✅ / 值 ❌ | push constant `rp<i>` |
+| 视图形状参数（RowMod/RotateHalf/BatchMod/BatchCol/RowAccess 的 param） | ❌ | push constant `vp<i>` |
+| `matmul.k` / `matmul.batch` | ❌ | push constant `mm_k` / `mm_batch` |
+| `matmul.a_input/b_input`（输入槽位） | ✅ | — |
+| `matmul.transA/transB` | ❌ | push constant `mm_trans`（bit0=transA / bit1=transB；shader 内两条加载路径 + uniform 分支，同一结构覆盖 4 种转置组合） |
+| fold 段 matmul 的 transA/transB | ✅（fold 的 mm 段生成期定死，**尚未收敛**） | — |
+| fold 的 `k` / `vec_state_len` | ❌ | push constant |
+| 分组归约视图的 `R` | ❌ | push constant `vp<i>`（读取走 `gr_r<slot>()` 辅助函数内的运行期循环，累加顺序与 CPU 模板路径一致） |
+
 ### 4.2 确定性铁律
 
 - **pass 遍历顺序必须固定**（如始终按指令序从前到后、视图按输入序、常量按出现序）。
@@ -151,9 +167,9 @@ IR → GlslEmitter（当前唯一注册后端）
 
 - `ExprEmitter` 纯接口（name/generate/generate_reduce）+ `emitter_registry`（按后端名选择工厂）。
 - `GlslEmitter`（`expr_glsl_gen.hpp` 的 generate_glsl/generate_glsl_reduce 封装）。
-- `gen_fused` 经 emitter 注册表选择后端（默认 glsl）；`--list-backends` 展示可用后端。
+- 生成阶段 经 emitter 注册表选择后端（默认 glsl）；`--list-backends` 展示可用后端。
 
-> **当前只有 `glsl` 一个注册后端**（`GlslEmitter`）；`gen_fused --list-backends` 可列出。
+> **当前只有 `glsl` 一个注册后端**（`GlslEmitter`）；`scan_exprs --list-backends` 可列出。
 > 接口 + 注册表即 IR-D 的全部交付：新后端实现 `ExprEmitter` 并注册即可，运行时无需包含该头（与 `glsl_gen` 一致）。
 
 ---
@@ -170,7 +186,7 @@ IR → GlslEmitter（当前唯一注册后端）
 ### IR-A / IR-B 实现要点（`expr_opt.hpp`）
 
 - `fold_constants_and_algebra`（常量池去重 + 保守常量折叠 + 代数化简）、`dead_code_elimination`、`renumber_registers`（寄存器连续重编号 + 常量池清理）、`common_subexpression_elimination`（Fanout 归一化 + 哈希复用）、`allocate_registers_liveness`（liveness 线性扫描，确定性贪心）、`canonicalize_expr_spec`（完整链）。
-- **canonical IR 接入 key**：`ExprRegistry::add/contains`、CPU `eval_expr_impl`、GPU `eval_expr/eval_expr_reduce` 全部先 `canonicalize_expr_spec` 再算 key；scan/gen_fused 存 canonical spec → shader 按 canonical 合成。**dispatch 必须用 canonical 的 consts**（折叠可能增删常量池）。
+- **canonical IR 接入 key**：`ExprRegistry::add/contains`、CPU `eval_expr_impl`、GPU `eval_expr/eval_expr_reduce` 全部先 `canonicalize_expr_spec` 再算 key；scan/生成阶段 存 canonical spec → shader 按 canonical 合成。**dispatch 必须用 canonical 的 consts**（折叠可能增删常量池）。
 - **关键不变量**：canonicalize 不改变 views/inputs（顺序、内容），只优化 instrs/consts/num_regs → 运行时输入绑定布局不变；输出指令（最后一条）恒为真实寄存器（glsl_gen 输出 `r<last_dst>`）。
 - **glsl_gen 配套**：寄存器"先声明、后赋值"（`float r0, r1, ...;` + 纯赋值），兼容 liveness 复用同号寄存器（否则 GLSL redefinition）。
 - **关键坑**：① regalloc 复用后归约指令 dst 与逐元素 dst 必须**区段分离**（validate 要求 reduce_dst/elem_dst 按号互斥）；② 各 pass 重映射只处理 `expr_instr_num_operands(op)` 实际使用的操作数（未用 b/c 是默认哨兵 {0,0}，不得当 Reg(0) 重编号）。
