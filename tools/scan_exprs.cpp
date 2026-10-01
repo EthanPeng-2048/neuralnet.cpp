@@ -594,15 +594,72 @@ int main(int argc, char* argv[])
     // 调用点（配置分支、未被 dry-run 造过的层路径）。两者合并后写盘。
     {
         auto& anchor = nn::dsl::anchor_registry();
+        // NN_SCAN_DUMP_SOURCES=1：逐条打印"只有执行 Layer/模型才拿得到"的结构。
+        // 这是"能否进一步删掉 dry-run"的唯一依据——锚点按表达式类型登记，但
+        // **符号实例（`Expr{}`）与真实实例可能折叠出不同结构**（运行期配置
+        // 维度：视图种类、输入个数、掩码组合…）；这些结构锚点看不到。
+        const bool dump_src = [] {
+#if defined(_MSC_VER)
+            char* b = nullptr; std::size_t n = 0;
+            _dupenv_s(&b, &n, "NN_SCAN_DUMP_SOURCES");
+            const bool v = (b != nullptr && b[0] == '1');
+            std::free(b);
+            return v;
+#else
+            const char* v = std::getenv("NN_SCAN_DUMP_SOURCES");
+            return v != nullptr && v[0] == '1';
+#endif
+        }();
+        std::unordered_set<std::string> dry_keys;
+        for (const auto& s : reg.specs)
+            dry_keys.insert(nn::expr_spec_key(s));
+        std::unordered_set<std::string> anchor_keys;
+        for (const auto& s : anchor.specs)
+            anchor_keys.insert(nn::expr_spec_key(s));
+        const auto summarize = [](const nn::ExprSpec& s)
+        {
+            const int raxis = nn::expr_spec_reduce_axis(s);
+            std::string v;
+            for (const auto& x : s.views)
+            {
+                if (!v.empty()) v += ",";
+                v += std::to_string(static_cast<int>(x.kind));
+            }
+            return "raxis=" + std::to_string(raxis)
+                 + " mm=" + (s.matmul ? "1" : "0")
+                 + " fold=" + (s.fold ? "1" : "0")
+                 + " nreg=" + std::to_string(s.num_regs)
+                 + " ninstr=" + std::to_string(s.instrs.size())
+                 + " nview=" + std::to_string(s.views.size())
+                 + " viewkinds=[" + v + "]";
+        };
+        std::size_t n_dry_only = 0;
+        for (const auto& s : reg.specs)
+        {
+            const std::string k = nn::expr_spec_key(s);
+            if (anchor_keys.count(k))
+                continue;
+            ++n_dry_only;
+            if (dump_src)
+                std::printf("[scan][dry-only] %s  %s\n", k.c_str(), summarize(s).c_str());
+        }
+        for (const auto& s : anchor.specs)
+        {
+            const std::string k = nn::expr_spec_key(s);
+            if (dry_keys.count(k))
+                continue;
+            if (dump_src)
+                std::printf("[scan][anchor-only] %s  %s\n", k.c_str(), summarize(s).c_str());
+        }
         for (const auto& s : anchor.specs)
             reg.add(s);
         std::printf("[scan] 结构来源：dry-run %zu（含模型 pass +%zu、显式登记 +%zu）"
-                    " + 锚点 %zu → 合并 %zu（锚点独有 %zu）\n",
+                    " + 锚点 %zu → 合并 %zu（锚点独有 %zu、dry-run 独有 %zu）\n",
                     n_after_dry,
                     n_after_model - n_after_dry,
                     n_before_anchor - n_after_model,
                     anchor.specs.size(), reg.specs.size(),
-                    reg.specs.size() - n_before_anchor);
+                    reg.specs.size() - n_before_anchor, n_dry_only);
         // 锚点独有 = 手写 dry-run 覆盖不到的调用点（该数突然变大 → 有新层路径
         // 没纳入 dry-run）。
         if (anchor.specs.empty() || n_before_anchor == reg.specs.size())
