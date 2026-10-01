@@ -50,6 +50,15 @@ expr_opt / expr_registry / expr_spec）「历史状态类注释」摘录。整�
 - **实测验收**：build 零告警；ctest 19/19；CPU 锚 `6f8849f14da23110` / GPU dev2 锚 `8ef51b2927253c50` 逐位不变；GPT f16 训练 `NN_PREC_TRACE=1` → `[prec][miss]=0`、边界 cast 归因表为空、`[prec][alu-hit]` 6670；**f16 扫描遍对结构贡献为 0**（`NN_SCAN_F32_ONLY` 探针：跳过它签名 66 → 0、结构恒 84）；**端到端**：Layer 头里新写一个 dry-run 覆盖不到的结构 → 锚点 59→60、结构 84→85、注册表 +`key`/`key#x`/`key#a`，**其他文件零改动**。
 - **未做（另案）**：把"收集 + 生成"做成库自带 CMake 能力 `nn_enable_gpu_fusion(target)`（下游自定义层）。**结构侧的关键约束已测明**：84 个结构里只有 13 个来自锚点，71 个来自 dry-run/模型 pass ⇒ 该收集器**必须保留模型 pass**，做不到"30 行纯锚点收集器"。
 
+## 库自带的融合能力 `nn_enable_gpu_fusion`（2026-10-01，A2）
+
+- 类型：演进记录 / 新增能力
+- **背景（缺口）**：本库 header-only，但 `fused_registry.hpp` 的生成**绑死在本仓库**（`CMakeLists.txt` 硬编码 `tools/scan_exprs.cpp` + `tools/prec_backfill.txt`，且 `nn_core` 无 install/导出）——库外使用者写自己的 `dsl::compute` 后**没有任何合法途径**产出自己的注册表，只能 fork。这是"导入头文件即可用"真正卡住的地方。
+- **落地**：CMake 函数 `nn_enable_gpu_fusion(<target> MAIN <含 main 的源> [OUT_DIR <目录>])`。收集器 = **库内收集逻辑**（`tools/scan_exprs.cpp`）+ **本目标的全部 TU**（`-DNN_EXPR_SCAN` 编译，令使用者调用点经 `FusedAnchor` 自登记）链接成一个可执行文件，产物目录只作该目标的私有 include 目录。样例 `examples/fusion_custom_layer{,.hpp,_main.cpp}`（"库外使用者"形态：自定义层 + 一行 CMake）。
+- **实测**：样例目标的注册表 = 库内 203 条 + 自研层 `94a2cc052598fe09` / `94a2cc052598fe09#x`（该表达式含 rparams → native16 谓词不通过，无 `#a`，符合预期）；样例可执行文件运行结果与期望值 `0.6712035` 逐位一致。库内文件零改动。
+- **顺带修的 header-only 缺陷**：`backend/compute_vk_backend.hpp` 的 `GpuBuffer::~GpuBuffer()` 类外定义**缺 `inline`** → 任何 ≥2 个 TU 的程序链接期 `duplicate symbol`（样例两 TU 复现）。已加 `inline`。这条此前从未暴露，因为库自身的可执行目标都是单 TU。
+- **未做**：把样例注册进 ctest（本次保持 ctest 19/19 口径不变；样例由默认构建覆盖编译，运行时断言需手工跑 `build/fusion_custom_layer_example.exe`）。
+
 ## 融合 matmul BK 取值 A/B 流水（原位置 include/neuralnet.cpp/expr_glsl_gen.hpp:262-269、303-310）
 - 类型：性能 A/B / 否决方案
 - 内容：40HX 变体 trade-off 记录（% = vs 单缓冲耗时，负=更快）：BK=32 单缓冲(16KB) 为深网格基线、

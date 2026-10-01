@@ -16,7 +16,11 @@
 //    时，把对应的 dry-run 调用加到下面。
 // ───────────────────────────────────────────────────────────────────────────
 
+// NN_EXPR_SCAN 由本文件自行开启；`nn_enable_gpu_fusion` 还会用同名宏编译
+// 使用者的 TU（让它们的 `dsl::compute` 调用点自登记）——此处必须防重定义。
+#ifndef NN_EXPR_SCAN
 #define NN_EXPR_SCAN
+#endif
 
 #include <cstdio>
 #include <cstddef>
