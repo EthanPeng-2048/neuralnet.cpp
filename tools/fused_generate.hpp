@@ -189,6 +189,20 @@ namespace nn::tool
     std::error_code ec;
     std::filesystem::create_directories(out_dir, ec);
 
+    // A/B 逃生阀：跳过运行期精度分派变体（键 #x）的发射。
+    const bool nn_no_dispatch = [] {
+#if defined(_MSC_VER)
+        char* b = nullptr; std::size_t n = 0;
+        _dupenv_s(&b, &n, "NN_SCAN_NO_DISPATCH");
+        const bool v = (b != nullptr && b[0] != '\0' && b[0] != '0');
+        std::free(b);
+        return v;
+#else
+        const char* v = std::getenv("NN_SCAN_NO_DISPATCH");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+#endif
+    }();
+
     if (reg.specs.empty())
     {
         std::fprintf(stderr, "[FAIL] 表达式集合为空（scan_exprs 未覆盖任何路径）\n");
@@ -325,11 +339,18 @@ namespace nn::tool
         if (alu && !nn::expr_prec_sig_native16(spec, sig))
             return false;   // 谓词不通过 → 不发 ALU 变体（f32 算术变体仍覆盖）
         const std::string key = nn::expr_spec_key(spec);
+        // 运行期精度分派（V1）：键 = key#x（无签名 hex——精度不再是身份）
+        const bool dispv = nn::expr_prec_sig_is_dispatch(sig);
         char sigbuf[16];
         std::snprintf(sigbuf, sizeof(sigbuf), "%04x", static_cast<unsigned>(sig));
-        const std::string vkey = alu ? nn::expr_prec_sig_alu_key(key, sig)
-                                     : nn::expr_prec_sig_key(key, sig);
-        const std::string suffix = key + "_" + sigbuf + (alu ? "_a" : "");
+        const std::string vkey = dispv
+            ? (key + nn::EXPR_PREC_DISPATCH_SUFFIX)
+            : (alu ? (key + "#a")   // native16：结构谓词判定 → 键与签名无关
+                   : nn::expr_prec_sig_key(key, sig));
+        const std::string suffix = dispv
+            ? (key + "_x")
+            : (alu ? (key + "_a")
+                   : (key + "_" + sigbuf));
         if (!emitted_vkeys.insert(vkey).second)
             return false;   // 已发射（scan 预测 ∩ 回填清单重叠）→ 幂等跳过
         const std::string comp_path = out_dir + "/fused_" + suffix + ".comp";
@@ -377,64 +398,35 @@ namespace nn::tool
         emitted_variants.push_back(VariantEmit{&spec, sig, vkey, suffix, alu});
         return true;
     };
-    for (const auto& v : reg.variants)
-    {
-        emit_one(v.spec, v.sig, /*alu=*/false);
-        emit_one(v.spec, v.sig, /*alu=*/true);   // 谓词不通过时内部静默跳过
-    }
 
-    // ── run-only 签名回填────────────────────────────────────────
-    // scan 的 dry-run 预测不到的运行时签名（Linear matmul 段混合签名 / Norm
-    // 归约链 / 全 f32 入 + f16 出等），miss 时适配层走边界 cast 物化输入副本
-    // （归因大头 (64,8192)/(256,8192) 即此）。清单 = 实测 [prec][miss] 输出
-    // （tools/prec_backfill.txt，NN_PREC_TRACE=1 mem_probe 复现），对命中的
-    // (结构, 签名) 走与 scan 变体完全相同的 emit_one 发射（含 ALU 谓词、
-    // 重复去重）；结构不在 bin 中 / 生成器不支持时告警跳过（不失败）。
-    if (!prec_manifest.empty())
+    // ── 运行期精度分派变体（V1，键 = key#x）──────────────────────────────
+    // **每个结构无条件发射一份**：输入/输出各声明 f32 + float16_t 双视图，
+    // 加载/存储处按 push constant `uint prec` 走 uniform 分支 → 一个 shader
+    // 覆盖全部 (输入精度位图, 输出精度)。
+    //
+    // 这是"签名不再需要构建期枚举"的载体：运行时按真实张量精度填 prec，
+    // 任何签名都有 shader → **永不 miss**，因此 dry-run / 模型 pass /
+    // tools/prec_backfill.txt 全部不再参与生成（A2 起从 scan 移除）。
+    //
+    // ── native16 变体（V2，键 = key#a）─────────────────────────────────
+    // 生成条件 = **结构谓词**（expr_prec_sig_native16 代入"全输入 f16 +
+    // 输出 f16"这一结构性常量签名）：无 fold / 无 matmul 段 / 无归约 /
+    // 无 rparams / 无常量微值。运行时仅在真实签名确为全 f16 时才选它 →
+    // 生成期不需要知道签名，运行期也不需要发现。
+    //
+    // A/B 逃生阀：NN_SCAN_NO_DISPATCH=1 时不发射 V1（退回旧集合）；
+    // 只影响登记集合，不影响语义。
+    for (const auto& spec : reg.specs)
     {
-        const std::string& manifest = prec_manifest;
-        std::ifstream mf(manifest);
-        if (!mf)
-        {
-            std::fprintf(stderr, "[gen][backfill] 清单不可读，跳过回填: %s\n",
-                         manifest.c_str());
-        }
-        else
-        {
-            std::unordered_map<std::string, const nn::ExprSpec*> spec_by_key;
-            for (const auto& s : reg.specs)
-                spec_by_key.emplace(nn::expr_spec_key(s), &s);
-            std::string line;
-            std::size_t n_ok = 0, n_total = 0;
-            while (std::getline(mf, line))
-            {
-                std::istringstream ln(line);
-                std::string k;
-                unsigned sig = 0;
-                if (!(ln >> k) || k.front() == '#')
-                    continue;                       // 空行 / 注释
-                if (!(ln >> std::hex >> sig))
-                {
-                    std::fprintf(stderr, "[gen][backfill] 无法解析行: %s\n", line.c_str());
-                    continue;
-                }
-                ++n_total;
-                const auto it = spec_by_key.find(k);
-                if (it == spec_by_key.end())
-                {
-                    std::fprintf(stderr, "[gen][backfill] 结构不在 bin 中（scan 未覆盖？）: %s\n",
-                                 k.c_str());
-                    continue;
-                }
-                const nn::ExprPrecSig psig = static_cast<nn::ExprPrecSig>(sig);
-                if (emit_one(*it->second, psig, /*alu=*/false))
-                    ++n_ok;
-                emit_one(*it->second, psig, /*alu=*/true);   // 谓词不通过静默跳过
-            }
-            std::printf("[gen][backfill] 回填清单 %s: %zu/%zu 条命中发射\n",
-                        manifest.c_str(), n_ok, n_total);
-        }
+        if (!nn_no_dispatch)
+            emit_one(spec, nn::EXPR_PREC_SIG_DISPATCH, /*alu=*/false);
+        const std::size_t n_in = spec.views.size();
+        const std::uint32_t all_in_bits =
+            (n_in >= 32) ? 0u : ((1u << n_in) - 1u);
+        emit_one(spec, nn::expr_prec_sig_make(all_in_bits, /*out_f16=*/true),
+                 /*alu=*/true);   // 谓词不通过时内部静默跳过
     }
+    (void)prec_manifest;   // 签名不再回填（V1 覆盖任意签名）
 
     H << "inline const FusedShader kFusedShaders[] = {\n";
     for (const auto& spec : reg.specs)
