@@ -665,6 +665,14 @@ int main(int argc, char* argv[])
             if (dump_src)
                 std::printf("[scan][anchor-only] %s  %s\n", k.c_str(), summarize(s).c_str());
         }
+        // 交集（锚点与 dry-run 都产出的结构）也打印：否则"某结构由哪个生成器
+        // 负责、运行时是否按 V1 分派"这类问题无法从 dump 里回答——V1 覆盖统计
+        // 的 20 条里有 18 条落在交集里。
+        if (dump_src)
+            for (const auto& s : reg.specs)
+                if (anchor_keys.count(nn::expr_spec_key(s)))
+                    std::printf("[scan][both] %s  %s\n",
+                                nn::expr_spec_key(s).c_str(), summarize(s).c_str());
         for (const auto& s : anchor.specs)
             reg.add(s);
         std::printf("[scan] 结构来源：dry-run %zu（含模型 pass +%zu、显式登记 +%zu）"
