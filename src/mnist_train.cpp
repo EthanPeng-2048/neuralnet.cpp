@@ -19,6 +19,7 @@
 #include <neuralnet.cpp/domain_mnist.hpp>
 #include <neuralnet.cpp/precision.hpp>
 #include <neuralnet.cpp/cli/cli_engine_factory.hpp>
+#include <neuralnet.cpp/cli/cli_help.hpp>
 #include <neuralnet.cpp/cli/cli_lr_scheduler.hpp>
 #include <neuralnet.cpp/cli/cli_mnist_io.hpp>
 #include <neuralnet.cpp/cli/cli_train_common.hpp>
@@ -52,63 +53,55 @@ enum class ArchType { MLP, Transformer, CNN };
 // ==================== 帮助信息 ====================
 void print_usage(const char *prog)
 {
-    std::cout
-        << "MNIST 手写数字训练程序 (支持 MLP/Transformer)\n\n"
-        << "用法: " << prog << " [选项]\n\n"
-        << "选项:\n"
-        << "  --arch <name>      模型架构: mlp/transformer/cnn (默认: mlp)\n"
-        << "  --resume <path>    从已有模型恢复训练 (自动读取模型规格与架构)\n"
-        << "  --save <path>      模型保存路径 (默认: mnist_model.bin)\n"
-        << "  --dataset <path>   数据集目录 (默认: datasets/mnist_data)\n"
-        << "  --epochs <n>       训练轮数 (默认: 10)\n"
-        << "  --lr <lr>          学习率 (默认: 0.001)\n"
-        << "  --batch-size <n>   批大小 (默认: 64)\n"
-        << "  --optimizer <name> 优化器: sgd/sgd_momentum/adam/adamw/muon (默认: adam)\n"
-        << "  --weight-decay <w> AdamW 权重衰减系数 (默认: 0.01)\n"
-        << "  --gpu <索引>       启用 GPU 加速 (需要 Vulkan SDK)，可用枚举索引指定设备\n"
-        << "                     (名称子串写法: --gpu=NVIDIA / --gpu=40HX)\n"
-        << "  --max-samples <n>  限制训练样本数 (用于快速测试, 默认: 全部)\n"
-        << "  --shuffle-steps <true|false>  每 epoch 打乱 batch 顺序 (默认: true)\n"
-        << "\n"
-        << "MLP 专用:\n"
-        << "  --layer-dims <d1,d2,...>  各层维度，逗号分隔 (默认: 784,512,256,128,64,10)\n"
-        << "  --norm <type>      归一化层: layernorm(默认)/rmsnorm/batchnorm\n"
-        << "                     layernorm: LayerNorm（按特征维归一化）\n"
-        << "                     rmsnorm: RMSNorm（无均值、更轻量）\n"
-        << "                     batchnorm: BatchNorm（按 batch 维归一化，MLP 专用）\n"
-        << "\n"
-        << "Transformer 专用:\n"
-        << "  --d-model <n>      模型维度 (默认: 64)\n"
-        << "  --num-heads <n>    注意力头数 (默认: 4)\n"
-        << "  --num-layers <n>   Transformer 层数 (默认: 2)\n"
-        << "  --d-ff <n>         FFN 中间维度 (默认: 128)\n"
-        << "  --patch-size <n>   patch 大小 (默认: 7, 28/7=4 → 16 patches)\n"
-        << "  --eval-samples <n> 评估样本数 (默认: 200，避免评估过慢)\n"
-        << "\n"
-        << "CNN 专用 (LeNet-5 风格):\n"
-        << "  --cnn-channels <c1,c2,...> 每个卷积层输出通道 (默认: 6,16)\n"
-        << "  --cnn-kernels <k1,k2,...>  每个卷积核大小 (默认: 5,5)\n"
-        << "  --cnn-pool <n>      每个卷积后的 MaxPool 窗口 (默认: 2, 0=无池化)\n"
-        << "  --cnn-fc <d1,d2,...> 展平后的全连接头 (默认: 120,10，末位为类别数)\n"
-        << "\n"
-        << "学习率调度:\n"
-        << "  --lr-schedule <type> 学习率调度: fixed/cosine (默认: fixed)\n"
-        << "                   cosine: 余弦退火，lr 从初始值衰减到 min-lr\n"
-        << "  --warmup-epochs <n> 线性预热轮数 (默认: 0, 即不预热)\n"
-        << "  --min-lr <lr>     余弦退火最低学习率 (默认: 1e-6)\n"
-        << "  --lr-per-epoch <v1,v2,...>  手动指定每轮学习率 (逗号分隔，优先级最高)\n"
-        << "\n"
-        << "混合精度 (docs/development/05-mixed-precision.md):\n"
-        << "  --f16              快捷方式：master-weights 配方 (param=f32,compute=f16,stable=f32,optimizer=f32)\n"
-        << "  --precision-param <f16|f32>\n"
-        << "                     权重/参数存储精度 (默认: f32)\n"
-        << "  --precision-compute <f16|f32>\n"
-        << "                     常规算子计算精度 (默认: f32)\n"
-        << "  --precision-stable <f16|f32>\n"
-        << "                     数值敏感算子精度 (默认: f32)\n"
-        << "  --precision-optimizer <f16|f32>\n"
-        << "                     优化器状态精度 (默认: f32)\n"
-        << "  --help             显示此帮助信息\n";
+    nn::cli::Help help(std::cout, prog, "MNIST 手写数字训练程序 (MLP / Transformer / CNN)");
+
+    help.usage("[选项]");
+
+    help.section("选项");
+    help.opt("--arch <name>", "模型架构: mlp/transformer/cnn (默认: mlp)");
+    help.opt("--resume <path>", "从已有模型恢复训练 (自动读取模型规格与架构)");
+    help.opt("--save <path>", "模型保存路径 (默认: mnist_model.bin)");
+    help.opt("--dataset <path>", "数据集目录 (默认: datasets/mnist_data)");
+    help.opt("--epochs <n>", "训练轮数 (默认: 10)");
+    help.opt("--lr <lr>", "学习率 (默认: 0.001)");
+    help.opt("--batch-size <n>", "批大小 (默认: 64)");
+    help.opt("--optimizer <name>", "优化器: sgd/sgd_momentum/adam/adamw/muon (默认: adam)");
+    help.opt("--weight-decay <w>", "AdamW 权重衰减系数 (默认: 0.01)");
+    help.opt("--max-samples <n>", "限制训练样本数 (默认: 全部，用于快速测试)");
+    help.opt("--shuffle-steps <true|false>", "每 epoch 打乱 batch 顺序 (默认: true)");
+    help.opt("--gpu [索引|名称]", "启用 GPU 加速 (需要 Vulkan SDK)\n空格形式只收枚举索引；名称子串用 --gpu=<名称>，如 --gpu=NVIDIA / --gpu=40HX");
+    help.opt("--help, -h", "显示此帮助信息");
+
+    help.section("MLP 专用");
+    help.opt("--layer-dims <d1,d2,...>", "各层维度，逗号分隔 (默认: 784,512,256,128,64,10)");
+    help.opt("--norm <type>", "归一化层: layernorm/rmsnorm/batchnorm (默认: layernorm)\nlayernorm: 按特征维归一化\nrmsnorm: 无均值、更轻量\nbatchnorm: 按 batch 维归一化 (仅 MLP)");
+
+    help.section("Transformer 专用");
+    help.opt("--d-model <n>", "模型维度 (默认: 64)");
+    help.opt("--num-heads <n>", "注意力头数 (默认: 4)");
+    help.opt("--num-layers <n>", "Transformer 层数 (默认: 2)");
+    help.opt("--d-ff <n>", "FFN 中间维度 (默认: 128)");
+    help.opt("--patch-size <n>", "patch 大小 (默认: 7；28/7=4 → 16 patches)");
+    help.opt("--eval-samples <n>", "评估样本数 (默认: 200，避免评估过慢)");
+
+    help.section("CNN 专用 (LeNet-5 风格)");
+    help.opt("--cnn-channels <c1,c2,...>", "每个卷积层输出通道 (默认: 6,16)");
+    help.opt("--cnn-kernels <k1,k2,...>", "每个卷积核大小 (默认: 5,5)");
+    help.opt("--cnn-pool <n>", "每个卷积后的 MaxPool 窗口 (默认: 2；0=无池化)");
+    help.opt("--cnn-fc <d1,d2,...>", "展平后的全连接头 (默认: 120,10；末位为类别数)");
+
+    help.section("学习率调度");
+    help.opt("--lr-schedule <type>", "学习率调度: fixed/constant/cosine (默认: fixed)\ncosine: 余弦退火 (epoch 级)，lr 从初始值衰减到 min-lr");
+    help.opt("--warmup-epochs <n>", "线性预热轮数 (默认: 0，即不预热)");
+    help.opt("--min-lr <lr>", "余弦退火最低学习率 (默认: 1e-6)");
+    help.opt("--lr-per-epoch <v1,v2,...>", "手动指定每轮学习率 (逗号分隔，优先级最高)");
+
+    help.section("混合精度 (docs/development/05-mixed-precision.md)");
+    help.opt("--f16", "快捷方式: master-weights 配方\n(param=f32, compute=f16, stable=f32, optimizer=f32)");
+    help.opt("--precision-param <f16|f32>", "权重/参数存储精度 (默认: f32)");
+    help.opt("--precision-compute <f16|f32>", "常规算子计算精度 (默认: f32)");
+    help.opt("--precision-stable <f16|f32>", "数值敏感算子精度 (默认: f32)");
+    help.opt("--precision-optimizer <f16|f32>", "优化器状态精度 (默认: f32)");
 }
 
 // ==================== 命令行参数 ====================
@@ -172,7 +165,7 @@ TrainConfig parse_args(int argc, char *argv[])
     for (int i = 1; i < argc; ++i)
     {
         std::string arg = argv[i];
-        if (arg == "--help")
+        if (arg == "--help" || arg == "-h")
         {
             print_usage(argv[0]);
             std::exit(0);

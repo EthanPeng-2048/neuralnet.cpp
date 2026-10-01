@@ -22,6 +22,7 @@
 #include <neuralnet.cpp/cli/cli_engine_factory.hpp>
 #include <neuralnet.cpp/cli/cli_lr_scheduler.hpp>
 #include <neuralnet.cpp/cli/cli_gpu_option.hpp>
+#include <neuralnet.cpp/cli/cli_help.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -248,92 +249,68 @@ nn::Precision parse_precision(const std::string& name, const char* flag)
 // ==================== 帮助信息 ====================
 void print_usage(const char *prog)
 {
-    std::cout
-        << "GPT 文本生成训练程序\n\n"
-        << "用法: " << prog << " <text-file> [选项]\n\n"
-        << "参数:\n"
-        << "  <text-file>        训练文本文件路径 (必需)\n\n"
-        << "选项:\n"
-        << "  --save <path>      模型保存路径 (默认: gpt_model.bin)\n"
-        << "  --resume <path>    从已有模型恢复训练\n"
-        << "  --resume-epoch <n>  从第 n 个 epoch 继续（0-based，需配合 --resume；默认 0）\n"
-        << "  --resume-step <n>   从本 epoch 内第 n 步继续（0-based，需配合 --resume；默认 0）\n"
-        << "  --vocab <path>     词表 JSON 路径 (默认: gpt_bpe.json)\n"
-        << "                     自动识别分词器类型（bpe / charbpe）\n"
-        << "  --test-file <path> 测试集文件路径（可选，每 epoch 结束后评估 test loss）\n"
-        << "  --epochs <n>       训练轮数 (默认: 10)\n"
-        << "  --lr <lr>          学习率 (默认: 0.001)\n"
-        << "  --batch-size <n>   批大小 (默认: 32)\n"
-        << "  --accum-steps <n>  梯度累积步数 (默认: 1)。每 n 步 forward/backward\n"
-        << "                     累加梯度后再更新参数，等效放大 batch_size×n\n"
-        << "  --seq-len <n>      序列长度 (默认: 256)\n"
-        << "  --stride <n>       滑动窗口步长 (默认: 等于 --seq-len，即不重叠)\n"
-        << "                     设小可产生重叠窗口，增加训练样本数\n"
-        << "  --optimizer <name> 优化器: sgd/sgd_momentum/adam/adamw/muon (默认: adam)\n"
-        << "  --weight-decay <w> AdamW 权重衰减系数 (默认: 0.01)\n"
-        << "  --d-model <n>      模型维度 (默认: 128)\n"
-        << "  --num-heads <n>    注意力头数 (默认: 4)\n"
-        << "  --num-layers <n>   Transformer 层数 (默认: 4)\n"
-        << "  --d-ff <n>         FFN 中间维度 (默认: 512)\n"
-        << "  --gpu <索引>       启用 GPU 加速 (需要 Vulkan SDK)，可用枚举索引指定设备\n"
-        << "                     (名称子串写法: --gpu=NVIDIA / --gpu=40HX)\n"
-        << "  --positional-encoding <type>\n"
-        << "                     位置编码类型: learned(默认)/sinusoidal/alibi/rope\n"
-        << "                     learned: 可学习位置嵌入（默认，GPT 原版）\n"
-        << "                     sinusoidal: 正弦波固定位置编码（不参与训练）\n"
-        << "                     alibi: 线性偏置注意力（无位置嵌入，支持长度外推）\n"
-        << "                     rope: 旋转位置编码（现代方案，在注意力 Q/K 上施加）\n"
-        << "  --activation <type>  FFN 激活: gelu(默认)/swiglu\n"
-        << "                     gelu: QuickGeLU（GPT-2 风格）\n"
-        << "                     swiglu: SwiGLU（LLaMA/Mistral 风格，每参数效率更高）\n"
-        << "  --norm <type>      归一化层: layernorm(默认)/rmsnorm\n"
-        << "                     layernorm: LayerNorm（GPT-2 风格）\n"
-        << "                     rmsnorm: RMSNorm（LLaMA/Mistral 风格，更快更稳）\n"
-        << "  --model <type>     模型架构: gpt(默认)/rapt (ReLU 线性注意力)\n"
-        << "                     rapt: ReLU 线性注意力（RLA）语言模型，动态稀疏检索，\n"
-        << "                           O(L·d²) 复杂度；强制 RoPE（ReLU 前施加）\n"
-        << "  --log-interval <n> 每隔多少 step 显示进度 (默认: 50)\n"
-        << "  --save-interval <n> 每隔多少 step 保存 checkpoint (默认: 100)\n"
-        << "  --grad-log         显示梯度统计（范数/最大值/均值）\n"
-        << "  --no-cache         禁用 tokenize 缓存（默认自动缓存到 .tokcache 文件）\n"
-        << "\n"
-        << "Batch 录制粒度:\n"
-        << "  --flush-interval <n>  每 N 个 Transformer block flush 一次 (默认: 1)\n"
-        << "  按层切 batch 缩短 D1 延迟销毁锁窗、拆分大提交防 TDR；\n"
-        << "  非阻塞提交后细粒度 flush 的额外 submit 代价不在关键路径，\n"
-        << "  不影响 batch_size 和训练质量\n"
-        << "\n"
-        << "显存优化:\n"
-        << "  --checkpoint-every <n> 每 N 个 Transformer block 重算一次 forward\n"
-        << "    (激活重计算，默认: 0=不启用)。1=每块都重算，显存收益最大，\n"
-        << "    以约 1 次额外前向 FLOPs 为代价省去整层激活驻留。\n"
-        << "  --activation-offload  把每块激活搬 host-visible，backward 拷回\n"
-        << "    (不重算，FLOPs 保持 1.0×，代价是 PCIe 传输；可与 --checkpoint-every\n"
-        << "     混合使用：checkpoint 块重算、其余块 offload；仅 GPU 有效)\n"
-        << "  GPU 训练每 step 末尾自动归还完全空闲的内存池底材（L2 整块释放）。\n"
-        << "\n"
-        << "学习率调度:\n"
-        << "  --lr-schedule <type> 学习率调度: fixed/cosine/step_cosine (默认: fixed)\n"
-        << "                   cosine: 余弦退火（epoch 级），lr 从初始值衰减到 min-lr\n"
-        << "                   step_cosine: 余弦退火（step 级），按单个训练步预热+退火，\n"
-        << "                   适合每 epoch 步数很多的场景（如大语料）\n"
-        << "  --warmup-epochs <n> 线性预热轮数 (默认: 0, 仅 cosine)\n"
-        << "  --warmup-steps <n>  线性预热步数 (默认: 0, 仅 step_cosine)\n"
-        << "  --min-lr <lr>     余弦退火最低学习率 (默认: 1e-6)\n"
-        << "  --lr-per-epoch <v1,v2,...>  手动指定每轮学习率 (逗号分隔，优先级最高)\n"
-        << "  --max-norm <f>    梯度裁剪最大全局 L2 范数 (默认: 0=不裁剪)\n"
-        << "\n"
-        << "混合精度 (docs/development/05-mixed-precision.md):\n"
-        << "  --f16              快捷方式：f16 存储（param/compute=F16，stable/optimizer=F32）\n"
-        << "  --precision-param <f16|f32>\n"
-        << "                     权重/参数存储精度 (默认: f32)\n"
-        << "  --precision-compute <f16|f32>\n"
-        << "                     常规算子计算精度 (matmul/逐元素/gather，默认: f32)\n"
-        << "  --precision-stable <f16|f32>\n"
-        << "                     数值敏感算子精度 (softmax/LayerNorm/loss，默认: f32)\n"
-        << "  --precision-optimizer <f16|f32>\n"
-        << "                     优化器状态精度 (Adam m/v，默认: f32)\n"
-        << "  --help             显示此帮助信息\n";
+    nn::cli::Help help(std::cout, prog, "GPT 文本生成训练程序");
+
+    help.usage("<text-file> [选项]");
+
+    help.section("参数");
+    help.item("<text-file>", "训练文本文件路径 (必需)");
+
+    help.section("选项");
+    help.opt("--save <path>", "模型保存路径 (默认: gpt_model.bin)");
+    help.opt("--resume <path>", "从已有模型恢复训练");
+    help.opt("--resume-epoch <n>", "从第 n 个 epoch 继续 (0-based，需配合 --resume；默认 0)");
+    help.opt("--resume-step <n>", "从本 epoch 内第 n 步继续 (0-based，需配合 --resume；默认 0)");
+    help.opt("--vocab <path>", "词表 JSON 路径 (默认: gpt_bpe.json)\n自动识别分词器类型 (bpe / charbpe)");
+    help.opt("--test-file <path>", "测试集文件路径 (可选，每 epoch 结束后评估 test loss)");
+    help.opt("--epochs <n>", "训练轮数 (默认: 10)");
+    help.opt("--lr <lr>", "学习率 (默认: 0.001)");
+    help.opt("--batch-size <n>", "批大小 (默认: 32)");
+    help.opt("--accum-steps <n>", "梯度累积步数 (默认: 1)\n每 n 步 forward/backward 累加梯度后再更新参数，等效放大 batch_size×n");
+    help.opt("--seq-len <n>", "序列长度 (默认: 256)");
+    help.opt("--stride <n>", "滑动窗口步长 (默认: 等于 --seq-len，即不重叠)\n设小可产生重叠窗口，增加训练样本数");
+    help.opt("--optimizer <name>", "优化器: sgd/sgd_momentum/adam/adamw/muon (默认: adam)");
+    help.opt("--weight-decay <w>", "AdamW 权重衰减系数 (默认: 0.01)");
+    help.opt("--max-norm <f>", "梯度裁剪最大全局 L2 范数 (默认: 0=不裁剪)");
+    help.opt("--log-interval <n>", "每隔多少 step 显示进度 (默认: 50)");
+    help.opt("--save-interval <n>", "每隔多少 step 保存 checkpoint (默认: 100)");
+    help.opt("--grad-log", "显示梯度统计 (范数/最大值/均值)");
+    help.opt("--no-cache", "禁用 tokenize 缓存 (默认自动缓存到 .tokcache 文件)");
+    help.opt("--gpu [索引|名称]", "启用 GPU 加速 (需要 Vulkan SDK)\n空格形式只收枚举索引；名称子串用 --gpu=<名称>，如 --gpu=NVIDIA / --gpu=40HX");
+    help.opt("--help, -h", "显示此帮助信息");
+
+    help.section("模型结构");
+    help.opt("--model <type>", "模型架构: gpt/rapt (默认: gpt)\ngpt: 标准 Transformer 语言模型\nrapt: ReLU 线性注意力 (RLA) 语言模型，动态稀疏检索，\nO(L·d²) 复杂度；强制 RoPE (ReLU 前施加)");
+    help.opt("--positional-encoding <type>", "位置编码类型: learned/sinusoidal/alibi/rope (默认: learned)\nlearned: 可学习位置嵌入 (GPT 原版)\nsinusoidal: 正弦波固定位置编码 (不参与训练)\nalibi: 线性偏置注意力 (无位置嵌入，支持长度外推)\nrope: 旋转位置编码 (现代方案，在注意力 Q/K 上施加)");
+    help.opt("--activation <type>", "FFN 激活: gelu/swiglu (默认: gelu)\ngelu: QuickGeLU (GPT-2 风格)\nswiglu: SwiGLU (LLaMA/Mistral 风格，每参数效率更高)");
+    help.opt("--norm <type>", "归一化层: layernorm/rmsnorm (默认: layernorm)\nlayernorm: LayerNorm (GPT-2 风格)\nrmsnorm: RMSNorm (LLaMA/Mistral 风格，更快更稳)");
+    help.opt("--d-model <n>", "模型维度 (默认: 128)");
+    help.opt("--num-heads <n>", "注意力头数 (默认: 4)");
+    help.opt("--num-layers <n>", "Transformer 层数 (默认: 4)");
+    help.opt("--d-ff <n>", "FFN 中间维度 (默认: 512)");
+
+    help.section("学习率调度");
+    help.opt("--lr-schedule <type>", "学习率调度: fixed/cosine/step_cosine (默认: fixed)\ncosine: 余弦退火 (epoch 级)，lr 从初始值衰减到 min-lr\nstep_cosine: 余弦退火 (step 级)，按单个训练步预热+退火，\n适合每 epoch 步数很多的场景 (如大语料)");
+    help.opt("--warmup-epochs <n>", "线性预热轮数 (默认: 0，仅 cosine)");
+    help.opt("--warmup-steps <n>", "线性预热步数 (默认: 0，仅 step_cosine)");
+    help.opt("--min-lr <lr>", "余弦退火最低学习率 (默认: 1e-6)");
+    help.opt("--lr-per-epoch <v1,v2,...>", "手动指定每轮学习率 (逗号分隔，优先级最高)");
+
+    help.section("显存优化");
+    help.opt("--checkpoint-every <n>", "每 N 个 Transformer block 重算一次 forward (激活重计算，默认: 0=不启用)\n1=每块都重算，显存收益最大，以约 1 次额外前向\nFLOPs 为代价省去整层激活驻留");
+    help.opt("--activation-offload", "把每块激活搬 host-visible，backward 拷回\n不重算，FLOPs 保持 1.0×，代价是 PCIe 传输；可与\n--checkpoint-every 混合使用：checkpoint 块重算、其余块 offload；仅 GPU 有效");
+    help.note("GPU 训练每 step 末尾自动归还完全空闲的内存池底材 (L2 整块释放)。");
+
+    help.section("Batch 录制粒度");
+    help.opt("--flush-interval <n>", "每 N 个 Transformer block flush 一次 (默认: 1)");
+    help.note("按层切 batch 缩短 D1 延迟销毁锁窗、拆分大提交防 TDR；\n非阻塞提交后细粒度 flush 的额外 submit 代价不在关键路径，\n不影响 batch_size 和训练质量");
+
+    help.section("混合精度 (docs/development/05-mixed-precision.md)");
+    help.opt("--f16", "快捷方式: f16 存储 (param/compute=F16，stable/optimizer=F32)");
+    help.opt("--precision-param <f16|f32>", "权重/参数存储精度 (默认: f32)");
+    help.opt("--precision-compute <f16|f32>", "常规算子计算精度 (matmul/逐元素/gather，默认: f32)");
+    help.opt("--precision-stable <f16|f32>", "数值敏感算子精度 (softmax/LayerNorm/loss，默认: f32)");
+    help.opt("--precision-optimizer <f16|f32>", "优化器状态精度 (Adam m/v，默认: f32)");
 }
 
 // ==================== 命令行参数 ====================
@@ -403,7 +380,7 @@ TrainConfig parse_args(int argc, char *argv[])
     for (int i = 1; i < argc; ++i)
     {
         std::string arg = argv[i];
-        if (arg == "--help")
+        if (arg == "--help" || arg == "-h")
         {
             print_usage(argv[0]);
             std::exit(0);

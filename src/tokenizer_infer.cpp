@@ -10,6 +10,7 @@
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>
+#include <neuralnet.cpp/cli/cli_help.hpp>
 
 #include <algorithm>
 #include <fstream>
@@ -25,27 +26,27 @@
 // ==================== 帮助信息 ====================
 void print_usage(const char *prog)
 {
-    std::cout
-        << "BPE 分词器推理程序 (编码/解码)\n\n"
-        << "用法:\n"
-        << "  " << prog << " --vocab <path> --encode \"text\"    编码文本\n"
-        << "  " << prog << " --vocab <path> --decode \"ids\"      解码 token IDs\n"
-        << "  " << prog << " --vocab <path> --interactive         交互模式\n"
-        << "  " << prog << " --vocab <path> --encode-file <file>  编码文件\n"
-        << "  " << prog << " --vocab <path> <text-file>           统计文本文件每行 token 数\n\n"
-        << "选项:\n"
-        << "  --vocab <path>       词表 JSON 路径 (默认: bpe_vocab.json)\n"
-        << "                       自动识别分词器类型（bpe / charbpe）\n"
-        << "  --encode <text>      编码文本为 token IDs\n"
-        << "  --decode <ids>       解码 token IDs (逗号分隔) 为文本\n"
-        << "  --encode-file <path> 编码整个文件（同时自动统计最长行 token 数）\n"
-        << "  <text-file>          位置参数：直接给文本文件即自动统计最长行 token 数\n"
-        << "  --top <n>            最长行排行榜行数 (默认: 10)\n"
-        << "  --threads <n>        encode 并行度: 0=自动(默认, 全部核心) 1=顺序 >1=指定\n"
-        << "                       （保序并行：任何并行度下输出与顺序执行逐字节一致）\n"
-        << "  --interactive        交互模式 (输入 'quit' 退出)\n"
-        << "  --show-bytes         显示原始字节 (调试用)\n"
-        << "  --help               显示此帮助信息\n";
+    nn::cli::Help help(std::cout, prog, "BPE 分词器推理程序 (编码/解码)");
+
+    help.usage("--vocab <path> --encode \"text\"", "编码文本");
+    help.usage("--vocab <path> --decode \"ids\"", "解码 token IDs");
+    help.usage("--vocab <path> --encode-file <file>", "编码文件");
+    help.usage("--vocab <path> --interactive", "交互模式");
+    help.usage("--vocab <path> <text-file>", "统计文本文件每行 token 数");
+
+    help.section("参数");
+    help.item("<text-file>", "直接给文本文件即统计最长行 token 数");
+
+    help.section("选项");
+    help.opt("--vocab <path>", "词表 JSON 路径 (默认: bpe_vocab.json)\n自动识别分词器类型 (bpe / charbpe)");
+    help.opt("--encode <text>", "编码文本为 token IDs");
+    help.opt("--decode <ids>", "解码 token IDs (逗号分隔) 为文本");
+    help.opt("--encode-file <path>", "编码整个文件 (同时自动统计最长行 token 数)");
+    help.opt("--interactive", "交互模式 (输入 'quit' 退出)");
+    help.opt("--top <n>", "最长行排行榜行数 (默认: 10)");
+    help.opt("--threads <n>", "encode 并行度: 0=自动(默认) 1=顺序 >1=指定\n保序并行：任何并行度下输出与顺序执行逐字节一致");
+    help.opt("--show-bytes", "显示原始字节 (调试用)");
+    help.opt("--help, -h", "显示此帮助信息");
 }
 
 // ==================== 命令行参数 ====================
@@ -68,7 +69,7 @@ Config parse_args(int argc, char *argv[])
     for (int i = 1; i < argc; ++i)
     {
         std::string arg = argv[i];
-        if (arg == "--help")
+        if (arg == "--help" || arg == "-h")
         {
             print_usage(argv[0]);
             std::exit(0);

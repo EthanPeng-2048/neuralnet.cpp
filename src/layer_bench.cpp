@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <iostream>
 #include <random>
 #include <string>
 #include <string_view>
@@ -27,6 +28,7 @@
 
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/cli/cli_engine_factory.hpp>
+#include <neuralnet.cpp/cli/cli_help.hpp>
 
 using nn::Scalar;
 using nn::Matrix;
@@ -462,25 +464,35 @@ void bench_layer(ComputeEngine& engine, const BenchConfig& cfg, const LayerSpec&
 // ═══════════════════════════════════════════════════════════════════════════
 void print_help(const char* prog)
 {
-    std::printf("用法: %s [--gpu] [--all | --layer <name>[,...] | --op <name|all>[,...]] [选项]\n", prog);
-    std::printf("  --gpu            使用 Vulkan GPU（默认 CPU）\n");
-    std::printf("  --all            测试全部层\n");
-    std::printf("  --layer <n>      指定层（逗号分隔可多个）\n");
-    std::printf("  --op <n>         指定算子（matmul 等；'all' 测试全部算子）\n");
-    std::printf("  --forward-only   仅前向（默认前向+反向）\n");
-    std::printf("  --iter <n>       迭代次数（默认 10）\n");
-    std::printf("  --warmup <n>     预热次数（默认 2）\n");
-    std::printf("  --in/--out       Linear 输入/输出维度\n");
-    std::printf("  --dmodel/--heads/--dff   序列层维度\n");
-    std::printf("  --batch/--seq    batch / 序列长度\n");
-    std::printf("  --cin/--cout/--kernel/--hw  卷积尺寸\n");
-    std::printf("  --rows/--cols    Softmax 形状\n");
-    std::printf("  --m/--n/--k      算子尺寸（matmul: (m,k)·(k,n)；逐元素/归约: (m,n)）\n");
-    std::printf("层名: linear swiglu layernorm rmsnorm softmax mha causal_attn\n");
-    std::printf("      feedforward transformer gpt_block conv2d maxpool\n");
-    std::printf("算子: matmul matmul_bt matmul_at batched_matmul add_inplace\n");
-    std::printf("      row_reduce_sum col_reduce_sum transpose scale_inplace\n");
+    nn::cli::Help help(std::cout, prog, "层 / 算子吞吐量基准");
+
+    help.usage("[--gpu] [--all | --layer <name>[,...] | --op <name|all>[,...]] [选项]");
+
+    help.section("选项");
+    help.opt("--gpu", "使用 Vulkan GPU (默认 CPU)");
+    help.opt("--all", "测试全部层");
+    help.opt("--layer <n>", "指定层 (逗号分隔可多个)");
+    help.opt("--op <n>", "指定算子 (matmul 等；all 测试全部算子)");
+    help.opt("--forward-only", "仅前向 (默认前向+反向)");
+    help.opt("--iter <n>", "迭代次数 (默认: 10)");
+    help.opt("--warmup <n>", "预热次数 (默认: 2)");
+    help.opt("--in/--out <n>", "Linear 输入/输出维度");
+    help.opt("--dmodel/--heads/--dff <n>", "序列层维度");
+    help.opt("--batch/--seq <n>", "batch / 序列长度");
+    help.opt("--cin/--cout/--kernel/--hw <n>", "卷积尺寸");
+    help.opt("--rows/--cols <n>", "Softmax 形状");
+    help.opt("--m/--n/--k <n>", "算子尺寸 (matmul: (m,k)·(k,n)；逐元素/归约: (m,n))");
+    help.opt("--help, -h", "显示此帮助信息");
+
+    help.section("层名");
+    help.text("linear swiglu layernorm rmsnorm softmax mha causal_attn");
+    help.text("feedforward transformer gpt_block conv2d maxpool");
+
+    help.section("算子");
+    help.text("matmul matmul_bt matmul_at batched_matmul add_inplace");
+    help.text("row_reduce_sum col_reduce_sum transpose scale_inplace");
 }
+
 
 size_t parse_size(const char* val)
 {

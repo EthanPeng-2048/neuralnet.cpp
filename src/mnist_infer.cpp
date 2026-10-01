@@ -13,6 +13,7 @@
 #include <neuralnet.cpp/domain_mnist.hpp>
 #include <neuralnet.cpp/cli/cli_engine_factory.hpp>
 #include <neuralnet.cpp/cli/cli_gpu_option.hpp>
+#include <neuralnet.cpp/cli/cli_help.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -33,18 +34,17 @@ using nn::Scalar;
 // ==================== 帮助信息 ====================
 void print_usage(const char *prog)
 {
-    std::cout
-        << "MNIST 手写数字推理程序\n\n"
-        << "用法:\n"
-        << "  " << prog << " <image.csv> [选项]     推理单张图片\n"
-        << "  " << prog << " <目录>   [选项]     批量推理目录下所有 CSV\n\n"
-        << "选项:\n"
-        << "  --model <path>     模型文件路径 (默认: pretrained/model.bin)\n"
-        << "  --topk <n>         显示前 n 个预测结果 (默认: 3)\n"
-        << "  --show-pixels      显示像素矩阵 (调试用)\n"
-        << "  --gpu <索引>       启用 GPU 加速 (需要 Vulkan SDK)，可用枚举索引指定设备\n"
-        << "                     (名称子串写法: --gpu=NVIDIA / --gpu=40HX)\n"
-        << "  --help             显示此帮助信息\n";
+    nn::cli::Help help(std::cout, prog, "MNIST 手写数字推理程序");
+
+    help.usage("<image.csv> [选项]", "推理单张图片");
+    help.usage("<目录> [选项]", "批量推理目录下所有 CSV");
+
+    help.section("选项");
+    help.opt("--model <path>", "模型文件路径 (默认: pretrained/model.bin)");
+    help.opt("--topk <n>", "显示前 n 个预测结果 (默认: 3)");
+    help.opt("--show-pixels", "显示像素矩阵 (调试用)");
+    help.opt("--gpu [索引|名称]", "启用 GPU 加速 (需要 Vulkan SDK)\n空格形式只收枚举索引；名称子串用 --gpu=<名称>，如 --gpu=NVIDIA / --gpu=40HX");
+    help.opt("--help, -h", "显示此帮助信息");
 }
 
 // ==================== 命令行参数 ====================
@@ -66,7 +66,7 @@ nn::Result<InferConfig> parse_args(int argc, char *argv[])
     for (int i = 1; i < argc; ++i)
     {
         std::string arg = argv[i];
-        if (arg == "--help")
+        if (arg == "--help" || arg == "-h")
         {
             print_usage(argv[0]);
             std::exit(0);

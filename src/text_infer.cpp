@@ -12,6 +12,7 @@
 #include <neuralnet.cpp/domain_gpt.hpp>
 #include <neuralnet.cpp/cli/cli_engine_factory.hpp>
 #include <neuralnet.cpp/cli/cli_gpu_option.hpp>
+#include <neuralnet.cpp/cli/cli_help.hpp>
 
 #include <chrono>
 #include <iomanip>
@@ -25,25 +26,21 @@ using nn::Scalar;
 // ==================== 帮助信息 ====================
 void print_usage(const char *prog)
 {
-    std::cout
-        << "GPT 文本生成推理程序\n\n"
-        << "用法:\n"
-        << "  " << prog << " --prompt \"text\" [选项]\n"
-        << "  " << prog << " --interactive          交互模式\n\n"
-        << "选项:\n"
-        << "  --model <path>       模型文件路径 (默认: gpt_model.bin)\n"
-        << "                       V3 格式模型自动读取规格和嵌入 tokenizer\n"
-        << "  --vocab <path>       词表 JSON 路径 (默认: bpe_vocab.json)\n"
-        << "                       仅当模型未嵌入 tokenizer 时使用\n"
-        << "                       自动识别分词器类型（bpe / charbpe）\n"
-        << "  --prompt <text>      输入提示文本\n"
-        << "  --interactive        交互式生成模式\n"
-        << "  --max-tokens <n>     最大生成 token 数 (默认: 200)\n"
-        << "  --temperature <t>    温度参数 (默认: 1.0, 0=贪心)\n"
-        << "  --gpu <索引>         启用 GPU 加速 (需要 Vulkan SDK)，可用枚举索引指定设备\n"
-        << "                       (名称子串写法: --gpu=NVIDIA / --gpu=40HX)\n"
-        << "  --show-tokens        显示 token ID (调试用)\n"
-        << "  --help               显示此帮助信息\n";
+    nn::cli::Help help(std::cout, prog, "GPT 文本生成推理程序");
+
+    help.usage("--prompt \"text\" [选项]", "单次生成");
+    help.usage("--interactive [选项]", "交互模式");
+
+    help.section("选项");
+    help.opt("--model <path>", "模型文件路径 (默认: gpt_model.bin)\nV3 格式模型自动读取规格和嵌入 tokenizer");
+    help.opt("--vocab <path>", "词表 JSON 路径 (默认: bpe_vocab.json)\n仅当模型未嵌入 tokenizer 时使用；自动识别分词器类型 (bpe / charbpe)");
+    help.opt("--prompt <text>", "输入提示文本");
+    help.opt("--interactive", "交互式生成模式");
+    help.opt("--max-tokens <n>", "最大生成 token 数 (默认: 200)");
+    help.opt("--temperature <t>", "温度参数 (默认: 1.0；0=贪心)");
+    help.opt("--show-tokens", "显示 token ID (调试用)");
+    help.opt("--gpu [索引|名称]", "启用 GPU 加速 (需要 Vulkan SDK)\n空格形式只收枚举索引；名称子串用 --gpu=<名称>，如 --gpu=NVIDIA / --gpu=40HX");
+    help.opt("--help, -h", "显示此帮助信息");
 }
 
 // ==================== 命令行参数 ====================
@@ -66,7 +63,7 @@ InferConfig parse_args(int argc, char *argv[])
     for (int i = 1; i < argc; ++i)
     {
         std::string arg = argv[i];
-        if (arg == "--help")
+        if (arg == "--help" || arg == "-h")
         {
             print_usage(argv[0]);
             std::exit(0);

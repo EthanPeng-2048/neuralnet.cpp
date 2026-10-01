@@ -26,6 +26,7 @@
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/cli/cli_engine_factory.hpp>
 #include <neuralnet.cpp/cli/cli_gpu_option.hpp>
+#include <neuralnet.cpp/cli/cli_help.hpp>
 #include <neuralnet.cpp/domain_gpt.hpp>
 
 #include <algorithm>
@@ -260,21 +261,32 @@ template <typename T>
 
 void print_usage(const char* prog)
 {
-    std::cout
-        << "运行时显存分项探针\n\n用法: " << prog << " [选项]\n\n"
-        << "选项:\n"
-        << "  --gpu=<设备>            指定 Vulkan 设备（索引或名称子串，如 40HX）\n"
-        << "  --f16                   f16 存储（param/compute=F16，stable/optimizer=F32）\n"
-        << "  --f16-all               四字段全 F16（实验配方，见 precision.hpp）\n"
-        << "  --checkpoint-every <n>  梯度检查点（每 n 个 block 重算）\n"
-        << "  --activation-offload    激活搬 host-visible\n"
-        << "  --doc-mask              启用文档感知掩码（复刻 text_train doc_ids 路径）\n"
-        << "  --batch/--seq/--vocab/--d-model/--num-heads/--num-layers/--d-ff <n>\n"
-        << "  --optimizer <name>      sgd/sgd_momentum/adam/adamw/muon (默认 adam)\n"
-        << "  --steps <n>             训练步数采样 (默认 2)\n"
-        << "  --no-kv                 跳过 KV cache 推理阶段\n"
-        << "  --kv-steps <n>          KV 阶段 forward_step 次数 (默认 32)\n"
-        << "  --help                  显示帮助\n";
+    nn::cli::Help help(std::cout, prog, "运行时显存分项探针");
+
+    help.usage("[选项]");
+
+    help.section("选项");
+    help.opt("--gpu=<设备>", "指定 Vulkan 设备 (索引或名称子串，如 40HX)");
+    help.opt("--f16", "f16 存储 (param/compute=F16，stable/optimizer=F32)");
+    help.opt("--f16-all", "四字段全 F16 (实验配方，见 precision.hpp)");
+    help.opt("--checkpoint-every <n>", "梯度检查点 (每 n 个 block 重算)");
+    help.opt("--flush-interval <n>", "batch flush 粒度 (默认: 2)");
+    help.opt("--activation-offload", "激活搬 host-visible");
+    help.opt("--doc-mask", "启用文档感知掩码 (复刻 text_train doc_ids 路径)");
+    help.opt("--steps <n>", "训练步数采样 (默认: 2)");
+    help.opt("--no-kv", "跳过 KV cache 推理阶段");
+    help.opt("--kv-steps <n>", "KV 阶段 forward_step 次数 (默认: 32)");
+    help.opt("--optimizer <name>", "优化器: sgd/sgd_momentum/adam/adamw/muon (默认: adam)");
+    help.opt("--help, -h", "显示此帮助信息");
+
+    help.section("模型尺寸");
+    help.opt("--vocab <n>", "词表大小 (默认: 8208)");
+    help.opt("--d-model <n>", "模型维度 (默认: 64)");
+    help.opt("--num-heads <n>", "注意力头数 (默认: 4)");
+    help.opt("--num-layers <n>", "Transformer 层数 (默认: 4)");
+    help.opt("--d-ff <n>", "FFN 中间维度 (默认: 256)");
+    help.opt("--seq <n>", "序列长度 (默认: 256)");
+    help.opt("--batch <n>", "批大小 (默认: 64)");
 }
 
 int main(int argc, char* argv[])
@@ -310,7 +322,7 @@ int main(int argc, char* argv[])
             }
             return argv[++i];
         };
-        if (arg == "--help") { print_usage(argv[0]); return 0; }
+        if (arg == "--help" || arg == "-h") { print_usage(argv[0]); return 0; }
         else if (arg == "--f16") f16 = true;
         else if (arg == "--f16-all") { f16 = true; f16_all = true; }
         else if (arg == "--activation-offload") activation_offload = true;

@@ -32,6 +32,12 @@ from cli_controllers import (  # noqa: E402
 )
 
 FLAG_RE = re.compile(r"--[a-z0-9][a-z0-9-]*")
+# 统一帮助排版器（include/neuralnet.cpp/cli/cli_help.hpp）的调用行形态：
+#   help.opt("--epochs <n>", "...")
+# 帮助内容只出现在这种行里（而非 `<<` 字符串链），审计据此把帮助行排除在
+# "解析分支"之外——否则帮助里声明的 flag 会被误当成已解析，幽灵选项检测失效。
+# 见 cli_help.hpp 文件头的审计约定：每条 help.<方法>() 必须落在同一物理行。
+HELP_CALL_RE = re.compile(r"\bhelp\s*\.\s*(usage|text|section|note|item|opt|flush)\s*\(")
 EXES = ["mnist_train", "mnist_infer", "text_train", "text_infer",
         "tokenizer_train", "tokenizer_infer"]
 
@@ -145,8 +151,9 @@ def audit_phantom_options() -> int:
         lines = [(cpp, ln) for ln in cpp.read_text(encoding="utf-8", errors="replace").splitlines()]
         real: set[str] = set()
         for _, ln in lines + shared:
-            # 帮助行以 `<<` 续接；解析行不含 → 据此区分
-            if "<<" in ln or ln.lstrip().startswith("//"):
+            # 帮助行以 `<<` 续接（旧式）或 `help.<方法>(...)`（统一排版器）；
+            # 解析行不含这两者 → 据此区分
+            if "<<" in ln or HELP_CALL_RE.search(ln) or ln.lstrip().startswith("//"):
                 continue
             real |= set(FLAG_RE.findall(ln))
         phantom = sorted(cli_help_flags(exe) - real)
