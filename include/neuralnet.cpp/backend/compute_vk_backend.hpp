@@ -543,6 +543,13 @@ private:
     std::unordered_map<std::string, std::uint32_t> fused_rparam_counts_;
     // 每线程处理元素数（1=标量, 4=vec4；决定 dispatch 宽度缩放）
     std::unordered_map<std::string, std::uint32_t> fused_vec_width_;
+    // push constant **固定头**长度（uint 槽数，不含 vp/常量池）：**注册时算一次**
+    // 并在此存下，run_fused_gpu 只读不算 —— 该值此前在创建侧与写入侧各推导一遍
+    // （两侧入参来源不同：fs.spec.fold/has_matmul/reduce_axis 对
+    //  is_fold/matmul_k/has_mm/raxis），任一侧漂移就是"vkCmdPushConstants 超
+    //  range 被驱动丢弃 → shader 读到未定义残留 → 假 PASS"（见注册处注释）。
+    // 运行期精度分派变体（键后缀 "#x"）的额外 `prec` 槽也含在此值内。
+    std::unordered_map<std::string, std::uint32_t> fused_pc_base_fixed_;
 
     std::unique_ptr<MemoryPool> memory_pool_;
     // 第二阶段：瞬态/持久分池。batch 录制期（batch_mode_=true）创建的
@@ -1699,42 +1706,54 @@ public:
 
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
         // 16. 注册 AOT 融合 shader pipelines（构建期 scan_exprs 收集 +
-        //     gen_fused 合成；每个条目：N 输入 + 1 输出 binding；
-        //     push constants = count + cols + 常量池；key = expr_spec_key）
+        //     fused_generate.hpp 合成）。条目形态：
+        //       · V0 / V2（键 `key` / `key#a`）：N 输入 + 1 输出 binding；
+        //       · V1 运行期精度分派（键 `key#x`）：2N + 2 binding（每个输入/输出
+        //         各绑 f32 与 f16 两个视图）；PC 固定头末尾多一个 `prec` 槽。
+        //     push constants = 固定头（count/cols/…）+ vp 槽 + 常量池 + rp 槽。
         for (const auto& fs : nn::fused::kFusedShaders)
         {
             if (!fs.spirv || fs.spirv_words == 0)
                 continue;  // 空 SPIR-V：跳过（构建配置缺失）
-            // 精度变体（key 含 '#'，Phase 2 in-kernel f16）需要 SSBO 16 位存储；
-            // 设备未启用 → 跳过注册（运行时按 (key,sig) 查不到 → 回退边界 cast）。
+            // 运行期精度分派变体（键 "#x"）：输入/输出各双视图 + PC 多一个 prec 槽
+            const bool is_disp =
+                std::string_view(fs.key).ends_with(nn::EXPR_PREC_DISPATCH_SUFFIX);
+            // 带 '#' 的变体（f16 视图）需要 SSBO 16 位存储；设备未启用 →
+            // 跳过注册（运行时查不到 `#x`/`#a` → 基类 NVI 入口回退边界 cast）。
             if (std::string_view(fs.key).find('#') != std::string_view::npos &&
                 !device_.has_16bit_storage())
                 continue;
             // ALU 变体（key 以 "#a" 结尾，native16 原生 f16 算术）额外需要
-            // shaderFloat16 特性；未启用 → 跳过 → 运行时回退同签名的 f32 算术
-            // 变体（其 pipeline 独立存在）或边界 cast——正确性不变。
-            if (std::string_view(fs.key).ends_with("#a") &&
+            // shaderFloat16 特性；未启用 → 跳过 → 运行时回退 `#x`（其 pipeline
+            // 独立存在）或边界 cast——正确性不变。
+            if (std::string_view(fs.key).ends_with(nn::EXPR_PREC_ALU_SUFFIX) &&
                 !device_.has_shader_float16())
                 continue;
+            const std::uint32_t n_in =
+                static_cast<std::uint32_t>(fs.spec.views.size());
+            // 分派变体：输入 i 的 f32 视图 binding=i、f16 视图 binding=n_in+i；
+            // 输出 f32/f16 视图 binding=2*n_in / 2*n_in+1。
             const std::uint32_t num_bindings =
-                static_cast<std::uint32_t>(fs.spec.views.size()) + 1;  // 输入 + 输出
-            // 归约 kernel 的 push constants 多 uint rows + uint vector_out；
-            // matmul 融合 kernel 多 uint rows + uint mm_k + uint mm_batch + uint mm_trans；
-            // matmul+归约组合再多 uint mm_k + uint mm_batch + uint mm_trans（7 槽）；
-            // fold v1（标量域）= count, cols, rows, vector_out, fold_k（5 槽）——
-            //   **必须与 run_fused_gpu 的 pc_base 逐形态一致**：漏分支会让
-            //   range 少算，vkCmdPushConstants 超 range 部分被驱动丢弃 →
-            //   fold_k 读到未定义残留（残留随前序 op 漂移，表现为时对时错的
-            //   假 PASS，"全绿"验不出）；改动 PC 形态时创建侧(本处)与写入侧
-            //   (run_fused_gpu)必须同改）；
-            // 另加 fs.view_param_count 个运行时视图参数槽（RowMod/RotateHalf）
-            const std::uint32_t pc_base =
+                is_disp ? (2u * n_in + 2u) : (n_in + 1u);   // 输入 + 输出
+            // push constant **固定头**槽数（uint）：逐形态与生成器的 PC 声明
+            // 逐槽一致——
+            //   逐元素 2（count, cols）/ +matmul 6（…, rows, mm_k, mm_batch,
+            //   mm_trans）/ 归约 4（…, rows, vector_out）/ 归约+matmul 7 /
+            //   fold 5（…, vector_out, fold_k）/ fold+mm 7（…, fold_k, mm_k,
+            //   mm_batch）+ 分派变体 1 个 `prec`。
+            // ⚠ 该值**只在此处计算一次**并存进 fused_pc_base_fixed_，写入侧
+            //   (run_fused_gpu) 只读：此前两侧各推导一遍，漂移会让
+            //   vkCmdPushConstants 超 range 而被驱动丢弃 → shader 读到未定义
+            //   残留（随前序 op 漂移，表现为时对时错的假 PASS，"全绿"验不出）。
+            const std::uint32_t pc_base_fixed =
                 (fs.spec.fold && fs.spec.fold->matmul)    ? 7u  // fold+mm 7 槽
               : (fs.spec.fold)                            ? 5u
               : (fs.reduce_axis >= 0 && fs.has_matmul)    ? 7u
               : (fs.reduce_axis >= 0)                     ? 4u
               : (fs.has_matmul)                           ? 6u
               :                                             2u;
+            // 分派变体在固定头末尾多一个 uint prec（生成器同位置声明）
+            const std::uint32_t pc_base = pc_base_fixed + (is_disp ? 1u : 0u);
             const std::uint32_t pc_uints = pc_base + fs.view_param_count;
             const std::uint32_t pc_size =
                 static_cast<std::uint32_t>(pc_uints * sizeof(std::uint32_t) +
@@ -1759,6 +1778,7 @@ public:
                 fused_view_param_counts_.emplace(fs.key, fs.view_param_count);
                 fused_rparam_counts_.emplace(fs.key, fs.rparam_count);
                 fused_vec_width_.emplace(fs.key, fs.vec_width);
+                fused_pc_base_fixed_.emplace(fs.key, pc_base_fixed);
             }
         }
 #endif
@@ -3347,7 +3367,10 @@ public:
         // 输出存储精度（Phase 2 in-kernel f16）：true → 分配 f16 字节布局的
         // 输出缓冲（返回的 GpuTensor 仅是**占位标签**，调用方按此标志重贴
         // GpuTensorF16 —— 见 GpuEngine::eval_expr）。
-        bool out_f16 = false)
+        bool out_f16 = false,
+        // 运行期精度分派（键 "#x"）：真实 (输入精度位图, 输出精度)。仅在
+        // 分派变体上写入 PC `prec` 槽；其余变体忽略（其精度已是身份）。
+        nn::ExprPrecSig prec_sig = 0)
     {
         if (!initialized_)
             return std::unexpected(Error{"GPU backend not initialized"});
@@ -3356,6 +3379,18 @@ public:
         if (it == fused_pipelines_.end())
             return std::unexpected(Error{"fused shader not registered: " + shader_name});
         const VulkanPipeline& pipeline = it->second;
+        // 运行期精度分派变体（键后缀 "#x"）：描述符 = 2N 输入视图 + 2 输出视图，
+        // 且 PC 固定头末尾多一个 `prec` 槽。
+        const bool is_disp =
+            std::string_view(shader_name).ends_with(nn::EXPR_PREC_DISPATCH_SUFFIX);
+        // PC 固定头槽数：**注册时算定，此处只读**（唯一来源 =
+        // register_fused_shaders 的 pc_base_fixed；本地重推会让两侧漂移 →
+        // push constant 超 range 被驱动丢弃 → 静默读未定义残留）。
+        const auto pcbase_it = fused_pc_base_fixed_.find(shader_name);
+        if (pcbase_it == fused_pc_base_fixed_.end())
+            return std::unexpected(Error{
+                "run_fused_gpu: shader 元数据缺失（pc_base_fixed）：" + shader_name});
+        const std::uint32_t pc_base_fixed = pcbase_it->second;
         // 归约轴：-1=逐元素, 0=行归约, 1=列归约
         const int raxis = fused_reduce_axis_.count(shader_name)
             ? fused_reduce_axis_.at(shader_name) : -1;
@@ -3453,17 +3488,34 @@ public:
         }
         GpuTensor output = *output_ptr;
 
-        // 2. 分配描述符集（N 输入 + 1 输出）
+        // 2. 分配描述符集（N 输入 + 1 输出；分派变体 = 2N + 2）
         auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
         if (!ds_r) return std::unexpected(ds_r.error());
         VkDescriptorSet desc_set = *ds_r;
 
-        const std::size_t n_bindings = inputs.size() + 1;
+        const std::size_t n_in = inputs.size();
+        const std::size_t n_bindings = is_disp ? (2 * n_in + 2) : (n_in + 1);
         std::vector<VkDescriptorBufferInfo> buf_infos(n_bindings);
         std::vector<VkWriteDescriptorSet> writes(n_bindings);
-        for (std::size_t i = 0; i < inputs.size(); ++i)
-            buf_infos[i] = {inputs[i]->impl(), 0, VK_WHOLE_SIZE};
-        buf_infos[inputs.size()] = {output.buffer().impl(), 0, VK_WHOLE_SIZE};
+        if (is_disp)
+        {
+            // 同一 VkBuffer 绑两次（f32 视图 / f16 视图）；输入对是 readonly、
+            // 输出对是 writeonly，shader 每个元素只解引用 PC `prec` 选中的那一个
+            // → 另一个从不访问（无别名风险）。
+            for (std::size_t i = 0; i < n_in; ++i)
+            {
+                buf_infos[i] = {inputs[i]->impl(), 0, VK_WHOLE_SIZE};
+                buf_infos[n_in + i] = {inputs[i]->impl(), 0, VK_WHOLE_SIZE};
+            }
+            buf_infos[2 * n_in] = {output.buffer().impl(), 0, VK_WHOLE_SIZE};
+            buf_infos[2 * n_in + 1] = {output.buffer().impl(), 0, VK_WHOLE_SIZE};
+        }
+        else
+        {
+            for (std::size_t i = 0; i < n_in; ++i)
+                buf_infos[i] = {inputs[i]->impl(), 0, VK_WHOLE_SIZE};
+            buf_infos[n_in] = {output.buffer().impl(), 0, VK_WHOLE_SIZE};
+        }
         for (std::size_t i = 0; i < n_bindings; ++i)
         {
             writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -3503,19 +3555,15 @@ public:
         //   matmul+归约: count, cols, rows, vector_out, mm_k, mm_batch, mm_trans,
         //                [vp0..], c0..
         //
-        // ⚠ 固定头长度必须**逐形态**与生成器的 PC 声明一致：逐元素 2 /
-        //   逐元素+matmul 6 / 归约 4 / 归约+matmul 7 / fold 5 / fold+matmul 7。
+        // ⚠ 固定头长度**唯一来源 = 注册时的 pc_base_fixed**（本处只读，见上）。
+        //   逐形态：逐元素 2 / 逐元素+matmul 6 / 归约 4 / 归约+matmul 7 /
+        //   fold 5 / fold+matmul 7（+ 分派变体 1 个 prec）。
         //   错一个 uint 即常量池整体后移 → shader 从错位处读常量，GPU 上带
         //   常量的归约静默错值而 CPU 正常（实测把 select(cond,1,0) 的常量
         //   读成垃圾）。
-        const std::uint32_t pc_base =
-            (is_fold && matmul_k)       ? 7u   // fold+mm: …, fold_k, mm_k, mm_batch
-          : (is_fold)                   ? 5u   // fold: count,cols,rows,vector_out,fold_k
-          : (raxis >= 0 && has_mm) ? 7u   // …, mm_k, mm_batch, mm_trans
-          : (raxis >= 0)           ? 4u   // count, cols, rows, vector_out
-          : (has_mm)               ? 6u   // count, cols, rows, mm_k, mm_batch, mm_trans
-          :                          2u;  // count, cols
-        const std::uint32_t pc_uints = pc_base;
+        // 分派变体（键 "#x"）在固定头**末尾**多一个 uint prec：生成器同位置
+        // 声明（各生成器的 PC 块都在固定槽之后、vp 之前发 `uint prec;`）。
+        const std::uint32_t pc_uints = pc_base_fixed + (is_disp ? 1u : 0u);
         std::vector<std::uint8_t> pc(
             (pc_uints + n_vp) * sizeof(std::uint32_t) + sizeof(Scalar) * consts.size()
             + sizeof(Scalar) * rparams.size());
@@ -3582,6 +3630,11 @@ public:
                             sizeof(std::uint32_t));
             }
         }
+        // 运行期精度分派：把真实 (输入精度位图, 输出精度) 写进固定头末尾的
+        // prec 槽——shader 据此在每个加载/存储点走 uniform 分支。
+        if (is_disp)
+            std::memcpy(pc.data() + pc_base_fixed * sizeof(std::uint32_t),
+                        &prec_sig, sizeof(prec_sig));
         // 运行时视图参数（RowMod 周期 / RotateHalf 块大小），置于固定头之后、常量池之前
         for (std::uint32_t i = 0; i < n_vp; ++i)
             std::memcpy(pc.data() + (pc_uints + i) * sizeof(std::uint32_t),
@@ -5146,8 +5199,13 @@ public:
 // ══════════════════════════════════════════════════════════════════════
 // GpuBuffer 析构（类外定义）：batch 录制期间延迟销毁，避免已录制的
 // descriptor 引用已销毁的 buffer（VUID-vkDestroyBuffer-buffer-00922）。
+//
+// **必须 inline**：本库是 header-only，任何包含本头的翻译单元都会发射本定义
+// ——缺失 inline 会让"≥2 个 TU 的程序"链接期 duplicate symbol（实测
+// `examples/fusion_custom_layer_*` 两 TU 即撞）。库外使用者的常规工程
+// （多 TU）因此不可用。
 // ══════════════════════════════════════════════════════════════════════
-GpuBuffer::~GpuBuffer()
+inline GpuBuffer::~GpuBuffer()
 {
     if (buffer_ == VK_NULL_HANDLE)
         return;

@@ -1361,30 +1361,54 @@ public:
     }
 
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
-    // ── (结构, 精度签名) 变体选择：native16 ALU 变体优先，f32 算术变体回退 ──
-    // 查找顺序（Phase 3 原生 f16）：
-    //   1. key#sig#a（native16 原生 f16 算术）—— 注册表与 pipeline **都**命中
-    //      才选（设备无 shaderFloat16 时 pipeline 不创建 → 自动落 2）；
-    //   2. key#sig（f16 存储 + f32 算术，原行为）—— pipeline 命中与否交由
-    //      调用方原有判断（fs && has_fused_shader(fs->key)）；
-    //   3. psig == 0 → 全 f32 结构键（调用方处理）。
-    // 两变体并存 → 任何设备都有最优可用路径，无回归。
+    // ── 变体选择：native16（`key#a`）优先，运行期精度分派（`key#x`）回退 ──
+    //   · psig == 0 → 全 f32 结构键 `key`（V0）。
+    //   · 结构谓词 expr_prec_sig_native16 通过 → `key#a`（V2b 原生 f16 算术）。
+    //     **必须在运行期用真实 spec 重跑谓词**：常量值已不进 key（同结构可带
+    //     不同常量），生成期是对"生成那一份时的常量"判定，运行期实例的常量
+    //     可能不满足谓词（如 0 < |c| < 6e-8 的 eps 在 f16 下 flush-to-0）。
+    //     生成期判定与运行期判定不一致 = 静默错值。
+    //   · 其余 → `key#x`（V1 运行期精度分派）：一份 shader 覆盖任意签名。
+    //     ⚠ "任何非零签名都必定命中"只在**生成端产出了 `#x`** 且设备启用了
+    //     16bit 存储时成立；生成被跳过（`[skip]`）/ `NN_SCAN_NO_DISPATCH=1` /
+    //     设备无 16bit storage 时仍会 miss → 基类 NVI 入口回退边界 cast。
+    // registry 与 pipeline **都**命中才选（设备无 shaderFloat16 时 `#a` 的
+    // pipeline 不创建 → 自动落 `#x`）。
+    //
+    // 诊断（NN_PREC_TRACE=1）：记**实际选中的变体**（V1/V2），不记 V0 默认
+    // 路径（f32 热路径，逐调用打日志会淹没输出）。两个约束：
+    //   ① 只在**确认命中**后打（此前 V1 分支先打后查，miss 也报 alu-hit）；
+    //   ② 只由真正 dispatch 的调用方传 log_hit=true ——
+    //      `supports_expr_precision_variant` 只是查询（NVI 入口每次都调），
+    //      它打日志会让计数翻倍（实测 12040 行 = 6020 次真实分派 × 2）。
     [[nodiscard]] const nn::fused::FusedShader* find_prec_variant_(
-        const std::string& key, nn::ExprPrecSig psig) const
+        const std::string& key, nn::ExprPrecSig psig, const nn::ExprSpec& spec,
+        bool log_hit = false) const
     {
         if (psig == 0)
-            return nn::fused::find_fused(key);
-        const std::string akey = nn::expr_prec_sig_alu_key(key, psig);
-        if (const auto* fs = nn::fused::find_fused(akey);
-            fs && backend_.has_fused_shader(akey))
-        {
-            // 诊断（NN_PREC_TRACE=1）：确认 native16 变体被实际命中
-            //（而非静默落 f32 算术回退——测试全绿区分不了这两者）
-            if (nn::dsl::env_flag("NN_PREC_TRACE"))
-                std::fprintf(stderr, "[prec][alu-hit] %s\n", akey.c_str());
+            return nn::fused::find_fused(key);      // V0：全 f32 结构键
+        const bool trace = log_hit && nn::dsl::env_flag("NN_PREC_TRACE");
+        const auto hit = [&](const std::string& k) -> const nn::fused::FusedShader* {
+            const auto* fs = nn::fused::find_fused(k);
+            if (!fs || !backend_.has_fused_shader(k))
+                return nullptr;
+            if (trace)
+                std::fprintf(stderr, "[prec][alu-hit] %s\n", k.c_str());
             return fs;
-        }
-        return nn::fused::find_fused(nn::expr_prec_sig_key(key, psig));
+        };
+        // V2b：native16 原生 f16 算术（运行期用真实 spec 复核结构谓词）
+        if (nn::expr_prec_sig_native16(spec, psig))
+            if (const auto* fs = hit(key + nn::EXPR_PREC_ALU_SUFFIX))
+                return fs;
+        // V1：运行期精度分派
+        const std::string xkey = key + nn::EXPR_PREC_DISPATCH_SUFFIX;
+        if (const auto* fs = hit(xkey))
+            return fs;
+        if (trace)
+            std::fprintf(stderr,
+                         "[prec][fallback] %s 未预生成 → 回退基类边界 cast\n",
+                         xkey.c_str());
+        return nullptr;
     }
 #endif
     // ══════════════════════════════════════════════════════════════════════
@@ -1402,17 +1426,18 @@ public:
         {
             const std::string fkey = nn::expr_spec_key(raw_spec);
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
-            // fold 精度变体（键 fkey#sig；native16 谓词排除 fold
-            // → 只有 f32 算术变体，find_prec_variant_ 的 #a 探测自然落空）
+            // fold 变体：native16 谓词排除 fold，find_prec_variant_ 的 `#a`
+            // 探测必然落空 → 命中 `#x`（或有真实位图的存储变体）
             const nn::ExprPrecSig fpsig = nn::expr_prec_sig_of(inputs, P);
-            const nn::fused::FusedShader* ffs = find_prec_variant_(fkey, fpsig);
+            const nn::fused::FusedShader* ffs =
+                find_prec_variant_(fkey, fpsig, raw_spec, /*log_hit=*/true);
             if (ffs && backend_.has_fused_shader(ffs->key))
             {
                 auto fi_r = fused_buffers_(inputs);
                 if (!fi_r) return std::unexpected(fi_r.error());
                 std::vector<const GpuBuffer*>& gpu_inputs = fi_r->bufs;
                 const auto fvp = nn::expr_spec_runtime_view_params(raw_spec);
-                const bool fout_f16 = nn::expr_prec_sig_out_f16(ffs->prec_sig);
+                const bool fout_f16 = nn::expr_variant_out_f16(ffs->prec_sig, fpsig);
                 auto out = backend_.run_fused_gpu(
                     ffs->key, gpu_inputs, raw_spec.consts, rows, cols,
                     /*vector_out=*/false, fvp, raw_spec.rparams,
@@ -1422,7 +1447,7 @@ public:
                     nn::expr_spec_runtime_matmul_k(raw_spec),
                     nn::expr_spec_runtime_matmul_batch(raw_spec),
                     /*matmul_trans=*/0u,
-                    nn::expr_spec_runtime_fold_k(raw_spec), fout_f16);
+                    nn::expr_spec_runtime_fold_k(raw_spec), fout_f16, fpsig);
                 if (!out) return std::unexpected(out.error());
                 // f16 输出：按 2B/元素分配后重贴 GpuTensorF16（同非 fold 路径）
                 if (fout_f16)
@@ -1441,13 +1466,13 @@ public:
         // ── AOT 匹配：按规范结构 key 查预编译融合 shader ──────────────
         const std::string key = nn::expr_spec_key(spec);
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
-        // 精度变体优先（Phase 2 in-kernel f16 + Phase 3 native16 ALU）：按
-        // **真实输入精度** + 目标输出精度取变体——native16（原生 f16 算术）
-        // 优先，f32 算术变体回退（find_prec_variant_）。命中即 shader 直接
-        // 半精度读/写，无需边界 cast；未命中则退回全 f32 key —— 此时输入必须
-        // 已全 f32（由基类 NVI 入口 cast）。
+        // 变体优先（native16 `#a` → 运行期精度分派 `#x`）：按**真实输入精度**
+        // + 目标输出精度取变体（find_prec_variant_）。命中即 shader 直接半精度
+        // 读/写，无需边界 cast；未命中则退回全 f32 key —— 此时输入必须已全 f32
+        // （由基类 NVI 入口 cast）。
         const nn::ExprPrecSig psig = nn::expr_prec_sig_of(inputs, P);
-        const nn::fused::FusedShader* fs = find_prec_variant_(key, psig);
+        const nn::fused::FusedShader* fs =
+            find_prec_variant_(key, psig, spec, /*log_hit=*/true);
         if (fs && backend_.has_fused_shader(fs->key))
         {
             // 命中：收集 GPU 输入（同一 buffer 可重复绑定，如 RoPE 的 q×2）
@@ -1462,14 +1487,15 @@ public:
             // 否则 shader 只写前半、返回的却是 f32 标签 → 下游全是垃圾（实测
             // batch32 训练 loss=NaN）。缓冲布局由 out_f16 决定，返回的 GpuTensor
             // 只是占位标签，这里按实际精度重贴 GpuTensorF16。
-            const bool out_f16 = nn::expr_prec_sig_out_f16(fs->prec_sig);
+            // 输出存储精度：分派变体按**运行期真实签名**（bit16），其余按变体身份
+            const bool out_f16 = nn::expr_variant_out_f16(fs->prec_sig, psig);
             auto out = backend_.run_fused_gpu(
                 fs->key, gpu_inputs, spec.consts, rows, cols,
                 /*vector_out=*/false, vp, spec.rparams, /*output_override=*/nullptr,
                 nn::expr_spec_runtime_matmul_k(spec),
                 nn::expr_spec_runtime_matmul_batch(spec),
                 nn::expr_spec_runtime_matmul_trans(spec),
-                /*fold_k=*/std::nullopt, out_f16);
+                /*fold_k=*/std::nullopt, out_f16, psig);
             if (!out) return std::unexpected(out.error());
             if (out_f16)
                 return Tensor::from_gpu(GpuTensorF16(out->shared_buffer(), rows, cols));
@@ -1512,23 +1538,20 @@ public:
         Precision P = Precision::F32) const override
     {
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
-        if (raw_spec.fold)
-        {
-            // Phase D2：fold 带类型变体已由 gen_fused 生成（键 fkey#sig）→
-            // 按真实签名查询（native16 谓词排除 fold，#a 探测自然落空）。
-            const nn::ExprPrecSig psig = nn::expr_prec_sig_of(inputs, P);
-            if (psig == 0)
-                return false;   // 全 f32：无带类型变体（适配层 all_f32 直通）
-            const std::string k = nn::expr_prec_sig_key(
-                nn::expr_spec_key(raw_spec), psig);
-            return nn::fused::find_fused(k) != nullptr && backend_.has_fused_shader(k);
-        }
+        // psig == 0（全 f32）：基类快路径直通，无需变体。
+        // psig != 0：选路与 eval_expr_impl 完全同源（`#a` native16 优先 →
+        // `#x` 运行期分派）。**本函数只是查询**（NVI 入口每次都调）→ 传
+        // log_hit=false，否则 NN_PREC_TRACE 的命中计数会翻倍。
         const nn::ExprPrecSig psig = nn::expr_prec_sig_of(inputs, P);
         if (psig == 0)
             return false;
-        const std::string k = nn::expr_prec_sig_key(
-            nn::expr_spec_key(nn::canonicalize_expr_spec(raw_spec)), psig);
-        return nn::fused::find_fused(k) != nullptr && backend_.has_fused_shader(k);
+        // 查表 key 与 native16 谓词都必须在 **canonical** 形态上求值：登记端
+        // 存的是 canonical spec，生成期的谓词判定也基于它（如常量折叠会改
+        // 常量值）。对 raw_spec 求值可能与生成端不一致 → 静默选错变体。
+        const ExprSpec canon = nn::canonicalize_expr_spec(raw_spec);
+        const std::string key = nn::expr_spec_key(canon);
+        const auto* fs = find_prec_variant_(key, psig, canon);
+        return fs != nullptr && backend_.has_fused_shader(fs->key);
 #else
         (void)raw_spec; (void)inputs; (void)P;
         return false;
@@ -1572,25 +1595,25 @@ public:
         const std::string key = nn::expr_spec_key(spec);
         const nn::ExprPrecSig psig = nn::expr_prec_sig_of(inputs, P);
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
-        // 精度变体优先（Phase 2 in-kernel f16 + Phase 3 native16）：与 eval_expr
-        // 同款 (key,sig) 匹配；native16 ALU 变体优先（find_prec_variant_）——
-        // 归约形态 native16 谓词恒 false，自动落 f32 算术变体
-        const nn::fused::FusedShader* fs = (psig != 0) ? find_prec_variant_(key, psig)
-                                                      : nn::fused::find_fused(key);
+        // 变体优先（`#a` native16 → `#x` 运行期分派）：与 eval_expr 同款
+        // (key,sig) 匹配；归约形态的 native16 谓词恒 false → 自动落 `#x`
+        const nn::fused::FusedShader* fs = (psig != 0)
+            ? find_prec_variant_(key, psig, spec, /*log_hit=*/true)
+            : nn::fused::find_fused(key);
         if (fs && backend_.has_fused_shader(fs->key))
         {
             auto fi_r = fused_buffers_(inputs);
             if (!fi_r) return std::unexpected(fi_r.error());
             std::vector<const GpuBuffer*>& gpu_inputs = fi_r->bufs;   // owners 随 fi_r 存活到本作用域末
             const auto vp = nn::expr_spec_runtime_view_params(spec);
-            const bool out_f16 = nn::expr_prec_sig_out_f16(fs->prec_sig);
+            const bool out_f16 = nn::expr_variant_out_f16(fs->prec_sig, psig);
             auto out = backend_.run_fused_gpu(
                 fs->key, gpu_inputs, spec.consts, rows, cols, /*vector_out=*/true, vp,
                 spec.rparams,
                 /*output_override=*/nullptr, nn::expr_spec_runtime_matmul_k(spec),
                 nn::expr_spec_runtime_matmul_batch(spec),
                 nn::expr_spec_runtime_matmul_trans(spec),
-                std::nullopt, out_f16);
+                std::nullopt, out_f16, psig);
             if (!out) return std::unexpected(out.error());
             if (out_f16)
             {
@@ -1636,13 +1659,13 @@ public:
             return std::unexpected(Error{
                 "eval_expr_into: 仅支持逐元素表达式（无归约）"});
         const std::string key = nn::expr_spec_key(spec);
-        // 精度变体优先（Phase 2 in-kernel f16）：目标精度 = dst.precision()
+        // 变体优先（`#a` native16 → `#x` 运行期分派）：目标精度 = dst.precision()
         const nn::ExprPrecSig psig =
             nn::expr_prec_sig_of(inputs, dst.precision());
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
-        // native16 ALU 变体优先，f32 算术变体回退（find_prec_variant_）
-        const nn::fused::FusedShader* fs = (psig != 0) ? find_prec_variant_(key, psig)
-                                                      : nn::fused::find_fused(key);
+        const nn::fused::FusedShader* fs = (psig != 0)
+            ? find_prec_variant_(key, psig, spec, /*log_hit=*/true)
+            : nn::fused::find_fused(key);
         if (fs && backend_.has_fused_shader(fs->key))
         {
             auto fi_r = fused_buffers_(inputs);
@@ -1682,7 +1705,8 @@ public:
                 spec.rparams, dst_override,
                 nn::expr_spec_runtime_matmul_k(spec),
                 nn::expr_spec_runtime_matmul_batch(spec),
-                nn::expr_spec_runtime_matmul_trans(spec));
+                nn::expr_spec_runtime_matmul_trans(spec),
+                /*fold_k=*/std::nullopt, /*out_f16=*/false, psig);
             if (!out) return std::unexpected(out.error());
             // dst 原为 CPU staging 时，import 上传了新 buffer（结果在它上面）
             // → 用 upload 后的张量替换 dst，保证调用方看到更新后的数据

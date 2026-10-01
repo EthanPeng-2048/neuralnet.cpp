@@ -294,6 +294,16 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(expr_gpu_test src/expr_gpu_test.cpp)
     list(APPEND NN_TEST_TARGETS expr_gpu_test)
 
+    # ── 融合 shader **逐形态** GPU 对拍（rope/swiglu/gelu/softmax/matmul/
+    #    matmul+reduce/norm/reduce_consts/fold v1/fold attn/回退）──────────
+    # ⚠ 此前该文件**未被任何 CMake 目标引用**（未编译、未注册）——它是融合
+    #    shader 逐形态的回归面，重新接入。
+    # 覆盖口径：**V0（全 f32）**逐形态对拍（该文件无 f16/精度引用）。
+    # V1（`key#x` 运行期精度分派）的覆盖在 `f16_precision_test`（NN_PREC_TRACE
+    # 实测 20 条 #x / 4 条 #a）；本测试不覆盖 V1。
+    nn_add_executable(fused_gpu_test src/fused_gpu_test.cpp)
+    list(APPEND NN_TEST_TARGETS fused_gpu_test)
+
     # ── ModelSpec 架构校验（load_model 文件头 vs 模型规格比对）──────────
     nn_add_executable(model_spec_validation_test src/model_spec_validation_test.cpp)
     list(APPEND NN_TEST_TARGETS model_spec_validation_test)
@@ -367,13 +377,12 @@ if(Vulkan_FOUND)
         scan_suffix_outer_gen
         outer_col
         cast)
-    # ── 融合 shader：构建期从 Layer 内联表达式自动合成 ───────────────
+    # 融合 shader：构建期从 Layer 内联表达式自动合成（**单步**）──────────
     # 表达式**文本只出现在 Layer**（compute / compute_reduce / compute_into）。
-    # 构建期两步：
-    #   ① scan_exprs：dry-run 跑 Layer 的 forward/backward，收集折叠出的
-    #      ExprSpec 结构（去重）→ expr_specs.bin（派生物，非手写定义）
-    #   ② gen_fused：读 bin → glsl_gen → glslc → 内联 SPIR-V
-    #      → fused_registry.hpp（key=expr_spec_key → 融合 shader）
+    # scan_exprs 同进程内完成：收集折叠出的 ExprSpec 结构（锚点自登记 + dry-run
+    # + 模型 pass + 显式登记，按 key 去重）→ glsl_gen → glslc → 内联 SPIR-V
+    # → fused_registry.hpp（key=expr_spec_key[#x|#a] → 融合 shader）。
+    # 不经 .bin 中间序列化（原独立工具 gen_fused 已并入 tools/fused_generate.hpp）。
     # 运行时按 key 精确匹配 dispatch；未命中硬报错（闭合世界）。
     set(GPU_SHADER_HPPS "")
 
@@ -486,13 +495,93 @@ if(Vulkan_FOUND)
         # 全新构建时 generated/ 尚未存在会写入失败（见 08-pitfalls）。
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/generated
         COMMAND scan_exprs ${CMAKE_BINARY_DIR}/generated ${GLSLC}
-                ${CMAKE_SOURCE_DIR}/tools/prec_backfill.txt
         DEPENDS scan_exprs ${SCAN_SRC} ${FUSED_GEN_SRC}
-                ${CMAKE_SOURCE_DIR}/tools/prec_backfill.txt
         COMMENT "[GPU] Scan + synthesize fused shaders (scan_exprs) → fused_registry.hpp"
     )
 
     list(APPEND GPU_SHADER_HPPS ${NN_FUSED_REGISTRY_HPP})
+
+    # ── 库自带的融合能力：为**任意目标**收集 + 生成它自己的 fused_registry.hpp ──
+    # 用法：nn_enable_gpu_fusion(<target> MAIN <含 main 的源文件> [OUT_DIR <目录>])
+    #
+    # 语义（对应"写 dsl::compute 之后只跑构建即可"）：
+    #   收集器 = 库内收集逻辑（`tools/scan_exprs.cpp`：锚点自登记 + dry-run +
+    #   模型 pass + 显式登记）+ **本目标的全部 TU**（用 -DNN_EXPR_SCAN 编，
+    #   让使用者的 `dsl::compute` 调用点在静态初始化期自登记）。
+    #   产物目录只作为该目标的私有 include 目录——"`fused_registry.hpp` 在
+    #   include path 上即生效"这一既有机制不变。
+    #
+    # ⚠ 收集器**必须保留库内收集逻辑**：实测 84 个结构里只有 13 个来自
+    #   编译期锚点，71 个来自 dry-run/模型 pass（见 docs/history.md 与
+    #   docs/development/02）。纯锚点收集器会漏掉库自身的结构。
+    function(nn_enable_gpu_fusion target)
+        cmake_parse_arguments(NNF "" "MAIN;OUT_DIR" "" ${ARGN})
+        if(NOT TARGET ${target})
+            message(FATAL_ERROR "nn_enable_gpu_fusion: 目标 ${target} 不存在")
+        endif()
+        if(TARGET ${target}_nnfusion_collect)
+            message(FATAL_ERROR
+                "nn_enable_gpu_fusion: 目标 ${target} 已调用过（${target}_nnfusion_collect 已存在）")
+        endif()
+        if(NOT NNF_OUT_DIR)
+            set(NNF_OUT_DIR "${CMAKE_BINARY_DIR}/nn_fusion/${target}")
+        endif()
+        if(NNF_MAIN)
+            get_filename_component(NNF_MAIN "${NNF_MAIN}" ABSOLUTE)
+        endif()
+        get_target_property(_nnf_srcs ${target} SOURCES)
+        set(_nnf_inputs "")
+        set(_nnf_main_found FALSE)
+        foreach(_s IN LISTS _nnf_srcs)
+            if(_s MATCHES "^\\$<")          # 生成器表达式源（跳过，罕见）
+                continue()
+            endif()
+            get_filename_component(_abs "${_s}" ABSOLUTE)
+            if(NNF_MAIN AND _abs STREQUAL NNF_MAIN)
+                set(_nnf_main_found TRUE)
+                continue()                 # 收集器自带 main（SCAN_SRC），排除目标的
+            endif()
+            list(APPEND _nnf_inputs "${_abs}")
+        endforeach()
+        # MAIN 拼写/路径不一致会让目标的 main 进入收集器 → 链接期 duplicate main。
+        # 静默通过不了（链接会报），但报错点离根因很远，这里提前拦住。
+        if(NNF_MAIN AND NOT _nnf_main_found)
+            message(FATAL_ERROR
+                "nn_enable_gpu_fusion: MAIN=${NNF_MAIN} 不在 ${target} 的源文件列表里")
+        endif()
+        set(_nnf_reg "${NNF_OUT_DIR}/fused_registry.hpp")
+        add_executable(${target}_nnfusion_collect ${SCAN_SRC} ${_nnf_inputs})
+        target_include_directories(${target}_nnfusion_collect
+            PRIVATE ${CMAKE_SOURCE_DIR}/include/neuralnet.cpp)
+        # 收集器必须按**与目标相同的编译条件**编译其 TU：使用者的层代码常在
+        # `#ifdef NN_HAS_VULKAN` / 私有 include / 自定义宏之内，条件缺失会让那些
+        # 调用点静默消失 → 收集不到 → GPU 运行期闭合世界硬报错（离根因很远）。
+        target_include_directories(${target}_nnfusion_collect PRIVATE
+            $<TARGET_PROPERTY:${target},INCLUDE_DIRECTORIES>)
+        target_compile_options(${target}_nnfusion_collect PRIVATE
+            $<TARGET_PROPERTY:${target},COMPILE_OPTIONS>)
+        target_compile_definitions(${target}_nnfusion_collect PRIVATE
+            NN_EXPR_SCAN $<TARGET_PROPERTY:${target},COMPILE_DEFINITIONS>)
+        target_link_libraries(${target}_nnfusion_collect PRIVATE nn_core Vulkan::Vulkan)
+        add_custom_command(
+            OUTPUT ${_nnf_reg}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${NNF_OUT_DIR}
+            COMMAND ${target}_nnfusion_collect ${NNF_OUT_DIR} ${GLSLC}
+            DEPENDS ${target}_nnfusion_collect ${SCAN_SRC} ${FUSED_GEN_SRC} ${_nnf_inputs}
+            COMMENT "[nn] 为 ${target} 收集 + 合成融合 shader → ${_nnf_reg}")
+        add_custom_target(${target}_nnfusion_registry DEPENDS ${_nnf_reg})
+        # ⚠ include 顺序有意义：本目标自己的 `fused_registry.hpp` 必须排在
+        #   `${CMAKE_BINARY_DIR}/generated` **之前**——后者含库自身的注册表
+        #   （不含使用者的自定义结构）与手写原语 shader 的嵌入头。放在前面
+        #   才能让 `__has_include("fused_registry.hpp")`（见
+        #   backend/compute_vk_backend.hpp）解析到本目标专属的那一份。
+        # **必须用 BEFORE**：CMake 的 INCLUDE_DIRECTORIES 属性对重复项保留
+        # 首次出现的位置，若目标此前已（由 GPU 统一启用循环）拿到
+        # `generated`，普通 append 会把它排在前面，顺序语义反而失效。
+        target_include_directories(${target} BEFORE PRIVATE
+            ${NNF_OUT_DIR} ${CMAKE_BINARY_DIR}/generated)
+        add_dependencies(${target} ${target}_nnfusion_registry compile_gpu_shaders)
+    endfunction()
 
     if(NOT GLSLC)
         message(WARNING "No SPIR-V compiler found (glslc). "
@@ -515,6 +604,33 @@ if(Vulkan_FOUND)
             target_link_libraries(${TARGET} PRIVATE Vulkan::Vulkan)
             add_dependencies(${TARGET} compile_gpu_shaders)
         endforeach()
+
+        # ── A2 验收样例：一个「库外使用者」形态的目标 ──────────────────────
+        # 它有自己的自研融合层（examples/fusion_custom_layer.hpp），**不使用**
+        # 库内 build/generated 的注册表，而是靠 nn_enable_gpu_fusion 生成自己
+        # 的那一份 —— 证明"写 dsl::compute + 一行 CMake 即可"。
+        # 只在 NN_ENABLE_TESTS 下构建：它的收集器会为 ~85 个库内结构各跑一遍
+        # glslc（三份变体），是纯验收成本，不该加到默认构建上。
+        if(NN_ENABLE_TESTS)
+            nn_add_executable(fusion_custom_layer_example
+                examples/fusion_custom_layer_main.cpp
+                examples/fusion_custom_layer.cpp)
+            target_compile_definitions(fusion_custom_layer_example PRIVATE NN_HAS_VULKAN)
+            target_link_libraries(fusion_custom_layer_example PRIVATE Vulkan::Vulkan)
+            nn_enable_gpu_fusion(fusion_custom_layer_example
+                MAIN ${CMAKE_SOURCE_DIR}/examples/fusion_custom_layer_main.cpp)
+
+            # 注册为**常驻 ctest**（注册循环在 Vulkan 探测之前跑，故此处手工注册，
+            # 口径与循环一致：输出目录 + SKIP_RETURN_CODE 77 = 无设备时 skip）。
+            # 这是"库外使用者写 dsl::compute + 一行 CMake → GPU 能跑"的唯一自动
+            # 门禁（含 f16 运行期精度分派 `key#x` 路径与归一化形态）。
+            set_target_properties(fusion_custom_layer_example PROPERTIES
+                RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test)
+            add_test(NAME fusion_custom_layer_example
+                     COMMAND fusion_custom_layer_example)
+            set_tests_properties(fusion_custom_layer_example
+                PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
 
         message(STATUS "GPU acceleration enabled (Vulkan compute)")
     endif()

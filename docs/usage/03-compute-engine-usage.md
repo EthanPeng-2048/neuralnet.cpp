@@ -1570,7 +1570,7 @@ public:
 | 环境变量 | 作用 |
 |---|---|
 | `NN_BIND_DEBUG=1` | 未绑定输入进引擎也报错（抓库内 stamp 漏网）；错误同步打 stderr，带 `file:line` 与形状。**建议作为门禁运行 `NN_BIND_DEBUG=1 ctest`** |
-| `NN_PREC_TRACE=1` | 打印每个 `(结构 key, 精度签名)`；`[prec][miss]` = "请求了非零精度签名却没命中带类型变体"（静默回退边界 cast 的唯一可见信号）；`[into] branch=…` 打印 `eval_expr_into` 的分支 |
+| `NN_PREC_TRACE=1` | 打印每个 `(结构 key, 精度签名)`；`[prec][alu-hit]` = 命中**变体**（`key#x` 运行期精度分派 **或** `key#a` native16，key 本身即区分）；`[prec][fallback]` = 该结构没有可用的 `#x`（回退基类边界 cast）；`[into] branch=…` 打印 `eval_expr_into` 的分支。**`[prec][miss]` 保留为通用诊断**（V1 覆盖后 f16 融合路径实测 `miss=0`）；"回填清单"工作流（`tools/prec_backfill.txt`）已随"运行期精度分派"删除。日志只由真正 dispatch 的入口、且在确认命中后打——`supports_expr_precision_variant` 是查询，不产生命中日志 |
 | `NN_F16_DEBUG=1` | f16 中间量数值扫描（`nn_dbg_scan`）、`accumulate` 巨值打印、`compute_into` 预绑定失败原因 |
 | `NN_MEM_STATS=1` | 训练中内存采样（配合 `pool_stats()`） |
 | `NN_VULKAN_DEVICE` | 强制指定 Vulkan 计算设备（索引 `"2"` 或名称子串 `"NVIDIA"`）。优先级：显式 API > 本变量 > 自动打分 |
@@ -1598,7 +1598,7 @@ if (nn::dsl::env_flag("NN_PREC_TRACE"))
 | `read/write: 元素数与张量形状不匹配` | span 长度 ≠ `rows*cols` | 修正长度 |
 | `bind_check_ mixed engines` | 两个不同引擎创建的张量进了同一个算子 | 用 `import` 把张量拉到目标引擎 |
 | `dsl::compute_into: dst not on CPU` | CPU 引擎下 `dst` 是 GPU 张量 | 检查 `dst.device()` |
-| GPU 报闭合世界未命中 | 表达式结构或精度签名没有预生成 shader | 检查是否把运行时值写成了 `ConstLeaf`（应改 `rparam`）；改 Layer 表达式后需重新构建（`scan_exprs` → 生成阶段 自动跑） |
+| GPU 报闭合世界未命中 | 表达式**结构**没有预生成 shader | 检查是否把运行时值写成了 `ConstLeaf`（应改 `rparam`）；改 Layer 表达式后需重新构建（`scan_exprs` → 生成阶段 自动跑）。**精度签名不会再导致 miss**（运行期分派 shader 覆盖任意签名） |
 | `validate_expr_spec: empty instruction list` | 表达式根是裸视图/叶子 | 尾接 `+ dsl::rparam(0.0f)` |
 | 构建期 `[scan] validate_expr_spec 失败` + `_Exit(3)` | 新增表达式非法（最常是空指令表 / 裸分组归约视图作根） | 同上；这是**构建期闸门**，不是运行期 bug |
 | `VK_ERROR_DEVICE_LOST` | 录制期张量提前析构（铁律 #6），或 TDR | 确认张量存活到 `end_batch()`；TDR 不可重试，存 checkpoint 退出；`VK_TIMEOUT` 可减半 batch 重试 |

@@ -572,16 +572,20 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 - **结论：签名必须逐输入**。实测存在 `in=[f16,f32] out=f32`、`in=[f32,f16,f16] out=f32`、`in=[f16,f32,f32] out=f16` 等混合组合（LayerNorm/loss 链与参数/激活的精度不同源）——"全 f16 / 全 f32 两变体"的方案会漏掉相当一部分。
 - 逐元素/归约占 84%（32/38），且是激活侧 transient 的主要来源（残差、激活、Norm 内部量都在这一类）→ 变体按类别逐批生成：纯逐元素（§12.7）→ matmul 段 / 含归约 / 目标传递（§12.10）→ op-level f16 GEMM（§12.11）；fold 变体与运行时签名回填见 §12.10 ⑤。
 
-### 12.7 in-kernel f16 第一期：纯逐元素带类型变体（当前机制）
+### 12.7 in-kernel f16 第一期：纯逐元素带类型变体（**历史机制**，已由 §12.10 ⑤ 取代）
 
-| 组件 | 当前实现 |
+> 本节记录的是 **2026-09 的第一期机制**（构建期按签名枚举变体 + `bin v9` 变体段 + `key#sig` 注册键）。
+> 该机制已于 **2026-10-01（A1 段）** 整体删除：签名从「身份」降级为「参数」，变体集合不再按签名枚举
+> （见 §12.10 ⑤）。保留本节是为了解释"为什么当初这么做、后来为什么不需要"——**不是当前实现**。
+
+| 组件 | 当时的实现（**全部已删除/改写**） |
 |---|---|
-| `scan_exprs` 双 pass | 整段 dry-run 收进 `dry_run(engine, profile)`：`profile_f32`（sig==0，旧行为）与 `profile_f16`（输入张量按 compute 精度创建 → 与运行时同源）。f16 pass **直接传原生引擎即可**——P-1 后 f16 边界 cast 由基类 NVI 入口统一处理（历史上直喂原生 `CpuEngine` = heap corruption（0xC0000374，实测）；适配层已删除、职责并入基类）。 |
-| bin v9 | 规格表之后的**变体段**：每个变体只存 `{sig, 基础结构下标}`——变体与基础结构同 key（精度不进 `expr_spec_key`），故不重复序列化 spec 体（也免读写不对称风险）。 |
-| `GlslEmitter` | `generate/generate_reduce` 带 `sig` 形参（默认 0 → **GLSL 与不带变体时逐字节相同**）。带类型输出 = 缓冲声明 `float16_t` + `#extension GL_EXT_shader_16bit_storage` + 读 `float(x)` / 写 `float16_t(v)`；算术默认全 f32（§7.2）。视图内部有算术的分支（RotateHalf 的取负、RowGather 的 `uint(...)` 索引）必须**在叶子处**转换——否则 glslc 报 `'-' : wrong operand type ... float16_t`。 |
-| 生成阶段 | 每变体独立 shader（文件名/标识符 `key_sighex`，注册键 `key#sig`），`FusedShader` 带 `prec_sig`；生成器不支持的形态 → **跳过并告警**（不是失败）。 |
-| 设备 | 查询并启用 `storageBuffer16BitAccess`（`NN_VULKAN_NO_16BIT_STORAGE=1` 可强制回退）；未启用时后端跳过 `key#sig` 键（运行时自然回退边界 cast）。 |
-| 运行时 | `run_fused_gpu` 输入是**类型擦除的 buffer 视图**；`FusedInputs{owners, bufs}` **必须同时持有 owner**——只存裸 `GpuBuffer*` 会在录制中途释放上传缓冲（铁律 6，实测 `A+=B err=0.5`）。`GpuEngine::eval_expr` 按 `(key,sig)` 优先命中变体，**f16 输出按 2B/元素分配缓冲并重贴 `GpuTensorF16`**（漏了 = shader 只写前半 + f32 标签 → 训练 loss=NaN）；f16 进原生引擎却无变体 → 明确报错（绝不把 f16 buffer 绑到 f32 shader）。适配层 `supports_expr_precision_variant` 前置查询：命中则直吃 f16、未命中回退边界 cast。 |
+| ~~`scan_exprs` 双 pass~~ | 整段 dry-run 收进 `dry_run(engine, profile)`（`profile_f32` + `profile_f16`）。**已删除**：实测 f16 遍对结构贡献为 0（跳过它签名 66 → 0、结构恒 84），而签名已不是构建期集合。 |
+| ~~`bin v9` 变体段~~ | 规格表之后的变体段，每变体只存 `{sig, 基础结构下标}`。**已删除**：`write_registry/read_registry` 连同整个 `.bin` 中间序列化一起移除（构建期单步）。 |
+| `GlslEmitter` | `generate/generate_reduce` 的 `sig` 形参保留至今，但语义已扩展：`sig == 0` → V0 全 f32；`sig == EXPR_PREC_SIG_DISPATCH` → V1 运行期精度分派；真实位图 → V2 存储变体；`native16=true` → V2b 原生 f16 算术（键 `#a`）。 |
+| ~~生成阶段按 `key#sig` 注册~~ | 当时的键 = `key#<sighex>`（+ `#a`）。**已消失**：现在的键只有 `key`（V0）/ `key#x`（V1）/ `key#a`（V2b），不带签名 hex。 |
+| 设备 | 仍有效：查询并启用 `storageBuffer16BitAccess`（`NN_VULKAN_NO_16BIT_STORAGE=1` 强制回退）；未启用时后端跳过带 `#` 的键。 |
+| 运行时 | 仍有效的两条经验：① `FusedInputs{owners, bufs}` **必须同时持有 owner**——只存裸 `GpuBuffer*` 会在录制中途释放上传缓冲（铁律 6，实测 `A+=B err=0.5`）；② **f16 输出必须按 2B/元素分配缓冲并重贴 `GpuTensorF16`**（漏了 = shader 只写前半 + f32 标签 → 训练 loss=NaN）。变体选择改为 §12.10 ⑤。 |
 
 纯逐元素变体阶段的实测（f32 / f16 边界 cast / in-kernel 三方对照）与当时的"剩余缺口"清单见 `docs/history.md`；**当前数字与下一步见 §12.11**。
 
@@ -617,23 +621,34 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 
 `ComputeEngine::note_temp_()`（`NN_PREC_TRACE=1` 时记录每次"物化临时量"的 `(rows, cols, 方向)` → 次数/字节）+ `ComputeEngine::dump_temp_stats()`（mem_probe 末尾按字节降序打印）。这份表把 GB 级 cast **直接落到具体形状**——判定"哪些 cast 还在、哪些已被变体消掉"的当前手段（如注意力反向物化的 `(32768,256)` W / grad_A，曾是单项最大头，补齐 matmul 段变体后该项消失，见 §12.11）。
 
-#### ③ 落地的三类带类型变体（当前）
+#### ③ 落地的三类带类型变体（**V0 时代的按签名枚举**；其生成器代码现由 V1 复用）
+
+> 下表描述的三条生成路径**仍在**（同一批生成器、同一份索引数学），但变体已不再按签名枚举：
+> 每条路径现在都被要求能发射 `EXPR_PREC_SIG_DISPATCH`（V1 双视图 + PC `prec`）形态，见 ⑤。
+> 表中"`(key,sig)` 匹配"的措辞已被 `find_prec_variant_` 的 `key`/`key#x`/`key#a` 取代。
 
 | 项 | 机制 | 效果 |
 |---|---|---|
-| **matmul 段** | `generate_glsl_matmul(name, spec, sig)`：A/B 槽 `float16_t` 声明 + `uvec2` 别名槽（4×half=8B，`unpackHalf2x16` 解 vec4）+ 全局加载处统一转 f32（共享 tile / VFMA 累加 / 尾链全 f32）+ 输出按 out 位 `float16_t()`；分块/双缓冲/barrier 节奏与 f32 逐字一致 | matmul 段变体可生成 |
+| **matmul 段** | `generate_glsl_matmul(name, spec, sig)`：A/B 槽 `float16_t` 声明 + `uvec2` 别名槽（4×half=8B，`unpackHalf2x16` 解 vec4）+ 全局加载处统一转 f32（共享 tile / VFMA 累加 / 尾链全 f32）+ 输出按 out 位 `float16_t()`；分块/双缓冲/barrier 节奏与 f32 逐字一致（V1 下这两条加载路径**都发射**，运行时按 PC `mm_trans` 选） | matmul 段变体可生成 |
 | **归约 kernel** | `generate_glsl_reduce(name, spec, sig)`：输入 `float16_t` + `rd()/wr()` 在读写点统一转换（含 `emit_mm_decl` 点积、行/列两个 pass 的直接索引读、`operand()` 的视图读与广播读、输出写） | 含归约的变体可生成 |
-| **目标传递** | `GpuEngine::eval_expr_into` / `eval_expr_reduce` 带 `(key,sig)` 变体匹配（输出精度 = `dst.precision()` / `P`），f16 输出重贴 `GpuTensorF16`（归约向量形状按 raxis 取 `(rows,1)/(1,cols)`）；适配层这两入口先查 `supports_expr_precision_variant` 再回退 cast | `compute_into` / `compute_reduce` 不再必然走边界 cast |
+| **目标传递** | `GpuEngine::eval_expr_into` / `eval_expr_reduce` 带变体匹配（输出精度 = `dst.precision()` / `P`），f16 输出重贴 `GpuTensorF16`（归约向量形状按 raxis 取 `(rows,1)/(1,cols)`）；两入口先查 `supports_expr_precision_variant` 再回退 cast | `compute_into` / `compute_reduce` 不再必然走边界 cast |
 
-生成阶段 的基础结构数与变体条目数以构建输出 `[scan]`/`[gen]` 为准（变体含 scan 预测 + 回填清单，见 ⑤）。
+生成阶段的基础结构数与变体条目数**以构建输出 `[scan]` / `[gen]` 为准**（`[gen]` 打印"N 条融合表达式 + M 条变体"）。
+**回填清单已不存在**（无 `tools/prec_backfill.txt`；M = V1 条数 + V2b 条数，全部由构建期一次算定）。
 
 #### ④ 实测收益
 
 matmul 段 / 归约 / 目标传递三类变体落地后的同窗交错实测（f32 与 f16 峰值、耗时、backward transient 分桶变化）见 `docs/history.md`；**当前（含 op-level f16 GEMM）的最终数字见 §12.11**。
 
-#### ⑤ 运行时签名回填（当前）
+#### ⑤ 运行期精度分派（当前，2026-10-01 A1）
 
-`[prec][miss]`（`NN_PREC_TRACE=1`）打印"请求了非零签名却没命中带类型变体"的 `(key, sig, 形态)`——这类**扫描时看不到的运行时签名**（如 Linear matmul 段的 `in=[f16,f32,f32]` 混合签名、Norm 归约链 `[f32,f16]` 输入）miss 时走边界 cast。**当前机制 = 回填清单** `tools/prec_backfill.txt`（Phase D3）：miss 复现 → 追加一行 `<key> <sig>` → 生成阶段 对命中的 `(结构, 签名)` 额外发射变体（与 scan 变体同一代码路径，重复条目幂等去重；结构不在注册表 / 生成器不支持时告警跳过）。**fold 的带类型变体已生成**（Phase D2，键 `fkey#sig`，3 输入全 f16 + 输出 f16，算术/状态进位 f32）。
+**签名已从「身份」降级为「参数」**：融合 shader 的变体集合不再按签名枚举，而是对每个结构发一份**运行期精度分派** shader（键 `key#x`）——它声明每个输入/输出各 f32 + `float16_t` **双视图**（同一 `VkBuffer` 绑两次，只解引用与真实元素类型一致的那一个），加载/存储处按 push constant `uint prec`（bit i = 输入 i 为 f16，bit16 = 输出 f16）走 uniform 分支。索引数学与旧带类型变体**逐字相同** ⇒ 数值等价。
+
+- **精度路径三档**（**不是"永不 miss"**）：`key#a`（V2b native16）→ `key#x`（V1 运行期分派）→ **基类边界 cast**。V1 默认对每个结构无条件生成，但生成被跳过（`[skip] 分派变体…`）、`NN_SCAN_NO_DISPATCH=1`、或设备无 16bit 存储时会 miss 并落到边界 cast —— `[prec][miss]` 因此**仍是通用诊断**（实测 f16 融合路径 miss = 0）。
+- **native16** 改由**结构谓词**判定生成（键 `key#a`，代入"全输入 f16 + 输出 f16"这一常量签名）。⚠ 该谓词含**常量值**判据（`0 < |c| < 6e-8` 会 flush-to-0），而常量值**不进 key** ⇒ 运行时选 `#a` 前必须用**真实实例的 spec 重跑同一谓词**（`GpuEngine::find_prec_variant_`），否则"生成时那一个实例的常量"会被套用到同结构但常量不同的实例上（静默错值）。
+- **回填清单已删除**：`tools/prec_backfill.txt` 连同 `NN_PREC_TRACE` 的"补变体"工作流一并移除；f16 扫描遍也因"对结构贡献为 0"而删除（实测：跳过它签名 66 → 0、结构恒 84）。
+- **追踪日志口径**：变体命中只在确认命中后、且只由真正 dispatch 的入口打（`supports_expr_precision_variant` 只是查询）。修复前该函数也打日志 ⇒ 计数翻倍（实测 12040 行 = 6020 次真实分派 × 2；修复后同为 f16_precision_test 实测 **6022 行 / 24 条 distinct = 20 条 `#x` + 4 条 `#a`**）。
+- **实测**（GPT f16 训练，`NN_PREC_TRACE=1`）：`[prec][miss]=0`、边界 cast 归因表为空、`[prec][alu-hit]` 6670 —— ⚠ **6670 是修复"双重打点"前的口径**，真实分派数为其一半。
 
 ---
 
@@ -686,7 +701,7 @@ matmul 段 / 归约 / 目标传递三类变体落地后的同窗交错实测（f
 #### ④ 当前剩余（收益递减，按需再做）
 
 - **仍走边界 cast 的 op-level 原语**：用 `NN_PREC_TRACE=1` + `dump_temp_stats()` 复测形状表，对剩余大项按 §12.11 ① 的 `-DNN_SHADER_F16` 手法补变体（同法已覆盖大部分 op 级 shader，见 ① 的 CMake 清单）。
-- **扫描预测不到的运行时签名**：按 §12.10 ⑤ 的回填清单流程处理（miss → 追加 `tools/prec_backfill.txt` → 重跑构建）。
+- **签名覆盖**：不需要任何操作——生成阶段对每个结构发运行期精度分派 shader（§12.10 ⑤），任何签名都命中；新的调用点只要被构建期收集到结构即自动获得 f16 路径（实测：Layer 头里新写一个 `dsl::compute` → 注册表自动多出 `key`/`key#x`/`key#a` 三条，其他文件零改动）。
 - **native16（f16 ALU 算术）变体**按设备能力命中/回退（§11.1），无需额外操作。
 
 ---
