@@ -267,7 +267,11 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 手写 dry-run 清单只覆盖**跑到的**路径；配置分支没被跑到就漏（`MaxPool2D(pool≠2)` 曾如此）。为此 `expr_dsl.hpp` 增加 `FusedAnchor<Expr>`：每个 `dsl::compute/_into/_reduce` 实例化 odr-use 一个锚点，其**静态初始化期**把"从表达式类型默认构造的符号实例"折叠出的结构登记进注册表。
 
 - **前提 = "结构 = 表达式类型"**：为此步骤①②③把 `consts` 值、`matmul.transA/transB`、`GroupedReduce.R` 逐出 key（分别改走 push constant），并把 `GroupedReduceRef` 的 `is_max`（决定视图 kind）提为模板参数。
-- **覆盖语义**：调用点在函数体里，**函数被编译即实例化**——与运行期是否走到该分支无关，因此是"编译期可达"而非"运行期可达"。A/B 实测（`-DNN_SCAN_NO_ANCHOR`）：结构数 **71（仅 dry-run/模型 pass）→ 84（+锚点）**，多出的 13 条都是编译进来的真实调用点（含 matmul、归约、16 个 vp 槽的宽表达式等）。⇒ 锚点与 dry-run **互补**：dry-run/模型 pass 是结构的主要来源（71/84），锚点覆盖它跑不到的调用点（13/84）。
+- **覆盖语义**：调用点在函数体里，**函数被编译即实例化**——与运行期是否走到该分支无关，因此是"编译期可达"而非"运行期可达"。A/B 实测（`-DNN_SCAN_NO_ANCHOR`）：结构数 **71（仅 dry-run/模型 pass）→ 84（+锚点）**，多出的 13 条都是编译进来的真实调用点（含 matmul、归约、16 个 vp 槽的宽表达式等）。
+- **两者互补，不冗余**（`NN_SCAN_DUMP_SOURCES=1` 逐条打印来源，实测 84 条）：per-layer dry-run 38（含模型 pass +25、显式登记 +8）、锚点 59，**重叠 46 → 锚点独有 13、dry-run 独有 25**。所以**单独删任何一方都会丢结构**：
+  - **dry-run 独有 25 条**按形态分：**fold 8 条**（= 显式登记的掩码×偏置组合与通用 fold 样例，见下）、**含 matmul 段 7 条**（注意力反向 / CE / 优化器步）、**RowAccess(12) 4 条**（共享内存 SwiGLU 的半偏移行切分）、**RowGather(9)/ColBroadcast(8) 若干**（稀疏 CE 的 5 视图形态 `[0,8,8,8,8]` 等）——共同点是**结构由运行期配置决定**（视图种类/项数/掩码组合），类型层面推不出来，符号实例 `Expr{}` 与真实实例会折叠出**不同 key**（实测存在"视图种类与指令数完全相同、只有 key 不同"的镜像对，如 dry-only `784781c7b82fa76c` ↔ anchor-only `28cdf7c6d5df0e1d`）。
+  - **锚点独有 13 条**是镜像面：dry-run/模型 pass 没跑到的编译期可见调用点（最著名的是 `9ca81b4967cdfa20`——关掉锚点后 `text_infer` KV-cache 增量解码在 GPU 上闭合世界硬报错）。
+  - **结论**：dry-run + 模型 pass 是结构的主要来源，**删不掉**；锚点补它跑不到的部分。这也是"扫描步骤本身无法删除"的精确根因。
 - **常驻台账**：锚点登记进独立注册表 `anchor_registry()`，`scan_exprs` 末尾合并并打印来源分项（见下）。**锚点独有数突然变大 = 有新的层路径没纳入任何驱动**（回归信号）。
 - **只登记结构**：⚠ 自登记只能给**结构**（`sig=0`）。**精度签名由生成期的运行期分派变体覆盖**（见上节"精度签名已不是构建期集合"）——自登记 + V1 合起来才构成完整的"零注解"链路：结构靠编译期可达，签名靠运行期参数。
 - **模型级 pass（结构侧）**：per-layer dry-run 块只覆盖"层被单独造出来"的路径；有些调用点只在**完整模型**里才执行（GPT/RAPT 的 LM head、PatchEmbedding、模型级位置编码等）。`scan_exprs` 因此跑一遍**配置矩阵**（只跑 f32）：`mnist_mlp`×{LayerNorm,RMSNorm,BatchNorm}、`mnist_transformer`(ViT)、`cnn`×{pool2,pool3}、`gpt`×{Learned,ALiBi,Sinusoidal,RoPE}×{GeLU,SwiGLU}×{LayerNorm,RMSNorm}、`rapt`×{causal,bidir}（小配置 vocab=64/d_model=16/seq=8/H=2/d_ff=32/L=2；id 输入须填合法 token 值）。该 pass 失败只打 `[scan][warn]` 不中断构建（它是增量，主路径已由 dry-run + 锚点覆盖）。
@@ -277,9 +281,9 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
   保留的是**整模型跑不到**的来源：优化器（5 变体）、损失（MSE / CE 稠密 / CE 稀疏）、RoPE `apply_step`（增量推理）、CSA×4（掩码/偏置组合，含模型未覆盖的 doc 变体）、MHA、以及 `scan_exprs` 内的**显式测试覆盖登记**（matmul+bias+relu / bmm_reduce / reduce_consts）。
 - **常驻分项台账**（每次构建打印，结构侧）：
   ```
-  [scan] 结构来源：dry-run 38（含模型 pass +25、显式登记 +8） + 锚点 59 → 合并 84（锚点独有 13）
+  [scan] 结构来源：dry-run 38（含模型 pass +25、显式登记 +8） + 锚点 59 → 合并 84（锚点独有 13、dry-run 独有 25）
   ```
-  A/B 开关：`-DNN_SCAN_NO_ANCHOR`（关锚点）/ `-DNN_SCAN_NO_DRYRUN`（关 dry-run/模型 pass），均只影响登记集合、不改语义。
+  A/B 开关：`-DNN_SCAN_NO_ANCHOR`（关锚点）/ `-DNN_SCAN_NO_DRYRUN`（关 dry-run/模型 pass），均只影响登记集合、不改语义。逐条来源用 `NN_SCAN_DUMP_SOURCES=1` 打印（`[scan][dry-only]` / `[scan][anchor-only]` + 结构摘要）。
 - **run-only 签名回填已删除**（A1e）：`--f16` 下曾有一批只有真实训练才暴露的签名（注意力 fold 的文档掩码 5 输入形态、MNIST/CNN f16 训练的 8 条"f32 入 + f16 出"混合签名），靠 `NN_PREC_TRACE=1` 的 `[prec][miss]` 收集后写进 `tools/prec_backfill.txt`。**该清单与其工作流已随 A1 整体删除**——V1 分派 shader 覆盖任意签名，f16 训练实测 `miss=0` 且边界 cast 归因表为空。历史清单条目与复现命令归档在 `docs/history.md`。
 - **契约回归**：上述三条 key 语义 + "符号实例 key ≡ 真实实例 key" 由
   `src/expr_fused_key_test.cpp` 锁定（并入 `expr_cpu_test` 聚合目标，ctest 目标数不变）。
