@@ -237,6 +237,16 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 
 `scan_exprs` 需覆盖所有 Layer 的 DSL 路径（Softmax/LN/RMSNorm fwd+bwd、CrossEntropy softmax 结构、**Attention fold 结构**——层 forward 直调 `engine.eval_expr(make_fold_attn_o(...))` 不经 DSL 钩子，scan 的显式登记块（3 掩码 × 2 偏置的 5 个组合）是 fold spec 唯一注册来源、漏组合即 GPU 闭合世界硬报错、Linear 的 matmul 段、optimizer 的 `compute_into` 原地表达式），使融合结构被收集。未命中 → `eval_expr` 现有"硬报错"逻辑，提示补进扫描（保持项目"GPU 硬报错、不降级"哲学）。
 
+### 自登记锚点：结构覆盖不再依赖手写清单（2026-10-01）
+
+手写 dry-run 清单只覆盖**跑到的**路径；配置分支没被跑到就漏（`MaxPool2D(pool≠2)` 曾如此）。为此 `expr_dsl.hpp` 增加 `FusedAnchor<Expr>`：每个 `dsl::compute/_into/_reduce` 实例化 odr-use 一个锚点，其**静态初始化期**把"从表达式类型默认构造的符号实例"折叠出的结构登记进注册表。
+
+- **前提 = "结构 = 表达式类型"**：为此步骤①②③把 `consts` 值、`matmul.transA/transB`、`GroupedReduce.R` 逐出 key（分别改走 push constant），并把 `GroupedReduceRef` 的 `is_max`（决定视图 kind）提为模板参数。
+- **覆盖语义**：调用点在函数体里，**函数被编译即实例化**——与运行期是否走到该分支无关，因此是"编译期可达"而非"运行期可达"。A/B 实测（`-DNN_SCAN_NO_ANCHOR`）：结构数 **72（仅 dry-run）→ 84（+锚点）**，多出的 12 条都是编译进来的真实调用点（3 条含 matmul、1 条归约、1 条 16 个 vp 槽的宽表达式、其余逐元素）。
+- **只登记结构（sig=0）**：⚠ **精度签名登记不出来**——同一个表达式里"哪些输入是 f16"由运行期张量精度决定（类型层面不可见）。实测扫描出的 60 个带类型变体里只有 16 个是"全 f16 输入+输出"，其余 44 个是混合签名（`0x0001/0x0003/0x10005…`）。故 f16 带类型变体**仍须**由 profile_f32/profile_f16 两遍 dry-run（或运行期 `NN_PREC_TRACE` + `prec_backfill.txt`）产生，**自登记无法取代它**。
+- 非法结构（裸视图作根 → 空指令表）在构建期即 `_Exit(3)`，与 dry-run 同一闸门。
+- `-DNN_SCAN_NO_ANCHOR` 可关掉锚点做 A/B（只影响登记集合，不影响语义）。
+
 ---
 
 ## 二期 S1-S7：手写算子收敛为 IR 融合
