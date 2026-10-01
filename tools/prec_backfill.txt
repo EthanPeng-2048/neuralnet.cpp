@@ -34,3 +34,19 @@ c0006fc8ea6a0e6b 0002
 # 的 [prec][miss] 复现；scan 的 fold 显式块按 (掩码×偏置) 组合登记结构，
 # 但该 5 输入形态的 f16 签名只有真实 doc-mask 训练才暴露
 74a6eaacc0e5d766 10007
+
+# ── MNIST / CNN f16 训练的 run-only 签名（2026-10-01）─────────────────────
+# 复现：NN_PREC_TRACE=1 mnist_train --arch {mlp,cnn,transformer} --f16
+#   --epochs 1 --batch-size 8 --max-samples 32 --gpu=<dev>
+# 成因：MLP/CNN 的输入与部分中间张量在 master-weights 配方下是 **f32 存储**
+#   （compute=f16 但输入来自数据集/上一层的 f32 缓冲）→ 出现"f32 入 + f16 出"
+#   的混合签名，scan 的 dry-run（占位张量按 compute 精度造）预测不到。
+# 收益：这些是 `--f16` 训练里 miss 时走边界 cast（物化 f32 副本）的大头。
+59e079001367d11b 10000
+fe93c0d99c16113f 10000
+cb3d830f25b84895 10001
+fe93c0d99c16113f 10002
+b7e6d363af1963ac 10000
+8a29d02213a0e196 10003
+b7e6d363af1963ac 10002
+27c7edd7a0a4f808 10007
