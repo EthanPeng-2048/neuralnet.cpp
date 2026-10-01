@@ -61,6 +61,20 @@ expr_opt / expr_registry / expr_spec）「历史状态类注释」摘录。整�
 - **CMake include 顺序有语义（踩坑）**：`nn_enable_gpu_fusion` 起初只把 `${NNF_OUT_DIR}` 加进目标，样例 GPU 初始化报 `matmul SPIR-V bytecode not embedded`——手写原语 shader 的嵌入头在 `${CMAKE_BINARY_DIR}/generated`；但该目录**同时含库自身的 `fused_registry.hpp`**。最终把两者都加、且 `${NNF_OUT_DIR}` **排在前面**（`__has_include` 取第一个匹配），否则使用者的自定义结构全部闭合世界报错。已写进 AGENTS §7。
 - **未做**：把样例注册进 ctest（本次保持 ctest 19/19 口径不变；样例由默认构建覆盖编译，运行时断言需手工跑 `build/fusion_custom_layer_example.exe`，无 Vulkan 时退出码 77 = skip）。
 
+## 「锚点 vs dry-run」边界实测刻画（2026-10-01，round 15）
+
+- 类型：覆盖缺口 / 否决方案（"删掉 dry-run"）
+- **动机**：⑥ 的目标是"删除扫描"。此前只知"dry-run 贡献 71/84"，但**不知道那 71 条为什么锚点看不到**——没有这个答案就无法判断"能否再进一步"。为此给 `scan_exprs` 加了 env 门控诊断 `NN_SCAN_DUMP_SOURCES=1`：逐条打印 `[scan][dry-only]` / `[scan][anchor-only]` 加结构摘要（raxis / mm / fold / nreg / ninstr / nview / viewkinds）。
+- **实测（84 条结构）**：per-layer dry-run 38（含模型 pass +25、显式登记 +8）、锚点 59，**重叠 46 → 锚点独有 13、dry-run 独有 25**。
+- **dry-run 独有 25 条的分类**：
+  - **fold 8 条** = 显式登记的掩码×偏置组合与通用 fold 样例（`fold=1`，viewkinds `[0]`/`[0,0,0]`/`[0,0,0,10]`/`[0,0,0,7,11]`/`[0,0,0,10,7,11]`）；
+  - **含 matmul 段 7 条**（`mm=1`：注意力反向 / CE / 优化器步）；
+  - **RowAccess(12) 4 条**（共享内存 SwiGLU 的半偏移行切分）；
+  - **RowGather(9)/ColBroadcast(8) 若干**（稀疏 CE 的 5 视图形态 `[0,8,8,8,8]` 等）。
+  - 共同点：**结构由运行期配置决定**（视图种类 / 项数 / 掩码组合），类型层面推不出来；符号实例 `Expr{}` 与真实实例折叠出**不同 key**。最直接的证据是**镜像对**——dry-only `784781c7b82fa76c` 与 anchor-only `28cdf7c6d5df0e1d` 的摘要逐字段相同（`raxis=-1 mm=0 fold=0 nreg=2 ninstr=2 nview=2 viewkinds=[0,0]`），只有 key 不同。
+- **锚点独有 13 条**是镜像面：dry-run/模型 pass 没跑到的编译期可见调用点。最著名的是 `9ca81b4967cdfa20`——关掉锚点（`-DNN_SCAN_NO_ANCHOR`）后 `text_infer`（KV-cache 增量解码）在 GPU 上闭合世界硬报错。
+- **结论（否决"删掉 dry-run"）**：锚点与 dry-run **互补、不冗余**，单独删任何一方都会丢结构（dry-only 25 / anchor-only 13）。dry-run + 模型 pass 是结构的**主要**来源，`scan_exprs` 这一**构建步骤本身无法删除**；能删的只有签名维（已完成，扫描工作量减半）。若将来真要清零，路径是"把运行期配置维度类型化"（让视图种类/项数进入表达式类型），使符号实例等价于真实实例——那是另一次架构变更，不属于本阶段。
+
 ## 融合 matmul BK 取值 A/B 流水（原位置 include/neuralnet.cpp/expr_glsl_gen.hpp:262-269、303-310）
 - 类型：性能 A/B / 否决方案
 - 内容：40HX 变体 trade-off 记录（% = vs 单缓冲耗时，负=更快）：BK=32 单缓冲(16KB) 为深网格基线、
