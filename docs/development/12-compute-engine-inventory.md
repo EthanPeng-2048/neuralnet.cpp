@@ -88,9 +88,12 @@ scan_suffix_outer/outer_col——顺序状态机，DSL 无此语义）、`eval_e
 3. **新增 ExprViewKind 的落点清单**（以 grouped_reduce 为参照）：`expr_spec.hpp`
    枚举+validate → `expr_dsl.hpp` SpecBuilder helper + 叶子 + 自由函数 +
    `has_reduction_v=false` 显式特化 → `expr_glsl_gen.hpp` `glsl_view_read` case
-   （param 编译期展开）→ `compute_cpu_engine.hpp` 解释器两处（形状校验 switch +
-   读取 switch）。GPU 侧无 per-view 分派（只填 vp push constant，非 runtime param
-   的 view 不涉及）；`glsl_vec4_eligible` 白名单与 `glsl_view_uses_row/col` 排除集
+   → `compute_cpu_engine.hpp` 解释器两处（形状校验 switch + 读取 switch）。
+   **param 是否进 key 取决于 `expr_view_has_runtime_param`**：进（结构参数）= case
+   内按 `v.param` 编译期展开；不进（运行期视图参数）= case 内只发一个读取调用，
+   另需一处生成器侧辅助函数（如分组归约的 `glsl_emit_grouped_reduce_helpers` 发
+   `gr_r<i>()` 运行期循环）并在生成器 PC 之后调用。GPU 侧无 per-view 分派（只填 vp
+   push constant）；`glsl_vec4_eligible` 白名单与 `glsl_view_uses_row/col` 排除集
    自动正确——无需改。
 
 ### 2.2 不被 Layer 直接调用（其余 28 个：DSL lowering / 序列化 / CLI / 适配层 / 测试）

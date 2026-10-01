@@ -131,34 +131,14 @@ inline void glsl_view_read(std::ostringstream& os,
     }
     case static_cast<uint8_t>(ExprViewKind::GroupedReduceSum):
     case static_cast<uint8_t>(ExprViewKind::GroupedReduceMax):
-    {
         // 分组归约：输出行 r → 输入组行 [r*R, (r+1)*R)，列不变。
-        // R = v.param 是**进 key 的结构参数**（编译期已知）→ 展开 R 次
-        // 读取链（sum 用左结合加法、max 用嵌套 max）：累加顺序 t 升序，
-        // 与 CPU 模板路径 GroupedReduceRef::eval 逐元素一致（铁律 8）。
-        // rw() 负责 f16 缓冲的 float() 包装（f16_native 变体保持原类型）。
-        const std::uint32_t R = v.param;
-        const bool gmax =
-            v.kind == static_cast<uint8_t>(ExprViewKind::GroupedReduceMax);
-        const auto elem = [&](std::uint32_t tt) -> std::string {
-            const std::string idx = "(" + row_var + " * " + std::to_string(R)
-                + "u + " + std::to_string(tt) + "u) * cols + " + col_var;
-            return rw(idx);
-        };
-        std::string acc = elem(0);
-        if (gmax)
-        {
-            for (std::uint32_t tt = 1; tt < R; ++tt)
-                acc = "max(" + acc + ", " + elem(tt) + ")";
-        }
-        else
-        {
-            for (std::uint32_t tt = 1; tt < R; ++tt)
-                acc += " + " + elem(tt);
-        }
-        os << "(" << acc << ")";
+        // R 是**运行期**视图参数（vp 槽，不进 key → 任意池化窗口共享一个
+        // shader），故读取走 per-view 辅助函数 `gr_r<buf_id>(row, col)`
+        // （内部为运行期循环；累加顺序与 CPU 模板路径 GroupedReduceRef::eval
+        // 逐元素一致，铁律 8）。辅助函数由
+        // `glsl_emit_grouped_reduce_helpers()` 在 shader 顶部发射。
+        os << "gr_r" << buf_id << "(" << row_var << ", " << col_var << ")";
         return;
-    }
     case static_cast<uint8_t>(ExprViewKind::RowBroadcast):
         os << buf << "[" << row_var << "]";   // 输入 (rows,1)：每行一个值
         return;
@@ -184,6 +164,53 @@ inline void glsl_view_read(std::ostringstream& os,
         //    每批列数 seq 为运行时视图参数 → 同结构不同 seq 共享一个融合 shader）
         os << buf << "[batch * vp" << std::to_string(vp_slot) << " + " << col_var << "]";
         return;
+    }
+}
+
+// ── 分组归约视图的读取辅助函数发射（R 运行期 → 循环替代编译期展开链）──────
+// R 是运行期视图参数（vp 槽，不进 key）→ 任意池化窗口共享一个 shader。
+// 循环内的累加顺序与 CPU 模板路径 GroupedReduceRef::eval 逐元素一致（铁律 8）：
+// sum = 左结合升序加；max = 嵌套 max(acc, elem)。读取点见 glsl_view_read 的
+// GroupedReduceSum/Max 分支（`gr_r<i>(row, col)`），故**两者必须成对发射**。
+// 位置：shader 顶部（PC 声明之后、main 之前）。
+// 注意：分组归约视图不属于归约视图（expr_view_is_reduce=false）→ 只走
+// elementwise 生成路径；其它生成器不需要调用本函数。
+inline void glsl_emit_grouped_reduce_helpers(std::ostringstream& os,
+                                             const ExprSpec& spec,
+                                             ExprPrecSig sig = 0,
+                                             bool f16_native = false)
+{
+    const char* ty = f16_native ? "float16_t" : "float";
+    for (std::size_t i = 0; i < spec.views.size(); ++i)
+    {
+        const auto k = static_cast<ExprViewKind>(spec.views[i].kind);
+        if (k != ExprViewKind::GroupedReduceSum &&
+            k != ExprViewKind::GroupedReduceMax)
+            continue;
+        // vp 槽 = 按视图序累计（与 glsl_view_read 调用点的算法逐字一致）
+        std::uint32_t vp = 0;
+        for (std::size_t j = 0; j < i; ++j)
+            if (expr_view_has_runtime_param(
+                    static_cast<ExprViewKind>(spec.views[j].kind)))
+                vp += expr_view_runtime_param_slots(
+                    static_cast<ExprViewKind>(spec.views[j].kind));
+        const bool is_max = (k == ExprViewKind::GroupedReduceMax);
+        const bool f16_buf = expr_prec_sig_in_f16(sig, i) && !f16_native;
+        const std::string buf = "b" + std::to_string(i);
+        const auto elem = [&](const std::string& tt) -> std::string {
+            const std::string idx = "((row * R + " + tt + ") * cols + col)";
+            return f16_buf ? ("float(" + buf + "[" + idx + "])")
+                           : (buf + "[" + idx + "]");
+        };
+        os << "\n" << ty << " gr_r" << i << "(uint row, uint col)\n{\n";
+        os << "    const uint R = vp" << vp << ";\n";
+        os << "    " << ty << " acc = " << elem("0u") << ";\n";
+        os << "    for (uint tt = 1u; tt < R; ++tt)\n";
+        if (is_max)
+            os << "        acc = max(acc, " << elem("tt") << ");\n";
+        else
+            os << "        acc += " << elem("tt") << ";\n";
+        os << "    return acc;\n}\n";
     }
 }
 
@@ -1484,6 +1511,11 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
     for (std::uint32_t i = 0; i < n_rp; ++i)
         L << "    float rp" << i << ";\n";
     L << "};\n\n";
+
+    // 分组归约视图（MaxPool 等）的读取辅助函数：R 是运行期 vp 参数 → 循环。
+    // 与 glsl_view_read 的 GroupedReduceSum/Max 分支成对（编译器把 `gr_r<i>`
+    // 调用点连到这里；漏发 = 未声明函数，glslc 立刻报错而非静默错值）。
+    glsl_emit_grouped_reduce_helpers(L, spec, sig, native16);
 
     // native16 恒走标量 kernel（f16vec4 向量化路径留作后续优化）——
     // vec_width 元数据必须同源为 1（gen_fused 对 ALU 变体同判，否则
