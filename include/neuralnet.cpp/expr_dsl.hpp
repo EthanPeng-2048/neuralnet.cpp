@@ -315,6 +315,11 @@ struct CpuViewCache
     {
         if (!t.is_cpu())
             return;
+        // 符号张量（默认构造：未绑定、无存储）——AOT 自登记需要"从表达式类型
+        // 折叠出结构"，那条路径只看 to_spec 折出的视图/指令，不会 eval；此处
+        // 直接返回，避免在无存储张量上取 CPU 视图（原会 NN_ASSERT 硬失败）。
+        if (!t.valid())
+            return;
         if (t.precision() == Precision::F16)
         {
             auto m = std::make_shared<Matrix>(t.rows(), t.cols());
