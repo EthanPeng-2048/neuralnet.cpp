@@ -1570,7 +1570,7 @@ public:
 | 环境变量 | 作用 |
 |---|---|
 | `NN_BIND_DEBUG=1` | 未绑定输入进引擎也报错（抓库内 stamp 漏网）；错误同步打 stderr，带 `file:line` 与形状。**建议作为门禁运行 `NN_BIND_DEBUG=1 ctest`** |
-| `NN_PREC_TRACE=1` | 打印每个 `(结构 key, 精度签名)`；`[prec][alu-hit]` = 命中 native16 变体；`[into] branch=…` 打印 `eval_expr_into` 的分支。**`[prec][miss]` 与"回填清单"工作流已随"运行期精度分派"删除**——分派 shader（键 `key#x`）覆盖任意签名，f16 路径实测 `miss=0` |
+| `NN_PREC_TRACE=1` | 打印每个 `(结构 key, 精度签名)`；`[prec][alu-hit]` = 命中**变体**（`key#x` 运行期精度分派 **或** `key#a` native16，key 本身即区分）；`[prec][fallback]` = 该结构没有可用的 `#x`（回退基类边界 cast）；`[into] branch=…` 打印 `eval_expr_into` 的分支。**`[prec][miss]` 保留为通用诊断**（V1 覆盖后 f16 融合路径实测 `miss=0`）；"回填清单"工作流（`tools/prec_backfill.txt`）已随"运行期精度分派"删除。日志只由真正 dispatch 的入口、且在确认命中后打——`supports_expr_precision_variant` 是查询，不产生命中日志 |
 | `NN_F16_DEBUG=1` | f16 中间量数值扫描（`nn_dbg_scan`）、`accumulate` 巨值打印、`compute_into` 预绑定失败原因 |
 | `NN_MEM_STATS=1` | 训练中内存采样（配合 `pool_stats()`） |
 | `NN_VULKAN_DEVICE` | 强制指定 Vulkan 计算设备（索引 `"2"` 或名称子串 `"NVIDIA"`）。优先级：显式 API > 本变量 > 自动打分 |

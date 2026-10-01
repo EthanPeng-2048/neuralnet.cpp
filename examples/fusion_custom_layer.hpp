@@ -21,8 +21,9 @@ namespace nn_example
 // 一个刻意与库内任何结构都不同的融合表达式：
 //   out = exp(|x| * alpha) / (sqrt(|y|) + alpha)
 // 两个运行时标量参数（alpha）→ 值不进 key，同结构共享 shader。
+// 入参只读：`dsl::leaf` 按值收 Tensor（句柄拷贝），表达式不写输入。
 [[nodiscard]] inline nn::Result<nn::Tensor> fused_custom_op(
-    nn::ComputeEngine& engine, nn::Tensor& x, nn::Tensor& y, float alpha,
+    nn::ComputeEngine& engine, const nn::Tensor& x, const nn::Tensor& y, float alpha,
     nn::Precision P = nn::Precision::F32)
 {
     return nn::dsl::compute(engine,
@@ -39,7 +40,7 @@ namespace nn_example
 // 库外自定义层没有 dry-run/模型 pass，因此本函数是对 `nn_enable_gpu_fusion`
 // **可靠性**的直接检验：注册表若漏了运行期那一条，GPU 会闭合世界硬报错。
 [[nodiscard]] inline nn::Result<nn::Tensor> fused_custom_norm(
-    nn::ComputeEngine& engine, nn::Tensor& x, float inv_cols, float eps,
+    nn::ComputeEngine& engine, const nn::Tensor& x, float inv_cols, float eps,
     nn::Precision P = nn::Precision::F32)
 {
     return nn::dsl::compute(engine,

@@ -24,7 +24,7 @@
 
 namespace
 {
-int g_fail_fk = 0;
+int g_fail = 0;
 
 [[nodiscard]] std::string fk_key(const nn::ExprSpec& s)
 { return nn::expr_spec_key(nn::canonicalize_expr_spec(s)); }
@@ -37,7 +37,7 @@ void fk_eq(const char* name, const std::string& a, const std::string& b,
         std::printf("[PASS] %s（%s）key=%s\n", name, why, a.c_str());
         return;
     }
-    ++g_fail_fk;
+    ++g_fail;
     std::printf("[FAIL] %s：key 应相同但不同（%s）\n        a=%s\n        b=%s\n",
                 name, why, a.c_str(), b.c_str());
 }
@@ -91,7 +91,9 @@ int main()
     for (const Pair& p : pairs)
         fk_eq(p.name, p.real, p.sym, "符号实例 key ≡ 真实实例 key");
 
-    // 默认构造可用性（锚点要求整棵表达式树可符号构造）
+    // 默认构造可用性（锚点要求整棵表达式树可符号构造）。上面 pairs[] 里的
+    // `S`（默认构造 Tensor）折叠与真实实例同 key，已经证明"可符号构造"这条
+    // 不变量**成立**；这里只再补类型层面的静态断言（编译期，无运行期成本）。
     static_assert(std::is_default_constructible_v<nn::dsl::TensorRef>);
     static_assert(std::is_default_constructible_v<nn::dsl::GroupedReduceSumRef>);
     static_assert(std::is_default_constructible_v<nn::dsl::GroupedReduceMaxRef>);
@@ -115,19 +117,8 @@ int main()
         fk_eq("matmul_trans_not_in_key", k00, k01, "4 种转置组合共享一个 shader");
         fk_eq("matmul_trans_not_in_key", k00, k10, "4 种转置组合共享一个 shader");
         fk_eq("matmul_trans_not_in_key", k00, k11, "4 种转置组合共享一个 shader");
-
-        // 运行期描述子位编码（GPU 端据此选加载路径；编码错 = 静默读错布局）
-        const auto trans_of = [](bool a, bool c) {
-            nn::ExprSpec s;
-            s.views  = {nn::expr::linear(), nn::expr::linear()};
-            s.matmul = nn::MatmulSpec{0, 1, static_cast<std::uint8_t>(a ? 1u : 0u),
-                                      static_cast<std::uint8_t>(c ? 1u : 0u), 1};
-            return nn::expr_spec_runtime_matmul_trans(s);
-        };
-        const bool enc_ok = trans_of(false, false) == 0u && trans_of(true, false) == 1u
-                         && trans_of(false, true) == 2u && trans_of(true, true) == 3u;
-        if (enc_ok) std::printf("[PASS] expr_spec_runtime_matmul_trans 位编码\n");
-        else { ++g_fail_fk; std::printf("[FAIL] matmul trans 位编码不是 bit0/bit1\n"); }
+        // （mm_trans 的位编码断言在 expr_matmul_test 的第 4 节——同一聚合目标里
+        //   不重复；此处只锁 key 契约。）
     }
 
     // ── ④ 分组归约 R 不进 key（运行期视图参数）────────────────────────────
@@ -144,9 +135,9 @@ int main()
         const std::string km = fk_key(dsl::to_expr_spec(
             dsl::grouped_reduce_max(x, 4u) + dsl::rparam(Scalar{0})).first);
         if (ks != km) std::printf("[PASS] sum/max 是不同视图（key 不同）\n");
-        else { ++g_fail_fk; std::printf("[FAIL] grouped_reduce sum/max key 应不同\n"); }
+        else { ++g_fail; std::printf("[FAIL] grouped_reduce sum/max key 应不同\n"); }
     }
 
-    std::printf("\nexpr_fused_key_test: %d failure(s)\n", g_fail_fk);
-    return g_fail_fk != 0 ? 1 : 0;
+    std::printf("\nexpr_fused_key_test: %d failure(s)\n", g_fail);
+    return g_fail != 0 ? 1 : 0;
 }
