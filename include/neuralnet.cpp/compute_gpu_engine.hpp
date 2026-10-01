@@ -1417,9 +1417,11 @@ public:
                     ffs->key, gpu_inputs, raw_spec.consts, rows, cols,
                     /*vector_out=*/false, fvp, raw_spec.rparams,
                     /*output_override=*/nullptr,
-                    // 双域 fold 自带 matmul 段的 k/batch（7 槽 PC 的 slot5/6）
+                    // 双域 fold 自带 matmul 段的 k/batch（7 槽 PC 的 slot5/6）；
+                    // fold 的转置仍在 key 里（生成期定死）→ 此处恒 0（无该槽）
                     nn::expr_spec_runtime_matmul_k(raw_spec),
                     nn::expr_spec_runtime_matmul_batch(raw_spec),
+                    /*matmul_trans=*/0u,
                     nn::expr_spec_runtime_fold_k(raw_spec), fout_f16);
                 if (!out) return std::unexpected(out.error());
                 // f16 输出：按 2B/元素分配后重贴 GpuTensorF16（同非 fold 路径）
@@ -1466,6 +1468,7 @@ public:
                 /*vector_out=*/false, vp, spec.rparams, /*output_override=*/nullptr,
                 nn::expr_spec_runtime_matmul_k(spec),
                 nn::expr_spec_runtime_matmul_batch(spec),
+                nn::expr_spec_runtime_matmul_trans(spec),
                 /*fold_k=*/std::nullopt, out_f16);
             if (!out) return std::unexpected(out.error());
             if (out_f16)
@@ -1581,7 +1584,9 @@ public:
                 fs->key, gpu_inputs, spec.consts, rows, cols, /*vector_out=*/true, vp,
                 spec.rparams,
                 /*output_override=*/nullptr, nn::expr_spec_runtime_matmul_k(spec),
-                nn::expr_spec_runtime_matmul_batch(spec), std::nullopt, out_f16);
+                nn::expr_spec_runtime_matmul_batch(spec),
+                nn::expr_spec_runtime_matmul_trans(spec),
+                std::nullopt, out_f16);
             if (!out) return std::unexpected(out.error());
             if (out_f16)
             {
@@ -1671,7 +1676,8 @@ public:
                 fs->key, gpu_inputs, spec.consts, rows, cols, /*vector_out=*/false, vp,
                 spec.rparams, dst_override,
                 nn::expr_spec_runtime_matmul_k(spec),
-                nn::expr_spec_runtime_matmul_batch(spec));
+                nn::expr_spec_runtime_matmul_batch(spec),
+                nn::expr_spec_runtime_matmul_trans(spec));
             if (!out) return std::unexpected(out.error());
             // dst 原为 CPU staging 时，import 上传了新 buffer（结果在它上面）
             // → 用 upload 后的张量替换 dst，保证调用方看到更新后的数据
