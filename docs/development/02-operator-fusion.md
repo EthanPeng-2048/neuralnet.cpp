@@ -245,7 +245,13 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 - **覆盖语义**：调用点在函数体里，**函数被编译即实例化**——与运行期是否走到该分支无关，因此是"编译期可达"而非"运行期可达"。A/B 实测（`-DNN_SCAN_NO_ANCHOR`）：结构数 **72（仅 dry-run）→ 84（+锚点）**，多出的 12 条都是编译进来的真实调用点（3 条含 matmul、1 条归约、1 条 16 个 vp 槽的宽表达式、其余逐元素）。
 - **常驻台账**：锚点登记进独立注册表 `anchor_registry()`，`scan_exprs` 末尾合并并打印 `结构来源：dry-run 72 + 锚点 59 → 合并 84（锚点独有 12）`。**锚点独有数突然变大 = 有新的层路径没纳入 dry-run**（该数字是回归信号）。
 - **只登记结构（sig=0）**：⚠ **精度签名登记不出来**——同一个表达式里"哪些输入是 f16"由运行期张量精度决定（类型层面不可见）。实测扫描出的 60 个带类型变体里只有 16 个是"全 f16 输入+输出"，其余 44 个是混合签名（`0x0001/0x0003/0x10005…`）。故 f16 带类型变体**必须**由 profile_f32/profile_f16 两遍 dry-run（或运行期 `NN_PREC_TRACE` + `prec_backfill.txt`）产生，**自登记无法取代它**。
-- **模型级签名 pass**（补签名覆盖）：per-layer dry-run 块只覆盖"层被单独造出来"的路径；有些调用点只在**完整模型**里才执行（GPT/RAPT 的 LM head、PatchEmbedding、模型级位置编码等）。`scan_exprs` 因此在两个 profile 下各加一遍"用 shipped 工厂建 5 个模型 + 跑 fwd/bwd"（`mnist_mlp`/`mnist_transformer`/`cnn`/`gpt`/`rapt`；id 输入须填合法 token 值）。实测 **精度变体 60 → 72**，`prec_backfill.txt` 的"运行期才发现的签名"由 **7/7 降到 2/7**（即 5 个原本 run-only 的 f16 混合签名现在构建期即可预测）。该 pass 失败只打 `[scan][warn]` 不中断构建（它是增量，主路径已由 dry-run + 锚点覆盖）。
+- **模型级签名 pass**（补签名覆盖）：per-layer dry-run 块只覆盖"层被单独造出来"的路径；有些调用点只在**完整模型**里才执行（GPT/RAPT 的 LM head、PatchEmbedding、模型级位置编码等）。`scan_exprs` 因此在两个 profile 下各跑一遍**配置矩阵**：`mnist_mlp`×{LayerNorm,RMSNorm,BatchNorm}、`mnist_transformer`(ViT)、`cnn`×{pool2,pool3}、`gpt`×{Learned,ALiBi,Sinusoidal,RoPE}×{GeLU,SwiGLU}×{LayerNorm,RMSNorm}、`rapt`×{causal,bidir}（小配置 vocab=64/d_model=16/seq=8/H=2/d_ff=32/L=2；id 输入须填合法 token 值）。实测：**签名 +13**（73 条），`prec_backfill.txt` 的"运行期才发现的签名"由 **7/7 降到 2/7**。该 pass 失败只打 `[scan][warn]` 不中断构建（它是增量，主路径已由 dry-run + 锚点覆盖）。
+- **常驻分项台账**（每次构建打印）：
+  ```
+  [scan] 结构来源：dry-run 64（含模型 pass +0、显式登记 +8） + 锚点 59 → 合并 84（锚点独有 12）
+  [scan] 签名来源：dry-run 60 + 模型 pass 13 + 显式登记 0 = 73
+  ```
+  A/B（`-DNN_SCAN_NO_DRYRUN` 关掉手写 per-layer 块）只剩 **76 结构 / 50 签名** → 即那批手写块目前仍贡献 **8 结构 + 23 签名**（其中 5 个结构是 `scan_exprs` 内的**显式测试覆盖登记**（matmul+bias+relu / bmm_reduce / reduce_consts），不是层 dry-run）。这两行是"手写清单还差多少才能删"的度量。
 - 非法结构（裸视图作根 → 空指令表）在构建期即 `_Exit(3)`，与 dry-run 同一闸门。
 - `-DNN_SCAN_NO_ANCHOR` 可关掉锚点做 A/B（只影响登记集合，不影响语义）。
 
