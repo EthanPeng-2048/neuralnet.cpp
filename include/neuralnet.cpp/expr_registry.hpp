@@ -29,52 +29,28 @@
 namespace nn::fused
 {
 
-// ── 精度变体（Phase 2 in-kernel f16）：同一结构 + 精度签名 ────────────────
-struct ExprVariant
-{
-    ExprSpec    spec;
-    ExprPrecSig sig = 0;
-};
-
-// ── 注册表：收集折叠出的 ExprSpec 结构，按规范 key 去重 ─────────────────
+// ── 注册表：收集折叠出的 ExprSpec **结构**，按规范 key 去重 ───────────────
+//
+// 只装**结构**：精度签名已不是构建期集合（生成阶段对每个结构发运行期精度
+// 分派 shader，键 `key#x`；见 expr_spec.hpp 的 EXPR_PREC_SIG_DISPATCH）。
+// 历史上有过 `variants`（(结构, 签名) 表）与 `contains_variant`——随签名
+// 降级为运行期参数一并删除（docs/history.md）。
 struct ExprRegistry
 {
-    // sig == 0（全 f32）：按结构 key 去重进基础表 specs —— bin / 生成头的
-    // 基础段只承载这些条目（key 不加后缀）。
     std::vector<ExprSpec>       specs;
     std::unordered_set<std::string> keys;
-    // sig != 0（带类型变体）：按 (结构 key, 精度签名) 去重。bin 只序列化
-    // {sig, 基础结构下标}：变体与基础结构**同结构同 key**，故只需下标引用。
-    // 同结构同 key，spec 体复用基础表条目，不重复落盘。
-    std::vector<ExprVariant>    variants;
-    std::unordered_set<std::string> variant_keys;
 
-    void add(const ExprSpec& s, ExprPrecSig sig = 0)
+    void add(const ExprSpec& s)
     {
         // 登记 canonical IR：canonicalize 为引擎内部优化（IR-A/IR-B），
-        // bin 与 key 建立在 canonical 形态上（scan 与 runtime 两端一致）。
+        // key 建立在 canonical 形态上（scan 与 runtime 两端一致）。
         const ExprSpec canon = canonicalize_expr_spec(s);
         const std::string k = expr_spec_key(canon);
-        if (sig == 0u)
-        {
-            if (keys.insert(k).second)
-                specs.push_back(canon);
-            return;
-        }
-        const std::string vk = expr_prec_sig_key(k, sig);
-        if (variant_keys.insert(vk).second)
-            variants.push_back(ExprVariant{canon, sig});
+        if (keys.insert(k).second)
+            specs.push_back(canon);
     }
     [[nodiscard]] bool contains(const ExprSpec& s) const
     { return keys.count(expr_spec_key(canonicalize_expr_spec(s))) != 0; }
-    // 该 (结构, 签名) 是否已登记（sig==0 走结构表）
-    [[nodiscard]] bool contains_variant(const ExprSpec& s, ExprPrecSig sig) const
-    {
-        const std::string k = expr_spec_key(canonicalize_expr_spec(s));
-        if (sig == 0u)
-            return keys.count(k) != 0;
-        return variant_keys.count(expr_prec_sig_key(k, sig)) != 0;
-    }
 };
 
 // 全局注册表（scan_exprs 记录模式写入；普通构建不含 NN_EXPR_SCAN，零开销）
