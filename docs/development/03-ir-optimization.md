@@ -111,7 +111,7 @@ expr_spec_key(spec) ≡ expr_spec_key(canonicalize_expr_spec(spec))
 | `matmul.transA/transB` | ❌ | push constant `mm_trans`（bit0=transA / bit1=transB；shader 内两条加载路径 + uniform 分支，同一结构覆盖 4 种转置组合） |
 | fold 段 matmul 的 transA/transB | ✅（fold 的 mm 段生成期定死，**尚未收敛**） | — |
 | fold 的 `k` / `vec_state_len` | ❌ | push constant |
-| 分组归约视图的 `R` | ✅（**待收敛**：目标改为运行期循环） | — |
+| 分组归约视图的 `R` | ❌ | push constant `vp<i>`（读取走 `gr_r<slot>()` 辅助函数内的运行期循环，累加顺序与 CPU 模板路径一致） |
 
 ### 4.2 确定性铁律
 

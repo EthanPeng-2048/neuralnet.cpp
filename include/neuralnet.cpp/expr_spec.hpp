@@ -183,9 +183,9 @@ enum class ExprViewKind : uint8_t
     // ── 分组归约（segmented reduce；MaxPool 等按固定长度 R 分组的场景）──
     // 输出网格 (G, N)，输入 (G*R, N)：out[r][c] = Σ/max over t∈[0,R) of
     //   in[(r*R + t)][c]（沿行方向按固定长度 R 分组，组内归约）。
-    // param = R（组长度）：**非 runtime param → R 进 expr_spec_key**（不同
-    //   组长度 = 不同结构，glsl_gen 编译期展开 R 次读取链；R 是池化窗口等
-    //   结构参数，取值空间小）。**不属于归约视图**（expr_view_is_reduce=false）：
+    // param = R（组长度）：**运行期形状数据 → R 不进 expr_spec_key**（同一
+    //   结构覆盖任意组长度，glsl_gen 用运行期循环而非编译期展开链；R 经
+    //   push constant vp 槽填入）。**不属于归约视图**（expr_view_is_reduce=false）：
     //   输出是全网格而非归约向量，不参与 expr_spec_reduce_axis 的归约轴判定，
     //   也不进 reduce-shader 分派——每输出元素独立归约 R 个输入元素，与
     //   RowAccess 同属"逐元素索引/局部读取"类，走 elementwise 生成路径。
@@ -473,21 +473,24 @@ struct ExprSpec
 }
 
 // ── 运行时视图参数（形状无关融合的关键）───────────────────────────────
-// RowMod（周期）与 RotateHalf（块大小）的 param 是**运行时形状数据**（如
-// RoPE 的 d_k），不是表达式结构：同结构不同 param（不同 d_k）应共享一个
-// 融合 shader。因此：
-//   - expr_spec_key **不**把这两个 param 折进 key（结构相同 → 同 key）
+// RowMod（周期）/RotateHalf（块）/RowAccess（偏移+模）与分组归约的 R 都是
+// **运行时形状数据**，不是表达式结构：同结构不同 param 应共享一个融合 shader。
+// 因此：
+//   - expr_spec_key **不**把这些 param 折进 key（结构相同 → 同 key）
 //   - glsl_gen 把它们作为 push constant（vp 槽）读取，dispatch 时按实际
-//     spec 填充 → 一个 shader 适配所有形状（任何 d_k）
+//     spec 填充 → 一个 shader 适配所有形状（任何 d_k / 任何池化窗口）
 [[nodiscard]] inline constexpr bool expr_view_has_runtime_param(ExprViewKind k) noexcept
 {
     // RowMod/RotateHalf 的形状参数（d_k）与 BatchMod/BatchCol 的形状参数
     // （num_heads / seq）都是**运行时形状数据**：不进 expr_spec_key，作为
     // push constant vp 槽由 dispatch 按实际 spec 填充 → 同结构不同形状
     // （不同 d_k / num_heads / seq_len）共享一个融合 shader（形状无关融合）。
+    // 分组归约的 R（= 池化窗口面积）同理：运行期循环取代编译期展开链。
     return k == ExprViewKind::RowMod || k == ExprViewKind::RotateHalf ||
            k == ExprViewKind::BatchMod || k == ExprViewKind::BatchCol ||
-           k == ExprViewKind::RowAccess;
+           k == ExprViewKind::RowAccess ||
+           k == ExprViewKind::GroupedReduceSum ||
+           k == ExprViewKind::GroupedReduceMax;
 }
 // 该视图消耗的运行时视图参数槽位数（RowAccess 用 offset+mod 两个 vp 槽）
 [[nodiscard]] inline constexpr std::uint32_t expr_view_runtime_param_slots(
