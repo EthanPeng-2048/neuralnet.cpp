@@ -50,3 +50,10 @@ b7e6d363af1963ac 10000
 8a29d02213a0e196 10003
 b7e6d363af1963ac 10002
 27c7edd7a0a4f808 10007
+
+# ── text_train（tinystories smoke）× f16 的 run-only 签名（2026-10-01）───────
+# 复现：NN_PREC_TRACE=1 text_train datasets/tinystories_smoke.txt --epochs 1
+#   --d-model 128 --num-heads 4 --num-layers 4 --d-ff 512 --seq-len 64
+#   --batch-size 50 --gpu --f16 [--model rapt]
+b7e6d363af1963ac 0001    # GPT：纯 matmul 段，in=[f16,f32] out=f32
+a1d46a05bb060c47 10001   # RAPT：8 指令链（含 4 个列归约视图），in=[f16,f32×4] out=f16
