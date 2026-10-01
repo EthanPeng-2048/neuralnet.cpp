@@ -247,7 +247,11 @@ struct ExprInstr
 //   - 其余逐元素输入的视图/形状仍要求 (M, N)（如 bias、残差）。
 //   - k（求和维度）是**形状参数**：不进 expr_spec_key（同结构不同 K 共享
 //     一个融合 shader），运行时作为 push constant 填充。
-//   - transA/transB/a_input/b_input 是**结构**：进 expr_spec_key。
+//   - transA/transB 是**运行期 operand layout**：不进 expr_spec_key（同一个
+//     结构覆盖 4 种转置组合），运行时经 `expr_spec_runtime_matmul_trans`
+//     打包成 push constant `mm_trans`（bit0=transA / bit1=transB），shader
+//     内两条加载路径 + uniform 分支选择。
+//   - a_input/b_input（输入槽位）是**结构**：进 expr_spec_key。
 //   - batch：批量数，A/B 按 batch 垂直切分为连续行块（与
 //     batched_matmul 原语同布局），输出网格 (batch*M, N)；
 //     **形状参数**：不进 key（同结构不同 batch 共享一个融合 shader），
@@ -443,6 +447,17 @@ struct ExprSpec
     if (s.fold && s.fold->matmul) return s.fold->matmul->batch;
     return 1u;
 }
+// 运行时 matmul 转置布局（bit0 = transA，bit1 = transB）：**不进 key** ——
+// 同一结构覆盖 4 种转置组合，shader 内两条加载路径 + uniform 分支按此选择
+// （见 generate_glsl_matmul / generate_glsl_reduce 的 PC `mm_trans`）。
+// ⚠ **双域 fold 自带的 matmul 段不在此列**：fold 的 transA/transB 仍进 key
+// （生成期定死，见 expr_spec_key 的 fold 分支），此处只描述顶层 matmul 段。
+[[nodiscard]] inline std::uint32_t expr_spec_runtime_matmul_trans(
+    const ExprSpec& s) noexcept
+{
+    if (!s.matmul) return 0u;
+    return (s.matmul->transA ? 1u : 0u) | (s.matmul->transB ? 2u : 0u);
+}
 // fold 收缩轴长度（形状参数，不进 key → push constant 运行时填充）
 [[nodiscard]] inline std::optional<std::uint32_t> expr_spec_runtime_fold_k(
     const ExprSpec& s) noexcept
@@ -610,16 +625,17 @@ struct ExprSpec
     // 共享一个融合 shader（glsl_gen 把 rparams 作为 push constant 读取，
     // dispatch 时按实际 spec 填充）。与 RowMod/RotateHalf 的 param 同处理。
     feed_u32(static_cast<std::uint32_t>(s.rparams.size()));
-    // matmul 段（可选）：transA/transB/a_input/b_input 是**结构** → 进 key；
-    // k（求和维度）是**形状参数** → 不进 key（同 RowMod/RotateHalf 的 param
-    // 处理）：同结构不同 K 共享一个融合 shader（glsl_gen 把 k 作为 push
-    // constant 读取，dispatch 时按实际 spec 填充）。
+    // matmul 段（可选）：a_input/b_input（输入槽位）是**结构** → 进 key；
+    // k（求和维度）与 batch 是**形状参数** → 不进 key（同 RowMod/RotateHalf 的
+    // param 处理）：同结构不同 K/batch 共享一个融合 shader（glsl_gen 把 k/batch
+    // 作为 push constant 读取，dispatch 时按实际 spec 填充）。
+    // **transA/transB 同样不进 key**：它们是运行期 operand layout（PC `mm_trans`，
+    // 见 expr_spec_runtime_matmul_trans），shader 内两条加载路径 + uniform 分支
+    // 运行时选择 → 同一结构覆盖 4 种转置组合（原先 4 份 shader 合并为 1 份）。
     if (s.matmul)
     {
         feed(&s.matmul->a_input, 1);
         feed(&s.matmul->b_input, 1);
-        feed(&s.matmul->transA, 1);
-        feed(&s.matmul->transB, 1);
     }
     // fold 段：结构字段全进 key（num_state、inits 初值——-inf/0 属
     // 结构、body/finalize 指令序列）；k 是形状参数不进（同 matmul.k 处理，

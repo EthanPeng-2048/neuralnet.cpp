@@ -1719,8 +1719,8 @@ public:
             const std::uint32_t num_bindings =
                 static_cast<std::uint32_t>(fs.spec.views.size()) + 1;  // 输入 + 输出
             // 归约 kernel 的 push constants 多 uint rows + uint vector_out；
-            // matmul 融合 kernel 多 uint rows + uint mm_k + uint mm_batch；
-            // matmul+归约组合再多 uint mm_k + uint mm_batch（6 槽）；
+            // matmul 融合 kernel 多 uint rows + uint mm_k + uint mm_batch + uint mm_trans；
+            // matmul+归约组合再多 uint mm_k + uint mm_batch + uint mm_trans（7 槽）；
             // fold v1（标量域）= count, cols, rows, vector_out, fold_k（5 槽）——
             //   **必须与 run_fused_gpu 的 pc_base 逐形态一致**：漏分支会让
             //   range 少算，vkCmdPushConstants 超 range 部分被驱动丢弃 →
@@ -1731,8 +1731,10 @@ public:
             const std::uint32_t pc_base =
                 (fs.spec.fold && fs.spec.fold->matmul)    ? 7u  // fold+mm 7 槽
               : (fs.spec.fold)                            ? 5u
-              : (fs.reduce_axis >= 0 && fs.has_matmul)    ? 6u
-              : ((fs.reduce_axis >= 0 || fs.has_matmul) ? 5u : 2u);
+              : (fs.reduce_axis >= 0 && fs.has_matmul)    ? 7u
+              : (fs.reduce_axis >= 0)                     ? 4u
+              : (fs.has_matmul)                           ? 6u
+              :                                             2u;
             const std::uint32_t pc_uints = pc_base + fs.view_param_count;
             const std::uint32_t pc_size =
                 static_cast<std::uint32_t>(pc_uints * sizeof(std::uint32_t) +
@@ -3335,6 +3337,11 @@ public:
         GpuTensor* output_override = nullptr,
         std::optional<std::uint32_t> matmul_k = std::nullopt,
         std::uint32_t matmul_batch = 1,
+        // matmul 段转置布局（bit0=transA，bit1=transB）：**运行期 operand layout，
+        // 不进 expr_spec_key** —— 同一结构覆盖 4 种转置组合。仅 matmul 形态
+        // （matmul / matmul+归约）使用；fold 形态的 mm 段转置仍在 key 里
+        // （生成期定死），此处忽略。
+        std::uint32_t matmul_trans = 0u,
         // fold 收缩轴长度（fold shader 传入填 fold_k 槽；非 fold 传 nullopt）
         std::optional<std::uint32_t> fold_k = std::nullopt,
         // 输出存储精度（Phase 2 in-kernel f16）：true → 分配 f16 字节布局的
@@ -3492,20 +3499,21 @@ public:
         // Push constants 布局与 glsl_gen.hpp 一致：
         //   逐元素: count, cols, [vp0..], c0..
         //   归约:   count, cols, rows, vector_out, [vp0..], c0..
-        //   matmul: count, cols, rows, mm_k, mm_batch, [vp0..], c0..
-        //   matmul+归约: count, cols, rows, vector_out, mm_k, mm_batch, [vp0..], c0..
+        //   matmul: count, cols, rows, mm_k, mm_batch, mm_trans, [vp0..], c0..
+        //   matmul+归约: count, cols, rows, vector_out, mm_k, mm_batch, mm_trans,
+        //                [vp0..], c0..
         //
         // ⚠ 固定头长度必须**逐形态**与生成器的 PC 声明一致：逐元素 2 /
-        //   逐元素+matmul 5 / 归约 4 / 归约+matmul 6 / fold 5 / fold+matmul 7。
+        //   逐元素+matmul 6 / 归约 4 / 归约+matmul 7 / fold 5 / fold+matmul 7。
         //   错一个 uint 即常量池整体后移 → shader 从错位处读常量，GPU 上带
         //   常量的归约静默错值而 CPU 正常（实测把 select(cond,1,0) 的常量
         //   读成垃圾）。
         const std::uint32_t pc_base =
             (is_fold && matmul_k)       ? 7u   // fold+mm: …, fold_k, mm_k, mm_batch
           : (is_fold)                   ? 5u   // fold: count,cols,rows,vector_out,fold_k
-          : (raxis >= 0 && has_mm) ? 6u   // count, cols, rows, vector_out, mm_k, mm_batch
+          : (raxis >= 0 && has_mm) ? 7u   // …, mm_k, mm_batch, mm_trans
           : (raxis >= 0)           ? 4u   // count, cols, rows, vector_out
-          : (has_mm)               ? 5u   // count, cols, rows, mm_k, mm_batch
+          : (has_mm)               ? 6u   // count, cols, rows, mm_k, mm_batch, mm_trans
           :                          2u;  // count, cols
         const std::uint32_t pc_uints = pc_base;
         std::vector<std::uint8_t> pc(
@@ -3527,23 +3535,29 @@ public:
                         sizeof(std::uint32_t));
             if (has_mm)
             {
-                // matmul+归约：mm_k + mm_batch（形状参数，运行时填充）
+                // matmul+归约：mm_k + mm_batch + mm_trans（形状参数 + 运行期
+                // operand layout，运行时填充）
                 std::memcpy(pc.data() + 4 * sizeof(std::uint32_t), &*matmul_k,
                             sizeof(std::uint32_t));
                 std::memcpy(pc.data() + 5 * sizeof(std::uint32_t), &matmul_batch,
+                            sizeof(std::uint32_t));
+                std::memcpy(pc.data() + 6 * sizeof(std::uint32_t), &matmul_trans,
                             sizeof(std::uint32_t));
             }
         }
         else if (has_mm)
         {
-            // matmul 融合：rows + mm_k + mm_batch（形状参数，运行时按实际 spec
-            // 填充 → 同结构不同 K/batch 共享一个融合 shader）
+            // matmul 融合：rows + mm_k + mm_batch + mm_trans（形状参数 + 运行期
+            // operand layout，运行时按实际 spec 填充 → 同结构不同 K/batch/转置
+            // 共享一个融合 shader）
             const std::uint32_t rows32 = static_cast<std::uint32_t>(rows);
             std::memcpy(pc.data() + 2 * sizeof(std::uint32_t), &rows32,
                         sizeof(std::uint32_t));
             std::memcpy(pc.data() + 3 * sizeof(std::uint32_t), &*matmul_k,
                         sizeof(std::uint32_t));
             std::memcpy(pc.data() + 4 * sizeof(std::uint32_t), &matmul_batch,
+                        sizeof(std::uint32_t));
+            std::memcpy(pc.data() + 5 * sizeof(std::uint32_t), &matmul_trans,
                         sizeof(std::uint32_t));
         }
         else if (is_fold)
