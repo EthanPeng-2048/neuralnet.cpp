@@ -80,7 +80,7 @@ Shader / 融合逻辑是引擎内部实现，用户不可见
 ```
 Layer 内联表达式 → to_expr_spec 折叠 → ExprSpec（扁平 SSA IR）
     → expr_spec_key（规范结构 key）→ scan_exprs 收集
-    → gen_fused 用 glsl_gen 合成 GLSL → glslc → 内联 SPIR-V → fused_registry.hpp
+    → 生成阶段 用 glsl_gen 合成 GLSL → glslc → 内联 SPIR-V → fused_registry.hpp
 运行时：fold → key → find_fused(key) → 精确 dispatch（闭合世界）
 ```
 

@@ -579,7 +579,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 | `scan_exprs` 双 pass | 整段 dry-run 收进 `dry_run(engine, profile)`：`profile_f32`（sig==0，旧行为）与 `profile_f16`（输入张量按 compute 精度创建 → 与运行时同源）。f16 pass **直接传原生引擎即可**——P-1 后 f16 边界 cast 由基类 NVI 入口统一处理（历史上直喂原生 `CpuEngine` = heap corruption（0xC0000374，实测）；适配层已删除、职责并入基类）。 |
 | bin v9 | 规格表之后的**变体段**：每个变体只存 `{sig, 基础结构下标}`——变体与基础结构同 key（精度不进 `expr_spec_key`），故不重复序列化 spec 体（也免读写不对称风险）。 |
 | `GlslEmitter` | `generate/generate_reduce` 带 `sig` 形参（默认 0 → **GLSL 与不带变体时逐字节相同**）。带类型输出 = 缓冲声明 `float16_t` + `#extension GL_EXT_shader_16bit_storage` + 读 `float(x)` / 写 `float16_t(v)`；算术默认全 f32（§7.2）。视图内部有算术的分支（RotateHalf 的取负、RowGather 的 `uint(...)` 索引）必须**在叶子处**转换——否则 glslc 报 `'-' : wrong operand type ... float16_t`。 |
-| `gen_fused` | 每变体独立 shader（文件名/标识符 `key_sighex`，注册键 `key#sig`），`FusedShader` 带 `prec_sig`；生成器不支持的形态 → **跳过并告警**（不是失败）。 |
+| 生成阶段 | 每变体独立 shader（文件名/标识符 `key_sighex`，注册键 `key#sig`），`FusedShader` 带 `prec_sig`；生成器不支持的形态 → **跳过并告警**（不是失败）。 |
 | 设备 | 查询并启用 `storageBuffer16BitAccess`（`NN_VULKAN_NO_16BIT_STORAGE=1` 可强制回退）；未启用时后端跳过 `key#sig` 键（运行时自然回退边界 cast）。 |
 | 运行时 | `run_fused_gpu` 输入是**类型擦除的 buffer 视图**；`FusedInputs{owners, bufs}` **必须同时持有 owner**——只存裸 `GpuBuffer*` 会在录制中途释放上传缓冲（铁律 6，实测 `A+=B err=0.5`）。`GpuEngine::eval_expr` 按 `(key,sig)` 优先命中变体，**f16 输出按 2B/元素分配缓冲并重贴 `GpuTensorF16`**（漏了 = shader 只写前半 + f32 标签 → 训练 loss=NaN）；f16 进原生引擎却无变体 → 明确报错（绝不把 f16 buffer 绑到 f32 shader）。适配层 `supports_expr_precision_variant` 前置查询：命中则直吃 f16、未命中回退边界 cast。 |
 
@@ -625,7 +625,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 | **归约 kernel** | `generate_glsl_reduce(name, spec, sig)`：输入 `float16_t` + `rd()/wr()` 在读写点统一转换（含 `emit_mm_decl` 点积、行/列两个 pass 的直接索引读、`operand()` 的视图读与广播读、输出写） | 含归约的变体可生成 |
 | **目标传递** | `GpuEngine::eval_expr_into` / `eval_expr_reduce` 带 `(key,sig)` 变体匹配（输出精度 = `dst.precision()` / `P`），f16 输出重贴 `GpuTensorF16`（归约向量形状按 raxis 取 `(rows,1)/(1,cols)`）；适配层这两入口先查 `supports_expr_precision_variant` 再回退 cast | `compute_into` / `compute_reduce` 不再必然走边界 cast |
 
-`gen_fused` 的基础结构数与变体条目数以构建输出 `[scan]`/`[gen]` 为准（变体含 scan 预测 + 回填清单，见 ⑤）。
+生成阶段 的基础结构数与变体条目数以构建输出 `[scan]`/`[gen]` 为准（变体含 scan 预测 + 回填清单，见 ⑤）。
 
 #### ④ 实测收益
 
@@ -633,7 +633,7 @@ matmul 段 / 归约 / 目标传递三类变体落地后的同窗交错实测（f
 
 #### ⑤ 运行时签名回填（当前）
 
-`[prec][miss]`（`NN_PREC_TRACE=1`）打印"请求了非零签名却没命中带类型变体"的 `(key, sig, 形态)`——这类**扫描时看不到的运行时签名**（如 Linear matmul 段的 `in=[f16,f32,f32]` 混合签名、Norm 归约链 `[f32,f16]` 输入）miss 时走边界 cast。**当前机制 = 回填清单** `tools/prec_backfill.txt`（Phase D3）：miss 复现 → 追加一行 `<key> <sig>` → `gen_fused` 对命中的 `(结构, 签名)` 额外发射变体（与 scan 变体同一代码路径，重复条目幂等去重；结构不在 bin / 生成器不支持时告警跳过）。**fold 的带类型变体已生成**（Phase D2，键 `fkey#sig`，3 输入全 f16 + 输出 f16，算术/状态进位 f32）。
+`[prec][miss]`（`NN_PREC_TRACE=1`）打印"请求了非零签名却没命中带类型变体"的 `(key, sig, 形态)`——这类**扫描时看不到的运行时签名**（如 Linear matmul 段的 `in=[f16,f32,f32]` 混合签名、Norm 归约链 `[f32,f16]` 输入）miss 时走边界 cast。**当前机制 = 回填清单** `tools/prec_backfill.txt`（Phase D3）：miss 复现 → 追加一行 `<key> <sig>` → 生成阶段 对命中的 `(结构, 签名)` 额外发射变体（与 scan 变体同一代码路径，重复条目幂等去重；结构不在注册表 / 生成器不支持时告警跳过）。**fold 的带类型变体已生成**（Phase D2，键 `fkey#sig`，3 输入全 f16 + 输出 f16，算术/状态进位 f32）。
 
 ---
 

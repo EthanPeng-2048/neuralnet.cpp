@@ -456,35 +456,30 @@ int test_expr_fold()
         }
     }
 
-    // ── 7) bin 序列化 roundtrip（v8 tri_skip 写读对称）─────────────────
+    // ── 7) 注册表去重 + key 契约（原 bin 序列化 roundtrip 的接替者）────────
+    // 原先这里验证 write_registry/read_registry 往返不丢 tri_skip 位。bin 序列化
+    // 已删除（构建期单步：scan_exprs 直接调 `generate_fused_registry`），改验
+    // 注册表自身的两条不变量：① 同结构重复 add 只留一条；② tri_skip 进 key。
     {
-        const std::string tmp = "nn_expr_fold_roundtrip.tmp.bin";
         nn::fused::ExprRegistry reg;
-        reg.add(nn::expr::make_fold_attn_o(64, 4, 2, nn::expr::AttnMaskKind::Causal, /*score_bias=*/false));   // tri_skip=true
-        reg.add(nn::expr::make_fold_attn_o(64, 4, 2, nn::expr::AttnMaskKind::Plain, /*score_bias=*/false));    // tri_skip=false
+        const nn::ExprSpec sk = nn::expr::make_fold_attn_o(
+            64, 4, 2, nn::expr::AttnMaskKind::Causal, /*score_bias=*/false);   // tri_skip=true
+        const nn::ExprSpec pl = nn::expr::make_fold_attn_o(
+            64, 4, 2, nn::expr::AttnMaskKind::Plain, /*score_bias=*/false);    // tri_skip=false
+        reg.add(sk);
+        reg.add(pl);
         reg.add(nn::expr::make_fold_rowsum(64));
-        const bool wok = nn::fused::write_registry(tmp, reg);
-        nn::fused::ExprRegistry back;
-        const bool rok = wok && nn::fused::read_registry(tmp, back);
-        std::remove(tmp.c_str());
-        check(wok && rok && back.specs.size() == reg.specs.size(),
-              "registry roundtrip 写读成功 n=" + std::to_string(back.specs.size()));
-        if (wok && rok && back.specs.size() == reg.specs.size())
-        {
-            // key 含 tri_skip 位 → 往返 key 全等即证该位与整段结构未丢
-            bool keys_ok = true;
-            bool saw_skip = false;
-            for (std::size_t i = 0; i < reg.specs.size(); ++i)
-            {
-                if (nn::expr_spec_key(back.specs[i]) !=
-                    nn::expr_spec_key(reg.specs[i]))
-                    keys_ok = false;
-                if (back.specs[i].fold && back.specs[i].fold->tri_skip)
-                    saw_skip = true;
-            }
-            check(keys_ok, "registry roundtrip key 全等（结构+tri_skip 未丢）");
-            check(saw_skip, "registry roundtrip tri_skip=true 读回仍 true");
-        }
+        const std::size_t n1 = reg.specs.size();
+        reg.add(sk);   // 重复 add → 按 key 去重
+        check(n1 == 3 && reg.specs.size() == 3,
+              "registry add 去重 n=" + std::to_string(reg.specs.size()));
+        check(nn::expr_spec_key(nn::canonicalize_expr_spec(sk)) !=
+              nn::expr_spec_key(nn::canonicalize_expr_spec(pl)),
+              "fold tri_skip（Causal vs Plain）进 key：两者 key 必须不同");
+        bool saw_skip = false;
+        for (const auto& s : reg.specs)
+            if (s.fold && s.fold->tri_skip) saw_skip = true;
+        check(saw_skip, "fold Causal → tri_skip=true 登记保留");
     }
 
     return fail;

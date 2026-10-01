@@ -59,7 +59,7 @@
 |------|------|
 | **引擎只提供 op-level 原语** | `ComputeEngine` 只能有 `matmul`/`reduce`/`broadcast`/`elementwise` 这类通用原语；**绝不允许出现 `softmax`/`attention`/`layernorm` 命名的接口** |
 | **算法文本只在 Layer** | ReLU/GeLU/Softmax/LayerNorm/Attention/CrossEntropy 的公式只写在 `compute_layer.hpp` / `compute_loss.hpp` |
-| **融合逻辑归工具/引擎内部** | `glsl_gen` / `gen_fused` / 各引擎实现负责"怎么融"，Layer 只写"是什么" |
+| **融合逻辑归工具/引擎内部** | `glsl_gen` / 生成阶段 / 各引擎实现负责"怎么融"，Layer 只写"是什么" |
 | **Shader 是引擎内部实现** | 融合 shader 只存在于 `shaders/` + 各引擎，用户不可见 |
 
 > 设计原则：**原语可以多、可以专（matmul+归约、matmul+exp+sum 都是合法原语），但原语必须"通用可复用、不叫算法名"。** 引擎可以认"结构"（`reduce(matmul(A,B))`、`matmul→softmax→matmul`），绝不认"算法名"。
@@ -82,7 +82,7 @@ graph LR
         G[GPU 实现 + 融合 shader]
     end
     E --> F & G
-    G -->|结构 key| I[scan_exprs + gen_fused 闭合世界]
+    G -->|结构 key| I[scan_exprs + 生成阶段 闭合世界]
 ```
 
 **核心机制**：Layer 用 `dsl::compute` / `compute_reduce` / `compute_into`（GPU 上折叠为 `ExprSpec`）表达算法；引擎/工具按**结构**合成融合 kernel。所有中间 Tensor 由融合 kernel 内部消解，不落 VRAM。注意力 / 稀疏 CE 等结构一律由 IR 表达（`MatmulSpec` 段、归约视图与归约指令、`FoldSpec` fold 段），`glsl_gen` 从 IR 结构统一合成。**不存在"跨表达式融合"**——运行时没有跨表达式录制机制（IR-C 不在库中，见 §表达式录制与融合边界）。
@@ -158,7 +158,7 @@ struct MatmulSpec {
 
 ## 表达式录制与融合边界
 
-本文的"表达式录制"指**构建期扫描**：`scan_exprs` dry-run 跑各 Layer 的 forward/backward，把折叠出的 `ExprSpec` 结构去重录进 `expr_specs.bin`（见 §构建工具链与闭合世界）——这是库里唯一的表达式收集机制。
+本文的"表达式录制"指**构建期收集**：`scan_exprs` 收集各 Layer 折叠出的 `ExprSpec`——**结构**由 `FusedAnchor<Expr>` 在静态初始化期按表达式类型自登记（编译期可达），**精度签名**由 dry-run / 模型 pass 执行产生（见 §构建工具链与闭合世界与 §自登记锚点）——这是库里唯一的表达式收集机制。
 
 **运行时没有跨表达式录制**：`ComputeEngine::begin_expr/end_expr`、`dsl::start_expr/end_expr`、`expr_graph.hpp`、演示层 `FusedChainLayer` 均不存在（IR-C 已移除；取舍记录见 `docs/history.md`，另见 `03-ir-optimization.md` §5.3）。融合边界 = 单个表达式的输入/输出；需要融合的长链直接写成**一个** `dsl::compute` 表达式（单个 AOT 融合 kernel）。CPU 侧表达式求值只有两套机制：**DSL 编译期模板路径 + IR 解释器**（见 `12-compute-engine-inventory.md`）。
 
@@ -230,12 +230,14 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 
 ## 构建工具链与闭合世界
 
-构建期两步（CMake 自动编排，改 Layer 内联表达式后重跑构建即可）：
+构建期**一步**（CMake 自动编排，改 Layer 内联表达式后重跑构建即可）：
 
-1. **`tools/scan_exprs.cpp`**：dry-run 跑各 Layer forward/backward，收集折叠出的 `ExprSpec` 结构（去重）→ `build/generated/expr_specs.bin`。
-2. **`tools/gen_fused.cpp`**：读 bin → `glsl_gen` 生成 GLSL → glslc → 内联 SPIR-V → `build/generated/fused_registry.hpp`。
+1. **`tools/scan_exprs.cpp`**（收集 + 生成同一进程）：
+   · **收集**：`FusedAnchor<Expr>` 在静态初始化期按表达式**类型**登记结构（编译期可达），再由 dry-run per-layer 块 + 模型级配置矩阵补精度签名；每个 `dsl::compute*` 在记录模式下把折叠出的 `ExprSpec` 登记进注册表（按 key 去重）。
+   · **生成**：`tools/fused_generate.hpp`（原 `gen_fused.cpp`）对每条 spec 出 `glsl_gen` GLSL → glslc → 内联 SPIR-V → `build/generated/fused_registry.hpp`。
+   · **不经 `.bin` 中间序列化**（`expr_registry.hpp` 的 `write_registry/read_registry/kExprBinVersion` 已删除）。
 
-`scan_exprs` 需覆盖所有 Layer 的 DSL 路径（Softmax/LN/RMSNorm fwd+bwd、CrossEntropy softmax 结构、**Attention fold 结构**——层 forward 直调 `engine.eval_expr(make_fold_attn_o(...))` 不经 DSL 钩子，scan 的显式登记块（3 掩码 × 2 偏置的 5 个组合）是 fold spec 唯一注册来源、漏组合即 GPU 闭合世界硬报错、Linear 的 matmul 段、optimizer 的 `compute_into` 原地表达式），使融合结构被收集。未命中 → `eval_expr` 现有"硬报错"逻辑，提示补进扫描（保持项目"GPU 硬报错、不降级"哲学）。
+`scan_exprs` 需覆盖所有 Layer 的 DSL 路径（Softmax/LN/RMSNorm fwd+bwd、CrossEntropy softmax 结构、**Attention fold 结构**——层 forward 直调 `engine.eval_expr(make_fold_attn_o(...))` 不经 DSL 钩子，scan 的显式登记块（3 掩码 × 2 偏置的 5 个组合）是 fold spec 唯一注册来源、漏组合即 GPU 闭合世界硬报错、Linear 的 matmul 段、optimizer 的 `compute_into` 原地表达式），使融合签名被收集。**结构**已由自登记锚点保证（见下节），未命中 → `eval_expr` 硬报错（保持项目"GPU 硬报错、不降级"哲学）。
 
 ### 自登记锚点：结构覆盖不再依赖手写清单（2026-10-01）
 
@@ -277,7 +279,7 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 |------|------|----------------|
 | **S1 IR 地基** | `ExprSpec` 增加 `MatmulSpec` + `ExprOperandKind::Matmul`；`validate_expr_spec`/`expr_spec_key`/`expr_spec_reduce_axis` 兼容 matmul 段；key 与形状无关（`k` 不进 key，`transA/transB/a_input/b_input` 进 key） | 现行；相关子测试并入聚合目标 `expr_cpu_test` |
 | **S2 CPU 正确性** | `CpuEngine::eval_expr` 支持 matmul 段（matmul 预计算 + 逐元素链，`eval_expr_reduce` 经归约指令消费 matmul 输出） | `expr_matmul_test`（`expr_cpu_test` 内）：`matmul+bias` 融合 vs 参考 |
-| **S3 GLSL 生成** | `generate_glsl_matmul`（共享内存分块 + vec4）；`gen_fused`/`scan_exprs`/`run_fused_gpu` 接入 | `expr_gpu_test`（`fused_gpu_test` 并入其中）matmul 融合用例（GPU vs CPU）；AOT 命中 |
+| **S3 GLSL 生成** | `generate_glsl_matmul`（共享内存分块 + vec4）；生成阶段/`scan_exprs`/`run_fused_gpu` 接入 | `expr_gpu_test`（`fused_gpu_test` 并入其中）matmul 融合用例（GPU vs CPU）；AOT 命中 |
 | **S4 Layer 迁移（线性）** | `Linear`/`FeedForward` 的 `matmul+bias+activation` 走 `dsl::compute`（含 matmul 段） | gradcheck / MNIST/GPT 训练回归 |
 | **S5 跨归约/跨 matmul 链** | 融合分块矩阵乘法（16×16 线程/64×64 块/4×4 寄存器分块/vec4 转置共享内存 + `eval_tail` 函数）；matmul+归约（`row_max(matmul)`、`row_sum(exp(matmul-rm))`）经 `generate_glsl_reduce` 内联点积 | 注意力相关 gradcheck |
 | **S6 自动窗口** | **不接线**——运行时没有跨表达式并入窗口（见 §跨 kernel 自动融合） | — |
@@ -290,13 +292,13 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 1. **运行时值禁进表达式常量池**：常量池的值虽已不进 `expr_spec_key`（只喂个数，`glsl_gen` 经 push constant `c<i>` 读取），但**个数**仍进 key，而 canonicalize 会**按值去重**常量——把运行期标量塞进常量池会让同一结构的 key 随取值漂移，等于每个取值组合一份 shader。运行时标量一律用 **`rparam`** 承载——注意力 `scale_`（1/√d_k）折进 Q：`dsl::compute_into(engine, leaf(Q) * rparam(scale_), Q)`（backward 的 grad_Q 相应补乘），使表达式结构与 d_k 无关；稀疏 CE 的 `inv_num_valid` 用 `dsl::rparam(inv_num_valid)` 尾链。rparam 值不进 key、个数固定，同结构不同值共享一个 shader。
 2. **BatchCol 视图要求 `(1, BH*seq)`**（doc_ids 按 (b,h) 块重复），`(1, batch*seq)` 会越界。
 3. **RowGather 主输入行数≠网格行数**（loss_vec 在 (1,N) 读 (C,N) logits），校验只查 cols。
-4. `gen_fused` `emit_spec` 的 ±inf 常量必须用 `numeric_limits`。
-5. **matmul + 列归约已支持**：`generate_glsl_reduce` 列归约分支按元素分解 batch（`batch = row/m_per`，列归约遍历全部 `rows = batch*m_per` 行，与 CPU `matmul_out` 逐列归约语义一致），`gen_fused` 不跳过该形态（扫描到的 spec 全部生成）；`expr_cpu_test::col_max(matmul)`（独立标量参考，batch=2）+ `expr_gpu_test::col_max(matmul)` 广播/归约向量/batch=2 对拍锁死（err≈1e-7）。
+4. 生成阶段 `emit_spec` 的 ±inf 常量必须用 `numeric_limits`。
+5. **matmul + 列归约已支持**：`generate_glsl_reduce` 列归约分支按元素分解 batch（`batch = row/m_per`，列归约遍历全部 `rows = batch*m_per` 行，与 CPU `matmul_out` 逐列归约语义一致），生成阶段 不跳过该形态（扫描到的 spec 全部生成）；`expr_cpu_test::col_max(matmul)`（独立标量参考，batch=2）+ `expr_gpu_test::col_max(matmul)` 广播/归约向量/batch=2 对拍锁死（err≈1e-7）。
 6. **PS 删大文件段行号易漂移**、`-replace` 多行静默失败——先 read 再 edit，删前 `git diff` 核对。
 7. `dispatch_compute`（`compute_vk_backend.hpp` 的融合 dispatch 分发函数）有多处调用点——改签名或删除时按调用点逐一核对重建。
 8. **IR 扩展**：MatmulSpec.batch（不进 key，dispatch z）、MatmulSpec.transA/transB（不进 key，运行期 operand layout → PC `mm_trans`；见"运行期 operand layout"节）、Row/Col/Batch 操作数(6/7/8)、RowGather(9)/BatchMod(10)/BatchCol(11)；注意力 forward 现为单 fold kernel（`FoldSpec`，掩码 `AttnScoreMask::mask_kind()` × 位置偏置 `PositionEncoder::has_score_bias()` 两个正交入参），bwd=掩码 → 位置偏置（独立一步）→ softmax 的 R/X 表达式+3 个 `batched_matmul`（m/l/W 表达式+bm(W,V_t) 的 S7 forward 结构已删）；CE 稠密 `denom=col_sum(exp(logits-cb(col_max)))`，稀疏 grad/loss_vec 用 Row+RowGather。
    ⚠ `dsl::row()` 是"批内行号"，其分解来自**同一 spec 里的 matmul 段**；把原本融在 matmul 表达式里的项拆成独立一步后 batch 退化为 1、`row()` 变全局行号 → 静默错值。需要批内位置时用 `(rows,1)` 行表 + `dsl::row_broadcast`（`AlibiPositionEncoder::apply_score_bias` 即此写法）。
-9. **IR-D 现只有 `GlslEmitter` 一个注册后端**（`gen_fused --list-backends` 可列）；`cpu_emitter.hpp` 不存在。
+9. **IR-D 现只有 `GlslEmitter` 一个注册后端**（`scan_exprs --list-backends` 可列）；`cpu_emitter.hpp` 不存在。
 
 ---
 
@@ -341,7 +343,7 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 
 1. `expr_spec_key` 剔除 RowMod/RotateHalf 的 param（保留 kind 与 negate_first_half）→ 同结构不同 d_k 共享一个 shader。
 2. `glsl_gen` 把这两个参数作为 push constant `vpN` 槽读取。
-3. `gen_fused`/`vk_backend` 记录并传递 vp 槽数（FusedShader 带 `view_param_count`）。
+3. 生成阶段/`vk_backend` 记录并传递 vp 槽数（FusedShader 带 `view_param_count`）。
 4. `GpuEngine::eval_expr`/`eval_expr_reduce` 按实际 spec 提取 vp 参数（`expr_spec_runtime_view_params`）传入 dispatch。
 5. 未命中硬报错，不静默回退 CPU。
 
