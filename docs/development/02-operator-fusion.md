@@ -256,7 +256,10 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
   [scan] 签名来源：dry-run 32 + 模型 pass 34 + 显式登记 0 = 66
   ```
   A/B 开关：`-DNN_SCAN_NO_ANCHOR`（关锚点）/ `-DNN_SCAN_NO_DRYRUN`（关手写块），均只影响登记集合、不改语义。
-- **run-only 签名回填仍是兜底**：`--f16 --doc-mask` 会命中一条 fold 的 5 输入形态签名（`74a6eaacc0e5d766 10007`，`[f16,f16,f16,f32,f32] out=f16`）——scan 的 fold 显式块按"掩码×偏置"登记结构，但该形态的 f16 签名只有真实 doc-mask 训练才暴露；已加入 `prec_backfill.txt`，复跑 miss=0。这是"签名必须执行期发现"的最后兜底通道。
+- **run-only 签名回填仍是兜底**：`--f16` 下有些签名只有真实训练才暴露，靠 `NN_PREC_TRACE=1` 的 `[prec][miss]` 收集后写进 `tools/prec_backfill.txt`。已完成两批：
+  1. 注意力 forward 单 fold kernel 的**文档掩码** 5 输入形态（`74a6eaacc0e5d766 10007`，`[f16,f16,f16,f32,f32] out=f16`），复现 `mem_probe --f16 --doc-mask`；
+  2. **MNIST/CNN f16 训练**的 8 条（`59e079001367d11b 10000`、`fe93c0d99c16113f 10000/10002`、`cb3d830f25b84895 10001`、`b7e6d363af1963ac 10000/10002`、`8a29d02213a0e196 10003`、`27c7edd7a0a4f808 10007`）。成因：MLP/CNN 的输入与部分中间张量在 master-weights 配方下是 **f32 存储** → 出现"f32 入 + f16 出"的混合签名，占位张量按 compute 精度造的 dry-run 预测不到；这些 miss 正是 `--f16` 训练里边界 cast（物化 f32 副本）的大头。
+  逐条复现命令写在清单注释里。**验证**：`mnist_train --arch {mlp,cnn,transformer} --f16` × `mem_probe --f16`（默认 / `--doc-mask`）共 5 个负载 **miss 全为 0**。
 - 非法结构（裸视图作根 → 空指令表）在构建期即 `_Exit(3)`，与 dry-run 同一闸门。
 - `-DNN_SCAN_NO_ANCHOR` 可关掉锚点做 A/B（只影响登记集合，不影响语义）。
 
