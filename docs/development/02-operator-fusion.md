@@ -257,7 +257,7 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 
 ### 二期关键教训（改融合/IR 代码前必读）
 
-1. **运行时值禁进表达式常量池**（进 `expr_spec_key` 会破坏闭合世界）：运行时标量一律用 **`rparam`** 承载——注意力 `scale_`（1/√d_k）折进 Q：`dsl::compute_into(engine, leaf(Q) * rparam(scale_), Q)`（backward 的 grad_Q 相应补乘），使表达式结构与 d_k 无关；稀疏 CE 的 `inv_num_valid` 用 `dsl::rparam(inv_num_valid)` 尾链。rparam 值不进 key，同结构不同值共享一个 shader。
+1. **运行时值禁进表达式常量池**：常量池的值虽已不进 `expr_spec_key`（只喂个数，`glsl_gen` 经 push constant `c<i>` 读取），但**个数**仍进 key，而 canonicalize 会**按值去重**常量——把运行期标量塞进常量池会让同一结构的 key 随取值漂移，等于每个取值组合一份 shader。运行时标量一律用 **`rparam`** 承载——注意力 `scale_`（1/√d_k）折进 Q：`dsl::compute_into(engine, leaf(Q) * rparam(scale_), Q)`（backward 的 grad_Q 相应补乘），使表达式结构与 d_k 无关；稀疏 CE 的 `inv_num_valid` 用 `dsl::rparam(inv_num_valid)` 尾链。rparam 值不进 key、个数固定，同结构不同值共享一个 shader。
 2. **BatchCol 视图要求 `(1, BH*seq)`**（doc_ids 按 (b,h) 块重复），`(1, batch*seq)` 会越界。
 3. **RowGather 主输入行数≠网格行数**（loss_vec 在 (1,N) 读 (C,N) logits），校验只查 cols。
 4. `gen_fused` `emit_spec` 的 ±inf 常量必须用 `numeric_limits`。

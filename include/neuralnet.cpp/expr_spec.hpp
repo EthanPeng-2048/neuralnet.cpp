@@ -553,9 +553,9 @@ struct ExprSpec
 }
 
 // ── 规范结构 key（AOT 收集/匹配的单一依据）──────────────────────────────
-// 把 ExprSpec 的**结构**（指令、视图、常量、寄存器数；不含输入张量）确定性地
-// 哈希成 16 位十六进制字符串。同一结构跨构建/跨调用恒得同 key，不同结构
-// 以极大概率不同。用于：
+// 把 ExprSpec 的**结构**（指令、视图、常量池**个数**、寄存器数；不含输入张量、
+// 也不含常量**值**）确定性地哈希成 16 位十六进制字符串。同一结构跨构建/跨调用
+// 恒得同 key，不同结构以极大概率不同。用于：
 //   1. 构建期 scan_exprs 注册表去重（identical 表达式只合成一个 shader）
 //   2. gen_fused 产物命名（fused_<key>）与嵌入注册
 //   3. 运行时 eval_expr 折叠内联表达式 → key → 查预编译 shader（闭合世界）
@@ -599,9 +599,12 @@ struct ExprSpec
             feed_u32(v.param2);
         }
     }
+    // 常量池：只喂**个数**（决定 push constant 布局），不喂值——常量值本身是
+    // 运行时数据（glsl_gen 把 consts 声明进 push constant、操作数发射成
+    // `c<idx>`；见 expr_glsl_gen.hpp 的 PC 声明与 ExprOperandKind::Const），
+    // 同结构不同常量值共享一个融合 shader。与 RParam 同处理。
+    // *** 常量池值进 key 会让每个取值组合都编译一份 **逐字节相同** 的 shader ***
     feed_u32(static_cast<std::uint32_t>(s.consts.size()));
-    for (const auto& c : s.consts)
-        feed(&c, sizeof(c));
     // 运行时标量参数（RParam）：只喂**个数**（结构），不喂值——值本身是
     // 运行时数据（如优化器的 lr/eps/β），不进 key；同结构不同值的表达式
     // 共享一个融合 shader（glsl_gen 把 rparams 作为 push constant 读取，

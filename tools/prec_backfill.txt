@@ -27,4 +27,4 @@ c0006fc8ea6a0e6b 0002
 
 # 注意力 forward 单 fold kernel（Phase D2：fold 带类型变体；3 输入全 f16、
 # 输出 f16 = Q/K/V 直读 + O 落回，算术/状态进位全 f32）
-9396eb8a1f95352c 10007
+66b03ef936bb97c7 10007
