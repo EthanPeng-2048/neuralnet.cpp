@@ -13,8 +13,8 @@
 //       参考；{2,133,4} 跨 EXPR_FOLD_BLOCK=128 → 多块流式 + causal 整块跳过
 //    6. validate 负例：状态吃元素源 / fold+顶层 instrs / fold+matmul /
 //       finalize 读输入 —— 四类违规必须被拒绝（静态拒而非静默错算）
-//    7. registry bin roundtrip：v8 tri_skip 写读对称（key 含该位 →
-//       往返 key 全等即证未丢；丢失=静默退化全量算、其余测试仍会绿）
+//    7. 注册表去重 + key 契约（原 bin 序列化 roundtrip 的接替者：bin 已删除）：
+//       同结构重复 add 只留一条；tri_skip（只翻该字段）与掩码 body 差异均进 key
 //  纯 CPU；输出 (rows,1)（eval_expr 的 cols 参数 = 1 调用约定）。
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -473,9 +473,21 @@ int test_expr_fold()
         reg.add(sk);   // 重复 add → 按 key 去重
         check(n1 == 3 && reg.specs.size() == 3,
               "registry add 去重 n=" + std::to_string(reg.specs.size()));
+        // tri_skip 进 key 必须**只翻该字段**来验：Causal vs Plain 的 body 本就
+        // 不同（has_causal 多 3 条 Gt/Select/Add 指令，指令序列进 key），拿它们
+        // 比 key 即使删掉 `feed(&tri_skip, 1)` 也照样"通过" = 假测试。
+        {
+            nn::ExprSpec a = sk;
+            nn::ExprSpec b = sk;
+            b.fold->tri_skip = !a.fold->tri_skip;
+            check(nn::expr_spec_key(nn::canonicalize_expr_spec(a)) !=
+                  nn::expr_spec_key(nn::canonicalize_expr_spec(b)),
+                  "fold tri_skip 进 key：同结构仅翻 tri_skip 位后 key 必须不同");
+        }
+        // 顺带锁死"不同掩码 = 不同结构"（body 差异进 key）
         check(nn::expr_spec_key(nn::canonicalize_expr_spec(sk)) !=
               nn::expr_spec_key(nn::canonicalize_expr_spec(pl)),
-              "fold tri_skip（Causal vs Plain）进 key：两者 key 必须不同");
+              "Causal vs Plain 掩码 body 不同 → key 不同");
         bool saw_skip = false;
         for (const auto& s : reg.specs)
             if (s.fold && s.fold->tri_skip) saw_skip = true;

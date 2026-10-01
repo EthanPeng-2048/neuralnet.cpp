@@ -40,14 +40,14 @@
 | `src/` | **55 个 `.cpp` / 17873 行** | 同上换 `src -Filter *.cpp` |
 | `shaders/` | **19 个 `.comp`** | `Get-ChildItem shaders -Recurse -Filter *.comp` |
 | `docs/` | **25 篇 `.md`**（本文加入前；含 `history.md` 与 `release-notes/`） | `Get-ChildItem docs -Recurse -Filter *.md` |
-| 最大源文件 | `compute_vk_backend.hpp` **5174** 行、`expr_glsl_gen.hpp` **2424**、`compute_cpu_engine.hpp` **2353**、`compute_engine.hpp` **2087**、`src/text_train.cpp` **1746**、`gui.py` **1646**（非空 1456） | 逐文件 `(Get-Content $f).Count` |
-| ctest | **19 个测试** = 18 个测试目标（`list(APPEND NN_TEST_TARGETS` 计数）+ `cnn_test_gpu` | `Select-String CMakeLists.txt -Pattern 'list\(APPEND NN_TEST_TARGETS'` |
+| 最大源文件 | `compute_vk_backend.hpp` **5246** 行、`expr_glsl_gen.hpp` **2746**、`compute_cpu_engine.hpp` **2353**、`compute_engine.hpp` **2087**、`src/text_train.cpp` **1746**、`gui.py` **1646**（非空 1456） | 逐文件 `(Get-Content $f).Count` |
+| ctest | **21 个测试** = 19 个测试目标（`list(APPEND NN_TEST_TARGETS` 计数）+ `cnn_test_gpu`（= `cnn_test --gpu`）+ `fusion_custom_layer_example`（AOT 融合端到端） | `ctest --test-dir build -N` |
 | 引擎接口 | **49 个 virtual 方法**；`L2-VIOLATIONS: 0`；宿主桥 40 处（仅披露） | `pwsh -File bench/doc_inventory.ps1` |
 | 版本 | git tag **v1.5.1**；`CMakeLists.txt` 的 `project(... VERSION 1.0.0)`；`release-notes/` 仅 `v1.5.0.md` | `git describe` + 读 `CMakeLists.txt` |
 | CI | 仅 `.github/workflows/cmake-single-platform.yml`：clang++ / Ninja / Release / `NN_ENABLE_NATIVE=OFF`，Linux + Windows；**不开 `NN_ENABLE_TESTS`、不跑 ctest** | 读该 workflow |
 
 > 口径说明：表中行数均为**总行数**；`gui.py` 另有非空 1456 行。
-> `19` 是当前唯一正确计数——仓库里同时存在"ctest 计数 19"与"ctest 20 比 20"两种表述（§3 工程化第 4 条）。
+> `21` 是当前唯一正确计数。历史上仓库里同时存在"ctest 计数 19"与"ctest 20 比 20"两种表述（§3 工程化第 4 条）——那是**计数口径不同**（是否含 `cnn_test_gpu`、以及后来新增的两个目标），2026-10-01 的 A4/A5 两轮把计数推到 21 并统一到本文与 `AGENTS.md`。
 
 ### 2.1 已经稳固的底座（本轮不再动）
 
@@ -88,7 +88,7 @@
 | E1 | CI 是唯一自动门禁，却**只编译生产目标、不编译测试、不跑 ctest** | `.github/workflows/cmake-single-platform.yml`（configure 无 `NN_ENABLE_TESTS`，无 ctest 步骤） | 所有测试结论只存在于本地；回归可在无人察觉时合入 |
 | E2 | 无 `install()` / export，无 `CMakePresets.json` | `CMakeLists.txt` 实测 `install(` 0 处；根目录无 `CMakePresets.json` | 库无法被下游 `find_package` 消费，构建参数靠口口相传 |
 | E3 | `CMakeLists.txt` 版本 1.0.0 与 git tag v1.5.1 不一致，且缺 v1.5.1 release note | `CMakeLists.txt` 的 `project(...)` 行；`docs/release-notes/` | 版本可读性缺失；分发产物无对应变更说明 |
-| E4 | 文档内 ctest 计数自相矛盾：同一份 `AGENTS.md` 内既有 19 也有 20 比 20 的表述 | `AGENTS.md` §12 | 读者无法判断哪个是当前事实（实测 19） |
+| E4 | 文档内 ctest 计数曾自相矛盾（19 vs 20） | `AGENTS.md` §12 已统一为实测 21（19 目标 + `cnn_test_gpu` + `fusion_custom_layer_example`） | 已修；口径差异来源见 §2 口径说明 |
 | E5 | `src/text_train.cpp` 1746 行、34 处 `std::exit` | 该文件（CLI 解析 + 训练循环 + TDR 恢复 + checkpoint 混杂） | 任一改动牵动全文件；恢复逻辑是 C4 的前置阻塞 |
 | E6 | 单文件多职责：`compute_vk_backend.hpp` 5174 行 | 该文件（fence / staging / dispatch / 算子混装） | header-only 项目里增量编译是主要开发成本 |
 | E7 | `README.md` 与实际不符：死链 `docs/development/07-zipt-algorithm.md`、mojibake、声称链式 `add<LayerType>()`、文档索引缺 13–17 | `README.md:21`、`:35`、`:63`、`:269`、索引表（`:23` 起） | 新用户第一入口即误导；`add<T>(args...)` 是返回 `Result<void>` 的模板方法，**无链式 API** |
@@ -141,8 +141,8 @@ P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
 
 | 项目 | 目标 | 验收口径 | 成本 | 依赖 |
 |---|---|---|---|---|
-| **P0-1 CI 真跑构建 + 测试**（最高优先） | workflow 加 `-DNN_ENABLE_TESTS=ON`，并在 Linux 与 Windows 各跑一轮 `ctest`（失败时输出完整失败日志） | GitHub Actions 绿且日志出现 19 个用例；需 Vulkan 的用例按退出码 77 记 skip 而非失败 | 小（改一个 `.yml`，约 10 行） | 无。**先于其它一切**——没有真门禁，后面所有验收都无法自动防回退 |
-| **P0-2 文档一致性回正** | ① ctest 计数统一为实测 19；② `CMakeLists.txt` 版本与 tag 对齐（或明确声明"以 tag 为准"）；③ 补 `docs/release-notes/v1.5.1.md`；④ 修 `README.md` 死链/mojibake/链式 API 声明/索引缺 13–17 | `bench/doc_align_audit.ps1` 的 [A][D][E][F] 可行动项为 0；开发文档中 ctest 计数的旧写法（ASCII 斜杠数字）零命中（历史归档 `docs/history.md` 除外） | 小–中（纯文档 + 一处 `project()` 版本号） | P0-1（否则改动无法被自动验证） |
+| **P0-1 CI 真跑构建 + 测试**（最高优先） | workflow 加 `-DNN_ENABLE_TESTS=ON`，并在 Linux 与 Windows 各跑一轮 `ctest`（失败时输出完整失败日志） | GitHub Actions 绿且日志出现 21 个用例；需 Vulkan 的用例按退出码 77 记 skip 而非失败 | 小（改一个 `.yml`，约 10 行） | 无。**先于其它一切**——没有真门禁，后面所有验收都无法自动防回退 |
+| **P0-2 文档一致性回正** | ① ctest 计数统一为实测 21（19 目标 + `cnn_test_gpu` + `fusion_custom_layer_example`）；② `CMakeLists.txt` 版本与 tag 对齐（或明确声明"以 tag 为准"）；③ 补 `docs/release-notes/v1.5.1.md`；④ 修 `README.md` 死链/mojibake/链式 API 声明/索引缺 13–17 | `bench/doc_align_audit.ps1` 的 [A][D][E][F] 可行动项为 0；开发文档中 ctest 计数的旧写法（ASCII 斜杠数字）零命中（历史归档 `docs/history.md` 除外） | 小–中（纯文档 + 一处 `project()` 版本号） | P0-1（否则改动无法被自动验证） |
 | **P0-3 BatchNorm 禁止静默回落** | `make_norm_layer` 对 `NormType::BatchNorm` **显式报错**（`Result`/fail-fast）或真正实现 BatchNorm；二选一，不允许静默降级 | 构造 batchnorm 规格必须可观测地失败或给出正确层；`bench/doc_inventory.ps1` 无关项仍 0；新增一条断言测试 | 小（显式报错）–中大（真实现） | 无。**修复本身在本文范围外（本任务只登记路线图）** |
 | **P0-4 CMake install/export + CMakePresets** | 头文件库可被 `find_package(neuralnet.cpp)` 消费；`CMakePresets.json` 固化 Release/Debug/无 Vulkan 等常用配置 | 干净目录里执行安装步骤后，最小下游工程能编译并链接出一个 Layer 示例 | 小–中 | P0-1（preset 需进 CI 才不腐化） |
 | **P0-5 推理采样 top-k / top-p + 多轮对话闭环** | 采样器支持 top-k / top-p 截断与重复惩罚；`text_infer` 暴露对应开关；GUI GPT 推理 Tab 支持多轮上下文 | 同 prompt 在 top-k / top-p 下输出可复现（同 seed）；多轮对话示例可连续交互 N 轮不丢上下文 | 中 | 无。命名冲突提醒：`--topk` 属 `mnist_infer`（`src/mnist_infer.cpp:44`），`--top` 属 `tokenizer_infer`（`src/tokenizer_infer.cpp:46`）；`text_infer` 两者都没有，新开关命名不得与它们冲突 |
@@ -238,19 +238,19 @@ ZiPT 恢复、LRLA、CUDA、分布式。
 | 基线 | 口径 | 当前值 / 复现 |
 |---|---|---|
 | build | 全绿、零告警（`-Werror`） | `cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build` |
-| ctest | **实测 19**（18 目标 + `cnn_test_gpu`）；需 Vulkan 用例退出码 77 = skip | `ctest --test-dir build` |
+| ctest | **实测 21**（19 目标 + `cnn_test_gpu` + `fusion_custom_layer_example`）；需 Vulkan 用例退出码 77 = skip | `ctest --test-dir build` |
 | L2 分层审计 | `L2-VIOLATIONS: 0`（宿主桥用量只披露） | `pwsh -File bench/doc_inventory.ps1` 第 [4] 节（实测：virtual 49 / host_bridge 40） |
 | CPU 字节锚 | `--steps 20` hash = `6f8849f14da23110` | 逐位一致 |
 | GPU 字节锚 | dev2 hash = `8ef51b2927253c50` | 逐位一致（GPU 档位按 17 §6 容差规则） |
-| scan 双 hash | `expr_specs.bin` = `bdc3a442…a58360`；`fused_registry.hpp` = `7a10412c…` | `tools/scan_exprs.cpp` + `tools/gen_fused.cpp` 产物 |
+| scan 产物 | `fused_registry.hpp`（**唯一产物**；`expr_specs.bin` 已随构建期单步删除） | `tools/scan_exprs.cpp` + `tools/fused_generate.hpp` 产物 |
 | 初值锚 | `gpu_stability_probe --init-hash` 各模型跨进程一致 | 见 `AGENTS.md` §12 当前锚 |
 | 文档对齐 | `pwsh -File bench/doc_align_audit.ps1`：[A][B][D][E][F] 可行动项为 0 | 2026-10-01 实测：可行动 0 / 历史白名单跳过 11 |
 | 行为回归 | `layer_bench` 同窗交错 + 配对 A/B，无系统性回退（噪声 ±6%） | `build/layer_bench` |
 
 ### 8.2 本轮新增门禁（P0 后生效）
 
-1. **CI 必须执行 ctest**：日志需出现 19 个用例；77 = skip 不算失败（P0-1）。
-2. **开发文档不得出现 ctest 计数的旧写法**：统一写实测 19（P0-2）。
+1. **CI 必须执行 ctest**：日志需出现 21 个用例；77 = skip 不算失败（P0-1）。
+2. **开发文档不得出现 ctest 计数的旧写法**：统一写实测 21（P0-2）。
 3. **BatchNorm 行为门禁**：构造 batchnorm 规格必须有可观测结果（报错或正确层），不允许静默降级（P0-3）。
 4. **危险精度组合门禁**：危险组合必须启动期失败（P1-3）。
 5. **审计覆盖补强**：`bench/doc_align_audit.ps1` 的 [A] 需扩展到 markdown 链接目标（E8），或由 P0-2 直接修掉已知死链。
@@ -292,5 +292,5 @@ ZiPT 恢复、LRLA、CUDA、分布式。
 | 日期 | 变更 | 依据 |
 |---|---|---|
 | 2026-10-01 | 本文建立：合并 13 号未完成条目 + 未来方向 + 裁定台账；13 号改重定向 stub | 维护者裁定 |
-| 2026-10-01 | 订正实测口径：ctest 19；`max_abs_diff` 7 份（非 9/8）；`gui.py` 1646 总行 / 1456 非空 / `collect_args` 7 处；承接原 13 §9 的两条工程教训 | Lead 与归档 owner 双重核验 |
+| 2026-10-01 | 订正实测口径：ctest 19（后于同日的 A4/A5 两轮由 19 → 20 → 21）；`max_abs_diff` 7 份（非 9/8）；`gui.py` 1646 总行 / 1456 非空 / `collect_args` 7 处；承接原 13 §9 的两条工程教训 | Lead 与归档 owner 双重核验 |
 

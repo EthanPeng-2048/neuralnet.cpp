@@ -239,19 +239,19 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 
 ### 精度签名已不是构建期集合（2026-10-01，A1）
 
-**问题**：签名（哪些输入/输出是 f16）由运行期张量精度决定、类型层面不可见，因此历史上"每个 (结构, 签名) 一份 shader"必须靠**执行**发现（dry-run 跑 f32/f16 两遍 + 模型 pass + `NN_PREC_TRACE` 回填清单）。这是扫描里唯一无法用自登记取代的部分。
+**问题（历史）**：签名（哪些输入/输出是 f16）由运行期张量精度决定、类型层面不可见，因此历史上"每个 (结构, 签名) 一份 shader"必须靠**执行**发现（dry-run 跑 f32/f16 两遍 + 模型 pass + `NN_PREC_TRACE` 回填清单）。**该问题已随"签名降级为参数"消失**，下面的实测数据保留作为历史依据。这是扫描里唯一无法用自登记取代的部分。
 
 **解法 = 把签名从「身份」降级为「参数」**：V1 变体的 GLSL 对每个输入/输出各声明 **f32 + `float16_t` 双视图**（同一 `VkBuffer` 绑两次，只解引用与真实元素类型一致的那一个），加载/存储处按 push constant `uint prec`（bit i = 输入 i 为 f16，bit16 = 输出 f16）走 **uniform 分支**。索引数学**逐字不变**（两种视图共用同一逻辑下标）→ 与旧带类型变体数值等价。
 
 于是：
-- V1 对**每个结构无条件生成** ⇒ **任何签名都命中**，运行期**不存在 miss**、**不存在边界 cast 回退**、**不存在回填清单**（`tools/prec_backfill.txt` 已删除）；
+- V1 默认对**每个结构**都尝试生成 ⇒ 一份 shader 覆盖任意签名，运行期不再需要"发现签名"；精度路径仍是三档 `key#a` → `key#x` → **基类边界 cast**（生成被 `[skip]` / `NN_SCAN_NO_DISPATCH=1` / 设备无 16bit 存储时落到 cast，`[prec][miss]` 仍会触发）；**`tools/prec_backfill.txt` 与回填工作流已删除**；
 - V2（native16，原生 f16 算术）改由**结构谓词**判定生成（代入"全输入 f16 + 输出 f16"这一常量签名），运行时按真实签名确认 —— 生成期同样不需要发现；
-- **实测 f16 扫描遍对结构贡献为 0**（`NN_SCAN_F32_ONLY` 探针：跳过它签名 66 → 0、结构恒 84）→ f16 dry-run 遍与 f16 模型 pass 已删除，扫描工作量减半。
+- **实测 f16 扫描遍对结构贡献为 0**（当时的 `NN_SCAN_F32_ONLY` 探针——该宏随删除一并移除：跳过它签名 66 → 0、结构恒 84）→ f16 dry-run 遍与 f16 模型 pass 已删除，扫描工作量减半。
 
 **端到端实测**（"写 `dsl::compute` 即自动融合"）：在 Layer 头里新写一个结构不在任何 dry-run/模型 pass 覆盖内的表达式 →
 
 ```
-[scan] 结构来源：dry-run 38（含模型 pass +25、显式登记 +8） + 锚点 60 → 合并 85（锚点独有 14）
+[scan] 结构来源：dry-run 侧 71（per-layer+显式 38、模型 pass +25、fold 显式 +8） + 锚点 60（新增 14）= 合计 85（锚点独有 14、dry-run 独有 25）
 [scan] 收集到 85 条融合表达式
 新增键：7d5efd96f337a4a9 / 7d5efd96f337a4a9#x / 7d5efd96f337a4a9#a
 ```
@@ -268,7 +268,7 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 
 - **前提 = "结构 = 表达式类型"**：为此步骤①②③把 `consts` 值、`matmul.transA/transB`、`GroupedReduce.R` 逐出 key（分别改走 push constant），并把 `GroupedReduceRef` 的 `is_max`（决定视图 kind）提为模板参数。
 - **覆盖语义**：调用点在函数体里，**函数被编译即实例化**——与运行期是否走到该分支无关，因此是"编译期可达"而非"运行期可达"。A/B 实测（`-DNN_SCAN_NO_ANCHOR`）：结构数 **71（仅 dry-run/模型 pass）→ 84（+锚点）**，多出的 13 条都是编译进来的真实调用点（含 matmul、归约、16 个 vp 槽的宽表达式等）。
-- **两者互补，不冗余**（`NN_SCAN_DUMP_SOURCES=1` 逐条打印来源，实测 84 条）：per-layer dry-run 38（含模型 pass +25、显式登记 +8）、锚点 59，**重叠 46 → 锚点独有 13、dry-run 独有 25**。所以**单独删任何一方都会丢结构**：
+- **两者互补，不冗余**（`NN_SCAN_DUMP_SOURCES=1` 逐条打印来源，实测 84 条）：per-layer+显式登记 38 + 模型 pass 25 + fold 显式 8 = **dry-run 侧 71**、锚点 59，**重叠 46 → 锚点独有 13、dry-run 独有 25**（口径：三段互不重叠；打印行见下）。所以**单独删任何一方都会丢结构**：
   - **dry-run 独有 25 条**按形态分：**fold 8 条**（= 显式登记的掩码×偏置组合与通用 fold 样例，见下）、**含 matmul 段 7 条**（注意力反向 / CE / 优化器步）、**RowAccess(12) 4 条**（共享内存 SwiGLU 的半偏移行切分）、**RowGather(9)/ColBroadcast(8) 若干**（稀疏 CE 的 5 视图形态 `[0,8,8,8,8]` 等）——共同点是**结构由运行期配置决定**（视图种类/项数/掩码组合），类型层面推不出来，符号实例 `Expr{}` 与真实实例会折叠出**不同 key**（实测存在"视图种类与指令数完全相同、只有 key 不同"的镜像对，如 dry-only `784781c7b82fa76c` ↔ anchor-only `28cdf7c6d5df0e1d`）。
   - **锚点独有 13 条**是镜像面：dry-run/模型 pass 没跑到的编译期可见调用点（最著名的是 `9ca81b4967cdfa20`——关掉锚点后 `text_infer` KV-cache 增量解码在 GPU 上闭合世界硬报错）。
   - **结论**：dry-run + 模型 pass 是结构的主要来源，**删不掉**；锚点补它跑不到的部分。这也是"扫描步骤本身无法删除"的精确根因。
@@ -281,7 +281,7 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
   保留的是**整模型跑不到**的来源：优化器（5 变体）、损失（MSE / CE 稠密 / CE 稀疏）、RoPE `apply_step`（增量推理）、CSA×4（掩码/偏置组合，含模型未覆盖的 doc 变体）、MHA、以及 `scan_exprs` 内的**显式测试覆盖登记**（matmul+bias+relu / bmm_reduce / reduce_consts）。
 - **常驻分项台账**（每次构建打印，结构侧）：
   ```
-  [scan] 结构来源：dry-run 38（含模型 pass +25、显式登记 +8） + 锚点 59 → 合并 84（锚点独有 13、dry-run 独有 25）
+  [scan] 结构来源：dry-run 侧 71（per-layer+显式 38、模型 pass +25、fold 显式 +8） + 锚点 59（新增 13）= 合计 84（锚点独有 13、dry-run 独有 25）
   ```
   A/B 开关：`-DNN_SCAN_NO_ANCHOR`（关锚点）/ `-DNN_SCAN_NO_DRYRUN`（关 dry-run/模型 pass），均只影响登记集合、不改语义。逐条来源用 `NN_SCAN_DUMP_SOURCES=1` 打印（`[scan][dry-only]` / `[scan][anchor-only]` + 结构摘要）。
 - **run-only 签名回填已删除**（A1e）：`--f16` 下曾有一批只有真实训练才暴露的签名（注意力 fold 的文档掩码 5 输入形态、MNIST/CNN f16 训练的 8 条"f32 入 + f16 出"混合签名），靠 `NN_PREC_TRACE=1` 的 `[prec][miss]` 收集后写进 `tools/prec_backfill.txt`。**该清单与其工作流已随 A1 整体删除**——V1 分派 shader 覆盖任意签名，f16 训练实测 `miss=0` 且边界 cast 归因表为空。历史清单条目与复现命令归档在 `docs/history.md`。
