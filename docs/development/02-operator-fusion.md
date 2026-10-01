@@ -260,6 +260,10 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
   1. 注意力 forward 单 fold kernel 的**文档掩码** 5 输入形态（`74a6eaacc0e5d766 10007`，`[f16,f16,f16,f32,f32] out=f16`），复现 `mem_probe --f16 --doc-mask`；
   2. **MNIST/CNN f16 训练**的 8 条（`59e079001367d11b 10000`、`fe93c0d99c16113f 10000/10002`、`cb3d830f25b84895 10001`、`b7e6d363af1963ac 10000/10002`、`8a29d02213a0e196 10003`、`27c7edd7a0a4f808 10007`）。成因：MLP/CNN 的输入与部分中间张量在 master-weights 配方下是 **f32 存储** → 出现"f32 入 + f16 出"的混合签名，占位张量按 compute 精度造的 dry-run 预测不到；这些 miss 正是 `--f16` 训练里边界 cast（物化 f32 副本）的大头。
   逐条复现命令写在清单注释里。**验证**：`mnist_train --arch {mlp,cnn,transformer} --f16` × `mem_probe --f16`（默认 / `--doc-mask`）共 5 个负载 **miss 全为 0**。
+- **契约回归**：上述三条 key 语义 + "符号实例 key ≡ 真实实例 key" 由
+  `src/expr_fused_key_test.cpp` 锁定（并入 `expr_cpu_test` 聚合目标，ctest 目标数不变）。
+  任一条被违反（有人重新引入"运行期值决定结构"）→ 运行时 key 与登记 key 不一致
+  → 闭合世界 miss；测试会立刻红。
 - 非法结构（裸视图作根 → 空指令表）在构建期即 `_Exit(3)`，与 dry-run 同一闸门。
 - `-DNN_SCAN_NO_ANCHOR` 可关掉锚点做 A/B（只影响登记集合，不影响语义）。
 
