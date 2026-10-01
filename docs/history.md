@@ -68,7 +68,18 @@ expr_opt / expr_registry / expr_spec）「历史状态类注释」摘录。整�
 - **它是什么**：融合 shader **逐形态** GPU 对拍——rope / swiglu / gelu / softmax / matmul / matmul+列归约 / norm / reduce_consts / **fold v1**（rowmax/rowsum/softmax_denom）/ **fold attn**（plain/causal/alibi/doc/alibidoc × 5 种形状）/ **未扫描表达式硬报错**。正是 AOT 融合最核心的回归面。
 - **处置**：接入构建（`nn_add_executable` + `list(APPEND NN_TEST_TARGETS ...)`，CMakeLists 紧邻 `expr_gpu_test`）。
 - **实测**：编译零告警、输出 `ALL PASS`、退出码 0；接入后 **ctest 20 → 21**（19 个测试目标 + `cnn_test_gpu` + `fusion_custom_layer_example`），21/21 全绿。
-- **仍存在的缺口（未修，记录在案）**：该文件 **0 处 f16 引用** ⇒ 它覆盖的是 **V0（全 f32）** 逐形态路径，**不覆盖 V1 运行期精度分派（`key#x`）**。V1 目前只有 7 个真实 f16 负载（`NN_PREC_TRACE=1` 实测 `[prec][miss]=0`）与样例的第二形态在压测它，**没有逐形态的数值断言**。若将来要补，做法是给该文件的每个 form 加一个 f16 变体（CPU 参考 + GPU f16，容差按 f16）。
+- **该文件的边界（round 19 实测更正）**：它 **0 处 f16 引用** ⇒ 覆盖的是 **V0（全 f32）** 逐形态路径。
+  - ⚠ **曾据此误判**为"V1 无覆盖、无逐形态数值断言"——**该结论是错的**，见下条：V1 由 `f16_precision_test` 覆盖（20 条结构、四大生成器族、`CHECK_NEAR` 容差断言）。本文件缺的是"**本套件的** rope/swiglu/gelu/softmax/fold-attn 形状的 f16 变体"，不是"V1 无覆盖"。
+
+## `NN_PREC_TRACE` 对 V1 是盲的（2026-10-01，round 19）
+
+- 类型：已修复缺陷（诊断不对称 → 直接导致一次错误判断）
+- **发现过程**：想量"V1 逐形态覆盖"，用 `NN_PREC_TRACE=1` 跑 6 个 GPU 测试，得到 **0 条 `#x`**、只有 4 条 `#a`。做**对照实验**（跑已知必然走 V1 的库外样例——它含 rparam ⇒ native16 结构谓词不通过）——**样例也一行都不打** ⇒ 说明是**测量工具**瞎，不是"V1 没被用"。
+- **根因**：`compute_gpu_engine.hpp::find_prec_variant_` 的 `[prec][alu-hit]` 打印**只写在 V2（`#a`）分支**（原 1391-1392 行），V1（`#x`）分支与 V0 分支都**静默返回**。
+- **处置**：V1 分支补同款日志（V0 默认路径**仍不记**——f32 热路径逐调用打日志会淹没输出）。现规则：**变体选择事件（V1/V2）一律打日志**。
+- **修正后的实测（`f16_precision_test` 单测即可）**：12040 次分派、**24 条 distinct 结构 = 20 条 V1（`#x`）+ 4 条 V2（`#a`）**；V1 的 20 条**覆盖全部四个生成器族**：元素 9 / 归约 6 / matmul 4 / fold 1。该测试用 `CHECK_NEAR` 容差断言 ⇒ **V1 有真实的逐结构数值覆盖**，"V1 无覆盖"不成立。
+- **顺带**：`scan_exprs` 的来源 dump 新增 `[scan][both]`（锚点∩dry-run 交集，原 84 条里 38 条落在这里）——否则"某结构由哪个生成器负责、运行时是否按 V1 分派"无法从 dump 回答（V1 覆盖的 20 条里 18 条在交集中）。
+- **教训（本会话第二次）**：一个覆盖/一致性结论在写进文档前，**必须先有一个已知必然命中/必然不命中的对照样本**。上一次是"镜像对"（粗摘要相同但指令序列不同），这一次是"trace 对 V1 盲"。
 
 ## 「锚点 vs dry-run」边界实测刻画（2026-10-01，round 15）
 
