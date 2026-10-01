@@ -243,15 +243,20 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 
 - **前提 = "结构 = 表达式类型"**：为此步骤①②③把 `consts` 值、`matmul.transA/transB`、`GroupedReduce.R` 逐出 key（分别改走 push constant），并把 `GroupedReduceRef` 的 `is_max`（决定视图 kind）提为模板参数。
 - **覆盖语义**：调用点在函数体里，**函数被编译即实例化**——与运行期是否走到该分支无关，因此是"编译期可达"而非"运行期可达"。A/B 实测（`-DNN_SCAN_NO_ANCHOR`）：结构数 **72（仅 dry-run）→ 84（+锚点）**，多出的 12 条都是编译进来的真实调用点（3 条含 matmul、1 条归约、1 条 16 个 vp 槽的宽表达式、其余逐元素）。
-- **常驻台账**：锚点登记进独立注册表 `anchor_registry()`，`scan_exprs` 末尾合并并打印 `结构来源：dry-run 72 + 锚点 59 → 合并 84（锚点独有 12）`。**锚点独有数突然变大 = 有新的层路径没纳入 dry-run**（该数字是回归信号）。
+- **常驻台账**：锚点登记进独立注册表 `anchor_registry()`，`scan_exprs` 末尾合并并打印来源分项（见下）。**锚点独有数突然变大 = 有新的层路径没纳入任何驱动**（回归信号）。
 - **只登记结构（sig=0）**：⚠ **精度签名登记不出来**——同一个表达式里"哪些输入是 f16"由运行期张量精度决定（类型层面不可见）。实测扫描出的 60 个带类型变体里只有 16 个是"全 f16 输入+输出"，其余 44 个是混合签名（`0x0001/0x0003/0x10005…`）。故 f16 带类型变体**必须**由 profile_f32/profile_f16 两遍 dry-run（或运行期 `NN_PREC_TRACE` + `prec_backfill.txt`）产生，**自登记无法取代它**。
-- **模型级签名 pass**（补签名覆盖）：per-layer dry-run 块只覆盖"层被单独造出来"的路径；有些调用点只在**完整模型**里才执行（GPT/RAPT 的 LM head、PatchEmbedding、模型级位置编码等）。`scan_exprs` 因此在两个 profile 下各跑一遍**配置矩阵**：`mnist_mlp`×{LayerNorm,RMSNorm,BatchNorm}、`mnist_transformer`(ViT)、`cnn`×{pool2,pool3}、`gpt`×{Learned,ALiBi,Sinusoidal,RoPE}×{GeLU,SwiGLU}×{LayerNorm,RMSNorm}、`rapt`×{causal,bidir}（小配置 vocab=64/d_model=16/seq=8/H=2/d_ff=32/L=2；id 输入须填合法 token 值）。实测：**签名 +13**（73 条），`prec_backfill.txt` 的"运行期才发现的签名"由 **7/7 降到 2/7**。该 pass 失败只打 `[scan][warn]` 不中断构建（它是增量，主路径已由 dry-run + 锚点覆盖）。
+- **模型级签名 pass**（补签名覆盖）：per-layer dry-run 块只覆盖"层被单独造出来"的路径；有些调用点只在**完整模型**里才执行（GPT/RAPT 的 LM head、PatchEmbedding、模型级位置编码等）。`scan_exprs` 因此在两个 profile 下各跑一遍**配置矩阵**：`mnist_mlp`×{LayerNorm,RMSNorm,BatchNorm}、`mnist_transformer`(ViT)、`cnn`×{pool2,pool3}、`gpt`×{Learned,ALiBi,Sinusoidal,RoPE}×{GeLU,SwiGLU}×{LayerNorm,RMSNorm}、`rapt`×{causal,bidir}（小配置 vocab=64/d_model=16/seq=8/H=2/d_ff=32/L=2；id 输入须填合法 token 值）。该 pass 失败只打 `[scan][warn]` 不中断构建（它是增量，主路径已由 dry-run + 锚点覆盖）。
+- **已验证可删：13 个 per-layer dry-run 块（−223 行）**。模型 pass 覆盖了这些层路径后，`scan_exprs` 里 ReLU/SwiGLU/GeLU/Softmax/RMSNorm/LayerNorm/RLA(causal+bidir)/GPTBlock/TransformerEncoderLayer/Linear/Conv2D/MaxPool2D 的独立 dry-run 块**已删除**，判据是两条硬证据：
+  1. **结构集合逐字节不变**（84 条，bin 内容一致）；
+  2. **运行时 miss 集合不变**：`NN_PREC_TRACE=1 mem_probe --f16` 的 5 个工作负载（默认 / `--doc-mask` / `--checkpoint-every 2` / `--optimizer muon` / `--activation-offload`）在删除前后都是同一个 miss（仅 fold doc-mask 一条，见下）。
+  保留的是**整模型跑不到**的来源：优化器（5 变体）、损失（MSE / CE 稠密 / CE 稀疏）、RoPE `apply_step`（增量推理）、CSA×4（掩码/偏置组合，含模型未覆盖的 doc 变体）、MHA、以及 `scan_exprs` 内的**显式测试覆盖登记**（matmul+bias+relu / bmm_reduce / reduce_consts）。
 - **常驻分项台账**（每次构建打印）：
   ```
-  [scan] 结构来源：dry-run 64（含模型 pass +0、显式登记 +8） + 锚点 59 → 合并 84（锚点独有 12）
-  [scan] 签名来源：dry-run 60 + 模型 pass 13 + 显式登记 0 = 73
+  [scan] 结构来源：dry-run 38（含模型 pass +25、显式登记 +8） + 锚点 59 → 合并 84（锚点独有 13）
+  [scan] 签名来源：dry-run 32 + 模型 pass 34 + 显式登记 0 = 66
   ```
-  A/B（`-DNN_SCAN_NO_DRYRUN` 关掉手写 per-layer 块）只剩 **76 结构 / 50 签名** → 即那批手写块目前仍贡献 **8 结构 + 23 签名**（其中 5 个结构是 `scan_exprs` 内的**显式测试覆盖登记**（matmul+bias+relu / bmm_reduce / reduce_consts），不是层 dry-run）。这两行是"手写清单还差多少才能删"的度量。
+  A/B 开关：`-DNN_SCAN_NO_ANCHOR`（关锚点）/ `-DNN_SCAN_NO_DRYRUN`（关手写块），均只影响登记集合、不改语义。
+- **run-only 签名回填仍是兜底**：`--f16 --doc-mask` 会命中一条 fold 的 5 输入形态签名（`74a6eaacc0e5d766 10007`，`[f16,f16,f16,f32,f32] out=f16`）——scan 的 fold 显式块按"掩码×偏置"登记结构，但该形态的 f16 签名只有真实 doc-mask 训练才暴露；已加入 `prec_backfill.txt`，复跑 miss=0。这是"签名必须执行期发现"的最后兜底通道。
 - 非法结构（裸视图作根 → 空指令表）在构建期即 `_Exit(3)`，与 dry-run 同一闸门。
 - `-DNN_SCAN_NO_ANCHOR` 可关掉锚点做 A/B（只影响登记集合，不影响语义）。
 
