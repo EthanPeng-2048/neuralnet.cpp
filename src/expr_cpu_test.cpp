@@ -45,9 +45,9 @@
 
 // ── expr_fused_key_test（"结构 = 表达式类型"：AOT 自登记的 key 契约）────────
 #define main test_fused_key
-#define g_fail_fk g_fail_fused_key
+#define g_fail g_fail_fused_key
 #include "expr_fused_key_test.cpp"
-#undef g_fail_fk
+#undef g_fail
 #undef main
 
 int main()

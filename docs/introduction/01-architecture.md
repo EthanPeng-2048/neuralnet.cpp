@@ -290,7 +290,7 @@ class Tensor {
 | `eval_expr` | `ComputeEngine` 虚接口：CPU 编译期模板求值（经 `dsl::compute`）；Vulkan 按 `expr_spec_key` 查 `fused_registry`（闭合世界，未命中硬报错，无 eager、无运行时编译） |
 | `dsl::compute(engine, expr, rows, cols)` | 统一求值入口：CPU 走编译期模板；GPU 折叠成 `ExprSpec` → `eval_expr` 按 key AOT 分发 |
 
-> **AOT 收集原则**：表达式**文本只出现在 Layer**（内联写进 `forward/backward`）。构建期 `scan_exprs` 收集折叠后的 `ExprSpec` 结构（派生物，非手写定义）：**结构**由 `FusedAnchor<Expr>` 按表达式类型自登记（编译期可达，dry-run 跑不到的分支也覆盖），**精度签名**由 dry-run/模型 pass 执行产生；随后同进程合成融合 shader 并内联进 `fused_registry.hpp`。运行时按 key 精确匹配 dispatch，最终程序自包含、无运行时编译器。**登记方式例外**：注意力 fold spec 由 `make_fold_attn_o`（定义在 `compute_layer_attention.hpp`，与 Layer 其余表达式同住）构造、层直调 `engine.eval_expr` 不经 DSL 钩子——其登记来自 `scan_exprs` 的显式块，**掩码（`AttnMaskKind`）× 位置偏置（`bool score_bias`）两个正交维度的 5 个实际组合必须全部列出**（漏登记 = GPU 闭合世界硬报错）。通用 fold 样例构造在 `expr_fold.hpp`，不含注意力语义。
+> **AOT 收集原则**：表达式**文本只出现在 Layer**（内联写进 `forward/backward`）。构建期 `scan_exprs` 只收集折叠后的 `ExprSpec` **结构**（派生物，非手写定义）：由 `FusedAnchor<Expr>` 按表达式类型自登记（编译期可达，dry-run 跑不到的分支也覆盖），再由 dry-run / 模型 pass 补齐运行期配置相关的结构；随后同进程为每个结构发三份 shader（全 f32 / **运行期精度分派** `key#x` / native16 `key#a`）并内联进 `fused_registry.hpp`。**精度签名不是构建期集合**——分派 shader 声明输入/输出双视图、按 PC `prec` 走 uniform 分支，覆盖任意签名，故运行时无 miss、无边界 cast 回退、无回填清单。运行时按 key 精确匹配 dispatch，最终程序自包含、无运行时编译器。**登记方式例外**：注意力 fold spec 由 `make_fold_attn_o`（定义在 `compute_layer_attention.hpp`，与 Layer 其余表达式同住）构造、层直调 `engine.eval_expr` 不经 DSL 钩子——其登记来自 `scan_exprs` 的显式块，**掩码（`AttnMaskKind`）× 位置偏置（`bool score_bias`）两个正交维度的 5 个实际组合必须全部列出**（漏登记 = GPU 闭合世界硬报错）。通用 fold 样例构造在 `expr_fold.hpp`，不含注意力语义。
 
 ### L3 实现层
 

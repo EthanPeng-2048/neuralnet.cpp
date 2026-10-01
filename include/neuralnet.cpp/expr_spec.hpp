@@ -121,8 +121,10 @@ enum class ExprOperandKind : uint8_t
     // 修正系数），不是表达式结构 → 不进 expr_spec_key；同结构不同值的
     // 表达式（如不同 lr、每步变化的 inv_bc）共享一个融合 shader，运行时
     // 按实际 spec 填充 push constant。
-    // 与 Const 的区别：Const 值进 key（结构）、编译期不变；RParam 值不进
-    // key（运行时）、CPU 求值用 spec.rparams[idx]、GPU 经 PC 传入。
+    // 与 Const 的区别：两者**都不进 key**（值都是运行时数据）；差别只在
+    // 载体——Const 是每结构固定的小常量池（PC `c<i>`）、RParam 是可每步变化的
+    // 标量槽（PC `rp<i>`）；CPU 求值分别取 spec.consts[idx] / spec.rparams[idx]。
+    // （历史：Const 值曾进 key，与 RParam 不对称且导致同结构重复编译，已改。）
     RParam = 9,
     // ── fold 行向量态操作数：按当前输出列 d 读行向量态[idx][d]──
     // 仅允许出现在 fold 的 finalize（向量域逐列求值）；idx 恒 0（单槽，
@@ -720,12 +722,56 @@ using ExprPrecSig = std::uint32_t;
 [[nodiscard]] inline constexpr bool expr_prec_sig_is_f32(ExprPrecSig s) noexcept
 { return s == 0u; }
 
+// ── 运行期精度分派（V1 形态）哨兵 ────────────────────────────────────────
+// 语义：**同一份 shader 处理任意 (输入精度位图, 输出精度)**——每个操作数
+// 声明 f32 / float16_t 双视图（binding i 与 n_inputs+i），加载/存储处按
+// push constant `uint prec`（逐位）走 uniform 分支选择。
+//
+// 与"带类型变体"（sig = 真实位图）的区别：
+//   · 带类型变体：精度是**身份**（key 含 `#xxxx`），必须先知道有哪些签名
+//     → 只能靠 dry-run 执行期发现 → 需要回填清单；
+//   · 运行期分派：精度是**参数**（PC `prec`），一个结构一份 shader 覆盖全部
+//     签名 → 不需要发现 → 构建期只需"结构"这一维（锚点已自动）。
+//
+// 哨兵取值落在输入字段（bit 0..15）与输出位（bit 16）之外 —— 因此谓词
+// expr_prec_sig_in_f16 / expr_prec_sig_out_f16 对它一律返回 false，旧路径不会
+// 被误触发。⚠ 该结论**依赖 in_f16 把入参先与 EXPR_PREC_SIG_INPUT_MASK 相与**
+// （否则 bit 17 会被读成"第 17 个输入是 f16"）。
+inline constexpr ExprPrecSig EXPR_PREC_SIG_DISPATCH = 0x00020000u;
+
+[[nodiscard]] inline constexpr bool expr_prec_sig_is_dispatch(ExprPrecSig s) noexcept
+{ return s == EXPR_PREC_SIG_DISPATCH; }
+
+// 运行期分派变体的 key 后缀（结构 key + "#x"）。#x 不含 [0-9a-f] 之外的
+// 字符，且既有变体后缀是 "#%04x" / "#a"，不会碰撞。
+inline constexpr const char* EXPR_PREC_DISPATCH_SUFFIX = "#x";
+// native16（原生 f16 算术，见 expr_prec_sig_native16）变体的 key 后缀。
+inline constexpr const char* EXPR_PREC_ALU_SUFFIX = "#a";
+
 // 第 i 个输入是否为 f16 / 输出是否为 f16
+// ⚠ in_f16 必须先与 EXPR_PREC_SIG_INPUT_MASK 相与：EXPR_PREC_SIG_DISPATCH
+// （0x00020000）是**哨兵**而非位图，不对齐输入字段就会把 bit 17 读成
+// "第 17 个输入是 f16"（EXPR_MAX_INPUTS=16 时侥幸为假，改上限即踩雷）。
 [[nodiscard]] inline constexpr bool expr_prec_sig_in_f16(ExprPrecSig s,
                                                          std::size_t i) noexcept
-{ return i < 32u && ((s >> i) & 1u) != 0u; }
+{
+    return i < EXPR_PREC_SIG_OUT_BIT &&
+           ((s & EXPR_PREC_SIG_INPUT_MASK) >> i & 1u) != 0u;
+}
 [[nodiscard]] inline constexpr bool expr_prec_sig_out_f16(ExprPrecSig s) noexcept
 { return ((s >> EXPR_PREC_SIG_OUT_BIT) & 1u) != 0u; }
+
+// 变体的**实际输出存储精度**：运行期分派变体（`key#x`）按运行期真实签名
+// （bit16）决定，其余变体（V0 / `key#a`）按变体自身的身份签名决定。
+// 各 eval 入口共用本函数——同一条规则手写四处时写错一处，就会出现
+// "输出缓冲按 4B 分配、shader 却按 2B 写"这类静默错值。
+[[nodiscard]] inline constexpr bool expr_variant_out_f16(ExprPrecSig variant_sig,
+                                                         ExprPrecSig runtime_sig) noexcept
+{
+    return expr_prec_sig_is_dispatch(variant_sig)
+        ? expr_prec_sig_out_f16(runtime_sig)
+        : expr_prec_sig_out_f16(variant_sig);
+}
 
 // 变体索引 key：全 f32 → 结构 key 本身；否则加 "#xxxx"
 [[nodiscard]] inline std::string expr_prec_sig_key(const std::string& spec_key,
@@ -738,19 +784,7 @@ using ExprPrecSig = std::uint32_t;
     return spec_key + buf;
 }
 
-// native16（原生 f16 算术）变体键 = 签名键再加 "#a" 后缀（如
-// "644a...#10001#a"）。与 f32 算术变体（"644a...#10001"）**并存**：
-// 后端按设备 shaderFloat16 能力决定创建哪个 pipeline，运行时优先命中
-// native16 键、回退 f32 算术键（设备无 ALU 能力时走 f32 算术键）。结构 key 与 sig 均为
-// hex 字符串，"#a" 后缀不可能与任何普通键碰撞（普通键只含 [0-9a-f#] 且以
-// sig hex 结尾）。
-[[nodiscard]] inline std::string expr_prec_sig_alu_key(const std::string& spec_key,
-                                                       ExprPrecSig sig)
-{
-    return expr_prec_sig_key(spec_key, sig) + "#a";
-}
-
-// 诊断用：把签名渲染成 "in=[f16,f32,...] out=f16"
+// ── 诊断用：把签名渲染成 "in=[f16,f32,...] out=f16"
 [[nodiscard]] inline std::string expr_prec_sig_str(ExprPrecSig sig,
                                                    std::size_t num_inputs)
 {

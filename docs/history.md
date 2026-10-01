@@ -40,6 +40,86 @@ expr_opt / expr_registry / expr_spec）「历史状态类注释」摘录。整�
 原理、契约与理由；本文件保存被移出的历史叙事（bug 根因、被否决方案、性能 A/B 过程、
 删除清单），供追溯用。
 
+## 精度签名从构建期枚举 → 运行期参数（2026-10-01，分支 `feat/fused-runtime-prec-dispatch`）
+
+- 类型：演进记录 / 删除清单 / 性能 A/B
+- **背景（被取代的机制）**：精度签名（哪些输入/输出是 f16，`ExprPrecSig`）由运行期张量精度决定、类型层面不可见，因此"每个 (结构, 签名) 一份 shader"必须靠**执行**发现。旧链路 = `FusedAnchor` 只登记结构 + dry-run `profile_f32`/`profile_f16` **两遍** + 模型级配置矩阵两个 profile + `NN_PREC_TRACE=1` 的 `[prec][miss]` → 手工写 `tools/prec_backfill.txt` → 重新构建。清单曾有两批：注意力 fold 文档掩码 5 输入形态（`74a6eaacc0e5d766 10007`）、MNIST/CNN f16 训练 8 条"f32 入 + f16 出"混合签名（`59e079001367d11b 10000`、`fe93c0d99c16113f 10000/10002`、`cb3d830f25b84895 10001`、`b7e6d363af1963ac 10000/10002`、`8a29d02213a0e196 10003`、`27c7edd7a0a4f808 10007`）。旧注册表 84 结构 + 86 签名变体 = 170 条 / 3.43 MB。
+- **新机制**：V1「运行期精度分派」shader（键 `key#x`）对每个输入/输出各声明 f32 + `float16_t` **双视图**（同一 `VkBuffer` 绑两次，只解引用与真实元素类型一致的那一个），加载/存储按 push constant `uint prec` 走 uniform 分支；**索引数学逐字不变** ⇒ 与旧带类型变体数值等价。native16 改按**结构谓词**生成（键 `key#a`，代入"全输入 f16 + 输出 f16"常量签名）。新注册表 84 结构 + 84 分派 + 35 native16 = 203 条 / 4.36 MB。
+- **删除清单**：`tools/prec_backfill.txt`（整文件）、`scan_exprs` 的 f16 dry-run 遍与 f16 模型 pass、"没有带类型变体 / 用 NN_PREC_TRACE 回填"提示、`supports_expr_precision_variant` 里的 (key,sig) 探测、旧 `key#<sighex>` 变体发射与 run-only 回填分支。
+- **性能 A/B（决定 A 而非 B 的依据）**：曾实测「同质化 + 边界 cast」（方案 B，数值与混合变体等价）在 GPT f16 1 epoch / `tinystories_smoke` / 40HX 上为 4.1s vs 变体路径 4.0/3.9s（**≈+4%**，38 个签名落回 cast）；但 B 会给含 f16 输入的表达式造 f32 临时量、推高 f16 峰值显存，故最终选 A（运行期分派，显存不涨）。
+- **实测验收**：build 零告警；ctest 19/19；CPU 锚 `6f8849f14da23110` / GPU dev2 锚 `8ef51b2927253c50` 逐位不变；GPT f16 训练 `NN_PREC_TRACE=1` → `[prec][miss]=0`、边界 cast 归因表为空、`[prec][alu-hit]` 6670；**f16 扫描遍对结构贡献为 0**（`NN_SCAN_F32_ONLY` 探针：跳过它签名 66 → 0、结构恒 84）；**端到端**：Layer 头里新写一个 dry-run 覆盖不到的结构 → 锚点 59→60、结构 84→85、注册表 +`key`/`key#x`/`key#a`，**其他文件零改动**。
+- **未做（另案）**：把"收集 + 生成"做成库自带 CMake 能力 `nn_enable_gpu_fusion(target)`（下游自定义层）。**结构侧的关键约束已测明**：84 个结构里只有 13 个来自锚点，71 个来自 dry-run/模型 pass ⇒ 该收集器**必须保留模型 pass**，做不到"30 行纯锚点收集器"。
+
+## 库自带的融合能力 `nn_enable_gpu_fusion`（2026-10-01，A2）
+
+- 类型：演进记录 / 新增能力
+- **背景（缺口）**：本库 header-only，但 `fused_registry.hpp` 的生成**绑死在本仓库**（`CMakeLists.txt` 硬编码 `tools/scan_exprs.cpp` + `tools/prec_backfill.txt`，且 `nn_core` 无 install/导出）——库外使用者写自己的 `dsl::compute` 后**没有任何合法途径**产出自己的注册表，只能 fork。这是"导入头文件即可用"真正卡住的地方。
+- **落地**：CMake 函数 `nn_enable_gpu_fusion(<target> MAIN <含 main 的源> [OUT_DIR <目录>])`。收集器 = **库内收集逻辑**（`tools/scan_exprs.cpp`）+ **本目标的全部 TU**（`-DNN_EXPR_SCAN` 编译，令使用者调用点经 `FusedAnchor` 自登记）链接成一个可执行文件，产物目录只作该目标的私有 include 目录。样例 `examples/fusion_custom_layer{,.hpp,_main.cpp}`（"库外使用者"形态：自定义层 + 一行 CMake）。
+- **实测**：样例目标的注册表 = 库内 203 条 + 自研层 `94a2cc052598fe09` / `94a2cc052598fe09#x`（该表达式含 rparams → native16 谓词不通过，无 `#a`，符合预期）；样例可执行文件运行结果与期望值 `0.6712035` 逐位一致。库内文件零改动。
+- **顺带修的 header-only 缺陷**：`backend/compute_vk_backend.hpp` 的 `GpuBuffer::~GpuBuffer()` 类外定义**缺 `inline`** → 任何 ≥2 个 TU 的程序链接期 `duplicate symbol`（样例两 TU 复现）。已加 `inline`。这条此前从未暴露，因为库自身的可执行目标都是单 TU。
+- **GPU 端到端验收（本轮补齐）**：样例原先只验 CPU——而 CPU 走模板求值、与注册表无关，等于**没验到本 PR 的核心机制**。补上 GPU 后实测：CPU f32 `0.6712035`（差 0）；GPU f32（V0）`0.6712036`（差 5.96e-08）；**GPU f16（V1 运行期精度分派）`0.6708984`（差 3.05e-04，f16 舍入内）**。该表达式含 rparams ⇒ `expr_prec_sig_native16` 谓词不通过 ⇒ f16 那一跑命中的必然是 `key#x` 分派 shader；注册表若漏它就是闭合世界硬报错，"跑通"本身即断言。
+- **CMake include 顺序有语义（踩坑）**：`nn_enable_gpu_fusion` 起初只把 `${NNF_OUT_DIR}` 加进目标，样例 GPU 初始化报 `matmul SPIR-V bytecode not embedded`——手写原语 shader 的嵌入头在 `${CMAKE_BINARY_DIR}/generated`；但该目录**同时含库自身的 `fused_registry.hpp`**。最终把两者都加、且 `${NNF_OUT_DIR}` **排在前面**（`__has_include` 取第一个匹配），否则使用者的自定义结构全部闭合世界报错。已写进 AGENTS §7。
+- **已注册为常驻 ctest（round 17）**：样例的目标原先只由默认构建覆盖编译（运行时断言需手工跑），会静默腐化。现已 `add_test(fusion_custom_layer_example)` + `SKIP_RETURN_CODE 77`（无 Vulkan 设备时跳过）——它是**库外使用者形态的 AOT 融合端到端门禁**。ctest 总数 19 → **20**（18 个测试目标 + `cnn_test_gpu` + 本样例；`AGENTS.md` §12 与 `docs/development/12` 的当前数字已同步）。
+
+## AOT 融合分支代码审核与本轮修复（2026-10-01，round 20）
+
+- 类型：代码审核（简化 / 规范化 / 指针与内存 / 逻辑审查）+ 已修复缺陷
+- **范围**：`feat/fused-runtime-prec-dispatch` 全部 29 个 commit 相对 `main` 的源码、工具、CMake、测试与文档。
+- **本轮修掉的真缺陷（不只是风格）**：
+  1. **native16 谓词与 key 的错配（静默错值）**：`expr_prec_sig_native16` 含**常量值**判据（`0 < |c| < 6e-8` 在 f16 下 flush-to-0），而步骤①让常量值**退出 key** ⇒ 生成期用"生成那一份时的常量"判定、运行期却按**位图**选 `#a` —— 同结构换一组常量就会被套上会 flush 的 native16 shader。修复：选 `#a` 前用**真实实例的 spec 重跑同一谓词**（`find_prec_variant_` 改为收 `const ExprSpec&`）。
+  2. **`[prec][alu-hit]` 先打后查 + 双重打点**：见上一条节（12040 → 6022）。
+  3. **push constant 固定头长度两侧各推一遍**：创建侧用 `fs.spec.fold/has_matmul/reduce_axis`、写入侧用 `is_fold/matmul_k/has_mm/raxis` —— 注释里记着"漂移 = 超 range 被驱动丢弃 = 假 PASS"，本次把它降为**注册时算一次 + 存 map**（`fused_pc_base_fixed_`），写入侧只读。
+  4. **`in_rd` 用子串替换拼 f16 视图名**：找不到前缀时静默保留 f32 视图名 ⇒ 把 2B 缓冲当 float 读（编译期不报错）。改为显式拼 `b<i>[...]` / `b<i>h[...]`。
+  5. **`nn_enable_gpu_fusion` 的 include 顺序不成立**：普通 `target_include_directories` 对重复项保留**首次出现位置**，库内 GPU 循环先加了 `${CMAKE_BINARY_DIR}/generated` ⇒ 追加的 `${NNF_OUT_DIR}` 反而排在后面。改 **`BEFORE`**。
+  6. **收集器不继承目标的编译条件**：`NN_HAS_VULKAN`/私有 include/自定义宏缺失 ⇒ 使用者的调用点静默消失（而后只在 GPU 运行期闭合世界报错）。改为把目标的 `INCLUDE_DIRECTORIES`/`COMPILE_DEFINITIONS`/`COMPILE_OPTIONS` 用生成器表达式传给收集器。
+  7. **模型 pass 失败只 warning**：它贡献 25/84 条结构，静默降级 = 注册表不完整。改为**失败即构建失败**（与 dry-run 的 fail-fast 一致）。
+  8. **两条"永远通过"的测试**：`fold tri_skip 进 key` 用 Causal vs Plain 比 key（两者 body 本就不同，删掉该字段的 feed 也照样过）→ 改为**只翻该字段**；`expr_fused_key_test` 里与 `expr_matmul_test` 逐字重复的 mm_trans 位编码断言删掉一份。
+  9. **`read_spv` 不校验 `tellg()`**：失败返回 -1 → `size_t(-1)/4` 请求 ~4GB；截断读也被忽略。改为校验 `sz > 0 && sz % 4 == 0` 与 `read_pod_span` 返回值。
+- **删除的死物**：`prec_manifest` 形参（回填工作流残留）、`ExprRegistry::contains`（无调用点）、`fusion_anchor_touch`（**实测删除后库外样例的 2 条自定义结构仍被锚点登记**——registry 84 → 86 不变，说明该 TU 靠"包含头文件"即可）、`std::exit(1)`（改 `return false`，与同函数其余错误路径一致）、`scan_exprs` 里重复 4 次的 matmul trans 登记（转置不进 key 后 4 份折叠成 1 条）、AGENTS 里 4 处有争议的 `ctest 19/19`。
+- **简化/去重**：`glsl_vp_slot()` 取代 6 处逐字重复的"按视图序累计 vp 槽"（漂移 = 读写错位 push constant）；`scan_register<E>()` 取代 3 个 dsl 入口各写一遍的锚点+折叠+校验+登记；`is_fusable`/`fused_vec_width_for` 取代生成/发射/元数据三循环各写一遍的判据；`expr_variant_out_f16()` 取代 4 处"分派变体按运行期签名、其余按变体身份"；f16 双 `float16_t()` 冗余转换删除；`EXPR_PREC_ALU_SUFFIX` 常量取代 3 处硬编码 `"#a"`；`tool_env_flag()` 取代两份 `_dupenv_s` 样板。
+- **检测口径收紧**：`expr_prec_sig_in_f16` 先与 `EXPR_PREC_SIG_INPUT_MASK` 相与（否则哨兵 `0x00020000` 的 bit17 会被读成"第 17 个输入是 f16"，改 `EXPR_MAX_INPUTS` 即踩雷）；分发查询改用 `reg.keys` 而非重建集合；`--list-backends` 排序（铁律 8）。
+- **文档纠偏**（本轮统一）：AGENTS §7/§12、`docs/development/02/05/18`、`docs/usage/03` 中"运行期永不 miss""`[prec][miss]` 已删除""bin v9 变体段""`gen_fused` 产物""ctest 19""12040 次分派"等表述全部改写为当前事实；`docs/development/05` §12.7 改为**历史机制**（明确标注已删除），§12.10 ③ 标注为 V0 时代口径。
+- **验收（本机 Debug+Ninja+clang）**：build 零告警（`-Werror`）；**ctest 21/21**；`NN_BIND_DEBUG=1 ctest` 全绿；**CPU 字节锚 `6f8849f14da23110` / GPU dev2 锚 `8ef51b2927253c50` 逐位不变**（GLSL 文本改动全部数值等价）；库外样例端到端值不变（CPU f32 `0.6712035`、GPU f32 `0.6712036`、GPU f16 `0.6708984`、归一化 f16 `1.2246094`）；`scan_exprs` 结构数 **84**（例 86）不变；`NN_PREC_TRACE` 分派日志 12040 → **6022**、distinct 仍 24（20 `#x` + 4 `#a`）；`L2-VIOLATIONS: 0`、`doc_align_audit` A/D/E/F 可行动项 0。
+- **教训**：这一轮 9 条真缺陷里有 4 条的形态是同一个——**同一份知识被写在两个地方、靠注释维持同步**（谓词 vs key、创建侧 vs 写入侧 PC 长度、f16 视图名 vs 子串替换、目标编译条件 vs 收集器）。"能简化的简化"在本仓的直接收益就是**消掉这些同步点**；剩下两条（trace 先打后查、测试假通过）则是"**测量/断言必须先证明它能失败**"的同一个教训的延续（round 15/19 已各记一次）。
+
+## 融合回归测试 `fused_gpu_test` 曾是孤儿（2026-10-01，round 18）
+
+- 类型：已修复缺陷（测试覆盖缺口 / 构建配置遗漏）
+- **发现**：`src/fused_gpu_test.cpp`（44 KB）**未被任何 CMake 目标引用**——既不编译也不注册 ctest。`git log -S'fused_gpu_test' -- CMakeLists.txt` 最后一次改动是 `516d781`（Release v1.2.0），此后再无引用。
+- **它是什么**：融合 shader **逐形态** GPU 对拍——rope / swiglu / gelu / softmax / matmul / matmul+列归约 / norm / reduce_consts / **fold v1**（rowmax/rowsum/softmax_denom）/ **fold attn**（plain/causal/alibi/doc/alibidoc × 5 种形状）/ **未扫描表达式硬报错**。正是 AOT 融合最核心的回归面。
+- **处置**：接入构建（`nn_add_executable` + `list(APPEND NN_TEST_TARGETS ...)`，CMakeLists 紧邻 `expr_gpu_test`）。
+- **实测**：编译零告警、输出 `ALL PASS`、退出码 0；接入后 **ctest 20 → 21**（19 个测试目标 + `cnn_test_gpu` + `fusion_custom_layer_example`），21/21 全绿。
+- **该文件的边界（round 19 实测更正）**：它 **0 处 f16 引用** ⇒ 覆盖的是 **V0（全 f32）** 逐形态路径。
+  - ⚠ **曾据此误判**为"V1 无覆盖、无逐形态数值断言"——**该结论是错的**，见下条：V1 由 `f16_precision_test` 覆盖（20 条结构、四大生成器族、`CHECK_NEAR` 容差断言）。本文件缺的是"**本套件的** rope/swiglu/gelu/softmax/fold-attn 形状的 f16 变体"，不是"V1 无覆盖"。
+
+## `NN_PREC_TRACE` 对 V1 是盲的（2026-10-01，round 19）
+
+- 类型：已修复缺陷（诊断不对称 → 直接导致一次错误判断）
+- **发现过程**：想量"V1 逐形态覆盖"，用 `NN_PREC_TRACE=1` 跑 6 个 GPU 测试，得到 **0 条 `#x`**、只有 4 条 `#a`。做**对照实验**（跑已知必然走 V1 的库外样例——它含 rparam ⇒ native16 结构谓词不通过）——**样例也一行都不打** ⇒ 说明是**测量工具**瞎，不是"V1 没被用"。
+- **根因**：`compute_gpu_engine.hpp::find_prec_variant_` 的 `[prec][alu-hit]` 打印**只写在 V2（`#a`）分支**（原 1391-1392 行），V1（`#x`）分支与 V0 分支都**静默返回**。
+- **处置**：V1 分支补同款日志（V0 默认路径**仍不记**——f32 热路径逐调用打日志会淹没输出）。现规则：**变体选择事件（V1/V2）一律打日志**。
+- **round 20 复核（本次代码审核）**：上面那次"补日志"本身留了两个尾巴，本次一并修掉——① **先打后查**：V1 分支在 `find_fused` 返回前就打印，`#x` 缺失时也报 `alu-hit`（与刚被修掉的"V1 静默"是同一类错误的反面）→ 改为**确认命中后才打**，miss 时打 `[prec][fallback]`；② **双重打点**：`supports_expr_precision_variant`（每个 op 的 NVI 前置查询）也走同一函数并打日志 ⇒ 计数翻倍——**12040 行其实是 6020 次真实分派 × 2**。改为只有真正 dispatch 的三个入口传 `log_hit=true`。
+- **修正后的实测（`f16_precision_test` 单测即可）**：**6022 条命中日志 / 24 条 distinct 结构 = 20 条 V1（`#x`）+ 4 条 V2（`#a`）**（修复双重打点后的真实分派数）；V1 的 20 条**覆盖全部四个生成器族**：元素 9 / 归约 6 / matmul 4 / fold 1。该测试用 `CHECK_NEAR` 容差断言 ⇒ **V1 有真实的逐结构数值覆盖**，"V1 无覆盖"不成立。
+- **顺带**：`scan_exprs` 的来源 dump 新增 `[scan][both]`（锚点∩dry-run 交集，原 84 条里 38 条落在这里）——否则"某结构由哪个生成器负责、运行时是否按 V1 分派"无法从 dump 回答（V1 覆盖的 20 条里 18 条在交集中）。
+- **教训（本会话第二次）**：一个覆盖/一致性结论在写进文档前，**必须先有一个已知必然命中/必然不命中的对照样本**。上一次是"镜像对"（粗摘要相同但指令序列不同），这一次是"trace 对 V1 盲"。
+
+## 「锚点 vs dry-run」边界实测刻画（2026-10-01，round 15）
+
+- 类型：覆盖缺口 / 否决方案（"删掉 dry-run"）
+- **动机**：⑥ 的目标是"删除扫描"。此前只知"dry-run 贡献 71/84"，但**不知道那 71 条为什么锚点看不到**——没有这个答案就无法判断"能否再进一步"。为此给 `scan_exprs` 加了 env 门控诊断 `NN_SCAN_DUMP_SOURCES=1`：逐条打印 `[scan][dry-only]` / `[scan][anchor-only]` 加结构摘要（raxis / mm / fold / nreg / ninstr / nview / viewkinds）。
+- **实测（84 条结构）**：per-layer dry-run 38（含模型 pass +25、显式登记 +8）、锚点 59，**重叠 46 → 锚点独有 13、dry-run 独有 25**。
+- **dry-run 独有 25 条的分类**：
+  - **fold 8 条** = 显式登记的掩码×偏置组合与通用 fold 样例（`fold=1`，viewkinds `[0]`/`[0,0,0]`/`[0,0,0,10]`/`[0,0,0,7,11]`/`[0,0,0,10,7,11]`）；
+  - **含 matmul 段 7 条**（`mm=1`：注意力反向 / CE / 优化器步）；
+  - **RowAccess(12) 4 条**（共享内存 SwiGLU 的半偏移行切分）；
+  - **RowGather(9)/ColBroadcast(8) 若干**（稀疏 CE 的 5 视图形态 `[0,8,8,8,8]` 等）。
+  - 共同点：**结构由运行期配置决定**（视图种类 / 项数 / 掩码组合），类型层面推不出来；符号实例 `Expr{}` 与真实实例折叠出**不同 key**。最直接的证据是**镜像对**——dry-only `784781c7b82fa76c` 与 anchor-only `28cdf7c6d5df0e1d` 的摘要逐字段相同（`raxis=-1 mm=0 fold=0 nreg=2 ninstr=2 nview=2 viewkinds=[0,0]`），只有 key 不同。
+- **锚点独有 13 条**是镜像面：dry-run/模型 pass 没跑到的编译期可见调用点。最著名的是 `9ca81b4967cdfa20`——关掉锚点（`-DNN_SCAN_NO_ANCHOR`）后 `text_infer`（KV-cache 增量解码）在 GPU 上闭合世界硬报错。
+- **结论（否决"删掉 dry-run"）**：锚点与 dry-run **互补、不冗余**，单独删任何一方都会丢结构（dry-only 25 / anchor-only 13）。dry-run + 模型 pass 是结构的**主要**来源，`scan_exprs` 这一**构建步骤本身无法删除**；能删的只有签名维（已完成，扫描工作量减半）。若将来真要清零，路径是"把运行期配置维度类型化"（让视图种类/项数进入表达式类型），使符号实例等价于真实实例——那是另一次架构变更，不属于本阶段。
+- **推论与实测反驳（round 16）**：既然 25 条"只有执行才拿得到"，那**库外自定义层（没有 dry-run）是否就不可靠？** 直接用实验回答：给 `examples/fusion_custom_layer*` 加了第二种自研形态——**归一化形态** `rsqrt(col_reduce_sum(x)·inv + ε)`，与库内 LayerNorm/RMSNorm 的 `std_inv` 同形（`raxis=1`、`viewkinds=[0,8]`，正落在 dry-un-only 的形态类别里），**只用锚点**在 GPU 上以 f16 跑通（`1.2246094`，走 `key#x` 分派 shader）。⇒ **锚点对常见自定义层可靠**，A2 机制成立。
+- **同时排除了一个错误假设**：曾怀疑"符号实例的常量默认值（全 0）触发 CSE 合并出不同结构"。查 `expr_opt.hpp` 的 CSE key = `op(8)+a.kind/idx+b.kind/idx+c.kind/idx`，**不含常量值** ⇒ 与值无关，假设排除。（此前的"镜像对"是错的：粗摘要相同但指令序列完全不同——`nconst=2 instrs=[17(1/0,1/1);19(0/0,2/0,2/1)]` vs `nconst=1 instrs=[1(2/0,0/0);10(1/0,0/0)]`，是两个不同表达式，不是同一表达式的两个 key。）
+- **仍记录的残余不确定性**：25 条 divergence 的**根因未定位**（已知不是 CSE-值依赖、不是视图种类-运行期选择——`ExprViewKind` 全部由类型决定）。若将来使用者的自定义层遇到闭合世界报错，下一步是给 `nn_enable_gpu_fusion` 加 `COLLECT <file>` 钩子（使用者提供"跑一遍自己的层"的收集函数，等价于库内模型 pass）。诊断工具已就位：`NN_SCAN_DUMP_SOURCES=1` 打印逐条来源 + 完整指令序列。
+
 ## 融合 matmul BK 取值 A/B 流水（原位置 include/neuralnet.cpp/expr_glsl_gen.hpp:262-269、303-310）
 - 类型：性能 A/B / 否决方案
 - 内容：40HX 变体 trade-off 记录（% = vs 单缓冲耗时，负=更快）：BK=32 单缓冲(16KB) 为深网格基线、
@@ -2069,12 +2149,17 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 AGENTS §7、`docs/development/01-compute-engine-development.md` 等现行文档重复）。
 
 **「文档坐标已过期」事实记录（2026-10-01 实测，供后续纠偏）**：13 正文中的行数/份数是审查当时快照，
-现已过期——`include/neuralnet.cpp/backend/compute_vk_backend.hpp` **5174** 行（13 写 ≈4700）、
-`include/neuralnet.cpp/expr_glsl_gen.hpp` **2424** 行（写 2310）、
-`include/neuralnet.cpp/compute_cpu_engine.hpp` **2353** 行（写 2543）、
+现已过期——`include/neuralnet.cpp/backend/compute_vk_backend.hpp` **5246** 行（13 写 ≈4700；
+A1 段改动前为 5174）、`include/neuralnet.cpp/expr_glsl_gen.hpp` **2746** 行（写 2310；
+A1 段改动前为 2424）、`include/neuralnet.cpp/compute_cpu_engine.hpp` **2353** 行（写 2543）、
 `src/text_train.cpp` **1746** 行（写 1860）、`gui.py` **1646** 行（非空 1456；13 写 1636，
 且所谓"五 Tab"实为 **7** 个 `collect_args` 定义）；`max_abs_diff` 定义实测 **7** 份
 （13 与 `src/test_common.hpp:19` 注释均写 9，交接口径记 8——三处不一致，以本实测为准）。
-ctest 实测 **19**（本轮不做构建/ctest 复核，采信交接结论），而 `AGENTS.md` §12 与
-`docs/release-notes/v1.5.0.md`、`docs/development/17-unified-tensor-engine.md` 仍写 20——
-19 vs 20 的矛盾待 18 号文档与 AGENTS 修订统一。
+**ctest 计数（口径已统一，2026-10-01 A4/A5 两轮 + 本次审核）**：审查当时实测 **19**
+（= 18 个测试目标 + `cnn_test_gpu`），此后 A4 注册 `fusion_custom_layer_example`、A5 接回
+`fused_gpu_test` → **20 → 21**（= **19** 个测试目标 + `cnn_test_gpu` + `fusion_custom_layer_example`）。
+`AGENTS.md` §12 与 `docs/development/18-roadmap.md` §2/§7 已统一写 **21**；
+`docs/release-notes/v1.5.0.md` 与 `docs/development/17-unified-tensor-engine.md` 记的 **20/20** 是
+**2026-09-30 里程碑当时的计数**（历史值，不回改）。19 / 20 / 21 三个数并存过一阵，根因就是
+"是否含 `cnn_test_gpu`"与"后来新增了两个目标"两件互不相关的事叠在一起——**这不构成矛盾**，
+但必须写明口径（本次补记）。
