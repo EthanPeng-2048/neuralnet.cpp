@@ -821,7 +821,7 @@ template <typename T> concept nn::dsl::DslExpr =
 
 > ⚠ `batch_col` 要求 `(1, BH*seq)` 这类按 `(b,h)` 块重复的形状；写 `(1, batch*seq)` 会**越界**。
 
-**`R`（分组归约长度）是结构参数，进 `expr_spec_key`**；它不是"归约视图"，不参与归约轴判定，走 elementwise 路径。累加顺序固定为 `i` 升序左结合（三端一致，铁律 #8）。
+**`R`（分组归约长度）是运行期视图参数，不进 `expr_spec_key`**（经 push constant `vp` 槽传入，任一 shader 用运行期循环读取 → 任意池化窗口共享一个融合 shader）；它不是"归约视图"，不参与归约轴判定，走 elementwise 路径。累加顺序固定为 `i` 升序左结合（三端一致，铁律 #8）。
 
 ```cpp
 // 典型：加偏置（每行同一个偏置）
