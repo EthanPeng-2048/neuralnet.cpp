@@ -720,6 +720,29 @@ using ExprPrecSig = std::uint32_t;
 [[nodiscard]] inline constexpr bool expr_prec_sig_is_f32(ExprPrecSig s) noexcept
 { return s == 0u; }
 
+// ── 运行期精度分派（V1 形态）哨兵 ────────────────────────────────────────
+// 语义：**同一份 shader 处理任意 (输入精度位图, 输出精度)**——每个操作数
+// 声明 f32 / float16_t 双视图（binding i 与 n_inputs+i），加载/存储处按
+// push constant `uint prec`（逐位）走 uniform 分支选择。
+//
+// 与"带类型变体"（sig = 真实位图）的区别：
+//   · 带类型变体：精度是**身份**（key 含 `#xxxx`），必须先知道有哪些签名
+//     → 只能靠 dry-run 执行期发现 → 需要回填清单；
+//   · 运行期分派：精度是**参数**（PC `prec`），一个结构一份 shader 覆盖全部
+//     签名 → 不需要发现 → 构建期只需"结构"这一维（锚点已自动）。
+//
+// 哨兵取值落在输入位（bit 0..15）与输出位（bit 16）之外 —— 因此既有谓词
+// expr_prec_sig_in_f16 / expr_prec_sig_out_f16 对它一律返回 false，
+// 旧路径不会被误触发。
+inline constexpr ExprPrecSig EXPR_PREC_SIG_DISPATCH = 0x00020000u;
+
+[[nodiscard]] inline constexpr bool expr_prec_sig_is_dispatch(ExprPrecSig s) noexcept
+{ return s == EXPR_PREC_SIG_DISPATCH; }
+
+// 运行期分派变体的 key 后缀（结构 key + "#x"）。#x 不含 [0-9a-f] 之外的
+// 字符，且既有变体后缀是 "#%04x" / "#a"，不会碰撞。
+inline constexpr const char* EXPR_PREC_DISPATCH_SUFFIX = "#x";
+
 // 第 i 个输入是否为 f16 / 输出是否为 f16
 [[nodiscard]] inline constexpr bool expr_prec_sig_in_f16(ExprPrecSig s,
                                                          std::size_t i) noexcept
