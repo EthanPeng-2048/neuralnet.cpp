@@ -1433,7 +1433,7 @@ public:
 #endif
             return std::unexpected(Error{
                 "GpuEngine::eval_expr: fold 表达式未命中 AOT 融合 shader"
-                "（闭合世界）；请将该 fold 结构纳入 scan_exprs"});
+                "（闭合世界）；请将该 fold 结构纳入 scan_exprs；key=" + fkey});
         }
         // ── canonical IR：canonicalize 为引擎内部优化（IR-A/IR-B），
         //    key 与 shader 合成两端一致；dispatch 用 canonical 的 consts ──
@@ -1483,11 +1483,15 @@ public:
         if (psig != 0)
             return std::unexpected(Error{
                 "GpuEngine::eval_expr: 该 (结构,精度) 变体未预生成（in-kernel f16 覆盖不足）"
-                "；NVI 入口本应在此前抬到 f32（supports_expr_precision_variant 与 shader 查询不一致）"});
+                "；NVI 入口本应在此前抬到 f32（supports_expr_precision_variant 与 shader 查询不一致）"
+                "；key=" + key});
         // ── 闭合世界：未命中任何 AOT 融合 shader → 硬报错（绝不静默回退） ──
+        // 带上 key：闭合世界报错必须可定位——key 是登记/查表两侧的唯一标识，
+        // 可用来查 fused_registry.hpp 里有没有该条目、以及它属于哪个 Layer 路径。
         return std::unexpected(Error{
             "GpuEngine::eval_expr: 未找到该内联表达式的 AOT 融合 shader（闭合世界）；"
-            "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）"});
+            "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）；"
+            "key=" + key});
     }
 
     // ── 归约向量原生形状输出（LayerNorm/RMSNorm 小向量缓存） ────────
@@ -1606,7 +1610,8 @@ public:
         // ── 闭合世界：未命中归约融合 shader → 硬报错（绝不静默回退） ──
         return std::unexpected(Error{
             "GpuEngine::eval_expr_reduce: 未找到该归约表达式的 AOT 融合 shader（闭合世界）；"
-            "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）"});
+            "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）；"
+            "key=" + key});
     }
 
     // ── 目标传递（destination-passing）：结果直接写回已有张量 ─────────────
@@ -1693,7 +1698,8 @@ public:
         // ── 闭合世界：未命中 AOT 融合 shader → 硬报错（绝不静默回退） ──
         return std::unexpected(Error{
             "GpuEngine::eval_expr_into: 未找到该表达式的 AOT 融合 shader（闭合世界）；"
-            "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）"});
+            "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）；"
+            "key=" + key});
     }
 
 private:
