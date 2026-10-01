@@ -57,7 +57,9 @@ expr_opt / expr_registry / expr_spec）「历史状态类注释」摘录。整�
 - **落地**：CMake 函数 `nn_enable_gpu_fusion(<target> MAIN <含 main 的源> [OUT_DIR <目录>])`。收集器 = **库内收集逻辑**（`tools/scan_exprs.cpp`）+ **本目标的全部 TU**（`-DNN_EXPR_SCAN` 编译，令使用者调用点经 `FusedAnchor` 自登记）链接成一个可执行文件，产物目录只作该目标的私有 include 目录。样例 `examples/fusion_custom_layer{,.hpp,_main.cpp}`（"库外使用者"形态：自定义层 + 一行 CMake）。
 - **实测**：样例目标的注册表 = 库内 203 条 + 自研层 `94a2cc052598fe09` / `94a2cc052598fe09#x`（该表达式含 rparams → native16 谓词不通过，无 `#a`，符合预期）；样例可执行文件运行结果与期望值 `0.6712035` 逐位一致。库内文件零改动。
 - **顺带修的 header-only 缺陷**：`backend/compute_vk_backend.hpp` 的 `GpuBuffer::~GpuBuffer()` 类外定义**缺 `inline`** → 任何 ≥2 个 TU 的程序链接期 `duplicate symbol`（样例两 TU 复现）。已加 `inline`。这条此前从未暴露，因为库自身的可执行目标都是单 TU。
-- **未做**：把样例注册进 ctest（本次保持 ctest 19/19 口径不变；样例由默认构建覆盖编译，运行时断言需手工跑 `build/fusion_custom_layer_example.exe`）。
+- **GPU 端到端验收（本轮补齐）**：样例原先只验 CPU——而 CPU 走模板求值、与注册表无关，等于**没验到本 PR 的核心机制**。补上 GPU 后实测：CPU f32 `0.6712035`（差 0）；GPU f32（V0）`0.6712036`（差 5.96e-08）；**GPU f16（V1 运行期精度分派）`0.6708984`（差 3.05e-04，f16 舍入内）**。该表达式含 rparams ⇒ `expr_prec_sig_native16` 谓词不通过 ⇒ f16 那一跑命中的必然是 `key#x` 分派 shader；注册表若漏它就是闭合世界硬报错，"跑通"本身即断言。
+- **CMake include 顺序有语义（踩坑）**：`nn_enable_gpu_fusion` 起初只把 `${NNF_OUT_DIR}` 加进目标，样例 GPU 初始化报 `matmul SPIR-V bytecode not embedded`——手写原语 shader 的嵌入头在 `${CMAKE_BINARY_DIR}/generated`；但该目录**同时含库自身的 `fused_registry.hpp`**。最终把两者都加、且 `${NNF_OUT_DIR}` **排在前面**（`__has_include` 取第一个匹配），否则使用者的自定义结构全部闭合世界报错。已写进 AGENTS §7。
+- **未做**：把样例注册进 ctest（本次保持 ctest 19/19 口径不变；样例由默认构建覆盖编译，运行时断言需手工跑 `build/fusion_custom_layer_example.exe`，无 Vulkan 时退出码 77 = skip）。
 
 ## 融合 matmul BK 取值 A/B 流水（原位置 include/neuralnet.cpp/expr_glsl_gen.hpp:262-269、303-310）
 - 类型：性能 A/B / 否决方案
