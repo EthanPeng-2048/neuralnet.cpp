@@ -82,7 +82,7 @@ int main(int argc, char* argv[])
     // P-1 下沉后 f16 边界 cast 由基类 NVI 入口统一处理（原 PrecisionEngine
     // 适配层已删除，见 docs/development/15 §4.1）；原生 CpuEngine 从未见过
     // f16 张量（历史上直交属 UB，实测 heap corruption 0xC0000374）。
-    const auto dry_run = [&](nn::ComputeEngine& engine, const nn::PrecisionProfile& prof)
+    [[maybe_unused]] const auto dry_run = [&](nn::ComputeEngine& engine, const nn::PrecisionProfile& prof)
     {
         g_scan_prof = prof;
         // M1（docs/development/17 §4.1）：库外不再直构 Tensor——scan 输入经
@@ -589,8 +589,13 @@ int main(int argc, char* argv[])
     }
 
     };   // dry_run 结束
+#if !defined(NN_SCAN_NO_DRYRUN)
     dry_run(raw_engine, nn::profile_f32());   // f32 pass：sig == 0（基础结构表）
     dry_run(raw_engine, nn::profile_f16());   // Phase 2：收集 (结构, 精度签名)；
+#endif
+    // 分项台账快照（末尾合并时打印；见"结构来源"行）
+    const std::size_t n_after_dry = nn::fused::global_registry().specs.size();
+    const std::size_t v_after_dry = nn::fused::global_registry().variants.size();
     // f16 安全由基类边界 cast 入口保证（原 PrecisionEngine 适配层已下沉删除）
 
     // ── 模型级 pass：用 shipped 工厂建模型跑 fwd/bwd（补"整模型路径"的签名）──
@@ -637,64 +642,99 @@ int main(int argc, char* argv[])
             run(*m, input, name);
         };
 
-        // 1) MNIST MLP（784 → …）
-        try_build("mnist_mlp",
-                  [&] { return nn::build_mnist_mlp_model(engine, nn::MNIST_LAYER_DIMS,
-                                                         nn::NormType::LayerNorm, prof); },
-                  scan_tensor(nn::MNIST_LAYER_DIMS.front(), B));
-        // 2) MNIST Transformer（ViT 风格；输入 img²）
+        // 小配置（覆盖各"结构分支"：位置编码 / 激活 / 归一化 / 池化 / causal）
+        constexpr std::size_t V = 64, S = 8, D = 16, H = 2, F = 32, L = 2;
+        // id 输入：概念上是整数索引 → 恒 f32（text_train 同口径）；
+        //   gather_rows 按值取行，必须填**合法** id（否则越界）
+        const auto id_input = [&](std::size_t seq, std::size_t vocab)
+        {
+            nn::Tensor t = engine.create_tensor(seq, B, nn::Precision::F32);
+            std::vector<nn::Scalar> v(seq * B);
+            for (std::size_t i = 0; i < v.size(); ++i)
+                v[i] = static_cast<nn::Scalar>(i % vocab);
+            (void)engine.write(t, std::span<nn::Scalar>(v));
+            return t;
+        };
+        const nn::Tensor ids = id_input(S, V);
+
+        // ── 1) MNIST MLP：归一化维（LayerNorm/RMSNorm/BatchNorm 是三条不同
+        //        融合表达式：归约链形状与原地更新都不同）──
+        for (const auto nrm : {nn::NormType::LayerNorm, nn::NormType::RMSNorm,
+                               nn::NormType::BatchNorm})
+        {
+            const char* nm = (nrm == nn::NormType::LayerNorm) ? "mnist_mlp_ln"
+                           : (nrm == nn::NormType::RMSNorm)   ? "mnist_mlp_rms"
+                                                              : "mnist_mlp_bn";
+            try_build(nm,
+                      [&] { return nn::build_mnist_mlp_model(
+                                engine, nn::MNIST_LAYER_DIMS, nrm, prof); },
+                      scan_tensor(nn::MNIST_LAYER_DIMS.front(), B));
+        }
+        // ── 2) MNIST Transformer（ViT 风格；输入 img²）──
         try_build("mnist_transformer",
                   [&] { return nn::build_mnist_transformer_model(
                             engine, nn::MNIST_IMG_SIZE, nn::MNIST_PATCH_SIZE,
                             nn::MNIST_TF_D_MODEL, nn::MNIST_TF_NUM_HEADS,
                             nn::MNIST_TF_D_FF, nn::MNIST_TF_NUM_LAYERS, prof); },
                   scan_tensor(nn::MNIST_IMG_SIZE * nn::MNIST_IMG_SIZE, B));
-        // 3) CNN（LeNet 风格；输入 C·H·W）
-        try_build("cnn",
-                  [&] {
-                      nn::CnnConfig cfg;
-                      cfg.convs = nn::MNIST_CNN_CONVS;
-                      cfg.fc_dims = nn::MNIST_CNN_FC;
-                      // 注：CnnConfig 无精制度字段（CNN 走默认 f32 profile）
-                      return nn::build_cnn_model(engine, cfg);
-                  },
-                  scan_tensor(1 * 28 * 28, B));
-        // 4) GPT（小配置，Learned 位置编码）——输入是 token id (seq, batch)，
-        //    gather_rows 会按值取行，必须填**合法** id（否则越界）
+        // ── 3) CNN：池化窗口维（R 是运行期视图参数，pool=3 → R=9）──
+        for (const std::size_t pool : {std::size_t{2}, std::size_t{3}})
         {
-            constexpr std::size_t V = 64, S = 8, D = 16, H = 2, F = 32, L = 2;
+            nn::CnnConfig cfg;
+            cfg.convs = nn::MNIST_CNN_CONVS;
+            cfg.fc_dims = nn::MNIST_CNN_FC;
+            cfg.pool = pool;
+            // 注：CnnConfig 无精制度字段（CNN 走默认 f32 profile）
+            try_build(pool == 2 ? "cnn_pool2" : "cnn_pool3",
+                      [&] { return nn::build_cnn_model(engine, cfg); },
+                      scan_tensor(1 * 28 * 28, B));
+        }
+        // ── 4) GPT：位置编码 × 激活 × 归一化（每一维都换一组融合表达式：
+        //        ALiBi 走分数侧偏置、Sinusoidal 走嵌入侧、RoPE 走 Q/K 侧、
+        //        SwiGLU ≠ GeLU、RMSNorm ≠ LayerNorm）──
+        struct GptCase
+        {
+            const char*          name;
+            nn::PosEncodingType  pe;
+            nn::ActivationType   act;
+            nn::NormType         norm;
+        };
+        for (const GptCase& c : {
+                 GptCase{"gpt_learned_gelu_ln", nn::PosEncodingType::Learned,
+                         nn::ActivationType::GeLU, nn::NormType::LayerNorm},
+                 GptCase{"gpt_alibi_gelu_ln", nn::PosEncodingType::ALiBi,
+                         nn::ActivationType::GeLU, nn::NormType::LayerNorm},
+                 GptCase{"gpt_sinusoidal_gelu_ln", nn::PosEncodingType::Sinusoidal,
+                         nn::ActivationType::GeLU, nn::NormType::LayerNorm},
+                 GptCase{"gpt_rope_gelu_ln", nn::PosEncodingType::RoPE,
+                         nn::ActivationType::GeLU, nn::NormType::LayerNorm},
+                 GptCase{"gpt_learned_swiglu_rms", nn::PosEncodingType::Learned,
+                         nn::ActivationType::SwiGLU, nn::NormType::RMSNorm}})
+        {
             nn::GptConfig cfg;
             cfg.vocab_size = V; cfg.d_model = D; cfg.seq_len = S;
             cfg.num_heads = H; cfg.d_ff = F; cfg.num_layers = L;
-            cfg.pos_enc = nn::PosEncodingType::Learned;
+            cfg.pos_enc = c.pe; cfg.activation = c.act; cfg.norm_type = c.norm;
             cfg.precision = prof;
-            // id 输入恒 f32（概念上是整数索引；text_train 同口径）
-            nn::Tensor ids = engine.create_tensor(S, B, nn::Precision::F32);
-            std::vector<nn::Scalar> idv(S * B);
-            for (std::size_t i = 0; i < idv.size(); ++i)
-                idv[i] = static_cast<nn::Scalar>(i % V);
-            (void)engine.write(ids, std::span<nn::Scalar>(idv));
-            try_build("gpt", [&] { return nn::build_gpt_model(engine, cfg); }, ids);
+            try_build(c.name, [&] { return nn::build_gpt_model(engine, cfg); }, ids);
         }
-        // 5) RAPT（RoPE + causal）
+        // ── 5) RAPT：causal 维（RLA 的因果/双向是两组不同表达式）──
+        for (const bool causal : {true, false})
         {
-            constexpr std::size_t V = 64, S = 8, D = 16, H = 2, F = 32, L = 2;
             nn::RAPTConfig cfg;
             cfg.vocab_size = V; cfg.d_model = D; cfg.seq_len = S;
             cfg.num_heads = H; cfg.d_ff = F; cfg.num_layers = L;
-            cfg.pos_enc = nn::PosEncodingType::RoPE;
-            cfg.causal = true;
+            cfg.pos_enc = nn::PosEncodingType::RoPE;   // RAPT v1 仅支持 RoPE
+            cfg.causal = causal;
             cfg.precision = prof;
-            nn::Tensor ids = engine.create_tensor(S, B, nn::Precision::F32);
-            std::vector<nn::Scalar> idv(S * B);
-            for (std::size_t i = 0; i < idv.size(); ++i)
-                idv[i] = static_cast<nn::Scalar>(i % V);
-            (void)engine.write(ids, std::span<nn::Scalar>(idv));
-            try_build("rapt", [&] { return nn::build_rapt_model(engine, cfg); }, ids);
+            try_build(causal ? "rapt_causal" : "rapt_bidir",
+                      [&] { return nn::build_rapt_model(engine, cfg); }, ids);
         }
     };
     model_pass(raw_engine, nn::profile_f32());   // 结构 + 全 f32 签名
     model_pass(raw_engine, nn::profile_f16());   // 整模型路径的 f16 签名
+    const std::size_t n_after_model = nn::fused::global_registry().specs.size();
+    const std::size_t v_after_model = nn::fused::global_registry().variants.size();
     // ── fold v1（标量域）分块状态归约（表达式集合登记）──────────────────────────
     // 三个共享样例（expr_fold.hpp——与 fused_gpu_test 对拍**同源构造** →
     // key 一致、闭合世界命中）：rowmax / rowsum / softmax_denom(online 双
@@ -749,22 +789,30 @@ int main(int argc, char* argv[])
         }
     }
 
+    const std::size_t n_before_anchor = nn::fused::global_registry().specs.size();
+    const std::size_t v_before_anchor = nn::fused::global_registry().variants.size();
     auto& reg = nn::fused::global_registry();
     // ── 合并自登记锚点的结构（"结构 = 表达式类型"，见 expr_dsl.hpp）─────────
     // 锚点在静态初始化期按**类型**登记，覆盖"编译进来但 dry-run 未执行到"的
     // 调用点（配置分支、未被 dry-run 造过的层路径）。两者合并后写盘。
     {
         auto& anchor = nn::dsl::anchor_registry();
-        const std::size_t dry_only = reg.specs.size();
         for (const auto& s : anchor.specs)
             reg.add(s, 0u);
-        std::printf("[scan] 结构来源：dry-run %zu + 锚点 %zu → 合并 %zu（锚点独有 %zu）\n",
-                    dry_only, anchor.specs.size(), reg.specs.size(),
-                    reg.specs.size() - dry_only);
+        std::printf("[scan] 结构来源：dry-run %zu（含模型 pass +%zu、显式登记 +%zu）"
+                    " + 锚点 %zu → 合并 %zu（锚点独有 %zu）\n",
+                    n_after_dry,
+                    n_after_model - n_after_dry,
+                    n_before_anchor - n_after_model,
+                    anchor.specs.size(), reg.specs.size(),
+                    reg.specs.size() - n_before_anchor);
+        std::printf("[scan] 签名来源：dry-run %zu + 模型 pass %zu + 显式登记 %zu = %zu\n",
+                    v_after_dry, v_after_model - v_after_dry,
+                    v_before_anchor - v_after_model, v_before_anchor);
         // 锚点独有 = 手写 dry-run 覆盖不到的调用点（该数突然变大 → 有新层路径
         // 没纳入 dry-run）。锚点只登记结构（sig=0），故这些结构默认没有 f16
         // 带类型变体 —— 下面单独报告。
-        if (anchor.specs.empty() || dry_only == reg.specs.size())
+        if (anchor.specs.empty() || n_before_anchor == reg.specs.size())
             std::fprintf(stderr,
                 "[scan][warn] 锚点未贡献任何结构：可能被 -DNN_SCAN_NO_ANCHOR 关闭，"
                 "或所有调用点都已被 dry-run 覆盖\n");
