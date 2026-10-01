@@ -537,8 +537,14 @@ if(Vulkan_FOUND)
             DEPENDS ${target}_nnfusion_collect ${SCAN_SRC} ${FUSED_GEN_SRC} ${_nnf_inputs}
             COMMENT "[nn] 为 ${target} 收集 + 合成融合 shader → ${_nnf_reg}")
         add_custom_target(${target}_nnfusion_registry DEPENDS ${_nnf_reg})
-        target_include_directories(${target} PRIVATE ${NNF_OUT_DIR})
-        add_dependencies(${target} ${target}_nnfusion_registry)
+        # ⚠ include 顺序有意义：本目标自己的 `fused_registry.hpp` 必须排在
+        #   `${CMAKE_BINARY_DIR}/generated` **之前**——后者含库自身的注册表
+        #   （不含使用者的自定义结构）与手写原语 shader 的嵌入头。放在前面
+        #   才能让 `__has_include("fused_registry.hpp")`（见
+        #   backend/compute_vk_backend.hpp）解析到本目标专属的那一份。
+        target_include_directories(${target} PRIVATE
+            ${NNF_OUT_DIR} ${CMAKE_BINARY_DIR}/generated)
+        add_dependencies(${target} ${target}_nnfusion_registry compile_gpu_shaders)
     endfunction()
 
     if(NOT GLSLC)
