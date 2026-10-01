@@ -107,7 +107,9 @@ expr_spec_key(spec) ≡ expr_spec_key(canonicalize_expr_spec(spec))
 | `rparams` 个数 / 值 | 个数 ✅ / 值 ❌ | push constant `rp<i>` |
 | 视图形状参数（RowMod/RotateHalf/BatchMod/BatchCol/RowAccess 的 param） | ❌ | push constant `vp<i>` |
 | `matmul.k` / `matmul.batch` | ❌ | push constant `mm_k` / `mm_batch` |
-| `matmul.transA/transB`、`a_input/b_input` | ✅（**待收敛**：目标是把旋转布局改成运行期 operand layout） | — |
+| `matmul.a_input/b_input`（输入槽位） | ✅ | — |
+| `matmul.transA/transB` | ❌ | push constant `mm_trans`（bit0=transA / bit1=transB；shader 内两条加载路径 + uniform 分支，同一结构覆盖 4 种转置组合） |
+| fold 段 matmul 的 transA/transB | ✅（fold 的 mm 段生成期定死，**尚未收敛**） | — |
 | fold 的 `k` / `vec_state_len` | ❌ | push constant |
 | 分组归约视图的 `R` | ✅（**待收敛**：目标改为运行期循环） | — |
 
