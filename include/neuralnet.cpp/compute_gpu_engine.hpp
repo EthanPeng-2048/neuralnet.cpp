@@ -1417,9 +1417,11 @@ public:
                     ffs->key, gpu_inputs, raw_spec.consts, rows, cols,
                     /*vector_out=*/false, fvp, raw_spec.rparams,
                     /*output_override=*/nullptr,
-                    // 双域 fold 自带 matmul 段的 k/batch（7 槽 PC 的 slot5/6）
+                    // 双域 fold 自带 matmul 段的 k/batch（7 槽 PC 的 slot5/6）；
+                    // fold 的转置仍在 key 里（生成期定死）→ 此处恒 0（无该槽）
                     nn::expr_spec_runtime_matmul_k(raw_spec),
                     nn::expr_spec_runtime_matmul_batch(raw_spec),
+                    /*matmul_trans=*/0u,
                     nn::expr_spec_runtime_fold_k(raw_spec), fout_f16);
                 if (!out) return std::unexpected(out.error());
                 // f16 输出：按 2B/元素分配后重贴 GpuTensorF16（同非 fold 路径）
@@ -1431,7 +1433,7 @@ public:
 #endif
             return std::unexpected(Error{
                 "GpuEngine::eval_expr: fold 表达式未命中 AOT 融合 shader"
-                "（闭合世界）；请将该 fold 结构纳入 scan_exprs"});
+                "（闭合世界）；请将该 fold 结构纳入 scan_exprs；key=" + fkey});
         }
         // ── canonical IR：canonicalize 为引擎内部优化（IR-A/IR-B），
         //    key 与 shader 合成两端一致；dispatch 用 canonical 的 consts ──
@@ -1466,6 +1468,7 @@ public:
                 /*vector_out=*/false, vp, spec.rparams, /*output_override=*/nullptr,
                 nn::expr_spec_runtime_matmul_k(spec),
                 nn::expr_spec_runtime_matmul_batch(spec),
+                nn::expr_spec_runtime_matmul_trans(spec),
                 /*fold_k=*/std::nullopt, out_f16);
             if (!out) return std::unexpected(out.error());
             if (out_f16)
@@ -1480,11 +1483,15 @@ public:
         if (psig != 0)
             return std::unexpected(Error{
                 "GpuEngine::eval_expr: 该 (结构,精度) 变体未预生成（in-kernel f16 覆盖不足）"
-                "；NVI 入口本应在此前抬到 f32（supports_expr_precision_variant 与 shader 查询不一致）"});
+                "；NVI 入口本应在此前抬到 f32（supports_expr_precision_variant 与 shader 查询不一致）"
+                "；key=" + key});
         // ── 闭合世界：未命中任何 AOT 融合 shader → 硬报错（绝不静默回退） ──
+        // 带上 key：闭合世界报错必须可定位——key 是登记/查表两侧的唯一标识，
+        // 可用来查 fused_registry.hpp 里有没有该条目、以及它属于哪个 Layer 路径。
         return std::unexpected(Error{
             "GpuEngine::eval_expr: 未找到该内联表达式的 AOT 融合 shader（闭合世界）；"
-            "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）"});
+            "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）；"
+            "key=" + key});
     }
 
     // ── 归约向量原生形状输出（LayerNorm/RMSNorm 小向量缓存） ────────
@@ -1581,7 +1588,9 @@ public:
                 fs->key, gpu_inputs, spec.consts, rows, cols, /*vector_out=*/true, vp,
                 spec.rparams,
                 /*output_override=*/nullptr, nn::expr_spec_runtime_matmul_k(spec),
-                nn::expr_spec_runtime_matmul_batch(spec), std::nullopt, out_f16);
+                nn::expr_spec_runtime_matmul_batch(spec),
+                nn::expr_spec_runtime_matmul_trans(spec),
+                std::nullopt, out_f16);
             if (!out) return std::unexpected(out.error());
             if (out_f16)
             {
@@ -1601,7 +1610,8 @@ public:
         // ── 闭合世界：未命中归约融合 shader → 硬报错（绝不静默回退） ──
         return std::unexpected(Error{
             "GpuEngine::eval_expr_reduce: 未找到该归约表达式的 AOT 融合 shader（闭合世界）；"
-            "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）"});
+            "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）；"
+            "key=" + key});
     }
 
     // ── 目标传递（destination-passing）：结果直接写回已有张量 ─────────────
@@ -1671,7 +1681,8 @@ public:
                 fs->key, gpu_inputs, spec.consts, rows, cols, /*vector_out=*/false, vp,
                 spec.rparams, dst_override,
                 nn::expr_spec_runtime_matmul_k(spec),
-                nn::expr_spec_runtime_matmul_batch(spec));
+                nn::expr_spec_runtime_matmul_batch(spec),
+                nn::expr_spec_runtime_matmul_trans(spec));
             if (!out) return std::unexpected(out.error());
             // dst 原为 CPU staging 时，import 上传了新 buffer（结果在它上面）
             // → 用 upload 后的张量替换 dst，保证调用方看到更新后的数据
@@ -1687,7 +1698,8 @@ public:
         // ── 闭合世界：未命中 AOT 融合 shader → 硬报错（绝不静默回退） ──
         return std::unexpected(Error{
             "GpuEngine::eval_expr_into: 未找到该表达式的 AOT 融合 shader（闭合世界）；"
-            "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）"});
+            "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）；"
+            "key=" + key});
     }
 
 private:

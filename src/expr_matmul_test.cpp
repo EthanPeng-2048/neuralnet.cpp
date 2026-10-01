@@ -8,7 +8,9 @@
 //       CPU err=0（与参考实现逐位/容差一致）。
 //    3. DSL matmul(A,B) 叶子：折叠为 matmul 段，dsl::compute 自动分流引擎。
 //    4. key 与形状无关：k（求和维度）不进 key，同结构不同 K 共享融合 shader；
-//       transA/transB/a_input/b_input 是结构，进 key。
+//       a_input/b_input（输入槽位）是结构，进 key；
+//       **transA/transB 是运行期 operand layout，不进 key** —— 4 种转置组合共享
+//       同一个融合 shader（GPU 端由 push constant `mm_trans` 选加载路径）。
 //    5. matmul 输出可被归约指令消费（row_sum(matmul(x))，CPU 参考路径）。
 //
 //  纯 CPU、无 GPU 依赖。编译/运行：
@@ -143,7 +145,7 @@ void test_matmul_bias_relu()
     CHECK(inputs.size() == 3, "折叠 spec 应有 3 个输入（A/B/bias）");
 }
 
-// ── 4) transA / transB 变体（转置标志是结构，进 key）────────────────────
+// ── 4) transA / transB 变体（运行期 operand layout，不进 key）─────────────
 void test_transpose_variants()
 {
     const std::size_t M = 4, K = 5, N = 3;
@@ -181,8 +183,25 @@ void test_transpose_variants()
     const std::string k01 = run(false, true);
     const std::string k10 = run(true, false);
     const std::string k11 = run(true, true);
-    CHECK(k00 != k01 && k01 != k10 && k10 != k11 && k00 != k11,
-          "transA/transB 是结构：不同转置组合 key 必须不同");
+    // 契约（2026-10-01 起）：transA/transB 是**运行期 operand layout**、不进 key
+    // → 4 种转置组合共享同一个融合 shader（GPU 端经 PC `mm_trans` 的两条加载
+    // 路径 + uniform 分支选择）。数值正确性由上面 4 次 eval_expr vs eng.matmul
+    // 对拍保证；这里锁死"key 必须相同"，防止转置被重新折回结构。
+    CHECK(k00 == k01 && k01 == k10 && k10 == k11,
+          "transA/transB 是运行期 operand layout：4 种转置组合的 key 必须相同");
+
+    // 运行期描述子：4 种组合必须编码成 mm_trans 的 4 个不同位模式
+    // （GPU 端靠它选加载路径；编码错 = 静默读错布局）
+    const auto mk = [](bool a, bool b) {
+        nn::ExprSpec s;
+        s.views  = {nn::expr::linear(), nn::expr::linear()};
+        s.matmul = nn::MatmulSpec{0, 1, static_cast<std::uint8_t>(a ? 1u : 0u),
+                                  static_cast<std::uint8_t>(b ? 1u : 0u), 1};
+        return nn::expr_spec_runtime_matmul_trans(s);
+    };
+    CHECK(mk(false, false) == 0u && mk(true, false) == 1u &&
+          mk(false, true) == 2u && mk(true, true) == 3u,
+          "expr_spec_runtime_matmul_trans 位编码（bit0=transA, bit1=transB）");
 }
 
 // ── 5) key 与形状无关：k 不进 key，同结构不同 K 共享融合 shader ────────

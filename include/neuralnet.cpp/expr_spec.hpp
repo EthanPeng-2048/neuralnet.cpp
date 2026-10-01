@@ -183,9 +183,9 @@ enum class ExprViewKind : uint8_t
     // ── 分组归约（segmented reduce；MaxPool 等按固定长度 R 分组的场景）──
     // 输出网格 (G, N)，输入 (G*R, N)：out[r][c] = Σ/max over t∈[0,R) of
     //   in[(r*R + t)][c]（沿行方向按固定长度 R 分组，组内归约）。
-    // param = R（组长度）：**非 runtime param → R 进 expr_spec_key**（不同
-    //   组长度 = 不同结构，glsl_gen 编译期展开 R 次读取链；R 是池化窗口等
-    //   结构参数，取值空间小）。**不属于归约视图**（expr_view_is_reduce=false）：
+    // param = R（组长度）：**运行期形状数据 → R 不进 expr_spec_key**（同一
+    //   结构覆盖任意组长度，glsl_gen 用运行期循环而非编译期展开链；R 经
+    //   push constant vp 槽填入）。**不属于归约视图**（expr_view_is_reduce=false）：
     //   输出是全网格而非归约向量，不参与 expr_spec_reduce_axis 的归约轴判定，
     //   也不进 reduce-shader 分派——每输出元素独立归约 R 个输入元素，与
     //   RowAccess 同属"逐元素索引/局部读取"类，走 elementwise 生成路径。
@@ -247,7 +247,11 @@ struct ExprInstr
 //   - 其余逐元素输入的视图/形状仍要求 (M, N)（如 bias、残差）。
 //   - k（求和维度）是**形状参数**：不进 expr_spec_key（同结构不同 K 共享
 //     一个融合 shader），运行时作为 push constant 填充。
-//   - transA/transB/a_input/b_input 是**结构**：进 expr_spec_key。
+//   - transA/transB 是**运行期 operand layout**：不进 expr_spec_key（同一个
+//     结构覆盖 4 种转置组合），运行时经 `expr_spec_runtime_matmul_trans`
+//     打包成 push constant `mm_trans`（bit0=transA / bit1=transB），shader
+//     内两条加载路径 + uniform 分支选择。
+//   - a_input/b_input（输入槽位）是**结构**：进 expr_spec_key。
 //   - batch：批量数，A/B 按 batch 垂直切分为连续行块（与
 //     batched_matmul 原语同布局），输出网格 (batch*M, N)；
 //     **形状参数**：不进 key（同结构不同 batch 共享一个融合 shader），
@@ -443,6 +447,17 @@ struct ExprSpec
     if (s.fold && s.fold->matmul) return s.fold->matmul->batch;
     return 1u;
 }
+// 运行时 matmul 转置布局（bit0 = transA，bit1 = transB）：**不进 key** ——
+// 同一结构覆盖 4 种转置组合，shader 内两条加载路径 + uniform 分支按此选择
+// （见 generate_glsl_matmul / generate_glsl_reduce 的 PC `mm_trans`）。
+// ⚠ **双域 fold 自带的 matmul 段不在此列**：fold 的 transA/transB 仍进 key
+// （生成期定死，见 expr_spec_key 的 fold 分支），此处只描述顶层 matmul 段。
+[[nodiscard]] inline std::uint32_t expr_spec_runtime_matmul_trans(
+    const ExprSpec& s) noexcept
+{
+    if (!s.matmul) return 0u;
+    return (s.matmul->transA ? 1u : 0u) | (s.matmul->transB ? 2u : 0u);
+}
 // fold 收缩轴长度（形状参数，不进 key → push constant 运行时填充）
 [[nodiscard]] inline std::optional<std::uint32_t> expr_spec_runtime_fold_k(
     const ExprSpec& s) noexcept
@@ -458,21 +473,24 @@ struct ExprSpec
 }
 
 // ── 运行时视图参数（形状无关融合的关键）───────────────────────────────
-// RowMod（周期）与 RotateHalf（块大小）的 param 是**运行时形状数据**（如
-// RoPE 的 d_k），不是表达式结构：同结构不同 param（不同 d_k）应共享一个
-// 融合 shader。因此：
-//   - expr_spec_key **不**把这两个 param 折进 key（结构相同 → 同 key）
+// RowMod（周期）/RotateHalf（块）/RowAccess（偏移+模）与分组归约的 R 都是
+// **运行时形状数据**，不是表达式结构：同结构不同 param 应共享一个融合 shader。
+// 因此：
+//   - expr_spec_key **不**把这些 param 折进 key（结构相同 → 同 key）
 //   - glsl_gen 把它们作为 push constant（vp 槽）读取，dispatch 时按实际
-//     spec 填充 → 一个 shader 适配所有形状（任何 d_k）
+//     spec 填充 → 一个 shader 适配所有形状（任何 d_k / 任何池化窗口）
 [[nodiscard]] inline constexpr bool expr_view_has_runtime_param(ExprViewKind k) noexcept
 {
     // RowMod/RotateHalf 的形状参数（d_k）与 BatchMod/BatchCol 的形状参数
     // （num_heads / seq）都是**运行时形状数据**：不进 expr_spec_key，作为
     // push constant vp 槽由 dispatch 按实际 spec 填充 → 同结构不同形状
     // （不同 d_k / num_heads / seq_len）共享一个融合 shader（形状无关融合）。
+    // 分组归约的 R（= 池化窗口面积）同理：运行期循环取代编译期展开链。
     return k == ExprViewKind::RowMod || k == ExprViewKind::RotateHalf ||
            k == ExprViewKind::BatchMod || k == ExprViewKind::BatchCol ||
-           k == ExprViewKind::RowAccess;
+           k == ExprViewKind::RowAccess ||
+           k == ExprViewKind::GroupedReduceSum ||
+           k == ExprViewKind::GroupedReduceMax;
 }
 // 该视图消耗的运行时视图参数槽位数（RowAccess 用 offset+mod 两个 vp 槽）
 [[nodiscard]] inline constexpr std::uint32_t expr_view_runtime_param_slots(
@@ -553,9 +571,9 @@ struct ExprSpec
 }
 
 // ── 规范结构 key（AOT 收集/匹配的单一依据）──────────────────────────────
-// 把 ExprSpec 的**结构**（指令、视图、常量、寄存器数；不含输入张量）确定性地
-// 哈希成 16 位十六进制字符串。同一结构跨构建/跨调用恒得同 key，不同结构
-// 以极大概率不同。用于：
+// 把 ExprSpec 的**结构**（指令、视图、常量池**个数**、寄存器数；不含输入张量、
+// 也不含常量**值**）确定性地哈希成 16 位十六进制字符串。同一结构跨构建/跨调用
+// 恒得同 key，不同结构以极大概率不同。用于：
 //   1. 构建期 scan_exprs 注册表去重（identical 表达式只合成一个 shader）
 //   2. gen_fused 产物命名（fused_<key>）与嵌入注册
 //   3. 运行时 eval_expr 折叠内联表达式 → key → 查预编译 shader（闭合世界）
@@ -599,24 +617,28 @@ struct ExprSpec
             feed_u32(v.param2);
         }
     }
+    // 常量池：只喂**个数**（决定 push constant 布局），不喂值——常量值本身是
+    // 运行时数据（glsl_gen 把 consts 声明进 push constant、操作数发射成
+    // `c<idx>`；见 expr_glsl_gen.hpp 的 PC 声明与 ExprOperandKind::Const），
+    // 同结构不同常量值共享一个融合 shader。与 RParam 同处理。
+    // *** 常量池值进 key 会让每个取值组合都编译一份 **逐字节相同** 的 shader ***
     feed_u32(static_cast<std::uint32_t>(s.consts.size()));
-    for (const auto& c : s.consts)
-        feed(&c, sizeof(c));
     // 运行时标量参数（RParam）：只喂**个数**（结构），不喂值——值本身是
     // 运行时数据（如优化器的 lr/eps/β），不进 key；同结构不同值的表达式
     // 共享一个融合 shader（glsl_gen 把 rparams 作为 push constant 读取，
     // dispatch 时按实际 spec 填充）。与 RowMod/RotateHalf 的 param 同处理。
     feed_u32(static_cast<std::uint32_t>(s.rparams.size()));
-    // matmul 段（可选）：transA/transB/a_input/b_input 是**结构** → 进 key；
-    // k（求和维度）是**形状参数** → 不进 key（同 RowMod/RotateHalf 的 param
-    // 处理）：同结构不同 K 共享一个融合 shader（glsl_gen 把 k 作为 push
-    // constant 读取，dispatch 时按实际 spec 填充）。
+    // matmul 段（可选）：a_input/b_input（输入槽位）是**结构** → 进 key；
+    // k（求和维度）与 batch 是**形状参数** → 不进 key（同 RowMod/RotateHalf 的
+    // param 处理）：同结构不同 K/batch 共享一个融合 shader（glsl_gen 把 k/batch
+    // 作为 push constant 读取，dispatch 时按实际 spec 填充）。
+    // **transA/transB 同样不进 key**：它们是运行期 operand layout（PC `mm_trans`，
+    // 见 expr_spec_runtime_matmul_trans），shader 内两条加载路径 + uniform 分支
+    // 运行时选择 → 同一结构覆盖 4 种转置组合（原先 4 份 shader 合并为 1 份）。
     if (s.matmul)
     {
         feed(&s.matmul->a_input, 1);
         feed(&s.matmul->b_input, 1);
-        feed(&s.matmul->transA, 1);
-        feed(&s.matmul->transB, 1);
     }
     // fold 段：结构字段全进 key（num_state、inits 初值——-inf/0 属
     // 结构、body/finalize 指令序列）；k 是形状参数不进（同 matmul.k 处理，

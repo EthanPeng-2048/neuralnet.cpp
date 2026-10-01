@@ -315,6 +315,11 @@ struct CpuViewCache
     {
         if (!t.is_cpu())
             return;
+        // 符号张量（默认构造：未绑定、无存储）——AOT 自登记需要"从表达式类型
+        // 折叠出结构"，那条路径只看 to_spec 折出的视图/指令，不会 eval；此处
+        // 直接返回，避免在无存储张量上取 CPU 视图（原会 NN_ASSERT 硬失败）。
+        if (!t.valid())
+            return;
         if (t.precision() == Precision::F16)
         {
             auto m = std::make_shared<Matrix>(t.rows(), t.cols());
@@ -369,6 +374,9 @@ struct TensorRef : CpuViewCache
     Tensor t;
 
     TensorRef(Tensor tt) : t(std::move(tt)) { cache_cpu_view(t); }
+    // 符号实例（AOT 自登记 `FusedAnchor<Expr>`）：`t` 默认构造（未绑定、无存储，
+    // cache_cpu_view 对 !valid() 直接返回）——结构只由类型决定
+    TensorRef() = default;
     [[nodiscard]] Scalar eval(std::size_t i) const { return at(i); }
     ExprOperand to_spec(SpecBuilder& b) const { return b.add_input_linear(t); }
 };
@@ -377,10 +385,12 @@ struct TensorRef : CpuViewCache
 struct RotateHalfRef : CpuViewCache
 {
     Tensor t;
-    std::uint32_t block;
+    std::uint32_t block = 1;   // 运行时视图参数（不进 key）；默认值供符号实例
 
     RotateHalfRef(Tensor tt, std::uint32_t blk) : t(std::move(tt)), block(blk)
     { cache_cpu_view(t); }
+    // 符号实例（AOT 自登记）：结构由类型决定，视图参数取中性值（不进 key）
+    RotateHalfRef() = default;
 
     [[nodiscard]] Scalar eval(std::size_t i) const
     {
@@ -399,9 +409,11 @@ struct RotateHalfRef : CpuViewCache
 struct RowModRef : CpuViewCache
 {
     Tensor t;
-    std::uint32_t mod;
+    std::uint32_t mod = 1;   // 运行时视图参数（不进 key）；默认值供符号实例
 
     RowModRef(Tensor tt, std::uint32_t m) : t(std::move(tt)), mod(m) { cache_cpu_view(t); }
+    // 符号实例（AOT 自登记）：结构由类型决定，视图参数取中性值（不进 key）
+    RowModRef() = default;
 
     [[nodiscard]] Scalar eval(std::size_t i) const
     {
@@ -419,11 +431,13 @@ struct RowModRef : CpuViewCache
 struct RowAccessRef : CpuViewCache
 {
     Tensor t;
-    std::uint32_t offset;
-    std::uint32_t mod;
+    std::uint32_t offset = 0;   // 运行时视图参数（不进 key）；默认值供符号实例
+    std::uint32_t mod = 1;      // 同上
 
     RowAccessRef(Tensor tt, std::uint32_t off, std::uint32_t m)
         : t(std::move(tt)), offset(off), mod(m) { cache_cpu_view(t); }
+    // 符号实例（AOT 自登记）：结构由类型决定，视图参数取中性值（不进 key）
+    RowAccessRef() = default;
 
     [[nodiscard]] Scalar eval(std::size_t i) const
     {
@@ -444,35 +458,45 @@ struct RowAccessRef : CpuViewCache
 //   elementwise 生成（glsl_view_read 展开 R 次读取链）。不触发
 //   expr_spec_reduce_axis / reduce-shader 分派（输出是全网格而非归约向量）。
 //   累加顺序：t 升序左结合链，CPU/GPU/解释器三端一致（铁律 8）。
+//   IsMax 是**模板参数**（决定视图 kind = 结构），不是运行期成员：
+//   0-sum / 1-max 是两种不同视图（`ExprViewKind::GroupedReduceSum/Max`），
+//   而"结构 = 表达式类型"是 AOT 自登记（`FusedAnchor<Expr>` 默认构造符号实例）
+//   的前提——运行期 bool 会让两种视图同类型、结构不可枚举。
+//   r_len（R）是运行期视图参数，不进 expr_spec_key（见 expr_spec.hpp）。
+template <bool IsMax>
 struct GroupedReduceRef : CpuViewCache
 {
     Tensor t;
-    std::uint32_t r_len;   // 组长度 R（进 expr_spec_key 的结构参数）
-    bool is_max;
+    std::uint32_t r_len = 1;   // 组长度 R（运行期视图参数，不进 expr_spec_key）
 
-    GroupedReduceRef(Tensor tt, std::uint32_t R, bool mx)
-        : t(std::move(tt)), r_len(R), is_max(mx)
+    GroupedReduceRef(Tensor tt, std::uint32_t R)
+        : t(std::move(tt)), r_len(R)
     { cache_cpu_view(t); }
+    // 符号实例（AOT 自登记）：结构由类型决定，R 取中性值（不进 key）
+    GroupedReduceRef() = default;
 
     // 输入 cols = 输出 cols（分组只沿行方向）→ 缓存 cols 即可分解 (g, c)
     [[nodiscard]] Scalar eval(std::size_t i) const
     {
         const std::size_t g = i / cols, c = i % cols;
-        Scalar acc = is_max ? std::numeric_limits<Scalar>::lowest() : Scalar{0};
+        Scalar acc = IsMax ? std::numeric_limits<Scalar>::lowest() : Scalar{0};
         const std::size_t base = g * static_cast<std::size_t>(r_len);
         for (std::uint32_t tt = 0; tt < r_len; ++tt)
         {
             const Scalar v = at((base + tt) * cols + c);
-            if (is_max) { if (v > acc) acc = v; }
-            else         { acc += v; }
+            if (IsMax) { if (v > acc) acc = v; }
+            else       { acc += v; }
         }
         return acc;
     }
     // 2 参版本：cols 语义与 1 参相同（输入/输出同列），转发即可
     [[nodiscard]] Scalar eval(std::size_t i, std::size_t) const { return eval(i); }
     ExprOperand to_spec(SpecBuilder& b) const
-    { return b.add_input_grouped_reduce(t, r_len, is_max); }
+    { return b.add_input_grouped_reduce(t, r_len, IsMax); }
 };
+
+using GroupedReduceSumRef = GroupedReduceRef<false>;
+using GroupedReduceMaxRef = GroupedReduceRef<true>;
 
 // ══════════════════════════════════════════════════════════════════════════
 // 归约叶子：把"按行/按列归约出标量向量"接入表达式
@@ -673,7 +697,7 @@ struct RowGatherRef
 struct BatchModRef
 {
     Tensor t;
-    std::uint32_t modulo;
+    std::uint32_t modulo = 1;   // 运行时视图参数（不进 key）；默认值供符号实例
 
     [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
     ExprOperand to_spec(SpecBuilder& sb) const
@@ -689,7 +713,7 @@ struct BatchModRef
 struct BatchColRef
 {
     Tensor t;
-    std::uint32_t per_batch_cols;
+    std::uint32_t per_batch_cols = 1;   // 运行时视图参数（不进 key）；默认值供符号实例
 
     [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
     ExprOperand to_spec(SpecBuilder& sb) const
@@ -714,6 +738,8 @@ struct BroadcastRef : CpuViewCache
     Tensor t;
 
     BroadcastRef(Tensor tt) : t(std::move(tt)) { cache_cpu_view(t); }
+    // 符号实例（AOT 自登记）：结构由类型（Kind）与默认张量决定
+    BroadcastRef() = default;
 
     [[nodiscard]] Scalar eval(std::size_t i) const
     {
@@ -865,7 +891,9 @@ inline constexpr bool has_reduction_v<BroadcastRef<K>> = false;
 // 分组归约视图：每输出元素独立归约 R 行、元素间零依赖 → 非归约（留
 // 编译期模板路径；fail-safe 显式声明，防默认值漂移把它推进解释器）
 template <>
-inline constexpr bool has_reduction_v<GroupedReduceRef> = false;
+inline constexpr bool has_reduction_v<GroupedReduceSumRef> = false;
+template <>
+inline constexpr bool has_reduction_v<GroupedReduceMaxRef> = false;
 // matmul 叶子同样需走 eval_expr（matmul 预计算 + 逐元素链，引擎实现）
 template <>
 inline constexpr bool has_reduction_v<MatmulRef> = true;
@@ -934,10 +962,10 @@ inline constexpr bool has_reduction_v<Select<C, T, E>>
 { return RowAccessRef{std::move(t), offset, mod}; }
 
 // 分组归约（MaxPool 窗口归约等）：输入 (G*R, N) → 输出 (G, N)
-[[nodiscard]] inline GroupedReduceRef grouped_reduce_sum(Tensor t, std::uint32_t R)
-{ return GroupedReduceRef{std::move(t), R, /*is_max=*/false}; }
-[[nodiscard]] inline GroupedReduceRef grouped_reduce_max(Tensor t, std::uint32_t R)
-{ return GroupedReduceRef{std::move(t), R, /*is_max=*/true}; }
+[[nodiscard]] inline GroupedReduceSumRef grouped_reduce_sum(Tensor t, std::uint32_t R)
+{ return GroupedReduceSumRef{std::move(t), R}; }
+[[nodiscard]] inline GroupedReduceMaxRef grouped_reduce_max(Tensor t, std::uint32_t R)
+{ return GroupedReduceMaxRef{std::move(t), R}; }
 
 // ══════════════════════════════════════════════════════════════════════════
 // 归约自由函数：对输入 Tensor 直接归约 → 归约**视图**（GPU 融合更友好）；
@@ -1326,6 +1354,46 @@ template <typename E>
     std::fflush(nullptr);
     std::_Exit(3);
 }
+
+// ── AOT 自登记锚点（"结构 = 表达式类型"）──────────────────────────────────
+// 每个 `dsl::compute*` 实例化 odr-use 一个 `FusedAnchor<Expr>`：其**静态初始化期**
+// 把"从类型默认构造的符号实例"折叠出的结构登记进全局注册表（去重）。
+//
+// 与"执行路径捕获"（dry-run 跑 Layer）互补：
+//   · dry-run 只覆盖**跑到的**路径（配置分支没跑到就漏）；
+//   · 锚点覆盖**编译进来的每个调用点**——调用点在函数体里，函数被编译即实例化，
+//     与运行期是否走到该分支无关（因此这是"编译期可达"而非"运行期可达"）。
+//
+// ⚠ 只登记**结构**（sig=0）：精度签名取决于运行期张量精度（同一表达式里哪些
+//   输入是 f16），类型层面推不出来 → f16 带类型变体仍由 profile_f32/profile_f16
+//   两遍 dry-run 负责（自登记无法取代它）。
+//
+// 结构非法（裸视图作根 → 空指令表等）在构建期即 `_Exit(3)`，与 dry-run 同一闸门。
+//
+// 可用 `-DNN_SCAN_NO_ANCHOR` 关掉锚点做 A/B（只影响登记集合，不影响语义）。
+//
+// 锚点登记进**独立注册表**：scan_exprs 在结尾把两者合并并打印"锚点独有结构数"
+// —— 这是"结构覆盖已不依赖手写清单"的常驻台账（锚点独有 = 手写 dry-run 覆盖
+// 不到的调用点；该数突然变大通常意味着新增了未纳入 dry-run 的层路径）。
+[[nodiscard]] inline nn::fused::ExprRegistry& anchor_registry()
+{
+    static nn::fused::ExprRegistry reg;
+    return reg;
+}
+
+template <class Expr>
+struct FusedAnchor
+{
+    static inline const int reg = [] {
+        const Expr sym{};
+        auto [spec, inputs] = to_expr_spec(sym);
+        (void)inputs;   // 符号实例：inputs 全是占位张量，注册只用结构
+        if (auto v = validate_expr_spec(spec, spec.views.size()); !v)
+            scan_reject(v.error());
+        anchor_registry().add(spec, 0u);
+        return 0;
+    }();
+};
 #endif
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1349,6 +1417,10 @@ template <typename E>
     // 构建期扫描模式：折叠内联表达式的**结构**并登记进全局注册表，
     // 返回占位张量让 dry-run 流程继续（scan 只关心表达式集合，不真算）。
     // 表达式文本仍只出现在 Layer；这里登记的是派生物 ExprSpec。
+    // 自登记锚点：按**类型**登记结构（覆盖 dry-run 没跑到的调用点）
+#if !defined(NN_SCAN_NO_ANCHOR)
+    (void)FusedAnchor<E>::reg;
+#endif
     (void)eng;
     auto [spec, inputs] = to_expr_spec(e);
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)
@@ -1453,6 +1525,10 @@ template <typename E>
 {
 #ifdef NN_EXPR_SCAN
     // 构建期扫描：与 compute() 一样只登记结构（不真算、不关心 dst 的值）
+    // 自登记锚点（按类型登记结构）见 compute() 同名说明
+#if !defined(NN_SCAN_NO_ANCHOR)
+    (void)FusedAnchor<E>::reg;
+#endif
     (void)eng;
     auto [spec, inputs] = to_expr_spec(e);
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)
@@ -1527,6 +1603,10 @@ template <typename E>
     // 构建期扫描：同 compute()，登记结构（归约轴由 gen_fused 判定）。
     // 占位张量按归约轴取向量形状 (rows,1)/(1,cols)，使 Layer 后续
     // add_inplace 等形状相关操作在 dry-run 中不因形状失配而中断。
+    // 自登记锚点（按类型登记结构）见 compute() 同名说明
+#if !defined(NN_SCAN_NO_ANCHOR)
+    (void)FusedAnchor<E>::reg;
+#endif
     (void)eng;
     auto [spec, inputs] = to_expr_spec(e);
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)

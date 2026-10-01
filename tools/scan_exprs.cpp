@@ -25,7 +25,12 @@
 #include "compute_layer.hpp"
 #include "compute_loss.hpp"
 #include "compute_optimizer.hpp"
+#include "domain_cnn.hpp"
+#include "domain_gpt.hpp"
+#include "domain_mnist.hpp"
+#include "domain_rla.hpp"
 #include "expr_registry.hpp"
+#include "fused_generate.hpp"   // 生成阶段（原 gen_fused.cpp；不经 .bin 中间文件）
 #include "neuralnet.cpp/expr_fold.hpp"
 
 #include <csignal>
@@ -63,12 +68,27 @@ static nn::PrecisionProfile g_scan_prof{};
 
 int main(int argc, char* argv[])
 {
-    if (argc < 2)
+    // --list-backends：列出可用 emitter 后端（IR-D 多后端验证）
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--list-backends")
+        {
+            std::printf("[scan] 可用 emitter 后端（IR-D）:\n");
+            for (const auto& n : nn::emitter_registry::names())
+                std::printf("      - %s\n", n.c_str());
+            return 0;
+        }
+    if (argc < 3)
     {
-        std::fprintf(stderr, "用法: scan_exprs <out.bin>\n");
+        std::fprintf(stderr,
+                     "用法: scan_exprs <out_dir> <glslc_path> [<prec_backfill.txt>] "
+                     "[--list-backends]\n"
+                     "  收集 Layer 内联表达式（锚点自登记 + dry-run + 模型 pass），\n"
+                     "  原地合成 <out_dir>/fused_registry.hpp（不经 .bin 中间文件）。\n");
         return 2;
     }
-    const std::string out_path = argv[1];
+    const std::string out_dir  = argv[1];
+    const std::string glslc    = argv[2];
+    const std::string manifest = (argc >= 4) ? argv[3] : std::string{};
     std::signal(SIGABRT, &on_abort);   // NN_ASSERT → abort 带栈（见文件头）
 
     nn::CpuEngine raw_engine;
@@ -78,7 +98,7 @@ int main(int argc, char* argv[])
     // P-1 下沉后 f16 边界 cast 由基类 NVI 入口统一处理（原 PrecisionEngine
     // 适配层已删除，见 docs/development/15 §4.1）；原生 CpuEngine 从未见过
     // f16 张量（历史上直交属 UB，实测 heap corruption 0xC0000374）。
-    const auto dry_run = [&](nn::ComputeEngine& engine, const nn::PrecisionProfile& prof)
+    [[maybe_unused]] const auto dry_run = [&](nn::ComputeEngine& engine, const nn::PrecisionProfile& prof)
     {
         g_scan_prof = prof;
         // M1（docs/development/17 §4.1）：库外不再直构 Tensor——scan 输入经
@@ -107,151 +127,6 @@ int main(int argc, char* argv[])
         nn::Tensor q1 = scan_tensor(dk, 1);      // 增量推理（单位置）
         (void)rope.apply_step(engine, q1, /*pos=*/3, /*backward=*/false);
         (void)rope.apply_step(engine, q1, /*pos=*/3, /*backward=*/true);
-    }
-
-    // ── ReLU forward + backward（DSL 融合，CNN/RAPT 模型使用）────────────────
-    // forward:  max(x, 0)；backward: select(x>0, grad, 0)。
-    // 结构不依赖形状，任取一个 R×C 即可；先 forward 填 input_cache_ 再 backward。
-    {
-        const std::size_t R = 6, C = 9;
-        nn::ReLU relu;
-        relu.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
-        (void)relu.init(engine);   // M6 段 C：层由 init 绑定引擎
-        nn::Tensor input = scan_tensor(R, C);
-        (void)relu.forward(input);
-        nn::Tensor grad = scan_tensor(R, C);
-        (void)relu.backward(grad);
-    }
-
-    // ── SwiGLU backward（grad_gate / grad_up 两条内联表达式）──────────────
-    // 结构不依赖 d_ff，任取一个即可；先 forward 填充 cache 再 backward。
-    {
-        const std::size_t d_ff = 8;
-        nn::SwiGLU swiglu(d_ff);
-        swiglu.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
-        (void)swiglu.init(engine);   // M6 段 C：层由 init 绑定引擎
-        nn::Tensor input = scan_tensor(2 * d_ff, 5);
-        (void)swiglu.forward(input);
-        nn::Tensor grad = scan_tensor(d_ff, 5);
-        (void)swiglu.backward(grad);
-    }
-
-    // ── GeLU forward + backward（QuickGeLU 单表达式 DSL 融合）─────────────
-    // forward:  x / (1 + exp(-βx))；backward: grad_out * s*(1 + βx*(1-s))，
-    //           s = sigmoid(βx)。sigmoid 在 backward 用 input_cache_ 重算。
-    // 结构不依赖形状，任取一个 R×C 即可；先 forward 填 input_cache_ 再 backward。
-    {
-        const std::size_t R = 6, C = 9;
-        nn::GeLU gelu;
-        gelu.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
-        (void)gelu.init(engine);   // M6 段 C：层由 init 绑定引擎
-        nn::Tensor input = scan_tensor(R, C);
-        (void)gelu.forward(input);
-        nn::Tensor grad = scan_tensor(R, C);
-        (void)gelu.backward(grad);
-    }
-
-    // ── Softmax forward + backward（行归约融合）────────────────────────
-    // forward:  exp(x - row_max) / row_sum(exp(x - row_max))
-    // backward: out * (grad - row_dot(out * grad))
-    // 结构不依赖形状，任取一个 R×C 即可。
-    {
-        const std::size_t R = 6, C = 9;
-        nn::Softmax softmax;
-        softmax.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
-        (void)softmax.init(engine);   // M6 段 C：层由 init 绑定引擎
-        nn::Tensor input = scan_tensor(R, C);
-        (void)softmax.forward(input);   // 填充 output_cache_ + 登记 fwd 结构
-        nn::Tensor grad = scan_tensor(R, C);
-        (void)softmax.backward(grad);   // 登记 bwd 结构
-    }
-
-    // ── RMSNorm forward + backward（融合）────────────────────
-    // forward:  s=col_sum(x²)*invF+eps → rms_inv=rsqrt(s) → normed=x*rms_inv → out=normed*gamma
-    // backward: grad_x 列归约表达式 + grad_gamma 行归约表达式
-    {
-        const std::size_t F = 8, B = 5;
-        nn::RMSNorm rms(F);
-        rms.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
-        (void)rms.init(engine);
-        nn::Tensor input = scan_tensor(F, B);
-        (void)rms.forward(input);       // 填充 normed/rms_inv 缓存 + 登记 fwd 结构
-        nn::Tensor grad = scan_tensor(F, B);
-        (void)rms.backward(grad);       // 登记 bwd 结构
-    }
-
-    // ── LayerNorm forward + backward（融合）──────────────────
-    // forward: mean → diff → var → std_inv → normalized → out=normalized*gamma+beta
-    // backward: grad_x 列归约表达式 + grad_gamma/grad_beta 行归约表达式
-    {
-        const std::size_t F = 8, B = 5;
-        nn::LayerNorm ln(F);
-        ln.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
-        (void)ln.init(engine);
-        nn::Tensor input = scan_tensor(F, B);
-        (void)ln.forward(input);
-        nn::Tensor grad = scan_tensor(F, B);
-        (void)ln.backward(grad);
-    }
-
-    // ── ReLULinearAttention forward + backward（RLA 原语组合版逐元素链）──
-    // forward:  Sm=S·mask, S2=Sm·Sm, denom=sqrt(rowsum(S2)+1e-6), out=num/denom
-    // backward: dnum=dO/denom, prod=dO·num, ddenom=-dot/(denom²),
-    //           ddenom2=ddenom/(2·denom), dSm_den=2·Sm·ddenom2, dSm=dSm_num+dSm_den,
-    //           dS=dSm·mask
-    // 结构不依赖形状，任取一个小 d_model/seq 即可。
-    {
-        const std::size_t d_model = 8, heads = 2, seq = 4, batch = 2;
-        nn::ReLULinearAttention attn(d_model, heads, seq, /*causal=*/true,
-                                     nn::PosEncodingType::RoPE);
-        attn.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
-        (void)attn.init(engine);
-        nn::Tensor x = scan_tensor(d_model, batch * seq);
-        (void)attn.forward(x);                       // 填 cache + 登记 fwd 结构
-        nn::Tensor grad = scan_tensor(d_model, batch * seq);
-        (void)attn.backward(grad);                   // 登记 bwd 结构
-    }
-
-    // ── ReLULinearAttention（**双向** causal=false）forward + backward ───
-    // 双向分支与因果分支表达式不同（Bb = broadcast_row(dB_sum)；
-    // tsq = row_reduce_sum(scale·q)；gk = gK_B + row_broadcast(tsq)），
-    // 必须单独 dry-run：否则 GPU 运行到该分支未命中融合 shader 会硬报错。
-    {
-        const std::size_t d_model = 8, heads = 2, seq = 4, batch = 2;
-        nn::ReLULinearAttention attn_nc(d_model, heads, seq, /*causal=*/false,
-                                       nn::PosEncodingType::RoPE);
-        attn_nc.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
-        (void)attn_nc.init(engine);
-        nn::Tensor x = scan_tensor(d_model, batch * seq);
-        (void)attn_nc.forward(x);
-        nn::Tensor grad = scan_tensor(d_model, batch * seq);
-        (void)attn_nc.backward(grad);
-    }
-
-    // ── GPTBlock forward + backward（残差相加 A+B）────────────────────────
-    {
-        const std::size_t d_model = 16, heads = 2, d_ff = 32, seq = 4, batch = 2;
-        nn::GPTBlock block(d_model, heads, d_ff, /*max_len=*/1024, /*seq_len=*/seq,
-                           nn::PosEncodingType::Learned, nn::ActivationType::GeLU,
-                           nn::NormType::LayerNorm);
-        block.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
-        (void)block.init(engine);
-        nn::Tensor x = scan_tensor(d_model, batch * seq);
-        (void)block.forward(x);
-        nn::Tensor grad = scan_tensor(d_model, batch * seq);
-        (void)block.backward(grad);
-    }
-
-    // ── TransformerEncoderLayer forward + backward（残差相加 + 位置编码）──
-    {
-        const std::size_t d_model = 16, heads = 2, d_ff = 32, seq = 4, batch = 2;
-        nn::TransformerEncoderLayer enc(d_model, heads, d_ff, seq);
-        enc.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
-        (void)enc.init(engine);
-        nn::Tensor x = scan_tensor(d_model, batch * seq);
-        (void)enc.forward(x);
-        nn::Tensor grad = scan_tensor(d_model, batch * seq);
-        (void)enc.backward(grad);
     }
 
     // ── MSELoss forward（diff = pred-target；diff_sq = diff*diff）────────
@@ -301,24 +176,6 @@ int main(int argc, char* argv[])
                 (void)opt->clip_grad_norm(nn::Scalar{1e3f});
             }
         }
-    }
-
-    // ── Linear forward + backward（算子融合二期 S4：matmul+bias 融合路径）──
-    // Linear::forward 实现为 dsl::compute(matmul(W,x) + row_broadcast(b))：
-    // 折叠出前置 matmul 段 + 尾逐元素链（Add + RowBroadcast 视图）。
-    // Linear::backward 的 grad_w 累加实现为
-    // dsl::compute(grad_w + matmul(grad_out, input^T))（matmul 段 + Add 融合）。
-    // 两者都必须 dry-run 覆盖：GPU 运行时同一结构命中 AOT 融合 shader（闭合
-    // 世界两端一致）。结构不依赖形状，任取一个 in/out/batch 即可。
-    {
-        const std::size_t in_f = 8, out_f = 5, B = 4;
-        nn::Linear linear(in_f, out_f);
-        linear.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
-        (void)linear.init(engine);
-        nn::Tensor input = scan_tensor(in_f, B);
-        (void)linear.forward(input);
-        nn::Tensor grad_out = scan_tensor(out_f, B);
-        (void)linear.backward(grad_out);   // 登记 grad_w 融合结构
     }
 
     // ── 算子融合二期（docs/development/02-operator-fusion.md）：matmul 参与 IR 融合 ──
@@ -507,66 +364,6 @@ int main(int argc, char* argv[])
         (void)ce.forward_sparse(engine, logits, labels2, {}, C);
     }
 
-    // ── Conv2D forward + backward（matmul 段融合 bias / 融合累加）──────────
-    // forward : Z = matmul(W, im2col(x)) + row_broadcast(b) —— matmul 段 + 尾链
-    // backward: grad_w += matmul(gZ, col^T) —— matmul 段 + 原地累加（compute_into）
-    // 两者都必须 dry-run：GPU 运行时同一结构才能命中 AOT 融合 shader。
-    // 结构不依赖形状，任取小尺寸即可。
-    {
-        const std::size_t c_in = 1, c_out = 2, k = 3, in_h = 5, in_w = 5, batch = 2;
-        nn::Conv2D conv(c_in, c_out, k, /*stride=*/1, /*padding=*/0, in_h, in_w);
-        conv.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
-        (void)conv.init(engine);
-        const std::size_t oh = in_h - k + 1, ow = in_w - k + 1;
-        nn::Tensor x = scan_tensor(c_in * in_h * in_w, batch);
-        if (auto fr = conv.forward(x); !fr)
-        {
-            std::fprintf(stderr, "[scan] Conv2D forward FAILED: %s\n",
-                         fr.error().message.c_str());
-            std::fflush(stderr);
-            std::abort();
-        }
-        nn::Tensor grad = scan_tensor(c_out * oh * ow, batch);
-        if (auto br = conv.backward(grad); !br)
-        {
-            std::fprintf(stderr, "[scan] Conv2D backward FAILED: %s\n",
-                         br.error().message.c_str());
-            std::fflush(stderr);
-            std::abort();
-        }
-    }
-
-    // ── MaxPool2D forward + backward（分组归约视图 + 窗口 mask 表达式）────────
-    // forward : im2col → grouped_reduce_max 视图（+ rparam(0) 使根节点合法）
-    // backward: mask = select(窗口 == 广播(窗口max), 广播(g/cnt), 0)，
-    //           cnt = grouped_reduce_sum 视图（同样 + rparam(0)）
-    //           —— **必须 dry-run**：该表达式未被扫描覆盖时
-    //           GPU 运行到它会因闭合世界未命中而硬报错。
-    {
-        const std::size_t c = 2, in_h = 6, in_w = 6, pool = 2, stride = 2, batch = 2;
-        nn::MaxPool2D mp(c, in_h, in_w, pool, stride);
-        mp.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
-        (void)mp.init(engine);   // M6 段 C：层由 init 绑定引擎
-        const std::size_t oh = (in_h - pool) / stride + 1;
-        const std::size_t ow = (in_w - pool) / stride + 1;
-        nn::Tensor x = scan_tensor(c * in_h * in_w, batch);
-        if (auto fr = mp.forward(x); !fr)
-        {
-            std::fprintf(stderr, "[scan] MaxPool2D forward FAILED: %s\n",
-                         fr.error().message.c_str());
-            std::fflush(stderr);
-            std::abort();
-        }
-        nn::Tensor grad = scan_tensor(c * oh * ow, batch);
-        if (auto br = mp.backward(grad); !br)
-        {
-            std::fprintf(stderr, "[scan] MaxPool2D backward FAILED: %s\n",
-                         br.error().message.c_str());
-            std::fflush(stderr);
-            std::abort();
-        }
-    }
-
     // ── 归约表达式内联常量（push-constant 头长度回归）────────────────────
     // `col_reduce_sum(select(cond, 1, 0))` 是**带常量池的归约**结构：GPU 侧
     // push-constant 固定头长度必须按形态算（归约且无 matmul = 4 个 uint）。
@@ -585,9 +382,152 @@ int main(int argc, char* argv[])
     }
 
     };   // dry_run 结束
+#if !defined(NN_SCAN_NO_DRYRUN)
     dry_run(raw_engine, nn::profile_f32());   // f32 pass：sig == 0（基础结构表）
     dry_run(raw_engine, nn::profile_f16());   // Phase 2：收集 (结构, 精度签名)；
+#endif
+    // 分项台账快照（末尾合并时打印；见"结构来源"行）
+    const std::size_t n_after_dry = nn::fused::global_registry().specs.size();
+    const std::size_t v_after_dry = nn::fused::global_registry().variants.size();
     // f16 安全由基类边界 cast 入口保证（原 PrecisionEngine 适配层已下沉删除）
+
+    // ── 模型级 pass：用 shipped 工厂建模型跑 fwd/bwd（补"整模型路径"的签名）──
+    // per-layer dry-run 块只覆盖"层被单独造出来"的路径；有些调用点只在**完整模型**
+    // 里才会执行到（GPT/RAPT 的 LM head、PatchEmbedding、模型级位置编码等），
+    // 它们此前既没有结构（现已由 FusedAnchor 自登记补齐）也没有精度签名
+    // → `--f16` 下走边界 cast。本 pass 让这些路径也产出签名。
+    //
+    // 失败不硬失败：本 pass 是**增量**，主路径已由 dry-run + 锚点覆盖；
+    // 某一模型配置跑不通不应让整个构建失败（但不吞掉信息 → 打 [scan][warn]）。
+    const auto model_pass = [&](nn::ComputeEngine& engine,
+                                const nn::PrecisionProfile& prof)
+    {
+        g_scan_prof = prof;
+        const std::size_t B = 3;
+        // 扫描期占位张量（精度 = 当前 pass 的 compute 精度，与真实运行同源）
+        const auto scan_tensor = [&](std::size_t rows, std::size_t cols)
+        { return engine.create_tensor(rows, cols, g_scan_prof.compute); };
+        // 跑一个模型：forward → 取其输出形状造梯度 → backward
+        const auto run = [&](nn::Model& model, const nn::Tensor& input, const char* name)
+        {
+            auto out = model.forward(input);
+            if (!out)
+            {
+                std::fprintf(stderr, "[scan][warn] %s forward 失败：%s\n", name,
+                             out.error().message.c_str());
+                return;
+            }
+            nn::Tensor grad = scan_tensor(out->rows(), out->cols());
+            auto br = model.backward(grad);
+            if (!br)
+                std::fprintf(stderr, "[scan][warn] %s backward 失败：%s\n", name,
+                             br.error().message.c_str());
+        };
+        const auto try_build = [&](const char* name, auto&& build, const nn::Tensor& input)
+        {
+            auto m = build();
+            if (!m)
+            {
+                std::fprintf(stderr, "[scan][warn] %s 构建失败：%s\n", name,
+                             m.error().message.c_str());
+                return;
+            }
+            run(*m, input, name);
+        };
+
+        // 小配置（覆盖各"结构分支"：位置编码 / 激活 / 归一化 / 池化 / causal）
+        constexpr std::size_t V = 64, S = 8, D = 16, H = 2, F = 32, L = 2;
+        // id 输入：概念上是整数索引 → 恒 f32（text_train 同口径）；
+        //   gather_rows 按值取行，必须填**合法** id（否则越界）
+        const auto id_input = [&](std::size_t seq, std::size_t vocab)
+        {
+            nn::Tensor t = engine.create_tensor(seq, B, nn::Precision::F32);
+            std::vector<nn::Scalar> v(seq * B);
+            for (std::size_t i = 0; i < v.size(); ++i)
+                v[i] = static_cast<nn::Scalar>(i % vocab);
+            (void)engine.write(t, std::span<nn::Scalar>(v));
+            return t;
+        };
+        const nn::Tensor ids = id_input(S, V);
+
+        // ── 1) MNIST MLP：归一化维（LayerNorm/RMSNorm/BatchNorm 是三条不同
+        //        融合表达式：归约链形状与原地更新都不同）──
+        for (const auto nrm : {nn::NormType::LayerNorm, nn::NormType::RMSNorm,
+                               nn::NormType::BatchNorm})
+        {
+            const char* nm = (nrm == nn::NormType::LayerNorm) ? "mnist_mlp_ln"
+                           : (nrm == nn::NormType::RMSNorm)   ? "mnist_mlp_rms"
+                                                              : "mnist_mlp_bn";
+            try_build(nm,
+                      [&] { return nn::build_mnist_mlp_model(
+                                engine, nn::MNIST_LAYER_DIMS, nrm, prof); },
+                      scan_tensor(nn::MNIST_LAYER_DIMS.front(), B));
+        }
+        // ── 2) MNIST Transformer（ViT 风格；输入 img²）──
+        try_build("mnist_transformer",
+                  [&] { return nn::build_mnist_transformer_model(
+                            engine, nn::MNIST_IMG_SIZE, nn::MNIST_PATCH_SIZE,
+                            nn::MNIST_TF_D_MODEL, nn::MNIST_TF_NUM_HEADS,
+                            nn::MNIST_TF_D_FF, nn::MNIST_TF_NUM_LAYERS, prof); },
+                  scan_tensor(nn::MNIST_IMG_SIZE * nn::MNIST_IMG_SIZE, B));
+        // ── 3) CNN：池化窗口维（R 是运行期视图参数，pool=3 → R=9）──
+        for (const std::size_t pool : {std::size_t{2}, std::size_t{3}})
+        {
+            nn::CnnConfig cfg;
+            cfg.convs = nn::MNIST_CNN_CONVS;
+            cfg.fc_dims = nn::MNIST_CNN_FC;
+            cfg.pool = pool;
+            // 注：CnnConfig 无精制度字段（CNN 走默认 f32 profile）
+            try_build(pool == 2 ? "cnn_pool2" : "cnn_pool3",
+                      [&] { return nn::build_cnn_model(engine, cfg); },
+                      scan_tensor(1 * 28 * 28, B));
+        }
+        // ── 4) GPT：位置编码 × 激活 × 归一化（每一维都换一组融合表达式：
+        //        ALiBi 走分数侧偏置、Sinusoidal 走嵌入侧、RoPE 走 Q/K 侧、
+        //        SwiGLU ≠ GeLU、RMSNorm ≠ LayerNorm）──
+        struct GptCase
+        {
+            const char*          name;
+            nn::PosEncodingType  pe;
+            nn::ActivationType   act;
+            nn::NormType         norm;
+        };
+        for (const GptCase& c : {
+                 GptCase{"gpt_learned_gelu_ln", nn::PosEncodingType::Learned,
+                         nn::ActivationType::GeLU, nn::NormType::LayerNorm},
+                 GptCase{"gpt_alibi_gelu_ln", nn::PosEncodingType::ALiBi,
+                         nn::ActivationType::GeLU, nn::NormType::LayerNorm},
+                 GptCase{"gpt_sinusoidal_gelu_ln", nn::PosEncodingType::Sinusoidal,
+                         nn::ActivationType::GeLU, nn::NormType::LayerNorm},
+                 GptCase{"gpt_rope_gelu_ln", nn::PosEncodingType::RoPE,
+                         nn::ActivationType::GeLU, nn::NormType::LayerNorm},
+                 GptCase{"gpt_learned_swiglu_rms", nn::PosEncodingType::Learned,
+                         nn::ActivationType::SwiGLU, nn::NormType::RMSNorm}})
+        {
+            nn::GptConfig cfg;
+            cfg.vocab_size = V; cfg.d_model = D; cfg.seq_len = S;
+            cfg.num_heads = H; cfg.d_ff = F; cfg.num_layers = L;
+            cfg.pos_enc = c.pe; cfg.activation = c.act; cfg.norm_type = c.norm;
+            cfg.precision = prof;
+            try_build(c.name, [&] { return nn::build_gpt_model(engine, cfg); }, ids);
+        }
+        // ── 5) RAPT：causal 维（RLA 的因果/双向是两组不同表达式）──
+        for (const bool causal : {true, false})
+        {
+            nn::RAPTConfig cfg;
+            cfg.vocab_size = V; cfg.d_model = D; cfg.seq_len = S;
+            cfg.num_heads = H; cfg.d_ff = F; cfg.num_layers = L;
+            cfg.pos_enc = nn::PosEncodingType::RoPE;   // RAPT v1 仅支持 RoPE
+            cfg.causal = causal;
+            cfg.precision = prof;
+            try_build(causal ? "rapt_causal" : "rapt_bidir",
+                      [&] { return nn::build_rapt_model(engine, cfg); }, ids);
+        }
+    };
+    model_pass(raw_engine, nn::profile_f32());   // 结构 + 全 f32 签名
+    model_pass(raw_engine, nn::profile_f16());   // 整模型路径的 f16 签名
+    const std::size_t n_after_model = nn::fused::global_registry().specs.size();
+    const std::size_t v_after_model = nn::fused::global_registry().variants.size();
     // ── fold v1（标量域）分块状态归约（表达式集合登记）──────────────────────────
     // 三个共享样例（expr_fold.hpp——与 fused_gpu_test 对拍**同源构造** →
     // key 一致、闭合世界命中）：rowmax / rowsum / softmax_denom(online 双
@@ -642,14 +582,56 @@ int main(int argc, char* argv[])
         }
     }
 
+    const std::size_t n_before_anchor = nn::fused::global_registry().specs.size();
+    const std::size_t v_before_anchor = nn::fused::global_registry().variants.size();
     auto& reg = nn::fused::global_registry();
-    if (!nn::fused::write_registry(out_path, reg))
+    // ── 合并自登记锚点的结构（"结构 = 表达式类型"，见 expr_dsl.hpp）─────────
+    // 锚点在静态初始化期按**类型**登记，覆盖"编译进来但 dry-run 未执行到"的
+    // 调用点（配置分支、未被 dry-run 造过的层路径）。两者合并后写盘。
     {
-        std::fprintf(stderr, "[FAIL] 无法写入 %s\n", out_path.c_str());
-        return 1;
+        auto& anchor = nn::dsl::anchor_registry();
+        for (const auto& s : anchor.specs)
+            reg.add(s, 0u);
+        std::printf("[scan] 结构来源：dry-run %zu（含模型 pass +%zu、显式登记 +%zu）"
+                    " + 锚点 %zu → 合并 %zu（锚点独有 %zu）\n",
+                    n_after_dry,
+                    n_after_model - n_after_dry,
+                    n_before_anchor - n_after_model,
+                    anchor.specs.size(), reg.specs.size(),
+                    reg.specs.size() - n_before_anchor);
+        std::printf("[scan] 签名来源：dry-run %zu + 模型 pass %zu + 显式登记 %zu = %zu\n",
+                    v_after_dry, v_after_model - v_after_dry,
+                    v_before_anchor - v_after_model, v_before_anchor);
+        // 锚点独有 = 手写 dry-run 覆盖不到的调用点（该数突然变大 → 有新层路径
+        // 没纳入 dry-run）。锚点只登记结构（sig=0），故这些结构默认没有 f16
+        // 带类型变体 —— 下面单独报告。
+        if (anchor.specs.empty() || n_before_anchor == reg.specs.size())
+            std::fprintf(stderr,
+                "[scan][warn] 锚点未贡献任何结构：可能被 -DNN_SCAN_NO_ANCHOR 关闭，"
+                "或所有调用点都已被 dry-run 覆盖\n");
     }
-    std::printf("[scan] 收集到 %zu 条融合表达式 -> %s\n",
-                reg.specs.size(), out_path.c_str());
+    std::printf("[scan] 收集到 %zu 条融合表达式\n", reg.specs.size());
+    // ── 签名覆盖报告：哪些结构**没有任何带类型变体** ──────────────────────
+    // 自登记只能给结构（sig=0）：精度签名取决于运行期张量精度，类型层面推不出来
+    // → f16 带类型变体仍须 dry-run 的 f32/f16 两遍产生。缺变体不是错误
+    // （运行时回退边界 cast，正确但慢），但新增融合表达式时应当看到这一行。
+    {
+        std::size_t no_variant = 0;
+        for (const auto& s : reg.specs)
+        {
+            const std::string k = nn::expr_spec_key(s);
+            bool has = false;
+            for (const auto& v : reg.variants)
+                if (nn::expr_spec_key(v.spec) == k) { has = true; break; }
+            if (!has) ++no_variant;
+        }
+        if (no_variant)
+            std::printf("[scan][note] %zu/%zu 条结构没有带类型变体"
+                        "（缺 f16 时运行时回退边界 cast：正确但更慢；"
+                        "补法 = 让 dry-run 覆盖该 Layer 路径，或用 NN_PREC_TRACE "
+                        "收集后加进 tools/prec_backfill.txt）\n",
+                        no_variant, reg.specs.size());
+    }
     // 带类型变体（in-kernel f16）：结构相同、精度签名不同 —— 每个 (结构, 签名)
     // 需要一个独立 shader；打印分类统计便于确认扫描覆盖（哪些是纯逐元素、
     // 含 matmul 段或 fold 段）。
@@ -671,5 +653,9 @@ int main(int argc, char* argv[])
     {
         std::printf("[scan] 精度变体 0 条（f16 pass 未产生非零签名）\n");
     }
+    // ── 生成阶段（原 gen_fused）：同一进程内直接消费注册表 → fused_registry.hpp
+    //    构建期因此只有一步；不再经 expr_specs.bin 中间序列化。
+    if (!nn::tool::generate_fused_registry(out_dir, glslc, reg, manifest))
+        return 1;
     return 0;
 }
