@@ -80,15 +80,15 @@ int main(int argc, char* argv[])
     if (argc < 3)
     {
         std::fprintf(stderr,
-                     "用法: scan_exprs <out_dir> <glslc_path> [<prec_backfill.txt>] "
-                     "[--list-backends]\n"
-                     "  收集 Layer 内联表达式（锚点自登记 + dry-run + 模型 pass），\n"
-                     "  原地合成 <out_dir>/fused_registry.hpp（不经 .bin 中间文件）。\n");
+                     "用法: scan_exprs <out_dir> <glslc_path> [--list-backends]\n"
+                     "  收集 Layer 内联表达式的**结构**（锚点自登记 + dry-run + 模型 pass），\n"
+                     "  原地合成 <out_dir>/fused_registry.hpp（不经 .bin 中间文件）。\n"
+                     "  精度签名不再是构建期集合：生成阶段对每个结构发一份运行期\n"
+                     "  精度分派 shader（键 key#x），运行时按真实精度填 PC `prec`。\n");
         return 2;
     }
     const std::string out_dir  = argv[1];
     const std::string glslc    = argv[2];
-    const std::string manifest = (argc >= 4) ? argv[3] : std::string{};
     std::signal(SIGABRT, &on_abort);   // NN_ASSERT → abort 带栈（见文件头）
 
     nn::CpuEngine raw_engine;
@@ -383,8 +383,11 @@ int main(int argc, char* argv[])
 
     };   // dry_run 结束
 #if !defined(NN_SCAN_NO_DRYRUN)
-    dry_run(raw_engine, nn::profile_f32());   // f32 pass：sig == 0（基础结构表）
-    dry_run(raw_engine, nn::profile_f16());   // Phase 2：收集 (结构, 精度签名)；
+    // ⚠ 只跑 f32 一遍：**实测 f16 遍对结构贡献为 0**（NN_SCAN_F32_ONLY 探针：
+    // 跳过 f16 遍后签名 66 → 0，结构恒 84）。f16 遍存在的唯一理由是发现精度
+    // 签名，而签名已不再是构建期集合（生成阶段对每个结构发运行期分派 shader，
+    // 键 key#x，运行期按真实精度填 PC `prec`）→ 该遍删除，扫描工作量减半。
+    dry_run(raw_engine, nn::profile_f32());   // 结构（与精度无关）
 #endif
     // 分项台账快照（末尾合并时打印；见"结构来源"行）
     const std::size_t n_after_dry = nn::fused::global_registry().specs.size();
@@ -524,8 +527,8 @@ int main(int argc, char* argv[])
                       [&] { return nn::build_rapt_model(engine, cfg); }, ids);
         }
     };
-    model_pass(raw_engine, nn::profile_f32());   // 结构 + 全 f32 签名
-    model_pass(raw_engine, nn::profile_f16());   // 整模型路径的 f16 签名
+    // 模型 pass：**结构**来源（运行期配置相关的路径），与精度无关 → 只跑 f32。
+    model_pass(raw_engine, nn::profile_f32());
     const std::size_t n_after_model = nn::fused::global_registry().specs.size();
     const std::size_t v_after_model = nn::fused::global_registry().variants.size();
     // ── fold v1（标量域）分块状态归约（表达式集合登记）──────────────────────────
@@ -611,51 +614,22 @@ int main(int argc, char* argv[])
                 "或所有调用点都已被 dry-run 覆盖\n");
     }
     std::printf("[scan] 收集到 %zu 条融合表达式\n", reg.specs.size());
-    // ── 签名覆盖报告：哪些结构**没有任何带类型变体** ──────────────────────
-    // 自登记只能给结构（sig=0）：精度签名取决于运行期张量精度，类型层面推不出来
-    // → f16 带类型变体仍须 dry-run 的 f32/f16 两遍产生。缺变体不是错误
-    // （运行时回退边界 cast，正确但慢），但新增融合表达式时应当看到这一行。
-    {
-        std::size_t no_variant = 0;
-        for (const auto& s : reg.specs)
-        {
-            const std::string k = nn::expr_spec_key(s);
-            bool has = false;
-            for (const auto& v : reg.variants)
-                if (nn::expr_spec_key(v.spec) == k) { has = true; break; }
-            if (!has) ++no_variant;
-        }
-        if (no_variant)
-            std::printf("[scan][note] %zu/%zu 条结构没有带类型变体"
-                        "（缺 f16 时运行时回退边界 cast：正确但更慢；"
-                        "补法 = 让 dry-run 覆盖该 Layer 路径，或用 NN_PREC_TRACE "
-                        "收集后加进 tools/prec_backfill.txt）\n",
-                        no_variant, reg.specs.size());
-    }
-    // 带类型变体（in-kernel f16）：结构相同、精度签名不同 —— 每个 (结构, 签名)
-    // 需要一个独立 shader；打印分类统计便于确认扫描覆盖（哪些是纯逐元素、
-    // 含 matmul 段或 fold 段）。
+    // ── 签名覆盖：**不再需要背书** ────────────────────────────────────────
+    // 生成阶段对每个结构无条件发一份运行期精度分派 shader（键 key#x）——
+    // 输入/输出双视图 + PC `prec`，一份覆盖任意 (输入精度位图, 输出精度)。
+    // 因此：
+    //   · 结构 = 唯一需要"收集"的东西（锚点 + dry-run/模型 pass）；
+    //   · 签名**不再是构建期集合**，无需 dry-run 的 f16 遍、无需回填清单，
+    //     运行期也不存在 miss / 边界 cast 回退。
+    // 下面只保留结构侧的诊断（dry-run 的 profile 遍仍会走 Layer，用于暴露
+    // 运行期配置相关的结构，与签名无关）。
     if (!reg.variants.empty())
-    {
-        std::size_t plain = 0, with_mm = 0, with_fold = 0, out_f16 = 0;
-        for (const auto& v : reg.variants)
-        {
-            if (v.spec.fold) ++with_fold;
-            else if (v.spec.matmul) ++with_mm;
-            else ++plain;
-            if (nn::expr_prec_sig_out_f16(v.sig)) ++out_f16;
-        }
-        std::printf("[scan] 精度变体 %zu 条（纯逐元素 %zu / 含 matmul 段 %zu / fold %zu；"
-                    "输出 f16 者 %zu）\n",
-                    reg.variants.size(), plain, with_mm, with_fold, out_f16);
-    }
-    else
-    {
-        std::printf("[scan] 精度变体 0 条（f16 pass 未产生非零签名）\n");
-    }
+        std::printf("[scan] 精度变体 %zu 条（历史数据；生成阶段已不再消费——"
+                    "分派 shader 覆盖全部签名）\n",
+                    reg.variants.size());
     // ── 生成阶段（原 gen_fused）：同一进程内直接消费注册表 → fused_registry.hpp
     //    构建期因此只有一步；不再经 expr_specs.bin 中间序列化。
-    if (!nn::tool::generate_fused_registry(out_dir, glslc, reg, manifest))
+    if (!nn::tool::generate_fused_registry(out_dir, glslc, reg))
         return 1;
     return 0;
 }
