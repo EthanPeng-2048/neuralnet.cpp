@@ -583,6 +583,16 @@ if(Vulkan_FOUND)
         nn_enable_gpu_fusion(fusion_custom_layer_example
             MAIN ${CMAKE_SOURCE_DIR}/examples/fusion_custom_layer_main.cpp)
 
+        # A2 验收注册为**常驻 ctest**：这是"库外使用者写 dsl::compute + 一行
+        # CMake → GPU 能跑"的唯一自动门禁（含 f16 运行期精度分派 `key#x` 路径
+        # 与归一化形态）。无 Vulkan 设备时退出码 77 = skip。
+        if(NN_ENABLE_TESTS)
+            add_test(NAME fusion_custom_layer_example
+                     COMMAND fusion_custom_layer_example)
+            set_tests_properties(fusion_custom_layer_example
+                PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
+
         message(STATUS "GPU acceleration enabled (Vulkan compute)")
     endif()
 else()

@@ -264,7 +264,7 @@ optimizer.step();
 | `development/06-rapt-algorithm.md` | **线性注意力（RLA → RAPT → RLA-2）：直观理解 + 数学定义 + 扫描原语工程落地 + 训练显存开关** |
 | `development/08-pitfalls-and-lessons.md` | **踩坑警示录，改代码前读** |
 | `development/10-development-standards.md` | C++ 编码规范全文 |
-| `development/12-compute-engine-inventory.md` | **引擎接口盘点（复现：`bench/doc_inventory.ps1`）：49 个 virtual 方法、Layer 直调 21 个（基础设施/数据搬运/状态扫描/fold 登记）、两套 CPU 求值机制（DSL 模板 + IR 解释器）、ctest 19 个测试；演进记录见 `docs/history.md`** |
+| `development/12-compute-engine-inventory.md` | **引擎接口盘点（复现：`bench/doc_inventory.ps1`）：49 个 virtual 方法、Layer 直调 21 个（基础设施/数据搬运/状态扫描/fold 登记）、两套 CPU 求值机制（DSL 模板 + IR 解释器）、ctest 20 个测试；演进记录见 `docs/history.md`** |
 | `development/13-refactor-backlog.md` | **已合并的重定向 stub（2026-10-01）：未完成项与裁定台账迁入 `development/18-roadmap.md`；已完成 / 被否决 / 已执行记录在 `docs/history.md`** |
 | `development/15-computeengine-refresh.md` | **ComputeEngine Refresh 详细设计（13 §10 展开）：张量出生绑定 + `import` + 存储多态；含 P-1（PrecisionEngine 下沉删除）与 P1（出生绑定 + `bind_check_` 跨引擎检查 + `adopt` 内部通道，**两项均已实施 2026-09-29**）与 D1-D9 未决点裁定；**未实施的 P2-P6 已被 17 吸收改期（M1-M7），后续立项读 17** |
 | `development/16-computeengine-p0-inventory.md` | **Refresh P0 盘点结果（2026-09-28）：ensure_gpu 43 分类 / ComputeEngine& 175 打标 / 宿主中转 381 清单 / ctest 双基线（Lavapipe 20 20、Mali offload 非确定）/ GPU 稳定性探针与未决 7 项** |
@@ -287,7 +287,7 @@ optimizer.step();
 
 ### 已知问题
 
-- **GPU `stable=f16` 训练 loss 打印冻结（未修）**：`text_train --precision-stable f16` 时 step 恒 4.0137、跨 epoch/跨进程逐位相同；**权重照常更新**（同进程跨 epoch 模型快照 63% 参数字节不同，冻结仅在 loss 回读链）；CPU 同配置健康；ctest 全绿（19/19）但**无 GPU+stable=f16 用例**。触发矩阵、覆盖缺口与证据见 `docs/development/14-f16-stable-gpu-loss-frozen.md`。推荐路径 `--f16`（stable/optimizer=f32）实测健康。
+- **GPU `stable=f16` 训练 loss 打印冻结（未修）**：`text_train --precision-stable f16` 时 step 恒 4.0137、跨 epoch/跨进程逐位相同；**权重照常更新**（同进程跨 epoch 模型快照 63% 参数字节不同，冻结仅在 loss 回读链）；CPU 同配置健康；ctest 全绿（20/20）但**无 GPU+stable=f16 用例**。触发矩阵、覆盖缺口与证据见 `docs/development/14-f16-stable-gpu-loss-frozen.md`。推荐路径 `--f16`（stable/optimizer=f32）实测健康。
 - **数值性限制**：四字段全 f16 不可训练——`optimizer=f16` 单独即令 Adam 更新爆炸、`stable=f16` 链约 200 步 NaN，见 `docs/development/05-mixed-precision.md` §12.5；常规 f32 训练健康收敛。
 - **不存在的 CLI 参数**：`--tdr-retry`/`--max-tdr-retries` 与 `mnist_train --osc-guard`/`--osc-window`/`--osc-threshold`（**均已移除**：前两者从未实现，后三者属"帮助声明了、解析分支不存在"的幽灵选项，2026-10-01 已从帮助/控制器/GUI 三层清除，详见 `docs/history.md`「GUI / CLI 参数一致性清理」）。
 - **`text_train --model zipt` 启动即中止（未修）** → **已随 ZiPT 整体移除而消失（2026-10-01）**：AttnZip/ZiPT 已从主线移除（`--model zipt` 现在直接报"未知模型架构"并给出迁移提示），代码保留在 **`legacy/zipt` 分支**。**恢复前提（两条同时满足）**：① **算法层**——压缩向量必须因果（压缩器只能看当前位置之前的内容）；② **代码层**——实现质量对齐 RAPT/GPT（支持 `forward_recompute` 梯度检查点与 activation offload、CLI/序列化/测试齐备）。裁决依据见 `docs/history.md`「ZiPT 移除」条。已移除的 API：`ZiPTModel`/`ZiPTBlock`/`CrossAttention`、`build_zipt_model*`/`make_zipt_spec`/`ZiPTConfig`/`ZIPT_MEMORY_TOKENS`、`ModelSpec::is_zipt()` 与 `memory_tokens`/`window` 字段、CLI `--model zipt`/`--window`/`--memory-tokens`、`zipt_test`；`ModelType` 的 6 号枚举保留为 `Reserved_ZiPT` 占位，用于对旧 `.bin`（type=6）给出明确错误。
@@ -314,7 +314,7 @@ optimizer.step();
 - **评估分块**：`evaluate_mnist` 的 `eval_batch`（默认 1000）分块前向 + 每块 `release_idle_pool_blocks()`，防大 batch 评估 OOM。
 - **BPE 保序并行 encode**：`Tokenizer::set_encode_threads`（0=自动/1=顺序/>1=指定）+ `encode_segments_`——按空白安全切分点分段、段内经全局线程池并发编码、**按段下标升序拼接**，任意并行度与顺序执行**逐字节一致**（铁律 #8；切分点必为 chunk 边界、标记不含空白不会被切断）；文本 < 256 KiB 或找不到切分点回退顺序路径。`bpe_merge_impl_` 改 thread_local `BpeMergeScratch` + 手写堆，每 chunk 合并**零堆分配**。`text_train::parallel_tokenize` 收编到 `nn::parallel_for_samples`，`tokenizer_infer` 新增 `--threads`。实测 8 MiB 多样文本 `encode` 0.93s→0.134s（32 线程，7.0x）；`.tokcache` 重新生成 SHA256 与旧实现一致。**训练期合并循环仍不可并行**（链式依赖，见 `docs/development/08` §4.2）。
 - **CPU 性能**：DSL 模板路径向量化/并行、`dsl::compute_into` 零分配原地更新、`Tensor::cpu_get_ptr`、分块 GEMM 内核（BLOCK_SIZE=64）。
-- **测试**：ctest 注册 19 个测试（18 个测试目标 + `cnn_test_gpu` = `cnn_test --gpu`；`-DNN_ENABLE_TESTS=ON`；需 Vulkan 的用例退出码 77 = skip）。
+- **测试**：ctest 注册 **20** 个测试（**18** 个测试目标 + `cnn_test_gpu` = `cnn_test --gpu` + `fusion_custom_layer_example` = 库外使用者形态的 AOT 融合端到端门禁；`-DNN_ENABLE_TESTS=ON`；需 Vulkan 的用例退出码 77 = skip）。
 
 ### 融合二期状态与 IR 编码约束（改融合/IR 代码前必读）
 
