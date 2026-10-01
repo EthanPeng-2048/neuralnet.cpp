@@ -30,6 +30,7 @@
 #include "domain_mnist.hpp"
 #include "domain_rla.hpp"
 #include "expr_registry.hpp"
+#include "fused_generate.hpp"   // 生成阶段（原 gen_fused.cpp；不经 .bin 中间文件）
 #include "neuralnet.cpp/expr_fold.hpp"
 
 #include <csignal>
@@ -67,12 +68,27 @@ static nn::PrecisionProfile g_scan_prof{};
 
 int main(int argc, char* argv[])
 {
-    if (argc < 2)
+    // --list-backends：列出可用 emitter 后端（IR-D 多后端验证）
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--list-backends")
+        {
+            std::printf("[scan] 可用 emitter 后端（IR-D）:\n");
+            for (const auto& n : nn::emitter_registry::names())
+                std::printf("      - %s\n", n.c_str());
+            return 0;
+        }
+    if (argc < 3)
     {
-        std::fprintf(stderr, "用法: scan_exprs <out.bin>\n");
+        std::fprintf(stderr,
+                     "用法: scan_exprs <out_dir> <glslc_path> [<prec_backfill.txt>] "
+                     "[--list-backends]\n"
+                     "  收集 Layer 内联表达式（锚点自登记 + dry-run + 模型 pass），\n"
+                     "  原地合成 <out_dir>/fused_registry.hpp（不经 .bin 中间文件）。\n");
         return 2;
     }
-    const std::string out_path = argv[1];
+    const std::string out_dir  = argv[1];
+    const std::string glslc    = argv[2];
+    const std::string manifest = (argc >= 4) ? argv[3] : std::string{};
     std::signal(SIGABRT, &on_abort);   // NN_ASSERT → abort 带栈（见文件头）
 
     nn::CpuEngine raw_engine;
@@ -594,13 +610,7 @@ int main(int argc, char* argv[])
                 "[scan][warn] 锚点未贡献任何结构：可能被 -DNN_SCAN_NO_ANCHOR 关闭，"
                 "或所有调用点都已被 dry-run 覆盖\n");
     }
-    if (!nn::fused::write_registry(out_path, reg))
-    {
-        std::fprintf(stderr, "[FAIL] 无法写入 %s\n", out_path.c_str());
-        return 1;
-    }
-    std::printf("[scan] 收集到 %zu 条融合表达式 -> %s\n",
-                reg.specs.size(), out_path.c_str());
+    std::printf("[scan] 收集到 %zu 条融合表达式\n", reg.specs.size());
     // ── 签名覆盖报告：哪些结构**没有任何带类型变体** ──────────────────────
     // 自登记只能给结构（sig=0）：精度签名取决于运行期张量精度，类型层面推不出来
     // → f16 带类型变体仍须 dry-run 的 f32/f16 两遍产生。缺变体不是错误
@@ -643,5 +653,9 @@ int main(int argc, char* argv[])
     {
         std::printf("[scan] 精度变体 0 条（f16 pass 未产生非零签名）\n");
     }
+    // ── 生成阶段（原 gen_fused）：同一进程内直接消费注册表 → fused_registry.hpp
+    //    构建期因此只有一步；不再经 expr_specs.bin 中间序列化。
+    if (!nn::tool::generate_fused_registry(out_dir, glslc, reg, manifest))
+        return 1;
     return 0;
 }

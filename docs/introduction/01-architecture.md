@@ -283,14 +283,14 @@ class Tensor {
 |------|------|
 | `expr_spec.hpp` | `ExprSpec` 逐元素表达式扁平 IR（纯数据结构，跨后端可序列化，GPU AOT 契约）+ 可选 `fold` 段（`FoldSpec` 分块状态归约——通用折叠表达式机制，含 `tri_skip`、`EXPR_FOLD_BLOCK/ROWS_PER_WG` 共享常量）+ `expr_spec_key`（规范结构 key，AOT 收集/匹配依据） |
 | `expr_dsl.hpp` | 统一表达式 DSL（`nn::dsl`）：编译期模板，普通数学写法；`compute` / `compute_reduce` / `compute_into`（原地目标传递）。CPU 直接求值（内联+SIMD）；GPU 经 `to_expr_spec` 折叠出 `ExprSpec` → 按 `expr_spec_key` 匹配预编译融合 shader。 |
-| `expr_registry.hpp` | 构建期表达式注册表（`scan_exprs` 收集折叠出的结构，按 key 去重；二进制 dump/load 供 `gen_fused` 消费） |
-| `fused_registry.hpp` | **生成物**（构建期 `gen_fused` 产出）：`key → {ExprSpec 结构, 内联 SPIR-V}` 融合 shader 注册表；运行时按 key 精确匹配 |
-| `tools/scan_exprs.cpp` | 构建期工具：dry-run 跑 Layer 的 forward/backward，收集内联表达式的结构（派生物）→ `expr_specs.bin` |
-| `tools/gen_fused.cpp` | 构建期工具：读 bin → `glsl_gen` → glslc → 内联 SPIR-V → `fused_registry.hpp` |
+| `expr_registry.hpp` | 构建期表达式注册表（收集折叠出的结构 + 精度变体，按 key 去重；**不再有 bin 序列化**——收集与生成同一进程） |
+| `fused_registry.hpp` | **生成物**（构建期 生成阶段 产出）：`key → {ExprSpec 结构, 内联 SPIR-V}` 融合 shader 注册表；运行时按 key 精确匹配 |
+| `tools/scan_exprs.cpp` | 构建期工具（**单步** = 收集 + 生成）：`FusedAnchor` 按类型自登记结构 + dry-run/模型 pass 补签名，随后原地生成 `fused_registry.hpp` |
+| `tools/fused_generate.hpp` | 生成阶段（原 `gen_fused.cpp`，现为头文件）：注册表 → `glsl_gen` → glslc → 内联 SPIR-V → `fused_registry.hpp` |
 | `eval_expr` | `ComputeEngine` 虚接口：CPU 编译期模板求值（经 `dsl::compute`）；Vulkan 按 `expr_spec_key` 查 `fused_registry`（闭合世界，未命中硬报错，无 eager、无运行时编译） |
 | `dsl::compute(engine, expr, rows, cols)` | 统一求值入口：CPU 走编译期模板；GPU 折叠成 `ExprSpec` → `eval_expr` 按 key AOT 分发 |
 
-> **AOT 收集原则**：表达式**文本只出现在 Layer**（内联写进 `forward/backward`）。构建期 `scan_exprs` dry-run 执行 Layer 代码触达它们，把折叠后的 `ExprSpec` 结构（派生物，非手写定义）收集进注册表；`gen_fused` 据此合成融合 shader 并内联进 `fused_registry.hpp`。运行时按 key 精确匹配 dispatch，最终程序自包含、无运行时编译器。**登记方式例外**：注意力 fold spec 由 `make_fold_attn_o`（定义在 `compute_layer_attention.hpp`，与 Layer 其余表达式同住）构造、层直调 `engine.eval_expr` 不经 DSL 钩子——其登记来自 `scan_exprs` 的显式块，**掩码（`AttnMaskKind`）× 位置偏置（`bool score_bias`）两个正交维度的 5 个实际组合必须全部列出**（漏登记 = GPU 闭合世界硬报错）。通用 fold 样例构造在 `expr_fold.hpp`，不含注意力语义。
+> **AOT 收集原则**：表达式**文本只出现在 Layer**（内联写进 `forward/backward`）。构建期 `scan_exprs` 收集折叠后的 `ExprSpec` 结构（派生物，非手写定义）：**结构**由 `FusedAnchor<Expr>` 按表达式类型自登记（编译期可达，dry-run 跑不到的分支也覆盖），**精度签名**由 dry-run/模型 pass 执行产生；随后同进程合成融合 shader 并内联进 `fused_registry.hpp`。运行时按 key 精确匹配 dispatch，最终程序自包含、无运行时编译器。**登记方式例外**：注意力 fold spec 由 `make_fold_attn_o`（定义在 `compute_layer_attention.hpp`，与 Layer 其余表达式同住）构造、层直调 `engine.eval_expr` 不经 DSL 钩子——其登记来自 `scan_exprs` 的显式块，**掩码（`AttnMaskKind`）× 位置偏置（`bool score_bias`）两个正交维度的 5 个实际组合必须全部列出**（漏登记 = GPU 闭合世界硬报错）。通用 fold 样例构造在 `expr_fold.hpp`，不含注意力语义。
 
 ### L3 实现层
 

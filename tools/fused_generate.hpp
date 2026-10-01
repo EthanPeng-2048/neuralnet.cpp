@@ -1,22 +1,27 @@
 // ───────────────────────────────────────────────────────────────────────────
-//  gen_fused.cpp — AOT 算子融合：构建期合成（读 scan_exprs 的 bin）
+//  fused_generate.hpp — AOT 算子融合：构建期合成（scan_exprs 的生成阶段）
 //
-//  读取 scan_exprs dump 的 expr_specs.bin（表达式结构集合），对每条
-//  用 emitter 抽象（IR-D：expr_emitter.hpp）展开为单个融合 kernel 源码，
-//  再经 glslc 编译成 SPIR-V，最后内联进单个生成头 fused_registry.hpp
-//  （key → {ExprSpec, SPIR-V}）。
+//  对注册表里的每条表达式，用 emitter 抽象（IR-D：expr_emitter.hpp）展开为
+//  单个融合 kernel 源码，再经 glslc 编译成 SPIR-V，最后内联进单个生成头
+//  fused_registry.hpp（key → {ExprSpec, SPIR-V}）。
 //
-//  IR-D 落地：本工具经 nn::emitter_registry 选择后端（默认 "glsl" =
-//  GlslEmitter），不直接绑定 GLSL 生成函数——同一份 canonical IR 可由
-//  其它后端展开（--list-backends 查看已登记后端）。
+//  **不再经由中间的 .bin 序列化**：本文件是头文件，由 `tools/scan_exprs.cpp`
+//  直接 include 并在收集完注册表后原地调用 `nn::tool::generate_fused_registry`
+//  —— 构建期因此只有一步（scan + generate），`expr_registry.hpp` 的
+//  `write_registry/read_registry/kExprBinVersion` 随之删除。
 //
-//  表达式**文本只出现在 Layer**；本工具只消费折叠后的结构（派生物）。
+//  IR-D 落地：经 nn::emitter_registry 选择后端（默认 "glsl" = GlslEmitter），
+//  不直接绑定 GLSL 生成函数——同一份 canonical IR 可由其它后端展开
+//  （`scan_exprs --list-backends` 查看已登记后端）。
+//
+//  表达式**文本只出现在 Layer**；这里只消费折叠后的结构（派生物）。
 //  产物 fused_registry.hpp 供运行时（GpuEngine::eval_expr / vk_backend）
 //  按 expr_spec_key 精确匹配 dispatch——闭合世界，未命中硬报错。
 //
-//  用法： gen_fused <out_dir> <glslc_path> <expr_specs.bin> [--list-backends]
 //  产物： <out_dir>/fused_registry.hpp（+ 调试用 .comp/.spv）
 // ───────────────────────────────────────────────────────────────────────────
+
+#pragma once
 
 #include <cstdint>
 #include <cstdio>
@@ -32,6 +37,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "core_file.hpp"      // nn::read_pod_span（读 glslc 产物 SPIR-V）
 #include "expr_spec.hpp"
 #include "expr_registry.hpp"
 #include "expr_emitter.hpp"   // IR-D：emitter 抽象（后端选择）
@@ -169,42 +175,24 @@ namespace
 
 } // namespace
 
-int main(int argc, char* argv[])
+namespace nn::tool
 {
-    // --list-backends：列出可用 emitter 后端（IR-D 多后端验证）
-    for (int i = 1; i < argc; ++i)
-        if (std::string(argv[i]) == "--list-backends")
-        {
-            std::printf("[gen] 可用 emitter 后端（IR-D）:\n");
-            for (const auto& n : nn::emitter_registry::names())
-                std::printf("      - %s\n", n.c_str());
-            return 0;
-        }
 
-    if (argc < 4)
-    {
-        std::fprintf(stderr,
-                     "用法: gen_fused <out_dir> <glslc_path> <expr_specs.bin> "
-                     "[<prec_backfill.txt>] [--list-backends]\n");
-        return 2;
-    }
-    const std::string out_dir  = argv[1];
-    const std::string glslc    = argv[2];
-    const std::string bin_path = argv[3];
-
+// 生成融合 shader 注册表（见文件头说明）。reg 由调用方（scan_exprs）收集好后
+// 传入；prec_manifest 可为空（空 = 不做 run-only 签名回填）。
+[[nodiscard]] inline bool generate_fused_registry(
+    const std::string& out_dir,
+    const std::string& glslc,
+    const nn::fused::ExprRegistry& reg,
+    const std::string& prec_manifest = {})
+{
     std::error_code ec;
     std::filesystem::create_directories(out_dir, ec);
 
-    nn::fused::ExprRegistry reg;
-    if (!nn::fused::read_registry(bin_path, reg))
-    {
-        std::fprintf(stderr, "[FAIL] 无法读取表达式集合 %s\n", bin_path.c_str());
-        return 1;
-    }
     if (reg.specs.empty())
     {
         std::fprintf(stderr, "[FAIL] 表达式集合为空（scan_exprs 未覆盖任何路径）\n");
-        return 1;
+        return false;
     }
 
     std::ostringstream H;
@@ -267,7 +255,7 @@ int main(int argc, char* argv[])
         if (!emitter)
         {
             std::fprintf(stderr, "[FAIL] 无法创建 GLSL emitter（IR-D 注册表异常）\n");
-            return 1;
+            return false;
         }
         // 含归约（raxis >= 0）→ 归约 kernel（workgroup 级共享内存归约）；否则逐元素
         const std::string glsl = (raxis >= 0)
@@ -276,23 +264,23 @@ int main(int argc, char* argv[])
         if (glsl.empty())
         {
             std::fprintf(stderr, "[FAIL] 生成 %s 失败（归约结构不支持？）\n", key.c_str());
-            return 1;
+            return false;
         }
         {
             std::ofstream f(comp_path);
-            if (!f) { std::fprintf(stderr, "[FAIL] 无法写入 %s\n", comp_path.c_str()); return 1; }
+            if (!f) { std::fprintf(stderr, "[FAIL] 无法写入 %s\n", comp_path.c_str()); return false; }
             f << glsl;
         }
         if (!run_glslc(glslc, comp_path, spv_path))
         {
             std::fprintf(stderr, "[FAIL] glslc 编译 %s 失败\n", key.c_str());
-            return 1;
+            return false;
         }
         const auto spv = read_spv(spv_path);
         if (spv.empty())
         {
             std::fprintf(stderr, "[FAIL] 读取 %s 失败\n", spv_path.c_str());
-            return 1;
+            return false;
         }
 
         H << "inline constexpr std::uint32_t kSpirv_" << key << "[] = {";
@@ -402,9 +390,9 @@ int main(int argc, char* argv[])
     // （tools/prec_backfill.txt，NN_PREC_TRACE=1 mem_probe 复现），对命中的
     // (结构, 签名) 走与 scan 变体完全相同的 emit_one 发射（含 ALU 谓词、
     // 重复去重）；结构不在 bin 中 / 生成器不支持时告警跳过（不失败）。
-    if (argc >= 5)
+    if (!prec_manifest.empty())
     {
-        const std::string manifest = argv[4];
+        const std::string& manifest = prec_manifest;
         std::ifstream mf(manifest);
         if (!mf)
         {
@@ -502,10 +490,12 @@ int main(int argc, char* argv[])
     const std::string reg_path = out_dir + "/fused_registry.hpp";
     {
         std::ofstream f(reg_path);
-        if (!f) { std::fprintf(stderr, "[FAIL] 无法写入 %s\n", reg_path.c_str()); return 1; }
+        if (!f) { std::fprintf(stderr, "[FAIL] 无法写入 %s\n", reg_path.c_str()); return false; }
         f << H.str();
     }
     std::printf("[gen] %zu 条融合表达式 + %zu 条精度变体 -> %s\n",
                 reg.specs.size(), emitted_variants.size(), reg_path.c_str());
-    return 0;
+    return true;
 }
+
+} // namespace nn::tool

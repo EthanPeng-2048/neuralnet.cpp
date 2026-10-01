@@ -1598,7 +1598,7 @@ if (nn::dsl::env_flag("NN_PREC_TRACE"))
 | `read/write: 元素数与张量形状不匹配` | span 长度 ≠ `rows*cols` | 修正长度 |
 | `bind_check_ mixed engines` | 两个不同引擎创建的张量进了同一个算子 | 用 `import` 把张量拉到目标引擎 |
 | `dsl::compute_into: dst not on CPU` | CPU 引擎下 `dst` 是 GPU 张量 | 检查 `dst.device()` |
-| GPU 报闭合世界未命中 | 表达式结构或精度签名没有预生成 shader | 检查是否把运行时值写成了 `ConstLeaf`（应改 `rparam`）；改 Layer 表达式后需重新构建（`scan_exprs` → `gen_fused` 自动跑） |
+| GPU 报闭合世界未命中 | 表达式结构或精度签名没有预生成 shader | 检查是否把运行时值写成了 `ConstLeaf`（应改 `rparam`）；改 Layer 表达式后需重新构建（`scan_exprs` → 生成阶段 自动跑） |
 | `validate_expr_spec: empty instruction list` | 表达式根是裸视图/叶子 | 尾接 `+ dsl::rparam(0.0f)` |
 | 构建期 `[scan] validate_expr_spec 失败` + `_Exit(3)` | 新增表达式非法（最常是空指令表 / 裸分组归约视图作根） | 同上；这是**构建期闸门**，不是运行期 bug |
 | `VK_ERROR_DEVICE_LOST` | 录制期张量提前析构（铁律 #6），或 TDR | 确认张量存活到 `end_batch()`；TDR 不可重试，存 checkpoint 退出；`VK_TIMEOUT` 可减半 batch 重试 |
