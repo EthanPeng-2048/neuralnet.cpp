@@ -138,7 +138,7 @@ inline std::string glsl_view_read_(const ExprView& v, std::uint32_t buf_id,
         const std::string lb = "b" + std::to_string(v.param);
         std::string lab;
         if (disp)
-            lab = "((pc.prec >> " + std::to_string(v.param) + "u & 1u) != 0u ? uint(float("
+            lab = "((prec >> " + std::to_string(v.param) + "u & 1u) != 0u ? uint(float("
                 + lb + "h[" + col_var + "])) : uint(" + lb + "[" + col_var + "]))";
         else if (expr_prec_sig_in_f16(sig, v.param))
             lab = "uint(float(" + lb + "[" + col_var + "]))";
@@ -185,7 +185,7 @@ inline void glsl_view_read(std::ostringstream& os,
     const std::string hbuf = buf + "h";
     const std::string f16e = glsl_view_read_(v, buf_id, hbuf, true, idx_var,
                                              row_var, col_var, vp_slot, sig);
-    os << "((pc.prec >> " << buf_id << "u & 1u) != 0u ? float(" << f16e
+    os << "((prec >> " << buf_id << "u & 1u) != 0u ? float(" << f16e
        << ") : " << f32e << ")";
 }
 
@@ -223,7 +223,7 @@ inline void glsl_emit_grouped_reduce_helpers(std::ostringstream& os,
         const auto elem = [&](const std::string& tt) -> std::string {
             const std::string idx = "((row * R + " + tt + ") * cols + col)";
             if (disp)
-                return "((pc.prec >> " + std::to_string(i) + "u & 1u) != 0u ? float("
+                return "((prec >> " + std::to_string(i) + "u & 1u) != 0u ? float("
                        + buf + "h[" + idx + "]) : " + buf + "[" + idx + "])";
             return f16_buf ? ("float(" + buf + "[" + idx + "])")
                            : (buf + "[" + idx + "]");
@@ -429,7 +429,7 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     const auto vec4_load = [&](std::uint32_t slot, const std::string& idx) -> std::string {
         const std::string arr = "b" + std::to_string(slot) + "v4[" + idx + "]";
         if (disp)
-            return "((pc.prec >> " + std::to_string(slot) + "u & 1u) != 0u ? vec4("
+            return "((prec >> " + std::to_string(slot) + "u & 1u) != 0u ? vec4("
                    "unpackHalf2x16(b" + std::to_string(slot) + "v4h[" + idx
                    + "].x), unpackHalf2x16(b" + std::to_string(slot) + "v4h[" + idx
                    + "].y)) : " + arr + ")";
@@ -481,7 +481,7 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
             : "((batch*m_per + (" + row_e + "))*mm_k + (" + k_e + "))";
         const std::string an = "b" + std::to_string(a_slot);
         if (disp)
-            return "((pc.prec >> " + std::to_string(a_slot) + "u & 1u) != 0u ? float("
+            return "((prec >> " + std::to_string(a_slot) + "u & 1u) != 0u ? float("
                    + an + "h[" + idx + "]) : " + an + "[" + idx + "])";
         const std::string raw = an + "[" + idx + "]";
         return a_f16 ? ("float(" + raw + ")") : raw;
@@ -494,7 +494,7 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
             : "((batch*mm_k + (" + k_e + "))*cols + (" + col_e + "))";
         const std::string bn = "b" + std::to_string(b_slot);
         if (disp)
-            return "((pc.prec >> " + std::to_string(b_slot) + "u & 1u) != 0u ? float("
+            return "((prec >> " + std::to_string(b_slot) + "u & 1u) != 0u ? float("
                    + bn + "h[" + idx + "]) : " + bn + "[" + idx + "])";
         const std::string raw = bn + "[" + idx + "]";
         return b_f16 ? ("float(" + raw + ")") : raw;
@@ -787,7 +787,7 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     {
         L << "            {\n";
         L << "                const uint oi = (batch * m_per + rr) * cols + cc;\n";
-        L << "                if ((pc.prec >> 16u & 1u) != 0u)\n";
+        L << "                if ((prec >> 16u & 1u) != 0u)\n";
         L << "                    bout16[oi] = float16_t(eval_tail(acc[i][j], rr, cc, batch));\n";
         L << "                else\n";
         L << "                    bout[oi] = eval_tail(acc[i][j], rr, cc, batch);\n";
@@ -1051,7 +1051,7 @@ inline std::string generate_glsl_fold(const std::string& name, const ExprSpec& s
     }
     if (disp)
     {
-        L << "    if ((pc.prec >> 16u & 1u) != 0u)\n";
+        L << "    if ((prec >> 16u & 1u) != 0u)\n";
         L << "        bout16[row] = float16_t(r"
           << static_cast<int>(f.finalize.back().dst) << ");\n";
         L << "    else\n";
@@ -1127,7 +1127,7 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
             const std::size_t p = e16.find(fn);
             if (p != std::string::npos)
                 e16.replace(p, fn.size(), hn);
-            return "((pc.prec >> " + std::to_string(i) + "u & 1u) != 0u ? float("
+            return "((prec >> " + std::to_string(i) + "u & 1u) != 0u ? float("
                    + e16 + ") : " + e + ")";
         }
         return (sig != 0 && expr_prec_sig_in_f16(sig, i)) ? ("float(" + e + ")") : e;
@@ -1562,7 +1562,7 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
     if (disp)
     {
         L << "      if (row_ok) {\n";
-        L << "        if ((pc.prec >> 16u & 1u) != 0u)\n";
+        L << "        if ((prec >> 16u & 1u) != 0u)\n";
         L << "          bout16[row * vector_out + dd] = float16_t(r"
           << static_cast<int>(f.finalize.back().dst) << ");\n";
         L << "        else\n";
@@ -1863,7 +1863,7 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
             L << "    bout[i] = r" << last_dst << ";\n";
         else if (disp)
         {
-            L << "    if ((pc.prec >> 16u & 1u) != 0u) {\n";
+            L << "    if ((prec >> 16u & 1u) != 0u) {\n";
             L << "        bout16[i] = float16_t(r" << last_dst << ");\n";
             L << "    } else {\n";
             L << "        bout[i] = r" << last_dst << ";\n";
@@ -1901,7 +1901,7 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
         const auto ld = [&](const std::string& idx) {
             const std::string bf = "b" + std::to_string(i) + "[" + idx + "]";
             if (disp)
-                return "((pc.prec >> " + std::to_string(i) + "u & 1u) != 0u ? float(b"
+                return "((prec >> " + std::to_string(i) + "u & 1u) != 0u ? float(b"
                        + std::to_string(i) + "h[" + idx + "]) : " + bf + ")";
             return cvt.empty() ? bf : ("float(" + bf + ")");
         };
@@ -2016,7 +2016,7 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
     };
     if (disp)
     {
-        L << "        if ((pc.prec >> 16u & 1u) != 0u) {\n";
+        L << "        if ((prec >> 16u & 1u) != 0u) {\n";
         emit_store4("bout16", true, "            ");
         L << "        } else {\n";
         emit_store4("bout", false, "            ");
@@ -2042,7 +2042,7 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
     const std::string sv = "r" + std::to_string(last_dst);
     if (disp)
     {
-        L << "        if ((pc.prec >> 16u & 1u) != 0u) {\n";
+        L << "        if ((prec >> 16u & 1u) != 0u) {\n";
         L << "            bout16[e] = float16_t(" << sv << ");\n";
         L << "        } else {\n";
         L << "            bout[e] = " << sv << ";\n";
@@ -2120,7 +2120,7 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
     const auto rd = [&](std::size_t k, const std::string& idx) -> std::string {
         const std::string raw = "b" + std::to_string(k) + "[" + idx + "]";
         if (disp)
-            return "((pc.prec >> " + std::to_string(k) + "u & 1u) != 0u ? float(b"
+            return "((prec >> " + std::to_string(k) + "u & 1u) != 0u ? float(b"
                    + std::to_string(k) + "h[" + idx + "]) : " + raw + ")";
         return (sign_f16 && expr_prec_sig_in_f16(sig, k)) ? ("float(" + raw + ")") : raw;
     };
@@ -2200,7 +2200,7 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
             L << ind << "bout[" << lhs << "] = " << wr(v) << ";\n";
             return;
         }
-        L << ind << "if ((pc.prec >> 16u & 1u) != 0u)\n";
+        L << ind << "if ((prec >> 16u & 1u) != 0u)\n";
         L << ind << "    bout16[" << lhs << "] = float16_t(" << v << ");\n";
         L << ind << "else\n";
         L << ind << "    bout[" << lhs << "] = " << v << ";\n";
