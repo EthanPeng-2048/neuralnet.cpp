@@ -74,6 +74,9 @@ expr_opt / expr_registry / expr_spec）「历史状态类注释」摘录。整�
   - 共同点：**结构由运行期配置决定**（视图种类 / 项数 / 掩码组合），类型层面推不出来；符号实例 `Expr{}` 与真实实例折叠出**不同 key**。最直接的证据是**镜像对**——dry-only `784781c7b82fa76c` 与 anchor-only `28cdf7c6d5df0e1d` 的摘要逐字段相同（`raxis=-1 mm=0 fold=0 nreg=2 ninstr=2 nview=2 viewkinds=[0,0]`），只有 key 不同。
 - **锚点独有 13 条**是镜像面：dry-run/模型 pass 没跑到的编译期可见调用点。最著名的是 `9ca81b4967cdfa20`——关掉锚点（`-DNN_SCAN_NO_ANCHOR`）后 `text_infer`（KV-cache 增量解码）在 GPU 上闭合世界硬报错。
 - **结论（否决"删掉 dry-run"）**：锚点与 dry-run **互补、不冗余**，单独删任何一方都会丢结构（dry-only 25 / anchor-only 13）。dry-run + 模型 pass 是结构的**主要**来源，`scan_exprs` 这一**构建步骤本身无法删除**；能删的只有签名维（已完成，扫描工作量减半）。若将来真要清零，路径是"把运行期配置维度类型化"（让视图种类/项数进入表达式类型），使符号实例等价于真实实例——那是另一次架构变更，不属于本阶段。
+- **推论与实测反驳（round 16）**：既然 25 条"只有执行才拿得到"，那**库外自定义层（没有 dry-run）是否就不可靠？** 直接用实验回答：给 `examples/fusion_custom_layer*` 加了第二种自研形态——**归一化形态** `rsqrt(col_reduce_sum(x)·inv + ε)`，与库内 LayerNorm/RMSNorm 的 `std_inv` 同形（`raxis=1`、`viewkinds=[0,8]`，正落在 dry-un-only 的形态类别里），**只用锚点**在 GPU 上以 f16 跑通（`1.2246094`，走 `key#x` 分派 shader）。⇒ **锚点对常见自定义层可靠**，A2 机制成立。
+- **同时排除了一个错误假设**：曾怀疑"符号实例的常量默认值（全 0）触发 CSE 合并出不同结构"。查 `expr_opt.hpp` 的 CSE key = `op(8)+a.kind/idx+b.kind/idx+c.kind/idx`，**不含常量值** ⇒ 与值无关，假设排除。（此前的"镜像对"是错的：粗摘要相同但指令序列完全不同——`nconst=2 instrs=[17(1/0,1/1);19(0/0,2/0,2/1)]` vs `nconst=1 instrs=[1(2/0,0/0);10(1/0,0/0)]`，是两个不同表达式，不是同一表达式的两个 key。）
+- **仍记录的残余不确定性**：25 条 divergence 的**根因未定位**（已知不是 CSE-值依赖、不是视图种类-运行期选择——`ExprViewKind` 全部由类型决定）。若将来使用者的自定义层遇到闭合世界报错，下一步是给 `nn_enable_gpu_fusion` 加 `COLLECT <file>` 钩子（使用者提供"跑一遍自己的层"的收集函数，等价于库内模型 pass）。诊断工具已就位：`NN_SCAN_DUMP_SOURCES=1` 打印逐条来源 + 完整指令序列。
 
 ## 融合 matmul BK 取值 A/B 流水（原位置 include/neuralnet.cpp/expr_glsl_gen.hpp:262-269、303-310）
 - 类型：性能 A/B / 否决方案
