@@ -61,6 +61,15 @@ expr_opt / expr_registry / expr_spec）「历史状态类注释」摘录。整�
 - **CMake include 顺序有语义（踩坑）**：`nn_enable_gpu_fusion` 起初只把 `${NNF_OUT_DIR}` 加进目标，样例 GPU 初始化报 `matmul SPIR-V bytecode not embedded`——手写原语 shader 的嵌入头在 `${CMAKE_BINARY_DIR}/generated`；但该目录**同时含库自身的 `fused_registry.hpp`**。最终把两者都加、且 `${NNF_OUT_DIR}` **排在前面**（`__has_include` 取第一个匹配），否则使用者的自定义结构全部闭合世界报错。已写进 AGENTS §7。
 - **已注册为常驻 ctest（round 17）**：样例的目标原先只由默认构建覆盖编译（运行时断言需手工跑），会静默腐化。现已 `add_test(fusion_custom_layer_example)` + `SKIP_RETURN_CODE 77`（无 Vulkan 设备时跳过）——它是**库外使用者形态的 AOT 融合端到端门禁**。ctest 总数 19 → **20**（18 个测试目标 + `cnn_test_gpu` + 本样例；`AGENTS.md` §12 与 `docs/development/12` 的当前数字已同步）。
 
+## 融合回归测试 `fused_gpu_test` 曾是孤儿（2026-10-01，round 18）
+
+- 类型：已修复缺陷（测试覆盖缺口 / 构建配置遗漏）
+- **发现**：`src/fused_gpu_test.cpp`（44 KB）**未被任何 CMake 目标引用**——既不编译也不注册 ctest。`git log -S'fused_gpu_test' -- CMakeLists.txt` 最后一次改动是 `516d781`（Release v1.2.0），此后再无引用。
+- **它是什么**：融合 shader **逐形态** GPU 对拍——rope / swiglu / gelu / softmax / matmul / matmul+列归约 / norm / reduce_consts / **fold v1**（rowmax/rowsum/softmax_denom）/ **fold attn**（plain/causal/alibi/doc/alibidoc × 5 种形状）/ **未扫描表达式硬报错**。正是 AOT 融合最核心的回归面。
+- **处置**：接入构建（`nn_add_executable` + `list(APPEND NN_TEST_TARGETS ...)`，CMakeLists 紧邻 `expr_gpu_test`）。
+- **实测**：编译零告警、输出 `ALL PASS`、退出码 0；接入后 **ctest 20 → 21**（19 个测试目标 + `cnn_test_gpu` + `fusion_custom_layer_example`），21/21 全绿。
+- **仍存在的缺口（未修，记录在案）**：该文件 **0 处 f16 引用** ⇒ 它覆盖的是 **V0（全 f32）** 逐形态路径，**不覆盖 V1 运行期精度分派（`key#x`）**。V1 目前只有 7 个真实 f16 负载（`NN_PREC_TRACE=1` 实测 `[prec][miss]=0`）与样例的第二形态在压测它，**没有逐形态的数值断言**。若将来要补，做法是给该文件的每个 form 加一个 f16 变体（CPU 参考 + GPU f16，容差按 f16）。
+
 ## 「锚点 vs dry-run」边界实测刻画（2026-10-01，round 15）
 
 - 类型：覆盖缺口 / 否决方案（"删掉 dry-run"）

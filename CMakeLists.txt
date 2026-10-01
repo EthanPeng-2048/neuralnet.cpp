@@ -294,6 +294,14 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(expr_gpu_test src/expr_gpu_test.cpp)
     list(APPEND NN_TEST_TARGETS expr_gpu_test)
 
+    # ── 融合 shader **逐形态** GPU 对拍（rope/swiglu/gelu/softmax/matmul/
+    #    matmul+reduce/norm/reduce_consts/fold v1/fold attn/回退）──────────
+    # ⚠ 此前该文件**未被任何 CMake 目标引用**（未编译、未注册）——它恰好是
+    #   覆盖"每个生成器各自的 V1 运行期精度分派形态"的测试，属于 AOT 融合的
+    #   核心回归面。重新接入。
+    nn_add_executable(fused_gpu_test src/fused_gpu_test.cpp)
+    list(APPEND NN_TEST_TARGETS fused_gpu_test)
+
     # ── ModelSpec 架构校验（load_model 文件头 vs 模型规格比对）──────────
     nn_add_executable(model_spec_validation_test src/model_spec_validation_test.cpp)
     list(APPEND NN_TEST_TARGETS model_spec_validation_test)
