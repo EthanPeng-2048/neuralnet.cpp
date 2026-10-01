@@ -5188,8 +5188,13 @@ public:
 // ══════════════════════════════════════════════════════════════════════
 // GpuBuffer 析构（类外定义）：batch 录制期间延迟销毁，避免已录制的
 // descriptor 引用已销毁的 buffer（VUID-vkDestroyBuffer-buffer-00922）。
+//
+// **必须 inline**：本库是 header-only，任何包含本头的翻译单元都会发射本定义
+// ——缺失 inline 会让"≥2 个 TU 的程序"链接期 duplicate symbol（实测
+// `examples/fusion_custom_layer_*` 两 TU 即撞）。库外使用者的常规工程
+// （多 TU）因此不可用。
 // ══════════════════════════════════════════════════════════════════════
-GpuBuffer::~GpuBuffer()
+inline GpuBuffer::~GpuBuffer()
 {
     if (buffer_ == VK_NULL_HANDLE)
         return;

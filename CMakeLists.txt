@@ -492,6 +492,55 @@ if(Vulkan_FOUND)
 
     list(APPEND GPU_SHADER_HPPS ${NN_FUSED_REGISTRY_HPP})
 
+    # ── 库自带的融合能力：为**任意目标**收集 + 生成它自己的 fused_registry.hpp ──
+    # 用法：nn_enable_gpu_fusion(<target> MAIN <含 main 的源文件> [OUT_DIR <目录>])
+    #
+    # 语义（对应"写 dsl::compute 之后只跑构建即可"）：
+    #   收集器 = 库内收集逻辑（`tools/scan_exprs.cpp`：锚点自登记 + dry-run +
+    #   模型 pass + 显式登记）+ **本目标的全部 TU**（用 -DNN_EXPR_SCAN 编，
+    #   让使用者的 `dsl::compute` 调用点在静态初始化期自登记）。
+    #   产物目录只作为该目标的私有 include 目录——"`fused_registry.hpp` 在
+    #   include path 上即生效"这一既有机制不变。
+    #
+    # ⚠ 收集器**必须保留库内收集逻辑**：实测 84 个结构里只有 13 个来自
+    #   编译期锚点，71 个来自 dry-run/模型 pass（见 docs/history.md 与
+    #   docs/development/02）。纯锚点收集器会漏掉库自身的结构。
+    function(nn_enable_gpu_fusion target)
+        cmake_parse_arguments(NNF "" "MAIN;OUT_DIR" "" ${ARGN})
+        if(NOT NNF_OUT_DIR)
+            set(NNF_OUT_DIR "${CMAKE_BINARY_DIR}/nn_fusion/${target}")
+        endif()
+        if(NNF_MAIN)
+            get_filename_component(NNF_MAIN "${NNF_MAIN}" ABSOLUTE)
+        endif()
+        get_target_property(_nnf_srcs ${target} SOURCES)
+        set(_nnf_inputs "")
+        foreach(_s IN LISTS _nnf_srcs)
+            if(_s MATCHES "^\\$<")          # 生成器表达式源（跳过，罕见）
+                continue()
+            endif()
+            get_filename_component(_abs "${_s}" ABSOLUTE)
+            if(NOT NNF_MAIN OR NOT _abs STREQUAL NNF_MAIN)
+                list(APPEND _nnf_inputs "${_abs}")
+            endif()
+        endforeach()
+        set(_nnf_reg "${NNF_OUT_DIR}/fused_registry.hpp")
+        add_executable(${target}_nnfusion_collect ${SCAN_SRC} ${_nnf_inputs})
+        target_include_directories(${target}_nnfusion_collect
+            PRIVATE ${CMAKE_SOURCE_DIR}/include/neuralnet.cpp)
+        target_compile_definitions(${target}_nnfusion_collect PRIVATE NN_EXPR_SCAN)
+        target_link_libraries(${target}_nnfusion_collect PRIVATE nn_core Vulkan::Vulkan)
+        add_custom_command(
+            OUTPUT ${_nnf_reg}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${NNF_OUT_DIR}
+            COMMAND ${target}_nnfusion_collect ${NNF_OUT_DIR} ${GLSLC}
+            DEPENDS ${target}_nnfusion_collect ${SCAN_SRC} ${FUSED_GEN_SRC} ${_nnf_inputs}
+            COMMENT "[nn] 为 ${target} 收集 + 合成融合 shader → ${_nnf_reg}")
+        add_custom_target(${target}_nnfusion_registry DEPENDS ${_nnf_reg})
+        target_include_directories(${target} PRIVATE ${NNF_OUT_DIR})
+        add_dependencies(${target} ${target}_nnfusion_registry)
+    endfunction()
+
     if(NOT GLSLC)
         message(WARNING "No SPIR-V compiler found (glslc). "
                         "GPU acceleration disabled. Install Vulkan SDK.")
@@ -513,6 +562,20 @@ if(Vulkan_FOUND)
             target_link_libraries(${TARGET} PRIVATE Vulkan::Vulkan)
             add_dependencies(${TARGET} compile_gpu_shaders)
         endforeach()
+
+        # ── A2 验收样例：一个「库外使用者」形态的目标 ──────────────────────
+        # 它有自己的自研融合层（examples/fusion_custom_layer.hpp），**不使用**
+        # 库内 build/generated 的注册表，而是靠 nn_enable_gpu_fusion 生成自己
+        # 的那一份 —— 证明"写 dsl::compute + 一行 CMake 即可"。
+        add_executable(fusion_custom_layer_example
+            examples/fusion_custom_layer_main.cpp
+            examples/fusion_custom_layer.cpp)
+        target_include_directories(fusion_custom_layer_example PRIVATE
+            ${CMAKE_SOURCE_DIR}/include/neuralnet.cpp)
+        target_compile_definitions(fusion_custom_layer_example PRIVATE NN_HAS_VULKAN)
+        target_link_libraries(fusion_custom_layer_example PRIVATE nn_core Vulkan::Vulkan)
+        nn_enable_gpu_fusion(fusion_custom_layer_example
+            MAIN ${CMAKE_SOURCE_DIR}/examples/fusion_custom_layer_main.cpp)
 
         message(STATUS "GPU acceleration enabled (Vulkan compute)")
     endif()
