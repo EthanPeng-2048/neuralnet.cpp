@@ -1390,7 +1390,7 @@ struct FusedAnchor
         (void)inputs;   // 符号实例：inputs 全是占位张量，注册只用结构
         if (auto v = validate_expr_spec(spec, spec.views.size()); !v)
             scan_reject(v.error());
-        anchor_registry().add(spec, 0u);
+        anchor_registry().add(spec);
         return 0;
     }();
 };
@@ -1425,11 +1425,9 @@ template <typename E>
     auto [spec, inputs] = to_expr_spec(e);
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)
         scan_reject(v.error());
-    // 精度签名（结构 key 不含精度）：同一结构可登记多个带类型变体
-    // （in-kernel f16 = 半精度直读直写）。占位张量按目标精度返回 —— 否则
-    // dry-run 下游层看到的是 f32，f16 变体永远发现不到。
-    const ExprPrecSig sig = expr_prec_sig_of(inputs, P);
-    fused::global_registry().add(spec, sig);
+    // 构建期只登记**结构**：精度签名已不是构建期集合（生成阶段对每个结构
+    // 发运行期精度分派 shader，运行期按真实精度填 PC `prec`）。
+    fused::global_registry().add(spec);
     return eng.adopt(P == Precision::F16 ? TensorAccess::cpu<Precision::F16>(rows, cols)
                                          : TensorAccess::cpu(rows, cols));
 #else
@@ -1533,10 +1531,9 @@ template <typename E>
     auto [spec, inputs] = to_expr_spec(e);
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)
         scan_reject(v.error());
-    // 原地语义：输出精度 = dst 的存储精度（§8.3）→ 签名输出位取 dst
-    const ExprPrecSig sig = expr_prec_sig_of(inputs, dst.precision());
+    // 只登记结构（精度签名不是构建期集合，见 expr_dsl.hpp 头注释）
     (void)dst;
-    fused::global_registry().add(spec, sig);
+    fused::global_registry().add(spec);
     return {};
 #else
     if (eng.device() == Device::CPU)
@@ -1612,9 +1609,8 @@ template <typename E>
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)
         scan_reject(v.error());
     const int raxis = expr_spec_reduce_axis(spec);
-    // 精度签名（同 compute()）：占位张量按目标精度返回，供下游 dry-run 继续
-    const ExprPrecSig sig = expr_prec_sig_of(inputs, P);
-    fused::global_registry().add(spec, sig);
+    // 只登记结构；占位张量仍按目标精度返回，供下游 dry-run 继续（形状相关）
+    fused::global_registry().add(spec);
     if (P == Precision::F16)
         return eng.adopt((raxis == 0) ? TensorAccess::cpu<Precision::F16>(rows, 1)
              : (raxis == 1) ? TensorAccess::cpu<Precision::F16>(1, cols)

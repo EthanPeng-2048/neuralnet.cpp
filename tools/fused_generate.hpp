@@ -339,18 +339,13 @@ namespace nn::tool
         if (alu && !nn::expr_prec_sig_native16(spec, sig))
             return false;   // 谓词不通过 → 不发 ALU 变体（f32 算术变体仍覆盖）
         const std::string key = nn::expr_spec_key(spec);
-        // 运行期精度分派（V1）：键 = key#x（无签名 hex——精度不再是身份）
+        // 只有两种结构变体（精度不再是身份）：
+        //   V1 运行期精度分派 → 键 key#x
+        //   V2 native16（结构谓词判定）→ 键 key#a
         const bool dispv = nn::expr_prec_sig_is_dispatch(sig);
-        char sigbuf[16];
-        std::snprintf(sigbuf, sizeof(sigbuf), "%04x", static_cast<unsigned>(sig));
-        const std::string vkey = dispv
-            ? (key + nn::EXPR_PREC_DISPATCH_SUFFIX)
-            : (alu ? (key + "#a")   // native16：结构谓词判定 → 键与签名无关
-                   : nn::expr_prec_sig_key(key, sig));
-        const std::string suffix = dispv
-            ? (key + "_x")
-            : (alu ? (key + "_a")
-                   : (key + "_" + sigbuf));
+        const std::string vkey = dispv ? (key + nn::EXPR_PREC_DISPATCH_SUFFIX)
+                                       : (key + "#a");
+        const std::string suffix = dispv ? (key + "_x") : (key + "_a");
         if (!emitted_vkeys.insert(vkey).second)
             return false;   // 已发射（scan 预测 ∩ 回填清单重叠）→ 幂等跳过
         const std::string comp_path = out_dir + "/fused_" + suffix + ".comp";
@@ -367,9 +362,11 @@ namespace nn::tool
         if (glsl.empty())
         {
             if (alu)
-                return false;   // ALU 谓词/形态不支持 → 静默跳过（f32 变体已覆盖）
-            std::fprintf(stderr, "[skip] 精度变体 %s（sig=%s）暂不支持带类型生成\n",
-                         key.c_str(), sigbuf);
+                return false;   // 结构谓词通过但发射器不支持该形态 → 静默跳过
+                                //（V0/V1 仍覆盖，只是拿不到原生 f16 算术）
+            // 分派变体（key#x）是唯一的签名无关 shader：发不出来 = 该结构
+            // 没有 f16 路径 → 必须可见。
+            std::fprintf(stderr, "[skip] 分派变体 %s 的形态暂不支持生成\n", vkey.c_str());
             return false;
         }
         {

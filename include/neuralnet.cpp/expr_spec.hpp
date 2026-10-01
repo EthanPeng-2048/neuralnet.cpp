@@ -761,19 +761,7 @@ inline constexpr const char* EXPR_PREC_DISPATCH_SUFFIX = "#x";
     return spec_key + buf;
 }
 
-// native16（原生 f16 算术）变体键 = 签名键再加 "#a" 后缀（如
-// "644a...#10001#a"）。与 f32 算术变体（"644a...#10001"）**并存**：
-// 后端按设备 shaderFloat16 能力决定创建哪个 pipeline，运行时优先命中
-// native16 键、回退 f32 算术键（设备无 ALU 能力时走 f32 算术键）。结构 key 与 sig 均为
-// hex 字符串，"#a" 后缀不可能与任何普通键碰撞（普通键只含 [0-9a-f#] 且以
-// sig hex 结尾）。
-[[nodiscard]] inline std::string expr_prec_sig_alu_key(const std::string& spec_key,
-                                                       ExprPrecSig sig)
-{
-    return expr_prec_sig_key(spec_key, sig) + "#a";
-}
-
-// 诊断用：把签名渲染成 "in=[f16,f32,...] out=f16"
+// ── 诊断用：把签名渲染成 "in=[f16,f32,...] out=f16"
 [[nodiscard]] inline std::string expr_prec_sig_str(ExprPrecSig sig,
                                                    std::size_t num_inputs)
 {

@@ -395,7 +395,6 @@ int main(int argc, char* argv[])
 #endif
     // 分项台账快照（末尾合并时打印；见"结构来源"行）
     const std::size_t n_after_dry = nn::fused::global_registry().specs.size();
-    const std::size_t v_after_dry = nn::fused::global_registry().variants.size();
     // f16 安全由基类边界 cast 入口保证（原 PrecisionEngine 适配层已下沉删除）
 
     // ── 模型级 pass：用 shipped 工厂建模型跑 fwd/bwd（补"整模型路径"的签名）──
@@ -534,7 +533,6 @@ int main(int argc, char* argv[])
     // 模型 pass：**结构**来源（运行期配置相关的路径），与精度无关 → 只跑 f32。
     model_pass(raw_engine, nn::profile_f32());
     const std::size_t n_after_model = nn::fused::global_registry().specs.size();
-    const std::size_t v_after_model = nn::fused::global_registry().variants.size();
     // ── fold v1（标量域）分块状态归约（表达式集合登记）──────────────────────────
     // 三个共享样例（expr_fold.hpp——与 fused_gpu_test 对拍**同源构造** →
     // key 一致、闭合世界命中）：rowmax / rowsum / softmax_denom(online 双
@@ -590,7 +588,6 @@ int main(int argc, char* argv[])
     }
 
     const std::size_t n_before_anchor = nn::fused::global_registry().specs.size();
-    const std::size_t v_before_anchor = nn::fused::global_registry().variants.size();
     auto& reg = nn::fused::global_registry();
     // ── 合并自登记锚点的结构（"结构 = 表达式类型"，见 expr_dsl.hpp）─────────
     // 锚点在静态初始化期按**类型**登记，覆盖"编译进来但 dry-run 未执行到"的
@@ -598,7 +595,7 @@ int main(int argc, char* argv[])
     {
         auto& anchor = nn::dsl::anchor_registry();
         for (const auto& s : anchor.specs)
-            reg.add(s, 0u);
+            reg.add(s);
         std::printf("[scan] 结构来源：dry-run %zu（含模型 pass +%zu、显式登记 +%zu）"
                     " + 锚点 %zu → 合并 %zu（锚点独有 %zu）\n",
                     n_after_dry,
@@ -606,31 +603,22 @@ int main(int argc, char* argv[])
                     n_before_anchor - n_after_model,
                     anchor.specs.size(), reg.specs.size(),
                     reg.specs.size() - n_before_anchor);
-        std::printf("[scan] 签名来源：dry-run %zu + 模型 pass %zu + 显式登记 %zu = %zu\n",
-                    v_after_dry, v_after_model - v_after_dry,
-                    v_before_anchor - v_after_model, v_before_anchor);
         // 锚点独有 = 手写 dry-run 覆盖不到的调用点（该数突然变大 → 有新层路径
-        // 没纳入 dry-run）。锚点只登记结构（sig=0），故这些结构默认没有 f16
-        // 带类型变体 —— 下面单独报告。
+        // 没纳入 dry-run）。
         if (anchor.specs.empty() || n_before_anchor == reg.specs.size())
             std::fprintf(stderr,
                 "[scan][warn] 锚点未贡献任何结构：可能被 -DNN_SCAN_NO_ANCHOR 关闭，"
                 "或所有调用点都已被 dry-run 覆盖\n");
     }
     std::printf("[scan] 收集到 %zu 条融合表达式\n", reg.specs.size());
-    // ── 签名覆盖：**不再需要背书** ────────────────────────────────────────
+    // ── 签名覆盖：**构建期不再需要任何背书** ──────────────────────────────
     // 生成阶段对每个结构无条件发一份运行期精度分派 shader（键 key#x）——
     // 输入/输出双视图 + PC `prec`，一份覆盖任意 (输入精度位图, 输出精度)。
     // 因此：
     //   · 结构 = 唯一需要"收集"的东西（锚点 + dry-run/模型 pass）；
     //   · 签名**不再是构建期集合**，无需 dry-run 的 f16 遍、无需回填清单，
-    //     运行期也不存在 miss / 边界 cast 回退。
-    // 下面只保留结构侧的诊断（dry-run 的 profile 遍仍会走 Layer，用于暴露
-    // 运行期配置相关的结构，与签名无关）。
-    if (!reg.variants.empty())
-        std::printf("[scan] 精度变体 %zu 条（历史数据；生成阶段已不再消费——"
-                    "分派 shader 覆盖全部签名）\n",
-                    reg.variants.size());
+    //     运行期也不存在 miss / 边界 cast 回退；
+    //   · 注册表里没有"精度变体"这一层（`ExprRegistry::variants` 已删除）。
     // ── 生成阶段（原 gen_fused）：同一进程内直接消费注册表 → fused_registry.hpp
     //    构建期因此只有一步；不再经 expr_specs.bin 中间序列化。
     if (!nn::tool::generate_fused_registry(out_dir, glslc, reg))
