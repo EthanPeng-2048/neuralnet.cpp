@@ -631,9 +631,14 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 
 matmul 段 / 归约 / 目标传递三类变体落地后的同窗交错实测（f32 与 f16 峰值、耗时、backward transient 分桶变化）见 `docs/history.md`；**当前（含 op-level f16 GEMM）的最终数字见 §12.11**。
 
-#### ⑤ 运行时签名回填（当前）
+#### ⑤ 运行期精度分派（当前，2026-10-01 A1）
 
-`[prec][miss]`（`NN_PREC_TRACE=1`）打印"请求了非零签名却没命中带类型变体"的 `(key, sig, 形态)`——这类**扫描时看不到的运行时签名**（如 Linear matmul 段的 `in=[f16,f32,f32]` 混合签名、Norm 归约链 `[f32,f16]` 输入）miss 时走边界 cast。**当前机制 = 回填清单** `tools/prec_backfill.txt`（Phase D3）：miss 复现 → 追加一行 `<key> <sig>` → 生成阶段 对命中的 `(结构, 签名)` 额外发射变体（与 scan 变体同一代码路径，重复条目幂等去重；结构不在注册表 / 生成器不支持时告警跳过）。**fold 的带类型变体已生成**（Phase D2，键 `fkey#sig`，3 输入全 f16 + 输出 f16，算术/状态进位 f32）。
+**签名已从「身份」降级为「参数」**：融合 shader 的变体集合不再按签名枚举，而是对每个结构发一份**运行期精度分派** shader（键 `key#x`）——它声明每个输入/输出各 f32 + `float16_t` **双视图**（同一 `VkBuffer` 绑两次，只解引用与真实元素类型一致的那一个），加载/存储处按 push constant `uint prec`（bit i = 输入 i 为 f16，bit16 = 输出 f16）走 uniform 分支。索引数学与旧带类型变体**逐字相同** ⇒ 数值等价。
+
+- **无 miss**：V1 对每个结构无条件生成 ⇒ 任何签名都命中；`[prec][miss]` 与边界 cast 回退**不再是 f16 融合路径的一部分**。
+- **native16** 改由**结构谓词**判定生成（键 `key#a`，代入"全输入 f16 + 输出 f16"这一常量签名），运行时按真实签名确认。
+- **回填清单已删除**：`tools/prec_backfill.txt` 连同 `NN_PREC_TRACE` 的"补变体"工作流一并移除；f16 扫描遍也因"对结构贡献为 0"而删除（实测：跳过它签名 66 → 0、结构恒 84）。
+- **实测**（GPT f16 训练，`NN_PREC_TRACE=1`）：`[prec][miss]=0`、边界 cast 归因表为空、`[prec][alu-hit]` 6670。
 
 ---
 
@@ -686,7 +691,7 @@ matmul 段 / 归约 / 目标传递三类变体落地后的同窗交错实测（f
 #### ④ 当前剩余（收益递减，按需再做）
 
 - **仍走边界 cast 的 op-level 原语**：用 `NN_PREC_TRACE=1` + `dump_temp_stats()` 复测形状表，对剩余大项按 §12.11 ① 的 `-DNN_SHADER_F16` 手法补变体（同法已覆盖大部分 op 级 shader，见 ① 的 CMake 清单）。
-- **扫描预测不到的运行时签名**：按 §12.10 ⑤ 的回填清单流程处理（miss → 追加 `tools/prec_backfill.txt` → 重跑构建）。
+- **签名覆盖**：不需要任何操作——生成阶段对每个结构发运行期精度分派 shader（§12.10 ⑤），任何签名都命中；新的调用点只要被构建期收集到结构即自动获得 f16 路径（实测：Layer 头里新写一个 `dsl::compute` → 注册表自动多出 `key`/`key#x`/`key#a` 三条，其他文件零改动）。
 - **native16（f16 ALU 算术）变体**按设备能力命中/回退（§11.1），无需额外操作。
 
 ---

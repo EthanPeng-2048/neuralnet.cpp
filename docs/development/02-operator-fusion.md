@@ -158,7 +158,7 @@ struct MatmulSpec {
 
 ## 表达式录制与融合边界
 
-本文的"表达式录制"指**构建期收集**：`scan_exprs` 收集各 Layer 折叠出的 `ExprSpec`——**结构**由 `FusedAnchor<Expr>` 在静态初始化期按表达式类型自登记（编译期可达），**精度签名**由 dry-run / 模型 pass 执行产生（见 §构建工具链与闭合世界与 §自登记锚点）——这是库里唯一的表达式收集机制。
+本文的"表达式录制"指**构建期收集**：`scan_exprs` 收集各 Layer 折叠出的 `ExprSpec` **结构**——由 `FusedAnchor<Expr>` 在静态初始化期按表达式类型自登记（编译期可达），再由 dry-run / 模型 pass 补齐运行期配置相关的结构（见 §构建工具链与闭合世界与 §自登记锚点）。**精度签名不是构建期集合**：生成阶段对每个结构发一份运行期精度分派 shader（键 `key#x`），运行时按真实精度填 PC `prec`。这是库里唯一的表达式收集机制。
 
 **运行时没有跨表达式录制**：`ComputeEngine::begin_expr/end_expr`、`dsl::start_expr/end_expr`、`expr_graph.hpp`、演示层 `FusedChainLayer` 均不存在（IR-C 已移除；取舍记录见 `docs/history.md`，另见 `03-ir-optimization.md` §5.3）。融合边界 = 单个表达式的输入/输出；需要融合的长链直接写成**一个** `dsl::compute` 表达式（单个 AOT 融合 kernel）。CPU 侧表达式求值只有两套机制：**DSL 编译期模板路径 + IR 解释器**（见 `12-compute-engine-inventory.md`）。
 
@@ -233,9 +233,32 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 构建期**一步**（CMake 自动编排，改 Layer 内联表达式后重跑构建即可）：
 
 1. **`tools/scan_exprs.cpp`**（收集 + 生成同一进程）：
-   · **收集**：`FusedAnchor<Expr>` 在静态初始化期按表达式**类型**登记结构（编译期可达），再由 dry-run per-layer 块 + 模型级配置矩阵补精度签名；每个 `dsl::compute*` 在记录模式下把折叠出的 `ExprSpec` 登记进注册表（按 key 去重）。
-   · **生成**：`tools/fused_generate.hpp`（原独立工具 `gen_fused`，现已并入本工具）对每条 spec 出 `glsl_gen` GLSL → glslc → 内联 SPIR-V → `build/generated/fused_registry.hpp`。
+   · **收集**：只收集**结构**。`FusedAnchor<Expr>` 在静态初始化期按表达式**类型**登记结构（编译期可达），再由 dry-run per-layer + 模型 pass（**只跑 f32**）补齐"运行期配置相关"的结构；fold spec 与 matmul trans 族由显式登记块给出。
+   · **生成**：`tools/fused_generate.hpp`（原独立工具 `gen_fused`，现已并入本工具）对**每个结构发三份**：V0 全 f32（键 = `key`）/ **V1 运行期精度分派**（键 = `key#x`）/ V2 native16（键 = `key#a`，按 `expr_prec_sig_native16` 的**结构谓词**判定）→ GLSL → glslc → 内联 SPIR-V → `build/generated/fused_registry.hpp`。
    · **不经 `.bin` 中间序列化**（`expr_registry.hpp` 的 `write_registry/read_registry/kExprBinVersion` 已删除）。
+
+### 精度签名已不是构建期集合（2026-10-01，A1）
+
+**问题**：签名（哪些输入/输出是 f16）由运行期张量精度决定、类型层面不可见，因此历史上"每个 (结构, 签名) 一份 shader"必须靠**执行**发现（dry-run 跑 f32/f16 两遍 + 模型 pass + `NN_PREC_TRACE` 回填清单）。这是扫描里唯一无法用自登记取代的部分。
+
+**解法 = 把签名从「身份」降级为「参数」**：V1 变体的 GLSL 对每个输入/输出各声明 **f32 + `float16_t` 双视图**（同一 `VkBuffer` 绑两次，只解引用与真实元素类型一致的那一个），加载/存储处按 push constant `uint prec`（bit i = 输入 i 为 f16，bit16 = 输出 f16）走 **uniform 分支**。索引数学**逐字不变**（两种视图共用同一逻辑下标）→ 与旧带类型变体数值等价。
+
+于是：
+- V1 对**每个结构无条件生成** ⇒ **任何签名都命中**，运行期**不存在 miss**、**不存在边界 cast 回退**、**不存在回填清单**（`tools/prec_backfill.txt` 已删除）；
+- V2（native16，原生 f16 算术）改由**结构谓词**判定生成（代入"全输入 f16 + 输出 f16"这一常量签名），运行时按真实签名确认 —— 生成期同样不需要发现；
+- **实测 f16 扫描遍对结构贡献为 0**（`NN_SCAN_F32_ONLY` 探针：跳过它签名 66 → 0、结构恒 84）→ f16 dry-run 遍与 f16 模型 pass 已删除，扫描工作量减半。
+
+**端到端实测**（"写 `dsl::compute` 即自动融合"）：在 Layer 头里新写一个结构不在任何 dry-run/模型 pass 覆盖内的表达式 →
+
+```
+[scan] 结构来源：dry-run 38（含模型 pass +25、显式登记 +8） + 锚点 60 → 合并 85（锚点独有 14）
+[scan] 收集到 85 条融合表达式
+新增键：7d5efd96f337a4a9 / 7d5efd96f337a4a9#x / 7d5efd96f337a4a9#a
+```
+
+**其他文件零改动**——无 dry-run 条目、无回填清单、无模型 pass 改动。
+
+**f16 路径实测**（`NN_PREC_TRACE=1 text_train … --gpu --f16`）：`[prec][miss]=0`、边界 cast 归因表**为空**、`[prec][alu-hit]` 6670 → 全程命中预生成 shader，零 cast 回退。
 
 `scan_exprs` 需覆盖所有 Layer 的 DSL 路径（Softmax/LN/RMSNorm fwd+bwd、CrossEntropy softmax 结构、**Attention fold 结构**——层 forward 直调 `engine.eval_expr(make_fold_attn_o(...))` 不经 DSL 钩子，scan 的显式登记块（3 掩码 × 2 偏置的 5 个组合）是 fold spec 唯一注册来源、漏组合即 GPU 闭合世界硬报错、Linear 的 matmul 段、optimizer 的 `compute_into` 原地表达式），使融合签名被收集。**结构**已由自登记锚点保证（见下节），未命中 → `eval_expr` 硬报错（保持项目"GPU 硬报错、不降级"哲学）。
 
@@ -244,24 +267,20 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 手写 dry-run 清单只覆盖**跑到的**路径；配置分支没被跑到就漏（`MaxPool2D(pool≠2)` 曾如此）。为此 `expr_dsl.hpp` 增加 `FusedAnchor<Expr>`：每个 `dsl::compute/_into/_reduce` 实例化 odr-use 一个锚点，其**静态初始化期**把"从表达式类型默认构造的符号实例"折叠出的结构登记进注册表。
 
 - **前提 = "结构 = 表达式类型"**：为此步骤①②③把 `consts` 值、`matmul.transA/transB`、`GroupedReduce.R` 逐出 key（分别改走 push constant），并把 `GroupedReduceRef` 的 `is_max`（决定视图 kind）提为模板参数。
-- **覆盖语义**：调用点在函数体里，**函数被编译即实例化**——与运行期是否走到该分支无关，因此是"编译期可达"而非"运行期可达"。A/B 实测（`-DNN_SCAN_NO_ANCHOR`）：结构数 **72（仅 dry-run）→ 84（+锚点）**，多出的 12 条都是编译进来的真实调用点（3 条含 matmul、1 条归约、1 条 16 个 vp 槽的宽表达式、其余逐元素）。
+- **覆盖语义**：调用点在函数体里，**函数被编译即实例化**——与运行期是否走到该分支无关，因此是"编译期可达"而非"运行期可达"。A/B 实测（`-DNN_SCAN_NO_ANCHOR`）：结构数 **71（仅 dry-run/模型 pass）→ 84（+锚点）**，多出的 13 条都是编译进来的真实调用点（含 matmul、归约、16 个 vp 槽的宽表达式等）。⇒ 锚点与 dry-run **互补**：dry-run/模型 pass 是结构的主要来源（71/84），锚点覆盖它跑不到的调用点（13/84）。
 - **常驻台账**：锚点登记进独立注册表 `anchor_registry()`，`scan_exprs` 末尾合并并打印来源分项（见下）。**锚点独有数突然变大 = 有新的层路径没纳入任何驱动**（回归信号）。
-- **只登记结构（sig=0）**：⚠ **精度签名登记不出来**——同一个表达式里"哪些输入是 f16"由运行期张量精度决定（类型层面不可见）。实测扫描出的 60 个带类型变体里只有 16 个是"全 f16 输入+输出"，其余 44 个是混合签名（`0x0001/0x0003/0x10005…`）。故 f16 带类型变体**必须**由 profile_f32/profile_f16 两遍 dry-run（或运行期 `NN_PREC_TRACE` + `prec_backfill.txt`）产生，**自登记无法取代它**。
-- **模型级签名 pass**（补签名覆盖）：per-layer dry-run 块只覆盖"层被单独造出来"的路径；有些调用点只在**完整模型**里才执行（GPT/RAPT 的 LM head、PatchEmbedding、模型级位置编码等）。`scan_exprs` 因此在两个 profile 下各跑一遍**配置矩阵**：`mnist_mlp`×{LayerNorm,RMSNorm,BatchNorm}、`mnist_transformer`(ViT)、`cnn`×{pool2,pool3}、`gpt`×{Learned,ALiBi,Sinusoidal,RoPE}×{GeLU,SwiGLU}×{LayerNorm,RMSNorm}、`rapt`×{causal,bidir}（小配置 vocab=64/d_model=16/seq=8/H=2/d_ff=32/L=2；id 输入须填合法 token 值）。该 pass 失败只打 `[scan][warn]` 不中断构建（它是增量，主路径已由 dry-run + 锚点覆盖）。
+- **只登记结构**：⚠ 自登记只能给**结构**（`sig=0`）。**精度签名由生成期的运行期分派变体覆盖**（见上节"精度签名已不是构建期集合"）——自登记 + V1 合起来才构成完整的"零注解"链路：结构靠编译期可达，签名靠运行期参数。
+- **模型级 pass（结构侧）**：per-layer dry-run 块只覆盖"层被单独造出来"的路径；有些调用点只在**完整模型**里才执行（GPT/RAPT 的 LM head、PatchEmbedding、模型级位置编码等）。`scan_exprs` 因此跑一遍**配置矩阵**（只跑 f32）：`mnist_mlp`×{LayerNorm,RMSNorm,BatchNorm}、`mnist_transformer`(ViT)、`cnn`×{pool2,pool3}、`gpt`×{Learned,ALiBi,Sinusoidal,RoPE}×{GeLU,SwiGLU}×{LayerNorm,RMSNorm}、`rapt`×{causal,bidir}（小配置 vocab=64/d_model=16/seq=8/H=2/d_ff=32/L=2；id 输入须填合法 token 值）。该 pass 失败只打 `[scan][warn]` 不中断构建（它是增量，主路径已由 dry-run + 锚点覆盖）。
 - **已验证可删：13 个 per-layer dry-run 块（−223 行）**。模型 pass 覆盖了这些层路径后，`scan_exprs` 里 ReLU/SwiGLU/GeLU/Softmax/RMSNorm/LayerNorm/RLA(causal+bidir)/GPTBlock/TransformerEncoderLayer/Linear/Conv2D/MaxPool2D 的独立 dry-run 块**已删除**，判据是两条硬证据：
   1. **结构集合逐字节不变**（84 条，bin 内容一致）；
   2. **运行时 miss 集合不变**：`NN_PREC_TRACE=1 mem_probe --f16` 的 5 个工作负载（默认 / `--doc-mask` / `--checkpoint-every 2` / `--optimizer muon` / `--activation-offload`）在删除前后都是同一个 miss（仅 fold doc-mask 一条，见下）。
   保留的是**整模型跑不到**的来源：优化器（5 变体）、损失（MSE / CE 稠密 / CE 稀疏）、RoPE `apply_step`（增量推理）、CSA×4（掩码/偏置组合，含模型未覆盖的 doc 变体）、MHA、以及 `scan_exprs` 内的**显式测试覆盖登记**（matmul+bias+relu / bmm_reduce / reduce_consts）。
-- **常驻分项台账**（每次构建打印）：
+- **常驻分项台账**（每次构建打印，结构侧）：
   ```
   [scan] 结构来源：dry-run 38（含模型 pass +25、显式登记 +8） + 锚点 59 → 合并 84（锚点独有 13）
-  [scan] 签名来源：dry-run 32 + 模型 pass 34 + 显式登记 0 = 66
   ```
-  A/B 开关：`-DNN_SCAN_NO_ANCHOR`（关锚点）/ `-DNN_SCAN_NO_DRYRUN`（关手写块），均只影响登记集合、不改语义。
-- **run-only 签名回填仍是兜底**：`--f16` 下有些签名只有真实训练才暴露，靠 `NN_PREC_TRACE=1` 的 `[prec][miss]` 收集后写进 `tools/prec_backfill.txt`。已完成两批：
-  1. 注意力 forward 单 fold kernel 的**文档掩码** 5 输入形态（`74a6eaacc0e5d766 10007`，`[f16,f16,f16,f32,f32] out=f16`），复现 `mem_probe --f16 --doc-mask`；
-  2. **MNIST/CNN f16 训练**的 8 条（`59e079001367d11b 10000`、`fe93c0d99c16113f 10000/10002`、`cb3d830f25b84895 10001`、`b7e6d363af1963ac 10000/10002`、`8a29d02213a0e196 10003`、`27c7edd7a0a4f808 10007`）。成因：MLP/CNN 的输入与部分中间张量在 master-weights 配方下是 **f32 存储** → 出现"f32 入 + f16 出"的混合签名，占位张量按 compute 精度造的 dry-run 预测不到；这些 miss 正是 `--f16` 训练里边界 cast（物化 f32 副本）的大头。
-  逐条复现命令写在清单注释里。**验证**：`mnist_train --arch {mlp,cnn,transformer} --f16` × `mem_probe --f16`（默认 / `--doc-mask`）共 5 个负载 **miss 全为 0**。
+  A/B 开关：`-DNN_SCAN_NO_ANCHOR`（关锚点）/ `-DNN_SCAN_NO_DRYRUN`（关 dry-run/模型 pass），均只影响登记集合、不改语义。
+- **run-only 签名回填已删除**（A1e）：`--f16` 下曾有一批只有真实训练才暴露的签名（注意力 fold 的文档掩码 5 输入形态、MNIST/CNN f16 训练的 8 条"f32 入 + f16 出"混合签名），靠 `NN_PREC_TRACE=1` 的 `[prec][miss]` 收集后写进 `tools/prec_backfill.txt`。**该清单与其工作流已随 A1 整体删除**——V1 分派 shader 覆盖任意签名，f16 训练实测 `miss=0` 且边界 cast 归因表为空。历史清单条目与复现命令归档在 `docs/history.md`。
 - **契约回归**：上述三条 key 语义 + "符号实例 key ≡ 真实实例 key" 由
   `src/expr_fused_key_test.cpp` 锁定（并入 `expr_cpu_test` 聚合目标，ctest 目标数不变）。
   任一条被违反（有人重新引入"运行期值决定结构"）→ 运行时 key 与登记 key 不一致
