@@ -266,6 +266,14 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
   `src/expr_fused_key_test.cpp` 锁定（并入 `expr_cpu_test` 聚合目标，ctest 目标数不变）。
   任一条被违反（有人重新引入"运行期值决定结构"）→ 运行时 key 与登记 key 不一致
   → 闭合世界 miss；测试会立刻红。
+- **运行时证据（2026-10-01）**：关掉锚点（`-DNN_SCAN_NO_ANCHOR`，结构 84 → 71）后，`text_train` / `mnist_train --f16` / `gpu_stability_probe` 全部照常通过，但 **`text_infer`（KV-cache 增量解码）在 GPU 上闭合世界硬报错**：
+
+  ```
+  GpuEngine::eval_expr: 未找到该内联表达式的 AOT 融合 shader（闭合世界）；…
+  key=9ca81b4967cdfa20
+  ```
+
+  该 key = `mm=1 + rparam×1 + 两个 Linear 输入`，即 `forward_step` 的注意力打分链——**手写 dry-run 从未覆盖过的路径**。打开锚点后同一命令正常（8 tokens / 0.2s）。⇒ 锚点不是纯理论安全网：它挡住了一个**已发布负载**的硬报错。（闭合世界报错现在都会打印 `key=` 以便定位。）
 - 非法结构（裸视图作根 → 空指令表）在构建期即 `_Exit(3)`，与 dry-run 同一闸门。
 - `-DNN_SCAN_NO_ANCHOR` 可关掉锚点做 A/B（只影响登记集合，不影响语义）。
 
