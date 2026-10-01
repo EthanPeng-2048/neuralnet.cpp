@@ -25,6 +25,10 @@
 #include "compute_layer.hpp"
 #include "compute_loss.hpp"
 #include "compute_optimizer.hpp"
+#include "domain_cnn.hpp"
+#include "domain_gpt.hpp"
+#include "domain_mnist.hpp"
+#include "domain_rla.hpp"
 #include "expr_registry.hpp"
 #include "neuralnet.cpp/expr_fold.hpp"
 
@@ -588,6 +592,109 @@ int main(int argc, char* argv[])
     dry_run(raw_engine, nn::profile_f32());   // f32 pass：sig == 0（基础结构表）
     dry_run(raw_engine, nn::profile_f16());   // Phase 2：收集 (结构, 精度签名)；
     // f16 安全由基类边界 cast 入口保证（原 PrecisionEngine 适配层已下沉删除）
+
+    // ── 模型级 pass：用 shipped 工厂建模型跑 fwd/bwd（补"整模型路径"的签名）──
+    // per-layer dry-run 块只覆盖"层被单独造出来"的路径；有些调用点只在**完整模型**
+    // 里才会执行到（GPT/RAPT 的 LM head、PatchEmbedding、模型级位置编码等），
+    // 它们此前既没有结构（现已由 FusedAnchor 自登记补齐）也没有精度签名
+    // → `--f16` 下走边界 cast。本 pass 让这些路径也产出签名。
+    //
+    // 失败不硬失败：本 pass 是**增量**，主路径已由 dry-run + 锚点覆盖；
+    // 某一模型配置跑不通不应让整个构建失败（但不吞掉信息 → 打 [scan][warn]）。
+    const auto model_pass = [&](nn::ComputeEngine& engine,
+                                const nn::PrecisionProfile& prof)
+    {
+        g_scan_prof = prof;
+        const std::size_t B = 3;
+        // 扫描期占位张量（精度 = 当前 pass 的 compute 精度，与真实运行同源）
+        const auto scan_tensor = [&](std::size_t rows, std::size_t cols)
+        { return engine.create_tensor(rows, cols, g_scan_prof.compute); };
+        // 跑一个模型：forward → 取其输出形状造梯度 → backward
+        const auto run = [&](nn::Model& model, const nn::Tensor& input, const char* name)
+        {
+            auto out = model.forward(input);
+            if (!out)
+            {
+                std::fprintf(stderr, "[scan][warn] %s forward 失败：%s\n", name,
+                             out.error().message.c_str());
+                return;
+            }
+            nn::Tensor grad = scan_tensor(out->rows(), out->cols());
+            auto br = model.backward(grad);
+            if (!br)
+                std::fprintf(stderr, "[scan][warn] %s backward 失败：%s\n", name,
+                             br.error().message.c_str());
+        };
+        const auto try_build = [&](const char* name, auto&& build, const nn::Tensor& input)
+        {
+            auto m = build();
+            if (!m)
+            {
+                std::fprintf(stderr, "[scan][warn] %s 构建失败：%s\n", name,
+                             m.error().message.c_str());
+                return;
+            }
+            run(*m, input, name);
+        };
+
+        // 1) MNIST MLP（784 → …）
+        try_build("mnist_mlp",
+                  [&] { return nn::build_mnist_mlp_model(engine, nn::MNIST_LAYER_DIMS,
+                                                         nn::NormType::LayerNorm, prof); },
+                  scan_tensor(nn::MNIST_LAYER_DIMS.front(), B));
+        // 2) MNIST Transformer（ViT 风格；输入 img²）
+        try_build("mnist_transformer",
+                  [&] { return nn::build_mnist_transformer_model(
+                            engine, nn::MNIST_IMG_SIZE, nn::MNIST_PATCH_SIZE,
+                            nn::MNIST_TF_D_MODEL, nn::MNIST_TF_NUM_HEADS,
+                            nn::MNIST_TF_D_FF, nn::MNIST_TF_NUM_LAYERS, prof); },
+                  scan_tensor(nn::MNIST_IMG_SIZE * nn::MNIST_IMG_SIZE, B));
+        // 3) CNN（LeNet 风格；输入 C·H·W）
+        try_build("cnn",
+                  [&] {
+                      nn::CnnConfig cfg;
+                      cfg.convs = nn::MNIST_CNN_CONVS;
+                      cfg.fc_dims = nn::MNIST_CNN_FC;
+                      // 注：CnnConfig 无精制度字段（CNN 走默认 f32 profile）
+                      return nn::build_cnn_model(engine, cfg);
+                  },
+                  scan_tensor(1 * 28 * 28, B));
+        // 4) GPT（小配置，Learned 位置编码）——输入是 token id (seq, batch)，
+        //    gather_rows 会按值取行，必须填**合法** id（否则越界）
+        {
+            constexpr std::size_t V = 64, S = 8, D = 16, H = 2, F = 32, L = 2;
+            nn::GptConfig cfg;
+            cfg.vocab_size = V; cfg.d_model = D; cfg.seq_len = S;
+            cfg.num_heads = H; cfg.d_ff = F; cfg.num_layers = L;
+            cfg.pos_enc = nn::PosEncodingType::Learned;
+            cfg.precision = prof;
+            // id 输入恒 f32（概念上是整数索引；text_train 同口径）
+            nn::Tensor ids = engine.create_tensor(S, B, nn::Precision::F32);
+            std::vector<nn::Scalar> idv(S * B);
+            for (std::size_t i = 0; i < idv.size(); ++i)
+                idv[i] = static_cast<nn::Scalar>(i % V);
+            (void)engine.write(ids, std::span<nn::Scalar>(idv));
+            try_build("gpt", [&] { return nn::build_gpt_model(engine, cfg); }, ids);
+        }
+        // 5) RAPT（RoPE + causal）
+        {
+            constexpr std::size_t V = 64, S = 8, D = 16, H = 2, F = 32, L = 2;
+            nn::RAPTConfig cfg;
+            cfg.vocab_size = V; cfg.d_model = D; cfg.seq_len = S;
+            cfg.num_heads = H; cfg.d_ff = F; cfg.num_layers = L;
+            cfg.pos_enc = nn::PosEncodingType::RoPE;
+            cfg.causal = true;
+            cfg.precision = prof;
+            nn::Tensor ids = engine.create_tensor(S, B, nn::Precision::F32);
+            std::vector<nn::Scalar> idv(S * B);
+            for (std::size_t i = 0; i < idv.size(); ++i)
+                idv[i] = static_cast<nn::Scalar>(i % V);
+            (void)engine.write(ids, std::span<nn::Scalar>(idv));
+            try_build("rapt", [&] { return nn::build_rapt_model(engine, cfg); }, ids);
+        }
+    };
+    model_pass(raw_engine, nn::profile_f32());   // 结构 + 全 f32 签名
+    model_pass(raw_engine, nn::profile_f16());   // 整模型路径的 f16 签名
     // ── fold v1（标量域）分块状态归约（表达式集合登记）──────────────────────────
     // 三个共享样例（expr_fold.hpp——与 fused_gpu_test 对拍**同源构造** →
     // key 一致、闭合世界命中）：rowmax / rowsum / softmax_denom(online 双
