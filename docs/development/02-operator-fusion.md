@@ -234,7 +234,7 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 
 1. **`tools/scan_exprs.cpp`**（收集 + 生成同一进程）：
    · **收集**：`FusedAnchor<Expr>` 在静态初始化期按表达式**类型**登记结构（编译期可达），再由 dry-run per-layer 块 + 模型级配置矩阵补精度签名；每个 `dsl::compute*` 在记录模式下把折叠出的 `ExprSpec` 登记进注册表（按 key 去重）。
-   · **生成**：`tools/fused_generate.hpp`（原 `gen_fused.cpp`）对每条 spec 出 `glsl_gen` GLSL → glslc → 内联 SPIR-V → `build/generated/fused_registry.hpp`。
+   · **生成**：`tools/fused_generate.hpp`（原独立工具 `gen_fused`，现已并入本工具）对每条 spec 出 `glsl_gen` GLSL → glslc → 内联 SPIR-V → `build/generated/fused_registry.hpp`。
    · **不经 `.bin` 中间序列化**（`expr_registry.hpp` 的 `write_registry/read_registry/kExprBinVersion` 已删除）。
 
 `scan_exprs` 需覆盖所有 Layer 的 DSL 路径（Softmax/LN/RMSNorm fwd+bwd、CrossEntropy softmax 结构、**Attention fold 结构**——层 forward 直调 `engine.eval_expr(make_fold_attn_o(...))` 不经 DSL 钩子，scan 的显式登记块（3 掩码 × 2 偏置的 5 个组合）是 fold spec 唯一注册来源、漏组合即 GPU 闭合世界硬报错、Linear 的 matmul 段、optimizer 的 `compute_into` 原地表达式），使融合签名被收集。**结构**已由自登记锚点保证（见下节），未命中 → `eval_expr` 硬报错（保持项目"GPU 硬报错、不降级"哲学）。
