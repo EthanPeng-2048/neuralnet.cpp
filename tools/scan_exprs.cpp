@@ -1,19 +1,23 @@
 // ───────────────────────────────────────────────────────────────────────────
-//  scan_exprs.cpp — AOT 算子融合：构建期表达式收集（dry-run）
+//  scan_exprs.cpp — AOT 算子融合：构建期**单步**工具（收集 + 合成）
 //
-//  用 CPU 引擎 + 假张量跑一遍相关 Layer 的 forward/backward，使每个
+//  收集：CPU 引擎 + 假张量跑一遍相关 Layer 的 forward/backward，使每个
 //  dsl::compute / compute_reduce / compute_into 在 NN_EXPR_SCAN 记录模式下把
-//  折叠出的 ExprSpec **结构**登记进全局注册表（按 expr_spec_key 去重），跑完 dump 成 bin。
+//  折叠出的 ExprSpec **结构**登记进全局注册表（按 expr_spec_key 去重）。
+//  脚本里还有两条互补来源：`FusedAnchor<Expr>` 静态初始化期按表达式**类型**
+//  自登记（编译期可达），以及 fold / matmul-trans 等显式登记块。
+//  合成：同进程内直接调 `nn::tool::generate_fused_registry`
+//  （tools/fused_generate.hpp，原独立工具 gen_fused）→
+//  <out_dir>/fused_registry.hpp。**不经任何中间序列化**。
 //
 //  表达式**文本只出现在 Layer**；这里只是"执行 Layer 代码路径"以触达它们，
-//  dump 出来的是派生物（结构），不是手写定义。
+//  产物是派生物（结构 + SPIR-V），不是手写定义。
 //
-//  用法： scan_exprs <out.bin>
-//  之后 gen_fused 读 <out.bin> 合成融合 shader（→ fused_registry.hpp）。
+//  用法： scan_exprs <out_dir> <glslc_path> [--list-backends]
 //
-//  ⚠ 闭合世界安全网：若某条 Layer 路径未被本工具覆盖，其内联表达式在
-//    GPU 运行时将硬报错，提醒把该路径补进扫描。新增融合表达式 / 新 d_k
-//    时，把对应的 dry-run 调用加到下面。
+//  ⚠ 闭合世界安全网：若某条 Layer 路径未被覆盖，其内联表达式在 GPU 运行时
+//    将硬报错（错误信息带 key），提醒把该路径补进扫描。新增融合表达式时优先
+//    依赖锚点自登记；只有"运行期配置决定的结构"才需要在这里补 dry-run 块。
 // ───────────────────────────────────────────────────────────────────────────
 
 // NN_EXPR_SCAN 由本文件自行开启；`nn_enable_gpu_fusion` 还会用同名宏编译
@@ -22,8 +26,12 @@
 #define NN_EXPR_SCAN
 #endif
 
+#include <algorithm>
 #include <cstdio>
 #include <cstddef>
+#include <cstdlib>
+#include <string>
+#include <vector>
 
 #include "compute_cpu_engine.hpp"
 #include "compute_layer.hpp"
@@ -63,12 +71,11 @@ void on_abort(int)
 }
 } // namespace
 
-// ── 扫描期精度配置（Phase 2：in-kernel f16 变体收集）──────────────────────
-// dry-run 收集的是**结构**（与形状/精度无关）；但精度签名（哪些输入/输出是
-// f16）取决于 profile，故整段 dry-run 跑两遍：profile_f32（sig=0，登记基础结构表）与
-// profile_f16（带类型变体）。输入张量按当前 profile 的 compute 创建，使 f16
-// pass 与运行时（激活即 f16）**同源**——否则会收集到运行时永不使用的签名。
-static nn::PrecisionProfile g_scan_prof{};
+// ── 扫描期精度配置 ────────────────────────────────────────────────────────
+// dry-run 收集的是**结构**（与形状/精度无关），故只跑 profile_f32 一遍。
+// 历史上曾跑第二遍 profile_f16 以枚举"精度签名"；签名已降级为运行期参数
+// （生成阶段对每个结构发运行期分派 shader，键 `key#x`），该遍已删除。
+// scan_prof 仍用于：占位张量按当前 pass 的 compute 精度创建（与真实运行同源）。
 
 int main(int argc, char* argv[])
 {
@@ -77,7 +84,10 @@ int main(int argc, char* argv[])
         if (std::string(argv[i]) == "--list-backends")
         {
             std::printf("[scan] 可用 emitter 后端（IR-D）:\n");
-            for (const auto& n : nn::emitter_registry::names())
+            // 排序：names() 走 unordered_map，顺序不定；工具输出必须确定性（铁律 8）
+            std::vector<std::string> backends = nn::emitter_registry::names();
+            std::sort(backends.begin(), backends.end());
+            for (const auto& n : backends)
                 std::printf("      - %s\n", n.c_str());
             return 0;
         }
@@ -96,20 +106,20 @@ int main(int argc, char* argv[])
     std::signal(SIGABRT, &on_abort);   // NN_ASSERT → abort 带栈（见文件头）
 
     nn::CpuEngine raw_engine;
+    // 扫描期精度配置（占位张量按当前 pass 的 compute 精度创建，与真实运行同源）
+    nn::PrecisionProfile scan_prof{};
 
-    // ── dry-run 主体：对给定 profile 跑一遍（f32 pass 收集 sig=0 基础结构；f16 pass 收集带类型变体）
-    // engine 是**形参**（遮蔽外层 raw_engine）：f16 pass 直接传原生引擎即可——
-    // P-1 下沉后 f16 边界 cast 由基类 NVI 入口统一处理（原 PrecisionEngine
-    // 适配层已删除，见 docs/development/15 §4.1）；原生 CpuEngine 从未见过
-    // f16 张量（历史上直交属 UB，实测 heap corruption 0xC0000374）。
+    // ── dry-run 主体：跑一遍 Layer 的 forward/backward（只收集**结构**）──
+    // engine 是**形参**（遮蔽外层 raw_engine）：f16 边界 cast 由基类 NVI 入口
+    // 统一处理（原 PrecisionEngine 适配层已删除，见 docs/development/15 §4.1）。
     [[maybe_unused]] const auto dry_run = [&](nn::ComputeEngine& engine, const nn::PrecisionProfile& prof)
     {
-        g_scan_prof = prof;
+        scan_prof = prof;
         // M1（docs/development/17 §4.1）：库外不再直构 Tensor——scan 输入经
         // 引擎创建（出生绑定与本段 dry-run 使用的 engine 一致）。
         const auto scan_tensor = [&](std::size_t rows, std::size_t cols)
         {
-            return engine.create_tensor(rows, cols, g_scan_prof.compute);
+            return engine.create_tensor(rows, cols, scan_prof.compute);
         };
     // ── RoPE：forward + backward ─────────────────────────────────────────
     // （apply 与 apply_step 折叠出的结构相同，会自动去重）
@@ -123,7 +133,7 @@ int main(int argc, char* argv[])
                                  std::size_t{64}, std::size_t{128}})
     {
         nn::RotaryEmbedding rope(dk);
-        rope.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+        rope.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
         (void)rope.init(engine);   // M6 段 C：层由 init 绑定引擎
         nn::Tensor q = scan_tensor(2 * dk, 8);   // rows 为 dk 的整数倍
         (void)rope.apply(engine, q, /*seq=*/8, /*backward=*/false);
@@ -137,7 +147,7 @@ int main(int argc, char* argv[])
     {
         const std::size_t R = 8, C = 5;
         nn::MSELoss mse;
-        mse.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+        mse.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
         nn::Tensor pred = scan_tensor(R, C);
         nn::Tensor target = scan_tensor(R, C);
         (void)mse.forward(engine, pred, target);
@@ -148,7 +158,7 @@ int main(int argc, char* argv[])
     {
         const std::size_t C = 8, B = 5;
         nn::CrossEntropyLoss ce;
-        ce.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+        ce.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
         nn::Tensor logits = scan_tensor(C, B);
         nn::Tensor target = scan_tensor(C, B);
         (void)ce.forward(engine, logits, target);
@@ -187,35 +197,33 @@ int main(int argc, char* argv[])
     //   前置 matmul 段（MatmulSpec）+ 尾逐元素链（Add + Max）。
     // 这里直接构造折叠后的结构并登记（与 dsl::compute 登记 spec 是同一机制），
     // 保证 GPU 运行时同一结构命中 AOT 融合 shader（闭合世界）。
-    //   - transA/transB 是结构 → 分别登记（4 种组合各一个 shader）
+    //   - transA/transB 是**运行期 operand layout**（PC `mm_trans`）→ **不进 key**：
+    //     4 种转置组合折叠成同一个 key，登记一次即可（历史上此处登记 4 份，
+    //     key 去掉转置后它们全被去重合并）。
     //   - k（求和维度）是形状参数 → 不进 key：任取一个 K 登记，运行时任何 K
-    //     都命中同一融合 shader（同 RowMod/RotateHalf 的视图参数处理：不进 key，运行时填充）
+    //     都命中同一融合 shader（同 RowMod/RotateHalf 的视图参数处理：不进 key，
+    //     运行时填充）。
     {
-        const auto make_spec = [](std::uint8_t trA, std::uint8_t trB) {
-            nn::ExprSpec s;
-            s.views    = {nn::expr::linear(), nn::expr::linear(), nn::expr::linear()};
-            s.num_regs = 2;
-            s.matmul   = nn::MatmulSpec{0, 1, trA, trB, /*k=*/8};
-            // Add r0 = matmul(A,B) + bias（Input 2）
-            s.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::Add), 0,
-                                nn::expr::matmul_op(), nn::expr::input(2), {}});
-            // Max r1 = max(r0, 0)（relu）
-            s.consts.push_back(nn::Scalar{0});
-            s.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::Max), 1,
-                                nn::expr::reg(0), nn::expr::cst(0), {}});
-            return s;
-        };
-        nn::fused::global_registry().add(make_spec(0, 0));
-        nn::fused::global_registry().add(make_spec(0, 1));
-        nn::fused::global_registry().add(make_spec(1, 0));
-        nn::fused::global_registry().add(make_spec(1, 1));
+        nn::ExprSpec s;
+        s.views    = {nn::expr::linear(), nn::expr::linear(), nn::expr::linear()};
+        s.num_regs = 2;
+        // transA/transB 取 (0,0) 作代表值：它们不进 key
+        s.matmul   = nn::MatmulSpec{0, 1, /*transA=*/0, /*transB=*/0, /*k=*/8};
+        // Add r0 = matmul(A,B) + bias（Input 2）
+        s.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::Add), 0,
+                            nn::expr::matmul_op(), nn::expr::input(2), {}});
+        // Max r1 = max(r0, 0)（relu）
+        s.consts.push_back(nn::Scalar{0});
+        s.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::Max), 1,
+                            nn::expr::reg(0), nn::expr::cst(0), {}});
+        nn::fused::global_registry().add(s);
         // 纯 matmul（无逐元素链）：输出 = matmul 结果
         {
-            nn::ExprSpec s;
-            s.views    = {nn::expr::linear(), nn::expr::linear()};
-            s.num_regs = 0;
-            s.matmul   = nn::MatmulSpec{0, 1, 0, 0, /*k=*/8};
-            nn::fused::global_registry().add(s);
+            nn::ExprSpec pure;
+            pure.views    = {nn::expr::linear(), nn::expr::linear()};
+            pure.num_regs = 0;
+            pure.matmul   = nn::MatmulSpec{0, 1, 0, 0, /*k=*/8};
+            nn::fused::global_registry().add(pure);
         }
     }
 
@@ -297,7 +305,7 @@ int main(int argc, char* argv[])
         {
             nn::CausalSelfAttention attn(d_model, heads, /*max_len=*/1024,
                                          /*seq_len=*/seq, enc);
-            attn.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+            attn.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
             (void)attn.init(engine);   // M6 段 C：层由 init 绑定引擎
             run_csa(attn);
         }
@@ -306,7 +314,7 @@ int main(int argc, char* argv[])
             const std::size_t doc_ids[8] = {0, 0, 1, 1, 0, 0, 1, 1};
             nn::CausalSelfAttention attn_d(d_model, heads, 1024, seq,
                                            nn::PosEncodingType::Learned);
-            attn_d.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+            attn_d.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
             (void)attn_d.init(engine);   // M6 段 C：层由 init 绑定引擎
             attn_d.set_doc_ids(doc_ids);
             run_csa(attn_d);
@@ -315,7 +323,7 @@ int main(int argc, char* argv[])
             const std::size_t doc_ids[8] = {0, 0, 1, 1, 0, 0, 1, 1};
             nn::CausalSelfAttention attn_ad(d_model, heads, 1024, seq,
                                             nn::PosEncodingType::ALiBi);
-            attn_ad.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+            attn_ad.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
             (void)attn_ad.init(engine);   // M6 段 C：层由 init 绑定引擎
             attn_ad.set_doc_ids(doc_ids);
             run_csa(attn_ad);
@@ -330,7 +338,7 @@ int main(int argc, char* argv[])
     {
         const std::size_t d_model = 16, heads = 2, seq = 4, batch = 2;
         nn::MultiHeadAttention attn(d_model, heads, /*seq_len=*/seq);
-        attn.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+        attn.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
         (void)attn.init(engine);
         nn::Tensor x = scan_tensor(d_model, batch * seq);
         auto fr = attn.forward(x);
@@ -357,7 +365,7 @@ int main(int argc, char* argv[])
     {
         const std::size_t C = 8, B = 5;
         nn::CrossEntropyLoss ce;
-        ce.set_precision_profile(g_scan_prof);   // 扫描期精度（f16 pass 收集变体）
+        ce.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
         nn::Tensor logits = scan_tensor(C, B);
         std::vector<std::size_t> labels(B, 1);
         std::vector<nn::Scalar> mask(B, 1.0f);
@@ -397,45 +405,50 @@ int main(int argc, char* argv[])
     const std::size_t n_after_dry = nn::fused::global_registry().specs.size();
     // f16 安全由基类边界 cast 入口保证（原 PrecisionEngine 适配层已下沉删除）
 
-    // ── 模型级 pass：用 shipped 工厂建模型跑 fwd/bwd（补"整模型路径"的签名）──
-    // per-layer dry-run 块只覆盖"层被单独造出来"的路径；有些调用点只在**完整模型**
-    // 里才会执行到（GPT/RAPT 的 LM head、PatchEmbedding、模型级位置编码等），
-    // 它们此前既没有结构（现已由 FusedAnchor 自登记补齐）也没有精度签名
-    // → `--f16` 下走边界 cast。本 pass 让这些路径也产出签名。
-    //
-    // 失败不硬失败：本 pass 是**增量**，主路径已由 dry-run + 锚点覆盖；
-    // 某一模型配置跑不通不应让整个构建失败（但不吞掉信息 → 打 [scan][warn]）。
+    // ── 模型级 pass：用 shipped 工厂建模型跑 fwd/bwd（补"整模型路径"的结构）──
+    // per-layer dry-run 块只覆盖"层被单独造出来"的路径；有些调用点只在**完整
+    // 模型**里才会执行到（GPT/RAPT 的 LM head、PatchEmbedding、模型级位置编码
+    // 等）。它们是"运行期配置决定结构"的主要来源——实测 84 条结构里 25 条只由
+    // 本 pass 产出，故**失败即构建失败**：静默降级会产出不完整的注册表，只在
+    // GPU 运行期以闭合世界硬报错暴露（离根因很远）。与 dry-run 的 fail-fast
+    // （见 run_csa 的 abort）一致。
     const auto model_pass = [&](nn::ComputeEngine& engine,
-                                const nn::PrecisionProfile& prof)
+                                const nn::PrecisionProfile& prof) -> bool
     {
-        g_scan_prof = prof;
+        scan_prof = prof;
+        std::size_t n_fail = 0;
         const std::size_t B = 3;
         // 扫描期占位张量（精度 = 当前 pass 的 compute 精度，与真实运行同源）
         const auto scan_tensor = [&](std::size_t rows, std::size_t cols)
-        { return engine.create_tensor(rows, cols, g_scan_prof.compute); };
+        { return engine.create_tensor(rows, cols, scan_prof.compute); };
         // 跑一个模型：forward → 取其输出形状造梯度 → backward
         const auto run = [&](nn::Model& model, const nn::Tensor& input, const char* name)
         {
             auto out = model.forward(input);
             if (!out)
             {
-                std::fprintf(stderr, "[scan][warn] %s forward 失败：%s\n", name,
+                std::fprintf(stderr, "[scan][FAIL] %s forward 失败：%s\n", name,
                              out.error().message.c_str());
+                ++n_fail;
                 return;
             }
             nn::Tensor grad = scan_tensor(out->rows(), out->cols());
             auto br = model.backward(grad);
             if (!br)
-                std::fprintf(stderr, "[scan][warn] %s backward 失败：%s\n", name,
+            {
+                std::fprintf(stderr, "[scan][FAIL] %s backward 失败：%s\n", name,
                              br.error().message.c_str());
+                ++n_fail;
+            }
         };
         const auto try_build = [&](const char* name, auto&& build, const nn::Tensor& input)
         {
             auto m = build();
             if (!m)
             {
-                std::fprintf(stderr, "[scan][warn] %s 构建失败：%s\n", name,
+                std::fprintf(stderr, "[scan][FAIL] %s 构建失败：%s\n", name,
                              m.error().message.c_str());
+                ++n_fail;
                 return;
             }
             run(*m, input, name);
@@ -529,9 +542,20 @@ int main(int argc, char* argv[])
             try_build(causal ? "rapt_causal" : "rapt_bidir",
                       [&] { return nn::build_rapt_model(engine, cfg); }, ids);
         }
+        return n_fail == 0;
     };
     // 模型 pass：**结构**来源（运行期配置相关的路径），与精度无关 → 只跑 f32。
-    model_pass(raw_engine, nn::profile_f32());
+    // 与 per-layer dry-run 同受 `-DNN_SCAN_NO_DRYRUN` 门控（该宏的文档语义就是
+    // "关掉 dry-run/模型 pass"，此前只关了前者）。
+#if !defined(NN_SCAN_NO_DRYRUN)
+    if (!model_pass(raw_engine, nn::profile_f32()))
+    {
+        std::fprintf(stderr,
+                     "[scan][FAIL] 模型 pass 失败 → 注册表不完整，中止构建"
+                     "（闭合世界：缺结构只在 GPU 运行期报错）\n");
+        return 1;
+    }
+#endif
     const std::size_t n_after_model = nn::fused::global_registry().specs.size();
     // ── fold v1（标量域）分块状态归约（表达式集合登记）──────────────────────────
     // 三个共享样例（expr_fold.hpp——与 fused_gpu_test 对拍**同源构造** →
@@ -598,24 +622,10 @@ int main(int argc, char* argv[])
         // 这是"能否进一步删掉 dry-run"的唯一依据——锚点按表达式类型登记，但
         // **符号实例（`Expr{}`）与真实实例可能折叠出不同结构**（运行期配置
         // 维度：视图种类、输入个数、掩码组合…）；这些结构锚点看不到。
-        const bool dump_src = [] {
-#if defined(_MSC_VER)
-            char* b = nullptr; std::size_t n = 0;
-            _dupenv_s(&b, &n, "NN_SCAN_DUMP_SOURCES");
-            const bool v = (b != nullptr && b[0] == '1');
-            std::free(b);
-            return v;
-#else
-            const char* v = std::getenv("NN_SCAN_DUMP_SOURCES");
-            return v != nullptr && v[0] == '1';
-#endif
-        }();
-        std::unordered_set<std::string> dry_keys;
-        for (const auto& s : reg.specs)
-            dry_keys.insert(nn::expr_spec_key(s));
-        std::unordered_set<std::string> anchor_keys;
-        for (const auto& s : anchor.specs)
-            anchor_keys.insert(nn::expr_spec_key(s));
+        const bool dump_src = nn::tool::tool_env_flag("NN_SCAN_DUMP_SOURCES");
+        // 两侧的 key 集合直接取注册表已有的 keys（add() 已算过 key），不再重建。
+        const std::unordered_set<std::string>& dry_keys = reg.keys;
+        const std::unordered_set<std::string>& anchor_keys = anchor.keys;
         const auto summarize = [](const nn::ExprSpec& s)
         {
             const int raxis = nn::expr_spec_reduce_axis(s);
@@ -675,12 +685,19 @@ int main(int argc, char* argv[])
                                 nn::expr_spec_key(s).c_str(), summarize(s).c_str());
         for (const auto& s : anchor.specs)
             reg.add(s);
-        std::printf("[scan] 结构来源：dry-run %zu（含模型 pass +%zu、显式登记 +%zu）"
-                    " + 锚点 %zu → 合并 %zu（锚点独有 %zu、dry-run 独有 %zu）\n",
+        // 分段口径（**互不重叠**）：dry-run 侧 = ①per-layer dry-run + matmul/bmm
+        // 显式登记（n_after_dry）+ ②模型 pass（+）+ ③fold/attn-fold 显式登记（+）；
+        // 锚点为独立来源，与上面各段取并集去重后的新增量 = 锚点独有。
+        std::printf("[scan] 结构来源：dry-run 侧 %zu（per-layer+显式 %zu、模型 pass +%zu、"
+                    "fold 显式 +%zu） + 锚点 %zu（新增 %zu）= 合计 %zu"
+                    "（锚点独有 %zu、dry-run 独有 %zu）\n",
+                    n_before_anchor,
                     n_after_dry,
                     n_after_model - n_after_dry,
                     n_before_anchor - n_after_model,
-                    anchor.specs.size(), reg.specs.size(),
+                    anchor.specs.size(),
+                    reg.specs.size() - n_before_anchor,
+                    reg.specs.size(),
                     reg.specs.size() - n_before_anchor, n_dry_only);
         // 锚点独有 = 手写 dry-run 覆盖不到的调用点（该数突然变大 → 有新层路径
         // 没纳入 dry-run）。
@@ -691,13 +708,15 @@ int main(int argc, char* argv[])
     }
     std::printf("[scan] 收集到 %zu 条融合表达式\n", reg.specs.size());
     // ── 签名覆盖：**构建期不再需要任何背书** ──────────────────────────────
-    // 生成阶段对每个结构无条件发一份运行期精度分派 shader（键 key#x）——
+    // 生成阶段对每个结构无条件发一份运行期精度分派 shader（键 `key#x`）——
     // 输入/输出双视图 + PC `prec`，一份覆盖任意 (输入精度位图, 输出精度)。
     // 因此：
-    //   · 结构 = 唯一需要"收集"的东西（锚点 + dry-run/模型 pass）；
-    //   · 签名**不再是构建期集合**，无需 dry-run 的 f16 遍、无需回填清单，
-    //     运行期也不存在 miss / 边界 cast 回退；
+    //   · 结构 = 唯一需要"收集"的东西（锚点 + dry-run/模型 pass + 显式登记）；
+    //   · 签名**不再是构建期集合**，无需 dry-run 的 f16 遍、无需回填清单；
     //   · 注册表里没有"精度变体"这一层（`ExprRegistry::variants` 已删除）。
+    // ⚠ 精度路径的落点仍有三档，不是"永不 miss"：`#a`（native16）→ `#x`
+    //   （运行期分派）→ 基类边界 cast。`#x` 在生成被跳过（[skip]）、
+    //   NN_SCAN_NO_DISPATCH=1、或设备无 16bit 存储时不注册 → 落到边界 cast。
     // ── 生成阶段（原 gen_fused）：同一进程内直接消费注册表 → fused_registry.hpp
     //    构建期因此只有一步；不再经 expr_specs.bin 中间序列化。
     if (!nn::tool::generate_fused_registry(out_dir, glslc, reg))
