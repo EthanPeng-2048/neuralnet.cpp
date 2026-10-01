@@ -625,13 +625,27 @@ int main(int argc, char* argv[])
                 if (!v.empty()) v += ",";
                 v += std::to_string(static_cast<int>(x.kind));
             }
+            std::string ins;
+            for (const auto& i : s.instrs)
+            {
+                if (!ins.empty()) ins += ";";
+                ins += std::to_string(static_cast<int>(i.op)) + "("
+                     + std::to_string(static_cast<int>(i.a.kind)) + "/"
+                     + std::to_string(static_cast<int>(i.a.idx)) + ","
+                     + std::to_string(static_cast<int>(i.b.kind)) + "/"
+                     + std::to_string(static_cast<int>(i.b.idx)) + ","
+                     + std::to_string(static_cast<int>(i.c.kind)) + "/"
+                     + std::to_string(static_cast<int>(i.c.idx)) + ")";
+            }
             return "raxis=" + std::to_string(raxis)
                  + " mm=" + (s.matmul ? "1" : "0")
                  + " fold=" + (s.fold ? "1" : "0")
                  + " nreg=" + std::to_string(s.num_regs)
-                 + " ninstr=" + std::to_string(s.instrs.size())
+                 + " nconst=" + std::to_string(s.consts.size())
+                 + " nrparam=" + std::to_string(s.rparams.size())
                  + " nview=" + std::to_string(s.views.size())
-                 + " viewkinds=[" + v + "]";
+                 + " viewkinds=[" + v + "]"
+                 + " instrs=[" + ins + "]";
         };
         std::size_t n_dry_only = 0;
         for (const auto& s : reg.specs)

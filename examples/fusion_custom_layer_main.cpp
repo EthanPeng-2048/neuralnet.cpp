@@ -132,6 +132,31 @@ int main()
             return 1;
         }
     }
+
+    // ②′ 归一化形态（列归约 + 广播）：库内属"只有执行 Layer 才拿得到"的一类，
+    //     本层没有 dry-run —— 注册表若只靠锚点而符号实例与运行期不一致，
+    //     这里会闭合世界硬报错。
+    {
+        nn::Tensor gx = gpu.create_tensor(4, 3, nn::Precision::F16,
+                                          nn::InitSpec::constant(0.5f));
+        auto r = nn_example::fused_custom_norm(gpu, gx, 1.0f / 3.0f, 1e-5f,
+                                               nn::Precision::F16);
+        if (!r)
+        {
+            std::fprintf(stderr,
+                "[example] 归一化形态 GPU 未命中（闭合世界）：%s\n",
+                r.error().message.c_str());
+            return 1;
+        }
+        std::vector<nn::f16> hb(12, nn::f16(0.0f));
+        if (auto rr = gpu.read(*r, std::span<nn::f16>(hb)); !rr)
+        {
+            std::fprintf(stderr, "[example] 归一化形态 read 失败\n");
+            return 1;
+        }
+        std::printf("[example] GPU f16 归一化形态 = %.7f\n",
+                    static_cast<double>(static_cast<float>(hb[0])));
+    }
     std::puts("[example] GPU OK");
 #endif
 
