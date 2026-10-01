@@ -97,6 +97,20 @@ expr_spec_key(spec) ≡ expr_spec_key(canonicalize_expr_spec(spec))
 
 即 **key 一定在 canonical IR 上计算**。scan（构建期折叠时）与 runtime（运行时折叠时）必须都先 canonicalize 再算 key，保证两端一致。
 
+**key 只描述"结构"，运行期数值一律不进 key**（进了会让每个取值组合各编译一份**逐字节相同**的 shader，并让"结构 = 表达式类型"不成立）：
+
+| 字段 | 进 key | 运行期载体 |
+|------|--------|-----------|
+| 指令 / 视图 / 寄存器数 | ✅ | — |
+| 常量池**个数** | ✅（决定 push constant 布局） | — |
+| 常量池**值** | ❌ | push constant `c<i>`（`ExprOperandKind::Const` 发射成 `c<idx>`） |
+| `rparams` 个数 / 值 | 个数 ✅ / 值 ❌ | push constant `rp<i>` |
+| 视图形状参数（RowMod/RotateHalf/BatchMod/BatchCol/RowAccess 的 param） | ❌ | push constant `vp<i>` |
+| `matmul.k` / `matmul.batch` | ❌ | push constant `mm_k` / `mm_batch` |
+| `matmul.transA/transB`、`a_input/b_input` | ✅（**待收敛**：目标是把旋转布局改成运行期 operand layout） | — |
+| fold 的 `k` / `vec_state_len` | ❌ | push constant |
+| 分组归约视图的 `R` | ✅（**待收敛**：目标改为运行期循环） | — |
+
 ### 4.2 确定性铁律
 
 - **pass 遍历顺序必须固定**（如始终按指令序从前到后、视图按输入序、常量按出现序）。
