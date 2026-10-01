@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <memory>
 #include <span>
 #include <string>
@@ -38,6 +39,7 @@
 #include <vector>
 
 #include "neuralnet.cpp/cli/cli_gpu_option.hpp"
+#include "neuralnet.cpp/cli/cli_help.hpp"
 #include "neuralnet.cpp/nn.hpp"
 
 namespace
@@ -439,6 +441,23 @@ namespace
     }
 } // namespace
 
+static void print_usage(const char *prog)
+{
+    nn::cli::Help help(std::cout, prog, "CPU / GPU 稳定性与初值一致性探针");
+
+    help.usage("[--steps <n>] [--init-hash | --io-roundtrip] [--gpu [索引]]");
+
+    help.section("选项");
+    help.opt("--steps <n>", "默认模式: 两轮相同训练比 loss / 参数哈希 (默认: 20)");
+    help.opt("--init-hash", "只建模型比初值，不训练 (M2 验收)");
+    help.opt("--io-roundtrip", "批量 read/write/get_index/set_index 语义对拍 (M3 验收)");
+    help.opt("--gpu [索引]", "使用 Vulkan GPU；可选枚举索引，名称子串用 --gpu=<名称>");
+    help.opt("--help, -h", "显示此帮助信息");
+
+    help.section("退出码");
+    help.text("0 = 两轮逐位一致；1 = 不一致；2 = 运行错误");
+}
+
 int main(int argc, char **argv)
 {
     std::size_t steps = 20;
@@ -482,10 +501,9 @@ int main(int argc, char **argv)
             io_roundtrip = true;
             ++i;
         }
-        else if (std::strcmp(argv[i], "--help") == 0)
+        else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0)
         {
-            std::printf("用法: %s [--steps N] [--init-hash] [--io-roundtrip] [--gpu [索引]]\n",
-                        argv[0]);
+            print_usage(argv[0]);
             return 0;
         }
         else

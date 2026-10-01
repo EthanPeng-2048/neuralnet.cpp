@@ -10,6 +10,7 @@
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>
+#include <neuralnet.cpp/cli/cli_help.hpp>
 
 #include <chrono>
 #include <iomanip>
@@ -22,23 +23,20 @@ using nn::Scalar;
 // ==================== 帮助信息 ====================
 void print_usage(const char *prog)
 {
-    std::cout
-        << "BPE 分词器训练程序\n\n"
-        << "用法: " << prog << " <text-file> [选项]\n\n"
-        << "参数:\n"
-        << "  <text-file>          训练文本文件路径 (UTF-8 编码)\n\n"
-        << "选项:\n"
-        << "  --tokenizer <type>   分词器类型: bpe (字节级 BBPE, 默认) | charbpe (字符级, 支持中文)\n"
-        << "  --output <path>      词表输出路径 (默认: bpe_vocab.json)\n"
-        << "  --vocab-size <n>     目标词表大小 (默认: 5000)\n"
-        << "  --min-freq <n>       最小合并频率 (默认: 2)\n"
-        << "  --threads <n>        预分词并行线程数 (默认: 0=自动使用全部核心, 1=顺序)\n"
-        << "  --help               显示此帮助信息\n\n"
-        << "说明:\n"
-        << "  bpe     字节级 BPE（BBPE）：兼容性最好，任意字节均可编码；\n"
-        << "          但中文按 3 字节切分，小模型难学到词义。\n"
-        << "  charbpe 字符级 BPE：每个汉字为 1 个基础 token，BPE 学会合并常见词组；\n"
-        << "          中文场景推荐使用。\n";
+    nn::cli::Help help(std::cout, prog, "BPE 分词器训练程序");
+
+    help.usage("<text-file> [选项]");
+
+    help.section("参数");
+    help.item("<text-file>", "训练文本文件路径 (UTF-8 编码)");
+
+    help.section("选项");
+    help.opt("--tokenizer <type>", "分词器类型: bpe/charbpe (默认: bpe)\nbpe: 字节级 BBPE，兼容性最好，任意字节均可编码；\n但中文按 3 字节切分，小模型难学到词义\ncharbpe: 字符级 BPE，每个汉字为 1 个基础 token，\nBPE 学会合并常见词组；中文场景推荐使用");
+    help.opt("--output <path>", "词表输出路径 (默认: bpe_vocab.json)");
+    help.opt("--vocab-size <n>", "目标词表大小 (默认: 5000；最小 258 = 256 字节 + BOS/EOS)");
+    help.opt("--min-freq <n>", "最小合并频率 (默认: 2)");
+    help.opt("--threads <n>", "预分词并行线程数: 0=自动(默认) 1=顺序 >1=指定");
+    help.opt("--help, -h", "显示此帮助信息");
 }
 
 // ==================== 命令行参数 ====================
@@ -58,7 +56,7 @@ Config parse_args(int argc, char *argv[])
     for (int i = 1; i < argc; ++i)
     {
         std::string arg = argv[i];
-        if (arg == "--help")
+        if (arg == "--help" || arg == "-h")
         {
             print_usage(argv[0]);
             std::exit(0);
