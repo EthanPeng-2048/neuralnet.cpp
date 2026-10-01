@@ -486,9 +486,7 @@ if(Vulkan_FOUND)
         # 全新构建时 generated/ 尚未存在会写入失败（见 08-pitfalls）。
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/generated
         COMMAND scan_exprs ${CMAKE_BINARY_DIR}/generated ${GLSLC}
-                ${CMAKE_SOURCE_DIR}/tools/prec_backfill.txt
         DEPENDS scan_exprs ${SCAN_SRC} ${FUSED_GEN_SRC}
-                ${CMAKE_SOURCE_DIR}/tools/prec_backfill.txt
         COMMENT "[GPU] Scan + synthesize fused shaders (scan_exprs) → fused_registry.hpp"
     )
 
