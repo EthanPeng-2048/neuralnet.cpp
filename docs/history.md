@@ -30,6 +30,7 @@
 - [AGENTS.md](#AGENTS.md)（24 条）
 - [ZiPT（AttnZip）移除](#ZiPT（AttnZip）移除（2026-10-01）)（1 条）
 - [GUI / CLI 参数一致性清理](#GUI / CLI 参数一致性清理（2026-10-01）)（1 条）
+- [分支归档与 legacy 命名空间整理](#分支归档与 legacy 命名空间整理（2026-10-02，v1.6.0 发布时）)（1 条）
 
 ---
 
@@ -2174,3 +2175,20 @@ A1 段改动前为 2424）、`include/neuralnet.cpp/compute_cpu_engine.hpp` **23
 **2026-09-30 里程碑当时的计数**（历史值，不回改）。19 / 20 / 21 三个数并存过一阵，根因就是
 "是否含 `cnn_test_gpu`"与"后来新增了两个目标"两件互不相关的事叠在一起——**这不构成矛盾**，
 但必须写明口径（本次补记）。
+---
+
+# 分支归档与 legacy 命名空间整理（2026-10-02，v1.6.0 发布时）
+
+## 两条开发分支迁入 legacy/dev/（本地与 origin 同步）
+
+- 类型：演进记录 / 删除清单
+- 内容：`feat/fused-self-register` → **`legacy/dev/fused-self-register`**、
+  `feat/fused-runtime-prec-dispatch` → **`legacy/dev/fused-runtime-prec-dispatch`**（沿用
+  `legacy/zipt` 惯例，`feat/` 换为 `legacy/dev/`；远端旧 `feat/*` 引用已删除，分支历史完整保留
+  于新名字与 main 上的合并提交 PR #14 / #16）。
+- 连带：origin 上的旧分支 **`legacy`**（顶端 `b368eea`「clang++ & libstdc++」，非 main 祖先的
+  编译器兼容实验）占住了 `legacy` 这个名字，与 `legacy/dev/*` 构成 git **目录/文件引用冲突**
+  （D/F conflict，远端拒绝推送）→ 按裁定改名为 **`legacy/compiler-compat`** 释放命名空间。
+- 教训：`legacy/<dir>/*` 这类目录式分支命名，前提是 `legacy` 本身不能是分支名；归档前先查
+  `git branch -a` 是否存在平铺同名分支。
+
