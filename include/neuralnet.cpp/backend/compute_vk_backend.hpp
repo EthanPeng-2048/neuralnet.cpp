@@ -46,6 +46,13 @@
 #include "../core_errors.hpp"
 #include "../core_observer_ptr.hpp"
 #include "../core_config.hpp"
+// 本文件直接使用 expr_spec 的符号（run_fused_gpu 签名的 ExprPrecSig、
+// EXPR_PREC_DISPATCH_SUFFIX/EXPR_MAX_INPUTS/EXPR_MAX_CONSTS/
+// EXPR_MATMUL_BLOCK/EXPR_FOLD_ROWS_PER_WG）——**必须显式 include**：
+// include 链 algebra_matrix.hpp → 本文件发生在 expr_spec.hpp 之前，此前
+// 只靠 fused_registry.hpp 传递带入 → 注册表缺失（干净构建 / NN_EXPR_SCAN
+// 收集器 TU）时编译断裂（clang 与 MSVC 同批报错，实测）。
+#include "../expr_spec.hpp"
 #include "compute_memory_pool.hpp"
 #include "compute_staging_ring.hpp"
 
@@ -243,7 +250,14 @@
 
 // AOT 融合 shader 注册表（构建期 scan_exprs 收集 + gen_fused 合成；表达式
 // 只出现在 Layer，本表是折叠后的派生物）。运行时按 expr_spec_key 匹配 dispatch。
-#if __has_include("fused_registry.hpp")
+//
+// ⚠ NN_EXPR_SCAN（扫描/收集期 TU，含 nn_enable_gpu_fusion 的收集器）**不嵌入**：
+//   ① 注册表是收集器自身的**产物**——收集期 include 它会让 depfile 记录
+//     「fused_registry.hpp → collect.exe → .obj → fused_registry.hpp」依赖环，
+//     下次构建 ninja 图加载即失败（实测）；
+//   ② 收集走 CPU 干跑，运行期 dispatch 表与收集无关。
+//   因此不变量：**NN_EXPR_SCAN ⇒ 不含 fused_registry**（应用/样例目标不受影响）。
+#if __has_include("fused_registry.hpp") && !defined(NN_EXPR_SCAN)
 #include "fused_registry.hpp"
 #endif
 

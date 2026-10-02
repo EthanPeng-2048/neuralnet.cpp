@@ -1419,6 +1419,12 @@ public:
         std::size_t rows, std::size_t cols,
         Precision P = Precision::F32) override
     {
+        // 无注册表模式（NN_EXPR_SCAN 收集器 TU / 注册表缺失）：融合分支整体
+        // 不编译 → rows/cols 仅在 NN_FUSED_REGISTRY_EMBEDDED 内被使用 →
+        // 显式消 unused-parameter（clang -Werror）。
+#ifndef NN_FUSED_REGISTRY_EMBEDDED
+        (void)rows; (void)cols;
+#endif
         // ── fold 段：canonicalize 对 fold 恒等（expr_opt 入口
         //    early-return），scan/runtime 两端 key 同源 → 直接用 raw_spec 查表。
         //    PC/分派形态由 run_fused_gpu 的 fold_k 参数走（见其形态校验）。
@@ -1465,12 +1471,18 @@ public:
         const ExprSpec spec = nn::canonicalize_expr_spec(raw_spec);
         // ── AOT 匹配：按规范结构 key 查预编译融合 shader ──────────────
         const std::string key = nn::expr_spec_key(spec);
+        // psig **无条件计算**（不随 NN_FUSED_REGISTRY_EMBEDDED 走）：`#endif`
+        // 之后的「变体未预生成」判定（`psig != 0`）在有/无注册表两种模式下都要
+        // 能编译 —— 无注册表 = NN_EXPR_SCAN 收集器 TU（注册表是它自己的产物，
+        // 见 compute_vk_backend.hpp 的 NN_EXPR_SCAN 不变量）或注册表缺失的干净
+        // 构建。无注册表模式下 supports_expr_precision_variant 恒 false → NVI
+        // 入口已把输入抬到 f32 → psig 必为 0 → 正确落到下方闭合世界错误。
+        const nn::ExprPrecSig psig = nn::expr_prec_sig_of(inputs, P);
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
         // 变体优先（native16 `#a` → 运行期精度分派 `#x`）：按**真实输入精度**
         // + 目标输出精度取变体（find_prec_variant_）。命中即 shader 直接半精度
         // 读/写，无需边界 cast；未命中则退回全 f32 key —— 此时输入必须已全 f32
         // （由基类 NVI 入口 cast）。
-        const nn::ExprPrecSig psig = nn::expr_prec_sig_of(inputs, P);
         const nn::fused::FusedShader* fs =
             find_prec_variant_(key, psig, spec, /*log_hit=*/true);
         if (fs && backend_.has_fused_shader(fs->key))
@@ -1565,6 +1577,11 @@ public:
         std::size_t rows, std::size_t cols,
         Precision P = Precision::F32) override
     {
+        // 无注册表模式：融合分支不编译 → rows/cols 仅在
+        // NN_FUSED_REGISTRY_EMBEDDED 内被使用 → 消 unused-parameter。
+#ifndef NN_FUSED_REGISTRY_EMBEDDED
+        (void)rows; (void)cols;
+#endif
         // fold 形态只经 eval_expr（PC 需 fold_k，本入口不传）——显式拒绝，
         //   否则落到 run_fused_gpu 的通用缺参错误，误导排查方向
         if (raw_spec.fold)
