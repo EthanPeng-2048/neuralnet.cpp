@@ -32,7 +32,6 @@
 | [显存优化](docs/development/04-memory-optimization.md) | 激活重计算、内存池归还 |
 | [多精度计算](docs/development/05-mixed-precision.md) | f16/混合精度设计：Precision 类型系统、PrecisionProfile |
 | [线性注意力](docs/development/06-rapt-algorithm.md) | RLA → RAPT → RLA-2 演进 + GPU 扫描原语落地 |
-| [ZiPT 记忆压缩](docs/development/07-zipt-algorithm.md) | AttnZip / ZiPT 解码器算法 |
 | [踩坑警示录](docs/development/08-pitfalls-and-lessons.md) | **改代码前读**，历史 bug 分级与根因模式 |
 | [开发规范](docs/development/10-development-standards.md) | C++ 编码规范、模块隔离、内存管理 |
 | [计算引擎盘点](docs/development/12-compute-engine-inventory.md) | 引擎接口全景、表达式求值机制、遗留物清单 |
@@ -60,7 +59,6 @@ neuralnet.cpp/
 │   │   ├── 04-memory-optimization.md     ← 显存优化
 │   │   ├── 05-mixed-precision.md         ← 多精度计算
 │   │   ├── 06-rapt-algorithm.md          ← RLA / RAPT / RLA-2 算法
-│   │   ├── 07-zipt-algorithm.md          ← AttnZip / ZiPT 算法
 │   │   ├── 08-pitfalls-and-lessons.md    ← 踩坑警示录
 │   │   ├── 10-development-standards.md   ← 开发规范
 │   │   └── 12-compute-engine-inventory.md ← 引擎接口盘点
@@ -78,7 +76,7 @@ neuralnet.cpp/
 │   ├── compute_cpu_engine.hpp   ← CPU 引擎
 │   ├── compute_gpu_engine.hpp   ← GPU 引擎 (Vulkan)
 │   ├── compute_layer.hpp        ← Layer 聚合头
-│   ├── compute_layer_{base,mlp,conv,softmax,attention,feedforward,transformer,gpt,zipt,rapt}.hpp ← 各层域
+│   ├── compute_layer_{base,mlp,conv,softmax,attention,feedforward,transformer,gpt,rapt}.hpp ← 各层域
 │   ├── compute_loss.hpp         ← 损失函数
 │   ├── compute_optimizer.hpp    ← 优化器 (SGD/Adam/AdamW/Muon)
 │   ├── model_container.hpp      ← Model 容器

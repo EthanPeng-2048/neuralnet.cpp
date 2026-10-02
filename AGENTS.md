@@ -241,7 +241,7 @@ optimizer.step();
 | 文档 | 何时读 |
 |------|--------|
 | `history.md` | **全仓唯一的历史状态归档**：演进记录 / 已修复勘误 / 被否决方案 / 性能 A/B 过程。代码注释与其他文档只记录当前状态；查"为什么当初这么改、旧数字是多少"只来这里 |
-| `release-notes/v*.md` | 面向使用者的版本变更说明（破坏性 API 变更 + 迁移指南 + 验收基线）。当前为 `release-notes/v1.5.0.md`（v1.4.6 → 底层统一 M1–M6 + 位置编码重构 + 分词器优化） |
+| `release-notes/v*.md` | 面向使用者的版本变更说明（破坏性 API 变更 + 迁移指南 + 验收基线）。当前为 `release-notes/v1.6.0.md`（v1.5.1 → **AOT 融合二期收官**：key 只描述结构 / 锚点自登记 / 运行期精度分派 V1 / 单步 `scan_exprs` / `nn_enable_gpu_fusion`，ctest 19 → 21；上一版 v1.5.0.md = v1.4.6 → 底层统一 M1–M6） |
 
 ### 介绍类（docs/introduction/）
 

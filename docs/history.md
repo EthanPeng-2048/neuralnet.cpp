@@ -26,7 +26,7 @@
 - [docs/development 02 · 03 · 05](#docs/development 02 · 03 · 05)（19 条）
 - [docs/development 01 · 04 · 06 · 07 · 10 · 14](#docs/development 01 · 04 · 06 · 07 · 10 · 14)（25 条）
 - [docs/introduction · usage · benchmarks](#docs/introduction · usage · benchmarks)（46 条）
-- [构建系统 / CI（CMakeLists.txt、.github/workflows）](#构建系统 / CI（CMakeLists.txt、.github/workflows）)（1 条）
+- [构建系统 / CI（CMakeLists.txt、.github/workflows）](#构建系统 / CI（CMakeLists.txt、.github/workflows）)（2 条）
 - [AGENTS.md](#AGENTS.md)（24 条）
 - [ZiPT（AttnZip）移除](#ZiPT（AttnZip）移除（2026-10-01）)（1 条）
 - [GUI / CLI 参数一致性清理](#GUI / CLI 参数一致性清理（2026-10-01）)（1 条）
@@ -1736,6 +1736,17 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 ---
 
 # 构建系统 / CI（CMakeLists.txt、.github/workflows）
+
+## 干净构建三缺陷：注册表常驻掩盖了编译失败与依赖环（2026-10-02，`f093261`）
+
+- 类型：bug 根因 / 教训
+- 内容：v1.6.0 发布前首次把仓库放进**注册表缺失的干净构建目录**编译，立即暴露三缺陷：
+  ① `compute_vk_backend.hpp` 直接使用 `expr_spec.hpp` 的 6 个符号却只靠生成的 `fused_registry.hpp` 传递带入——注册表缺失时 **clang 与 MSVC 在完全相同的符号列表上报错**（`ExprPrecSig`/`EXPR_PREC_DISPATCH_SUFFIX`/`EXPR_MAX_INPUTS`/`EXPR_MAX_CONSTS`/`EXPR_MATMUL_BLOCK`/`EXPR_FOLD_ROWS_PER_WG`），显式 include 修复；
+  ② `nn_enable_gpu_fusion` 收集器继承了目标 `INCLUDE_DIRECTORIES`（含其自身产物目录）→ 注册表存在时 depfile 记录 `fused_registry.hpp → collect.exe → .obj → 该头` = **ninja 依赖环**、图加载失败 → 立不变量 `NN_EXPR_SCAN ⇒ 不嵌入 fused_registry`（收集器是生成者、绝不消费自己的产物）；
+  ③ `compute_gpu_engine.hpp` 的 `psig` 声明在 `#ifdef NN_FUSED_REGISTRY_EMBEDDED` 内、使用在无 ifdef 处 + 连带 unused-parameter `-Werror` → 改无条件计算（无注册表时 NVI 抬 f32 → 恒 0 → 正确落闭合世界错误）。
+- 为什么此前没暴露：开发机 `build/generated/fused_registry.hpp` 长期常驻，M1–M6 与融合分支的全部验收都在**脏构建目录**上进行；app 目标靠 `add_dependencies(compile_gpu_shaders)` 兜底，只有收集器两头都不占。
+- 教训：**验收口径必须含一次干净构建**；两个编译器报出完全相同的符号列表 = 根因在源码、不在编译器（本轮 MSVC 首跑即被误判为“MSVC 特有问题”的反例）。
+- 验收（v1.6.0）：clang 203/203 零告警 + ctest 21/21；MSVC 0 error + ctest 21/21；ASan+UBSan ctest 21/21；二次增量构建无依赖环、收集器 depfile 干净；结构数 84/86 与样例值全部不变。
 
 ## 编译器与标准库一律默认（2026-09-27，原位置 .github/workflows/cmake-single-platform.yml 原 2/53-60/71-73/182-215/281 行、AGENTS.md:22、src/expr_dsl_test.cpp:13、src/expr_opt_test.cpp:13）
 

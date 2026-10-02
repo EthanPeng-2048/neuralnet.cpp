@@ -812,11 +812,14 @@ TEST_CASE("linear_gradcheck") {
 2. 使用 `gpu_test` 运行测试
 3. 检查 `VK_ERROR_DEVICE_LOST` 错误
 4. 使用 RenderDoc 捕获 frame
+5. 环境诊断开关：`NN_PREC_TRACE=1`（融合精度分派 `#a`/`#x` 命中与 miss 逐条打日志）、
+   `NN_BIND_DEBUG=1`（Tensor 跨引擎绑定检查，抓未绑定/串引擎）、`NN_MEM_STATS=1`（内存池账本）、
+   `NN_VULKAN_DEVICE`（多 GPU 选择，CLI 另有 `--gpu`）
 
 ### Q3: 如何添加新的激活函数？
 
 **A**:
-1. 在 Layer 中用表达式 DSL 组合表达（绝大多数激活 = 一条表达式，参照 `ReLU::forward`：`dsl::max(dsl::leaf(x), Scalar{0})`）
+1. 在 Layer 中用表达式 DSL 组合表达（绝大多数激活 = 一条表达式，参照 `ReLU::forward`：`dsl::max(dsl::leaf(input), Scalar{0})`）
 2. 在 Layer 中实现 forward/backward（backward 同样是 DSL 表达式）
 3. 添加 gradcheck 测试
 4. 引擎与 shader 不认识"激活函数"——**绝不**在引擎侧加算法名算子（铁律 3）
@@ -824,11 +827,30 @@ TEST_CASE("linear_gradcheck") {
 ### Q4: 如何优化矩阵乘法？
 
 **A**:
-1. 使用 `matmul_tiled` shader（分块优化）
-2. 调整 `BLOCK_SIZE`（缓存分块大小）
-3. 使用 `batched_matmul`（批量运算）
-4. 启用 `自适应并行`（自适应并行）
+1. **shader 无需手动选择**：引擎按形状自动分派（f16 存储版 > 小 N GEMV（N≤8）> 粗化分块
+   `matmul_tiled` > naive），见 `backend/compute_vk_backend.hpp` 的 matmul pipeline 选择
+2. 调整 `BLOCK_SIZE`（`core_config.hpp`，CPU 缓存分块大小）
+3. 批量运算使用 `batched_matmul`（不走逐次 matmul）
+4. **CPU 自适应并行是自动的、无开关**：工作量 ≥ `PARALLEL_THRESHOLD`（524288）即并行，
+   由 `nn::parallel_for_blocks` / `nn::parallel_for_samples` 门控（阈值 `core_config.hpp`）；本机运行保持 `NN_ENABLE_NATIVE=ON`
+   （`-march=native`）
+5. GPU 显存带宽吃紧时用 `--f16`（f16 存储 + in-kernel f16 GEMM 变体，实测峰值显存低于 f32，
+   见 `docs/development/05-mixed-precision.md` §12.11）
 
 ### Q5: 为什么 `begin_batch/end_batch` 在 CPU 上是 no-op？
 
 **A**: CPU 操作是同步的，立即执行。GPU 操作是异步的，需要录制 command buffer 后统一提交。
+
+### Q6: GPU 报「未找到该内联表达式的 AOT 融合 shader（闭合世界）」怎么办？
+
+**A**: 这是**设计内**的硬报错（铁律 #7：AOT 闭合世界，构建期生成、运行期按 `expr_spec_key`
+精确匹配，未命中不静默回退），不是崩溃。按 key 依次排查：
+
+1. **改了 Layer 里的内联表达式但没重新构建**：直接重跑构建即可——`scan_exprs` 单步
+   （收集 + 生成）会自动重建 `fused_registry.hpp`
+2. **该 Layer 路径没被扫描覆盖**：结构来自锚点自登记 + per-layer dry-run + 模型 pass 三路；
+   报错带 `key=`，可查 `build/generated/fused_registry.hpp` 是否有该条目
+3. **库外自定义层**：必须用 `nn_enable_gpu_fusion(<target> MAIN <src>)` 生成该目标专属注册表，
+   且 `${NNF_OUT_DIR}` 的 include 顺序要在库自身注册表之前（见 AGENTS §7）
+4. **注意区分**：`[prec][miss]` 是精度变体的诊断日志、不是错误——精度三档
+   `key#a` → `key#x` → 基类边界 cast，最后一档正确但更慢；只有 f32 结构 key 缺失才硬报错
