@@ -12,7 +12,7 @@
 - [表达式 DSL / 融合 IR（expr_*.hpp）](#表达式 DSL / 融合 IR（expr_*.hpp）)（15 条）
 - [GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）](#GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）)（17 条）
 - [注意力 / ZiPT / Transformer / FeedForward 层](#注意力 / ZiPT / Transformer / FeedForward 层)（16 条）
-- [RAPT / CNN / MLP / Softmax / GPT 层](#RAPT / CNN / MLP / Softmax / GPT 层)（12 条）
+- [RAPT / CNN / MLP / Softmax / GPT 层](#RAPT / CNN / MLP / Softmax / GPT 层)（13 条）
 - [引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器](#引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器)（19 条）
 - [代数层 / 基础设施 / 模型容器与序列化](#代数层 / 基础设施 / 模型容器与序列化)（12 条）
 - [领域模型工厂与 CLI 公共头](#领域模型工厂与 CLI 公共头)（3 条）
@@ -26,7 +26,7 @@
 - [docs/development 02 · 03 · 05](#docs/development 02 · 03 · 05)（19 条）
 - [docs/development 01 · 04 · 06 · 07 · 10 · 14](#docs/development 01 · 04 · 06 · 07 · 10 · 14)（25 条）
 - [docs/introduction · usage · benchmarks](#docs/introduction · usage · benchmarks)（46 条）
-- [构建系统 / CI（CMakeLists.txt、.github/workflows）](#构建系统 / CI（CMakeLists.txt、.github/workflows）)（2 条）
+- [构建系统 / CI（CMakeLists.txt、.github/workflows）](#构建系统 / CI（CMakeLists.txt、.github/workflows）)（3 条）
 - [AGENTS.md](#AGENTS.md)（24 条）
 - [ZiPT（AttnZip）移除](#ZiPT（AttnZip）移除（2026-10-01）)（1 条）
 - [GUI / CLI 参数一致性清理](#GUI / CLI 参数一致性清理（2026-10-01）)（1 条）
@@ -487,7 +487,50 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 - 类型：迁移叙事 / 性能 A/B
 - 内容：2026-09-26~27 计算原语迁 DSL 后注释里残留的演进标注——「归约步迁 dsl::compute_reduce（原 engine.row_reduce_sum）」「纯 matmul 迁 DSL 直写（原 engine.matmul）」「（迁 DSL grouped_reduce_sum 视图，同 forward）」「原地累加迁 dsl::compute_into」「迁 dsl::matmul(batch)：…」「（GPU 上 2 → 1）/（3 → 1 次 dispatch）/（原 zero + broadcast_row_inplace + elementwise Add 三次 dispatch → 1 次）」「取代 matmul + accumulate 两次 dispatch」；rapt 另有「（原为 term/diff/gx 三个独立 kernel + 一个逐元素原语）」「原"乘 x² → 列归约 → 乘 1/dk → 加 eps → rsqrt"五步压成两步 DSL」「不再吞错后让…」（ensure_ones_ 的错误传播）「同一个 AOT 键…（此前的 eager elementwise_binary 已退役）」。删除后保留的当前陈述：单次 dispatch / 不物化中间张量的融合事实、该表达式与哪个 dry-run 同 `expr_spec_key`（闭合世界注册来源）、分两步执行的原因（归约融合 shader 不支持归约后逐元素后处理，GPU 侧显式拒绝）、错误传播避免根因被 "ensure_gpu: invalid tensor" 掩盖。
 
+## BatchNorm 落地（2026-10-03，roadmap P0-3「BatchNorm 禁止静默回落」）
+- 类型：演进记录（特性落地 + 兼容性变化）
+- 背景：`NormType::BatchNorm` 枚举 / `mnist_train --norm batchnorm` / `gui.py` NORM_OPTIONS / README 声明早已存在，但 `make_norm_layer`（`compute_layer_mlp.hpp:782`）一直**静默回落到 LayerNorm**（roadmap C3 / P0-3）。P0-3 裁定「显式报错 或 真实现，二选一」，本轮选**真实现**。
+- 实施：
+  - `compute_layer_mlp.hpp` 新增 `BatchNorm` 层：训练态用 batch 统计（`row_reduce_sum` 沿 batch，与 LayerNorm 沿特征互为方向翻转）+ EMA 更新 `running_mean/running_var`；推理态用 running 统计（batch=1 安全）；γ/β 为参数，running 统计经 `extra_state()` 序列化（不进 `parameters()`，优化器不碰）；`set_training` 双态（**默认训练态**）、`forward_recompute` 抑制 EMA 重复更新（否则检查点场景双倍计数）；推理态 backward = `grad_x = gy·γ·inv_std`（无均值修正项，γ/β 归约项与训练态同形）。`make_norm_layer` 增加真分支。
+  - **口径裁定**：running_var 的 EMA 用**有偏**方差（1/B，与归一口径一致；PyTorch 用无偏）——B=1 无除零、结果确定（铁律 #8）；`momentum=0.1` = 新 batch 权重（PyTorch 同口径）。
+  - `tools/scan_exprs.cpp` 模型 pass：每个模型先训练态 fwd+bwd、**再推理态 fwd+bwd**——推理态是不同表达式结构（无归约链），只跑训练态则 GPU 推理闭合世界硬报错；对无双态层 `set_training` 是 no-op，多跑一轮只重复登记已知结构。
+  - 测试：新增 `src/batchnorm_test.cpp`（工厂不回落断言 / 双态 forward vs 宿主参考 / running EMA 多批对拍 + 推理态不更新 / 训练态 gradcheck（γ/β/输入）/ 推理态 backward vs 宿主 / Model::set_training 转发 + extra_state + save-load 逐位往返），CMake 注册 `batchnorm_test` 与 `batchnorm_test_gpu`（77=skip 约定）→ **ctest 21 → 23**。
+- 兼容性变化（**需随下个版本写入 release-notes**）：旧的 `norm_type=BatchNorm` 规格模型文件是当年按 LayerNorm 实际保存的（params 之后**没有** extra 张量），新代码加载时会在 extra 状态解析处报错（非静默错值）——这类文件规格与内容本就不符，预期失败；重新训练即可。
+- 验收：build 零告警；ctest 23 用例中本机 21 过 + `gpt_offload_test`/`rapt_offload_test` 失败 = **docs/development/16 登记的 Mali 已知非确定基线**（`NN_VULKAN_DEVICE=1` Lavapipe 下两用例全过，与本改动无关）；scan 结构 **84 → 91**（库内口径：模型 pass 25 → 32、锚点 59 → 66，锚点独有仍 13、dry-run 独有仍 25；样例收集器 = 91 + 样例自定义 2 = 93）；端到端冒烟：`mnist_train --norm batchnorm` CPU 1 epoch test_acc 92.76%、`--resume` 往返续训正常、`--gpu` 训练+评估正常；`batchnorm_test --gpu` 全过（= 推理态/EMA 融合结构在 Mali 上闭合世界命中）。
+
 ---
+
+## CNN / ViT 接入归一化（NormPlace，2026-10-03）
+- 类型：演进记录（特性落地 + 兼容性口径）
+- 背景：`mnist_train --norm` 与 GUI「归一化层」此前**只对 `--arch mlp` 生效**——`--arch transformer`（ViT）/ `--arch cnn` 两条路径既不读 `cfg.norm_type`，CNN 更是完全没有归一化层；ViT 的 pre-norm 类型在 `TransformerEncoderLayer` 里硬编码为 `LayerNorm norm1_/norm2_`。
+- 实施：
+  - 新增 `NormPlace{None,Conv,Head,Both,Final}`（`model_spec.hpp`）+ `ModelSpec::norm_place`，把「类型」（`--norm`）与「挂载位置」（`--norm-place`）拆成两个正交维度。CNN：`Conv` = 每个卷积(+池化)之后按 (C*H*W, batch) 每样本归一化、`Head` = 全连接头 `Linear→Norm→ReLU`（与 MLP 同款，末层 logits 不挂）、`Both`；ViT：`Final` = 编码器末端、全局平均池化之前的 ln_f（原版 ViT 的 final norm）。
+  - `TransformerEncoderLayer` 的两个 pre-norm 槽位由 `LayerNorm` 成员改为 `make_norm_layer(d_model, norm_type)`（`unique_ptr<Layer>`，**参数顺序不变**：self_attn → norm1 → ff → norm2）；`TransformerEncoder` 接收 `norm_type` + `final_norm`；并在 `TransformerEncoder` 与 `TransformerEncoderLayer` 两级补 `set_training` 下传（BatchNorm 进 pre-norm/final 槽位后才能拿到训练/推理开关；GPT/RAPT 复合层仍不转发，口径见 `compute_layer_mlp.hpp` 注释）。
+  - 序列化：`spec_to_kv`/`spec_from_kv` 新增 `norm_place` 键。**旧文件没有该键 → 读回 `NormPlace::None` = 不加额外归一化 → 参数布局与旧实现逐位一致**，旧 checkpoint 仍可加载；版本默认值表补了说明行（无需回落动作）。`spec_matches` 把 `norm_type`/`norm_place` 纳入 MLP/Transformer/CNN 的关键维度（原 MLP 只比 `layer_dims`，norm 错配会被推迟成矩阵形状错位）。
+  - CLI/GUI：`--norm` 从「MLP 专用」提升为全架构通用；新增 `--norm-place auto|none|conv|head|both|final`，两者都支持 `auto`（= 未指定，按架构取默认）；非法组合 fail-fast，如 `--arch cnn --norm-place final` / `--arch mlp --norm-place conv` 均 exit 1；`gui.py` 的归一化行移出 MLP 专属组、新增「归一化位置」行（仅 transformer/cnn 显示，默认均选 `auto`），`cli_controllers.py` 与 `bench/gui_cli_audit.py` 的 CASES 同步。
+  - `scan_exprs` 模型 pass 补 6 例归一化变体（ViT final-ln / final-rms / pre-norm-bn，CNN both-ln / conv-rms / head-bn）——归一化类型与挂载位置都是「运行期配置决定的结构」，与 GPT 的 pe/act/norm 维同性质。
+- **各架构默认（初版按“零字节变化”定为 None，随后裁定改为按架构取最合适）**：CNN = `BatchNorm@conv`、ViT = `LayerNorm@final`、MLP = `LayerNorm`（结构内置 Linear→Norm→激活）；CLI/GUI 用 `auto` 表达“按架构默认”。**4 epoch / 1024 样本 / `--shuffle-steps false` 同 seed A/B（本机 CPU）**：
+
+  | 架构 | 配置 | epoch4 loss / test_acc |
+  |---|---|---|
+  | CNN | 无 norm（旧默认） | 0.3337 / 86.71% |
+  | CNN | **batchnorm@conv（新默认）** | **0.1535 / 89.48%** |
+  | CNN | batchnorm@head | 0.2530 / 89.81% |
+  | CNN | batchnorm@both | 0.2260 / 89.39% |
+  | CNN | layernorm@conv | 0.1851 / 89.20% |
+  | CNN | layernorm@both | 0.2361 / 89.05% |
+  | CNN | rmsnorm@conv | 0.2012 / 89.12% |
+  | ViT | layernorm@none（旧默认） | 0.7580 / 69.00% |
+  | ViT | **layernorm@final（新默认）** | 0.7342 / **77.50%** |
+  | ViT | batchnorm@final | 0.5230 / 72.50% |
+  | ViT | batchnorm@none | 0.5011 / 75.50% |
+
+  取舍：CNN 上 BatchNorm 全面占优，`conv` 与 `head`/`both` 差距在噪声内（−0.3pp/+0.1pp）而 loss 最低 → 取最经典的 Conv→BN；ViT 加 final norm +8.5pp，而 BatchNorm 类型掉点（72.50% < 77.50%）→ 类型保持 LayerNorm。
+- **旧文件兼容（与“默认值”正交）**：`spec_from_kv` 缺 `norm_place`/`norm_type` 键时保持 `ModelSpec` 默认（`None`/`LayerNorm`）——**缺键不回落架构默认**，旧 checkpoint 参数布局逐位一致、仍可加载；新文件写全两键，`--resume`/`mnist_infer` 按文件值重建（`model_spec_validation_test` 7.0 有断言锁）。
+- **锚点与验收（实测）**：默认变更令 `gpu_stability_probe --init-hash` 的 **cnn / mnist_transformer / gpt / rapt 四个 hash 变化**（mlp 首建不变）——后两者是**连带位移**：探针在同一引擎上按序建 5 个模型、`InitSpec` seed 按创建序号混流，CNN/ViT 新增的归一化参数把后续模型的序号整体推移（与「ZiPT 移除令 rapt 锚变化」同机理）。本机新锚（跨进程逐次一致）：mnist_mlp `0148e453908158dc` / cnn `1aa083597005faa0` / mnist_transformer `0e928b0fc18fe184` / gpt `7ac3e9d97f9d903a` / rapt `6f58e076e290e24c`（锚点机器/stdlib 相关，变更前的历史锚见本文件 M2 条）。`build/generated/fused_registry.hpp` sha256 **不变**（`7eaff502…d7589`，结构数 91——新默认涉及的结构全部已在 dry-run 覆盖内）；ctest 除 `gpt_offload_test`/`rapt_offload_test` 外全绿，**这两项在本改动之前的基线上同样失败**（把本分支 10 个源文件回退到 HEAD 另建构建复现，逐次波动 3~63 条 FAIL，属另案的非确定问题）；`python bench/gui_cli_audit.py` 三节 PASS（本机需把 `.exe` 后缀换成无后缀可执行名）。
+- 测试：`model_spec_validation_test` 第 7 节 = 7.0 缺键兼容 / **7.0b 默认值回归锁（`make_cnn_spec` 默认 = BatchNorm@Conv、`make_mnist_transformer_spec` 默认 = LayerNorm@Final）** / 7.1 CNN both 往返 + 错配拦截 / 7.2 ViT final forward+backward（batch=2）+ 往返；`cnn_smoke_test` 第 2 段锁「默认 = BatchNorm@conv 且归一化层数 = 卷积阶段数」、第 2b 段 RMSNorm@Both 层数与 fwd/bwd。ctest 计数不变（23）。
+- 端到端实测：不传 norm 参数时 `--arch cnn` → `BatchNorm @ conv`、`--arch transformer` → `LayerNorm @ final`、`--arch mlp` → `LayerNorm`；CNN/ViT 默认配置 `--gpu` 训练通过（GPU 闭合世界无 miss）；`--resume` 从文件读回 `norm_place` 后按原架构重建并加载成功；`mnist_infer` 对 CNN/ViT/BatchNorm 三个 norm 模型推理正常；`--norm-place conv`（MLP）与 `--norm-place final`（CNN）均 exit 1。
+
 
 # 引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器
 
@@ -1748,6 +1791,14 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 - 为什么此前没暴露：开发机 `build/generated/fused_registry.hpp` 长期常驻，M1–M6 与融合分支的全部验收都在**脏构建目录**上进行；app 目标靠 `add_dependencies(compile_gpu_shaders)` 兜底，只有收集器两头都不占。
 - 教训：**验收口径必须含一次干净构建**；两个编译器报出完全相同的符号列表 = 根因在源码、不在编译器（本轮 MSVC 首跑即被误判为“MSVC 特有问题”的反例）。
 - 验收（v1.6.0）：clang 203/203 零告警 + ctest 21/21；MSVC 0 error + ctest 21/21；ASan+UBSan ctest 21/21；二次增量构建无依赖环、收集器 depfile 干净；结构数 84/86 与样例值全部不变。
+
+## 收集器依赖环复发：`#if __has_include(...) && !defined(NN_EXPR_SCAN)` 在 clang 21 下防不住 depfile（2026-10-03）
+
+- 类型：bug 根因（f093261 ② 的守卫形式不充分）
+- 内容：BatchNorm 落地后的增量重建中 ninja 报 `fused_registry.hpp → collect → .obj → fused_registry.hpp` 依赖环、**图加载即失败**（任何构建目标都拒绝执行）。根因：f093261 的守卫把两个条件写在**同一行 `#if`**（`__has_include("fused_registry.hpp") && !defined(NN_EXPR_SCAN)`），而 **clang 21 对 `#if` 条件里的 `__has_include` 无论是否被短路求值、都记进 `-MD` depfile**（实测：原序与反序 `!defined && __has_include` 都记录；收集器 NNF_OUT_DIR 在 include 首位 → 命中自身产物）。修复 = 守卫改**嵌套条件编译**：`#ifndef NN_EXPR_SCAN` 包住 `#if __has_include(...)` + include——被跳过的组不出词法，0 探测记录（实测对照：NN_EXPR_SCAN 下 depfile 0 条 fused_registry、普通 TU 仍 1 条、行为不变）。
+- 触发条件：收集器 TU 在**自身产物注册表已存在**时重编译（改 `tools/scan_exprs.cpp` 或其头链即触发）→ 依赖记录入库 → 下次 ninja 图加载报环；首次干净构建不会触发（当时注册表尚不存在），所以 f093261 当时的“二次增量构建无依赖环”验证漏掉了这一形态。
+- 修复位置：`include/neuralnet.cpp/backend/compute_vk_backend.hpp` 的 fused_registry 嵌入守卫（注释同步记录“为何不能用 && 同行守卫”）。
+- 验收：`ninja -t deps` 中 `fusion_custom_layer_example_nnfusion_collect` 的 TU 不再出现 `nn_fusion/.../fused_registry.hpp`（应用 TU 对注册表的合法持有不变）；全量干净重建 + ctest 23 用例（21 过 + 2 个 Mali 已知非确定 offload 用例，`NN_VULKAN_DEVICE=1` Lavapipe 下全过）。
 
 ## 编译器与标准库一律默认（2026-09-27，原位置 .github/workflows/cmake-single-platform.yml 原 2/53-60/71-73/182-215/281 行、AGENTS.md:22、src/expr_dsl_test.cpp:13、src/expr_opt_test.cpp:13）
 

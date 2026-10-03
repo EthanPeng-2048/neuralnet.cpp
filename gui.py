@@ -57,7 +57,10 @@ GPT_LR_SCHEDULE_OPTIONS = ["fixed", "cosine", "step_cosine"]
 TOKENIZER_OPTIONS = ["bpe", "charbpe"]
 POSITIONAL_ENCODING_OPTIONS = ["learned", "sinusoidal", "alibi", "rope"]
 ACTIVATION_OPTIONS = ["gelu", "swiglu"]
-NORM_OPTIONS = ["layernorm", "rmsnorm", "batchnorm"]
+NORM_OPTIONS = ["auto", "layernorm", "rmsnorm", "batchnorm"]
+# 归一化挂载位置（仅 CNN/ViT 需要；MLP 的挂载位置由结构固定，GUI 隐藏该行）
+# auto = 按架构默认：CNN = conv, ViT = final（与 mnist_train 默认一致）
+NORM_PLACE_OPTIONS = ["auto", "none", "conv", "head", "both", "final"]
 GPT_NORM_OPTIONS = ["layernorm", "rmsnorm"]  # GPT 仅支持 LayerNorm/RMSNorm
 PRECISION_OPTIONS = ["f32", "f16"]  # 混合精度选项
 # 模型架构：zipt(AttnZip) 已于 2026-10-01 移除（恢复前提见 docs/history.md / AGENTS §12）
@@ -792,11 +795,17 @@ class MnistTrainTab(TabBase):
                             self.precision_param, self.precision_compute,
                             self.precision_stable, self.precision_optimizer]
 
+        # --- 归一化（全架构通用，auto = 按架构默认：
+        #     MLP/ViT = layernorm, CNN = batchnorm；位置见下一行）---
+        self.norm = _make_option_row(p, "归一化层", r, NORM_OPTIONS, "auto"); r += 1
+        # 归一化位置（CNN/ViT 专用）：MLP 挂载位置固定 → 随架构隐藏
+        self.norm_place = _make_option_row(p, "归一化位置", r, NORM_PLACE_OPTIONS, "auto"); r += 1
+        self._norm_place_widgets = [self.norm_place]
+
         # --- MLP 专用参数 ---
         self.mlp_sep_label = _make_label(p, "── MLP 参数 ──", r); r += 1
         self.layer_dims = _make_entry_row(p, "layer_dims", r, "784,512,256,128,64,10"); r += 1
-        self.norm = _make_option_row(p, "归一化层", r, NORM_OPTIONS, "layernorm"); r += 1
-        self._mlp_widgets = [self.mlp_sep_label, self.layer_dims, self.norm]
+        self._mlp_widgets = [self.mlp_sep_label, self.layer_dims]
 
         # --- Transformer 专用参数 ---
         self.tf_sep_label = _make_label(p, "── Transformer 参数 ──", r); r += 1
@@ -856,6 +865,9 @@ class MnistTrainTab(TabBase):
         for w in self._cnn_widgets:
             w = getattr(w, "widget", w)
             w.grid() if arch == "cnn" else w.grid_remove()
+        for w in self._norm_place_widgets:
+            w = getattr(w, "widget", w)
+            w.grid() if arch in ("transformer", "cnn") else w.grid_remove()
 
     def _on_lr_schedule_change(self, *args):
         """fixed 调度下隐藏 min_lr / warmup"""
@@ -914,10 +926,12 @@ class MnistTrainTab(TabBase):
             args["precision_optimizer"] = self.precision_optimizer.get()
         # 架构特定参数
         arch = self.arch.get()
+        # 归一化类型：全架构通用（auto = 与 CLI 默认一致，按架构取最合适）
+        args["norm"] = self.norm.get()
         if arch == "mlp":
             if self.layer_dims.get(): args["layer_dims"] = self.layer_dims.get()
-            args["norm"] = self.norm.get()
         elif arch == "transformer":
+            args["norm_place"] = self.norm_place.get()
             if self.d_model.get(): args["d_model"] = int(self.d_model.get())
             if self.num_heads.get(): args["num_heads"] = int(self.num_heads.get())
             if self.num_layers.get(): args["num_layers"] = int(self.num_layers.get())
@@ -925,6 +939,7 @@ class MnistTrainTab(TabBase):
             if self.patch_size.get(): args["patch_size"] = int(self.patch_size.get())
             if self.eval_samples.get(): args["eval_samples"] = int(self.eval_samples.get())
         elif arch == "cnn":
+            args["norm_place"] = self.norm_place.get()
             if self.cnn_channels.get(): args["cnn_channels"] = self.cnn_channels.get()
             if self.cnn_kernels.get(): args["cnn_kernels"] = self.cnn_kernels.get()
             if self.cnn_pool.get(): args["cnn_pool"] = int(self.cnn_pool.get())

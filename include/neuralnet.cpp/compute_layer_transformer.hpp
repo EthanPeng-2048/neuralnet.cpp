@@ -118,26 +118,27 @@ class TransformerEncoderLayer final : public Layer
 {
 private:
     MultiHeadAttention self_attn_;
-    LayerNorm norm1_;
+    std::unique_ptr<Layer> norm1_;   // make_norm_layer(d_model, norm_type)
     FeedForward ff_;
-    LayerNorm norm2_;
+    std::unique_ptr<Layer> norm2_;
 
     Tensor residual2_cache_;
 
 public:
     TransformerEncoderLayer(std::size_t d_model, std::size_t num_heads,
-                            std::size_t d_ff, std::size_t seq_len = 0)
+                            std::size_t d_ff, std::size_t seq_len = 0,
+                            NormType norm_type = NormType::LayerNorm)
         : self_attn_(d_model, num_heads, seq_len),
-          norm1_(d_model),
+          norm1_(make_norm_layer(d_model, norm_type)),
           ff_(d_model, d_ff),
-          norm2_(d_model) {}
+          norm2_(make_norm_layer(d_model, norm_type)) {}
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
         NN_TRY(r1, self_attn_.init(engine));
-        NN_TRY(r2, norm1_.init(engine));
+        NN_TRY(r2, norm1_->init(engine));
         NN_TRY(r3, ff_.init(engine));
-        NN_TRY(r4, norm2_.init(engine));
+        NN_TRY(r4, norm2_->init(engine));
         return {};
     }
 
@@ -146,25 +147,25 @@ public:
     {
         Layer::set_precision_profile(profile);
         self_attn_.set_precision_profile(profile);
-        norm1_.set_precision_profile(profile);
+        norm1_->set_precision_profile(profile);
         ff_.set_precision_profile(profile);
-        norm2_.set_precision_profile(profile);
+        norm2_->set_precision_profile(profile);
     }
 
     std::vector<TensorRef> parameters() override
     {
         return collect_refs(self_attn_.parameters(),
-                            norm1_.parameters(),
+                            norm1_->parameters(),
                             ff_.parameters(),
-                            norm2_.parameters());
+                            norm2_->parameters());
     }
 
     std::vector<TensorRef> param_gradients() override
     {
         return collect_refs(self_attn_.param_gradients(),
-                            norm1_.param_gradients(),
+                            norm1_->param_gradients(),
                             ff_.param_gradients(),
-                            norm2_.param_gradients());
+                            norm2_->param_gradients());
     }
 
     // 梯度检查点：把模式传播给内部注意力/归一化/FFN
@@ -172,9 +173,9 @@ public:
     {
         Layer::set_checkpoint_mode(enabled);
         self_attn_.set_checkpoint_mode(enabled);
-        norm1_.set_checkpoint_mode(enabled);
+        norm1_->set_checkpoint_mode(enabled);
         ff_.set_checkpoint_mode(enabled);
-        norm2_.set_checkpoint_mode(enabled);
+        norm2_->set_checkpoint_mode(enabled);
     }
 
     [[nodiscard]] bool recompute_supported() const override { return true; }
@@ -192,10 +193,21 @@ public:
     void clear_cache() override
     {
         self_attn_.clear_cache();
-        norm1_.clear_cache();
+        norm1_->clear_cache();
         ff_.clear_cache();
-        norm2_.clear_cache();
+        norm2_->clear_cache();
         residual2_cache_ = Tensor{};
+    }
+
+    // 训练/推理双态（Model::set_training → 本层 → 归一化子层）：
+    // norm_type = BatchNorm 时子层必须拿到该开关，否则恒用 batch 统计。
+    void set_training(bool training) override
+    {
+        Layer::set_training(training);
+        self_attn_.set_training(training);
+        norm1_->set_training(training);
+        ff_.set_training(training);
+        norm2_->set_training(training);
     }
 
     [[nodiscard]] Result<Tensor> forward(
@@ -203,12 +215,12 @@ public:
     {
         ComputeEngine& engine = engine_ref();
         // 残差分支 1（Pre-Norm + 自注意力），与 GPTBlock/RAPTBlock 同骨架
-        NN_TRY(r2, prenorm_residual_forward_(engine, input, norm1_, self_attn_, p_.compute));
+        NN_TRY(r2, prenorm_residual_forward_(engine, input, *norm1_, self_attn_, p_.compute));
         Tensor res2 = std::move(*r2);
         if (!checkpoint_mode_)
             residual2_cache_ = res2;
         // 残差分支 2（Pre-Norm + FFN）
-        return prenorm_residual_forward_(engine, res2, norm2_, ff_, p_.compute);
+        return prenorm_residual_forward_(engine, res2, *norm2_, ff_, p_.compute);
     }
 
     [[nodiscard]] Result<Tensor> backward(
@@ -217,7 +229,7 @@ public:
         ComputeEngine& engine = engine_ref();
         // 两处残差分流 + 子层反向（与 GPTBlock / RAPTBlock 同一骨架）
         return prenorm_residual_backward_(engine, grad_output,
-                                          norm1_, self_attn_, norm2_, ff_,
+                                          *norm1_, self_attn_, *norm2_, ff_,
                                           p_.compute);
     }
 };
@@ -248,6 +260,8 @@ private:
     Scalar inv_num_patches_;
     std::vector<TransformerEncoderLayer> layers_;
     PositionalEncoding pos_encoding_;
+    // final norm（NormPlace::Final 时创建）：编码器末端、全局池化之前的 ln_f
+    std::unique_ptr<Layer> ln_f_;
 
     std::size_t batch_size_ = 0;
     Tensor ones_row_;  // (1, num_patches) 全1，用于 backward 池化梯度广播
@@ -255,7 +269,9 @@ private:
 public:
     TransformerEncoder(std::size_t d_model, std::size_t num_heads,
                        std::size_t d_ff, std::size_t num_layers,
-                       std::size_t num_patches)
+                       std::size_t num_patches,
+                       NormType norm_type = NormType::LayerNorm,
+                       bool final_norm = false)
         : d_model_(d_model), num_patches_(num_patches),
           inv_num_patches_(Scalar{1} / static_cast<Scalar>(num_patches)),
           // PE 启用 tiling：每个样本独立使用 (d_model, num_patches) 的编码
@@ -263,7 +279,9 @@ public:
     {
         // 所有 EncoderLayer 传入 seq_len=num_patches，启用 MHA 批量化路径
         for (std::size_t i = 0; i < num_layers; ++i)
-            layers_.emplace_back(d_model, num_heads, d_ff, num_patches);
+            layers_.emplace_back(d_model, num_heads, d_ff, num_patches, norm_type);
+        if (final_norm)
+            ln_f_ = make_norm_layer(d_model, norm_type);
     }
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
@@ -278,6 +296,10 @@ public:
         }
         // 预创建 ones_row_ (1, num_patches) 全1，用于 backward 广播
         // （M2 声明式：引擎填数，原 from_matrix 口径 = F32）
+        if (ln_f_)
+        {
+            NN_TRY(rn, ln_f_->init(engine));
+        }
         ones_row_ = engine.create_tensor(1, num_patches_, Precision::F32, InitSpec::constant(1));
         if (!ones_row_.valid())
             return std::unexpected(Error{"TransformerEncoder: ones_row_ 初始化失败"});
@@ -289,17 +311,46 @@ public:
     {
         Layer::set_precision_profile(profile);
         for (auto& l : layers_) l.set_precision_profile(profile);
+        if (ln_f_) ln_f_->set_precision_profile(profile);
         pos_encoding_.set_precision_profile(profile);
+    }
+
+    // 训练/推理双态：Model::set_training 只打到本层，须继续下传
+    // （pre-norm 槽位与 final norm 都可能是 BatchNorm）。
+    void set_training(bool training) override
+    {
+        Layer::set_training(training);
+        for (auto& l : layers_) l.set_training(training);
+        if (ln_f_) ln_f_->set_training(training);
+    }
+
+    // 缓存释放同 GPTModel/RAPTModel：逐层下传（含 final norm）
+    void clear_cache() override
+    {
+        for (auto& l : layers_) l.clear_cache();
+        if (ln_f_) ln_f_->clear_cache();
     }
 
     std::vector<TensorRef> parameters() override
     {
-        return collect_block_refs_(layers_, &TransformerEncoderLayer::parameters);
+        auto refs = collect_block_refs_(layers_, &TransformerEncoderLayer::parameters);
+        if (ln_f_)
+        {
+            auto n = ln_f_->parameters();
+            refs.insert(refs.end(), n.begin(), n.end());
+        }
+        return refs;
     }
 
     std::vector<TensorRef> param_gradients() override
     {
-        return collect_block_refs_(layers_, &TransformerEncoderLayer::param_gradients);
+        auto refs = collect_block_refs_(layers_, &TransformerEncoderLayer::param_gradients);
+        if (ln_f_)
+        {
+            auto n = ln_f_->param_gradients();
+            refs.insert(refs.end(), n.begin(), n.end());
+        }
+        return refs;
     }
 
     [[nodiscard]] Result<Tensor> forward(
@@ -322,6 +373,13 @@ public:
         {
             NN_TRY(lr, layer.forward(x));
             x = std::move(*lr);
+        }
+
+        // final norm（NormPlace::Final）：在全局池化之前对每个 token 归一化
+        if (ln_f_)
+        {
+            NN_TRY(nf, ln_f_->forward(x));
+            x = std::move(*nf);
         }
         // x: (d_model, batch * num_patches)
 
@@ -371,6 +429,13 @@ public:
         Tensor grad_x = std::move(*grad);
 
         // 2. 反向通过所有 EncoderLayer [全批量化 GPU]
+        // final norm 反向：次序 = forward 的逆（池化反向之后、逐层反向之前）
+        if (ln_f_)
+        {
+            NN_TRY(gb, ln_f_->backward(grad_x));
+            grad_x = std::move(*gb);
+        }
+
         for (auto it = layers_.rbegin(); it != layers_.rend(); ++it)
         {
             NN_TRY(br, it->backward(grad_x));

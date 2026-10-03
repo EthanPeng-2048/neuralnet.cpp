@@ -31,6 +31,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <string>
@@ -74,7 +75,10 @@ void print_usage(const char *prog)
 
     help.section("MLP 专用");
     help.opt("--layer-dims <d1,d2,...>", "各层维度，逗号分隔 (默认: 784,512,256,128,64,10)");
-    help.opt("--norm <type>", "归一化层: layernorm/rmsnorm/batchnorm (默认: layernorm)\nlayernorm: 按特征维归一化\nrmsnorm: 无均值、更轻量\nbatchnorm: 按 batch 维归一化 (仅 MLP)");
+
+    help.section("归一化");
+    help.opt("--norm <type>", "归一化层: auto/layernorm/rmsnorm/batchnorm (默认: auto)\nauto = 按架构取最合适: MLP/ViT = layernorm, CNN = batchnorm\nlayernorm: 按特征维归一化\nrmsnorm: 无均值、更轻量\nbatchnorm: 沿 batch 维归一化");
+    help.opt("--norm-place <where>", "归一化挂载位置: auto/none/conv/head/both/final (默认: auto)\nauto = 按架构: CNN = conv, ViT = final, MLP = 结构内置(不额外加)\nconv: CNN 每个卷积(+池化)之后; head: CNN 全连接头 Linear→Norm→ReLU; both: 两者\nfinal: ViT 编码器末端 final norm (全局平均池化之前)\nMLP 的挂载位置由结构固定，只接受 none/auto");
 
     help.section("Transformer 专用");
     help.opt("--d-model <n>", "模型维度 (默认: 64)");
@@ -124,7 +128,10 @@ struct TrainConfig
 
     // MLP 参数
     std::vector<std::size_t> layer_dims;
-    nn::NormType norm_type = nn::NormType::LayerNorm;  // 归一化层类型
+    // 归一化（两者都可未指定 = auto → build_spec 按架构取默认：
+    //   MLP = layernorm + 结构内置挂载；CNN = batchnorm@conv；ViT = layernorm@final）
+    std::optional<nn::NormType> norm_type;    // --norm（未指定/显式 auto = 架构默认）
+    std::optional<nn::NormPlace> norm_place;  // --norm-place（同上）
 
     // Transformer 参数
     std::size_t d_model = nn::MNIST_TF_D_MODEL;
@@ -224,7 +231,9 @@ TrainConfig parse_args(int argc, char *argv[])
         else if (arg == "--norm" && i + 1 < argc)
         {
             std::string v = argv[++i];
-            if (v == "layernorm")
+            if (v == "auto")
+                cfg.norm_type = std::nullopt;          // 回到按架构默认
+            else if (v == "layernorm")
                 cfg.norm_type = nn::NormType::LayerNorm;
             else if (v == "rmsnorm")
                 cfg.norm_type = nn::NormType::RMSNorm;
@@ -232,7 +241,23 @@ TrainConfig parse_args(int argc, char *argv[])
                 cfg.norm_type = nn::NormType::BatchNorm;
             else
             {
-                std::cerr << "无效 --norm: " << v << "，可选: layernorm, rmsnorm, batchnorm\n";
+                std::cerr << "无效 --norm: " << v << "，可选: auto, layernorm, rmsnorm, batchnorm\n";
+                std::exit(1);
+            }
+        }
+        else if (arg == "--norm-place" && i + 1 < argc)
+        {
+            std::string v = argv[++i];
+            if (v == "auto")        cfg.norm_place = std::nullopt;   // 回到按架构默认
+            else if (v == "none")   cfg.norm_place = nn::NormPlace::None;
+            else if (v == "conv")   cfg.norm_place = nn::NormPlace::Conv;
+            else if (v == "head")   cfg.norm_place = nn::NormPlace::Head;
+            else if (v == "both")   cfg.norm_place = nn::NormPlace::Both;
+            else if (v == "final")  cfg.norm_place = nn::NormPlace::Final;
+            else
+            {
+                std::cerr << "无效 --norm-place: " << v
+                          << "，可选: auto, none, conv, head, both, final\n";
                 std::exit(1);
             }
         }
@@ -434,21 +459,48 @@ nn::ModelSpec build_spec(const TrainConfig &cfg)
 {
     if (cfg.arch == ArchType::Transformer)
     {
+        // auto（未指定）→ ViT 规范形态：LayerNorm@final（块 pre-norm + 末端 ln_f）
+        const nn::NormPlace place = cfg.norm_place.value_or(nn::NormPlace::Final);
+        if (place != nn::NormPlace::None && place != nn::NormPlace::Final)
+        {
+            std::cerr << "--norm-place 的 conv/head/both 仅适用于 --arch cnn；"
+                      << "Transformer 只接受 none/final\n";
+            std::exit(1);
+        }
         return nn::make_mnist_transformer_spec(
             cfg.patch_size,
-            cfg.d_model, cfg.num_heads, cfg.d_ff, cfg.num_layers);
+            cfg.d_model, cfg.num_heads, cfg.d_ff, cfg.num_layers,
+            cfg.norm_type.value_or(nn::NormType::LayerNorm), place);
     }
     if (cfg.arch == ArchType::CNN)
     {
+        // auto（未指定）→ CNN 规范形态：BatchNorm@conv（4 epoch A/B 实测最优）
+        const nn::NormPlace place = cfg.norm_place.value_or(nn::NormPlace::Conv);
+        if (place == nn::NormPlace::Final)
+        {
+            std::cerr << "--norm-place final 仅适用于 --arch transformer；"
+                      << "CNN 接受 none/conv/head/both\n";
+            std::exit(1);
+        }
         nn::CnnConfig c = build_cnn_config(cfg);
+        c.norm_type  = cfg.norm_type.value_or(nn::NormType::BatchNorm);
+        c.norm_place = place;
         std::vector<nn::CnnConvSpec> convs = c.convs;
-        return nn::make_cnn_spec(c.in_channels, c.in_size, c.pool, convs, c.fc_dims);
+        return nn::make_cnn_spec(c.in_channels, c.in_size, c.pool, convs, c.fc_dims,
+                                 c.norm_type, c.norm_place);
     }
-    // MLP
+    if (cfg.norm_place && *cfg.norm_place != nn::NormPlace::None)
+    {
+        std::cerr << "MLP 的归一化挂载位置由结构固定（Linear→Norm→激活），"
+                  << "请去掉 --norm-place（或改为 none/auto）\n";
+        std::exit(1);
+    }
+    // MLP（结构内置 Linear→Norm→激活；auto = layernorm）
     nn::ModelSpec spec;
     spec.type = nn::ModelType::MLP;
     spec.layer_dims = cfg.layer_dims.empty() ? nn::MNIST_LAYER_DIMS : cfg.layer_dims;
-    spec.norm_type = cfg.norm_type;
+    spec.norm_type = cfg.norm_type.value_or(nn::NormType::LayerNorm);
+    spec.norm_place = nn::NormPlace::None;
     return spec;
 }
 
@@ -471,12 +523,15 @@ int main(int argc, char *argv[])
                 std::cout << "从模型文件读取 MLP 规格\n";
                 spec = std::move(*spec_result);
                 cfg.arch = ArchType::MLP;
+                cfg.norm_type = spec.norm_type;
             }
             else if (spec_result->is_transformer())
             {
                 std::cout << "从模型文件读取 Transformer 规格\n";
                 spec = std::move(*spec_result);
                 cfg.arch = ArchType::Transformer;
+                cfg.norm_type = spec.norm_type;
+                cfg.norm_place = spec.norm_place;
                 cfg.patch_size = spec.patch_size != 0 ? spec.patch_size : nn::MNIST_PATCH_SIZE;
                 cfg.d_model = spec.d_model;
                 cfg.num_heads = spec.num_heads;
@@ -488,6 +543,8 @@ int main(int argc, char *argv[])
                 std::cout << "从模型文件读取 CNN 规格\n";
                 spec = std::move(*spec_result);
                 cfg.arch = ArchType::CNN;
+                cfg.norm_type = spec.norm_type;
+                cfg.norm_place = spec.norm_place;
                 cfg.cnn_in_channels = spec.cnn_in_channels;
                 cfg.cnn_in_size     = spec.cnn_in_size;
                 cfg.cnn_pool        = spec.cnn_pool;
@@ -568,8 +625,10 @@ int main(int argc, char *argv[])
 
     std::cout << "  归一化: "
               << ((spec.norm_type == nn::NormType::RMSNorm) ? "RMSNorm" :
-                  (spec.norm_type == nn::NormType::BatchNorm) ? "BatchNorm" : "LayerNorm")
-              << "\n";
+                  (spec.norm_type == nn::NormType::BatchNorm) ? "BatchNorm" : "LayerNorm");
+    if (spec.norm_place != nn::NormPlace::None)
+        std::cout << " @ " << nn::norm_place_name(spec.norm_place);
+    std::cout << "\n";
     std::cout << "  优化器: " << cfg.optimizer_name << "  学习率: " << cfg.lr << "\n";
     std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
     std::cout << "  GPU: " << (cfg.gpu_enabled ? "启用" : "禁用")

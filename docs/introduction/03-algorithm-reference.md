@@ -229,7 +229,7 @@ Forward/Backward 直接委托给子层的 forward/backward。
 
 ### 9. TransformerEncoderLayer — Pre-Norm 编码器层
 
-**参数：** `d_model`, `num_heads`, `d_ff`, `seq_len`
+**参数：** `d_model`, `num_heads`, `d_ff`, `seq_len`, `norm_type`
 
 **算法（Pre-Norm）：**
 
@@ -242,19 +242,20 @@ f   = FFN(x_2)
 out = r_2 + f
 ```
 
-包含子层：`MultiHeadAttention` + `LayerNorm`×2 + `FeedForward`
+包含子层：`MultiHeadAttention` + 归一化×2（`norm_type`：`LayerNorm` 默认 / `RMSNorm` / `BatchNorm`，即 `make_norm_layer(d_model, norm_type)`）+ `FeedForward`
 
 ---
 
 ### 10. TransformerEncoder — ViT 编码器
 
-**参数：** `d_model`, `num_heads`, `d_ff`, `num_layers`, `num_patches`
+**参数：** `d_model`, `num_heads`, `d_ff`, `num_layers`, `num_patches`, `norm_type`（默认 LayerNorm）, `final_norm`（默认 true = `NormPlace::Final`）
 
 **算法：**
 
 1. 添加 tiled 位置编码
 2. 通过 N 个 `TransformerEncoderLayer`
-3. 全局平均池化（按样本聚合 `num_patches` 维度）
+3. （默认启用；`final_norm` 可显式关闭）编码器末端归一化：在池化之前对每个 token 施加（原版 ViT 的 ln_f）
+4. 全局平均池化（按样本聚合 `num_patches` 维度）
 
 **池化：**
 

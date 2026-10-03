@@ -5,8 +5,10 @@
 // 依赖：Model + ComputeEngine + ModelSpec（model_container.hpp / compute_engine.hpp）
 //
 // 结构（LeNet 风格，batch-major 列布局 (C*H*W, batch)）：
-//   Conv2D → [MaxPool2D] × N  → 展平 (C*H*W, batch)
-//   → Linear(H1) → ReLU → ... → Linear(num_classes)
+//   Conv2D → [MaxPool2D] → [Norm] × N  → 展平 (C*H*W, batch)
+//   → Linear(H1) → [Norm] → ReLU → ... → Linear(num_classes)
+// 方括号项可选：由 CnnConfig::norm_place（NormPlace）控制，
+// 默认 BatchNorm@Conv（现代 LeNet 形态；显式置 None = 无 norm 的旧结构）。
 //
 // 布局约定：卷积/池化层输入输出均为 (C*H*W, batch) 列布局（与项目一致），
 //   展平后直接喂给 Linear，无需独立 Flatten 层。
@@ -44,6 +46,14 @@ struct CnnConfig
     // 展平后的全连接头（首元素 = 展平后第一隐藏层宽度，末位 = 类别数）。
     // 例如 {120, 10} → Linear(flatten→120) + ReLU + Linear(120→10)。
     std::vector<std::size_t> fc_dims;
+    // ── 归一化（默认 CNN 规范形态 = BatchNorm@Conv；显式置 None 可关）──────
+    // norm_type 决定归一化层种类，norm_place 决定挂在哪（见 model_spec.hpp
+    // 的 NormPlace 注释）：Conv = 每个卷积（+池化）后按 (C*H*W, batch) 归一化
+    // （BatchNorm 下即“逐特征跨 batch”的经典 Conv→BN 语义）；Head = 全连接头
+    // 隐藏层 Linear→Norm→ReLU（MLP 同款）。默认值由 4 epoch A/B 实测选定。
+    // 旧模型文件缺 norm_place 键 → spec 读回 None → 不加（旧布局逐位一致）。
+    NormType  norm_type  = NormType::BatchNorm;
+    NormPlace norm_place = NormPlace::Conv;
 };
 
 // 默认 MNIST CNN（LeNet-5 风格）：
@@ -72,6 +82,10 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
         return std::unexpected(Error{"CNN: fc_dims must have at least 2 elements"});
     if (cfg.in_channels == 0 || cfg.in_size == 0)
         return std::unexpected(Error{"CNN: in_channels/in_size must be positive"});
+    if (cfg.norm_place != NormPlace::None && cfg.norm_place != NormPlace::Conv &&
+        cfg.norm_place != NormPlace::Head && cfg.norm_place != NormPlace::Both)
+        return std::unexpected(Error{
+            "CNN: norm_place must be none/conv/head/both (final is ViT-only)"});
 
     Model model(engine);
     std::size_t c = cfg.in_channels;
@@ -102,16 +116,32 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
             h = (h - cfg.pool) / cfg.pool + 1;
             w = (w - cfg.pool) / cfg.pool + 1;
         }
+
+        // 归一化（NormPlace::Conv / Both）：池化之后、下一组卷积之前，
+        // 按展平后的特征图 (C*H*W, batch) 每样本归一化（与布局约定一致）。
+        if (cfg.norm_place == NormPlace::Conv || cfg.norm_place == NormPlace::Both)
+        {
+            auto r = model.add_layer(make_norm_layer(c * h * w, cfg.norm_type));
+            if (!r) return std::unexpected(r.error());
+        }
     }
 
     const std::size_t flattened = c * h * w;
     if (flattened == 0)
         return std::unexpected(Error{"CNN: flattened size is zero"});
 
-    // 全连接头：Linear(flatten → fc_dims[0]) → ReLU → ... → Linear(→ num_classes)
+    // 全连接头：Linear(flatten → fc_dims[0]) → [Norm] → ReLU → ...
+    // → Linear(→ num_classes)；Norm 只挂隐藏层，最后一层保持原始 logits。
+    const bool norm_head = (cfg.norm_place == NormPlace::Head ||
+                            cfg.norm_place == NormPlace::Both);
     {
         auto r = model.add<Linear>(flattened, cfg.fc_dims[0]);
         if (!r) return std::unexpected(r.error());
+        if (norm_head)
+        {
+            auto rn = model.add_layer(make_norm_layer(cfg.fc_dims[0], cfg.norm_type));
+            if (!rn) return std::unexpected(rn.error());
+        }
     }
     for (std::size_t i = 1; i < cfg.fc_dims.size(); ++i)
     {
@@ -122,6 +152,12 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
         {
             auto r = model.add<Linear>(cfg.fc_dims[i - 1], cfg.fc_dims[i]);
             if (!r) return std::unexpected(r.error());
+        }
+        // 隐藏层后再挂一份 Norm（最后一层 fc_dims.size()-1 不挂）
+        if (norm_head && i + 1 < cfg.fc_dims.size())
+        {
+            auto rn = model.add_layer(make_norm_layer(cfg.fc_dims[i], cfg.norm_type));
+            if (!rn) return std::unexpected(rn.error());
         }
     }
     return model;
@@ -134,10 +170,14 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
     std::size_t in_size,
     std::size_t pool,
     const std::vector<CnnConvSpec>& convs,
-    const std::vector<std::size_t>& fc_dims)
+    const std::vector<std::size_t>& fc_dims,
+    NormType norm_type = NormType::BatchNorm,
+    NormPlace norm_place = NormPlace::Conv)
 {
     ModelSpec spec;
     spec.type            = ModelType::CNN;
+    spec.norm_type       = norm_type;
+    spec.norm_place      = norm_place;
     spec.cnn_in_channels = in_channels;
     spec.cnn_in_size     = in_size;
     spec.cnn_pool        = pool;
@@ -173,6 +213,12 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
     cfg.in_size     = spec.cnn_in_size;
     cfg.pool        = spec.cnn_pool;
     cfg.fc_dims     = spec.layer_dims;
+    cfg.norm_type   = spec.norm_type;
+    cfg.norm_place  = spec.norm_place;
+    if (cfg.norm_place != NormPlace::None && cfg.norm_place != NormPlace::Conv &&
+        cfg.norm_place != NormPlace::Head && cfg.norm_place != NormPlace::Both)
+        return std::unexpected(Error{
+            "CNN spec: norm_place must be none/conv/head/both (final is ViT-only)"});
     for (std::size_t i = 0; i < spec.cnn_channels.size(); ++i)
     {
         cfg.convs.push_back(CnnConvSpec{

@@ -66,12 +66,14 @@ CASES.append(("mnist_train", MnistTrainController(), dict(
     epochs=10, lr=0.001, batch_size=64, optimizer="adam", weight_decay=0.01,
     gpu=True, max_samples=0, shuffle_steps="true", lr_schedule="cosine",
     min_lr=1e-6, warmup_epochs=1, lr_per_epoch="0.01,0.001",
+    norm="layernorm", norm_place="final",
     d_model=64, num_heads=4, num_layers=2, d_ff=128, patch_size=7,
     eval_samples=200, **BASE_PREC)))
 CASES.append(("mnist_train", MnistTrainController(), dict(
     arch="mlp", layer_dims="784,512,10", norm="layernorm", shuffle_steps="false")))
 CASES.append(("mnist_train", MnistTrainController(), dict(
-    arch="cnn", cnn_channels="6,16", cnn_kernels="5,5", cnn_pool=2, cnn_fc="120,10")))
+    arch="cnn", cnn_channels="6,16", cnn_kernels="5,5", cnn_pool=2, cnn_fc="120,10",
+    norm="rmsnorm", norm_place="both")))
 CASES.append(("mnist_train", MnistTrainController(), dict(arch="mlp", f16=True)))
 
 CASES.append(("mnist_infer", MnistInferController(), dict(

@@ -259,6 +259,11 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(layer_gradcheck_test src/layer_gradcheck_test.cpp)
     list(APPEND NN_TEST_TARGETS layer_gradcheck_test)
 
+    # ── BatchNorm（工厂不回落 + 训练/推理双态 fwd/bwd + running EMA
+    #    + Model::set_training 转发 + save/load 往返逐位一致）────────────
+    nn_add_executable(batchnorm_test src/batchnorm_test.cpp)
+    list(APPEND NN_TEST_TARGETS batchnorm_test)
+
     # ── CNN（MaxPool2D 独立参考比对 + 缓存/checkpoint 契约 + 端到端冒烟）──
     nn_add_executable(cnn_test src/cnn_test.cpp)
     list(APPEND NN_TEST_TARGETS cnn_test)
@@ -339,6 +344,13 @@ if(NN_ENABLE_TESTS)
     if(TARGET cnn_test)
         add_test(NAME cnn_test_gpu COMMAND cnn_test --gpu)
         set_tests_properties(cnn_test_gpu PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    # BatchNorm 的 GPU 变体：推理态/EMA 表达式的 ExprSpec 校验只在 GPU
+    # 路径发生（CPU 模板路径不校验），且闭合世界 miss 只在 GPU 运行期暴露。
+    # 无 Vulkan 构建下返回 77 = SKIP。
+    if(TARGET batchnorm_test)
+        add_test(NAME batchnorm_test_gpu COMMAND batchnorm_test --gpu)
+        set_tests_properties(batchnorm_test_gpu PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     # 基准工具已移除（2026 清理：无法在 -Werror 下编译，且无 ctest 覆盖）
     foreach(TARGET ${NN_BENCH_TARGETS})

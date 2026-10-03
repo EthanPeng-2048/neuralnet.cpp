@@ -303,6 +303,7 @@ template <typename... Ts>
     kv.set("pos_encoding", static_cast<uint64_t>(spec.pos_encoding));
     kv.set("activation",   static_cast<uint64_t>(spec.activation));
     kv.set("norm_type",    static_cast<uint64_t>(spec.norm_type));
+    kv.set("norm_place",   static_cast<uint64_t>(spec.norm_place));
     // ZiPT（AttnZip）已于 2026-10-01 整体移除：不再写 memory_tokens / window 字段。
     // 旧文件（含这两个键）由 spec_from_kv 的 type 分支给出明确错误。
 
@@ -339,6 +340,9 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
     // 注：v1/v2/v3 偏移量格式在 read_and_validate_header 已拒绝，此处为语义兜底。
     if (version < 4 && !kv.has("norm_type"))
         kv.set("norm_type", static_cast<uint64_t>(NormType::LayerNorm));
+    // norm_place（CNN/ViT 归一化挂载）于 v5 引入；缺失时保持 ModelSpec 默认
+    // NormPlace::None = 不加额外归一化，与旧文件的参数布局逐位一致 → 无需回落动作。
+    // if (version < 5 && !kv.has("norm_place")) kv.set("norm_place", 0);
     // ── 未来字段在此追加，例如：
     // if (version < 5 && !kv.has("max_norm")) kv.set("max_norm", 0);
 }
@@ -367,6 +371,7 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
     if (kv.get("pos_encoding", v)) spec.pos_encoding = static_cast<PosEncodingType>(v);
     if (kv.get("activation", v))  spec.activation   = static_cast<ActivationType>(v);
     if (kv.get("norm_type", v))   spec.norm_type    = static_cast<NormType>(v);
+    if (kv.get("norm_place", v))  spec.norm_place   = static_cast<NormPlace>(v);
     // 旧文件的 memory_tokens / window（ZiPT 专用）不再读取，随 type=6 一并拒绝。
 
     // ── CNN ──

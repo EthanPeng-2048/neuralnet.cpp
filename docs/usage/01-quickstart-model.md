@@ -64,6 +64,8 @@ auto model_result = nn::build_mnist_mlp_model(engine);
 nn::Model model = std::move(*model_result);
 
 // MNIST Transformer (ViT)：28×28 图像，patch_size=7
+// 默认含编码器末端 final norm（NormPlace::Final，原版 ViT 的 ln_f）；
+// 块内 pre-norm 默认 LayerNorm，可用 NormType 参数换 RMSNorm/BatchNorm
 auto model_result = nn::build_mnist_transformer_model(engine);
 nn::Model model = std::move(*model_result);
 
