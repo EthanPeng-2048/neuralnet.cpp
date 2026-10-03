@@ -252,13 +252,19 @@
 // 只出现在 Layer，本表是折叠后的派生物）。运行时按 expr_spec_key 匹配 dispatch。
 //
 // ⚠ NN_EXPR_SCAN（扫描/收集期 TU，含 nn_enable_gpu_fusion 的收集器）**不嵌入**：
-//   ① 注册表是收集器自身的**产物**——收集期 include 它会让 depfile 记录
-//     「fused_registry.hpp → collect.exe → .obj → fused_registry.hpp」依赖环，
-//     下次构建 ninja 图加载即失败（实测）；
+//   ① 注册表是收集器自身的**产物**——收集期哪怕只让编译器**探测**到它，
+//     depfile 也会记录「fused_registry.hpp → collect.exe → .obj → fused_registry.hpp」
+//     依赖环，下次构建 ninja 图加载即失败（实测）；
 //   ② 收集走 CPU 干跑，运行期 dispatch 表与收集无关。
 //   因此不变量：**NN_EXPR_SCAN ⇒ 不含 fused_registry**（应用/样例目标不受影响）。
-#if __has_include("fused_registry.hpp") && !defined(NN_EXPR_SCAN)
+// ⚠ 守卫必须写成**嵌套 #ifndef**、不能写成 `__has_include(...) && !defined(...)`
+//   （或反过来短路）：clang 21 实测 `#if` 条件里的 `__has_include` **无论是否被
+//   短路求值、都会被 -MD 记进 depfile**（2026-10-03 复现 f093261 后仍存在的依赖环）；
+//   只有把整组条件编译**跳过**（组内不出词法）才不产生探测记录。
+#ifndef NN_EXPR_SCAN
+#if __has_include("fused_registry.hpp")
 #include "fused_registry.hpp"
+#endif
 #endif
 
 // Vulkan 设备/Pipeline 辅助类（detail::vk_check/convert + VulkanDevice + VulkanPipeline）
