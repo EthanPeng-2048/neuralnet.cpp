@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="430" viewBox="0 0 760 430">
+<rect width="760" height="430" fill="#ffffff"/>
+<text x="78" y="26" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="16" font-weight="600" fill="#111">学习曲线（test_acc vs epoch）</text>
+<line x1="78" y1="363.4" x2="550" y2="363.4" stroke="#e5e7eb"/>
+<text x="70" y="367.4" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="11" fill="#555" text-anchor="end">95</text>
+<line x1="78" y1="291.0" x2="550" y2="291.0" stroke="#e5e7eb"/>
+<text x="70" y="295.0" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="11" fill="#555" text-anchor="end">96</text>
+<line x1="78" y1="218.7" x2="550" y2="218.7" stroke="#e5e7eb"/>
+<text x="70" y="222.7" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="11" fill="#555" text-anchor="end">97</text>
+<line x1="78" y1="146.3" x2="550" y2="146.3" stroke="#e5e7eb"/>
+<text x="70" y="150.3" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="11" fill="#555" text-anchor="end">98</text>
+<line x1="78" y1="73.9" x2="550" y2="73.9" stroke="#e5e7eb"/>
+<text x="70" y="77.9" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="11" fill="#555" text-anchor="end">99</text>
+<line x1="189.1" y1="44" x2="189.1" y2="368" stroke="#f3f4f6"/>
+<text x="189.1" y="386" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="11" fill="#555" text-anchor="middle">5</text>
+<line x1="327.9" y1="44" x2="327.9" y2="368" stroke="#f3f4f6"/>
+<text x="327.9" y="386" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="11" fill="#555" text-anchor="middle">10</text>
+<line x1="466.7" y1="44" x2="466.7" y2="368" stroke="#f3f4f6"/>
+<text x="466.7" y="386" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="11" fill="#555" text-anchor="middle">15</text>
+<line x1="78" y1="368" x2="550" y2="368" stroke="#9ca3af"/>
+<line x1="78" y1="44" x2="78" y2="368" stroke="#9ca3af"/>
+<text x="314" y="416" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#374151" text-anchor="middle">epoch</text>
+<text x="20" y="206" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#374151" text-anchor="middle" transform="rotate(-90 20 206)">test_acc (%)</text>
+<path d="M78.0,181.0 L105.8,122.4 L133.5,336.6 L161.3,145.6 L189.1,174.5 L216.8,184.6 L244.6,279.5 L272.4,128.9 L300.1,139.0 L327.9,103.6 L355.6,163.7 L383.4,92.0 L411.2,89.8 L438.9,79.0 L466.7,76.1 L494.5,76.1 L522.2,75.4 L550.0,75.4" fill="none" stroke="#2563eb" stroke-width="2"/>
+<circle cx="78.0" cy="181.0" r="3.2" fill="#2563eb"/>
+<circle cx="105.8" cy="122.4" r="3.2" fill="#2563eb"/>
+<circle cx="133.5" cy="336.6" r="3.2" fill="#2563eb"/>
+<circle cx="161.3" cy="145.6" r="3.2" fill="#2563eb"/>
+<circle cx="189.1" cy="174.5" r="3.2" fill="#2563eb"/>
+<circle cx="216.8" cy="184.6" r="3.2" fill="#2563eb"/>
+<circle cx="244.6" cy="279.5" r="3.2" fill="#2563eb"/>
+<circle cx="272.4" cy="128.9" r="3.2" fill="#2563eb"/>
+<circle cx="300.1" cy="139.0" r="3.2" fill="#2563eb"/>
+<circle cx="327.9" cy="103.6" r="3.2" fill="#2563eb"/>
+<circle cx="355.6" cy="163.7" r="3.2" fill="#2563eb"/>
+<circle cx="383.4" cy="92.0" r="3.2" fill="#2563eb"/>
+<circle cx="411.2" cy="89.8" r="3.2" fill="#2563eb"/>
+<circle cx="438.9" cy="79.0" r="3.2" fill="#2563eb"/>
+<circle cx="466.7" cy="76.1" r="3.2" fill="#2563eb"/>
+<circle cx="494.5" cy="76.1" r="3.2" fill="#2563eb"/>
+<circle cx="522.2" cy="75.4" r="3.2" fill="#2563eb"/>
+<circle cx="550.0" cy="75.4" r="3.2" fill="#2563eb"/>
+<line x1="562" y1="56" x2="584" y2="56" stroke="#2563eb" stroke-width="2"/>
+<text x="590" y="60" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="11" fill="#374151">cw_64_128</text>
+</svg>
