@@ -38,10 +38,46 @@ enum class ActivationType : uint32_t
 // ── 归一化层类型 ─────────────────────────────────────────────────────────
 enum class NormType : uint32_t
 {
-    LayerNorm = 0,  // LayerNorm（GPT-2 风格，默认）
+    LayerNorm = 0,  // LayerNorm（GPT-2 风格；MLP/ViT 默认）
     RMSNorm   = 1,  // RMSNorm（LLaMA/Mistral 风格，更快更稳）
-    BatchNorm = 2,  // BatchNorm（沿 batch 维归一化，仅用于 MLP 类模型）
+    BatchNorm = 2,  // BatchNorm（沿 batch 维归一化，CNN 默认）
 };
+
+// ── 归一化挂载位置（CNN / MNIST Transformer 专用）───────────────────────
+// 归一化**类型**由 NormType 描述；本枚举描述“加不加、加在哪”。
+//
+// **各架构默认（builder 默认实参，2026-10-03 起）**：CNN = BatchNorm@Conv、
+// ViT = LayerNorm@Final、MLP/GPT/RAPT = None（它们的 norm 由自身结构决定）。
+// **旧模型文件没有 norm_place 键 → 读回 None = 不加额外归一化**——
+// 缺键**不**回落架构默认，与旧实现参数布局逐位一致（旧 checkpoint 仍可加载）。
+//
+//   None  = 不加（MLP/GPT/RAPT 恒为 None：它们的 norm 挂载位置由自身
+//           结构决定 —— MLP = Linear→Norm→激活，GPT/RAPT = pre-norm）
+//   Conv  = CNN：每个卷积（+池化）之后，按 (C*H*W, batch) 每样本归一化
+//   Head  = CNN：全连接头隐藏层（Linear → Norm → ReLU，与 MLP 同款）
+//   Both  = CNN：Conv + Head
+//   Final = ViT：编码器末端 final norm（全局平均池化之前，原版 ViT 的 ln_f）
+enum class NormPlace : uint32_t
+{
+    None  = 0,
+    Conv  = 1,
+    Head  = 2,
+    Both  = 3,
+    Final = 4,
+};
+
+// NormPlace → CLI/日志用短名（归一化位置的唯一命名口径）
+[[nodiscard]] inline const char* norm_place_name(NormPlace p) noexcept
+{
+    switch (p)
+    {
+    case NormPlace::Conv:  return "conv";
+    case NormPlace::Head:  return "head";
+    case NormPlace::Both:  return "both";
+    case NormPlace::Final: return "final";
+    default:               return "none";
+    }
+}
 
 // ── 模型类型枚举 ─────────────────────────────────────────────────────────
 enum class ModelType : uint32_t
@@ -81,6 +117,7 @@ struct ModelSpec
     PosEncodingType pos_encoding = PosEncodingType::Learned;  // 位置编码类型
     ActivationType activation = ActivationType::GeLU;         // FFN 激活类型
     NormType norm_type = NormType::LayerNorm;                 // 归一化层类型
+    NormPlace norm_place = NormPlace::None;                   // 归一化挂载位置（CNN/ViT）
 
     // ── CNN ──
     std::size_t cnn_in_channels = 0;         // 输入通道数（MNIST=1）
@@ -147,13 +184,18 @@ struct ModelSpec
     switch (a.type)
     {
     case ModelType::MLP:
-        return a.layer_dims == b.layer_dims;
+        // norm_type 影响参数个数（RMSNorm 无 beta、BatchNorm 另有 running 状态）
+        // → 属关键维度，加载错配必须给出明确错误而非矩阵形状错位
+        return a.layer_dims == b.layer_dims &&
+               a.norm_type  == b.norm_type;
     case ModelType::Transformer:
         return a.d_model    == b.d_model &&
                a.num_heads  == b.num_heads &&
                a.d_ff       == b.d_ff &&
                a.num_layers == b.num_layers &&
-               a.patch_size == b.patch_size;
+               a.patch_size == b.patch_size &&
+               a.norm_type  == b.norm_type &&
+               a.norm_place == b.norm_place;
     case ModelType::CNN:
         return a.cnn_in_channels == b.cnn_in_channels &&
                a.cnn_in_size     == b.cnn_in_size &&
@@ -162,7 +204,9 @@ struct ModelSpec
                a.cnn_kernels     == b.cnn_kernels &&
                a.cnn_strides     == b.cnn_strides &&
                a.cnn_paddings    == b.cnn_paddings &&
-               a.layer_dims      == b.layer_dims;
+               a.layer_dims      == b.layer_dims &&
+               a.norm_type       == b.norm_type &&
+               a.norm_place      == b.norm_place;
     default:
         return false;
     }

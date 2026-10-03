@@ -268,20 +268,20 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 
 - **前提 = "结构 = 表达式类型"**：为此步骤①②③把 `consts` 值、`matmul.transA/transB`、`GroupedReduce.R` 逐出 key（分别改走 push constant），并把 `GroupedReduceRef` 的 `is_max`（决定视图 kind）提为模板参数。
 - **覆盖语义**：调用点在函数体里，**函数被编译即实例化**——与运行期是否走到该分支无关，因此是"编译期可达"而非"运行期可达"。A/B 实测（`-DNN_SCAN_NO_ANCHOR`）：结构数 **71（仅 dry-run/模型 pass）→ 84（+锚点）**，多出的 13 条都是编译进来的真实调用点（含 matmul、归约、16 个 vp 槽的宽表达式等）。
-- **两者互补，不冗余**（`NN_SCAN_DUMP_SOURCES=1` 逐条打印来源，实测 84 条）：per-layer+显式登记 38 + 模型 pass 25 + fold 显式 8 = **dry-run 侧 71**、锚点 59，**重叠 46 → 锚点独有 13、dry-run 独有 25**（口径：三段互不重叠；打印行见下）。所以**单独删任何一方都会丢结构**：
+- **两者互补，不冗余**（`NN_SCAN_DUMP_SOURCES=1` 逐条打印来源，实测 91 条，2026-10-03 BatchNorm 落地后；该节上方 A/B 时点为 84）：per-layer+显式登记 38 + 模型 pass 32 + fold 显式 8 = **dry-run 侧 78**、锚点 66，**重叠 53 → 锚点独有 13、dry-run 独有 25**（口径：三段互不重叠；打印行见下）。所以**单独删任何一方都会丢结构**：
   - **dry-run 独有 25 条**按形态分：**fold 8 条**（= 显式登记的掩码×偏置组合与通用 fold 样例，见下）、**含 matmul 段 7 条**（注意力反向 / CE / 优化器步）、**RowAccess(12) 4 条**（共享内存 SwiGLU 的半偏移行切分）、**RowGather(9)/ColBroadcast(8) 若干**（稀疏 CE 的 5 视图形态 `[0,8,8,8,8]` 等）——共同点是**结构由运行期配置决定**（视图种类/项数/掩码组合），类型层面推不出来，符号实例 `Expr{}` 与真实实例会折叠出**不同 key**（实测存在"视图种类与指令数完全相同、只有 key 不同"的镜像对，如 dry-only `784781c7b82fa76c` ↔ anchor-only `28cdf7c6d5df0e1d`）。
   - **锚点独有 13 条**是镜像面：dry-run/模型 pass 没跑到的编译期可见调用点（最著名的是 `9ca81b4967cdfa20`——关掉锚点后 `text_infer` KV-cache 增量解码在 GPU 上闭合世界硬报错）。
   - **结论**：dry-run + 模型 pass 是结构的主要来源，**删不掉**；锚点补它跑不到的部分。这也是"扫描步骤本身无法删除"的精确根因。
 - **常驻台账**：锚点登记进独立注册表 `anchor_registry()`，`scan_exprs` 末尾合并并打印来源分项（见下）。**锚点独有数突然变大 = 有新的层路径没纳入任何驱动**（回归信号）。
 - **只登记结构**：⚠ 自登记只能给**结构**（`sig=0`）。**精度签名由生成期的运行期分派变体覆盖**（见上节"精度签名已不是构建期集合"）——自登记 + V1 合起来才构成完整的"零注解"链路：结构靠编译期可达，签名靠运行期参数。
-- **模型级 pass（结构侧）**：per-layer dry-run 块只覆盖"层被单独造出来"的路径；有些调用点只在**完整模型**里才执行（GPT/RAPT 的 LM head、PatchEmbedding、模型级位置编码等）。`scan_exprs` 因此跑一遍**配置矩阵**（只跑 f32）：`mnist_mlp`×{LayerNorm,RMSNorm,BatchNorm}、`mnist_transformer`(ViT)、`cnn`×{pool2,pool3}、`gpt`×{Learned,ALiBi,Sinusoidal,RoPE}×{GeLU,SwiGLU}×{LayerNorm,RMSNorm}、`rapt`×{causal,bidir}（小配置 vocab=64/d_model=16/seq=8/H=2/d_ff=32/L=2；id 输入须填合法 token 值）。该 pass 失败只打 `[scan][warn]` 不中断构建（它是增量，主路径已由 dry-run + 锚点覆盖）。
+- **模型级 pass（结构侧）**：per-layer dry-run 块只覆盖"层被单独造出来"的路径；有些调用点只在**完整模型**里才执行（GPT/RAPT 的 LM head、PatchEmbedding、模型级位置编码等）。`scan_exprs` 因此跑一遍**配置矩阵**（只跑 f32）：`mnist_mlp`×{LayerNorm,RMSNorm,BatchNorm}、`mnist_transformer`(ViT)、`cnn`×{pool2,pool3}、`gpt`×{Learned,ALiBi,Sinusoidal,RoPE}×{GeLU,SwiGLU}×{LayerNorm,RMSNorm}、`rapt`×{causal,bidir}（小配置 vocab=64/d_model=16/seq=8/H=2/d_ff=32/L=2；id 输入须填合法 token 值）。**每个模型先训练态 forward+backward、再推理态 forward+backward**（2026-10-03 起——训练/推理双态层如 `BatchNorm` 的两条路径是不同表达式结构，只跑训练态则 GPU 推理闭合世界硬报错；对无双态语义的层 `set_training` 是 no-op，多跑一轮只重复登记已知结构）。该 pass 失败**中止构建**（注册表不完整 = 闭合世界缺口）。
 - **已验证可删：13 个 per-layer dry-run 块（−223 行）**。模型 pass 覆盖了这些层路径后，`scan_exprs` 里 ReLU/SwiGLU/GeLU/Softmax/RMSNorm/LayerNorm/RLA(causal+bidir)/GPTBlock/TransformerEncoderLayer/Linear/Conv2D/MaxPool2D 的独立 dry-run 块**已删除**，判据是两条硬证据：
   1. **结构集合逐字节不变**（84 条，bin 内容一致）；
   2. **运行时 miss 集合不变**：`NN_PREC_TRACE=1 mem_probe --f16` 的 5 个工作负载（默认 / `--doc-mask` / `--checkpoint-every 2` / `--optimizer muon` / `--activation-offload`）在删除前后都是同一个 miss（仅 fold doc-mask 一条，见下）。
   保留的是**整模型跑不到**的来源：优化器（5 变体）、损失（MSE / CE 稠密 / CE 稀疏）、RoPE `apply_step`（增量推理）、CSA×4（掩码/偏置组合，含模型未覆盖的 doc 变体）、MHA、以及 `scan_exprs` 内的**显式测试覆盖登记**（matmul+bias+relu / bmm_reduce / reduce_consts）。
 - **常驻分项台账**（每次构建打印，结构侧）：
   ```
-  [scan] 结构来源：dry-run 侧 71（per-layer+显式 38、模型 pass +25、fold 显式 +8） + 锚点 59（新增 13）= 合计 84（锚点独有 13、dry-run 独有 25）
+  [scan] 结构来源：dry-run 侧 78（per-layer+显式 38、模型 pass +32、fold 显式 +8） + 锚点 66（新增 13）= 合计 91（锚点独有 13、dry-run 独有 25）
   ```
   A/B 开关：`-DNN_SCAN_NO_ANCHOR`（关锚点）/ `-DNN_SCAN_NO_DRYRUN`（关 dry-run/模型 pass），均只影响登记集合、不改语义。逐条来源用 `NN_SCAN_DUMP_SOURCES=1` 打印（`[scan][dry-only]` / `[scan][anchor-only]` + 结构摘要）。
 - **run-only 签名回填已删除**（A1e）：`--f16` 下曾有一批只有真实训练才暴露的签名（注意力 fold 的文档掩码 5 输入形态、MNIST/CNN f16 训练的 8 条"f32 入 + f16 出"混合签名），靠 `NN_PREC_TRACE=1` 的 `[prec][miss]` 收集后写进 `tools/prec_backfill.txt`。**该清单与其工作流已随 A1 整体删除**——V1 分派 shader 覆盖任意签名，f16 训练实测 `miss=0` 且边界 cast 归因表为空。历史清单条目与复现命令归档在 `docs/history.md`。

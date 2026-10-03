@@ -453,6 +453,9 @@ class MnistTrainController(CLIController):
 
         if "norm" in kwargs:
             args.extend(["--norm", self._format_arg_value(kwargs["norm"])])
+
+        if "norm_place" in kwargs:
+            args.extend(["--norm-place", self._format_arg_value(kwargs["norm_place"])])
         
         # Transformer专用参数
         if "d_model" in kwargs:

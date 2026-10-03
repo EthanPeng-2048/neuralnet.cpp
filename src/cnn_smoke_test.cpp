@@ -86,21 +86,112 @@ int main(int argc, char* argv[])
     }
     std::cout << "spec round-trip OK (" << nn::spec_summary(spec) << ")\n";
 
-    // ── 2. 层组成核对 ──────────────────────────────────────────────
-    std::size_t n_conv = 0, n_pool = 0, n_linear = 0;
+    // ── 2. 层组成核对（cfg 为默认构造 → CNN 规范形态 BatchNorm@conv）───
+    std::size_t n_conv = 0, n_pool = 0, n_linear = 0, n_norm = 0;
     for (std::size_t i = 0; i < model.num_layers(); ++i)
     {
         nn::Layer& l = model.layer_at(i);
         if (dynamic_cast<nn::Conv2D*>(&l))    ++n_conv;
         if (dynamic_cast<nn::MaxPool2D*>(&l)) ++n_pool;
         if (dynamic_cast<nn::Linear*>(&l))    ++n_linear;
+        if (dynamic_cast<nn::LayerNorm*>(&l) || dynamic_cast<nn::RMSNorm*>(&l) ||
+            dynamic_cast<nn::BatchNorm*>(&l)) ++n_norm;
     }
-    std::printf("layers=%zu  Conv2D=%zu  MaxPool2D=%zu  Linear=%zu\n",
-                model.num_layers(), n_conv, n_pool, n_linear);
+    std::printf("layers=%zu  Conv2D=%zu  MaxPool2D=%zu  Linear=%zu  Norm=%zu\n",
+                model.num_layers(), n_conv, n_pool, n_linear, n_norm);
     if (n_conv != cfg.convs.size() || n_pool != cfg.convs.size() || n_linear < 2)
     {
         std::cerr << "层组成与配置不符\n";
         return 1;
+    }
+    // 默认挂载回归锁：BatchNorm@conv → 每个卷积(+池化)后 1 个，FC 头不挂
+    if (n_norm != cfg.convs.size() || cfg.norm_type != nn::NormType::BatchNorm ||
+        cfg.norm_place != nn::NormPlace::Conv)
+    {
+        std::cerr << "CNN 默认应为 BatchNorm@conv（归一化层数不符）\n";
+        return 1;
+    }
+
+    // ── 2b. 归一化挂载（NormPlace）：both → 卷积后各 1 + FC 隐藏层 1 ───
+    {
+        nn::CnnConfig ncfg = cfg;
+        ncfg.norm_type  = nn::NormType::RMSNorm;
+        ncfg.norm_place = nn::NormPlace::Both;
+
+        auto nspec = nn::make_cnn_spec(ncfg.in_channels, ncfg.in_size, ncfg.pool,
+                                       ncfg.convs, ncfg.fc_dims,
+                                       ncfg.norm_type, ncfg.norm_place);
+        auto nmodel_r = nn::build_cnn_model_from_spec(eng, nspec);
+        if (!nmodel_r)
+        {
+            std::cerr << "norm CNN 构建失败: " << nmodel_r.error().message << "\n";
+            return 1;
+        }
+        nn::Model& nmodel = *nmodel_r;
+
+        std::size_t n_norm = 0;
+        for (std::size_t i = 0; i < nmodel.num_layers(); ++i)
+            if (dynamic_cast<nn::RMSNorm*>(&nmodel.layer_at(i))) ++n_norm;
+        const std::size_t want_norm = ncfg.convs.size() + 1;  // conv 后各 1 + FC 首隐藏层 1
+        std::printf("norm_layers(RMSNorm)=%zu (期望 %zu)\n", n_norm, want_norm);
+        if (n_norm != want_norm)
+        {
+            std::cerr << "norm_place=both 的归一化层数不符\n";
+            return 1;
+        }
+        auto ncfg_back = nn::cnn_config_from_spec(nspec);
+        if (!ncfg_back || ncfg_back->norm_place != nn::NormPlace::Both ||
+            ncfg_back->norm_type != nn::NormType::RMSNorm)
+        {
+            std::cerr << "norm spec 往返不一致\n";
+            return 1;
+        }
+
+        // 挂 norm 后跑一轮 fwd/bwd：梯度必须全有限
+        const std::size_t nbatch = 4;
+        nn::Matrix nxm(ncfg.in_channels * ncfg.in_size * ncfg.in_size, nbatch);
+        std::mt19937_64 nrng{20261003};
+        std::uniform_real_distribution<nn::Scalar> ndist(-1.0f, 1.0f);
+        for (std::size_t i = 0; i < nxm.size(); ++i) nxm.span()[i] = ndist(nrng);
+        std::vector<std::size_t> nlabels(nbatch);
+        for (std::size_t i = 0; i < nbatch; ++i)
+            nlabels[i] = static_cast<std::size_t>(nrng() % ncfg.fc_dims.back());
+
+        auto nx = eng.from_matrix(nxm);
+        if (!nx) { std::cerr << "norm from_matrix 失败\n"; return 1; }
+        auto nlogits = nmodel.forward(*nx);
+        if (!nlogits)
+        {
+            std::cerr << "norm forward 失败: " << nlogits.error().message << "\n";
+            return 1;
+        }
+        nn::CrossEntropyLoss nce;
+        auto nloss = nce.forward_sparse(eng, *nlogits, nlabels, {},
+                                        ncfg.fc_dims.back());
+        if (!nloss) { std::cerr << "norm loss 失败\n"; return 1; }
+        auto ngrad = nce.backward();
+        if (!ngrad) { std::cerr << "norm CE backward 失败\n"; return 1; }
+        auto nbwd = nmodel.backward(*ngrad);
+        if (!nbwd)
+        {
+            std::cerr << "norm model backward 失败: " << nbwd.error().message << "\n";
+            return 1;
+        }
+        bool finite = true;
+        for (auto& g : nmodel.param_gradients())
+        {
+            auto gm = eng.to_matrix(g.get());
+            if (!gm) { finite = false; break; }
+            for (auto v : gm->span())
+                if (!std::isfinite(v)) { finite = false; break; }
+            if (!finite) break;
+        }
+        if (!finite)
+        {
+            std::cerr << "norm CNN 梯度含 NaN/Inf\n";
+            return 1;
+        }
+        std::cout << "norm_place=both OK (loss=" << *nloss << ")\n";
     }
 
     // ── 3. 固定小批训练：loss 下降、梯度有限 ────────────────────────

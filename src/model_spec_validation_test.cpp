@@ -11,6 +11,7 @@
 //   4. 无 spec 模型（build_gpt_model 直接构建）：跳过校验，向后兼容。
 // ─────────────────────────────────────────────────────────────────────────
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -24,6 +25,7 @@ using nn::ActivationType;
 using nn::ModelSpec;
 using nn::ModelType;
 using nn::NormType;
+using nn::NormPlace;
 using nn::PosEncodingType;
 
 namespace
@@ -75,6 +77,8 @@ int run_test()
     ModelSpec m3;  m3.type = ModelType::MLP; m3.layer_dims = {64, 10};
     expect(nn::spec_matches(m1, m2),   "MLP 相同 layer_dims 匹配", all);
     expect(!nn::spec_matches(m1, m3),  "MLP 不同 layer_dims 不匹配", all);
+    ModelSpec m4 = m1;  m4.norm_type = NormType::RMSNorm;
+    expect(!nn::spec_matches(m1, m4),  "MLP 不同 norm_type 不匹配", all);
 
     // Transformer
     ModelSpec t1;  t1.type = ModelType::Transformer;
@@ -84,6 +88,10 @@ int run_test()
     ModelSpec t3 = t1;  t3.num_heads = 8;
     expect(nn::spec_matches(t1, t2),   "Transformer 相同 spec 匹配", all);
     expect(!nn::spec_matches(t1, t3),  "Transformer 不同 heads 不匹配", all);
+    ModelSpec t4 = t1;  t4.norm_place = NormPlace::Final;
+    expect(!nn::spec_matches(t1, t4),  "Transformer 不同 norm_place 不匹配", all);
+    ModelSpec t5 = t1;  t5.norm_type = NormType::BatchNorm;
+    expect(!nn::spec_matches(t1, t5),  "Transformer 不同 norm_type 不匹配", all);
 
     // CNN
     ModelSpec c1;  c1.type = ModelType::CNN;
@@ -95,6 +103,10 @@ int run_test()
     ModelSpec c3 = c1;  c3.cnn_channels = {16, 64};
     expect(nn::spec_matches(c1, c2),   "CNN 相同 spec 匹配", all);
     expect(!nn::spec_matches(c1, c3),  "CNN 不同 channels 不匹配", all);
+    ModelSpec c4 = c1;  c4.norm_place = NormPlace::Both;
+    expect(!nn::spec_matches(c1, c4),  "CNN 不同 norm_place 不匹配", all);
+    ModelSpec c5 = c1;  c5.norm_type = NormType::RMSNorm;
+    expect(!nn::spec_matches(c1, c5),  "CNN 不同 norm_type 不匹配", all);
 
     // ── 2. round-trip：匹配 spec 加载成功 ─────────────────────────────
     std::cout << "\n── round-trip（匹配 spec 加载成功） ──\n";
@@ -249,6 +261,151 @@ int run_test()
             const bool readable = r.error().message.find("ZiPT") != std::string::npos;
             expect(readable, "type=6 拒绝信息含 'ZiPT'（可读）", all);
             std::cout << "      错误信息: " << r.error().message << "\n";
+        }
+    }
+
+    // ── 7. 归一化挂载（NormPlace）：默认值 / 显式挂载 / 规格往返 ───────
+    // **各架构默认（2026-10-03 起）**：CNN = BatchNorm@Conv、ViT = LayerNorm@Final、
+    // MLP = LayerNorm + 结构内置挂载；**旧文件缺 norm_place 键 → None**（旧布局逐位不变）；
+    // 显式挂载时 norm 必须真的在模型里，且 save→load 往返成功、错配被拦截。
+    std::cout << "\n── 归一化挂载（NormPlace） ──\n";
+    {
+        nn::CpuEngine eng;
+
+        // 7.0 旧文件兼容：缺 norm_place / norm_type 键 → 架构无关的 None / LayerNorm
+        //（**不**回落到新默认 CNN=BatchNorm@Conv、ViT=LayerNorm@Final——
+        //  否则旧 checkpoint 的参数布局会错位，加载必败）
+        {
+            nn::KeyValueRecord kv;
+            kv.set("type", static_cast<uint64_t>(nn::ModelType::CNN));
+            auto r = nn::detail::spec_from_kv(kv);
+            expect(bool(r) && r->norm_place == nn::NormPlace::None &&
+                            r->norm_type == nn::NormType::LayerNorm,
+                   "缺 norm_place/norm_type 键的旧文件 → None/LayerNorm（旧布局）", all);
+        }
+
+        // 7.0b 各架构默认（回归锁，改默认值必须同步文档与锚点）
+        {
+            const nn::ModelSpec c = nn::make_cnn_spec(1, 12, 2, {{4, 3, 1, 0}}, {16, 10});
+            expect(c.norm_type == NormType::BatchNorm && c.norm_place == NormPlace::Conv,
+                   "make_cnn_spec 默认 = BatchNorm@Conv", all);
+            const nn::ModelSpec t = nn::make_mnist_transformer_spec();
+            expect(t.norm_type == NormType::LayerNorm && t.norm_place == NormPlace::Final,
+                   "make_mnist_transformer_spec 默认 = LayerNorm@Final", all);
+        }
+
+        // 7.1 CNN：conv+head 挂 RMSNorm
+        {
+            nn::CnnConfig ccfg;
+            ccfg.in_channels = 1; ccfg.in_size = 12; ccfg.pool = 2;
+            ccfg.convs = {{4, 3, 1, 0}, {8, 3, 1, 0}};
+            ccfg.fc_dims = {16, 10};
+            ccfg.norm_type = NormType::RMSNorm;
+            ccfg.norm_place = NormPlace::Both;
+
+            const nn::ModelSpec spec = nn::make_cnn_spec(
+                ccfg.in_channels, ccfg.in_size, ccfg.pool, ccfg.convs,
+                ccfg.fc_dims, ccfg.norm_type, ccfg.norm_place);
+            auto m = nn::build_cnn_model_from_spec(eng, spec);
+            if (!m) { expect(false, "build_cnn_model(norm=both): " + m.error().message, all); }
+            else
+            {
+                std::size_t n_rms = 0;
+                for (std::size_t i = 0; i < m->num_layers(); ++i)
+                    if (dynamic_cast<nn::RMSNorm*>(&m->layer_at(i))) ++n_rms;
+                // 卷积后 2 个 + FC 隐藏层 1 个（fc_dims 尾元素是 logits 不挂）
+                expect(n_rms == 3, "CNN norm_place=both → 3 个 RMSNorm（conv 2 + head 1）", all);
+
+                expect(m->spec().has_value() && nn::spec_matches(spec, *m->spec()),
+                       "CNN norm spec 记录且一致", all);
+
+                const std::string file = "arch_check_cnn_norm.bin";
+                if (auto r = nn::save_model(file, *m, spec); !r)
+                    expect(false, "CNN save_model: " + r.error().message, all);
+                else
+                {
+                    auto m2 = nn::build_cnn_model_from_spec(eng, spec);
+                    if (!m2)
+                        expect(false, "CNN build_from_spec: " + m2.error().message, all);
+                    else
+                    {
+                        auto lr = nn::load_model(file, *m2);
+                        expect(static_cast<bool>(lr), "CNN norm spec 往返 load 成功", all);
+                    }
+                    // norm_place 不同的架构加载同一文件 → 必须被拦截
+                    nn::ModelSpec bad = spec;
+                    bad.norm_place = NormPlace::None;
+                    auto m3 = nn::build_cnn_model_from_spec(eng, bad);
+                    if (!m3)
+                        expect(false, "CNN build(norm_place=None): " + m3.error().message, all);
+                    else
+                    {
+                        auto lr3 = nn::load_model(file, *m3);
+                        expect(!lr3, "CNN norm_place 错配的 load 被拦截", all);
+                    }
+                }
+                std::remove(file.c_str());
+            }
+        }
+
+        // 7.2 ViT：final norm（+ 一轮 forward/backward，梯度有限）
+        {
+            const nn::ModelSpec spec = nn::make_mnist_transformer_spec(
+                nn::MNIST_PATCH_SIZE, nn::MNIST_TF_D_MODEL, nn::MNIST_TF_NUM_HEADS,
+                nn::MNIST_TF_D_FF, nn::MNIST_TF_NUM_LAYERS,
+                NormType::LayerNorm, NormPlace::Final);
+            auto m = nn::build_mnist_model_from_spec(eng, spec);
+            if (!m) { expect(false, "build ViT(final norm): " + m.error().message, all); }
+            else
+            {
+                const std::size_t B = 2;   // batch>1：批内布局（铁律 #5）
+                auto x = eng.create_tensor(nn::MNIST_INPUT_DIM, B, nn::Precision::F32,
+                                           nn::InitSpec::normal(0.0f, 1.0f, 42));
+                auto out = m->forward(x);
+                bool ok = out.has_value();
+                if (ok)
+                {
+                    auto g = eng.create_tensor(out->rows(), out->cols(), nn::Precision::F32,
+                                               nn::InitSpec::constant(1));
+                    auto grad = m->backward(g);
+                    ok = grad.has_value();
+                    if (ok)
+                    {
+                        auto gm = eng.to_matrix(*grad);
+                        ok = static_cast<bool>(gm);
+                        if (ok)
+                            for (auto v : gm->span())
+                                if (!std::isfinite(v)) { ok = false; break; }
+                    }
+                }
+                expect(ok, "ViT(final norm) forward/backward 梯度全有限", all);
+
+                const std::string file = "arch_check_vit_norm.bin";
+                if (auto r = nn::save_model(file, *m, spec); !r)
+                    expect(false, "ViT save_model: " + r.error().message, all);
+                else
+                {
+                    auto m2 = nn::build_mnist_model_from_spec(eng, spec);
+                    if (!m2)
+                        expect(false, "ViT build_from_spec: " + m2.error().message, all);
+                    else
+                    {
+                        auto lr = nn::load_model(file, *m2);
+                        expect(static_cast<bool>(lr), "ViT final-norm 往返 load 成功", all);
+                    }
+                    nn::ModelSpec bad = spec;
+                    bad.norm_place = NormPlace::None;
+                    auto m3 = nn::build_mnist_model_from_spec(eng, bad);
+                    if (!m3)
+                        expect(false, "ViT build(norm_place=None): " + m3.error().message, all);
+                    else
+                    {
+                        auto lr3 = nn::load_model(file, *m3);
+                        expect(!lr3, "ViT norm_place 错配的 load 被拦截", all);
+                    }
+                }
+                std::remove(file.c_str());
+            }
         }
     }
 

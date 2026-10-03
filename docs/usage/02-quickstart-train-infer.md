@@ -53,7 +53,7 @@ cmake --build build --parallel
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--arch` | `mlp` | 架构：`mlp` / `transformer` |
+| `--arch` | `mlp` | 架构：`mlp` / `transformer` / `cnn` |
 | `--resume <path>` | 无 | 从已有模型恢复训练 |
 | `--save <path>` | `mnist_model.bin` | 模型保存路径 |
 | `--dataset <path>` | `datasets/mnist_data` | 数据集目录 |
@@ -63,6 +63,8 @@ cmake --build build --parallel
 | `--optimizer <name>` | `adam` | 优化器：`sgd`/`sgd_momentum`/`adam`/`adamw`/`muon` |
 | `--gpu <索引>` / `--gpu=<名称>` | 禁用 | 启用 Vulkan GPU 加速；可选指定计算设备（索引如 `2`，名称子串如 `--gpu=40HX`/`--gpu=NVIDIA`） |
 | `--max-samples <n>` | 全部 | 限制训练样本数 |
+| `--norm <type>` | `auto` | 归一化类型：`auto` / `layernorm` / `rmsnorm` / `batchnorm`（三架构通用；`auto` = 按架构：MLP/ViT = layernorm、CNN = batchnorm） |
+| `--norm-place <where>` | `auto` | 归一化挂载：`auto` / `none` / `conv` / `head` / `both`（CNN）、`final`（ViT）；`auto` = 按架构：CNN = `conv`、ViT = `final`；`none` = 不额外添加（旧模型文件缺该键即此值，参数布局与旧实现一致），MLP 只接受 `none`/`auto` |
 
 ### 推理
 
@@ -433,7 +435,7 @@ int main() {
 
 - `save_model` 统一写入 v5；`load_model` 接受 v4 及以上自描述格式（v1/v2/v3 会提示重新训练保存）
 - 规格头为长度前缀 KeyValueRecord（自描述、无偏移量假设）；
-  版本默认值表保证字段缺失时回落默认（如 norm_type 缺失 → LayerNorm）
+  版本默认值表保证字段缺失时回落默认（如 norm_type 缺失 → LayerNorm）；**例外：`norm_place` 缺失 → `None`（不额外加归一化）而非架构默认**，以保证旧 checkpoint 的参数布局逐位一致
 - v4/v5 模型推理时无需单独指定 `--vocab` 参数（嵌入词表随模型保存）
 
 ---

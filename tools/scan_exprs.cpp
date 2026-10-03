@@ -439,7 +439,34 @@ int main(int argc, char* argv[])
                 std::fprintf(stderr, "[scan][FAIL] %s backward 失败：%s\n", name,
                              br.error().message.c_str());
                 ++n_fail;
+                return;
             }
+
+            // ── 推理态再跑一轮 forward + backward：训练/推理双态层
+            //（BatchNorm）的推理路径是**不同的表达式结构**——无归约链、
+            // grad_x 无均值修正项——只跑训练态会在 GPU 推理时闭合世界
+            // 硬报错。对无双态语义的层 set_training 是 no-op，多跑一轮
+            // 只是重复登记已有结构（key 去重）。
+            model.set_training(false);
+            auto eout = model.forward(input);
+            if (!eout)
+            {
+                std::fprintf(stderr, "[scan][FAIL] %s 推理态 forward 失败：%s\n",
+                             name, eout.error().message.c_str());
+                ++n_fail;
+            }
+            else
+            {
+                nn::Tensor egrad = scan_tensor(eout->rows(), eout->cols());
+                auto ebr = model.backward(egrad);
+                if (!ebr)
+                {
+                    std::fprintf(stderr, "[scan][FAIL] %s 推理态 backward 失败：%s\n",
+                                 name, ebr.error().message.c_str());
+                    ++n_fail;
+                }
+            }
+            model.set_training(true);   // 恢复训练态（后续模型默认口径）
         };
         const auto try_build = [&](const char* name, auto&& build, const nn::Tensor& input)
         {
@@ -489,6 +516,29 @@ int main(int argc, char* argv[])
                             nn::MNIST_TF_D_MODEL, nn::MNIST_TF_NUM_HEADS,
                             nn::MNIST_TF_D_FF, nn::MNIST_TF_NUM_LAYERS, prof); },
                   scan_tensor(nn::MNIST_IMG_SIZE * nn::MNIST_IMG_SIZE, B));
+        // ── 2b) 归一化维（NormType / NormPlace 是运行期配置决定的结构，类型
+        //        层面推不出 → 与 GPT 的 pe/act/norm 同理，必须在这里补 dry-run）──
+        try_build("mnist_transformer_final_ln",
+                  [&] { return nn::build_mnist_transformer_model(
+                            engine, nn::MNIST_IMG_SIZE, nn::MNIST_PATCH_SIZE,
+                            nn::MNIST_TF_D_MODEL, nn::MNIST_TF_NUM_HEADS,
+                            nn::MNIST_TF_D_FF, nn::MNIST_TF_NUM_LAYERS, prof,
+                            nn::NormType::LayerNorm, nn::NormPlace::Final); },
+                  scan_tensor(nn::MNIST_IMG_SIZE * nn::MNIST_IMG_SIZE, B));
+        try_build("mnist_transformer_final_rms",
+                  [&] { return nn::build_mnist_transformer_model(
+                            engine, nn::MNIST_IMG_SIZE, nn::MNIST_PATCH_SIZE,
+                            nn::MNIST_TF_D_MODEL, nn::MNIST_TF_NUM_HEADS,
+                            nn::MNIST_TF_D_FF, nn::MNIST_TF_NUM_LAYERS, prof,
+                            nn::NormType::RMSNorm, nn::NormPlace::Final); },
+                  scan_tensor(nn::MNIST_IMG_SIZE * nn::MNIST_IMG_SIZE, B));
+        try_build("mnist_transformer_prenorm_bn",
+                  [&] { return nn::build_mnist_transformer_model(
+                            engine, nn::MNIST_IMG_SIZE, nn::MNIST_PATCH_SIZE,
+                            nn::MNIST_TF_D_MODEL, nn::MNIST_TF_NUM_HEADS,
+                            nn::MNIST_TF_D_FF, nn::MNIST_TF_NUM_LAYERS, prof,
+                            nn::NormType::BatchNorm, nn::NormPlace::None); },
+                  scan_tensor(nn::MNIST_IMG_SIZE * nn::MNIST_IMG_SIZE, B));
         // ── 3) CNN：池化窗口维（R 是运行期视图参数，pool=3 → R=9）──
         for (const std::size_t pool : {std::size_t{2}, std::size_t{3}})
         {
@@ -500,6 +550,29 @@ int main(int argc, char* argv[])
             try_build(pool == 2 ? "cnn_pool2" : "cnn_pool3",
                       [&] { return nn::build_cnn_model(engine, cfg); },
                       scan_tensor(1 * 28 * 28, B));
+        }
+        // ── 3b) CNN 归一化维（NormPlace × NormType 同上：运行期配置决定）──
+        {
+            struct CnnNormCase { const char* name; nn::NormType nt; nn::NormPlace np; };
+            for (const CnnNormCase c : {
+                     CnnNormCase{"cnn_norm_both_ln", nn::NormType::LayerNorm,
+                                 nn::NormPlace::Both},
+                     CnnNormCase{"cnn_norm_conv_rms", nn::NormType::RMSNorm,
+                                 nn::NormPlace::Conv},
+                     CnnNormCase{"cnn_norm_head_bn",  nn::NormType::BatchNorm,
+                                 nn::NormPlace::Head},
+                 })
+            {
+                nn::CnnConfig cfg;
+                cfg.convs = nn::MNIST_CNN_CONVS;
+                cfg.fc_dims = nn::MNIST_CNN_FC;
+                cfg.pool = 2;
+                cfg.norm_type = c.nt;
+                cfg.norm_place = c.np;
+                try_build(c.name,
+                          [&] { return nn::build_cnn_model(engine, cfg); },
+                          scan_tensor(1 * 28 * 28, B));
+            }
         }
         // ── 4) GPT：位置编码 × 激活 × 归一化（每一维都换一组融合表达式：
         //        ALiBi 走分数侧偏置、Sinusoidal 走嵌入侧、RoPE 走 Q/K 侧、

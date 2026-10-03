@@ -41,13 +41,13 @@
 | `shaders/` | **19 个 `.comp`** | `Get-ChildItem shaders -Recurse -Filter *.comp` |
 | `docs/` | **25 篇 `.md`**（本文加入前；含 `history.md` 与 `release-notes/`） | `Get-ChildItem docs -Recurse -Filter *.md` |
 | 最大源文件 | `compute_vk_backend.hpp` **5246** 行、`expr_glsl_gen.hpp` **2746**、`compute_cpu_engine.hpp` **2353**、`compute_engine.hpp` **2087**、`src/text_train.cpp` **1746**、`gui.py` **1646**（非空 1456） | 逐文件 `(Get-Content $f).Count` |
-| ctest | **21 个测试** = 19 个测试目标（`list(APPEND NN_TEST_TARGETS` 计数）+ `cnn_test_gpu`（= `cnn_test --gpu`）+ `fusion_custom_layer_example`（AOT 融合端到端） | `ctest --test-dir build -N` |
+| ctest | **23 个测试** = 20 个测试目标（`list(APPEND NN_TEST_TARGETS` 计数）+ `cnn_test_gpu`（= `cnn_test --gpu`）+ `batchnorm_test_gpu`（= `batchnorm_test --gpu`，2026-10-03 随 BatchNorm 落地新增）+ `fusion_custom_layer_example`（AOT 融合端到端） | `ctest --test-dir build -N` |
 | 引擎接口 | **49 个 virtual 方法**；`L2-VIOLATIONS: 0`；宿主桥 40 处（仅披露） | `pwsh -File bench/doc_inventory.ps1` |
 | 版本 | git tag **v1.6.0**；`CMakeLists.txt` 的 `project(... VERSION 1.0.0)`（滞后于 git tag，**以 git tag 为版本权威**）；`release-notes/` 有 `v1.5.0.md` 与 `v1.6.0.md` | `git describe` + 读 `CMakeLists.txt` |
 | CI | 仅 `.github/workflows/cmake-single-platform.yml`：clang++ / Ninja / Release / `NN_ENABLE_NATIVE=OFF`，Linux + Windows；**不开 `NN_ENABLE_TESTS`、不跑 ctest** | 读该 workflow |
 
 > 口径说明：表中行数均为**总行数**；`gui.py` 另有非空 1456 行。
-> `21` 是当前唯一正确计数。历史上仓库里同时存在"ctest 计数 19"与"ctest 20 比 20"两种表述（§3 工程化第 4 条）——那是**计数口径不同**（是否含 `cnn_test_gpu`、以及后来新增的两个目标），2026-10-01 的 A4/A5 两轮把计数推到 21 并统一到本文与 `AGENTS.md`。
+> `23` 是当前唯一正确计数（2026-10-03 起，随 BatchNorm 落地新增 `batchnorm_test` + `batchnorm_test_gpu`；此前为 21）。历史上仓库里同时存在"ctest 计数 19"与"ctest 20 比 20"两种表述（§3 工程化第 4 条）——那是**计数口径不同**（是否含 `cnn_test_gpu`、以及后来新增的目标），2026-10-01 的 A4/A5 两轮把计数推到 21 并统一到本文与 `AGENTS.md`。
 
 ### 2.1 已经稳固的底座（本轮不再动）
 
@@ -74,7 +74,7 @@
 |---|---|---|---|
 | C1 | GPU `stable=f16` 训练 loss 回读冻结（权重照常更新） | `docs/development/14-f16-stable-gpu-loss-frozen.md` | GPU f16 训练的 loss 曲线不可观测；无对应 ctest 用例 |
 | C2 | `optimizer=f16` 无 loss scaling 即更新爆炸、`stable=f16` 约 200 步 NaN | `docs/development/05-mixed-precision.md` §12.5；`src/text_train.cpp` 解析处只赋值不校验 | 用户可组合出必崩配置，且无任何启动期提示 |
-| C3 | `NormType::BatchNorm` **静默回落**到 LayerNorm | `compute_layer_mlp.hpp:782`（`make_norm_layer`）；`README.md:248` 声称支持；`gui.py:60` 把 `batchnorm` 列为可选项；`model_spec.hpp:43` 保留枚举 | 模型规格写 batchnorm、实际跑 layernorm，无告警、无日志 |
+| C3 | `NormType::BatchNorm` **静默回落**到 LayerNorm | `compute_layer_mlp.hpp:782`（`make_norm_layer`）；`README.md:248` 声称支持；`gui.py:60` 把 `batchnorm` 列为可选项；`model_spec.hpp:43` 保留枚举 | 模型规格写 batchnorm、实际跑 layernorm，无告警、无日志。**✅ 已解决（2026-10-03）**：真正实现 `BatchNorm` 层（P0-3），`make_norm_layer` 真分支，见 `docs/history.md` |
 | C4 | checkpoint（`.bin`）不存 Adam m/v | `model_serialization.hpp`（`MODEL_VERSION = 5`，见该文件版本常量注释）；`compute_optimizer.hpp` 无 `save_state/load_state` | TDR 重启 / `--resume` 后动量归零，续训轨迹不连续 |
 | C5 | `.bin` 无整文件校验和与尾部完整性标记 | `model_serialization.hpp` 版本常量附近的注释（明示"若引入需升 MODEL_VERSION"） | 截断/损坏的模型文件无法与合法文件区分 |
 | C6 | `gpt_test` 偶发失败未定位 | 13 原条目 §9.5（62 次直跑 1 次失败、日志被覆盖） | CI 化之后会成为随机红 |
@@ -124,7 +124,7 @@ P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
 
 | 期 | 项数 | 项目 | 共同前置 |
 |---|---|---|---|
-| **P0** | 5 | CI 真跑测试、文档一致性回正、BatchNorm 禁止静默回落、CMake install/export + presets、推理采样 top-k/top-p | 无（P0-1 是所有人的前置） |
+| **P0** | 5 | CI 真跑测试、文档一致性回正、BatchNorm 禁止静默回落（**✅ 已完成 2026-10-03**）、CMake install/export + presets、推理采样 top-k/top-p | 无（P0-1 是所有人的前置） |
 | **P1** | 5 | `text_train` 模块化、checkpoint 优化器状态、危险精度组合 fail-fast、`gpt_test` flaky、CI 冒烟扩 MSVC Debug | P0-1 |
 | **P2** | 8 | `.bin` 校验和、Adafactor、RAPT/CNN f16、Dataset/DataLoader、Python/C 绑定、GUI 两项、header 拆分、F16C | P0-1；P2-7 另需 P1-5；P2-6 另需 P0-5 |
 | **P3** | 8 | 由 §6 触发条件启动（含 CUDA、分布式） | 各自触发条件 |
@@ -141,9 +141,9 @@ P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
 
 | 项目 | 目标 | 验收口径 | 成本 | 依赖 |
 |---|---|---|---|---|
-| **P0-1 CI 真跑构建 + 测试**（最高优先） | workflow 加 `-DNN_ENABLE_TESTS=ON`，并在 Linux 与 Windows 各跑一轮 `ctest`（失败时输出完整失败日志） | GitHub Actions 绿且日志出现 21 个用例；需 Vulkan 的用例按退出码 77 记 skip 而非失败 | 小（改一个 `.yml`，约 10 行） | 无。**先于其它一切**——没有真门禁，后面所有验收都无法自动防回退 |
-| **P0-2 文档一致性回正** | ① ctest 计数统一为实测 21（19 目标 + `cnn_test_gpu` + `fusion_custom_layer_example`）；② `CMakeLists.txt` 版本与 tag 对齐（或明确声明"以 tag 为准"）；③ 补 `docs/release-notes/v1.5.1.md`；④ 修 `README.md` 死链/mojibake/链式 API 声明/索引缺 13–17 | `bench/doc_align_audit.ps1` 的 [A][D][E][F] 可行动项为 0；开发文档中 ctest 计数的旧写法（ASCII 斜杠数字）零命中（历史归档 `docs/history.md` 除外） | 小–中（纯文档 + 一处 `project()` 版本号） | P0-1（否则改动无法被自动验证） |
-| **P0-3 BatchNorm 禁止静默回落** | `make_norm_layer` 对 `NormType::BatchNorm` **显式报错**（`Result`/fail-fast）或真正实现 BatchNorm；二选一，不允许静默降级 | 构造 batchnorm 规格必须可观测地失败或给出正确层；`bench/doc_inventory.ps1` 无关项仍 0；新增一条断言测试 | 小（显式报错）–中大（真实现） | 无。**修复本身在本文范围外（本任务只登记路线图）** |
+| **P0-1 CI 真跑构建 + 测试**（最高优先） | workflow 加 `-DNN_ENABLE_TESTS=ON`，并在 Linux 与 Windows 各跑一轮 `ctest`（失败时输出完整失败日志） | GitHub Actions 绿且日志出现 23 个用例；需 Vulkan 的用例按退出码 77 记 skip 而非失败 | 小（改一个 `.yml`，约 10 行） | 无。**先于其它一切**——没有真门禁，后面所有验收都无法自动防回退 |
+| **P0-2 文档一致性回正** | ① ctest 计数统一为实测 23（20 目标 + `cnn_test_gpu` + `batchnorm_test_gpu` + `fusion_custom_layer_example`；2026-10-03 起）；② `CMakeLists.txt` 版本与 tag 对齐（或明确声明"以 tag 为准"）；③ 补 `docs/release-notes/v1.5.1.md`；④ 修 `README.md` 死链/mojibake/链式 API 声明/索引缺 13–17 | `bench/doc_align_audit.ps1` 的 [A][D][E][F] 可行动项为 0；开发文档中 ctest 计数的旧写法（ASCII 斜杠数字）零命中（历史归档 `docs/history.md` 除外） | 小–中（纯文档 + 一处 `project()` 版本号） | P0-1（否则改动无法被自动验证） |
+| **P0-3 BatchNorm 禁止静默回落** ✅ **已完成（2026-10-03，真实现路线）** | **已实施**：`compute_layer_mlp.hpp` 新增 `BatchNorm` 层（训练/推理双态、running 统计 EMA + `extra_state` 序列化、`forward_recompute` 抑制 EMA），`make_norm_layer` 真分支；`scan_exprs` 模型 pass 补推理态 fwd+bwd 覆盖（GPU 闭合世界）；新增断言测试 `batchnorm_test`（+`--gpu` 变体），ctest 21 → 23，scan 结构 84 → 91（库内口径；样例收集器 93） | 构造 batchnorm 规格给出真层（可观测、不再静默降级）；ctest 含 `batchnorm_test`；详见 `docs/history.md`「BatchNorm 落地」条 | 已完成 | 无 |
 | **P0-4 CMake install/export + CMakePresets** | 头文件库可被 `find_package(neuralnet.cpp)` 消费；`CMakePresets.json` 固化 Release/Debug/无 Vulkan 等常用配置 | 干净目录里执行安装步骤后，最小下游工程能编译并链接出一个 Layer 示例 | 小–中 | P0-1（preset 需进 CI 才不腐化） |
 | **P0-5 推理采样 top-k / top-p + 多轮对话闭环** | 采样器支持 top-k / top-p 截断与重复惩罚；`text_infer` 暴露对应开关；GUI GPT 推理 Tab 支持多轮上下文 | 同 prompt 在 top-k / top-p 下输出可复现（同 seed）；多轮对话示例可连续交互 N 轮不丢上下文 | 中 | 无。命名冲突提醒：`--topk` 属 `mnist_infer`（`src/mnist_infer.cpp:44`），`--top` 属 `tokenizer_infer`（`src/tokenizer_infer.cpp:46`）；`text_infer` 两者都没有，新开关命名不得与它们冲突 |
 
@@ -238,7 +238,7 @@ ZiPT 恢复、LRLA、CUDA、分布式。
 | 基线 | 口径 | 当前值 / 复现 |
 |---|---|---|
 | build | 全绿、零告警（`-Werror`） | `cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build` |
-| ctest | **实测 21**（19 目标 + `cnn_test_gpu` + `fusion_custom_layer_example`）；需 Vulkan 用例退出码 77 = skip | `ctest --test-dir build` |
+| ctest | **实测 23**（20 目标 + `cnn_test_gpu` + `batchnorm_test_gpu` + `fusion_custom_layer_example`）；需 Vulkan 用例退出码 77 = skip | `ctest --test-dir build` |
 | L2 分层审计 | `L2-VIOLATIONS: 0`（宿主桥用量只披露） | `pwsh -File bench/doc_inventory.ps1` 第 [4] 节（实测：virtual 49 / host_bridge 40） |
 | CPU 字节锚 | `--steps 20` hash = `6f8849f14da23110` | 逐位一致 |
 | GPU 字节锚 | dev2 hash = `8ef51b2927253c50` | 逐位一致（GPU 档位按 17 §6 容差规则） |
@@ -249,9 +249,9 @@ ZiPT 恢复、LRLA、CUDA、分布式。
 
 ### 8.2 本轮新增门禁（P0 后生效）
 
-1. **CI 必须执行 ctest**：日志需出现 21 个用例；77 = skip 不算失败（P0-1）。
-2. **开发文档不得出现 ctest 计数的旧写法**：统一写实测 21（P0-2）。
-3. **BatchNorm 行为门禁**：构造 batchnorm 规格必须有可观测结果（报错或正确层），不允许静默降级（P0-3）。
+1. **CI 必须执行 ctest**：日志需出现 23 个用例；77 = skip 不算失败（P0-1）。
+2. **开发文档不得出现 ctest 计数的旧写法**：统一写实测 23（P0-2）。
+3. **BatchNorm 行为门禁**：构造 batchnorm 规格必须有可观测结果（报错或正确层），不允许静默降级（P0-3）。**✅ 已满足（2026-10-03）**：真层 + `batchnorm_test` 工厂断言。
 4. **危险精度组合门禁**：危险组合必须启动期失败（P1-3）。
 5. **审计覆盖补强**：`bench/doc_align_audit.ps1` 的 [A] 需扩展到 markdown 链接目标（E8），或由 P0-2 直接修掉已知死链。
 

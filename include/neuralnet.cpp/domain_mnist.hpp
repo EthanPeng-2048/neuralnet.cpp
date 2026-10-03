@@ -134,8 +134,11 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
 // ── 构建 MNIST Transformer (ViT 风格) 模型 ──────────────────────────────────
 // 结构：PatchEmbedding → TransformerEncoder → Linear(分类头)
 //   PatchEmbedding: img 28×28 → 16 个 7×7 patch → Linear(49, d_model) 投影
-//   TransformerEncoder: PE + N×EncoderLayer + 全局平均池化
+//   TransformerEncoder: PE + N×EncoderLayer（块内 pre-norm，类型 = norm_type）
+//     + final norm（默认开，NormPlace::Final = 池化前的 ln_f）+ 全局平均池化
 //   Linear: d_model → 10（分类头）
+// norm_place：Final（默认，原版 ViT 的 ln_f）/ None（显式关闭 = 旧结构）；
+//   conv/head/both 属 CNN。旧模型文件缺 norm_place 键 → None → 不加。
 [[nodiscard]] inline Result<Model> build_mnist_transformer_model(
     ComputeEngine& engine,
     std::size_t img_size   = MNIST_IMG_SIZE,
@@ -144,7 +147,9 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
     std::size_t num_heads  = MNIST_TF_NUM_HEADS,
     std::size_t d_ff       = MNIST_TF_D_FF,
     std::size_t num_layers = MNIST_TF_NUM_LAYERS,
-    PrecisionProfile precision = PrecisionProfile{})
+    PrecisionProfile precision = PrecisionProfile{},
+    NormType norm_type   = NormType::LayerNorm,
+    NormPlace norm_place = NormPlace::Final)
 {
     if (img_size % patch_size != 0)
         return std::unexpected(Error{"MNIST Transformer: img_size must be divisible by patch_size"});
@@ -152,6 +157,9 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
         return std::unexpected(Error{"MNIST Transformer: parameters must be positive"});
     if (d_model % num_heads != 0)
         return std::unexpected(Error{"MNIST Transformer: d_model must be divisible by num_heads"});
+    if (norm_place != NormPlace::None && norm_place != NormPlace::Final)
+        return std::unexpected(Error{
+            "MNIST Transformer: norm_place must be none/final (conv/head/both are CNN-only)"});
 
     const std::size_t grid_size  = img_size / patch_size;
     const std::size_t num_patches = grid_size * grid_size;
@@ -163,7 +171,9 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
         if (!r) return std::unexpected(r.error());
     }
     {
-        auto r = model.add<TransformerEncoder>(d_model, num_heads, d_ff, num_layers, num_patches);
+        auto r = model.add<TransformerEncoder>(d_model, num_heads, d_ff, num_layers,
+                                               num_patches, norm_type,
+                                               norm_place == NormPlace::Final);
         if (!r) return std::unexpected(r.error());
     }
     {
@@ -175,12 +185,17 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
 
 // ── 构造 MNIST Transformer ModelSpec ───────────────────────────────────────
 // img_size 固定为 MNIST_IMG_SIZE（28×28），故不入参、不写入 spec。
+// norm_type/norm_place 描述归一化：类型（pre-norm 槽位）与 final norm 开关；
+// 默认 Final（原版 ViT = 块 pre-norm + 末端 ln_f，4 epoch A/B 实测优于无 final）。
+// 旧模型文件缺 norm_place 键 → spec 读回 None → 不加（旧布局逐位一致）。
 [[nodiscard]] inline ModelSpec make_mnist_transformer_spec(
     std::size_t patch_size = MNIST_PATCH_SIZE,
     std::size_t d_model    = MNIST_TF_D_MODEL,
     std::size_t num_heads  = MNIST_TF_NUM_HEADS,
     std::size_t d_ff       = MNIST_TF_D_FF,
-    std::size_t num_layers = MNIST_TF_NUM_LAYERS)
+    std::size_t num_layers = MNIST_TF_NUM_LAYERS,
+    NormType norm_type   = NormType::LayerNorm,
+    NormPlace norm_place = NormPlace::Final)
 {
     ModelSpec spec;
     spec.type       = ModelType::Transformer;
@@ -189,6 +204,8 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
     spec.d_ff       = d_ff;
     spec.num_layers = num_layers;
     spec.patch_size = patch_size;
+    spec.norm_type  = norm_type;
+    spec.norm_place = norm_place;
     // vocab_size / seq_len 不用于 Transformer (MNIST ViT)
     return spec;
 }
@@ -213,7 +230,8 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
         const std::size_t patch_size = spec.patch_size != 0 ? spec.patch_size : MNIST_PATCH_SIZE;
         auto model = build_mnist_transformer_model(
             engine, MNIST_IMG_SIZE, patch_size,
-            spec.d_model, spec.num_heads, spec.d_ff, spec.num_layers, precision);
+            spec.d_model, spec.num_heads, spec.d_ff, spec.num_layers, precision,
+            spec.norm_type, spec.norm_place);
         if (model)
             model->set_spec(spec);  // 记录架构规格，供 load_model 校验
         return model;

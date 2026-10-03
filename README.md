@@ -227,9 +227,11 @@ python gui.py
 
 支持三种模型架构（通过 `--arch mlp|transformer|cnn` 切换，实现见 `domain_mnist.hpp`）；下面详述 MLP 与 Transformer（CNN 见 `--cnn-*` 系列参数）：
 
+归一化分两维，两者默认 **`auto`（= 按架构取最合适，4 epoch A/B 实测，见 `docs/history.md`）**：**类型** `--norm auto|layernorm|rmsnorm|batchnorm`（auto：MLP/ViT = layernorm、CNN = batchnorm）与**挂载位置** `--norm-place auto|none|conv|head|both|final`（auto：CNN = `conv`、ViT = `final`；`conv`/`head`/`both` 属 CNN、`final` 属 ViT；MLP 的挂载位置由结构固定，只接受 `none`/`auto`）。**旧模型文件没有 `norm_place` 键 → 读回 `none`**：参数布局与旧实现逐位一致，旧 checkpoint 仍可加载。
+
 ### MLP（默认）
 
-归一化层可通过 `--norm layernorm|rmsnorm|batchnorm` 切换（默认 LayerNorm）：
+归一化层可通过 `--norm` 切换（`auto` → MLP 默认 LayerNorm）：
 
 ```
 输入 (784)
@@ -243,7 +245,7 @@ python gui.py
 
 - `LayerNorm`：按特征维归一化（GPT-2 风格，默认）
 - `RMSNorm`：无均值、更轻量（LLaMA 风格）
-- `BatchNorm`：按 batch 维归一化，训练时更新 running 统计、推理时使用（MLP 专用）
+- `BatchNorm`：按 batch 维归一化，训练时更新 running 统计、推理时使用
 
 ### Transformer（ViT-like）
 
@@ -254,6 +256,7 @@ python gui.py
     ├── MultiHeadAttention(d_model=64, heads=4)
     ├── LayerNorm + FeedForward(d_model=64 → d_ff=128 → 64)
     └── 残差连接 + 位置编码
+→ [--norm-place final] 归一化（默认开：编码器末端的 final norm，池化之前）
 → 池化 (seq_len → 1)
 → Linear(64 → 10)
 → CrossEntropy Loss (含 Softmax)

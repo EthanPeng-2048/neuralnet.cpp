@@ -778,12 +778,379 @@ public:
     }
 };
 
-// ── 归一化层工厂：按 NormType 创建 LayerNorm 或 RMSNorm ──────────────────
+// ══════════════════════════════════════════════════════════════════════════
+// BatchNorm — 批归一化（沿 batch 维；NormType::BatchNorm，MLP/CNN/ViT 三路径接入）
+//
+// 训练/推理双态（`set_training` 切换；`Model::set_training` 逐层转发）：
+//   训练态：用当前 batch 的统计量归一化，并以 EMA 更新 running 统计；
+//   推理态：用 running 统计量归一化（batch=1 也安全）。
+// running_mean/running_var 是**非可学习状态**：经 `extra_state()` 序列化、
+// 不进 `parameters()`（优化器不碰它们）。
+//
+// 口径说明（与 PyTorch 的差异）：running_var 的 EMA 用**有偏**方差（1/B）
+// ——归一化与统计更新同口径，B=1 无除零，结果确定（铁律 #8）。
+// momentum_ = 新 batch 的权重（PyTorch 同口径，默认 0.1）。
+//
+// 算法（只在此处，不在 Engine/Shader；归约方向 = 沿 batch，与 LayerNorm
+// 的沿特征方向互为翻转，其余公式同形）：
+//   训练态 forward:
+//     mean      = (1/B) Σ_b x[f][b]        (row_reduce_sum + 缩放)
+//     diff      = x - mean                  (row 广播 Sub)
+//     var       = (1/B) Σ_b diff²           (row_reduce_sum + 缩放)
+//     std_inv   = 1/√(var + ε)              (rsqrt)
+//     normalized= diff * std_inv            (row 广播 Mul)
+//     out       = γ⊙normalized + β          (row 广播 Mul/Add)
+//     running_mean ← (1-m)·running_mean + m·mean        (EMA)
+//     running_var  ← (1-m)·running_var  + m·var         (EMA)
+//   推理态 forward:
+//     inv_std   = 1/√(running_var + ε)      (rsqrt)
+//     normalized= (x - running_mean)·inv_std
+//     out       = γ⊙normalized + β
+//   backward（训练态；均值/归约全部沿 batch 维）:
+//     gy         = grad_out * γ
+//     mean_g     = (1/B) Σ_b gy
+//     mean_gn    = (1/B) Σ_b gy⊙normalized
+//     grad_x     = (gy - mean_g - normalized·mean_gn) * std_inv
+//     grad_gamma += Σ_b grad_out⊙normalized   (row_reduce_sum)
+//     grad_beta  += Σ_b grad_out               (row_reduce_sum)
+//   backward（推理态；前向对 x 逐元素、跨 b 无耦合，故无均值修正项）:
+//     grad_x     = grad_out * γ * inv_std     （γ/β 归约项与训练态同形）
+//
+// 接入范围：MNIST MLP（`mnist_train --norm batchnorm` / gui.py）、CNN（`--norm-place
+//     conv/head/both`，层是 Model 直接子层）、ViT（pre-norm 槽位与 `--norm-place final`；
+//     `TransformerEncoder{,Layer}` 已逐级转发 set_training）。
+// GPT/RAPT 复合层不转发 set_training、text CLI 也不提供该选项；
+// 梯度检查点场景由 forward_recompute 抑制 running 统计的重复 EMA。
+// ══════════════════════════════════════════════════════════════════════════
+class BatchNorm final : public Layer
+{
+private:
+    std::size_t features_;
+    Scalar epsilon_;
+    Scalar momentum_;              // EMA 的新 batch 权重（默认 0.1）
+    bool training_ = true;         // 训练/推理双态（set_training 切换）
+    bool stat_update_suppress_ = false;  // forward_recompute 重算时抑制 EMA
+
+    // 可学习参数
+    Tensor gamma_;      // (features, 1)
+    Tensor beta_;       // (features, 1)
+    Tensor grad_gamma_;
+    Tensor grad_beta_;
+
+    // 非可学习状态（extra_state → 序列化；初值 mean=0 / var=1）
+    Tensor running_mean_;   // (features, 1)
+    Tensor running_var_;    // (features, 1)
+
+    // backward 缓存
+    Tensor normalized_cache_;  // (features, batch)
+    Tensor std_cache_;         // (features, 1) — 训练态 std_inv / 推理态 inv_std
+
+    static constexpr Scalar EPSILON = 1e-5;
+    static constexpr Scalar MOMENTUM = 0.1f;
+
+public:
+    explicit BatchNorm(std::size_t features, Scalar epsilon = EPSILON,
+                       Scalar momentum = MOMENTUM)
+        : features_(features), epsilon_(epsilon), momentum_(momentum) {}
+
+    [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
+    {
+        // γ=1、β=0（同 LayerNorm）；running 统计 mean=0、var=1（初值下
+        // 推理态 = 恒等缩放，可直接训练早期评估）——M2 声明式：引擎填数。
+        gamma_ = engine.create_tensor(features_, 1, p_.param, InitSpec::constant(1));
+        beta_ = engine.create_tensor(features_, 1, p_.param, InitSpec::zero());
+        if (!gamma_.valid() || !beta_.valid())
+            return std::unexpected(Error{"BatchNorm: 参数初始化失败"});
+
+        grad_gamma_ = engine.create_tensor(features_, 1, p_.param, InitSpec::zero());
+        grad_beta_ = engine.create_tensor(features_, 1, p_.param, InitSpec::zero());
+        if (!grad_gamma_.valid() || !grad_beta_.valid())
+            return std::unexpected(Error{"BatchNorm: 梯度缓冲初始化失败"});
+
+        running_mean_ = engine.create_tensor(features_, 1, p_.stable, InitSpec::zero());
+        running_var_ = engine.create_tensor(features_, 1, p_.stable,
+                                             InitSpec::constant(1));
+        if (!running_mean_.valid() || !running_var_.valid())
+            return std::unexpected(Error{"BatchNorm: running 统计初始化失败"});
+        return {};
+    }
+
+    [[nodiscard]] std::vector<TensorRef> parameters() override
+    {
+        return {gamma_, beta_};
+    }
+
+    [[nodiscard]] std::vector<TensorRef> param_gradients() override
+    {
+        return {grad_gamma_, grad_beta_};
+    }
+
+    // 非可学习状态：running 统计（不进 parameters → 优化器不更新）
+    [[nodiscard]] std::vector<TensorRef> extra_state() override
+    {
+        std::vector<TensorRef> r;
+        if (running_mean_.valid()) r.emplace_back(running_mean_);
+        if (running_var_.valid())  r.emplace_back(running_var_);
+        return r;
+    }
+
+    // 训练/推理双态切换（Model::set_training → 本层）
+    void set_training(bool training) override { training_ = training; }
+
+    void clear_cache() override
+    {
+        normalized_cache_ = Tensor{};
+        std_cache_ = Tensor{};
+    }
+
+    std::vector<TensorRef> activation_cache() override
+    {
+        std::vector<TensorRef> r;
+        if (normalized_cache_.valid()) r.emplace_back(normalized_cache_);
+        if (std_cache_.valid()) r.emplace_back(std_cache_);
+        return r;
+    }
+
+    // ── forward ───────────────────────────────────────────────────────────
+    // 训练态（步骤与 LayerNorm 一一对应，归约/广播方向沿 batch）：
+    //   1. mean_raw = row_reduce_sum(x)                     → (F,1)
+    //   2. mean     = mean_raw*(1/B)                        → (F,1)
+    //   3. diff     = x - mean (row 广播)                   → (F,B)
+    //   4. var_raw  = row_reduce_sum(diff²)                 → (F,1)
+    //   5. std_inv  = rsqrt(var_raw*(1/B) + ε)              → (F,1)
+    //   6. normalized = diff * std_inv (row 广播)           → (F,B)
+    //   7. running 统计 EMA（compute_into 原地；recompute 抑制）
+    //   8. out      = normalized*γ + β (row 广播)           → (F,B)
+    //（1/B、ε、momentum 都是 RParam：值不进 expr_spec_key）
+    // 推理态：inv_std + 归一化 + 出参三步，无归约链（不同结构，scan 必须
+    // 单独覆盖——见 tools/scan_exprs.cpp 模型 pass 的推理态 run）。
+    [[nodiscard]] Result<Tensor> forward(
+        const Tensor& input) override
+    {
+        ComputeEngine& engine = engine_ref();
+        if (input.rows() != features_)
+            return std::unexpected(Error{"batchnorm forward: input shape mismatch"});
+
+        const std::size_t F = features_;
+        const std::size_t B = input.cols();
+
+        // ── 推理态：用 running 统计（batch=1 安全）──
+        if (!training_)
+        {
+            // 1. inv_std = rsqrt(running_var + ε) → (F,1)
+            auto inv_std = dsl::compute(engine,
+                dsl::rsqrt(dsl::leaf(running_var_) + dsl::rparam(epsilon_)),
+                F, 1, p_.stable);
+            NN_TRY_CHECK(inv_std);
+            Tensor inv_std_t = std::move(*inv_std);
+            if (!checkpoint_mode_)
+                std_cache_ = inv_std_t;
+
+            // 2. normalized = (x - running_mean) * inv_std → (F,B)
+            auto normalized = dsl::compute(engine,
+                (dsl::leaf(input) - dsl::row_broadcast(running_mean_))
+                * dsl::row_broadcast(inv_std_t), F, B, p_.stable);
+            NN_TRY_CHECK(normalized);
+            Tensor normalized_t = std::move(*normalized);
+            if (!checkpoint_mode_)
+                normalized_cache_ = normalized_t;
+
+            // 3. out = normalized*γ + β（与训练态同构，共享融合结构）
+            return dsl::compute(engine,
+                dsl::leaf(normalized_t) * dsl::row_broadcast(gamma_)
+                + dsl::row_broadcast(beta_),
+                F, B, p_.stable);
+        }
+
+        // ── 训练态 ──
+        const Scalar inv_batch = Scalar{1} / static_cast<Scalar>(B);
+
+        // 1. mean_raw = row_reduce_sum(x) → (F,1)
+        auto mean_raw = dsl::compute_reduce(engine,
+            dsl::row_reduce_sum(dsl::leaf(input)), F, B, p_.stable);
+        NN_TRY_CHECK(mean_raw);
+
+        // 2. mean = mean_raw*(1/B) → (F,1)
+        auto mean = dsl::compute(engine,
+            dsl::leaf(*mean_raw) * dsl::rparam(inv_batch),
+            mean_raw->rows(), mean_raw->cols(), p_.stable);
+        NN_TRY_CHECK(mean);
+
+        // 3. diff = x - mean (row 广播) → (F,B)
+        auto diff = dsl::compute(engine,
+            dsl::leaf(input) - dsl::row_broadcast(*mean), F, B, p_.stable);
+        NN_TRY_CHECK(diff);
+
+        // 4. var_raw = row_reduce_sum(diff²) → (F,1)
+        auto var_raw = dsl::compute_reduce(engine,
+            dsl::row_reduce_sum(dsl::leaf(*diff) * dsl::leaf(*diff)),
+            F, B, p_.stable);
+        NN_TRY_CHECK(var_raw);
+
+        // 5. std_inv = rsqrt(var_raw*(1/B) + ε) → (F,1)
+        auto std_inv = dsl::compute(engine,
+            dsl::rsqrt(dsl::leaf(*var_raw) * dsl::rparam(inv_batch)
+                       + dsl::rparam(epsilon_)),
+            var_raw->rows(), var_raw->cols(), p_.stable);
+        NN_TRY_CHECK(std_inv);
+        Tensor std_inv_t = std::move(*std_inv);
+        if (!checkpoint_mode_)
+            std_cache_ = std_inv_t;
+
+        // 6. normalized = diff * std_inv (row 广播) → (F,B)
+        auto normalized = dsl::compute(engine,
+            dsl::leaf(*diff) * dsl::row_broadcast(std_inv_t), F, B, p_.stable);
+        NN_TRY_CHECK(normalized);
+        Tensor normalized_t = std::move(*normalized);
+        if (!checkpoint_mode_)
+            normalized_cache_ = normalized_t;
+
+        // 7. running 统计 EMA（原地 compute_into；推理态无此步，
+        //    forward_recompute 重算时抑制——否则检查点场景会双倍更新）
+        if (!stat_update_suppress_)
+        {
+            auto ema_m = dsl::compute_into(engine,
+                dsl::leaf(running_mean_) * dsl::rparam(1 - momentum_)
+                + dsl::leaf(*mean) * dsl::rparam(momentum_),
+                running_mean_);
+            NN_TRY_CHECK(ema_m);
+            // 有偏 var（1/B 口径）直接以 var_raw*(1/B·m) 进 EMA，省一次分配
+            auto ema_v = dsl::compute_into(engine,
+                dsl::leaf(running_var_) * dsl::rparam(1 - momentum_)
+                + dsl::leaf(*var_raw) * dsl::rparam(inv_batch * momentum_),
+                running_var_);
+            NN_TRY_CHECK(ema_v);
+        }
+
+        // 8. out = normalized*γ + β → (F,B)
+        return dsl::compute(engine,
+            dsl::leaf(normalized_t) * dsl::row_broadcast(gamma_)
+            + dsl::row_broadcast(beta_),
+            F, B, p_.stable);
+    }
+
+    // ── backward ──────────────────────────────────────────────────────────
+    // 训练态：与 LayerNorm backward 同形（归约方向翻转为 batch、1/F → 1/B）；
+    // 推理态：前向对 x 逐元素（无跨 b 耦合）→ grad_x 无均值修正项。
+    // γ/β 归约项两种模式同构（normalized_cache_ 语义一致）。
+    [[nodiscard]] Result<Tensor> backward(
+        const Tensor& grad_output) override
+    {
+        ComputeEngine& engine = engine_ref();
+        if (!normalized_cache_.valid() || !std_cache_.valid())
+            return std::unexpected(Error{
+                "batchnorm backward: 缺少 forward 缓存（先调 forward）"});
+
+        const std::size_t F = features_;
+        const std::size_t B = grad_output.cols();
+        const Scalar inv_batch = Scalar{1} / static_cast<Scalar>(B);
+
+        // ── 推理态：grad_x = gy * γ * inv_std ──
+        if (!training_)
+        {
+            auto grad_x = dsl::compute(engine,
+                dsl::leaf(grad_output) * dsl::row_broadcast(gamma_)
+                * dsl::row_broadcast(std_cache_),
+                F, B, p_.stable);
+            NN_TRY_CHECK(grad_x);
+            NN_TRY(grad_gamma_acc, accumulate_gamma_(engine, grad_output));
+            NN_TRY(grad_beta_acc, accumulate_beta_(engine, grad_output));
+            return grad_x;
+        }
+
+        // ── 训练态 ──
+        // 1. mean_g_raw = row_reduce_sum(gy) → (F,1)
+        auto mg_raw = dsl::compute_reduce(engine,
+            dsl::row_reduce_sum(
+                dsl::leaf(grad_output) * dsl::row_broadcast(gamma_)),
+            F, B, p_.stable);
+        NN_TRY_CHECK(mg_raw);
+        auto mean_g = dsl::compute(engine,
+            dsl::leaf(*mg_raw) * dsl::rparam(inv_batch),
+            mg_raw->rows(), mg_raw->cols(), p_.stable);
+        NN_TRY_CHECK(mean_g);
+
+        // 2. mean_gn_raw = row_reduce_sum(gy ⊙ normalized) → (F,1)
+        auto mgn_raw = dsl::compute_reduce(engine,
+            dsl::row_reduce_sum(
+                dsl::leaf(grad_output) * dsl::row_broadcast(gamma_)
+                * dsl::leaf(normalized_cache_)),
+            F, B, p_.stable);
+        NN_TRY_CHECK(mgn_raw);
+        auto mean_gn = dsl::compute(engine,
+            dsl::leaf(*mgn_raw) * dsl::rparam(inv_batch),
+            mgn_raw->rows(), mgn_raw->cols(), p_.stable);
+        NN_TRY_CHECK(mean_gn);
+
+        // 3. grad_x = (gy - mean_g - normalized*mean_gn) * std_inv → (F,B)
+        auto grad_x = dsl::compute(engine,
+            (dsl::leaf(grad_output) * dsl::row_broadcast(gamma_)
+             - dsl::row_broadcast(*mean_g)
+             - dsl::leaf(normalized_cache_) * dsl::row_broadcast(*mean_gn))
+            * dsl::row_broadcast(std_cache_),
+            F, B, p_.stable);
+        NN_TRY_CHECK(grad_x);
+
+        // 4. grad_gamma += row_reduce_sum(grad_out ⊙ normalized) → (F,1)
+        // 5. grad_beta  += row_reduce_sum(grad_out)             → (F,1)
+        NN_TRY(grad_gamma_acc, accumulate_gamma_(engine, grad_output));
+        NN_TRY(grad_beta_acc, accumulate_beta_(engine, grad_output));
+
+        return grad_x;
+    }
+
+    // 梯度检查点重算：重建缓存，但**不**重复更新 running 统计
+    //（原 forward 已在真实前向里更新过一次）。
+    [[nodiscard]] Result<Tensor> forward_recompute(const Tensor& saved_input) override
+    {
+        const bool prev_ckpt = checkpoint_mode_;
+        const bool prev_sup  = stat_update_suppress_;
+        checkpoint_mode_ = false;
+        stat_update_suppress_ = true;
+        auto r = forward(saved_input);
+        checkpoint_mode_ = prev_ckpt;
+        stat_update_suppress_ = prev_sup;
+        return r;
+    }
+
+private:
+    // grad_gamma += row_reduce_sum(grad_out ⊙ normalized)（训练/推理态共用）
+    [[nodiscard]] Result<void> accumulate_gamma_(
+        ComputeEngine& engine, const Tensor& grad_output)
+    {
+        const std::size_t F = features_;
+        const std::size_t B = grad_output.cols();
+        auto gg = dsl::compute_reduce(engine,
+            dsl::row_reduce_sum(
+                dsl::leaf(grad_output) * dsl::leaf(normalized_cache_)),
+            F, B, p_.stable);
+        NN_TRY_CHECK(gg);
+        return dsl::compute_into(engine,
+            dsl::leaf(grad_gamma_) + dsl::leaf(*gg), grad_gamma_);
+    }
+
+    // grad_beta += row_reduce_sum(grad_out)（训练/推理态共用）
+    [[nodiscard]] Result<void> accumulate_beta_(
+        ComputeEngine& engine, const Tensor& grad_output)
+    {
+        const std::size_t F = features_;
+        const std::size_t B = grad_output.cols();
+        auto gb = dsl::compute_reduce(engine,
+            dsl::row_reduce_sum(dsl::leaf(grad_output)), F, B, p_.stable);
+        NN_TRY_CHECK(gb);
+        return dsl::compute_into(engine,
+            dsl::leaf(grad_beta_) + dsl::leaf(*gb), grad_beta_);
+    }
+};
+
+// ── 归一化层工厂：按 NormType 创建 LayerNorm / RMSNorm / BatchNorm ────────
 [[nodiscard]] inline std::unique_ptr<Layer> make_norm_layer(
     std::size_t d_model, NormType norm_type)
 {
     if (norm_type == NormType::RMSNorm)
         return std::make_unique<RMSNorm>(d_model);
+    if (norm_type == NormType::BatchNorm)
+        return std::make_unique<BatchNorm>(d_model);
     return std::make_unique<LayerNorm>(d_model);
 }
 } // namespace nn
