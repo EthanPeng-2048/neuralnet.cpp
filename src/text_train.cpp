@@ -170,6 +170,36 @@ void parallel_tokenize(
     }
 }
 
+// ── assistant 段标记（--loss-scope assistant）────────────────────────────
+// 扫描 token 流，把 <|assistant|>…<|end_of_assistant|> 段（含首尾标记）标为 1，
+// 并返回被标记的 token 数。对话 SFT 时仅这些位置作为预测目标参与 loss——
+// system/user 轮只作条件不作监督（标准 SFT 惯例）；含首标记 ⇒ 能学会
+// <|end_of_user|> 后输出 <|assistant|>，含尾标记 ⇒ 能学会收尾。
+// 行边界（doc_id 变化）重置段状态：残缺未闭合的标记不会把后续文档整篇
+// 误标为 assistant（doc_ids 为空时不重置）。
+[[nodiscard]] std::vector<unsigned char> mark_assistant_spans(
+    const std::vector<std::size_t>& flow,
+    const std::vector<std::size_t>& doc_ids,
+    std::size_t asst_begin,
+    std::size_t asst_end,
+    std::size_t& asst_count)
+{
+    std::vector<unsigned char> mask(flow.size(), 0);
+    bool in_asst = false;
+    asst_count = 0;
+    for (std::size_t i = 0; i < flow.size(); ++i)
+    {
+        if (!doc_ids.empty() && i > 0 && doc_ids[i] != doc_ids[i - 1])
+            in_asst = false;
+        const std::size_t id = flow[i];
+        if (id == asst_begin) in_asst = true;
+        mask[i] = in_asst ? 1u : 0u;
+        if (mask[i]) ++asst_count;
+        if (id == asst_end) in_asst = false;
+    }
+    return mask;
+}
+
 // ── Tokenize 二进制缓存 ─────────────────────────────────────
 static constexpr char TOKCACHE_MAGIC[4] = {'T','K','C','H'};
 static constexpr std::uint32_t TOKCACHE_VERSION = 2;
@@ -269,11 +299,15 @@ void print_usage(const char *prog)
     help.opt("--accum-steps <n>", "梯度累积步数 (默认: 1)\n每 n 步 forward/backward 累加梯度后再更新参数，等效放大 batch_size×n");
     help.opt("--seq-len <n>", "序列长度 (默认: 256)");
     help.opt("--stride <n>", "滑动窗口步长 (默认: 等于 --seq-len，即不重叠)\n设小可产生重叠窗口，增加训练样本数");
+    help.opt("--loss-scope <scope>", "loss 计算范围: all / assistant (默认: all)\nall: 全部有效 token 参与 loss (预训练)\nassistant: 仅 <|assistant|>…<|end_of_assistant|> 段参与 (对话 SFT；语料须含对话标记)");
     help.opt("--optimizer <name>", "优化器: sgd/sgd_momentum/adam/adamw/muon (默认: adam)");
     help.opt("--weight-decay <w>", "AdamW 权重衰减系数 (默认: 0.01)");
+    help.opt("--beta1 <b>", "Adam/AdamW 一阶动量衰减 β1 (默认: 0.9，sgd/muon 忽略)");
+    help.opt("--beta2 <b>", "Adam/AdamW 二阶动量衰减 β2 (默认: 0.999，sgd/muon 忽略)\nLLM 预训练惯例常取 0.95 (GPT-3/LLaMA 配方)");
     help.opt("--max-norm <f>", "梯度裁剪最大全局 L2 范数 (默认: 0=不裁剪)");
     help.opt("--log-interval <n>", "每隔多少 step 显示进度 (默认: 50)");
     help.opt("--save-interval <n>", "每隔多少 step 保存 checkpoint (默认: 100)");
+    help.opt("--max-steps <n>", "本次运行最多训练多少 step 后停止并保存 (默认: 0=不限)\n按本进程执行的步数计，可与 --resume 组合分段跑；用于吞吐实测/分段训练");
     help.opt("--grad-log", "显示梯度统计 (范数/最大值/均值)");
     help.opt("--no-cache", "禁用 tokenize 缓存 (默认自动缓存到 .tokcache 文件)");
     help.opt("--gpu [索引|名称]", "启用 GPU 加速 (需要 Vulkan SDK)\n空格形式只收枚举索引；名称子串用 --gpu=<名称>，如 --gpu=NVIDIA / --gpu=40HX");
@@ -338,6 +372,10 @@ struct TrainConfig
     std::string model_type = "gpt";   // gpt / rapt（zipt 已于 2026-10-01 移除）
     std::size_t log_interval = 50;
     std::size_t save_interval = 100;  // checkpoint 保存间隔（独立于 log_interval）
+    std::size_t max_steps = 0;        // 本进程最多训练步数（0 = 不限，按 epoch 跑完）
+    Scalar beta1 = 0.9f;              // Adam/AdamW 一阶动量衰减（sgd/muon 忽略）
+    Scalar beta2 = 0.999f;            // Adam/AdamW 二阶动量衰减（LLM 预训练常取 0.95）
+    std::string loss_scope = "all";   // loss 范围: all / assistant（对话 SFT 仅 assistant 段）
     bool load_existing = false;
     bool gpu_enabled = false;
     std::string gpu_device;         // --gpu 的可选设备选择子（空 = 自动选卡）
@@ -444,6 +482,16 @@ TrainConfig parse_args(int argc, char *argv[])
             if (!v) { std::cerr << "无效 --stride: " << v.error().message << "\n"; std::exit(1); }
             cfg.stride = *v;
         }
+        else if (arg == "--loss-scope" && i + 1 < argc)
+        {
+            cfg.loss_scope = argv[++i];
+            if (cfg.loss_scope != "all" && cfg.loss_scope != "assistant")
+            {
+                std::cerr << "未知 --loss-scope: " << cfg.loss_scope
+                          << "，可选: all, assistant\n";
+                std::exit(1);
+            }
+        }
         else if (arg == "--optimizer" && i + 1 < argc)
         {
             cfg.optimizer_name = argv[++i];
@@ -461,6 +509,18 @@ TrainConfig parse_args(int argc, char *argv[])
             auto v = nn::parse_number<Scalar>(argv[++i]);
             if (!v) { std::cerr << "无效 --weight-decay: " << v.error().message << "\n"; std::exit(1); }
             cfg.weight_decay = *v;
+        }
+        else if (arg == "--beta1" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<Scalar>(argv[++i]);
+            if (!v || *v <= 0 || *v >= 1) { std::cerr << "--beta1 须在 (0, 1) 区间内\n"; std::exit(1); }
+            cfg.beta1 = *v;
+        }
+        else if (arg == "--beta2" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<Scalar>(argv[++i]);
+            if (!v || *v <= 0 || *v >= 1) { std::cerr << "--beta2 须在 (0, 1) 区间内\n"; std::exit(1); }
+            cfg.beta2 = *v;
         }
         else if (arg == "--d-model" && i + 1 < argc)
         {
@@ -510,6 +570,12 @@ TrainConfig parse_args(int argc, char *argv[])
             auto v = nn::parse_number<std::size_t>(argv[++i]);
             if (!v) { std::cerr << "无效 --save-interval: " << v.error().message << "\n"; std::exit(1); }
             cfg.save_interval = *v;  // 0 = 禁用保存（下方 % 前有 >0 保护）
+        }
+        else if (arg == "--max-steps" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<std::size_t>(argv[++i]);
+            if (!v) { std::cerr << "无效 --max-steps: " << v.error().message << "\n"; std::exit(1); }
+            cfg.max_steps = *v;  // 0 = 不限步数
         }
         else if (auto gpu_dev = nn::cli::parse_gpu_option(argc, argv, i))
         {
@@ -818,6 +884,31 @@ int main(int argc, char *argv[])
         std::cout << "文档感知掩码已启用（每行 = 一篇文档，"
                   << flow_doc_ids.back() << " 篇文档）\n";
 
+    // ── assistant 段标记（--loss-scope assistant）────────────────────────
+    // 仅 assistant 段内的预测目标参与 loss（对话 SFT；语料须含对话标记）。
+    std::vector<unsigned char> flow_assistant;   // 非空 ⇔ loss_scope == assistant
+    if (cfg.loss_scope == "assistant")
+    {
+        if (!tokenizer->has_dialogue_markers())
+        {
+            std::cerr << "--loss-scope assistant 需要带对话标记的词表（<|assistant|> 等）\n";
+            return 1;
+        }
+        std::size_t asst_tokens = 0;
+        flow_assistant = mark_assistant_spans(token_flow, flow_doc_ids,
+                                              tokenizer->assistant_marker_id(),
+                                              tokenizer->end_assistant_marker_id(),
+                                              asst_tokens);
+        if (asst_tokens == 0)
+        {
+            std::cerr << "--loss-scope assistant: 语料中未找到 <|assistant|> 段\n"
+                      << "（数据须为对话格式: …<|end_of_user|><|assistant|>…<|end_of_assistant|>）\n";
+            return 1;
+        }
+        std::cout << "assistant loss 掩码已启用（" << asst_tokens << " / "
+                  << token_flow.size() << " tokens 作为预测目标参与 loss）\n";
+    }
+
     // 切窗口：每个窗口 = 一个训练样本（长度 seq_len，末窗不足则 PAD）。
     // 保留全部窗口（含跨文档）；文档感知掩码在单 fold 融合 kernel 内生效
     // （fold body 逐块 select 屏蔽，不物化 (BH·seq,seq)），无需再丢弃跨文档窗口。
@@ -848,6 +939,15 @@ int main(int argc, char *argv[])
         std::cout << "  位置编码: RoPE（RLA 强制，施加在 ReLU 之前）\n";
     }
     std::cout << "  优化器: " << cfg.optimizer_name << "  学习率: " << cfg.lr << "\n";
+    if (cfg.optimizer_name == "adam" || cfg.optimizer_name == "adamw")
+    {
+        // 前面的计时打印固定过 precision(1)，这里恢复足够位数（0.95 才不会印成 0.9）
+        std::cout << std::defaultfloat << std::setprecision(6)
+                  << "  Adam β1/β2: " << cfg.beta1 << " / " << cfg.beta2 << "\n";
+    }
+    std::cout << "  loss 范围: " << cfg.loss_scope << "\n";
+    if (cfg.max_steps > 0)
+        std::cout << "  最大步数: " << cfg.max_steps << "\n";
     std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
     std::cout << "  GPU: " << (cfg.gpu_enabled ? "启用" : "禁用") << "\n";
     std::cout << "  梯度日志: " << (cfg.grad_log ? "启用" : "禁用") << "\n";
@@ -1072,7 +1172,7 @@ int main(int argc, char *argv[])
     auto optimizer = nn::create_optimizer(
         cfg.optimizer_name, *engine,
         model.parameters(), model.param_gradients(), cfg.lr,
-        cfg.weight_decay, cfg.precision);
+        cfg.weight_decay, cfg.precision, cfg.beta1, cfg.beta2);
     if (!optimizer)
     {
         std::cerr << "错误：未知优化器名称: " << cfg.optimizer_name << "\n";
@@ -1109,6 +1209,7 @@ int main(int argc, char *argv[])
     std::vector<std::size_t> test_window_offsets;
     std::vector<std::size_t> test_flow;
     std::vector<std::size_t> test_flow_doc_ids;
+    std::vector<unsigned char> test_flow_assistant;  // --loss-scope assistant 时与 test_flow 等长
     if (!cfg.test_path.empty())
     {
         std::error_code ec_test, ec_vocab2;
@@ -1139,6 +1240,24 @@ int main(int argc, char *argv[])
             if (!cfg.no_cache && !ec_test && !ec_vocab2)
                 save_tokenize_cache(test_cache_path, test_fsize, vocab_fsize2,
                                     test_flow, test_flow_doc_ids);
+        }
+
+        // assistant 段标记：与训练端同一口径（test loss 与 train loss 可比）
+        if (cfg.loss_scope == "assistant")
+        {
+            std::size_t t_asst = 0;
+            test_flow_assistant = mark_assistant_spans(test_flow, test_flow_doc_ids,
+                                                       tokenizer->assistant_marker_id(),
+                                                       tokenizer->end_assistant_marker_id(),
+                                                       t_asst);
+            if (t_asst == 0)
+            {
+                std::cerr << "--loss-scope assistant: 测试集中未找到 <|assistant|> 段\n"
+                          << "（测试集须与训练集同为对话格式，否则 test loss 无意义）\n";
+                return 1;
+            }
+            std::cout << "测试集 assistant 掩码: " << t_asst << " / "
+                      << test_flow.size() << " tokens 参与评估\n";
         }
 
         // 测试窗口：保留全部窗口（与训练一致，含跨文档；文档感知掩码 kernel 内生效）
@@ -1193,6 +1312,10 @@ int main(int argc, char *argv[])
     std::vector<std::size_t> flat_targets(eff_seq * cfg.batch_size);
 
     auto t_start = std::chrono::steady_clock::now();
+
+    // --max-steps：按本进程执行的步数计数（与 --resume 组合可分段跑）
+    std::size_t steps_executed = 0;
+    bool stop_training = false;
 
     for (int epoch = cfg.start_epoch; epoch < cfg.epochs; ++epoch)
     {
@@ -1295,6 +1418,12 @@ int main(int argc, char *argv[])
                 }
             }
 
+            // ── --max-steps：达到上限的那一步为最后一步，同时强制完成一次
+            // 参数更新（把梯度累积中未满的累积刷进参数，不丢半截累积）──
+            const bool is_final_step =
+                (cfg.max_steps > 0) && (steps_executed + 1 >= cfg.max_steps);
+            ++steps_executed;
+
             // ── 采样 batch：每样本 = 一个滑动窗口 ─────────────
             // 按 shuffle 后的顺序切片取 this_bs 个窗口（末批可能不满）。
             // 每 epoch 每样本恰好访问一次。
@@ -1323,9 +1452,11 @@ int main(int argc, char *argv[])
                     const std::size_t y_id = (t + 1 < win_len) ? token_flow[win_pos + t + 1] : pad_id;
                     x_tokens.set_value_unchecked(t, b, static_cast<Scalar>(x_id));
                     y_tokens.set_value_unchecked(t, b, static_cast<Scalar>(y_id));
-                    const bool participate = (t + 1 < win_len);
+                    // 仅真实位置（非 padding）参与 loss；
+                    // --loss-scope assistant 时还要是 assistant 段内的预测目标
+                    const bool participate = (t + 1 < win_len) &&
+                        (flow_assistant.empty() || flow_assistant[win_pos + t + 1]);
                     loss_mask.set_value_unchecked(t, b, participate ? 1.0f : 0.0f);
-                    // 仅真实位置（非 padding）参与 loss
                     if (participate) ++step_valid;
                 }
             }
@@ -1520,7 +1651,8 @@ int main(int argc, char *argv[])
             // 梯度裁剪/step/zero_grad 仅在累积到 accum_steps 或 epoch 末尾执行。
             ++steps_since_update;
             const bool do_update =
-                (steps_since_update >= cfg.accum_steps) || (step + 1 == steps_per_epoch);
+                (steps_since_update >= cfg.accum_steps) ||
+                (step + 1 == steps_per_epoch) || is_final_step;
 
             if (do_update)
             {
@@ -1593,6 +1725,13 @@ int main(int argc, char *argv[])
                     std::cerr << "\n  [ckpt] 保存失败: " << save_r.error().message << "\n";
             }
 
+            // ── --max-steps 到达：本步已完成更新与保存，退出步循环 ──
+            if (is_final_step)
+            {
+                stop_training = true;
+                break;
+            }
+
             // 进度显示在 harvest_loss 内完成（loss 走异步回读）：按"值就绪即打印"，
             // 稳定态仍是每步一条，且 host 全程不等 GPU。
         }
@@ -1605,6 +1744,14 @@ int main(int argc, char *argv[])
                 std::cerr << "loss drain failed: " << ep_drain.error().message << '\n';
                 return 1;
             }
+        }
+
+        // ── --max-steps 到达：跳过本 epoch 的统计与测试评估，直接收尾 ──
+        if (stop_training)
+        {
+            std::cout << "\n已达 --max-steps=" << cfg.max_steps << "（本进程执行 "
+                      << steps_executed << " 步），提前结束训练\n";
+            break;
         }
 
         auto ep_end = std::chrono::steady_clock::now();
@@ -1653,9 +1800,12 @@ int main(int argc, char *argv[])
                         const std::size_t y_id = (t + 1 < win_len) ? test_flow[win_pos + t + 1] : pad_id;
                         x_tokens.set_value(t, b, static_cast<Scalar>(x_id));
                         y_tokens.set_value(t, b, static_cast<Scalar>(y_id));
-                        const bool participate = (t + 1 < win_len);
+                        // 仅真实位置（非 padding）参与评估；
+                        // --loss-scope assistant 时还要是 assistant 段内的预测目标
+                        const bool participate = (t + 1 < win_len) &&
+                            (test_flow_assistant.empty() ||
+                             test_flow_assistant[win_pos + t + 1]);
                         loss_mask.set_value(t, b, participate ? 1.0f : 0.0f);
-                        // 仅真实位置（非 padding）参与评估
                         if (participate) ++test_valid;
                     }
                 }

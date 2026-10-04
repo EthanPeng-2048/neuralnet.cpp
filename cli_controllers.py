@@ -829,6 +829,17 @@ class GptTrainController(CLIController):
         if "weight_decay" in kwargs:
             args.extend(["--weight-decay", self._format_arg_value(kwargs["weight_decay"])])
         
+        # Adam/AdamW 动量衰减（sgd/muon 忽略；LLM 预训练常取 beta2=0.95）
+        if "beta1" in kwargs:
+            args.extend(["--beta1", self._format_arg_value(kwargs["beta1"])])
+        
+        if "beta2" in kwargs:
+            args.extend(["--beta2", self._format_arg_value(kwargs["beta2"])])
+        
+        # loss 范围（assistant = 对话 SFT 仅 assistant 段参与 loss）
+        if "loss_scope" in kwargs:
+            args.extend(["--loss-scope", self._format_arg_value(kwargs["loss_scope"])])
+        
         # 模型参数
         if "d_model" in kwargs:
             args.extend(["--d-model", self._format_arg_value(kwargs["d_model"])])
@@ -868,6 +879,10 @@ class GptTrainController(CLIController):
         
         if "save_interval" in kwargs:
             args.extend(["--save-interval", self._format_arg_value(kwargs["save_interval"])])
+        
+        # 最大训练步数（0/缺省 = 不限；吞吐实测 / 分段跑）
+        if "max_steps" in kwargs:
+            args.extend(["--max-steps", self._format_arg_value(kwargs["max_steps"])])
         
         # 梯度日志
         if kwargs.get("grad_log", False):

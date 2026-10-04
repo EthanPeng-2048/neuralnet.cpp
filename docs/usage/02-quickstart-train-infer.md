@@ -115,6 +115,9 @@ cmake --build build --parallel
 | `--seq-len <n>` | `256` | 序列长度 |
 | `--optimizer <name>` | `adam` | 优化器 |
 | `--weight-decay <w>` | `0.01` | AdamW 权重衰减 |
+| `--beta1 <b>` / `--beta2 <b>` | `0.9` / `0.999` | Adam/AdamW 动量衰减（LLM 预训练常取 β2=0.95） |
+| `--loss-scope <scope>` | `all` | loss 范围：`all` 全部 token；`assistant` 仅 `<\|assistant\|>` 段（对话 SFT） |
+| `--max-steps <n>` | `0` | 本次运行最多训练多少 step 后停止并保存（0=不限；吞吐实测/分段跑） |
 | `--d-model <n>` | `128` | 模型维度 |
 | `--num-heads <n>` | `4` | 注意力头数 |
 | `--num-layers <n>` | `4` | Transformer 层数 |

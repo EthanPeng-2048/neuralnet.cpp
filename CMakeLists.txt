@@ -8,8 +8,8 @@ cmake_minimum_required(VERSION 3.30)
 # 否则链接期会出现 std 符号 ABI 不匹配）。
 # 本文件不再隐式挑选编译器或 stdlib，避免与调用方/CI 的设置冲突。
 
-# VERSION 以 git tag 为准（当前 v1.6.0；AGENTS §变更此文件时务必同步 git 状态）
-project(neuralnet.cpp VERSION 1.6.0 LANGUAGES CXX)
+# VERSION 以 git tag 为准（当前 v1.6.1；AGENTS §变更此文件时务必同步 git 状态）
+project(neuralnet.cpp VERSION 1.6.1 LANGUAGES CXX)
 
 # ══════════════════════════════════════════════════════════════════════════
 #  作为库被消费（add_subdirectory / FetchContent 嵌入 3rd_party）的门控

@@ -62,6 +62,7 @@ NORM_OPTIONS = ["auto", "layernorm", "rmsnorm", "batchnorm"]
 # auto = 按架构默认：CNN = conv, ViT = final（与 mnist_train 默认一致）
 NORM_PLACE_OPTIONS = ["auto", "none", "conv", "head", "both", "final"]
 GPT_NORM_OPTIONS = ["layernorm", "rmsnorm"]  # GPT 仅支持 LayerNorm/RMSNorm
+GPT_LOSS_SCOPE_OPTIONS = ["all", "assistant"]  # loss 范围（assistant = 对话 SFT）
 PRECISION_OPTIONS = ["f32", "f16"]  # 混合精度选项
 # 模型架构：zipt(AttnZip) 已于 2026-10-01 移除（恢复前提见 docs/history.md / AGENTS §12）
 GPT_MODEL_OPTIONS = ["gpt", "rapt"]
@@ -1376,6 +1377,8 @@ class GptTrainTab(TabBase):
         self.stride = _make_entry_row(p, "滑动窗口步长 (0=seq_len)", r, "0"); r += 1
         self.optimizer = _make_option_row(p, "优化器", r, OPTIMIZER_OPTIONS, "adam"); r += 1
         self.weight_decay = _make_entry_row(p, "权重衰减", r, "0.01"); r += 1
+        self.beta1 = _make_entry_row(p, "Adam β1 (空=默认 0.9)", r, ""); r += 1
+        self.beta2 = _make_entry_row(p, "Adam β2 (空=默认 0.999)", r, ""); r += 1
         self.engine = _make_option_row(p, "计算引擎", r, ENGINE_OPTIONS, "CPU"); r += 1
 
         # --- 学习率调度 ---
@@ -1388,6 +1391,12 @@ class GptTrainTab(TabBase):
         self.warmup_steps = _make_entry_row(p, "预热步数 (step_cosine)", r, "0"); r += 1
         self.max_norm = _make_entry_row(p, "梯度裁剪 (0=不裁剪)", r, "0"); r += 1
         self.lr_per_epoch = _make_entry_row(p, "每轮 lr (逗号分隔, 可选)", r, ""); r += 1
+
+        # --- loss 范围与限步 ---
+        _make_label(p, "── loss 范围与限步 ──", r); r += 1
+        self.loss_scope = _make_option_row(p, "loss 范围 (assistant=对话SFT)", r,
+                                           GPT_LOSS_SCOPE_OPTIONS, "all"); r += 1
+        self.max_steps = _make_entry_row(p, "最大训练步数 (0=不限)", r, "0"); r += 1
 
         # LR 调度相关控件（fixed 时隐藏）
         self._lr_schedule_widgets = [self.min_lr, self.warmup_epochs,
@@ -1526,6 +1535,10 @@ class GptTrainTab(TabBase):
         args.update(_int(self.stride, "stride"))
         args["optimizer"] = self.optimizer.get()
         args.update(_float(self.weight_decay, "weight_decay"))
+        args.update(_float(self.beta1, "beta1"))
+        args.update(_float(self.beta2, "beta2"))
+        args["loss_scope"] = self.loss_scope.get()
+        args.update(_int(self.max_steps, "max_steps"))
         engine = self.engine.get()
         if engine == "GPU (Vulkan)":
             args["gpu"] = True
