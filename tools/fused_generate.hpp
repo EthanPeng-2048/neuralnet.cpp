@@ -23,6 +23,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -33,6 +35,7 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -198,6 +201,23 @@ namespace nn::tool
 #endif
 }
 
+// 同上的整数版（缺省/空串/非正数 → fallback）。MSVC 下 std::getenv 是
+// -Wdeprecated-declarations 且在 -Werror 下直接失败，故走 _dupenv_s。
+[[nodiscard]] inline int tool_env_int(const char* name, int fallback)
+{
+    int v = fallback;
+#if defined(_MSC_VER)
+    char* b = nullptr; std::size_t n = 0;
+    _dupenv_s(&b, &n, name);
+    if (b != nullptr && b[0] != '\0') v = std::atoi(b);
+    std::free(b);
+#else
+    const char* e = std::getenv(name);
+    if (e != nullptr && e[0] != '\0') v = std::atoi(e);
+#endif
+    return v;
+}
+
 // 该结构是否可生成融合 shader（生成循环 / emit_one / 元数据循环三处共用同一
 // 判据——此前三处各写一遍，靠注释"同上"维持同步，漏一处就是"元数据与 shader
 // 集合不一致"）。raxis == -2（行+列混合归约）无法单 kernel 融合；
@@ -217,6 +237,105 @@ namespace nn::tool
     if (alu || spec.fold) return 1u;
     if (nn::expr_spec_reduce_axis(spec) >= 0) return 1u;
     return nn::glsl_vec4_eligible(spec) ? 4u : 1u;
+}
+
+// ── 生成期并行执行（glslc 子进程是这一阶段的全部耗时）──────────────────────
+// 实测：91 条结构 + 130 条精度变体 = 221 次 glslc，单次 ~250ms，**串行**合计
+// ~55s —— 占满整个构建期单步（所有 C++ TU 都 `add_dependencies(
+// compile_gpu_shaders)`，等于全量构建开头硬等 55s）。
+// glslc 是无状态子进程，天然可并行：默认 hardware_concurrency 个线程，可用
+// NN_SCAN_JOBS=<n> 覆盖（调试/限流用）。
+struct GenJob
+{
+    std::string ident;      // 生成头里的标识符后缀：key / key_x / key_a
+    std::string label;      // 诊断用键名：key / key#x / key#a
+    std::string comp_path;
+    std::string spv_path;
+    std::string glsl;
+    std::vector<std::uint32_t> spv;
+    bool ok = false;
+};
+
+[[nodiscard]] inline unsigned gen_job_threads()
+{
+    const int override_n = tool_env_int("NN_SCAN_JOBS", 0);
+    if (override_n > 0) return static_cast<unsigned>(override_n);
+    const unsigned hw = std::thread::hardware_concurrency();
+    return hw == 0 ? 1u : hw;
+}
+
+// 并行：写 .comp → glslc → 读 .spv，逐条独立。任一条失败只标记该 job（其余
+// 继续跑完再统一失败），对构建的可见语义与串行版一致（同样中止构建、同样
+// 打印 [FAIL]）；只是不再"首发失败即丢弃后面所有已排好的工作"。
+inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
+{
+    if (jobs.empty()) return;
+    const unsigned nthreads =
+        std::min<unsigned>(gen_job_threads(), static_cast<unsigned>(jobs.size()));
+    std::atomic<std::size_t> next{0};
+    const auto worker = [&]()
+    {
+        for (;;)
+        {
+            const std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= jobs.size()) return;
+            GenJob& j = jobs[i];
+            {
+                std::ofstream f(j.comp_path, std::ios::binary);
+                if (!f)
+                {
+                    std::fprintf(stderr, "[FAIL] 无法写入 %s\n", j.comp_path.c_str());
+                    continue;
+                }
+                f << j.glsl;
+            }
+            if (!run_glslc(glslc, j.comp_path, j.spv_path))
+            {
+                std::fprintf(stderr, "[FAIL] glslc 编译 %s 失败\n", j.label.c_str());
+                continue;
+            }
+            j.spv = read_spv(j.spv_path);
+            if (j.spv.empty())
+            {
+                std::fprintf(stderr, "[FAIL] 读取 %s 失败\n", j.spv_path.c_str());
+                continue;
+            }
+            j.ok = true;
+        }
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(nthreads > 0 ? nthreads - 1 : 0);
+    for (unsigned t = 1; t < nthreads; ++t) pool.emplace_back(worker);
+    worker();                       // 调用线程也干活，省一个线程的启动/回收
+    for (std::thread& th : pool) th.join();
+}
+
+// 磁盘上的文件是否与给定内容相同（不存在 = 不同）。
+// **文本模式**（与旧的无条件覆写一致）：Windows 上写出 CRLF、读入时再翻译回
+// LF，两边口径一致；改二进制模式会让生成头从 CRLF 变 LF，平白制造全文件 diff。
+[[nodiscard]] inline bool file_content_equal(const std::string& path,
+                                             const std::string& content)
+{
+    std::ifstream in(path);
+    if (!in) return false;
+    std::ostringstream cur;
+    cur << in.rdbuf();
+    return cur.str() == content;
+}
+
+// 只在**内容真的变了**时落盘。
+// ninja 给这个自定义命令生成了 `restat = 1`：输出 mtime 不变 → 下游（全部
+// C++ TU 都 include 这份注册表）**不重建**。改一个 Layer 头会重新跑
+// scan_exprs，但多数时候折叠出的结构逐字节不变——"无条件 ofstream 覆写"
+// 会把这种情况放大成全量重编。
+[[nodiscard]] inline bool write_if_different(const std::string& path,
+                                             const std::string& content)
+{
+    if (file_content_equal(path, content)) return true;   // 内容相同 → 不碰 mtime
+    std::ofstream f(path);
+    if (!f) return false;
+    f << content;
+    return true;
 }
 
 // 生成融合 shader 注册表（见文件头说明）。reg 由调用方（scan_exprs）收集好后
@@ -268,6 +387,11 @@ namespace nn::tool
     H << "                                //   V2=\"全输入 f16 + 输出 f16\"位图\n";
     H << "};\n\n";
 
+    // 生成期任务队列：顺序 = 生成头里 SPIR-V 数组的顺序（先全部基础结构，
+    // 再按发射顺序的全部精度变体）。GLSL 在这一轮全部产出，glslc 在
+    // run_gen_jobs 里并行跑完，最后统一按序回填 H——输出与串行版逐字节一致。
+    std::vector<GenJob> jobs;
+
     for (const auto& spec : reg.specs)
     {
         if (!is_fusable(spec))
@@ -286,8 +410,6 @@ namespace nn::tool
         // 操作数（内联点积，不物化 (batch*M,N) 中间矩阵），同样不跳过。
         const int raxis = nn::expr_spec_reduce_axis(spec);
         const std::string key = nn::expr_spec_key(spec);
-        const std::string comp_path = out_dir + "/fused_" + key + ".comp";
-        const std::string spv_path  = out_dir + "/fused_" + key + ".spv";
 
         // 经 emitter 抽象（IR-D）生成 kernel 源码：默认 GlslEmitter。
         // 同一份 canonical IR 可由其它后端展开（--list-backends）。
@@ -306,30 +428,10 @@ namespace nn::tool
             std::fprintf(stderr, "[FAIL] 生成 %s 失败（归约结构不支持？）\n", key.c_str());
             return false;
         }
-        {
-            std::ofstream f(comp_path);
-            if (!f) { std::fprintf(stderr, "[FAIL] 无法写入 %s\n", comp_path.c_str()); return false; }
-            f << glsl;
-        }
-        if (!run_glslc(glslc, comp_path, spv_path))
-        {
-            std::fprintf(stderr, "[FAIL] glslc 编译 %s 失败\n", key.c_str());
-            return false;
-        }
-        const auto spv = read_spv(spv_path);
-        if (spv.empty())
-        {
-            std::fprintf(stderr, "[FAIL] 读取 %s 失败\n", spv_path.c_str());
-            return false;
-        }
-
-        H << "inline constexpr std::uint32_t kSpirv_" << key << "[] = {";
-        for (std::size_t i = 0; i < spv.size(); ++i)
-        {
-            if (i % 8 == 0) H << "\n    ";
-            H << "0x" << std::hex << spv[i] << "u, ";
-        }
-        H << std::dec << "\n};\n\n";
+        jobs.push_back(GenJob{key, key,
+                              out_dir + "/fused_" + key + ".comp",
+                              out_dir + "/fused_" + key + ".spv",
+                              glsl, {}, false});
     }
 
     // ── 结构变体：V1 运行期精度分派（键 = key#x）与 V2 native16（键 = key#a）──
@@ -400,29 +502,8 @@ namespace nn::tool
             std::fprintf(stderr, "[skip] 分派变体 %s 的形态暂不支持生成\n", vkey.c_str());
             return false;
         }
-        {
-            std::ofstream f(comp_path);
-            if (!f) { std::fprintf(stderr, "[FAIL] 无法写入 %s\n", comp_path.c_str()); return false; }
-            f << glsl;
-        }
-        if (!run_glslc(glslc, comp_path, spv_path))
-        {
-            std::fprintf(stderr, "[FAIL] glslc 编译变体 %s 失败\n", vkey.c_str());
-            return false;
-        }
-        const auto spv = read_spv(spv_path);
-        if (spv.empty())
-        {
-            std::fprintf(stderr, "[FAIL] 读取 %s 失败\n", spv_path.c_str());
-            return false;
-        }
-        H << "inline constexpr std::uint32_t kSpirv_" << suffix << "[] = {";
-        for (std::size_t i = 0; i < spv.size(); ++i)
-        {
-            if (i % 8 == 0) H << "\n    ";
-            H << "0x" << std::hex << spv[i] << "u, ";
-        }
-        H << std::dec << "\n};\n\n";
+        // 只登记任务：glslc 统一在 run_gen_jobs 里并行执行。
+        jobs.push_back(GenJob{suffix, vkey, comp_path, spv_path, glsl, {}, false});
         emitted_variants.push_back(VariantEmit{&spec, sig, vkey, suffix, alu});
         return true;
     };
@@ -435,13 +516,33 @@ namespace nn::tool
             !emit_one(spec, nn::EXPR_PREC_SIG_DISPATCH, /*alu=*/false))
         {
             // V1 发不出来只是少了 f16 路径（见 emit_one），V2/V0 仍可能成功；
-            // 真正的失败（写文件 / glslc / 读 SPIR-V）已在 emit_one 内报 [FAIL]。
+            // 真正的失败（生成 GLSL 失败）已在 emit_one 内报 [FAIL]/[skip]。
         }
         // V2：结构性"全输入 f16 + 输出 f16"签名（输入位掩码取满，
         // 谓词内部再按 views 数量与其余条件判定）
         emit_one(spec, nn::expr_prec_sig_make(nn::EXPR_PREC_SIG_INPUT_MASK,
                                               /*out_f16=*/true),
                  /*alu=*/true);
+    }
+
+    // ── 并行 glslc：GLSL 已全部产出，这里一次性并发编译 ────────────────────
+    run_gen_jobs(glslc, jobs);
+    for (const GenJob& j : jobs)
+    {
+        if (!j.ok)
+            return false;   // [FAIL] 明细已在 run_gen_jobs 内逐条打印
+    }
+
+    // SPIR-V 数组按 jobs 顺序回填（= 串行版的「基础结构全部在前、变体全部在后」）
+    for (const GenJob& j : jobs)
+    {
+        H << "inline constexpr std::uint32_t kSpirv_" << j.ident << "[] = {";
+        for (std::size_t i = 0; i < j.spv.size(); ++i)
+        {
+            if (i % 8 == 0) H << "\n    ";
+            H << "0x" << std::hex << j.spv[i] << "u, ";
+        }
+        H << std::dec << "\n};\n\n";
     }
 
     H << "inline const FusedShader kFusedShaders[] = {\n";
@@ -486,13 +587,18 @@ namespace nn::tool
     H << "#endif // NN_FUSED_REGISTRY_HPP\n";
 
     const std::string reg_path = out_dir + "/fused_registry.hpp";
+    const std::string reg_text = H.str();
+    // 内容不变则**不落盘**（保持 mtime）——ninja 的 restat=1 据此判定下游
+    // 是否重建；无条件覆写会把"结构没变"的重新生成放大成全量重编。
+    const bool reg_changed = !file_content_equal(reg_path, reg_text);
+    if (!write_if_different(reg_path, reg_text))
     {
-        std::ofstream f(reg_path);
-        if (!f) { std::fprintf(stderr, "[FAIL] 无法写入 %s\n", reg_path.c_str()); return false; }
-        f << H.str();
+        std::fprintf(stderr, "[FAIL] 无法写入 %s\n", reg_path.c_str());
+        return false;
     }
-    std::printf("[gen] %zu 条融合表达式 + %zu 条精度变体 -> %s\n",
-                reg.specs.size(), emitted_variants.size(), reg_path.c_str());
+    std::printf("[gen] %zu 条融合表达式 + %zu 条精度变体 -> %s%s\n",
+                reg.specs.size(), emitted_variants.size(), reg_path.c_str(),
+                reg_changed ? "" : "（内容未变化，保持 mtime）");
     return true;
 }
 
