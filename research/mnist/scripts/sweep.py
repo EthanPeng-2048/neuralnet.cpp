@@ -9,13 +9,13 @@
   * 关键结论再用默认打乱（shuffle=true）多轮复验（robust 组），防止结论被
     「固定顺序」这一特殊训练制度带偏。
   * 每个 run 一个日志 + 一个 .bin；日志可断点续跑（检测到「训练完成」且模型存在则跳过）。
-  * 全局汇总写到 research/results/all_runs.csv（每 run 一行）与
-    research/results/all_epochs.csv（每 run·epoch 一行，学习曲线来源）。
+  * 全局汇总写到 research/mnist/results/all_runs.csv（每 run 一行）与
+    research/mnist/results/all_epochs.csv（每 run·epoch 一行，学习曲线来源）。
 
 用法：
-  python research/scripts/sweep.py --phases scale_conv,scale_fc --jobs 4
-  python research/scripts/sweep.py --list
-  python research/scripts/sweep.py --rebuild-csv        # 只从已有日志重建 CSV
+  python research/mnist/scripts/sweep.py --phases scale_conv,scale_fc --jobs 4
+  python research/mnist/scripts/sweep.py --list
+  python research/mnist/scripts/sweep.py --rebuild-csv        # 只从已有日志重建 CSV
 """
 
 from __future__ import annotations
@@ -32,8 +32,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(os.path.dirname(HERE))
-RES = os.path.join(ROOT, "research", "results")
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+RES = os.path.join(ROOT, "research", "mnist", "results")
 # 注：早期 46 个配置是用过期 Debug 二进制跑的历史数据；新实验请用 build_rel。
 TRAIN = os.path.join(ROOT, "build_rel", "mnist_train.exe")
 if not os.path.exists(TRAIN):

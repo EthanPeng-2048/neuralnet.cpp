@@ -77,9 +77,13 @@
 #define NN_ETYPE float16_t
 #define NN_V4   uvec2
 #define NN_LOADV4(arr, i) vec4(unpackHalf2x16(arr[i].x), unpackHalf2x16(arr[i].y))
-#define NN_PACK4(v) uvec2(packHalf2x16(v.xy), packHalf2x16(v.zw))
+#define NN_PACK4(v) uvec2(packHalf2x16(vec2(nn_f16_rne((v).x), nn_f16_rne((v).y))), \
+                          packHalf2x16(vec2(nn_f16_rne((v).z), nn_f16_rne((v).w))))
 #define NN_RD(x) float(x)
-#define NN_WR(x) float16_t(x)
+// f16 写出统一走 RNE：标量回退用 NN_WR，vec4 快路径用 NN_PACK4（逐 lane 先
+// RNE 再 pack）——float16_t()/packHalf2x16 在本驱动的舍入都不受规范约束。
+#include "nn_f16_rne.glsl"
+#define NN_WR(w) float16_t(nn_f16_rne(w))
 #else
 #define NN_ETYPE float
 #define NN_V4   vec4

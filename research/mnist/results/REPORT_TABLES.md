@@ -1,9 +1,9 @@
-<!-- 由 research/scripts/analyze.py 自动生成，请勿手改 -->
+<!-- 由 research/mnist/scripts/analyze.py 自动生成，请勿手改 -->
 
 ## 0. 运行总览
 
-- 已收集 run 数：**41**（`research/results/all_runs.csv`）
-- epoch 级记录：**712** 条（`research/results/all_epochs.csv`，学习曲线来源）
+- 已收集 run 数：**41**（`research/mnist/results/all_runs.csv`）
+- epoch 级记录：**712** 条（`research/mnist/results/all_epochs.csv`，学习曲线来源）
 - ⚠ 未完整跑完：opt_sgd_0.01, opt_sgd_0.1, opt_sgd_momentum_0.001, opt_sgd_momentum_0.01
 
 | phase | runs | 最好(final) | 该配置 |

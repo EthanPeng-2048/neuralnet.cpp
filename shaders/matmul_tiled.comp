@@ -51,7 +51,12 @@
 #define NN_V4    uvec2
 #define NN_LOADV4(arr, i) vec4(unpackHalf2x16(arr[i].x), unpackHalf2x16(arr[i].y))
 #define NN_RD(x) float(x)
-#define NN_WR(x) float16_t(x)
+// f16 写出的 RNE 舍入：float16_t(x) 的 OpFConvert 舍入模式未被规范钉死（实测
+// NVIDIA 驱动向零截断 → 权重衰减类写回每步恰掉 1 个 f16 网格步，见
+// research/f16_weight_decay/REPORT.md）。packHalf2x16 按 round-half-to-even，
+// unpack 回 f32 后值已落在 f16 网格上 → 其后 float16_t() 转换必然精确。
+#include "nn_f16_rne.glsl"
+#define NN_WR(w) float16_t(nn_f16_rne(w))
 #else
 #define NN_ETYPE float
 #define NN_V4    vec4

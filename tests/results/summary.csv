@@ -1,0 +1,38 @@
+phase,config,round,completed,epochs_done,final_test,best_test,final_train,norm,model,log
+small_proxy,base,2,True,6,98.41,98.41,99.99,BatchNorm @ conv,results/models_smallproxy/s2_base.bin,results/logs_smallproxy/s2_base.log
+small_proxy,bn_both,2,True,6,98.5,98.5,99.96,BatchNorm @ both,results/models_smallproxy/s2_bn_both.bin,results/logs_smallproxy/s2_bn_both.log
+small_proxy,bn_head,2,True,6,98.53,98.53,99.93,BatchNorm @ head,results/models_smallproxy/s2_bn_head.bin,results/logs_smallproxy/s2_bn_head.log
+small_proxy,ln_both,2,True,6,98.41,98.41,99.92,LayerNorm @ both,results/models_smallproxy/s2_ln_both.bin,results/logs_smallproxy/s2_ln_both.log
+small_proxy,ln_conv,2,True,6,98.35,98.35,99.97,LayerNorm @ conv,results/models_smallproxy/s2_ln_conv.bin,results/logs_smallproxy/s2_ln_conv.log
+small_proxy,ln_head,2,True,6,98.16,98.16,99.86,LayerNorm @ head,results/models_smallproxy/s2_ln_head.bin,results/logs_smallproxy/s2_ln_head.log
+small_proxy,none,2,True,6,98.16,98.16,99.81,BatchNorm,results/models_smallproxy/s2_none.bin,results/logs_smallproxy/s2_none.log
+small_proxy,rms_both,2,True,6,98.23,98.23,99.9,RMSNorm @ both,results/models_smallproxy/s2_rms_both.bin,results/logs_smallproxy/s2_rms_both.log
+small_proxy,rms_conv,2,True,6,98.31,98.31,99.95,RMSNorm @ conv,results/models_smallproxy/s2_rms_conv.bin,results/logs_smallproxy/s2_rms_conv.log
+small_proxy,rms_head,2,True,6,98.37,98.37,99.88,RMSNorm @ head,results/models_smallproxy/s2_rms_head.bin,results/logs_smallproxy/s2_rms_head.log
+small_proxy,base,3,True,6,98.37,98.37,99.97,BatchNorm @ conv,results/models_smallproxy/s3_base.bin,results/logs_smallproxy/s3_base.log
+small_proxy,bn_both,3,True,6,98.62,98.62,99.97,BatchNorm @ both,results/models_smallproxy/s3_bn_both.bin,results/logs_smallproxy/s3_bn_both.log
+small_proxy,bn_head,3,True,6,98.69,98.69,99.88,BatchNorm @ head,results/models_smallproxy/s3_bn_head.bin,results/logs_smallproxy/s3_bn_head.log
+small_proxy,ln_both,3,True,6,98.45,98.48,99.92,LayerNorm @ both,results/models_smallproxy/s3_ln_both.bin,results/logs_smallproxy/s3_ln_both.log
+small_proxy,ln_conv,3,True,6,98.26,98.26,99.95,LayerNorm @ conv,results/models_smallproxy/s3_ln_conv.bin,results/logs_smallproxy/s3_ln_conv.log
+small_proxy,ln_head,3,True,6,98.27,98.27,99.86,LayerNorm @ head,results/models_smallproxy/s3_ln_head.bin,results/logs_smallproxy/s3_ln_head.log
+small_proxy,none,3,True,6,98.37,98.37,99.81,BatchNorm,results/models_smallproxy/s3_none.bin,results/logs_smallproxy/s3_none.log
+small_proxy,rms_both,3,True,6,98.36,98.36,99.87,RMSNorm @ both,results/models_smallproxy/s3_rms_both.bin,results/logs_smallproxy/s3_rms_both.log
+small_proxy,rms_conv,3,True,6,98.47,98.47,99.97,RMSNorm @ conv,results/models_smallproxy/s3_rms_conv.bin,results/logs_smallproxy/s3_rms_conv.log
+small_proxy,rms_head,3,True,6,98.36,98.36,99.84,RMSNorm @ head,results/models_smallproxy/s3_rms_head.bin,results/logs_smallproxy/s3_rms_head.log
+small_proxy,base,1,True,6,98.37,98.37,99.95,BatchNorm @ conv,results/models_smallproxy/s_base.bin,results/logs_smallproxy/s_base.log
+small_proxy,bn_both,1,True,6,98.75,98.75,99.97,BatchNorm @ both,results/models_smallproxy/s_bn_both.bin,results/logs_smallproxy/s_bn_both.log
+small_proxy,bn_head,1,True,6,98.58,98.58,99.91,BatchNorm @ head,results/models_smallproxy/s_bn_head.bin,results/logs_smallproxy/s_bn_head.log
+small_proxy,ln_both,1,True,6,98.41,98.41,99.9,LayerNorm @ both,results/models_smallproxy/s_ln_both.bin,results/logs_smallproxy/s_ln_both.log
+small_proxy,ln_conv,1,True,6,98.32,98.32,99.98,LayerNorm @ conv,results/models_smallproxy/s_ln_conv.bin,results/logs_smallproxy/s_ln_conv.log
+small_proxy,ln_head,1,True,6,98.41,98.41,99.84,LayerNorm @ head,results/models_smallproxy/s_ln_head.bin,results/logs_smallproxy/s_ln_head.log
+small_proxy,none,1,True,6,98.19,98.19,99.77,BatchNorm,results/models_smallproxy/s_none.bin,results/logs_smallproxy/s_none.log
+small_proxy,rms_both,1,True,6,98.38,98.38,99.85,RMSNorm @ both,results/models_smallproxy/s_rms_both.bin,results/logs_smallproxy/s_rms_both.log
+small_proxy,rms_conv,1,True,6,98.47,98.47,99.98,RMSNorm @ conv,results/models_smallproxy/s_rms_conv.bin,results/logs_smallproxy/s_rms_conv.log
+small_proxy,rms_head,1,True,6,98.35,98.35,99.86,RMSNorm @ head,results/models_smallproxy/s_rms_head.bin,results/logs_smallproxy/s_rms_head.log
+fullsize,base,1,True,18,99.33,99.35,100.0,BatchNorm @ conv,results/models_fullsize/base.bin,results/logs_fullsize/base.log
+fullsize,bn_both,1,True,18,99.23,99.28,100.0,BatchNorm @ both,results/models_fullsize/bn_both.bin,results/logs_fullsize/bn_both.log
+fullsize,bn_head,1,True,18,99.34,99.37,100.0,BatchNorm @ head,results/models_fullsize/bn_head.bin,results/logs_fullsize/bn_head.log
+fullsize,ln_both,1,True,18,99.31,99.31,100.0,LayerNorm @ both,results/models_fullsize/ln_both.bin,results/logs_fullsize/ln_both.log
+fullsize,ln_conv,1,True,18,99.18,99.19,100.0,LayerNorm @ conv,results/models_fullsize/ln_conv.bin,results/logs_fullsize/ln_conv.log
+fullsize,ln_head,1,True,18,99.26,99.28,100.0,LayerNorm @ head,results/models_fullsize/ln_head.bin,results/logs_fullsize/ln_head.log
+fullsize,rms_both,1,True,18,99.22,99.24,100.0,RMSNorm @ both,results/models_fullsize/rms_both.bin,results/logs_fullsize/rms_both.log

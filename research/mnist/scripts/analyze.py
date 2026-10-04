@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""从 research/results/{all_runs.csv,all_epochs.csv} 生成研究表格（Markdown）。
+"""从 research/mnist/results/{all_runs.csv,all_epochs.csv} 生成研究表格（Markdown）。
 
-用法: python research/scripts/analyze.py > research/results/REPORT_TABLES.md
+用法: python research/mnist/scripts/analyze.py > research/mnist/results/REPORT_TABLES.md
 """
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ import statistics as st
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(os.path.dirname(HERE))
-RES = os.path.join(ROOT, "research", "results")
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+RES = os.path.join(ROOT, "research", "mnist", "results")
 
 
 def load():
@@ -112,13 +112,13 @@ def table(phase, runs, cols, sort_key, out):
 def main():
     runs, epochs = load()
     out = []
-    out.append("<!-- 由 research/scripts/analyze.py 自动生成，请勿手改 -->\n")
+    out.append("<!-- 由 research/mnist/scripts/analyze.py 自动生成，请勿手改 -->\n")
 
     # ── 0. 总览 ───────────────────────────────────────────────────────
     out.append("## 0. 运行总览\n")
-    out.append(f"- 已收集 run 数：**{len(runs)}**（`research/results/all_runs.csv`）")
+    out.append(f"- 已收集 run 数：**{len(runs)}**（`research/mnist/results/all_runs.csv`）")
     out.append(f"- epoch 级记录：**{sum(len(v) for v in epochs.values())}** 条"
-               f"（`research/results/all_epochs.csv`，学习曲线来源）")
+               f"（`research/mnist/results/all_epochs.csv`，学习曲线来源）")
     bad = [r for r in runs.values() if r["completed"] != "True"]
     if bad:
         out.append(f"- ⚠ 未完整跑完：{', '.join(r['run'] for r in sorted(bad, key=lambda x: x['run']))}")

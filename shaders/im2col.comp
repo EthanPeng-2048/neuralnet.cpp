@@ -21,7 +21,9 @@
 #if defined(NN_SHADER_F16)
 #extension GL_EXT_shader_16bit_storage : require
 #define NN_ETYPE float16_t
-#define NN_WR(x) float16_t(x)
+// f16 写出的 RNE 舍入（同 matmul_tiled：OpFConvert 舍入未钉死，pack 按 RNE）
+#include "nn_f16_rne.glsl"
+#define NN_WR(w) float16_t(nn_f16_rne(w))
 #else
 #define NN_ETYPE float
 #define NN_WR(x) (x)

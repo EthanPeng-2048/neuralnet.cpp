@@ -43,6 +43,7 @@
 //   只需 storageBuffer16BitAccess（无 f16 算术/原子）。
 #if defined(NN_SHADER_F16)
 #extension GL_EXT_shader_16bit_storage : require
+#include "nn_f16_rne.glsl"
 #endif
 
 layout(local_size_x = 256) in;
@@ -93,7 +94,9 @@ void atomicAddHalf(uint hidx, float val)
     {
         vec2 h = unpackHalf2x16(old_v);
         if (sel == 0u) h.x += val; else h.y += val;
-        new_v = packHalf2x16(h);
+        // 写回前逐 lane RNE 预舍入：packHalf2x16 的舍入未被规范钉死，实测
+        // NVIDIA 驱动向零截断（Khronos Vulkan-Docs #1825）
+        new_v = packHalf2x16(vec2(nn_f16_rne(h.x), nn_f16_rne(h.y)));
         uint prev = atomicCompSwap(dst[word], old_v, new_v);
         if (prev == old_v) break;
         old_v = prev;

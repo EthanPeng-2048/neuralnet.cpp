@@ -1,0 +1,11 @@
+config      n    mean    std     min     max  best_mean  vs_base  norm
+----------------------------------------------------------------------
+bn_head     1   99.34   0.00   99.34   99.34      99.37    +0.01  BatchNorm @ head
+base        1   99.33   0.00   99.33   99.33      99.35     0.00  BatchNorm @ conv
+ln_both     1   99.31   0.00   99.31   99.31      99.31    -0.02  LayerNorm @ both
+ln_head     1   99.26   0.00   99.26   99.26      99.28    -0.07  LayerNorm @ head
+bn_both     1   99.23   0.00   99.23   99.23      99.28    -0.10  BatchNorm @ both
+rms_both    1   99.22   0.00   99.22   99.22      99.24    -0.11  RMSNorm @ both
+ln_conv     1   99.18   0.00   99.18   99.18      99.19    -0.15  LayerNorm @ conv
+
+base = BatchNorm @ conv（当前默认），mean 99.33 ± 0.00
