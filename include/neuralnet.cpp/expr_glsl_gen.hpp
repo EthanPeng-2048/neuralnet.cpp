@@ -25,6 +25,41 @@
 namespace nn
 {
 
+// ── f32 → f16 存储的 RNE（round-half-to-even）预舍入 ─────────────────────
+// float16_t(x) 编译为 SPIR-V OpFConvert，其舍入模式**未被 Vulkan/SPIR-V 规范
+// 钉死**：实测 NVIDIA 驱动按“向零截断”。对 p *= (1-lr·wd) 这类结果紧贴原 f16
+// 网格点的写回，截断恰好每步掉 1 个网格步（与 lr 无关）→ 数万步后权重下溢为
+// 0、loss 回到 ln(V)（见 research/f16_weight_decay/REPORT.md）。
+// ⚠ 不能用 packHalf2x16 代替：同驱动上实测它**同样截断**（Khronos
+// Vulkan-Docs #1825「PackHalf2x16 rounding behavior is ambiguously defined」），
+// 与宿主 nn::f16（RNE）对拍 4/8 不一致。
+// 因此改用整数位运算在 f32 域做精确 RNE：返回值本身落在 f16 网格上（f16 ⊂ f32
+// 可精确表示），随后的 float16_t() 收窄无论取哪种舍入模式都不再产生偏差。
+[[nodiscard]] inline std::string glsl_f16_store(const std::string& v)
+{
+    return "float16_t(nn_f16_rne(" + v + "))";
+}
+
+// 上面 glsl_f16_store 依赖的 GLSL 辅助函数源码；凡会写 f16 的生成 shader
+// 前导必须发射一次（声明必须先于使用）。用整数位运算实现精确 RNE，不依赖
+// 驱动 OpFConvert / packHalf2x16 的舍入模式（两者实测都向零截断）。
+[[nodiscard]] inline const char* glsl_f16_rne_source()
+{
+    return
+        "// f32 → f16 网格的 RNE 预舍入：返回值本身落在 f16 网格上（f16 ⊂ f32\n"
+        "// 可精确表示），随后的 float16_t() 收窄不再产生任何舍入偏差。\n"
+        "float nn_f16_rne(float x)\n"
+        "{\n"
+        "    uint u = floatBitsToUint(x);\n"
+        "    const uint a = u & 0x7fffffffu;\n"
+        "    if (a >= 0x7f800000u || a < 0x38800000u)   // Inf/NaN，或 |x| < 2^-14\n"
+        "        return roundEven(x * 16777216.0) / 16777216.0;\n"
+        "    u += 0x0fffu + ((u >> 13u) & 1u);          // 半个 ULP + tie-to-even\n"
+        "    u &= 0xffffe000u;                          // 截到 f16 的 10 位尾数\n"
+        "    return uintBitsToFloat(u);\n"
+        "}\n\n";
+}
+
 // ── 算子 → GLSL 表达式片段 ────────────────────────────────────────────────
 
 // 二元/比较（输出 1.0/0.0 用于比较）
@@ -398,6 +433,8 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     L << "#version 450\n\n";
     if (sign_f16)
         L << "#extension GL_EXT_shader_16bit_storage : require\n\n";
+    if (sign_f16)
+        L << glsl_f16_rne_source();
     L << "layout(local_size_x = " << T << ", local_size_y = " << T << ") in;\n\n";
     for (std::size_t i = 0; i < n_inputs; ++i)
     {
@@ -812,7 +849,8 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
         L << "            {\n";
         L << "                const uint oi = (batch * m_per + rr) * cols + cc;\n";
         L << "                if ((prec >> 16u & 1u) != 0u)\n";
-        L << "                    bout16[oi] = float16_t(eval_tail(acc[i][j], rr, cc, batch));\n";
+        L << "                    bout16[oi] = "
+          << glsl_f16_store("eval_tail(acc[i][j], rr, cc, batch)") << ";\n";
         L << "                else\n";
         L << "                    bout[oi] = eval_tail(acc[i][j], rr, cc, batch);\n";
         L << "            }\n";
@@ -820,8 +858,10 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     else
     {
         L << "                bout[(batch * m_per + rr) * cols + cc]\n";
-        L << "                    = " << (out_f16 ? "float16_t(" : "")
-          << "eval_tail(acc[i][j], rr, cc, batch)" << (out_f16 ? ")" : "") << ";\n";
+        L << "                    = "
+          << (out_f16 ? glsl_f16_store("eval_tail(acc[i][j], rr, cc, batch)")
+                      : std::string("eval_tail(acc[i][j], rr, cc, batch)"))
+          << ";\n";
     }
     L << "        }\n";
     L << "}\n";
@@ -883,6 +923,8 @@ inline std::string generate_glsl_fold(const std::string& name, const ExprSpec& s
     L << "#version 450\n\n";
     if (sig != 0)
         L << "#extension GL_EXT_shader_16bit_storage : require\n\n";
+    if (sig != 0)
+        L << glsl_f16_rne_source();
     L << "layout(local_size_x = 256) in;\n\n";
     for (std::size_t i = 0; i < n_inputs; ++i)
     {
@@ -1068,14 +1110,18 @@ inline std::string generate_glsl_fold(const std::string& name, const ExprSpec& s
     if (disp)
     {
         L << "    if ((prec >> 16u & 1u) != 0u)\n";
-        L << "        bout16[row] = float16_t(r"
-          << static_cast<int>(f.finalize.back().dst) << ");\n";
+        L << "        bout16[row] = "
+          << glsl_f16_store("r" + std::to_string(static_cast<int>(f.finalize.back().dst)))
+          << ";\n";
         L << "    else\n";
         L << "        bout[row] = r" << static_cast<int>(f.finalize.back().dst) << ";\n";
     }
     else
-        L << "    bout[row] = " << (out_f16 ? "float16_t(r" : "r")
-          << static_cast<int>(f.finalize.back().dst) << (out_f16 ? ")" : "") << ";\n";
+        L << "    bout[row] = "
+          << (out_f16 ? glsl_f16_store(
+                            "r" + std::to_string(static_cast<int>(f.finalize.back().dst)))
+                      : ("r" + std::to_string(static_cast<int>(f.finalize.back().dst))))
+          << ";\n";
     L << "}\n";
     return L.str();
 }
@@ -1160,6 +1206,8 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
     L << "#extension GL_KHR_shader_subgroup_shuffle_relative : require\n\n"; // subgroupShuffleDown
     if (sig != 0)
         L << "#extension GL_EXT_shader_16bit_storage : require\n\n";
+    if (sig != 0)
+        L << glsl_f16_rne_source();
     L << "layout(local_size_x = 256) in;\n\n";
     for (std::size_t i = 0; i < n_inputs; ++i)
     {
@@ -1562,8 +1610,9 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
     {
         L << "      if (row_ok) {\n";
         L << "        if ((prec >> 16u & 1u) != 0u)\n";
-        L << "          bout16[row * vector_out + dd] = float16_t(r"
-          << static_cast<int>(f.finalize.back().dst) << ");\n";
+        L << "          bout16[row * vector_out + dd] = "
+          << glsl_f16_store("r" + std::to_string(static_cast<int>(f.finalize.back().dst)))
+          << ";\n";
         L << "        else\n";
         L << "          bout[row * vector_out + dd] = r"
           << static_cast<int>(f.finalize.back().dst) << ";\n";
@@ -1571,8 +1620,10 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
     }
     else
         L << "      if (row_ok) bout[row * vector_out + dd] = "
-          << (out_f16 ? "float16_t(r" : "r")
-          << static_cast<int>(f.finalize.back().dst) << (out_f16 ? ")" : "") << ";\n";   // 越界 ri 不写回
+          << (out_f16 ? glsl_f16_store(
+                            "r" + std::to_string(static_cast<int>(f.finalize.back().dst)))
+                      : ("r" + std::to_string(static_cast<int>(f.finalize.back().dst))))
+          << ";\n";   // 越界 ri 不写回
     L << "    }\n";
     L << "    }\n";   // NR 行循环尾
     L << "}\n";
@@ -1648,6 +1699,8 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
         // f16 算术扩展（float16_t 类型的 +,-,*,/,exp,log,... 与 f16vecN）；
         // 与 16bit_storage 同时声明（spike 验证两者共存可编译）。
         L << "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n\n";
+    if (any_f16)
+        L << glsl_f16_rne_source();
     L << "layout(local_size_x = 256) in;\n\n";
 
     // 逐输入/输出的存储类型
@@ -1734,13 +1787,15 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
             return "r" + std::to_string(op.idx);
         case static_cast<uint8_t>(ExprOperandKind::Const):
             // native16：常量按 float 推入 push constant，用点显式收 f16——
-            // f16 寄存器 = float 表达式是隐式收窄（glslc 拒绝）
-            return native16 ? ("float16_t(c" + std::to_string(op.idx) + ")")
+            // f16 寄存器 = float 表达式是隐式收窄（glslc 拒绝）。收窄走
+            // glsl_f16_store（RNE）——与输出写回同一舍入口径，否则常量型
+            // 乘法因子（如 p *= c）会在 native16 下每步掉 1 个网格步。
+            return native16 ? glsl_f16_store("c" + std::to_string(op.idx))
                             : ("c" + std::to_string(op.idx));
         case static_cast<uint8_t>(ExprOperandKind::RParam):
             // native16 谓词已排除 rparams（微小标量 flush-to-0 隐患），
             // 此处仍发 f16 包装作纵深防御（若未来谓词放开则不至于类型错）
-            return native16 ? ("float16_t(rp" + std::to_string(op.idx) + ")")
+            return native16 ? glsl_f16_store("rp" + std::to_string(op.idx))
                             : ("rp" + std::to_string(op.idx));
         // 索引操作数：当前网格下标（uint → float 参与算术）
         // 注：native16 谓词已排除 Row/Col/Batch 值操作数（f16 整数精度），
@@ -1862,15 +1917,17 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
         else if (disp)
         {
             L << "    if ((prec >> 16u & 1u) != 0u) {\n";
-            L << "        bout16[i] = float16_t(r" << last_dst << ");\n";
+            L << "        bout16[i] = " << glsl_f16_store("r" + std::to_string(last_dst))
+              << ";\n";
             L << "    } else {\n";
             L << "        bout[i] = r" << last_dst << ";\n";
             L << "    }\n";
         }
         else
             L << "    bout[i] = "
-              << (out_f16 ? "float16_t(r" : "r") << last_dst
-              << (out_f16 ? ")" : "") << ";\n";
+              << (out_f16 ? glsl_f16_store("r" + std::to_string(last_dst))
+                          : ("r" + std::to_string(last_dst)))
+              << ";\n";
         L << "}\n";
         return L.str();
     }
@@ -2003,13 +2060,15 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
     // 输出类型转换由本 lambda 统一负责（c16）——此前另有一个 st() 也包
     // float16_t(...)，在"非分派 + f16 输出"上生成 float16_t(float16_t(x))。
     const auto emit_store4 = [&](const char* arr, bool c16, const char* ind) {
-        const std::string o = c16 ? "float16_t(" : "";
-        const std::string c = c16 ? ")" : "";
         const std::string r = "r" + std::to_string(last_dst);
-        L << ind << arr << "[base] = " << o << r << ".x" << c << ";\n";
-        L << ind << arr << "[base+1u] = " << o << r << ".y" << c << ";\n";
-        L << ind << arr << "[base+2u] = " << o << r << ".z" << c << ";\n";
-        L << ind << arr << "[base+3u] = " << o << r << ".w" << c << ";\n";
+        const auto val = [&](char comp) {
+            const std::string v = r + "." + comp;
+            return c16 ? glsl_f16_store(v) : v;
+        };
+        L << ind << arr << "[base] = " << val('x') << ";\n";
+        L << ind << arr << "[base+1u] = " << val('y') << ";\n";
+        L << ind << arr << "[base+2u] = " << val('z') << ";\n";
+        L << ind << arr << "[base+3u] = " << val('w') << ";\n";
     };
     if (disp)
     {
@@ -2040,14 +2099,13 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
     if (disp)
     {
         L << "        if ((prec >> 16u & 1u) != 0u) {\n";
-        L << "            bout16[e] = float16_t(" << sv << ");\n";
+        L << "            bout16[e] = " << glsl_f16_store(sv) << ";\n";
         L << "        } else {\n";
         L << "            bout[e] = " << sv << ";\n";
         L << "        }\n";
     }
     else
-        L << "        bout[e] = " << (out_f16 ? "float16_t(" : "") << sv
-          << (out_f16 ? ")" : "") << ";\n";
+        L << "        bout[e] = " << (out_f16 ? glsl_f16_store(sv) : sv) << ";\n";
     L << "    }\n";
     L << "}\n";
     return L.str();
@@ -2122,7 +2180,7 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
         return (sign_f16 && expr_prec_sig_in_f16(sig, k)) ? ("float(" + raw + ")") : raw;
     };
     const auto wr = [&](const std::string& v) -> std::string {
-        return out_f16 ? ("float16_t(" + v + ")") : v;
+        return out_f16 ? glsl_f16_store(v) : v;
     };
 
     std::ostringstream L;
@@ -2139,6 +2197,8 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
     if (sign_f16)
         L << "#extension GL_EXT_shader_16bit_storage : require\n";
     L << "\n";
+    if (sign_f16)
+        L << glsl_f16_rne_source();
     L << "layout(local_size_x = 256) in;\n\n";
     for (std::size_t i = 0; i < n_inputs; ++i)
     {
@@ -2204,7 +2264,7 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
             return;
         }
         L << ind << "if ((prec >> 16u & 1u) != 0u)\n";
-        L << ind << "    bout16[" << lhs << "] = float16_t(" << v << ");\n";
+        L << ind << "    bout16[" << lhs << "] = " << glsl_f16_store(v) << ";\n";
         L << ind << "else\n";
         L << ind << "    bout[" << lhs << "] = " << v << ";\n";
     };

@@ -9,9 +9,9 @@
 
 | 资产名 | 文件 | 测试准确率 | 体积 | 训练命令 |
 |---|---|---|---|---|
-| `mnist_cnn_best_v3.bin` | 本目录 | 99.38%（该轮；5 轮均值 99.34%） | 743 KB | 见 `research/README.md` §2 |
+| `mnist_cnn_best_v3.bin` | 本目录 | 99.38%（该轮；5 轮均值 99.34%） | 743 KB | 见 `research/mnist/README.md` §2 |
 
-> 该文件在本地由 `research/scripts/focus_cnn.py` 的 confirm 轮次产出，
+> 该文件在本地由 `research/mnist/scripts/focus_cnn.py` 的 confirm 轮次产出，
 > 也可按 README §2 的命令直接重训得到（18 epoch，GPU 约 2 分钟）。
 
 ## 复现权重

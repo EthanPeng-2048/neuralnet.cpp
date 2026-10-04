@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """零依赖 SVG 图表生成（无 matplotlib）：从 all_runs.csv 画研究用图。
 
-用法: python research/scripts/charts.py
-输出: research/results/charts/*.svg
+用法: python research/mnist/scripts/charts.py
+输出: research/mnist/results/charts/*.svg
 """
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ import math
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(os.path.dirname(HERE))
-RES = os.path.join(ROOT, "research", "results")
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+RES = os.path.join(ROOT, "research", "mnist", "results")
 OUT = os.path.join(RES, "charts")
 
 W, H = 760, 430

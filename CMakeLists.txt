@@ -585,10 +585,12 @@ if(Vulkan_FOUND)
         set(GPU_SHADER_HPPS ${GPU_SHADER_HPPS} ${HPP} PARENT_SCOPE)
 
         # 编译 GLSL → SPIR-V
+        #   -I shaders：手写 shader 的 #include "nn_f16_rne.glsl"（f16 写出的
+        #   RNE 预舍入，见该文件头注释）；所有 shader 都依赖它 → 改动时全量重编。
         add_custom_command(
             OUTPUT ${SPV}
-            COMMAND ${GLSLC} ${ARGN} -o ${SPV} ${SRC_FILE}
-            DEPENDS ${SRC_FILE}
+            COMMAND ${GLSLC} -I ${CMAKE_CURRENT_SOURCE_DIR}/shaders ${ARGN} -o ${SPV} ${SRC_FILE}
+            DEPENDS ${SRC_FILE} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/nn_f16_rne.glsl
             COMMENT "[GPU] Compiling ${SHADER_NAME}.comp → ${SHADER_NAME}.spv"
         )
 

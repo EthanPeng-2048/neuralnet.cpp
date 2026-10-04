@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """聚焦实验：在「体积可控」的前提下把 MNIST CNN 测试准确率推到 99.3%+。
 
-与 research/scripts/sweep.py 的区别：
+与 research/mnist/scripts/sweep.py 的区别：
   * 只用**默认打乱**训练制度（shuffle=true）——这是真实使用制度，也是历次高分的来源；
   * 两阶段：screen（每个候选 1 轮，快筛）→ confirm（筛出的前几名各 3 轮，取均值±std）；
   * 目标口径：**多轮均值** ≥ 99.3%，同时模型体积尽量小。
 
 用法：
-  python research/scripts/focus_cnn.py --stage screen   --jobs 4
-  python research/scripts/focus_cnn.py --stage confirm  --jobs 4
-  python research/scripts/focus_cnn.py --stage report
+  python research/mnist/scripts/focus_cnn.py --stage screen   --jobs 4
+  python research/mnist/scripts/focus_cnn.py --stage confirm  --jobs 4
+  python research/mnist/scripts/focus_cnn.py --stage report
 """
 from __future__ import annotations
 
@@ -25,8 +25,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(os.path.dirname(HERE))
-OUT = os.path.join(ROOT, "research", "results", "focus_cnn")
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+OUT = os.path.join(ROOT, "research", "mnist", "results", "focus_cnn")
 # 必须用 build_rel（Release + 含 NormPlace/BatchNorm 提交的源码）：
 # 仓库里原有的 build/ 是 2026-10-02 的 Debug 产物，早于 --norm-place 特性。
 TRAIN = os.path.join(ROOT, "build_rel", "mnist_train.exe")

@@ -41,7 +41,9 @@
 #define NN_V4   uvec2
 #define NN_LOADV4(v) vec4(unpackHalf2x16((v).x), unpackHalf2x16((v).y))
 #define NN_RD(x) float(x)
-#define NN_WR(x) float16_t(x)
+// f16 写出的 RNE 舍入（同 matmul_tiled：OpFConvert 舍入未钉死，pack 按 RNE）
+#include "nn_f16_rne.glsl"
+#define NN_WR(w) float16_t(nn_f16_rne(w))
 #else
 #define NN_ETYPE float
 #define NN_V4   vec4

@@ -11,6 +11,8 @@
 #version 450
 layout(local_size_x = 256) in;
 
+#include "nn_f16_rne.glsl"
+
 layout(std430, binding = 0) readonly  buffer BufS { uint S[]; };
 layout(std430, binding = 1) writeonly buffer BufD { uint D[]; };
 
@@ -37,13 +39,15 @@ void main() {
     }
     else
     {
-        // f32 → f16（降精度，packHalf2x16 按 round-half-to-even）
+        // f32 → f16（降精度）：packHalf2x16 的舍入模式**未被规范钉死**，实测
+        // NVIDIA 驱动向零截断（Khronos Vulkan-Docs #1825）→ 先用整数位运算做
+        // RNE 预舍入，值落在 f16 网格上后再打包，打包不再产生偏差。
         for (uint w = gl_GlobalInvocationID.x; w < pairs; w += gsize)
         {
             const uint i0 = 2u * w;
             const float x = uintBitsToFloat(S[i0]);
             const float y = (i0 + 1u < count) ? uintBitsToFloat(S[i0 + 1u]) : 0.0f;
-            D[w] = packHalf2x16(vec2(x, y));
+            D[w] = packHalf2x16(vec2(nn_f16_rne(x), nn_f16_rne(y)));
         }
     }
 }
