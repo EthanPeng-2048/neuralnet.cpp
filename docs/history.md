@@ -26,7 +26,7 @@
 - [docs/development 02 · 03 · 05](#docs/development 02 · 03 · 05)（19 条）
 - [docs/development 01 · 04 · 06 · 07 · 10 · 14](#docs/development 01 · 04 · 06 · 07 · 10 · 14)（25 条）
 - [docs/introduction · usage · benchmarks](#docs/introduction · usage · benchmarks)（46 条）
-- [构建系统 / CI（CMakeLists.txt、.github/workflows）](#构建系统 / CI（CMakeLists.txt、.github/workflows）)（3 条）
+- [构建系统 / CI（CMakeLists.txt、.github/workflows）](#构建系统 / CI（CMakeLists.txt、.github/workflows）)（5 条）
 - [AGENTS.md](#AGENTS.md)（24 条）
 - [ZiPT（AttnZip）移除](#ZiPT（AttnZip）移除（2026-10-01）)（1 条）
 - [GUI / CLI 参数一致性清理](#GUI / CLI 参数一致性清理（2026-10-01）)（1 条）
@@ -1799,6 +1799,42 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 - 触发条件：收集器 TU 在**自身产物注册表已存在**时重编译（改 `tools/scan_exprs.cpp` 或其头链即触发）→ 依赖记录入库 → 下次 ninja 图加载报环；首次干净构建不会触发（当时注册表尚不存在），所以 f093261 当时的“二次增量构建无依赖环”验证漏掉了这一形态。
 - 修复位置：`include/neuralnet.cpp/backend/compute_vk_backend.hpp` 的 fused_registry 嵌入守卫（注释同步记录“为何不能用 && 同行守卫”）。
 - 验收：`ninja -t deps` 中 `fusion_custom_layer_example_nnfusion_collect` 的 TU 不再出现 `nn_fusion/.../fused_registry.hpp`（应用 TU 对注册表的合法持有不变）；全量干净重建 + ctest 23 用例（21 过 + 2 个 Mali 已知非确定 offload 用例，`NN_VULKAN_DEVICE=1` Lavapipe 下全过）。
+
+## 构建提速：关模块扫描 / 共享 PCH / glslc 并行 + 注册表内容稳定写入（2026-10-04）
+
+- 类型：性能 A/B / 演进记录
+- 背景：Debug + clang + Ninja + `NN_ENABLE_TESTS=ON` 下全量净构建 **125.5s**，单 TU **17.5s**，改任意公共头即接近全量重编。
+- 实测诊断（`.ninja_log` 逐边计时 + 手工 A/B）：
+  - 单 TU 编译 17.5s（`-O0`，成本在前端 parse 而非 codegen）；
+  - CMake 为**每个** TU 追加一次 `clang-scan-deps` 模块依赖扫描 ~2.1s（`*.obj.ddi` / `CXX.dd` / `*.obj.modmap` 三条边），而本项目零 `import`/`export module`；
+  - `scan_exprs` 生成阶段 **55.7s ≈ 221 次串行 glslc**（91 结构 + 130 精度变体，单次 ~250ms）；
+  - `fusion_custom_layer_example` 的收集器另跑一遍 ~279 次 glslc（60–77s）；
+  - `fused_registry.hpp`（4.7MB）**无条件 ofstream 覆写** → 每次重跑都改 mtime → 下游全部 TU 重编（该自定义命令本来就带 `restat = 1`，白白浪费）。
+- 整改（四处）：
+  1. `CMakeLists.txt`：`set(CMAKE_CXX_SCAN_FOR_MODULES OFF)`——零模块 → 扫描纯浪费，`.ddi`/`.modmap` 边整体消失。
+  2. `CMakeLists.txt`：`NN_ENABLE_PCH`（默认 ON）——`target_precompile_headers` 把 `nn.hpp` 预编译一次，31 个编译条件相同的目标 `REUSE_FROM nn_pch` **共享 1 份**（而非 31 份 × 79MB / ~780s CPU）；收集器目标**不套** PCH（`scan_exprs.cpp` 在源文件内、include 之前自行 `#define NN_EXPR_SCAN`，PCH 会先于该宏展开 `nn.hpp` → DSL 收集钩子失效、注册表空）。
+  3. `tools/fused_generate.hpp`：glslc 改线程池并行（默认 `hardware_concurrency`，`NN_SCAN_JOBS=<n>` 覆盖，`=1` 即旧串行）；注册表改 `write_if_different` 内容稳定写入。
+  4. `CMakeLists.txt`：编译器缓存探测扩到 ccache/**sccache**（Windows 上 ccache 常缺席）+ `NN_COMPILER_LAUNCHER` 覆盖；调用方已给 `-DCMAKE_CXX_COMPILER_LAUNCHER`（CI 即如此）时不再叠 `RULE_LAUNCH_COMPILE`，避免 `ccache ccache clang++`。
+- **⚠ 共享 PCH 必须 `add_dependencies(nn_pch compile_gpu_shaders)`**（本轮唯一踩到的坑）：`nn.hpp` 里 36 个 `#if __has_include("..._spv.hpp")` 与融合注册表嵌入，是在**编 PCH 那一刻**求值的——早于生成完成就整块落空，且因为"没 include 就没 depfile 记录"**永远不会自愈**。本轮症状：6 个 GPU 用例运行期报 `matmul SPIR-V bytecode not embedded`（脏目录上重建一次就看不出来）。逐目标 PCH 天然带 `cmake_object_order_depends_target_*`，共享 PCH 没有，必须显式补。
+- 实测（本机 Debug / clang 23 / Xeon E5-2697A v4 · 32 线程 / 64GB）：全量净构建 **125.5s → 72.7s（-42%）**；改单个源文件 **43.9s → 10.4s**；`scan_exprs` **55.7s → 6.4s**（`NN_SCAN_JOBS=1` 仍 55.9s，证明并行是唯一变量）；无改动构建 0.1s（restat 生效）。
+- 字节/行为零变化验收：`fused_registry.hpp` SHA256 与整改前**逐字节相同**（`7445E642DB8CEF6833D9DA6796AD8E5EA44D3394F31AFB063F325DFCC59960EF`，注意写回仍是**文本模式**以免把生成头从 CRLF 变 LF）；ctest **23/23** 全过（含 6 个 GPU 用例）；`-DNN_ENABLE_PCH=OFF` 与 `-DNN_ENABLE_TESTS=OFF` 两种配置均配置+构建通过。
+- 教训：`__has_include` 在 PCH 里是**一次性**求值；生成物参与 PCH 时，PCH 的编译边必须显式依赖生成边，否则 depfile 里没有记录、构建系统不会自愈。
+
+## 作为库被消费（P0-4 嵌入路径，2026-10-04）
+
+- 类型：演进记录 / bug 根因（roadmap E2「无 install/export、库无法被下游消费」的**嵌入路径**部分；install/find_package 与 CMakePresets 本轮按用户裁定**不做**、留 P0-4 剩余部分）
+- 背景：用户诉求 = 「把库放进 3rd_party/，CMake 两行 + 一个 include 即可用，且能随意控制 NN_HAS_VULKAN 这类参数」。改造前实测缺口：① 无门面目标（消费方要自己拼 include 目录/线程/标准）；② 根 CMakeLists 用 `CMAKE_SOURCE_DIR`/`CMAKE_BINARY_DIR` 共 ~30 处——嵌入时全部指到**消费方**工程根（路径全错）；③ 无条件创建 9 个 app/探针目标 + `CMAKE_BUILD_TYPE` FORCE + ccache `RULE_LAUNCH_*`（GLOBAL 属性）泄漏进消费方；④ `nn_enable_gpu_fusion` 函数体在**调用方作用域**求值，`SCAN_SRC`/`GLSLC`/`CMAKE_SOURCE_DIR` 等在树外作用域全错——树外工程根本无法调用（AGENTS §7 已注明的缺口）。
+- 整改（`CMakeLists.txt` 重构 + 新增 `examples/downstream/`、`docs/usage/05-consume-as-library.md`）：
+  1. **门面目标 `neuralnet::nn`**（ALIAS `neuralnet_cpp`）：`add_subdirectory` 后一行 `target_link_libraries(app PRIVATE neuralnet::nn)` 即拿到 include/`target_compile_features`（**实测 CMake 4.3：MSVC cl 不识别 `cxx_std_26`**（报 "not known to CXX compiler"）、其 `cxx_std_23` 映射即 `/std:c++latest`；Clang/GNU 认 `cxx_std_26` → 按 `CMAKE_CXX_COMPILE_FEATURES` 实测列表分流）/Threads/stacktrace；GPU 时再补 `NN_HAS_VULKAN` + `generated/` 嵌入头目录 + `Vulkan::Vulkan` + `add_dependencies(compile_gpu_shaders)`（**INTERFACE 库的 add_dependencies 实测挂到消费方目标的编译边** `cmake_object_order_depends_target_*`，保证 SPIR-V 头先于消费方 TU 编译）。
+  2. **`NN_BUILD_APPS`（默认 = `PROJECT_IS_TOP_LEVEL`）**：嵌入时默认 OFF，消费方不再被迫编 9 个 app；`f16_writeback_probe` 因双身份（app + ctest）按「任一开关」单独创建。
+  3. **`NN_ENABLE_GPU=AUTO|ON|OFF`**（默认 AUTO = 历史行为）：ON = 缺 Vulkan/glslc 配置期 fail-fast（含 glslc 单独校验）；OFF = 完全跳过探测/shader/`scan_exprs`（纯 CPU 最快路径）。控制权交给消费方（用户原始诉求）。
+  4. **路径全改 `CMAKE_CURRENT_*` + 函数作用域修复**：`nn_enable_gpu_fusion` 体内改用 `NN_LIB_SOURCE_DIR`/`NN_LIB_BINARY_DIR`（`CACHE INTERNAL`，每次 configure 刷新、全局可见）——因为**函数体在调用方作用域求值**，`CMAKE_SOURCE_DIR` 在树外 = 消费方根（实测）。GPU 不可用时定义 **stub 函数**给指向根因的 FATAL_ERROR（否则是难定位的 "Unknown CMake command"）。
+  5. **泄漏收口**：`CMAKE_BUILD_TYPE` FORCE、ccache `RULE_LAUNCH_*`（GLOBAL）自动探测均仅顶层工程生效；GNU stacktrace 探测失败的 FATAL_ERROR 降级为警告（嵌入方编头文件用不到它——**全仓只有 `tools/scan_exprs.cpp` 用 `std::stacktrace`**，grep 确认）。
+  6. **消费方编译选项随门面传递**（实测缺口：下游 Release 构建库头文件出 6 个 `-Wpass-failed` 警告——`#pragma clang loop` 向量化未达成，库内靠 `-Wno-pass-failed` 压住，**消费方开 `-Werror` 即挂**）：Clang 传 `-fexperimental-library` + `-Wno-pass-failed`（`$<COMPILE_LANG_AND_ID:CXX,...>` 限定），MSVC 传 `/utf-8`（库头文件是 UTF-8 + 中文注释）；`-fno-exceptions` **不传**（库头文件不用异常，异常策略留给消费方）。
+  7. **收集器改链门面**：`nn_enable_gpu_fusion` 的收集器原链 `nn_core` + 直连 `Vulkan::Vulkan`——树外实测 **imported 目标不可跨目录引用**（`target was not found`，探针复现）；且消费方目标的 `NN_HAS_VULKAN` 经 INTERFACE 传递、`$<TARGET_PROPERTY:...,COMPILE_DEFINITIONS>` **取不到**（只查目标自身属性）→ 收集器会漏编 `#ifdef NN_HAS_VULKAN` 内的层调用点 = 闭合世界硬报错。改链 `neuralnet::nn` 一并解决（imported 目标在**定义侧**解析，探针验证可用）。
+- 验收：① 本仓顶层配置+全量构建回归（首次重配后 ninja "no work to do" = 编译命令行零变化）；② 下游样例 **CPU 路径**（`NN_ENABLE_GPU=OFF`）构建+运行过、警告归零；③ 下游 **GPU 路径**（`NN_ENABLE_GPU=ON`）构建（shader 生成 + `scan_exprs` 收集 **91 条 = 库内口径**）+ 运行过（CPU/GPU forward 都 OK）；④ fusion 树外调用（`-DNN_DOWNSTREAM_FUSION=ON`，从消费方 CMakeLists 调 `nn_enable_gpu_fusion`）；⑤ 本仓 `NN_ENABLE_TESTS=ON` 全量 ctest。
+- 未做（按用户裁定留 P0-4 剩余）：`install()`/`find_package`/`CMakePresets.json`；`nn_enable_gpu_fusion` 的 `COLLECT <file>` 钩子（25 条 dry-run 独有结构的残余不确定性，见 §7 融合条）。
+- 探针实测记录（改造前用 6 个最小 CMake 工程验证的 4 个行为，均影响方案写法）：INTERFACE 库携带 imported target（Threads/Vulkan）可跨目录传递 ✓；INTERFACE 库的 `add_dependencies` 传递到消费方**编译边** ✓；MSVC cl 不识别 `cxx_std_26` ✗（Clang 认）；ALIAS/普通目标跨目录可见 ✓、**imported 目标直连不可见** ✗；目标自身 include 目录恒先于 INTERFACE 目录（决定 `NNF_OUT_DIR` 排序语义）✓；空列表 `foreach` 安全 ✓。
 
 ## 编译器与标准库一律默认（2026-09-27，原位置 .github/workflows/cmake-single-platform.yml 原 2/53-60/71-73/182-215/281 行、AGENTS.md:22、src/expr_dsl_test.cpp:13、src/expr_opt_test.cpp:13）
 

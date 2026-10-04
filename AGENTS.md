@@ -21,7 +21,9 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 
 - 链接报 `permission denied`（`build/` 下 exe 正在运行被占用 → 构建中止，易误判为"未改动"）：追加 `-- -k 0` 让 ninja 跳过失败目标继续构建其余目标；被占用目标仍需关掉进程后重链。
 - 编译器与标准库：**CMakeLists 不指定**（编译器由 CMake 默认探测或调用方 `CXX=...` / `-DCMAKE_CXX_COMPILER` 决定，标准库跟随编译器默认）；**CI 显式指定 clang++**（Linux/Windows，避免 GCC 独有警告在 `-Werror` 下失败）。标准库编译/链接两侧必须一致（否则链接期大量 `std::__cxx11::*` 未定义）。CMake 3.30+；已验证 Clang 22+（C++26）、g++ 15.2、MSVC（走 `/std:c++latest`）均可构建。
-- 构建选项：`NN_ENABLE_NATIVE`（默认 ON，开启 `-march=native`，分发/CI 用 `OFF` 生成可移植基线）；`NN_ENABLE_TESTS`（默认 OFF）。
+- 构建选项：`NN_ENABLE_NATIVE`（默认 ON，开启 `-march=native`，分发/CI 用 `OFF` 生成可移植基线）；`NN_ENABLE_TESTS`（默认 OFF）；`NN_ENABLE_PCH`（默认 ON，见下）。
+- **作为库被消费（嵌入 3rd_party / FetchContent）**：门面目标 `neuralnet::nn`——消费方 `add_subdirectory` 后 `target_link_libraries(app PRIVATE neuralnet::nn)` + `#include <neuralnet.cpp/nn.hpp>` 即可（C++26/线程/`NN_HAS_VULKAN`/SPIR-V 嵌入头目录/Vulkan 链接/shader 生成顺序全部经接口传递）。嵌入时 `NN_BUILD_APPS` 默认 OFF（不编本仓 9 个 app；顶层工程默认 ON）；`NN_ENABLE_GPU=AUTO|ON|OFF` 一行控制 GPU（`OFF`=纯 CPU 最快路径，`ON`=缺 Vulkan/glslc 配置期失败）；自研 `dsl::compute` 的融合注册 `nn_enable_gpu_fusion(<target> MAIN <main源>)`（仅 GPU 启用时有定义；**函数体在调用方作用域求值**，库内路径经 `NN_LIB_SOURCE_DIR`/`NN_LIB_BINARY_DIR` CACHE 变量解析，函数内不可用 `CMAKE_SOURCE_DIR`）。样例 `examples/downstream/`（独立工程），指南 `docs/usage/05-consume-as-library.md`。⚠ 两条实测约束：① `Vulkan::Vulkan` 是 imported 目标**不可跨目录直接引用**（消费方直接链接报 target not found），一律经 `neuralnet::nn` 传递；② 库头文件需要 `-Wno-pass-failed`/`-fexperimental-library`（Clang）与 `/utf-8`（MSVC），已作为接口选项随门面传递——漏传时消费方开 `-Werror` 会挂在 `#pragma clang loop` 警告上。
+- **编译提速（默认已开启，无需额外配置）**：本工程 header-only，单 TU 17.5s 的大头是重复 parse `nn.hpp`（含 36 份原语 SPIR-V 嵌入头 + AOT 融合注册表）。已落地四件事：① `NN_ENABLE_PCH`——`nn.hpp` 预编译一次，由 31 个编译条件相同的目标 `REUSE_FROM nn_pch` 共享；② `CMAKE_CXX_SCAN_FOR_MODULES OFF`——本项目零 C++ 模块，省掉每 TU 一次 `clang-scan-deps`；③ `scan_exprs` 的 glslc **并行**（`NN_SCAN_JOBS=<n>` 覆盖，`=1` 回串行）+ `fused_registry.hpp` **内容稳定写入**（内容不变则不动 mtime，靠自定义命令的 `restat` 掐断下游全量重编）；④ 编译器缓存探测扩到 ccache/**sccache**（`-DNN_COMPILER_LAUNCHER=<path>` 可指定）。实测（Debug/本机）：全量净构建 125.5s→72.7s、改单个源文件 43.9s→10.4s。**⚠ 两条不变量**：(a) 收集器目标（`scan_exprs`、`*_nnfusion_collect`）**不套 PCH**——前者在源文件内、include 之前 `#define NN_EXPR_SCAN`，PCH 会先于该宏展开 `nn.hpp` → DSL 收集钩子失效（注册表空）；(b) 新写"生成物参与 PCH"的场景必须显式 `add_dependencies(<pch_target>, <生成边>)`——`__has_include` 在 PCH 里**一次性**求值，早于生成完成就整块落空且因无 depfile 记录而永不重试。
 - Vulkan 可选：CMake 自动探测 Vulkan + glslc，找到则定义 `NN_HAS_VULKAN` 启用 GPU，否则纯 CPU。支持多 Vulkan 设备选择（`--gpu` 参数，见 `cli/cli_gpu_option.hpp`）。
 - **本项目不支持 CUDA**：后端仅 CPU / Vulkan，CLI 无 `--cuda` 参数；文档勿声称支持 CUDA。
 - 应用入口：`build/{mnist_train,mnist_infer,text_train,text_infer,tokenizer_train,tokenizer_infer}`，另有 `layer_bench`（性能）与测试类可执行文件。`gui.py` 是 Python GUI，`train_pkg.py` 打包 `.nnpkg` 训练包，`cli_controllers.py` 提供 CLI 控制逻辑。
@@ -280,6 +282,7 @@ optimizer.step();
 | `usage/02-quickstart-train-infer.md` | 训练/推理 CLI + C++ API + GUI |
 | `usage/03-compute-engine-usage.md` | 计算引擎使用指南：张量操作、矩阵运算、表达式融合 |
 | `usage/04-train-package.md` | `.nnpkg` 训练包 |
+| `usage/05-consume-as-library.md` | **把库嵌进自己工程（add_subdirectory/FetchContent）：`neuralnet::nn` 门面、`NN_ENABLE_GPU`/`NN_BUILD_APPS` 开关、`nn_enable_gpu_fusion`、故障排查** |
 
 ## 12. 当前状态
 
