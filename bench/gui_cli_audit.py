@@ -91,6 +91,7 @@ CASES.append(("tokenizer_infer", TokenizerInferController(), dict(
 GPT_COMMON = dict(
     save="g.bin", test_file="t.txt", vocab="v.json", epochs=10, batch_size=32,
     accum_steps=1, seq_len=256, stride=0, optimizer="adam", weight_decay=0.01,
+    loss_scope="all",
     gpu=True, lr=0.001, lr_schedule="cosine", min_lr=1e-6, warmup_epochs=1,
     d_model=128, num_heads=4, num_layers=4, d_ff=512,
     flush_interval=1, checkpoint_every=1, activation_offload=True,
@@ -102,9 +103,10 @@ CASES.append(("text_train", GptTrainController(), dict(
     **{**GPT_COMMON,
        "model": "rapt", "resume": "r.bin", "resume_epoch": 1, "resume_step": 5,
        "lr_schedule": "step_cosine", "warmup_steps": 10, "max_norm": 1.0,
+       "beta1": 0.9, "beta2": 0.95,
        "lr_per_epoch": "0.001"})))
 CASES.append(("text_train", GptTrainController(), dict(
-    model="gpt", text_file="t.txt", f16=True)))
+    model="gpt", text_file="t.txt", f16=True, max_steps=5)))
 
 CASES.append(("text_infer", GptInferController(), dict(
     model="g.bin", vocab="v.json", prompt="hello", max_tokens=200,

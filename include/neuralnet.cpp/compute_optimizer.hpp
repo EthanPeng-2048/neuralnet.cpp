@@ -724,6 +724,8 @@ public:
 // 未知名称返回 nullptr，由调用方处理。
 // precision：模型级精度配置（§9.1）——状态张量按 p.optimizer 创建，参数更新
 // 走 in-place（存储精度不可变）。默认全 F32。
+// beta1/beta2：仅 adam/adamw 使用（sgd 家族与 muon 忽略）。默认 0.9/0.999；
+// LLM 预训练惯例常取 beta2=0.95（如 GPT-3 / LLaMA 配方）。
 [[nodiscard]] inline std::unique_ptr<Optimizer> create_optimizer(
     std::string_view name,
     ComputeEngine& engine,
@@ -731,7 +733,9 @@ public:
     std::vector<TensorRef> grads,
     Scalar lr,
     Scalar weight_decay = 0,
-    PrecisionProfile precision = PrecisionProfile{})
+    PrecisionProfile precision = PrecisionProfile{},
+    Scalar beta1 = 0.9,
+    Scalar beta2 = 0.999)
 {
     if (name == "sgd")
         return std::make_unique<SGD>(engine, std::move(params), std::move(grads), lr,
@@ -741,10 +745,10 @@ public:
                                                  std::move(grads), lr, 0.9, precision);
     if (name == "adam")
         return std::make_unique<Adam>(engine, std::move(params), std::move(grads), lr,
-                                      0.9, 0.999, 1e-8, precision);
+                                      beta1, beta2, 1e-8, precision);
     if (name == "adamw")
         return std::make_unique<AdamW>(engine, std::move(params), std::move(grads), lr,
-                                       0.9, 0.999, 1e-8, weight_decay, precision);
+                                       beta1, beta2, 1e-8, weight_decay, precision);
     if (name == "muon")
         return std::make_unique<Muon>(engine, std::move(params), std::move(grads), lr,
                                       0.95f, true, 5, 1e-7f, precision);
