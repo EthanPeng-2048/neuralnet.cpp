@@ -14,7 +14,7 @@
 - [注意力 / ZiPT / Transformer / FeedForward 层](#注意力 / ZiPT / Transformer / FeedForward 层)（16 条）
 - [RAPT / CNN / MLP / Softmax / GPT 层](#RAPT / CNN / MLP / Softmax / GPT 层)（13 条）
 - [引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器](#引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器)（19 条）
-- [代数层 / 基础设施 / 模型容器与序列化](#代数层 / 基础设施 / 模型容器与序列化)（14 条）
+- [代数层 / 基础设施 / 模型容器与序列化](#代数层 / 基础设施 / 模型容器与序列化)（15 条）
 - [领域模型工厂与 CLI 公共头](#领域模型工厂与 CLI 公共头)（3 条）
 - [src 应用入口（text/mnist/tokenizer/bench）](#src 应用入口（text/mnist/tokenizer/bench）)（5 条）
 - [GPU 手写原语 shader（shaders/*.comp）](#GPU 手写原语 shader（shaders/*.comp）)（12 条）
@@ -741,6 +741,19 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 - **验收（本机 Release + Ninja + clang）**：`cmake --build --clean-first` 全量零告警（`-Werror`）；ctest **24/24**、带与不带 `NN_BIND_DEBUG=1` 各一轮 **24/24**；`gpu_stability_probe --init-hash` **五锚与迁移前逐位一致**（`3e982d018c00d94a`/`d8c8457f0053c4f9`/`70c4c085052268b2`/`f8c2d892f5834239`/`7002b986b84f679f`）；scan 结构仍 **91**（+130 变体 = 221 注册表条目）、`fused_registry.hpp` 内容未变；`L2-VIOLATIONS: 0`；`gui_cli_audit` PASS；`doc_align_audit` EXIT 0。
 - **新门禁（`bench/doc_inventory.ps1` 第 [5] 节）**：**手写 `return std::unexpected` 残留计数** —— 剥注释/字符串、豁免 `core_assert.hpp` 宏定义体、`core_errors.hpp` 的 `#define` 宏体、`error_macro_test.cpp` 夹具；**验收 = 残留 ≤ 基线 45**（当前实测 36），超基线即 `exit 1`。用意：新增错误检查一律走宏族，不应再出现裸 `unexpected`，防止迁移成果回潮。
 - **本轮未动**：518 处错误源 `NN_FAIL` 化中已迁的部分并入 A 批；剩余错误源裁定**不强制**（纯美观）。数据管道 `nn::data::`、`nn::generate` 仍**裁定推迟**。
+
+## 错误处理宏族 2 阶段：36 处边缘形态人工清零，门禁基线 45 → 0（2026-10-05）
+- 类型：演进记录（上一条"两批迁移完成"的收尾；原裁定"残留需人工审"的最终处置，剩余错误源同批并入）
+- **范围**：上轮门禁放行的 **36 处**手写 `return std::unexpected`（= 全仓剩余站点，宏定义体/注释/测试夹具豁免不计）逐一人工改宏，全部为**传播**与**错误源**两类，无行为变化：
+  - `compute_vk_backend.hpp` **22 处** = 主形态「失败分支先清理资源再传播」（`vkDestroyBuffer` / `vkFreeDescriptorSets` / `batch_mode_ = false` 后返回）→ 清理语句原样保留、return 行改 `NN_TRY_CHECK(x);`（宏在失败块内重测恒假 → 立即同错返回，展开与原手写逐字等价）；
+  - `compute_layer_gpt.hpp` **5 处**：`init_impl` 内联单行与滑窗 `engine.zero` 循环 → `{ NN_TRY(r, …); }`（声明型宏必须留花括号，否则 if/for 控制两条语句编译失败）；`fill_cache_` 内 end_batch 收尾后传播 → `NN_TRY_CHECK(r)`；
+  - `compute_layer_rapt.hpp` **4 处**：`dsl::compute` 结果传播（含尾随 `//` 注释两处）→ `NN_TRY_CHECK`；
+  - `compute_engine.hpp` **2 处**：跨行 `return std::unexpected(\n bind_error_(…))` 错误源 → `NN_FAIL(bind_error_(…))`（`Error{Error}` 拷贝构造，消息与 `NN_BIND_DEBUG` 打印逐字不变）；
+  - `compute_optimizer.hpp` **1 处**：`*init_error_` 解引用 → `if (init_error_) NN_FAIL(*init_error_);`
+  - `cli_mnist_io.hpp` **1 处**（end_batch 收尾后传播）、`gpu_stability_probe.cpp` **1 处**（init-statement 守卫 → `NN_TRY(r3, …)`，同块序号连带 r3/r4/r5 顺移 = 纯变量改名）。
+- **裁定保留（表达式形态，非 return 站点、门禁本就不计）**：`gpu_test.cpp:291` 的三元链 `Result<T>{std::unexpected(r.error())}` —— 错误沿表达式传给本循环自己的 `if (!out_r)` 处理（打印 + `++failures` + `continue`，不是函数返回），宏是语句、不能置于表达式内；改写需复制失败处理逻辑，风险 > 收益。
+- **门禁基线 45 → 0**（`bench/doc_inventory.ps1` 第 [5] 节）：`HANDWRITTEN-RESIDUE: 0`；此后新增任何裸 `return std::unexpected` 直接 `exit 1`（宏定义体/注释/夹具三类豁免不变）。
+- **验收（本机 Release + Ninja + clang）**：build 75 目标零告警（`-Werror`）；ctest **24/24**、带 `NN_BIND_DEBUG=1` 一轮 **24/24**；`gpu_stability_probe --init-hash` 五锚与迁移前**逐位一致**（`3e982d018c00d94a`/`d8c8457f0053c4f9`/`70c4c085052268b2`/`f8c2d892f5834239`/`7002b986b84f679f`）；`L2-VIOLATIONS: 0`、`HANDWRITTEN-RESIDUE: 0 (baseline 0)`；`gui_cli_audit` PASS；`doc_align_audit` EXIT 0。
 
 ---
 

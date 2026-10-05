@@ -194,7 +194,7 @@ namespace nn::cli
             if (!out_tensor_r)
             {
                 (void)engine.end_batch();   // 出错也收尾，避免录制状态泄漏
-                return std::unexpected(out_tensor_r.error());
+                NN_TRY_CHECK(out_tensor_r);
             }
 
             auto eb = engine.end_batch();

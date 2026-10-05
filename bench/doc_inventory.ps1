@@ -85,10 +85,11 @@ Write-Output ("  L2-VIOLATIONS: {0}" -f ($violType.Count + $violVerb.Count))
 #    迁移后的**手写 `return std::unexpected` 残留**计数。
 #    剔除：注释、字符串字面量内出现、以及 core_assert.hpp 的宏定义体（NN_ASSERT 实现，
 #    其中 `return std::unexpected(nn::Error{(msg)})` 是宏展开目标，必须保留）。
-#    验收口径：残留数不高于基线（迁移后人工审的边缘形态），且**不随新代码增长**——
-#    新增错误检查一律用宏族（NN_TRY/NN_EXIT/NN_FAIL），不应再出现裸 unexpected。
-#    当前基线：45（2026-10-05 两批迁移后实测）。
-$baseline = 45
+#    验收口径：残留数不高于基线（基线 = 0，2026-10-05 2 阶段边缘形态清零），
+#    且**不随新代码增长**——新增错误检查一律用宏族（NN_TRY/NN_EXIT/NN_FAIL），
+#    不应再出现裸 unexpected。
+#    当前基线：0（2026-10-05 两批迁移 + 2 阶段 36 处边缘形态清零后实测）。
+$baseline = 0
 $residue = @()
 $scanDirs = @('include', 'src', 'tools', 'examples', 'bench')
 foreach ($d in $scanDirs) {

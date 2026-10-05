@@ -211,9 +211,8 @@ namespace
         ccfg.convs = nn::MNIST_CNN_CONVS;
         ccfg.fc_dims = nn::MNIST_CNN_FC;
         NN_TRY(r2, hash_model(e, "cnn", nn::build_cnn_model(e, ccfg), out));
-        if (auto r = hash_model(e, "mnist_transformer",
-                                nn::build_mnist_transformer_model(e), out); !r)
-            return std::unexpected(r.error());
+        NN_TRY(r3, hash_model(e, "mnist_transformer",
+                              nn::build_mnist_transformer_model(e), out));
         nn::GptConfig gcfg{};
         gcfg.vocab_size = 257;
         gcfg.d_model     = 32;
@@ -221,7 +220,7 @@ namespace
         gcfg.num_heads   = 4;
         gcfg.d_ff        = 128;
         gcfg.num_layers  = 2;
-        NN_TRY(r3, hash_model(e, "gpt", nn::build_gpt_model(e, gcfg), out));
+        NN_TRY(r4, hash_model(e, "gpt", nn::build_gpt_model(e, gcfg), out));
         nn::RAPTConfig rcfg;
         rcfg.vocab_size = 257;
         rcfg.d_model    = 32;
@@ -229,7 +228,7 @@ namespace
         rcfg.num_heads  = 4;
         rcfg.d_ff       = 64;
         rcfg.num_layers = 2;
-        NN_TRY(r4, hash_model(e, "rapt", nn::build_rapt_model(e, rcfg), out));
+        NN_TRY(r5, hash_model(e, "rapt", nn::build_rapt_model(e, rcfg), out));
         return out;
     }
 
