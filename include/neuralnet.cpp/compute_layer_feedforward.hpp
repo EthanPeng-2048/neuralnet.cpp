@@ -42,8 +42,8 @@ public:
         NN_TRY(r2, fc2_.init(engine));
         // M6 段 C：激活子层也是 Layer（engine 由 init 绑定），必须一并 init——
         // 否则 forward 里调 gelu_/swiglu_.forward() 会在 engine_ref() 处 fail-fast。
-        { auto r = gelu_.init(engine);   if (!r) return std::unexpected(r.error()); }
-        { auto r = swiglu_.init(engine); if (!r) return std::unexpected(r.error()); }
+        { NN_TRY(r, gelu_.init(engine)); }
+        { NN_TRY(r, swiglu_.init(engine)); }
         return {};
     }
 

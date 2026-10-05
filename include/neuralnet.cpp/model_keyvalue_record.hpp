@@ -163,28 +163,27 @@ inline Result<KeyValueRecord> KeyValueRecord::parse(std::string_view bytes)
     KeyValueRecord rec;
     uint32_t count = 0;
     if (!detail::take_u32(bytes, count))
-        return std::unexpected(Error{"KeyValueRecord::parse: 缺少字段计数"});
-
+        NN_FAIL("KeyValueRecord::parse: 缺少字段计数");
     for (uint32_t i = 0; i < count; ++i)
     {
         uint32_t key_len = 0;
         if (!detail::take_u32(bytes, key_len))
-            return std::unexpected(Error{"KeyValueRecord::parse: 字段 key 长度越界"});
+            NN_FAIL("KeyValueRecord::parse: 字段 key 长度越界");
         if (bytes.size() < key_len)
-            return std::unexpected(Error{"KeyValueRecord::parse: key 数据不足"});
+            NN_FAIL("KeyValueRecord::parse: key 数据不足");
         std::string key(bytes.substr(0, key_len));
         bytes.remove_prefix(key_len);
 
         if (bytes.empty())
-            return std::unexpected(Error{"KeyValueRecord::parse: 缺少字段类型"});
+            NN_FAIL("KeyValueRecord::parse: 缺少字段类型");
         const auto type = static_cast<Type>(static_cast<unsigned char>(bytes[0]));
         bytes.remove_prefix(1);
 
         uint32_t value_len = 0;
         if (!detail::take_u32(bytes, value_len))
-            return std::unexpected(Error{"KeyValueRecord::parse: 缺少值长度"});
+            NN_FAIL("KeyValueRecord::parse: 缺少值长度");
         if (bytes.size() < value_len)
-            return std::unexpected(Error{"KeyValueRecord::parse: 值数据不足"});
+            NN_FAIL("KeyValueRecord::parse: 值数据不足");
         auto value = bytes.substr(0, value_len);
         bytes.remove_prefix(value_len);
 
@@ -201,7 +200,7 @@ inline Result<KeyValueRecord> KeyValueRecord::parse(std::string_view bytes)
         {
             uint64_t v = 0;
             if (!detail::take_u64(value, v))
-                return std::unexpected(Error{"KeyValueRecord::parse: UInt 值长度错误"});
+                NN_FAIL("KeyValueRecord::parse: UInt 值长度错误");
             f.u = v;
             break;
         }
@@ -210,7 +209,7 @@ inline Result<KeyValueRecord> KeyValueRecord::parse(std::string_view bytes)
             break;
         case Type::UIntArray:
             if (value.size() % sizeof(uint64_t) != 0)
-                return std::unexpected(Error{"KeyValueRecord::parse: UIntArray 值长度错误"});
+                NN_FAIL("KeyValueRecord::parse: UIntArray 值长度错误");
             {
                 // 先固定元素个数，避免 take_u64 缩短 value 影响循环边界
                 const std::size_t count = value.size() / sizeof(uint64_t);

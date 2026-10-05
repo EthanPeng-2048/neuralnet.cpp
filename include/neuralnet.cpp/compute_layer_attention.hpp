@@ -498,7 +498,7 @@ public:
         NN_TRY(r3, w_v_.init(engine));
         NN_TRY(r4, w_o_.init(engine));
         // M6 段 C：softmax_ 是子 Layer（engine 由 init 绑定），否则 forward 内 fail-fast
-        { auto r6 = softmax_.init(engine); if (!r6) return std::unexpected(r6.error()); }
+        { NN_TRY(r6, softmax_.init(engine)); }
         // 注意力侧位置编码（RoPE/ALiBi 的 init 是 no-op；恒等策略同样 no-op）——
         // 按 M6 段 C 的不变量"复合层 init_impl 必须 init 全部子对象"统一调用。
         return pos_->init(engine);
@@ -566,14 +566,12 @@ public:
     {
         ComputeEngine& engine = engine_ref();
         if (input.rows() != d_model_)
-            return std::unexpected(Error{"AttentionBase forward: input shape mismatch"});
-
+            NN_FAIL("AttentionBase forward: input shape mismatch");
         const std::size_t total_seq = input.cols();
         const std::size_t seq      = (seq_len_ > 0) ? seq_len_ : total_seq;
         const std::size_t batch    = (seq_len_ > 0) ? (total_seq / seq_len_) : 1;
         if (total_seq != batch * seq)
-            return std::unexpected(Error{"AttentionBase forward: cols not divisible by seq_len"});
-
+            NN_FAIL("AttentionBase forward: cols not divisible by seq_len");
         // 1. 线性投影 → Q/K/V: (H*d_k, batch*seq)
         NN_TRY(q_res, w_q_.forward(input));
         NN_TRY(k_res, w_k_.forward(input));
@@ -641,8 +639,7 @@ public:
         mask_->append_fold_inputs(fold_in);
         const nn::ExprSpec fold_spec = nn::expr::make_fold_attn_o(
             seq, d_k_, BH, mask_->mask_kind(), pos_->has_score_bias());
-        if (auto fv = nn::validate_expr_spec(fold_spec, fold_in.size()); !fv)
-            return std::unexpected(fv.error());
+        NN_TRY(fv, nn::validate_expr_spec(fold_spec, fold_in.size()));
         // scale 已折进 Q（见上 2.6；运行时值不进 expr_spec_key）——fold 的 mm 段直接消费
         NN_TRY(O_t_r, engine.eval_expr(fold_spec, fold_in, BH * seq, d_k_, p_.compute));
         Tensor O_t = std::move(*O_t_r);
@@ -839,8 +836,7 @@ public:
         std::size_t cur_len)
     {
         if (x_new.rows() != d_model_ || x_new.cols() != 1)
-            return std::unexpected(Error{"AttentionBase forward_step: x_new must be (d_model, 1)"});
-
+            NN_FAIL("AttentionBase forward_step: x_new must be (d_model, 1)");
         // 1. Q/K/V 投影 → (H*d_k, 1)
         NN_TRY(q_res, w_q_.forward(x_new));
         NN_TRY(k_new, w_k_.forward(x_new));

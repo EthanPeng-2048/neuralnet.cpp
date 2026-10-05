@@ -495,11 +495,7 @@ int main()
 #else
     auto& backend = nn::GpuBackend::instance();
     auto init_r = backend.initialize();
-    if (!init_r)
-    {
-        std::cerr << "GPU 初始化失败: " << init_r.error().message << "\n";
-        return 1;
-    }
+    NN_EXIT(init_r, 1, "GPU 初始化失败: ");
     nn::GpuEngine gpu_engine(backend);
     fail += run_case(gpu_engine, "GPU");
 

@@ -60,12 +60,9 @@ namespace nn::cli
                     << backend.device().device_name() << ")\n\n";
                 return std::make_unique<nn::GpuEngine>(backend);
             }
-            return std::unexpected(Error{
-                "请求 --gpu 但 GPU 初始化失败: " + init_r.error().message
-                + "（不回退 CPU；请移除 --gpu 或改用 CPU 模式）"});
+            NN_FAIL("请求 --gpu 但 GPU 初始化失败: " + init_r.error().message                 + "（不回退 CPU；请移除 --gpu 或改用 CPU 模式）");
 #else
-            return std::unexpected(Error{
-                "请求 --gpu 但未编译 Vulkan 支持（NN_HAS_VULKAN）；不回退 CPU"});
+            NN_FAIL("请求 --gpu 但未编译 Vulkan 支持（NN_HAS_VULKAN）；不回退 CPU");
 #endif
         }
 

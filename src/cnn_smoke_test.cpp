@@ -48,7 +48,7 @@ int main(int argc, char* argv[])
     }
 
     auto engine = nn::cli::create_engine(nn::cli::EngineConfig{use_gpu});
-    if (!engine) { std::cerr << engine.error().message << "\n"; return 1; }
+    NN_EXIT(engine, 1, "\n");
     nn::ComputeEngine& eng = **engine;
 
     std::cout << "========================================\n";
@@ -66,7 +66,7 @@ int main(int argc, char* argv[])
 
     auto spec = nn::make_cnn_spec(cfg.in_channels, cfg.in_size, cfg.pool, cfg.convs, cfg.fc_dims);
     auto model_r = nn::build_cnn_model_from_spec(eng, spec);
-    if (!model_r) { std::cerr << "build_cnn_model_from_spec 失败: " << model_r.error().message << "\n"; return 1; }
+    NN_EXIT(model_r, 1, "build_cnn_model_from_spec 失败: ");
     nn::Model& model = *model_r;
 
     if (!model.spec() || !nn::spec_matches(spec, *model.spec()))
@@ -122,11 +122,7 @@ int main(int argc, char* argv[])
                                        ncfg.convs, ncfg.fc_dims,
                                        ncfg.norm_type, ncfg.norm_place);
         auto nmodel_r = nn::build_cnn_model_from_spec(eng, nspec);
-        if (!nmodel_r)
-        {
-            std::cerr << "norm CNN 构建失败: " << nmodel_r.error().message << "\n";
-            return 1;
-        }
+        NN_EXIT(nmodel_r, 1, "norm CNN 构建失败: ");
         nn::Model& nmodel = *nmodel_r;
 
         std::size_t n_norm = 0;
@@ -158,25 +154,17 @@ int main(int argc, char* argv[])
             nlabels[i] = static_cast<std::size_t>(nrng() % ncfg.fc_dims.back());
 
         auto nx = eng.from_matrix(nxm);
-        if (!nx) { std::cerr << "norm from_matrix 失败\n"; return 1; }
+        NN_EXIT(nx, 1, "norm from_matrix 失败\n");
         auto nlogits = nmodel.forward(*nx);
-        if (!nlogits)
-        {
-            std::cerr << "norm forward 失败: " << nlogits.error().message << "\n";
-            return 1;
-        }
+        NN_EXIT(nlogits, 1, "norm forward 失败: ");
         nn::CrossEntropyLoss nce;
         auto nloss = nce.forward_sparse(eng, *nlogits, nlabels, {},
                                         ncfg.fc_dims.back());
-        if (!nloss) { std::cerr << "norm loss 失败\n"; return 1; }
+        NN_EXIT(nloss, 1, "norm loss 失败\n");
         auto ngrad = nce.backward();
-        if (!ngrad) { std::cerr << "norm CE backward 失败\n"; return 1; }
+        NN_EXIT(ngrad, 1, "norm CE backward 失败\n");
         auto nbwd = nmodel.backward(*ngrad);
-        if (!nbwd)
-        {
-            std::cerr << "norm model backward 失败: " << nbwd.error().message << "\n";
-            return 1;
-        }
+        NN_EXIT(nbwd, 1, "norm model backward 失败: ");
         bool finite = true;
         for (auto& g : nmodel.param_gradients())
         {
@@ -186,11 +174,7 @@ int main(int argc, char* argv[])
                 if (!std::isfinite(v)) { finite = false; break; }
             if (!finite) break;
         }
-        if (!finite)
-        {
-            std::cerr << "norm CNN 梯度含 NaN/Inf\n";
-            return 1;
-        }
+        NN_EXIT(finite, 1, "norm CNN 梯度含 NaN/Inf\n");
         std::cout << "norm_place=both OK (loss=" << *nloss << ")\n";
     }
 
@@ -206,28 +190,28 @@ int main(int argc, char* argv[])
     for (std::size_t i = 0; i < batch; ++i) labels[i] = static_cast<std::size_t>(rng() % classes);
 
     auto x = eng.from_matrix(xm);
-    if (!x) { std::cerr << "from_matrix 失败\n"; return 1; }
+    NN_EXIT(x, 1, "from_matrix 失败\n");
 
     auto optimizer = nn::create_optimizer(
         "sgd", eng, model.parameters(), model.param_gradients(), nn::Scalar{0.1});
-    if (!optimizer) { std::cerr << "optimizer 创建失败\n"; return 1; }
+    NN_EXIT(optimizer, 1, "optimizer 创建失败\n");
 
     nn::CrossEntropyLoss ce;
     nn::Scalar first_loss = 0, last_loss = 0;
     for (std::size_t step = 0; step < steps; ++step)
     {
         auto zero = optimizer->zero_grad();
-        if (!zero) { std::cerr << "zero_grad 失败\n"; return 1; }
+        NN_EXIT(zero, 1, "zero_grad 失败\n");
         auto logits = model.forward(*x);
-        if (!logits) { std::cerr << "forward 失败: " << logits.error().message << "\n"; return 1; }
+        NN_EXIT(logits, 1, "forward 失败: ");
         auto loss = ce.forward_sparse(eng, *logits, labels, {}, classes);
-        if (!loss) { std::cerr << "loss 失败: " << loss.error().message << "\n"; return 1; }
+        NN_EXIT(loss, 1, "loss 失败: ");
         auto grad = ce.backward();
-        if (!grad) { std::cerr << "CE backward 失败\n"; return 1; }
+        NN_EXIT(grad, 1, "CE backward 失败\n");
         auto b = model.backward(*grad);
-        if (!b) { std::cerr << "model backward 失败: " << b.error().message << "\n"; return 1; }
+        NN_EXIT(b, 1, "model backward 失败: ");
         auto st = optimizer->step();
-        if (!st) { std::cerr << "optimizer step 失败\n"; return 1; }
+        NN_EXIT(st, 1, "optimizer step 失败\n");
         if (step == 0) first_loss = *loss;
         last_loss = *loss;
         std::cout << "  step " << step << "  loss=" << *loss << "\n";

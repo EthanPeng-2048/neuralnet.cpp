@@ -66,8 +66,7 @@ struct FileContent {
 {
     std::ifstream ifs(path, std::ios::binary);
     if (!ifs)
-        return std::unexpected(nn::Error{"无法打开文件: " + path});
-
+        NN_FAIL("无法打开文件: " + path);
     FileContent fc;
     fc.buffer.assign(std::istreambuf_iterator<char>(ifs), {});
     if (fc.buffer.empty())
@@ -849,10 +848,7 @@ int main(int argc, char *argv[])
         {
             std::cout << "加载文本: " << cfg.text_path << " ..." << std::endl;
             auto fc_result = read_file_lines(cfg.text_path);
-            if (!fc_result) {
-                std::cerr << "Error: " << fc_result.error().message << '\n';
-                return 1;
-            }
+            NN_EXIT(fc_result, 1, "Error: ");
             auto fc = std::move(*fc_result);
             if (fc.lines.empty())
             {
@@ -970,11 +966,7 @@ int main(int argc, char *argv[])
     eng_cfg.use_gpu = cfg.gpu_enabled;
     eng_cfg.gpu_device = cfg.gpu_device;
     auto engine_res = nn::cli::create_engine(eng_cfg, std::cout);
-    if (!engine_res)
-    {
-        std::cerr << "引擎创建失败: " << engine_res.error().message << "\n";
-        return 1;
-    }
+    NN_EXIT(engine_res, 1, "引擎创建失败: ");
     auto raw_engine = std::move(*engine_res);
 
     // ── 多精度：边界 cast 已下沉基类（NVI，原 PrecisionEngine，f16 存储）────────────────────────────────
@@ -1037,10 +1029,7 @@ int main(int argc, char *argv[])
             cfg.pos_encoding, cfg.activation, cfg.norm_type,
             cfg.precision);
     }
-    if (!model_build) {
-        std::cerr << "构建模型失败: " << model_build.error().message << '\n';
-        return 1;
-    }
+    NN_EXIT(model_build, 1, "构建模型失败: ");
     auto model = std::move(*model_build);
     mem_mark("model-built");
 
@@ -1123,11 +1112,7 @@ int main(int argc, char *argv[])
             {
                 std::cout << "从模型文件读取 RAPT 规格\n";
                 auto build_result = nn::build_rapt_model_from_spec(*engine, file_spec, cfg.precision);
-                if (!build_result)
-                {
-                    std::cerr << "Error: " << build_result.error().message << '\n';
-                    return 1;
-                }
+                NN_EXIT(build_result, 1, "Error: ");
                 model = std::move(*build_result);
                 spec = file_spec;
             }
@@ -1142,11 +1127,7 @@ int main(int argc, char *argv[])
                 else
                     std::cout << "从模型文件读取 GPT 规格\n";
                 auto build_result = nn::build_gpt_model_from_spec(*engine, file_spec, cfg.precision);
-                if (!build_result)
-                {
-                    std::cerr << "Error: " << build_result.error().message << '\n';
-                    return 1;
-                }
+                NN_EXIT(build_result, 1, "Error: ");
                 model = std::move(*build_result);
                 spec = file_spec;
             }
@@ -1173,11 +1154,7 @@ int main(int argc, char *argv[])
         cfg.optimizer_name, *engine,
         model.parameters(), model.param_gradients(), cfg.lr,
         cfg.weight_decay, cfg.precision, cfg.beta1, cfg.beta2);
-    if (!optimizer)
-    {
-        std::cerr << "错误：未知优化器名称: " << cfg.optimizer_name << "\n";
-        return 1;
-    }
+    NN_EXIT(optimizer, 1, "错误：未知优化器名称: ");
 
     Scalar optimizer_current_lr = cfg.lr;
     mem_mark("optimizer-created");
@@ -1230,10 +1207,7 @@ int main(int argc, char *argv[])
         if (test_flow.empty())
         {
             auto fc_result = read_file_lines(cfg.test_path);
-            if (!fc_result) {
-                std::cerr << "加载测试集失败: " << fc_result.error().message << '\n';
-                return 1;
-            }
+            NN_EXIT(fc_result, 1, "加载测试集失败: ");
             auto fc = std::move(*fc_result);
             parallel_tokenize(*tokenizer, fc.lines, test_flow, test_flow_doc_ids);
 
@@ -1371,7 +1345,7 @@ int main(int argc, char *argv[])
             {
                 Scalar sum = Scalar{0};
                 auto pr = engine->poll_scalar_readback(pending_loss.front().slot, sum);
-                if (!pr) return std::unexpected(pr.error());
+                NN_TRY_CHECK(pr);
                 if (!*pr) break;   // 未就绪：留待下次（不阻塞）
                 PendingLoss pl = std::move(pending_loss.front());
                 pending_loss.pop_front();
@@ -1483,10 +1457,7 @@ int main(int argc, char *argv[])
 
             // ── Matrix → Tensor（上传到引擎设备） ──────────────
             auto x_tensor_r = engine->from_matrix(x_tokens);
-            if (!x_tensor_r) {
-                std::cerr << "\nfrom_matrix(x_tokens) failed: " << x_tensor_r.error().message << '\n';
-                return 1;
-            }
+            NN_EXIT(x_tensor_r, 1, "\nfrom_matrix(x_tokens) failed: ");
 
             // ── 构造平坦标签（与 logits 列序一致：batch-major，i = b*eff_seq + t） ──
             // 模型 forward 对输入 transpose 后按 batch-major 列序输出 logits，
@@ -1509,14 +1480,11 @@ int main(int argc, char *argv[])
             // end_batch 时一次 vkQueueSubmit + vkWaitForFences，消除 per-primitive 同步开销。
             // CPU 引擎 begin_batch/end_batch 为 no-op，所以两套引擎都安全。
             auto begin_r = engine->begin_batch();
-            if (!begin_r) {
-                std::cerr << "begin_batch failed: " << begin_r.error().message << '\n';
-                return 1;
-            }
+            NN_EXIT(begin_r, 1, "begin_batch failed: ");
 
             // ── 前向传播 ─────────────────────────────────────
             auto fwd_result = model.forward(*x_tensor_r);
-            if (!fwd_result) { std::cerr << "Error: " << fwd_result.error().message << '\n'; return 1; }
+            NN_EXIT(fwd_result, 1, "Error: ");
             auto logits = std::move(*fwd_result);
             mem_mark("step/forward");
             // logits: (vocab_size, seq_len × batch_size)
@@ -1532,17 +1500,11 @@ int main(int argc, char *argv[])
             auto loss_sum_t = ce_loss.forward_sparse_sum(
                 *engine, logits, flat_targets, mask_span,
                 tokenizer->vocab_size(), loss_num_valid, /*grad_reuse=*/&logits);
-            if (!loss_sum_t) {
-                std::cerr << "Error: " << loss_sum_t.error().message << '\n';
-                return 1;
-            }
+            NN_EXIT(loss_sum_t, 1, "Error: ");
             // 回读固定按 F32 取 4 字节：非 F32 时在 batch 内先 cast
             //（录制态，不提交、不 drain）
             auto loss_sum_f32 = engine->cast(*loss_sum_t, nn::Precision::F32);
-            if (!loss_sum_f32) {
-                std::cerr << "Error: " << loss_sum_f32.error().message << '\n';
-                return 1;
-            }
+            NN_EXIT(loss_sum_f32, 1, "Error: ");
 
             // ── 显存优化：logits 已消费完毕，立即释放（必须在 flush 之前）──
             //   延迟销毁按"当前录制帧"打标签：flush 前释放 → 标签为 forward
@@ -1559,26 +1521,17 @@ int main(int argc, char *argv[])
             // 在 forward 与 backward 之间 flush，将一次大提交拆为两次小提交。
             auto flush_r = engine->flush_batch();
             mem_mark("step/loss-fwd");
-            if (!flush_r) {
-                std::cerr << "\nflush_batch (forward) failed: " << flush_r.error().message << '\n';
-                return 1;
-            }
+            NN_EXIT(flush_r, 1, "\nflush_batch (forward) failed: ");
 
             // forward 帧已提交 → 排队异步回读（同队列 FIFO：拷贝在生产者之后）
             {
                 // 槽位将满：先非阻塞收割，必要时阻塞兜底（保证不覆盖未取走的值）
                 auto hv0 = harvest_loss();
-                if (!hv0) {
-                    std::cerr << "harvest_loss failed: " << hv0.error().message << '\n';
-                    return 1;
-                }
+                NN_EXIT(hv0, 1, "harvest_loss failed: ");
                 if (pending_loss.size() >= loss_slots)
                 {
                     auto hv1 = drain_loss();
-                    if (!hv1) {
-                        std::cerr << "drain_loss failed: " << hv1.error().message << '\n';
-                        return 1;
-                    }
+                    NN_EXIT(hv1, 1, "drain_loss failed: ");
                 }
                 PendingLoss pl;
                 pl.slot = loss_slot_next;
@@ -1599,7 +1552,7 @@ int main(int argc, char *argv[])
 
             // ── 反向传播（梯度已含 mask，无需额外处理） ────────
             auto grad_result = ce_loss.backward();
-            if (!grad_result) { std::cerr << "\nLoss backward failed: " << grad_result.error().message << '\n'; return 1; }
+            NN_EXIT(grad_result, 1, "\nLoss backward failed: ");
 
             // 梯度积累缩放：每步梯度除以 accum_steps
             //   forward_sparse 的梯度为 (softmax-one_hot)/num_valid（单步平均），
@@ -1609,37 +1562,31 @@ int main(int argc, char *argv[])
             {
                 auto scale_r = engine->scale_inplace(*grad_result,
                     Scalar{1} / static_cast<Scalar>(cfg.accum_steps));
-                if (!scale_r) { std::cerr << "\n梯度缩放失败: " << scale_r.error().message << '\n'; return 1; }
+                NN_EXIT(scale_r, 1, "\n梯度缩放失败: ");
             }
 
             auto bwd_result = model.backward(*grad_result);
             mem_mark("step/backward");
-            if (!bwd_result) { std::cerr << "Error: " << bwd_result.error().message << '\n'; return 1; }
+            NN_EXIT(bwd_result, 1, "Error: ");
 
             // ── 提交 backward batch（单独一次提交，已与 forward 拆分） ──
             auto bwd_end = engine->end_batch();
             mem_mark("step/end-batch");
-            if (!bwd_end) {
-                std::cerr << "\nend_batch (backward) failed: " << bwd_end.error().message << '\n';
-                return 1;
-            }
+            NN_EXIT(bwd_end, 1, "\nend_batch (backward) failed: ");
 
             // ── 收割已就绪的 loss 回读（非阻塞；打印/统计在此推进）─────────
             // 稳定态：此刻第 N-1 步的 loss 早已写回（GPU 一直在跑），
             // poll 立即命中 → 每步一条打印，且 host 一秒都不等 GPU。
             {
                 auto hv = harvest_loss();
-                if (!hv) {
-                    std::cerr << "harvest_loss failed: " << hv.error().message << '\n';
-                    return 1;
-                }
+                NN_EXIT(hv, 1, "harvest_loss failed: ");
             }
 
             // ── 显存回收（L2）：end_batch 提交完成、延迟销毁已 flush，
             //    归还完全空闲的内存池底材（GPU 引擎有效，CPU 引擎 no-op） ──
             auto rel_r = engine->release_idle_pool_blocks();
             mem_mark("step/released");
-            if (!rel_r) { std::cerr << "\n显存回收失败: " << rel_r.error().message << '\n'; return 1; }
+            NN_EXIT(rel_r, 1, "\n显存回收失败: ");
 
             // ── 显存优化：logits 梯度已消费完毕，立即释放 ──
             //   model.backward 已把 grad 传播到各参数梯度，grad_result（1.6GB）
@@ -1664,34 +1611,19 @@ int main(int argc, char *argv[])
                 if (cfg.max_norm > 0)
                 {
                     auto clip_begin = engine->begin_batch();
-                    if (!clip_begin) {
-                        std::cerr << "begin_batch (clip) failed: " << clip_begin.error().message << '\n';
-                        return 1;
-                    }
+                    NN_EXIT(clip_begin, 1, "begin_batch (clip) failed: ");
                     auto clip_r = optimizer->clip_grad_norm(cfg.max_norm);
-                    if (!clip_r) {
-                        std::cerr << "\n梯度裁剪失败: " << clip_r.error().message << '\n';
-                        return 1;
-                    }
+                    NN_EXIT(clip_r, 1, "\n梯度裁剪失败: ");
                     auto clip_end = engine->end_batch();
-                    if (!clip_end) {
-                        std::cerr << "end_batch (clip) failed: " << clip_end.error().message << '\n';
-                        return 1;
-                    }
+                    NN_EXIT(clip_end, 1, "end_batch (clip) failed: ");
                 }
 
                 auto opt_begin = engine->begin_batch();
-                if (!opt_begin) {
-                    std::cerr << "begin_batch (optimizer) failed: " << opt_begin.error().message << '\n';
-                    return 1;
-                }
+                NN_EXIT(opt_begin, 1, "begin_batch (optimizer) failed: ");
 
                 // ── 优化器 step + 梯度清零 ──
                 auto step_result = optimizer->step();
-                if (!step_result) {
-                    std::cerr << "Error: " << step_result.error().message << '\n';
-                    return 1;
-                }
+                NN_EXIT(step_result, 1, "Error: ");
 
                 // ── 梯度统计（step 后、zero_grad 前） ──
                 if (cfg.grad_log && ((step + 1) % cfg.log_interval == 0 || step + 1 == steps_per_epoch))
@@ -1701,17 +1633,11 @@ int main(int argc, char *argv[])
                 }
 
                 auto zero_result = optimizer->zero_grad();
-                if (!zero_result) {
-                    std::cerr << "\n优化器 zero_grad 失败: " << zero_result.error().message << '\n';
-                    return 1;
-                }
+                NN_EXIT(zero_result, 1, "\n优化器 zero_grad 失败: ");
 
                 // ── 提交 batch：一次 vkQueueSubmit + vkWaitForFences ──
                 auto end_r = engine->end_batch();
-                if (!end_r) {
-                    std::cerr << "end_batch (optimizer) failed: " << end_r.error().message << '\n';
-                    return 1;
-                }
+                NN_EXIT(end_r, 1, "end_batch (optimizer) failed: ");
 
                 steps_since_update = 0;
             }
@@ -1740,10 +1666,7 @@ int main(int argc, char *argv[])
         // 等的是已经在 GPU 上执行的旧帧，不影响 GPU 占空比。
         {
             auto ep_drain = drain_loss();
-            if (!ep_drain) {
-                std::cerr << "loss drain failed: " << ep_drain.error().message << '\n';
-                return 1;
-            }
+            NN_EXIT(ep_drain, 1, "loss drain failed: ");
         }
 
         // ── --max-steps 到达：跳过本 epoch 的统计与测试评估，直接收尾 ──
@@ -1883,10 +1806,7 @@ int main(int argc, char *argv[])
     // ── 保存模型（含规格 + 嵌入 tokenizer） ──────────────────
     {
         auto save_result = nn::save_model(cfg.save_path, model, spec, tokenizer_json);
-        if (!save_result) {
-            std::cerr << "Error: " << save_result.error().message << '\n';
-            return 1;
-        }
+        NN_EXIT(save_result, 1, "Error: ");
     }
     std::cout << "\n训练完成! 总耗时: " << std::fixed << std::setprecision(1)
               << total_sec << "s"

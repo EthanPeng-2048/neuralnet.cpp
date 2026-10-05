@@ -34,7 +34,7 @@ namespace conv_engine {
     ComputeEngine& engine, std::size_t C, std::size_t P)
 {
     if (C == 0 || P == 0)
-        return std::unexpected(Error{"make_layout_perm: C/P must be > 0"});
+        NN_FAIL("make_layout_perm: C/P must be > 0");
     std::vector<Scalar> perm(C * P);          // 宿主桥（17 §3 D11）：不经 Matrix
     for (std::size_t c = 0; c < C; ++c)
         for (std::size_t p = 0; p < P; ++p)
@@ -59,10 +59,9 @@ namespace conv_engine {
 {
     Tensor x2 = engine.create_tensor(P * C, B);
     if (!x2.valid())
-        return std::unexpected(Error{"samples_to_cols: 张量分配失败"});
-    { auto r = engine.zero(x2); if (!r) return std::unexpected(r.error()); }
-    { auto r = engine.scatter_add_rows(x2, perm, g);
-      if (!r) return std::unexpected(r.error()); }
+        NN_FAIL("samples_to_cols: 张量分配失败");
+    { NN_TRY(r, engine.zero(x2)); }
+    { NN_TRY(r, engine.scatter_add_rows(x2, perm, g)); }
     return engine.rearrange_3d(x2, C, P, B, /*inverse=*/true);    // (C, B*P)
 }
 
@@ -139,7 +138,7 @@ public:
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
         if (shape_invalid_)
-            return std::unexpected(Error{"Conv2D: kernel 过大 (kernel > in + 2*padding)"});
+            NN_FAIL("Conv2D: kernel 过大 (kernel > in + 2*padding)");
         const std::size_t fan_in = in_channels_ * kernel_ * kernel_;
 
         // ── 声明式初始化（M2，17 §4.4）：He 风格均匀分布，层算 limit、引擎
@@ -147,14 +146,13 @@ public:
         const Scalar limit = std::sqrt(6.0 / static_cast<Scalar>(fan_in + out_channels_));
         w_ = engine.create_tensor(out_channels_, fan_in, Precision::F32,
                                   InitSpec::uniform(-limit, limit, kInitSeed));
-        if (!w_.valid()) return std::unexpected(Error{"Conv2D: 权重初始化失败"});
+        if (!w_.valid()) NN_FAIL("Conv2D: 权重初始化失败");
         b_ = engine.create_tensor(out_channels_, 1, Precision::F32, InitSpec::zero());
-        if (!b_.valid()) return std::unexpected(Error{"Conv2D: 偏置初始化失败"});
-
+        if (!b_.valid()) NN_FAIL("Conv2D: 偏置初始化失败");
         grad_w_ = engine.create_tensor(out_channels_, fan_in, Precision::F32, InitSpec::zero());
         grad_b_ = engine.create_tensor(out_channels_, 1, Precision::F32, InitSpec::zero());
         if (!grad_w_.valid() || !grad_b_.valid())
-            return std::unexpected(Error{"Conv2D: 梯度缓冲初始化失败"});
+            NN_FAIL("Conv2D: 梯度缓冲初始化失败");
         return {};
     }
 
@@ -178,14 +176,13 @@ public:
     {
         ComputeEngine& engine = engine_ref();
         if (shape_invalid_)
-            return std::unexpected(Error{"Conv2D: kernel 过大 (kernel > in + 2*padding)"});
+            NN_FAIL("Conv2D: kernel 过大 (kernel > in + 2*padding)");
         if (input.rows() != in_channels_ * in_h_ * in_w_)
-            return std::unexpected(Error{"conv forward: input shape mismatch"});
+            NN_FAIL("conv forward: input shape mismatch");
         const std::size_t batch = input.cols();
         if (batch == 0)
-            return std::unexpected(Error{"conv forward: batch must be > 0"});
-        { auto r = ensure_perm_(engine); if (!r) return std::unexpected(r.error()); }
-
+            NN_FAIL("conv forward: batch must be > 0");
+        { NN_TRY(r, ensure_perm_(engine)); }
         const std::size_t P = out_h_ * out_w_;
 
         // 1) 窗口展开（引擎原语）：x (C_in*H*W, B) → col (C_in*k*k, P*B)
@@ -213,22 +210,19 @@ public:
     {
         ComputeEngine& engine = engine_ref();
         if (shape_invalid_)
-            return std::unexpected(Error{"Conv2D: kernel 过大 (kernel > in + 2*padding)"});
+            NN_FAIL("Conv2D: kernel 过大 (kernel > in + 2*padding)");
         if (grad_output.rows() != out_channels_ * out_h_ * out_w_)
-            return std::unexpected(Error{"conv backward: grad_output shape mismatch"});
+            NN_FAIL("conv backward: grad_output shape mismatch");
         const std::size_t batch = grad_output.cols();
         if (batch == 0)
-            return std::unexpected(Error{"conv backward: batch must be > 0"});
+            NN_FAIL("conv backward: batch must be > 0");
         const std::size_t kk = kernel_ * kernel_;
         const std::size_t P = out_h_ * out_w_;
         // 缓存前置校验：checkpoint 模式（尚未 forward_recompute）下 forward 不驻留
         // col_cache_；backward 必须校验缓存命中且形状匹配，否则会静默算出错误梯度。
         if (col_cache_.rows() != in_channels_ * kk || col_cache_.cols() != P * batch)
-            return std::unexpected(Error{
-                "conv backward: im2col 缓存缺失或不匹配"
-                "（checkpoint 模式需先 forward_recompute；batch 变化后需重新 forward）"});
-        { auto r = ensure_perm_(engine); if (!r) return std::unexpected(r.error()); }
-
+            NN_FAIL("conv backward: im2col 缓存缺失或不匹配"                 "（checkpoint 模式需先 forward_recompute；batch 变化后需重新 forward）");
+        { NN_TRY(r, ensure_perm_(engine)); }
         // 1) grad_output (C_out*P, B) → gZ (C_out, P*B)
         auto gZ = conv_engine::samples_to_cols(engine, grad_output,
                                                out_channels_, P, batch, perm_cache_);
@@ -359,14 +353,13 @@ public:
     {
         ComputeEngine& engine = engine_ref();
         if (shape_invalid_)
-            return std::unexpected(Error{"MaxPool2D: pool 窗口大于输入尺寸"});
+            NN_FAIL("MaxPool2D: pool 窗口大于输入尺寸");
         if (input.rows() != channels_ * in_h_ * in_w_)
-            return std::unexpected(Error{"maxpool forward: input shape mismatch"});
+            NN_FAIL("maxpool forward: input shape mismatch");
         const std::size_t batch = input.cols();
         if (batch == 0)
-            return std::unexpected(Error{"maxpool forward: batch must be > 0"});
-        { auto r = ensure_perm_(engine); if (!r) return std::unexpected(r.error()); }
-
+            NN_FAIL("maxpool forward: batch must be > 0");
+        { NN_TRY(r, ensure_perm_(engine)); }
         const std::size_t kk = pool_ * pool_;
         const std::size_t P = out_h_ * out_w_;
 
@@ -410,12 +403,12 @@ public:
     {
         ComputeEngine& engine = engine_ref();
         if (shape_invalid_)
-            return std::unexpected(Error{"MaxPool2D: pool 窗口大于输入尺寸"});
+            NN_FAIL("MaxPool2D: pool 窗口大于输入尺寸");
         if (grad_output.rows() != channels_ * out_h_ * out_w_)
-            return std::unexpected(Error{"maxpool backward: grad_output shape mismatch"});
+            NN_FAIL("maxpool backward: grad_output shape mismatch");
         const std::size_t batch = grad_output.cols();
         if (batch == 0)
-            return std::unexpected(Error{"maxpool backward: batch must be > 0"});
+            NN_FAIL("maxpool backward: batch must be > 0");
         const std::size_t kk = pool_ * pool_;
         const std::size_t P = out_h_ * out_w_;
         // 缓存前置校验：checkpoint（尚未 forward_recompute）或 clear_cache 后缓存为空，
@@ -423,9 +416,7 @@ public:
         if (col_cache_.rows() != channels_ * kk || col_cache_.cols() != P * batch ||
             pooled_cache_.rows() != channels_ || pooled_cache_.cols() != P * batch ||
             !perm_cache_.valid())
-            return std::unexpected(Error{
-                "maxpool backward: 展开/max 缓存缺失或不匹配"
-                "（checkpoint 模式需先 forward_recompute；clear_cache 后需重新 forward）"});
+            NN_FAIL("maxpool backward: 展开/max 缓存缺失或不匹配"                 "（checkpoint 模式需先 forward_recompute；clear_cache 后需重新 forward）");
 
         // 1) grad_output (C*P, B) → g_pooled (C, P*B)
         auto g_pooled = conv_engine::samples_to_cols(engine, grad_output,
@@ -436,8 +427,7 @@ public:
         //    mx_exp = 组内广播(pooled)：gather_rows 把每个通道的 max 复制 kk 次
         //    总梯度守恒（Σ share = 窗口梯度）；无并列时（cnt=1）全部梯度落在该
         //    唯一最大值位置。
-        { auto r = ensure_expand_(engine); if (!r) return std::unexpected(r.error()); }
-
+        { NN_TRY(r, ensure_expand_(engine)); }
         auto mx_exp = engine.gather_rows(pooled_cache_, expand_cache_);   // (C*kk, P*B)
         NN_TRY_CHECK(mx_exp);
 

@@ -79,8 +79,7 @@ enum class Precision : std::uint8_t
 {
     if (p == Precision::BF16 || p == Precision::F64)
     {
-        return std::unexpected(Error{
-            std::string("精度未实现（Phase 1 仅支持 f16 / f32）: ") + precision_name(p)});
+        NN_FAIL(std::string("精度未实现（Phase 1 仅支持 f16 / f32）: ") + precision_name(p));
     }
     return {};
 }

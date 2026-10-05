@@ -116,7 +116,7 @@ int main(int argc, char* argv[])
     nn::cli::EngineConfig ecfg;
     ecfg.use_gpu = use_gpu;
     auto engine_res = nn::cli::create_engine(ecfg, std::cout);
-    if (!engine_res) { std::cerr << "引擎创建失败: " << engine_res.error().message << "\n"; return 1; }
+    NN_EXIT(engine_res, 1, "引擎创建失败: ");
     auto engine = std::move(*engine_res);
     ComputeEngine& eng = *engine;
 
@@ -160,18 +160,18 @@ int main(int argc, char* argv[])
     };
 
     auto x = eng.from_matrix(ref.x);
-    if (!x) return 1;
+    NN_EXIT(x, 1);
     auto out = conv.forward(*x);
-    if (!out) { std::cerr << "  forward 失败: " << out.error().message << "\n"; return 1; }
+    NN_EXIT(out, 1, "  forward 失败: ");
     auto om = eng.to_matrix(*out);
-    if (!om) return 1;
+    NN_EXIT(om, 1);
     report("forward", *om, ref.fwd());
 
     Matrix gm = fill(C_out * OH * OW, B);
     auto go = eng.from_matrix(gm);
-    if (!go) return 1;
+    NN_EXIT(go, 1);
     auto gx = conv.backward(*go);
-    if (!gx) { std::cerr << "  backward 失败: " << gx.error().message << "\n"; return 1; }
+    NN_EXIT(gx, 1, "  backward 失败: ");
 
     Matrix gw_ref, gb_ref;
     ref.bwd(gm, gw_ref, gb_ref);

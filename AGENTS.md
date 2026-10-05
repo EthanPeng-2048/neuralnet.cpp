@@ -7,7 +7,7 @@
 ## 1. 项目一句话
 
 从零实现的 C++26 神经网络库：CPU / Vulkan 双后端，支持 MLP / ViT / GPT 训练推理 + BPE 分词器，可选 f16 混合精度。
-`include/neuralnet.cpp/` 是 header-only 库（唯一入口 `nn.hpp`），`src/` 是可执行入口，`shaders/` 是 GPU 原语 shader。
+`include/neuralnet.cpp/` 是 header-only 库（**统一聚合入口 `nn.hpp`**；也可按需 include `engine/layer/loss/optimizer/model/train.hpp` 薄转发头），`src/` 是可执行入口，`shaders/` 是 GPU 原语 shader。
 
 ## 2. 构建与测试
 
@@ -39,6 +39,7 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 | 加/改引擎原语（CPU 实现） | `compute_engine.hpp`（接口）+ `compute_cpu_engine.hpp` |
 | 加/改引擎原语（GPU 实现） | `compute_gpu_engine.hpp` + `backend/compute_vk_backend.hpp` + `backend/compute_vk_device.hpp` + `shaders/*.comp` |
 | 张量/设备抽象 | `compute_tensor.hpp` |
+| 按需 include（不走聚合头） | `engine.hpp` / `layer.hpp` / `loss.hpp` / `optimizer.hpp` / `model.hpp` / `train.hpp` = **薄转发头**（`nn.hpp` 仍是唯一聚合头；只求好记，不省 parse） |
 | 混合精度 / f16 类型系统 | `precision.hpp`（Precision 枚举、`nn::f16`、`PrecisionProfile`） |
 | 矩阵/代数层（CPU 存储与手写内核） | `algebra_matrix.hpp` / `algebra_span.hpp` / `algebra_ops.hpp`（`Expression`/`BoolExpression` 概念在 `expr_dsl.hpp`） |
 | 表达式 DSL / 融合 IR | `expr_dsl.hpp` / `expr_spec.hpp` / `expr_opt.hpp` / `expr_registry.hpp`（IR-C 图融合未采用、无 `expr_graph.hpp`；取舍记录见 `docs/history.md`） |
@@ -150,7 +151,7 @@ Matrix → engine.from_matrix → Tensor[GPU] → forward/loss/optimizer 全程�
 
 ## 5. 铁律（违反必出 bug）
 
-1. **禁止 throw/try/catch**：编译期 `-fno-exceptions` 强制。错误一律 `Result<T> = std::expected<T, Error>`（`core_errors.hpp`）。**传播写法统一走 `NN_TRY(decl, expr)` / `NN_TRY_CHECK(x)`**（L2 层 494 处已收敛，见 `core_errors.hpp` 宏注释）——展开后与手写 `auto r = expr; if (!r) return std::unexpected(r.error());` 逐字等价；新代码请沿用该形态。
+1. **禁止 throw/try/catch**：编译期 `-fno-exceptions` 强制。错误一律 `Result<T> = std::expected<T, Error>`（`core_errors.hpp`）。**手写错误检查一律改用宏族**（三种语义，完整定义与约束见 `core_errors.hpp` 宏注释）：**传播** `NN_TRY(decl, expr)` / `NN_TRY_MSG(decl, "语境", expr)` / `NN_TRY_CHECK(x)`（L2 层已收敛，展开后与手写 `auto r = expr; if (!r) return std::unexpected(r.error());` 逐字等价）；**解包+终止** `NN_CHECK(expr[, "语境"])`（别名 `NN_EASY_CHECK`，失败打印后 abort，也接受 bool 条件）；**解包+退出码** `NN_EXIT(expr, code[, "语境"])`（CLI/参数错误用它保住退出码）；错误源头语法糖 `NN_FAIL("msg")`。终止策略只有 abort/exit —— 本族任何路径都不出现 `throw`。
 2. **禁止 new/delete/裸指针所有权**：`std::vector` / `std::unique_ptr` / `std::span`。
 3. **分层职责单一**：Matrix（L1）不写神经网络算法；Layer（L2）不写底层计算；原语 shader 永不含算法（ReLU/Softmax/Attention 等一律来自 Layer 或 DSL）。
 4. **不穿透接口**：上层不访问下层内部数据结构（`.data()` 等），改一个模块只改一个头文件。
@@ -266,7 +267,7 @@ optimizer.step();
 | `development/06-rapt-algorithm.md` | **线性注意力（RLA → RAPT → RLA-2）：直观理解 + 数学定义 + 扫描原语工程落地 + 训练显存开关** |
 | `development/08-pitfalls-and-lessons.md` | **踩坑警示录，改代码前读** |
 | `development/10-development-standards.md` | C++ 编码规范全文 |
-| `development/12-compute-engine-inventory.md` | **引擎接口盘点（复现：`bench/doc_inventory.ps1`）：49 个 virtual 方法、Layer 直调 21 个（基础设施/数据搬运/状态扫描/fold 登记）、两套 CPU 求值机制（DSL 模板 + IR 解释器）、ctest 23 个测试；演进记录见 `docs/history.md`** |
+| `development/12-compute-engine-inventory.md` | **引擎接口盘点（复现：`bench/doc_inventory.ps1`）：49 个 virtual 方法、Layer 直调 21 个（基础设施/数据搬运/状态扫描/fold 登记）、两套 CPU 求值机制（DSL 模板 + IR 解释器）、ctest 24 个测试；演进记录见 `docs/history.md`** |
 | `development/13-refactor-backlog.md` | **已合并的重定向 stub（2026-10-01）：未完成项与裁定台账迁入 `development/18-roadmap.md`；已完成 / 被否决 / 已执行记录在 `docs/history.md`** |
 | `development/15-computeengine-refresh.md` | **ComputeEngine Refresh 详细设计（13 §10 展开）：张量出生绑定 + `import` + 存储多态；含 P-1（PrecisionEngine 下沉删除）与 P1（出生绑定 + `bind_check_` 跨引擎检查 + `adopt` 内部通道，**两项均已实施 2026-09-29**）与 D1-D9 未决点裁定；**未实施的 P2-P6 已被 17 吸收改期（M1-M7），后续立项读 17** |
 | `development/16-computeengine-p0-inventory.md` | **Refresh P0 盘点结果（2026-09-28）：ensure_gpu 43 分类 / ComputeEngine& 175 打标 / 宿主中转 381 清单 / ctest 双基线（Lavapipe 20 20、Mali offload 非确定）/ GPU 稳定性探针与未决 7 项** |
@@ -290,13 +291,14 @@ optimizer.step();
 
 ### 已知问题
 
-- **GPU `stable=f16` 训练 loss 打印冻结（未修）**：`text_train --precision-stable f16` 时 step 恒 4.0137、跨 epoch/跨进程逐位相同；**权重照常更新**（同进程跨 epoch 模型快照 63% 参数字节不同，冻结仅在 loss 回读链）；CPU 同配置健康；ctest 全绿（23/23）但**无 GPU+stable=f16 用例**。触发矩阵、覆盖缺口与证据见 `docs/development/14-f16-stable-gpu-loss-frozen.md`。推荐路径 `--f16`（stable/optimizer=f32）实测健康。
+- **GPU `stable=f16` 训练 loss 打印冻结（未修）**：`text_train --precision-stable f16` 时 step 恒 4.0137、跨 epoch/跨进程逐位相同；**权重照常更新**（同进程跨 epoch 模型快照 63% 参数字节不同，冻结仅在 loss 回读链）；CPU 同配置健康；ctest 全绿（24/24）但**无 GPU+stable=f16 用例**。触发矩阵、覆盖缺口与证据见 `docs/development/14-f16-stable-gpu-loss-frozen.md`。推荐路径 `--f16`（stable/optimizer=f32）实测健康。
 - **数值性限制**：四字段全 f16 不可训练——`optimizer=f16` 单独即令 Adam 更新爆炸、`stable=f16` 链约 200 步 NaN，见 `docs/development/05-mixed-precision.md` §12.5；常规 f32 训练健康收敛。
 - **不存在的 CLI 参数**：`--tdr-retry`/`--max-tdr-retries` 与 `mnist_train --osc-guard`/`--osc-window`/`--osc-threshold`（**均已移除**：前两者从未实现，后三者属"帮助声明了、解析分支不存在"的幽灵选项，2026-10-01 已从帮助/控制器/GUI 三层清除，详见 `docs/history.md`「GUI / CLI 参数一致性清理」）。
 - **`text_train --model zipt` 启动即中止（未修）** → **已随 ZiPT 整体移除而消失（2026-10-01）**：AttnZip/ZiPT 已从主线移除（`--model zipt` 现在直接报"未知模型架构"并给出迁移提示），代码保留在 **`legacy/zipt` 分支**。**恢复前提（两条同时满足）**：① **算法层**——压缩向量必须因果（压缩器只能看当前位置之前的内容）；② **代码层**——实现质量对齐 RAPT/GPT（支持 `forward_recompute` 梯度检查点与 activation offload、CLI/序列化/测试齐备）。裁决依据见 `docs/history.md`「ZiPT 移除」条。已移除的 API：`ZiPTModel`/`ZiPTBlock`/`CrossAttention`、`build_zipt_model*`/`make_zipt_spec`/`ZiPTConfig`/`ZIPT_MEMORY_TOKENS`、`ModelSpec::is_zipt()` 与 `memory_tokens`/`window` 字段、CLI `--model zipt`/`--window`/`--memory-tokens`、`zipt_test`；`ModelType` 的 6 号枚举保留为 `Reserved_ZiPT` 占位，用于对旧 `.bin`（type=6）给出明确错误。
 
 ### 已交付能力（当前功能清单）
 
+- **错误处理宏族（2026-10-05）**：`core_errors.hpp` 的三种语义 —— 传播 `NN_TRY` / `NN_TRY_MSG` / `NN_TRY_CHECK`、解包+终止 `NN_CHECK(expr[, "语境"])`（别名 `NN_EASY_CHECK`，也接受 bool 条件）、解包+退出码 `NN_EXIT(expr, code[, "语境"])`，加错误源头糖 `NN_FAIL("msg")`；实现支撑 `nn::detail::{check_message, contextualize, check_value, check_exit}`（格式化与终止策略解耦 = 可单测）。**存量手写形态两批迁移已完成（2026-10-05）**：B 批 `src/` 退出样板 320 处 → `NN_EXIT`；A 批全仓传播/错误源 1209 → 45 处（→ `NN_TRY`/`NN_TRY_CHECK`/`NN_FAIL`，96% 迁移；余 45 为 `core_assert.hpp` 宏定义体、`*init_error_` 解引用、`return std::unexpected(\n...)` 跨行构造等需人工审的边缘形态）；迁移脚本在 `tools/apply_*.ps1`（均带 `-DryRun`）。测试 `error_macro_test`，门禁见 `docs/history.md` 同日条。
 - **混合精度**：`precision.hpp` 的 `Precision`/`PrecisionProfile{param/compute/stable/optimizer}`；CPU/GPU f16 路径 = 边界 cast（`ComputeEngine` 基类 NVI 入口，**原 `PrecisionEngine` 装饰器已删除下沉**，见 15 §4.1）+ in-kernel f16 带类型变体 + op-level f16 GEMM（一份 .comp 用 `-DNN_SHADER_F16=1` 编第二份 SPIR-V）；`--f16` = `profile_f16()` = {param:F16, compute:F16, stable:F32, optimizer:F32}，实测峰值显存低于 f32（`docs/development/05` §12.11）。
 - **线性注意力**：RLA-2 / RAPT（`docs/development/06`）。
 - **BatchNorm（MNIST MLP，2026-10-03 落地 = roadmap P0-3）**：`compute_layer_mlp.hpp` 的 `BatchNorm` 层 + `make_norm_layer` 真分支（不再静默回落 LayerNorm）——训练态用 batch 统计（`row_reduce_sum` 沿 batch）并以 EMA 更新 `running_mean/var`（有偏 1/B 方差口径，B=1 安全；momentum=0.1 = 新 batch 权重），推理态用 running 统计；running 统计经 `extra_state()` 序列化（不进 `parameters()`，优化器不碰）。训练/推理双态经 `Layer::set_training`（默认训练态）+ `Model::set_training` 转发；`forward_recompute` 抑制 EMA 重复更新；**推理态是不同表达式结构**，`scan_exprs` 模型 pass 现在每个模型先训练态 fwd+bwd、再推理态 fwd+bwd（否则 GPU 推理闭合世界硬报错）。验收：`batchnorm_test`（+`--gpu` 变体）覆盖工厂/双态对拍/EMA/gradcheck/推理态 backward/save-load 往返，ctest 21 → 23；scan 结构 84 → 91（库内口径；样例收集器 = 91 + 样例自定义 2 = 93）。兼容注意：**旧的 `norm_type=BatchNorm` 规格模型文件**（当年实际按 LayerNorm 存、无 extra 张量）在新代码加载会在 extra 状态解析处报错——这类文件当年规格与内容不符，属预期失败（已记 `docs/history.md`）。
@@ -319,7 +321,7 @@ optimizer.step();
 - **评估分块**：`evaluate_mnist` 的 `eval_batch`（默认 1000）分块前向 + 每块 `release_idle_pool_blocks()`，防大 batch 评估 OOM。
 - **BPE 保序并行 encode**：`Tokenizer::set_encode_threads`（0=自动/1=顺序/>1=指定）+ `encode_segments_`——按空白安全切分点分段、段内经全局线程池并发编码、**按段下标升序拼接**，任意并行度与顺序执行**逐字节一致**（铁律 #8；切分点必为 chunk 边界、标记不含空白不会被切断）；文本 < 256 KiB 或找不到切分点回退顺序路径。`bpe_merge_impl_` 改 thread_local `BpeMergeScratch` + 手写堆，每 chunk 合并**零堆分配**。`text_train::parallel_tokenize` 收编到 `nn::parallel_for_samples`，`tokenizer_infer` 新增 `--threads`。实测 8 MiB 多样文本 `encode` 0.93s→0.134s（32 线程，7.0x）；`.tokcache` 重新生成 SHA256 与旧实现一致。**训练期合并循环仍不可并行**（链式依赖，见 `docs/development/08` §4.2）。
 - **CPU 性能**：DSL 模板路径向量化/并行、`dsl::compute_into` 零分配原地更新、`Tensor::cpu_get_ptr`、分块 GEMM 内核（BLOCK_SIZE=64）。
-- **测试**：ctest 注册 **23** 个测试（**20** 个测试目标 + `cnn_test_gpu` = `cnn_test --gpu` + `batchnorm_test_gpu` = `batchnorm_test --gpu` + `fusion_custom_layer_example` = 下游自定义层形态的 AOT 融合端到端门禁；`-DNN_ENABLE_TESTS=ON`；需 Vulkan 的用例退出码 77 = skip）。其中 `batchnorm_test` = **BatchNorm 双态**回归（工厂不回落 / 训练+推理态 forward 对拍 / running EMA / gradcheck / 推理态 backward / Model::set_training 转发 / save-load 逐位往返）；`fused_gpu_test` = **融合 shader 逐形态** GPU 对拍（rope/swiglu/gelu/softmax/matmul/matmul+reduce/norm/reduce_consts/fold v1/fold attn/回退硬报错）——覆盖口径是 **V0（全 f32）**，V1/V2 的覆盖在 `f16_precision_test`（`NN_PREC_TRACE` 实测 20 条 `#x`、4 条 `#a`）。
+- **测试**：ctest 注册 **24** 个测试（**21** 个测试目标 + `cnn_test_gpu` = `cnn_test --gpu` + `batchnorm_test_gpu` = `batchnorm_test --gpu` + `fusion_custom_layer_example` = 下游自定义层形态的 AOT 融合端到端门禁；`-DNN_ENABLE_TESTS=ON`；需 Vulkan 的用例退出码 77 = skip）。其中 `error_macro_test` = **错误处理宏族**（`NN_CHECK` 解值三形态 / 打印格式 / `NN_TRY_MSG` 语境前缀 / 终止与退出码经子进程断言）；`batchnorm_test` = **BatchNorm 双态**回归（工厂不回落 / 训练+推理态 forward 对拍 / running EMA / gradcheck / 推理态 backward / Model::set_training 转发 / save-load 逐位往返）；`fused_gpu_test` = **融合 shader 逐形态** GPU 对拍（rope/swiglu/gelu/softmax/matmul/matmul+reduce/norm/reduce_consts/fold v1/fold attn/回退硬报错）——覆盖口径是 **V0（全 f32）**，V1/V2 的覆盖在 `f16_precision_test`（`NN_PREC_TRACE` 实测 20 条 `#x`、4 条 `#a`）。
 
 ### 融合二期状态与 IR 编码约束（改融合/IR 代码前必读）
 

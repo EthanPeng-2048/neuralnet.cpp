@@ -83,7 +83,7 @@ int main()
         }
         banner("A1b from_matrix(f16)");
         auto x16 = ad.from_matrix(rnd(D, TOTAL, 1), nn::Precision::F16);
-        if (!x16) { std::printf("    from_matrix FAIL\n"); return 1; }
+        NN_EXIT(x16, 1, "    from_matrix FAIL\n");
         banner("A1c Linear.forward(x=f16)");
         auto y = ln.forward(*x16);
         if (!y) { std::printf("    forward ERR: %s\n", y.error().message.c_str()); ++g_bad; }
@@ -92,14 +92,14 @@ int main()
 
         banner("A2 Linear.forward  (W=f16, x=f32)");
         auto x32 = ad.from_matrix(rnd(D, TOTAL, 2));
-        if (!x32) { std::printf("    from_matrix FAIL\n"); return 1; }
+        NN_EXIT(x32, 1, "    from_matrix FAIL\n");
         auto y2 = ln.forward(*x32);
         if (!y2) { std::printf("    forward ERR: %s\n", y2.error().message.c_str()); ++g_bad; }
         else scan(ad, *y2, "A2 out");
 
         banner("A3 Linear.backward (grad=f16)");
         auto g = ad.from_matrix(rnd(OUT, TOTAL, 3), nn::Precision::F16);
-        if (!g) { std::printf("    from_matrix FAIL\n"); return 1; }
+        NN_EXIT(g, 1, "    from_matrix FAIL\n");
         if (auto z = ad.zero(ln.param_gradients()[0].get()); !z)
             std::printf("    zero grad FAIL\n");
         if (auto z = ad.zero(ln.param_gradients()[1].get()); !z)
@@ -117,7 +117,7 @@ int main()
         ln.set_precision_profile(prof);
         if (auto r = ln.init(ad); !r) { std::printf("    init FAIL\n"); return 1; }
         auto x16 = ad.from_matrix(rnd(D, TOTAL, 4), nn::Precision::F16);
-        if (!x16) { std::printf("    from_matrix FAIL\n"); return 1; }
+        NN_EXIT(x16, 1, "    from_matrix FAIL\n");
         auto y = ln.forward(*x16);
         if (!y) { std::printf("    forward ERR: %s\n", y.error().message.c_str()); ++g_bad; }
         else scan(ad, *y, "B out");
@@ -130,7 +130,7 @@ int main()
         ff.set_precision_profile(prof);
         if (auto r = ff.init(ad); !r) { std::printf("    init FAIL\n"); return 1; }
         auto x16 = ad.from_matrix(rnd(D, TOTAL, 5), nn::Precision::F16);
-        if (!x16) { std::printf("    from_matrix FAIL\n"); return 1; }
+        NN_EXIT(x16, 1, "    from_matrix FAIL\n");
         auto y = ff.forward(*x16);
         if (!y) { std::printf("    forward ERR: %s\n", y.error().message.c_str()); ++g_bad; }
         else scan(ad, *y, "C out");
@@ -143,7 +143,7 @@ int main()
         attn.set_precision_profile(prof);
         if (auto r = attn.init(ad); !r) { std::printf("    init FAIL\n"); return 1; }
         auto x16 = ad.from_matrix(rnd(D, TOTAL, 6), nn::Precision::F16);
-        if (!x16) { std::printf("    from_matrix FAIL\n"); return 1; }
+        NN_EXIT(x16, 1, "    from_matrix FAIL\n");
         auto y = attn.forward(*x16);
         if (!y) { std::printf("    forward ERR: %s\n", y.error().message.c_str()); ++g_bad; }
         else scan(ad, *y, "D out");
@@ -157,7 +157,7 @@ int main()
         cfg.num_heads = 2; cfg.d_ff = 2 * D; cfg.num_layers = 1;
         cfg.precision = nn::profile_f32();
         auto mr = nn::build_gpt_model(ad, cfg);
-        if (!mr) { std::printf("    build FAIL\n"); return 1; }
+        NN_EXIT(mr, 1, "    build FAIL\n");
         nn::Matrix x(SEQ, BATCH);
         for (std::size_t i = 0; i < SEQ * BATCH; ++i) x.span()[i] = static_cast<float>(i % 32);
         nn::Matrix tgt(32, TOTAL, 0.0f);
@@ -191,7 +191,7 @@ int main()
         if (auto r = ln.init(ad); !r) { std::printf("    init FAIL\n"); return 1; }
         auto opt = nn::create_optimizer("adam", ad, ln.parameters(), ln.param_gradients(),
                                         1e-3f, 0.0f, prof_f);
-        if (!opt) { std::printf("    create_optimizer FAIL\n"); return 1; }
+        NN_EXIT(opt, 1, "    create_optimizer FAIL\n");
         for (int s = 0; s < 3; ++s)
         {
             auto x16 = ad.from_matrix(rnd(D, TOTAL, 100 + (unsigned)s));
@@ -363,12 +363,12 @@ int main()
             const nn::Precision in_p = (cs.prof.compute == nn::Precision::F16)
                                            ? nn::Precision::F16 : nn::Precision::F32;
             auto x = ad.from_matrix(rnd(D, TOTAL, 42, -0.1f, 0.1f), in_p);
-            if (!x) { std::printf("    from_matrix FAIL\n"); return 1; }
+            NN_EXIT(x, 1, "    from_matrix FAIL\n");
             auto y = blk.forward(*x);
             if (!y) { std::printf("    fwd ERR: %s\n", y.error().message.c_str()); ++g_bad; continue; }
             scan(ad, *y, (std::string(cs.name) + " block-y").c_str());
             auto g = ad.from_matrix(rnd(D, TOTAL, 43, -0.1f, 0.1f), in_p);
-            if (!g) { std::printf("    from_matrix FAIL\n"); return 1; }
+            NN_EXIT(g, 1, "    from_matrix FAIL\n");
             if (auto r = blk.backward(*g); !r)
             { std::printf("    bwd ERR: %s\n", r.error().message.c_str()); ++g_bad; continue; }
             int gi = 0;

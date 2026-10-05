@@ -82,9 +82,7 @@ public:
         // 下方 merges_.reserve(config.vocab_size - BYTE_BASE - 2) 会发生无符号
         // 下溢 → ~SIZE_MAX 分配 → bad_alloc/terminate（-fno-exceptions 下不回 Result）。
         if (config.vocab_size < BYTE_BASE + 2)
-            return std::unexpected(Error{
-                "BPETokenizer::train: vocab_size 必须 >= " +
-                std::to_string(BYTE_BASE + 2) + "（256 字节 token + BOS/EOS）"});
+            NN_FAIL("BPETokenizer::train: vocab_size 必须 >= " +                 std::to_string(BYTE_BASE + 2) + "（256 字节 token + BOS/EOS）");
 
         auto log = config.log
             ? config.log
@@ -259,8 +257,7 @@ public:
     [[nodiscard]] Result<void> save(const std::string &path) const override
     {
         std::ofstream ofs(path);
-        if (!ofs) return std::unexpected(Error{"Cannot write: " + path});
-        // 共享 JSON 头部 + vocab 段（基类 save_vocab_json_）
+        if (!ofs) NN_FAIL("Cannot write: " + path);
         save_vocab_json_(ofs, "bpe_tokenizer", 0);
         ofs << ",\n  \"merges\": [";
         for (std::size_t i = 0; i < merges_.size(); ++i)
@@ -275,7 +272,7 @@ public:
     [[nodiscard]] Result<void> load(const std::string &path) override
     {
         std::ifstream ifs(path);
-        if (!ifs) return std::unexpected(Error{"Cannot read: " + path});
+        if (!ifs) NN_FAIL("Cannot read: " + path);
         std::string content((std::istreambuf_iterator<char>(ifs)),
                              std::istreambuf_iterator<char>());
         return load_from_string(content);

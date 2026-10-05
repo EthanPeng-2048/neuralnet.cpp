@@ -69,12 +69,12 @@ namespace
         {
             auto &p = tr.get();
             auto pm = eng.to_matrix(p);
-            if (!pm) return std::unexpected(pm.error());
+            NN_TRY_CHECK(pm);
             auto sp = pm->span();
             for (std::size_t i = 0; i < sp.size(); ++i)
                 sp[i] = 0.05f * std::sin(0.61803398875f * static_cast<float>(i + 1) +
                                          0.017f * static_cast<float>(idx));
-            if (auto r = eng.write(p, pm->span()); !r) return std::unexpected(r.error());
+            NN_TRY(r, eng.write(p, pm->span()));
             ++idx;
         }
         return {};
@@ -87,7 +87,7 @@ namespace
         for (auto tr : model.parameters())
         {
             auto pm = eng.to_matrix(tr.get());
-            if (!pm) return std::unexpected(pm.error());
+            NN_TRY_CHECK(pm);
             auto sp = pm->span();
             h = fnv1a(h, sp.data(), sp.size() * sizeof(nn::Scalar));
         }
@@ -107,11 +107,10 @@ namespace
             // VK_NULL_HANDLE 即 "Invalid device" 崩溃。与 cli_engine_factory
             // 及全部 GPU 测试入口同法。无显式 selector 时 initialize() 内部
             // 仍按 "显式 > NN_VULKAN_DEVICE 环境变量 > 自动打分" 读设备选择。
-            if (auto ir = backend.initialize(); !ir)
-                return std::unexpected(ir.error());
+            NN_TRY(ir, backend.initialize());
             eng = std::make_unique<nn::GpuEngine>(backend);
 #else
-            return std::unexpected(nn::Error{"built without Vulkan (NN_HAS_VULKAN)"});
+            NN_FAIL("built without Vulkan (NN_HAS_VULKAN)");
 #endif
         }
         else
@@ -127,7 +126,7 @@ namespace
         RunResult out;
 
         auto eng_r = make_engine(gpu);
-        if (!eng_r) return std::unexpected(eng_r.error());
+        NN_TRY_CHECK(eng_r);
         nn::ComputeEngine &e = **eng_r;
 
         // 微型配置：两层 GPT，seq=16 batch=2，双轮各 40 次前反向，足够覆盖
@@ -141,12 +140,11 @@ namespace
         cfg.d_ff       = 128;
         cfg.num_layers = 2;
         auto model_r = nn::build_gpt_model(e, cfg);
-        if (!model_r) return std::unexpected(model_r.error());
+        NN_TRY_CHECK(model_r);
         nn::Model model = std::move(*model_r);
 
-        if (auto r = fix_weights(e, model); !r) return std::unexpected(r.error());
-        if (auto r = model.zero_grad(); !r) return std::unexpected(r.error());
-
+        NN_TRY(r, fix_weights(e, model));
+        NN_TRY(r2, model.zero_grad());
         auto opt = nn::create_optimizer("adamw", e, model.parameters(),
                                         model.param_gradients(), 1e-3, 0.0);
         nn::CrossEntropyLoss ce;
@@ -161,23 +159,23 @@ namespace
             for (std::size_t i = 0; i < labels.size(); ++i)
                 labels[i] = (i * 11u + s * 17u + 3u) % vocab;
 
-            if (auto r = model.zero_grad(); !r) return std::unexpected(r.error());
+            NN_TRY(r, model.zero_grad());
             auto x = e.from_matrix(x_m);
-            if (!x) return std::unexpected(x.error());
+            NN_TRY_CHECK(x);
             auto logits = model.forward(*x);
-            if (!logits) return std::unexpected(logits.error());
+            NN_TRY_CHECK(logits);
             auto loss = ce.forward_sparse(e, *logits, labels, {}, vocab);
-            if (!loss) return std::unexpected(loss.error());
+            NN_TRY_CHECK(loss);
             auto grad = ce.backward();
-            if (!grad) return std::unexpected(grad.error());
+            NN_TRY_CHECK(grad);
             auto in_grad = model.backward(*grad);
-            if (!in_grad) return std::unexpected(in_grad.error());
-            if (auto r = opt->step(); !r) return std::unexpected(r.error());
+            NN_TRY_CHECK(in_grad);
+            NN_TRY(r2, opt->step());
             out.losses.push_back(static_cast<double>(*loss));
         }
 
         auto h = hash_params(e, model);
-        if (!h) return std::unexpected(h.error());
+        NN_TRY_CHECK(h);
         out.param_hash = *h;
         return out;
     }
@@ -188,10 +186,10 @@ namespace
     nn::Result<void> hash_model(nn::ComputeEngine &e, const char *name,
                                 nn::Result<nn::Model> &&mr, InitHashes &out)
     {
-        if (!mr) return std::unexpected(mr.error());
+        NN_TRY_CHECK(mr);
         nn::Model model = std::move(*mr);
         auto h = hash_params(e, model);
-        if (!h) return std::unexpected(h.error());
+        NN_TRY_CHECK(h);
         out.emplace_back(name, *h);
         return {};
     }
@@ -204,23 +202,18 @@ namespace
     nn::Result<InitHashes> run_init_hash(bool gpu)
     {
         auto eng_r = make_engine(gpu);
-        if (!eng_r) return std::unexpected(eng_r.error());
+        NN_TRY_CHECK(eng_r);
         nn::ComputeEngine &e = **eng_r;
         InitHashes out;
 
-        if (auto r = hash_model(e, "mnist_mlp", nn::build_mnist_mlp_model(e), out); !r)
-            return std::unexpected(r.error());
-
+        NN_TRY(r, hash_model(e, "mnist_mlp", nn::build_mnist_mlp_model(e), out));
         nn::CnnConfig ccfg;
         ccfg.convs = nn::MNIST_CNN_CONVS;
         ccfg.fc_dims = nn::MNIST_CNN_FC;
-        if (auto r = hash_model(e, "cnn", nn::build_cnn_model(e, ccfg), out); !r)
-            return std::unexpected(r.error());
-
+        NN_TRY(r2, hash_model(e, "cnn", nn::build_cnn_model(e, ccfg), out));
         if (auto r = hash_model(e, "mnist_transformer",
                                 nn::build_mnist_transformer_model(e), out); !r)
             return std::unexpected(r.error());
-
         nn::GptConfig gcfg{};
         gcfg.vocab_size = 257;
         gcfg.d_model     = 32;
@@ -228,9 +221,7 @@ namespace
         gcfg.num_heads   = 4;
         gcfg.d_ff        = 128;
         gcfg.num_layers  = 2;
-        if (auto r = hash_model(e, "gpt", nn::build_gpt_model(e, gcfg), out); !r)
-            return std::unexpected(r.error());
-
+        NN_TRY(r3, hash_model(e, "gpt", nn::build_gpt_model(e, gcfg), out));
         nn::RAPTConfig rcfg;
         rcfg.vocab_size = 257;
         rcfg.d_model    = 32;
@@ -238,9 +229,7 @@ namespace
         rcfg.num_heads  = 4;
         rcfg.d_ff       = 64;
         rcfg.num_layers = 2;
-        if (auto r = hash_model(e, "rapt", nn::build_rapt_model(e, rcfg), out); !r)
-            return std::unexpected(r.error());
-
+        NN_TRY(r4, hash_model(e, "rapt", nn::build_rapt_model(e, rcfg), out));
         return out;
     }
 
@@ -255,63 +244,53 @@ namespace
         auto t = e.create_tensor(kIoRows, kIoCols, nn::Precision::F32,
                                  nn::InitSpec::zero());
         if (!t.valid())
-            return std::unexpected(nn::Error{"io: create_tensor 失败"});
+            NN_FAIL("io: create_tensor 失败");
         std::vector<nn::Scalar> pat(kIoRows * kIoCols);
         for (std::size_t i = 0; i < pat.size(); ++i)
             pat[i] = 0.001f * static_cast<nn::Scalar>((i * 37u) % 1000u) - 0.2f;
 
-        if (auto r = e.write(t, std::span<const nn::Scalar>(pat)); !r)
-            return std::unexpected(r.error());
+        NN_TRY(r5, e.write(t, std::span<const nn::Scalar>(pat)));
         std::vector<nn::Scalar> back(pat.size());
-        if (auto r = e.read(t, std::span<nn::Scalar>(back)); !r)
-            return std::unexpected(r.error());
+        NN_TRY(r6, e.read(t, std::span<nn::Scalar>(back)));
         if (back != pat)
-            return std::unexpected(nn::Error{std::string(tag) + ": write/read 往返不一致"});
-
+            NN_FAIL(std::string(tag) + ": write/read 往返不一致");
         // read vs to_matrix：两条下载路径逐位一致
         auto m = e.to_matrix(t, nn::Precision::F32);
-        if (!m)
-            return std::unexpected(m.error());
+        NN_TRY_CHECK(m);
         if (m->span().size() != pat.size())
-            return std::unexpected(nn::Error{std::string(tag) + ": to_matrix 尺寸不一致"});
+            NN_FAIL(std::string(tag) + ": to_matrix 尺寸不一致");
         for (std::size_t i = 0; i < pat.size(); ++i)
             if (m->span()[i] != pat[i])
-                return std::unexpected(
-                    nn::Error{std::string(tag) + ": read 与 to_matrix 结果不一致"});
-
+                NN_FAIL(std::string(tag) + ": read 与 to_matrix 结果不一致");
         // get_index 往返（含首尾角与中部）
         const std::pair<std::size_t, std::size_t> pts[] = {
             {0, 0}, {kIoRows - 1, kIoCols - 1}, {2, 3}};
         for (const auto &rc : pts)
         {
             auto v = e.get_index(t, rc.first, rc.second);
-            if (!v)
-                return std::unexpected(v.error());
+            NN_TRY_CHECK(v);
             if (*v != pat[rc.first * kIoCols + rc.second])
-                return std::unexpected(nn::Error{std::string(tag) + ": get_index 不一致"});
+                NN_FAIL(std::string(tag) + ": get_index 不一致");
         }
 
         // set_index → 批量 read 复核
-        if (auto r = e.set_index(t, 3, 4, -0.125f); !r)
-            return std::unexpected(r.error());
-        if (auto r = e.read(t, std::span<nn::Scalar>(back)); !r)
-            return std::unexpected(r.error());
+        NN_TRY(r7, e.set_index(t, 3, 4, -0.125f));
+        NN_TRY(r8, e.read(t, std::span<nn::Scalar>(back)));
         if (back[3 * kIoCols + 4] != -0.125f)
-            return std::unexpected(nn::Error{std::string(tag) + ": set_index 未落盘"});
-
+            NN_FAIL(std::string(tag) + ": set_index 未落盘");
         // 错误路径：越界 / U2 精度错配 / 尺寸错配必须报错
         if (e.get_index(t, kIoRows, 0))
-            return std::unexpected(nn::Error{std::string(tag) + ": get_index 越界未报错"});
+            NN_FAIL(std::string(tag) + ": get_index 越界未报错");
         if (e.set_index(t, 0, kIoCols, 1.0f))
-            return std::unexpected(nn::Error{std::string(tag) + ": set_index 越界未报错"});
+            NN_FAIL(std::string(tag) + ": set_index 越界未报错");
         std::vector<nn::f16> wrong16(pat.size());
         if (e.read(t, std::span<nn::f16>(wrong16)))
-            return std::unexpected(nn::Error{std::string(tag) + ": read f16 错配未报错"});
+            NN_FAIL(std::string(tag) + ": read f16 错配未报错");
         if (e.write(t, std::span<const nn::f16>(wrong16)))
-            return std::unexpected(nn::Error{std::string(tag) + ": write f16 错配未报错"});
+            NN_FAIL(std::string(tag) + ": write f16 错配未报错");
         std::vector<nn::Scalar> shortbuf(3);
         if (e.read(t, std::span<nn::Scalar>(shortbuf)))
-            return std::unexpected(nn::Error{std::string(tag) + ": read 尺寸错配未报错"});
+            NN_FAIL(std::string(tag) + ": read 尺寸错配未报错");
         return {};
     }
 
@@ -320,48 +299,38 @@ namespace
         auto t = e.create_tensor(kIoRows, kIoCols, nn::Precision::F16,
                                  nn::InitSpec::zero());
         if (!t.valid())
-            return std::unexpected(nn::Error{"io: create_tensor(f16) 失败"});
+            NN_FAIL("io: create_tensor(f16) 失败");
         std::vector<nn::f16> pat(kIoRows * kIoCols);
         for (std::size_t i = 0; i < pat.size(); ++i)
             pat[i] = nn::f16(0.01f * static_cast<float>((i * 13u) % 200u) - 1.f);
 
-        if (auto r = e.write(t, std::span<const nn::f16>(pat)); !r)
-            return std::unexpected(r.error());
+        NN_TRY(r9, e.write(t, std::span<const nn::f16>(pat)));
         std::vector<nn::f16> back(pat.size());
-        if (auto r = e.read(t, std::span<nn::f16>(back)); !r)
-            return std::unexpected(r.error());
+        NN_TRY(r10, e.read(t, std::span<nn::f16>(back)));
         for (std::size_t i = 0; i < pat.size(); ++i)
             if (static_cast<float>(back[i]) != static_cast<float>(pat[i]))
-                return std::unexpected(
-                    nn::Error{std::string(tag) + ": f16 write/read 往返不一致"});
-
+                NN_FAIL(std::string(tag) + ": f16 write/read 往返不一致");
         // to_matrix（升 f32 精确无损）与 read(f16) 交叉对拍
         auto m = e.to_matrix(t, nn::Precision::F32);
-        if (!m)
-            return std::unexpected(m.error());
+        NN_TRY_CHECK(m);
         for (std::size_t i = 0; i < pat.size(); ++i)
             if (m->span()[i] != static_cast<float>(pat[i]))
-                return std::unexpected(
-                    nn::Error{std::string(tag) + ": f16 read 与 to_matrix 不一致"});
-
+                NN_FAIL(std::string(tag) + ": f16 read 与 to_matrix 不一致");
         // 索引往返：set_index 的 Scalar 经 RHE 落 f16（0.5 可精确表示）
         auto v = e.get_index(t, 1, 2);
-        if (!v)
-            return std::unexpected(v.error());
+        NN_TRY_CHECK(v);
         if (*v != static_cast<float>(pat[1 * kIoCols + 2]))
-            return std::unexpected(nn::Error{std::string(tag) + ": f16 get_index 不一致"});
-        if (auto r = e.set_index(t, 5, 6, 0.5f); !r)
-            return std::unexpected(r.error());
+            NN_FAIL(std::string(tag) + ": f16 get_index 不一致");
+        NN_TRY(r11, e.set_index(t, 5, 6, 0.5f));
         auto v2 = e.get_index(t, 5, 6);
         if (!v2 || *v2 != 0.5f)
-            return std::unexpected(nn::Error{std::string(tag) + ": f16 set_index 未落盘"});
-
+            NN_FAIL(std::string(tag) + ": f16 set_index 未落盘");
         // U2：f32 span 配 f16 张量必须报错
         std::vector<nn::Scalar> wrong32(pat.size());
         if (e.read(t, std::span<nn::Scalar>(wrong32)))
-            return std::unexpected(nn::Error{std::string(tag) + ": read f32 错配未报错"});
+            NN_FAIL(std::string(tag) + ": read f32 错配未报错");
         if (e.write(t, std::span<const nn::Scalar>(wrong32)))
-            return std::unexpected(nn::Error{std::string(tag) + ": write f32 错配未报错"});
+            NN_FAIL(std::string(tag) + ": write f32 错配未报错");
         return {};
     }
 
@@ -372,28 +341,21 @@ namespace
     {
         auto t = e.create_tensor(4, 5, nn::Precision::F32, nn::InitSpec::zero());
         if (!t.valid())
-            return std::unexpected(nn::Error{"io: create_tensor 失败"});
+            NN_FAIL("io: create_tensor 失败");
         std::vector<nn::Scalar> pat(20);
         for (std::size_t i = 0; i < pat.size(); ++i)
             pat[i] = 0.5f + static_cast<nn::Scalar>(i);
 
-        if (auto r = e.begin_batch(); !r)
-            return std::unexpected(r.error());
-        if (auto r = e.write(t, std::span<const nn::Scalar>(pat)); !r)
-            return std::unexpected(r.error());
+        NN_TRY(r12, e.begin_batch());
+        NN_TRY(r13, e.write(t, std::span<const nn::Scalar>(pat)));
         std::vector<nn::Scalar> back(pat.size());
-        if (auto r = e.read(t, std::span<nn::Scalar>(back)); !r)
-            return std::unexpected(r.error());
+        NN_TRY(r14, e.read(t, std::span<nn::Scalar>(back)));
         if (back != pat)
-            return std::unexpected(
-                nn::Error{std::string(tag) + ": 窗口内 write/read 不一致"});
-        if (auto r = e.end_batch(); !r)
-            return std::unexpected(r.error());
-        if (auto r = e.read(t, std::span<nn::Scalar>(back)); !r)
-            return std::unexpected(r.error());
+            NN_FAIL(std::string(tag) + ": 窗口内 write/read 不一致");
+        NN_TRY(r15, e.end_batch());
+        NN_TRY(r16, e.read(t, std::span<nn::Scalar>(back)));
         if (back != pat)
-            return std::unexpected(
-                nn::Error{std::string(tag) + ": end_batch 后复读值变化"});
+            NN_FAIL(std::string(tag) + ": end_batch 后复读值变化");
         return {};
     }
 
@@ -548,17 +510,9 @@ int main(int argc, char **argv)
     if (init_hash)
     {
         auto a = run_init_hash(gpu);
-        if (!a)
-        {
-            std::fprintf(stderr, "init-hash round1 失败: %s\n", a.error().message.c_str());
-            return 2;
-        }
+        NN_EXIT(a, 2, "init-hash round1 失败: %s\n");
         auto b = run_init_hash(gpu);
-        if (!b)
-        {
-            std::fprintf(stderr, "init-hash round2 失败: %s\n", b.error().message.c_str());
-            return 2;
-        }
+        NN_EXIT(b, 2, "init-hash round2 失败: %s\n");
         // 固定前缀行：跨进程比对用 `grep '^INIT1' <(两次启动输出) | diff`
         for (const auto &kv : *a)
             std::printf("INIT1 %s hash=%016" PRIx64 "\n", kv.first.c_str(), kv.second);
@@ -571,17 +525,9 @@ int main(int argc, char **argv)
     }
 
     auto r1 = run_once(gpu, steps);
-    if (!r1)
-    {
-        std::fprintf(stderr, "run1 失败: %s\n", r1.error().message.c_str());
-        return 2;
-    }
+    NN_EXIT(r1, 2, "run1 失败: %s\n");
     auto r2 = run_once(gpu, steps);
-    if (!r2)
-    {
-        std::fprintf(stderr, "run2 失败: %s\n", r2.error().message.c_str());
-        return 2;
-    }
+    NN_EXIT(r2, 2, "run2 失败: %s\n");
 
     // 固定前缀行：跨进程比对用 `probe ... | grep -E '^run[12]' | diff -`
     for (std::size_t s = 0; s < steps; ++s)

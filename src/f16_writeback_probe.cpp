@@ -97,20 +97,18 @@ nn::Result<Matrix> inplace_add_writeback(nn::ComputeEngine& eng, Precision targe
     for (auto& v : m.span()) v = 1.0f;
 
     auto p_r = eng.from_matrix(m, target_p);
-    if (!p_r) return std::unexpected(p_r.error());
+    NN_TRY_CHECK(p_r);
     auto p = std::move(*p_r);
 
     // delta 全 0.5，按 target_p 物化（对齐 optimizer 里 delta 精度 = p_.param）
     Matrix dm(2, 2);
     for (auto& v : dm.span()) v = 0.5f;
     auto d_r = eng.from_matrix(dm, target_p);
-    if (!d_r) return std::unexpected(d_r.error());
-
+    NN_TRY_CHECK(d_r);
     // K3：compute_into(leaf(p) + leaf(delta), p) —— 目标传递 in-place
     auto r = nn::dsl::compute_into(eng,
         nn::dsl::leaf(p) + nn::dsl::leaf(*d_r), p);
-    if (!r) return std::unexpected(r.error());
-
+    NN_TRY_CHECK(r);
     return eng.to_matrix(p);
 }
 

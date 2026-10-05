@@ -69,8 +69,7 @@ public:
     [[nodiscard]] Result<Matrix> to_matrix(const Tensor& t, Precision P = Precision::F32) override
     {
         if (!t.is_cpu())
-            return std::unexpected(Error{"to_matrix: tensor is not CPU"});
-
+            NN_FAIL("to_matrix: tensor is not CPU");
         if (P == Precision::F16)
         {
             // 下载为 f16 → cast 到 f32（升 cast，精确无损）
@@ -121,8 +120,7 @@ public:
             return src;
 
         if (!src.is_cpu())
-            return std::unexpected(Error{"cast: CPU engine only supports CPU tensors"});
-
+            NN_FAIL("cast: CPU engine only supports CPU tensors");
         if (src.precision() == Precision::F16 && dst == Precision::F32)
         {
             const auto& m16 = src.cpu_matrix<Precision::F16>();
@@ -145,7 +143,7 @@ public:
             return Tensor::from_matrix(std::move(m16));
         }
 
-        return std::unexpected(Error{"cast: unsupported precision conversion"});
+        NN_FAIL("cast: unsupported precision conversion");
     }
 
     // ── cast_into / copy_into（多精度适配层的"写回原存储"路径，§6.5）──────
@@ -154,11 +152,11 @@ public:
     [[nodiscard]] Result<void> copy_into(Tensor& dst, const Tensor& src) override
     {
         if (!dst.is_cpu() || !src.is_cpu())
-            return std::unexpected(Error{"copy_into: CPU engine only supports CPU tensors"});
+            NN_FAIL("copy_into: CPU engine only supports CPU tensors");
         if (dst.rows() != src.rows() || dst.cols() != src.cols())
-            return std::unexpected(Error{"copy_into: shape mismatch"});
+            NN_FAIL("copy_into: shape mismatch");
         if (dst.precision() != src.precision())
-            return std::unexpected(Error{"copy_into: precision mismatch"});
+            NN_FAIL("copy_into: precision mismatch");
         if (dst.precision() == Precision::F16)
         {
             const auto s = src.cpu_matrix<Precision::F16>().span();
@@ -177,9 +175,9 @@ public:
     [[nodiscard]] Result<void> cast_into(const Tensor& src, Tensor& dst) override
     {
         if (!dst.is_cpu() || !src.is_cpu())
-            return std::unexpected(Error{"cast_into: CPU engine only supports CPU tensors"});
+            NN_FAIL("cast_into: CPU engine only supports CPU tensors");
         if (dst.rows() != src.rows() || dst.cols() != src.cols())
-            return std::unexpected(Error{"cast_into: shape mismatch"});
+            NN_FAIL("cast_into: shape mismatch");
         if (src.precision() == dst.precision())
             return copy_into(dst, src);
         if (src.precision() == Precision::F16 && dst.precision() == Precision::F32)
@@ -198,15 +196,15 @@ public:
                 d[i] = s[i];                       // 降 cast：round-half-to-even
             return {};
         }
-        return std::unexpected(Error{"cast_into: unsupported precision conversion"});
+        NN_FAIL("cast_into: unsupported precision conversion");
     }
 
     [[nodiscard]] Result<void> copy_from_impl(Tensor& dst, const Matrix& src) override
     {
         if (!dst.is_cpu())
-            return std::unexpected(Error{"copy_from: dst tensor is not CPU"});
+            NN_FAIL("copy_from: dst tensor is not CPU");
         if (dst.rows() != src.rows() || dst.cols() != src.cols())
-            return std::unexpected(Error{"copy_from: shape mismatch"});
+            NN_FAIL("copy_from: shape mismatch");
         dst.cpu_matrix() = src;  // 拷贝赋值
         return {};
     }
@@ -214,7 +212,7 @@ public:
     [[nodiscard]] Result<Tensor> clone_impl(const Tensor& src) override
     {
         if (!src.is_cpu())
-            return std::unexpected(Error{"clone: src tensor is not CPU"});
+            NN_FAIL("clone: src tensor is not CPU");
         return Tensor::from_matrix(Matrix(src.cpu_matrix()));  // 深拷贝
     }
 
@@ -223,11 +221,10 @@ public:
         const Tensor& src, std::size_t start_row, std::size_t count) override
     {
         if (!src.is_cpu())
-            return std::unexpected(Error{"slice_rows: src tensor is not CPU"});
+            NN_FAIL("slice_rows: src tensor is not CPU");
         const Matrix& m = src.cpu_matrix();
         if (start_row + count > m.rows())
-            return std::unexpected(Error{"slice_rows: range out of bounds"});
-
+            NN_FAIL("slice_rows: range out of bounds");
         Matrix result(count, m.cols());
         const auto src_span = m.span();
         auto dst_span = result.span();
@@ -243,12 +240,11 @@ public:
         Tensor& dst, std::size_t dst_start_row, const Tensor& src) override
     {
         if (!dst.is_cpu() || !src.is_cpu())
-            return std::unexpected(Error{"insert_rows: tensors are not CPU"});
+            NN_FAIL("insert_rows: tensors are not CPU");
         if (dst.cols() != src.cols())
-            return std::unexpected(Error{"insert_rows: column count mismatch"});
+            NN_FAIL("insert_rows: column count mismatch");
         if (dst_start_row + src.rows() > dst.rows())
-            return std::unexpected(Error{"insert_rows: range out of bounds"});
-
+            NN_FAIL("insert_rows: range out of bounds");
         Matrix& d = dst.cpu_matrix();
         const Matrix& s = src.cpu_matrix();
         const auto dst_span = d.span();
@@ -273,8 +269,7 @@ public:
         const Tensor& table, const Tensor& indices) override
     {
         if (!table.is_cpu() || !indices.is_cpu())
-            return std::unexpected(Error{"gather_rows: tensors are not CPU"});
-
+            NN_FAIL("gather_rows: tensors are not CPU");
         const Matrix& tbl = table.cpu_matrix();
         const Matrix& idx = indices.cpu_matrix();
         const std::size_t vocab = tbl.rows();
@@ -332,10 +327,9 @@ public:
         Tensor& dst, const Tensor& indices, const Tensor& grad) override
     {
         if (!dst.is_cpu() || !indices.is_cpu() || !grad.is_cpu())
-            return std::unexpected(Error{"scatter_add_rows: tensors are not CPU"});
+            NN_FAIL("scatter_add_rows: tensors are not CPU");
         if (dst.cols() != grad.cols())
-            return std::unexpected(Error{"scatter_add_rows: column count mismatch"});
-
+            NN_FAIL("scatter_add_rows: column count mismatch");
         Matrix& d = dst.cpu_matrix();
         const Matrix& idx = indices.cpu_matrix();
         const Matrix& g = grad.cpu_matrix();
@@ -375,13 +369,11 @@ public:
         bool inverse) override
     {
         if (x.is_gpu())
-            return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
-
+            NN_FAIL("CpuEngine: GPU tensor on CPU engine");
         const Matrix& m = x.cpu_matrix();
         const std::size_t total = M * B * N;
         if (m.size() != total)
-            return std::unexpected(Error{"rearrange_3d: element count mismatch"});
-
+            NN_FAIL("rearrange_3d: element count mismatch");
         Matrix out(inverse ? M : (B * M), inverse ? (B * N) : N);
         const auto src = m.span();
         const auto dst = out.span();
@@ -429,7 +421,7 @@ public:
     [[nodiscard]] Result<Tensor> transpose_impl(const Tensor& A) override
     {
         if (A.is_gpu())
-            return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+            NN_FAIL("CpuEngine: GPU tensor on CPU engine");
         return Tensor::from_matrix(A.cpu_matrix().transpose());
     }
 
@@ -443,13 +435,12 @@ public:
         std::size_t OH, std::size_t OW) override
     {
         if (x.is_gpu())
-            return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+            NN_FAIL("CpuEngine: GPU tensor on CPU engine");
         if (C == 0 || H == 0 || W == 0 || k == 0 || stride == 0 || OH == 0 || OW == 0)
-            return std::unexpected(Error{"im2col: C/H/W/k/stride/OH/OW must be > 0"});
+            NN_FAIL("im2col: C/H/W/k/stride/OH/OW must be > 0");
         const std::size_t B = x.cols();
         if (x.rows() != C * H * W)
-            return std::unexpected(Error{"im2col: x must be (C*H*W, B)"});
-
+            NN_FAIL("im2col: x must be (C*H*W, B)");
         const std::size_t kk = k * k;
         const std::size_t P = OH * OW;
         const std::size_t rows = C * kk;
@@ -512,13 +503,13 @@ public:
         std::size_t OH, std::size_t OW) override
     {
         if (col.is_gpu())
-            return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+            NN_FAIL("CpuEngine: GPU tensor on CPU engine");
         if (C == 0 || H == 0 || W == 0 || k == 0 || stride == 0 || OH == 0 || OW == 0)
-            return std::unexpected(Error{"col2im: C/H/W/k/stride/OH/OW must be > 0"});
+            NN_FAIL("col2im: C/H/W/k/stride/OH/OW must be > 0");
         const std::size_t kk = k * k;
         const std::size_t P = OH * OW;
         if (col.rows() != C * kk || col.cols() == 0 || col.cols() % P != 0)
-            return std::unexpected(Error{"col2im: col must be (C*k*k, B*OH*OW)"});
+            NN_FAIL("col2im: col must be (C*k*k, B*OH*OW)");
         const std::size_t B = col.cols() / P;
 
         Matrix out(C * H * W, B, Scalar{0});
@@ -579,8 +570,7 @@ public:
         Precision P = Precision::F32) override
     {
         if (A.is_gpu() || B.is_gpu())
-            return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
-
+            NN_FAIL("CpuEngine: GPU tensor on CPU engine");
         // ── 精度与存储不匹配时不可直读（cpu_matrix<P> 对错位存储返回空 → UB；
         //    实测 CPU f16 训练 step0 即 NaN）→ 先统一到 f32 空间计算，输出按 P
         //    舍入（§7.2 f32 参考语义）。两端同 f16 才走下方原生 f16 GEMM。
@@ -591,11 +581,11 @@ public:
                 (P == Precision::F16 && !(a16 && b16)))
             {
                 auto a32 = a16 ? cast(A, Precision::F32) : Result<Tensor>{A};
-                if (!a32) return std::unexpected(a32.error());
+                NN_TRY_CHECK(a32);
                 auto b32 = b16 ? cast(B, Precision::F32) : Result<Tensor>{B};
-                if (!b32) return std::unexpected(b32.error());
+                NN_TRY_CHECK(b32);
                 auto r = matmul(*a32, *b32, transA, transB, Precision::F32);
-                if (!r) return std::unexpected(r.error());
+                NN_TRY_CHECK(r);
                 if (P == Precision::F32) return r;
                 return cast(*r, Precision::F16);
             }
@@ -612,14 +602,12 @@ public:
             const std::size_t K2 = transB ? b.cols() : b.rows();
             const std::size_t N  = transB ? b.rows() : b.cols();
             if (K != K2)
-                return std::unexpected(Error{"matmul: dimension mismatch A=" +
+                NN_FAIL("matmul: dimension mismatch A=" +
                     std::to_string(a.rows()) + "x" + std::to_string(a.cols()) +
                     " transA=" + (transA ? "1" : "0") +
                     " B=" + std::to_string(b.rows()) + "x" + std::to_string(b.cols()) +
                     " transB=" + (transB ? "1" : "0") +
-                    " K=" + std::to_string(K) + " K2=" + std::to_string(K2)});
-
-            // 未初始化：multiply_to 内部会先 result.zero() 再累加，
+                    " K=" + std::to_string(K) + " K2=" + std::to_string(K2));
             // 构造函数里的全尺寸零填充是**重复**的（本机单线程写满一遍 6MB ~2ms）
             Matrix result = Matrix::make_uninitialized(M, N);
             if (!transA && !transB) {
@@ -647,8 +635,7 @@ public:
             const std::size_t K2 = transB ? b.cols() : b.rows();
             const std::size_t N  = transB ? b.rows() : b.cols();
             if (K != K2)
-                return std::unexpected(Error{"matmul(f16): dimension mismatch"});
-
+                NN_FAIL("matmul(f16): dimension mismatch");
             MatrixT<Precision::F16> result(M, N);
             // f16 无原生 x86 SIMD → 向量化失败是预期行为（§7.2 兼容路径）
             if (!transA && !transB) {
@@ -664,7 +651,7 @@ public:
             return Tensor::from_matrix(std::move(result));
         }
 
-        return std::unexpected(Error{"matmul: unsupported precision"});
+        NN_FAIL("matmul: unsupported precision");
     }
 
     // ── matmul + 行广播 bias：经 DSL 融合（单一事实源）──────────────
@@ -677,7 +664,7 @@ public:
         Precision P = Precision::F32) override
     {
         if (A.is_gpu() || B.is_gpu())
-            return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+            NN_FAIL("CpuEngine: GPU tensor on CPU engine");
         const std::size_t rows = transA ? A.cols() : A.rows();
         const std::size_t cols = transB ? B.rows() : B.cols();
         // P 必须下传（不可丢弃）：scan 的 f16 dry-run 靠 dsl::compute 的
@@ -701,10 +688,9 @@ public:
         Precision P = Precision::F32) override
     {
         if (A.is_gpu() || B.is_gpu())
-            return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+            NN_FAIL("CpuEngine: GPU tensor on CPU engine");
         if (batch == 0)
-            return std::unexpected(Error{"batched_matmul: batch must be > 0"});
-
+            NN_FAIL("batched_matmul: batch must be > 0");
         // ── 精度与存储不匹配：统一到 f32 空间计算 + 按 P 舍入（同 matmul）──
         {
             const bool a16 = A.precision() == Precision::F16;
@@ -713,12 +699,12 @@ public:
                 (P == Precision::F16 && !(a16 && b16)))
             {
                 auto a32 = a16 ? cast(A, Precision::F32) : Result<Tensor>{A};
-                if (!a32) return std::unexpected(a32.error());
+                NN_TRY_CHECK(a32);
                 auto b32 = b16 ? cast(B, Precision::F32) : Result<Tensor>{B};
-                if (!b32) return std::unexpected(b32.error());
+                NN_TRY_CHECK(b32);
                 auto r = batched_matmul(*a32, *b32, batch, transA, transB, alpha,
                                         Precision::F32);
-                if (!r) return std::unexpected(r.error());
+                NN_TRY_CHECK(r);
                 if (P == Precision::F32) return r;
                 return cast(*r, Precision::F16);
             }
@@ -781,8 +767,7 @@ public:
 
         // 每个 batch 的行数
         if (a.rows() % batch != 0 || b.rows() % batch != 0)
-            return std::unexpected(Error{"batched_matmul: rows not divisible by batch"});
-
+            NN_FAIL("batched_matmul: rows not divisible by batch");
         const std::size_t a_rows_per = a.rows() / batch;
         const std::size_t b_rows_per = b.rows() / batch;
 
@@ -796,8 +781,7 @@ public:
         const std::size_t K2 = transB ? b.cols() : b_rows_per;
         const std::size_t N  = transB ? b_rows_per : b.cols();
         if (K != K2)
-            return std::unexpected(Error{"batched_matmul: K dimension mismatch"});
-
+            NN_FAIL("batched_matmul: K dimension mismatch");
         Matrix result(batch * M, N);
         auto result_span = result.span();
         const auto a_span = a.span();
@@ -854,7 +838,7 @@ public:
     [[nodiscard]] Result<void> add_inplace_impl(Tensor& A, const Tensor& B) override
     {
         if (A.rows() != B.rows() || A.cols() != B.cols())
-            return std::unexpected(Error{"add_inplace: shape mismatch"});
+            NN_FAIL("add_inplace: shape mismatch");
         A.cpu_matrix().add_inplace(B.cpu_matrix());
         return {};
     }
@@ -889,29 +873,28 @@ public:
     {
         for (const auto& t : {K, V, P, R, A0, B0, boundary})
             if (t.is_gpu())
-                return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+                NN_FAIL("CpuEngine: GPU tensor on CPU engine");
         if (dk == 0 || heads == 0)
-            return std::unexpected(Error{"scan_prefix_outer: dk/heads must be > 0"});
-
+            NN_FAIL("scan_prefix_outer: dk/heads must be > 0");
         const Matrix& Km = K.cpu_matrix();
         const std::size_t rows = Km.rows();
         const std::size_t seq  = Km.cols();
         if (rows % (dk * heads) != 0)
-            return std::unexpected(Error{"scan_prefix_outer: K rows not divisible by H*dk"});
+            NN_FAIL("scan_prefix_outer: K rows not divisible by H*dk");
         for (const auto* m : {&V.cpu_matrix(), &P.cpu_matrix(), &R.cpu_matrix()})
             if (m->rows() != rows || m->cols() != seq)
-                return std::unexpected(Error{"scan_prefix_outer: K/V/P/R shape mismatch"});
+                NN_FAIL("scan_prefix_outer: K/V/P/R shape mismatch");
         if (has_state)
         {
             if (A0.cpu_matrix().rows() != heads * dk || A0.cpu_matrix().cols() != dk ||
                 B0.cpu_matrix().rows() != heads * dk || B0.cpu_matrix().cols() != dk)
-                return std::unexpected(Error{"scan_prefix_outer: A0/B0 must be (H*dk, dk)"});
+                NN_FAIL("scan_prefix_outer: A0/B0 must be (H*dk, dk)");
         }
         if (has_bnd)
         {
             const Matrix& bd = boundary.cpu_matrix();
             if (bd.rows() != 1 || bd.cols() != (rows / (dk * heads)) * seq)
-                return std::unexpected(Error{"scan_prefix_outer: boundary must be (1, B*seq)"});
+                NN_FAIL("scan_prefix_outer: boundary must be (1, B*seq)");
         }
 
         const std::size_t BH = rows / dk;
@@ -1037,25 +1020,24 @@ public:
     {
         for (const auto& t : {D, X, Y, boundary})
             if (t.is_gpu())
-                return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+                NN_FAIL("CpuEngine: GPU tensor on CPU engine");
         if (dk == 0 || heads == 0)
-            return std::unexpected(Error{"scan_suffix_outer: dk/heads must be > 0"});
-
+            NN_FAIL("scan_suffix_outer: dk/heads must be > 0");
         const Matrix& Xm = X.cpu_matrix();
         const std::size_t rows = Xm.rows();
         const std::size_t seq  = Xm.cols();
         if (rows % (dk * heads) != 0)
-            return std::unexpected(Error{"scan_suffix_outer: X rows not divisible by H*dk"});
+            NN_FAIL("scan_suffix_outer: X rows not divisible by H*dk");
         const Matrix& Dm = D.cpu_matrix();
         if (Dm.rows() != rows * dk || Dm.cols() != seq)
-            return std::unexpected(Error{"scan_suffix_outer: D must be (B*H*dk*dk, seq)"});
+            NN_FAIL("scan_suffix_outer: D must be (B*H*dk*dk, seq)");
         if (Y.cpu_matrix().rows() != rows || Y.cpu_matrix().cols() != seq)
-            return std::unexpected(Error{"scan_suffix_outer: X/Y shape mismatch"});
+            NN_FAIL("scan_suffix_outer: X/Y shape mismatch");
         if (has_bnd)
         {
             const Matrix& bd = boundary.cpu_matrix();
             if (bd.rows() != 1 || bd.cols() != (rows / (dk * heads)) * seq)
-                return std::unexpected(Error{"scan_suffix_outer: boundary must be (1, B*seq)"});
+                NN_FAIL("scan_suffix_outer: boundary must be (1, B*seq)");
         }
 
         const std::size_t BH = rows / dk;
@@ -1130,21 +1112,19 @@ public:
     {
         for (const auto& t : {P, R, S})
             if (t.is_gpu())
-                return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+                NN_FAIL("CpuEngine: GPU tensor on CPU engine");
         if (dk == 0)
-            return std::unexpected(Error{"outer_col: dk must be > 0"});
-
+            NN_FAIL("outer_col: dk must be > 0");
         const Matrix& Pm = P.cpu_matrix();
         const std::size_t rows = Pm.rows();
         const std::size_t seq  = Pm.cols();
         if (rows % dk != 0)
-            return std::unexpected(Error{"outer_col: rows not divisible by dk"});
+            NN_FAIL("outer_col: rows not divisible by dk");
         if (R.cpu_matrix().rows() != rows || R.cpu_matrix().cols() != seq)
-            return std::unexpected(Error{"outer_col: P/R shape mismatch"});
+            NN_FAIL("outer_col: P/R shape mismatch");
         if (has_scale &&
             (S.cpu_matrix().rows() != rows || S.cpu_matrix().cols() != seq))
-            return std::unexpected(Error{"outer_col: S must be (B*H*dk, seq)"});
-
+            NN_FAIL("outer_col: S must be (B*H*dk, seq)");
         const Matrix& Rm = R.cpu_matrix();
         const Matrix& Sm = S.cpu_matrix();
 
@@ -1210,15 +1190,14 @@ public:
         const Tensor& x, std::size_t G, std::size_t R)
     {
         if (x.is_gpu())
-            return std::unexpected(Error{"CpuEngine: GPU tensor on CPU engine"});
+            NN_FAIL("CpuEngine: GPU tensor on CPU engine");
         if (G == 0 || R == 0)
-            return std::unexpected(Error{"grouped_reduce: G/R must be > 0"});
+            NN_FAIL("grouped_reduce: G/R must be > 0");
         if (x.rows() != G * R)
-            return std::unexpected(Error{"grouped_reduce: x must be (G*R, N)"});
+            NN_FAIL("grouped_reduce: x must be (G*R, N)");
         const std::size_t N = x.cols();
         if (N == 0)
-            return std::unexpected(Error{"grouped_reduce: N must be > 0"});
-
+            NN_FAIL("grouped_reduce: N must be > 0");
         Matrix out(G, N);
         const auto src = x.cpu_matrix().span();
         const auto dst = out.span();
@@ -1285,7 +1264,7 @@ public:
         // 省掉一遍全尺寸零写（见 Tensor::cpu_uninitialized）
         Tensor out = Tensor::cpu_uninitialized(rows, cols);
         auto r = eval_expr_impl(spec, inputs, rows, cols, /*vector_out=*/false, out);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return out;
     }
 
@@ -1306,7 +1285,7 @@ public:
         Tensor out = vec_is_row ? Tensor::cpu_uninitialized(rows, 1)
                                 : Tensor::cpu_uninitialized(1, cols);
         auto r = eval_expr_impl(spec, inputs, rows, cols, /*vector_out=*/true, out);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return out;
     }
 
@@ -1325,10 +1304,9 @@ public:
         std::size_t rows, std::size_t cols, Tensor& dst) override
     {
         if (dst.rows() != rows || dst.cols() != cols)
-            return std::unexpected(Error{"eval_expr_into: dst shape mismatch"});
+            NN_FAIL("eval_expr_into: dst shape mismatch");
         if (expr_spec_reduce_axis(canonicalize_expr_spec(spec)) != -1)
-            return std::unexpected(Error{
-                "eval_expr_into: 仅支持逐元素表达式（无归约）"});
+            NN_FAIL("eval_expr_into: 仅支持逐元素表达式（无归约）");
         return eval_expr_impl(spec, inputs, rows, cols, /*vector_out=*/false, dst);
     }
 
@@ -1348,16 +1326,13 @@ public:
         std::size_t rows, std::size_t cols, bool vector_out, Tensor& output)
     {
         if (vector_out)
-            return std::unexpected(Error{
-                "eval_fold: vector_out not expected (fold outputs via eval_expr)"});
+            NN_FAIL("eval_fold: vector_out not expected (fold outputs via eval_expr)");
         const FoldSpec& f = *spec.fold;
         const std::size_t K = f.k;
         const std::size_t out_cols =
             (f.vec_state_len > 0) ? f.vec_state_len : 1;
         if (cols != out_cols)
-            return std::unexpected(Error{
-                "eval_fold: cols must equal fold output width (vec_state_len or 1)"});
-
+            NN_FAIL("eval_fold: cols must equal fold output width (vec_state_len or 1)");
         // 输入：分 fold.matmul 的 A/B（按 trans 布局）与普通输入（视图校验）
         std::vector<ConstSpan> spans;
         spans.reserve(inputs.size());
@@ -1365,7 +1340,7 @@ public:
         {
             const Tensor& t = inputs[k];
             if (!t.is_cpu())
-                return std::unexpected(Error{"eval_fold: input not CPU"});
+                NN_FAIL("eval_fold: input not CPU");
             const ExprViewKind vk = static_cast<ExprViewKind>(spec.views[k].kind);
             // vecacc.b（(K, vec) 独立校验于下方）与掩码小表（BatchMod/BatchCol
             //   为 (1, *) 标签/斜率向量，行主序平坦读、不占 (rows,K) 网格）
@@ -1397,8 +1372,7 @@ public:
                     ? (tr ? m_per : mm_k)
                     : (tr ? mm_k : K);
                 if (t.rows() != er || t.cols() != ec)
-                    return std::unexpected(Error{
-                        "eval_fold: fold matmul input shape mismatch"});
+                    NN_FAIL("eval_fold: fold matmul input shape mismatch");
                 spans.push_back(t.cpu_matrix().span());
                 continue;
             }
@@ -1408,14 +1382,12 @@ public:
                 vk != ExprViewKind::RowBroadcast &&
                 !((vk == ExprViewKind::BatchMod || vk == ExprViewKind::BatchCol) &&
                   f.matmul))
-                return std::unexpected(Error{"eval_fold: view outside supported scope"});
+                NN_FAIL("eval_fold: view outside supported scope");
             if (!is_vecb && !is_tag_table && !is_rowvec &&
                 (t.rows() != rows || t.cols() != K))
-                return std::unexpected(Error{
-                    "eval_fold: input shape mismatch (expect (rows, fold.k))"});
+                NN_FAIL("eval_fold: input shape mismatch (expect (rows, fold.k))");
             if (is_tag_table && t.rows() != 1)
-                return std::unexpected(Error{
-                    "eval_fold: tag table (BatchMod/BatchCol) must be (1, n)"});
+                NN_FAIL("eval_fold: tag table (BatchMod/BatchCol) must be (1, n)");
             // 标签表列数守卫（必须连 cols 一起查，否则形状违约静默越界读）：
             //   BatchMod 读 [batch_idx % param] → cols ≥ param（param==0 无
             //   定义直接拒）；BatchCol 读 [batch_idx*param + gk] →
@@ -1424,19 +1396,16 @@ public:
             {
                 const std::uint32_t vparam = spec.views[k].param;
                 if (vparam == 0)
-                    return std::unexpected(Error{
-                        "eval_fold: BatchMod/BatchCol param must be > 0"});
+                    NN_FAIL("eval_fold: BatchMod/BatchCol param must be > 0");
                 const std::size_t batch_n = f.matmul ? f.matmul->batch : 1;
                 const std::size_t need = vk == ExprViewKind::BatchMod
                     ? static_cast<std::size_t>(vparam)
                     : (batch_n - 1) * static_cast<std::size_t>(vparam) + K;
                 if (t.cols() < need)
-                    return std::unexpected(Error{
-                        "eval_fold: tag table cols out of range (BatchMod/BatchCol)"});
+                    NN_FAIL("eval_fold: tag table cols out of range (BatchMod/BatchCol)");
             }
             if (is_rowvec && !(t.rows() == rows && t.cols() == 1))
-                return std::unexpected(Error{
-                    "eval_fold: RowBroadcast input must be (rows, 1)"});
+                NN_FAIL("eval_fold: RowBroadcast input must be (rows, 1)");
             spans.push_back(t.cpu_matrix().span());
         }
         // vecacc.b：(batch·K, vec_state_len) 行主序（行 = batch 全局键
@@ -1447,13 +1416,11 @@ public:
             const std::size_t want_rows =
                 (f.matmul ? f.matmul->batch : 1) * K;
             if (tb.rows() != want_rows || tb.cols() != f.vec_state_len)
-                return std::unexpected(Error{
-                    "eval_fold: vecacc b_input shape mismatch (expect (batch*k, vec_state_len))"});
+                NN_FAIL("eval_fold: vecacc b_input shape mismatch (expect (batch*k, vec_state_len))");
         }
 
         auto cls_r = expr_fold_classify(f, spec.num_regs);
-        if (!cls_r)
-            return std::unexpected(cls_r.error());
+        NN_TRY_CHECK(cls_r);
         const std::vector<uint8_t>& is_elem = *cls_r;
 
         // fold matmul 上下文（掩码网格索引与 mm 段求值共用）
@@ -1669,24 +1636,20 @@ public:
     {
         // canonical IR：canonicalize 为引擎内部优化（IR-A/IR-B），Layer 无感知；
         // 结构统一在 canonical 形态上，与 scan/gen_fused 两端一致。
-        if (auto v = validate_expr_spec(raw_spec, inputs.size()); !v)
-            return std::unexpected(v.error());
+        NN_TRY(v, validate_expr_spec(raw_spec, inputs.size()));
         // fold 段：独立执行路径——跳过 canonicalize（IR-A/B 不作用于
         //   body/finalize 序列）与空指令表检查（fold 的 finalize 即尾链）
         if (raw_spec.fold)
             return eval_fold_impl(raw_spec, inputs, rows, cols, vector_out, output);
         const ExprSpec spec = canonicalize_expr_spec(raw_spec);
-        if (auto v = validate_expr_spec(spec, inputs.size()); !v)
-            return std::unexpected(v.error());
+        NN_TRY(v2, validate_expr_spec(spec, inputs.size()));
         // 空指令表仅允许"纯 matmul"（输出 = matmul 结果本身）
         if (spec.instrs.empty() && !spec.matmul)
-            return std::unexpected(Error{"eval_expr: empty instruction list"});
-
+            NN_FAIL("eval_expr: empty instruction list");
         // vector_out：要求表达式为纯行/列归约（归约轴 0/1），输出取向量形状
         const int raxis = vector_out ? expr_spec_reduce_axis(spec) : -1;
         if (vector_out && raxis != 0 && raxis != 1)
-            return std::unexpected(Error{
-                "eval_expr_reduce: 表达式需为行/列归约（归约轴 0/1）"});
+            NN_FAIL("eval_expr_reduce: 表达式需为行/列归约（归约轴 0/1）");
         const bool vec_is_row = (raxis == 0);
 
         std::vector<ConstSpan> spans;
@@ -1705,12 +1668,11 @@ public:
         {
             const Tensor& t = inputs[k];
             if (!t.is_cpu())
-                return std::unexpected(Error{"eval_expr: input not CPU"});
+                NN_FAIL("eval_expr: input not CPU");
             // CPU 解释器按 f32 存储读取 span：f16 输入直读 = 空指针 UB →
             // 响亮报错，让误用立刻暴露。
             if (t.precision() != Precision::F32)
-                return std::unexpected(Error{
-                    "eval_expr: CPU 解释器仅支持 f32 输入（f16 须由基类 NVI 入口先抬到 f32（直调 eval_expr_impl 才会到这里））"});
+                NN_FAIL("eval_expr: CPU 解释器仅支持 f32 输入（f16 须由基类 NVI 入口先抬到 f32（直调 eval_expr_impl 才会到这里））");
             const ExprView& v = spec.views[k];
             if (mm && (k == static_cast<std::size_t>(mm->a_input) ||
                        k == static_cast<std::size_t>(mm->b_input)))
@@ -1725,7 +1687,7 @@ public:
                     ? (tr ? m_per : mm_k)                    // A 存储列数期望
                     : (tr ? mm_k : cols);
                 if (t.rows() != er || t.cols() != ec)
-                    return std::unexpected(Error{"eval_expr: matmul input shape mismatch"});
+                    NN_FAIL("eval_expr: matmul input shape mismatch");
                 spans.push_back(t.cpu_matrix().span());
                 continue;
             }
@@ -1742,48 +1704,47 @@ public:
             case static_cast<uint8_t>(ExprViewKind::RowGather):
                 // 按标签行收集：主输入行数任意（读取经 label 索引），列数须一致
                 if (t.cols() != cols)
-                    return std::unexpected(Error{"eval_expr: RowGather input cols mismatch"});
+                    NN_FAIL("eval_expr: RowGather input cols mismatch");
                 break;
             case static_cast<uint8_t>(ExprViewKind::RotateHalf):
                 if (t.rows() != rows || t.cols() != cols || v.param == 0 ||
                     rows % v.param != 0 || v.param % 2 != 0)
-                    return std::unexpected(Error{"eval_expr: RotateHalf shape/param invalid"});
+                    NN_FAIL("eval_expr: RotateHalf shape/param invalid");
                 break;
             case static_cast<uint8_t>(ExprViewKind::RowMod):
                 if (t.rows() != v.param || t.cols() != cols || v.param == 0 || rows % v.param != 0)
-                    return std::unexpected(Error{"eval_expr: RowMod shape/param invalid"});
+                    NN_FAIL("eval_expr: RowMod shape/param invalid");
                 break;
             case static_cast<uint8_t>(ExprViewKind::RowAccess):
                 // 读取行 [offset, offset+mod)，须在输入行数内；offset 为运行时形状
                 if (t.cols() != cols || v.param == 0 || v.param2 + v.param > t.rows())
-                    return std::unexpected(Error{"eval_expr: RowAccess shape/param invalid"});
+                    NN_FAIL("eval_expr: RowAccess shape/param invalid");
                 break;
             case static_cast<uint8_t>(ExprViewKind::RowBroadcast):
                 // 输入 (rows,1)：每行一个值，按行广播
                 if (t.rows() != rows || t.cols() != 1)
-                    return std::unexpected(Error{"eval_expr: RowBroadcast input must be (rows,1)"});
+                    NN_FAIL("eval_expr: RowBroadcast input must be (rows,1)");
                 break;
             case static_cast<uint8_t>(ExprViewKind::ColBroadcast):
                 // 输入 (1,cols)：每列一个值，按列广播
                 if (t.rows() != 1 || t.cols() != cols)
-                    return std::unexpected(Error{"eval_expr: ColBroadcast input must be (1,cols)"});
+                    NN_FAIL("eval_expr: ColBroadcast input must be (1,cols)");
                 break;
             case static_cast<uint8_t>(ExprViewKind::BatchMod):
                 // 输入 (1,modulo 相关)：按批次取模索引的小向量
                 if (t.rows() != 1)
-                    return std::unexpected(Error{"eval_expr: BatchMod input must be (1,cols)"});
+                    NN_FAIL("eval_expr: BatchMod input must be (1,cols)");
                 break;
             case static_cast<uint8_t>(ExprViewKind::BatchCol):
                 // 输入 (1, batch*param)：按 (batch, col) 切片（doc_ids 等）
                 if (t.rows() != 1 || t.cols() != mm_batch * v.param)
-                    return std::unexpected(Error{"eval_expr: BatchCol input must be (1,batch*param)"});
+                    NN_FAIL("eval_expr: BatchCol input must be (1,batch*param)");
                 break;
             case static_cast<uint8_t>(ExprViewKind::GroupedReduceSum):
             case static_cast<uint8_t>(ExprViewKind::GroupedReduceMax):
                 // 输入 (rows*R, cols)：输出行 r 读组行 [r*R, (r+1)*R)
                 if (v.param == 0 || t.cols() != cols || t.rows() != rows * v.param)
-                    return std::unexpected(Error{
-                        "eval_expr: GroupedReduce input shape invalid (expect (rows*R, cols))"});
+                    NN_FAIL("eval_expr: GroupedReduce input shape invalid (expect (rows*R, cols))");
                 break;
             }
             spans.push_back(t.cpu_matrix().span());
@@ -1792,8 +1753,7 @@ public:
         // 输出 span 由调用方预分配；n 恒为**网格**元素数（vector_out 时输出
         // span 更小，而下述归约重放循环仍按网格遍历）。
         if (output.precision() != Precision::F32)
-            return std::unexpected(Error{
-                "eval_expr: CPU 解释器输出须为 f32 存储（f16 输出须由基类 NVI 入口落回）"});
+            NN_FAIL("eval_expr: CPU 解释器输出须为 f32 存储（f16 输出须由基类 NVI 入口落回）");
         Span out = output.cpu_matrix().span();
         const std::size_t n = rows * cols;
         if (n == 0)
@@ -1920,7 +1880,7 @@ public:
         if (spec.instrs.empty())
         {
             if (!mm)
-                return std::unexpected(Error{"eval_expr: empty instruction list without matmul"});
+                NN_FAIL("eval_expr: empty instruction list without matmul");
             const auto ms = matmul_out.span();
             for (std::size_t i = 0; i < n; ++i)
                 out[i] = ms[i];
@@ -2251,15 +2211,12 @@ public:
                             const ExprViewKind vk =
                                 static_cast<ExprViewKind>(spec.views[op.idx].kind);
                             if (!expr_view_is_reduce(vk) && !expr_view_is_broadcast(vk))
-                                return std::unexpected(Error{
-                                    "eval_expr_reduce: 输出链经 Linear/视图直接访问输入，"
-                                    "输出不沿归约轴恒定"});
+                                NN_FAIL("eval_expr_reduce: 输出链经 Linear/视图直接访问输入，"                                     "输出不沿归约轴恒定");
                         }
                         else if (op.kind == static_cast<uint8_t>(ExprOperandKind::Matmul))
                         {
                             // matmul 输出沿两个轴都变化，不能作为归约向量输出
-                            return std::unexpected(Error{
-                                "eval_expr_reduce: 输出链经 Matmul 访问，输出不沿归约轴恒定"});
+                            NN_FAIL("eval_expr_reduce: 输出链经 Matmul 访问，输出不沿归约轴恒定");
                         }
                         else if (op.kind == static_cast<uint8_t>(ExprOperandKind::Row) ||
                                  op.kind == static_cast<uint8_t>(ExprOperandKind::Col) ||
@@ -2267,8 +2224,7 @@ public:
                         {
                             // 索引操作数沿归约轴的恒定性由生成器/引擎按轴判定；
                             // 这里保守拒绝（实际表达式不触发此路径）
-                            return std::unexpected(Error{
-                                "eval_expr_reduce: 输出链经 Row/Col/Batch 索引，输出不沿归约轴恒定"});
+                            NN_FAIL("eval_expr_reduce: 输出链经 Row/Col/Batch 索引，输出不沿归约轴恒定");
                         }
                         else if (op.kind == static_cast<uint8_t>(ExprOperandKind::Reg) ||
                                  op.kind == static_cast<uint8_t>(ExprOperandKind::Fanout) ||

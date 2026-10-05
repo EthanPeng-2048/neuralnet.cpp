@@ -32,9 +32,7 @@ namespace detail
 {
     if (res != VK_SUCCESS)
     {
-        return std::unexpected(Error{
-            "Vulkan error " + std::to_string(static_cast<int>(res)) +
-            " at " + std::string(file) + ":" + std::to_string(line)});
+        NN_FAIL("Vulkan error " + std::to_string(static_cast<int>(res)) +             " at " + std::string(file) + ":" + std::to_string(line));
     }
     return {};
 }
@@ -165,14 +163,12 @@ public:
 
         VkResult res = vkCreateInstance(&instance_info, nullptr, &instance_);
         if (res != VK_SUCCESS)
-            return std::unexpected(Error{"vkCreateInstance failed: " + std::to_string(res)});
-
+            NN_FAIL("vkCreateInstance failed: " + std::to_string(res));
         // 2. 选择物理设备
         uint32_t device_count = 0;
         vkEnumeratePhysicalDevices(instance_, &device_count, nullptr);
         if (device_count == 0)
-            return std::unexpected(Error{"No Vulkan devices found"});
-
+            NN_FAIL("No Vulkan devices found");
         std::vector<VkPhysicalDevice> devices(device_count);
         vkEnumeratePhysicalDevices(instance_, &device_count, devices.data());
 
@@ -227,8 +223,7 @@ public:
                     vkGetPhysicalDeviceProperties(devices[i], &props);
                     avail += "\n  [" + std::to_string(i) + "] " + props.deviceName;
                 }
-                return std::unexpected(Error{
-                    "未找到匹配的计算设备 \"" + selector + "\"，可用设备:" + avail});
+                NN_FAIL("未找到匹配的计算设备 \"" + selector + "\"，可用设备:" + avail);
             }
         }
 
@@ -289,8 +284,7 @@ public:
             }
         }
         if (!found_queue)
-            return std::unexpected(Error{"No compute queue family found"});
-
+            NN_FAIL("No compute queue family found");
         // 4. 创建逻辑设备
         // 先探测时间线信号量能力（Vulkan 1.2 核心特性）：跨 submit 数据依赖
         // 需要"同一信号量可被多个 submit 等待"的语义，二进制信号量做不到
@@ -415,8 +409,7 @@ public:
 
         res = vkCreateDevice(physical_device_, &device_info, nullptr, &device_);
         if (res != VK_SUCCESS)
-            return std::unexpected(Error{"vkCreateDevice failed: " + std::to_string(res)});
-
+            NN_FAIL("vkCreateDevice failed: " + std::to_string(res));
         // 5. 获取计算队列
         vkGetDeviceQueue(device_, queue_family_index_, 0, &compute_queue_);
 
@@ -518,9 +511,7 @@ public:
         auto r = detail::vk_check(
             vkCreateShaderModule(device, &module_info, nullptr, &pl.shader_module_),
             __FILE__, __LINE__);
-        if (!r)
-            return std::unexpected(r.error());
-
+        NN_TRY_CHECK(r);
         // 创建 descriptor set layout（3 个 storage buffer）
         VkDescriptorSetLayoutBinding bindings[3]{};
         for (int i = 0; i < 3; ++i)
@@ -539,9 +530,7 @@ public:
         r = detail::vk_check(
             vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &pl.descriptor_layout_),
             __FILE__, __LINE__);
-        if (!r)
-            return std::unexpected(r.error());
-
+        NN_TRY_CHECK(r);
         // 创建 pipeline layout（push constants: M, N, K, transA, transB）
         VkPushConstantRange push_range{};
         push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -558,9 +547,7 @@ public:
         r = detail::vk_check(
             vkCreatePipelineLayout(device, &pl_layout_info, nullptr, &pl.pipeline_layout_),
             __FILE__, __LINE__);
-        if (!r)
-            return std::unexpected(r.error());
-
+        NN_TRY_CHECK(r);
         // 创建 compute pipeline
         VkComputePipelineCreateInfo pipeline_info{};
         pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
@@ -573,9 +560,7 @@ public:
         r = detail::vk_check(
             vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pl.pipeline_),
             __FILE__, __LINE__);
-        if (!r)
-            return std::unexpected(r.error());
-
+        NN_TRY_CHECK(r);
         return pl;
     }
 
@@ -597,9 +582,7 @@ public:
         auto r = detail::vk_check(
             vkCreateShaderModule(device, &module_info, nullptr, &pl.shader_module_),
             __FILE__, __LINE__);
-        if (!r)
-            return std::unexpected(r.error());
-
+        NN_TRY_CHECK(r);
         // 创建 descriptor set layout（num_bindings 个 storage buffer）
         std::vector<VkDescriptorSetLayoutBinding> bindings(num_bindings);
         for (uint32_t i = 0; i < num_bindings; ++i)
@@ -618,9 +601,7 @@ public:
         r = detail::vk_check(
             vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &pl.descriptor_layout_),
             __FILE__, __LINE__);
-        if (!r)
-            return std::unexpected(r.error());
-
+        NN_TRY_CHECK(r);
         // 创建 pipeline layout（push constants）
         VkPushConstantRange push_range{};
         push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -637,9 +618,7 @@ public:
         r = detail::vk_check(
             vkCreatePipelineLayout(device, &pl_layout_info, nullptr, &pl.pipeline_layout_),
             __FILE__, __LINE__);
-        if (!r)
-            return std::unexpected(r.error());
-
+        NN_TRY_CHECK(r);
         // 创建 compute pipeline
         VkComputePipelineCreateInfo pipeline_info{};
         pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
@@ -652,9 +631,7 @@ public:
         r = detail::vk_check(
             vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pl.pipeline_),
             __FILE__, __LINE__);
-        if (!r)
-            return std::unexpected(r.error());
-
+        NN_TRY_CHECK(r);
         return pl;
     }
 

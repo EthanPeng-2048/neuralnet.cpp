@@ -131,7 +131,7 @@ public:
         std::size_t seq, bool backward)
     {
         if (d_k_ == 0 || d_k_ % 2 != 0)
-            return std::unexpected(Error{"RotaryEmbedding::apply: d_k must be positive and even"});
+            NN_FAIL("RotaryEmbedding::apply: d_k must be positive and even");
         if (seq != seq_cached_)
         {
             NN_TRY(r, rebuild(engine, seq));
@@ -157,7 +157,7 @@ public:
         ComputeEngine& engine, const Tensor& q, std::size_t pos, bool backward)
     {
         if (d_k_ == 0 || d_k_ % 2 != 0)
-            return std::unexpected(Error{"RotaryEmbedding::apply_step: d_k must be positive and even"});
+            NN_FAIL("RotaryEmbedding::apply_step: d_k must be positive and even");
         std::vector<Scalar> c(d_k_), s(d_k_);       // 宿主桥（17 §3 D11）
         fill_pos_column_(c, s, 1, pos, 0);
         NN_TRY(cr, detail::upload_span(engine, d_k_, 1, Precision::F32, std::span(c)));
@@ -301,12 +301,12 @@ protected:
         learnable_ = learnable;
         pos_emb_ = std::move(pe);
         if (!pos_emb_.valid())
-            return std::unexpected(Error{"PositionEncoder: 位置编码创建失败"});
+            NN_FAIL("PositionEncoder: 位置编码创建失败");
         if (learnable_)
         {
             grad_pos_emb_ = engine.create_tensor(rows, cols, p_.param, InitSpec::zero());
             if (!grad_pos_emb_.valid())
-                return std::unexpected(Error{"PositionEncoder: 梯度缓冲初始化失败"});
+                NN_FAIL("PositionEncoder: 梯度缓冲初始化失败");
         }
         return {};
     }
@@ -403,7 +403,7 @@ public:
         auto pe = engine.create_tensor(seq_len_, d_model_, p_.param,
                                        InitSpec::normal(0, 0.02, kInitSeed));
         if (!pe.valid())
-            return std::unexpected(Error{"LearnedPositionEncoder: 初始化失败"});
+            NN_FAIL("LearnedPositionEncoder: 初始化失败");
         return init_(engine, std::move(pe), /*learnable=*/true);
     }
 };

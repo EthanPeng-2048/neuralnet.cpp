@@ -382,11 +382,11 @@ struct FoldSpec
         {
             const int se = src_elem(*ops[oi]);
             if (se < 0)
-                return std::unexpected(Error{"expr_fold_classify: operand domain error"});
+                NN_FAIL("expr_fold_classify: operand domain error");
             if (se > e) e = se;
         }
         if (ins.dst >= num_regs)
-            return std::unexpected(Error{"expr_fold_classify: dst out of range"});
+            NN_FAIL("expr_fold_classify: dst out of range");
         if (expr_op_is_reduce(op))
         {
             is_reduce_dst[ins.dst] = 1;
@@ -395,8 +395,7 @@ struct FoldSpec
         else
         {
             if (ins.dst < f.num_state && e != 0)
-                return std::unexpected(Error{
-                    "expr_fold_classify: state written from element-class source (kb-dependent overwrite)"});
+                NN_FAIL("expr_fold_classify: state written from element-class source (kb-dependent overwrite)");
             if (e != 0) is_elem[ins.dst] = 1;      // 类别单调升为元素（跨指令保守）
         }
     }
@@ -912,27 +911,27 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
     // matmul 段或 fold 段存在时允许空指令表（输出 = 段结果本身；
     //   fold 的 finalize 序列即其尾链）
     if (spec.instrs.empty() && !spec.matmul && !spec.fold)
-        return std::unexpected(Error{"validate_expr_spec: empty instruction list"});
+        NN_FAIL("validate_expr_spec: empty instruction list");
     if (spec.instrs.size() > EXPR_MAX_INSTRS)
-        return std::unexpected(Error{"validate_expr_spec: too many instructions"});
+        NN_FAIL("validate_expr_spec: too many instructions");
     if (spec.num_regs > EXPR_MAX_REGS)
-        return std::unexpected(Error{"validate_expr_spec: too many registers"});
+        NN_FAIL("validate_expr_spec: too many registers");
     if (num_inputs > EXPR_MAX_INPUTS)
-        return std::unexpected(Error{"validate_expr_spec: too many inputs"});
+        NN_FAIL("validate_expr_spec: too many inputs");
     if (spec.consts.size() > EXPR_MAX_CONSTS)
-        return std::unexpected(Error{"validate_expr_spec: too many constants"});
+        NN_FAIL("validate_expr_spec: too many constants");
     // 运行时标量参数同样受限（PC 浮点槽位有限）
     if (spec.rparams.size() > EXPR_MAX_CONSTS)
-        return std::unexpected(Error{"validate_expr_spec: too many runtime params"});
+        NN_FAIL("validate_expr_spec: too many runtime params");
     if (spec.views.size() != num_inputs)
-        return std::unexpected(Error{"validate_expr_spec: views count != inputs count"});
+        NN_FAIL("validate_expr_spec: views count != inputs count");
     // matmul 段：A/B 输入下标必须在输入范围内（形状由引擎按实际张量推导）
     if (spec.matmul)
     {
         if (spec.matmul->a_input >= num_inputs || spec.matmul->b_input >= num_inputs)
-            return std::unexpected(Error{"validate_expr_spec: matmul input out of range"});
+            NN_FAIL("validate_expr_spec: matmul input out of range");
         if (spec.matmul->batch == 0)
-            return std::unexpected(Error{"validate_expr_spec: matmul batch must be > 0"});
+            NN_FAIL("validate_expr_spec: matmul batch must be > 0");
     }
     // 分组归约视图：组长度 R 必须 > 0（R=0 时 GLSL 展开循环无下界、CPU 除零）
     for (const auto& v : spec.views)
@@ -940,7 +939,7 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
         const auto vk = static_cast<ExprViewKind>(v.kind);
         if ((vk == ExprViewKind::GroupedReduceSum || vk == ExprViewKind::GroupedReduceMax)
             && v.param == 0)
-            return std::unexpected(Error{"validate_expr_spec: grouped reduce R must be > 0"});
+            NN_FAIL("validate_expr_spec: grouped reduce R must be > 0");
     }
 
     // ── fold 段校验（单域 / 双域：可带自带 matmul 段/行向量态）────
@@ -948,55 +947,49 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
     {
         const FoldSpec& f = *spec.fold;
         if (spec.matmul)
-            return std::unexpected(Error{
-                "validate_expr_spec: fold + 顶层 matmul not allowed（fold 用自带段 f.matmul）"});
+            NN_FAIL("validate_expr_spec: fold + 顶层 matmul not allowed（fold 用自带段 f.matmul）");
         if (!spec.instrs.empty())
-            return std::unexpected(Error{
-                "validate_expr_spec: fold requires empty top-level instrs"});
+            NN_FAIL("validate_expr_spec: fold requires empty top-level instrs");
         if (f.num_state == 0 || f.num_state > FOLD_MAX_STATE ||
             f.inits.size() != static_cast<std::size_t>(f.num_state))
-            return std::unexpected(Error{
-                "validate_expr_spec: fold state count/init mismatch"});
+            NN_FAIL("validate_expr_spec: fold state count/init mismatch");
         if (f.k == 0)
-            return std::unexpected(Error{"validate_expr_spec: fold k must be > 0"});
+            NN_FAIL("validate_expr_spec: fold k must be > 0");
         if (f.body.empty() || f.body.size() > FOLD_MAX_BODY)
-            return std::unexpected(Error{"validate_expr_spec: fold body size out of range"});
+            NN_FAIL("validate_expr_spec: fold body size out of range");
         if (f.finalize.empty() || f.finalize.size() > FOLD_MAX_FINALIZE)
-            return std::unexpected(Error{"validate_expr_spec: fold finalize size out of range"});
+            NN_FAIL("validate_expr_spec: fold finalize size out of range");
         if (spec.num_regs < f.num_state)
-            return std::unexpected(Error{"validate_expr_spec: fold num_regs < num_state"});
+            NN_FAIL("validate_expr_spec: fold num_regs < num_state");
         // 双域字段
         if (f.vec_state_len > FOLD_MAX_VEC)
-            return std::unexpected(Error{"validate_expr_spec: fold vec_state_len out of range"});
+            NN_FAIL("validate_expr_spec: fold vec_state_len out of range");
         if ((f.vec_state_len > 0) != f.vecacc.has_value())
-            return std::unexpected(Error{
-                "validate_expr_spec: fold vec_state_len 与 vecacc 必须成对"});
+            NN_FAIL("validate_expr_spec: fold vec_state_len 与 vecacc 必须成对");
         if (f.matmul)
         {
             if (f.matmul->a_input >= num_inputs || f.matmul->b_input >= num_inputs)
-                return std::unexpected(Error{"validate_expr_spec: fold matmul input out of range"});
+                NN_FAIL("validate_expr_spec: fold matmul input out of range");
             if (f.matmul->batch == 0)
-                return std::unexpected(Error{"validate_expr_spec: fold matmul batch must be > 0"});
+                NN_FAIL("validate_expr_spec: fold matmul batch must be > 0");
             if (f.matmul->k > FOLD_MAX_MMK)
-                return std::unexpected(Error{
-                    "validate_expr_spec: fold matmul k exceeds shared preload cap (1024)"});
+                NN_FAIL("validate_expr_spec: fold matmul k exceeds shared preload cap (1024)");
         }
         // tri_skip 的 Row/m_per 网格语义取自 mm.batch——无 mm 段时生成器
         //   会引用未声明的 m_per（glslc 报错但定位差），此处静态拒绝
         if (f.tri_skip && !f.matmul)
-            return std::unexpected(Error{
-                "validate_expr_spec: fold tri_skip requires fold matmul segment"});
+            NN_FAIL("validate_expr_spec: fold tri_skip requires fold matmul segment");
         if (f.vecacc)
         {
             const VecAccSpec& va = *f.vecacc;
             if (va.vec_state != 0)
-                return std::unexpected(Error{"validate_expr_spec: fold vecacc: multi vec slot unsupported"});
+                NN_FAIL("validate_expr_spec: fold vecacc: multi vec slot unsupported");
             if (va.weight_reg >= spec.num_regs)
-                return std::unexpected(Error{"validate_expr_spec: fold vecacc weight_reg out of range"});
+                NN_FAIL("validate_expr_spec: fold vecacc weight_reg out of range");
             if (va.b_input >= num_inputs)
-                return std::unexpected(Error{"validate_expr_spec: fold vecacc b_input out of range"});
+                NN_FAIL("validate_expr_spec: fold vecacc b_input out of range");
             if (va.scale_reg >= spec.num_regs)
-                return std::unexpected(Error{"validate_expr_spec: fold vecacc scale_reg out of range"});
+                NN_FAIL("validate_expr_spec: fold vecacc scale_reg out of range");
         }
 
         const bool has_mm = f.matmul.has_value();
@@ -1006,11 +999,10 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
             // Matmul 段操作数 / 网格索引操作数：仅当 fold 自带 matmul 段存在时
             //   允许（掩码折叠与内层收缩消费；语义与既有 batched 网格一致）
             if (k == ExprOperandKind::Matmul && !has_mm)
-                return std::unexpected(Error{"validate_expr_spec: fold: Matmul operand without fold matmul segment"});
+                NN_FAIL("validate_expr_spec: fold: Matmul operand without fold matmul segment");
             if ((k == ExprOperandKind::Row || k == ExprOperandKind::Col ||
                  k == ExprOperandKind::Batch) && !has_mm)
-                return std::unexpected(Error{
-                    "validate_expr_spec: fold: index operands require fold matmul segment (batch 网格语义)"});
+                NN_FAIL("validate_expr_spec: fold: index operands require fold matmul segment (batch 网格语义)");
             // VecState 的 body/finalize 区分不在这里做：本 lambda 两处共用——
             //   body 侧由 expr_fold_classify 拒（src_elem(VecState) = -1 域错误），
             //   finalize 侧由下方主链做域校验（veclen/单槽）。
@@ -1028,10 +1020,9 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
         {
             const ExprOp op = static_cast<ExprOp>(ins.op);
             if (expr_op_is_reduce(op) && expr_op_reduces_cols(op))
-                return std::unexpected(Error{
-                    "validate_expr_spec: fold body: col-reduce not allowed (block axis is the row-reduce axis)"});
+                NN_FAIL("validate_expr_spec: fold body: col-reduce not allowed (block axis is the row-reduce axis)");
             if (ins.dst >= spec.num_regs)
-                return std::unexpected(Error{"validate_expr_spec: fold body dst out of range"});
+                NN_FAIL("validate_expr_spec: fold body dst out of range");
             const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
             const std::size_t nops = expr_op_is_reduce(op) ? 1
                 : expr_instr_num_operands(op);
@@ -1039,35 +1030,30 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
             {
                 const ExprOperand& opnd = *ops[oi];
                 const auto k = static_cast<ExprOperandKind>(opnd.kind);
-                if (auto d = check_operand_domain(opnd); !d)
-                    return std::unexpected(d.error());
+                NN_TRY(d, check_operand_domain(opnd));
                 if (k == ExprOperandKind::Reduce)
                 {
                     if (opnd.idx >= spec.num_regs || opnd.idx == ins.dst)
-                        return std::unexpected(Error{"validate_expr_spec: fold body reduce ref invalid"});
+                        NN_FAIL("validate_expr_spec: fold body reduce ref invalid");
                     if (!body_reduce_dst[opnd.idx])
-                        return std::unexpected(Error{
-                            "validate_expr_spec: fold body Reduce operand must reference a prior block-reduce instr"});
+                        NN_FAIL("validate_expr_spec: fold body Reduce operand must reference a prior block-reduce instr");
                 }
                 else if (k == ExprOperandKind::Reg || k == ExprOperandKind::Fanout)
                 {
                     if (opnd.idx >= spec.num_regs)
-                        return std::unexpected(Error{"validate_expr_spec: fold body reg out of range"});
+                        NN_FAIL("validate_expr_spec: fold body reg out of range");
                     if (body_reduce_dst[opnd.idx])
-                        return std::unexpected(Error{
-                            "validate_expr_spec: fold body reg ref to block-reduce dst (use Reduce operand)"});
+                        NN_FAIL("validate_expr_spec: fold body reg ref to block-reduce dst (use Reduce operand)");
                     if (!defined[opnd.idx])
-                        return std::unexpected(Error{
-                            "validate_expr_spec: fold body use before def (or block-local reg read)"});
+                        NN_FAIL("validate_expr_spec: fold body use before def (or block-local reg read)");
                 }
                 else if (k == ExprOperandKind::Input)
                 {
                     if (opnd.idx >= num_inputs)
-                        return std::unexpected(Error{"validate_expr_spec: fold body input out of range"});
+                        NN_FAIL("validate_expr_spec: fold body input out of range");
                     const auto vk = static_cast<ExprViewKind>(spec.views[opnd.idx].kind);
                     if (expr_view_is_reduce(vk))
-                        return std::unexpected(Error{
-                            "validate_expr_spec: fold body: reduce-view input not allowed"});
+                        NN_FAIL("validate_expr_spec: fold body: reduce-view input not allowed");
                     if (vk == ExprViewKind::Linear || vk == ExprViewKind::RowMod ||
                         vk == ExprViewKind::RowBroadcast)
                         ;  // 标量域恒允许；RowBroadcast = 行参数向量（b[row]，
@@ -1076,18 +1062,17 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
                               vk == ExprViewKind::BatchCol) && has_mm)
                         ;  // 双域：掩码钩子消费（ALiBi 斜率 / doc_ids），需 batch 网格
                     else
-                        return std::unexpected(Error{
-                            "validate_expr_spec: fold body: view kind outside supported scope"});
+                        NN_FAIL("validate_expr_spec: fold body: view kind outside supported scope");
                 }
                 else if (k == ExprOperandKind::Const)
                 {
                     if (opnd.idx >= spec.consts.size())
-                        return std::unexpected(Error{"validate_expr_spec: fold body const out of range"});
+                        NN_FAIL("validate_expr_spec: fold body const out of range");
                 }
                 else if (k == ExprOperandKind::RParam)
                 {
                     if (opnd.idx >= spec.rparams.size())
-                        return std::unexpected(Error{"validate_expr_spec: fold body rparam out of range"});
+                        NN_FAIL("validate_expr_spec: fold body rparam out of range");
                 }
             }
             if (expr_op_is_reduce(op))
@@ -1100,54 +1085,48 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
         {
             const ExprOp op = static_cast<ExprOp>(ins.op);
             if (expr_op_is_reduce(op))
-                return std::unexpected(Error{"validate_expr_spec: fold finalize: reduce not allowed"});
+                NN_FAIL("validate_expr_spec: fold finalize: reduce not allowed");
             if (ins.dst >= spec.num_regs)
-                return std::unexpected(Error{"validate_expr_spec: fold finalize dst out of range"});
+                NN_FAIL("validate_expr_spec: fold finalize dst out of range");
             const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
             const std::size_t nops = expr_instr_num_operands(op);
             for (std::size_t oi = 0; oi < nops; ++oi)
             {
                 const ExprOperand& opnd = *ops[oi];
                 const auto k = static_cast<ExprOperandKind>(opnd.kind);
-                if (auto d = check_operand_domain(opnd); !d)
-                    return std::unexpected(d.error());
+                NN_TRY(d, check_operand_domain(opnd));
                 if (k == ExprOperandKind::Reduce)
-                    return std::unexpected(Error{"validate_expr_spec: fold finalize: Reduce operand not allowed"});
+                    NN_FAIL("validate_expr_spec: fold finalize: Reduce operand not allowed");
                 if (k == ExprOperandKind::Input)
-                    return std::unexpected(Error{"validate_expr_spec: fold finalize cannot read inputs"});
+                    NN_FAIL("validate_expr_spec: fold finalize cannot read inputs");
                 if (k == ExprOperandKind::VecState)
                 {
                     if (f.vec_state_len == 0)
-                        return std::unexpected(Error{
-                            "validate_expr_spec: fold finalize: VecState without vec_state_len"});
+                        NN_FAIL("validate_expr_spec: fold finalize: VecState without vec_state_len");
                     if (opnd.idx != 0)
-                        return std::unexpected(Error{
-                            "validate_expr_spec: fold finalize: VecState multi-slot unsupported"});
+                        NN_FAIL("validate_expr_spec: fold finalize: VecState multi-slot unsupported");
                     continue;  // 单槽域校验通过
                 }
                 if (k == ExprOperandKind::Reg || k == ExprOperandKind::Fanout)
                 {
                     if (opnd.idx >= spec.num_regs)
-                        return std::unexpected(Error{"validate_expr_spec: fold finalize reg out of range"});
+                        NN_FAIL("validate_expr_spec: fold finalize reg out of range");
                     if (opnd.idx >= f.num_state)
-                        return std::unexpected(Error{
-                            "validate_expr_spec: fold finalize reads block-local register"});
+                        NN_FAIL("validate_expr_spec: fold finalize reads block-local register");
                 }
                 else if (k == ExprOperandKind::Const && opnd.idx >= spec.consts.size())
-                    return std::unexpected(Error{"validate_expr_spec: fold finalize const out of range"});
+                    NN_FAIL("validate_expr_spec: fold finalize const out of range");
                 else if (k == ExprOperandKind::RParam && opnd.idx >= spec.rparams.size())
-                    return std::unexpected(Error{"validate_expr_spec: fold finalize rparam out of range"});
+                    NN_FAIL("validate_expr_spec: fold finalize rparam out of range");
             }
         }
 
         // 类别流分析：状态不得从元素类（kb 依赖）源更新
         auto cls = expr_fold_classify(f, spec.num_regs);
-        if (!cls)
-            return std::unexpected(cls.error());
+        NN_TRY_CHECK(cls);
         // vecacc 缩放必须是行标量（广播 rescale；吃元素源=跨 kb 覆盖）
         if (f.vecacc && (*cls)[f.vecacc->scale_reg] != 0)
-            return std::unexpected(Error{
-                "validate_expr_spec: fold vecacc: scale_reg must be row-scalar class"});
+            NN_FAIL("validate_expr_spec: fold vecacc: scale_reg must be row-scalar class");
         // 向量域多列循环的**写后读跨迭代污染**静态拒：finalize 被写的寄存器
         //   不得再被任何源读取（如 dst 复用被读状态 l——首列输出覆盖除数，
         //   次列起全错值）。单列输出（vec_state_len=0）无跨迭代，
@@ -1172,9 +1151,7 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
             }
             for (std::uint32_t i = 0; i < spec.num_regs; ++i)
                 if (fin_written[i] && fin_read[i])
-                    return std::unexpected(Error{
-                        "validate_expr_spec: fold finalize: written reg also read "
-                        "(multi-column loop would read its own prior output)"});
+                    NN_FAIL("validate_expr_spec: fold finalize: written reg also read "                         "(multi-column loop would read its own prior output)");
         }
     }
     // 视图：RowGather 的标签槽（param）必须在输入范围内
@@ -1182,12 +1159,12 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
     {
         if (static_cast<ExprViewKind>(spec.views[k].kind) == ExprViewKind::RowGather &&
             spec.views[k].param >= num_inputs)
-            return std::unexpected(Error{"validate_expr_spec: RowGather label slot out of range"});
+            NN_FAIL("validate_expr_spec: RowGather label slot out of range");
     }
     for (const auto& ins : spec.instrs)
     {
         if (ins.dst >= spec.num_regs)
-            return std::unexpected(Error{"validate_expr_spec: dst reg out of range"});
+            NN_FAIL("validate_expr_spec: dst reg out of range");
         const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
         const std::size_t nops = expr_instr_num_operands(static_cast<ExprOp>(ins.op));
         for (std::size_t oi = 0; oi < nops; ++oi)
@@ -1195,16 +1172,15 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
             const ExprOperand& op = *ops[oi];
             if ((op.kind == static_cast<uint8_t>(ExprOperandKind::Reg) ||
                  op.kind == static_cast<uint8_t>(ExprOperandKind::Fanout)) && op.idx >= spec.num_regs)
-                return std::unexpected(Error{"validate_expr_spec: src reg out of range"});
+                NN_FAIL("validate_expr_spec: src reg out of range");
             if (op.kind == static_cast<uint8_t>(ExprOperandKind::Input) && op.idx >= num_inputs)
-                return std::unexpected(Error{"validate_expr_spec: input index out of range"});
+                NN_FAIL("validate_expr_spec: input index out of range");
             if (op.kind == static_cast<uint8_t>(ExprOperandKind::Const) && op.idx >= spec.consts.size())
-                return std::unexpected(Error{"validate_expr_spec: const index out of range"});
+                NN_FAIL("validate_expr_spec: const index out of range");
             if (op.kind == static_cast<uint8_t>(ExprOperandKind::RParam) && op.idx >= spec.rparams.size())
-                return std::unexpected(Error{"validate_expr_spec: rparam index out of range"});
+                NN_FAIL("validate_expr_spec: rparam index out of range");
             if (op.kind == static_cast<uint8_t>(ExprOperandKind::Matmul) && !spec.matmul)
-                return std::unexpected(Error{
-                    "validate_expr_spec: Matmul operand without matmul segment"});
+                NN_FAIL("validate_expr_spec: Matmul operand without matmul segment");
         }
     }
 
@@ -1232,17 +1208,17 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
                 if (opnd.kind == static_cast<uint8_t>(ExprOperandKind::Reduce))
                 {
                     if (opnd.idx >= spec.num_regs)
-                        return std::unexpected(Error{"validate_expr_spec: reduce ref out of range"});
+                        NN_FAIL("validate_expr_spec: reduce ref out of range");
                     if (opnd.idx == ins.dst)
-                        return std::unexpected(Error{"validate_expr_spec: reduce self-reference"});
+                        NN_FAIL("validate_expr_spec: reduce self-reference");
                     if (!reduce_dst[opnd.idx] || elem_dst[opnd.idx])
-                        return std::unexpected(Error{"validate_expr_spec: Reduce operand must reference a prior reduce instruction"});
+                        NN_FAIL("validate_expr_spec: Reduce operand must reference a prior reduce instruction");
                 }
                 else if ((opnd.kind == static_cast<uint8_t>(ExprOperandKind::Reg) ||
                           opnd.kind == static_cast<uint8_t>(ExprOperandKind::Fanout)) &&
                          opnd.idx < spec.num_regs && reduce_dst[opnd.idx])
                 {
-                    return std::unexpected(Error{"validate_expr_spec: register ref to reduce dst (use Reduce operand)"});
+                    NN_FAIL("validate_expr_spec: register ref to reduce dst (use Reduce operand)");
                 }
             }
         }

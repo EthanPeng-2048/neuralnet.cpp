@@ -106,8 +106,7 @@ private:
         // create_tensor 分配失败时返回空 Tensor（非 Result）；此处显式检查，
         // 否则 zero→import 只会报笼统的 "invalid tensor"，掩盖真实原因（显存/设备）。
         if (!d.valid())
-            return std::unexpected(Error{
-                "make_dummy_: GPU 张量分配失败（显存不足或设备异常）"});
+            NN_FAIL("make_dummy_: GPU 张量分配失败（显存不足或设备异常）");
         NN_TRY(r, engine.zero(d));
         return d;
     }
@@ -127,7 +126,7 @@ private:
         V_ones_cache_ = engine.create_tensor(rows, seq, Precision::F32,
                                              InitSpec::constant(Scalar{1}));
         if (!V_ones_cache_.valid())
-            return std::unexpected(Error{"ensure_ones_: V_ones 分配失败"});
+            NN_FAIL("ensure_ones_: V_ones 分配失败");
         // e_0：每头首行=1，其余=0（用于 suffix(scale·q) 的外积构造）
         std::vector<Scalar> e0(rows * seq, Scalar{0});   // 宿主桥（17 §3 D11）
         for (std::size_t bh = 0; bh < BH; ++bh)
@@ -153,8 +152,7 @@ private:
         const Scalar eps = Scalar{1e-5};
         Tensor output = engine.create_tensor(BH * dk, seq);
         if (!output.valid())
-            return std::unexpected(Error{
-                "rms_norm_forward_: GPU 张量分配失败（显存不足或设备异常）"});
+            NN_FAIL("rms_norm_forward_: GPU 张量分配失败（显存不足或设备异常）");
         // rms_inv_out == nullptr（checkpoint 模式）：不收集逐头 1/rms 缓存，
         // backward 由 forward_recompute 重建；同时省掉 BH 次 GPU→CPU 下载。
         // 宿主桥（17 §3 D11）：标量缓冲收逐头 1/rms，不经 Matrix。
@@ -207,8 +205,7 @@ private:
         const Scalar inv_dk = Scalar{1} / static_cast<Scalar>(dk);
         Tensor output = engine.create_tensor(BH * dk, seq);
         if (!output.valid())
-            return std::unexpected(Error{
-                "rms_norm_backward_: GPU 张量分配失败（显存不足或设备异常）"});
+            NN_FAIL("rms_norm_backward_: GPU 张量分配失败（显存不足或设备异常）");
         for (std::size_t bh = 0; bh < BH; ++bh)
         {
             NN_TRY(gy, engine.slice_rows(grad, bh * dk, dk));
@@ -358,13 +355,12 @@ public:
     {
         ComputeEngine& engine = engine_ref();
         if (input.rows() != d_model_)
-            return std::unexpected(Error{"ReLULinearAttention forward: input shape mismatch"});
-
+            NN_FAIL("ReLULinearAttention forward: input shape mismatch");
         const std::size_t total = input.cols();
         const std::size_t seq = (seq_len_ > 0) ? seq_len_ : total;
         const std::size_t batch = (seq_len_ > 0) ? (total / seq_len_) : 1;
         if (total != batch * seq)
-            return std::unexpected(Error{"ReLULinearAttention forward: cols not divisible by seq_len"});
+            NN_FAIL("ReLULinearAttention forward: cols not divisible by seq_len");
         const std::size_t H_dk = num_heads_ * d_k_;
 
         NN_TRY(q_res, w_q_.forward(input));
@@ -520,9 +516,7 @@ public:
             !Q_normed_cache_.valid() || !K_normed_cache_.valid() ||
             !Q_rms_inv_cache_.valid() || !K_rms_inv_cache_.valid())
         {
-            return std::unexpected(Error{
-                "ReLULinearAttention::backward: forward 缓存缺失"
-                "（checkpoint 模式需先 forward_recompute）"});
+            NN_FAIL("ReLULinearAttention::backward: forward 缓存缺失"                 "（checkpoint 模式需先 forward_recompute）");
         }
         const std::size_t seq = seq_cache_;
         const std::size_t batch = batch_cache_;
@@ -1078,13 +1072,11 @@ public:
         token_emb_ = engine.create_tensor(vocab_size_, d_model_, Precision::F32,
                                           InitSpec::normal(0, emb_init_std, kInitSeed));
         if (!token_emb_.valid())
-            return std::unexpected(Error{"RAPTModel: token_emb 初始化失败"});
-
+            NN_FAIL("RAPTModel: token_emb 初始化失败");
         grad_token_emb_ = engine.create_tensor(vocab_size_, d_model_, Precision::F32,
                                                InitSpec::zero());
         if (!grad_token_emb_.valid())
-            return std::unexpected(Error{"RAPTModel: token_emb 梯度缓冲初始化失败"});
-
+            NN_FAIL("RAPTModel: token_emb 梯度缓冲初始化失败");
         if (pos_encoder_)
         {
             NN_TRY(r, pos_encoder_->init(engine));
@@ -1097,7 +1089,7 @@ public:
         {
             NN_TRY(r, ln_f_->init(engine));
         }
-        { auto r = lm_head_.init(engine); if (!r) return std::unexpected(r.error()); }
+        { NN_TRY(r, lm_head_.init(engine)); }
         return {};
     }
 
@@ -1257,9 +1249,7 @@ public:
             }
             auto br = blocks_[idx].backward(grad_x);
             if (!br)
-                return std::unexpected(Error{
-                    "RAPTModel::backward: block " + std::to_string(idx) + " failed: "
-                    + br.error().message});
+                NN_FAIL("RAPTModel::backward: block " + std::to_string(idx) + " failed: "                     + br.error().message);
             grad_x = std::move(*br);
             // 重算/恢复出来的激活用后即释放，避免跨块累积（否则抵消省显存收益）
             if (checkpoint_every_ > 0 || activation_offload_)
@@ -1278,7 +1268,7 @@ public:
         Tensor grad_input = engine.create_tensor(seq, batch, Precision::F32,
                                                  InitSpec::zero());
         if (!grad_input.valid())
-            return std::unexpected(Error{"RAPT token_emb backward: 梯度张量分配失败"});
+            NN_FAIL("RAPT token_emb backward: 梯度张量分配失败");
         return grad_input;
     }
 
@@ -1294,16 +1284,16 @@ public:
              std::size_t min_new_tokens = 0)
     {
         if (prompt.empty())
-            return std::unexpected(Error{"RAPT generate: empty prompt"});
+            NN_FAIL("RAPT generate: empty prompt");
         const std::size_t dk = d_model_ / num_heads_;
         // RLA-2 每块两个运行态：B_state (d_model, d_k) + z_state (d_model, 1)
         std::vector<Tensor> statesB, statesZ;
         for (std::size_t i = 0; i < blocks_.size(); ++i)
         {
             statesB.emplace_back(engine.create_tensor(d_model_, dk));
-            { auto r = engine.zero(statesB.back()); if (!r) return std::unexpected(r.error()); }
+            { NN_TRY(r, engine.zero(statesB.back())); }
             statesZ.emplace_back(engine.create_tensor(d_model_, 1));
-            { auto r = engine.zero(statesZ.back()); if (!r) return std::unexpected(r.error()); }
+            { NN_TRY(r, engine.zero(statesZ.back())); }
         }
 
         // 处理单个 token：embed → 各块 forward_step → LN → LM head → 返回 logits 列

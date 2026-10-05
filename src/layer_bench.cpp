@@ -496,7 +496,7 @@ void print_help(const char* prog)
 
 size_t parse_size(const char* val)
 {
-    if (!val) return 0;
+    NN_EXIT(val, 0);
     return static_cast<size_t>(std::strtoull(val, nullptr, 10));
 }
 
@@ -557,11 +557,7 @@ int main(int argc, char* argv[])
 
     // 选择引擎（CPU/GPU），失败硬报错不回退
     auto engine_r = nn::cli::create_engine(nn::cli::EngineConfig{cfg.gpu});
-    if (!engine_r)
-    {
-        std::printf("引擎创建失败: %s\n", engine_r.error().message.c_str());
-        return 2;
-    }
+    NN_EXIT(engine_r, 2, "引擎创建失败: %s\n");
     ComputeEngine& engine = **engine_r;
     const bool op_mode = !cfg.ops.empty();
     std::printf("=== layer_bench (%s%s) ===\n",

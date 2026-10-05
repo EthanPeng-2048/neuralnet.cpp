@@ -48,7 +48,7 @@ target_link_libraries(my_app PRIVATE neuralnet::nn)
 |------|------|------|------|
 | `NN_ENABLE_GPU` | `AUTO` / `ON` / `OFF` | `AUTO` | `AUTO` = 探测到 Vulkan+glslc 就启用 GPU（本仓历史行为）；`ON` = 强制要求，缺 Vulkan 或 glslc **配置期直接失败**（不静默降级 CPU）；`OFF` = 完全跳过——不探测 Vulkan、不编 `scan_exprs`、不生成 shader（纯 CPU 最快路径） |
 | `NN_BUILD_APPS` | `ON` / `OFF` | **嵌入时 OFF** | 是否构建本仓 9 个 app/探针/基准可执行文件。顶层工程默认 ON，`add_subdirectory` 嵌入默认 OFF——消费方只拿到库目标，不被迫编译整个应用集 |
-| `NN_ENABLE_TESTS` | `ON` / `OFF` | `OFF` | 本仓 23 个 ctest 用例（嵌入场景一般不开） |
+| `NN_ENABLE_TESTS` | `ON` / `OFF` | `OFF` | 本仓 24 个 ctest 用例（嵌入场景一般不开） |
 | `NN_ENABLE_PCH` | `ON` / `OFF` | `ON` | 本仓共享 PCH（无 app 目标时自动无候选、无副作用） |
 | `NN_ENABLE_NATIVE` | `ON` / `OFF` | `ON` | `-march=native`（只作用于本仓目标，不影响消费方编译选项） |
 | `NEURALNET_CPP_DIR` | 路径 | `../..` | 仅 `examples/downstream` 样例用：库位置（可指向 3rd_party 摆放处） |

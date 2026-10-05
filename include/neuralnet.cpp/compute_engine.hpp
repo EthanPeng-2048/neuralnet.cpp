@@ -246,11 +246,9 @@ public:
     [[nodiscard]] Result<void> offload_save(
         const Tensor& buffer, std::size_t offset, const Tensor& src)
     {
-        if (auto ec = bind_check_({&buffer, &src}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&buffer, &src}));
         auto s = to_f32(src);
-        if (!s)
-            return std::unexpected(s.error());
+        NN_TRY_CHECK(s);
         return offload_save_impl(buffer, offset, *s);
     }
     // 从 buffer 的 offset（float 单位）处复制 rows×cols 到新 GPU tensor
@@ -275,11 +273,9 @@ public:
     // scalar_readback_slots()：可用槽位数（调用方据此做环形复用）。
     [[nodiscard]] Result<void> submit_scalar_readback(std::size_t slot, const Tensor& t)
     {
-        if (auto ec = bind_check_({&t}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&t}));
         auto s = to_f32(t);
-        if (!s)
-            return std::unexpected(s.error());
+        NN_TRY_CHECK(s);
         return submit_scalar_readback_impl(slot, *s);
     }
 
@@ -357,10 +353,9 @@ public:
 
     [[nodiscard]] Result<Tensor> import(const Tensor& src, Precision P)
     {
-        if (auto ec = bind_check_({&src}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&src}));
         if (!src.valid())
-            return std::unexpected(Error{"import: invalid tensor"});
+            NN_FAIL("import: invalid tensor");
         return stamp_(import_impl(src, P));
     }
 
@@ -397,20 +392,17 @@ public:
         static_assert(!std::is_const_v<T> &&
                           (std::is_same_v<T, Scalar> || std::is_same_v<T, f16>),
                       "read: span 元素类型必须是 nn::Scalar(float) 或 nn::f16（U2 精确匹配）");
-        if (auto ec = bind_check_({&t}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&t}));
         constexpr Precision want =
             std::is_same_v<T, f16> ? Precision::F16 : Precision::F32;
         if (t.precision() != want)
-            return std::unexpected(
-                Error{"read: span 元素类型与张量精度不匹配（U2 精确匹配）"});
+            NN_FAIL("read: span 元素类型与张量精度不匹配（U2 精确匹配）");
         if (dst.size() != t.rows() * t.cols())
-            return std::unexpected(Error{"read: 元素数与张量形状不匹配"});
+            NN_FAIL("read: 元素数与张量形状不匹配");
         // 统一经 to_matrix（GPU 分支自带 flush + wait_in_flight；f16 存储
         // 升 f32 精确无损，T=f16 时下面再 RHE 落回——往返位不变）。
         auto m = to_matrix(t, Precision::F32);
-        if (!m)
-            return std::unexpected(m.error());
+        NN_TRY_CHECK(m);
         const auto src = m->span();
         if constexpr (std::is_same_v<T, Scalar>)
         {
@@ -436,16 +428,13 @@ public:
         using Elem = std::remove_cv_t<T>;
         static_assert(std::is_same_v<Elem, Scalar> || std::is_same_v<Elem, f16>,
                       "write: span 元素类型必须是 nn::Scalar(float) 或 nn::f16（U2 精确匹配）");
-        if (auto ec = bind_check_({&t}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&t}));
         constexpr Precision want =
             std::is_same_v<Elem, f16> ? Precision::F16 : Precision::F32;
         if (t.precision() != want)
-            return std::unexpected(
-                Error{"write: span 元素类型与张量精度不匹配（U2 精确匹配）"});
+            NN_FAIL("write: span 元素类型与张量精度不匹配（U2 精确匹配）");
         if (src.size() != t.rows() * t.cols())
-            return std::unexpected(Error{"write: 元素数与张量形状不匹配"});
-
+            NN_FAIL("write: 元素数与张量形状不匹配");
         if (t.is_cpu())
         {
             // 宿主张量直写既有存储（保留对象身份）。不走 copy_from：GPU 引擎
@@ -491,10 +480,9 @@ public:
     [[nodiscard]] Result<Scalar> get_index(const Tensor& t, std::size_t row,
                                            std::size_t col)
     {
-        if (auto ec = bind_check_({&t}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&t}));
         if (row >= t.rows() || col >= t.cols())
-            return std::unexpected(Error{"get_index: (row, col) 越界"});
+            NN_FAIL("get_index: (row, col) 越界");
         const std::size_t idx = row * t.cols() + col;
         if (t.is_cpu())
         {
@@ -505,13 +493,11 @@ public:
         if (t.precision() == Precision::F16)
         {
             std::vector<f16> buf(t.rows() * t.cols());
-            if (auto r = read(t, std::span<f16>(buf)); !r)
-                return std::unexpected(r.error());
+            NN_TRY(r, read(t, std::span<f16>(buf)));
             return static_cast<Scalar>(buf[idx]);
         }
         std::vector<Scalar> buf(t.rows() * t.cols());
-        if (auto r = read(t, std::span<Scalar>(buf)); !r)
-            return std::unexpected(r.error());
+        NN_TRY(r, read(t, std::span<Scalar>(buf)));
         return buf[idx];
     }
 
@@ -520,10 +506,9 @@ public:
     [[nodiscard]] Result<void> set_index(Tensor& t, std::size_t row, std::size_t col,
                                          Scalar v)
     {
-        if (auto ec = bind_check_({&t}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&t}));
         if (row >= t.rows() || col >= t.cols())
-            return std::unexpected(Error{"set_index: (row, col) 越界"});
+            NN_FAIL("set_index: (row, col) 越界");
         const std::size_t idx = row * t.cols() + col;
         if (t.is_cpu())
         {
@@ -536,14 +521,12 @@ public:
         if (t.precision() == Precision::F16)
         {
             std::vector<f16> buf(t.rows() * t.cols());
-            if (auto r = read(t, std::span<f16>(buf)); !r)
-                return std::unexpected(r.error());
+            NN_TRY(r, read(t, std::span<f16>(buf)));
             buf[idx] = static_cast<f16>(v);
             return write(t, std::span<const f16>(buf));
         }
         std::vector<Scalar> buf(t.rows() * t.cols());
-        if (auto r = read(t, std::span<Scalar>(buf)); !r)
-            return std::unexpected(r.error());
+        NN_TRY(r, read(t, std::span<Scalar>(buf)));
         buf[idx] = v;
         return write(t, std::span<const Scalar>(buf));
     }
@@ -555,10 +538,9 @@ public:
     [[nodiscard]] Result<Tensor> reshape(const Tensor& t, std::size_t new_rows,
                                           std::size_t new_cols)
     {
-        if (auto ec = bind_check_({&t}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&t}));
         if (t.rows() * t.cols() != new_rows * new_cols)
-            return std::unexpected(Error{"reshape: element count mismatch"});
+            NN_FAIL("reshape: element count mismatch");
         return stamp_(t.reshape(new_rows, new_cols));
     }
 
@@ -567,8 +549,7 @@ public:
     // 默认实现：同精度 = 返回 src（共享所有权，零拷贝）；跨精度 = 错误（引擎覆盖）。
     [[nodiscard]] Result<Tensor> cast(const Tensor& src, Precision dst)
     {
-        if (auto ec = bind_check_({&src}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&src}));
         return stamp_(cast_impl(src, dst));
     }
 
@@ -580,10 +561,10 @@ public:
     [[nodiscard]] virtual Result<void> cast_into(const Tensor& src, Tensor& dst)
     {
         if (src.rows() != dst.rows() || src.cols() != dst.cols())
-            return std::unexpected(Error{"cast_into: shape mismatch"});
+            NN_FAIL("cast_into: shape mismatch");
         if (src.precision() == dst.precision())
             return copy_into(dst, src);
-        return std::unexpected(Error{"cast_into: 该引擎不支持跨精度转换"});
+        NN_FAIL("cast_into: 该引擎不支持跨精度转换");
     }
 
     // ── copy_into：同精度同形状拷贝（dst 的既有存储被完整覆盖，不替换对象）
@@ -591,7 +572,7 @@ public:
     [[nodiscard]] virtual Result<void> copy_into(Tensor& dst, const Tensor& src)
     {
         (void)dst; (void)src;
-        return std::unexpected(Error{"copy_into: 该引擎未实现"});
+        NN_FAIL("copy_into: 该引擎未实现");
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -669,8 +650,7 @@ public:
     // 用于需要修改中间结果但不影响原 Tensor 的场景
     [[nodiscard]] Result<Tensor> clone(const Tensor& src)
     {
-        if (auto ec = bind_check_({&src}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&src}));
         // 原生 f16 数据搬运：引擎的 clone 是模板化字节拷贝 → 直接放行，
         // 省掉"抬 f32 → 拷贝 → 落回 f16"的 2 份全尺寸临时量。
         if (src.precision() != Precision::F32 && supports_native_data_move())
@@ -683,13 +663,11 @@ public:
     // f16 目标：先按 f32 上传，再 cast_into 写进 dst 的原存储
     [[nodiscard]] Result<void> copy_from(Tensor& dst, const Matrix& src)
     {
-        if (auto ec = bind_check_({&dst}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&dst}));
         if (dst.precision() == Precision::F32)
             return copy_from_impl(dst, src);
         auto t = from_matrix(src, Precision::F32);
-        if (!t)
-            return std::unexpected(t.error());
+        NN_TRY_CHECK(t);
         return cast_into(*t, dst);
     }
 
@@ -699,8 +677,7 @@ public:
     [[nodiscard]] Result<Tensor> slice_rows(
         const Tensor& src, std::size_t start_row, std::size_t count)
     {
-        if (auto ec = bind_check_({&src}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&src}));
         if (src.precision() != Precision::F32 && supports_native_data_move())
             return stamp_(slice_rows_impl(src, start_row, count));
         return stamp_(move_(src, [this, start_row, count](const Tensor& s)
@@ -716,8 +693,7 @@ public:
     [[nodiscard]] Result<void> insert_rows(
         Tensor& dst, std::size_t dst_start_row, const Tensor& src)
     {
-        if (auto ec = bind_check_({&dst, &src}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&dst, &src}));
         if (dst.precision() != Precision::F32 && dst.precision() == src.precision() &&
             supports_native_data_move())
             return insert_rows_impl(dst, dst_start_row, src);
@@ -725,14 +701,11 @@ public:
             return insert_rows_impl(dst, dst_start_row, src);
         // 不同精度（或 f16 dst）：统一在 f32 空间插入后写回 dst 的原存储
         auto d = to_f32(dst);
-        if (!d)
-            return std::unexpected(d.error());
+        NN_TRY_CHECK(d);
         auto s = to_f32(src);
-        if (!s)
-            return std::unexpected(s.error());
+        NN_TRY_CHECK(s);
         auto r = insert_rows_impl(*d, dst_start_row, *s);
-        if (!r)
-            return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         if (dst.precision() == Precision::F32)
             return {};
         return cast_into(*d, dst);
@@ -747,8 +720,7 @@ public:
     [[nodiscard]] Result<Tensor> gather_rows(
         const Tensor& table, const Tensor& indices)
     {
-        if (auto ec = bind_check_({&table, &indices}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&table, &indices}));
         return stamp_(move_(table, [this, &indices](const Tensor& t)
         {
             return gather_rows_impl(t, indices);
@@ -765,8 +737,7 @@ public:
     [[nodiscard]] Result<void> scatter_add_rows(
         Tensor& dst, const Tensor& indices, const Tensor& grad)
     {
-        if (auto ec = bind_check_({&dst, &indices, &grad}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&dst, &indices, &grad}));
         if (dst.precision() == Precision::F32 && grad.precision() == Precision::F32)
             return scatter_add_rows_impl(dst, indices, grad);
         // 原生 f16（GPU：打包 half CAS 变体；无 pipeline 时引擎内 cast 回退）
@@ -774,14 +745,11 @@ public:
         if (supports_native_data_move())
             return scatter_add_rows_impl(dst, indices, grad);
         auto d = to_f32(dst);
-        if (!d)
-            return std::unexpected(d.error());
+        NN_TRY_CHECK(d);
         auto g = to_f32(grad);
-        if (!g)
-            return std::unexpected(g.error());
+        NN_TRY_CHECK(g);
         auto r = scatter_add_rows_impl(*d, indices, *g);
-        if (!r)
-            return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         if (dst.precision() == Precision::F32)
             return {};
         return cast_into(*d, dst);
@@ -798,8 +766,7 @@ public:
         const Tensor& x, std::size_t M, std::size_t B, std::size_t N,
         bool inverse = false)
     {
-        if (auto ec = bind_check_({&x}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&x}));
         return stamp_(move_(x, [this, M, B, N, inverse](const Tensor& t)
         {
             return rearrange_3d_impl(t, M, B, N, inverse);
@@ -810,8 +777,7 @@ public:
     // 纯 layout 操作，零算法语义。用于 embedding 列布局转换等场景。
     [[nodiscard]] Result<Tensor> transpose(const Tensor& A)
     {
-        if (auto ec = bind_check_({&A}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&A}));
         return stamp_(move_(A, [this](const Tensor& t) { return transpose_impl(t); }));
     }
 
@@ -832,8 +798,7 @@ public:
         std::size_t k, std::size_t stride, std::size_t pad,
         std::size_t OH, std::size_t OW)
     {
-        if (auto ec = bind_check_({&x}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&x}));
         return stamp_(move_(x, [this, C, H, W, k, stride, pad, OH, OW](const Tensor& t)
         {
             return im2col_impl(t, C, H, W, k, stride, pad, OH, OW);
@@ -853,8 +818,7 @@ public:
         std::size_t k, std::size_t stride, std::size_t pad,
         std::size_t OH, std::size_t OW)
     {
-        if (auto ec = bind_check_({&col}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&col}));
         return stamp_(move_(col, [this, C, H, W, k, stride, pad, OH, OW](const Tensor& t)
         {
             return col2im_impl(t, C, H, W, k, stride, pad, OH, OW);
@@ -878,8 +842,7 @@ public:
         bool transA = false, bool transB = false,
         Precision P = Precision::F32)
     {
-        if (auto ec = bind_check_({&A, &B}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&A, &B}));
         if (P != Precision::F32)
             return stamp_(matmul_impl(A, B, transA, transB, P));
         return stamp_(binary_(A, B, P, [this, transA, transB](const Tensor& a, const Tensor& b)
@@ -905,8 +868,7 @@ public:
         Scalar alpha = Scalar{1},
         Precision P = Precision::F32)
     {
-        if (auto ec = bind_check_({&A, &B}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&A, &B}));
         if (P != Precision::F32)
             return stamp_(batched_matmul_impl(A, B, batch, transA, transB, alpha, P));
         return stamp_(binary_(A, B, P,
@@ -927,8 +889,7 @@ public:
         bool transA = false, bool transB = false,
         Precision P = Precision::F32)
     {
-        if (auto ec = bind_check_({&A, &B, &bias}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&A, &B, &bias}));
         if (P != Precision::F32 &&
             (A.precision() != Precision::F32 || B.precision() != Precision::F32 ||
              bias.precision() != Precision::F32))
@@ -939,22 +900,21 @@ public:
             return stamp_(matmul_with_bias_impl(A, B, bias, transA, transB,
                                          Precision::F32));
         auto a = to_f32(A);
-        if (!a) return std::unexpected(a.error());
+        NN_TRY_CHECK(a);
         auto b = to_f32(B);
-        if (!b) return std::unexpected(b.error());
+        NN_TRY_CHECK(b);
         auto bi = to_f32(bias);
-        if (!bi) return std::unexpected(bi.error());
+        NN_TRY_CHECK(bi);
         auto r = matmul_with_bias_impl(*a, *b, *bi, transA, transB,
                                        Precision::F32);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return stamp_(to_prec(std::move(*r), P));
     }
 
     // 梯度累加：dst += src（dst 存储精度不可变，§8.3）
     [[nodiscard]] Result<void> accumulate(Tensor& dst, const Tensor& src)
     {
-        if (auto ec = bind_check_({&dst, &src}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&dst, &src}));
         const bool dbg = prec_env_flag("NN_F16_DEBUG");
         const auto mx = [this](const Tensor& t)
         {
@@ -988,8 +948,7 @@ public:
     // A += B（逐元素，同形状）
     [[nodiscard]] Result<void> add_inplace(Tensor& A, const Tensor& B)
     {
-        if (auto ec = bind_check_({&A, &B}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&A, &B}));
         return inplace2_(A, B, [this](Tensor& a, const Tensor& b)
         {
             return add_inplace_impl(a, b);
@@ -999,16 +958,14 @@ public:
     // A *= scalar
     [[nodiscard]] Result<void> scale_inplace(Tensor& A, Scalar s)
     {
-        if (auto ec = bind_check_({&A}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&A}));
         return inplace1_(A, [this, s](Tensor& a) { return scale_inplace_impl(a, s); });
     }
 
     // A = 0
     [[nodiscard]] Result<void> zero(Tensor& A)
     {
-        if (auto ec = bind_check_({&A}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&A}));
         // 原生 f16 清零：fill_zero 是字节级原语（每步 zero_grad 调用 N 次）
         if (A.precision() != Precision::F32 && supports_native_data_move())
             return zero_impl(A);
@@ -1058,8 +1015,7 @@ public:
         const Tensor& boundary, bool has_bnd,
         Precision prec = Precision::F32)
     {
-        if (auto ec = bind_check_({&K, &V, &P, &R, &A0, &B0, &boundary}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&K, &V, &P, &R, &A0, &B0, &boundary}));
         if (prec == Precision::F32 && K.precision() == Precision::F32 &&
             V.precision() == Precision::F32 && P.precision() == Precision::F32 &&
             R.precision() == Precision::F32 && A0.precision() == Precision::F32 &&
@@ -1071,16 +1027,16 @@ public:
         {
             auto r = scan_prefix_outer_impl(K, V, P, R, A0, B0, has_state, dk, heads,
                                             causal, boundary, has_bnd, prec);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             return stamp_(to_prec(std::move(*r), prec));
         }
         const std::vector<Tensor> ts{K, V, P, R, A0, B0, boundary};
         auto c = to_f32_all(ts);
-        if (!c) return std::unexpected(c.error());
+        NN_TRY_CHECK(c);
         auto r = scan_prefix_outer_impl((*c)[0], (*c)[1], (*c)[2], (*c)[3],
                                         (*c)[4], (*c)[5], has_state, dk, heads,
                                         causal, (*c)[6], has_bnd, Precision::F32);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return stamp_(to_prec(std::move(*r), prec));
     }
 
@@ -1096,8 +1052,7 @@ public:
         const Tensor& boundary, bool has_bnd,
         Precision prec = Precision::F32)
     {
-        if (auto ec = bind_check_({&D, &X, &Y, &boundary}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&D, &X, &Y, &boundary}));
         if (prec == Precision::F32 && D.precision() == Precision::F32 &&
             X.precision() == Precision::F32 && Y.precision() == Precision::F32 &&
             boundary.precision() == Precision::F32)
@@ -1107,15 +1062,15 @@ public:
         {
             auto r = scan_suffix_outer_impl(D, X, Y, dk, heads, causal, boundary,
                                             has_bnd, prec);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             return stamp_(to_prec(std::move(*r), prec));
         }
         const std::vector<Tensor> ts{D, X, Y, boundary};
         auto c = to_f32_all(ts);
-        if (!c) return std::unexpected(c.error());
+        NN_TRY_CHECK(c);
         auto r = scan_suffix_outer_impl((*c)[0], (*c)[1], (*c)[2], dk, heads,
                                         causal, (*c)[3], has_bnd, Precision::F32);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return stamp_(to_prec(std::move(*r), prec));
     }
 
@@ -1129,23 +1084,22 @@ public:
         std::size_t dk, bool has_scale,
         Precision prec = Precision::F32)
     {
-        if (auto ec = bind_check_({&P, &R, &S}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&P, &R, &S}));
         if (prec == Precision::F32 && P.precision() == Precision::F32 &&
             R.precision() == Precision::F32 && S.precision() == Precision::F32)
             return stamp_(outer_col_impl(P, R, S, dk, has_scale, Precision::F32));
         if (supports_native_data_move())
         {
             auto r = outer_col_impl(P, R, S, dk, has_scale, prec);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             return stamp_(to_prec(std::move(*r), prec));
         }
         const std::vector<Tensor> ts{P, R, S};
         auto c = to_f32_all(ts);
-        if (!c) return std::unexpected(c.error());
+        NN_TRY_CHECK(c);
         auto r = outer_col_impl((*c)[0], (*c)[1], (*c)[2], dk, has_scale,
                                 Precision::F32);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return stamp_(to_prec(std::move(*r), prec));
     }
 
@@ -1163,12 +1117,11 @@ public:
     [[nodiscard]] Result<Tensor> row_reduce_sum(
         const Tensor& A, Precision P = Precision::F32)
     {
-        if (auto ec = bind_check_({&A}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&A}));
         if (A.precision() != Precision::F32 && supports_native_f16_reduce())
         {
             auto r = row_reduce_sum_impl(A, P);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             return stamp_(to_prec(std::move(*r), P));
         }
         return stamp_(unary_(A, P, [this](const Tensor& a)
@@ -1182,12 +1135,11 @@ public:
     [[nodiscard]] Result<Tensor> col_reduce_sum(
         const Tensor& A, Precision P = Precision::F32)
     {
-        if (auto ec = bind_check_({&A}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&A}));
         if (A.precision() != Precision::F32 && supports_native_f16_reduce())
         {
             auto r = col_reduce_sum_impl(A, P);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             return stamp_(to_prec(std::move(*r), P));
         }
         return stamp_(unary_(A, P, [this](const Tensor& a)
@@ -1201,12 +1153,11 @@ public:
     [[nodiscard]] Result<Tensor> col_reduce_max(
         const Tensor& A, Precision P = Precision::F32)
     {
-        if (auto ec = bind_check_({&A}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&A}));
         if (A.precision() != Precision::F32 && supports_native_f16_reduce())
         {
             auto r = col_reduce_max_impl(A, P);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             return stamp_(to_prec(std::move(*r), P));
         }
         return stamp_(unary_(A, P, [this](const Tensor& a)
@@ -1226,12 +1177,11 @@ public:
         const Tensor& x, std::size_t G, std::size_t R,
         Precision P = Precision::F32)
     {
-        if (auto ec = bind_check_({&x}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&x}));
         if (x.precision() != Precision::F32 && supports_native_f16_reduce())
         {
             auto r = grouped_reduce_sum_impl(x, G, R, P);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             return stamp_(to_prec(std::move(*r), P));
         }
         return stamp_(unary_(x, P, [this, G, R](const Tensor& t)
@@ -1243,12 +1193,11 @@ public:
         const Tensor& x, std::size_t G, std::size_t R,
         Precision P = Precision::F32)
     {
-        if (auto ec = bind_check_({&x}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_({&x}));
         if (x.precision() != Precision::F32 && supports_native_f16_reduce())
         {
             auto r = grouped_reduce_max_impl(x, G, R, P);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             return stamp_(to_prec(std::move(*r), P));
         }
         return stamp_(unary_(x, P, [this, G, R](const Tensor& t)
@@ -1278,8 +1227,7 @@ public:
         std::size_t rows, std::size_t cols,
         Precision P = Precision::F32)
     {
-        if (auto ec = bind_check_(inputs); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_(inputs));
         trace_variant_(spec, inputs, P);
         if (P == Precision::F32 && all_f32(inputs))
             return stamp_(eval_expr_impl(spec, inputs, rows, cols, Precision::F32));
@@ -1289,11 +1237,9 @@ public:
         if (prec_trace_enabled_())
             trace_miss_(spec, inputs, P);
         auto in32 = to_f32_all(inputs);
-        if (!in32)
-            return std::unexpected(in32.error());
+        NN_TRY_CHECK(in32);
         auto r = eval_expr_impl(spec, *in32, rows, cols, Precision::F32);
-        if (!r)
-            return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return stamp_(to_prec(std::move(*r), P));
     }
 
@@ -1307,8 +1253,7 @@ public:
         std::size_t rows, std::size_t cols,
         Precision P = Precision::F32)
     {
-        if (auto ec = bind_check_(inputs); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_(inputs));
         trace_variant_(spec, inputs, P);
         if (P == Precision::F32 && all_f32(inputs))
             return stamp_(eval_expr_reduce_impl(spec, inputs, rows, cols, Precision::F32));
@@ -1318,11 +1263,9 @@ public:
         if (prec_trace_enabled_())
             trace_miss_(spec, inputs, P);
         auto in32 = to_f32_all(inputs);
-        if (!in32)
-            return std::unexpected(in32.error());
+        NN_TRY_CHECK(in32);
         auto r = eval_expr_reduce_impl(spec, *in32, rows, cols, Precision::F32);
-        if (!r)
-            return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return stamp_(to_prec(std::move(*r), P));
     }
 
@@ -1337,10 +1280,8 @@ public:
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols, Tensor& out)
     {
-        if (auto ec = bind_check_(inputs); !ec)
-            return std::unexpected(ec.error());
-        if (auto ec = bind_check_({&out}); !ec)
-            return std::unexpected(ec.error());
+        NN_TRY(ec, bind_check_(inputs));
+        NN_TRY(ec2, bind_check_({&out}));
         trace_variant_(spec, inputs, out.precision());
         if (out.precision() == Precision::F32 && all_f32(inputs))
         {
@@ -1365,12 +1306,10 @@ public:
                          static_cast<int>(out.precision()));
         }
         auto in32 = to_f32_all(inputs);
-        if (!in32)
-            return std::unexpected(in32.error());
+        NN_TRY_CHECK(in32);
         auto tmp = create_tensor(rows, cols, Precision::F32);
         auto r = eval_expr_into_impl(spec, *in32, rows, cols, tmp);
-        if (!r)
-            return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return cast_into(tmp, out);
     }
 
@@ -1427,8 +1366,7 @@ protected:
             return cast(src, P);            // 同设备异精度 = 引擎内 cast
         }
         auto m = to_matrix(src, Precision::F32);   // 跨设备：宿主中转
-        if (!m)
-            return std::unexpected(m.error());
+        NN_TRY_CHECK(m);
         return from_matrix(*m, P);
     }
     // cast 默认实现：同精度 = 返回 src（共享所有权，零拷贝）；跨精度 = 错误（引擎覆盖）
@@ -1436,7 +1374,7 @@ protected:
     {
         if (src.precision() == dst)
             return src;  // 同精度 = 返回共享所有权（零拷贝）
-        return std::unexpected(Error{"cast: 该引擎不支持跨精度转换"});
+        NN_FAIL("cast: 该引擎不支持跨精度转换");
     }
     // offload 占位默认（激活 offload 是 GPU 特性；CPU 开启只得到 1×1 张量）
     // D8（15 §4.8）：走 `create_tensor` 而非 `Tensor::cpu` 静态工厂——出生即经
@@ -1465,8 +1403,7 @@ protected:
         std::size_t slot, const Tensor& t)
     {
         if (!t.is_cpu())
-            return std::unexpected(Error{
-                "submit_scalar_readback: 默认实现仅支持 CPU 张量"});
+            NN_FAIL("submit_scalar_readback: 默认实现仅支持 CPU 张量");
         Scalar v = Scalar{0};
         if (t.precision() == Precision::F32)
         {
@@ -1480,8 +1417,7 @@ protected:
         }
         else
         {
-            return std::unexpected(Error{
-                "submit_scalar_readback: 不支持的精度"});
+            NN_FAIL("submit_scalar_readback: 不支持的精度");
         }
         if (sync_readback_slots_.size() <= slot)
             sync_readback_slots_.resize(slot + 1, Scalar{0});
@@ -1583,7 +1519,7 @@ protected:
         Precision P)
     {
         (void)spec; (void)inputs; (void)rows; (void)cols; (void)P;
-        return std::unexpected(Error{"eval_expr_reduce: 该引擎不支持归约向量输出"});
+        NN_FAIL("eval_expr_reduce: 该引擎不支持归约向量输出");
     }
 
     // 默认实现返回错误（未支持的引擎）；CPU/GPU 覆盖为真原地实现。
@@ -1593,8 +1529,7 @@ protected:
         std::size_t rows, std::size_t cols, Tensor& out)
     {
         (void)spec; (void)inputs; (void)rows; (void)cols; (void)out;
-        return std::unexpected(Error{
-            "eval_expr_into: 该引擎不支持原地表达式求值"});
+        NN_FAIL("eval_expr_into: 该引擎不支持原地表达式求值");
     }
 
 private:
@@ -1801,8 +1736,7 @@ private:
         for (const auto& t : ts)
         {
             auto c = to_f32(t, loc);
-            if (!c)
-                return std::unexpected(c.error());
+            NN_TRY_CHECK(c);
             out.push_back(std::move(*c));
         }
         return out;
@@ -1822,16 +1756,13 @@ private:
         if (supports_native_data_move())
             return fn(A, B);
         auto b = to_f32(B, loc);
-        if (!b)
-            return std::unexpected(b.error());
+        NN_TRY_CHECK(b);
         if (A.precision() == Precision::F32)
             return fn(A, *b);
         auto a = to_f32(A, loc);
-        if (!a)
-            return std::unexpected(a.error());
+        NN_TRY_CHECK(a);
         auto r = fn(*a, *b);
-        if (!r)
-            return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return cast_into(*a, A);   // 存储精度不可变（§8.3）
     }
 
@@ -1847,11 +1778,9 @@ private:
         if (supports_native_data_move())
             return fn(A);
         auto a = to_f32(A, loc);
-        if (!a)
-            return std::unexpected(a.error());
+        NN_TRY_CHECK(a);
         auto r = fn(*a);
-        if (!r)
-            return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return cast_into(*a, A);
     }
 
@@ -1863,11 +1792,9 @@ private:
         if (P == Precision::F32 && A.precision() == Precision::F32)
             return fn(A);
         auto a = to_f32(A, loc);
-        if (!a)
-            return std::unexpected(a.error());
+        NN_TRY_CHECK(a);
         auto r = fn(*a);
-        if (!r)
-            return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return to_prec(std::move(*r), P, loc);
     }
 
@@ -1881,14 +1808,11 @@ private:
             B.precision() == Precision::F32)
             return fn(A, B);
         auto a = to_f32(A, loc);
-        if (!a)
-            return std::unexpected(a.error());
+        NN_TRY_CHECK(a);
         auto b = to_f32(B, loc);
-        if (!b)
-            return std::unexpected(b.error());
+        NN_TRY_CHECK(b);
         auto r = fn(*a, *b);
-        if (!r)
-            return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return to_prec(std::move(*r), P, loc);
     }
 
@@ -1906,11 +1830,9 @@ private:
         if (supports_native_data_move())
             return fn(A);
         auto a = to_f32(A, loc);
-        if (!a)
-            return std::unexpected(a.error());
+        NN_TRY_CHECK(a);
         auto r = fn(*a);
-        if (!r)
-            return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return to_prec(std::move(*r), out_p, loc);
     }
 
@@ -2040,21 +1962,19 @@ namespace detail {
                                                 std::span<const Scalar> src)
 {
     if (src.size() != rows * cols)
-        return std::unexpected(Error{"upload_span: 元素数与形状不匹配"});
+        NN_FAIL("upload_span: 元素数与形状不匹配");
     Tensor t = engine.create_tensor(rows, cols, P);
     if (!t.valid())
-        return std::unexpected(Error{"upload_span: 张量分配失败"});
+        NN_FAIL("upload_span: 张量分配失败");
     if (P == Precision::F32)
     {
-        if (auto r = engine.write(t, std::span<const Scalar>(src)); !r)
-            return std::unexpected(r.error());
+        NN_TRY(r, engine.write(t, std::span<const Scalar>(src)));
         return t;
     }
     std::vector<f16> buf(src.size());
     for (std::size_t i = 0; i < src.size(); ++i)
         buf[i] = f16{src[i]};   // RHE 舍入，与 from_matrix 的 f32→f16 同路径
-    if (auto r = engine.write(t, std::span<f16>(buf)); !r)
-        return std::unexpected(r.error());
+    NN_TRY(r, engine.write(t, std::span<f16>(buf)));
     return t;
 }
 
@@ -2062,12 +1982,11 @@ namespace detail {
                                                 std::span<Scalar> dst)
 {
     if (dst.size() != t.rows() * t.cols())
-        return std::unexpected(Error{"download_span: 元素数与张量形状不匹配"});
+        NN_FAIL("download_span: 元素数与张量形状不匹配");
     if (t.precision() == Precision::F32)
         return engine.read(t, dst);
     std::vector<f16> buf(dst.size());
-    if (auto r = engine.read(t, std::span<f16>(buf)); !r)
-        return std::unexpected(r.error());
+    NN_TRY(r, engine.read(t, std::span<f16>(buf)));
     for (std::size_t i = 0; i < dst.size(); ++i)
         dst[i] = static_cast<Scalar>(buf[i]);
     return {};
@@ -2077,8 +1996,7 @@ namespace detail {
                                                                 const Tensor& t)
 {
     std::vector<Scalar> v(t.rows() * t.cols());
-    if (auto r = download_span(engine, t, std::span(v)); !r)
-        return std::unexpected(r.error());
+    NN_TRY(r, download_span(engine, t, std::span(v)));
     return v;
 }
 

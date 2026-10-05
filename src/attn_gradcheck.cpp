@@ -116,7 +116,7 @@ int main(int argc, char* argv[])
     nn::cli::EngineConfig ecfg;
     ecfg.use_gpu = use_gpu;
     auto engine_res = nn::cli::create_engine(ecfg, std::cout);
-    if (!engine_res) { std::cerr << "引擎创建失败: " << engine_res.error().message << "\n"; return 1; }
+    NN_EXIT(engine_res, 1, "引擎创建失败: ");
     auto engine = std::move(*engine_res);
     ComputeEngine& eng = *engine;
 
@@ -137,7 +137,7 @@ int main(int argc, char* argv[])
               << "\n";
 
     CausalSelfAttention attn(d_model, num_heads, seq, seq, pos_enc);
-    { auto r = attn.init(eng); if (!r) { std::cerr << "CausalSelfAttention init 失败: " << r.error().message << "\n"; return 1; } }
+    NN_EXIT(attn.init(eng), 1, "CausalSelfAttention init 失败: ");
     if (use_doc)
     {
         // 文档感知：每样本两文档（前/后半）、样本错开基线 → 覆盖 backward
@@ -162,22 +162,22 @@ int main(int argc, char* argv[])
     for (std::size_t i = 0; i < go_m.size(); ++i) go_m.span()[i] = dist(rng);
 
     auto x = eng.from_matrix(x_m);
-    if (!x) { std::cerr << "from_matrix(x) failed\n"; return 1; }
+    NN_EXIT(x, 1, "from_matrix(x) failed\n");
     auto go = eng.from_matrix(go_m);
-    if (!go) { std::cerr << "from_matrix(go) failed\n"; return 1; }
+    NN_EXIT(go, 1, "from_matrix(go) failed\n");
 
     auto y_fwd = attn.forward(*x);
-    if (!y_fwd) { std::cerr << "forward failed: " << y_fwd.error().message << "\n"; return 1; }
+    NN_EXIT(y_fwd, 1, "forward failed: ");
 
     auto params = attn.parameters();
     auto grads  = attn.param_gradients();
     for (auto& g : grads)
     {
         auto rz = eng.zero(g.get());
-        if (!rz) { std::cerr << "zero failed\n"; return 1; }
+        NN_EXIT(rz, 1, "zero failed\n");
     }
     auto gx = attn.backward(*go);
-    if (!gx) { std::cerr << "backward failed: " << gx.error().message << "\n"; return 1; }
+    NN_EXIT(gx, 1, "backward failed: ");
 
     const Scalar eps = 1e-3f;
     bool all_pass = true;

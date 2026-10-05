@@ -104,7 +104,7 @@ public:
     [[nodiscard]] Result<Tensor> create_offload_buffer_impl(std::size_t bytes) override
     {
         auto g = GpuTensor::create_host_visible_empty(1, bytes, backend_);
-        if (!g) return std::unexpected(g.error());
+        NN_TRY_CHECK(g);
         return Tensor::from_gpu(std::move(*g));
     }
 
@@ -128,14 +128,14 @@ public:
         std::size_t rows, std::size_t cols) override
     {
         auto dst = GpuTensor::create_empty(rows, cols, backend_);
-        if (!dst) return std::unexpected(dst.error());
+        NN_TRY_CHECK(dst);
         const VkDeviceSize size =
             static_cast<VkDeviceSize>(rows * cols * sizeof(float));
         auto r = backend_.copy_buffer_region_gpu(
             buffer.gpu_tensor().buffer().impl(),
             static_cast<VkDeviceSize>(offset * sizeof(float)),
             dst->buffer().impl(), 0, size);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return Tensor::from_gpu(std::move(*dst));
     }
 
@@ -147,11 +147,9 @@ public:
         std::size_t slot, const Tensor& t) override
     {
         if (t.is_cpu())
-            return std::unexpected(Error{
-                "submit_scalar_readback: 期望 GPU 张量"});
+            NN_FAIL("submit_scalar_readback: 期望 GPU 张量");
         if (t.precision() != Precision::F32)
-            return std::unexpected(Error{
-                "submit_scalar_readback: 仅支持 F32 标量（调用方先 cast）"});
+            NN_FAIL("submit_scalar_readback: 仅支持 F32 标量（调用方先 cast）");
         return backend_.submit_scalar_readback(
             slot, t.gpu_tensor().buffer().impl());
     }
@@ -161,7 +159,7 @@ public:
     {
         float v = 0.0f;
         auto r = backend_.poll_scalar_readback(slot, v);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         out = static_cast<Scalar>(v);
         return *r;
     }
@@ -208,11 +206,11 @@ public:
             for (std::size_t i = 0; i < src.size(); ++i)
                 dst[i] = src[i];
             auto r = GpuTensorF16::from_matrix(m16, backend_);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             return Tensor::from_gpu(std::move(*r));
         }
         auto r = GpuTensor::from_matrix(m, backend_);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return Tensor::from_gpu(std::move(*r));
     }
 
@@ -236,16 +234,16 @@ public:
         if (in_batch())
         {
             auto r = end_batch();
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             auto rw = backend_.wait_in_flight();
-            if (!rw) return std::unexpected(rw.error());
+            NN_TRY_CHECK(rw);
             auto rb = begin_batch();
-            if (!rb) return std::unexpected(rb.error());
+            NN_TRY_CHECK(rb);
         }
         if (t.precision() == Precision::F16)
         {
             auto m16_r = t.gpu_tensor<Precision::F16>().to_matrix(backend_);
-            if (!m16_r) return std::unexpected(m16_r.error());
+            NN_TRY_CHECK(m16_r);
             if (P == Precision::F32)
             {
                 Matrix m32(m16_r->rows(), m16_r->cols());
@@ -266,11 +264,8 @@ public:
             return src;
 
         // 保留精度 Pair（BF16/F64 Phase 1 未实现）清晰报错
-        if (auto pcheck = check_precision_supported(src.precision()); !pcheck)
-            return std::unexpected(pcheck.error());
-        if (auto pcheck = check_precision_supported(dst); !pcheck)
-            return std::unexpected(pcheck.error());
-
+        NN_TRY(pcheck, check_precision_supported(src.precision()));
+        NN_TRY(pcheck2, check_precision_supported(dst));
         if (src.is_gpu())
         {
             const std::size_t count = src.rows() * src.cols();
@@ -278,11 +273,11 @@ public:
             {
                 // f16 GPU → f32 GPU（升 cast，精确无损，GPU kernel）
                 auto dst_gpu = GpuTensor::create_empty(src.rows(), src.cols(), backend_);
-                if (!dst_gpu) return std::unexpected(dst_gpu.error());
+                NN_TRY_CHECK(dst_gpu);
                 auto r = backend_.cast_gpu(
                     src.gpu_tensor<Precision::F16>().buffer(), dst_gpu->buffer(),
                     count, /*kind=0*/ 0u);
-                if (!r) return std::unexpected(r.error());
+                NN_TRY_CHECK(r);
                 return Tensor::from_gpu(std::move(*dst_gpu));
             }
             if (src.precision() == Precision::F32 && dst == Precision::F16)
@@ -290,14 +285,14 @@ public:
                 // f32 GPU → f16 GPU（降 cast，round-half-to-even，GPU kernel）
                 // create_f16_tensor 保证奇数元素 count 时 word 写入不越界。
                 auto dst_gpu = backend_.create_f16_tensor(src.rows(), src.cols());
-                if (!dst_gpu) return std::unexpected(dst_gpu.error());
+                NN_TRY_CHECK(dst_gpu);
                 auto r = backend_.cast_gpu(
                     src.gpu_tensor().buffer(), dst_gpu->buffer(),
                     count, /*kind=1*/ 1u);
-                if (!r) return std::unexpected(r.error());
+                NN_TRY_CHECK(r);
                 return Tensor::from_gpu(std::move(*dst_gpu));
             }
-            return std::unexpected(Error{"cast: unsupported precision conversion"});
+            NN_FAIL("cast: unsupported precision conversion");
         }
         // CPU path
         if (src.precision() == Precision::F16 && dst == Precision::F32)
@@ -321,7 +316,7 @@ public:
             // CPU f16 tensor
             return Tensor::from_matrix(std::move(m16));
         }
-        return std::unexpected(Error{"cast: unsupported precision conversion"});
+        NN_FAIL("cast: unsupported precision conversion");
     }
 
     // ── cast_into / copy_into（多精度适配层的"写回原存储"路径，§6.5）──────
@@ -331,11 +326,11 @@ public:
     [[nodiscard]] Result<void> copy_into(Tensor& dst, const Tensor& src) override
     {
         if (dst.rows() != src.rows() || dst.cols() != src.cols())
-            return std::unexpected(Error{"copy_into: shape mismatch"});
+            NN_FAIL("copy_into: shape mismatch");
         if (dst.precision() != src.precision())
-            return std::unexpected(Error{"copy_into: precision mismatch"});
+            NN_FAIL("copy_into: precision mismatch");
         if (dst.is_cpu() != src.is_cpu())
-            return std::unexpected(Error{"copy_into: device mismatch"});
+            NN_FAIL("copy_into: device mismatch");
         const std::size_t count = dst.rows() * dst.cols();
         if (dst.is_gpu())
         {
@@ -367,11 +362,11 @@ public:
     [[nodiscard]] Result<void> cast_into(const Tensor& src, Tensor& dst) override
     {
         if (dst.rows() != src.rows() || dst.cols() != src.cols())
-            return std::unexpected(Error{"cast_into: shape mismatch"});
+            NN_FAIL("cast_into: shape mismatch");
         if (src.precision() == dst.precision())
             return copy_into(dst, src);
         if (dst.is_cpu() != src.is_cpu())
-            return std::unexpected(Error{"cast_into: device mismatch"});
+            NN_FAIL("cast_into: device mismatch");
         const std::size_t count = dst.rows() * dst.cols();
         if (dst.is_gpu())
         {
@@ -383,7 +378,7 @@ public:
                 return backend_.cast_gpu(
                     src.gpu_tensor().buffer(),
                     dst.gpu_tensor<Precision::F16>().buffer(), count, /*kind=*/1u);
-            return std::unexpected(Error{"cast_into: unsupported precision conversion"});
+            NN_FAIL("cast_into: unsupported precision conversion");
         }
         if (src.precision() == Precision::F16 && dst.precision() == Precision::F32)
         {
@@ -399,13 +394,13 @@ public:
             for (std::size_t i = 0; i < s.size(); ++i) d[i] = s[i];
             return {};
         }
-        return std::unexpected(Error{"cast_into: unsupported precision conversion"});
+        NN_FAIL("cast_into: unsupported precision conversion");
     }
 
     [[nodiscard]] Result<void> copy_from_impl(Tensor& dst, const Matrix& src) override
     {
         if (dst.rows() != src.rows() || dst.cols() != src.cols())
-            return std::unexpected(Error{"copy_from: shape mismatch"});
+            NN_FAIL("copy_from: shape mismatch");
         if (dst.is_cpu())
         {
             // 防御性：dst 应为 GPU Tensor，但若为 CPU 则直接拷贝
@@ -420,11 +415,11 @@ public:
         if (in_batch())
         {
             auto r = end_batch();
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             auto rw = backend_.wait_in_flight();
-            if (!rw) return std::unexpected(rw.error());
+            NN_TRY_CHECK(rw);
             auto rb = begin_batch();
-            if (!rb) return std::unexpected(rb.error());
+            NN_TRY_CHECK(rb);
         }
         return backend_.upload_blocking(dst.gpu_tensor(), src.span());
     }
@@ -439,12 +434,11 @@ public:
         if (src.precision() == Precision::F16)   // 原生 f16 字节拷贝（后端模板化实现）
         {
             auto r16 = backend_.clone_gpu(src.gpu_tensor<Precision::F16>());
-            if (!r16) return std::unexpected(r16.error());
+            NN_TRY_CHECK(r16);
             return Tensor::from_gpu(std::move(*r16));
         }
         auto r = backend_.clone_gpu(src.gpu_tensor());
-        if (!r)
-            return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return Tensor::from_gpu(std::move(*r));
     }
 
@@ -453,16 +447,16 @@ public:
         const Tensor& src, std::size_t start_row, std::size_t count) override
     {
         auto src_gpu = import(src);
-        if (!src_gpu) return std::unexpected(src_gpu.error());
+        NN_TRY_CHECK(src_gpu);
         if (src_gpu->precision() == Precision::F16)   // 原生 f16 行切片（纯字节拷贝）
         {
             auto r16 = backend_.slice_rows_gpu(
                 src_gpu->gpu_tensor<Precision::F16>(), start_row, count);
-            if (!r16) return std::unexpected(r16.error());
+            NN_TRY_CHECK(r16);
             return Tensor::from_gpu(std::move(*r16));
         }
         auto r = backend_.slice_rows_gpu(src_gpu->gpu_tensor(), start_row, count);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return Tensor::from_gpu(std::move(*r));
     }
 
@@ -472,9 +466,9 @@ public:
         Tensor& dst, std::size_t dst_start_row, const Tensor& src) override
     {
         if (dst.is_cpu())
-            return std::unexpected(Error{"insert_rows: dst must be GPU tensor in pure-GPU architecture"});
+            NN_FAIL("insert_rows: dst must be GPU tensor in pure-GPU architecture");
         auto src_gpu = import(src);
-        if (!src_gpu) return std::unexpected(src_gpu.error());
+        NN_TRY_CHECK(src_gpu);
         if (dst.precision() == Precision::F16)   // 原生 f16 行插入（纯字节拷贝）
             return backend_.insert_rows_gpu(dst.gpu_tensor<Precision::F16>(),
                                             dst_start_row,
@@ -489,10 +483,9 @@ public:
         const Tensor& table, const Tensor& indices) override
     {
         auto tbl_gpu = import(table);
-        if (!tbl_gpu) return std::unexpected(tbl_gpu.error());
+        NN_TRY_CHECK(tbl_gpu);
         auto idx_gpu = import(indices);
-        if (!idx_gpu) return std::unexpected(idx_gpu.error());
-
+        NN_TRY_CHECK(idx_gpu);
         // Phase C1 f16 直读直写（table/out f16；indices 恒 f32——行号整数值
         // 精度要求）。无 f16 pipeline → 引擎内边界 cast 回退。
         if (tbl_gpu->precision() == Precision::F16)
@@ -503,27 +496,27 @@ public:
                 auto r = backend_.gather_gpu(f16_view(*tbl_gpu),
                                              idx_gpu->gpu_tensor(),
                                              /*f16_io=*/true);
-                if (!r) return std::unexpected(r.error());
+                NN_TRY_CHECK(r);
                 return Tensor::from_gpu(
                     GpuTensorF16(r->shared_buffer(), r->rows(), r->cols()));
             }
             auto t32 = cast(*tbl_gpu, Precision::F32);
-            if (!t32) return std::unexpected(t32.error());
+            NN_TRY_CHECK(t32);
             std::optional<Tensor> i32;
             if (idx_gpu->precision() != Precision::F32)
             {
                 auto c = cast(*idx_gpu, Precision::F32);
-                if (!c) return std::unexpected(c.error());
+                NN_TRY_CHECK(c);
                 i32 = std::move(*c);
             }
             const Tensor& idx_ref = i32 ? *i32 : *idx_gpu;
             auto r = backend_.gather_gpu(t32->gpu_tensor(), idx_ref.gpu_tensor());
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             Tensor out32 = Tensor::from_gpu(std::move(*r));
             return cast(out32, Precision::F16);
         }
         auto r = backend_.gather_gpu(tbl_gpu->gpu_tensor(), idx_gpu->gpu_tensor());
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return Tensor::from_gpu(std::move(*r));
     }
 
@@ -537,13 +530,11 @@ public:
         Tensor& dst, const Tensor& indices, const Tensor& grad) override
     {
         if (!dst.is_gpu())
-            return std::unexpected(Error{"scatter_add_rows: dst must be GPU tensor"});
-
+            NN_FAIL("scatter_add_rows: dst must be GPU tensor");
         auto idx_gpu = import(indices);
-        if (!idx_gpu) return std::unexpected(idx_gpu.error());
+        NN_TRY_CHECK(idx_gpu);
         auto grad_gpu = import(grad);
-        if (!grad_gpu) return std::unexpected(grad_gpu.error());
-
+        NN_TRY_CHECK(grad_gpu);
         const bool f16_io = dst.precision() == Precision::F16 &&
                             grad_gpu->precision() == Precision::F16 &&
                             backend_.has_scatter_add_f16_pipeline();
@@ -559,15 +550,15 @@ public:
             // 引擎内 cast 回退：dst 若 f16 → cast_into 写回原存储（§8.3）
             auto d32 = (dst.precision() == Precision::F16)
                 ? cast(dst, Precision::F32) : Result<Tensor>(dst);
-            if (!d32) return std::unexpected(d32.error());
+            NN_TRY_CHECK(d32);
             auto g32 = (grad_gpu->precision() == Precision::F16)
                 ? cast(*grad_gpu, Precision::F32) : Result<Tensor>(*grad_gpu);
-            if (!g32) return std::unexpected(g32.error());
+            NN_TRY_CHECK(g32);
             auto g32_gpu = import(*g32);
-            if (!g32_gpu) return std::unexpected(g32_gpu.error());
+            NN_TRY_CHECK(g32_gpu);
             auto r = backend_.scatter_add_gpu(d32->gpu_tensor(), idx_gpu->gpu_tensor(),
                                               g32_gpu->gpu_tensor());
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             if (dst.precision() == Precision::F16)
                 return cast_into(*d32, dst);
             return {};
@@ -588,8 +579,7 @@ public:
         bool inverse) override
     {
         auto x_gpu = import(x);
-        if (!x_gpu) return std::unexpected(x_gpu.error());
-
+        NN_TRY_CHECK(x_gpu);
         // Phase C1 f16 直读直写；无 f16 pipeline → 引擎内边界 cast 回退
         if (x_gpu->precision() == Precision::F16)
         {
@@ -599,17 +589,17 @@ public:
                     f16_view(*x_gpu), static_cast<uint32_t>(M),
                     static_cast<uint32_t>(B), static_cast<uint32_t>(N),
                     inverse ? 1u : 0u, /*f16_io=*/true);
-                if (!r) return std::unexpected(r.error());
+                NN_TRY_CHECK(r);
                 return Tensor::from_gpu(
                     GpuTensorF16(r->shared_buffer(), r->rows(), r->cols()));
             }
             auto x32 = cast(*x_gpu, Precision::F32);
-            if (!x32) return std::unexpected(x32.error());
+            NN_TRY_CHECK(x32);
             auto r = backend_.rearrange_3d_gpu(
                 x32->gpu_tensor(), static_cast<uint32_t>(M),
                 static_cast<uint32_t>(B), static_cast<uint32_t>(N),
                 inverse ? 1u : 0u);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             Tensor out32 = Tensor::from_gpu(std::move(*r));
             return cast(out32, Precision::F16);
         }
@@ -619,8 +609,7 @@ public:
             static_cast<uint32_t>(B),
             static_cast<uint32_t>(N),
             inverse ? 1u : 0u);
-        if (!r)
-            return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return Tensor::from_gpu(std::move(*r));
     }
 
@@ -628,7 +617,7 @@ public:
     [[nodiscard]] Result<Tensor> transpose_impl(const Tensor& A) override
     {
         auto a_gpu = import(A);
-        if (!a_gpu) return std::unexpected(a_gpu.error());
+        NN_TRY_CHECK(a_gpu);
         // Phase C1 f16 直读直写；无 f16 pipeline（设备能力不足）→ 引擎内
         // 边界 cast 回退（f16→f32→算→f16），正确性不变——绝不把 f16 buffer
         // 绑到 f32 pipeline（静默错值）。
@@ -637,19 +626,19 @@ public:
             if (backend_.has_transpose_f16_pipeline())
             {
                 auto r = backend_.transpose_gpu(f16_view(*a_gpu), /*f16_io=*/true);
-                if (!r) return std::unexpected(r.error());
+                NN_TRY_CHECK(r);
                 return Tensor::from_gpu(
                     GpuTensorF16(r->shared_buffer(), r->rows(), r->cols()));
             }
             auto a32 = cast(*a_gpu, Precision::F32);
-            if (!a32) return std::unexpected(a32.error());
+            NN_TRY_CHECK(a32);
             auto r32 = backend_.transpose_gpu(a32->gpu_tensor());
-            if (!r32) return std::unexpected(r32.error());
+            NN_TRY_CHECK(r32);
             Tensor out32 = Tensor::from_gpu(std::move(*r32));
             return cast(out32, Precision::F16);
         }
         auto r = backend_.transpose_gpu(a_gpu->gpu_tensor());
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return Tensor::from_gpu(std::move(*r));
     }
 
@@ -661,7 +650,7 @@ public:
         std::size_t OH, std::size_t OW) override
     {
         auto x_gpu = import(x);
-        if (!x_gpu) return std::unexpected(x_gpu.error());
+        NN_TRY_CHECK(x_gpu);
         // Phase C2d：f16 输入/输出 → f16 窗口变体（in/out 均 half，语义
         // "输出精度 = 源精度" §8.4）；无 pipeline → 引擎内边界 cast 回退
         //（绝不把 f16 buffer 绑到 f32 pipeline；CNN 路径与 move_ 直通保障）
@@ -672,21 +661,21 @@ public:
                 auto r = backend_.im2col_gpu(f16_view(*x_gpu),
                                              C, H, W, k, stride, pad, OH, OW,
                                              /*f16_io=*/true);
-                if (!r) return std::unexpected(r.error());
+                NN_TRY_CHECK(r);
                 return Tensor::from_gpu(
                     GpuTensorF16(r->shared_buffer(), r->rows(), r->cols()));
             }
             auto x32 = cast(*x_gpu, Precision::F32);
-            if (!x32) return std::unexpected(x32.error());
+            NN_TRY_CHECK(x32);
             auto r = backend_.im2col_gpu(x32->gpu_tensor(),
                                          C, H, W, k, stride, pad, OH, OW);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             Tensor out32 = Tensor::from_gpu(std::move(*r));
             return cast(out32, Precision::F16);
         }
         auto r = backend_.im2col_gpu(x_gpu->gpu_tensor(),
                                      C, H, W, k, stride, pad, OH, OW);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return Tensor::from_gpu(std::move(*r));
     }
 
@@ -697,7 +686,7 @@ public:
         std::size_t OH, std::size_t OW) override
     {
         auto c_gpu = import(col);
-        if (!c_gpu) return std::unexpected(c_gpu.error());
+        NN_TRY_CHECK(c_gpu);
         // Phase C2d：同 im2col——f16 窗口变体优先，无 pipeline 引擎内回退
         if (c_gpu->precision() == Precision::F16)
         {
@@ -706,21 +695,21 @@ public:
                 auto r = backend_.col2im_gpu(f16_view(*c_gpu),
                                              C, H, W, k, stride, pad, OH, OW,
                                              /*f16_io=*/true);
-                if (!r) return std::unexpected(r.error());
+                NN_TRY_CHECK(r);
                 return Tensor::from_gpu(
                     GpuTensorF16(r->shared_buffer(), r->rows(), r->cols()));
             }
             auto c32 = cast(*c_gpu, Precision::F32);
-            if (!c32) return std::unexpected(c32.error());
+            NN_TRY_CHECK(c32);
             auto r = backend_.col2im_gpu(c32->gpu_tensor(),
                                          C, H, W, k, stride, pad, OH, OW);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             Tensor out32 = Tensor::from_gpu(std::move(*r));
             return cast(out32, Precision::F16);
         }
         auto r = backend_.col2im_gpu(c_gpu->gpu_tensor(),
                                      C, H, W, k, stride, pad, OH, OW);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return Tensor::from_gpu(std::move(*r));
     }
 
@@ -731,26 +720,26 @@ public:
         const Tensor& x, std::size_t G, std::size_t R, bool is_max)
     {
         auto x_gpu = import(x);
-        if (!x_gpu) return std::unexpected(x_gpu.error());
+        NN_TRY_CHECK(x_gpu);
         if (x_gpu->precision() == Precision::F16)
         {
             if (backend_.has_group_reduce_f16_pipeline())
             {
                 auto r = backend_.grouped_reduce_gpu(
                     f16_view(*x_gpu), G, R, is_max, /*f16_in=*/true);
-                if (!r) return std::unexpected(r.error());
+                NN_TRY_CHECK(r);
                 return Tensor::from_gpu(std::move(*r));
             }
             auto x32 = cast(*x_gpu, Precision::F32);
-            if (!x32) return std::unexpected(x32.error());
+            NN_TRY_CHECK(x32);
             auto x32_gpu = import(*x32);
-            if (!x32_gpu) return std::unexpected(x32_gpu.error());
+            NN_TRY_CHECK(x32_gpu);
             auto r = backend_.grouped_reduce_gpu(x32_gpu->gpu_tensor(), G, R, is_max);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             return Tensor::from_gpu(std::move(*r));
         }
         auto r = backend_.grouped_reduce_gpu(x_gpu->gpu_tensor(), G, R, is_max);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return Tensor::from_gpu(std::move(*r));
     }
 
@@ -779,18 +768,16 @@ public:
     {
         // 确保 A、B 在 GPU 上
         auto a_gpu = import(A);
-        if (!a_gpu) return std::unexpected(a_gpu.error());
+        NN_TRY_CHECK(a_gpu);
         auto b_gpu = import(B);
-        if (!b_gpu) return std::unexpected(b_gpu.error());
-
+        NN_TRY_CHECK(b_gpu);
         // ── F32 路径（现状，零改动）─────────────────────────────────────
         if (P == Precision::F32)
         {
             auto r = backend_.matmul_gpu(
                 a_gpu->gpu_tensor(), b_gpu->gpu_tensor(),
                 transA ? 1u : 0u, transB ? 1u : 0u);
-            if (!r)
-                return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             return Tensor::from_gpu(std::move(*r));
         }
 
@@ -815,8 +802,7 @@ public:
                 auto r = backend_.matmul_gpu(
                     f16_view(*a_gpu), f16_view(*b_gpu),
                     transA ? 1u : 0u, transB ? 1u : 0u, /*f16_io=*/true);
-                if (!r)
-                    return std::unexpected(r.error());
+                NN_TRY_CHECK(r);
                 return Tensor::from_gpu(
                     GpuTensorF16(r->shared_buffer(), r->rows(), r->cols()));
             }
@@ -828,28 +814,24 @@ public:
         {
             // 边界 cast：f16 → f32（§7.5 cast 原语）
             auto a32 = cast(*a_gpu, Precision::F32);
-            if (!a32) return std::unexpected(a32.error());
+            NN_TRY_CHECK(a32);
             auto b32 = cast(*b_gpu, Precision::F32);
-            if (!b32) return std::unexpected(b32.error());
-
+            NN_TRY_CHECK(b32);
             auto a32_gpu = import(*a32);
-            if (!a32_gpu) return std::unexpected(a32_gpu.error());
+            NN_TRY_CHECK(a32_gpu);
             auto b32_gpu = import(*b32);
-            if (!b32_gpu) return std::unexpected(b32_gpu.error());
-
+            NN_TRY_CHECK(b32_gpu);
             // f32 matmul
             auto r = backend_.matmul_gpu(
                 a32_gpu->gpu_tensor(), b32_gpu->gpu_tensor(),
                 transA ? 1u : 0u, transB ? 1u : 0u);
-            if (!r)
-                return std::unexpected(r.error());
-
+            NN_TRY_CHECK(r);
             // cast 回 f16
             Tensor result_f32 = Tensor::from_gpu(std::move(*r));
             return cast(result_f32, Precision::F16);
         }
 
-        return std::unexpected(Error{"matmul: unsupported precision"});
+        NN_FAIL("matmul: unsupported precision");
     }
 
     // ── matmul + 行广播 bias：经 DSL 融合（单一事实源）──────────────
@@ -877,8 +859,7 @@ public:
 
         auto [spec, inputs] = nn::dsl::to_expr_spec(
             nn::dsl::matmul(A, B, transA, transB, 1) + nn::dsl::row_broadcast(bias));
-        if (auto v = nn::validate_expr_spec(spec, inputs.size()); !v)
-            return std::unexpected(v.error());
+        NN_TRY(v, nn::validate_expr_spec(spec, inputs.size()));
         if (supports_expr_precision_variant(spec, inputs, P))
             return eval_expr(spec, inputs, rows, cols, P);
 
@@ -893,14 +874,14 @@ public:
                 continue;
             }
             auto c = cast(*ops[i], Precision::F32);
-            if (!c) return std::unexpected(c.error());
+            NN_TRY_CHECK(c);
             c32[i] = std::move(*c);
         }
         auto r = nn::dsl::compute(*this,
             nn::dsl::matmul(c32[0], c32[1], transA, transB, 1)
                 + nn::dsl::row_broadcast(c32[2]),
             rows, cols);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return cast(*r, P);
     }
 
@@ -915,10 +896,9 @@ public:
         Precision P = Precision::F32) override
     {
         auto a_gpu = import(A);
-        if (!a_gpu) return std::unexpected(a_gpu.error());
+        NN_TRY_CHECK(a_gpu);
         auto b_gpu = import(B);
-        if (!b_gpu) return std::unexpected(b_gpu.error());
-
+        NN_TRY_CHECK(b_gpu);
         // ── F32 路径（现状，零改动）─────────────────────────────────────
         if (P == Precision::F32)
         {
@@ -927,8 +907,7 @@ public:
                 static_cast<uint32_t>(batch),
                 transA ? 1u : 0u, transB ? 1u : 0u,
                 static_cast<float>(alpha));
-            if (!r)
-                return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             return Tensor::from_gpu(std::move(*r));
         }
 
@@ -942,8 +921,7 @@ public:
                 f16_view(*a_gpu), f16_view(*b_gpu),
                 static_cast<uint32_t>(batch), transA ? 1u : 0u, transB ? 1u : 0u,
                 static_cast<float>(alpha), /*f16_io=*/true);
-            if (!r)
-                return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             return Tensor::from_gpu(
                 GpuTensorF16(r->shared_buffer(), r->rows(), r->cols()));
         }
@@ -952,28 +930,24 @@ public:
         if (P == Precision::F16)
         {
             auto a32 = cast(*a_gpu, Precision::F32);
-            if (!a32) return std::unexpected(a32.error());
+            NN_TRY_CHECK(a32);
             auto b32 = cast(*b_gpu, Precision::F32);
-            if (!b32) return std::unexpected(b32.error());
-
+            NN_TRY_CHECK(b32);
             auto a32_gpu = import(*a32);
-            if (!a32_gpu) return std::unexpected(a32_gpu.error());
+            NN_TRY_CHECK(a32_gpu);
             auto b32_gpu = import(*b32);
-            if (!b32_gpu) return std::unexpected(b32_gpu.error());
-
+            NN_TRY_CHECK(b32_gpu);
             auto r = backend_.batched_matmul_gpu(
                 a32_gpu->gpu_tensor(), b32_gpu->gpu_tensor(),
                 static_cast<uint32_t>(batch),
                 transA ? 1u : 0u, transB ? 1u : 0u,
                 static_cast<float>(alpha));
-            if (!r)
-                return std::unexpected(r.error());
-
+            NN_TRY_CHECK(r);
             Tensor result_f32 = Tensor::from_gpu(std::move(*r));
             return cast(result_f32, Precision::F16);
         }
 
-        return std::unexpected(Error{"batched_matmul: unsupported precision"});
+        NN_FAIL("batched_matmul: unsupported precision");
     }
 
     // A += B：真原地，直接写回 A 的 buffer（与 CpuEngine 语义一致）
@@ -982,13 +956,11 @@ public:
     [[nodiscard]] Result<void> add_inplace_impl(Tensor& A, const Tensor& B) override
     {
         if (A.rows() != B.rows() || A.cols() != B.cols())
-            return std::unexpected(Error{"add_inplace: shape mismatch"});
-
+            NN_FAIL("add_inplace: shape mismatch");
         auto a_gpu = import(A);
-        if (!a_gpu) return std::unexpected(a_gpu.error());
+        NN_TRY_CHECK(a_gpu);
         auto b_gpu = import(B);
-        if (!b_gpu) return std::unexpected(b_gpu.error());
-
+        NN_TRY_CHECK(b_gpu);
         // Phase C1b：目标 A 是 f16 → f16 pipeline 原地直加（A 自身永不物化
         // f32 副本，A 的 f32 副本正是 in-place 路径的瞬态开销大头）。
         //   · B 同 f16 → 零副本直加；
@@ -1001,7 +973,7 @@ public:
             if (b_gpu->precision() != Precision::F16)
             {
                 auto c = cast(*b_gpu, Precision::F16);
-                if (!c) return std::unexpected(c.error());
+                NN_TRY_CHECK(c);
                 b16 = std::move(*c);
             }
             const GpuTensor& b_ref = b16 ? f16_view(*b16) : f16_view(*b_gpu);
@@ -1011,8 +983,7 @@ public:
                 a_ref, &b_ref, nullptr,
                 count16, 1u, 0u, 0u, 0u, 0.0f, 0.0f, 0.0f,
                 &a_ref, /*f16_io=*/true);  // BINARY, Add, 原地写回 A
-            if (!r)
-                return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             if (A.is_cpu())
                 A = std::move(*a_gpu);
             return {};
@@ -1021,12 +992,12 @@ public:
         {
             // 无 f16 pipeline：A 抬 f32 → 加 → 写回 A（边界 cast 路径内聚在引擎）
             auto a32 = cast(*a_gpu, Precision::F32);
-            if (!a32) return std::unexpected(a32.error());
+            NN_TRY_CHECK(a32);
             std::optional<Tensor> b32;
             if (b_gpu->precision() != Precision::F32)
             {
                 auto c = cast(*b_gpu, Precision::F32);
-                if (!c) return std::unexpected(c.error());
+                NN_TRY_CHECK(c);
                 b32 = std::move(*c);
             }
             const GpuTensor& b_ref2 = b32 ? b32->gpu_tensor() : b_gpu->gpu_tensor();
@@ -1035,8 +1006,7 @@ public:
                 a32->gpu_tensor(), &b_ref2, nullptr,
                 cnt, 1u, 0u, 0u, 0u, 0.0f, 0.0f, 0.0f,
                 &a32->gpu_tensor());
-            if (!r)
-                return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             return cast_into(*a32, A);   // f32 结果写回 A 的 f16 原存储
         }
 
@@ -1045,13 +1015,13 @@ public:
         if (b_gpu->precision() == Precision::F16)
         {
             auto b32 = cast(*b_gpu, Precision::F32);
-            if (!b32) return std::unexpected(b32.error());
+            NN_TRY_CHECK(b32);
             const uint32_t cnt = static_cast<uint32_t>(A.rows() * A.cols());
             auto r = backend_.elementwise_v2_gpu(
                 a_gpu->gpu_tensor(), &b32->gpu_tensor(), nullptr,
                 cnt, 1u, 0u, 0u, 0u, 0.0f, 0.0f, 0.0f,
                 &a_gpu->gpu_tensor());
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             if (A.is_cpu()) A = std::move(*a_gpu);
             return {};
         }
@@ -1061,8 +1031,7 @@ public:
             a_gpu->gpu_tensor(), &b_gpu->gpu_tensor(), nullptr,
             count, 1u, 0u, 0u, 0u, 0.0f, 0.0f, 0.0f,
             &a_gpu->gpu_tensor());  // BINARY, Add, 原地写回 A
-        if (!r)
-            return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         // 原地模式下 A 的 buffer 已被更新；若 import 上传了新 Tensor（防御路径），替换 A
         if (A.is_cpu())
             A = std::move(*a_gpu);
@@ -1073,8 +1042,7 @@ public:
     [[nodiscard]] Result<void> scale_inplace_impl(Tensor& A, Scalar s) override
     {
         auto a_gpu = import(A);
-        if (!a_gpu) return std::unexpected(a_gpu.error());
-
+        NN_TRY_CHECK(a_gpu);
         // Phase C1b：f16 → f16 pipeline 原地缩放（A 永不物化 f32 副本）；
         // 无 pipeline → 引擎内回退（抬 f32 → 缩放 → 写回）
         if (a_gpu->precision() == Precision::F16)
@@ -1087,17 +1055,17 @@ public:
                     a_ref, nullptr, nullptr,
                     cnt, 1u, 2u, 0u, 1u, static_cast<float>(s), 0.0f, 0.0f,
                     &a_ref, /*f16_io=*/true);
-                if (!r) return std::unexpected(r.error());
+                NN_TRY_CHECK(r);
                 if (A.is_cpu()) A = std::move(*a_gpu);
                 return {};
             }
             auto a32 = cast(*a_gpu, Precision::F32);
-            if (!a32) return std::unexpected(a32.error());
+            NN_TRY_CHECK(a32);
             auto r = backend_.elementwise_v2_gpu(
                 a32->gpu_tensor(), nullptr, nullptr,
                 cnt, 1u, 2u, 0u, 1u, static_cast<float>(s), 0.0f, 0.0f,
                 &a32->gpu_tensor());
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             return cast_into(*a32, A);
         }
 
@@ -1107,8 +1075,7 @@ public:
             a_gpu->gpu_tensor(), nullptr, nullptr,
             count, 1u, 2u, 0u, 1u, static_cast<float>(s), 0.0f, 0.0f,
             &a_gpu->gpu_tensor());  // 原地写回 A
-        if (!r)
-            return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         if (A.is_cpu())
             A = std::move(*a_gpu);
         return {};
@@ -1118,17 +1085,16 @@ public:
     [[nodiscard]] Result<void> zero_impl(Tensor& A) override
     {
         auto a_gpu = import(A);
-        if (!a_gpu) return std::unexpected(a_gpu.error());
+        NN_TRY_CHECK(a_gpu);
         if (a_gpu->precision() == Precision::F16)   // vkCmdFillBuffer 字节级 → f16 原生可用
         {
             auto r16 = backend_.fill_zero_gpu(a_gpu->gpu_tensor<Precision::F16>());
-            if (!r16) return std::unexpected(r16.error());
+            NN_TRY_CHECK(r16);
             if (A.is_cpu()) A = std::move(*a_gpu);
             return {};
         }
         auto r = backend_.fill_zero_gpu(a_gpu->gpu_tensor());
-        if (!r)
-            return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         // fill_zero 修改的是 GPU buffer 本身，Tensor 的 shared_ptr 不变
         // 但若 import 上传了新 Tensor，需要替换 A
         if (A.is_cpu())
@@ -1162,13 +1128,13 @@ public:
         const Tensor& boundary, bool has_bnd,
         Precision prec = Precision::F32) override
     {
-        auto k = import(K); if (!k) return std::unexpected(k.error());
-        auto v = import(V); if (!v) return std::unexpected(v.error());
-        auto p = import(P); if (!p) return std::unexpected(p.error());
-        auto r = import(R); if (!r) return std::unexpected(r.error());
-        auto a = import(A0); if (!a) return std::unexpected(a.error());
-        auto b = import(B0); if (!b) return std::unexpected(b.error());
-        auto bn = import(boundary); if (!bn) return std::unexpected(bn.error());
+        NN_TRY(k, import(K));
+        NN_TRY(v, import(V));
+        NN_TRY(p, import(P));
+        NN_TRY(r, import(R));
+        NN_TRY(a, import(A0));
+        NN_TRY(b, import(B0));
+        NN_TRY(bn, import(boundary));
         const bool all_f16 = k->precision() == Precision::F16 &&
             v->precision() == Precision::F16 && p->precision() == Precision::F16 &&
             r->precision() == Precision::F16 && a->precision() == Precision::F16 &&
@@ -1183,24 +1149,24 @@ public:
                 f16_view(*a), f16_view(*b), has_state,
                 static_cast<uint32_t>(dk), static_cast<uint32_t>(heads), causal,
                 f16_view(*bn), has_bnd, /*f16_io=*/true);
-            if (!res) return std::unexpected(res.error());
+            NN_TRY_CHECK(res);
             return Tensor::from_gpu(
                 GpuTensorF16(res->shared_buffer(), res->rows(), res->cols()));
         }
         // 引擎内 cast 回退（混合精度或无 f16 pipeline）：f16 侧抬 f32
-        auto k32 = cast_if_f16(*k); if (!k32) return std::unexpected(k32.error());
-        auto v32 = cast_if_f16(*v); if (!v32) return std::unexpected(v32.error());
-        auto p32 = cast_if_f16(*p); if (!p32) return std::unexpected(p32.error());
-        auto r32 = cast_if_f16(*r); if (!r32) return std::unexpected(r32.error());
-        auto a32 = cast_if_f16(*a); if (!a32) return std::unexpected(a32.error());
-        auto b32 = cast_if_f16(*b); if (!b32) return std::unexpected(b32.error());
-        auto n32 = cast_if_f16(*bn); if (!n32) return std::unexpected(n32.error());
+        NN_TRY(k32, cast_if_f16(*k));
+        NN_TRY(v32, cast_if_f16(*v));
+        NN_TRY(p32, cast_if_f16(*p));
+        NN_TRY(r32, cast_if_f16(*r));
+        NN_TRY(a32, cast_if_f16(*a));
+        NN_TRY(b32, cast_if_f16(*b));
+        NN_TRY(n32, cast_if_f16(*bn));
         auto res = backend_.scan_prefix_outer_gpu(
             k32->gpu_tensor(), v32->gpu_tensor(), p32->gpu_tensor(), r32->gpu_tensor(),
             a32->gpu_tensor(), b32->gpu_tensor(), has_state,
             static_cast<uint32_t>(dk), static_cast<uint32_t>(heads), causal,
             n32->gpu_tensor(), has_bnd);
-        if (!res) return std::unexpected(res.error());
+        NN_TRY_CHECK(res);
         return Tensor::from_gpu(std::move(*res));
     }
 
@@ -1210,10 +1176,10 @@ public:
         const Tensor& boundary, bool has_bnd,
         Precision prec = Precision::F32) override
     {
-        auto d = import(D); if (!d) return std::unexpected(d.error());
-        auto x = import(X); if (!x) return std::unexpected(x.error());
-        auto y = import(Y); if (!y) return std::unexpected(y.error());
-        auto bn = import(boundary); if (!bn) return std::unexpected(bn.error());
+        NN_TRY(d, import(D));
+        NN_TRY(x, import(X));
+        NN_TRY(y, import(Y));
+        NN_TRY(bn, import(boundary));
         const bool all_f16 = d->precision() == Precision::F16 &&
             x->precision() == Precision::F16 && y->precision() == Precision::F16 &&
             bn->precision() == Precision::F16;
@@ -1223,19 +1189,19 @@ public:
                 f16_view(*d), f16_view(*x), f16_view(*y),
                 static_cast<uint32_t>(dk), static_cast<uint32_t>(heads), causal,
                 f16_view(*bn), has_bnd, /*f16_io=*/true);
-            if (!res) return std::unexpected(res.error());
+            NN_TRY_CHECK(res);
             return Tensor::from_gpu(
                 GpuTensorF16(res->shared_buffer(), res->rows(), res->cols()));
         }
-        auto d32 = cast_if_f16(*d); if (!d32) return std::unexpected(d32.error());
-        auto x32 = cast_if_f16(*x); if (!x32) return std::unexpected(x32.error());
-        auto y32 = cast_if_f16(*y); if (!y32) return std::unexpected(y32.error());
-        auto n32 = cast_if_f16(*bn); if (!n32) return std::unexpected(n32.error());
+        NN_TRY(d32, cast_if_f16(*d));
+        NN_TRY(x32, cast_if_f16(*x));
+        NN_TRY(y32, cast_if_f16(*y));
+        NN_TRY(n32, cast_if_f16(*bn));
         auto res = backend_.scan_suffix_outer_gpu(
             d32->gpu_tensor(), x32->gpu_tensor(), y32->gpu_tensor(),
             static_cast<uint32_t>(dk), static_cast<uint32_t>(heads), causal,
             n32->gpu_tensor(), has_bnd);
-        if (!res) return std::unexpected(res.error());
+        NN_TRY_CHECK(res);
         return Tensor::from_gpu(std::move(*res));
     }
 
@@ -1244,9 +1210,9 @@ public:
         std::size_t dk, bool has_scale,
         Precision prec = Precision::F32) override
     {
-        auto p = import(P); if (!p) return std::unexpected(p.error());
-        auto r = import(R); if (!r) return std::unexpected(r.error());
-        auto s = import(S); if (!s) return std::unexpected(s.error());
+        NN_TRY(p, import(P));
+        NN_TRY(r, import(R));
+        NN_TRY(s, import(S));
         const bool all_f16 = p->precision() == Precision::F16 &&
             r->precision() == Precision::F16 && s->precision() == Precision::F16;
         if (prec == Precision::F16 && all_f16 &&
@@ -1255,17 +1221,17 @@ public:
             auto res = backend_.outer_col_gpu(
                 f16_view(*p), f16_view(*r), f16_view(*s),
                 static_cast<uint32_t>(dk), has_scale, /*f16_io=*/true);
-            if (!res) return std::unexpected(res.error());
+            NN_TRY_CHECK(res);
             return Tensor::from_gpu(
                 GpuTensorF16(res->shared_buffer(), res->rows(), res->cols()));
         }
-        auto p32 = cast_if_f16(*p); if (!p32) return std::unexpected(p32.error());
-        auto r32 = cast_if_f16(*r); if (!r32) return std::unexpected(r32.error());
-        auto s32 = cast_if_f16(*s); if (!s32) return std::unexpected(s32.error());
+        NN_TRY(p32, cast_if_f16(*p));
+        NN_TRY(r32, cast_if_f16(*r));
+        NN_TRY(s32, cast_if_f16(*s));
         auto res = backend_.outer_col_gpu(
             p32->gpu_tensor(), r32->gpu_tensor(), s32->gpu_tensor(),
             static_cast<uint32_t>(dk), has_scale);
-        if (!res) return std::unexpected(res.error());
+        NN_TRY_CHECK(res);
         return Tensor::from_gpu(std::move(*res));
     }
 
@@ -1280,7 +1246,7 @@ public:
         const Tensor& A, uint32_t mode, uint32_t reduce_op)
     {
         auto a_gpu = import(A);
-        if (!a_gpu) return std::unexpected(a_gpu.error());
+        NN_TRY_CHECK(a_gpu);
         if (a_gpu->precision() == Precision::F16)
         {
             // f16 张量必须经 f16_view（gpu_tensor() 默认 P=F32 → 读 f16 buffer
@@ -1290,9 +1256,9 @@ public:
                                            /*f16_in=*/true);
             // 引擎内边界 cast（无 f16 pipeline 的设备）
             auto a32 = cast(*a_gpu, Precision::F32);
-            if (!a32) return std::unexpected(a32.error());
+            NN_TRY_CHECK(a32);
             auto a32_gpu = import(*a32);
-            if (!a32_gpu) return std::unexpected(a32_gpu.error());
+            NN_TRY_CHECK(a32_gpu);
             return backend_.reduce_gpu(a32_gpu->gpu_tensor(), mode, reduce_op);
         }
         return backend_.reduce_gpu(a_gpu->gpu_tensor(), mode, reduce_op);
@@ -1301,21 +1267,21 @@ public:
     [[nodiscard]] Result<Tensor> row_reduce_sum_impl(const Tensor& A, Precision = Precision::F32) override
     {
         auto r = reduce_f16_or_cast_(A, /*mode=*/0u, /*reduce_op=*/0u);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return Tensor::from_gpu(std::move(*r));
     }
 
     [[nodiscard]] Result<Tensor> col_reduce_sum_impl(const Tensor& A, Precision = Precision::F32) override
     {
         auto r = reduce_f16_or_cast_(A, /*mode=*/1u, /*reduce_op=*/0u);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return Tensor::from_gpu(std::move(*r));
     }
 
     [[nodiscard]] Result<Tensor> col_reduce_max_impl(const Tensor& A, Precision = Precision::F32) override
     {
         auto r = reduce_f16_or_cast_(A, /*mode=*/1u, /*reduce_op=*/1u);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return Tensor::from_gpu(std::move(*r));
     }
 
@@ -1350,7 +1316,7 @@ public:
         for (const auto& t : ts)
         {
             auto g = import(t);
-            if (!g) return std::unexpected(g.error());
+            NN_TRY_CHECK(g);
             if (g->precision() == Precision::F16)
                 out.bufs.push_back(&g->gpu_tensor<Precision::F16>().buffer());
             else
@@ -1440,7 +1406,7 @@ public:
             if (ffs && backend_.has_fused_shader(ffs->key))
             {
                 auto fi_r = fused_buffers_(inputs);
-                if (!fi_r) return std::unexpected(fi_r.error());
+                NN_TRY_CHECK(fi_r);
                 std::vector<const GpuBuffer*>& gpu_inputs = fi_r->bufs;
                 const auto fvp = nn::expr_spec_runtime_view_params(raw_spec);
                 const bool fout_f16 = nn::expr_variant_out_f16(ffs->prec_sig, fpsig);
@@ -1454,7 +1420,7 @@ public:
                     nn::expr_spec_runtime_matmul_batch(raw_spec),
                     /*matmul_trans=*/0u,
                     nn::expr_spec_runtime_fold_k(raw_spec), fout_f16, fpsig);
-                if (!out) return std::unexpected(out.error());
+                NN_TRY_CHECK(out);
                 // f16 输出：按 2B/元素分配后重贴 GpuTensorF16（同非 fold 路径）
                 if (fout_f16)
                     return Tensor::from_gpu(
@@ -1462,9 +1428,7 @@ public:
                 return Tensor::from_gpu(std::move(*out));
             }
 #endif
-            return std::unexpected(Error{
-                "GpuEngine::eval_expr: fold 表达式未命中 AOT 融合 shader"
-                "（闭合世界）；请将该 fold 结构纳入 scan_exprs；key=" + fkey});
+            NN_FAIL("GpuEngine::eval_expr: fold 表达式未命中 AOT 融合 shader"                 "（闭合世界）；请将该 fold 结构纳入 scan_exprs；key=" + fkey);
         }
         // ── canonical IR：canonicalize 为引擎内部优化（IR-A/IR-B），
         //    key 与 shader 合成两端一致；dispatch 用 canonical 的 consts ──
@@ -1490,7 +1454,7 @@ public:
             // 命中：收集 GPU 输入（同一 buffer 可重复绑定，如 RoPE 的 q×2）
             // GpuTensor 内部为 shared_ptr<GpuBuffer>，拷贝即共享，零成本
             auto fi_r = fused_buffers_(inputs);
-            if (!fi_r) return std::unexpected(fi_r.error());
+            NN_TRY_CHECK(fi_r);
             std::vector<const GpuBuffer*>& gpu_inputs = fi_r->bufs;   // owners 随 fi_r 存活到本作用域末
             // 运行时视图参数（RowMod 周期 / RotateHalf 块大小）：
             // 同结构不同形状共享一个融合 shader，按实际 spec 填充 vp 槽
@@ -1508,7 +1472,7 @@ public:
                 nn::expr_spec_runtime_matmul_batch(spec),
                 nn::expr_spec_runtime_matmul_trans(spec),
                 /*fold_k=*/std::nullopt, out_f16, psig);
-            if (!out) return std::unexpected(out.error());
+            NN_TRY_CHECK(out);
             if (out_f16)
                 return Tensor::from_gpu(GpuTensorF16(out->shared_buffer(), rows, cols));
             return Tensor::from_gpu(std::move(*out));
@@ -1519,17 +1483,11 @@ public:
         // f32 shader 上（静默错值）→ 明确报错，明确报错（NVI 入口本应已拦截——能力查询
         // 与 shader 查询不一致时才会到这里）。
         if (psig != 0)
-            return std::unexpected(Error{
-                "GpuEngine::eval_expr: 该 (结构,精度) 变体未预生成（in-kernel f16 覆盖不足）"
-                "；NVI 入口本应在此前抬到 f32（supports_expr_precision_variant 与 shader 查询不一致）"
-                "；key=" + key});
+            NN_FAIL("GpuEngine::eval_expr: 该 (结构,精度) 变体未预生成（in-kernel f16 覆盖不足）"                 "；NVI 入口本应在此前抬到 f32（supports_expr_precision_variant 与 shader 查询不一致）"                 "；key=" + key);
         // ── 闭合世界：未命中任何 AOT 融合 shader → 硬报错（绝不静默回退） ──
         // 带上 key：闭合世界报错必须可定位——key 是登记/查表两侧的唯一标识，
         // 可用来查 fused_registry.hpp 里有没有该条目、以及它属于哪个 Layer 路径。
-        return std::unexpected(Error{
-            "GpuEngine::eval_expr: 未找到该内联表达式的 AOT 融合 shader（闭合世界）；"
-            "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）；"
-            "key=" + key});
+        NN_FAIL("GpuEngine::eval_expr: 未找到该内联表达式的 AOT 融合 shader（闭合世界）；"             "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）；"             "key=" + key);
     }
 
     // ── 归约向量原生形状输出（LayerNorm/RMSNorm 小向量缓存） ────────
@@ -1585,8 +1543,7 @@ public:
         // fold 形态只经 eval_expr（PC 需 fold_k，本入口不传）——显式拒绝，
         //   否则落到 run_fused_gpu 的通用缺参错误，误导排查方向
         if (raw_spec.fold)
-            return std::unexpected(Error{
-                "GpuEngine::eval_expr_reduce: fold 表达式请走 eval_expr（需 fold_k 形态参数）"});
+            NN_FAIL("GpuEngine::eval_expr_reduce: fold 表达式请走 eval_expr（需 fold_k 形态参数）");
         // canonical IR：与 eval_expr 同（canonicalize 为引擎内部优化）
         const ExprSpec spec = nn::canonicalize_expr_spec(raw_spec);
 
@@ -1603,10 +1560,7 @@ public:
         if (!spec.instrs.empty() &&
             !expr_op_is_reduce(static_cast<ExprOp>(spec.instrs.back().op)))
         {
-            return std::unexpected(Error{
-                "GpuEngine::eval_expr_reduce: 归约向量输出的表达式末指令必须是归约指令"
-                "（归约后逐元素后处理在归约融合 shader 中尚未正确实现）；"
-                "请拆成两步：compute_reduce 取归约向量，再用 dsl::compute 做后处理"});
+            NN_FAIL("GpuEngine::eval_expr_reduce: 归约向量输出的表达式末指令必须是归约指令"                 "（归约后逐元素后处理在归约融合 shader 中尚未正确实现）；"                 "请拆成两步：compute_reduce 取归约向量，再用 dsl::compute 做后处理");
         }
 
         const std::string key = nn::expr_spec_key(spec);
@@ -1620,7 +1574,7 @@ public:
         if (fs && backend_.has_fused_shader(fs->key))
         {
             auto fi_r = fused_buffers_(inputs);
-            if (!fi_r) return std::unexpected(fi_r.error());
+            NN_TRY_CHECK(fi_r);
             std::vector<const GpuBuffer*>& gpu_inputs = fi_r->bufs;   // owners 随 fi_r 存活到本作用域末
             const auto vp = nn::expr_spec_runtime_view_params(spec);
             const bool out_f16 = nn::expr_variant_out_f16(fs->prec_sig, psig);
@@ -1631,7 +1585,7 @@ public:
                 nn::expr_spec_runtime_matmul_batch(spec),
                 nn::expr_spec_runtime_matmul_trans(spec),
                 std::nullopt, out_f16, psig);
-            if (!out) return std::unexpected(out.error());
+            NN_TRY_CHECK(out);
             if (out_f16)
             {
                 // 归约向量原生形状：(rows,1)（行）/ (1,cols)（列）
@@ -1644,14 +1598,9 @@ public:
         }
 #endif
         if (psig != 0)
-            return std::unexpected(Error{
-                "GpuEngine::eval_expr_reduce: 该 (结构,精度) 变体未预生成（in-kernel f16 覆盖不足）"
-                "；NVI 入口本应在此前抬到 f32（supports_expr_precision_variant 与 shader 查询不一致）"});
+            NN_FAIL("GpuEngine::eval_expr_reduce: 该 (结构,精度) 变体未预生成（in-kernel f16 覆盖不足）"                 "；NVI 入口本应在此前抬到 f32（supports_expr_precision_variant 与 shader 查询不一致）");
         // ── 闭合世界：未命中归约融合 shader → 硬报错（绝不静默回退） ──
-        return std::unexpected(Error{
-            "GpuEngine::eval_expr_reduce: 未找到该归约表达式的 AOT 融合 shader（闭合世界）；"
-            "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）；"
-            "key=" + key});
+        NN_FAIL("GpuEngine::eval_expr_reduce: 未找到该归约表达式的 AOT 融合 shader（闭合世界）；"             "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）；"             "key=" + key);
     }
 
     // ── 目标传递（destination-passing）：结果直接写回已有张量 ─────────────
@@ -1665,16 +1614,13 @@ public:
         std::size_t rows, std::size_t cols, Tensor& dst) override
     {
         if (dst.rows() != rows || dst.cols() != cols)
-            return std::unexpected(Error{"eval_expr_into: dst shape mismatch"});
-
+            NN_FAIL("eval_expr_into: dst shape mismatch");
         // fold 形态只经 eval_expr（PC 需 fold_k，本入口不传）——显式拒绝
         if (raw_spec.fold)
-            return std::unexpected(Error{
-                "GpuEngine::eval_expr_into: fold 表达式请走 eval_expr（需 fold_k 形态参数）"});
+            NN_FAIL("GpuEngine::eval_expr_into: fold 表达式请走 eval_expr（需 fold_k 形态参数）");
         const ExprSpec spec = nn::canonicalize_expr_spec(raw_spec);
         if (nn::expr_spec_reduce_axis(spec) != -1)
-            return std::unexpected(Error{
-                "eval_expr_into: 仅支持逐元素表达式（无归约）"});
+            NN_FAIL("eval_expr_into: 仅支持逐元素表达式（无归约）");
         const std::string key = nn::expr_spec_key(spec);
         // 变体优先（`#a` native16 → `#x` 运行期分派）：目标精度 = dst.precision()
         const nn::ExprPrecSig psig =
@@ -1686,10 +1632,10 @@ public:
         if (fs && backend_.has_fused_shader(fs->key))
         {
             auto fi_r = fused_buffers_(inputs);
-            if (!fi_r) return std::unexpected(fi_r.error());
+            NN_TRY_CHECK(fi_r);
             std::vector<const GpuBuffer*>& gpu_inputs = fi_r->bufs;   // owners 随 fi_r 存活到本作用域末
             auto dst_gpu = import(dst);
-            if (!dst_gpu) return std::unexpected(dst_gpu.error());
+            NN_TRY_CHECK(dst_gpu);
             // ── output_override 必须按目标存储精度取视图 ──────────────────
             // f16 目标必须经 f16_view 包 f16 buffer（同 run_fused_gpu 的
             // out_f16 做法）：按默认 F32 取 gpu_tensor() 会得到空
@@ -1702,18 +1648,14 @@ public:
             if (dst_gpu->precision() == Precision::F16)
             {
                 if (!dst_gpu->gpu_shared<Precision::F16>())
-                    return std::unexpected(Error{
-                        "eval_expr_into: f16 目标缺少 f16 GPU 存储"
-                        "（precision 标签与 variant 存储不一致）"});
+                    NN_FAIL("eval_expr_into: f16 目标缺少 f16 GPU 存储"                         "（precision 标签与 variant 存储不一致）");
                 dst_view = f16_view(*dst_gpu);
                 dst_override = &*dst_view;
             }
             else
             {
                 if (!dst_gpu->gpu_shared<Precision::F32>())
-                    return std::unexpected(Error{
-                        "eval_expr_into: f32 目标缺少 f32 GPU 存储"
-                        "（precision 标签与 variant 存储不一致）"});
+                    NN_FAIL("eval_expr_into: f32 目标缺少 f32 GPU 存储"                         "（precision 标签与 variant 存储不一致）");
                 dst_override = &dst_gpu->gpu_tensor();
             }
             const auto vp = nn::expr_spec_runtime_view_params(spec);
@@ -1724,7 +1666,7 @@ public:
                 nn::expr_spec_runtime_matmul_batch(spec),
                 nn::expr_spec_runtime_matmul_trans(spec),
                 /*fold_k=*/std::nullopt, /*out_f16=*/false, psig);
-            if (!out) return std::unexpected(out.error());
+            NN_TRY_CHECK(out);
             // dst 原为 CPU staging 时，import 上传了新 buffer（结果在它上面）
             // → 用 upload 后的张量替换 dst，保证调用方看到更新后的数据
             if (dst.is_cpu())
@@ -1733,14 +1675,9 @@ public:
         }
 #endif
         if (psig != 0)
-            return std::unexpected(Error{
-                "GpuEngine::eval_expr_into: 该 (结构,精度) 变体未预生成（in-kernel f16 覆盖不足）"
-                "；NVI 入口本应在此前抬到 f32（supports_expr_precision_variant 与 shader 查询不一致）"});
+            NN_FAIL("GpuEngine::eval_expr_into: 该 (结构,精度) 变体未预生成（in-kernel f16 覆盖不足）"                 "；NVI 入口本应在此前抬到 f32（supports_expr_precision_variant 与 shader 查询不一致）");
         // ── 闭合世界：未命中 AOT 融合 shader → 硬报错（绝不静默回退） ──
-        return std::unexpected(Error{
-            "GpuEngine::eval_expr_into: 未找到该表达式的 AOT 融合 shader（闭合世界）；"
-            "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）；"
-            "key=" + key});
+        NN_FAIL("GpuEngine::eval_expr_into: 未找到该表达式的 AOT 融合 shader（闭合世界）；"             "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）；"             "key=" + key);
     }
 
 private:
@@ -1774,17 +1711,15 @@ private:
             return cast(src, P);            // 同设备异精度 = 引擎内 cast
         }
         if (!src.valid())
-            return std::unexpected(Error{"import: invalid tensor"});
+            NN_FAIL("import: invalid tensor");
         if (src.precision() == Precision::F32 && P == Precision::F32)
         {
             auto r = GpuTensor::from_matrix(src.cpu_matrix(), backend_);
-            if (!r)
-                return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             return Tensor::from_gpu(std::move(*r));
         }
         auto m = to_matrix(src, Precision::F32);
-        if (!m)
-            return std::unexpected(m.error());
+        NN_TRY_CHECK(m);
         return from_matrix(*m, P);
     }
 };

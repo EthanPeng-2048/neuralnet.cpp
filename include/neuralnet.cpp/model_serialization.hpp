@@ -81,7 +81,7 @@ template <typename T>
 [[nodiscard]] inline Result<void> write_bytes(std::ofstream &ofs, const T &v)
 {
     if (!nn::write_pod(ofs, v))
-        return std::unexpected(Error{"Write error"});
+        NN_FAIL("Write error");
     return {};
 }
 
@@ -91,7 +91,7 @@ template <typename T>
 {
     T v{};
     if (!nn::read_pod(ifs, v))
-        return std::unexpected(Error{"Unexpected end of file"});
+        NN_FAIL("Unexpected end of file");
     return v;
 }
 
@@ -132,7 +132,7 @@ template <typename Tuple, std::size_t I, std::size_t... Rest>
 {
     using T = std::tuple_element_t<I, Tuple>;
     auto r = read_bytes<T>(ifs);
-    if (!r) return std::unexpected(r.error());
+    NN_TRY_CHECK(r);
     std::get<I>(values) = *r;
     return read_fields_rec(ifs, values, std::index_sequence<Rest...>{});
 }
@@ -144,7 +144,7 @@ template <typename... Ts>
     std::tuple<Ts...> values{};
     auto result = detail_read::read_fields_rec<std::tuple<Ts...>>(
         ifs, values, std::index_sequence_for<Ts...>{});
-    if (!result) return std::unexpected(result.error());
+    NN_TRY_CHECK(result);
     return values;
 }
 
@@ -154,30 +154,24 @@ template <typename... Ts>
 [[nodiscard]] inline Result<void> write_matrix_v5(std::ofstream &ofs, const Matrix &m, Precision p)
 {
     // 写入 precision tag（§11.3）
-    if (auto r = write_bytes<uint8_t>(ofs, precision_tag(p)); !r)
-        return std::unexpected(r.error());
+    NN_TRY(r, write_bytes<uint8_t>(ofs, precision_tag(p)));
     // 写入形状
-    if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.rows())); !r)
-        return std::unexpected(r.error());
-    if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.cols())); !r)
-        return std::unexpected(r.error());
+    NN_TRY(r2, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.rows())));
+    NN_TRY(r3, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.cols())));
     // 写入数据
     if (!nn::write_pod_span(ofs, m.span()))
-        return std::unexpected(Error{"Write error while writing matrix data"});
+        NN_FAIL("Write error while writing matrix data");
     return {};
 }
 
 // v5：写入 f16 矩阵
 [[nodiscard]] inline Result<void> write_matrix_fp16(std::ofstream &ofs, const MatrixT<Precision::F16> &m)
 {
-    if (auto r = write_bytes<uint8_t>(ofs, precision_tag(Precision::F16)); !r)
-        return std::unexpected(r.error());
-    if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.rows())); !r)
-        return std::unexpected(r.error());
-    if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.cols())); !r)
-        return std::unexpected(r.error());
+    NN_TRY(r, write_bytes<uint8_t>(ofs, precision_tag(Precision::F16)));
+    NN_TRY(r2, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.rows())));
+    NN_TRY(r3, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.cols())));
     if (!nn::write_pod_span(ofs, m.span()))
-        return std::unexpected(Error{"Write error while writing f16 matrix data"});
+        NN_FAIL("Write error while writing f16 matrix data");
     return {};
 }
 
@@ -186,16 +180,15 @@ template <typename... Ts>
 {
     // 读取 precision tag
     auto tag_r = read_bytes<uint8_t>(ifs);
-    if (!tag_r) return std::unexpected(tag_r.error());
+    NN_TRY_CHECK(tag_r);
     Precision p = precision_from_tag(*tag_r);
     if (p != Precision::F32 && p != Precision::F16)
-        return std::unexpected(Error{"Unsupported precision tag in v5: " + std::to_string(*tag_r)});
-
+        NN_FAIL("Unsupported precision tag in v5: " + std::to_string(*tag_r));
     // 读取形状
     auto rows_r = read_bytes<uint64_t>(ifs);
-    if (!rows_r) return std::unexpected(rows_r.error());
+    NN_TRY_CHECK(rows_r);
     auto cols_r = read_bytes<uint64_t>(ifs);
-    if (!cols_r) return std::unexpected(cols_r.error());
+    NN_TRY_CHECK(cols_r);
     const auto rows = static_cast<std::size_t>(*rows_r);
     const auto cols = static_cast<std::size_t>(*cols_r);
 
@@ -212,17 +205,15 @@ template <typename... Ts>
         ifs.seekg(0, std::ios::end);
         const std::streampos end = ifs.tellg();
         if (pos < 0 || end < pos)
-            return std::unexpected(Error{"Cannot determine file size while reading matrix"});
+            NN_FAIL("Cannot determine file size while reading matrix");
         ifs.seekg(pos);
         if (!ifs)
-            return std::unexpected(Error{"Stream seek failed while reading matrix"});
+            NN_FAIL("Stream seek failed while reading matrix");
         const auto remaining = static_cast<std::uint64_t>(end - pos);
         const std::uint64_t elem_bytes = (p == Precision::F16) ? 2u : 4u;
         const std::uint64_t max_elems = remaining / elem_bytes;
         if (rows != 0 && cols != 0 && static_cast<std::uint64_t>(rows) > max_elems / cols)
-            return std::unexpected(Error{
-                "Matrix shape " + std::to_string(rows) + "x" + std::to_string(cols)
-                + " exceeds remaining file bytes; file is corrupt or malicious"});
+            NN_FAIL("Matrix shape " + std::to_string(rows) + "x" + std::to_string(cols)                 + " exceeds remaining file bytes; file is corrupt or malicious");
     }
 
     if (p == Precision::F16)
@@ -230,7 +221,7 @@ template <typename... Ts>
         // 读取 f16 数据到临时 buffer，然后转为 f32 Matrix
         std::vector<f16> buf(rows * cols);
         if (!nn::read_pod_span(ifs, std::span<f16>(buf.data(), buf.size())))
-            return std::unexpected(Error{"Unexpected end of file while reading f16 matrix data"});
+            NN_FAIL("Unexpected end of file while reading f16 matrix data");
         // 转为 f32（升 cast，精确无损）
         Matrix m(rows, cols);
         auto span = m.span();
@@ -242,41 +233,36 @@ template <typename... Ts>
     // F32 路径
     Matrix m(rows, cols);
     if (!nn::read_pod_span(ifs, m.span()))
-        return std::unexpected(Error{"Unexpected end of file while reading matrix data"});
+        NN_FAIL("Unexpected end of file while reading matrix data");
     return std::make_pair(Precision::F32, std::move(m));
 }
 
 // ── v4 兼容：无 precision tag 的矩阵读写 ─────────────────────────────────
 [[nodiscard]] inline Result<void> write_matrix(std::ofstream &ofs, const Matrix &m)
 {
-    if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.rows())); !r)
-        return std::unexpected(r.error());
-    if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.cols())); !r)
-        return std::unexpected(r.error());
+    NN_TRY(r, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.rows())));
+    NN_TRY(r2, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.cols())));
     if (!nn::write_pod_span(ofs, m.span()))
-        return std::unexpected(Error{"Write error while writing matrix data"});
+        NN_FAIL("Write error while writing matrix data");
     return {};
 }
 
 [[nodiscard]] inline Result<void> read_matrix(std::ifstream &ifs, Matrix &m)
 {
     auto rows_r = read_bytes<uint64_t>(ifs);
-    if (!rows_r) return std::unexpected(rows_r.error());
+    NN_TRY_CHECK(rows_r);
     auto cols_r = read_bytes<uint64_t>(ifs);
-    if (!cols_r) return std::unexpected(cols_r.error());
+    NN_TRY_CHECK(cols_r);
     const auto rows = static_cast<std::size_t>(*rows_r);
     const auto cols = static_cast<std::size_t>(*cols_r);
 
     if (rows != m.rows() || cols != m.cols())
     {
-        return std::unexpected(Error{
-            "Matrix shape mismatch: expected (" + std::to_string(m.rows())
-            + ", " + std::to_string(m.cols()) + "), got ("
-            + std::to_string(rows) + ", " + std::to_string(cols) + ")"});
+        NN_FAIL("Matrix shape mismatch: expected (" + std::to_string(m.rows())             + ", " + std::to_string(m.cols()) + "), got ("             + std::to_string(rows) + ", " + std::to_string(cols) + ")");
     }
 
     if (!nn::read_pod_span(ifs, m.span()))
-        return std::unexpected(Error{"Unexpected end of file while reading matrix data"});
+        NN_FAIL("Unexpected end of file while reading matrix data");
     return {};
 }
 
@@ -391,11 +377,9 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
     if (kv.get("cnn_paddings", dims)) spec.cnn_paddings  = from_u64_vec(dims);
 
     if (spec.type == ModelType::Unknown)
-        return std::unexpected(Error{"模型文件规格缺少有效的 type 字段"});
+        NN_FAIL("模型文件规格缺少有效的 type 字段");
     if (spec.type == ModelType::Reserved_ZiPT)
-        return std::unexpected(Error{
-            "该模型文件为 AttnZip/ZiPT 架构，已于 2026-10-01 整体移除"
-            "（代码保留在 legacy/zipt 分支；恢复前提见 docs/history.md）"});
+        NN_FAIL("该模型文件为 AttnZip/ZiPT 架构，已于 2026-10-01 整体移除"             "（代码保留在 legacy/zipt 分支；恢复前提见 docs/history.md）");
     return spec;
 }
 
@@ -404,13 +388,12 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
 [[nodiscard]] inline Result<void> write_spec_header(std::ofstream &ofs, const ModelSpec &spec)
 {
     auto bytes = spec_to_kv(spec).serialize();
-    if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(bytes.size())); !r)
-        return std::unexpected(r.error());
+    NN_TRY(r, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(bytes.size())));
     if (!bytes.empty())
     {
         ofs.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
         if (!ofs)
-            return std::unexpected(Error{"Write error while writing spec header"});
+            NN_FAIL("Write error while writing spec header");
     }
     return {};
 }
@@ -423,19 +406,19 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
 [[nodiscard]] inline Result<ModelSpec> read_spec_header(std::ifstream &ifs, uint32_t version)
 {
     auto len_r = read_bytes<uint64_t>(ifs);
-    if (!len_r) return std::unexpected(len_r.error());
+    NN_TRY_CHECK(len_r);
     if (*len_r > kMaxSerializedStringBytes)
-        return std::unexpected(Error{"spec header 长度越界（超过 64 MiB），文件可能损坏或恶意"});
+        NN_FAIL("spec header 长度越界（超过 64 MiB），文件可能损坏或恶意");
     const auto len = static_cast<std::size_t>(*len_r);
     std::string bytes(len, '\0');
     if (len > 0)
     {
         ifs.read(bytes.data(), static_cast<std::streamsize>(len));
         if (!ifs)
-            return std::unexpected(Error{"Unexpected end while reading spec header"});
+            NN_FAIL("Unexpected end while reading spec header");
     }
     auto kv_r = KeyValueRecord::parse(bytes);
-    if (!kv_r) return std::unexpected(kv_r.error());
+    NN_TRY_CHECK(kv_r);
     apply_spec_version_defaults(*kv_r, version);
     return spec_from_kv(*kv_r);
 }
@@ -444,12 +427,9 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
 
 [[nodiscard]] inline Result<void> write_header(std::ofstream &ofs)
 {
-    if (auto r = write_bytes<uint32_t>(ofs, MODEL_MAGIC); !r)
-        return std::unexpected(r.error());
-    if (auto r = write_bytes<uint32_t>(ofs, MODEL_VERSION); !r)
-        return std::unexpected(r.error());
-    if (auto r = write_bytes<uint8_t>(ofs, PRECISION_TAG); !r)
-        return std::unexpected(r.error());
+    NN_TRY(r, write_bytes<uint32_t>(ofs, MODEL_MAGIC));
+    NN_TRY(r2, write_bytes<uint32_t>(ofs, MODEL_VERSION));
+    NN_TRY(r3, write_bytes<uint8_t>(ofs, PRECISION_TAG));
     return {};
 }
 
@@ -458,30 +438,25 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
 [[nodiscard]] inline Result<uint32_t> read_and_validate_header(std::ifstream &ifs)
 {
     auto magic_r = read_bytes<uint32_t>(ifs);
-    if (!magic_r) return std::unexpected(magic_r.error());
+    NN_TRY_CHECK(magic_r);
     if (*magic_r != MODEL_MAGIC)
-        return std::unexpected(Error{"Invalid model file: bad magic number (0x"
-                           + std::to_string(*magic_r) + ")"});
-
+        NN_FAIL("Invalid model file: bad magic number (0x"
+                           + std::to_string(*magic_r) + ")");
     auto version_r = read_bytes<uint32_t>(ifs);
-    if (!version_r) return std::unexpected(version_r.error());
+    NN_TRY_CHECK(version_r);
     const auto version = *version_r;
     if (version < 4)
-        return std::unexpected(Error{"模型文件为旧格式 (v" + std::to_string(version)
-                           + ")，已不再支持；请用当前版本重新训练/保存。"});
+        NN_FAIL("模型文件为旧格式 (v" + std::to_string(version)
+                           + ")，已不再支持；请用当前版本重新训练/保存。");
     if (version > MODEL_VERSION)
-        return std::unexpected(Error{"模型文件版本过新 (v" + std::to_string(version)
-                           + " > v" + std::to_string(MODEL_VERSION) + ")，请升级程序。"});
-
-    // 读取并校验精度标记（v4/v5 通用）
+        NN_FAIL("模型文件版本过新 (v" + std::to_string(version)
+                           + " > v" + std::to_string(MODEL_VERSION) + ")，请升级程序。");
     auto pt_result = read_bytes<uint8_t>(ifs);
     if (!pt_result)
-        return std::unexpected(Error{"Unexpected end: missing precision tag"});
+        NN_FAIL("Unexpected end: missing precision tag");
     uint8_t precision_tag = *pt_result;
     if (precision_tag != PRECISION_TAG)
-        return std::unexpected(Error{
-            "Precision mismatch: file uses " + std::string(precision_tag == 0 ? "f32" : "f64")
-            + ", but build uses " + std::string(PRECISION_TAG == 0 ? "f32" : "f64")});
+        NN_FAIL("Precision mismatch: file uses " + std::string(precision_tag == 0 ? "f32" : "f64")             + ", but build uses " + std::string(PRECISION_TAG == 0 ? "f32" : "f64"));
 
     return version;
 }
@@ -490,13 +465,12 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
 
 [[nodiscard]] inline Result<void> write_tokenizer(std::ofstream &ofs, const std::string &json)
 {
-    if (auto r = write_bytes<uint64_t>(ofs, static_cast<uint64_t>(json.size())); !r)
-        return std::unexpected(r.error());
+    NN_TRY(r, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(json.size())));
     if (!json.empty())
     {
         ofs.write(json.data(), static_cast<std::streamsize>(json.size()));
         if (!ofs)
-            return std::unexpected(Error{"Write error while writing tokenizer"});
+            NN_FAIL("Write error while writing tokenizer");
     }
     return {};
 }
@@ -504,16 +478,16 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
 [[nodiscard]] inline Result<std::string> read_tokenizer(std::ifstream &ifs)
 {
     auto len_r = read_bytes<uint64_t>(ifs);
-    if (!len_r) return std::unexpected(len_r.error());
+    NN_TRY_CHECK(len_r);
     if (*len_r > kMaxSerializedStringBytes)
-        return std::unexpected(Error{"tokenizer 长度越界（超过 64 MiB），文件可能损坏或恶意"});
+        NN_FAIL("tokenizer 长度越界（超过 64 MiB），文件可能损坏或恶意");
     const auto len = static_cast<std::size_t>(*len_r);
     if (len == 0) return std::string{};  // 未嵌入
 
     std::string json(len, '\0');
     ifs.read(json.data(), static_cast<std::streamsize>(len));
     if (!ifs)
-        return std::unexpected(Error{"Unexpected end while reading tokenizer data"});
+        NN_FAIL("Unexpected end while reading tokenizer data");
     return json;
 }
 
@@ -535,13 +509,9 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
 {
     std::ofstream ofs(filename, std::ios::binary);
     if (!ofs)
-        return std::unexpected(Error{"Cannot open file for writing: " + filename});
-
-    if (auto r = detail::write_header(ofs); !r)
-        return std::unexpected(r.error());
-    if (auto r = detail::write_spec_header(ofs, spec); !r)
-        return std::unexpected(r.error());
-
+        NN_FAIL("Cannot open file for writing: " + filename);
+    NN_TRY(r, detail::write_header(ofs));
+    NN_TRY(r2, detail::write_spec_header(ofs, spec));
     auto& engine = model.engine();
     auto params = model.parameters();
     for (auto& p_tensor : params)
@@ -552,22 +522,20 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
             // f16 参数（M1：不再直读存储，统一经引擎下载——CPU/GPU 同路）：
             // 下载为 f32（f16 升位精确无损）→ 转回 f16 落盘，字节与直读一致。
             auto m32_r = engine.to_matrix(p_tensor, Precision::F32);
-            if (!m32_r) return std::unexpected(m32_r.error());
+            NN_TRY_CHECK(m32_r);
             MatrixT<Precision::F16> m16(m32_r->rows(), m32_r->cols());
             const auto src = m32_r->span();
             auto dst = m16.span();
             for (std::size_t i = 0; i < src.size(); ++i)
                 dst[i] = src[i];
-            if (auto r = detail::write_matrix_fp16(ofs, m16); !r)
-                return std::unexpected(r.error());
+            NN_TRY(r, detail::write_matrix_fp16(ofs, m16));
         }
         else
         {
             // f32 参数（默认路径）
             auto m = engine.to_matrix(p_tensor, Precision::F32);
-            if (!m) return std::unexpected(m.error());
-            if (auto r = detail::write_matrix_v5(ofs, *m, p); !r)
-                return std::unexpected(r.error());
+            NN_TRY_CHECK(m);
+            NN_TRY(r, detail::write_matrix_v5(ofs, *m, p));
         }
     }
 
@@ -576,17 +544,14 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
     for (auto& e_tensor : extras)
     {
         auto m = engine.to_matrix(e_tensor);
-        if (!m) return std::unexpected(m.error());
-        if (auto r = detail::write_matrix_v5(ofs, *m, e_tensor.get().precision()); !r)
-            return std::unexpected(r.error());
+        NN_TRY_CHECK(m);
+        NN_TRY(r, detail::write_matrix_v5(ofs, *m, e_tensor.get().precision()));
     }
 
     // tokenizer JSON（长度前缀，0 表示无）
-    if (auto r = detail::write_tokenizer(ofs, tokenizer_json); !r)
-        return std::unexpected(r.error());
-
+    NN_TRY(r3, detail::write_tokenizer(ofs, tokenizer_json));
     if (!ofs)
-        return std::unexpected(Error{"Write error while saving model to: " + filename});
+        NN_FAIL("Write error while saving model to: " + filename);
     return {};
 }
 
@@ -595,11 +560,9 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
 {
     std::ifstream ifs(filename, std::ios::binary);
     if (!ifs)
-        return std::unexpected(Error{"Cannot open file for reading: " + filename});
-
+        NN_FAIL("Cannot open file for reading: " + filename);
     auto version_r = detail::read_and_validate_header(ifs);
-    if (!version_r) return std::unexpected(version_r.error());
-
+    NN_TRY_CHECK(version_r);
     return detail::read_spec_header(ifs, *version_r);
 }
 
@@ -611,24 +574,19 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
 {
     std::ifstream ifs(filename, std::ios::binary);
     if (!ifs)
-        return std::unexpected(Error{"Cannot open file for reading: " + filename});
-
+        NN_FAIL("Cannot open file for reading: " + filename);
     auto version_r = detail::read_and_validate_header(ifs);
-    if (!version_r) return std::unexpected(version_r.error());
+    NN_TRY_CHECK(version_r);
     const uint32_t version = *version_r;
 
     // 读取并校验规格头
     auto spec_r = detail::read_spec_header(ifs, version);
-    if (!spec_r) return std::unexpected(spec_r.error());
-
+    NN_TRY_CHECK(spec_r);
     if (auto stored = model.spec(); stored)
     {
         if (!spec_matches(*stored, *spec_r))
         {
-            return std::unexpected(Error{
-                "Model architecture mismatch while loading '" + filename + "': "
-                "model expects " + spec_summary(*stored) +
-                " but file contains " + spec_summary(*spec_r)});
+            NN_FAIL("Model architecture mismatch while loading '" + filename + "': "                 "model expects " + spec_summary(*stored) +                 " but file contains " + spec_summary(*spec_r));
         }
     }
 
@@ -641,7 +599,7 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
         for (auto& p_tensor : params)
         {
             auto result_r = detail::read_matrix_v5(ifs);
-            if (!result_r) return std::unexpected(result_r.error());
+            NN_TRY_CHECK(result_r);
             // file_prec 由 read_matrix_v5 校验（F32/F16）；值路径不再分精度
             // 分支，故只取矩阵本体（file_matrix 恒为 f32 宿主值）。
             const Matrix& file_matrix = result_r->second;
@@ -653,8 +611,7 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
             // 再 copy_from` （多两个 PCIe 往返）。file_matrix 恒为 f32 宿主值
             // （f16 文件数据读入时已精确升 f32，f16→f32→f16 位不变），故四种
             // (file_prec × target) 组合与原路径逐位一致，收敛为一行。
-            if (auto r = engine.copy_from(p_tensor, file_matrix); !r)
-                return std::unexpected(r.error());
+            NN_TRY(r, engine.copy_from(p_tensor, file_matrix));
         }
     }
     else
@@ -663,10 +620,8 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
         for (auto& p_tensor : params)
         {
             Matrix tmp(p_tensor.get().rows(), p_tensor.get().cols());
-            if (auto r = detail::read_matrix(ifs, tmp); !r)
-                return std::unexpected(r.error());
-            if (auto r = engine.copy_from(p_tensor, tmp); !r)
-                return std::unexpected(r.error());
+            NN_TRY(r, detail::read_matrix(ifs, tmp));
+            NN_TRY(r2, engine.copy_from(p_tensor, tmp));
         }
     }
 
@@ -679,18 +634,16 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
         if (version >= 5)
         {
             auto result_r = detail::read_matrix_v5(ifs);
-            if (!result_r) return std::unexpected(result_r.error());
+            NN_TRY_CHECK(result_r);
             auto& [file_prec, file_matrix] = *result_r;
-            if (auto r = engine.copy_from(e_tensor, file_matrix); !r)
-                return std::unexpected(r.error());
+            NN_TRY(r, engine.copy_from(e_tensor, file_matrix));
         }
         else
         {
             Matrix tmp(e_tensor.get().rows(), e_tensor.get().cols());
             auto mr = detail::read_matrix(ifs, tmp);
-            if (!mr) return std::unexpected(mr.error());
-            if (auto r = engine.copy_from(e_tensor, tmp); !r)
-                return std::unexpected(r.error());
+            NN_TRY_CHECK(mr);
+            NN_TRY(r, engine.copy_from(e_tensor, tmp));
         }
     }
 
@@ -698,12 +651,12 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
     std::string tokenizer_json;
     {
         auto tok_r = detail::read_tokenizer(ifs);
-        if (!tok_r) return std::unexpected(tok_r.error());
+        NN_TRY_CHECK(tok_r);
         tokenizer_json = std::move(*tok_r);
     }
 
     if (!ifs)
-        return std::unexpected(Error{"Read error while loading model from: " + filename});
+        NN_FAIL("Read error while loading model from: " + filename);
     return tokenizer_json;
 }
 

@@ -78,12 +78,11 @@ nn::Result<InferConfig> parse_args(int argc, char *argv[])
         else if (arg == "--topk" && i + 1 < argc)
         {
             auto v = nn::parse_number<int>(argv[++i]);
-            if (!v) return std::unexpected(std::move(v).error());
+            NN_TRY_CHECK(v);
             if (*v <= 0)
-                return std::unexpected(nn::Error{"--topk 必须为正整数"});
+                NN_FAIL("--topk 必须为正整数");
             if (*v > static_cast<int>(nn::MNIST_NUM_CLASSES))
-                return std::unexpected(nn::Error{
-                    "--topk 不能超过类别数 " + std::to_string(nn::MNIST_NUM_CLASSES)});
+                NN_FAIL("--topk 不能超过类别数 " + std::to_string(nn::MNIST_NUM_CLASSES));
             cfg.topk = *v;
         }
         else if (arg == "--show-pixels")
@@ -102,13 +101,12 @@ nn::Result<InferConfig> parse_args(int argc, char *argv[])
         }
         else
         {
-            return std::unexpected(nn::Error{"未知参数: " + arg + "，使用 --help 查看用法"});
+            NN_FAIL("未知参数: " + arg + "，使用 --help 查看用法");
         }
     }
 
     if (!has_input)
-        return std::unexpected(nn::Error{"请指定图片文件或目录，使用 --help 查看用法"});
-
+        NN_FAIL("请指定图片文件或目录，使用 --help 查看用法");
     return cfg;
 }
 
@@ -126,16 +124,11 @@ nn::Result<std::vector<Prediction>> predict_with_confidence(
     const nn::Matrix &img, int topk)
 {
     auto x_tensor_r = engine.from_matrix(img);
-    if (!x_tensor_r)
-        return std::unexpected(std::move(x_tensor_r).error());
-
+    NN_TRY_CHECK(x_tensor_r);
     auto logits_tensor_r = model.forward(*x_tensor_r);
-    if (!logits_tensor_r)
-        return std::unexpected(std::move(logits_tensor_r).error());
-
+    NN_TRY_CHECK(logits_tensor_r);
     auto logits_r = engine.to_matrix(*logits_tensor_r);
-    if (!logits_r)
-        return std::unexpected(std::move(logits_r).error());
+    NN_TRY_CHECK(logits_r);
     const auto &logits = *logits_r;
 
     // Softmax 计算概率
@@ -202,13 +195,11 @@ nn::Result<void> infer_single(
 {
     std::ifstream file(filepath);
     if (!file)
-        return std::unexpected(nn::Error{"无法打开文件: " + filepath});
-
+        NN_FAIL("无法打开文件: " + filepath);
     std::string line;
     std::getline(file, line);
     auto img_result = nn::load_image_from_csv_line(line);
-    if (!img_result)
-        return std::unexpected(std::move(img_result).error());
+    NN_TRY_CHECK(img_result);
     auto img = std::move(*img_result);
 
     if (cfg.show_pixels)
@@ -219,9 +210,7 @@ nn::Result<void> infer_single(
     }
 
     auto results = predict_with_confidence(model, engine, img, cfg.topk);
-    if (!results)
-        return std::unexpected(std::move(results).error());
-
+    NN_TRY_CHECK(results);
     std::cout << fs::path(filepath).filename().string() << " -> ";
     for (std::size_t k = 0; k < results->size(); ++k)
     {
@@ -237,20 +226,12 @@ nn::Result<void> infer_single(
 int main(int argc, char *argv[])
 {
     auto cfg_result = parse_args(argc, argv);
-    if (!cfg_result)
-    {
-        std::cerr << "参数错误: " << cfg_result.error().message << std::endl;
-        return 1;
-    }
+    NN_EXIT(cfg_result, 1, "参数错误: ");
     InferConfig cfg = std::move(*cfg_result);
 
     // ── 从模型文件读取规格 ─────────────────────────────────
     auto spec_result = nn::peek_model_spec(cfg.model_path);
-    if (!spec_result)
-    {
-        std::cerr << "读取模型文件失败: " << spec_result.error().message << std::endl;
-        return 1;
-    }
+    NN_EXIT(spec_result, 1, "读取模型文件失败: ");
     nn::ModelSpec spec = spec_result.value();
 
     // 支持的模型类型：MLP、Transformer（ViT）、CNN
@@ -279,28 +260,16 @@ int main(int argc, char *argv[])
     eng_cfg.use_gpu = cfg.gpu_enabled;
     eng_cfg.gpu_device = cfg.gpu_device;
     auto engine_res = nn::cli::create_engine(eng_cfg, std::cout);
-    if (!engine_res)
-    {
-        std::cerr << "引擎创建失败: " << engine_res.error().message << "\n";
-        return 1;
-    }
+    NN_EXIT(engine_res, 1, "引擎创建失败: ");
     auto engine = std::move(*engine_res);
 
     // ── 构建模型（绑定引擎） ─────────────────────────────────
     auto build_result = nn::build_mnist_model_from_spec(*engine, spec);
-    if (!build_result)
-    {
-        std::cerr << "构建模型失败: " << build_result.error().message << std::endl;
-        return 1;
-    }
+    NN_EXIT(build_result, 1, "构建模型失败: ");
     auto model = std::move(*build_result);
 
     auto load_result = nn::load_model(cfg.model_path, model);
-    if (!load_result)
-    {
-        std::cerr << "加载模型失败: " << load_result.error().message << std::endl;
-        return 1;
-    }
+    NN_EXIT(load_result, 1, "加载模型失败: ");
     std::cout << "模型已加载: " << cfg.model_path << "\n" << std::endl;
 
     // 推理模式：BatchNorm 使用保存的 running 统计量（batch 可能为 1，不能算 batch 统计）
@@ -339,7 +308,7 @@ int main(int argc, char *argv[])
     {
         // 单张推理
         auto result = infer_single(model, *engine, input.string(), cfg);
-        if (!result) { std::cerr << "推理失败: " << result.error().message << '\n'; return 1; }
+        NN_EXIT(result, 1, "推理失败: ");
     }
     else
     {
