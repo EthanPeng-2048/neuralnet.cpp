@@ -126,7 +126,7 @@ nn::Result<std::vector<std::size_t>> generate_text(
     if (auto *rapt_ptr = dynamic_cast<nn::RAPTModel *>(&layer_ref))
         return rapt_ptr->generate(engine, prompt_tokens, max_new_tokens, temperature,
                                   eos_token_id, min_new);
-    return std::unexpected(nn::Error{"Model does not contain a GPTModel or RAPTModel layer"});
+    NN_FAIL("Model does not contain a GPTModel or RAPTModel layer");
 }
 
 // ==================== 交互模式 ====================
@@ -236,11 +236,7 @@ int main(int argc, char *argv[])
 
     // ── 从模型文件读取规格 ─────────────────────────────────────
     auto spec_result = nn::peek_model_spec(cfg.model_path);
-    if (!spec_result)
-    {
-        std::cerr << "读取模型文件失败: " << spec_result.error().message << std::endl;
-        return 1;
-    }
+    NN_EXIT(spec_result, 1, "读取模型文件失败: ");
     nn::ModelSpec spec = spec_result.value();
     if (!spec.is_gpt() && !spec.is_rapt())
     {
@@ -254,11 +250,7 @@ int main(int argc, char *argv[])
     eng_cfg.use_gpu = cfg.gpu_enabled;
     eng_cfg.gpu_device = cfg.gpu_device;
     auto engine_res = nn::cli::create_engine(eng_cfg, std::cout);
-    if (!engine_res)
-    {
-        std::cerr << "引擎创建失败: " << engine_res.error().message << "\n";
-        return 1;
-    }
+    NN_EXIT(engine_res, 1, "引擎创建失败: ");
     auto engine = std::move(*engine_res);
 
     // ── 构建 GPT 模型 ────────────────────────────────────────
@@ -287,21 +279,13 @@ int main(int argc, char *argv[])
         model_result = nn::build_rapt_model_from_spec(*engine, spec);
     else  // 统一的 GPTModel 通过 pos_encoding 区分 Learned/Sinusoidal/ALiBi
         model_result = nn::build_gpt_model_from_spec(*engine, spec);
-    if (!model_result)
-    {
-        std::cerr << "构建模型失败: " << model_result.error().message << std::endl;
-        return 1;
-    }
+    NN_EXIT(model_result, 1, "构建模型失败: ");
     auto model = std::move(*model_result);
 
     // ── 加载模型参数 + tokenizer ────────────────────────────
     std::cout << "加载模型: " << cfg.model_path << " ..." << std::endl;
     auto load_result = nn::load_model(cfg.model_path, model);
-    if (!load_result)
-    {
-        std::cerr << "加载模型失败: " << load_result.error().message << std::endl;
-        return 1;
-    }
+    NN_EXIT(load_result, 1, "加载模型失败: ");
     std::cout << "模型已加载" << std::endl;
 
     // ── 加载 tokenizer（自动识别类型） ─────────────────────────
@@ -311,11 +295,7 @@ int main(int argc, char *argv[])
     {
         // V3 格式：模型文件嵌入了 tokenizer JSON
         tokenizer = nn::load_tokenizer_from_string(embedded_json);
-        if (!tokenizer)
-        {
-            std::cerr << "解析嵌入 tokenizer 失败或无法识别分词器类型" << std::endl;
-            return 1;
-        }
+        NN_EXIT(tokenizer, 1, "解析嵌入 tokenizer 失败或无法识别分词器类型");
         std::cout << "已从模型文件加载嵌入 tokenizer" << std::endl;
     }
     else
@@ -358,11 +338,7 @@ int main(int argc, char *argv[])
     auto t_end = std::chrono::steady_clock::now();
     Scalar gen_sec = std::chrono::duration<Scalar>(t_end - t_start).count();
 
-    if (!gen_result)
-    {
-        std::cerr << "生成失败: " << gen_result.error().message << std::endl;
-        return 1;
-    }
+    NN_EXIT(gen_result, 1, "生成失败: ");
     auto generated = std::move(*gen_result);
 
     std::cout << cfg.prompt << tokenizer->decode(generated) << std::endl;

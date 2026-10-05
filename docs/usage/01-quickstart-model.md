@@ -25,6 +25,28 @@ auto result = model.forward(input);   // engine 在 Model 内部自动传递
 
 ---
 
+## 头文件怎么 include（两种方式）
+
+```cpp
+// ① 聚合入口：一次拿齐全部模块（本篇示例都用它）
+#include <neuralnet.cpp/nn.hpp>
+
+// ② 按需加载：只拿要写的那部分（薄转发头，名字即用途）
+#include <neuralnet.cpp/engine.hpp>      // ComputeEngine / CpuEngine / GpuEngine
+#include <neuralnet.cpp/layer.hpp>       // Layer 基类 + 全部内置层 + 位置编码
+#include <neuralnet.cpp/loss.hpp>        // Loss / MSELoss / CrossEntropyLoss
+#include <neuralnet.cpp/optimizer.hpp>   // Optimizer + create_optimizer
+#include <neuralnet.cpp/model.hpp>       // Model / ModelSpec / save_model / load_model
+#include <neuralnet.cpp/train.hpp>       // 上面五者的合集（写训练循环够用）
+```
+
+> 两者取其一即可（都带 `#pragma once`，混用无副作用）。转发头是**整洁性**入口，
+> **不省编译时间** —— 各头的依赖闭包本就相互牵连，真正省 parse 是另一个专项
+> （`docs/development/18-roadmap.md`）。模型工厂（`build_gpt_model` 等）与分词器
+> 仍在 `domain_*.hpp`，名字已足够清楚，不另起转发头。
+
+---
+
 ## 第一步：选择引擎
 
 ```cpp
@@ -46,31 +68,32 @@ nn::CpuEngine engine;
 ```cpp
 nn::Model model(engine);
 
-model.add<nn::Linear>(784, 256);   // 输入层: 784 → 256
-model.add<nn::ReLU>();             // 激活函数
-model.add<nn::Linear>(256, 128);   // 隐藏层: 256 → 128
-model.add<nn::ReLU>();
-model.add<nn::Linear>(128, 10);    // 输出层: 128 → 10
+// add 返回 Result<void>（[[nodiscard]]）——直接丢弃在 -Werror 下编译失败，
+// 用 NN_CHECK 解掉：失败时打印 message + file:line 后终止
+NN_CHECK(model.add<nn::Linear>(784, 256));   // 输入层: 784 → 256
+NN_CHECK(model.add<nn::ReLU>());             // 激活函数
+NN_CHECK(model.add<nn::Linear>(256, 128));   // 隐藏层: 256 → 128
+NN_CHECK(model.add<nn::ReLU>());
+NN_CHECK(model.add<nn::Linear>(128, 10));    // 输出层: 128 → 10
 ```
 
 > `add<LayerType>(args...)` 返回 `Result<void>`（层构造后自动调用 `Layer::init(engine)`，
-> 失败经 Result 上抛）；它不返回 `*this`，**不能点链调用**——逐行添加、需要时逐个检查错误。
+> 失败经 Result 上抛）；它不返回 `*this`，**不能点链调用**——逐行添加并 `NN_CHECK(...)`
+> 解掉；要把错误往上传（函数本身返回 `Result`）则用 `NN_TRY(r, ...)`。
 
 ### 方式二：使用工厂函数（MNIST/GPT 预设）
 
 ```cpp
 // MNIST MLP：784 → 512 → 256 → 128 → 64 → 10
-auto model_result = nn::build_mnist_mlp_model(engine);
-nn::Model model = std::move(*model_result);
+nn::Model model = NN_CHECK(nn::build_mnist_mlp_model(engine));
 
 // MNIST Transformer (ViT)：28×28 图像，patch_size=7
 // 默认含编码器末端 final norm（NormPlace::Final，原版 ViT 的 ln_f）；
 // 块内 pre-norm 默认 LayerNorm，可用 NormType 参数换 RMSNorm/BatchNorm
-auto model_result = nn::build_mnist_transformer_model(engine);
-nn::Model model = std::move(*model_result);
+nn::Model vit = NN_CHECK(nn::build_mnist_transformer_model(engine));
 
 // GPT 语言模型
-auto model_result = nn::build_gpt_model(
+nn::Model gpt = NN_CHECK(nn::build_gpt_model(
     engine,
     10000,  // vocab_size
     128,    // d_model
@@ -78,22 +101,24 @@ auto model_result = nn::build_gpt_model(
     4,      // num_heads
     512,    // d_ff
     4       // num_layers
-);
-nn::Model model = std::move(*model_result);
+));
 ```
+
+> ⚠ 不要写 `std::move(*model_result)` 而不先判断——失败态解引用是未定义行为。
+> `NN_CHECK(...)` 把"检查 + 解值"合成一步。
 
 ### 方式三：添加其他内置层
 
 ```cpp
 nn::Model model(engine);
-model.add<nn::GeLU>();                  // QuickGeLU 激活
-model.add<nn::LayerNorm>(256);          // 层归一化
-model.add<nn::Softmax>();               // Softmax
-model.add<nn::PositionalEncoding>(128, 1024); // 位置编码
-model.add<nn::FeedForward>(128, 512);   // FFN
-model.add<nn::TransformerEncoderLayer>(128, 4, 512, 256); // Transformer 编码器层
-model.add<nn::CausalSelfAttention>(128, 4, 1024);  // 因果自注意力
-model.add<nn::GPTBlock>(128, 4, 512, 1024);        // GPT 块
+NN_CHECK(model.add<nn::GeLU>());                  // QuickGeLU 激活
+NN_CHECK(model.add<nn::LayerNorm>(256));          // 层归一化
+NN_CHECK(model.add<nn::Softmax>());               // Softmax
+NN_CHECK(model.add<nn::PositionalEncoding>(128, 1024)); // 位置编码
+NN_CHECK(model.add<nn::FeedForward>(128, 512));   // FFN
+NN_CHECK(model.add<nn::TransformerEncoderLayer>(128, 4, 512, 256)); // Transformer 编码器层
+NN_CHECK(model.add<nn::CausalSelfAttention>(128, 4, 1024));  // 因果自注意力
+NN_CHECK(model.add<nn::GPTBlock>(128, 4, 512, 1024));        // GPT 块
 ```
 
 ---
@@ -150,37 +175,40 @@ Matrix/Tensor 行主序:  (rows, cols)
 int main() {
     nn::CpuEngine engine;
 
-    // 1. 构建模型
+    // 1. 构建模型（add 返回 Result<void>，[[nodiscard]] 不能直接丢弃；
+    //    NN_CHECK = 失败时打印 message + file:line 后终止）
     nn::Model model(engine);
-    model.add<nn::Linear>(784, 256);
-    model.add<nn::ReLU>();
-    model.add<nn::Linear>(256, 10);
+    NN_CHECK(model.add<nn::Linear>(784, 256));
+    NN_CHECK(model.add<nn::ReLU>());
+    NN_CHECK(model.add<nn::Linear>(256, 10));
 
     // 2. 准备输入 (784 像素, 32 样本)
     nn::Tensor input = engine.create_tensor(784, 32);
     // ... 填充数据 ...
 
-    // 3. 前向传播
-    auto out_result = model.forward(input);
-    if (!out_result) {
-        std::cerr << "Error: " << out_result.error().message << "\n";
-        return 1;
-    }
-    nn::Tensor output = std::move(*out_result);
+    // 3. 前向传播：NN_CHECK 直接解出值，免写 if (!r) { …; return 1; }
+    nn::Tensor output = NN_CHECK(model.forward(input));
     // output: (10, 32) — 每列一个样本的 10 类 logits
 
     // 4. 下载到 CPU 做 argmax
-    auto m = engine.to_matrix(output);
+    nn::Matrix m = NN_CHECK(engine.to_matrix(output));
     for (std::size_t b = 0; b < 32; ++b) {
         std::size_t best = 0;
         for (std::size_t c = 1; c < 10; ++c) {
-            if (m->at(c, b) > m->at(best, b))
+            if (m.at(c, b) > m.at(best, b))
                 best = c;
         }
         std::cout << "Sample " << b << ": predicted " << best << "\n";
     }
 }
 ```
+
+> **三种错误处理语义怎么选**（完整定义见 `core_errors.hpp` 宏注释 / AGENTS.md 铁律 #1）：
+> - 函数**返回 `Result<T>`** 要往上传 → `NN_TRY(decl, expr)`（展开与手写逐字等价）；
+>   要把调用点语境也带上去 → `NN_TRY_MSG(decl, "语境", expr)`；
+> - **任意上下文**（`main` / `void` / 测试）解包并继续，失败即终止 → `NN_CHECK(expr[, "语境"])`
+>   （别名 `NN_EASY_CHECK`；也接受 `bool` 条件，等于"始终启用的断言"）；
+> - **CLI/参数错误**要保住退出码 → `NN_EXIT(expr, code[, "语境"])`。
 
 ---
 
@@ -203,19 +231,20 @@ public:
         : in_dim_(in_dim), out_dim_(out_dim) {}
 
     // 权重初始化：M2 声明式——层算分布参数（Xavier limit），引擎填数
-    [[nodiscard]] nn::Result<void> init(nn::ComputeEngine& engine) override
+    // M6 段 C 起公共 init 是 NVI：子类覆写的是 init_impl（不是 init）
+    [[nodiscard]] nn::Result<void> init_impl(nn::ComputeEngine& engine) override
     {
         const nn::Scalar limit =
             std::sqrt(6.0f / static_cast<nn::Scalar>(in_dim_ + out_dim_));
         weight_ = engine.create_tensor(out_dim_, in_dim_, nn::Precision::F32,
                                        nn::InitSpec::uniform(-limit, limit, nn::kInitSeed));
         if (!weight_.valid())
-            return std::unexpected(nn::Error{"MyLayer: 权重初始化失败"});
+            NN_FAIL("MyLayer: 权重初始化失败");
 
         grad_weight_ = engine.create_tensor(out_dim_, in_dim_, nn::Precision::F32,
                                             nn::InitSpec::zero());
         if (!grad_weight_.valid())
-            return std::unexpected(nn::Error{"MyLayer: 梯度缓冲初始化失败"});
+            NN_FAIL("MyLayer: 梯度缓冲初始化失败");
         return {};
     }
 
@@ -227,32 +256,36 @@ public:
         return {grad_weight_};
     }
 
-    // 前向传播
-    [[nodiscard]] nn::Result<nn::Tensor> forward(
-        nn::ComputeEngine& engine, const nn::Tensor& input) override
+    // 前向传播：M6 段 C 起不带 engine 形参（engine 在 init 时已绑定到 engine_，
+    // 方法体里经 engine_ref() 取回，未 init 就调用会 fail-fast 并打印调用点）
+    [[nodiscard]] nn::Result<nn::Tensor> forward(const nn::Tensor& input) override
     {
+        nn::ComputeEngine& engine = engine_ref();
         input_cache_ = input;
         // 组合原语表达算法
         return engine.matmul(weight_, input);
     }
 
     // 反向传播
-    [[nodiscard]] nn::Result<nn::Tensor> backward(
-        nn::ComputeEngine& engine, const nn::Tensor& grad_output) override
+    [[nodiscard]] nn::Result<nn::Tensor> backward(const nn::Tensor& grad_output) override
     {
-        // grad_input = weight^T × grad_output
-        auto grad_input = engine.matmul(weight_, grad_output, /*transA=*/true);
+        nn::ComputeEngine& engine = engine_ref();
 
-        // grad_weight += grad_output × input^T
-        auto gw = engine.matmul(grad_output, input_cache_, /*transA=*/false, /*transB=*/true);
-        if (!gw) return std::unexpected(gw.error());
-        auto r = engine.add_inplace(grad_weight_, *gw);
-        if (!r) return std::unexpected(r.error());
+        // grad_input = weight^T × grad_output
+        NN_TRY(grad_input, engine.matmul(weight_, grad_output, /*transA=*/true));
+
+        // grad_weight += grad_output × input^T（NN_TRY = 声明 + 检查 + 传播）
+        NN_TRY(gw, engine.matmul(grad_output, input_cache_, /*transA=*/false, /*transB=*/true));
+        NN_TRY(r, engine.add_inplace(grad_weight_, *gw));
 
         return grad_input;
     }
 };
 ```
+
+> 错误写法对照：`NN_TRY(decl, expr)` 只用于**声明**表达式结果（内部求值一次）；
+> `NN_TRY_CHECK(x)` 只用于**已声明**的变量——它在失败分支会再取一次 `x.error()`，
+> 对带副作用的表达式写成 `NN_TRY_CHECK(engine.foo())` 会重复执行 `foo()`。
 
 **添加到 Model：**
 

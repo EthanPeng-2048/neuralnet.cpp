@@ -31,7 +31,7 @@ namespace nn
 {
     std::ifstream ifs(path, std::ios::binary);
     if (!ifs)
-        return std::unexpected(Error{"Cannot open text file: " + path});
+        NN_FAIL("Cannot open text file: " + path);
     return std::string{std::istreambuf_iterator<char>(ifs),
                        std::istreambuf_iterator<char>()};
 }

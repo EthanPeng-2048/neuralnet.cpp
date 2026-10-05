@@ -589,14 +589,14 @@ struct MatmulRef
         if (a.precision() != Precision::F32)
         {
             auto r = eng.cast(a, Precision::F32);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             ca = std::move(*r);
             pa = &ca;
         }
         if (b.precision() != Precision::F32)
         {
             auto r = eng.cast(b, Precision::F32);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             cb = std::move(*r);
             pb = &cb;
         }
@@ -604,12 +604,11 @@ struct MatmulRef
         Result<Tensor> c = (batch > 1)
             ? eng.batched_matmul(*pa, *pb, batch, transA, transB, Scalar{1}, P)
             : eng.matmul(*pa, *pb, transA, transB, P);
-        if (!c)
-            return std::unexpected(c.error());
+        NN_TRY_CHECK(c);
         if (!c->is_cpu())
-            return std::unexpected(Error{"dsl matmul prepare: result not on CPU"});
+            NN_FAIL("dsl matmul prepare: result not on CPU");
         if (c->precision() != Precision::F32)
-            return std::unexpected(Error{"dsl matmul prepare: result not f32"});
+            NN_FAIL("dsl matmul prepare: result not f32");
         if (env_flag("NN_F16_DEBUG"))
         {
             const auto sp = TensorAccess::cpu_matrix(*c).span();
@@ -1181,10 +1180,9 @@ template <ExprViewKind K>
     if (r.v_ != nullptr)
         return {};
     if (!r.t.is_cpu())
-        return std::unexpected(Error{"dsl reduce-view prepare: input not on CPU"});
+        NN_FAIL("dsl reduce-view prepare: input not on CPU");
     if (r.t.rows() != rows || r.t.cols() != cols)
-        return std::unexpected(Error{"dsl reduce-view prepare: shape mismatch"});
-
+        NN_FAIL("dsl reduce-view prepare: shape mismatch");
     using R = ReduceViewRef<K>;
     // f16 输入 → 归约在 f32 参考空间做（§7.2）：一次性镜像后读。直接
     // cpu_matrix() 读 f16 存储 = 空指针 UB（MatmulRef::prepare_cpu 同款
@@ -1206,7 +1204,7 @@ template <ExprViewKind K>
     }
     else
     {
-        return std::unexpected(Error{"dsl reduce-view prepare: unsupported precision"});
+        NN_FAIL("dsl reduce-view prepare: unsupported precision");
     }
     const Scalar init = R::reduces_max ? std::numeric_limits<Scalar>::lowest() : Scalar{0};
     const std::size_t len = R::reduces_rows ? rows : cols;
@@ -1465,16 +1463,14 @@ template <typename E>
             // 归约"，折叠成 ExprSpec 走引擎 eval_expr（CPU 扩展语义处理归约
             // 视图/指令）
             auto [spec, inputs] = to_expr_spec(e);
-            if (auto v = validate_expr_spec(spec, inputs.size()); !v)
-                return std::unexpected(v.error());
+            NN_TRY(v, validate_expr_spec(spec, inputs.size()));
             return eng.eval_expr(spec, inputs, rows, cols, P);
         }
         return eng.adopt(eval_cpu(e, rows, cols, P));
     }
 
     auto [spec, inputs] = to_expr_spec(e);
-    if (auto v = validate_expr_spec(spec, inputs.size()); !v)
-        return std::unexpected(v.error());
+    NN_TRY(v, validate_expr_spec(spec, inputs.size()));
     return eng.eval_expr(spec, inputs, rows, cols, P);  // 闭合世界：GPU 未命中即报错
 #endif
 }
@@ -1549,7 +1545,7 @@ template <typename E>
     if (eng.device() == Device::CPU)
     {
         if (!dst.is_cpu())
-            return std::unexpected(Error{"dsl::compute_into: dst not on CPU"});
+            NN_FAIL("dsl::compute_into: dst not on CPU");
         if constexpr (nn::dsl::has_reduction_v<E>)
         {
             // 注意：只在"不含真归约"时才走预绑定路径。含真归约的表达式必须落到
@@ -1575,8 +1571,7 @@ template <typename E>
             }
             // 含归约：折叠成 ExprSpec 走引擎（与 compute() 的 CPU 分支一致）
             auto [spec, inputs] = to_expr_spec(e);
-            if (auto v = validate_expr_spec(spec, inputs.size()); !v)
-                return std::unexpected(v.error());
+            NN_TRY(v, validate_expr_spec(spec, inputs.size()));
             return eng.eval_expr_into(spec, inputs, dst.rows(), dst.cols(), dst);
         }
         // 纯逐元素：编译期模板直接写进 dst 的 span（零解释器开销、零分配），
@@ -1586,8 +1581,7 @@ template <typename E>
     }
 
     auto [spec, inputs] = to_expr_spec(e);
-    if (auto v = validate_expr_spec(spec, inputs.size()); !v)
-        return std::unexpected(v.error());
+    NN_TRY(v, validate_expr_spec(spec, inputs.size()));
     return eng.eval_expr_into(spec, inputs, dst.rows(), dst.cols(), dst);
 #endif
 }
@@ -1642,8 +1636,7 @@ template <typename E>
         }
     }
     auto [spec, inputs] = to_expr_spec(e);
-    if (auto v = validate_expr_spec(spec, inputs.size()); !v)
-        return std::unexpected(v.error());
+    NN_TRY(v, validate_expr_spec(spec, inputs.size()));
     return eng.eval_expr_reduce(spec, inputs, rows, cols, P);
 #endif
 }

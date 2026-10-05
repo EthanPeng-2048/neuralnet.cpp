@@ -194,11 +194,7 @@ public:
         // ── 0. 校验最小词表大小（4 特殊 + 256 ASCII 兜底） ──────
         if (config.vocab_size < MIN_VOCAB_SIZE)
         {
-            return std::unexpected(Error{
-                "CharBPE vocab_size too small: minimum is " +
-                std::to_string(MIN_VOCAB_SIZE) +
-                " (4 special + 256 ASCII fallback), got " +
-                std::to_string(config.vocab_size)});
+            NN_FAIL("CharBPE vocab_size too small: minimum is " +                 std::to_string(MIN_VOCAB_SIZE) +                 " (4 special + 256 ASCII fallback), got " +                 std::to_string(config.vocab_size));
         }
 
         // ── 1. 初始化词表：4 特殊 + 256 单字节 ASCII 兜底 ──────
@@ -529,8 +525,7 @@ public:
     [[nodiscard]] Result<void> save(const std::string &path) const override
     {
         std::ofstream ofs(path);
-        if (!ofs) return std::unexpected(Error{"Cannot write: " + path});
-        // 共享 JSON 头部 + vocab 段（基类 save_vocab_json_ + write_vocab_entry_ 钩子）
+        if (!ofs) NN_FAIL("Cannot write: " + path);
         // 起始 ID = 0：保留前 4 个特殊 token + ASCII 兜底，全部写入。
         save_vocab_json_(ofs, "char_bpe_tokenizer", 0);
         ofs << ",\n  \"merges\": [";
@@ -547,7 +542,7 @@ public:
     [[nodiscard]] Result<void> load(const std::string &path) override
     {
         std::ifstream ifs(path);
-        if (!ifs) return std::unexpected(Error{"Cannot read: " + path});
+        if (!ifs) NN_FAIL("Cannot read: " + path);
         std::string content((std::istreambuf_iterator<char>(ifs)),
                              std::istreambuf_iterator<char>());
         return load_from_string(content);

@@ -122,10 +122,7 @@ int main(int argc, char *argv[])
     // ── 加载文本 ─────────────────────────────────────────────
     std::cout << "加载文本: " << cfg.text_path << " ..." << std::endl;
     auto text_result = nn::load_text_file(cfg.text_path);
-    if (!text_result) {
-        std::cerr << "Error: " << text_result.error().message << '\n';
-        return 1;
-    }
+    NN_EXIT(text_result, 1, "Error: ");
     std::string text = std::move(*text_result);
     if (text.empty())
     {
@@ -186,11 +183,7 @@ int main(int argc, char *argv[])
         train_result = tok.train(text, tcfg);
     }
 
-    if (!train_result)
-    {
-        std::cerr << "训练失败: " << train_result.error().message << '\n';
-        return 1;
-    }
+    NN_EXIT(train_result, 1, "训练失败: ");
     auto t_end = std::chrono::steady_clock::now();
     Scalar train_sec = std::chrono::duration<Scalar>(t_end - t_start).count();
 
@@ -200,11 +193,7 @@ int main(int argc, char *argv[])
 
     // ── 保存词表 ─────────────────────────────────────────────
     auto save_result = tokenizer->save(cfg.output_path);
-    if (!save_result)
-    {
-        std::cerr << "保存词表失败: " << save_result.error().message << '\n';
-        return 1;
-    }
+    NN_EXIT(save_result, 1, "保存词表失败: ");
     std::cout << "词表已保存: " << cfg.output_path << std::endl;
 
     // ── 打印示例（验证分词效果） ─────────────────────────────

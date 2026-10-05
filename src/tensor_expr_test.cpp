@@ -68,7 +68,7 @@ int check(ComputeEngine& eng, const std::string& name, const Expr& expr,
 {
     auto r = nn::dsl::compute(eng, expr, rows, cols);
     Matrix got;
-    if (!to_cpu(eng, r, got)) { std::cerr << "[FAIL] " << name << "\n"; return 1; }
+    NN_EXIT(to_cpu(eng, r, got), 1, "[FAIL] ");
     const Scalar err = max_abs_diff(ref, got);
     const bool ok = err <= tol;
     std::cout << "[" << (ok ? "PASS" : "FAIL") << "] " << name

@@ -593,21 +593,13 @@ int main(int argc, char *argv[])
         nn::cli::EngineConfig ec;
         ec.use_gpu = true;
         auto probe = nn::cli::create_engine(ec);
-        if (!probe)
-        {
-            std::cout << "GPU 不可用，跳过: " << probe.error().message << "\n";
-            return 77;
-        }
+        NN_EXIT(probe, 77, "GPU 不可用，跳过: ");
     }
 
     nn::cli::EngineConfig ecfg;
     ecfg.use_gpu = use_gpu;
     auto engine_res = nn::cli::create_engine(ecfg, std::cout);
-    if (!engine_res)
-    {
-        std::cerr << "引擎创建失败: " << engine_res.error().message << "\n";
-        return 1;
-    }
+    NN_EXIT(engine_res, 1, "引擎创建失败: ");
     auto engine = std::move(*engine_res);
     ComputeEngine &eng = *engine;
 

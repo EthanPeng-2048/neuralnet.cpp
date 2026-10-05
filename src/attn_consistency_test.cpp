@@ -276,13 +276,13 @@ int main(int argc, char* argv[])
         else if (arg == "--seq" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --seq\n"; return 1; }
+            NN_EXIT(v, 1, "无效 --seq\n");
             seq_len = *v;
         }
         else if (arg == "--layers" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --layers\n"; return 1; }
+            NN_EXIT(v, 1, "无效 --layers\n");
             num_layers = *v;
         }
         else if (arg == "--help")
@@ -311,11 +311,7 @@ int main(int argc, char* argv[])
     nn::cli::EngineConfig cfg;
     cfg.use_gpu = use_gpu;
     auto engine_res = nn::cli::create_engine(cfg, std::cout);
-    if (!engine_res)
-    {
-        std::cerr << "引擎创建失败: " << engine_res.error().message << "\n";
-        return 1;
-    }
+    NN_EXIT(engine_res, 1, "引擎创建失败: ");
     auto engine = std::move(*engine_res);
 
     bool all_pass = true;

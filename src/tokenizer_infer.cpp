@@ -401,11 +401,7 @@ int main(int argc, char *argv[])
     if (!cfg.encode_file.empty())
     {
         auto text_result = nn::load_text_file(cfg.encode_file);
-        if (!text_result)
-        {
-            std::cerr << "读取文件失败: " << text_result.error().message << '\n';
-            return 1;
-        }
+        NN_EXIT(text_result, 1, "读取文件失败: ");
         auto ids = tokenizer->encode(*text_result);
         std::cout << "文件大小: " << text_result->size() << " 字节\n";
         std::cout << "Token 数: " << ids.size() << "\n";

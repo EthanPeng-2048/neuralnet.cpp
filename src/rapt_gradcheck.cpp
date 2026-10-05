@@ -138,7 +138,7 @@ int main(int argc, char* argv[])
     }
 
     auto engine = nn::cli::create_engine(nn::cli::EngineConfig{use_gpu});
-    if (!engine) { std::cerr << engine.error().message << "\n"; return 1; }
+    NN_EXIT(engine, 1, "\n");
     ComputeEngine& eng = **engine;
 
     constexpr Scalar eps = 1e-3f;
@@ -158,11 +158,11 @@ int main(int argc, char* argv[])
         Matrix x_m(d_model, batch * seq);
         { auto sp = x_m.span(); for (auto& v : sp) v = dist(rng); }
         auto x_t = eng.from_matrix(x_m);
-        if (!x_t) return 1;
+        NN_EXIT(x_t, 1);
         Matrix go_m(d_model, batch * seq);
         { auto sp = go_m.span(); for (auto& v : sp) v = dist(rng); }
         auto go_t = eng.from_matrix(go_m);
-        if (!go_t) return 1;
+        NN_EXIT(go_t, 1);
 
         auto eval_loss = [&]() -> Scalar {
             auto y = attn.forward(*x_t);
@@ -173,9 +173,9 @@ int main(int argc, char* argv[])
         auto grads = attn.param_gradients();
         for (auto& g : grads) { if (!eng.zero(g)) return 1; }
         auto y0 = attn.forward(*x_t);
-        if (!y0) { std::cerr << "  fwd failed\n"; return 1; }
+        NN_EXIT(y0, 1, "  fwd failed\n");
         auto gx = attn.backward(*go_t);
-        if (!gx) { std::cerr << "  bwd failed\n"; return 1; }
+        NN_EXIT(gx, 1, "  bwd failed\n");
 
         auto params = attn.parameters();
         all_ok &= check_all_params(eng, eval_loss, params, grads, eps, tol);
@@ -195,11 +195,11 @@ int main(int argc, char* argv[])
         Matrix x_m(d_model, batch * seq);
         { auto sp = x_m.span(); for (auto& v : sp) v = dist(rng); }
         auto x_t = eng.from_matrix(x_m);
-        if (!x_t) return 1;
+        NN_EXIT(x_t, 1);
         Matrix go_m(d_model, batch * seq);
         { auto sp = go_m.span(); for (auto& v : sp) v = dist(rng); }
         auto go_t = eng.from_matrix(go_m);
-        if (!go_t) return 1;
+        NN_EXIT(go_t, 1);
 
         auto eval_loss = [&]() -> Scalar {
             auto y = attn.forward(*x_t);
@@ -210,9 +210,9 @@ int main(int argc, char* argv[])
         auto grads = attn.param_gradients();
         for (auto& g : grads) { if (!eng.zero(g)) return 1; }
         auto y0 = attn.forward(*x_t);
-        if (!y0) { std::cerr << "  fwd failed\n"; return 1; }
+        NN_EXIT(y0, 1, "  fwd failed\n");
         auto gx = attn.backward(*go_t);
-        if (!gx) { std::cerr << "  bwd failed\n"; return 1; }
+        NN_EXIT(gx, 1, "  bwd failed\n");
 
         auto params = attn.parameters();
         all_ok &= check_all_params(eng, eval_loss, params, grads, eps, tol);
@@ -240,11 +240,11 @@ int main(int argc, char* argv[])
         Matrix x_m(d_model, batch * seq);
         { auto sp = x_m.span(); for (auto& v : sp) v = dist(rng); }
         auto x_t = eng.from_matrix(x_m);
-        if (!x_t) return 1;
+        NN_EXIT(x_t, 1);
         Matrix go_m(d_model, batch * seq);
         { auto sp = go_m.span(); for (auto& v : sp) v = dist(rng); }
         auto go_t = eng.from_matrix(go_m);
-        if (!go_t) return 1;
+        NN_EXIT(go_t, 1);
 
         auto eval_loss = [&]() -> Scalar {
             auto y = attn.forward(*x_t);
@@ -255,9 +255,9 @@ int main(int argc, char* argv[])
         auto grads = attn.param_gradients();
         for (auto& g : grads) { if (!eng.zero(g)) return 1; }
         auto y0 = attn.forward(*x_t);
-        if (!y0) { std::cerr << "  fwd failed\n"; return 1; }
+        NN_EXIT(y0, 1, "  fwd failed\n");
         auto gx = attn.backward(*go_t);
-        if (!gx) { std::cerr << "  bwd failed\n"; return 1; }
+        NN_EXIT(gx, 1, "  bwd failed\n");
 
         auto params = attn.parameters();
         all_ok &= check_all_params(eng, eval_loss, params, grads, eps, tol);

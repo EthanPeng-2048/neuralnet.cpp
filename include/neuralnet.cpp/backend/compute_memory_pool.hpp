@@ -236,7 +236,7 @@ private:
         c_vkalloc_ms_ += std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - t0).count();
         if (res != VK_SUCCESS)
-            return std::unexpected(Error{"vkAllocateMemory failed: " + std::to_string(res)});
+            NN_FAIL("vkAllocateMemory failed: " + std::to_string(res));
         c_blocks_created_++;
 
         Block block;
@@ -297,8 +297,7 @@ public:
 
         auto mem_type = find_memory_type(requirements.memoryTypeBits, preferred_flags, fallback_flags);
         if (!mem_type)
-            return std::unexpected(Error{"No suitable GPU memory type found"});
-
+            NN_FAIL("No suitable GPU memory type found");
         VkDeviceSize alignment = requirements.alignment > 0 ? requirements.alignment : 1;
         // matmul_tiled 等 vec4 SSBO 快路径要求基址 16B 对齐（std430 vec4 读的
         // 对齐门槛）。buffer requirements 可能小于 16，这里统一抬到 ≥16；
@@ -349,14 +348,11 @@ public:
 
         // 创建新块
         auto block_result = create_block(*mem_type, preferred_flags, pool_size);
-        if (!block_result)
-            return std::unexpected(block_result.error());
-
+        NN_TRY_CHECK(block_result);
         auto new_block = std::make_unique<Block>(std::move(*block_result));
         auto best = find_best(*new_block, alignment, alloc_size);
         if (!best)
-            return std::unexpected(Error{"Suballocation failed in new block"});
-
+            NN_FAIL("Suballocation failed in new block");
         VkDeviceMemory mem = new_block->memory;
         VkMemoryPropertyFlags flags = new_block->property_flags;
         new_block->allocation_count++;

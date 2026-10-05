@@ -345,8 +345,7 @@ public:
         VkBuffer buffer = VK_NULL_HANDLE;
         VkResult res = vkCreateBuffer(device, &buf_info, nullptr, &buffer);
         if (res != VK_SUCCESS)
-            return std::unexpected(Error{"vkCreateBuffer failed: " + std::to_string(res)});
-
+            NN_FAIL("vkCreateBuffer failed: " + std::to_string(res));
         VkMemoryRequirements mem_reqs;
         vkGetBufferMemoryRequirements(device, buffer, &mem_reqs);
 
@@ -363,7 +362,7 @@ public:
         {
             pool.free(*alloc_r);
             vkDestroyBuffer(device, buffer, nullptr);
-            return std::unexpected(Error{"vkBindBufferMemory failed: " + std::to_string(res)});
+            NN_FAIL("vkBindBufferMemory failed: " + std::to_string(res));
         }
 
         return GpuBuffer(device, buffer, *alloc_r, pool);
@@ -383,8 +382,7 @@ public:
         VkBuffer buffer = VK_NULL_HANDLE;
         VkResult res = vkCreateBuffer(device, &buf_info, nullptr, &buffer);
         if (res != VK_SUCCESS)
-            return std::unexpected(Error{"vkCreateBuffer failed: " + std::to_string(res)});
-
+            NN_FAIL("vkCreateBuffer failed: " + std::to_string(res));
         VkMemoryRequirements mem_reqs;
         vkGetBufferMemoryRequirements(device, buffer, &mem_reqs);
 
@@ -418,7 +416,7 @@ public:
         {
             pool.free(*alloc_r);
             vkDestroyBuffer(device, buffer, nullptr);
-            return std::unexpected(Error{"vkBindBufferMemory failed: " + std::to_string(res)});
+            NN_FAIL("vkBindBufferMemory failed: " + std::to_string(res));
         }
 
         return GpuBuffer(device, buffer, *alloc_r, pool);
@@ -1172,18 +1170,10 @@ public:
             {
                 // 设备丢失（TDR 触发）：GPU 已死亡，无法恢复
                 device_lost_ = true;
-                return std::unexpected(Error{
-                    "GPU 设备丢失 (VK_ERROR_DEVICE_LOST): Windows TDR 已重置 GPU 驱动。"
-                    "\n模型已自动保存，请使用 --resume <save-path> 重启训练。"
-                    "\n建议：减小 --batch-size 或 --seq-len，或增大 Windows TDR 超时"
-                    " (注册表 TdrDelay)"});
+                NN_FAIL("GPU 设备丢失 (VK_ERROR_DEVICE_LOST): Windows TDR 已重置 GPU 驱动。"                     "\n模型已自动保存，请使用 --resume <save-path> 重启训练。"                     "\n建议：减小 --batch-size 或 --seq-len，或增大 Windows TDR 超时"                     " (注册表 TdrDelay)");
             }
             if (wr != VK_SUCCESS)
-                return std::unexpected(Error{
-                    std::string("GPU 帧等待失败: Vulkan error ") +
-                    std::to_string(static_cast<int>(wr)) +
-                    "\n建议：减小 --batch-size 或 --seq-len，或增大 Windows TDR 超时"
-                    " (注册表 TdrDelay)"});
+                NN_FAIL(std::string("GPU 帧等待失败: Vulkan error ") +                     std::to_string(static_cast<int>(wr)) +                     "\n建议：减小 --batch-size 或 --seq-len，或增大 Windows TDR 超时"                     " (注册表 TdrDelay)");
         }
         // 该帧的延迟销毁：先 vkDestroyBuffer 再归还内存
         {
@@ -1226,8 +1216,7 @@ public:
         // 1. 检查 SPIR-V 是否可用
         const auto& spirv = get_matmul_spirv();
         if (spirv.empty())
-            return std::unexpected(Error{"matmul SPIR-V bytecode not embedded"});
-
+            NN_FAIL("matmul SPIR-V bytecode not embedded");
         // 2. 初始化 Vulkan 设备（先登记设备选择器）
         if (!device_selector.empty())
             device_.set_device_selector(std::move(device_selector));
@@ -1241,8 +1230,7 @@ public:
 
         // 3. 创建 matmul pipeline
         auto pl_r = VulkanPipeline::create_matmul(device_.device(), spirv);
-        if (!pl_r)
-            return std::unexpected(pl_r.error());
+        NN_TRY_CHECK(pl_r);
         matmul_pipeline_ = std::move(*pl_r);
 
         // 4. 创建 memory pool（持久 + 瞬态）
@@ -1912,21 +1900,14 @@ public:
             {
                 // 设备丢失（TDR 触发）：GPU 已死亡，无法恢复
                 device_lost_ = true;
-                return std::unexpected(Error{
-                    "GPU 设备丢失 (VK_ERROR_DEVICE_LOST): Windows TDR 已重置 GPU 驱动。"
-                    "\n模型已自动保存，请使用 --resume <save-path> 重启训练。"
-                    "\n建议：减小 --batch-size 或 --seq-len，或增大 Windows TDR 超时"
-                    " (注册表 TdrDelay)"});
+                NN_FAIL("GPU 设备丢失 (VK_ERROR_DEVICE_LOST): Windows TDR 已重置 GPU 驱动。"                     "\n模型已自动保存，请使用 --resume <save-path> 重启训练。"                     "\n建议：减小 --batch-size 或 --seq-len，或增大 Windows TDR 超时"                     " (注册表 TdrDelay)");
             }
             if (rs != VK_TIMEOUT && rs != VK_SUCCESS)
-                return std::unexpected(Error{
-                    std::string("GPU fence 非阻塞查询失败: Vulkan error ") +
-                    std::to_string(static_cast<int>(rs))});
+                NN_FAIL(std::string("GPU fence 非阻塞查询失败: Vulkan error ") +                     std::to_string(static_cast<int>(rs)));
             if (rs == VK_SUCCESS)
             {
                 auto rr = reap_frame(i, /*wait=*/false);
-                if (!rr)
-                    return std::unexpected(rr.error());
+                NN_TRY_CHECK(rr);
             }
         }
         return {};
@@ -1978,14 +1959,12 @@ public:
 
         auto& f = frames_[i];
         auto r = detail::vk_check(vkResetCommandBuffer(f.cmd, 0), __FILE__, __LINE__);
-        if (!r) return std::unexpected(r.error());
-
+        NN_TRY_CHECK(r);
         VkCommandBufferBeginInfo begin_info{};
         begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         r = detail::vk_check(vkBeginCommandBuffer(f.cmd, &begin_info), __FILE__, __LINE__);
-        if (!r) return std::unexpected(r.error());
-
+        NN_TRY_CHECK(r);
         batch_cmd_ = f.cmd;
         batch_frame_ = i;
         last_active_frame_ = i;
@@ -2005,8 +1984,7 @@ public:
         // reap 已确保 fence 处于 unsignaled（或从未提交）状态
         auto r = detail::vk_check(
             vkResetFences(device_.device(), 1, &f.fence), __FILE__, __LINE__);
-        if (!r) return std::unexpected(r.error());
-
+        NN_TRY_CHECK(r);
         // 跨 submit 数据依赖：帧命令的输入可能刚由 batch 内的 from_matrix
         // 独立上传提交写入——等 in-flight region 信号量（GPU 队列内等待，
         // host 不阻塞）
@@ -2024,8 +2002,7 @@ public:
                 vkQueueSubmit(device_.compute_queue(), 1, &submit_info, f.fence),
                 __FILE__, __LINE__);
         }
-        if (!r) return std::unexpected(r.error());
-
+        NN_TRY_CHECK(r);
         f.in_flight = true;
         last_active_frame_ = batch_frame_;
         // 提交后立即非阻塞收割其它已完成帧：让步内已析构张量的内存尽早
@@ -2034,8 +2011,7 @@ public:
         if (early_reap_enabled_)
         {
             auto rr = reap_completed_frames();
-            if (!rr)
-                return std::unexpected(rr.error());
+            NN_TRY_CHECK(rr);
         }
         return {};
     }
@@ -2043,9 +2019,9 @@ public:
     [[nodiscard]] Result<void> begin_batch()
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
+            NN_FAIL("GPU backend not initialized");
         if (batch_mode_)
-            return std::unexpected(Error{"Already in batch mode"});
+            NN_FAIL("Already in batch mode");
         return start_frame();
     }
 
@@ -2112,8 +2088,7 @@ public:
             if (frames_[i].in_flight)
             {
                 auto r = reap_frame(i, /*wait=*/true);
-                if (!r)
-                    return std::unexpected(r.error());
+                NN_TRY_CHECK(r);
             }
         }
         // 所有帧已完成：兜底清理剩余延迟销毁（正常应为空）
@@ -2131,14 +2106,12 @@ public:
     {
         using ElemType = elem<P>;
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
+            NN_FAIL("GPU backend not initialized");
         if (!dst.valid())
-            return std::unexpected(Error{"Invalid destination GpuTensor"});
-
+            NN_FAIL("Invalid destination GpuTensor");
         const std::size_t elem_count = dst.rows() * dst.cols();
         if (cpu_data.size() != elem_count)
-            return std::unexpected(Error{"Upload size mismatch"});
-
+            NN_FAIL("Upload size mismatch");
         const std::size_t total_bytes = elem_count * sizeof(ElemType);
         const std::size_t staging_cap = staging_ring_->region_size();
 
@@ -2288,14 +2261,12 @@ public:
     {
         using ElemType = elem<P>;
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
+            NN_FAIL("GPU backend not initialized");
         if (!src.valid())
-            return std::unexpected(Error{"Invalid source GpuTensor"});
-
+            NN_FAIL("Invalid source GpuTensor");
         const std::size_t elem_count = src.rows() * src.cols();
         if (cpu_data.size() != elem_count)
-            return std::unexpected(Error{"Download size mismatch"});
-
+            NN_FAIL("Download size mismatch");
         const std::size_t total_bytes = elem_count * sizeof(ElemType);
         const std::size_t staging_cap = staging_ring_->region_size();
 
@@ -2461,10 +2432,10 @@ public:
         std::uint32_t wg_x, std::uint32_t wg_y, std::uint32_t wg_z)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
+            NN_FAIL("GPU backend not initialized");
         const auto t_disp_start = std::chrono::steady_clock::now();
         auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
-        if (!ds_r) return std::unexpected(ds_r.error());
+        NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
 
         const std::size_t n = inputs.size() + 1;
@@ -2519,7 +2490,7 @@ public:
                     "[gpu-profile] record+setup=%lldus（提交/等待分段见上一条 solo_op）\n",
                     static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
                         t_rec - t_disp_start).count()));
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         return {};
     }
@@ -2534,16 +2505,14 @@ public:
         bool f16_io = false)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
-
+            NN_FAIL("GPU backend not initialized");
         // 计算有效维度（考虑转置）
         const auto M = static_cast<uint32_t>(transA ? A.cols() : A.rows());
         const auto K = static_cast<uint32_t>(transA ? A.rows() : A.cols());
         const auto N = static_cast<uint32_t>(transB ? B.rows() : B.cols());
         const auto K_B = static_cast<uint32_t>(transB ? B.cols() : B.rows());
         if (K != K_B)
-            return std::unexpected(Error{"Dimension mismatch"});
-
+            NN_FAIL("Dimension mismatch");
         // 1. 分配输出 Tensor（f16_io：按 2B/元素分配 + 纯绑定视图，见
         //    batched_matmul_gpu 的同款做法）
         const bool use_f16 = f16_io;
@@ -2554,21 +2523,18 @@ public:
             // gemv_f16 可用 → 下方分派走 GEMV，无需 tiled_f16
         }
         else if (use_f16 && !has_matmul_tiled_f16_pipeline())
-            return std::unexpected(Error{
-                "matmul_gpu: f16 pipeline 不可用（设备无 SSBO 16 位存储？）"});
+            NN_FAIL("matmul_gpu: f16 pipeline 不可用（设备无 SSBO 16 位存储？）");
         std::optional<GpuTensor> owned;
         if (use_f16)
         {
             auto f16r = GpuTensorF16::create_empty(M, N, *this);
-            if (!f16r)
-                return std::unexpected(f16r.error());
+            NN_TRY_CHECK(f16r);
             owned.emplace(f16r->shared_buffer(), f16r->rows(), f16r->cols());
         }
         else
         {
             auto C_res = GpuTensor::create_empty(M, N, *this);
-            if (!C_res)
-                return std::unexpected(C_res.error());
+            NN_TRY_CHECK(C_res);
             owned.emplace(std::move(*C_res));
         }
         GpuTensor C = *owned;
@@ -2614,15 +2580,13 @@ public:
         {
             auto r = dispatch_compute(pipeline, inputs, C, pc,
                 (M + GEMV_ROWS - 1u) / GEMV_ROWS, 1u, 1u);
-            if (!r)
-                return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             return C;
         }
         const uint32_t tile = use_tiled ? 64u : 16u;
         auto r = dispatch_compute(pipeline, inputs, C, pc,
             (N + tile - 1u) / tile, (M + tile - 1u) / tile, 1u);
-        if (!r)
-            return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return C;
     }
 
@@ -2645,20 +2609,17 @@ public:
         bool f16_io = false)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
+            NN_FAIL("GPU backend not initialized");
         if (batch == 0)
-            return std::unexpected(Error{"batched_matmul_gpu: batch must be > 0"});
+            NN_FAIL("batched_matmul_gpu: batch must be > 0");
         const bool use_f16 = f16_io && has_batched_matmul_f16_pipeline();
         if (f16_io && !use_f16)
-            return std::unexpected(Error{
-                "batched_matmul_gpu: f16 pipeline 不可用（设备无 SSBO 16 位存储？）"});
+            NN_FAIL("batched_matmul_gpu: f16 pipeline 不可用（设备无 SSBO 16 位存储？）");
         if (!use_f16 && !has_batched_matmul_pipeline())
-            return std::unexpected(Error{"batched_matmul_gpu: pipeline not available"});
-
+            NN_FAIL("batched_matmul_gpu: pipeline not available");
         // 校验：A.rows() 必须能被 batch 整除
         if (A.rows() % batch != 0 || B.rows() % batch != 0)
-            return std::unexpected(Error{"batched_matmul_gpu: rows not divisible by batch"});
-
+            NN_FAIL("batched_matmul_gpu: rows not divisible by batch");
         // 计算每个 batch 的逻辑维度
         const auto a_rows_per = static_cast<uint32_t>(A.rows() / batch);
         const auto b_rows_per = static_cast<uint32_t>(B.rows() / batch);
@@ -2667,8 +2628,7 @@ public:
         const auto K_B = transB ? static_cast<uint32_t>(B.cols()) : b_rows_per;
         const auto N = transB ? b_rows_per : static_cast<uint32_t>(B.cols());
         if (K != K_B)
-            return std::unexpected(Error{"batched_matmul_gpu: K dimension mismatch"});
-
+            NN_FAIL("batched_matmul_gpu: K dimension mismatch");
         // 1. 分配输出 Tensor: (batch * M, N)
         //    f16：按 2B/元素分配，再用 GpuTensor(shared_buffer,...) 包一层纯
         //    绑定视图交给 dispatch（调用方按 f16_io 重贴 GpuTensorF16）。
@@ -2677,15 +2637,13 @@ public:
         {
             auto f16r = GpuTensorF16::create_empty(
                 static_cast<std::size_t>(batch) * M, N, *this);
-            if (!f16r)
-                return std::unexpected(f16r.error());
+            NN_TRY_CHECK(f16r);
             owned.emplace(f16r->shared_buffer(), f16r->rows(), f16r->cols());
         }
         else
         {
             auto C_res = GpuTensor::create_empty(static_cast<std::size_t>(batch) * M, N, *this);
-            if (!C_res)
-                return std::unexpected(C_res.error());
+            NN_TRY_CHECK(C_res);
             owned.emplace(std::move(*C_res));
         }
         GpuTensor C = *owned;
@@ -2707,8 +2665,7 @@ public:
         auto r = dispatch_compute(
             use_f16 ? batched_matmul_f16_pipeline_ : batched_matmul_pipeline_,
             inputs, C, pc, (N + BN - 1) / BN, (M + BM - 1) / BM, batch);
-        if (!r)
-            return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return C;
     }
 
@@ -2728,34 +2685,34 @@ public:
         bool f16_io = false)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
+            NN_FAIL("GPU backend not initialized");
         if (dk == 0u || heads == 0u)
-            return std::unexpected(Error{"scan_prefix_outer_gpu: dk/heads must be > 0"});
+            NN_FAIL("scan_prefix_outer_gpu: dk/heads must be > 0");
         const bool generic = dk > 64u;  // 通用路径（状态驻全局 scratch，无 dk 上限）
         if (f16_io && !has_scan_f16_pipelines())
-            return std::unexpected(Error{"scan_prefix_outer_gpu: f16 pipelines not available"});
+            NN_FAIL("scan_prefix_outer_gpu: f16 pipelines not available");
         VulkanPipeline& pipe = generic
             ? (f16_io ? scan_prefix_outer_gen_f16_pipeline_ : scan_prefix_outer_gen_pipeline_)
             : (f16_io ? scan_prefix_outer_f16_pipeline_ : scan_prefix_outer_pipeline_);
         if (!generic && !has_scan_prefix_outer_pipeline())
-            return std::unexpected(Error{"scan_prefix_outer_gpu: pipeline not available"});
+            NN_FAIL("scan_prefix_outer_gpu: pipeline not available");
         if (generic && !has_scan_prefix_outer_gen_pipeline())
-            return std::unexpected(Error{"scan_prefix_outer_gpu: generic pipeline not available"});
+            NN_FAIL("scan_prefix_outer_gpu: generic pipeline not available");
         const auto rows = static_cast<uint32_t>(K.rows());
         if (rows % (dk * heads) != 0)
-            return std::unexpected(Error{"scan_prefix_outer_gpu: rows not divisible by H*dk"});
+            NN_FAIL("scan_prefix_outer_gpu: rows not divisible by H*dk");
         if (V.rows() != rows || V.cols() != K.cols() ||
             P.rows() != rows || P.cols() != K.cols() ||
             R.rows() != rows || R.cols() != K.cols())
-            return std::unexpected(Error{"scan_prefix_outer_gpu: K/V/P/R shape mismatch"});
+            NN_FAIL("scan_prefix_outer_gpu: K/V/P/R shape mismatch");
         if (has_state && (A0.rows() != heads * dk || A0.cols() != dk ||
                           B0.rows() != heads * dk || B0.cols() != dk))
-            return std::unexpected(Error{"scan_prefix_outer_gpu: A0/B0 must be (H*dk, dk)"});
+            NN_FAIL("scan_prefix_outer_gpu: A0/B0 must be (H*dk, dk)");
         const auto seq = static_cast<uint32_t>(K.cols());
         if (has_bnd)
         {
             if (boundary.rows() != 1 || boundary.cols() != (rows / (dk * heads)) * seq)
-                return std::unexpected(Error{"scan_prefix_outer_gpu: boundary must be (1, B*seq)"});
+                NN_FAIL("scan_prefix_outer_gpu: boundary must be (1, B*seq)");
         }
         const auto BH = rows / dk;
         const std::size_t out_rows = static_cast<std::size_t>(rows) * 5;
@@ -2763,15 +2720,13 @@ public:
         if (f16_io)
         {
             auto f16r = GpuTensorF16::create_empty(out_rows, seq, *this);
-            if (!f16r)
-                return std::unexpected(f16r.error());
+            NN_TRY_CHECK(f16r);
             C = GpuTensor(f16r->shared_buffer(), out_rows, seq);
         }
         else
         {
             auto C_res = GpuTensor::create_empty(out_rows, seq, *this);
-            if (!C_res)
-                return std::unexpected(C_res.error());
+            NN_TRY_CHECK(C_res);
             C = std::move(*C_res);
         }
         struct PushPrefix { uint32_t dk, heads, seq, causal, has_state, has_bnd, rows; };
@@ -2786,19 +2741,16 @@ public:
             // batch 录制期被引用（descriptor set）也不会过早释放。
             auto St_res = GpuTensor::create_empty(
                 static_cast<std::size_t>(BH) * 2u * dk * dk, 1u, *this);
-            if (!St_res)
-                return std::unexpected(St_res.error());
+            NN_TRY_CHECK(St_res);
             GpuTensor St = std::move(*St_res);
             std::vector<GpuTensor> inputs{K, V, P, R, A0, B0, boundary, St};
             auto r = dispatch_compute(pipe, inputs, C, pc, 1u, BH, 1u);
-            if (!r)
-                return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             return C;
         }
         std::vector<GpuTensor> inputs{K, V, P, R, A0, B0, boundary};
         auto r = dispatch_compute(pipe, inputs, C, pc, 1u, BH, 1u);
-        if (!r)
-            return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return C;
     }
 
@@ -2811,30 +2763,30 @@ public:
         bool f16_io = false)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
+            NN_FAIL("GPU backend not initialized");
         if (dk == 0u || heads == 0u)
-            return std::unexpected(Error{"scan_suffix_outer_gpu: dk/heads must be > 0"});
+            NN_FAIL("scan_suffix_outer_gpu: dk/heads must be > 0");
         const bool generic = dk > 64u;  // 通用路径（状态驻全局 scratch，无 dk 上限）
         if (f16_io && !has_scan_f16_pipelines())
-            return std::unexpected(Error{"scan_suffix_outer_gpu: f16 pipelines not available"});
+            NN_FAIL("scan_suffix_outer_gpu: f16 pipelines not available");
         VulkanPipeline& pipe = generic
             ? (f16_io ? scan_suffix_outer_gen_f16_pipeline_ : scan_suffix_outer_gen_pipeline_)
             : (f16_io ? scan_suffix_outer_f16_pipeline_ : scan_suffix_outer_pipeline_);
         if (!generic && !has_scan_suffix_outer_pipeline())
-            return std::unexpected(Error{"scan_suffix_outer_gpu: pipeline not available"});
+            NN_FAIL("scan_suffix_outer_gpu: pipeline not available");
         if (generic && !has_scan_suffix_outer_gen_pipeline())
-            return std::unexpected(Error{"scan_suffix_outer_gpu: generic pipeline not available"});
+            NN_FAIL("scan_suffix_outer_gpu: generic pipeline not available");
         const auto rows = static_cast<uint32_t>(X.rows());
         if (rows % (dk * heads) != 0)
-            return std::unexpected(Error{"scan_suffix_outer_gpu: X rows not divisible by H*dk"});
+            NN_FAIL("scan_suffix_outer_gpu: X rows not divisible by H*dk");
         if (D.rows() != rows * dk || D.cols() != X.cols() ||
             Y.rows() != rows || Y.cols() != X.cols())
-            return std::unexpected(Error{"scan_suffix_outer_gpu: D/X/Y shape mismatch"});
+            NN_FAIL("scan_suffix_outer_gpu: D/X/Y shape mismatch");
         const auto seq = static_cast<uint32_t>(X.cols());
         if (has_bnd)
         {
             if (boundary.rows() != 1 || boundary.cols() != (rows / (dk * heads)) * seq)
-                return std::unexpected(Error{"scan_suffix_outer_gpu: boundary must be (1, B*seq)"});
+                NN_FAIL("scan_suffix_outer_gpu: boundary must be (1, B*seq)");
         }
         const auto BH = rows / dk;
         const std::size_t out_rows = static_cast<std::size_t>(rows) * 3;
@@ -2842,15 +2794,13 @@ public:
         if (f16_io)
         {
             auto f16r = GpuTensorF16::create_empty(out_rows, seq, *this);
-            if (!f16r)
-                return std::unexpected(f16r.error());
+            NN_TRY_CHECK(f16r);
             C = GpuTensor(f16r->shared_buffer(), out_rows, seq);
         }
         else
         {
             auto C_res = GpuTensor::create_empty(out_rows, seq, *this);
-            if (!C_res)
-                return std::unexpected(C_res.error());
+            NN_TRY_CHECK(C_res);
             C = std::move(*C_res);
         }
         struct PushSuffix { uint32_t dk, heads, seq, causal, has_bnd, rows; };
@@ -2861,19 +2811,16 @@ public:
         {
             auto St_res = GpuTensor::create_empty(
                 static_cast<std::size_t>(BH) * dk * dk, 1u, *this);
-            if (!St_res)
-                return std::unexpected(St_res.error());
+            NN_TRY_CHECK(St_res);
             GpuTensor St = std::move(*St_res);
             std::vector<GpuTensor> inputs{D, X, Y, boundary, St};
             auto r = dispatch_compute(pipe, inputs, C, pc, 1u, BH, 1u);
-            if (!r)
-                return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             return C;
         }
         std::vector<GpuTensor> inputs{D, X, Y, boundary};
         auto r = dispatch_compute(pipe, inputs, C, pc, 1u, BH, 1u);
-        if (!r)
-            return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return C;
     }
 
@@ -2885,36 +2832,34 @@ public:
         bool f16_io = false)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
+            NN_FAIL("GPU backend not initialized");
         if (!has_outer_col_pipeline())
-            return std::unexpected(Error{"outer_col_gpu: pipeline not available"});
+            NN_FAIL("outer_col_gpu: pipeline not available");
         if (f16_io && outer_col_f16_pipeline_.handle() == VK_NULL_HANDLE)
-            return std::unexpected(Error{"outer_col_gpu: f16 pipeline not available"});
+            NN_FAIL("outer_col_gpu: f16 pipeline not available");
         VulkanPipeline& pipe = f16_io ? outer_col_f16_pipeline_ : outer_col_pipeline_;
         if (dk == 0u)
-            return std::unexpected(Error{"outer_col_gpu: dk must be > 0"});
+            NN_FAIL("outer_col_gpu: dk must be > 0");
         const auto rows = static_cast<uint32_t>(P.rows());
         if (rows % dk != 0)
-            return std::unexpected(Error{"outer_col_gpu: rows not divisible by dk"});
+            NN_FAIL("outer_col_gpu: rows not divisible by dk");
         if (R.rows() != rows || R.cols() != P.cols())
-            return std::unexpected(Error{"outer_col_gpu: P/R shape mismatch"});
+            NN_FAIL("outer_col_gpu: P/R shape mismatch");
         if (has_scale && (S.rows() != rows || S.cols() != P.cols()))
-            return std::unexpected(Error{"outer_col_gpu: S must be (B*H*dk, seq)"});
+            NN_FAIL("outer_col_gpu: S must be (B*H*dk, seq)");
         const auto seq = static_cast<uint32_t>(P.cols());
         const std::size_t out_rows = static_cast<std::size_t>(rows) * dk;
         GpuTensor C;
         if (f16_io)
         {
             auto f16r = GpuTensorF16::create_empty(out_rows, seq, *this);
-            if (!f16r)
-                return std::unexpected(f16r.error());
+            NN_TRY_CHECK(f16r);
             C = GpuTensor(f16r->shared_buffer(), out_rows, seq);
         }
         else
         {
             auto C_res = GpuTensor::create_empty(out_rows, seq, *this);
-            if (!C_res)
-                return std::unexpected(C_res.error());
+            NN_TRY_CHECK(C_res);
             C = std::move(*C_res);
         }
         struct PushOuter { uint32_t dk, seq, rows, has_scale; };
@@ -2925,8 +2870,7 @@ public:
         const auto total = static_cast<uint32_t>(rows) * dk * seq;
         auto r = dispatch_compute(pipe, inputs, C, pc,
             (total + 255u) / 256u, 1u, 1u);
-        if (!r)
-            return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return C;
     }
 
@@ -2954,7 +2898,7 @@ public:
         auto r = detail::vk_check(
             vkAllocateDescriptorSets(device_.device(), &desc_alloc, &desc_set),
             __FILE__, __LINE__);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         // batch 模式：描述符集被当前帧的已录制命令引用，归属该帧，
         // 帧的 fence 信号后（reap_frame）才释放
         if (batch_mode_) frames_[batch_frame_].desc_sets.push_back(desc_set);
@@ -3078,17 +3022,14 @@ public:
         // （规范允许 reset 从错误态恢复），下次调用可重试。
         VkCommandBuffer cmd = solo_cmd_;
         if (cmd == VK_NULL_HANDLE)
-            return std::unexpected(Error{"acquire_cmd: solo_cmd_ not initialized"});
-
+            NN_FAIL("acquire_cmd: solo_cmd_ not initialized");
         auto r = detail::vk_check(vkResetCommandBuffer(cmd, 0), __FILE__, __LINE__);
-        if (!r) return std::unexpected(r.error());
-
+        NN_TRY_CHECK(r);
         VkCommandBufferBeginInfo begin_info{};
         begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         r = detail::vk_check(vkBeginCommandBuffer(cmd, &begin_info), __FILE__, __LINE__);
-        if (!r)
-            return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return std::make_pair(cmd, true);
     }
 
@@ -3115,7 +3056,7 @@ public:
         {
             if (desc_set != VK_NULL_HANDLE)
                 vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-            return std::unexpected(Error{"submit_and_wait: solo_fence_ not initialized"});
+            NN_FAIL("submit_and_wait: solo_fence_ not initialized");
         }
         // 上一次 submit 已 wait 到 signaled → 这里 reset 回 unsignaled 复用
         //（首次调用时是 init 创建的 fresh unsignaled，reset 为合法 no-op）
@@ -3252,14 +3193,13 @@ public:
         const GpuTensor* out = nullptr, bool f16_io = false)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
+            NN_FAIL("GPU backend not initialized");
         if (!has_elementwise_v2_pipeline())
-            return std::unexpected(Error{"elementwise_v2 pipeline not available"});
+            NN_FAIL("elementwise_v2 pipeline not available");
         // Phase C1b f16 变体（仅需 16 位存储门控）；请求但无 pipeline →
         // 报错由引擎层回退边界 cast
         if (f16_io && !has_elementwise_v2_f16_pipeline())
-            return std::unexpected(Error{
-                "elementwise_v2_gpu: f16 pipeline 不可用（设备无16位存储）"});
+            NN_FAIL("elementwise_v2_gpu: f16 pipeline 不可用（设备无16位存储）");
         auto& pipeline = f16_io ? elementwise_v2_f16_pipeline_
                                 : elementwise_v2_pipeline_;
 
@@ -3273,19 +3213,19 @@ public:
         else if (f16_io)
         {
             auto f16r = GpuTensorF16::create_empty(A.rows(), A.cols(), *this);
-            if (!f16r) return std::unexpected(f16r.error());
+            NN_TRY_CHECK(f16r);
             output = GpuTensor(f16r->shared_buffer(), f16r->rows(), f16r->cols());
         }
         else
         {
             auto output_res = GpuTensor::create_empty(A.rows(), A.cols(), *this);
-            if (!output_res) return std::unexpected(output_res.error());
+            NN_TRY_CHECK(output_res);
             output = std::move(*output_res);
         }
 
         // 2. 分配描述符集
         auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
-        if (!ds_r) return std::unexpected(ds_r.error());
+        NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
 
         // 3. 写入描述符集（未使用的 binding 绑定 A 作为占位）
@@ -3341,7 +3281,7 @@ public:
         if (owns_cmd)
         {
             auto r = submit_and_wait(cmd, desc_set);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         return output;
     }
@@ -3393,11 +3333,11 @@ public:
         nn::ExprPrecSig prec_sig = 0)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
+            NN_FAIL("GPU backend not initialized");
         const auto prof_t0 = std::chrono::steady_clock::now();
         const auto it = fused_pipelines_.find(shader_name);
         if (it == fused_pipelines_.end())
-            return std::unexpected(Error{"fused shader not registered: " + shader_name});
+            NN_FAIL("fused shader not registered: " + shader_name);
         const VulkanPipeline& pipeline = it->second;
         // 运行期精度分派变体（键后缀 "#x"）：描述符 = 2N 输入视图 + 2 输出视图，
         // 且 PC 固定头末尾多一个 `prec` 槽。
@@ -3408,8 +3348,7 @@ public:
         // push constant 超 range 被驱动丢弃 → 静默读未定义残留）。
         const auto pcbase_it = fused_pc_base_fixed_.find(shader_name);
         if (pcbase_it == fused_pc_base_fixed_.end())
-            return std::unexpected(Error{
-                "run_fused_gpu: shader 元数据缺失（pc_base_fixed）：" + shader_name});
+            NN_FAIL("run_fused_gpu: shader 元数据缺失（pc_base_fixed）：" + shader_name);
         const std::uint32_t pc_base_fixed = pcbase_it->second;
         // 归约轴：-1=逐元素, 0=行归约, 1=列归约
         const int raxis = fused_reduce_axis_.count(shader_name)
@@ -3431,38 +3370,30 @@ public:
             ? fused_rparam_counts_.at(shader_name) : 0u;
 
         if (inputs.size() + 1 > EXPR_MAX_INPUTS + 1)
-            return std::unexpected(Error{"run_fused_gpu: too many inputs"});
+            NN_FAIL("run_fused_gpu: too many inputs");
         if (consts.size() > EXPR_MAX_CONSTS)
-            return std::unexpected(Error{"run_fused_gpu: too many constants"});
+            NN_FAIL("run_fused_gpu: too many constants");
         if (view_params.size() != n_vp)
-            return std::unexpected(Error{
-                "run_fused_gpu: view_params count mismatch for " + shader_name});
+            NN_FAIL("run_fused_gpu: view_params count mismatch for " + shader_name);
         if (rparams.size() != n_rp)
-            return std::unexpected(Error{
-                "run_fused_gpu: rparams count mismatch for " + shader_name});
+            NN_FAIL("run_fused_gpu: rparams count mismatch for " + shader_name);
         if (has_mm && !matmul_k)
-            return std::unexpected(Error{
-                "run_fused_gpu: matmul shader 缺少 matmul_k（求和维度）"});
+            NN_FAIL("run_fused_gpu: matmul shader 缺少 matmul_k（求和维度）");
         if (!has_mm && matmul_k && !is_fold)
-            return std::unexpected(Error{
-                "run_fused_gpu: 非 matmul shader 收到了 matmul_k"});
+            NN_FAIL("run_fused_gpu: 非 matmul shader 收到了 matmul_k");
         // fold 形态校验（与 matmul_k 同款对称防呆 + 调用约定）：
         //   fold 输出网格 = (rows, out_cols)，out_cols = vec_state_len（或 1），
         //   cols 参数必须等于它（GpuEngine/层调用约定）；PC cols 槽填 fold_k
         //   （视图/块轴列数=键长，见下方 cols32），不填输出列。
         //   fold+matmul 时 matmul_k/matmul_batch 同传（PC slot5/6）。
         if (is_fold && !fold_k)
-            return std::unexpected(Error{
-                "run_fused_gpu: fold shader 缺少 fold_k（收缩轴长度）"});
+            NN_FAIL("run_fused_gpu: fold shader 缺少 fold_k（收缩轴长度）");
         if (!is_fold && fold_k)
-            return std::unexpected(Error{
-                "run_fused_gpu: 非 fold shader 收到了 fold_k"});
+            NN_FAIL("run_fused_gpu: 非 fold shader 收到了 fold_k");
         if (is_fold && vector_out)
-            return std::unexpected(Error{
-                "run_fused_gpu: fold shader 以 vector_out 调度（应走 eval_expr）"});
+            NN_FAIL("run_fused_gpu: fold shader 以 vector_out 调度（应走 eval_expr）");
         if (is_fold && cols == 0)
-            return std::unexpected(Error{
-                "run_fused_gpu: fold 调用约定 cols（=输出列数 out_cols）必须 > 0"});
+            NN_FAIL("run_fused_gpu: fold 调用约定 cols（=输出列数 out_cols）必须 > 0");
         // （形状无关：out_cols 不做 shader 侧比对——veclen 不进 key，同一
         //   shader 服务任意 d_k，PC vector_out 槽按调用方 cols 运行时填充）
         // matmul+归约：raxis >= 0 时 mm_k 填入 PC 第 5 槽（见下方填充）
@@ -3470,8 +3401,7 @@ public:
         // count 以 uint32 传入 shader（gl_GlobalInvocationID / push constant），
         // 必须保证 rows*cols 不溢出 uint32，否则分派与索引会静默截断。
         if (rows > 0 && cols > UINT32_MAX / rows)
-            return std::unexpected(Error{
-                "run_fused_gpu: rows*cols exceeds uint32 range"});
+            NN_FAIL("run_fused_gpu: rows*cols exceeds uint32 range");
         const std::uint32_t count = static_cast<std::uint32_t>(rows * cols);
 
         // 1. 分配输出 Tensor（vector_out：归约向量原生形状 (rows,1)/(1,cols)）
@@ -3487,22 +3417,20 @@ public:
         if (output_override)
         {
             if (output_override->rows() != out_rows || output_override->cols() != out_cols)
-                return std::unexpected(Error{
-                    "run_fused_gpu: output_override shape mismatch (" +
-                    std::to_string(out_rows) + "x" + std::to_string(out_cols) + ")"});
+                NN_FAIL("run_fused_gpu: output_override shape mismatch (" +                     std::to_string(out_rows) + "x" + std::to_string(out_cols) + ")");
         }
         else if (out_f16)
         {
             // f16 输出：按 f16 字节布局分配（2B/元素，偶数槽位对齐见 create_f16_tensor）
             auto f16r = GpuTensorF16::create_empty(out_rows, out_cols, *this);
-            if (!f16r) return std::unexpected(f16r.error());
+            NN_TRY_CHECK(f16r);
             owned_output.emplace(f16r->shared_buffer(), out_rows, out_cols);
             output_ptr = &*owned_output;
         }
         else
         {
             auto output_res = GpuTensor::create_empty(out_rows, out_cols, *this);
-            if (!output_res) return std::unexpected(output_res.error());
+            NN_TRY_CHECK(output_res);
             owned_output.emplace(std::move(*output_res));
             output_ptr = &*owned_output;
         }
@@ -3510,7 +3438,7 @@ public:
 
         // 2. 分配描述符集（N 输入 + 1 输出；分派变体 = 2N + 2）
         auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
-        if (!ds_r) return std::unexpected(ds_r.error());
+        NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
 
         const std::size_t n_in = inputs.size();
@@ -3720,7 +3648,7 @@ public:
         if (owns_cmd)
         {
             auto r = submit_and_wait(cmd, desc_set);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         if (profile_ops_enabled())
         {
@@ -3761,11 +3689,11 @@ public:
         bool f16_in = false)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
+            NN_FAIL("GPU backend not initialized");
         if (!has_reduce_pipeline())
-            return std::unexpected(Error{"reduce pipeline not available"});
+            NN_FAIL("reduce pipeline not available");
         if (f16_in && !has_reduce_f16_pipeline())
-            return std::unexpected(Error{"reduce f16 pipeline not available"});
+            NN_FAIL("reduce f16 pipeline not available");
         // 输入侧 pipeline（pass1 / 单段）；输出侧与 pass2 恒 f32 pipeline
         VulkanPipeline& in_pipe = f16_in ? reduce_f16_pipeline_ : reduce_pipeline_;
 
@@ -3776,7 +3704,7 @@ public:
         std::size_t out_rows = (mode == 0) ? rows : 1;
         std::size_t out_cols = (mode == 0) ? 1 : cols;
         auto output_res = GpuTensor::create_empty(out_rows, out_cols, *this);
-        if (!output_res) return std::unexpected(output_res.error());
+        NN_TRY_CHECK(output_res);
         GpuTensor output = std::move(*output_res);
 
         // ── 列归约大行数：两段式 partials（ggml rms_norm_partials 模式）──
@@ -3815,7 +3743,7 @@ public:
                 static_cast<uint32_t>(reduce_partial_->cols()) != cols)
             {
                 auto pres = GpuTensor::create_empty(nchunk, cols, *this);
-                if (!pres) return std::unexpected(pres.error());
+                NN_TRY_CHECK(pres);
                 reduce_partial_ = std::move(*pres);
             }
             const GpuTensor& partial = *reduce_partial_;
@@ -3824,10 +3752,10 @@ public:
             // pass2 读 f32 partials → 恒 f32 pipeline（f16 shader 读 f32
             // partials = 静默错值，必须分开）
             auto ds1_r = alloc_desc_set(in_pipe.descriptor_layout());
-            if (!ds1_r) return std::unexpected(ds1_r.error());
+            NN_TRY_CHECK(ds1_r);
             VkDescriptorSet ds1 = *ds1_r;
             auto ds2_r = alloc_desc_set(reduce_pipeline_.descriptor_layout());
-            if (!ds2_r) return std::unexpected(ds2_r.error());
+            NN_TRY_CHECK(ds2_r);
             VkDescriptorSet ds2 = *ds2_r;
 
             VkDescriptorBufferInfo infos1[2]{
@@ -3891,7 +3819,7 @@ public:
             if (owns_cmd)
             {
                 auto r = submit_and_wait(cmd, ds1);   // 等 fence 后归还 ds1
-                if (!r) return std::unexpected(r.error());
+                NN_TRY_CHECK(r);
                 vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &ds2);
             }
             return output;
@@ -3899,7 +3827,7 @@ public:
 
         // 2. 分配描述符集（随 in_pipe：f16_in 时输入按 float16_t 读）
         auto ds_r = alloc_desc_set(in_pipe.descriptor_layout());
-        if (!ds_r) return std::unexpected(ds_r.error());
+        NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
 
         // 3. 写入描述符集
@@ -3950,7 +3878,7 @@ public:
         if (owns_cmd)
         {
             auto r = submit_and_wait(cmd, desc_set);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         return output;
     }
@@ -3969,19 +3897,17 @@ public:
         bool f16_io = false)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
+            NN_FAIL("GPU backend not initialized");
         if (!has_rearrange_3d_pipeline())
-            return std::unexpected(Error{"rearrange_3d pipeline not available"});
+            NN_FAIL("rearrange_3d pipeline not available");
         if (f16_io && !has_rearrange_3d_f16_pipeline())
-            return std::unexpected(Error{
-                "rearrange_3d_gpu: f16 pipeline 不可用（设备无16位存储）"});
+            NN_FAIL("rearrange_3d_gpu: f16 pipeline 不可用（设备无16位存储）");
         auto& pipeline = f16_io ? rearrange_3d_f16_pipeline_
                                 : rearrange_3d_pipeline_;
 
         const uint32_t total = M * B * N;
         if (total != input.rows() * input.cols())
-            return std::unexpected(Error{"rearrange_3d: element count mismatch"});
-
+            NN_FAIL("rearrange_3d: element count mismatch");
         // 1. 分配输出 Tensor（f16：2B/元素 + 纯绑定视图，同 matmul_gpu）
         const std::size_t out_rows = inverse ? M : (static_cast<std::size_t>(B) * M);
         const std::size_t out_cols = inverse ? (static_cast<std::size_t>(B) * N) : N;
@@ -3989,20 +3915,20 @@ public:
         if (f16_io)
         {
             auto f16r = GpuTensorF16::create_empty(out_rows, out_cols, *this);
-            if (!f16r) return std::unexpected(f16r.error());
+            NN_TRY_CHECK(f16r);
             owned.emplace(f16r->shared_buffer(), f16r->rows(), f16r->cols());
         }
         else
         {
             auto output_res = GpuTensor::create_empty(out_rows, out_cols, *this);
-            if (!output_res) return std::unexpected(output_res.error());
+            NN_TRY_CHECK(output_res);
             owned.emplace(std::move(*output_res));
         }
         GpuTensor output = *owned;
 
         // 2. 分配描述符集
         auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
-        if (!ds_r) return std::unexpected(ds_r.error());
+        NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
 
         // 3. 写入描述符集
@@ -4050,7 +3976,7 @@ public:
         if (owns_cmd)
         {
             auto r = submit_and_wait(cmd, desc_set);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         return output;
     }
@@ -4062,10 +3988,9 @@ public:
     [[nodiscard]] Result<void> fill_zero_gpu(GpuTensorT<P>& tensor)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
-
+            NN_FAIL("GPU backend not initialized");
         auto cmd_r = acquire_cmd();
-        if (!cmd_r) return std::unexpected(cmd_r.error());
+        NN_TRY_CHECK(cmd_r);
         auto [cmd, owns_cmd] = *cmd_r;
 
         vkCmdFillBuffer(cmd, tensor.buffer().impl(), 0, VK_WHOLE_SIZE, 0);
@@ -4089,7 +4014,7 @@ public:
         {
             // fill_zero 不使用描述符集，传 VK_NULL_HANDLE 跳过释放
             auto r = submit_and_wait(cmd, VK_NULL_HANDLE);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         return {};
     }
@@ -4114,10 +4039,9 @@ public:
         VkDeviceSize size)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
-
+            NN_FAIL("GPU backend not initialized");
         auto cmd_r = acquire_cmd();
-        if (!cmd_r) return std::unexpected(cmd_r.error());
+        NN_TRY_CHECK(cmd_r);
         auto [cmd, owns_cmd] = *cmd_r;
 
         VkBufferCopy cp{src_offset, dst_offset, size};
@@ -4140,7 +4064,7 @@ public:
         if (owns_cmd)
         {
             auto r = submit_and_wait(cmd, VK_NULL_HANDLE);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         return {};
     }
@@ -4160,14 +4084,12 @@ public:
             ca.commandBufferCount = 1;
             auto r = detail::vk_check(
                 vkAllocateCommandBuffers(device_.device(), &ca, &s.cmd), __FILE__, __LINE__);
-            if (!r) return std::unexpected(r.error());
-
+            NN_TRY_CHECK(r);
             VkFenceCreateInfo fi{};
             fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
             r = detail::vk_check(
                 vkCreateFence(device_.device(), &fi, nullptr, &s.fence), __FILE__, __LINE__);
-            if (!r) return std::unexpected(r.error());
-
+            NN_TRY_CHECK(r);
             VkBufferCreateInfo bi{};
             bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
             bi.size = sizeof(float);
@@ -4175,24 +4097,23 @@ public:
             bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
             r = detail::vk_check(
                 vkCreateBuffer(device_.device(), &bi, nullptr, &s.host), __FILE__, __LINE__);
-            if (!r) return std::unexpected(r.error());
-
+            NN_TRY_CHECK(r);
             VkMemoryRequirements mr{};
             vkGetBufferMemoryRequirements(device_.device(), s.host, &mr);
             constexpr VkMemoryPropertyFlags kVis = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
             constexpr VkMemoryPropertyFlags kCoh = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
             auto ar = memory_pool().allocate(mr, kVis | kCoh, kVis);
-            if (!ar) return std::unexpected(ar.error());
+            NN_TRY_CHECK(ar);
             s.alloc = *ar;
             r = detail::vk_check(
                 vkBindBufferMemory(device_.device(), s.host, s.alloc.memory, s.alloc.offset),
                 __FILE__, __LINE__);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             r = detail::vk_check(
                 vkMapMemory(device_.device(), s.alloc.memory, s.alloc.offset,
                             sizeof(float), 0, &s.mapped),
                 __FILE__, __LINE__);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         return {};
     }
@@ -4226,9 +4147,9 @@ public:
     [[nodiscard]] Result<void> submit_scalar_readback(std::size_t slot, VkBuffer src)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
+            NN_FAIL("GPU backend not initialized");
         if (slot >= rb_slots_.size())
-            return std::unexpected(Error{"scalar readback: slot out of range"});
+            NN_FAIL("scalar readback: slot out of range");
         auto& s = rb_slots_[slot];
 
         // 上一轮的值尚未取走：等它就绪（防御路径；正常调用方先 poll）
@@ -4240,24 +4161,21 @@ public:
             if (wr == VK_ERROR_DEVICE_LOST)
             {
                 device_lost_ = true;
-                return std::unexpected(Error{
-                    "scalar readback: VK_ERROR_DEVICE_LOST（GPU 已被 TDR 重置）"});
+                NN_FAIL("scalar readback: VK_ERROR_DEVICE_LOST（GPU 已被 TDR 重置）");
             }
             if (wr != VK_SUCCESS)
-                return std::unexpected(
-                    Error{"scalar readback: fence wait failed " +
-                          std::to_string(static_cast<int>(wr))});
+                NN_FAIL("scalar readback: fence wait failed " +
+                          std::to_string(static_cast<int>(wr)));
             s.pending = false;
         }
 
         auto r = detail::vk_check(vkResetCommandBuffer(s.cmd, 0), __FILE__, __LINE__);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         VkCommandBufferBeginInfo cbi{};
         cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         r = detail::vk_check(vkBeginCommandBuffer(s.cmd, &cbi), __FILE__, __LINE__);
-        if (!r) return std::unexpected(r.error());
-
+        NN_TRY_CHECK(r);
         VkBufferCopy cp{};
         cp.srcOffset = 0;
         cp.dstOffset = 0;
@@ -4278,10 +4196,9 @@ public:
             0, 0, nullptr, 1, &b, 0, nullptr);
 
         r = detail::vk_check(vkEndCommandBuffer(s.cmd), __FILE__, __LINE__);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         r = detail::vk_check(vkResetFences(device_.device(), 1, &s.fence), __FILE__, __LINE__);
-        if (!r) return std::unexpected(r.error());
-
+        NN_TRY_CHECK(r);
         {
             std::lock_guard lock(queue_mutex_);
             VkSubmitInfo si{};
@@ -4291,7 +4208,7 @@ public:
             r = detail::vk_check(
                 vkQueueSubmit(device_.compute_queue(), 1, &si, s.fence), __FILE__, __LINE__);
         }
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         s.pending = true;
         return {};
     }
@@ -4300,7 +4217,7 @@ public:
     [[nodiscard]] Result<bool> poll_scalar_readback(std::size_t slot, float& out)
     {
         if (slot >= rb_slots_.size())
-            return std::unexpected(Error{"scalar readback: slot out of range"});
+            NN_FAIL("scalar readback: slot out of range");
         auto& s = rb_slots_[slot];
         if (!s.pending)
             return false;
@@ -4310,15 +4227,11 @@ public:
         if (st == VK_ERROR_DEVICE_LOST)
         {
             device_lost_ = true;
-            return std::unexpected(Error{
-                "scalar readback: VK_ERROR_DEVICE_LOST（GPU 已被 TDR 重置）"});
+            NN_FAIL("scalar readback: VK_ERROR_DEVICE_LOST（GPU 已被 TDR 重置）");
         }
         if (st != VK_SUCCESS)
-            return std::unexpected(
-                Error{"scalar readback: fence status " +
-                      std::to_string(static_cast<int>(st))});
-
-        // 非 coherent 内存需 invalidate；coherent 下该调用是合法的 no-op。
+            NN_FAIL("scalar readback: fence status " +
+                      std::to_string(static_cast<int>(st)));
         // size = VK_WHOLE_SIZE 时 offset 无对齐要求（VU 只约束非 WHOLE_SIZE）。
         VkMappedMemoryRange mr{};
         mr.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
@@ -4326,8 +4239,7 @@ public:
         mr.offset = s.alloc.offset;
         mr.size = VK_WHOLE_SIZE;
         if (vkInvalidateMappedMemoryRanges(device_.device(), 1, &mr) != VK_SUCCESS)
-            return std::unexpected(Error{"scalar readback: invalidate mapped range failed"});
-
+            NN_FAIL("scalar readback: invalidate mapped range failed");
         std::memcpy(&out, s.mapped, sizeof(float));
         s.pending = false;
         return true;
@@ -4340,19 +4252,17 @@ public:
     [[nodiscard]] Result<GpuTensorT<P>> clone_gpu(const GpuTensorT<P>& src)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
-
+            NN_FAIL("GPU backend not initialized");
         // 1. 分配同形状的新 buffer
         auto dst_res = GpuTensorT<P>::create_empty(src.rows(), src.cols(), *this);
-        if (!dst_res) return std::unexpected(dst_res.error());
+        NN_TRY_CHECK(dst_res);
         GpuTensorT<P> dst = std::move(*dst_res);
 
         // 2. GPU 内拷贝
         const VkDeviceSize size = static_cast<VkDeviceSize>(
             src.rows() * src.cols() * sizeof(elem<P>));
         auto r = copy_buffer_gpu(src.buffer().impl(), dst.buffer().impl(), size);
-        if (!r) return std::unexpected(r.error());
-
+        NN_TRY_CHECK(r);
         return dst;
     }
 
@@ -4367,12 +4277,11 @@ public:
         std::size_t count, std::uint32_t kind)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
+            NN_FAIL("GPU backend not initialized");
         if (!has_cast_pipeline())
-            return std::unexpected(Error{"cast_gpu: cast pipeline not available"});
-
+            NN_FAIL("cast_gpu: cast pipeline not available");
         auto ds_r = alloc_desc_set(cast_pipeline_.descriptor_layout());
-        if (!ds_r) return std::unexpected(ds_r.error());
+        NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
 
         VkDescriptorBufferInfo binfo[2] = {
@@ -4427,7 +4336,7 @@ public:
         if (owns_cmd)
         {
             auto r = submit_and_wait(cmd, desc_set);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         return {};
     }
@@ -4440,14 +4349,14 @@ public:
         std::size_t rows, std::size_t cols)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
+            NN_FAIL("GPU backend not initialized");
         const std::size_t cnt = rows * cols;
         const std::size_t cnt_pad = cnt + (cnt & 1u);         // 偶数槽位
         auto b = GpuBuffer::create_device_local(
             device_.device(), *memory_pool_, cnt_pad * 2u,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
                 | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        if (!b) return std::unexpected(b.error());
+        NN_TRY_CHECK(b);
         return GpuTensorF16(std::make_shared<GpuBuffer>(std::move(*b)), rows, cols);
     }
     template <Precision P>
@@ -4455,15 +4364,13 @@ public:
         const GpuTensorT<P>& src, std::size_t start_row, std::size_t count)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
-
+            NN_FAIL("GPU backend not initialized");
         const std::size_t cols = src.cols();
         if (start_row + count > src.rows())
-            return std::unexpected(Error{"slice_rows_gpu: range out of bounds"});
-
+            NN_FAIL("slice_rows_gpu: range out of bounds");
         // 分配目标 buffer
         auto dst_res = GpuTensorT<P>::create_empty(count, cols, *this);
-        if (!dst_res) return std::unexpected(dst_res.error());
+        NN_TRY_CHECK(dst_res);
         GpuTensorT<P> dst = std::move(*dst_res);
 
         // 行区间在行主序下连续：[start_row * cols, (start_row + count) * cols)
@@ -4474,7 +4381,7 @@ public:
             count * cols * elem_size);
 
         auto cmd_r = acquire_cmd();
-        if (!cmd_r) return std::unexpected(cmd_r.error());
+        NN_TRY_CHECK(cmd_r);
         auto [cmd, owns_cmd] = *cmd_r;
 
         VkBufferCopy cp{src_offset, 0, size};
@@ -4497,7 +4404,7 @@ public:
         if (owns_cmd)
         {
             auto r = submit_and_wait(cmd, VK_NULL_HANDLE);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         return dst;
     }
@@ -4513,14 +4420,12 @@ public:
         GpuTensorT<P>& dst, std::size_t dst_start_row, const GpuTensorT<P>& src)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
-
+            NN_FAIL("GPU backend not initialized");
         const std::size_t cols = dst.cols();
         if (src.cols() != cols)
-            return std::unexpected(Error{"insert_rows_gpu: column count mismatch"});
+            NN_FAIL("insert_rows_gpu: column count mismatch");
         if (dst_start_row + src.rows() > dst.rows())
-            return std::unexpected(Error{"insert_rows_gpu: range out of bounds"});
-
+            NN_FAIL("insert_rows_gpu: range out of bounds");
         const std::size_t elem_size = sizeof(elem<P>);
         const VkDeviceSize dst_offset = static_cast<VkDeviceSize>(
             dst_start_row * cols * elem_size);
@@ -4528,7 +4433,7 @@ public:
             src.rows() * cols * elem_size);
 
         auto cmd_r = acquire_cmd();
-        if (!cmd_r) return std::unexpected(cmd_r.error());
+        NN_TRY_CHECK(cmd_r);
         auto [cmd, owns_cmd] = *cmd_r;
 
         VkBufferCopy cp{0, dst_offset, size};
@@ -4551,7 +4456,7 @@ public:
         if (owns_cmd)
         {
             auto r = submit_and_wait(cmd, VK_NULL_HANDLE);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         return {};
     }
@@ -4563,21 +4468,16 @@ public:
         uint32_t transA = 0, uint32_t transB = 0)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
-
+            NN_FAIL("GPU backend not initialized");
         // 1. 创建临时 GPU buffers（byte count = 元素数 × sizeof(float)，§6.3）
         auto a_buf = GpuBuffer::create_device_local(
             device_.device(), *memory_pool_, M * K * sizeof(float),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        if (!a_buf)
-            return std::unexpected(a_buf.error());
-
+        NN_TRY_CHECK(a_buf);
         auto b_buf = GpuBuffer::create_device_local(
             device_.device(), *memory_pool_, K * N * sizeof(float),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        if (!b_buf)
-            return std::unexpected(b_buf.error());
-
+        NN_TRY_CHECK(b_buf);
         // 2. 上传数据
         auto a_tensor = GpuTensor(std::make_shared<GpuBuffer>(std::move(*a_buf)), M, K);
         auto b_tensor = GpuTensor(std::make_shared<GpuBuffer>(std::move(*b_buf)), K, N);
@@ -4592,9 +4492,7 @@ public:
 
         // 3. 执行 matmul
         auto c_tensor_res = matmul_gpu(a_tensor, b_tensor, transA, transB);
-        if (!c_tensor_res)
-            return std::unexpected(c_tensor_res.error());
-
+        NN_TRY_CHECK(c_tensor_res);
         // 4. 下载结果
         r = download_blocking(*c_tensor_res, c);
         if (!r)
@@ -4613,14 +4511,13 @@ public:
                                                   bool f16_io = false)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
+            NN_FAIL("GPU backend not initialized");
         if (!has_transpose_pipeline())
-            return std::unexpected(Error{"transpose pipeline not available"});
+            NN_FAIL("transpose pipeline not available");
         // Phase C1 f16 变体：f16_io 请求但设备无 f16 pipeline（能力门控未过）
         // → 显式报错，引擎层回退边界 cast（不静默绑错类型）
         if (f16_io && !has_transpose_f16_pipeline())
-            return std::unexpected(Error{
-                "transpose_gpu: f16 pipeline 不可用（需16位存储 + shaderFloat16）"});
+            NN_FAIL("transpose_gpu: f16 pipeline 不可用（需16位存储 + shaderFloat16）");
         auto& pipeline = f16_io ? transpose_f16_pipeline_ : transpose_pipeline_;
 
         const uint32_t R = static_cast<uint32_t>(A.rows());
@@ -4631,20 +4528,20 @@ public:
         if (f16_io)
         {
             auto f16r = GpuTensorF16::create_empty(C, R, *this);
-            if (!f16r) return std::unexpected(f16r.error());
+            NN_TRY_CHECK(f16r);
             owned.emplace(f16r->shared_buffer(), f16r->rows(), f16r->cols());
         }
         else
         {
             auto out_res = GpuTensor::create_empty(C, R, *this);
-            if (!out_res) return std::unexpected(out_res.error());
+            NN_TRY_CHECK(out_res);
             owned.emplace(std::move(*out_res));
         }
         GpuTensor output = *owned;
 
         // 分配描述符集
         auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
-        if (!ds_r) return std::unexpected(ds_r.error());
+        NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
 
         // 写入描述符集
@@ -4701,7 +4598,7 @@ public:
         if (owns_cmd)
         {
             auto r = submit_and_wait(cmd, desc_set);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         return output;
     }
@@ -4720,15 +4617,15 @@ public:
         bool f16_io = false)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
+            NN_FAIL("GPU backend not initialized");
         if (!has_im2col_pipeline())
-            return std::unexpected(Error{"im2col pipeline not available"});
+            NN_FAIL("im2col pipeline not available");
         if (f16_io && !has_im2col_f16_pipeline())
-            return std::unexpected(Error{"im2col f16 pipeline not available"});
+            NN_FAIL("im2col f16 pipeline not available");
         if (C == 0 || H == 0 || W == 0 || k == 0 || stride == 0 || OH == 0 || OW == 0)
-            return std::unexpected(Error{"im2col_gpu: C/H/W/k/stride/OH/OW must be > 0"});
+            NN_FAIL("im2col_gpu: C/H/W/k/stride/OH/OW must be > 0");
         if (x.rows() != C * H * W)
-            return std::unexpected(Error{"im2col_gpu: x must be (C*H*W, B)"});
+            NN_FAIL("im2col_gpu: x must be (C*H*W, B)");
         VulkanPipeline& pipe = f16_io ? im2col_f16_pipeline_ : im2col_pipeline_;
 
         const std::size_t B    = x.cols();
@@ -4740,18 +4637,18 @@ public:
         if (f16_io)
         {
             auto f16r = GpuTensorF16::create_empty(rows, cols, *this);
-            if (!f16r) return std::unexpected(f16r.error());
+            NN_TRY_CHECK(f16r);
             output = GpuTensor(f16r->shared_buffer(), rows, cols);
         }
         else
         {
             auto out_res = GpuTensor::create_empty(rows, cols, *this);
-            if (!out_res) return std::unexpected(out_res.error());
+            NN_TRY_CHECK(out_res);
             output = std::move(*out_res);
         }
 
         auto ds_r = alloc_desc_set(pipe.descriptor_layout());
-        if (!ds_r) return std::unexpected(ds_r.error());
+        NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
 
         VkDescriptorBufferInfo buf_infos[2]{
@@ -4801,7 +4698,7 @@ public:
         if (owns_cmd)
         {
             auto r = submit_and_wait(cmd, desc_set);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         return output;
     }
@@ -4814,16 +4711,16 @@ public:
         bool f16_io = false)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
+            NN_FAIL("GPU backend not initialized");
         if (!has_col2im_pipeline())
-            return std::unexpected(Error{"col2im pipeline not available"});
+            NN_FAIL("col2im pipeline not available");
         if (f16_io && !has_col2im_f16_pipeline())
-            return std::unexpected(Error{"col2im f16 pipeline not available"});
+            NN_FAIL("col2im f16 pipeline not available");
         if (C == 0 || H == 0 || W == 0 || k == 0 || stride == 0 || OH == 0 || OW == 0)
-            return std::unexpected(Error{"col2im_gpu: C/H/W/k/stride/OH/OW must be > 0"});
+            NN_FAIL("col2im_gpu: C/H/W/k/stride/OH/OW must be > 0");
         const std::size_t P = OH * OW;
         if (col.rows() != C * k * k || col.cols() == 0 || col.cols() % P != 0)
-            return std::unexpected(Error{"col2im_gpu: col must be (C*k*k, B*OH*OW)"});
+            NN_FAIL("col2im_gpu: col must be (C*k*k, B*OH*OW)");
         VulkanPipeline& pipe = f16_io ? col2im_f16_pipeline_ : col2im_pipeline_;
 
         const std::size_t B    = col.cols() / P;
@@ -4834,18 +4731,18 @@ public:
         if (f16_io)
         {
             auto f16r = GpuTensorF16::create_empty(rows, cols, *this);
-            if (!f16r) return std::unexpected(f16r.error());
+            NN_TRY_CHECK(f16r);
             output = GpuTensor(f16r->shared_buffer(), rows, cols);
         }
         else
         {
             auto out_res = GpuTensor::create_empty(rows, cols, *this);
-            if (!out_res) return std::unexpected(out_res.error());
+            NN_TRY_CHECK(out_res);
             output = std::move(*out_res);
         }
 
         auto ds_r = alloc_desc_set(pipe.descriptor_layout());
-        if (!ds_r) return std::unexpected(ds_r.error());
+        NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
 
         VkDescriptorBufferInfo buf_infos[2]{
@@ -4895,7 +4792,7 @@ public:
         if (owns_cmd)
         {
             auto r = submit_and_wait(cmd, desc_set);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         return output;
     }
@@ -4914,27 +4811,27 @@ public:
         bool f16_in = false)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
+            NN_FAIL("GPU backend not initialized");
         if (!has_group_reduce_pipeline())
-            return std::unexpected(Error{"group_reduce pipeline not available"});
+            NN_FAIL("group_reduce pipeline not available");
         if (f16_in && !has_group_reduce_f16_pipeline())
-            return std::unexpected(Error{"group_reduce f16 pipeline not available"});
+            NN_FAIL("group_reduce f16 pipeline not available");
         if (G == 0 || R == 0)
-            return std::unexpected(Error{"grouped_reduce_gpu: G/R must be > 0"});
+            NN_FAIL("grouped_reduce_gpu: G/R must be > 0");
         if (x.rows() != G * R)
-            return std::unexpected(Error{"grouped_reduce_gpu: x must be (G*R, N)"});
+            NN_FAIL("grouped_reduce_gpu: x must be (G*R, N)");
         const std::size_t N = x.cols();
         if (N == 0)
-            return std::unexpected(Error{"grouped_reduce_gpu: N must be > 0"});
+            NN_FAIL("grouped_reduce_gpu: N must be > 0");
         VulkanPipeline& pipe = f16_in ? group_reduce_f16_pipeline_
                                        : group_reduce_pipeline_;
 
         auto out_res = GpuTensor::create_empty(G, N, *this);
-        if (!out_res) return std::unexpected(out_res.error());
+        NN_TRY_CHECK(out_res);
         GpuTensor output = std::move(*out_res);
 
         auto ds_r = alloc_desc_set(pipe.descriptor_layout());
-        if (!ds_r) return std::unexpected(ds_r.error());
+        NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
 
         VkDescriptorBufferInfo buf_infos[2]{
@@ -4981,7 +4878,7 @@ public:
         if (owns_cmd)
         {
             auto r = submit_and_wait(cmd, desc_set);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         return output;
     }
@@ -4999,14 +4896,13 @@ public:
         bool f16_io = false)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
+            NN_FAIL("GPU backend not initialized");
         if (!has_gather_pipeline())
-            return std::unexpected(Error{"gather pipeline not available"});
+            NN_FAIL("gather pipeline not available");
         // Phase C1 f16 变体：table/out f16；**indices 恒 f32**（行号整数值
         // 精度要求，shader 内 float indices 槽不变）
         if (f16_io && !has_gather_f16_pipeline())
-            return std::unexpected(Error{
-                "gather_gpu: f16 pipeline 不可用（设备无16位存储）"});
+            NN_FAIL("gather_gpu: f16 pipeline 不可用（设备无16位存储）");
         auto& pipeline = f16_io ? gather_f16_pipeline_ : gather_pipeline_;
 
         const uint32_t vocab = static_cast<uint32_t>(table.rows());
@@ -5018,20 +4914,20 @@ public:
         if (f16_io)
         {
             auto f16r = GpuTensorF16::create_empty(num, D, *this);
-            if (!f16r) return std::unexpected(f16r.error());
+            NN_TRY_CHECK(f16r);
             owned.emplace(f16r->shared_buffer(), f16r->rows(), f16r->cols());
         }
         else
         {
             auto out_res = GpuTensor::create_empty(num, D, *this);
-            if (!out_res) return std::unexpected(out_res.error());
+            NN_TRY_CHECK(out_res);
             owned.emplace(std::move(*out_res));
         }
         GpuTensor output = *owned;
 
         // 分配描述符集
         auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
-        if (!ds_r) return std::unexpected(ds_r.error());
+        NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
 
         // 写入描述符集
@@ -5081,7 +4977,7 @@ public:
         if (owns_cmd)
         {
             auto r = submit_and_wait(cmd, desc_set);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         return output;
     }
@@ -5108,21 +5004,20 @@ public:
         bool f16_io = false)
     {
         if (!initialized_)
-            return std::unexpected(Error{"GPU backend not initialized"});
+            NN_FAIL("GPU backend not initialized");
         if (!has_scatter_add_pipeline())
-            return std::unexpected(Error{"scatter_add pipeline not available"});
+            NN_FAIL("scatter_add pipeline not available");
         VulkanPipeline& pipe = f16_io ? scatter_add_f16_pipeline_
                                        : scatter_add_pipeline_;
         if (f16_io && !has_scatter_add_f16_pipeline())
-            return std::unexpected(Error{"scatter_add f16 pipeline not available"});
-
+            NN_FAIL("scatter_add f16 pipeline not available");
         const uint32_t vocab = static_cast<uint32_t>(dst.rows());
         const uint32_t D = static_cast<uint32_t>(dst.cols());
         const uint32_t num = static_cast<uint32_t>(indices.rows() * indices.cols());
 
         // 分配描述符集
         auto ds_r = alloc_desc_set(pipe.descriptor_layout());
-        if (!ds_r) return std::unexpected(ds_r.error());
+        NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
 
         // 写入描述符集（dst 使用 uint 视图用于原子操作）
@@ -5210,7 +5105,7 @@ public:
         if (owns_cmd)
         {
             auto r = submit_and_wait(cmd, desc_set);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         return {};
     }

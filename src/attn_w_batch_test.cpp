@@ -27,11 +27,11 @@ using nn::Matrix;
 int main(int argc, char** argv)
 {
     auto cpu_res = nn::cli::create_engine(nn::cli::EngineConfig{}, std::cout);
-    if (!cpu_res) { std::cerr << "CPU 引擎创建失败: " << cpu_res.error().message << "\n"; return 2; }
+    NN_EXIT(cpu_res, 2, "CPU 引擎创建失败: ");
     nn::cli::EngineConfig gcfg;
     gcfg.use_gpu = true;
     auto gpu_res = nn::cli::create_engine(gcfg, std::cout);
-    if (!gpu_res) { std::cout << "GPU 不可用，跳过: " << gpu_res.error().message << "\n"; return 77; }
+    NN_EXIT(gpu_res, 77, "GPU 不可用，跳过: ");
     nn::ComputeEngine& cpu = **cpu_res;
     nn::ComputeEngine& gpu = **gpu_res;
 

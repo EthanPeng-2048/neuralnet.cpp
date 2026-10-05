@@ -320,12 +320,10 @@ public:
         token_emb_ = engine.create_tensor(vocab_size_, d_model_, p_.param,
                                           InitSpec::normal(0, emb_init_std, kInitSeed));
         if (!token_emb_.valid())
-            return std::unexpected(Error{"GPTModel: token_emb 初始化失败"});
-
+            NN_FAIL("GPTModel: token_emb 初始化失败");
         grad_token_emb_ = engine.create_tensor(vocab_size_, d_model_, p_.param, InitSpec::zero());
         if (!grad_token_emb_.valid())
-            return std::unexpected(Error{"GPTModel: token_emb 梯度缓冲初始化失败"});
-
+            NN_FAIL("GPTModel: token_emb 梯度缓冲初始化失败");
         // 初始化子层
         if (pos_encoder_)
         {
@@ -339,7 +337,7 @@ public:
         {
             NN_TRY(r, ln_f_->init(engine));
         }
-        { auto r = lm_head_.init(engine); if (!r) return std::unexpected(r.error()); }
+        { NN_TRY(r, lm_head_.init(engine)); }
         return {};
     }
 
@@ -510,7 +508,7 @@ public:
         Tensor grad_input = engine.create_tensor(seq_len, batch_size_, Precision::F32,
                                                  InitSpec::zero());
         if (!grad_input.valid())
-            return std::unexpected(Error{"GPT token_emb backward: 梯度张量分配失败"});
+            NN_FAIL("GPT token_emb backward: 梯度张量分配失败");
         return grad_input;
     }
 

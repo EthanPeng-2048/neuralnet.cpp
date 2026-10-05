@@ -58,7 +58,7 @@ protected:
     [[nodiscard]] Result<void> validate_sizes_() const
     {
         if (params_.size() != grads_.size())
-            return std::unexpected(Error{"Optimizer: params/grads size mismatch"});
+            NN_FAIL("Optimizer: params/grads size mismatch");
         return {};
     }
 
@@ -73,7 +73,7 @@ protected:
             auto buf = engine_.create_tensor(p.get().rows(), p.get().cols(),
                                              p_.optimizer);
             auto r = engine_.zero(buf);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             buffers.push_back(std::move(buf));
         }
         return buffers;
@@ -133,23 +133,22 @@ public:
             // g² = g * g（逐元素乘法）
             auto g_sq_r = dsl::compute(engine_, dsl::leaf(g) * dsl::leaf(g),
                                        g.rows(), g.cols());
-            if (!g_sq_r) return std::unexpected(g_sq_r.error());
+            NN_TRY_CHECK(g_sq_r);
             // 按行求和 → (rows, 1)（dsl::compute_reduce）
             auto row_sums_r = dsl::compute_reduce(engine_,
                 dsl::row_reduce_sum(dsl::leaf(*g_sq_r)),
                 g_sq_r->rows(), g_sq_r->cols());
-            if (!row_sums_r) return std::unexpected(row_sums_r.error());
+            NN_TRY_CHECK(row_sums_r);
             // 按列求和 → (1, 1) 标量张量（dsl::compute_reduce）
             auto col_sum_r = dsl::compute_reduce(engine_,
                 dsl::col_reduce_sum(dsl::leaf(*row_sums_r)),
                 row_sums_r->rows(), row_sums_r->cols());
-            if (!col_sum_r) return std::unexpected(col_sum_r.error());
-
+            NN_TRY_CHECK(col_sum_r);
             if (acc.valid())
             {
                 auto sum_r = dsl::compute(engine_, dsl::leaf(acc) + dsl::leaf(*col_sum_r),
                                           acc.rows(), acc.cols());
-                if (!sum_r) return std::unexpected(sum_r.error());
+                NN_TRY_CHECK(sum_r);
                 acc = std::move(*sum_r);
             }
             else
@@ -161,7 +160,7 @@ public:
         // 仅一次下载获取全局平方和（宿主桥，17 §3 D11）
         std::vector<Scalar> total_buf(acc.rows() * acc.cols());
         auto dl_r = detail::download_span(engine_, acc, std::span(total_buf));
-        if (!dl_r) return std::unexpected(dl_r.error());
+        NN_TRY_CHECK(dl_r);
         const Scalar total_sq = total_buf[0];
 
         Scalar norm = std::sqrt(total_sq);
@@ -174,7 +173,7 @@ public:
         {
             auto r = dsl::compute_into(engine_,
                 dsl::leaf(g_ref.get()) * dsl::rparam(scale), g_ref.get());
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         return {};
     }
@@ -185,7 +184,7 @@ public:
         for (auto& g : grads_)
         {
             auto r = engine_.zero(g);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         return {};
     }
@@ -213,15 +212,14 @@ public:
 
     [[nodiscard]] Result<void> step() override
     {
-        if (auto r = validate_sizes_(); !r) return std::unexpected(r.error());
-
+        NN_TRY(r, validate_sizes_());
         for (std::size_t i = 0; i < params_.size(); ++i)
         {
             // p -= lr * g（目标传递：原地、单 dispatch）
             auto r = dsl::compute_into(engine_,
                 dsl::leaf(params_[i]) + dsl::leaf(grads_[i]) * dsl::rparam(-lr_),
                 params_[i]);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         return {};
     }
@@ -259,9 +257,8 @@ public:
 
     [[nodiscard]] Result<void> step() override
     {
-        if (auto r = check_ready_(); !r) return std::unexpected(r.error());
-        if (auto r = validate_sizes_(); !r) return std::unexpected(r.error());
-
+        NN_TRY(r, check_ready_());
+        NN_TRY(r2, validate_sizes_());
         const Scalar one_minus_beta = Scalar{1} - beta_;
 
         for (std::size_t i = 0; i < params_.size(); ++i)
@@ -271,13 +268,12 @@ public:
                 dsl::leaf(velocities_[i]) * dsl::rparam(beta_)
                     + dsl::leaf(grads_[i]) * dsl::rparam(one_minus_beta),
                 velocities_[i]);
-            if (!r) return std::unexpected(r.error());
-
+            NN_TRY_CHECK(r);
             // p -= lr * v（原地、单 dispatch）
             r = dsl::compute_into(engine_,
                 dsl::leaf(params_[i]) + dsl::leaf(velocities_[i]) * dsl::rparam(-lr_),
                 params_[i]);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         return {};
     }
@@ -325,7 +321,7 @@ protected:
             dsl::leaf(m_[i]) * dsl::rparam(beta1_) +
                 dsl::leaf(g) * dsl::rparam(one_minus_beta1),
             rows, cols, p_.optimizer);
-        if (!m_new) return std::unexpected(m_new.error());
+        NN_TRY_CHECK(m_new);
         m_[i] = std::move(*m_new);
 
         // K2: v = β2*v + (1-β2)*g²（单 kernel 融合；状态精度 = p_.optimizer）
@@ -333,7 +329,7 @@ protected:
             dsl::leaf(v_[i]) * dsl::rparam(beta2_) +
                 dsl::leaf(g) * dsl::leaf(g) * dsl::rparam(one_minus_beta2),
             rows, cols, p_.optimizer);
-        if (!v_new) return std::unexpected(v_new.error());
+        NN_TRY_CHECK(v_new);
         v_[i] = std::move(*v_new);
 
         // K3: p -= lr * (inv_bc1*m) / (sqrt(inv_bc2*v)+eps)（全链单 kernel 融合；
@@ -346,11 +342,11 @@ protected:
                  / (dsl::sqrt(dsl::leaf(v_[i]) * dsl::rparam(inv_bc2))
                     + dsl::rparam(eps_))),
             rows, cols, p_.param);
-        if (!delta) return std::unexpected(delta.error());
+        NN_TRY_CHECK(delta);
         // p += delta（目标传递：原地、单 dispatch，不额外分配）
         auto r = dsl::compute_into(engine_,
             dsl::leaf(params_[i]) + dsl::leaf(*delta), params_[i]);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         return {};
     }
 
@@ -400,9 +396,8 @@ public:
 
     [[nodiscard]] Result<void> step() override
     {
-        if (auto r = check_ready_(); !r) return std::unexpected(r.error());
-        if (auto r = validate_sizes_(); !r) return std::unexpected(r.error());
-
+        NN_TRY(r, check_ready_());
+        NN_TRY(r2, validate_sizes_());
         // 偏差修正：每步只计算一次（而非每参数重复 pow）
         const std::size_t t_next = t_ + 1;
         const auto [inv_bc1, inv_bc2] = bias_correction_(t_next);
@@ -410,7 +405,7 @@ public:
         for (std::size_t i = 0; i < params_.size(); ++i)
         {
             auto r = adam_update_(i, inv_bc1, inv_bc2);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         t_ = t_next;  // 全部参数成功才推进步数（失败时不推进）
         return {};
@@ -453,9 +448,8 @@ public:
 
     [[nodiscard]] Result<void> step() override
     {
-        if (auto r = check_ready_(); !r) return std::unexpected(r.error());
-        if (auto r = validate_sizes_(); !r) return std::unexpected(r.error());
-
+        NN_TRY(r, check_ready_());
+        NN_TRY(r2, validate_sizes_());
         // 偏差修正：每步只计算一次（而非每参数重复 pow）
         const std::size_t t_next = t_ + 1;
         const auto [inv_bc1, inv_bc2] = bias_correction_(t_next);
@@ -468,12 +462,12 @@ public:
             {
                 auto r = dsl::compute_into(engine_,
                     dsl::leaf(params_[i]) * dsl::rparam(decay_factor), params_[i]);
-                if (!r) return std::unexpected(r.error());
+                NN_TRY_CHECK(r);
             }
 
             // Adam 更新
             auto r = adam_update_(i, inv_bc1, inv_bc2);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         t_ = t_next;  // 全部参数成功才推进步数（失败时不推进）
         return {};
@@ -509,18 +503,17 @@ public:
     // 再对 (rows,1) 小向量做列归约 → (1,1)
     auto row_sum_norm = dsl::compute_reduce(engine,
         dsl::row_reduce_sum(dsl::leaf(G) * dsl::leaf(G)), G.rows(), G.cols(), prec);
-    if (!row_sum_norm) return std::unexpected(row_sum_norm.error());
+    NN_TRY_CHECK(row_sum_norm);
     // 二级归约（(rows,1) → (1,1)）用 dsl::compute_reduce
     auto total_norm_sq = dsl::compute_reduce(engine,
         dsl::col_reduce_sum(dsl::leaf(*row_sum_norm)),
         row_sum_norm->rows(), row_sum_norm->cols(), prec);
-    if (!total_norm_sq) return std::unexpected(total_norm_sq.error());
-
+    NN_TRY_CHECK(total_norm_sq);
     // 从 (1,1) Tensor 提取标量值
     // 使用宿主桥下载后取值（一次 PCIe 下载，可接受；17 §3 D11）
     std::vector<Scalar> total_buf(total_norm_sq->rows() * total_norm_sq->cols());
     auto dl_r = detail::download_span(engine, *total_norm_sq, std::span(total_buf));
-    if (!dl_r) return std::unexpected(dl_r.error());
+    NN_TRY_CHECK(dl_r);
     Scalar norm_sq_val = total_buf[0];
     Scalar inv_norm_scalar = Scalar{1} / std::sqrt(norm_sq_val + eps * eps);
 
@@ -528,8 +521,7 @@ public:
     // 1 次分配）
     auto X = dsl::compute(engine,
         dsl::leaf(G) * dsl::rparam(inv_norm_scalar), G.rows(), G.cols(), prec);
-    if (!X) return std::unexpected(X.error());
-
+    NN_TRY_CHECK(X);
     // 选更小一侧构造母矩阵，避免显存爆炸（Muon 显存 > AdamW 的根因）：
     //   - 短宽/方阵（m ≤ n）：行正交化，母矩阵 A = X·X^T（m×m，m 为短边）
     //   - 高窄矩阵（m > n）：列正交化，母矩阵 G = X^T·X（n×n，n 为短边）
@@ -551,24 +543,21 @@ public:
             // 纯 matmul 经 DSL 直写（scan 的 optimizer dry-run 自动登记结构）
             auto A = dsl::compute(engine,           // A = X·X^T
                 dsl::matmul(*X, *X, false, true), m, m, prec);
-            if (!A) return std::unexpected(A.error());
+            NN_TRY_CHECK(A);
             auto A_sq = dsl::compute(engine,         // A²
                 dsl::matmul(*A, *A, false, false), m, m, prec);
-            if (!A_sq) return std::unexpected(A_sq.error());
-
+            NN_TRY_CHECK(A_sq);
             // A = b·A + c·A²：一次原地目标传递（GPU 上 1 个 kernel）
             auto accA = dsl::compute_into(engine,
                 dsl::leaf(*A) * dsl::rparam(b) + dsl::leaf(*A_sq) * dsl::rparam(c), *A);
-            if (!accA) return std::unexpected(accA.error());
-
+            NN_TRY_CHECK(accA);
             auto BX = dsl::compute(engine,           // B·X
                 dsl::matmul(*A, *X, false, false), m, n, prec);
-            if (!BX) return std::unexpected(BX.error());
+            NN_TRY_CHECK(BX);
             // BX += a·X（原地目标传递：单 dispatch，不额外分配）
             auto accBX = dsl::compute_into(engine,
                 dsl::leaf(*BX) + dsl::leaf(*X) * dsl::rparam(a), *BX);
-            if (!accBX) return std::unexpected(accBX.error());
-
+            NN_TRY_CHECK(accBX);
             X = std::move(*BX);
         }
     }
@@ -582,24 +571,21 @@ public:
             // 纯 matmul 经 DSL 直写（同上，scan optimizer dry-run 登记）
             auto Gr = dsl::compute(engine,           // G = X^T·X（n×n）
                 dsl::matmul(*X, *X, true, false), n, n, prec);
-            if (!Gr) return std::unexpected(Gr.error());
+            NN_TRY_CHECK(Gr);
             auto Gr_sq = dsl::compute(engine,        // G²
                 dsl::matmul(*Gr, *Gr, false, false), n, n, prec);
-            if (!Gr_sq) return std::unexpected(Gr_sq.error());
-
+            NN_TRY_CHECK(Gr_sq);
             // G = b·G + c·G²（同上：一次原地目标传递，单 kernel）
             auto accG = dsl::compute_into(engine,
                 dsl::leaf(*Gr) * dsl::rparam(b) + dsl::leaf(*Gr_sq) * dsl::rparam(c), *Gr);
-            if (!accG) return std::unexpected(accG.error());
-
+            NN_TRY_CHECK(accG);
             auto XM = dsl::compute(engine,           // X·G
                 dsl::matmul(*X, *Gr, false, false), m, n, prec);
-            if (!XM) return std::unexpected(XM.error());
+            NN_TRY_CHECK(XM);
             // XM += a·X（原地目标传递：单 dispatch）
             auto accXM = dsl::compute_into(engine,
                 dsl::leaf(*XM) + dsl::leaf(*X) * dsl::rparam(a), *XM);
-            if (!accXM) return std::unexpected(accXM.error());
-
+            NN_TRY_CHECK(accXM);
             X = std::move(*XM);
         }
     }
@@ -659,9 +645,8 @@ public:
 
     [[nodiscard]] Result<void> step() override
     {
-        if (auto r = check_ready_(); !r) return std::unexpected(r.error());
-        if (auto r = validate_sizes_(); !r) return std::unexpected(r.error());
-
+        NN_TRY(r, check_ready_());
+        NN_TRY(r2, validate_sizes_());
         for (std::size_t i = 0; i < params_.size(); ++i)
         {
             const Tensor& g = grads_[i];
@@ -670,8 +655,7 @@ public:
             auto r = dsl::compute_into(engine_,
                 dsl::leaf(velocities_[i]) * dsl::rparam(momentum_) + dsl::leaf(g),
                 velocities_[i]);
-            if (!r) return std::unexpected(r.error());
-
+            NN_TRY_CHECK(r);
             // 确定用于正交化的更新方向（Nesterov 时需临时缓冲，否则直接用 v）
             std::optional<Tensor> nesterov_buf;
             if (nesterov_)
@@ -680,7 +664,7 @@ public:
                 auto buf = dsl::compute(engine_,
                     dsl::leaf(g) + dsl::leaf(velocities_[i]) * dsl::rparam(momentum_),
                     g.rows(), g.cols(), p_.optimizer);
-                if (!buf) return std::unexpected(buf.error());
+                NN_TRY_CHECK(buf);
                 nesterov_buf = std::move(*buf);
             }
             const Tensor& update = nesterov_buf ? *nesterov_buf : velocities_[i];
@@ -690,8 +674,7 @@ public:
             {
                 auto ortho_update = newton_schulz_orthogonalize(
                     engine_, update, ns_steps_, ns_eps_, p_.optimizer);
-                if (!ortho_update) return std::unexpected(ortho_update.error());
-
+                NN_TRY_CHECK(ortho_update);
                 // 3. 参数更新: p -= lr * 0.2 * sqrt(max(m,n)) * NS(update)
                 //    NorMuon 论文 / KellerJordan 参考实现的形状缩放：NS 输出谱范数为 1，
                 //    不缩放则等效学习率偏差 0.2*sqrt(max(m,n)) 倍（如 256×768 权重 → 5.5×）
@@ -704,7 +687,7 @@ public:
                     dsl::leaf(params_[i])
                         + dsl::leaf(*ortho_update) * dsl::rparam(-lr_ * muon_scale),
                     params_[i]);
-                if (!r) return std::unexpected(r.error());
+                NN_TRY_CHECK(r);
             }
             else
             {
@@ -712,7 +695,7 @@ public:
                 r = dsl::compute_into(engine_,
                     dsl::leaf(params_[i]) + dsl::leaf(update) * dsl::rparam(-lr_),
                     params_[i]);
-                if (!r) return std::unexpected(r.error());
+                NN_TRY_CHECK(r);
             }
         }
         return {};

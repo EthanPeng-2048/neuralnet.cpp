@@ -47,7 +47,7 @@ parse_csv_line(const std::string &line)
     {
         auto v = parse_number<Scalar>(token);
         if (!v)
-            return std::unexpected(Error{"CSV 含无效数字 '" + token + "': " + v.error().message});
+            NN_FAIL("CSV 含无效数字 '" + token + "': " + v.error().message);
         values.push_back(*v);
     }
     return values;
@@ -62,12 +62,10 @@ parse_csv_line(const std::string &line)
 load_image_from_csv_line(const std::string &csv_line)
 {
     auto values = parse_csv_line(csv_line);
-    if (!values)
-        return std::unexpected(std::move(values).error());
+    NN_TRY_CHECK(values);
     if (values->size() != MNIST_INPUT_DIM)
-        return std::unexpected(Error{"CSV 必须包含恰好 " + std::to_string(MNIST_INPUT_DIM) +
-                                    " 个值，实际: " + std::to_string(values->size())});
-
+        NN_FAIL("CSV 必须包含恰好 " + std::to_string(MNIST_INPUT_DIM) +
+                                    " 个值，实际: " + std::to_string(values->size()));
     Matrix img(MNIST_INPUT_DIM, 1);
     for (std::size_t i = 0; i < MNIST_INPUT_DIM; ++i)
         img.set_value_unchecked(i, 0, (*values)[i]);
@@ -81,8 +79,7 @@ load_image_from_csv_line(const std::string &csv_line)
 load_image_tensor_from_csv_line(const std::string &csv_line, ComputeEngine& engine)
 {
     auto mat_r = load_image_from_csv_line(csv_line);
-    if (!mat_r)
-        return std::unexpected(std::move(mat_r).error());
+    NN_TRY_CHECK(mat_r);
     return engine.from_matrix(*mat_r);
 }
 
@@ -102,8 +99,7 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
     PrecisionProfile precision = PrecisionProfile{})
 {
     if (layer_dims.size() < 2)
-        return std::unexpected(Error{"MLP layer_dims must have at least 2 elements"});
-
+        NN_FAIL("MLP layer_dims must have at least 2 elements");
     Model model(engine);
     model.set_default_precision_profile(precision);   // 须在 add 之前：权重按精度创建
     for (std::size_t i = 0; i < layer_dims.size() - 1; ++i)
@@ -113,18 +109,18 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
 
         {
             auto r = model.add<Linear>(in_dim, out_dim);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
 
         if (i < layer_dims.size() - 2)
         {
             {
                 auto r = model.add_layer(make_norm_layer(out_dim, norm_type));
-                if (!r) return std::unexpected(r.error());
+                NN_TRY_CHECK(r);
             }
             {
                 auto r = model.add<GeLU>();
-                if (!r) return std::unexpected(r.error());
+                NN_TRY_CHECK(r);
             }
         }
     }
@@ -152,15 +148,13 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
     NormPlace norm_place = NormPlace::Final)
 {
     if (img_size % patch_size != 0)
-        return std::unexpected(Error{"MNIST Transformer: img_size must be divisible by patch_size"});
+        NN_FAIL("MNIST Transformer: img_size must be divisible by patch_size");
     if (d_model == 0 || num_heads == 0 || d_ff == 0 || num_layers == 0)
-        return std::unexpected(Error{"MNIST Transformer: parameters must be positive"});
+        NN_FAIL("MNIST Transformer: parameters must be positive");
     if (d_model % num_heads != 0)
-        return std::unexpected(Error{"MNIST Transformer: d_model must be divisible by num_heads"});
+        NN_FAIL("MNIST Transformer: d_model must be divisible by num_heads");
     if (norm_place != NormPlace::None && norm_place != NormPlace::Final)
-        return std::unexpected(Error{
-            "MNIST Transformer: norm_place must be none/final (conv/head/both are CNN-only)"});
-
+        NN_FAIL("MNIST Transformer: norm_place must be none/final (conv/head/both are CNN-only)");
     const std::size_t grid_size  = img_size / patch_size;
     const std::size_t num_patches = grid_size * grid_size;
 
@@ -168,17 +162,17 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
     model.set_default_precision_profile(precision);   // 须在 add 之前：权重按精度创建
     {
         auto r = model.add<PatchEmbedding>(img_size, patch_size, d_model);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
     }
     {
         auto r = model.add<TransformerEncoder>(d_model, num_heads, d_ff, num_layers,
                                                num_patches, norm_type,
                                                norm_place == NormPlace::Final);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
     }
     {
         auto r = model.add<Linear>(d_model, MNIST_NUM_CLASSES);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
     }
     return model;
 }
@@ -245,8 +239,7 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
         return model;
     }
 
-    return std::unexpected(Error{
-        "Invalid ModelSpec type for MNIST: expected MLP, Transformer, or CNN"});
+    NN_FAIL("Invalid ModelSpec type for MNIST: expected MLP, Transformer, or CNN");
 }
 
 } // namespace nn

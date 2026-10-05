@@ -77,16 +77,14 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
     ComputeEngine& engine, const CnnConfig& cfg)
 {
     if (cfg.convs.empty())
-        return std::unexpected(Error{"CNN: convs must not be empty"});
+        NN_FAIL("CNN: convs must not be empty");
     if (cfg.fc_dims.size() < 2)
-        return std::unexpected(Error{"CNN: fc_dims must have at least 2 elements"});
+        NN_FAIL("CNN: fc_dims must have at least 2 elements");
     if (cfg.in_channels == 0 || cfg.in_size == 0)
-        return std::unexpected(Error{"CNN: in_channels/in_size must be positive"});
+        NN_FAIL("CNN: in_channels/in_size must be positive");
     if (cfg.norm_place != NormPlace::None && cfg.norm_place != NormPlace::Conv &&
         cfg.norm_place != NormPlace::Head && cfg.norm_place != NormPlace::Both)
-        return std::unexpected(Error{
-            "CNN: norm_place must be none/conv/head/both (final is ViT-only)"});
-
+        NN_FAIL("CNN: norm_place must be none/conv/head/both (final is ViT-only)");
     Model model(engine);
     std::size_t c = cfg.in_channels;
     std::size_t h = cfg.in_size;
@@ -96,14 +94,13 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
     {
         const CnnConvSpec& cv = cfg.convs[i];
         if (cv.out_channels == 0 || cv.kernel == 0)
-            return std::unexpected(Error{"CNN: conv out_channels/kernel must be positive"});
+            NN_FAIL("CNN: conv out_channels/kernel must be positive");
         if (cv.kernel > h + 2 * cv.padding || cv.kernel > w + 2 * cv.padding)
-            return std::unexpected(Error{"CNN: kernel larger than input spatial size"});
-
+            NN_FAIL("CNN: kernel larger than input spatial size");
         {
             auto r = model.add<Conv2D>(c, cv.out_channels, cv.kernel,
                                        cv.stride, cv.padding, h, w);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         h = conv_out_size(h, cv.kernel, cv.stride, cv.padding);
         w = conv_out_size(w, cv.kernel, cv.stride, cv.padding);
@@ -112,7 +109,7 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
         if (cfg.pool > 0)
         {
             auto r = model.add<MaxPool2D>(c, h, w, cfg.pool);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             h = (h - cfg.pool) / cfg.pool + 1;
             w = (w - cfg.pool) / cfg.pool + 1;
         }
@@ -122,42 +119,41 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
         if (cfg.norm_place == NormPlace::Conv || cfg.norm_place == NormPlace::Both)
         {
             auto r = model.add_layer(make_norm_layer(c * h * w, cfg.norm_type));
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
     }
 
     const std::size_t flattened = c * h * w;
     if (flattened == 0)
-        return std::unexpected(Error{"CNN: flattened size is zero"});
-
+        NN_FAIL("CNN: flattened size is zero");
     // 全连接头：Linear(flatten → fc_dims[0]) → [Norm] → ReLU → ...
     // → Linear(→ num_classes)；Norm 只挂隐藏层，最后一层保持原始 logits。
     const bool norm_head = (cfg.norm_place == NormPlace::Head ||
                             cfg.norm_place == NormPlace::Both);
     {
         auto r = model.add<Linear>(flattened, cfg.fc_dims[0]);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         if (norm_head)
         {
             auto rn = model.add_layer(make_norm_layer(cfg.fc_dims[0], cfg.norm_type));
-            if (!rn) return std::unexpected(rn.error());
+            NN_TRY_CHECK(rn);
         }
     }
     for (std::size_t i = 1; i < cfg.fc_dims.size(); ++i)
     {
         {
             auto r = model.add<ReLU>();
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         {
             auto r = model.add<Linear>(cfg.fc_dims[i - 1], cfg.fc_dims[i]);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         // 隐藏层后再挂一份 Norm（最后一层 fc_dims.size()-1 不挂）
         if (norm_head && i + 1 < cfg.fc_dims.size())
         {
             auto rn = model.add_layer(make_norm_layer(cfg.fc_dims[i], cfg.norm_type));
-            if (!rn) return std::unexpected(rn.error());
+            NN_TRY_CHECK(rn);
         }
     }
     return model;
@@ -200,14 +196,13 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
 [[nodiscard]] inline Result<CnnConfig> cnn_config_from_spec(const ModelSpec& spec)
 {
     if (!spec.is_cnn())
-        return std::unexpected(Error{"cnn_config_from_spec: not a CNN spec"});
+        NN_FAIL("cnn_config_from_spec: not a CNN spec");
     if (spec.cnn_channels.size() != spec.cnn_kernels.size() ||
         spec.cnn_channels.size() != spec.cnn_strides.size() ||
         spec.cnn_channels.size() != spec.cnn_paddings.size())
-        return std::unexpected(Error{"CNN spec: conv vectors length mismatch"});
+        NN_FAIL("CNN spec: conv vectors length mismatch");
     if (spec.cnn_channels.empty())
-        return std::unexpected(Error{"CNN spec: no conv layers"});
-
+        NN_FAIL("CNN spec: no conv layers");
     CnnConfig cfg;
     cfg.in_channels = spec.cnn_in_channels;
     cfg.in_size     = spec.cnn_in_size;
@@ -217,8 +212,7 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
     cfg.norm_place  = spec.norm_place;
     if (cfg.norm_place != NormPlace::None && cfg.norm_place != NormPlace::Conv &&
         cfg.norm_place != NormPlace::Head && cfg.norm_place != NormPlace::Both)
-        return std::unexpected(Error{
-            "CNN spec: norm_place must be none/conv/head/both (final is ViT-only)"});
+        NN_FAIL("CNN spec: norm_place must be none/conv/head/both (final is ViT-only)");
     for (std::size_t i = 0; i < spec.cnn_channels.size(); ++i)
     {
         cfg.convs.push_back(CnnConvSpec{
@@ -236,7 +230,7 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
     ComputeEngine& engine, const ModelSpec& spec)
 {
     auto cfg_r = cnn_config_from_spec(spec);
-    if (!cfg_r) return std::unexpected(std::move(cfg_r).error());
+    NN_TRY_CHECK(cfg_r);
     auto model = build_cnn_model(engine, *cfg_r);
     if (model)
         model->set_spec(spec);  // 记录架构规格，供 load_model 校验

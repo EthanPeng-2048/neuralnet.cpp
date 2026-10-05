@@ -82,7 +82,7 @@ int off_run_test()
                     PosEncodingType::RoPE,
                     ActivationType::SwiGLU,
                     NormType::RMSNorm);
-    { auto r = model.init(eng); if (!r) { std::cerr << "RAPTModel init 失败: " << r.error().message << "\n"; return 1; } }
+    NN_EXIT(model.init(eng), 1, "RAPTModel init 失败: ");
 
     std::mt19937_64 rng(7);
     std::uniform_real_distribution<Scalar> dist(-1, 1);
@@ -94,31 +94,31 @@ int off_run_test()
     for (std::size_t i = 0; i < go_m.size(); ++i) go_m.span()[i] = dist(rng);
 
     auto x = eng.from_matrix(x_m);
-    if (!x) { std::cerr << "from_matrix(x) failed\n"; return 1; }
+    NN_EXIT(x, 1, "from_matrix(x) failed\n");
     auto go = eng.from_matrix(go_m);
-    if (!go) { std::cerr << "from_matrix(go) failed\n"; return 1; }
+    NN_EXIT(go, 1, "from_matrix(go) failed\n");
 
     // ── 基线（offload 关闭） ──
     Matrix baseline_logits;
     std::vector<Matrix> baseline_grads;
     {
         auto r = model.forward(*x);
-        if (!r) { std::cerr << "baseline forward failed: " << r.error().message << "\n"; return 1; }
+        NN_EXIT(r, 1, "baseline forward failed: ");
         auto lm = eng.to_matrix(*r);
-        if (!lm) { std::cerr << "to_matrix(logits) failed\n"; return 1; }
+        NN_EXIT(lm, 1, "to_matrix(logits) failed\n");
         baseline_logits = std::move(*lm);
 
         for (auto& g : model.param_gradients())
         {
             auto rz = eng.zero(g.get());
-            if (!rz) { std::cerr << "baseline zero failed\n"; return 1; }
+            NN_EXIT(rz, 1, "baseline zero failed\n");
         }
         auto b = model.backward(*go);
-        if (!b) { std::cerr << "baseline backward failed: " << b.error().message << "\n"; return 1; }
+        NN_EXIT(b, 1, "baseline backward failed: ");
         for (auto& g : model.param_gradients())
         {
             auto gm = eng.to_matrix(g.get());
-            if (!gm) { std::cerr << "to_matrix(grad) failed\n"; return 1; }
+            NN_EXIT(gm, 1, "to_matrix(grad) failed\n");
             baseline_grads.push_back(std::move(*gm));
         }
     }
@@ -129,9 +129,9 @@ int off_run_test()
     // ── 开启 offload，重跑并对比 ──
     model.set_activation_offload(true);
     auto r = model.forward(*x);
-    if (!r) { std::cerr << "offload forward failed: " << r.error().message << "\n"; return 1; }
+    NN_EXIT(r, 1, "offload forward failed: ");
     auto lm = eng.to_matrix(*r);
-    if (!lm) { std::cerr << "to_matrix(logits) failed\n"; return 1; }
+    NN_EXIT(lm, 1, "to_matrix(logits) failed\n");
     std::cout << "  offload slab: " << (model.offload_ram_bytes() / 1024) << " KB\n";
 
     all_pass &= close_to(*lm, baseline_logits, tol, "logits", 0);
@@ -139,16 +139,16 @@ int off_run_test()
     for (auto& g : model.param_gradients())
     {
         auto rz = eng.zero(g.get());
-        if (!rz) { std::cerr << "zero failed\n"; return 1; }
+        NN_EXIT(rz, 1, "zero failed\n");
     }
     auto b = model.backward(*go);
-    if (!b) { std::cerr << "offload backward failed: " << b.error().message << "\n"; return 1; }
+    NN_EXIT(b, 1, "offload backward failed: ");
 
     const auto& grads = model.param_gradients();
     for (std::size_t p = 0; p < grads.size(); ++p)
     {
         auto gm = eng.to_matrix(grads[p].get());
-        if (!gm) { std::cerr << "to_matrix(grad) failed\n"; return 1; }
+        NN_EXIT(gm, 1, "to_matrix(grad) failed\n");
         std::string name = "grad[" + std::to_string(p) + "]";
         all_pass &= close_to(*gm, baseline_grads[p], tol, name, p);
     }

@@ -50,18 +50,17 @@ struct GptConfig {
     ComputeEngine& engine, const GptConfig& cfg)
 {
     if (cfg.d_model == 0 || cfg.num_heads == 0 || cfg.seq_len == 0 || cfg.vocab_size == 0)
-        return std::unexpected(Error{"GPT model parameters must be positive"});
+        NN_FAIL("GPT model parameters must be positive");
     if (cfg.d_ff == 0 || cfg.num_layers == 0)
-        return std::unexpected(Error{"GPT d_ff and num_layers must be positive"});
+        NN_FAIL("GPT d_ff and num_layers must be positive");
     if (cfg.d_model % cfg.num_heads != 0)
-        return std::unexpected(Error{"GPT d_model must be divisible by num_heads"});
-
+        NN_FAIL("GPT d_model must be divisible by num_heads");
     Model model(engine);
     {
         auto r = model.add<GPTModel>(cfg.vocab_size, cfg.d_model, cfg.seq_len,
                                      cfg.num_heads, cfg.d_ff, cfg.num_layers, cfg.pos_enc,
                                      cfg.activation, cfg.norm_type, cfg.precision);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
     }
     return model;
 }
@@ -95,8 +94,7 @@ struct GptConfig {
 {
     // 接受 GPT 类型，或 ALiBi_GPT 类型（两种 spec 类型走同一构建路径）
     if (!spec.is_gpt() && !spec.is_alibi_gpt())
-        return std::unexpected(Error{"Invalid ModelSpec type for GPT: expected GPT or ALiBi_GPT"});
-
+        NN_FAIL("Invalid ModelSpec type for GPT: expected GPT or ALiBi_GPT");
     auto model = build_gpt_model(
         engine,
         spec.vocab_size, spec.d_model, spec.seq_len,

@@ -79,3 +79,62 @@ foreach ($v in $violVerb)  { Write-Output ("  [IO-VERB] {0}" -f $v) }
 Write-Output ("  matrix_type_hits: {0}   io_verb_hits: {1}   host_bridge_uses: {2}" -f $violType.Count, $violVerb.Count, $bridge.Count)
 if ($bridge.Count -gt 0) { Write-Output ("  bridge sites: " + ($bridge -join ', ')) }
 Write-Output ("  L2-VIOLATIONS: {0}" -f ($violType.Count + $violVerb.Count))
+
+# 5) 错误处理宏族手写残留审计（AGENTS.md 铁律 #1 / §12 错误处理宏族）
+#    A 批（传播/错误源 → NN_TRY/NN_TRY_CHECK/NN_FAIL）与 B 批（src/ 退出样板 → NN_EXIT）
+#    迁移后的**手写 `return std::unexpected` 残留**计数。
+#    剔除：注释、字符串字面量内出现、以及 core_assert.hpp 的宏定义体（NN_ASSERT 实现，
+#    其中 `return std::unexpected(nn::Error{(msg)})` 是宏展开目标，必须保留）。
+#    验收口径：残留数不高于基线（迁移后人工审的边缘形态），且**不随新代码增长**——
+#    新增错误检查一律用宏族（NN_TRY/NN_EXIT/NN_FAIL），不应再出现裸 unexpected。
+#    当前基线：45（2026-10-05 两批迁移后实测）。
+$baseline = 45
+$residue = @()
+$scanDirs = @('include', 'src', 'tools', 'examples', 'bench')
+foreach ($d in $scanDirs) {
+    $dd = Join-Path $root $d
+    if (-not (Test-Path $dd)) { continue }
+    foreach ($f in (Get-ChildItem $dd -Recurse -Include *.hpp, *.cpp -File)) {
+        if ($f.Name -eq 'core_assert.hpp') { continue }   # 宏定义体，豁免
+        # core_errors.hpp 的 NN_TRY/NN_FAIL 宏定义体（`return std::unexpected(...)` 是
+        # 展开目标，必须保留）与 error_macro_test.cpp 的测试夹具（故意构造 unexpected
+        # 以断言宏行为）——逐行豁免见下。
+        $isCoreErr = ($f.Name -eq 'core_errors.hpp')
+        $isMacroFixture = ($f.Name -eq 'error_macro_test.cpp')
+        $inDefine = $false   # core_errors.hpp：#define 宏体（续行以 \ 结尾，末行收尾）
+        $lineNo = 0
+        foreach ($raw in (Get-Content $f.FullName)) {
+            $lineNo++
+            $s = $raw.Trim()
+            # core_errors.hpp：跟踪 #define 宏体（宏定义里的 return std::unexpected 是
+            # 展开目标，必须保留）——以 "#define" 起，行尾 "\" 续行，末行收尾。
+            if ($isCoreErr) {
+                if ($s -match '^#define\s') { $inDefine = $true }
+                if ($inDefine) {
+                    $hadContinuation = ($s -match '\\\s*$')
+                    if (-not $hadContinuation) { $inDefine = $false }   # 末行：退出宏体
+                    continue   # 宏体行（含末行）一律豁免
+                }
+            }
+            # 剥行注释与字符串字面量（只判代码部分）
+            $code = [regex]::Replace($s, '"(?:[^"\\]|\\.)*"', '""')
+            $cmt = $code.IndexOf('//')
+            if ($cmt -ge 0) { $code = $code.Substring(0, $cmt) }
+            if ($code -match 'return\s+std::unexpected') {
+                # error_macro_test.cpp：豁免测试夹具（bad_int 等 helper 故意构造 unexpected）
+                if ($isMacroFixture) { continue }
+                $rel = $f.FullName.Substring($root.Length + 1)
+                $residue += ("{0}:{1}" -f $rel, $lineNo)
+            }
+        }
+    }
+}
+Write-Output ''
+Write-Output '=== [5] 错误处理宏族手写残留（铁律 #1；NN_TRY/NN_EXIT/NN_FAIL 迁移后）==='
+foreach ($r in $residue) { Write-Output ("  [residue] {0}" -f $r) }
+Write-Output ("  HANDWRITTEN-RESIDUE: {0}   (baseline {1})" -f $residue.Count, $baseline)
+if ($residue.Count -gt $baseline) {
+    Write-Output ("  [GATE] FAIL — 残留 {0} 超过基线 {1}：新增错误检查须用宏族，勿写裸 unexpected。" -f $residue.Count, $baseline)
+    exit 1
+}
+Write-Output "  [GATE] PASS — 残留未超基线（新增检查须用宏族）。"

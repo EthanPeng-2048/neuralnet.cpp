@@ -81,13 +81,12 @@ public:
     {
         ComputeEngine& engine = engine_ref();
         if (input.rows() != d_model_)
-            return std::unexpected(Error{"PE forward: d_model mismatch"});
+            NN_FAIL("PE forward: d_model mismatch");
         const std::size_t total_len = input.cols();
         if (tile_size_ > 0 && total_len % tile_size_ != 0)
-            return std::unexpected(Error{"PE forward: total_len not divisible by tile_size"});
+            NN_FAIL("PE forward: total_len not divisible by tile_size");
         if (tile_size_ == 0 && total_len > max_len_)
-            return std::unexpected(Error{"PE forward: seq_len exceeds max_len"});
-
+            NN_FAIL("PE forward: seq_len exceeds max_len");
         if (cached_total_ != total_len)
         {
             NN_TRY(r, rebuild_encoding(engine, total_len));
@@ -302,7 +301,7 @@ public:
         }
         ones_row_ = engine.create_tensor(1, num_patches_, Precision::F32, InitSpec::constant(1));
         if (!ones_row_.valid())
-            return std::unexpected(Error{"TransformerEncoder: ones_row_ 初始化失败"});
+            NN_FAIL("TransformerEncoder: ones_row_ 初始化失败");
         return {};
     }
 
@@ -359,9 +358,9 @@ public:
         ComputeEngine& engine = engine_ref();
         // input: (d_model, batch * num_patches)
         if (input.rows() != d_model_)
-            return std::unexpected(Error{"TransformerEncoder: row count mismatch"});
+            NN_FAIL("TransformerEncoder: row count mismatch");
         if (input.cols() % num_patches_ != 0)
-            return std::unexpected(Error{"TransformerEncoder: cols not divisible by num_patches"});
+            NN_FAIL("TransformerEncoder: cols not divisible by num_patches");
         batch_size_ = input.cols() / num_patches_;
 
         // 1. 添加 tiled 位置编码 → (d_model, batch * num_patches)

@@ -14,7 +14,7 @@
 - [注意力 / ZiPT / Transformer / FeedForward 层](#注意力 / ZiPT / Transformer / FeedForward 层)（16 条）
 - [RAPT / CNN / MLP / Softmax / GPT 层](#RAPT / CNN / MLP / Softmax / GPT 层)（13 条）
 - [引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器](#引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器)（19 条）
-- [代数层 / 基础设施 / 模型容器与序列化](#代数层 / 基础设施 / 模型容器与序列化)（12 条）
+- [代数层 / 基础设施 / 模型容器与序列化](#代数层 / 基础设施 / 模型容器与序列化)（14 条）
 - [领域模型工厂与 CLI 公共头](#领域模型工厂与 CLI 公共头)（3 条）
 - [src 应用入口（text/mnist/tokenizer/bench）](#src 应用入口（text/mnist/tokenizer/bench）)（5 条）
 - [GPU 手写原语 shader（shaders/*.comp）](#GPU 手写原语 shader（shaders/*.comp）)（12 条）
@@ -716,6 +716,31 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 ## 失效文档链接清理（原位置 core_file.hpp:13/:42、model_serialization.hpp:24/:82、algebra_matrix.hpp:41/:43/:746、core_config.hpp:47）
 - 类型：删除清单
 - 内容：docs/17-pointer-audit.md、docs/23-mixed-precision.md、docs/development/11-cpu-performance-diagnosis.md、DEVELOPMENT_STANDARDS.md、src/bench_thresholds.cpp 均已删除或改名；对应链接改指 docs/development/10-development-standards.md、docs/development/05-mixed-precision.md，或去掉文件名只留实测结论（blocked 优于 naive、并行阈值 524288 标定表等实测数据保留）。
+
+## 错误处理宏族落地：NN_CHECK / NN_EXIT / NN_TRY_MSG / NN_FAIL（2026-10-05，原位置 include/neuralnet.cpp/core_errors.hpp 的 NN_TRY 段、AGENTS.md §5 铁律 #1、CMakeLists.txt 测试块、docs/development/12 / 18、docs/usage/05 的 ctest 计数行）
+- 类型：演进记录
+- **背景（被替代的手写形态与实测量）**：全仓 `return std::unexpected(...)` 共 **1205** 处 —— 其中**纯传播** `return std::unexpected(r.error())` **628** 处（`NN_TRY`/`NN_TRY_CHECK` 此前只覆盖 **392** 处：L2 已收敛，其余散在 backend/engine/src/tools）、**错误源头** `return std::unexpected(Error{...})` **518** 处、`src/` 里 `if (!r) { std::cerr << ...; return 1/false; }` 形态 **374** 处（**全仓唯一没有任何宏覆盖的语义**）。原宏族只解决"传播"，解包与失败退出两类全靠手写，也正是"作为库易用性"评估里排第一的摩擦源。
+- **新宏族（三种语义 + 一个糖）**：`NN_TRY` / `NN_TRY_CHECK`（传播，展开与手写逐字等价）；`NN_TRY_MSG(decl, "语境", expr)`（传播并把语境前缀进 `Error.message`）；`NN_CHECK(expr[, "语境"])`（解包 + 终止，别名 `NN_EASY_CHECK`，接受 `Result<T>` / `Result<void>` / `bool` 三形态）；`NN_EXIT(expr, code[, "语境"])`（解包 + `std::exit(code)`，CLI 参数错误保住退出码）；`NN_FAIL("msg")`（错误源头糖）。
+- **实现约束（改动前必读）**：终止只有 abort/exit，**任何路径不出现 `throw`** —— 故未做"可抛异常"变体（铁律 #1 + `-fno-exceptions`）；变参分发走实参计数 `NN_DETAIL_PICK2/3` + 末尾哨兵，**不用 `__VA_OPT__`**（MSVC 传统预处理器不可靠）；解值用 `std::move(r).value()`（`expected<void>` 的 `operator*` 返回 void，`std::move(*r)` 编译不过）；非 void 重载带 `[[nodiscard]]`、void 重载**不带**（否则 `NN_CHECK(f());` 纯副作用调用误告警）；`check_message` / `contextualize` 单独成函数 = 可单测。**已知边界**：被检查表达式含**顶层逗号**（多参数模板列表、花括号初始化）会让实参计数出错 → 选错分支 → **编译期报错（响亮，不会静默错值）**，加一层括号即可（已写进宏注释与铁律 #1）。
+- **本轮范围**：只交付宏族 + 测试 + 文档；存量 628 处传播与 374 处 `src/` 退出样板分 A/B 两批随后迁移（验收口径 = 两批残留 0），518 处错误源 `NN_FAIL` 化裁定为**不强制**（纯美观，风险 > 收益）。数据管道 `nn::data::`、`nn::generate`、易用层聚合头同期**裁定推迟**（数据格式待定型；`nn.hpp` 保持唯一聚合头，改为提供按需薄转发头）。
+- **验收（本机 Release + Ninja + clang）**：build 零告警（`-Werror`）；ctest **23 → 24**（新增 `error_macro_test`：解值三形态 / `check_message` 打印格式 / `NN_TRY_MSG` 语境前缀 / 终止与退出码经 `std::system` 子进程 `--expect-abort`、`--expect-exit <n>` 断言）；带与不带 `NN_BIND_DEBUG=1` 各一轮 **24/24**；`gpu_stability_probe --init-hash` **五锚与改动前 A/B 逐位一致**（实测法见下条"过程坑"）：mnist_mlp `3e982d018c00d94a` / cnn `d8c8457f0053c4f9` / mnist_transformer `70c4c085052268b2` / gpt `f8c2d892f5834239` / rapt `7002b986b84f679f`；scan 结构仍 **91**（样例收集器 93）、`fused_registry.hpp` 内容未变；`L2-VIOLATIONS: 0`；`gui_cli_audit` PASS；`doc_align_audit` EXIT 0。
+- ⚠ **锚点口径**：AGENTS.md §12 记录的 `0148e453908158dc` 等是**作者机器**的值（锚标注"机器/stdlib 相关"），本机 clang+MSVC STL 实测即为上列另一组 —— 判"锚有没有动"只能用**同机 A/B**，不能对文档数值。
+- **过程坑（记录供后效）**：做 A/B 时用 `Copy-Item` 回退 `core_errors.hpp` / `CMakeLists.txt`，**源文件时间戳被一并复制**，恢复后 mtime 反而早于刚生成的 PCH → ninja 不重建 PCH，而 Clang 的 PCH 内容校验报 `file '…core_errors.hpp' has been modified since the precompiled header … was built`（`note: size changed from expected 4355 to 11119`）整片 fatal；同一原因令 `CMakeLists.txt` mtime 回退 → **未重新 configure** → `ctest -N` 少列一项（23 而非 24，容易误判成"测试没注册"）。**处置 = 把恢复文件的 `LastWriteTime` 推到当前再构建**。
+
+## 错误处理宏族两批迁移完成（2026-10-05，A/B 批：src/ 退出样板 + 全仓传播/错误源）
+- 类型：演进记录（上一条"错误处理宏族落地"的迁移收尾）
+- **B 批（`src/` 退出样板 → `NN_EXIT`，320 处）**：两种形态 —— ①`if (!r) { std::cerr << …; return 1; }` 单行 304 处（`tools/apply_nn_exit.ps1`）、②`{ auto r = f(); if (!r) { …; return N; } }` 花括号 16 处（`tools/apply_nn_exit_braced.ps1`）。`NN_EXIT` 语义 = 打印后 `std::exit(code)`，`main()` 内与 `return code` 等价，打印内容是原手写形态的超集（ctx + error.message + 表达式原文 + file:line）。**不迁**：测试 helper 里的 `return false`（28 处，聚合语义）与 `return 77`（ctest SKIP 约定）。
+- **A 批（全仓传播/错误源 → `NN_TRY`/`NN_TRY_CHECK`/`NN_FAIL`，1209 → 36 处，96%）**：分七种形态脚本化迁移（均 `tools/apply_*.ps1`、带 `-DryRun`）：
+  - 守卫传播 `if (!x) return std::unexpected(x.error());`（单行/跨行）→ `NN_TRY_CHECK(x);`（宏 = 该守卫逐字等价）
+  - init-statement 守卫 `if (auto r = f(); !r) return …;`（单行/跨行/花括号作用域）→ `NN_TRY(r, f());`
+  - 同行声明+守卫 `auto k = import(K); if (!k) return …;` → `NN_TRY(k, import(K));`
+  - 错误源 `return std::unexpected(Error{"…"});`（单行/多行/拼接）→ `NN_FAIL("…");`
+  - 守卫+错误源 `if (!w_.valid()) return std::unexpected(Error{…});` → `if (!w_.valid()) NN_FAIL("…");`（`NN_FAIL` 含 return，接在 `if()` 后等价）
+  - **残留 36 处需人工审**：`core_assert.hpp` 宏定义体与 `error_macro_test.cpp` 测试夹具（豁免）、`*init_error_` 解引用、`return std::unexpected(\n…)` 跨行构造（`Error` 不在行首）、嵌套在 `if`/`for` 体内多语句块、尾随 `// comment` 的守卫等。
+- **踩坑（迁移中的作用域重定义）**：`NN_TRY(r, …)` 把声明**提升到所在块**，而原 `if (auto r = …; !r)` 把 `r` 限定在 if 的 init 里 —— 同块内连续多个 `NN_TRY(r, …)` 会 **redefinition**（实测 `compute_optimizer`/`model_serialization`/`gpu_stability_probe` 等约 12 处）。**处置 = 逐处改名 `r2`/`r3`**（编译器是 ground truth，`--clean-first` 全量重编确认零错误；脚本化改名因 C++ 真实作用域难精确判定而放弃）。另：首轮把 `return` 错误地加在 `NN_FAIL(...)`/`NN_TRY_CHECK(...)` 前（两宏**自带 return**）→ `return return …` 编译失败，已回退重做。
+- **验收（本机 Release + Ninja + clang）**：`cmake --build --clean-first` 全量零告警（`-Werror`）；ctest **24/24**、带与不带 `NN_BIND_DEBUG=1` 各一轮 **24/24**；`gpu_stability_probe --init-hash` **五锚与迁移前逐位一致**（`3e982d018c00d94a`/`d8c8457f0053c4f9`/`70c4c085052268b2`/`f8c2d892f5834239`/`7002b986b84f679f`）；scan 结构仍 **91**（+130 变体 = 221 注册表条目）、`fused_registry.hpp` 内容未变；`L2-VIOLATIONS: 0`；`gui_cli_audit` PASS；`doc_align_audit` EXIT 0。
+- **新门禁（`bench/doc_inventory.ps1` 第 [5] 节）**：**手写 `return std::unexpected` 残留计数** —— 剥注释/字符串、豁免 `core_assert.hpp` 宏定义体、`core_errors.hpp` 的 `#define` 宏体、`error_macro_test.cpp` 夹具；**验收 = 残留 ≤ 基线 45**（当前实测 36），超基线即 `exit 1`。用意：新增错误检查一律走宏族，不应再出现裸 `unexpected`，防止迁移成果回潮。
+- **本轮未动**：518 处错误源 `NN_FAIL` 化中已迁的部分并入 A 批；剩余错误源裁定**不强制**（纯美观）。数据管道 `nn::data::`、`nn::generate` 仍**裁定推迟**。
 
 ---
 

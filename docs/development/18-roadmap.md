@@ -41,13 +41,13 @@
 | `shaders/` | **19 个 `.comp`** | `Get-ChildItem shaders -Recurse -Filter *.comp` |
 | `docs/` | **25 篇 `.md`**（本文加入前；含 `history.md` 与 `release-notes/`） | `Get-ChildItem docs -Recurse -Filter *.md` |
 | 最大源文件 | `compute_vk_backend.hpp` **5246** 行、`expr_glsl_gen.hpp` **2746**、`compute_cpu_engine.hpp` **2353**、`compute_engine.hpp` **2087**、`src/text_train.cpp` **1746**、`gui.py` **1646**（非空 1456） | 逐文件 `(Get-Content $f).Count` |
-| ctest | **23 个测试** = 20 个测试目标（`list(APPEND NN_TEST_TARGETS` 计数）+ `cnn_test_gpu`（= `cnn_test --gpu`）+ `batchnorm_test_gpu`（= `batchnorm_test --gpu`，2026-10-03 随 BatchNorm 落地新增）+ `fusion_custom_layer_example`（AOT 融合端到端） | `ctest --test-dir build -N` |
+| ctest | **24 个测试** = 21 个测试目标（`list(APPEND NN_TEST_TARGETS` 计数）+ `cnn_test_gpu`（= `cnn_test --gpu`）+ `batchnorm_test_gpu`（= `batchnorm_test --gpu`，2026-10-03 随 BatchNorm 落地新增）+ `fusion_custom_layer_example`（AOT 融合端到端） | `ctest --test-dir build -N` |
 | 引擎接口 | **49 个 virtual 方法**；`L2-VIOLATIONS: 0`；宿主桥 40 处（仅披露） | `pwsh -File bench/doc_inventory.ps1` |
 | 版本 | git tag **v1.6.0**；`CMakeLists.txt` 的 `project(... VERSION 1.0.0)`（滞后于 git tag，**以 git tag 为版本权威**）；`release-notes/` 有 `v1.5.0.md` 与 `v1.6.0.md` | `git describe` + 读 `CMakeLists.txt` |
 | CI | 仅 `.github/workflows/cmake-single-platform.yml`：clang++ / Ninja / Release / `NN_ENABLE_NATIVE=OFF`，Linux + Windows；**不开 `NN_ENABLE_TESTS`、不跑 ctest** | 读该 workflow |
 
 > 口径说明：表中行数均为**总行数**；`gui.py` 另有非空 1456 行。
-> `23` 是当前唯一正确计数（2026-10-03 起，随 BatchNorm 落地新增 `batchnorm_test` + `batchnorm_test_gpu`；此前为 21）。历史上仓库里同时存在"ctest 计数 19"与"ctest 20 比 20"两种表述（§3 工程化第 4 条）——那是**计数口径不同**（是否含 `cnn_test_gpu`、以及后来新增的目标），2026-10-01 的 A4/A5 两轮把计数推到 21 并统一到本文与 `AGENTS.md`。
+> `24` 是当前唯一正确计数（2026-10-05 起，随错误处理宏族落地新增 `error_macro_test`；此前 2026-10-03 起为 23 = 随 BatchNorm 落地新增 `batchnorm_test` + `batchnorm_test_gpu`，再此前为 21）。历史上仓库里同时存在"ctest 计数 19"与"ctest 20 比 20"两种表述（§3 工程化第 4 条）——那是**计数口径不同**（是否含 `cnn_test_gpu`、以及后来新增的目标），2026-10-01 的 A4/A5 两轮把计数推到 21 并统一到本文与 `AGENTS.md`。
 
 ### 2.1 已经稳固的底座（本轮不再动）
 

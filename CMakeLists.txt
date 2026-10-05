@@ -476,6 +476,12 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(ce_fusion_test src/ce_fusion_test.cpp)
     list(APPEND NN_TEST_TARGETS ce_fusion_test)
 
+    # ── 错误处理宏族（NN_CHECK / NN_EXIT / NN_TRY_MSG / NN_FAIL）────────────
+    # 覆盖：解值三形态 + 打印格式 + 传播语境前缀 + 终止/退出码
+    # （终止行为经子进程 --expect-abort / --expect-exit <n> 断言，本进程不终止）
+    nn_add_executable(error_macro_test src/error_macro_test.cpp)
+    list(APPEND NN_TEST_TARGETS error_macro_test)
+
 endif()
 
 # ── 测试目标统一处理：输出到 <默认可执行目录>/test，并注册到 ctest ──────────

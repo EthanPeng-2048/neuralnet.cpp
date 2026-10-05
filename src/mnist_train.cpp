@@ -643,11 +643,7 @@ int main(int argc, char *argv[])
     eng_cfg.use_gpu = cfg.gpu_enabled;
     eng_cfg.gpu_device = cfg.gpu_device;
     auto engine_res = nn::cli::create_engine(eng_cfg, std::cout);
-    if (!engine_res)
-    {
-        std::cerr << "引擎创建失败: " << engine_res.error().message << "\n";
-        return 1;
-    }
+    NN_EXIT(engine_res, 1, "引擎创建失败: ");
     auto raw_engine = std::move(*engine_res);
 
     // ── 多精度：边界 cast 已下沉基类（NVI，原 PrecisionEngine；同 text_train）──
@@ -664,21 +660,17 @@ int main(int argc, char *argv[])
     const std::size_t train_max =
         (cfg.max_train_samples > 0) ? static_cast<std::size_t>(cfg.max_train_samples) : 0;
     auto csv_train_result = nn::cli::load_mnist_csv(cfg.dataset_path + "/train.csv", train_max);
-    if (!csv_train_result) { std::cerr << "Error: " << csv_train_result.error().message << '\n'; return 1; }
+    NN_EXIT(csv_train_result, 1, "Error: ");
     auto [train_x, train_y] = std::move(*csv_train_result);
 
     auto csv_test_result = nn::cli::load_mnist_csv(cfg.dataset_path + "/test.csv");
-    if (!csv_test_result) { std::cerr << "Error: " << csv_test_result.error().message << '\n'; return 1; }
+    NN_EXIT(csv_test_result, 1, "Error: ");
     auto [test_x, test_y] = std::move(*csv_test_result);
     std::cout << "训练集: " << train_x.cols() << " 样本, 测试集: " << test_x.cols() << " 样本\n" << std::endl;
 
     // ── 构建模型（绑定引擎） ─────────────────────────────────
     auto model_result = nn::build_mnist_model_from_spec(*engine, spec, cfg.precision);
-    if (!model_result)
-    {
-        std::cerr << "构建模型失败: " << model_result.error().message << '\n';
-        return 1;
-    }
+    NN_EXIT(model_result, 1, "构建模型失败: ");
     auto model = std::move(*model_result);
     model.set_training(true);  // 训练模式：BatchNorm 使用 batch 统计量并更新 running 统计
 
@@ -715,11 +707,7 @@ int main(int argc, char *argv[])
         cfg.optimizer_name, *engine,
         model.parameters(), model.param_gradients(), cfg.lr,
         cfg.weight_decay, cfg.precision);
-    if (!optimizer)
-    {
-        std::cerr << "错误：未知优化器名称: " << cfg.optimizer_name << "\n";
-        return 1;
-    }
+    NN_EXIT(optimizer, 1, "错误：未知优化器名称: ");
 
     Scalar optimizer_current_lr = cfg.lr;
 
@@ -792,51 +780,39 @@ int main(int argc, char *argv[])
 
             // ── Matrix → Tensor（上传到引擎设备） ──
             auto x_tensor_r = engine->from_matrix(x_batch);
-            if (!x_tensor_r) {
-                std::cerr << "\nfrom_matrix(x_batch) failed: " << x_tensor_r.error().message << '\n';
-                return 1;
-            }
+            NN_EXIT(x_tensor_r, 1, "\nfrom_matrix(x_batch) failed: ");
             auto y_tensor_r = engine->from_matrix(y_batch);
-            if (!y_tensor_r) {
-                std::cerr << "\nfrom_matrix(y_batch) failed: " << y_tensor_r.error().message << '\n';
-                return 1;
-            }
+            NN_EXIT(y_tensor_r, 1, "\nfrom_matrix(y_batch) failed: ");
 
             // ── 批量录制：forward + loss + backward 录制到单一 command buffer ──
             auto bb = engine->begin_batch();
-            if (!bb) { std::cerr << "\nbegin_batch failed: " << bb.error().message << '\n'; return 1; }
+            NN_EXIT(bb, 1, "\nbegin_batch failed: ");
 
             // ── 前向 ──
             auto out_r = model.forward(*x_tensor_r);
-            if (!out_r) {
-                std::cerr << "\nForward pass failed: " << out_r.error().message << '\n';
-                return 1;
-            }
+            NN_EXIT(out_r, 1, "\nForward pass failed: ");
 
             // ── 计算损失 ──
             auto loss_result = ce_loss.forward(*engine, *out_r, *y_tensor_r);
-            if (!loss_result) {
-                std::cerr << "\nLoss computation failed: " << loss_result.error().message << '\n';
-                return 1;
-            }
+            NN_EXIT(loss_result, 1, "\nLoss computation failed: ");
             Scalar loss = *loss_result;
             total_loss += loss;
 
             // ── 反向 ──
             auto grad_r = ce_loss.backward();
-            if (!grad_r) { std::cerr << "\nLoss backward failed: " << grad_r.error().message << '\n'; return 1; }
+            NN_EXIT(grad_r, 1, "\nLoss backward failed: ");
 
             auto bwd_r = model.backward(*grad_r);
-            if (!bwd_r) { std::cerr << "\nModel backward failed: " << bwd_r.error().message << '\n'; return 1; }
+            NN_EXIT(bwd_r, 1, "\nModel backward failed: ");
 
             // ── 提交并等待所有录制的命令 ──
             auto eb = engine->end_batch();
-            if (!eb) { std::cerr << "\nend_batch failed: " << eb.error().message << '\n'; return 1; }
+            NN_EXIT(eb, 1, "\nend_batch failed: ");
 
             // ── 优化器 step + 梯度清零（整段包进单次 begin/end_batch，
             //    与 text_train 一致；否则 GPU 下逐原语同步提交，铁律 6）──
             auto obb = engine->begin_batch();
-            if (!obb) { std::cerr << "\nbegin_batch (optimizer) failed: " << obb.error().message << '\n'; return 1; }
+            NN_EXIT(obb, 1, "\nbegin_batch (optimizer) failed: ");
 
             auto step_result = optimizer->step();
             if (!step_result) {
@@ -853,7 +829,7 @@ int main(int argc, char *argv[])
             }
 
             auto oeb = engine->end_batch();
-            if (!oeb) { std::cerr << "\nend_batch (optimizer) failed: " << oeb.error().message << '\n'; return 1; }
+            NN_EXIT(oeb, 1, "\nend_batch (optimizer) failed: ");
 
             // ── 进度显示 ──
             if ((batch + 1) % 10 == 0 || batch + 1 == num_batches)
@@ -901,11 +877,7 @@ int main(int argc, char *argv[])
 
     // ── 保存模型 ─────────────────────────────────────────────
     auto save_result = nn::save_model(cfg.save_path, model, spec);
-    if (!save_result)
-    {
-        std::cerr << "保存模型失败: " << save_result.error().message << '\n';
-        return 1;
-    }
+    NN_EXIT(save_result, 1, "保存模型失败: ");
     std::cout << "\n训练完成! 总耗时: " << std::fixed << std::setprecision(1) << total_sec << "s" << std::endl;
 
     return 0;

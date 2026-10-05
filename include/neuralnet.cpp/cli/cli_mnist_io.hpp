@@ -44,8 +44,7 @@ namespace nn::cli
     {
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         if (!file.is_open())
-            return std::unexpected(nn::Error{"Cannot open file: " + path});
-
+            NN_FAIL("Cannot open file: " + path);
         const auto file_size = file.tellg();
         file.seekg(0);
 
@@ -60,8 +59,7 @@ namespace nn::cli
         if (!buffer.empty() && buffer.back() != '\n')
             ++row_count;
         if (row_count == 0)
-            return std::unexpected(nn::Error{"CSV file is empty or malformed: " + path});
-
+            NN_FAIL("CSV file is empty or malformed: " + path);
         if (max_samples > 0 && max_samples < row_count)
             row_count = max_samples;
 
@@ -103,8 +101,7 @@ namespace nn::cli
         {
             auto [p_label, ec_label] = std::from_chars(ptr, end, labels[row]);
             if (ec_label != std::errc{})
-                return std::unexpected(
-                    nn::Error{"Failed to parse label at row " + std::to_string(row)});
+                NN_FAIL("Failed to parse label at row " + std::to_string(row));
             ptr = p_label;
 
             for (std::size_t j = 0; j < feat_dim; ++j)
@@ -113,8 +110,7 @@ namespace nn::cli
                 nn::Scalar val;
                 auto [p_feat, ec_feat] = std::from_chars(ptr, end, val);
                 if (ec_feat != std::errc{})
-                    return std::unexpected(
-                        nn::Error{"Failed to parse feature at row " + std::to_string(row)});
+                    NN_FAIL("Failed to parse feature at row " + std::to_string(row));
                 features[row * feat_dim + j] = val;
                 ptr = p_feat;
             }
@@ -135,8 +131,7 @@ namespace nn::cli
         {
             int lbl = labels[i];
             if (lbl < 0 || lbl >= 10)
-                return std::unexpected(
-                    nn::Error{"Label out of range: " + std::to_string(lbl)});
+                NN_FAIL("Label out of range: " + std::to_string(lbl));
             label_mat.set_value_unchecked(lbl, i, 1.0);
         }
 
@@ -163,7 +158,7 @@ namespace nn::cli
         const std::size_t N =
             (eval_samples > 0) ? std::min(x.cols(), eval_samples) : x.cols();
         if (N == 0)
-            return std::unexpected(nn::Error{"evaluate_mnist: empty dataset"});
+            NN_FAIL("evaluate_mnist: empty dataset");
         const std::size_t chunk = (eval_batch > 0) ? std::min(eval_batch, N) : N;
 
         // 评估一律用推理模式：BatchNorm 使用 running 统计量而非 batch 统计量。
@@ -191,24 +186,21 @@ namespace nn::cli
                     xb.set_value_unchecked(r, i, x.at_unchecked(r, start + i));
 
             auto x_tensor_r = engine.from_matrix(xb);
-            if (!x_tensor_r) return std::unexpected(std::move(x_tensor_r).error());
-
+            NN_TRY_CHECK(x_tensor_r);
             // batch 模式加速 forward（GPU 下消除 per-primitive 提交开销）
             auto bb = engine.begin_batch();
-            if (!bb) return std::unexpected(bb.error());
-
+            NN_TRY_CHECK(bb);
             auto out_tensor_r = model.forward(*x_tensor_r);
             if (!out_tensor_r)
             {
                 (void)engine.end_batch();   // 出错也收尾，避免录制状态泄漏
-                return std::unexpected(std::move(out_tensor_r).error());
+                return std::unexpected(out_tensor_r.error());
             }
 
             auto eb = engine.end_batch();
-            if (!eb) return std::unexpected(eb.error());
-
+            NN_TRY_CHECK(eb);
             auto out_r = engine.to_matrix(*out_tensor_r);
-            if (!out_r) return std::unexpected(std::move(out_r).error());
+            NN_TRY_CHECK(out_r);
             const auto &out = *out_r;
 
             for (std::size_t i = 0; i < cnt; ++i)

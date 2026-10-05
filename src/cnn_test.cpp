@@ -35,11 +35,7 @@ int main(int argc, char* argv[])
         nn::cli::EngineConfig ec;
         ec.use_gpu = true;
         auto probe = nn::cli::create_engine(ec);
-        if (!probe)
-        {
-            std::cout << "GPU 不可用，跳过: " << probe.error().message << "\n";
-            return 77;
-        }
+        NN_EXIT(probe, 77, "GPU 不可用，跳过: ");
         break;
     }
 

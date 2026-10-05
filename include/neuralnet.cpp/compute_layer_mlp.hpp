@@ -49,15 +49,13 @@ public:
         const Scalar limit = std::sqrt(6.0 / static_cast<Scalar>(in_features_ + out_features_));
         w_ = engine.create_tensor(out_features_, in_features_, p_.param,
                                   InitSpec::uniform(-limit, limit, kInitSeed));
-        if (!w_.valid()) return std::unexpected(Error{"Linear: 权重初始化失败"});
+        if (!w_.valid()) NN_FAIL("Linear: 权重初始化失败");
         b_ = engine.create_tensor(out_features_, 1, p_.param, InitSpec::zero());
-        if (!b_.valid()) return std::unexpected(Error{"Linear: 偏置初始化失败"});
-
-        // ── 梯度张量精度 = p_.param（与参数同精度；§8.3 存储精度不可变）──
+        if (!b_.valid()) NN_FAIL("Linear: 偏置初始化失败");
         grad_w_ = engine.create_tensor(out_features_, in_features_, p_.param, InitSpec::zero());
         grad_b_ = engine.create_tensor(out_features_, 1, p_.param, InitSpec::zero());
         if (!grad_w_.valid() || !grad_b_.valid())
-            return std::unexpected(Error{"Linear: 梯度缓冲初始化失败"});
+            NN_FAIL("Linear: 梯度缓冲初始化失败");
         return {};
     }
 
@@ -87,8 +85,7 @@ public:
     {
         ComputeEngine& engine = engine_ref();
         if (input.rows() != w_.cols())
-            return std::unexpected(Error{"linear forward: input shape mismatch"});
-
+            NN_FAIL("linear forward: input shape mismatch");
         if (!checkpoint_mode_)
             input_cache_ = input;
 
@@ -107,8 +104,7 @@ public:
     {
         ComputeEngine& engine = engine_ref();
         if (grad_output.rows() != w_.rows())
-            return std::unexpected(Error{"linear backward: grad_output shape mismatch"});
-
+            NN_FAIL("linear backward: grad_output shape mismatch");
         // 计算精度 = p_.compute（in-place 累加的目标精度 = grad_w_ 的存储精度，
         // compute_into 无需 P：§8.3 in-place 存储精度不可变）
         // grad_input = W^T × grad_output：纯 matmul 段（无尾链），由 dsl::compute
@@ -194,8 +190,7 @@ public:
         ComputeEngine& engine = engine_ref();
         if (input_cache_.rows() != grad_output.rows() ||
             input_cache_.cols() != grad_output.cols())
-            return std::unexpected(Error{"relu backward: shape mismatch"});
-
+            NN_FAIL("relu backward: shape mismatch");
         return dsl::compute(engine,
             dsl::select(dsl::leaf(input_cache_) > Scalar{0},
                         dsl::leaf(grad_output), Scalar{0}),
@@ -263,8 +258,7 @@ public:
         ComputeEngine& engine = engine_ref();
         if (input_cache_.rows() != grad_output.rows() ||
             input_cache_.cols() != grad_output.cols())
-            return std::unexpected(Error{"gelu backward: shape mismatch"});
-
+            NN_FAIL("gelu backward: shape mismatch");
         const Scalar beta = BETA;
         // s = 1/(1+exp(-βx))；factor = s * (1 + βx*(1-s))；out = grad_out * factor
         auto bx = dsl::leaf(input_cache_) * beta;                    // βx
@@ -361,10 +355,9 @@ public:
         const std::size_t cols = grad_output.cols();
 
         if (input_cache_.rows() != rows || input_cache_.cols() != cols)
-            return std::unexpected(Error{"swiglu backward: input_cache shape mismatch"});
+            NN_FAIL("swiglu backward: input_cache shape mismatch");
         if (grad_output.rows() != d_ff_ || grad_output.cols() != cols)
-            return std::unexpected(Error{"swiglu backward: grad_output shape mismatch"});
-
+            NN_FAIL("swiglu backward: grad_output shape mismatch");
         const auto go   = dsl::row_access(grad_output, 0u, dff);   // go[r % d_ff]
         const auto gate = dsl::row_access(input_cache_, 0u, dff);   // in[r % d_ff]
         const auto up   = dsl::row_access(input_cache_, dff, dff);  // in[d_ff + r % d_ff]
@@ -427,12 +420,11 @@ public:
         gamma_ = engine.create_tensor(normalized_shape_, 1, p_.param, InitSpec::constant(1));
         beta_ = engine.create_tensor(normalized_shape_, 1, p_.param, InitSpec::zero());
         if (!gamma_.valid() || !beta_.valid())
-            return std::unexpected(Error{"LayerNorm: 参数初始化失败"});
-
+            NN_FAIL("LayerNorm: 参数初始化失败");
         grad_gamma_ = engine.create_tensor(normalized_shape_, 1, p_.param, InitSpec::zero());
         grad_beta_ = engine.create_tensor(normalized_shape_, 1, p_.param, InitSpec::zero());
         if (!grad_gamma_.valid() || !grad_beta_.valid())
-            return std::unexpected(Error{"LayerNorm: 梯度缓冲初始化失败"});
+            NN_FAIL("LayerNorm: 梯度缓冲初始化失败");
         return {};
     }
 
@@ -476,8 +468,7 @@ public:
     {
         ComputeEngine& engine = engine_ref();
         if (input.rows() != normalized_shape_)
-            return std::unexpected(Error{"layernorm forward: input shape mismatch"});
-
+            NN_FAIL("layernorm forward: input shape mismatch");
         const Scalar inv_features = Scalar{1} / static_cast<Scalar>(normalized_shape_);
         const std::size_t F = normalized_shape_;
         const std::size_t B = input.cols();
@@ -646,11 +637,10 @@ public:
         // gamma 初始化为 1（无 beta）——M2 声明式：引擎填数
         gamma_ = engine.create_tensor(normalized_shape_, 1, p_.param, InitSpec::constant(1));
         if (!gamma_.valid())
-            return std::unexpected(Error{"RMSNorm: 参数初始化失败"});
-
+            NN_FAIL("RMSNorm: 参数初始化失败");
         grad_gamma_ = engine.create_tensor(normalized_shape_, 1, p_.param, InitSpec::zero());
         if (!grad_gamma_.valid())
-            return std::unexpected(Error{"RMSNorm: 梯度缓冲初始化失败"});
+            NN_FAIL("RMSNorm: 梯度缓冲初始化失败");
         return {};
     }
 
@@ -691,8 +681,7 @@ public:
     {
         ComputeEngine& engine = engine_ref();
         if (input.rows() != normalized_shape_)
-            return std::unexpected(Error{"rmsnorm forward: input shape mismatch"});
-
+            NN_FAIL("rmsnorm forward: input shape mismatch");
         const Scalar inv_features = Scalar{1} / static_cast<Scalar>(normalized_shape_);
         const std::size_t F = normalized_shape_;
         const std::size_t B = input.cols();
@@ -860,18 +849,16 @@ public:
         gamma_ = engine.create_tensor(features_, 1, p_.param, InitSpec::constant(1));
         beta_ = engine.create_tensor(features_, 1, p_.param, InitSpec::zero());
         if (!gamma_.valid() || !beta_.valid())
-            return std::unexpected(Error{"BatchNorm: 参数初始化失败"});
-
+            NN_FAIL("BatchNorm: 参数初始化失败");
         grad_gamma_ = engine.create_tensor(features_, 1, p_.param, InitSpec::zero());
         grad_beta_ = engine.create_tensor(features_, 1, p_.param, InitSpec::zero());
         if (!grad_gamma_.valid() || !grad_beta_.valid())
-            return std::unexpected(Error{"BatchNorm: 梯度缓冲初始化失败"});
-
+            NN_FAIL("BatchNorm: 梯度缓冲初始化失败");
         running_mean_ = engine.create_tensor(features_, 1, p_.stable, InitSpec::zero());
         running_var_ = engine.create_tensor(features_, 1, p_.stable,
                                              InitSpec::constant(1));
         if (!running_mean_.valid() || !running_var_.valid())
-            return std::unexpected(Error{"BatchNorm: running 统计初始化失败"});
+            NN_FAIL("BatchNorm: running 统计初始化失败");
         return {};
     }
 
@@ -929,8 +916,7 @@ public:
     {
         ComputeEngine& engine = engine_ref();
         if (input.rows() != features_)
-            return std::unexpected(Error{"batchnorm forward: input shape mismatch"});
-
+            NN_FAIL("batchnorm forward: input shape mismatch");
         const std::size_t F = features_;
         const std::size_t B = input.cols();
 
@@ -1038,9 +1024,7 @@ public:
     {
         ComputeEngine& engine = engine_ref();
         if (!normalized_cache_.valid() || !std_cache_.valid())
-            return std::unexpected(Error{
-                "batchnorm backward: 缺少 forward 缓存（先调 forward）"});
-
+            NN_FAIL("batchnorm backward: 缺少 forward 缓存（先调 forward）");
         const std::size_t F = features_;
         const std::size_t B = grad_output.cols();
         const Scalar inv_batch = Scalar{1} / static_cast<Scalar>(B);

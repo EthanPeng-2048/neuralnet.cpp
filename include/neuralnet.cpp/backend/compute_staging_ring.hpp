@@ -151,8 +151,7 @@ public:
 
             VkResult res = vkCreateBuffer(device_, &buf_info, nullptr, &r.buffer);
             if (res != VK_SUCCESS)
-                return std::unexpected(Error{"vkCreateBuffer failed: " + std::to_string(res)});
-
+                NN_FAIL("vkCreateBuffer failed: " + std::to_string(res));
             // 分配内存
             VkMemoryRequirements mem_reqs;
             vkGetBufferMemoryRequirements(device_, r.buffer, &mem_reqs);
@@ -160,28 +159,24 @@ public:
             auto alloc_r = pool_->allocate(
                 mem_reqs,
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            if (!alloc_r)
-                return std::unexpected(alloc_r.error());
+            NN_TRY_CHECK(alloc_r);
             r.alloc = *alloc_r;
 
             // 绑定内存
             res = vkBindBufferMemory(device_, r.buffer, r.alloc.memory, r.alloc.offset);
             if (res != VK_SUCCESS)
-                return std::unexpected(Error{"vkBindBufferMemory failed: " + std::to_string(res)});
-
+                NN_FAIL("vkBindBufferMemory failed: " + std::to_string(res));
             // 映射内存
             res = vkMapMemory(device_, r.alloc.memory, r.alloc.offset, r.alloc.size, 0, &r.mapped_ptr);
             if (res != VK_SUCCESS)
-                return std::unexpected(Error{"vkMapMemory failed: " + std::to_string(res)});
-
+                NN_FAIL("vkMapMemory failed: " + std::to_string(res));
             // 创建 fence
             VkFenceCreateInfo fence_info{};
             fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
             fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT; // 初始状态为 signaled
             res = vkCreateFence(device_, &fence_info, nullptr, &r.fence);
             if (res != VK_SUCCESS)
-                return std::unexpected(Error{"vkCreateFence failed: " + std::to_string(res)});
-
+                NN_FAIL("vkCreateFence failed: " + std::to_string(res));
             // 创建跨 submit 信号量（仅时间线模式；初始 value 0 = 未 signal，
             // 见 Region::semaphore 注释）
             if (timeline_)
@@ -196,8 +191,7 @@ public:
                 sema_info.pNext = &type_info;
                 res = vkCreateSemaphore(device_, &sema_info, nullptr, &r.semaphore);
                 if (res != VK_SUCCESS)
-                    return std::unexpected(Error{
-                        "vkCreateSemaphore(timeline) failed: " + std::to_string(res)});
+                    NN_FAIL("vkCreateSemaphore(timeline) failed: " + std::to_string(res));
             }
 
             // 分配专属 command buffer（见 Region::cmd 注释：禁止 pending 释放）
@@ -208,7 +202,7 @@ public:
             cmd_alloc.commandBufferCount = 1;
             res = vkAllocateCommandBuffers(device_, &cmd_alloc, &r.cmd);
             if (res != VK_SUCCESS)
-                return std::unexpected(Error{"vkAllocateCommandBuffers failed: " + std::to_string(res)});
+                NN_FAIL("vkAllocateCommandBuffers failed: " + std::to_string(res));
         }
 
         return {};
@@ -280,14 +274,12 @@ public:
         std::size_t region_idx, std::span<const T> data, VkDeviceSize offset = 0)
     {
         if (region_idx >= regions_.size())
-            return std::unexpected(Error{"Invalid region index"});
-
+            NN_FAIL("Invalid region index");
         auto& r = regions_[region_idx];
         const std::size_t byte_size = data.size() * sizeof(T);
 
         if (offset + byte_size > region_size_)
-            return std::unexpected(Error{"Upload exceeds staging region size"});
-
+            NN_FAIL("Upload exceeds staging region size");
         std::memcpy(static_cast<char*>(r.mapped_ptr) + offset, data.data(), byte_size);
         return {};
     }
@@ -298,14 +290,12 @@ public:
         std::size_t region_idx, std::span<T> data, VkDeviceSize offset = 0)
     {
         if (region_idx >= regions_.size())
-            return std::unexpected(Error{"Invalid region index"});
-
+            NN_FAIL("Invalid region index");
         auto& r = regions_[region_idx];
         const std::size_t byte_size = data.size() * sizeof(T);
 
         if (offset + byte_size > region_size_)
-            return std::unexpected(Error{"Download exceeds staging region size"});
-
+            NN_FAIL("Download exceeds staging region size");
         std::memcpy(data.data(), static_cast<char*>(r.mapped_ptr) + offset, byte_size);
         return {};
     }

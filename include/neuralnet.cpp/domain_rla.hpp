@@ -45,22 +45,21 @@ struct RAPTConfig {
 {
     if (cfg.d_model == 0 || cfg.num_heads == 0 || cfg.seq_len == 0 ||
         cfg.vocab_size == 0 || cfg.d_ff == 0 || cfg.num_layers == 0)
-        return std::unexpected(Error{"RAPT model parameters must be positive"});
+        NN_FAIL("RAPT model parameters must be positive");
     if (cfg.d_model % cfg.num_heads != 0)
-        return std::unexpected(Error{"RAPT d_model must be divisible by num_heads"});
+        NN_FAIL("RAPT d_model must be divisible by num_heads");
     // RLA 强约束：RoPE 需偶数 d_k（旋转块）；v1 只支持 RoPE
     if (cfg.pos_enc != PosEncodingType::RoPE)
-        return std::unexpected(Error{"RAPT v1 requires pos_enc == RoPE (RLA constraint)"});
+        NN_FAIL("RAPT v1 requires pos_enc == RoPE (RLA constraint)");
     if ((cfg.d_model / cfg.num_heads) % 2 != 0)
-        return std::unexpected(Error{"RAPT requires even d_k (RoPE) — d_model/num_heads must be even"});
-
+        NN_FAIL("RAPT requires even d_k (RoPE) — d_model/num_heads must be even");
     Model model(engine);
     {
         auto r = model.add<RAPTModel>(
             cfg.vocab_size, cfg.d_model, cfg.seq_len,
             cfg.num_heads, cfg.d_ff, cfg.num_layers,
             cfg.pos_enc, cfg.activation, cfg.norm_type, cfg.causal, cfg.precision);
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
     }
     return model;
 }
@@ -71,8 +70,7 @@ struct RAPTConfig {
     PrecisionProfile precision = PrecisionProfile{})
 {
     if (!spec.is_rapt())
-        return std::unexpected(Error{"Invalid ModelSpec type for RAPT: expected RAPT"});
-
+        NN_FAIL("Invalid ModelSpec type for RAPT: expected RAPT");
     auto model = build_rapt_model(engine, RAPTConfig{
         spec.vocab_size, spec.d_model, spec.seq_len,
         spec.num_heads, spec.d_ff, spec.num_layers,

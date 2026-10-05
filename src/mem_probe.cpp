@@ -372,11 +372,7 @@ int main(int argc, char* argv[])
     eng_cfg.use_gpu = true;
     eng_cfg.gpu_device = gpu_dev;
     auto engine_r = nn::cli::create_engine(eng_cfg, std::cout);
-    if (!engine_r)
-    {
-        std::cerr << "引擎创建失败: " << engine_r.error().message << "\n";
-        return 1;
-    }
+    NN_EXIT(engine_r, 1, "引擎创建失败: ");
     auto raw_engine = std::move(*engine_r);
     if (raw_engine->device() != nn::Device::GPU)
     {
@@ -405,11 +401,7 @@ int main(int argc, char* argv[])
         vocab, d_model, seq, heads, d_ff, layers,
         nn::PosEncodingType::Learned, nn::ActivationType::GeLU,
         nn::NormType::LayerNorm, prof});
-    if (!model_r)
-    {
-        std::cerr << "构建模型失败: " << model_r.error().message << "\n";
-        return 1;
-    }
+    NN_EXIT(model_r, 1, "构建模型失败: ");
     nn::Model model = std::move(*model_r);
     model.set_flush_interval(flush_interval);  // 与 text_train 默认一致
     if (checkpoint_every > 0) model.set_checkpoint_every(checkpoint_every);
@@ -427,11 +419,7 @@ int main(int argc, char* argv[])
     // ── 优化器（状态在构造期分配）──────────────────────────────────────
     auto optimizer = nn::create_optimizer(opt_name, *engine, params, grads,
                                           /*lr=*/1e-3, /*wd=*/0.01);
-    if (!optimizer)
-    {
-        std::cerr << "未知优化器: " << opt_name << "\n";
-        return 1;
-    }
+    NN_EXIT(optimizer, 1, "未知优化器: ");
     take_sample("optimizer-created");
 
     // 优化器状态实测增量（optimizer-created 与 model-built 的 live 差）
@@ -491,7 +479,7 @@ int main(int argc, char* argv[])
     {
         const std::string tag = "step" + std::to_string(step) + "/";
         auto xt_r = engine->from_matrix(x_tokens);
-        if (!xt_r) { std::cerr << "from_matrix 失败: " << xt_r.error().message << "\n"; return 1; }
+        NN_EXIT(xt_r, 1, "from_matrix 失败: ");
 
         // 文档感知掩码（复刻 text_train 的 doc_ids 路径）：每窗口内模拟多个
         // 文档边界（batch-major b*seq+t 布局）。
@@ -505,10 +493,10 @@ int main(int argc, char* argv[])
         }
 
         auto br = engine->begin_batch();
-        if (!br) { std::cerr << "begin_batch 失败: " << br.error().message << "\n"; return 1; }
+        NN_EXIT(br, 1, "begin_batch 失败: ");
 
         auto fwd = model.forward(*xt_r);
-        if (!fwd) { std::cerr << "forward 失败: " << fwd.error().message << "\n"; return 1; }
+        NN_EXIT(fwd, 1, "forward 失败: ");
         nn::Tensor logits = std::move(*fwd);
         logits_seen = tensor_bytes(logits);
         take_sample(tag + "forward");
@@ -521,38 +509,38 @@ int main(int argc, char* argv[])
         auto loss_r = ce.forward_sparse_sum(*engine, logits,
             std::span<const std::size_t>(flat_targets),
             std::span<const Scalar>(flat_mask), vocab, num_valid);
-        if (!loss_r) { std::cerr << "loss 失败: " << loss_r.error().message << "\n"; return 1; }
+        NN_EXIT(loss_r, 1, "loss 失败: ");
         take_sample(tag + "loss-fwd");
 
         auto fl = engine->flush_batch();
-        if (!fl) { std::cerr << "flush 失败: " << fl.error().message << "\n"; return 1; }
+        NN_EXIT(fl, 1, "flush 失败: ");
 
         logits = {};  // text_train 同款：logits 消费完立即释放
         take_sample(tag + "logits-freed");
 
         auto g = ce.backward();
-        if (!g) { std::cerr << "loss backward 失败: " << g.error().message << "\n"; return 1; }
+        NN_EXIT(g, 1, "loss backward 失败: ");
         auto bw = model.backward(*g);
-        if (!bw) { std::cerr << "backward 失败: " << bw.error().message << "\n"; return 1; }
+        NN_EXIT(bw, 1, "backward 失败: ");
         take_sample(tag + "backward");
 
         auto eb = engine->end_batch();
-        if (!eb) { std::cerr << "end_batch 失败: " << eb.error().message << "\n"; return 1; }
+        NN_EXIT(eb, 1, "end_batch 失败: ");
         take_sample(tag + "end-batch");
 
         auto rel = engine->release_idle_pool_blocks();
-        if (!rel) { std::cerr << "release 失败: " << rel.error().message << "\n"; return 1; }
+        NN_EXIT(rel, 1, "release 失败: ");
         take_sample(tag + "released");
         g = {};
 
         auto ob = engine->begin_batch();
-        if (!ob) { std::cerr << "begin_batch(opt) 失败: " << ob.error().message << "\n"; return 1; }
+        NN_EXIT(ob, 1, "begin_batch(opt) 失败: ");
         auto st = optimizer->step();
-        if (!st) { std::cerr << "optimizer step 失败: " << st.error().message << "\n"; return 1; }
+        NN_EXIT(st, 1, "optimizer step 失败: ");
         auto zg = optimizer->zero_grad();
-        if (!zg) { std::cerr << "zero_grad 失败: " << zg.error().message << "\n"; return 1; }
+        NN_EXIT(zg, 1, "zero_grad 失败: ");
         auto oe = engine->end_batch();
-        if (!oe) { std::cerr << "end_batch(opt) 失败: " << oe.error().message << "\n"; return 1; }
+        NN_EXIT(oe, 1, "end_batch(opt) 失败: ");
         take_sample(tag + "optimizer-step");
     }
 
@@ -581,7 +569,7 @@ int main(int argc, char* argv[])
             take_sample("kv/caches-allocated");
 
             auto kbr = engine->begin_batch();
-            if (!kbr) { std::cerr << "kv begin_batch 失败: " << kbr.error().message << "\n"; return 1; }
+            NN_EXIT(kbr, 1, "kv begin_batch 失败: ");
             nn::Tensor last_logits;
             std::mt19937_64 rng{777};
             std::uniform_int_distribution<std::size_t> uid(0, vocab - 1);
@@ -594,7 +582,7 @@ int main(int argc, char* argv[])
             }
             take_sample("kv/after-steps(batch内)");
             auto ker = engine->end_batch();
-            if (!ker) { std::cerr << "kv end_batch 失败: " << ker.error().message << "\n"; return 1; }
+            NN_EXIT(ker, 1, "kv end_batch 失败: ");
             take_sample("kv/end-batch");
             kc.clear();
             vc.clear();

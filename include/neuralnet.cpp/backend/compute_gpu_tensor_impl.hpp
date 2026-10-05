@@ -21,26 +21,21 @@ template <Precision P>
 inline Result<GpuTensorT<P>> GpuTensorT<P>::from_matrix(const MatrixT<P>& cpu_mat, GpuBackend& backend)
 {
     if (cpu_mat.empty())
-        return std::unexpected(Error{"Empty matrix"});
-
+        NN_FAIL("Empty matrix");
     // buffer 字节数 = 元素数 × sizeof(elem<P>)（§6.3）
     const std::size_t byte_count = cpu_mat.size() * sizeof(elem<P>);
     auto buf_res = GpuBuffer::create_device_local(
         backend.device().device(), backend.alloc_pool(),
         byte_count,
         TENSOR_BUFFER_USAGE);
-    if (!buf_res)
-        return std::unexpected(buf_res.error());
-
+    NN_TRY_CHECK(buf_res);
     auto tensor = GpuTensorT<P>(
         std::make_shared<GpuBuffer>(std::move(*buf_res)),
         cpu_mat.rows(), cpu_mat.cols());
 
     // 同精度跨设备 = 原始字节拷贝（§6.5）
     auto upload_res = backend.upload_blocking(tensor, cpu_mat.span());
-    if (!upload_res)
-        return std::unexpected(upload_res.error());
-
+    NN_TRY_CHECK(upload_res);
     return tensor;
 }
 
@@ -56,9 +51,7 @@ inline Result<GpuTensorT<P>> GpuTensorT<P>::create_empty(
         backend.device().device(), backend.alloc_pool(),
         byte_count,
         TENSOR_BUFFER_USAGE);
-    if (!buf_res)
-        return std::unexpected(buf_res.error());
-
+    NN_TRY_CHECK(buf_res);
     return GpuTensorT<P>(std::make_shared<GpuBuffer>(std::move(*buf_res)), rows, cols);
 }
 
@@ -73,9 +66,7 @@ inline Result<GpuTensorT<P>> GpuTensorT<P>::create_host_visible_empty(
         backend.device().device(), backend.alloc_pool(),
         byte_count,
         TENSOR_BUFFER_USAGE);
-    if (!buf_res)
-        return std::unexpected(buf_res.error());
-
+    NN_TRY_CHECK(buf_res);
     return GpuTensorT<P>(std::make_shared<GpuBuffer>(std::move(*buf_res)), rows, cols);
 }
 
@@ -83,13 +74,10 @@ template <Precision P>
 inline Result<MatrixT<P>> GpuTensorT<P>::to_matrix(GpuBackend& backend) const
 {
     if (!valid())
-        return std::unexpected(Error{"Invalid GpuTensor"});
-
+        NN_FAIL("Invalid GpuTensor");
     MatrixT<P> cpu_mat(rows_, cols_);
     auto dl_res = backend.download_blocking(*this, cpu_mat.span());
-    if (!dl_res)
-        return std::unexpected(dl_res.error());
-
+    NN_TRY_CHECK(dl_res);
     return cpu_mat;
 }
 

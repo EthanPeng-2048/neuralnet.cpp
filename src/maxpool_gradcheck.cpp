@@ -121,7 +121,7 @@ int main(int argc, char* argv[])
     nn::cli::EngineConfig ecfg;
     ecfg.use_gpu = use_gpu;
     auto engine_res = nn::cli::create_engine(ecfg, std::cout);
-    if (!engine_res) { std::cerr << "引擎创建失败: " << engine_res.error().message << "\n"; return 1; }
+    NN_EXIT(engine_res, 1, "引擎创建失败: ");
     auto engine = std::move(*engine_res);
     ComputeEngine& eng = *engine;
 
@@ -176,12 +176,12 @@ int main(int argc, char* argv[])
 
         // ① forward / backward 与独立参考一致
         auto out = pool.forward(*x);
-        if (!out) { std::cerr << "  forward 失败: " << out.error().message << "\n"; return 1; }
+        NN_EXIT(out, 1, "  forward 失败: ");
         auto om = eng.to_matrix(*out);
         report("forward", *om, ref.fwd());
 
         auto gx = pool.backward(*go);
-        if (!gx) { std::cerr << "  backward 失败: " << gx.error().message << "\n"; return 1; }
+        NN_EXIT(gx, 1, "  backward 失败: ");
         auto gxm = eng.to_matrix(*gx);
         report("backward(grad_x)", *gxm, ref.bwd(gom));
 
@@ -196,14 +196,14 @@ int main(int argc, char* argv[])
         //    forward_recompute 重建缓存后必须与参考一致
         pool.set_checkpoint_mode(true);
         auto out3 = pool.forward(*x);
-        if (!out3) { std::cerr << "  ckpt forward 失败\n"; return 1; }
+        NN_EXIT(out3, 1, "  ckpt forward 失败\n");
         auto gx3 = pool.backward(*go);
         std::printf("  %-22s %s\n", "ckpt→backward",
                     gx3 ? "FAIL（未拦截）" : "OK（已拒绝）");
         if (gx3) ++failures;
 
         auto rec = pool.forward_recompute(*x);
-        if (!rec) { std::cerr << "  forward_recompute 失败: " << rec.error().message << "\n"; return 1; }
+        NN_EXIT(rec, 1, "  forward_recompute 失败: ");
         auto gx4 = pool.backward(*go);
         if (!gx4)
         {

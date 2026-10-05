@@ -78,7 +78,7 @@ public:
         if (default_precision_.has_value())
             layer->set_precision_profile(default_precision_.value());
         auto r = layer->init(engine());
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         layers_.emplace_back(std::move(layer));
         return {};
     }
@@ -89,7 +89,7 @@ public:
         if (default_precision_.has_value())
             layer->set_precision_profile(default_precision_.value());
         auto r = layer->init(engine());
-        if (!r) return std::unexpected(r.error());
+        NN_TRY_CHECK(r);
         layers_.emplace_back(std::move(layer));
         return {};
     }
@@ -183,15 +183,14 @@ public:
     [[nodiscard]] Result<Tensor> forward(const Tensor& input)
     {
         if (layers_.empty())
-            return std::unexpected(Error{"Model::forward: no layers"});
+            NN_FAIL("Model::forward: no layers");
         if (engine_ == nullptr)
-            return std::unexpected(Error{"Model::forward: engine not bound"});
-
+            NN_FAIL("Model::forward: engine not bound");
         Tensor x = input;
         for (auto& layer : layers_)
         {
             auto r = layer->forward(x);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             x = std::move(*r);
         }
         return x;
@@ -201,15 +200,14 @@ public:
     [[nodiscard]] Result<Tensor> backward(const Tensor& grad_output)
     {
         if (layers_.empty())
-            return std::unexpected(Error{"Model::backward: no layers"});
+            NN_FAIL("Model::backward: no layers");
         if (engine_ == nullptr)
-            return std::unexpected(Error{"Model::backward: engine not bound"});
-
+            NN_FAIL("Model::backward: engine not bound");
         Tensor g = grad_output;
         for (std::size_t i = layers_.size(); i-- > 0;)
         {
             auto r = layers_[i]->backward(g);
-            if (!r) return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
             g = std::move(*r);
         }
         return g;
