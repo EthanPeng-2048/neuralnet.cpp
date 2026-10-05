@@ -350,9 +350,10 @@ if(NN_BUILD_APPS)
     nn_add_executable(tokenizer_infer src/tokenizer_infer.cpp)
     list(APPEND NN_APP_TARGETS text_train text_infer tokenizer_train tokenizer_infer)
 
-    # ── 数据集工具（旧格式转换器；dataset_gen 生成器随阶段二落地）─────────
+    # ── 数据集工具（生成器 + 旧格式转换器）────────────────────────────────
+    nn_add_executable(dataset_gen src/dataset_gen.cpp)
     nn_add_executable(dataset_convert src/dataset_convert.cpp)
-    list(APPEND NN_APP_TARGETS dataset_convert)
+    list(APPEND NN_APP_TARGETS dataset_gen dataset_convert)
 
     # ── 层吞吐量基准（CPU/Vulkan GPU；--all 或 --layer <name> 指定） ────────
     nn_add_executable(layer_bench src/layer_bench.cpp)
@@ -493,6 +494,10 @@ if(NN_ENABLE_TESTS)
     # ── .nnvocab 词表文件（json→nnvocab→加载语义一致 + 旧 json 明确拒绝）────
     nn_add_executable(nnvocab_test src/nnvocab_test.cpp)
     list(APPEND NN_TEST_TARGETS nnvocab_test)
+
+    # ── .nndataset / nn::Dataset（生成→读取与旧 tokcache 产物逐位一致）─────
+    nn_add_executable(dataset_test src/dataset_test.cpp)
+    list(APPEND NN_TEST_TARGETS dataset_test)
 
 endif()
 

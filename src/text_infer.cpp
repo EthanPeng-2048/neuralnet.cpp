@@ -284,17 +284,17 @@ int main(int argc, char *argv[])
 
     // ── 加载模型参数 + tokenizer ────────────────────────────
     std::cout << "加载模型: " << cfg.model_path << " ..." << std::endl;
-    auto load_result = nn::load_model(cfg.model_path, model);
+    std::uint32_t model_version = 0;
+    auto load_result = nn::load_model(cfg.model_path, model, &model_version);
     NN_EXIT(load_result, 1, "加载模型失败: ");
     std::cout << "模型已加载" << std::endl;
 
-    // ── 加载 tokenizer（自动识别类型） ─────────────────────────
+    // ── 加载 tokenizer（按模型版本分派：v5=JSON / v6=.nnvocab kvrec）──
     std::unique_ptr<nn::Tokenizer> tokenizer;
     const std::string &embedded_vocab = *load_result;
     if (!embedded_vocab.empty())
     {
-        // 模型内嵌词表：v5 = JSON、v6 起 = .nnvocab kvrec，按内容嗅探分派
-        auto tok_r = nn::load_tokenizer_from_bytes(embedded_vocab);
+        auto tok_r = nn::load_tokenizer_from_model_blob(embedded_vocab, model_version);
         NN_EXIT(tok_r, 1, "解析嵌入 tokenizer 失败: ");
         tokenizer = std::move(*tok_r);
         std::cout << "已从模型文件加载嵌入 tokenizer" << std::endl;

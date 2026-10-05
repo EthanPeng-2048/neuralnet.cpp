@@ -1,7 +1,11 @@
 // ── GPT 文本生成训练程序（引擎化架构） ──────────────────────────────────────
 //
+// 输入：.nndataset 数据集（docs/development/19-unified-dataset.md）——
+//   tokenize、loss 掩码、词表都在生成期（dataset_gen）定好并嵌入数据集。
+//
 // 数据流（滑动窗口，GPT 预训练标准做法）：
-//   文本 → 逐行 Tokenizer.encode → 各行 token 纯拼接成连续 token 流
+//   nn::Dataset::load_text → token 流 + doc_ids + loss_mask（与旧 tokcache
+//     + mark_assistant_spans 产物逐位同构）→ 各 doc token 纯拼接成连续 token 流
 //     （行间无分隔符、不插入 BOS/EOS；行边界由 doc_ids 记录，窗口可跨行，
 //       上下文连续）
 //   按 stride 对 token 流滑动切 seq_len 窗口 → 每窗口 = 一个训练样本
@@ -51,220 +55,12 @@ using nn::Scalar;
 
 namespace fs = std::filesystem;
 
-// ── 流式文件读取：返回原始 buffer + 行引用，避免逐行拷贝 ─────────
-struct LineRef {
-    const char* data;
-    std::size_t len;
-};
-
-struct FileContent {
-    std::string buffer;
-    std::vector<LineRef> lines;
-};
-
-[[nodiscard]] nn::Result<FileContent> read_file_lines(const std::string& path)
-{
-    std::ifstream ifs(path, std::ios::binary);
-    if (!ifs)
-        NN_FAIL("无法打开文件: " + path);
-    FileContent fc;
-    fc.buffer.assign(std::istreambuf_iterator<char>(ifs), {});
-    if (fc.buffer.empty())
-        return fc;
-
-    // 逐行提取引用（仅记录偏移，不拷贝字符串）
-    const char* buf = fc.buffer.data();
-    const std::size_t total = fc.buffer.size();
-    std::size_t pos = 0;
-    while (pos < total)
-    {
-        std::size_t line_start = pos;
-        while (pos < total && buf[pos] != '\n') ++pos;
-        std::size_t line_end = pos;
-        if (pos < total) ++pos;  // skip '\n'
-        // 去除 \r 和首尾空白
-        while (line_start < line_end &&
-               (buf[line_start] == ' ' || buf[line_start] == '\t' || buf[line_start] == '\r'))
-            ++line_start;
-        while (line_end > line_start &&
-               (buf[line_end - 1] == ' ' || buf[line_end - 1] == '\t' || buf[line_end - 1] == '\r'))
-            --line_end;
-        if (line_start < line_end)
-            fc.lines.push_back({buf + line_start, line_end - line_start});
-    }
-    return fc;
-}
-
-// ── 并行 tokenize + 文档 id：每行 = 一篇文档 ───────────────────────
-// base 模式纯拼接：行间无分隔符，不插入 BOS/EOS。
-// 输出 token_flow 与等长的 doc_ids：每 token 的文档 id = 所在行号 + 1
-//（1 起，0 保留给 PAD/无效位置，便于块对角掩码隔离）。
-void parallel_tokenize(
-    const nn::Tokenizer& tokenizer,
-    const std::vector<LineRef>& lines,
-    std::vector<std::size_t>& token_flow,
-    std::vector<std::size_t>& doc_ids)
-{
-    token_flow.clear();
-    doc_ids.clear();
-    const std::size_t n = lines.size();
-    if (n == 0) return;
-
-    const unsigned hw = std::thread::hardware_concurrency();
-    const std::size_t n_threads = std::max(hw, 1u);
-
-    // 行数太少时单线程（避免线程开销超过收益）
-    if (n < n_threads * 64 || n_threads <= 1)
-    {
-        token_flow.reserve(n * 8);
-        for (std::size_t li = 0; li < n; ++li)
-        {
-            auto toks = tokenizer.encode(std::string(lines[li].data, lines[li].len));
-            if (toks.empty()) continue;
-            const std::size_t doc = li + 1;   // 文档 id（1 起）
-            for (const auto tk : toks)
-            {
-                token_flow.push_back(tk);
-                doc_ids.push_back(doc);
-            }
-        }
-        return;
-    }
-
-    // 分块并行：每块独立编码，结果按块下标升序拼接
-    //（顺序契约：与单线程逐字节一致，故块边界只由 n/chunk 决定）。
-    struct Chunk { std::vector<std::size_t> toks; std::vector<std::size_t> doc; };
-    const std::size_t chunk = (n + n_threads - 1) / n_threads;
-    const std::size_t n_chunks = (n + chunk - 1) / chunk;
-    std::vector<Chunk> parts(n_chunks);
-
-    nn::parallel_for_samples(n_chunks, [&](std::size_t c) {
-        const std::size_t begin = c * chunk;
-        const std::size_t end = std::min(begin + chunk, n);
-        auto &cc = parts[c];
-        cc.toks.reserve((end - begin) * 8);
-        cc.doc.reserve((end - begin) * 8);
-        for (std::size_t i = begin; i < end; ++i)
-        {
-            auto toks = tokenizer.encode(std::string(lines[i].data, lines[i].len));
-            if (toks.empty()) continue;
-            const std::size_t doc = i + 1;   // 文档 id（1 起，全局行号）
-            for (const auto tk : toks)
-            {
-                cc.toks.push_back(tk);
-                cc.doc.push_back(doc);
-            }
-        }
-    });
-
-    // 汇总：按 chunk 下标升序拼接（doc_ids 保持单调递增）
-    std::size_t total = 0;
-    for (const auto& c : parts) total += c.toks.size();
-    token_flow.reserve(total);
-    doc_ids.reserve(total);
-    for (const auto& c : parts)
-    {
-        token_flow.insert(token_flow.end(), c.toks.begin(), c.toks.end());
-        doc_ids.insert(doc_ids.end(), c.doc.begin(), c.doc.end());
-    }
-}
-
-// ── assistant 段标记（--loss-scope assistant）────────────────────────────
-// 扫描 token 流，把 <|assistant|>…<|end_of_assistant|> 段（含首尾标记）标为 1，
-// 并返回被标记的 token 数。对话 SFT 时仅这些位置作为预测目标参与 loss——
-// system/user 轮只作条件不作监督（标准 SFT 惯例）；含首标记 ⇒ 能学会
-// <|end_of_user|> 后输出 <|assistant|>，含尾标记 ⇒ 能学会收尾。
-// 行边界（doc_id 变化）重置段状态：残缺未闭合的标记不会把后续文档整篇
-// 误标为 assistant（doc_ids 为空时不重置）。
-[[nodiscard]] std::vector<unsigned char> mark_assistant_spans(
-    const std::vector<std::size_t>& flow,
-    const std::vector<std::size_t>& doc_ids,
-    std::size_t asst_begin,
-    std::size_t asst_end,
-    std::size_t& asst_count)
-{
-    std::vector<unsigned char> mask(flow.size(), 0);
-    bool in_asst = false;
-    asst_count = 0;
-    for (std::size_t i = 0; i < flow.size(); ++i)
-    {
-        if (!doc_ids.empty() && i > 0 && doc_ids[i] != doc_ids[i - 1])
-            in_asst = false;
-        const std::size_t id = flow[i];
-        if (id == asst_begin) in_asst = true;
-        mask[i] = in_asst ? 1u : 0u;
-        if (mask[i]) ++asst_count;
-        if (id == asst_end) in_asst = false;
-    }
-    return mask;
-}
-
-// ── Tokenize 二进制缓存 ─────────────────────────────────────
-static constexpr char TOKCACHE_MAGIC[4] = {'T','K','C','H'};
-static constexpr std::uint32_t TOKCACHE_VERSION = 2;
-
-struct TokCacheHeader {
-    char           magic[4];
-    std::uint32_t  version;
-    std::uint32_t  sizeof_size_t;   // 平台 sizeof(size_t)，防止跨平台混用
-    std::uint64_t  text_size;       // 原始文本文件大小（失效判断）
-    std::uint64_t  vocab_size;      // 词表文件大小（失效判断）
-    std::uint64_t  token_count;     // token_flow 长度（= doc_ids 长度）
-};
-
-// Tokenize 缓存的数据（token_flow + 等长 doc_ids）
-struct TokenizedData {
-    std::vector<std::size_t> flow;
-    std::vector<std::size_t> doc_ids;
-};
-
-[[nodiscard]] std::optional<TokenizedData> load_tokenize_cache(
-    const std::string& cache_path,
-    std::uint64_t text_file_size,
-    std::uint64_t vocab_file_size)
-{
-    std::ifstream ifs(cache_path, std::ios::binary);
-    if (!ifs) return std::nullopt;
-
-    TokCacheHeader hdr{};
-    if (!nn::read_pod(ifs, hdr)) return std::nullopt;
-    if (std::memcmp(hdr.magic, TOKCACHE_MAGIC, 4) != 0) return std::nullopt;
-    if (hdr.version != TOKCACHE_VERSION) return std::nullopt;
-    if (hdr.sizeof_size_t != sizeof(std::size_t)) return std::nullopt;
-    if (hdr.text_size != text_file_size) return std::nullopt;
-    if (hdr.vocab_size != vocab_file_size) return std::nullopt;
-
-    TokenizedData data;
-    data.flow.resize(hdr.token_count);
-    data.doc_ids.resize(hdr.token_count);
-    if (!nn::read_pod_span(ifs, std::span(data.flow))) return std::nullopt;
-    if (!nn::read_pod_span(ifs, std::span(data.doc_ids))) return std::nullopt;
-    return data;
-}
-
-bool save_tokenize_cache(
-    const std::string& cache_path,
-    std::uint64_t text_file_size,
-    std::uint64_t vocab_file_size,
-    const std::vector<std::size_t>& token_flow,
-    const std::vector<std::size_t>& doc_ids)
-{
-    std::ofstream ofs(cache_path, std::ios::binary);
-    if (!ofs) return false;
-
-    TokCacheHeader hdr{};
-    std::memcpy(hdr.magic, TOKCACHE_MAGIC, 4);
-    hdr.version = TOKCACHE_VERSION;
-    hdr.sizeof_size_t = static_cast<std::uint32_t>(sizeof(std::size_t));
-    hdr.text_size = text_file_size;
-    hdr.vocab_size = vocab_file_size;
-    hdr.token_count = token_flow.size();
-
-    if (!nn::write_pod(ofs, hdr)) return false;
-    if (!nn::write_pod_span(ofs, std::span(token_flow))) return false;
-    if (!nn::write_pod_span(ofs, std::span(doc_ids))) return false;
-    return true;
-}
+// ── 数据来源：.nndataset（token 流/掩码在生成期已定好）─────────────────
+// 19 号设计（docs/development/19-unified-dataset.md）落地后，文本读取/trim、
+// 并行 tokenize、assistant 掩码扫描、.tokcache 全部移出本入口：
+//   生成侧 = dataset_gen（nn::read_text_docs / nn::encode_docs_parallel /
+//             nn::mark_assistant_span），读取侧 = nn::Dataset（只读）。
+// 本入口只剩：拼流 → 滑窗 → 训练（窗口化是训练策略，裁决 #3）。
 
 // ── 精度解析辅助 ─────────────────────────────────────────────────────────
 nn::Precision parse_precision(const std::string& name, const char* flag)
@@ -280,25 +76,22 @@ void print_usage(const char *prog)
 {
     nn::cli::Help help(std::cout, prog, "GPT 文本生成训练程序");
 
-    help.usage("<text-file> [选项]");
+    help.usage("<dataset.nndataset> [选项]");
 
     help.section("参数");
-    help.item("<text-file>", "训练文本文件路径 (必需)");
+    help.item("<dataset.nndataset>", "数据集文件路径 (.nndataset，由 dataset_gen 生成；\n词表/loss 掩码/test 子集都在生成期定好)");
 
     help.section("选项");
     help.opt("--save <path>", "模型保存路径 (默认: gpt_model.bin)");
     help.opt("--resume <path>", "从已有模型恢复训练");
     help.opt("--resume-epoch <n>", "从第 n 个 epoch 继续 (0-based，需配合 --resume；默认 0)");
     help.opt("--resume-step <n>", "从本 epoch 内第 n 步继续 (0-based，需配合 --resume；默认 0)");
-    help.opt("--vocab <path>", "词表 .nnvocab 路径 (默认: gpt_bpe.nnvocab)\n自动识别分词器类型 (bpe / charbpe)");
-    help.opt("--test-file <path>", "测试集文件路径 (可选，每 epoch 结束后评估 test loss)");
     help.opt("--epochs <n>", "训练轮数 (默认: 10)");
     help.opt("--lr <lr>", "学习率 (默认: 0.001)");
     help.opt("--batch-size <n>", "批大小 (默认: 32)");
     help.opt("--accum-steps <n>", "梯度累积步数 (默认: 1)\n每 n 步 forward/backward 累加梯度后再更新参数，等效放大 batch_size×n");
     help.opt("--seq-len <n>", "序列长度 (默认: 256)");
     help.opt("--stride <n>", "滑动窗口步长 (默认: 等于 --seq-len，即不重叠)\n设小可产生重叠窗口，增加训练样本数");
-    help.opt("--loss-scope <scope>", "loss 计算范围: all / assistant (默认: all)\nall: 全部有效 token 参与 loss (预训练)\nassistant: 仅 <|assistant|>…<|end_of_assistant|> 段参与 (对话 SFT；语料须含对话标记)");
     help.opt("--optimizer <name>", "优化器: sgd/sgd_momentum/adam/adamw/muon (默认: adam)");
     help.opt("--weight-decay <w>", "AdamW 权重衰减系数 (默认: 0.01)");
     help.opt("--beta1 <b>", "Adam/AdamW 一阶动量衰减 β1 (默认: 0.9，sgd/muon 忽略)");
@@ -308,7 +101,6 @@ void print_usage(const char *prog)
     help.opt("--save-interval <n>", "每隔多少 step 保存 checkpoint (默认: 100)");
     help.opt("--max-steps <n>", "本次运行最多训练多少 step 后停止并保存 (默认: 0=不限)\n按本进程执行的步数计，可与 --resume 组合分段跑；用于吞吐实测/分段训练");
     help.opt("--grad-log", "显示梯度统计 (范数/最大值/均值)");
-    help.opt("--no-cache", "禁用 tokenize 缓存 (默认自动缓存到 .tokcache 文件)");
     help.opt("--gpu [索引|名称]", "启用 GPU 加速 (需要 Vulkan SDK)\n空格形式只收枚举索引；名称子串用 --gpu=<名称>，如 --gpu=NVIDIA / --gpu=40HX");
     help.opt("--help, -h", "显示此帮助信息");
 
@@ -350,9 +142,7 @@ void print_usage(const char *prog)
 struct TrainConfig
 {
     std::string text_path;
-    std::string test_path;   // 测试集文件路径（可选，用于每 epoch 结束后评估）
     std::string save_path = "gpt_model.bin";
-    std::string vocab_path = "gpt_bpe.nnvocab";
     std::string resume_path;
     std::string optimizer_name = "adam";
     int epochs = 10;
@@ -374,12 +164,10 @@ struct TrainConfig
     std::size_t max_steps = 0;        // 本进程最多训练步数（0 = 不限，按 epoch 跑完）
     Scalar beta1 = 0.9f;              // Adam/AdamW 一阶动量衰减（sgd/muon 忽略）
     Scalar beta2 = 0.999f;            // Adam/AdamW 二阶动量衰减（LLM 预训练常取 0.95）
-    std::string loss_scope = "all";   // loss 范围: all / assistant（对话 SFT 仅 assistant 段）
     bool load_existing = false;
     bool gpu_enabled = false;
     std::string gpu_device;         // --gpu 的可选设备选择子（空 = 自动选卡）
     bool grad_log = false;          // 显示梯度统计
-    bool no_cache = false;          // 禁用 tokenize 缓存
     nn::PosEncodingType pos_encoding = nn::PosEncodingType::Learned;
     nn::ActivationType activation = nn::ActivationType::GeLU;  // FFN 激活
     nn::NormType norm_type = nn::NormType::LayerNorm;           // 归一化层类型
@@ -441,8 +229,6 @@ TrainConfig parse_args(int argc, char *argv[])
             if (!v) { std::cerr << "无效 --resume-step: " << argv[i] << "\n"; std::exit(1); }
             cfg.start_step = *v;
         }
-        else if (arg == "--vocab" && i + 1 < argc)
-            cfg.vocab_path = argv[++i];
         else if (arg == "--epochs" && i + 1 < argc)
         {
             auto v = nn::parse_number<int>(argv[++i]);
@@ -480,16 +266,6 @@ TrainConfig parse_args(int argc, char *argv[])
             auto v = nn::parse_number<std::size_t>(argv[++i]);
             if (!v) { std::cerr << "无效 --stride: " << v.error().message << "\n"; std::exit(1); }
             cfg.stride = *v;
-        }
-        else if (arg == "--loss-scope" && i + 1 < argc)
-        {
-            cfg.loss_scope = argv[++i];
-            if (cfg.loss_scope != "all" && cfg.loss_scope != "assistant")
-            {
-                std::cerr << "未知 --loss-scope: " << cfg.loss_scope
-                          << "，可选: all, assistant\n";
-                std::exit(1);
-            }
         }
         else if (arg == "--optimizer" && i + 1 < argc)
         {
@@ -583,8 +359,6 @@ TrainConfig parse_args(int argc, char *argv[])
         }
         else if (arg == "--grad-log")
             cfg.grad_log = true;
-        else if (arg == "--no-cache")
-            cfg.no_cache = true;
         else if (arg == "--f16")
         {
             // 快捷方式：**f16 存储**（param=F16 + compute=F16；stable/optimizer
@@ -721,8 +495,6 @@ TrainConfig parse_args(int argc, char *argv[])
         {
             cfg.activation_offload = true;
         }
-        else if (arg == "--test-file" && i + 1 < argc)
-            cfg.test_path = argv[++i];
         else if (!arg.starts_with("--"))
             cfg.text_path = arg;
         else
@@ -734,7 +506,7 @@ TrainConfig parse_args(int argc, char *argv[])
 
     if (cfg.text_path.empty())
     {
-        std::cerr << "请指定训练文本文件\n使用 --help 查看用法\n";
+        std::cerr << "请指定数据集文件 (.nndataset)\n使用 --help 查看用法\n";
         std::exit(1);
     }
 
@@ -806,102 +578,48 @@ int main(int argc, char *argv[])
 {
     TrainConfig cfg = parse_args(argc, argv);
 
-    // ── 加载分词器（.nnvocab 词表文件，自动识别 BPE/CharBPE） ───
-    auto tokenizer_r = nn::load_tokenizer_from_file(cfg.vocab_path);
-    if (!tokenizer_r)
+    // ── 打开数据集（.nndataset；token 流/掩码/词表都在生成期定好）──────
+    std::cout << "加载数据集: " << cfg.text_path << " ..." << std::endl;
+    auto ds_r = nn::Dataset::open(cfg.text_path);
+    NN_EXIT(ds_r, 1, "打开数据集失败: ");
+    const nn::Dataset &dataset = *ds_r;
+    const std::string &loss_scope = dataset.info().loss_scope;
+
+    // 词表来自数据集配套（内嵌三层 kvrec）；保存模型时原样嵌出（模型 v6）。
+    auto tokenizer_r = nn::load_tokenizer_from_kvrec(dataset.vocab_kvrec());
+    NN_EXIT(tokenizer_r, 1, "加载数据集内嵌词表失败: ");
+    std::unique_ptr<nn::Tokenizer> tokenizer = std::move(*tokenizer_r);
+    const std::size_t pad_id = tokenizer->pad_id();
+    const std::string tokenizer_bytes = nn::write_nnvocab(dataset.vocab_kvrec());
+
+    // ── 训练子集（与旧 tokcache + mark_assistant_spans 产物逐位同构）──
+    // base 模式纯拼接、不插入 BOS/EOS（行间无分隔符），文档边界由
+    // doc_ids 表示（每行 = 一篇文档）。
+    const std::size_t stride = (cfg.stride == 0) ? cfg.seq_len : cfg.stride;
+    auto corpus_r = dataset.load_text(false);
+    NN_EXIT(corpus_r, 1, "读取训练子集失败: ");
+    std::vector<std::size_t> token_flow = std::move(corpus_r->token_flow);
+    std::vector<std::size_t> flow_doc_ids = std::move(corpus_r->doc_ids);
+    std::vector<unsigned char> flow_assistant = std::move(corpus_r->loss_mask);
+    if (token_flow.empty())
     {
-        std::cerr << "加载词表失败: " << cfg.vocab_path << '\n'
-                  << tokenizer_r.error().message << std::endl;
+        std::cerr << "数据集 train 子集为空: " << cfg.text_path << "\n";
         return 1;
     }
-    std::unique_ptr<nn::Tokenizer> tokenizer = std::move(*tokenizer_r);
-    // 注意：base 模式纯拼接、不插入 BOS/EOS（行间无分隔符），
-    // 文档边界由 parallel_tokenize 产出的 doc_ids 表示（每行 = 一篇文档）。
-    const std::size_t pad_id = tokenizer->pad_id();
+    std::cout << "训练子集: " << dataset.info().num_docs << " docs / "
+              << token_flow.size() << " tokens  loss_scope=" << loss_scope << "\n";
 
-    // ── Tokenize（并行 + 缓存） ─────────────────────────────
-    // 流式读取文件 → 多线程并行 tokenize → 释放原始文本 → 保留 token_flow + doc_ids。
-    // 首次运行自动保存 .tokcache 二进制缓存，后续加载秒开。
-    const std::size_t stride = (cfg.stride == 0) ? cfg.seq_len : cfg.stride;
-    std::vector<std::size_t> token_flow;
-    std::vector<std::size_t> flow_doc_ids;
-    {
-        std::error_code ec_text, ec_vocab;
-        auto text_fsize = static_cast<std::uint64_t>(fs::file_size(cfg.text_path, ec_text));
-        auto vocab_fsize = static_cast<std::uint64_t>(fs::file_size(cfg.vocab_path, ec_vocab));
-        const std::string cache_path = cfg.text_path + ".tokcache";
-
-        // 1) 尝试从缓存加载
-        if (!cfg.no_cache && !ec_text && !ec_vocab)
-        {
-            auto cached = load_tokenize_cache(cache_path, text_fsize, vocab_fsize);
-            if (cached)
-            {
-                token_flow = std::move(cached->flow);
-                flow_doc_ids = std::move(cached->doc_ids);
-                std::cout << "从缓存加载 token流: " << cache_path
-                          << " (" << token_flow.size() << " tokens)\n";
-            }
-        }
-
-        // 2) 缓存未命中 → 流式读取 + 并行 tokenize
-        if (token_flow.empty())
-        {
-            std::cout << "加载文本: " << cfg.text_path << " ..." << std::endl;
-            auto fc_result = read_file_lines(cfg.text_path);
-            NN_EXIT(fc_result, 1, "Error: ");
-            auto fc = std::move(*fc_result);
-            if (fc.lines.empty())
-            {
-                std::cerr << "文本文件为空\n";
-                return 1;
-            }
-
-            auto t_tok = std::chrono::steady_clock::now();
-            parallel_tokenize(*tokenizer, fc.lines, token_flow, flow_doc_ids);
-            auto t_tok_end = std::chrono::steady_clock::now();
-            // fc 在此作用域末尾析构 → 释放原始文本 buffer
-            // 此后仅 token_flow / flow_doc_ids 占用内存
-            std::cout << "Tokenize 完成: " << token_flow.size() << " tokens, 耗时 "
-                      << std::fixed << std::setprecision(1)
-                      << std::chrono::duration<double>(t_tok_end - t_tok).count() << "s\n";
-
-            // 3) 保存缓存（下次秒开）
-            if (!cfg.no_cache && !ec_text && !ec_vocab)
-            {
-                if (save_tokenize_cache(cache_path, text_fsize, vocab_fsize,
-                                        token_flow, flow_doc_ids))
-                    std::cout << "Token 缓存已保存: " << cache_path << "\n";
-            }
-        }
-    }
-
-    // 文档感知：doc_ids 非空（每行 = 一篇文档）即启用块对角掩码。
+    // 文档感知：doc_ids 非空（每 doc = 一篇文档）即启用块对角掩码。
     if (!flow_doc_ids.empty())
         std::cout << "文档感知掩码已启用（每行 = 一篇文档，"
                   << flow_doc_ids.back() << " 篇文档）\n";
 
-    // ── assistant 段标记（--loss-scope assistant）────────────────────────
-    // 仅 assistant 段内的预测目标参与 loss（对话 SFT；语料须含对话标记）。
-    std::vector<unsigned char> flow_assistant;   // 非空 ⇔ loss_scope == assistant
-    if (cfg.loss_scope == "assistant")
+    // loss 掩码在生成期已定（loss_scope=all 为全 1）：仅掩码内的预测目标
+    // 参与 loss（对话 SFT 时 = <|assistant|>…<|end_of_assistant|> 段）。
+    if (loss_scope == "assistant")
     {
-        if (!tokenizer->has_dialogue_markers())
-        {
-            std::cerr << "--loss-scope assistant 需要带对话标记的词表（<|assistant|> 等）\n";
-            return 1;
-        }
         std::size_t asst_tokens = 0;
-        flow_assistant = mark_assistant_spans(token_flow, flow_doc_ids,
-                                              tokenizer->assistant_marker_id(),
-                                              tokenizer->end_assistant_marker_id(),
-                                              asst_tokens);
-        if (asst_tokens == 0)
-        {
-            std::cerr << "--loss-scope assistant: 语料中未找到 <|assistant|> 段\n"
-                      << "（数据须为对话格式: …<|end_of_user|><|assistant|>…<|end_of_assistant|>）\n";
-            return 1;
-        }
+        for (unsigned char m : flow_assistant) asst_tokens += m;
         std::cout << "assistant loss 掩码已启用（" << asst_tokens << " / "
                   << token_flow.size() << " tokens 作为预测目标参与 loss）\n";
     }
@@ -942,25 +660,13 @@ int main(int argc, char *argv[])
         std::cout << std::defaultfloat << std::setprecision(6)
                   << "  Adam β1/β2: " << cfg.beta1 << " / " << cfg.beta2 << "\n";
     }
-    std::cout << "  loss 范围: " << cfg.loss_scope << "\n";
+    std::cout << "  loss 范围: " << loss_scope << "（生成期定好，随数据集）\n";
     if (cfg.max_steps > 0)
         std::cout << "  最大步数: " << cfg.max_steps << "\n";
     std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
     std::cout << "  GPU: " << (cfg.gpu_enabled ? "启用" : "禁用") << "\n";
     std::cout << "  梯度日志: " << (cfg.grad_log ? "启用" : "禁用") << "\n";
     std::cout << "========================================\n\n";
-
-    // ── 读取 tokenizer JSON 以便嵌入模型 ─────────────────────
-    std::string tokenizer_json;
-    {
-        std::ifstream tfs(cfg.vocab_path, std::ios::binary);
-        if (tfs)
-        {
-            std::ostringstream oss;
-            oss << tfs.rdbuf();
-            tokenizer_json = oss.str();
-        }
-    }
 
     // ── 创建计算引擎 ─────────────────────────────────────────
     nn::cli::EngineConfig eng_cfg;
@@ -1183,54 +889,23 @@ int main(int argc, char *argv[])
     }
     std::cout << "训练窗口样本数: " << window_offsets.size() << "\n" << std::endl;
 
-    // ── 加载测试集（可选，并行 + 缓存） ─────────────────────
+    // ── 测试子集（可选，数据集配套里带）────────────────────────
     std::vector<std::size_t> test_window_offsets;
     std::vector<std::size_t> test_flow;
     std::vector<std::size_t> test_flow_doc_ids;
-    std::vector<unsigned char> test_flow_assistant;  // --loss-scope assistant 时与 test_flow 等长
-    if (!cfg.test_path.empty())
+    std::vector<unsigned char> test_flow_assistant;  // 与 test_flow 等长（all 模式全 1）
+    if (dataset.info().has_test)
     {
-        std::error_code ec_test, ec_vocab2;
-        auto test_fsize = static_cast<std::uint64_t>(fs::file_size(cfg.test_path, ec_test));
-        auto vocab_fsize2 = static_cast<std::uint64_t>(fs::file_size(cfg.vocab_path, ec_vocab2));
-        const std::string test_cache_path = cfg.test_path + ".tokcache";
+        auto test_corpus_r = dataset.load_text(true);
+        NN_EXIT(test_corpus_r, 1, "读取测试子集失败: ");
+        test_flow = std::move(test_corpus_r->token_flow);
+        test_flow_doc_ids = std::move(test_corpus_r->doc_ids);
+        test_flow_assistant = std::move(test_corpus_r->loss_mask);
 
-        if (!cfg.no_cache && !ec_test && !ec_vocab2)
-        {
-            auto cached = load_tokenize_cache(test_cache_path, test_fsize, vocab_fsize2);
-            if (cached)
-            {
-                test_flow = std::move(cached->flow);
-                test_flow_doc_ids = std::move(cached->doc_ids);
-            }
-        }
-
-        if (test_flow.empty())
-        {
-            auto fc_result = read_file_lines(cfg.test_path);
-            NN_EXIT(fc_result, 1, "加载测试集失败: ");
-            auto fc = std::move(*fc_result);
-            parallel_tokenize(*tokenizer, fc.lines, test_flow, test_flow_doc_ids);
-
-            if (!cfg.no_cache && !ec_test && !ec_vocab2)
-                save_tokenize_cache(test_cache_path, test_fsize, vocab_fsize2,
-                                    test_flow, test_flow_doc_ids);
-        }
-
-        // assistant 段标记：与训练端同一口径（test loss 与 train loss 可比）
-        if (cfg.loss_scope == "assistant")
+        if (loss_scope == "assistant")
         {
             std::size_t t_asst = 0;
-            test_flow_assistant = mark_assistant_spans(test_flow, test_flow_doc_ids,
-                                                       tokenizer->assistant_marker_id(),
-                                                       tokenizer->end_assistant_marker_id(),
-                                                       t_asst);
-            if (t_asst == 0)
-            {
-                std::cerr << "--loss-scope assistant: 测试集中未找到 <|assistant|> 段\n"
-                          << "（测试集须与训练集同为对话格式，否则 test loss 无意义）\n";
-                return 1;
-            }
+            for (unsigned char m : test_flow_assistant) t_asst += m;
             std::cout << "测试集 assistant 掩码: " << t_asst << " / "
                       << test_flow.size() << " tokens 参与评估\n";
         }
@@ -1240,7 +915,8 @@ int main(int argc, char *argv[])
         {
             test_window_offsets.push_back(pos);
         }
-        std::cout << "测试集: " << cfg.test_path << "  样本数: " << test_window_offsets.size()
+        std::cout << "测试集: " << dataset.info().test_docs << " docs  样本数: "
+                  << test_window_offsets.size()
                   << "  tokens: " << test_flow.size() << std::endl;
     }
     // ── 步数与采样：每 epoch 每样本恰好访问一次 ──────────────
@@ -1428,7 +1104,7 @@ int main(int argc, char *argv[])
                     x_tokens.set_value_unchecked(t, b, static_cast<Scalar>(x_id));
                     y_tokens.set_value_unchecked(t, b, static_cast<Scalar>(y_id));
                     // 仅真实位置（非 padding）参与 loss；
-                    // --loss-scope assistant 时还要是 assistant 段内的预测目标
+                    // 且 loss_mask=1（生成期定好；assistant 段外为 0）
                     const bool participate = (t + 1 < win_len) &&
                         (flow_assistant.empty() || flow_assistant[win_pos + t + 1]);
                     loss_mask.set_value_unchecked(t, b, participate ? 1.0f : 0.0f);
@@ -1647,7 +1323,7 @@ int main(int argc, char *argv[])
             if (cfg.save_interval > 0 &&
                 ((step + 1) % cfg.save_interval == 0 || step + 1 == steps_per_epoch))
             {
-                auto save_r = nn::save_model(cfg.save_path, model, spec, tokenizer_json);
+                auto save_r = nn::save_model(cfg.save_path, model, spec, tokenizer_bytes);
                 if (!save_r)
                     std::cerr << "\n  [ckpt] 保存失败: " << save_r.error().message << "\n";
             }
@@ -1725,7 +1401,7 @@ int main(int argc, char *argv[])
                         x_tokens.set_value(t, b, static_cast<Scalar>(x_id));
                         y_tokens.set_value(t, b, static_cast<Scalar>(y_id));
                         // 仅真实位置（非 padding）参与评估；
-                        // --loss-scope assistant 时还要是 assistant 段内的预测目标
+                        // 且 loss_mask=1（生成期定好；assistant 段外为 0）
                         const bool participate = (t + 1 < win_len) &&
                             (test_flow_assistant.empty() ||
                              test_flow_assistant[win_pos + t + 1]);
@@ -1806,7 +1482,7 @@ int main(int argc, char *argv[])
 
     // ── 保存模型（含规格 + 嵌入 tokenizer） ──────────────────
     {
-        auto save_result = nn::save_model(cfg.save_path, model, spec, tokenizer_json);
+        auto save_result = nn::save_model(cfg.save_path, model, spec, tokenizer_bytes);
         NN_EXIT(save_result, 1, "Error: ");
     }
     std::cout << "\n训练完成! 总耗时: " << std::fixed << std::setprecision(1)

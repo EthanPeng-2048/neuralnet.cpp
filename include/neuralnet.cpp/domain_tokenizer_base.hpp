@@ -916,5 +916,38 @@ protected:
         return global;
     }
 };
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  逐 doc 并行 encode（dataset_gen 用；19 号设计 §4.3.2 硬约束 2 = 保序）
+// ═══════════════════════════════════════════════════════════════════════════
+// 与原 text_train `parallel_tokenize` 同口径：每 doc 独立 encode（含空 token
+// doc——不丢行号），分块并行、结果按 doc 下标归位 ⇒ 任意并行度与顺序执行
+// 逐字节一致（铁律 #8）。doc 下标即 doc_id - 1，序号语义不变。
+[[nodiscard]] inline std::vector<std::vector<std::size_t>>
+encode_docs_parallel(const Tokenizer &tokenizer, const std::vector<std::string> &docs)
+{
+    std::vector<std::vector<std::size_t>> out(docs.size());
+    const unsigned hw = std::thread::hardware_concurrency();
+    const std::size_t n_threads = std::max<std::size_t>(hw, 1u);
+
+    // 文档数太少时单线程（避免线程开销超过收益；与原逻辑同阈值）
+    if (docs.size() < n_threads * 64 || n_threads <= 1)
+    {
+        for (std::size_t i = 0; i < docs.size(); ++i)
+            out[i] = tokenizer.encode(docs[i]);
+        return out;
+    }
+
+    const std::size_t chunk = (docs.size() + n_threads - 1) / n_threads;
+    const std::size_t n_chunks = (docs.size() + chunk - 1) / chunk;
+    parallel_for_samples(n_chunks, [&](std::size_t c) {
+        const std::size_t begin = c * chunk;
+        const std::size_t end = std::min(begin + chunk, docs.size());
+        for (std::size_t i = begin; i < end; ++i)
+            out[i] = tokenizer.encode(docs[i]);
+    });
+    return out;
+}
+
 } // namespace nn
 
