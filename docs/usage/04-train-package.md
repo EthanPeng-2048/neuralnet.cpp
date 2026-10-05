@@ -23,9 +23,9 @@
 run.nnpkg                          # = tar.gz（或外层 zstd 的 tar）
 ├── manifest.json                   # 超参、任务、数据元信息、sha256 校验和
 └── data/                           # 训练数据（文件或目录树）
-    ├── train/...                   #   训练集（必填）
-    ├── test/...                    #   测试集（GPT 可选）
-    └── vocab/...                   #   词表（GPT 可选）
+    └── train/...                   #   训练集（必填）：GPT = 单个 .nndataset
+                                    #   （词表/掩码/test 子集随数据集，dataset_gen 生成）；
+                                    #   MNIST = 数据集目录
 ```
 
 ## 配置模板
@@ -44,9 +44,7 @@ python train_pkg.py new --task mnist -o runs/mnist.json
   "task": "gpt",                // gpt | mnist
   "device": "cpu",              // cpu | gpu（train 时可用 --device 覆盖）
   "data": {                     // 训练集路径（相对本配置所在目录）
-    "train": "datasets/tinystories_20k.txt",
-    "test": "",
-    "vocab": "bpe_vocab.json"
+    "train": "datasets/tinystories_20k.nndataset"
   },
   "hyperparameters": {          // 键名与 cli_controllers 控制器参数一致
     "epochs": 10,
@@ -65,7 +63,8 @@ python train_pkg.py new --task mnist -o runs/mnist.json
 ```
 
 MNIST 的 `data.train` 是**数据集目录**（如 `datasets/mnist_data`），
-GPT 的 `data.train` 是**文本文件**（`data.test`/`data.vocab` 可选）。
+GPT 的 `data.train` 是**`.nndataset` 数据集文件**（token/词表/loss 掩码/test 子集
+都在生成期定好，见 `docs/development/19-unified-dataset.md`；`.nnpkg` 只搬这一个文件）。
 
 ## 工作流
 

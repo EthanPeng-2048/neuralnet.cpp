@@ -6,12 +6,13 @@
 >
 > **当前数字**：引擎 virtual **49 个方法**（`bench/doc_inventory.ps1` 口径；M6 新增 `import_impl` 使其由 48 → 49。注意 `grep -c "\bvirtual\b"` 原始计 **51** 处 = 49 方法 + 析构 1 + 注释里的 "Non-Virtual" 1，勿混用口径）；Layer/Loss/Optimizer 直调 **21 个**（其余 28 个
 > 只服务 DSL lowering / 序列化 / CLI / 适配层 / 测试，见 §2）；CPU 求值机制 **2 套**
-> （DSL 模板路径 + IR 解释器，见 §3）；ctest **24** 个测试（**21** 个测试目标 + `cnn_test_gpu`
+> （DSL 模板路径 + IR 解释器，见 §3）；ctest **27** 个测试（**24** 个测试目标 + `cnn_test_gpu`
 > = `cnn_test --gpu` + `batchnorm_test_gpu` = `batchnorm_test --gpu` + `fusion_custom_layer_example`
 > = 库外使用者形态的 AOT 融合端到端门禁，
 > 见 `AGENTS.md` §7。其中 `fused_gpu_test` = 融合 shader **逐形态** GPU 对拍；`error_macro_test`
-> = 错误处理宏族（`NN_CHECK`/`NN_EXIT`/`NN_TRY_MSG`/`NN_FAIL`）；`zipt_test` 随
-> ZiPT 于 2026-10-01 移除，见 `docs/history.md`）。
+> = 错误处理宏族（`NN_CHECK`/`NN_EXIT`/`NN_TRY_MSG`/`NN_FAIL`）；`kvrec_test`/`nnvocab_test`/`dataset_test`
+> = 统一数据集（KVRecord v2 / `.nnvocab` / `.nndataset`，见 `docs/development/19`）；
+> `zipt_test` 随 ZiPT 于 2026-10-01 移除，见 `docs/history.md`）。
 >
 > 历史演进与收敛记录（2026-09-27 计算类原语全量迁 DSL、2026-09-26 算子收敛与遗留物
 > 清理、2026-09-19 IR-C 删除、接口数字 58→49 / 直调 35→23 的过程）已移入

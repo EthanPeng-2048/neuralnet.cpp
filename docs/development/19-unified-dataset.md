@@ -1,6 +1,11 @@
 # 统一数据集格式与加载（.nndataset / .nnvocab / KVRecord v2）设计
 
-> **状态**：设计定稿（2026-10-05 对话裁定），**本轮只交付本文档，不改代码**。
+> **状态**：设计定稿（2026-10-05 对话裁定）；**阶段一~三已实施（2026-10-05/06 落地）**——
+> 阶段一 = KVRecord v2 + `.nnvocab` + `tokenizer_train` 切换 + `dataset_convert vocab`；
+> 阶段二 = `.nndataset` + `dataset_gen` + `nn::Dataset` + `text_train` 切换 + 模型 v6 内嵌
+> （`MODEL_VERSION 5→6`，v5 及以下仍读内嵌 JSON）；阶段三 = GUI / 控制器 / `train_pkg` /
+> 审计脚本参数同步 + 文档。**阶段四（tabular/csv）未实施**（按裁决预留）。
+> 落地验收与实测数字见 `docs/history.md`「统一数据集」条与 AGENTS §12。
 > **关联**：`docs/development/18-roadmap.md` X2（无 Dataset 抽象）/ P2-4（Dataset/DataLoader + 流式）——
 > 本文是其前半（格式统一 + 统一类）的详细设计；DataLoader/流式仍留在 P2-4 后半。
 > `.nnpkg` 打包链路**本轮不在范围**（用户裁定），但 §6 标注了它的参数冲突依赖。
@@ -240,7 +245,7 @@ enum class DatasetKind : std::uint64_t { Text = 0, Tabular = 1 };
 struct DatasetInfo {
     DatasetKind kind;
     std::uint64_t num_docs;      // train 子集
-    bool         has_test;
+    std::uint64_t test_docs;     // test 子集 doc 数（0 = 无 test 子集）
     std::string  loss_scope;     // "all" | "assistant"（来自配套 gen）
     std::string  source_sha256;  // 源文本摘要（诊断/复现用）
     // …配套只读视图按需扩展

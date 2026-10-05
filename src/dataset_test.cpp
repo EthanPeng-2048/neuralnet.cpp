@@ -229,7 +229,7 @@ int main()
         const nn::Dataset &ds = *ds_r;
         expect(ds.info().kind == nn::DatasetKind::Text, tag + ": kind=text");
         expect(ds.info().num_docs == build.train_docs.size(), tag + ": num_docs（含空 doc）");
-        expect(ds.info().has_test && ds.info().test_docs == 3, tag + ": test 子集元数据");
+        expect(ds.info().test_docs == 3, tag + ": test 子集元数据");
         expect(ds.info().loss_scope == build.loss_scope, tag + ": loss_scope 一致");
         expect(ds.info().source_sha256 == nn::sha256_hex(kCorpus), tag + ": source.sha256 一致");
 

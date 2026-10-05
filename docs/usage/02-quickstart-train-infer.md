@@ -80,35 +80,47 @@ cmake --build build --parallel
 
 ## GPT 文本生成
 
+### 准备数据集（dataset_gen）
+
+训练数据统一为 `.nndataset` 文件：token 流、词表、loss 掩码、test 子集都在**生成期**
+定好并嵌入数据集（设计见 `docs/development/19-unified-dataset.md`）：
+
+```bash
+# 先训词表（tokenizer_train），再打包数据集（dataset_gen）
+./build/tokenizer_train datasets/llm_corpus.txt --vocab-size 10000 --output my_bpe.nnvocab
+./build/dataset_gen datasets/llm_corpus.txt --vocab my_bpe.nnvocab -o llm.nndataset
+
+# 对话 SFT：生成期写 assistant 掩码（--loss-scope assistant）；
+# 可选第二输入 → test 子集（每 epoch 末自动评估 test loss）
+./build/dataset_gen dialogs.txt --vocab my_bpe.nnvocab -o dialogs.nndataset \
+    --loss-scope assistant --test dialogs_eval.txt
+```
+
 ### 训练
 
 ```bash
 # 基础训练
-./build/text_train datasets/llm_corpus.txt --epochs 10 --lr 0.001
+./build/text_train datasets/llm.nndataset --epochs 10 --lr 0.001
 
 # 自定义模型大小
-./build/text_train datasets/llm_corpus.txt \
+./build/text_train datasets/llm.nndataset \
     --d-model 256 --num-heads 8 --num-layers 6 --d-ff 1024 \
     --seq-len 512 --batch-size 16 --epochs 20
 
-# 使用自定义词表
-./build/text_train datasets/llm_corpus.txt --vocab my_bpe.json
-
 # 使用 Muon 优化器
-./build/text_train datasets/llm_corpus.txt --optimizer muon --lr 0.002
+./build/text_train datasets/llm.nndataset --optimizer muon --lr 0.002
 
 # 恢复训练
-./build/text_train datasets/llm_corpus.txt --resume gpt_model.bin --epochs 5
+./build/text_train datasets/llm.nndataset --resume gpt_model.bin --epochs 5
 ```
 
 **完整参数：**
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `<text-file>` | 必需 | 训练文本文件路径 |
+| `<dataset.nndataset>` | 必需 | 数据集文件路径（dataset_gen 生成；词表/loss 掩码/test 子集随数据集） |
 | `--save <path>` | `gpt_model.bin` | 模型保存路径 |
 | `--resume <path>` | 无 | 从已有模型恢复训练 |
-| `--vocab <path>` | `gpt_bpe.json` | 词表 JSON 路径（自动识别类型） |
 | `--epochs <n>` | `10` | 训练轮数 |
 | `--lr <lr>` | `0.001` | 学习率 |
 | `--batch-size <n>` | `32` | 批大小 |
@@ -116,7 +128,6 @@ cmake --build build --parallel
 | `--optimizer <name>` | `adam` | 优化器 |
 | `--weight-decay <w>` | `0.01` | AdamW 权重衰减 |
 | `--beta1 <b>` / `--beta2 <b>` | `0.9` / `0.999` | Adam/AdamW 动量衰减（LLM 预训练常取 β2=0.95） |
-| `--loss-scope <scope>` | `all` | loss 范围：`all` 全部 token；`assistant` 仅 `<\|assistant\|>` 段（对话 SFT） |
 | `--max-steps <n>` | `0` | 本次运行最多训练多少 step 后停止并保存（0=不限；吞吐实测/分段跑） |
 | `--d-model <n>` | `128` | 模型维度 |
 | `--num-heads <n>` | `4` | 注意力头数 |
@@ -124,6 +135,9 @@ cmake --build build --parallel
 | `--d-ff <n>` | `512` | FFN 中间维度 |
 | `--gpu <索引>` / `--gpu=<名称>` | 禁用 | 启用 Vulkan GPU 加速；可选指定计算设备（索引如 `2`，名称子串如 `--gpu=40HX`/`--gpu=NVIDIA`） |
 | `--log-interval <n>` | `50` | 日志间隔 |
+
+> 词表、loss 范围（`all`/`assistant`）、test 子集都随数据集（生成期定好），
+> 不再是 `text_train` 的选项；窗口化（`--seq-len`/`--stride`）仍属训练策略。
 
 ### 推理
 
@@ -146,7 +160,7 @@ cmake --build build --parallel
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--model <path>` | `gpt_model.bin` | 模型文件路径 |
-| `--vocab <path>` | `bpe_vocab.json` | 词表路径（仅模型未嵌入时） |
+| `--vocab <path>` | `bpe_vocab.nnvocab` | 词表 `.nnvocab` 路径（仅模型未嵌入时） |
 | `--prompt <text>` | `Hello` | 输入提示文本 |
 | `--interactive` | 禁用 | 交互式生成模式 |
 | `--max-tokens <n>` | `200` | 最大生成 token 数 |
@@ -162,40 +176,45 @@ cmake --build build --parallel
 
 ```bash
 # 训练 BPE 分词器（预分词默认自动并行，可使用全部核心）
-./build/tokenizer_train datasets/llm_corpus.txt --vocab-size 10000 --output my_bpe.json
+./build/tokenizer_train datasets/llm_corpus.txt --vocab-size 10000 --output my_bpe.nnvocab
 
 # 训练 CharBPE 分词器（字符级，适合中文）
-./build/tokenizer_train datasets/llm_corpus.txt --tokenizer charbpe --vocab-size 10000 --output my_charbpe.json
+./build/tokenizer_train datasets/llm_corpus.txt --tokenizer charbpe --vocab-size 10000 --output my_charbpe.nnvocab
 
 # 强制顺序预分词（--threads 1）或指定并行度（--threads 4）
-./build/tokenizer_train datasets/llm_corpus.txt --threads 1 --output seq.json
+./build/tokenizer_train datasets/llm_corpus.txt --threads 1 --output seq.nnvocab
 ```
 
 `--threads`：预分词并行线程数，`0`=自动（默认，使用线程池全部核心），`1`=顺序，`>1`=指定并行度（上限为线程池大小）。并行预分词与顺序执行结果完全一致（词表逐字节相同）。
+
+词表输出为 `.nnvocab`（kvrec v2 二进制自描述格式）。**旧 JSON 词表不直读**，
+迁移用 `./build/dataset_convert vocab old.json -o old.nnvocab`。
 
 ### 分词器推理
 
 ```bash
 # 编码文本
-./build/tokenizer_infer --vocab gpt_bpe.json --encode "Hello world"
+./build/tokenizer_infer --vocab gpt_bpe.nnvocab --encode "Hello world"
 
 # 解码 token IDs
-./build/tokenizer_infer --vocab gpt_bpe.json --decode "72,101,108,108,111"
+./build/tokenizer_infer --vocab gpt_bpe.nnvocab --decode "72,101,108,108,111"
 
 # 编码整个文件（长文本自动保序并行编码，可用 --threads 指定并行度）
-./build/tokenizer_infer --vocab gpt_bpe.json --encode-file corpus.txt --threads 8
+./build/tokenizer_infer --vocab gpt_bpe.nnvocab --encode-file corpus.txt --threads 8
 ```
 
 `--threads`：单次 encode 的并行度，`0`=自动（默认，使用线程池全部核心），`1`=顺序，`>1`=指定并行度（上限为线程池大小）。**任意并行度下输出与顺序执行逐字节一致**（按空白安全切分点分段、段内并发编码、按段序拼接）；文本小于 256 KiB 或找不到切分点时自动回退顺序路径。
 
 ### 支持的分词器类型
 
-| 类型 | JSON `"type"` 字段 | 说明 |
+| 类型 | `.nnvocab` 的 `"type"` 字段 | 说明 |
 |------|---------------------|------|
 | BPE | `"bpe"` | Byte-Pair Encoding |
-| CharBPE | `"charbpe"` | 字符级 BPE |
+| CharBPE | `"char_bpe"` | 字符级 BPE |
 
-V4 及以上格式的模型文件会自动嵌入分词器，推理时无需单独指定 `--vocab`。
+V4 及以上格式的模型文件会自动嵌入分词器，推理时无需单独指定 `--vocab`——
+**v5 及以下模型内嵌的是 JSON 词表（照常读取），v6 起内嵌 `.nnvocab` kvrec**
+（按模型版本分派，旧模型零破坏）。
 
 ---
 
@@ -285,7 +304,7 @@ int main() {
     nn::CpuEngine engine;
 
     // 1. 加载分词器
-    auto tokenizer = nn::load_tokenizer_from_file("gpt_bpe.json");
+    auto tokenizer = nn::load_tokenizer_from_file("gpt_bpe.nnvocab");
 
     // 2. 构建 GPT 模型
     auto model_result = nn::build_gpt_model(
@@ -598,9 +617,8 @@ python gui.py
 ┌──────────────────────────────────────────────────┐
 │  GPT 训练 Tab                                     │
 │                                                    │
-│  训练文本文件: [datasets/llm_corpus.txt ] [浏览…]   │
+│  数据集文件:  [datasets/llm.nndataset  ] [浏览…]   │
 │  模型保存路径: [gpt_model.bin           ] [浏览…]   │
-│  词表 JSON:   [bpe_vocab.json          ] [浏览…]   │
 │  ☑ 从已有模型恢复训练                                │
 │                                                    │
 │  ┌─ 超参数 ────────────────────────────────────┐   │
@@ -635,13 +653,13 @@ python gui.py
 
 **操作步骤：**
 
-1. **选择训练文本** — 点击"浏览…"选择 `.txt` 文本文件（如 `datasets/llm_corpus.txt`）
-2. **设置词表** — 指定 BPE 词表 JSON 路径（如 `bpe_vocab.json`）
-3. **配置模型架构** — 模型维度、注意力头数、Transformer 层数、FFN 维度
-4. **选择位置编码 / 激活 / 归一化** — `learned`/`sinusoidal`/`alibi`，`gelu`/`swiglu`，`layernorm`/`rmsnorm`
-5. **配置超参数** — 轮数、学习率、批大小、序列长度、优化器；可开启梯度累积与滑动窗口 stride
-6. **高级选项** — 学习率调度（cosine / step_cosine）、TDR 防护、梯度统计、梯度裁剪
-7. **点击 "▶ 开始训练"** — 实时显示 loss 曲线
+1. **选择数据集** — 点击"浏览…"选择 `.nndataset` 数据集文件（由 `dataset_gen` 生成；
+   词表、loss 掩码、test 子集都随数据集）
+2. **配置模型架构** — 模型维度、注意力头数、Transformer 层数、FFN 维度
+3. **选择位置编码 / 激活 / 归一化** — `learned`/`sinusoidal`/`alibi`，`gelu`/`swiglu`，`layernorm`/`rmsnorm`
+4. **配置超参数** — 轮数、学习率、批大小、序列长度、优化器；可开启梯度累积与滑动窗口 stride
+5. **高级选项** — 学习率调度（cosine / step_cosine）、TDR 防护、梯度统计、梯度裁剪
+6. **点击 "▶ 开始训练"** — 实时显示 loss 曲线
 
 ---
 
@@ -650,7 +668,7 @@ python gui.py
 **操作步骤：**
 
 1. **选择模型** — 指定训练好的 GPT 模型 `.bin` 文件
-2. **选择词表** — 指定对应的词表 JSON
+2. **选择词表** — 模型未嵌入词表时指定 `.nnvocab` 词表文件
 3. **设置生成参数** — 最大 token 数（默认 200）、温度（0=贪心，>1=更随机，默认 1.0）
 4. **输入提示文本** — 在输入框中输入起始文本（如 "Hello"）
 5. **点击 "▶ 生成文本"** — 在输出区域显示生成结果

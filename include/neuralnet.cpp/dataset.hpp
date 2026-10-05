@@ -55,7 +55,6 @@ struct DatasetInfo
     DatasetKind kind = DatasetKind::Text;
     std::uint64_t num_docs = 0;     // train 子集 doc 数
     std::uint64_t test_docs = 0;    // test 子集 doc 数（0 = 无 test 子集）
-    bool has_test = false;
     std::string loss_scope = "all"; // "all" | "assistant"（来自配套 gen）
     std::string source_path;        // 源文本路径/名称
     std::string source_sha256;      // 源文本内容摘要（诊断/复现用）
@@ -435,7 +434,6 @@ public:
         KeyValueRecord test;
         if (root->get("test", test))
         {
-            ds.info_.has_test = true;
             NN_TRY_CHECK(ds.load_subset_(test, ds.test_index_, ds.info_.test_docs));
         }
         return ds;
@@ -455,7 +453,7 @@ public:
         if (info_.kind != DatasetKind::Text)
             NN_FAIL("tabular 数据集尚未支持（阶段四预留，见 docs/development/19 §4.4）");
         const std::vector<std::uint64_t> &index = test ? test_index_ : train_index_;
-        if (test && !info_.has_test)
+        if (test && info_.test_docs == 0)
             NN_FAIL("该数据集没有 test 子集");
         const bool has_mask = (info_.loss_scope == "assistant");
 
