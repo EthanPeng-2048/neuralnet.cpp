@@ -108,6 +108,7 @@
 | X3 | 无 Python / C 绑定 | 仓库仅有 `gui.py` 这一 Python 入口（subprocess 调 CLI） | 生态集成只能走命令行 + 文件 |
 | X4 | `gui.py` 六个 Tab、7 处手写 `collect_args` | `gui.py`（`def collect_args` 实测 7 处） | 加 CLI 选项要手改多处，漏参风险（13 §4 的"五个 Tab / 1471-1500"坐标已过期） |
 | X5 | GUI 画布拖动全量降采样重绘 | `gui.py:1135`（`_on_draw_move`）；已有节流先例 `gui.py:216`（`_RENDER_MS = 250`） | 快速拖动卡顿 |
+| X6 | **无"写自定义层"使用文档**：层接入的四条契约（`init_impl` NVI / `checkpoint_mode_` 缓存 / `activation_cache` / 精度 profile 用法）只在库内源码里；配套的 2 个易用性隐患（`NN_CHECK` 名为 CHECK 实为 unwrap、"造张量"两套失败协议）也没有成文 | 实测报告与逐条坐标见 `docs/development/20-custom-layer-ergonomics.md`（2026-10-05，v1.7.0，库外视角）；最小样例 `examples/custom_layer_lowrank.hpp` + `examples/custom_layer_train.cpp` | 使用者写出"能编译但静默失效"的层（精度硬编码、offload 失效、gradcheck 全无）；库内 C7（Conv2D 硬编码 F32）即同一成因；自定义层是生态缺口的入口，文档缺口直接抬高外部贡献门槛 |
 
 ### 3.4 模型能力
 
@@ -130,7 +131,7 @@ P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
 | 期 | 项数 | 项目 | 共同前置 |
 |---|---|---|---|
 | **P0** | 5 | CI 真跑测试、文档一致性回正、BatchNorm 禁止静默回落（**✅ 已完成 2026-10-03**）、CMake install/export + presets、推理采样 top-k/top-p | 无（P0-1 是所有人的前置） |
-| **P1** | 5 | `text_train` 模块化、checkpoint 优化器状态、危险精度组合 fail-fast、`gpt_test` flaky、CI 冒烟扩 MSVC Debug | P0-1 |
+| **P1** | 6 | `text_train` 模块化、checkpoint 优化器状态、危险精度组合 fail-fast、`gpt_test` flaky、CI 冒烟扩 MSVC Debug、**自定义层使用文档 + 精度自检**（P1-6） | P0-1；P1-6 无依赖 |
 | **P2** | 8 | `.bin` 校验和、Adafactor、RAPT/CNN f16、Dataset/DataLoader、Python/C 绑定、GUI 两项、header 拆分、F16C | P0-1；P2-7 另需 P1-5；P2-6 另需 P0-5 |
 | **P3** | 8 | 由 §6 触发条件启动（含 CUDA、分布式） | 各自触发条件 |
 
@@ -165,6 +166,7 @@ P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
 | **P1-3 危险精度组合 fail-fast** | 启动期拒绝 `optimizer=f16` / 四字段全 f16 的组合，或明确要求显式确认开关（拟新增，名字待定） | 危险组合直接退出并打印原因；`--f16` 与合法 `--precision-*` 组合不受影响；新增 CLI 断言测试 | 小 | 无。依据 `docs/development/05-mixed-precision.md` §12.5 的实测结论 |
 | **P1-4 `gpt_test` flaky 定位** | 复现并消除偶发失败（或定位为已知资源边界并加显式 skip/重试语义） | 连续大样本直跑零失败；定位结论写入 `docs/history.md` | 小–中（复现成本不确定） | P0-1（需要 CI 反复跑才有样本） |
 | **P1-5 CI 冒烟扩到 MSVC Debug + 权重变化断言** | Debug 构建冒烟；训练 N 步后断言参数**确实变化**（防"loss 不动"类静默失败） | CI 中 MSVC Debug 目标编译通过；权重变化断言可检出冻结；大 TU 若触发 C1128 再出 `/bigobj` | 中 | P0-1。可复用 `f16_writeback_probe` 的"8 步 Adam 参数必须移动"思路 |
+| **P1-6 自定义层使用文档 + 精度自检** | 新增 `docs/usage/06-write-a-custom-layer.md`（层骨架模板 + gradcheck 片段 + 四条隐式契约 + GPU checklist）；`Layer::init` NVI 处加"`profile.param == F16` ⇒ `parameters()` 全为 F16 存储"的统一自检 | 文档：按模板能写出一个可训练的自定义层（样例 `examples/custom_layer_*` 即验收物）；自检：C7 形态的硬编码 F32 层被启动期拒绝，新增断言测试 | 小 | 无。问题清单与逐条坐标见 `docs/development/20-custom-layer-ergonomics.md` §2，修复建议 §4（R1/R2） |
 
 ### 4.3 P2（3–6 月：结构优化）
 
@@ -298,4 +300,4 @@ ZiPT 恢复、LRLA、CUDA、分布式。
 |---|---|---|
 | 2026-10-01 | 本文建立：合并 13 号未完成条目 + 未来方向 + 裁定台账；13 号改重定向 stub | 维护者裁定 |
 | 2026-10-01 | 订正实测口径：ctest 19（后于同日的 A4/A5 两轮由 19 → 20 → 21）；`max_abs_diff` 7 份（非 9/8）；`gui.py` 1646 总行 / 1456 非空 / `collect_args` 7 处；承接原 13 §9 的两条工程教训 | Lead 与归档 owner 双重核验 |
-
+| 2026-10-05 | 新增 X6（无"写自定义层"使用文档 + 2 个易用性隐患）与 P1-6（使用文档 + 精度自检），依据 = `docs/development/20-custom-layer-ergonomics.md` 的库外实测（v1.7.0） | 实测报告（`examples/custom_layer_*`） |

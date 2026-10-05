@@ -23,9 +23,6 @@ CMakeUserPresets.json
 
 # ==================== Model binaries (训练产物) ====================
 *.bin
-*.pt
-*.pth
-*.onnx
 pretrained/
 
 # ==================== Tokenizer / 词表 (训练产物) ====================
@@ -41,6 +38,7 @@ go_tokenizer*.json
 vocab_bpe*.txt
 vocab_bytezip*.txt
 vocab_word*.txt
+*.nnvocab
 
 # ==================== Dataset (下载 / 生成) ====================
 dataset*.txt
@@ -49,6 +47,7 @@ datasets/
 texts/
 scripts/datasets/
 scripts/tokenizers/
+*.nndataset
 
 # ==================== 训练包 (train_pkg.py) ====================
 *.nnpkg
