@@ -350,6 +350,10 @@ if(NN_BUILD_APPS)
     nn_add_executable(tokenizer_infer src/tokenizer_infer.cpp)
     list(APPEND NN_APP_TARGETS text_train text_infer tokenizer_train tokenizer_infer)
 
+    # ── 数据集工具（旧格式转换器；dataset_gen 生成器随阶段二落地）─────────
+    nn_add_executable(dataset_convert src/dataset_convert.cpp)
+    list(APPEND NN_APP_TARGETS dataset_convert)
+
     # ── 层吞吐量基准（CPU/Vulkan GPU；--all 或 --layer <name> 指定） ────────
     nn_add_executable(layer_bench src/layer_bench.cpp)
     list(APPEND NN_APP_TARGETS layer_bench)
@@ -481,6 +485,14 @@ if(NN_ENABLE_TESTS)
     # （终止行为经子进程 --expect-abort / --expect-exit <n> 断言，本进程不终止）
     nn_add_executable(error_macro_test src/error_macro_test.cpp)
     list(APPEND NN_TEST_TARGETS error_macro_test)
+
+    # ── KVRecord v2（哨兵自举 / 嵌套 / 未知类型跳过 / 搬迁地址校验）─────────
+    nn_add_executable(kvrec_test src/kvrec_test.cpp)
+    list(APPEND NN_TEST_TARGETS kvrec_test)
+
+    # ── .nnvocab 词表文件（json→nnvocab→加载语义一致 + 旧 json 明确拒绝）────
+    nn_add_executable(nnvocab_test src/nnvocab_test.cpp)
+    list(APPEND NN_TEST_TARGETS nnvocab_test)
 
 endif()
 

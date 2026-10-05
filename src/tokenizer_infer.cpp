@@ -38,7 +38,7 @@ void print_usage(const char *prog)
     help.item("<text-file>", "直接给文本文件即统计最长行 token 数");
 
     help.section("选项");
-    help.opt("--vocab <path>", "词表 JSON 路径 (默认: bpe_vocab.json)\n自动识别分词器类型 (bpe / charbpe)");
+    help.opt("--vocab <path>", "词表 .nnvocab 路径 (默认: bpe_vocab.nnvocab)\n自动识别分词器类型 (bpe / charbpe)");
     help.opt("--encode <text>", "编码文本为 token IDs");
     help.opt("--decode <ids>", "解码 token IDs (逗号分隔) 为文本");
     help.opt("--encode-file <path>", "编码整个文件 (同时自动统计最长行 token 数)");
@@ -52,7 +52,7 @@ void print_usage(const char *prog)
 // ==================== 命令行参数 ====================
 struct Config
 {
-    std::string vocab_path = "bpe_vocab.json";
+    std::string vocab_path = "bpe_vocab.nnvocab";
     std::string encode_text;
     std::string decode_ids;
     std::string encode_file;
@@ -353,14 +353,15 @@ int main(int argc, char *argv[])
 {
     Config cfg = parse_args(argc, argv);
 
-    // ── 加载词表（自动识别分词器类型） ─────────────────────
-    auto tokenizer = nn::load_tokenizer_from_file(cfg.vocab_path);
-    if (!tokenizer)
+    // ── 加载词表（.nnvocab 词表文件，自动识别分词器类型） ─────────
+    auto tokenizer_r = nn::load_tokenizer_from_file(cfg.vocab_path);
+    if (!tokenizer_r)
     {
-        std::cerr << "加载词表失败或无法识别分词器类型: " << cfg.vocab_path << '\n'
-                  << "请检查 JSON 文件是否包含有效的 \"type\" 字段" << std::endl;
+        std::cerr << "加载词表失败: " << cfg.vocab_path << '\n'
+                  << tokenizer_r.error().message << std::endl;
         return 1;
     }
+    std::unique_ptr<nn::Tokenizer> tokenizer = std::move(*tokenizer_r);
     std::cout << "词表已加载: " << tokenizer->vocab_size() << " 词" << std::endl;
     tokenizer->set_encode_threads(cfg.threads);
 

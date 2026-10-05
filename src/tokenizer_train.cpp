@@ -1,7 +1,7 @@
 // ── BPE 分词器训练程序 ──────────────────────────────────────────────────
 //
-// 读取文本文件 → 训练分词器 → 保存词表 JSON
-// 词表 JSON 可被 text_train / text_infer 加载。
+// 读取文本文件 → 训练分词器 → 保存词表 .nnvocab（kvrec v2）
+// 词表 .nnvocab 可被 text_train / text_infer 加载。
 //
 // 支持两种 BPE：
 //   --tokenizer bpe      字节级 BPE（BBPE），天然兼容 UTF-8，但中文按字节切分
@@ -32,7 +32,7 @@ void print_usage(const char *prog)
 
     help.section("选项");
     help.opt("--tokenizer <type>", "分词器类型: bpe/charbpe (默认: bpe)\nbpe: 字节级 BBPE，兼容性最好，任意字节均可编码；\n但中文按 3 字节切分，小模型难学到词义\ncharbpe: 字符级 BPE，每个汉字为 1 个基础 token，\nBPE 学会合并常见词组；中文场景推荐使用");
-    help.opt("--output <path>", "词表输出路径 (默认: bpe_vocab.json)");
+    help.opt("--output <path>", "词表输出路径 (默认: bpe_vocab.nnvocab)");
     help.opt("--vocab-size <n>", "目标词表大小 (默认: 5000；最小 258 = 256 字节 + BOS/EOS)");
     help.opt("--min-freq <n>", "最小合并频率 (默认: 2)");
     help.opt("--threads <n>", "预分词并行线程数: 0=自动(默认) 1=顺序 >1=指定");
@@ -43,7 +43,7 @@ void print_usage(const char *prog)
 struct Config
 {
     std::string text_path;
-    std::string output_path = "bpe_vocab.json";
+    std::string output_path = "bpe_vocab.nnvocab";
     std::string tokenizer_type = "bpe";  // "bpe" 或 "charbpe"
     std::size_t vocab_size = nn::BPETokenizer::DEFAULT_VOCAB_SIZE;
     std::uint32_t min_freq = nn::BPETokenizer::DEFAULT_MIN_FREQ;

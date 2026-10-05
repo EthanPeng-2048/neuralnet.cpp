@@ -290,7 +290,7 @@ void print_usage(const char *prog)
     help.opt("--resume <path>", "从已有模型恢复训练");
     help.opt("--resume-epoch <n>", "从第 n 个 epoch 继续 (0-based，需配合 --resume；默认 0)");
     help.opt("--resume-step <n>", "从本 epoch 内第 n 步继续 (0-based，需配合 --resume；默认 0)");
-    help.opt("--vocab <path>", "词表 JSON 路径 (默认: gpt_bpe.json)\n自动识别分词器类型 (bpe / charbpe)");
+    help.opt("--vocab <path>", "词表 .nnvocab 路径 (默认: gpt_bpe.nnvocab)\n自动识别分词器类型 (bpe / charbpe)");
     help.opt("--test-file <path>", "测试集文件路径 (可选，每 epoch 结束后评估 test loss)");
     help.opt("--epochs <n>", "训练轮数 (默认: 10)");
     help.opt("--lr <lr>", "学习率 (默认: 0.001)");
@@ -352,7 +352,7 @@ struct TrainConfig
     std::string text_path;
     std::string test_path;   // 测试集文件路径（可选，用于每 epoch 结束后评估）
     std::string save_path = "gpt_model.bin";
-    std::string vocab_path = "gpt_bpe.json";
+    std::string vocab_path = "gpt_bpe.nnvocab";
     std::string resume_path;
     std::string optimizer_name = "adam";
     int epochs = 10;
@@ -806,14 +806,15 @@ int main(int argc, char *argv[])
 {
     TrainConfig cfg = parse_args(argc, argv);
 
-    // ── 加载分词器（自动识别类型：BPE/CharBPE） ───
-    auto tokenizer = nn::load_tokenizer_from_file(cfg.vocab_path);
-    if (!tokenizer)
+    // ── 加载分词器（.nnvocab 词表文件，自动识别 BPE/CharBPE） ───
+    auto tokenizer_r = nn::load_tokenizer_from_file(cfg.vocab_path);
+    if (!tokenizer_r)
     {
-        std::cerr << "加载词表失败或无法识别分词器类型: " << cfg.vocab_path << '\n'
-                  << "请检查 JSON 文件是否包含有效的 \"type\" 字段" << std::endl;
+        std::cerr << "加载词表失败: " << cfg.vocab_path << '\n'
+                  << tokenizer_r.error().message << std::endl;
         return 1;
     }
+    std::unique_ptr<nn::Tokenizer> tokenizer = std::move(*tokenizer_r);
     // 注意：base 模式纯拼接、不插入 BOS/EOS（行间无分隔符），
     // 文档边界由 parallel_tokenize 产出的 doc_ids 表示（每行 = 一篇文档）。
     const std::size_t pad_id = tokenizer->pad_id();
