@@ -91,7 +91,7 @@ protected:
 
     [[nodiscard]] Result<void> check_ready_() const
     {
-        if (init_error_) return std::unexpected(*init_error_);
+        if (init_error_) NN_FAIL(*init_error_);
         return {};
     }
 

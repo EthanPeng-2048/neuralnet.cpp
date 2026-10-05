@@ -572,7 +572,7 @@ public:
         auto z_inv_r = dsl::compute(engine,
             dsl::leaf(*z2_r) * dsl::rparam(Scalar{1} / static_cast<Scalar>(d_k_)),
             z2_r->rows(), z2_r->cols());
-        if (!z_inv_r) return std::unexpected(z_inv_r.error()); // z = [2)/dk
+        NN_TRY_CHECK(z_inv_r); // z = [2)/dk
 
         // ── pass 1：主扫描，读出 B^T·g 和 r = g·(B·q) ────────────
         auto Sc = engine.scan_prefix_outer(Kp_cache_, V_re_cache_, Qp_cache_, gcr,
@@ -598,7 +598,7 @@ public:
             dsl::neg(dsl::leaf(*r_r))
                 / ((dsl::leaf(*u_r) + Scalar{1e-4}) * (dsl::leaf(*u_r) + Scalar{1e-4})),
             cRows, cCols);
-        if (!scale_r) return std::unexpected(scale_r.error()); // -r/den²（标量重复 dk 次）
+        NN_TRY_CHECK(scale_r); // -r/den²（标量重复 dk 次）
 
         // ── gQ = B^T·gnum + scale·z（全链融合为单 kernel） ─────────────
         auto gQt_r = dsl::compute(engine,
@@ -779,10 +779,10 @@ public:
         NN_TRY_CHECK(B_add_r);
         { auto r = dsl::compute_into(engine,
               dsl::leaf(B_state) + dsl::leaf(*B_add_r), B_state);
-          if (!r) return std::unexpected(r.error()); }
+          NN_TRY_CHECK(r); }
         { auto r = dsl::compute_into(engine,               // z += k'（(H*dk, 1)）
               dsl::leaf(z_state) + dsl::leaf(*Kp), z_state);
-          if (!r) return std::unexpected(r.error()); }
+          NN_TRY_CHECK(r); }
 
         // num = B·q'：batched_matmul(B_state, Qp, H) → (H*dk, 1)
         // dsl::matmul(batch)：纯 {0,0} 结构（scan 手工登记同 key）

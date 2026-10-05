@@ -354,7 +354,7 @@ public:
         if (!alloc_r)
         {
             vkDestroyBuffer(device, buffer, nullptr);
-            return std::unexpected(alloc_r.error());
+            NN_TRY_CHECK(alloc_r);
         }
 
         res = vkBindBufferMemory(device, buffer, alloc_r->memory, alloc_r->offset);
@@ -408,7 +408,7 @@ public:
         if (!alloc_r)
         {
             vkDestroyBuffer(device, buffer, nullptr);
-            return std::unexpected(alloc_r.error());
+            NN_TRY_CHECK(alloc_r);
         }
 
         res = vkBindBufferMemory(device, buffer, alloc_r->memory, alloc_r->offset);
@@ -1954,7 +1954,7 @@ public:
         if (!rr)
         {
             batch_mode_ = false;
-            return std::unexpected(rr.error());
+            NN_TRY_CHECK(rr);
         }
 
         auto& f = frames_[i];
@@ -2038,7 +2038,7 @@ public:
         if (!r)
         {
             batch_mode_ = false;
-            return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
 
         // 2. 提交（不等待）
@@ -2063,14 +2063,14 @@ public:
         if (!r)
         {
             batch_mode_ = false;
-            return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
 
         r = submit_frame_no_wait();  // 不等待
         if (!r)
         {
             batch_mode_ = false;
-            return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
 
         // 仍处于 batch 模式：开始录制下一帧
@@ -2460,7 +2460,7 @@ public:
         if (!cmd_r)
         {
             vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-            return std::unexpected(cmd_r.error());
+            NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
 
@@ -3048,7 +3048,7 @@ public:
         {
             if (desc_set != VK_NULL_HANDLE)
                 vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-            return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
         const auto t_end = std::chrono::steady_clock::now();
 
@@ -3066,7 +3066,7 @@ public:
         {
             if (desc_set != VK_NULL_HANDLE)
                 vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-            return std::unexpected(r.error());
+            NN_TRY_CHECK(r);
         }
 
         // 跨 submit 数据依赖：输入 buffer 可能刚由在飞上传的 copy 写入
@@ -3089,7 +3089,7 @@ public:
             {
                 if (desc_set != VK_NULL_HANDLE)
                     vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-                return std::unexpected(r.error());
+                NN_TRY_CHECK(r);
             }
         }
         const auto t_submit = std::chrono::steady_clock::now();
@@ -3253,7 +3253,7 @@ public:
         if (!cmd_r)
         {
             vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-            return std::unexpected(cmd_r.error());
+            NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
 
@@ -3481,7 +3481,7 @@ public:
         if (!cmd_r)
         {
             vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-            return std::unexpected(cmd_r.error());
+            NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
 
@@ -3786,7 +3786,7 @@ public:
             {
                 VkDescriptorSet free_sets[2] = {ds1, ds2};
                 vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 2, free_sets);
-                return std::unexpected(cmd_r.error());
+                NN_TRY_CHECK(cmd_r);
             }
             auto [cmd, owns_cmd] = *cmd_r;
 
@@ -3852,7 +3852,7 @@ public:
         if (!cmd_r)
         {
             vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-            return std::unexpected(cmd_r.error());
+            NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
 
@@ -3953,7 +3953,7 @@ public:
         if (!cmd_r)
         {
             vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-            return std::unexpected(cmd_r.error());
+            NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
 
@@ -4308,7 +4308,7 @@ public:
         if (!cmd_r)
         {
             vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-            return std::unexpected(cmd_r.error());
+            NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
 
@@ -4566,7 +4566,7 @@ public:
         if (!cmd_r)
         {
             vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-            return std::unexpected(cmd_r.error());
+            NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
 
@@ -4671,7 +4671,7 @@ public:
         if (!cmd_r)
         {
             vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-            return std::unexpected(cmd_r.error());
+            NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
 
@@ -4765,7 +4765,7 @@ public:
         if (!cmd_r)
         {
             vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-            return std::unexpected(cmd_r.error());
+            NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
 
@@ -4854,7 +4854,7 @@ public:
         if (!cmd_r)
         {
             vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-            return std::unexpected(cmd_r.error());
+            NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
 
@@ -4953,7 +4953,7 @@ public:
         if (!cmd_r)
         {
             vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-            return std::unexpected(cmd_r.error());
+            NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
 
@@ -5043,7 +5043,7 @@ public:
         if (!cmd_r)
         {
             vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-            return std::unexpected(cmd_r.error());
+            NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
 

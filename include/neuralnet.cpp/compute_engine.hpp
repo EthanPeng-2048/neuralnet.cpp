@@ -1649,8 +1649,7 @@ private:
         if (!t->bound())
         {
             if (bind_debug_enabled_())
-                return std::unexpected(
-                    bind_error_("unbound input into engine", t, nullptr, loc));
+                NN_FAIL(bind_error_("unbound input into engine", t, nullptr, loc));
             return {};   // 库外豁免（D3）
         }
         if (!ref)
@@ -1659,8 +1658,7 @@ private:
             return {};
         }
         if (t->engine_.get() != ref->engine_.get())
-            return std::unexpected(
-                bind_error_("mixed engines (both bound, pointers differ)", ref, t, loc));
+            NN_FAIL(bind_error_("mixed engines (both bound, pointers differ)", ref, t, loc));
         return {};
     }
 

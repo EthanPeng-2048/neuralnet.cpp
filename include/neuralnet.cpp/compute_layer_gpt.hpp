@@ -61,9 +61,9 @@ public:
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
         NN_TRY(r1, self_attn_.init(engine));
-        if (norm1_) { auto r = norm1_->init(engine); if (!r) return std::unexpected(r.error()); }
+        if (norm1_) { NN_TRY(r, norm1_->init(engine)); }
         NN_TRY(r2, ff_.init(engine));
-        if (norm2_) { auto r = norm2_->init(engine); if (!r) return std::unexpected(r.error()); }
+        if (norm2_) { NN_TRY(r, norm2_->init(engine)); }
         return {};
     }
 
@@ -659,7 +659,7 @@ public:
                 if (!r)
                 {
                     (void)engine.end_batch();  // 出错也收尾，避免录制状态泄漏
-                    return std::unexpected(r.error());
+                    NN_TRY_CHECK(r);
                 }
                 last_logits_t = *r;
                 ++cur_len;
@@ -677,8 +677,8 @@ public:
             // Sliding window: rebuild cache when full (keep last seq_len_-1 tokens)
             if (cur_len >= seq_len_)
             {
-                for (auto& kc : k_caches) { auto r = engine.zero(kc); if (!r) return std::unexpected(r.error()); }
-                for (auto& vc : v_caches) { auto r = engine.zero(vc); if (!r) return std::unexpected(r.error()); }
+                for (auto& kc : k_caches) { NN_TRY(r, engine.zero(kc)); }
+                for (auto& vc : v_caches) { NN_TRY(r, engine.zero(vc)); }
                 cur_len = 0;
                 const std::size_t keep = seq_len_ - 1;
                 const std::size_t start_new = (context.size() > keep) ? (context.size() - keep) : 0;
