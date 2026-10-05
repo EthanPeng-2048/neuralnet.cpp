@@ -33,7 +33,7 @@ void print_usage(const char *prog)
 
     help.section("选项");
     help.opt("--model <path>", "模型文件路径 (默认: gpt_model.bin)\nV3 格式模型自动读取规格和嵌入 tokenizer");
-    help.opt("--vocab <path>", "词表 JSON 路径 (默认: bpe_vocab.json)\n仅当模型未嵌入 tokenizer 时使用；自动识别分词器类型 (bpe / charbpe)");
+    help.opt("--vocab <path>", "词表 .nnvocab 路径 (默认: bpe_vocab.nnvocab)\n仅当模型未嵌入 tokenizer 时使用；自动识别分词器类型 (bpe / charbpe)");
     help.opt("--prompt <text>", "输入提示文本");
     help.opt("--interactive", "交互式生成模式");
     help.opt("--max-tokens <n>", "最大生成 token 数 (默认: 200)");
@@ -47,7 +47,7 @@ void print_usage(const char *prog)
 struct InferConfig
 {
     std::string model_path = "gpt_model.bin";
-    std::string vocab_path = "bpe_vocab.json";
+    std::string vocab_path = "bpe_vocab.nnvocab";
     std::string prompt = "Hello";
     int max_tokens = 200;
     double temperature = 1.0;
@@ -290,24 +290,28 @@ int main(int argc, char *argv[])
 
     // ── 加载 tokenizer（自动识别类型） ─────────────────────────
     std::unique_ptr<nn::Tokenizer> tokenizer;
-    const std::string &embedded_json = *load_result;
-    if (!embedded_json.empty())
+    const std::string &embedded_vocab = *load_result;
+    if (!embedded_vocab.empty())
     {
-        // V3 格式：模型文件嵌入了 tokenizer JSON
-        tokenizer = nn::load_tokenizer_from_string(embedded_json);
-        NN_EXIT(tokenizer, 1, "解析嵌入 tokenizer 失败或无法识别分词器类型");
+        // 模型内嵌词表：v5 = JSON、v6 起 = .nnvocab kvrec，按内容嗅探分派
+        auto tok_r = nn::load_tokenizer_from_bytes(embedded_vocab);
+        NN_EXIT(tok_r, 1, "解析嵌入 tokenizer 失败: ");
+        tokenizer = std::move(*tok_r);
         std::cout << "已从模型文件加载嵌入 tokenizer" << std::endl;
     }
     else
     {
-        // 回退：从外部 JSON 文件加载
-        tokenizer = nn::load_tokenizer_from_file(cfg.vocab_path);
-        if (!tokenizer)
+        // 回退：从外部 .nnvocab 词表文件加载
+        auto tok_r = nn::load_tokenizer_from_file(cfg.vocab_path);
+        if (!tok_r)
         {
-            std::cerr << "加载词表失败或无法识别分词器类型: " << cfg.vocab_path
-                      << "\n请使用 --vocab 指定词表路径，或使用 V3 格式模型" << std::endl;
+            std::cerr << "加载词表失败: " << cfg.vocab_path << '\n'
+                      << tok_r.error().message
+                      << "\n请使用 --vocab 指定 .nnvocab 词表路径，"
+                         "或使用嵌入 tokenizer 的模型" << std::endl;
             return 1;
         }
+        tokenizer = std::move(*tok_r);
         std::cout << "已从外部文件加载 tokenizer: " << cfg.vocab_path << std::endl;
     }
     std::cout << "词表大小: " << tokenizer->vocab_size() << "\n" << std::endl;

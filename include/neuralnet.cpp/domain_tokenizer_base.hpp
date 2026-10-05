@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "core_config.hpp"
+#include "dataset_format.hpp"
 
 namespace nn
 {
@@ -43,8 +44,114 @@ public:
     [[nodiscard]] virtual std::string decode(std::span<const std::size_t> ids) const = 0;
     [[nodiscard]] virtual std::size_t vocab_size() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<std::string> &vocab() const noexcept = 0;
-    [[nodiscard]] virtual Result<void> save(const std::string &path) const = 0;
-    [[nodiscard]] virtual Result<void> load(const std::string &path) = 0;
+
+    // ── .nnvocab（kvrec v2）词表序列化 ────────────────────────────────
+    // 词表文件 = [label "NNVC"][词表 kvrec v2]（设计见
+    // docs/development/19-unified-dataset.md §4.2）。字段：
+    //   "type"    := Str   "bpe" | "char_bpe"（工厂判别依据）
+    //   "vocab"   := Str   词表 blob（dataset_format.hpp，token 原样字节）
+    //   "merges"  := UIntArray 展平三元组 (id_a, id_b, new_id) × n
+    //   "markers" := UIntArray(8) 对话标记 ID（见 to_kvrec 注释；可缺省）
+    // 旧 JSON **写出已废弃**（裁决 #7：tokenizer_train 只写 .nnvocab）；
+    // JSON **读取保留**（load_from_string），供模型 v5 内嵌词表与
+    // `dataset_convert vocab` 迁移旧词表使用。
+    [[nodiscard]] virtual std::string_view kvrec_type_str() const noexcept = 0;
+
+    // 词表 → 词表 kvrec（无文件标签；嵌入 .nndataset 配套/模型 v6 共用）
+    [[nodiscard]] KeyValueRecord to_kvrec() const
+    {
+        KeyValueRecord rec;
+        rec.set("type", std::string(kvrec_type_str()));
+        rec.set("vocab", encode_vocab_blob(vocab()));
+        std::vector<std::uint64_t> flat;
+        flat.reserve(merges_.size() * 3);
+        for (const auto &m : merges_)
+        {
+            flat.push_back(static_cast<std::uint64_t>(m.id_a));
+            flat.push_back(static_cast<std::uint64_t>(m.id_b));
+            flat.push_back(static_cast<std::uint64_t>(m.new_id));
+        }
+        rec.set("merges", flat);
+        // markers 顺序 = restore_dialogue_markers 的标记串顺序：
+        // system, end_of_system, user, end_of_user, assistant,
+        // end_of_assistant, start_think, end_think（npos = UINT64_MAX）
+        std::vector<std::uint64_t> markers = {
+            static_cast<std::uint64_t>(markers_.system),
+            static_cast<std::uint64_t>(markers_.system_end),
+            static_cast<std::uint64_t>(markers_.user),
+            static_cast<std::uint64_t>(markers_.user_end),
+            static_cast<std::uint64_t>(markers_.assistant),
+            static_cast<std::uint64_t>(markers_.assistant_end),
+            static_cast<std::uint64_t>(markers_.start_think),
+            static_cast<std::uint64_t>(markers_.end_think)};
+        rec.set("markers", markers);
+        return rec;
+    }
+
+    // 词表 kvrec → 词表（load_from_kvrec 与 JSON 的 load_from_string 语义对齐：
+    // markers 存在则按存储值绑定、缺省才走 restore_dialogue_markers 推导）
+    [[nodiscard]] virtual Result<void> load_from_kvrec(const KeyValueRecord &rec)
+    {
+        std::string type_str;
+        if (!rec.get("type", type_str) || type_str != kvrec_type_str())
+            NN_FAIL("词表 kvrec 类型不匹配（期望 " + std::string(kvrec_type_str())
+                + "，实际 '" + type_str + "'）");
+        std::string blob;
+        if (!rec.get("vocab", blob))
+            NN_FAIL("词表 kvrec 缺少 vocab 字段");
+        NN_TRY(v, decode_vocab_blob(blob));
+
+        std::vector<std::uint64_t> flat;
+        if (rec.get("merges", flat) && flat.size() % 3 != 0)
+            NN_FAIL("词表 kvrec merges 长度错误（须为三元组展平）");
+        merges_.clear();
+        merges_.reserve(flat.size() / 3);
+        for (std::size_t i = 0; i + 2 < flat.size(); i += 3)
+            merges_.push_back({static_cast<std::size_t>(flat[i]),
+                               static_cast<std::size_t>(flat[i + 1]),
+                               static_cast<std::size_t>(flat[i + 2])});
+        rebuild_merge_map_();
+
+        std::vector<std::uint64_t> markers;
+        if (rec.get("markers", markers) && markers.size() == 8)
+        {
+            set_dialogue_marker_ids(
+                static_cast<std::size_t>(markers[0]), static_cast<std::size_t>(markers[1]),
+                static_cast<std::size_t>(markers[2]), static_cast<std::size_t>(markers[3]),
+                static_cast<std::size_t>(markers[4]), static_cast<std::size_t>(markers[5]),
+                static_cast<std::size_t>(markers[6]), static_cast<std::size_t>(markers[7]));
+            // 重建 reserved_ids_（幂等：词表已有保留 token 时不再追加）
+            append_reserved_extras_(*v);
+        }
+        else
+        {
+            // 缺省时按现 restore_dialogue_markers 从 vocab 推导（与现行为一致）
+            restore_dialogue_markers(*v);
+        }
+        set_vocab_(std::move(*v));
+        return {};
+    }
+
+    // ── 词表文件读写（.nnvocab）────────────────────────────────────────
+    [[nodiscard]] virtual Result<void> save(const std::string &path) const
+    {
+        std::ofstream ofs(path, std::ios::binary);
+        if (!ofs) NN_FAIL("Cannot write: " + path);
+        const std::string bytes = write_nnvocab(to_kvrec());
+        ofs.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        if (!ofs) NN_FAIL("Write error while writing: " + path);
+        return {};
+    }
+
+    [[nodiscard]] virtual Result<void> load(const std::string &path)
+    {
+        std::ifstream ifs(path, std::ios::binary);
+        if (!ifs) NN_FAIL("Cannot read: " + path);
+        std::string content((std::istreambuf_iterator<char>(ifs)),
+                             std::istreambuf_iterator<char>());
+        NN_TRY(rec, parse_nnvocab(content));
+        return load_from_kvrec(*rec);
+    }
 
     // ── 特殊 token ID 统一接口 ────────────────────────────────────────
     // 默认返回 npos（表示该 tokenizer 无此特殊 token）。
@@ -135,6 +242,10 @@ public:
 protected:
     // 对话标记 ID 集合（子类直接读取，无需各自定义 6 个字段）
     DialogueMarkers markers_;
+
+    // ── 子类词表存储接管（load_from_kvrec 经此写入解码后的词表）──────
+    // 子类把词表落到自己的 vocab_ 并重建内部索引（如 CharBPE 的 char_to_id_）。
+    virtual void set_vocab_(std::vector<std::string> vocab) = 0;
 
     // encode 并行度（0=自动，1=顺序，>1=指定；见 set_encode_threads）
     std::size_t encode_threads_ = 0;
@@ -524,36 +635,9 @@ protected:
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  JSON save/load 共享构件
+    //  JSON 读取共享构件（JSON 写出已废弃——词表落盘一律 .nnvocab；
+    //  本段仅供模型 v5 内嵌词表与 dataset_convert vocab 迁移旧 JSON 词表）
     // ═══════════════════════════════════════════════════════════════════════════
-
-    // 写入 JSON 头部 + vocab 段 + vocab_size 字段。
-    // 子类继续追加差异段（merges / special_tokens / decompose 等）并以 "\n}\n" 结尾。
-    // start_id: 起始写入的 token ID（用于跳过特殊 token 槽位）。
-    void save_vocab_json_(std::ofstream &ofs, std::string_view type_str, std::size_t start_id) const
-    {
-        const auto &v = vocab();
-        ofs << "{\n  \"type\": \"" << type_str << "\",\n  \"vocab\": {\n";
-        bool first = true;
-        for (std::size_t tid = start_id; tid < v.size(); ++tid)
-        {
-            if (v[tid].empty()) continue;
-            if (!first) ofs << ",\n";
-            first = false;
-            ofs << "    \"" << std::dec << tid << "\": \"";
-            write_vocab_entry_(ofs, v[tid], tid);
-            ofs << "\"" << std::dec;
-        }
-        ofs << "\n  },\n  \"vocab_size\": " << std::dec << v.size();
-    }
-
-    // 钩子：默认 hex 编码所有字节。
-    // CharBPETokenizer 重写以对前 4 个特殊 token (<pad>/<unk>/<bos>/<eos>) 用纯文本。
-    virtual void write_vocab_entry_(std::ofstream &ofs, const std::string &tok, std::size_t /*tid*/) const
-    {
-        for (unsigned char b : tok)
-            ofs << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(b);
-    }
 
     // 从 JSON 内容解析 vocab 段，返回按 ID 索引的词表向量。
     // 调用 decode_vocab_entry_(raw, tid) 解码每个条目（默认 hex，CharBPE 重写）。

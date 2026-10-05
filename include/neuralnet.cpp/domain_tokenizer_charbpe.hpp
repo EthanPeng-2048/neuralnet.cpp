@@ -87,19 +87,9 @@ public:
     [[nodiscard]] std::size_t bos_id() const noexcept override { return BOS_ID; }
     [[nodiscard]] std::size_t eos_id() const noexcept override { return EOS_ID; }
 
-    // ── write_vocab_entry_ 钩子：前 4 个特殊 token 用纯文本，其余 hex ──
-    // 基类 save_vocab_json_ 在写入每个词表条目时回调此虚方法。
-    void write_vocab_entry_(std::ofstream &ofs, const std::string &tok, std::size_t tid) const override
-    {
-        if (tid < 4)
-            ofs << tok;
-        else
-            for (unsigned char b : tok)
-                ofs << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(b);
-    }
-
     // ── decode_vocab_entry_ 钩子：前 4 个特殊 token 纯文本，其余 hex ──
     // 基类 parse_vocab_json_ 在解析每个词表条目时回调此虚方法。
+    // （旧 JSON 词表的条目编码；JSON 写出已废弃，词表落盘一律 .nnvocab）
     [[nodiscard]] std::string decode_vocab_entry_(const std::string &raw, std::size_t tid) const override
     {
         if (tid < 4)
@@ -521,33 +511,22 @@ public:
 
     [[nodiscard]] std::size_t merge_count() const noexcept { return merges_.size(); }
 
-    // ── 保存 JSON ────────────────────────────────────────────────────
-    [[nodiscard]] Result<void> save(const std::string &path) const override
+    // ── kvrec 词表序列化钩子（基类 to_kvrec / load_from_kvrec 调用）────
+    [[nodiscard]] std::string_view kvrec_type_str() const noexcept override { return "char_bpe"; }
+
+protected:
+    // 子类词表存储接管：落到 vocab_ 并重建 char_to_id_
+    void set_vocab_(std::vector<std::string> vocab) override
     {
-        std::ofstream ofs(path);
-        if (!ofs) NN_FAIL("Cannot write: " + path);
-        // 起始 ID = 0：保留前 4 个特殊 token + ASCII 兜底，全部写入。
-        save_vocab_json_(ofs, "char_bpe_tokenizer", 0);
-        ofs << ",\n  \"merges\": [";
-        for (std::size_t i = 0; i < merges_.size(); ++i)
-        {
-            if (i > 0) ofs << ",";
-            ofs << "\n    [" << merges_[i].id_a << ", " << merges_[i].id_b
-                << ", " << merges_[i].new_id << "]";
-        }
-        ofs << "\n  ]\n}\n";
-        return {};
+        vocab_ = std::move(vocab);
+        char_to_id_.clear();
+        for (std::size_t id = BYTE_BASE; id < vocab_.size(); ++id)
+            if (!vocab_[id].empty())
+                char_to_id_[vocab_[id]] = id;
     }
 
-    [[nodiscard]] Result<void> load(const std::string &path) override
-    {
-        std::ifstream ifs(path);
-        if (!ifs) NN_FAIL("Cannot read: " + path);
-        std::string content((std::istreambuf_iterator<char>(ifs)),
-                             std::istreambuf_iterator<char>());
-        return load_from_string(content);
-    }
-
+public:
+    // ── 旧 JSON 词表读取（模型 v5 内嵌词表 / dataset_convert vocab 用）──
     [[nodiscard]] Result<void> load_from_string(const std::string &content) override
     {
         vocab_.clear();
@@ -605,9 +584,11 @@ private:
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Tokenizer 工厂：根据 JSON 的 "type" 字段创建对应分词器实例
+//  Tokenizer 工厂：根据 "type" 字段创建对应分词器实例
 // ═══════════════════════════════════════════════════════════════════════════
 //  自动识别 BBPE / CharBPE 两种分词器。
+//  两套 type 词法并存：词表 kvrec 用 "bpe" | "char_bpe"（§4.2）；
+//  旧 JSON 用 "bpe_tokenizer" | "char_bpe_tokenizer"（模型 v5 内嵌词表）。
 //  训练/推理入口统一使用此工厂，无需手动判断类型。
 
 [[nodiscard]] inline std::string peek_tokenizer_type(const std::string &json_content)
@@ -629,14 +610,16 @@ private:
 
 [[nodiscard]] inline std::unique_ptr<Tokenizer> make_tokenizer(const std::string &type_str)
 {
-    if (type_str == "bpe_tokenizer")
+    if (type_str == "bpe_tokenizer" || type_str == "bpe")
         return std::make_unique<BPETokenizer>();
-    if (type_str == "char_bpe_tokenizer")
+    if (type_str == "char_bpe_tokenizer" || type_str == "char_bpe")
         return std::make_unique<CharBPETokenizer>();
     return nullptr;
 }
 
-// 从 JSON 内容创建已加载的 tokenizer（失败返回 nullptr）
+// 从旧 JSON 内容创建已加载的 tokenizer（失败返回 nullptr）。
+// ⚠ JSON 词表**不直读**（裁决 #7）：仅模型 v5 内嵌词表与
+//   `dataset_convert vocab` 迁移旧词表时调用本函数。
 [[nodiscard]] inline std::unique_ptr<Tokenizer>
 load_tokenizer_from_string(const std::string &json_content)
 {
@@ -652,15 +635,52 @@ load_tokenizer_from_string(const std::string &json_content)
     return tok;
 }
 
-// 从文件创建已加载的 tokenizer
-[[nodiscard]] inline std::unique_ptr<Tokenizer>
+// 从词表 kvrec（无文件标签）创建已加载的 tokenizer
+[[nodiscard]] inline Result<std::unique_ptr<Tokenizer>>
+load_tokenizer_from_kvrec(const KeyValueRecord &rec)
+{
+    std::string type_str;
+    if (!rec.get("type", type_str))
+        NN_FAIL("词表 kvrec 缺少 type 字段");
+    auto tok = make_tokenizer(type_str);
+    if (!tok)
+        NN_FAIL("未知分词器类型: " + type_str);
+    NN_TRY_CHECK(tok->load_from_kvrec(rec));
+    return tok;
+}
+
+// 从词表文件镜像字节创建已加载的 tokenizer：
+// .nnvocab 字节（[label "NNVC"][词表 kvrec v2]）或旧 JSON 字符串，按内容嗅探。
+// 模型内嵌词表（v5 JSON / v6 kvrec）经此加载。
+[[nodiscard]] inline Result<std::unique_ptr<Tokenizer>>
+load_tokenizer_from_bytes(const std::string &content)
+{
+    if (content.size() >= 4 && content.compare(0, 4, NNVOCAB_MAGIC, 4) == 0)
+    {
+        NN_TRY(rec, parse_nnvocab(content));
+        return load_tokenizer_from_kvrec(*rec);
+    }
+    if (!content.empty() && content[0] == '{')
+    {
+        auto tok = load_tokenizer_from_string(content);
+        if (!tok)
+            NN_FAIL("无法识别分词器类型（旧 JSON 词表）");
+        return tok;
+    }
+    NN_FAIL("无法识别的词表数据（既不是 .nnvocab 也不是 JSON 词表）");
+}
+
+// 从 .nnvocab 词表文件创建已加载的 tokenizer。
+// 旧 JSON 词表不直读：报错并提示 `dataset_convert vocab`（裁决 #7）。
+[[nodiscard]] inline Result<std::unique_ptr<Tokenizer>>
 load_tokenizer_from_file(const std::string &path)
 {
-    std::ifstream ifs(path);
-    if (!ifs) return nullptr;
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs) NN_FAIL("Cannot read: " + path);
     std::string content((std::istreambuf_iterator<char>(ifs)),
                         std::istreambuf_iterator<char>());
-    return load_tokenizer_from_string(content);
+    NN_TRY(rec, parse_nnvocab(content));
+    return load_tokenizer_from_kvrec(*rec);
 }
 
 

@@ -254,30 +254,15 @@ public:
         return result;
     }
 
-    [[nodiscard]] Result<void> save(const std::string &path) const override
-    {
-        std::ofstream ofs(path);
-        if (!ofs) NN_FAIL("Cannot write: " + path);
-        save_vocab_json_(ofs, "bpe_tokenizer", 0);
-        ofs << ",\n  \"merges\": [";
-        for (std::size_t i = 0; i < merges_.size(); ++i)
-        {
-            if (i > 0) ofs << ",";
-            ofs << "\n    [" << merges_[i].id_a << ", " << merges_[i].id_b << ", " << merges_[i].new_id << "]";
-        }
-        ofs << "\n  ]\n}\n";
-        return {};
-    }
+    // ── kvrec 词表序列化钩子（基类 to_kvrec / load_from_kvrec 调用）────
+    [[nodiscard]] std::string_view kvrec_type_str() const noexcept override { return "bpe"; }
 
-    [[nodiscard]] Result<void> load(const std::string &path) override
-    {
-        std::ifstream ifs(path);
-        if (!ifs) NN_FAIL("Cannot read: " + path);
-        std::string content((std::istreambuf_iterator<char>(ifs)),
-                             std::istreambuf_iterator<char>());
-        return load_from_string(content);
-    }
+protected:
+    // 子类词表存储接管：落到 vocab_（BPE 无额外索引要重建）
+    void set_vocab_(std::vector<std::string> vocab) override { vocab_ = std::move(vocab); }
 
+public:
+    // ── 旧 JSON 词表读取（模型 v5 内嵌词表 / dataset_convert vocab 用）──
     [[nodiscard]] Result<void> load_from_string(const std::string &content) override
     {
         vocab_.clear();
