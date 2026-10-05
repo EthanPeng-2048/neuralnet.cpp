@@ -43,7 +43,7 @@
 | 最大源文件 | `compute_vk_backend.hpp` **5161** 行、`expr_glsl_gen.hpp` **2806**、`compute_cpu_engine.hpp` **2309**、`compute_engine.hpp` **2003**、`gui.py` **1662**（非空约 1470）、`src/text_train.cpp` **1493** | 逐文件 `(Get-Content $f).Count` |
 | ctest | **27 个测试** = 24 个测试目标（`list(APPEND NN_TEST_TARGETS` 计数）+ `cnn_test_gpu`（= `cnn_test --gpu`）+ `batchnorm_test_gpu`（= `batchnorm_test --gpu`，2026-10-03 随 BatchNorm 落地新增）+ `fusion_custom_layer_example`（AOT 融合端到端） | `ctest --test-dir build -N` |
 | 引擎接口 | **49 个 virtual 方法**；`L2-VIOLATIONS: 0`；宿主桥 40 处（仅披露） | `pwsh -File bench/doc_inventory.ps1` |
-| 版本 | git tag **v1.6.0**；`CMakeLists.txt` 的 `project(... VERSION 1.0.0)`（滞后于 git tag，**以 git tag 为版本权威**）；`release-notes/` 有 `v1.5.0.md` 与 `v1.6.0.md` | `git describe` + 读 `CMakeLists.txt` |
+| 版本 | git tag **v1.7.0**；`CMakeLists.txt` 的 `project(... VERSION 1.7.0)`（2026-10-06 发布时对齐；口径仍为 **git tag 是版本权威**）；`release-notes/` 有 `v1.5.0.md`、`v1.6.0.md`、`v1.7.0.md`（v1.5.1 / v1.6.1 无独立发布说明，v1.6.1 的用户可见变化补记于 v1.7.0.md §7） | `git describe` + 读 `CMakeLists.txt` |
 | CI | 仅 `.github/workflows/cmake-single-platform.yml`：clang++ / Ninja / Release / `NN_ENABLE_NATIVE=OFF`，Linux + Windows；**不开 `NN_ENABLE_TESTS`、不跑 ctest** | 读该 workflow |
 
 > 口径说明：表中行数均为**总行数**（2026-10-06 统一数据集落地后实测刷新）。

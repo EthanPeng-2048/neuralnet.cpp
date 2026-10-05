@@ -39,6 +39,7 @@
 | [快速上手：训练与推理](docs/usage/02-quickstart-train-infer.md) | MNIST/GPT 训练推理命令行 + C++ API 示例 + GUI 操作指南 |
 | [计算引擎使用](docs/usage/03-compute-engine-usage.md) | 张量操作、矩阵运算、表达式融合 |
 | [训练包](docs/usage/04-train-package.md) | 用 `.nnpkg` 打包超参+训练集，跨设备一键复现训练 |
+| [统一数据集设计](docs/development/19-unified-dataset.md) | `.nndataset`/`.nnvocab`/KVRecord v2 格式与 `nn::Dataset` |
 
 ## 项目结构
 
@@ -102,6 +103,8 @@ neuralnet.cpp/
 │   ├── text_infer.cpp           ← GPT 文本推理
 │   ├── tokenizer_train.cpp      ← 分词器训练
 │   ├── tokenizer_infer.cpp      ← 分词器推理
+│   ├── dataset_gen.cpp          ← 数据集生成（文本+词表 → .nndataset）
+│   ├── dataset_convert.cpp      ← 旧格式转换（JSON 词表 → .nnvocab 等）
 │   └── gpu_test.cpp             ← GPU 后端测试
 ├── datasets/                    ← 训练数据
 ├── pretrained/                  ← 预训练模型
@@ -131,6 +134,13 @@ cmake -B build -G Ninja
 
 - MNIST 数据：`datasets/mnist_data/`（`train.csv` / `test.csv`）
 - 文本语料：使用 `scripts/` 下的 `download_*.py` 脚本下载
+- GPT 训练数据统一为 **`.nndataset`**（token/词表/loss 掩码/test 子集都在生成期定好，
+  见 `docs/development/19-unified-dataset.md`）：
+
+  ```powershell
+  ./build/tokenizer_train corpus.txt --vocab-size 10000 --output my_bpe.nnvocab
+  ./build/dataset_gen corpus.txt --vocab my_bpe.nnvocab -o corpus.nndataset
+  ```
 
 ### 运行训练
 
@@ -210,12 +220,12 @@ python gui.py
 5. **手写板模式**：在白色画布上书写数字 → 点击 **"🔍 识别手写数字"**，即刻得到预测
 
 **GPT 训练：**
-1. 选择训练文本文件（`.txt`）和词表 JSON
+1. 选择 `.nndataset` 数据集文件（由 `dataset_gen` 生成；词表/loss 掩码/test 子集随数据集）
 2. 配置模型架构（维度/头数/层数/FFN）和位置编码
 3. 点击 **"▶ 开始训练"**，实时显示 loss 曲线
 
 **GPT 推理：**
-1. 选择模型文件和词表，设置温度和最大 token 数
+1. 选择模型文件（v4+ 自动使用内嵌词表），模型未嵌入时指定 `.nnvocab` 词表；设置温度和最大 token 数
 2. 输入提示文本，点击 **"▶ 生成文本"**
 3. 支持勾选"交互式生成模式"进行多轮生成
 
