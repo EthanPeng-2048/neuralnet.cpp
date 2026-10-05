@@ -17,9 +17,8 @@ train_pkg.py - 训练包（配置 + 数据）制作与按超参训练
   run.nnpkg
   ├── manifest.json      # 超参、任务类型、数据元信息、sha256 校验和
   └── data/              # 训练数据（文件或目录树）
-      ├── train/...
-      ├── test/...       # 可选（GPT）
-      └── vocab/...      # 可选（GPT 词表）
+      └── train/...      # GPT = 单个 .nndataset（词表/掩码/test 子集随数据集，
+                         #  由 dataset_gen 生成）；MNIST = 数据集目录
 
 用法：
   # 生成配置模板
@@ -82,8 +81,9 @@ SUPPORTED_TASKS = ("gpt", "mnist")
 SUPPORTED_COMPRESS = ("gzip", "zstd")
 
 # 每种任务：数据 role -> 传给控制器的参数名
+# GPT 只有一个数据角色（.nndataset 自带词表/掩码/test 子集，19 号设计）
 TASK_DATA_ROLE_TO_ARG = {
-    "gpt": {"train": "text_file", "test": "test_file", "vocab": "vocab"},
+    "gpt": {"train": "text_file"},
     "mnist": {"train": "dataset"},
 }
 
@@ -215,9 +215,7 @@ def make_template(task: str, name: str = "run") -> Dict[str, Any]:
             "task": "gpt",
             "device": "cpu",
             "data": {
-                "train": "datasets/tinystories_20k.txt",
-                "test": "",
-                "vocab": "bpe_vocab.json",
+                "train": "datasets/tinystories_20k.nndataset",
             },
             "hyperparameters": {
                 "epochs": 10,

@@ -39,15 +39,20 @@
 | `include/` | **58 个 `.hpp` / 35637 行**（非空 32594） | `Get-ChildItem include -Recurse -Filter *.hpp` + 逐文件 `Get-Content` 计数 |
 | `src/` | **55 个 `.cpp` / 17873 行** | 同上换 `src -Filter *.cpp` |
 | `shaders/` | **19 个 `.comp`** | `Get-ChildItem shaders -Recurse -Filter *.comp` |
-| `docs/` | **25 篇 `.md`**（本文加入前；含 `history.md` 与 `release-notes/`） | `Get-ChildItem docs -Recurse -Filter *.md` |
-| 最大源文件 | `compute_vk_backend.hpp` **5246** 行、`expr_glsl_gen.hpp` **2746**、`compute_cpu_engine.hpp` **2353**、`compute_engine.hpp` **2087**、`src/text_train.cpp` **1746**、`gui.py` **1646**（非空 1456） | 逐文件 `(Get-Content $f).Count` |
-| ctest | **24 个测试** = 21 个测试目标（`list(APPEND NN_TEST_TARGETS` 计数）+ `cnn_test_gpu`（= `cnn_test --gpu`）+ `batchnorm_test_gpu`（= `batchnorm_test --gpu`，2026-10-03 随 BatchNorm 落地新增）+ `fusion_custom_layer_example`（AOT 融合端到端） | `ctest --test-dir build -N` |
+| `docs/` | **29 篇 `.md`**（含 `history.md` 与 `release-notes/`） | `Get-ChildItem docs -Recurse -Filter *.md` |
+| 最大源文件 | `compute_vk_backend.hpp` **5161** 行、`expr_glsl_gen.hpp` **2806**、`compute_cpu_engine.hpp` **2309**、`compute_engine.hpp` **2003**、`gui.py` **1662**（非空约 1470）、`src/text_train.cpp` **1493** | 逐文件 `(Get-Content $f).Count` |
+| ctest | **27 个测试** = 24 个测试目标（`list(APPEND NN_TEST_TARGETS` 计数）+ `cnn_test_gpu`（= `cnn_test --gpu`）+ `batchnorm_test_gpu`（= `batchnorm_test --gpu`，2026-10-03 随 BatchNorm 落地新增）+ `fusion_custom_layer_example`（AOT 融合端到端） | `ctest --test-dir build -N` |
 | 引擎接口 | **49 个 virtual 方法**；`L2-VIOLATIONS: 0`；宿主桥 40 处（仅披露） | `pwsh -File bench/doc_inventory.ps1` |
 | 版本 | git tag **v1.6.0**；`CMakeLists.txt` 的 `project(... VERSION 1.0.0)`（滞后于 git tag，**以 git tag 为版本权威**）；`release-notes/` 有 `v1.5.0.md` 与 `v1.6.0.md` | `git describe` + 读 `CMakeLists.txt` |
 | CI | 仅 `.github/workflows/cmake-single-platform.yml`：clang++ / Ninja / Release / `NN_ENABLE_NATIVE=OFF`，Linux + Windows；**不开 `NN_ENABLE_TESTS`、不跑 ctest** | 读该 workflow |
 
-> 口径说明：表中行数均为**总行数**；`gui.py` 另有非空 1456 行。
-> `24` 是当前唯一正确计数（2026-10-05 起，随错误处理宏族落地新增 `error_macro_test`；此前 2026-10-03 起为 23 = 随 BatchNorm 落地新增 `batchnorm_test` + `batchnorm_test_gpu`，再此前为 21）。历史上仓库里同时存在"ctest 计数 19"与"ctest 20 比 20"两种表述（§3 工程化第 4 条）——那是**计数口径不同**（是否含 `cnn_test_gpu`、以及后来新增的目标），2026-10-01 的 A4/A5 两轮把计数推到 21 并统一到本文与 `AGENTS.md`。
+> 口径说明：表中行数均为**总行数**（2026-10-06 统一数据集落地后实测刷新）。
+> `27` 是当前唯一正确计数（2026-10-05/06 随统一数据集落地新增 `kvrec_test`/`nnvocab_test`/
+> `dataset_test`：24 → 27；此前 2026-10-05 起为 24 = 随错误处理宏族落地新增 `error_macro_test`；
+> 再此前 2026-10-03 起为 23 = 随 BatchNorm 落地新增 `batchnorm_test` + `batchnorm_test_gpu`，
+> 更早为 21）。历史上仓库里同时存在"ctest 计数 19"与"ctest 20 比 20"两种表述（§3 工程化第 4 条）
+> ——那是**计数口径不同**（是否含 `cnn_test_gpu`、以及后来新增的目标），2026-10-01 的 A4/A5 两轮
+> 把计数推到 21 并统一到本文与 `AGENTS.md`。
 
 ### 2.1 已经稳固的底座（本轮不再动）
 
@@ -99,7 +104,7 @@
 | # | 现象 | 坐标 | 影响面 |
 |---|---|---|---|
 | X1 | 推理无 top-k / top-p 采样截断 | `src/text_infer.cpp` 只有 `--temperature` 与 `--interactive`；`compute_layer_gpt.hpp:622` 的采样入口只吃 temperature | 长文本生成质量不可控；无法做"多轮对话闭环"演示 |
-| X2 | 无 Dataset / DataLoader 抽象，文本训练数据加载不成体系 | `src/text_train.cpp` 内联数据路径；`train_pkg.py` / `cli_controllers.py` 各自处理 | 新数据集接入成本高，流式大语料不可行 |
+| X2 | ~~无 Dataset / DataLoader 抽象，文本训练数据加载不成体系~~ **前半已解决（2026-10-05/06，19 号设计阶段一~三）**：`nn::Dataset` + `.nndataset`/`.nnvocab` 统一格式 + `dataset_gen`/`dataset_convert`，text_train 只吃数据集；**剩 DataLoader/流式** | ~~`src/text_train.cpp` 内联数据路径；`train_pkg.py` / `cli_controllers.py` 各自处理~~（已收编，见 `docs/development/19-unified-dataset.md`） | 流式大语料仍不可行（`load_text` 一次性物化，P2-4 后半解决） |
 | X3 | 无 Python / C 绑定 | 仓库仅有 `gui.py` 这一 Python 入口（subprocess 调 CLI） | 生态集成只能走命令行 + 文件 |
 | X4 | `gui.py` 六个 Tab、7 处手写 `collect_args` | `gui.py`（`def collect_args` 实测 7 处） | 加 CLI 选项要手改多处，漏参风险（13 §4 的"五个 Tab / 1471-1500"坐标已过期） |
 | X5 | GUI 画布拖动全量降采样重绘 | `gui.py:1135`（`_on_draw_move`）；已有节流先例 `gui.py:216`（`_RENDER_MS = 250`） | 快速拖动卡顿 |
@@ -168,7 +173,7 @@ P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
 | **P2-1 `.bin` 整文件校验和 + 尾部完整性标记** | 版本段之后加校验和；按注释约定升 `MODEL_VERSION` | 截断文件明确报错；合法文件 round-trip SHA256 一致 | 小–中 | P1-2（同一版本段改动，合并做省一次升版） |
 | **P2-2 Adafactor 类无 m/v 优化器** | 新增不物化二阶矩的优化器，训练更大模型 | 同任务对比 Adam 的显存下降与收敛曲线；`create_optimizer` 可创建 | 中 | 无 |
 | **P2-3 RAPT / CNN f16 接线** | RAPT 的 `dsl::compute*` 调用接精度实参；`Conv2D` 权重/梯度去 `Precision::F32` 硬编码 | f16 下 CNN/RAPT 训练健康收敛；CPU/GPU 字节锚按计划内变化流程重立 | 中 | 无（C2 的 fail-fast 先落地，防用户踩坑） |
-| **P2-4 Dataset / DataLoader 抽象 + 流式文本** | 数据集抽象 + 流式加载，不再把语料整段读进内存 | 大文件训练内存曲线平稳；现有 `.nnpkg` 路径回归 | 中–大 | 无 |
+| **P2-4 Dataset / DataLoader 抽象 + 流式文本**（**前半 Dataset 已于 2026-10-05/06 落地** = 19 号设计阶段一~三；本条只剩**流式后半**：DataLoader/分块迭代 `for_each_chunk`，不再把语料整段读进内存） | 流式加载（Dataset 格式与统一只读类见 `docs/development/19-unified-dataset.md`） | 大文件训练内存曲线平稳；`dataset_test` 逐位一致口径回归 | 中 | 无 |
 | **P2-5 Python / C 绑定** | 提供稳定 C ABI 或 pybind 绑定，供生态集成 | 绑定层跑通训练/推理最小示例；ABI 报错信息可读 | 中–大 | **条件触发**（§6） |
 | **P2-6 GUI 声明式字段表 + 绘制节流** | dataclass 元数据自动生成 UI 行与 `collect_args`；画布 motion 按帧节流、dirty 标志跳过空帧 | 现有 Tab 参数零遗漏（`bench/gui_cli_audit.py` 退出码 0）；拖动帧率回升 | 小–中（两项同批） | P0-5（采样新开关先定型，避免二次改字段表） |
 | **P2-7 超大 header 拆分** | backend 拆 fence / staging / dispatch / 算子为独立 TU；`compute_vk_backend.hpp` 瘦身 | 拆分前后 build 全绿 + ctest 全绿 + CPU/GPU 字节锚逐位一致 | 中–大 | **前置 = 先补编译/链接期冒烟**（P0-1 + P1-5），否则拆分无回归网 |

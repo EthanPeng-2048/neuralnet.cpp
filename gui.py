@@ -62,7 +62,6 @@ NORM_OPTIONS = ["auto", "layernorm", "rmsnorm", "batchnorm"]
 # auto = 按架构默认：CNN = conv, ViT = final（与 mnist_train 默认一致）
 NORM_PLACE_OPTIONS = ["auto", "none", "conv", "head", "both", "final"]
 GPT_NORM_OPTIONS = ["layernorm", "rmsnorm"]  # GPT 仅支持 LayerNorm/RMSNorm
-GPT_LOSS_SCOPE_OPTIONS = ["all", "assistant"]  # loss 范围（assistant = 对话 SFT）
 PRECISION_OPTIONS = ["f32", "f16"]  # 混合精度选项
 # 模型架构：zipt(AttnZip) 已于 2026-10-01 移除（恢复前提见 docs/history.md / AGENTS §12）
 GPT_MODEL_OPTIONS = ["gpt", "rapt"]
@@ -1288,8 +1287,8 @@ class TokenizerTrainTab(TabBase):
         self.tokenizer_type = _make_option_row(p, "分词器类型", r,
                                                 TOKENIZER_OPTIONS, "bpe"); r += 1
         self.output_path = _make_save_row(p, "输出路径", r,
-                                           default_name="bpe_vocab.json",
-                                           filetypes=[("JSON", "*.json")]); r += 1
+                                           default_name="bpe_vocab.nnvocab",
+                                           filetypes=[("词表文件", "*.nnvocab")]); r += 1
         self.vocab_size = _make_entry_row(p, "词表大小", r, "5000"); r += 1
         self.min_freq = _make_entry_row(p, "最小频率", r, "2"); r += 1
         self.threads = _make_entry_row(p, "预分词线程数 (0=自动)", r, "0"); r += 1
@@ -1315,7 +1314,7 @@ class TokenizerInferTab(TabBase):
         p = self.params_frame
         r = 0
         self.vocab_path = _make_file_row(p, "词表路径", r,
-                                          filetypes=[("JSON", "*.json")]); r += 1
+                                          filetypes=[("词表文件", "*.nnvocab")]); r += 1
         self.encode_text = _make_entry_row(p, "编码文本", r, "", width=200); r += 1
         self.decode_ids = _make_entry_row(p, "解码ID列表", r, "", width=200); r += 1
         self.encode_file = _make_file_row(p, "编码文件", r,
@@ -1355,18 +1354,14 @@ class GptTrainTab(TabBase):
         r = 0
 
         # --- 基本参数 ---
-        self.text_file = _make_file_row(p, "训练文本文件", r,
-                                         filetypes=[("文本文件", "*.txt")]); r += 1
+        self.text_file = _make_file_row(p, "数据集文件 (.nndataset)", r,
+                                         filetypes=[("数据集文件", "*.nndataset")]); r += 1
         self.save_path = _make_save_row(p, "保存路径", r,
                                          default_name="gpt_model.bin"); r += 1
         self.resume_path = _make_file_row(p, "恢复路径", r,
                                            filetypes=[("模型文件", "*.bin *.nnpkg")]); r += 1
         self.resume_epoch = _make_entry_row(p, "续训起始 epoch (0-based)", r, "0"); r += 1
         self.resume_step = _make_entry_row(p, "续训起始 step (0-based)", r, "0"); r += 1
-        self.test_file = _make_file_row(p, "测试集 (可选)", r,
-                                         filetypes=[("文本文件", "*.txt")]); r += 1
-        self.vocab_path = _make_file_row(p, "词表路径", r,
-                                          filetypes=[("JSON", "*.json")]); r += 1
 
         # --- 训练参数 ---
         _make_label(p, "── 训练参数 ──", r); r += 1
@@ -1392,10 +1387,8 @@ class GptTrainTab(TabBase):
         self.max_norm = _make_entry_row(p, "梯度裁剪 (0=不裁剪)", r, "0"); r += 1
         self.lr_per_epoch = _make_entry_row(p, "每轮 lr (逗号分隔, 可选)", r, ""); r += 1
 
-        # --- loss 范围与限步 ---
-        _make_label(p, "── loss 范围与限步 ──", r); r += 1
-        self.loss_scope = _make_option_row(p, "loss 范围 (assistant=对话SFT)", r,
-                                           GPT_LOSS_SCOPE_OPTIONS, "all"); r += 1
+        # --- 限步（loss 范围/测试集/词表随数据集，生成期定好）---
+        _make_label(p, "── 限步 ──", r); r += 1
         self.max_steps = _make_entry_row(p, "最大训练步数 (0=不限)", r, "0"); r += 1
 
         # LR 调度相关控件（fixed 时隐藏）
@@ -1444,7 +1437,6 @@ class GptTrainTab(TabBase):
         self.log_interval = _make_entry_row(p, "日志间隔 (steps)", r, "50"); r += 1
         self.save_interval = _make_entry_row(p, "保存间隔 (steps)", r, "100"); r += 1
         self.grad_log_var = _make_checkbox_row(p, "梯度日志", r); r += 1
-        self.no_cache_var = _make_checkbox_row(p, "禁用 tokenize 缓存", r); r += 1
 
         self._add_export_button()
 
@@ -1452,7 +1444,7 @@ class GptTrainTab(TabBase):
         """把当前 GPT 训练 UI 参数打包为训练包配置"""
         args = self.collect_args()
         data = {}
-        for k, role in (("text_file", "train"), ("test_file", "test"), ("vocab", "vocab")):
+        for k, role in (("text_file", "train"),):
             if args.get(k):
                 data[role] = args.pop(k)
         dev = "cpu"
@@ -1526,8 +1518,6 @@ class GptTrainTab(TabBase):
         args.update(_str(self.resume_path, "resume"))
         args.update(_int(self.resume_epoch, "resume_epoch"))
         args.update(_int(self.resume_step, "resume_step"))
-        args.update(_str(self.test_file, "test_file"))
-        args.update(_str(self.vocab_path, "vocab"))
         args.update(_int(self.epochs, "epochs"))
         args.update(_int(self.batch_size, "batch_size"))
         args.update(_int(self.accum_steps, "accum_steps"))
@@ -1537,7 +1527,6 @@ class GptTrainTab(TabBase):
         args.update(_float(self.weight_decay, "weight_decay"))
         args.update(_float(self.beta1, "beta1"))
         args.update(_float(self.beta2, "beta2"))
-        args["loss_scope"] = self.loss_scope.get()
         args.update(_int(self.max_steps, "max_steps"))
         engine = self.engine.get()
         if engine == "GPU (Vulkan)":
@@ -1580,7 +1569,6 @@ class GptTrainTab(TabBase):
         args.update(_int(self.log_interval, "log_interval", skip_vals=()))
         args.update(_int(self.save_interval, "save_interval", skip_vals=()))
         args["grad_log"] = self.grad_log_var.get()
-        args["no_cache"] = self.no_cache_var.get()
         return args
 
 
@@ -1596,7 +1584,7 @@ class GptInferTab(TabBase):
         self.model_path = _make_file_row(p, "模型路径", r,
                                           filetypes=[("模型文件", "*.bin *.pt *.nnpkg")]); r += 1
         self.vocab_path = _make_file_row(p, "词表路径 (模型未嵌入时)", r,
-                                          filetypes=[("JSON", "*.json")]); r += 1
+                                          filetypes=[("词表文件", "*.nnvocab")]); r += 1
         self.max_tokens = _make_entry_row(p, "最大生成token数", r, "200"); r += 1
         self.temperature = _make_entry_row(p, "温度 (0=贪心)", r, "1.0"); r += 1
         self.engine = _make_option_row(p, "计算引擎", r, ENGINE_OPTIONS, "CPU"); r += 1

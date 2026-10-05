@@ -778,7 +778,7 @@ class GptTrainController(CLIController):
         """格式化GPT训练参数"""
         args = []
         
-        # 训练文本文件（第一个位置参数）
+        # 数据集文件（第一个位置参数，.nndataset；词表/掩码/test 子集随数据集）
         if "text_file" in kwargs:
             args.append(self._format_arg_value(kwargs["text_file"]))
         
@@ -795,14 +795,6 @@ class GptTrainController(CLIController):
         
         if "resume_step" in kwargs:
             args.extend(["--resume-step", self._format_arg_value(kwargs["resume_step"])])
-        
-        # 词表路径
-        if "vocab" in kwargs:
-            args.extend(["--vocab", self._format_arg_value(kwargs["vocab"])])
-        
-        # 测试集文件
-        if "test_file" in kwargs:
-            args.extend(["--test-file", self._format_arg_value(kwargs["test_file"])])
         
         # 训练参数
         if "epochs" in kwargs:
@@ -835,10 +827,6 @@ class GptTrainController(CLIController):
         
         if "beta2" in kwargs:
             args.extend(["--beta2", self._format_arg_value(kwargs["beta2"])])
-        
-        # loss 范围（assistant = 对话 SFT 仅 assistant 段参与 loss）
-        if "loss_scope" in kwargs:
-            args.extend(["--loss-scope", self._format_arg_value(kwargs["loss_scope"])])
         
         # 模型参数
         if "d_model" in kwargs:
@@ -887,10 +875,6 @@ class GptTrainController(CLIController):
         # 梯度日志
         if kwargs.get("grad_log", False):
             args.append("--grad-log")
-        
-        # 禁用 tokenize 缓存（每次重新分词，不写 .tokcache）
-        if kwargs.get("no_cache", False):
-            args.append("--no-cache")
         
         # Batch录制粒度
         if "flush_interval" in kwargs:

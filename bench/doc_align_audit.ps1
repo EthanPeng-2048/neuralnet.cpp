@@ -126,9 +126,13 @@ $externalFlags = @('--test-dir','--parallel','--target-env','--dtype','--adam-ep
 # 已在文档中明确标注"已移除"的历史参数
 #   --memory-tokens / --window : ZiPT(AttnZip) 专用，随 ZiPT 于 2026-10-01 移除
 #   --osc-guard/-window/-threshold : mnist_train 的幽灵选项（帮助声明、解析不存在），同日清除
+#   --vocab/--test-file/--loss-scope/--no-cache（text_train 上）: 随统一数据集
+#     （19 号设计阶段二）于 2026-10-05 移除——词表/掩码/test 子集随 .nndataset
+#     （--vocab 仍存在于 text_infer/tokenizer_infer，此处只登记 text_train 语境的提及）
 $removedFlags  = @('--cuda','--tdr-retry','--max-tdr-retries',
                    '--memory-tokens','--window',
-                   '--osc-guard','--osc-window','--osc-threshold')
+                   '--osc-guard','--osc-window','--osc-threshold',
+                   '--no-cache','--test-file','--loss-scope')
 
 # ── [D] 文档里的 CLI 参数是否存在 ────────────────────────────────────────
 Write-Host '=== [D] 文档引用但代码中不存在的 CLI 参数（--flag）==='

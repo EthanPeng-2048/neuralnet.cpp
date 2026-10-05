@@ -31,6 +31,7 @@
 - [ZiPT（AttnZip）移除](#ZiPT（AttnZip）移除（2026-10-01）)（1 条）
 - [GUI / CLI 参数一致性清理](#GUI / CLI 参数一致性清理（2026-10-01）)（1 条）
 - [分支归档与 legacy 命名空间整理](#分支归档与 legacy 命名空间整理（2026-10-02，v1.6.0 发布时）)（1 条）
+- [统一数据集格式与加载（19 号设计落地）](#统一数据集格式与加载（19 号设计落地，2026-10-05/06）)（1 条）
 
 ---
 
@@ -2316,4 +2317,63 @@ A1 段改动前为 2424）、`include/neuralnet.cpp/compute_cpu_engine.hpp` **23
   （D/F conflict，远端拒绝推送）→ 按裁定改名为 **`legacy/compiler-compat`** 释放命名空间。
 - 教训：`legacy/<dir>/*` 这类目录式分支命名，前提是 `legacy` 本身不能是分支名；归档前先查
   `git branch -a` 是否存在平铺同名分支。
+
+---
+
+# 统一数据集格式与加载（19 号设计落地，2026-10-05/06）
+
+## 阶段一~三实施记录（KVRecord v2 / .nnvocab / .nndataset / text_train 切换 / 模型 v6）
+
+- 类型：演进记录 / 删除清单 / 覆盖缺口
+- **背景**：接入一个新数据集要重写一套读取+解析+缓存——六条互不相通的读取路径（MNIST CSV
+  ×2、txt 直读、`.tokcache`、JSON 词表、`.nnpkg`）散落在三个文件里；词表/语料/掩码/缓存四个
+  概念互相纠缠。设计与逐条裁决见 `docs/development/19-unified-dataset.md`（2026-10-05 对话定稿，
+  本轮按其 §9 分期落地，分段提交）。
+- **阶段一（KVRecord v2 + `.nnvocab`）**：`model_keyvalue_record.hpp` 增 v2 分支——哨兵
+  `kvrec_version` 自举 v1/v2 分派（无版本字段 = v1，有 = 按版本读）、字段只记 key/类型/文件绝对
+  地址、数据块 `[value_len u64][value]` 按字段序连续排布、`Type::Record` 层层嵌套、未知类型按
+  长度跳过。**实施解释一处**：解析器对数据块地址做**连续性校验**（`addr == 期望游标`），整体搬迁
+  的字节（换基址复制）硬报错而非静默错值——这是 §10-1/§10-2"哨兵是唯一内联字段、绝对地址不可
+  搬迁"两条风险的合流兑现。模型 spec 头仍走 v1 `serialize()`，**字节零变化**。词表 `.nnvocab`
+  = `[label NNVC][词表 kvrec v2 @8]`（type/vocab blob/merges 三元组/markers 8 元组）；tokenizer
+  `save/load` 切 `.nnvocab`（JSON 写出废弃、读取保留给模型 v5 与迁移器）；`tokenizer_train`
+  默认输出 `bpe_vocab.nnvocab`；`text_*`/`tokenizer_*` 的 `--vocab` 只吃 `.nnvocab`，旧 JSON 报错
+  指路 `dataset_convert vocab`（新 CLI）。
+- **阶段二（`.nndataset` + `nn::Dataset` + text_train 切换 + 模型 v6）**：`.nndataset` =
+  `[label NNDS][文件级 kvrec v2][doc 块 arena]`，companion 三层嵌套（vocab 词表 kvrec /
+  source sha256（`core_sha256.hpp` 新增）/ license 纯文本 / gen 参数），train/test 子集
+  `doc_index` 绝对偏移寻址；**`loss_scope=all` 不写 mask 段、加载端合成全 1**（裁决 #11 的体积
+  实施解释）。`nn::Dataset` 只读类 + 生成期公共件（`read_text_docs` / `mark_assistant_span` /
+  `encode_docs_parallel`——§4.3.2 三段一致性硬约束**逐字**迁自 text_train）；`dataset_gen` CLI
+  （`--test`/`--loss-scope`/`--license`/`--source`）。`text_train` 位置参数改 `<dataset.nndataset>`，
+  **删除清单**：`--vocab`/`--test-file`/`--loss-scope`/`--no-cache` 四选项 + `read_file_lines`/
+  `parallel_tokenize`/`mark_assistant_spans`/tokcache 全部内联代码（`.tokcache` 机制随之消亡）；
+  窗口化 `--seq-len`/`--stride` 保留（裁决 #3：窗口是训练策略）。**模型格式 v6**：内嵌词表改
+  `.nnvocab` 字节，`MODEL_VERSION 5→6`，v5 及以下仍读内嵌 JSON（`load_model` 带出版本号 →
+  `load_tokenizer_from_model_blob` 按版本分派，旧模型零破坏）。⚠ 版本号抢号提示已在
+  `model_serialization.hpp` 记录（roadmap P1-2 也计划 5→6，谁先落地谁占 6）。
+- **阶段三（Python 侧 + 文档同批）**：`gui.py` GPT Tab 的 `text_file` 改指 `.nndataset`、删除
+  vocab/test_file/loss_scope/no_cache 四行（含 `collect_args`/`build_pack_config` 角色映射）；
+  `cli_controllers.py` GptTrainController 删对应四个参数块；`train_pkg.py` GPT 数据角色收敛为
+  单一 `train`（`.nndataset` 自带词表/掩码/test）；`bench/gui_cli_audit.py` 用例同批改；
+  usage 02/04、AGENTS、12 号盘点、19 号状态行同步。
+- **验收（本机 Release+Ninja+clang）**：① build 零告警（`-Werror`）；② **ctest 24/24 → 27/27**
+  （新增 `kvrec_test`/`nnvocab_test`/`dataset_test` 全绿）；③ **§8 逐位一致口径**：`dataset_test`
+  把 trim 规则、保序并行 encode、逐 doc 掩码、flow+doc_ids+mask 全链与**旧参考实现**（原
+  `read_file_lines`/`mark_assistant_spans` 逐字复制进测试）对拍逐位一致（含空 token doc 行号
+  保持）；端到端同语料同词表：`dataset_gen` 产出 **3525 tokens / assistant 604/3525** 与改动前
+  旧路径基线（tokcache + mark_assistant_spans 实测留存 `build/ds_baseline/`）逐位一致，滑窗样本
+  数 56、文档数 173 全同；④ **字节锚 `gpu_stability_probe --steps 20` 前后逐位一致**（本机
+  Release 口径 `49ded8cf81d9f8f4`，pre/post worktree 双向对比；默认无 CMAKE_BUILD_TYPE 口径
+  `6f8849f14da23110` = 文档锚，post 侧复现）；⑤ `gui_cli_audit.py` PASS（可行动问题 0）、
+  `doc_inventory.ps1` L2-VIOLATIONS 0 / HANDWRITTEN-RESIDUE 0；⑥ v6 模型端到端：text_train 保存
+  → text_infer 按版本分派加载内嵌词表并生成。
+- **顺带查明的既有事实（非本轮引入）**：`text_train` CPU 训练**跨进程非确定**——同配置连续 4 次
+  运行 loss 轨迹与保存模型 SHA256 两两不同（4.5077/4.4322/4.2834/4.3736 起步；首轮还观测到
+  "优化器: adam 学习率: 0.001 vs 0.0"打印差异）。故 text_train 无法用"模型文件 hash"当字节锚，
+  §8 的"训练字节锚"只能落在确定性的 `gpu_stability_probe` 上；数据等价改由④的逐位对拍承担。
+  该非确定性在改动前的基线运行即存在（本轮基线取证时发现），根因未定位，如需立项另案。
+- **未做（按裁决/分期）**：阶段四 tabular/csv（`dataset_convert csv` + `load_tabular` +
+  `mnist_train` 切换）、DataLoader/流式（P2-4 后半）、`.nnpkg` 链路改造（用户裁定"先不管"，
+  本轮只做了参数名级同步使其不红）。
 

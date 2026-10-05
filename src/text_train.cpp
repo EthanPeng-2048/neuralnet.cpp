@@ -894,7 +894,7 @@ int main(int argc, char *argv[])
     std::vector<std::size_t> test_flow;
     std::vector<std::size_t> test_flow_doc_ids;
     std::vector<unsigned char> test_flow_assistant;  // 与 test_flow 等长（all 模式全 1）
-    if (dataset.info().has_test)
+    if (dataset.info().test_docs > 0)
     {
         auto test_corpus_r = dataset.load_text(true);
         NN_EXIT(test_corpus_r, 1, "读取测试子集失败: ");

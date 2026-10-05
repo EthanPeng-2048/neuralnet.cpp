@@ -87,15 +87,14 @@ CASES.append(("tokenizer_infer", TokenizerInferController(), dict(
     vocab="v.json", encode="hi", decode="1,2", encode_file="f.txt",
     text_file="t.txt", top=10, threads=0, show_bytes=True)))
 
-# GPT 训练
+# GPT 训练（词表/loss 掩码/test 子集随 .nndataset，19 号设计后不再有独立选项）
 GPT_COMMON = dict(
-    save="g.bin", test_file="t.txt", vocab="v.json", epochs=10, batch_size=32,
+    save="g.bin", epochs=10, batch_size=32,
     accum_steps=1, seq_len=256, stride=0, optimizer="adam", weight_decay=0.01,
-    loss_scope="all",
     gpu=True, lr=0.001, lr_schedule="cosine", min_lr=1e-6, warmup_epochs=1,
     d_model=128, num_heads=4, num_layers=4, d_ff=512,
     flush_interval=1, checkpoint_every=1, activation_offload=True,
-    log_interval=50, save_interval=100, grad_log=True, no_cache=True, **BASE_PREC)
+    log_interval=50, save_interval=100, grad_log=True, **BASE_PREC)
 CASES.append(("text_train", GptTrainController(), dict(
     model="gpt", positional_encoding="alibi", activation="swiglu", norm="rmsnorm",
     **GPT_COMMON)))

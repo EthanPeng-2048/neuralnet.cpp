@@ -16,7 +16,7 @@ project(neuralnet.cpp VERSION 1.6.1 LANGUAGES CXX)
 # ══════════════════════════════════════════════════════════════════════════
 # PROJECT_IS_TOP_LEVEL：本文件是顶层工程（正常开发/CI）时 ON；被消费方
 # add_subdirectory 嵌入时 OFF。据此默认值翻转，让嵌入方**只拿到库目标**，
-# 不被迫编译本仓 9 个 app/探针/基准（可显式 -DNN_BUILD_APPS=ON 打开）。
+# 不被迫编译本仓 12 个 app/探针/基准（可显式 -DNN_BUILD_APPS=ON 打开）。
 option(NN_BUILD_APPS "Build neuralnet.cpp application/bench executables"
        ${PROJECT_IS_TOP_LEVEL})
 
@@ -334,7 +334,7 @@ set(NN_BENCH_TARGETS "")   # 性能基准已移除（2026 清理：bench 工具�
 
 # ── 应用 / 探针 / 基准目标（NN_BUILD_APPS，默认 = 是否顶层工程）───────────
 # 嵌入消费方（add_subdirectory）默认 OFF：只拿库目标（neuralnet::nn），
-# 不被迫编译本仓 9 个可执行文件。需要复现应用时显式 -DNN_BUILD_APPS=ON。
+# 不被迫编译本仓 12 个可执行文件。需要复现应用时显式 -DNN_BUILD_APPS=ON。
 # ⚠ f16_writeback_probe 同时是 ctest 用例（见 NN_ENABLE_TESTS 块），故它
 #   单独按「任一开关」创建；其余 app 只看 NN_BUILD_APPS。
 if(NN_BUILD_APPS)
