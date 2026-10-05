@@ -2377,3 +2377,24 @@ A1 段改动前为 2424）、`include/neuralnet.cpp/compute_cpu_engine.hpp` **23
   `mnist_train` 切换）、DataLoader/流式（P2-4 后半）、`.nnpkg` 链路改造（用户裁定"先不管"，
   本轮只做了参数名级同步使其不红）。
 
+---
+
+# dataset_gen 编码进度条（2026-10-06）
+
+## encode_docs_parallel 增可选进度条 + 进度条构件下沉 nn::detail（原位置
+## include/neuralnet.cpp/domain_tokenizer_base.hpp 控制台进度条共享构件段、encode_docs_parallel；
+## src/dataset_gen.cpp build_subset）
+
+- 类型：演进记录
+- 内容：① 控制台进度条构件（`render_progress_bar`/`finish_progress_bar`，`\r` 原地刷新 40 格
+  条）从 `Tokenizer` protected static **下沉为 `nn::detail` 自由函数**——`encode_docs_parallel`
+  是 namespace 级自由函数，够不着类内 protected 成员；类内 `render_progress_`/`finish_progress_`
+  改为薄委托，tokenizer 训练（`bpe_train_impl_`/`parallel_pretokenize`）调用点零改动。②
+  `encode_docs_parallel` 增可选参数 `show_progress`/`label`（默认关，`dataset_test` 等既有
+  调用零变化）：并行/顺序两条路径都逐 doc `tick()`，原子完成数 + 锁内按 1% 节流渲染（多线程
+  并发完成不撕裂 `\r` 行），收尾 `finish_progress_bar`；关闭时零开销（tick 首行即返回）。③
+  `dataset_gen` 的 train/test 两个子集编码各开一条（label `Tokenize 训练集`/`Tokenize 测试集`），
+  原「Tokenize: N docs ...」单行提示删除（进度条自身带百分比）。多线程编码本身**未改**——
+  `encode_docs_parallel` 的分块并行（`nn::parallel_for_samples` 保序归位）原样保留，输出
+  逐字节不变（`dataset_test` 回归锁定）。
+

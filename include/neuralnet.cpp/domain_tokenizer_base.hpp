@@ -16,6 +16,7 @@
 #include <queue>
 #include <ranges>
 #include <regex>
+#include <mutex>
 #include <span>
 #include <sstream>
 #include <string>
@@ -30,6 +31,39 @@
 
 namespace nn
 {
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  控制台进度条共享构件（tokenizer 训练 / 逐 doc 并行 encode 共用）
+// ═══════════════════════════════════════════════════════════════════════════
+// 使用 \r 原地刷新当前行。
+// render_progress_bar 渲染进度；finish_progress_bar 结束并换行。
+namespace detail
+{
+
+// 渲染进度条：\r[label] [####----] 45% tail
+inline void render_progress_bar(std::string_view label,
+                                std::size_t cur, std::size_t total,
+                                std::string_view tail = {})
+{
+    constexpr std::size_t BAR_W = 40;
+    const auto denom = std::max<std::size_t>(total, 1);
+    const std::size_t filled = (total == 0) ? BAR_W
+        : std::min(BAR_W, cur * BAR_W / denom);
+    std::cout << '\r' << label << " [";
+    for (std::size_t i = 0; i < BAR_W; ++i)
+        std::cout << (i < filled ? '#' : '-');
+    const int pct = (total == 0) ? 100
+        : static_cast<int>(std::min<std::size_t>(100, cur * 100 / denom));
+    std::cout << "] " << pct << "% " << tail << std::flush;
+}
+
+// 结束进度条：覆盖为 "[label] 完成" 并换行
+inline void finish_progress_bar(std::string_view label)
+{
+    std::cout << '\r' << label << " 完成" << std::string(48, ' ') << '\n' << std::flush;
+}
+
+} // namespace detail
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Tokenizer — 抽象基类
@@ -606,9 +640,8 @@ protected:
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  控制台进度条共享构件
+    //  控制台进度条（构件实现在 nn::detail::render_progress_bar，此处薄委托）
     // ═══════════════════════════════════════════════════════════════════════════
-    // 使用 \r 原地刷新当前行。子类在 show_progress 时调用。
     // render_progress_ 渲染进度；finish_progress_ 结束并换行。
 
     // 渲染进度条：\r[label] [####----] 45% tail
@@ -616,22 +649,13 @@ protected:
                                  std::size_t cur, std::size_t total,
                                  std::string_view tail = {})
     {
-        constexpr std::size_t BAR_W = 40;
-        const auto denom = std::max<std::size_t>(total, 1);
-        const std::size_t filled = (total == 0) ? BAR_W
-            : std::min(BAR_W, cur * BAR_W / denom);
-        std::cout << '\r' << label << " [";
-        for (std::size_t i = 0; i < BAR_W; ++i)
-            std::cout << (i < filled ? '#' : '-');
-        const int pct = (total == 0) ? 100
-            : static_cast<int>(std::min<std::size_t>(100, cur * 100 / denom));
-        std::cout << "] " << pct << "% " << tail << std::flush;
+        detail::render_progress_bar(label, cur, total, tail);
     }
 
     // 结束进度条：覆盖为 "[label] 完成" 并换行
     static void finish_progress_(std::string_view label)
     {
-        std::cout << '\r' << label << " 完成" << std::string(48, ' ') << '\n' << std::flush;
+        detail::finish_progress_bar(label);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -923,29 +947,59 @@ protected:
 // 与原 text_train `parallel_tokenize` 同口径：每 doc 独立 encode（含空 token
 // doc——不丢行号），分块并行、结果按 doc 下标归位 ⇒ 任意并行度与顺序执行
 // 逐字节一致（铁律 #8）。doc 下标即 doc_id - 1，序号语义不变。
+// show_progress 时渲染控制台进度条（按完成 doc 数推进；输出不进任何字节锚）。
 [[nodiscard]] inline std::vector<std::vector<std::size_t>>
-encode_docs_parallel(const Tokenizer &tokenizer, const std::vector<std::string> &docs)
+encode_docs_parallel(const Tokenizer &tokenizer, const std::vector<std::string> &docs,
+                     bool show_progress = false, std::string_view label = "Tokenize")
 {
     std::vector<std::vector<std::size_t>> out(docs.size());
     const unsigned hw = std::thread::hardware_concurrency();
     const std::size_t n_threads = std::max<std::size_t>(hw, 1u);
+    const std::size_t total = docs.size();
+    if (total == 0) return out;
+
+    // 进度条：完成数原子累加 + 锁内按 1% 节流渲染（多线程并发完成也只刷百
+    // 分比变化的整数档，\r 行不被并发写撕裂）
+    std::atomic<std::size_t> done{0};
+    std::mutex progress_mu;
+    std::size_t last_pct = static_cast<std::size_t>(-1);
+    auto tick = [&]() {
+        if (!show_progress) return;
+        const std::size_t d = done.fetch_add(1, std::memory_order_relaxed) + 1;
+        std::lock_guard<std::mutex> lock(progress_mu);
+        const std::size_t pct = d * 100 / std::max<std::size_t>(total, 1);
+        if (pct != last_pct)
+        {
+            last_pct = pct;
+            detail::render_progress_bar(label, d, total);
+        }
+    };
 
     // 文档数太少时单线程（避免线程开销超过收益；与原逻辑同阈值）
-    if (docs.size() < n_threads * 64 || n_threads <= 1)
+    if (total < n_threads * 64 || n_threads <= 1)
     {
-        for (std::size_t i = 0; i < docs.size(); ++i)
+        for (std::size_t i = 0; i < total; ++i)
+        {
             out[i] = tokenizer.encode(docs[i]);
-        return out;
+            tick();
+        }
     }
-
-    const std::size_t chunk = (docs.size() + n_threads - 1) / n_threads;
-    const std::size_t n_chunks = (docs.size() + chunk - 1) / chunk;
-    parallel_for_samples(n_chunks, [&](std::size_t c) {
-        const std::size_t begin = c * chunk;
-        const std::size_t end = std::min(begin + chunk, docs.size());
-        for (std::size_t i = begin; i < end; ++i)
-            out[i] = tokenizer.encode(docs[i]);
-    });
+    else
+    {
+        const std::size_t chunk = (total + n_threads - 1) / n_threads;
+        const std::size_t n_chunks = (total + chunk - 1) / chunk;
+        parallel_for_samples(n_chunks, [&](std::size_t c) {
+            const std::size_t begin = c * chunk;
+            const std::size_t end = std::min(begin + chunk, total);
+            for (std::size_t i = begin; i < end; ++i)
+            {
+                out[i] = tokenizer.encode(docs[i]);
+                tick();
+            }
+        });
+    }
+    if (show_progress)
+        detail::finish_progress_bar(label);
     return out;
 }
 
