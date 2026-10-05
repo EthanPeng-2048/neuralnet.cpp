@@ -124,7 +124,8 @@ nn::Result<SubsetBuild> build_subset(const nn::Tokenizer &tokenizer,
                                      bool need_mask, std::string_view name)
 {
     SubsetBuild out;
-    out.docs = nn::encode_docs_parallel(tokenizer, docs);
+    out.docs = nn::encode_docs_parallel(tokenizer, docs, /*show_progress=*/true,
+                                        std::string("Tokenize ") + std::string(name));
     if (!need_mask)
         return out;
     for (const auto &toks : out.docs)
@@ -173,8 +174,7 @@ int main(int argc, char *argv[])
         test_lines = std::move(*test_lines_r);
     }
 
-    // ── tokenize（保序并行）+ 掩码 ────────────────────────────────
-    std::cout << "Tokenize: " << train_lines.size() << " docs ..." << std::endl;
+    // ── tokenize（保序并行 + 进度条）+ 掩码 ──────────────────────────
     auto train_r = build_subset(*tokenizer, train_lines, need_mask, "训练集");
     NN_EXIT(train_r, 1, "生成训练子集失败: ");
     std::optional<SubsetBuild> test_build;
