@@ -41,7 +41,10 @@ namespace nn
 //    [param matrices...]        模型权重
 //    [extra state matrices...]  非可学习状态（如 BatchNorm running 统计）
 //    [tokenizer_len 8B]         0 = 未嵌入
-//    [tokenizer data...]        分词表数据
+//    [tokenizer data...]        词表数据（**按模型版本分派**：
+//                               v5 及以下 = 内嵌 JSON 字符串（模型格式的一部分，
+//                               照常读取、零破坏）；v6 起 = .nnvocab 文件镜像
+//                               字节（[label "NNVC"][词表 kvrec v2]））
 //
 //  文件格式 v4+ 自描述（长度前缀 + KeyValueRecord）；v1/v2/v3 偏移量定长
 //  格式在 header 校验阶段（read_and_validate_header）即拒绝。
@@ -50,7 +53,10 @@ namespace nn
 // ═══════════════════════════════════════════════════════════════════════════
 
 inline constexpr uint32_t MODEL_MAGIC    = 0x4E4E4E4E;  // "NNNN"
-inline constexpr uint32_t MODEL_VERSION  = 5;            // v5: per-tensor precision tags
+// v6: 内嵌词表改为 .nnvocab kvrec（v5 及以下仍读其内嵌 JSON，见上）。
+// ⚠ 版本号抢号提示：roadmap P1-2（checkpoint 优化器状态）也计划 5 → 6；
+//   谁先落地谁占 6，另一项顺延（docs/development/19-unified-dataset.md §7）。
+inline constexpr uint32_t MODEL_VERSION  = 6;
 
 // ── 已知缺口：.bin 全文件无校验和 ─────────────────────────────────────────
 // 内容损坏会被静默载入错误权重且无感知（.nnpkg 有 sha256，模型 .bin 没有）。
@@ -461,14 +467,16 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
     return version;
 }
 
-// ── Tokenizer JSON 读写 ──────────────────────────────────────────────
+// ── Tokenizer 数据读写（长度前缀字节块；内容按模型版本分派）────────────
+// v5 及以下 = JSON 字符串；v6 起 = .nnvocab 文件镜像字节。
+// 本层只搬字节，解释权在调用方（load_tokenizer_from_model_blob）。
 
-[[nodiscard]] inline Result<void> write_tokenizer(std::ofstream &ofs, const std::string &json)
+[[nodiscard]] inline Result<void> write_tokenizer(std::ofstream &ofs, const std::string &data)
 {
-    NN_TRY(r, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(json.size())));
-    if (!json.empty())
+    NN_TRY(r, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(data.size())));
+    if (!data.empty())
     {
-        ofs.write(json.data(), static_cast<std::streamsize>(json.size()));
+        ofs.write(data.data(), static_cast<std::streamsize>(data.size()));
         if (!ofs)
             NN_FAIL("Write error while writing tokenizer");
     }
@@ -484,11 +492,11 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
     const auto len = static_cast<std::size_t>(*len_r);
     if (len == 0) return std::string{};  // 未嵌入
 
-    std::string json(len, '\0');
-    ifs.read(json.data(), static_cast<std::streamsize>(len));
+    std::string data(len, '\0');
+    ifs.read(data.data(), static_cast<std::streamsize>(len));
     if (!ifs)
         NN_FAIL("Unexpected end while reading tokenizer data");
-    return json;
+    return data;
 }
 
 } // namespace detail
@@ -505,7 +513,7 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
 // 参数为 Tensor*，通过 engine.to_matrix 下载到 CPU 后写入。
 // v5 格式：每个矩阵前加 1B precision tag（0=f32, 2=f16）。
 [[nodiscard]] inline Result<void> save_model(const std::string &filename,
-    Model &model, const ModelSpec &spec, const std::string &tokenizer_json = {})
+    Model &model, const ModelSpec &spec, const std::string &tokenizer_data = {})
 {
     std::ofstream ofs(filename, std::ios::binary);
     if (!ofs)
@@ -548,8 +556,8 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
         NN_TRY(r, detail::write_matrix_v5(ofs, *m, e_tensor.get().precision()));
     }
 
-    // tokenizer JSON（长度前缀，0 表示无）
-    NN_TRY(r3, detail::write_tokenizer(ofs, tokenizer_json));
+    // tokenizer 数据（长度前缀，0 = 未嵌入；v5=JSON / v6=.nnvocab，按版本分派）
+    NN_TRY(r3, detail::write_tokenizer(ofs, tokenizer_data));
     if (!ofs)
         NN_FAIL("Write error while saving model to: " + filename);
     return {};
@@ -567,10 +575,12 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
 }
 
 // ── 加载参数 + tokenizer ───────────────────────────────────────────────
-//    返回嵌入的 tokenizer 数据字符串（空串 = 未嵌入）
+//    返回嵌入的 tokenizer 数据（空串 = 未嵌入）；version_out 可取回文件
+//    版本，用于词表数据的 v5(JSON)/v6(.nnvocab kvrec) 分派。
 // v5：per-tensor precision tag（读取时自动识别 f32/f16）
 // v4：无 precision tag（所有矩阵为 f32）
-[[nodiscard]] inline Result<std::string> load_model(const std::string &filename, Model &model)
+[[nodiscard]] inline Result<std::string> load_model(const std::string &filename, Model &model,
+                                                   uint32_t *version_out = nullptr)
 {
     std::ifstream ifs(filename, std::ios::binary);
     if (!ifs)
@@ -578,6 +588,7 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
     auto version_r = detail::read_and_validate_header(ifs);
     NN_TRY_CHECK(version_r);
     const uint32_t version = *version_r;
+    if (version_out) *version_out = version;
 
     // 读取并校验规格头
     auto spec_r = detail::read_spec_header(ifs, version);
@@ -647,17 +658,17 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
         }
     }
 
-    // 读取 tokenizer
-    std::string tokenizer_json;
+    // 读取 tokenizer 数据（v5=JSON / v6=.nnvocab kvrec，解释权在调用方）
+    std::string tokenizer_data;
     {
         auto tok_r = detail::read_tokenizer(ifs);
         NN_TRY_CHECK(tok_r);
-        tokenizer_json = std::move(*tok_r);
+        tokenizer_data = std::move(*tok_r);
     }
 
     if (!ifs)
         NN_FAIL("Read error while loading model from: " + filename);
-    return tokenizer_json;
+    return tokenizer_data;
 }
 
 } // namespace nn

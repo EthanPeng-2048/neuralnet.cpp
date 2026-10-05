@@ -670,6 +670,26 @@ load_tokenizer_from_bytes(const std::string &content)
     NN_FAIL("无法识别的词表数据（既不是 .nnvocab 也不是 JSON 词表）");
 }
 
+// 模型内嵌词表按**模型版本**分派（模型格式的一部分，零破坏）：
+// v5 及以下 = 内嵌 JSON 字符串；v6 起 = .nnvocab 文件镜像字节（kvrec v2）。
+//（版本常量在 model_serialization.hpp 的 MODEL_VERSION；此处按字面 6 分派，
+//  避免分词器域反向依赖模型序列化头。）
+[[nodiscard]] inline Result<std::unique_ptr<Tokenizer>>
+load_tokenizer_from_model_blob(const std::string &content, std::uint32_t model_version)
+{
+    if (content.empty())
+        NN_FAIL("模型未嵌入词表数据");
+    if (model_version >= 6)
+    {
+        NN_TRY(rec, parse_nnvocab(content));
+        return load_tokenizer_from_kvrec(*rec);
+    }
+    auto tok = load_tokenizer_from_string(content);
+    if (!tok)
+        NN_FAIL("无法识别分词器类型（模型内嵌 JSON 词表）");
+    return tok;
+}
+
 // 从 .nnvocab 词表文件创建已加载的 tokenizer。
 // 旧 JSON 词表不直读：报错并提示 `dataset_convert vocab`（裁决 #7）。
 [[nodiscard]] inline Result<std::unique_ptr<Tokenizer>>

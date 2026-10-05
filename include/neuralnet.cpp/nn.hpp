@@ -41,6 +41,7 @@
 #include "model_container.hpp"
 #include "model_spec.hpp"
 #include "model_serialization.hpp"
+#include "dataset.hpp"
 
 // L4 构建层
 #include "domain_mnist.hpp"
