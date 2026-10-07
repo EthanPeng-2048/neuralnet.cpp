@@ -375,7 +375,7 @@ loss      = −(1/batch) Σ target · log_sm
 ## Optimizer 篇
 
 > **实现方式**：优化器全部用 `dsl::compute` / `dsl::compute_into`（`compute_optimizer.hpp`），
-> 一次表达式 = 一条融合 kernel；逐元素计算不走 eager 原语——引擎只提供 49 个 virtual 方法，
+> 一次表达式 = 一条融合 kernel；逐元素计算不走 eager 原语——引擎只提供 52 个 virtual 方法，
 > 逐元素/广播/条件选择一律经表达式 DSL 执行。
 > 下面每条 "DSL 表达式" 即 `step()` 里的真实写法（`leaf` = 输入张量，`rparam` = 标量常量）。
 

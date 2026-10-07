@@ -402,11 +402,19 @@ public:
         const std::size_t t_next = t_ + 1;
         const auto [inv_bc1, inv_bc2] = bias_correction_(t_next);
 
+        // IR-C（P2，2026-10-06）：整个步进录制为一张图——每参数的 K1/K2 状态
+        // 写穿 + K3 中间量 + K4 目标传递融合为**每张量一个多输出 kernel**（f32
+        // 下 4 节点金刚石单 kernel 3 extras；混精度按门禁自动分裂），替代逐表达式
+        // 数百个小 dispatch（P2 前实测 266 设备 kernel/步、host 提交 4.5ms/步）。
+        // CPU begin/end 为 no-op（行为不变）；NN_EXPR_SCAN 下本段把复合 spec
+        // 登记进闭合世界（scan_exprs 的优化器 dry-run 正是经此登记）。
+        NN_TRY(b, engine_.begin_expr());
+        ExprSegment seg(engine_);
         for (std::size_t i = 0; i < params_.size(); ++i)
         {
-            auto r = adam_update_(i, inv_bc1, inv_bc2);
-            NN_TRY_CHECK(r);
+            NN_TRY(ur, adam_update_(i, inv_bc1, inv_bc2));
         }
+        NN_TRY_CHECK(seg.end());
         t_ = t_next;  // 全部参数成功才推进步数（失败时不推进）
         return {};
     }
@@ -455,20 +463,26 @@ public:
         const auto [inv_bc1, inv_bc2] = bias_correction_(t_next);
         const Scalar decay_factor = Scalar{1} - lr_ * wd_;
 
+        // IR-C（P2）：同 Adam——整个步进录制为一张图。⚠ decay 与 adam_update_
+        // 是**同目标（p）的两次 compute_into、无数据依赖边**：执行序 = 节点序
+        // （稳定拓扑序保持列表序），故 decay 必须写在 adam_update_ 之前
+        // （先衰减后更新 = AdamW 语义）；两者不连通 → 各自独立 kernel，天然
+        // 顺序执行，不会同 kernel 双写 p。
+        NN_TRY(b, engine_.begin_expr());
+        ExprSegment seg(engine_);
         for (std::size_t i = 0; i < params_.size(); ++i)
         {
             // 权重衰减解耦：p = (1 - lr*wd) * p（目标传递：原地、单 dispatch）
             if (wd_ != Scalar{0})
             {
-                auto r = dsl::compute_into(engine_,
-                    dsl::leaf(params_[i]) * dsl::rparam(decay_factor), params_[i]);
-                NN_TRY_CHECK(r);
+                NN_TRY(dr, dsl::compute_into(engine_,
+                    dsl::leaf(params_[i]) * dsl::rparam(decay_factor), params_[i]));
             }
 
             // Adam 更新
-            auto r = adam_update_(i, inv_bc1, inv_bc2);
-            NN_TRY_CHECK(r);
+            NN_TRY(ur, adam_update_(i, inv_bc1, inv_bc2));
         }
+        NN_TRY_CHECK(seg.end());
         t_ = t_next;  // 全部参数成功才推进步数（失败时不推进）
         return {};
     }

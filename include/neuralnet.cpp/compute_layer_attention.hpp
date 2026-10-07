@@ -338,9 +338,22 @@ public:
         auto t = detail::upload_span(engine, 1, BH * seq, Precision::F32, std::span(d));
         NN_TRY_CHECK(t);
         doc_ids_cache_ = std::move(*t);
-        auto tc = detail::upload_span(engine, BH * seq, 1, Precision::F32, std::span(d));
-        NN_TRY_CHECK(tc);
-        doc_col_ = std::move(*tc);
+        if (doc_ids_cache_.is_gpu())
+        {
+            // GPU：复用同一份上传数据，在设备内完成形状变换，避免第二次
+            // staging upload 触发 batch drain。
+            auto tc = engine.transpose(doc_ids_cache_);
+            NN_TRY_CHECK(tc);
+            doc_col_ = std::move(*tc);
+        }
+        else
+        {
+            // CPU：直接构造目标形状，避免为一个小表引入额外转置遍历。
+            auto tc = detail::upload_span(engine, BH * seq, 1, Precision::F32,
+                                          std::span(d));
+            NN_TRY_CHECK(tc);
+            doc_col_ = std::move(*tc);
+        }
         return {};
     }
 

@@ -459,6 +459,12 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(expr_cpu_test src/expr_cpu_test.cpp)
     list(APPEND NN_TEST_TARGETS expr_cpu_test)
 
+    # ── 图 IR + 融合分析（IR-C，纯 CPU：链融合/边界/确定性/matmul 参与）──
+    # 2026-10-06 随 IR-C 恢复（git 8f2990f^ 旧测试移植，见 docs/history.md
+    # 「IR-C 定位修正与恢复立项」）
+    nn_add_executable(expr_graph_test src/expr_graph_test.cpp)
+    list(APPEND NN_TEST_TARGETS expr_graph_test)
+
     # ── 表达式/IR GPU（图融合端到端 + AOT shader 验证 + 表达式求值）────
     nn_add_executable(expr_gpu_test src/expr_gpu_test.cpp)
     list(APPEND NN_TEST_TARGETS expr_gpu_test)
@@ -896,6 +902,22 @@ if(Vulkan_FOUND)
                      COMMAND fusion_custom_layer_example)
             set_tests_properties(fusion_custom_layer_example
                 PROPERTIES SKIP_RETURN_CODE 77)
+
+            # ── IR-C 图融合 GPU 端到端（2026-10-06 随 IR-C 恢复）──────────
+            # begin_expr/end_expr 录制 → fuse_expr_graph 融合 → 复合 kernel
+            # 写回 tail 占位的闭环验证。走 nn_enable_gpu_fusion 专属 registry：
+            # 测试 TU 的 NN_EXPR_SCAN 静态初始化 dry-run 把录制段的复合 spec
+            # 登记进 global_registry（与运行期同跑 fuse_expr_graph，闭合世界
+            # 两端一致）。手工注册原因同上（注册循环早于 Vulkan 探测）。
+            nn_add_executable(expr_fuse_test src/expr_fuse_test.cpp src/expr_fuse_shapes.cpp)
+            target_compile_definitions(expr_fuse_test PRIVATE NN_HAS_VULKAN)
+            target_link_libraries(expr_fuse_test PRIVATE Vulkan::Vulkan)
+            nn_enable_gpu_fusion(expr_fuse_test
+                MAIN ${CMAKE_CURRENT_SOURCE_DIR}/src/expr_fuse_test.cpp)
+            set_target_properties(expr_fuse_test PROPERTIES
+                RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test)
+            add_test(NAME expr_fuse_test COMMAND expr_fuse_test)
+            set_tests_properties(expr_fuse_test PROPERTIES SKIP_RETURN_CODE 77)
         endif()
 
         message(STATUS "GPU acceleration enabled (Vulkan compute)")
@@ -918,8 +940,9 @@ endif()
 # 候选目标的编译条件逐项相同（nn_core 的 include + NN_HAS_VULKAN +
 # generated/ + Vulkan include），因此**一份 PCH 全目标共享**（REUSE_FROM）。
 # 代价对比（本机 Debug 全量构建）：31 份逐目标 PCH ≈ 780s CPU → 1 份。
-# ⚠ 例外：`fusion_custom_layer_example` 经 `nn_enable_gpu_fusion` 多出
-#   自己的产物目录（BEFORE include），条件不匹配 → 单独一份，不能 REUSE。
+# ⚠ 例外：`fusion_custom_layer_example` / `expr_fuse_test` 经
+#   `nn_enable_gpu_fusion` 多出自己的产物目录（BEFORE include），条件不匹配
+#   → 各自单独一份，不能 REUSE。
 if(NN_ENABLE_PCH AND NN_PCH_CANDIDATES)
     add_library(nn_pch OBJECT ${CMAKE_CURRENT_SOURCE_DIR}/cmake/nn_pch_stub.cpp)
     target_link_libraries(nn_pch PRIVATE nn_core)
@@ -939,7 +962,7 @@ if(NN_ENABLE_PCH AND NN_PCH_CANDIDATES)
 
     set(NN_PCH_OWN_TARGETS "")
     foreach(_pch_tgt IN LISTS NN_PCH_CANDIDATES)
-        if(_pch_tgt STREQUAL "fusion_custom_layer_example")
+        if(_pch_tgt STREQUAL "fusion_custom_layer_example" OR _pch_tgt STREQUAL "expr_fuse_test")
             target_precompile_headers(${_pch_tgt} PRIVATE [["neuralnet.cpp/nn.hpp"]])
             list(APPEND NN_PCH_OWN_TARGETS ${_pch_tgt})
         else()

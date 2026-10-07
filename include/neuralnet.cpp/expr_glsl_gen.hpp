@@ -16,6 +16,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <sstream>
 #include <string>
 
@@ -151,6 +152,11 @@ inline std::string glsl_view_read_(const ExprView& v, std::uint32_t buf_id,
         return buf + "[(" + "vp" + std::to_string(vp_slot + 1) + " + ("
                + row_var + " % vp" + std::to_string(vp_slot) + ")) * cols + "
                + col_var + "]";
+    case static_cast<uint8_t>(ExprViewKind::Transpose):
+        // 转置读：data[col*stride + row]（stride = 存储行距，运行期 vp 槽）。
+        // 与 Linear 同为裸读（f16 外层转换由调用方负责）。
+        return buf + "[" + col_var + " * vp" + std::to_string(vp_slot) + " + "
+               + row_var + "]";
     case static_cast<uint8_t>(ExprViewKind::GroupedReduceSum):
     case static_cast<uint8_t>(ExprViewKind::GroupedReduceMax):
         // 分组归约：输出行 r → 输入组行 [r*R, (r+1)*R)，列不变。
@@ -302,7 +308,8 @@ inline void glsl_emit_grouped_reduce_helpers(std::ostringstream& os,
 
 // ── 视图是否使用行/列索引（用于按需发射 row/col，省去每元素整数除法/取模）──
 // Linear 用扁平索引、RowBroadcast 用 row、ColBroadcast 用 col、
-// RowMod/RotateHalf 用 row+col（索引映射逐元素变化，见 glsl_view_read）。
+// RowMod/RotateHalf 用 row+col（索引映射逐元素变化，见 glsl_view_read）、
+// Transpose 用 row+col（data[col*stride+row]）。
 inline bool glsl_view_uses_row(ExprViewKind k)
 {
     return k != ExprViewKind::Linear && k != ExprViewKind::ColBroadcast &&
@@ -917,6 +924,57 @@ inline std::string generate_glsl_fold(const std::string& name, const ExprSpec& s
         if (expr_op_is_reduce(static_cast<ExprOp>(ins.op)))
             is_block_reduce[ins.dst] = 1;
 
+    // ── 归约输入内联（通用生成优化，2026-10-06）─────────────────────────
+    // 块归约的元素源若**只被归约消费**（可沿 def 链传递），把其定义表达式
+    // 逐 kb 重算、直接内联进归约循环——省掉 e{n}[BLOCK] 物化（动态下标私有
+    // 数组在多数驱动落 local memory：实测 CE 的 logsumexp fold 因此慢 2.4×）
+    // 与多余的整块扫趟（4 趟 → 2 趟）。内联重算与逐指令物化是**同一表达式
+    // 同一 kb 序**求值 → 逐位一致（铁律 8）；"唯一消费者"约束保证每 kb 恰算
+    // 一次（表达式纯，无副作用重复求值问题）。
+    std::vector<uint8_t> inlineable(spec.num_regs, 0);
+    {
+        std::vector<int> use_count(spec.num_regs, 0);
+        std::vector<int> single_use(spec.num_regs, -1);
+        for (std::size_t ii = 0; ii < f.body.size(); ++ii)
+        {
+            const auto& ins = f.body[ii];
+            const ExprOp op = static_cast<ExprOp>(ins.op);
+            const std::size_t nops = expr_op_is_reduce(op) ? 1
+                : expr_instr_num_operands(op);
+            const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
+            for (std::size_t oi = 0; oi < nops; ++oi)
+            {
+                const auto k = static_cast<ExprOperandKind>(ops[oi]->kind);
+                if ((k == ExprOperandKind::Reg || k == ExprOperandKind::Fanout) &&
+                    ops[oi]->idx < spec.num_regs)
+                {
+                    ++use_count[ops[oi]->idx];
+                    single_use[ops[oi]->idx] = static_cast<int>(ii);
+                }
+            }
+        }
+        // 不动点：唯一消费者是块归约、或其唯一消费所在指令自身已内联 → 可内联
+        bool changed = true;
+        while (changed)
+        {
+            changed = false;
+            for (std::uint32_t r = 0; r < spec.num_regs; ++r)
+            {
+                if (!is_elem[r] || inlineable[r] || use_count[r] != 1)
+                    continue;
+                const ExprInstr& u = f.body[static_cast<std::size_t>(single_use[r])];
+                const bool via_reduce =
+                    expr_op_is_reduce(static_cast<ExprOp>(u.op));
+                const bool via_inlined = is_elem[u.dst] && inlineable[u.dst];
+                if (via_reduce || via_inlined)
+                {
+                    inlineable[r] = 1;
+                    changed = true;
+                }
+            }
+        }
+    }
+
     std::ostringstream L;
     L << "// ── 自动生成（AOT 算子融合 · fold 分块状态归约），请勿手动编辑 ──\n";
     L << "// 表达式: " << name << "\n";
@@ -967,8 +1025,11 @@ inline std::string generate_glsl_fold(const std::string& name, const ExprSpec& s
     L << "    if (row >= rows) return;\n";
 
     // 寄存器物化（元素类 = 块内数组；其余 = 标量）+ 块归约行标量
+    // （可内联元素寄存器不物化：消费点归约循环内逐 kb 重算）
     for (std::uint32_t r = 0; r < spec.num_regs; ++r)
     {
+        if (is_elem[r] && inlineable[r])
+            continue;
         if (is_elem[r])
             L << "    float e" << r << "[" << EXPR_FOLD_BLOCK << "];\n";
         else
@@ -1055,6 +1116,50 @@ inline std::string generate_glsl_fold(const std::string& name, const ExprSpec& s
         L << dst_str << " = " << glsl_unary_op(op) << "(" << a << ");\n";
     };
 
+    // ── 内联表达式文本（递归展开可内联元素寄存器；与 emit_assign 同形）────
+    const auto def_of = [&](std::uint32_t r) -> const ExprInstr*
+    {
+        for (const auto& d : f.body)
+            if (d.dst == r)
+                return &d;
+        return nullptr;
+    };
+    std::function<std::string(const ExprOperand&, const std::string&)> opnd_inl;
+    std::function<std::string(const ExprInstr&, const std::string&)> expr_inl;
+    opnd_inl = [&](const ExprOperand& o, const std::string& kbv) -> std::string
+    {
+        if ((o.kind == static_cast<uint8_t>(ExprOperandKind::Reg) ||
+             o.kind == static_cast<uint8_t>(ExprOperandKind::Fanout)) &&
+            o.idx < spec.num_regs && is_elem[o.idx] && inlineable[o.idx])
+        {
+            if (const ExprInstr* d = def_of(o.idx))
+                return expr_inl(*d, kbv);
+        }
+        return operand(o, kbv);
+    };
+    expr_inl = [&](const ExprInstr& ins, const std::string& kbv) -> std::string
+    {
+        const ExprOp op = static_cast<ExprOp>(ins.op);
+        const std::string a = opnd_inl(ins.a, kbv);
+        if (op == ExprOp::Select)
+            return "((" + a + " != 0.0) ? " + opnd_inl(ins.b, kbv) + " : "
+                   + opnd_inl(ins.c, kbv) + ")";
+        if (op == ExprOp::Max || op == ExprOp::Min)
+            return std::string(op == ExprOp::Max ? "max" : "min") + "(" + a
+                   + ", " + opnd_inl(ins.b, kbv) + ")";
+        bool cmp = false;
+        const char* s = glsl_binary_op(op, cmp);
+        if (s && *s)
+        {
+            const std::string b = opnd_inl(ins.b, kbv);
+            return cmp ? ("((" + a + " " + s + " " + b + ") ? 1.0 : 0.0)")
+                       : ("(" + a + " " + s + " " + b + ")");
+        }
+        if (op == ExprOp::Neg)
+            return "(-(" + a + "))";
+        return std::string(glsl_unary_op(op)) + "(" + a + ")";
+    };
+
     // ── 块循环（k0 步进 BLOCK；valid gate 尾块——与 CPU 同序）──────────
     L << "\n    // 分块收缩轴（与 CPU eval_fold 同分块同序 → 逐位一致）\n";
     L << "    for (uint k0 = 0u; k0 < fold_k; k0 += " << EXPR_FOLD_BLOCK << "u) {\n";
@@ -1073,22 +1178,45 @@ inline std::string generate_glsl_fold(const std::string& name, const ExprSpec& s
             //   时算出 blk_m=-inf → dm = m_old − m = −inf−−inf = **NaN** →
             //   l/O 全污染（fold 分块状态进位特有；两趟式对整行求 m 不触发）。
             //   lowest() 有限 → dm=−inf → exp(−inf)=0，全屏蔽块贡献恒 0，语义正确。
+            // 归约源是可内联元素寄存器 → 表达式逐 kb 重算内联（无 e[] 物化）
+            const bool src_inlined =
+                (ins.a.kind == static_cast<uint8_t>(ExprOperandKind::Reg) ||
+                 ins.a.kind == static_cast<uint8_t>(ExprOperandKind::Fanout)) &&
+                ins.a.idx < spec.num_regs && is_elem[ins.a.idx] &&
+                inlineable[ins.a.idx];
+            const auto src_at = [&](const std::string& kbv) {
+                return src_inlined ? expr_inl(*def_of(ins.a.idx), kbv)
+                                   : operand(ins.a, kbv);
+            };
+            // ── 循环剥离 + 预取（软件流水，通用）─────────────────────────
+            // 直写 `acc = acc + f(load(kb))` 是逐迭代 load→f→add 的**串行依赖
+            // 链**（动态 valid 抑制编译器自动流水）：实测 fold v1 因此比同工作
+            // 量的归约 kernel 慢 ~3×（16K 线程 × 16K 迭代 × 数百周期延迟隐藏
+            // 不了）。剥离首迭代、把 kb+1 的源表达式先算进 vn 再累加 v（上一
+            // 迭代值）——访存/表达式求值与累加重叠。**累加序仍为 kb 升序逐个
+            // 累加 → 与 CPU eval_fold 逐位一致**（铁律 8）。
             L << "        { float acc = "
               << (is_max ? "uintBitsToFloat(0xFF7FFFFFu)" : "0.0")
               << ";\n";
-            L << "          for (uint kb = 0u; kb < valid; ++kb) {\n";
-            const std::string src = operand(ins.a, "kb");
+            L << "          float v = " << src_at("0u") << ";\n";
+            L << "          for (uint kb = 1u; kb < valid; ++kb) {\n";
+            L << "            const float vn = " << src_at("kb") << ";\n";
             L << "            acc = "
-              << (is_max ? ("max(acc, " + src + ")")
-                         : ("(acc + " + src + ")"))
-              << ";\n";
+              << (is_max ? "max(acc, v)" : "(acc + v)") << ";\n";
+            L << "            v = vn;\n";
             L << "          }\n";
+            L << "            acc = "
+              << (is_max ? "max(acc, v)" : "(acc + v)") << ";\n";
             L << "          red" << dst_r << " = acc; }\n";
         }
         else if (!is_elem[ins.dst])
         {
             L << "        ";
             emit_assign(ins, "r" + dst_r, "0u");
+        }
+        else if (inlineable[ins.dst])
+        {
+            // 可内联元素临时：不物化（消费点归约循环内逐 kb 重算）
         }
         else
         {
@@ -1650,12 +1778,22 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
 // 形态覆盖：纯逐元素、前置 matmul 段、fold 段（v1/v2）、归约 kernel
 // （generate_glsl_reduce，读写点按 sig 转换）。仍返回空串的情形：归约混合轴
 // （== -2）、归约槽过多（>8）等 → 上层跳过该变体，运行时回退，正确性不受影响。
+// batched=true → **P3 批量变体**（键 = key#b）：同结构多实例一次派发——
+//      缓冲声明改为"实例表 + buffer reference + 名字宏"、main 序言按
+//      gl_WorkGroupID.y 取实例、强制标量路径；PC 布局与 V0 完全一致。
+//      仅纯逐元素（expr_spec_batchable）+ V0 全 f32，其余返回空串。
 //
 // native16 恒走**标量 kernel**（vec4 的 f16vec4 向量化路径留作后续优化）——
 // 对应变体的 FusedShader.vec_width 必须为 1（fused_generate.hpp 同源判定）。
 inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
-                                 ExprPrecSig sig = 0, bool native16 = false)
+                                 ExprPrecSig sig = 0, bool native16 = false,
+                                 bool batched = false)
 {
+    // P3 批量变体（键 = key#b）：纯逐元素 + 仅 V0 全 f32。其余形态返回空串
+    // （上层 [skip]，运行期逐 kernel 降级，不是错误）。资格判据与
+    // fused_generate / execute_fused_graph 同源（expr_spec_batchable）。
+    if (batched && (sig != 0 || native16 || !expr_spec_batchable(spec)))
+        return {};
     if (native16 && !expr_prec_sig_native16(spec, sig))
         return {};
     if (sig != 0)
@@ -1677,6 +1815,11 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
 
     const std::size_t n_inputs = spec.views.size();
     const bool disp = expr_prec_sig_is_dispatch(sig);
+    // P2 多输出（extras，IR-C 写穿物化）：仅 V0（全 f32）生成——`#x` 分派/
+    // typed/native16 变体跳过（返回空串 = 上层 [skip]，该结构运行时只走 V0；
+    // 多输出节点同精度融合由 fuse_expr_graph 的精度门禁保证）。
+    if (!spec.extras.empty() && (disp || sig != 0 || native16))
+        return {};
     std::ostringstream L;
     const auto in_type = [&](std::size_t i) -> const char*
     {
@@ -1691,8 +1834,16 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
         L << "   [精度 " << expr_prec_sig_str(sig, n_inputs) << "]";
     else if (disp)
         L << "   [运行期精度分派]";
+    else if (batched)
+        L << "   [批量 #b：实例表 + buffer device address]";
     L << "\n";
     L << "#version 450\n\n";
+    if (batched)
+        // buffer reference（P3 实例表按 64 位设备地址解引用输入/输出缓冲）；
+        // uvec2 槽位 → reference 的构造另需 GL_EXT_buffer_reference_uvec2
+        // （glslc 强制，缺则 "required extension not requested"）。
+        L << "#extension GL_EXT_buffer_reference : require\n"
+             "#extension GL_EXT_buffer_reference_uvec2 : require\n\n";
     if (any_f16)
         L << "#extension GL_EXT_shader_16bit_storage : require\n\n";
     if (native16)
@@ -1704,6 +1855,42 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
     L << "layout(local_size_x = 256) in;\n\n";
 
     // 逐输入/输出的存储类型
+    if (batched)
+    {
+        // ── P3 批量变体缓冲声明：实例表 + buffer reference + 名字宏 ──────
+        // 实例记录布局（uvec2 数组，stride **S = n_inputs + 1 + n_extras + 1**，
+        // 每实例一段，实例下标 = gl_WorkGroupID.y）：
+        //   槽 [0, n_inputs)               第 j 个输入缓冲的设备地址（b<j>）
+        //   槽 n_inputs                    主输出缓冲地址（bout）
+        //   槽 [n_inputs+1, +n_extras)     extras 输出地址（bex<k>，成员序）
+        //   槽 S-1 = (count, cols)         尾槽：本实例元素数 + 本实例列数
+        // 尾槽 y 分量即每实例列数（`#define cols` 见 PC 块后）：批量组键与
+        // rows/cols 无关（同组形状可不同），列数必须随实例走，不能用 PC 的
+        // 单一 cols 槽。宏把普通版的缓冲名 b<i>/bout/bex<k> 映射到"实例 ib
+        // 的第 j 槽地址"——视图读取（glsl_view_read）与输出写回的渲染与普通
+        // 版逐字一致（RowGather 的 b<param> 标签槽同样覆盖）。
+        // `ib` 必须是模块级变量：gr_r<i> 辅助函数也经宏访问实例表。
+        L << "// P3 批量派发：实例表槽位 = 输入…、输出…、(count,cols)；"
+             "stride S = " << (n_inputs + 2 + spec.extras.size()) << "\n";
+        L << "layout(buffer_reference, std430) readonly buffer F32BufR "
+             "{ float d[]; };\n";
+        L << "layout(buffer_reference, std430) buffer F32BufW "
+             "{ float d[]; };\n";
+        L << "layout(std430, binding = 0) readonly buffer Inst "
+             "{ uvec2 inst[]; };\n";
+        L << "uint ib;   // 模块级 per-invocation 私有（gr_r<> 辅助函数也用）\n";
+        for (std::size_t i = 0; i < n_inputs; ++i)
+            L << "#define b" << i << " (F32BufR(inst[ib + " << i
+              << "u]).d)\n";
+        L << "#define bout (F32BufW(inst[ib + " << n_inputs << "u]).d)\n";
+        for (std::size_t k = 0; k < spec.extras.size(); ++k)
+            L << "#define bex" << k << " (F32BufW(inst[ib + "
+              << (n_inputs + 1 + k) << "u]).d)\n";
+        L << "\n";
+    }
+    else
+    {
+    // 非批量：per-binding 声明（发射文本与历史逐字一致）
     for (std::size_t i = 0; i < n_inputs; ++i)
     {
         L << "layout(std430, binding = " << i << ") readonly buffer Buf" << i
@@ -1723,7 +1910,14 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
     {
         L << "layout(std430, binding = " << n_inputs
           << ") writeonly buffer BufOut { " << (out_f16 ? "float16_t" : "float")
-          << " bout[]; };\n\n";
+          << " bout[]; };\n";
+        // P2 多输出：额外输出缓冲（V0 专属，类型恒 float——sig==0 ⇒ out_f16=0）
+        for (std::size_t k = 0; k < spec.extras.size(); ++k)
+            L << "layout(std430, binding = " << (n_inputs + 1 + k)
+              << ") writeonly buffer BufOut" << (k + 1)
+              << " { float bex" << k << "[]; };\n";
+        L << "\n";
+    }
     }
 
     // push constants：count + cols（视图行/列）+ [prec] + 运行时视图参数 vp + 常量
@@ -1743,6 +1937,16 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
         L << "    float rp" << i << ";\n";
     L << "};\n\n";
 
+    if (batched)
+    {
+        // 每实例列数：实例表尾槽 (count, cols) 的 y 分量。同组实例形状可不同
+        // （批量组键与 rows/cols 无关），故主体与 gr_r<i> 辅助函数里的 `cols`
+        // 一律取本实例值——宏放在 PC 块之后（PC 布局与 V0 逐字一致，批量路径
+        // 不读其 count/cols 两槽）、辅助函数之前（它们也用 `cols`）。
+        L << "#define cols ((inst[ib + "
+          << (n_inputs + 1 + spec.extras.size()) << "u]).y)\n\n";
+    }
+
     // 分组归约视图（MaxPool 等）的读取辅助函数：R 是运行期 vp 参数 → 循环。
     // 与 glsl_view_read 的 GroupedReduceSum/Max 分支成对（编译器把 `gr_r<i>`
     // 调用点连到这里；漏发 = 未声明函数，glslc 立刻报错而非静默错值）。
@@ -1751,7 +1955,8 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
     // native16 恒走标量 kernel（f16vec4 向量化路径留作后续优化）——
     // vec_width 元数据必须同源为 1（gen_fused 对 ALU 变体同判，否则
     // dispatch 按 4 宽派发而 kernel 按 1 宽算 → 静默只算 1/4 元素）。
-    const bool vec4_ok = glsl_vec4_eligible(spec) && !native16;
+    // 批量变体同理恒标量（实例表按元素下标派发，无 vec4 快路径）。
+    const bool vec4_ok = glsl_vec4_eligible(spec) && !native16 && !batched;
     // 索引操作数（Row/Col/Batch）也按需发射 row/col/batch 变量
     const auto instr_uses = [&](uint8_t kind) {
         for (const auto& ins : spec.instrs)
@@ -1899,8 +2104,23 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
     {
         // ── 纯标量 kernel（含 RowMod/RotateHalf 等无法向量化的视图）──
         L << "void main()\n{\n";
-        L << "    const uint i = gl_GlobalInvocationID.x;\n";
-        L << "    if (i >= count) return;\n";
+        if (batched)
+        {
+            // 批量序言：实例下标 = gl_WorkGroupID.y，元素数取本实例尾槽；
+            // 此后 row/col/batch 推导与指令链与普通版逐字一致（`cols` 经宏
+            // 取本实例值）。dispatch = (ceil(max_count/256), n_instances, 1)。
+            L << "    const uint S = " << (n_inputs + 2 + spec.extras.size())
+              << "u;   // uvec2 槽位数：输入…、输出…、(count,cols)\n";
+            L << "    ib = gl_WorkGroupID.y * S;\n";
+            L << "    const uint count_l = inst[ib + S - 1u].x;\n";
+            L << "    const uint i = gl_GlobalInvocationID.x;\n";
+            L << "    if (i >= count_l) return;\n";
+        }
+        else
+        {
+            L << "    const uint i = gl_GlobalInvocationID.x;\n";
+            L << "    if (i >= count) return;\n";
+        }
         if (need_row && need_col)
             L << "    const uint row = i / cols;\n    const uint col = i % cols;\n";
         else if (need_row)
@@ -1928,6 +2148,10 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
               << (out_f16 ? glsl_f16_store("r" + std::to_string(last_dst))
                           : ("r" + std::to_string(last_dst)))
               << ";\n";
+        // P2 多输出：额外输出寄存器同元素写各自的输出缓冲（V0 专属）
+        for (std::size_t k = 0; k < spec.extras.size(); ++k)
+            L << "    bex" << k << "[i] = r"
+              << static_cast<int>(spec.extras[k]) << ";\n";
         L << "}\n";
         return L.str();
     }
@@ -2080,6 +2304,15 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
     }
     else
         emit_store4("bout", out_f16, "        ");
+    // P2 多输出：vec4 快路径按分量写额外输出缓冲
+    for (std::size_t k = 0; k < spec.extras.size(); ++k)
+    {
+        const std::string rx = "r" + std::to_string(static_cast<int>(spec.extras[k]));
+        L << "        bex" << k << "[base] = " << rx << ".x;\n";
+        L << "        bex" << k << "[base+1u] = " << rx << ".y;\n";
+        L << "        bex" << k << "[base+2u] = " << rx << ".z;\n";
+        L << "        bex" << k << "[base+3u] = " << rx << ".w;\n";
+    }
     L << "        return;\n";
     L << "    }\n";
 
@@ -2106,6 +2339,10 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
     }
     else
         L << "        bout[e] = " << (out_f16 ? glsl_f16_store(sv) : sv) << ";\n";
+    // P2 多输出：标量回退路径同元素写额外输出缓冲（此处 rN 为标量）
+    for (std::size_t k = 0; k < spec.extras.size(); ++k)
+        L << "        bex" << k << "[e] = r"
+          << static_cast<int>(spec.extras[k]) << ";\n";
     L << "    }\n";
     L << "}\n";
     return L.str();
@@ -2793,6 +3030,14 @@ public:
         const std::string& name_, const ExprSpec& spec,
         ExprPrecSig sig = 0) override
     { return nn::generate_glsl_reduce(name_, spec, sig); }
+
+    // P3 批量变体（键 = key#b）：纯逐元素 + V0 全 f32 的多实例批量派发形态
+    // （实例表 + buffer device address）。不支持的形态返回空串 → 上层跳过
+    // 该变体，运行期逐 kernel 降级（见 expr_spec_batchable）。
+    [[nodiscard]] std::string generate_batched(
+        const std::string& name_, const ExprSpec& spec) const override
+    { return nn::generate_glsl(name_, spec, /*sig=*/0, /*native16=*/false,
+                               /*batched=*/true); }
 };
 
 // 登记到 emitter 注册表（静态初始化；重复包含无害——同名拒绝覆盖）

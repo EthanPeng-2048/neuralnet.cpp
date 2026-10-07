@@ -1191,6 +1191,7 @@ public:
         for (std::size_t bi = 0; bi < blocks_.size(); ++bi)
         {
             RAPTBlock& b = blocks_[bi];
+            NN_PROF_SCOPE(nn::prof::interned("fwd.blk", bi));
             // 无条件下发：空 span 也要清掉上一 step 的文档感知（否则跨 step 串扰）
             b.set_doc_ids(doc_ids_);
             // 梯度检查点：每 checkpoint_every_ 个块保存一次输入，该块以 checkpoint
@@ -1239,6 +1240,7 @@ public:
         for (std::size_t bi = 0; bi < n; ++bi)
         {
             const std::size_t idx = n - 1 - bi;
+            NN_PROF_SCOPE(nn::prof::interned("bwd.blk", idx));
             // 梯度检查点：checkpoint 块先用保存的输入重算 forward 重建缓存，再反向
             if (checkpoint_every_ > 0 && (idx % checkpoint_every_ == 0))
             {

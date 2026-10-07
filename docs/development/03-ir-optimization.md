@@ -1,7 +1,7 @@
 # IR 优化（IR Optimization）—— 为融合算子引入中间表示
 
 > 目标：在**不推翻现有 AOT 闭合世界**的前提下，把 `ExprSpec` 从"直通轻量 IR"演进为带优化 pass 的规范 IR，分阶段提升开发便利与代码质量。
-> 状态：现行优化链 = **IR-A（canonicalize：DCE/常量折叠/代数化简/稳定重编号）+ IR-B（CSE + 寄存器分配 liveness）+ IR-D（后端 emitter 抽象）**，分别由 `expr_opt.hpp` / `expr_emitter.hpp` 承载；**IR-C（图 IR + `begin_expr/end_expr` 融合分析）不存在**——当前没有任何跨表达式录制机制（取舍记录见 §5.3）。
+> 状态：现行优化链 = **IR-A（canonicalize：DCE/常量折叠/代数化简/稳定重编号）+ IR-B（CSE + 寄存器分配 liveness）+ IR-C（图 IR + `begin_expr/end_expr` 融合分析）+ IR-D（后端 emitter 抽象）**，分别由 `expr_opt.hpp` / `expr_graph.hpp` / `expr_emitter.hpp` 承载；**IR-C 已恢复并通用化（2026-10-06：P1 机制 + P2 写穿多输出 + Adam 接线，见 §5.3）**。
 > 关联文档：`02-operator-fusion.md`（算子融合）、`10-development-standards.md`（分层铁律）、`08-pitfalls-and-lessons.md`。
 
 ## 目录
@@ -36,7 +36,7 @@ Layer 内联表达式 → to_expr_spec 折叠 → ExprSpec → glsl_gen → GLSL
 2. **无死代码消除、无常量折叠、无代数化简**，shader 携带冗余计算 → 现由 canonicalize 链处理。
 3. **无寄存器分配**，`num_regs` 线性增长，受 `EXPR_MAX_REGS=32` 约束 → 现由活跃性分配复用。
 4. **后端耦合**：`glsl_gen` 为 GLSL 专用，无法"一份 IR 多后端"（CUDA 后端已整体移除）→ IR-D emitter 抽象，当前注册的只有 GLSL。
-5. **跨表达式融合无落地形态**：运行时没有跨表达式录制机制（图级 IR 即 IR-C 不存在，§5.3）；长逐元素链直接写成单个 `dsl::compute`（单个 AOT 融合 kernel）。
+5. **跨表达式融合**：已由 IR-C 落地（`begin_expr/end_expr` + `expr_graph.hpp` 图 IR，P1 链 / P2 分量融合，§5.3）；不需要跨表达式写穿的场景仍可直接写成单个 `dsl::compute`（单个 AOT 融合 kernel）。
 
 本文记录 IR 优化 pass 的设计与当前实现，核心约束是**不破坏闭合世界的确定性 key 匹配**。
 
@@ -63,7 +63,7 @@ IR 属于"引擎/工具内部"，**完全落在红线允许区**，且强化"引
 2. **可优化性**：提供确定性优化 pass（DCE、常量折叠、CSE、寄存器分配、代数化简）。
 3. **闭合世界兼容**：key 定义在 **canonical（优化后）IR** 上，scan 与 runtime 两端一致。
 4. **跨后端**：IR → 多 emitter（GLSL / CPU），可选扩展。
-5. **可扩展性**：IR 保持"单表达式"形态；跨表达式融合（图 IR）**不采用**（§5.3），如需重提须先制造出可安全融合的层。
+5. **可扩展性**：单表达式 IR 与图 IR 分层——跨表达式融合（IR-C 图 IR）**现行**（§5.3），可安全融合的层由 `begin_expr/end_expr` 显式录制。
 
 ---
 
@@ -147,9 +147,11 @@ expr_spec_key(spec) ≡ expr_spec_key(canonicalize_expr_spec(spec))
 
 CSE 需处理 `Input/Const/Reduce` 操作数的等价性（视图相同 + 输入相同 + 常量相同才等价）。归约指令的 CSE 需保证归约槽语义一致。
 
-### 5.3 阶段 C：图 IR（已移除）
+### 5.3 阶段 C：图 IR（现行：P1 + P2，2026-10-06 恢复）
 
-**IR-C（图级跨表达式融合）已移除，取舍记录见 `docs/history.md`。**（记录含：五条否证依据、删除项/保留项清单、以及"重新立项的前提"。）
+**IR-C（图级跨表达式融合）现行**：`expr_graph.hpp`（`ExprGraph`/`ExprGraphNode`/`fuse_expr_graph`/`recording_graph_owner`、per-graph `node_outputs`、占位 tag 分配器 `next_virtual_tag()`）+ 引擎虚入口 `ComputeEngine::begin_expr()/end_expr()`，配套 `dsl::start_expr/end_expr`（`ExprBlock` 语法糖，单表达式跨行）与 `ExprSegment`（RAII 守卫）。GPU 走真录制（`GpuEngine::execute_fused_graph`），CPU 普通运行 no-op、`NN_EXPR_SCAN` 下 `end_expr` 跑同一套 `fuse_expr_graph`（构建期扫描与运行期一致）。P2 新增 `ExprSpec.extras`（写穿多输出，≤4）与引擎入口 `eval_expr_multi_into`（NVI + 虚 `eval_expr_multi_into_impl`），并落地 P2-12 图级计划缓存（`graph_cache_key`/`FusedKernelPlan`/`instantiate_plan`）。
+
+**定位修正（2026-10-06 用户裁定）**：**2026-09-19 的移除判定针对的是当时不完整的实现**（无生产调用方、无写穿物化），**不是对图融合方向的否决**；旧实现（git `8f2990f^`）恢复并通用化，P1（链融合机制）与 P2（写穿多输出 + Adam/AdamW 接线）已落地。历史取舍正文（五条否证依据、删除项/保留项清单）与恢复流水见 `docs/history.md`。
 
 ### 批内上传免 flush（P2，与图 IR 无关）
 
@@ -180,7 +182,7 @@ IR → GlslEmitter（当前唯一注册后端）
 |--------|------|--------|
 | **IR-A** | 确立 ExprSpec 为 IR 规范 + `canonicalize_expr_spec`（DCE/常量折叠/稳定排序）+ 接入 key | **现行**（`expr_opt.hpp`） |
 | **IR-B** | CSE + 寄存器分配（liveness） | **现行**（`expr_opt.hpp`） |
-| **IR-C** | 图 IR + `begin_expr/end_expr` 融合分析 | **不采用**（归约边界 + 缓存逃逸，无收益点；§5.3，取舍记录在 `docs/history.md`） |
+| **IR-C** | 图 IR + `begin_expr/end_expr` 融合分析 | **现行**（`expr_graph.hpp`；P1/P2 已落地 2026-10-06，§5.3） |
 | **IR-D** | 后端 emitter 抽象（多后端，一份 canonical IR） | **现行**（`expr_emitter.hpp`，仅 `GlslEmitter` 注册） |
 
 ### IR-A / IR-B 实现要点（`expr_opt.hpp`）
@@ -211,9 +213,10 @@ canonicalization 与优化 pass 的验证重点：
 | 目标 | 状态 |
 |------|------|
 | 轻量 IR + 优化（IR-A + IR-B） | 现行 |
-| 图 IR 融合分析（IR-C） | **不采用**（已移除，§5.3） |
+| 图 IR 融合分析（IR-C） | **现行**（`expr_graph.hpp`，P1/P2，§5.3） |
 | + 后端 emitter（IR-D） | 现行（仅 `GlslEmitter` 注册） |
 
 最大成本集中在**确定性 key 验证**。现有 `ExprSpec` 已是合格轻量 IR，直通、简单、确定性是其最大优点；
-IR-C 留下的教训是**"设计完整度不等于价值"**——一个没有生产调用方的优化层，即使实现了也是负资产。
-后续演进以"小步演进、不推翻、有真实调用方"为原则推进。
+IR-C 的历史教训仍成立但口径需修正：**2026-09-19 的移除判定的是当时不完整的实现**（无生产调用方、无写穿物化），
+**不是对图融合方向的否决**；恢复并通用化后（2026-10-06，P1 机制 + P2 写穿多输出 + Adam/AdamW 接线）它才有真实调用方。
+后续演进以"小步演进、不推翻、有真实调用方"为原则推进；IR-C 的完整历史（含两次往返）见 `docs/history.md`。

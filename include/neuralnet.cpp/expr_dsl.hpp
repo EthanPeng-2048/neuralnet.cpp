@@ -1397,6 +1397,21 @@ struct FusedAnchor
     }();
 };
 
+// fold 锚点：fold spec 由**值构造器**产出（make_fold_*），类型不编码结构——
+// FusedAnchor 按类型登记覆盖不到（视图种类/参数是构造实参）。由**消费方**
+// 在静态初始化期经本锚点自登记"本调用点实际会构造的结构变体"（k / view
+// param 等形状参数不进 key，取代表值即可），与 FusedAnchor 同机制/同注册表：
+// **新增 fold 表达式无需改 scan_exprs**（表达式自登记约定）。
+struct FoldAnchor
+{
+    explicit FoldAnchor(ExprSpec s)
+    {
+        if (auto v = validate_expr_spec(s, s.views.size()); !v)
+            scan_reject(v.error());
+        anchor_registry().add(std::move(s));
+    }
+};
+
 // ── 构建期扫描的单点登记（三个 dsl 入口共用）────────────────────────────
 // 折叠表达式 → 校验 → 登记进全局注册表，并返回折叠出的 spec（compute_reduce
 // 还要用它判定归约轴）。**只登记结构**：精度签名已不是构建期集合
@@ -1436,13 +1451,33 @@ template <typename E>
                                      std::size_t rows, std::size_t cols,
                                      Precision P)   // 默认实参在 compute_engine.hpp 前置声明处
 {
+    NN_PROF_OP("dsl::compute");   // CPU 模板路径不经引擎入口，须在此计时（剖析器）
 #ifdef NN_EXPR_SCAN
     // 构建期扫描模式：折叠内联表达式的**结构**并登记进全局注册表，
     // 返回占位张量让 dry-run 流程继续（scan 只关心表达式集合，不真算）。
     // 表达式文本仍只出现在 Layer；这里登记的是派生物 ExprSpec。
     // 自登记锚点（按类型登记结构）在 scan_register 内统一处理。
     (void)eng;
-    (void)scan_register(e);
+    // IR-C（2026-10-06 恢复）：个体结构**恒登记**（录制段内也登记——锚点的
+    // 符号实例与运行期实例可能折叠出不同 key，双保险；注册表按 key 去重，
+    // 冗余无害。P2 教训：只入图不登记会让未融合回退/单节点 kernel 闭合世界
+    // miss），录制段内再入图（end_expr 时融合并登记复合 spec）。
+    const ExprSpec reg_spec = scan_register(e);
+    if (auto* g = fused::recording_graph())
+    {
+        auto [spec, inputs] = to_expr_spec(e);
+        if (auto v = validate_expr_spec(spec, inputs.size()); !v)
+            scan_reject(v.error());
+        const int node = g->add_node(spec, inputs, rows, cols,
+                                     /*vector_out=*/false, P);
+        Tensor ph = eng.adopt(P == Precision::F16
+            ? TensorAccess::cpu<Precision::F16>(rows, cols)
+            : TensorAccess::cpu(rows, cols));
+        ph.set_virtual_tag(g->tag_of_node[static_cast<std::size_t>(node)]);
+        g->node_outputs[node] = ph;
+        return ph;
+    }
+    (void)reg_spec;
     return eng.adopt(P == Precision::F16 ? TensorAccess::cpu<Precision::F16>(rows, cols)
                                          : TensorAccess::cpu(rows, cols));
 #else
@@ -1534,11 +1569,25 @@ inline void eval_into_tensor_cpu(const E& e, Tensor& dst)
 template <typename E>
 [[nodiscard]] Result<void> compute_into(ComputeEngine& eng, const E& e, Tensor& dst)
 {
+    NN_PROF_OP("dsl::compute_into");   // CPU 模板路径不经引擎入口，须在此计时（剖析器）
 #ifdef NN_EXPR_SCAN
     // 构建期扫描：与 compute() 一样只登记结构（不真算、不关心 dst 的值），
     // 锚点自登记在 scan_register 内统一处理
     (void)eng;
+    // 个体结构恒登记（录制段内也登记，双保险——见 compute 的说明）
     (void)scan_register(e);
+    // IR-C（P2）：录制段内作为目标传递节点入图（输出 = dst 既有张量，
+    // end_expr 的复合 kernel 写回其存储）
+    if (auto* g = fused::recording_graph())
+    {
+        auto [tspec, tinputs] = to_expr_spec(e);
+        if (auto v = validate_expr_spec(tspec, tinputs.size()); !v)
+            scan_reject(v.error());
+        const int node = g->add_node(tspec, tinputs, dst.rows(), dst.cols(),
+                                     /*vector_out=*/false, dst.precision());
+        g->node_outputs[node] = dst;
+        return {};
+    }
     (void)dst;
     return {};
 #else
@@ -1600,13 +1649,36 @@ template <typename E>
                                             std::size_t rows, std::size_t cols,
                                             Precision P)   // 默认实参在 compute_engine.hpp 前置声明处
 {
+    NN_PROF_OP("dsl::compute_reduce");   // CPU 模板路径不经引擎入口，须在此计时（剖析器）
 #ifdef NN_EXPR_SCAN
     // 构建期扫描：同 compute()，登记结构（归约轴供下面取占位张量形状）。
     // 占位张量按归约轴取向量形状 (rows,1)/(1,cols)，使 Layer 后续
     // add_inplace 等形状相关操作在 dry-run 中不因形状失配而中断。
     // 锚点自登记在 scan_register 内统一处理。
     (void)eng;
-    const ExprSpec spec = scan_register(e);
+    // 个体结构恒登记（录制段内也登记，双保险——见 compute 的说明）
+    const ExprSpec reg_spec = scan_register(e);
+    // IR-C（2026-10-06 恢复）：录制段内加入图（归约向量占位 + tag）
+    if (auto* g = fused::recording_graph())
+    {
+        auto [rspec, rinputs] = to_expr_spec(e);
+        if (auto v = validate_expr_spec(rspec, rinputs.size()); !v)
+            scan_reject(v.error());
+        const int raxis0 = expr_spec_reduce_axis(rspec);
+        const int node = g->add_node(rspec, rinputs, rows, cols,
+                                     /*vector_out=*/true, P);
+        Tensor ph = eng.adopt(P == Precision::F16
+            ? ((raxis0 == 0) ? TensorAccess::cpu<Precision::F16>(rows, 1)
+               : (raxis0 == 1) ? TensorAccess::cpu<Precision::F16>(1, cols)
+               : TensorAccess::cpu<Precision::F16>(rows, cols))
+            : ((raxis0 == 0) ? TensorAccess::cpu(rows, 1)
+               : (raxis0 == 1) ? TensorAccess::cpu(1, cols)
+               : TensorAccess::cpu(rows, cols)));
+        ph.set_virtual_tag(g->tag_of_node[static_cast<std::size_t>(node)]);
+        g->node_outputs[node] = ph;
+        return ph;
+    }
+    const ExprSpec spec = reg_spec;
     const int raxis = expr_spec_reduce_axis(spec);
     if (P == Precision::F16)
         return eng.adopt((raxis == 0) ? TensorAccess::cpu<Precision::F16>(rows, 1)
@@ -1640,6 +1712,34 @@ template <typename E>
     return eng.eval_expr_reduce(spec, inputs, rows, cols, P);
 #endif
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// start_expr / end_expr — 跨行书写同一表达式的语法糖（IR-C 恢复自旧实现）
+//
+// 与 compute() 等价：内联数学表达式只出现在这里（Layer），框内即一个融合
+// 单元（单表达式），end_expr 只是延迟到整块写完再求值。
+//   auto out = dsl::end_expr(dsl::start_expr(engine, rows, cols,
+//       leaf(a) * leaf(b)
+//       + leaf(c) * Scalar{2}
+//       - leaf(d)));
+// ⚠ 与 ComputeEngine::begin_expr/end_expr（**跨表达式**图录制）不是一回事。
+// ══════════════════════════════════════════════════════════════════════════
+template <typename E>
+struct ExprBlock
+{
+    ComputeEngine* eng;
+    std::size_t    rows, cols;
+    E              expr;
+};
+
+template <typename E>
+[[nodiscard]] ExprBlock<E> start_expr(ComputeEngine& eng, std::size_t rows,
+                                      std::size_t cols, const E& e)
+{ return {&eng, rows, cols, e}; }
+
+template <typename E>
+[[nodiscard]] Result<Tensor> end_expr(const ExprBlock<E>& b)
+{ return compute(*b.eng, b.expr, b.rows, b.cols); }
 
 } // namespace nn::dsl
 

@@ -368,9 +368,10 @@ public:
         Tensor x = std::move(*pe);
 
         // 2. 一次性通过所有 EncoderLayer [全批量化 GPU]
-        for (auto& layer : layers_)
+        for (std::size_t li = 0; li < layers_.size(); ++li)
         {
-            NN_TRY(lr, layer.forward(x));
+            NN_PROF_SCOPE(nn::prof::interned("fwd.enc", li));
+            NN_TRY(lr, layers_[li].forward(x));
             x = std::move(*lr);
         }
 
@@ -437,6 +438,9 @@ public:
 
         for (auto it = layers_.rbegin(); it != layers_.rend(); ++it)
         {
+            const std::size_t li =
+                static_cast<std::size_t>(layers_.rend() - it) - 1;
+            NN_PROF_SCOPE(nn::prof::interned("bwd.enc", li));
             NN_TRY(br, it->backward(grad_x));
             grad_x = std::move(*br);
         }

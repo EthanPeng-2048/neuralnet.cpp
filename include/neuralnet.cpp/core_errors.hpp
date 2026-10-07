@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdio>   // fputs（错误打印）
 #include <cstdlib>  // for strtof/strtod/strtold（浮点解析回退）+ abort/exit
+                    // + Windows：_set_abort_behavior/_set_error_mode（abort 弹窗静音）
 #include <expected>
 #include <source_location>
 #include <string>
@@ -35,11 +36,20 @@ template <typename T>
 namespace detail {
 
 // 终止策略：铁律 #1 禁异常，这里只有 abort / exit 两条路，库头不出现 throw。
+// ⚠ Windows：CRT 在 abort() 时弹**模态**"abort() has been called"对话框
+//   （GUI 弹窗不进 stdout/stderr → 日志/审计全看不见，测试与脚本被卡死等人点；
+//   2026-10-06 实测 `error_macro_test` 的 abort 负例子进程即弹了此框）。错误
+//   信息本函数已打印到 stderr，可见性不受影响 → 终止前把 CRT 运行时错误/abort
+//   消息与 WER 上报全部改道/静音，保证 abort 恒为"打印后立即终止"。
 [[noreturn]] inline void fail_abort(const std::string& msg)
 {
     std::fputs(msg.c_str(), stderr);
     std::fputc('\n', stderr);
     std::fflush(stderr);
+#if defined(_WIN32)
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+    _set_error_mode(_OUT_TO_STDERR);
+#endif
     std::abort();
 }
 
@@ -185,8 +195,15 @@ inline void check_exit(bool ok, const char* what, std::string_view ctx,
     auto decl = (__VA_ARGS__); \
     if (!decl) return std::unexpected(decl.error())
 
+// ⚠ NN_TRY_CHECK **必须只求值一次** x：旧展开 `if (!(x)) return
+//   std::unexpected((x).error())` 把 x 求值两遍，对**带副作用**的表达式是
+//   正确性炸弹——x = seg.end() 这类"失败即已重置状态"的调用，第二遍会重新
+//   进入并**返回成功**，随后对 success 的 std::expected 调 .error() = MSVC
+//   `expected` 断言 / 读已析构的 Error 字符串 → 堆损坏（实测 f16_precision_test
+//   0xC0000374）。改 if-init 绑定：单次求值、语义与文档承诺的手写形态逐字等价。
+//   绑定用 auto&&（不引入拷贝：Result 载体可能是不可拷贝的 unique_ptr）。
 #define NN_TRY_CHECK(x) \
-    if (!(x)) return std::unexpected((x).error())
+    if (auto&& nn_try_r_ = (x); !nn_try_r_) return std::unexpected(nn_try_r_.error())
 
 #define NN_TRY_MSG(decl, ctx, ...) \
     auto decl = (__VA_ARGS__); \

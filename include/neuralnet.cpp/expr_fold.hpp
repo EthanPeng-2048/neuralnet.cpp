@@ -148,4 +148,37 @@ namespace nn::expr
     return s;
 }
 
+// ── 4) fold logsumexp（online 双状态 → 单值 lse = m + log(l)）──────────────
+// body 与 softmax_denom **逐指令同构**（states 0=m/1=l、同 rescale 语义序：
+// 复用 make_fold_softmax_denom 的 body/状态/初值），只换两处：
+//   - 输入视图由调用方给出（linear = (rows,K) 直读；trans(stride) = 转置
+//     直读 (K,rows) 存储——如交叉熵沿词表行归约而 logits 为 (vocab,total)
+//     存储；视图 param 走 vp、不进 key → 一份登记覆盖所有形状）
+//   - finalize 合成单值 lse = m + log(l)（= log Σ_k exp(x(row,k))，数值稳定：
+//     l ≥ 1 ⇒ log l 有限；dst 用临时寄存器，不覆写被读状态）
+// 参考语义：lse_final = log Σ_k exp(x(row,k) − max_k x) + max_k x
+//   （浮点结合序容差内等价于直接 logsumexp）。
+[[nodiscard]] inline ExprSpec make_fold_logsumexp(std::uint32_t k,
+                                                  ExprView input_view = linear())
+{
+    ExprSpec s = make_fold_softmax_denom(k);     // body/states/inits/consts 同源
+    const auto ins = [](ExprOp op, std::uint8_t dst, ExprOperand a,
+                        ExprOperand b = {}) {
+        ExprInstr i;
+        i.op  = static_cast<uint8_t>(op);
+        i.dst = dst;
+        i.a   = a;
+        i.b   = b;
+        return i;
+    };
+    // finalize：lse = m + log(l)——寄存器 10/11 为 finalize 专用临时
+    s.fold->finalize = {
+        ins(ExprOp::Log, 10, reg(1)),
+        ins(ExprOp::Add, 11, reg(0), reg(10)),
+    };
+    s.num_regs = 12;                             // 状态 0..1 + body 临时 2..9 + finalize 10..11
+    s.views    = { input_view };
+    return s;
+}
+
 } // namespace nn::expr

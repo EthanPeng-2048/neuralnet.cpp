@@ -72,17 +72,46 @@ public:
     // 这消除了 per-primitive 的 vkQueueSubmit+vkWaitForFences 开销。
     [[nodiscard]] Result<void> begin_batch() override
     {
+        NN_PROF_OP("begin_batch");
         return backend_.begin_batch();
     }
 
     [[nodiscard]] Result<void> end_batch() override
     {
+        NN_PROF_OP("end_batch");
         return backend_.end_batch();
+    }
+
+    // ── 表达式录制（IR-C，2026-10-06 恢复）──────────────────────────────
+    // begin_expr 开启录制：期间 eval_expr/eval_expr_reduce 经 NVI 拦截入图
+    // （expr_graph.hpp），返回带 virtual_tag 的占位 GPU 张量（真实存储）。
+    // end_expr 融合分析（fuse_expr_graph）→ 复合 kernel 直接写回各 tail
+    // 占位存储（output_override），中间量内联为寄存器。复合 spec 未命中
+    // AOT shader = 闭合世界硬报错（须在 scan_exprs 覆盖录制段）。
+    [[nodiscard]] Result<void> begin_expr() override
+    {
+        auto& owner = fused::recording_graph_owner();
+        if (owner)
+            NN_FAIL("begin_expr: 嵌套录制（已有未结束的 begin_expr）");
+        owner = std::make_unique<ExprGraph>();
+        owner->owner = this;
+        return {};
+    }
+
+    [[nodiscard]] Result<void> end_expr() override
+    {
+        auto& owner = fused::recording_graph_owner();
+        if (!owner)
+            return {};
+        ExprGraph g = std::move(*owner);
+        owner.reset();
+        return execute_fused_graph(g);
     }
 
     // ── 显存回收（L2）：end_batch 之后归还完全空闲的内存池底材 ──────
     [[nodiscard]] Result<void> release_idle_pool_blocks() override
     {
+        NN_PROF_OP("release_idle_pool_blocks");
         return backend_.release_idle_pool_blocks();
     }
 
@@ -173,6 +202,7 @@ public:
     // 用于拆分大 batch（如 forward 与 backward 之间），防 TDR。
     [[nodiscard]] Result<void> flush_batch() override
     {
+        NN_PROF_OP("flush_batch");
         return backend_.flush_batch();
     }
 
@@ -216,6 +246,7 @@ public:
 
     [[nodiscard]] Result<Matrix> to_matrix(const Tensor& t, Precision P = Precision::F32) override
     {
+        NN_PROF_OP("to_matrix");
         if (t.is_cpu())
         {
             if (t.precision() == Precision::F16 && P == Precision::F32)
@@ -325,6 +356,7 @@ public:
     // GPU 路径用 vkCmdCopyBuffer / cast 原语直接写 dst 的既有 buffer，无分配。
     [[nodiscard]] Result<void> copy_into(Tensor& dst, const Tensor& src) override
     {
+        NN_PROF_OP("copy_into");
         if (dst.rows() != src.rows() || dst.cols() != src.cols())
             NN_FAIL("copy_into: shape mismatch");
         if (dst.precision() != src.precision())
@@ -361,6 +393,7 @@ public:
 
     [[nodiscard]] Result<void> cast_into(const Tensor& src, Tensor& dst) override
     {
+        NN_PROF_OP("cast_into");
         if (dst.rows() != src.rows() || dst.cols() != src.cols())
             NN_FAIL("cast_into: shape mismatch");
         if (src.precision() == dst.precision())
@@ -1680,7 +1713,673 @@ public:
         NN_FAIL("GpuEngine::eval_expr_into: 未找到该表达式的 AOT 融合 shader（闭合世界）；"             "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）；"             "key=" + key);
     }
 
+    // ── P2 多输出（IR-C 写穿物化）────────────────────────────────────────
+    // outs 全部为既有 f32 存储（主输出 + extras）；选路 = V0（NVI 已验全 f32，
+    // extras 结构只生成 V0 变体）。输出视图经 import 取 GpuTensor 句柄，
+    // 以 output_override + extra_outs 交给 run_fused_gpu（无分配路径）。
+    [[nodiscard]] Result<void> eval_expr_multi_into_impl(
+        const ExprSpec& raw_spec, std::span<const Tensor> inputs,
+        std::size_t rows, std::size_t cols, std::span<Tensor> outs) override
+    {
+        if (raw_spec.fold || raw_spec.matmul ||
+            expr_spec_reduce_axis(raw_spec) != -1)
+            NN_FAIL("eval_expr_multi_into: 仅支持纯逐元素 spec");
+        const ExprSpec spec = nn::canonicalize_expr_spec(raw_spec);
+        const std::string key = nn::expr_spec_key(spec);
+#ifndef NN_FUSED_REGISTRY_EMBEDDED
+        // 无注册表模式（NN_EXPR_SCAN 收集器 TU）：融合分支整体不编译
+        (void)inputs; (void)rows; (void)cols; (void)outs;
+#endif
+#ifdef NN_FUSED_REGISTRY_EMBEDDED
+        const nn::fused::FusedShader* fs = nn::fused::find_fused(key);
+        if (fs && backend_.has_fused_shader(fs->key))
+        {
+            auto fi_r = fused_buffers_(inputs);
+            NN_TRY_CHECK(fi_r);
+            std::vector<GpuTensor> owned;       // 视图持有者（ptrs 指向其元素）
+            std::vector<GpuTensor*> ptrs;
+            owned.reserve(outs.size());
+            ptrs.reserve(outs.size());
+            for (auto& t : outs)
+            {
+                auto g = import(t);
+                NN_TRY_CHECK(g);
+                if (!g->gpu_shared<Precision::F32>())
+                    NN_FAIL("eval_expr_multi_into: f32 输出缺少 f32 GPU 存储");
+                owned.push_back(g->gpu_tensor());
+                ptrs.push_back(&owned.back());
+            }
+            std::vector<GpuTensor*> extra_ptrs(ptrs.begin() + 1, ptrs.end());
+            const auto vp = nn::expr_spec_runtime_view_params(spec);
+            auto r = backend_.run_fused_gpu(
+                fs->key, fi_r->bufs, spec.consts, rows, cols,
+                /*vector_out=*/false, vp, spec.rparams, ptrs[0],
+                /*matmul_k=*/std::nullopt, /*matmul_batch=*/1u,
+                /*matmul_trans=*/0u, /*fold_k=*/std::nullopt,
+                /*out_f16=*/false, /*prec_sig=*/0,
+                extra_ptrs);
+            NN_TRY_CHECK(r);
+            return {};
+        }
+#endif
+        NN_FAIL("GpuEngine::eval_expr_multi_into: 未命中 AOT 融合 shader（闭合世界）；"
+                "请将 begin_expr/end_expr 段纳入构建期扫描（scan_exprs）；key=" + key);
+    }
+
 private:
+    // ── IR-C：融合执行（2026-10-06 恢复）────────────────────────────────
+    // 图 → 融合分析 → kernel 序列 → 逐个 AOT dispatch。每个 kernel 的输出
+    // **直接写入**其 tail 节点的占位 buffer（output_override），使调用方持有
+    // 的占位 Tensor 在 end_expr 后物化。被融合的中间节点无独立输出（寄存器
+    // 内联），其占位 buffer 从未被写入、dispatch 后立即释放归还内存池。
+    // D3：node_outputs 随图（thread_local 堆分配）隔离，不用引擎成员。
+    [[nodiscard]] Result<void> execute_fused_graph(ExprGraph& g)
+    {
+        // P2-12 图级缓存跨 step 复用：训练每 step 图结构重复，命中缓存则跳过
+        // 融合分析 + 拼接 canonicalize + validate（缓存只复用结构决策，运行时
+        // 按 plan 绑定 node_outputs 与外部张量；不改数值、不破确定性）。
+        auto& gcache = fused::graph_plan_cache();
+        const std::uint64_t gkey = graph_cache_key(g);
+        std::vector<FusedKernel> kernels;
+        const auto cit = gcache.find(gkey);
+        if (cit != gcache.end())
+        {
+            kernels.reserve(cit->second.size());
+            for (const auto& p : cit->second)
+                kernels.push_back(instantiate_plan(p, g));
+        }
+        else
+        {
+            kernels = fuse_expr_graph(g);
+            std::vector<FusedKernelPlan> plans;
+            plans.reserve(kernels.size());
+            for (const auto& k : kernels)
+                plans.push_back(plan_from_kernel(k));
+            if (gcache.size() >= fused::GRAPH_PLAN_CACHE_MAX)
+                gcache.clear();
+            gcache.emplace(gkey, std::move(plans));
+        }
+
+        // ── 稳定拓扑序（P2）：kernel 依赖 = 成员的 dep 落在另一 kernel 的成员 ──
+        // 分量分裂/与 P1 kernel 交错时，fuse 的列表序不保证依赖序；按"就绪者
+        // 取列表序最前"重排（确定性）。依赖只指向更早节点（add_node 保证）→
+        // 无环。
+        {
+            std::vector<int> kernel_of(g.nodes.size(), -1);
+            for (std::size_t ki = 0; ki < kernels.size(); ++ki)
+                for (const int m : kernels[ki].members)
+                    if (m >= 0 && static_cast<std::size_t>(m) < kernel_of.size())
+                        kernel_of[static_cast<std::size_t>(m)] = static_cast<int>(ki);
+            std::vector<std::uint8_t> done(kernels.size(), 0);
+            std::vector<FusedKernel> ordered;
+            ordered.reserve(kernels.size());
+            while (ordered.size() < kernels.size())
+            {
+                bool progressed = false;
+                for (std::size_t ki = 0; ki < kernels.size(); ++ki)
+                {
+                    if (done[ki])
+                        continue;
+                    bool ready = true;
+                    for (const int m : kernels[ki].members)
+                    {
+                        const auto& nd = g.nodes[static_cast<std::size_t>(m)];
+                        for (const int d : nd.dep_of_input)
+                        {
+                            if (d < 0)
+                                continue;
+                            const int kd = kernel_of[static_cast<std::size_t>(d)];
+                            if (kd >= 0 && kd != static_cast<int>(ki) &&
+                                !done[static_cast<std::size_t>(kd)])
+                            {
+                                ready = false;
+                                break;
+                            }
+                        }
+                        if (!ready)
+                            break;
+                    }
+                    if (ready)
+                    {
+                        done[ki] = 1;
+                        ordered.push_back(std::move(kernels[ki]));
+                        progressed = true;
+                        break;   // 重新从头扫 = 稳定（列表序优先）
+                    }
+                }
+                if (!progressed)   // 防御：理论无环，仍保底排完
+                {
+                    for (std::size_t ki = 0; ki < kernels.size(); ++ki)
+                        if (!done[ki])
+                        {
+                            done[ki] = 1;
+                            ordered.push_back(std::move(kernels[ki]));
+                        }
+                }
+            }
+            kernels = std::move(ordered);
+        }
+
+        // 保留占位集合：kernel tail（输出物化）+ kernel 输入源（融合边界，
+        // 其 buffer 被后续 kernel 绑定为输入）+ P2 写穿成员（多输出 kernel 的
+        // 全部成员都落回各自占位/目标）；其余（被融合中间节点）释放。
+        std::vector<std::uint8_t> keep(g.nodes.size(), 0);
+        for (const auto& k : kernels)
+        {
+            if (!k.spec.extras.empty())
+            {
+                for (const int m : k.members)
+                    if (m >= 0 && static_cast<std::size_t>(m) < keep.size())
+                        keep[static_cast<std::size_t>(m)] = 1;
+            }
+            if (k.tail >= 0 && static_cast<std::size_t>(k.tail) < keep.size())
+                keep[static_cast<std::size_t>(k.tail)] = 1;
+            for (const auto& in : k.inputs)
+                if (in.node >= 0 && static_cast<std::size_t>(in.node) < keep.size())
+                    keep[static_cast<std::size_t>(in.node)] = 1;
+        }
+
+        // ── 逐 kernel 解析输入/输出张量（顺序 = 稳定拓扑序）────────────────
+        // 解析一次两用：P3 批量分组的依赖判定（存储级）+ 派发期的缓冲绑定。
+        struct DispatchItem
+        {
+            std::vector<Tensor> ins;        // 与 spec.views 同序
+            Tensor              out;        // 主输出（tail 占位/目标传递 dst）
+            std::vector<Tensor> extras;     // P2 写穿的其余成员输出（成员序）
+            std::vector<const void*> in_tok;   // 输入存储身份（hazard 判定）
+            std::vector<const void*> out_tok;  // 物化输出存储身份
+            bool        degraded = false;   // 复合降级 = 逐成员派发
+            bool        batchable = false;  // P3 批量资格（含 `key#b` 已登记）
+            std::string bkey;               // 组键（结构 key + 参数值序列）
+            ExprSpec    bspec;              // canonical spec（批量派发参数来源）
+        };
+        std::vector<DispatchItem> items(kernels.size());
+        // P3 逃生阀：NN_IRC_NO_BATCH=1 关闭批量派发（A/B 对照用；每次调用读取，
+        // 测试可在同进程切换）。逐 kernel 原路径不受影响（数值不变）。
+        const bool batch_enabled = !nn::dsl::env_flag("NN_IRC_NO_BATCH");
+        for (std::size_t ki = 0; ki < kernels.size(); ++ki)
+        {
+            FusedKernel& k = kernels[ki];
+            DispatchItem& d = items[ki];
+            d.ins.reserve(k.inputs.size());
+            for (auto& in : k.inputs)
+            {
+                if (in.node >= 0)
+                {
+                    const auto it = g.node_outputs.find(in.node);
+                    if (it == g.node_outputs.end())
+                        NN_FAIL("GpuEngine::end_expr: 依赖节点输出缺失（图 IR 状态损坏）");
+                    d.ins.push_back(it->second);
+                }
+                else
+                {
+                    d.ins.push_back(in.external);
+                }
+            }
+            const auto out_it = g.node_outputs.find(k.tail);
+            if (out_it == g.node_outputs.end())
+                NN_FAIL("GpuEngine::end_expr: tail 占位缺失（图 IR 状态损坏）");
+            d.out = out_it->second;
+            // 复合降级判定（与原循环同判据：写穿前置条件不满足即逐成员派发）
+            d.degraded = k.members.size() > 1 &&
+                         !composite_kernel_available_(k, d.ins, d.out);
+            // P2 写穿成员输出（成员序，tail 之后；派发输出槽 [1..]，与
+            // spec.extras 同序——fuse 构造时即按 members 去尾序登记）
+            if (!k.spec.extras.empty() && !d.degraded)
+            {
+                for (const int m : k.members)
+                {
+                    if (m == k.tail)
+                        continue;
+                    const auto mo = g.node_outputs.find(m);
+                    if (mo == g.node_outputs.end())
+                        NN_FAIL("GpuEngine::end_expr: 写穿成员占位缺失（图 IR 状态损坏）");
+                    d.extras.push_back(mo->second);
+                }
+            }
+            // 物化输出全集（hazard 判定）：降级/写穿形态 = 全部成员占位，
+            // 其余 = 仅 tail（被融合中间节点不落回存储，无跨 kernel 消费者）
+            if (d.degraded || !k.spec.extras.empty())
+            {
+                for (const int m : k.members)
+                {
+                    const auto mo = g.node_outputs.find(m);
+                    if (mo != g.node_outputs.end())
+                        d.out_tok.push_back(tensor_storage_token_(mo->second));
+                }
+            }
+            else
+                d.out_tok.push_back(tensor_storage_token_(d.out));
+            d.in_tok.reserve(d.ins.size());
+            for (const Tensor& t : d.ins)
+                d.in_tok.push_back(tensor_storage_token_(t));
+            // P3 批量资格：纯逐元素（含 extras 复合）+ 全 f32 GPU + 不降级 +
+            // `key#b` 已登记（无 BDA 时注册期即跳过 → 天然不可批量）。
+            // bspec 与 run_graph_kernel_into_ 的选路同源（fold 原样、其余
+            // canonicalize）。
+            const ExprSpec bspec = k.spec.fold
+                ? k.spec : nn::canonicalize_expr_spec(k.spec);
+            d.bspec = bspec;
+            if (!d.degraded && !k.vector_out && nn::expr_spec_batchable(bspec) &&
+                batch_enabled &&
+                (k.rows == 0 || k.cols <= UINT32_MAX / k.rows))
+            {
+                bool f32_gpu = true;
+                for (const Tensor& t : d.ins)
+                    f32_gpu = f32_gpu && t.valid() && t.is_gpu() &&
+                              t.precision() == Precision::F32;
+                for (const Tensor& t : d.extras)
+                    f32_gpu = f32_gpu && t.valid() && t.is_gpu() &&
+                              t.precision() == Precision::F32;
+                f32_gpu = f32_gpu && d.out.valid() && d.out.is_gpu() &&
+                          d.out.precision() == Precision::F32;
+                if (f32_gpu && batch_variant_available_(bspec))
+                {
+                    d.batchable = true;
+                    d.bkey = batch_group_key_(bspec);
+                }
+            }
+        }
+
+        // ── P3 同签名分组（跨链批量派发）──────────────────────────────────
+        // 组键 = 结构 key + consts/rparams/vp **值序列**（批量派发共享一份 PC，
+        // 形状数据走实例表）；贪心按列表序收集，单组 CAP 32。入组条件：
+        //   ① 同组键；② 未满 CAP；③ 组内成员两两互不依赖（存储级：无任一
+        //   成员消费/覆写另一成员的物化输出——覆盖目标传递同 dst 的无边形态）；
+        //   ④ 移入较早的组不得逆置任何既有顺序：凡与更早 kernel 有存储冲突者，
+        //   其派发位置必须先于本组（组在其首成员位置一次性派发 = 整组前移）。
+        // 决策只按列表序 + 键值扫描（确定性铁律 8），不依赖容器无序迭代。
+        constexpr std::size_t kBatchCap = 32;
+        struct BatchGroup
+        {
+            std::string           key;
+            std::vector<std::size_t> members;   // items 下标（列表序）
+            std::size_t           first = 0;    // 首成员下标 = 派发位置
+        };
+        std::vector<BatchGroup> groups;
+        std::vector<int> group_of(items.size(), -1);
+        // 已定派发位置：入组 = 组首成员下标；未入组 = 自身下标
+        const auto action_pos = [&](std::size_t yi) -> std::size_t
+        {
+            const int gy = group_of[yi];
+            return gy >= 0 ? groups[static_cast<std::size_t>(gy)].first : yi;
+        };
+        const auto hazard = [](const DispatchItem& a, const DispatchItem& b)
+        {
+            const auto hit = [](const std::vector<const void*>& x,
+                                const std::vector<const void*>& y)
+            {
+                for (const void* p : x)
+                    if (p != nullptr && std::find(y.begin(), y.end(), p) != y.end())
+                        return true;
+                return false;
+            };
+            return hit(a.out_tok, b.in_tok) || hit(a.out_tok, b.out_tok) ||
+                   hit(b.out_tok, a.in_tok);
+        };
+        for (std::size_t xi = 0; xi < items.size(); ++xi)
+        {
+            const DispatchItem& x = items[xi];
+            if (!x.batchable)
+                continue;
+            int chosen = -1;
+            for (std::size_t gi = 0; gi < groups.size() && chosen < 0; ++gi)
+            {
+                const BatchGroup& gr = groups[gi];
+                if (gr.key != x.bkey || gr.members.size() >= kBatchCap)
+                    continue;
+                bool ok = true;
+                for (const std::size_t m : gr.members)
+                    if (hazard(x, items[m])) { ok = false; break; }
+                if (!ok)
+                    continue;
+                for (std::size_t yi = 0; yi < xi && ok; ++yi)
+                {
+                    if (group_of[yi] == static_cast<int>(gi))
+                        continue;   // 同组成员与 x 已由上面排除 hazard
+                    if (hazard(x, items[yi]) && action_pos(yi) >= gr.first)
+                        ok = false;
+                }
+                if (ok)
+                    chosen = static_cast<int>(gi);
+            }
+            if (chosen >= 0)
+            {
+                groups[static_cast<std::size_t>(chosen)].members.push_back(xi);
+                group_of[xi] = chosen;
+            }
+            else
+            {
+                groups.push_back(BatchGroup{x.bkey, {xi}, xi});
+                group_of[xi] = static_cast<int>(groups.size() - 1);
+            }
+        }
+
+        // ── 派发：动作序 = kernel 列表序；批量组在其首成员位置一次性派发 ──
+        for (std::size_t ki = 0; ki < kernels.size(); ++ki)
+        {
+            FusedKernel& k = kernels[ki];
+            DispatchItem& d = items[ki];
+            const int gi = group_of[ki];
+            if (gi >= 0)
+            {
+                const BatchGroup& gr = groups[static_cast<std::size_t>(gi)];
+                if (gr.members.front() != ki)
+                    continue;   // 已随本组首成员一次性派发
+                if (gr.members.size() >= 2)
+                {
+                    if (nn::dsl::env_flag("NN_IRC_TRACE"))
+                        std::fprintf(stderr,
+                                     "[ir-c][batch] %zu 实例 → 1 派发 %s\n",
+                                     gr.members.size(), gr.key.c_str());
+                    std::vector<FusedBatchInst> insts;
+                    insts.reserve(gr.members.size());
+                    for (const std::size_t m : gr.members)
+                    {
+                        const DispatchItem& dm = items[m];
+                        FusedBatchInst bi;
+                        bi.inputs.reserve(dm.ins.size());
+                        for (const Tensor& t : dm.ins)
+                            bi.inputs.push_back(&t.gpu_tensor().buffer());
+                        bi.out = &dm.out.gpu_tensor().buffer();
+                        bi.extra_outs.reserve(dm.extras.size());
+                        for (const Tensor& t : dm.extras)
+                            bi.extra_outs.push_back(&t.gpu_tensor().buffer());
+                        bi.count = static_cast<std::uint32_t>(
+                            kernels[m].rows * kernels[m].cols);
+                        bi.cols = static_cast<std::uint32_t>(kernels[m].cols);
+                        insts.push_back(std::move(bi));
+                    }
+                    const ExprSpec& s = items[gr.members.front()].bspec;
+                    auto br = backend_.run_fused_gpu_batch(
+                        nn::expr_spec_key(s) + nn::EXPR_BATCH_SUFFIX, insts,
+                        s.consts, nn::expr_spec_runtime_view_params(s), s.rparams);
+                    NN_TRY_CHECK(br);
+                    continue;
+                }
+                // 单成员组 = 常规逐 kernel（单 kernel 现有语义不变）
+            }
+            // ── 通用降级可观测（NN_IRC_TRACE=1）：逐元素候选但未成组 ──────
+            if (nn::dsl::env_flag("NN_IRC_TRACE") && !d.degraded &&
+                !k.vector_out && nn::expr_spec_batchable(d.bspec))
+                std::fprintf(stderr,
+                             "[ir-c][batch-degrade] %s → 逐 kernel 派发（%s）\n",
+                             nn::expr_spec_key(d.bspec).c_str(),
+                             !batch_enabled ? "NN_IRC_NO_BATCH"
+                             : !d.batchable ? "key#b 未登记/无 BDA"
+                             : "同签名未集齐 2 实例（依赖/上限）");
+
+            // ── 复合 kernel 的闭合世界降级（通用机制，非单算子特例）─────────
+            // 融合**分组本身依赖精度**：P2 写穿组要求成员全 F32、P1 链要求成员
+            // 同精度。于是混精度 profile（`--f16` = optimizer:F32 / param:F16）
+            // 会产出 f32 扫描期根本不存在的复合结构（实测 Adam 的 {K3,K4} F16
+            // 尾链）→ 构建期按精度组合枚举是 2^4 爆炸，不可取。改为运行期降级：
+            // 复合 kernel 未登记（或写穿前置条件不满足：多输出 V0 要求全 f32）
+            // 时拆回成员逐个派发——每个成员都是**已登记的单节点结构**（scan 的
+            // 个体结构恒登记），闭合世界仍然成立，只是该段退化为"1 节点 = 1
+            // dispatch"（= IR-C 之前的形态）。未登记的**单节点**仍是硬报错。
+            if (d.degraded)
+            {
+                // 通用诊断（NN_IRC_TRACE=1；与 NN_PREC_TRACE 同哲学：降级不是
+                // 错误，但必须可观测——否则"某段悄悄没融合"无从归因）。
+                if (nn::dsl::env_flag("NN_IRC_TRACE"))
+                    std::fprintf(stderr,
+                                 "[ir-c][degrade] 复合 kernel(%zu 成员, extras=%zu)"
+                                 " 未登记 → 逐成员派发\n",
+                                 k.members.size(), k.spec.extras.size());
+                for (const int m : k.members)
+                {
+                    NN_TRY(mr, dispatch_graph_member_(g, m));
+                }
+                continue;
+            }
+
+            if (k.spec.extras.empty())
+            {
+                auto r = run_graph_kernel_into_(k.spec, d.ins, k.rows, k.cols,
+                                                k.vector_out, d.out);
+                NN_TRY_CHECK(r);
+            }
+            else
+            {
+                // P2 写穿物化：输出槽 [0] = tail，[1..] = 其余成员（成员序，
+                // 与 spec.extras 同序——fuse 构造时即按 members 去尾序登记）
+                std::vector<Tensor> outs;
+                outs.reserve(d.extras.size() + 1);
+                outs.push_back(d.out);
+                for (const Tensor& t : d.extras)
+                    outs.push_back(t);
+                auto r = eval_expr_multi_into(k.spec, d.ins, k.rows, k.cols, outs);
+                NN_TRY_CHECK(r);
+            }
+        }
+
+        // 释放被融合中间节点的占位 buffer（显存中间张量消除，同旧实现）。
+        // 安全依据：被融合节点的占位只被 node_outputs 持有；tail 与输入源
+        // 保留（调用方句柄与之共享 buffer）。
+        for (auto it = g.node_outputs.begin(); it != g.node_outputs.end();)
+        {
+            const int nd = it->first;
+            if (nd >= 0 && static_cast<std::size_t>(nd) < keep.size()
+                && !keep[static_cast<std::size_t>(nd)])
+                it = g.node_outputs.erase(it);
+            else
+                ++it;
+        }
+        return {};
+    }
+
+    // 融合 kernel 单次执行：结果写进 out 的既有存储（output_override）。
+    // 形态覆盖 fold（fold_k 形态参数）/ matmul 段（S5）/ 归约向量输出
+    // （vector_out）/ 精度变体（`#a`/`#x`/V0）——与 eval_expr_impl /
+    // eval_expr_into_impl 的选路同源，output_override 精度视图同
+    // eval_expr_into_impl（f16 目标必须经 f16_view 包 f16 buffer）。
+    [[nodiscard]] Result<void> run_graph_kernel_into_(
+        const ExprSpec& raw_spec, std::span<const Tensor> inputs,
+        std::size_t rows, std::size_t cols, bool vector_out, Tensor& out)
+    {
+        const bool is_fold = raw_spec.fold.has_value();
+        const ExprSpec spec = is_fold ? raw_spec : nn::canonicalize_expr_spec(raw_spec);
+        const std::string key = nn::expr_spec_key(spec);
+        const nn::ExprPrecSig psig = nn::expr_prec_sig_of(inputs, out.precision());
+#ifndef NN_FUSED_REGISTRY_EMBEDDED
+        // 无注册表模式（NN_EXPR_SCAN 收集器 TU）：融合分支整体不编译
+        (void)rows; (void)cols; (void)vector_out; (void)psig;
+#endif
+#ifdef NN_FUSED_REGISTRY_EMBEDDED
+        const nn::fused::FusedShader* fs = (psig != 0)
+            ? find_prec_variant_(key, psig, spec, /*log_hit=*/true)
+            : nn::fused::find_fused(key);
+        if (fs && backend_.has_fused_shader(fs->key))
+        {
+            auto fi_r = fused_buffers_(inputs);
+            NN_TRY_CHECK(fi_r);
+            std::vector<const GpuBuffer*>& gpu_inputs = fi_r->bufs;   // owners 随 fi_r 存活
+            auto out_gpu = import(out);
+            NN_TRY_CHECK(out_gpu);
+            std::optional<GpuTensor> out_view;
+            GpuTensor* out_override = nullptr;
+            if (out_gpu->precision() == Precision::F16)
+            {
+                if (!out_gpu->gpu_shared<Precision::F16>())
+                    NN_FAIL("GpuEngine::end_expr: f16 占位缺少 f16 GPU 存储"
+                            "（precision 标签与存储不一致）");
+                out_view = f16_view(*out_gpu);
+                out_override = &*out_view;
+            }
+            else
+            {
+                if (!out_gpu->gpu_shared<Precision::F32>())
+                    NN_FAIL("GpuEngine::end_expr: f32 占位缺少 f32 GPU 存储"
+                            "（precision 标签与存储不一致）");
+                out_override = &out_gpu->gpu_tensor();
+            }
+            const auto vp = nn::expr_spec_runtime_view_params(spec);
+            auto r = backend_.run_fused_gpu(
+                fs->key, gpu_inputs, spec.consts, rows, cols, vector_out, vp,
+                spec.rparams, out_override,
+                nn::expr_spec_runtime_matmul_k(spec),
+                nn::expr_spec_runtime_matmul_batch(spec),
+                nn::expr_spec_runtime_matmul_trans(spec),
+                is_fold ? nn::expr_spec_runtime_fold_k(spec) : std::nullopt,
+                /*out_f16=*/false, psig);
+            NN_TRY_CHECK(r);
+            return {};
+        }
+#endif
+        NN_FAIL("GpuEngine::end_expr: 融合 kernel 未命中 AOT 融合 shader（闭合世界）；"
+                "请将 begin_expr/end_expr 段纳入构建期扫描（scan_exprs）；key=" + key);
+    }
+
+    // ── 复合 kernel 可用性查询（闭合世界降级的判据）────────────────────────
+    // true = 该复合结构在 AOT 注册表里可执行（含 `#a`/`#x` 精度变体与写穿形态
+    // 前置条件）。**只查不判错**：miss 由调用方降级为逐成员派发（见
+    // execute_fused_graph）。与 run_graph_kernel_into_ / eval_expr_multi_into
+    // 的选路同源——这里若"过宽"（说可用但实际查不到）不会静默错值，只是让
+    // 下游把原来的硬报错照常抛出。
+    [[nodiscard]] bool composite_kernel_available_(
+        const FusedKernel& k, std::span<const Tensor> ins, const Tensor& out) const
+    {
+#ifndef NN_FUSED_REGISTRY_EMBEDDED
+        (void)k; (void)ins; (void)out;
+        return true;   // 收集器 TU：融合执行分支整体不编译
+#else
+        if (k.spec.extras.empty())
+        {
+            // 单输出链：与 run_graph_kernel_into_ 同源的 (key, psig) 选路
+            const bool is_fold = k.spec.fold.has_value();
+            const ExprSpec spec = is_fold ? k.spec : nn::canonicalize_expr_spec(k.spec);
+            const std::string key = nn::expr_spec_key(spec);
+            const nn::ExprPrecSig psig = nn::expr_prec_sig_of(ins, out.precision());
+            const nn::fused::FusedShader* fs = (psig != 0)
+                ? find_prec_variant_(key, psig, spec, /*log_hit=*/false)
+                : nn::fused::find_fused(key);
+            return fs != nullptr && backend_.has_fused_shader(fs->key);
+        }
+        // 写穿物化（多输出）：V0 专用——eval_expr_multi_into 的 NVI 前置校验
+        // 要求输入/输出全 f32，这里同条件（不满足 = 不可用 = 逐成员降级）
+        for (const auto& t : ins)
+            if (t.precision() != Precision::F32)
+                return false;
+        if (out.precision() != Precision::F32)
+            return false;
+        const std::string key =
+            nn::expr_spec_key(nn::canonicalize_expr_spec(k.spec));
+        const nn::fused::FusedShader* fs = nn::fused::find_fused(key);
+        return fs != nullptr && backend_.has_fused_shader(fs->key);
+#endif
+    }
+
+    // ── P3：Tensor → 底层存储身份（批量分组的 hazard 判定用）──────────────
+    // 同一底层 buffer（或 CPU 同一 Matrix 存储）→ 同一 token；空 = 不适用。
+    // 用途：判"任一成员是否消费/覆写另一成员的物化输出"（含目标传递同 dst 的
+    // 无依赖边形态，如 AdamW 的 decay 与 update 都写 p）。
+    [[nodiscard]] static const void* tensor_storage_token_(const Tensor& t)
+    {
+        if (!t.valid())
+            return nullptr;
+        if (t.is_gpu())
+        {
+            if (t.precision() == Precision::F16)
+            {
+                auto s = t.gpu_shared<Precision::F16>();
+                return s ? static_cast<const void*>(s->shared_buffer().get())
+                         : nullptr;
+            }
+            auto s = t.gpu_shared<Precision::F32>();
+            return s ? static_cast<const void*>(s->shared_buffer().get())
+                     : nullptr;
+        }
+        if (t.precision() == Precision::F16)
+        {
+            auto s = t.cpu_shared<Precision::F16>();
+            return s ? static_cast<const void*>(s.get()) : nullptr;
+        }
+        auto s = t.cpu_shared<Precision::F32>();
+        return s ? static_cast<const void*>(s.get()) : nullptr;
+    }
+
+    // ── P3：`key#b` 批量变体可用性（注册表 + pipeline 双命中）──────────────
+    // 设备无 buffer device address 时注册期即跳过 `#b` → 此处恒 false →
+    // 调用方逐 kernel 降级（闭合世界降级，不是错误）。
+    [[nodiscard]] bool batch_variant_available_(const ExprSpec& spec) const
+    {
+#ifdef NN_FUSED_REGISTRY_EMBEDDED
+        const std::string bkey = nn::expr_spec_key(spec) + nn::EXPR_BATCH_SUFFIX;
+        const nn::fused::FusedShader* fs = nn::fused::find_fused(bkey);
+        return fs != nullptr && backend_.has_fused_shader(fs->key);
+#else
+        (void)spec;
+        return false;
+#endif
+    }
+
+    // ── P3 批量组键：结构 key + consts/rparams/vp **值位型序列**────────────
+    // 批量派发共享一份 push constants → 值必须逐位一致才可同组（值不进结构
+    // key，但进组键）。按 32 位位型（%08x）而非十进制串接：同值同键、异位型
+    // 必异键（NaN 载荷 / -0.0 不合并——PC 是逐位 memcpy，合并即改数值）。
+    [[nodiscard]] static std::string batch_group_key_(const ExprSpec& spec)
+    {
+        static_assert(sizeof(Scalar) == sizeof(std::uint32_t),
+                      "batch_group_key_ 按 32 位位型编码标量");
+        std::string s = nn::expr_spec_key(spec);
+        const auto feed_u32 = [&s](std::uint32_t v)
+        {
+            char buf[9];
+            std::snprintf(buf, sizeof(buf), "%08x", v);
+            s += '|';
+            s += buf;
+        };
+        const auto feed_scalar = [&feed_u32](Scalar v)
+        {
+            std::uint32_t bits = 0;
+            std::memcpy(&bits, &v, sizeof(bits));
+            feed_u32(bits);
+        };
+        for (Scalar v : spec.consts)
+            feed_scalar(v);
+        s += "|r";
+        for (Scalar v : spec.rparams)
+            feed_scalar(v);
+        s += "|v";
+        for (std::uint32_t v : nn::expr_spec_runtime_view_params(spec))
+            feed_u32(v);
+        return s;
+    }
+
+    // ── 逐成员派发（复合 kernel 未登记时的降级路径）────────────────────────
+    // 每个成员按**自己的单节点结构 + 自己的输入/输出占位**执行，等价于 IR-C
+    // 之前的逐表达式 dispatch（中间量落回占位存储，不再寄存器内联）。成员的
+    // 输入占位此时尚未释放（释放在 end_expr 全部 dispatch 之后），故依赖边
+    // 经 node_outputs 正常解析。
+    [[nodiscard]] Result<void> dispatch_graph_member_(ExprGraph& g, int m)
+    {
+        const auto& nd = g.nodes[static_cast<std::size_t>(m)];
+        std::vector<Tensor> mins;
+        mins.reserve(nd.spec.views.size());
+        for (std::size_t k = 0; k < nd.spec.views.size(); ++k)
+        {
+            const int dep = (k < nd.dep_of_input.size()) ? nd.dep_of_input[k] : -1;
+            if (dep >= 0)
+            {
+                const auto it = g.node_outputs.find(dep);
+                if (it == g.node_outputs.end())
+                    NN_FAIL("GpuEngine::end_expr: 降级派发依赖输出缺失（图 IR 状态损坏）");
+                mins.push_back(it->second);
+            }
+            else
+            {
+                mins.push_back(k < nd.input_tensors.size() ? nd.input_tensors[k]
+                                                           : Tensor{});
+            }
+        }
+        const auto mo = g.node_outputs.find(m);
+        if (mo == g.node_outputs.end())
+            NN_FAIL("GpuEngine::end_expr: 降级派发占位缺失（图 IR 状态损坏）");
+        return run_graph_kernel_into_(nd.spec, mins, nd.rows, nd.cols, nd.vector_out,
+                                      mo->second);
+    }
+
     // ── 辅助：f16 Tensor → GpuTensor **绑定视图** ─────────────────────────
     // 只借用底层 buffer + 形状；字节布局由 f16 存储版 pipeline 决定（调用方
     // 必须同时保证 f16_io 语义）。与 run_fused_gpu 的 out_f16 同一套做法
