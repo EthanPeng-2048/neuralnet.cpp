@@ -187,9 +187,10 @@ public:
         if (engine_ == nullptr)
             NN_FAIL("Model::forward: engine not bound");
         Tensor x = input;
-        for (auto& layer : layers_)
+        for (std::size_t li = 0; li < layers_.size(); ++li)
         {
-            auto r = layer->forward(x);
+            NN_PROF_SCOPE(nn::prof::interned("fwd.layer", li));
+            auto r = layers_[li]->forward(x);
             NN_TRY_CHECK(r);
             x = std::move(*r);
         }
@@ -206,6 +207,7 @@ public:
         Tensor g = grad_output;
         for (std::size_t i = layers_.size(); i-- > 0;)
         {
+            NN_PROF_SCOPE(nn::prof::interned("bwd.layer", i));
             auto r = layers_[i]->backward(g);
             NN_TRY_CHECK(r);
             g = std::move(*r);

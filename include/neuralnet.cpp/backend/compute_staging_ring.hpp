@@ -147,6 +147,10 @@ public:
             buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
             buf_info.size = region_size_;
             buf_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            // P3：与 GpuBuffer 创建侧同款补 SHADER_DEVICE_ADDRESS（池分配侧
+            // 配对 DEVICE_ADDRESS 标志；本缓冲不进实例表，仅保持全库一致）
+            if (pool_->device_address_alloc())
+                buf_info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
             buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
             VkResult res = vkCreateBuffer(device_, &buf_info, nullptr, &r.buffer);

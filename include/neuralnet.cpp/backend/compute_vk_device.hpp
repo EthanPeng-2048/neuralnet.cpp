@@ -85,9 +85,21 @@ private:
     // 的前提。与 has_16bit_storage_ 独立：只有存储没 ALU 的设备仍走"f16 存储 +
     // f32 算术"变体；两者齐备才启用"f16 直算"变体。
     bool has_shader_float16_ = false;
+    // ── buffer device address（P3 跨链批量派发的 `#b` 变体前提）───────────
+    // Vulkan 1.2 核心特性（VK_KHR_buffer_device_address）：查询 + 启用
+    // bufferDeviceAddress 后，实例表才能按 64 位设备地址经 buffer reference
+    // 直接解引用各实例的输入/输出缓冲。不支持 → bda_available()=false →
+    // 后端不登记 `key#b` pipeline → 运行期逐 kernel 降级（正确性不变）。
+    bool has_buffer_device_address_ = false;
     uint32_t subgroup_size_ = 4;  // 计算队列 subgroup 尺寸——matmul_gemv 的
                                   // red[..][64] 容量前提（256/subgroup≤64）；
                                   // VK1.1 查询失败按 4 兜底，见 initialize
+    // ── timestamp query 能力（NN_PROFILE 设备侧计时，core_profile.hpp）────
+    // validBits = 所选计算队列族的 timestampValidBits（=0 → 该队列不支持
+    // 时间戳，设备侧计时整体降级为 host 计时，见 GpuBackend::initialize）；
+    // period = 一个时间戳 tick 的纳秒数（ticks × period = ns）。
+    uint32_t queue_timestamp_valid_bits_ = 0;
+    float timestamp_period_ns_ = 1.0f;
 
 public:
     VulkanDevice() = default;
@@ -264,6 +276,7 @@ public:
             VkPhysicalDeviceProperties props;
             vkGetPhysicalDeviceProperties(physical_device_, &props);
             device_name_ = props.deviceName;
+            timestamp_period_ns_ = props.limits.timestampPeriod;   // tick → ns
         }
 
         // 3. 查找计算队列族
@@ -279,6 +292,7 @@ public:
             if (queue_families[i].queueFlags & VK_QUEUE_COMPUTE_BIT)
             {
                 queue_family_index_ = i;
+                queue_timestamp_valid_bits_ = queue_families[i].timestampValidBits;
                 found_queue = true;
                 break;
             }
@@ -370,6 +384,25 @@ public:
         // 避免把未启用的特性声明进 pNext（校验层 VUID-VkDeviceCreateInfo 系列）。
         f16alu.shaderInt8 = VK_FALSE;   // 本库不用 int8 ALU，恒不启用
 
+        // buffer device address（P3 `#b` 批量变体）：查询 + 启用，见成员注释。
+        VkPhysicalDeviceBufferDeviceAddressFeatures bda{};
+        bda.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+        {
+            VkPhysicalDeviceProperties bda_props{};
+            vkGetPhysicalDeviceProperties(physical_device_, &bda_props);
+            if (app_info.apiVersion >= VK_API_VERSION_1_2 &&
+                bda_props.apiVersion >= VK_API_VERSION_1_2)
+            {
+                VkPhysicalDeviceFeatures2 bdaq{};
+                bdaq.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+                bdaq.pNext = &bda;
+                vkGetPhysicalDeviceFeatures2(physical_device_, &bdaq);
+                has_buffer_device_address_ = (bda.bufferDeviceAddress == VK_TRUE);
+            }
+        }
+        if (!has_buffer_device_address_)
+            bda.bufferDeviceAddress = VK_FALSE;
+
         float queue_priority = 1.0f;
         VkDeviceQueueCreateInfo queue_info{};
         queue_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -403,6 +436,12 @@ public:
             chain = reinterpret_cast<VkBaseInStructure*>(&storage16);
         else if (timeline_semaphores_)
             chain = reinterpret_cast<VkBaseInStructure*>(&timeline_features);
+        // P3 BDA（`#b` 批量变体）：支持即启用，作为 pNext 链头（其余链不变）
+        if (has_buffer_device_address_)
+        {
+            bda.pNext = chain;
+            chain = reinterpret_cast<VkBaseInStructure*>(&bda);
+        }
         device_info.pNext = chain;
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;
@@ -426,10 +465,21 @@ public:
     [[nodiscard]] bool has_16bit_storage() const noexcept { return has_16bit_storage_; }
     // f16 ALU（shaderFloat16）是否已启用：原生 f16 算术 shader 前提
     [[nodiscard]] bool has_shader_float16() const noexcept { return has_shader_float16_; }
+    // buffer device address 是否已启用：P3 批量派发（`key#b`）前提。未启用
+    // → 后端不登记 `#b` pipeline，运行期逐 kernel 降级（可观测、非错误）。
+    [[nodiscard]] bool bda_available() const noexcept
+    { return has_buffer_device_address_; }
     // 所选物理设备名（"NVIDIA CMP 40HX" 等；初始化前为空）
     [[nodiscard]] const std::string& device_name() const noexcept { return device_name_; }
     // 计算队列 subgroup 尺寸（初始化前 = 兜底值 4；GEMV 分派门禁用）
     [[nodiscard]] uint32_t subgroup_size() const noexcept { return subgroup_size_; }
+    // timestamp query 能力（NN_PROFILE 设备侧计时）：
+    // validBits=0 → 所选队列不支持时间戳；period = 1 tick 的纳秒数
+    [[nodiscard]] uint32_t queue_timestamp_valid_bits() const noexcept
+    {
+        return queue_timestamp_valid_bits_;
+    }
+    [[nodiscard]] float timestamp_period_ns() const noexcept { return timestamp_period_ns_; }
     // 已启用时间线信号量（决定跨 submit 依赖走信号量还是 host 等 fence）
     [[nodiscard]] bool has_timeline_semaphores() const noexcept
     {

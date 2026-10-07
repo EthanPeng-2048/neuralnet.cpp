@@ -193,6 +193,14 @@ enum class ExprViewKind : uint8_t
     //   RowAccess 同属"逐元素索引/局部读取"类，走 elementwise 生成路径。
     GroupedReduceSum = 13,
     GroupedReduceMax = 14,
+    // ── 转置读取（不物化转置副本）────────────────────────────────────
+    // 逻辑网格 (rows, cols) 读取**按 (cols, rows) 存储**的输入缓冲：
+    //   读取 data[col * param + row]（param = 存储行距 = 底层行主序的列数）。
+    // 用于"归约轴在存储行方向"的场景（如交叉熵沿词表行归约而 logits 为
+    // (vocab, total) 存储）——零额外内存/趟次地把 (rows, K) 网格映射到
+    // (K, rows) 存储。param 是**运行时形状数据**（vp 槽、不进 key）：同结构
+    // 不同形状共享一个融合 shader（与 RowMod/RowAccess 同处理）。
+    Transpose = 15,
 };
 
 // ── 归约视图辅助（引擎/校验共用）──────────────────────────────────────
@@ -411,6 +419,12 @@ struct FoldSpec
 //     逐元素链经 Matmul 操作数读取（matmul 不消耗逐元素寄存器）；
 //     instrs 可为空（输出 = matmul 结果本身）。
 //   - fold 段（可选）：见 FoldSpec；存在时 instrs 必须为空，输出 = fold 输出。
+//   - extras（P2 多输出，2026-10-06）：除主输出（instrs.back().dst）外**额外
+//     物化**的寄存器列表（槽序 = 输出槽 1..k）。IR-C 写穿物化用：图融合把
+//     状态量（如 Adam 的 m/v）连同其消费链拼进单 kernel 时，状态寄存器经
+//     extras 落回各自张量。**仅纯逐元素 spec**（无 matmul/fold/归约）支持；
+//     仅 V0（全 f32）变体生成（`#x`/`#a` 变体跳过——多输出节点同精度融合由
+//     fuse_expr_graph 的精度门禁保证）。属于结构 → 进 key。
 // 上限（校验保证，亦约束 GPU 路径资源）：
 //   - 指令 ≤ 64，寄存器 ≤ 16，输入 ≤ 8，常量 ≤ 16
 struct ExprSpec
@@ -422,7 +436,11 @@ struct ExprSpec
     std::uint32_t               num_regs = 0;
     std::optional<MatmulSpec>   matmul;  // 前置 matmul 段（可选；缺省=无）
     std::optional<FoldSpec>     fold;    // 分块状态归约段（可选；缺省=无）
+    std::vector<std::uint8_t>   extras;  // P2 额外输出寄存器（槽 1..k；见上）
 };
+
+// 多输出上限（Adam 金刚石 = 3 extras：m/v/delta，主输出 p）
+inline constexpr std::size_t EXPR_MAX_EXTRA_OUT = 4;
 
 // ── matmul 段辅助（引擎/校验/生成器共用）──────────────────────────────
 [[nodiscard]] inline bool expr_spec_has_matmul(const ExprSpec& s) noexcept
@@ -491,7 +509,8 @@ struct ExprSpec
            k == ExprViewKind::BatchMod || k == ExprViewKind::BatchCol ||
            k == ExprViewKind::RowAccess ||
            k == ExprViewKind::GroupedReduceSum ||
-           k == ExprViewKind::GroupedReduceMax;
+           k == ExprViewKind::GroupedReduceMax ||
+           k == ExprViewKind::Transpose;
 }
 // 该视图消耗的运行时视图参数槽位数（RowAccess 用 offset+mod 两个 vp 槽）
 [[nodiscard]] inline constexpr std::uint32_t expr_view_runtime_param_slots(
@@ -551,6 +570,17 @@ struct ExprSpec
     return axis;
 }
 
+// ── P3 批量变体资格（`key#b`，跨链批量派发）──────────────────────────────
+// 纯逐元素 = 无归约轴、无 fold 段、无 matmul 段、指令表非空。该类结构可
+// 生成/派发批量变体：同结构多实例经实例表一次 dispatch（含 P2 多输出 extras
+// 复合结构——optimizer 主力）；只发 V0 全 f32（f16/混精度走既有逐 kernel 路径）。
+// **生成器（fused_generate）与运行期分组（execute_fused_graph）同源用本函数**。
+[[nodiscard]] inline bool expr_spec_batchable(const ExprSpec& s)
+{
+    return expr_spec_reduce_axis(s) == -1 && !s.fold && !s.matmul &&
+           !s.instrs.empty();
+}
+
 // ── 表达式规格相等比较（GPU AOT 匹配用）────────────────────────────────
 // 两个 ExprSpec 相等 ⟺ 指令序列、输入视图、常量池、运行时参数、寄存器数、
 // matmul 段全部一致。
@@ -561,7 +591,8 @@ struct ExprSpec
            a.consts == b.consts && a.rparams == b.rparams &&
            a.num_regs == b.num_regs &&
            a.matmul == b.matmul &&
-           a.fold == b.fold;
+           a.fold == b.fold &&
+           a.extras == b.extras;
 }
 
 // 该 spec 的运行时标量参数个数（= 融合 shader 的 push constant 浮点 p 槽位数）
@@ -594,6 +625,9 @@ struct ExprSpec
     const auto feed_u32 = [&](std::uint32_t v) { feed(&v, sizeof(v)); };
 
     feed_u32(s.num_regs);
+    // P2 多输出（extras）：寄存器号是结构（决定 shader 的额外输出存储）→ 进 key
+    feed_u32(static_cast<std::uint32_t>(s.extras.size()));
+    for (const auto& e : s.extras) feed(&e, 1);
     feed_u32(static_cast<std::uint32_t>(s.instrs.size()));
     for (const auto& in : s.instrs)
     {
@@ -742,10 +776,14 @@ inline constexpr ExprPrecSig EXPR_PREC_SIG_DISPATCH = 0x00020000u;
 { return s == EXPR_PREC_SIG_DISPATCH; }
 
 // 运行期分派变体的 key 后缀（结构 key + "#x"）。#x 不含 [0-9a-f] 之外的
-// 字符，且既有变体后缀是 "#%04x" / "#a"，不会碰撞。
+// 字符，且既有变体后缀是 "#%04x" / "#a" / "#b"，不会碰撞。
 inline constexpr const char* EXPR_PREC_DISPATCH_SUFFIX = "#x";
 // native16（原生 f16 算术，见 expr_prec_sig_native16）变体的 key 后缀。
 inline constexpr const char* EXPR_PREC_ALU_SUFFIX = "#a";
+// P3 跨链批量派发变体的 key 后缀（结构 key + "#b"）：同结构、同参数值、
+// 互不依赖的多实例合成**一次批量派发**（实例表 + buffer device address）。
+// 仅纯逐元素结构、仅 V0 全 f32（见 expr_spec_batchable）。
+inline constexpr const char* EXPR_BATCH_SUFFIX = "#b";
 
 // 第 i 个输入是否为 f16 / 输出是否为 f16
 // ⚠ in_f16 必须先与 EXPR_PREC_SIG_INPUT_MASK 相与：EXPR_PREC_SIG_DISPATCH
@@ -925,6 +963,32 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
         NN_FAIL("validate_expr_spec: too many runtime params");
     if (spec.views.size() != num_inputs)
         NN_FAIL("validate_expr_spec: views count != inputs count");
+    // P2 多输出（extras，IR-C 写穿物化）：仅纯逐元素 spec；额外输出寄存器须
+    // 被某指令定义、槽互异、且不与主输出（instrs.back().dst）重复。
+    if (!spec.extras.empty())
+    {
+        if (spec.matmul || spec.fold)
+            NN_FAIL("validate_expr_spec: extras 仅支持纯逐元素 spec（无 matmul/fold）");
+        if (expr_spec_reduce_axis(spec) != -1)
+            NN_FAIL("validate_expr_spec: extras 仅支持纯逐元素 spec（无归约）");
+        if (spec.extras.size() > EXPR_MAX_EXTRA_OUT)
+            NN_FAIL("validate_expr_spec: too many extra outputs");
+        for (std::size_t k = 0; k < spec.extras.size(); ++k)
+        {
+            if (spec.extras[k] >= spec.num_regs)
+                NN_FAIL("validate_expr_spec: extra output reg out of range");
+            if (spec.extras[k] == spec.instrs.back().dst)
+                NN_FAIL("validate_expr_spec: extra output duplicates primary output");
+            for (std::size_t j = 0; j < k; ++j)
+                if (spec.extras[k] == spec.extras[j])
+                    NN_FAIL("validate_expr_spec: duplicate extra output reg");
+            bool defined = false;
+            for (const auto& ins : spec.instrs)
+                if (ins.dst == spec.extras[k]) { defined = true; break; }
+            if (!defined)
+                NN_FAIL("validate_expr_spec: extra output reg never defined");
+        }
+    }
     // matmul 段：A/B 输入下标必须在输入范围内（形状由引擎按实际张量推导）
     if (spec.matmul)
     {
@@ -1055,9 +1119,11 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
                     if (expr_view_is_reduce(vk))
                         NN_FAIL("validate_expr_spec: fold body: reduce-view input not allowed");
                     if (vk == ExprViewKind::Linear || vk == ExprViewKind::RowMod ||
-                        vk == ExprViewKind::RowBroadcast)
+                        vk == ExprViewKind::RowBroadcast ||
+                        vk == ExprViewKind::Transpose)
                         ;  // 标量域恒允许；RowBroadcast = 行参数向量（b[row]，
-                           //   无列依赖——doc_col 等行级掩码参数恒可用）
+                           //   无列依赖——doc_col 等行级掩码参数恒可用）；
+                           //   Transpose = 转置读（data[col*param+row]，通用索引）
                     else if ((vk == ExprViewKind::BatchMod ||
                               vk == ExprViewKind::BatchCol) && has_mm)
                         ;  // 双域：掩码钩子消费（ALiBi 斜率 / doc_ids），需 batch 网格
@@ -1081,8 +1147,15 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
         }
 
         // finalize：只读状态/常量/rparam/Row——禁归约、禁 Input、禁块内临时
-        for (const auto& ins : f.finalize)
+        //   （链内临时 = 各指令 dst，def-before-use 可读，见下）
+        std::vector<uint8_t> fin_def(spec.num_regs, 0);   // 本列已写（def-before-use）
+        std::vector<int> fin_write_max(spec.num_regs, -1);// 任一写的位置（污染判定）
+        for (std::size_t fi = 0; fi < f.finalize.size(); ++fi)
+            if (f.finalize[fi].dst < spec.num_regs)
+                fin_write_max[f.finalize[fi].dst] = static_cast<int>(fi);
+        for (std::size_t fi = 0; fi < f.finalize.size(); ++fi)
         {
+            const auto& ins = f.finalize[fi];
             const ExprOp op = static_cast<ExprOp>(ins.op);
             if (expr_op_is_reduce(op))
                 NN_FAIL("validate_expr_spec: fold finalize: reduce not allowed");
@@ -1111,14 +1184,27 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
                 {
                     if (opnd.idx >= spec.num_regs)
                         NN_FAIL("validate_expr_spec: fold finalize reg out of range");
-                    if (opnd.idx >= f.num_state)
-                        NN_FAIL("validate_expr_spec: fold finalize reads block-local register");
+                    // 读取许可（多指令链内临时 def-before-use + 跨迭代污染拒）：
+                    //   ① 被**先前** finalize 指令写过 → 本列迭代内先写后读，
+                    //     链内临时与状态覆写后的新值均安全（多列循环每列重放
+                    //     同一序列 → 每列重写后再读）；
+                    //   ② 否则必须是状态前缀，且多列（vec_state_len>0）下该
+                    //     状态不得被 finalize 覆写——次列会读到上一列的输出
+                    //     （如 dst 复用被读状态 l：首列输出覆盖除数，次列起
+                    //     全错值）。单列（=0）无跨迭代，fold v1 的状态自复制
+                    //     finalize（同指令读写状态）合法。
+                    if (opnd.idx >= f.num_state && !fin_def[opnd.idx])
+                        NN_FAIL("validate_expr_spec: fold finalize reads undefined chain temp (def-before-use)");
+                    if (opnd.idx < f.num_state && !fin_def[opnd.idx] &&
+                        f.vec_state_len > 0 && fin_write_max[opnd.idx] >= 0)
+                        NN_FAIL("validate_expr_spec: fold finalize: written reg also read "                         "(multi-column loop would read its own prior output)");
                 }
                 else if (k == ExprOperandKind::Const && opnd.idx >= spec.consts.size())
                     NN_FAIL("validate_expr_spec: fold finalize const out of range");
                 else if (k == ExprOperandKind::RParam && opnd.idx >= spec.rparams.size())
                     NN_FAIL("validate_expr_spec: fold finalize rparam out of range");
             }
+            fin_def[ins.dst] = 1;
         }
 
         // 类别流分析：状态不得从元素类（kb 依赖）源更新
@@ -1127,32 +1213,8 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
         // vecacc 缩放必须是行标量（广播 rescale；吃元素源=跨 kb 覆盖）
         if (f.vecacc && (*cls)[f.vecacc->scale_reg] != 0)
             NN_FAIL("validate_expr_spec: fold vecacc: scale_reg must be row-scalar class");
-        // 向量域多列循环的**写后读跨迭代污染**静态拒：finalize 被写的寄存器
-        //   不得再被任何源读取（如 dst 复用被读状态 l——首列输出覆盖除数，
-        //   次列起全错值）。单列输出（vec_state_len=0）无跨迭代，
-        //   不受限（fold v1 的状态自复制 finalize 合法）。
-        if (f.vec_state_len > 0)
-        {
-            std::vector<uint8_t> fin_written(spec.num_regs, 0);
-            std::vector<uint8_t> fin_read(spec.num_regs, 0);
-            for (const auto& ins : f.finalize)
-            {
-                fin_written[ins.dst] = 1;
-                const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
-                const std::size_t nops = expr_instr_num_operands(
-                    static_cast<ExprOp>(ins.op));
-                for (std::size_t oi = 0; oi < nops; ++oi)
-                {
-                    const auto k = static_cast<ExprOperandKind>(ops[oi]->kind);
-                    if ((k == ExprOperandKind::Reg ||
-                         k == ExprOperandKind::Fanout) && ops[oi]->idx < spec.num_regs)
-                        fin_read[ops[oi]->idx] = 1;
-                }
-            }
-            for (std::uint32_t i = 0; i < spec.num_regs; ++i)
-                if (fin_written[i] && fin_read[i])
-                    NN_FAIL("validate_expr_spec: fold finalize: written reg also read "                         "(multi-column loop would read its own prior output)");
-        }
+        // （跨迭代写后读污染已在上方 finalize 逐读检查中精确覆盖：被写状态在
+        //   写前读 = 多列循环读到上一列输出 → 拒；链内临时 def-before-use → 许。）
     }
     // 视图：RowGather 的标签槽（param）必须在输入范围内
     for (std::size_t k = 0; k < spec.views.size(); ++k)
@@ -1263,6 +1325,9 @@ namespace expr
     { return {10, 0, modulo}; }
     inline constexpr ExprView batch_col(std::uint32_t per_batch_cols)
     { return {11, 0, per_batch_cols}; }
+    // 转置读（param = 存储行距；运行期 vp 槽、不进 key）
+    inline constexpr ExprView trans(std::uint32_t row_stride)
+    { return {15, 0, row_stride}; }
 } // namespace expr
 
 } // namespace nn

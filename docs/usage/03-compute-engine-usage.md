@@ -599,7 +599,7 @@ if (!back) return std::unexpected(back.error());
 
 > **一句话**：DSL 表达式就是**普通 C++ 表达式树**（值语义、编译期类型），由 `nn::dsl::leaf(tensor)` 引用输入、`nn::dsl::rparam(v)` 引用运行时标量，用普通数学运算符拼出来，交给 `dsl::compute` / `dsl::compute_into` / `dsl::compute_reduce` 求值。
 >
-> **没有 lambda 形式的提交流水线，没有跨表达式录制**（`start_expr`/`end_expr` 不存在）。融合粒度 = **单条表达式**。
+> **没有 lambda 形式的提交流水线**。融合粒度默认 = **单条表达式**；跨表达式录制（IR-C）由**引擎侧** `engine.begin_expr()` / `engine.end_expr()` + `ExprSegment` 提供（见 §8.9）。`dsl::start_expr/end_expr` 是"**单表达式**跨行书写"的语法糖，不是跨表达式。
 
 ### 8.1 三个求值入口（完整签名）
 
@@ -931,6 +931,22 @@ auto bad = nn::dsl::matmul(q, k, true, false, 1, 0.125f);
 
 **DSL 里没有的矩阵入口**（它们是**引擎原语**，不是 DSL）：`dsl::add_inplace` / `scale_inplace` / `accumulate` / `transpose` / `batched_matmul` / `matmul_with_bias` / `slice_rows` / `gather_rows` / `zero`。DSL 里的原地写法用 `compute_into`（§8.1）。
 
+### 8.9 跨表达式录制（IR-C，引擎侧入口）
+
+把一个 step 内的多个表达式录进一张图，融合分析后合成 kernel（P2 写穿可让一个 kernel 有多个输出，`ExprSpec.extras` ≤4，每个成员输出写回各自张量）：
+
+```cpp
+NN_TRY(seg_begin, engine.begin_expr());       // 开始录制（GPU 真录制）
+nn::ExprSegment seg(engine);                  // RAII：作用域退出自动兜底收口
+// 录制期内正常写 dsl::compute / compute_into，GPU 上入图不求值
+NN_TRY_CHECK(seg.end());                      // 显式收口；end_expr 错误照常传播
+```
+
+- **GPU-only 收益**：只有 `GpuEngine::execute_fused_graph` 真做图融合；**CPU 普通运行 `begin_expr/end_expr` 是 no-op**（数值不变），构建期收集器 `NN_EXPR_SCAN` 下 `end_expr` 会跑同一套融合分析并登记 spec。
+- **闭合世界**：录制段折叠出的结构必须被构建期 `scan_exprs`（收集器目标）覆盖，运行时才命中预生成 shader。未登记时**只有复合 kernel 降级**——拆回成员逐个派发（成员都是已登记的**单节点**结构，`NN_IRC_TRACE=1` 打 `[ir-c][degrade]`）；未登记的**单节点**结构仍是**硬报错**。
+- **融合规则**：P1 链（单输出逐元素链，允许 matmul 头段）与 P2 分量（纯逐元素 F32 同形状节点连通成组、多消费者不再阻断，写穿全部成员输出）。
+- 不需要多输出/写穿的场景，直接把长链写成一个 `dsl::compute` 更简单——**仍是首选**。库内生产调用方是 `Adam::step` / `AdamW::step`（每参数张量 1 个多输出 kernel）。
+
 ---
 
 ## 9. 矩阵级原语
@@ -1245,7 +1261,7 @@ auto attn = engine.eval_expr(
     inputs, rows, cols, p_.stable);
 ```
 
-> `nn::expr::make_fold_attn_o` 等 fold 构造定义在 `compute_layer_attention.hpp`（AOT 原则："表达式文本只出现在 Layer"）。入参是**掩码 `AttnMaskKind{Plain, Causal, CausalDoc}` × 位置偏置 `bool score_bias`（ALiBi）**两个正交维度，`scan_exprs` 里必须把 5 个实际组合（3 掩码 × 2 偏置 − 1，"Plain + 偏置"不存在）**全部登记**，漏登记 → GPU 闭合世界硬报错。ALiBi 的偏置在 **backward** 里是掩码之后的独立一步（`PositionEncoder::apply_score_bias`），forward 则融在同一个 fold kernel 内。
+> `nn::expr::make_fold_attn_o` 等 fold 构造定义在 `compute_layer_attention.hpp`（AOT 原则："表达式文本只出现在 Layer"）。入参是**掩码 `AttnMaskKind{Plain, Causal, CausalDoc}` × 位置偏置 `bool score_bias`（ALiBi）**两个正交维度，`scan_exprs` 里必须把 5 个实际组合（3 掩码 × 2 偏置 − 1，"Plain + 偏置"不存在）**全部登记**，漏登记 → GPU 闭合世界硬报错。ALiBi 的偏置在 **backward** 里是掩码之后的独立一步（`PositionEncoder::apply_score_bias`），forward 则融在同一个 fold kernel 内。通用 fold 值构造（如 `nn::expr::make_fold_logsumexp`）走 **`FoldAnchor` 自登记**，无需改 `scan_exprs`。
 
 **普通业务代码不应该直接调这三个入口**——用 `dsl::compute*`。它们是给"Layer 显式登记 fold 构造"和"引擎自测"用的。
 
@@ -1618,7 +1634,7 @@ if (nn::dsl::env_flag("NN_PREC_TRACE"))
 | `nn::GpuEngine engine;`（无参） | `GpuEngine(GpuBackend&)` 是唯一构造 |
 | `engine.ensure_gpu(...)` | 已改名 `import`（符号清零，命名即防线） |
 | `engine.set_offload_enabled(...)` | 不存在；开关在 `GPTModel`/`RAPTModel` 的 `set_activation_offload(bool)`，底层 `ActivationOffloader` |
-| `dsl::start_expr` / `end_expr` / `begin_expr` / `record_expr` | **跨表达式录制（IR-C）未采用**；融合粒度 = 单条表达式。无 `expr_graph.hpp` |
+| `dsl::begin_expr` / `dsl::record_expr` | 不存在；跨表达式录制走**引擎**入口 `engine.begin_expr()` / `engine.end_expr()`（IR-C，见 §8.9）。`dsl::start_expr` / `dsl::end_expr` **存在**，但只是"单表达式跨行书写"的语法糖（`ExprBlock`） |
 | lambda 形式提交流水线 | 不存在；表达式就是普通 C++ 表达式树，提交靠 3 个 `dsl::compute*` |
 | `dsl::pow` / `sin` / `cos` / `erf` / `gelu` / `sigmoid` / `clamp` / `where` / `sqr` / `sum` / `step` | 不存在；用 §8.3 的组合表达，cos/sin 以张量 + `row_mod` 读入 |
 | `dsl::matmul(A, B, alpha)` | **没有 `alpha` 形参**；缩放写尾链 `* dsl::rparam(alpha)` |
@@ -1639,7 +1655,7 @@ if (nn::dsl::env_flag("NN_PREC_TRACE"))
 | 文档 | 何时读 |
 |---|---|
 | `docs/development/01-compute-engine-development.md` | 想**扩展引擎**（加新原语）而不是使用它 |
-| `docs/development/12-compute-engine-inventory.md` | 引擎 49 个 virtual 方法的盘点与 Layer 直调分类（复现：`bench/doc_inventory.ps1`） |
+| `docs/development/12-compute-engine-inventory.md` | 引擎 52 个 virtual 方法的盘点与 Layer 直调分类（复现：`bench/doc_inventory.ps1`） |
 | `docs/development/05-mixed-precision.md` | 多精度类型系统、f16 语义锚与实测结论（§12 已知限制） |
 | `docs/development/02-operator-fusion.md` + `03-ir-optimization.md` | 表达式融合与 IR 细节 |
 | `docs/development/17-unified-tensor-engine.md` | 统一张量/引擎总纲：访问不变量（铁律 #11）、Matrix 降级（铁律 #12）、InitSpec、批量读写、内存契约 |

@@ -296,6 +296,8 @@
 | `byte_fallback=True` 不自动补 256 字节，中文→UNK | 分词器 | `BpeTrainer(initial_alphabet=ByteLevel.alphabet())` |
 | C++ CharBPETokenizer 对中文仍是 UNK | 分词器 | 字节级 BPE 拆中文字节，须改 encode 或换 charbpe |
 | tokenizer_infer 预览截断产生半个 UTF-8 字符（终端 ``） | 分词器 | 按完整字符（首字节宽 1/2/3/4）截断 |
+| Windows CRT `abort()` 弹**模态**"abort() has been called"对话框（GUI 弹窗不进 stdout/stderr → 日志/审计全看不见，ctest/脚本卡死等人点；实测 `error_macro_test` 的 abort 负例子进程弹框） | 工程 | abort 落点（`core_errors.hpp` `fail_abort`）终止前 `_set_abort_behavior(0, _WRITE_ABORT_MSG\|_CALL_REPORTFAULT)` + `_set_error_mode(_OUT_TO_STDERR)`——错误信息本就打 stderr，abort 恒为"打印后立即终止"；**弹窗类报错 grep 不到，只能靠人眼/截图**，遇到"测试全绿但用户看到报错"先想 GUI 弹窗 |
+| **跨时段 GPU 设备计时不可比**：同二进制同 shader（注册表内容跨时段不变证实）的 CE 3 kernel 会话早期测 13.2 ms/step、晚期稳定 5.93 ms/step（2.2×），同时段非 CE kernel 一致 ⇒ 非时钟/热；对照混入过的假设有模型形状（`--d-model` 默认 vs 显式）与精度变体分派（`--f16`）——均已排除仍无法归因（P4 实测，2026-10-06） | 性能测量 | **性能数字只认同窗交错测量**（新旧二进制交替跑、或同窗多复测）；跨时段对比必须先用同窗复测证明口径稳定，否则差异可能是机器状态漂移而非代码收益 |
 | 模型/词表等训练产物进 git（204MB 数据集） | 工程 | .gitignore 只留源码，产物一律忽略 |
 
 ---

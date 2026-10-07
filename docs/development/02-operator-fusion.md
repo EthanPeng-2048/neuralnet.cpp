@@ -3,7 +3,7 @@
 > 本文记录算子融合的**当前形态与设计约束**：一期（M1-M7）建立归约语义 IR 与注意力 / 稀疏 CE 的融合结构，二期（S1-S7）把 **matmul 纳入 IR 融合**，让手写融合原语收敛为 IR 表达——**一期的手写融合原语（M4-M6）已不存在，其结构一律由 IR / fold 承载**。两期服务同一目标：减少 GPT+Vulkan 训练显存，同时严格遵循分层铁律。
 >
 > 状态：二期范围 = S1-S5、S7（**S6 自动窗口不接线**，见 §跨 kernel 自动融合）；**注意力 forward 是单 fold kernel（FoldSpec 分块流式求值）——见"关键算法"章，S7 的 IR 链现仅存于 backward**。分期实施流水、删除清单与否决方案的演进记录见 `docs/history.md`。
-> 关联文档：`03-ir-optimization.md`（IR-A/B/D；IR-C 不存在）。
+> 关联文档：`03-ir-optimization.md`（IR-A/B/C/D；IR-C = 图 IR + `begin_expr/end_expr` 融合分析，2026-10-06 恢复）。
 
 **怎么读本文（3 条路径）**：
 
@@ -46,7 +46,7 @@
 
 - Softmax / LayerNorm / RMSNorm / CrossEntropy 融为单 kernel，消除全尺寸中间 Tensor。
 - 注意力采用**单遍分块流式（fold）内存高效算法**，不物化 `O(seq²)` 分数矩阵。
-- **matmul 参与 IR 融合**（matmul 段进 `ExprSpec`），手写融合原语一律收敛为 IR 表达；跨表达式融合不接线（见 §跨 kernel 自动融合）。
+- **matmul 参与 IR 融合**（matmul 段进 `ExprSpec`），手写融合原语一律收敛为 IR 表达；跨表达式融合经 `begin_expr/end_expr` 接线（IR-C，P1/P2，见 §表达式录制与融合边界）。
 - 完全兼容现有 `eval_expr` AOT 闭合世界机制，不引入运行时编译。
 
 ---
@@ -85,7 +85,7 @@ graph LR
     G -->|结构 key| I[scan_exprs + 生成阶段 闭合世界]
 ```
 
-**核心机制**：Layer 用 `dsl::compute` / `compute_reduce` / `compute_into`（GPU 上折叠为 `ExprSpec`）表达算法；引擎/工具按**结构**合成融合 kernel。所有中间 Tensor 由融合 kernel 内部消解，不落 VRAM。注意力 / 稀疏 CE 等结构一律由 IR 表达（`MatmulSpec` 段、归约视图与归约指令、`FoldSpec` fold 段），`glsl_gen` 从 IR 结构统一合成。**不存在"跨表达式融合"**——运行时没有跨表达式录制机制（IR-C 不在库中，见 §表达式录制与融合边界）。
+**核心机制**：Layer 用 `dsl::compute` / `compute_reduce` / `compute_into`（GPU 上折叠为 `ExprSpec`）表达算法；引擎/工具按**结构**合成融合 kernel。所有中间 Tensor 由融合 kernel 内部消解，不落 VRAM。注意力 / 稀疏 CE 等结构一律由 IR 表达（`MatmulSpec` 段、归约视图与归约指令、`FoldSpec` fold 段），`glsl_gen` 从 IR 结构统一合成。**跨表达式融合（IR-C）现行**：`engine.begin_expr()/end_expr()` 在图级录制期拼接多个表达式并融合（`expr_graph.hpp`），见 §表达式录制与融合边界。
 
 ---
 
@@ -158,9 +158,19 @@ struct MatmulSpec {
 
 ## 表达式录制与融合边界
 
-本文的"表达式录制"指**构建期收集**：`scan_exprs` 收集各 Layer 折叠出的 `ExprSpec` **结构**——由 `FusedAnchor<Expr>` 在静态初始化期按表达式类型自登记（编译期可达），再由 dry-run / 模型 pass 补齐运行期配置相关的结构（见 §构建工具链与闭合世界与 §自登记锚点）。**精度签名不是构建期集合**：生成阶段对每个结构发一份运行期精度分派 shader（键 `key#x`），运行时按真实精度填 PC `prec`。这是库里唯一的表达式收集机制。
+"表达式录制"有两层，二者互补：
 
-**运行时没有跨表达式录制**：`ComputeEngine::begin_expr/end_expr`、`dsl::start_expr/end_expr`、`expr_graph.hpp`、演示层 `FusedChainLayer` 均不存在（IR-C 已移除；取舍记录见 `docs/history.md`，另见 `03-ir-optimization.md` §5.3）。融合边界 = 单个表达式的输入/输出；需要融合的长链直接写成**一个** `dsl::compute` 表达式（单个 AOT 融合 kernel）。CPU 侧表达式求值只有两套机制：**DSL 编译期模板路径 + IR 解释器**（见 `12-compute-engine-inventory.md`）。
+**① 构建期收集（不变）**：`scan_exprs` 收集各 Layer 折叠出的 `ExprSpec` **结构**——由 `FusedAnchor<Expr>` 在静态初始化期按表达式类型自登记（编译期可达），再由 dry-run / 模型 pass 补齐运行期配置相关的结构（见 §构建工具链与闭合世界与 §自登记锚点）。**精度签名不是构建期集合**：生成阶段对每个结构发一份运行期精度分派 shader（键 `key#x`），运行时按真实精度填 PC `prec`。
+
+**② 运行时跨表达式录制（IR-C：2026-10-06 恢复，P1 机制 + P2 写穿多输出）**：`expr_graph.hpp` 提供 `ExprGraph`/`ExprGraphNode`/`fuse_expr_graph`/`recording_graph_owner`、per-graph `node_outputs`、全局唯一占位 tag 分配器 `next_virtual_tag()`，以及 P2-12 图级计划缓存（`graph_cache_key`/`FusedKernelPlan`/`instantiate_plan`）。引擎侧入口是虚方法 `ComputeEngine::begin_expr()/end_expr()`（引擎 virtual 总数 **52**）；`dsl::start_expr/end_expr`（`ExprBlock` 语法糖）用于跨行书写**单个**表达式；`ExprSegment` 是 `compute_engine.hpp` 里的 RAII 守卫——作用域退出自动收口录制段并传播 `end_expr` 错误。融合边界不再恒等于单个表达式：
+
+- **GPU 真录制**：`GpuEngine::execute_fused_graph`（图 → 融合分析 → kernel 序列 → AOT dispatch），kernel 输出经 `output_override` 直接写进尾节点占位存储（`run_graph_kernel_into_`）。
+- **CPU no-op**：普通运行 `begin_expr/end_expr` 是 no-op（CPU 数值不变）；构建期收集器 `NN_EXPR_SCAN` 下 `CpuEngine::end_expr` 跑同一套 `fuse_expr_graph` 并登记**每个**融合 kernel 的 spec，使构建期扫描与运行期融合一致（闭合世界）。
+- **融合规则**：**P1 链**（单输出；两端节点均逐元素、无归约、同形状同精度；尾节点恰一个消费者、经 Linear 视图消费；允许 matmul 头段 = 旧 S5 规则）与 **P2 分量**（纯逐元素 F32 同形状节点按依赖边 union-find 成组，多消费者/菱形不再是融合边界；成员输出**全部写穿** = `ExprSpec.extras`，≤4 个 extras、至少 2 个成员；预算溢出则拆成更多 kernel）。kernel 序列按确定性稳定拓扑序执行。
+- **Adam 接线**：`Adam::step`/`AdamW::step` 用 `begin_expr` + `ExprSegment` 录制整个 step；每个参数张量的 K1/K2 m/v 状态写穿 + K3 delta + K4 `p += delta` 目标传递收敛为**一个多输出 kernel**（f32；混合精度自动拆分）。实测（`NN_PROFILE`，GPU NVIDIA CMP 40HX，GPT d_model=64 / 4 层 / heads=4 / seq=256 / batch=64，`adam`，20 步）：`fused@optimizer` 设备 kernel **266 → 66.5 每步**、设备时间 **0.57 → 0.23 ms/step**（设备侧数字与构建配置无关；Debug 构建会放大 host 侧数字）。
+- **闭合世界降级（本轮新增的通用机制）**：融合分组依赖精度（P2 需全 F32 成员、P1 需同精度），混精度 profile 可能产出 f32 构建期扫描从未登记的**复合**结构。构建期不枚举精度组合（2⁴ 爆炸），而是执行期通用降级：复合 kernel 的 AOT shader 未登记（或写穿前置条件不满足——多输出要求输入/输出全 f32）时，`execute_fused_graph` 把该 kernel 拆回逐成员派发——每个成员都是已登记的**单节点**结构，铁律仍成立（只有 AOT 登记的 shader 会跑，未登记的**单节点** spec 仍是硬报错）。该段恢复为 IR-C 之前的行为。
+
+仍可（且常常更简单）把一条长逐元素链直接写成**一个** `dsl::compute` 表达式（单个 AOT 融合 kernel）——这仍是首选机制；跨表达式录制用于同一 step 内多个表达式共享写穿/多输出目标（优化器步即典型）。**`FusedChainLayer`（旧演示层）未恢复**——只恢复机制。取舍记录见 `docs/history.md`，另见 `03-ir-optimization.md` §5.3。
 
 ---
 
@@ -170,7 +180,7 @@ struct MatmulSpec {
 
 现行 forward 是**单 fold kernel 分块流式求值**：QKᵀ / 掩码 / online softmax / ΣwV 在同一 kernel 内逐 `EXPR_FOLD_BLOCK=128` 块完成，`S` 矩阵绝不物化；`tri_skip` 把被屏蔽区整块钳成空转（NR=2，每 WG 两行）。
 
-- **构造位置**：`make_fold_attn_o` 与掩码种类 `AttnMaskKind`（Plain/Causal/CausalDoc）定义在 `compute_layer_attention.hpp`（漏登记任一组合即 GPU 闭合世界硬报错）；位置偏置（ALiBi）是**正交的第二入参** `bool score_bias`，实际登记 5 个组合（3 掩码 × 2 偏置 − 1）。通用 fold 样例在 `expr_fold.hpp`。注意力 forward 直调 `engine.eval_expr(make_fold_attn_o(...))`，**不经 DSL 钩子——scan 的显式登记块是 fold spec 唯一注册来源**。
+- **构造位置**：`make_fold_attn_o` 与掩码种类 `AttnMaskKind`（Plain/Causal/CausalDoc）定义在 `compute_layer_attention.hpp`（漏登记任一组合即 GPU 闭合世界硬报错）；位置偏置（ALiBi）是**正交的第二入参** `bool score_bias`，实际登记 5 个组合（3 掩码 × 2 偏置 − 1）。通用 fold 样例在 `expr_fold.hpp`（rowmax/rowsum/softmax_denom/logsumexp），fold 值构造经 **`FoldAnchor` 自登记**（与 `FusedAnchor` 同机制；`make_fold_logsumexp` 即此形态，新 fold 构造无需改 `scan_exprs`）。注意力 forward 直调 `engine.eval_expr(make_fold_attn_o(...))`，不经 DSL 钩子——其 5 组合由 scan 显式登记块覆盖（存量形态）。
 - **掩码处理**：因果掩码对 row-max 的修正是常数（`-inf` 屏蔽列）；文档块对角掩码按 doc_id 分组；ALiBi 线性偏置折进链内加项。**掩码与位置偏置是两件正交的事、各有策略对象**：`AttnScoreMask` 族（`PlainScoreMask`/`CausalScoreMask`/`CausalDocScoreMask`，**只做掩码**）各自实现 `mask_kind()`（类级常量）+ `prepare()`（构建 doc_col/doc_ids 输入张量）+ `masked_scores()`（反向重算 S 的 DSL 文本），由 `AttentionBase::make_score_mask_()` 在配置期工厂化定型；位置偏置由 `PositionEncoder::apply_score_bias()` 在 **backward** 的"掩码之后、softmax 之前"独立叠加（非 ALiBi = no-op）。引擎只认"matmul+reduce/fold"结构、绝不认算法名。
 - **显存**：`scores`/`masked`/`attn_cache_` 全部不物化，每层注意力激活从 ~3×`BH·seq²` 降到 `O(BH·seq·d_k)`（fold 单遍每块只算一次 QKᵀ，S 从不存在）。
 - **backward**：`recompute_W_` 两步重算 W——① `S = masked(Q·Kᵀ)`（掩码树与 forward 的 fold 变体同构，matmul 分块快路径，S 瞬时物化一遍）② `W = softmax(S)`（单归约表达式，m/l 在 kernel 内部归一化、不作为输入/缓存）；随后 R/X 表达式 + 3×`batched_matmul` 得 grad_Q/K/V，绝不物化概率矩阵。
@@ -203,7 +213,7 @@ struct MatmulSpec {
 
 ## 跨 kernel 自动融合
 
-**当前结论：不接线。** 运行时没有跨表达式融合机制——`eval_expr` / `eval_expr_reduce` 每次调用独立 dispatch，`GpuEngine` 不维护跨表达式的并入窗口，也没有图级融合计划缓存；能融的表达式直接写成**单个** `dsl::compute`（单个 AOT 融合 kernel，只有 input/output 落显存）。二期 S6（自动窗口）与 P2-12（图级缓存）两个方案的取舍记录见 `docs/history.md`；重新立项的前提见 `03-ir-optimization.md` §5.3（记录在 `docs/history.md`）。
+**当前结论：S6 自动窗口不接线。** `GpuEngine` 没有"自动把相邻 `eval_expr` 并入一个窗口"的机制；**跨表达式融合由显式录制提供**（IR-C：`begin_expr/end_expr`，见 §表达式录制与融合边界），且 P2-12 图级融合计划缓存（`graph_cache_key`/`FusedKernelPlan`/`instantiate_plan`）已随之落地。能不写录制就融的表达式仍可直接写成**单个** `dsl::compute`（单个 AOT 融合 kernel，只有 input/output 落显存）。二期 S6（自动窗口）的取舍记录见 `docs/history.md`；IR-C 的当前形态与历史见 `03-ir-optimization.md` §5.3。
 
 ---
 
@@ -260,7 +270,7 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 
 **f16 路径实测**（`NN_PREC_TRACE=1 text_train … --gpu --f16`）：`[prec][miss]=0`、边界 cast 归因表**为空**、`[prec][alu-hit]` 6670 → 全程命中预生成 shader，零 cast 回退。
 
-`scan_exprs` 需覆盖所有 Layer 的 DSL 路径（Softmax/LN/RMSNorm fwd+bwd、CrossEntropy softmax 结构、**Attention fold 结构**——层 forward 直调 `engine.eval_expr(make_fold_attn_o(...))` 不经 DSL 钩子，scan 的显式登记块（3 掩码 × 2 偏置的 5 个组合）是 fold spec 唯一注册来源、漏组合即 GPU 闭合世界硬报错、Linear 的 matmul 段、optimizer 的 `compute_into` 原地表达式），使融合签名被收集。**结构**已由自登记锚点保证（见下节），未命中 → `eval_expr` 硬报错（保持项目"GPU 硬报错、不降级"哲学）。
+`scan_exprs` 需覆盖所有 Layer 的 DSL 路径（Softmax/LN/RMSNorm fwd+bwd、CrossEntropy softmax 结构、**Attention fold 结构**——层 forward 直调 `engine.eval_expr(make_fold_attn_o(...))` 不经 DSL 钩子，scan 的显式登记块（3 掩码 × 2 偏置的 5 个组合）覆盖注意力 fold（漏组合即 GPU 闭合世界硬报错；fold 值构造另有 `FoldAnchor` 自登记通道，见"自登记锚点"节）、Linear 的 matmul 段、optimizer 的 `compute_into` 原地表达式），使融合签名被收集。**结构**已由自登记锚点保证（见下节），未命中 → `eval_expr` 硬报错（保持项目"GPU 硬报错、不降级"哲学）。
 
 ### 自登记锚点：结构覆盖不再依赖手写清单（2026-10-01）
 
@@ -313,7 +323,7 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 | **S3 GLSL 生成** | `generate_glsl_matmul`（共享内存分块 + vec4）；生成阶段/`scan_exprs`/`run_fused_gpu` 接入 | `expr_gpu_test`（`fused_gpu_test` 并入其中）matmul 融合用例（GPU vs CPU）；AOT 命中 |
 | **S4 Layer 迁移（线性）** | `Linear`/`FeedForward` 的 `matmul+bias+activation` 走 `dsl::compute`（含 matmul 段） | gradcheck / MNIST/GPT 训练回归 |
 | **S5 跨归约/跨 matmul 链** | 融合分块矩阵乘法（16×16 线程/64×64 块/4×4 寄存器分块/vec4 转置共享内存 + `eval_tail` 函数）；matmul+归约（`row_max(matmul)`、`row_sum(exp(matmul-rm))`）经 `generate_glsl_reduce` 内联点积 | 注意力相关 gradcheck |
-| **S6 自动窗口** | **不接线**——运行时没有跨表达式并入窗口（见 §跨 kernel 自动融合） | — |
+| **S6 自动窗口** | **不接线**——没有"自动并入相邻表达式"的窗口；跨表达式融合走显式录制（IR-C，见 §表达式录制与融合边界） | — |
 | **S7 手写融合原语收敛** | 7 个手写融合原语（`batched_matmul_reduce/softmax_denom/softmax_apply`、`batched_matmul_softmax_backward_q/kv`、`col_softmax_denom/col_softmax_sparse_forward`）**均不存在**——结构由 IR 表达。IR 扩展：`MatmulSpec.batch`、`ExprOperandKind::Row/Col/Batch`、`ExprViewKind::RowGather/BatchMod/BatchCol` | 全量 ctest；训练冒烟（CPU+GPU） |
 
 > S1-S7 的实施顺序、依赖关系、删除顺序与当时验收流水见 `docs/history.md`。
@@ -327,7 +337,7 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 5. **matmul + 列归约已支持**：`generate_glsl_reduce` 列归约分支按元素分解 batch（`batch = row/m_per`，列归约遍历全部 `rows = batch*m_per` 行，与 CPU `matmul_out` 逐列归约语义一致），生成阶段 不跳过该形态（扫描到的 spec 全部生成）；`expr_cpu_test::col_max(matmul)`（独立标量参考，batch=2）+ `expr_gpu_test::col_max(matmul)` 广播/归约向量/batch=2 对拍锁死（err≈1e-7）。
 6. **PS 删大文件段行号易漂移**、`-replace` 多行静默失败——先 read 再 edit，删前 `git diff` 核对。
 7. `dispatch_compute`（`compute_vk_backend.hpp` 的融合 dispatch 分发函数）有多处调用点——改签名或删除时按调用点逐一核对重建。
-8. **IR 扩展**：MatmulSpec.batch（不进 key，dispatch z）、MatmulSpec.transA/transB（不进 key，运行期 operand layout → PC `mm_trans`；见"运行期 operand layout"节）、Row/Col/Batch 操作数(6/7/8)、RowGather(9)/BatchMod(10)/BatchCol(11)；注意力 forward 现为单 fold kernel（`FoldSpec`，掩码 `AttnScoreMask::mask_kind()` × 位置偏置 `PositionEncoder::has_score_bias()` 两个正交入参），bwd=掩码 → 位置偏置（独立一步）→ softmax 的 R/X 表达式+3 个 `batched_matmul`（m/l/W 表达式+bm(W,V_t) 的 S7 forward 结构已删）；CE 稠密 `denom=col_sum(exp(logits-cb(col_max)))`，稀疏 grad/loss_vec 用 Row+RowGather。
+8. **IR 扩展**：MatmulSpec.batch（不进 key，dispatch z）、MatmulSpec.transA/transB（不进 key，运行期 operand layout → PC `mm_trans`；见"运行期 operand layout"节）、Row/Col/Batch 操作数(6/7/8)、RowGather(9)/BatchMod(10)/BatchCol(11)/Transpose(15，`data[col*param+row]`，param=行距走 `vp` 不进 key)；注意力 forward 现为单 fold kernel（`FoldSpec`，掩码 `AttnScoreMask::mask_kind()` × 位置偏置 `PositionEncoder::has_score_bias()` 两个正交入参），bwd=掩码 → 位置偏置（独立一步）→ softmax 的 R/X 表达式+3 个 `batched_matmul`（m/l/W 表达式+bm(W,V_t) 的 S7 forward 结构已删）；CE 稀疏路径 = fold lse 单趟（`make_fold_logsumexp`，online m/l 进位）+ loss_sum 归约链 + grad `exp(logits−lse)−onehot`（3 kernel，旧 `col_max+denom/loss_vec/grad` 5-kernel 链已删，稠密 denom 形态同），稀疏 grad/loss_vec 用 Row+RowGather。
    ⚠ `dsl::row()` 是"批内行号"，其分解来自**同一 spec 里的 matmul 段**；把原本融在 matmul 表达式里的项拆成独立一步后 batch 退化为 1、`row()` 变全局行号 → 静默错值。需要批内位置时用 `(rows,1)` 行表 + `dsl::row_broadcast`（`AlibiPositionEncoder::apply_score_bias` 即此写法）。
 9. **IR-D 现只有 `GlslEmitter` 一个注册后端**（`scan_exprs --list-backends` 可列）；`cpu_emitter.hpp` 不存在。
 
@@ -342,7 +352,7 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 | 代号 | 含义（当前） |
 |------|--------------|
 | **M1** | `ExprSpec` 归约视图 / 归约指令 + CPU `eval_expr` 归约语义（见 §IR 扩展：归约语义） |
-| **M2** | 跨表达式录制框架——**不存在**（IR-C 已移除，见 §表达式录制与融合边界） |
+| **M2** | 跨表达式录制框架——**现行**（IR-C：`begin_expr/end_expr` + `expr_graph.hpp`，P1/P2，见 §表达式录制与融合边界） |
 | **M3** | Softmax/LayerNorm/RMSNorm fwd/bwd 的 DSL 归约表达式 + GPU 归约融合 shader（见 §Layer 迁移） |
 | **M4 / M6** | 手写注意力融合原语——**不存在**；forward 由 fold 承载、backward 由 IR 链承载（见 §关键算法） |
 | **M5** | 稀疏交叉熵——现为 IR 表达（见 §关键算法） |
@@ -420,6 +430,6 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 
 1. **CPU 正确性基准**：CPU 实现先按"多次原语"正确实现，作为融合 kernel 的参考。
 2. **gradcheck**：Softmax/LayerNorm/RMSNorm/Attention/CrossEntropy 中心差分 gradcheck。
-3. **GPU 未命中策略**：融合 shader 未命中 = **硬报错**（铁律 7，无回退路径）——修复方式是把该结构纳入 `scan_exprs` 覆盖，绝不静默降级。
+3. **GPU 未命中策略**：**单节点**融合 shader 未命中 = **硬报错**（铁律 7，无回退路径）——修复方式是把该结构纳入 `scan_exprs` 覆盖，绝不静默降级；IR-C **复合** kernel 未登记时按通用机制拆回逐成员派发（成员均为已登记单节点，见 §表达式录制与融合边界）。
 4. **数值稳定性**：保留 `-max` 平移（`alpha*QᵀK - m`）。
 5. **fold 分块一致性**：fold 的 m/l/向量状态在单 kernel 内跨块进位，CPU/GPU 共享 `EXPR_FOLD_BLOCK` 分块常量，无跨 kernel 漂移；backward 重算的 W 与 forward 的 fold 掩码树同构同序（同源生成，天然一致）。

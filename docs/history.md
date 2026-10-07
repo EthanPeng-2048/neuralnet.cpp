@@ -32,6 +32,7 @@
 - [GUI / CLI 参数一致性清理](#GUI / CLI 参数一致性清理（2026-10-01）)（1 条）
 - [分支归档与 legacy 命名空间整理](#分支归档与 legacy 命名空间整理（2026-10-02，v1.6.0 发布时）)（1 条）
 - [统一数据集格式与加载（19 号设计落地）](#统一数据集格式与加载（19 号设计落地，2026-10-05/06）)（1 条）
+- [训练 step 剖析器（NN_PROFILE）](#训练 step 剖析器（NN_PROFILE，2026-10-06）)（1 条）
 
 ---
 
@@ -1939,6 +1940,44 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 - 类型：已修复勘误
 - 内容：新增 `grouped_reduce_sum/max`（沿行方向按固定长度 R 分组归约），MaxPool2D 因此去掉逐通道 C 次 dispatch → 单次原语；新增 `fused_gpu_test::run_reduce_consts` 回归用例。根因：`run_fused_gpu` 的 push-constant **固定头长度必须逐形态**与生成器 PC 声明一致（逐元素 2 / 逐元素+matmul 5 / 归约 4 / 归约+matmul 6）；bug 把"归约但无 matmul"按 **5** 算 → 常量池整体后移一个 uint → **GPU 上"带常量的归约"静默错值而 CPU 正常**（表现为 `col_reduce_sum(select(x == col_broadcast(max), 1, 0))` 恒返回 kk-1 而非真实并列数）。教训：这类"只有 GPU 错"的问题要**先打印生成的 GLSL/IR 再猜成因**。详见 `docs/development/08-pitfalls-and-lessons.md` §4.10。
 
+# 训练 step 剖析器（NN_PROFILE，2026-10-06）
+
+## 训练 step 剖析器落地（2026-10-06，全新设施 `core_profile.hpp`）
+
+- 类型：演进记录
+- 内容：目标 = 用工具回答"一个训练 step 里各阶段/各原语的开销构成、GPU 利用率多少"，让性能优化方向由数据决定。四层插桩：① **`core_profile.hpp` 聚合器**（帧栈 inclusive/exclusive 双口径——stage 表打 inclusive 墙钟、op 表打 exclusive 净归属（跨线程可加总、嵌套不重复计数）；`stage::op` 两级聚合；env 门控 `NN_PROFILE=1` 聚合打表、`NN_PROFILE_TRACE=<path>` 写 Chrome trace JSON；`device_add` 供设备侧回填；`interned()` 动态名驻留；默认关闭零时钟调用）；② **引擎/DSL 插桩**：`compute_engine.hpp` 42 个公共 NVI 入口首行 RAII 计时（脚本注入 + DryRun 逐条审阅）+ `expr_dsl.hpp` 三入口（`dsl::compute/compute_into/compute_reduce`——**CPU 模板路径不经引擎公共入口**，漏掉这三处会丢 optimizer/激活/残差的主体耗时）+ 两引擎 `to_matrix/copy_into/cast_into/release_idle_pool_blocks` 与 GPU 批次生命周期 override（public virtual 被 override 时基类计时不触发）；③ **phase/层级打点**：`text_train` step 循环 phase（data/forward/submit-fwd/backward/sync/optimizer/ckpt，`nn::prof::Phase` 连续阶段句柄——各阶段共享局部变量、不能用花括号块隔开）+ Model/GPT/RAPT/TransformerEncoder 逐层/逐块 scope；④ **GPU 设备侧 timestamp query**（`compute_vk_backend.hpp`）：query pool 按帧分块 + solo 块（`TsCursor`），`ts_dispatch` 括住全部 15 个 `vkCmdDispatch` 调用点（`dispatch_compute` 加 `ts_label` 形参按调用方标 matmul/batched_matmul/scan/outer_col），帧块在 `reap_frame`（fence 已等）、solo 块在 `submit_and_wait` resolve；`compute_vk_device.hpp` 保存所选队列族 `timestampValidBits`/`timestampPeriod`（**validBits=0 的队列整体降级 host 计时**——R5 240 有族=0，按所选族判门）。口径注记：begin/end 均 `ALL_COMMANDS`，每对间隔 ≈ 该 kernel 的 GPU 执行时间、dispatch 间屏障空隙不计入任何标号（= "kernel 时间 vs 空隙"口径）；GPU 内传输（fill/copy/slice/insert）暂未标号，host 侧 op 计时已覆盖 PCIe 归因。
+- 验收：CPU `gpu_stability_probe --steps 20` 剖析关/开 hash 逐位一致（`49ded8cf81d9f8f4`）、GPU dev2 同（`5e992f668b4209c8`）——插桩零数值影响；Debug（文档锚口径）下 CPU 锚 `6f8849f14da23110` 与文档逐字一致；scan 91 结构 / 130 精度变体不变。实测样本（GPT d128/L4/H4/seq256/B8，TinyStories 2k doc）：**CPU 20 步**——forward:backward ≈ 72:28，`eval_expr` 净归属占墙钟 **63.7%**（注意力 fold 在 CPU 走 IR 解释器，avg 194ms/call/块），`batched_matmul` 11.2%；**GPU 20 步**（dev2）——**GPU busy 66.4%**（设备 kernel 384.7ms/墙钟 579ms：`fused_mm` 241ms/1900 次 + `fused` 132ms/10360 次），host 侧 `copy_from`（staging 上传）净归属 **30.6%**、optimizer 阶段 21.5%（其中 `import` 3.4 万次/20 步的 NVI 摊薄开销）、`release_idle_pool_blocks` 8.7%。
+- 附注（既有问题，非本次引入）：**Release 构建下字节锚与 init-hash 均偏离 AGENTS §12 文档锚**（CPU 训练锚 `49ded8cf81d9f8f4` ≠ `6f8849f14da23110`、GPU `5e992f668b4209c8` ≠ `8ef51b2927253c50`、init-hash gpt `daec9e935f9b4c68` ≠ `7ac3e9d97f9d903a`）；**Debug 构建下训练锚复现 `6f8849f14da23110`** ⇒ 文档锚是 Debug 口径、Release 的 FP 优化（`-O3 -funroll-loops -march=native` 等）改变归约/初始化数值；init-hash 在 Debug 下也不复现文档值（跨进程稳定、非 flaky）——疑为 2026-10-03 后探针/构造序变动（0c53f48/d1926f0 触碰过 `gpu_stability_probe.cpp`）或锚未随最后变更刷新，**待办：重刷 §12 init 锚并注明构建口径**。
+
+## GPU 训练 staging 上传收敛（NN_PROFILE，2026-10-06）
+
+- 类型：性能 A/B
+- 内容：首轮 profile 显示 GPT d128/L4/H4/seq256/B8 的 GPU 墙钟 579ms/20 steps、GPU busy 66.4%，`copy_from` staging 30.6%，其中文档感知注意力掩码每步把同一份 `doc_ids` 宿主缓冲按 `(1,BH·seq)` 和 `(BH·seq,1)` **重复上传**。`CausalDocScoreMask::prepare` 改为先上传一次，再在 GPU 张量上调用 `transpose` 生成列形状；CPU 路径保留原双宿主构造，避免 CPU 引入额外遍历。
+- A/B（同一 Release 构建、同一 dev2、20 steps）：墙钟 **579.19→542.03ms（−6.4%）**；设备 kernel **384.71→390.45ms**；GPU busy **66.4→72.0%（+5.6 个百分点）**；GPU kernel 调度总量基本不变（`fused_mm` 1900→1883、`fused` 10360→10322）。profile 中 `copy_from` 调用数 **201→121**，说明重复 staging 路径已消除；其净毫秒受 batch drain/设备负载影响，不作为单独收益口径。
+- 验收：Release `cmake --build build` 通过；CPU `gpu_stability_probe --steps 20` hash=`49ded8cf81d9f8f4`，GPU dev2 hash=`5e992f668b4209c8`，两者进程内双轮 loss/hash 均 PASS；`bench/doc_inventory.ps1` = virtual 49、`L2-VIOLATIONS: 0`、`HANDWRITTEN-RESIDUE: 0`。CPU 画像保持原瓶颈：`eval_expr` 约 64% 墙钟，下一阶段应转向 CPU fold 解释器快路；GPU 下一优先级是 optimizer 的 3.4 万次 `import`/20 steps 与 `release_idle_pool_blocks`，而不是继续重复上传。
+
+## GPU optimizer import 快路径（NN_PROFILE，2026-10-06）
+
+- 类型：性能 A/B
+- 内容：profile 发现 optimizer/DSL 每 20 steps 约 3.4 万次 `import`，其中绝大多数是同一引擎、同一精度、已经在 GPU 上的 Tensor。`ComputeEngine::import` 增加安全快路：仅当 Tensor 有效、已绑定到当前引擎且 precision 一致时直接返回共享句柄；跨引擎、跨精度、未绑定和无效 Tensor 仍走原 `bind_check_` + `import_impl` 路径。快路不改变数据或所有权语义，只省去重复的绑定检查与虚分派。
+- A/B（同一 Release 构建、同一 dev2、20 steps，设备时钟存在正常运行间抖动）：`import` 总计 **12.26→11.55ms（−5.8%）**，optimizer 内 `import` **4.83→4.55ms（−5.8%）**，调用数维持 68128（其中 optimizer 30800），证明优化的是 host/NVI 固定开销而非减少计算；单次总墙钟受 GPU 频率与 staging 排队影响（本轮 542~558ms）不作单点收益结论。
+- 验收：`cmake --build build` 通过；CPU hash=`49ded8cf81d9f8f4`、GPU dev2 hash=`5e992f668b4209c8`，两轮 loss/hash 均 PASS；`bench/doc_inventory.ps1` = virtual 49、`L2-VIOLATIONS: 0`、`HANDWRITTEN-RESIDUE: 0`。后续若要继续压 GPU host 开销，应处理 `release_idle_pool_blocks` 的每步固定成本；optimizer import 已从首要低风险项中移出。
+
+## GPU 内存池 idle block 释放单次扫描（NN_PROFILE，2026-10-06）
+
+- 类型：性能 A/B
+- 内容：`release_idle_pool_blocks` 每 step 调用 `release_idle_blocks`。原实现无论 `retain_free_bytes_` 是否为默认 0，都先遍历全部 `free_regions` 计算 `total_free`，再遍历 `blocks_` 判断并释放完全空闲 block；默认保留阈值始终为 0，因此第一遍统计没有决策价值。新增 `retain_free_bytes_ == 0` 快路径，单次扫描直接按原完全空闲条件释放；非零保留阈值继续使用原双扫描精确逻辑，避免改变配置语义或内存安全契约。
+- A/B（同一 Release 构建、同一 dev2、20 steps）：`release_idle_pool_blocks` **39.88→34.76ms（−12.8%）**，单次平均约 1.99→1.74ms；总墙钟 **542.03→527.42ms（−2.7%）**。GPU busy 受设备时钟/排队影响为 72.0%→71.1%，不将其视为该改动的收益指标；本轮直接收益来自 host 侧释放扫描减少。
+- 验收：`cmake --build build` 通过；CPU hash=`49ded8cf81d9f8f4`、GPU dev2 hash=`5e992f668b4209c8`，两轮 loss/hash 均 PASS；`bench/doc_inventory.ps1` = virtual 49、`L2-VIOLATIONS: 0`、`HANDWRITTEN-RESIDUE: 0`。profile 产物为 `build/prof_gpu_pool_opt.txt` 与 `build/trace_gpu_pool_opt.json`。
+
+## nn vs torch 端到端训练基准重测（2026-10-06，新报告 docs/benchmarks/2026-10-06-vulkan-vs-torch.md）
+
+- 类型：性能 A/B / 演进记录
+- 内容：上一份报告（`2026-09-25-vulkan-vs-cuda.md`）所用 4000 行语料未入库，且其 nn 复现命令已因 `text_train` 改收 `.nndataset` 而失效 → 按同口径重建语料（`tinystories_small.txt` 前 4000 非空行，`dataset_gen` 记录 `source.sha256=584422376434996e…`），**重新生成一份基准报告**，nn/torch 两侧同日、同卡、同语料采集以规避 ±15% 跨会话漂移。主对比 f32：nn **107.1 ms/step / 152,917 tok/s / 3141 MiB** vs torch **50.2 ms/step / 326,593 tok/s / 3313 MiB** → **torch 吞吐 2.14×、nn 显存省 5%**，两侧 loss 曲线几乎重合（7.335→5.171 / 7.383→5.342，负载等价的交叉验证）。可用低精度：nn `--f16` 118.4 ms/step（健康，2113 MiB）vs torch fp16 30.4 ms/step → 3.89×；nn 全 f16 本轮 epoch1 起即 `-nan`（14 号缺陷的第三种表现，前两种为发散/打印冻结），计时与显存（1526 MiB）有效、训练无效。
+- **关键差异：torch fp16"病态慢"本轮不复现**——同脚本、同 torch 2.14.0+cu132、同卡，fp16 30.4 ms/step 比 fp32 **快 1.65×**（旧值 150.3，慢 3.16×）；单步 probe：forward 47.64→**8.55**ms、fwd+loss+bwd 150.02→**26.604**ms，而 host 构 batch / H2D / Adam / zero_grad 各段不变（= 脚本与管线未变）⇒ 差异在 GPU kernel 执行本身，疑驱动 / 设备时钟 / 运行时环境；旧环境不可复现、**未二分**，标为待查项，不判旧报告为错误。f32 侧与显存则复现：吞吐比值 2.13→**2.14**、torch 显存 3313/1981 MiB **逐字一致**、两侧各 +5.7%/+6.0% 落在 ±15% 漂移内。
+- step 剖析（**d64/B64，与 e2e 同配置**，20 步，`NN_PROFILE=1`）：墙钟 2197.68ms（109.9 ms/step，观测开销 +2.6%）、**GPU busy 89.8%**（设备 kernel 1972.59ms）；阶段 forward 85.4% / backward 5.4% / optimizer 5.0% / sync 3.7% / data 0.3%；op 表 `copy_from` **78.3%**（121 次、avg 14.2ms）、`release_idle_pool_blocks` 3.5%、`import` 0.5%（68128 次）；设备侧 `fused_mm` 1211ms/1830 次 + `fused` 704ms/10197 次 = 每步 95.8ms 的 **87%**。读数：`copy_from` 的 78.3% **含阻塞等待、不可读作 PCIe 传输**——`fwd.blk#0` 单次 57ms 而该处每步上传仅 KB 级，物理上不可能是传输时间，实为承接上一步设备排队；**瓶颈在设备 kernel 效率与每步约 602 次 dispatch**，三项 host 侧优化落地后继续压 host 固定开销难以改变 2.14× 差距，下一杠杆应转向 `fused_mm`/`fused`。
+- 产物：`docs/benchmarks/2026-10-06-vulkan-vs-torch.md`；`build/{nn_short_f32,nn_short_f16rec,nn_short_f16,torch_short_fp32,torch_short_fp16}_20261006.log`（+`.vram`/`.peak`）、`build/torch_train_fp{32,16}_20261006.json`、`build/prof_bench_20261006.txt`、`build/trace_bench_20261006.json`、`build/{bench_bpe_8192.nnvocab,tinystories_bench40.nndataset}`。
+
 ## 评估分块（CNN 全量评估 OOM 修复，2026-09-20，原位置 AGENTS.md §12）
 
 - 类型：已修复勘误
@@ -2398,3 +2437,427 @@ A1 段改动前为 2424）、`include/neuralnet.cpp/compute_cpu_engine.hpp` **23
   `encode_docs_parallel` 的分块并行（`nn::parallel_for_samples` 保序归位）原样保留，输出
   逐字节不变（`dataset_test` 回归锁定）。
 
+---
+
+# 训练 step「算子 vs 框架」开销归因（2026-10-06，接同日端到端基准重测）
+
+## 设备侧 kernel 表按阶段归因（剖析器新增）+ torch 设备流探针 + GEMM 形状探针
+
+- 类型：性能 A/B / 演进记录
+- 背景：新报告（`docs/benchmarks/2026-10-06-vulkan-vs-torch.md`）主差距 torch 2.14×；
+  回答「慢在算子还是框架、框架开销还能否降低、是否没吃满加速特性」。
+- **测量 ①（torch 侧设备时间，新增 `bench/probe_torch_gpu.py`）**：CUDA event 口径——
+  fp32 整步墙钟 50.70 ms/step、**设备流 50.61 ms/step → GPU busy 99.8%**（host 完全被掩盖）；
+  分段（best-of-50）：H2D 0.507 / forward 15.762 / +CE 2.722 / zero+fwd+bwd 49.973
+  （推得 backward 31.490）/ Adam 1.666 / zero_grad 0.108。**限制**：kineto 在 CMP 40HX 报
+  `CUPTI_ERROR_CMP_DEVICE_NOT_SUPPORTED`，torch 的 kernel 名表拿不到，torch 侧只有分段口径。
+- **测量 ②（nn 设备时间按阶段归因，剖析器新增能力）**：timestamp resolve 在 fence 之后、
+  此时 scope 栈已出栈，故在 `ts_dispatch` **录制期**抓 `nn::prof::current_stage()` 并以
+  `interned_pair` 驻留成 `label@stage` 键（`core_profile.hpp` 新增两函数；
+  `compute_vk_backend.hpp` ts_dispatch 改 4 行；**仅剖析开启分支内执行**，fused_registry
+  hash 不变、默认路径零开销）。20 步实测（`build/prof_bench_stage_20261006.txt`）：
+  设备 99.26 ms/step、墙钟 106.8、busy 93.0%。**按阶段**：backward 67.1（其中 fused_mm
+  53.6）/ forward 31.6（fused_mm 7.3 + 融合表达式 23.2 含 CE≈5.6）/ optimizer 仅 0.57。
+  **按家族**：GEMM 60.9（61%）、融合表达式 fold/elementwise 35.5（36%）、布局 2.9（3%）。
+  全仓只有一处 `vkCmdDispatch`（均经 ts_dispatch）→ 表无遗漏。
+- **测量 ③（host 框架账）**：host 未与设备重叠的空闲 = 106.8 − 99.3 = **7.5 ms/step
+  （7.0%，torch 对应值 ≈0.1）**；copy_from 87.1 ms/step 是等上一步队列（非 PCIe）；
+  release_idle_pool_blocks 2.4/step、sync(loss 回读) 2.6/step、data 0.4/step；
+  **Adam host 提交 4.5 ms/step 却只有 266 个约 2µs 小 kernel（设备仅 0.57）**。
+- **测量 ④（GEMM 形状探针，`layer_bench --gpu --op matmul --forward-only --m/--k/--n`）**：
+  方阵 4096³ = 4040 GFLOPS（44% FP32 峰值）；fwd 形状 (16384,64)x(64,192) 1454、
+  (16384,64)x(64,8208) 2965、dgrad (16384,192)x(192,64) 1527；**病态——wgrad.QKV
+  (192,16384)x(16384,64) = 208、wgrad.ffn1 (256,16384)x(16384,64) = 273 GFLOPS**；
+  wgrad.head (8208,16384)x(16384,64) 2941 正常。另测层微基准（含每迭代 I/O，仅供横向参照）：
+  causal_attn fwd 7.14 / train 21.78、layernorm fwd 1.02、linear 64-256 fwd 0.145 /
+  train 0.687、feedforward train 6.56 ms。
+- **根因（已定位，未修）**：tiled matmul 输出块 64x64、`grid = ceil(N/64) x ceil(M/64)`
+  （engine 路径与 fused S5 路径同用 `EXPR_MATMUL_BLOCK`）——反传 wgrad 形状
+  `M=64..256, K=16384, N=64..256` 只派 **3-4 个工作组**，40HX 约 34 SM 大面积空转。
+  按阶段表反推：每 block 反传 11.18 ms 中 4 个 wgrad 约 7.9 ms，x4 block =
+  **约 31.6 ms/step ≈ 整步 30%、设备差距 48.7 ms 的约 65%**。
+- **结论**：① 框架 host 开销只剩 ~7%（可压项见测量 ③，天花板远小于差距），
+  **差距 87% 在设备侧算子**；② 时间饱和度并不低（nn busy 93% vs torch 99.8%），
+  低的是**单位时间产出**（77 GFLOP/step：nn 0.78 TFLOPS vs torch 1.52）与
+  **派发并行度**——「没完全利用加速特性」实锤在 wgrad 工作组饥饿；
+  ③ 另一项未兑现：`--f16` 反而慢 11%（118.4 vs 107.1），torch fp16 快 1.65×。
+- **修复方向与估算（未实施，供立项）**：P0 修 wgrad 派发（WG 持久循环扫多输出块 /
+  K 切分二次归约 / 网格过小时切小 tile），约 -26~28 ms/step → 107→约 80（2.14×→约 1.6×）；
+  P1 CE 多趟扫描 5.6 → torch 2.7；P1 Adam 每张量合并提交（4.5 ms host）；
+  P2 host 7%（release_idle 降频、loss 回读重叠）；P3 f16 提速兑现。
+  验收参照：`layer_bench --op matmul` 形状探针、`expr_gpu_test`、
+  `gpu_stability_probe` 字节锚、ctest。
+- **产物**：`build/prof_bench_stage_20261006.txt`、`build/torch_gpu_20261006.txt`、
+  探针 `bench/probe_torch_gpu.py`；剖析器改动 `include/neuralnet.cpp/core_profile.hpp`、
+  `include/neuralnet.cpp/backend/compute_vk_backend.hpp`。
+
+---
+
+# IR-C P2 机制落地：写穿物化 + 多输出 kernel（2026-10-06）
+
+## fuse 双规则 + ExprSpec.extras + eval_expr_multi_into（Adam 金刚石 GPU 端到端 err≈2e-7）
+
+- 类型：演进记录（「IR-C 定位修正与恢复立项」的 P2 机制部分；**Adam/CE 真实接线与
+  NN_PROFILE 收益核验在下一阶段**）
+- 内容：
+  1. **IR：`ExprSpec.extras`**（P2 多输出，聚合第 8 字段）——主输出（instrs.back().dst）
+     之外额外物化的寄存器列表，进 key / expr_spec_equal / validate（仅纯逐元素、
+     无 matmul/fold/归约、寄存器互异且被定义、≤4）。**canonicalize 四个 pass 全部
+     支持 extras**：simplify 的定义指令走输出指令豁免（不折叠/不 alias）、DCE 播种
+     存活、CSE/renumber/allocate 重映射（allocate 的 liveness 保护到 kernel 末）。
+  2. **fuse_expr_graph 双规则**：① P1 链语义（matmul 头链等非纯逐元素 F32 场景，
+     单输出、中间量契约不变）；② **P2 分量融合**——纯逐元素 F32 同形状节点经依赖边
+     连通成组（union-find，小根确定性），**多消费者/菱形不再是融合边界**（写穿全输出：
+     成员序 [0..n-2] 进 extras、尾成员为主输出）；成员引用任意已并入成员经寄存器直替；
+     预算不足分裂为多 kernel（跨 kernel 依赖经写穿输出读取）。执行侧补**稳定拓扑序**
+     （分量分裂与 P1 kernel 交错时列表序不保证依赖序）。
+  3. **执行链**：`ComputeEngine::eval_expr_multi_into`（新 NVI + virtual
+     `eval_expr_multi_into_impl`，**virtual 51 → 52**）——GPU = V0 查表 +
+     `run_fused_gpu` 追加 `extra_outs` 绑定（`output_override` 同款精度视图）；
+     CPU = 解释器逐槽求值（extras 用 `-(-x)` 精确复制链提升为主输出，Neg∘Neg 逐位恒等）。
+     `compute_into` 录制段**目标传递**：P1 的拒绝解除，节点输出 = dst 既有张量
+     （Adam 的 p 更新直写参数存储，张量身份不替换）。单输出入口对 extras spec 防御性
+     拒绝（防描述符绑定数错位）。
+  4. **测试**：`expr_graph_test` 12/12（链/三节点/多消费者**写穿融合 1 kernel 3 输出**/
+     边界/预算分裂/确定性/S5 全保留，多输出槽序与逐节点参考逐项对拍）；
+     `expr_fuse_test` 11/11（新增 **Adam 金刚石**：m/v 状态写穿 + d 中间量 + p 目标
+     传递 → 单 kernel 4 输出，GPU vs CPU err=2.4e-07 级；目标传递 dst 写穿用例）。
+- **两个教训（坑录）**：① **聚合发射漏字段静默错值**——`fused_generate.hpp` 的
+  ExprSpec 位置式发射停在旧字段表（fold 后无 extras），registry spec 丢 extras →
+  管线布局少输出绑定 → 多输出 shader 绑定错位、**结果错但不报错**（tail 取到成员 A
+  的值，err≈1.5）；结构化聚合初始化的字段清单必须随 struct 扩展同步（与 matmul
+  batch 漏发同族）。② **分量簿记漏 push**——`comp_append` 成员下标簿记漏
+  `mem.push_back(bi)`，3 节点以上深链的依赖查找落空退化为外部输入（2 节点/扇出
+  形态恰好测不出）；融合簿记与成员表同源更新 + 深链用例才能抓到。
+- **验收**：全量构建 84 目标零告警（-Werror）；**ctest 29/29 全绿**；CPU 字节锚
+  `49ded8cf81d9f8f4`、GPU dev2 `5e992f668b4209c8` **逐位不变**（机制未接入训练路径，
+  数值面零变化）；`doc_inventory`：virtual 52/52、L2-VIOLATIONS 0、HANDWRITTEN-RESIDUE 0；
+  闭合世界自登记实测（expr_fuse_test 收集器）：91 → 100（+9 多输出/链结构）。
+
+---
+
+# IR-C P1 恢复完成（2026-10-06）
+
+## expr_graph + begin_expr/end_expr + GPU 图执行 + 双测试恢复（ctest 27 → 29 全绿）
+
+- 类型：演进记录（承接同日「IR-C 定位修正与恢复立项」的 P1）
+- 内容（相对 git `8f2990f^` 的移植 + 两点加固）：
+  1. **图核**：`expr_graph.hpp` 恢复（`ExprGraph`/`fuse_expr_graph`/`recording_graph_owner`
+     + P2-12 图级计划缓存）+ `Tensor::virtual_tag_` 占位标记恢复（公共元数据访问器，
+     存储仍守铁律 #11）。加固：**融合成员精度一致门禁**（旧版无精度维度，混精度链
+     拼进单 kernel = 静默错值）+ `ExprGraph::owner` 跨引擎 fail-fast。
+  2. **引擎 API**：`ComputeEngine::begin_expr/end_expr`（**virtual 49 → 51**，
+     doc_inventory 口径；先例 = M6 的 import_impl 48→49）；`eval_expr`/
+     `eval_expr_reduce` NVI 顶部录制拦截（占位 Tensor 经 `create_tensor` 出生即
+     绑定、tag = 节点号+1；`record_graph_node_`）；`eval_expr_into` 拒绝录制段
+     （目标传递待 P2 写穿，dsl 侧同款守卫双保险）。
+  3. **引擎实现**：CpuEngine 普通运行 no-op（CPU 行为不变）；NN_EXPR_SCAN 下
+     begin 开录制、end **融合并登记复合 spec**（闭合世界两端一致）。GpuEngine
+     begin/end + `execute_fused_graph`（P2-12 缓存 + 占位保留集合 + 被融合中间
+     占位即时释放归池）+ `run_graph_kernel_into_`（output_override 写回 tail，
+     覆盖 fold/fold_k 形态、S5 matmul 段、vector_out、精度变体 `#a`/`#x`/V0；
+     精度视图同 eval_expr_into_impl）。
+  4. **dsl**：scan 分支录制感知（入图 + tag 占位；锚点 odr-use 两路保留，编译期
+     可达覆盖不因录制分支丢失）+ `dsl::start_expr/end_expr`（ExprBlock 语法糖）恢复。
+  5. **测试**：`expr_graph_test` **12/12**（纯 CPU：链融合/三节点/边界/上限/确定性/
+     依赖识别/输入序/S5 两形态/emitter）+ `expr_fuse_test` **9/9**（GPU 端到端：
+     3 节点链融合逐位 **err=0.00**、P2-12 缓存重复命中、独立分支 2 kernel、S5
+     matmul 链、未录制回归、vec4 路径、compute_into 契约守卫）。**闭合世界自登记**：
+     `src/expr_fuse_shapes.cpp`（收集器 TU）NN_EXPR_SCAN 静态初始化 dry-run 录制段，
+     scan 端 end_expr 把复合 spec 登记进本目标专属 registry（`nn_enable_gpu_fusion`，
+     实测收集 91 → 96 = +5 测试结构）；链定义集中在 `expr_fuse_shapes.hpp` 单一
+     事实源，运行期/收集期同调一组函数、不会漂移。
+  6. **用例语义**：录制段内同次求值的输入须同引擎（`bind_check_` 硬规则——混引擎
+     fail-fast 是设计本意，旧测试靠当年的未绑定张量绕过）；测试外部输入先
+     `import` 到 GPU（GPU 常驻训练的真实形态）。
+- **验收**：全量构建零告警（-Werror）；**ctest 29/29 全绿**；CPU 字节锚
+  `49ded8cf81d9f8f4`、GPU dev2 `5e992f668b4209c8` **逐位不变**；scan 库内 registry
+  **91 结构不变**（"内容未变化，保持 mtime"）；`doc_inventory.ps1`：virtual 51/51、
+  L2-VIOLATIONS 0、HANDWRITTEN-RESIDUE 0。
+- 顺带修复：`652c53d`（HEAD「易用性审查」）误删整个 `examples/`（CMakeLists /
+  AGENTS / 20 号文档仍在引用，20 号文档同提交还在称 `fusion_custom_layer*` 为
+  "现有样例"）→ 从 `652c53d^` 恢复 5 个文件；`-DNN_ENABLE_TESTS=ON` 此前在
+  configure 阶段即失败，现恢复可用。
+- 待办（**已于 2026-10-06 随 P2 收官完成**）：`docs/development/02、03、12`、
+  `docs/usage/03`、`docs/introduction/04` 中"IR-C 不存在/未采用"的当前状态表述。
+
+---
+
+# IR-C 定位修正与恢复立项（2026-10-06）
+
+## 「否决」修正为「暂时废弃、可恢复」，按 git `8f2990f^` 旧实现恢复 + 通用扩展
+
+- 类型：演进记录 / 用户裁定（覆盖 18 号路线图判据）
+- **裁定**：① IR-C 不是被否决——是当年实现不完整而**暂时废弃、可恢复**；② **设计原则：
+  不为单一操作加专用原语**（Adam 多状态 foreach/arena、CE 专用 shader 之类），
+  通用机制优先（图融合扩展 / fold 通用折叠）；③ 授权按旧分支实现合并回主干。
+  18 号路线图「不得复活显式录制 API」判据被本裁定覆盖：**先按旧形态恢复**
+  （`begin_expr/end_expr` 显式录制），自动作用域 + 逃逸检测作为后续演进
+  （= 03 §5.3 重新立项前提的第 1 步路线）。AGENTS §3/§7/§11 措辞同批改。
+- **旧实现盘点**（删除于 `8f2990f`，最后存在 = `8f2990f^`/`e936f4d`；研究副本
+  `build/ir_c_study/`）：`expr_graph.hpp` 480 行（`ExprGraphNode`/`ExprGraph`/
+  `fuse_expr_graph`/`recording_graph_owner` + P2-12 图级计划缓存
+  `graph_cache_key`/`FusedKernelPlan`/`instantiate_plan`）+ `src/expr_graph_test.cpp`/
+  `src/expr_fuse_test.cpp`；引擎 API `ComputeEngine::begin_expr/end_expr`、
+  `dsl::start_expr/end_expr`（`ExprBlock`）、`GpuEngine::execute_fused_graph`、
+  `Tensor::virtual_tag_`、演示层 `FusedChainLayer`。
+- **能力边界（"做得不好"实指，`fuse_expr_graph` 判据 = expr_graph.hpp:180-211）**：
+  只拼「纯逐元素、同形状、tail 恰一个消费者、B 以 Linear 视图引用 tail、双方无归约、
+  B 无 matmul」的链（A 可带前置 matmul 段 = S5）→ ① 无写穿物化（中间量逃逸/多消费者
+  直接放弃）；② 单输出（只有 tail）；③ 归约硬边界；④ 无跨链/跨张量批量派发
+  （37 条独立链仍 37 个 kernel）；⑤ 显式录制、无自动作用域/逃逸检测；⑥ CPU 录制
+  普通运行 no-op。2026-09-19 的五条否证（归约边界、eager 交错、缓存逃逸、22 flush 点、
+  CPU 零收益）针对的正是这个能力面——**否证的是当年实现，不是图融合路线本身**。
+- **对两个性能目标的映射（诚实口径）**：as-is 只能把 Adam K3(delta)+K4(p+=) 折成一个
+  （4→3 kernel/张量；且这步不恢复 IR-C、用单条 `compute_into` 表达式同样能拿到）；
+  K1/K2 的 m/v 状态**写穿给 K3**、以及**跨张量合并**都需要扩展——「写穿物化/多消费者 +
+  多输出 kernel」（Adam 每张量 1 kernel，266→~37）与「跨链批量派发」（37→3，可选后置）。
+  CE 的 max→denom 是归约数据依赖，IR-C 管不了：修法 = **online-softmax 单趟**，
+  走既有 fold 通用折叠机制加一个 spec（(m,l) 运行态与注意力 fold 同款），不新增原语类。
+- **分期**：P1 恢复移植（expr_graph + begin/end_expr + virtual_tag 通道 + GpuEngine 图
+  执行 + 测试 + scan 集成，适配 M1-M6 后 Tensor/Result/NVI 基座）→ P2 通用扩展：写穿
+  物化 + 多输出（Adam 每张量 1 kernel）→ P3 跨链批量派发（可选）→ P4 CE online-softmax
+  fold。**P0（wgrad 派发饥饿 −26ms/step）不属 IR 范畴，独立推进**。
+- **验收口径**：ctest 27 全绿 + 新 graph/fuse 测试恢复、`gpu_stability_probe` 字节锚、
+  scan 双 hash、`bench/doc_inventory.ps1` 门禁、融合前后 loss 逐位一致（链融合不改
+  数值语义）、optimizer 设备 kernel 数/耗时对照（NN_PROFILE 设备表）。
+
+---
+
+# IR-C P2 收官：Adam/AdamW 接线 + NN_PROFILE 收益核验 + 混精度闭合世界通用降级（2026-10-06）
+
+## 承接「IR-C 定位修正与恢复立项」的 P2；并修复 f16 GPU 训练崩溃（0xC0000374）
+
+- 类型：演进记录（性能收益核验 + 缺陷修复 + 文档校订）
+- **1. Adam/AdamW 接线（P2 落地到训练路径）**：`Adam::step` / `AdamW::step` 用
+  `engine.begin_expr()` + `ExprSegment`（RAII 收口，作用域退出/早退都兜底 `end_expr`）把
+  **整步**录成一张图：每参数张量 K1（m 更新）/K2（v 更新）状态写穿 + K3（delta）+
+  K4（`p += delta` 目标传递）在 f32 下融合成**每张量 1 个多输出 kernel**
+  （`GpuEngine::execute_fused_graph` → `run_graph_kernel_into_` / `eval_expr_multi_into`）。
+  CPU 普通运行 `begin_expr/end_expr` 仍是 no-op（数值面零变化）。
+- **2. NN_PROFILE 收益核验（验收口径「optimizer 设备 kernel 数/耗时对照」）**：同配置
+  （`text_train build/tinystories_bench40.nndataset --model gpt --gpu=40HX --optimizer adam
+  --max-steps 20 --d-model 64 --num-layers 4 --num-heads 4 --d-ff 256 --seq-len 256
+  --batch-size 64`）设备侧表：
+  | 口径 | P2 前（`prof_bench_stage_20261006.txt`） | P2 后（`prof_p2_adam_20261006.txt` / `prof_p2_adam_final.txt`） |
+  |---|---|---|
+  | `fused@optimizer` 调用数 | 5320（**266/step**） | 1330（**66.5/step**） |
+  | `fused@optimizer` 设备耗时 | 11.35 ms（**0.57 ms/step**） | 4.58 ms（**0.23 ms/step**） |
+  即 **kernel 数 4.0×、设备耗时 2.5×**（单 kernel 从 ~2.1µs 小 kernel 变为 ~3.4µs
+  多输出 kernel；host 提交次数同步下降）。⚠ 口径注记：device 侧数字与构建类型无关，
+  host 侧数字在 Debug 构建下被显著放大（同配置 Debug 墙钟 3250ms / optimizer inclusive
+  1012ms，Release 2135ms / 95.7ms）——对照只取设备表，host 侧数字须同构建类型比。
+- **3. 缺陷 ①：`NN_TRY_CHECK` 重复求值 → f16 GPU 训练堆损坏（0xC0000374）**。旧展开
+  `if (!(x)) return std::unexpected((x).error());` 把 `x` 求值**两遍**；对带副作用的实参
+  （`Adam::step` 的 `NN_TRY_CHECK(seg.end())`）第二遍会重新进入 `end_expr`——此时录制
+  owner 已被第一遍 move + reset，故第二遍**返回成功**，随后对 success 的 `std::expected`
+  调 `.error()`：Debug STL 触发 `expected` 断言（MSVC），Release 读已析构的 Error 字符串
+  → 堆损坏。**根因与"失败"无关**：底层失败（见 4）只是把第二遍求值这条路径打开。修法 =
+  宏改单次求值 `if (auto&& r = (x); !r) return std::unexpected(r.error())`（`auto&&` 不
+  引入拷贝，兼容不可拷贝 Result 载体），与 `core_errors.hpp` 文档承诺的"展开后与手写形态
+  逐字等价"重回一致；回归锁 `error_macro_test::test_try_check_single_eval`（失败路径与
+  成功路径各断言求值次数 == 1，并断言用的是第一次求值的错误）。
+- **4. 缺陷 ②：混精度 profile 的闭合世界硬报错 → 通用降级（非单算子特例）**。
+  `text_train --f16`（`profile_f16` = optimizer:F32 / param:F16）实测
+  `GpuEngine::end_expr: 融合 kernel 未命中 AOT 融合 shader（闭合世界）… key=60bb980ae730649a`。
+  根因：**融合分组本身依赖精度**（P2 写穿组要求成员全 F32；P1 链要求成员同精度），于是
+  f16 下 Adam 的 K3/K4（F16）落成 P1 尾链 `{K3,K4}`——这个复合结构 f32 扫描期根本不存在
+  （f32 下 K1..K4 属同一 P2 分量）。构建期按精度组合枚举是 2^4 爆炸，不可取。**通用机制**：
+  `GpuEngine::execute_fused_graph` 对多成员复合 kernel 先查可用性
+  （`composite_kernel_available_`：`(key, psig)` 变体选路 / 写穿形态要求全 f32 输入输出），
+  不可用则拆回成员逐个派发（`dispatch_graph_member_`，成员 = 已登记的**单节点**结构）——
+  闭合世界仍然成立（只跑 AOT 已登记 shader；**未登记的单节点结构照旧硬报错**），该段退化
+  为 IR-C 之前的"1 节点 = 1 dispatch"。诊断开关 `NN_IRC_TRACE=1` 打 `[ir-c][degrade]`
+  （与 `NN_PREC_TRACE` 同哲学：降级是优化取舍而非错误，但必须可观测）。实测
+  `NN_IRC_TRACE=1 f16_precision_test`：**760 条 `复合 kernel(2 成员, extras=0) 未登记 →
+  逐成员派发`**（正是 K3/K4 尾链）→ GPU f16 端到端恢复全绿。
+- **5. 回归覆盖**：`f16_precision_test` 的 GPU f16 端到端即缺陷 ② 的回归锁（修复前堆损坏 /
+  闭合世界报错，修复后 ALL PASSED，且 `NN_IRC_TRACE=1` 可观测降级发生）；`error_macro_test`
+  新增单次求值用例锁缺陷 ①。
+- **6. 验收（本机 clang，Debug 与 Release 双构建）**：
+  | 项 | Debug（`build/`） | Release（`build-release/`） |
+  |---|---|---|
+  | ctest | **29/29 全绿** | 关键测试（f16_precision / expr_fuse / expr_graph）单跑全绿 |
+  | CPU 字节锚 `--steps 20` | `6f8849f14da23110` | `49ded8cf81d9f8f4` |
+  | GPU 40HX 字节锚 `--steps 20` | `8ef51b2927253c50` | `5e992f668b4209c8` |
+  两个构建的各锚均与既有文档锚**逐位一致**（Release 锚 = 本仓性能档口径，见另条「Release
+  构建下字节锚与 init-hash 均偏离 AGENTS §12 文档锚」的说明）⇒ **IR-C 接入训练路径后
+  f32 数值面零变化**。scan 注册表 **92 结构不变**（构建日志 `内容未变化，保持 mtime`；
+  库内口径）；`bench/doc_inventory.ps1`：virtual **52/52**、layer-called **22**、
+  `L2-VIOLATIONS: 0`、`HANDWRITTEN-RESIDUE: 0`；`text_train --f16 --gpu=40HX` 3 步端到端
+  跑通（loss 9.0279 → 8.9614 → 8.9176；f32 对照 9.0197 → 8.9681 → 8.9041，差在 f16 存储
+  舍入内）；`expr_fuse_test` 11 → **12 用例全绿**（含 P2 写穿多输出、融合 vs 未融合逐位
+  一致 diff=0）。
+- **7. 文档校订（回收 P1 条的遗留待办）**：AGENTS §3/§7/§11/§12 与 `docs/development/`
+  `02-operator-fusion.md`、`03-ir-optimization.md`、`12-compute-engine-inventory.md`、
+  `docs/usage/03-compute-engine-usage.md`、`docs/introduction/04-innovative-designs.md` 中
+  "IR-C 不存在 / 未采用 / 已移除"的**当前状态**表述全部改为现行（含 P1/P2 规则、GPU 真
+  录制 / CPU no-op、写穿多输出、闭合世界降级与 `NN_IRC_TRACE`）；历史取舍正文仍留在本文件。
+- **8. 剩余（未做，后置；2026-10-06 用户裁定本轮收口，作为后续独立立项）**：P3 跨链批量派发（66.5 → ~3 kernel/step，可选）、P4 CE
+  online-softmax fold（归约数据依赖，IR-C 管不了，走 fold 通用机制）；P0（wgrad 派发饥饿
+  −26ms/step）仍在 IR 范畴之外，独立推进。
+
+---
+
+## 勘误补记（同日，承接上条）
+- 上条 §2 的 host 侧对照曾只取 Release 口径；Debug 构建的 host 侧数字（optimizer
+  inclusive 1012ms、墙钟 3250ms）**不是回退**——device 侧表完全一致（1330 调用 /
+  4.58ms），差异来自 Debug 未优化 STL 与 IR 处理的 host 耗时。跨构建类型比较一律用
+  `NN_PROFILE` 的设备侧表。
+- **构建期 `[skip] 分派变体 6b634571443ba779#x 的形态暂不支持生成` 的语义澄清
+  （2026-10-06，此前多轮构建均出现但未记录）**：该 key 是 **P2 的 Adam 多输出
+  （extras）复合结构**（6 输入 + extras={2,1,3} 写穿 m/v/delta、8 个 rparams），不是
+  形态缺口——**多输出结构按设计只生成 V0 变体**（`expr_glsl_gen` 的 P2 约束：
+  `#x`/`#a` 均跳过，f16 复合结构由 `execute_fused_graph` 的逐成员降级覆盖），但
+  `fused_generate` 的发射器把"发不出 `#x`"一律打成"形态暂不支持生成"，把设计内跳过
+  伪装成了报错文本。已修正为两类成因分打（extras → "[skip] 多输出(extras) 结构 …
+  按设计不生成（仅 V0；混精度走逐成员降级）"；其余才是真形态缺口提示）。运行期
+  影响为零（该结构本就只走 V0 全 f32 路径）。
+
+---
+
+# Windows CRT abort() 模态弹窗静音（2026-10-06，用户截图报障）
+
+- 类型：缺陷修复（测试/脚本可用性）+ 工具链坑（已录入 `docs/development/08` §5）
+- **现象**：Windows Debug CRT 在 `abort()` 时弹**模态**"Microsoft Visual C++ Runtime
+  Library — Debug Error! abort() has been called (Press Retry to debug the application)"
+  对话框（用户截图实测，来源 `error_macro_test.exe` 的 abort 负例子进程）。两个要害：
+  ① **GUI 弹窗不进 stdout/stderr**——测试输出/ctest 日志/审计 grep 全看不见它
+  （"测试全绿但用户看到报错"）；② **模态阻塞**——子进程卡在弹窗等人点，`std::system`
+  的父进程连带挂起，ctest 被卡死。此前未记录（报错不在任何日志流里）。
+- **修法**（通用，非测试特例）：abort 唯一落点 `core_errors.hpp::fail_abort` 在
+  `std::abort()` 前静音 CRT 弹窗与 WER 上报——`_set_abort_behavior(0,
+  _WRITE_ABORT_MSG | _CALL_REPORTFAULT)` + `_set_error_mode(_OUT_TO_STDERR)`
+  （Windows 宏守卫，其余平台 no-op）。错误信息本函数已打印到 stderr，可见性不变；
+  abort 语义保持"打印后立即终止"。`fail_exit`（`std::exit`）无此问题。
+- **验收**：`error_macro_test` abort 负例子进程直跑 <10s 内以 **exit code 3**
+  终止（此前挂弹窗）、stderr 错误行完整；`error_macro_test` 全套 0 failures、
+  0.5s 跑完（修复前 ctest 里 3.5s 的差额即等人点弹窗）。
+
+---
+
+# CE online-softmax 单趟 fold（P4）：Transpose 视图 + FoldAnchor 自登记 + fold 生成器通用优化（2026-10-06）
+
+## 承接「IR-C P2 收官」§8 的 P4；用户裁定"表达式自登记、不为单一操作加专用原语"
+
+- 类型：演进记录（性能 A/B + 数值验收 + 测量方法坑）+ 锚点重置
+- **1. 定位与设计裁定**：CE 的 online-softmax 归约带跨块数据依赖（m/l 跨块进位），
+  IR-C 图融合管不了；按用户裁定"不想加太多专门针对某一个操作设计的原语"，走
+  **FoldSpec 通用折叠**（P-C1/C2 机制）——全程零 CE 专属 shader / 原语 / 视图。
+  旧 5-kernel 链（col_max 原语 + denom/loss_vec/grad 表达式 + Σ）重写为 **3-kernel**
+  （fold lse 单趟 + loss_sum 归约链 + grad），logits DRAM 趟数 **3 → 2**；grad 公式
+  由 `exp(x−m)/denom − onehot` 等价改写为 `exp(x−lse) − onehot`（少一次除法与广播）。
+- **2. 通用机制新增（全部是通用面，非 CE 特例）**：
+  - `ExprViewKind::Transpose = 15`（`expr_spec.hpp`）：转置直读 `data[col*param + row]`，
+    param = 行距走运行期视图参数 `vp`、**不进 key**（同结构不同 stride 共享 shader）；
+    fold 与非 fold 双生成路径 + CPU 解释器两处 switch + 越界守卫
+    （`(K-1)*stride + rows <= size`）；助手 `expr::trans(stride)`。
+  - `make_fold_logsumexp(k, input_view)`（`expr_fold.hpp` 第 4 个通用 fold 样例）：
+    body 与 `make_fold_softmax_denom` 同构（online m/l rescale），finalize 多指令链
+    `lse = m + log(l)`（reg 10/11 链内临时）。
+  - **`FoldAnchor` 自登记**（`expr_dsl.hpp`）：fold 值构造与 `FusedAnchor` 同机制入
+    `anchor_registry()`——用户裁定"新表达式一律自登记，`tools/scan_exprs.cpp` 不得
+    随新表达式改动"；本 P4 scan_exprs **零 diff**（此前误改显式登记块，已撤销）。
+    注意力 fold 5 组合仍在 scan 显式块（存量不动）。
+  - finalize 校验一般化（`expr_spec.hpp`）：多指令 finalize 链内临时允许 def-before-use
+    （`fin_def`）+ 精确跨迭代污染规则（`fin_write_max`）；原"写出寄存器不得再读"的
+    保守规则会拒绝这类合法 finalize（fold v1 状态自拷贝语义由新规则精确保留）。
+  - fold v1 生成器两个**通用**优化（`expr_glsl_gen.hpp`）：① **归约输入内联**——只被
+    归约消费的元素临时量在归约块循环内逐块重算，消 `e[n][128]` 私有数组物化；
+    ② **循环剥离 + 预取软件流水**（`v=src(0u); for(kb=1..){ vn=src(kb); acc+=v; v=vn; }
+    acc+=v`）消 64 级 L2 串行延迟链。累加序不变 ⇒ CPU/GPU 逐位同序（对拍口径不变）。
+- **3. 数值验收（用户裁定「P4 另加逐位不变验收」：允许移锚 + 逐用例对拍 + gradcheck）**：
+  `ce_fusion_test::run_old_new_parity` 新旧 CE 逐用例对拍 **8 形状**（K=129/300/1000/4096
+  分块边界 + scale-40 压力值）× CPU/GPU，容差 `1e-6*(1+|ref|)`：**grad_err ~1e-8**、
+  loss 相对误差 ~2e-7（scale-40 压力下绝对值 ≤1.1e-5）；3 个旧形 CE 单测改写为现行链形
+  （lse fold + loss_sum + grad 逐段 vs 参考）；gradcheck 全绿；ce_fusion_test CPU+GPU
+  ALL PASS。
+- **4. 性能口径（同窗交错 / 同窗复测；测量坑见 §5）**：
+  - kernel 数 **5 → 3/step**（设备表实测 60 calls/20 steps）；
+  - 新侧设备耗时实测（GPU 40HX，logits (8208,16384)，同窗 5 次复测稳定）：
+    `ce.fold` 2.95 + `ce.grad` 2.92 + `ce.lossum` 0.02 = **5.93 ms/step**；
+  - 旧侧**分项标定**（剖析器晚于旧路径、无同码 A/B；`build/head_ab/` 留有
+    git worktree @HEAD 的基线二进制供后续补测）：col_max ≈ 1.5 ms（`layer_bench` 同形
+    `col_reduce_sum(8208,16384)` = 1.495 ms 标定）+ denom ≈ 2.9 ms（与 fold 同工作量的
+    一趟 exp+归约）+ grad 2.92 ms（同构 kernel 实测）+ loss_vec/Σ ≈ 0.1 ms
+    ≈ **7.4 ms/step** ⇒ P4 设备时间 **≈ −20%**，主体 = col_max+denom 两趟（~4.4 ms）
+    融为 fold 一趟（2.95 ms）；即便保守按"持平"读，确凿收益仍是 kernel 5→3 与
+    logits 趟数 3→2。
+- **5. 测量方法坑（跨时段设备计时漂移；已录 `development/08` §5）**：同二进制同 shader
+  （注册表 mtime/内容跨时段不变证实）的 CE 3 kernel 会话早期测 **13.2 ms/step**、晚期
+  稳定 **5.93 ms/step**（2.2×），同时段非 CE kernel 一致 ⇒ 非时钟/热。已排除三个假设：
+  模型形状混淆（`--d-model` 默认 128 与显式 64 的对照混入，同形化后仍 5.93）、精度变体
+  分派（`--f16` / `--precision-stable f16` 实测 fold 仍 ~3 ms）、shader 版本（注册表
+  内容一致）。**结论口径：性能数字只认同窗交错测量**；本条全部对照均为同窗
+  （新旧二进制同窗交错 2+2 轮、新侧同窗 5 复测）。
+- **6. 锚点重置（用户裁定：数值变更允许移锚并更新文档）**：
+  | 锚 | 旧 | 新（P4 后） |
+  |---|---|---|
+  | CPU 字节锚（Debug） | `6f8849f14da23110` | **`8809f07142e29472`** |
+  | GPU dev2 字节锚（Debug） | `8ef51b2927253c50` | **`c69a3378c7dcc037`** |
+  | CPU 字节锚（Release） | `49ded8cf81d9f8f4` | **`f360f9bdbbfbe12c`** |
+  | GPU dev2 字节锚（Release） | `5e992f668b4209c8` | **`4103194cb9e3e230`** |
+  均 `gpu_stability_probe` 双轮 PASS。**init 锚逐位不变**（HEAD worktree 同探针对照：
+  `a22e807ee05ec3ac`/`2d7ecb570d91fd37`/`27f50137087d09b5`/`daec9e935f9b4c68`/
+  `d31c2e46bda6f3b5` 全同）⇒ P4 未动初值；顺带收口「Release 构建下字节锚与 init-hash
+  均偏离 AGENTS §12 文档锚」条的待办——§12 init 锚按 Debug/Release 双口径重刷
+  （1950 条留下的漂移，与 P4 无关；Release init 新值 `3e982d018c00d94a`/
+  `d8c8457f0053c4f9`/`70c4c085052268b2`/`f8c2d892f5834239`/`7002b986b84f679f`）。
+- **7. 收尾验收**：ctest **29/29**（Debug 全量）+ Release 全量构建与 ctest；
+  `text_train --f16` 冒烟跑通；registry **93 结构**（92 + LSE trans fold；其 linear
+  视图变体未被消费、按不消费不登记处理）；`doc_inventory` / `doc_align_audit` 门禁过。
+
+# P3 跨链批量派发：`#b` 批量变体 + BDA 实例表 + 图内同签名分组（2026-10-06）
+
+- **类型/机制**：通用机制（闭合世界、可降级、可观测），非单算子特例；数值面零变化
+  （批量派发不改变任何逐元素计算与顺序）。生成期给每个**纯逐元素**结构
+  （`expr_spec_batchable`：无归约/fold/matmul，**含 P2 多输出 extras 复合**，仅 V0
+  全 f32）追加 `key#b` 批量变体（`EXPR_BATCH_SUFFIX`、`ExprEmitter::generate_batched`）：
+  缓冲声明块改「实例表（uvec2，stride = 输入+主输出+extras+尾槽）+ buffer reference
+  + 名字宏」、main 序言按 `gl_WorkGroupID.y` 取实例、强制标量；主体渲染与普通版
+  逐字一致，PC 与 V0 完全同布局。运行期 `GpuBackend::run_fused_gpu_batch`：实例表经
+  `vkCmdUpdateBuffer` 录制期内联写入小 device-local 缓冲（≤64KB），一次 dispatch
+  `(ceil(max_count/256), n_instances, 1)` 跑完整组。**取舍：BDA（buffer device
+  address）而非描述符数组**——描述符数组管道的注册/绑定面翻倍（逐实例写描述符 +
+  数组池），BDA 只要一条实例表 + 一个 binding，代价是设备特性门控（不支持即降级）。
+- **分组规则**（`execute_fused_graph`，稳定拓扑序 + keep 占位之后）：组键 = 结构 key
+  + consts/rparams/vp **值位型序列**（批量共享一份 PC）；贪心按列表序收集、单组
+  CAP 32；组内两两**互不依赖**（存储级：无任一成员消费/覆写另一成员的物化输出，
+  覆盖 AdamW decay/update 同 dst 的无依赖边形态），且入组不得逆置任何既有顺序
+  （与更早 kernel 有存储冲突者其派发位置必须更早）。决策只按列表序 + 键值。
+- **实例记录布局**（生成器 `expr_glsl_gen` batched 分支与后端 `FusedBatchInst`
+  注释同源写明）：uvec2 数组、每实例一段，**stride S = n_in + 1 + n_extras + 1**——
+  槽 `[0,n_in)` 输入地址、`[n_in]` 主输出、`[n_in+1+k]` extras（成员序）、
+  `[S-1] = (count, cols)` 尾槽 = 本实例元素数 + **本实例列数**。组键与 rows/cols
+  无关（设计）⇒ 同组形状可不同，count/cols 必须逐实例携带（shader 侧 `count_l`
+  与 `#define cols` 均读尾槽；PC 的 count/cols 两槽仅保持 V0 布局）。这是正确性
+  守卫而非偏离：PC 只有一个 cols 槽，同组混形状时复用它会静默错值。
+- **降级与开关**：`key#b` 未登记 / 设备无 buffer device address（`bda_available()`
+  为假时注册期即跳过 `#b`）/ `NN_IRC_NO_BATCH=1`（每次 `execute_fused_graph` 读取，
+  测试可同进程 A/B）→ 逐 kernel 走原路径；`NN_IRC_TRACE=1` 打 `[ir-c][batch] N 实例
+  → 1 派发 <组键>` 与 `[ir-c][batch-degrade] …`（与 `[ir-c][degrade]` 同哲学）。
+  未登记的单节点结构照旧硬报错（闭合世界不变）。
+- **验收数字**（Debug）：
+  - **kernel 对照（验收口径 = 融合派发合计；ts 标签保持 `fused_b`）**：
+    `NN_PROFILE=1 text_train --seq-len 256 --batch-size 64 --max-steps 20
+    --d-model 64 --gpu=40HX`：`fused@optimizer` **1330 calls（66.5/step）→ 归零**，
+    派发计入批量行 **`fused_b@optimizer` 57 calls（2.85/step）**，即
+    **合计 1330 → 57 calls/20 步**（≤120、≤6/step 达标）；`NN_IRC_TRACE` 逐组迹证
+    每步 **70 实例（32+32+6）→ 3 次派发（3.0/step）**（设备表少 3 = 尾帧 marks
+    打表后才 resolve 的既有剖析口径，2 步复测 3/6 同证）。**批量与非批量分列是
+    有意为之（用户裁定）**：`fused@optimizer` 行保留 = 任何漏批量/降级回落的派发
+    立即可见（降级必须可见）；两行合计才是融合派发总数。
+  - **批量 vs 逐个逐字节一致**：`expr_fuse_test` 新用例（3 同签名单节点 + 3 个
+    P2 extras 金刚石 + 1 条 P1 链）`NN_IRC_NO_BATCH=1` 与默认各跑一遍，
+    **16 张量 memcmp 逐字节相等**；CPU 逐节点对照 max_err 2.38e-07（容差 1e-4）；
+    并断言**批量派发恰 2 组**（`fused_batch_dispatches == 2`，无 BDA 时跳过）——
+    该断言兼作**同组混形状回归锁**：两组的三个实例 (R,C)=(3,5)/(4,7)/(2,11)
+    各不同（count/cols 均逐实例）仍各自成组一次派发。
+  - **字节锚逐位不变**：`gpu_stability_probe --steps 20` = `8809f07142e29472`、
+    `--gpu 2` = `c69a3378c7dcc037`（与 P4 后锚逐位一致）。
+  - **ctest 29/29** 全绿（含新用例）；构建 `-Werror` 零告警。
+- **代码现实两处**（最小改动 + 同源处理）：① GLSL 侧在设计的
+  `GL_EXT_buffer_reference` 之外追加 `GL_EXT_buffer_reference_uvec2`——uvec2 槽位
+  → reference 的构造 glslc 强制要求该扩展（缺则编译期报错）；② ts 标签/指标行
+  口径见上「kernel 对照」条（用户裁定：`fused_b` 与 `fused@optimizer` 分列，
+  合计核对）。

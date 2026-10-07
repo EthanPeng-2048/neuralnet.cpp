@@ -401,6 +401,7 @@ public:
         const bool ckpt = (checkpoint_every_ > 0);
         for (std::size_t bi = 0; bi < blocks_.size(); ++bi)
         {
+            NN_PROF_SCOPE(nn::prof::interned("fwd.blk", bi));
             // 文档感知：把本 step 每样本文档 id 传给各 block 的注意力
             blocks_[bi].set_doc_ids(doc_ids_);
             // 梯度检查点：每 checkpoint_every_ 个块保存一次输入；
@@ -468,6 +469,7 @@ public:
             for (std::size_t bi = 0; bi < n; ++bi)
             {
                 const std::size_t idx = n - 1 - bi;
+                NN_PROF_SCOPE(nn::prof::interned("bwd.blk", idx));
                 // 梯度检查点：若是 checkpoint 块，先重算 forward 重建缓存再反向
                 if (checkpoint_every_ > 0 && (idx % checkpoint_every_ == 0))
                 {

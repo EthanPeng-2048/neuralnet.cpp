@@ -46,6 +46,7 @@
 #include "../core_errors.hpp"
 #include "../core_observer_ptr.hpp"
 #include "../core_config.hpp"
+#include "../core_profile.hpp"   // 设备侧计时回填（NN_PROFILE=1 门控）
 // 本文件直接使用 expr_spec 的符号（run_fused_gpu 签名的 ExprPrecSig、
 // EXPR_PREC_DISPATCH_SUFFIX/EXPR_MAX_INPUTS/EXPR_MAX_CONSTS/
 // EXPR_MATMUL_BLOCK/EXPR_FOLD_ROWS_PER_WG）——**必须显式 include**：
@@ -332,6 +333,8 @@ public:
     GpuBuffer& operator=(const GpuBuffer&) = delete;
 
     // 创建 Device Local 缓冲区（尺寸语义 = 字节数，§6.3）
+    // usage 恒补 SHADER_DEVICE_ADDRESS（P3 实例表按设备地址引用张量缓冲）：
+    // 与 MemoryPool 分配侧的 DEVICE_ADDRESS 标志成对（都随 bda_available 门控）。
     [[nodiscard]] static Result<GpuBuffer> create_device_local(
         VkDevice device, MemoryPool& pool,
         std::size_t byte_count, VkBufferUsageFlags usage)
@@ -340,6 +343,8 @@ public:
         buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         buf_info.size = byte_count;
         buf_info.usage = usage;
+        if (pool.device_address_alloc())
+            buf_info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
         VkBuffer buffer = VK_NULL_HANDLE;
@@ -377,6 +382,10 @@ public:
         buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         buf_info.size = byte_count;
         buf_info.usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        // P3：与 create_device_local 同款补 SHADER_DEVICE_ADDRESS（池分配侧
+        // 已配对 DEVICE_ADDRESS 标志，见 MemoryPool::create_block）
+        if (pool.device_address_alloc())
+            buf_info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
         VkBuffer buffer = VK_NULL_HANDLE;
@@ -483,6 +492,23 @@ using GpuTensor = GpuTensorT<Precision::F32>;
 using GpuTensorF32 = GpuTensorT<Precision::F32>;
 using GpuTensorF16 = GpuTensorT<Precision::F16>;
 
+// ── P3 跨链批量派发：单实例描述（run_fused_gpu_batch 的输入）──────────────
+// 与 run_fused_gpu 的单 kernel 调用同一组形参的实例化：每实例自带输入/输出
+// 缓冲与元素数，共享一份 push constants（consts/rparams/vp 同值是分组前提）。
+// 实例表布局与生成器（expr_glsl_gen batched 分支）同源：uvec2 数组，每实例
+// 一段、stride **S = inputs.size() + 1 + extra_outs.size() + 1**——
+//   [0, n_in) 输入地址 / [n_in] 主输出 / [n_in+1+k] extras / [S-1] = (count, cols)
+// 尾槽 = (本实例元素数, 本实例列数)：组键与 rows/cols 无关（同组形状可不同），
+// count/cols 必须逐实例携带（shader 侧 `#define cols` 与 count_l 同读尾槽）。
+struct FusedBatchInst
+{
+    std::vector<const GpuBuffer*> inputs;      // 与 spec.views 同序
+    const GpuBuffer*              out = nullptr;    // 主输出（槽 n_in）
+    std::vector<const GpuBuffer*> extra_outs;  // extras 输出（槽 n_in+1+k）
+    std::uint32_t                 count = 0;   // rows*cols（元素数）
+    std::uint32_t                 cols = 0;    // 每实例列数（row/col 推导）
+};
+
 // ══════════════════════════════════════════════════════════════════════════
 // GpuBackend — Vulkan 计算后端单例
 // ══════════════════════════════════════════════════════════════════════════
@@ -568,6 +594,12 @@ private:
     //  range 被驱动丢弃 → shader 读到未定义残留 → 假 PASS"（见注册处注释）。
     // 运行期精度分派变体（键后缀 "#x"）的额外 `prec` 槽也含在此值内。
     std::unordered_map<std::string, std::uint32_t> fused_pc_base_fixed_;
+    // P3 批量派发观测计数（测试/诊断用：确认批量路径真的走到、而非静默降级
+    // 为逐 kernel 后 A/B 自比恒真）
+    std::uint64_t fused_batch_dispatches_ = 0;
+    // `#b` 批量变体的实例表 stride（uvec2 槽数 = 输入+主输出+extras+尾槽）：
+    // 注册时算定，run_fused_gpu_batch 校验实例布局与之一致（防槽位错位错值）。
+    std::unordered_map<std::string, std::uint32_t> fused_batch_stride_;
 
     std::unique_ptr<MemoryPool> memory_pool_;
     // 第二阶段：瞬态/持久分池。batch 录制期（batch_mode_=true）创建的
@@ -579,6 +611,21 @@ private:
 
     VkCommandPool command_pool_ = VK_NULL_HANDLE;
     VkDescriptorPool gpu_tensor_pool_ = VK_NULL_HANDLE;
+
+    // ── 设备侧计时（NN_PROFILE=1 且所选队列支持时间戳时启用）───────────
+    // ts_dispatch 在每个 vkCmdDispatch 前后各写一个 timestamp，按 (帧|solo)
+    // 分块分配查询区间：帧块在 reap_frame（fence 已等）resolve、solo 块在
+    // submit_and_wait（已等）resolve，逐标号聚合进 nn::prof::device_add。
+    // begin/end 均用 ALL_COMMANDS：begin 在此前命令全部完成后落笔、end 在
+    // 本 dispatch 完成后落笔 ⇒ 每对标记间隔 ≈ 该 kernel 的 GPU 执行时间；
+    // dispatch 之间的屏障/空隙不计入任何标号（即"kernel 时间 vs 空隙"口径）。
+    static constexpr std::uint32_t kTsPairsPerBlock = 4096;
+    struct TsCursor
+    {
+        std::uint32_t base = 0;   // 本块首查询号
+        std::uint32_t next = 0;   // 已用 pair 数
+        std::vector<std::pair<const char*, std::uint32_t>> marks;  // (标号, pair 号)
+    };
 
     // ── Command Buffer Batching + 多帧流水线─────────────────────
     // 单帧模型（一次提交 + 阻塞等待）会让 GPU 执行 step N 时 host 卡在 fence 上、
@@ -604,6 +651,7 @@ private:
         VkFence fence = VK_NULL_HANDLE;  // 创建即为 unsignaled
         std::vector<VkDescriptorSet> desc_sets;  // 本帧使用的描述符集
         bool in_flight = false;                  // 已提交、fence 尚未被等待
+        TsCursor ts;                             // 设备侧计时块（NN_PROFILE）
     };
     std::vector<Frame> frames_;
     std::size_t frame_next_ = 0;         // 下一轮转帧（begin/flush 取用）
@@ -645,6 +693,13 @@ private:
     // batch 模式走 frames_ 环，不经过这里。单线程录制假设同 batch_cmd_。
     VkFence solo_fence_ = VK_NULL_HANDLE;        // 创建即 unsignaled
     VkCommandBuffer solo_cmd_ = VK_NULL_HANDLE;   // 每次 reset + begin 复用
+
+    // ── 设备侧计时：运行期状态（TsCursor 定义见帧环段）────────────────
+    VkQueryPool ts_pool_ = VK_NULL_HANDLE;
+    bool ts_enabled_ = false;
+    float ts_period_ns_ = 1.0f;
+    TsCursor ts_solo_;                     // solo 块（base = PIPELINE_FRAMES × 块长）
+    TsCursor* ts_cur_ = &ts_solo_;         // 当前录制块（acquire_cmd 切换）
 
     std::mutex init_mutex_;
     std::mutex queue_mutex_;
@@ -1081,6 +1136,8 @@ public:
 
             if (gpu_tensor_pool_ != VK_NULL_HANDLE)
                 vkDestroyDescriptorPool(device_.device(), gpu_tensor_pool_, nullptr);
+            if (ts_pool_ != VK_NULL_HANDLE)
+                vkDestroyQueryPool(device_.device(), ts_pool_, nullptr);
             if (command_pool_ != VK_NULL_HANDLE)
                 vkDestroyCommandPool(device_.device(), command_pool_, nullptr);
         }
@@ -1175,6 +1232,7 @@ public:
             if (wr != VK_SUCCESS)
                 NN_FAIL(std::string("GPU 帧等待失败: Vulkan error ") +                     std::to_string(static_cast<int>(wr)) +                     "\n建议：减小 --batch-size 或 --seq-len，或增大 Windows TDR 超时"                     " (注册表 TdrDelay)");
         }
+        ts_resolve(f.ts);   // 设备侧计时：fence 已等（或调用方已确认），读回本帧 kernel 时间
         // 该帧的延迟销毁：先 vkDestroyBuffer 再归还内存
         {
             std::lock_guard lock(pending_mutex_);
@@ -1262,6 +1320,10 @@ public:
         transient_pool_ = std::make_unique<MemoryPool>(
             device_.device(), device_.physical_device(), block_bytes,
             MemoryPool::DEFAULT_SMALL_BLOCK_SIZE, ladder_max);
+        // P3（buffer device address）：设备支持即让**全部**池分配可取设备地址
+        // （实例表引用张量缓冲；块内子分配同样覆盖），须在首次 allocate 前设置
+        memory_pool_->set_device_address_alloc(device_.bda_available());
+        transient_pool_->set_device_address_alloc(device_.bda_available());
 
         // 5. 创建 command pool
         VkCommandPoolCreateInfo pool_info{};
@@ -1372,6 +1434,35 @@ public:
             if (!r)
                 return r;
         }
+
+        // 7d. timestamp query pool（NN_PROFILE 设备侧计时；按帧分块 + solo 块）
+        //     所选队列族 timestampValidBits=0（部分虚拟/软件设备）→ 整体
+        //     降级 host 计时，ts_enabled_ 保持 false，零额外开销。
+        ts_enabled_ = nn::prof::enabled() &&
+                      device_.queue_timestamp_valid_bits() > 0;
+        if (ts_enabled_)
+        {
+            ts_period_ns_ = device_.timestamp_period_ns();
+            VkQueryPoolCreateInfo qp{};
+            qp.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+            qp.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qp.queryCount = (PIPELINE_FRAMES + 1) * kTsPairsPerBlock * 2;
+            const VkResult qres =
+                vkCreateQueryPool(device_.device(), &qp, nullptr, &ts_pool_);
+            if (qres != VK_SUCCESS)
+            {
+                ts_enabled_ = false;
+                ts_pool_ = VK_NULL_HANDLE;
+                std::fprintf(stderr,
+                    "[profile] timestamp query pool 创建失败(%d)，设备侧计时降级\n",
+                    static_cast<int>(qres));
+            }
+        }
+        for (std::size_t i = 0; i < PIPELINE_FRAMES; ++i)
+            frames_[i].ts.base =
+                static_cast<std::uint32_t>(i * kTsPairsPerBlock * 2);
+        ts_solo_.base = static_cast<std::uint32_t>(
+            PIPELINE_FRAMES * kTsPairsPerBlock * 2);
 
         // 9. 创建 tiled matmul pipeline（可选）
         const auto& tiled_spirv = get_matmul_tiled_spirv();
@@ -1726,10 +1817,19 @@ public:
             // 运行期精度分派变体（键 "#x"）：输入/输出各双视图 + PC 多一个 prec 槽
             const bool is_disp =
                 std::string_view(fs.key).ends_with(nn::EXPR_PREC_DISPATCH_SUFFIX);
-            // 带 '#' 的变体（f16 视图）需要 SSBO 16 位存储；设备未启用 →
+            // P3 批量变体（键 "#b"）：单 binding（实例表），PC 与 V0 同布局
+            const bool is_batch =
+                std::string_view(fs.key).ends_with(nn::EXPR_BATCH_SUFFIX);
+            // 带 '#' 的 f16 变体（#x/#a）需要 SSBO 16 位存储；设备未启用 →
             // 跳过注册（运行时查不到 `#x`/`#a` → 基类 NVI 入口回退边界 cast）。
-            if (std::string_view(fs.key).find('#') != std::string_view::npos &&
+            // `#b` 全 f32 无此要求（不得被这条误伤）。
+            if (!is_batch &&
+                std::string_view(fs.key).find('#') != std::string_view::npos &&
                 !device_.has_16bit_storage())
+                continue;
+            // `#b` 批量变体需要 buffer device address（实例表按 64 位地址解引用
+            // 各实例缓冲）；未启用 → 跳过注册 → 运行期逐 kernel 降级（可观测）。
+            if (is_batch && !device_.bda_available())
                 continue;
             // ALU 变体（key 以 "#a" 结尾，native16 原生 f16 算术）额外需要
             // shaderFloat16 特性；未启用 → 跳过 → 运行时回退 `#x`（其 pipeline
@@ -1741,8 +1841,13 @@ public:
                 static_cast<std::uint32_t>(fs.spec.views.size());
             // 分派变体：输入 i 的 f32 视图 binding=i、f16 视图 binding=n_in+i；
             // 输出 f32/f16 视图 binding=2*n_in / 2*n_in+1。
+            // P2 多输出（extras）：V0 追加 k 个输出 binding（bex<k>，主输出之后）；
+            // `#x`/`#a` 变体不生成 extras（生成器跳过）⇒ 分派分支恒 2N+2。
+            // `#b` 批量变体：只绑 binding=0 一个 storage buffer（实例表）。
             const std::uint32_t num_bindings =
-                is_disp ? (2u * n_in + 2u) : (n_in + 1u);   // 输入 + 输出
+                is_batch ? 1u
+                : is_disp ? (2u * n_in + 2u)
+                : (n_in + 1u + static_cast<std::uint32_t>(fs.spec.extras.size()));
             // push constant **固定头**槽数（uint）：逐形态与生成器的 PC 声明
             // 逐槽一致——
             //   逐元素 2（count, cols）/ +matmul 6（…, rows, mm_k, mm_batch,
@@ -1787,6 +1892,14 @@ public:
                 fused_rparam_counts_.emplace(fs.key, fs.rparam_count);
                 fused_vec_width_.emplace(fs.key, fs.vec_width);
                 fused_pc_base_fixed_.emplace(fs.key, pc_base_fixed);
+                // P3 批量变体：实例表 stride（uvec2 槽数），run_fused_gpu_batch
+                // 据此校验实例布局（生成器 S = 输入+主输出+extras+尾槽，同源）
+                if (is_batch)
+                    fused_batch_stride_.emplace(
+                        fs.key,
+                        n_in + 1u
+                            + static_cast<std::uint32_t>(fs.spec.extras.size())
+                            + 1u);
             }
         }
 #endif
@@ -1970,6 +2083,7 @@ public:
         last_active_frame_ = i;
         batch_has_ops_ = false;
         batch_mode_ = true;
+        ts_begin_block(f.cmd, f.ts);   // 设备侧计时：本帧块开始
         return {};
     }
 
@@ -2429,7 +2543,8 @@ public:
     [[nodiscard]] Result<void> dispatch_compute(
         const VulkanPipeline& pipeline, std::span<const GpuTensor> inputs,
         const GpuTensor& output, const std::vector<std::uint8_t>& pc,
-        std::uint32_t wg_x, std::uint32_t wg_y, std::uint32_t wg_z)
+        std::uint32_t wg_x, std::uint32_t wg_y, std::uint32_t wg_z,
+        const char* ts_label = "dispatch")   // 设备侧计时标号（NN_PROFILE）
     {
         if (!initialized_)
             NN_FAIL("GPU backend not initialized");
@@ -2477,7 +2592,7 @@ public:
             vkCmdPushConstants(cmd, pipeline.pipeline_layout(),
                 VK_SHADER_STAGE_COMPUTE_BIT, 0,
                 static_cast<uint32_t>(pc.size()), pc.data());
-        vkCmdDispatch(cmd, wg_x, wg_y, wg_z);
+        ts_dispatch(cmd, ts_label, wg_x, wg_y, wg_z);
         record_output_barrier(cmd, output.buffer().impl());
 
         if (owns_cmd)
@@ -2579,13 +2694,13 @@ public:
         if (use_gemv)
         {
             auto r = dispatch_compute(pipeline, inputs, C, pc,
-                (M + GEMV_ROWS - 1u) / GEMV_ROWS, 1u, 1u);
+                (M + GEMV_ROWS - 1u) / GEMV_ROWS, 1u, 1u, "matmul");
             NN_TRY_CHECK(r);
             return C;
         }
         const uint32_t tile = use_tiled ? 64u : 16u;
         auto r = dispatch_compute(pipeline, inputs, C, pc,
-            (N + tile - 1u) / tile, (M + tile - 1u) / tile, 1u);
+            (N + tile - 1u) / tile, (M + tile - 1u) / tile, 1u, "matmul");
         NN_TRY_CHECK(r);
         return C;
     }
@@ -2664,7 +2779,7 @@ public:
         std::vector<GpuTensor> inputs{A, B};
         auto r = dispatch_compute(
             use_f16 ? batched_matmul_f16_pipeline_ : batched_matmul_pipeline_,
-            inputs, C, pc, (N + BN - 1) / BN, (M + BM - 1) / BM, batch);
+            inputs, C, pc, (N + BN - 1) / BN, (M + BM - 1) / BM, batch, "batched_matmul");
         NN_TRY_CHECK(r);
         return C;
     }
@@ -2744,12 +2859,12 @@ public:
             NN_TRY_CHECK(St_res);
             GpuTensor St = std::move(*St_res);
             std::vector<GpuTensor> inputs{K, V, P, R, A0, B0, boundary, St};
-            auto r = dispatch_compute(pipe, inputs, C, pc, 1u, BH, 1u);
+            auto r = dispatch_compute(pipe, inputs, C, pc, 1u, BH, 1u, "scan_prefix");
             NN_TRY_CHECK(r);
             return C;
         }
         std::vector<GpuTensor> inputs{K, V, P, R, A0, B0, boundary};
-        auto r = dispatch_compute(pipe, inputs, C, pc, 1u, BH, 1u);
+        auto r = dispatch_compute(pipe, inputs, C, pc, 1u, BH, 1u, "scan_prefix");
         NN_TRY_CHECK(r);
         return C;
     }
@@ -2814,7 +2929,7 @@ public:
             NN_TRY_CHECK(St_res);
             GpuTensor St = std::move(*St_res);
             std::vector<GpuTensor> inputs{D, X, Y, boundary, St};
-            auto r = dispatch_compute(pipe, inputs, C, pc, 1u, BH, 1u);
+            auto r = dispatch_compute(pipe, inputs, C, pc, 1u, BH, 1u, "scan_suffix");
             NN_TRY_CHECK(r);
             return C;
         }
@@ -3006,12 +3121,81 @@ public:
         return on;
     }
 
+    // ── 设备侧计时 helper（口径见成员注释）────────────────────────────
+    // 录制块开始：reset 本块查询区间 + 游标复位（帧/solo 通用；上一块内容
+    // 必已在其 fence 等待点 resolve，见 reap_frame / submit_and_wait）
+    void ts_begin_block(VkCommandBuffer cmd, TsCursor& cur)
+    {
+        cur.next = 0;
+        cur.marks.clear();
+        ts_cur_ = &cur;
+        if (!ts_enabled_)
+            return;
+        vkCmdResetQueryPool(cmd, ts_pool_, cur.base, kTsPairsPerBlock * 2);
+    }
+
+    // dispatch 前后各写一个 timestamp（见成员注释的口径）
+    void ts_dispatch(VkCommandBuffer cmd, const char* label,
+                     std::uint32_t gx, std::uint32_t gy, std::uint32_t gz)
+    {
+        const bool mark = ts_enabled_ && ts_cur_ != nullptr &&
+                          ts_cur_->next < kTsPairsPerBlock;
+        std::uint32_t q = 0;
+        if (mark)
+        {
+            q = ts_cur_->base + ts_cur_->next * 2;
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, ts_pool_, q);
+            // 归因到录制期 stage（resolve 时 scope 已出栈）：key = "label@stage"，
+            // 使设备 kernel 表可与 host 阶段表同维度对账（仅剖析开启时进入）
+            const char* stage = nn::prof::current_stage();
+            const char* key = (stage != nullptr && stage[0] != '\0')
+                                  ? nn::prof::interned_pair(label, stage)
+                                  : label;
+            ts_cur_->marks.emplace_back(key, ts_cur_->next);
+            ++ts_cur_->next;
+        }
+        vkCmdDispatch(cmd, gx, gy, gz);
+        if (mark)
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, ts_pool_, q + 1);
+    }
+
+    // resolve：调用点 fence 已等 → 读回本块全部 pair → 按标号聚合
+    void ts_resolve(TsCursor& cur)
+    {
+        if (!ts_enabled_ || cur.next == 0 || cur.marks.empty())
+        {
+            cur.next = 0;
+            cur.marks.clear();
+            return;
+        }
+        std::vector<std::uint64_t> ts(cur.next * 2);
+        const VkResult r = vkGetQueryPoolResults(device_.device(), ts_pool_,
+            cur.base, cur.next * 2, ts.size() * sizeof(std::uint64_t),
+            ts.data(), sizeof(std::uint64_t),
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        if (r == VK_SUCCESS)
+        {
+            for (const auto& [label, p] : cur.marks)
+            {
+                const std::uint64_t t0 = ts[static_cast<std::size_t>(p) * 2];
+                const std::uint64_t t1 = ts[static_cast<std::size_t>(p) * 2 + 1];
+                if (t1 >= t0)
+                    nn::prof::device_add(label,
+                        static_cast<std::uint64_t>(
+                            static_cast<double>(t1 - t0) * ts_period_ns_));
+            }
+        }
+        cur.next = 0;
+        cur.marks.clear();
+    }
+
     // 返回 (cmd, owns_cmd)。owns_cmd=true 时调用方需 submit_and_wait。
     [[nodiscard]] Result<std::pair<VkCommandBuffer, bool>> acquire_cmd()
     {
         if (batch_mode_)
         {
             batch_has_ops_ = true;  // 当前帧已含 op（空帧不提交）
+            ts_cur_ = &frames_[batch_frame_].ts;   // 设备侧计时：归属当前帧块
             return std::make_pair(batch_cmd_, false);
         }
 
@@ -3030,6 +3214,7 @@ public:
         begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         r = detail::vk_check(vkBeginCommandBuffer(cmd, &begin_info), __FILE__, __LINE__);
         NN_TRY_CHECK(r);
+        ts_begin_block(cmd, ts_solo_);   // 设备侧计时：solo 块开始
         return std::make_pair(cmd, true);
     }
 
@@ -3100,6 +3285,8 @@ public:
             vkWaitForFences(device_.device(), 1, &solo_fence_, VK_TRUE, kSingleOpTimeoutNs),
             __FILE__, __LINE__);
         const auto t_wait = std::chrono::steady_clock::now();
+
+        ts_resolve(ts_solo_);   // 设备侧计时：solo 块 resolve（fence 已等）
 
         // 只归还描述符集；solo fence/cmd 留待下次复用（不销毁/不释放）
         if (desc_set != VK_NULL_HANDLE)
@@ -3274,7 +3461,7 @@ public:
 
         // vec4 kernel（与 DSL count/(256*vec_width) 同口径）：每线程 4 元素
         const uint32_t wg_count = (count + 256u * 4u - 1u) / (256u * 4u);
-        vkCmdDispatch(cmd, wg_count, 1, 1);
+        ts_dispatch(cmd, "elementwise_v2", wg_count, 1, 1);
         record_output_barrier(cmd, output.buffer().impl());
 
         // 6. 独立模式提交
@@ -3330,7 +3517,11 @@ public:
         bool out_f16 = false,
         // 运行期精度分派（键 "#x"）：真实 (输入精度位图, 输出精度)。仅在
         // 分派变体上写入 PC `prec` 槽；其余变体忽略（其精度已是身份）。
-        nn::ExprPrecSig prec_sig = 0)
+        nn::ExprPrecSig prec_sig = 0,
+        // P2 多输出（extras，IR-C 写穿物化）：主输出之外的**额外输出存储**
+        // （槽 1..k，与生成器的 `bex<k>` 绑定同序）。仅 V0（全 f32）逐元素
+        // shader 支持（`#x`/typed/native16 变体不生成 extras，见 expr_glsl_gen）。
+        std::span<GpuTensor* const> extra_outs = {})
     {
         if (!initialized_)
             NN_FAIL("GPU backend not initialized");
@@ -3436,13 +3627,27 @@ public:
         }
         GpuTensor output = *output_ptr;
 
-        // 2. 分配描述符集（N 输入 + 1 输出；分派变体 = 2N + 2）
+        // P2 多输出（extras）：额外输出全部由调用方提供既有存储（写穿物化），
+        // 主输出亦须是 output_override（全输出目标显式，无分配路径）。
+        if (!extra_outs.empty())
+        {
+            if (is_disp)
+                NN_FAIL("run_fused_gpu: 多输出（extras）仅支持 V0 变体");
+            if (!output_override)
+                NN_FAIL("run_fused_gpu: 多输出（extras）要求主输出为 output_override");
+            for (const GpuTensor* eo : extra_outs)
+                if (eo == nullptr)
+                    NN_FAIL("run_fused_gpu: 多输出（extras）含空输出指针");
+        }
+
+        // 2. 分配描述符集（N 输入 + 1 输出；分派变体 = 2N + 2；extras 追加 k 个输出）
         auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
         NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
 
         const std::size_t n_in = inputs.size();
-        const std::size_t n_bindings = is_disp ? (2 * n_in + 2) : (n_in + 1);
+        const std::size_t n_bindings =
+            is_disp ? (2 * n_in + 2) : (n_in + 1 + extra_outs.size());
         std::vector<VkDescriptorBufferInfo> buf_infos(n_bindings);
         std::vector<VkWriteDescriptorSet> writes(n_bindings);
         if (is_disp)
@@ -3463,6 +3668,9 @@ public:
             for (std::size_t i = 0; i < n_in; ++i)
                 buf_infos[i] = {inputs[i]->impl(), 0, VK_WHOLE_SIZE};
             buf_infos[n_in] = {output.buffer().impl(), 0, VK_WHOLE_SIZE};
+            // P2 多输出：bex<k> 绑定在主输出之后（与生成器 binding 同序）
+            for (std::size_t k = 0; k < extra_outs.size(); ++k)
+                buf_infos[n_in + 1 + k] = {extra_outs[k]->buffer().impl(), 0, VK_WHOLE_SIZE};
         }
         for (std::size_t i = 0; i < n_bindings; ++i)
         {
@@ -3622,7 +3830,7 @@ public:
             const std::uint32_t wg_y =
                 (m_per + nn::EXPR_MATMUL_BLOCK - 1u) / nn::EXPR_MATMUL_BLOCK;
             // batch：dispatch z = 批次，A/B 按 batch 垂直切分
-            vkCmdDispatch(cmd, wg_x, wg_y, matmul_batch);
+            ts_dispatch(cmd, "fused_mm", wg_x, wg_y, matmul_batch);
         }
         else
         {
@@ -3640,9 +3848,12 @@ public:
                 : (raxis == 0) ? static_cast<std::uint32_t>(rows)
                 : (raxis == 1) ? (static_cast<std::uint32_t>(cols) + 31u) / 32u
                 : (count + 256u * vec_width - 1u) / (256u * vec_width);
-            vkCmdDispatch(cmd, wg_count, 1, 1);
+            ts_dispatch(cmd, "fused", wg_count, 1, 1);
         }
         record_output_barrier(cmd, output.buffer().impl());
+        // P2 多输出：额外输出同样过写后屏障
+        for (const GpuTensor* eo : extra_outs)
+            record_output_barrier(cmd, eo->buffer().impl());
 
         // 5. 独立模式提交
         if (owns_cmd)
@@ -3665,11 +3876,249 @@ public:
         return output;
     }
 
+    // ══════════════════════════════════════════════════════════════════
+    // run_fused_gpu_batch — P3 跨链批量派发（键 = key#b）
+    //
+    // 同结构（同 key）、同参数值（consts/rparams/vp）、互不依赖的 N 个实例
+    // 合成**一次 dispatch**：实例表（uvec2 数组，见 FusedBatchInst 注释）经
+    // vkCmdUpdateBuffer 在录制期内联写入一个小 device-local 缓冲，shader 用
+    // buffer device address 按槽位解引用各实例的输入/输出缓冲。
+    //
+    // 与生成器（expr_glsl_gen 的 batched 分支）的契约：
+    //   Bindings: 仅 binding 0（实例表，storage buffer）
+    //   Push Constants = V0 逐元素同布局：count(=max_count), cols, [vp..],
+    //                    [c..], [rp..]（批量路径不读 count/cols 两槽——元素数
+    //                    与列数取每实例尾槽，见生成器 `#define cols`）
+    //   dispatch = (ceil(max_count/256), N, 1)，实例下标 = gl_WorkGroupID.y
+    //
+    // 前置（调用方 = execute_fused_graph 保证，本函数只防御性校验）：
+    // `key#b` 已注册、设备 bda_available、实例全 f32、组内互不依赖。
+    // ══════════════════════════════════════════════════════════════════
+    [[nodiscard]] Result<void> run_fused_gpu_batch(
+        const std::string& shader_name,
+        std::span<const FusedBatchInst> instances,
+        std::span<const Scalar> consts,
+        std::span<const std::uint32_t> view_params = {},
+        std::span<const Scalar> rparams = {})
+    {
+        if (!initialized_)
+            NN_FAIL("GPU backend not initialized");
+        const auto prof_t0 = std::chrono::steady_clock::now();
+        if (!device_.bda_available())
+            NN_FAIL("run_fused_gpu_batch: 设备未启用 buffer device address"
+                    "（应先逐 kernel 降级，不该到此）");
+        if (!std::string_view(shader_name).ends_with(nn::EXPR_BATCH_SUFFIX))
+            NN_FAIL("run_fused_gpu_batch: 非批量变体键（应以 #b 结尾）：" + shader_name);
+        const auto it = fused_pipelines_.find(shader_name);
+        if (it == fused_pipelines_.end())
+            NN_FAIL("fused shader not registered: " + shader_name);
+        const VulkanPipeline& pipeline = it->second;
+        if (instances.empty())
+            return {};
+        // PC 槽位校验（与 run_fused_gpu 同源：vp/rp 计数来自注册表元数据）
+        const std::uint32_t n_vp = fused_view_param_counts_.count(shader_name)
+            ? fused_view_param_counts_.at(shader_name) : 0u;
+        const std::uint32_t n_rp = fused_rparam_counts_.count(shader_name)
+            ? fused_rparam_counts_.at(shader_name) : 0u;
+        if (view_params.size() != n_vp)
+            NN_FAIL("run_fused_gpu_batch: view_params count mismatch for " + shader_name);
+        if (rparams.size() != n_rp)
+            NN_FAIL("run_fused_gpu_batch: rparams count mismatch for " + shader_name);
+        const std::uint32_t pc_base_fixed = fused_pc_base_fixed_.count(shader_name)
+            ? fused_pc_base_fixed_.at(shader_name) : 2u;
+
+        // 实例表布局：stride S = 输入 + 主输出 + extras + (count,cols) 尾槽
+        const std::size_t n_in = instances[0].inputs.size();
+        const std::size_t n_ex = instances[0].extra_outs.size();
+        const std::size_t stride = n_in + 1 + n_ex + 1;
+        const auto stride_it = fused_batch_stride_.find(shader_name);
+        if (stride_it != fused_batch_stride_.end() &&
+            stride_it->second != static_cast<std::uint32_t>(stride))
+            NN_FAIL("run_fused_gpu_batch: 实例槽数与注册结构不一致：" + shader_name);
+        for (const FusedBatchInst& inst : instances)
+        {
+            if (inst.inputs.size() != n_in || inst.extra_outs.size() != n_ex)
+                NN_FAIL("run_fused_gpu_batch: 组内实例结构不一致");
+            if (inst.out == nullptr)
+                NN_FAIL("run_fused_gpu_batch: 实例缺主输出缓冲");
+            for (const GpuBuffer* b : inst.inputs)
+                if (b == nullptr)
+                    NN_FAIL("run_fused_gpu_batch: 实例缺输入缓冲");
+            for (const GpuBuffer* b : inst.extra_outs)
+                if (b == nullptr)
+                    NN_FAIL("run_fused_gpu_batch: 实例缺 extras 输出缓冲");
+        }
+        // vkCmdUpdateBuffer 的硬上限：单次 ≤ 64KB、4 字节对齐
+        if (instances.size() * stride * sizeof(std::uint64_t) > 65536u)
+            NN_FAIL("run_fused_gpu_batch: 实例表超过 vkCmdUpdateBuffer 64KB 上限");
+
+        // ── 实例表内容：uvec2 = (地址低 32 位, 高 32 位)；尾槽 = (count, cols) ──
+        std::vector<std::uint32_t> table(instances.size() * stride * 2, 0u);
+        std::uint32_t max_count = 0;
+        std::uint32_t max_cols = 0;
+        for (std::size_t i = 0; i < instances.size(); ++i)
+        {
+            const FusedBatchInst& inst = instances[i];
+            const std::size_t base = i * stride * 2;
+            bool addr_ok = true;
+            const auto put_addr = [&](std::size_t slot, const GpuBuffer* b) -> bool
+            {
+                VkBufferDeviceAddressInfo ai{};
+                ai.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+                ai.buffer = b->impl();
+                const VkDeviceAddress addr =
+                    vkGetBufferDeviceAddress(device_.device(), &ai);
+                table[base + slot * 2 + 0] =
+                    static_cast<std::uint32_t>(addr & 0xffffffffull);
+                table[base + slot * 2 + 1] =
+                    static_cast<std::uint32_t>(addr >> 32);
+                return addr != 0;
+            };
+            for (std::size_t j = 0; j < n_in; ++j)
+                addr_ok = put_addr(j, inst.inputs[j]) && addr_ok;
+            addr_ok = put_addr(n_in, inst.out) && addr_ok;
+            for (std::size_t k = 0; k < n_ex; ++k)
+                addr_ok = put_addr(n_in + 1 + k, inst.extra_outs[k]) && addr_ok;
+            if (!addr_ok)
+                NN_FAIL("run_fused_gpu_batch: vkGetBufferDeviceAddress 返回 0"
+                        "（buffer 未带 SHADER_DEVICE_ADDRESS？）");
+            table[base + (stride - 1) * 2 + 0] = inst.count;
+            table[base + (stride - 1) * 2 + 1] = inst.cols;
+            max_count = std::max(max_count, inst.count);
+            max_cols = std::max(max_cols, inst.cols);
+        }
+
+        // 实例表缓冲：小 device-local（TRANSFER_DST 走 vkCmdUpdateBuffer）。
+        // 数据内联进命令缓冲 → 录制生命周期安全；缓冲本体析构走 pending_destroys_
+        // 延迟队列（铁律 6，与其余录制期资源同款）。
+        auto inst_r = GpuBuffer::create_device_local(
+            device_.device(), alloc_pool(), table.size() * sizeof(std::uint32_t),
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        NN_TRY_CHECK(inst_r);
+        std::shared_ptr<GpuBuffer> inst_buf =
+            std::make_shared<GpuBuffer>(std::move(*inst_r));
+
+        // 描述符：key#b pipeline 只绑 binding 0（实例表）——复用 per-pipeline
+        // 描述符机制
+        auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
+        NN_TRY_CHECK(ds_r);
+        VkDescriptorSet desc_set = *ds_r;
+        VkDescriptorBufferInfo inst_bi{inst_buf->impl(), 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet w{};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet = desc_set;
+        w.dstBinding = 0;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w.pBufferInfo = &inst_bi;
+        vkUpdateDescriptorSets(device_.device(), 1, &w, 0, nullptr);
+
+        // command buffer
+        auto cmd_r = acquire_cmd();
+        if (!cmd_r)
+        {
+            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            NN_TRY_CHECK(cmd_r);
+        }
+        auto [cmd, owns_cmd] = *cmd_r;
+
+        // 录制：实例表写入 → 输入屏障（含实例表，去重）→ bind → PC → dispatch
+        vkCmdUpdateBuffer(cmd, inst_buf->impl(), 0,
+                          static_cast<std::uint32_t>(
+                              table.size() * sizeof(std::uint32_t)),
+                          table.data());
+        {
+            // 屏障覆盖组内全部实例的输入 buffer + 实例表（vkCmdUpdateBuffer 是
+            // TRANSFER 写，record_input_barriers 的 src 阶段含 TRANSFER）；
+            // 同一 buffer 去重（组内互不依赖已由引擎保证，仅防重复屏障）。
+            std::vector<VkBuffer> in_bufs;
+            in_bufs.reserve(instances.size() * (n_in + 1) + 1);
+            for (const FusedBatchInst& inst : instances)
+                for (const GpuBuffer* b : inst.inputs)
+                    in_bufs.push_back(b->impl());
+            in_bufs.push_back(inst_buf->impl());
+            std::sort(in_bufs.begin(), in_bufs.end());
+            in_bufs.erase(std::unique(in_bufs.begin(), in_bufs.end()),
+                          in_bufs.end());
+            record_input_barriers(cmd, in_bufs);
+        }
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+
+        // Push constants 与 run_fused_gpu 的 V0 逐元素分支同源：
+        //   count(=max_count), cols, [vp0..], [c0..], [rp0..]
+        // 批量 shader 不读 count/cols 两槽（每实例取尾槽），两值仅保持 V0 布局。
+        const std::uint32_t pc_uints = pc_base_fixed + n_vp;
+        std::vector<std::uint8_t> pc(
+            (pc_uints) * sizeof(std::uint32_t) + sizeof(Scalar) * consts.size()
+            + sizeof(Scalar) * rparams.size());
+        std::memcpy(pc.data(), &max_count, sizeof(std::uint32_t));
+        std::memcpy(pc.data() + sizeof(std::uint32_t), &max_cols, sizeof(std::uint32_t));
+        for (std::uint32_t i = 0; i < n_vp; ++i)
+            std::memcpy(pc.data() + (pc_base_fixed + i) * sizeof(std::uint32_t),
+                        &view_params[i], sizeof(std::uint32_t));
+        if (!consts.empty())
+            std::memcpy(pc.data() + (pc_uints) * sizeof(std::uint32_t), consts.data(),
+                        sizeof(Scalar) * consts.size());
+        if (!rparams.empty())
+            std::memcpy(pc.data() + (pc_uints) * sizeof(std::uint32_t) +
+                            sizeof(Scalar) * consts.size(),
+                        rparams.data(), sizeof(Scalar) * rparams.size());
+        vkCmdPushConstants(cmd, pipeline.pipeline_layout(),
+            VK_SHADER_STAGE_COMPUTE_BIT, 0,
+            static_cast<std::uint32_t>(pc.size()), pc.data());
+
+        // dispatch = (ceil(max_count/256), n_instances, 1)；批量恒标量
+        // （vec_width=1，与生成器同源）
+        const std::uint32_t wg_x = (max_count + 255u) / 256u;
+        ts_dispatch(cmd, "fused_b", wg_x,
+                    static_cast<std::uint32_t>(instances.size()), 1);
+
+        // 输出屏障（主输出 + 全部 extras，去重）：组内输出互不重叠（引擎保证）
+        {
+            std::vector<VkBuffer> out_bufs;
+            out_bufs.reserve(instances.size() * (1 + n_ex));
+            for (const FusedBatchInst& inst : instances)
+            {
+                out_bufs.push_back(inst.out->impl());
+                for (const GpuBuffer* b : inst.extra_outs)
+                    out_bufs.push_back(b->impl());
+            }
+            std::sort(out_bufs.begin(), out_bufs.end());
+            out_bufs.erase(std::unique(out_bufs.begin(), out_bufs.end()),
+                           out_bufs.end());
+            for (VkBuffer b : out_bufs)
+                record_output_barrier(cmd, b);
+        }
+
+        if (owns_cmd)
+        {
+            auto r = submit_and_wait(cmd, desc_set);
+            NN_TRY_CHECK(r);
+        }
+        ++fused_batch_dispatches_;
+        if (profile_ops_enabled())
+        {
+            const long long dt = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - prof_t0).count();
+            std::fprintf(stderr,
+                "[gpu-profile] fused_batch inst=%zu max_count=%u total=%lldus "
+                "key=%.16s\n",
+                instances.size(), max_count, dt, shader_name.c_str());
+        }
+        return {};
+    }
+
     // 查询融合 shader 是否已注册（GpuEngine AOT 匹配前置判断）
     [[nodiscard]] bool has_fused_shader(const std::string& shader_name) const noexcept
     {
         return fused_pipelines_.find(shader_name) != fused_pipelines_.end();
     }
+
+    // P3 批量派发计数（测试/诊断：确认批量路径真的被走到，而非静默降级）
+    [[nodiscard]] std::uint64_t fused_batch_dispatches() const noexcept
+    { return fused_batch_dispatches_; }
 
     // ══════════════════════════════════════════════════════════════════
     // reduce_gpu — 行/列归约原语（sum/max）
@@ -3799,7 +4248,7 @@ public:
             const uint32_t push1[5] = {rows, cols, 1u, reduce_op, chunk_rows};
             vkCmdPushConstants(cmd, in_pipe.pipeline_layout(),
                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push1), push1);
-            vkCmdDispatch(cmd, (cols + 31u) / 32u, nchunk, 1);
+            ts_dispatch(cmd, "reduce", (cols + 31u) / 32u, nchunk, 1);
 
             // partials：写 → 读（同 cmd 内跨 dispatch 依赖）
             record_input_barriers(cmd, {partial.buffer().impl()});
@@ -3813,7 +4262,7 @@ public:
             const uint32_t push2[5] = {nchunk, cols, 1u, reduce_op, 0u};
             vkCmdPushConstants(cmd, reduce_pipeline_.pipeline_layout(),
                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push2), push2);
-            vkCmdDispatch(cmd, (cols + 31u) / 32u, 1, 1);
+            ts_dispatch(cmd, "reduce", (cols + 31u) / 32u, 1, 1);
             record_output_barrier(cmd, output.buffer().impl());
 
             if (owns_cmd)
@@ -3871,7 +4320,7 @@ public:
         // 列：每 WG 32 列 tile（lane=列、warp=行块，合并访问；与
         //     reduce.comp 的 WG 结构契约同源）→ (cols+31)/32 个 WG
         const uint32_t workgroups = (mode == 0) ? rows : (cols + 31u) / 32u;
-        vkCmdDispatch(cmd, workgroups, 1, 1);
+        ts_dispatch(cmd, "reduce", workgroups, 1, 1);
         record_output_barrier(cmd, output.buffer().impl());
 
         // 6. 独立模式提交
@@ -3969,7 +4418,7 @@ public:
             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
 
         const uint32_t wg_count = (total + 255) / 256;
-        vkCmdDispatch(cmd, wg_count, 1, 1);
+        ts_dispatch(cmd, "rearrange_3d", wg_count, 1, 1);
         record_output_barrier(cmd, output.buffer().impl());
 
         // 6. 独立模式提交
@@ -4094,6 +4543,9 @@ public:
             bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
             bi.size = sizeof(float);
             bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            // P3：同其余缓冲创建点补 SHADER_DEVICE_ADDRESS（池分配侧配对）
+            if (memory_pool().device_address_alloc())
+                bi.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
             bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
             r = detail::vk_check(
                 vkCreateBuffer(device_.device(), &bi, nullptr, &s.host), __FILE__, __LINE__);
@@ -4330,7 +4782,7 @@ public:
         // 每线程处理 2 元素（一对一 half 或单词对）
         const auto pairs = (count + 1u) / 2u;
         const std::uint32_t wg = static_cast<std::uint32_t>((pairs + 255u) / 256u);
-        vkCmdDispatch(cmd, wg < 1u ? 1u : wg, 1u, 1u);
+        ts_dispatch(cmd, "cast", wg < 1u ? 1u : wg, 1u, 1u);
         record_output_barrier(cmd, dst.impl());
 
         if (owns_cmd)
@@ -4592,7 +5044,7 @@ public:
         const uint32_t ty = (R + 63u) / 64u;
         const uint32_t bx = (tx + 7u) / 8u;
         const uint32_t by = (ty + 7u) / 8u;
-        vkCmdDispatch(cmd, 8, 8, bx * by);
+        ts_dispatch(cmd, "transpose", 8, 8, bx * by);
         record_output_barrier(cmd, output.buffer().impl());
 
         if (owns_cmd)
@@ -4692,7 +5144,7 @@ public:
 
         const std::size_t total = rows * cols;
         const uint32_t wg_count = static_cast<uint32_t>((total + 255) / 256);
-        vkCmdDispatch(cmd, wg_count, 1, 1);
+        ts_dispatch(cmd, "im2col", wg_count, 1, 1);
         record_output_barrier(cmd, output.buffer().impl());
 
         if (owns_cmd)
@@ -4786,7 +5238,7 @@ public:
 
         const std::size_t total = rows * cols;
         const uint32_t wg_count = static_cast<uint32_t>((total + 255) / 256);
-        vkCmdDispatch(cmd, wg_count, 1, 1);
+        ts_dispatch(cmd, "col2im", wg_count, 1, 1);
         record_output_barrier(cmd, output.buffer().impl());
 
         if (owns_cmd)
@@ -4872,7 +5324,7 @@ public:
 
         const std::size_t total = G * N;
         const uint32_t wg_count = static_cast<uint32_t>((total + 255) / 256);
-        vkCmdDispatch(cmd, wg_count, 1, 1);
+        ts_dispatch(cmd, "group_reduce", wg_count, 1, 1);
         record_output_barrier(cmd, output.buffer().impl());
 
         if (owns_cmd)
@@ -4971,7 +5423,7 @@ public:
         const uint32_t total = num * D;
         // vec4 kernel（与 elementwise/broadcast/DSL 同口径）：每线程 4 元素
         const uint32_t wg_count = (total + 256u * 4u - 1u) / (256u * 4u);
-        vkCmdDispatch(cmd, wg_count, 1, 1);
+        ts_dispatch(cmd, "gather", wg_count, 1, 1);
         record_output_barrier(cmd, output.buffer().impl());
 
         if (owns_cmd)
@@ -5083,7 +5535,7 @@ public:
 
         const uint32_t total = num * D;
         const uint32_t wg_count = (total + 255) / 256;
-        vkCmdDispatch(cmd, wg_count, 1, 1);
+        ts_dispatch(cmd, "scatter_add", wg_count, 1, 1);
 
         // 输出屏障（dst 被修改，需要 memory barrier）
         {

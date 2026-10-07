@@ -42,6 +42,39 @@ public:
     [[nodiscard]] Result<void> end_batch() override { return {}; }
     [[nodiscard]] Result<void> flush_batch() override { return {}; }
 
+    // ── 表达式录制（IR-C，2026-10-06 恢复）──────────────────────────────
+    // 普通 CPU 运行：no-op（各表达式直接求值，行为不变——图融合是 GPU 优化）。
+    // 构建期 scan（NN_EXPR_SCAN）：begin_expr 开启录制图（dsl 的 scan 分支把
+    // 表达式加入图而非直接登记），end_expr 融合分析并登记**全部融合 kernel 的
+    // spec**（含未拼接的单节点）——保证 GPU 运行期 begin_expr/end_expr 融合出的
+    // 复合 spec 命中 AOT shader（闭合世界两端一致）。
+    [[nodiscard]] Result<void> begin_expr() override
+    {
+#ifdef NN_EXPR_SCAN
+        auto& owner = fused::recording_graph_owner();
+        if (owner)
+            NN_FAIL("begin_expr: 嵌套录制（已有未结束的 begin_expr）");
+        owner = std::make_unique<ExprGraph>();
+        owner->owner = this;
+#endif
+        return {};
+    }
+
+    [[nodiscard]] Result<void> end_expr() override
+    {
+#ifdef NN_EXPR_SCAN
+        auto& owner = fused::recording_graph_owner();
+        if (!owner)
+            return {};
+        ExprGraph g = std::move(*owner);
+        owner.reset();
+        auto kernels = fuse_expr_graph(g);
+        for (auto& k : kernels)
+            fused::global_registry().add(k.spec);
+#endif
+        return {};
+    }
+
     // ── 张量工厂（统一接口，§6.4, §6.5）────────────────────────────────
     // P 由调用方显式指定（§8.5）：无隐式推导，无 Auto
     [[nodiscard]] Tensor create_tensor_impl(std::size_t rows, std::size_t cols, Precision P) override
@@ -68,6 +101,7 @@ public:
 
     [[nodiscard]] Result<Matrix> to_matrix(const Tensor& t, Precision P = Precision::F32) override
     {
+        NN_PROF_OP("to_matrix");
         if (!t.is_cpu())
             NN_FAIL("to_matrix: tensor is not CPU");
         if (P == Precision::F16)
@@ -151,6 +185,7 @@ public:
     // 语义必需——若替换 dst 对象，其它持有同一张量句柄的缓存会静默失联）。
     [[nodiscard]] Result<void> copy_into(Tensor& dst, const Tensor& src) override
     {
+        NN_PROF_OP("copy_into");
         if (!dst.is_cpu() || !src.is_cpu())
             NN_FAIL("copy_into: CPU engine only supports CPU tensors");
         if (dst.rows() != src.rows() || dst.cols() != src.cols())
@@ -174,6 +209,7 @@ public:
 
     [[nodiscard]] Result<void> cast_into(const Tensor& src, Tensor& dst) override
     {
+        NN_PROF_OP("cast_into");
         if (!dst.is_cpu() || !src.is_cpu())
             NN_FAIL("cast_into: CPU engine only supports CPU tensors");
         if (dst.rows() != src.rows() || dst.cols() != src.cols())
@@ -1310,6 +1346,45 @@ public:
         return eval_expr_impl(spec, inputs, rows, cols, /*vector_out=*/false, dst);
     }
 
+    // ── P2 多输出（IR-C 写穿物化）────────────────────────────────────────
+    // 逐槽求值：主输出直接跑；extras 各给 spec 副本追加 `-(-x)` 精确复制链
+    // 把目标寄存器提升为主输出（解释器单输出写回；Neg∘Neg 逐位恒等——含 -0
+    // 与 NaN；末指令是输出 ⇒ simplify 的输出指令豁免不折叠该链）。CPU 无
+    // 运行时图录制，本路径仅测试/工具使用，重复求值可接受。
+    [[nodiscard]] Result<void> eval_expr_multi_into_impl(
+        const ExprSpec& raw_spec, std::span<const Tensor> inputs,
+        std::size_t rows, std::size_t cols, std::span<Tensor> outs) override
+    {
+        if (raw_spec.instrs.empty())
+            NN_FAIL("eval_expr_multi_into: 空指令表");
+        auto r0 = eval_expr_impl(raw_spec, inputs, rows, cols,
+                                /*vector_out=*/false, outs[0]);
+        NN_TRY_CHECK(r0);
+        for (std::size_t k = 0; k < raw_spec.extras.size(); ++k)
+        {
+            if (raw_spec.extras[k] >= raw_spec.num_regs)
+                NN_FAIL("eval_expr_multi_into: extras 寄存器越界");
+            if (raw_spec.num_regs + 2 > EXPR_MAX_REGS)
+                NN_FAIL("eval_expr_multi_into: extras 复制链超出寄存器上限");
+            ExprSpec s = raw_spec;
+            ExprInstr n1;
+            n1.op  = static_cast<std::uint8_t>(ExprOp::Neg);
+            n1.dst = static_cast<std::uint8_t>(s.num_regs);
+            n1.a   = expr::reg(raw_spec.extras[k]);
+            s.instrs.push_back(n1);
+            ExprInstr n2;
+            n2.op  = static_cast<std::uint8_t>(ExprOp::Neg);
+            n2.dst = static_cast<std::uint8_t>(s.num_regs + 1);
+            n2.a   = expr::reg(static_cast<std::uint8_t>(s.num_regs));
+            s.instrs.push_back(n2);
+            s.num_regs += 2;
+            auto r = eval_expr_impl(s, inputs, rows, cols,
+                                   /*vector_out=*/false, outs[k + 1]);
+            NN_TRY_CHECK(r);
+        }
+        return {};
+    }
+
     // ── fold 段求值（标量域 + 双域；CPU 正确性基准）─────────────
     // 调用约定：经 eval_expr 进入——输出网格 (rows, out_cols)（out_cols =
     //   vec_state_len 或 1，cols 参数必须等于它）；普通输入 (rows, K)、
@@ -1380,12 +1455,22 @@ public:
             //   必须一致，否则合法视图在一侧被拒、fold forward 直接报错）
             if (vk != ExprViewKind::Linear && vk != ExprViewKind::RowMod &&
                 vk != ExprViewKind::RowBroadcast &&
+                vk != ExprViewKind::Transpose &&
                 !((vk == ExprViewKind::BatchMod || vk == ExprViewKind::BatchCol) &&
                   f.matmul))
                 NN_FAIL("eval_fold: view outside supported scope");
-            if (!is_vecb && !is_tag_table && !is_rowvec &&
+            const bool is_trans = (vk == ExprViewKind::Transpose);
+            if (!is_vecb && !is_tag_table && !is_rowvec && !is_trans &&
                 (t.rows() != rows || t.cols() != K))
                 NN_FAIL("eval_fold: input shape mismatch (expect (rows, fold.k))");
+            if (is_trans)
+            {
+                // 转置读：(rows, K) 网格读 (K, rows) 存储——与 matmul 输入同
+                //   精神的"定向放宽"（形状元数据不设假设，只做寻址越界守卫）
+                const std::size_t stride = spec.views[k].param;
+                if (stride == 0 || (K - 1) * stride + rows > t.size())
+                    NN_FAIL("eval_fold: Transpose input addressing out of range");
+            }
             if (is_tag_table && t.rows() != 1)
                 NN_FAIL("eval_fold: tag table (BatchMod/BatchCol) must be (1, n)");
             // 标签表列数守卫（必须连 cols 一起查，否则形状违约静默越界读）：
@@ -1442,6 +1527,8 @@ public:
                 return spans[k][(r / m_per) * v.param + gk];  // b[batch*param + col]
             if (vk == ExprViewKind::RowBroadcast)
                 return spans[k][r];                           // (rows,1)：b[row]
+            if (vk == ExprViewKind::Transpose)
+                return spans[k][gk * static_cast<std::size_t>(v.param) + r];  // b[col*stride+row]
             return spans[k][r * K + gk];
         };
 
@@ -1715,6 +1802,13 @@ public:
                 if (t.rows() != v.param || t.cols() != cols || v.param == 0 || rows % v.param != 0)
                     NN_FAIL("eval_expr: RowMod shape/param invalid");
                 break;
+            case static_cast<uint8_t>(ExprViewKind::Transpose):
+                // 转置读：(rows, cols) 网格读 (cols, rows) 存储（行距 = param）——
+                // 形状元数据不设假设，只做寻址越界守卫（与 fold 侧同精神）
+                if (v.param == 0 ||
+                    (cols - 1) * static_cast<std::size_t>(v.param) + rows > t.size())
+                    NN_FAIL("eval_expr: Transpose input addressing out of range");
+                break;
             case static_cast<uint8_t>(ExprViewKind::RowAccess):
                 // 读取行 [offset, offset+mod)，须在输入行数内；offset 为运行时形状
                 if (t.cols() != cols || v.param == 0 || v.param2 + v.param > t.rows())
@@ -1914,6 +2008,9 @@ public:
             case static_cast<uint8_t>(ExprViewKind::RowAccess):
                 // 行偏移+取模：data[(offset + r % mod)*cols + c]
                 return s[(v.param2 + (r % v.param)) * cols + c];
+            case static_cast<uint8_t>(ExprViewKind::Transpose):
+                // 转置读：data[col*stride + row]（stride = param，运行期形状数据）
+                return s[c * static_cast<std::size_t>(v.param) + r];
             case static_cast<uint8_t>(ExprViewKind::RowReduceSum):
             case static_cast<uint8_t>(ExprViewKind::RowReduceMax):
                 return view_reduce[k][r];

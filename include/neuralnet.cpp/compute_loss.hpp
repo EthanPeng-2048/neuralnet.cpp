@@ -28,9 +28,21 @@
 #include "compute_layer_base.hpp"  // clone_tensor
 #include "compute_tensor.hpp"
 #include "expr_dsl.hpp"
+#include "expr_fold.hpp"           // make_fold_logsumexp（online-softmax 单趟 fold）
 
 namespace nn
 {
+
+#if defined(NN_EXPR_SCAN)
+// ── AOT 自登记锚点（表达式自登记约定：新增表达式不改 scan_exprs）────────
+// CE sparse 的 online-softmax fold 是**值构造**（make_fold_logsumexp，类型
+// 不编码结构，FusedAnchor 按类型登记覆盖不到）→ 由消费方经 FoldAnchor 在
+// 静态初始化期登记本调用点实际构造的结构变体。k/stride 是形状参数（不进
+// key）→ 代表值一份覆盖所有形状；视图 kind 进 key → trans（转置直读）即
+// CE 的构造形态。
+inline const nn::dsl::FoldAnchor g_anchor_ce_lse_fold{
+    nn::expr::make_fold_logsumexp(64, nn::expr::trans(64))};
+#endif
 
 // ══════════════════════════════════════════════════════════════════════════
 // Loss — 引擎化损失函数基类
@@ -258,10 +270,12 @@ public:
     // 解决大词表（vocab_size≈25k）+ 大 batch 时 one-hot 矩阵
     // (vocab_size, total_tokens) 爆显存的问题。
     //
-    // 融合路径（唯一路径）：
+    // 融合路径（唯一路径，online-softmax 单趟）：
     //   1. 上传 labels / loss_mask 为 (1, total) 浮点张量（小传输）
-    //   2. 融合表达式链：列内 max + denom + 稠密梯度 + 标签位置
-    //      log_softmax（loss_vec）——不物化 (classes, total) 全 softmax
+    //   2. fold logsumexp（通用 FoldSpec + Transpose 视图）单趟在线归约出
+    //      s = m + log(l)，再两条 IR 链：loss_sum（标签位 gather → (1,1)）与
+    //      稠密梯度 exp(logits − s)——不物化 (classes, total) 全 softmax，
+    //      也无 col_max/denom 中间向量
     //   3. loss = -(1/num_valid)·Σ loss_vec（下载标量）
     // 前置条件：vocab_size ≤ 2^24（labels 按 (1,total) 浮点打包，超出则标签
     // 不可精确表示）。路径内任何失败直接透传错误、不降级（"硬报错、不降级"）。
@@ -316,12 +330,15 @@ public:
             : Scalar{0};
     }
 
-    // ── 融合路径实现（IR 组合：col_max 原语 + denom/loss_vec/grad 表达式）──
-    // 不物化 (classes, total) 全 softmax：
-    //   col_max  = 列内 max（原语）
-    //   denom    = col_sum(exp(logits - cb(col_max)))          （IR 表达式）
-    //   loss_vec = (rg(logits) - cb(col_max) - log(denom)) * cb(mask)  （IR，(1,total)）
-    //   grad     = (exp/logits 链 - select(Row==cb(labels),1,0)) * cb(mask) * inv（IR）
+    // ── 融合路径实现（online-softmax 单趟 fold + 两条 IR 链）────────────
+    // 不物化 (classes, total) 全 softmax，也不物化 col_max/denom 中间向量：
+    //   lse      = fold logsumexp(logits)：通用 FoldSpec 单趟 online 归约
+    //              出 s = m + log(l)（m/l 双状态与注意力 fold 同款 rescale），
+    //              输入经通用 Transpose 视图转置直读 (classes,total) 存储
+    //   loss_sum = row_reduce_sum((rg(logits) - cb(lse)) * cb(mask))（单 kernel → (1,1)）
+    //   grad     = (exp(logits - cb(lse)) - select(Row==cb(labels),1,0)) * cb(mask) * inv
+    // exp(x−s) ≡ exp(x−m)/l（同一数学值；online 归约改变浮点结合序，容差口径）
+    // 派发序：lse → loss_sum → grad（grad_reuse 原地覆写 logits，前两者须先读完）
     [[nodiscard]] Result<Tensor> fused_forward_sparse_(
         ComputeEngine& engine, const Tensor& logits,
         std::span<const std::size_t> labels,
@@ -361,29 +378,48 @@ public:
         const Scalar inv_num_valid = (num_valid > 0)
             ? Scalar{1} / static_cast<Scalar>(num_valid) : Scalar{0};
 
-        // 4. col_max → denom（IR）→ loss_vec / grad（IR）
-        //    col_max 用 dsl::compute_reduce（归约向量，输出 (1,total) 同形）
-        auto col_max = dsl::compute_reduce(engine,
-            dsl::col_reduce_max(dsl::leaf(logits)),
-            classes, total, p_.stable);
-        NN_TRY_CHECK(col_max);
-        auto denom = dsl::compute_reduce(engine,
-            dsl::col_reduce_sum(
-                dsl::exp(dsl::leaf(logits) - dsl::col_broadcast(*col_max))),
-            classes, total, p_.stable);
-        NN_TRY_CHECK(denom);
-        // loss_vec[c] = (logits[label[c]][c] - col_max[c] - log(denom[c])) * mask[c]
-        auto loss_vec = dsl::compute(engine,
-            (dsl::row_gather(logits, *labels_t) - dsl::col_broadcast(*col_max)
-             - dsl::log(dsl::leaf(*denom))) * dsl::col_broadcast(*mask_t),
-            1, total, p_.stable);
-        NN_TRY_CHECK(loss_vec);
-        // grad[r][c] = (exp(logits-col_max)/denom - [r==label[c]]) * mask[c] / num_valid
-        // 1/num_valid 由 RParam 承载（运行时值、不进 expr_spec_key）→ 与整个
-        // 逐元素链融合为单 kernel
+        // 4. lse = logsumexp（online 双状态单趟 fold）：m/l 一并归约、单值
+        //    s = m + log(l) 输出——省掉 col_max 与 denom 两趟 logits 扫描。
+        //    输入经通用 Transpose 视图（trans(total)）转置直读：(total, classes)
+        //    网格 ← (classes, total) 存储，不物化转置副本（fold 收缩轴 = 词表行）。
+        const nn::ExprSpec lse_spec = nn::expr::make_fold_logsumexp(
+            classes, nn::expr::trans(static_cast<std::uint32_t>(total)));
+        NN_TRY(fv, nn::validate_expr_spec(lse_spec, 1));
+        Tensor lse_rs;
+        {
+            NN_PROF_SCOPE("ce.fold");
+            auto lse = engine.eval_expr(lse_spec, std::span<const Tensor>{&logits, 1},
+                                        total, 1, p_.stable);
+            NN_TRY_CHECK(lse);
+            // (total,1) → (1,total)：reshape 零拷贝（GPU 元数据重贴；CPU 小拷贝），
+            // 供下方 loss/grad 两条链按列广播（ColBroadcast 读 b[c]）取用
+            auto lse_rs_r = engine.reshape(*lse, 1, total);
+            NN_TRY_CHECK(lse_rs_r);
+            lse_rs = std::move(*lse_rs_r);
+        }
+        // 5. loss_sum = Σ_c (logits[label[c]][c] − lse[c])·mask[c]（无效列已乘 0）
+        //    ——逐元素链（RowGather 标签位 − 列广播 lse）与行归约融合为**单**
+        //    kernel → (1,1)。**必须在下方 grad 原地写 logits 之前完成**
+        //    （grad_reuse 路径会覆写 logits 缓冲）。结果**不下载**：
+        //    热路径由调用方经 engine.submit_scalar_readback 异步取回；
+        //    同步版 forward_sparse 在此之后 to_matrix。
+        Tensor total_t;
+        {
+            NN_PROF_SCOPE("ce.lossum");
+            auto tr = dsl::compute_reduce(engine,
+                dsl::row_reduce_sum(
+                    (dsl::row_gather(logits, *labels_t) - dsl::col_broadcast(lse_rs))
+                        * dsl::col_broadcast(*mask_t)),
+                1, total, p_.stable);
+            NN_TRY_CHECK(tr);
+            total_t = std::move(*tr);
+        }
+        // 6. grad[r][c] = (exp(logits−lse) − [r==label[c]]) · mask[c] / num_valid
+        //    exp(x−s) ≡ exp(x−m)/l（数学等价；在线归约改变结合序 → 容差口径）。
+        //    1/num_valid 由 RParam 承载（运行时值、不进 expr_spec_key）→ 与整个
+        //    逐元素链融合为单 kernel
         auto grad_expr =
-            (dsl::exp(dsl::leaf(logits) - dsl::col_broadcast(*col_max))
-                / dsl::col_broadcast(*denom)
+            (dsl::exp(dsl::leaf(logits) - dsl::col_broadcast(lse_rs))
              - dsl::select(dsl::row() == dsl::col_broadcast(*labels_t),
                            Scalar{1}, Scalar{0}))
             * dsl::col_broadcast(*mask_t)
@@ -393,31 +429,29 @@ public:
         // 缓冲（典型用法：传 &logits）——省一份 (vocab×total) 显存，训练峰值
         // 第二大单项（bench 配置实测 513MB）。安全性：本表达式对输入只有
         // 逐元素读取 + 列/标量广播（row() 是隐式行下标，不是跨行 gather），
-        // 每个元素读后写同址；唯一的跨行 row_gather(logits) 在上方 loss_vec
-        // 中，且 loss_vec 已算入独立缓冲。
-        if (grad_reuse != nullptr && grad_reuse->valid()
-            && grad_reuse->rows() == classes && grad_reuse->cols() == total
-            && grad_reuse->precision() == logits.precision())
+        // 每个元素读后写同址；唯一的跨行 row_gather(logits) 在上方 loss_sum
+        // 中，且 loss_sum 已于本派发之前算完（步骤 5）。
         {
-            auto w = dsl::compute_into(engine, grad_expr, *grad_reuse);
-            NN_TRY_CHECK(w);
-            grad_input_ = *grad_reuse;
-        }
-        else
-        {
-            auto grad = dsl::compute(engine, grad_expr, classes, total, p_.stable);
-            NN_TRY_CHECK(grad);
-            grad_input_ = std::move(*grad);
+            NN_PROF_SCOPE("ce.grad");
+            if (grad_reuse != nullptr && grad_reuse->valid()
+                && grad_reuse->rows() == classes && grad_reuse->cols() == total
+                && grad_reuse->precision() == logits.precision())
+            {
+                auto w = dsl::compute_into(engine, grad_expr, *grad_reuse);
+                NN_TRY_CHECK(w);
+                grad_input_ = *grad_reuse;
+            }
+            else
+            {
+                auto grad = dsl::compute(engine, grad_expr, classes, total, p_.stable);
+                NN_TRY_CHECK(grad);
+                grad_input_ = std::move(*grad);
+            }
         }
 
-        // 5. loss_sum = Σ loss_vec（无效列已乘 0）——**不下载**：
-        //    热路径由调用方经 engine.submit_scalar_readback 异步取回；
-        //    同步版 forward_sparse 在此之后 to_matrix。
-        // 归约步用 dsl::compute_reduce（(1,total) → (1,1)）
-        auto total_t = dsl::compute_reduce(engine,
-            dsl::row_reduce_sum(dsl::leaf(*loss_vec)),
-            loss_vec->rows(), loss_vec->cols(), p_.stable);
-        NN_TRY_CHECK(total_t);
+        // 7. loss_sum 已于步骤 5 算出（(1,1)，未下载）——热路径经
+        //    engine.submit_scalar_readback 异步取回；同步版 forward_sparse
+        //    在此之后 to_matrix。
         num_valid_out = num_valid;
         return total_t;
     }

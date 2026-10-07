@@ -82,6 +82,12 @@ private:
     // Tensor（一期不加析构探测，13 §10.3 第 3 条）。
     observer_ptr<ComputeEngine> engine_ = nullptr;
 
+    // ── IR-C 录制占位标记（图节点输出识别，expr_graph.hpp）──────────────
+    // begin_expr/end_expr 录制期内，eval 出口给占位 Tensor 打上节点标号
+    // （= 节点下标 + 1，0 = 非节点输出）；add_node 据此识别输入依赖边。
+    // 纯元数据（不涉及存储访问，铁律 #11 不适用）；非录制张量恒为 0。
+    std::uint64_t virtual_tag_ = 0;
+
     // ── M1 访问收口（docs/development/17 §4.1）：存储与创建只对引擎域内开放 ──
     // 公共面只剩形状/精度/设备查询、bound()/engine()、valid()、shape_str()。
     // 绕过引擎摸存储 = 编译错误（库内豁免：引擎 friend + detail::TensorAccess）。
@@ -228,6 +234,10 @@ public:
     [[nodiscard]] std::size_t size() const noexcept { return rows_ * cols_; }
     [[nodiscard]] bool is_cpu() const noexcept { return device_ == Device::CPU; }
     [[nodiscard]] bool is_gpu() const noexcept { return device_ == Device::GPU; }
+
+    // ── IR-C 录制占位标记（见字段注释）──────────────────────────────────
+    [[nodiscard]] std::uint64_t virtual_tag() const noexcept { return virtual_tag_; }
+    void set_virtual_tag(std::uint64_t tag) noexcept { virtual_tag_ = tag; }
 
     // ── 出生绑定（P1，§3.1）──────────────────────────────────────────────
     // bound()：是否已 stamp 到某个引擎（未绑定输入在 P1 检查中按库外豁免放行，

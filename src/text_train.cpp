@@ -27,6 +27,7 @@
 #include <neuralnet.cpp/cli/cli_lr_scheduler.hpp>
 #include <neuralnet.cpp/cli/cli_gpu_option.hpp>
 #include <neuralnet.cpp/cli/cli_help.hpp>
+#include <neuralnet.cpp/core_profile.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -1075,6 +1076,13 @@ int main(int argc, char *argv[])
                 (cfg.max_steps > 0) && (steps_executed + 1 >= cfg.max_steps);
             ++steps_executed;
 
+            // ── step 剖析（NN_PROFILE=1 时生效）────────────────────────
+            // "step" = 每步伞形 scope；prof 划分连续阶段（各阶段共享局部
+            // 变量，不能用花括号块隔开，故用显式 start/stop）。
+            NN_PROF_SCOPE("step");
+            nn::prof::Phase prof;
+            prof.start("data");
+
             // ── 采样 batch：每样本 = 一个滑动窗口 ─────────────
             // 按 shuffle 后的顺序切片取 this_bs 个窗口（末批可能不满）。
             // 每 epoch 每样本恰好访问一次。
@@ -1156,6 +1164,7 @@ int main(int argc, char *argv[])
             // 整个 forward + backward + optimizer step 录制到一个 command buffer，
             // end_batch 时一次 vkQueueSubmit + vkWaitForFences，消除 per-primitive 同步开销。
             // CPU 引擎 begin_batch/end_batch 为 no-op，所以两套引擎都安全。
+            prof.start("forward");
             auto begin_r = engine->begin_batch();
             NN_EXIT(begin_r, 1, "begin_batch failed: ");
 
@@ -1196,6 +1205,7 @@ int main(int argc, char *argv[])
             // ── 中点刷新：提交 forward+loss，拆分为两次 GPU 提交 ──
             // 大词表 + 长序列时 forward+backward 单次提交可能触发 TDR 超时。
             // 在 forward 与 backward 之间 flush，将一次大提交拆为两次小提交。
+            prof.start("submit-fwd");
             auto flush_r = engine->flush_batch();
             mem_mark("step/loss-fwd");
             NN_EXIT(flush_r, 1, "\nflush_batch (forward) failed: ");
@@ -1228,6 +1238,7 @@ int main(int argc, char *argv[])
             }
 
             // ── 反向传播（梯度已含 mask，无需额外处理） ────────
+            prof.start("backward");
             auto grad_result = ce_loss.backward();
             NN_EXIT(grad_result, 1, "\nLoss backward failed: ");
 
@@ -1247,6 +1258,7 @@ int main(int argc, char *argv[])
             NN_EXIT(bwd_result, 1, "Error: ");
 
             // ── 提交 backward batch（单独一次提交，已与 forward 拆分） ──
+            prof.start("sync");
             auto bwd_end = engine->end_batch();
             mem_mark("step/end-batch");
             NN_EXIT(bwd_end, 1, "\nend_batch (backward) failed: ");
@@ -1280,6 +1292,7 @@ int main(int argc, char *argv[])
 
             if (do_update)
             {
+                prof.start("optimizer");
                 // ── 梯度裁剪（在 step() 之前，backward() 之后） ──
                 // clip_grad_norm 逐原语在 batch **外**会各自
                 // submit_and_wait（约 200 次 host↔GPU 往返/次裁剪）；包进
@@ -1323,6 +1336,7 @@ int main(int argc, char *argv[])
             if (cfg.save_interval > 0 &&
                 ((step + 1) % cfg.save_interval == 0 || step + 1 == steps_per_epoch))
             {
+                prof.start("ckpt");
                 auto save_r = nn::save_model(cfg.save_path, model, spec, tokenizer_bytes);
                 if (!save_r)
                     std::cerr << "\n  [ckpt] 保存失败: " << save_r.error().message << "\n";
@@ -1479,6 +1493,12 @@ int main(int argc, char *argv[])
 
     auto t_end = std::chrono::steady_clock::now();
     Scalar total_sec = std::chrono::duration<Scalar>(t_end - t_start).count();
+
+    // ── step 剖析报告（NN_PROFILE=1 / NN_PROFILE_TRACE 时生效）────────────
+    if (nn::prof::enabled())
+        nn::prof::dump(stderr,
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                t_end - t_start).count()));
 
     // ── 保存模型（含规格 + 嵌入 tokenizer） ──────────────────
     {
