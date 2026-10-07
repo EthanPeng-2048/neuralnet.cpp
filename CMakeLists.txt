@@ -657,6 +657,10 @@ if(Vulkan_FOUND)
     #     cast，正确性不变）。f32 分支文本逐字未改 → 零回归。
     nn_embed_shader(batched_matmul_f16 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/batched_matmul.comp -DNN_SHADER_F16=1)
     nn_embed_shader(matmul_tiled_f16 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matmul_tiled.comp -DNN_SHADER_F16=1)
+    # P0 wgrad 网格饥饿：同一份 matmul_tiled 用 -DNN_MM_FINE=1 编 16×16
+    # 输出块变体（4×4 线程）。后端在 64-tile 网格工作组数低于
+    # EXPR_MATMUL_FINE_MIN_WGS 时选它（逐输出元素 K 累加序不变 → 逐位一致）。
+    nn_embed_shader(matmul_tiled_fine ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matmul_tiled.comp -DNN_MM_FINE=1)
     # C2e：小 N GEMV 的 f16 变体（n_out≤8 推理热路径；subgroup → vulkan1.2）
     nn_embed_shader(matmul_gemv_f16 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matmul_gemv.comp --target-env=vulkan1.2 -DNN_SHADER_F16=1)
     # C2f：RLA 扫描原语的 f16 存储变体（输入输出均 half；输出 (·,seq) 全

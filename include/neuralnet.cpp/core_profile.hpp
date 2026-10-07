@@ -7,7 +7,7 @@
 //  · 默认关闭（零开销：构造体只读一个 bool，不调时钟）；
 //  · `NN_PROFILE=1` 开启聚合计时，进程结束前由入口程序调 `nn::prof::dump()`
 //    打表（stage 表 = 各阶段墙钟构成、op 表 = 各原语净归属、GPU 表 = 设备侧
-//    kernel 时间与 busy%）；
+//    kernel 时间与 busy%、per-key 表 = 逐 shader key 的设备耗时细分）；
 //  · `NN_PROFILE_TRACE=<path>` 额外记录逐事件时间轴，`dump()` 时写 Chrome
 //    trace JSON（chrome://tracing / Perfetto 直接打开）。
 //
@@ -143,6 +143,11 @@ struct State
     std::mutex mu;
     StageMap stages;                                        // stage → op → 桶（op=="" = stage 本身）
     std::unordered_map<std::string_view, DeviceBucket> device;
+    // per-key 归因（"shader_key@label@stage" → 桶）：device 表按 label 聚合后
+    // 看不出 fused@fwd.blk 这类大桶由哪些结构贡献——此表把逐 dispatch 的
+    // 运行期 shader key（expr_spec_key[#x/#b/#f] 或原语变体名）细分进去。
+    // 只增不改：device 表口径不变（两表可对账：device_keys 合计 ≤ device 合计）。
+    std::unordered_map<std::string_view, DeviceBucket> device_keys;
     std::vector<Event> trace;
 };
 
@@ -254,6 +259,38 @@ inline void trace_event(const char* name, const char* cat,
     return p;
 }
 
+// ── 设备侧 per-key 归因：detail@label@stage 驻留 ───────────────────────────
+//   detail = 运行期 shader key（expr_spec_key 及 #x/#b/#f 变体后缀）或原语
+//   变体名（tiled/gemv/fine…）——都是 dispatch 时才确定的运行期字符串，
+//   必须拷进稳定池才能当聚合表 key（见文件头"命名约束"）。suffix 单列是为了
+//   让调用点零分配传细 tile 变体（detail=shader_name、suffix="#f"）。
+//   产出 "detail[suffix]@label[@stage]"；仅剖析开启时被调用。
+[[nodiscard]] inline const char* interned_detail(std::string_view detail,
+                                                 const char* suffix,
+                                                 const char* label,
+                                                 const char* stage)
+{
+    static std::mutex mu;
+    static std::deque<std::string> pool;                       // 地址稳定
+    static std::unordered_map<std::string, const char*> seen;
+    std::string key(detail);
+    if (suffix != nullptr && suffix[0] != '\0') key += suffix;
+    key += '@';
+    key += label;
+    if (stage != nullptr && stage[0] != '\0')
+    {
+        key += '@';
+        key += stage;
+    }
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = seen.find(key);
+    if (it != seen.end()) return it->second;
+    pool.push_back(std::move(key));
+    const char* p = pool.back().c_str();
+    seen.emplace(pool.back(), p);
+    return p;
+}
+
 // ── RAII 计时器 ─────────────────────────────────────────────────────────────
 
 // Scope：阶段/层级计时（forward / backward / L3 …），name 必须静态存储。
@@ -351,7 +388,10 @@ private:
 };
 
 // ── 设备侧回填（Vulkan timestamp query 解析后调用）─────────────────────────
-inline void device_add(const char* name, std::uint64_t ns)
+//   detail：可选的 per-key 归因串（已驻留，见 interned_detail）——非空时同时
+//   计入 device_keys 表；device 表口径不变。
+inline void device_add(const char* name, std::uint64_t ns,
+                       const char* detail = nullptr)
 {
     if (!g_enabled) return;
     detail::State& s = detail::state();
@@ -360,6 +400,13 @@ inline void device_add(const char* name, std::uint64_t ns)
     ++b.calls;
     b.total_ns += ns;
     if (ns > b.max_ns) b.max_ns = ns;
+    if (detail != nullptr && detail[0] != '\0')
+    {
+        DeviceBucket& d = s.device_keys[detail];
+        ++d.calls;
+        d.total_ns += ns;
+        if (ns > d.max_ns) d.max_ns = ns;
+    }
 }
 
 // ── 宏（__LINE__ 拼接出唯一变量名）──────────────────────────────────────────
@@ -432,10 +479,12 @@ inline void dump(std::FILE* out, std::uint64_t wall_ns, bool reset)
     detail::State& s = detail::state();
     detail::StageMap stages;
     std::unordered_map<std::string_view, DeviceBucket> device;
+    std::unordered_map<std::string_view, DeviceBucket> device_keys;
     {
         std::lock_guard<std::mutex> lock(s.mu);
         stages = s.stages;
         device = s.device;
+        device_keys = s.device_keys;
     }
 
     std::fprintf(out, "\n[profile] ══════ 训练 step 剖析 ══════\n");
@@ -565,6 +614,35 @@ inline void dump(std::FILE* out, std::uint64_t wall_ns, bool reset)
                          static_cast<double>(dev_sum) / 1e6,
                          static_cast<double>(wall_ns) / 1e6);
         }
+
+        // ── 表 5：per-key 归因（key@label@stage，逐结构细分 top 60）────────
+        //   用途：表 4 里 fused@fwd.blk 这类大桶看不出由哪些结构贡献；此表把
+        //   运行期 shader key（含 #x/#b/#f 变体后缀）细分进去，直接指向可优化
+        //   的表达式结构。合计 ≤ 表 4 合计（仅被 dispatch 点带 detail 的行入表）。
+        if (!device_keys.empty())
+        {
+            std::fprintf(out, "[profile] ── 设备侧 per-key 归因（key@label@stage，top 60）──\n");
+            std::fprintf(out, "[profile] %-52s %10s %12s %10s\n",
+                         "key@label@stage", "ms", "calls", "avg_us");
+            std::vector<std::pair<std::string_view, DeviceBucket>> key_rows(
+                device_keys.begin(), device_keys.end());
+            std::sort(key_rows.begin(), key_rows.end(),
+                      [](const auto& a, const auto& b)
+                      { return a.second.total_ns > b.second.total_ns; });
+            for (std::size_t i = 0; i < key_rows.size() && i < 60; ++i)
+            {
+                const auto& [name, b] = key_rows[i];
+                std::fprintf(out, "[profile] %-52s %10.2f %12llu %10.1f\n",
+                             std::string(name).c_str(),
+                             static_cast<double>(b.total_ns) / 1e6,
+                             static_cast<unsigned long long>(b.calls),
+                             b.calls > 0 ? static_cast<double>(b.total_ns) / 1e3
+                                             / static_cast<double>(b.calls) : 0.0);
+            }
+            if (key_rows.size() > 60)
+                std::fprintf(out, "[profile]（共 %zu 条，仅显示 top 60）\n",
+                             key_rows.size());
+        }
     }
 
     if (wall_ns > 0)
@@ -582,6 +660,7 @@ inline void dump(std::FILE* out, std::uint64_t wall_ns, bool reset)
         std::lock_guard<std::mutex> lock(s.mu);
         s.stages.clear();
         s.device.clear();
+        s.device_keys.clear();
         s.trace.clear();
     }
 }
