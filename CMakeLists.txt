@@ -539,6 +539,12 @@ if(NN_ENABLE_TESTS)
         set_tests_properties(batchnorm_test_gpu PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     # 基准工具已移除（2026 清理：无法在 -Werror 下编译，且无 ctest 覆盖）
+    # 三值（T1_58）BitLinear 的 GPU 变体：BitLinear 的表达式必须命中 AOT 融合
+    # 注册表（闭合世界）+ 走一遍 f16 运行期精度分派；纯 CPU 构建/无设备 → 77。
+    if(TARGET t1_58_test)
+        add_test(NAME t1_58_test_gpu COMMAND t1_58_test --gpu)
+        set_tests_properties(t1_58_test_gpu PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
     foreach(TARGET ${NN_BENCH_TARGETS})
         set_target_properties(${TARGET} PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test)

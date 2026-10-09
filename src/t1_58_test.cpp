@@ -176,11 +176,312 @@ void test_post_init_immutable()
     CHECK(code != 0, "init 后 set_precision_profile → 非零退出（abort）");
 }
 
+// ── [5][6] BitLinear：τ / wq 规则（逐位）+ 去量化 forward + STE backward ────
+// 参考值全部在宿主上用双精度独立算一遍（不复用被测实现）。
+// 已知 latent 权重：三行的结构各不相同
+//   行0 {1.0, 0.3, -0.3, 0.3}  → absmean τ=0.475（absmax τ=1.0 会把 0.3 全归零）
+//   行1 {0.4,-0.4, 0.1,-0.1}   → τ=0.25，阈值 0.125 → 两个 0.1 归零
+//   行2 {0.7, 0.6, 0.5, 0.1}   → τ=0.475 → 只有 0.1 归零
+constexpr std::size_t kIN = 4, kOUT = 3, kB = 2;
+constexpr float kRawW[kOUT][kIN] = {
+    {1.0f, 0.3f, -0.3f, 0.3f},
+    {0.4f, -0.4f, 0.1f, -0.1f},
+    {0.7f, 0.6f, 0.5f, 0.1f},
+};
+constexpr float kX[kIN][kB] = {{1.f, -2.f}, {0.5f, 1.f}, {-1.f, 0.25f}, {2.f, -0.5f}};
+
+nn::Matrix known_weight_matrix()
+{
+    nn::Matrix W(kOUT, kIN);
+    for (std::size_t o = 0; o < kOUT; ++o)
+        for (std::size_t k = 0; k < kIN; ++k)
+            W.set_value(o, k, kRawW[o][k]);
+    return W;
+}
+
+nn::Matrix known_input_matrix()
+{
+    nn::Matrix X(kIN, kB);
+    for (std::size_t k = 0; k < kIN; ++k)
+        for (std::size_t b = 0; b < kB; ++b)
+            X.set_value(k, b, kX[k][b]);
+    return X;
+}
+
+// 宿主参考：τ（逐行 absmean）与 wq（RoundClip(W/τ,-1,1)）
+void ref_quant(double (&tau_ref)[kOUT], double (&wq_ref)[kOUT][kIN])
+{
+    for (std::size_t o = 0; o < kOUT; ++o)
+    {
+        double s = 0.0;
+        for (std::size_t k = 0; k < kIN; ++k) s += std::fabs(static_cast<double>(kRawW[o][k]));
+        tau_ref[o] = s / static_cast<double>(kIN);
+        for (std::size_t k = 0; k < kIN; ++k)
+        {
+            const double w = static_cast<double>(kRawW[o][k]);
+            wq_ref[o][k] = (w > 0.5 * tau_ref[o]) ? 1.0
+                         : (w < -0.5 * tau_ref[o]) ? -1.0 : 0.0;
+        }
+    }
+}
+
+void test_bitlinear_rules()
+{
+    std::puts("[5] BitLinear：τ = 逐行 absmean，wq 逐位符合 RoundClip(W/τ,-1,1)");
+    nn::CpuEngine eng;
+    constexpr std::size_t IN = kIN, OUT = kOUT, B = kB;
+
+    nn::BitLinear bl(IN, OUT);
+    nn::PrecisionProfile prof;
+    prof.param = nn::Precision::T1_58;
+    bl.set_precision_profile(prof);
+    auto init_r = bl.init(eng);
+    CHECK(init_r.has_value(), "BitLinear + param=T1_58 → init 成功");
+    if (!init_r.has_value()) return;
+
+    const nn::Matrix W = known_weight_matrix();
+    {
+        auto wr = eng.copy_from(bl.parameters()[0].get(), W);
+        CHECK(wr.has_value(), "写入已知 latent 权重");
+    }
+
+    // 输入
+    const nn::Matrix X = known_input_matrix();
+    const nn::Tensor Xt = upload(eng, X);
+
+    auto y_r = bl.forward(Xt);
+    CHECK(y_r.has_value(), "BitLinear forward 成功");
+    if (!y_r.has_value()) return;
+
+    // ── 宿主参考：τ / wq ───────────────────────────────────────────────
+    double tau_ref[OUT] = {0, 0, 0};
+    double wq_ref[OUT][IN] = {};
+    ref_quant(tau_ref, wq_ref);
+    {
+        const nn::Matrix tau = download(eng, bl.row_scales());
+        CHECK(tau.rows() == OUT && tau.cols() == 1, "τ 形状 (out,1)");
+        for (std::size_t o = 0; o < OUT; ++o)
+            CHECK(std::fabs(static_cast<double>(tau.at(o, 0)) - tau_ref[o]) < 1e-6,
+                  "τ = 逐行 absmean（absmax 不是尺度）");
+    }
+    {
+        const nn::Matrix wq = download(eng, bl.quantized_weights());
+        bool exact = true, in_set = true;
+        for (std::size_t o = 0; o < OUT; ++o)
+            for (std::size_t k = 0; k < IN; ++k)
+            {
+                const double q = static_cast<double>(wq.at(o, k));
+                if (q != wq_ref[o][k]) exact = false;
+                if (!(q == 1.0 || q == 0.0 || q == -1.0)) in_set = false;
+            }
+        CHECK(exact, "wq 逐位等于 RoundClip(W/τ,-1,1)");
+        CHECK(in_set, "wq 取值 ⊂ {-1,0,+1}（f16 精确可表示）");
+        // 行0 的三值码位：absmean 保留 0.3（absmax 会把它们全归零）
+        CHECK(wq.at(0, 1) == 1.0f && wq.at(0, 2) == -1.0f,
+              "absmean 尺度下 0.3 不被归零（与 absmax 的关键差别）");
+    }
+    // ── forward：Y = (wq·X)∘τ + b（b 初值 0）────────────────────────────
+    {
+        const nn::Matrix Y = download(eng, *y_r);
+        double ref[OUT][B] = {};
+        for (std::size_t o = 0; o < OUT; ++o)
+            for (std::size_t b = 0; b < B; ++b)
+            {
+                double acc = 0.0;
+                for (std::size_t k = 0; k < IN; ++k)
+                    acc += wq_ref[o][k] * static_cast<double>(kX[k][b]);
+                ref[o][b] = acc * tau_ref[o];
+            }
+        double mx = 0.0;
+        for (std::size_t o = 0; o < OUT; ++o)
+            for (std::size_t b = 0; b < B; ++b)
+                mx = std::max(mx, std::fabs(static_cast<double>(Y.at(o, b)) - ref[o][b]));
+        CHECK(mx < 1e-5, "forward = (wq·X)∘τ（去量化点积）");
+    }
+
+    // ── STE backward：dX = wqᵀ(dY∘τ)；dW = (dY·Xᵀ)∘τ；db = ΣdY ──────────
+    std::puts("[6] BitLinear：STE 梯度 = 解析式（量化器导数当恒等）");
+    {
+        auto zr = bl.zero_grad();
+        CHECK(zr.has_value(), "zero_grad");
+        nn::Matrix dY(OUT, B);
+        const float dv[OUT][B] = {{0.5f, -0.25f}, {1.0f, 0.75f}, {-0.5f, 0.25f}};
+        for (std::size_t o = 0; o < OUT; ++o)
+            for (std::size_t b = 0; b < B; ++b)
+                dY.set_value(o, b, dv[o][b]);
+        const nn::Tensor dYt = upload(eng, dY);
+
+        auto gi_r = bl.backward(dYt);
+        CHECK(gi_r.has_value(), "BitLinear backward 成功");
+        if (!gi_r.has_value()) return;
+
+        // dW[o,k] = τ_o · Σ_b dY[o,b]·X[k,b]
+        double dw_ref[OUT][IN] = {};
+        for (std::size_t o = 0; o < OUT; ++o)
+            for (std::size_t k = 0; k < IN; ++k)
+            {
+                double acc = 0.0;
+                for (std::size_t b = 0; b < B; ++b)
+                    acc += static_cast<double>(dv[o][b]) * static_cast<double>(kX[k][b]);
+                dw_ref[o][k] = acc * tau_ref[o];
+            }
+        const nn::Matrix gw = download(eng, bl.param_gradients()[0].get());
+        double mxw = 0.0;
+        for (std::size_t o = 0; o < OUT; ++o)
+            for (std::size_t k = 0; k < IN; ++k)
+                mxw = std::max(mxw, std::fabs(static_cast<double>(gw.at(o, k)) - dw_ref[o][k]));
+        CHECK(mxw < 1e-5, "dW_lat = (dY·Xᵀ)∘τ（STE 含去量化尺度）");
+
+        // db[o] = Σ_b dY[o,b]
+        const nn::Matrix gb = download(eng, bl.param_gradients()[1].get());
+        double mxb = 0.0;
+        for (std::size_t o = 0; o < OUT; ++o)
+        {
+            double s = 0.0;
+            for (std::size_t b = 0; b < B; ++b) s += static_cast<double>(dv[o][b]);
+            mxb = std::max(mxb, std::fabs(static_cast<double>(gb.at(o, 0)) - s));
+        }
+        CHECK(mxb < 1e-5, "db = Σ_batch dY");
+
+        // dX[k,b] = Σ_o wq[o,k]·τ_o·dY[o,b]
+        const nn::Matrix gi = download(eng, *gi_r);
+        double mxi = 0.0;
+        for (std::size_t k = 0; k < IN; ++k)
+            for (std::size_t b = 0; b < B; ++b)
+            {
+                double acc = 0.0;
+                for (std::size_t o = 0; o < OUT; ++o)
+                    acc += wq_ref[o][k] * tau_ref[o] * static_cast<double>(dv[o][b]);
+                mxi = std::max(mxi, std::fabs(static_cast<double>(gi.at(k, b)) - acc));
+            }
+        CHECK(mxi < 1e-5, "dX = wqᵀ(dY∘τ)（τ 在求和维内，不能提到 matmul 外）");
+    }
+}
+
+// ── [7] 端到端：T1_58 MLP 小训练收敛（CPU / GPU 同一份代码）──────────────
+// ── [7a] compute=F16：混合精度槽（param 三值 + 激活 f16）───────────────
+// 三值只占 param 槽；激活/稳定链仍是 f16/f32 → 同一层在 compute=f16 下
+// 必须给出与 f32 路径**同一数学结果**（差异仅 f16 舍入）。
+void test_bitlinear_f16_compute()
+{
+    std::puts("[7a] BitLinear：compute=F16（param 三值 + 激活 f16）与 f32 一致");
+    nn::CpuEngine eng;
+    constexpr std::size_t IN = kIN, OUT = kOUT, B = kB;
+
+    nn::PrecisionProfile prof;
+    prof.param     = nn::Precision::T1_58;
+    prof.compute   = nn::Precision::F16;
+    prof.stable    = nn::Precision::F32;
+    prof.optimizer = nn::Precision::F32;
+    nn::BitLinear bl(IN, OUT);
+    bl.set_precision_profile(prof);
+    auto init_r = bl.init(eng);
+    CHECK(init_r.has_value(), "BitLinear + compute=F16 → init 成功（能力校验只锁 param 槽）");
+    if (!init_r.has_value()) return;
+
+    const nn::Matrix W = known_weight_matrix();
+    auto wr = eng.copy_from(bl.parameters()[0].get(), W);
+    CHECK(wr.has_value(), "写入已知 latent 权重");
+
+    const nn::Matrix X = known_input_matrix();
+    auto y_r = bl.forward(upload(eng, X));
+    CHECK(y_r.has_value(), "f16 compute forward 成功");
+    if (!y_r.has_value()) return;
+
+    double tau_ref[OUT] = {0, 0, 0};
+    double wq_ref[OUT][IN] = {};
+    ref_quant(tau_ref, wq_ref);
+    const nn::Matrix Y = download(eng, *y_r);
+    double mx = 0.0;
+    for (std::size_t o = 0; o < OUT; ++o)
+        for (std::size_t b = 0; b < B; ++b)
+        {
+            double acc = 0.0;
+            for (std::size_t k = 0; k < IN; ++k)
+                acc += wq_ref[o][k] * static_cast<double>(kX[k][b]);
+            mx = std::max(mx, std::fabs(static_cast<double>(Y.at(o, b)) - acc * tau_ref[o]));
+        }
+    CHECK(mx < 2e-3, "f16 compute 下结果与 f32 参考一致（f16 舍入内）");
+    // 量化缓冲恒 f16（与 compute 槽无关）
+    CHECK(bl.quantized_weights().precision() == nn::Precision::F16, "wq 缓冲恒 f16");
+    CHECK(bl.latent_weights().precision() == nn::Precision::F32, "latent 恒 f32（STE 落点）");
+}
+
+bool test_training(nn::ComputeEngine& eng, const char* dev)
+{
+    std::printf("[7] BitLinear MLP 端到端小训练（%s）：loss 收敛\n", dev);
+    constexpr std::size_t IN = 8, HID = 16, OUT = 4, B = 32;
+
+    // 教师：三值权重线性映射 + 固定偏置（学生是"BitLinear → Norm → 激活 → BitLinear"）
+    std::mt19937 rng(20261010u);
+    std::uniform_int_distribution<int> td(0, 2);
+    std::uniform_real_distribution<float> ud(-1.f, 1.f);
+    nn::Matrix Wt(OUT, IN);
+    for (auto& v : Wt.span())
+        v = static_cast<float>(td(rng) - 1) * 0.5f;
+    nn::Matrix Xm(IN, B);
+    for (auto& v : Xm.span()) v = ud(rng);
+    nn::Matrix Ym(OUT, B);
+    Wt.multiply_to(Ym, Xm);   // Ym = Wt·Xm（教师权重**逐元素固定**，不随列变化）
+
+    nn::PrecisionProfile t1;
+    t1.param = nn::Precision::T1_58;
+    auto m_r = nn::build_mnist_mlp_model(eng, {IN, HID, OUT}, nn::NormType::LayerNorm, t1);
+    CHECK(m_r.has_value(), "T1_58 MLP 构建成功（线性层 = BitLinear）");
+    if (!m_r.has_value())
+    {
+        std::printf("    构建失败: %s\n", m_r.error().message.c_str());
+        return false;
+    }
+    nn::Model& model = *m_r;
+
+    auto opt = nn::create_optimizer("adam", eng, model.parameters(), model.param_gradients(),
+                                    /*lr=*/0.05f, /*wd=*/0.0f, t1);
+    CHECK(opt != nullptr, "优化器创建成功");
+    if (!opt) return false;
+
+    nn::MSELoss mse;
+    mse.set_precision_profile(t1);
+    const nn::Tensor Xt = upload(eng, Xm);
+    const nn::Tensor Yt = upload(eng, Ym);
+
+    float first = -1.f, last = -1.f;
+    constexpr int STEPS = 300;
+    // 失败时打印引擎错误原文（GPU 上多为"闭合世界未命中/精度签名不支持"）
+    const auto report = [](const char* what, const std::string& msg)
+    {
+        std::printf("    [FAIL] %s: %s\n", what, msg.c_str());
+        CHECK(false, what);
+    };
+    for (int step = 0; step < STEPS; ++step)
+    {
+        if (auto r = model.zero_grad(); !r) { report("zero_grad", r.error().message); return false; }
+        auto pred = model.forward(Xt);
+        if (!pred) { report("forward", pred.error().message); return false; }
+        auto loss = mse.forward(eng, *pred, Yt);
+        if (!loss) { report("loss", loss.error().message); return false; }
+        if (!std::isfinite(*loss)) { CHECK(false, "loss 非有限"); return false; }
+        if (step == 0) first = *loss;
+        last = *loss;
+        auto grad = mse.backward();
+        if (!grad) { report("loss.backward", "no grad"); return false; }
+        if (auto r = model.backward(*grad); !r) { report("model.backward", r.error().message); return false; }
+        if (auto r = opt->step(); !r) { report("optimizer.step", r.error().message); return false; }
+    }
+    std::printf("    loss: %.6f → %.6f（%d 步）\n", first, last, STEPS);
+    CHECK(last < first * 0.7f, "loss 显著下降（量化权重仍可训练）");
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
 {
     g_self = (argc > 0 && argv[0] != nullptr) ? argv[0] : "";
+
+    bool gpu = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--gpu") gpu = true;
 
     // ── 子进程自举：init 后注入 profile → 期望终止 ────────────────────────
     if (argc >= 2 && std::string(argv[1]) == "--expect-post-init-abort")
@@ -197,6 +498,23 @@ int main(int argc, char* argv[])
     test_capability_reject();
     test_capability_accept();
     test_post_init_immutable();
+    test_bitlinear_rules();
+    test_bitlinear_f16_compute();
+
+    // ── 端到端训练：--gpu 时用 GPU（无设备/未编译 Vulkan → 退出码 77 = skip）──
+    if (gpu)
+    {
+        nn::cli::EngineConfig ec;
+        ec.use_gpu = true;
+        auto eng_r = nn::cli::create_engine(ec);
+        NN_EXIT(eng_r, 77, "GPU 不可用，跳过: ");
+        if (!test_training(**eng_r, "GPU")) g_failures++;
+    }
+    else
+    {
+        nn::CpuEngine eng;
+        if (!test_training(eng, "CPU")) g_failures++;
+    }
 
     if (g_failures == 0)
     {

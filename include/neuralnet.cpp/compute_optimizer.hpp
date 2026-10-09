@@ -335,13 +335,20 @@ protected:
         // K3: p -= lr * (inv_bc1*m) / (sqrt(inv_bc2*v)+eps)（全链单 kernel 融合；
         //     依赖刚更新的 m_[i]/v_[i]，偏置修正系数 inv_bc1/inv_bc2 逐步变化
         //     由 RParam 承载，不进 key → 共享 shader）
-        //     更新量精度 = p_.param（与目标参数存储精度一致，省一次 cast）
+        //     更新量精度 = **目标参数的存储精度**：通常就是 p_.param（省一次 cast），
+        //     但当 param 槽不是"存储精度"时必须以张量自身为准 —— 例如 BitLinear 的
+        //     T1_58（latent 恒 f32）：照搬 p_.param 会拿非存储精度去建张量
+        //     （CPU 走 f32 兜底、GPU 在 check_precision_supported 处硬报错 =
+        //      两端行为不一致）。见 docs/development/21-quantized-weights.md §4.3.2。
+        const Precision upd_prec = (precision_bytes(p_.param) != 0)
+                                       ? p_.param
+                                       : params_[i].get().precision();
         auto delta = dsl::compute(engine_,
               -dsl::rparam(lr_)
               * ((dsl::leaf(m_[i]) * dsl::rparam(inv_bc1))
                  / (dsl::sqrt(dsl::leaf(v_[i]) * dsl::rparam(inv_bc2))
                     + dsl::rparam(eps_))),
-            rows, cols, p_.param);
+            rows, cols, upd_prec);
         NN_TRY_CHECK(delta);
         // p += delta（目标传递：原地、单 dispatch，不额外分配）
         auto r = dsl::compute_into(engine_,
@@ -739,4 +746,3 @@ public:
 }
 
 } // namespace nn
-

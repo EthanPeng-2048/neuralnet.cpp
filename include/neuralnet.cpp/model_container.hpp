@@ -94,6 +94,19 @@ public:
         return {};
     }
 
+    // 添加已构造的层并**显式**注入给定 profile（跳过 default_precision_）。
+    // 用于"同一模型内按层类型分派精度"的场景：三值 MLP 里 BitLinear 要
+    // param=T1_58，而非权重层/归一化层的 param 槽不适用（仍走模型默认）。
+    // 见 docs/development/21-quantized-weights.md §4.8。
+    Result<void> add_layer(std::unique_ptr<Layer> layer, const PrecisionProfile& profile)
+    {
+        layer->set_precision_profile(profile);
+        auto r = layer->init(engine());
+        NN_TRY_CHECK(r);
+        layers_.emplace_back(std::move(layer));
+        return {};
+    }
+
     // ── 默认精度配置（§9.2）：须在 add()/add_layer() 之前调用 ─────────────
     void set_default_precision_profile(const PrecisionProfile& profile)
     {
@@ -261,4 +274,3 @@ public:
 };
 
 } // namespace nn
-
