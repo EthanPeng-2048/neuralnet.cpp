@@ -275,6 +275,7 @@ optimizer.step();
 | `development/17-unified-tensor-engine.md` | **统一 Tensor/ComputeEngine/MemoryPool 底层架构总纲（2026-09-30 裁定；M1-M6 全部已实施 2026-09-30，仅 M7 未立项）：访问不变量（Tensor 存储私有、一切经引擎，已立为铁律 #11）、InitSpec 声明式初始化、批量 read/write、Matrix 降级为宿主 I/O 载体（L2+ 禁用 = 铁律 #12）、内存池契约统一、`import` 跨设备拉取、Layer 删每调用 engine 形参（M6 段 C，Loss/DSL/辅助对象保留形参见 §8）；吸收 15 未实施的 P2-P6（改期 M1-M7）。立项前先读本文件 + §5 分期 + §8** |
 | `development/18-roadmap.md` | **未来方向路线图 + 未完成项裁定台账（2026-10-01，13 号清单的承接者）：P0-P3 分期、13 号逐条裁定（做/条件触发/不做）、触发式立项条件、非目标、门禁与验收口径。要规划下一步、查某件事该不该做、避免重复立项时读本文** |
 | `development/19-unified-dataset.md` | **统一数据集格式与加载（`.nndataset`/`.nnvocab`/KVRecord v2，2026-10-05 设计定稿、阶段一~三已实施）：裁决记录、KVRecord v2 规范、文件布局、`nn::Dataset`/`dataset_gen`/`dataset_convert`/模型 v6 分期落地与兼容迁移。接数据集相关任务前读本文** |
+| `development/21-quantized-weights.md` | **三值（1.58-bit）量化权重与 BitLinear 设计（2026-10-09 设计定稿、2026-10-10 尺度/打包/命名裁定，P1 未实施）：`Precision::T1_58` + `Layer::precision_support()`（按槽声明、`init` 构建期校验）+ `BitLinear`（量化 forward / STE backward）；含 Lumina-Engine `TQ1_0` 参考实现拆解。**已裁定**：尺度 = absmean + per-row（absmax 只剩 0.13~1.29 bit 信息，实测见 `research/ternary_scale/`）、打包 = `TQ1_0` 编码 + 行级块、命名 `T1_58` / CLI 无别名 / 层名 `BitLinear`；**待定** D3（复合层 profile 下传）与 D5（BitLinear 在 GPT/RAPT 的落地）。前置证据 `research/ternary_ste/`** |
 | `development/14-f16-stable-gpu-loss-frozen.md` | **故障报告（2026-09-26，未修）：GPU `stable=f16` 训练 loss 打印冻结（权重不冻结）——触发矩阵、测试覆盖缺口、证据与复现** |
 
 ### 使用类（docs/usage/）
