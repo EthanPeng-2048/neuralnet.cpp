@@ -4,16 +4,19 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <random>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "compute_engine.hpp"
 #include "compute_tensor.hpp"
 #include "model_spec.hpp"
+#include "precision.hpp"
 #include "expr_dsl.hpp"
 
 namespace nn
@@ -46,6 +49,77 @@ inline void nn_dbg_scan(const char* tag, ComputeEngine& eng, const Tensor& t)
 // ══════════════════════════════════════════════════════════════════════════
 // Layer — 引擎化计算层基类
 // ══════════════════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════════
+// PrecisionSet / PrecisionSupport — 层能力声明（docs 21 §4.2，裁决 R1）
+//
+// 背景（docs 21 §2）：`Precision` 是"精度词汇表"，加一个枚举值等于给**所有模型
+// 的所有槽位**多一个可选项。若不声明"谁能用"，就会制造 18 §3.1 C2/C3 那类缺陷
+// （"可组合但必崩，且无任何启动期提示"、"静默回落另一个实现"）。
+//
+// 解法：**层按槽声明自己支持哪些精度**，框架在 `Layer::init` 这个唯一咽喉处校验，
+// 不兼容组合 = 初始化期报错（带层名 + 槽位 + 取值 + 该槽允许集合）。
+//
+// 为什么**按槽**而不是一个扁平集合：`BitLinear` 需要 `param ∈ {T1_58}` 而
+// `compute/stable/optimizer ∈ {f16,f32}`；扁平 `{T1_58}` 会让
+// `{param:T1_58, compute:T1_58}` 通过校验，然后**每个激活算子都被要求输出三值**。
+//
+// 位掩码实现：无分配、可平凡拷贝、可 constexpr，且留足扩展（uint32 = 32 种精度）。
+// ══════════════════════════════════════════════════════════════════════════
+struct PrecisionSet
+{
+    std::uint32_t mask = 0;
+
+    [[nodiscard]] constexpr bool has(Precision p) const noexcept
+    {
+        return (mask & (1u << static_cast<std::uint32_t>(p))) != 0;
+    }
+    constexpr void add(Precision p) noexcept
+    {
+        mask |= (1u << static_cast<std::uint32_t>(p));
+    }
+    [[nodiscard]] static constexpr PrecisionSet of(std::initializer_list<Precision> list) noexcept
+    {
+        PrecisionSet s;
+        for (Precision p : list) s.add(p);
+        return s;
+    }
+
+    // 诊断用：按枚举序罗列（"f16|f32"）——进错误信息，不进任何热路径。
+    [[nodiscard]] std::string to_string() const
+    {
+        std::string s;
+        for (const Precision p : {Precision::F16, Precision::F32, Precision::BF16,
+                                 Precision::F64, Precision::T1_58})
+        {
+            if (!has(p)) continue;
+            if (!s.empty()) s += '|';
+            s += precision_name(p);
+        }
+        return s.empty() ? std::string("(空集)") : s;
+    }
+};
+
+// 舍入精度集合 {f16, f32}：**一切既有层的默认能力**（§4.2 —— 这是"不影响其他层"
+// 的落实方式：默认声明 = 现状，既有层一行不改）。
+[[nodiscard]] constexpr PrecisionSet rounding_precision_set() noexcept
+{
+    return PrecisionSet::of({Precision::F16, Precision::F32});
+}
+
+// 按槽的精度能力（四槽与 PrecisionProfile 一一对应；语义见 §4.3.2：
+// param = "该层 forward 的**有效权重精度**"，不是"参数张量的存储布局"）。
+struct PrecisionSupport
+{
+    PrecisionSet param, compute, stable, optimizer;
+
+    [[nodiscard]] static constexpr PrecisionSupport rounding_all_slots() noexcept
+    {
+        const PrecisionSet s = rounding_precision_set();
+        return PrecisionSupport{s, s, s, s};
+    }
+};
+
 class Layer
 {
 protected:
@@ -82,11 +156,38 @@ protected:
 public:
     virtual ~Layer() = default;
 
+    // ── 层名（诊断设施）─────────────────────────────────────────────────
+    // 能力校验的错误信息必须能定位到"哪一层"（此前 Layer 无任何名称设施，
+    // 诊断只能靠 file:line）。各层 override 返回自己的名字；复合层返回自身名。
+    [[nodiscard]] virtual const char* layer_name() const noexcept { return "Layer"; }
+
     // ── D7：精度配置注入（§9.2）─────────────────────────────────────────
     // virtual：复合层/持有辅助对象（RoPE、位置编码器）的层需要把 profile 继续
     // 下传（否则辅助对象内的 DSL 求值退回 F32，静默丢掉 f16 存储收益）。
-    virtual void set_precision_profile(const PrecisionProfile& profile) { p_ = profile; }
+    //
+    // **契约（D3(b)）**：profile 在 `init(engine)` 之后**不可变**——已 init 时
+    // 调用即 fail-fast。"profile 何时有效"因此从"三条注入路径的交集"收敛成一条
+    // 可判定规则（docs 21 §4.3.2）：校验（唯一的、发生在 init 内的）不可能被旁路。
+    // 复合层的 override 必须先调本函数（先校验），再逐子层下传。
+    virtual void set_precision_profile(const PrecisionProfile& profile)
+    {
+        if (engine_ != nullptr)
+        {
+            NN_CHECK(false,
+                     std::string("set_precision_profile: 层已 init，精度 profile 之后不可变（层=")
+                         + layer_name() + "）—— 请在 init(engine) 之前注入"
+                         "（docs/development/21-quantized-weights.md §4.3.2(b)）");
+        }
+        p_ = profile;
+    }
     [[nodiscard]] const PrecisionProfile& precision_profile() const noexcept { return p_; }
+
+    // ── 层能力声明（R1，§4.2）──────────────────────────────────────────
+    // 默认 = 现状（f16/f32 × 四槽）→ 既有层零改动。声明支持的层 override。
+    [[nodiscard]] virtual PrecisionSupport precision_support() const
+    {
+        return PrecisionSupport::rounding_all_slots();
+    }
 
     // forward/backward 只写一次，CPU/GPU 由引擎实现自动分发（引擎来自 init 绑定）
     [[nodiscard]] virtual Result<Tensor> forward(const Tensor& input) = 0;
@@ -209,11 +310,48 @@ public:
     // **NVI（M6 段 C）**：公共入口负责绑定 engine_，各层 override `init_impl`
     //（层代码不感知绑定，改名由编译器穷尽驱动：`init(...) override` → `init_impl`）。
     // 默认实现空操作；各层在构造后由 Model::add<T>() 调用（测试里也必须调一次）。
+    //
+    // **精度能力校验（R3，docs 21 §4.3）**：这是全仓**唯一**的校验咽喉 ——
+    // `Model::add<T>()` 先注入 profile 再 init；工厂路径（构造器注入）也在 init 前
+    // 完成注入；复合层的 `init_impl` 逐个 init 子层 → 叶子层各自校验即可，
+    // **不需要任何聚合/递归求交逻辑**（那会把静态声明变成递归求交，复杂度升一个量级）。
+    // 校验必须在 init_impl **之前**：init_impl 会用 p_.param 建权重张量
+    //（T1_58 走到那里才会报"不是存储精度"，离根因太远）。
     [[nodiscard]] Result<void> init(ComputeEngine& engine)
     {
         engine_ = &engine;
+        NN_TRY_CHECK(check_precision_support_());
         return init_impl(engine);
     }
+
+protected:
+    // ── 能力校验实现：把 profile 的四个槽逐个对照 precision_support() ────────
+    [[nodiscard]] Result<void> check_precision_support_() const
+    {
+        const PrecisionSupport sup = precision_support();
+        const PrecisionProfile& p = p_;
+        if (!sup.param.has(p.param))
+            return precision_slot_error_("param", p.param, sup.param);
+        if (!sup.compute.has(p.compute))
+            return precision_slot_error_("compute", p.compute, sup.compute);
+        if (!sup.stable.has(p.stable))
+            return precision_slot_error_("stable", p.stable, sup.stable);
+        if (!sup.optimizer.has(p.optimizer))
+            return precision_slot_error_("optimizer", p.optimizer, sup.optimizer);
+        return {};
+    }
+
+    // 错误信息口径（§7 验收 2）：层名 + 槽位 + 取值 + 该槽**允许的集合**
+    [[nodiscard]] Result<void> precision_slot_error_(const char* slot, Precision got,
+                                                     const PrecisionSet& allowed) const
+    {
+        NN_FAIL(std::string("精度能力校验失败: 层 ") + layer_name()
+                + " 不支持 " + slot + "=" + precision_name(got)
+                + "（该槽允许: " + allowed.to_string()
+                + "）—— 见 docs/development/21-quantized-weights.md §4.2");
+    }
+
+public:
 
     // 梯度检查点（激活重计算）契约 ──────────────────────────────────
     // checkpoint_mode_ = true 时，forward 不保留中间激活（供 L1 激活重计算）；
@@ -418,4 +556,3 @@ public:
 }
 
 } // namespace nn
-

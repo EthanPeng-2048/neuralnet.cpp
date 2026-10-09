@@ -41,6 +41,8 @@ public:
     Linear(std::size_t in_features, std::size_t out_features)
         : in_features_(in_features), out_features_(out_features) {}
 
+    [[nodiscard]] const char* layer_name() const noexcept override { return "Linear"; }
+
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
         // ── 声明式初始化（M2，17 §4.4）：层算分布参数，引擎填数 ──────────
@@ -1138,4 +1140,3 @@ private:
     return std::make_unique<LayerNorm>(d_model);
 }
 } // namespace nn
-
