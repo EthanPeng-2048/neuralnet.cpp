@@ -6,7 +6,7 @@
 >
 > **不覆盖**：引擎内部实现（`*_impl`、shader、内存池算法）、Layer/Loss/Optimizer 的算法语义、IR/代码生成管线细节。这些见 §23"相关文档"。
 >
-> **版本锚**：以 `include/neuralnet.cpp/compute_engine.hpp`（2087 行）、`expr_dsl.hpp`（1573 行）、`compute_tensor.hpp`、`precision.hpp`、`core_config.hpp`、`core_errors.hpp` 的当前实现为准。任何与本手册不符的代码行为以源码为准，并请同步修订本手册。
+> **版本锚**：以 `include/neuralnet.cpp/compute_engine.hpp`（2021 行）、`expr_dsl.hpp`（1655 行）、`compute_tensor.hpp`、`precision.hpp`、`core_config.hpp`、`core_errors.hpp` 的当前实现为准。任何与本手册不符的代码行为以源码为准，并请同步修订本手册。
 
 ---
 
@@ -233,8 +233,10 @@ nn::ComputeEngine& engine() const;          // 取绑定引擎；未绑定 → N
 ### 3.3 精度系统
 
 ```cpp
-enum class nn::Precision : std::uint8_t { F16 = 0, F32 = 1, BF16 = 2, F64 = 3 };
-// 仅 F16 / F32 可用；BF16 / F64 是保留值，使用即报错（check_precision_supported）
+enum class nn::Precision : std::uint8_t { F16 = 0, F32 = 1, BF16 = 2, F64 = 3, T1_58 = 4 };
+// 存储/舍入精度只有 F16 / F32；BF16 / F64 是保留值，使用即报错。
+// T1_58 是三值权重（1.58-bit）的**声明**精度（见下）：P1 里它同样不能当存储标签 ——
+// create_tensor / from_matrix / dsl::compute / compute_reduce 都会拒绝它。
 
 struct nn::PrecisionProfile {
     Precision param     = Precision::F32;   // 权重 / 嵌入表 / 参数存储
@@ -244,6 +246,18 @@ struct nn::PrecisionProfile {
 };
 // 配方：profile_f32() / profile_master_weights() / profile_f16() / profile_all_f16()
 ```
+
+> **三值 `T1_58` 与 f16/f32 正交（docs/development/21-quantized-weights.md）**：f16 是"换更窄的
+> 容器"（舍入，全算子统一 P）；`T1_58` 是"换一种权重表示"（按逐行 absmean 尺度把权重投影到
+> `{-1,0,+1}`，需要额外尺度 γ）。因此它**不进提升序**（`precision_rank()` 对它无定义，
+> `max_precision` 直接 fail-fast），在 P1 里也只作为 `PrecisionProfile.param` 的一句**声明**
+> 存在（`precision_bytes(T1_58) == 0`）。
+>
+> **层能力声明**：每个 `Layer` 用 `Layer::precision_support()` 按槽声明自己支持的精度集合
+> （`PrecisionSet` 位掩码；默认 = `{f16,f32}` × 四槽，所以既有层零改动），
+> 校验发生在 `Layer::init()` 这个唯一咽喉 —— 不兼容组合 = **初始化期报错**，信息含
+> 层名 + 槽位 + 取值 + 该槽允许的集合。例：普通 `Linear` 声明 `param={f16,f32}`，
+> 给它 `param=T1_58` 会立刻报错；`BitLinear` 反之声明 `param={T1_58}`。
 
 **P 精度算术的正式定义**（一切精度行为的语义锚）：
 

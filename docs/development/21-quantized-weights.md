@@ -1,10 +1,12 @@
 # 三值（1.58-bit）量化权重与 BitLinear 设计
 
-> **状态**：**设计定稿**（2026-10-09 起草；2026-10-10 裁定尺度 / 打包 / 命名三项）。
-> **P1 未实施**——本文是实现 P1 的唯一依据：§4 是设计，§7 是文件级实施清单，§5 是分期与验收。
-> 仍有 3 项待批（D3 复合层 profile 下传、D5 `BitLinear` 接入位置、D6 行步长对齐），
-> 本文均已给出**推荐做法与理由**（§4.3 / §4.8 / §6），实施前确认即可。
-> **落地分支**：`dev/t1_58`。
+> **状态**：**P1 已实施**（2026-10-09 起草；2026-10-10 裁定尺度 / 打包 / 命名；
+> 2026-10-10 落地 P1 全部 5 步并提交，见 §9 提交清单与 §7 实施清单末列）。
+> 本文现在同时是**实现依据**与**实现说明**：§4 是设计，§4.9 是"实现与设计的差异"，
+> §5 是分期与验收（P1 ✅），§7 是文件级实施清单，§8 是架构图。
+> D1–D6 全部裁定：D3 = (a)+(b)（§4.3.2）、D5 = ③（P1 只覆盖 MLP 路径，§4.8.3）、
+> D6 属 P2（§6 待定项，实施前再定）。
+> **落地分支**：`dev/t1_58`（P1 五个提交，未 push）。
 > **关联**：`05-mixed-precision.md`（Precision 语义契约 §7.2）、
 > `17-unified-tensor-engine.md` §5 M7（存储多态——本文给出它的第一个触发条件）、
 > `18-roadmap.md` §1.1 立项三问 + §3.1 C2/C3（"可选但静默失效"缺陷类）、
@@ -37,6 +39,12 @@
 | 13 | **D1 粒度** | **per-row（输出通道）**。实测 absmean 下 `tensor/row/blk256/blk128/blk64` 的质量相差不到 2 个百分点 → **粒度按工程约束挑**；per-row 还避开了 `TQ1_0` 的"行宽必须整除 256"约束 |
 | 14 | **D2 打包** | **照抄 `TQ1_0` 的编码与解码**（base-3 5-per-byte + `qh` 尾巴 + 定点 `(s·3^n·3)>>8`），**但块粒度 = 行、尺度 = absmean**；不采用它的 per-256 fp16 absmax 尺度 |
 | 15 | **D4 命名** | 枚举 `Precision::T1_58`、`precision_name` = `"t1_58"`、CLI 词法 `t1_58`（**无别名**）、序列化 tag 4、层名保持 **`BitLinear`** |
+| 16 | **D3 落地口径** | **(a)+(b)** 都做：补 `GPTModel`/`RAPTModel`（+ 两个 Block）的 `set_precision_profile` override，并让 `set_precision_profile` 在**已 init** 时 fail-fast（§4.3.2） |
+| 17 | **D5 落地口径** | **③**：P1 只覆盖 MLP；`BitLinear` 在 GPT/RAPT 的接线留 P1.5（照 `make_norm_layer` 先例走 `make_linear_layer` + `unique_ptr<Layer>`） |
+| 18 | **层能力的实现形态** | `PrecisionSet`（uint32 位掩码）+ `Layer::precision_support()` 默认 `{f16,f32}×四槽` + 校验落在 `Layer::init` NVI 首步（**既有层一行不改**） |
+| 19 | **CLI 粒度（实现期细化）** | `--precision-param` 收 `t1_58`；`--precision-{compute,stable,optimizer}` **在参数解析处**就拒绝 `t1_58`（三值只描述权重；拖到 init 期才报是坏 UX）。帮助行同步：只有 param 行写 `<f16\|f32\|t1_58>` |
+| 20 | **"非存储精度"硬化** | `create_tensor`/`from_matrix`/`dsl::compute`/`compute_reduce` 一律拒绝 BF16/F64/T1_58 作为**存储/输出**精度；Adam 的"更新量精度"在 param 槽非存储精度时回落到**目标张量自身**（否则 BitLinear 在 GPU 上 step 失败） |
+| 21 | **CNN 的诚实提示** | CNN 构建器目前不接收精度 profile（roadmap P2）→ CLI 显式打印"本选项未生效"，不静默失效（三值消息在 CNN 下也不再误报"已启用"） |
 
 ---
 
@@ -248,7 +256,7 @@ enum class Precision : std::uint8_t {
   | 枚举 | `Precision::T1_58` |
   | `precision_name` | `"t1_58"` |
   | CLI 词法 | `t1_58`（**无别名**——不提供 `1_58`/`t158` 等变体） |
-  | CLI 帮助 | `--precision-* <f16\|f32\|t1_58>` |
+  | CLI 帮助 | `--precision-param <f16\|f32\|t1_58>`；其余三行 `<f16\|f32>`（实现期细化，见 §0 第 19 条） |
   | 序列化 tag | `4` |
   | 层名 | **`BitLinear`**（保留 BitNet 专名，便于检索） |
   | 存储格式 | "T1_58 打包（编码参照 llama.cpp `TQ1_0`，尺度 = 行级 absmean）" |
@@ -445,11 +453,49 @@ MLP 路径（`build_mnist_mlp_model`）确实是 `model.add<Linear>(...)` 一条
 
 ---
 
+### 4.9 实现与设计的差异（P1 落地记录，2026-10-10）
+
+设计定稿后实施时，有 5 处**细化**（不改设计意图，只把口径写死；§0 表 16–21 条是同一批裁定）：
+
+1. **CLI 粒度**：设计写的是 `--precision-* <f16|f32|t1_58>`（四行都列 t1_58）。实现改为
+   **只有 `--precision-param` 列 t1_58**，其余三行保持 `<f16|f32>`，且
+   `--precision-{compute,stable,optimizer} t1_58` 在**参数解析处**就报错
+   （`三值权重只适用于 --precision-param`）而不是拖到 init 期能力校验。理由：三值描述的是
+   **权重**，把它列进 compute/stable/optimizer 的帮助行等于鼓励一个必然失败的组合；
+   词法本身仍是**唯一词法 `t1_58`（无别名）**。
+2. **`scan_exprs` 的登记位置**：设计写"per-layer dry-run 补一个 `BitLinear`"；实现落在
+   **模型 pass**（新增一条 `param=T1_58` 的 MLP 用例）。理由：`BitLinear` 的真实使用路径是
+   MLP 工厂（`param=T1_58` → `BitLinear`），模型 pass 能一次覆盖 forward/backward/量化三段结构，
+   且与既有的"按运行期配置枚举变体"分工一致。实测 **91 → 96 条结构**、精度变体 130 → 135。
+3. **非存储精度硬化扩到引擎与 DSL**：设计只规定 `check_precision_supported(T1_58)` 拒绝。
+   实现额外在 `ComputeEngine::create_tensor`/`from_matrix`、`dsl::compute`/`compute_reduce`
+   入口拒绝"非存储精度"，并修掉 Adam 用 `p_.param` 建更新量张量的隐患
+   （BitLinear 下 param 槽是 T1_58 → GPU 硬报错、CPU 静默按 f32 走 = 两端不一致；
+   由 `t1_58_test --gpu` 抓到）。**这是本设计"保证没人拿 T1_58 建张量"的完整落实**。
+4. **`Model::add_layer(unique_ptr, profile)` 重载**：三值 MLP 里 `BitLinear` 要 `param=T1_58`，
+   而 norm/激活层的 param 槽无意义（拿 T1_58 会被能力校验误报）→ 工厂给两类层注入不同 profile。
+   为此新增一个显式注入的重载（原 `add_layer` 语义与调用点零变化）。
+5. **CNN 的诚实提示**：CNN 构建器目前根本不接收精度 profile（roadmap P2「RAPT/CNN f16」），
+   所以 `--arch cnn --precision-param t1_58` 是**静默无效**。实现选择显式打印
+   "本选项未生效（run at f32）"而不是改成硬报错（后者会改既有 f16+CNN 的行为）。
+
+**验证证据（本机 clang 24 / Vulkan(glslc) / `-Werror`，`build_t`）**：
+
+| 项 | 结果 |
+|---|---|
+| `t1_58_test`（CPU） | ALL PASSED：τ/wq 逐位、STE 三项梯度、f16 混合精度、规格往返、端到端 loss 0.981→0.025 |
+| `t1_58_test --gpu`（llvmpipe） | ALL PASSED，且 loss 轨迹与 CPU **逐位相同** ⇒ 5 条新结构确实命中 AOT 融合注册表 |
+| `ctest` | 28 项（库内口径）；本机唯一不稳定项是**软件 Vulkan 的 teardown 段错**（`fused_gpu_test`），基线 worktree 实测同样复现，与本文无关 |
+| CLI 端到端 | `--precision-param t1_58 --arch mlp`：训练跑通（2000 样本 / 1 epoch → test_acc 77.98%）；`--resume` 正确还原 BitLinear；`--arch transformer + t1_58` 明确报错"层 PatchEmbedding 不支持 param=t1_58" |
+| `gui_cli_audit.py` | PASS（可行动问题 0）；GUI 只在 param 下拉加入 `t1_58` |
+
+---
+
 ## 5. 分期与验收
 
 | 阶段 | 内容 | 落点 | 验收 |
 |---|---|---|---|
-| **P1** 架构统一 + 功能正确<br>（**范围 = MLP 路径**，D5 建议③） | `Precision::T1_58`（含 R4 的序处理、tag 4、`check_precision_supported` 拒绝）；`PrecisionSet` + `Layer::precision_support()` + `init` 校验 + `layer_name()`；`BitLinear`（量化 forward + STE backward）；D3 的 (a)+(b)（§4.3.2）；`scan_exprs` 补 dry-run；spec 的 `weight_quant` 字段；2 个 CLI × 4 flag 的词法 + GUI + `gui_cli_audit` | `precision.hpp` / `compute_layer_base.hpp` / 新 `compute_layer_bitlinear.hpp` / `tools/scan_exprs.cpp` / `model_spec.hpp` / `src/*` / `gui.py` | ① 不兼容组合**构建期报错**（含 `param=T1_58` + 普通 `Linear` 的反例用例）；② latent 权重的 gradcheck（STE 穿不过量化器，只对 latent 做数值梯度）；③ CPU/GPU 各一个端到端小训练收敛；④ 既有 27 个 ctest 全绿、L2 审计 0。**逐文件清单见 §7** |
+| **P1 ✅（2026-10-10 落地）** 架构统一 + 功能正确<br>（**范围 = MLP 路径**，D5 建议③） | `Precision::T1_58`（含 R4 的序处理、tag 4、`check_precision_supported` 拒绝）；`PrecisionSet` + `Layer::precision_support()` + `init` 校验 + `layer_name()`；`BitLinear`（量化 forward + STE backward）；D3 的 (a)+(b)（§4.3.2）；`scan_exprs` 补 dry-run；spec 的 `weight_quant` 字段；2 个 CLI × 4 flag 的词法 + GUI + `gui_cli_audit` | `precision.hpp` / `compute_layer_base.hpp` / 新 `compute_layer_bitlinear.hpp` / `tools/scan_exprs.cpp` / `model_spec.hpp` / `src/*` / `gui.py` | ① 不兼容组合**初始化期报错**（含 `param=T1_58` + 普通 `Linear` 的反例用例）✅；② latent 权重的 STE 梯度 = 解析式（量化器不可微 → 不做数值 gradcheck，改与宿主参考逐项对拍）✅；③ CPU/GPU 各一个端到端小训练收敛（loss 0.981→0.025，两端逐位相同）✅；④ 既有 ctest 全绿（本机唯一不稳定 = 软件 Vulkan teardown）、L2 审计 0 ✅。**逐文件清单见 §7；逐条差异见 §4.9** |
 | **P2** 真性能 | Tensor qparam（M7）+ **行级打包**（`TQ1_0` 编码：base-3 5-per-byte + `qh` 尾巴 + 定点解码；尺度 = 行级 absmean，**无 per-256 尺度**；行步长/对齐待定）+ `matmul_q` / `matmul_q_t`（CPU 微内核 + Vulkan shader）+ `layer_bench` A/B + 序列化打包 | `compute_tensor.hpp` / `compute_engine.hpp` / `compute_cpu_engine.hpp` / `compute_gpu_engine.hpp` / 新 `.comp` | ① `layer_bench --op matmul` 配对 A/B 报告（含"当前 matmul 是带宽受限还是延迟受限"的判定）；② 打包往返逐字节；③ 数值与 P1 的 f16 缓冲路径一致（同 latent 权重下逐位）；④ 与 llama.cpp `TQ1_0` 的反量化对拍（**只对编码/解码**——尺度规则不同，块内容不互通） |
 | **P1.5** GPT/RAPT 接入 | `make_linear_layer` + `unique_ptr<Layer>` 替换 4 处 `Linear` 成员（照 `make_norm_layer` 先例，§4.8.3） | `compute_layer_attention.hpp` / `compute_layer_feedforward.hpp` / `compute_layer_gpt.hpp` / `compute_layer_rapt.hpp` | GPT/RAPT 的三值端到端训练；既有全 f32 路径零回归 |
 | **P3** 计算侧收益 | 激活 int8 量化 + 整数点积（GPU 需 `GL_EXT_shader_integer_dot_product` 的设备特性探测；CPU 侧参考 §3.4/§3.5）；DSL 新增 `round`/`clamp` 算子（三处同步：`ExprOp` + CPU 求值 + GLSL emitter） | `expr_spec.hpp` / `expr_dsl.hpp` / `expr_glsl_gen.hpp` / 新 `.comp` | 与 PyTorch 参考实现对拍（`compare_with_torch/`） |
@@ -472,6 +518,11 @@ MLP 路径（`build_mnist_mlp_model`）确实是 `model.add<Linear>(...)` 一条
    与 `05-mixed-precision.md` §12.5 记录的"全 f16 不可训练"同一性质、更严重。
 4. **照搬 BitNet TL 的每权重查表**：16 字节/权重，带宽上必输（§3.6，Lumina 已有结论）。
 5. **在 P1 里用 `T1_58` 建张量**：P1 拒绝，避免"半实现的存储类型"散进引擎。
+   实现期把这条从"`check_precision_supported` 一处"扩到引擎/DSL 四个入口（§4.9-3）。
+6. **把 `t1_58` 列进 compute/stable/optimizer 的 CLI 帮助与解析**：三值只描述权重；
+   这三个槽收 `t1_58` 是"鼓励一个必然失败的组合"→ 解析期直接拒绝（§4.9-1）。
+7. **给 CNN 硬报错**（而非提示）：CNN 目前完全不接精度 profile（roadmap P2），
+   改硬报错会连带改掉既有 `--f16 --arch cnn` 的行为 → 取"显式提示未生效"（§4.9-5）。
 
 **风险**
 
@@ -494,14 +545,18 @@ MLP 路径（`build_mnist_mlp_model`）确实是 `model.add<Linear>(...)` 一条
 
 **待定**
 
-- **D3 复合层 profile 下传** —— 本文建议 **（a）补 `GPTModel`/`RAPTModel` 的 override + （b）
-  `set_precision_profile` 在 init 后 fail-fast**，见 §4.3.2；否决了"复合层递归求交"。
-- **D5 `BitLinear` 接入位置** —— 本文建议 **P1 只覆盖 MLP（③），P1.5 照 `make_norm_layer` 先例
-  引入 `make_linear_layer` + `unique_ptr<Layer>`（②）**，见 §4.8.3；否决了模板化（①）。
-- **D6 行步长与对齐**（P2 编码前定案）—— 行连续打包（`ceil(5K/… )` 字节/行，允许非对齐标量读）
+- **D6 行步长与对齐**（P2 编码前定案，唯一仍待定项）—— 行连续打包（`ceil(5K/… )` 字节/行，允许非对齐标量读）
   vs 每行 pad 到 16 B（换 vec4 快路径，但 K=128 时位宽从 1.71 回到 2.0）。
   本文倾向**先按行连续、不 pad**：P2 的第一目标是拿到真实的带宽/时间数据（§5 的 `layer_bench`），
   对齐优化应在数据之后。
+
+**已裁定并落地（2026-10-10，P1）**
+
+- **D3 = (a)+(b)**：`GPTBlock`/`GPTModel`/`RAPTBlock`/`RAPTModel` 补 `set_precision_profile`
+  override 逐子层下传；`Layer::set_precision_profile` 在已 init 时 fail-fast
+  （"profile 在 init 后不可变"）；删掉 `mnist_train` 的冗余注入。否决了"复合层递归求交"。
+- **D5 = ③**：P1 只覆盖 MLP（`param=T1_58` → `BitLinear`）；P1.5 再照 `make_norm_layer`
+  先例引入 `make_linear_layer` + `unique_ptr<Layer>` 覆盖 GPT/RAPT。否决了模板化（①）。
 
 ---
 
@@ -509,21 +564,22 @@ MLP 路径（`build_mnist_mlp_model`）确实是 `model.add<Linear>(...)` 一条
 
 按依赖顺序；每项给出"改什么 / 为什么"。**P1 不含 GPT/RAPT 三值训练**（§4.8.3 ③）。
 
-| # | 文件 | 改动 |
-|---|---|---|
-| 1 | `include/neuralnet.cpp/precision.hpp` | 加 `Precision::T1_58 = 4`；`precision_name` → `"t1_58"`；`precision_tag`/`precision_from_tag` 加 `4`；`precision_bytes` 返回 0 并注明"非存储精度，位宽由打包格式表达"；`check_precision_supported` 拒绝 `T1_58`；**把"序"从枚举值拆出**（`precision_rank()`，见 §4.1 R4） |
-| 2 | `include/neuralnet.cpp/compute_layer_base.hpp` | 加 `PrecisionSet` / `PrecisionSupport`（§4.2 骨架）；`virtual precision_support()` 默认 `{f16,f32}×4`；`virtual const char* layer_name()`；在 `Layer::init` NVI 内做校验（层名 + 槽位 + 取值 + 允许集合）；按 D3(b) 在已 init 时拒绝 `set_precision_profile` |
-| 3 | 新 `include/neuralnet.cpp/compute_layer_bitlinear.hpp` | `BitLinear`：`latent_w_`(f32) + `wq_`(f16 缓冲) + `tau_`((out,1) f32)；`forward` = `compute_reduce(row_reduce_sum(abs(W)))` → `select` 量化 → `matmul+row_broadcast(τ)`；`backward` = STE（`dX`/`dW_lat`/`db`，§4.4）；`precision_support()` = `param={T1_58}` 其余 `{f16,f32}`；`layer_name()` = `"BitLinear"` |
-| 4 | `tools/scan_exprs.cpp` | per-layer dry-run 补一个 `BitLinear`（否则 GPU 闭合世界硬报错；dry-run 是结构的主要来源，见 `AGENTS.md` §7） |
-| 5 | `include/neuralnet.cpp/model_spec.hpp` + `model_serialization.hpp` | `ModelSpec` 加 `weight_quant`（`None`/`T1_58`，缺键 = `None`）；`save/load` 往返；`spec_summary` 与校验同步 |
-| 6 | `src/mnist_train.cpp`、`src/text_train.cpp` | `parse_precision` 接受 `t1_58`（**无别名**）；4 行 help 改成 `<f16\|f32\|t1_58>`；删掉 `mnist_train:678` 的冗余 `set_precision_profile`（D3(a) 的连带） |
-| 7 | `gui.py` + `bench/gui_cli_audit.py` | `PRECISION_OPTIONS` 加 `"t1_58"`（4 行下拉）；审计脚本跑一遍确认仍退 0（只加**取值**、不加 flag，flag 面无变化） |
-| 8 | 新测试 | ① 能力校验：`param=T1_58` + 普通 `Linear` → **构建期报错**（反向用例）；`BitLinear` + `param=f16` → 报错；② `BitLinear` 的 latent 梯度 = STE 公式（数值梯度只对 latent）；③ 量化输出逐位符合 τ 规则；④ MLP 端到端小训练收敛（CPU + GPU 各一） |
-| 9 | 文档 | `AGENTS.md` §11（已加行）+ `docs/usage/03-compute-engine-usage.md` 的精度表（"仅 F16/F32 可用"）在 P1 落地后同步 |
+| # | 文件 | 改动 | 落地 |
+|---|---|---|---|
+| 1 | `include/neuralnet.cpp/precision.hpp` | 加 `Precision::T1_58 = 4`；`precision_name` → `"t1_58"`；`precision_tag`/`precision_from_tag` 加 `4`；`precision_bytes` 返回 0 并注明"非存储精度，位宽由打包格式表达"；`check_precision_supported` 拒绝 `T1_58`；**把"序"从枚举值拆出**（`precision_rank()`，见 §4.1 R4） | ✅ 步骤 1 |
+| 2 | `include/neuralnet.cpp/compute_layer_base.hpp` | 加 `PrecisionSet` / `PrecisionSupport`（§4.2 骨架）；`virtual precision_support()` 默认 `{f16,f32}×4`；`virtual const char* layer_name()`；在 `Layer::init` NVI 内做校验（层名 + 槽位 + 取值 + 允许集合）；按 D3(b) 在已 init 时拒绝 `set_precision_profile` | ✅ 步骤 2（+ `layer_name()` 铺开在步骤 4） |
+| 3 | 新 `include/neuralnet.cpp/compute_layer_bitlinear.hpp` | `BitLinear`：`latent_w_`(f32) + `wq_`(f16 缓冲) + `tau_`((out,1) f32)；`forward` = `compute_reduce(row_reduce_sum(abs(W)))` → `select` 量化 → `matmul+row_broadcast(τ)`；`backward` = STE（`dX`/`dW_lat`/`db`，§4.4）；`precision_support()` = `param={T1_58}` 其余 `{f16,f32}`；`layer_name()` = `"BitLinear"` | ✅ 步骤 3 |
+| 4 | `tools/scan_exprs.cpp` | per-layer dry-run 补一个 `BitLinear`（否则 GPU 闭合世界硬报错；dry-run 是结构的主要来源，见 `AGENTS.md` §7） | ✅ 步骤 3（落在**模型 pass**，见 §4.9-2；91 → 96 条结构） |
+| 5 | `include/neuralnet.cpp/model_spec.hpp` + `model_serialization.hpp` | `ModelSpec` 加 `weight_quant`（`None`/`T1_58`，缺键 = `None`）；`save/load` 往返；`spec_summary` 与校验同步 | ✅ 步骤 3（KV 读写）+ 步骤 4（往返测试 [8]） |
+| 6 | `src/mnist_train.cpp`、`src/text_train.cpp` | `parse_precision` 接受 `t1_58`（**无别名**）；帮助行写明 `t1_58`（实现期细化为只挂 param 行，见 §4.9-1）；删掉 `mnist_train:678` 的冗余 `set_precision_profile`（D3(a) 的连带） | ✅ 步骤 2（删冗余）+ 步骤 4 |
+| 7 | `gui.py` + `bench/gui_cli_audit.py` | 参数精度下拉加 `"t1_58"`（实现期拆成 `PRECISION_PARAM_OPTIONS`，只挂 param 行）；审计脚本跑一遍确认仍退 0（只加**取值**、不加 flag，flag 面无变化） | ✅ 步骤 4 |
+| 8 | 新测试 | ① 能力校验：`param=T1_58` + 普通 `Linear` → **初始化期报错**（反向用例）；`BitLinear` + `param=f16` → 报错；② `BitLinear` 的 latent 梯度 = STE 公式（量化器不可微 → 与宿主解析式对拍）；③ 量化输出逐位符合 τ 规则；④ MLP 端到端小训练收敛（CPU + GPU 各一） | ✅ 步骤 2/3（`src/t1_58_test.cpp`：[1]–[8]）+ 步骤 4（[8] 规格往返） |
+| 9 | 文档 | `AGENTS.md` §3/§4/§11/§12 同步 + `docs/usage/03-compute-engine-usage.md` 的精度表（"仅 F16/F32 可用"）+ `docs/history.md` 条目 + 本文 §8 架构图 | ✅ 步骤 5 |
 
 **验收口径**（沿用仓库四件套 + 本设计的专属项）：
 
-1. 构建零告警；`ctest` 既有 27 个全绿（GPU 用例按既有 `77 = skip` 口径如实记录）；
+1. 构建零告警；`ctest` 全绿（新增 `t1_58_test` + `t1_58_test_gpu` → 本机 28 项；
+   GPU 用例按既有 `77 = skip` 口径如实记录）；
    `pwsh -File bench/doc_inventory.ps1` 第 [4] 节 `L2-VIOLATIONS: 0`；
    scan 产物 hash 的变化**必须**是"新增 T1_58 相关结构"可解释的（逐条核对来源，见 `AGENTS.md` §7）。
 2. 能力校验的反例必须**在构建/初始化期**报错，且错误信息含层名 + 槽位 + 取值。
@@ -532,7 +588,93 @@ MLP 路径（`build_mnist_mlp_model`）确实是 `model.add<Linear>(...)` 一条
 
 ---
 
-## 8. 附录：与 f16 的正交性
+## 8. 架构图（P1 落地后）
+
+### 8.1 精度词汇表与层能力（谁可以声明 T1_58）
+
+```mermaid
+graph TB
+    subgraph "Precision — 精度词汇表（precision.hpp）"
+        R["舍入精度（有提升序，可作存储标签）<br/>F16 = 0 &lt; F32 = 1<br/>precision_rank(): 0 / 1"]
+        T["离散化精度（<b>无</b>提升序，P1 不作存储标签）<br/>T1_58 = 4<br/>precision_bytes() = 0<br/>check_precision_supported() 拒绝建张量"]
+        X["保留值（使用即报错）<br/>BF16 = 2 / F64 = 3"]
+    end
+
+    subgraph "PrecisionProfile — 四槽（模型级配置）"
+        P1["param"]; P2["compute"]; P3["stable"]; P4["optimizer"]
+    end
+
+    subgraph "Layer 能力（按槽声明 + init 校验）"
+        L1["普通层（Linear / Norm / 激活 …）<br/>precision_support() = {f16,f32} × 四槽<br/>（默认实现 → 既有层一行不改）"]
+        L2["BitLinear<br/>param = {T1_58}<br/>compute/stable/optimizer = {f16,f32}"]
+    end
+
+    R --> P1
+    R --> P2
+    R --> P3
+    R --> P4
+    T -.->|"只有 BitLinear 的 param 槽接受"| P1
+    P1 --> CHK["Layer::init（NVI 首步）能力校验<br/>不兼容 = 初始化期报错：<br/>层名 + 槽位 + 取值 + 允许集合"]
+    P2 --> CHK
+    P3 --> CHK
+    P4 --> CHK
+    CHK --> L1
+    CHK --> L2
+    L2 -->|"param=T1_58 是**声明**<br/>不是存储布局"| NOTE["latent 参数恒 f32<br/>（优化器与 STE 的作用点）"]
+```
+
+### 8.2 BitLinear 的数据流（量化 forward / STE backward）
+
+```mermaid
+flowchart LR
+    subgraph FWD["forward（每步重算，不落盘）"]
+        W["latent_w_ (out,in) f32<br/>可训练参数"]
+        RU["dsl::compute_reduce<br/>row_reduce_sum(abs(W))"]
+        TAU["tau_ (out,1) f32<br/>逐行 absmean × (1/K)"]
+        SEL["dsl::compute_into<br/>select(W &gt; 0.5τ, +1,<br/>select(W &lt; -0.5τ, -1, 0))"]
+        WQ["wq_ (out,in) f16<br/>值 ∈ {-1,0,+1}"]
+        MM["dsl::matmul(wq_, X) × row_broadcast(τ)<br/>+ row_broadcast(b_)"]
+        Y["Y (out,batch) = p_.compute"]
+        W --> RU --> TAU --> SEL --> WQ --> MM --> Y
+        TAU -->|"row_broadcast"| MM
+    end
+
+    subgraph BWD["backward（STE：量化器导数 ≡ 1）"]
+        DYE["dY ∘ row_broadcast(τ)"]
+        DX["dX = matmul(wq_,·, transA)"]
+        DW["grad_w_ += matmul(dY, Xᵀ) ∘ row_broadcast(τ)"]
+        DB["grad_b_ += row_reduce_sum(dY)"]
+        Y -.->|"上游梯度 dY"| DYE --> DX
+        DYE --> DW --> W
+        DYE --> DB
+    end
+
+    subgraph AOT["AOT 闭合世界（GPU）"]
+        S["scan_exprs 模型 pass<br/>param=T1_58 的 MLP 用例"]
+        G["fused_registry.hpp<br/>91 → 96 条结构 / 130 → 135 变体"]
+        S --> G
+    end
+    RU -.->|"登记结构"| S
+    SEL -.->|"登记结构"| S
+    MM -.->|"登记结构"| S
+    DW -.->|"登记结构"| S
+```
+
+### 8.3 与 f16 的关系（两条正交的腿）
+
+```mermaid
+graph LR
+    A["精度系统"] --> B["f16 / f32：换更窄的容器<br/>（舍入契约，全算子统一 P）"]
+    A --> C["T1_58：换一种权重表示<br/>（离散化 + 尺度 τ，只作用于权重）"]
+    B --> D["边界 cast（基类 NVI）<br/>+ in-kernel f16 变体"]
+    C --> E["BitLinear：Layer 内 qparam（τ）+ 派生物（wq_）"]
+    D --> F["P2：qparam 进张量 + 行级打包 + matmul_q（M7）"]
+    E --> F
+```
+
+---
+
+## 9. 附录：与 f16 的正交性
 
 | 维度 | f16/f32（现有） | 三值（本文） |
 |---|---|---|
@@ -544,3 +686,20 @@ MLP 路径（`build_mnist_mlp_model`）确实是 `model.add<Linear>(...)` 一条
 
 **一句话**：f16 是"同一算法换更窄的容器"，三值是"换一种权重表示"。二者正交，
 所以三值进的是"精度词汇表"，而它的实现落在 `Layer` 与（P2 起的）专用原语上。
+
+---
+
+## 10. P1 提交清单（分支 `dev/t1_58`）
+
+| # | 提交 | 内容 |
+|---|---|---|
+| 0 | `构建解阻` | `examples/` 已被删除但 CMake 样例块仍引用旧路径 → 加存在性守卫（否则「Vulkan + `NN_ENABLE_TESTS=ON`」配置期即失败，无法跑 ctest） |
+| 1 | `P1-步骤1` | `Precision::T1_58` 进枚举 + 提升序与枚举值解耦（`precision_rank()`）+ tag 4 + `check_precision_supported` 拒绝 |
+| 2 | `P1-步骤2` | `PrecisionSet`/`PrecisionSupport` + `Layer::layer_name()` + `init` 能力校验 + D3(a)/(b)（复合层 profile 下传 + init 后不可变；删 `mnist_train` 冗余注入） |
+| 3 | `P1-步骤3` | `BitLinear` 层 + MLP 工厂接线 + `ModelSpec.weight_quant` + `scan_exprs` 模型 pass + 三处"非存储精度"硬化（引擎/DSL/优化器） + `t1_58_test`[1–7] |
+| 4 | `P1-步骤4` | CLI/GUI 接入 `t1_58`（param 行）+ `gui_cli_audit` PASS + 规格往返测试 [8] + 层名铺开 |
+| 5 | `P1-步骤5` | 本文（状态/差异/清单/架构图）+ `AGENTS.md` §3/§4/§11/§12 + `docs/usage/03` 精度表 + `docs/history.md` 条目 |
+
+**未做（明确留待后续）**：P2（行级打包 + `matmul_q` + M7 张量 qparam + `layer_bench` A/B）、
+P1.5（`Linear` 成员 → `make_linear_layer` + `unique_ptr<Layer>`，让 GPT/RAPT 也能三值）、
+P3（激活 int8 + 整数点积 + DSL `round`/`clamp`）。

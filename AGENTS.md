@@ -32,7 +32,7 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 
 | 任务 | 文件 |
 |------|------|
-| 加/改神经网络层（Linear/Attention/Norm/激活…） | `compute_layer.hpp`（聚合头）+ `compute_layer_{base,mlp,conv,softmax,attention,feedforward,transformer,gpt,rapt}.hpp` |
+| 加/改神经网络层（Linear/Attention/Norm/激活…） | `compute_layer.hpp`（聚合头）+ `compute_layer_{base,mlp,bitlinear,conv,softmax,attention,feedforward,transformer,gpt,rapt}.hpp`（`bitlinear` = 三值权重 BitLinear） |
 | 加/改位置编码（Learned/Sinusoidal/RoPE/ALiBi/无） | `compute_position_encoding.hpp`（`PositionEncoder` 基类 + 子类 + 按注入点分开的两个工厂）+ `compute_layer_attention.hpp` 的 `AttnScoreMask` 族（掩码语义） |
 | 加/改损失函数 | `compute_loss.hpp` |
 | 加/改优化器（SGD/Adam/AdamW/Muon） | `compute_optimizer.hpp` |
@@ -40,7 +40,7 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 | 加/改引擎原语（GPU 实现） | `compute_gpu_engine.hpp` + `backend/compute_vk_backend.hpp` + `backend/compute_vk_device.hpp` + `shaders/*.comp` |
 | 张量/设备抽象 | `compute_tensor.hpp` |
 | 按需 include（不走聚合头） | `engine.hpp` / `layer.hpp` / `loss.hpp` / `optimizer.hpp` / `model.hpp` / `train.hpp` = **薄转发头**（`nn.hpp` 仍是唯一聚合头；只求好记，不省 parse） |
-| 混合精度 / f16 类型系统 | `precision.hpp`（Precision 枚举、`nn::f16`、`PrecisionProfile`） |
+| 混合精度 / f16 类型系统 / 三值（T1_58） | `precision.hpp`（Precision 枚举含 `T1_58`、`precision_rank()`、`nn::f16`、`PrecisionProfile`）；层能力声明 `PrecisionSet`/`PrecisionSupport` + `Layer::precision_support()`/`layer_name()`（`compute_layer_base.hpp`） |
 | 矩阵/代数层（CPU 存储与手写内核） | `algebra_matrix.hpp` / `algebra_span.hpp` / `algebra_ops.hpp`（`Expression`/`BoolExpression` 概念在 `expr_dsl.hpp`） |
 | 表达式 DSL / 融合 IR | `expr_dsl.hpp` / `expr_spec.hpp` / `expr_opt.hpp` / `expr_registry.hpp`（IR-C 图融合未采用、无 `expr_graph.hpp`；取舍记录见 `docs/history.md`） |
 | 后端代码生成（IR-D emitter 抽象） | `expr_emitter.hpp`（注册表）+ `expr_glsl_gen.hpp`（GlslEmitter） |
@@ -83,10 +83,10 @@ graph TB
         K["compute_engine.hpp"]
         L["compute_cpu_engine.hpp"]
         M["compute_gpu_engine.hpp"]
-        N["compute_layer*.hpp"]
+        N["compute_layer*.hpp<br/>(含三值 BitLinear)"]
         O["compute_loss.hpp"]
         P["compute_optimizer.hpp"]
-        P2["precision.hpp"]
+        P2["precision.hpp<br/>F16/F32 + T1_58(三值)"]
     end
     
     subgraph "L1 代数层"
@@ -107,7 +107,8 @@ graph TB
     H & I & J --> K & N & O & P
     K --> L & M
     N & O & P --> Q
-    P2 -.精度配置.-> K
+    P2 -. "精度配置（含 param=T1_58 → BitLinear）".-> K
+    P2 -. "层能力校验（init 期，按槽）".-> N
     Q --> R & S
     Q --> V & W & X
 ```
@@ -126,7 +127,9 @@ graph TB
 Matrix → engine.from_matrix → Tensor[GPU] → forward/loss/optimizer 全程在 GPU → 仅 evaluate 时 to_matrix 回 CPU
 ```
 
-**多精度**：`Precision`（F16/F32；BF16/F64 为保留值，使用即报错）贯穿张量存储与算子输出；`PrecisionProfile{param/compute/stable/optimizer}` 做模型级配置。语义锚点见 `precision.hpp` 头注释与 `docs/development/05-mixed-precision.md`。
+**多精度**：`Precision`（F16/F32 为**存储/舍入**精度；BF16/F64 是保留值，使用即报错）贯穿张量存储与算子输出；`PrecisionProfile{param/compute/stable/optimizer}` 做模型级配置。语义锚点见 `precision.hpp` 头注释与 `docs/development/05-mixed-precision.md`。
+
+**三值权重（T1_58，1.58-bit）**：`Precision::T1_58` 是**离散化**而不是舍入——它把权重按逐行 absmean 尺度投影到 `{-1,0,+1}`、需要额外尺度 γ，且**不进提升序**（`precision_rank()` 无定义，`max_precision` 对它 fail-fast）。P1 里它**不是存储精度**（`precision_bytes = 0`；`create_tensor`/`from_matrix`/`dsl::compute` 一律拒绝拿它建张量/当输出），只作为 `PrecisionProfile.param` 的一句声明 + 层能力集合的取值。落地形态：**每个 Layer 按槽声明自己支持的精度**（`PrecisionSupport{param,compute,stable,optimizer}`，默认 `{f16,f32}×四槽` → 既有层一行不改），`Layer::init`（NVI 首步）做唯一校验，不兼容组合 = **初始化期报错**（层名 + 槽位 + 取值 + 允许集合）；`set_precision_profile` 在已 init 时 fail-fast（"profile init 后不可变"）。谁声明什么：`BitLinear`（三值线性层：量化 forward + STE backward，latent 恒 f32）`param={T1_58}`、其余层默认。CLI 只有 `--precision-param t1_58`（**无别名**；compute/stable/optimizer 收它即解析期报错），`ModelSpec.weight_quant` 记住"该模型用 BitLinear"（缺键 = None → 旧文件零破坏）。P1 覆盖 **MLP 路径**（`--arch mlp`）；GPT/RAPT 留 P1.5，GPU 侧结构由 `scan_exprs` 的模型 pass 登记（91 → 96 条）。完整设计/架构图/验收见 `docs/development/21-quantized-weights.md`。
 
 ### 4.3 ComputeEngine 原语分类
 
@@ -275,7 +278,7 @@ optimizer.step();
 | `development/17-unified-tensor-engine.md` | **统一 Tensor/ComputeEngine/MemoryPool 底层架构总纲（2026-09-30 裁定；M1-M6 全部已实施 2026-09-30，仅 M7 未立项）：访问不变量（Tensor 存储私有、一切经引擎，已立为铁律 #11）、InitSpec 声明式初始化、批量 read/write、Matrix 降级为宿主 I/O 载体（L2+ 禁用 = 铁律 #12）、内存池契约统一、`import` 跨设备拉取、Layer 删每调用 engine 形参（M6 段 C，Loss/DSL/辅助对象保留形参见 §8）；吸收 15 未实施的 P2-P6（改期 M1-M7）。立项前先读本文件 + §5 分期 + §8** |
 | `development/18-roadmap.md` | **未来方向路线图 + 未完成项裁定台账（2026-10-01，13 号清单的承接者）：P0-P3 分期、13 号逐条裁定（做/条件触发/不做）、触发式立项条件、非目标、门禁与验收口径。要规划下一步、查某件事该不该做、避免重复立项时读本文** |
 | `development/19-unified-dataset.md` | **统一数据集格式与加载（`.nndataset`/`.nnvocab`/KVRecord v2，2026-10-05 设计定稿、阶段一~三已实施）：裁决记录、KVRecord v2 规范、文件布局、`nn::Dataset`/`dataset_gen`/`dataset_convert`/模型 v6 分期落地与兼容迁移。接数据集相关任务前读本文** |
-| `development/21-quantized-weights.md` | **三值（1.58-bit）量化权重与 BitLinear 设计（2026-10-09 设计定稿、2026-10-10 尺度/打包/命名裁定，P1 未实施）：`Precision::T1_58` + `Layer::precision_support()`（按槽声明、`init` 构建期校验）+ `BitLinear`（量化 forward / STE backward）；含 Lumina-Engine `TQ1_0` 参考实现拆解。**已裁定**：尺度 = absmean + per-row（absmax 只剩 0.13~1.29 bit 信息，实测见 `research/ternary_scale/`）、打包 = `TQ1_0` 编码 + 行级块、命名 `T1_58` / CLI 无别名 / 层名 `BitLinear`；**待定** D3（复合层 profile 下传）与 D5（BitLinear 在 GPT/RAPT 的落地）。前置证据 `research/ternary_ste/`** |
+| `development/21-quantized-weights.md` | **三值（1.58-bit）量化权重与 BitLinear（2026-10-09 设计定稿 → 2026-10-10 **P1 已实施**，分支 `dev/t1_58`）：`Precision::T1_58` + `Layer::precision_support()`（按槽声明、`init` 期校验）+ `BitLinear`（量化 forward / STE backward）；含 Lumina-Engine `TQ1_0` 参考实现拆解、`§4.9` 实现与设计的差异、`§8` 架构图、`§10` 提交清单。**已裁定**：尺度 = absmean + per-row（absmax 只剩 0.13~1.29 bit 信息，实测见 `research/ternary_scale/`）、打包 = `TQ1_0` 编码 + 行级块、命名 `T1_58` / CLI 无别名 / 层名 `BitLinear`、D3 = (a)+(b)、D5 = ③（P1 只覆盖 MLP，GPT/RAPT 留 P1.5）；**仍待定** D6（P2 行步长/对齐）。前置证据 `research/ternary_ste/`**；验收 `src/t1_58_test.cpp`（+`--gpu` 变体） |
 | `development/14-f16-stable-gpu-loss-frozen.md` | **故障报告（2026-09-26，未修）：GPU `stable=f16` 训练 loss 打印冻结（权重不冻结）——触发矩阵、测试覆盖缺口、证据与复现** |
 
 ### 使用类（docs/usage/）
@@ -303,6 +306,7 @@ optimizer.step();
 
 - **错误处理宏族（2026-10-05）**：`core_errors.hpp` 的三种语义 —— 传播 `NN_TRY` / `NN_TRY_MSG` / `NN_TRY_CHECK`、解包+终止 `NN_CHECK(expr[, "语境"])`（别名 `NN_EASY_CHECK`，也接受 bool 条件）、解包+退出码 `NN_EXIT(expr, code[, "语境"])`，加错误源头糖 `NN_FAIL("msg")`；实现支撑 `nn::detail::{check_message, contextualize, check_value, check_exit}`（格式化与终止策略解耦 = 可单测）。**存量手写形态迁移全部完成（2026-10-05，含 2 阶段边缘形态清零）**：B 批 `src/` 退出样板 320 处 → `NN_EXIT`；A 批全仓传播/错误源 1209 → 36 处（脚本迁移，96%，`tools/apply_*.ps1` 均带 `-DryRun`）；2 阶段把余下 36 处需人工审的边缘形态（vk_backend「先清理后传播」、跨行 `bind_error_` 错误源、`*init_error_` 解引用、init-statement 守卫等）逐一人工改宏 → **站点级残留 0**（`core_assert.hpp`/`core_errors.hpp` 宏定义体与 `error_macro_test.cpp` 夹具豁免不计）。测试 `error_macro_test`；门禁 = `doc_inventory.ps1` 第 [5] 节**基线 0**（新增裸 `unexpected` 即 exit 1）；演进记录见 `docs/history.md` 同日三条。
 - **混合精度**：`precision.hpp` 的 `Precision`/`PrecisionProfile{param/compute/stable/optimizer}`；CPU/GPU f16 路径 = 边界 cast（`ComputeEngine` 基类 NVI 入口，**原 `PrecisionEngine` 装饰器已删除下沉**，见 15 §4.1）+ in-kernel f16 带类型变体 + op-level f16 GEMM（一份 .comp 用 `-DNN_SHADER_F16=1` 编第二份 SPIR-V）；`--f16` = `profile_f16()` = {param:F16, compute:F16, stable:F32, optimizer:F32}，实测峰值显存低于 f32（`docs/development/05` §12.11）。
+- **三值权重（`T1_58` / `BitLinear`，2026-10-10 落地 = P1，分支 `dev/t1_58`）**：`Precision::T1_58` 进枚举（tag 4、`precision_name` = `"t1_58"`、CLI 词法无别名），**与提升序解耦**（`precision_rank()`；`max_precision` 对无序精度 fail-fast）；**P1 里它不是存储精度** —— `precision_bytes = 0`，`create_tensor`/`from_matrix`/`dsl::compute`/`compute_reduce` 一律拒绝它，只作 `param` 槽声明。层侧新增**按槽的能力声明**：`PrecisionSet`（位掩码）/`PrecisionSupport`/`Layer::precision_support()`（默认 `{f16,f32}×四槽` → 既有层零改动）/`Layer::layer_name()`（诊断），校验落在 `Layer::init` NVI 首步 → 不兼容组合**初始化期报错**（层名+槽位+取值+允许集合）；`set_precision_profile` 已 init 即 fail-fast。`BitLinear`（`compute_layer_bitlinear.hpp`）：latent/偏置恒 f32、`wq_`(f16,{-1,0,1}) + `tau_`((out,1) absmean) 每步重算、forward 去量化点积、backward STE；**MLP 工厂**在 `param=T1_58` 时改用 `BitLinear`（其余层拿 param 归一化为 f32 的 profile），`ModelSpec.weight_quant`（KVRecord 追加键，缺键 = None）是加载时的权威。CLI/GUI 只让 `--precision-param` 收 `t1_58`；扫描器在模型 pass 登记 5 条新结构（91 → 96）。验收 `src/t1_58_test.cpp`：能力校验反例/τ·wq 逐位/STE 三项梯度/f16 混合精度/规格往返/端到端（CPU 与 GPU 逐位相同，loss 0.981→0.025）。设计与架构图见 `docs/development/21-quantized-weights.md`；P2 = 行级打包 + `matmul_q`（M7），P1.5 = GPT/RAPT 接线。
 - **线性注意力**：RLA-2 / RAPT（`docs/development/06`）。
 - **BatchNorm（MNIST MLP，2026-10-03 落地 = roadmap P0-3）**：`compute_layer_mlp.hpp` 的 `BatchNorm` 层 + `make_norm_layer` 真分支（不再静默回落 LayerNorm）——训练态用 batch 统计（`row_reduce_sum` 沿 batch）并以 EMA 更新 `running_mean/var`（有偏 1/B 方差口径，B=1 安全；momentum=0.1 = 新 batch 权重），推理态用 running 统计；running 统计经 `extra_state()` 序列化（不进 `parameters()`，优化器不碰）。训练/推理双态经 `Layer::set_training`（默认训练态）+ `Model::set_training` 转发；`forward_recompute` 抑制 EMA 重复更新；**推理态是不同表达式结构**，`scan_exprs` 模型 pass 现在每个模型先训练态 fwd+bwd、再推理态 fwd+bwd（否则 GPU 推理闭合世界硬报错）。验收：`batchnorm_test`（+`--gpu` 变体）覆盖工厂/双态对拍/EMA/gradcheck/推理态 backward/save-load 往返，ctest 21 → 23；scan 结构 84 → 91（库内口径；样例收集器 = 91 + 样例自定义 2 = 93）。兼容注意：**旧的 `norm_type=BatchNorm` 规格模型文件**（当年实际按 LayerNorm 存、无 extra 张量）在新代码加载会在 extra 状态解析处报错——这类文件当年规格与内容不符，属预期失败（已记 `docs/history.md`）。
 - **CNN / ViT 接入归一化 + 各架构默认（NormPlace，2026-10-03）**：归一化拆成两维——**类型** `--norm auto|layernorm|rmsnorm|batchnorm`（已从“MLP 专用”提升为全架构通用：ViT 的 pre-norm 槽位原硬编码 LayerNorm，现改 `make_norm_layer(d_model, norm_type)`）与**挂载位置** `--norm-place auto|none|conv|head|both|final`（`model_spec.hpp` 新增 `NormPlace` + `ModelSpec::norm_place`；序列化新键 `norm_place`，**旧文件缺键 → `None` = 旧参数布局**（缺键**不**回落默认），旧 checkpoint 仍可加载）。**默认 = 该结构最合适的 norm（4 epoch / 1024 样本 A/B 实测后裁定）**：CNN = `BatchNorm@conv`（旧默认无 norm：86.71% → 89.48%）、ViT = `LayerNorm@final`（编码器末端池化前 ln_f：69.00% → 77.50%）、MLP = `LayerNorm`（结构内置）；CLI/GUI 以 `auto` 表达“按架构默认”，非法组合 fail-fast。`spec_matches` 把 `norm_type`/`norm_place` 纳入 MLP/Transformer/CNN 关键维度；`TransformerEncoder{,Layer}` 补 `set_training` + `clear_cache` 两级下传。**影响面**：init-hash 的 cnn/transformer/gpt/rapt 四锚变化（gpt/rapt 为 seed 序号连带位移，mlp 不变，新五锚见上 M2 行），`fused_registry.hpp` hash 与 ctest 计数（23）不变；`scan_exprs` 模型 pass 补 6 例归一化变体（闭合世界）；`gui.py` 归一化两行默认 `auto` + `gui_cli_audit` PASS；默认值有回归锁（`make_cnn_spec`/`make_mnist_transformer_spec` 默认断言、`cnn_smoke_test` 层数断言、缺键兼容断言）。详见 `docs/history.md`「CNN / ViT 接入归一化」。
@@ -325,7 +329,7 @@ optimizer.step();
 - **BPE 保序并行 encode**：`Tokenizer::set_encode_threads`（0=自动/1=顺序/>1=指定）+ `encode_segments_`——按空白安全切分点分段、段内经全局线程池并发编码、**按段下标升序拼接**，任意并行度与顺序执行**逐字节一致**（铁律 #8；切分点必为 chunk 边界、标记不含空白不会被切断）；文本 < 256 KiB 或找不到切分点回退顺序路径。`bpe_merge_impl_` 改 thread_local `BpeMergeScratch` + 手写堆，每 chunk 合并**零堆分配**。逐 doc 保序并行编码 `nn::encode_docs_parallel`（dataset_gen 用，原 `text_train::parallel_tokenize`）收编到 `nn::parallel_for_samples`，`tokenizer_infer` 新增 `--threads`；`encode_docs_parallel` 带可选控制台进度条（构件 `nn::detail::render_progress_bar`，tokenizer 训练共用，按 1% 节流）。实测 8 MiB 多样文本 `encode` 0.93s→0.134s（32 线程，7.0x）；保序性由 `dataset_test` 回归锁定。**训练期合并循环仍不可并行**（链式依赖，见 `docs/development/08` §4.2）。
 - **CPU 性能**：DSL 模板路径向量化/并行、`dsl::compute_into` 零分配原地更新、`Tensor::cpu_get_ptr`、分块 GEMM 内核（BLOCK_SIZE=64）。
 - **统一数据集（19 号设计阶段一~三，2026-10-05/06）**：KVRecord **v2**（`model_keyvalue_record.hpp`：哨兵自举 v1/v2 分派、字段只记 key/类型/文件绝对地址、`Type::Record` 层层嵌套、未知类型按长度跳过、**数据块地址连续性校验 = 整体搬迁硬报错**；模型 spec 头仍 v1 字节零变化）；词表 `.nnvocab`（kvrec v2，tokenizer_train 直写，**旧 JSON 不直读**——`dataset_convert vocab` 迁移；模型按版本分派：v5 及以下读内嵌 JSON、v6 起内嵌 `.nnvocab`，`MODEL_VERSION 5→6`）；数据集 `.nndataset`（文件级 kvrec 嵌套 companion(vocab/source sha256/license/gen)+train/test 子集 + doc 块 arena，`doc_index` 绝对偏移寻址；`loss_scope=all` 不写 mask 段、加载合成全 1）；**`nn::Dataset` 只读类**（`dataset.hpp`，含生成期公共件 `read_text_docs`/`mark_assistant_span`/`encode_docs_parallel`——§4.3.2 三段一致性硬约束逐字迁自 text_train）；CLI：`dataset_gen`（文本+词表 → `.nndataset`，`--test`/`--loss-scope`/`--license`/`--source`）+ `dataset_convert vocab`；`text_train` 位置参数改 `<dataset.nndataset>`、**移除 `--vocab`/`--test-file`/`--loss-scope`/`--no-cache`** 四选项与 txt 直读/tokcache/掩码扫描，词表/掩码/test 子集全随数据集（裁决 #3：窗口化 `--seq-len`/`--stride` 仍留训练入口）。验收：`dataset_test`（§8 逐位一致口径：trim/保序/掩码/flow+doc_ids+mask 对拍旧参考实现）+ `kvrec_test`/`nnvocab_test`；同语料同词表下 dataset_gen 产出 tokens/mask 与旧 tokcache 基线逐位一致（3525 tokens / assistant 604）；字节锚 `gpu_stability_probe --steps 20` 前后逐位一致；GUI/控制器/train_pkg/audit 同批同步（`gui_cli_audit` PASS）。
-- **测试**：ctest 注册 **27** 个测试（**24** 个测试目标 + `cnn_test_gpu` = `cnn_test --gpu` + `batchnorm_test_gpu` = `batchnorm_test --gpu` + `fusion_custom_layer_example` = 下游自定义层形态的 AOT 融合端到端门禁；`-DNN_ENABLE_TESTS=ON`；需 Vulkan 的用例退出码 77 = skip）。其中 `error_macro_test` = **错误处理宏族**（`NN_CHECK` 解值三形态 / 打印格式 / `NN_TRY_MSG` 语境前缀 / 终止与退出码经子进程断言）；`batchnorm_test` = **BatchNorm 双态**回归（工厂不回落 / 训练+推理态 forward 对拍 / running EMA / gradcheck / 推理态 backward / Model::set_training 转发 / save-load 逐位往返）；`kvrec_test` = **KVRecord v1/v2**（哨兵自举/嵌套/未知类型跳过/搬迁地址校验）；`nnvocab_test` = **`.nnvocab` 词表**（json→nnvocab→加载语义一致 + 旧 json 明确拒绝 + 模型内嵌字节直载）；`dataset_test` = **`.nndataset`/`nn::Dataset`**（生成→读取与旧 tokcache 产物逐位一致，§8 口径）；`fused_gpu_test` = **融合 shader 逐形态** GPU 对拍（rope/swiglu/gelu/softmax/matmul/matmul+reduce/norm/reduce_consts/fold v1/fold attn/回退硬报错）——覆盖口径是 **V0（全 f32）**，V1/V2 的覆盖在 `f16_precision_test`（`NN_PREC_TRACE` 实测 20 条 `#x`、4 条 `#a`）。
+- **测试**：ctest 注册 **29** 个测试（**25** 个测试目标 + `cnn_test_gpu` = `cnn_test --gpu` + `batchnorm_test_gpu` = `batchnorm_test --gpu` + `t1_58_test_gpu` = `t1_58_test --gpu` + `fusion_custom_layer_example` = 下游自定义层形态的 AOT 融合端到端门禁；`-DNN_ENABLE_TESTS=ON`；需 Vulkan 的用例退出码 77 = skip；**样例源文件缺失时 `fusion_custom_layer_example` 不注册 → 本机实测 28 项**）。其中 `error_macro_test` = **错误处理宏族**（`NN_CHECK` 解值三形态 / 打印格式 / `NN_TRY_MSG` 语境前缀 / 终止与退出码经子进程断言）；`batchnorm_test` = **BatchNorm 双态**回归（工厂不回落 / 训练+推理态 forward 对拍 / running EMA / gradcheck / 推理态 backward / Model::set_training 转发 / save-load 逐位往返）；`kvrec_test` = **KVRecord v1/v2**（哨兵自举/嵌套/未知类型跳过/搬迁地址校验）；`nnvocab_test` = **`.nnvocab` 词表**（json→nnvocab→加载语义一致 + 旧 json 明确拒绝 + 模型内嵌字节直载）；`dataset_test` = **`.nndataset`/`nn::Dataset`**（生成→读取与旧 tokcache 产物逐位一致，§8 口径）；`t1_58_test` = **三值（T1_58）/BitLinear**（能力校验反例+正例 / init 后 profile 不可变 / τ·wq 逐位规则 / STE 三项梯度 / f16 混合精度 / 规格往返 / CPU 端到端；`--gpu` 变体在同一份代码上跑 GPU）；`fused_gpu_test` = **融合 shader 逐形态** GPU 对拍（rope/swiglu/gelu/softmax/matmul/matmul+reduce/norm/reduce_consts/fold v1/fold attn/回退硬报错）——覆盖口径是 **V0（全 f32）**，V1/V2 的覆盖在 `f16_precision_test`（`NN_PREC_TRACE` 实测 20 条 `#x`、4 条 `#a`）。
 
 ### 融合二期状态与 IR 编码约束（改融合/IR 代码前必读）
 
