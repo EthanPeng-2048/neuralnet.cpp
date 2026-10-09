@@ -360,13 +360,33 @@ void test_error_paths()
         CHECK(!r.has_value(), "F64 被拒");
         CHECK(r.error().message.find("f64") != std::string::npos, "F64 错误含精度名");
     }
+    // T1_58（三值）：P1 里**不是存储精度** → 建张量入口必须拒绝（docs 21 §4.1）
+    {
+        auto r = nn::check_precision_supported(nn::Precision::T1_58);
+        CHECK(!r.has_value(), "T1_58 被拒（非存储精度）");
+        CHECK(r.error().message.find("t1_58") != std::string::npos, "T1_58 错误含精度名");
+        CHECK(r.error().message.find("不是存储精度") != std::string::npos, "T1_58 错误语义");
+    }
+    CHECK(std::string(nn::precision_name(nn::Precision::T1_58)) == "t1_58", "precision_name(T1_58)");
+    CHECK(nn::precision_bytes(nn::Precision::T1_58) == 0, "precision_bytes(T1_58)=0（非存储精度）");
+    // 提升序与枚举值解耦（§4.1 R4）：枚举值只是标签，T1_58 不进提升序
+    CHECK(nn::precision_has_order(nn::Precision::F16), "F16 有提升序");
+    CHECK(nn::precision_has_order(nn::Precision::F32), "F32 有提升序");
+    CHECK(!nn::precision_has_order(nn::Precision::T1_58), "T1_58 **无**提升序（离散化，正交）");
+    CHECK(!nn::precision_has_order(nn::Precision::BF16), "BF16 无提升序（保留）");
+    CHECK(nn::precision_rank(nn::Precision::F16) < nn::precision_rank(nn::Precision::F32), "F16 < F32");
+    CHECK(nn::precision_rank(nn::Precision::T1_58) == -1, "T1_58 rank = -1");
+    CHECK(nn::max_precision(nn::Precision::F16, nn::Precision::F32) == nn::Precision::F32,
+          "max_precision 走 rank 而非枚举值");
     // 序列化 tag 互锁（v5，§11.3）
     CHECK(nn::precision_tag(nn::Precision::F32) == 0, "tag(F32)=0");
     CHECK(nn::precision_tag(nn::Precision::F64) == 1, "tag(F64)=1 (占位)");
     CHECK(nn::precision_tag(nn::Precision::F16) == 2, "tag(F16)=2");
     CHECK(nn::precision_tag(nn::Precision::BF16) == 3, "tag(BF16)=3 (保留)");
+    CHECK(nn::precision_tag(nn::Precision::T1_58) == 4, "tag(T1_58)=4");
     CHECK(nn::precision_from_tag(nn::precision_tag(nn::Precision::F16)) == nn::Precision::F16, "tag 往返 F16");
     CHECK(nn::precision_from_tag(nn::precision_tag(nn::Precision::F32)) == nn::Precision::F32, "tag 往返 F32");
+    CHECK(nn::precision_from_tag(4) == nn::Precision::T1_58, "tag 4 → T1_58");
     // elem / acc
     CHECK((std::is_same_v<nn::elem<nn::Precision::F16>, nn::f16>), "elem<F16> = f16");
     CHECK((std::is_same_v<nn::elem<nn::Precision::F32>, float>), "elem<F32> = float");

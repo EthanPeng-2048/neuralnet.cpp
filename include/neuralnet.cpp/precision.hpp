@@ -2,7 +2,8 @@
 
 // ── precision.hpp — 多精度类型系统（docs/development/05-mixed-precision.md）──────────────
 // L1 语义层（设备无关）：
-//   - Precision 枚举：F16 / F32（BF16 / F64 为保留值，Phase 1 使用 → 清晰报错）
+//   - Precision 枚举：F16 / F32 + T1_58（三值 {-1,0,+1}，1.58 bit/权重；
+//     BF16 / F64 为保留值，使用 → 清晰报错）
 //   - nn::f16：IEEE binary16 值类型（uint16 位布局，与 GPU R16F 内存布局一致，
 //     little-endian → 同精度 CPU↔GPU 传输 = 原始字节拷贝）
 //   - elem<P>：P → 元素类型（f16 / float）
@@ -12,6 +13,14 @@
 //   对 P ≠ F32：P 精度算术 := 以 f32 参考精度计算 + 每个算子输出舍入到 P
 //                （round-half-to-even）；matmul / 归约类算子额外：累加精度 = max(P, f32) = f32
 //   对 P = F32：参考即自身，不舍入
+//
+// **T1_58 是另一种东西（docs/development/21-quantized-weights.md §8）**：它不是"舍入"
+// 而是"离散化"——把权重按统计尺度 γ 投影到 {-1,0,+1}，需要 γ 这个额外元数据，
+// 且只适用于权重（激活保持 f16/f32）。因此：
+//   · T1_58 **不进提升序**（precision_rank 无定义）→ 与 f16/f32 正交；
+//   · P1 里 T1_58 **不是存储精度**（precision_bytes=0、check_precision_supported 拒绝），
+//     只作为 PrecisionProfile 的一句声明 + Layer 能力集合的取值；
+//   · 一切"T1_58 张量"（打包存储）在 P2 由专用存储类型与 matmul_q 原语承载。
 //
 // 该定义使硬件路径与兼容路径**语义等价**（Q4）：硬件 f16 运算的输出本来就
 // 舍入到 f16；tensor core 点积用 f32 累加。差异仅在归约内累加顺序 →
@@ -32,32 +41,51 @@ namespace nn
 {
 
 // ══════════════════════════════════════════════════════════════════════════
-// Precision — 精度枚举（F16 < F32 提升序；BF16 / F64 保留）
+// Precision — 精度枚举（F16 < F32 提升序；T1_58 三值；BF16 / F64 保留）
+//
+// 枚举值只是**标签**，不再隐含"数值越大精度越高"（T1_58=4 比 F64 还大）。
+// 提升序由 precision_rank() 单独表达（§4.1 R4）。
 // ══════════════════════════════════════════════════════════════════════════
 enum class Precision : std::uint8_t
 {
-    F16  = 0,   // IEEE half（binary16），2 字节
-    F32  = 1,   // 参考精度（reference）
-    BF16 = 2,   // 保留（Phase 2；使用 → 清晰报错）
-    F64  = 3,   // 保留（使用 → 清晰报错）
+    F16   = 0,  // IEEE half（binary16），2 字节
+    F32   = 1,  // 参考精度（reference）
+    BF16  = 2,  // 保留（Phase 2；使用 → 清晰报错）
+    F64   = 3,  // 保留（使用 → 清晰报错）
+    T1_58 = 4,  // 三值 {-1,0,+1}（1.58 bit/权重）—— P2 起才有打包存储
 };
 
 // ── 精度工具 ────────────────────────────────────────────────────────────────
 
-// 提升序 F16 < F32：返回两者中更高的精度（§8.1 的精度序）
-[[nodiscard]] constexpr Precision max_precision(Precision a, Precision b) noexcept
+// 提升序（§4.1 R4）：与枚举值**解耦**。F16 < F32 是唯一的合法序；
+// T1_58（离散化，正交）与 BF16/F64（保留）都**没有**提升序。
+[[nodiscard]] constexpr bool precision_has_order(Precision p) noexcept
 {
-    return a > b ? a : b;
+    return p == Precision::F16 || p == Precision::F32;
 }
 
-// 元素字节数（f16=2 / f32=4；保留值返回 0，仅供能力/诊断，不用于存储）
+// 序值：F16 = 0 < F32 = 1；无序的精度返回 -1（调用方须先查 precision_has_order）
+[[nodiscard]] constexpr int precision_rank(Precision p) noexcept
+{
+    switch (p)
+    {
+        case Precision::F16:  return 0;
+        case Precision::F32:  return 1;
+        default:              return -1;
+    }
+}
+
+// 元素字节数（f16=2 / f32=4；保留值与 T1_58 返回 0，仅供能力/诊断，不用于存储）
+// T1_58：P1 的量化缓冲用 f16（{-1,0,1} 在 f16 下精确可表示）；P2 的打包位宽
+// 由打包格式表达（行级 base-3 = log2 3 + 16/K ≈ 1.59~1.71 bpw），**不要**塞进
+// "整数字节/元素"。见 docs/development/21-quantized-weights.md §4.1。
 [[nodiscard]] constexpr std::size_t precision_bytes(Precision p) noexcept
 {
     switch (p)
     {
         case Precision::F16:  return 2;
         case Precision::F32:  return 4;
-        default:              return 0;  // BF16 / F64：Phase 1 未实现
+        default:              return 0;  // BF16 / F64（未实现）/ T1_58（非存储精度）
     }
 }
 
@@ -69,23 +97,46 @@ enum class Precision : std::uint8_t
         case Precision::F32:  return "f32";
         case Precision::BF16: return "bf16";
         case Precision::F64:  return "f64";
+        case Precision::T1_58: return "t1_58";
     }
     return "?";
 }
 
-// Phase 1 支持检查：BF16 / F64 → 清晰 Result 报错"精度未实现"
-// 用于一切"精度作为运行期输入"的入口（张量创建、cast、序列化 tag 回读…）
+// 提升序 F16 < F32：返回两者中更高的精度（§8.1 的精度序）
+// 非"舍入精度"（T1_58 / BF16 / F64）在此 fail-fast —— 它们不参与提升，
+// 静默给出一个序会把"正交维度"错当成"更宽/更窄的容器"。
+[[nodiscard]] inline Precision max_precision(Precision a, Precision b)
+{
+    if (!precision_has_order(a) || !precision_has_order(b))
+    {
+        NN_CHECK(false,
+                 std::string("max_precision: 无提升序的精度（非舍入精度）: ")
+                     + precision_name(a) + " / " + precision_name(b));
+    }
+    return precision_rank(a) >= precision_rank(b) ? a : b;
+}
+
+// Phase 1 支持检查：BF16 / F64 → 清晰 Result 报错"精度未实现"；
+//                     T1_58 → 清晰 Result 报错"不是存储精度"
+// 用于一切"精度作为运行期输入"的入口（张量创建、cast、序列化 tag 回读…）。
+// T1_58 的拒绝是**设计意图**（docs 21 §4.1）：P1 里它只是一句 profile 声明 +
+// 层能力集合取值，绝不能有人拿它去 create_tensor。
 [[nodiscard]] inline Result<void> check_precision_supported(Precision p)
 {
     if (p == Precision::BF16 || p == Precision::F64)
     {
         NN_FAIL(std::string("精度未实现（Phase 1 仅支持 f16 / f32）: ") + precision_name(p));
     }
+    if (p == Precision::T1_58)
+    {
+        NN_FAIL(std::string("t1_58 不是存储精度（P1 口径：仅作为权重精度声明 + "
+                            "BitLinear 能力集合；量化缓冲用 f16。打包存储 P2 落地）"));
+    }
     return {};
 }
 
 // 序列化 tag（v5，§11.3）：沿用 v4 数值，避免 v4 文件被误读：
-//   0=f32、1=f64（占位）、2=f16、3=bf16（保留）
+//   0=f32、1=f64（占位）、2=f16、3=bf16（保留）、4=t1_58（P2 打包权重用）
 [[nodiscard]] constexpr std::uint8_t precision_tag(Precision p) noexcept
 {
     switch (p)
@@ -94,6 +145,7 @@ enum class Precision : std::uint8_t
         case Precision::F64:  return 1;
         case Precision::F16:  return 2;
         case Precision::BF16: return 3;
+        case Precision::T1_58: return 4;
     }
     return 0;
 }
@@ -105,6 +157,8 @@ enum class Precision : std::uint8_t
         case 0: return Precision::F32;
         case 1: return Precision::F64;
         case 2: return Precision::F16;
+        case 3: return Precision::BF16;
+        case 4: return Precision::T1_58;
         default: return Precision::BF16;
     }
 }
