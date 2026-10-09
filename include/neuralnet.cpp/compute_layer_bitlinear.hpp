@@ -137,11 +137,8 @@ public:
             NN_FAIL("bitlinear forward: input shape mismatch");
         if (!checkpoint_mode_)
             input_cache_ = input;
-        if (auto q = quantize_weights_(); !q)
-        {
-            // τ / wq 重算失败：直接上抛（不静默沿用上一步的旧缓冲）
-            return std::unexpected(q.error());
-        }
+        // τ / wq 重算失败：直接上抛（不静默沿用上一步的旧缓冲）
+        NN_TRY(q, quantize_weights_());
         return dsl::compute(engine,
             dsl::matmul(wq_, input, false, false) * dsl::row_broadcast(tau_)
                 + dsl::row_broadcast(b_),

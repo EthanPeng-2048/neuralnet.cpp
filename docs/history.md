@@ -13,7 +13,7 @@
 - [GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）](#GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）)（17 条）
 - [注意力 / ZiPT / Transformer / FeedForward 层](#注意力 / ZiPT / Transformer / FeedForward 层)（16 条）
 - [RAPT / CNN / MLP / Softmax / GPT 层](#RAPT / CNN / MLP / Softmax / GPT 层)（13 条）
-- [引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器](#引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器)（19 条）
+- [引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器](#引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器)（20 条）
 - [代数层 / 基础设施 / 模型容器与序列化](#代数层 / 基础设施 / 模型容器与序列化)（15 条）
 - [领域模型工厂与 CLI 公共头](#领域模型工厂与 CLI 公共头)（3 条）
 - [src 应用入口（text/mnist/tokenizer/bench）](#src 应用入口（text/mnist/tokenizer/bench）)（5 条）
@@ -534,6 +534,13 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 
 
 # 引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器
+
+## 三值（T1_58 / BitLinear）P1 落地（2026-10-10，分支 `dev/t1_58`；原位置 设计文档 `docs/development/21-quantized-weights.md` 的"P1 未实施"状态、`compute_layer_base.hpp` 无能力声明、`compute_optimizer.hpp:344` 用 `p_.param` 建更新量张量）
+- 类型：演进记录 / 设计落地（含 3 处实施期裁定与 1 处缺陷修复）
+- 内容：设计（`21-quantized-weights.md`，2026-10-09 定稿 + 2026-10-10 三项裁定）→ **P1 实施 5 步**：① `Precision::T1_58 = 4` 进枚举并把**提升序从枚举值里拆出**（`precision_rank()`/`precision_has_order()`；`max_precision` 对无序精度 fail-fast）——枚举值从此只是标签；② 层**按槽能力声明**（`PrecisionSet` 位掩码 + `PrecisionSupport` + `Layer::precision_support()` 默认 `{f16,f32}×四槽` + `Layer::layer_name()`），校验落在 `Layer::init` NVI 首步（不兼容 = 初始化期报错：层名+槽位+取值+允许集合），并按 D3(a)/(b) 补 `GPT/RAPT`（含 Block）的 profile 下传、`set_precision_profile` 在已 init 时 fail-fast；③ `BitLinear`（latent/偏置恒 f32、`wq_` f16 三值缓冲 + `tau_` 逐行 absmean 每步重算、forward 去量化点积、backward STE）+ MLP 工厂接线 + `ModelSpec.weight_quant`（KVRecord 追加键，缺键 = None）；④ CLI/GUI 只让 `--precision-param` 收 `t1_58`；⑤ 文档与架构图。
+- **实施期裁定（同设计文档 §0 表 16–21 / §4.9）**：(a) CLI 帮助只把 `t1_58` 挂 param 行，compute/stable/optimizer 收它即**解析期**报错（三值只描述权重）；(b) 扫描器登记从"per-layer dry-run"改到**模型 pass**（一条 `param=T1_58` 的 MLP 用例覆盖 forward/backward/量化三段结构，91 → 96 条结构、130 → 135 变体）；(c) CNN 目前不接精度 profile → 显式提示"本选项未生效"而非改硬报错（后者会改既有 `--f16 --arch cnn` 行为）。
+- **缺陷修复（由 `t1_58_test --gpu` 抓到）**：Adam 的"更新量精度 = `p_.param`"在 `param=T1_58` 时拿**非存储精度**去建张量 —— GPU 在 `check_precision_supported` 硬报错、CPU 静默按 f32 建（两端不一致）。修法 = param 槽不是存储精度时回落到**目标张量自身**的精度；同批把"非存储精度"硬化扩到 `create_tensor`/`from_matrix`/`dsl::compute`/`compute_reduce` 四个入口（P1 保证：没有任何代码能拿 `T1_58` 当存储/输出精度）。
+- **未做（留在后续阶段）**：P2 = 行级打包（`TQ1_0` 编码 + absmean 尺度）+ `matmul_q` + M7 张量 qparam + `layer_bench` A/B（D6 行步长/对齐仍待定）；P1.5 = `Linear` 成员 → `make_linear_layer` + `unique_ptr<Layer>`（GPT/RAPT 三值）；P3 = 激活 int8 + 整数点积。性能预期须先量后承诺（`d_model` 64–256 可能落在 kernel 启动延迟区）。
 
 ## f16 次正规转换守卫的移位 UB（原位置 include/neuralnet.cpp/precision.hpp:197，整改前行号）
 - 类型：bug 根因
@@ -2397,4 +2404,3 @@ A1 段改动前为 2424）、`include/neuralnet.cpp/compute_cpu_engine.hpp` **23
   原「Tokenize: N docs ...」单行提示删除（进度条自身带百分比）。多线程编码本身**未改**——
   `encode_docs_parallel` 的分块并行（`nn::parallel_for_samples` 保序归位）原样保留，输出
   逐字节不变（`dataset_test` 回归锁定）。
-
