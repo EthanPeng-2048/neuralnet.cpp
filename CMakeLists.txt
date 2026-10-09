@@ -877,7 +877,13 @@ if(Vulkan_FOUND)
         # 的那一份 —— 证明"写 dsl::compute + 一行 CMake 即可"。
         # 只在 NN_ENABLE_TESTS 下构建：它的收集器会为 ~85 个库内结构各跑一遍
         # glslc（三份变体），是纯验收成本，不该加到默认构建上。
-        if(NN_ENABLE_TESTS)
+        # ⚠ 存在性守卫：样例源文件在 652c53d「易用性审查」中随 examples/ 目录
+        #    一并删除（roadmap X6 计划以新样例补齐），但上面的样例块仍引用旧路径
+        #    → 「Vulkan 可用 + NN_ENABLE_TESTS=ON」组合会在**配置期**直接失败
+        #    （add_executable: No SOURCES given）。守卫让该组合重新可用；样例源
+        #    文件回来时自动恢复（无需再改这里）。
+        if(NN_ENABLE_TESTS AND EXISTS
+           ${CMAKE_CURRENT_SOURCE_DIR}/examples/fusion_custom_layer_main.cpp)
             nn_add_executable(fusion_custom_layer_example
                 examples/fusion_custom_layer_main.cpp
                 examples/fusion_custom_layer.cpp)
