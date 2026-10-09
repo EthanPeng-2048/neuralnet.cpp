@@ -399,6 +399,9 @@ public:
 // ═══════════════════════════════════════════════════════════════════════════
 class AttentionBase : public Layer
 {
+public:
+    [[nodiscard]] const char* layer_name() const noexcept override { return "Attention"; }
+
 protected:
     std::size_t d_model_;
     std::size_t num_heads_;
@@ -941,6 +944,8 @@ protected:
 class MultiHeadAttention final : public AttentionBase
 {
 public:
+    [[nodiscard]] const char* layer_name() const noexcept override { return "MultiHeadAttention"; }
+
     MultiHeadAttention(std::size_t d_model, std::size_t num_heads,
                        std::size_t seq_len = 0)
         : AttentionBase(d_model, num_heads, seq_len) {}
@@ -971,6 +976,9 @@ public:
 // ══════════════════════════════════════════════════════════════════════════
 class CausalSelfAttention final : public AttentionBase
 {
+public:
+    [[nodiscard]] const char* layer_name() const noexcept override { return "CausalSelfAttention"; }
+
 private:
     bool doc_enabled_ = false;
 

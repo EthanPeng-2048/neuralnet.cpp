@@ -28,6 +28,8 @@ private:
     bool use_swiglu_ = false;
 
 public:
+    [[nodiscard]] const char* layer_name() const noexcept override { return "FeedForward"; }
+
     FeedForward(std::size_t d_model, std::size_t d_ff,
                 ActivationType activation = ActivationType::GeLU)
         : fc1_(d_model,
@@ -137,4 +139,3 @@ public:
 // ══════════════════════════════════════════════════════════════════════════
 
 } // namespace nn
-

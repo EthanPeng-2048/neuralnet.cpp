@@ -62,7 +62,12 @@ NORM_OPTIONS = ["auto", "layernorm", "rmsnorm", "batchnorm"]
 # auto = 按架构默认：CNN = conv, ViT = final（与 mnist_train 默认一致）
 NORM_PLACE_OPTIONS = ["auto", "none", "conv", "head", "both", "final"]
 GPT_NORM_OPTIONS = ["layernorm", "rmsnorm"]  # GPT 仅支持 LayerNorm/RMSNorm
-PRECISION_OPTIONS = ["f32", "f16"]  # 混合精度选项
+# 混合精度选项（compute/stable/optimizer 三槽：只接受数值精度）
+PRECISION_OPTIONS = ["f32", "f16"]
+# param 槽额外接受三值权重（1.58-bit，BitLinear）：
+#   t1_58 = 权重三值化 + STE（docs/development/21-quantized-weights.md）。
+#   P1 只在 MLP 路径生效；其他架构选它会在层能力校验处明确报错（非静默失效）。
+PRECISION_PARAM_OPTIONS = ["f32", "f16", "t1_58"]
 # 模型架构：zipt(AttnZip) 已于 2026-10-01 移除（恢复前提见 docs/history.md / AGENTS §12）
 GPT_MODEL_OPTIONS = ["gpt", "rapt"]
 
@@ -787,7 +792,7 @@ class MnistTrainTab(TabBase):
         self.mp_sep_label = _make_label(p, "── 混合精度 ──", r); r += 1
         self.precision_preset = _make_option_row(p, "精度预设", r,
             ["f32 (默认)", "f16 (master-weights)"], "f32 (默认)"); r += 1
-        self.precision_param = _make_option_row(p, "参数精度 (param)", r, PRECISION_OPTIONS, "f32"); r += 1
+        self.precision_param = _make_option_row(p, "参数精度 (param)", r, PRECISION_PARAM_OPTIONS, "f32"); r += 1
         self.precision_compute = _make_option_row(p, "计算精度 (compute)", r, PRECISION_OPTIONS, "f32"); r += 1
         self.precision_stable = _make_option_row(p, "稳定精度 (stable)", r, PRECISION_OPTIONS, "f32"); r += 1
         self.precision_optimizer = _make_option_row(p, "优化器精度 (optimizer)", r, PRECISION_OPTIONS, "f32"); r += 1
@@ -1401,7 +1406,7 @@ class GptTrainTab(TabBase):
         _make_label(p, "── 混合精度 ──", r); r += 1
         self.precision_preset = _make_option_row(p, "精度预设", r,
             ["f32 (默认)", "f16 (存储)"], "f32 (默认)"); r += 1
-        self.precision_param = _make_option_row(p, "参数精度 (param)", r, PRECISION_OPTIONS, "f32"); r += 1
+        self.precision_param = _make_option_row(p, "参数精度 (param)", r, PRECISION_PARAM_OPTIONS, "f32"); r += 1
         self.precision_compute = _make_option_row(p, "计算精度 (compute)", r, PRECISION_OPTIONS, "f32"); r += 1
         self.precision_stable = _make_option_row(p, "稳定精度 (stable)", r, PRECISION_OPTIONS, "f32"); r += 1
         self.precision_optimizer = _make_option_row(p, "优化器精度 (optimizer)", r, PRECISION_OPTIONS, "f32"); r += 1

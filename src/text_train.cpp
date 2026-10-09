@@ -63,11 +63,24 @@ namespace fs = std::filesystem;
 // 本入口只剩：拼流 → 滑窗 → 训练（窗口化是训练策略，裁决 #3）。
 
 // ── 精度解析辅助 ─────────────────────────────────────────────────────────
-nn::Precision parse_precision(const std::string& name, const char* flag)
+// allow_t1_58：三值（T1_58）只适用于 param 槽（"该层权重是三值"）；本入口的
+// GPT 架构在 P1 **还没有**三值线性层（docs 21 §4.8 P1.5），但词法上照样接受：
+// 不兼容组合由 `Layer::init` 的能力校验给出"层 X 不支持 param=t1_58"的报错，
+// 这正是设计意图（§4.1）—— CLI 不加模型白名单。
+nn::Precision parse_precision(const std::string& name, const char* flag,
+                              bool allow_t1_58 = false)
 {
     if (name == "f16" || name == "half") return nn::Precision::F16;
     if (name == "f32" || name == "float") return nn::Precision::F32;
-    std::cerr << "无效 --" << flag << ": " << name << "，可选: f16, f32\n";
+    if (name == "t1_58")
+    {
+        if (allow_t1_58) return nn::Precision::T1_58;
+        std::cerr << "无效 --" << flag << ": t1_58（三值权重只适用于 --precision-param）"
+                  << "，可选: f16, f32\n";
+        std::exit(1);
+    }
+    std::cerr << "无效 --" << flag << ": " << name << "，可选: "
+              << (allow_t1_58 ? "f16, f32, t1_58" : "f16, f32") << "\n";
     std::exit(1);
 }
 
@@ -132,7 +145,10 @@ void print_usage(const char *prog)
 
     help.section("混合精度 (docs/development/05-mixed-precision.md)");
     help.opt("--f16", "快捷方式: f16 存储 (param/compute=F16，stable/optimizer=F32)");
-    help.opt("--precision-param <f16|f32>", "权重/参数存储精度 (默认: f32)");
+    help.opt("--precision-param <f16|f32|t1_58>",
+             "权重/参数精度 (默认: f32)；t1_58 = 三值权重（1.58-bit）——\n"
+             "P1 只支持 MLP 路径，GPT/RAPT 选它会在层能力校验处明确报错\n"
+             "(docs/development/21-quantized-weights.md §4.8)");
     help.opt("--precision-compute <f16|f32>", "常规算子计算精度 (matmul/逐元素/gather，默认: f32)");
     help.opt("--precision-stable <f16|f32>", "数值敏感算子精度 (softmax/LayerNorm/loss，默认: f32)");
     help.opt("--precision-optimizer <f16|f32>", "优化器状态精度 (Adam m/v，默认: f32)");
@@ -372,7 +388,8 @@ TrainConfig parse_args(int argc, char *argv[])
         }
         else if (arg == "--precision-param" && i + 1 < argc)
         {
-            cfg.precision.param = parse_precision(argv[++i], "precision-param");
+            cfg.precision.param = parse_precision(argv[++i], "precision-param",
+                                                  /*allow_t1_58=*/true);
         }
         else if (arg == "--precision-compute" && i + 1 < argc)
         {

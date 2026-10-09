@@ -41,11 +41,23 @@
 using nn::Scalar;
 
 // ── 精度解析辅助 ─────────────────────────────────────────────────────────
-nn::Precision parse_precision(const std::string& name, const char* flag)
+// allow_t1_58：三值（T1_58）**只适用于 param 槽**（"该层权重是三值"），
+// compute/stable/optimizer 出现它一律在参数解析处拒绝，而不是拖到 init 期才报
+// 能力校验错误（docs/development/21-quantized-weights.md §4.1）。
+nn::Precision parse_precision(const std::string& name, const char* flag,
+                              bool allow_t1_58 = false)
 {
     if (name == "f16" || name == "half") return nn::Precision::F16;
     if (name == "f32" || name == "float") return nn::Precision::F32;
-    std::cerr << "无效 --" << flag << ": " << name << "，可选: f16, f32\n";
+    if (name == "t1_58")
+    {
+        if (allow_t1_58) return nn::Precision::T1_58;
+        std::cerr << "无效 --" << flag << ": t1_58（三值权重只适用于 --precision-param）"
+                  << "，可选: f16, f32\n";
+        std::exit(1);
+    }
+    std::cerr << "无效 --" << flag << ": " << name << "，可选: "
+              << (allow_t1_58 ? "f16, f32, t1_58" : "f16, f32") << "\n";
     std::exit(1);
 }
 
@@ -102,7 +114,9 @@ void print_usage(const char *prog)
 
     help.section("混合精度 (docs/development/05-mixed-precision.md)");
     help.opt("--f16", "快捷方式: master-weights 配方\n(param=f32, compute=f16, stable=f32, optimizer=f32)");
-    help.opt("--precision-param <f16|f32>", "权重/参数存储精度 (默认: f32)");
+    help.opt("--precision-param <f16|f32|t1_58>",
+             "权重/参数精度 (默认: f32)；t1_58 = 三值权重 BitLinear（1.58-bit，"
+             "MLP 路径；docs/development/21-quantized-weights.md）");
     help.opt("--precision-compute <f16|f32>", "常规算子计算精度 (默认: f32)");
     help.opt("--precision-stable <f16|f32>", "数值敏感算子精度 (默认: f32)");
     help.opt("--precision-optimizer <f16|f32>", "优化器状态精度 (默认: f32)");
@@ -382,7 +396,8 @@ TrainConfig parse_args(int argc, char *argv[])
         }
         else if (arg == "--precision-param" && i + 1 < argc)
         {
-            cfg.precision.param = parse_precision(argv[++i], "precision-param");
+            cfg.precision.param = parse_precision(argv[++i], "precision-param",
+                                                  /*allow_t1_58=*/true);
         }
         else if (arg == "--precision-compute" && i + 1 < argc)
         {
@@ -501,6 +516,10 @@ nn::ModelSpec build_spec(const TrainConfig &cfg)
     spec.layer_dims = cfg.layer_dims.empty() ? nn::MNIST_LAYER_DIMS : cfg.layer_dims;
     spec.norm_type = cfg.norm_type.value_or(nn::NormType::LayerNorm);
     spec.norm_place = nn::NormPlace::None;
+    // 三值权重：param=t1_58 → 线性层用 BitLinear（规格是加载时的权威来源，
+    // 缺键 = None 保证旧文件零破坏）。见 docs 21 §4.7。
+    spec.weight_quant = (cfg.precision.param == nn::Precision::T1_58)
+                            ? nn::WeightQuant::T1_58 : nn::WeightQuant::None;
     return spec;
 }
 
@@ -647,7 +666,18 @@ int main(int argc, char *argv[])
     auto raw_engine = std::move(*engine_res);
 
     // ── 多精度：边界 cast 已下沉基类（NVI，原 PrecisionEngine；同 text_train）──
-    if (!nn::is_profile_f32(cfg.precision))
+    // 三值（param=t1_58）与"f16 存储"是两件事：前者 latent 恒 f32、只有量化缓冲
+    // 是 f16，后者才是"所有算子输出按 P 舍入"的边界 cast 路径 → 提示分开打。
+    if (cfg.precision.param == nn::Precision::T1_58 && !spec.is_cnn())
+    {
+        std::cout << "[精度] 三值权重已启用（T1_58 / BitLinear：量化 forward + STE backward，"
+                     "latent 恒 f32）\n"
+                     "  [范围] P1 支持 MLP 路径；docs/development/21-quantized-weights.md\n";
+    }
+    if (cfg.precision.param == nn::Precision::F16 ||
+        cfg.precision.compute == nn::Precision::F16 ||
+        cfg.precision.stable == nn::Precision::F16 ||
+        cfg.precision.optimizer == nn::Precision::F16)
     {
         std::cout << "[精度] f16 存储已启用（基类边界 cast）\n"
                      "  [注意] 边界 cast 的 transient 放大：峰值可能高于 f32，"
@@ -669,6 +699,13 @@ int main(int argc, char *argv[])
     std::cout << "训练集: " << train_x.cols() << " 样本, 测试集: " << test_x.cols() << " 样本\n" << std::endl;
 
     // ── 构建模型（绑定引擎） ─────────────────────────────────
+    // 显式告知而不是静默失效：CNN 构建器目前**不接收**精度 profile
+    //（roadmap P2「RAPT/CNN f16」），所以 CNN + 非 f32 选项实际不生效。
+    if (spec.is_cnn() && !nn::is_profile_f32(cfg.precision))
+    {
+        std::cout << "[精度] 注意：CNN 架构当前不支持精度配置（含三值 T1_58），"
+                     "本选项**未生效**（run at f32）\n";
+    }
     auto model_result = nn::build_mnist_model_from_spec(*engine, spec, cfg.precision);
     NN_EXIT(model_result, 1, "构建模型失败: ");
     auto model = std::move(*model_result);
