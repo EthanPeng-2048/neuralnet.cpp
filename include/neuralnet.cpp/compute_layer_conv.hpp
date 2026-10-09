@@ -113,6 +113,8 @@ private:
     }
 
 public:
+    [[nodiscard]] const char* layer_name() const noexcept override { return "Conv2D"; }
+
     Conv2D(std::size_t in_channels, std::size_t out_channels,
            std::size_t kernel, std::size_t stride = 1, std::size_t padding = 0,
            std::size_t in_h = 0, std::size_t in_w = 0)
@@ -317,6 +319,8 @@ private:
     }
 
 public:
+    [[nodiscard]] const char* layer_name() const noexcept override { return "MaxPool2D"; }
+
     MaxPool2D(std::size_t channels, std::size_t in_h, std::size_t in_w,
               std::size_t pool = 2, std::size_t stride = 0)
         : channels_(channels), in_h_(in_h), in_w_(in_w),
@@ -465,4 +469,3 @@ public:
     }
 };
 } // namespace nn
-

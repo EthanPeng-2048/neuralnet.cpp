@@ -165,6 +165,8 @@ private:
     Tensor input_cache_;
 
 public:
+    [[nodiscard]] const char* layer_name() const noexcept override { return "ReLU"; }
+
     ReLU() = default;
 
     void clear_cache() override { input_cache_ = Tensor{}; }
@@ -219,6 +221,8 @@ private:
     Tensor input_cache_;
 
 public:
+    [[nodiscard]] const char* layer_name() const noexcept override { return "GeLU"; }
+
     GeLU() = default;
 
     void clear_cache() override
@@ -297,6 +301,8 @@ private:
     Tensor input_cache_;  // 前向输入 (2*d_ff, batch)：backward 据此重算 gate/up/s（全融合，不缓存中间张量）
 
 public:
+    [[nodiscard]] const char* layer_name() const noexcept override { return "SwiGLU"; }
+
     SwiGLU() = default;
     explicit SwiGLU(std::size_t d_ff) : d_ff_(d_ff) {}
 
@@ -413,6 +419,8 @@ private:
     static constexpr Scalar EPSILON = 1e-5;
 
 public:
+    [[nodiscard]] const char* layer_name() const noexcept override { return "LayerNorm"; }
+
     explicit LayerNorm(std::size_t normalized_shape, Scalar epsilon = EPSILON)
         : normalized_shape_(normalized_shape), epsilon_(epsilon) {}
 
@@ -631,6 +639,8 @@ private:
     static constexpr Scalar EPSILON = 1e-5;
 
 public:
+    [[nodiscard]] const char* layer_name() const noexcept override { return "RMSNorm"; }
+
     explicit RMSNorm(std::size_t normalized_shape, Scalar epsilon = EPSILON)
         : normalized_shape_(normalized_shape), epsilon_(epsilon) {}
 
@@ -840,6 +850,8 @@ private:
     static constexpr Scalar MOMENTUM = 0.1f;
 
 public:
+    [[nodiscard]] const char* layer_name() const noexcept override { return "BatchNorm"; }
+
     explicit BatchNorm(std::size_t features, Scalar epsilon = EPSILON,
                        Scalar momentum = MOMENTUM)
         : features_(features), epsilon_(epsilon), momentum_(momentum) {}

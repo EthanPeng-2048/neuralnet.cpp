@@ -34,6 +34,8 @@ private:
     Tensor output_cache_;
 
 public:
+    [[nodiscard]] const char* layer_name() const noexcept override { return "Softmax"; }
+
     Softmax() = default;
 
     void clear_cache() override { output_cache_ = Tensor{}; }
@@ -87,4 +89,3 @@ public:
 };
 
 } // namespace nn
-

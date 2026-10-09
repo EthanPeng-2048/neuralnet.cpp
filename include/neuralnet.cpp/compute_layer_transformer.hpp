@@ -124,6 +124,8 @@ private:
     Tensor residual2_cache_;
 
 public:
+    [[nodiscard]] const char* layer_name() const noexcept override { return "TransformerEncoderLayer"; }
+
     TransformerEncoderLayer(std::size_t d_model, std::size_t num_heads,
                             std::size_t d_ff, std::size_t seq_len = 0,
                             NormType norm_type = NormType::LayerNorm)
@@ -266,6 +268,8 @@ private:
     Tensor ones_row_;  // (1, num_patches) 全1，用于 backward 池化梯度广播
 
 public:
+    [[nodiscard]] const char* layer_name() const noexcept override { return "TransformerEncoder"; }
+
     TransformerEncoder(std::size_t d_model, std::size_t num_heads,
                        std::size_t d_ff, std::size_t num_layers,
                        std::size_t num_patches,
@@ -472,6 +476,8 @@ private:
     Tensor input_cache_;
 
 public:
+    [[nodiscard]] const char* layer_name() const noexcept override { return "PatchEmbedding"; }
+
     PatchEmbedding(std::size_t img_size, std::size_t patch_size,
                    std::size_t d_model)
         : img_size_(img_size), patch_size_(patch_size),
@@ -590,4 +596,3 @@ public:
 };
 
 } // namespace nn
-

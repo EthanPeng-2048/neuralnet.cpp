@@ -407,6 +407,114 @@ void test_bitlinear_f16_compute()
     CHECK(bl.latent_weights().precision() == nn::Precision::F32, "latent 恒 f32（STE 落点）");
 }
 
+// ── [8] 规格/序列化往返：weight_quant 决定重建 BitLinear ─────────────────
+// 保存 → peek → 用规格重建 → 加载 → 同一输入的前向逐位一致；且该前向必须等于
+// "三值量化"的宿主参考（这就是"重建出来的是 BitLinear 而非 Linear"的判据）。
+void test_spec_roundtrip()
+{
+    std::puts("[8] ModelSpec.weight_quant 往返（save → peek → 重建 → load → 前向一致）");
+    constexpr std::size_t IN = kIN, OUT = kOUT, B = kB;
+    const std::string file = "t1_58_spec_roundtrip.bin";
+    const nn::Matrix W = known_weight_matrix();
+    const nn::Matrix X = known_input_matrix();
+
+    nn::ModelSpec spec;
+    spec.type         = nn::ModelType::MLP;
+    spec.layer_dims   = {IN, OUT};
+    spec.norm_type    = nn::NormType::LayerNorm;
+    spec.weight_quant = nn::WeightQuant::T1_58;
+
+    nn::PrecisionProfile t1;
+    t1.param = nn::Precision::T1_58;
+
+    nn::Matrix Y_ref;
+    {   // 建模型（from_spec：与 mnist_train 生产路径一致）→ 写已知权重 → 保存
+        nn::CpuEngine eng;
+        auto m = nn::build_mnist_model_from_spec(eng, spec, t1);
+        CHECK(m.has_value(), "from_spec 构建 T1_58 单层模型");
+        if (!m.has_value())
+        {
+            std::printf("    构建失败: %s\n", m.error().message.c_str());
+            return;
+        }
+        CHECK(m->num_layers() == 1, "单层模型（{IN,OUT} → 一个 BitLinear）");
+        auto wr = eng.copy_from(m->parameters()[0].get(), W);
+        CHECK(wr.has_value(), "写入已知 latent 权重");
+
+        auto y = m->forward(upload(eng, X));
+        CHECK(y.has_value(), "forward 成功");
+        if (!y.has_value()) return;
+        Y_ref = download(eng, *y);
+
+        double tau[kOUT] = {0, 0, 0};
+        double wq[kOUT][kIN] = {};
+        ref_quant(tau, wq);
+        double mx = 0.0;
+        for (std::size_t o = 0; o < OUT; ++o)
+            for (std::size_t b = 0; b < B; ++b)
+            {
+                double acc = 0.0;
+                for (std::size_t k = 0; k < IN; ++k)
+                    acc += wq[o][k] * static_cast<double>(kX[k][b]);
+                mx = std::max(mx, std::fabs(static_cast<double>(Y_ref.at(o, b)) - acc * tau[o]));
+            }
+        CHECK(mx < 1e-5, "该层前向 = 三值量化参考 ⇒ 确实是 BitLinear（不是 Linear）");
+
+        auto sr = nn::save_model(file, *m, spec);
+        CHECK(sr.has_value(), "save_model");
+        if (!sr.has_value()) std::printf("    save 失败: %s\n", sr.error().message.c_str());
+    }
+
+    {   // peek：规格必须记住三值（缺键 = None → 旧文件零破坏）
+        auto peeked = nn::peek_model_spec(file);
+        CHECK(peeked.has_value(), "peek_model_spec");
+        if (peeked.has_value())
+        {
+            CHECK(peeked->weight_quant == nn::WeightQuant::T1_58, "规格记住 weight_quant=t1_58");
+            CHECK(peeked->layer_dims == spec.layer_dims, "layer_dims 往返一致");
+            CHECK(nn::spec_matches(*peeked, spec), "spec_matches 含 weight_quant 比对");
+            CHECK(nn::spec_summary(*peeked).find("wq=t1_58") != std::string::npos,
+                  "spec_summary 披露 wq=t1_58");
+        }
+        // 反例：把同一文件加载进"普通 MLP"（weight_quant=None）必须被拒
+        nn::CpuEngine eng;
+        nn::ModelSpec plain = spec;
+        plain.weight_quant = nn::WeightQuant::None;
+        auto plain_model = nn::build_mnist_model_from_spec(eng, plain, nn::profile_f32());
+        CHECK(plain_model.has_value(), "普通 MLP 构建成功");
+        if (plain_model.has_value())
+        {
+            auto lr = nn::load_model(file, *plain_model);
+            CHECK(!lr.has_value(), "三值权重**不能**加载进普通 Linear 模型（架构不匹配）");
+        }
+    }
+
+    {   // 重建 + 加载：同一输入 → 与前向参考一致
+        nn::CpuEngine eng;
+        auto m2 = nn::build_mnist_model_from_spec(eng, spec, t1);
+        CHECK(m2.has_value(), "按规格重建成功");
+        if (!m2.has_value()) return;
+        auto lr = nn::load_model(file, *m2);
+        CHECK(lr.has_value(), "load_model 成功（参数条数/形状一致）");
+        if (!lr.has_value())
+        {
+            std::printf("    load 失败: %s\n", lr.error().message.c_str());
+            return;
+        }
+        auto y2 = m2->forward(upload(eng, X));
+        CHECK(y2.has_value(), "重建模型 forward 成功");
+        if (!y2.has_value()) return;
+        const nn::Matrix Y2 = download(eng, *y2);
+        double mx = 0.0;
+        for (std::size_t o = 0; o < OUT; ++o)
+            for (std::size_t b = 0; b < B; ++b)
+                mx = std::max(mx, std::fabs(static_cast<double>(Y2.at(o, b))
+                                            - static_cast<double>(Y_ref.at(o, b))));
+        CHECK(mx == 0.0, "重建 + 加载后前向与保存前**逐位一致**");
+    }
+    std::remove(file.c_str());
+}
+
 bool test_training(nn::ComputeEngine& eng, const char* dev)
 {
     std::printf("[7] BitLinear MLP 端到端小训练（%s）：loss 收敛\n", dev);
@@ -500,6 +608,7 @@ int main(int argc, char* argv[])
     test_post_init_immutable();
     test_bitlinear_rules();
     test_bitlinear_f16_compute();
+    test_spec_roundtrip();
 
     // ── 端到端训练：--gpu 时用 GPU（无设备/未编译 Vulkan → 退出码 77 = skip）──
     if (gpu)
