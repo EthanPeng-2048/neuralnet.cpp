@@ -1436,6 +1436,16 @@ template <typename E>
                                      std::size_t rows, std::size_t cols,
                                      Precision P)   // 默认实参在 compute_engine.hpp 前置声明处
 {
+    // 非存储精度（BF16/F64 保留值、T1_58 三值声明）不得作为**算子输出**精度：
+    // docs 21 §4.6 规定"T1_58 张量只进量化 GEMM"，其余入口一律走 unsupported
+    // 误差路径。此处显式拦下——GPU 侧本来就会在 create/eval 处报错，CPU 侧若
+    // 不拦会静默按 f32 建张量（两端语义不一致）。
+    if (auto ok = check_precision_supported(P); !ok)
+    {
+        std::fprintf(stderr, "[dsl] compute 拒绝非存储精度: %s\n",
+                     ok.error().message.c_str());
+        return Tensor{};
+    }
 #ifdef NN_EXPR_SCAN
     // 构建期扫描模式：折叠内联表达式的**结构**并登记进全局注册表，
     // 返回占位张量让 dry-run 流程继续（scan 只关心表达式集合，不真算）。
@@ -1600,6 +1610,7 @@ template <typename E>
                                             std::size_t rows, std::size_t cols,
                                             Precision P)   // 默认实参在 compute_engine.hpp 前置声明处
 {
+    NN_TRY(pc, check_precision_supported(P));   // 同 compute()：拒绝非存储精度
 #ifdef NN_EXPR_SCAN
     // 构建期扫描：同 compute()，登记结构（归约轴供下面取占位张量形状）。
     // 占位张量按归约轴取向量形状 (rows,1)/(1,cols)，使 Layer 后续
@@ -1642,4 +1653,3 @@ template <typename E>
 }
 
 } // namespace nn::dsl
-

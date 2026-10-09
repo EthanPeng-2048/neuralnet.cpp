@@ -10,6 +10,7 @@
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <cstddef>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -92,6 +93,14 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
 // 通过指定 ComputeEngine 创建同设备的权重张量；可指定自定义层维度。
 // 结构：Linear → Norm → GeLU × (N-1) + Linear（最后一层）
 // norm_type 决定归一化层：LayerNorm / RMSNorm / BatchNorm。
+//
+// **三值（T1_58）路径**（docs/development/21-quantized-weights.md §4.8）：
+// `precision.param == T1_58` 时线性层换成 `BitLinear`（三值权重 + STE），
+// 其余层（norm / 激活）行为不变。两种 profile 分工：
+//   · BitLinear —— 拿**完整** precision（它的 param 槽只接受 T1_58）；
+//   · 其余层   —— 拿 param 归一化为 f32 的 profile（它们不拥有"三值权重"
+//     这个概念，param 槽对其无意义；不归一化会被能力校验以
+//     "层 ReLU 不支持 param=t1_58" 拦下，属误报）。
 [[nodiscard]] inline Result<Model> build_mnist_mlp_model(
     ComputeEngine& engine,
     const std::vector<std::size_t> &layer_dims = MNIST_LAYER_DIMS,
@@ -100,13 +109,24 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
 {
     if (layer_dims.size() < 2)
         NN_FAIL("MLP layer_dims must have at least 2 elements");
+    const bool ternary = (precision.param == Precision::T1_58);
+    PrecisionProfile plain = precision;
+    if (ternary) plain.param = Precision::F32;
+
     Model model(engine);
-    model.set_default_precision_profile(precision);   // 须在 add 之前：权重按精度创建
+    model.set_default_precision_profile(plain);   // 须在 add 之前：权重按精度创建
     for (std::size_t i = 0; i < layer_dims.size() - 1; ++i)
     {
         std::size_t in_dim  = layer_dims[i];
         std::size_t out_dim = layer_dims[i + 1];
 
+        if (ternary)
+        {
+            // BitLinear 需要 param=T1_58 → 显式注入完整 precision（跳过 default）
+            auto r = model.add_layer(std::make_unique<BitLinear>(in_dim, out_dim), precision);
+            NN_TRY_CHECK(r);
+        }
+        else
         {
             auto r = model.add<Linear>(in_dim, out_dim);
             NN_TRY_CHECK(r);
@@ -210,6 +230,17 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
     ComputeEngine& engine, const ModelSpec &spec,
     PrecisionProfile precision = PrecisionProfile{})
 {
+    // ── 三值（T1_58）权重由**规格**决定（不是 CLI 参数）───────────────
+    // 保存过的三值模型必须还原成 BitLinear（参数形状相同、语义不同）：
+    // 规格是权威来源，CLI 的 precision.param 会被它覆盖。
+    if (spec.weight_quant == WeightQuant::T1_58)
+    {
+        if (!spec.is_mlp())
+            NN_FAIL("weight_quant=t1_58 目前只支持 MLP 架构（P1 范围；"
+                    "GPT/RAPT 的三值线性层见 docs/development/21-quantized-weights.md §4.8 P1.5）");
+        precision.param = Precision::T1_58;
+    }
+
     if (spec.is_mlp())
     {
         auto model = build_mnist_mlp_model(engine, spec.layer_dims, spec.norm_type,
@@ -243,4 +274,3 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
 }
 
 } // namespace nn
-

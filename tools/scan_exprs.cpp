@@ -509,6 +509,22 @@ int main(int argc, char* argv[])
                                 engine, nn::MNIST_LAYER_DIMS, nrm, prof); },
                       scan_tensor(nn::MNIST_LAYER_DIMS.front(), B));
         }
+        // ── 1b) 三值（T1_58）MLP：BitLinear 的量化 / 去量化 / STE 三段结构 ──
+        //   BitLinear 的表达式（τ 的 absmean 归约、wq 的阈值 select、
+        //   matmul×row_broadcast(τ) 尾链、dW∘τ 的原地累加）不在任何其它层里
+        //   出现 → **只由这一条用例产出**；漏掉就是 GPU 闭合世界硬报错
+        //   （AGENTS §7：dry-run/模型 pass 是结构的主要来源）。
+        //   结构不依赖精度（prof 只决定占位张量精度）→ 与其它用例同处一跑。
+        //   见 docs/development/21-quantized-weights.md §7 第 4 项。
+        {
+            nn::PrecisionProfile t1 = prof;
+            t1.param = nn::Precision::T1_58;
+            try_build("mnist_mlp_t1_58",
+                      [&] { return nn::build_mnist_mlp_model(
+                                engine, nn::MNIST_LAYER_DIMS,
+                                nn::NormType::LayerNorm, t1); },
+                      scan_tensor(nn::MNIST_LAYER_DIMS.front(), B));
+        }
         // ── 2) MNIST Transformer（ViT 风格；输入 img²）──
         try_build("mnist_transformer",
                   [&] { return nn::build_mnist_transformer_model(

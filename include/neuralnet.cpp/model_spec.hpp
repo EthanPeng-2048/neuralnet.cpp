@@ -79,6 +79,25 @@ enum class NormPlace : uint32_t
     }
 }
 
+// ── 权重三值量化（docs/development/21-quantized-weights.md §4.7）──────────
+// 描述"这个模型的线性层是不是 BitLinear（三值权重 1.58-bit + STE）"。
+//   None  = 普通 Linear（f32/f16 权重）
+//   T1_58 = BitLinear（param=T1_58；latent 仍 f32，量化缓冲是派生物、不落盘）
+//
+// **缺键 → None**：旧模型文件（没有 weight_quant 键）读回 None，
+// 参数条数/顺序不变 → 无需升 MODEL_VERSION，与 norm_place 的缺键处理同款。
+enum class WeightQuant : uint32_t
+{
+    None  = 0,
+    T1_58 = 1,
+};
+
+// WeightQuant → CLI/日志/序列化用短名（唯一命名口径；与 Precision::T1_58 同词法）
+[[nodiscard]] inline const char* weight_quant_name(WeightQuant q) noexcept
+{
+    return q == WeightQuant::T1_58 ? "t1_58" : "none";
+}
+
 // ── 模型类型枚举 ─────────────────────────────────────────────────────────
 enum class ModelType : uint32_t
 {
@@ -118,6 +137,10 @@ struct ModelSpec
     ActivationType activation = ActivationType::GeLU;         // FFN 激活类型
     NormType norm_type = NormType::LayerNorm;                 // 归一化层类型
     NormPlace norm_place = NormPlace::None;                   // 归一化挂载位置（CNN/ViT）
+
+    // ── 线性层权重是否三值（T1_58；P1 覆盖 MLP 路径）──
+    // 缺键 → None（旧文件零破坏）。见 WeightQuant 注释与 docs 21 §4.7。
+    WeightQuant weight_quant = WeightQuant::None;
 
     // ── CNN ──
     std::size_t cnn_in_channels = 0;         // 输入通道数（MNIST=1）
@@ -161,7 +184,8 @@ struct ModelSpec
                a.num_layers   == b.num_layers &&
                a.pos_encoding == b.pos_encoding &&
                a.activation   == b.activation &&
-               a.norm_type    == b.norm_type;
+               a.norm_type    == b.norm_type &&
+               a.weight_quant == b.weight_quant;
     }
 
     // RAPT：ReLU-Linear Attention（causal LM），共享 GPT 类似字段
@@ -175,7 +199,8 @@ struct ModelSpec
                a.num_layers   == b.num_layers &&
                a.pos_encoding == b.pos_encoding &&
                a.activation   == b.activation &&
-               a.norm_type    == b.norm_type;
+               a.norm_type    == b.norm_type &&
+               a.weight_quant == b.weight_quant;
     }
 
     if (a.type != b.type)
@@ -186,8 +211,11 @@ struct ModelSpec
     case ModelType::MLP:
         // norm_type 影响参数个数（RMSNorm 无 beta、BatchNorm 另有 running 状态）
         // → 属关键维度，加载错配必须给出明确错误而非矩阵形状错位
+        // weight_quant 同理：参数**形状**相同（latent 恒 f32），但层语义不同
+        //（Linear vs BitLinear）→ 不比对就等于允许"把三值模型权重加载进普通 MLP"。
         return a.layer_dims == b.layer_dims &&
-               a.norm_type  == b.norm_type;
+               a.norm_type  == b.norm_type &&
+               a.weight_quant == b.weight_quant;
     case ModelType::Transformer:
         return a.d_model    == b.d_model &&
                a.num_heads  == b.num_heads &&
@@ -195,7 +223,8 @@ struct ModelSpec
                a.num_layers == b.num_layers &&
                a.patch_size == b.patch_size &&
                a.norm_type  == b.norm_type &&
-               a.norm_place == b.norm_place;
+               a.norm_place == b.norm_place &&
+               a.weight_quant == b.weight_quant;
     case ModelType::CNN:
         return a.cnn_in_channels == b.cnn_in_channels &&
                a.cnn_in_size     == b.cnn_in_size &&
@@ -206,7 +235,8 @@ struct ModelSpec
                a.cnn_paddings    == b.cnn_paddings &&
                a.layer_dims      == b.layer_dims &&
                a.norm_type       == b.norm_type &&
-               a.norm_place      == b.norm_place;
+               a.norm_place      == b.norm_place &&
+               a.weight_quant    == b.weight_quant;
     default:
         return false;
     }
@@ -261,8 +291,12 @@ struct ModelSpec
         }
         return std::string(type_name(s.type)) + "(" + c + ")";
     }
-    return std::string(type_name(s.type)) + "(layers=" + std::to_string(s.num_layers) + ")";
+    std::string out = std::string(type_name(s.type)) + "(layers="
+                    + std::to_string(s.num_layers);
+    // 三值权重是**架构级**差异（层类型 Linear → BitLinear），摘要必须显式披露
+    if (s.weight_quant != WeightQuant::None)
+        out += ",wq=" + std::string(weight_quant_name(s.weight_quant));
+    return out + ")";
 }
 
 } // namespace nn
-

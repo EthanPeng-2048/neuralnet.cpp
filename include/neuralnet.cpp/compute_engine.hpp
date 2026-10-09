@@ -297,6 +297,16 @@ public:
     // 每个 override 各自漏 stamp。to_matrix 输出 Matrix（宿主），不参与 stamp。
     [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols, Precision P = Precision::F32)
     {
+        // 非"存储精度"（BF16/F64 保留值、T1_58 三值声明）**拒绝建张量**：
+        // 这是 docs 21 §4.1 的落地保证——P1 里 T1_58 只是层的精度声明，
+        // 绝不能有代码拿它当存储标签。契约沿用"失败返回空 Tensor（调用方查
+        // valid()）"，但同时把原因打到 stderr（静默空张量极难定位）。
+        if (auto ok = check_precision_supported(P); !ok)
+        {
+            std::fprintf(stderr, "[engine] create_tensor 拒绝非存储精度: %s\n",
+                         ok.error().message.c_str());
+            return Tensor{};
+        }
         return stamp_(create_tensor_impl(rows, cols, P));
     }
     // ── 声明式创建/初始化（M2，17 §4.3/§4.4）────────────────────────────
@@ -308,6 +318,12 @@ public:
     [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols, Precision P,
                                        const InitSpec& spec)
     {
+        if (auto ok = check_precision_supported(P); !ok)
+        {
+            std::fprintf(stderr, "[engine] create_tensor 拒绝非存储精度: %s\n",
+                         ok.error().message.c_str());
+            return Tensor{};
+        }
         switch (spec.kind)
         {
         case InitSpec::Kind::Uninitialized:
@@ -334,6 +350,8 @@ public:
     }
     [[nodiscard]] Result<Tensor> from_matrix(const Matrix& m, Precision P = Precision::F32)
     {
+        // 同上：非存储精度不得作为张量的存储标签（返回 Result，故直接上抛原因）
+        NN_TRY(pc, check_precision_supported(P));
         return stamp_(from_matrix_impl(m, P));
     }
     [[nodiscard]] virtual Result<Matrix> to_matrix(const Tensor& t, Precision P = Precision::F32) = 0;
