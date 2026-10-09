@@ -845,12 +845,23 @@ public:
           norm2_(make_norm_layer(d_model, norm_type)),
           ff_(d_model, d_ff, activation)
     {
-        // D7：将精度配置注入所有子层（§9.2）
+        // D7：将精度配置注入所有子层（§9.2）—— override 内已逐子层下传
         set_precision_profile(precision);
-        if (norm1_) norm1_->set_precision_profile(precision);
-        attn_.set_precision_profile(precision);
-        if (norm2_) norm2_->set_precision_profile(precision);
-        ff_.set_precision_profile(precision);
+    }
+
+    [[nodiscard]] const char* layer_name() const noexcept override { return "RAPTBlock"; }
+
+    // ── D3(a)：块内下传 ──────────────────────────────────────────────────
+    // 注意：`attn_`（ReLULinearAttention）内部还持有 4 个 Linear，但它自身没有
+    // set_precision_profile override → 内层 Linears 仍按各自默认（f32）建立。
+    // 这是**既有状态**（roadmap P2「RAPT/CNN f16」未落地），本步不改动它。
+    void set_precision_profile(const PrecisionProfile& profile) override
+    {
+        Layer::set_precision_profile(profile);
+        if (norm1_) norm1_->set_precision_profile(profile);
+        attn_.set_precision_profile(profile);
+        if (norm2_) norm2_->set_precision_profile(profile);
+        ff_.set_precision_profile(profile);
     }
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
@@ -1063,6 +1074,18 @@ public:
                                  activation, norm_type, causal, precision);
         }
         pos_encoder_->set_precision_profile(precision);
+    }
+
+    [[nodiscard]] const char* layer_name() const noexcept override { return "RAPTModel"; }
+
+    // ── D3(a)：精度配置注入 —— 递归下传到全部子层（§4.3.1/§4.3.2）────────
+    void set_precision_profile(const PrecisionProfile& profile) override
+    {
+        Layer::set_precision_profile(profile);
+        if (ln_f_) ln_f_->set_precision_profile(profile);
+        lm_head_.set_precision_profile(profile);
+        for (auto& b : blocks_) b.set_precision_profile(profile);
+        if (pos_encoder_) pos_encoder_->set_precision_profile(profile);
     }
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override

@@ -674,8 +674,11 @@ int main(int argc, char *argv[])
     auto model = std::move(*model_result);
     model.set_training(true);  // 训练模式：BatchNorm 使用 batch 统计量并更新 running 统计
 
-    // ── 注入精度配置 ──
-    model.set_precision_profile(cfg.precision);
+    // ── 精度配置 ──
+    // 不在这里再注入：`build_mnist_model_from_spec` 已在 add 之前用
+    // `Model::set_default_precision_profile` 注入（权重按精度创建），这里的
+    // 二次调用对 MLP 是冗余的；而按 D3(b)，profile 在 init 后**不可变**
+    //（再注入即 fail-fast）。见 docs/development/21-quantized-weights.md §4.3.2。
     {
         const auto& pp = cfg.precision;
         if (pp.param != nn::Precision::F32 || pp.compute != nn::Precision::F32 ||

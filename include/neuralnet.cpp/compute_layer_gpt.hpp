@@ -50,12 +50,22 @@ public:
           ff_(d_model, d_ff, activation),
           norm2_(make_norm_layer(d_model, norm_type))
     {
-        // D7：将精度配置注入所有子层（§9.2）
+        // D7：将精度配置注入所有子层（§9.2）—— override 内已逐子层下传
         set_precision_profile(precision);
-        self_attn_.set_precision_profile(precision);
-        if (norm1_) norm1_->set_precision_profile(precision);
-        ff_.set_precision_profile(precision);
-        if (norm2_) norm2_->set_precision_profile(precision);
+    }
+
+    [[nodiscard]] const char* layer_name() const noexcept override { return "GPTBlock"; }
+
+    // ── D3(a)：块内下传（构造器已注入；这里补"构造之后再设定"的语义）────────
+    // 没有这条 override，`GPTModel::set_precision_profile` 只能打到块自身，
+    // 块内 6 个叶子层（Q/K/V/O + fc1/fc2 + 2 个 norm）仍是旧 profile。
+    void set_precision_profile(const PrecisionProfile& profile) override
+    {
+        Layer::set_precision_profile(profile);
+        self_attn_.set_precision_profile(profile);
+        if (norm1_) norm1_->set_precision_profile(profile);
+        ff_.set_precision_profile(profile);
+        if (norm2_) norm2_->set_precision_profile(profile);
     }
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
@@ -311,6 +321,26 @@ public:
         // 位置编码器是辅助对象（非 Layer）→ profile 需单独下传：
         // 否则其内部 DSL 求值（gather→transpose→加性融合）退回 F32。
         pos_encoder_->set_precision_profile(precision);
+    }
+
+    [[nodiscard]] const char* layer_name() const noexcept override { return "GPTModel"; }
+
+    // ── D3(a)：精度配置注入 —— 递归下传到全部子层（§4.3.1/§4.3.2）────────
+    // 现状：GPTModel **没有** set_precision_profile override，只在构造器里向下传，
+    // 因此"构造之后"经 Model::set_precision_profile 注入的 profile 只打到复合层
+    // 自己（子层拿不到）→ init 期校验会被旁路。补齐后树内两条复合路径语义一致。
+    // head_prof 的 compute=stable 特例必须与构造器保持一致（见构造器注释）。
+    void set_precision_profile(const PrecisionProfile& profile) override
+    {
+        Layer::set_precision_profile(profile);
+        if (ln_f_) ln_f_->set_precision_profile(profile);
+        {
+            PrecisionProfile head_prof = profile;
+            head_prof.compute = profile.stable;
+            lm_head_.set_precision_profile(head_prof);
+        }
+        for (auto& b : blocks_) b.set_precision_profile(profile);
+        if (pos_encoder_) pos_encoder_->set_precision_profile(profile);
     }
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
@@ -720,4 +750,3 @@ public:
     }
 };
 } // namespace nn
-

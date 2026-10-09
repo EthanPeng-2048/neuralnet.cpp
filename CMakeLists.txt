@@ -411,6 +411,10 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(f16_precision_test src/f16_precision_test.cpp)
     list(APPEND NN_TEST_TARGETS f16_precision_test)
 
+    # ── 三值（T1_58）精度 + BitLinear（层能力校验 / 量化规则 / STE / 端到端）──
+    nn_add_executable(t1_58_test src/t1_58_test.cpp)
+    list(APPEND NN_TEST_TARGETS t1_58_test)
+
     # ── 分词器正确性（BPE pre_tokenize 对拍 + 标记往返）─────────────────
     nn_add_executable(tokenizer_test src/tokenizer_test.cpp)
     list(APPEND NN_TEST_TARGETS tokenizer_test)
