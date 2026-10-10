@@ -593,7 +593,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 
 ### 12.8 剩余开销归因（当前结论）
 
-**归因手段（当前工具）**：`mem_probe` 逐阶段探针（transient live / pending / 池分桶）+ `ComputeEngine` 基类入口的**形状级 cast 归因**（`NN_PREC_TRACE=1` → `note_temp_()` 记录每次"物化临时量"的 `(rows, cols, 方向)` → 次数/字节，`dump_temp_stats()` 在 mem_probe 末尾按字节降序打印）。
+**归因手段（当前工具）**：`mem_probe` 逐阶段探针（transient live / pending / 池分桶）+ `ComputeEngine` 基类入口的**形状级 cast 归因**（`NN_PREC_TRACE=1` → `note_temp_()` 记录每次"物化临时量"的 `(rows, cols, 方向)` → 次数/字节，`dump_temp_stats()` 在 mem_probe 末尾按字节降序打印）。⚠ 两者都属**探针**：需 `-DNN_ENABLE_PROBES=ON` 配置构建（默认构建里 `mem_probe` 目标不创建、`note_temp_` 为空实现，见 AGENTS §2）。
 
 **结论（当前有效）**：
 

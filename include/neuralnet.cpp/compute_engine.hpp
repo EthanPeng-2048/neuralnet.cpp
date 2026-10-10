@@ -1860,9 +1860,15 @@ private:
     // dump_temp_stats()。
     // line = source_location 行号（区分同一形状来自哪个算子路径——只有形状
     // 时 matmul/unary_/eval_expr 的 cast 无法分辨）。
+    // 探针门：NN_PROBES_ENABLED=0（默认）时 note_temp_ 是空实现、
+    // prec_env_flag 恒 false —— 逐算子归因与变体日志**整块不编译进二进制**。
     static void note_temp_(std::size_t rows, std::size_t cols, bool to_f32,
                            std::uint32_t line = 0)
     {
+#if !NN_PROBES_ENABLED
+        (void)rows; (void)cols; (void)to_f32; (void)line;
+        return;
+#else
         if (!prec_trace_enabled_())
             return;
         const std::size_t bytes = rows * cols * (to_f32 ? 4u : 2u);
@@ -1874,10 +1880,14 @@ private:
                 return;
             }
         temp_stats().push_back(TempStat{rows, cols, to_f32, 1, bytes, line});
+#endif
     }
 
     [[nodiscard]] static bool prec_trace_enabled_()
     {
+#if !NN_PROBES_ENABLED
+        return false;
+#else
         static const bool on = [] {
 #if defined(_MSC_VER)
             char* buf = nullptr; std::size_t len = 0;
@@ -1891,12 +1901,18 @@ private:
 #endif
         }();
         return on;
+#endif
     }
 
     // 通用环境变量开关（原 nn::dsl::env_flag 同语义：每次 getenv、零缓存；
     // compute_engine.hpp 不能反向依赖 expr_dsl.hpp，故保留同款实现）。
+    // 探针门：默认构建恒 false（不求值 getenv），"NN_F16_DEBUG" 等诊断开关失效。
     [[nodiscard]] static bool prec_env_flag(const char* name)
     {
+#if !NN_PROBES_ENABLED
+        (void)name;
+        return false;
+#else
 #if defined(_MSC_VER)
         char* buf = nullptr; std::size_t len = 0;
         _dupenv_s(&buf, &len, name);
@@ -1906,6 +1922,7 @@ private:
 #else
         const char* v = std::getenv(name);
         return v != nullptr && v[0] != '\0' && v[0] != '0';
+#endif
 #endif
     }
 

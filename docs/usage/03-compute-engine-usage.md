@@ -1575,19 +1575,28 @@ public:
 | `create_offload_buffer` / `offload_save` / `offload_restore` | 激活 offload（GPU 特性） |
 | `submit_scalar_readback` / `poll_scalar_readback` / `scalar_readback_slots` | 异步标量回读 |
 | `supports_native_data_move` / `supports_native_f16_reduce` / `supports_expr_precision_variant` | 精度原生路径能力查询 |
-| `temp_stats()` / `dump_temp_stats()` / `reset_temp_stats()` | 边界 cast 临时量归因（需 `NN_PREC_TRACE=1`） |
+| `temp_stats()` / `dump_temp_stats()` / `reset_temp_stats()` | 边界 cast 临时量归因（需**探针构建** + `NN_PREC_TRACE=1`） |
 | `nn::detail::upload_span` / `download_span` / `download_vector` | L2 宿主桥 |
 
 ---
 
 ## 20. 诊断与环境变量
 
+> **探针构建前提（2026-10-10）**：下表里的 `NN_PREC_TRACE` / `NN_F16_DEBUG` /
+> `NN_MEM_STATS`（以及训练入口的 `NN_NAN_TRACE`）都是**探针**，只在
+> `-DNN_ENABLE_PROBES=ON` 配置的构建里存在——默认构建（不传该选项）连这些代码
+> 都不参与编译，环境变量设了也一律无效（避免"设了环境变量就悄悄拖慢正常
+> 训练/推理"）。探针可执行目标 `mem_probe` / `f16_cpu_probe` /
+> `gpu_stability_probe` 同样只在 `NN_ENABLE_PROBES=ON` 时创建。
+> 例外：`NN_BIND_DEBUG`、`NN_VULKAN_*`、`NN_POOL_*` 是**初始化期读一次**的
+> 行为开关，任何构建都有效（零热路径开销）。
+
 | 环境变量 | 作用 |
 |---|---|
 | `NN_BIND_DEBUG=1` | 未绑定输入进引擎也报错（抓库内 stamp 漏网）；错误同步打 stderr，带 `file:line` 与形状。**建议作为门禁运行 `NN_BIND_DEBUG=1 ctest`** |
-| `NN_PREC_TRACE=1` | 打印每个 `(结构 key, 精度签名)`；`[prec][alu-hit]` = 命中**变体**（`key#x` 运行期精度分派 **或** `key#a` native16，key 本身即区分）；`[prec][fallback]` = 该结构没有可用的 `#x`（回退基类边界 cast）；`[into] branch=…` 打印 `eval_expr_into` 的分支。**`[prec][miss]` 保留为通用诊断**（V1 覆盖后 f16 融合路径实测 `miss=0`）；"回填清单"工作流（`tools/prec_backfill.txt`）已随"运行期精度分派"删除。日志只由真正 dispatch 的入口、且在确认命中后打——`supports_expr_precision_variant` 是查询，不产生命中日志 |
-| `NN_F16_DEBUG=1` | f16 中间量数值扫描（`nn_dbg_scan`）、`accumulate` 巨值打印、`compute_into` 预绑定失败原因 |
-| `NN_MEM_STATS=1` | 训练中内存采样（配合 `pool_stats()`） |
+| `NN_PREC_TRACE=1`（**需探针构建**） | 打印每个 `(结构 key, 精度签名)`；`[prec][alu-hit]` = 命中**变体**（`key#x` 运行期精度分派 **或** `key#a` native16，key 本身即区分）；`[prec][fallback]` = 该结构没有可用的 `#x`（回退基类边界 cast）；`[into] branch=…` 打印 `eval_expr_into` 的分支。**`[prec][miss]` 保留为通用诊断**（V1 覆盖后 f16 融合路径实测 `miss=0`）；"回填清单"工作流（`tools/prec_backfill.txt`）已随"运行期精度分派"删除。日志只由真正 dispatch 的入口、且在确认命中后打——`supports_expr_precision_variant` 是查询，不产生命中日志 |
+| `NN_F16_DEBUG=1`（**需探针构建**） | f16 中间量数值扫描（`nn_dbg_scan`）、`accumulate` 巨值打印、`compute_into` 预绑定失败原因 |
+| `NN_MEM_STATS=1`（**需探针构建**） | 训练中内存采样（配合 `pool_stats()`） |
 | `NN_VULKAN_DEVICE` | 强制指定 Vulkan 计算设备（索引 `"2"` 或名称子串 `"NVIDIA"`）。优先级：显式 API > 本变量 > 自动打分 |
 
 **临时量归因**：
@@ -1598,6 +1607,7 @@ nn::ComputeEngine::reset_temp_stats();
 if (nn::dsl::env_flag("NN_PREC_TRACE"))
     std::fprintf(stderr, "%s", nn::ComputeEngine::dump_temp_stats().c_str());
 // 输出：按字节降序的 (rows, cols) × 次数 + 调用点行号，用来定位"哪个算子在 cast"
+// ⚠ 需 -DNN_ENABLE_PROBES=ON 构建：默认构建里 env_flag 恒 false、note_temp_ 空实现
 ```
 
 ---

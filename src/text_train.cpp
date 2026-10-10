@@ -51,6 +51,165 @@
 #include <future>
 #include <optional>
 
+// ══ 非有限值追踪探针（NN_NAN_TRACE=1；探针门见 core_config.hpp）═══════════
+// 探针门：默认构建（未 -DNN_ENABLE_PROBES=ON）里**整块不编译**——训练循环里
+// 连判定分支都不存在（调用点同样被 #if 包住），环境变量 NN_NAN_TRACE 无效。
+#if NN_PROBES_ENABLED
+// 逐步扫描"参数 + 参数梯度"里的 NaN/Inf，命中第一个即打印
+//（张量序号/形状/非有限元素数/最大有限值）并让训练立即停止。
+// 用途：定位"训着训着 loss 变 nan"这类只在特定设备/数据顺序下复现的缺陷——
+// 打印的序号即该步参数/梯度数组的下标，可与参数张量顺序对照定位到层。
+inline bool nn_nan_trace_on()
+{
+    // MSVC CRT 弃用 getenv（-Werror 下必须走 _dupenv_s），与 NN_MEM_STATS 同款。
+    static const bool on = [] {
+#if defined(_MSC_VER)
+        char* buf = nullptr;
+        std::size_t len = 0;
+        _dupenv_s(&buf, &len, "NN_NAN_TRACE");
+        const bool v = (buf != nullptr && buf[0] != '\0');
+        std::free(buf);
+        return v;
+#else
+        const char* v = std::getenv("NN_NAN_TRACE");
+        return v != nullptr && v[0] != '\0';
+#endif
+    }();
+    return on;
+}
+
+// 最近一步喂进模型的 doc_ids（仅 NN_NAN_TRACE 时维护；命中时打印首样本的
+// 文档 id 序列与"每行可见列数"统计——文档感知掩码类缺陷靠它定位）。
+inline std::vector<std::size_t>& nn_nan_trace_doc_ids()
+{
+    static std::vector<std::size_t> ids;
+    return ids;
+}
+
+// 最近一步喂进模型的 token id（同上，仅 NN_NAN_TRACE 时维护；用于把
+// "embedding 梯度的非有限行"映射回 batch 内的 (t, b) 位置）。
+inline std::vector<std::size_t>& nn_nan_trace_tokens()
+{
+    static std::vector<std::size_t> toks;
+    return toks;
+}
+
+inline bool nn_nan_trace_step(nn::ComputeEngine& engine, nn::Model& model,
+                              std::size_t step, std::size_t seq_len)
+{
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        const char* what = (pass == 0) ? "param" : "grad";
+        std::vector<nn::TensorRef> refs = (pass == 0) ? model.parameters()
+                                                      : model.param_gradients();
+        std::size_t idx = 0;
+        for (auto& ref : refs)
+        {
+            auto m_r = engine.to_matrix(ref.get());
+            if (!m_r)
+            {
+                ++idx;
+                continue;
+            }
+            const nn::Matrix& m = *m_r;
+            std::size_t bad = 0;
+            double amax = 0.0;
+            std::vector<std::size_t> bad_rows;   // 行级定位（只看前若干行）
+            for (std::size_t r = 0; r < m.rows(); ++r)
+            {
+                bool row_bad = false;
+                for (std::size_t c = 0; c < m.cols(); ++c)
+                {
+                    const float v = m.at(r, c);
+                    if (std::isnan(v) || std::isinf(v))
+                    {
+                        ++bad;
+                        row_bad = true;
+                    }
+                    else
+                        amax = std::max(amax, std::fabs(static_cast<double>(v)));
+                }
+                if (row_bad && bad_rows.size() < 32) bad_rows.push_back(r);
+            }
+            if (bad != 0)
+            {
+                std::printf("[NAN-TRACE] step %zu: %s[%zu] %zux%zu 非有限 %zu/%zu，"
+                            "max|有限|=%.4g\n",
+                            step, what, idx, m.rows(), m.cols(), bad,
+                            m.rows() * m.cols(), amax);
+                // 同一 batch 的 doc_ids 快照（首样本）：文档感知掩码是
+                // "逐行可见列数"的源头，命中时把序列与统计一起打出来。
+                const auto& ids = nn_nan_trace_doc_ids();
+                if (!ids.empty() && seq_len > 0 && ids.size() >= seq_len)
+                {
+                    std::printf("[NAN-TRACE] doc_ids[0..%zu): ", seq_len);
+                    for (std::size_t t = 0; t < seq_len; ++t)
+                        std::printf("%zu%s", ids[t], t + 1 < seq_len ? "," : "");
+                    std::printf("\n");
+                    std::size_t zero_visible = 0, min_visible = ids.size();
+                    for (std::size_t t = 0; t < seq_len; ++t)
+                    {
+                        std::size_t vis = 0;
+                        for (std::size_t j = 0; j <= t; ++j)
+                            if (ids[j] == ids[t]) ++vis;
+                        min_visible = std::min(min_visible, vis);
+                        if (vis == 0) ++zero_visible;
+                    }
+                    std::printf("[NAN-TRACE] doc_ids 统计: 零可见列的行=%zu，最小可见列=%zu，"
+                                "递减次数=%zu，唯一 id 数=%zu\n",
+                                zero_visible, min_visible,
+                                [&] { std::size_t d = 0;
+                                      for (std::size_t t = 1; t < seq_len; ++t)
+                                          if (ids[t] < ids[t - 1]) ++d;
+                                      return d; }(),
+                                [&] { auto v = ids;
+                                      std::sort(v.begin(), v.begin() + seq_len);
+                                      return static_cast<std::size_t>(
+                                          std::unique(v.begin(), v.begin() + seq_len)
+                                          - v.begin()); }());
+                }
+                // 行级定位：`grad[0]` 是 token embedding 的梯度，行号 = token id；
+                // 把它映射回 batch 内的 (t,b) 位置，可区分"某些 id 坏"（数据/查表）
+                // 与"某些位置坏"（掩码/位置相关算子）。
+                if (pass == 1 && idx == 0 && !bad_rows.empty())
+                {
+                    std::printf("[NAN-TRACE] 非有限行(token id, 前 %zu): ",
+                                bad_rows.size());
+                    for (std::size_t k = 0; k < bad_rows.size(); ++k)
+                        std::printf("%zu%s", bad_rows[k],
+                                    k + 1 < bad_rows.size() ? "," : "");
+                    std::printf("\n");
+                    const auto& toks = nn_nan_trace_tokens();
+                    const std::size_t bs = (seq_len > 0 && !toks.empty())
+                                               ? toks.size() / seq_len : 0;
+                    if (bs > 0)
+                    {
+                        std::printf("[NAN-TRACE] 命中位置 (t,b) 前 24: ");
+                        std::size_t shown = 0;
+                        for (std::size_t b = 0; b < bs && shown < 24; ++b)
+                            for (std::size_t t = 0; t < seq_len && shown < 24; ++t)
+                            {
+                                const std::size_t id = toks[b * seq_len + t];
+                                if (std::find(bad_rows.begin(), bad_rows.end(), id)
+                                    != bad_rows.end())
+                                {
+                                    std::printf("(%zu,%zu)=%zu ", t, b, id);
+                                    ++shown;
+                                }
+                            }
+                        std::printf("\n");
+                    }
+                }
+                std::fflush(stdout);
+                return false;
+            }
+            ++idx;
+        }
+    }
+    return true;
+}
+#endif   // NN_PROBES_ENABLED（非有限值追踪探针）
+
 using nn::Scalar;
 
 namespace fs = std::filesystem;
@@ -733,7 +892,12 @@ int main(int argc, char *argv[])
     // ── 显存阶段采样（NN_MEM_STATS=1，诊断用，默认关闭）─────────────────
     // 在真实训练负载的各生命周期阶段打印池统计 + 延迟销毁字节，用于把
     // 峰值归因到具体阶段（与 src/mem_probe.cpp 的口径一致）。
+    // 探针门：默认构建里 mem_stats 恒 false（且不求值 getenv），mem_mark 是空
+    // 判定——训练热路径与探针无关。
     const bool mem_stats = [] {
+#if !NN_PROBES_ENABLED
+        return false;
+#else
         // MSVC CRT 弃用 getenv（-Werror）：按平台用 _dupenv_s / getenv。
 #if defined(_MSC_VER)
         char* buf = nullptr;
@@ -745,6 +909,7 @@ int main(int argc, char *argv[])
 #else
         const char* v = std::getenv("NN_MEM_STATS");
         return v != nullptr && v[0] != '\0' && v[0] != '0';
+#endif
 #endif
     }();
     const auto mem_mark = [&](const char* tag) {
@@ -1195,6 +1360,18 @@ int main(int argc, char *argv[])
                 }
             }
             model.set_doc_ids(doc_ids);
+#if NN_PROBES_ENABLED
+            if (nn_nan_trace_on())
+            {
+                nn_nan_trace_doc_ids() = doc_ids;   // 诊断探针用（默认不维护）
+                auto& tr_toks = nn_nan_trace_tokens();
+                tr_toks.assign(cfg.seq_len * this_bs, 0);
+                for (std::size_t b = 0; b < this_bs; ++b)
+                    for (std::size_t t = 0; t < cfg.seq_len; ++t)
+                        tr_toks[b * cfg.seq_len + t] =
+                            static_cast<std::size_t>(x_tokens.at(t, b));
+            }
+#endif
 
             // ── Matrix → Tensor（上传到引擎设备） ──────────────
             auto x_tensor_r = engine->from_matrix(x_tokens);
@@ -1314,6 +1491,18 @@ int main(int argc, char *argv[])
             auto bwd_end = engine->end_batch();
             mem_mark("step/end-batch");
             NN_EXIT(bwd_end, 1, "\nend_batch (backward) failed: ");
+
+            // ── 非有限值追踪探针（NN_NAN_TRACE=1；默认零开销）────────────
+            //   在"梯度已定稿、参数尚未更新"的时点扫描两者，命中即打印张量
+            //   序号并停止训练（见 nn_nan_trace_step 头注释）。
+#if NN_PROBES_ENABLED
+            if (nn_nan_trace_on() &&
+                !nn_nan_trace_step(*engine, model, step, cfg.seq_len))
+            {
+                std::printf("[NAN-TRACE] 命中即停止（NN_NAN_TRACE=1）\n");
+                return 9;
+            }
+#endif
 
             // ── 收割已就绪的 loss 回读（非阻塞；打印/统计在此推进）─────────
             // 稳定态：此刻第 N-1 步的 loss 早已写回（GPU 一直在跑），

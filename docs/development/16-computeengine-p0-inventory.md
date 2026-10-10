@@ -4,6 +4,10 @@
 > 2026-09-30 起未实施的 P2-P6 由 `17-unified-tensor-engine.md` §5 改期 M1-M7），
 > 选型出处 `docs/development/13-refactor-backlog.md` §10。
 > **本文是 P0（0 代码改动调研）的实测结果**；未决点与失败项只记录、不修复。
+> ⚠ 探针构建前提（2026-10-10）：本文引用的 `gpu_stability_probe` 属**探针**，
+> 只在 `-DNN_ENABLE_PROBES=ON` 配置的构建里创建目标（默认 `cmake -B build` 不再
+> 产出它；见 AGENTS §2 探针统一编译门）。下述命令需先按该选项配置。
+>
 > 除新增探针 `src/gpu_stability_probe.cpp`（P0 工具，app 目标不注册 ctest）外，
 > 未改动任何库代码。
 

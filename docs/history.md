@@ -26,7 +26,7 @@
 - [docs/development 02 · 03 · 05](#docs/development 02 · 03 · 05)（19 条）
 - [docs/development 01 · 04 · 06 · 07 · 10 · 14](#docs/development 01 · 04 · 06 · 07 · 10 · 14)（25 条）
 - [docs/introduction · usage · benchmarks](#docs/introduction · usage · benchmarks)（46 条）
-- [构建系统 / CI（CMakeLists.txt、.github/workflows）](#构建系统 / CI（CMakeLists.txt、.github/workflows）)（6 条）
+- [构建系统 / CI（CMakeLists.txt、.github/workflows）](#构建系统 / CI（CMakeLists.txt、.github/workflows）)（7 条）
 - [AGENTS.md](#AGENTS.md)（24 条）
 - [ZiPT（AttnZip）移除](#ZiPT（AttnZip）移除（2026-10-01）)（1 条）
 - [GUI / CLI 参数一致性清理](#GUI / CLI 参数一致性清理（2026-10-01）)（1 条）
@@ -1967,6 +1967,42 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
   153/153 零 error + ctest **30/30**；clang 23 + MSVC STL 153/153 + ctest **30/30**；
   clang 24 + libc++（Linux，Vulkan 开）**17/17**（GPU 用例未在沙箱内跑）；
   g++ 15.2 + libstdc++（WSL，无 Vulkan → 纯 CPU）**30/30**（11 条 GPU 用例 skip）。
+
+## 探针统一编译门 `NN_ENABLE_PROBES`（2026-10-10，分支 `dev/t1_58`）
+
+- 类型：演进记录 / 覆盖缺口（"探针在正常运行时也参与编译"）
+- **背景（被取代的机制）**：此前所有诊断探针都做成**运行期**环境变量开关——`nn_dbg_scan`
+  在 20 个反向调用点无条件调用（体内 `static const bool on = env_flag("NN_F16_DEBUG")`）、
+  `ComputeEngine::prec_env_flag` / `nn::dsl::env_flag` **每次调用都 getenv、零缓存**
+  （在逐算子路径上就是热路径），`NN_PREC_TRACE` 的变体/边界 cast 归因、`text_train` 的
+  `NN_NAN_TRACE` / `NN_MEM_STATS`，以及 `mem_probe` / `f16_cpu_probe` /
+  `gpu_stability_probe` 三个可执行目标——**默认构建里全都在**：能靠设错环境变量悄悄拖慢
+  正常训练/推理，探针代码也永远在编译/回归面内。
+- **新机制**：CMake 选项 `NN_ENABLE_PROBES`（默认 **OFF**）→ 经 `nn_core` 的
+  **INTERFACE** 定义 `NN_ENABLE_PROBES=1`（所有 TU / PCH 目标 / 收集器 / 嵌入消费方取值
+  一致；同头两种语义 = ODR 隐患，故不能只给 app 目标），`core_config.hpp` 折成
+  `NN_PROBES_ENABLED`（0/1）。门关时：`nn_dbg_scan` 是空内联（20 个调用点零指令）、
+  `env_flag`/`prec_env_flag` 恒 false 且**不求值 getenv**、`note_temp_`/`prec_trace_enabled_`
+  空实现、`text_train` 的探针块与两个调用点整块 `#if` 掉、三个探针目标**不创建**。
+  **不进本门**的两类（刻意）：① 初始化期读一次并缓存的**行为开关**——`NN_BIND_DEBUG`、
+  `NN_VULKAN_*` 设备/特性逃生阀、`NN_POOL_*`/`NN_NO_EARLY_REAP`/`NN_CPU_PAUSE`/
+  `NN_GPU_PROFILE`（零热路径开销；新增同类必须"读一次 + 缓存"）；② `f16_writeback_probe`
+  是注册在 ctest 的**回归用例**（in-place f16 写回 + 8 步 Adam 参数必须移动），去掉会削弱
+  测试门禁，故保留在默认测试面内。
+- **顺带修掉的真实缺陷**：`nn_nan_trace_on()` 用裸 `std::getenv` → MSVC CRT
+  `-Wdeprecated-declarations` 在 `-Werror` 下**编不过**（该探针块从未在 MSVC 上编译过，
+  因为此前没有"探针构建"这条验收路径）。改为与 `NN_MEM_STATS` 同款平台分支
+  （MSVC 走 `_dupenv_s`）。
+- **验收（2026-10-10，102/LLVM clang 23 + MSVC STL，语法级两态编译 + 配置期门禁）**：
+  ① 探针关：`text_train.cpp` 零告警 `-Werror` 通过，`build.ninja` 内
+  `mem_probe`/`f16_cpu_probe`/`gpu_stability_probe` **0 命中**、`NN_ENABLE_PROBES=1`
+  0 命中；② 探针开：同 TU 零告警通过，三个探针源各自语法级通过，`build.ninja` 出现
+  三个目标 + `NN_ENABLE_PROBES=1`（含 `nn_pch` 的 PCH 编译行 → PCH 与复用方宏状态一致，
+  否则 `REUSE_FROM` 会拿到另一种语义）；③ 本机 CMake 双态配置（配置期即验证目标门禁）。
+- **文档落点**：AGENTS §2（选项 + 完整探针清单 + 两类例外）、`docs/usage/05` 构建开关表
+  新增 `NN_ENABLE_PROBES` 行、`docs/usage/03` §20 诊断表加"探针构建前提"、
+  `docs/development/05` §12.8 / `docs/development/16` 归因与探针命令加前提、
+  `bench/run_mem_variants.ps1` / `bench/run_ab_env.ps1` 头部注明需探针构建。
 
 ---
 
