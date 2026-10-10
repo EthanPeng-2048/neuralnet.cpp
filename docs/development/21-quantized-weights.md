@@ -45,6 +45,7 @@
 | 19 | **CLI 粒度（实现期细化）** | `--precision-param` 收 `t1_58`；`--precision-{compute,stable,optimizer}` **在参数解析处**就拒绝 `t1_58`（三值只描述权重；拖到 init 期才报是坏 UX）。帮助行同步：只有 param 行写 `<f16\|f32\|t1_58>` |
 | 20 | **"非存储精度"硬化** | `create_tensor`/`from_matrix`/`dsl::compute`/`compute_reduce` 一律拒绝 BF16/F64/T1_58 作为**存储/输出**精度；Adam 的"更新量精度"在 param 槽非存储精度时回落到**目标张量自身**（否则 BitLinear 在 GPU 上 step 失败） |
 | 21 | **CNN 的诚实提示** | CNN 构建器目前不接收精度 profile（roadmap P2）→ CLI 显式打印"本选项未生效"，不静默失效（三值消息在 CNN 下也不再误报"已启用"） |
+| 22 | **精度预设 `--t1_58`（2026-10-10 追加）** | **加**。用户裁定："就是 `t1_58` 模式，其他默认 f16，模型参数 1.58"。`profile_t1_58()` = `{param=T1_58, compute=F16, stable=F32, optimizer=F32}`，实现上 = `profile_f16()` 改 `param`（另三槽同源派生）；CLI `--t1_58`、GUI 两训练页的"精度预设"下拉各一项。词法仍唯一 `t1_58`（预设是"整份 profile 的快捷方式"，不是 `--precision-param` 的别名） |
 
 ---
 
@@ -256,7 +257,7 @@ enum class Precision : std::uint8_t {
   | 枚举 | `Precision::T1_58` |
   | `precision_name` | `"t1_58"` |
   | CLI 词法 | `t1_58`（**无别名**——不提供 `1_58`/`t158` 等变体） |
-  | CLI 帮助 | `--precision-param <f16\|f32\|t1_58>`；其余三行 `<f16\|f32>`（实现期细化，见 §0 第 19 条） |
+  | CLI 帮助 | `--precision-param <f16\|f32\|t1_58>`；其余三行 `<f16\|f32>`（实现期细化，见 §0 第 19 条）；另有精度预设 `--t1_58`（§0 第 22 条） |
   | 序列化 tag | `4` |
   | 层名 | **`BitLinear`**（保留 BitNet 专名，便于检索） |
   | 存储格式 | "T1_58 打包（编码参照 llama.cpp `TQ1_0`，尺度 = 行级 absmean）" |
@@ -462,7 +463,10 @@ MLP 路径（`build_mnist_mlp_model`）确实是 `model.add<Linear>(...)` 一条
    `--precision-{compute,stable,optimizer} t1_58` 在**参数解析处**就报错
    （`三值权重只适用于 --precision-param`）而不是拖到 init 期能力校验。理由：三值描述的是
    **权重**，把它列进 compute/stable/optimizer 的帮助行等于鼓励一个必然失败的组合；
-   词法本身仍是**唯一词法 `t1_58`（无别名）**。
+   词法本身仍是**唯一词法 `t1_58`（无别名）**。**（2026-10-10 追加）**"想一次性开三值 +
+   f16 存储"的需求由**精度预设 `--t1_58` = `profile_t1_58()`** 承接（§0 第 22 条），
+   而不是把 `t1_58` 塞进 compute 帮助行 —— 预设是"整份 profile 的快捷方式"，与"哪个槽
+   可以取三值"是两件事。
 2. **`scan_exprs` 的登记位置**：设计写"per-layer dry-run 补一个 `BitLinear`"；实现落在
    **模型 pass**（新增一条 `param=T1_58` 的 MLP 用例）。理由：`BitLinear` 的真实使用路径是
    MLP 工厂（`param=T1_58` → `BitLinear`），模型 pass 能一次覆盖 forward/backward/量化三段结构，
@@ -532,6 +536,13 @@ graph TB
 - `build_gpt_model_from_spec` 补 `weight_quant → precision.param` 映射（规格是加载时的权威，
   与 `build_mnist_model_from_spec` 同款）；`text_train` 保存规格时写 `spec.weight_quant`
   并打印三值启用行。`--arch rapt --precision-param t1_58` **前置拒绝**（见下"仍未接线"）。
+- **精度预设 `--t1_58`**（2026-10-10 追加，§0 第 22 条）：`text_train` / `mnist_train` 各加
+  一行 preset 解析（`cfg.precision = profile_t1_58()`），GUI 两训练页的"精度预设"下拉加
+  `"t1_58 (BitLinear + f16 存储)"`、控制器发出 `--t1_58`。三条命令因此等价：
+  `--t1_58` == `--f16 --precision-param t1_58` == `--precision-param t1_58 --precision-compute f16`；
+  范围与前置拒绝**完全复用**既有规则（无需新白名单：GPT 全接线，`--model rapt` 前置拒绝，
+  `--arch transformer/cnn` 由层能力校验报错）。`--t1_58` 与 `--precision-*` 是同一份 profile
+  的两种写法，按参数出现顺序后者覆盖前者（与 `--f16` 同款语义）。
 - `scan_exprs` 模型 pass 增加两条三值 GPT（`gpt_learned_gelu_ln_t1_58`、
   `gpt_rope_relu2_rms_gqa_subln_tied_t1_58`）。**结构数不变（107 → 107）**：BitLinear 的三段
   结构（τ 的 absmean 归约 / wq 的阈值 select / 去量化点积与 STE 累加）已由 MLP 用例登记。
@@ -549,6 +560,7 @@ graph TB
 | `bitnet_struct_test` [15]（CPU） | 2B4T 形状（RoPE+ReLU²+RMSNorm+**SubLN+GQA+tied**+三值）200 步 CE+AdamW：三值+tied **3.469 → 0.018**、三值+BitLinear head **3.582 → 0.0064**、f32 基线 3.893 → 0.0045（随机基线 ln 32 = 3.466） |
 | `bitnet_struct_test_gpu` [15] | 同一配置在真实 GPU 上跑通，CPU/GPU 末步 loss 差 < 1e-3（断言） |
 | **真实数据 + 真实 GPU**（CLI，`--model gpt --precision-param t1_58`） | TinyStories 40MB（`.nndataset`，vocab 8192）/ d256·h8·L4·ff688 / seq 256 / batch 8 / AdamW 3e-3 / RoPE + ReLU² + RMSNorm（CLI 可表达的 2B4T 子集）：三值 **6.069 → 4.164**（150 步，17.3 s，NVIDIA CMP 40HX）；同配置 f32 基线 **5.815 → 4.327**（14.9 s）。两条曲线同量级下降 —— 这是"真实语料 + 真实 GPU 能训"的证据，**不是**精度结论（同一量级、未做超参扫描）；步时 +16% 来自每步重算 τ/wq，P2 的打包 GEMM 才是针对它的优化 |
+| **精度预设 `--t1_58`**（本机 clang + Vulkan GPU NVIDIA GTX 850M） | `precision_test` / `t1_58_test`（含 `--gpu`）全绿；新增用例 [9] 钉死预设四字段、"普通 Linear + 预设必须报错（不静默降级 f32）"、"预设构建的 MLP 线性层**全为 BitLinear**"、CPU/GPU 各 60 步 loss 下降到一半以下（CPU 0.654366→0.166908、GPU 0.654366→0.176052）；CLI `text_train datasets/tinystories_200mb.nndataset --gpu --t1_58`（d128·h4·L2·ff344·seq128·batch4、20 步）跑通并打印 `精度配置: param=t1_58 compute=f16 stable=f32 optimizer=f32` |
 
 **仍未接线（诚实边界）**：
 
