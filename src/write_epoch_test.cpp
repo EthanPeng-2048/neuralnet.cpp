@@ -26,6 +26,7 @@
 
 #include "neuralnet.cpp/cli/cli_engine_factory.hpp"
 #include "neuralnet.cpp/compute_layer_bitlinear.hpp"
+#include "neuralnet.cpp/compute_optimizer.hpp"
 #include "neuralnet.cpp/expr_dsl.hpp"
 
 #define NN_TEST_COUNTER g_failures
@@ -280,23 +281,29 @@ void test_bitlinear_cache(nn::ComputeEngine& eng, const char* tag)
     CHECK(bl.quantize_calls() == 1, "仅输入变化不触发重算（缓存只跟权重走）");
 
     // ── [5] 权重写入 → 必须重算，且与从零重算逐位相同 ──────────────────
-    std::printf("[5] 权重经引擎写入后重算，且与从零重算逐位相同（%s）\n", tag);
+    // 用**真实优化器**（Adam）走一遍参数更新：这就是训练循环里 latent 权重
+    // 唯一的变更路径（dsl::compute_into 原地写），也是"缓存必须失效"的现场。
+    std::printf("[5] 优化器/引擎写入权重后重算，且与从零重算逐位相同（%s）\n", tag);
     nn::Matrix W2(OUT, IN);
     for (std::size_t o = 0; o < OUT; ++o)
         for (std::size_t k = 0; k < IN; ++k)
             W2.set_value(o, k, 0.25f * static_cast<float>((o * 3 + k * 5) % 9) - 1.1f);
 
     {
-        // 优化器更新参数的实际路径：dsl::compute_into（原地写 latent）
-        auto upd = nn::dsl::compute_into(eng,
-            nn::dsl::leaf(bl.parameters()[0].get())
-                + nn::dsl::rparam(0.125f) * nn::dsl::leaf(bl.parameters()[0].get()),
-            bl.parameters()[0].get());
-        CHECK(upd.has_value(), "经 DSL 原地更新 latent（模拟优化器）");
+        // 造一份假梯度（STE 梯度的形态：与 latent 同形），交给真实 Adam
+        nn::Matrix G(OUT, IN);
+        for (std::size_t o = 0; o < OUT; ++o)
+            for (std::size_t k = 0; k < IN; ++k)
+                G.set_value(o, k, 0.03f * static_cast<float>(k + 1) - 0.05f);
+        auto gw = eng.copy_from(bl.param_gradients()[0].get(), G);
+        CHECK(gw.has_value(), "写入假梯度");
+        nn::Adam opt(eng, bl.parameters(), bl.param_gradients(), /*lr=*/0.05f);
+        auto st = opt.step();
+        CHECK(st.has_value(), "Adam step（真实参数更新路径）");
     }
     auto y4 = bl.forward(Xt);
     CHECK(y4.has_value(), "权重变化后 forward 成功");
-    CHECK(bl.quantize_calls() == 2, "权重写入后重算一次");
+    CHECK(bl.quantize_calls() == 2, "优化器更新权重后重算一次");
     const nn::Matrix wq1 = wq_of(eng, bl);
     const nn::Matrix tau1 = tau_of(eng, bl);
     CHECK(!mat_same(wq0, wq1) || !mat_same(tau0, tau1),
@@ -338,10 +345,8 @@ void test_bitlinear_cache(nn::ComputeEngine& eng, const char* tag)
     // ── [7] N 次 forward（梯度累积/生成期形态）与"每次重算"等价 ──────────
     std::printf("[7] 缓存路径与逐次重算路径数值等价（%s）\n", tag);
     {
-        auto upd = nn::dsl::compute_into(eng,
-            nn::dsl::leaf(bl.parameters()[0].get()) * nn::dsl::rparam(0.5f),
-            bl.parameters()[0].get());
-        CHECK(upd.has_value(), "再改一次权重（缓存失效）");
+        auto sc = eng.scale_inplace(bl.parameters()[0].get(), 0.5f);
+        CHECK(sc.has_value(), "再改一次权重（引擎原地缩放 → 缓存失效）");
         std::vector<nn::Matrix> outs;
         for (int i = 0; i < 4; ++i)
         {
@@ -353,6 +358,48 @@ void test_bitlinear_cache(nn::ComputeEngine& eng, const char* tag)
         for (std::size_t i = 1; i < outs.size(); ++i)
             CHECK(mat_same(outs[0], outs[i]), "同权重下多次 forward 输出逐位相同");
         CHECK(bl.quantize_calls() == 4, "该轮只量化一次（缓存命中 3 次）");
+    }
+}
+
+} // namespace
+
+// ── [8] F2：惰性梯度缓冲（推理路径不为梯度付存储）──────────────────────────
+namespace
+{
+void test_lazy_grads(nn::ComputeEngine& eng, const char* tag)
+{
+    constexpr std::size_t IN = 6, OUT = 5, B = 2;
+    std::printf("[8] 惰性梯度：init/forward 后未分配，param_gradients/backward 才分配（%s）\n",
+                tag);
+
+    // Linear（f16 配置：梯度 = 权重等体积）
+    {
+        nn::Linear lin(IN, OUT);
+        lin.set_precision_profile(nn::profile_f16());
+        auto r = lin.init(eng);
+        CHECK(r.has_value(), "Linear init 成功");
+        CHECK(!lin.grad_buffers_allocated(), "init 后梯度缓冲未分配");
+        auto y = lin.forward(filled(eng, IN, B, 0.5f));
+        CHECK(y.has_value(), "Linear forward 成功");
+        CHECK(!lin.grad_buffers_allocated(), "只 forward（推理）后梯度缓冲仍未分配");
+        (void)lin.param_gradients();   // 优化器构造路径（nodiscard：显式丢弃）
+        CHECK(lin.grad_buffers_allocated(), "param_gradients() 后梯度缓冲已分配");
+    }
+
+    // BitLinear（三值配置：梯度恒 f32，是推理足迹的 40%）
+    {
+        nn::Matrix W(OUT, IN);
+        for (std::size_t o = 0; o < OUT; ++o)
+            for (std::size_t k = 0; k < IN; ++k)
+                W.set_value(o, k, 0.2f * static_cast<float>((o + k) % 5) - 0.4f);
+        nn::BitLinear bl = make_bitlinear(eng, IN, OUT, W);
+        CHECK(!bl.grad_buffers_allocated(), "BitLinear init 后梯度缓冲未分配");
+        auto y = bl.forward(filled(eng, IN, B, 0.5f));
+        CHECK(y.has_value(), "BitLinear forward 成功");
+        CHECK(!bl.grad_buffers_allocated(), "只 forward（推理）后梯度缓冲仍未分配");
+        auto br = bl.backward(filled(eng, OUT, B, 1.0f));
+        CHECK(br.has_value(), "backward 成功");
+        CHECK(bl.grad_buffers_allocated(), "backward 后梯度缓冲已分配（训练路径）");
     }
 }
 
@@ -372,12 +419,14 @@ int main(int argc, char* argv[])
         NN_EXIT(eng_r, 77, "GPU 不可用，跳过: ");
         test_write_entries(**eng_r, "GPU");
         test_bitlinear_cache(**eng_r, "GPU");
+        test_lazy_grads(**eng_r, "GPU");
     }
     else
     {
         nn::CpuEngine eng;
         test_write_entries(eng, "CPU");
         test_bitlinear_cache(eng, "CPU");
+        test_lazy_grads(eng, "CPU");
     }
 
     if (g_failures == 0)

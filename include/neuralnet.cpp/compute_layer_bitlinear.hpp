@@ -99,11 +99,7 @@ public:
         if (!latent_w_.valid()) NN_FAIL("BitLinear: latent 权重初始化失败");
         b_ = engine.create_tensor(out_features_, 1, Precision::F32, InitSpec::zero());
         if (!b_.valid()) NN_FAIL("BitLinear: 偏置初始化失败");
-        grad_w_ = engine.create_tensor(out_features_, in_features_, Precision::F32,
-                                       InitSpec::zero());
-        grad_b_ = engine.create_tensor(out_features_, 1, Precision::F32, InitSpec::zero());
-        if (!grad_w_.valid() || !grad_b_.valid())
-            NN_FAIL("BitLinear: 梯度缓冲初始化失败");
+        // 梯度缓冲**不在此分配**（F2）：惰性 + 只训练时分配，见 ensure_grad_()。
         // 量化缓冲：wq_ 恒 f16（{-1,0,1} 精确可表示；P2 起才改打包存储）
         wq_ = engine.create_tensor(out_features_, in_features_, Precision::F16,
                                    InitSpec::zero());
@@ -120,7 +116,13 @@ public:
     }
     [[nodiscard]] std::vector<TensorRef> param_gradients() override
     {
+        ensure_grad_();
         return {grad_w_, grad_b_};
+    }
+
+    [[nodiscard]] bool grad_buffers_allocated() const noexcept override
+    {
+        return grad_w_.valid();
     }
 
     // ── 量化派生物只读视图（诊断 / 测试 / 序列化对拍用）────────────────────
@@ -174,6 +176,7 @@ public:
         ComputeEngine& engine = engine_ref();
         if (grad_output.rows() != out_features_)
             NN_FAIL("bitlinear backward: grad_output shape mismatch");
+        ensure_grad_();   // 训练路径：首次反向才建梯度缓冲（F2）
         if (!tau_.valid() || !input_cache_.valid())
             NN_FAIL("bitlinear backward: 必须先 forward（τ/输入缓存未建立）");
 
@@ -209,6 +212,24 @@ public:
     }
 
 private:
+    // ── 梯度缓冲：惰性分配（F2）────────────────────────────────────────────
+    // 三值层的梯度**恒 f32**（STE 落点 + 优化器状态，见 §4.3.2），即 4 B/权重
+    // —— 在推理足迹（latent 4 + wq 2 + grad 4 = 10 B/权重）里占 40%；2B 参数
+    // 规模下是 8 GB 级死显存。梯度的唯一消费者是 `param_gradients()`（优化器
+    // 构造/诊断）与 `backward()`，都在训练路径上；TensorRef 是成员引用，故
+    // "先给引用、后建存储"对优化器透明。
+    void ensure_grad_()
+    {
+        if (grad_w_.valid()) return;
+        ComputeEngine& engine = engine_ref();
+        grad_w_ = engine.create_tensor(out_features_, in_features_, Precision::F32,
+                                       InitSpec::zero());
+        grad_b_ = engine.create_tensor(out_features_, 1, Precision::F32, InitSpec::zero());
+        // 终止式检查（本函数返回 void，不能用 NN_FAIL 的 return 语义）
+        NN_CHECK(grad_w_.valid() && grad_b_.valid(),
+                 "BitLinear: 梯度缓冲（惰性）初始化失败");
+    }
+
     // 量化派生物是否还有效：写版本相等 ⇒ latent 权重未被写过。
     // 另外兜底"存储被清"（offload 的 export 会把成员置空、clear_cache 等）：
     // 那种情况下算一次比用空张量安全。
