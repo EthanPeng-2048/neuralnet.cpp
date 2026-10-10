@@ -535,6 +535,14 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 
 # 引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器
 
+## 三值（T1_58）性能优化：写版本缓存 / 惰性梯度 / 打包 GEMM（2026-10-11，分支 `dev/t1_58`；原位置 `docs/development/21-quantized-weights.md` §4.11 的"P1 不省显存"结论、`compute_layer_bitlinear.hpp` 的"每次 forward 重算 τ/wq"、`compute_layer_mlp.hpp` / `compute_layer_bitlinear.hpp` init 里的无条件梯度分配）
+- 类型：演进记录 / 性能 A/B / bug 根因
+- 内容：§4.11 定位出三个代价（每步重算 τ/wq、f16 稠密缓冲 2 B/权重、推理也分配 f32 梯度），本轮四提交落地：**F1** 存储级写版本（`MatrixT`/`GpuBuffer` 持单调 `write_epoch`，`WriteEpochGuard` 覆盖 12 个引擎写入口 + DSL 的 CPU 直写路径经 `TensorAccess::mark_written` 补记）→ τ/wq 只在权重变过时重算；**F4** `1/K` 折进归约操作数（3 pass → 2 pass）；**F6** τ 移出 `activation_cache`（它是权重派生物不是激活）；**F3** 打包三值权重（2 bit/权重、码值 = 三值 + 2，与 microsoft/BitNet `gpu/pack_weight.py` 对齐）+ `trit_pack`/`matmul_q`/`matmul_q_t` 原语 + GPU shader（含 `-DNN_SHADER_F16` 变体）；**F2** 梯度惰性分配（`Linear`/`BitLinear`）。
+- **两个由测试抓到的真 bug**：(a) DSL 在 CPU 上**绕过引擎**直写 dst（`eval_into_tensor_cpu`）→ 优化器更新对量化缓存**不可见**（`write_epoch_test` 的 [1] 逐入口断言抓到）；(b) BitLinear 的 scan dry-run 跑在 CPU 引擎上、默认走打包路径 → **稠密路径的结构不再被任何用例产出**，未接打包的后端（GPU）运行期闭合世界硬报错（`t1_58_test_gpu` 带 key 报错暴露）。修法：scan 里两条路径各 dry-run 一份（结构集回到基线 107 条）。
+- **性能 A/B（102 / 40HX，d256·h8·L4·ff688·seq256·b8 合成语料 60 步）**：训练 2.0 s → 2.0 s、显存 570 → 570 MiB（**零回归**）；解码 128 token **27.1 s → 14.1 s（1.92×）**；推理显存峰值 **88 → 76 MiB（−13.6%）**。
+- **被实测否决/改写的方案**："打包 GEMM 无条件替换 f16 稠密缓冲" —— 强制打包时训练 60 步 **4.0 s vs 基线 2.0 s**（本 shader 按输出元素重复解码，宽 batch 计算受限）。改为**按激活宽度选址**（≤ 8 → 打包，> 8 → 分块 f16 GEMM），阈值是启发式，待分块解码 GEMM 落地后重标定。
+- **F5 裁决**：训练显存的最大单项是优化器状态（m/v = 8 B/权重 = 三值层训练账的 44%），**开新优化器（`AdamW8Bit`）而不是修改 `Adam`** —— 改 Adam 会让 f32/f16/t1_58 三条历史基线的数值口径不可复现（docs 21 §4.13）。
+
 ## 三值（T1_58 / BitLinear）P1 落地（2026-10-10，分支 `dev/t1_58`；原位置 设计文档 `docs/development/21-quantized-weights.md` 的"P1 未实施"状态、`compute_layer_base.hpp` 无能力声明、`compute_optimizer.hpp:344` 用 `p_.param` 建更新量张量）
 - 类型：演进记录 / 设计落地（含 3 处实施期裁定与 1 处缺陷修复）
 - 内容：设计（`21-quantized-weights.md`，2026-10-09 定稿 + 2026-10-10 三项裁定）→ **P1 实施 5 步**：① `Precision::T1_58 = 4` 进枚举并把**提升序从枚举值里拆出**（`precision_rank()`/`precision_has_order()`；`max_precision` 对无序精度 fail-fast）——枚举值从此只是标签；② 层**按槽能力声明**（`PrecisionSet` 位掩码 + `PrecisionSupport` + `Layer::precision_support()` 默认 `{f16,f32}×四槽` + `Layer::layer_name()`），校验落在 `Layer::init` NVI 首步（不兼容 = 初始化期报错：层名+槽位+取值+允许集合），并按 D3(a)/(b) 补 `GPT/RAPT`（含 Block）的 profile 下传、`set_precision_profile` 在已 init 时 fail-fast；③ `BitLinear`（latent/偏置恒 f32、`wq_` f16 三值缓冲 + `tau_` 逐行 absmean 每步重算、forward 去量化点积、backward STE）+ MLP 工厂接线 + `ModelSpec.weight_quant`（KVRecord 追加键，缺键 = None）；④ CLI/GUI 只让 `--precision-param` 收 `t1_58`；⑤ 文档与架构图。
