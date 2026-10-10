@@ -25,7 +25,9 @@ private:
     Linear fc2_;   // (d_ff → d_model)
     GeLU  gelu_;
     SwiGLU swiglu_;  // SwiGLU 激活（含 split/merge）
+    ReLU2GLU relu2glu_;  // 门控平方 ReLU 激活（BitNet 2B4T；同 split/merge 接线）
     bool use_swiglu_ = false;
+    bool use_relu2_ = false;
 
     // ── SubLN（BitNet b1.58 的"子层归一化"，docs/development/22 §3.1）──────
     // **子层内部**的额外归一化：挂在中间激活（宽 d_ff）与输出投影 fc2 之间。
@@ -45,10 +47,13 @@ public:
                 bool subln = false,
                 NormType subln_norm_type = NormType::LayerNorm)
         : fc1_(d_model,
-               activation == ActivationType::SwiGLU ? 2 * d_ff : d_ff),
+               (activation == ActivationType::SwiGLU ||
+                activation == ActivationType::ReLU2) ? 2 * d_ff : d_ff),
           fc2_(d_ff, d_model),
           swiglu_(d_ff),
-          use_swiglu_(activation == ActivationType::SwiGLU)
+          relu2glu_(d_ff),
+          use_swiglu_(activation == ActivationType::SwiGLU),
+          use_relu2_(activation == ActivationType::ReLU2)
     {
         if (subln)
             sub_norm_ = make_norm_layer(d_ff, subln_norm_type);
@@ -62,6 +67,7 @@ public:
         // 否则 forward 里调 gelu_/swiglu_.forward() 会在 engine_ref() 处 fail-fast。
         { NN_TRY(r, gelu_.init(engine)); }
         { NN_TRY(r, swiglu_.init(engine)); }
+        { NN_TRY(r, relu2glu_.init(engine)); }
         if (sub_norm_) { NN_TRY(r, sub_norm_->init(engine)); }
         return {};
     }
@@ -96,6 +102,7 @@ public:
         fc2_.set_checkpoint_mode(enabled);
         gelu_.set_checkpoint_mode(enabled);
         swiglu_.set_checkpoint_mode(enabled);
+        relu2glu_.set_checkpoint_mode(enabled);
         if (sub_norm_) sub_norm_->set_checkpoint_mode(enabled);
     }
 
@@ -110,6 +117,7 @@ public:
         fc2_.set_precision_profile(profile);
         gelu_.set_precision_profile(profile);
         swiglu_.set_precision_profile(profile);
+        relu2glu_.set_precision_profile(profile);
         if (sub_norm_) sub_norm_->set_precision_profile(profile);
     }
 
@@ -119,6 +127,7 @@ public:
         fc2_.clear_cache();
         gelu_.clear_cache();
         swiglu_.clear_cache();
+        relu2glu_.clear_cache();
         if (sub_norm_) sub_norm_->clear_cache();
     }
 
@@ -129,6 +138,7 @@ public:
         auto b = fc2_.activation_cache(); r.insert(r.end(), b.begin(), b.end());
         auto g = gelu_.activation_cache(); r.insert(r.end(), g.begin(), g.end());
         auto s = swiglu_.activation_cache(); r.insert(r.end(), s.begin(), s.end());
+        auto r2 = relu2glu_.activation_cache(); r.insert(r.end(), r2.begin(), r2.end());
         if (sub_norm_)
         {
             auto sn = sub_norm_->activation_cache();
@@ -145,6 +155,11 @@ public:
         if (use_swiglu_)
         {
             NN_TRY(h2, swiglu_.forward(*h1));
+            h2_out = std::move(*h2);
+        }
+        else if (use_relu2_)
+        {
+            NN_TRY(h2, relu2glu_.forward(*h1));
             h2_out = std::move(*h2);
         }
         else
@@ -174,6 +189,11 @@ public:
         if (use_swiglu_)
         {
             NN_TRY(bg, swiglu_.backward(g));
+            return fc1_.backward(*bg);
+        }
+        if (use_relu2_)
+        {
+            NN_TRY(bg, relu2glu_.backward(g));
             return fc1_.backward(*bg);
         }
         NN_TRY(bg, gelu_.backward(g));

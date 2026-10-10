@@ -120,7 +120,7 @@ void print_usage(const char *prog)
     help.section("模型结构");
     help.opt("--model <type>", "模型架构: gpt/rapt (默认: gpt)\ngpt: 标准 Transformer 语言模型\nrapt: ReLU 线性注意力 (RLA) 语言模型，动态稀疏检索，\nO(L·d²) 复杂度；强制 RoPE (ReLU 前施加)");
     help.opt("--positional-encoding <type>", "位置编码类型: learned/sinusoidal/alibi/rope (默认: learned)\nlearned: 可学习位置嵌入 (GPT 原版)\nsinusoidal: 正弦波固定位置编码 (不参与训练)\nalibi: 线性偏置注意力 (无位置嵌入，支持长度外推)\nrope: 旋转位置编码 (现代方案，在注意力 Q/K 上施加)");
-    help.opt("--activation <type>", "FFN 激活: gelu/swiglu (默认: gelu)\ngelu: QuickGeLU (GPT-2 风格)\nswiglu: SwiGLU (LLaMA/Mistral 风格，每参数效率更高)");
+    help.opt("--activation <type>", "FFN 激活: gelu/swiglu/relu2 (默认: gelu)\ngelu: QuickGeLU (GPT-2 风格)\nswiglu: SwiGLU (LLaMA/Mistral 风格，每参数效率更高)\nrelu2: 门控平方 ReLU (BitNet b1.58 2B4T 的 hidden_act)");
     help.opt("--norm <type>", "归一化层: layernorm/rmsnorm (默认: layernorm)\nlayernorm: LayerNorm (GPT-2 风格)\nrmsnorm: RMSNorm (LLaMA/Mistral 风格，更快更稳)");
     help.opt("--d-model <n>", "模型维度 (默认: 128)");
     help.opt("--num-heads <n>", "注意力头数 (默认: 4)");
@@ -475,10 +475,12 @@ TrainConfig parse_args(int argc, char *argv[])
                 cfg.activation = nn::ActivationType::GeLU;
             else if (v == "swiglu")
                 cfg.activation = nn::ActivationType::SwiGLU;
+            else if (v == "relu2")
+                cfg.activation = nn::ActivationType::ReLU2;
             else
             {
                 std::cerr << "未知激活类型: " << v
-                          << "，可选: gelu, swiglu\n";
+                          << "，可选: gelu, swiglu, relu2\n";
                 std::exit(1);
             }
         }

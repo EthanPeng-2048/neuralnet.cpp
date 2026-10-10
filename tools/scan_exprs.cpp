@@ -610,7 +610,10 @@ int main(int argc, char* argv[])
                  GptCase{"gpt_rope_gelu_ln", nn::PosEncodingType::RoPE,
                          nn::ActivationType::GeLU, nn::NormType::LayerNorm},
                  GptCase{"gpt_learned_swiglu_rms", nn::PosEncodingType::Learned,
-                         nn::ActivationType::SwiGLU, nn::NormType::RMSNorm}})
+                         nn::ActivationType::SwiGLU, nn::NormType::RMSNorm},
+                 // BitNet 2B4T 形态：门控平方 ReLU（relu2 ≠ swiglu ≠ gelu）
+                 GptCase{"gpt_rope_relu2_rms", nn::PosEncodingType::RoPE,
+                         nn::ActivationType::ReLU2, nn::NormType::RMSNorm}})
         {
             nn::GptConfig cfg;
             cfg.vocab_size = V; cfg.d_model = D; cfg.seq_len = S;

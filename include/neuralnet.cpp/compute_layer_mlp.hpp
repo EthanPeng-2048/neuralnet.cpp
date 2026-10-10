@@ -382,6 +382,82 @@ public:
 };
 
 // ══════════════════════════════════════════════════════════════════════════
+// ReLU2GLU — 门控平方 ReLU（BitNet b1.58 2B4T 的 FFN 激活）
+//
+// 算法（只在此处，不在 Engine/Shader）：
+//   forward:  out = relu(gate)² ⊙ up            （relu(g) = max(g, 0)）
+//   backward: grad_gate = grad_out ⊙ up ⊙ 2·relu(gate)
+//             grad_up   = grad_out ⊙ relu(gate)²
+//
+// 与 SwiGLU **同接线**（输入 (2·d_ff, batch)，gate = 前 d_ff 行、up = 后 d_ff 行，
+// RowAccess 行视图零拷贝、单表达式全融合、输出 (d_ff, batch)），只把逐元素函数
+// σ(g) 换成 relu(g)。两者不可互相替代（2B4T 用 relu2，LLaMA 用 silu）。
+// ══════════════════════════════════════════════════════════════════════════
+class ReLU2GLU final : public Layer
+{
+private:
+    std::size_t d_ff_ = 0;
+    Tensor input_cache_;  // 前向输入 (2*d_ff, batch)：backward 据此重算 gate
+
+public:
+    [[nodiscard]] const char* layer_name() const noexcept override { return "ReLU2GLU"; }
+
+    ReLU2GLU() = default;
+    explicit ReLU2GLU(std::size_t d_ff) : d_ff_(d_ff) {}
+
+    void clear_cache() override
+    {
+        input_cache_ = Tensor{};
+    }
+
+    std::vector<TensorRef> activation_cache() override
+    {
+        std::vector<TensorRef> r;
+        if (input_cache_.valid()) r.emplace_back(input_cache_);
+        return r;
+    }
+
+    [[nodiscard]] Result<Tensor> forward(
+        const Tensor& input) override
+    {
+        ComputeEngine& engine = engine_ref();
+        const std::uint32_t dff = static_cast<std::uint32_t>(d_ff_);
+        if (!checkpoint_mode_)
+            input_cache_ = input;
+        const std::size_t cols = input.cols();
+        const auto gv = dsl::row_access(input, 0u, dff);      // gate = in[r]
+        const auto uv = dsl::row_access(input, dff, dff);     // up   = in[d_ff + r]
+        const auto r  = dsl::relu(gv);                        // max(g, 0)
+        return dsl::compute(engine, r * r * uv, d_ff_, cols, p_.compute);
+    }
+
+    [[nodiscard]] Result<Tensor> backward(
+        const Tensor& grad_output) override
+    {
+        ComputeEngine& engine = engine_ref();
+        const std::uint32_t dff = static_cast<std::uint32_t>(d_ff_);
+        const std::size_t rows = 2 * d_ff_;
+        const std::size_t cols = grad_output.cols();
+
+        if (input_cache_.rows() != rows || input_cache_.cols() != cols)
+            NN_FAIL("relu2glu backward: input_cache shape mismatch");
+        if (grad_output.rows() != d_ff_ || grad_output.cols() != cols)
+            NN_FAIL("relu2glu backward: grad_output shape mismatch");
+
+        const auto go   = dsl::row_access(grad_output, 0u, dff);
+        const auto gate = dsl::row_access(input_cache_, 0u, dff);
+        const auto up   = dsl::row_access(input_cache_, dff, dff);
+        const auto r    = dsl::relu(gate);
+        // d/dg relu²(g) = 2·relu(g)（g=0 处不可导，取次梯度 0）
+        const auto gg = go * up * (Scalar{2} * r);
+        const auto gu = go * r * r;
+        return dsl::compute(engine,
+            dsl::select(dsl::row() < dsl::rparam(static_cast<nn::Scalar>(d_ff_)), gg, gu),
+            rows, cols, p_.compute);
+    }
+};
+
+// ══════════════════════════════════════════════════════════════════════════
 // LayerNorm — 层归一化
 //
 // 算法（只在此处，不在 Engine/Shader）：
