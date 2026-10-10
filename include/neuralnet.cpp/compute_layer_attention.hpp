@@ -405,6 +405,15 @@ public:
 protected:
     std::size_t d_model_;
     std::size_t num_heads_;
+    // ── GQA（分组查询注意力，docs/development/22 §3.2）─────────────────────
+    // n_head_kv_ == num_heads_ 时退化为 MHA（既有路径逐位不变）。
+    // 头映射 = 块映射：query head h 用 KV head `h / (num_heads_/n_head_kv_)`
+    //（llama.cpp FA 内核 `ik2 = iq2 / rk2` 与 HF `repeat_kv` 的 reshape 一致）。
+    std::size_t n_head_kv_ = 0;
+    // 展开索引表：(num_heads·d_k, 1) 宿主常量（detail::upload_span 上桥）。
+    // 前向 gather_rows(K_kv) → K_full；反向 scatter_add_rows(该表) → grad_K_kv。
+    // MHA 时 invalid（不建表、零开销）。
+    Tensor gqa_expand_idx_;
     std::size_t d_k_;
     std::size_t seq_len_;   // 单样本序列长度（0 = 单样本，cols 即 seq）
     Scalar scale_;
@@ -472,18 +481,24 @@ public:
     AttentionBase(std::size_t d_model, std::size_t num_heads,
                   std::size_t seq_len = 0,
                   bool subln = false,
-                  NormType subln_norm_type = NormType::LayerNorm)
+                  NormType subln_norm_type = NormType::LayerNorm,
+                  std::size_t n_head_kv = 0)
         : d_model_(d_model), num_heads_(num_heads),
+          n_head_kv_(n_head_kv == 0 ? num_heads : n_head_kv),
           d_k_(d_model / num_heads),
           seq_len_(seq_len),
           scale_(Scalar{1} / std::sqrt(static_cast<Scalar>(d_model / num_heads))),
           w_q_(d_model, d_model),
-          w_k_(d_model, d_model),
-          w_v_(d_model, d_model),
+          // Linear(in_features, out_features)：GQA 只收窄**输出**宽度
+          // （K/V 的 out = n_head_kv·d_k），输入侧仍是 d_model。
+          w_k_(d_model, (n_head_kv == 0 ? num_heads : n_head_kv) * (d_model / num_heads)),
+          w_v_(d_model, (n_head_kv == 0 ? num_heads : n_head_kv) * (d_model / num_heads)),
           w_o_(d_model, d_model)
     {
         NN_ASSERT(d_model % num_heads == 0,
                   "AttentionBase: d_model must be divisible by num_heads");
+        NN_ASSERT(n_head_kv_ != 0 && num_heads % n_head_kv_ == 0,
+                  "AttentionBase: num_heads must be divisible by n_head_kv");
         mask_ = std::make_unique<PlainScoreMask>();
         if (subln)
             attn_sub_norm_ = make_norm_layer(d_model, subln_norm_type);
@@ -514,6 +529,22 @@ public:
         NN_TRY(r2, w_k_.init(engine));
         NN_TRY(r3, w_v_.init(engine));
         NN_TRY(r4, w_o_.init(engine));
+        // GQA 展开索引（铁律 #12 允许的"层自算辅助数据：索引表"）。
+        // 块映射：n_rep 个连续 query head 共享一个 KV head。
+        if (n_head_kv_ != num_heads_)
+        {
+            const std::size_t n_rep = num_heads_ / n_head_kv_;
+            std::vector<Scalar> idx(num_heads_ * d_k_);
+            for (std::size_t h = 0; h < num_heads_; ++h)
+            {
+                const std::size_t src = (h / n_rep) * d_k_;
+                for (std::size_t r = 0; r < d_k_; ++r)
+                    idx[h * d_k_ + r] = static_cast<Scalar>(src + r);
+            }
+            NN_TRY(gi, detail::upload_span(engine, num_heads_ * d_k_, 1,
+                                           Precision::F32, idx));
+            gqa_expand_idx_ = std::move(*gi);
+        }
         // M6 段 C：softmax_ 是子 Layer（engine 由 init 绑定），否则 forward 内 fail-fast
         { NN_TRY(r6, softmax_.init(engine)); }
         // 注意力侧位置编码（RoPE/ALiBi 的 init 是 no-op；恒等策略同样 no-op）——
@@ -611,8 +642,25 @@ public:
             NN_FAIL("AttentionBase forward: cols not divisible by seq_len");
         // 1. 线性投影 → Q/K/V: (H*d_k, batch*seq)
         NN_TRY(q_res, w_q_.forward(input));
-        NN_TRY(k_res, w_k_.forward(input));
-        NN_TRY(v_res, w_v_.forward(input));
+        NN_TRY(k_proj, w_k_.forward(input));
+        NN_TRY(v_proj, w_v_.forward(input));
+
+        // 1.5 GQA：把 K/V 从 n_head_kv 个头展开到 num_heads 个（块映射）。
+        //     MHA（表 invalid）= 恒等搬移，零额外拷贝；展开后 fold 注意力与
+        //     AOT 注册表完全不知情（BH 恒 = batch·num_heads）。
+        Tensor k_res, v_res;
+        if (gqa_expand_idx_.valid())
+        {
+            NN_TRY(ke, engine.gather_rows(*k_proj, gqa_expand_idx_));
+            k_res = std::move(*ke);
+            NN_TRY(ve, engine.gather_rows(*v_proj, gqa_expand_idx_));
+            v_res = std::move(*ve);
+        }
+        else
+        {
+            k_res = std::move(*k_proj);
+            v_res = std::move(*v_proj);
+        }
 
         // 2. rearrange: (H*d_k, batch*seq) → (batch*H*d_k, seq)
         //    使 batched_matmul 能按 batch*H 切分行块
@@ -623,17 +671,17 @@ public:
         {
             NN_TRY(qr, engine.rearrange_3d(*q_res, H_dk, batch, seq, false));
             Q = std::move(*qr);
-            NN_TRY(kr, engine.rearrange_3d(*k_res, H_dk, batch, seq, false));
+            NN_TRY(kr, engine.rearrange_3d(k_res, H_dk, batch, seq, false));
             K = std::move(*kr);
-            NN_TRY(vr, engine.rearrange_3d(*v_res, H_dk, batch, seq, false));
+            NN_TRY(vr, engine.rearrange_3d(v_res, H_dk, batch, seq, false));
             V = std::move(*vr);
         }
         else
         {
             // batch=1: rearrange 是恒等拷贝，跳过
             Q = std::move(*q_res);
-            K = std::move(*k_res);
-            V = std::move(*v_res);
+            K = std::move(k_res);
+            V = std::move(v_res);
         }
 
         // 2.5 位置编码：对 Q/K 施加旋转位置编码（rearrange 后列=position，
@@ -852,9 +900,23 @@ public:
         // 9. 投影层反向 + 累加输入梯度
         NN_TRY(giq, w_q_.backward(grad_Q));
         nn_dbg_scan("attn.giq", engine, *giq);
-        NN_TRY(gik, w_k_.backward(grad_K));
+        // GQA：把 grad_K / grad_V 从 num_heads 个头折叠回 n_head_kv 个（与展开
+        // 同一张表；重复行 = 多路累加，正是"多个 query 头共享一个 KV 头"的
+        // 梯度语义）。MHA 时为恒等搬移。
+        auto fold_kv = [&](Tensor&& grad_full) -> Result<Tensor>
+        {
+            if (!gqa_expand_idx_.valid()) return std::move(grad_full);
+            Tensor collapsed = engine.create_tensor(n_head_kv_ * d_k_, grad_full.cols(),
+                                                    grad_full.precision(), InitSpec::zero());
+            if (!collapsed.valid()) NN_FAIL("AttentionBase: GQA 折叠缓冲分配失败");
+            NN_TRY(sr, engine.scatter_add_rows(collapsed, gqa_expand_idx_, grad_full));
+            return collapsed;
+        };
+        NN_TRY(gk_fold, fold_kv(std::move(grad_K)));
+        NN_TRY(gik, w_k_.backward(*gk_fold));
         nn_dbg_scan("attn.gik", engine, *gik);
-        NN_TRY(giv, w_v_.backward(grad_V));
+        NN_TRY(gv_fold, fold_kv(std::move(grad_V)));
+        NN_TRY(giv, w_v_.backward(*gv_fold));
         nn_dbg_scan("attn.giv", engine, *giv);
 
         // grad_input = grad_Q + grad_K + grad_V：三路累加**原地**融合为单趟
@@ -890,20 +952,35 @@ public:
             NN_FAIL("AttentionBase forward_step: x_new must be (d_model, 1)");
         // 1. Q/K/V 投影 → (H*d_k, 1)
         NN_TRY(q_res, w_q_.forward(x_new));
-        NN_TRY(k_new, w_k_.forward(x_new));
-        NN_TRY(v_new, w_v_.forward(x_new));
+        NN_TRY(k_proj, w_k_.forward(x_new));
+        NN_TRY(v_proj, w_v_.forward(x_new));
+
+        // GQA：展开到 num_heads（cache 布局恒 (max_len, num_heads*d_k)，不因 GQA 改变）
+        Tensor k_new, v_new;
+        if (gqa_expand_idx_.valid())
+        {
+            NN_TRY(ke, engine.gather_rows(*k_proj, gqa_expand_idx_));
+            k_new = std::move(*ke);
+            NN_TRY(ve, engine.gather_rows(*v_proj, gqa_expand_idx_));
+            v_new = std::move(*ve);
+        }
+        else
+        {
+            k_new = std::move(*k_proj);
+            v_new = std::move(*v_proj);
+        }
 
         // 1.5 位置编码：对 Q/K 施加当前位置 (cur_len) 的旋转后写入 KV cache
         //     （cache 中的历史 K 已在各自 step 旋转过，相对位置自然成立；
         //      非 RoPE 策略 = 恒等）
         {
             NN_TRY(qr, pos_->apply_qk_step(engine, *q_res, cur_len, /*backward=*/false));
-            NN_TRY(kr, pos_->apply_qk_step(engine, *k_new, cur_len, /*backward=*/false));
+            NN_TRY(kr, pos_->apply_qk_step(engine, k_new, cur_len, /*backward=*/false));
         }
 
         // 2. transpose → (1, H*d_k)，匹配 cache 的行布局
-        NN_TRY(k_new_T, engine.transpose(*k_new));
-        NN_TRY(v_new_T, engine.transpose(*v_new));
+        NN_TRY(k_new_T, engine.transpose(k_new));
+        NN_TRY(v_new_T, engine.transpose(v_new));
 
         // 3. 追加到 KV cache（就地写入第 cur_len 行）
         NN_TRY(r1, engine.insert_rows(k_cache, cur_len, *k_new_T));
@@ -1051,8 +1128,9 @@ public:
                         std::size_t seq_len = 0,
                         PosEncodingType pos_enc = PosEncodingType::Learned,
                         bool subln = false,
-                        NormType subln_norm_type = NormType::LayerNorm)
-        : AttentionBase(d_model, num_heads, seq_len, subln, subln_norm_type)
+                        NormType subln_norm_type = NormType::LayerNorm,
+                        std::size_t n_head_kv = 0)
+        : AttentionBase(d_model, num_heads, seq_len, subln, subln_norm_type, n_head_kv)
     {
         // ① 位置编码：注意力侧**由本层自持**（RoPE 的 cos/sin 表随层构建；
         //    Learned/Sinusoidal 在注意力侧是恒等 → 交回模型侧施加）。

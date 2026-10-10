@@ -41,6 +41,7 @@ struct GptConfig {
     NormType norm_type = NormType::LayerNorm;
     PrecisionProfile precision;  // 模型级精度配置（§9.1，默认全 F32）
     bool subln = false;          // SubLN（BitNet 2B4T 子层归一化，docs 22 §3.1）
+    std::size_t n_head_kv = 0;   // GQA 的 KV 头数（0 = num_heads = MHA，docs 22 §3.2）
 };
 
 // ── 构建 GPT 模型（GptConfig 版本，推荐使用） ────────────────────────────
@@ -56,12 +57,15 @@ struct GptConfig {
         NN_FAIL("GPT d_ff and num_layers must be positive");
     if (cfg.d_model % cfg.num_heads != 0)
         NN_FAIL("GPT d_model must be divisible by num_heads");
+    if (cfg.n_head_kv != 0 && (cfg.n_head_kv > cfg.num_heads ||
+                               cfg.num_heads % cfg.n_head_kv != 0))
+        NN_FAIL("GPT n_head_kv must be a divisor of num_heads (0 = MHA)");
     Model model(engine);
     {
         auto r = model.add<GPTModel>(cfg.vocab_size, cfg.d_model, cfg.seq_len,
                                      cfg.num_heads, cfg.d_ff, cfg.num_layers, cfg.pos_enc,
                                      cfg.activation, cfg.norm_type, cfg.precision,
-                                     cfg.subln);
+                                     cfg.subln, cfg.n_head_kv);
         NN_TRY_CHECK(r);
     }
     return model;
@@ -80,11 +84,12 @@ struct GptConfig {
     ActivationType activation = ActivationType::GeLU,
     NormType norm_type = NormType::LayerNorm,
     PrecisionProfile precision = PrecisionProfile{},
-    bool subln = false)
+    bool subln = false,
+    std::size_t n_head_kv = 0)
 {
     return build_gpt_model(engine, GptConfig{
         vocab_size, d_model, seq_len, num_heads, d_ff, num_layers,
-        pos_enc_type, activation, norm_type, precision, subln});
+        pos_enc_type, activation, norm_type, precision, subln, n_head_kv});
 }
 
 // ── 从 ModelSpec 构建 GPT 模型 ──────────────────────────────────────────
@@ -103,7 +108,7 @@ struct GptConfig {
         spec.vocab_size, spec.d_model, spec.seq_len,
         spec.num_heads, spec.d_ff, spec.num_layers,
         spec.pos_encoding, spec.activation, spec.norm_type, precision,
-        spec.subln);
+        spec.subln, spec.n_head_kv);
     if (model)
         model->set_spec(spec);  // 记录架构规格，供 load_model 校验
     return model;
@@ -120,7 +125,8 @@ struct GptConfig {
     PosEncodingType pos_encoding = PosEncodingType::Learned,
     ActivationType activation = ActivationType::GeLU,
     NormType norm_type = NormType::LayerNorm,
-    bool subln = false)
+    bool subln = false,
+    std::size_t n_head_kv = 0)
 {
     ModelSpec spec;
     spec.type         = ModelType::GPT;
@@ -134,6 +140,7 @@ struct GptConfig {
     spec.activation   = activation;
     spec.norm_type    = norm_type;
     spec.subln        = subln;
+    spec.n_head_kv    = n_head_kv;
     return spec;
 }
 

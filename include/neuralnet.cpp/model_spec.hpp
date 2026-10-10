@@ -144,6 +144,12 @@ struct ModelSpec
     //        （类型 = norm_type；2B4T = RMSNorm，宽 d_model / d_ff）
     bool subln = false;
 
+    // n_head_kv：GQA 的 KV 头数。**0 = 与 num_heads 相同（= MHA，旧语义）**。
+    //   缺键 → 0 → 旧文件零破坏。2B4T 是 20 query / 5 KV。
+    std::size_t n_head_kv = 0;
+    [[nodiscard]] std::size_t n_head_kv_or_heads() const noexcept
+    { return n_head_kv == 0 ? num_heads : n_head_kv; }
+
     // ── 线性层权重是否三值（T1_58；P1 覆盖 MLP 路径）──
     // 缺键 → None（旧文件零破坏）。见 WeightQuant 注释与 docs 21 §4.7。
     WeightQuant weight_quant = WeightQuant::None;
@@ -192,6 +198,7 @@ struct ModelSpec
                a.activation   == b.activation &&
                a.norm_type    == b.norm_type &&
                a.subln        == b.subln &&
+               a.n_head_kv_or_heads() == b.n_head_kv_or_heads() &&
                a.weight_quant == b.weight_quant;
     }
 
@@ -286,7 +293,9 @@ struct ModelSpec
                ",heads=" + std::to_string(s.num_heads) +
                ",d_ff=" + std::to_string(s.d_ff) +
                ",layers=" + std::to_string(s.num_layers) +
-               (s.subln ? ",subln=1" : "") + ")";
+               (s.subln ? ",subln=1" : "") +
+               (s.n_head_kv_or_heads() != s.num_heads
+                    ? ",kv_heads=" + std::to_string(s.n_head_kv_or_heads()) : "") + ")";
     }
     if (s.is_cnn())
     {
