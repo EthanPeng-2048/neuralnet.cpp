@@ -260,6 +260,14 @@ private:
     std::unique_ptr<Layer> ln_f_;
     Linear lm_head_;
 
+    // ── tied embedding（docs/development/22 §3.3）────────────────────────
+    // true：head 复用 token_emb_（logits = W_embᵀ·x），lm_head_ 不建参数、
+    //       不进 parameters()；head 侧 dW 累加进 grad_token_emb_（与嵌入侧
+    //       的 scatter_add_rows 同一张缓冲，优化器每步只清一次）。
+    // false（默认）：ls_head_ 是独立 Linear —— 既有路径逐位不变。
+    bool tie_embeddings_ = false;
+    Tensor head_input_cache_;   // tied 时 head 侧求 dW 所需的输入（ln_f 输出）
+
     // 反向缓存
     Tensor stored_tokens_tensor_;          // token IDs 的 Tensor 版本 (total, 1)
     std::size_t batch_size_ = 0;
@@ -280,6 +288,21 @@ private:
     // activation offload（L1-offload）：把每块内部激活搬 host-visible，backward 拷回
     bool activation_offload_ = false;
 
+    // ── LM head 前向（tied / 独立两条路）─────────────────────────────────
+    // tied：logits = token_emb_ · x —— token_emb_ (V,D) **就是** head 的权重
+    // （weight tying：logits[v] = <emb_v, x>），因此不做转置。
+    // 输出精度取 p_.stable —— 与独立 head 的 head_prof.compute = stable 同款
+    // 理由（docs 21 §9.2：logits 是最大张量、被 loss 链多次读取，留 f16 会物化
+    // 多份 f32 副本 → OOM）。
+    [[nodiscard]] Result<Tensor> head_forward_(ComputeEngine& engine, const Tensor& x)
+    {
+        if (!tie_embeddings_)
+            return lm_head_.forward(x);
+        return dsl::compute(engine,
+            dsl::matmul(token_emb_, x, /*transA=*/false, /*transB=*/false),
+            vocab_size_, x.cols(), p_.stable);
+    }
+
 public:
     GPTModel(std::size_t vocab_size, std::size_t d_model, std::size_t seq_len,
              std::size_t num_heads, std::size_t d_ff, std::size_t num_layers,
@@ -288,10 +311,12 @@ public:
              NormType norm_type = NormType::LayerNorm,
              PrecisionProfile precision = PrecisionProfile{},
              bool subln = false,
-             std::size_t n_head_kv = 0)
+             std::size_t n_head_kv = 0,
+             bool tie_embeddings = false)
         : vocab_size_(vocab_size), d_model_(d_model), seq_len_(seq_len),
           ln_f_(make_norm_layer(d_model, norm_type)),
-          lm_head_(d_model, vocab_size)
+          lm_head_(d_model, vocab_size),
+          tie_embeddings_(tie_embeddings)
     {
         // D7：将精度配置注入自身和所有子层（§9.2）
         set_precision_profile(precision);
@@ -304,6 +329,7 @@ public:
         // OOM（探针 transient 桶 6 项/3.1GB）。head 用 stable 后 logits 与 f32
         // 基线同构（零 cast），f16 的收益集中在隐藏层激活（体积小、生命周期短）。
         // 真正的 f16 logits 需要 in-kernel f16（typed IR，docs 05 §12.3 Phase 2）。
+        if (!tie_embeddings_)
         {
             PrecisionProfile head_prof = precision;
             head_prof.compute = precision.stable;
@@ -340,6 +366,7 @@ public:
     {
         Layer::set_precision_profile(profile);
         if (ln_f_) ln_f_->set_precision_profile(profile);
+        if (!tie_embeddings_)
         {
             PrecisionProfile head_prof = profile;
             head_prof.compute = profile.stable;
@@ -373,26 +400,36 @@ public:
         {
             NN_TRY(r, ln_f_->init(engine));
         }
-        { NN_TRY(r, lm_head_.init(engine)); }
+        if (!tie_embeddings_) { NN_TRY(r, lm_head_.init(engine)); }
         return {};
     }
 
     std::vector<TensorRef> parameters() override
     {
-        return collect_refs(token_emb_,
-                            pos_encoder_->parameters(),
-                            collect_block_refs_(blocks_, &GPTBlock::parameters),
-                            ln_f_->parameters(),
-                            lm_head_.parameters());
+        auto refs = collect_refs(token_emb_,
+                                 pos_encoder_->parameters(),
+                                 collect_block_refs_(blocks_, &GPTBlock::parameters),
+                                 ln_f_->parameters());
+        if (!tie_embeddings_)
+        {
+            auto h = lm_head_.parameters();
+            refs.insert(refs.end(), h.begin(), h.end());
+        }
+        return refs;
     }
 
     std::vector<TensorRef> param_gradients() override
     {
-        return collect_refs(grad_token_emb_,
-                            pos_encoder_->param_gradients(),
-                            collect_block_refs_(blocks_, &GPTBlock::param_gradients),
-                            ln_f_->param_gradients(),
-                            lm_head_.param_gradients());
+        auto refs = collect_refs(grad_token_emb_,
+                                 pos_encoder_->param_gradients(),
+                                 collect_block_refs_(blocks_, &GPTBlock::param_gradients),
+                                 ln_f_->param_gradients());
+        if (!tie_embeddings_)
+        {
+            auto h = lm_head_.param_gradients();
+            refs.insert(refs.end(), h.begin(), h.end());
+        }
+        return refs;
     }
 
     // 文档感知：设置当前 step 每样本文档 id（batch-major b*seq+t → doc id）。
@@ -473,8 +510,13 @@ public:
         x = std::move(*ln);
 
         // ── 6. LM Head → (vocab_size, seq*batch) batch-major ──
-        auto lm_out = lm_head_.forward(x);
-        return lm_out;
+        // tied：缓存 head 输入（backward 求 dW_emb 用），再走 head_forward_
+        if (tie_embeddings_)
+        {
+            NN_TRY(hc, engine.clone(x));
+            head_input_cache_ = std::move(*hc);
+        }
+        return head_forward_(engine, x);
     }
 
     [[nodiscard]] Result<Tensor> backward(
@@ -491,8 +533,29 @@ public:
         // (void)engine.zero(grad_token_emb_);
 
         // ── 1. LM Head 反向 → (d_model, seq*batch) ──
-        NN_TRY(b_lm, lm_head_.backward(grad_output));
-        Tensor grad_x = std::move(*b_lm);
+        Tensor grad_x;
+        if (tie_embeddings_)
+        {
+            // dX = W_embᵀ·g
+            auto dx = dsl::compute(engine,
+                dsl::matmul(token_emb_, grad_output, /*transA=*/true, /*transB=*/false),
+                d_model_, grad_output.cols(), p_.stable);
+            NN_TRY_CHECK(dx);
+            grad_x = std::move(*dx);
+            // dW_emb += g·xᵀ —— 与第 5 步的 scatter_add_rows **累加到同一张
+            // grad_token_emb_**（token_emb_ 同时充当输入嵌入与输出权重）。
+            auto dw = dsl::compute_into(engine,
+                dsl::leaf(grad_token_emb_)
+                    + dsl::matmul(grad_output, head_input_cache_, /*transA=*/false,
+                                  /*transB=*/true),
+                grad_token_emb_);
+            NN_TRY_CHECK(dw);
+        }
+        else
+        {
+            NN_TRY(b_lm, lm_head_.backward(grad_output));
+            grad_x = std::move(*b_lm);
+        }
 
         // ── 2. LayerNorm/RMSNorm 反向 ──
         NN_TRY(b_ln, ln_f_->backward(grad_x));
@@ -592,6 +655,7 @@ public:
         for (auto& b : blocks_) b.clear_cache();
         ln_f_->clear_cache();
         lm_head_.clear_cache();
+        head_input_cache_ = Tensor{};
         checkpoint_inputs_.clear();
     }
 
@@ -636,7 +700,7 @@ public:
 
         // 4. 最终 LayerNorm + LM Head → (vocab_size, 1)
         NN_TRY(ln, ln_f_->forward(x));
-        return lm_head_.forward(*ln);
+        return head_forward_(engine, *ln);
     }
 
     // ── 采样生成（KV cache 增量推理）────────────────────────────────

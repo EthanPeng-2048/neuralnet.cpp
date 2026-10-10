@@ -471,6 +471,142 @@ void test_gqa_spec()
     std::remove(file.c_str());
 }
 
+// ── [10] tied embedding：参数条数 / 数值等价 / 梯度累加 ──────────────────
+void test_tied_embedding()
+{
+    std::puts("[10] tied embedding：参数条数 / 数值等价 / 梯度累加");
+    nn::CpuEngine eng;
+    const std::size_t V = 64, D = 32, S = 8, H = 4, FF = 64, L = 2, B = 2, N = S * B;
+
+    auto mk = [&](bool tie) {
+        auto m = std::make_unique<nn::GPTModel>(
+            V, D, S, H, FF, L, nn::PosEncodingType::Learned,
+            nn::ActivationType::SwiGLU, nn::NormType::RMSNorm,
+            nn::PrecisionProfile{}, /*subln=*/false, /*n_head_kv=*/0, /*tie=*/tie);
+        NN_EXIT(m->init(eng), 1, "GPTModel init 失败: ");
+        return m;
+    };
+
+    auto off = mk(false);
+    auto on  = mk(true);
+    const std::size_t n_off = count_params(off->parameters());
+    const std::size_t n_on  = count_params(on->parameters());
+    std::printf("    off=%zu on=%zu Δ=%zu（期望 %zu = V*D + V）\n",
+                n_off, n_on, n_off - n_on, V * D + V);
+    CHECK(n_off - n_on == V * D + V, "tied 少 head 的 (w,b) 两张");
+
+    auto po = on->parameters();
+    auto pf = off->parameters();
+    CHECK(pf.size() == po.size() + 2, "非 tied 比 tied 多 2 张参数");
+    if (pf.size() != po.size() + 2) return;
+
+    // 数值等价构造：非 tied 的 head 权重 = token_emb、bias = 0，其余参数 1:1
+    for (std::size_t i = 0; i < po.size(); ++i)
+    {
+        const nn::Matrix w = download(eng, po[i].get());
+        NN_EXIT(eng.copy_from(pf[i].get(), w), 1, "拷贝参数失败: ");
+    }
+    NN_EXIT(eng.copy_from(pf[po.size()].get(), download(eng, po[0].get())),
+            1, "head.w ← token_emb 失败: ");
+    {
+        nn::Matrix zb(V, 1);
+        for (auto& v : zb.span()) v = 0.0f;
+        NN_EXIT(eng.copy_from(pf[po.size() + 1].get(), zb), 1, "head.b ← 0 失败: ");
+    }
+
+    nn::Matrix x_m(S, B);
+    for (std::size_t i = 0; i < x_m.size(); ++i)
+        x_m.span()[i] = static_cast<float>((i * 5 + 1) % V);
+    const nn::Tensor x = upload(eng, x_m);
+
+    auto y_on = on->forward(x);
+    NN_EXIT(y_on, 1, "tied forward 失败: ");
+    auto y_off = off->forward(x);
+    NN_EXIT(y_off, 1, "非 tied forward 失败: ");
+    const double fd = max_abs_diff(download(eng, *y_on), download(eng, *y_off));
+    std::printf("    tied vs 等价非 tied：forward 最大差 = %.6g\n", fd);
+    CHECK(fd < 1e-5, "tied 前向 = 独立 head（权重 = 嵌入、bias=0）");
+
+    auto g = make_tensor(eng, V, N, 0.01f, 0.0003f);
+    auto b_on = on->backward(g);
+    NN_EXIT(b_on, 1, "tied backward 失败: ");
+    auto b_off = off->backward(g);
+    NN_EXIT(b_off, 1, "非 tied backward 失败: ");
+
+    // token_emb 的梯度必须 = 嵌入侧(scatter) + head 侧(dW)，即"累加"而非覆盖
+    const nn::Matrix gt = download(eng, on->param_gradients()[0].get());
+    const nn::Matrix ge = download(eng, off->param_gradients()[0].get());
+    const nn::Matrix gh = download(eng, off->param_gradients()[po.size()].get());
+    nn::Matrix expect(V, D);
+    for (std::size_t r = 0; r < V; ++r)
+        for (std::size_t c = 0; c < D; ++c)
+            expect.set_value(r, c, ge.at(r, c) + gh.at(r, c));
+    const double gd = max_abs_diff(gt, expect);
+    std::printf("    tied 的 token_emb 梯度 vs (嵌入+head) 最大差 = %.6g\n", gd);
+    CHECK(gd < 1e-5, "tied：两条梯度路径累加到同一张 grad_token_emb_");
+
+    // 输入梯度也应与非 tied 等价
+    const double id = max_abs_diff(download(eng, *b_on), download(eng, *b_off));
+    CHECK(id < 1e-5, "tied 的输入梯度与非 tied 等价");
+}
+
+// ── [11] tied embedding 规格往返 + spec_matches ─────────────────────────
+void test_tied_spec()
+{
+    std::puts("[11] tied embedding 规格往返 + spec_matches");
+    const auto mk = [](bool tie) {
+        return nn::make_gpt_spec(64, 32, 8, 4, 64, 2, nn::PosEncodingType::Learned,
+                                 nn::ActivationType::SwiGLU, nn::NormType::RMSNorm,
+                                 true, 2, tie);
+    };
+    CHECK(!mk(false).tie_embeddings, "缺省 = false（旧文件语义）");
+    CHECK(!nn::spec_matches(mk(false), mk(true)), "tie 不同 → 不匹配");
+    CHECK(nn::spec_matches(mk(true), mk(true)), "同配置 → 匹配");
+
+    const std::string file = "bitnet_struct_tied_roundtrip.bin";
+    const std::size_t V = 64, D = 32, S = 8, H = 4, FF = 64, L = 2, B = 2;
+    nn::CpuEngine eng;
+    nn::GptConfig cfg;
+    cfg.vocab_size = V; cfg.d_model = D; cfg.seq_len = S;
+    cfg.num_heads = H;  cfg.d_ff = FF;   cfg.num_layers = L;
+    cfg.pos_enc = nn::PosEncodingType::Learned;
+    cfg.activation = nn::ActivationType::SwiGLU;
+    cfg.norm_type = nn::NormType::RMSNorm;
+    cfg.subln = true;
+    cfg.n_head_kv = 2;
+    cfg.tie_embeddings = true;
+    const nn::ModelSpec spec = nn::make_gpt_spec(
+        V, D, S, H, FF, L, cfg.pos_enc, cfg.activation, cfg.norm_type,
+        cfg.subln, cfg.n_head_kv, cfg.tie_embeddings);
+
+    nn::Matrix x_m(S, B);
+    for (std::size_t i = 0; i < x_m.size(); ++i) x_m.span()[i] = static_cast<float>(i % V);
+
+    nn::Matrix y_ref;
+    {
+        auto m = nn::build_gpt_model(eng, cfg);
+        NN_EXIT(m, 1, "build_gpt_model(tied) 失败: ");
+        auto y = m->forward(upload(eng, x_m));
+        NN_EXIT(y, 1, "tied forward 失败: ");
+        y_ref = download(eng, *y);
+        NN_EXIT(nn::save_model(file, *m, spec), 1, "save_model 失败: ");
+    }
+    {
+        auto peeked = nn::peek_model_spec(file);
+        CHECK(peeked.has_value() && peeked->tie_embeddings, "规格记住 tie_embeddings");
+        if (!peeked.has_value()) { std::remove(file.c_str()); return; }
+        auto m2 = nn::build_gpt_model_from_spec(eng, *peeked);
+        NN_EXIT(m2, 1, "build_gpt_model_from_spec(tied) 失败: ");
+        NN_EXIT(nn::load_model(file, *m2), 1, "load_model 失败: ");
+        auto y = m2->forward(upload(eng, x_m));
+        NN_EXIT(y, 1, "重建模型 forward 失败: ");
+        const double d = max_abs_diff(y_ref, download(eng, *y));
+        std::printf("    往返后前向最大差 = %.6g\n", d);
+        CHECK(d == 0.0, "tied 往返后前向逐位一致");
+    }
+    std::remove(file.c_str());
+}
+
 // ── [6] 端到端小训练（L2 损失：直接给 logits 梯度，避开 CE 依赖）──────────
 bool test_training(nn::ComputeEngine& eng, const char* tag)
 {
@@ -563,6 +699,8 @@ int main(int argc, char* argv[])
     test_gqa_mha_equivalence();
     test_gqa_head_mapping();
     test_gqa_spec();
+    test_tied_embedding();
+    test_tied_spec();
 
     if (gpu)
     {
