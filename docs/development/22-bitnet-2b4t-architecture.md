@@ -1,6 +1,8 @@
 # BitNet b1.58 2B4T 的结构对齐：SubLN / GQA / Tied Embedding
 
-> **状态**：**立项 + S1/S2/S3 全部实施完成**（2026-10-10 立项，同日三步落地并提交）。
+> **状态**：**立项 + S1/S2/S3/S4 + P2 全部实施完成**（2026-10-10 立项，同日落地并提交）。
+> 已落地：SubLN、GQA、tied embedding（S1–S3）、**FFN 激活 ReLU²**（S4，官方 `hidden_act`）、
+> **GQA 的 in-kernel 头映射**（P2，省掉 K/V 的头展开物化）。
 > **构建与验收在 `ethan@192.168.1.102`**（Windows + LLVM clang 23 + 真实 GPU
 > NVIDIA CMP 40HX）：全量 **ctest 30/30 通过**；本机（软件 Vulkan/llvmpipe）
 > 曾把 `expr_gpu_test`/`fused_gpu_test` 的退出段问题误判为回归，故改到 102 上验收。
@@ -29,7 +31,8 @@
 | 7 | GQA 的实现形态 | **显式展开 K/V 头**（`gather_rows` 前向 / `scatter_add_rows` 反向），fold 注意力与 AOT 注册表**零改动**；in-kernel 版留 P2 |
 | 8 | Tied embedding 的实现形态 | `GPTModel` 内一个开关（`tie_embeddings`）：head 复用 `token_emb_`，梯度累加进 `grad_token_emb_`（与 `scatter_add_rows` 的嵌入梯度**共存累加**） |
 | 9 | CLI 预设 | **不加**。不引入 `--model bitnet`；三个开关先只到库 API + `ModelSpec`（GUI 预设留待以后） |
-| 10 | ReLU² 激活 | **待定**（§9）：需先确认官方 `config.json` 的 `hidden_act`；llama.cpp 明确不支持 gated squared relu（`llama-graph.cpp:2293` `GGML_ABORT`），因此这条路没有 llama.cpp 可对拍 |
+| 10 | ReLU² 激活 | **已落地（S4）**：`ActivationType::ReLU2 = 2` + 新层 `ReLU2GLU`（门控平方 ReLU：`out = relu²(gate)·up`，与 SwiGLU 同接线、单表达式全融合）；CLI `--activation relu2`。llama.cpp 对 gated squared relu 明确 `GGML_ABORT`（`llama-graph.cpp:2293`）→ 无 llama.cpp 可对拍，验收改为**与宿主解析式对拍** |
+| 13 | **GQA 的 in-kernel 头映射（P2）** | **已落地**：新视图种类 `ExprViewKind::HeadGroup`（读取语义同 Linear），头分组比放 `views[].param` —— 它是**运行期形状数据、不进 key**（经既有 push constant vp 槽填充）→ **任意 n_rep 共用一份 AOT shader**；训练路径**完全不展开 K/V**（增量推理路径保持不变，见 §3.2.1） |
 | 11 | 范围 | 本轮只做 **GPT**；RAPT（ReLU 线性注意力）**不**挂这三项——它的注意力不是 softmax 注意力，做三值权重可以，但那不叫 BitNet |
 | 12 | 序列化 | `ModelSpec` 追加 `subln` / `n_head_kv` / `tie_embeddings` **三个键**，缺键 = 旧语义 → **不升 `MODEL_VERSION`**（与 `weight_quant`、`norm_place` 同款） |
 
@@ -145,6 +148,29 @@ in-kernel 版作为 P2 优化项记录）。
 **KV-cache 路径**：`forward_step` 里同样展开（`k_new`/`v_new` 投影后 `gather_rows`），
 **cache 布局不变**（仍 `(max_len, n_head*d_k)`）→ 增量推理代码零改动。
 
+#### 3.2.1 P2：把头映射做进 kernel（训练路径完全不展开）
+
+S2 的展开方案有实打实的代价：`n_rep` 倍物化（两个全尺寸缓冲）+ 两次全尺寸 gather +
+反向两次额外分配，且 `K_cache_/V_cache_` 要跨 backward 驻留全尺寸。P2 去掉它：
+
+- **新视图种类 `ExprViewKind::HeadGroup`**：读取语义与 `Linear` **完全相同**（恒等索引），
+  区别只在 `param` = **头分组比 n_rep**。行块号写成 `base / ratio`。
+- **为什么是"视图参数"而不是"算子结构字段"**：`views[].param` 被
+  `expr_view_has_runtime_param` 判定为**运行期形状数据** → 不进 `expr_spec_key`、
+  经既有 push constant `vp` 槽填充。若做成 `MatmulSpec` 的字段并进 key，
+  **每个 n_rep 各要一份 shader**，闭合世界对未登记的 n_rep 必然硬报错。
+- **单一真源** `nn::gqa_ratio_of(spec, view_idx)`：GPU 生成器与 CPU 参考都从这里取，
+  避免两侧口径漂移。
+- 覆盖三处：fold 的 mm 段 A/B 两侧、fold 的 vecacc（`V_t`）、独立 bmm 的 A/B 两侧
+  （`masked_scores` 的 K、`grad_A` 的 V、`grad_Q` 的 K）。
+- **CPU**：`MatmulRef::prepare_cpu`（预绑定走通用 `batched_matmul`、无头映射语义）在
+  ratio>1 时直接拒绝 → 上层回退解释器（`eval_expr` 的 MatmulSpec/vecacc 分支已支持）。
+  "预绑定只是优化，回退不引入正确性风险"是既有契约。
+- **训练 vs 推理**：`AttentionBase::forward`（训练）不展开；`forward_step`（增量推理）
+  仍展开 —— KV cache 布局恒 `(max_len, H·d_k)`，增量推理代码零改动。
+- **效应**：注意力的 K/V 工作集从 ~3×（Q+K_full+V_full）降到 ~1.5×（Q+K/V 各 1/n_rep），
+  省掉 2 个全尺寸缓冲 + 2 次全尺寸 gather；`K_cache_/V_cache_` 的跨 backward 驻留缩到 1/n_rep。
+
 ### 3.3 Tied embedding
 
 关闭时（默认）：`lm_head_` 是独立 `Linear(d_model, vocab_size)` —— 布局与今天逐位一致。
@@ -195,6 +221,8 @@ GPT 家族分支**逐字段比对**（漏比 = 允许把不匹配的权重加载
 |---|---|---|
 | **S1 ✅** SubLN | `AttentionBase`/`FeedForward` 加可选 sub-norm（§3.1）；`GPTBlock`/`GPTModel`/`GptConfig` 透传；`ModelSpec.subln` | ① 参数增量 = `layers×(d_model+d_ff)`（RMSNorm；实测 288 = 3×(32+64)）；LayerNorm 翻倍 576 ✅；② 子层 norm 参数梯度非零 ✅；③ 同权重消融 on≠off（最大差 0.388）✅；④ 规格往返逐位一致 ✅；⑤ 端到端 loss 592→3e-6 ✅；⑥ ctest 30/30 ✅ |
 | **S2 ✅** GQA | `AttentionBase` 加 `n_head_kv_` + 展开表（§3.2）；`CausalSelfAttention`/`GPTBlock`/`GPTModel`/`GptConfig` 透传；`ModelSpec.n_head_kv` | ① `n_head_kv == num_heads` 与 MHA 前向/输入梯度**逐位相同**（差 = 0）✅；② 与"把 K/V 权重按块映射复制成 MHA"对拍：前向差 **0**、输入梯度 1.19e-7、K/V 权重梯度 = 组内和 ✅（该用例**钉住块映射约定**）；③ 规格往返逐位一致 ✅；④ ctest 30/30 ✅ |
+| **S4 ✅** ReLU² | 官方 `hidden_act="relu2"`：`ActivationType::ReLU2 = 2` + 新层 `ReLU2GLU`（门控平方 ReLU）；CLI/GUI 同步；`scan_exprs` 模型 pass 补 `gpt_rope_relu2_rms` | ① `ReLU2GLU` 前向 vs 宿主 `relu²(gate)·up` 差 **0**、反向 vs 解析式 4.47e-8 ✅；② ReLU² 进 GPT（叠加 subln+GQA+tied）前向/反向跑通 ✅；③ 全量 ctest 30/30 ✅ |
+| **P2 ✅** GQA in-kernel | K/V 不展开（`HeadGroup` 视图 + 运行期 vp 比率）；fold/bmm/vecacc 三处行块号按比率取；`scan_exprs` 显式登记 attention fold 的 GQA 变体 | ① **测试与登记故意用不同配置**（heads=4/n_kv=2 vs heads=2/n_kv=1）仍命中同一 fold key → 证明"任意 n_rep 共用一份 shader" ✅；② CPU 与**真实 GPU** 双向对拍：与"按块映射复制成 MHA"前向差 **0**、输入梯度 1.19e-7 ✅；③ 全量 ctest 30/30 ✅ |
 | **S3 ✅** Tied embedding | `GPTModel` 开关（§3.3）；`ModelSpec.tie_embeddings` | ① 参数条数差 = `V·D + V`（实测 2112 = 64·32+64）✅；② 与"head 权重显式设为 `token_emb_`、bias=0"的等价构造对拍：前向差 **0** ✅；③ **梯度累加**：tied 的 `token_emb` 梯度 == 非 tied 的（嵌入梯度 + head 的 dW），差 **0** ✅；④ 规格往返逐位一致 ✅；⑤ ctest 30/30 ✅ |
 
 **统一回归口径**（每步都要满足）：
@@ -270,6 +298,8 @@ graph TB
 | S1 | `P1.5-S1 SubLN：子层内部的额外归一化（BitNet 2B4T）` | 子层可选 norm + 透传 + `ModelSpec.subln` + `src/bitnet_struct_test.cpp`（[1]–[6]）+ CMake 注册（ctest 28 → 30） |
 | S2 | `P1.5-S2 GQA：分组查询注意力 + 头映射展开` | `n_head_kv` + 展开表（前向 `gather_rows` / 反向 `scatter_add_rows`）+ 透传 + `ModelSpec.n_head_kv` + 测试 [7]–[9] |
 | S3 | `P1.5-S3 tied embedding：head 复用 token embedding` | `tie_embeddings` 开关 + 梯度累加 + `ModelSpec.tie_embeddings` + 测试 [10]–[11] |
+| S4 | `P1.5-S4 ReLU²（BitNet 2B4T 的 hidden_act）` | `ActivationType::ReLU2` + `ReLU2GLU` 层 + FeedForward 接线 + CLI/GUI + scan 模型 pass + 测试 [12]–[13] |
+| P2 | `P1.5-P2 GQA in-kernel 头映射（省掉 K/V 的头展开物化）` | `ExprViewKind::HeadGroup` + `gqa_ratio_of` + fold/bmm/vecacc 比率 + AttentionBase 不展开 + scan 显式 fold 登记 + GPU 侧对拍 |
 | 4 | `P1.5 文档同步` | 本文状态/实施记录 + `AGENTS.md` + `docs/history.md` |
 
 ---
@@ -285,16 +315,14 @@ graph TB
 
 ### 待定
 
-1. **FFN 激活 = ReLU²？** 官方 2B4T 的 FFN 口径需要 `config.json` 的 `hidden_act` 确认
-   （预期 `"relu2"`，即 gated：`relu²(gate(x)) · up(x)`）。若成立，需要新增
-   `ActivationType::ReLU2` + `FeedForward` 的一个分支（复用 SwiGLU 的 split 机制，只换逐元素函数）。
-   **注意**：llama.cpp 的 BITNET arch 用的是 **SwiGLU**（对应更早的 26 层 3B 版），且
-   `llama-graph.cpp:2293` 对 gated squared relu 明确 `GGML_ABORT` —— 所以这条路**没有 llama.cpp 可对拍**，
-   只能回官方 HF 实现。
-2. **GQA 的 in-kernel 版本**（P2）：把头映射做进 fold body，省掉 `n_rep` 倍的 K/V 物化。
-3. **CLI/GUI 暴露**：本轮只到库 API + `ModelSpec`；`--model bitnet` 预设**明确不做**，
-   GUI 的 BitNet 预设留待以后。
-4. **权重转换器**：从 HF 2B4T checkpoint 加载（含逐张量三值化 + 尺度折算）——另立。
+1. **`--model bitnet` 预设**：**明确不做**（用户裁定）；GUI 的 BitNet 预设留待以后。
+   当前暴露面 = 库 API + `ModelSpec` + 通用 `--activation relu2`。
+2. **权重转换器**：从 HF 2B4T checkpoint 加载（含逐张量三值化 + 尺度折算）——另立。
+3. **P1 的权重侧接线（21 §4.8.3 的 P1.5）**：`make_linear_layer` + `unique_ptr<Layer>`
+   让 GPT/RAPT 的线性层也能是 `BitLinear`（三值端到端）——与本文的结构三项正交，
+   仍未做。
+4. **`forward_step` 的增量推理**仍展开 K/V（保持 KV cache 布局不变）；若要省掉它，
+   需要同时改 attention 的增量路径与 cache 布局——收益低于训练路径，暂不做。
 
 ### 已否决
 
@@ -324,6 +352,13 @@ graph TB
    并不相同，测试里的 A/B 必须**显式拷贝权重**。（与 `gpt_checkpoint_test.cpp` 文件头注释一致。）
 4. **tied head 不转置**：`token_emb_ (V,D)` **就是** head 的权重矩阵，`logits = W_emb·x`；
    只有 backward 的 `dX = W_embᵀ·g` 需要 `transA=true`。
-5. **验收机器 = 102**：本机（软件 Vulkan/llvmpipe）的 `expr_gpu_test`/`fused_gpu_test`
+5. **attention fold 不在 `dsl::compute` 路径上**：层 forward 直调 `engine.eval_expr`，
+   因此 **fold 结构只能由 `scan_exprs` 的显式登记块产出**（dry-run/模型 pass 都收集不到）。
+   P2 的 GQA fold 变体（K/V_t 走 `HeadGroup` 视图）最初只加在模型 pass 的用例里 →
+   GPU 闭合世界硬报错；补进显式块后结构数 102 → **107**。
+6. **头分组比必须做成"视图参数"而不是"算子字段"**：视图 `param` 是运行期形状数据
+   （不进 key、经 push constant `vp` 槽），所以任意 `n_rep` 共用一份 shader。
+   实测：测试用 heads=4/n_kv=2、登记用 heads=2/n_kv=1，两侧仍命中同一 fold key。
+7. **验收机器 = 102**：本机（软件 Vulkan/llvmpipe）的 `expr_gpu_test`/`fused_gpu_test`
    在退出段随机段错（基线同样复现、且故障时已打印 `ALL PASS`）；102 的真实 GPU 上
    30/30 全绿 —— 避免把环境问题误判成代码回归。
