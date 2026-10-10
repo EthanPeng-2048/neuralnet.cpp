@@ -1098,14 +1098,10 @@ private:
         NN_TRY(ec, bind_check_({&packed, &scale, &B}));
         if (!supports_ternary_gemm())
             NN_FAIL("matmul_q: 该引擎不支持三值 GEMM（docs 21 §5 P2）");
-        // 打包容器恒 f32 容器；B 为 f16 时抬 f32 计算、结果按 P 落回（同
-        // matmul_with_bias 的边界 cast 口径）。带类型（in-kernel f16）变体留待
-        // 需要时按 matmul 的先例加。
-        auto b32 = to_f32(B);
-        NN_TRY_CHECK(b32);
-        NN_TRY(raw, matmul_q_impl(packed, scale, *b32, transA, out_rows,
-                                 Precision::F32));
-        return stamp_(to_prec(std::move(*raw), P));
+        // 精度策略与 matmul 同款：非 f32 下传引擎自行决定（GPU 有 in-kernel f16
+        // 变体 → 直读 f16 的 B / 直写 f16 的 C，零边界 cast；CPU/无变体时由
+        // 引擎内部抬 f32 计算 + 按 P 落回，见各 *matmul_q_impl*）。
+        return stamp_(matmul_q_impl(packed, scale, B, transA, out_rows, P));
     }
 
 public:
