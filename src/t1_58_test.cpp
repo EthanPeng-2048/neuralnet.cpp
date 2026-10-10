@@ -11,6 +11,8 @@
 //   [6] BitLinear：量化输出逐位符合 τ 规则（absmean + per-row）
 //   [7] BitLinear：latent 权重的 STE 梯度 = 解析式（数值梯度只对 latent 做）
 //   [8] BitLinear MLP 端到端小训练（CPU；`--gpu` 时在 GPU 上跑）
+//   [9] 精度预设 profile_t1_58()（CLI `--t1_58`）：字段 + 工厂真的接成 BitLinear
+//       + 端到端几十步（三值权重 + f16 存储）
 //
 // 子进程模式：--expect-post-init-abort（父进程 std::system 自举）
 // 退出码：0 = 通过，1 = 失败，77 = 跳过（--gpu 且无设备）
@@ -581,6 +583,101 @@ bool test_training(nn::ComputeEngine& eng, const char* dev)
     return true;
 }
 
+// ── [9] 精度预设 profile_t1_58()（CLI `--t1_58` 的语义）───────────────────
+// 预设 = **f16 存储 + 三值权重**：四槽逐项 {T1_58, F16, F32, F32}，即 profile_f16()
+// 把 param 换成 T1_58（另三槽逐字段相同 → "其他默认 f16"）。本用例钉死两件事：
+//   ① 字段值（含"与 --f16 只在 param 槽不同"这条不变量）；
+//   ② 预设**真的**把线性层接成 BitLinear（不是"声明了 T1_58 却建出普通 Linear"）。
+// CLI 三条命令因此等价：
+//   --t1_58 == --f16 --precision-param t1_58
+//           == --precision-param t1_58 --precision-compute f16
+bool test_preset_t1_58(nn::ComputeEngine& eng, const char* dev)
+{
+    std::printf("[9] 精度预设 profile_t1_58()（%s）：字段 + 真的接成 BitLinear\n", dev);
+    const nn::PrecisionProfile t1  = nn::profile_t1_58();
+    const nn::PrecisionProfile f16 = nn::profile_f16();
+
+    CHECK(t1.param == nn::Precision::T1_58, "预设 param = T1_58");
+    CHECK(t1.compute == nn::Precision::F16, "预设 compute = F16（\"其他默认 f16\"）");
+    CHECK(t1.stable == nn::Precision::F32, "预设 stable = F32（数值敏感链）");
+    CHECK(t1.optimizer == nn::Precision::F32, "预设 optimizer = F32（Adam 的 m/v）");
+    CHECK(t1.compute == f16.compute && t1.stable == f16.stable &&
+              t1.optimizer == f16.optimizer,
+          "预设与 --f16 只在 param 槽不同（另三槽逐字段相同 → 不会各自漂移）");
+    CHECK(!nn::is_profile_f32(t1), "预设不是全 f32（适配层必须启用）");
+
+    // 预设携带 param=T1_58 → 不支持三值的层必须**报错**（fail-fast，不静默降级 f32）
+    {
+        nn::Linear ln(4, 3);
+        ln.set_precision_profile(t1);
+        auto r = ln.init(eng);
+        CHECK(!r.has_value(), "普通 Linear + 预设 → 能力校验报错（预设真的带着 t1_58）");
+    }
+
+    // 工厂接线：预设构建的 MLP，线性层必须全部是 BitLinear
+    constexpr std::size_t IN = 8, HID = 16, OUT = 4, B = 32;
+    auto m_r = nn::build_mnist_mlp_model(eng, {IN, HID, OUT}, nn::NormType::LayerNorm, t1);
+    CHECK(m_r.has_value(), "预设构建 MLP 成功");
+    if (!m_r.has_value())
+    {
+        std::printf("    构建失败: %s\n", m_r.error().message.c_str());
+        return false;
+    }
+    nn::Model& model = *m_r;
+    std::size_t n_bit = 0, n_plain = 0;
+    for (std::size_t i = 0; i < model.num_layers(); ++i)
+    {
+        const std::string name = model.layer_at(i).layer_name();
+        if (name == "BitLinear") ++n_bit;
+        else if (name == "Linear") ++n_plain;
+    }
+    CHECK(n_bit == 2, "预设构建的 MLP 有 2 个 BitLinear（IN→HID、HID→OUT）");
+    CHECK(n_plain == 0, "预设构建的 MLP 没有普通 Linear");
+
+    // 端到端：同一份代码在 CPU / GPU 上跑几十步，loss 必须下降（f16 存储 + 三值权重）
+    std::mt19937 rng(20261010u);
+    std::uniform_real_distribution<float> ud(-1.f, 1.f);
+    nn::Matrix Xm(IN, B), Ym(OUT, B);
+    for (auto& v : Xm.span()) v = ud(rng);
+    for (auto& v : Ym.span()) v = ud(rng);
+
+    auto opt = nn::create_optimizer("adamw", eng, model.parameters(), model.param_gradients(),
+                                    /*lr=*/0.05f, /*wd=*/0.0f, t1);
+    CHECK(opt != nullptr, "预设创建优化器成功");
+    if (!opt) return false;
+
+    nn::MSELoss mse;
+    mse.set_precision_profile(t1);
+    const nn::Tensor Xt = upload(eng, Xm);
+    const nn::Tensor Yt = upload(eng, Ym);
+
+    const auto report = [](const char* what, const std::string& msg)
+    {
+        std::printf("    [FAIL] %s: %s\n", what, msg.c_str());
+        CHECK(false, what);
+    };
+    float first = -1.f, last = -1.f;
+    constexpr int STEPS = 60;
+    for (int step = 0; step < STEPS; ++step)
+    {
+        if (auto r = model.zero_grad(); !r) { report("zero_grad", r.error().message); return false; }
+        auto pred = model.forward(Xt);
+        if (!pred) { report("forward", pred.error().message); return false; }
+        auto loss = mse.forward(eng, *pred, Yt);
+        if (!loss) { report("loss", loss.error().message); return false; }
+        if (!std::isfinite(*loss)) { CHECK(false, "loss 非有限"); return false; }
+        if (step == 0) first = *loss;
+        last = *loss;
+        auto grad = mse.backward();
+        if (!grad) { report("loss.backward", "no grad"); return false; }
+        if (auto r = model.backward(*grad); !r) { report("model.backward", r.error().message); return false; }
+        if (auto r = opt->step(); !r) { report("optimizer.step", r.error().message); return false; }
+    }
+    std::printf("    loss: %.6f → %.6f（%d 步）\n", first, last, STEPS);
+    CHECK(last < first * 0.5f, "预设（三值权重 + f16 存储）训练 loss 下降到一半以下");
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -618,11 +715,13 @@ int main(int argc, char* argv[])
         auto eng_r = nn::cli::create_engine(ec);
         NN_EXIT(eng_r, 77, "GPU 不可用，跳过: ");
         if (!test_training(**eng_r, "GPU")) g_failures++;
+        if (!test_preset_t1_58(**eng_r, "GPU")) g_failures++;
     }
     else
     {
         nn::CpuEngine eng;
         if (!test_training(eng, "CPU")) g_failures++;
+        if (!test_preset_t1_58(eng, "CPU")) g_failures++;
     }
 
     if (g_failures == 0)

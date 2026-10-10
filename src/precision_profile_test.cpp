@@ -1,8 +1,13 @@
 // ── precision_profile_test — PrecisionProfile 配方语义 ──────────────────────
 // 验收：CLI `--f16` = profile_f16() {param/compute = F16, stable/optimizer = F32}
 // —— 即 f16 存储配方，而不是 master-weights 混合配方（F32 主权重 + f16 计算）。
-// 与 profile_master_weights() 是不同 profile，本测试把该语义钉死（三个配方两两
+// 与 profile_master_weights() 是不同 profile，本测试把该语义钉死（各配方两两
 // 可区分，见文件末）。
+//
+// 同样钉死 CLI `--t1_58` = profile_t1_58() {param = T1_58, compute = F16,
+// stable/optimizer = F32}：**f16 存储 + 三值权重**——param 之外的三个槽必须与
+// profile_f16() 逐字段相同（"其他默认 f16"），这样加新预设时不可能悄悄改掉
+// 数值安全边界。
 //
 // 为何 stable/optimizer 不取 F16（实测证据，见 precision.hpp 注释）：
 //   · optimizer=F16：Adam 的 v ≈ g² ~ 1e-10 在 f16 下溢到 0 → 更新爆炸
@@ -53,7 +58,19 @@ int main()
           mw.stable == Precision::F32 && mw.optimizer == Precision::F32,
           "profile_master_weights 应为 F32/F16/F32/F32（混合，参数仍 f32）");
 
-    // 三个配方两两可区分：锁定 --f16 = f16 存储配方，不被改成混合/全 f16
+    // ── CLI `--t1_58` 语义：param + 其余三槽照抄 --f16 ───────────────────
+    const PrecisionProfile t158 = nn::profile_t1_58();
+    CHECK(t158.param == Precision::T1_58,
+          "--t1_58 语义：param 必须是 T1_58（三值权重 = BitLinear）");
+    CHECK(t158.compute == f16.compute && t158.stable == f16.stable &&
+              t158.optimizer == f16.optimizer,
+          "--t1_58 语义：compute/stable/optimizer 必须与 profile_f16() 逐字段相同");
+    CHECK(t158.compute == Precision::F16 && t158.stable == Precision::F32 &&
+              t158.optimizer == Precision::F32,
+          "profile_t1_58 应为 T1_58/F16/F32/F32（其他默认 f16，数值敏感链留 f32）");
+    CHECK(!nn::is_profile_f32(t158), "profile_t1_58 不是全 f32（适配层必须启用）");
+
+    // 各配方两两可区分：锁定 --f16 = f16 存储配方，不被改成混合/全 f16
     const auto same = [](const PrecisionProfile& a, const PrecisionProfile& b)
     {
         return a.param == b.param && a.compute == b.compute &&
@@ -62,6 +79,9 @@ int main()
     CHECK(!same(f16, mw), "profile_f16 与 profile_master_weights 必须可区分");
     CHECK(!same(f16, all16), "profile_f16 与 profile_all_f16 必须可区分");
     CHECK(!same(mw, all16), "profile_master_weights 与 profile_all_f16 必须可区分");
+    CHECK(!same(t158, f16), "profile_t1_58 与 profile_f16 必须可区分（param 槽）");
+    CHECK(!same(t158, f32), "profile_t1_58 与 profile_f32 必须可区分");
+    CHECK(!same(t158, mw), "profile_t1_58 与 profile_master_weights 必须可区分");
 
     CHECK(std::string(nn::precision_name(Precision::F16)) == "f16",
           "precision_name(F16) 应为 \"f16\"");

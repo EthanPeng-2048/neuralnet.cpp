@@ -31,7 +31,10 @@ from cli_controllers import (  # noqa: E402
     GptTrainController, GptInferController,
 )
 
-FLAG_RE = re.compile(r"--[a-z0-9][a-z0-9-]*")
+# flag 词法：允许 `_`（唯一的带下划线 flag 是精度预设 `--t1_58`，见
+# include/neuralnet.cpp/precision.hpp profile_t1_58()）。不加 `_` 时
+# `--t1_58` 会被截成 `--t1`，在 [1]/[2] 两节里误报。
+FLAG_RE = re.compile(r"--[a-z0-9][a-z0-9_-]*")
 # 统一帮助排版器（include/neuralnet.cpp/cli/cli_help.hpp）的调用行形态：
 #   help.opt("--epochs <n>", "...")
 # 帮助内容只出现在这种行里（而非 `<<` 字符串链），审计据此把帮助行排除在
@@ -75,6 +78,7 @@ CASES.append(("mnist_train", MnistTrainController(), dict(
     arch="cnn", cnn_channels="6,16", cnn_kernels="5,5", cnn_pool=2, cnn_fc="120,10",
     norm="rmsnorm", norm_place="both")))
 CASES.append(("mnist_train", MnistTrainController(), dict(arch="mlp", f16=True)))
+CASES.append(("mnist_train", MnistTrainController(), dict(arch="mlp", t1_58=True)))
 
 CASES.append(("mnist_infer", MnistInferController(), dict(
     model="m.bin", input="x.csv", topk=3, show_pixels=True, gpu=True)))
@@ -106,6 +110,8 @@ CASES.append(("text_train", GptTrainController(), dict(
        "lr_per_epoch": "0.001"})))
 CASES.append(("text_train", GptTrainController(), dict(
     model="gpt", text_file="t.txt", f16=True, max_steps=5)))
+CASES.append(("text_train", GptTrainController(), dict(
+    model="gpt", text_file="t.txt", t1_58=True, max_steps=5)))
 
 CASES.append(("text_infer", GptInferController(), dict(
     model="g.bin", vocab="v.json", prompt="hello", max_tokens=200,

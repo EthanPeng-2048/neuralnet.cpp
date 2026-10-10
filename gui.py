@@ -66,7 +66,11 @@ GPT_NORM_OPTIONS = ["layernorm", "rmsnorm"]  # GPT 仅支持 LayerNorm/RMSNorm
 PRECISION_OPTIONS = ["f32", "f16"]
 # param 槽额外接受三值权重（1.58-bit，BitLinear）：
 #   t1_58 = 权重三值化 + STE（docs/development/21-quantized-weights.md）。
-#   P1 只在 MLP 路径生效；其他架构选它会在层能力校验处明确报错（非静默失效）。
+#   已接线：文本侧 GPT（--model gpt：4 投影 + fc1/fc2 + 未 tie 的 LM head）、
+#   图像侧 --arch mlp。未接线（选它=明确报错，非静默失效）：--model rapt 前置拒绝，
+#   --arch transformer/cnn 在层能力校验处报错。
+#   精度预设下拉里的 "t1_58 (BitLinear + f16 存储)" = --t1_58 = profile_t1_58()
+#   = {param:T1_58, compute:F16, stable:F32, optimizer:F32}。
 PRECISION_PARAM_OPTIONS = ["f32", "f16", "t1_58"]
 # 模型架构：zipt(AttnZip) 已于 2026-10-01 移除（恢复前提见 docs/history.md / AGENTS §12）
 GPT_MODEL_OPTIONS = ["gpt", "rapt"]
@@ -791,7 +795,7 @@ class MnistTrainTab(TabBase):
         # --- 混合精度 ---
         self.mp_sep_label = _make_label(p, "── 混合精度 ──", r); r += 1
         self.precision_preset = _make_option_row(p, "精度预设", r,
-            ["f32 (默认)", "f16 (master-weights)"], "f32 (默认)"); r += 1
+            ["f32 (默认)", "f16 (存储)", "t1_58 (BitLinear + f16 存储)"], "f32 (默认)"); r += 1
         self.precision_param = _make_option_row(p, "参数精度 (param)", r, PRECISION_PARAM_OPTIONS, "f32"); r += 1
         self.precision_compute = _make_option_row(p, "计算精度 (compute)", r, PRECISION_OPTIONS, "f32"); r += 1
         self.precision_stable = _make_option_row(p, "稳定精度 (stable)", r, PRECISION_OPTIONS, "f32"); r += 1
@@ -885,11 +889,24 @@ class MnistTrainTab(TabBase):
                 w.grid()
 
     def _on_precision_preset_change(self, *args):
-        """精度预设切换时自动填充各精度字段"""
+        """精度预设切换时自动填充各精度字段。
+
+        与 CLI 语义严格对齐（mnist_train --help / precision.hpp）：
+          · "f16 (存储)"  = --f16     = profile_f16()     = {param:F16,    compute:F16, stable:F32, optimizer:F32}
+          · "t1_58"       = --t1_58   = profile_t1_58()  = {param:T1_58,  compute:F16, stable:F32, optimizer:F32}
+        t1_58 预设下 param 之外的三个字段与 f16 预设逐字段相同（"其他默认 f16"），
+        stable/optimizer 留 F32 有实测依据（见 precision.hpp profile_f16() 注释）。
+        """
         preset = self.precision_preset.get()
-        if "f16" in preset:
-            # master-weights 配方：param=f32, compute=f16, stable=f32, optimizer=f32
-            self.precision_param.widget.set("f32")
+        if "t1_58" in preset:
+            # 三值权重 + f16 存储（三值只作用于 BitLinear 的权重）
+            self.precision_param.widget.set("t1_58")
+            self.precision_compute.widget.set("f16")
+            self.precision_stable.widget.set("f32")
+            self.precision_optimizer.widget.set("f32")
+        elif "f16" in preset:
+            # f16 存储：param 与 compute 都是 f16（= CLI --f16 = profile_f16()）
+            self.precision_param.widget.set("f16")
             self.precision_compute.widget.set("f16")
             self.precision_stable.widget.set("f32")
             self.precision_optimizer.widget.set("f32")
@@ -922,7 +939,9 @@ class MnistTrainTab(TabBase):
         # 训练控制：--shuffle-steps 需要 true/false 字面量（不是开关标志）
         args["shuffle_steps"] = "true" if self.shuffle_steps.get() else "false"
         # 混合精度
-        if "f16" in self.precision_preset.get():
+        if "t1_58" in self.precision_preset.get():
+            args["t1_58"] = True
+        elif "f16" in self.precision_preset.get():
             args["f16"] = True
         else:
             args["precision_param"] = self.precision_param.get()
@@ -1405,7 +1424,7 @@ class GptTrainTab(TabBase):
         # --- 混合精度 ---
         _make_label(p, "── 混合精度 ──", r); r += 1
         self.precision_preset = _make_option_row(p, "精度预设", r,
-            ["f32 (默认)", "f16 (存储)"], "f32 (默认)"); r += 1
+            ["f32 (默认)", "f16 (存储)", "t1_58 (BitLinear + f16 存储)"], "f32 (默认)"); r += 1
         self.precision_param = _make_option_row(p, "参数精度 (param)", r, PRECISION_PARAM_OPTIONS, "f32"); r += 1
         self.precision_compute = _make_option_row(p, "计算精度 (compute)", r, PRECISION_OPTIONS, "f32"); r += 1
         self.precision_stable = _make_option_row(p, "稳定精度 (stable)", r, PRECISION_OPTIONS, "f32"); r += 1
@@ -1485,9 +1504,17 @@ class GptTrainTab(TabBase):
         与 CLI 语义严格对齐（text_train --help / precision.hpp）：
         `--f16` = profile_f16() = {param:F16, compute:F16, stable:F32, optimizer:F32}，
         即"f16 存储"，**不是** mnist_train 的 master-weights 配方（{f32,f16,f32,f32}）。
+        `--t1_58` = profile_t1_58() = {param:T1_58, compute:F16, stable:F32,
+        optimizer:F32} —— 就是 --f16 再把 param 换成三值（"其他默认 f16"），
+        只有 BitLinear 的权重是三值（GPT：4 投影 + fc1/fc2 + 未 tie 的 LM head）。
         """
         preset = self.precision_preset.get()
-        if "f16" in preset:
+        if "t1_58" in preset:
+            self.precision_param.widget.set("t1_58")
+            self.precision_compute.widget.set("f16")
+            self.precision_stable.widget.set("f32")
+            self.precision_optimizer.widget.set("f32")
+        elif "f16" in preset:
             self.precision_param.widget.set("f16")
             self.precision_compute.widget.set("f16")
             self.precision_stable.widget.set("f32")
@@ -1554,7 +1581,9 @@ class GptTrainTab(TabBase):
         args.update(_int(self.num_layers, "num_layers"))
         args.update(_int(self.d_ff, "d_ff"))
         # 混合精度
-        if "f16" in self.precision_preset.get():
+        if "t1_58" in self.precision_preset.get():
+            args["t1_58"] = True
+        elif "f16" in self.precision_preset.get():
             args["f16"] = True
         else:
             args["precision_param"] = self.precision_param.get()

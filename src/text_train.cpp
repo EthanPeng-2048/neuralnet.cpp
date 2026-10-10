@@ -145,6 +145,7 @@ void print_usage(const char *prog)
 
     help.section("混合精度 (docs/development/05-mixed-precision.md)");
     help.opt("--f16", "快捷方式: f16 存储 (param/compute=F16，stable/optimizer=F32)");
+    help.opt("--t1_58", "快捷方式: 精度预设 t1_58 = f16 存储 + 三值权重\n(param=T1_58，compute=F16，stable/optimizer=F32；等价于 --f16 再把 param 换成 t1_58)。\n范围与前置拒绝同 --precision-param t1_58（docs/development/21-quantized-weights.md §4.10）");
     help.opt("--precision-param <f16|f32|t1_58>",
              "权重/参数精度 (默认: f32)；t1_58 = 三值权重（1.58-bit）——\n"
              "GPT 已支持（注意力 4 投影 + fc1/fc2 + 未 tie 的 LM head 全部换成\n"
@@ -386,6 +387,17 @@ TrainConfig parse_args(int argc, char *argv[])
             // 想要四字段全 f16（实验性）：--f16 --precision-stable f16
             //                                  --precision-optimizer f16
             cfg.precision = nn::profile_f16();
+        }
+        else if (arg == "--t1_58")
+        {
+            // 精度预设 t1_58 = **三值权重 + f16 存储**（profile_t1_58()：
+            // param=T1_58, compute=F16, stable/optimizer=F32）——就是 --f16 再
+            // 把 param 换成 t1_58，故三条命令等价：
+            //   --t1_58 / --f16 --precision-param t1_58 / --precision-param t1_58
+            //   --precision-compute f16
+            // 与 --f16 同理，想要字面四槽全 f16 再追加 --precision-stable f16
+            // --precision-optimizer f16（数值上不可用于训练，见 precision.hpp）。
+            cfg.precision = nn::profile_t1_58();
         }
         else if (arg == "--precision-param" && i + 1 < argc)
         {

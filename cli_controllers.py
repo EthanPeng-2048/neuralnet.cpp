@@ -493,7 +493,11 @@ class MnistTrainController(CLIController):
         # 但解析分支与实现均不存在（传入即"未知参数"退出）。详见 docs/history.md。
         
         # 混合精度
-        if kwargs.get("f16", False):
+        # 预设：t1_58（三值权重 + f16 存储）与 f16（f16 存储）各是一个 flag；
+        # 预设与逐字段覆盖互斥（选预设即整份 profile，见 precision.hpp）。
+        if kwargs.get("t1_58", False):
+            args.append("--t1_58")
+        elif kwargs.get("f16", False):
             args.append("--f16")
         else:
             if "precision_param" in kwargs:
@@ -890,7 +894,11 @@ class GptTrainController(CLIController):
             args.append("--activation-offload")
 
         # 混合精度
-        if kwargs.get("f16", False):
+        # 预设：t1_58（三值权重 + f16 存储）与 f16（f16 存储）各是一个 flag；
+        # 预设与逐字段覆盖互斥（选预设即整份 profile，见 precision.hpp）。
+        if kwargs.get("t1_58", False):
+            args.append("--t1_58")
+        elif kwargs.get("f16", False):
             args.append("--f16")
         else:
             if "precision_param" in kwargs:
