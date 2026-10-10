@@ -264,6 +264,15 @@ if(NN_STACKTRACE_LIB)
     target_link_libraries(nn_core INTERFACE ${NN_STACKTRACE_LIB})
 endif()
 
+# ── 诊断探针编译门（NN_ENABLE_PROBES，见下方 option；默认关）─────────────
+# 定义放在 nn_core 的 **INTERFACE**：库头里的探针门（`nn_dbg_scan`、
+# `NN_PREC_TRACE`、`env_flag` 等，core_config.hpp 的 NN_PROBES_ENABLED）在
+# **所有 TU 上必须取值一致**，否则同一头文件两种语义（ODR 隐患）；随 nn_core
+# 传播可同时覆盖库内目标、PCH 目标、收集器与嵌入消费方。
+if(NN_ENABLE_PROBES)
+    target_compile_definitions(nn_core INTERFACE NN_ENABLE_PROBES=1)
+endif()
+
 # ── C++ 标准（消费方使用需求，实测于 CMake 4.3）─────────────────────────────
 # Clang/GNU（GNU 前端）认识 cxx_std_26 → 传 -std=c++26；
 # **MSVC cl 不认识 cxx_std_26**（实测报 "not known to CXX compiler"，其
@@ -346,6 +355,21 @@ endfunction()
 # 需要时用 -DNN_ENABLE_TESTS=ON 开启全部 gradcheck / *_test / *_probe / *_debug。
 option(NN_ENABLE_TESTS "Build test/verification executables" OFF)
 
+# ── 诊断探针开关（默认关闭）─────────────────────────────────────────────
+# "探针" = 会在**热路径**采样/打印/下载/扫描的诊断代码 + 只服务于排障的可执行
+# 目标。打开后：① 库头里的探针门打开（`nn_dbg_scan`/`NN_F16_DEBUG` 中间量扫描、
+# `NN_PREC_TRACE` 变体与边界 cast 归因、`text_train` 的 `NN_NAN_TRACE` /
+# `NN_MEM_STATS`）；② 创建探针可执行目标（mem_probe / f16_cpu_probe /
+# gpu_stability_probe）。
+# 关闭（默认）时这些代码**不参与编译**：没有额外分支、没有字符串、没有 host
+# 下载路径，相关环境变量一律无效——探针只在排障时按需打开，不允许"设了环境
+# 变量就悄悄拖慢正常训练/推理"。运行时**行为开关**（NN_BIND_DEBUG 正确性检查、
+# NN_VULKAN_* 设备/特性逃生阀、NN_POOL_* 池 A/B）不在本门内：它们读取一次并
+# 缓存，不产生热路径开销（新增同类开关必须遵守"读一次 + 缓存"）。
+# ⚠ 打开会改变库头语义 → 探针构建的二进制/缓存与正常构建不可混用；
+#   覆盖率/归因类验收（如 docs 里 `NN_PREC_TRACE` 的 V1 覆盖实测）需用本开关配置。
+option(NN_ENABLE_PROBES "Compile diagnostic probes (hot-path trace hooks + probe executables)" OFF)
+
 # 收集实际构建的目标，供 GPU 统一启用（避免引用未定义目标）
 set(NN_APP_TARGETS "")
 set(NN_TEST_TARGETS "")
@@ -378,22 +402,30 @@ if(NN_BUILD_APPS)
     nn_add_executable(layer_bench src/layer_bench.cpp)
     list(APPEND NN_APP_TARGETS layer_bench)
 
-    # ── 运行时显存分项探针（双池采样 + nvidia-smi + 逻辑分项归因） ─────────────
-    nn_add_executable(mem_probe src/mem_probe.cpp)
-    list(APPEND NN_APP_TARGETS mem_probe)
+    # ── 探针目标（诊断专用；需 -DNN_ENABLE_PROBES=ON，默认不构建）───────────
+    # 这三个只服务排障，不进任何正常流程：正常构建里连可执行文件都不存在，
+    # 文档里引用它们的复现步骤须先配置 NN_ENABLE_PROBES=ON。
+    if(NN_ENABLE_PROBES)
+        # 运行时显存分项探针（双池采样 + nvidia-smi + 逻辑分项归因）
+        nn_add_executable(mem_probe src/mem_probe.cpp)
+        list(APPEND NN_APP_TARGETS mem_probe)
 
-    # ── CPU f16 组件级诊断探针（A-I 阶段定位发散；NN_F16_DEBUG=1 开逐中间量扫描）──
-    nn_add_executable(f16_cpu_probe src/f16_cpu_probe.cpp)
-    list(APPEND NN_APP_TARGETS f16_cpu_probe)
+        # CPU f16 组件级诊断探针（A-I 阶段定位发散；NN_F16_DEBUG=1 开逐中间量扫描）
+        nn_add_executable(f16_cpu_probe src/f16_cpu_probe.cpp)
+        list(APPEND NN_APP_TARGETS f16_cpu_probe)
 
-    # ── CPU/GPU 训练 run-to-run 确定性探针（ComputeEngine Refresh P0 / D9 实测；
-    #    手动运行不注册 ctest，退出码 0=逐位一致 1=非确定 2=运行错误）──────────
-    nn_add_executable(gpu_stability_probe src/gpu_stability_probe.cpp)
-    list(APPEND NN_APP_TARGETS gpu_stability_probe)
+        # CPU/GPU 训练 run-to-run 确定性探针（ComputeEngine Refresh P0 / D9 实测；
+        # 手动运行不注册 ctest，退出码 0=逐位一致 1=非确定 2=运行错误）
+        nn_add_executable(gpu_stability_probe src/gpu_stability_probe.cpp)
+        list(APPEND NN_APP_TARGETS gpu_stability_probe)
+    endif()
 endif()
 
 # ── GPU f16 参数写回探针（issue #13 P0-②：MSVC 下权重冻结定位）──────────────
 # app 与 ctest 双身份 → 任一开关打开就创建（目标重复创建会报错，故统一在此）。
+# ⚠ 刻意**不**并入 NN_ENABLE_PROBES：它是注册在 ctest 里的**回归用例**
+#   （断言 in-place f16 写回值正确 + 8 步 Adam 后参数必须移动），去掉会削弱
+#   测试门禁；它自身不含热路径探针，不参与 NN_ENABLE_PROBES 的语义。
 if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(f16_writeback_probe src/f16_writeback_probe.cpp)
     if(NN_BUILD_APPS)

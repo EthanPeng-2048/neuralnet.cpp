@@ -22,7 +22,11 @@
 namespace nn
 {
 
-// ── NN_F16_DEBUG：中间量扫描（CPU f16 发散定位诊断；未设环境变量时零开销）──
+// ── NN_F16_DEBUG：中间量扫描（CPU f16 发散定位诊断）─────────────────────
+// 探针门（core_config.hpp 的 NN_PROBES_ENABLED）：默认构建里本函数是**空内联**，
+// 20 个反向调用点零指令、零字符串；要排障时用 `-DNN_ENABLE_PROBES=ON` 重新配置
+// 构建，再设 `NN_F16_DEBUG=1` 选择性地开（同一份探针构建里逐算子开关）。
+#if NN_PROBES_ENABLED
 inline void nn_dbg_scan(const char* tag, ComputeEngine& eng, const Tensor& t)
 {
     static const bool on = nn::dsl::env_flag("NN_F16_DEBUG");
@@ -45,6 +49,9 @@ inline void nn_dbg_scan(const char* tag, ComputeEngine& eng, const Tensor& t)
                  mx, bad ? "  <<< NONFINITE" : "");
     std::fflush(stderr);
 }
+#else
+inline void nn_dbg_scan(const char*, ComputeEngine&, const Tensor&) noexcept {}
+#endif
 
 // ══════════════════════════════════════════════════════════════════════════
 // Layer — 引擎化计算层基类

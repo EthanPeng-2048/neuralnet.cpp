@@ -59,6 +59,24 @@ namespace nn
     // 注：1024-4096 元素数测出的高加速比是亚微秒级测量噪声，不可靠。
     inline constexpr std::size_t PARALLEL_THRESHOLD = 524288;
 
+    // ── 诊断探针编译门（默认关；CMake `-DNN_ENABLE_PROBES=ON` 才编入）────────
+    // "探针" = 会在**热路径**采样/打印/下载/扫描的诊断代码：层内逐中间量扫描
+    //（`nn_dbg_scan` / `NN_F16_DEBUG`）、精度变体与边界 cast 归因
+    //（`NN_PREC_TRACE` / `note_temp_`）、训练循环的非有限值追踪（`NN_NAN_TRACE`）、
+    // 显存阶段采样（`NN_MEM_STATS`），以及探针可执行目标（`mem_probe` /
+    // `f16_cpu_probe` / `gpu_stability_probe`）。
+    // 关闭（默认）时它们**不参与编译**：正常训练没有额外分支、没有字符串、
+    // 没有 host 下载路径，相关环境变量一律无效——探针只在排障时按需打开，
+    // 不允许"设了环境变量就悄悄拖慢正常训练"。
+    // 新增探针一律走这个门；初始化期读一次的**行为开关**（`NN_BIND_DEBUG`
+    // 正确性检查、`NN_VULKAN_*` 设备/特性逃生阀、`NN_POOL_*` 池 A/B）不在此列。
+    // 门经 `nn_core` 的 INTERFACE 定义传播 → 所有 TU（含嵌入消费方）取值一致。
+#if defined(NN_ENABLE_PROBES) && NN_ENABLE_PROBES
+    #define NN_PROBES_ENABLED 1
+#else
+    #define NN_PROBES_ENABLED 0
+#endif
+
     // ── 顶层并行算法函数 ─────────────────────────────────────────────────────
     // 用法与 std::for_each / std::transform 完全一致，内部自动选择串行/并行。
     // 替代 std::execution::par 的线程创建开销，也替代手写 for 循环。

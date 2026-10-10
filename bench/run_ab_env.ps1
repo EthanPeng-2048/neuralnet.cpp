@@ -10,6 +10,9 @@
 #       @{name='base';   env=@{}},
 #       @{name='ladder16'; env=@{NN_POOL_LADDER_MAX_MB='16'}},
 #       @{name='blk4';   env=@{NN_POOL_BLOCK_MB='4'}} )
+# ⚠ 默认 -Exe 指向 mem_probe.exe，它是**探针目标**：需先配置
+#   `cmake -B build -G Ninja -DNN_ENABLE_PROBES=ON`（默认构建不创建它，
+#   见 AGENTS §2 探针统一编译门）。
 param(
     [int]$Rounds = 3,
     [string]$Exe = ".\build\mem_probe.exe",

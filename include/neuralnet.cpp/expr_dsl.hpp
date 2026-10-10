@@ -33,11 +33,19 @@
 #include <limits>
 #include <ranges>
 
+#include "core_config.hpp"   // NN_PROBES_ENABLED（探针编译门）
+
 namespace nn::dsl
 {
 // 环境变量开关（MSVC 下 getenv 标记 deprecated → -Werror 会炸；走 _dupenv_s）
+// ⚠ 探针门：默认构建（未 -DNN_ENABLE_PROBES=ON）里恒返回 false 且**不求值 getenv**
+//   → 调用点被编译期折叠，"NN_F16_DEBUG" 之类的诊断开关不会在正常训练里生效。
 inline bool env_flag(const char* name)
 {
+#if !NN_PROBES_ENABLED
+    (void)name;
+    return false;
+#else
 #ifdef _MSC_VER
     char* buf = nullptr;
     std::size_t len = 0;
@@ -47,6 +55,7 @@ inline bool env_flag(const char* name)
 #else
     const char* v = std::getenv(name);
     return v != nullptr && v[0] != '\0';
+#endif
 #endif
 }
 } // namespace nn::dsl
