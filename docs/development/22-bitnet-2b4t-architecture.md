@@ -192,6 +192,34 @@ dW_emb += grad_logits · xᵀ     (matmul(g, x, transB=true)) → 累加进 grad
 
 ---
 
+### 3.4 权重侧接入（P1.5 落地，2026-10-10）：三值线性层落点
+
+结构三项是"图长什么样"，权重侧（`21` §4.8.3 的 P1.5）是"线性层用哪种实现"。落地后
+**同一个 `PrecisionProfile` 就能点亮整条 2B4T 形态**（权重三值 + 四个结构开关）：
+
+| 落点 | 改法 | 三值（`weight_quant=T1_58`）时变成 |
+|---|---|---|
+| `AttentionBase`（`CausalSelfAttention` 继承） | `Linear w_q_/w_k_/w_v_/w_o_` → `std::unique_ptr<Layer>` | `BitLinear` × 4（GQA 只改 K/V 的**输出**宽度，与三值正交） |
+| `FeedForward` | `Linear fc1_/fc2_` → `std::unique_ptr<Layer>` | `BitLinear` × 2（`fc1_` 宽度随 GeLU/SwiGLU/ReLU² 变化，与三值正交） |
+| `GPTModel` | `Linear lm_head_` → `std::unique_ptr<Layer>` | `BitLinear`（`tie_embeddings=true` 时 head 就是嵌入，无线性层） |
+| 自定义层 / 下游工程 | 同一条 `make_linear_layer(in, out, weight_quant)` | 与 `make_norm_layer` 同一个先例 |
+
+**判据唯一 + 构造期定型**：`effective_weight_quant(precision, weight_quant)` ——
+`precision.param == T1_58`（CLI `--precision-param t1_58` / `ModelSpec.weight_quant` /
+库 API）等价于 `weight_quant = T1_58`；开关是**构造参数**（默认 `None`），所以既有
+f16/f32 路径的成员构造与求值结构逐位不变（`split_ternary_profile` 在非三值时恒等）。
+
+**profile 分流**：`param=T1_58` 只对**线性子层**有意义，因此复合层把一次 profile 拆两份
+（`sp.self` = param 归一化为 f32，给自身/norm/激活/softmax/位置编码；`sp.linear` = param=T1_58，
+给 BitLinear）。**未以三值模式构造却收到 T1_58 → fail-fast**，不静默降级 f32。
+落地细节与验收数字见 `21` §4.10。
+
+**边界（诚实）**：RAPT 的 `ReLULinearAttention` 与 ViT/MNIST Transformer 的补丁/池化侧
+**仍未接线**，两者现在都明确拒绝（`--arch rapt --precision-param t1_58` 前置报错；
+ViT 在 `PatchEmbedding` 的能力校验处报错），而不是"跑了一半三值"。
+
+---
+
 ## 4. 规格与序列化
 
 `ModelSpec` 追加三个字段（`model_spec.hpp` 的 GPT 段）：
@@ -224,6 +252,7 @@ GPT 家族分支**逐字段比对**（漏比 = 允许把不匹配的权重加载
 | **S4 ✅** ReLU² | 官方 `hidden_act="relu2"`：`ActivationType::ReLU2 = 2` + 新层 `ReLU2GLU`（门控平方 ReLU）；CLI/GUI 同步；`scan_exprs` 模型 pass 补 `gpt_rope_relu2_rms` | ① `ReLU2GLU` 前向 vs 宿主 `relu²(gate)·up` 差 **0**、反向 vs 解析式 4.47e-8 ✅；② ReLU² 进 GPT（叠加 subln+GQA+tied）前向/反向跑通 ✅；③ 全量 ctest 30/30 ✅ |
 | **P2 ✅** GQA in-kernel | K/V 不展开（`HeadGroup` 视图 + 运行期 vp 比率）；fold/bmm/vecacc 三处行块号按比率取；`scan_exprs` 显式登记 attention fold 的 GQA 变体 | ① **测试与登记故意用不同配置**（heads=4/n_kv=2 vs heads=2/n_kv=1）仍命中同一 fold key → 证明"任意 n_rep 共用一份 shader" ✅；② CPU 与**真实 GPU** 双向对拍：与"按块映射复制成 MHA"前向差 **0**、输入梯度 1.19e-7 ✅；③ 全量 ctest 30/30 ✅ |
 | **S3 ✅** Tied embedding | `GPTModel` 开关（§3.3）；`ModelSpec.tie_embeddings` | ① 参数条数差 = `V·D + V`（实测 2112 = 64·32+64）✅；② 与"head 权重显式设为 `token_emb_`、bias=0"的等价构造对拍：前向差 **0** ✅；③ **梯度累加**：tied 的 `token_emb` 梯度 == 非 tied 的（嵌入梯度 + head 的 dW），差 **0** ✅；④ 规格往返逐位一致 ✅；⑤ ctest 30/30 ✅ |
+| **W1–W3 ✅** 权重侧（21 §4.8.3 的 P1.5） | `make_linear_layer` + `unique_ptr<Layer>`：`AttentionBase` 4 投影 / `FeedForward` fc1·fc2 / `GPTModel` LM head；`split_ternary_profile` 分流 + `effective_weight_quant` 唯一判据（§3.4） | ① 三值 GPT 参数张量形状与 f32 基线**逐一相同**、36/36 张量梯度非零 ✅；② **2B4T 形状端到端训练**（RoPE+ReLU²+RMSNorm+SubLN+GQA+tied+三值，CE+AdamW 200 步）：3.469→**0.018**（tied）/ 3.582→0.0064（BitLinear head）/ f32 基线 3.893→0.0045 ✅；③ CPU/GPU 末步 loss 差 **7.5e-4 < 1e-3** ✅；④ 既有 f16/f32 路径零回归 + ctest 30/30 ✅；⑤ RAPT/ViT 明确拒绝（不留半三值）✅ |
 
 **统一回归口径**（每步都要满足）：
 
@@ -281,8 +310,60 @@ graph TB
     end
     W --> JOIN["GPT/RAPT 的 2B4T 形态"]
     A --> JOIN
-    JOIN --> MISS["仍缺：<br/>· P1.5 make_linear_layer（GPT/RAPT 三值接线）<br/>· ReLU²（§9 待定）<br/>· bias 置零"]
+    JOIN --> GOT["已齐（P1.5 落地）：<br/>· GPT 的三值接线（4 投影 + fc1/fc2 + LM head）<br/>· ReLU²（§3.4 / S4）<br/>= <b>三值 + SubLN + GQA + tied + ReLU² 可同时打开</b>"]
+    JOIN --> MISS["仍缺：<br/>· HF 2B4T 权重转换器<br/>· RAPT / ViT 的三值接线（明确拒绝）<br/>· bias 置零、P2 行级打包"]
 ```
+
+---
+
+### 6.4 P1.5 落地后的全景（权重侧 × 结构侧同时打开）
+
+一个 `PrecisionProfile{param: T1_58}` + 四个结构开关（`subln` / `n_head_kv` / `tie_embeddings`
+/ `activation=relu2`）就能表达完整的 BitNet b1.58 2B4T 形态（规模另说）：
+
+```mermaid
+graph TB
+    subgraph TOOL["L2 层工具箱（P1.5 之后）"]
+        T1["make_linear_layer(in, out, weight_quant)<br/>None → Linear ／ T1_58 → BitLinear"]
+        T2["make_norm_layer(width, norm_type)<br/>LayerNorm ／ RMSNorm ／ BatchNorm"]
+    end
+
+    subgraph MODEL["GPTModel（2B4T 形态）"]
+        EMB["token_emb_ (V,D)<br/>+ Learned/Sinusoidal 位置编码表"]
+        subgraph BLOCKS["GPTBlock × L（pre-norm 残差）"]
+            N1["norm1：RMSNorm"]
+            ATT["CausalSelfAttention<br/>W_q/W_k/W_v/W_o = <b>BitLinear</b><br/>GQA：K/V 输出宽 = n_head_kv·d_k<br/>SubLN：attn_sub_norm(d_model) → W_o"]
+            N2["norm2：RMSNorm"]
+            FF["FeedForward<br/>fc1/fc2 = <b>BitLinear</b><br/>ReLU²：relu²(gate)·up<br/>SubLN：sub_norm(d_ff) → fc2"]
+        end
+        LNF["ln_f：RMSNorm"]
+        HEAD["lm_head = <b>BitLinear</b><br/>tie_embeddings：logits = token_emb_ · x"]
+    end
+
+    PROFILE["PrecisionProfile{param: T1_58}<br/>+ subln / n_head_kv / tie_embeddings / relu2"]
+
+    T1 --> ATT
+    T1 --> FF
+    T1 --> HEAD
+    T2 --> N1
+    T2 --> N2
+    T2 --> LNF
+    PROFILE -. "param=T1_58 → weight_quant=T1_58（唯一判据）" .-> T1
+    PROFILE -. "结构开关（ModelSpec / GptConfig 透传）" .-> BLOCKS
+    EMB -->|"x"| N1
+    N1 --> ATT --> N2 --> FF --> LNF --> HEAD
+    N2 -. "残差：x + sub(norm(x))" .-> N1
+```
+
+**开关清单（默认值 = 既有路径逐位不变）**：
+
+| 开关 | 取值 | 落点 | 依赖 |
+|---|---|---|---|
+| `PrecisionProfile.param` / `ModelSpec.weight_quant` | `t1_58` | 上表 3 处线性层 → `BitLinear` | 非存储精度：latent 恒 f32，量化缓冲 f16 |
+| `subln` | `true` | `AttentionBase::attn_sub_norm_` / `FeedForward::sub_norm_` | 类型跟随 `norm_type`（2B4T = RMSNorm） |
+| `n_head_kv` | `> 0` | K/V 投影输出宽度 + fold 的 `HeadGroup` 视图 | 必须整除 `num_heads` |
+| `tie_embeddings` | `true` | head 复用 `token_emb_`（梯度累加进同一缓冲） | 与 `BitLinear` head 互斥（无独立 head） |
+| `activation` | `relu2` | `ReLU2GLU`（`fc1_` 宽 2·d_ff） | 通用取值，CLI/GUI 已有 |
 
 ---
 
@@ -301,6 +382,9 @@ graph TB
 | S4 | `P1.5-S4 ReLU²（BitNet 2B4T 的 hidden_act）` | `ActivationType::ReLU2` + `ReLU2GLU` 层 + FeedForward 接线 + CLI/GUI + scan 模型 pass + 测试 [12]–[13] |
 | P2 | `P1.5-P2 GQA in-kernel 头映射（省掉 K/V 的头展开物化）` | `ExprViewKind::HeadGroup` + `gqa_ratio_of` + fold/bmm/vecacc 比率 + AttentionBase 不展开 + scan 显式 fold 登记 + GPU 侧对拍 |
 | 4 | `P1.5 文档同步` | 本文状态/实施记录 + `AGENTS.md` + `docs/history.md` |
+| W1 | `P1.5-W1 线性层工厂 + Attention/FeedForward 三值接线` | `make_linear_layer`（Linear/BitLinear 工厂）+ `AttentionBase` 4 投影 / `FeedForward` fc1·fc2 → `unique_ptr<Layer>` + `split_ternary_profile`（含自相矛盾 fail-fast） |
+| W2 | `P1.5-W2 GPT 三值接线：投影/FFN/LM head + 规格·CLI·扫描登记` | `GPTBlock`/`GPTModel` 开关传播 + `lm_head_` + `effective_weight_quant` + `build_gpt_model_from_spec` 映射 + `text_train` 写规格/RAPT 前置拒绝 + scan 两条三值 GPT 用例（结构数 107 持平） |
+| W3 | `P1.5-W3 验收：三值 GPT 接线 + 真实 BitNet（2B4T 形状）端到端训练` | `bitnet_struct_test` [14]（形状一致 + 36/36 梯度非零）、[15]（三配置收敛 + CPU/GPU 末步 loss 差 < 1e-3） |
 
 ---
 
@@ -318,9 +402,10 @@ graph TB
 1. **`--model bitnet` 预设**：**明确不做**（用户裁定）；GUI 的 BitNet 预设留待以后。
    当前暴露面 = 库 API + `ModelSpec` + 通用 `--activation relu2`。
 2. **权重转换器**：从 HF 2B4T checkpoint 加载（含逐张量三值化 + 尺度折算）——另立。
-3. **P1 的权重侧接线（21 §4.8.3 的 P1.5）**：`make_linear_layer` + `unique_ptr<Layer>`
-   让 GPT/RAPT 的线性层也能是 `BitLinear`（三值端到端）——与本文的结构三项正交，
-   仍未做。
+3. **权重侧接线的剩余边界**（21 §4.8.3 的 P1.5，GPT 已于 2026-10-10 落地 → §3.4）：
+   RAPT 的 `ReLULinearAttention`（自持 4 个 `Linear` 且不转发 profile）与 ViT/MNIST
+   Transformer 的补丁/池化侧仍未接 `make_linear_layer`。两者**明确拒绝** `t1_58`
+   （CLI 前置报错 / 能力校验报错），不留"半三值"路径。
 4. **`forward_step` 的增量推理**仍展开 K/V（保持 KV cache 布局不变）；若要省掉它，
    需要同时改 attention 的增量路径与 cache 布局——收益低于训练路径，暂不做。
 
@@ -362,3 +447,11 @@ graph TB
 7. **验收机器 = 102**：本机（软件 Vulkan/llvmpipe）的 `expr_gpu_test`/`fused_gpu_test`
    在退出段随机段错（基线同样复现、且故障时已打印 `ALL PASS`）；102 的真实 GPU 上
    30/30 全绿 —— 避免把环境问题误判成代码回归。
+8. **P1.5 的坑：`param=T1_58` 会顺着"原样再注入一次"的代码路径打到不该打的地方。**
+   `GPTModel` 构造器里除了 `set_precision_profile(precision)`，还单独把 `precision`
+   再注给 `ln_f_` 与**位置编码器**（历史写法，f16 时代无害）。三值模式下这两处会拿
+   `T1_58` 去 `create_tensor`（RMSNorm 的 γ/β、Learned 编码表）→ 引擎拒绝"非存储精度"。
+   抓到它的不是运行时测试，而是 **`scan_exprs` 的模型 pass**（构建期）：`gpt_*_t1_58`
+   用例当场报 `LearnedPositionEncoder: 初始化失败` / `层 RMSNorm 不支持 param=t1_58`。
+   结论：**三值接线期间往 `scan_exprs` 的模型 pass 里加一条该组合的用例**，等于把"这条
+   组合能不能构造 + 跑一遍 fwd/bwd"变成构建期门禁（结构数不必变，这道门禁本身就值）。
