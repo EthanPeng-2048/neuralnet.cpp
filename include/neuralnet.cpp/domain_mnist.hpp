@@ -236,8 +236,9 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
     if (spec.weight_quant == WeightQuant::T1_58)
     {
         if (!spec.is_mlp())
-            NN_FAIL("weight_quant=t1_58 目前只支持 MLP 架构（P1 范围；"
-                    "GPT/RAPT 的三值线性层见 docs/development/21-quantized-weights.md §4.8 P1.5）");
+            NN_FAIL("weight_quant=t1_58 该构建入口只支持 MLP 架构：GPT 走 "
+                    "build_gpt_model_from_spec，RAPT 与 MNIST Transformer（ViT 风格）"
+                    "的三值接线尚未落地（见 docs/development/21-quantized-weights.md §4.8.3）");
         precision.param = Precision::T1_58;
     }
 

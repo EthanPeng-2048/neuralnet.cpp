@@ -30,6 +30,9 @@ private:
     std::unique_ptr<Layer> norm1_;
     FeedForward ff_;
     std::unique_ptr<Layer> norm2_;
+    // 三值模式（P1.5，docs 21 §4.8.3）：构造期定型 → 决定 self_attn_/ff_ 内部
+    // 线性层是 Linear 还是 BitLinear，以及 profile 的分流口径。
+    WeightQuant weight_quant_ = WeightQuant::None;
 
     Tensor residual2_cache_;
 
@@ -46,12 +49,14 @@ public:
              NormType norm_type = NormType::LayerNorm,
              PrecisionProfile precision = PrecisionProfile{},
              bool subln = false,
-             std::size_t n_head_kv = 0)
+             std::size_t n_head_kv = 0,
+             WeightQuant weight_quant = WeightQuant::None)
         : self_attn_(d_model, num_heads, max_len, seq_len, pos_enc, subln, norm_type,
-                     n_head_kv),
+                     n_head_kv, weight_quant),
           norm1_(make_norm_layer(d_model, norm_type)),
-          ff_(d_model, d_ff, activation, subln, norm_type),
-          norm2_(make_norm_layer(d_model, norm_type))
+          ff_(d_model, d_ff, activation, subln, norm_type, weight_quant),
+          norm2_(make_norm_layer(d_model, norm_type)),
+          weight_quant_(weight_quant)
     {
         // D7：将精度配置注入所有子层（§9.2）—— override 内已逐子层下传
         set_precision_profile(precision);
@@ -62,13 +67,17 @@ public:
     // ── D3(a)：块内下传（构造器已注入；这里补"构造之后再设定"的语义）────────
     // 没有这条 override，`GPTModel::set_precision_profile` 只能打到块自身，
     // 块内 6 个叶子层（Q/K/V/O + fc1/fc2 + 2 个 norm）仍是旧 profile。
+    // ── P1.5 三值分流（§4.8.3）：本块自身与两个 norm 拿 param 归一化为 f32 的
+    // 那一份；attention/FF 是"线性层持有者"，拿三值那一份（它们各自再分流）。
     void set_precision_profile(const PrecisionProfile& profile) override
     {
-        Layer::set_precision_profile(profile);
-        self_attn_.set_precision_profile(profile);
-        if (norm1_) norm1_->set_precision_profile(profile);
-        ff_.set_precision_profile(profile);
-        if (norm2_) norm2_->set_precision_profile(profile);
+        const TernaryProfileSplit sp = split_ternary_profile(
+            layer_name(), profile, weight_quant_ == WeightQuant::T1_58);
+        Layer::set_precision_profile(sp.self);
+        self_attn_.set_precision_profile(sp.linear);
+        if (norm1_) norm1_->set_precision_profile(sp.self);
+        ff_.set_precision_profile(sp.linear);
+        if (norm2_) norm2_->set_precision_profile(sp.self);
     }
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
@@ -258,7 +267,12 @@ private:
 
     std::vector<GPTBlock> blocks_;
     std::unique_ptr<Layer> ln_f_;
-    Linear lm_head_;
+    // LM head 走线性层工厂（P1.5，docs 21 §4.8.3）：三值模式下是 BitLinear。
+    // tied 时该对象不 init、不进 parameters()（参数全部来自 token_emb_）。
+    std::unique_ptr<Layer> lm_head_;
+    // 三值模式（构造期定型；`precision.param == T1_58` 也等价于它，见
+    // `effective_weight_quant`）
+    WeightQuant weight_quant_ = WeightQuant::None;
 
     // ── tied embedding（docs/development/22 §3.3）────────────────────────
     // true：head 复用 token_emb_（logits = W_embᵀ·x），lm_head_ 不建参数、
@@ -297,7 +311,7 @@ private:
     [[nodiscard]] Result<Tensor> head_forward_(ComputeEngine& engine, const Tensor& x)
     {
         if (!tie_embeddings_)
-            return lm_head_.forward(x);
+            return lm_head_->forward(x);
         return dsl::compute(engine,
             dsl::matmul(token_emb_, x, /*transA=*/false, /*transB=*/false),
             vocab_size_, x.cols(), p_.stable);
@@ -312,15 +326,24 @@ public:
              PrecisionProfile precision = PrecisionProfile{},
              bool subln = false,
              std::size_t n_head_kv = 0,
-             bool tie_embeddings = false)
+             bool tie_embeddings = false,
+             WeightQuant weight_quant = WeightQuant::None)
         : vocab_size_(vocab_size), d_model_(d_model), seq_len_(seq_len),
           ln_f_(make_norm_layer(d_model, norm_type)),
-          lm_head_(d_model, vocab_size),
+          // 三值模式：`precision.param == T1_58` 与显式 weight_quant 等价（唯一判据）
+          lm_head_(make_linear_layer(
+              d_model, vocab_size, effective_weight_quant(precision, weight_quant))),
+          weight_quant_(effective_weight_quant(precision, weight_quant)),
           tie_embeddings_(tie_embeddings)
     {
         // D7：将精度配置注入自身和所有子层（§9.2）
+        // P1.5：三值 profile 的分流口径由 `split_ternary_profile` 统一给出
+        //（param=T1_58 只对 BitLinear 有意义）——构造器里两处"辅助对象/LM head"
+        // 的注入必须用同一份口径，否则会把 T1_58 打到 norm / 位置编码表上
+        //（它们要建张量 → 引擎拒绝"非存储精度"）。
+        const TernaryProfileSplit sp = split_ternary_profile(
+            layer_name(), precision, weight_quant_ == WeightQuant::T1_58);
         set_precision_profile(precision);
-        if (ln_f_) ln_f_->set_precision_profile(precision);
         // ── LM head（词表投影）：计算精度强制 = stable ────────────────────
         // logits 是 (vocab, batch·seq) —— 全模型最大的张量，且被 loss 链**多次**
         // 读取（col_max / denom / loss_vec / grad …）。若 head 留在 compute 精度
@@ -331,9 +354,9 @@ public:
         // 真正的 f16 logits 需要 in-kernel f16（typed IR，docs 05 §12.3 Phase 2）。
         if (!tie_embeddings_)
         {
-            PrecisionProfile head_prof = precision;
-            head_prof.compute = precision.stable;
-            lm_head_.set_precision_profile(head_prof);
+            PrecisionProfile head_prof = sp.linear;
+            head_prof.compute = sp.self.stable;
+            lm_head_->set_precision_profile(head_prof);
         }
 
         // ── 位置编码器（**嵌入侧**）：模型只负责"加到 token 嵌入上"那一半 ────
@@ -347,12 +370,14 @@ public:
         {
             blocks_.emplace_back(d_model, num_heads, d_ff, seq_len, seq_len,
                                  pos_enc_type, activation, norm_type, precision,
-                                 subln, n_head_kv);
+                                 subln, n_head_kv, weight_quant_);
         }
 
         // 位置编码器是辅助对象（非 Layer）→ profile 需单独下传：
         // 否则其内部 DSL 求值（gather→transpose→加性融合）退回 F32。
-        pos_encoder_->set_precision_profile(precision);
+        // 注意用 `sp.self`（param 归一化）——它的编码表是**张量**，拿 T1_58 建表
+        // 会被引擎拒绝（T1_58 不是存储精度，见 docs 21 §4.3）。
+        pos_encoder_->set_precision_profile(sp.self);
     }
 
     [[nodiscard]] const char* layer_name() const noexcept override { return "GPTModel"; }
@@ -364,16 +389,21 @@ public:
     // head_prof 的 compute=stable 特例必须与构造器保持一致（见构造器注释）。
     void set_precision_profile(const PrecisionProfile& profile) override
     {
-        Layer::set_precision_profile(profile);
-        if (ln_f_) ln_f_->set_precision_profile(profile);
+        // P1.5 三值分流（§4.8.3）：本模型自身（token 嵌入按 param 建张量）与
+        // 各 norm/位置编码拿 param 归一化为 f32 的那一份；LM head 是线性层，
+        // 三值模式下拿 param=T1_58；块是"线性层持有者"，拿同一份（块内再分流）。
+        const TernaryProfileSplit sp = split_ternary_profile(
+            layer_name(), profile, weight_quant_ == WeightQuant::T1_58);
+        Layer::set_precision_profile(sp.self);
+        if (ln_f_) ln_f_->set_precision_profile(sp.self);
         if (!tie_embeddings_)
         {
-            PrecisionProfile head_prof = profile;
-            head_prof.compute = profile.stable;
-            lm_head_.set_precision_profile(head_prof);
+            PrecisionProfile head_prof = sp.linear;
+            head_prof.compute = sp.self.stable;
+            lm_head_->set_precision_profile(head_prof);
         }
-        for (auto& b : blocks_) b.set_precision_profile(profile);
-        if (pos_encoder_) pos_encoder_->set_precision_profile(profile);
+        for (auto& b : blocks_) b.set_precision_profile(sp.self);
+        if (pos_encoder_) pos_encoder_->set_precision_profile(sp.self);
     }
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
@@ -400,7 +430,7 @@ public:
         {
             NN_TRY(r, ln_f_->init(engine));
         }
-        if (!tie_embeddings_) { NN_TRY(r, lm_head_.init(engine)); }
+        if (!tie_embeddings_) { NN_TRY(r, lm_head_->init(engine)); }
         return {};
     }
 
@@ -412,7 +442,7 @@ public:
                                  ln_f_->parameters());
         if (!tie_embeddings_)
         {
-            auto h = lm_head_.parameters();
+            auto h = lm_head_->parameters();
             refs.insert(refs.end(), h.begin(), h.end());
         }
         return refs;
@@ -426,7 +456,7 @@ public:
                                  ln_f_->param_gradients());
         if (!tie_embeddings_)
         {
-            auto h = lm_head_.param_gradients();
+            auto h = lm_head_->param_gradients();
             refs.insert(refs.end(), h.begin(), h.end());
         }
         return refs;
@@ -553,7 +583,7 @@ public:
         }
         else
         {
-            NN_TRY(b_lm, lm_head_.backward(grad_output));
+            NN_TRY(b_lm, lm_head_->backward(grad_output));
             grad_x = std::move(*b_lm);
         }
 
@@ -647,14 +677,14 @@ public:
         Layer::set_checkpoint_mode(enabled);
         for (auto& b : blocks_) b.set_checkpoint_mode(enabled);
         ln_f_->set_checkpoint_mode(enabled);
-        lm_head_.set_checkpoint_mode(enabled);
+        lm_head_->set_checkpoint_mode(enabled);
     }
 
     void clear_cache() override
     {
         for (auto& b : blocks_) b.clear_cache();
         ln_f_->clear_cache();
-        lm_head_.clear_cache();
+        lm_head_->clear_cache();
         head_input_cache_ = Tensor{};
         checkpoint_inputs_.clear();
     }
