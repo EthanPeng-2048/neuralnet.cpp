@@ -120,6 +120,53 @@ struct PrecisionSupport
     }
 };
 
+// ── P1.5：三值（T1_58）profile 的「复合层分流」──────────────────────────
+// 语义（docs 21 §4.3.2 + §4.8.3）：`param = T1_58` 描述的是**线性子层
+// （BitLinear）的权重是三值**，不是"本层自己的存储布局是三值"——
+// T1_58 不是存储精度，拿它建张量会被引擎拒绝。
+// 因此持有线性子层的复合层（Attention / FeedForward / GPTBlock / GPTModel /
+// RAPT*）必须把一次 profile 拆成两份：
+//   · `self`   —— param 归一化为 f32（复合层自身不持有三值权重；它自建的张量
+//                 如 token 嵌入按 f32 创建），其余三槽原样；
+//   · `linear` —— 三值模式（weight_quant=T1_58）下 param 置为 T1_58，
+//                 否则 == self → 交给 BitLinear / Linear。
+// 非三值入参（param != T1_58）时 `self == linear == 入参` → 既有路径逐位不变。
+//
+// **配置自相矛盾 = fail-fast**：本层未以三值模式构造（weight_quant=None）却
+// 收到 param=T1_58，说明有人把三值声明打到了普通 Linear 上——普通 Linear
+// 承载不了三值权重，此时**不静默降级成 f32**，直接报错（否则会得到"配置了
+// 三值、实际跑 f32"的静默错值路径）。
+struct TernaryProfileSplit
+{
+    PrecisionProfile self;    // 自身 / 非三值子层
+    PrecisionProfile linear;  // 直接持有的线性子层（BitLinear 或 Linear）
+};
+
+[[nodiscard]] inline TernaryProfileSplit split_ternary_profile(
+    const char* layer_name, const PrecisionProfile& profile, bool ternary)
+{
+    if (!ternary && profile.param == Precision::T1_58)
+    {
+        NN_CHECK(false,
+                 std::string("层 ") + layer_name + "：收到 param=t1_58，但该层不是"
+                 "三值模式（weight_quant=None）—— 三值权重只对 BitLinear 有意义；"
+                 "请以 weight_quant=t1_58 构造该层，或把 param 改回 f16/f32"
+                 "（docs/development/21-quantized-weights.md §4.8.3）");
+    }
+    TernaryProfileSplit out{profile, profile};
+    if (out.self.param == Precision::T1_58) out.self.param = Precision::F32;
+    if (ternary) out.linear.param = Precision::T1_58;
+    return out;
+}
+
+// 「param 归一化」单用版（给自建张量的复合层用：`GPTModel` 的 token 嵌入）。
+[[nodiscard]] inline PrecisionProfile without_ternary_param(
+    PrecisionProfile profile) noexcept
+{
+    if (profile.param == Precision::T1_58) profile.param = Precision::F32;
+    return profile;
+}
+
 class Layer
 {
 protected:

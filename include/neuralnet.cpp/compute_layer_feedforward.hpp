@@ -21,8 +21,12 @@ namespace nn {
 class FeedForward final : public Layer
 {
 private:
-    Linear fc1_;   // GeLU: (d_model → d_ff); SwiGLU: (d_model → 2*d_ff)
-    Linear fc2_;   // (d_ff → d_model)
+    // 线性子层走工厂（P1.5 docs 21 §4.8.3）：weight_quant=T1_58 → BitLinear。
+    // 成员类型 = std::unique_ptr<Layer>（与 norm1_/sub_norm_ 同一形态）。
+    std::unique_ptr<Layer> fc1_;  // GeLU: (d_model → d_ff); SwiGLU: (d_model → 2*d_ff)
+    std::unique_ptr<Layer> fc2_;  // (d_ff → d_model)
+    // 三值模式（构造期定型；决定 fc1_/fc2_ 的**具体类型**与 profile 分流）
+    WeightQuant weight_quant_ = WeightQuant::None;
     GeLU  gelu_;
     SwiGLU swiglu_;  // SwiGLU 激活（含 split/merge）
     ReLU2GLU relu2glu_;  // 门控平方 ReLU 激活（BitNet 2B4T；同 split/merge 接线）
@@ -45,11 +49,13 @@ public:
     FeedForward(std::size_t d_model, std::size_t d_ff,
                 ActivationType activation = ActivationType::GeLU,
                 bool subln = false,
-                NormType subln_norm_type = NormType::LayerNorm)
-        : fc1_(d_model,
+                NormType subln_norm_type = NormType::LayerNorm,
+                WeightQuant weight_quant = WeightQuant::None)
+        : fc1_(make_linear_layer(d_model,
                (activation == ActivationType::SwiGLU ||
-                activation == ActivationType::ReLU2) ? 2 * d_ff : d_ff),
-          fc2_(d_ff, d_model),
+                activation == ActivationType::ReLU2) ? 2 * d_ff : d_ff, weight_quant)),
+          fc2_(make_linear_layer(d_ff, d_model, weight_quant)),
+          weight_quant_(weight_quant),
           swiglu_(d_ff),
           relu2glu_(d_ff),
           use_swiglu_(activation == ActivationType::SwiGLU),
@@ -61,8 +67,8 @@ public:
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
-        NN_TRY(r1, fc1_.init(engine));
-        NN_TRY(r2, fc2_.init(engine));
+        NN_TRY(r1, fc1_->init(engine));
+        NN_TRY(r2, fc2_->init(engine));
         // M6 段 C：激活子层也是 Layer（engine 由 init 绑定），必须一并 init——
         // 否则 forward 里调 gelu_/swiglu_.forward() 会在 engine_ref() 处 fail-fast。
         { NN_TRY(r, gelu_.init(engine)); }
@@ -74,7 +80,7 @@ public:
 
     std::vector<TensorRef> parameters() override
     {
-        auto r = collect_refs(fc1_.parameters(), fc2_.parameters());
+        auto r = collect_refs(fc1_->parameters(), fc2_->parameters());
         if (sub_norm_)
         {
             auto s = sub_norm_->parameters();
@@ -85,7 +91,7 @@ public:
 
     std::vector<TensorRef> param_gradients() override
     {
-        auto r = collect_refs(fc1_.param_gradients(), fc2_.param_gradients());
+        auto r = collect_refs(fc1_->param_gradients(), fc2_->param_gradients());
         if (sub_norm_)
         {
             auto s = sub_norm_->param_gradients();
@@ -98,8 +104,8 @@ public:
     void set_checkpoint_mode(bool enabled) override
     {
         Layer::set_checkpoint_mode(enabled);
-        fc1_.set_checkpoint_mode(enabled);
-        fc2_.set_checkpoint_mode(enabled);
+        fc1_->set_checkpoint_mode(enabled);
+        fc2_->set_checkpoint_mode(enabled);
         gelu_.set_checkpoint_mode(enabled);
         swiglu_.set_checkpoint_mode(enabled);
         relu2glu_.set_checkpoint_mode(enabled);
@@ -110,21 +116,28 @@ public:
     // FeedForward 是复合层（fc1/fc2 + GeLU/SwiGLU）：必须把 profile 下传给
     // 所有子层，否则子层 p_ 停在默认全 F32 —— FFN 是 d_ff=4·d_model 量级的
     // 最大激活生产者，f16 配置下静默失效。
+    //
+    // ── P1.5 三值分流（§4.8.3）───────────────────────────────────────────
+    // `weight_quant_ = T1_58` 时：fc1_/fc2_ 是 BitLinear，拿 param=T1_58 的
+    // profile；本层自身与激活层拿 param 归一化为 f32 的那一份（自身不持有
+    // 三值权重）。非三值模式逐位不变（split 退化为恒等）。
     void set_precision_profile(const PrecisionProfile& profile) override
     {
-        Layer::set_precision_profile(profile);
-        fc1_.set_precision_profile(profile);
-        fc2_.set_precision_profile(profile);
-        gelu_.set_precision_profile(profile);
-        swiglu_.set_precision_profile(profile);
-        relu2glu_.set_precision_profile(profile);
-        if (sub_norm_) sub_norm_->set_precision_profile(profile);
+        const TernaryProfileSplit sp = split_ternary_profile(
+            layer_name(), profile, weight_quant_ == WeightQuant::T1_58);
+        Layer::set_precision_profile(sp.self);
+        fc1_->set_precision_profile(sp.linear);
+        fc2_->set_precision_profile(sp.linear);
+        gelu_.set_precision_profile(sp.self);
+        swiglu_.set_precision_profile(sp.self);
+        relu2glu_.set_precision_profile(sp.self);
+        if (sub_norm_) sub_norm_->set_precision_profile(sp.self);
     }
 
     void clear_cache() override
     {
-        fc1_.clear_cache();
-        fc2_.clear_cache();
+        fc1_->clear_cache();
+        fc2_->clear_cache();
         gelu_.clear_cache();
         swiglu_.clear_cache();
         relu2glu_.clear_cache();
@@ -134,8 +147,8 @@ public:
     std::vector<TensorRef> activation_cache() override
     {
         std::vector<TensorRef> r;
-        auto a = fc1_.activation_cache(); r.insert(r.end(), a.begin(), a.end());
-        auto b = fc2_.activation_cache(); r.insert(r.end(), b.begin(), b.end());
+        auto a = fc1_->activation_cache(); r.insert(r.end(), a.begin(), a.end());
+        auto b = fc2_->activation_cache(); r.insert(r.end(), b.begin(), b.end());
         auto g = gelu_.activation_cache(); r.insert(r.end(), g.begin(), g.end());
         auto s = swiglu_.activation_cache(); r.insert(r.end(), s.begin(), s.end());
         auto r2 = relu2glu_.activation_cache(); r.insert(r.end(), r2.begin(), r2.end());
@@ -150,7 +163,7 @@ public:
     [[nodiscard]] Result<Tensor> forward(
         const Tensor& input) override
     {
-        NN_TRY(h1, fc1_.forward(input));
+        NN_TRY(h1, fc1_->forward(input));
         Tensor h2_out;
         if (use_swiglu_)
         {
@@ -173,13 +186,13 @@ public:
             NN_TRY(sn, sub_norm_->forward(h2_out));
             h2_out = std::move(*sn);
         }
-        return fc2_.forward(h2_out);
+        return fc2_->forward(h2_out);
     }
 
     [[nodiscard]] Result<Tensor> backward(
         const Tensor& grad_output) override
     {
-        NN_TRY(b2, fc2_.backward(grad_output));
+        NN_TRY(b2, fc2_->backward(grad_output));
         Tensor g = std::move(*b2);
         if (sub_norm_)
         {
@@ -189,15 +202,15 @@ public:
         if (use_swiglu_)
         {
             NN_TRY(bg, swiglu_.backward(g));
-            return fc1_.backward(*bg);
+            return fc1_->backward(*bg);
         }
         if (use_relu2_)
         {
             NN_TRY(bg, relu2glu_.backward(g));
-            return fc1_.backward(*bg);
+            return fc1_->backward(*bg);
         }
         NN_TRY(bg, gelu_.backward(g));
-        return fc1_.backward(*bg);
+        return fc1_->backward(*bg);
     }
 };
 
