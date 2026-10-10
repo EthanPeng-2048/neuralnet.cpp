@@ -2206,6 +2206,7 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 | GPT 训练 | d_model / d_ff | 256 / 1024 | **128 / 512** |
 | GPT 训练 | flush 间隔 | 0（=不间断） | **1**（实现默认；帮助文本同时由 2 订正为 1） |
 | GPT 训练 | 精度预设 f16 的回填值 | param=f32/compute=f16（**master-weights 配方**） | **param=f16/compute=f16/stable=f32/opt=f32**（= `text_train --f16` 的真实语义 `profile_f16()`；原回填值与实际发出的 `--f16` 语义不符，属误导） |
+| MNIST 训练 | 精度预设 f16 的回填值 | param=f32/compute=f16（**master-weights 配方**） | **param=f16/compute=f16/stable=f32/opt=f32**（= `mnist_train --f16` 的真实语义 `profile_f16()`）。与上一行**同一个缺陷**（当时只修了 GPT 页）；2026-10-10 追加补修 MNIST 页与 `mnist_train --help` 里同样的旧文案 |
 | GPT 推理 | 温度 | 0.8 | **1.0** |
 
 - **控制器侧顺带修复**：`--shuffle-steps` 是**带值**选项（CLI 接受 `true/false/1/0`），

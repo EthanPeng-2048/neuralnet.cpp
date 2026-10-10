@@ -244,7 +244,8 @@ struct nn::PrecisionProfile {
     Precision stable    = Precision::F32;   // 数值敏感算子（softmax / Norm / loss）
     Precision optimizer = Precision::F32;   // 优化器状态（m / v / momentum）
 };
-// 配方：profile_f32() / profile_master_weights() / profile_f16() / profile_all_f16()
+// 配方（CLI 预设）：profile_f32() / profile_f16()（--f16）/ profile_t1_58()（--t1_58，三值权重 + f16 存储）
+//                  / profile_master_weights() / profile_all_f16()
 ```
 
 > **三值 `T1_58` 与 f16/f32 正交（docs/development/21-quantized-weights.md）**：f16 是"换更窄的

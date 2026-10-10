@@ -377,6 +377,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 - 优化器更新算子全部显式：参数更新 P = `param`（in-place，存储不变），状态更新 P = `optimizer`。
 - **per-layer 覆盖 = Phase 2**：`p_` 本就是每层成员，改成员即覆盖（如末层 head 强制 F32），纯增量。
 - CLI 入口的 `--f16` 标志 = `profile_f16()` = **{param=F16, compute=F16, stable=F32, optimizer=F32}**（§9.4"全 f16（激进）"行）；`text_train`/`mnist_train` 另有 `--precision-param/compute/stable/optimizer` 逐字段覆盖，`mem_probe` 有 `--f16` / `--f16-all`。master-weights 配方 {param=F32, compute=F16, stable=F32, optimizer=F32} 对应 `profile_master_weights()`。
+- **精度预设（2026-10-10 新增）**：CLI `--t1_58` = `profile_t1_58()` = **{param=T1_58, compute=F16, stable=F32, optimizer=F32}** —— 定义上就是 `profile_f16()` 把 `param` 换成三值（另三槽在同一函数里派生 → 不可能与 `--f16` 漂移），即"**其他默认 f16，模型参数 1.58**"。三值只描述**权重**（`T1_58` 不是存储精度），落地点是 `BitLinear`，见 `docs/development/21-quantized-weights.md` §4.10。
 
 ### 9.4 典型配方
 
@@ -384,12 +385,13 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 |---|---|---|---|---|
 | 全 f32（现状/默认，`profile_f32()`） | F32 | F32 | F32 | F32 |
 | 全 f16（激进）——即 CLI `--f16` = `profile_f16()` | F16 | F16 | F32 | F32 |
+| **三值权重 + f16 存储——即 CLI `--t1_58` = `profile_t1_58()`** | T1_58 | F16 | F32 | F32 |
 | **master-weights（经典混合精度，`profile_master_weights()`）** | F32 | F16 | F32 | F32 |
 | 四字段全 f16（`profile_all_f16()`，实验配方） | F16 | F16 | F16 | F16 |
 
 （`stable` 可放宽为 F16，用户自担溢出风险，见 §12.4。）
 
-**注意区分**：`--f16` 只把 **param/compute** 设为 F16，stable/optimizer 留 F32；**四字段全 F16 实测不可用于训练**（optimizer=F16 状态下溢、stable=F16 时 CE 链 NaN，见 §12.5），仅供显式实验。
+**注意区分**：`--f16` 只把 **param/compute** 设为 F16，stable/optimizer 留 F32；**四字段全 F16 实测不可用于训练**（optimizer=F16 状态下溢、stable=F16 时 CE 链 NaN，见 §12.5），仅供显式实验。同理 `--t1_58` 只把 **param** 换成三值（`T1_58` 只描述权重、不是存储精度）：compute/stable/optimizer 与 `--f16` 逐字段相同；字面"四槽全 f16 + 三值权重"= `--t1_58 --precision-stable f16 --precision-optimizer f16`。
 
 ---
 
@@ -532,7 +534,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 | DSL | `dsl::compute / compute_reduce` 带 `Precision P`（输出精度）；`compute_into` 取 dst 存储精度；CPU 侧 f16 叶子一次性转 f32 镜像（`CpuViewCache`，`at()` 保持无分支 → 热路径零回归）、`eval_cpu`/`eval_into_tensor_cpu` 支持 f16 输出 |
 | Layer 接线 | `Linear`（param + compute）、`ReLU/GeLU/SwiGLU`（compute）、`LayerNorm/RMSNorm`（stable + param）、`AttentionBase`（4 投影 + Softmax + RoPE 一并下传）、`FeedForward`、`GPTModel`（位置编码器下传；**LM head 强制 stable**，见下）、`TransformerEncoderLayer/Encoder/PatchEmbedding/PositionalEncoding` |
 | Loss / Optimizer | `Loss` 基类带 `p_`（loss 链 = stable，D9）；`Optimizer` 构造器接 `PrecisionProfile`，状态张量按 `p.optimizer` 创建，参数更新 in-place |
-| 工厂 / CLI | `Model::set_default_precision_profile`（必须在 `add` 之前调用：权重在 `init` 时按精度创建）；`build_mnist_*`、`create_optimizer` 接 profile；`--f16`（= `profile_f16()`）/`--precision-*` 在 `text_train`/`mnist_train`/`mem_probe` 启用适配层 |
+| 工厂 / CLI | `Model::set_default_precision_profile`（必须在 `add` 之前调用：权重在 `init` 时按精度创建）；`build_mnist_*`、`create_optimizer` 接 profile；`--f16`（= `profile_f16()`）/`--t1_58`（= `profile_t1_58()`）/`--precision-*` 在 `text_train`/`mnist_train`/`mem_probe` 启用适配层 |
 | 测试 | `f16_precision_test`：f32 零回归逐字节、f16 DSL / 搬运 / 归约 / matmul、in-place 存储精度不变、**GPT 模型级 f32↔f16 逐 step 轨迹对拍** |
 
 **机制结论（当前有效）**
@@ -808,7 +810,7 @@ matmul 段 / 归约 / 目标传递三类变体落地后的同窗交错实测（f
 | `compute_loss.hpp` / `compute_optimizer.hpp` | 显式 P（loss = stable；状态 = optimizer；参数 = param） |
 | `model_container.hpp` / `model_spec.hpp` | `PrecisionProfile` 持有与透传 |
 | `model_serialization.hpp` | v5（每张量 tag） |
-| `src/`（CLI 入口） | `--f16`（= `profile_f16()`）与 `--precision-*` 逐字段覆盖 |
+| `src/`（CLI 入口） | 预设 `--f16`（= `profile_f16()`）/ `--t1_58`（= `profile_t1_58()`）与 `--precision-*` 逐字段覆盖 |
 | `src/*_test` / `src/*_probe` | §13 测试集 + gradcheck 容差按 P 分级 |
 
 ---
