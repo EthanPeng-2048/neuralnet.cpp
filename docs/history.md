@@ -13,7 +13,7 @@
 - [GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）](#GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）)（17 条）
 - [注意力 / ZiPT / Transformer / FeedForward 层](#注意力 / ZiPT / Transformer / FeedForward 层)（16 条）
 - [RAPT / CNN / MLP / Softmax / GPT 层](#RAPT / CNN / MLP / Softmax / GPT 层)（13 条）
-- [引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器](#引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器)（20 条）
+- [引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器](#引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器)（21 条）
 - [代数层 / 基础设施 / 模型容器与序列化](#代数层 / 基础设施 / 模型容器与序列化)（15 条）
 - [领域模型工厂与 CLI 公共头](#领域模型工厂与 CLI 公共头)（3 条）
 - [src 应用入口（text/mnist/tokenizer/bench）](#src 应用入口（text/mnist/tokenizer/bench）)（5 条）
@@ -541,6 +541,28 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 - **实施期裁定（同设计文档 §0 表 16–21 / §4.9）**：(a) CLI 帮助只把 `t1_58` 挂 param 行，compute/stable/optimizer 收它即**解析期**报错（三值只描述权重）；(b) 扫描器登记从"per-layer dry-run"改到**模型 pass**（一条 `param=T1_58` 的 MLP 用例覆盖 forward/backward/量化三段结构，91 → 96 条结构、130 → 135 变体）；(c) CNN 目前不接精度 profile → 显式提示"本选项未生效"而非改硬报错（后者会改既有 `--f16 --arch cnn` 行为）。
 - **缺陷修复（由 `t1_58_test --gpu` 抓到）**：Adam 的"更新量精度 = `p_.param`"在 `param=T1_58` 时拿**非存储精度**去建张量 —— GPU 在 `check_precision_supported` 硬报错、CPU 静默按 f32 建（两端不一致）。修法 = param 槽不是存储精度时回落到**目标张量自身**的精度；同批把"非存储精度"硬化扩到 `create_tensor`/`from_matrix`/`dsl::compute`/`compute_reduce` 四个入口（P1 保证：没有任何代码能拿 `T1_58` 当存储/输出精度）。
 - **未做（留在后续阶段）**：P2 = 行级打包（`TQ1_0` 编码 + absmean 尺度）+ `matmul_q` + M7 张量 qparam + `layer_bench` A/B（D6 行步长/对齐仍待定）；P1.5 = `Linear` 成员 → `make_linear_layer` + `unique_ptr<Layer>`（GPT/RAPT 三值）；P3 = 激活 int8 + 整数点积。性能预期须先量后承诺（`d_model` 64–256 可能落在 kernel 启动延迟区）。
+
+## P1 三值显存/步时实测：**不省显存**（2026-10-10，102 / NVIDIA CMP 40HX；原位置 设计文档 `docs/development/21-quantized-weights.md` §5 的"性能"承诺口径）
+
+- 类型：性能 A/B / 口径纠正
+- 动机：实测反馈"t1_58 好像不省显存"。复核结论 = **P1 形态下确实不省，反而略增**，据此在文档里
+  写明，避免把"省显存"当成三值的能力（P1 只交付架构与正确性，D7 不做打包存储）。
+- 构成（每权重元素字节）：f32 普通层 4+4 = 8；f16 普通层 2+2 = 4；BitLinear（`--t1_58`）
+  = latent **恒 f32** 4 + 梯度 **恒 f32** 4 + `wq_` f16 2 = **10**（latent/梯度留 f32 是 STE
+  落点与优化器正确性要求，`05-mixed-precision.md` 有 f16 优化器状态 NaN/下溢实测）。
+- 实测（`bench/run_with_vram.ps1`：nvidia-smi 200 ms 采样整卡峰值；同机顺序、每档 60 步、
+  同一份 40 MB `.nndataset`，`NN_MEM_STATS=1` 同时取池统计）：小模型
+  d64·h4·L4·ff256·seq128·b64 = f32 **1164** / f16 **908** / t1_58 **1202** MiB
+  （t1_58 比 f16 **+32%**，甚至高于 f32）；中模型 d512·h8·L8·ff2048·seq256·b8 =
+  2858 / 1882 / **2254** MiB（比 f16 **+20%**）。
+- 步时：同机 150 步 wall-clock f32 75.9 s / f16 80.6 s / t1_58 81.4 s（含一次性数据集装载，
+  只看差值）→ `f16 → t1_58` **+1%**；与真实语料 150 步的 **+16% vs f32** 同量级（来源 =
+  每步重算 τ/wq 的三次额外 pass + 权重带宽）。
+- 收益在哪：训练期只有 P2 打包能压 `wq_` 那一项（2 B → 行级 base-3 ≈ 1.7 bpw，总账
+  10 → ~8.3 B/元素 = **−17%**）；数量级收益在**推理/部署**（无 latent/梯度/优化器：
+  1.7 bpw vs f16 的 16 bpw ≈ **9.4×**）。2B4T 训练侧的显存收益来自 GQA + tied embedding，
+  与 BitLinear 无关。
+- 落点：当前状态表述进 `21-quantized-weights.md` §4.11；本条归档实测过程与数值。
 
 ## BitNet b1.58 2B4T 结构对齐（SubLN / GQA / tied embedding）落地（2026-10-10，分支 `dev/t1_58`；原位置 设计文档 `docs/development/22-bitnet-2b4t-architecture.md` 的"立项 + 实施中"状态）
 - 类型：演进记录 / 设计落地（含 4 处实现期踩坑）
