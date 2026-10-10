@@ -44,6 +44,7 @@
 #include "compute_engine.hpp"
 #include "expr_opt.hpp"
 #include "expr_dsl.hpp"    // matmul_with_bias 经 DSL 融合（单一事实源）
+#include "ternary_pack.hpp"  // 三值打包布局（trit_pack / matmul_q，P2/F3）
 
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
 #include "fused_registry.hpp"
@@ -762,6 +763,89 @@ public:
     // ══════════════════════════════════════════════════════════════════════
     // 矩阵级原语
     // ══════════════════════════════════════════════════════════════════════
+
+    // ── 三值打包权重（P2 / F3）：打包字容器 + 量化 GEMM ────────────────────
+    // 能力位 = 打包与 GEMM 两个 pipeline 都在（缺任一 → BitLinear 走 f16 稠密
+    // 缓冲，见 compute_layer_bitlinear.hpp 的 use_packed_）。
+    [[nodiscard]] bool supports_ternary_gemm() const noexcept override
+    {
+        return backend_.has_trit_pack_pipeline() && backend_.has_matmul_q_pipeline();
+    }
+
+    [[nodiscard]] Result<Tensor> trit_pack_impl(const Tensor& w,
+                                                const Tensor& scale) override
+    {
+        if (!w.is_gpu() || !scale.is_gpu())
+            NN_FAIL("trit_pack: GPU 张量必需");
+        if (w.precision() != Precision::F32 || scale.precision() != Precision::F32)
+            NN_FAIL("trit_pack: 需要 f32 权重 + f32 尺度");
+        if (scale.rows() != w.rows() || scale.cols() != 1)
+            NN_FAIL("trit_pack: τ 形状必须是 (rows,1)");
+        const std::size_t rows = w.rows(), k = w.cols();
+        const std::size_t wpr = nn::trit_pack::words_per_row(k);
+        auto out = GpuTensor::create_empty(rows, wpr, backend_);
+        NN_TRY_CHECK(out);
+        NN_TRY(r, backend_.trit_pack_gpu(
+            w.gpu_tensor().buffer(), scale.gpu_tensor().buffer(), out->buffer(),
+            static_cast<std::uint32_t>(rows), static_cast<std::uint32_t>(k),
+            static_cast<std::uint32_t>(wpr)));
+        return Tensor::from_gpu(std::move(*out));
+    }
+
+    [[nodiscard]] Result<Tensor> matmul_q_impl(const Tensor& packed,
+                                               const Tensor& scale, const Tensor& B,
+                                               bool transA, std::size_t out_rows,
+                                               Precision P) override
+    {
+        if (!packed.is_gpu() || !scale.is_gpu() || !B.is_gpu())
+            NN_FAIL("matmul_q: GPU 张量必需（跨设备请先 import）");
+        if (packed.precision() != Precision::F32)
+            NN_FAIL("matmul_q: 打包容器必须是 f32 容器");
+        // 形状推导与校验（与 CPU 实现同一口径）
+        const std::size_t N = B.cols();
+        const std::size_t M = transA ? out_rows : packed.rows();
+        const std::size_t K = transA ? packed.rows() : B.rows();
+        const std::size_t a_len = transA ? M : K;
+        if (transA && out_rows == 0) NN_FAIL("matmul_q_t: out_rows 必须显式给出");
+        if (B.rows() != K) NN_FAIL("matmul_q: B 行数 != 求和维 K");
+        const std::size_t wpr = nn::trit_pack::words_per_row(a_len);
+        if (wpr != packed.cols()) NN_FAIL("matmul_q: 打包容器列数与 (K/M) 不匹配");
+        if (scale.rows() != packed.rows() || scale.cols() != 1)
+            NN_FAIL("matmul_q: τ 形状必须与打包 A 的行数一致");
+
+        // in-kernel f16 变体（B 与输出均 f16）：f16 profile 下的主路径 ——
+        // 否则每个 BitLinear 层每步要多付两份 (·,batch) 的 f32 边界 cast 临时量。
+        if (P == Precision::F16 && B.precision() == Precision::F16 &&
+            backend_.has_matmul_q_f16_pipeline())
+        {
+            auto out16 = GpuTensorF16::create_empty(M, N, backend_);
+            NN_TRY_CHECK(out16);
+            NN_TRY(r, backend_.matmul_q_gpu(
+                packed.gpu_tensor().buffer(), scale.gpu_tensor().buffer(),
+                B.gpu_tensor<Precision::F16>().buffer(), out16->buffer(),
+                static_cast<std::uint32_t>(M), static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(K), transA ? 1u : 0u,
+                static_cast<std::uint32_t>(wpr), /*f16=*/true));
+            return Tensor::from_gpu(std::move(*out16));
+        }
+
+        // f32 路径（B 为 f16 时先抬 f32；输出按 P 落回）
+        // 注：to_f32 是基类**私有**助手 → 用公共 cast（同 matmul_impl 的口径）
+        auto b32 = (B.precision() == Precision::F32) ? Result<Tensor>{B}
+                                                     : cast(B, Precision::F32);
+        NN_TRY_CHECK(b32);
+        auto out = GpuTensor::create_empty(M, N, backend_);
+        NN_TRY_CHECK(out);
+        NN_TRY(r, backend_.matmul_q_gpu(
+            packed.gpu_tensor().buffer(), scale.gpu_tensor().buffer(),
+            b32->gpu_tensor().buffer(), out->buffer(),
+            static_cast<std::uint32_t>(M), static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(K), transA ? 1u : 0u,
+            static_cast<std::uint32_t>(wpr), /*f16=*/false));
+        Tensor res = Tensor::from_gpu(std::move(*out));
+        if (P == Precision::F32) return res;
+        return cast(res, P);
+    }
 
     [[nodiscard]] Result<Tensor> matmul_impl(
         const Tensor& A, const Tensor& B,

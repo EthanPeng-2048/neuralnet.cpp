@@ -612,8 +612,20 @@ public:
     {
         if (!packed.is_cpu() || !scale.is_cpu() || !B.is_cpu())
             NN_FAIL("matmul_q: tensors are not CPU");
-        if (P != Precision::F32)
-            NN_FAIL("matmul_q: CPU 实现恒 f32（边界 cast 在入口层）");
+        // 边界 cast（CPU 无 in-kernel f16 变体）：B/输出统一走 f32 参考空间 ——
+        // 与 matmul_impl 的 CPU 口径一致（§7.2）。
+        if (P != Precision::F32 || B.precision() != Precision::F32)
+        {
+            // 注：to_f32/to_prec 是基类**私有**助手（只有基类入口可用）→ 这里
+            // 用公共 cast（与 matmul_impl 的 CPU 边界 cast 同款）。
+            auto b32 = (B.precision() == Precision::F32) ? Result<Tensor>{B}
+                                                         : cast(B, Precision::F32);
+            NN_TRY_CHECK(b32);
+            NN_TRY(r, matmul_q_impl(packed, scale, *b32, transA, out_rows,
+                                    Precision::F32));
+            if (P == Precision::F32) return r;
+            return cast(*r, P);
+        }
         if (packed.precision() != Precision::F32 || scale.precision() != Precision::F32 ||
             B.precision() != Precision::F32)
             NN_FAIL("matmul_q: 需要 f32 容器/尺度/操作数");

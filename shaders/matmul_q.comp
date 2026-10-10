@@ -1,0 +1,80 @@
+// ── matmul_q.comp — 三值打包权重的量化 GEMM 原语（P2 / F3）─────────────────
+// C = (τ∘W)^(T)·B，其中 W 以 2 bit/权重打包（见 trit_pack.comp / ternary_pack.hpp），
+// τ 是逐**存储行**的尺度（absmean）。两种形态：
+//   transA=0：A 存为 (M,K) 打包 → C (M,N) = (τ∘A)·B，B (K,N)，τ 取行 m
+//   transA=1：A 存为 (K,M) 打包 → C (M,N) = (τ∘A)^T·B，B (K,N)，τ 取行 k
+// 两条路径都把 τ 乘进**每个 trit**（τ·(code-2)）后再累加 —— 与 CPU 参考实现
+// 逐运算同序（可对拍到 1e-5 以内），不是"算完再整体乘"。
+//
+// 精度变体（glslc -DNN_SHADER_F16=1）：B/C 声明 float16_t（同所有原语惯例：
+// f32 参考累加 + 写出 RNE 舍入）；打包字缓冲恒 uint（与精度无关）。
+//
+// 性能定位（先量后承诺）：本版是"每输出元素独立解码"的直白内核（一个 8×8
+// workgroup，无共享内存分块）—— 对 batch=1 的自回归解码（GEMV，权重带宽受限）
+// 是自然形态；大 batch 训练下解码被重复执行的代价高于分块 GEMM，是否需要
+// 分块解码按 layer_bench 的配对 A/B 决定（docs 21 §5 的 P2 准入门槛）。
+// ─────────────────────────────────────────────────────────────────────────
+#version 450
+
+#if defined(NN_SHADER_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#define NN_ETYPE float16_t
+#define NN_RD(x) float(x)
+#include "nn_f16_rne.glsl"
+#define NN_WR(x) float16_t(nn_f16_rne(x))
+#else
+#define NN_ETYPE float
+#define NN_RD(x) x
+#define NN_WR(x) x
+#endif
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 0) readonly  buffer BufP { uint P[]; };      // 打包 A
+layout(std430, binding = 1) readonly  buffer BufT { float T[]; };     // τ（存储行）
+layout(std430, binding = 2) readonly  buffer BufB { NN_ETYPE B[]; };  // B (K,N)
+layout(std430, binding = 3) writeonly buffer BufC { NN_ETYPE C[]; };  // C (M,N)
+
+layout(push_constant) uniform Push {
+    uint M;
+    uint N;
+    uint K;       // 求和维（= B 的行数）
+    uint transA;  // 0 = A 存 (M,K)；1 = A 存 (K,M)
+    uint wpr;     // A 每存储行的字数：transA=0 → ceil(K/16)；transA=1 → ceil(M/16)
+};
+
+void main()
+{
+    const uint m = gl_GlobalInvocationID.x;
+    const uint n = gl_GlobalInvocationID.y;
+    if (m >= M || n >= N) return;
+
+    float acc = 0.0f;
+    if (transA == 0u)
+    {
+        const float tau = T[m];
+        const uint base = m * wpr;
+        for (uint k0 = 0u; k0 < K; k0 += 16u)
+        {
+            const uint word = P[base + (k0 >> 4u)];
+            const uint lim = min(16u, K - k0);
+            for (uint j = 0u; j < lim; ++j)
+            {
+                const float t = (float((word >> (2u * j)) & 3u) - 2.0f) * tau;
+                acc += t * NN_RD(B[(k0 + j) * N + n]);
+            }
+        }
+    }
+    else
+    {
+        const uint word_idx = m >> 4u;
+        const uint shift = 2u * (m & 15u);
+        for (uint k = 0u; k < K; ++k)
+        {
+            const uint word = P[k * wpr + word_idx];
+            const float t = (float((word >> shift) & 3u) - 2.0f) * T[k];
+            acc += t * NN_RD(B[k * N + n]);
+        }
+    }
+    C[m * N + n] = NN_WR(acc);
+}

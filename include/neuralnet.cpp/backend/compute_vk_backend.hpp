@@ -248,6 +248,23 @@
 #define NN_CAST_SPV_EMBEDDED
 #endif
 
+// P2/F3：三值打包权重（打包字容器 + 量化 GEMM；见 shaders/trit_pack.comp /
+// matmul_q.comp 与 include/neuralnet.cpp/ternary_pack.hpp）
+#if __has_include("trit_pack_spv.hpp")
+#include "trit_pack_spv.hpp"
+#define NN_TRIT_PACK_SPV_EMBEDDED
+#endif
+
+#if __has_include("matmul_q_spv.hpp")
+#include "matmul_q_spv.hpp"
+#define NN_MATMUL_Q_SPV_EMBEDDED
+#endif
+
+#if __has_include("matmul_q_f16_spv.hpp")
+#include "matmul_q_f16_spv.hpp"
+#define NN_MATMUL_Q_F16_SPV_EMBEDDED
+#endif
+
 // AOT 融合 shader 注册表（构建期 scan_exprs 收集 + gen_fused 合成；表达式
 // 只出现在 Layer，本表是折叠后的派生物）。运行时按 expr_spec_key 匹配 dispatch。
 //
@@ -553,6 +570,10 @@ private:
     VulkanPipeline outer_col_f16_pipeline_;
     // 通用精度转换原语（engine.cast 的 GPU 实现；f16↔f32，kind 分派精度对）
     VulkanPipeline cast_pipeline_;
+    // 三值打包原语（P2/F3）：打包字容器 + 量化 GEMM（f32 / f16 存储两版）
+    VulkanPipeline trit_pack_pipeline_;
+    VulkanPipeline matmul_q_pipeline_;
+    VulkanPipeline matmul_q_f16_pipeline_;
     // AOT 融合 shader pipelines（key = expr_spec_key → pipeline；由构建期
     // fused_registry.hpp 注册，运行时按 key 匹配后直接 dispatch）
     std::unordered_map<std::string, VulkanPipeline> fused_pipelines_;
@@ -1056,6 +1077,36 @@ private:
     {
 #ifdef NN_CAST_SPV_EMBEDDED
         return nn_cast_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_trit_pack_spirv()
+    {
+#ifdef NN_TRIT_PACK_SPV_EMBEDDED
+        return nn_trit_pack_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_matmul_q_spirv()
+    {
+#ifdef NN_MATMUL_Q_SPV_EMBEDDED
+        return nn_matmul_q_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_matmul_q_f16_spirv()
+    {
+#ifdef NN_MATMUL_Q_F16_SPV_EMBEDDED
+        return nn_matmul_q_f16_spirv_bytecode();
 #else
         static const std::vector<uint32_t> empty;
         return empty;
@@ -1725,6 +1776,36 @@ public:
                 cast_pipeline_ = std::move(*cast_r);
         }
 
+        // 15b. 三值打包权重（P2/F3）：trit_pack（3 缓冲 + push{rows,k,wpr}）与
+        //      matmul_q（4 缓冲 + push{M,N,K,transA,wpr}）。f16 存储变体在设备
+        //      支持 16 位存储时才建（否则 BitLinear 走 f16 稠密路径）。
+        {
+            const auto& tp = get_trit_pack_spirv();
+            if (!tp.empty())
+            {
+                auto r = VulkanPipeline::create_generic(
+                    device_.device(), tp, 3, 3u * sizeof(uint32_t));
+                if (r) trit_pack_pipeline_ = std::move(*r);
+            }
+            const auto& mq = get_matmul_q_spirv();
+            if (!mq.empty())
+            {
+                auto r = VulkanPipeline::create_generic(
+                    device_.device(), mq, 4, 5u * sizeof(uint32_t));
+                if (r) matmul_q_pipeline_ = std::move(*r);
+            }
+            if (device_.has_16bit_storage())
+            {
+                const auto& mq16 = get_matmul_q_f16_spirv();
+                if (!mq16.empty())
+                {
+                    auto r = VulkanPipeline::create_generic(
+                        device_.device(), mq16, 4, 5u * sizeof(uint32_t));
+                    if (r) matmul_q_f16_pipeline_ = std::move(*r);
+                }
+            }
+        }
+
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
         // 16. 注册 AOT 融合 shader pipelines（构建期 scan_exprs 收集 +
         //     fused_generate.hpp 合成）。条目形态：
@@ -1857,6 +1938,10 @@ public:
     [[nodiscard]] bool has_outer_col_pipeline() const noexcept { return outer_col_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_outer_col_f16_pipeline() const noexcept { return outer_col_f16_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_cast_pipeline() const noexcept { return cast_pipeline_.handle() != VK_NULL_HANDLE; }
+    // 三值打包能力（P2/F3）：打包 + 量化 GEMM 两个 pipeline 都在才算接通
+    [[nodiscard]] bool has_trit_pack_pipeline() const noexcept { return trit_pack_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_matmul_q_pipeline() const noexcept { return matmul_q_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_matmul_q_f16_pipeline() const noexcept { return matmul_q_f16_pipeline_.handle() != VK_NULL_HANDLE; }
 
     // ── f16 硬件能力查询（§7.1）────────────────────────────────────
     [[nodiscard]] bool has_shader_float16() const noexcept { return has_shader_float16_; }
@@ -4345,6 +4430,162 @@ public:
         const std::uint32_t wg = static_cast<std::uint32_t>((pairs + 255u) / 256u);
         vkCmdDispatch(cmd, wg < 1u ? 1u : wg, 1u, 1u);
         record_output_barrier(cmd, dst.impl());
+
+        if (owns_cmd)
+        {
+            auto r = submit_and_wait(cmd, desc_set);
+            NN_TRY_CHECK(r);
+        }
+        return {};
+    }
+
+    // ── 三值打包（P2/F3）：W (rows,k) f32 + τ (rows) f32 → 打包字 (rows,wpr) ──
+    [[nodiscard]] Result<void> trit_pack_gpu(
+        const GpuBuffer& w, const GpuBuffer& tau, const GpuBuffer& packed,
+        std::uint32_t rows, std::uint32_t k, std::uint32_t wpr)
+    {
+        if (!initialized_)
+            NN_FAIL("GPU backend not initialized");
+        if (!has_trit_pack_pipeline())
+            NN_FAIL("trit_pack_gpu: trit_pack pipeline not available");
+        auto ds_r = alloc_desc_set(trit_pack_pipeline_.descriptor_layout());
+        NN_TRY_CHECK(ds_r);
+        VkDescriptorSet desc_set = *ds_r;
+
+        VkDescriptorBufferInfo binfo[3] = {
+            {w.impl(), 0, VK_WHOLE_SIZE},
+            {tau.impl(), 0, VK_WHOLE_SIZE},
+            {packed.impl(), 0, VK_WHOLE_SIZE},
+        };
+        VkWriteDescriptorSet writes[3];
+        for (std::uint32_t i = 0; i < 3; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].pNext = nullptr;
+            writes[i].dstSet = desc_set;
+            writes[i].dstBinding = i;
+            writes[i].dstArrayElement = 0;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pImageInfo = nullptr;
+            writes[i].pBufferInfo = &binfo[i];
+            writes[i].pTexelBufferView = nullptr;
+        }
+        vkUpdateDescriptorSets(device_.device(), 3, writes, 0, nullptr);
+
+        auto cmd_r = acquire_cmd();
+        if (!cmd_r)
+        {
+            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            NN_TRY_CHECK(cmd_r);
+        }
+        auto [cmd, owns_cmd] = *cmd_r;
+
+        std::vector<VkBuffer> in_bufs{w.impl(), tau.impl()};
+        record_input_barriers(cmd, in_bufs);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, trit_pack_pipeline_.handle());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            trit_pack_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+
+        struct Push { std::uint32_t rows; std::uint32_t k; std::uint32_t wpr; };
+        Push push{rows, k, wpr};
+        std::vector<std::uint8_t> pc(sizeof(push));
+        std::memcpy(pc.data(), &push, sizeof(push));
+        vkCmdPushConstants(cmd, trit_pack_pipeline_.pipeline_layout(),
+            VK_SHADER_STAGE_COMPUTE_BIT, 0,
+            static_cast<uint32_t>(pc.size()), pc.data());
+
+        const std::uint32_t total = rows * wpr;
+        const std::uint32_t wg = (total + 255u) / 256u;
+        vkCmdDispatch(cmd, wg < 1u ? 1u : wg, 1u, 1u);
+        record_output_barrier(cmd, packed.impl());
+
+        if (owns_cmd)
+        {
+            auto r = submit_and_wait(cmd, desc_set);
+            NN_TRY_CHECK(r);
+        }
+        return {};
+    }
+
+    // ── 量化 GEMM（P2/F3）：C = (τ∘A)^(T)·B（A 为打包三值）────────────────
+    // f16 = true 时用 f16 存储变体（B/C 均为 half），否则全 f32。
+    [[nodiscard]] Result<void> matmul_q_gpu(
+        const GpuBuffer& packed, const GpuBuffer& tau, const GpuBuffer& b,
+        const GpuBuffer& c, std::uint32_t M, std::uint32_t N, std::uint32_t K,
+        std::uint32_t transA, std::uint32_t wpr, bool f16)
+    {
+        if (!initialized_)
+            NN_FAIL("GPU backend not initialized");
+        const VulkanPipeline* pipe = nullptr;
+        if (f16)
+        {
+            if (!has_matmul_q_f16_pipeline())
+                NN_FAIL("matmul_q_gpu: f16 pipeline not available（设备缺 16 位存储？）");
+            pipe = &matmul_q_f16_pipeline_;
+        }
+        else
+        {
+            if (!has_matmul_q_pipeline())
+                NN_FAIL("matmul_q_gpu: matmul_q pipeline not available");
+            pipe = &matmul_q_pipeline_;
+        }
+        auto ds_r = alloc_desc_set(pipe->descriptor_layout());
+        NN_TRY_CHECK(ds_r);
+        VkDescriptorSet desc_set = *ds_r;
+
+        VkDescriptorBufferInfo binfo[4] = {
+            {packed.impl(), 0, VK_WHOLE_SIZE},
+            {tau.impl(), 0, VK_WHOLE_SIZE},
+            {b.impl(), 0, VK_WHOLE_SIZE},
+            {c.impl(), 0, VK_WHOLE_SIZE},
+        };
+        VkWriteDescriptorSet writes[4];
+        for (std::uint32_t i = 0; i < 4; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].pNext = nullptr;
+            writes[i].dstSet = desc_set;
+            writes[i].dstBinding = i;
+            writes[i].dstArrayElement = 0;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pImageInfo = nullptr;
+            writes[i].pBufferInfo = &binfo[i];
+            writes[i].pTexelBufferView = nullptr;
+        }
+        vkUpdateDescriptorSets(device_.device(), 4, writes, 0, nullptr);
+
+        auto cmd_r = acquire_cmd();
+        if (!cmd_r)
+        {
+            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            NN_TRY_CHECK(cmd_r);
+        }
+        auto [cmd, owns_cmd] = *cmd_r;
+
+        std::vector<VkBuffer> in_bufs{packed.impl(), tau.impl(), b.impl()};
+        record_input_barriers(cmd, in_bufs);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->handle());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipe->pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+
+        struct Push {
+            std::uint32_t M, N, K, transA, wpr;
+        };
+        Push push{M, N, K, transA, wpr};
+        std::vector<std::uint8_t> pc(sizeof(push));
+        std::memcpy(pc.data(), &push, sizeof(push));
+        vkCmdPushConstants(cmd, pipe->pipeline_layout(),
+            VK_SHADER_STAGE_COMPUTE_BIT, 0,
+            static_cast<uint32_t>(pc.size()), pc.data());
+
+        const std::uint32_t gx = (M + 7u) / 8u;
+        const std::uint32_t gy = (N + 7u) / 8u;
+        vkCmdDispatch(cmd, gx < 1u ? 1u : gx, gy < 1u ? 1u : gy, 1u);
+        record_output_barrier(cmd, c.impl());
 
         if (owns_cmd)
         {

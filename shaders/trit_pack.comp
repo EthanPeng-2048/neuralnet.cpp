@@ -1,0 +1,53 @@
+// ── trit_pack.comp — 三值权重打包原语（P2 / F3）────────────────────────────
+// 语义：W (rows,k) f32 + τ (rows) → 打包字 (rows, wpr)，wpr = (k+15)/16。
+// 布局（与 microsoft/BitNet 的 gpu/pack_weight.py 同款位宽与码值）：
+//   每权重 2 bit、4 权重/字节、码值 = 三值 + 2 ∈ {1,2,3}（0 码不用）；
+//   每个 32-bit 字装 16 个权重，低位对应行内更靠前的权重：
+//       码(j) = (word >> 2j) & 3
+//   尾部位（k 之外）填码 2（= 三值 0）—— 码 0 无定义，误读尾部会得到 -2。
+// 布局的唯一差别：不做 BitNet CUDA 侧的 32-bit interleave 置换（那是为
+// coalesced 访问做的重排，解码等价）。
+//
+// 本 shader 只做"编码"这一件事（不解码、不乘激活）：解码在 matmul_q.comp。
+// ─────────────────────────────────────────────────────────────────────────
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufW { float W[]; };  // latent (rows*k)
+layout(std430, binding = 1) readonly  buffer BufT { float T[]; };  // τ (rows)
+layout(std430, binding = 2) writeonly buffer BufP { uint P[]; };   // 打包字
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint k;
+    uint wpr;   // ceil(k/16)
+};
+
+// 码 = 三值 + 2：w > +0.5τ → 3；w < -0.5τ → 1；否则 2
+uint code_of(float w, float half_tau)
+{
+    if (w >  half_tau) return 3u;
+    if (w < -half_tau) return 1u;
+    return 2u;
+}
+
+void main()
+{
+    const uint total = rows * wpr;
+    const uint stride = gl_NumWorkGroups.x * 256u;
+    for (uint idx = gl_GlobalInvocationID.x; idx < total; idx += stride)
+    {
+        const uint row = idx / wpr;
+        const uint wi  = idx % wpr;
+        const float half_tau = 0.5f * T[row];
+        const uint k0 = wi * 16u;
+        uint word = 0u;
+        for (uint j = 0u; j < 16u; ++j)
+        {
+            const uint kk = k0 + j;
+            const uint code = (kk < k) ? code_of(W[row * k + kk], half_tau) : 2u;
+            word |= (code << (2u * j));
+        }
+        P[idx] = word;
+    }
+}

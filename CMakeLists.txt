@@ -674,6 +674,8 @@ if(Vulkan_FOUND)
         scan_prefix_outer_gen
         scan_suffix_outer_gen
         outer_col
+        trit_pack
+        matmul_q
         cast)
     # 融合 shader：构建期从 Layer 内联表达式自动合成（**单步**）──────────
     # 表达式**文本只出现在 Layer**（compute / compute_reduce / compute_into）。
@@ -779,6 +781,10 @@ if(Vulkan_FOUND)
     # C2d：卷积窗口展开/伴随散射的 f16 存储变体（数据搬运，in/out 均 half）
     nn_embed_shader(im2col_f16 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/im2col.comp -DNN_SHADER_F16=1)
     nn_embed_shader(col2im_f16 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/col2im.comp -DNN_SHADER_F16=1)
+    # P2/F3：三值打包 GEMM 的 f16 存储变体（B/C 为 half；打包字恒 uint）。
+    # 训练时激活是 f16 → 不带类型的边界 cast 会为每个 BitLinear 层物化
+    # (K,batch)+(M,batch) 两份 f32 临时量（比权重带宽还大），故必须有此变体。
+    nn_embed_shader(matmul_q_f16 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matmul_q.comp -DNN_SHADER_F16=1)
 
     # 2. AOT 融合 shader：scan_exprs（**单步** = 收集 + 生成）
     #    收集：FusedAnchor 自登记（按表达式类型）+ dry-run + 模型 pass
