@@ -150,6 +150,10 @@ struct ModelSpec
     [[nodiscard]] std::size_t n_head_kv_or_heads() const noexcept
     { return n_head_kv == 0 ? num_heads : n_head_kv; }
 
+    // tie_embeddings：head 复用 token embedding（logits = W_embᵀ·x）。
+    //   缺键 → false → 独立 lm_head（旧文件零破坏）。2B4T = true。
+    bool tie_embeddings = false;
+
     // ── 线性层权重是否三值（T1_58；P1 覆盖 MLP 路径）──
     // 缺键 → None（旧文件零破坏）。见 WeightQuant 注释与 docs 21 §4.7。
     WeightQuant weight_quant = WeightQuant::None;
@@ -199,6 +203,7 @@ struct ModelSpec
                a.norm_type    == b.norm_type &&
                a.subln        == b.subln &&
                a.n_head_kv_or_heads() == b.n_head_kv_or_heads() &&
+               a.tie_embeddings == b.tie_embeddings &&
                a.weight_quant == b.weight_quant;
     }
 
@@ -295,7 +300,8 @@ struct ModelSpec
                ",layers=" + std::to_string(s.num_layers) +
                (s.subln ? ",subln=1" : "") +
                (s.n_head_kv_or_heads() != s.num_heads
-                    ? ",kv_heads=" + std::to_string(s.n_head_kv_or_heads()) : "") + ")";
+                    ? ",kv_heads=" + std::to_string(s.n_head_kv_or_heads()) : "") +
+               (s.tie_embeddings ? ",tied=1" : "") + ")";
     }
     if (s.is_cnn())
     {
