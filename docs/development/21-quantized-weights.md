@@ -548,6 +548,7 @@ graph TB
 | `bitnet_struct_test` [14] | 三值 GPT 参数张量 36 张 / 21376 标量，与 f32 基线**逐张量形状相同**；一步真实 sparse-CE 反向后 **36/36** 参数张量梯度非零（max\|g\|=3.81） |
 | `bitnet_struct_test` [15]（CPU） | 2B4T 形状（RoPE+ReLU²+RMSNorm+**SubLN+GQA+tied**+三值）200 步 CE+AdamW：三值+tied **3.469 → 0.018**、三值+BitLinear head **3.582 → 0.0064**、f32 基线 3.893 → 0.0045（随机基线 ln 32 = 3.466） |
 | `bitnet_struct_test_gpu` [15] | 同一配置在真实 GPU 上跑通，CPU/GPU 末步 loss 差 < 1e-3（断言） |
+| **真实数据 + 真实 GPU**（CLI，`--model gpt --precision-param t1_58`） | TinyStories 40MB（`.nndataset`，vocab 8192）/ d256·h8·L4·ff688 / seq 256 / batch 8 / AdamW 3e-3 / RoPE + ReLU² + RMSNorm（CLI 可表达的 2B4T 子集）：三值 **6.069 → 4.164**（150 步，17.3 s，NVIDIA CMP 40HX）；同配置 f32 基线 **5.815 → 4.327**（14.9 s）。两条曲线同量级下降 —— 这是"真实语料 + 真实 GPU 能训"的证据，**不是**精度结论（同一量级、未做超参扫描）；步时 +16% 来自每步重算 τ/wq，P2 的打包 GEMM 才是针对它的优化 |
 
 **仍未接线（诚实边界）**：
 

@@ -702,7 +702,14 @@ int main(int argc, char *argv[])
     // 落回（expr_spec_key 本身不含精度维度，f16 变体按 (key, 精度签名) 另行注册）。
     // 全 f32 时入口为快速直通分支，与原生引擎逐字节一致。
     // 层内的 p_.param/compute/stable/optimizer 是唯一精度来源（§8.5 G4）。
-    if (!nn::is_profile_f32(cfg.precision))
+    // 触发条件 = **真的有 f16 存储**（四个槽里任一为 f16）。不能用
+    // `!is_profile_f32()`：`param = t1_58` 时三值并不产生 f16 存储（latent 恒 f32、
+    // 只有量化缓冲是 f16），那样会打出误导性的"f16 存储已启用"。
+    const bool f16_storage = (cfg.precision.param == nn::Precision::F16 ||
+                              cfg.precision.compute == nn::Precision::F16 ||
+                              cfg.precision.stable == nn::Precision::F16 ||
+                              cfg.precision.optimizer == nn::Precision::F16);
+    if (f16_storage)
     {
         std::cout << "[精度] f16 存储已启用（基类边界 cast + in-kernel f16 变体 + f16 GEMM）\n"
                      "  [提示] 池底材粒度可用 NN_POOL_BLOCK_MB / NN_POOL_LADDER_MAX_MB 调参"
