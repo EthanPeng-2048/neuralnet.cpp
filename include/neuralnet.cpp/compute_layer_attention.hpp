@@ -427,6 +427,15 @@ protected:
     // ── 分数掩码策略（构造期/配置期定型；热路径只调用，不判断变体）──
     std::unique_ptr<AttnScoreMask> mask_;
 
+    // ── SubLN（BitNet b1.58 的"子层归一化"，docs/development/22 §3.1）──────
+    // **子层内部**的额外归一化：挂在 attention 输出（宽 d_model）与输出投影
+    // w_o_ 之间。默认 nullptr = 关（既有路径逐位不变）。类型跟随模型的
+    // norm_type（2B4T = RMSNorm）——与 GPTBlock 的 norm1_/norm2_ 同一工厂。
+    //
+    // 位置：注意力输出 → **attn_sub_norm_ → w_o_**。不能挂到 block 级：
+    // block 只看到 w_o_ 之后的 (d_model, N)，看不到投影前的 concat。
+    std::unique_ptr<Layer> attn_sub_norm_;
+
     // forward 缓存（rearranged 版本，供 backward 直接使用；得分矩阵类量
     // 不作缓存——W/m/l/attn 均不物化，W 在 backward 重算）
     Tensor Q_cache_, K_cache_, V_cache_;  // (batch*H*d_k, seq) rearranged
@@ -461,7 +470,9 @@ protected:
 
 public:
     AttentionBase(std::size_t d_model, std::size_t num_heads,
-                  std::size_t seq_len = 0)
+                  std::size_t seq_len = 0,
+                  bool subln = false,
+                  NormType subln_norm_type = NormType::LayerNorm)
         : d_model_(d_model), num_heads_(num_heads),
           d_k_(d_model / num_heads),
           seq_len_(seq_len),
@@ -474,6 +485,8 @@ public:
         NN_ASSERT(d_model % num_heads == 0,
                   "AttentionBase: d_model must be divisible by num_heads");
         mask_ = std::make_unique<PlainScoreMask>();
+        if (subln)
+            attn_sub_norm_ = make_norm_layer(d_model, subln_norm_type);
     }
 
     [[nodiscard]] PositionEncoder& position_encoder() noexcept { return *pos_; }
@@ -492,6 +505,7 @@ public:
         w_o_.set_precision_profile(profile);
         softmax_.set_precision_profile(profile);
         pos_->set_precision_profile(profile);   // 位置编码（RoPE 表 / ALiBi 斜率）
+        if (attn_sub_norm_) attn_sub_norm_->set_precision_profile(profile);
     }
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
@@ -504,19 +518,32 @@ public:
         { NN_TRY(r6, softmax_.init(engine)); }
         // 注意力侧位置编码（RoPE/ALiBi 的 init 是 no-op；恒等策略同样 no-op）——
         // 按 M6 段 C 的不变量"复合层 init_impl 必须 init 全部子对象"统一调用。
+        if (attn_sub_norm_) { NN_TRY(r7, attn_sub_norm_->init(engine)); }
         return pos_->init(engine);
     }
 
     std::vector<TensorRef> parameters() override
     {
-        return collect_refs(w_q_.parameters(), w_k_.parameters(),
-                            w_v_.parameters(), w_o_.parameters());
+        auto r = collect_refs(w_q_.parameters(), w_k_.parameters(),
+                              w_v_.parameters(), w_o_.parameters());
+        if (attn_sub_norm_)
+        {
+            auto s = attn_sub_norm_->parameters();
+            r.insert(r.end(), s.begin(), s.end());
+        }
+        return r;
     }
 
     std::vector<TensorRef> param_gradients() override
     {
-        return collect_refs(w_q_.param_gradients(), w_k_.param_gradients(),
-                            w_v_.param_gradients(), w_o_.param_gradients());
+        auto r = collect_refs(w_q_.param_gradients(), w_k_.param_gradients(),
+                              w_v_.param_gradients(), w_o_.param_gradients());
+        if (attn_sub_norm_)
+        {
+            auto s = attn_sub_norm_->param_gradients();
+            r.insert(r.end(), s.begin(), s.end());
+        }
+        return r;
     }
 
     // 梯度检查点：把模式传播给内部投影层与 softmax
@@ -528,6 +555,7 @@ public:
         w_v_.set_checkpoint_mode(enabled);
         w_o_.set_checkpoint_mode(enabled);
         softmax_.set_checkpoint_mode(enabled);
+        if (attn_sub_norm_) attn_sub_norm_->set_checkpoint_mode(enabled);
     }
 
     // 文档感知：转发给掩码策略（非文档策略 = no-op，与旧"无 doc 钩子"一致）
@@ -548,6 +576,7 @@ public:
         w_v_.clear_cache();
         w_o_.clear_cache();
         softmax_.clear_cache();
+        if (attn_sub_norm_) attn_sub_norm_->clear_cache();
     }
 
     std::vector<TensorRef> activation_cache() override
@@ -561,6 +590,11 @@ public:
         auto wv = w_v_.activation_cache(); r.insert(r.end(), wv.begin(), wv.end());
         auto wo = w_o_.activation_cache(); r.insert(r.end(), wo.begin(), wo.end());
         auto sm = softmax_.activation_cache(); r.insert(r.end(), sm.begin(), sm.end());
+        if (attn_sub_norm_)
+        {
+            auto sn = attn_sub_norm_->activation_cache();
+            r.insert(r.end(), sn.begin(), sn.end());
+        }
         return r;
     }
 
@@ -673,8 +707,14 @@ public:
             concat = std::move(concat_out);
         }
 
-        // 9. 输出投影
-        return w_o_.forward(concat);
+        // 9. SubLN（子层内部归一化；关 = 直通，逐位不变）→ 输出投影
+        Tensor attn_out = std::move(concat);
+        if (attn_sub_norm_)
+        {
+            NN_TRY(sn, attn_sub_norm_->forward(attn_out));
+            attn_out = std::move(*sn);
+        }
+        return w_o_.forward(attn_out);
     }
 
     [[nodiscard]] Result<Tensor> backward(
@@ -688,8 +728,16 @@ public:
         const std::size_t H_dk = num_heads_ * d_k_;
         const std::size_t BH = batch * num_heads_;
 
-        // 1. 输出投影反向 → grad_concat: (H*d_k, batch*seq)
-        NN_TRY(gc, w_o_.backward(grad_output));
+        // 1. SubLN 反向（关 = 直通）→ 输出投影反向 → grad_concat: (H*d_k, batch*seq)
+        const Tensor* p_grad_o = &grad_output;
+        Tensor grad_prenorm;
+        if (attn_sub_norm_)
+        {
+            NN_TRY(gsn, attn_sub_norm_->backward(grad_output));
+            grad_prenorm = std::move(*gsn);
+            p_grad_o = &grad_prenorm;
+        }
+        NN_TRY(gc, w_o_.backward(*p_grad_o));
         nn_dbg_scan("attn.gc", engine, *gc);
 
         // 2. rearrange grad_concat → (batch*H*d_k, seq)
@@ -902,8 +950,14 @@ public:
             V_T->rows(), attn->rows() / num_heads_, p_.compute);
         NN_TRY_CHECK(attn_out);
 
-        // 9. 输出投影 → (d_model, 1)
-        return w_o_.forward(*attn_out);
+        // 9. SubLN（子层内部归一化；关 = 直通）→ 输出投影 → (d_model, 1)
+        Tensor ao = std::move(*attn_out);
+        if (attn_sub_norm_)
+        {
+            NN_TRY(sn, attn_sub_norm_->forward(ao));
+            ao = std::move(*sn);
+        }
+        return w_o_.forward(ao);
     }
 
 protected:
@@ -995,8 +1049,10 @@ public:
     CausalSelfAttention(std::size_t d_model, std::size_t num_heads,
                         std::size_t /*max_len*/ = 1024,
                         std::size_t seq_len = 0,
-                        PosEncodingType pos_enc = PosEncodingType::Learned)
-        : AttentionBase(d_model, num_heads, seq_len)
+                        PosEncodingType pos_enc = PosEncodingType::Learned,
+                        bool subln = false,
+                        NormType subln_norm_type = NormType::LayerNorm)
+        : AttentionBase(d_model, num_heads, seq_len, subln, subln_norm_type)
     {
         // ① 位置编码：注意力侧**由本层自持**（RoPE 的 cos/sin 表随层构建；
         //    Learned/Sinusoidal 在注意力侧是恒等 → 交回模型侧施加）。

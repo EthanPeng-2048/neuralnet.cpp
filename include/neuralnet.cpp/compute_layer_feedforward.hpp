@@ -27,16 +27,32 @@ private:
     SwiGLU swiglu_;  // SwiGLU 激活（含 split/merge）
     bool use_swiglu_ = false;
 
+    // ── SubLN（BitNet b1.58 的"子层归一化"，docs/development/22 §3.1）──────
+    // **子层内部**的额外归一化：挂在中间激活（宽 d_ff）与输出投影 fc2 之间。
+    // 默认 nullptr = 关（既有路径逐位不变）。类型跟随模型的 norm_type
+    // （2B4T = RMSNorm）——经 make_norm_layer 构造，与 GPTBlock 的 norm1_/norm2_
+    // 同一工厂、同一类型来源。
+    //
+    // 位置：`h2 = act(fc1(x))` → **sub_norm_ → fc2**。不能挂到 block 级：
+    // block 看不到这个 (d_ff, N) 的中间张量（这正是"子层内部"的含义）。
+    std::unique_ptr<Layer> sub_norm_;
+
 public:
     [[nodiscard]] const char* layer_name() const noexcept override { return "FeedForward"; }
 
     FeedForward(std::size_t d_model, std::size_t d_ff,
-                ActivationType activation = ActivationType::GeLU)
+                ActivationType activation = ActivationType::GeLU,
+                bool subln = false,
+                NormType subln_norm_type = NormType::LayerNorm)
         : fc1_(d_model,
                activation == ActivationType::SwiGLU ? 2 * d_ff : d_ff),
           fc2_(d_ff, d_model),
           swiglu_(d_ff),
-          use_swiglu_(activation == ActivationType::SwiGLU) {}
+          use_swiglu_(activation == ActivationType::SwiGLU)
+    {
+        if (subln)
+            sub_norm_ = make_norm_layer(d_ff, subln_norm_type);
+    }
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
@@ -46,17 +62,30 @@ public:
         // 否则 forward 里调 gelu_/swiglu_.forward() 会在 engine_ref() 处 fail-fast。
         { NN_TRY(r, gelu_.init(engine)); }
         { NN_TRY(r, swiglu_.init(engine)); }
+        if (sub_norm_) { NN_TRY(r, sub_norm_->init(engine)); }
         return {};
     }
 
     std::vector<TensorRef> parameters() override
     {
-        return collect_refs(fc1_.parameters(), fc2_.parameters());
+        auto r = collect_refs(fc1_.parameters(), fc2_.parameters());
+        if (sub_norm_)
+        {
+            auto s = sub_norm_->parameters();
+            r.insert(r.end(), s.begin(), s.end());
+        }
+        return r;
     }
 
     std::vector<TensorRef> param_gradients() override
     {
-        return collect_refs(fc1_.param_gradients(), fc2_.param_gradients());
+        auto r = collect_refs(fc1_.param_gradients(), fc2_.param_gradients());
+        if (sub_norm_)
+        {
+            auto s = sub_norm_->param_gradients();
+            r.insert(r.end(), s.begin(), s.end());
+        }
+        return r;
     }
 
     // 梯度检查点：把模式传播给内部 fc1/fc2/gelu/swiglu
@@ -67,6 +96,7 @@ public:
         fc2_.set_checkpoint_mode(enabled);
         gelu_.set_checkpoint_mode(enabled);
         swiglu_.set_checkpoint_mode(enabled);
+        if (sub_norm_) sub_norm_->set_checkpoint_mode(enabled);
     }
 
     // ── D7：精度配置下传（§9.2）──────────────────────────────────────────
@@ -80,6 +110,7 @@ public:
         fc2_.set_precision_profile(profile);
         gelu_.set_precision_profile(profile);
         swiglu_.set_precision_profile(profile);
+        if (sub_norm_) sub_norm_->set_precision_profile(profile);
     }
 
     void clear_cache() override
@@ -88,6 +119,7 @@ public:
         fc2_.clear_cache();
         gelu_.clear_cache();
         swiglu_.clear_cache();
+        if (sub_norm_) sub_norm_->clear_cache();
     }
 
     std::vector<TensorRef> activation_cache() override
@@ -97,6 +129,11 @@ public:
         auto b = fc2_.activation_cache(); r.insert(r.end(), b.begin(), b.end());
         auto g = gelu_.activation_cache(); r.insert(r.end(), g.begin(), g.end());
         auto s = swiglu_.activation_cache(); r.insert(r.end(), s.begin(), s.end());
+        if (sub_norm_)
+        {
+            auto sn = sub_norm_->activation_cache();
+            r.insert(r.end(), sn.begin(), sn.end());
+        }
         return r;
     }
 
@@ -104,25 +141,42 @@ public:
         const Tensor& input) override
     {
         NN_TRY(h1, fc1_.forward(input));
+        Tensor h2_out;
         if (use_swiglu_)
         {
             NN_TRY(h2, swiglu_.forward(*h1));
-            return fc2_.forward(*h2);
+            h2_out = std::move(*h2);
         }
-        NN_TRY(h2, gelu_.forward(*h1));
-        return fc2_.forward(*h2);
+        else
+        {
+            NN_TRY(h2, gelu_.forward(*h1));
+            h2_out = std::move(*h2);
+        }
+        // SubLN：中间激活归一化后再进输出投影（关 = 直通，逐位不变）
+        if (sub_norm_)
+        {
+            NN_TRY(sn, sub_norm_->forward(h2_out));
+            h2_out = std::move(*sn);
+        }
+        return fc2_.forward(h2_out);
     }
 
     [[nodiscard]] Result<Tensor> backward(
         const Tensor& grad_output) override
     {
         NN_TRY(b2, fc2_.backward(grad_output));
+        Tensor g = std::move(*b2);
+        if (sub_norm_)
+        {
+            NN_TRY(gs, sub_norm_->backward(g));
+            g = std::move(*gs);
+        }
         if (use_swiglu_)
         {
-            NN_TRY(bg, swiglu_.backward(*b2));
+            NN_TRY(bg, swiglu_.backward(g));
             return fc1_.backward(*bg);
         }
-        NN_TRY(bg, gelu_.backward(*b2));
+        NN_TRY(bg, gelu_.backward(g));
         return fc1_.backward(*bg);
     }
 };

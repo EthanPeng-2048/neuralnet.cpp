@@ -415,6 +415,10 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(t1_58_test src/t1_58_test.cpp)
     list(APPEND NN_TEST_TARGETS t1_58_test)
 
+    # ── BitNet b1.58 2B4T 的结构开关（SubLN / GQA / tied embedding，docs 22）──
+    nn_add_executable(bitnet_struct_test src/bitnet_struct_test.cpp)
+    list(APPEND NN_TEST_TARGETS bitnet_struct_test)
+
     # ── 分词器正确性（BPE pre_tokenize 对拍 + 标记往返）─────────────────
     nn_add_executable(tokenizer_test src/tokenizer_test.cpp)
     list(APPEND NN_TEST_TARGETS tokenizer_test)
@@ -544,6 +548,12 @@ if(NN_ENABLE_TESTS)
     if(TARGET t1_58_test)
         add_test(NAME t1_58_test_gpu COMMAND t1_58_test --gpu)
         set_tests_properties(t1_58_test_gpu PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    # BitNet 结构开关的 GPU 变体：SubLN 的 norm 表达式 / GQA 的 reshape+gather
+    # 必须命中 AOT 融合注册表（闭合世界）。无 Vulkan 构建/无设备 → 77。
+    if(TARGET bitnet_struct_test)
+        add_test(NAME bitnet_struct_test_gpu COMMAND bitnet_struct_test --gpu)
+        set_tests_properties(bitnet_struct_test_gpu PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     foreach(TARGET ${NN_BENCH_TARGETS})
         set_target_properties(${TARGET} PROPERTIES

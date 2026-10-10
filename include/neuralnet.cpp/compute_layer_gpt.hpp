@@ -44,10 +44,11 @@ public:
              PosEncodingType pos_enc = PosEncodingType::Learned,
              ActivationType activation = ActivationType::GeLU,
              NormType norm_type = NormType::LayerNorm,
-             PrecisionProfile precision = PrecisionProfile{})
-        : self_attn_(d_model, num_heads, max_len, seq_len, pos_enc),
+             PrecisionProfile precision = PrecisionProfile{},
+             bool subln = false)
+        : self_attn_(d_model, num_heads, max_len, seq_len, pos_enc, subln, norm_type),
           norm1_(make_norm_layer(d_model, norm_type)),
-          ff_(d_model, d_ff, activation),
+          ff_(d_model, d_ff, activation, subln, norm_type),
           norm2_(make_norm_layer(d_model, norm_type))
     {
         // D7：将精度配置注入所有子层（§9.2）—— override 内已逐子层下传
@@ -283,7 +284,8 @@ public:
              PosEncodingType pos_enc_type = PosEncodingType::Learned,
              ActivationType activation = ActivationType::GeLU,
              NormType norm_type = NormType::LayerNorm,
-             PrecisionProfile precision = PrecisionProfile{})
+             PrecisionProfile precision = PrecisionProfile{},
+             bool subln = false)
         : vocab_size_(vocab_size), d_model_(d_model), seq_len_(seq_len),
           ln_f_(make_norm_layer(d_model, norm_type)),
           lm_head_(d_model, vocab_size)
@@ -315,7 +317,8 @@ public:
         for (std::size_t i = 0; i < num_layers; ++i)
         {
             blocks_.emplace_back(d_model, num_heads, d_ff, seq_len, seq_len,
-                                 pos_enc_type, activation, norm_type, precision);
+                                 pos_enc_type, activation, norm_type, precision,
+                                 subln);
         }
 
         // 位置编码器是辅助对象（非 Layer）→ profile 需单独下传：
