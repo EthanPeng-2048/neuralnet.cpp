@@ -435,10 +435,15 @@ protected:
     std::size_t seq_len_;   // 单样本序列长度（0 = 单样本，cols 即 seq）
     Scalar scale_;
 
-    Linear w_q_;
-    Linear w_k_;
-    Linear w_v_;
-    Linear w_o_;
+    // ── 线性投影走工厂（P1.5 docs 21 §4.8.3）：weight_quant=T1_58 → BitLinear。
+    //    成员类型 = std::unique_ptr<Layer>（与 attn_sub_norm_ 同一形态）。
+    //    Linear(in_features, out_features)：GQA 只收窄**输出**宽度（见构造器）。
+    std::unique_ptr<Layer> w_q_;
+    std::unique_ptr<Layer> w_k_;
+    std::unique_ptr<Layer> w_v_;
+    std::unique_ptr<Layer> w_o_;
+    // 三值模式（构造期定型；决定 4 个投影的**具体类型**与 profile 分流）
+    WeightQuant weight_quant_ = WeightQuant::None;
     Softmax softmax_;
 
     // ── 位置编码策略（**注意力层自持**，构造期由子类经
@@ -499,19 +504,25 @@ public:
                   std::size_t seq_len = 0,
                   bool subln = false,
                   NormType subln_norm_type = NormType::LayerNorm,
-                  std::size_t n_head_kv = 0)
+                  std::size_t n_head_kv = 0,
+                  WeightQuant weight_quant = WeightQuant::None)
         : d_model_(d_model), num_heads_(num_heads),
           n_head_kv_(n_head_kv == 0 ? num_heads : n_head_kv),
           kv_ratio_(num_heads / (n_head_kv == 0 ? num_heads : n_head_kv)),
           d_k_(d_model / num_heads),
           seq_len_(seq_len),
           scale_(Scalar{1} / std::sqrt(static_cast<Scalar>(d_model / num_heads))),
-          w_q_(d_model, d_model),
+          w_q_(make_linear_layer(d_model, d_model, weight_quant)),
           // Linear(in_features, out_features)：GQA 只收窄**输出**宽度
           // （K/V 的 out = n_head_kv·d_k），输入侧仍是 d_model。
-          w_k_(d_model, (n_head_kv == 0 ? num_heads : n_head_kv) * (d_model / num_heads)),
-          w_v_(d_model, (n_head_kv == 0 ? num_heads : n_head_kv) * (d_model / num_heads)),
-          w_o_(d_model, d_model)
+          w_k_(make_linear_layer(
+              d_model, (n_head_kv == 0 ? num_heads : n_head_kv) * (d_model / num_heads),
+              weight_quant)),
+          w_v_(make_linear_layer(
+              d_model, (n_head_kv == 0 ? num_heads : n_head_kv) * (d_model / num_heads),
+              weight_quant)),
+          w_o_(make_linear_layer(d_model, d_model, weight_quant)),
+          weight_quant_(weight_quant)
     {
         NN_ASSERT(d_model % num_heads == 0,
                   "AttentionBase: d_model must be divisible by num_heads");
@@ -529,24 +540,31 @@ public:
     // 注意力是复合层（4 个投影 Linear + Softmax + 位置编码）；子层/辅助对象必须
     // 一起拿到 profile，否则它们的 p_ 停在默认 F32：参数仍按 F32 创建、
     // DSL 求值退回 F32 —— f16 配置下静默失效。
+    //
+    // ── P1.5 三值分流（docs 21 §4.8.3）───────────────────────────────────
+    // `weight_quant_ = T1_58` 时 4 个投影是 BitLinear，拿 param=T1_58 的 profile；
+    // 本层自身（不持有三值权重）与 softmax/位置编码/SubLN 拿 param 归一化为 f32
+    // 的那一份。非三值模式 split 退化为恒等 → 逐位不变。
     void set_precision_profile(const PrecisionProfile& profile) override
     {
-        Layer::set_precision_profile(profile);
-        w_q_.set_precision_profile(profile);
-        w_k_.set_precision_profile(profile);
-        w_v_.set_precision_profile(profile);
-        w_o_.set_precision_profile(profile);
-        softmax_.set_precision_profile(profile);
-        pos_->set_precision_profile(profile);   // 位置编码（RoPE 表 / ALiBi 斜率）
-        if (attn_sub_norm_) attn_sub_norm_->set_precision_profile(profile);
+        const TernaryProfileSplit sp = split_ternary_profile(
+            layer_name(), profile, weight_quant_ == WeightQuant::T1_58);
+        Layer::set_precision_profile(sp.self);
+        w_q_->set_precision_profile(sp.linear);
+        w_k_->set_precision_profile(sp.linear);
+        w_v_->set_precision_profile(sp.linear);
+        w_o_->set_precision_profile(sp.linear);
+        softmax_.set_precision_profile(sp.self);
+        pos_->set_precision_profile(sp.self);   // 位置编码（RoPE 表 / ALiBi 斜率）
+        if (attn_sub_norm_) attn_sub_norm_->set_precision_profile(sp.self);
     }
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
-        NN_TRY(r1, w_q_.init(engine));
-        NN_TRY(r2, w_k_.init(engine));
-        NN_TRY(r3, w_v_.init(engine));
-        NN_TRY(r4, w_o_.init(engine));
+        NN_TRY(r1, w_q_->init(engine));
+        NN_TRY(r2, w_k_->init(engine));
+        NN_TRY(r3, w_v_->init(engine));
+        NN_TRY(r4, w_o_->init(engine));
         // GQA 展开索引（铁律 #12 允许的"层自算辅助数据：索引表"）。
         // 块映射：n_rep 个连续 query head 共享一个 KV head。
         if (n_head_kv_ != num_heads_)
@@ -573,8 +591,8 @@ public:
 
     std::vector<TensorRef> parameters() override
     {
-        auto r = collect_refs(w_q_.parameters(), w_k_.parameters(),
-                              w_v_.parameters(), w_o_.parameters());
+        auto r = collect_refs(w_q_->parameters(), w_k_->parameters(),
+                              w_v_->parameters(), w_o_->parameters());
         if (attn_sub_norm_)
         {
             auto s = attn_sub_norm_->parameters();
@@ -585,8 +603,8 @@ public:
 
     std::vector<TensorRef> param_gradients() override
     {
-        auto r = collect_refs(w_q_.param_gradients(), w_k_.param_gradients(),
-                              w_v_.param_gradients(), w_o_.param_gradients());
+        auto r = collect_refs(w_q_->param_gradients(), w_k_->param_gradients(),
+                              w_v_->param_gradients(), w_o_->param_gradients());
         if (attn_sub_norm_)
         {
             auto s = attn_sub_norm_->param_gradients();
@@ -599,10 +617,10 @@ public:
     void set_checkpoint_mode(bool enabled) override
     {
         Layer::set_checkpoint_mode(enabled);
-        w_q_.set_checkpoint_mode(enabled);
-        w_k_.set_checkpoint_mode(enabled);
-        w_v_.set_checkpoint_mode(enabled);
-        w_o_.set_checkpoint_mode(enabled);
+        w_q_->set_checkpoint_mode(enabled);
+        w_k_->set_checkpoint_mode(enabled);
+        w_v_->set_checkpoint_mode(enabled);
+        w_o_->set_checkpoint_mode(enabled);
         softmax_.set_checkpoint_mode(enabled);
         if (attn_sub_norm_) attn_sub_norm_->set_checkpoint_mode(enabled);
     }
@@ -620,10 +638,10 @@ public:
         V_cache_ = Tensor{};
         // 掩码/偏置描述子（掩码策略持有的 doc/slopes 缓存）小而常驻，
         // 不随激活清理
-        w_q_.clear_cache();
-        w_k_.clear_cache();
-        w_v_.clear_cache();
-        w_o_.clear_cache();
+        w_q_->clear_cache();
+        w_k_->clear_cache();
+        w_v_->clear_cache();
+        w_o_->clear_cache();
         softmax_.clear_cache();
         if (attn_sub_norm_) attn_sub_norm_->clear_cache();
     }
@@ -634,10 +652,10 @@ public:
         if (Q_cache_.valid()) r.emplace_back(Q_cache_);
         if (K_cache_.valid()) r.emplace_back(K_cache_);
         if (V_cache_.valid()) r.emplace_back(V_cache_);
-        auto wq = w_q_.activation_cache(); r.insert(r.end(), wq.begin(), wq.end());
-        auto wk = w_k_.activation_cache(); r.insert(r.end(), wk.begin(), wk.end());
-        auto wv = w_v_.activation_cache(); r.insert(r.end(), wv.begin(), wv.end());
-        auto wo = w_o_.activation_cache(); r.insert(r.end(), wo.begin(), wo.end());
+        auto wq = w_q_->activation_cache(); r.insert(r.end(), wq.begin(), wq.end());
+        auto wk = w_k_->activation_cache(); r.insert(r.end(), wk.begin(), wk.end());
+        auto wv = w_v_->activation_cache(); r.insert(r.end(), wv.begin(), wv.end());
+        auto wo = w_o_->activation_cache(); r.insert(r.end(), wo.begin(), wo.end());
         auto sm = softmax_.activation_cache(); r.insert(r.end(), sm.begin(), sm.end());
         if (attn_sub_norm_)
         {
@@ -659,9 +677,9 @@ public:
         if (total_seq != batch * seq)
             NN_FAIL("AttentionBase forward: cols not divisible by seq_len");
         // 1. 线性投影 → Q/K/V: (H*d_k, batch*seq)
-        NN_TRY(q_res, w_q_.forward(input));
-        NN_TRY(k_proj, w_k_.forward(input));
-        NN_TRY(v_proj, w_v_.forward(input));
+        NN_TRY(q_res, w_q_->forward(input));
+        NN_TRY(k_proj, w_k_->forward(input));
+        NN_TRY(v_proj, w_v_->forward(input));
 
         // 1.5 GQA：把 K/V 从 n_head_kv 个头展开到 num_heads 个（块映射）。
         //     MHA（表 invalid）= 恒等搬移，零额外拷贝；展开后 fold 注意力与
@@ -779,7 +797,7 @@ public:
             NN_TRY(sn, attn_sub_norm_->forward(attn_out));
             attn_out = std::move(*sn);
         }
-        return w_o_.forward(attn_out);
+        return w_o_->forward(attn_out);
     }
 
     [[nodiscard]] Result<Tensor> backward(
@@ -802,7 +820,7 @@ public:
             grad_prenorm = std::move(*gsn);
             p_grad_o = &grad_prenorm;
         }
-        NN_TRY(gc, w_o_.backward(*p_grad_o));
+        NN_TRY(gc, w_o_->backward(*p_grad_o));
         nn_dbg_scan("attn.gc", engine, *gc);
 
         // 2. rearrange grad_concat → (batch*H*d_k, seq)
@@ -919,7 +937,7 @@ public:
         }
 
         // 9. 投影层反向 + 累加输入梯度
-        NN_TRY(giq, w_q_.backward(grad_Q));
+        NN_TRY(giq, w_q_->backward(grad_Q));
         nn_dbg_scan("attn.giq", engine, *giq);
         // GQA：把 grad_K / grad_V 从 num_heads 个头折叠回 n_head_kv 个（与展开
         // 同一张表；重复行 = 多路累加，正是"多个 query 头共享一个 KV 头"的
@@ -934,10 +952,10 @@ public:
             return collapsed;
         };
         NN_TRY(gk_fold, fold_kv(std::move(grad_K)));
-        NN_TRY(gik, w_k_.backward(*gk_fold));
+        NN_TRY(gik, w_k_->backward(*gk_fold));
         nn_dbg_scan("attn.gik", engine, *gik);
         NN_TRY(gv_fold, fold_kv(std::move(grad_V)));
-        NN_TRY(giv, w_v_.backward(*gv_fold));
+        NN_TRY(giv, w_v_->backward(*gv_fold));
         nn_dbg_scan("attn.giv", engine, *giv);
 
         // grad_input = grad_Q + grad_K + grad_V：三路累加**原地**融合为单趟
@@ -972,9 +990,9 @@ public:
         if (x_new.rows() != d_model_ || x_new.cols() != 1)
             NN_FAIL("AttentionBase forward_step: x_new must be (d_model, 1)");
         // 1. Q/K/V 投影 → (H*d_k, 1)
-        NN_TRY(q_res, w_q_.forward(x_new));
-        NN_TRY(k_proj, w_k_.forward(x_new));
-        NN_TRY(v_proj, w_v_.forward(x_new));
+        NN_TRY(q_res, w_q_->forward(x_new));
+        NN_TRY(k_proj, w_k_->forward(x_new));
+        NN_TRY(v_proj, w_v_->forward(x_new));
 
         // GQA：展开到 num_heads（cache 布局恒 (max_len, num_heads*d_k)，不因 GQA 改变）
         Tensor k_new, v_new;
@@ -1055,7 +1073,7 @@ public:
             NN_TRY(sn, attn_sub_norm_->forward(ao));
             ao = std::move(*sn);
         }
-        return w_o_.forward(ao);
+        return w_o_->forward(ao);
     }
 
 protected:
@@ -1099,8 +1117,10 @@ public:
     [[nodiscard]] const char* layer_name() const noexcept override { return "MultiHeadAttention"; }
 
     MultiHeadAttention(std::size_t d_model, std::size_t num_heads,
-                       std::size_t seq_len = 0)
-        : AttentionBase(d_model, num_heads, seq_len) {}
+                       std::size_t seq_len = 0,
+                       WeightQuant weight_quant = WeightQuant::None)
+        : AttentionBase(d_model, num_heads, seq_len, false, NormType::LayerNorm, 0,
+                        weight_quant) {}
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1150,8 +1170,10 @@ public:
                         PosEncodingType pos_enc = PosEncodingType::Learned,
                         bool subln = false,
                         NormType subln_norm_type = NormType::LayerNorm,
-                        std::size_t n_head_kv = 0)
-        : AttentionBase(d_model, num_heads, seq_len, subln, subln_norm_type, n_head_kv)
+                        std::size_t n_head_kv = 0,
+                        WeightQuant weight_quant = WeightQuant::None)
+        : AttentionBase(d_model, num_heads, seq_len, subln, subln_norm_type, n_head_kv,
+                        weight_quant)
     {
         // ① 位置编码：注意力侧**由本层自持**（RoPE 的 cos/sin 表随层构建；
         //    Learned/Sinusoidal 在注意力侧是恒等 → 交回模型侧施加）。

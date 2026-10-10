@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "compute_layer_base.hpp"
+#include "compute_layer_bitlinear.hpp"
 #include "compute_engine.hpp"
 #include "compute_tensor.hpp"
 #include "model_spec.hpp"
@@ -1226,5 +1227,19 @@ private:
     if (norm_type == NormType::BatchNorm)
         return std::make_unique<BatchNorm>(d_model);
     return std::make_unique<LayerNorm>(d_model);
+}
+
+// ── 线性层工厂：按 WeightQuant 创建 Linear / BitLinear（P1.5，docs 21 §4.8.3）──
+// 与 make_norm_layer 同一先例：复合层（Attention / FeedForward / GPT / RAPT）
+// 用**运行期开关**选线性层类型，成员类型统一为 `std::unique_ptr<Layer>`。
+// BitLinear 与 Linear 的参数形状/顺序完全一致（(out,in) 权重 + (out,1) 偏置），
+// 因此序列化与优化器侧零改动。
+[[nodiscard]] inline std::unique_ptr<Layer> make_linear_layer(
+    std::size_t in_features, std::size_t out_features,
+    WeightQuant quant = WeightQuant::None)
+{
+    if (quant == WeightQuant::T1_58)
+        return std::make_unique<BitLinear>(in_features, out_features);
+    return std::make_unique<Linear>(in_features, out_features);
 }
 } // namespace nn
