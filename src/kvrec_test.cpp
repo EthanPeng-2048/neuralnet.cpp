@@ -138,7 +138,6 @@ void test_v2_roundtrip()
                && arr.size() == 2 && arr[1] == 20, "v2 base=8 嵌套可读");
         KeyValueRecord child;
         std::uint64_t u = 0;
-        std::string ls;
         expect(sub.get("child", child) && child.get("leaf_u", u) && u == 9,
                "v2 base=8 二层嵌套还原");
     }

@@ -74,10 +74,25 @@ endif()
 # ── 公共编译标志 ─────────────────────────────────────────────────────────
 # 项目规范：禁止异常、开启严格警告。按编译器选择对应标志：
 # - Clang/GCC：-fno-exceptions -Wall -Wextra -Wpedantic -Werror
-# - MSVC：     /W4 /permissive-（严格一致性）；保留 /EHsc（ppltasks.h 需要），
-#              不强制 /WX（MSVC 与 clang 警告集不同，代码未按 MSVC 零警告编写）
+# - MSVC：     /W4 /permissive- /Zc:preprocessor（严格一致性）；保留 /EHsc
+#              （ppltasks.h 需要），不强制 /WX（MSVC 与 clang 警告集不同，
+#              代码未按 MSVC 零警告编写）
+#
+# /Zc:preprocessor 是**必需**项，不是加固项（2026-10-10 四编译器矩阵实测）：
+#   cl.exe 默认走传统预处理器，它在把 `__VA_ARGS__` 代入**嵌套宏调用**时
+#   会把整个实参表当成**一个**实参（core_errors.hpp 的 NN_DETAIL_PICK2/3 实参
+#   计数分发因此全部错位）。后果对两种语义都致命：
+#     · `NN_CHECK(cond, "ctx")` → 错选 NN_CHECK_1 → 展开成逗号表达式
+#       `check_value((cond, "ctx"), …)` → 条件恒为字符串指针（恒真）
+#       → **检查静默失效且编译通过**（实测：`NN_CHECK(false, "x")` 不 abort）；
+#     · `NN_EXIT(cond, code, "ctx")` → 错选 NN_PICK_END → C3861 编译失败。
+#   打开 /Zc:preprocessor 后两种形态均按 C++ 标准展开（实测 `NN_CHECK(false,…)`
+#   正常 abort），本仓 500+ 处宏调用点的语义在 MSVC 下才与 clang/GCC 一致。
+#   该开关同时也是**接口**选项（见下方 nn_core），否则库外消费者在 cl.exe 下
+#   会拿到失效的 NN_CHECK。
 if(MSVC)
-    add_compile_options(/W4 /permissive- /source-charset:utf-8 /execution-charset:utf-8)
+    add_compile_options(/W4 /permissive- /Zc:preprocessor
+                        /source-charset:utf-8 /execution-charset:utf-8)
 else()
     add_compile_options(-fno-exceptions -Wall -Wextra -Wpedantic -Werror)
 endif()
@@ -292,7 +307,11 @@ target_compile_options(neuralnet_cpp INTERFACE
     # 系统 codepage 读 → C4819/C4828 甚至误解析；/utf-8 = source+execution
     # 都按 UTF-8（= 库内 /source-charset:utf-8 /execution-charset:utf-8 的
     # 合并等价物）。⚠ 这同时要求消费方源码也是 UTF-8（现代工程默认如此）。
-    $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+    # /utf-8 = /source-charset:utf-8 + /execution-charset:utf-8；
+    # /Zc:preprocessor 必须随接口传出去（见上方公共标志处的实测说明：
+    # 传统预处理器会让 NN_CHECK/NN_EXIT 的变参分发错位）。
+    $<$<CXX_COMPILER_ID:MSVC>:/utf-8>
+    $<$<CXX_COMPILER_ID:MSVC>:/Zc:preprocessor>)
 
 add_library(neuralnet::nn ALIAS neuralnet_cpp)
 

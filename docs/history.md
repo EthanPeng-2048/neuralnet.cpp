@@ -20,13 +20,13 @@
 - [GPU 手写原语 shader（shaders/*.comp）](#GPU 手写原语 shader（shaders/*.comp）)（12 条）
 - [构建期工具 / 基准脚本 / 对拍脚本](#构建期工具 / 基准脚本 / 对拍脚本)（12 条）
 - [表达式与融合测试](#表达式与融合测试)（18 条）
-- [层 / 模型测试](#层 / 模型测试)（14 条）
+- [层 / 模型测试](#层 / 模型测试)（15 条）
 - [精度 / RAPT / ZiPT / 分词器测试与探针](#精度 / RAPT / ZiPT / 分词器测试与探针)（11 条）
 - [docs/development 12 · 13 · 08](#docs/development 12 · 13 · 08)（17 条）
 - [docs/development 02 · 03 · 05](#docs/development 02 · 03 · 05)（19 条）
 - [docs/development 01 · 04 · 06 · 07 · 10 · 14](#docs/development 01 · 04 · 06 · 07 · 10 · 14)（25 条）
 - [docs/introduction · usage · benchmarks](#docs/introduction · usage · benchmarks)（46 条）
-- [构建系统 / CI（CMakeLists.txt、.github/workflows）](#构建系统 / CI（CMakeLists.txt、.github/workflows）)（5 条）
+- [构建系统 / CI（CMakeLists.txt、.github/workflows）](#构建系统 / CI（CMakeLists.txt、.github/workflows）)（6 条）
 - [AGENTS.md](#AGENTS.md)（24 条）
 - [ZiPT（AttnZip）移除](#ZiPT（AttnZip）移除（2026-10-01）)（1 条）
 - [GUI / CLI 参数一致性清理](#GUI / CLI 参数一致性清理（2026-10-01）)（1 条）
@@ -1068,6 +1068,16 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 - 类型：bug 根因
 - 内容：原文「其 logits 只可能因跨样本串扰而变（position-major 类历史 bug 在 batch=1 下不可见）」。整改后保留理由、删去「历史 bug」：「batch>1 是必须的：batch=1 时 position-major 与 batch-major 布局重合，串扰不可见」。
 
+## kvrec_test 里的死变量（2026-10-10，clang + libc++ 干净构建捕获；原位置 src/kvrec_test.cpp:141）
+
+- 类型：bug 根因（编译器/标准库口径差异）
+- 症状：`clang++ -stdlib=libc++ -Werror` 下 `src/kvrec_test.cpp:141` 报
+  `-Wunused-variable: unused variable 'ls'`，同一份代码在 clang + libstdc++ 与 MSVC 下**不报**。
+- 根因：该局部 `std::string ls;` 声明后从未参与任何断言（用例只检查 `child.get("leaf_u", u) && u == 9`），
+  是改造遗留的**真实死变量**；libc++ 的 `std::string` 在本配置下让 clang 走到"未使用即告警"的分支，
+  libstdc++ 同版本不告警 → 属"两个标准库的诊断口径差异"，删掉即可（不是放宽编译选项的理由）。
+- 整改：删除该行。四组编译器 × 标准库矩阵随后全部零告警通过。
+
 ---
 
 # 精度 / RAPT / ZiPT / 分词器测试与探针
@@ -1909,6 +1919,32 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 
 - 类型：bug 根因 / 演进记录
 - 内容：Linux 云端构建复现历史链接失败（`tokenizer_train` FAILED，大量 `std::__cxx11::*`/`std::__throw_*`/`std::thread` undefined reference）：链接命令带两处 `-stdlib=libc++`（分处 CMAKE_CXX_FLAGS 与 CMAKE_EXE_LINKER_FLAGS 槽位），而 .o 是 libstdc++ ABI——clang 带 `-stdlib=libc++` 但系统无 libc++ 头时**静默回退 libstdc++ 头**，链接却切到 libc++ → ABI 分叉。演进三段：① 旧 workflow 曾传 `-DCMAKE_CXX_FLAGS/-DCMAKE_EXE_LINKER_FLAGS=-stdlib=libc++`，与 CMakeLists 当时的 `NN_STDLIB`（Linux+Clang 默认 libstdc++，`add_compile_options/add_link_options(-stdlib=...)`）冲突（68565b0 曾统一 libstdc++ 缓解）；② 1b415bf 从 CMakeLists 移除 NN_STDLIB 及「PATH 有 clang++ 即设为默认」块，仓库自此无任何编译器/标准库指定；③ 本轮云端**在干净源码上仍复现** → 残留载体：workflow build 目录缓存（`restore-keys` 跨 sha 恢复旧 `CMakeCache.txt`，configure 不清除未重传的 `-D` 缓存变量，历史 `-stdlib` 因此永久驻留）或调用方环境（`CXXFLAGS`/`LDFLAGS`/旧 configure 命令/旧 tag）。整改（2026-09-27，两轮）：轮1——workflow 删 build 目录缓存步骤（ccache 保留，注释记明原因）、删 `-DCMAKE_CXX_COMPILER/-DCMAKE_C_COMPILER` 与 `env CC/CXX`、删与 CMakeLists 重复的 `-DCMAKE_CXX_STANDARD*`，NN_STDLIB 陈旧注释改写；AGENTS.md:22 撤回「PATH 有 clang++ 会自动优先选」（1b415bf 已删该机制）；src/expr_{dsl,opt}_test.cpp:13 手动编译建议去掉 `-stdlib=libc++`。轮1 后云端回退默认 `/usr/bin/c++`（GCC 15）→ `-Werror=format-truncation` 失败（`expr_spec.hpp:715` 与 `gen_fused.cpp:341` 的 `snprintf` 缓冲区按 `%04x` 最坏 8 位十六进制不够；GCC 独有警告、clang 不报——为何此前 WSL g++ 15.2「全量构建 exit 0」未捕获待查，疑与该环境未开 Vulkan、不编译 tools/ 有关）；轮2——按用户要求**恢复 CI 指定 clang++**（双平台 `-DCMAKE_CXX_COMPILER=clang++`/`-DCMAKE_C_COMPILER=clang` + `env CC/CXX`，名称 `CMake (Clang, C++26)`、release 说明「Clang」）。当前事实：**CI 指定 clang++，CMakeLists 与标准库一律不指定**（标准库跟随编译器默认，编译/链接两侧必须一致）；上述两处 format-truncation 编码在 GCC 本地构建（开 Vulkan 时含 tools/）仍会触发（未修，CI 走 clang 不受影响）；云端若仍复现 -stdlib 问题，先查环境变量与删除陈旧 `build/CMakeCache.txt`。
+
+---
+
+## MSVC 传统预处理器让 NN_CHECK/NN_EXIT 变参分发错位（2026-10-10，四编译器×标准库矩阵实测；原位置 CMakeLists.txt 的 MSVC 公共标志分支）
+
+- 类型：bug 根因 / 编译器矩阵
+- 症状：`cl.exe` 构建 `dev/t1_58` 分支时 `tools/scan_exprs.cpp` 报 3 处
+  `C2665: nn::detail::check_value 没有重载函数可以转换所有参数类型`（新写的
+  `NN_CHECK(false, std::string(...) + ...)`），而同一份代码在 clang / gcc 下零告警。
+- 根因：cl.exe **默认走传统预处理器**（VS 18 / cl 19.51 实测仍如此），它把
+  `__VA_ARGS__` 代入**嵌套宏调用**时按"单个实参"处理 → `NN_DETAIL_PICK2/3` 的实参计数分发
+  整体错位，两种语义各自翻车：
+  ① `NN_CHECK(cond, "ctx")` 错选 `NN_CHECK_1` → 展开成逗号表达式 `check_value((cond, "ctx"), …)`
+     → 条件变成字符串指针（**恒真**）→ **检查静默失效且编译通过**（最小复现：
+     `NN_CHECK(false, "SHOULD-ABORT")` 打印 "AFTER-CHECK" 并以 0 退出）；消息实参是
+     `std::string` 时逗号表达式类型无法转 `bool` → 变成**响亮编译错**（本轮撞到的就是这一支）；
+  ② `NN_EXIT(cond, code, "ctx")` 错选 `NN_PICK_END` → `C3861: NN_PICK_END 找不到标识符`。
+- 整改：`CMakeLists.txt` 的 MSVC 分支加 **`/Zc:preprocessor`**，并同时作为**接口**选项
+  （`neuralnet_cpp`）传给库外消费者——否则消费方在 cl.exe 下拿到的是失效的宏。
+  实测：同一 `NN_CHECK(false, …)` 打开开关后正常 abort（退出码 `0xC0000409`）。
+- 影响面：全仓 500+ 处宏调用点在 MSVC 下语义此前与 clang/GCC 不一致（两参数形态静默不检查）；
+  `NN_EXIT(x, code, msg)` 的调用点此前在 MSVC 下**根本编不过**，即 MSVC 侧从未真正验证过这族宏。
+- 验收（2026-10-10，四组"编译器 × 标准库"各自全新构建 + ctest）：MSVC cl 19.51 + MSVC STL
+  153/153 零 error + ctest **30/30**；clang 23 + MSVC STL 153/153 + ctest **30/30**；
+  clang 24 + libc++（Linux，Vulkan 开）**17/17**（GPU 用例未在沙箱内跑）；
+  g++ 15.2 + libstdc++（WSL，无 Vulkan → 纯 CPU）**30/30**（11 条 GPU 用例 skip）。
 
 ---
 
