@@ -607,6 +607,108 @@ void test_tied_spec()
     std::remove(file.c_str());
 }
 
+// ── [12] ReLU²（BitNet 2B4T 的 hidden_act）：前向/反向 vs 宿主参考 ────────
+void test_relu2_activation()
+{
+    std::puts("[12] ReLU2GLU：门控平方 ReLU 前向/反向 vs 宿主参考");
+    nn::CpuEngine eng;
+    const std::size_t FF = 6, B = 3, R = 2 * FF;
+
+    nn::ReLU2GLU gl(FF);
+    NN_EXIT(gl.init(eng), 1, "ReLU2GLU init 失败: ");
+    CHECK(std::string(gl.layer_name()) == "ReLU2GLU", "层名 = ReLU2GLU");
+    CHECK(gl.parameters().empty(), "纯激活无参数");
+
+    // 输入含负/零/正（覆盖 relu 折点）
+    nn::Matrix x(R, B);
+    for (std::size_t i = 0; i < x.size(); ++i)
+        x.span()[i] = static_cast<float>(static_cast<int>(i % 7) - 3) * 0.5f;
+
+    auto y = gl.forward(upload(eng, x));
+    NN_EXIT(y, 1, "ReLU2GLU forward 失败: ");
+    const nn::Matrix ym = download(eng, *y);
+    CHECK(ym.rows() == FF && ym.cols() == B, "输出形状 (d_ff, batch)");
+    double fmax = 0.0;
+    for (std::size_t r = 0; r < FF; ++r)
+        for (std::size_t c = 0; c < B; ++c)
+        {
+            const double g = x.at(r, c);
+            const double u = x.at(FF + r, c);
+            const double relu = g > 0.0 ? g : 0.0;
+            fmax = std::max(fmax, std::fabs(static_cast<double>(ym.at(r, c))
+                                            - relu * relu * u));
+        }
+    std::printf("    forward vs 宿主 relu²(gate)·up 最大差 = %.6g\n", fmax);
+    CHECK(fmax < 1e-6, "前向 = relu²(gate)·up");
+
+    nn::Matrix go(FF, B);
+    for (std::size_t i = 0; i < go.size(); ++i)
+        go.span()[i] = 0.25f + static_cast<float>(i % 5) * 0.1f;
+    auto gi = gl.backward(upload(eng, go));
+    NN_EXIT(gi, 1, "ReLU2GLU backward 失败: ");
+    const nn::Matrix gim = download(eng, *gi);
+    CHECK(gim.rows() == R && gim.cols() == B, "grad 形状 (2·d_ff, batch)");
+    double bmax = 0.0;
+    for (std::size_t r = 0; r < R; ++r)
+        for (std::size_t c = 0; c < B; ++c)
+        {
+            const std::size_t o = r < FF ? r : r - FF;
+            const double g = x.at(o, c);
+            const double u = x.at(FF + o, c);
+            const double relu = g > 0.0 ? g : 0.0;
+            const double expect = (r < FF) ? go.at(o, c) * u * 2.0 * relu
+                                           : go.at(o, c) * relu * relu;
+            bmax = std::max(bmax, std::fabs(static_cast<double>(gim.at(r, c)) - expect));
+        }
+    std::printf("    backward vs 宿主解析式 最大差 = %.6g\n", bmax);
+    CHECK(bmax < 1e-5, "反向 = (grad_gate, grad_up) 解析式");
+}
+
+// ── [13] ReLU² 进 GPT：端到端 + 规格往返 ────────────────────────────────
+void test_relu2_gpt()
+{
+    std::puts("[13] ReLU² 进 GPT：前向/反向 + 规格往返");
+    nn::CpuEngine eng;
+    const std::size_t V = 48, D = 32, S = 8, H = 4, FF = 64, L = 2, B = 2, N = S * B;
+
+    nn::GptConfig cfg;
+    cfg.vocab_size = V; cfg.d_model = D; cfg.seq_len = S;
+    cfg.num_heads = H;  cfg.d_ff = FF;   cfg.num_layers = L;
+    cfg.pos_enc = nn::PosEncodingType::RoPE;
+    cfg.activation = nn::ActivationType::ReLU2;
+    cfg.norm_type = nn::NormType::RMSNorm;
+    cfg.subln = true;
+    cfg.n_head_kv = 2;
+    cfg.tie_embeddings = true;   // = 2B4T 的完整结构组合
+
+    nn::Matrix x_m(S, B);
+    for (std::size_t i = 0; i < x_m.size(); ++i) x_m.span()[i] = static_cast<float>(i % V);
+
+    auto m = nn::build_gpt_model(eng, cfg);
+    NN_EXIT(m, 1, "build_gpt_model(relu2) 失败: ");
+    auto y = m->forward(upload(eng, x_m));
+    NN_EXIT(y, 1, "relu2 GPT forward 失败: ");
+    const nn::Matrix ym = download(eng, *y);
+    CHECK(ym.rows() == V && ym.cols() == N, "logits 形状");
+    double mx = 0.0;
+    for (auto v : ym.span()) mx = std::max(mx, std::fabs(static_cast<double>(v)));
+    CHECK(std::isfinite(mx) && mx > 0.0, "logits 有限且非全零");
+
+    auto g = make_tensor(eng, V, N, 0.01f, 0.0002f);
+    auto bi = m->backward(g);
+    NN_EXIT(bi, 1, "relu2 GPT backward 失败: ");
+
+    // 规格：activation 进 spec_matches
+    const nn::ModelSpec spec = nn::make_gpt_spec(
+        V, D, S, H, FF, L, cfg.pos_enc, cfg.activation, cfg.norm_type,
+        cfg.subln, cfg.n_head_kv, cfg.tie_embeddings);
+    auto other = spec;
+    other.activation = nn::ActivationType::SwiGLU;
+    CHECK(!nn::spec_matches(spec, other), "activation 不同 → 不匹配");
+    CHECK(nn::spec_matches(spec, spec), "同配置 → 匹配");
+    CHECK(static_cast<std::uint32_t>(nn::ActivationType::ReLU2) == 2, "枚举值 = 2");
+}
+
 // ── [6] 端到端小训练（L2 损失：直接给 logits 梯度，避开 CE 依赖）──────────
 bool test_training(nn::ComputeEngine& eng, const char* tag)
 {
@@ -701,6 +803,8 @@ int main(int argc, char* argv[])
     test_gqa_spec();
     test_tied_embedding();
     test_tied_spec();
+    test_relu2_activation();
+    test_relu2_gpt();
 
     if (gpu)
     {

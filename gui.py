@@ -56,7 +56,7 @@ LR_SCHEDULE_OPTIONS = ["fixed", "cosine"]
 GPT_LR_SCHEDULE_OPTIONS = ["fixed", "cosine", "step_cosine"]
 TOKENIZER_OPTIONS = ["bpe", "charbpe"]
 POSITIONAL_ENCODING_OPTIONS = ["learned", "sinusoidal", "alibi", "rope"]
-ACTIVATION_OPTIONS = ["gelu", "swiglu"]
+ACTIVATION_OPTIONS = ["gelu", "swiglu", "relu2"]
 NORM_OPTIONS = ["auto", "layernorm", "rmsnorm", "batchnorm"]
 # 归一化挂载位置（仅 CNN/ViT 需要；MLP 的挂载位置由结构固定，GUI 隐藏该行）
 # auto = 按架构默认：CNN = conv, ViT = final（与 mnist_train 默认一致）

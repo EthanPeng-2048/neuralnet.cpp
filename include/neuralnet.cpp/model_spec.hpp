@@ -33,6 +33,9 @@ enum class ActivationType : uint32_t
 {
     GeLU   = 0,  // QuickGeLU（GPT-2 风格，默认）
     SwiGLU = 1,  // SwiGLU（LLaMA/Mistral 风格，每参数效率更高）
+    // 门控平方 ReLU（BitNet b1.58 2B4T 的 `hidden_act = "relu2"`）：
+    //   out = relu²(gate(x)) ⊙ up(x) —— 与 SwiGLU 同接线，只换逐元素函数。
+    ReLU2  = 2,
 };
 
 // ── 归一化层类型 ─────────────────────────────────────────────────────────
