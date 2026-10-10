@@ -43,7 +43,7 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 | 加/改引擎原语（GPU 实现） | `compute_gpu_engine.hpp` + `backend/compute_vk_backend.hpp` + `backend/compute_vk_device.hpp` + `shaders/*.comp` |
 | 张量/设备抽象 | `compute_tensor.hpp` |
 | 按需 include（不走聚合头） | `engine.hpp` / `layer.hpp` / `loss.hpp` / `optimizer.hpp` / `model.hpp` / `train.hpp` = **薄转发头**（`nn.hpp` 仍是唯一聚合头；只求好记，不省 parse） |
-| 混合精度 / f16 类型系统 / 三值（T1_58） | `precision.hpp`（Precision 枚举含 `T1_58`、`precision_rank()`、`nn::f16`、`PrecisionProfile`）；层能力声明 `PrecisionSet`/`PrecisionSupport` + `Layer::precision_support()`/`layer_name()`（`compute_layer_base.hpp`） |
+| 混合精度 / f16 类型系统 / 三值（T1_58） | `precision.hpp`（Precision 枚举含 `T1_58`、`precision_rank()`、`nn::f16`、`PrecisionProfile`）；层能力声明 `PrecisionSet`/`PrecisionSupport` + `Layer::precision_support()`/`layer_name()`（`compute_layer_base.hpp`）；三值打包布局 `ternary_pack.hpp`；打包 GEMM 原语 `trit_pack`/`matmul_q`(`_t`)（`compute_engine.hpp` + CPU/GPU 实现 + `shaders/{trit_pack,matmul_q}.comp`） |
 | 矩阵/代数层（CPU 存储与手写内核） | `algebra_matrix.hpp` / `algebra_span.hpp` / `algebra_ops.hpp`（`Expression`/`BoolExpression` 概念在 `expr_dsl.hpp`） |
 | 表达式 DSL / 融合 IR | `expr_dsl.hpp` / `expr_spec.hpp` / `expr_opt.hpp` / `expr_registry.hpp`（IR-C 图融合未采用、无 `expr_graph.hpp`；取舍记录见 `docs/history.md`） |
 | 后端代码生成（IR-D emitter 抽象） | `expr_emitter.hpp`（注册表）+ `expr_glsl_gen.hpp`（GlslEmitter） |
@@ -136,6 +136,28 @@ Matrix → engine.from_matrix → Tensor[GPU] → forward/loss/optimizer 全程�
 
 **三值精度预设（CLI `--t1_58`，2026-10-10 落地）**：`profile_t1_58()` = `{param=T1_58, compute=F16, stable=F32, optimizer=F32}` —— 定义上就是 `profile_f16()` 把 `param` 换成三值（另三槽在同一函数里派生 → 不会与 `--f16` 各自漂移），即"**其他默认 f16、模型参数 1.58**"；CLI `--t1_58`、GUI 两个训练页的"精度预设"下拉各一项，三条命令等价：`--t1_58` == `--f16 --precision-param t1_58` == `--precision-param t1_58 --precision-compute f16`。实测验收见 `docs/development/21-quantized-weights.md` §4.10。
 
+**三值性能优化（2026-10-11 落地，docs 21 §4.12）——改三值相关代码前必读**：
+① **写版本（write epoch）**：`Tensor` 的**存储对象**（`MatrixT` / `GpuBuffer`）持单调
+`write_epoch`，`ComputeEngine` 的**每个写入口**首行放 `WriteEpochGuard`（返回即 +1，
+失败也 +1）；DSL 在 CPU 上绕过引擎直写 dst（`eval_into_tensor_cpu`）必须经
+`TensorAccess::mark_written` 补记 —— **新增写入口/新的直写路径时漏掉 Guard 就会让
+BitLinear 的量化缓存静默用旧权重**（`src/write_epoch_test.cpp` 逐入口断言 + 只读路径
+不推进 + 别名可见）。`BitLinear` 只在 `latent_w_.write_epoch()` 变化时重算 τ/wq
+（`quantize_calls()` 可观测），覆盖梯度累积 / 逐 token 生成 / 激活重计算三种重复调用。
+② **打包权重（P2）**：`trit_pack` / `matmul_q` / `matmul_q_t` 是 **op-level 引擎原语**
+（不进 DSL 闭合世界、不需 scan 登记），布局 = 2 bit/权重 + 4 权重/字节 + 码值 = 三值 + 2
+（与 microsoft/BitNet `pack_weight.py` 一致；不做其 CUDA interleave），容器是 f32 张量
+当原始字（布局/编解码唯一来源 `ternary_pack.hpp`）。`supports_ternary_gemm()` =
+能力位（GPU = 两条 pipeline 都在）。
+③ **按宽度选址**：BitLinear 默认**按激活宽度**选缓冲（≤ 8 → 打包；> 8 → f16 稠密分块
+GEMM）——因为打包内核在宽 batch 下输给分块 GEMM（实测 60 步训练 4.0 s vs 2.0 s）。
+`set_ternary_pack_enabled()` 强制开关（A/B/回退）。**动这块前先量**：本机与 102 的
+训练/解码/显存 A/B 口径见 docs 21 §4.12 的表。
+④ **梯度惰性分配**：`Linear` / `BitLinear` 的梯度只在 `param_gradients()` /
+`backward()` 首次触及时建（`grad_buffers_allocated()` 可见）；新增层若也用
+`ensure_grad_()` 模式，注意**返回 void 的函数里用 `NN_CHECK` 而不是 `NN_FAIL`**
+（后者是 `return std::unexpected` 语义，`-Wreturn-mismatch` 直接编译失败）。
+
 ### 4.3 ComputeEngine 原语分类
 
 | 类别 | 原语 |
@@ -148,7 +170,10 @@ Matrix → engine.from_matrix → Tensor[GPU] → forward/loss/optimizer 全程�
 | 批次/内存 | `begin_batch/end_batch/flush_batch/release_idle_pool_blocks/pool_stats` |
 | offload | `create_offload_buffer/offload_save/offload_restore`（activation offload） |
 
-> 引擎共 **49** 个 virtual 方法（复现：`bench/doc_inventory.ps1` 的 `virtual methods`；M6 新增 `import_impl` 使其由 48 → 49；`grep -c "\bvirtual\b"` 原始计 51 处 = 49 方法 + 析构 1 + 注释里的词 1）；逐元素/广播等计算类原语一律经表达式
+> 引擎的 virtual 方法计数**以审计输出为准**：`bench/doc_inventory.ps1` 的 `virtual methods`
+行为 **52 declarations / 52 unique**（改三值优化前为 49：M6 的 `import_impl` 曾使其 48 → 49；
+本轮 +4 = `supports_ternary_gemm` / `trit_pack_impl` / `matmul_q_impl` /
+`grad_buffers_allocated`，审计口径含析构等声明）；逐元素/广播等计算类原语一律经表达式
 > DSL 求值，不经 Layer 直调（`dsl::row_reduce_max` 是 DSL 叶子，不是引擎算子）。CRLF/`scan_exprs` AOT 键规则见 §7。
 
 ### 4.4 理解优先级（建议学习顺序）
