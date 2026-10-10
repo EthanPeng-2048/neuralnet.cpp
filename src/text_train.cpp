@@ -147,8 +147,9 @@ void print_usage(const char *prog)
     help.opt("--f16", "快捷方式: f16 存储 (param/compute=F16，stable/optimizer=F32)");
     help.opt("--precision-param <f16|f32|t1_58>",
              "权重/参数精度 (默认: f32)；t1_58 = 三值权重（1.58-bit）——\n"
-             "P1 只支持 MLP 路径，GPT/RAPT 选它会在层能力校验处明确报错\n"
-             "(docs/development/21-quantized-weights.md §4.8)");
+             "GPT 已支持（注意力 4 投影 + fc1/fc2 + 未 tie 的 LM head 全部换成\n"
+             "BitLinear；P1.5 落地）；--model rapt 选它会被前置拒绝\n"
+             "(docs/development/21-quantized-weights.md §4.8.3)");
     help.opt("--precision-compute <f16|f32>", "常规算子计算精度 (matmul/逐元素/gather，默认: f32)");
     help.opt("--precision-stable <f16|f32>", "数值敏感算子精度 (softmax/LayerNorm/loss，默认: f32)");
     help.opt("--precision-optimizer <f16|f32>", "优化器状态精度 (Adam m/v，默认: f32)");
@@ -748,7 +749,7 @@ int main(int argc, char *argv[])
             std::cerr << "RAPT 尚不支持三值权重（--precision-param t1_58）：RLA 注意力的"
                          " 4 个 Linear 还没接 make_linear_layer，\n"
                          "见 docs/development/21-quantized-weights.md §4.8.3。\n"
-                         "  · 三值 GPT：改用 --arch gpt\n"
+                         "  · 三值 GPT：改用 --model gpt\n"
                          "  · 三值 MLP：mnist_train --arch mlp --precision-param t1_58\n";
             std::exit(1);
         }

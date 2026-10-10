@@ -489,6 +489,76 @@ MLP 路径（`build_mnist_mlp_model`）确实是 `model.add<Linear>(...)` 一条
 | CLI 端到端 | `--precision-param t1_58 --arch mlp`：训练跑通（2000 样本 / 1 epoch → test_acc 77.98%）；`--resume` 正确还原 BitLinear；`--arch transformer + t1_58` 明确报错"层 PatchEmbedding 不支持 param=t1_58" |
 | `gui_cli_audit.py` | PASS（可行动问题 0）；GUI 只在 param 下拉加入 `t1_58` |
 
+### 4.10 P1.5 落地记录（GPT 的线性层接线，2026-10-10）
+
+§4.8.3 的 P1.5 已按方案 ② 落地（三步：W1 工厂 + 注意力/FFN、W2 GPT/规格/CLI/扫描、W3 验收）。
+P1 只覆盖 MLP 的那条界线（`--arch mlp`）从此消失：**三值 GPT 与新结构三项正交组合**。
+
+**接线点**（`Linear` 成员 → `std::unique_ptr<Layer>` + `make_linear_layer`）：
+
+| 持有者 | 成员 | 备注 |
+|---|---|---|
+| `AttentionBase`（`MultiHeadAttention` / `CausalSelfAttention` 继承） | `w_q_ / w_k_ / w_v_ / w_o_` | GQA 只收窄 K/V 的**输出**宽度，与三值正交 |
+| `FeedForward` | `fc1_ / fc2_` | `fc1_` 宽度随 GeLU/SwiGLU/ReLU² 变化，与三值正交 |
+| `GPTModel` | `lm_head_` | `tie_embeddings=true` 时不 init、不进 `parameters()`（head 就是嵌入） |
+
+**开关的唯一判据**：`effective_weight_quant(precision, weight_quant)`
+—— `precision.param == T1_58` **等价于** `weight_quant = T1_58`。三条注入路径（库 API 的
+`PrecisionProfile`、CLI 的 `--precision-param t1_58`、`ModelSpec.weight_quant`）因此收敛到
+同一个判据，不存在"声明了三值却构造出普通 Linear"的组合。构造期定型（不是运行期分支）：
+`weight_quant` 是尾参默认 `None` → **既有 f16/f32 路径的成员构造、参数顺序、求值结构逐位不变**。
+
+**profile 分流（`TernaryProfileSplit` + `split_ternary_profile`）**：`param = T1_58` 只对
+**线性子层（BitLinear）**有意义，因此持有线性子层的复合层把一次 profile 拆两份：
+
+```mermaid
+graph TB
+    P["PrecisionProfile<br/>{param: T1_58, compute/stable/optimizer: …}"]
+    P --> S["sp.self —— param 归一化为 f32"]
+    P --> L["sp.linear —— param = T1_58"]
+    S --> S1["复合层自身（它自建的张量：token 嵌入 / RoPE 表）"]
+    S --> S2["norm / 激活 / softmax / 位置编码"]
+    L --> L1["BitLinear（4 投影 + fc1/fc2 + LM head）"]
+    P -. "未以三值模式构造却收到 T1_58<br/>→ fail-fast（不静默降级 f32）" .-> F["NN_CHECK 报错"]
+```
+
+非三值入参（`param != T1_58`）时 `self == linear == 入参`（恒等）→ 既有路径零变化。
+**这条规则同时修掉一个真实缺陷**：GPTModel 构造器原本把 `precision` 原样再注入
+`ln_f_` 与**位置编码表**，三值模式下会让 RMSNorm/Learned 编码表拿 T1_58 去建张量
+（"不是存储精度"）——由构建期扫描用例当场抓到（见下）。
+
+**CLI / 规格 / 扫描**：
+
+- `build_gpt_model_from_spec` 补 `weight_quant → precision.param` 映射（规格是加载时的权威，
+  与 `build_mnist_model_from_spec` 同款）；`text_train` 保存规格时写 `spec.weight_quant`
+  并打印三值启用行。`--arch rapt --precision-param t1_58` **前置拒绝**（见下"仍未接线"）。
+- `scan_exprs` 模型 pass 增加两条三值 GPT（`gpt_learned_gelu_ln_t1_58`、
+  `gpt_rope_relu2_rms_gqa_subln_tied_t1_58`）。**结构数不变（107 → 107）**：BitLinear 的三段
+  结构（τ 的 absmean 归约 / wq 的阈值 select / 去量化点积与 STE 累加）已由 MLP 用例登记。
+  保留它们的价值是**构建期 smoke test**：模型 pass 会真的把三值 GPT 构造 + 跑一遍 fwd/bwd，
+  上面那个 `ln_f_`/位置编码表的缺陷就是这里报出来的（`LearnedPositionEncoder: 初始化失败`
+  + `层 RMSNorm 不支持 param=t1_58`）。
+
+**验收（102 实测：Windows + LLVM clang 23 + 真实 GPU NVIDIA CMP 40HX）**：
+
+| 项 | 结果 |
+|---|---|
+| 构建 | 零告警（`-Werror`）；`[scan] 收集到 107 条融合表达式`（与 P2 持平，可解释） |
+| `ctest`（W2 状态） | **30/30 全绿** |
+| `bitnet_struct_test` [14] | 三值 GPT 参数张量 36 张 / 21376 标量，与 f32 基线**逐张量形状相同**；一步真实 sparse-CE 反向后 **36/36** 参数张量梯度非零（max\|g\|=3.81） |
+| `bitnet_struct_test` [15]（CPU） | 2B4T 形状（RoPE+ReLU²+RMSNorm+**SubLN+GQA+tied**+三值）200 步 CE+AdamW：三值+tied **3.469 → 0.018**、三值+BitLinear head **3.582 → 0.0064**、f32 基线 3.893 → 0.0045（随机基线 ln 32 = 3.466） |
+| `bitnet_struct_test_gpu` [15] | 同一配置在真实 GPU 上跑通，CPU/GPU 末步 loss 差 < 1e-3（断言） |
+
+**仍未接线（诚实边界）**：
+
+1. **RAPT**：`ReLULinearAttention` 自持 4 个 `Linear` 且当前**不转发**精度 profile
+   （roadmap P2「RAPT/CNN f16」同源）——接三值必须同时补 profile 下传，会改变既有 f16 RAPT 的
+   数值行为，属独立一步。CLI 侧对 `--arch rapt --precision-param t1_58` **前置拒绝**。
+2. **ViT / MNIST Transformer**：`TransformerEncoderLayer` 的 `MultiHeadAttention`/`FeedForward`
+   已经能承载 BitLinear（同一个工厂），但补丁式/池化侧的张量仍拿 `p_.param` 建表 →
+   现在会以"层 PatchEmbedding 不支持 param=t1_58"报错（诚实失败，不静默跑 f32）。
+3. **P2 性能**（行级打包 + `matmul_q`）与 **HF 权重转换器**：与本文 P2 同期，未动。
+
 ---
 
 ## 5. 分期与验收
@@ -497,7 +567,7 @@ MLP 路径（`build_mnist_mlp_model`）确实是 `model.add<Linear>(...)` 一条
 |---|---|---|---|
 | **P1 ✅（2026-10-10 落地）** 架构统一 + 功能正确<br>（**范围 = MLP 路径**，D5 建议③） | `Precision::T1_58`（含 R4 的序处理、tag 4、`check_precision_supported` 拒绝）；`PrecisionSet` + `Layer::precision_support()` + `init` 校验 + `layer_name()`；`BitLinear`（量化 forward + STE backward）；D3 的 (a)+(b)（§4.3.2）；`scan_exprs` 补 dry-run；spec 的 `weight_quant` 字段；2 个 CLI × 4 flag 的词法 + GUI + `gui_cli_audit` | `precision.hpp` / `compute_layer_base.hpp` / 新 `compute_layer_bitlinear.hpp` / `tools/scan_exprs.cpp` / `model_spec.hpp` / `src/*` / `gui.py` | ① 不兼容组合**初始化期报错**（含 `param=T1_58` + 普通 `Linear` 的反例用例）✅；② latent 权重的 STE 梯度 = 解析式（量化器不可微 → 不做数值 gradcheck，改与宿主参考逐项对拍）✅；③ CPU/GPU 各一个端到端小训练收敛（loss 0.981→0.025，两端逐位相同）✅；④ 既有 ctest 全绿（本机唯一不稳定 = 软件 Vulkan teardown）、L2 审计 0 ✅。**逐文件清单见 §7；逐条差异见 §4.9** |
 | **P2** 真性能 | Tensor qparam（M7）+ **行级打包**（`TQ1_0` 编码：base-3 5-per-byte + `qh` 尾巴 + 定点解码；尺度 = 行级 absmean，**无 per-256 尺度**；行步长/对齐待定）+ `matmul_q` / `matmul_q_t`（CPU 微内核 + Vulkan shader）+ `layer_bench` A/B + 序列化打包 | `compute_tensor.hpp` / `compute_engine.hpp` / `compute_cpu_engine.hpp` / `compute_gpu_engine.hpp` / 新 `.comp` | ① `layer_bench --op matmul` 配对 A/B 报告（含"当前 matmul 是带宽受限还是延迟受限"的判定）；② 打包往返逐字节；③ 数值与 P1 的 f16 缓冲路径一致（同 latent 权重下逐位）；④ 与 llama.cpp `TQ1_0` 的反量化对拍（**只对编码/解码**——尺度规则不同，块内容不互通） |
-| **P1.5** GPT/RAPT 接入 | `make_linear_layer` + `unique_ptr<Layer>` 替换 4 处 `Linear` 成员（照 `make_norm_layer` 先例，§4.8.3） | `compute_layer_attention.hpp` / `compute_layer_feedforward.hpp` / `compute_layer_gpt.hpp` / `compute_layer_rapt.hpp` | GPT/RAPT 的三值端到端训练；既有全 f32 路径零回归 |
+| **P1.5 ✅（2026-10-10 落地）** GPT 接入<br>（**范围 = GPT**，RAPT/ViT 见 §4.10 边界） | `make_linear_layer` + `unique_ptr<Layer>` 替换 GPT 侧全部 `Linear` 成员：`AttentionBase` 4 投影、`FeedForward` fc1/fc2、`GPTModel` LM head；`TernaryProfileSplit` 分流规则；`effective_weight_quant` 唯一判据；规格/CLI/扫描同步 | `compute_layer_base.hpp` / `compute_layer_attention.hpp` / `compute_layer_feedforward.hpp` / `compute_layer_gpt.hpp` / `domain_gpt.hpp` / `src/text_train.cpp` / `tools/scan_exprs.cpp` | ① 三值 GPT 端到端训练（2B4T 形状 3.469→0.018；MLP 之外的路径首次可用）✅；② 参数张量形状与 f32 基线逐一相同 + 梯度非零 ✅；③ 既有 f32/f16 路径零回归（`split` 恒等 + ctest 30/30）✅；④ **RAPT/ViT 明确拒绝**而非静默半三值 ✅。逐条记录见 §4.10 |
 | **P3** 计算侧收益 | 激活 int8 量化 + 整数点积（GPU 需 `GL_EXT_shader_integer_dot_product` 的设备特性探测；CPU 侧参考 §3.4/§3.5）；DSL 新增 `round`/`clamp` 算子（三处同步：`ExprOp` + CPU 求值 + GLSL emitter） | `expr_spec.hpp` / `expr_dsl.hpp` / `expr_glsl_gen.hpp` / 新 `.comp` | 与 PyTorch 参考实现对拍（`compare_with_torch/`） |
 
 > **性能预期必须先量后承诺**：本项目主线模型 `d_model` 只有 64–256（GPT d64/h4/L4/ff256），
@@ -562,7 +632,8 @@ MLP 路径（`build_mnist_mlp_model`）确实是 `model.add<Linear>(...)` 一条
 
 ## 7. 实施清单（P1，文件级）
 
-按依赖顺序；每项给出"改什么 / 为什么"。**P1 不含 GPT/RAPT 三值训练**（§4.8.3 ③）。
+按依赖顺序；每项给出"改什么 / 为什么"。**P1 不含 GPT/RAPT 三值训练**（§4.8.3 ③）——
+GPT 侧已于 **P1.5 落地**（§4.10），RAPT/ViT 仍拒绝（§4.10 边界）。
 
 | # | 文件 | 改动 | 落地 |
 |---|---|---|---|
@@ -701,5 +772,14 @@ graph LR
 | 5 | `P1-步骤5` | 本文（状态/差异/清单/架构图）+ `AGENTS.md` §3/§4/§11/§12 + `docs/usage/03` 精度表 + `docs/history.md` 条目 |
 
 **未做（明确留待后续）**：P2（行级打包 + `matmul_q` + M7 张量 qparam + `layer_bench` A/B）、
-P1.5（`Linear` 成员 → `make_linear_layer` + `unique_ptr<Layer>`，让 GPT/RAPT 也能三值）、
+P1.5 的**剩余边界**（RAPT 的 `ReLULinearAttention`、ViT/MNIST Transformer 的补丁/池化侧张量
+——两者现在都**明确拒绝**而不是静默跑 f32，见 §4.10）、
 P3（激活 int8 + 整数点积 + DSL `round`/`clamp`）。
+
+### 10.1 P1.5 提交（同一分支）
+
+| # | 提交 | 内容 |
+|---|---|---|
+| W1 | `P1.5-W1 线性层工厂 + Attention/FeedForward 三值接线` | `make_linear_layer`；`AttentionBase` 4 投影与 `FeedForward` fc1/fc2 → `unique_ptr<Layer>`；`split_ternary_profile`（含"未以三值模式构造却收到 T1_58 → fail-fast"） |
+| W2 | `P1.5-W2 GPT 三值接线：投影/FFN/LM head + 规格·CLI·扫描登记` | `GPTBlock`/`GPTModel` 开关传播 + `lm_head_`；`effective_weight_quant`；`build_gpt_model_from_spec` 映射；`text_train` 写规格 + RAPT 前置拒绝；scan 两条三值 GPT 用例（结构数 107 持平）+ 修掉构造器把 T1_58 打进 `ln_f_`/位置编码表 |
+| W3 | `P1.5-W3 验收：三值 GPT 接线 + 真实 BitNet（2B4T 形状）端到端训练` | `bitnet_struct_test` [14] 接线（形状一致 + 36/36 梯度非零）、[15] 真实 BitNet 训练（三配置收敛数字 + CPU/GPU 末步 loss 差 < 1e-3） |
