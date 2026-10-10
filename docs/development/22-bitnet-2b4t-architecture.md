@@ -1,6 +1,9 @@
 # BitNet b1.58 2B4T 的结构对齐：SubLN / GQA / Tied Embedding
 
-> **状态**：**立项 + 实施中**（2026-10-10 立项）。
+> **状态**：**立项 + S1/S2/S3 全部实施完成**（2026-10-10 立项，同日三步落地并提交）。
+> **构建与验收在 `ethan@192.168.1.102`**（Windows + LLVM clang 23 + 真实 GPU
+> NVIDIA CMP 40HX）：全量 **ctest 30/30 通过**；本机（软件 Vulkan/llvmpipe）
+> 曾把 `expr_gpu_test`/`fused_gpu_test` 的退出段问题误判为回归，故改到 102 上验收。
 > 本文是"BitNet 结构"的唯一入口；权重侧（`T1_58` + `BitLinear`）在
 > `21-quantized-weights.md`，两者是**两条正交的腿**（§8）。
 > **落地分支**：`dev/t1_58`（承接 P1，延续"一步一测试一提交"）。
@@ -188,11 +191,11 @@ GPT 家族分支**逐字段比对**（漏比 = 允许把不匹配的权重加载
 每步 = **实现 + 测试 + 提交**（沿用仓库纪律：`ctest` 全绿 + `L2-VIOLATIONS: 0`
 + 既有路径零回归）。
 
-| 步骤 | 内容 | 验收 |
+| 步骤 | 内容 | 验收（全部在 102 实测） |
 |---|---|---|
-| **S1** SubLN | `AttentionBase`/`FeedForward` 加可选 sub-norm（§3.1）；`GPTBlock`/`GPTModel`/`GptConfig` 透传；`ModelSpec.subln` | ① 开/关两组参数条数差 = 2×层数；② 开启后 CPU/GPU 端到端小训练收敛；③ **关闭时全量 ctest 零回归**（含既有 GPT 测试） |
-| **S2** GQA | `AttentionBase` 加 `n_head_kv_` + 展开表（§3.2）；`CausalSelfAttention`/`GPTBlock`/`GPTModel`/`GptConfig` 透传；`ModelSpec.n_head_kv` | ① **`n_head_kv == num_heads` 与 MHA 逐位相同的**（同一权重、同一输入）；② `n_head_kv < num_heads` 时前向/反向形状正确、梯度和有限；③ 反向 `scatter_add_rows` 的累加正确（重复行 = 多次累加）；④ 既有 ctest 零回归 |
-| **S3** Tied embedding | `GPTModel` 开关（§3.3）；`ModelSpec.tie_embeddings` | ① 开启后参数条数 = 关闭 − `(V*D + V)`；② 数值 = "把 `lm_head_` 权重显式设成 `token_emb_`"的等价构造（对拍）；③ 嵌入与 head 两条梯度路径**累加**而非覆盖（用只走一条路径的样例分别验证）；④ 既有 ctest 零回归 |
+| **S1 ✅** SubLN | `AttentionBase`/`FeedForward` 加可选 sub-norm（§3.1）；`GPTBlock`/`GPTModel`/`GptConfig` 透传；`ModelSpec.subln` | ① 参数增量 = `layers×(d_model+d_ff)`（RMSNorm；实测 288 = 3×(32+64)）；LayerNorm 翻倍 576 ✅；② 子层 norm 参数梯度非零 ✅；③ 同权重消融 on≠off（最大差 0.388）✅；④ 规格往返逐位一致 ✅；⑤ 端到端 loss 592→3e-6 ✅；⑥ ctest 30/30 ✅ |
+| **S2 ✅** GQA | `AttentionBase` 加 `n_head_kv_` + 展开表（§3.2）；`CausalSelfAttention`/`GPTBlock`/`GPTModel`/`GptConfig` 透传；`ModelSpec.n_head_kv` | ① `n_head_kv == num_heads` 与 MHA 前向/输入梯度**逐位相同**（差 = 0）✅；② 与"把 K/V 权重按块映射复制成 MHA"对拍：前向差 **0**、输入梯度 1.19e-7、K/V 权重梯度 = 组内和 ✅（该用例**钉住块映射约定**）；③ 规格往返逐位一致 ✅；④ ctest 30/30 ✅ |
+| **S3 ✅** Tied embedding | `GPTModel` 开关（§3.3）；`ModelSpec.tie_embeddings` | ① 参数条数差 = `V·D + V`（实测 2112 = 64·32+64）✅；② 与"head 权重显式设为 `token_emb_`、bias=0"的等价构造对拍：前向差 **0** ✅；③ **梯度累加**：tied 的 `token_emb` 梯度 == 非 tied 的（嵌入梯度 + head 的 dW），差 **0** ✅；④ 规格往返逐位一致 ✅；⑤ ctest 30/30 ✅ |
 
 **统一回归口径**（每步都要满足）：
 
@@ -259,10 +262,15 @@ graph TB
 
 | # | 提交 | 内容 |
 |---|---|---|
-| 0 | 本文 | 立项文档（三项裁决 + 依据 + 分期 + 架构图） |
-| S1 | `P1.5-S1 SubLN` | 子层可选 norm + 透传 + `ModelSpec.subln` + 测试 |
-| S2 | `P1.5-S2 GQA` | `n_head_kv` + 展开表（前向 gather / 反向 scatter_add）+ 透传 + `ModelSpec.n_head_kv` + 测试 |
-| S3 | `P1.5-S3 tied` | `tie_embeddings` 开关 + 梯度累加 + `ModelSpec.tie_embeddings` + 测试 |
+> 提交 hash 以 `git log dev/t1_58` 为准（本文档记录**提交主题**，不写 hash —— hash 会随 amend 变化）。
+
+| # | 提交主题 | 内容 |
+|---|------|------|
+| 0 | `P1.5 立项：BitNet b1.58 2B4T 结构对齐（SubLN / GQA / tied embedding）` | 本文（三项裁决 + 依据 + 分期 + 架构图）+ `AGENTS.md` 索引 |
+| S1 | `P1.5-S1 SubLN：子层内部的额外归一化（BitNet 2B4T）` | 子层可选 norm + 透传 + `ModelSpec.subln` + `src/bitnet_struct_test.cpp`（[1]–[6]）+ CMake 注册（ctest 28 → 30） |
+| S2 | `P1.5-S2 GQA：分组查询注意力 + 头映射展开` | `n_head_kv` + 展开表（前向 `gather_rows` / 反向 `scatter_add_rows`）+ 透传 + `ModelSpec.n_head_kv` + 测试 [7]–[9] |
+| S3 | `P1.5-S3 tied embedding：head 复用 token embedding` | `tie_embeddings` 开关 + 梯度累加 + `ModelSpec.tie_embeddings` + 测试 [10]–[11] |
+| 4 | `P1.5 文档同步` | 本文状态/实施记录 + `AGENTS.md` + `docs/history.md` |
 
 ---
 
@@ -298,3 +306,24 @@ graph TB
    4 个头与全部实例化点，与 `20-custom-layer-ergonomics.md` 的方向相反。→ `21` §4.8.3。
 5. **RAPT 挂 SubLN/GQA**：RAPT 的注意力是 ReLU 线性注意力（无 softmax），不是 BitNet 的形态。
    → §0 第 11 条。
+
+---
+
+## 10. 实施记录（落地差异与踩到的坑）
+
+§3 的设计与实现一致；以下是**实现期才显形**的几点，按"代码注释只记当前状态、
+历史过程进 history"的纪律，过程归档在 `docs/history.md`，这里只留结论性事实：
+
+1. **`Linear(in_features, out_features)` 是"入在前"** —— GQA 收窄的只是 K/V 的**输出**宽度，
+   正确写法 `w_k_(d_model, n_head_kv·d_k)`。写反会被 `bitnet_struct_test` [8] 的形状打印
+   当场抓住（`param[2] gqa=16x8` vs 期望 `8x16`）。
+2. **`grad_V` 也要折叠**：前向里 K 与 V **一起**展开，反向必须对称地一起折叠回 `n_head_kv`；
+   漏掉 V 会在 `w_v_.backward` 处报 `grad_output shape mismatch`。
+3. **声明式初始化的 seed 按"创建序号"混流**（`compute_engine.hpp` InitSpec 注释：
+   "同 seed 的不同张量不撞流（同形状多层不互为镜像）"）→ **两次独立构造**的同构层权重
+   并不相同，测试里的 A/B 必须**显式拷贝权重**。（与 `gpt_checkpoint_test.cpp` 文件头注释一致。）
+4. **tied head 不转置**：`token_emb_ (V,D)` **就是** head 的权重矩阵，`logits = W_emb·x`；
+   只有 backward 的 `dX = W_embᵀ·g` 需要 `transA=true`。
+5. **验收机器 = 102**：本机（软件 Vulkan/llvmpipe）的 `expr_gpu_test`/`fused_gpu_test`
+   在退出段随机段错（基线同样复现、且故障时已打印 `ALL PASS`）；102 的真实 GPU 上
+   30/30 全绿 —— 避免把环境问题误判成代码回归。
