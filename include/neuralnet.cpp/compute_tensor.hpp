@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <functional>
 #include <memory>
@@ -258,6 +259,18 @@ public:
 #endif
     }
 
+    // ── 写版本（write epoch）──────────────────────────────────────────────
+    // 语义："本张量的存储内容**可能已经变了**"的单调计数（存储对象持有：
+    // MatrixT::write_epoch_ / GpuBuffer::write_epoch_，故 Tensor 拷贝/别名
+    // 共享同一计数）。用途：派生缓冲（如 BitLinear 的三值权重）判断"输入
+    // 是否变过"，从而**只在必要时**重算 —— 见 docs/development/21 §4.11。
+    //
+    // 契约：只有 **ComputeEngine 的写入口**会推进它（`touch_write_epoch_`
+    // 私有，friend 限定）；库外无法直写存储（M1，铁律 #11），因此"版本没变
+    // ⇒ 内容没变"成立。注意它是**保守**信号：失败返回、只读地取可变存储等
+    // 情形也可能推进（代价 = 多算一次派生缓冲，不会用旧值）。
+    [[nodiscard]] std::uint64_t write_epoch() const noexcept;
+
 private:
     // ── CPU 存储访问（模板化，P 默认 F32，§6.1）──────────────────────────
     template <Precision P = Precision::F32>
@@ -328,6 +341,10 @@ private:
     }
 #endif
 
+    // 推进写版本：**只允许 ComputeEngine 的写入口护栏调用**（friend 限定）。
+    // 无存储 / 槽位与 precision_ 不符 → 静默跳过（空槽不变量由 valid() 守卫）。
+    void touch_write_epoch_() noexcept;
+
 public:
     // ── 形状描述（调试用） ────────────────────────────────────────────────
     [[nodiscard]] std::string shape_str() const
@@ -385,6 +402,54 @@ private:
     }
 };
 
+// ── write_epoch 的两个出口（定义在类外：需要上面私有存储访问器可见）────────
+inline std::uint64_t Tensor::write_epoch() const noexcept
+{
+    if (device_ == Device::CPU)
+    {
+        if (precision_ == Precision::F16)
+        {
+            const MatrixT<Precision::F16>* p = cpu_get_ptr<Precision::F16>();
+            return p ? p->write_epoch() : 0;
+        }
+        const MatrixT<Precision::F32>* p = cpu_get_ptr<Precision::F32>();
+        return p ? p->write_epoch() : 0;
+    }
+#ifdef NN_HAS_VULKAN
+    if (precision_ == Precision::F16)
+    {
+        auto p = gpu_get<Precision::F16>();
+        return p ? p->shared_buffer()->write_epoch() : 0;
+    }
+    auto p = gpu_get<Precision::F32>();
+    return p ? p->shared_buffer()->write_epoch() : 0;
+#else
+    return 0;
+#endif
+}
+
+inline void Tensor::touch_write_epoch_() noexcept
+{
+    if (device_ == Device::CPU)
+    {
+        if (precision_ == Precision::F16)
+        {
+            if (auto* p = cpu_get_ptr<Precision::F16>()) p->mark_content_changed();
+            return;
+        }
+        if (auto* p = cpu_get_ptr<Precision::F32>()) p->mark_content_changed();
+        return;
+    }
+#ifdef NN_HAS_VULKAN
+    if (precision_ == Precision::F16)
+    {
+        if (auto p = gpu_get<Precision::F16>()) p->shared_buffer()->mark_content_changed();
+        return;
+    }
+    if (auto p = gpu_get<Precision::F32>()) p->shared_buffer()->mark_content_changed();
+#endif
+}
+
 // ── 引擎域内访问通道（M1，docs/development/17 §4.1 豁免之一）──────────────
 // Tensor 的存储访问器/静态直构工厂已私有化；DSL 求值器（expr_dsl.hpp）在
 // friend 关系下经本结构创建与读写存储。库外（测试/tools/CLI）不得使用——
@@ -395,6 +460,12 @@ struct detail::TensorAccess
     [[nodiscard]] static MatrixT<P>& cpu_matrix(Tensor& t) { return t.cpu_matrix<P>(); }
     template <Precision P = Precision::F32>
     [[nodiscard]] static const MatrixT<P>& cpu_matrix(const Tensor& t) { return t.cpu_matrix<P>(); }
+
+    // 引擎域内的"写下"记账：DSL 的 CPU 编译期模板路径（eval_into_tensor_cpu）
+    // **直接**写 dst 的 span，不经 ComputeEngine 的写入口 —— 必须自己推进写
+    // 版本，否则参数派生物缓存（BitLinear 的 τ/wq）看不到这次写入（见
+    // ComputeEngine::WriteEpochGuard 的三条性质）。
+    static void mark_written(Tensor& t) noexcept { t.touch_write_epoch_(); }
 
     [[nodiscard]] static Tensor from_matrix(Matrix m) { return Tensor::from_matrix(std::move(m)); }
     [[nodiscard]] static Tensor from_matrix(MatrixT<Precision::F16> m) { return Tensor::from_matrix(std::move(m)); }

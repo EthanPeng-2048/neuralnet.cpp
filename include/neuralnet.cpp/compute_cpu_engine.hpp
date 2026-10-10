@@ -151,6 +151,7 @@ public:
     // 语义必需——若替换 dst 对象，其它持有同一张量句柄的缓存会静默失联）。
     [[nodiscard]] Result<void> copy_into(Tensor& dst, const Tensor& src) override
     {
+        WriteEpochGuard wg{dst};
         if (!dst.is_cpu() || !src.is_cpu())
             NN_FAIL("copy_into: CPU engine only supports CPU tensors");
         if (dst.rows() != src.rows() || dst.cols() != src.cols())
@@ -174,6 +175,7 @@ public:
 
     [[nodiscard]] Result<void> cast_into(const Tensor& src, Tensor& dst) override
     {
+        WriteEpochGuard wg{dst};
         if (!dst.is_cpu() || !src.is_cpu())
             NN_FAIL("cast_into: CPU engine only supports CPU tensors");
         if (dst.rows() != src.rows() || dst.cols() != src.cols())

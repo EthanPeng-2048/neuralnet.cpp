@@ -30,6 +30,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <utility>
 
 #include "compute_engine.hpp"
@@ -58,6 +59,19 @@ private:
     Tensor tau_;         // (out_features, 1) f32，逐行 absmean
 
     Tensor input_cache_; // forward 输入缓存（backward 用）
+
+    // ── 量化缓存（F1）：只在**权重变过**时重算 τ/wq ──────────────────────
+    // 判据 = `latent_w_.write_epoch()`（存储级写版本，任何经引擎媒介的参数
+    // 写入都会推进它，见 ComputeEngine::WriteEpochGuard）。为什么必须有：
+    // forward 的调用频率远高于参数更新频率 ——
+    //   · 梯度累积 `--accum-steps N`：一个 optimizer step 有 N 次 forward；
+    //   · 自回归生成：每个 token 每层一次 forward（KV cache 只省注意力）；
+    //   · 激活重计算（checkpoint）会再跑一次 forward。
+    // 缓存不改变数值：同一权重算出的 τ/wq 逐位相同（见
+    // src/write_epoch_test.cpp 的"缓存重算 = 从零重算"逐位断言）。
+    std::uint64_t quant_epoch_ = 0;   // 最近一次量化时 latent_w_ 的写版本
+    bool quant_valid_ = false;        // 首次 forward 必然量化（epoch 0 不参与判定）
+    std::uint64_t quantize_calls_ = 0;  // 量化实际执行次数（诊断/测试用）
 
 public:
     BitLinear(std::size_t in_features, std::size_t out_features)
@@ -113,19 +127,24 @@ public:
     [[nodiscard]] const Tensor& latent_weights() const noexcept { return latent_w_; }
     [[nodiscard]] const Tensor& quantized_weights() const noexcept { return wq_; }
     [[nodiscard]] const Tensor& row_scales() const noexcept { return tau_; }
+    // 量化实际执行次数（诊断/测试：缓存是否生效看它，不看 forward 次数）
+    [[nodiscard]] std::uint64_t quantize_calls() const noexcept { return quantize_calls_; }
 
     void clear_cache() override
     {
+        // 只清**激活**缓存。wq_/τ 是**权重派生物**：有效性由写版本决定
+        // （needs_quantize_），清掉只会让下一次 forward 白算一遍全量权重。
         input_cache_ = Tensor{};
-        tau_ = Tensor{};   // 派生物：重算即可（wq_ 属参数派生物，保留缓冲）
     }
 
     [[nodiscard]] std::vector<TensorRef> activation_cache() override
     {
-        // backward 需要 input_cache_（X）与 tau_（尺度）→ 两者都参与 offload/重算
+        // backward 需要 input_cache_（X）。τ **不在**此列：它是权重派生物
+        // （随写版本缓存），不是激活 —— 列进 offload 会被搬到 host 再搬回
+        // （白付一次搬运），清空后还会让缓存判定失效、触发一次全量重算；
+        // 它只有 (out,1)，常驻代价可忽略。
         std::vector<TensorRef> r;
         if (input_cache_.valid()) r.emplace_back(input_cache_);
-        if (tau_.valid()) r.emplace_back(tau_);
         return r;
     }
 
@@ -137,8 +156,12 @@ public:
             NN_FAIL("bitlinear forward: input shape mismatch");
         if (!checkpoint_mode_)
             input_cache_ = input;
-        // τ / wq 重算失败：直接上抛（不静默沿用上一步的旧缓冲）
-        NN_TRY(q, quantize_weights_());
+        // τ / wq 只在 latent 权重变过时重算（同权重下的 N 次 forward 共享）。
+        // 重算失败：直接上抛（不静默沿用上一步的旧缓冲）。
+        if (needs_quantize_())
+        {
+            NN_TRY(q, quantize_weights_());
+        }
         return dsl::compute(engine,
             dsl::matmul(wq_, input, false, false) * dsl::row_broadcast(tau_)
                 + dsl::row_broadcast(b_),
@@ -186,34 +209,51 @@ public:
     }
 
 private:
+    // 量化派生物是否还有效：写版本相等 ⇒ latent 权重未被写过。
+    // 另外兜底"存储被清"（offload 的 export 会把成员置空、clear_cache 等）：
+    // 那种情况下算一次比用空张量安全。
+    [[nodiscard]] bool needs_quantize_() const noexcept
+    {
+        if (!quant_valid_) return true;
+        if (!wq_.valid() || !tau_.valid()) return true;
+        return quant_epoch_ != latent_w_.write_epoch();
+    }
+
     // ── 量化：τ = 逐行 absmean；wq = RoundClip(W/τ, -1, 1) ───────────────
     // 全程在引擎内（铁律 #12：L2+ 不得把权重读回宿主）：
-    //   1) τ_raw = row_reduce_sum(|W|)          —— 独立一趟归约（GLSL emitter
-    //      不支持把归约视图内联进逐元素 kernel，故用 compute_reduce 单独出向量）；
-    //   2) τ = τ_raw·(1/K)                      —— RParam 承载 1/K（值不进 key）；
-    //   3) wq ← select(|W|>0.5τ 的正负两侧)      —— compute_into 原地写 f16 缓冲。
+    //   1) τ = row_reduce_sum(|W|·(1/K))        —— **一趟**归约出 τ：1/K 折进
+    //      归约操作数（RParam 承载，值不进 key；归约器会重放操作数前缀的
+    //      逐元素指令）。此前是"归约 + 一次 (out,1) 标量缩放"两次 dispatch。
+    //      注：GLSL emitter 不支持把**归约视图**内联进逐元素 kernel，故归约
+    //      必须单独出向量（这条限制与 RParam 无关）。
+    //   2) wq ← select(|W|>0.5τ 的正负两侧)      —— compute_into 原地写 f16 缓冲。
+    // 合计每步每层 2 次 dispatch（原 3 次）、2 趟权重读（4+4 B/元素）+ 1 趟
+    // f16 写（2 B/元素）；见 docs/development/21 §4.11 的字节账。
     [[nodiscard]] Result<void> quantize_weights_()
     {
         ComputeEngine& engine = engine_ref();
         const Scalar inv_in = Scalar{1} / static_cast<Scalar>(in_features_);
 
-        NN_TRY(tau_raw, dsl::compute_reduce(engine,
-            dsl::row_reduce_sum(dsl::abs(dsl::leaf(latent_w_))),
+        NN_TRY(tau, dsl::compute_reduce(engine,
+            dsl::row_reduce_sum(dsl::abs(dsl::leaf(latent_w_)) * dsl::rparam(inv_in)),
             out_features_, in_features_, Precision::F32));
-        NN_TRY(tau, dsl::compute(engine,
-            dsl::leaf(*tau_raw) * dsl::rparam(inv_in),
-            out_features_, 1, Precision::F32));
         tau_ = std::move(*tau);
 
         // RoundClip(W/τ, -1, 1)：DSL 没有 round/floor，但在 [-1,1] 区间内
         // 与"阈值 0.5τ 的两侧 select"等价（BitNet 的定义形式）。
         auto lo = dsl::row_broadcast(tau_) * dsl::rparam(Scalar{-0.5});
         auto hi = dsl::row_broadcast(tau_) * dsl::rparam(Scalar{0.5});
-        return dsl::compute_into(engine,
+        auto r = dsl::compute_into(engine,
             dsl::select(dsl::leaf(latent_w_) > hi,
                         Scalar{1},
                         dsl::select(dsl::leaf(latent_w_) < lo, Scalar{-1}, Scalar{0})),
             wq_);
+        NN_TRY_CHECK(r);
+        // 只有全部成功才登记"派生缓冲对应该写版本"
+        quant_epoch_ = latent_w_.write_epoch();
+        quant_valid_ = true;
+        ++quantize_calls_;
+        return {};
     }
 };
 

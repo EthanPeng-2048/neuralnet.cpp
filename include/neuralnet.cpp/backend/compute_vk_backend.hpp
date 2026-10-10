@@ -295,7 +295,18 @@ private:
     MemoryPool::Allocation alloc_;
     observer_ptr<MemoryPool> pool_;
 
+    // ── 写版本（write epoch）──────────────────────────────────────────────
+    // 与 MatrixT 的 write_epoch_ 同义（见 algebra_matrix.hpp 的说明）：内容
+    // "可能已经变了"的单调计数，唯一推进入口 = ComputeEngine 的写入口护栏。
+    // 放在 GpuBuffer（而不是 GpuTensorT）上：GpuTensorT 存在零拷贝重贴标签
+    // （with_shape）与 import 别名，同一块显存可能有多个 GpuTensorT 句柄 ——
+    // 版本必须随真正存放数据的 buffer 走。
+    std::uint64_t write_epoch_{0};
+
 public:
+    [[nodiscard]] std::uint64_t write_epoch() const noexcept { return write_epoch_; }
+    void mark_content_changed() noexcept { ++write_epoch_; }
+
     GpuBuffer() = default;
 
     GpuBuffer(VkDevice device, VkBuffer buffer, const MemoryPool::Allocation& alloc, MemoryPool& pool)
@@ -307,7 +318,8 @@ public:
 
     // 移动语义
     GpuBuffer(GpuBuffer&& o) noexcept
-        : device_(o.device_), buffer_(o.buffer_), alloc_(o.alloc_), pool_(o.pool_)
+        : device_(o.device_), buffer_(o.buffer_), alloc_(o.alloc_), pool_(o.pool_),
+          write_epoch_(o.write_epoch_)
     {
         o.device_ = VK_NULL_HANDLE;
         o.buffer_ = VK_NULL_HANDLE;
@@ -323,6 +335,7 @@ public:
             std::swap(buffer_, o.buffer_);
             std::swap(alloc_, o.alloc_);
             pool_.swap(o.pool_);
+            std::swap(write_epoch_, o.write_epoch_);
         }
         return *this;
     }
