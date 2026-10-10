@@ -20,6 +20,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <bit>
+#include <cstdint>
 #include <iostream>
 #include <random>
 #include <string>
@@ -267,7 +269,27 @@ void test_bitlinear_rules()
                   "τ = 逐行 absmean（absmax 不是尺度）");
     }
     {
-        const nn::Matrix wq = download(eng, bl.quantized_weights());
+        // 两种缓冲形态都要验：打包路径（2 bit/权重，P2）与 f16 稠密（P1）。
+        // 打包路径经 ternary_pack 解码成同一份"有效三值"，比对**同一套** wq_ref。
+        nn::Matrix wq(OUT, IN);
+        if (bl.uses_packed_weights())
+        {
+            const nn::Matrix packed = download(eng, bl.quantized_weights_packed());
+            const std::size_t words = nn::trit_pack::words_per_row(IN);
+            CHECK(packed.rows() == OUT && packed.cols() == words,
+                  "打包容器形状 (out, ceil(K/16))");
+            for (std::size_t o = 0; o < OUT; ++o)
+            {
+                std::vector<std::uint32_t> row(words);
+                for (std::size_t i = 0; i < words; ++i)
+                    row[i] = std::bit_cast<std::uint32_t>(packed.at(o, i));
+                for (std::size_t k = 0; k < IN; ++k)
+                    wq.set_value(o, k, nn::trit_pack::at(row.data(), k));
+            }
+        }
+        else
+            wq = download(eng, bl.quantized_weights());
+
         bool exact = true, in_set = true;
         for (std::size_t o = 0; o < OUT; ++o)
             for (std::size_t k = 0; k < IN; ++k)
@@ -276,7 +298,7 @@ void test_bitlinear_rules()
                 if (q != wq_ref[o][k]) exact = false;
                 if (!(q == 1.0 || q == 0.0 || q == -1.0)) in_set = false;
             }
-        CHECK(exact, "wq 逐位等于 RoundClip(W/τ,-1,1)");
+        CHECK(exact, "wq 逐位等于 RoundClip(W/τ,-1,1)（打包路径经解码）");
         CHECK(in_set, "wq 取值 ⊂ {-1,0,+1}（f16 精确可表示）");
         // 行0 的三值码位：absmean 保留 0.3（absmax 会把它们全归零）
         CHECK(wq.at(0, 1) == 1.0f && wq.at(0, 2) == -1.0f,
@@ -404,8 +426,12 @@ void test_bitlinear_f16_compute()
             mx = std::max(mx, std::fabs(static_cast<double>(Y.at(o, b)) - acc * tau_ref[o]));
         }
     CHECK(mx < 2e-3, "f16 compute 下结果与 f32 参考一致（f16 舍入内）");
-    // 量化缓冲恒 f16（与 compute 槽无关）
-    CHECK(bl.quantized_weights().precision() == nn::Precision::F16, "wq 缓冲恒 f16");
+    // 量化缓冲形态：打包路径 = f32 容器（2 bit/权重）；否则 f16 稠密缓冲
+    if (bl.uses_packed_weights())
+        CHECK(bl.quantized_weights_packed().precision() == nn::Precision::F32,
+              "打包容器是 f32 原始字容器");
+    else
+        CHECK(bl.quantized_weights().precision() == nn::Precision::F16, "wq 缓冲恒 f16");
     CHECK(bl.latent_weights().precision() == nn::Precision::F32, "latent 恒 f32（STE 落点）");
 }
 
