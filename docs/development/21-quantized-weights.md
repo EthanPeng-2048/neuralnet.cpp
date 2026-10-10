@@ -543,6 +543,13 @@ graph TB
   范围与前置拒绝**完全复用**既有规则（无需新白名单：GPT 全接线，`--model rapt` 前置拒绝，
   `--arch transformer/cnn` 由层能力校验报错）。`--t1_58` 与 `--precision-*` 是同一份 profile
   的两种写法，按参数出现顺序后者覆盖前者（与 `--f16` 同款语义）。
+  **等价性实测（102/40HX，2026-10-10）**：三种写法各跑
+  `text_train datasets/tinystories_bench40.nndataset --gpu … --lr 0 --max-steps 5 --save …`
+  → 产物 SHA256 **逐字节相同**（`5CF7F0E9…CF6B9`，同一条命令重复跑亦相同）。
+  为什么用 `--lr 0`：更新量恒 0 ⇒ 产物 = 确定性初值（`InitSpec.seed` 默认 42 + 创建序号混流，
+  跨进程同序），从而把"profile 等价"与"训练噪声"分离 —— **注意** `text_train` 每个 epoch 用
+  `std::random_device` 播种 shuffle 样本顺序（`src/text_train.cpp:1010/1053`），两次真实训练
+  的权重并不可复现，用产物哈希判等价会得出假阴性。
 - `scan_exprs` 模型 pass 增加两条三值 GPT（`gpt_learned_gelu_ln_t1_58`、
   `gpt_rope_relu2_rms_gqa_subln_tied_t1_58`）。**结构数不变（107 → 107）**：BitLinear 的三段
   结构（τ 的 absmean 归约 / wq 的阈值 select / 去量化点积与 STE 累加）已由 MLP 用例登记。
