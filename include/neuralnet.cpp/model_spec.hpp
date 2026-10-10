@@ -138,6 +138,12 @@ struct ModelSpec
     NormType norm_type = NormType::LayerNorm;                 // 归一化层类型
     NormPlace norm_place = NormPlace::None;                   // 归一化挂载位置（CNN/ViT）
 
+    // ── BitNet b1.58 2B4T 的结构开关（docs/development/22 §4）──────────────
+    // 缺键 → 默认值（= 今天的参数布局，旧文件零破坏；无需升 MODEL_VERSION）。
+    // subln：每个 block 的 attention/FFN **子层内部**各加一个 norm
+    //        （类型 = norm_type；2B4T = RMSNorm，宽 d_model / d_ff）
+    bool subln = false;
+
     // ── 线性层权重是否三值（T1_58；P1 覆盖 MLP 路径）──
     // 缺键 → None（旧文件零破坏）。见 WeightQuant 注释与 docs 21 §4.7。
     WeightQuant weight_quant = WeightQuant::None;
@@ -185,6 +191,7 @@ struct ModelSpec
                a.pos_encoding == b.pos_encoding &&
                a.activation   == b.activation &&
                a.norm_type    == b.norm_type &&
+               a.subln        == b.subln &&
                a.weight_quant == b.weight_quant;
     }
 
@@ -278,7 +285,8 @@ struct ModelSpec
                ",seq_len=" + std::to_string(s.seq_len) +
                ",heads=" + std::to_string(s.num_heads) +
                ",d_ff=" + std::to_string(s.d_ff) +
-               ",layers=" + std::to_string(s.num_layers) + ")";
+               ",layers=" + std::to_string(s.num_layers) +
+               (s.subln ? ",subln=1" : "") + ")";
     }
     if (s.is_cnn())
     {

@@ -40,6 +40,7 @@ struct GptConfig {
     ActivationType activation = ActivationType::GeLU;
     NormType norm_type = NormType::LayerNorm;
     PrecisionProfile precision;  // 模型级精度配置（§9.1，默认全 F32）
+    bool subln = false;          // SubLN（BitNet 2B4T 子层归一化，docs 22 §3.1）
 };
 
 // ── 构建 GPT 模型（GptConfig 版本，推荐使用） ────────────────────────────
@@ -59,7 +60,8 @@ struct GptConfig {
     {
         auto r = model.add<GPTModel>(cfg.vocab_size, cfg.d_model, cfg.seq_len,
                                      cfg.num_heads, cfg.d_ff, cfg.num_layers, cfg.pos_enc,
-                                     cfg.activation, cfg.norm_type, cfg.precision);
+                                     cfg.activation, cfg.norm_type, cfg.precision,
+                                     cfg.subln);
         NN_TRY_CHECK(r);
     }
     return model;
@@ -77,11 +79,12 @@ struct GptConfig {
     PosEncodingType pos_enc_type = PosEncodingType::Learned,
     ActivationType activation = ActivationType::GeLU,
     NormType norm_type = NormType::LayerNorm,
-    PrecisionProfile precision = PrecisionProfile{})
+    PrecisionProfile precision = PrecisionProfile{},
+    bool subln = false)
 {
     return build_gpt_model(engine, GptConfig{
         vocab_size, d_model, seq_len, num_heads, d_ff, num_layers,
-        pos_enc_type, activation, norm_type, precision});
+        pos_enc_type, activation, norm_type, precision, subln});
 }
 
 // ── 从 ModelSpec 构建 GPT 模型 ──────────────────────────────────────────
@@ -99,7 +102,8 @@ struct GptConfig {
         engine,
         spec.vocab_size, spec.d_model, spec.seq_len,
         spec.num_heads, spec.d_ff, spec.num_layers,
-        spec.pos_encoding, spec.activation, spec.norm_type, precision);
+        spec.pos_encoding, spec.activation, spec.norm_type, precision,
+        spec.subln);
     if (model)
         model->set_spec(spec);  // 记录架构规格，供 load_model 校验
     return model;
@@ -115,7 +119,8 @@ struct GptConfig {
     std::size_t num_layers,
     PosEncodingType pos_encoding = PosEncodingType::Learned,
     ActivationType activation = ActivationType::GeLU,
-    NormType norm_type = NormType::LayerNorm)
+    NormType norm_type = NormType::LayerNorm,
+    bool subln = false)
 {
     ModelSpec spec;
     spec.type         = ModelType::GPT;
@@ -128,8 +133,8 @@ struct GptConfig {
     spec.pos_encoding = pos_encoding;
     spec.activation   = activation;
     spec.norm_type    = norm_type;
+    spec.subln        = subln;
     return spec;
 }
 
 } // namespace nn
-

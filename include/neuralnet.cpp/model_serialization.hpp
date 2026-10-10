@@ -296,6 +296,8 @@ template <typename... Ts>
     kv.set("activation",   static_cast<uint64_t>(spec.activation));
     kv.set("norm_type",    static_cast<uint64_t>(spec.norm_type));
     kv.set("norm_place",   static_cast<uint64_t>(spec.norm_place));
+    // subln（BitNet 2B4T 的子层归一化，docs 22）：缺失 → false（旧布局逐位一致）。
+    kv.set("subln",        static_cast<uint64_t>(spec.subln ? 1 : 0));
     // weight_quant（线性层是否 BitLinear/三值）于 P1 引入。旧文件**无此键** →
     // 读回 WeightQuant::None（= 普通 Linear，参数布局逐位一致）→ 无需升版本。
     kv.set("weight_quant", static_cast<uint64_t>(spec.weight_quant));
@@ -367,6 +369,8 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
     if (kv.get("activation", v))  spec.activation   = static_cast<ActivationType>(v);
     if (kv.get("norm_type", v))   spec.norm_type    = static_cast<NormType>(v);
     if (kv.get("norm_place", v))  spec.norm_place   = static_cast<NormPlace>(v);
+    // subln（docs 22 新增）：缺键 → 保持 ModelSpec 默认 subln = false
+    if (kv.get("subln", v))       spec.subln        = (v != 0);
     // weight_quant（P1 新增）：缺键 → 保持 ModelSpec 默认 WeightQuant::None
     if (kv.get("weight_quant", v)) spec.weight_quant = static_cast<WeightQuant>(v);
     // 旧文件的 memory_tokens / window（ZiPT 专用）不再读取，随 type=6 一并拒绝。
