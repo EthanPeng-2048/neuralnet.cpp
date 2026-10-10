@@ -263,6 +263,13 @@ public:
     [[nodiscard]] virtual std::vector<TensorRef> parameters() { return {}; }
     [[nodiscard]] virtual std::vector<TensorRef> param_gradients() { return {}; }
 
+    // 诊断（F2）：梯度缓冲是否已**实际分配**。
+    // 采用惰性梯度分配的层（Linear / BitLinear）在 init 后、第一次
+    // param_gradients()/backward()/zero_grad() 之前返回 false —— 推理路径
+    // （只 forward）应当一直是 false，这也是"推理不为梯度付显存"的可见信号。
+    // 默认 true = "本层不参与惰性方案（梯度随参数一起常驻）"，供未迁移的层沿用。
+    [[nodiscard]] virtual bool grad_buffers_allocated() const noexcept { return true; }
+
 protected:
     // ── 复合层参数收集（消除各复合层 parameters()/param_gradients() 的同构级联）──
     // 按实参顺序拼接若干列表；实参可以是 `Tensor`（隐式变成单元素）或
