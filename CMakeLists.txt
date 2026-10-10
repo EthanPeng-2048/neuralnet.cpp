@@ -474,6 +474,10 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(write_epoch_test src/write_epoch_test.cpp)
     list(APPEND NN_TEST_TARGETS write_epoch_test)
 
+    # ── 三值打包权重 + 量化 GEMM（P2/F3，docs 21 §5 的 P2 验收）──
+    nn_add_executable(ternary_gemm_test src/ternary_gemm_test.cpp)
+    list(APPEND NN_TEST_TARGETS ternary_gemm_test)
+
     # ── 分词器正确性（BPE pre_tokenize 对拍 + 标记往返）─────────────────
     nn_add_executable(tokenizer_test src/tokenizer_test.cpp)
     list(APPEND NN_TEST_TARGETS tokenizer_test)
@@ -615,6 +619,12 @@ if(NN_ENABLE_TESTS)
     if(TARGET write_epoch_test)
         add_test(NAME write_epoch_test_gpu COMMAND write_epoch_test --gpu)
         set_tests_properties(write_epoch_test_gpu PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    # 三值打包 GEMM 的 GPU 变体：打包/解码在设备侧（GpuEngine 接打包路径后生效），
+    # 未接的后端上 BitLinear 自动退回 f16 稠密缓冲（本用例会打印跳过）。无设备 → 77。
+    if(TARGET ternary_gemm_test)
+        add_test(NAME ternary_gemm_test_gpu COMMAND ternary_gemm_test --gpu)
+        set_tests_properties(ternary_gemm_test_gpu PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     foreach(TARGET ${NN_BENCH_TARGETS})
         set_target_properties(${TARGET} PROPERTIES

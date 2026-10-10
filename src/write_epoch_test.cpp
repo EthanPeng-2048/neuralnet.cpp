@@ -209,7 +209,7 @@ void test_write_entries(nn::ComputeEngine& eng, const char* tag)
 // [4]~[7] BitLinear 量化缓存
 // ══════════════════════════════════════════════════════════════════════════
 nn::BitLinear make_bitlinear(nn::ComputeEngine& eng, std::size_t in, std::size_t out,
-                             const nn::Matrix& w)
+                             const nn::Matrix& w, bool packed = false)
 {
     nn::BitLinear bl(in, out);
     nn::PrecisionProfile prof;
@@ -219,6 +219,9 @@ nn::BitLinear make_bitlinear(nn::ComputeEngine& eng, std::size_t in, std::size_t
     NN_ASSERT(r, "BitLinear init failed");
     auto wr = eng.copy_from(bl.parameters()[0].get(), w);
     NN_ASSERT(wr, "BitLinear 权重写入失败");
+    // 本节测的是**缓存**（与缓冲形态正交）：默认强制 f16 稠密路径，好让
+    // `quantized_weights()` 直接可读；打包路径的缓存另有 [7b] 一段。
+    bl.set_ternary_pack_enabled(packed);
     return bl;
 }
 
@@ -358,6 +361,20 @@ void test_bitlinear_cache(nn::ComputeEngine& eng, const char* tag)
         for (std::size_t i = 1; i < outs.size(); ++i)
             CHECK(mat_same(outs[0], outs[i]), "同权重下多次 forward 输出逐位相同");
         CHECK(bl.quantize_calls() == 4, "该轮只量化一次（缓存命中 3 次）");
+    }
+
+    // ── [7b] 打包路径同样命中缓存（F1 × F3 的交叉）────────────────────────
+    if (eng.supports_ternary_gemm())
+    {
+        nn::BitLinear pk = make_bitlinear(eng, IN, OUT, W, /*packed=*/true);
+        CHECK(pk.uses_packed_weights(), "打包路径已启用");
+        auto a = pk.forward(Xt);
+        auto b = pk.forward(Xt);
+        CHECK(a.has_value() && b.has_value(), "打包路径 forward ×2 成功");
+        CHECK(pk.quantize_calls() == 1, "打包路径：同权重两次 forward 只量化一次");
+        if (a.has_value() && b.has_value())
+            CHECK(mat_same(download(eng, *a), download(eng, *b)),
+                  "打包路径缓存命中时输出逐位相同");
     }
 }
 

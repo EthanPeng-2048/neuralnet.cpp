@@ -56,7 +56,13 @@ private:
 
     // ── 量化派生物（每步重算；不落盘、不进序列化）────────────────────────
     Tensor wq_;          // (out_features, in_features) f16，值 ∈ {-1,0,+1}
+    Tensor wq_packed_;   // (out, ceil(in/16)) f32 容器，2 bit/权重（P2/F3 路径）
     Tensor tau_;         // (out_features, 1) f32，逐行 absmean
+
+    // 打包路径开关：由引擎能力（`supports_ternary_gemm()`）决定。false = 退回
+    // f16 稠密缓冲（尚未接打包的后端）；两条路径的数值口径由
+    // src/ternary_gemm_test.cpp 对拍。
+    bool use_packed_ = false;
 
     Tensor input_cache_; // forward 输入缓存（backward 用）
 
@@ -100,13 +106,26 @@ public:
         b_ = engine.create_tensor(out_features_, 1, Precision::F32, InitSpec::zero());
         if (!b_.valid()) NN_FAIL("BitLinear: 偏置初始化失败");
         // 梯度缓冲**不在此分配**（F2）：惰性 + 只训练时分配，见 ensure_grad_()。
-        // 量化缓冲：wq_ 恒 f16（{-1,0,1} 精确可表示；P2 起才改打包存储）
-        wq_ = engine.create_tensor(out_features_, in_features_, Precision::F16,
-                                   InitSpec::zero());
-        if (!wq_.valid()) NN_FAIL("BitLinear: 量化缓冲初始化失败");
+        // 量化缓冲：引擎支持三值 GEMM → 打包容器（2 bit/权重，F3）；否则退回
+        // f16 稠密缓冲（{-1,0,1} 在 f16 下精确可表示）。
+        use_packed_ = engine.supports_ternary_gemm();
+        ensure_quant_buffer_();
         tau_ = engine.create_tensor(out_features_, 1, Precision::F32, InitSpec::zero());
         if (!tau_.valid()) NN_FAIL("BitLinear: 尺度缓冲初始化失败");
         return {};
+    }
+
+    // ── 打包路径开关（逃生阀 / A-B 用）────────────────────────────────────
+    // 引擎支持三值 GEMM 时默认开启；显式传 false 可退回 f16 稠密缓冲（P0/A-B
+    // 对比与回退用）。切换会换缓冲形态 → 必须作废量化缓存、下一次 forward 重算。
+    // 需在 init 之后调用（缓冲分配与 shape 有关）。
+    void set_ternary_pack_enabled(bool enabled)
+    {
+        const bool target = enabled && engine_ref().supports_ternary_gemm();
+        if (target == use_packed_) return;
+        use_packed_ = target;
+        quant_valid_ = false;
+        ensure_quant_buffer_();
     }
 
     // ── 参数视图：latent（f32）+ 偏置（f32）──────────────────────────────
@@ -129,6 +148,13 @@ public:
     [[nodiscard]] const Tensor& latent_weights() const noexcept { return latent_w_; }
     [[nodiscard]] const Tensor& quantized_weights() const noexcept { return wq_; }
     [[nodiscard]] const Tensor& row_scales() const noexcept { return tau_; }
+    // 打包路径（P2/F3）：本层是否用 2 bit/权重的打包缓冲（`quantized_weights()`
+    // 在打包路径下为空 —— 用 `quantized_weights_packed()` + ternary_pack.hpp 解码）
+    [[nodiscard]] bool uses_packed_weights() const noexcept { return use_packed_; }
+    [[nodiscard]] const Tensor& quantized_weights_packed() const noexcept
+    {
+        return wq_packed_;
+    }
     // 量化实际执行次数（诊断/测试：缓存是否生效看它，不看 forward 次数）
     [[nodiscard]] std::uint64_t quantize_calls() const noexcept { return quantize_calls_; }
 
@@ -164,6 +190,15 @@ public:
         {
             NN_TRY(q, quantize_weights_());
         }
+        // 打包路径：Y = (τ∘W)·X 是一趟量化 GEMM（权重读 0.25 B/元素），偏置用
+        // 一次行广播加（原语不带 bias，见 compute_engine.hpp 的说明）。
+        if (use_packed_)
+        {
+            NN_TRY(y, engine.matmul_q(wq_packed_, tau_, input, p_.compute));
+            return dsl::compute(engine,
+                dsl::leaf(*y) + dsl::row_broadcast(b_),
+                out_features_, input.cols(), p_.compute);
+        }
         return dsl::compute(engine,
             dsl::matmul(wq_, input, false, false) * dsl::row_broadcast(tau_)
                 + dsl::row_broadcast(b_),
@@ -180,15 +215,27 @@ public:
         if (!tau_.valid() || !input_cache_.valid())
             NN_FAIL("bitlinear backward: 必须先 forward（τ/输入缓存未建立）");
 
-        // dX = wqᵀ·(dY∘τ)：τ 是逐输出通道的，必须先落到 dY 的行上再左乘
-        //（不能提到 matmul 外面——τ_o 在求和维内）。
-        NN_TRY(dy_scaled, dsl::compute(engine,
-            dsl::leaf(grad_output) * dsl::row_broadcast(tau_),
-            out_features_, grad_output.cols(), p_.compute));
-        auto grad_input = dsl::compute(engine,
-            dsl::matmul(wq_, *dy_scaled, /*transA=*/true, false),
-            in_features_, grad_output.cols(), p_.compute);
-        NN_TRY_CHECK(grad_input);
+        // dX = (τ∘W)ᵀ·dY：τ 是逐输出通道的（落在求和维内），必须在内核里按
+        // 存储行取 —— 打包路径直接一趟量化 GEMM（顺带省掉了 dy_scaled 中间量）。
+        Tensor grad_input;
+        if (use_packed_)
+        {
+            NN_TRY(gi, engine.matmul_q_t(wq_packed_, tau_, grad_output,
+                                         in_features_, p_.compute));
+            grad_input = std::move(*gi);
+        }
+        else
+        {
+            // f16 稠密缓冲路径：τ 先落到 dY 的行上再左乘（等价形式）
+            NN_TRY(dy_scaled, dsl::compute(engine,
+                dsl::leaf(grad_output) * dsl::row_broadcast(tau_),
+                out_features_, grad_output.cols(), p_.compute));
+            auto gi = dsl::compute(engine,
+                dsl::matmul(wq_, *dy_scaled, /*transA=*/true, false),
+                in_features_, grad_output.cols(), p_.compute);
+            NN_TRY_CHECK(gi);
+            grad_input = std::move(*gi);
+        }
 
         // dW += (dY·Xᵀ)∘τ（STE：∂wq/∂W ≡ 1，再乘去量化尺度 τ）
         // matmul 段 + 逐行缩放 + 原地累加融合为单次 dispatch（与 Linear 同构）。
@@ -212,6 +259,31 @@ public:
     }
 
 private:
+    // 按当前模式准备量化缓冲（另一形态释放：两种容器不共存，避免推理期为
+    // 用不到的形态付显存）。
+    void ensure_quant_buffer_()
+    {
+        ComputeEngine& engine = engine_ref();
+        if (use_packed_)
+        {
+            if (!wq_packed_.valid())
+                wq_packed_ = engine.create_tensor(
+                    out_features_, nn::trit_pack::words_per_row(in_features_),
+                    Precision::F32, InitSpec::zero());
+            // 终止式检查（本函数返回 void）
+            NN_CHECK(wq_packed_.valid(), "BitLinear: 打包量化缓冲初始化失败");
+            wq_ = Tensor{};
+        }
+        else
+        {
+            if (!wq_.valid())
+                wq_ = engine.create_tensor(out_features_, in_features_, Precision::F16,
+                                           InitSpec::zero());
+            NN_CHECK(wq_.valid(), "BitLinear: 量化缓冲初始化失败");
+            wq_packed_ = Tensor{};
+        }
+    }
+
     // ── 梯度缓冲：惰性分配（F2）────────────────────────────────────────────
     // 三值层的梯度**恒 f32**（STE 落点 + 优化器状态，见 §4.3.2），即 4 B/权重
     // —— 在推理足迹（latent 4 + wq 2 + grad 4 = 10 B/权重）里占 40%；2B 参数
@@ -236,7 +308,8 @@ private:
     [[nodiscard]] bool needs_quantize_() const noexcept
     {
         if (!quant_valid_) return true;
-        if (!wq_.valid() || !tau_.valid()) return true;
+        if (!tau_.valid()) return true;
+        if (use_packed_ ? !wq_packed_.valid() : !wq_.valid()) return true;
         return quant_epoch_ != latent_w_.write_epoch();
     }
 
@@ -259,6 +332,18 @@ private:
             dsl::row_reduce_sum(dsl::abs(dsl::leaf(latent_w_)) * dsl::rparam(inv_in)),
             out_features_, in_features_, Precision::F32));
         tau_ = std::move(*tau);
+
+        // 打包路径（F3）：一趟 trit_pack 直接出 2 bit/权重容器（8.25 B/元素
+        // 流量 vs f16 缓冲路径的 10 B/元素，且常驻从 2 B → 0.25 B/权重）。
+        if (use_packed_)
+        {
+            NN_TRY(packed, engine.trit_pack(latent_w_, tau_));
+            wq_packed_ = std::move(*packed);
+            quant_epoch_ = latent_w_.write_epoch();
+            quant_valid_ = true;
+            ++quantize_calls_;
+            return {};
+        }
 
         // RoundClip(W/τ, -1, 1)：DSL 没有 round/floor，但在 [-1,1] 区间内
         // 与"阈值 0.5τ 的两侧 select"等价（BitNet 的定义形式）。

@@ -1044,6 +1044,73 @@ public:
     }
 
     // ══════════════════════════════════════════════════════════════════════
+    // 三值打包权重（P2 / F3）：trit_pack + matmul_q
+    //
+    // BitLinear 的"有效权重"是 τ∘W（W 三值、τ 逐行 absmean）。打包后权重容器
+    // 只占 **0.25 B/权重**（f16 稠密缓冲 2 B/权重），代价是必须由专用内核解码
+    // —— docs/development/21 §4.6 的"T1_58 张量只进量化 GEMM"在这里落地为
+    // "打包容器只进 matmul_q"（布局见 ternary_pack.hpp）。
+    //
+    //   trit_pack(w (R,K) f32, τ (R,1) f32) → 容器 (R, ceil(K/16)) f32
+    //   matmul_q  (容器, τ, B)          → C = (τ∘W)·B   （W = (M,K)，M=R）
+    //   matmul_q_t(容器, τ, B, out_rows) → C = (τ∘W)^T·B（A 存为 (K,M)，即 W
+    //                                         本身 (out,in) 按 A^T 用 ——
+    //                                         反向的 dX 走这条）
+    //   τ 恒按**存储行**（= W 的输出通道）取：两条路径同一口径，内核无需分支。
+    //   入口不带 bias（BitLinear 在调用点用一次 row_broadcast 加）—— 保持原语
+    //   最小；把 bias 折进 shader 是后续可选优化（省一次 (out,batch) dispatch）。
+    //
+    // 能力：`supports_ternary_gemm()` false 的引擎（尚未接打包的 GPU 后端）
+    //   一律 fail-fast，BitLinear 会退回 f16 稠密缓冲路径，不会静默走错。
+    // ══════════════════════════════════════════════════════════════════════
+    [[nodiscard]] virtual bool supports_ternary_gemm() const noexcept { return false; }
+
+    [[nodiscard]] Result<Tensor> trit_pack(const Tensor& w, const Tensor& scale)
+    {
+        NN_TRY(ec, bind_check_({&w, &scale}));
+        if (!supports_ternary_gemm())
+            NN_FAIL("trit_pack: 该引擎不支持三值打包（docs 21 §5 P2）");
+        return stamp_(trit_pack_impl(w, scale));
+    }
+
+    [[nodiscard]] Result<Tensor> matmul_q(const Tensor& packed, const Tensor& scale,
+                                          const Tensor& B,
+                                          Precision P = Precision::F32)
+    {
+        return matmul_q_dispatch_(packed, scale, B, /*transA=*/false, /*out_rows=*/0,
+                                  P);
+    }
+
+    // C = (τ∘W)^T·B：A 存储为 (K, M)（= W 的 (out, in)），out_rows = M。
+    [[nodiscard]] Result<Tensor> matmul_q_t(const Tensor& packed, const Tensor& scale,
+                                            const Tensor& B, std::size_t out_rows,
+                                            Precision P = Precision::F32)
+    {
+        return matmul_q_dispatch_(packed, scale, B, /*transA=*/true, out_rows, P);
+    }
+
+private:
+    [[nodiscard]] Result<Tensor> matmul_q_dispatch_(const Tensor& packed,
+                                                    const Tensor& scale,
+                                                    const Tensor& B, bool transA,
+                                                    std::size_t out_rows, Precision P)
+    {
+        NN_TRY(ec, bind_check_({&packed, &scale, &B}));
+        if (!supports_ternary_gemm())
+            NN_FAIL("matmul_q: 该引擎不支持三值 GEMM（docs 21 §5 P2）");
+        // 打包容器恒 f32 容器；B 为 f16 时抬 f32 计算、结果按 P 落回（同
+        // matmul_with_bias 的边界 cast 口径）。带类型（in-kernel f16）变体留待
+        // 需要时按 matmul 的先例加。
+        auto b32 = to_f32(B);
+        NN_TRY_CHECK(b32);
+        NN_TRY(raw, matmul_q_impl(packed, scale, *b32, transA, out_rows,
+                                 Precision::F32));
+        return stamp_(to_prec(std::move(*raw), P));
+    }
+
+public:
+
+    // ══════════════════════════════════════════════════════════════════════
     // 扫描级原语（带状态的顺序归约 + matvec 读出；RLA 线性注意力积木）
     //
     // 引擎只提供"前缀/后缀顺序归约 + matvec 读出"；RLA 算法（L2 归一化
@@ -1527,6 +1594,25 @@ protected:
     [[nodiscard]] virtual Result<Tensor> matmul_impl(
         const Tensor& A, const Tensor& B,
         bool transA, bool transB, Precision P) = 0;
+
+    // 三值打包权重（P2 / F3）：语义见公共入口 trit_pack / matmul_q 的说明。
+    // 默认 = 引擎未接打包路径（fail-fast），与 supports_ternary_gemm() 的默认
+    // false 一致 —— 上层（BitLinear）据此退回 f16 稠密缓冲。
+    [[nodiscard]] virtual Result<Tensor> trit_pack_impl(const Tensor& w,
+                                                        const Tensor& scale)
+    {
+        (void)w; (void)scale;
+        NN_FAIL("trit_pack: 该引擎未实现三值打包");
+    }
+    [[nodiscard]] virtual Result<Tensor> matmul_q_impl(const Tensor& packed,
+                                                      const Tensor& scale,
+                                                      const Tensor& B, bool transA,
+                                                      std::size_t out_rows,
+                                                      Precision P)
+    {
+        (void)packed; (void)scale; (void)B; (void)transA; (void)out_rows; (void)P;
+        NN_FAIL("matmul_q: 该引擎未实现三值 GEMM");
+    }
     [[nodiscard]] virtual Result<Tensor> batched_matmul_impl(
         const Tensor& A, const Tensor& B,
         std::size_t batch,

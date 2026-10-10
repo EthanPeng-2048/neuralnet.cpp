@@ -9,6 +9,7 @@
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <algorithm>
+#include <bit>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -17,6 +18,7 @@
 #include "expr_opt.hpp"
 #include "expr_registry.hpp" // scan 模式融合 kernel 登记（NN_EXPR_SCAN）
 #include "expr_dsl.hpp"      // matmul_with_bias 经 DSL 融合（单一事实源）
+#include "ternary_pack.hpp"  // 三值打包布局（trit_pack / matmul_q，P2）
 
 namespace nn
 {
@@ -565,6 +567,145 @@ public:
     // ══════════════════════════════════════════════════════════════════════
     // 矩阵级原语
     // ══════════════════════════════════════════════════════════════════════
+
+    // ── 三值打包权重（P2 / F3）：打包 + 量化 GEMM（CPU 参考实现）──────────
+    // 语义与布局：compute_engine.hpp 的 trit_pack / matmul_q、ternary_pack.hpp。
+    // 解码只在"逐存储行"上做一次（一行 16 个权重共享一个 32-bit 字，解码一遍
+    // 进小缓冲，之后按标量 FMA 复用）—— 既不物化 4 B/权重的 f32 副本，也不
+    // 让内层循环反复移位。
+    [[nodiscard]] bool supports_ternary_gemm() const noexcept override { return true; }
+
+    [[nodiscard]] Result<Tensor> trit_pack_impl(const Tensor& w,
+                                                const Tensor& scale) override
+    {
+        if (!w.is_cpu() || !scale.is_cpu())
+            NN_FAIL("trit_pack: tensors are not CPU");
+        if (w.precision() != Precision::F32 || scale.precision() != Precision::F32)
+            NN_FAIL("trit_pack: 需要 f32 权重 + f32 尺度");
+        if (scale.rows() != w.rows() || scale.cols() != 1)
+            NN_FAIL("trit_pack: τ 形状必须是 (rows,1)");
+        const std::size_t rows = w.rows(), k = w.cols();
+        const std::size_t words = nn::trit_pack::words_per_row(k);
+        // 输出被完整写满（逐行 pack_row）→ 未初始化构造
+        Tensor out = Tensor::cpu(rows, words);
+        const Matrix& wm = w.cpu_matrix();
+        const Matrix& sm = scale.cpu_matrix();
+        Matrix& om = out.cpu_matrix();
+        const auto w_span = wm.span();
+        auto o_span = om.span();
+        std::vector<std::uint32_t> buf(words);
+        for (std::size_t r = 0; r < rows; ++r)
+        {
+            nn::trit_pack::pack_row(w_span.data() + r * k, k, sm.at(r, 0), buf.data());
+            // 容器是 f32 张量、内容按原始字解释（little-endian；Vulkan/本仓目标
+            // 平台均为 LE）——不做任何浮点运算。
+            for (std::size_t i = 0; i < words; ++i)
+                o_span[r * words + i] = std::bit_cast<float>(buf[i]);
+        }
+        return out;
+    }
+
+    [[nodiscard]] Result<Tensor> matmul_q_impl(const Tensor& packed,
+                                               const Tensor& scale, const Tensor& B,
+                                               bool transA, std::size_t out_rows,
+                                               Precision P) override
+    {
+        if (!packed.is_cpu() || !scale.is_cpu() || !B.is_cpu())
+            NN_FAIL("matmul_q: tensors are not CPU");
+        if (P != Precision::F32)
+            NN_FAIL("matmul_q: CPU 实现恒 f32（边界 cast 在入口层）");
+        if (packed.precision() != Precision::F32 || scale.precision() != Precision::F32 ||
+            B.precision() != Precision::F32)
+            NN_FAIL("matmul_q: 需要 f32 容器/尺度/操作数");
+
+        const std::size_t N = B.cols();
+        // A 的"存储行长"（每行多少个三值）：transA=0 是 K（求和维），transA=1
+        // 是 M（输出维）。
+        const std::size_t M = transA ? out_rows : packed.rows();
+        const std::size_t K = transA ? packed.rows() : B.rows();
+        const std::size_t a_len = transA ? M : K;
+        if (transA)
+        {
+            if (out_rows == 0) NN_FAIL("matmul_q_t: out_rows 必须显式给出");
+            if (B.rows() != K) NN_FAIL("matmul_q_t: B 行数 != 打包 A 的行数 K");
+        }
+        else if (B.rows() != K)
+            NN_FAIL("matmul_q: B 行数 != A 的列数 K");
+        if (nn::trit_pack::words_per_row(a_len) != packed.cols())
+            NN_FAIL("matmul_q: 打包容器列数与 (K/M) 不匹配");
+        if (scale.rows() != packed.rows() || scale.cols() != 1)
+            NN_FAIL("matmul_q: τ 形状必须与打包 A 的行数一致");
+
+        Tensor out = Tensor::cpu_uninitialized(M, N);
+        const Matrix& pm = packed.cpu_matrix();
+        const Matrix& sm = scale.cpu_matrix();
+        const Matrix& bm = B.cpu_matrix();
+        Matrix& om = out.cpu_matrix();
+        const auto p_span = pm.span();
+        const auto s_span = sm.span();
+        const auto b_span = bm.span();
+        auto o_span = om.span();
+
+        // 每次调用一次的"一行解码"小缓冲（16 个权重/字，逐行解码一遍即可）
+        std::vector<float> a_row(a_len);
+        const std::size_t wpr = nn::trit_pack::words_per_row(a_len);
+
+        if (!transA)
+        {
+            // C[m,n] = τ_m · Σ_k trit(m,k)·B[k,n]
+            for (std::size_t m = 0; m < M; ++m)
+            {
+                const float* pw = p_span.data() + m * wpr;
+                const float tau = s_span[m];
+                for (std::size_t i = 0; i < a_len; ++i)
+                {
+                    const std::uint32_t word =
+                        std::bit_cast<std::uint32_t>(pw[i / nn::trit_pack::kPerWord]);
+                    const std::uint32_t code =
+                        (word >> (nn::trit_pack::kBits *
+                                  (i % nn::trit_pack::kPerWord))) &
+                        nn::trit_pack::kMask;
+                    a_row[i] = tau * nn::trit_pack::value_of(code);
+                }
+                for (std::size_t n = 0; n < N; ++n)
+                {
+                    float acc = 0.0f;
+                    for (std::size_t k = 0; k < K; ++k)
+                        acc += a_row[k] * b_span[k * N + n];
+                    o_span[m * N + n] = acc;
+                }
+            }
+        }
+        else
+        {
+            // C[m,n] = τ_k · Σ_k trit(k,m)·B[k,n]（A 存为 (K,M)）
+            for (std::size_t m = 0; m < M; ++m)
+                for (std::size_t n = 0; n < N; ++n) o_span[m * N + n] = 0.0f;
+            for (std::size_t k = 0; k < K; ++k)
+            {
+                const float* pw = p_span.data() + k * wpr;
+                const float tau = s_span[k];
+                for (std::size_t i = 0; i < a_len; ++i)
+                {
+                    const std::uint32_t word =
+                        std::bit_cast<std::uint32_t>(pw[i / nn::trit_pack::kPerWord]);
+                    const std::uint32_t code =
+                        (word >> (nn::trit_pack::kBits *
+                                  (i % nn::trit_pack::kPerWord))) &
+                        nn::trit_pack::kMask;
+                    a_row[i] = tau * nn::trit_pack::value_of(code);
+                }
+                const float* brow = b_span.data() + k * N;
+                for (std::size_t n = 0; n < N; ++n)
+                {
+                    const float bc = brow[n];
+                    for (std::size_t m = 0; m < M; ++m)
+                        o_span[m * N + n] += a_row[m] * bc;
+                }
+            }
+        }
+        return out;
+    }
 
     [[nodiscard]] Result<Tensor> matmul_impl(
         const Tensor& A, const Tensor& B,
