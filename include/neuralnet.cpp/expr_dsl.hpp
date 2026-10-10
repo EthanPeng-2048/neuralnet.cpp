@@ -1531,9 +1531,12 @@ template <typename E>
 
 // ── CPU 侧"写进目标张量"（f16 目标 → f32 参考求值 + 舍入写回，§7.2）────────
 // f32 目标 = 直通 span 写入（零额外拷贝）。
+// 写版本：本函数是 DSL 在 CPU 上**绕过 ComputeEngine 写入口**的唯一落点，
+// 故出口处自己记账（TensorAccess::mark_written）—— 参数派生物缓存依赖它。
 template <typename E>
 inline void eval_into_tensor_cpu(const E& e, Tensor& dst)
 {
+    TensorAccess::mark_written(dst);
     static const auto dbg_max = [](const Matrix& m)
     {
         double mx = 0.0;

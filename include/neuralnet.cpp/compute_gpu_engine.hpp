@@ -325,6 +325,7 @@ public:
     // GPU 路径用 vkCmdCopyBuffer / cast 原语直接写 dst 的既有 buffer，无分配。
     [[nodiscard]] Result<void> copy_into(Tensor& dst, const Tensor& src) override
     {
+        WriteEpochGuard wg{dst};
         if (dst.rows() != src.rows() || dst.cols() != src.cols())
             NN_FAIL("copy_into: shape mismatch");
         if (dst.precision() != src.precision())
@@ -361,6 +362,7 @@ public:
 
     [[nodiscard]] Result<void> cast_into(const Tensor& src, Tensor& dst) override
     {
+        WriteEpochGuard wg{dst};
         if (dst.rows() != src.rows() || dst.cols() != src.cols())
             NN_FAIL("cast_into: shape mismatch");
         if (src.precision() == dst.precision())

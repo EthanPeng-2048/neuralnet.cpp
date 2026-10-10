@@ -434,12 +434,56 @@ public:
         return {};
     }
 
+protected:
+    // ══════════════════════════════════════════════════════════════════════
+    // 写版本护栏（WriteEpochGuard）—— 参数派生缓冲的失效依据
+    //
+    // 问题：Layer 的"参数派生物"（BitLinear 的 τ/wq）只在**参数变过**时才需要
+    // 重算，而 forward 每步都会被调用（梯度累积 N 次、自回归生成每 token 一次
+    // ——见 docs/development/21 §4.11）。判断"变没变"必须有一个便宜且**不漏
+    // 报**的信号。
+    //
+    // 机制：Tensor 的存储对象（MatrixT / GpuBuffer）持有一个单调计数
+    // `write_epoch`；**每一个"经引擎媒介写入张量存储"的公共入口**在首行放一个
+    // Guard，函数返回（成功或失败）时把目标张量的写版本 +1。派生缓冲记下
+    // "我算它时的版本"，版本相同即内容未变。
+    //
+    // 三条性质（为什么可信）：
+    //   1. **不遗漏**：库内所有写入都经引擎（M1/铁律 #11 由编译器保证存储
+    //      访问器私有）；本类里每一个写入口都有 Guard（`bench/doc_inventory.ps1`
+    //      的审计 + `src/write_epoch_test.cpp` 逐入口断言）。
+    //   2. **别名安全**：版本记在存储对象上（不是 Tensor 上），Tensor 拷贝 /
+    //      GPU with_shape 重贴标签 / import 零拷贝别名共享同一计数。
+    //   3. **单调**：只前进（整对象替换走 `inherit_write_epoch_` 抬到两端较大
+    //      者之后），故"替换后恰好等于旧值"的假命中不可能发生。
+    // 代价：写入路径多一次自增；失败返回也会推进（保守方向 —— 多算一次派生
+    // 缓冲，不会用旧值）。
+    // ──────────────────────────────────────────────────────────────────────
+    static void mark_written_(Tensor& t) noexcept { t.touch_write_epoch_(); }
+
+    class WriteEpochGuard
+    {
+    public:
+        explicit WriteEpochGuard(Tensor& t) noexcept : t_(&t) {}
+        WriteEpochGuard(const WriteEpochGuard&) = delete;
+        WriteEpochGuard& operator=(const WriteEpochGuard&) = delete;
+        ~WriteEpochGuard() { mark_written_(*t_); }
+
+    private:
+        Tensor* t_;
+    };
+
+public:
     // 批量写：src 覆盖 t 的既有存储（不替换对象、不改形状/精度）。
     // 与 copy_from 的分工：copy_from 收 f32 Matrix（含 f32→f16 转换填充，
     // 序列化加载用）；write 收与张量精度严格一致的 span（U2）。
     // 形参用 span<T> 而非 span<const T>：模板实参推导中 "const T" 无法与
     // 非 const 的 span<Scalar> 匹配（推导失败），故这里收 span<T>、静态断言
     // 只校验去 cv 后的元素类型；src 只读。
+    //
+    // ⚠ 本函数（以及下面每一个"写张量存储"的公共入口）首行的
+    //   `WriteEpochGuard` 是**契约的一部分**，不要删：参数派生缓冲
+    //   （BitLinear 的三值权重）靠写版本判断"要不要重算"，见下方说明。
     template <class T>
     [[nodiscard]] Result<void> write(Tensor& t, std::span<T> src)
     {
@@ -447,6 +491,7 @@ public:
         static_assert(std::is_same_v<Elem, Scalar> || std::is_same_v<Elem, f16>,
                       "write: span 元素类型必须是 nn::Scalar(float) 或 nn::f16（U2 精确匹配）");
         NN_TRY(ec, bind_check_({&t}));
+        WriteEpochGuard wg{t};   // 写版本（见 guard 注释）
         constexpr Precision want =
             std::is_same_v<Elem, f16> ? Precision::F16 : Precision::F32;
         if (t.precision() != want)
@@ -525,6 +570,7 @@ public:
                                          Scalar v)
     {
         NN_TRY(ec, bind_check_({&t}));
+        WriteEpochGuard wg{t};
         if (row >= t.rows() || col >= t.cols())
             NN_FAIL("set_index: (row, col) 越界");
         const std::size_t idx = row * t.cols() + col;
@@ -682,6 +728,7 @@ public:
     [[nodiscard]] Result<void> copy_from(Tensor& dst, const Matrix& src)
     {
         NN_TRY(ec, bind_check_({&dst}));
+        WriteEpochGuard wg{dst};
         if (dst.precision() == Precision::F32)
             return copy_from_impl(dst, src);
         auto t = from_matrix(src, Precision::F32);
@@ -712,6 +759,7 @@ public:
         Tensor& dst, std::size_t dst_start_row, const Tensor& src)
     {
         NN_TRY(ec, bind_check_({&dst, &src}));
+        WriteEpochGuard wg{dst};
         if (dst.precision() != Precision::F32 && dst.precision() == src.precision() &&
             supports_native_data_move())
             return insert_rows_impl(dst, dst_start_row, src);
@@ -756,6 +804,7 @@ public:
         Tensor& dst, const Tensor& indices, const Tensor& grad)
     {
         NN_TRY(ec, bind_check_({&dst, &indices, &grad}));
+        WriteEpochGuard wg{dst};
         if (dst.precision() == Precision::F32 && grad.precision() == Precision::F32)
             return scatter_add_rows_impl(dst, indices, grad);
         // 原生 f16（GPU：打包 half CAS 变体；无 pipeline 时引擎内 cast 回退）
@@ -933,6 +982,7 @@ public:
     [[nodiscard]] Result<void> accumulate(Tensor& dst, const Tensor& src)
     {
         NN_TRY(ec, bind_check_({&dst, &src}));
+        WriteEpochGuard wg{dst};
         const bool dbg = prec_env_flag("NN_F16_DEBUG");
         const auto mx = [this](const Tensor& t)
         {
@@ -967,6 +1017,7 @@ public:
     [[nodiscard]] Result<void> add_inplace(Tensor& A, const Tensor& B)
     {
         NN_TRY(ec, bind_check_({&A, &B}));
+        WriteEpochGuard wg{A};
         return inplace2_(A, B, [this](Tensor& a, const Tensor& b)
         {
             return add_inplace_impl(a, b);
@@ -977,6 +1028,7 @@ public:
     [[nodiscard]] Result<void> scale_inplace(Tensor& A, Scalar s)
     {
         NN_TRY(ec, bind_check_({&A}));
+        WriteEpochGuard wg{A};
         return inplace1_(A, [this, s](Tensor& a) { return scale_inplace_impl(a, s); });
     }
 
@@ -984,6 +1036,7 @@ public:
     [[nodiscard]] Result<void> zero(Tensor& A)
     {
         NN_TRY(ec, bind_check_({&A}));
+        WriteEpochGuard wg{A};
         // 原生 f16 清零：fill_zero 是字节级原语（每步 zero_grad 调用 N 次）
         if (A.precision() != Precision::F32 && supports_native_data_move())
             return zero_impl(A);
@@ -1300,6 +1353,7 @@ public:
     {
         NN_TRY(ec, bind_check_(inputs));
         NN_TRY(ec2, bind_check_({&out}));
+        WriteEpochGuard wg{out};
         trace_variant_(spec, inputs, out.precision());
         if (out.precision() == Precision::F32 && all_f32(inputs))
         {

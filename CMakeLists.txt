@@ -470,6 +470,10 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(bitnet_struct_test src/bitnet_struct_test.cpp)
     list(APPEND NN_TEST_TARGETS bitnet_struct_test)
 
+    # ── 写版本（write epoch）契约 + BitLinear 量化缓存（docs 21 §4.11）──
+    nn_add_executable(write_epoch_test src/write_epoch_test.cpp)
+    list(APPEND NN_TEST_TARGETS write_epoch_test)
+
     # ── 分词器正确性（BPE pre_tokenize 对拍 + 标记往返）─────────────────
     nn_add_executable(tokenizer_test src/tokenizer_test.cpp)
     list(APPEND NN_TEST_TARGETS tokenizer_test)
@@ -605,6 +609,12 @@ if(NN_ENABLE_TESTS)
     if(TARGET bitnet_struct_test)
         add_test(NAME bitnet_struct_test_gpu COMMAND bitnet_struct_test --gpu)
         set_tests_properties(bitnet_struct_test_gpu PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    # 写版本 + BitLinear 量化缓存的 GPU 变体：写版本记在 GpuBuffer 上（别名
+    # 安全），且缓存命中路径不得绕过 AOT 闭合世界。无 Vulkan 构建/无设备 → 77。
+    if(TARGET write_epoch_test)
+        add_test(NAME write_epoch_test_gpu COMMAND write_epoch_test --gpu)
+        set_tests_properties(write_epoch_test_gpu PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     foreach(TARGET ${NN_BENCH_TARGETS})
         set_target_properties(${TARGET} PROPERTIES
