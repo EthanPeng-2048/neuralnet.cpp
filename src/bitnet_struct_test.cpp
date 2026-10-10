@@ -9,6 +9,11 @@
 //   [4] 规格往返：subln 被 spec 记住 → 重建 → 前向一致
 //   [5] spec_matches：subln 不同 → 不一致（防错载）
 //   [6] 端到端小训练收敛（CPU；`--gpu` 时在 GPU 上跑）
+//   [7]-[13] GQA / tied embedding / ReLU²（见各段标题）
+//   [14] 三值 GPT 接线：BitLinear 覆盖 4 投影 + fc1/fc2 + LM head
+//        （参数张量形状与 f32 基线逐一相同、全部参数梯度非零）
+//   [15] 真实 BitNet（2B4T 形状）端到端训练：CE + AdamW + 三值
+//        （subln/GQA/tied/ReLU² 全开；CPU 必跑，`--gpu` 时比对 CPU/GPU 末步 loss）
 //
 // 退出码：0 = 通过，1 = 失败，77 = 跳过（--gpu 且无设备）
 // ───────────────────────────────────────────────────────────────────────────
@@ -787,6 +792,184 @@ bool test_training(nn::ComputeEngine& eng, const char* tag)
     return true;
 }
 
+// ── 真实 LM 任务的数据：token 序列满足 next = (cur + 1) % V ──────────────-
+// 因果注意力 + 位置编码可学（把"当前 token + 1"写进 logits）→ 真语言模型目标，
+// 而不是"拟合一组随机目标"。输入 Matrix(seq, batch)（position-major 源布局），
+// 标签按 **batch-major** 平坦索引（i = b*seq + t，与 logits 列序一致，铁律 #5）。
+struct BitnetData
+{
+    nn::Matrix x;                     // (seq, batch) token ids
+    std::vector<std::size_t> labels;  // batch-major：i = b*seq + t
+};
+
+[[nodiscard]] BitnetData make_bitnet_data(std::size_t V, std::size_t S,
+                                          std::size_t B, unsigned seed)
+{
+    BitnetData d;
+    d.x = nn::Matrix(S, B);
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> ud(0, static_cast<int>(V) - 1);
+    for (std::size_t t = 0; t < S; ++t)
+        for (std::size_t b = 0; b < B; ++b)
+            d.x.span()[t * B + b] = static_cast<float>(ud(rng));
+    d.labels.assign(S * B, 0);
+    for (std::size_t b = 0; b < B; ++b)
+        for (std::size_t t = 0; t < S; ++t)
+        {
+            const std::size_t cur =
+                static_cast<std::size_t>(d.x.span()[t * B + b]);
+            d.labels[b * S + t] = (cur + 1) % V;
+        }
+    return d;
+}
+
+// ── [14] 三值 GPT 接线：BitLinear 覆盖 4 个投影 + fc1/fc2 + LM head ───────-
+// P1.5（docs/development/21-quantized-weights.md §4.8.3）：线性层走
+// make_linear_layer → 参数形状与 f32 基线**逐张量一致**（drop-in 语义），
+// 前向/反向跑通且权重梯度非零（STE 把梯度送回 f32 latent）。
+void test_gpt_ternary_wiring()
+{
+    std::puts("[14] 三值 GPT：BitLinear 接线（形状一致 + 梯度非零）");
+    nn::CpuEngine eng;
+    const std::size_t V = 32, D = 32, S = 8, H = 4, KV = 2, FF = 64, L = 2, B = 2;
+
+    const nn::PrecisionProfile f32p;
+    nn::PrecisionProfile t1 = f32p;
+    t1.param = nn::Precision::T1_58;
+
+    const auto build = [&](const nn::PrecisionProfile& pp) {
+        return nn::build_gpt_model(eng, V, D, S, H, FF, L,
+                                   nn::PosEncodingType::RoPE,
+                                   nn::ActivationType::ReLU2, nn::NormType::RMSNorm,
+                                   pp, /*subln=*/true, /*n_head_kv=*/KV,
+                                   /*tie_embeddings=*/false);
+    };
+    auto base = build(f32p);
+    auto tern = build(t1);
+    CHECK(base.has_value() && tern.has_value(),
+          "三值 GPT 构建+init 成功（4 投影/fc1/fc2/LM head 均 BitLinear）");
+    if (!base.has_value() || !tern.has_value())
+    {
+        if (!tern.has_value())
+            std::printf("    init 失败: %s\n", tern.error().message.c_str());
+        return;
+    }
+
+    const auto& pb = base->parameters();
+    const auto& pt = tern->parameters();
+    bool same = (pb.size() == pt.size());
+    for (std::size_t i = 0; same && i < pb.size(); ++i)
+        same = (pb[i].get().rows() == pt[i].get().rows() &&
+                pb[i].get().cols() == pt[i].get().cols());
+    std::printf("    参数：%zu 张量 / %zu 标量（f32 基线 %zu / %zu）\n",
+                pt.size(), count_params(pt), pb.size(), count_params(pb));
+    CHECK(same, "逐张量形状与 f32 基线一致（BitLinear latent 恒 f32）");
+    CHECK(count_params(pb) == count_params(pt), "参数量一致");
+
+    // 一步真实 CE 反向：全部参数张量必须拿到非零梯度
+    const BitnetData data = make_bitnet_data(V, S, B, 3u);
+    const nn::Tensor xt = upload(eng, data.x);
+    nn::CrossEntropyLoss ce;
+    ce.set_precision_profile(t1);
+    NN_EXIT(tern->zero_grad(), 1, "zero_grad 失败: ");
+    auto logits = tern->forward(xt);
+    NN_EXIT(logits, 1, "三值 GPT forward 失败: ");
+    auto loss = ce.forward_sparse(eng, *logits,
+                                  std::span<const std::size_t>(data.labels),
+                                  std::span<const nn::Scalar>{}, V);
+    NN_EXIT(loss, 1, "sparse CE 失败: ");
+    CHECK(std::isfinite(*loss), "三值 GPT 前向 loss 有限");
+    auto grad = ce.backward();
+    NN_EXIT(grad, 1, "CE backward 失败: ");
+    NN_EXIT(tern->backward(*grad), 1, "三值 GPT backward 失败: ");
+    double max_g = 0.0;
+    std::size_t nonzero = 0;
+    for (const auto& g : tern->param_gradients())
+    {
+        const nn::Matrix m = download(eng, g.get());
+        const double mg = max_abs(m);
+        if (mg > 0.0) ++nonzero;
+        max_g = std::max(max_g, mg);
+    }
+    std::printf("    梯度：%zu/%zu 张量非零，max|g|=%.3e\n", nonzero,
+                tern->param_gradients().size(), max_g);
+    CHECK(nonzero == tern->param_gradients().size(), "全部参数张量拿到非零梯度");
+}
+
+// ── [15] 真实 BitNet（2B4T 形状）端到端训练：CE + AdamW + 三值 ─────────────-
+// 结构：RoPE + ReLU² + RMSNorm + SubLN + GQA + tied embedding + BitLinear ——
+// BitNet b1.58 2B4T 的权重侧（三值）与结构侧（subln/GQA/tied/ReLU²）开关全开。
+// 返回末步 loss（失败 = -1），供 CPU/GPU 一致性比对。
+double test_bitnet_training(nn::ComputeEngine& eng, const char* tag)
+{
+    const std::size_t V = 32, D = 32, S = 8, H = 4, KV = 2, FF = 64, L = 2, B = 4;
+    constexpr int STEPS = 200;
+    std::printf("[15] 真实 BitNet（2B4T 形状）端到端训练（%s，CE + AdamW，%d 步）\n",
+                tag, STEPS);
+
+    const BitnetData data = make_bitnet_data(V, S, B, 7u);
+    const nn::Tensor xt = upload(eng, data.x);
+    const nn::PrecisionProfile f32p;
+
+    const auto train_one = [&](const nn::PrecisionProfile& pp, bool tie,
+                               const char* name) -> double {
+        auto m_r = nn::build_gpt_model(eng, V, D, S, H, FF, L,
+                                       nn::PosEncodingType::RoPE,
+                                       nn::ActivationType::ReLU2,
+                                       nn::NormType::RMSNorm, pp,
+                                       /*subln=*/true, /*n_head_kv=*/KV, tie);
+        if (!m_r.has_value())
+        {
+            std::printf("    [%s] 构建失败: %s\n", name, m_r.error().message.c_str());
+            CHECK(false, "BitNet 构建成功");
+            return -1.0;
+        }
+        nn::Model& model = *m_r;
+        auto opt = nn::create_optimizer("adamw", eng, model.parameters(),
+                                        model.param_gradients(),
+                                        nn::Scalar{3e-3}, nn::Scalar{0.0f}, pp);
+        if (!opt) { CHECK(false, "优化器创建成功"); return -1.0; }
+        nn::CrossEntropyLoss ce;
+        ce.set_precision_profile(pp);
+
+        double first = 0.0, last = 0.0;
+        for (int step = 0; step < STEPS; ++step)
+        {
+            auto zg = model.zero_grad();
+            if (!zg) { std::printf("    [%s] zero_grad: %s\n", name, zg.error().message.c_str()); return -1.0; }
+            auto logits = model.forward(xt);
+            if (!logits) { std::printf("    [%s] forward: %s\n", name, logits.error().message.c_str()); return -1.0; }
+            auto loss = ce.forward_sparse(eng, *logits,
+                                          std::span<const std::size_t>(data.labels),
+                                          std::span<const nn::Scalar>{}, V);
+            if (!loss) { std::printf("    [%s] loss: %s\n", name, loss.error().message.c_str()); return -1.0; }
+            if (!std::isfinite(*loss)) { CHECK(false, "loss 有限"); return -1.0; }
+            if (step == 0) first = *loss;
+            last = *loss;
+            auto grad = ce.backward();
+            if (!grad) { std::printf("    [%s] ce.backward 失败\n", name); return -1.0; }
+            auto bw = model.backward(*grad);
+            if (!bw) { std::printf("    [%s] backward: %s\n", name, bw.error().message.c_str()); return -1.0; }
+            auto st = opt->step();
+            if (!st) { std::printf("    [%s] step: %s\n", name, st.error().message.c_str()); return -1.0; }
+        }
+        std::printf("    [%s] loss: %.6f → %.6f\n", name, first, last);
+        return last;
+    };
+
+    nn::PrecisionProfile t1;
+    t1.param = nn::Precision::T1_58;
+    const double t1_tied = train_one(t1, /*tie=*/true, "bitnet_t1_58_tied");
+    const double t1_head = train_one(t1, /*tie=*/false, "bitnet_t1_58_lmhead");
+    const double base    = train_one(f32p, /*tie=*/false, "f32_baseline");
+    std::printf("    （随机基线 ln(V)=%.4f）\n", std::log(static_cast<double>(V)));
+
+    CHECK(t1_tied >= 0.0 && t1_tied < 0.30, "三值 + tied（2B4T 形状）收敛到 < 0.30");
+    CHECK(t1_head >= 0.0 && t1_head < 0.30, "三值 + BitLinear LM head 收敛到 < 0.30");
+    CHECK(base >= 0.0 && base < 0.30, "f32 基线同样收敛（对照）");
+    return std::max(t1_tied, t1_head);
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -811,6 +994,15 @@ int main(int argc, char* argv[])
     test_tied_spec();
     test_relu2_activation();
     test_relu2_gpt();
+    test_gpt_ternary_wiring();
+
+    // 真实 BitNet（2B4T 形状）训练：CPU 必跑；--gpu 时在真实 GPU 上再跑一遍比对
+    double cpu_bitnet_loss = -1.0;
+    {
+        nn::CpuEngine eng;
+        cpu_bitnet_loss = test_bitnet_training(eng, "CPU");
+        if (cpu_bitnet_loss < 0.0) ++g_failures;
+    }
 
     if (gpu)
     {
@@ -821,6 +1013,16 @@ int main(int argc, char* argv[])
         test_gqa_mha_equivalence(**eng_r, "GPU");
         test_gqa_head_mapping(**eng_r, "GPU");
         if (!test_training(**eng_r, "GPU")) g_failures++;
+        const double gpu_bitnet_loss = test_bitnet_training(**eng_r, "GPU");
+        if (gpu_bitnet_loss < 0.0)
+            ++g_failures;
+        else
+        {
+            const double d = std::fabs(gpu_bitnet_loss - cpu_bitnet_loss);
+            std::printf("    [parity] 末步 loss CPU=%.6f GPU=%.6f 差=%.3e\n",
+                        cpu_bitnet_loss, gpu_bitnet_loss, d);
+            CHECK(d < 1e-3, "CPU/GPU 端到端训练末步 loss 一致（<1e-3）");
+        }
     }
     else
     {
