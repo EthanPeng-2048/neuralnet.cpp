@@ -1365,9 +1365,11 @@ public:
                 //   A: trans0 → (rows, mm_k)；trans1 → (batch*mm_k, m_per)
                 //   B: trans0 → (batch*mm_k, K)；trans1 → (batch*K, mm_k)
                 //   其中 mm_k=内层收缩、K=fold 收缩轴=网格列数
+                const std::size_t nb_a = batch / gqa_ratio_of(spec, f.matmul->a_input);
+                const std::size_t nb_b = batch / gqa_ratio_of(spec, f.matmul->b_input);
                 const std::size_t er = is_a
-                    ? (tr ? batch * mm_k : rows)
-                    : (tr ? batch * K : batch * mm_k);
+                    ? (tr ? nb_a * mm_k : rows)
+                    : (tr ? nb_b * K : nb_b * mm_k);
                 const std::size_t ec = is_a
                     ? (tr ? m_per : mm_k)
                     : (tr ? mm_k : K);
@@ -1378,7 +1380,8 @@ public:
             }
             // 视图白名单（与 expr_spec 的 fold validate **同步维护**——两处清单
             //   必须一致，否则合法视图在一侧被拒、fold forward 直接报错）
-            if (vk != ExprViewKind::Linear && vk != ExprViewKind::RowMod &&
+            if (vk != ExprViewKind::Linear && vk != ExprViewKind::HeadGroup &&
+                vk != ExprViewKind::RowMod &&
                 vk != ExprViewKind::RowBroadcast &&
                 !((vk == ExprViewKind::BatchMod || vk == ExprViewKind::BatchCol) &&
                   f.matmul))
@@ -1413,8 +1416,12 @@ public:
         if (f.vecacc)
         {
             const Tensor& tb = inputs[f.vecacc->b_input];
+            // GQA：V_t 只存 n_head_kv 个头 → 行数按头分组比缩小
+            const std::size_t vb =
+                (f.matmul ? f.matmul->batch : 1) /
+                gqa_ratio_of(spec, f.vecacc->b_input);
             const std::size_t want_rows =
-                (f.matmul ? f.matmul->batch : 1) * K;
+                (vb ? vb : 1) * K;
             if (tb.rows() != want_rows || tb.cols() != f.vec_state_len)
                 NN_FAIL("eval_fold: vecacc b_input shape mismatch (expect (batch*k, vec_state_len))");
         }
@@ -1462,17 +1469,20 @@ public:
             const std::size_t mm_k = fmm->k;
             const std::size_t b = static_cast<std::size_t>(r / m_per);
             const std::size_t row_in = r - b * m_per;
+            // GQA：A/B 侧行块号按各自视图的头分组比取（HeadGroup 视图才有）
+            const std::size_t bA = b / gqa_ratio_of(spec, fmm->a_input);
+            const std::size_t bB = b / gqa_ratio_of(spec, fmm->b_input);
             const ConstSpan& as = spans[fmm->a_input];
             const ConstSpan& bs = spans[fmm->b_input];
             Scalar acc = 0;
             for (std::size_t d = 0; d < mm_k; ++d)
             {
                 const Scalar av = fmm->transA
-                    ? as[(b * mm_k + d) * m_per + row_in]
-                    : as[(b * m_per + row_in) * mm_k + d];
+                    ? as[(bA * mm_k + d) * m_per + row_in]
+                    : as[(bA * m_per + row_in) * mm_k + d];
                 const Scalar bv = fmm->transB
-                    ? bs[(b * K + gk) * mm_k + d]
-                    : bs[(b * mm_k + d) * K + gk];
+                    ? bs[(bB * K + gk) * mm_k + d]
+                    : bs[(bB * mm_k + d) * K + gk];
                 acc += av * bv;
             }
             return acc;
@@ -1600,8 +1610,11 @@ public:
                         for (std::size_t d = 0; d < f.vec_state_len; ++d)
                             vecd[d] *= sc;
                     const ConstSpan& bs = spans[va.b_input];
+                    // GQA：V_t 的行块号按其视图的头分组比取
                     const std::size_t b_of_row =
-                        fmm ? static_cast<std::size_t>(r / m_per) : 0;
+                        fmm ? (static_cast<std::size_t>(r / m_per) /
+                               gqa_ratio_of(spec, va.b_input))
+                           : 0;
                     for (std::size_t kb = 0; kb < valid; ++kb)
                     {
                         const Scalar w = is_elem[va.weight_reg]
@@ -1680,9 +1693,12 @@ public:
                 // matmul 输入：形状按 trans 标志、K 与 batch 推导（M=rows/batch）
                 const bool is_a = (k == static_cast<std::size_t>(mm->a_input));
                 const bool tr = is_a ? (mm->transA != 0) : (mm->transB != 0);
+                // GQA：操作数只存 mm_batch/kv_ratio 份行块（1 = 恒等）
+                const std::size_t nb =
+                    mm_batch / gqa_ratio_of(spec, is_a ? mm->a_input : mm->b_input);
                 const std::size_t er = is_a
-                    ? (tr ? mm_batch * mm_k : rows)          // A 存储行数期望
-                    : (tr ? mm_batch * cols : mm_batch * mm_k);
+                    ? (tr ? nb * mm_k : nb * m_per)          // A 存储行数期望
+                    : (tr ? nb * cols : nb * mm_k);
                 const std::size_t ec = is_a
                     ? (tr ? m_per : mm_k)                    // A 存储列数期望
                     : (tr ? mm_k : cols);
@@ -1836,8 +1852,11 @@ public:
                 // 每批切片：A 存储 (M,K) 或 (K,M)，元素数恒为 M*K；B 同理恒为 K*N。
                 // ConstSpan/Span 是 DSL 数据视图（无到 std::span 的隐式转换），
                 // 与 batched_matmul 一致，用 data()+偏移显式构造 std::span 子区间。
-                const std::size_t a_off = b * M * K;
-                const std::size_t b_off = b * K * N;
+                // GQA：输入只存 mm_batch/kv_ratio 份行块 → 按 b/ratio 取源块
+                const std::size_t ba = b / gqa_ratio_of(spec, mm->a_input);
+                const std::size_t bb = b / gqa_ratio_of(spec, mm->b_input);
+                const std::size_t a_off = ba * M * K;
+                const std::size_t b_off = bb * K * N;
                 const auto a_sub = std::span<const Scalar>(as.data() + a_off, M * K);
                 const auto b_sub = std::span<const Scalar>(bs.data() + b_off, K * N);
                 auto c_sub = std::span<Scalar>(out.data() + b * M * N, M * N);

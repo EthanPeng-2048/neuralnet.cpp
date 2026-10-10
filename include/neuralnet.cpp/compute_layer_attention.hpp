@@ -62,7 +62,8 @@ enum class AttnMaskKind
 //   掩码（causal → doc）→ ALiBi 斜率项，与拆分前的 5 个融合变体逐指令一致。
 [[nodiscard]] inline ExprSpec make_fold_attn_o(std::uint32_t seq, std::uint32_t dk,
                                                std::uint32_t bh, AttnMaskKind mask,
-                                               bool score_bias)
+                                               bool score_bias,
+                                               std::uint32_t kv_ratio = 1)
 {
     ExprSpec s;
     FoldSpec f;
@@ -81,6 +82,16 @@ enum class AttnMaskKind
     const bool has_causal = (mask != AttnMaskKind::Plain);
     f.tri_skip = has_causal;   // 生成器据此钳 valid（整块/边界跳过 -inf 区）
     s.views = { linear(), linear(), linear() };
+    // GQA（docs 22 §3.2 P2）：K/V_t 只存 bh/kv_ratio 份行块（块映射）
+    //   —— 挂成 HeadGroup 视图，比率走运行期 vp 槽（不进 key → 任意 n_rep
+    //   共用一份 shader）。kv_ratio==1 时保持 linear()，既有结构逐字节不变。
+    if (kv_ratio > 1)
+    {
+        s.views[1].kind  = static_cast<std::uint8_t>(ExprViewKind::HeadGroup);
+        s.views[1].param = kv_ratio;
+        s.views[2].kind  = static_cast<std::uint8_t>(ExprViewKind::HeadGroup);
+        s.views[2].param = kv_ratio;
+    }
     std::uint8_t slot_slope = 0, slot_dc = 0, slot_ids = 0;
     if (has_slope)
     {
@@ -250,7 +261,8 @@ public:
     //   位置偏置由位置编码策略另行叠加，见 PositionEncoder::apply_score_bias）
     [[nodiscard]] virtual Result<Tensor> masked_scores(
         ComputeEngine& engine, const Tensor& Q, const Tensor& K,
-        std::size_t BH, std::size_t seq, const PrecisionProfile& p) const = 0;
+        std::size_t BH, std::size_t seq, const PrecisionProfile& p,
+        std::uint32_t kv_ratio) const = 0;
 
     // 文档 id 注入（仅文档感知策略覆写；其余 no-op = 无文档掩码）
     virtual void set_doc_ids(std::span<const std::size_t> /*ids*/) {}
@@ -265,9 +277,10 @@ public:
 
     [[nodiscard]] Result<Tensor> masked_scores(
         ComputeEngine& engine, const Tensor& Q, const Tensor& K,
-        std::size_t BH, std::size_t seq, const PrecisionProfile& p) const override
+        std::size_t BH, std::size_t seq, const PrecisionProfile& p,
+        std::uint32_t kv_ratio) const override
     {
-        return dsl::compute(engine, dsl::matmul(Q, K, true, false, BH),
+        return dsl::compute(engine, dsl::matmul_kv(Q, K, true, false, BH, 1, kv_ratio),
                             BH * seq, seq, p.compute);
     }
 };
@@ -284,9 +297,10 @@ public:
 
     [[nodiscard]] Result<Tensor> masked_scores(
         ComputeEngine& engine, const Tensor& Q, const Tensor& K,
-        std::size_t BH, std::size_t seq, const PrecisionProfile& p) const override
+        std::size_t BH, std::size_t seq, const PrecisionProfile& p,
+        std::uint32_t kv_ratio) const override
     {
-        const auto scores = dsl::matmul(Q, K, true, false, BH);
+        const auto scores = dsl::matmul_kv(Q, K, true, false, BH, 1, kv_ratio);
         const auto causal = dsl::select(dsl::col() > dsl::row(),
                                         Scalar{1}, Scalar{0});
         return dsl::compute(engine,
@@ -352,9 +366,10 @@ public:
 
     [[nodiscard]] Result<Tensor> masked_scores(
         ComputeEngine& engine, const Tensor& Q, const Tensor& K,
-        std::size_t BH, std::size_t seq, const PrecisionProfile& p) const override
+        std::size_t BH, std::size_t seq, const PrecisionProfile& p,
+        std::uint32_t kv_ratio) const override
     {
-        const auto scores = dsl::matmul(Q, K, true, false, BH);
+        const auto scores = dsl::matmul_kv(Q, K, true, false, BH, 1, kv_ratio);
         const auto causal = dsl::select(dsl::col() > dsl::row(),
                                         Scalar{1}, Scalar{0});
         const auto blocked = causal + dsl::select(
@@ -410,6 +425,8 @@ protected:
     // 头映射 = 块映射：query head h 用 KV head `h / (num_heads_/n_head_kv_)`
     //（llama.cpp FA 内核 `ik2 = iq2 / rk2` 与 HF `repeat_kv` 的 reshape 一致）。
     std::size_t n_head_kv_ = 0;
+    // GQA 头分组比 = num_heads_ / n_head_kv_（1 = MHA，= head_mapping 的 n_rep）
+    std::size_t kv_ratio_ = 1;
     // 展开索引表：(num_heads·d_k, 1) 宿主常量（detail::upload_span 上桥）。
     // 前向 gather_rows(K_kv) → K_full；反向 scatter_add_rows(该表) → grad_K_kv。
     // MHA 时 invalid（不建表、零开销）。
@@ -485,6 +502,7 @@ public:
                   std::size_t n_head_kv = 0)
         : d_model_(d_model), num_heads_(num_heads),
           n_head_kv_(n_head_kv == 0 ? num_heads : n_head_kv),
+          kv_ratio_(num_heads / (n_head_kv == 0 ? num_heads : n_head_kv)),
           d_k_(d_model / num_heads),
           seq_len_(seq_len),
           scale_(Scalar{1} / std::sqrt(static_cast<Scalar>(d_model / num_heads))),
@@ -648,32 +666,29 @@ public:
         // 1.5 GQA：把 K/V 从 n_head_kv 个头展开到 num_heads 个（块映射）。
         //     MHA（表 invalid）= 恒等搬移，零额外拷贝；展开后 fold 注意力与
         //     AOT 注册表完全不知情（BH 恒 = batch·num_heads）。
-        Tensor k_res, v_res;
-        if (gqa_expand_idx_.valid())
-        {
-            NN_TRY(ke, engine.gather_rows(*k_proj, gqa_expand_idx_));
-            k_res = std::move(*ke);
-            NN_TRY(ve, engine.gather_rows(*v_proj, gqa_expand_idx_));
-            v_res = std::move(*ve);
-        }
-        else
-        {
-            k_res = std::move(*k_proj);
-            v_res = std::move(*v_proj);
-        }
+        // GQA（P2）：**训练路径不展开 K/V** —— 头映射由 fold 的 HeadGroup 视图在
+        // kernel 内完成（省掉 n_rep 倍物化 + 两次全尺寸 gather + 两个全尺寸
+        // 重排缓冲）。展开表 gqa_expand_idx_ 仅供增量推理（forward_step 的
+        // KV cache 仍按 H 个头布局）。
+        Tensor k_res = std::move(*k_proj);
+        Tensor v_res = std::move(*v_proj);
 
         // 2. rearrange: (H*d_k, batch*seq) → (batch*H*d_k, seq)
         //    使 batched_matmul 能按 batch*H 切分行块
         //    局部 Q/K/V 承载 forward 计算；仅在非 checkpoint 模式下写入成员缓存。
         const std::size_t H_dk = num_heads_ * d_k_;
+        const std::size_t KV_dk = n_head_kv_ * d_k_;
         Tensor Q, K, V;  // (batch*H*d_k, seq) rearranged
         if (batch > 1)
         {
             NN_TRY(qr, engine.rearrange_3d(*q_res, H_dk, batch, seq, false));
             Q = std::move(*qr);
-            NN_TRY(kr, engine.rearrange_3d(k_res, H_dk, batch, seq, false));
+            // GQA（P2，in-kernel 头映射）：K/V 保持 n_head_kv 个头**不展开**
+            //   —— 展开由 fold 的 HeadGroup 视图在 kernel 内完成（省掉 n_rep 倍
+            //   物化与两次全尺寸 gather；见 docs 22 §3.2）。
+            NN_TRY(kr, engine.rearrange_3d(k_res, KV_dk, batch, seq, false));
             K = std::move(*kr);
-            NN_TRY(vr, engine.rearrange_3d(v_res, H_dk, batch, seq, false));
+            NN_TRY(vr, engine.rearrange_3d(v_res, KV_dk, batch, seq, false));
             V = std::move(*vr);
         }
         else
@@ -705,6 +720,7 @@ public:
 
         // ── 注意力主体：单 fold 路径 ────────────────────────────────────
         const std::size_t BH = batch * num_heads_;
+        const std::size_t BH_kv = batch * n_head_kv_;
         //   分数输入准备：位置偏置表（ALiBi 斜率；非 ALiBi = no-op）
         NN_TRY(pb, pos_->prepare_score_bias(engine, batch, seq));
         //   掩码输入张量准备（掩码策略自己构建 doc_col/doc_ids）
@@ -712,7 +728,7 @@ public:
         Tensor concat_out;  // (batch*H*d_k, seq)——fold 输出 O_t 经转置/重排得到
         // V 需 (BH*seq, d_k) 布局：V_t 构建须在 fold 求值之前完成（fold 直接消费 V_t）
         NN_TRY(V_T_full, engine.transpose(V));
-        NN_TRY(V_t, engine.rearrange_3d(*V_T_full, seq, BH, d_k_, false));
+        NN_TRY(V_t, engine.rearrange_3d(*V_T_full, seq, BH_kv, d_k_, false));
         // ── 单 fold 表达式：S 不物化、online 单遍 ──────────────────────
         //   无 (BH·seq, seq) 中间张量流量；掩码在 fold body 内逐块生效，
         //   tri_skip 把被屏蔽块钳成空转（被跳过的恰是 -inf/0 恒等项 →
@@ -723,7 +739,8 @@ public:
         pos_->append_score_bias_inputs(fold_in);
         mask_->append_fold_inputs(fold_in);
         const nn::ExprSpec fold_spec = nn::expr::make_fold_attn_o(
-            seq, d_k_, BH, mask_->mask_kind(), pos_->has_score_bias());
+            seq, d_k_, BH, mask_->mask_kind(), pos_->has_score_bias(),
+            static_cast<std::uint32_t>(kv_ratio_));
         NN_TRY(fv, nn::validate_expr_spec(fold_spec, fold_in.size()));
         // scale 已折进 Q（见上 2.6；运行时值不进 expr_spec_key）——fold 的 mm 段直接消费
         NN_TRY(O_t_r, engine.eval_expr(fold_spec, fold_in, BH * seq, d_k_, p_.compute));
@@ -807,8 +824,10 @@ public:
             // forward: O = V × A^T → grad_A = grad_O^T × V（后续 R/X 分解的 P 输入）
             // dsl::matmul(batch)（结构经 scan 的 CSA/MHA backward dry-run 登记）；
             // 输出形状：transA=true → rows=BH*A.cols()；transB=false → cols=B.cols()
+            // GQA：V_cache_ 存的是 n_head_kv 个头 → B 侧按头分组比取行块
+            const std::uint32_t kvr = static_cast<std::uint32_t>(kv_ratio_);
             auto grad_A = dsl::compute(engine,
-                dsl::matmul(grad_concat_re, V_cache_, true, false, BH),
+                dsl::matmul_kv(grad_concat_re, V_cache_, true, false, BH, 1, kvr),
                 BH * grad_concat_re.cols(), V_cache_.cols(), p_.compute);
             NN_TRY_CHECK(grad_A);
             nn_dbg_scan("attn.grad_A", engine, *grad_A);
@@ -838,9 +857,11 @@ public:
             nn_dbg_scan("attn.X", engine, *X);
             // grad_Q = K × X^T（K_b (d_k,seq)，X_b (seq,seq) 按 X^T 使用）
             // dsl::matmul(batch)（transA=F,transB=T → rows=K.rows(), cols=X.rows()/BH）
+            // GQA：A 侧 K 只存 n_head_kv 个头 → 按头分组比取行块；输出仍是
+            //   **全 H 头**（rows = BH·d_k），即"紧输入 → 满输出"的映射。
             auto gq = dsl::compute(engine,
-                dsl::matmul(K_cache_, *X, false, true, BH),
-                K_cache_.rows(), X->rows() / BH, p_.compute);
+                dsl::matmul_kv(K_cache_, *X, false, true, BH, kvr, 1),
+                BH * d_k_, X->rows() / BH, p_.compute);
             NN_TRY_CHECK(gq);
             nn_dbg_scan("attn.gq(pre-scale)", engine, *gq);
             // grad_Q 补乘 scale（forward 把 scale 折进了 Q）：compute_into 原地
@@ -1051,7 +1072,7 @@ protected:
         const Tensor& Q, const Tensor& K,
         std::size_t BH, std::size_t seq) const
     {
-        NN_TRY(sres, mask_->masked_scores(engine, Q, K, BH, seq, p_));
+        NN_TRY(sres, mask_->masked_scores(engine, Q, K, BH, seq, p_, kv_ratio_));
         Tensor S = std::move(*sres);
         // 位置偏置：原地叠加（零额外分配）；非 ALiBi 策略是 no-op
         NN_TRY_CHECK(pos_->apply_score_bias(engine, S, BH, seq));

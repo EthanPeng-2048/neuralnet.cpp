@@ -253,6 +253,20 @@ inline void glsl_view_read(std::ostringstream& os,
     return vp;
 }
 
+// ── GQA：操作数"行块号"表达式（docs/development/22 §3.2 P2）──────────────
+// 该操作数的视图是 HeadGroup 时，行块号 = base / 头分组比（比走运行期 vp 槽，
+//   param 不进 key → 任意 n_rep 共用一份 shader）；
+// 其余视图原样返回 base → 生成代码与既有逐字节相同（MHA 路径零变化）。
+[[nodiscard]] inline std::string gqa_blk_expr(const ExprSpec& spec, std::size_t view_idx,
+                                              const std::string& base = "batch")
+{
+    if (view_idx >= spec.views.size())
+        return base;
+    if (static_cast<ExprViewKind>(spec.views[view_idx].kind) != ExprViewKind::HeadGroup)
+        return base;
+    return "(" + base + " / vp" + std::to_string(glsl_vp_slot(spec, view_idx)) + ")";
+}
+
 // ── 分组归约视图的读取辅助函数发射（R 运行期 → 循环替代编译期展开链）──────
 // R 是运行期视图参数（vp 槽，不进 key）→ 任意池化窗口共享一个 shader。
 // 循环内的累加顺序与 CPU 模板路径 GroupedReduceRef::eval 逐元素一致（铁律 8）：
@@ -399,6 +413,10 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     const std::size_t n_inputs = spec.views.size();
     const std::uint32_t a_slot = mm.a_input;
     const std::uint32_t b_slot = mm.b_input;
+    // GQA：A/B 侧行块号（生成代码里的别名；ratio==1 时就是 batch 本身 →
+    // 既有 shader 的代码逐字节不变）。别名在 main 里按需定义。
+    const std::string a_blk = gqa_blk_expr(spec, a_slot);
+    const std::string b_blk = gqa_blk_expr(spec, b_slot);
     // 注：mm.transA/transB **不在此处读取** —— 转置是运行期 operand layout
     // （PC `mm_trans`），两条加载路径都发射、运行时经 uniform 分支选择。
     // ── 带类型变体（Phase 2 in-kernel f16）───────────────────────────────
@@ -543,8 +561,8 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
                             bool trans)
     {
         const std::string idx = trans
-            ? "((batch*mm_k + (" + k_e + "))*m_per + (" + row_e + "))"
-            : "((batch*m_per + (" + row_e + "))*mm_k + (" + k_e + "))";
+            ? "((" + a_blk + "*mm_k + (" + k_e + "))*m_per + (" + row_e + "))"
+            : "((" + a_blk + "*m_per + (" + row_e + "))*mm_k + (" + k_e + "))";
         const std::string an = "b" + std::to_string(a_slot);
         if (disp)
             return "((prec >> " + std::to_string(a_slot) + "u & 1u) != 0u ? float("
@@ -556,8 +574,8 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
                             bool trans)
     {
         const std::string idx = trans
-            ? "((batch*cols + (" + col_e + "))*mm_k + (" + k_e + "))"
-            : "((batch*mm_k + (" + k_e + "))*cols + (" + col_e + "))";
+            ? "((" + b_blk + "*cols + (" + col_e + "))*mm_k + (" + k_e + "))"
+            : "((" + b_blk + "*mm_k + (" + k_e + "))*cols + (" + col_e + "))";
         const std::string bn = "b" + std::to_string(b_slot);
         if (disp)
             return "((prec >> " + std::to_string(b_slot) + "u & 1u) != 0u ? float("
@@ -715,7 +733,7 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
           << " && kAG < mm_k && arG < m_per)\n";
         L << "    {\n";
         L << "        Ash[stage][kAL][mA4] = "
-          << vec4_load(a_slot, "(((batch*mm_k + (kAG))*m_per + (arG))) >> 2") << ";\n";
+          << vec4_load(a_slot, "(((" + a_blk + "*mm_k + (kAG))*m_per + (arG))) >> 2") << ";\n";
         L << "    }\n    else\n    {\n";
         L << "        for (uint j = 0u; j < 4u; ++j)\n        {\n";
         L << "            const float v = (arG + j < m_per && kAG < mm_k) ? "
@@ -734,7 +752,7 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
           << " && arG < m_per && kAG < mm_k)\n";
         L << "    {\n";
         L << "        const vec4 v = "
-          << vec4_load(a_slot, "(((batch*m_per + (arG))*mm_k + (kAG))) >> 2") << ";\n";
+          << vec4_load(a_slot, "(((" + a_blk + "*m_per + (arG))*mm_k + (kAG))) >> 2") << ";\n";
         L << "        Ash[stage][kAL    ][arT >> 2][arT & 3u] = v.x;\n";
         L << "        Ash[stage][kAL + 1u][arT >> 2][arT & 3u] = v.y;\n";
         L << "        Ash[stage][kAL + 2u][arT >> 2][arT & 3u] = v.z;\n";
@@ -760,7 +778,7 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
           << " && bcG < cols && kBG < mm_k)\n";
         L << "    {\n";
         L << "        const vec4 v = "
-          << vec4_load(b_slot, "(((batch*cols + (bcG))*mm_k + (kBG))) >> 2") << ";\n";
+          << vec4_load(b_slot, "(((" + b_blk + "*cols + (bcG))*mm_k + (kBG))) >> 2") << ";\n";
         L << "        for (uint j = 0u; j < 4u; ++j)\n";
         L << "            Bsh[stage][kBL + j][nT >> 2][nT & 3u] = v[j];\n";
         L << "    }\n    else\n    {\n";
@@ -781,7 +799,7 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
           << " && kBG < mm_k && bcG < cols)\n";
         L << "    {\n";
         L << "        Bsh[stage][kBL][nB4] = "
-          << vec4_load(b_slot, "(((batch*mm_k + (kBG))*cols + (bcG))) >> 2") << ";\n";
+          << vec4_load(b_slot, "(((" + b_blk + "*mm_k + (kBG))*cols + (bcG))) >> 2") << ";\n";
         L << "    }\n    else\n    {\n";
         L << "        for (uint j = 0u; j < 4u; ++j)\n        {\n";
         L << "            const float v = (kBG < mm_k && bcG + j < cols) ? "
@@ -1282,12 +1300,14 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
         L << "      const uint row_in = row - batch * m_per;\n";
         // Q 行按行预载 shared（整行 dk 个，256 线程步进；A 的 d 维布局按 transA）
         L << "      for (uint d = tid; d < mm_k; d += 256u) {\n";
+        // GQA：A 侧行块号——HeadGroup 视图时按 vp 槽里的头分组比取（1 = 恒等）
+        const std::string a_blk = gqa_blk_expr(spec, f.matmul->a_input);
         if (f.matmul->transA)
             L << "        Ash[d] = " << in_rd(f.matmul->a_input,
-              "(batch * mm_k + d) * m_per + row_in") << ";\n";
+              "(" + a_blk + " * mm_k + d) * m_per + row_in") << ";\n";
         else
             L << "        Ash[d] = " << in_rd(f.matmul->a_input,
-              "(batch * m_per + row_in) * mm_k + d") << ";\n";
+              "(" + a_blk + " * m_per + row_in) * mm_k + d") << ";\n";
         L << "      }\n";
         L << "      barrier();   // Ash 就绪（每行预载，块循环前一次）\n";
     }
@@ -1433,12 +1453,14 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
         L << "        float part = 0.0;\n";
         L << "        if (jm < valid) {\n";
         L << "          for (uint d = grp; d < mm_k; d += " << NG << "u) {\n";
+        // GQA：B 侧行块号——HeadGroup 视图时按 vp 槽里的头分组比取
+        const std::string b_blk = gqa_blk_expr(spec, m.b_input);
         if (m.transB)
             L << "            part += Ash[d] * " << in_rd(m.b_input,
-                "(batch * cols + (k0 + jm)) * mm_k + d") << ";\n";
+                "(" + b_blk + " * cols + (k0 + jm)) * mm_k + d") << ";\n";
         else
             L << "            part += Ash[d] * " << in_rd(m.b_input,
-                "(batch * mm_k + d) * cols + (k0 + jm)") << ";\n";
+                "(" + b_blk + " * mm_k + d) * cols + (k0 + jm)") << ";\n";
         L << "          }\n";
         L << "        }\n";
         L << "        spart[jm][grp] = part;\n";
@@ -1574,7 +1596,9 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
               << " o[(dd - tid) / 256u] *= r"
               << static_cast<int>(va.scale_reg) << ";\n";
         }
-        const std::string b_row = has_mm ? "(row / m_per)" : "0u";
+        // GQA：vecacc 的 b_input（V_t）行块号同样按其视图的头分组比取
+        const std::string b_row = !has_mm ? std::string("0u")
+                                          : gqa_blk_expr(spec, va.b_input, "(row / m_per)");
         // vecacc：O += Σ_j w(j)·b(j, d) —— 4 路软件流水。
         //   每拍同批发出 j..j+3 四个读使延迟重叠（GPU 无硬件预取，单发
         //   串行读会暴露 64 级 L2 延迟链——探针量化其占 fold 开销 55%）；
@@ -2803,4 +2827,3 @@ inline const bool kGlslEmitterRegistered =
         });
 
 } // namespace nn
-

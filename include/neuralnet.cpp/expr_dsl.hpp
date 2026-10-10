@@ -566,6 +566,10 @@ struct MatmulRef
     bool transA = false;
     bool transB = false;
     std::uint32_t batch = 1;  // 批量数（形状参数，不进 key）
+    // GQA 头分组比（docs/development/22 §3.2 P2）：>1 时该操作数只存
+    // batch/ratio 份行块（多个 query 头共享一个 KV 头）。1 = 恒等。
+    std::uint32_t a_kv_ratio = 1;
+    std::uint32_t b_kv_ratio = 1;
 
     // ── CPU 模板求值路径的预绑定状态（引擎内部，Layer 无感知）───────────
     // C 由引擎通用 matmul 原语物化一次并绑定指针；随后尾链（如 +bias）在
@@ -576,6 +580,11 @@ struct MatmulRef
 
     [[nodiscard]] Result<void> prepare_cpu(ComputeEngine& eng) const
     {
+        // GQA（ratio>1）：CPU 预绑定路径用通用 batched_matmul，无头映射语义
+        // → 直接拒绝，让上层回退到解释器（eval_expr 的 MatmulSpec 分支已支持
+        // 头映射）。预绑定只是优化，回退不引入正确性风险。
+        if (a_kv_ratio > 1 || b_kv_ratio > 1)
+            NN_FAIL("dsl matmul prepare: kv_ratio > 1 走解释器路径（CPU 预绑定不支持头映射）");
         if (c_data_ != nullptr)
             return {};  // 幂等：同一棵树重复求值只物化一次
         // ── 精度安全（§7.2 f32 参考）────────────────────────────────────
@@ -650,9 +659,21 @@ struct MatmulRef
         // k = 求和维度：transA=0 → A.cols()（A 存储 (batch*M, K)）；
         // transA=1 → A.rows()/batch（A 存储 (batch*K, M)，每批 (K, M)）
         const std::uint32_t k = static_cast<std::uint32_t>(
-            transA ? (a.rows() / batch) : a.cols());
+            transA ? (a.rows() / (batch / (a_kv_ratio ? a_kv_ratio : 1))) : a.cols());
         sb.spec.matmul = MatmulSpec{ai, bi, transA ? std::uint8_t{1} : std::uint8_t{0},
                                     transB ? std::uint8_t{1} : std::uint8_t{0}, k, batch};
+        // GQA（ratio>1）：把该操作数的**视图**标成 HeadGroup 并记下头分组比
+        //   —— param 是运行期形状数据（不进 key），任意 n_rep 共用一份 shader。
+        if (a_kv_ratio > 1)
+        {
+            sb.spec.views[ai].kind = static_cast<std::uint8_t>(ExprViewKind::HeadGroup);
+            sb.spec.views[ai].param = a_kv_ratio;
+        }
+        if (b_kv_ratio > 1)
+        {
+            sb.spec.views[bi].kind = static_cast<std::uint8_t>(ExprViewKind::HeadGroup);
+            sb.spec.views[bi].param = b_kv_ratio;
+        }
         return expr::matmul_op();
     }
 };
@@ -936,6 +957,20 @@ inline constexpr bool has_reduction_v<Select<C, T, E>>
                                       bool transA = false, bool transB = false,
                                       std::uint32_t batch = 1)
 { return MatmulRef{std::move(a), std::move(b), transA, transB, batch}; }
+
+// GQA 变体：a_kv_ratio / b_kv_ratio > 1 时该操作数只存 batch/ratio 份行块
+// （多个连续 query 头共享一个 KV 头；块映射见 docs/development/22 §3.2）。
+[[nodiscard]] inline MatmulRef matmul_kv(Tensor a, Tensor b,
+                                         bool transA, bool transB,
+                                         std::uint32_t batch,
+                                         std::uint32_t a_kv_ratio,
+                                         std::uint32_t b_kv_ratio)
+{
+    MatmulRef m{std::move(a), std::move(b), transA, transB, batch};
+    m.a_kv_ratio = a_kv_ratio;
+    m.b_kv_ratio = b_kv_ratio;
+    return m;
+}
 
 // 网格索引叶子：行号/列号/批次下标
 [[nodiscard]] inline RowIdxLeaf row()   { return {}; }
