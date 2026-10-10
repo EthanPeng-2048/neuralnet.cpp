@@ -106,6 +106,11 @@ struct GptConfig {
     // 接受 GPT 类型，或 ALiBi_GPT 类型（两种 spec 类型走同一构建路径）
     if (!spec.is_gpt() && !spec.is_alibi_gpt())
         NN_FAIL("Invalid ModelSpec type for GPT: expected GPT or ALiBi_GPT");
+    // ── 三值（T1_58）权重由**规格**决定（权威来源，docs 21 §4.7/§4.8.3）──
+    // 与 build_mnist_mlp_model 的加载路径同款：保存过的三值模型必须还原成
+    // BitLinear（参数形状相同、语义不同），命令行传进来的 precision 会被规格覆盖。
+    if (spec.weight_quant == WeightQuant::T1_58)
+        precision.param = Precision::T1_58;
     auto model = build_gpt_model(
         engine,
         spec.vocab_size, spec.d_model, spec.seq_len,

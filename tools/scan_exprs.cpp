@@ -615,6 +615,7 @@ int main(int argc, char* argv[])
             std::size_t          n_head_kv = 0;   // 0 = MHA；>0 = GQA（头映射结构）
             bool                 subln     = false;
             bool                 tie       = false;
+            bool                 ternary   = false;  // P1.5：param=T1_58 → BitLinear
         };
         for (const GptCase& c : {
                  GptCase{"gpt_learned_gelu_ln", nn::PosEncodingType::Learned,
@@ -637,7 +638,22 @@ int main(int argc, char* argv[])
                          nn::ActivationType::ReLU2, nn::NormType::RMSNorm,
                          // 模型 pass 的小配置 H=2 → n_head_kv=1 才得到 ratio>1
                          // （比率是**视图参数**、不进 key → 任意 n_rep 共用一份 shader）
-                         /*n_head_kv=*/1, /*subln=*/true, /*tie=*/true}})
+                         /*n_head_kv=*/1, /*subln=*/true, /*tie=*/true},
+                 // ── 三值 GPT（P1.5-W2）：权重侧接线后，注意力 4 个投影、
+                 //    fc1/fc2、LM head 全部是 BitLinear。BitLinear 的三段结构
+                 //    （τ 的 absmean 归约 / wq 的阈值 select / 去量化点积与 STE
+                 //    累加）已由 1b) 的 MLP 用例登记；这里再按 GPT 组合登记一遍，
+                 //    把"三值 + GQA/SubLN/tied + ReLU²/RoPE"这一整条链路钉进
+                 //    闭合世界（漏登记 = GPU 硬报错，见 AGENTS §7）。
+                 GptCase{"gpt_learned_gelu_ln_t1_58", nn::PosEncodingType::Learned,
+                         nn::ActivationType::GeLU, nn::NormType::LayerNorm,
+                         /*n_head_kv=*/0, /*subln=*/false, /*tie=*/false,
+                         /*ternary=*/true},
+                 GptCase{"gpt_rope_relu2_rms_gqa_subln_tied_t1_58",
+                         nn::PosEncodingType::RoPE, nn::ActivationType::ReLU2,
+                         nn::NormType::RMSNorm,
+                         /*n_head_kv=*/1, /*subln=*/true, /*tie=*/true,
+                         /*ternary=*/true}})
         {
             nn::GptConfig cfg;
             cfg.vocab_size = V; cfg.d_model = D; cfg.seq_len = S;
@@ -647,6 +663,7 @@ int main(int argc, char* argv[])
             cfg.subln = c.subln;
             cfg.tie_embeddings = c.tie;
             cfg.precision = prof;
+            if (c.ternary) cfg.precision.param = nn::Precision::T1_58;
             try_build(c.name, [&] { return nn::build_gpt_model(engine, cfg); }, ids);
         }
         // ── 5) RAPT：causal 维（RLA 的因果/双向是两组不同表达式）──

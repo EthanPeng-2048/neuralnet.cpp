@@ -740,6 +740,18 @@ int main(int argc, char *argv[])
     {
         // RLA 强约束：位置编码必须 RoPE（施加在 Q/K 进 ReLU 之前），强制覆盖
         cfg.pos_encoding = nn::PosEncodingType::RoPE;
+        // ── RAPT 的三值接线尚未落地（P1.5 范围，docs 21 §4.8.3）────────────
+        // RLA 注意力自持 4 个 Linear 且当前**不转发**精度 profile（与 roadmap
+        // P2「RAPT/CNN f16」同源）→ 留成"静默半三值"是最坏的选项，前置拒绝。
+        if (cfg.precision.param == nn::Precision::T1_58)
+        {
+            std::cerr << "RAPT 尚不支持三值权重（--precision-param t1_58）：RLA 注意力的"
+                         " 4 个 Linear 还没接 make_linear_layer，\n"
+                         "见 docs/development/21-quantized-weights.md §4.8.3。\n"
+                         "  · 三值 GPT：改用 --arch gpt\n"
+                         "  · 三值 MLP：mnist_train --arch mlp --precision-param t1_58\n";
+            std::exit(1);
+        }
         model_build = nn::build_rapt_model(*engine, nn::RAPTConfig{
             tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
             cfg.num_heads, cfg.d_ff, cfg.num_layers,
@@ -762,6 +774,13 @@ int main(int argc, char *argv[])
     // ── 打印精度配置 ──
     {
         const auto& pp = cfg.precision;
+        // 三值（T1_58）与"f16 存储"是两件事：前者 latent 恒 f32、只有量化缓冲是
+        // f16（P1.5-W2 起覆盖 GPT 的 4 个投影 + fc1/fc2 + LM head）。
+        if (pp.param == nn::Precision::T1_58)
+            std::cout << "[精度] 三值权重已启用（T1_58 / BitLinear：量化 forward + "
+                         "STE backward，latent 恒 f32）\n"
+                         "  [范围] GPT（注意力 4 投影 + FFN fc1/fc2 + 未 tie 的 LM head）；"
+                         "RAPT/Transformer 见 docs/development/21-quantized-weights.md §4.8.3\n";
         if (pp.param != nn::Precision::F32 || pp.compute != nn::Precision::F32 ||
             pp.stable != nn::Precision::F32 || pp.optimizer != nn::Precision::F32)
         {
@@ -822,6 +841,12 @@ int main(int argc, char *argv[])
             tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
             cfg.num_heads, cfg.d_ff, cfg.num_layers,
             cfg.pos_encoding, cfg.activation, cfg.norm_type);
+
+    // 三值权重（P1.5，docs 21 §4.7/§4.8.3）：param=t1_58 → 线性层用 BitLinear。
+    // 规格是**加载时的权威来源**（缺键 = None → 旧文件零破坏）；--resume 时下面
+    // 会用文件里的规格覆盖本行。
+    spec.weight_quant = (cfg.precision.param == nn::Precision::T1_58)
+                            ? nn::WeightQuant::T1_58 : nn::WeightQuant::None;
 
     if (cfg.load_existing)
     {

@@ -167,6 +167,17 @@ struct TernaryProfileSplit
     return profile;
 }
 
+// 「profile → 线性层种类」的**唯一**约定（与 MLP 工厂 `build_mnist_mlp_model`
+// 的 `ternary = (precision.param == T1_58)` 同源）：模型层构造时若 profile 的
+// param 槽声明了 T1_58，就等价于 weight_quant=T1_58（显式开关优先保留）。
+// 这样 CLI `--precision-param t1_58`、`ModelSpec.weight_quant` 与库 API 三条
+// 路径收敛到同一个判据，不存在"声明了三值却构造出普通 Linear"的组合。
+[[nodiscard]] inline WeightQuant effective_weight_quant(
+    const PrecisionProfile& profile, WeightQuant explicit_quant) noexcept
+{
+    return (profile.param == Precision::T1_58) ? WeightQuant::T1_58 : explicit_quant;
+}
+
 class Layer
 {
 protected:
