@@ -525,6 +525,29 @@ inline constexpr PrecisionProfile profile_f16() noexcept
         /*optimizer=*/ Precision::F32};
 }
 
+// ── 三值权重训练配方（CLI `--t1_58` 的语义）───────────────────────────────
+// {param=T1_58, compute=F16, stable=F32, optimizer=F32} = **f16 存储 + 三值权重**：
+// 定义就是 `profile_f16()` 把 param 换成 T1_58，其余三槽逐字段相同（下面按这个
+// 写法实现 → 另三槽不可能与 --f16 漂移）。于是**只有"线性层的权重"是三值**
+// （{-1,0,+1} + 逐行 absmean 尺度 γ，见 compute_layer_bitlinear.hpp），
+// 激活/张量存储仍是 F16、数值敏感链仍是 F32、优化器状态仍是 F32。
+//
+// 为什么 stable / optimizer 不跟着取 F16 —— 同 profile_f16() 的实测证据
+// （f16 下 CE 链 ~200 步 NaN、Adam 的 m/v 下溢发散）。想要字面"四槽全 f16"：
+//   --t1_58 --precision-stable f16 --precision-optimizer f16
+// （= profile_all_f16() 的 param 换成 T1_58，仍不可用于训练。）
+//
+// T1_58 只描述**权重**（不是存储精度：precision_bytes = 0，引擎/DSL 拒绝拿它
+// 建张量），因此持有线性子层的复合层要按 split_ternary_profile() 分流
+// （self = param 归一化为 f32 的那份，linear = param=T1_58 的那份）；
+// 接线范围与 CLI 语义见 docs/development/21-quantized-weights.md §4.10。
+inline constexpr PrecisionProfile profile_t1_58() noexcept
+{
+    PrecisionProfile p = profile_f16();   // compute/stable/optimizer 逐字段跟随 --f16
+    p.param = Precision::T1_58;           // 只有权重槽变三值
+    return p;
+}
+
 // 全 f16：四个字段全部 F16（激进实验配方；见上：当前数值上不可用于训练）。
 // 注意与其它两种 f16 相关 profile 区分——CLI `--f16` = profile_f16()
 // （param:F16, compute:F16, stable:F32, optimizer:F32），profile_master_weights()

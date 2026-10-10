@@ -113,10 +113,12 @@ void print_usage(const char *prog)
     help.opt("--lr-per-epoch <v1,v2,...>", "手动指定每轮学习率 (逗号分隔，优先级最高)");
 
     help.section("混合精度 (docs/development/05-mixed-precision.md)");
-    help.opt("--f16", "快捷方式: master-weights 配方\n(param=f32, compute=f16, stable=f32, optimizer=f32)");
+    help.opt("--f16", "快捷方式: f16 存储 (param/compute=F16，stable/optimizer=F32)");
+    help.opt("--t1_58", "快捷方式: 精度预设 t1_58 = f16 存储 + 三值权重\n(param=T1_58，compute=F16，stable/optimizer=F32；等价于 --f16 再把 param 换成 t1_58)");
     help.opt("--precision-param <f16|f32|t1_58>",
-             "权重/参数精度 (默认: f32)；t1_58 = 三值权重 BitLinear（1.58-bit，"
-             "MLP 路径；docs/development/21-quantized-weights.md）");
+             "权重/参数精度 (默认: f32)；t1_58 = 三值权重 BitLinear（1.58-bit）；"
+             "本入口仅 MLP 架构支持（transformer/CNN 由层能力校验报错），"
+             "GPT 见 text_train；docs/development/21-quantized-weights.md");
     help.opt("--precision-compute <f16|f32>", "常规算子计算精度 (默认: f32)");
     help.opt("--precision-stable <f16|f32>", "数值敏感算子精度 (默认: f32)");
     help.opt("--precision-optimizer <f16|f32>", "优化器状态精度 (默认: f32)");
@@ -393,6 +395,11 @@ TrainConfig parse_args(int argc, char *argv[])
         else if (arg == "--f16")
         {
             cfg.precision = nn::profile_f16();   // param+compute f16（stable/optimizer f32）
+        }
+        else if (arg == "--t1_58")
+        {
+            // 精度预设 t1_58 = 三值权重 + f16 存储（= --f16 再把 param 换成 t1_58）
+            cfg.precision = nn::profile_t1_58();
         }
         else if (arg == "--precision-param" && i + 1 < argc)
         {
