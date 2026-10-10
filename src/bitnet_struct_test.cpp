@@ -289,10 +289,9 @@ nn::Matrix repeat_kv_rows(const nn::Matrix& src, std::size_t d_k,
 }
 
 // ── [7] GQA 退化：n_head_kv == num_heads 与 MHA 逐位一致 ────────────────
-void test_gqa_mha_equivalence()
+void test_gqa_mha_equivalence(nn::ComputeEngine& eng, const char* tag)
 {
-    std::puts("[7] GQA 退化：n_head_kv == num_heads 与 MHA 逐位一致");
-    nn::CpuEngine eng;
+    std::printf("[7] GQA 退化：n_head_kv == num_heads 与 MHA 逐位一致（%s）\n", tag);
     const std::size_t D = 16, H = 4, S = 4, B = 2;
 
     // 声明式初始化是**确定性**的（kInitSeed）→ 同构两层的权重逐位相同
@@ -340,10 +339,13 @@ void test_gqa_mha_equivalence()
 
 // ── [8] GQA 头映射：等价于"把 KV 权重按块映射复制成 MHA" ─────────────────
 // 这条同时**钉住约定**：块映射 h/(H/n_kv)（若实现误用 h%n_kv，本用例必挂）
-void test_gqa_head_mapping()
+void test_gqa_head_mapping(nn::ComputeEngine& eng, const char* tag)
 {
-    std::puts("[8] GQA 头映射 = 块映射（与复制成 MHA 对拍）");
-    nn::CpuEngine eng;
+    std::printf("[8] GQA 头映射 = 块映射（与复制成 MHA 对拍，%s）\n", tag);
+    // 与 scan_exprs 的登记**故意不同配置**（heads=4/n_head_kv=2 → n_rep=2，
+    // 而 scan 登记用 heads=2/n_head_kv=1）：头分组比是运行期的视图参数、
+    // **不进 key** → 两侧必须折叠出同一 fold key。这条同时验证"任意 n_rep
+    // 共用一份 AOT shader"。
     const std::size_t D = 16, H = 4, S = 4, B = 2, n_kv = 2;
     const std::size_t d_k = D / H;
 
@@ -798,8 +800,12 @@ int main(int argc, char* argv[])
     test_subln_changes_forward();
     test_subln_spec_roundtrip();
     test_subln_spec_matches();
-    test_gqa_mha_equivalence();
-    test_gqa_head_mapping();
+    {   // GQA 对拍：CPU 必跑；--gpu 时**再在真实 GPU 上跑一遍**（P2 的
+        // in-kernel 头映射（HeadGroup 视图 + vp 槽）只有 GPU 才真正生效）
+        nn::CpuEngine cpu_eng;
+        test_gqa_mha_equivalence(cpu_eng, "CPU");
+        test_gqa_head_mapping(cpu_eng, "CPU");
+    }
     test_gqa_spec();
     test_tied_embedding();
     test_tied_spec();
@@ -812,6 +818,8 @@ int main(int argc, char* argv[])
         ec.use_gpu = true;
         auto eng_r = nn::cli::create_engine(ec);
         NN_EXIT(eng_r, 77, "GPU 不可用，跳过: ");
+        test_gqa_mha_equivalence(**eng_r, "GPU");
+        test_gqa_head_mapping(**eng_r, "GPU");
         if (!test_training(**eng_r, "GPU")) g_failures++;
     }
     else

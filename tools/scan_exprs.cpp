@@ -328,6 +328,19 @@ int main(int argc, char* argv[])
             attn_ad.set_doc_ids(doc_ids);
             run_csa(attn_ad);
         }
+        // GQA（docs/development/22 §3.2 的 P2）：K/V_t 走 **HeadGroup 视图**
+        //   （头分组比是运行期 vp 参数、**不进 key** → 登记一次覆盖任意 n_rep，
+        //   但"视图种类"本身是结构 → 必须是独立一条，否则 GPU 闭合世界对
+        //   GQA 的 fold 直接硬报错）。heads=2 / n_head_kv=1 → ratio 2。
+        {
+            nn::CausalSelfAttention attn_gqa(d_model, heads, 1024, seq,
+                                             nn::PosEncodingType::RoPE,
+                                             /*subln=*/false, nn::NormType::LayerNorm,
+                                             /*n_head_kv=*/1);
+            attn_gqa.set_precision_profile(scan_prof);
+            (void)attn_gqa.init(engine);
+            run_csa(attn_gqa);
+        }
     }
 
     // ── MultiHeadAttention（MHA=Plain 双向无掩码）───────────────
@@ -599,6 +612,9 @@ int main(int argc, char* argv[])
             nn::PosEncodingType  pe;
             nn::ActivationType   act;
             nn::NormType         norm;
+            std::size_t          n_head_kv = 0;   // 0 = MHA；>0 = GQA（头映射结构）
+            bool                 subln     = false;
+            bool                 tie       = false;
         };
         for (const GptCase& c : {
                  GptCase{"gpt_learned_gelu_ln", nn::PosEncodingType::Learned,
@@ -613,12 +629,23 @@ int main(int argc, char* argv[])
                          nn::ActivationType::SwiGLU, nn::NormType::RMSNorm},
                  // BitNet 2B4T 形态：门控平方 ReLU（relu2 ≠ swiglu ≠ gelu）
                  GptCase{"gpt_rope_relu2_rms", nn::PosEncodingType::RoPE,
-                         nn::ActivationType::ReLU2, nn::NormType::RMSNorm}})
+                         nn::ActivationType::ReLU2, nn::NormType::RMSNorm},
+                 // 2B4T 完整组合：GQA（HeadGroup 视图）+ SubLN + tied head。
+                 // GQA 的 fold / masked_scores / grad_A / grad_Q 是**新结构**
+                 //   （K/V 走 HeadGroup 视图）→ 必须在此登记（闭合世界）。
+                 GptCase{"gpt_rope_relu2_rms_gqa_subln_tied", nn::PosEncodingType::RoPE,
+                         nn::ActivationType::ReLU2, nn::NormType::RMSNorm,
+                         // 模型 pass 的小配置 H=2 → n_head_kv=1 才得到 ratio>1
+                         // （比率是**视图参数**、不进 key → 任意 n_rep 共用一份 shader）
+                         /*n_head_kv=*/1, /*subln=*/true, /*tie=*/true}})
         {
             nn::GptConfig cfg;
             cfg.vocab_size = V; cfg.d_model = D; cfg.seq_len = S;
             cfg.num_heads = H; cfg.d_ff = F; cfg.num_layers = L;
             cfg.pos_enc = c.pe; cfg.activation = c.act; cfg.norm_type = c.norm;
+            cfg.n_head_kv = c.n_head_kv;
+            cfg.subln = c.subln;
+            cfg.tie_embeddings = c.tie;
             cfg.precision = prof;
             try_build(c.name, [&] { return nn::build_gpt_model(engine, cfg); }, ids);
         }
@@ -688,16 +715,23 @@ int main(int argc, char* argv[])
                     continue;   // 无掩码 + ALiBi 不是本仓会构造的组合
                 for (const std::uint32_t dk : {2u, 4u, 8u})
                 {
-                    const nn::ExprSpec as =
-                        nn::expr::make_fold_attn_o(64, dk, 2, mask, score_bias);
-                    if (auto v = nn::validate_expr_spec(as, as.views.size()); !v)
+                    // kv_ratio=1（MHA）与 >1（GQA，K/V_t 走 HeadGroup 视图）是
+                    // **两个结构**（视图种类进 key）；但头分组比本身是运行期 vp
+                    // 参数、**不进 key** → 这里登记一次 kv_ratio=2 即覆盖任意
+                    // n_rep（docs/development/22 §3.2 P2）。
+                    for (const std::uint32_t kv_ratio : {1u, 2u})
                     {
-                        std::fprintf(stderr,
-                                     "[FAIL] attn fold 样例 validate 失败: %s\n",
-                                     v.error().message.c_str());
-                        return 1;
+                        const nn::ExprSpec as =
+                            nn::expr::make_fold_attn_o(64, dk, 2, mask, score_bias, kv_ratio);
+                        if (auto v = nn::validate_expr_spec(as, as.views.size()); !v)
+                        {
+                            std::fprintf(stderr,
+                                         "[FAIL] attn fold 样例 validate 失败: %s\n",
+                                         v.error().message.c_str());
+                            return 1;
+                        }
+                        reg_all.add(as);
                     }
-                    reg_all.add(as);
                 }
             }
         }

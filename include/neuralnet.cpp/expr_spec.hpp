@@ -193,6 +193,15 @@ enum class ExprViewKind : uint8_t
     //   RowAccess 同属"逐元素索引/局部读取"类，走 elementwise 生成路径。
     GroupedReduceSum = 13,
     GroupedReduceMax = 14,
+    // ── GQA 头分组（docs/development/22 §3.2 的 P2 in-kernel 版）──────────
+    // 读取语义**同 Linear**（恒等索引）；区别只在 `param`：它是该操作数的
+    // **头分组比**（n_rep > 1 时表示"只存 1/n_rep 份行块、多个连续 query 头
+    // 共享一个 KV 头"，块映射同 llama.cpp FA 的 ik2=iq2/rk2 与 HF repeat_kv）。
+    // param 是**运行时形状数据 → 不进 expr_spec_key**（同 RowMod 的 d_k）：
+    // 任意 n_rep 共用一份 shader，运行时经 push constant vp 槽填充 —— 这正是
+    // 它必须做成"视图参数"而不是"算子结构字段"的原因（后者会让每个 n_rep
+    // 各要一份 shader，闭合世界对未登记 n_rep 必然 miss）。
+    HeadGroup = 15,
 };
 
 // ── 归约视图辅助（引擎/校验共用）──────────────────────────────────────
@@ -489,6 +498,7 @@ struct ExprSpec
     // 分组归约的 R（= 池化窗口面积）同理：运行期循环取代编译期展开链。
     return k == ExprViewKind::RowMod || k == ExprViewKind::RotateHalf ||
            k == ExprViewKind::BatchMod || k == ExprViewKind::BatchCol ||
+           k == ExprViewKind::HeadGroup ||
            k == ExprViewKind::RowAccess ||
            k == ExprViewKind::GroupedReduceSum ||
            k == ExprViewKind::GroupedReduceMax;
@@ -509,6 +519,19 @@ struct ExprSpec
             n += expr_view_runtime_param_slots(static_cast<ExprViewKind>(v.kind));
     return n;
 }
+// ── GQA：该输入的"头分组比"（docs/development/22 §3.2 P2）────────────────
+// HeadGroup 视图的 param 即该操作数的头分组比 n_rep（1 = 恒等/非 GQA）。
+// GPU 生成器与 CPU 参考都从这里取——单一真源，避免两侧口径漂移。
+[[nodiscard]] inline std::uint32_t gqa_ratio_of(const ExprSpec& s,
+                                                std::size_t view_idx) noexcept
+{
+    if (view_idx >= s.views.size())
+        return 1;
+    if (static_cast<ExprViewKind>(s.views[view_idx].kind) != ExprViewKind::HeadGroup)
+        return 1;
+    return s.views[view_idx].param != 0 ? s.views[view_idx].param : 1;
+}
+
 // 按视图顺序提取运行时视图参数（RowMod 周期 / RotateHalf 块大小 / RowAccess
 // 的 mod+offset），运行时 eval_expr 用它填充融合 shader 的 push constant vp 槽。
 [[nodiscard]] inline std::vector<std::uint32_t> expr_spec_runtime_view_params(
@@ -1054,7 +1077,8 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
                     const auto vk = static_cast<ExprViewKind>(spec.views[opnd.idx].kind);
                     if (expr_view_is_reduce(vk))
                         NN_FAIL("validate_expr_spec: fold body: reduce-view input not allowed");
-                    if (vk == ExprViewKind::Linear || vk == ExprViewKind::RowMod ||
+                    if (vk == ExprViewKind::Linear || vk == ExprViewKind::HeadGroup ||
+                        vk == ExprViewKind::RowMod ||
                         vk == ExprViewKind::RowBroadcast)
                         ;  // 标量域恒允许；RowBroadcast = 行参数向量（b[row]，
                            //   无列依赖——doc_col 等行级掩码参数恒可用）
@@ -1266,4 +1290,3 @@ namespace expr
 } // namespace expr
 
 } // namespace nn
-
