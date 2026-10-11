@@ -765,26 +765,13 @@ public:
     // ══════════════════════════════════════════════════════════════════════
 
     // ── 三值打包权重（P2 / F3）：打包字容器 + 量化 GEMM ────────────────────
-    // 能力位 = 打包与 GEMM 两个 pipeline 都在（缺任一 → BitLinear 走 f16 稠密
-    // 缓冲，见 compute_layer_bitlinear.hpp 的 use_packed_）。
-    [[nodiscard]] bool supports_ternary_gemm() const noexcept override
-    {
-        return backend_.has_trit_pack_pipeline() && backend_.has_matmul_q_pipeline();
-    }
-
-    // P3 门禁：设备侧 int8 点积（DP4A 语义）是否可用
-    [[nodiscard]] bool supports_int8_dot() const noexcept override
-    {
-        return backend_.device().has_int8_dot();
-    }
-    [[nodiscard]] bool int8_dot_accelerated() const noexcept override
-    {
-        return backend_.device().int8_dot_accelerated();
-    }
-
+    // 引擎私有能力：打包 pipeline 与 matmul_q pipeline 都在（缺任一 →
+    // `matmul_q_impl` / `trit_pack_impl` 在此 fail-fast；对外事实见 describe()）。
     [[nodiscard]] Result<Tensor> trit_pack_impl(const Tensor& w,
                                                 const Tensor& scale) override
     {
+        if (!(backend_.has_trit_pack_pipeline() && backend_.has_matmul_q_pipeline()))
+            NN_FAIL("trit_pack: 该设备未创建三值打包 pipeline（docs 21 §5 P2）");
         if (!w.is_gpu() || !scale.is_gpu())
             NN_FAIL("trit_pack: GPU 张量必需");
         if (w.precision() != Precision::F32 || scale.precision() != Precision::F32)
@@ -807,6 +794,8 @@ public:
                                                bool transA, std::size_t out_rows,
                                                Precision P) override
     {
+        if (!(backend_.has_trit_pack_pipeline() && backend_.has_matmul_q_pipeline()))
+            NN_FAIL("matmul_q: 该设备未创建三值 GEMM pipeline（docs 21 §5 P2）");
         if (!packed.is_gpu() || !scale.is_gpu() || !B.is_gpu())
             NN_FAIL("matmul_q: GPU 张量必需（跨设备请先 import）");
         if (packed.precision() != Precision::F32)
@@ -956,29 +945,9 @@ public:
         auto [spec, inputs] = nn::dsl::to_expr_spec(
             nn::dsl::matmul(A, B, transA, transB, 1) + nn::dsl::row_broadcast(bias));
         NN_TRY(v, nn::validate_expr_spec(spec, inputs.size()));
-        if (supports_expr_precision_variant(spec, inputs, P))
-            return eval_expr(spec, inputs, rows, cols, P);
-
-        // ── 边界 cast 回退（带类型变体未预生成）──────────────────────────
-        const Tensor* ops[3] = {&A, &B, &bias};
-        Tensor c32[3];
-        for (int i = 0; i < 3; ++i)
-        {
-            if (ops[i]->precision() == Precision::F32)
-            {
-                c32[i] = *ops[i];
-                continue;
-            }
-            auto c = cast(*ops[i], Precision::F32);
-            NN_TRY_CHECK(c);
-            c32[i] = std::move(*c);
-        }
-        auto r = nn::dsl::compute(*this,
-            nn::dsl::matmul(c32[0], c32[1], transA, transB, 1)
-                + nn::dsl::row_broadcast(c32[2]),
-            rows, cols);
-        NN_TRY_CHECK(r);
-        return cast(*r, P);
+        // 变体选路与"无变体 → 边界 cast 回退"都在 eval_expr_impl 内部
+        //（F2 修复后基类入口不再代劳）；这里只需把 P 下传。
+        return eval_expr(spec, inputs, rows, cols, P);
     }
 
     // ── 批量矩阵乘法：按 batch 切分行块，单次 dispatch 处理所有 batch ──
@@ -1263,7 +1232,7 @@ public:
             static_cast<uint32_t>(dk), static_cast<uint32_t>(heads), causal,
             n32->gpu_tensor(), has_bnd);
         NN_TRY_CHECK(res);
-        return Tensor::from_gpu(std::move(*res));
+        return to_prec(Tensor::from_gpu(std::move(*res)), prec);
     }
 
     [[nodiscard]] Result<Tensor> scan_suffix_outer_impl(
@@ -1298,7 +1267,7 @@ public:
             static_cast<uint32_t>(dk), static_cast<uint32_t>(heads), causal,
             n32->gpu_tensor(), has_bnd);
         NN_TRY_CHECK(res);
-        return Tensor::from_gpu(std::move(*res));
+        return to_prec(Tensor::from_gpu(std::move(*res)), prec);
     }
 
     [[nodiscard]] Result<Tensor> outer_col_impl(
@@ -1328,7 +1297,7 @@ public:
             p32->gpu_tensor(), r32->gpu_tensor(), s32->gpu_tensor(),
             static_cast<uint32_t>(dk), has_scale);
         NN_TRY_CHECK(res);
-        return Tensor::from_gpu(std::move(*res));
+        return to_prec(Tensor::from_gpu(std::move(*res)), prec);
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1360,25 +1329,26 @@ public:
         return backend_.reduce_gpu(a_gpu->gpu_tensor(), mode, reduce_op);
     }
 
-    [[nodiscard]] Result<Tensor> row_reduce_sum_impl(const Tensor& A, Precision = Precision::F32) override
+    [[nodiscard]] Result<Tensor> row_reduce_sum_impl(const Tensor& A, Precision P = Precision::F32) override
     {
+        // 归约恒 f32 累加；输出按 P 落回（原生 f16 输入由 reduce_f16_or_cast_ 处理）
         auto r = reduce_f16_or_cast_(A, /*mode=*/0u, /*reduce_op=*/0u);
         NN_TRY_CHECK(r);
-        return Tensor::from_gpu(std::move(*r));
+        return to_prec(Tensor::from_gpu(std::move(*r)), P);
     }
 
-    [[nodiscard]] Result<Tensor> col_reduce_sum_impl(const Tensor& A, Precision = Precision::F32) override
+    [[nodiscard]] Result<Tensor> col_reduce_sum_impl(const Tensor& A, Precision P = Precision::F32) override
     {
         auto r = reduce_f16_or_cast_(A, /*mode=*/1u, /*reduce_op=*/0u);
         NN_TRY_CHECK(r);
-        return Tensor::from_gpu(std::move(*r));
+        return to_prec(Tensor::from_gpu(std::move(*r)), P);
     }
 
-    [[nodiscard]] Result<Tensor> col_reduce_max_impl(const Tensor& A, Precision = Precision::F32) override
+    [[nodiscard]] Result<Tensor> col_reduce_max_impl(const Tensor& A, Precision P = Precision::F32) override
     {
         auto r = reduce_f16_or_cast_(A, /*mode=*/1u, /*reduce_op=*/1u);
         NN_TRY_CHECK(r);
-        return Tensor::from_gpu(std::move(*r));
+        return to_prec(Tensor::from_gpu(std::move(*r)), P);
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1524,6 +1494,16 @@ public:
                 return Tensor::from_gpu(std::move(*out));
             }
 #endif
+            // 非 f32（输入或输出精度）却未命中变体 → 引擎内边界 cast 回退
+            // （抬 f32 重入；F2 修复后基类不再代劳）
+            if (!all_f32(inputs) || P != Precision::F32)
+            {
+                auto in32 = to_f32_all(inputs);
+                NN_TRY_CHECK(in32);
+                auto r = eval_expr_impl(raw_spec, *in32, rows, cols, Precision::F32);
+                NN_TRY_CHECK(r);
+                return to_prec(std::move(*r), P);
+            }
             NN_FAIL("GpuEngine::eval_expr: fold 表达式未命中 AOT 融合 shader"                 "（闭合世界）；请将该 fold 结构纳入 scan_exprs；key=" + fkey);
         }
         // ── canonical IR：canonicalize 为引擎内部优化（IR-A/IR-B），
@@ -1575,54 +1555,44 @@ public:
         }
 #endif
 
-        // f16 存储进了原生引擎却没命中带类型变体：**不能**把 f16 buffer 绑到
-        // f32 shader 上（静默错值）→ 明确报错，明确报错（NVI 入口本应已拦截——能力查询
-        // 与 shader 查询不一致时才会到这里）。
+        // 带类型变体未预生成（in-kernel f16 覆盖不足）→ **引擎内边界 cast 回退**：
+        // 输入抬 f32 → 重入本函数（psig==0，走 f32 融合 shader）→ 输出按 P 落回。
+        // 绝不把 f16 buffer 绑到 f32 shader 上（静默错值）。此前这段由基类 NVI
+        // 入口代为处理（能力查询 + 二次归因）；F2 修复后归因/选路只做一次。
         if (psig != 0)
-            NN_FAIL("GpuEngine::eval_expr: 该 (结构,精度) 变体未预生成（in-kernel f16 覆盖不足）"                 "；NVI 入口本应在此前抬到 f32（supports_expr_precision_variant 与 shader 查询不一致）"                 "；key=" + key);
+        {
+            if (prec_trace_enabled_())
+                trace_miss_(raw_spec, inputs, P);
+            auto in32 = to_f32_all(inputs);
+            NN_TRY_CHECK(in32);
+            auto r = eval_expr_impl(raw_spec, *in32, rows, cols, Precision::F32);
+            NN_TRY_CHECK(r);
+            return to_prec(std::move(*r), P);
+        }
         // ── 闭合世界：未命中任何 AOT 融合 shader → 硬报错（绝不静默回退） ──
         // 带上 key：闭合世界报错必须可定位——key 是登记/查表两侧的唯一标识，
         // 可用来查 fused_registry.hpp 里有没有该条目、以及它属于哪个 Layer 路径。
         NN_FAIL("GpuEngine::eval_expr: 未找到该内联表达式的 AOT 融合 shader（闭合世界）；"             "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）；"             "key=" + key);
     }
 
-    // ── 归约向量原生形状输出（LayerNorm/RMSNorm 小向量缓存） ────────
-    // ── 精度变体能力查询（Phase 2 in-kernel f16）──────────────────────────
-    // 只有 (结构, 真实输入精度, 目标输出精度) 的带类型 shader 已注册时才为 true：
-    // 适配层据此决定"直接吃 f16"还是"边界 cast 回退"。
-    [[nodiscard]] bool supports_native_data_move() const noexcept override { return true; }
-    // Phase C2：f16 归约——reduce_f16_pipeline_ 创建成功即原生（设备无
-    // 16bit 存储时为 false → 适配层维持边界 cast，与引擎内回退等价但
-    // 归因表仍可见）。
-    [[nodiscard]] bool supports_native_f16_reduce() const noexcept override
+    // ── 能力摘要（唯一对外通道；只披露事实，不用于选路）──────────────────
+    // 设备事实在 init 期已解析（pipeline 创建结果）；这里只做只读汇总。
+    [[nodiscard]] EngineInfo describe() const override
     {
-        return backend_.has_reduce_f16_pipeline();
+        EngineInfo i;
+        i.engine = "vulkan";
+        i.device = backend_.device().device_name();
+        i.native_f16_move = true;      // 字节级搬运 + 引擎内 cast 回退
+        i.native_f16_reduce = backend_.has_reduce_f16_pipeline();
+        i.fused_prec_variant = true;   // 有带类型融合 shader 机制（AOT 闭合世界）
+        i.ternary_gemm = backend_.has_trit_pack_pipeline() &&
+                         backend_.has_matmul_q_pipeline();
+        i.int8_dot = backend_.device().has_int8_dot();
+        i.int8_dot_accelerated = backend_.device().int8_dot_accelerated();
+        return i;
     }
 
-    [[nodiscard]] bool supports_expr_precision_variant(
-        const ExprSpec& raw_spec, std::span<const Tensor> inputs,
-        Precision P = Precision::F32) const override
-    {
-#ifdef NN_FUSED_REGISTRY_EMBEDDED
-        // psig == 0（全 f32）：基类快路径直通，无需变体。
-        // psig != 0：选路与 eval_expr_impl 完全同源（`#a` native16 优先 →
-        // `#x` 运行期分派）。**本函数只是查询**（NVI 入口每次都调）→ 传
-        // log_hit=false，否则 NN_PREC_TRACE 的命中计数会翻倍。
-        const nn::ExprPrecSig psig = nn::expr_prec_sig_of(inputs, P);
-        if (psig == 0)
-            return false;
-        // 查表 key 与 native16 谓词都必须在 **canonical** 形态上求值：登记端
-        // 存的是 canonical spec，生成期的谓词判定也基于它（如常量折叠会改
-        // 常量值）。对 raw_spec 求值可能与生成端不一致 → 静默选错变体。
-        const ExprSpec canon = nn::canonicalize_expr_spec(raw_spec);
-        const std::string key = nn::expr_spec_key(canon);
-        const auto* fs = find_prec_variant_(key, psig, canon);
-        return fs != nullptr && backend_.has_fused_shader(fs->key);
-#else
-        (void)raw_spec; (void)inputs; (void)P;
-        return false;
-#endif
-    }
+    // ── 归约向量原生形状输出（LayerNorm/RMSNorm 小向量缓存） ────────
     // 与 eval_expr 相同，但以 vector_out=1 调度归约融合 shader（thread 0 写
     // (rows,1)/(1,cols) 归约向量，不写全尺寸广播）。
     [[nodiscard]] Result<Tensor> eval_expr_reduce_impl(
@@ -1693,8 +1663,17 @@ public:
             return Tensor::from_gpu(std::move(*out));
         }
 #endif
+        // 变体未预生成 → 引擎内边界 cast 回退（抬 f32 重入；F2 修复）
         if (psig != 0)
-            NN_FAIL("GpuEngine::eval_expr_reduce: 该 (结构,精度) 变体未预生成（in-kernel f16 覆盖不足）"                 "；NVI 入口本应在此前抬到 f32（supports_expr_precision_variant 与 shader 查询不一致）");
+        {
+            if (prec_trace_enabled_())
+                trace_miss_(raw_spec, inputs, P);
+            auto in32 = to_f32_all(inputs);
+            NN_TRY_CHECK(in32);
+            auto r = eval_expr_reduce_impl(raw_spec, *in32, rows, cols, Precision::F32);
+            NN_TRY_CHECK(r);
+            return to_prec(std::move(*r), P);
+        }
         // ── 闭合世界：未命中归约融合 shader → 硬报错（绝不静默回退） ──
         NN_FAIL("GpuEngine::eval_expr_reduce: 未找到该归约表达式的 AOT 融合 shader（闭合世界）；"             "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）；"             "key=" + key);
     }
@@ -1770,8 +1749,19 @@ public:
             return {};
         }
 #endif
+        // 变体未预生成 → 引擎内边界 cast 回退（目标 f16：在 f32 空间求值后
+        // cast_into 写回 dst 原存储；F2 修复）
         if (psig != 0)
-            NN_FAIL("GpuEngine::eval_expr_into: 该 (结构,精度) 变体未预生成（in-kernel f16 覆盖不足）"                 "；NVI 入口本应在此前抬到 f32（supports_expr_precision_variant 与 shader 查询不一致）");
+        {
+            if (prec_trace_enabled_())
+                trace_miss_(raw_spec, inputs, dst.precision());
+            auto in32 = to_f32_all(inputs);
+            NN_TRY_CHECK(in32);
+            auto tmp = create_tensor(rows, cols, Precision::F32);
+            auto r = eval_expr_into_impl(raw_spec, *in32, rows, cols, tmp);
+            NN_TRY_CHECK(r);
+            return cast_into(tmp, dst);
+        }
         // ── 闭合世界：未命中 AOT 融合 shader → 硬报错（绝不静默回退） ──
         NN_FAIL("GpuEngine::eval_expr_into: 未找到该表达式的 AOT 融合 shader（闭合世界）；"             "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）；"             "key=" + key);
     }

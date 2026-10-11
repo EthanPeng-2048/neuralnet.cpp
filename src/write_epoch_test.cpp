@@ -364,7 +364,7 @@ void test_bitlinear_cache(nn::ComputeEngine& eng, const char* tag)
     }
 
     // ── [7b] 打包路径同样命中缓存（F1 × F3 的交叉）────────────────────────
-    if (eng.supports_ternary_gemm())
+    if (eng.describe().ternary_gemm)
     {
         nn::BitLinear pk = make_bitlinear(eng, IN, OUT, W, /*packed=*/true);
         CHECK(pk.uses_packed_weights(), "打包路径已启用");

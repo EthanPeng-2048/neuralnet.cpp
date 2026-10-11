@@ -377,9 +377,9 @@ void run_scale(ComputeEngine& e, const BenchConfig&, OpCtx& ctx)
 void make_packed(ComputeEngine& e, std::size_t rows, std::size_t len,
                  Tensor& packed, Tensor& tau)
 {
-    if (!e.supports_ternary_gemm())
+    if (!e.describe().ternary_gemm)
     {
-        std::printf("  该引擎不支持三值打包 GEMM（supports_ternary_gemm() == false）\n");
+        std::printf("  该引擎不支持三值打包 GEMM（describe().ternary_gemm == false）\n");
         std::abort();
     }
     Matrix w(rows, len);

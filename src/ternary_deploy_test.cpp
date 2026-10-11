@@ -98,7 +98,7 @@ std::size_t file_size(const std::string& path)
 void test_deploy(nn::ComputeEngine& eng, const char* tag)
 {
     std::printf("[1..5] 三值部署格式：载入逐位等价 / packed-only / 尺寸账（%s）\n", tag);
-    if (!eng.supports_ternary_gemm())
+    if (!eng.describe().ternary_gemm)
     {
         std::puts("    （该引擎不支持三值 GEMM → 跳过；部署格式要求打包路径）");
         return;
@@ -253,7 +253,7 @@ std::string walk_signature(nn::Model& model)
 void test_gpt_deploy(nn::ComputeEngine& eng, const char* tag)
 {
     std::printf("[6] GPT 嵌套三值层：部署往返（%s）\n", tag);
-    if (!eng.supports_ternary_gemm())
+    if (!eng.describe().ternary_gemm)
     {
         std::puts("    （该引擎不支持三值 GEMM → 跳过）");
         return;

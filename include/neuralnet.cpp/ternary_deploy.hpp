@@ -217,10 +217,10 @@ template <typename Fn>
                 return {};
             }
 
-            // 打包条目：确保量化派生物有效（部署格式的收益全在这条分支上）
-            if (!engine.supports_ternary_gemm())
-                NN_FAIL("save_deployment: 该引擎不支持三值 GEMM，无法导出打包权重"
-                        "（部署文件要求打包形态）");
+            // 打包条目：确保量化派生物有效（部署格式的收益全在这条分支上）。
+            // 注意：本文件（NNQT 独立部署格式）已列入库级清理（docs 23），
+            // 由 v7 单一格式 + .nnmodel 角色取代；能力检查已下沉到引擎，
+            // 不支持打包的引擎会在 trit_pack 处 fail-fast。
             if (!bl->uses_packed_weights()) bl->set_ternary_pack_enabled(true);
             NN_TRY(q, bl->ensure_quantized());
             auto cont_r = engine.to_matrix(bl->quantized_weights_packed(), Precision::F32);

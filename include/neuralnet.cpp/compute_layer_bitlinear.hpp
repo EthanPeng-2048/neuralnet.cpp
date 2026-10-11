@@ -59,14 +59,14 @@ private:
     Tensor wq_packed_;   // (out, ceil(in/16)) f32 容器，2 bit/权重（P2/F3 路径）
     Tensor tau_;         // (out_features, 1) f32，逐行 absmean
 
-    // 打包路径开关：由引擎能力（`supports_ternary_gemm()`）决定。false = 退回
-    // f16 稠密缓冲（尚未接打包的后端）；两条路径的数值口径由
-    // src/ternary_gemm_test.cpp 对拍。
+    // 缓冲形态：**打包容器是默认形态**（训练与解码同一条路）。层不查引擎
+    // 能力 —— 不支持打包的引擎由 trit_pack/matmul_q 自行 fail-fast。
+    // f16 稠密缓冲仅作为 `force_pack_ = 0` 的 A/B 对照形态保留（数值口径由
+    // src/ternary_gemm_test.cpp 对拍）。
     bool use_packed_ = false;
 
     // 打包路径开关（F3 的实测结论，2026-10-11，102/40HX）：
-    //   · 默认 = **跟随引擎能力**（`supports_ternary_gemm()`）；
-    //   · `force_pack_`：-1 = 跟随能力；0/1 = 强制关/开（A/B 与回退用）。
+    //   · 默认 = 打包（-1）；0/1 = 强制关/开（A/B 与回退用）。
     // 为什么不再按激活宽度选址：**分块解码版** `matmul_q.comp` 落地后，打包路径在
     // 宽 batch（训练）下也与 f16 稠密分块 GEMM 持平 —— 实测 d256/L4 60 步
     // 2.0 s vs 2.0 s、d512/L8 30 步 5.2 s vs 5.1 s；同时省下 wq 的
@@ -122,9 +122,9 @@ public:
         b_ = engine.create_tensor(out_features_, 1, Precision::F32, InitSpec::zero());
         if (!b_.valid()) NN_FAIL("BitLinear: 偏置初始化失败");
         // 梯度缓冲**不在此分配**（F2）：惰性 + 只训练时分配，见 ensure_grad_()。
-        // 量化缓冲：引擎支持三值 GEMM → 打包容器（2 bit/权重，F3）；否则退回
-        // f16 稠密缓冲（{-1,0,1} 在 f16 下精确可表示）。
-        use_packed_ = engine.supports_ternary_gemm();
+        // 量化缓冲：**打包容器**（2 bit/权重，F3）是默认也是唯一形态 ——
+        // 能力判断不下沉到层（引擎不支持时由 matmul_q/trit_pack 自行 fail-fast）。
+        use_packed_ = true;
         ensure_quant_buffer_();
         tau_ = engine.create_tensor(out_features_, 1, Precision::F32, InitSpec::zero());
         if (!tau_.valid()) NN_FAIL("BitLinear: 尺度缓冲初始化失败");
@@ -138,7 +138,7 @@ public:
     void set_ternary_pack_enabled(bool enabled)
     {
         force_pack_ = enabled ? 1 : 0;
-        const bool target = enabled && engine_ref().supports_ternary_gemm();
+        const bool target = enabled;
         if (target == use_packed_) return;
         use_packed_ = target;
         quant_valid_ = false;
@@ -149,7 +149,7 @@ public:
     void set_ternary_pack_auto()
     {
         force_pack_ = -1;
-        const bool target = engine_ref().supports_ternary_gemm();
+        const bool target = true;
         if (target == use_packed_) return;
         use_packed_ = target;
         quant_valid_ = false;
@@ -207,8 +207,6 @@ public:
         if (tau.rows() != out_features_ || tau.cols() != 1)
             NN_FAIL("BitLinear: 部署 τ 形状与层不匹配（期望 " +
                     std::to_string(out_features_) + "x1）");
-        if (!engine_ref().supports_ternary_gemm())
-            NN_FAIL("BitLinear: 部署态需要引擎支持三值 GEMM（supports_ternary_gemm()）");
         force_pack_ = 1;
         use_packed_ = true;
         wq_packed_ = std::move(packed_words);
@@ -261,8 +259,7 @@ public:
             NN_FAIL("bitlinear forward: input shape mismatch");
         // 部署态：只允许"打包字 + τ"这条路（引擎不支持三值 GEMM 就没法跑）
         if (packed_only_ && !(use_packed_ && wq_packed_.valid() && tau_.valid()))
-            NN_FAIL("BitLinear(packed-only)：部署态需要引擎支持三值 GEMM"
-                    "（supports_ternary_gemm()），当前引擎/设备不支持");
+            NN_FAIL("BitLinear(packed-only)：部署态缺少打包权重/τ（载入失败或缓冲被清）");
         if (!checkpoint_mode_)
             input_cache_ = input;
         // 缓冲形态：默认跟随引擎能力（分块解码版下训练/解码都不亏，见成员注释）；
@@ -349,18 +346,8 @@ private:
     // 按当前模式策略（force_pack_ / 引擎能力）选定缓冲形态。
     void sync_buffer_mode_()
     {
-        // 部署态：形态由文件固定（load_packed_weights 已校验引擎能力）
+        // 部署态：形态由文件固定（打包字 + τ）
         if (packed_only_) return;
-        if (!engine_ref().supports_ternary_gemm())
-        {
-            if (use_packed_)
-            {
-                use_packed_ = false;
-                quant_valid_ = false;
-                ensure_quant_buffer_();
-            }
-            return;
-        }
         const bool want = (force_pack_ == 0) ? false : true;
         if (want == use_packed_) return;
         use_packed_ = want;
