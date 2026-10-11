@@ -535,6 +535,13 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 
 # 引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器
 
+## P3 起步：int8 点积（W2A8）能力探测 + 路线判定（2026-10-11，分支 `dev/t1_58`；原位置 `docs/development/21-quantized-weights.md` §5 的 P3）
+- 类型：能力探测 / 路线判定（先量后承诺）
+- 内容：设备侧查询并启用 `shaderIntegerDotProduct`（Vulkan 1.3 / `VK_KHR_shader_integer_dot_product`），属性位 `integerDotProduct4x8BitPackedSignedAccelerated` 单独记录；暴露 `ComputeEngine::supports_int8_dot()`（门禁）+ `int8_dot_accelerated()`（诊断）+ `NN_VULKAN_NO_INT8_DOT` 逃生阀；dev creation 的 pNext 链改为前插 lambda（原来的多层三元表达式每加一个特性就要重排）。顺带把 `GpuBackend::device()` 只读句柄打开（能力位取值用）。
+- **实测（102/40HX，Turing）：`supports_int8_dot() = true`，硬件加速 = true**（DP4A 可用）。
+- **路线判定（重要，避免走错方向）**：① 本项目 Vulkan 路径**没有张量核**（Turing 不暴露 cooperative matrix）→ BitNet 官方 GPU kernel 的大头收益（int8 wmma）拿不到；② **DP4A 的算力增益为零**（每指令 4 MAC = vec4 FMA 的同量级）→ P3 的收益只能来自"激活 1 B vs f16 2 B"与"把 2-bit 解码折进 DP4A 操作数"；③ 因此准入门槛改为**先做配对微基准**（`matmul_q` vs 未来的 `matmul_q_i8`），量出 (b) 的指令数收益再决定是否写全链路。
+- **设计要点**：激活 int8 沿用三值容器先例（打包字放 f32 张量、`bit_cast` 当原始字）→ **不新增存储精度**（M7 仍不需要）；需要 `quantize_act_i8`（per-列 absmax + round/clamp + 4×int8 打包）+ `matmul_q_i8`（整数累加 + τ_m·s_n 双向量缩放）；文档早先列的"DSL `round` 算子前置"**降级为可选**（手写原语同 `trit_pack` 先例，不需要它）。
+
 ## 三值 P2 部署格式：base-3 载荷 + packed-only 只读推理文件（2026-10-11，分支 `dev/t1_58`；原位置 `docs/development/21-quantized-weights.md` §4.11 ② 的"部署期 9.4×"与 §5 的 P2 剩余项）
 - 类型：新能力（部署格式）/ 新 Layer 契约 / 性能 A/B
 - 内容：① **base-3 载荷**（`ternary_pack.hpp`）：5 个三值/字节（`3^5 ≤ 256`），`digit = 码 − 1`，字节 = `Σ digit_i·3^i`；2-bit 容器 ↔ base-3 逐位往返（含非 5 倍数与尾部）。② **独立部署文件格式**（新头 `ternary_deploy.hpp`）：magic `"NNQT"` + 版本 + 精度 + spec kvrec + 参数条目（tag 0/2 = f32/f16 矩阵，与 v5/v6 逐字节同款；tag 4 = 打包三值：encoding/rows/k/τ/payload）+ extra state + tokenizer。**为什么独立 magic**：版本号已抢号（v6 = .nnvocab），且部署文件是**只读**语义（与训练检查点混在一个版本会让 `--resume` 误载不可训练的文件）。③ **`BitLinear` packed-only**：`load_packed_weights` 释放 latent/梯度/稠密缓冲 → 推理足迹 4.25 → 0.25 B/权重；τ 随文件按位载入（重新量化会有 `absmean(trit)·τ` 比例差异）；只读是硬约束（backward 返错、parameters/param_gradients fail-fast）。④ **`Layer::sub_layers()`（新虚函数）**：GPT 的三值层藏在 Block→Attention/FeedForward 内，部署条目要落到正确的层必须能递归；契约 = 子层顺序与 `parameters()` 拼接顺序一致 + 自身参数在前，遍历器逐层核对覆盖数（不一致 fail-fast，绝不静默错位）；实现在 AttentionBase / FeedForward / GPTBlock / GPTModel。⑤ CLI：`text_train --export-deploy`（非三值模型显式拒绝）+ `text_infer`/`mnist_infer` 自动识别两类文件。

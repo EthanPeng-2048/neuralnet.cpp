@@ -155,6 +155,11 @@ void test_primitives(nn::ComputeEngine& eng, const char* tag)
         std::puts("    （该引擎尚未接三值打包原语 → 跳过；BitLinear 会自动走 f16 路径）");
         return;
     }
+    // P3 门禁（W2A8）：int8 点积能力 —— 决定"激活 int8 + 整数点积"内核在
+    // 本设备上是否可建（正确性无关，只影响那条路线的可行性与收益）
+    std::printf("    P3 门禁：supports_int8_dot() = %s，硬件加速 = %s\n",
+                eng.supports_int8_dot() ? "true" : "false",
+                eng.int8_dot_accelerated() ? "true" : "false");
 
     // 造 latent 权重（含正负/微小值，覆盖三值三种码）
     nn::Matrix W(ROWS, K);

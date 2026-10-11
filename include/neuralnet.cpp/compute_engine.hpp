@@ -1065,6 +1065,19 @@ public:
     // ══════════════════════════════════════════════════════════════════════
     [[nodiscard]] virtual bool supports_ternary_gemm() const noexcept { return false; }
 
+    // ── P3（W2A8）能力位：int8 点积 ───────────────────────────────────────
+    // true = 引擎/设备能在 shader 里做 4×int8 打包点积（DP4A 语义，SPIR-V
+    // `SPV_KHR_integer_dot_product` / GLSL `dotPacked4x8EXT`）。这是"激活 int8
+    // 量化 + 整数点积"内核（打包在 GPU 上真正打赢稠密 f16 的前提）的**门禁**：
+    // false 的引擎一律走现有 f16 累加路径，不静默换算法。
+    // `supports_int8_dot()` 是"能不能用"；加速与否（硬件 DP4A vs 驱动软件展开）
+    // 是**性能**问题，由后端诊断接口另行披露，不改变正确性契约。
+    [[nodiscard]] virtual bool supports_int8_dot() const noexcept { return false; }
+    // 诊断位（不参与正确性/门禁）：int8 点积是否**硬件加速**（DP4A 指令）还是
+    // 驱动软件展开。软件展开时"激活 int8"仍省一半激活带宽，但算力不占优 ——
+    // P3 内核是否值得创建/分派靠这两个位合起来判断。
+    [[nodiscard]] virtual bool int8_dot_accelerated() const noexcept { return false; }
+
     [[nodiscard]] Result<Tensor> trit_pack(const Tensor& w, const Tensor& scale)
     {
         NN_TRY(ec, bind_check_({&w, &scale}));
