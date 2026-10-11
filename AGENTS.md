@@ -147,11 +147,12 @@ BitLinear 的量化缓存静默用旧权重**（`src/write_epoch_test.cpp` 逐�
 ② **打包权重（P2）**：`trit_pack` / `matmul_q` / `matmul_q_t` 是 **op-level 引擎原语**
 （不进 DSL 闭合世界、不需 scan 登记），布局 = 2 bit/权重 + 4 权重/字节 + 码值 = 三值 + 2
 （与 microsoft/BitNet `pack_weight.py` 一致；不做其 CUDA interleave），容器是 f32 张量
-当原始字（布局/编解码唯一来源 `ternary_pack.hpp`）。`supports_ternary_gemm()` =
-能力位（GPU = 两条 pipeline 都在）。
-③ **打包是默认的权重缓冲形态（训练与解码同一条路）**：`BitLinear` 跟随引擎能力
-（`supports_ternary_gemm()`）用打包缓冲，`set_ternary_pack_enabled()` 是 A/B 与回退的
-强制开关。**分块版 `matmul_q.comp` 的两条不变量**：网格随分块常量（BM=BN=64）、
+当原始字（布局/编解码唯一来源 `ternary_pack.hpp`；**base-3 1.6 bpw 只是 `.nnmodel`
+的盘上编码**，读盘后一律转回 2-bit 容器）。引擎是否具备打包路径是**引擎私有事实**
+（GPU = 两条 pipeline 都在；对外只经 `describe().ternary_gemm` 披露，见铁律 13）。
+③ **打包是唯一的权重缓冲形态（训练与解码同一条路）**：`BitLinear` 恒用打包缓冲，
+**不查引擎能力**（不支持的引擎在 `trit_pack`/`matmul_q` 处 fail-fast）；
+`set_ternary_pack_enabled()` 仅作 A/B 与回退的强制开关。**分块版 `matmul_q.comp` 的两条不变量**：网格随分块常量（BM=BN=64）、
 **轴向 x↔输出列 N / y↔输出行 M**（与 `matmul_tiled`/`batched_matmul` 同约定）——
 写反只会在 M≠N 的形状上错值（方形小形状恰好正确，是 WIP 卡住一轮的根因）。
 `N ≤ 8 且 transA=0` 走 **`matmul_q_gemv.comp`**（subgroup = 4 行、subgroup 内沿打包字
@@ -160,15 +161,16 @@ ceil(M/(4·(256/subgroup_size)))` 是布局契约**）。CPU 侧 `matmul_q_impl`
 （RB=64）+ 稠密微内核**（`multiply_to`/`transpose_multiply_to`）——逐元素直算比稠密慢
 ~70×，禁止回退到那种写法。**动这块前先量**：`layer_bench --op matmul,matmul_q,matmul_q_bw
 --f16 --inner N` 的配对 A/B + 端到端（训练/解码/显存/CPU）口径见 docs 21 §4.14。
-④ **部署格式（P2，`ternary_deploy.hpp`）**：独立 magic `"NNQT"`（**不占 `MODEL_VERSION`**）
-+ 只读语义 —— 三值层以打包字 + τ 落盘（可选 base-3 1.6 bpw 载荷），载入后 `BitLinear`
-进 **packed-only**（释放 latent/梯度/稠密缓冲；backward / parameters / param_gradients
-一律 fail-fast，别让它静默当训练层用）。**`Layer::sub_layers()` 是新的结构契约**（子层
-顺序必须与 `parameters()` 拼接顺序一致、自身参数在前）—— GPT 的三值层在 Attention /
-FeedForward 内部，任何"完整遍历参数"的新功能（部署格式、未来的量化导出…）都靠它；
-复合层没实现时遍历器按覆盖数不符 **fail-fast**（不是静默错位）。`text_infer` /
-`mnist_infer` 用 `peek_any_model_spec` + `load_any_model` 自动分流两类文件。
-⚠ **本节 ④ 的形态（NNQT 独立格式 / `--export-deploy` / `Layer::sub_layers()` / packed-only 只读态）已列入库级清理，见 `docs/development/23-library-design-cleanup-and-model-file-roles.md`** —— 按裁决要改成“单一 NNNN v7 格式 + `.nnmodel`/`.nnckpt` 文件角色 + 参数形态协议”，不要再以本节 ④ 为准继续扩展。
+④ **模型文件角色（v7，**已取代原 NNQT 独立格式**，见 docs 23）**：**一份格式、两种角色** ——
+`*.nnmodel`（推理：三值层写**打包形态**，盘上 base-3 1.6 bpw + τ）与 `*.nnckpt`
+（训练断点：写 f32 latent）。文件头 = `magic|version=7|精度|role 1B|spec`；参数区是
+**参数级 `kind`** 条目，由拥有该参数的层经 `Layer::export_param` / `import_param` 决定
+形态（参数形态协议）；载入 `.nnmodel` 后三值层是**只读**态（无 latent ⇒ `backward()`
+返回明确错误；`parameters()` 不再 abort）。CLI：`--save`（默认 `*.nnmodel`）写推理角色、
+`--save-interval` 写 `*.nnckpt`、`--resume` **只认** `.nnckpt`；v5/v6 老 `.bin` 仍可读。
+`text_infer` / `mnist_infer` 用 `peek_any_model_spec` + `load_any_model` + `peek_model_role`。
+**`Layer::sub_layers()` 已删除**（层树枚举没有消费者）；参数下标转发走**受保护的**
+`param_children()`（仅供参数协议，不是对外结构契约）。
 ⑤ **梯度惰性分配**：`Linear` / `BitLinear` 的梯度只在 `param_gradients()` /
 `backward()` 首次触及时建（`grad_buffers_allocated()` 可见）；新增层若也用
 `ensure_grad_()` 模式，注意**返回 void 的函数里用 `NN_CHECK` 而不是 `NN_FAIL`**
@@ -187,10 +189,11 @@ FeedForward 内部，任何"完整遍历参数"的新功能（部署格式、未
 | offload | `create_offload_buffer/offload_save/offload_restore`（activation offload） |
 
 > 引擎的 virtual 方法计数**以审计输出为准**：`bench/doc_inventory.ps1` 的 `virtual methods`
-行为 **54 declarations / 54 unique**（改三值优化前为 49：M6 的 `import_impl` 曾使其 48 → 49；
-三值 P2 轮 +4 = `supports_ternary_gemm` / `trit_pack_impl` / `matmul_q_impl` /
-`grad_buffers_allocated`；P3 起步 +2 = `supports_int8_dot` / `int8_dot_accelerated`；
-审计口径含析构等声明）；逐元素/广播等计算类原语一律经表达式
+行为 **49 declarations / 49 unique**（原 54：库级清理把 6 个能力谓词
+`supports_native_data_move` / `supports_native_f16_reduce` / `supports_expr_precision_variant` /
+`supports_ternary_gemm` / `supports_int8_dot` / `int8_dot_accelerated` **从基类删除**，
+能力改由 `describe()` 披露；`trit_pack_impl` / `matmul_q_impl` / `grad_buffers_allocated`
+保留）；逐元素/广播等计算类原语一律经表达式
 > DSL 求值，不经 Layer 直调（`dsl::row_reduce_max` 是 DSL 叶子，不是引擎算子）。CRLF/`scan_exprs` AOT 键规则见 §7。
 
 ### 4.4 理解优先级（建议学习顺序）
@@ -214,6 +217,8 @@ FeedForward 内部，任何"完整遍历参数"的新功能（部署格式、未
 10. **`//` 注释中禁止出现 `\` 反斜杠**（尤其行尾）：GCC 行拼接会把下一行并入当前注释——轻则 `-Wcomment -Werror` 编译失败，重则下一行代码被静默吞掉。
 11. **张量存储不可绕过引擎（M1，docs/development/17 §4.1）**：一切 Tensor 的创建/读写/reshape 必须经 ComputeEngine（`create_tensor/from_matrix/to_matrix/reshape` 等）；存储访问器（`cpu_matrix/cpu_shared/gpu_tensor/gpu_shared`）与静态直构工厂（`Tensor::from_matrix/cpu/...`）**已私有**，绕过 = 编译错误。库内豁免仅两条：引擎 friend（ComputeEngine/CpuEngine/GpuEngine）与 `detail::TensorAccess`（DSL 求值器专用通道，**库外禁用**，违反靠 grep 审计抓）。
 12. **L2+ 计算路径禁用 Matrix（M4，docs/development/17 §4.6 + §3 D11）**：Layer/Loss/Optimizer/Model 头文件里不得出现 `Matrix`/`MatrixT` 类型，也不得调用 Matrix 型 I/O 动词（`from_matrix`/`to_matrix`/`copy_from`）。层自算的辅助数据（索引/位置编码/掩码/斜率/编码表等——没有引擎侧生成原语的那类）一律走 **span 宿主桥** `detail::upload_span/download_span/download_vector`（内部是 M3 的批量 `write`/`read`，见 `compute_engine.hpp` 尾部）或 `create_tensor`+`InitSpec`/`zero` 就地建张量；数据集、预训练权重、对拍与落盘等大批量 I/O 仍在 I/O 层用 `from_matrix`/`to_matrix`。**审计口径**：`pwsh -File bench/doc_inventory.ps1` 第 [4] 节，验收 = `L2-VIOLATIONS: 0`（宿主桥用量只披露不判违规）。
+13. **引擎能力体系（docs/development/23 §2.3）**：能力谓词是**具体引擎的私有实现细节**（私有成员 / 编译期常量），**不得出现在基类 `ComputeEngine`**，也**不得被 Layer/L4/L5/CLI/测试调用**；基类 NVI 入口**不做能力分支**（精度策略下沉到各引擎的 `*_impl`）。能力**信息**只经 `ComputeEngine::describe()` 返回的 `EngineInfo` 披露（`text()` 是稳定一行摘要），且**禁止用于选路**——选路必须走引擎内部谓词。热路径政策：由**引擎类别**决定的（如 CPU 引擎没有原生 f16 搬运/归约）用编译期标签消分支；由**设备**决定的在 init 期解析成常量成员；**每结构可变**的（有无该表达式的融合变体）不当能力用，由实现内部一次解析。
+14. **参数形态协议（v7，docs/development/23 §2.2）**：模型文件的每个参数条目带**参数级 `kind`**（`ParamKind`：Dense / TernaryLatent / TernaryPacked2 / TernaryPacked3 / 预留 I8Packed4），由**拥有该参数的层**经 `Layer::export_param(index, ModelRole)` / `import_param(index, entry)` 决定落盘/载入形态；`index` 与 `parameters()` **同序**（复合层经受保护的 `param_children()` 按顺序转发）。**禁止**在序列化层 `dynamic_cast` 具体层类型；**禁止**恢复层树枚举型公开 API（`sub_layers()` 已删）。形态不被接受必须 **fail-fast**（层名 + 期望 + 实际），不得静默降级。
 
 ## 6. 数据布局约定
 
@@ -327,7 +332,7 @@ optimizer.step();
 | `development/19-unified-dataset.md` | **统一数据集格式与加载（`.nndataset`/`.nnvocab`/KVRecord v2，2026-10-05 设计定稿、阶段一~三已实施）：裁决记录、KVRecord v2 规范、文件布局、`nn::Dataset`/`dataset_gen`/`dataset_convert`/模型 v6 分期落地与兼容迁移。接数据集相关任务前读本文** |
 | `development/21-quantized-weights.md` | **三值（1.58-bit）量化权重与 BitLinear（2026-10-09 设计定稿 → 2026-10-10 **P1 已实施**，分支 `dev/t1_58`）：`Precision::T1_58` + `Layer::precision_support()`（按槽声明、`init` 期校验）+ `BitLinear`（量化 forward / STE backward）；含 Lumina-Engine `TQ1_0` 参考实现拆解、`§4.9` 实现与设计的差异、`§8` 架构图、`§10` 提交清单。**已裁定**：尺度 = absmean + per-row（absmax 只剩 0.13~1.29 bit 信息，实测见 `research/ternary_scale/`）、打包 = `TQ1_0` 编码 + 行级块、命名 `T1_58` / CLI 无别名 / 层名 `BitLinear`、D3 = (a)+(b)、D5 = ③（P1 只覆盖 MLP；GPT 侧由 P1.5 补齐，RAPT/ViT 仍拒绝）；**仍待定** D6（P2 行步长/对齐）。前置证据 `research/ternary_ste/`**；验收 `src/t1_58_test.cpp`（+`--gpu` 变体） |
 | `development/22-bitnet-2b4t-architecture.md` | **BitNet b1.58 2B4T 的结构对齐（2026-10-10 立项 + **S1/S2/S3 三步已实施并提交**，分支 `dev/t1_58`）：三项结构差距 = SubLN / GQA / tied embedding，均为**可选开关、默认关**。**已裁定**：SubLN 封装在子层内部（`AttentionBase`/`FeedForward` 的可选 `unique_ptr<Layer>`，**不是** `NormType` 新值、**不是** block 的第三个 norm）、类型跟随 `norm_type`；GQA 头映射 = `kv = h/(n_head/n_head_kv)`（llama.cpp FA 与 HF `repeat_kv` 互证）+ 显式展开 K/V 头（前向 `gather_rows` / 反向 `scatter_add_rows`，fold 与 AOT 注册表零改动）；tied embedding 在 `GPTModel` 内一个开关（梯度**累加**进 `grad_token_emb_`）；**不加 CLI 预设**（GUI 留待以后）；`ModelSpec` 追加 `subln`/`n_head_kv`/`tie_embeddings` 三键（缺键 = 旧语义，不升 MODEL_VERSION）。**验收 `src/bitnet_struct_test.cpp`（+`--gpu`）**：GQA 退化与 MHA 逐位一致、GQA↔按块映射复制成 MHA 前向差 0、tied 梯度累加差 0；102 上全量 ctest 30/30。**实施记录见本文 §10**。**待定**：FFN 激活 ReLU²（需确认官方 `hidden_act`；llama.cpp 对 gated squared relu `GGML_ABORT`，无对拍）、GQA in-kernel 版（P2）、HF 权重转换器。**结构侧**与 21 号（权重侧 `T1_58`/`BitLinear`）是两条正交的腿** |
-| `development/23-library-design-cleanup-and-model-file-roles.md` | **库级违规设计清理（2026-10-11 讨论稿，未实施）：模型文件角色 + 参数形态协议 + 引擎能力体系**（范围 = **整个库**，不只三值）。三轮裁决要点：① 参数级 `kind`（Dense / TernaryLatent / TernaryPacked2 / TernaryPacked3 / 预留 int8）；② **不引入**可训练/不可训练状态；③ 能力谓词 = 具体引擎私有 `supports_*_`、**不得进基类**、不作对外标签、只作内部分发（设备不支持走引擎内降级/报错），能力**信息**走**统一对外查询通道**；④ 文件角色拆开：**`.nnmodel`**（推理，`.bin` 接替者）与 **`.nnckpt`**（含训练参数，`--save-interval` 写它）；⑤ 热路径审查（19 处基类能力分支 + `eval_expr` 每次求值双份归因 → 编译期标签 / init 期常量 / 按 spec 身份缓存）；⑥ `sub_layers()` 与 NNQT 独立格式、`--export-deploy` 等标签、`BitLinear` 特例 API **全部删除**。读本文前先读 21 §4.15/§4.16（那两节记录的是被本稿取代的现状） |
+| `development/23-library-design-cleanup-and-model-file-roles.md` | **库级违规设计清理（2026-10-11 **已实施**）：模型文件角色 + 参数形态协议 + 引擎能力体系**（范围 = **整个库**，不只三值）。三轮裁决要点：① 参数级 `kind`（Dense / TernaryLatent / TernaryPacked2 / TernaryPacked3 / 预留 int8）；② **不引入**可训练/不可训练状态；③ 能力谓词 = 具体引擎私有、**不得进基类**、不作对外标签、只作内部分发（设备不支持走引擎内降级/报错），能力**信息**走**统一对外查询通道**（`describe()`）；④ 文件角色拆开：**`.nnmodel`**（推理，`.bin` 接替者）与 **`.nnckpt`**（含训练参数，`--save-interval` 写它）；⑤ 热路径审查（基类能力分支 + `eval_expr` 每次求值双份归因 → 编译期标签 / init 期常量 / 引擎内就地回退）；⑥ `sub_layers()` 与 NNQT 独立格式、`--export-deploy` 等标签**全部删除**（`BitLinear` 的 f16 稠密 A/B 开关保留）。**§3 待裁决已定**：`EngineInfo` 结构体 + `text()`、接口名 `describe()`；`.nnmodel` 不留 latent；旧 `.bin` 只读不写、不提供转换工具。落地验收见 21 §4.15 与 `src/model_roles_test.cpp` |
 | `development/14-f16-stable-gpu-loss-frozen.md` | **故障报告（2026-09-26，未修）：GPU `stable=f16` 训练 loss 打印冻结（权重不冻结）——触发矩阵、测试覆盖缺口、证据与复现** |
 
 ### 使用类（docs/usage/）

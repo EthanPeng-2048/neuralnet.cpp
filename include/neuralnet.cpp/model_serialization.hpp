@@ -53,10 +53,13 @@ namespace nn
 // ═══════════════════════════════════════════════════════════════════════════
 
 inline constexpr uint32_t MODEL_MAGIC    = 0x4E4E4E4E;  // "NNNN"
+// v7（docs/development/23）：**文件角色**（role 字节：Model=推理 / Checkpoint=训练）
+//   + **参数级 kind**（[kind][precision][rows][cols][aux_len][payload_len][aux][payload]）。
+//   · 角色决定"写哪些参数"：`.nnmodel` 写推理所需全部参数（三值层写打包形态）；
+//     `.nnckpt` 写模型 + 训练参数（三值层写 f32 latent）。
+//   · v5/v6 的扁平矩阵序列仍**可读**（role 缺失按 Model 处理）；**写一律 v7**。
 // v6: 内嵌词表改为 .nnvocab kvrec（v5 及以下仍读其内嵌 JSON，见上）。
-// ⚠ 版本号抢号提示：roadmap P1-2（checkpoint 优化器状态）也计划 5 → 6；
-//   谁先落地谁占 6，另一项顺延（docs/development/19-unified-dataset.md §7）。
-inline constexpr uint32_t MODEL_VERSION  = 6;
+inline constexpr uint32_t MODEL_VERSION  = 7;
 
 // ── 已知缺口：.bin 全文件无校验和 ─────────────────────────────────────────
 // 内容损坏会被静默载入错误权重且无感知（.nnpkg 有 sha256，模型 .bin 没有）。
@@ -97,7 +100,14 @@ template <typename T>
 {
     T v{};
     if (!nn::read_pod(ifs, v))
-        NN_FAIL("Unexpected end of file");
+    {
+        // 诊断增强：带上失败位置（跨版本格式排查时先看"读到哪断了"）
+        const auto pos = ifs.tellg();
+        NN_FAIL("Unexpected end of file（读 " + std::to_string(sizeof(T)) +
+                " 字节失败，流位置 " +
+                (pos < 0 ? std::string("<eof>")
+                         : std::to_string(static_cast<long long>(pos))) + "）");
+    }
     return v;
 }
 
@@ -448,17 +458,19 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
 
 // ── 文件头读写 ──────────────────────────────────────────────────────
 
-[[nodiscard]] inline Result<void> write_header(std::ofstream &ofs)
+[[nodiscard]] inline Result<void> write_header(std::ofstream &ofs, ModelRole role)
 {
     NN_TRY(r, write_bytes<uint32_t>(ofs, MODEL_MAGIC));
     NN_TRY(r2, write_bytes<uint32_t>(ofs, MODEL_VERSION));
     NN_TRY(r3, write_bytes<uint8_t>(ofs, PRECISION_TAG));
+    NN_TRY(r4, write_bytes<uint8_t>(ofs, static_cast<uint8_t>(role)));
     return {};
 }
 
 // 返回读到的 version，同时校验 magic number、格式版本和精度
 // 仅接受自描述格式 v4+；v1/v2/v3 偏移量定长格式在此处拒绝。
-[[nodiscard]] inline Result<uint32_t> read_and_validate_header(std::ifstream &ifs)
+[[nodiscard]] inline Result<uint32_t> read_and_validate_header(
+    std::ifstream &ifs, ModelRole* role_out = nullptr)
 {
     auto magic_r = read_bytes<uint32_t>(ifs);
     NN_TRY_CHECK(magic_r);
@@ -481,6 +493,18 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
     if (precision_tag != PRECISION_TAG)
         NN_FAIL("Precision mismatch: file uses " + std::string(precision_tag == 0 ? "f32" : "f64")             + ", but build uses " + std::string(PRECISION_TAG == 0 ? "f32" : "f64"));
 
+    // ── v7：文件角色字节（v5/v6 无该字段 → 一律按 Model 处理，零破坏）──────
+    ModelRole role = ModelRole::Model;
+    if (version >= 7)
+    {
+        auto role_r = read_bytes<uint8_t>(ifs);
+        if (!role_r)
+            NN_FAIL("Unexpected end: missing file role byte (v7)");
+        if (*role_r > static_cast<uint8_t>(ModelRole::Checkpoint))
+            NN_FAIL("模型文件 role 字段非法（" + std::to_string(*role_r) + "）");
+        role = static_cast<ModelRole>(*role_r);
+    }
+    if (role_out) *role_out = role;
     return version;
 }
 
@@ -516,7 +540,283 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
     return data;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// v7 参数条目（参数级 kind）
+//   [kind 1B][precision 1B][rows 8B][cols 8B][aux_len 8B][payload_len 8B][aux][payload]
+// 载荷一律按**原始字节**落盘：
+//   · Dense / TernaryLatent：rows*cols 个元素（precision = f32/f16）
+//   · TernaryPacked2：rows * ceil(K/16) 个 f32 字（2 bit/权重容器）
+//   · TernaryPacked3：rows * ceil(K/5) 字节（base-3，1.6 bpw）
+//   · aux：形态附加（三值：tau，rows 个 f32）
+// base-3 只是**盘上编码**（由 L3 决定），运行期永远是 2-bit 容器 —— 层只认后者。
+// ═══════════════════════════════════════════════════════════════════════════
+static_assert(sizeof(Scalar) == 4, "v7 打包载荷按 f32 字承载（Scalar 必须是 float）");
+
+// 单行：2-bit 容器字 -> 盘上 payload（2-bit / base-3）
+inline void encode_packed_row(bool base3, const std::uint32_t *words, std::size_t k,
+                              std::uint8_t *out) noexcept
+{
+    if (base3)
+    {
+        nn::trit_pack::pack_row_base3(words, k, out);
+        return;
+    }
+    std::memcpy(out, words, nn::trit_pack::bytes_per_row(k));
+}
+
+// 单行：盘上 payload -> 2-bit 容器字（运行期一律 2-bit）
+inline void decode_packed_row(bool base3, const std::uint8_t *in, std::size_t k,
+                              std::uint32_t *words) noexcept
+{
+    if (base3)
+    {
+        nn::trit_pack::unpack_row_base3(in, k, words);
+        return;
+    }
+    std::memcpy(words, in, nn::trit_pack::bytes_per_row(k));
+}
+
+struct ParamBlob
+{
+    ParamKind kind = ParamKind::Dense;
+    Precision precision = Precision::F32;
+    std::uint64_t rows = 0;
+    std::uint64_t cols = 0;
+    std::vector<std::uint8_t> aux;
+    std::vector<std::uint8_t> payload;
+};
+
+[[nodiscard]] inline Result<void> write_param_blob(std::ofstream &ofs, const ParamBlob &b)
+{
+    NN_TRY(r0, write_bytes<uint8_t>(ofs, static_cast<uint8_t>(b.kind)));
+    NN_TRY(r1, write_bytes<uint8_t>(ofs, precision_tag(b.precision)));
+    NN_TRY(r2, write_bytes<uint64_t>(ofs, b.rows));
+    NN_TRY(r3, write_bytes<uint64_t>(ofs, b.cols));
+    NN_TRY(r4, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(b.aux.size())));
+    NN_TRY(r5, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(b.payload.size())));
+    if (!b.aux.empty())
+    {
+        ofs.write(reinterpret_cast<const char *>(b.aux.data()),
+                  static_cast<std::streamsize>(b.aux.size()));
+        if (!ofs) NN_FAIL("Write error while writing param aux");
+    }
+    if (!b.payload.empty())
+    {
+        ofs.write(reinterpret_cast<const char *>(b.payload.data()),
+                  static_cast<std::streamsize>(b.payload.size()));
+        if (!ofs) NN_FAIL("Write error while writing param payload");
+    }
+    return {};
+}
+
+[[nodiscard]] inline Result<ParamBlob> read_param_blob(std::ifstream &ifs)
+{
+    auto k_r = read_bytes<uint8_t>(ifs);
+    NN_TRY_CHECK(k_r);
+    if (*k_r > static_cast<uint8_t>(ParamKind::I8Packed4))
+        NN_FAIL("参数条目 kind 非法（" + std::to_string(*k_r) + "）");
+    auto pt_r = read_bytes<uint8_t>(ifs);
+    NN_TRY_CHECK(pt_r);
+    auto rows_r = read_bytes<uint64_t>(ifs);
+    NN_TRY_CHECK(rows_r);
+    auto cols_r = read_bytes<uint64_t>(ifs);
+    NN_TRY_CHECK(cols_r);
+    auto alen_r = read_bytes<uint64_t>(ifs);
+    NN_TRY_CHECK(alen_r);
+    auto plen_r = read_bytes<uint64_t>(ifs);
+    NN_TRY_CHECK(plen_r);
+    // 未信任长度防御：载荷字节数不得超过文件剩余长度（与 read_matrix_v5 同一威胁模型）
+    {
+        const std::streampos pos = ifs.tellg();
+        ifs.seekg(0, std::ios::end);
+        const std::streampos end = ifs.tellg();
+        if (pos < 0 || end < pos)
+            NN_FAIL("Cannot determine file size while reading param entry");
+        ifs.seekg(pos);
+        const auto remain = static_cast<std::uint64_t>(end - pos);
+        if (*alen_r > remain || *plen_r > remain - *alen_r)
+            NN_FAIL("参数条目长度越界（文件可能损坏或恶意）");
+    }
+    ParamBlob b;
+    b.kind = static_cast<ParamKind>(*k_r);
+    b.precision = precision_from_tag(*pt_r);
+    b.rows = *rows_r;
+    b.cols = *cols_r;
+    b.aux.resize(static_cast<std::size_t>(*alen_r));
+    b.payload.resize(static_cast<std::size_t>(*plen_r));
+    if (!b.aux.empty())
+    {
+        ifs.read(reinterpret_cast<char *>(b.aux.data()),
+                 static_cast<std::streamsize>(b.aux.size()));
+        if (!ifs) NN_FAIL("Unexpected end while reading param aux");
+    }
+    if (!b.payload.empty())
+    {
+        ifs.read(reinterpret_cast<char *>(b.payload.data()),
+                 static_cast<std::streamsize>(b.payload.size()));
+        if (!ifs) NN_FAIL("Unexpected end while reading param payload");
+    }
+    return b;
+}
+
 } // namespace detail
+
+// ── ParamEntry ⇄ ParamBlob（宿主字节编解码；base-3 只在这里出现）─────────
+[[nodiscard]] inline Result<detail::ParamBlob> param_entry_to_blob(
+    ComputeEngine &engine, const ParamEntry &e, ModelRole role)
+{
+    detail::ParamBlob b;
+    b.rows = e.rows;
+    b.cols = e.cols;
+    switch (e.kind)
+    {
+        case ParamKind::Dense:
+        case ParamKind::TernaryLatent:
+        {
+            b.kind = e.kind;
+            b.precision = e.precision;
+            auto m32 = engine.to_matrix(e.payload, Precision::F32);
+            NN_TRY_CHECK(m32);
+            if (m32->rows() != e.rows || m32->cols() != e.cols)
+                NN_FAIL("序列化：参数张量形状与条目不一致");
+            if (e.precision == Precision::F16)
+            {
+                MatrixT<Precision::F16> m16(e.rows, e.cols);
+                const auto s = m32->span();
+                auto d = m16.span();
+                for (std::size_t i = 0; i < s.size(); ++i) d[i] = s[i];
+                const auto bytes = std::span<const std::uint8_t>(
+                    reinterpret_cast<const std::uint8_t *>(m16.span().data()),
+                    m16.span().size() * sizeof(std::uint16_t));
+                b.payload.assign(bytes.begin(), bytes.end());
+            }
+            else
+            {
+                const auto bytes = std::span<const std::uint8_t>(
+                    reinterpret_cast<const std::uint8_t *>(m32->span().data()),
+                    m32->span().size() * sizeof(Scalar));
+                b.payload.assign(bytes.begin(), bytes.end());
+            }
+            return b;
+        }
+        case ParamKind::TernaryPacked2:
+        {
+            auto cont = engine.to_matrix(e.payload, Precision::F32);
+            NN_TRY_CHECK(cont);
+            auto tau = engine.to_matrix(e.aux, Precision::F32);
+            NN_TRY_CHECK(tau);
+            const std::size_t k = e.cols;
+            const std::size_t rows = e.rows;
+            const std::size_t wpr = nn::trit_pack::words_per_row(k);
+            if (cont->rows() != rows || cont->cols() != wpr)
+                NN_FAIL("序列化：打包容器形状与条目不一致");
+            if (tau->rows() != rows || tau->cols() != 1)
+                NN_FAIL("序列化：tau 形状与条目不一致");
+            const auto tsp = tau->span();
+            b.aux.resize(tsp.size() * sizeof(Scalar));
+            std::memcpy(b.aux.data(), tsp.data(), b.aux.size());
+            // 推理角色默认落盘为 base-3（1.6 bpw）；断点角色不会走到这里
+            const bool base3 = (role == ModelRole::Model);
+            b.kind = base3 ? ParamKind::TernaryPacked3 : ParamKind::TernaryPacked2;
+            b.precision = Precision::F32;
+            const std::size_t per_row = base3
+                ? nn::trit_pack::base3_bytes_per_row(k)
+                : nn::trit_pack::bytes_per_row(k);
+            b.payload.resize(rows * per_row);
+            const auto cs = cont->span();
+            std::vector<std::uint32_t> words(wpr);
+            for (std::size_t r = 0; r < rows; ++r)
+            {
+                for (std::size_t i = 0; i < wpr; ++i)
+                    words[i] = std::bit_cast<std::uint32_t>(cs[r * wpr + i]);
+                detail::encode_packed_row(base3, words.data(), k,
+                                          b.payload.data() + r * per_row);
+            }
+            return b;
+        }
+        default:
+            NN_FAIL(std::string("序列化：不支持的参数形态（kind=") +
+                    param_kind_name(e.kind) + "）");
+    }
+}
+
+[[nodiscard]] inline Result<ParamEntry> param_blob_to_entry(
+    ComputeEngine &engine, const detail::ParamBlob &b)
+{
+    ParamEntry e;
+    e.rows = static_cast<std::size_t>(b.rows);
+    e.cols = static_cast<std::size_t>(b.cols);
+    switch (b.kind)
+    {
+        case ParamKind::Dense:
+        case ParamKind::TernaryLatent:
+        {
+            Matrix m(e.rows, e.cols);
+            if (b.precision == Precision::F16)
+            {
+                MatrixT<Precision::F16> m16(e.rows, e.cols);
+                if (b.payload.size() != m16.span().size() * sizeof(std::uint16_t))
+                    NN_FAIL("序列化：f16 载荷长度与形状不一致");
+                std::memcpy(m16.span().data(), b.payload.data(), b.payload.size());
+                const auto s = m16.span();
+                auto d = m.span();
+                for (std::size_t i = 0; i < s.size(); ++i)
+                    d[i] = static_cast<Scalar>(s[i]);
+            }
+            else
+            {
+                if (b.payload.size() != m.size() * sizeof(Scalar))
+                    NN_FAIL("序列化：载荷长度与形状不一致");
+                std::memcpy(m.span().data(), b.payload.data(), b.payload.size());
+            }
+            // 载荷恒物化为 f32 张量（f16 升位精确无损）→ import_into_ 负责回写
+            auto t = engine.from_matrix(m, Precision::F32);
+            NN_TRY_CHECK(t);
+            e.kind = b.kind;
+            e.precision = b.precision;
+            e.payload = std::move(*t);
+            return e;
+        }
+        case ParamKind::TernaryPacked2:
+        case ParamKind::TernaryPacked3:
+        {
+            const std::size_t k = static_cast<std::size_t>(b.cols);
+            const std::size_t rows = static_cast<std::size_t>(b.rows);
+            const std::size_t wpr = nn::trit_pack::words_per_row(k);
+            const bool base3 = (b.kind == ParamKind::TernaryPacked3);
+            const std::size_t per_row = base3
+                ? nn::trit_pack::base3_bytes_per_row(k)
+                : nn::trit_pack::bytes_per_row(k);
+            if (b.payload.size() != rows * per_row)
+                NN_FAIL("序列化：打包载荷长度与形状不一致");
+            Matrix cont(rows, wpr);
+            std::vector<std::uint32_t> words(wpr);
+            auto cs = cont.span();
+            for (std::size_t r = 0; r < rows; ++r)
+            {
+                detail::decode_packed_row(base3, b.payload.data() + r * per_row, k,
+                                          words.data());
+                for (std::size_t i = 0; i < wpr; ++i)
+                    cs[r * wpr + i] = std::bit_cast<Scalar>(words[i]);
+            }
+            auto ct = engine.from_matrix(cont, Precision::F32);
+            NN_TRY_CHECK(ct);
+            e.kind = ParamKind::TernaryPacked2;   // 运行期形态：内核只认 2-bit 容器
+            e.payload = std::move(*ct);
+            Matrix tm(rows, 1);
+            if (b.aux.size() != tm.size() * sizeof(Scalar))
+                NN_FAIL("序列化：tau（aux）长度与形状不一致");
+            std::memcpy(tm.span().data(), b.aux.data(), b.aux.size());
+            auto tt = engine.from_matrix(tm, Precision::F32);
+            NN_TRY_CHECK(tt);
+            e.aux = std::move(*tt);
+            return e;
+        }
+        default:
+            NN_FAIL(std::string("序列化：文件里是不支持的参数形态（kind=") +
+                    param_kind_name(b.kind) + "）");
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  公开 API
@@ -526,51 +826,45 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
 //  peek_model_spec — 只读文件头，返回 ModelSpec（不读参数）
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ── 保存模型（v5：per-tensor precision tag）──────────────────────────────
-// 参数为 Tensor*，通过 engine.to_matrix 下载到 CPU 后写入。
-// v5 格式：每个矩阵前加 1B precision tag（0=f32, 2=f16）。
+// ── 保存模型（v7：文件角色 + 参数级 kind）────────────────────────────────
+// role 决定"写哪些参数"：Model = 推理模型（三值层写打包形态，默认 base-3 载荷）；
+// Checkpoint = 训练断点（三值层写 f32 latent）。
 [[nodiscard]] inline Result<void> save_model(const std::string &filename,
-    Model &model, const ModelSpec &spec, const std::string &tokenizer_data = {})
+    Model &model, const ModelSpec &spec, const std::string &tokenizer_data = {},
+    ModelRole role = ModelRole::Model)
 {
     std::ofstream ofs(filename, std::ios::binary);
     if (!ofs)
         NN_FAIL("Cannot open file for writing: " + filename);
-    NN_TRY(r, detail::write_header(ofs));
+    NN_TRY(r, detail::write_header(ofs, role));
     NN_TRY(r2, detail::write_spec_header(ofs, spec));
     auto& engine = model.engine();
-    auto params = model.parameters();
-    for (auto& p_tensor : params)
+
+    // 逐层逐参数（索引 = 本层参数扁平顺序；`Model::parameters()` 即各层的级联）
+    for (std::size_t li = 0; li < model.num_layers(); ++li)
     {
-        Precision p = p_tensor.get().precision();
-        if (p == Precision::F16)
+        Layer &L = model.layer_at(li);
+        const std::size_t n = L.param_count();
+        for (std::size_t i = 0; i < n; ++i)
         {
-            // f16 参数（M1：不再直读存储，统一经引擎下载——CPU/GPU 同路）：
-            // 下载为 f32（f16 升位精确无损）→ 转回 f16 落盘，字节与直读一致。
-            auto m32_r = engine.to_matrix(p_tensor, Precision::F32);
-            NN_TRY_CHECK(m32_r);
-            MatrixT<Precision::F16> m16(m32_r->rows(), m32_r->cols());
-            const auto src = m32_r->span();
-            auto dst = m16.span();
-            for (std::size_t i = 0; i < src.size(); ++i)
-                dst[i] = src[i];
-            NN_TRY(r, detail::write_matrix_fp16(ofs, m16));
-        }
-        else
-        {
-            // f32 参数（默认路径）
-            auto m = engine.to_matrix(p_tensor, Precision::F32);
-            NN_TRY_CHECK(m);
-            NN_TRY(r, detail::write_matrix_v5(ofs, *m, p));
+            NN_TRY(e, L.export_param(i, role));
+            NN_TRY(b, param_entry_to_blob(engine, *e, role));
+            NN_TRY(w, detail::write_param_blob(ofs, *b));
         }
     }
 
-    // 非可学习状态（如 BatchNorm 的 running_mean/running_var）
+    // 非可学习状态（如 BatchNorm 的 running_mean/running_var）：Dense 条目
     auto extras = model.extra_state();
     for (auto& e_tensor : extras)
     {
-        auto m = engine.to_matrix(e_tensor);
-        NN_TRY_CHECK(m);
-        NN_TRY(r, detail::write_matrix_v5(ofs, *m, e_tensor.get().precision()));
+        ParamEntry e;
+        e.kind = ParamKind::Dense;
+        e.precision = e_tensor.get().precision();
+        e.rows = e_tensor.get().rows();
+        e.cols = e_tensor.get().cols();
+        e.payload = e_tensor;
+        NN_TRY(b, param_entry_to_blob(engine, e, role));
+        NN_TRY(w, detail::write_param_blob(ofs, *b));
     }
 
     // tokenizer 数据（长度前缀，0 = 未嵌入；v5=JSON / v6=.nnvocab，按版本分派）
@@ -591,21 +885,38 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
     return detail::read_spec_header(ifs, *version_r);
 }
 
+// ── 只读文件角色（v7；v5/v6 无该字段 → Model）────────────────────────────
+[[nodiscard]] inline Result<ModelRole> peek_model_role(const std::string &filename,
+                                                       uint32_t *version_out = nullptr)
+{
+    std::ifstream ifs(filename, std::ios::binary);
+    if (!ifs)
+        NN_FAIL("Cannot open file for reading: " + filename);
+    ModelRole role = ModelRole::Model;
+    auto v = detail::read_and_validate_header(ifs, &role);
+    NN_TRY_CHECK(v);
+    if (version_out) *version_out = *v;
+    return role;
+}
+
 // ── 加载参数 + tokenizer ───────────────────────────────────────────────
 //    返回嵌入的 tokenizer 数据（空串 = 未嵌入）；version_out 可取回文件
 //    版本，用于词表数据的 v5(JSON)/v6(.nnvocab kvrec) 分派。
 // v5：per-tensor precision tag（读取时自动识别 f32/f16）
 // v4：无 precision tag（所有矩阵为 f32）
 [[nodiscard]] inline Result<std::string> load_model(const std::string &filename, Model &model,
-                                                   uint32_t *version_out = nullptr)
+                                                   uint32_t *version_out = nullptr,
+                                                   ModelRole *role_out = nullptr)
 {
     std::ifstream ifs(filename, std::ios::binary);
     if (!ifs)
         NN_FAIL("Cannot open file for reading: " + filename);
-    auto version_r = detail::read_and_validate_header(ifs);
+    ModelRole role = ModelRole::Model;
+    auto version_r = detail::read_and_validate_header(ifs, &role);
     NN_TRY_CHECK(version_r);
     const uint32_t version = *version_r;
     if (version_out) *version_out = version;
+    if (role_out) *role_out = role;
 
     // 读取并校验规格头
     auto spec_r = detail::read_spec_header(ifs, version);
@@ -621,7 +932,35 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
     auto& engine = model.engine();
     auto params = model.parameters();
 
-    if (version >= 5)
+    if (version >= 7)
+    {
+        // ── v7：参数级 kind（由拥有该参数的那个层决定形态）─────────────
+        for (std::size_t li = 0; li < model.num_layers(); ++li)
+        {
+            Layer &L = model.layer_at(li);
+            const std::size_t n = L.param_count();
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                NN_TRY(b, detail::read_param_blob(ifs));
+                NN_TRY(e, param_blob_to_entry(engine, *b));
+                NN_TRY(r, L.import_param(i, *e));
+            }
+        }
+        // 非可学习状态：Dense 条目
+        auto extras7 = model.extra_state();
+        for (auto& e_tensor : extras7)
+        {
+            NN_TRY(b, detail::read_param_blob(ifs));
+            if (b->kind != ParamKind::Dense)
+                NN_FAIL(std::string("非可学习状态必须是 Dense 条目，实际 kind=") +
+                        param_kind_name(b->kind));
+            NN_TRY(e, param_blob_to_entry(engine, *b));
+            auto m = engine.to_matrix(e->payload, Precision::F32);
+            NN_TRY_CHECK(m);
+            NN_TRY(cf, engine.copy_from(e_tensor, *m));
+        }
+    }
+    else if (version >= 5)
     {
         // ── v5：per-tensor precision tag ─────────────────────────────
         for (auto& p_tensor : params)
@@ -653,10 +992,11 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
         }
     }
 
-    // 非可学习状态
+    // 非可学习状态（**v7 已在上面按参数条目读过** → 这里只服务 v5/v6 老文件）
     auto extras = model.extra_state();
     for (auto& e_tensor : extras)
     {
+        if (version >= 7) break;
         if (ifs.peek() == EOF) break;
 
         if (version >= 5)
@@ -686,6 +1026,22 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
     if (!ifs)
         NN_FAIL("Read error while loading model from: " + filename);
     return tokenizer_data;
+}
+
+// ── 统一入口（v5/v6/v7 同一 magic，自动按版本分流）───────────────────────
+[[nodiscard]] inline Result<ModelSpec> peek_any_model_spec(const std::string &filename)
+{
+    return peek_model_spec(filename);
+}
+
+[[nodiscard]] inline Result<void> load_any_model(const std::string &filename, Model &model,
+                                                 std::string *tokenizer_out = nullptr,
+                                                 ModelRole *role_out = nullptr)
+{
+    auto tok_r = load_model(filename, model, nullptr, role_out);
+    NN_TRY_CHECK(tok_r);
+    if (tokenizer_out) *tokenizer_out = std::move(*tok_r);
+    return {};
 }
 
 } // namespace nn

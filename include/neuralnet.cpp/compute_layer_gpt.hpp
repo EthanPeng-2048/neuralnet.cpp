@@ -98,7 +98,7 @@ public:
     }
 
     // 子层结构（部署格式的完整遍历；顺序 = 上面 `parameters()` 的拼接顺序）
-    [[nodiscard]] std::vector<Layer*> sub_layers() noexcept override
+    [[nodiscard]] std::vector<Layer*> param_children() noexcept override
     {
         return {&self_attn_, norm1_.get(), &ff_, norm2_.get()};
     }
@@ -457,7 +457,7 @@ public:
     // 子层结构（部署格式的完整遍历；顺序 = 上面 `parameters()` 的拼接顺序；
     // token_emb_（Tensor）与 pos_encoder_（PositionEncoder，**不是 Layer**）都是
     // GPTModel 的"自身参数" → 由遍历器按"自身参数在前"处理，落成普通矩阵条目）
-    [[nodiscard]] std::vector<Layer*> sub_layers() noexcept override
+    [[nodiscard]] std::vector<Layer*> param_children() noexcept override
     {
         std::vector<Layer*> r;
         r.reserve(r.size() + blocks_.size() + 2);

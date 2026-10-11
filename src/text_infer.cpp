@@ -234,13 +234,12 @@ int main(int argc, char *argv[])
 {
     InferConfig cfg = parse_args(argc, argv);
 
-    // ── 从模型文件读取规格（训练文件 v6 / **打包部署文件** 两种都支持）────
+    // ── 从模型文件读取规格（v5/v6/v7 同一 magic，自动按版本分流）──────────
     auto spec_result = nn::peek_any_model_spec(cfg.model_path);
     NN_EXIT(spec_result, 1, "读取模型文件失败: ");
     nn::ModelSpec spec = spec_result.value();
-    auto is_deploy_r = nn::is_deployment_file(cfg.model_path);
-    NN_EXIT(is_deploy_r, 1, "读取模型文件失败: ");
-    const bool is_deploy = *is_deploy_r;
+    auto role_r = nn::peek_model_role(cfg.model_path);
+    NN_EXIT(role_r, 1, "读取模型文件失败: ");
     if (!spec.is_gpt() && !spec.is_rapt())
     {
         std::cerr << "模型文件不是 GPT/RAPT 类型 (type="
@@ -285,24 +284,16 @@ int main(int argc, char *argv[])
     NN_EXIT(model_result, 1, "构建模型失败: ");
     auto model = std::move(*model_result);
 
-    // ── 加载模型参数 + tokenizer（部署文件 → 三值层进 packed-only 只读态）──
+    // ── 加载模型参数 + tokenizer（.nnmodel 的打包三值层 → 只读推理态）──────
     std::cout << "加载模型: " << cfg.model_path << " ..." << std::endl;
     std::uint32_t model_version = 0;
     std::string embedded_vocab;
-    if (is_deploy)
-    {
-        auto load_r = nn::load_deployment(cfg.model_path, model, &embedded_vocab);
-        NN_EXIT(load_r, 1, "加载部署模型失败: ");
-        // 部署文件的词表载荷 = v6 的 .nnvocab 镜像（同一份 blob 编解码）
-        model_version = 6;
-        std::cout << "模型已加载（打包部署：0.25 B/权重 + τ，只读推理）" << std::endl;
-    }
-    else
     {
         auto load_result = nn::load_model(cfg.model_path, model, &model_version);
         NN_EXIT(load_result, 1, "加载模型失败: ");
-        embedded_vocab = *load_result;
-        std::cout << "模型已加载" << std::endl;
+        embedded_vocab = std::move(*load_result);
+        std::cout << "模型已加载（角色: " << nn::model_role_name(*role_r) << "）"
+                  << std::endl;
     }
 
     // ── 加载 tokenizer（按模型版本分派：v5=JSON / v6=.nnvocab kvrec）──
