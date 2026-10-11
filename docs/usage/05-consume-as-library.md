@@ -105,8 +105,9 @@ nn_enable_gpu_fusion(my_app MAIN ${CMAKE_CURRENT_SOURCE_DIR}/my_app_main.cpp)
   `cxx_std_26`；MSVC cl 不识别 `cxx_std_26`，降级传 `cxx_std_23`——其映射即
   `/std:c++latest`，C++26 预览全开）。MSVC 下消费方源码也须为 UTF-8（`/utf-8` 已传）。
 - **install / `find_package` 尚不支持**：当前只支持源码嵌入（add_subdirectory /
-  FetchContent）。`install()`/export 与 `CMakePresets.json` 见
-  `docs/todo/18-roadmap.md` P0-4 的剩余部分。
+  FetchContent）。`install()`/export 见 `docs/todo/18-roadmap.md` P0-4 的剩余部分
+  （`CMakePresets.json` 已于 2026-10-11 落地，但它是**本仓开发**用的构建口径，
+  消费方不需要它——你只要 `add_subdirectory` + 链 `neuralnet::nn`）。
 - **只支持 CPU / Vulkan 双后端**（无 CUDA）。
 
 ## 6. 故障排查

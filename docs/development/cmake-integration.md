@@ -155,12 +155,28 @@ nn_enable_gpu_fusion(my_app MAIN ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
 ## 7. 本仓开发：构建与测试
 
 ```bash
+# 推荐：用仓库自带的 CMakePresets.json（cmake --list-presets 看全部）
+cmake --preset dev && cmake --build --preset dev && ctest --preset dev
+cmake --workflow --preset dev          # 配置 + 构建 + 测试 一条命令
+
+# 等价的手写写法：
 # 默认 Release：-O3 -funroll-loops -march=native
 cmake -B build -G Ninja && cmake --build build
 
 # 开测试（测试程序在 build/，注册进 ctest）
 cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --test-dir build
 ```
+
+预设一览（`binaryDir` = `build/<preset名>`）：
+
+| preset | 配置 | 用途 |
+|--------|------|------|
+| `release` | Release + `-march=native`，无测试 | 跑应用，最省时间 |
+| `dev` | `release` + `NN_ENABLE_TESTS=ON` | 本仓日常开发（默认选它） |
+| `debug` | `dev` 换 `-O0 -g` | 断点/单步 |
+| `portable` | `dev` + `NN_ENABLE_NATIVE=OFF` | 发布/CI/换机可跑的基线 |
+| `cpu` | `dev` + `NN_ENABLE_GPU=OFF` | 纯 CPU 最短构建路径（不探测 Vulkan、不生成 shader） |
+| `probes` | `dev` + `NN_ENABLE_PROBES=ON` | 排障探针；⚠ 库头语义不同，缓存/二进制不可与正常构建混用 |
 
 构建出的应用入口：`build/{mnist_train,mnist_infer,text_train,text_infer,tokenizer_train,
 tokenizer_infer,dataset_gen,dataset_convert}`，另有 `layer_bench`（性能）与测试类可执行文件。
@@ -183,6 +199,25 @@ tokenizer_infer,dataset_gen,dataset_convert}`，另有 `layer_bench`（性能）
 3. `scan_exprs` 的 glslc **并行**（环境变量 `NN_SCAN_JOBS=<n>` 覆盖，`=1` 回串行）
    + `fused_registry.hpp` 内容稳定写入（内容不变则不动 mtime，靠 `restat` 掐断下游重编）；
 4. 编译器缓存探测扩到 ccache / sccache（可用 `-DNN_COMPILER_LAUNCHER=<path>` 指定）。
+5. **ccache 与共享 PCH 的兼容**（2026-10-11）：ccache 手册要求 Clang 侧**三项同时满足**
+   才能缓存"用了 PCH 的 TU"——`sloppiness` 含 `pch_defines,time_macros`、以 `-include-pch`
+   使用 PCH、编译带 `-fno-pch-timestamp`。前两项由构建系统补齐（sloppiness 用
+   `cmake -E env` 钉在 `RULE_LAUNCH_COMPILE` 前缀里，**不依赖用户全局 ccache 配置**），
+   第三项由 `NN_ENABLE_PCH` 路径自动加到 PCH 生成方与所有使用方。修复前**每一个**用 PCH
+   的 TU 都被记 "Could not use precompiled header" = 全部不可缓存。
+
+**实测数字**（本机 8 核，Release + 测试 + GPU，全量构建）：
+
+| 口径 | 时间 |
+|------|------|
+| 冷构建（无缓存） | **13 min 26 s**（189 个构建边；单个 TU 约 30 s，PCH 约 54 s） |
+| 命中 ccache 的重建（`ninja -t clean` 后同目录重跑） | **58.8 s**（13m26s → 58.8s；55/55 次编译命中，剩余时间是 shader 生成与链接） |
+| 单 TU（Release，PCH 已就绪） | 修复前 30.2 s → 命中缓存 **0.11 s** |
+
+> 时间构成的实测归因（`-ftime-trace`，Release / 单个 TU）：**后端 29.1 s / 总计 33.1 s**，
+> 其中优化器 16.6 s、代码生成 12.5 s；前端只占 4.0 s（无 PCH 时前端 16.8 s、总计 45.8 s）。
+> 也就是说 **PCH 之后编译时间的大头已经是 LLVM 的优化/代码生成**，不是头文件解析——
+> 继续压这一侧要靠减少每 TU 的代码量（拆目标/拆 TU），而不是再加 PCH 花活。
 
 **消费方**加速：对自己的目标用
 `target_precompile_headers(my_app PRIVATE <path>/neuralnet.cpp/nn.hpp)`。

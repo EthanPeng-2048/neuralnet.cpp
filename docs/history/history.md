@@ -34,7 +34,7 @@
 - [docs/development 01 · 04 · 06 · 07 · 10 · 14](#docs/development 01 · 04 · 06 · 07 · 10 · 14)（25 条）
 - [docs/development 15 · 16（ComputeEngine Refresh 设计与 P0 盘点，归档）](#docs/development 15 · 16（ComputeEngine Refresh：设计与 P0 盘点，2026-10-11 归档）)（2 条）
 - [docs/introduction · usage · benchmarks](#docs/introduction · usage · benchmarks)（46 条）
-- [构建系统 / CI（CMakeLists.txt、.github/workflows）](#构建系统 / CI（CMakeLists.txt、.github/workflows）)（5 条）
+- [构建系统 / CI（CMakeLists.txt、.github/workflows）](#构建系统 / CI（CMakeLists.txt、.github/workflows）)（8 条）
 - [AGENTS.md](#AGENTS.md)（24 条）
 - [ZiPT（AttnZip）移除](#ZiPT（AttnZip）移除（2026-10-01）)（1 条）
 - [GUI / CLI 参数一致性清理](#GUI / CLI 参数一致性清理（2026-10-01）)（1 条）
@@ -1895,6 +1895,70 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 
 - 类型：bug 根因 / 演进记录
 - 内容：Linux 云端构建复现历史链接失败（`tokenizer_train` FAILED，大量 `std::__cxx11::*`/`std::__throw_*`/`std::thread` undefined reference）：链接命令带两处 `-stdlib=libc++`（分处 CMAKE_CXX_FLAGS 与 CMAKE_EXE_LINKER_FLAGS 槽位），而 .o 是 libstdc++ ABI——clang 带 `-stdlib=libc++` 但系统无 libc++ 头时**静默回退 libstdc++ 头**，链接却切到 libc++ → ABI 分叉。演进三段：① 旧 workflow 曾传 `-DCMAKE_CXX_FLAGS/-DCMAKE_EXE_LINKER_FLAGS=-stdlib=libc++`，与 CMakeLists 当时的 `NN_STDLIB`（Linux+Clang 默认 libstdc++，`add_compile_options/add_link_options(-stdlib=...)`）冲突（68565b0 曾统一 libstdc++ 缓解）；② 1b415bf 从 CMakeLists 移除 NN_STDLIB 及「PATH 有 clang++ 即设为默认」块，仓库自此无任何编译器/标准库指定；③ 本轮云端**在干净源码上仍复现** → 残留载体：workflow build 目录缓存（`restore-keys` 跨 sha 恢复旧 `CMakeCache.txt`，configure 不清除未重传的 `-D` 缓存变量，历史 `-stdlib` 因此永久驻留）或调用方环境（`CXXFLAGS`/`LDFLAGS`/旧 configure 命令/旧 tag）。整改（2026-09-27，两轮）：轮1——workflow 删 build 目录缓存步骤（ccache 保留，注释记明原因）、删 `-DCMAKE_CXX_COMPILER/-DCMAKE_C_COMPILER` 与 `env CC/CXX`、删与 CMakeLists 重复的 `-DCMAKE_CXX_STANDARD*`，NN_STDLIB 陈旧注释改写；AGENTS.md:22 撤回「PATH 有 clang++ 会自动优先选」（1b415bf 已删该机制）；src/expr_{dsl,opt}_test.cpp:13 手动编译建议去掉 `-stdlib=libc++`。轮1 后云端回退默认 `/usr/bin/c++`（GCC 15）→ `-Werror=format-truncation` 失败（`expr_spec.hpp:715` 与 `gen_fused.cpp:341` 的 `snprintf` 缓冲区按 `%04x` 最坏 8 位十六进制不够；GCC 独有警告、clang 不报——为何此前 WSL g++ 15.2「全量构建 exit 0」未捕获待查，疑与该环境未开 Vulkan、不编译 tools/ 有关）；轮2——按用户要求**恢复 CI 指定 clang++**（双平台 `-DCMAKE_CXX_COMPILER=clang++`/`-DCMAKE_C_COMPILER=clang` + `env CC/CXX`，名称 `CMake (Clang, C++26)`、release 说明「Clang」）。当前事实：**CI 指定 clang++，CMakeLists 与标准库一律不指定**（标准库跟随编译器默认，编译/链接两侧必须一致）；上述两处 format-truncation 编码在 GCC 本地构建（开 Vulkan 时含 tools/）仍会触发（未修，CI 走 clang 不受影响）；云端若仍复现 -stdlib 问题，先查环境变量与删除陈旧 `build/CMakeCache.txt`。
+
+## ccache × 共享 PCH 不兼容：42 个目标的编译全部不可缓存（2026-10-11）
+
+- 类型：性能 A/B / bug 根因（构建系统）
+- 背景：`NN_ENABLE_PCH`（默认 ON）落地后，`ccache -s -v` 把"用了 PCH 的 TU"整类记进
+  `Could not use precompiled header`（756 条不可缓存里 125 条是该原因）。而本仓 40+ 个
+  app/test 目标的编译**全部**走 PCH ⇒ ccache 对这些编译形同虚设，且不报错、只是慢——
+  "装了 ccache 却感觉没加速"的隐藏根因。
+- 根因（ccache 手册《Precompiled headers》，Clang 侧三条件必须**同时**满足）：① `sloppiness`
+  含 `pch_defines,time_macros`；② 以 `-include-pch` 使用 PCH（CMake 天然满足）；③ **编译带
+  `-fno-pch-timestamp`**。缺 ①/③ 即整类不可缓存。
+- 整改（`CMakeLists.txt`，三处）：① 探测到 ccache 时用 `cmake -E env` 把
+  `CCACHE_SLOPPINESS=pch_defines,time_macros` 钉进 `RULE_LAUNCH_COMPILE` 前缀——**不改用户全局
+  ccache 配置**（"换机器/换人就悄悄失效"正是这次暴露的问题）；② `NN_ENABLE_PCH` 路径给 PCH 生成方
+  `nn_pch` 与**全部** PCH 使用方加 `-Xclang -fno-pch-timestamp`（cc1 开关，驱动不认该拼写；ccache
+  是逐 token 匹配字面量，`-Xclang` 形式同样满足——实测命中）；③ 删除 `RULE_LAUNCH_LINK`（本项目不做
+  LTO，ccache 包链接只有进程开销与 "Called for linking" 统计噪声，全量一次 337 次）。
+- 两项 sloppiness 的安全性（沿手册风险面逐条核对）：全仓无 `__DATE__`/`__TIME__`/`__TIMESTAMP__`
+  （已 grep）；`pch_defines` 只在"用 PCH + 源内 `#define` 影响 PCH 内容"时有风险，而 PCH 是**强制前置
+  包含**、源内 `#define` 影响不到它（`scan_exprs.cpp` 的 `NN_EXPR_SCAN` 本就**不套 PCH**，见前面条目）。
+- 实测（本机 8 核 / Release + `NN_ENABLE_TESTS=ON` + GPU）：同一 TU（`mnist_train.cpp`，PCH 就绪）
+  **30.2s → 0.11s**（`ccache -s`：Cacheable 2/2、Hits 1）；全量冷构建 **13m26s**（189 条构建边；
+  单 TU ≈30s、PCH ≈54s），`ninja -t clean` 后**同目录**重建 **58.8s**（13m26s → 58.8s；`ccache -s`：55/55 次编译命中——51 direct + 4 preprocessed；剩余时间是 shader 生成与链接）。
+  ⚠ 跨目录（换 `binaryDir`）不命中：PCH 的**绝对路径**在命令行里、参与哈希。
+- 顺带归档的耗时分摊（`-ftime-trace`，Release 单 TU）：总计 33.1s = **后端 29.1s**（优化器 16.6s，
+  其中 ModuleInlinerWrapper 10.5s / DevirtSCCRepeated 8.6s；代码生成 12.5s）+ **前端 4.0s**；
+  **无 PCH 时**前端 16.8s、总计 45.8s。⇒ PCH 之后的大头已是 LLVM 优化/代码生成，继续压这一侧要
+  减少每 TU 的代码量（拆目标/拆 TU），不是再加 PCH 花活。
+- 验收：全新配置目录 `-DCMAKE_BUILD_TYPE=Release -DNN_ENABLE_TESTS=ON`（Vulkan SDK 在 PATH）→
+  `Compiler launcher: /usr/bin/cmake -E env CCACHE_SLOPPINESS=pch_defines,time_macros /usr/bin/ccache`；
+  `build.ninja` 的 `FLAGS` 含 `-Xclang -fno-pch-timestamp`（54 处）；全量构建通过。
+
+## `CMakePresets.json` 落地（2026-10-11，E2/P0-4「剩余部分」的一半）
+
+- 类型：演进记录（**撤销一次旧裁定**）
+- 内容：E2/P0-4 曾记「`install()`/`find_package` 与 `CMakePresets.json` 本轮按用户裁定**不做**」。
+  2026-10-11 用户要求补上 preset 部分：新增 `CMakePresets.json`（v6）6 个配置 preset
+  （`release`/`dev`/`debug`/`portable`/`cpu`/`probes`，`binaryDir = build/<preset名>`）+ 对应
+  build/test preset + 2 个 workflow preset（`cmake --workflow --preset dev` 一条命令走完
+  配置/构建/测试）。**preset 只描述构建口径、不改变 CMakeLists 默认值**：不带 preset 的
+  `cmake -B build -G Ninja` 行为逐字不变（避免"引入 preset 反而改了默认构建"）。
+- 仍未做：`install()`/`find_package(neuralnet.cpp)`（P0-4 的另一半）——树外消费仍走
+  `add_subdirectory`/FetchContent（见 `docs/usage/05-consume-as-library.md`）。
+- 验收：`cmake --list-presets`（configure/build/test/workflow 四类均列出）；`cpu` 与 `portable`
+  两个 preset 各跑通一次真实配置（`build/cpu`、`build/portable`）。
+
+## 代码风格可执行化：`.clang-format` / `.editorconfig` / `.gitattributes`（2026-10-11）
+
+- 类型：演进记录 / 否决方案（"整仓 clang-format 重排"被否决）
+- 内容：风格规则原本只在 `docs/todo/10-development-standards.md` §8（散文），新增机器可读的
+  `.clang-format`。取值是**实测拟合**出来的（对 `include/` 71 个文件跑 `clang-format` 后统计与
+  原文的行级差异）：Allman（函数/类型/控制语句大括号一律另起一行，仓内主流）+ `NamespaceIndentation:
+  None` + `ColumnLimit: 100`（全仓 99% 的行 ≤100 列）+ `ReflowComments: false` +
+  `AlignTrailingComments: Leave`（仓内大量按**显示宽度**手工对齐的中文注释块，clang-format 按码点
+  计算宽度，接管即打乱）+ `SortIncludes: false`（包含顺序在 §8.3 有语义约定）。逐项对照见该文件
+  头注释。
+- **被否决的方案**：整仓 `clang-format -i`。实测**即使是最佳拟合配置**，对全仓 150 个文件整体格式化
+  仍会改 **41%** 的行（主因：续行折行策略、`if (c) stmt;` 单行/两行两种写法在仓内各约一半、
+  以及少数历史文件带 namespace 缩进）。因此定位为**目标风格 + 增量工具**：推荐 `git clang-format`
+  只格式化自己的改动行，并在 CONTRIBUTING/文件头明确写"不要在功能 PR 里顺手格式化无关文件"。
+- 同批：`.editorconfig`（缩进/行尾/编码/尾随空格）、`.gitattributes`（**全仓 LF**：`scan_exprs` 的
+  AOT 键与 KVRecord/日志解析对 `\r` 敏感，见 `docs/todo/08-pitfalls-and-lessons.md` 的 CRLF 条）。
+- 验收：`.clang-format` 能被 clang-format 23 解析（`--style=file` 退出码 0）；`.gitattributes`
+  落地后 `git status` 无重规范化噪声（工作树本来就全 LF）。
 
 ---
 
