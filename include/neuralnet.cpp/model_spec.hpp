@@ -46,7 +46,7 @@ enum class NormType : uint32_t
 // ── 归一化挂载位置（CNN / MNIST Transformer 专用）───────────────────────
 // 归一化**类型**由 NormType 描述；本枚举描述“加不加、加在哪”。
 //
-// **各架构默认（builder 默认实参，2026-10-03 起）**：CNN = BatchNorm@Conv、
+// **各架构默认（builder 默认实参）**：CNN = BatchNorm@Conv、
 // ViT = LayerNorm@Final、MLP/GPT/RAPT = None（它们的 norm 由自身结构决定）。
 // **旧模型文件没有 norm_place 键 → 读回 None = 不加额外归一化**——
 // 缺键**不**回落架构默认，与旧实现参数布局逐位一致（旧 checkpoint 仍可加载）。
@@ -88,7 +88,7 @@ enum class ModelType : uint32_t
     GPT         = 3,
     ALiBi_GPT   = 4,  // 使用 ALiBi 的 GPT 模型（向后兼容）
     CNN         = 5,  // 卷积神经网络（LeNet 风格，MNIST）
-    // 6 = AttnZip / ZiPT —— **已于 2026-10-01 整体移除**（代码保留在 `legacy/zipt`
+    // 6 = AttnZip / ZiPT —— **已整体移除**（代码保留在 `legacy/zipt`
     //     分支，恢复前提见 docs/history.md「ZiPT 移除」条）。此枚举值仅作占位：
     //     加载旧模型文件（type=6）时据此给出明确错误，而不是含糊的 "Unknown"。
     Reserved_ZiPT = 6,

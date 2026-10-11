@@ -1,7 +1,7 @@
-# 14 — GPU `stable=f16` 训练 loss 回读冻结（2026-09-26 基准重跑发现）
+# 14 — GPU `stable=f16` 训练 loss 回读冻结
 
-> 状态：**未修复（Open）** · 发现日期：2026-09-26 · 环境：Windows + clang++ 22（Release `-O3`）+ NVIDIA CMP 40HX（Vulkan）· HEAD `4a12876`
-> 发现途径：`docs/benchmarks/2026-09-25-vulkan-vs-cuda.md` 全量重跑（nn 侧）。本报告只记录事实与证据，不实施修复。
+> 状态：**未修复（Open）** · 环境：Windows + clang++ 22（Release `-O3`）+ NVIDIA CMP 40HX（Vulkan）· HEAD `4a12876`
+> 发现途径：`docs/benchmarks/*-vulkan-vs-cuda.md`（Vulkan vs CUDA 基准文档）全量重跑（nn 侧）。本报告只记录事实与证据，不实施修复。
 > 关联：issue #13 P0-②（MSVC f16 权重冻结，3c2b9e8 已修，**本缺陷与之不同**）；`docs/development/05-mixed-precision.md` §12.5（四字段全 f16 历史即不可训练）。
 
 ## 0. 结论速览
@@ -94,16 +94,16 @@ bench/raw/f16_ep2.bin  (2,971,754 B)  ← epoch2 结束时
 
 ## 4. 与已修缺陷的区分
 
-- 与 **issue #13 P0-②**（MSVC f16 权重冻结，`3c2b9e8` 已修）**不是同一问题**：
+- 与 **issue #13 P0-②**（MSVC f16 权重冻结，已修）**不是同一问题**：
 
-| | P0-②（3c2b9e8 已修） | 本缺陷 |
+| | P0-②（已修） | 本缺陷 |
 |---|---|---|
 | 编译器 | MSVC（clang 正常） | **clang（本机 clang++ 22）** |
 | 精度字段 | param=f16 即触发 | 仅 stable=f16 触发 |
 | 冻结对象 | **权重冻结**（loss 恒 = ln V） | **loss 回读冻结**（权重正常更新） |
 | 工具现状 | `f16_writeback_probe` ALL PASSED | 同工具无法覆盖本配置 |
 
-- 回归窗口比对与嫌疑提交排查（09-24 行为对照、`git log 75255da..HEAD` 嫌疑清单）已移入 `docs/history.md`。
+- 回归窗口比对与嫌疑提交排查已移入 `docs/history.md`。
 
 ## 5. 链路与嫌疑点（未定根因）
 
@@ -123,7 +123,7 @@ bench/raw/f16_ep2.bin  (2,971,754 B)  ← epoch2 结束时
 
 ## 6. 影响面
 
-1. **`docs/benchmarks/2026-09-25-vulkan-vs-cuda.md` §2**：「双方全 f16」主对比中 nn 侧的 loss/稳定性数据不可信（**wall-clock 计时与显存采样仍有效**）；已改 f32 优先。
+1. **`docs/benchmarks/*-vulkan-vs-cuda.md`（Vulkan vs CUDA 基准文档）§2**：「双方全 f16」主对比中 nn 侧的 loss/稳定性数据不可信（**wall-clock 计时与显存采样仍有效**）；已改 f32 优先。
 2. 所有 `--precision-stable f16`（GPU）用户：训练监控失效，**无告警**。
 3. `--f16` 推荐路径（param/compute=f16, stable/optimizer=f32）不受影响，实测健康。
 4. 四字段全 f16 本就是实验性配置（`text_train.cpp:583` 注释「想要四字段全 f16（实验性）：--f16 --precision-stable f16」），但 CLI 允许无告警组合出坏状态。

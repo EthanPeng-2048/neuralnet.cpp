@@ -3,7 +3,7 @@
 > 本文记录算子融合的**当前形态与设计约束**：一期（M1-M7）建立归约语义 IR 与注意力 / 稀疏 CE 的融合结构，二期（S1-S7）把 **matmul 纳入 IR 融合**，让手写融合原语收敛为 IR 表达——**一期的手写融合原语（M4-M6）已不存在，其结构一律由 IR / fold 承载**。两期服务同一目标：减少 GPT+Vulkan 训练显存，同时严格遵循分层铁律。
 >
 > 状态：二期范围 = S1-S5、S7（**S6 自动窗口不接线**，见 §跨 kernel 自动融合）；**注意力 forward 是单 fold kernel（FoldSpec 分块流式求值）——见"关键算法"章，S7 的 IR 链现仅存于 backward**。分期实施流水、删除清单与否决方案的演进记录见 `docs/history.md`。
-> 关联文档：`03-ir-optimization.md`（IR-A/B/C/D；IR-C = 图 IR + `begin_expr/end_expr` 融合分析，2026-10-06 恢复）。
+> 关联文档：`03-ir-optimization.md`（IR-A/B/C/D；IR-C = 图 IR + `begin_expr/end_expr` 融合分析）。
 
 **怎么读本文（3 条路径）**：
 
@@ -162,15 +162,15 @@ struct MatmulSpec {
 
 **① 构建期收集（不变）**：`scan_exprs` 收集各 Layer 折叠出的 `ExprSpec` **结构**——由 `FusedAnchor<Expr>` 在静态初始化期按表达式类型自登记（编译期可达），再由 dry-run / 模型 pass 补齐运行期配置相关的结构（见 §构建工具链与闭合世界与 §自登记锚点）。**精度签名不是构建期集合**：生成阶段对每个结构发一份运行期精度分派 shader（键 `key#x`），运行时按真实精度填 PC `prec`。
 
-**② 运行时跨表达式录制（IR-C：2026-10-06 恢复，P1 机制 + P2 写穿多输出）**：`expr_graph.hpp` 提供 `ExprGraph`/`ExprGraphNode`/`fuse_expr_graph`/`recording_graph_owner`、per-graph `node_outputs`、全局唯一占位 tag 分配器 `next_virtual_tag()`，以及 P2-12 图级计划缓存（`graph_cache_key`/`FusedKernelPlan`/`instantiate_plan`）。引擎侧入口是虚方法 `ComputeEngine::begin_expr()/end_expr()`（引擎 virtual 总数 **52**）；`dsl::start_expr/end_expr`（`ExprBlock` 语法糖）用于跨行书写**单个**表达式；`ExprSegment` 是 `compute_engine.hpp` 里的 RAII 守卫——作用域退出自动收口录制段并传播 `end_expr` 错误。融合边界不再恒等于单个表达式：
+**② 运行时跨表达式录制（IR-C：P1 机制 + P2 写穿多输出）**：`expr_graph.hpp` 提供 `ExprGraph`/`ExprGraphNode`/`fuse_expr_graph`/`recording_graph_owner`、per-graph `node_outputs`、全局唯一占位 tag 分配器 `next_virtual_tag()`，以及 P2-12 图级计划缓存（`graph_cache_key`/`FusedKernelPlan`/`instantiate_plan`）。引擎侧入口是虚方法 `ComputeEngine::begin_expr()/end_expr()`（引擎 virtual 总数 **52**）；`dsl::start_expr/end_expr`（`ExprBlock` 语法糖）用于跨行书写**单个**表达式；`ExprSegment` 是 `compute_engine.hpp` 里的 RAII 守卫——作用域退出自动收口录制段并传播 `end_expr` 错误。融合边界不再恒等于单个表达式：
 
 - **GPU 真录制**：`GpuEngine::execute_fused_graph`（图 → 融合分析 → kernel 序列 → AOT dispatch），kernel 输出经 `output_override` 直接写进尾节点占位存储（`run_graph_kernel_into_`）。
 - **CPU no-op**：普通运行 `begin_expr/end_expr` 是 no-op（CPU 数值不变）；构建期收集器 `NN_EXPR_SCAN` 下 `CpuEngine::end_expr` 跑同一套 `fuse_expr_graph` 并登记**每个**融合 kernel 的 spec，使构建期扫描与运行期融合一致（闭合世界）。
 - **融合规则**：**P1 链**（单输出；两端节点均逐元素、无归约、同形状同精度；尾节点恰一个消费者、经 Linear 视图消费；允许 matmul 头段 = 旧 S5 规则）与 **P2 分量**（纯逐元素 F32 同形状节点按依赖边 union-find 成组，多消费者/菱形不再是融合边界；成员输出**全部写穿** = `ExprSpec.extras`，≤4 个 extras、至少 2 个成员；预算溢出则拆成更多 kernel）。kernel 序列按确定性稳定拓扑序执行。
 - **Adam 接线**：`Adam::step`/`AdamW::step` 用 `begin_expr` + `ExprSegment` 录制整个 step；每个参数张量的 K1/K2 m/v 状态写穿 + K3 delta + K4 `p += delta` 目标传递收敛为**一个多输出 kernel**（f32；混合精度自动拆分）。实测（`NN_PROFILE`，GPU NVIDIA CMP 40HX，GPT d_model=64 / 4 层 / heads=4 / seq=256 / batch=64，`adam`，20 步）：`fused@optimizer` 设备 kernel **266 → 66.5 每步**、设备时间 **0.57 → 0.23 ms/step**（设备侧数字与构建配置无关；Debug 构建会放大 host 侧数字）。
-- **闭合世界降级（本轮新增的通用机制）**：融合分组依赖精度（P2 需全 F32 成员、P1 需同精度），混精度 profile 可能产出 f32 构建期扫描从未登记的**复合**结构。构建期不枚举精度组合（2⁴ 爆炸），而是执行期通用降级：复合 kernel 的 AOT shader 未登记（或写穿前置条件不满足——多输出要求输入/输出全 f32）时，`execute_fused_graph` 把该 kernel 拆回逐成员派发——每个成员都是已登记的**单节点**结构，铁律仍成立（只有 AOT 登记的 shader 会跑，未登记的**单节点** spec 仍是硬报错）。该段恢复为 IR-C 之前的行为。
+- **闭合世界降级（本轮新增的通用机制）**：融合分组依赖精度（P2 需全 F32 成员、P1 需同精度），混精度 profile 可能产出 f32 构建期扫描从未登记的**复合**结构。构建期不枚举精度组合（2⁴ 爆炸），而是执行期通用降级：复合 kernel 的 AOT shader 未登记（或写穿前置条件不满足——多输出要求输入/输出全 f32）时，`execute_fused_graph` 把该 kernel 拆回逐成员派发——每个成员都是已登记的**单节点**结构，铁律仍成立（只有 AOT 登记的 shader 会跑，未登记的**单节点** spec 仍是硬报错）。降级后即回落到单表达式的常规派发路径。
 
-仍可（且常常更简单）把一条长逐元素链直接写成**一个** `dsl::compute` 表达式（单个 AOT 融合 kernel）——这仍是首选机制；跨表达式录制用于同一 step 内多个表达式共享写穿/多输出目标（优化器步即典型）。**`FusedChainLayer`（旧演示层）未恢复**——只恢复机制。取舍记录见 `docs/history.md`，另见 `03-ir-optimization.md` §5.3。
+仍可（且常常更简单）把一条长逐元素链直接写成**一个** `dsl::compute` 表达式（单个 AOT 融合 kernel）——这仍是首选机制；跨表达式录制用于同一 step 内多个表达式共享写穿/多输出目标（优化器步即典型）。**`FusedChainLayer`（旧演示层）不存在**——跨表达式录制只提供机制。取舍记录见 `docs/history.md`，另见 `03-ir-optimization.md` §5.3。
 
 ---
 
@@ -247,16 +247,16 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
    · **生成**：`tools/fused_generate.hpp`（原独立工具 `gen_fused`，现已并入本工具）对**每个结构发三份**：V0 全 f32（键 = `key`）/ **V1 运行期精度分派**（键 = `key#x`）/ V2 native16（键 = `key#a`，按 `expr_prec_sig_native16` 的**结构谓词**判定）→ GLSL → glslc → 内联 SPIR-V → `build/generated/fused_registry.hpp`。
    · **不经 `.bin` 中间序列化**（`expr_registry.hpp` 的 `write_registry/read_registry/kExprBinVersion` 已删除）。
 
-### 精度签名已不是构建期集合（2026-10-01，A1）
+### 精度签名已不是构建期集合
 
-**问题（历史）**：签名（哪些输入/输出是 f16）由运行期张量精度决定、类型层面不可见，因此历史上"每个 (结构, 签名) 一份 shader"必须靠**执行**发现（dry-run 跑 f32/f16 两遍 + 模型 pass + `NN_PREC_TRACE` 回填清单）。**该问题已随"签名降级为参数"消失**，下面的实测数据保留作为历史依据。这是扫描里唯一无法用自登记取代的部分。
+**背景**：签名（哪些输入/输出是 f16）由运行期张量精度决定、类型层面不可见——因此"每个 (结构, 签名) 一份 shader"的做法必须靠**执行**发现签名。**该问题已随"签名降级为参数"消失**：构建期不再需要发现签名。这是扫描里唯一曾无法用自登记取代的部分。
 
 **解法 = 把签名从「身份」降级为「参数」**：V1 变体的 GLSL 对每个输入/输出各声明 **f32 + `float16_t` 双视图**（同一 `VkBuffer` 绑两次，只解引用与真实元素类型一致的那一个），加载/存储处按 push constant `uint prec`（bit i = 输入 i 为 f16，bit16 = 输出 f16）走 **uniform 分支**。索引数学**逐字不变**（两种视图共用同一逻辑下标）→ 与旧带类型变体数值等价。
 
 于是：
 - V1 默认对**每个结构**都尝试生成 ⇒ 一份 shader 覆盖任意签名，运行期不再需要"发现签名"；精度路径仍是三档 `key#a` → `key#x` → **基类边界 cast**（生成被 `[skip]` / `NN_SCAN_NO_DISPATCH=1` / 设备无 16bit 存储时落到 cast，`[prec][miss]` 仍会触发）；**`tools/prec_backfill.txt` 与回填工作流已删除**；
 - V2（native16，原生 f16 算术）改由**结构谓词**判定生成（代入"全输入 f16 + 输出 f16"这一常量签名），运行时按真实签名确认 —— 生成期同样不需要发现；
-- **实测 f16 扫描遍对结构贡献为 0**（当时的 `NN_SCAN_F32_ONLY` 探针——该宏随删除一并移除：跳过它签名 66 → 0、结构恒 84）→ f16 dry-run 遍与 f16 模型 pass 已删除，扫描工作量减半。
+- **实测 f16 扫描遍对结构贡献为 0**（A/B：跳过该遍结构数不变）→ f16 dry-run 遍与 f16 模型 pass 已删除，扫描只跑 f32 一遍，工作量减半。
 
 **端到端实测**（"写 `dsl::compute` 即自动融合"）：在 Layer 头里新写一个结构不在任何 dry-run/模型 pass 覆盖内的表达式 →
 
@@ -272,19 +272,19 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 
 `scan_exprs` 需覆盖所有 Layer 的 DSL 路径（Softmax/LN/RMSNorm fwd+bwd、CrossEntropy softmax 结构、**Attention fold 结构**——层 forward 直调 `engine.eval_expr(make_fold_attn_o(...))` 不经 DSL 钩子，scan 的显式登记块（3 掩码 × 2 偏置的 5 个组合）覆盖注意力 fold（漏组合即 GPU 闭合世界硬报错；fold 值构造另有 `FoldAnchor` 自登记通道，见"自登记锚点"节）、Linear 的 matmul 段、optimizer 的 `compute_into` 原地表达式），使融合签名被收集。**结构**已由自登记锚点保证（见下节），未命中 → `eval_expr` 硬报错（保持项目"GPU 硬报错、不降级"哲学）。
 
-### 自登记锚点：结构覆盖不再依赖手写清单（2026-10-01）
+### 自登记锚点：结构覆盖不再依赖手写清单
 
-手写 dry-run 清单只覆盖**跑到的**路径；配置分支没被跑到就漏（`MaxPool2D(pool≠2)` 曾如此）。为此 `expr_dsl.hpp` 增加 `FusedAnchor<Expr>`：每个 `dsl::compute/_into/_reduce` 实例化 odr-use 一个锚点，其**静态初始化期**把"从表达式类型默认构造的符号实例"折叠出的结构登记进注册表。
+手写 dry-run 清单只覆盖**跑到的**路径；配置分支没被跑到就漏（如 `MaxPool2D(pool≠2)`）。为此 `expr_dsl.hpp` 增加 `FusedAnchor<Expr>`：每个 `dsl::compute/_into/_reduce` 实例化 odr-use 一个锚点，其**静态初始化期**把"从表达式类型默认构造的符号实例"折叠出的结构登记进注册表。
 
 - **前提 = "结构 = 表达式类型"**：为此步骤①②③把 `consts` 值、`matmul.transA/transB`、`GroupedReduce.R` 逐出 key（分别改走 push constant），并把 `GroupedReduceRef` 的 `is_max`（决定视图 kind）提为模板参数。
-- **覆盖语义**：调用点在函数体里，**函数被编译即实例化**——与运行期是否走到该分支无关，因此是"编译期可达"而非"运行期可达"。A/B 实测（`-DNN_SCAN_NO_ANCHOR`）：结构数 **71（仅 dry-run/模型 pass）→ 84（+锚点）**，多出的 13 条都是编译进来的真实调用点（含 matmul、归约、16 个 vp 槽的宽表达式等）。
-- **两者互补，不冗余**（`NN_SCAN_DUMP_SOURCES=1` 逐条打印来源，实测 91 条，2026-10-03 BatchNorm 落地后；该节上方 A/B 时点为 84）：per-layer+显式登记 38 + 模型 pass 32 + fold 显式 8 = **dry-run 侧 78**、锚点 66，**重叠 53 → 锚点独有 13、dry-run 独有 25**（口径：三段互不重叠；打印行见下）。所以**单独删任何一方都会丢结构**：
+- **覆盖语义**：调用点在函数体里，**函数被编译即实例化**——与运行期是否走到该分支无关，因此是"编译期可达"而非"运行期可达"。A/B 实测（`-DNN_SCAN_NO_ANCHOR`）：结构数 **78（仅 dry-run/模型 pass）→ 91（+锚点）**，多出的 13 条都是编译进来的真实调用点（含 matmul、归约、16 个 vp 槽的宽表达式等）。
+- **两者互补，不冗余**（`NN_SCAN_DUMP_SOURCES=1` 逐条打印来源，实测 91 条）：per-layer+显式登记 38 + 模型 pass 32 + fold 显式 8 = **dry-run 侧 78**、锚点 66，**重叠 53 → 锚点独有 13、dry-run 独有 25**（口径：三段互不重叠；打印行见下）。所以**单独删任何一方都会丢结构**：
   - **dry-run 独有 25 条**按形态分：**fold 8 条**（= 显式登记的掩码×偏置组合与通用 fold 样例，见下）、**含 matmul 段 7 条**（注意力反向 / CE / 优化器步）、**RowAccess(12) 4 条**（共享内存 SwiGLU 的半偏移行切分）、**RowGather(9)/ColBroadcast(8) 若干**（稀疏 CE 的 5 视图形态 `[0,8,8,8,8]` 等）——共同点是**结构由运行期配置决定**（视图种类/项数/掩码组合），类型层面推不出来，符号实例 `Expr{}` 与真实实例会折叠出**不同 key**（实测存在"视图种类与指令数完全相同、只有 key 不同"的镜像对，如 dry-only `784781c7b82fa76c` ↔ anchor-only `28cdf7c6d5df0e1d`）。
   - **锚点独有 13 条**是镜像面：dry-run/模型 pass 没跑到的编译期可见调用点（最著名的是 `9ca81b4967cdfa20`——关掉锚点后 `text_infer` KV-cache 增量解码在 GPU 上闭合世界硬报错）。
   - **结论**：dry-run + 模型 pass 是结构的主要来源，**删不掉**；锚点补它跑不到的部分。这也是"扫描步骤本身无法删除"的精确根因。
 - **常驻台账**：锚点登记进独立注册表 `anchor_registry()`，`scan_exprs` 末尾合并并打印来源分项（见下）。**锚点独有数突然变大 = 有新的层路径没纳入任何驱动**（回归信号）。
 - **只登记结构**：⚠ 自登记只能给**结构**（`sig=0`）。**精度签名由生成期的运行期分派变体覆盖**（见上节"精度签名已不是构建期集合"）——自登记 + V1 合起来才构成完整的"零注解"链路：结构靠编译期可达，签名靠运行期参数。
-- **模型级 pass（结构侧）**：per-layer dry-run 块只覆盖"层被单独造出来"的路径；有些调用点只在**完整模型**里才执行（GPT/RAPT 的 LM head、PatchEmbedding、模型级位置编码等）。`scan_exprs` 因此跑一遍**配置矩阵**（只跑 f32）：`mnist_mlp`×{LayerNorm,RMSNorm,BatchNorm}、`mnist_transformer`(ViT)、`cnn`×{pool2,pool3}、`gpt`×{Learned,ALiBi,Sinusoidal,RoPE}×{GeLU,SwiGLU}×{LayerNorm,RMSNorm}、`rapt`×{causal,bidir}（小配置 vocab=64/d_model=16/seq=8/H=2/d_ff=32/L=2；id 输入须填合法 token 值）。**每个模型先训练态 forward+backward、再推理态 forward+backward**（2026-10-03 起——训练/推理双态层如 `BatchNorm` 的两条路径是不同表达式结构，只跑训练态则 GPU 推理闭合世界硬报错；对无双态语义的层 `set_training` 是 no-op，多跑一轮只重复登记已知结构）。该 pass 失败**中止构建**（注册表不完整 = 闭合世界缺口）。
+- **模型级 pass（结构侧）**：per-layer dry-run 块只覆盖"层被单独造出来"的路径；有些调用点只在**完整模型**里才执行（GPT/RAPT 的 LM head、PatchEmbedding、模型级位置编码等）。`scan_exprs` 因此跑一遍**配置矩阵**（只跑 f32）：`mnist_mlp`×{LayerNorm,RMSNorm,BatchNorm}、`mnist_transformer`(ViT)、`cnn`×{pool2,pool3}、`gpt`×{Learned,ALiBi,Sinusoidal,RoPE}×{GeLU,SwiGLU}×{LayerNorm,RMSNorm}、`rapt`×{causal,bidir}（小配置 vocab=64/d_model=16/seq=8/H=2/d_ff=32/L=2；id 输入须填合法 token 值）。**每个模型先训练态 forward+backward、再推理态 forward+backward**（训练/推理双态层如 `BatchNorm` 的两条路径是不同表达式结构，只跑训练态则 GPU 推理闭合世界硬报错；对无双态语义的层 `set_training` 是 no-op，多跑一轮只重复登记已知结构）。该 pass 失败**中止构建**（注册表不完整 = 闭合世界缺口）。
 - **已验证可删：13 个 per-layer dry-run 块（−223 行）**。模型 pass 覆盖了这些层路径后，`scan_exprs` 里 ReLU/SwiGLU/GeLU/Softmax/RMSNorm/LayerNorm/RLA(causal+bidir)/GPTBlock/TransformerEncoderLayer/Linear/Conv2D/MaxPool2D 的独立 dry-run 块**已删除**，判据是两条硬证据：
   1. **结构集合逐字节不变**（84 条，bin 内容一致）；
   2. **运行时 miss 集合不变**：`NN_PREC_TRACE=1 mem_probe --f16` 的 5 个工作负载（默认 / `--doc-mask` / `--checkpoint-every 2` / `--optimizer muon` / `--activation-offload`）在删除前后都是同一个 miss（仅 fold doc-mask 一条，见下）。
@@ -294,12 +294,12 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
   [scan] 结构来源：dry-run 侧 78（per-layer+显式 38、模型 pass +32、fold 显式 +8） + 锚点 66（新增 13）= 合计 91（锚点独有 13、dry-run 独有 25）
   ```
   A/B 开关：`-DNN_SCAN_NO_ANCHOR`（关锚点）/ `-DNN_SCAN_NO_DRYRUN`（关 dry-run/模型 pass），均只影响登记集合、不改语义。逐条来源用 `NN_SCAN_DUMP_SOURCES=1` 打印（`[scan][dry-only]` / `[scan][anchor-only]` + 结构摘要）。
-- **run-only 签名回填已删除**（A1e）：`--f16` 下曾有一批只有真实训练才暴露的签名（注意力 fold 的文档掩码 5 输入形态、MNIST/CNN f16 训练的 8 条"f32 入 + f16 出"混合签名），靠 `NN_PREC_TRACE=1` 的 `[prec][miss]` 收集后写进 `tools/prec_backfill.txt`。**该清单与其工作流已随 A1 整体删除**——V1 分派 shader 覆盖任意签名，f16 训练实测 `miss=0` 且边界 cast 归因表为空。历史清单条目与复现命令归档在 `docs/history.md`。
+- **run-only 签名回填不存在**（A1e）：该工作流（`--f16` 下用 `NN_PREC_TRACE=1` 的 `[prec][miss]` 收集只有真实训练才暴露的签名、写进 `tools/prec_backfill.txt`）**已整体删除**——V1 分派 shader 覆盖任意签名，f16 训练实测 `miss=0` 且边界 cast 归因表为空。历史清单条目与复现命令归档在 `docs/history.md`。
 - **契约回归**：上述三条 key 语义 + "符号实例 key ≡ 真实实例 key" 由
   `src/expr_fused_key_test.cpp` 锁定（并入 `expr_cpu_test` 聚合目标，ctest 目标数不变）。
   任一条被违反（有人重新引入"运行期值决定结构"）→ 运行时 key 与登记 key 不一致
   → 闭合世界 miss；测试会立刻红。
-- **运行时证据（2026-10-01）**：关掉锚点（`-DNN_SCAN_NO_ANCHOR`，结构 84 → 71）后，`text_train` / `mnist_train --f16` / `gpu_stability_probe` 全部照常通过，但 **`text_infer`（KV-cache 增量解码）在 GPU 上闭合世界硬报错**：
+- **运行时证据**：关掉锚点（`-DNN_SCAN_NO_ANCHOR`，结构 91 → 78）后，`text_train` / `mnist_train --f16` / `gpu_stability_probe` 全部照常通过，但 **`text_infer`（KV-cache 增量解码）在 GPU 上闭合世界硬报错**：
 
   ```
   GpuEngine::eval_expr: 未找到该内联表达式的 AOT 融合 shader（闭合世界）；…
@@ -390,9 +390,9 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 
 **效果（当前）**：闭合世界不随 d_k 穷举（RoPE 的 4×dk 去重为同构）；`expr_gpu_test` 用 d_k ∈ {16, 40, 64, 96, 128}（含非 2 的幂）全部命中同一 shader，err≤1.2e-7。零额外显存。matmul 段的 `k`/`batch` 与 `rparam` 运行时标量采用同样的形状无关处理。
 
-### 运行期 operand layout：matmul 转置（2026-10-01）
+### 运行期 operand layout：matmul 转置
 
-`MatmulSpec.transA/transB` 原先按"结构"进 key，同一表达式的 4 种转置组合各占一份 shader。而 DSL 的 `dsl::matmul(A,B,transA,transB)` 在**类型层面看不出转置差异**（四个组合同类型）——这正是"结构 = 表达式类型"（AOT 按类型实例化自登记的前提）的障碍。
+`MatmulSpec.transA/transB` 不进 key——若按"结构"进 key，同一表达式的 4 种转置组合会各占一份 shader。而 DSL 的 `dsl::matmul(A,B,transA,transB)` 在**类型层面看不出转置差异**（四个组合同类型）——这正是"结构 = 表达式类型"（AOT 按类型实例化自登记的前提）的障碍。
 
 处理方式与形状参数同源（把结构信息从 key 拿到运行时）：
 
@@ -401,7 +401,7 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 3. `run_fused_gpu` 的 PC 形态随之扩 1 个 uint（matmul 5→6、matmul+归约 6→7；fold 形态不在此列）——**创建侧 `pc_base` 与写入侧必须逐形态同改**（见 `compute_vk_backend.hpp` 的告警）。
 4. ⚠ **双域 fold 自带的 matmul 段不在此列**：fold 的转置仍进 key（生成期定死），`mm_trans` 恒传 0。
 
-**效果**：扫描结构 77 → 72（5 个"仅转置不同"的结构合并；`dsl::matmul` 的 4 组合由 4 份 shader 收敛为 1 份），并让 matmul 段成为"纯类型决定"的结构——AOT 自登记的前提之一。
+**效果**：5 个"仅转置不同"的结构合并（`dsl::matmul` 的 4 组合由 4 份 shader 收敛为 1 份），并让 matmul 段成为"纯类型决定"的结构——AOT 自登记的前提之一。
 
 ---
 

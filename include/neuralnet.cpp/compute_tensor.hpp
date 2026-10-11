@@ -239,6 +239,32 @@ public:
     [[nodiscard]] std::uint64_t virtual_tag() const noexcept { return virtual_tag_; }
     void set_virtual_tag(std::uint64_t tag) noexcept { virtual_tag_ = tag; }
 
+    // ── 存储身份比较（M1：非数据访问，不暴露存储读写能力）─────────────────
+    // 两个包装是否指向同一份底层存储（同设备 / 同精度 / 同指针 / 同形状）。
+    // 用途：DSL SpecBuilder 输入槽去重（同一张量+同一视图复用一个绑定槽，
+    // 让 CSE 能识别"同一输入的重复子链"，归约视图只算一遍）。空/无效张量
+    // 一律判不等——锚点符号实例是占位张量，绝不能据此合并（否则扫描期结构
+    // 与运行期结构分叉）。
+    [[nodiscard]] bool same_storage(const Tensor& o) const noexcept
+    {
+        if (!valid() || !o.valid()) return false;
+        if (device_ != o.device_ || precision_ != o.precision_) return false;
+        if (rows_ != o.rows_ || cols_ != o.cols_) return false;
+        if (device_ == Device::CPU)
+        {
+            return precision_ == Precision::F16
+                ? cpu_get<Precision::F16>() == o.cpu_get<Precision::F16>()
+                : cpu_get<Precision::F32>() == o.cpu_get<Precision::F32>();
+        }
+#ifdef NN_HAS_VULKAN
+        return precision_ == Precision::F16
+            ? gpu_get<Precision::F16>() == o.gpu_get<Precision::F16>()
+            : gpu_get<Precision::F32>() == o.gpu_get<Precision::F32>();
+#else
+        return false;
+#endif
+    }
+
     // ── 出生绑定（P1，§3.1）──────────────────────────────────────────────
     // bound()：是否已 stamp 到某个引擎（未绑定输入在 P1 检查中按库外豁免放行，
     //   仅 NN_BIND_DEBUG=1 时报错——见 ComputeEngine::bind_check_）。

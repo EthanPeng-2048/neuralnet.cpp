@@ -42,7 +42,7 @@ public:
     [[nodiscard]] Result<void> end_batch() override { return {}; }
     [[nodiscard]] Result<void> flush_batch() override { return {}; }
 
-    // ── 表达式录制（IR-C，2026-10-06 恢复）──────────────────────────────
+    // ── 表达式录制（IR-C）──────────────────────────────
     // 普通 CPU 运行：no-op（各表达式直接求值，行为不变——图融合是 GPU 优化）。
     // 构建期 scan（NN_EXPR_SCAN）：begin_expr 开启录制图（dsl 的 scan 分支把
     // 表达式加入图而非直接登记），end_expr 融合分析并登记**全部融合 kernel 的
@@ -235,8 +235,10 @@ public:
         NN_FAIL("cast_into: unsupported precision conversion");
     }
 
-    [[nodiscard]] Result<void> copy_from_impl(Tensor& dst, const Matrix& src) override
+    [[nodiscard]] Result<void> copy_from_impl(Tensor& dst, const Matrix& src,
+                                              bool /*fresh_dst*/) override
     {
+        // fresh_dst 是 GPU 录制窗口排空的跳过声明，CPU 直拷无此概念。
         if (!dst.is_cpu())
             NN_FAIL("copy_from: dst tensor is not CPU");
         if (dst.rows() != src.rows() || dst.cols() != src.cols())

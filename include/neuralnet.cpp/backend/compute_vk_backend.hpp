@@ -267,7 +267,7 @@
 //   因此不变量：**NN_EXPR_SCAN ⇒ 不含 fused_registry**（应用/样例目标不受影响）。
 // ⚠ 守卫必须写成**嵌套 #ifndef**、不能写成 `__has_include(...) && !defined(...)`
 //   （或反过来短路）：clang 21 实测 `#if` 条件里的 `__has_include` **无论是否被
-//   短路求值、都会被 -MD 记进 depfile**（2026-10-03 复现 f093261 后仍存在的依赖环）；
+//   短路求值、都会被 -MD 记进 depfile**（该写法会触发上述依赖环）；
 //   只有把整组条件编译**跳过**（组内不出词法）才不产生探测记录。
 #ifndef NN_EXPR_SCAN
 #if __has_include("fused_registry.hpp")

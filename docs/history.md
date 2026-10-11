@@ -38,6 +38,7 @@
 - [fold v2 恒等三改（P2-1）与注意力 fold 相位消融](#fold v2 恒等三改（P2-1）与注意力 fold 相位消融（2026-10-07）)（1 条）
 - [fold v2 vecacc 双路径改写（P2-2）](#fold v2 vecacc 双路径改写（P2-2）：j 分片跨线程 + 标量累加器（2026-10-07）)（1 条）
 - [matmul K 切分二次归约（`#ks`/`#kr`）](#matmul K 切分二次归约（`#ks`/`#kr`）：wgrad 派发饥饿第二刀（2026-10-07）)（1 条）
+- [录制窗口排空隐藏 + SpecBuilder 输入槽去重（项目 4/5）](#录制窗口排空隐藏 + SpecBuilder 输入槽去重（项目 4/5，2026-10-08）)（1 条）
 
 ---
 
@@ -3225,3 +3226,104 @@ A1 段改动前为 2424）、`include/neuralnet.cpp/compute_cpu_engine.hpp` **23
   → reference 的构造 glslc 强制要求该扩展（缺则编译期报错）；② ts 标签/指标行
   口径见上「kernel 对照」条（用户裁定：`fused_b` 与 `fused@optimizer` 分列，
   合计核对）。
+
+---
+
+# 录制窗口排空隐藏 + SpecBuilder 输入槽去重（项目 4/5，2026-10-08）
+
+## copy_from fresh 上传免排空（项目 4）与输入槽去重（项目 5）
+
+- 类型：性能 A/B + 演进记录（含闭合世界分叉的实测暴露与补登记）。
+- **立项来源**：剖析画像定位的两个瓶颈——① `copy_from` 121 次/20 步、占墙钟
+  71.8%（host 反复 `end_batch → wait_in_flight → begin_batch` 全排空，
+  busy 已 90% ⇒ 收益在"把等待藏掉"）；② 反传注意力 `86c84dd0293c4913`
+  （`recompute_W_` softmax）归约链 4 槽冗余 + `fused@bwd.blk` 家族 10.3 ms/step。
+
+- **项目 5：SpecBuilder 输入槽去重（通用 IR 机制，非注意力专属）**：
+  - 中心化 `SpecBuilder::add_input(t, view, dedup=true)`：同
+    `Tensor::same_storage`（同设备/精度/存储指针/形状）+ 同 `ExprView` →
+    复用已有槽、不新增绑定。全部 `add_input_*` 与 `BatchModRef/BatchColRef`
+    的 `to_spec` 收口到它。
+  - **两处调用方必须独占新槽**（返回值即下标，不能用 `inputs.size()` 预判）：
+    `RowGatherRef`（登记后改写 `views[ti]` 为 RowGather，复用会污染原输入视图
+    → `dedup=false`）；`MatmulNode` A/B（vec4 快路径以 `a_slot != b_slot` 为
+    启用条件，同张量 `matmul(X,X)`（Muon Nesterov/NS）合并成单槽会**整体关闭
+    快路径**、标量回退 → A/B 恒 `dedup=false`）。
+  - `Tensor::same_storage`：新增公开**身份**比较（返回 bool，不暴露存储访问，
+    符合铁律 #11）；**无效张量一律判不等**——锚点符号实例（占位张量）不参与
+    去重，否则扫描期/运行期结构分叉（见下）。
+  - 收益（`recompute_W_` 实测）：4 槽 → 2 槽，归约生成器的 RowReduceMax 全矩阵
+    pass 减半 + 重复 `sub/exp` 链因输入下标一致被 CSE 合并。fold spec、
+    `expr_graph` FusedKernelInput 不走 SpecBuilder，零影响。
+
+- **实施期暴露的闭合世界分叉（已修）**：去重后**运行期真实张量结构 ≠ 锚点符号
+  结构**，同一表达式两个 key。锚点侧登记旧结构、dry-run 侧（真实张量）登记新
+  结构；只被锚点覆盖、dry-run 未执行到的调用点 → 运行期新 key 未登记 → 硬报错。
+  实测中招：**`Softmax::backward`**（`expr_gpu_test`/`fused_gpu_test` 双挂，
+  key=`f017f5936c6a76c1`）——softmax 层不在任何模型主干（注意力走 fold），
+  此前只靠锚点。修法 = `scan_exprs` 补 **Softmax fwd+bwd 真实张量 dry-run**
+  （按既有约定：dry-run 是结构主要来源）。冒烟扫残余 miss：gpt/rapt 训练、
+  mnist mlp/transformer/cnn 训练、`--f16` 分派、text_infer 增量推理、
+  checkpoint-every、Muon（`matmul(X,X)`）**全部无闭合世界报错**。
+  结构数 91 → **99**（去重令部分结构锚点/双侧各一 + Softmax 补登记）。
+  残余风险披露：锚点独有结构中含重复视图者（见 `NN_SCAN_DUMP_SOURCES=1`）若
+  未来新增同张量调用点而无 dry-run 覆盖 → 闭合世界硬报错，届时补 dry-run 即可。
+
+- **项目 4：copy_from fresh 上传免排空**：
+  - `copy_from(dst, src, fresh_dst=false)` / `write(t, span, fresh_dst=false)`
+    新增参数（`copy_from_impl` 虚签名同步；CPU 实现忽略）。
+    `fresh_dst=true` = 调用方声明 dst 是刚创建、当前录制帧与在飞帧都不可能
+    引用的全新张量 → GPU 侧**跳过整段 `end_batch/wait_in_flight/begin_batch`
+    排空**，直接 `upload_blocking`。
+  - 正确性论证：反向依赖（当前帧先前命令写 dst、被先执行的上传覆盖）不存在——
+    全新 buffer 无任何已录命令引用（3 参 `create_tensor` = 纯分配不录命令；
+    池化复用只在写出方帧 fence 信号、`flush_pending_destroys` 归还之后才可能）；
+    正向依赖（后续帧读 dst）由 `upload_blocking` 的时间线信号量 + 各帧 submit
+    处 `collect_staging_waits` 显式保证（与 `from_matrix` 批内上传同一条既有
+    机制）。
+  - **唯一承诺方 = `detail::upload_span`**（create→write 相邻形态），两处
+    `write` 传 `true`；其余调用方（load_model / 测试直写既有张量）默认
+    `false` 保留原排空语义 → **零回归**。
+  - 逃生阀 **`NN_COPY_FROM_DRAIN=1`**（进程内静态缓存，fresh 也强制走旧排空
+    路径，A/B 对照；与 `NN_MM_NO_KSPLIT` 同口径）。
+  - 实施期另一发现：去重把 Muon 的 `matmul(X,X)` 合并成单槽后，K 切分生成器的
+    vec4 别名声明被 `vec4_ok=false` 跳过但 `b0v4` 引用仍在 → `glslc` 12 错；
+    matmul 排除去重后即消失（见上项目 5 两处独占槽）。
+
+- **同窗交错 A/B**（text_train d64/L4/H4/ff256/seq256/B64、adam、20 步、
+  GPU 40HX、3 对、弃冷启动、`NN_PROFILE=1`）：
+  1. **项目 4 单项**（同一 binary，`NN_COPY_FROM_DRAIN` 开关）：
+     | 口径 | OFF（旧排空） | ON（fresh） | Δ |
+     |---|---|---|---|
+     | step 墙钟 ms/20 步 | 1481.8 / 1462.5 / 1477.7（均 **1474.0**） | 1354.6 / 1363.2 / 1353.0（均 **1356.9**） | **−7.9%** |
+     | `copy_from` 合计 ms | ~1076 | **~231** | **−78%** |
+     | GPU busy% | 90.2 | **95.5** | +5.3pt |
+  2. **项目 5 单项**（基线二进制 vs 新二进制，新侧关 fresh 阀 = 只差去重）：
+     | 口径 | 基线 | 去重 | Δ |
+     |---|---|---|---|
+     | step 墙钟 ms/20 步 | 1497.2 / 1494.7 / 1468.0（均 **1486.6**） | 1450.4 / 1456.6 / 1465.2（均 **1457.4**） | **−2.0%** |
+     | softmax 重算桶（`86c84dd`→`b58f7bf1`，4 块合计 ms/20 步） | 88.4（均） | **67.1**（均） | **−24.0%** |
+  3. **总效果**（基线二进制 vs 两改动全开）：
+     | 口径 | 基线 | 全开 | Δ |
+     |---|---|---|---|
+     | step 墙钟 ms/20 步 | 1505.6 / 1489.2 / 1495.0（均 **1496.6**） | 1380.5 / 1366.6 / 1360.9（均 **1369.3**） | **−127.3 ms（−8.5%）** |
+     | E2E ms/step | 74.8 | **68.5** | −6.3 ms/step |
+     | `copy_from` 合计 | ~1100 ms | **~234 ms** | −79% |
+     | GPU busy% | 89.2~90.5 | **95.4~95.6** | +5.3pt |
+     对 torch fp32 50.7 ms/step 差距 **1.48× → 1.35×**。
+
+- **验收**：`cmake --build build` 干净（ninja: no work to do）；ctest
+  **29/29**（去重中途两轮挂 `expr_gpu_test`/`fused_gpu_test` 的 Softmax
+  闭合世界 miss，补 dry-run 后全绿）；**CPU 字节锚 `f360f9bdbbfbe12c` 与
+  GPU dev2 字节锚 `f1f5de1c4420d565` 双双逐位不变**——两改动均数值中性
+  （去重只消冗余同值计算、fresh 只改上传时序，求值序/求和序零变化 ⇒ **锚不
+  移动**，无需按 K-split 先例重测移锚）；`doc_inventory` exit 0
+  （virtual 52 / L2-VIOLATIONS 0 / HANDWRITTEN-RESIDUE 0）、
+  `doc_align_audit` exit 0；多架构冒烟（gpt/rapt/mlp/transformer/cnn/f16/
+  infer/checkpoint/muon）无闭合世界报错。
+- **关键文件**：`expr_dsl.hpp`（`SpecBuilder::add_input` 去重中心 + `RowGather/
+  Matmul` 独占槽）、`compute_tensor.hpp`（`same_storage`）、
+  `compute_engine.hpp`（`copy_from/write` 的 `fresh_dst` 契约 + `upload_span`
+  承诺方）、`compute_cpu_engine.hpp`/`compute_gpu_engine.hpp`（`copy_from_impl`
+  新签名 + fresh 分支 + `NN_COPY_FROM_DRAIN` 阀）、`tools/scan_exprs.cpp`
+  （Softmax dry-run 补登记）、`build/ab/ab_copy.ps1`/`ab_p5.ps1`（A/B 脚本）。

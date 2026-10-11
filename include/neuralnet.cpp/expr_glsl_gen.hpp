@@ -1189,7 +1189,7 @@ inline std::string generate_glsl_fold(const std::string& name, const ExprSpec& s
         if (expr_op_is_reduce(static_cast<ExprOp>(ins.op)))
             is_block_reduce[ins.dst] = 1;
 
-    // ── 归约输入内联（通用生成优化，2026-10-06）─────────────────────────
+    // ── 归约输入内联（通用生成优化）─────────────────────────
     // 块归约的元素源若**只被归约消费**（可沿 def 链传递），把其定义表达式
     // 逐 kb 重算、直接内联进归约循环——省掉 e{n}[BLOCK] 物化（动态下标私有
     // 数组在多数驱动落 local memory：实测 CE 的 logsumexp fold 因此慢 2.4×）

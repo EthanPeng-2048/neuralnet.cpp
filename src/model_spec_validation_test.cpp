@@ -183,7 +183,7 @@ int run_test()
         std::remove(file.c_str());
     }
 
-    // ── 5. v5 矩阵形状未信任输入防御（内存安全审计 2026-09）────────────
+    // ── 5. v5 矩阵形状未信任输入防御（内存安全审计）────────────
     // rows/cols 直接来自文件字节：溢出回绕（小缓冲+巨大元数据 → 后续按行列
     // 索引越界）与巨量分配（内存耗尽）必须在分配前被拒绝；正常矩阵不得误杀。
     std::cout << "\n── v5 未信任形状防御（应拒绝恶意、放行正常） ──\n";
@@ -244,7 +244,7 @@ int run_test()
     }
 
     // ── 6. 已移除模型类型（ZiPT，type=6）必须被明确拒绝 ────────────────
-    // 2026-10-01 AttnZip/ZiPT 整体移除；ModelType 的 6 号取值保留为
+    // AttnZip/ZiPT 已整体移除；ModelType 的 6 号取值保留为
     // Reserved_ZiPT 占位，旧 .bin（type=6）应得到**可读的**错误
     // （而非含糊的 "Unknown" 或静默误解）。见 docs/history.md「ZiPT 移除」。
     std::cout << "\n── 已移除模型类型（type=6）拒绝 ──\n";
@@ -265,7 +265,7 @@ int run_test()
     }
 
     // ── 7. 归一化挂载（NormPlace）：默认值 / 显式挂载 / 规格往返 ───────
-    // **各架构默认（2026-10-03 起）**：CNN = BatchNorm@Conv、ViT = LayerNorm@Final、
+    // **各架构默认**：CNN = BatchNorm@Conv、ViT = LayerNorm@Final、
     // MLP = LayerNorm + 结构内置挂载；**旧文件缺 norm_place 键 → None**（旧布局逐位不变）；
     // 显式挂载时 norm 必须真的在模型里，且 save→load 往返成功、错配被拦截。
     std::cout << "\n── 归一化挂载（NormPlace） ──\n";

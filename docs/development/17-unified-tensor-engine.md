@@ -1,12 +1,12 @@
-# 统一 Tensor / ComputeEngine / MemoryPool 底层架构总纲（2026-09-30）
+# 统一 Tensor / ComputeEngine / MemoryPool 底层架构总纲
 
 > **本文是新总纲**：吸收并取代 `15-computeengine-refresh.md` 未实施的 P2-P6（本文 §5 分期），
 > 并对 `13-refactor-backlog.md` §10.8 增补"访问不变量"注脚。历史归档见 `docs/history.md`。
-> 状态：**设计裁定已完成（§3 共 11 项）；M1 访问收口已实施（2026-09-30，验收与
-> 过程见 §5 M1 行 + `docs/history.md`）；M2 声明式初始化已实施（2026-09-30，
-> 见 §5 M2 行）；M3 批量读写 API 已实施（2026-09-30，见 §5 M3 行）；M4 Matrix
-> 降级收口已实施（2026-09-30，见 §3 D11 + §5 M4 行）；M5 内存池契约统一已实施
-> （2026-09-30，见 §4.5 + §5 M5 行）；M6 分三段**全部已实施（2026-09-30）**：段 A
+> 状态：**设计裁定已完成（§3 共 11 项）；M1 访问收口已实施（验收与
+> 过程见 §5 M1 行 + `docs/history.md`）；M2 声明式初始化已实施（
+> 见 §5 M2 行）；M3 批量读写 API 已实施（见 §5 M3 行）；M4 Matrix
+> 降级收口已实施（见 §3 D11 + §5 M4 行）；M5 内存池契约统一已实施
+> （见 §4.5 + §5 M5 行）；M6 分三段**全部已实施**：段 A
 >（15 D6/D7/D8 落地 + `NN_BIND_DEBUG` ctest 门禁）、段 B（43 处 `ensure_gpu`→`import`）、
 > 段 C（**删 Layer 每调用 engine 形参**——`forward/backward/zero_grad/forward_recompute`
 > 改 `init` 绑定；Loss/DSL 入口/位置编码等辅助对象**保留形参**，理由与清单见 §8）；
@@ -28,7 +28,7 @@
 3. 底层因此双轨并行：上层（Layer/Model/Loss）已用父类+继承收口，底层（Tensor/存储/内存）
    却是"静态工厂直构 + 公开存储访问 + GPU 专属内存池"的松散组合。
 
-**现状事实**（可复现，2026-09-30 核对；**M1/M2 实施前口径**——M1 落地后库外直构/直读已归零、
+**现状事实**（可复现；**M1/M2 实施前口径**——M1 落地后库外直构/直读已归零、
 M2 落地后 init RNG 已收编，下表保留为动机证据，复现命令仍可跑但库外命中应为 0、init 站点应无 `random_device`）：
 
 | 事实 | 数字 | 复现 |
@@ -36,9 +36,9 @@ M2 落地后 init RNG 已收编，下表保留为动机证据，复现命令仍�
 | `Matrix` 出现（include 213 + src 373 次命中） | 61 文件 / 586 处 | `Select-String` 扫 `include/**/*.hpp` + `src/**/*.cpp`，pattern `\bMatrix\b`（命中行；src 若含 `.hpp` 另 +3 行/1 文件） |
 | `cpu_matrix()/cpu_shared()` 调用 | include 5 文件（CPU/GPU 引擎 + 引擎基类 + DSL + 容器头）+ src 127 处（126 测试 + `text_train.cpp:756`） | `grep -rn "cpu_matrix()"` |
 | `gpu_tensor()` 调用 | **全部**在 `compute_gpu_engine.hpp` 内部 59 处（引擎自己，合规）；`compute_tensor.hpp:276/294` 仅为访问器声明 | 同上换 pattern |
-| `Tensor` 静态直构工厂（`Tensor::from_matrix/cpu/...`） | 98 处 / 8 文件（2026-09-30 复核；库外为主，15 §1 口径同源） | `Select-String` 两个 pattern（`Tensor::from_matrix`、`Tensor::cpu\b`）扫 `src/*_test.cpp`，命中行和 = 98 |
+| `Tensor` 静态直构工厂（`Tensor::from_matrix/cpu/...`） | 98 处 / 8 文件（库外为主，15 §1 口径同源） | `Select-String` 两个 pattern（`Tensor::from_matrix`、`Tensor::cpu\b`）扫 `src/*_test.cpp`，命中行和 = 98 |
 | 内存池 | 仅 Vulkan：`backend/compute_memory_pool.hpp`（`GpuBackend` 持双池 memory/transient）；`backend/compute_staging_ring.hpp:56/93/104/232` 与 `compute_vk_backend.hpp` 亦引用，均 Vulkan 后端 | `grep -rn MemoryPool include/` |
-| CPU 池 | **不存在**：`Matrix` 直接 `std::vector`；`pool_stats()` CPU 返回空串（`compute_engine.hpp:144`） | 读引擎默认实现 |（**M5 已补齐 2026-09-30**：CPU 现返回宿主直配账本 `direct{…}`，本行保留为动机证据）
+| CPU 池 | **不存在**：`Matrix` 直接 `std::vector`；`pool_stats()` CPU 返回空串（`compute_engine.hpp:144`） | 读引擎默认实现 |（**M5 已补齐**：CPU 现返回宿主直配账本 `direct{…}`，本行保留为动机证据）
 | init RNG | 混乱：固定 seed 42 = `gpt:432/603`、`rapt:1155`、`zipt:814`；`std::random_device{}`（**跨进程不确定**）= `gpt:953`、`mlp:40`、`conv:107`、`zipt:89/1044`、`rapt:1462`（**M2 已收编**：init 站点全迁 InitSpec + 显式 seed；余下 `gpt:953`/`zipt:1044`/`rapt:1462` 为 `generate()` **采样** RNG——运行期采样随机性非 init，M2 裁定不动） | `grep -rn mt19937 include/` |
 | 读 GPU 张量 | `to_matrix` 是唯一 PCIe 下载点；`ensure_gpu` 43 处隐式上传（15 §1） | `grep -n "= ensure_gpu(" compute_gpu_engine.hpp` |
 | Layer init 模式 | 层内 `Matrix` 填数 → `engine.from_matrix` 上传（如 `compute_layer_mlp.hpp:46-64`） | 读 `Layer::init` |
@@ -82,7 +82,7 @@ M2 落地后 init RNG 已收编，下表保留为动机证据，复现命令仍�
 
 ## 4. 目标架构
 
-### 4.1 访问不变量（已立为铁律——AGENTS.md §5 第 11 条，M1 落地 2026-09-30）
+### 4.1 访问不变量（已立为铁律——AGENTS.md §5 第 11 条，M1 落地）
 
 > **一切 Tensor 的创建、访问、修改必须经由 ComputeEngine。**
 > Tensor 存储是私有实现细节；静态直构工厂与公开存储访问器从公共 API 消失。
@@ -156,7 +156,7 @@ struct InitSpec {
   同形状多层不互为镜像；层手填 `Matrix` + `from_matrix` 的 init 路径一并清空。
   `generate()` 采样 RNG 与 `text_train` 数据洗牌 RNG 属运行期随机性，**裁定不迁**。）
 
-### 4.5 内存池统一（契约层，D5）——**M5 已落地 2026-09-30**
+### 4.5 内存池统一（契约层，D5）——**M5 已落地**
 
 - 统一的是**接口与语义**，不是实现：
   - `pool_stats()`：GPU 返回现有池统计（`persist{…} transient{…} pending=…`）；**无池引擎
@@ -178,7 +178,7 @@ struct InitSpec {
 - **保留**：宿主 I/O 载体 + 测试对拍基准 + 文件 codec（`model_serialization.hpp` 的
   read/write_matrix、`cli_mnist_io.hpp`、`domain_mnist.hpp` 照旧）。
 - **禁止**：出现在 L2+ 计算路径——Layer/Loss/Optimizer/Model 不得持有或交换 `Matrix`
-  （**已立为铁律 #12，M4 落地 2026-09-30**）；层自算辅助数据经 D11 的 span 宿主桥。
+  （**已立为铁律 #12，M4 落地**）；层自算辅助数据经 D11 的 span 宿主桥。
 - `compute_cpu_engine.hpp` 内核继续吃 `MatrixT<P>`（引擎**内部** = 存储实现细节，合规，
   这正是 D5"一期零内核迁移"的依据）。
 - 审计：**已落地为 `bench/doc_inventory.ps1` 第 [4] 节**（U5 裁定：扩展 doc_inventory，
@@ -205,12 +205,12 @@ CPU 字节基线 + scan 产物 hash + layer_bench（定义见 §6）。
 
 | 期 | 内容 | 关键改动面 | 专属验收 |
 |---|---|---|---|
-| **M1** ✅（2026-09-30） | **访问收口**：存储私有化、静态工厂收编、`reshape` 引擎化（`ComputeEngine::reshape`，D10）、库外同期全迁（D7） | `compute_tensor.hpp`；`detail::TensorAccess`（DSL 19 处改道）；`model_serialization.hpp` f16 分支；src 9 测试 + `text_train.cpp:756` + `tools/scan_exprs.cpp`（commits `3d76478`/`c8f308f`） | **四件套全过**：build 122/122；ctest 20/20；CPU 探针 `6f8849f14da23110` 与 pre 逐位一致；scan 双 hash 不变；layer_bench 配对 A/B（pre=HEAD~2 worktree 二进制，feedforward/swiglu/linear 各 4 轮交错，分布重叠无回退）；**编译期强制**：`grep \.cpu_matrix` 库外零命中（详见 `docs/history.md` M1 条） |
-| **M2** ✅（2026-09-30） | **声明式创建/初始化**：`InitSpec` + `Layer::init` 迁移 + RNG 收编 | `create_tensor` NVI 扩展；`compute_layer_*.hpp` 的 init（mlp/conv/gpt/zipt/rapt…）（commits `8bd6bd5` 核心、`4492098` 层迁移） | **四件套全过** + **初值跨进程确定性**：build 122/122 零告警；ctest 20/20；`gpu_stability_probe --init-hash` 六模型两进程 `INIT1` 行全同（**新锚**：mnist_mlp `a22e807ee05ec3ac`、cnn `4020958a14160bbd`、mnist_transformer `04a72d865624042a`、gpt `8efa936ac5c8c9b2`、zipt `f90bf8c8783c2f89`、rapt `b037632f75b7159c`）；mnist 三架构（`--shuffle-steps false`）双进程 loss 序列 + 模型文件逐字节一致（**新训练锚**，仅墙钟行异）；`--steps 20` hash=`6f8849f14da23110` 与 M1 锚点逐位一致（覆写隔离下后端执行零变化）；scan 双 hash 不变（`expr_specs.bin`=bdc3a442…a58360、`fused_registry.hpp`=7a10412c…）；layer_bench 配对 4 轮 + feedforward 逆序 4 轮复测均 < ±6% 无系统性回退；`NN_BIND_DEBUG=1` 冒烟零诊断（详见 `docs/history.md` M2 条） |
-| **M3** ✅（2026-09-30） | **批量读写 API**：`read/write/get_index/set_index` + I/O 分组审计口径（D9；U2 精确匹配） | `compute_engine.hpp` I/O 分组（基类非虚模板，复用 `to_matrix`/`copy_from`）+ CPU/GPU 两引擎；测试 f32 填充/恢复路径迁 `write`；探针 `--io-roundtrip`（commits `e0338d9` 核心、`4977a29` 探针、`3ddb13c` 测试） | **四件套全过**：build 全绿零告警；ctest 20/20；`gpu_stability_probe --io-roundtrip` CPU + GPU 全过（`f32_roundtrip`/`f16_roundtrip`/`batch_window` 三用例含录制窗口 write→read→end_batch→复读）；CPU 字节锚 `--steps 20` hash=`6f8849f14da23110` 不变；scan 双 hash 不变（`expr_specs.bin`=bdc3a442…a58360、`fused_registry.hpp`=7a10412c…）；**顺带修复 16 §7-2**（探针漏 `backend.initialize()` 的 GPU 崩溃，根因回填 16 §6/§7）——dev0/dev2/dev4 进程内两轮 + 跨进程 loss/hash 逐字节（详见 `docs/history.md` M3 条） |
-| **M4** ✅（2026-09-30） | **Matrix 降级收口**：L2+ 禁用规则成文（铁律 #12）+ D11 宿主桥裁定 + 分层审计脚本（U5） | L2 全量迁移：`compute_layer_{attention,base,conv,gpt,rapt,transformer,zipt}.hpp` + `compute_loss.hpp` + `compute_optimizer.hpp`（45 处 Matrix 型 I/O + 32 处 `Matrix` 类型）；`compute_engine.hpp` 尾部新增 `detail::upload_span/download_span/download_vector`（宿主桥，0 虚表项）；`bench/doc_inventory.ps1` 新增第 [4] 节 | **审计零违规**（`L2-VIOLATIONS: 0`，宿主桥 41 处仅披露）+ 四件套全过：build 122/122 零告警；ctest 20/20；**CPU 字节锚 `6f8849f14da23110` 与 GPU dev2 `8ef51b2927253c50` 均与迁移前逐位一致**（迁移是纯载体替换，数值路径零改动）；scan 双 hash 不变；layer_bench 配对 A/B（pre=HEAD worktree 二进制，feedforward/swiglu/linear 各 4 轮交错）：feedforward fwd/train **-1.2%/-1.6%**、linear +1.4%/-4.2%、swiglu fwd -6.2%（0.4ms 亚毫秒级，PRE 自身极差 0.38–0.47ms 即 ±10%）——全部在 ±6% 噪声带内无系统性回退（详见 `docs/history.md` M4 条） |
-| **M5** ✅（2026-09-30） | **内存池契约统一**：无池引擎 `pool_stats` 语义补齐 | `algebra_matrix.hpp`（`HostAllocLedger` + `MatrixT` 分配/释放记账三出口）+ `compute_engine.hpp` 基类默认 `pool_stats` | **两引擎 `pool_stats` 非空且口径文档化**（17 §4.5 + `04-memory-optimization.md` + `01-compute-engine-development.md`）：CPU `direct{ blocks/live_bytes/peak_bytes/total_blocks/total_bytes }` 实测随 model-built/optimizer-created 递增（`NN_MEM_STATS=1 text_train` 抓取），GPU `persist{…} transient{…} pending=…` 照旧；`release_idle_pool_blocks` CPU no-op 写明理由。四件套：build 122/122 零告警、ctest 20/20、CPU 锚 `6f8849f14da23110` 与 scan 双 hash 不变、`--io-roundtrip` CPU/GPU 全过、L2 审计仍 0 |
-| **M6** ✅（2026-09-30，三段全落地） | **吸收 15 P2/P3**：**A** = 15 D6/D7/D8 落地 + `NN_BIND_DEBUG` 门禁；**B** = 43 处 `ensure_gpu`→`import`（新增跨设备拉取契约，virtual 48→49）；**C** = 删 Layer 每调用 engine 形参（175 打标清单里的 Layer 部分） | 段 A：`model_serialization.hpp`、`model_container.hpp`、`compute_engine.hpp`（D6-3 改纯虚、`to_prec` 补绑定、`bind_error_` 打 stderr）、offload 占位（D8）、`expr_dsl.hpp`；段 B：`compute_engine.hpp` `import/import_impl` + `compute_gpu_engine.hpp` 48 处改名；段 C：`compute_layer_base.hpp`（`engine_` 成员 + `init` NVI + 四虚接口去形参 + `engine_ref()` 带 source_location 诊断）、10 个层头 54 处定义 + 约 200 处调用点、复合层子层 init 补齐、scan/测试补 `init(engine)`（commits `8ecf1bd`/`8110f83`/`402b213`） | **三段四件套全过**：build 零告警；ctest 20/20 **且 `NN_BIND_DEBUG=1` 同样 20/20（门禁）**；CPU 锚 `6f8849f14da23110` 与 **GPU dev2 锚 `8ef51b2927253c50`** 均逐位不变；`--init-hash` 六模型与 M2 锚全同；scan 双 hash 不变；`--io-roundtrip` CPU/GPU 全过；L2 审计 0；D6-1 round-trip SHA256 逐字节一致（f32/f16 param）。**layer_bench 配对 A/B（pre=4ce5884 worktree）**：正序 feedforward fwd/train +4.1%/+4.5%、**逆序复测 -0.7%/+0.4%**（排除运行顺序偏置，判定为 -O0 二进制重排级小差，同 M2 结论）；linear fwd ±8%（0.8ms 亚毫秒、train 反向 -6.9%，M1/M2 已记录该点方差）——**无系统性回退** |
+| **M1** ✅ | **访问收口**：存储私有化、静态工厂收编、`reshape` 引擎化（`ComputeEngine::reshape`，D10）、库外同期全迁（D7） | `compute_tensor.hpp`；`detail::TensorAccess`（DSL 19 处改道）；`model_serialization.hpp` f16 分支；src 9 测试 + `text_train.cpp:756` + `tools/scan_exprs.cpp` | **四件套全过**：build 122/122；ctest 20/20；CPU 探针 `6f8849f14da23110` 与 pre 逐位一致；scan 双 hash 不变；layer_bench 配对 A/B（pre=worktree 基线二进制，feedforward/swiglu/linear 各 4 轮交错，分布重叠无回退）；**编译期强制**：`grep \.cpu_matrix` 库外零命中（详见 `docs/history.md` M1 条） |
+| **M2** ✅ | **声明式创建/初始化**：`InitSpec` + `Layer::init` 迁移 + RNG 收编 | `create_tensor` NVI 扩展；`compute_layer_*.hpp` 的 init（mlp/conv/gpt/zipt/rapt…） | **四件套全过** + **初值跨进程确定性**：build 122/122 零告警；ctest 20/20；`gpu_stability_probe --init-hash` 六模型两进程 `INIT1` 行全同（**新锚**：mnist_mlp `a22e807ee05ec3ac`、cnn `4020958a14160bbd`、mnist_transformer `04a72d865624042a`、gpt `8efa936ac5c8c9b2`、zipt `f90bf8c8783c2f89`、rapt `b037632f75b7159c`）；mnist 三架构（`--shuffle-steps false`）双进程 loss 序列 + 模型文件逐字节一致（**新训练锚**，仅墙钟行异）；`--steps 20` hash=`6f8849f14da23110` 与 M1 锚点逐位一致（覆写隔离下后端执行零变化）；scan 双 hash 不变（`expr_specs.bin`=bdc3a442…a58360、`fused_registry.hpp`=7a10412c…）；layer_bench 配对 4 轮 + feedforward 逆序 4 轮复测均 < ±6% 无系统性回退；`NN_BIND_DEBUG=1` 冒烟零诊断（详见 `docs/history.md` M2 条） |
+| **M3** ✅ | **批量读写 API**：`read/write/get_index/set_index` + I/O 分组审计口径（D9；U2 精确匹配） | `compute_engine.hpp` I/O 分组（基类非虚模板，复用 `to_matrix`/`copy_from`）+ CPU/GPU 两引擎；测试 f32 填充/恢复路径迁 `write`；探针 `--io-roundtrip` | **四件套全过**：build 全绿零告警；ctest 20/20；`gpu_stability_probe --io-roundtrip` CPU + GPU 全过（`f32_roundtrip`/`f16_roundtrip`/`batch_window` 三用例含录制窗口 write→read→end_batch→复读）；CPU 字节锚 `--steps 20` hash=`6f8849f14da23110` 不变；scan 双 hash 不变（`expr_specs.bin`=bdc3a442…a58360、`fused_registry.hpp`=7a10412c…）；**顺带修复 16 §7-2**（探针漏 `backend.initialize()` 的 GPU 崩溃，根因回填 16 §6/§7）——dev0/dev2/dev4 进程内两轮 + 跨进程 loss/hash 逐字节（详见 `docs/history.md` M3 条） |
+| **M4** ✅ | **Matrix 降级收口**：L2+ 禁用规则成文（铁律 #12）+ D11 宿主桥裁定 + 分层审计脚本（U5） | L2 全量迁移：`compute_layer_{attention,base,conv,gpt,rapt,transformer,zipt}.hpp` + `compute_loss.hpp` + `compute_optimizer.hpp`（45 处 Matrix 型 I/O + 32 处 `Matrix` 类型）；`compute_engine.hpp` 尾部新增 `detail::upload_span/download_span/download_vector`（宿主桥，0 虚表项）；`bench/doc_inventory.ps1` 新增第 [4] 节 | **审计零违规**（`L2-VIOLATIONS: 0`，宿主桥 41 处仅披露）+ 四件套全过：build 122/122 零告警；ctest 20/20；**CPU 字节锚 `6f8849f14da23110` 与 GPU dev2 `8ef51b2927253c50` 均与迁移前逐位一致**（迁移是纯载体替换，数值路径零改动）；scan 双 hash 不变；layer_bench 配对 A/B（pre=HEAD worktree 二进制，feedforward/swiglu/linear 各 4 轮交错）：feedforward fwd/train **-1.2%/-1.6%**、linear +1.4%/-4.2%、swiglu fwd -6.2%（0.4ms 亚毫秒级，PRE 自身极差 0.38–0.47ms 即 ±10%）——全部在 ±6% 噪声带内无系统性回退（详见 `docs/history.md` M4 条） |
+| **M5** ✅ | **内存池契约统一**：无池引擎 `pool_stats` 语义补齐 | `algebra_matrix.hpp`（`HostAllocLedger` + `MatrixT` 分配/释放记账三出口）+ `compute_engine.hpp` 基类默认 `pool_stats` | **两引擎 `pool_stats` 非空且口径文档化**（17 §4.5 + `04-memory-optimization.md` + `01-compute-engine-development.md`）：CPU `direct{ blocks/live_bytes/peak_bytes/total_blocks/total_bytes }` 实测随 model-built/optimizer-created 递增（`NN_MEM_STATS=1 text_train` 抓取），GPU `persist{…} transient{…} pending=…` 照旧；`release_idle_pool_blocks` CPU no-op 写明理由。四件套：build 122/122 零告警、ctest 20/20、CPU 锚 `6f8849f14da23110` 与 scan 双 hash 不变、`--io-roundtrip` CPU/GPU 全过、L2 审计仍 0 |
+| **M6** ✅（三段全落地） | **吸收 15 P2/P3**：**A** = 15 D6/D7/D8 落地 + `NN_BIND_DEBUG` 门禁；**B** = 43 处 `ensure_gpu`→`import`（新增跨设备拉取契约，virtual 48→49）；**C** = 删 Layer 每调用 engine 形参（175 打标清单里的 Layer 部分） | 段 A：`model_serialization.hpp`、`model_container.hpp`、`compute_engine.hpp`（D6-3 改纯虚、`to_prec` 补绑定、`bind_error_` 打 stderr）、offload 占位（D8）、`expr_dsl.hpp`；段 B：`compute_engine.hpp` `import/import_impl` + `compute_gpu_engine.hpp` 48 处改名；段 C：`compute_layer_base.hpp`（`engine_` 成员 + `init` NVI + 四虚接口去形参 + `engine_ref()` 带 source_location 诊断）、10 个层头 54 处定义 + 约 200 处调用点、复合层子层 init 补齐、scan/测试补 `init(engine)` | **三段四件套全过**：build 零告警；ctest 20/20 **且 `NN_BIND_DEBUG=1` 同样 20/20（门禁）**；CPU 锚 `6f8849f14da23110` 与 **GPU dev2 锚 `8ef51b2927253c50`** 均逐位不变；`--init-hash` 六模型与 M2 锚全同；scan 双 hash 不变；`--io-roundtrip` CPU/GPU 全过；L2 审计 0；D6-1 round-trip SHA256 逐字节一致（f32/f16 param）。**layer_bench 配对 A/B（pre=worktree 基线）**：正序 feedforward fwd/train +4.1%/+4.5%、**逆序复测 -0.7%/+0.4%**（排除运行顺序偏置，判定为 -O0 二进制重排级小差，同 M2 结论）；linear fwd ±8%（0.8ms 亚毫秒、train 反向 -6.9%，M1/M2 已记录该点方差）——**无系统性回退** |
 | **M7** | （可选后置）15 P5/P6 存储多态 + `as_cpu/as_gpu` | `compute_tensor.hpp` | 第三后端出现前**不立项** |
 
 **顺序理由**：M1 先行——编译器立刻封锁一切绕路，后续各期都在不变量内做；M2 在 M3 前，
@@ -226,7 +226,7 @@ CPU 字节基线 + scan 产物 hash + layer_bench（定义见 §6）。
 - **scan 产物 hash 恒定**：`expr_specs.bin` = `bdc3a442…a58360`；`fused_registry.hpp`
   本机 pre/post 锚点见 15 §7.1。
 - **layer_bench**：同窗交错 + 配对 A/B，无系统性回退（噪声 ±6% 口径）。
-- **计划内字节变化例外**：M2（RNG 收编，**已按此立新锚 2026-09-30——见 §5 M2 行**）与将来设备端 RNG 落地——先立新锚，
+- **计划内字节变化例外**：M2（RNG 收编，**已按此立新锚——见 §5 M2 行**）与将来设备端 RNG 落地——先立新锚，
   新锚两次独立运行之间仍须逐字节；变化条目在该期验收中显式记录。
 
 ## 7. 风险与陷阱
@@ -250,24 +250,24 @@ CPU 字节基线 + scan 产物 hash + layer_bench（定义见 §6）。
    一次编译红海换一次性收口。
 6. **既有故障不混入**：f16 loss 冻结（14）、`gpu_stability_probe --gpu` 崩溃均非本范围——
    验收时按既有状态如实记录，不得当回归。（原列的 `text_train --model zipt` abort 已随
-   ZiPT 于 2026-10-01 整体移除而消失，见 `docs/history.md`。）
+   ZiPT 整体移除而消失，见 `docs/history.md`。）
 
 ## 8. 与既有文档关系 / 未决点
 
 **关系**
 
-- `15-computeengine-refresh.md`：P-1/P1 成果保留；**P2→M6 段 C（2026-09-30 落地，Layer 范围）、P3→M6 段 B（2026-09-30 落地）、P5/P6→M7**，
+- `15-computeengine-refresh.md`：P-1/P1 成果保留；**P2→M6 段 C（落地，Layer 范围）、P3→M6 段 B（落地）、P5/P6→M7**，
   P4 正交另案；15 本文头部已标注被本文吸收。
 - `13-refactor-backlog.md` §10.8：句柄指针化**维持否决**，增补注脚"访问诉求由本文
   §4.1 不变量承接"。
 - `16-computeengine-p0-inventory.md`：M0 证据沿用（175 打标 / 43 ensure_gpu / 381 宿主中转）
-  ——**43 处 ensure_gpu 已于 M6 段 B 全部改名 `import`（本表 §2 需按此读作历史口径）**；
+  ——**43 处 ensure_gpu 已全部改名 `import`（M6 段 B；16 §2 表按旧符号口径给出，供分类参考）**；
   381 宿主中转中的 L2 部分已随 M4 归零（见 §5 M4 行）。
-- `AGENTS.md`：**M1 已新增铁律第 11 条**（张量存储不可绕过引擎，2026-09-30）；
-  **M4 已新增铁律第 12 条**（L2+ 计算路径禁用 Matrix，含宿主桥与审计口径，2026-09-30）；
+- `AGENTS.md`：**M1 已新增铁律第 11 条**（张量存储不可绕过引擎）；
+  **M4 已新增铁律第 12 条**（L2+ 计算路径禁用 Matrix，含宿主桥与审计口径）；
   **§8 签名细节已按 M6 段 C 更新**；文档索引已同步。
 
-**M6 段 C 实施记录（2026-09-30，commit `402b213`）与保留形参清单**
+**M6 段 C 落地设计与保留形参清单**
 
 1. **落地设计**：`Layer` 新增 `ComputeEngine* engine_`；`init` 改 **NVI**（公共
    `init(engine)` 绑定后转 `init_impl`，17 处层 override 全部改名——编译器穷尽驱动）；
@@ -304,5 +304,5 @@ CPU 字节基线 + scan 产物 hash + layer_bench（定义见 §6）。
 | U1 | `InitSpec::seed` 是否必填 | **已裁（M2 实施）**：分布类工厂签名 seed 必填（漏传 = 编译错误），层传显式默认值 `kInitSeed = 42`；引擎内按创建序号混流防同 seed 撞流 |
 | U2 | `read/write` 元素类型形态：`span<T>` 精度精确匹配，还是按 `precision()` 重载 | **已裁（M3 实施）**：精确匹配 + 静态断言（防 f16/f32 槽错位）——错配运行期错误、元素类型非 float/f16 编译期报错；`read` 的 T 须非 const，`write` 形参 `span<T>` 去 cv 后校验（模板推导中 `const T` 无法匹配非 const span，需同时承接 const/非 const 实参） |
 | U3 | CPU 真内存池立项与否 | 先分配剖析量化，另案 |
-| U4 | 15 D6/D7/D8（宿主格式契约定序 / `Model::set_engine` 死码 / dummy 张量） | **已裁（M6 段 A 实施，2026-09-30）**：D6-1 = `load_model` v5 两支白做上传/往返**收敛为 `copy_from` 一行**（round-trip SHA256 逐字节一致）；D6-2 = **已由基类 `copy_from` 入口修复**（F16 目标走 `from_matrix`+`cast_into`，`copy_from_impl` 的 F32 槽假设仅在 F32 目标下可达），无代码改动；D6-3 = `matmul_with_bias_impl` 默认宿主兜底**改纯虚**（两引擎均已实现，删死码）；D7 = `Model::set_engine` **删除**（零调用方）；D8 = offload 占位 `Tensor::cpu(1,1)` → `create_tensor(1,1)` |
+| U4 | 15 D6/D7/D8（宿主格式契约定序 / `Model::set_engine` 死码 / dummy 张量） | **已裁（M6 段 A 实施）**：D6-1 = `load_model` v5 两支白做上传/往返**收敛为 `copy_from` 一行**（round-trip SHA256 逐字节一致）；D6-2 = **已由基类 `copy_from` 入口修复**（F16 目标走 `from_matrix`+`cast_into`，`copy_from_impl` 的 F32 槽假设仅在 F32 目标下可达），无代码改动；D6-3 = `matmul_with_bias_impl` 默认宿主兜底**改纯虚**（两引擎均已实现，删死码）；D7 = `Model::set_engine` **删除**（零调用方）；D8 = offload 占位 `Tensor::cpu(1,1)` → `create_tensor(1,1)` |
 | U5 | 分层审计脚本落点：扩展 `bench/doc_inventory.ps1` vs 新建 audit | **已裁（M4 实施）**：扩展 `doc_inventory.ps1` 第 [4] 节——它本就枚举 L2 文件集（`compute_layer*.hpp` + loss + optimizer + model_container），不另建脚本 |

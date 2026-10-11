@@ -857,7 +857,7 @@ class GptTrainController(CLIController):
         if "norm" in kwargs:
             args.extend(["--norm", self._format_arg_value(kwargs["norm"])])
         
-        # 模型架构（gpt / rapt；zipt(AttnZip) 已于 2026-10-01 移除）
+        # 模型架构（gpt / rapt；zipt(AttnZip) 已移除）
         if "model" in kwargs:
             args.extend(["--model", self._format_arg_value(kwargs["model"])])
         

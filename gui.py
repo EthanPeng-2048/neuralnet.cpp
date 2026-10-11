@@ -63,7 +63,7 @@ NORM_OPTIONS = ["auto", "layernorm", "rmsnorm", "batchnorm"]
 NORM_PLACE_OPTIONS = ["auto", "none", "conv", "head", "both", "final"]
 GPT_NORM_OPTIONS = ["layernorm", "rmsnorm"]  # GPT 仅支持 LayerNorm/RMSNorm
 PRECISION_OPTIONS = ["f32", "f16"]  # 混合精度选项
-# 模型架构：zipt(AttnZip) 已于 2026-10-01 移除（恢复前提见 docs/history.md / AGENTS §12）
+# 模型架构：zipt(AttnZip) 已移除（恢复前提见 docs/history.md / AGENTS §12）
 GPT_MODEL_OPTIONS = ["gpt", "rapt"]
 
 

@@ -1,14 +1,14 @@
-# ComputeEngine Refresh —— 详细设计与未决问题（2026-09-28）
+# ComputeEngine Refresh —— 详细设计与未决问题
 
 > 本文是 `docs/development/13-refactor-backlog.md` §10 的展开版：补全设计细节、
 > 列出模糊点并给出各方案利弊。**本文只记录方案，不实施。**
 > 立项时读本文 + 13 §10 + 对应源码现状。历史归档见 `docs/history.md`。
 > 修订：D1 已裁定（PrecisionEngine 下沉，§4.1）；D9 已裁定（分层验收，§4.9）；
 > D2 补真实代码片段并修正结论（§4.2）。
-> **实施进度：P0 完成（盘点见 16）；P-1 完成（2026-09-29，验收四件套全过）；
-> P1 完成（2026-09-29，张量出生绑定 + 跨引擎检查，验收四件套 + NN_BIND_DEBUG
+> **实施进度：P0 完成（盘点见 16）；P-1 完成（验收四件套全过）；
+> P1 完成（张量出生绑定 + 跨引擎检查，验收四件套 + NN_BIND_DEBUG
 > 诊断零漏网，过程归档 `docs/history.md`）。P2-P6 未实施。**
-> **2026-09-30：未实施的 P2-P6 已被 `17-unified-tensor-engine.md`（统一底层架构总纲）
+> **未实施的 P2-P6 已被 `17-unified-tensor-engine.md`（统一底层架构总纲）
 > 吸收改期——P2/P3 → M6、P5/P6 → M7、P4 维持正交另案；本文降级为历史引用，
 > P-1/P1 成果继续有效。P2 的宿主动词改名（to_host/from_host）已由 17 §3 D9 取消。**
 
@@ -18,7 +18,7 @@
 engine 形参**，用 `import` 收敛跨设备互传，用存储多态消掉容器头的
 `#ifdef NN_HAS_VULKAN`；**前置一步：PrecisionEngine 下沉进基类、该类整体删除**。
 
-## 1. 现状事实（可复现坐标，2026-09-28 核对）
+## 1. 现状事实（可复现坐标，实测核对）
 
 | 事实 | 数字 | 复现 |
 |---|---|---|
@@ -30,7 +30,7 @@ engine 形参**，用 `import` 收敛跨设备互传，用存储多态消掉容�
 | 宿主中转调用（from/to_matrix/copy_from，排除引擎自身） | ~596 处 | `grep` 后过滤引擎头 |
 | `Model::set_engine` | **零调用方 = 死码** | `grep -rn "set_engine(" src/` 空 |
 | `PrecisionEngine` | 独立装饰器类（>900 行），49 方法全量委托 `inner_` | `compute_precision_engine.hpp` |
-| 测试直构张量（`Tensor::from_matrix`/`Tensor::cpu`） | 98 处 / 8 文件（2026-09-30 复核；09-28 原记 90） | `grep -c src/*_test.cpp` |
+| 测试直构张量（`Tensor::from_matrix`/`Tensor::cpu`） | 98 处 / 8 文件 | `grep -c src/*_test.cpp` |
 | 三处绑定先例 | Model(observer_ptr)、Optimizer(`ComputeEngine&`)、`Layer::init` | 各头文件 |
 
 ## 2. 目标与非目标
@@ -219,7 +219,7 @@ const Tensor qc = Tensor::from_matrix(Matrix(q));  // 宿主直构，未绑定
 auto cr = rope_cpu.apply(cpu, qc, seq, backward);  // 喂 CPU
 auto gr = rope_gpu.apply(gpu, qc, seq, backward);  // 同一个 qc 再喂 GPU
 ```
-98 处测试直构张量（2026-09-30 复核）是**库外**代码。若严格执行"非绑定不得参与计算"，全要改成
+98 处测试直构张量是**库外**代码。若严格执行"非绑定不得参与计算"，全要改成
 `cpu.from_host(q)` + `gpu.from_host(q)`（或 `gpu.import(qc)`）。
 
 **片段 D：`compute_engine.hpp` :104/:117——基类默认实现**
@@ -230,7 +230,7 @@ auto gr = rope_gpu.apply(gpu, qc, seq, backward);  // 同一个 qc 再喂 GPU
     return Tensor::cpu(1, 1);    // ← 看似无引擎，其实 this 就在——可 stamp
 }
 ```
-说明：**引擎成员函数里的静态工厂调用都能 stamp（有 `this`）**，此前高估了范围。
+说明：**引擎成员函数里的静态工厂调用都能 stamp（有 `this`）**——绑定范围以此为准。
 
 **修正结论（分库内/库外）**
 - **库内不变量保持**（13 §10.3 第 1 条不作废）：所有库内产物出生即绑定——
@@ -302,10 +302,10 @@ P0 的"字节基线"因此拆成两半：**同设备 pre/post 锚点**（不变�
 | 期 | 内容 | 关键点 |
 |---|---|---|
 | P0 | 0 改动调研：43 ensure_gpu 分类 / 175 打标 / 字节+scan 基线 / 宿主中转盘点 / **GPU run-to-run 稳定性实测** | D9 实测、D6 调用方 |
-| **P-1** ✅（2026-09-29） | **PrecisionEngine 下沉删除（NVI）**：基类非虚入口 + protected `*_impl`（CPU 33 / GPU 29 处机械改名），`compute_precision_engine.hpp` 删除，7 处使用方迁移 | 验收全过：dev1 ctest 20/20（含 4 个 f16 用例）、CPU 探针与 P0 基线逐字节、scan 产物 hash 不变、layer_bench 交错 4 轮无系统性回退（A/B 过程归档 history.md） |
-| P1 | 加绑定 + 跨引擎检查（只加不改） | ✅（2026-09-29）D2（adopt 通道）、D3（指针判等）已落地，见 §7.2 交接 |
-| P2 | 删形参 + 宿主动词改名 + 测试 `from_host` 迁移 | **M6 段 C ✅（2026-09-30，Layer 范围）**：`forward/backward/zero_grad/forward_recompute` 去 engine 形参 + `init` NVI 绑定；Loss/DSL/辅助对象保留形参（理由与清单见 17 §8）。**D6/D7/D8 已于 M6 段 A 裁定落地**（17 §8 U4）；宿主动词改名已由 17 D9 取消（保留 `from_matrix/to_matrix`） |
-| P3 | 检查升硬错误 + 43 处 ensure_gpu → import + 序列化去 `model.engine()` | D4、D5 —— **M6 段 B 已完成前两项（2026-09-30）**：跨引擎检查自 P1 起默认硬错误，`ensure_gpu`→`import` 全量迁移（17 §4.3，虚表 49→50）；第三项**裁定保留 `model.engine()`**（M1 后 save/load 的引擎来源只有"调用方显式传"或"模型回查"两条，改签名会破坏 `save_model(model, path)` 公开 API，收益为零） |
+| **P-1** ✅ | **PrecisionEngine 下沉删除（NVI）**：基类非虚入口 + protected `*_impl`（CPU 33 / GPU 29 处机械改名），`compute_precision_engine.hpp` 删除，7 处使用方迁移 | 验收全过：dev1 ctest 20/20（含 4 个 f16 用例）、CPU 探针与 P0 基线逐字节、scan 产物 hash 不变、layer_bench 交错 4 轮无系统性回退（A/B 过程归档 history.md） |
+| P1 | 加绑定 + 跨引擎检查（只加不改） | ✅ D2（adopt 通道）、D3（指针判等）已落地，见 §7.2 交接 |
+| P2 | 删形参 + 宿主动词改名 + 测试 `from_host` 迁移 | **M6 段 C ✅（Layer 范围）**：`forward/backward/zero_grad/forward_recompute` 去 engine 形参 + `init` NVI 绑定；Loss/DSL/辅助对象保留形参（理由与清单见 17 §8）。**D6/D7/D8 已裁定（M6 段 A，17 §8 U4）**；宿主动词改名已由 17 D9 取消（保留 `from_matrix/to_matrix`） |
+| P3 | 检查升硬错误 + 43 处 ensure_gpu → import + 序列化去 `model.engine()` | D4、D5 —— **M6 段 B 已完成前两项**：跨引擎检查自 P1 起默认硬错误，`ensure_gpu`→`import` 全量迁移（17 §4.3，虚表 49→50）；第三项**裁定保留 `model.engine()`**（M1 后 save/load 的引擎来源只有"调用方显式传"或"模型回查"两条，改签名会破坏 `save_model(model, path)` 公开 API，收益为零） |
 | P4 | 宿主格式契约（**正交另案**） | — |
 | P5 | 存储多态 + reshape virtual | `layer_bench` 热点回归 |
 | P6 | as_cpu/as_gpu 访问器（纯加法） | — |
@@ -318,7 +318,7 @@ P0 的"字节基线"因此拆成两半：**同设备 pre/post 锚点**（不变�
 - 精度边界语义（P-1 下沉对象）：`docs/development/05-mixed-precision.md` §8/§12。
 - 历史归档：`docs/history.md`。
 
-## 7. 当前进度与交接（2026-09-29）
+## 7. 当前进度与交接
 
 ### 7.1 已完成
 
@@ -326,7 +326,7 @@ P0 的"字节基线"因此拆成两半：**同设备 pre/post 锚点**（不变�
 |---|---|---|
 | P0 | `16-computeengine-p0-inventory.md`（ensure_gpu 43 分类 / ComputeEngine& 175 打标 / 宿主中转 381 清单 / ctest 双基线）；`src/gpu_stability_probe.cpp`（app 目标，ctest 仍 20 个） | 见 16 §0 |
 | P-1 | PrecisionEngine 删除 + NVI 下沉（本文 §4.1/§5）；7 处使用方迁移；history.md 归档条目 | ① `NN_VULKAN_DEVICE=1 ctest` = 20/20；② `build/gpu_stability_probe --steps 20` 与 P0 基线逐位一致（`grep -E '^(run1)'` diff 为空）；③ `sha256sum build/generated/expr_specs.bin` = `bdc3a442a5a47a4cf6c0b3ced83c05c870c6fc4ce503681a4a97aca5d6a58360`、`fused_registry.hpp` = `d751008c3ad6074ff444ae59a75ef7c0137de988428644843f37d6581b1df714`（scan 产物锚点，后续重构不得变动） |
-| **P1** ✅（2026-09-29） | **张量出生绑定 + 跨引擎检查**（本文 §3.1/§4.2/§4.3）：`Tensor +8B engine_`（`bound()`/`engine()`，拷贝/reshape 传播）；`create_tensor`/`from_matrix`/`cast`/`create_offload_buffer`/`offload_restore` NVI 化（CPU/GPU 共 8 处 override 改名 `*_impl`，基类 virtual 仍 49）；20 个返回 Tensor 的公共入口统一 `stamp_`；`bind_check_` 按 D3 字面（双方 bound 且不同 → 硬错误；单侧未绑定豁免；`NN_BIND_DEBUG=1` 未绑定也报错）插入约 28 个入口；`adopt` friend 通道给 `nn::dsl::compute/compute_reduce`（默认实参在前置声明处）。history.md 归档条目 | 本机（Debug+Ninja+clang，Windows）：① ctest 20/20 ×2；② CPU `gpu_stability_probe --steps 20` 与 P0 基线**逐字节**；③ `expr_specs.bin` hash = `bdc3a442…a58360` 不变（=15 锚点）、`fused_registry.hpp` = `7a10412c…` 不变（含 SPIR-V 字节，仅本机 pre/post 可比，Termux 锚点 d751… 不适用）；④ layer_bench stash 往返 A/B：linear/layernorm/mha/transformer 全 ±6% 噪声内无回退；`text_train` 9 步 244.7s vs 245.0s 持平；⑤ `NN_BIND_DEBUG=1` 诊断零漏网：mnist MLP（CPU+GPU）/CNN/Transformer、text_train gpt/rapt（CPU+GPU）、zipt_test |
+| **P1** ✅ | **张量出生绑定 + 跨引擎检查**（本文 §3.1/§4.2/§4.3）：`Tensor +8B engine_`（`bound()`/`engine()`，拷贝/reshape 传播）；`create_tensor`/`from_matrix`/`cast`/`create_offload_buffer`/`offload_restore` NVI 化（CPU/GPU 共 8 处 override 改名 `*_impl`，基类 virtual 仍 49）；20 个返回 Tensor 的公共入口统一 `stamp_`；`bind_check_` 按 D3 字面（双方 bound 且不同 → 硬错误；单侧未绑定豁免；`NN_BIND_DEBUG=1` 未绑定也报错）插入约 28 个入口；`adopt` friend 通道给 `nn::dsl::compute/compute_reduce`（默认实参在前置声明处）。history.md 归档条目 | 本机（Debug+Ninja+clang，Windows）：① ctest 20/20 ×2；② CPU `gpu_stability_probe --steps 20` 与 P0 基线**逐字节**；③ `expr_specs.bin` hash = `bdc3a442…a58360` 不变（=15 锚点）、`fused_registry.hpp` = `7a10412c…` 不变（含 SPIR-V 字节，仅本机 pre/post 可比，Termux 锚点 d751… 不适用）；④ layer_bench stash 往返 A/B：linear/layernorm/mha/transformer 全 ±6% 噪声内无回退；`text_train` 9 步 244.7s vs 245.0s 持平；⑤ `NN_BIND_DEBUG=1` 诊断零漏网：mnist MLP（CPU+GPU）/CNN/Transformer、text_train gpt/rapt（CPU+GPU）、zipt_test |
 
 ### 7.2 下一步：P2（删形参 + 宿主动词改名 + 测试 `from_host` 迁移）
 
@@ -348,9 +348,9 @@ P0 的"字节基线"因此拆成两半：**同设备 pre/post 锚点**（不变�
 
 ### 7.3 搜置与未决（后续期处理，均不阻塞 P2）
 
-- **GPU 档位未定**：`gpu_stability_probe --gpu` 首个 `vkCreateBuffer` 即崩（16 §7-2，同设备同构建下既有测试全部正常 → 差异在探针路径，未定位；**Windows 本机同样复现**，2026-09-29 P1 验收时记录）。修好后回填 16 §6 GPU 行，D9 的 GPU 验收档位（逐字节 vs 容差）才有结论。
+- **GPU 档位未定**：`gpu_stability_probe --gpu` 首个 `vkCreateBuffer` 即崩（16 §7-2，同设备同构建下既有测试全部正常 → 差异在探针路径，未定位；**Windows 本机同样复现**，P1 验收时记录）。修好后回填 16 §6 GPU 行，D9 的 GPU 验收档位（逐字节 vs 容差）才有结论。
 - ~~**`text_train --model zipt` 既有故障（非 Refresh 范围，未修）**~~：**已随 ZiPT 整体移除
-  而消失**（2026-10-01，见 `docs/history.md`）——原故障 = 启动即调 `set_checkpoint_every(0)`
+  而消失**（见 `docs/history.md`）——原故障 = 启动即调 `set_checkpoint_every(0)`
   → `compute_layer_zipt.hpp` 该 override 不判 `stride==0` 直接 abort，且 abort 后进程挂死。
 - **Mali（GPU0）offload 非确定失败**（16 §5/§7-1）：设备级问题，另立 issue，不阻塞 refresh；**ctest 基线以 `NN_VULKAN_DEVICE=1`（Lavapipe 20/20）为准**（Termux 口径；Windows 本机 ctest 20/20 默认选卡即可）。
 - P0 遗留：`ComputeEngine&` REVIEW 7 处待 P2 逐条判定（16 §3）；宿主中转口径勘误 596→381，P2 改名清单按 381（16 §4）。
