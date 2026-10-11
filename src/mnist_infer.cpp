@@ -230,9 +230,13 @@ int main(int argc, char *argv[])
     InferConfig cfg = std::move(*cfg_result);
 
     // ── 从模型文件读取规格 ─────────────────────────────────
-    auto spec_result = nn::peek_model_spec(cfg.model_path);
+    // （训练文件 / 打包部署文件两种都支持：部署文件的三值层进 packed-only 只读态）
+    auto spec_result = nn::peek_any_model_spec(cfg.model_path);
     NN_EXIT(spec_result, 1, "读取模型文件失败: ");
     nn::ModelSpec spec = spec_result.value();
+    auto is_deploy_r = nn::is_deployment_file(cfg.model_path);
+    NN_EXIT(is_deploy_r, 1, "读取模型文件失败: ");
+    const bool is_deploy = *is_deploy_r;
 
     // 支持的模型类型：MLP、Transformer（ViT）、CNN
     if (spec.type == nn::ModelType::MLP)
@@ -268,9 +272,19 @@ int main(int argc, char *argv[])
     NN_EXIT(build_result, 1, "构建模型失败: ");
     auto model = std::move(*build_result);
 
-    auto load_result = nn::load_model(cfg.model_path, model);
-    NN_EXIT(load_result, 1, "加载模型失败: ");
-    std::cout << "模型已加载: " << cfg.model_path << "\n" << std::endl;
+    if (is_deploy)
+    {
+        auto load_r = nn::load_deployment(cfg.model_path, model, nullptr);
+        NN_EXIT(load_r, 1, "加载部署模型失败: ");
+        std::cout << "模型已加载（打包部署：0.25 B/权重 + τ，只读推理）: "
+                  << cfg.model_path << "\n" << std::endl;
+    }
+    else
+    {
+        auto load_result = nn::load_model(cfg.model_path, model);
+        NN_EXIT(load_result, 1, "加载模型失败: ");
+        std::cout << "模型已加载: " << cfg.model_path << "\n" << std::endl;
+    }
 
     // 推理模式：BatchNorm 使用保存的 running 统计量（batch 可能为 1，不能算 batch 统计）
     model.set_training(false);

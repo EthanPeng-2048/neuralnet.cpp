@@ -601,6 +601,14 @@ public:
         return r;
     }
 
+    // 子层结构（部署格式的完整遍历；顺序 = 上面 `parameters()` 的拼接顺序）
+    [[nodiscard]] std::vector<Layer*> sub_layers() noexcept override
+    {
+        std::vector<Layer*> r{w_q_.get(), w_k_.get(), w_v_.get(), w_o_.get()};
+        if (attn_sub_norm_) r.push_back(attn_sub_norm_.get());
+        return r;
+    }
+
     std::vector<TensorRef> param_gradients() override
     {
         auto r = collect_refs(w_q_->param_gradients(), w_k_->param_gradients(),

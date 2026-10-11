@@ -41,6 +41,7 @@
 #include "model_container.hpp"
 #include "model_spec.hpp"
 #include "model_serialization.hpp"
+#include "ternary_deploy.hpp"   // 三值部署格式（P2：0.25 B/权重 + τ，只读推理）
 #include "dataset.hpp"
 
 // L4 构建层

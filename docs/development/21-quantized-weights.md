@@ -843,6 +843,74 @@ GFLOPS 会随 n 线性掉，带宽口径才看得出离显存峰值多远），�
 形状、n=9 的门上形状、两种 profile）。本机（CPU）ctest **36/36**、102（含全部 GPU 用例）
 ctest **36/36**。
 
+### 4.15 P2 部署格式：base-3 载荷 + packed-only 只读推理文件（2026-10-11）
+
+§4.11 ② 把"推理/部署期 1.7 bpw vs f16 16 bpw ≈ 9.4×"列为"P2 之后"。本轮把这一项做完：
+**推理不再需要 f32 latent** —— 训练/检查点文件里三值层存的是 32 bit/权重的 latent，
+而推理只需要 (打包字, 逐行 τ)。
+
+**① base-3 载荷（`ternary_pack.hpp`）**：2-bit 定长编码是**运行期**容器（解码只有移位/
+掩码），部署文件用 base-3 再省 20%（2.0 → 1.6 bpw）：5 个三值/字节（`3^5 = 243 ≤ 256`、
+`3^6` 溢出 ⇒ 5 是"不浪费码位"的最大分组），字节 = `Σ digit_i·3^i`、`digit = 码 − 1`。
+解码按 `k` 截断、尾部补 digit 0；**读盘后一律转回 2-bit 容器**（内核只认它，成本一次性）。
+与 llama.cpp `TQ1_0` 的 base-3 分组同源，但块粒度 = **行**（`TQ1_0` 是 per-256 + qh 尾 +
+定点 `(s·3^n·3)>>8`）；不追求 GGUF 互读，故不引入 qh/interleave。
+
+**② 独立部署文件格式（`ternary_deploy.hpp`，新头）**：
+
+| 段 | 内容 |
+|---|---|
+| magic/版本/精度 | `"NNQT"` + u32 版本 + Scalar 精度字节 |
+| spec | 与 v6 同款 kvrec（**含 `weight_quant`**，读端据此重建 BitLinear） |
+| 参数条目 | tag 0/2 = f32/f16 矩阵（与 v5/v6 逐字节同款）；tag 4 = **打包三值**：`[encoding][rows][k][τ f32×rows][payload]`（encoding 0=2-bit / 1=base-3） |
+| extra state / tokenizer | 与 v6 同款（BatchNorm running 统计 / `.nnvocab` 镜像） |
+
+**为什么独立 magic 而不是升 `MODEL_VERSION`**：版本号已抢号（v6 = .nnvocab 镜像，
+roadmap 的 checkpoint 优化器状态还排着），且部署文件是**只读**语义 —— 与训练检查点混在
+一个版本里会让 `--resume` 误载一个不能再训的文件。独立 magic 让两类文件在**读第一行**
+时分流（`is_deployment_file` / `peek_any_model_spec` / `load_any_model`），既有模型文件
+路径零改动。
+
+**③ `BitLinear` packed-only 态**：载入打包条目 = 把该层切成"只有打包字 + τ"
+（`load_packed_weights`：释放 latent / 梯度 / f16 稠密缓冲），推理足迹
+**4.25 → 0.25 B/权重**（+ 4 B/行 τ）。τ 随文件保存并按位载入 —— 重新量化会得到
+`absmean(trit)·τ` 的比例差异，只有载入 τ 才能逐位复现有效权重 τ∘W。只读语义是**硬约束**：
+`backward()` 返回错误、`parameters()`/`param_gradients()` 立即 fail-fast（否则会"以为在
+训练，其实在推一个没有 latent 的残层"）。
+
+**④ 嵌套结构遍历（`Layer::sub_layers()`，新虚函数）**：GPT 的三值层藏在
+Block → Attention/FeedForward 内部，顶层 `Model::layer_at(i)` 拿不到 —— 部署格式要把
+打包条目落到正确的层上必须能递归。契约（写进基类注释）：子层顺序 = 本层 `parameters()`
+里子层参数的出现顺序，且自身参数在前；遍历器逐层核对覆盖数，不一致（复合层没实现
+`sub_layers`）**fail-fast**，绝不静默错位。实现落在 AttentionBase / FeedForward /
+GPTBlock / GPTModel 四处（`position_encoder` 不是 Layer → 归入 GPTModel 的"自身参数"）。
+
+**⑤ CLI**：`text_train --export-deploy <path>`（只对三值模型生效，非三值显式拒绝）；
+`text_infer` / `mnist_infer` 自动识别两种文件（`peek_any_model_spec` + 分派载入），
+无需新开关。
+
+**实测（102 / 40HX，d256·h8·L4·ff688，60 步合成语料）**：
+
+| 口径 | 训练文件（v6） | 部署文件（base-3） | 变化 |
+|---|---|---|---|
+| 文件大小 | 13 436 025 B | **1 126 970 B** | **11.9×** |
+| 推理（--temperature 0，128 token）峰值显存 | 76 MiB | 76 MiB | 持平（见下） |
+| 贪心输出 | — | **与原文件逐字节相同** | 等价性证据 |
+
+**诚实标注**：① 峰值显存**没有下降** —— 模型仍按架构规格构建（每个 BitLinear 在 init 里
+建 latent），部署条目是"构建后接管并释放"。要让峰值也降下来，需要**免 latent 构建**
+（`ModelSpec.deploy_packed` → `make_linear_layer(..., inference_only)` → BitLinear 跳过
+latent 分配），这是下一步（对小模型只是几 MB，对 2B4T 是 GB 级瞬时峰值）。
+② 小模型的部署文件仍被**词表**（8 MB 级 f32 嵌入）主导 —— 三值只压缩线性层：
+d256·L4 的线性层 ≈ 2.5 M 参数（f32 10 MB → base-3 0.5 MB）。
+③ 文件也没有校验和（与 `.bin` 同缺口）。
+
+**测试**：新 `src/ternary_deploy_test.cpp`（CPU + `--gpu` 两个变体）：
+[1] magic 分派 / [2] 两种载荷载入后前向**逐位相同** / [3] packed-only 语义（反向报错）/
+[4] 尺寸账 / [5] 训练文件不被误当部署文件 / [6] **GPT 嵌套层**（Attention/FF 内的 12 个
+BitLinear 全部进 packed-only + 前向逐位相同 + 两侧遍历签名一致）。本机与 102 各 ctest
+**38/38**。
+
 ---
 
 ## 5. 分期与验收
@@ -850,7 +918,7 @@ ctest **36/36**。
 | 阶段 | 内容 | 落点 | 验收 |
 |---|---|---|---|
 | **P1 ✅（2026-10-10 落地）** 架构统一 + 功能正确<br>（**范围 = MLP 路径**，D5 建议③） | `Precision::T1_58`（含 R4 的序处理、tag 4、`check_precision_supported` 拒绝）；`PrecisionSet` + `Layer::precision_support()` + `init` 校验 + `layer_name()`；`BitLinear`（量化 forward + STE backward）；D3 的 (a)+(b)（§4.3.2）；`scan_exprs` 补 dry-run；spec 的 `weight_quant` 字段；2 个 CLI × 4 flag 的词法 + GUI + `gui_cli_audit` | `precision.hpp` / `compute_layer_base.hpp` / 新 `compute_layer_bitlinear.hpp` / `tools/scan_exprs.cpp` / `model_spec.hpp` / `src/*` / `gui.py` | ① 不兼容组合**初始化期报错**（含 `param=T1_58` + 普通 `Linear` 的反例用例）✅；② latent 权重的 STE 梯度 = 解析式（量化器不可微 → 不做数值 gradcheck，改与宿主参考逐项对拍）✅；③ CPU/GPU 各一个端到端小训练收敛（loss 0.981→0.025，两端逐位相同）✅；④ 既有 ctest 全绿（本机唯一不稳定 = 软件 Vulkan teardown）、L2 审计 0 ✅。**逐文件清单见 §7；逐条差异见 §4.9** |
-| **P2 ✅（2026-10-11 落地，见 §4.12 + §4.14）** 真性能：2-bit 定长打包 + `matmul_q`/`matmul_q_t`（CPU/GPU 双端）+ **分块解码 GEMM（轴向修复）+ 窄 N 打包 GEMV + 训练/解码统一走打包 + `layer_bench --op matmul_q` 配对 A/B + CPU 行块解码复用稠密微内核** | **剩余 = base-3（1.59 bpw）部署编码 + 序列化打包 / 推理部署格式**（推理侧 1.7 bpw vs f16 16 bpw = 9.4× 的名义收益只能从这里拿）+ 激活 int8 / 整数点积（P3，打包在 GPU 上"打赢"稠密的前提） | 同左（`compute_tensor.hpp` 的 M7 张量 qparam 仍未做：当前容器是"f32 张量当原始字"，够用但没类型约束） | ① `layer_bench` 配对 A/B ✅（`matmul_q`/`matmul_q_t`/`matmul_q_bw` + `--f16`/`--inner`：宽 N 持平~+13%、窄 N 1.1–2.3×、权重 0.25 B/权重）；② 打包往返逐位 ✅（`ternary_gemm_test` [1][2]）；③ 数值与 f16 缓冲路径一致 ✅（同测试 [3][4][5][6][7]，含跨形状对拍）；④ 与 BitNet `pack_weight.py` 的位宽/码值对齐（**只对编码/解码**；不采用其 CUDA interleave 置换）；⑤ 端到端：训练 2.0 s 持平 / 训练显存 −8.4% / 解码 −30% / 推理显存 −13.6% / CPU 与 f16 稠密打平（§4.14） |
+| **P2 ✅（2026-10-11 落地，见 §4.12 + §4.14 + §4.15）** 真性能与部署格式：2-bit 定长打包 + `matmul_q`/`matmul_q_t`（CPU/GPU 双端）+ **分块解码 GEMM（轴向修复）+ 窄 N 打包 GEMV + 训练/解码统一走打包 + `layer_bench --op matmul_q` 配对 A/B + CPU 行块解码复用稠密微内核 + base-3（1.6 bpw）部署编码 + packed-only 只读推理文件（`ternary_deploy.hpp`，独立 magic）** | **剩余 = 免 latent 构建**（载入期瞬时峰值：模型仍按架构规格建 latent 再被部署条目接管 → 2B4T 上是 GB 级瞬时；方案 = `ModelSpec.deploy_packed` + `make_linear_layer(..., inference_only)`）+ 激活 int8 / 整数点积（P3，打包在 GPU 上"打赢"稠密的前提） | 同左（`compute_tensor.hpp` 的 M7 张量 qparam 仍未做：当前容器是"f32 张量当原始字"，够用但没类型约束） | ① `layer_bench` 配对 A/B ✅（`matmul_q`/`matmul_q_t`/`matmul_q_bw` + `--f16`/`--inner`：宽 N 持平~+13%、窄 N 1.1–2.3×、权重 0.25 B/权重）；② 打包往返逐位 ✅（`ternary_gemm_test` [1][2]）；③ 数值与 f16 缓冲路径一致 ✅（同测试 [3][4][5][6][7]，含跨形状对拍）；④ 与 BitNet `pack_weight.py` 的位宽/码值对齐（**只对编码/解码**；不采用其 CUDA interleave 置换）；⑤ 端到端：训练 2.0 s 持平 / 训练显存 −8.4% / 解码 −30% / 推理显存 −13.6% / CPU 与 f16 稠密打平（§4.14）；⑥ 部署文件 11.9× 更小、载入后前向逐字节等价、三值层 packed-only 只读（§4.15） |
 | **P1.5 ✅（2026-10-10 落地）** GPT 接入<br>（**范围 = GPT**，RAPT/ViT 见 §4.10 边界） | `make_linear_layer` + `unique_ptr<Layer>` 替换 GPT 侧全部 `Linear` 成员：`AttentionBase` 4 投影、`FeedForward` fc1/fc2、`GPTModel` LM head；`TernaryProfileSplit` 分流规则；`effective_weight_quant` 唯一判据；规格/CLI/扫描同步 | `compute_layer_base.hpp` / `compute_layer_attention.hpp` / `compute_layer_feedforward.hpp` / `compute_layer_gpt.hpp` / `domain_gpt.hpp` / `src/text_train.cpp` / `tools/scan_exprs.cpp` | ① 三值 GPT 端到端训练（2B4T 形状 3.469→0.018；MLP 之外的路径首次可用）✅；② 参数张量形状与 f32 基线逐一相同 + 梯度非零 ✅；③ 既有 f32/f16 路径零回归（`split` 恒等 + ctest 30/30）✅；④ **RAPT/ViT 明确拒绝**而非静默半三值 ✅。逐条记录见 §4.10 |
 | **P3** 计算侧收益 | 激活 int8 量化 + 整数点积（GPU 需 `GL_EXT_shader_integer_dot_product` 的设备特性探测；CPU 侧参考 §3.4/§3.5）；DSL 新增 `round`/`clamp` 算子（三处同步：`ExprOp` + CPU 求值 + GLSL emitter） | `expr_spec.hpp` / `expr_dsl.hpp` / `expr_glsl_gen.hpp` / 新 `.comp` | 与 PyTorch 参考实现对拍（`compare_with_torch/`） |
 

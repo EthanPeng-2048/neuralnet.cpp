@@ -255,6 +255,7 @@ void print_usage(const char *prog)
 
     help.section("选项");
     help.opt("--save <path>", "模型保存路径 (默认: gpt_model.bin)");
+    help.opt("--export-deploy <path>", "额外导出**打包部署文件**（只读推理：三值权重\n按 0.25 B/权重 + 逐行 τ 落盘，含 base-3 载荷；不含 latent/梯度）");
     help.opt("--resume <path>", "从已有模型恢复训练");
     help.opt("--resume-epoch <n>", "从第 n 个 epoch 继续 (0-based，需配合 --resume；默认 0)");
     help.opt("--resume-step <n>", "从本 epoch 内第 n 步继续 (0-based，需配合 --resume；默认 0)");
@@ -320,6 +321,9 @@ struct TrainConfig
 {
     std::string text_path;
     std::string save_path = "gpt_model.bin";
+    // 打包部署文件（P2，可选）：三值层以 0.25 B/权重 + τ 落盘（只读推理）。
+    // 与训练文件（f32 latent，可续训）是两种产物，互不影响。
+    std::string deploy_path;
     std::string resume_path;
     std::string optimizer_name = "adam";
     int epochs = 10;
@@ -389,6 +393,8 @@ TrainConfig parse_args(int argc, char *argv[])
         }
         else if (arg == "--save" && i + 1 < argc)
             cfg.save_path = argv[++i];
+        else if (arg == "--export-deploy" && i + 1 < argc)
+            cfg.deploy_path = argv[++i];
         else if (arg == "--resume" && i + 1 < argc)
         {
             cfg.resume_path = argv[++i];
@@ -1737,6 +1743,24 @@ int main(int argc, char *argv[])
     {
         auto save_result = nn::save_model(cfg.save_path, model, spec, tokenizer_bytes);
         NN_EXIT(save_result, 1, "Error: ");
+        // 可选：导出只读推理的**打包部署文件**（P2）。只在三值模型上有意义 ——
+        // 非三值模型没有打包权重，导出会退化成"f32 latent 换了个后缀"，故明确拒绝。
+        if (!cfg.deploy_path.empty())
+        {
+            if (spec.weight_quant != nn::WeightQuant::T1_58)
+            {
+                std::cerr << "  [deploy] --export-deploy 需要三值模型"
+                             "（--t1_58 或 --precision-param t1_58）；当前模型不是三值 → 跳过\n";
+            }
+            else
+            {
+                auto dep_r = nn::save_deployment(cfg.deploy_path, model, spec,
+                                                 /*base3=*/true, tokenizer_bytes);
+                NN_EXIT(dep_r, 1, "Error: ");
+                std::cout << "  部署文件已导出: " << cfg.deploy_path
+                          << "（打包三值 + 逐行 τ，base-3 载荷；只读推理）" << std::endl;
+            }
+        }
     }
     std::cout << "\n训练完成! 总耗时: " << std::fixed << std::setprecision(1)
               << total_sec << "s"

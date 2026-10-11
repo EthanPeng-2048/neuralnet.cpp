@@ -71,6 +71,45 @@ void test_layout()
     for (std::size_t i = 5; i < 16; ++i)
         if (at(w2, i) != 0.0f) roundtrip = false;   // 尾部 = 三值 0（不是 -2）
     CHECK(roundtrip, "解码往返（尾部位 = 码 2，不是未定义码 0）");
+
+    // ── base-3（部署编码，P2）：5 digit/字节，digit = 码 - 1 ─────────────
+    CHECK(kBase3PerByte == 5 && base3_bytes_per_row(128) == 26 &&
+              base3_bytes_per_row(5) == 1 && base3_bytes_per_row(6) == 2 &&
+              base3_bytes_per_row(17) == 4,
+          "base-3 尺寸账：ceil(K/5)（128 → 26 B = 1.625 bpw）");
+    {
+        // 覆盖三种码 + 长度非 5 倍数的尾部：base3 → 2-bit 容器必须与直接打包逐位一致
+        const std::size_t Ks[3] = {17, 40, 64};
+        bool b3_ok = true;
+        for (std::size_t ki = 0; ki < 3; ++ki)
+        {
+            const std::size_t K = Ks[ki];
+            const std::size_t wpr = nn::trit_pack::words_per_row(K);
+            std::vector<std::uint32_t> w(K), ref(wpr, 0u), back(wpr, 0u);
+            std::vector<std::uint8_t> b3(nn::trit_pack::base3_bytes_per_row(K), 0);
+            for (std::size_t i = 0; i < K; ++i)
+                w[i] = static_cast<std::uint32_t>(1 + (i * 7 + ki) % 3);   // 三值三种码轮换
+            // 参考容器：行内真码 + 尾部"码 2 = 三值 0"（与 pack_row / unpack 同约定）
+            for (std::size_t i = 0; i < wpr * nn::trit_pack::kPerWord; ++i)
+            {
+                const std::uint32_t code = (i < K) ? w[i] : 2u;
+                ref[i / nn::trit_pack::kPerWord] |=
+                    code << (2 * (i % nn::trit_pack::kPerWord));
+            }
+            // 容器 → base-3 → 容器（部署落盘/读盘的宿主侧往返，不涉浮点）
+            nn::trit_pack::pack_row_base3(ref.data(), K, b3.data());
+            nn::trit_pack::unpack_row_base3(b3.data(), K, back.data());
+            if (back != ref) b3_ok = false;
+            // 单点解码（参考读法）与真值一致
+            for (std::size_t i = 0; i < K; ++i)
+                if (nn::trit_pack::at_base3(b3.data(), i) !=
+                    nn::trit_pack::value_of(w[i])) b3_ok = false;
+            // 尾部字必须是"码 2 = 三值 0"
+            for (std::size_t i = K; i < wpr * nn::trit_pack::kPerWord; ++i)
+                if (nn::trit_pack::at(back.data(), i) != 0.0f) b3_ok = false;
+        }
+        CHECK(b3_ok, "base-3 ↔ 2-bit 容器往返逐位一致（含非 5 倍数长度与尾部）");
+    }
 }
 
 // ── 工具：宿主参考 GEMM（入参是**三值**（已量化），乘逐行 τ；transA=0/1）──

@@ -111,7 +111,9 @@ CASES.append(("text_train", GptTrainController(), dict(
 CASES.append(("text_train", GptTrainController(), dict(
     model="gpt", text_file="t.txt", f16=True, max_steps=5)))
 CASES.append(("text_train", GptTrainController(), dict(
-    model="gpt", text_file="t.txt", t1_58=True, max_steps=5)))
+    model="gpt", text_file="t.txt", t1_58=True, max_steps=5,
+    # 部署文件导出（P2）：GUI 的"导出部署文件 (可选)" 输入框非空时发出的 flag
+    export_deploy="d.nnqt")))
 
 CASES.append(("text_infer", GptInferController(), dict(
     model="g.bin", vocab="v.json", prompt="hello", max_tokens=200,

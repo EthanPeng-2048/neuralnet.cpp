@@ -160,7 +160,15 @@ ceil(M/(4·(256/subgroup_size)))` 是布局契约**）。CPU 侧 `matmul_q_impl`
 （RB=64）+ 稠密微内核**（`multiply_to`/`transpose_multiply_to`）——逐元素直算比稠密慢
 ~70×，禁止回退到那种写法。**动这块前先量**：`layer_bench --op matmul,matmul_q,matmul_q_bw
 --f16 --inner N` 的配对 A/B + 端到端（训练/解码/显存/CPU）口径见 docs 21 §4.14。
-④ **梯度惰性分配**：`Linear` / `BitLinear` 的梯度只在 `param_gradients()` /
+④ **部署格式（P2，`ternary_deploy.hpp`）**：独立 magic `"NNQT"`（**不占 `MODEL_VERSION`**）
++ 只读语义 —— 三值层以打包字 + τ 落盘（可选 base-3 1.6 bpw 载荷），载入后 `BitLinear`
+进 **packed-only**（释放 latent/梯度/稠密缓冲；backward / parameters / param_gradients
+一律 fail-fast，别让它静默当训练层用）。**`Layer::sub_layers()` 是新的结构契约**（子层
+顺序必须与 `parameters()` 拼接顺序一致、自身参数在前）—— GPT 的三值层在 Attention /
+FeedForward 内部，任何"完整遍历参数"的新功能（部署格式、未来的量化导出…）都靠它；
+复合层没实现时遍历器按覆盖数不符 **fail-fast**（不是静默错位）。`text_infer` /
+`mnist_infer` 用 `peek_any_model_spec` + `load_any_model` 自动分流两类文件。
+⑤ **梯度惰性分配**：`Linear` / `BitLinear` 的梯度只在 `param_gradients()` /
 `backward()` 首次触及时建（`grad_buffers_allocated()` 可见）；新增层若也用
 `ensure_grad_()` 模式，注意**返回 void 的函数里用 `NN_CHECK` 而不是 `NN_FAIL`**
 （后者是 `return std::unexpected` 语义，`-Wreturn-mismatch` 直接编译失败）。
