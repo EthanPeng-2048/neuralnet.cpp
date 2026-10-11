@@ -7,8 +7,11 @@
 > **状态**：实测报告 · 基准版本 v1.7.0（`f20532b`）· 环境：本机 CPU（clang++，Debug）
 > **方法**：以"库外使用者"身份**只写新文件、不改库内任何代码**，从零实现一个自定义层
 > 并把它训起来；记录全部编译失败、契约误解与"必须回读源码才能确定"的点。
-> **证据**：`examples/custom_layer_lowrank.hpp`（层，157 行）+ `examples/custom_layer_train.cpp`
-> （数值梯度检查 + MNIST 训练，277 行）+ `CMakeLists.txt` 的 `custom_layer_example` 目标。
+> **证据（快照）**：本次实测用的 `examples/custom_layer_lowrank.hpp`（层，157 行）+
+> `examples/custom_layer_train.cpp`（数值梯度检查 + MNIST 训练，277 行）+ `CMakeLists.txt`
+> 的 `custom_layer_example` 目标——**这三个产物已不在仓库中**（随 `examples/` 目录整理移除）。
+> **要写层请看 [`write-a-custom-layer.md`](write-a-custom-layer.md)**：它给出自包含、可复制、
+> 且经数值梯度检查实测通过的层模板与契约清单；本文退化为它的背景证据与摩擦点清单。
 > **关联**：`docs/todo/18-roadmap.md` X6（本文登记的问题项）；X2/P2-4 是数据侧的同类"使用者视角"缺口。
 > **写作纪律**：行号取自实测；坐标系为 `文件:行`，行号漂移后以符号名为准。
 
@@ -48,7 +51,9 @@ out = x + scale · (B · h)      B: (dim, rank)   B 初始化为 0 ⇒ 初始为
 | 测试集准确率 | 90.60%（2000 样本；模型 784→Linear(128)→LowRankAdapter(128,16)→ReLU→Linear(10)） |
 
 > Debug（`-O0`）下的 118 ms/step 不代表性能，仅证明路径正确。
-> 复现：`cmake --build build --target custom_layer_example && ./build/custom_layer_example`
+> 复现（快照期的命令，该目标与源文件已不在仓库）：
+> `cmake --build build --target custom_layer_example && ./build/custom_layer_example`；
+> 当前可复现的等价物是 [`write-a-custom-layer.md`](write-a-custom-layer.md) §3 的梯度自检片段。
 
 ---
 
@@ -224,7 +229,7 @@ CPU 上写完即可跑；切 GPU 需要额外在 CMake 加 `nn_enable_gpu_fusion
 
 | # | 动作 | 成本 | 消解的问题 |
 |---|---|---|---|
-| R1 | 新增 `docs/usage/06-write-a-custom-layer.md`：一页模板（层骨架 + gradcheck 片段 + 四条契约 + GPU checklist） | 小 | 2.1 / 2.2 / 2.3 / 2.5 / 2.7 |
+| R1 | 新增"写自定义层"指南（层骨架模板 + gradcheck 片段 + 契约清单 + GPU checklist）——**已落地**在 `docs/development/write-a-custom-layer.md`（原计划路径 `docs/usage/06-…`，改置 `development/` 以符合分册定位） | 小 | 2.1 / 2.2 / 2.3 / 2.5 / 2.7 |
 | R2 | `Layer::init` NVI 处加精度自检（`profile.param == F16` ⇒ `parameters()` 全为 F16 存储） | 小 | 2.4（同时为 C7 提供自动门禁） |
 | R3 | 提供公共梯度检查工具（或至少在 R1 的文档里给可复制的 60 行） | 小–中 | 2.6 |
 | R4 | `quickstart` 首屏加一句"`NN_CHECK` 是 unwrap 不是断言"；可选新增 `NN_UNWRAP` 别名 | 小 | 2.1 |

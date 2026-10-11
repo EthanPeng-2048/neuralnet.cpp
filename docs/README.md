@@ -10,7 +10,7 @@
 |------|------|------|--------|
 | `introduction/` | 读者 / 调用者 | 架构、性能、算法、创新设计的总览 | 当前状态 |
 | `usage/` | 调用者 | 用现成能力：CLI、C++ API、GUI、`.nnpkg`、作为库嵌入 | 当前状态 |
-| `development/` | **调用者（库使用者 / 扩展者）** | **在库之上写代码**：扩展引擎原语、写自定义层、精度语义契约、算法与原语的对应 | 当前状态 |
+| `development/` | **调用者（库使用者 / 扩展者）** | **在库之上写代码**：CMake 接入与全功能 C++ API 手册、写自定义层、扩展引擎原语、精度语义契约、算法与原语的对应 | 当前状态 |
 | `todo/` | **项目开发者** | 项目自身的工作：设计稿、路线图、盘点、规范、踩坑、故障报告、审查整改立项 | 当前状态（设计+进度） |
 | `history.md` | 项目开发者 | 全仓**唯一**历史归档：演进记录 / 已修复勘误 / 被否决方案 / 性能 A/B | 历史 |
 | `benchmarks/` | 项目开发者 / 评估者 | 对外性能对比基准报告（Vulkan vs CUDA / Torch） | 采集时的实测 |
@@ -60,11 +60,14 @@
 
 | 文档 | 何时读 |
 |------|--------|
-| [`README.md`](development/README.md) | 本分册定位与索引 |
+| [`README.md`](development/README.md) | 本分册定位与索引（含入门路径建议） |
+| [`cpp-api-manual.md`](development/cpp-api-manual.md) | **全功能 C++ API 手册**：错误宏 / 引擎 / 张量 / 精度 / DSL / 层与 Model / 工厂 / 损失 / 优化器 / 训练循环 / 模型文件 / 数据集 / 分词器 / 生成 / 剖析（每节带代码片段） |
+| [`cmake-integration.md`](development/cmake-integration.md) | 接入与构建：`add_subdirectory`/`FetchContent`、全部构建开关、GPU 语义、`nn_enable_gpu_fusion`、跨平台、故障排查 |
+| [`write-a-custom-layer.md`](development/write-a-custom-layer.md) | 写自己的层：完整示例（实测过梯度检查）+ 接入契约 + 精度槽声明 + 梯度自检 + GPU 清单 |
 | [`01-compute-engine-development.md`](development/01-compute-engine-development.md) | 扩展引擎原语：接口全解 + CPU/GPU 实现模式 + 加新原语的完整步骤 |
 | [`05-mixed-precision.md`](development/05-mixed-precision.md) | 多精度语义契约（写层/选 profile 必读）+ 实测限制 |
 | [`06-rapt-algorithm.md`](development/06-rapt-algorithm.md) | 线性注意力（RLA → RAPT → RLA-2）算法 + 扫描原语落地 |
-| [`20-custom-layer-ergonomics.md`](development/20-custom-layer-ergonomics.md) | 写自定义层：接入契约与实测摩擦点（库外使用者视角） |
+| [`20-custom-layer-ergonomics.md`](development/20-custom-layer-ergonomics.md) | 写自定义层的**实测报告**：接入契约与 7 个摩擦点（库外使用者视角） |
 
 ### todo/（给项目开发者）
 
@@ -101,6 +104,13 @@
 
 **新增**：`docs/README.md`（本文件）、`docs/todo/README.md`、`docs/development/README.md`、
 `docs/todo/00-code-review-remediation.md`（审查整改立项）。
+
+**同日第二轮（补"调用者能否不读源码用全库"的缺口）**：`docs/development/` 新增三篇
+用户向文档——`cpp-api-manual.md`（全功能 C++ API 手册）、`cmake-integration.md`
+（接入与构建全解）、`write-a-custom-layer.md`（写自定义层指南，含实测过梯度检查的示例层）。
+三篇均通过符号/文件/CLI 参数三重自审（对齐 `bench/doc_align_audit.ps1` 的 [A][D][E] 口径），
+其中示例层的代码片段经真实编译 + 数值梯度检查实跑验证。`development/20` 的
+悬空样例引用（`examples/custom_layer_*` 已不在仓库）一并订正。
 
 整理前 `docs/development/` 共有 20 篇文档，其中多数是"一件事只用几次"的内部设计/盘点稿——
 这正是本次把它们从面向用户的分册里移出的原因。
