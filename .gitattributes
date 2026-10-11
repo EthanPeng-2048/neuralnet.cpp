@@ -1,0 +1,27 @@
+# 行尾策略：仓库内一律 **LF**，跨平台检出也用 LF。
+#
+# 为什么钉死 LF（而不是 `text=auto` 的平台原生）：
+#   1) `tools/scan_exprs.cpp` 的 AOT 键要按源码内容做**稳定**哈希/比较，
+#      同一份源码在 Windows 检出成 CRLF、Linux 检出成 LF 会让两侧不一致；
+#   2) 本仓的落盘格式（KVRecord / .nnmodel / .nnvocab）与日志解析对 `\r` 敏感
+#      （见 docs/todo/08-pitfalls-and-lessons.md 的 CRLF 条）；
+#   3) 仓库历史上从未提交过 CRLF 文件（全仓检出实测均为 LF），本文件只是把
+#      既成事实写成规则，避免 Windows 侧编辑器/工具再引入 CRLF。
+* text=auto eol=lf
+
+# 明确按二进制处理（不做行尾/空白转换，diff 不因换行变化）
+*.bin binary
+*.spv binary
+*.nnpkg binary
+*.nnmodel binary
+*.nnckpt binary
+*.nndataset binary
+*.nnvocab binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.pdf binary
+
+# 生成物/归档不做语言统计
+build*/** linguist-generated=true
+docs/history/history.md linguist-documentation=true

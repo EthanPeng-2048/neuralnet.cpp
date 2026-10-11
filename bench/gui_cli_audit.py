@@ -55,8 +55,20 @@ EXES = ["mnist_train", "mnist_infer", "text_train", "text_infer",
 INTENTIONAL_GAPS = {"--interactive", "--t1_58"}
 
 
+def exe_path(exe: str) -> Path:
+    """定位 build/ 下的可执行文件（跨平台：Windows 带 .exe，Linux/macOS 不带）。
+
+    历史上这里写死 `build/<exe>.exe`，在 Linux 上直接 FileNotFoundError ——
+    本门禁因此只能在 Windows 跑。按"先 .exe 后无后缀"的顺序探测。
+    """
+    for cand in (ROOT / "build" / f"{exe}.exe", ROOT / "build" / exe):
+        if cand.exists():
+            return cand
+    return ROOT / "build" / f"{exe}.exe"
+
+
 def cli_help_flags(exe: str) -> set[str]:
-    out = subprocess.run([str(ROOT / "build" / f"{exe}.exe"), "--help"],
+    out = subprocess.run([str(exe_path(exe)), "--help"],
                          capture_output=True, text=True, errors="replace")
     flags = set(FLAG_RE.findall(out.stdout + out.stderr))
     return flags - {"--help"}
@@ -253,10 +265,10 @@ def cli_optimizer_names(exe: str) -> list[str]:
     帮助排版器按宽度折行，故先把文本里的空白全部去掉再匹配
     `优化器:<a/b/c>`；否则跨行的列表会被截断成前缀。
     """
-    exe_path = ROOT / "build" / f"{exe}.exe"
-    if not exe_path.exists():
+    path = exe_path(exe)
+    if not path.exists():
         return []
-    out = subprocess.run([str(exe_path), "--help"], capture_output=True,
+    out = subprocess.run([str(path), "--help"], capture_output=True,
                          text=True, errors="replace")
     flat = re.sub(r"\s+", "", out.stdout + out.stderr)
     m = OPTIMIZER_LIST_RE.search(flat)
@@ -284,7 +296,7 @@ def audit_optimizer_names() -> int:
     for exe in ("mnist_train", "text_train"):
         cli = cli_optimizer_names(exe)
         if not cli:
-            print(f"  [SKIP] {exe}: build/{exe}.exe 不存在或 --help 未声明名单")
+            print(f"  [SKIP] {exe}: build/{exe}(.exe) 不存在或 --help 未声明名单")
             continue
         if cli != fallback:
             print(f"  [BAD] {exe}: CLI={cli} != gui.py 兜底={fallback}"

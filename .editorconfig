@@ -1,0 +1,35 @@
+# .editorconfig —— 编辑器侧的**最小**统一（不替代 .clang-format）
+# 目的：让不同编辑器/IDE 至少在同一组"字符级"约定上一致（缩进/行尾/编码/尾随空格），
+#      把"这行到底改了没有"的噪声消掉。**C++ 的排版仍以 .clang-format 为准。**
+# 参考：https://editorconfig.org
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# 这些格式用 2 空格（与仓内现状一致）
+[*.{json,yml,yaml,md}]
+indent_size = 2
+
+# Makefile 必须用 tab 缩进
+[{Makefile,*.mk}]
+indent_style = tab
+
+# 补丁/二进制不要做空白处理
+[*.{diff,patch,bin,spv,nnpkg,nnmodel,nnckpt,nndataset,nnvocab}]
+insert_final_newline = false
+trim_trailing_whitespace = false
+
+# 生成物不参与（避免"改了但没人该改"的假 diff）
+[build/**]
+charset = unset
+end_of_line = unset
+insert_final_newline = unset
+trim_trailing_whitespace = unset
+indent_style = unset
+indent_size = unset

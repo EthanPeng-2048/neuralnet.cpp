@@ -1,17 +1,99 @@
-# research/ — 研究与排查归口
+# research/ — 可引用的实测结论（研究归口）
 
-本目录下每个子目录是**一次独立研究/排查的自包含归口**（报告 + 脚本/探针 + 原始日志 + 产物），
-互不混写：
+> **读者**：想**引用本仓实测结果**、或想知道"某个数字是怎么来的、该怎么重跑"的人——包括库外使用者。
+> 与 `docs/` 的分工：`docs/` 写"项目**现在**是什么"（见 [`../docs/README.md`](../docs/README.md)）；
+> `research/` 写"我们**实测过**什么、结论是什么、边界在哪"。全仓的历史叙事在
+> [`../docs/history/history.md`](../docs/history/history.md)，这里只放**自包含的研究报告 + 可重跑的脚本/数据**。
 
-| 子目录 | 主题 | 主报告 |
-|---|---|---|
-| [`mnist/`](mnist/README.md) | MNIST：模型尺寸 / 训练超参 → 准确率（743 KB CNN，5 轮均值 99.34%） | `mnist/README.md` |
-| [`f16_weight_decay/`](f16_weight_decay/REPORT.md) | GPT `--precision-param f16` 训练 loss 中途回弹 → AdamW 权重衰减写回的 f16 舍入缺陷（GPU `OpFConvert` 向零截断，每 optimizer step 掉 1 个 f16 网格步） | `f16_weight_decay/REPORT.md` |
-| [`ternary_ste/`](ternary_ste/REPORT.md) | 三值（1.58-bit）/ 二值权重的 STE 训练最小探针：现有 API 无改动跑通，教师模式 100% 还原（`docs/todo/21-quantized-weights.md` 的前置证据） | `ternary_ste/REPORT.md` |
-| [`ternary_scale/`](ternary_scale/REPORT.md) | 三值量化的「尺度规则 × 粒度」实测（D1 裁定依据）：三个真实模型上 absmax 把 64~98% 权重归零、信息熵仅 0.13~1.29 bit，absmean 命中 `log2 3 = 1.585 bit` | `ternary_scale/REPORT.md` |
+## 1. 怎么读 / 怎么引用
 
-约定（沿用原 `research/README.md` 的口径）：
+每条研究都按同一口径组织，引用时请**连口径一起引用**：
 
-- 入库范围 = 报告（`.md`）、脚本/探针、汇总 CSV/表、SVG 图；`.gitignore` 全域忽略
-  `*.bin`（权重）与 `*.log`（日志），这两类只留在本地，可按各报告里的命令从零重跑。
-- MNIST 研究的脚本路径常量按 `research/mnist/` 解析（`ROOT` = 仓库根，三层 `dirname`）。
+* **结论**——一句话、带数字与样本量（例：`99.34% ± 0.049, n=5`，而不是"约 99.3%"）；
+* **证据**——什么数据 / 多少轮 / 什么设备；
+* **重跑**——从零复现的入口命令（不需要读源码）；
+* **边界**——"本实测**不能**说明什么"（每条都单列一节，请勿跨边界外推）。
+
+两个通用注意事项：
+
+1. **单轮差异不要当结论**：轮间 std 常在 0.05 个百分点量级；凡未标 `n=` 的数字都是单轮。
+2. **设备/口径必须一起写**：本仓的 GPU 结论多来自 CMP 40HX（Windows / clang）；换卡
+   （尤其无 `shaderFloat16` 的 Maxwell 卡）可能落到不同的 f16 路径。
+
+## 2. 结论索引
+
+### 2.1 [`mnist/`](mnist/README.md) — MNIST：模型尺寸 / 训练超参 → 准确率
+
+* **结论（可引用）**：**743 KB 的 CNN（Conv16k5+Pool → Conv32k5+Pool → FC256 → FC128 → 10，
+  BatchNorm@conv）在 MNIST 上 5 轮独立运行均值 `99.34% ± 0.049`（99.26~99.38）**，
+  训练成本约 114 s/轮（GPU，18 epoch）。推荐超参：
+  `adamw / wd=1e-3 / lr=3e-3 / cosine + warmup 3 / batch 128 / 18 epoch`。
+* **证据**：41 轮确定性广度扫描（模型尺寸 × lr × optimizer × wd × batch × 精度）+ 聚焦筛选 +
+  5 轮确认。汇总表 [`results/REPORT_TABLES.md`](mnist/results/REPORT_TABLES.md)、逐 run 明细
+  [`results/all_runs.csv`](mnist/results/all_runs.csv)、图
+  [`results/charts/*.svg`](mnist/results/charts)、聚焦实验
+  [`results/focus_cnn/REPORT.md`](mnist/results/focus_cnn/REPORT.md)。
+* **重跑**：`cmake -B build_rel -G Ninja -DCMAKE_BUILD_TYPE=Release` → MNIST 报告 §6「复现」
+  （含 `scripts/focus_cnn.py --stage screen/confirm/report` 与广度扫描口径）。
+  权重不进仓，理由与「从零重训」的命令见 [`models/README.md`](mnist/models/README.md)。
+* **边界**：见该报告 **§5.1「本实测不能说明什么」**——结论**不能外推到更难的数据集**；
+  CLI 无 `--seed`，单轮差异（<0.1 pp）不当结论，能站住的只有「743 KB 稳定到 99.3 级」；
+  本报告只量准确率与体积，不含吞吐/显存；训练时间为单卡单次观察值。工程细节（未跑完的扫描组、
+  "训练中日志别当结果"）见该报告 §7。
+
+### 2.2 [`f16_weight_decay/`](f16_weight_decay/REPORT.md) — GPU `param=f16` 训练 loss 中途回弹的根因
+
+* **结论（可引用）**：`--precision-param f16` 下 AdamW 的权重衰减写回 `p *= (1-lr·wd)` 走融合
+  shader 的 `float16_t(...)`（SPIR-V `OpFConvert`），**在实测驱动上按"向零截断"舍入**：该差值
+  远小于 1 ULP，正确舍入应为恒等，截断则**每 optimizer step 恰好掉 1 个 f16 网格步**
+  （与 lr 无关，只要 wd>0）→ 权重以 ≈0.07%/步衰减，数万步后下溢为 0 → loss 回到 `ln(V)=9.01`。
+* **现状**：**根因已修**——`expr_glsl_gen.hpp` 的 f16 写出改为 `glsl_f16_store()`
+  （`float16_t(nn_f16_rne(v))`，整数位运算做精确 RNE）。⚠ 报告里建议的 `packHalf2x16`
+  **实测同样截断**（Vulkan-Docs #1825），最终没有采用它。
+* **证据**：现场模型张量解析 + 同数据 A/B 隔离 + 收缩量的定量性质 + 最小探针
+  （[`decay_probe.cpp`](f16_weight_decay/decay_probe.cpp)）+ SPIR-V 反汇编 + 时间线对账。
+* **重跑**：报告 §7.2「重建探针」/ §7.3「复现实验组」。
+* **边界**：舍入模式是**驱动相关**事实（"规范没钉死它"才是规范侧结论）；`wd=0` 或短跑看不到该
+  现象——所以"f16 轨迹与 f32 一致"这类旧结论只在 `wd=0/短跑`下成立。
+
+### 2.3 [`ternary_ste/`](ternary_ste/REPORT.md) — 三值 / 二值权重的 STE 训练可行性
+
+* **结论（可引用）**：**用现有公开 API 就能跑通三值 `{-1,0,+1}`（1.58 bit）与二值 `{-1,+1}`
+  的 STE 训练，零库改动**：两个探针都把教师权重模式**逐项 100% 还原**
+  （三值 1370/1370、二值 2048/2048；MSE 14.21→0 / 20.95→0）。
+* **证据**：两个自包含探针 [`poc_ternary_ste.cpp`](ternary_ste/poc_ternary_ste.cpp) /
+  [`poc_binary_ste.cpp`](ternary_ste/poc_binary_ste.cpp)（`dsl::compute` + `select` + `rparam` + `matmul`）。
+* **重跑**：报告 §1「复现」（一条 `clang++` 命令；两个程序毫秒级跑完 3000 步）。
+* **边界**：**只证明算法路径可行，不证明性能**——全部是 CPU、f32 存储、单层玩具问题。它是
+  [`../docs/todo/21-quantized-weights.md`](../docs/todo/21-quantized-weights.md) 的**前置证据**，
+  不等于三值整机能力（打包内核 / 精度枚举 / 能力声明是另一条线）。
+
+### 2.4 [`ternary_scale/`](ternary_scale/REPORT.md) — 三值量化的「尺度规则 × 粒度」（D1 裁定依据）
+
+* **结论（可引用）**：三值化 `w → q·τ` 的统计量**必须用 absmean（τ = 组内 mean|w|），不能沿用
+  llama.cpp TQ1_0 的 absmax**。三个真实模型一致：absmean 的三值分布携带 **1.567~1.585 bit/权重**
+  （≈ `log2 3` 的理论上限），absmax 只有 **0.53~1.29 bit**（GPT 上 absmax 把 77~84% 权重归零）。
+  **粒度是次要变量**：absmean 下 tensor / row / blk256 / 128 / 64 的零化率与重构误差相差 ≤2 个百分点。
+* **证据**：GPT d128(3.18M) / MNIST ViT d64(198K) / MNIST CNN(108K) 三个真实权重，逐矩阵明细见报告 §3.2。
+* **重跑**：探针 [`probe_scale.cpp`](ternary_scale/probe_scale.cpp)（只调公开 API）+ 报告 §1。
+* **边界**：只量**权重侧统计量**（零化率 / 重构误差 / 信息熵），**不含任务准确率**；结论是
+  "统计量选错会浪费 30%~92% 的存储"，不是"absmean 训练效果一定更好"。
+
+## 3. 目录约定
+
+| 入库 | 不入库（可重跑，`.gitignore` 全域忽略） |
+|------|------|
+| 报告 `*.md`、脚本/探针 `*.py`/`*.cpp`、汇总 `*.csv`、图 `*.svg` | 权重 `*.bin`、日志 `*.log`、中间产物 |
+
+每个子目录是**一次独立研究/排查的自包含归口**（报告 + 脚本 + 汇总数据），互不混写。脚本里的路径
+常量按本目录解析（`ROOT` = 仓库根，三层 `dirname`），因此从仓库根或子目录执行都应能跑通。
+
+## 4. 新增一份研究时
+
+1. 建 `research/<主题>/` 并写 `REPORT.md`（或 `README.md`），**结论先行**：开头一段给出可引用的
+   结论 + 数字 + 样本量，然后才是过程。
+2. 单列一节 **「本实测不能说明什么」**——边界比结论更常被人误用。
+3. 给出**从零复现**的入口命令（含构建口径、设备、数据集来源）；原始日志与权重不要进仓。
+4. 结论若影响代码/设计决策，在 [`../docs/todo/`](../docs/todo/) 的相应设计稿里引用本报告
+   （例：`ternary_scale` → `docs/todo/21-quantized-weights.md` 的 D1 裁定）。
+5. 在本文件 §2 加一条索引（结论 / 证据 / 重跑 / 边界 四段式）。

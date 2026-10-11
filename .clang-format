@@ -1,0 +1,58 @@
+# 本文件是「目标风格」的机器可读定义，与 docs/todo/10-development-standards.md §8
+# 「代码风格规范」一一对应。它是**增量**工具，不是整仓重排脚本：
+#
+#   ✅ 推荐：对新文件、或你正在改的代码用 `git clang-format`（只格式化改动行）
+#   ⚠ 存量文件保留手工排版（对齐的中文注释块、按语义分组的续行），对**整个**文件
+#     跑 clang-format 会产生大 diff —— 实测**即便用本文件**，全仓 150 个源文件整体
+#     格式化仍会改约 **41%** 的行（`include/` 单独看约 44%）；主因是续行折行策略与
+#     `if (c) stmt;` 单行/两行之争（两种写法仓内各约一半）。
+#     整仓重排**不在本仓的维护范围**；提交时请勿顺手格式化未改动的大段代码。
+#
+# 与仓内实际风格的取舍（实测依据，见 docs/history/history.md 的「代码风格」条）：
+#   · 大括号：函数/类型/控制语句一律另起一行（Allman）——仓内主流写法；
+#   · 顶层 namespace 内容不缩进（NamespaceIndentation: None）——仓内主流；
+#     少数历史文件（algebra_matrix.hpp / core_threadpool.hpp / cli/*.hpp）带缩进，
+#     属旧写法，改动它们时不必顺手改缩进；
+#   · 行宽 100：全仓 99% 的行 ≤100 列（仅 99 行 >120），这是事实口径而非新规定；
+#   · 注释不重排、行尾注释不对齐（ReflowComments: false + AlignTrailingComments:
+#     Leave）：仓内大量按显示宽度手工对齐的中文注释块，clang-format 按**码点**
+#     计算宽度，一旦接管就会把它们全部打乱；
+#   · include 不排序（SortIncludes: false）：包含顺序在 §8.3 有语义约定
+#     （自身头 → 标准库 → 项目头），交给人判断，避免工具改动语义。
+---
+Language: Cpp
+BasedOnStyle: LLVM
+Standard: c++26
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+BreakBeforeBraces: Allman
+AllowShortBlocksOnASingleLine: Always
+AllowShortIfStatementsOnASingleLine: AllIfsAndElse
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortLambdasOnASingleLine: All
+AlignEscapedNewlines: Left
+MaxEmptyLinesToKeep: 2
+AlignTrailingComments:
+  Kind: Leave
+  OverEmptyLines: 0
+ReflowComments: false
+SortIncludes: false
+NamespaceIndentation: None
+AccessModifierOffset: -4
+SpaceBeforeParens: Custom
+SpaceBeforeParensOptions:
+  AfterControlStatements: true
+  AfterForeachMacros: true
+  AfterFunctionDefinitionName: false
+  AfterFunctionDeclarationName: false
+  AfterIfMacros: true
+  AfterNot: false
+  AfterOverloadedOperator: false
+  AfterPlacementOperator: true
+  AfterRequiresInClause: true
+  AfterRequiresInExpression: true
+  BeforeNonEmptyParentheses: false
+PointerAlignment: Left
+ReferenceAlignment: Pointer

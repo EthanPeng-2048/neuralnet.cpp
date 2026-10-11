@@ -38,10 +38,14 @@
 | [计算引擎使用](docs/usage/03-compute-engine-usage.md) | 张量操作、矩阵运算、表达式融合 |
 | [训练包](docs/usage/04-train-package.md) | 用 `.nnpkg` 打包超参+训练集，跨设备一键复现训练 |
 | [作为库嵌入](docs/usage/05-consume-as-library.md) | 把本库嵌进自己的工程（`neuralnet::nn` 门面 / FetchContent） |
+| [实测结论索引](research/README.md) | **可引用的实验结论**（MNIST 准确率 / f16 回弹根因 / 三值 STE / 三值尺度规则）：结论 + 证据 + 重跑命令 + 边界 |
+| [参与本项目](CONTRIBUTING.md) | 给非作者的入口：构建、测试、代码规范、提 PR、CI 口径 |
 
 > **文档分册定位**：`introduction` / `usage` / `development` 写给**调用者**；
 > 项目内部的设计 / 路线图 / 盘点 / 规范 / 踩坑 / 故障 / 整改在 [`docs/todo/`](docs/todo/README.md)；
 > 历史归档在 [`docs/history/history.md`](docs/history/history.md)。**总索引见 [`docs/README.md`](docs/README.md)。**
+> `research/` 是**可引用的实测结论**归口（索引见 [`research/README.md`](research/README.md)），
+> 参与方式/门禁见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
 
 ## 项目结构
 
@@ -112,9 +116,13 @@ neuralnet.cpp/
 │   └── gpu_test.cpp             ← GPU 后端测试
 ├── datasets/                    ← 训练数据
 ├── pretrained/                  ← 预训练模型
+├── research/                    ← 可引用的实测结论（结论 + 证据 + 重跑命令 + 边界）
 ├── scripts/                     ← 数据处理/训练辅助脚本
 ├── shaders/                     ← GPU Compute Shader
-└── compare_with_torch/          ← PyTorch 对比实现
+├── compare_with_torch/          ← PyTorch 对比实现
+├── CMakePresets.json            ← 预设构建（cmake --preset dev / portable / cpu / probes ...）
+├── CONTRIBUTING.md              ← 给非作者的参与入口
+└── CODE_OF_CONDUCT.md           ← 行为准则
 ```
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/EthanPeng-2048/neuralnet.cpp)

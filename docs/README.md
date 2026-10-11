@@ -15,6 +15,7 @@
 | `history/history.md` | 项目开发者 | 全仓**唯一**历史归档：演进记录 / 已修复勘误 / 被否决方案 / 性能 A/B | 历史 |
 | `benchmarks/` | 项目开发者 / 评估者 | 对外性能对比基准报告（Vulkan vs CUDA / Torch） | 采集时的实测 |
 | `release-notes/` | 调用者 | 版本变更说明（破坏性变更 + 迁移指南 + 验收基线） | 版本发布时 |
+| [`../research/`](../research/README.md) | **想引用实测结论的人**（含库外） | 一次研究一个子目录：结论 / 证据 / **重跑命令** / 适用边界 | 实测结论（不随代码漂移） |
 
 ### 1.1 `development/` 的定位（明确约定）
 
@@ -82,6 +83,10 @@
 | 文档 | 何时读 |
 |------|--------|
 | [`history/history.md`](history/history.md) | 查"为什么当初这么改、旧数字是多少"（全仓唯一历史归档） |
+| [`../research/README.md`](../research/README.md) | 引用**实测结论**（MNIST 准确率、f16 回弹根因、三值 STE / 尺度规则）：每条带证据、重跑命令与边界 |
+| [`../CONTRIBUTING.md`](../CONTRIBUTING.md) | 参与本项目（构建 / 测试 / 规范 / PR / CI 口径）——**给非作者的入口** |
+| [`../CODE_OF_CONDUCT.md`](../CODE_OF_CONDUCT.md) | 社区行为准则 |
+| [`../CMakePresets.json`](../CMakePresets.json) | 预设构建（`cmake --preset dev` 等）——见 CONTRIBUTING §1 |
 | [`benchmarks/2026-09-25-vulkan-vs-cuda.md`](benchmarks/2026-09-25-vulkan-vs-cuda.md) | Vulkan 后端 vs CUDA（torch）基准 |
 | [`benchmarks/2026-10-06-vulkan-vs-torch.md`](benchmarks/2026-10-06-vulkan-vs-torch.md) | 第二轮复测 |
 | `release-notes/v1.5.0.md` … `v1.7.0.md` | 版本变更说明 |
@@ -114,3 +119,20 @@
 
 整理前 `docs/development/` 共有 20 篇文档，其中多数是"一件事只用几次"的内部设计/盘点稿——
 这正是本次把它们从面向用户的分册里移出的原因。
+
+## 4. 2026-10-11 对外入口补全（第二轮）
+
+第一轮解决"文档写给谁看"，第二轮补"**非作者怎么进得来**"。逐项：
+
+| 增加 | 作用 |
+|------|------|
+| [`../CONTRIBUTING.md`](../CONTRIBUTING.md) | 给非作者的统一入口：构建（preset）、测试口径、代码规范、提交信息写法、PR 自查清单、CI 实际做什么（**含"CI 不跑 ctest"这一事实**）、文档/研究怎么贡献 |
+| [`../CODE_OF_CONDUCT.md`](../CODE_OF_CONDUCT.md) | 社区行为准则（Contributor Covenant 2.1 改编）+ 本仓特有的"技术讨论对事不对人"约定 |
+| [`../CMakePresets.json`](../CMakePresets.json) | 预设构建：`release` / `dev` / `debug` / `portable` / `cpu` / `probes`（+ build/test/workflow preset）。**只描述口径，不改变 CMakeLists 默认值** |
+| [`../.clang-format`](../.clang-format) + [`../.editorconfig`](../.editorconfig) + [`../.gitattributes`](../.gitattributes) | 把 §8 的风格规则变成机器可读；全仓 LF。⚠ 定位是**目标风格 + 增量工具**（`git clang-format`），**不是整仓重排脚本**——对全仓整体格式化会改约 41% 的行，见 history 的「代码风格可执行化」条 |
+| [`../research/README.md`](../research/README.md) 重写 | 从"目录表"升级为**可引用结论索引**：每条给 结论（带数字与样本量）/ 证据 / 重跑命令 / **边界**，并写明"怎么引用、怎么新增一份研究" |
+
+同时修掉的构建问题：**ccache 与共享 PCH 互斥**（Clang 侧缺 `sloppiness=pch_defines,time_macros`
+与 `-fno-pch-timestamp`）导致 40+ 个目标的编译全部不可缓存——已修，单个 TU 从 30.2s 降到 0.11s
+（命中缓存；全量重建 13m26s → 58.8s）。归因与实测见 [`history/history.md`](history/history.md) 的「ccache × 共享 PCH」条，
+口径与复现见 [`development/cmake-integration.md`](development/cmake-integration.md) §8。
