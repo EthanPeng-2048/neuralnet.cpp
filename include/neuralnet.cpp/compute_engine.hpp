@@ -185,6 +185,9 @@ inline constexpr std::uint64_t kInitSeed = 42;
 // 披露；它**只陈述事实**，**禁止用于选路** —— 选路必须落在各引擎内部
 // （见 AGENTS 铁律「引擎能力体系」）。字段描述的是 init 期已解析完成的
 // 设备事实，读取无副作用、无计算。
+// ⚠ 打印/记录（`text()`）**只用于调试**：它是给人看的诊断快照，**不是**用来
+//   在运行时判断"该不该降级 / 该走哪条路径"的开关。按能力值分支 = 违反
+//   铁律 #13（选路走引擎内部谓词）；"打印出来就据此改行为"是错误用法。
 // ══════════════════════════════════════════════════════════════════════════
 struct EngineInfo
 {
@@ -244,7 +247,7 @@ public:
     [[nodiscard]] virtual Result<void> begin_batch() = 0;
     [[nodiscard]] virtual Result<void> end_batch() = 0;
 
-    // ── 表达式录制（IR-C 图融合；见 docs/history.md
+    // ── 表达式录制（IR-C 图融合；见 docs/history/history.md
     //    「IR-C 定位修正与恢复立项」）──────────────────────────────────────
     // begin_expr 进入录制；期间 eval_expr/eval_expr_reduce 把节点加入录制图
     // （expr_graph.hpp）并返回携带 virtual_tag 的占位 Tensor；end_expr 融合
@@ -360,7 +363,7 @@ public:
 
     // ── 张量工厂（统一接口，§6.4, §6.5）────────────────────────────────
     // P 由调用方显式指定（§8.5）：无隐式推导，无 Auto
-    // P1（docs/history.md「15 号归档」 §3.1）：公共非虚入口在尾部统一 stamp 出生绑定，
+    // P1（docs/history/history.md「15 号归档」 §3.1）：公共非虚入口在尾部统一 stamp 出生绑定，
     // 引擎只实现 create_tensor_impl / from_matrix_impl（protected）——避免
     // 每个 override 各自漏 stamp。to_matrix 输出 Matrix（宿主），不参与 stamp。
     // RV-02（工厂错误协议收敛）：错误**结构化**上抛，不再"空张量 + stderr"。
@@ -370,7 +373,7 @@ public:
     //   · 形状非法（rows*cols 溢出 size_t）→ 拒绝；
     //   · 分配失败 → 把实现侧原因（GpuTensor::create_empty 的设备/显存错误）
     //     原样带上（旧实现连 stderr 都不打印就返回空 Tensor）。
-    // 旧签名 `create_tensor` 保留为 Result 版 + NN_CHECK 解包（失败即终止），
+    // 旧签名 `create_tensor` 保留为 Result 版 + NN_UNWRAP 解包（失败即终止），
     // 库内 100+ 调用点无需一次性迁移（分期走 try_create_tensor）。
     [[nodiscard]] Result<Tensor> try_create_tensor(std::size_t rows, std::size_t cols,
                                                    Precision P = Precision::F32)
@@ -383,7 +386,7 @@ public:
     [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols,
                                        Precision P = Precision::F32)
     {
-        return NN_CHECK(try_create_tensor(rows, cols, P), "engine.create_tensor");
+        return NN_UNWRAP(try_create_tensor(rows, cols, P), "engine.create_tensor");
     }
     // ── 声明式创建/初始化（M2，17 §4.3/§4.4）────────────────────────────
     // InitSpec 指定初值；策略 = 引擎 host 生成后上传（D6：两设备同序列、
@@ -421,7 +424,7 @@ public:
     [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols, Precision P,
                                        const InitSpec& spec)
     {
-        return NN_CHECK(try_create_tensor(rows, cols, P, spec),
+        return NN_UNWRAP(try_create_tensor(rows, cols, P, spec),
                         "engine.create_tensor(spec)");
     }
     [[nodiscard]] Result<Tensor> from_matrix(const Matrix& m, Precision P = Precision::F32)
@@ -1677,7 +1680,7 @@ protected:
     [[nodiscard]] Tensor adopt(Tensor t) { return stamp_(std::move(t)); }
 
     // ══════════════════════════════════════════════════════════════════════
-    // P1 出生 stamp（docs/history.md「15 号归档」 §3.1）：未绑定的产物补上 this；
+    // P1 出生 stamp（docs/history/history.md「15 号归档」 §3.1）：未绑定的产物补上 this；
     // 已绑定 → 原样（cast 同精度返回 src 等传播场景沿用 src 绑定，不改写）。
     // 只 stamp 有效张量：失败路径返回的 Tensor() 空槽保持不绑定
     // （§3.1：库内非绑定态仅剩空槽；库外直构不受本函数管辖）。

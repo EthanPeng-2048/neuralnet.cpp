@@ -490,7 +490,7 @@ class MnistTrainController(CLIController):
             args.extend(["--cnn-fc", self._format_arg_value(kwargs["cnn_fc"])])
         
         # 振荡检测（--osc-*）**已从 CLI 移除**：mnist_train 帮助曾声明这三个选项，
-        # 但解析分支与实现均不存在（传入即"未知参数"退出）。详见 docs/history.md。
+        # 但解析分支与实现均不存在（传入即"未知参数"退出）。详见 docs/history/history.md。
         
         # 混合精度
         # 预设：t1_58（三值权重 + f16 存储）与 f16（f16 存储）各是一个 flag；

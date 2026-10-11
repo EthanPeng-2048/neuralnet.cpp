@@ -111,7 +111,7 @@ enum class ModelType : uint32_t
     ALiBi_GPT   = 4,  // 使用 ALiBi 的 GPT 模型（向后兼容）
     CNN         = 5,  // 卷积神经网络（LeNet 风格，MNIST）
     // 6 = AttnZip / ZiPT —— **已整体移除**（代码保留在 `legacy/zipt`
-    //     分支，恢复前提见 docs/history.md「ZiPT 移除」条）。此枚举值仅作占位：
+    //     分支，恢复前提见 docs/history/history.md「ZiPT 移除」条）。此枚举值仅作占位：
     //     加载旧模型文件（type=6）时据此给出明确错误，而不是含糊的 "Unknown"。
     Reserved_ZiPT = 6,
     RAPT        = 7,  // ReLU 激活线性注意力（ReLU-Linear Attention，causal LM）

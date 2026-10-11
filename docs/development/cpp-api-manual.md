@@ -83,17 +83,17 @@ nn::Result<T>  = std::expected<T, nn::Error>;   // Error 含 .message
 | `NN_TRY(decl, expr)` | 声明 + 检查 + 失败即**传播** `return std::unexpected(...)` | 函数返回 `Result<T>` |
 | `NN_TRY_MSG(decl, "语境", expr)` | 同上，失败时带上调用点语境 | 同上 |
 | `NN_TRY_CHECK(x)` | 检查**已声明**的变量（失败传播） | `Result` 已在手 |
-| `NN_CHECK(expr[, "语境"])` | **解包**：失败打印 `message + file:line` 后 `abort`；成功**返回解包后的值** | `main` / `void` / 测试 |
-| `NN_EASY_CHECK(x)` | `NN_CHECK` 的别名 | 同上 |
+| `NN_UNWRAP(expr[, "语境"])` | **解包**：失败打印 `message + file:line` 后 `abort`；成功**返回解包后的值** | `main` / `void` / 测试 |
+| `NN_UNWRAP_1(x)` | `NN_UNWRAP` 的别名 | 同上 |
 | `NN_EXIT(expr, code[, "语境"])` | 解包，失败打印后 **`exit(code)`** | CLI，保住退出码 |
 | `NN_FAIL("msg")` | **源头**：返回 `std::unexpected(Error{"msg"})` | 函数返回 `Result` |
 | `NN_ASSERT_ALWAYS(cond, msg)` | 前置条件断言，**与构建类型无关**（NDEBUG 下同样终止） | 断言后还要用该对象 |
 | `NN_FATAL(msg)` | 无条件 fail-fast（打印后终止） | 不可恢复 |
 
-> ⚠ **`NN_CHECK` 名字叫 CHECK，其实是"解包"**，不是断言：
-> `auto x = NN_CHECK(engine.from_matrix(m));` 里 **`x` 已经是 `Tensor`**，再写 `*x` 会编译错误。
+> ⚠ **`NN_UNWRAP` 名字叫 CHECK，其实是"解包"**，不是断言：
+> `auto x = NN_UNWRAP(engine.from_matrix(m));` 里 **`x` 已经是 `Tensor`**，再写 `*x` 会编译错误。
 > 返回 `Result<T>` 且 `T` 带 `[[nodiscard]]` 的入口（如 `Model::backward`）丢弃返回值要写
-> `(void)NN_CHECK(...)`。`NN_TRY_CHECK(x)` 对带副作用的表达式会**重复求值**，只能对已声明变量用。
+> `(void)NN_UNWRAP(...)`。`NN_TRY_CHECK(x)` 对带副作用的表达式会**重复求值**，只能对已声明变量用。
 
 ```cpp
 // 三种典型写法
@@ -107,15 +107,15 @@ int main()
 {
     nn::CpuEngine engine;
     nn::Tensor t = engine.create_tensor(4, 4);          // 纯分配：查 .valid()
-    NN_CHECK(t.valid(), "oom");                         // bool 条件也可直接喂给 NN_CHECK
-    nn::Matrix m = NN_CHECK(engine.to_matrix(t));       // 解包 + 失败终止
+    NN_UNWRAP(t.valid(), "oom");                         // bool 条件也可直接喂给 NN_UNWRAP
+    nn::Matrix m = NN_UNWRAP(engine.to_matrix(t));       // 解包 + 失败终止
     (void)m;
     return 0;
 }
 ```
 
 > 注意 `NN_FAIL(...)` 展开是 `return std::unexpected(...)`——只能出现在**返回 `Result`
-> 的函数**里。在 `main` / `void` / 测试里做检查用 `NN_CHECK(cond[, "msg"])` 或 `NN_FATAL("msg")`，
+> 的函数**里。在 `main` / `void` / 测试里做检查用 `NN_UNWRAP(cond[, "msg"])` 或 `NN_FATAL("msg")`，
 > 否则 `-Wreturn-mismatch` 直接编译失败。
 
 ---
@@ -176,7 +176,7 @@ nn::cli::EngineConfig cfg;
 cfg.use_gpu    = true;      // 启用 Vulkan
 cfg.gpu_device = "NVIDIA";  // 索引 "2" 或名称子串 "40HX"/"NVIDIA"；空 = 自动
 std::unique_ptr<nn::ComputeEngine> engine =
-    NN_CHECK(nn::cli::create_engine(cfg, std::cerr));
+    NN_UNWRAP(nn::cli::create_engine(cfg, std::cerr));
 ```
 
 ```cpp
@@ -200,7 +200,7 @@ shape_str / bound / engine`——**存储访问器与静态工厂已私有**（�
 ```cpp
 // 纯分配（3 参）：CPU 零填充，GPU 未初始化；失败返回**无效张量**（查 .valid()）
 nn::Tensor t = engine.create_tensor(784, 32);
-NN_CHECK(t.valid(), "create_tensor failed");
+NN_UNWRAP(t.valid(), "create_tensor failed");
 
 // 指定精度
 nn::Tensor h = engine.create_tensor(784, 32, nn::Precision::F16);
@@ -211,7 +211,7 @@ nn::Tensor w = engine.create_tensor(32, 10, nn::Precision::F32,
 nn::Tensor b = engine.create_tensor(10, 1, nn::Precision::F32, nn::InitSpec::zero());
 
 // 需要结构化错误（而非"无效张量"）时用 try_create_tensor：失败会说明原因
-nn::Tensor s = NN_CHECK(engine.try_create_tensor(10, 1, nn::Precision::F32,
+nn::Tensor s = NN_UNWRAP(engine.try_create_tensor(10, 1, nn::Precision::F32,
                                                  nn::InitSpec::normal(0.f, 0.02f, nn::kInitSeed)));
 ```
 
@@ -228,13 +228,13 @@ from_matrix / to_matrix / import / read / write / get_index / set_index
 ```cpp
 nn::Matrix m(784, 32);                                   // 宿主 I/O 载体（行主序）
 // ... 填 m ...
-nn::Tensor t   = NN_CHECK(engine.from_matrix(m));        // 上传
-nn::Matrix back = NN_CHECK(engine.to_matrix(t));         // 下载（GPU 会先等在飞命令）
+nn::Tensor t   = NN_UNWRAP(engine.from_matrix(m));        // 上传
+nn::Matrix back = NN_UNWRAP(engine.to_matrix(t));         // 下载（GPU 会先等在飞命令）
 
 // 大批量、免 Matrix 开销（性能敏感路径用它）：span 直读直写
 std::vector<nn::Scalar> host(t.size());
-NN_CHECK(engine.write(t, std::span(host)));              // 宿主 → 张量
-NN_CHECK(engine.read(t, std::span(host)));               // 张量 → 宿主
+NN_UNWRAP(engine.write(t, std::span(host)));              // 宿主 → 张量
+NN_UNWRAP(engine.read(t, std::span(host)));               // 张量 → 宿主
 ```
 
 `reshape` / `clone` / `cast` / `copy_from` 等语义见引擎手册 §4–§6。要点：
@@ -285,12 +285,12 @@ nn::profile_all_f16();           // 四槽全 F16（激进实验配方，当前�
 // ① 模型级：在 add() 之前设默认 profile（权重按精度创建）
 nn::Model model(engine);
 model.set_default_precision_profile(nn::profile_f16());
-NN_CHECK(model.add<nn::Linear>(784, 256));
+NN_UNWRAP(model.add<nn::Linear>(784, 256));
 
 // ② 工厂直接传：build_* 的 precision 形参
 nn::GptConfig cfg;
 cfg.precision = nn::profile_t1_58();
-nn::Model gpt = NN_CHECK(nn::build_gpt_model(engine, cfg));
+nn::Model gpt = NN_UNWRAP(nn::build_gpt_model(engine, cfg));
 ```
 
 **唯一要记的口诀**：*f16 只改变"数据存哪儿"，不改变"算子怎么算"*——每个算子以 f32
@@ -312,13 +312,13 @@ DSL 是库内**所有**逐元素与归约运算的写法（层不写手工循环
 
 ```cpp
 // 输出一个**新张量**（默认 P = F32）
-nn::Tensor y = NN_CHECK(nn::dsl::compute(engine, expr, rows, cols, nn::Precision::F32));
+nn::Tensor y = NN_UNWRAP(nn::dsl::compute(engine, expr, rows, cols, nn::Precision::F32));
 
 // 就地写进已有张量（只支持逐元素表达式，无归约）
-NN_CHECK(nn::dsl::compute_into(engine, expr, dst));
+NN_UNWRAP(nn::dsl::compute_into(engine, expr, dst));
 
 // 归约：输出归约向量（(rows,1) 或 (1,cols) 原生形状）
-nn::Tensor r = NN_CHECK(nn::dsl::compute_reduce(engine, expr, rows, cols, P));
+nn::Tensor r = NN_UNWRAP(nn::dsl::compute_reduce(engine, expr, rows, cols, P));
 ```
 
 叶子与算子（全部在 `namespace nn::dsl`）：
@@ -337,7 +337,7 @@ t1 + t2, t1 - t2, t1 * t2, t1 / t2, -t    // 运算符重载
 
 ```cpp
 // 例：逐列减去列最大值（数值稳定 softmax 的一步）
-nn::Tensor z = NN_CHECK(nn::dsl::compute(engine,
+nn::Tensor z = NN_UNWRAP(nn::dsl::compute(engine,
     nn::dsl::leaf(x) - nn::dsl::col_broadcast(mx), x.rows(), x.cols(), P));
 ```
 
@@ -360,20 +360,20 @@ nn::Tensor z = NN_CHECK(nn::dsl::compute(engine,
 nn::Model model(engine);                          // 必须绑定引擎（默认构造后使用时断言失败）
 
 // 添加层：add<T>(args...) 构造 + 自动 init(engine)，返回 Result<void>（不能链式调用）
-NN_CHECK(model.add<nn::Linear>(784, 256));
-NN_CHECK(model.add<nn::ReLU>());
-NN_CHECK(model.add<nn::Linear>(256, 10));
+NN_UNWRAP(model.add<nn::Linear>(784, 256));
+NN_UNWRAP(model.add<nn::ReLU>());
+NN_UNWRAP(model.add<nn::Linear>(256, 10));
 
 // 添加工厂构造的层（如按 NormType 建归一化层），可显式注入 profile
-NN_CHECK(model.add_layer(nn::make_norm_layer(256, nn::NormType::RMSNorm)));
-NN_CHECK(model.add_layer(nn::make_linear_layer(256, 10, nn::WeightQuant::T1_58), profile));
+NN_UNWRAP(model.add_layer(nn::make_norm_layer(256, nn::NormType::RMSNorm)));
+NN_UNWRAP(model.add_layer(nn::make_linear_layer(256, 10, nn::WeightQuant::T1_58), profile));
 
-nn::Tensor out = NN_CHECK(model.forward(input));       // (10, batch)
-nn::Tensor gin = NN_CHECK(model.backward(grad_out));   // 逐层反向
+nn::Tensor out = NN_UNWRAP(model.forward(input));       // (10, batch)
+nn::Tensor gin = NN_UNWRAP(model.backward(grad_out));   // 逐层反向
 
 std::vector<nn::TensorRef> ps = model.parameters();    // 供优化器
 std::vector<nn::TensorRef> gs = model.param_gradients();
-NN_CHECK(model.zero_grad());                           // 每步开头
+NN_UNWRAP(model.zero_grad());                           // 每步开头
 ```
 
 其它 `Model` 方法：
@@ -464,14 +464,14 @@ std::unique_ptr<nn::PositionEncoder> pe =
 
 ```cpp
 // MLP：784 → 512 → 256 → 128 → 64 → 10（默认层维度）
-nn::Model mlp = NN_CHECK(nn::build_mnist_mlp_model(engine));
+nn::Model mlp = NN_UNWRAP(nn::build_mnist_mlp_model(engine));
 
 // ViT：28×28 图像，patch=7（默认含末端 final norm）
-nn::Model vit = NN_CHECK(nn::build_mnist_transformer_model(engine));
+nn::Model vit = NN_UNWRAP(nn::build_mnist_transformer_model(engine));
 
 // 从 spec 还原（加载 .nnmodel 时用）
-nn::ModelSpec spec = NN_CHECK(nn::peek_any_model_spec("mnist_model.bin"));
-nn::Model m2 = NN_CHECK(nn::build_mnist_model_from_spec(engine, spec, nn::profile_f32()));
+nn::ModelSpec spec = NN_UNWRAP(nn::peek_any_model_spec("mnist_model.bin"));
+nn::Model m2 = NN_UNWRAP(nn::build_mnist_model_from_spec(engine, spec, nn::profile_f32()));
 ```
 
 签名（默认值节选）：
@@ -490,10 +490,10 @@ cfg.norm_type  = nn::NormType::RMSNorm;
 cfg.n_head_kv  = 0;                       // 0 = MHA；>0 = GQA 的 KV 头数
 cfg.tie_embeddings = false;               // true = head 复用 token embedding
 cfg.precision  = nn::profile_f16();
-nn::Model gpt = NN_CHECK(nn::build_gpt_model(engine, cfg));
+nn::Model gpt = NN_UNWRAP(nn::build_gpt_model(engine, cfg));
 
 // 位置参数版（等价的简写）
-nn::Model gpt2 = NN_CHECK(nn::build_gpt_model(engine, 10000, 128, 256, 4, 512, 4));
+nn::Model gpt2 = NN_UNWRAP(nn::build_gpt_model(engine, 10000, 128, 256, 4, 512, 4));
 ```
 
 ### 8.3 CNN 与 RAPT
@@ -501,12 +501,12 @@ nn::Model gpt2 = NN_CHECK(nn::build_gpt_model(engine, 10000, 128, 256, 4, 512, 4
 ```cpp
 // CNN（LeNet 风格可自定义）
 nn::CnnConfig c;                          // in_channels / in_size / pool / convs / fc_dims ...
-nn::Model cnn = NN_CHECK(nn::build_cnn_model(engine, c));
+nn::Model cnn = NN_UNWRAP(nn::build_cnn_model(engine, c));
 nn::ModelSpec cspec = nn::make_cnn_spec(1, 28, 2, nn::MNIST_CNN_CONVS, nn::MNIST_CNN_FC);
 
 // RAPT（线性注意力 causal LM；默认 pos_enc = RoPE，RLA 约束）
 nn::RAPTConfig r;
-nn::Model rapt = NN_CHECK(nn::build_rapt_model(engine, r));
+nn::Model rapt = NN_UNWRAP(nn::build_rapt_model(engine, r));
 ```
 
 ### 8.4 spec 构造与还原（统一表）
@@ -543,8 +543,8 @@ public:
 
 ```cpp
 nn::MSELoss loss;
-nn::Scalar l    = NN_CHECK(loss.forward(engine, pred, target));   // pred/target 同形状
-nn::Tensor grad = NN_CHECK(loss.backward());                      // = (2/N)·(pred−target)
+nn::Scalar l    = NN_UNWRAP(loss.forward(engine, pred, target));   // pred/target 同形状
+nn::Tensor grad = NN_UNWRAP(loss.backward());                      // = (2/N)·(pred−target)
 ```
 
 ### 9.2 `nn::CrossEntropyLoss`（含 softmax）
@@ -552,8 +552,8 @@ nn::Tensor grad = NN_CHECK(loss.backward());                      // = (2/N)·(p
 ```cpp
 // 稠密版：pred/target 都是 (classes, batch)
 nn::CrossEntropyLoss loss;
-nn::Scalar l    = NN_CHECK(loss.forward(engine, logits, one_hot_target));
-nn::Tensor grad = NN_CHECK(loss.backward());                      // (softmax − target)/batch
+nn::Scalar l    = NN_UNWRAP(loss.forward(engine, logits, one_hot_target));
+nn::Tensor grad = NN_UNWRAP(loss.backward());                      // (softmax − target)/batch
 ```
 
 大词表**禁止物化 one-hot**（铁律 #9）——用**稀疏标签**版：
@@ -563,11 +563,11 @@ std::vector<std::size_t> labels;   // 平坦标签，长度 = logits.cols()
 std::vector<nn::Scalar>  mask;     // 可选；空 = 全参与；>0.5 参与 loss
 
 // ① 同步版（测试 / 评估）：内部下载标量
-nn::Scalar l = NN_CHECK(loss.forward_sparse(engine, logits, labels, mask, vocab_size));
+nn::Scalar l = NN_UNWRAP(loss.forward_sparse(engine, logits, labels, mask, vocab_size));
 
 // ② 热路径版：设备端求和 + 异步标量回读（避免每 step 全流水线 drain）
 std::size_t num_valid = 0;
-nn::Tensor loss_sum = NN_CHECK(loss.forward_sparse_sum(engine, logits, labels, mask,
+nn::Tensor loss_sum = NN_UNWRAP(loss.forward_sparse_sum(engine, logits, labels, mask,
                                                        vocab_size, num_valid));
 // 训练热循环配合 engine.submit_scalar_readback(...) 异步取回
 ```
@@ -592,7 +592,7 @@ std::unique_ptr<nn::Optimizer> nn::create_optimizer(
 ```cpp
 auto opt = nn::create_optimizer("adamw", engine, model.parameters(),
                                 model.param_gradients(), 1e-3f, 0.01f, nn::profile_f16());
-NN_CHECK(opt != nullptr, "unknown optimizer");
+NN_UNWRAP(opt != nullptr, "unknown optimizer");
 ```
 
 可用名字（`nn::optimizer_names(", ")` 可打印）：`sgd` / `sgd_momentum` / `adam` /
@@ -604,10 +604,10 @@ NN_CHECK(opt != nullptr, "unknown optimizer");
 
 ```cpp
 opt->set_lr(lr);                      // 动态改学习率（调度器用）
-NN_CHECK(opt->zero_grad());           // 每步开头清零（或 model.zero_grad()；均 [[nodiscard]]）
+NN_UNWRAP(opt->zero_grad());           // 每步开头清零（或 model.zero_grad()；均 [[nodiscard]]）
 // ... forward / loss / backward ...
-NN_CHECK(opt->clip_grad_norm(1.0f));  // 全局 L2 范数裁剪（在 step 之前；<=0 或空则 no-op）
-NN_CHECK(opt->step());
+NN_UNWRAP(opt->clip_grad_norm(1.0f));  // 全局 L2 范数裁剪（在 step 之前；<=0 或空则 no-op）
+NN_UNWRAP(opt->step());
 ```
 
 其它：`opt->precision_profile()`、`opt->set_precision_profile(p)`。
@@ -624,7 +624,7 @@ int main()
     nn::CpuEngine engine;
 
     // 1. 模型 + 优化器 + 损失
-    nn::Model model = NN_CHECK(nn::build_mnist_mlp_model(engine));
+    nn::Model model = NN_UNWRAP(nn::build_mnist_mlp_model(engine));
     auto opt = nn::create_optimizer("adam", engine, model.parameters(),
                                     model.param_gradients(), 1e-3f);
     nn::CrossEntropyLoss loss;
@@ -638,13 +638,13 @@ int main()
         // ... 用 engine.write(...) / engine.from_matrix(...) 填 x, y ...
 
         // 3. 一步
-        NN_CHECK(opt->zero_grad());
-        nn::Tensor out  = NN_CHECK(model.forward(x));
-        nn::Scalar l    = NN_CHECK(loss.forward(engine, out, y));
-        nn::Tensor grad = NN_CHECK(loss.backward());
-        (void)NN_CHECK(model.backward(grad));
-        NN_CHECK(opt->clip_grad_norm(1.0f));
-        NN_CHECK(opt->step());
+        NN_UNWRAP(opt->zero_grad());
+        nn::Tensor out  = NN_UNWRAP(model.forward(x));
+        nn::Scalar l    = NN_UNWRAP(loss.forward(engine, out, y));
+        nn::Tensor grad = NN_UNWRAP(loss.backward());
+        (void)NN_UNWRAP(model.backward(grad));
+        NN_UNWRAP(opt->clip_grad_norm(1.0f));
+        NN_UNWRAP(opt->step());
 
         if (step % 50 == 0)
             std::printf("[step %d] loss=%.4f\n", step, static_cast<double>(l));
@@ -668,20 +668,20 @@ int main()
 
 ```cpp
 // 保存：role 默认 Model（.nnmodel）；断点传 ModelRole::Checkpoint
-NN_CHECK(nn::save_model("gpt.nnmodel", model, spec));
-NN_CHECK(nn::save_model("gpt_ckpt.nnckpt", model, spec, /*tokenizer_data=*/{},
+NN_UNWRAP(nn::save_model("gpt.nnmodel", model, spec));
+NN_UNWRAP(nn::save_model("gpt_ckpt.nnckpt", model, spec, /*tokenizer_data=*/{},
                         nn::ModelRole::Checkpoint));
 
 // 只读头：拿架构 spec / 文件角色（不读参数，用于先建对模型）
-nn::ModelSpec s1    = NN_CHECK(nn::peek_any_model_spec("gpt.nnmodel"));
-nn::ModelSpec s2    = NN_CHECK(nn::peek_model_spec("gpt.nnmodel"));
-nn::ModelRole role  = NN_CHECK(nn::peek_model_role("gpt_ckpt.nnckpt"));
+nn::ModelSpec s1    = NN_UNWRAP(nn::peek_any_model_spec("gpt.nnmodel"));
+nn::ModelSpec s2    = NN_UNWRAP(nn::peek_model_spec("gpt.nnmodel"));
+nn::ModelRole role  = NN_UNWRAP(nn::peek_model_role("gpt_ckpt.nnckpt"));
 std::cout << nn::model_role_name(role) << "\n";
 
 // 加载：先用 spec 建同构模型，再灌参数（tokenizer_out 取内嵌词表）
-nn::Model model = NN_CHECK(nn::build_gpt_model_from_spec(engine, s1));
+nn::Model model = NN_UNWRAP(nn::build_gpt_model_from_spec(engine, s1));
 std::string embedded_tok;
-NN_CHECK(nn::load_any_model("gpt.nnmodel", model, &embedded_tok));
+NN_UNWRAP(nn::load_any_model("gpt.nnmodel", model, &embedded_tok));
 ```
 
 相关类型：
@@ -719,11 +719,11 @@ NN_CHECK(nn::load_any_model("gpt.nnmodel", model, &embedded_tok));
 ```cpp
 #include <neuralnet.cpp/dataset.hpp>
 
-nn::Dataset ds = NN_CHECK(nn::Dataset::open("llm.nndataset"));   // 也接受 .nnvocab（词表独立场景）
+nn::Dataset ds = NN_UNWRAP(nn::Dataset::open("llm.nndataset"));   // 也接受 .nnvocab（词表独立场景）
 const nn::DatasetInfo& info = ds.info();    // kind / num_docs / test_docs / loss_scope / source_*
 
-nn::TextCorpus train = NN_CHECK(ds.load_text(false));   // train 子集
-nn::TextCorpus test  = NN_CHECK(ds.load_text(true));    // test 子集（无则报错）
+nn::TextCorpus train = NN_UNWRAP(ds.load_text(false));   // train 子集
+nn::TextCorpus test  = NN_UNWRAP(ds.load_text(true));    // test 子集（无则报错）
 
 const nn::KeyValueRecord& vocab = ds.vocab_kvrec();      // 词表（模型 v6 内嵌词表来源）
 ```
@@ -764,8 +764,8 @@ cfg.vocab_size    = 10000;
 cfg.min_freq      = 2;
 cfg.show_progress = true;
 cfg.threads       = 0;               // 预分词并行度：0=自动 / 1=顺序 / >1=指定
-NN_CHECK(tok.train(text, cfg));
-NN_CHECK(tok.save("my_bpe.nnvocab"));        // .nnvocab（kvrec v2 自描述格式）
+NN_UNWRAP(tok.train(text, cfg));
+NN_UNWRAP(tok.save("my_bpe.nnvocab"));        // .nnvocab（kvrec v2 自描述格式）
 
 // 编码 / 解码
 std::vector<std::size_t> ids = tok.encode("Hello world");
@@ -777,9 +777,9 @@ std::string s = tok.decode(ids);
 **从文件 / 模型内嵌词表加载**：
 
 ```cpp
-std::unique_ptr<nn::Tokenizer> t1 = NN_CHECK(nn::load_tokenizer_from_file("my_bpe.nnvocab"));
-std::unique_ptr<nn::Tokenizer> t2 = NN_CHECK(nn::load_tokenizer_from_model_blob(embedded_tok, model_version));
-std::unique_ptr<nn::Tokenizer> t3 = NN_CHECK(nn::load_tokenizer_from_bytes(bytes));  // 按内容嗅探
+std::unique_ptr<nn::Tokenizer> t1 = NN_UNWRAP(nn::load_tokenizer_from_file("my_bpe.nnvocab"));
+std::unique_ptr<nn::Tokenizer> t2 = NN_UNWRAP(nn::load_tokenizer_from_model_blob(embedded_tok, model_version));
+std::unique_ptr<nn::Tokenizer> t3 = NN_UNWRAP(nn::load_tokenizer_from_bytes(bytes));  // 按内容嗅探
 std::unique_ptr<nn::Tokenizer> t4 = nn::make_tokenizer("bpe");   // 只造对象、未加载（"bpe"/"char_bpe"）
 ```
 
@@ -793,15 +793,15 @@ std::unique_ptr<nn::Tokenizer> t4 = nn::make_tokenizer("bpe");   // 只造对象
 `nn::GPTModel` 与 `nn::RAPTModel` 各自暴露 `generate`（带 KV cache，按 `seq_len` 滑动窗口）：
 
 ```cpp
-nn::Model model = NN_CHECK(nn::build_gpt_model_from_spec(engine, spec));
-NN_CHECK(nn::load_any_model("gpt.nnmodel", model));
+nn::Model model = NN_UNWRAP(nn::build_gpt_model_from_spec(engine, spec));
+NN_UNWRAP(nn::load_any_model("gpt.nnmodel", model));
 
 // Model 只有一个顶层层；取出来 downcast
 auto* gpt = dynamic_cast<nn::GPTModel*>(&model.layer_at(0));
 if (gpt != nullptr)
 {
     std::vector<std::size_t> prompt = tok->encode("Once upon a time");
-    std::vector<std::size_t> out = NN_CHECK(gpt->generate(
+    std::vector<std::size_t> out = NN_UNWRAP(gpt->generate(
         engine, prompt, /*max_new_tokens=*/200, /*temperature=*/0.8,
         /*eos_token_id=*/tok->eos_id(), /*min_new_tokens=*/0));
     std::cout << tok->decode(out) << "\n";
@@ -853,7 +853,7 @@ nn::prof::dump(stdout);       // 进程结束前打表（stage / op / GPU / per-
 
 见 §1.3 的表；两条易混点再强调：
 
-- `NN_CHECK` = **解包 + 失败终止**（不是断言）；`NN_TRY` = **声明 + 传播**。
+- `NN_UNWRAP` = **解包 + 失败终止**（不是断言）；`NN_TRY` = **声明 + 传播**。
 - 断言后仍会**使用被校验对象**（解引用 / 索引 / 除零）的点位，一律用 `NN_ASSERT_ALWAYS` /
   `NN_FATAL`（`core_assert.hpp`，与构建类型无关）；`NN_ASSERT` 是"可选诊断"（NDEBUG 展开为空），
   只留给失败也不影响后续正确性的检查。

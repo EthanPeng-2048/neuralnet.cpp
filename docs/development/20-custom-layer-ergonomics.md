@@ -2,7 +2,7 @@
 
 > **读者**：调用者（库使用者 / 扩展者）——本分册定位见 [`README.md`](README.md)。
 > 本文是"库外使用者"视角的实测报告：写自定义层时**必须**满足的接入契约与已知摩擦点。
-> 报告登记的问题项由 [`../todo/18-roadmap.md`](../todo/18-roadmap.md) 承接；历史在 [`../history.md`](../history.md)。
+> 报告登记的问题项由 [`../todo/18-roadmap.md`](../todo/18-roadmap.md) 承接；历史在 [`../history.md`](../history/history.md)。
 
 > **状态**：实测报告 · 基准版本 v1.7.0（`f20532b`）· 环境：本机 CPU（clang++，Debug）
 > **方法**：以"库外使用者"身份**只写新文件、不改库内任何代码**，从零实现一个自定义层
@@ -64,7 +64,7 @@ out = x + scale · (B · h)      B: (dim, rank)   B 初始化为 0 ⇒ 初始为
 
 | # | 问题 | 严重度 | 坐标 |
 |---|---|---|---|
-| 2.1 | `NN_CHECK` 名为 CHECK 实为 unwrap，丢弃返回值还需 `(void)` | 高 | `core_errors.hpp:201` |
+| 2.1 | `NN_UNWRAP` 名为 CHECK 实为 unwrap，丢弃返回值还需 `(void)` | 高 | `core_errors.hpp:201` |
 | 2.2 | "造张量"存在两套失败协议（`Tensor`+`valid()` vs `Result<Tensor>`） | 高 | `compute_engine.hpp:298/308/335` |
 | 2.3 | 无"写自定义层"文档，四条契约全靠读源码 | 高 | `docs/usage/` 无对应篇章 |
 | 2.4 | 精度 profile 无自检（C7 类静默失效的成因） | 高 | `compute_layer_base.hpp:212` |
@@ -72,13 +72,13 @@ out = x + scale · (B · h)      B: (dim, rank)   B 初始化为 0 ⇒ 初始为
 | 2.6 | 库外没有梯度检查工具 | 中 | `src/test_common.hpp:18` |
 | 2.7 | GPU 路径是"额外一步 + 运行期才失败" | 中 | `CMakeLists.txt`（`nn_enable_gpu_fusion`） |
 
-### 2.1 `NN_CHECK` 名为 CHECK 实为 unwrap（严重度：高）
+### 2.1 `NN_UNWRAP` 名为 CHECK 实为 unwrap（严重度：高）
 
-**现象**：`NN_CHECK(x)` 的定义是"失败即 abort，成功返回**解包后的 `T`**"
+**现象**：`NN_UNWRAP(x)` 的定义是"失败即 abort，成功返回**解包后的 `T`**"
 （`core_errors.hpp:201`），不是断言宏。使用者按"断言"直觉写：
 
 ```cpp
-auto x = NN_CHECK(engine.from_matrix(m));   // x 已经是 Tensor，不是 Result<Tensor>
+auto x = NN_UNWRAP(engine.from_matrix(m));   // x 已经是 Tensor，不是 Result<Tensor>
 x.rows();                                   // OK
 *x;                                         // 编译错误（我实际写的形态）
 ```
@@ -88,17 +88,17 @@ x.rows();                                   // OK
 `member reference type 'nn::Tensor' is not a pointer`），而不是指向使用者写错的那一行。
 
 **放大器一**：[`docs/usage/01-quickstart-model.md`](../usage/01-quickstart-model.md) 的
-`NN_CHECK(model.add<nn::Linear>(784, 256));` 用的是 `Result<void>`，
+`NN_UNWRAP(model.add<nn::Linear>(784, 256));` 用的是 `Result<void>`，
 两种语义（纯检查 / 检查+解值）在这里**看起来完全一样**，掩盖了差异。
 
 **放大器二**：`Result<Tensor>` 的 `T` 带 `[[nodiscard]]`，丢弃返回值必须写
-`(void)NN_CHECK(model.backward(grad));`——一个"断言宏"要求使用者 `(void)` 它。
+`(void)NN_UNWRAP(model.backward(grad));`——一个"断言宏"要求使用者 `(void)` 它。
 
 **实测原始错误**（第 1 轮 12 条之一，第 2 轮复现）：
 
 ```
 error: ignoring return value of function declared with 'nodiscard' attribute
-    NN_CHECK(model.backward(grad));
+    NN_UNWRAP(model.backward(grad));
 ```
 
 ### 2.2 "造张量"存在两套失败协议（严重度：高）— **已解决（2026-10-11，RV-02）**
@@ -113,7 +113,7 @@ error: ignoring return value of function declared with 'nodiscard' attribute
 | `Layer::forward(input)` | `Result<Tensor>` | `Result` |
 
 写自定义层时四个入口都要用（建权重、建梯度缓冲、上传输入、调 forward），
-必须逐个记住哪个是哪个。把 `create_tensor` 包进 `NN_CHECK` 得到的错误是
+必须逐个记住哪个是哪个。把 `create_tensor` 包进 `NN_UNWRAP` 得到的错误是
 `no known conversion from 'Tensor' to 'Result<void>'`——报错不告诉你正确写法是查 `valid()`。
 
 **注**：`.valid()` 协议本身有明确理由（`:305` 注释：失败返回空 Tensor），
@@ -122,7 +122,7 @@ error: ignoring return value of function declared with 'nodiscard' attribute
 **已解决（2026-10-11，代码审查整改 RV-02）**：工厂统一到 `Result<Tensor>` ——
 新增 `engine.try_create_tensor(rows, cols, P[, InitSpec])`，把"非存储精度 / 形状溢出 /
 分配失败（GPU 侧连原因都带上）"三类错误结构化上抛；**两套旧签名原样保留**为
-`NN_CHECK(try_create_tensor(...))` 转发（失败即终止，不再是"返回空 Tensor 让调用方查
+`NN_UNWRAP(try_create_tensor(...))` 转发（失败即终止，不再是"返回空 Tensor 让调用方查
 `valid()`"）。因此本文 §4 的顾虑（"改动波及全部 Layer 与测试"）不成立：迁移是**增量**的，
 旧写法继续编译；想要结构化错误就用 `try_create_tensor`。判据与验收见
 `docs/todo/00-code-review-remediation.md` 的 RV-02 卡（负例在 `tensor_precision_test [5]`）。
@@ -232,7 +232,7 @@ CPU 上写完即可跑；切 GPU 需要额外在 CMake 加 `nn_enable_gpu_fusion
 | R1 | 新增"写自定义层"指南（层骨架模板 + gradcheck 片段 + 契约清单 + GPU checklist）——**已落地**在 `docs/development/write-a-custom-layer.md`（原计划路径 `docs/usage/06-…`，改置 `development/` 以符合分册定位） | 小 | 2.1 / 2.2 / 2.3 / 2.5 / 2.7 |
 | R2 | `Layer::init` NVI 处加精度自检（`profile.param == F16` ⇒ `parameters()` 全为 F16 存储） | 小 | 2.4（同时为 C7 提供自动门禁） |
 | R3 | 提供公共梯度检查工具（或至少在 R1 的文档里给可复制的 60 行） | 小–中 | 2.6 |
-| R4 | `quickstart` 首屏加一句"`NN_CHECK` 是 unwrap 不是断言"；可选新增 `NN_UNWRAP` 别名 | 小 | 2.1 |
+| R4 | `quickstart` 首屏加一句"`NN_UNWRAP` 是 unwrap 不是断言"；可选新增 `NN_UNWRAP` 别名 | 小 | 2.1 |
 | R5 | 把 `examples/custom_layer_*` 挂进 README 与使用文档索引（现有 `examples/` 只有融合样例） | 小 | 2.3 / 2.7 |
 
 **不建议做的**：
@@ -241,7 +241,7 @@ CPU 上写完即可跑；切 GPU 需要额外在 CMake 加 `nn_enable_gpu_fusion
   P1（工厂错误协议）冲突，后者已按"**增量**落地"处置——`try_create_tensor` 是新增的
   `Result` 入口，旧 `create_tensor` 两个重载保留为转发，故**不波及**既有 Layer / 测试
   （本条的"波及全部 Layer"前提不成立）。两套协议不再并存于"同一入口"，而是"旧入口 =
-  新入口 + `NN_CHECK`"。详见 RV-02。
+  新入口 + `NN_UNWRAP`"。详见 RV-02。
 - 不建议为 2.5 放宽 IR（多 matmul 融合）——这是 AOT 闭合世界的结构性约束，
   触发条件应按 18 号路线图 §6 的 IR-C/S6 判据走，不因"写法不够顺手"立项。
 
@@ -249,4 +249,4 @@ CPU 上写完即可跑；切 GPU 需要额外在 CMake 加 `nn_enable_gpu_fusion
 
 ## 5. 变更记录
 
-本文件不维护逐条修订记录（历史归档在 `docs/history.md`）；本文依据 = `examples/custom_layer_*` 库外实测（v1.7.0 / `f20532b`）。
+本文件不维护逐条修订记录（历史归档在 `docs/history/history.md`）；本文依据 = `examples/custom_layer_*` 库外实测（v1.7.0 / `f20532b`）。

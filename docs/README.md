@@ -1,8 +1,8 @@
 # 文档总索引与分册定位
 
 > 本文件是 `docs/` 的**总入口**：规定每个子目录**写给谁看**，并给出全部文档的一行索引。
-> 一句话总则：**除 `todo/` 与 `history.md` 外，`docs/` 下的文档都是写给调用者的**；
-> `todo/` 与 `history.md` 是项目开发者的内部工作区。
+> 一句话总则：**除 `todo/` 与 `history/history.md` 外，`docs/` 下的文档都是写给调用者的**；
+> `todo/` 与 `history/history.md` 是项目开发者的内部工作区。
 
 ## 1. 分册定位（写给谁看）
 
@@ -12,7 +12,7 @@
 | `usage/` | 调用者 | 用现成能力：CLI、C++ API、GUI、`.nnpkg`、作为库嵌入 | 当前状态 |
 | `development/` | **调用者（库使用者 / 扩展者）** | **在库之上写代码**：CMake 接入与全功能 C++ API 手册、写自定义层、扩展引擎原语、精度语义契约、算法与原语的对应 | 当前状态 |
 | `todo/` | **项目开发者** | 项目自身的工作：设计稿、路线图、盘点、规范、踩坑、故障报告、审查整改立项 | 当前状态（设计+进度） |
-| `history.md` | 项目开发者 | 全仓**唯一**历史归档：演进记录 / 已修复勘误 / 被否决方案 / 性能 A/B | 历史 |
+| `history/history.md` | 项目开发者 | 全仓**唯一**历史归档：演进记录 / 已修复勘误 / 被否决方案 / 性能 A/B | 历史 |
 | `benchmarks/` | 项目开发者 / 评估者 | 对外性能对比基准报告（Vulkan vs CUDA / Torch） | 采集时的实测 |
 | `release-notes/` | 调用者 | 版本变更说明（破坏性变更 + 迁移指南 + 验收基线） | 版本发布时 |
 
@@ -22,7 +22,7 @@
 扩展引擎原语、接入 GPU 融合、选精度策略。它**不是**项目开发者的工作区：
 
 - 项目内部的设计稿、路线图、盘点、规范、踩坑、故障报告、审查整改 → `docs/todo/`；
-- 已落地的演进过程、被否决方案、旧数字 → `docs/history.md`。
+- 已落地的演进过程、被否决方案、旧数字 → `docs/history/history.md`。
 
 判断标准一句话：**这篇文档的读者是"库外的人"还是"改库的人"？** 库外的放
 `development/`（或 `usage/`），改库的放 `todo/`。组件式设计文档即使被源码注释引用，
@@ -33,7 +33,7 @@
 `docs/todo/` = **项目开发者的内部工作区**，按"一件事一篇"存档：设计（含未实施部分）、
 路线图与裁定、现状盘点、编码规范、踩坑记录、未修故障、以及针对代码审查/评审的**整改立项**。
 这里的文档允许带进度状态（✅ 已实施 / ⏳ 待做），但不承载"当前是什么"以外的历史叙事——
-历史叙事一律进 `history.md`。
+历史叙事一律进 `history/history.md`。
 
 ## 2. 索引
 
@@ -81,7 +81,7 @@
 
 | 文档 | 何时读 |
 |------|--------|
-| [`history.md`](history.md) | 查"为什么当初这么改、旧数字是多少"（全仓唯一历史归档） |
+| [`history/history.md`](history/history.md) | 查"为什么当初这么改、旧数字是多少"（全仓唯一历史归档） |
 | [`benchmarks/2026-09-25-vulkan-vs-cuda.md`](benchmarks/2026-09-25-vulkan-vs-cuda.md) | Vulkan 后端 vs CUDA（torch）基准 |
 | [`benchmarks/2026-10-06-vulkan-vs-torch.md`](benchmarks/2026-10-06-vulkan-vs-torch.md) | 第二轮复测 |
 | `release-notes/v1.5.0.md` … `v1.7.0.md` | 版本变更说明 |
@@ -89,16 +89,16 @@
 ## 3. 2026-10-11 文档整理记录
 
 本仓库的文档在 2026-10-11 做过一次结构性整理，原则 =「`development/` 只留调用者文档；
-项目开发者文档进 `todo/`；历史进 `history.md`」。逐项：
+项目开发者文档进 `todo/`；历史进 `history/history.md`」。逐项：
 
 **迁移到 `docs/todo/`**（原 `docs/development/`，文件名与编号不变）：`02` `03` `04` `08`
 `10` `12` `14` `17` `18` `19` `21` `22` `23`。
 
-**整篇并入 `docs/history.md`**（内容已由后继文档承接，正文保留在 history 文末归档节）：
+**整篇并入 `docs/history/history.md`**（内容已由后继文档承接，正文保留在 history 文末归档节）：
 `15-computeengine-refresh.md`、`16-computeengine-p0-inventory.md`。
 
 **删除**：`13-refactor-backlog.md`——2026-10-01 起就只是 16 行的重定向 stub，
-正文早在 `history.md` 与 `todo/18-roadmap.md`。
+正文早在 `history/history.md` 与 `todo/18-roadmap.md`。
 
 **保留在 `docs/development/`（并重定义其读者为"调用者"）**：`01` `05` `06` `20`。
 

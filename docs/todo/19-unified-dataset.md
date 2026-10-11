@@ -1,13 +1,13 @@
 # 统一数据集格式与加载（.nndataset / .nnvocab / KVRecord v2）设计
 
-> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history.md)。
+> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history/history.md)。
 
 > **状态**：设计定稿；**阶段一~三已实施**——
 > 阶段一 = KVRecord v2 + `.nnvocab` + `tokenizer_train` 切换 + `dataset_convert vocab`；
 > 阶段二 = `.nndataset` + `dataset_gen` + `nn::Dataset` + `text_train` 切换 + 模型 v6 内嵌
 > （`MODEL_VERSION 5→6`，v5 及以下仍读内嵌 JSON）；阶段三 = GUI / 控制器 / `train_pkg` /
 > 审计脚本参数同步 + 文档。**阶段四（tabular/csv）未实施**（按裁决预留）。
-> 落地验收与实测数字见 `docs/history.md`「统一数据集」条与 AGENTS §12。
+> 落地验收与实测数字见 `docs/history/history.md`「统一数据集」条与 AGENTS §12。
 > **关联**：`docs/todo/18-roadmap.md` X2（无 Dataset 抽象）/ P2-4（Dataset/DataLoader + 流式）——
 > 本文是其前半（格式统一 + 统一类）的详细设计；DataLoader/流式仍留在 P2-4 后半。
 > `.nnpkg` 打包链路**本轮不在范围**（用户裁定），但 §6 标注了它的参数冲突依赖。

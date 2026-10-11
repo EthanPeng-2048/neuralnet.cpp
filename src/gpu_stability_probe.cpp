@@ -1,6 +1,6 @@
 // ── gpu_stability_probe.cpp — CPU/GPU 训练 run-to-run 确定性探针 ─────────
 //
-// 用途（ComputeEngine Refresh P0，见 docs/history.md「15 号归档」 §4.9 D9 实测）：
+// 用途（ComputeEngine Refresh P0，见 docs/history/history.md「15 号归档」 §4.9 D9 实测）：
 //   单进程内连续跑两轮完全相同的微型 GPT 训练（每轮独立建引擎、建模型），
 //   比对每步 loss（%.9g，f32 9 位有效数字可往返）与训练后全部参数的
 //   FNV-1a 校验和是否**逐位一致**；同时输出固定前缀行，便于跨进程
@@ -197,7 +197,7 @@ namespace
     // 五类模型 = 全部 init 路径（Linear/Conv/Norm 常数/token_emb/位置编码/
     // ones_row_）。同一引擎顺序构建：创建序号（InitSpec 混流）按构造顺序推进，
     // 跨进程同序 → 初值逐字节确定。
-    // （ZiPT 类已整体移除；锚点表见 AGENTS.md §12 / docs/history.md。）
+    // （ZiPT 类已整体移除；锚点表见 AGENTS.md §12 / docs/history/history.md。）
     nn::Result<InitHashes> run_init_hash(bool gpu)
     {
         auto eng_r = make_engine(gpu);

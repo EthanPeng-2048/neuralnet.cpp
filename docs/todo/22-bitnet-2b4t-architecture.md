@@ -1,6 +1,6 @@
 # BitNet b1.58 2B4T 的结构对齐：SubLN / GQA / Tied Embedding
 
-> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history.md)。
+> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history/history.md)。
 
 > **状态**：**立项 + S1/S2/S3/S4 + P2 全部实施完成**（2026-10-10 立项，同日落地并提交）。
 > 已落地：SubLN、GQA、tied embedding（S1–S3）、**FFN 激活 ReLU²**（S4，官方 `hidden_act`）、
@@ -383,7 +383,7 @@ graph TB
 | S3 | `P1.5-S3 tied embedding：head 复用 token embedding` | `tie_embeddings` 开关 + 梯度累加 + `ModelSpec.tie_embeddings` + 测试 [10]–[11] |
 | S4 | `P1.5-S4 ReLU²（BitNet 2B4T 的 hidden_act）` | `ActivationType::ReLU2` + `ReLU2GLU` 层 + FeedForward 接线 + CLI/GUI + scan 模型 pass + 测试 [12]–[13] |
 | P2 | `P1.5-P2 GQA in-kernel 头映射（省掉 K/V 的头展开物化）` | `ExprViewKind::HeadGroup` + `gqa_ratio_of` + fold/bmm/vecacc 比率 + AttentionBase 不展开 + scan 显式 fold 登记 + GPU 侧对拍 |
-| 4 | `P1.5 文档同步` | 本文状态/实施记录 + `AGENTS.md` + `docs/history.md` |
+| 4 | `P1.5 文档同步` | 本文状态/实施记录 + `AGENTS.md` + `docs/history/history.md` |
 | W1 | `P1.5-W1 线性层工厂 + Attention/FeedForward 三值接线` | `make_linear_layer`（Linear/BitLinear 工厂）+ `AttentionBase` 4 投影 / `FeedForward` fc1·fc2 → `unique_ptr<Layer>` + `split_ternary_profile`（含自相矛盾 fail-fast） |
 | W2 | `P1.5-W2 GPT 三值接线：投影/FFN/LM head + 规格·CLI·扫描登记` | `GPTBlock`/`GPTModel` 开关传播 + `lm_head_` + `effective_weight_quant` + `build_gpt_model_from_spec` 映射 + `text_train` 写规格/RAPT 前置拒绝 + scan 两条三值 GPT 用例（结构数 107 持平） |
 | W3 | `P1.5-W3 验收：三值 GPT 接线 + 真实 BitNet（2B4T 形状）端到端训练` | `bitnet_struct_test` [14]（形状一致 + 36/36 梯度非零）、[15]（三配置收敛 + CPU/GPU 末步 loss 差 < 1e-3） |
@@ -427,7 +427,7 @@ graph TB
 ## 10. 实施记录（落地差异与踩到的坑）
 
 §3 的设计与实现一致；以下是**实现期才显形**的几点，按"代码注释只记当前状态、
-历史过程进 history"的纪律，过程归档在 `docs/history.md`，这里只留结论性事实：
+历史过程进 history"的纪律，过程归档在 `docs/history/history.md`，这里只留结论性事实：
 
 1. **`Linear(in_features, out_features)` 是"入在前"** —— GQA 收窄的只是 K/V 的**输出**宽度，
    正确写法 `w_k_(d_model, n_head_kv·d_k)`。写反会被 `bitnet_struct_test` [8] 的形状打印

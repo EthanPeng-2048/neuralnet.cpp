@@ -3,7 +3,7 @@
 > 日期：2026-10-06 · 硬件：NVIDIA CMP 40HX (8 GB，本机唯一计算卡) · **全部数据本会话实测**
 > **数据版本**：nn 与 torch 两侧**同日、同机、同卡、同语料**采集，无跨会话漂移。
 > 与上一份报告 [`2026-09-25-vulkan-vs-cuda.md`](2026-09-25-vulkan-vs-cuda.md) 的关系见 §5：那份报告的语料未入库、无法复现，本轮语料为重建；其 09-25/09-26 数值在 §5 中作为对照列。
-> 本轮 nn 侧包含工作区未提交的三项 host 侧优化（staging 重复上传、`import` 快路径、内存池单扫描），见 §4.3 与 `docs/history.md`。
+> 本轮 nn 侧包含工作区未提交的三项 host 侧优化（staging 重复上传、`import` 快路径、内存池单扫描），见 §4.3 与 `docs/history/history.md`。
 
 ## 0. 结论速览
 
@@ -183,7 +183,7 @@
 4. **词表差异**：C++ BBPE 8208 vs torch HF BPE 8192，两侧分词器独立、token 流不同，LM-head FLOPs 差 0.16%；速度按 tok/s 归一，不影响可比性。
 5. **掩码语义**：nn 训练启用 per-line 文档掩码（fold 内生效），torch 为标准 causal——FLOPs 相同，语义不同，速度无影响。
 6. **显存口径**：统一 `nvidia-smi` 200 ms 采样整卡峰值（含 CUDA context）；torch allocator 视角另记 `peak_allocated` / `peak_reserved`（fp32 2794.8 / 3355.4 MB，fp16 1406.7 / 1956.6 MB）。
-7. **profile 口径**：`NN_PROFILE=1` 默认关闭零开销，开启后同配置 20 步墙钟比 e2e 高 2.6%（109.9 vs 107.1 ms/step），属观测开销；插桩的数值无关性由 `gpu_stability_probe` 剖析开/关 hash 逐位一致验证（`docs/history.md`「训练 step 剖析器」）。
+7. **profile 口径**：`NN_PROFILE=1` 默认关闭零开销，开启后同配置 20 步墙钟比 e2e 高 2.6%（109.9 vs 107.1 ms/step），属观测开销；插桩的数值无关性由 `gpu_stability_probe` 剖析开/关 hash 逐位一致验证（`docs/history/history.md`「训练 step 剖析器」）。
 8. **本机噪声**：40HX 为专用计算卡（跑测时显存 0 占用），显示输出走 AMD R5 240。
 
 ---

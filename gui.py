@@ -111,7 +111,7 @@ PRECISION_OPTIONS = ["f32", "f16"]
 #   精度预设下拉里的 "t1_58 (BitLinear + f16 存储)" = --t1_58 = profile_t1_58()
 #   = {param:T1_58, compute:F16, stable:F32, optimizer:F32}。
 PRECISION_PARAM_OPTIONS = ["f32", "f16", "t1_58"]
-# 模型架构：zipt(AttnZip) 已于 2026-10-01 移除（恢复前提见 docs/history.md / AGENTS §12）
+# 模型架构：zipt(AttnZip) 已于 2026-10-01 移除（恢复前提见 docs/history/history.md / AGENTS §12）
 GPT_MODEL_OPTIONS = ["gpt", "rapt"]
 
 

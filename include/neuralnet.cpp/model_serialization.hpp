@@ -412,7 +412,7 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
     if (spec.type == ModelType::Unknown)
         NN_FAIL("模型文件规格缺少有效的 type 字段");
     if (spec.type == ModelType::Reserved_ZiPT)
-        NN_FAIL("该模型文件为 AttnZip/ZiPT 架构，已整体移除"             "（代码保留在 legacy/zipt 分支；恢复前提见 docs/history.md）");
+        NN_FAIL("该模型文件为 AttnZip/ZiPT 架构，已整体移除"             "（代码保留在 legacy/zipt 分支；恢复前提见 docs/history/history.md）");
     return spec;
 }
 

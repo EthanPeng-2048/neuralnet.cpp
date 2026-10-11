@@ -51,8 +51,8 @@ private:
         nn::ComputeEngine& engine = engine_ref();
         grad_a_ = engine.create_tensor(rank_, dim_, p_.param, nn::InitSpec::zero());
         grad_b_ = engine.create_tensor(dim_, rank_, p_.param, nn::InitSpec::zero());
-        // 本函数返回 void → 用 NN_CHECK（终止式），不能用 NN_FAIL（返回语义）
-        NN_CHECK(grad_a_.valid() && grad_b_.valid(),
+        // 本函数返回 void → 用 NN_UNWRAP（终止式），不能用 NN_FAIL（返回语义）
+        NN_UNWRAP(grad_a_.valid() && grad_b_.valid(),
                  "LowRankAdapter: 梯度缓冲初始化失败");
     }
 
@@ -155,8 +155,8 @@ public:
 ```cpp
 nn::CpuEngine engine;
 nn::Model model(engine);
-NN_CHECK(model.add<nn::Linear>(28, 3));
-NN_CHECK(model.add<demo::LowRankAdapter>(3, 2));   // dim=3, rank=2
+NN_UNWRAP(model.add<nn::Linear>(28, 3));
+NN_UNWRAP(model.add<demo::LowRankAdapter>(3, 2));   // dim=3, rank=2
 
 auto opt = nn::create_optimizer("adam", engine, model.parameters(),
                                 model.param_gradients(), 1e-2f);
@@ -217,26 +217,26 @@ auto opt = nn::create_optimizer("adam", engine, model.parameters(),
 ```cpp
 nn::CpuEngine engine;
 nn::Model model(engine);
-NN_CHECK(model.add<nn::Linear>(4, 3));
-NN_CHECK(model.add<demo::LowRankAdapter>(3, 2));   // 换成你的层
+NN_UNWRAP(model.add<nn::Linear>(4, 3));
+NN_UNWRAP(model.add<demo::LowRankAdapter>(3, 2));   // 换成你的层
 
 const std::size_t in_dim = 4, dim = 3, batch = 4;
-nn::Tensor x = NN_CHECK(engine.try_create_tensor(in_dim, batch, nn::Precision::F32,
+nn::Tensor x = NN_UNWRAP(engine.try_create_tensor(in_dim, batch, nn::Precision::F32,
                                                  nn::InitSpec::uniform(-1.f, 1.f, 7)));
-nn::Tensor zero = NN_CHECK(engine.try_create_tensor(dim, batch, nn::Precision::F32,
+nn::Tensor zero = NN_UNWRAP(engine.try_create_tensor(dim, batch, nn::Precision::F32,
                                                     nn::InitSpec::zero()));
 nn::MSELoss mse;
 auto loss_once = [&]() -> double {
-    nn::Tensor out = NN_CHECK(model.forward(x));
-    return static_cast<double>(NN_CHECK(mse.forward(engine, out, zero)));
+    nn::Tensor out = NN_UNWRAP(model.forward(x));
+    return static_cast<double>(NN_UNWRAP(mse.forward(engine, out, zero)));
 };
 
 // 1. 解析梯度：一次 forward + backward
-NN_CHECK(model.zero_grad());
-nn::Tensor out = NN_CHECK(model.forward(x));
-(void)NN_CHECK(mse.forward(engine, out, zero));
-nn::Tensor gout = NN_CHECK(mse.backward());
-(void)NN_CHECK(model.backward(gout));
+NN_UNWRAP(model.zero_grad());
+nn::Tensor out = NN_UNWRAP(model.forward(x));
+(void)NN_UNWRAP(mse.forward(engine, out, zero));
+nn::Tensor gout = NN_UNWRAP(mse.backward());
+(void)NN_UNWRAP(model.backward(gout));
 
 // 2. 逐参数抽样做中心差分
 auto params = model.parameters();
@@ -248,20 +248,20 @@ for (std::size_t pi = 0; pi < params.size(); ++pi)
     nn::Tensor& P = params[pi].get();
     nn::Tensor& G = grads[pi].get();
     std::vector<nn::Scalar> pv(P.size()), gv(G.size());
-    NN_CHECK(engine.read(P, std::span(pv)));
-    NN_CHECK(engine.read(G, std::span(gv)));
+    NN_UNWRAP(engine.read(P, std::span(pv)));
+    NN_UNWRAP(engine.read(G, std::span(gv)));
     for (std::size_t k = 0; k < std::min<std::size_t>(P.size(), 4); ++k)
     {
         const std::size_t idx = (k * 5 + 1) % P.size();
         const nn::Scalar orig = pv[idx];
         pv[idx] = nn::Scalar(static_cast<double>(orig) + eps);
-        NN_CHECK(engine.write(P, std::span(pv)));
+        NN_UNWRAP(engine.write(P, std::span(pv)));
         const double lp = loss_once();
         pv[idx] = nn::Scalar(static_cast<double>(orig) - eps);
-        NN_CHECK(engine.write(P, std::span(pv)));
+        NN_UNWRAP(engine.write(P, std::span(pv)));
         const double lm = loss_once();
         pv[idx] = orig;
-        NN_CHECK(engine.write(P, std::span(pv)));
+        NN_UNWRAP(engine.write(P, std::span(pv)));
         const double num = (lp - lm) / (2.0 * eps);
         max_err = std::max(max_err, std::fabs(num - static_cast<double>(gv[idx])));
     }
@@ -300,10 +300,10 @@ GPU 表达式 shader 是**构建期**生成的（AOT 闭合世界，铁律 #7）
 
 | 你写的 | 报错 | 正确写法 |
 |---|---|---|
-| `if (!ok) NN_FAIL("...")` 在 `void` 函数 / `main` 里 | `-Wreturn-mismatch`（`NN_FAIL` = `return std::unexpected`） | `NN_CHECK(ok, "...")` 或 `NN_FATAL("...")` |
-| `auto x = NN_CHECK(engine.from_matrix(m)); *x;` | `member reference type 'Tensor' is not a pointer` | `NN_CHECK` **已解包**，`x` 就是 `Tensor` |
-| `NN_CHECK(model.backward(g));`（丢弃 `[[nodiscard]]`） | `ignoring return value ... nodiscard` | `(void)NN_CHECK(model.backward(g));` |
-| `opt->zero_grad();` 忽略返回值 | `-Wunused-result` | `NN_CHECK(opt->zero_grad());` |
+| `if (!ok) NN_FAIL("...")` 在 `void` 函数 / `main` 里 | `-Wreturn-mismatch`（`NN_FAIL` = `return std::unexpected`） | `NN_UNWRAP(ok, "...")` 或 `NN_FATAL("...")` |
+| `auto x = NN_UNWRAP(engine.from_matrix(m)); *x;` | `member reference type 'Tensor' is not a pointer` | `NN_UNWRAP` **已解包**，`x` 就是 `Tensor` |
+| `NN_UNWRAP(model.backward(g));`（丢弃 `[[nodiscard]]`） | `ignoring return value ... nodiscard` | `(void)NN_UNWRAP(model.backward(g));` |
+| `opt->zero_grad();` 忽略返回值 | `-Wunused-result` | `NN_UNWRAP(opt->zero_grad());` |
 | 覆写 `init(engine)` 而不是 `init_impl` | 行为异常（绕过 NVI 校验） | 覆写 `init_impl` |
 | 一个表达式里写两个 `dsl::matmul` | 折叠失败（不是清晰断言） | 拆成两次 `dsl::compute` |
 | forward 无条件 `x_cache_ = input;` | 梯度检查点下崩 | 加 `if (!checkpoint_mode_)` |

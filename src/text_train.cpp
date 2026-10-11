@@ -522,7 +522,7 @@ TrainConfig parse_args(int argc, char *argv[])
                           << ", 可选: gpt, rapt\n";
                 if (cfg.model_type == "zipt")
                     std::cerr << "（ZiPT 已移除，代码保留在 legacy/zipt 分支；"
-                                 "恢复前提见 docs/history.md）\n";
+                                 "恢复前提见 docs/history/history.md）\n";
                 std::exit(1);
             }
         }
@@ -1210,7 +1210,7 @@ int main(int argc, char *argv[])
 
     // ── 损失覆盖范围 ─────────────────────────────────────────────
     // 全部 seq_len 位置参与 loss。（ZiPT「压缩模式仅窗口位置参与 loss」
-    // 分支已整体移除，见 docs/history.md。）
+    // 分支已整体移除，见 docs/history/history.md。）
     const std::size_t eff_seq = cfg.seq_len;
 
     // ── 预分配 batch 缓冲区（末批不满时 resize 到实际 this_bs） ──

@@ -2,7 +2,7 @@
 
 > **本分册写给调用者（库使用者 / 扩展者）**，不是项目开发者的工作区。
 > 内部设计稿、路线图、盘点、规范、踩坑、故障报告、审查整改一律在 [`../todo/`](../todo/)；
-> 历史叙事在 [`../history.md`](../history.md)。
+> 历史叙事在 [`../history.md`](../history/history.md)。
 
 ## 这里的文档解决什么问题
 
@@ -46,4 +46,4 @@
 | 融合/IR 的**内部设计**（改库才需要） | [`../todo/02-operator-fusion.md`](../todo/02-operator-fusion.md)、[`../todo/03-ir-optimization.md`](../todo/03-ir-optimization.md) |
 
 > ⚠ 本分册的文档同样受仓库写作纪律约束：**只描述当前状态**；演进过程、被否决方案、
-> 旧数字一律在 [`../history.md`](../history.md)。
+> 旧数字一律在 [`../history.md`](../history/history.md)。

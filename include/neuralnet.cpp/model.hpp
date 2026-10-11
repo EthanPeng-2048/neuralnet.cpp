@@ -10,8 +10,8 @@
 // 用法：
 //     #include <neuralnet.cpp/model.hpp>
 //     nn::Model model(engine);
-//     NN_CHECK(model.add<nn::Linear>(784, 256));
-//     NN_CHECK(nn::save_model("model.bin", model, spec));
+//     NN_UNWRAP(model.add<nn::Linear>(784, 256));
+//     NN_UNWRAP(nn::save_model("model.bin", model, spec));
 //
 // 注：模型**工厂**（build_mnist_mlp_model / build_gpt_model / build_cnn_model…
 //     与分词器）在 `domain_*.hpp`，不在本头；本头的 `Model::spec()` 由那些

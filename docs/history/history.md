@@ -734,11 +734,11 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 - 类型：删除清单
 - 内容：docs/17-pointer-audit.md、docs/23-mixed-precision.md、docs/development/11-cpu-performance-diagnosis.md、DEVELOPMENT_STANDARDS.md、src/bench_thresholds.cpp 均已删除或改名；对应链接改指 docs/todo/10-development-standards.md、docs/development/05-mixed-precision.md，或去掉文件名只留实测结论（blocked 优于 naive、并行阈值 524288 标定表等实测数据保留）。
 
-## 错误处理宏族落地：NN_CHECK / NN_EXIT / NN_TRY_MSG / NN_FAIL（2026-10-05，原位置 include/neuralnet.cpp/core_errors.hpp 的 NN_TRY 段、AGENTS.md §5 铁律 #1、CMakeLists.txt 测试块、docs/todo/12 / 18、docs/usage/05 的 ctest 计数行）
+## 错误处理宏族落地：NN_UNWRAP / NN_EXIT / NN_TRY_MSG / NN_FAIL（2026-10-05，原位置 include/neuralnet.cpp/core_errors.hpp 的 NN_TRY 段、AGENTS.md §5 铁律 #1、CMakeLists.txt 测试块、docs/todo/12 / 18、docs/usage/05 的 ctest 计数行）
 - 类型：演进记录
 - **背景（被替代的手写形态与实测量）**：全仓 `return std::unexpected(...)` 共 **1205** 处 —— 其中**纯传播** `return std::unexpected(r.error())` **628** 处（`NN_TRY`/`NN_TRY_CHECK` 此前只覆盖 **392** 处：L2 已收敛，其余散在 backend/engine/src/tools）、**错误源头** `return std::unexpected(Error{...})` **518** 处、`src/` 里 `if (!r) { std::cerr << ...; return 1/false; }` 形态 **374** 处（**全仓唯一没有任何宏覆盖的语义**）。原宏族只解决"传播"，解包与失败退出两类全靠手写，也正是"作为库易用性"评估里排第一的摩擦源。
-- **新宏族（三种语义 + 一个糖）**：`NN_TRY` / `NN_TRY_CHECK`（传播，展开与手写逐字等价）；`NN_TRY_MSG(decl, "语境", expr)`（传播并把语境前缀进 `Error.message`）；`NN_CHECK(expr[, "语境"])`（解包 + 终止，别名 `NN_EASY_CHECK`，接受 `Result<T>` / `Result<void>` / `bool` 三形态）；`NN_EXIT(expr, code[, "语境"])`（解包 + `std::exit(code)`，CLI 参数错误保住退出码）；`NN_FAIL("msg")`（错误源头糖）。
-- **实现约束（改动前必读）**：终止只有 abort/exit，**任何路径不出现 `throw`** —— 故未做"可抛异常"变体（铁律 #1 + `-fno-exceptions`）；变参分发走实参计数 `NN_DETAIL_PICK2/3` + 末尾哨兵，**不用 `__VA_OPT__`**（MSVC 传统预处理器不可靠）；解值用 `std::move(r).value()`（`expected<void>` 的 `operator*` 返回 void，`std::move(*r)` 编译不过）；非 void 重载带 `[[nodiscard]]`、void 重载**不带**（否则 `NN_CHECK(f());` 纯副作用调用误告警）；`check_message` / `contextualize` 单独成函数 = 可单测。**已知边界**：被检查表达式含**顶层逗号**（多参数模板列表、花括号初始化）会让实参计数出错 → 选错分支 → **编译期报错（响亮，不会静默错值）**，加一层括号即可（已写进宏注释与铁律 #1）。
+- **新宏族（三种语义 + 一个糖）**：`NN_TRY` / `NN_TRY_CHECK`（传播，展开与手写逐字等价）；`NN_TRY_MSG(decl, "语境", expr)`（传播并把语境前缀进 `Error.message`）；`NN_UNWRAP(expr[, "语境"])`（解包 + 终止，别名 `NN_UNWRAP_1`，接受 `Result<T>` / `Result<void>` / `bool` 三形态）；`NN_EXIT(expr, code[, "语境"])`（解包 + `std::exit(code)`，CLI 参数错误保住退出码）；`NN_FAIL("msg")`（错误源头糖）。
+- **实现约束（改动前必读）**：终止只有 abort/exit，**任何路径不出现 `throw`** —— 故未做"可抛异常"变体（铁律 #1 + `-fno-exceptions`）；变参分发走实参计数 `NN_DETAIL_PICK2/3` + 末尾哨兵，**不用 `__VA_OPT__`**（MSVC 传统预处理器不可靠）；解值用 `std::move(r).value()`（`expected<void>` 的 `operator*` 返回 void，`std::move(*r)` 编译不过）；非 void 重载带 `[[nodiscard]]`、void 重载**不带**（否则 `NN_UNWRAP(f());` 纯副作用调用误告警）；`check_message` / `contextualize` 单独成函数 = 可单测。**已知边界**：被检查表达式含**顶层逗号**（多参数模板列表、花括号初始化）会让实参计数出错 → 选错分支 → **编译期报错（响亮，不会静默错值）**，加一层括号即可（已写进宏注释与铁律 #1）。
 - **本轮范围**：只交付宏族 + 测试 + 文档；存量 628 处传播与 374 处 `src/` 退出样板分 A/B 两批随后迁移（验收口径 = 两批残留 0），518 处错误源 `NN_FAIL` 化裁定为**不强制**（纯美观，风险 > 收益）。数据管道 `nn::data::`、`nn::generate`、易用层聚合头同期**裁定推迟**（数据格式待定型；`nn.hpp` 保持唯一聚合头，改为提供按需薄转发头）。
 - **验收（本机 Release + Ninja + clang）**：build 零告警（`-Werror`）；ctest **23 → 24**（新增 `error_macro_test`：解值三形态 / `check_message` 打印格式 / `NN_TRY_MSG` 语境前缀 / 终止与退出码经 `std::system` 子进程 `--expect-abort`、`--expect-exit <n>` 断言）；带与不带 `NN_BIND_DEBUG=1` 各一轮 **24/24**；`gpu_stability_probe --init-hash` **五锚与改动前 A/B 逐位一致**（实测法见下条"过程坑"）：mnist_mlp `3e982d018c00d94a` / cnn `d8c8457f0053c4f9` / mnist_transformer `70c4c085052268b2` / gpt `f8c2d892f5834239` / rapt `7002b986b84f679f`；scan 结构仍 **91**（样例收集器 93）、`fused_registry.hpp` 内容未变；`L2-VIOLATIONS: 0`；`gui_cli_audit` PASS；`doc_align_audit` EXIT 0。
 - ⚠ **锚点口径**：AGENTS.md §12 记录的 `0148e453908158dc` 等是**作者机器**的值（锚标注"机器/stdlib 相关"），本机 clang+MSVC STL 实测即为上列另一组 —— 判"锚有没有动"只能用**同机 A/B**，不能对文档数值。
@@ -3941,7 +3941,7 @@ build/gpu_stability_probe --gpu 1 --steps 20    # 指定 GPU
 （GPU 分配失败连 stderr 都没有），与同族 `from_matrix`/`to_matrix`/`cast`/`read`/`write`/
 `import`（全是 `Result`）不一致。现 `create_tensor_impl` 为 `Result<Tensor>`，新增
 `try_create_tensor`（含 `InitSpec` 重载）承载"非存储精度 / 形状溢出 / 分配失败"；旧签名保留为
-`NN_CHECK(try_...)` 转发（115 处调用点零改动，失败从静默变 fail-fast）。库内 4 处 `valid()`
+`NN_UNWRAP(try_...)` 转发（115 处调用点零改动，失败从静默变 fail-fast）。库内 4 处 `valid()`
 兜底（rapt 三处、`upload_span`/录制占位）改 `NN_TRY` 直抛。
 
 **RV-03（bug 根因）——同目标写序的隐式依赖**：AdamW 的 `p=(1−lr·wd)·p` 与 `p+=delta` 是

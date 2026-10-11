@@ -187,7 +187,7 @@ RoPE 的 `RowMod/RotateHalf` 参数如果以**结构常量**折进 key，每个 
 
 - **IR-A canonicalize**：DCE + 常量折叠 + 代数化简 + 稳定重编号（保守、不改变浮点语义）。
 - **IR-B CSE + 寄存器分配**：哈希指令去重，liveness 线性扫描确定性贪心分配寄存器。
-- **IR-C 图 IR + 融合分析**：**现行**——`engine.begin_expr()/end_expr()` + `ExprSegment` RAII 守卫 + `expr_graph.hpp` 做图级跨表达式融合：**P1 链**（单输出逐元素链、允许 matmul 头段）与 **P2 分量**（纯逐元素 F32 同形状节点按依赖边连通成组，多消费者/菱形不再是边界，成员输出全部写穿 = `ExprSpec.extras`，≤4）。GPU 真录制（`execute_fused_graph`），CPU 普通运行 no-op，`NN_EXPR_SCAN` 下构建期扫描与运行期融合一致（闭合世界）。首个生产调用方是 Adam/AdamW——每参数张量的 m/v 写穿 + delta + `p += delta` 收敛为**一个多输出 kernel**；`NN_PROFILE` 实测（GPU 40HX，GPT d_model=64/4 层/heads=4/seq=256/batch=64，`adam`，20 步）设备 kernel **266 → 66.5 每步**、设备时间 **0.57 → 0.23 ms/step**。不需要写穿的长链仍可直接写成一个 `dsl::compute`。历史取舍见 `docs/history.md`。
+- **IR-C 图 IR + 融合分析**：**现行**——`engine.begin_expr()/end_expr()` + `ExprSegment` RAII 守卫 + `expr_graph.hpp` 做图级跨表达式融合：**P1 链**（单输出逐元素链、允许 matmul 头段）与 **P2 分量**（纯逐元素 F32 同形状节点按依赖边连通成组，多消费者/菱形不再是边界，成员输出全部写穿 = `ExprSpec.extras`，≤4）。GPU 真录制（`execute_fused_graph`），CPU 普通运行 no-op，`NN_EXPR_SCAN` 下构建期扫描与运行期融合一致（闭合世界）。首个生产调用方是 Adam/AdamW——每参数张量的 m/v 写穿 + delta + `p += delta` 收敛为**一个多输出 kernel**；`NN_PROFILE` 实测（GPU 40HX，GPT d_model=64/4 层/heads=4/seq=256/batch=64，`adam`，20 步）设备 kernel **266 → 66.5 每步**、设备时间 **0.57 → 0.23 ms/step**。不需要写穿的长链仍可直接写成一个 `dsl::compute`。历史取舍见 `docs/history/history.md`。
 - **IR-D emitter 抽象**：`ExprEmitter` 接口 + 注册表，一份 canonical IR 可产出多后端代码（后端实现按接口注册；当前注册的只有 `glsl` 后端）。
 
 ### 6.3 关键不变量
@@ -269,7 +269,7 @@ f32 以控制数值风险；BF16/F64 为"使用即报错"的保留值）。数�
 > 2. **代码层**：实现质量对齐 RAPT/GPT——支持 `forward_recompute`（梯度检查点）与
 >    activation offload、CLI/序列化/测试覆盖齐备。
 >
-> 完整裁决依据与验收见 [`docs/history.md`](../history.md)「ZiPT 移除」条与 `AGENTS.md` §12。
+> 完整裁决依据与验收见 [`docs/history/history.md`](../history/history.md)「ZiPT 移除」条与 `AGENTS.md` §12。
 > 长上下文一侧现由 **fold 单遍流式注意力**（§4）与 **RLA-2 / RAPT**（ReLU 线性注意力）承载。
 
 ---

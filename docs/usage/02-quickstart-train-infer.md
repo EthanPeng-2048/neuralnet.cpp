@@ -15,10 +15,10 @@ cmake --build build --parallel
 
 **数据准备：**
 
-```bash
-# MNIST 数据集会自动下载到 datasets/mnist_data/
-# GPT 训练需要文本文件（如 datasets/llm_corpus.txt）
-```
+MNIST 数据不随仓库分发：从
+[Releases](https://github.com/EthanPeng-2048/neuralnet.cpp/releases) 下载 `mnist_data`
+压缩包，解压到 `datasets/mnist_data/`（`train.csv` / `test.csv`）。
+GPT 训练需要一份文本语料（如 `datasets/llm_corpus.txt`，用 `scripts/download_*.py` 拉取）。
 
 ---
 
@@ -68,12 +68,12 @@ cmake --build build --parallel
 
 ### 推理
 
+推理入口接受**单张** CSV（`784` 像素一行）。用 GUI 的**手写板**画一个数字、
+或自己导出一张 CSV 即可，无需预先准备测试图。
+
 ```bash
 # 使用已训练的模型推理（图片路径是位置参数）
-./build/mnist_infer datasets/mnist_data/test/0_1.csv --model mnist_model.bin
-
-# 批量推理整个目录下的 CSV
-./build/mnist_infer datasets/mnist_data/test --model mnist_model.bin --topk 5
+./build/mnist_infer my_digit.csv --model mnist_model.bin
 ```
 
 ---

@@ -41,7 +41,7 @@ target_link_libraries(my_app PRIVATE neuralnet::nn)
 int main()
 {
     nn::CpuEngine engine;
-    nn::Model model = NN_CHECK(nn::build_mnist_mlp_model(engine));
+    nn::Model model = NN_UNWRAP(nn::build_mnist_mlp_model(engine));
     (void)model;
     return 0;
 }
@@ -75,7 +75,7 @@ target_link_libraries(my_app PRIVATE neuralnet::nn)
 - **GPU（若启用）**：宏 `NN_HAS_VULKAN`、`Vulkan::Vulkan` 链接、以及
   「shader 生成先于你的 TU 编译」的顺序依赖；
 - **库头需要的接口选项**：Clang 的 `-Wno-pass-failed` / `-fexperimental-library`、
-  MSVC 的 `/utf-8`、`/Zc:preprocessor`（否则 `NN_CHECK` / `NN_EXIT` 会被
+  MSVC 的 `/utf-8`、`/Zc:preprocessor`（否则 `NN_UNWRAP` / `NN_EXIT` 会被
   传统预处理器静默展开错）。
 
 > 你**不要**自己写任何 Vulkan 相关 CMake。源码里 `#ifdef NN_HAS_VULKAN` 分支即可。
@@ -194,12 +194,12 @@ tokenizer_infer,dataset_gen,dataset_convert}`，另有 `layer_bench`（性能）
 
 ## 9. 跨平台与编译器
 
-- **标准要求 C++26**（接口以 `target_compile_features` 传递）。编译器：Clang 22+ / GCC 15+ /
-  MSVC（VS2026+，走 `/std:c++latest`）。
+- **标准要求 C++26**（接口以 `target_compile_features` 传递）。编译器不限具体版本，
+  只要**支持 C++26** 即可（Clang / GCC / MSVC 均可；MSVC 走 `/std:c++latest`）。
 - **CMake ≥ 3.30**。`CMakeLists.txt` 不指定编译器（由 CMake 探测或调用方
   `CXX=...` / `-DCMAKE_CXX_COMPILER` 决定），**标准库编译/链接两侧必须一致**。
 - **MSVC**：必须带 `/Zc:preprocessor`（已作为接口选项随门面传递）。`cl.exe` 默认的传统
-  预处理器会把 `NN_CHECK(x, msg)` 静默退化成逗号表达式（条件恒真、检查永不触发），
+  预处理器会把 `NN_UNWRAP(x, msg)` 静默退化成逗号表达式（条件恒真、检查永不触发），
   `NN_EXIT` 直接 `C3861`。
 - **Clang + libc++**：`-Werror` 下 libc++ 会对「记录类型但从未使用」的局部变量报
   `-Wunused-variable`（libstdc++ 不报）——属真实死变量，删掉即可。

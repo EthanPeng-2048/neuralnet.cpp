@@ -91,13 +91,13 @@ namespace detail {
     return Error{std::move(m)};
 }
 
-// ── 解包 + 终止（NN_CHECK）：Result<T> → T（失败 abort）────────────────────
+// ── 解包 + 终止（NN_UNWRAP）：Result<T> → T（失败 abort）────────────────────
 // **精确 Result<T> 重载，不用泛型 T&&**：`std::expected` 自带 `operator bool`，
 // 若形参是泛型 T&&，会与下面的 bool 重载形成部分排序歧义，clang 改走上下文
 // 转换、把整个 Result 当返回值（实测编译期才暴露）。三重载按形参类型精确
 // 划分：Result<T>（非 void）/ Result<void> / bool。
 // 非 void 带 nodiscard（丢弃解出的值会告警）；void 形态不带（否则纯副作用
-// 调用 NN_CHECK(f()); 会误告警）。按值接 + std::move 取值：结果可能持有不可
+// 调用 NN_UNWRAP(f()); 会误告警）。按值接 + std::move 取值：结果可能持有不可
 // 拷贝类型（如 std::unique_ptr），调用侧右值/左值都能绑。
 template <typename T>
     requires (!std::is_void_v<T>)
@@ -130,7 +130,7 @@ inline void check_value(bool ok, const char* what, std::string_view ctx,
 }
 
 // ── 解包 + std::exit(code)（NN_EXIT）：CLI/参数这类"用户输入错误"用它保住
-//    退出码（内部不变量用 NN_CHECK 的 abort）。**恒不带 nodiscard** —— 最常见
+//    退出码（内部不变量用 NN_UNWRAP 的 abort）。**恒不带 nodiscard** —— 最常见
 //    用法是纯退出检查（结果就此丢弃），带 nodiscard 会误告警。
 //    形参用转发引用 + if constexpr 取错误详情：既接 Result<T>（含 void 与不可
 //    拷贝的 unique_ptr 载体），也接裸指针 / unique_ptr / any 上下文可判定类型
@@ -168,9 +168,12 @@ inline void check_exit(bool ok, const char* what, std::string_view ctx,
 //        NN_TRY_CHECK(r)               检查已声明的 r
 //
 //   ② 解包继续 —— 任何上下文（main / void / 测试 helper），失败即终止：
-//        NN_CHECK(f())                 Result<T>→T；Result<void> 与 bool 条件也可
-//        NN_CHECK(f(), "上传批次")      带调用点语境
-//        NN_EASY_CHECK(f())            NN_CHECK 的别名（同语义）
+//        NN_UNWRAP(f())                 Result<T>→T；Result<void> 与 bool 条件也可
+//        NN_UNWRAP(f(), "上传批次")      带调用点语境
+//      语义是 **unwrap**（成功解出值；失败即终止打印 message + file:line），
+//      不是 assert。旧名 `NN_CHECK` / `NN_EASY_CHECK` 会诱导按断言直觉使用，
+//      故更名；两者保留为等价别名（见下方），**新代码一律用 NN_UNWRAP**。
+//      ⚠ 非 void 形态带 nodiscard：丢弃解出的值需显式 `(void)`。
 //
 //   ③ 解包退出 —— CLI/参数这类"用户输入错误"，保住退出码：
 //        NN_EXIT(f(), 1)               失败打印后 std::exit(1)
@@ -215,14 +218,16 @@ inline void check_exit(bool ok, const char* what, std::string_view ctx,
 #define NN_DETAIL_PICK2(_1, _2, NAME, ...) NAME
 #define NN_DETAIL_PICK3(_1, _2, _3, NAME, ...) NAME
 
-#define NN_CHECK(...) \
-    NN_DETAIL_PICK2(__VA_ARGS__, NN_CHECK_MSG, NN_CHECK_1, NN_PICK_END)(__VA_ARGS__)
-#define NN_CHECK_1(x) \
+#define NN_UNWRAP(...) \
+    NN_DETAIL_PICK2(__VA_ARGS__, NN_UNWRAP_MSG, NN_UNWRAP_1, NN_PICK_END)(__VA_ARGS__)
+#define NN_UNWRAP_1(x) \
     ::nn::detail::check_value((x), #x, {}, std::source_location::current())
-#define NN_CHECK_MSG(x, m) \
+#define NN_UNWRAP_MSG(x, m) \
     ::nn::detail::check_value((x), #x, (m), std::source_location::current())
 
-#define NN_EASY_CHECK(x) NN_CHECK_1(x)
+// ── 向后兼容别名（等价展开，仅旧代码在用；新代码请用 NN_UNWRAP）─────────
+#define NN_CHECK(...) NN_UNWRAP(__VA_ARGS__)
+#define NN_EASY_CHECK(x) NN_UNWRAP_1(x)
 
 #define NN_EXIT(...) \
     NN_DETAIL_PICK3(__VA_ARGS__, NN_EXIT_MSG, NN_EXIT_2, NN_PICK_END)(__VA_ARGS__)

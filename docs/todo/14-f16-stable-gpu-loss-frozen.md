@@ -1,6 +1,6 @@
 # 14 — GPU `stable=f16` 训练 loss 回读冻结
 
-> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history.md)。
+> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history/history.md)。
 
 > 状态：**未修复（Open）** · 环境：Windows + clang++ 22（Release `-O3`）+ NVIDIA CMP 40HX（Vulkan）· HEAD `4a12876`
 > 发现途径：`docs/benchmarks/*-vulkan-vs-cuda.md`（Vulkan vs CUDA 基准文档）全量重跑（nn 侧）。本报告只记录事实与证据，不实施修复。
@@ -105,7 +105,7 @@ bench/raw/f16_ep2.bin  (2,971,754 B)  ← epoch2 结束时
 | 冻结对象 | **权重冻结**（loss 恒 = ln V） | **loss 回读冻结**（权重正常更新） |
 | 工具现状 | `f16_writeback_probe` ALL PASSED | 同工具无法覆盖本配置 |
 
-- 回归窗口比对与嫌疑提交排查已移入 `docs/history.md`。
+- 回归窗口比对与嫌疑提交排查已移入 `docs/history/history.md`。
 
 ## 5. 链路与嫌疑点（未定根因）
 

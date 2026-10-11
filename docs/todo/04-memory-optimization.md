@@ -1,6 +1,6 @@
 # 显存优化计划（Memory Optimization）—— GPT + Vulkan/CPU 训练显存下探
 
-> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history.md)。
+> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history/history.md)。
 
 > 文档状态：**L1 激活重计算（梯度检查点）已实施 / L2 内存池整块归还 + 统计已实施**（L3 远期）。
 > 关联文档：`../todo/02-operator-fusion.md`（算子融合已完成部分，消除 seq² 物化）。

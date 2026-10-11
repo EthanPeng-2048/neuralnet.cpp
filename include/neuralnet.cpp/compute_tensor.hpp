@@ -11,7 +11,7 @@
 //   - precision_ 与 device_ 共同唯一确定存储的有效类型
 //   - 使用 shared_ptr 内部持有存储，拷贝廉价（零拷贝传递）
 //   - 出生绑定（P1）：engine_ 观察创建本张量的引擎；库内产物出生即绑定，
-//     绑定随拷贝/reshape 传播（docs/history.md「15 号归档」 §3.1）
+//     绑定随拷贝/reshape 传播（docs/history/history.md「15 号归档」 §3.1）
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <algorithm>
@@ -37,7 +37,7 @@ namespace nn
 {
 
 // ComputeEngine 前置声明：Tensor 持有非拥有绑定（observer_ptr，P1 出生绑定，
-// docs/history.md「15 号归档」 §3.1），不能反向 include。
+// docs/history/history.md「15 号归档」 §3.1），不能反向 include。
 class ComputeEngine;
 class CpuEngine;
 class GpuEngine;
@@ -75,7 +75,7 @@ private:
     std::size_t rows_ = 0;
     std::size_t cols_ = 0;
 
-    // ── 出生绑定（P1，docs/history.md「15 号归档」 §3.1）──────────────────────────
+    // ── 出生绑定（P1，docs/history/history.md「15 号归档」 §3.1）──────────────────────────
     // 创建本张量的引擎（非拥有观察者；+8B）。未绑定 = nullptr（非绑定态仅剩
     // 库外直构：Tensor{} 空槽、src/ 测试的 Tensor::from_matrix/from_host 之前
     // 的宿主直构）。库内产物出生即绑定——由引擎工厂/算子出口 stamp 或

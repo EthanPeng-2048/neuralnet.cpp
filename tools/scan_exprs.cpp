@@ -111,7 +111,7 @@ int main(int argc, char* argv[])
 
     // ── dry-run 主体：跑一遍 Layer 的 forward/backward（只收集**结构**）──
     // engine 是**形参**（遮蔽外层 raw_engine）：f16 边界 cast 由基类 NVI 入口
-    // 统一处理（原 PrecisionEngine 适配层已删除，见 docs/history.md「15 号归档」 §4.1）。
+    // 统一处理（原 PrecisionEngine 适配层已删除，见 docs/history/history.md「15 号归档」 §4.1）。
     [[maybe_unused]] const auto dry_run = [&](nn::ComputeEngine& engine, const nn::PrecisionProfile& prof)
     {
         scan_prof = prof;

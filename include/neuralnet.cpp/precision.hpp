@@ -109,7 +109,7 @@ enum class Precision : std::uint8_t
 {
     if (!precision_has_order(a) || !precision_has_order(b))
     {
-        NN_CHECK(false,
+        NN_UNWRAP(false,
                  std::string("max_precision: 无提升序的精度（非舍入精度）: ")
                      + precision_name(a) + " / " + precision_name(b));
     }

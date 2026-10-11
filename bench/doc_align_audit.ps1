@@ -40,7 +40,7 @@ $historicalFiles = @('compute_cuda_engine.hpp','compute_cuda_backend.hpp','cuda_
 
 # ── [A] 文档引用的文件是否存在 ──────────────────────────────────────────
 Write-Host '=== [A] 文档引用但仓库中不存在的文件 ==='
-# docs/history.md 是全仓唯一的历史归档，按设计记录已删符号/已删文件 → 整体豁免
+# docs/history/history.md 是全仓唯一的历史归档，按设计记录已删符号/已删文件 → 整体豁免
 $docs = @('AGENTS.md','README.md') +
         (Get-ChildItem -Recurse docs -Filter *.md |
             Where-Object { $_.Name -ne 'history.md' } |

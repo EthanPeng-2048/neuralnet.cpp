@@ -1,6 +1,6 @@
 # 代码审查整改立项台账（2026-10-11）
 
-> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history.md)。
+> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history/history.md`](../history/history.md)。
 >
 > **来源**：2026-10-11 的一份外部代码审查报告（范围 = `include/neuralnet.cpp/` 约 4.6 万行 header-only 库 + `src/` + 构建系统）。
 > **本文作用**：把审查报告里的问题**逐条立项**——先复核（哪些成立、哪些表述有误），再给每项定优先级、证据、
@@ -9,11 +9,11 @@
 
 ## 0. 怎么用本文
 
-**状态机**：`Open`（已立项，未动手）→ `Doing` → `Fixed`（**必须带验收证据**）→ `Archived`（结论进 `../history.md`）。
+**状态机**：`Open`（已立项，未动手）→ `Doing` → `Fixed`（**必须带验收证据**）→ `Archived`（结论进 `../history/history.md`）。
 
 **每条的字段**：编号 · 优先级 · 状态 · 来源 · 现象与证据（符号名 + 2026-10-11 实测行号）· 根因 · 方案（分步）· 验收口径 · 影响面/风险 · 依赖。
 
-**写作纪律**（与全仓一致）：行号取自 2026-10-11 实测、漂移后**以符号名为准**；只写"当前事实 + 决定"，历史叙事进 `../history.md`。
+**写作纪律**（与全仓一致）：行号取自 2026-10-11 实测、漂移后**以符号名为准**；只写"当前事实 + 决定"，历史叙事进 `../history/history.md`。
 
 **通用验收基线**（本仓任何改动都要过，下文不再重复）：
 `cmake --build build` 零告警 → `ctest --test-dir build` 全绿 →（涉及数值/默认结构时）字节锚逐位不变 →（涉及表达式/融合时）
@@ -123,7 +123,7 @@
 
 1. 新增 `Result<Tensor> try_create_tensor(rows, cols, P)` 与带 `InitSpec` 的重载（新协议：形状合法性 + 精度支持 + 分配失败都进 `Result`）；
 2. `create_tensor_impl` 提升为 `Result<Tensor>`，把 GPU 分配失败原因带上（`GpuTensor::create_empty` 的错误）；
-3. 旧 `create_tensor` 保留为 `Result` 版转发 + `NN_CHECK` 解包（或标注 deprecated，下一版删）；
+3. 旧 `create_tensor` 保留为 `Result` 版转发 + `NN_UNWRAP` 解包（或标注 deprecated，下一版删）；
 4. 分批迁移调用点：批 A = `include/` 库内（`compute_layer_*` 最多），批 B = `src/` + 测试。
 
 **验收**：工厂返回处不再有"空张量 + 查 `valid()`"兜底；新增负例（`T1_58`/`BF16` 请求 → 返回错误、**不打印** stderr、无空张量）；
@@ -135,7 +135,7 @@
 连 stderr 都没有）；② 新增 `try_create_tensor(rows, cols, P)` 与带 `InitSpec` 的重载：
 覆盖"非存储精度（T1_58/BF16/F64）拒绝 + 形状溢出（rows*cols 超 size_t）拒绝 + 分配失败
 原因上抛"，**不再打印 stderr、不再返回空张量**；③ 旧签名 `create_tensor`（两个重载）
-保留为 `NN_CHECK(try_create_tensor(...))` 转发——115 处调用点零改动即可编译，
+保留为 `NN_UNWRAP(try_create_tensor(...))` 转发——115 处调用点零改动即可编译，
 失败从"静默空张量"变成 fail-fast（分期迁移到 `try_*`）；④ 库内原先靠 `valid()` 兜底的
 4 处（`compute_layer_rapt::{make_dummy_,rms_norm_forward_,rms_norm_backward_}`、
 `detail::upload_span`、录制占位创建）改为 `NN_TRY` 直接上抛。
@@ -361,7 +361,7 @@ GPU 侧用 `static_cast<int>(P)` 拼精度签名/报错文本的地方补一致�
 **方案**：一次**只读**专项审计——列表（分配点 / 归还点 / 池重置点），核对"录制期引用"与"归还时机"是否满足**铁律 6**；
 产出结论（表格：点位 / 是否可能 use-after-free / 证据）写回本文；发现真缺陷则另立 RV 编号。
 
-**验收**：审计表格落进本文（或 `../history.md`）；结论明确（"闭环 / 有窗口 + 触发条件"）。
+**验收**：审计表格落进本文（或 `../history/history.md`）；结论明确（"闭环 / 有窗口 + 触发条件"）。
 
 ---
 
@@ -420,10 +420,10 @@ GPU 侧用 `static_cast<int>(P)` 拼精度签名/报错文本的地方补一致�
 
 ---
 
-## 5. 与 `18-roadmap.md` / `history.md` 的关系
+## 5. 与 `18-roadmap.md` / `history/history.md` 的关系
 
 - **立项的唯一入口仍是 [`18-roadmap.md`](18-roadmap.md)**（"下一步该做什么" + 做/条件触发/不做 的裁定）。
   本文是**它的执行细节来源**：整改某条时读本文对应 RV 卡，**不要**在 18 号里再抄一份（避免两处漂移）。
-- **完成一条**：把结论与验收证据（数字、hash、日志路径）归档到 [`../history.md`](../history.md)，
+- **完成一条**：把结论与验收证据（数字、hash、日志路径）归档到 [`../history/history.md`](../history/history.md)，
   并在本文把该 RV 状态改成 `Fixed`（带证据坐标）；`18-roadmap.md` 只在"是否仍然要做"改变时更新一行指针。
 - **仓库纪律**：任何一条的验收都走本文 §0 的通用基线；GPU 相关按 AGENTS §2 在提权环境跑。

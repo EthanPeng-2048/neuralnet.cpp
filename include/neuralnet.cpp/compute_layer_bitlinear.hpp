@@ -230,7 +230,7 @@ public:
                     // 默认打包缓冲形态；量化缓存作废（首次 forward 会重算）。
                     latent_w_ = engine_ref().create_tensor(
                         out_features_, in_features_, Precision::F32, InitSpec::zero());
-                    NN_CHECK(latent_w_.valid(), "BitLinear: latent 恢复失败");
+                    NN_UNWRAP(latent_w_.valid(), "BitLinear: latent 恢复失败");
                     packed_only_ = false;
                     use_packed_ = true;
                     ensure_quant_buffer_();
@@ -467,7 +467,7 @@ private:
                     out_features_, nn::trit_pack::words_per_row(in_features_),
                     Precision::F32, InitSpec::zero());
             // 终止式检查（本函数返回 void）
-            NN_CHECK(wq_packed_.valid(), "BitLinear: 打包量化缓冲初始化失败");
+            NN_UNWRAP(wq_packed_.valid(), "BitLinear: 打包量化缓冲初始化失败");
             wq_ = Tensor{};
         }
         else
@@ -475,7 +475,7 @@ private:
             if (!wq_.valid())
                 wq_ = engine.create_tensor(out_features_, in_features_, Precision::F16,
                                            InitSpec::zero());
-            NN_CHECK(wq_.valid(), "BitLinear: 量化缓冲初始化失败");
+            NN_UNWRAP(wq_.valid(), "BitLinear: 量化缓冲初始化失败");
             wq_packed_ = Tensor{};
         }
     }
@@ -494,7 +494,7 @@ private:
                                        InitSpec::zero());
         grad_b_ = engine.create_tensor(out_features_, 1, Precision::F32, InitSpec::zero());
         // 终止式检查（本函数返回 void，不能用 NN_FAIL 的 return 语义）
-        NN_CHECK(grad_w_.valid() && grad_b_.valid(),
+        NN_UNWRAP(grad_w_.valid() && grad_b_.valid(),
                  "BitLinear: 梯度缓冲（惰性）初始化失败");
     }
 

@@ -1,6 +1,6 @@
 # 踩坑警示录（Pitfalls & Lessons）
 
-> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history.md)。
+> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history/history.md)。
 
 > 本文档汇总项目开发至今踩过的所有坑，按严重度分级，提炼跨领域的根因模式，并提供开发活动的防坑清单。**每次踩新坑，先补充到本文档，再修复代码。**
 
@@ -93,7 +93,7 @@
 
 ### 3.5 CUDA obj 不随 Debug/Release 重编：链接失败
 
-> 本条为历史记录（CUDA 后端已整体移除，该坑不可触发），见 `docs/history.md`。
+> 本条为历史记录（CUDA 后端已整体移除，该坑不可触发），见 `docs/history/history.md`。
 
 ### 3.6 除零/越界防护缺失
 
@@ -395,5 +395,5 @@ GPU-resident 单算子对、链式错；attn batch=1 对、batch=2 错；gradche
 - `10-development-standards.md`（同目录）— 分层职责规范（"每层只能负责每层的事"）
 - `../introduction/01-architecture.md` — 架构分层
 - `06-rapt-algorithm.md` — 线性注意力家族（RLA / RAPT / RLA-2）的设计与工程约束
-  （原 `07-zipt-algorithm.md` 已随 AttnZip 移除，见 `docs/history.md`）
+  （原 `07-zipt-algorithm.md` 已随 AttnZip 移除，见 `docs/history/history.md`）
 - `../usage/04-train-package.md` — 训练包格式
