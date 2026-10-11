@@ -213,7 +213,11 @@ namespace nn
         const ExprInstr& ins = spec.instrs[idx];
         const ExprOp op = static_cast<ExprOp>(ins.op);
         const std::size_t dst = ins.dst;
-        const bool is_output = (idx + 1 == spec.instrs.size());
+        bool is_output = (idx + 1 == spec.instrs.size());
+        // P2 多输出（extras）：额外输出的定义指令同输出指令处理（只重映射
+        // 操作数，不折叠 / 不 alias）——值必须落在真实寄存器供输出存储。
+        for (const auto e : spec.extras)
+            if (e == ins.dst) { is_output = true; break; }
 
         // 只重映射实际使用的操作数（未使用的 b/c 是默认哨兵 {0,0}，
         // 不得当 Reg(0) 重编号——见 docs/development/03-ir-optimization.md 关键坑 ②）
@@ -285,6 +289,7 @@ namespace nn
     }
 
     out.num_regs = spec.num_regs;
+    out.extras = spec.extras;   // P2 多输出：跨 pass 原样透传（寄存器号未变）
     return out;
 }
 
@@ -302,6 +307,8 @@ namespace nn
     std::vector<std::uint8_t> live_reg(spec.num_regs, 0);
     std::vector<std::uint8_t> live_instr(n, 0);
     live_reg[spec.instrs.back().dst] = 1;  // 输出必存活
+    for (const auto e : spec.extras)       // P2 多输出：extras 定义亦须存活
+        if (e < spec.num_regs) live_reg[e] = 1;
 
     for (std::size_t i = n; i-- > 0;)
     {
@@ -330,6 +337,7 @@ namespace nn
     out.rparams = spec.rparams;  // RParam 值序列：非结构、跨 pass 原样透传
     out.num_regs = spec.num_regs;
     out.matmul  = spec.matmul;
+    out.extras  = spec.extras;   // P2 多输出：跨 pass 原样透传（寄存器号未变）
     out.instrs.reserve(n);
     for (std::size_t i = 0; i < n; ++i)
         if (live_instr[i])
@@ -403,6 +411,11 @@ namespace nn
         if (nops >= 3) ni.c = remap(in.c);
         out.instrs.push_back(ni);
     }
+    // P2 多输出：extras 随新寄存器号重映射
+    out.extras.reserve(spec.extras.size());
+    for (const auto e : spec.extras)
+        out.extras.push_back((e < spec.num_regs && new_reg[e] >= 0)
+            ? static_cast<std::uint8_t>(new_reg[e]) : e);
     out.num_regs = next;
     return out;
 }
@@ -474,6 +487,11 @@ namespace nn
         ExprInstr ni; ni.op = in.op; ni.dst = nd; ni.a = a; ni.b = b; ni.c = c;
         out.instrs.push_back(ni);
     }
+    // P2 多输出：extras 随 CSE 复用映射重指向（同一值合并后指向规范 dst）
+    out.extras.reserve(spec.extras.size());
+    for (const auto e : spec.extras)
+        out.extras.push_back((e < spec.num_regs && dst_map[e] >= 0)
+            ? static_cast<std::uint8_t>(dst_map[e]) : e);
     out.num_regs = next;
     return out;
 }
@@ -522,6 +540,10 @@ namespace nn
         }
     }
     last_use[n - 1] = static_cast<int>(n - 1);  // 输出寄存器保护
+    // P2 多输出：extras 的定义值同样存活到 kernel 末（防被 liveness 复用）
+    for (const auto e : spec.extras)
+        if (e < spec.num_regs && def_at[e] >= 0)
+            last_use[def_at[e]] = static_cast<int>(n - 1);
 
     // 分配（确定性贪心；逐元素 liveness 复用，归约独立区段）
     std::vector<int> reg_of(n, -1);
@@ -564,6 +586,11 @@ namespace nn
     out.consts = spec.consts;
     out.rparams = spec.rparams;  // RParam 值序列：跨 pass 原样透传
     out.matmul = spec.matmul;
+    // P2 多输出：extras 随分配结果重映射（reg_of[定义指令]）
+    out.extras.reserve(spec.extras.size());
+    for (const auto e : spec.extras)
+        out.extras.push_back((e < spec.num_regs && def_at[e] >= 0)
+            ? static_cast<std::uint8_t>(reg_of[def_at[e]]) : e);
     out.instrs.reserve(n);
     for (std::size_t i = 0; i < n; ++i)
     {

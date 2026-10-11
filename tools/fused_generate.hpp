@@ -79,7 +79,7 @@ namespace
 }
 
 // ExprSpec → 生成头里的聚合初始化
-// （ExprSpec{ instrs, views, consts, rparams, num_regs, matmul, fold }——
+// （ExprSpec{ instrs, views, consts, rparams, num_regs, matmul, fold, extras }——
 //   字段必须与 ExprSpec 声明序逐一对应，否则 -Wmissing-field-initializers）
 [[nodiscard]] std::string emit_spec(const nn::ExprSpec& spec)
 {
@@ -175,6 +175,16 @@ namespace
         }
         // FoldSpec 声明序末位 = tri_skip（聚合初始化 positional，字段加结构尾）
         o << "} , " << (f.tri_skip ? "true" : "false") << " }";
+    }
+    o << "}";
+    // P2 多输出（extras）：ExprSpec 聚合第 8 字段——漏发则 registry spec 丢
+    // extras → 管线布局少输出绑定 → 多输出 shader 绑定错位、结果静默错值
+    o << ", std::vector<std::uint8_t>{";
+    for (std::size_t i = 0; i < spec.extras.size(); ++i)
+    {
+        if (i) o << ",";
+        o << " static_cast<std::uint8_t>("
+          << static_cast<unsigned>(spec.extras[i]) << ")";
     }
     o << "} }";
     return o.str();
@@ -365,6 +375,8 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
     H << "//    · key            V0 全 f32\n";
     H << "//    · key#x          V1 运行期精度分派（PC `prec`，覆盖任意签名）\n";
     H << "//    · key#a          V2 native16 原生 f16 算术（结构谓词判定）\n";
+    H << "//    · key#b          P3 批量派发（实例表 + buffer device address，"
+         "仅纯逐元素 V0）\n";
     H << "//  运行时按 key 精确匹配 dispatch（闭合世界）。\n";
     H << "// ═══════════════════════════════════════════════════════════════\n";
     H << "#ifndef NN_FUSED_REGISTRY_HPP\n#define NN_FUSED_REGISTRY_HPP\n";
@@ -498,8 +510,17 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
                 return false;   // 结构谓词通过但发射器不支持该形态 → 静默跳过
                                 //（V0/V1 仍覆盖，只是拿不到原生 f16 算术）
             // 分派变体（key#x）是唯一的签名无关 shader：发不出来 = 该结构
-            // 没有 f16 路径 → 必须可见。
-            std::fprintf(stderr, "[skip] 分派变体 %s 的形态暂不支持生成\n", vkey.c_str());
+            // 没有 f16 路径 → 必须可见。**两类成因分开打**（否则"设计内跳过"
+            // 被误读成"形态缺失报错"——2026-10-06 勘误）：多输出（extras）
+            // 结构按设计仅 V0（expr_glsl_gen P2 写穿约束），混精度走
+            // execute_fused_graph 的逐成员降级；其余才是真形态缺口。
+            if (!spec.extras.empty())
+                std::fprintf(stderr,
+                             "[skip] 多输出(extras) 结构 %s 按设计不生成 #x/#a 变体"
+                             "（仅 V0；混精度走逐成员降级）\n", vkey.c_str());
+            else
+                std::fprintf(stderr, "[skip] 分派变体 %s 的形态暂不支持生成\n",
+                             vkey.c_str());
             return false;
         }
         // 只登记任务：glslc 统一在 run_gen_jobs 里并行执行。
@@ -523,6 +544,52 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
         emit_one(spec, nn::expr_prec_sig_make(nn::EXPR_PREC_SIG_INPUT_MASK,
                                               /*out_f16=*/true),
                  /*alu=*/true);
+    }
+
+    // ── P3 跨链批量派发变体（键 = key#b）──────────────────────────────────
+    //
+    // 资格与运行期分组同源（expr_spec_batchable）：纯逐元素（无归约/fold/
+    // matmul），**含 P2 多输出 extras 复合结构**（optimizer 主力）；只发 V0
+    // 全 f32（f16/混精度走既有逐 kernel 路径）。变体行元数据：reduce_axis=-1、
+    // has_matmul=0、vec_width=1（批量恒标量，与生成器同源）、vp/rparam 槽位数
+    // 与结构一致、prec_sig=0。`#b` 未登记或设备无 buffer device address 时
+    // 运行期逐 kernel 降级（闭合世界降级，不是错误）。
+    struct BatchedEmit
+    {
+        const nn::ExprSpec* spec;
+        std::string vkey;     // "key#b"（注册表键）
+        std::string suffix;   // "key_b"（标识符与文件名，不含 '#'）
+    };
+    std::vector<BatchedEmit> emitted_batched;
+    std::unordered_set<std::string> emitted_bkeys;
+    for (const auto& spec : reg.specs)
+    {
+        if (!is_fusable(spec) || !nn::expr_spec_batchable(spec))
+            continue;
+        const std::string key = nn::expr_spec_key(spec);
+        const std::string vkey = key + nn::EXPR_BATCH_SUFFIX;
+        const std::string suffix = key + "_b";
+        if (!emitted_bkeys.insert(vkey).second)
+            continue;   // 同 vkey 幂等（重复会生成重复 kSpirv_ 标识符）
+        auto emitter = nn::emitter_registry::make("glsl");
+        if (!emitter)
+        {
+            std::fprintf(stderr, "[FAIL] 无法创建 GLSL emitter（IR-D 注册表异常）\n");
+            return false;
+        }
+        const std::string glsl = emitter->generate_batched("fused_" + suffix, spec);
+        if (glsl.empty())
+        {
+            // 资格判据与生成器同一函数 → 正常不可达；保底可见（不静默）。
+            std::fprintf(stderr, "[skip] 批量变体 %s 的形态暂不支持生成\n",
+                         vkey.c_str());
+            continue;
+        }
+        jobs.push_back(GenJob{suffix, vkey,
+                              out_dir + "/fused_" + suffix + ".comp",
+                              out_dir + "/fused_" + suffix + ".spv",
+                              glsl, {}, false});
+        emitted_batched.push_back(BatchedEmit{&spec, vkey, suffix});
     }
 
     // ── 并行 glslc：GLSL 已全部产出，这里一次性并发编译 ────────────────────
@@ -574,6 +641,19 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
           << fused_vec_width_for(spec, ve.alu)
           << ", " << ve.sig << "u },\n";
     }
+    // P3 批量变体行（键 = key#b）：元数据 = 逐元素形态（reduce_axis=-1、
+    // has_matmul=0）+ vec_width=1（批量恒标量）+ vp/rparam 槽位数与结构一致。
+    for (const auto& be : emitted_batched)
+    {
+        const nn::ExprSpec& spec = *be.spec;
+        H << "    { \"" << be.vkey << "\",\n        " << emit_spec(spec) << ",\n"
+          << "        kSpirv_" << be.suffix
+          << ", sizeof(kSpirv_" << be.suffix << ")/sizeof(std::uint32_t), "
+          << "-1, 0, "
+          << nn::expr_spec_runtime_view_param_count(spec) << ", "
+          << nn::expr_spec_runtime_param_count(spec) << ", "
+          << "1u, 0u },\n";
+    }
     H << "};\n";
     H << "inline constexpr std::size_t kFusedShaderCount =\n"
       << "    sizeof(kFusedShaders) / sizeof(kFusedShaders[0]);\n";
@@ -596,8 +676,9 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
         std::fprintf(stderr, "[FAIL] 无法写入 %s\n", reg_path.c_str());
         return false;
     }
-    std::printf("[gen] %zu 条融合表达式 + %zu 条精度变体 -> %s%s\n",
-                reg.specs.size(), emitted_variants.size(), reg_path.c_str(),
+    std::printf("[gen] %zu 条融合表达式 + %zu 条精度变体 + %zu 条批量变体 -> %s%s\n",
+                reg.specs.size(), emitted_variants.size(), emitted_batched.size(),
+                reg_path.c_str(),
                 reg_changed ? "" : "（内容未变化，保持 mtime）");
     return true;
 }

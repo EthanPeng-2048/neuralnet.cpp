@@ -305,21 +305,74 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
         }
     }
 
-    // ── IR 组合：loss_vec / grad（RowGather + Row 操作数）──
-    //   loss_vec = (rg(logits) - cb(col_max) - log(denom)) * cb(mask)  （(1,N)）
-    //   grad     = (exp(logits-cb(col_max))/cb(denom)
-    //               - select(Row==cb(labels),1,0)) * cb(mask) * rp(inv)  （(C,N)）
+    // ── IR 组合：loss_sum / grad（RowGather + Row 操作数，与 compute_loss.hpp
+    //    现行链**同构**——结构一致 → 命中同一 AOT 融合 shader）──────────────
+    //   lse      = fold logsumexp(logits)（online 双状态单趟，trans(N) 转置直读）
+    //   loss_sum = row_reduce_sum((rg(logits) - cb(lse)) * cb(mask))   （(1,1)）
+    //   grad     = (exp(logits-cb(lse)) - select(Row==cb(labels),1,0))
+    //              * cb(mask) * rp(inv)                                 （(C,N)）
     // 注：inv_num_valid 由 RParam 承载（运行时标量，不进 expr_spec_key）→ 与
-    //     整条逐元素链融合为单 kernel。
+    //     整条逐元素链融合为单 kernel。loss_vec 不再物化（与归约融合为单 kernel），
+    //     对拍口径 = Σ lv_ref。
     {
         nn::Matrix labels_m(1, N);
         for (std::size_t i = 0; i < N; ++i)
             labels_m.set_value_unchecked(0, i, static_cast<Scalar>(labels[i]));
         const nn::Tensor t_labels = upload(eng, labels_m);
 
-        // 无 mask
+        const auto case_run = [&](const nn::Tensor& t_lab, const nn::Tensor& t_msk,
+                                  const nn::Matrix& g_ref, const nn::Matrix& lv_ref,
+                                  const char* nm_base)
         {
             char nm[128];
+            // lse = fold logsumexp（与 compute_loss.hpp 同源构造 → 同 key）
+            auto lse_r = eng.eval_expr(
+                nn::expr::make_fold_logsumexp(C, nn::expr::trans(N)),
+                std::span<const nn::Tensor>{&t_logits, 1}, N, 1);
+            if (!lse_r)
+            {
+                std::printf("[FAIL] %s lse fold: %s\n", nm_base,
+                            lse_r.error().message.c_str());
+                ++fail;
+                return;
+            }
+            auto lse_rs = eng.reshape(*lse_r, 1, N);
+            if (!lse_rs)
+            {
+                std::printf("[FAIL] %s lse reshape: %s\n", nm_base,
+                            lse_rs.error().message.c_str());
+                ++fail;
+                return;
+            }
+            // loss_sum = Σ_c (rg(logits) − lse)·mask（与 CE 同构链）
+            auto lv = nn::dsl::compute_reduce(eng,
+                nn::dsl::row_reduce_sum(
+                    (nn::dsl::row_gather(t_logits, t_lab) -
+                     nn::dsl::col_broadcast(*lse_rs))
+                        * nn::dsl::col_broadcast(t_msk)),
+                1, N);
+            nn::Matrix lv_sum(1, 1);
+            {
+                Scalar s = 0;
+                for (const Scalar v : lv_ref.span()) s += v;
+                lv_sum.set_value_unchecked(0, 0, s);
+            }
+            std::snprintf(nm, sizeof(nm), "%s IR loss_sum %s", tag, nm_base);
+            check(nm, std::move(lv), lv_sum);
+            // grad（与 CE 同构链）
+            auto g = nn::dsl::compute(eng,
+                (nn::dsl::exp(nn::dsl::leaf(t_logits) - nn::dsl::col_broadcast(*lse_rs))
+                    - nn::dsl::select(nn::dsl::row() == nn::dsl::col_broadcast(t_lab),
+                                      Scalar{1}, Scalar{0}))
+                * nn::dsl::col_broadcast(t_msk)
+                * nn::dsl::rparam(inv_num_valid),
+                C, N);
+            std::snprintf(nm, sizeof(nm), "%s IR grad %s", tag, nm_base);
+            check(nm, std::move(g), g_ref);
+        };
+
+        // 无 mask
+        {
             nn::Matrix lv_ref;
             const nn::Matrix g_ref = ref_sparse_forward(
                 logits, labels, nullptr, vocab_size, inv_num_valid, lv_ref);
@@ -329,34 +382,10 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
                 mask_m.set_value_unchecked(0, i,
                     labels[i] < vocab_size ? Scalar{1} : Scalar{0});
             const nn::Tensor t_mask = upload(eng, mask_m);
-            auto denom = nn::dsl::compute_reduce(eng,
-                nn::dsl::col_reduce_sum(nn::dsl::exp(
-                    nn::dsl::leaf(t_logits) - nn::dsl::col_broadcast(t_colmax))),
-                C, N);
-            if (!denom) { std::printf("[FAIL] %s denom: %s\n", tag, denom.error().message.c_str()); ++fail; }
-            else
-            {
-                auto lv = nn::dsl::compute(eng,
-                    (nn::dsl::row_gather(t_logits, t_labels) - nn::dsl::col_broadcast(t_colmax)
-                     - nn::dsl::log(nn::dsl::leaf(*denom))) * nn::dsl::col_broadcast(t_mask),
-                    1, N);
-                std::snprintf(nm, sizeof(nm), "%s IR loss_vec (no mask)", tag);
-                check(nm, std::move(lv), lv_ref);
-                auto g = nn::dsl::compute(eng,
-                    (nn::dsl::exp(nn::dsl::leaf(t_logits) - nn::dsl::col_broadcast(t_colmax))
-                        / nn::dsl::col_broadcast(*denom)
-                     - nn::dsl::select(nn::dsl::row() == nn::dsl::col_broadcast(t_labels),
-                                       Scalar{1}, Scalar{0}))
-                    * nn::dsl::col_broadcast(t_mask)
-                    * nn::dsl::rparam(inv_num_valid),
-                    C, N);
-                std::snprintf(nm, sizeof(nm), "%s IR grad (no mask)", tag);
-                check(nm, std::move(g), g_ref);
-            }
+            case_run(t_labels, t_mask, g_ref, lv_ref, "(no mask)");
         }
         // 有 mask
         {
-            char nm[128];
             nn::Matrix mask_m(1, N);
             for (std::size_t i = 0; i < N; ++i)
                 mask_m.set_value_unchecked(0, i,
@@ -366,34 +395,10 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
             nn::Matrix lv_ref;
             const nn::Matrix g_ref = ref_sparse_forward(
                 logits, labels, &loss_mask, vocab_size, inv_num_valid, lv_ref);
-            auto denom = nn::dsl::compute_reduce(eng,
-                nn::dsl::col_reduce_sum(nn::dsl::exp(
-                    nn::dsl::leaf(t_logits) - nn::dsl::col_broadcast(t_colmax))),
-                C, N);
-            if (!denom) { std::printf("[FAIL] %s denom: %s\n", tag, denom.error().message.c_str()); ++fail; }
-            else
-            {
-                auto lv = nn::dsl::compute(eng,
-                    (nn::dsl::row_gather(t_logits, t_labels) - nn::dsl::col_broadcast(t_colmax)
-                     - nn::dsl::log(nn::dsl::leaf(*denom))) * nn::dsl::col_broadcast(t_mask),
-                    1, N);
-                std::snprintf(nm, sizeof(nm), "%s IR loss_vec (mask)", tag);
-                check(nm, std::move(lv), lv_ref);
-                auto g = nn::dsl::compute(eng,
-                    (nn::dsl::exp(nn::dsl::leaf(t_logits) - nn::dsl::col_broadcast(t_colmax))
-                        / nn::dsl::col_broadcast(*denom)
-                     - nn::dsl::select(nn::dsl::row() == nn::dsl::col_broadcast(t_labels),
-                                       Scalar{1}, Scalar{0}))
-                    * nn::dsl::col_broadcast(t_mask)
-                    * nn::dsl::rparam(inv_num_valid),
-                    C, N);
-                std::snprintf(nm, sizeof(nm), "%s IR grad (mask)", tag);
-                check(nm, std::move(g), g_ref);
-            }
+            case_run(t_labels, t_mask, g_ref, lv_ref, "(mask)");
         }
-        // 全越界（num_valid=0）：mask 修正为 0 → grad 全 0、loss_vec 0
+        // 全越界（num_valid=0）：mask 修正为 0 → grad 全 0、loss_sum 0
         {
-            char nm[128];
             std::vector<std::size_t> bad(N, 99);
             nn::Matrix bad_m(1, N);
             for (std::size_t i = 0; i < N; ++i)
@@ -407,30 +412,7 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
             for (std::size_t i = 0; i < N; ++i)
                 mask_m.set_value_unchecked(0, i, Scalar{0});
             const nn::Tensor t_mask = upload(eng, mask_m);
-            auto denom = nn::dsl::compute_reduce(eng,
-                nn::dsl::col_reduce_sum(nn::dsl::exp(
-                    nn::dsl::leaf(t_logits) - nn::dsl::col_broadcast(t_colmax))),
-                C, N);
-            if (!denom) { std::printf("[FAIL] %s denom: %s\n", tag, denom.error().message.c_str()); ++fail; }
-            else
-            {
-                auto lv = nn::dsl::compute(eng,
-                    (nn::dsl::row_gather(t_logits, t_bad) - nn::dsl::col_broadcast(t_colmax)
-                     - nn::dsl::log(nn::dsl::leaf(*denom))) * nn::dsl::col_broadcast(t_mask),
-                    1, N);
-                std::snprintf(nm, sizeof(nm), "%s IR loss_vec (all invalid)", tag);
-                check(nm, std::move(lv), lv_ref);
-                auto g = nn::dsl::compute(eng,
-                    (nn::dsl::exp(nn::dsl::leaf(t_logits) - nn::dsl::col_broadcast(t_colmax))
-                        / nn::dsl::col_broadcast(*denom)
-                     - nn::dsl::select(nn::dsl::row() == nn::dsl::col_broadcast(t_bad),
-                                       Scalar{1}, Scalar{0}))
-                    * nn::dsl::col_broadcast(t_mask)
-                    * nn::dsl::rparam(inv_num_valid),
-                    C, N);
-                std::snprintf(nm, sizeof(nm), "%s IR grad (all invalid)", tag);
-                check(nm, std::move(g), g_ref);
-            }
+            case_run(t_bad, t_mask, g_ref, lv_ref, "(all invalid)");
         }
     }
 
@@ -481,6 +463,93 @@ int run_case(nn::ComputeEngine& eng, const char* tag)
     return fail;
 }
 
+// ── P4 新旧 CE 逐用例对拍（online-softmax fold vs 旧 max→denom 数学）──────
+// 旧数学 = ref_sparse_forward（exp(x−m)/denom 与 x−m−log(denom)——与 P4 前
+//   融合实现逐式一致的手写标量参考）；新 = forward_sparse（fold lse = m+log l
+//   单趟 + exp(x−s) 归一化形态）。数学等价、浮点结合序不同（online rescale
+//   逐块换底）→ 逐用例容差对拍锁语义不漂移（用户裁定的重验收口径）。
+// 覆盖：单块（K<128）/块边界（K=129）/跨块（K=300/1000/4096）/大幅值应力。
+int run_old_new_parity(nn::ComputeEngine& eng, const char* tag)
+{
+    int fail = 0;
+    struct Case { std::size_t C, N; Scalar scale; };
+    const Case cases[] = {
+        {8, 12, 1.5f}, {129, 2, 2.0f}, {300, 17, 2.0f}, {257, 64, 2.0f},
+        {1000, 7, 2.0f}, {3, 100, 2.0f}, {4096, 16, 2.0f},
+        {256, 64, 40.0f},   // 大幅值应力（数值稳定路径）
+    };
+    constexpr Scalar tol = 1e-6f;
+    std::mt19937 rng(20261006);
+    for (const auto& cs : cases)
+    {
+        const std::size_t C = cs.C, N = cs.N;
+        nn::Matrix logits(C, N);
+        std::uniform_real_distribution<Scalar> dist(-cs.scale, cs.scale);
+        for (auto& x : logits.span()) x = dist(rng);
+        std::vector<std::size_t> labels(N);
+        for (std::size_t i = 0; i < N; ++i)
+            labels[i] = static_cast<std::size_t>(rng() % (C + 3));  // 少量越界
+        std::vector<Scalar> mask(N);
+        for (std::size_t i = 0; i < N; ++i)
+            mask[i] = (rng() % 7 == 0) ? Scalar{0} : Scalar{1};
+        std::size_t nv = 0;
+        for (std::size_t i = 0; i < N; ++i)
+            if (mask[i] >= Scalar{0.5} && labels[i] < C) ++nv;
+        const Scalar inv = nv ? Scalar{1} / static_cast<Scalar>(nv) : Scalar{0};
+
+        // 旧数学参考（grad 为 exp(x−m)/denom 形态、lv 为 x−m−log(denom)）
+        nn::Matrix lv_ref;
+        const nn::Matrix g_ref =
+            ref_sparse_forward(logits, labels, &mask, C, inv, lv_ref);
+        Scalar ref_loss = 0;
+        for (const Scalar v : lv_ref.span()) ref_loss -= v;
+        if (nv) ref_loss *= inv;
+
+        // 新实现（P4：fold lse + exp(x−s)）
+        auto t_r = eng.from_matrix(logits);
+        if (!t_r)
+        {
+            std::printf("[FAIL] %s parity(%zu,%zu): from_matrix: %s\n", tag, C, N,
+                        t_r.error().message.c_str());
+            ++fail;
+            continue;
+        }
+        nn::CrossEntropyLoss ce;
+        auto loss_r = ce.forward_sparse(eng, *t_r, labels, mask, C);
+        if (!loss_r)
+        {
+            std::printf("[FAIL] %s parity(%zu,%zu): forward_sparse: %s\n", tag, C, N,
+                        loss_r.error().message.c_str());
+            ++fail;
+            continue;
+        }
+        auto g_r = ce.backward();
+        auto g_m = eng.to_matrix(*g_r);
+        if (!g_m)
+        {
+            std::printf("[FAIL] %s parity(%zu,%zu): backward 下载: %s\n", tag, C, N,
+                        g_m.error().message.c_str());
+            ++fail;
+            continue;
+        }
+        Scalar loss_err = std::fabs(*loss_r - ref_loss);
+        bool ok = loss_err <= tol * (Scalar{1} + std::fabs(ref_loss));
+        Scalar grad_err = 0;
+        for (std::size_t i = 0; i < g_ref.span().size(); ++i)
+        {
+            const Scalar e = std::fabs(g_m->span()[i] - g_ref.span()[i]);
+            const Scalar bound = tol * (Scalar{1} + std::fabs(g_ref.span()[i]));
+            if (e > bound) ok = false;
+            if (e > grad_err) grad_err = e;
+        }
+        std::printf("[%s] parity(%zu,%zu,x%g) loss_err=%.3e grad_err=%.3e\n",
+                    ok ? "PASS" : "FAIL", C, N, static_cast<double>(cs.scale),
+                    loss_err, grad_err);
+        if (!ok) ++fail;
+    }
+    return fail;
+}
+
 int main()
 {
     std::cout << "========================================\n"
@@ -489,6 +558,8 @@ int main()
 
     nn::CpuEngine cpu_engine;
     int fail = run_case(cpu_engine, "CPU");
+    std::cout << "\n── 新旧 CE 逐用例对拍（online-softmax fold vs 旧数学，容差 1e-6） ──\n";
+    fail += run_old_new_parity(cpu_engine, "CPU");
 
 #ifndef NN_HAS_VULKAN
     std::cout << "[SKIP] 无 Vulkan，跳过 GPU 部分\n";
@@ -498,6 +569,7 @@ int main()
     NN_EXIT(init_r, 1, "GPU 初始化失败: ");
     nn::GpuEngine gpu_engine(backend);
     fail += run_case(gpu_engine, "GPU");
+    fail += run_old_new_parity(gpu_engine, "GPU");
 
     // ── 异步标量回读（submit/poll）与同步下载必须逐值一致 ─────────
     // 同一组 logits 反复求 loss，按训练热循环的真实调用序：
