@@ -49,7 +49,7 @@ BUILD_DIR = PROJECT_DIR / "build"
 
 # ---------- 枚举选项 ----------
 ARCH_OPTIONS = ["mlp", "transformer", "cnn"]
-OPTIMIZER_OPTIONS = ["sgd", "sgd_momentum", "adam", "adamw", "muon"]
+OPTIMIZER_OPTIONS = ["sgd", "sgd_momentum", "adam", "adamw", "adamwquant", "muon"]
 # 后端仅 CPU / Vulkan，**本项目不支持 CUDA**（AGENTS §2）→ 不提供 CUDA 选项
 ENGINE_OPTIONS = ["CPU", "GPU (Vulkan)"]
 LR_SCHEDULE_OPTIONS = ["fixed", "cosine"]
