@@ -148,6 +148,11 @@ private:
     // 启用时中等分配按"最小 2 的幂类别"分池，见 allocate()。
     VkDeviceSize ladder_max_ = 0;
 
+    // P3（buffer device address）：块分配挂 VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+    // ——由后端按设备能力（VulkanDevice::bda_available）在建池后设置；未启用时
+    // 全池分配不挂该标志（VUID：特性未启用不得声明）。
+    bool device_address_alloc_ = false;
+
     // 使用 unique_ptr 避免 vector 扩容/删除时触发 Block 的移动和析构
     std::vector<std::unique_ptr<Block>> blocks_;
     std::unordered_map<SuballocKey, VkDeviceSize, SuballocKeyHash> active_allocs_;
@@ -229,6 +234,14 @@ private:
         alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         alloc_info.allocationSize = alloc_size;
         alloc_info.memoryTypeIndex = memory_type_index;
+        // P3（buffer device address）：块内子分配的 buffer 也要可取设备地址
+        // （实例表按 64 位地址解引用），故**分配侧**统一挂 DEVICE_ADDRESS 标志
+        // （VUID：usage 含 SHADER_DEVICE_ADDRESS 的 buffer 其内存必须如此分配）。
+        VkMemoryAllocateFlagsInfo addr_flags{};
+        addr_flags.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+        addr_flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        if (device_address_alloc_)
+            alloc_info.pNext = &addr_flags;
 
         VkDeviceMemory memory = VK_NULL_HANDLE;
         const auto t0 = std::chrono::steady_clock::now();
@@ -438,6 +451,14 @@ public:
         return has_device_local;  // 全部 device-local 均可 host 映射 → UMA
     }
 
+    // ── P3：块分配的 buffer device address 标志 ─────────────────────────
+    // 由后端在建池后按 VulkanDevice::bda_available() 设置（须在首次 allocate
+    // 之前）；读取端用于 buffer 创建侧配对 SHADER_DEVICE_ADDRESS usage 位
+    // （usage 与 alloc 标志必须成对，见 create_block）。
+    void set_device_address_alloc(bool on) noexcept { device_address_alloc_ = on; }
+    [[nodiscard]] bool device_address_alloc() const noexcept
+    { return device_address_alloc_; }
+
     // ── 池统计（L2 仪器化，供显存采样/逐项归因） ──────────────────────
     struct PoolStats
     {
@@ -544,7 +565,31 @@ public:
     void release_idle_blocks()
     {
         std::lock_guard lock(mutex_);
-        // 当前总空闲（用于保留阈值判断）
+
+        // 默认 retain_free_bytes_=0：不需要先统计 total_free，因为所有
+        // 完全空闲 block 都应归还。旧实现先遍历所有 free_regions 计算总量，
+        // 再遍历 blocks_ 释放，训练每 step 会为同一批 block 扫两遍。
+        // 单次释放扫描保持完全相同的安全条件，并避免额外 set 遍历。
+        if (retain_free_bytes_ == 0)
+        {
+            for (auto it = blocks_.begin(); it != blocks_.end(); )
+            {
+                const auto& b = **it;
+                if (b.allocation_count == 0 &&
+                    b.free_regions.size() == 1 &&
+                    b.free_regions.begin()->offset == 0 &&
+                    b.free_regions.begin()->size == b.size)
+                {
+                    it = blocks_.erase(it);
+                    c_blocks_released_++;
+                    continue;
+                }
+                ++it;
+            }
+            return;
+        }
+
+        // 非零保留阈值仍需精确维护 total_free，避免释放后低于配置目标。
         VkDeviceSize total_free = 0;
         for (const auto& bp : blocks_)
             for (const auto& r : bp->free_regions)

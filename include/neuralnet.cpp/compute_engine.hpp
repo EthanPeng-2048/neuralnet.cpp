@@ -56,8 +56,10 @@
 
 #include "core_config.hpp"
 #include "core_errors.hpp"
+#include "core_profile.hpp"   // 训练 step 剖析（NN_PROFILE=1 门控；默认零开销）
 #include "compute_tensor.hpp"
 #include "expr_opt.hpp"   // canonicalize_expr_spec（trace 归因用，与 gen_fused 同源 key）
+#include "expr_graph.hpp" // IR-C 录制图（begin_expr/end_expr 图融合，2026-10-06 恢复）
 #include "expr_spec.hpp"
 
 namespace nn
@@ -241,6 +243,21 @@ public:
     [[nodiscard]] virtual Result<void> begin_batch() = 0;
     [[nodiscard]] virtual Result<void> end_batch() = 0;
 
+    // ── 表达式录制（IR-C 图融合；2026-10-06 恢复，见 docs/history.md
+    //    「IR-C 定位修正与恢复立项」）──────────────────────────────────────
+    // begin_expr 进入录制；期间 eval_expr/eval_expr_reduce 把节点加入录制图
+    // （expr_graph.hpp）并返回携带 virtual_tag 的占位 Tensor；end_expr 融合
+    // 分析（fuse_expr_graph：纯逐元素单消费者链拼接 + S5 matmul 前置段），
+    // 复合 kernel 直接写回各 tail 占位存储（中间量内联为寄存器）。
+    //   · CPU 引擎：普通运行 no-op（表达式照常逐个求值）；NN_EXPR_SCAN 构建期
+    //     开启录制并在 end_expr 登记复合 spec（闭合世界两端一致）。
+    //   · GPU 引擎：录制 + 融合执行；复合 spec 未命中 AOT shader 硬报错。
+    // 契约（P1）：录制段内中间量**不得逃逸**（不落 backward 缓存 / 状态张量、
+    // 段外不读中间值）；段内表达式一律经开启录制的引擎求值（跨引擎 fail-fast）。
+    // P2「写穿物化/多输出」将解除逃逸限制。
+    [[nodiscard]] virtual Result<void> begin_expr() = 0;
+    [[nodiscard]] virtual Result<void> end_expr() = 0;
+
     // ── 批处理中点刷新（防 TDR）────────────────────────────────────────────
     // GPU 引擎：提交当前 command buffer 并等待完成，然后自动开始新的录制。
     // 可在 forward 与 backward 之间调用，将一次大提交拆分为多次小提交，
@@ -282,6 +299,7 @@ public:
     // 独立 128MB 块导致的碎片膨胀）。CPU 引擎 no-op（开启只会得到 1×1 张量）。
     [[nodiscard]] Result<Tensor> create_offload_buffer(std::size_t bytes)
     {
+        NN_PROF_OP("create_offload_buffer");
         return stamp_(create_offload_buffer_impl(bytes));
     }
     // 把 src 复制到 buffer 的 offset（float 单位）处
@@ -291,6 +309,7 @@ public:
     [[nodiscard]] Result<void> offload_save(
         const Tensor& buffer, std::size_t offset, const Tensor& src)
     {
+        NN_PROF_OP("offload_save");
         NN_TRY(ec, bind_check_({&buffer, &src}));
         auto s = to_f32(src);
         NN_TRY_CHECK(s);
@@ -301,6 +320,7 @@ public:
         const Tensor& buffer, std::size_t offset,
         std::size_t rows, std::size_t cols)
     {
+        NN_PROF_OP("offload_restore");
         return stamp_(offload_restore_impl(buffer, offset, rows, cols));
     }
 
@@ -318,6 +338,7 @@ public:
     // scalar_readback_slots()：可用槽位数（调用方据此做环形复用）。
     [[nodiscard]] Result<void> submit_scalar_readback(std::size_t slot, const Tensor& t)
     {
+        NN_PROF_OP("submit_scalar_readback");
         NN_TRY(ec, bind_check_({&t}));
         auto s = to_f32(t);
         NN_TRY_CHECK(s);
@@ -327,6 +348,7 @@ public:
     [[nodiscard]] virtual Result<bool> poll_scalar_readback(
         std::size_t slot, Scalar& out)
     {
+        NN_PROF_OP("poll_scalar_readback");
         if (slot >= sync_readback_slots_.size())
             return false;
         out = sync_readback_slots_[slot];
@@ -342,6 +364,7 @@ public:
     // 每个 override 各自漏 stamp。to_matrix 输出 Matrix（宿主），不参与 stamp。
     [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols, Precision P = Precision::F32)
     {
+        NN_PROF_OP("create_tensor");
         // 非"存储精度"（BF16/F64 保留值、T1_58 三值声明）**拒绝建张量**：
         // 这是 docs 21 §4.1 的落地保证——P1 里 T1_58 只是层的精度声明，
         // 绝不能有代码拿它当存储标签。契约沿用"失败返回空 Tensor（调用方查
@@ -363,6 +386,7 @@ public:
     [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols, Precision P,
                                        const InitSpec& spec)
     {
+        NN_PROF_OP("create_tensor");
         if (auto ok = check_precision_supported(P); !ok)
         {
             std::fprintf(stderr, "[engine] create_tensor 拒绝非存储精度: %s\n",
@@ -395,6 +419,7 @@ public:
     }
     [[nodiscard]] Result<Tensor> from_matrix(const Matrix& m, Precision P = Precision::F32)
     {
+        NN_PROF_OP("from_matrix");
         // 同上：非存储精度不得作为张量的存储标签（返回 Result，故直接上抛原因）
         NN_TRY(pc, check_precision_supported(P));
         return stamp_(from_matrix_impl(m, P));
@@ -411,11 +436,19 @@ public:
     // 命名即防线：跨设备互传只准经 `import`（16 §2 的 43 处 ensure_gpu 已迁完）。
     [[nodiscard]] Result<Tensor> import(const Tensor& src)
     {
+        NN_PROF_OP("import");
         return import(src, src.precision());
     }
 
     [[nodiscard]] Result<Tensor> import(const Tensor& src, Precision P)
     {
+        NN_PROF_OP("import");
+        // 热路径快路：同一引擎已绑定、精度也一致时，import_impl 只会
+        // 原样返回共享句柄。optimizer 每 step 会对每个 DSL leaf 反复走
+        // 此入口（profile 约 3.4 万次/20 steps）；在这里提前返回可跳过
+        // bind_check_ 与 virtual dispatch，同时保留跨引擎/跨精度的完整路径。
+        if (src.valid() && src.bound() && &src.engine() == this && src.precision() == P)
+            return src;
         NN_TRY(ec, bind_check_({&src}));
         if (!src.valid())
             NN_FAIL("import: invalid tensor");
@@ -452,6 +485,7 @@ public:
     template <class T>
     [[nodiscard]] Result<void> read(const Tensor& t, std::span<T> dst)
     {
+        NN_PROF_OP("read");
         static_assert(!std::is_const_v<T> &&
                           (std::is_same_v<T, Scalar> || std::is_same_v<T, f16>),
                       "read: span 元素类型必须是 nn::Scalar(float) 或 nn::f16（U2 精确匹配）");
@@ -518,6 +552,25 @@ protected:
         Tensor* t_;
     };
 
+    // 多输出版（P2 写穿物化 / IR-C 图执行）：一次调用可能写多张张量
+    // （outs[0] + spec.extras 的各槽），逐个推进写版本。span 只持引用，
+    // 生命周期由调用方保证（与 WriteEpochGuard 同契约，零分配）。
+    class WriteEpochGuardMulti
+    {
+    public:
+        explicit WriteEpochGuardMulti(std::span<Tensor> ts) noexcept : ts_(ts) {}
+        WriteEpochGuardMulti(const WriteEpochGuardMulti&) = delete;
+        WriteEpochGuardMulti& operator=(const WriteEpochGuardMulti&) = delete;
+        ~WriteEpochGuardMulti()
+        {
+            for (auto& t : ts_)
+                mark_written_(t);
+        }
+
+    private:
+        std::span<Tensor> ts_;
+    };
+
 public:
     // 批量写：src 覆盖 t 的既有存储（不替换对象、不改形状/精度）。
     // 与 copy_from 的分工：copy_from 收 f32 Matrix（含 f32→f16 转换填充，
@@ -532,6 +585,7 @@ public:
     template <class T>
     [[nodiscard]] Result<void> write(Tensor& t, std::span<T> src)
     {
+        NN_PROF_OP("write");
         using Elem = std::remove_cv_t<T>;
         static_assert(std::is_same_v<Elem, Scalar> || std::is_same_v<Elem, f16>,
                       "write: span 元素类型必须是 nn::Scalar(float) 或 nn::f16（U2 精确匹配）");
@@ -647,6 +701,7 @@ public:
     [[nodiscard]] Result<Tensor> reshape(const Tensor& t, std::size_t new_rows,
                                           std::size_t new_cols)
     {
+        NN_PROF_OP("reshape");
         NN_TRY(ec, bind_check_({&t}));
         if (t.rows() * t.cols() != new_rows * new_cols)
             NN_FAIL("reshape: element count mismatch");
@@ -658,6 +713,7 @@ public:
     // 默认实现：同精度 = 返回 src（共享所有权，零拷贝）；跨精度 = 错误（引擎覆盖）。
     [[nodiscard]] Result<Tensor> cast(const Tensor& src, Precision dst)
     {
+        NN_PROF_OP("cast");
         NN_TRY(ec, bind_check_({&src}));
         return stamp_(cast_impl(src, dst));
     }
@@ -758,6 +814,7 @@ public:
     // 用于需要修改中间结果但不影响原 Tensor 的场景
     [[nodiscard]] Result<Tensor> clone(const Tensor& src)
     {
+        NN_PROF_OP("clone");
         NN_TRY(ec, bind_check_({&src}));
         // 精度策略（原生 f16 字节拷贝 / 抬 f32 再落回）在引擎的 clone_impl 内。
         return stamp_(clone_impl(src));
@@ -768,6 +825,7 @@ public:
     // f16 目标：先按 f32 上传，再 cast_into 写进 dst 的原存储
     [[nodiscard]] Result<void> copy_from(Tensor& dst, const Matrix& src)
     {
+        NN_PROF_OP("copy_from");
         NN_TRY(ec, bind_check_({&dst}));
         WriteEpochGuard wg{dst};
         if (dst.precision() == Precision::F32)
@@ -783,6 +841,7 @@ public:
     [[nodiscard]] Result<Tensor> slice_rows(
         const Tensor& src, std::size_t start_row, std::size_t count)
     {
+        NN_PROF_OP("slice_rows");
         NN_TRY(ec, bind_check_({&src}));
         return stamp_(slice_rows_impl(src, start_row, count));
     }
@@ -794,6 +853,7 @@ public:
     [[nodiscard]] Result<void> insert_rows(
         Tensor& dst, std::size_t dst_start_row, const Tensor& src)
     {
+        NN_PROF_OP("insert_rows");
         NN_TRY(ec, bind_check_({&dst, &src}));
         WriteEpochGuard wg{dst};
         return insert_rows_impl(dst, dst_start_row, src);
@@ -808,6 +868,7 @@ public:
     [[nodiscard]] Result<Tensor> gather_rows(
         const Tensor& table, const Tensor& indices)
     {
+        NN_PROF_OP("gather_rows");
         NN_TRY(ec, bind_check_({&table, &indices}));
         return stamp_(gather_rows_impl(table, indices));
     }
@@ -822,6 +883,7 @@ public:
     [[nodiscard]] Result<void> scatter_add_rows(
         Tensor& dst, const Tensor& indices, const Tensor& grad)
     {
+        NN_PROF_OP("scatter_add_rows");
         NN_TRY(ec, bind_check_({&dst, &indices, &grad}));
         WriteEpochGuard wg{dst};
         return scatter_add_rows_impl(dst, indices, grad);
@@ -838,6 +900,7 @@ public:
         const Tensor& x, std::size_t M, std::size_t B, std::size_t N,
         bool inverse = false)
     {
+        NN_PROF_OP("rearrange_3d");
         NN_TRY(ec, bind_check_({&x}));
         return stamp_(rearrange_3d_impl(x, M, B, N, inverse));
     }
@@ -846,6 +909,7 @@ public:
     // 纯 layout 操作，零算法语义。用于 embedding 列布局转换等场景。
     [[nodiscard]] Result<Tensor> transpose(const Tensor& A)
     {
+        NN_PROF_OP("transpose");
         NN_TRY(ec, bind_check_({&A}));
         return stamp_(transpose_impl(A));
     }
@@ -867,6 +931,7 @@ public:
         std::size_t k, std::size_t stride, std::size_t pad,
         std::size_t OH, std::size_t OW)
     {
+        NN_PROF_OP("im2col");
         NN_TRY(ec, bind_check_({&x}));
         return stamp_(im2col_impl(x, C, H, W, k, stride, pad, OH, OW));
     }
@@ -884,6 +949,7 @@ public:
         std::size_t k, std::size_t stride, std::size_t pad,
         std::size_t OH, std::size_t OW)
     {
+        NN_PROF_OP("col2im");
         NN_TRY(ec, bind_check_({&col}));
         return stamp_(col2im_impl(col, C, H, W, k, stride, pad, OH, OW));
     }
@@ -905,6 +971,7 @@ public:
         bool transA = false, bool transB = false,
         Precision P = Precision::F32)
     {
+        NN_PROF_OP("matmul");
         NN_TRY(ec, bind_check_({&A, &B}));
         if (P != Precision::F32)
             return stamp_(matmul_impl(A, B, transA, transB, P));
@@ -931,6 +998,7 @@ public:
         Scalar alpha = Scalar{1},
         Precision P = Precision::F32)
     {
+        NN_PROF_OP("batched_matmul");
         NN_TRY(ec, bind_check_({&A, &B}));
         if (P != Precision::F32)
             return stamp_(batched_matmul_impl(A, B, batch, transA, transB, alpha, P));
@@ -952,6 +1020,7 @@ public:
         bool transA = false, bool transB = false,
         Precision P = Precision::F32)
     {
+        NN_PROF_OP("matmul_with_bias");
         NN_TRY(ec, bind_check_({&A, &B, &bias}));
         if (P != Precision::F32 &&
             (A.precision() != Precision::F32 || B.precision() != Precision::F32 ||
@@ -977,6 +1046,7 @@ public:
     // 梯度累加：dst += src（dst 存储精度不可变，§8.3）
     [[nodiscard]] Result<void> accumulate(Tensor& dst, const Tensor& src)
     {
+        NN_PROF_OP("accumulate");
         NN_TRY(ec, bind_check_({&dst, &src}));
         WriteEpochGuard wg{dst};
         const bool dbg = prec_env_flag("NN_F16_DEBUG");
@@ -1009,6 +1079,7 @@ public:
     // A += B（逐元素，同形状）
     [[nodiscard]] Result<void> add_inplace(Tensor& A, const Tensor& B)
     {
+        NN_PROF_OP("add_inplace");
         NN_TRY(ec, bind_check_({&A, &B}));
         WriteEpochGuard wg{A};
         return add_inplace_impl(A, B);
@@ -1017,6 +1088,7 @@ public:
     // A *= scalar
     [[nodiscard]] Result<void> scale_inplace(Tensor& A, Scalar s)
     {
+        NN_PROF_OP("scale_inplace");
         NN_TRY(ec, bind_check_({&A}));
         WriteEpochGuard wg{A};
         return scale_inplace_impl(A, s);
@@ -1025,6 +1097,7 @@ public:
     // A = 0
     [[nodiscard]] Result<void> zero(Tensor& A)
     {
+        NN_PROF_OP("zero");
         NN_TRY(ec, bind_check_({&A}));
         WriteEpochGuard wg{A};
         return zero_impl(A);
@@ -1131,6 +1204,7 @@ public:
         const Tensor& boundary, bool has_bnd,
         Precision prec = Precision::F32)
     {
+        NN_PROF_OP("scan_prefix_outer");
         NN_TRY(ec, bind_check_({&K, &V, &P, &R, &A0, &B0, &boundary}));
         // 精度策略（原生 f16 扫描 / 引擎内边界 cast）在引擎的 *_impl 内。
         return stamp_(scan_prefix_outer_impl(K, V, P, R, A0, B0, has_state, dk, heads,
@@ -1149,6 +1223,7 @@ public:
         const Tensor& boundary, bool has_bnd,
         Precision prec = Precision::F32)
     {
+        NN_PROF_OP("scan_suffix_outer");
         NN_TRY(ec, bind_check_({&D, &X, &Y, &boundary}));
         return stamp_(scan_suffix_outer_impl(D, X, Y, dk, heads, causal, boundary,
                                             has_bnd, prec));
@@ -1164,6 +1239,7 @@ public:
         std::size_t dk, bool has_scale,
         Precision prec = Precision::F32)
     {
+        NN_PROF_OP("outer_col");
         NN_TRY(ec, bind_check_({&P, &R, &S}));
         return stamp_(outer_col_impl(P, R, S, dk, has_scale, prec));
     }
@@ -1182,6 +1258,7 @@ public:
     [[nodiscard]] Result<Tensor> row_reduce_sum(
         const Tensor& A, Precision P = Precision::F32)
     {
+        NN_PROF_OP("row_reduce_sum");
         NN_TRY(ec, bind_check_({&A}));
         return stamp_(row_reduce_sum_impl(A, P));
     }
@@ -1191,6 +1268,7 @@ public:
     [[nodiscard]] Result<Tensor> col_reduce_sum(
         const Tensor& A, Precision P = Precision::F32)
     {
+        NN_PROF_OP("col_reduce_sum");
         NN_TRY(ec, bind_check_({&A}));
         return stamp_(col_reduce_sum_impl(A, P));
     }
@@ -1200,6 +1278,7 @@ public:
     [[nodiscard]] Result<Tensor> col_reduce_max(
         const Tensor& A, Precision P = Precision::F32)
     {
+        NN_PROF_OP("col_reduce_max");
         NN_TRY(ec, bind_check_({&A}));
         return stamp_(col_reduce_max_impl(A, P));
     }
@@ -1215,6 +1294,7 @@ public:
         const Tensor& x, std::size_t G, std::size_t R,
         Precision P = Precision::F32)
     {
+        NN_PROF_OP("grouped_reduce_sum");
         NN_TRY(ec, bind_check_({&x}));
         return stamp_(grouped_reduce_sum_impl(x, G, R, P));
     }
@@ -1222,6 +1302,7 @@ public:
         const Tensor& x, std::size_t G, std::size_t R,
         Precision P = Precision::F32)
     {
+        NN_PROF_OP("grouped_reduce_max");
         NN_TRY(ec, bind_check_({&x}));
         return stamp_(grouped_reduce_max_impl(x, G, R, P));
     }
@@ -1247,7 +1328,14 @@ public:
         std::size_t rows, std::size_t cols,
         Precision P = Precision::F32)
     {
+        NN_PROF_OP("eval_expr");
         NN_TRY(ec, bind_check_(inputs));
+        if (!spec.extras.empty())
+            NN_FAIL("eval_expr: 多输出 spec（P2 extras）请走 eval_expr_multi_into");
+        // IR-C 录制段：入图不求值（占位 Tensor，end_expr 融合执行）
+        if (auto* g = fused::recording_graph())
+            return record_graph_node_(*g, spec, inputs, rows, cols,
+                                      /*vector_out=*/false, P);
         // 变体选路 / 边界 cast 归因**只做一次**：整段下沉到引擎的
         // eval_expr_impl（它本来就要算 key/精度签名）——F2 修复。
         return stamp_(eval_expr_impl(spec, inputs, rows, cols, P));
@@ -1263,7 +1351,15 @@ public:
         std::size_t rows, std::size_t cols,
         Precision P = Precision::F32)
     {
+        NN_PROF_OP("eval_expr_reduce");
         NN_TRY(ec, bind_check_(inputs));
+        if (!spec.extras.empty())
+            NN_FAIL("eval_expr_reduce: 多输出 spec（P2 extras）请走 eval_expr_multi_into");
+        // IR-C 录制段：入图不求值（归约向量占位，end_expr 融合执行）
+        if (auto* g = fused::recording_graph())
+            return record_graph_node_(*g, spec, inputs, rows, cols,
+                                      /*vector_out=*/true, P);
+        // 变体选路 / 边界 cast 归因整段下沉到引擎的 eval_expr_reduce_impl（F2 修复）
         return stamp_(eval_expr_reduce_impl(spec, inputs, rows, cols, P));
     }
 
@@ -1278,10 +1374,46 @@ public:
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols, Tensor& out)
     {
+        NN_PROF_OP("eval_expr_into");
         NN_TRY(ec, bind_check_(inputs));
         NN_TRY(ec2, bind_check_({&out}));
+        if (!spec.extras.empty())
+            NN_FAIL("eval_expr_into: 多输出 spec（P2 extras）请走 eval_expr_multi_into");
         WriteEpochGuard wg{out};
+        // IR-C 录制段（P2 写穿物化）：目标传递节点——输出即 dst 既有张量，
+        // end_expr 的复合 kernel 直接写回其存储（多输出槽 0）。物化发生在
+        // end_expr 且不经本入口，故写版本在**录制点**就推进（保守方向）。
+        if (auto* g = fused::recording_graph())
+            return record_graph_into_node_(*g, spec, inputs, rows, cols, out);
+        // 变体选路 / 边界 cast 归因整段下沉到引擎的 eval_expr_into_impl（F2 修复）
         return eval_expr_into_impl(spec, inputs, rows, cols, out);
+    }
+
+    // ── P2 多输出（IR-C 写穿物化）：一次求值写多个输出张量 ────────────────
+    // outs[0] = 主输出（instrs.back().dst），outs[1+k] = spec.extras[k] 的值
+    // 各自写进对应张量的既有存储。仅纯逐元素 **V0（全 f32）** spec——生成器
+    // 对带 extras 的结构只发 V0 变体（`#x`/typed/native16 跳过），且多输出
+    // 融合由 fuse_expr_graph 的精度门禁限定 F32。不支持录制段（图执行是
+    // end_expr 的职责）。
+    [[nodiscard]] Result<void> eval_expr_multi_into(
+        const ExprSpec& spec, std::span<const Tensor> inputs,
+        std::size_t rows, std::size_t cols, std::span<Tensor> outs)
+    {
+        NN_PROF_OP("eval_expr_multi_into");
+        NN_TRY(ec, bind_check_(inputs));
+        NN_TRY(ec2, bind_check_(outs));
+        WriteEpochGuardMulti wgs{outs};   // 写版本：多输出逐个推进
+        if (fused::is_recording())
+            NN_FAIL("eval_expr_multi_into: 不支持在 begin_expr/end_expr 录制段内使用");
+        if (outs.size() != spec.extras.size() + 1)
+            NN_FAIL("eval_expr_multi_into: outs 数量 != 1 + extras 数量");
+        for (const auto& t : inputs)
+            if (t.precision() != Precision::F32)
+                NN_FAIL("eval_expr_multi_into: 多输出仅支持全 f32（V0）输入");
+        for (const auto& t : outs)
+            if (t.precision() != Precision::F32)
+                NN_FAIL("eval_expr_multi_into: 多输出仅支持全 f32（V0）输出");
+        return eval_expr_multi_into_impl(spec, inputs, rows, cols, outs);
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1490,6 +1622,16 @@ protected:
         NN_FAIL("eval_expr_into: 该引擎不支持原地表达式求值");
     }
 
+    // P2 多输出（IR-C 写穿物化）；默认实现返回错误（未支持的引擎）。
+    [[nodiscard]] virtual Result<void> eval_expr_multi_into_impl(
+        const ExprSpec& spec,
+        std::span<const Tensor> inputs,
+        std::size_t rows, std::size_t cols, std::span<Tensor> outs)
+    {
+        (void)spec; (void)inputs; (void)rows; (void)cols; (void)outs;
+        NN_FAIL("eval_expr_multi_into: 该引擎不支持多输出表达式求值");
+    }
+
 protected:
     // 下面这些是**引擎实现可复用的 cast / 绑定助手**（各引擎的 `*_impl`
     // 在"原生路径不可用"时用它们表达边界 cast）。对外不可见。
@@ -1522,6 +1664,46 @@ protected:
         if (r && r->valid() && !r->engine_)
             r->engine_ = make_observer(*this);
         return std::move(r);
+    }
+
+    // ── IR-C 录制拦截（2026-10-06 恢复）──────────────────────────────────
+    // begin_expr/end_expr 录制段内，eval_expr/eval_expr_reduce 不求值：表达式
+    // 入图（add_node 建依赖边），返回带 virtual_tag 的占位 Tensor（真实存储、
+    // 出生即绑定——end_expr 的复合 kernel 经 output_override 直接写回该存储，
+    // 调用方持有的句柄即物化结果）。占位精度 = P（输出存储精度）。
+    [[nodiscard]] Result<Tensor> record_graph_node_(
+        ExprGraph& g, const ExprSpec& spec, std::span<const Tensor> inputs,
+        std::size_t rows, std::size_t cols, bool vector_out, Precision P)
+    {
+        if (g.owner != nullptr && g.owner != this)
+            NN_FAIL("eval_expr: 录制段内跨引擎求值（段内表达式必须经开启录制的引擎）");
+        const int node = g.add_node(spec, inputs, rows, cols, vector_out, P);
+        std::size_t orows = rows, ocols = cols;
+        if (vector_out)
+        {
+            const int raxis = expr_spec_reduce_axis(spec);
+            orows = (raxis == 0) ? rows : 1;
+            ocols = (raxis == 1) ? cols : 1;
+        }
+        Tensor t = create_tensor(orows, ocols, P);
+        if (!t.valid())
+            NN_FAIL("eval_expr: 录制占位张量分配失败");
+        t.set_virtual_tag(g.tag_of_node[static_cast<std::size_t>(node)]);
+        g.node_outputs[node] = t;
+        return t;
+    }
+
+    // 目标传递的录制节点（P2 写穿物化）：输出 = dst 既有张量（无占位）。
+    [[nodiscard]] Result<void> record_graph_into_node_(
+        ExprGraph& g, const ExprSpec& spec, std::span<const Tensor> inputs,
+        std::size_t rows, std::size_t cols, Tensor& out)
+    {
+        if (g.owner != nullptr && g.owner != this)
+            NN_FAIL("eval_expr_into: 录制段内跨引擎求值（段内表达式必须经开启录制的引擎）");
+        const int node = g.add_node(spec, inputs, rows, cols,
+                                    /*vector_out=*/false, out.precision());
+        g.node_outputs[node] = out;   // 输出 = dst 张量（end_expr 写回其存储）
+        return {};
     }
 
     // ── InitSpec host 填数（M2）：seed 与创建序号混流 ─────────────────────
@@ -1996,5 +2178,30 @@ namespace detail {
 }
 
 } // namespace detail
+
+// ── IR-C 录制段 RAII 守卫（P2，2026-10-06）───────────────────────────────
+// 作用域退出（含 NN_TRY 错误早退）自动 end_expr 收口，防录制图悬挂；
+// 正常路径显式 end() 收口并把 end_expr 的错误照常传播（守卫只兜底）。
+class ExprSegment
+{
+public:
+    explicit ExprSegment(ComputeEngine& e) noexcept : e_(e) {}
+    ExprSegment(const ExprSegment&) = delete;
+    ExprSegment& operator=(const ExprSegment&) = delete;
+    ~ExprSegment()
+    {
+        if (!done_)
+            (void)e_.end_expr();   // 兜底收口（错误已被上层传播或忽略）
+    }
+    [[nodiscard]] Result<void> end()
+    {
+        done_ = true;
+        return e_.end_expr();
+    }
+
+private:
+    ComputeEngine& e_;
+    bool done_ = false;
+};
 
 } // namespace nn

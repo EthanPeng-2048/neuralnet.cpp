@@ -59,6 +59,14 @@ public:
     [[nodiscard]] virtual std::string generate_reduce(
         const std::string& name_, const ExprSpec& spec,
         ExprPrecSig sig = 0) = 0;
+
+    // 批量变体 kernel 源码（键 = key#b，P3 跨链批量派发）：同结构多实例
+    // 经实例表（uvec2 数组，stride = 输入+输出+尾槽）+ buffer device address
+    // 一次 dispatch。资格 = expr_spec_batchable（纯逐元素，含 extras 复合），
+    // 仅 V0 全 f32。默认返回空串 = 该后端不支持 → 运行期回退逐 kernel 派发
+    // （闭合世界降级，不是错误）。
+    [[nodiscard]] virtual std::string generate_batched(
+        const std::string&, const ExprSpec&) const { return {}; }
 };
 
 // ── 简单注册表：按后端名选择 emitter 工厂 ────────────────────────────────

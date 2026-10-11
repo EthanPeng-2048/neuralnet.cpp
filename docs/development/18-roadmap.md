@@ -42,7 +42,7 @@
 | `docs/` | **29 篇 `.md`**（含 `history.md` 与 `release-notes/`） | `Get-ChildItem docs -Recurse -Filter *.md` |
 | 最大源文件 | `compute_vk_backend.hpp` **5161** 行、`expr_glsl_gen.hpp` **2806**、`compute_cpu_engine.hpp` **2309**、`compute_engine.hpp` **2003**、`gui.py` **1662**（非空约 1470）、`src/text_train.cpp` **1493** | 逐文件 `(Get-Content $f).Count` |
 | ctest | **27 个测试** = 24 个测试目标（`list(APPEND NN_TEST_TARGETS` 计数）+ `cnn_test_gpu`（= `cnn_test --gpu`）+ `batchnorm_test_gpu`（= `batchnorm_test --gpu`，2026-10-03 随 BatchNorm 落地新增）+ `fusion_custom_layer_example`（AOT 融合端到端） | `ctest --test-dir build -N` |
-| 引擎接口 | **49 个 virtual 方法**；`L2-VIOLATIONS: 0`；宿主桥 40 处（仅披露） | `pwsh -File bench/doc_inventory.ps1` |
+| 引擎接口 | **52 个 virtual 方法**；`L2-VIOLATIONS: 0`；宿主桥 40 处（仅披露） | `pwsh -File bench/doc_inventory.ps1` |
 | 版本 | git tag **v1.7.0**；`CMakeLists.txt` 的 `project(... VERSION 1.7.0)`（2026-10-06 发布时对齐；口径仍为 **git tag 是版本权威**）；`release-notes/` 有 `v1.5.0.md`、`v1.6.0.md`、`v1.7.0.md`（v1.5.1 / v1.6.1 无独立发布说明，v1.6.1 的用户可见变化补记于 v1.7.0.md §7） | `git describe` + 读 `CMakeLists.txt` |
 | CI | 仅 `.github/workflows/cmake-single-platform.yml`：clang++ / Ninja / Release / `NN_ENABLE_NATIVE=OFF`，Linux + Windows；**不开 `NN_ENABLE_TESTS`、不跑 ctest** | 读该 workflow |
 
@@ -98,6 +98,7 @@
 | E6 | 单文件多职责：`compute_vk_backend.hpp` 5174 行 | 该文件（fence / staging / dispatch / 算子混装） | header-only 项目里增量编译是主要开发成本 |
 | E7 | `README.md` 与实际不符：死链 `docs/development/07-zipt-algorithm.md`、mojibake、声称链式 `add<LayerType>()`、文档索引缺 13–17 | `README.md:21`、`:35`、`:63`、`:269`、索引表（`:23` 起） | 新用户第一入口即误导；`add<T>(args...)` 是返回 `Result<void>` 的模板方法，**无链式 API** |
 | E8 | `bench/doc_align_audit.ps1` 的 [A] 只检查**反引号里的文件名**，markdown 链接目标不查 | 该脚本 [A] 段正则 | README 的 `07-zipt-algorithm.md` 死链因此漏检（需扩审计或在文档侧修） |
+| E9 | **归约融合 shader 不支持"归约后逐元素后处理"形态**（`reduce(...) * k + c` 类表达式）：GPU 硬报错拒绝（契约，防静默错值），CPU 已支持 | `GpuEngine::eval_expr_reduce` 的拒绝分支（错误文案即本缺口）；回归锁 `src/ce_fusion_test.cpp`「归约+后处理 (reduce*k+c)」用例（断言 GPU 必须硬报错）；机制背景 `docs/history.md` 同名条目 | 该形态只能拆两步 dispatch（先 `compute_reduce` 再 `dsl::compute` 后处理），多一次 kernel 与中间张量。**支持路径（通用、非单算子）**：归约生成器在归约累加收尾（epilogue）后接逐元素链发射（操作对象是归约结果的广播值），随后放开 `eval_expr_reduce` 的末指令校验；CPU 的指令下标反向切片前置校验已是同语义，可直接对拍 |
 
 ### 3.3 生态与可用性
 
@@ -116,7 +117,7 @@
 |---|---|---|---|
 | M1 | 优化器共 **5 个**：SGD / SGDWithMomentum / Adam / **AdamW** / Muon；其中**直接派生自 `Optimizer` 的是 4 个**（SGD/SGDWithMomentum/Adam/Muon），`AdamW` 派生自 `Adam` | `compute_optimizer.hpp:200`（SGD）、`:236`（SGDWithMomentum）、`:294`（Adam）、`:434`（`AdamW : public Adam`）、`:628`（Muon）；工厂注册名 `:723`、创建分支 `:745` | 缺无 m/v 状态的低显存优化器，模型规模受优化器状态限制（P2-2） |
 | M2 | LRLA 仅存在于文档对比表，未实现 | `docs/development/06-rapt-algorithm.md` §LRLA | 线性注意力家族停在本项目基线 RLA-2/RAPT |
-| M3 | IR-C 跨表达式图融合不采用、S6 自动窗口不接线 | `docs/development/03-ir-optimization.md:134`；`docs/development/02-operator-fusion.md` §跨 kernel 自动融合 | 每个表达式仍各 dispatch 一次；能融的必须写进单个 `dsl::compute` |
+| M3 | ~~IR-C 跨表达式图融合不采用~~ **已恢复并接入训练路径（2026-10-06，P1+P2）**：`begin_expr/end_expr` + 图融合（P1 链 / P2 写穿多输出）+ Adam/AdamW 接线；S6 自动窗口仍未接线 | `docs/development/03-ir-optimization.md`；`docs/history.md`「IR-C 定位修正与恢复立项」「IR-C P2 收官」 | S6 之外的"能融的必须写进单个 `dsl::compute`"已放宽（跨表达式经录制段融合）；**P4 CE online-softmax fold 已落地（2026-10-06，通用 FoldSpec 机制，5→3 kernel/step，见 `docs/history.md`「CE online-softmax 单趟 fold（P4）」）**；**P3 跨链批量派发已落地（2026-10-06，`#b` 批量变体 + BDA 实例表 + 图内同签名分组 CAP 32）**：设备表读数口径 = 批量/非批量分列（用户裁定），`fused@optimizer` 归零、派发计入 `fused_b@optimizer` 行，**合计 1330 → 57 calls/20 步（2.85/step ≤ 6/step）**；批量 vs 逐个逐字节一致（含同组混形状）、字节锚逐位不变，见 `docs/history.md`「P3 跨链批量派发」 |
 | M4 | M7 存储多态未立项 | `docs/development/17-unified-tensor-engine.md` §5 M7 行 | 新增第三后端仍需改 `compute_tensor.hpp` |
 | M5 | ZiPT / AttnZip 已整体移除，代码保留在 `legacy/zipt` 分支 | `docs/history.md`「ZiPT 移除」条 | 记忆压缩方向暂缺实现 |
 

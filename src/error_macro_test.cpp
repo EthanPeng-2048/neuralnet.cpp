@@ -1,8 +1,11 @@
 // ── error_macro_test — 错误处理宏族 ────────────────────────────────────────
-// 覆盖：NN_CHECK / NN_EASY_CHECK / NN_EXIT / NN_TRY / NN_TRY_MSG / NN_FAIL
+// 覆盖：NN_CHECK / NN_EASY_CHECK / NN_EXIT / NN_TRY / NN_TRY_CHECK / NN_TRY_MSG / NN_FAIL
 //   · 解值三形态（Result<T> / Result<void> / bool 条件）+ 移动语义
 //   · detail::check_message 打印格式（语境 / 详情 / 表达式 / 文件行号）
 //   · NN_TRY_MSG 的错误语境前缀；NN_TRY 展开后错误消息逐字不变
+//   · **NN_TRY_CHECK 只求值一次 x**（副作用回归：旧展开求值两遍，对
+//     `seg.end()` 这类"失败即已改状态"的调用会在第二遍拿到 success 再调
+//     .error() → MSVC expected 断言 / 读已析构 Error 字符串 → 堆损坏）
 //   · 终止行为：NN_CHECK → 非零退出（abort）、NN_EXIT(code) → 退出码 = code
 //     （两者经子进程断言，本进程不终止）
 //
@@ -120,7 +123,41 @@ void test_propagate()
           "空语境不修改错误消息");
 }
 
-// ── ④ 终止行为（子进程断言）──────────────────────────────────────────────
+// ── ④ NN_TRY_CHECK 单次求值（副作用回归）─────────────────────────────────
+int g_side_effects = 0;
+
+// 每次调用都推进计数器，且**第二次调用必然成功**：只有"只求值一次"的实现才
+// 能得到 side_effects == 1 且错误消息来自第一次调用。旧展开
+// `if (!(x)) return std::unexpected((x).error())` 在此处会第二次求值拿到
+// success，然后对 success 的 expected 调 .error()（Debug STL 断言 / Release
+// 读已析构字符串）。真实事故 = Adam 的 `NN_TRY_CHECK(seg.end())`：
+// end_expr 失败时已重置录制状态，第二遍重新进入返回成功 → 0xC0000374 堆损坏。
+nn::Result<void> flaky_side_effect()
+{
+    ++g_side_effects;
+    if (g_side_effects == 1)
+        return std::unexpected(nn::Error{"first call fails"});
+    return {};
+}
+
+nn::Result<int> call_flaky() { NN_TRY_CHECK(flaky_side_effect()); return 7; }
+
+void test_try_check_single_eval()
+{
+    g_side_effects = 0;
+    auto r = call_flaky();
+    CHECK(!r, "NN_TRY_CHECK 传播失败");
+    CHECK(g_side_effects == 1, "NN_TRY_CHECK 失败路径只求值一次 x");
+    CHECK(!r && r.error().message == "first call fails",
+          "NN_TRY_CHECK 用第一次求值的错误");
+
+    g_side_effects = 1;   // 下一次调用直接成功
+    auto r2 = call_flaky();
+    CHECK(r2 && *r2 == 7, "NN_TRY_CHECK 成功路径正常");
+    CHECK(g_side_effects == 2, "NN_TRY_CHECK 成功路径只求值一次 x");
+}
+
+// ── ⑤ 终止行为（子进程断言）──────────────────────────────────────────────
 int run_self(const char* args)
 {
     const std::string cmd = "\"" + g_self + "\" " + args;
@@ -185,6 +222,7 @@ int main(int argc, char* argv[])
     test_unwrap();
     test_message_format();
     test_propagate();
+    test_try_check_single_eval();
     test_termination();
 
     std::printf("\nerror_macro_test: %d failure(s)\n", g_fail);
