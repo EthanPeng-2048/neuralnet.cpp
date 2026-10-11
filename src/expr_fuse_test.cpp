@@ -1,5 +1,5 @@
 // ───────────────────────────────────────────────────────────────────────────
-//  expr_fuse_test.cpp — IR-C 图融合 GPU 端到端验证（2026-10-06 随 IR-C 恢复）
+//  expr_fuse_test.cpp — IR-C 图融合 GPU 端到端验证
 //
 //  验证 begin_expr/end_expr 的完整闭环：录制（NVI 拦截入图）→ 融合分析
 //  （fuse_expr_graph）→ 复合 kernel 写回 tail 占位（run_graph_kernel_into_）

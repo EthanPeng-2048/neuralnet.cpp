@@ -419,7 +419,7 @@ struct FoldSpec
 //     逐元素链经 Matmul 操作数读取（matmul 不消耗逐元素寄存器）；
 //     instrs 可为空（输出 = matmul 结果本身）。
 //   - fold 段（可选）：见 FoldSpec；存在时 instrs 必须为空，输出 = fold 输出。
-//   - extras（P2 多输出，2026-10-06）：除主输出（instrs.back().dst）外**额外
+//   - extras（P2 多输出）：除主输出（instrs.back().dst）外**额外
 //     物化**的寄存器列表（槽序 = 输出槽 1..k）。IR-C 写穿物化用：图融合把
 //     状态量（如 Adam 的 m/v）连同其消费链拼进单 kernel 时，状态寄存器经
 //     extras 落回各自张量。**仅纯逐元素 spec**（无 matmul/fold/归约）支持；
@@ -797,7 +797,7 @@ inline constexpr const char* EXPR_MM_FINE_SUFFIX = "#f";
 // （键 = 结构 key + "#kr"，见 EXPR_MM_KSPLIT_REDUCE_SUFFIX）按段升序求和 +
 // 跑尾链落最终输出。仅 V0 全 f32、仅纯 matmul 形态（与 #f 同判据）。
 // ⚠ K 切分改变**跨段的 K 累加序**（部分和 ≠ 逐 k 串联）→ 结果不再与
-// 64/16-tile 逐位一致，移动 GPU 字节锚（2026-10-07 已裁定放行——torch
+// 64/16-tile 逐位一致，移动 GPU 字节锚（已裁定放行——torch
 // 文档同样不保证数学等价浮点计算逐位一致，见 history「K 切分」条）。
 inline constexpr const char* EXPR_MM_KSPLIT_SUFFIX = "#ks";
 // K 切分的伴生归约 shader 后缀（结构 key + "#kr"）：绑定 = 原输入 0..N-1

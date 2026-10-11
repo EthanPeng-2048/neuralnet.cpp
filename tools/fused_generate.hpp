@@ -517,7 +517,7 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
                                 //（V0/V1 仍覆盖，只是拿不到原生 f16 算术）
             // 分派变体（key#x）是唯一的签名无关 shader：发不出来 = 该结构
             // 没有 f16 路径 → 必须可见。**两类成因分开打**（否则"设计内跳过"
-            // 被误读成"形态缺失报错"——2026-10-06 勘误）：多输出（extras）
+            // 被误读成"形态缺失报错"）：多输出（extras）
             // 结构按设计仅 V0（expr_glsl_gen P2 写穿约束），混精度走
             // execute_fused_graph 的逐成员降级；其余才是真形态缺口。
             if (!spec.extras.empty())

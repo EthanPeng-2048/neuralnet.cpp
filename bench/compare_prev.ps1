@@ -3,8 +3,8 @@
 #
 # 数据源（默认）：
 #   nn 本轮   : bench/raw/ops_nn.log            / bench/raw/layers_nn.log          （run_*_ps1 -Side nn 产出）
-#   torch 旧值: bench/raw/ops_torch.json        / bench/raw/layers_torch_{model,large}.json（09-25 采集）
-#   nn 上轮   : bench/raw/ops_nn_20260926.log   / bench/raw/layers_nn_20260926.log （09-26 采集）
+#   torch 旧值: bench/raw/ops_torch.json        / bench/raw/layers_torch_{model,large}.json
+#   nn 上轮   : bench/raw/ops_nn_20260926.log   / bench/raw/layers_nn_20260926.log
 #
 # 用法:
 #   ./bench/compare_prev.ps1 -Kind ops

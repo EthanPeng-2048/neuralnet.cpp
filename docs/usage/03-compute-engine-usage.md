@@ -104,7 +104,7 @@ nn::CpuEngine engine;          // 无参，立即可用
 #endif
 ```
 
-> ⚠ **常见错误**：写 `nn::GpuEngine engine;`（无参）——编译失败。本文件旧版本曾这样写；`docs/usage/01-quickstart-model.md:295` 的 `❌` 反例也用了这一行（那里本意是演示 `cpu_matrix` 私有化，但该行本身同样编译不过）。
+> ⚠ **常见错误**：写 `nn::GpuEngine engine;`（无参）——编译失败。`docs/usage/01-quickstart-model.md:295` 的 `❌` 反例也用了这一行（那里本意是演示 `cpu_matrix` 私有化，但该行本身同样编译不过）。
 >
 > ⚠ **生命周期**：`engine` 必须晚于任何持有其非拥有指针的对象（`nn::Model`、`Layer`、`Tensor::engine_`）析构。`GpuBackend` 必须比 `GpuEngine` 活得更久。
 

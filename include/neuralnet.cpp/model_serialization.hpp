@@ -296,7 +296,7 @@ template <typename... Ts>
     kv.set("activation",   static_cast<uint64_t>(spec.activation));
     kv.set("norm_type",    static_cast<uint64_t>(spec.norm_type));
     kv.set("norm_place",   static_cast<uint64_t>(spec.norm_place));
-    // ZiPT（AttnZip）已于 2026-10-01 整体移除：不再写 memory_tokens / window 字段。
+    // ZiPT（AttnZip）已整体移除：不再写 memory_tokens / window 字段。
     // 旧文件（含这两个键）由 spec_from_kv 的 type 分支给出明确错误。
 
     // ── CNN ──
@@ -385,7 +385,7 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
     if (spec.type == ModelType::Unknown)
         NN_FAIL("模型文件规格缺少有效的 type 字段");
     if (spec.type == ModelType::Reserved_ZiPT)
-        NN_FAIL("该模型文件为 AttnZip/ZiPT 架构，已于 2026-10-01 整体移除"             "（代码保留在 legacy/zipt 分支；恢复前提见 docs/history.md）");
+        NN_FAIL("该模型文件为 AttnZip/ZiPT 架构，已整体移除"             "（代码保留在 legacy/zipt 分支；恢复前提见 docs/history.md）");
     return spec;
 }
 

@@ -376,6 +376,22 @@ int main(int argc, char* argv[])
         (void)ce.forward_sparse(engine, logits, labels2, {}, C);
     }
 
+    // ── Softmax forward/backward（独立层；各模型主干走 fold 不经过它）──
+    // 输入槽去重（SpecBuilder::add_input）后 leaf(S)/row_reduce_max(S) 各由
+    // 4 槽并为 2 槽 → 结构 key 变化；锚点符号实例（占位张量）**不参与去重**
+    // 只登记旧结构，故此类"锚点覆盖但 dry-run 未覆盖"的表达式必须在此以
+    // 真实张量 dry-run 登记（否则运行期去重后 key 未命中 → 闭合世界硬报错）。
+    {
+        const std::size_t R = 6, C = 9;   // 与 fused_gpu_test run_softmax 同形
+        nn::Softmax sm;
+        sm.set_precision_profile(scan_prof);
+        (void)sm.init(engine);
+        nn::Tensor x = scan_tensor(R, C);
+        (void)sm.forward(x);
+        nn::Tensor g = scan_tensor(R, C);
+        (void)sm.backward(g);
+    }
+
     // ── 归约表达式内联常量（push-constant 头长度回归）────────────────────
     // `col_reduce_sum(select(cond, 1, 0))` 是**带常量池的归约**结构：GPU 侧
     // push-constant 固定头长度必须按形态算（归约且无 matmul = 4 个 uint）。

@@ -330,7 +330,7 @@ option(NN_ENABLE_TESTS "Build test/verification executables" OFF)
 # 收集实际构建的目标，供 GPU 统一启用（避免引用未定义目标）
 set(NN_APP_TARGETS "")
 set(NN_TEST_TARGETS "")
-set(NN_BENCH_TARGETS "")   # 性能基准已移除（2026 清理：bench 工具不注册 ctest 且无法在 -Werror 下编译）
+set(NN_BENCH_TARGETS "")   # 性能基准已移除（bench 工具不注册 ctest 且无法在 -Werror 下编译）
 
 # ── 应用 / 探针 / 基准目标（NN_BUILD_APPS，默认 = 是否顶层工程）───────────
 # 嵌入消费方（add_subdirectory）默认 OFF：只拿库目标（neuralnet::nn），
@@ -448,7 +448,7 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(doc_attn_test src/doc_attn_test.cpp)
     list(APPEND NN_TEST_TARGETS doc_attn_test)
 
-    # ── ZiPT / AttnZip 已于 2026-10-01 移除（保留在 legacy/zipt 分支）──
+    # ── ZiPT / AttnZip 已移除（保留在 legacy/zipt 分支）──
     #     恢复前提见 docs/history.md「ZiPT 移除」条。
 
     # ── RAPT / ReLU 线性注意力（梯度 + 冒烟 + 梯度检查点）──────────────
@@ -460,8 +460,7 @@ if(NN_ENABLE_TESTS)
     list(APPEND NN_TEST_TARGETS expr_cpu_test)
 
     # ── 图 IR + 融合分析（IR-C，纯 CPU：链融合/边界/确定性/matmul 参与）──
-    # 2026-10-06 随 IR-C 恢复（git 8f2990f^ 旧测试移植，见 docs/history.md
-    # 「IR-C 定位修正与恢复立项」）
+    # 历史归档见 docs/history.md「IR-C 定位修正与恢复立项」
     nn_add_executable(expr_graph_test src/expr_graph_test.cpp)
     list(APPEND NN_TEST_TARGETS expr_graph_test)
 
@@ -540,7 +539,7 @@ if(NN_ENABLE_TESTS)
         add_test(NAME batchnorm_test_gpu COMMAND batchnorm_test --gpu)
         set_tests_properties(batchnorm_test_gpu PROPERTIES SKIP_RETURN_CODE 77)
     endif()
-    # 基准工具已移除（2026 清理：无法在 -Werror 下编译，且无 ctest 覆盖）
+    # 基准工具已移除（无法在 -Werror 下编译，且无 ctest 覆盖）
     foreach(TARGET ${NN_BENCH_TARGETS})
         set_target_properties(${TARGET} PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test)
@@ -907,7 +906,7 @@ if(Vulkan_FOUND)
             set_tests_properties(fusion_custom_layer_example
                 PROPERTIES SKIP_RETURN_CODE 77)
 
-            # ── IR-C 图融合 GPU 端到端（2026-10-06 随 IR-C 恢复）──────────
+            # ── IR-C 图融合 GPU 端到端（begin_expr/end_expr 录制闭环）──────
             # begin_expr/end_expr 录制 → fuse_expr_graph 融合 → 复合 kernel
             # 写回 tail 占位的闭环验证。走 nn_enable_gpu_fusion 专属 registry：
             # 测试 TU 的 NN_EXPR_SCAN 静态初始化 dry-run 把录制段的复合 spec

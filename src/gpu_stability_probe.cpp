@@ -197,8 +197,7 @@ namespace
     // 五类模型 = 全部 init 路径（Linear/Conv/Norm 常数/token_emb/位置编码/
     // ones_row_）。同一引擎顺序构建：创建序号（InitSpec 混流）按构造顺序推进，
     // 跨进程同序 → 初值逐字节确定。
-    // （原第 6 类 ZiPT 已随 AttnZip 于 2026-10-01 移除；CrossAttention P 的
-    //   uniform 初始化路径随之消失。锚点表见 AGENTS.md §12 / docs/history.md。）
+    // （ZiPT 类已整体移除；锚点表见 AGENTS.md §12 / docs/history.md。）
     nn::Result<InitHashes> run_init_hash(bool gpu)
     {
         auto eng_r = make_engine(gpu);
