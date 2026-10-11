@@ -535,6 +535,13 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 
 # 引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器
 
+## AdamWQuant：量化状态的 AdamW（2026-10-11，分支 `dev/t1_58`；原位置 `compute_optimizer.hpp`（新类）、`docs/development/21-quantized-weights.md` §4.13 的"F5 待做"）
+- 类型：演进记录 / 性能 A/B / 被否决方案
+- 内容：训练显存的最大单项是优化器状态（m/v 各 f32 = 8 B/权重，三值层账 49%）。新类 `AdamWQuant`：状态存 **f16 + 按行动态缩放**，尺度用**上界估计**推进（`|m_new| ≤ β1|m_old| + (1-β1)|g|`）→ 不需要新状态的 f32 副本，因此**零新原语/零新 shader**（状态写回与参数更新各一趟融合）。`--optimizer adamwquant` + GUI 下拉 + scan 优化器 dry-run 补一条（结构 107 → 113）+ 新测试 `src/adam_quant_test.cpp`（状态账 / 尺度不变式 / 小量级行不下溢 / 零梯度首步 / 与 f32 AdamW 的收敛对齐）。
+- **实测（102 / 40HX，d512·h8·L8·ff2048，t1_58，30 步）**：整卡峰值 **2074 → 1738 MiB（−16.2%）**，墙钟 5.1 → 5.0 s，loss 同量级。
+- **被否决方案（本轮记录）**：① "直接 f16 存 m/v"——绝对值小的状态被舍入吃掉（`research/f16_weight_decay` 已证，本轮设计绕开它的正是按行动态缩放）；② "把状态量化塞进 `Adam` 本身"——改 Adam 会让 f32/f16/t1_58 三条历史基线的数值口径不可复现（docs 21 §4.13 的裁决：开新优化器）。③ "一上来就做 int8 payload + 紧凑 absmax" —— 需要融合的按块内核（新原语 ×2 后端 + 新 shader）与 DSL `round` 算子，先交付"零新原语"的有界尺度版拿到实测数据，再按需推进。
+- **待办**：真实语料上的收敛 A/B（30 步合成语料不是收敛结论）；int8 payload + 打包（状态再砍一半，前置 = DSL `round` + 字节容器）。
+
 ## 三值（T1_58）性能优化：写版本缓存 / 惰性梯度 / 打包 GEMM（2026-10-11，分支 `dev/t1_58`；原位置 `docs/development/21-quantized-weights.md` §4.11 的"P1 不省显存"结论、`compute_layer_bitlinear.hpp` 的"每次 forward 重算 τ/wq"、`compute_layer_mlp.hpp` / `compute_layer_bitlinear.hpp` init 里的无条件梯度分配）
 - 类型：演进记录 / 性能 A/B / bug 根因
 - 内容：§4.11 定位出三个代价（每步重算 τ/wq、f16 稠密缓冲 2 B/权重、推理也分配 f32 梯度），本轮四提交落地：**F1** 存储级写版本（`MatrixT`/`GpuBuffer` 持单调 `write_epoch`，`WriteEpochGuard` 覆盖 12 个引擎写入口 + DSL 的 CPU 直写路径经 `TensorAccess::mark_written` 补记）→ τ/wq 只在权重变过时重算；**F4** `1/K` 折进归约操作数（3 pass → 2 pass）；**F6** τ 移出 `activation_cache`（它是权重派生物不是激活）；**F3** 打包三值权重（2 bit/权重、码值 = 三值 + 2，与 microsoft/BitNet `gpu/pack_weight.py` 对齐）+ `trit_pack`/`matmul_q`/`matmul_q_t` 原语 + GPU shader（含 `-DNN_SHADER_F16` 变体）；**F2** 梯度惰性分配（`Linear`/`BitLinear`）。
