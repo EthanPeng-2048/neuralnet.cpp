@@ -1021,7 +1021,14 @@ int main(int argc, char* argv[])
             const double d = std::fabs(gpu_bitnet_loss - cpu_bitnet_loss);
             std::printf("    [parity] 末步 loss CPU=%.6f GPU=%.6f 差=%.3e\n",
                         cpu_bitnet_loss, gpu_bitnet_loss, d);
-            CHECK(d < 1e-3, "CPU/GPU 端到端训练末步 loss 一致（<1e-3）");
+            // 阈值 2e-3（原 1e-3）：合并后 GPU 的 wgrad 走 matmul K 切分
+            // （`#ks`/`#kr`，跨段 K 累加序 ≠ 逐 k 串联，main 侧已裁定"数学等价
+            // 不保证逐位一致"）→ 200 步训练的末步 loss 差被抬高到 1.051e-3。
+            // 同窗 A/B（102 / 40HX，本测试 --gpu，200 步）实测：
+            //   NN_MM_NO_KSPLIT=1 → 6.787e-4；NN_MM_NO_FINE=1 → 6.229e-4；
+            //   两者都开（默认）→ 1.051e-3。差值是求和序噪声量级（对照历史上
+            //   分块 GEMM 轴向写反的 bug 是 3.4447 → 乱值），故锁在 2e-3。
+            CHECK(d < 2e-3, "CPU/GPU 端到端训练末步 loss 一致（<2e-3）");
         }
     }
     else
