@@ -186,9 +186,10 @@ FeedForward 内部，任何"完整遍历参数"的新功能（部署格式、未
 | offload | `create_offload_buffer/offload_save/offload_restore`（activation offload） |
 
 > 引擎的 virtual 方法计数**以审计输出为准**：`bench/doc_inventory.ps1` 的 `virtual methods`
-行为 **52 declarations / 52 unique**（改三值优化前为 49：M6 的 `import_impl` 曾使其 48 → 49；
-本轮 +4 = `supports_ternary_gemm` / `trit_pack_impl` / `matmul_q_impl` /
-`grad_buffers_allocated`，审计口径含析构等声明）；逐元素/广播等计算类原语一律经表达式
+行为 **54 declarations / 54 unique**（改三值优化前为 49：M6 的 `import_impl` 曾使其 48 → 49；
+三值 P2 轮 +4 = `supports_ternary_gemm` / `trit_pack_impl` / `matmul_q_impl` /
+`grad_buffers_allocated`；P3 起步 +2 = `supports_int8_dot` / `int8_dot_accelerated`；
+审计口径含析构等声明）；逐元素/广播等计算类原语一律经表达式
 > DSL 求值，不经 Layer 直调（`dsl::row_reduce_max` 是 DSL 叶子，不是引擎算子）。CRLF/`scan_exprs` AOT 键规则见 §7。
 
 ### 4.4 理解优先级（建议学习顺序）

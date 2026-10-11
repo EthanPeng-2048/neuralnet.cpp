@@ -911,6 +911,43 @@ d256·L4 的线性层 ≈ 2.5 M 参数（f32 10 MB → base-3 0.5 MB）。
 BitLinear 全部进 packed-only + 前向逐位相同 + 两侧遍历签名一致）。本机与 102 各 ctest
 **38/38**。
 
+### 4.16 P3 起步：int8 点积（W2A8）能力探测与路线判定（2026-10-11）
+
+§5 的 P3（激活 int8 + 整数点积）是"打包在 GPU 上真正打赢稠密"的前提。落地前先做
+**能力探测**（先量后承诺）：
+
+**① 设备能力（新增查询 + 启用 + 能力位）**：`VkPhysicalDeviceShaderIntegerDotProductFeatures`
+（Vulkan 1.3 / `VK_KHR_shader_integer_dot_product`）在设备创建时查询并链入 pNext；
+属性位 `integerDotProduct4x8BitPackedSignedAccelerated`（硬件 DP4A vs 驱动软件展开）
+单独记录。暴露 `ComputeEngine::supports_int8_dot()`（门禁）+ `int8_dot_accelerated()`
+（诊断），逃生阀 `NN_VULKAN_NO_INT8_DOT`。**实测（102/40HX，Turing）：两者都是 true**
+—— 设备侧可以建 DP4A 内核。
+
+**② 路线判定（关键结论，避免走错方向）**：
+
+- **本项目 Vulkan 路径没有张量核**：BitNet 官方 GPU kernel 的大头收益来自
+  `wmma`/int8 tensor core（`ladder_int8xint2_kernel` 用 `m16n16k16` 一类的分块），
+  而 Vulkan 在 Turing 上不暴露 cooperative matrix —— 这条收益**拿不到**。
+- **DP4A 的算力增益是零**：`dotPacked4x8EXT` 与我们的 vec4 FMA 都是"每指令 4 个 MAC"。
+  所以 P3 的收益只能来自两处：**（a）激活存储 1 B vs f16 2 B**（带宽/显存减半）；
+  **（b）把"2-bit 解码"折进 DP4A 的操作数构造**（每 4 个权重：解码成 4×int8 打包
+  ≈ 6 条整数指令 + 1 条 DP4A，对比 f16 路径的 4×(解码+乘加)）—— 这是把当前
+  分块打包 GEMM 在宽 N 下**比稠密慢 ~13%** 那一段扳平/反超的机会。
+- 因此 P3 的**准入门槛**是先把 (b) 用配对微基准量出来（`layer_bench` 的
+  `matmul_q` vs 新增 `matmul_q_i8`），不是先写全链路。
+
+**③ 设计要点（下一步落地时按此走）**：
+- 激活 int8 **不新增存储精度**：沿用三值容器的先例 —— 打包字放 f32 张量
+  （每元素 4 个 int8，`bit_cast` 当原始字），于是"张量存储多态（M7）"仍不需要。
+- 需要一个 **per-列（per-token）absmax + round/clamp + 打包**的原语
+  （`quantize_act_i8`），以及 **`matmul_q_i8`**：`C[m,n] = τ_m·s_n·Σ code(m,k)·q(k,n)`，
+  整数累加 + 尾部两向量缩放。文档早先把"DSL `round` 算子"列为 P3 前置，实际上
+  **手写原语不需要它**（`trit_pack` 就是同一先例）；`round`/`clamp` 只在"想用 DSL
+  表达量化"时才需要 —— 降级为可选。
+- 数值口径必须先写死：`q = round(clamp(x/s, -127, 127))`、`s = absmax(x)/127`，
+  与 BitNet 的 W2A8 口径一致；验收 = 与 f16 累加路径的 loss 曲线同量级 +
+  `ternary_gemm_test` 式的跨形状对拍（int8 路径单独一组）。
+
 ---
 
 ## 5. 分期与验收
@@ -920,7 +957,7 @@ BitLinear 全部进 packed-only + 前向逐位相同 + 两侧遍历签名一致�
 | **P1 ✅（2026-10-10 落地）** 架构统一 + 功能正确<br>（**范围 = MLP 路径**，D5 建议③） | `Precision::T1_58`（含 R4 的序处理、tag 4、`check_precision_supported` 拒绝）；`PrecisionSet` + `Layer::precision_support()` + `init` 校验 + `layer_name()`；`BitLinear`（量化 forward + STE backward）；D3 的 (a)+(b)（§4.3.2）；`scan_exprs` 补 dry-run；spec 的 `weight_quant` 字段；2 个 CLI × 4 flag 的词法 + GUI + `gui_cli_audit` | `precision.hpp` / `compute_layer_base.hpp` / 新 `compute_layer_bitlinear.hpp` / `tools/scan_exprs.cpp` / `model_spec.hpp` / `src/*` / `gui.py` | ① 不兼容组合**初始化期报错**（含 `param=T1_58` + 普通 `Linear` 的反例用例）✅；② latent 权重的 STE 梯度 = 解析式（量化器不可微 → 不做数值 gradcheck，改与宿主参考逐项对拍）✅；③ CPU/GPU 各一个端到端小训练收敛（loss 0.981→0.025，两端逐位相同）✅；④ 既有 ctest 全绿（本机唯一不稳定 = 软件 Vulkan teardown）、L2 审计 0 ✅。**逐文件清单见 §7；逐条差异见 §4.9** |
 | **P2 ✅（2026-10-11 落地，见 §4.12 + §4.14 + §4.15）** 真性能与部署格式：2-bit 定长打包 + `matmul_q`/`matmul_q_t`（CPU/GPU 双端）+ **分块解码 GEMM（轴向修复）+ 窄 N 打包 GEMV + 训练/解码统一走打包 + `layer_bench --op matmul_q` 配对 A/B + CPU 行块解码复用稠密微内核 + base-3（1.6 bpw）部署编码 + packed-only 只读推理文件（`ternary_deploy.hpp`，独立 magic）** | **剩余 = 免 latent 构建**（载入期瞬时峰值：模型仍按架构规格建 latent 再被部署条目接管 → 2B4T 上是 GB 级瞬时；方案 = `ModelSpec.deploy_packed` + `make_linear_layer(..., inference_only)`）+ 激活 int8 / 整数点积（P3，打包在 GPU 上"打赢"稠密的前提） | 同左（`compute_tensor.hpp` 的 M7 张量 qparam 仍未做：当前容器是"f32 张量当原始字"，够用但没类型约束） | ① `layer_bench` 配对 A/B ✅（`matmul_q`/`matmul_q_t`/`matmul_q_bw` + `--f16`/`--inner`：宽 N 持平~+13%、窄 N 1.1–2.3×、权重 0.25 B/权重）；② 打包往返逐位 ✅（`ternary_gemm_test` [1][2]）；③ 数值与 f16 缓冲路径一致 ✅（同测试 [3][4][5][6][7]，含跨形状对拍）；④ 与 BitNet `pack_weight.py` 的位宽/码值对齐（**只对编码/解码**；不采用其 CUDA interleave 置换）；⑤ 端到端：训练 2.0 s 持平 / 训练显存 −8.4% / 解码 −30% / 推理显存 −13.6% / CPU 与 f16 稠密打平（§4.14）；⑥ 部署文件 11.9× 更小、载入后前向逐字节等价、三值层 packed-only 只读（§4.15） |
 | **P1.5 ✅（2026-10-10 落地）** GPT 接入<br>（**范围 = GPT**，RAPT/ViT 见 §4.10 边界） | `make_linear_layer` + `unique_ptr<Layer>` 替换 GPT 侧全部 `Linear` 成员：`AttentionBase` 4 投影、`FeedForward` fc1/fc2、`GPTModel` LM head；`TernaryProfileSplit` 分流规则；`effective_weight_quant` 唯一判据；规格/CLI/扫描同步 | `compute_layer_base.hpp` / `compute_layer_attention.hpp` / `compute_layer_feedforward.hpp` / `compute_layer_gpt.hpp` / `domain_gpt.hpp` / `src/text_train.cpp` / `tools/scan_exprs.cpp` | ① 三值 GPT 端到端训练（2B4T 形状 3.469→0.018；MLP 之外的路径首次可用）✅；② 参数张量形状与 f32 基线逐一相同 + 梯度非零 ✅；③ 既有 f32/f16 路径零回归（`split` 恒等 + ctest 30/30）✅；④ **RAPT/ViT 明确拒绝**而非静默半三值 ✅。逐条记录见 §4.10 |
-| **P3** 计算侧收益 | 激活 int8 量化 + 整数点积（GPU 需 `GL_EXT_shader_integer_dot_product` 的设备特性探测；CPU 侧参考 §3.4/§3.5）；DSL 新增 `round`/`clamp` 算子（三处同步：`ExprOp` + CPU 求值 + GLSL emitter） | `expr_spec.hpp` / `expr_dsl.hpp` / `expr_glsl_gen.hpp` / 新 `.comp` | 与 PyTorch 参考实现对拍（`compare_with_torch/`） |
+| **P3** 计算侧收益<br>**起步（2026-10-11，见 §4.16）**：设备 int8 点积能力探测（门禁 `supports_int8_dot()` + 诊断 `int8_dot_accelerated()`）已落地，**102/40HX 实测两者皆 true** | **剩余 = 配对微基准（`matmul_q` vs `matmul_q_i8`）→ `quantize_act_i8`（per-列 absmax + round/clamp + 4×int8 打包）→ `matmul_q_i8`（DP4A 整数累加 + τ·s 双向量缩放）→ 数值/收敛对拍**；DSL 的 `round`/`clamp` **降级为可选**（手写原语不需要） | `include/neuralnet.cpp/expr_spec.hpp` / `expr_dsl.hpp` / `expr_glsl_gen.hpp`（仅当走 DSL 路线）、新 `.comp` + `compute_*_engine.hpp` 原语 | ① 设备能力探测 ✅（§4.16）；② **准入门槛 = 微基准量出解码折叠 + 激活减半的指令/带宽收益**（DP4A 算力与 vec4 FMA 同量级，且 Vulkan/Turing 无张量核 → 收益上限低于 BitNet 官方）；③ 与 f16 累加路径的 loss 同量级 + 跨形状对拍 |
 
 > **性能预期必须先量后承诺**：本项目主线模型 `d_model` 只有 64–256（GPT d64/h4/L4/ff256），
 > matmul 很可能落在 **kernel 启动延迟区而不是带宽区**——打包省下的权重带宽未必能兑现成墙钟时间。

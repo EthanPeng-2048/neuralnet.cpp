@@ -1191,6 +1191,10 @@ public:
     bool device_lost_ = false;
     [[nodiscard]] bool is_device_lost() const noexcept { return device_lost_; }
 
+    // ── 设备能力直读（P3 门禁等：int8 点积特性在设备创建时已查询/启用）────
+    // 只读句柄：调用方（GpuEngine）据此暴露 `supports_int8_dot()` 等能力位。
+    [[nodiscard]] const VulkanDevice& device() const noexcept { return device_; }
+
     // 禁止拷贝和移动
     GpuBackend(const GpuBackend&) = delete;
     GpuBackend& operator=(const GpuBackend&) = delete;

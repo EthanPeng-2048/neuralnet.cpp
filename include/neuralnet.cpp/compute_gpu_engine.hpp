@@ -772,6 +772,16 @@ public:
         return backend_.has_trit_pack_pipeline() && backend_.has_matmul_q_pipeline();
     }
 
+    // P3 门禁：设备侧 int8 点积（DP4A 语义）是否可用
+    [[nodiscard]] bool supports_int8_dot() const noexcept override
+    {
+        return backend_.device().has_int8_dot();
+    }
+    [[nodiscard]] bool int8_dot_accelerated() const noexcept override
+    {
+        return backend_.device().int8_dot_accelerated();
+    }
+
     [[nodiscard]] Result<Tensor> trit_pack_impl(const Tensor& w,
                                                 const Tensor& scale) override
     {
