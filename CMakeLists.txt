@@ -470,6 +470,22 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(bitnet_struct_test src/bitnet_struct_test.cpp)
     list(APPEND NN_TEST_TARGETS bitnet_struct_test)
 
+    # ── 写版本（write epoch）契约 + BitLinear 量化缓存（docs 21 §4.11）──
+    nn_add_executable(write_epoch_test src/write_epoch_test.cpp)
+    list(APPEND NN_TEST_TARGETS write_epoch_test)
+
+    # ── 三值打包权重 + 量化 GEMM（P2/F3，docs 21 §5 的 P2 验收）──
+    nn_add_executable(ternary_gemm_test src/ternary_gemm_test.cpp)
+    list(APPEND NN_TEST_TARGETS ternary_gemm_test)
+
+    # ── 模型文件角色（v7：.nnmodel / .nnckpt）+ 参数形态协议 ──
+    nn_add_executable(model_roles_test src/model_roles_test.cpp)
+    list(APPEND NN_TEST_TARGETS model_roles_test)
+
+    # ── 量化状态优化器 AdamWQuant（F5 第一步，docs 21 §4.13）──
+    nn_add_executable(adam_quant_test src/adam_quant_test.cpp)
+    list(APPEND NN_TEST_TARGETS adam_quant_test)
+
     # ── 分词器正确性（BPE pre_tokenize 对拍 + 标记往返）─────────────────
     nn_add_executable(tokenizer_test src/tokenizer_test.cpp)
     list(APPEND NN_TEST_TARGETS tokenizer_test)
@@ -606,6 +622,23 @@ if(NN_ENABLE_TESTS)
         add_test(NAME bitnet_struct_test_gpu COMMAND bitnet_struct_test --gpu)
         set_tests_properties(bitnet_struct_test_gpu PROPERTIES SKIP_RETURN_CODE 77)
     endif()
+    # 写版本 + BitLinear 量化缓存的 GPU 变体：写版本记在 GpuBuffer 上（别名
+    # 安全），且缓存命中路径不得绕过 AOT 闭合世界。无 Vulkan 构建/无设备 → 77。
+    if(TARGET write_epoch_test)
+        add_test(NAME write_epoch_test_gpu COMMAND write_epoch_test --gpu)
+        set_tests_properties(write_epoch_test_gpu PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    # 三值打包 GEMM 的 GPU 变体：打包/解码在设备侧（GpuEngine 接打包路径后生效），
+    # 未接的后端上 BitLinear 自动退回 f16 稠密缓冲（本用例会打印跳过）。无设备 → 77。
+    if(TARGET ternary_gemm_test)
+        add_test(NAME ternary_gemm_test_gpu COMMAND ternary_gemm_test --gpu)
+        set_tests_properties(ternary_gemm_test_gpu PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    # 量化状态优化器的 GPU 变体（状态读写全在设备侧；GPU 上表达式须命中闭合世界）。
+    if(TARGET adam_quant_test)
+        add_test(NAME adam_quant_test_gpu COMMAND adam_quant_test --gpu)
+        set_tests_properties(adam_quant_test_gpu PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
     foreach(TARGET ${NN_BENCH_TARGETS})
         set_target_properties(${TARGET} PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test)
@@ -654,6 +687,8 @@ if(Vulkan_FOUND)
         scan_prefix_outer_gen
         scan_suffix_outer_gen
         outer_col
+        trit_pack
+        matmul_q
         cast)
     # 融合 shader：构建期从 Layer 内联表达式自动合成（**单步**）──────────
     # 表达式**文本只出现在 Layer**（compute / compute_reduce / compute_into）。
@@ -711,6 +746,10 @@ if(Vulkan_FOUND)
     #     其余 shader 编译参数不变。
     nn_embed_shader(matmul_gemv ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matmul_gemv.comp --target-env=vulkan1.2)
 
+    # 1b'. 三值打包权重的窄 N GEMV（P2/F3）：与 matmul_gemv 同骨（subgroup
+    #      归约）→ 同样需 SPIR-V ≥1.3 的 --target-env=vulkan1.2。
+    nn_embed_shader(matmul_q_gemv ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matmul_q_gemv.comp --target-env=vulkan1.2)
+
     # 1c. reduce：行列归约用 subgroup 蝶式（GL_KHR_shader_subgroup_*，与
     #     DSL 融合归约同配方）→ 同样需 SPIR-V ≥1.3 → --target-env=vulkan1.2
     nn_embed_shader(reduce ${CMAKE_CURRENT_SOURCE_DIR}/shaders/reduce.comp --target-env=vulkan1.2)
@@ -759,6 +798,12 @@ if(Vulkan_FOUND)
     # C2d：卷积窗口展开/伴随散射的 f16 存储变体（数据搬运，in/out 均 half）
     nn_embed_shader(im2col_f16 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/im2col.comp -DNN_SHADER_F16=1)
     nn_embed_shader(col2im_f16 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/col2im.comp -DNN_SHADER_F16=1)
+    # P2/F3：三值打包 GEMM 的 f16 存储变体（B/C 为 half；打包字恒 uint）。
+    # 训练时激活是 f16 → 不带类型的边界 cast 会为每个 BitLinear 层物化
+    # (K,batch)+(M,batch) 两份 f32 临时量（比权重带宽还大），故必须有此变体。
+    nn_embed_shader(matmul_q_f16 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matmul_q.comp -DNN_SHADER_F16=1)
+    # 同上：窄 N 打包 GEMV 的 f16 存储变体（解码路的主路径：激活 f16）
+    nn_embed_shader(matmul_q_gemv_f16 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matmul_q_gemv.comp --target-env=vulkan1.2 -DNN_SHADER_F16=1)
 
     # 2. AOT 融合 shader：scan_exprs（**单步** = 收集 + 生成）
     #    收集：FusedAnchor 自登记（按表达式类型）+ dry-run + 模型 pass

@@ -132,7 +132,11 @@ $externalFlags = @('--test-dir','--parallel','--target-env','--dtype','--adam-ep
 $removedFlags  = @('--cuda','--tdr-retry','--max-tdr-retries',
                    '--memory-tokens','--window',
                    '--osc-guard','--osc-window','--osc-threshold',
-                   '--no-cache','--test-file','--loss-scope')
+                   '--no-cache','--test-file','--loss-scope',
+                   # --export-deploy : NNQT 独立部署格式的导出口，随库级清理
+                   #   （docs/development/23，2026-10-11）删除 → 文件角色
+                   #   .nnmodel/.nnckpt 取代
+                   '--export-deploy')
 
 # ── [D] 文档里的 CLI 参数是否存在 ────────────────────────────────────────
 Write-Host '=== [D] 文档引用但代码中不存在的 CLI 参数（--flag）==='

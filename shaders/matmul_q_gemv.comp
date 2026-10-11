@@ -1,0 +1,204 @@
+// ── matmul_q_gemv.comp — 三值打包权重的**窄 N**（GEMV）内核 ───────────────
+// C = (τ∘W)·B，W 以 2 bit/权重打包（transA=0 形态：A 存 (M,K) 打包），
+// τ 是逐**存储行**的尺度。后端仅在 transA=0 且 N ≤ 8 时分派本 kernel
+// （与稠密路径的 matmul_gemv 同一门槛，见 compute_vk_backend 的选址）。
+//
+// **为什么需要它**（实测驱动）：分块版 matmul_q 按 64×64 输出块算，n=1 时
+// 63/64 的列是空转 —— 102/40HX 实测 m=2560 k=6912 n=1：分块打包 1.53 ms vs
+// 稠密 GEMV 0.36 ms，打包侧权重带宽只有 **2.9 GB/s**（稠密 97 GB/s），
+// "权重读 0.25 B/元素"的优势完全兑不出来。本内核改成"每线程沿**打包字**分片
+// + 只算真实的 N 列"：一个 32-bit 字 = 16 个三值 = 16 个连续 k，每字只读一次
+// 即 0.25 B/权重 → 自回归解码（权重带宽受限）才能兑现打包收益。
+// 思路与 BitNet 官方把 M=1 单独做成 ladder 内核一致（ref/BitNet/kernels.cu）。
+//
+// 结构（**subgroup = 4 行输出，subgroup 内 lane 沿 k 分片**）：
+//   · WorkGroup 256 线程 = gl_NumSubgroups 个 subgroup；第 s 个 subgroup 负责
+//     输出行块 [m0, m0+4)，m0 = (WGID.x*gl_NumSubgroups + s) * 4
+//     （后端 dispatch grid.x = ceil(M / (4*gl_NumSubgroups))）
+//   · subgroup 内 lane 沿**打包字**步进 w = lane, lane+SubgroupSize, … < wpr：
+//     **相邻 lane 读相邻字** → 合并访存
+//   · 每线程持 **4 行** × acc[MAX_N]：一次 B 切片装载摊到 4 行的 4×ncols 次 FMA
+//     （实测口径：每 4 个 k 的 B 装载 ≈ 8 条 load + 24 条解包 = 与"单行 × n=8"
+//     的 32 次 FMA 同量级 —— 1 行/线程的版本在 n=8 比这版慢 2×）
+//   · 归约 = 每 (行, 列) 一次 subgroupAdd，lane r 直接写第 r 行：
+//     **无 barrier、无 shared、无跨 subgroup 串行求和**（对照 matmul_gemv 的
+//     256 路归约 + shared + 串行求和：窄 N 下那部分的指令数与主循环同量级）
+//   · 尾块：K 非 16 倍数时末字的越界位恒为 pad 码 2（三值 0）→ A 侧不判界，
+//     B 侧按 k0+i < K 判零
+//
+// 尾块：K 非 16 倍数时末字有越界位，但 pad 位恒为码 2（三值 0）→ A 侧无需
+// 判界；B 侧仍按 k0+i < K 判零（与 matmul_gemv 同规则，覆盖一致）。
+//
+// 精度变体（glslc -DNN_SHADER_F16=1）：B/C 声明 float16_t（f32 参考累加 + 写出
+// RNE，同所有原语惯例）；打包字缓冲恒 uint。
+// 仅支持 transA=0（转发形态）；transA=1 的窄 N 仍走分块内核 —— 后端门禁保证。
+// ─────────────────────────────────────────────────────────────────────────
+#version 450
+
+#if defined(NN_SHADER_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#define NN_ETYPE float16_t
+#define NN_V4   uvec2
+#define NN_LOADV4(v) vec4(unpackHalf2x16((v).x), unpackHalf2x16((v).y))
+#define NN_RD(x) float(x)
+#include "nn_f16_rne.glsl"
+#define NN_WR(w) float16_t(nn_f16_rne(w))
+#else
+#define NN_ETYPE float
+#define NN_V4   vec4
+#define NN_LOADV4(v) (v)
+#define NN_RD(x) (x)
+#define NN_WR(x) (x)
+#endif
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer BufP   { uint P[]; };      // 打包 A
+layout(std430, binding = 1) readonly  buffer BufT   { float T[]; };     // τ（存储行）
+layout(std430, binding = 2) readonly  buffer BufB   { NN_ETYPE B[]; };  // B (K,N)
+layout(std430, binding = 2) readonly  buffer BufBv4 { NN_V4 Bv4[]; };
+layout(std430, binding = 3) writeonly buffer BufC   { NN_ETYPE C[]; };  // C (M,N)
+
+layout(push_constant) uniform Push {
+    uint M;
+    uint N;
+    uint K;
+    uint transA;   // 恒 0（本内核只服务转发形态）
+    uint wpr;      // A 每存储行的字数 = ceil(K/16)
+};
+
+const uint MAX_N = 8u;       // 后端仅在 N ≤ MAX_N 时分派；= acc 的寄存器宽度
+const uint K_PER_WORD = 16u; // = trit_pack::kPerWord（2 bit × 16 = 一个 uint）
+const uint RPS = 4u;         // 每个 subgroup 负责的输出行数（B 装载的摊销倍数）
+
+void main()
+{
+    if (transA != 0u) return;   // 后端门禁：只有 transA=0 会分派到本内核
+    const uint lane = gl_SubgroupInvocationID;
+    const uint kstride = gl_SubgroupSize;   // subgroup 内 k 分片步长
+    const uint m0 = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * RPS;
+    const uint ncols = (N < MAX_N) ? N : MAX_N;
+
+    // 行有效 + τ（每行一次，寄存器常驻）；τ·(code-2) 写成 fma(τ, code, -2τ)
+    bool row_ok[RPS];
+    float tau[RPS], neg2tau[RPS];
+    [[unroll]] for (uint r = 0u; r < RPS; ++r)
+    {
+        row_ok[r] = (m0 + r < M);
+        tau[r] = row_ok[r] ? T[m0 + r] : 0.0;
+        neg2tau[r] = -2.0 * tau[r];
+    }
+
+    float acc[RPS][MAX_N];
+    [[unroll]] for (uint r = 0u; r < RPS; ++r)
+    [[unroll]] for (uint n = 0u; n < MAX_N; ++n)
+        acc[r][n] = 0.0;
+
+    // ── 沿打包字步进：subgroup 内分片，分片互不依赖（零 barrier）───────
+    for (uint w = lane; w < wpr; w += kstride)
+    {
+        // 4 行各取一字（每字 = 16 个连续 k）；相邻 lane 取相邻字 → 合并访存
+        uint word[RPS];
+        [[unroll]] for (uint r = 0u; r < RPS; ++r)
+            word[r] = row_ok[r] ? P[(m0 + r) * wpr + w] : 0u;
+
+        [[unroll]] for (uint g = 0u; g < 4u; ++g)
+        {
+            const uint k0 = w * K_PER_WORD + g * 4u;
+            if (k0 >= K) break;   // 末字的部分组越界（pad 位已是码 2）
+
+            // 解码 4 个 k × 4 行 → a[r][4]（码 j 的位域 = [8g+2j, 8g+2j+1]）
+            float a[RPS][4];
+            [[unroll]] for (uint r = 0u; r < RPS; ++r)
+                [[unroll]] for (uint i = 0u; i < 4u; ++i)
+                    a[r][i] = fma(tau[r], float((word[r] >> (8u * g + 2u * i)) & 3u),
+                                  neg2tau[r]);
+
+            // ── B 加载 → b[4][MAX_N]（与 matmul_gemv 同款分支）─────────
+            float b[4][MAX_N];
+            [[unroll]] for (uint i = 0u; i < 4u; ++i)
+                [[unroll]] for (uint n = 0u; n < MAX_N; ++n)
+                    b[i][n] = 0.0;
+
+            if (k0 + 4u <= K)
+            {
+                if ((N & 3u) == 0u)
+                {
+                    // N%4==0：按行 vec4 直取（(k0+i)*N%4==0 ⇔ N%4==0）
+                    [[unroll]] for (uint i = 0u; i < 4u; ++i)
+                        [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                        {
+                            if (j * 4u >= ncols) break;
+                            const vec4 v = NN_LOADV4(Bv4[((k0 + i) * N + j * 4u) >> 2]);
+                            b[i][j * 4u + 0u] = v.x;
+                            b[i][j * 4u + 1u] = v.y;
+                            b[i][j * 4u + 2u] = v.z;
+                            b[i][j * 4u + 3u] = v.w;
+                        }
+                }
+                else
+                {
+                    // N%4≠0（1,2,3,5,6,7）：扁平 vec4 装入 cb，按 p=i*N+n 拆分
+                    const uint flatn = (ncols * 4u + 3u) / 4u;
+                    vec4 cb[MAX_N];
+                    [[unroll]] for (uint j = 0u; j < MAX_N; ++j)
+                        cb[j] = vec4(0.0);
+                    for (uint j = 0u; j < flatn; ++j)
+                        cb[j] = NN_LOADV4(Bv4[(k0 * N + j * 4u) >> 2]);
+                    [[unroll]] for (uint i = 0u; i < 4u; ++i)
+                        [[unroll]] for (uint n = 0u; n < MAX_N; ++n)
+                        {
+                            if (n >= ncols) break;
+                            const uint p = i * N + n;
+                            b[i][n] = cb[p >> 2][p & 3u];
+                        }
+                }
+            }
+            else
+            {
+                // k 尾块：标量 + k 判界
+                [[unroll]] for (uint i = 0u; i < 4u; ++i)
+                {
+                    if (k0 + i >= K) break;
+                    [[unroll]] for (uint n = 0u; n < MAX_N; ++n)
+                    {
+                        if (n >= ncols) break;
+                        b[i][n] = NN_RD(B[(k0 + i) * N + n]);
+                    }
+                }
+            }
+
+            // ── 外积 4×ncols 累加（每元素 1 FMA）───────────────────────
+            [[unroll]] for (uint r = 0u; r < RPS; ++r)
+            {
+                if (!row_ok[r]) continue;
+                [[unroll]] for (uint i = 0u; i < 4u; ++i)
+                {
+                    const float av = a[r][i];
+                    [[unroll]] for (uint n = 0u; n < MAX_N; ++n)
+                    {
+                        if (n >= ncols) break;
+                        acc[r][n] = fma(av, b[i][n], acc[r][n]);
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 归约 + 写出：本 subgroup 的 4 行各做一次 subgroupAdd，lane r 写第 r 行 ──
+    // （无 barrier / 无 shared / 无跨 subgroup 串行求和；只归约真实列数 ncols）
+    [[unroll]] for (uint r = 0u; r < RPS; ++r)
+    {
+        [[unroll]] for (uint n = 0u; n < MAX_N; ++n)
+        {
+            if (n >= ncols) break;
+            const float s = subgroupAdd(acc[r][n]);
+            if (lane == r && row_ok[r])
+                C[(m0 + r) * N + n] = NN_WR(s);
+        }
+    }
+}

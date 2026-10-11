@@ -283,6 +283,9 @@ void main()
     [[unroll]] for (uint r = 0u; r < ROWS; ++r)
         [[unroll]] for (uint n = 0u; n < MAX_N; ++n)
         {
+            // 只归约真实列数：MAX_N=8 的固定 32 路归约在 n=1 时与主循环同量级
+            // （每路 = subgroupAdd + shared 写 + barrier + 跨 subgroup 求和）
+            if (n >= ncols) break;
             acc[r][n] = subgroupAdd(acc[r][n]);
             if (gl_SubgroupInvocationID == 0u && gl_SubgroupID < 64u)
                 red[r][n][gl_SubgroupID] = acc[r][n];

@@ -49,7 +49,7 @@ BUILD_DIR = PROJECT_DIR / "build"
 
 # ---------- 枚举选项 ----------
 ARCH_OPTIONS = ["mlp", "transformer", "cnn"]
-OPTIMIZER_OPTIONS = ["sgd", "sgd_momentum", "adam", "adamw", "muon"]
+OPTIMIZER_OPTIONS = ["sgd", "sgd_momentum", "adam", "adamw", "adamwquant", "muon"]
 # 后端仅 CPU / Vulkan，**本项目不支持 CUDA**（AGENTS §2）→ 不提供 CUDA 选项
 ENGINE_OPTIONS = ["CPU", "GPU (Vulkan)"]
 LR_SCHEDULE_OPTIONS = ["fixed", "cosine"]
@@ -770,9 +770,9 @@ class MnistTrainTab(TabBase):
         self.dataset.insert(0, str(DATASETS_DIR / "mnist_data"))
         r += 1
         self.save_path = _make_save_row(p, "保存路径", r,
-                                         default_name="pretrained/mnist_model.bin"); r += 1
-        self.resume_path = _make_file_row(p, "恢复路径", r,
-                                           filetypes=[("模型文件", "*.bin")]); r += 1
+                                         default_name="pretrained/mnist_model.nnmodel"); r += 1
+        self.resume_path = _make_file_row(p, "恢复路径 (训练断点 .nnckpt)", r,
+                                           filetypes=[("训练断点", "*.nnckpt *.bin")]); r += 1
         self.epochs = _make_entry_row(p, "轮数 (epochs)", r, "10"); r += 1
         self.batch_size = _make_entry_row(p, "批大小", r, "64"); r += 1
         self.optimizer = _make_option_row(p, "优化器", r, OPTIMIZER_OPTIONS, "adam"); r += 1
@@ -858,7 +858,7 @@ class MnistTrainTab(TabBase):
         dev = "cpu"
         if args.pop("gpu", False):
             dev = "gpu"
-        name = Path(args.get("save", "mnist_model.bin")).stem or "mnist_run"
+        name = Path(args.get("save", "mnist_model.nnmodel")).stem or "mnist_run"
         return {"format_version": 1, "name": name, "task": "mnist",
                 "device": dev, "data": data, "hyperparameters": args}
 
@@ -986,7 +986,7 @@ class MnistInferTab(TabBase):
         p = self.params_frame
         r = 0
         self.model_path = _make_file_row(p, "模型路径", r,
-                                          filetypes=[("模型文件", "*.bin *.onnx")]); r += 1
+                                          filetypes=[("模型文件", "*.nnmodel *.bin *.onnx")]); r += 1
         self.input_method = _make_option_row(p, "输入方式", r,
                                               ["单个文件", "目录", "画板绘制"],
                                               "单个文件"); r += 1
@@ -1381,9 +1381,9 @@ class GptTrainTab(TabBase):
         self.text_file = _make_file_row(p, "数据集文件 (.nndataset)", r,
                                          filetypes=[("数据集文件", "*.nndataset")]); r += 1
         self.save_path = _make_save_row(p, "保存路径", r,
-                                         default_name="gpt_model.bin"); r += 1
-        self.resume_path = _make_file_row(p, "恢复路径", r,
-                                           filetypes=[("模型文件", "*.bin *.nnpkg")]); r += 1
+                                         default_name="gpt_model.nnmodel"); r += 1
+        self.resume_path = _make_file_row(p, "恢复路径 (训练断点 .nnckpt)", r,
+                                           filetypes=[("训练断点", "*.nnckpt *.bin *.nnpkg")]); r += 1
         self.resume_epoch = _make_entry_row(p, "续训起始 epoch (0-based)", r, "0"); r += 1
         self.resume_step = _make_entry_row(p, "续训起始 step (0-based)", r, "0"); r += 1
 
@@ -1474,7 +1474,7 @@ class GptTrainTab(TabBase):
         dev = "cpu"
         if args.pop("gpu", False):
             dev = "gpu"
-        name = Path(args.get("save", "gpt_model.bin")).stem or "gpt_run"
+        name = Path(args.get("save", "gpt_model.nnmodel")).stem or "gpt_run"
         return {"format_version": 1, "name": name, "task": "gpt",
                 "device": dev, "data": data, "hyperparameters": args}
 
@@ -1616,7 +1616,7 @@ class GptInferTab(TabBase):
         p = self.params_frame
         r = 0
         self.model_path = _make_file_row(p, "模型路径", r,
-                                          filetypes=[("模型文件", "*.bin *.pt *.nnpkg")]); r += 1
+                                          filetypes=[("模型文件", "*.nnmodel *.bin *.pt *.nnpkg")]); r += 1
         self.vocab_path = _make_file_row(p, "词表路径 (模型未嵌入时)", r,
                                           filetypes=[("词表文件", "*.nnvocab")]); r += 1
         self.max_tokens = _make_entry_row(p, "最大生成token数", r, "200"); r += 1

@@ -254,8 +254,8 @@ void print_usage(const char *prog)
     help.item("<dataset.nndataset>", "数据集文件路径 (.nndataset，由 dataset_gen 生成；\n词表/loss 掩码/test 子集都在生成期定好)");
 
     help.section("选项");
-    help.opt("--save <path>", "模型保存路径 (默认: gpt_model.bin)");
-    help.opt("--resume <path>", "从已有模型恢复训练");
+    help.opt("--save <path>", "推理模型保存路径 (默认: gpt_model.nnmodel；\n只含推理所需参数——三值层写打包形态，不含训练参数)");
+    help.opt("--resume <path>", "从训练断点 (.nnckpt) 恢复训练；\n推理模型文件 (.nnmodel) 没有训练参数，会被明确拒绝");
     help.opt("--resume-epoch <n>", "从第 n 个 epoch 继续 (0-based，需配合 --resume；默认 0)");
     help.opt("--resume-step <n>", "从本 epoch 内第 n 步继续 (0-based，需配合 --resume；默认 0)");
     help.opt("--epochs <n>", "训练轮数 (默认: 10)");
@@ -264,13 +264,13 @@ void print_usage(const char *prog)
     help.opt("--accum-steps <n>", "梯度累积步数 (默认: 1)\n每 n 步 forward/backward 累加梯度后再更新参数，等效放大 batch_size×n");
     help.opt("--seq-len <n>", "序列长度 (默认: 256)");
     help.opt("--stride <n>", "滑动窗口步长 (默认: 等于 --seq-len，即不重叠)\n设小可产生重叠窗口，增加训练样本数");
-    help.opt("--optimizer <name>", "优化器: sgd/sgd_momentum/adam/adamw/muon (默认: adam)");
+    help.opt("--optimizer <name>", "优化器: sgd/sgd_momentum/adam/adamw/adamwquant/muon (默认: adam)\nadamwquant: 量化状态的 AdamW（状态 4 B/权重 vs 8 B；见 docs/development/21 §4.13）");
     help.opt("--weight-decay <w>", "AdamW 权重衰减系数 (默认: 0.01)");
     help.opt("--beta1 <b>", "Adam/AdamW 一阶动量衰减 β1 (默认: 0.9，sgd/muon 忽略)");
     help.opt("--beta2 <b>", "Adam/AdamW 二阶动量衰减 β2 (默认: 0.999，sgd/muon 忽略)\nLLM 预训练惯例常取 0.95 (GPT-3/LLaMA 配方)");
     help.opt("--max-norm <f>", "梯度裁剪最大全局 L2 范数 (默认: 0=不裁剪)");
     help.opt("--log-interval <n>", "每隔多少 step 显示进度 (默认: 50)");
-    help.opt("--save-interval <n>", "每隔多少 step 保存 checkpoint (默认: 100)");
+    help.opt("--save-interval <n>", "每隔多少 step 保存训练断点 .nnckpt (默认: 100；\n文件名 = --save 的路径换 .nnckpt 扩展名)");
     help.opt("--max-steps <n>", "本次运行最多训练多少 step 后停止并保存 (默认: 0=不限)\n按本进程执行的步数计，可与 --resume 组合分段跑；用于吞吐实测/分段训练");
     help.opt("--grad-log", "显示梯度统计 (范数/最大值/均值)");
     help.opt("--gpu [索引|名称]", "启用 GPU 加速 (需要 Vulkan SDK)\n空格形式只收枚举索引；名称子串用 --gpu=<名称>，如 --gpu=NVIDIA / --gpu=40HX");
@@ -316,10 +316,22 @@ void print_usage(const char *prog)
 }
 
 // ==================== 命令行参数 ====================
+// 训练断点路径（docs/development/23 §2.1）：`--save` 的路径换扩展名为 .nnckpt
+// （`gpt_model.nnmodel` → `gpt_model.nnckpt`；其它路径则追加 .nnckpt）。
+[[nodiscard]] static std::string ckpt_path_of(const std::string& save_path)
+{
+    static const std::string kExt = ".nnmodel";
+    if (save_path.size() > kExt.size() &&
+        save_path.compare(save_path.size() - kExt.size(), kExt.size(), kExt) == 0)
+        return save_path.substr(0, save_path.size() - kExt.size()) + ".nnckpt";
+    return save_path + ".nnckpt";
+}
+
 struct TrainConfig
 {
     std::string text_path;
-    std::string save_path = "gpt_model.bin";
+    // 推理模型（.nnmodel，Model 角色）：只含推理所需参数（三值层写打包形态）。
+    std::string save_path = "gpt_model.nnmodel";
     std::string resume_path;
     std::string optimizer_name = "adam";
     int epochs = 10;
@@ -449,10 +461,10 @@ TrainConfig parse_args(int argc, char *argv[])
             cfg.optimizer_name = argv[++i];
             if (cfg.optimizer_name != "sgd" && cfg.optimizer_name != "sgd_momentum" &&
                 cfg.optimizer_name != "adam" && cfg.optimizer_name != "adamw" &&
-                cfg.optimizer_name != "muon")
+                cfg.optimizer_name != "adamwquant" && cfg.optimizer_name != "muon")
             {
                 std::cerr << "未知优化器: " << cfg.optimizer_name
-                          << "，可选: sgd, sgd_momentum, adam, adamw, muon\n";
+                          << "，可选: sgd, sgd_momentum, adam, adamw, adamwquant, muon\n";
                 std::exit(1);
             }
         }
@@ -1035,6 +1047,21 @@ int main(int argc, char *argv[])
 
     if (cfg.load_existing)
     {
+        // 角色校验（v7，docs/development/23 §2.1）：`--resume` 只认训练断点。
+        // 推理模型文件（.nnmodel）没有训练参数（三值层只有打包权重）→ 明确拒绝；
+        // v5/v6 老 .bin 无 role 字段 → 按"训练文件"处理（零破坏）。
+        {
+            uint32_t resume_version = 0;
+            auto role_r = nn::peek_model_role(cfg.resume_path, &resume_version);
+            if (role_r && resume_version >= 7 && *role_r != nn::ModelRole::Checkpoint)
+            {
+                std::cerr << "错误: --resume 需要训练断点文件（.nnckpt，Checkpoint 角色），但 "
+                          << cfg.resume_path << " 是 " << nn::model_role_name(*role_r)
+                          << "；它不含训练参数（三值层只有打包权重）。\n"
+                          << "  请用训练时 --save-interval 产出的 .nnckpt 续训。\n";
+                std::exit(1);
+            }
+        }
         auto spec_result = nn::peek_model_spec(cfg.resume_path);
         if (!spec_result)
         {
@@ -1576,7 +1603,9 @@ int main(int argc, char *argv[])
             if (cfg.save_interval > 0 &&
                 ((step + 1) % cfg.save_interval == 0 || step + 1 == steps_per_epoch))
             {
-                auto save_r = nn::save_model(cfg.save_path, model, spec, tokenizer_bytes);
+                // 训练断点（Checkpoint 角色）：含训练参数（三值层 = f32 latent）
+                auto save_r = nn::save_model(ckpt_path_of(cfg.save_path), model, spec,
+                                             tokenizer_bytes, nn::ModelRole::Checkpoint);
                 if (!save_r)
                     std::cerr << "\n  [ckpt] 保存失败: " << save_r.error().message << "\n";
             }
@@ -1735,7 +1764,9 @@ int main(int argc, char *argv[])
 
     // ── 保存模型（含规格 + 嵌入 tokenizer） ──────────────────
     {
-        auto save_result = nn::save_model(cfg.save_path, model, spec, tokenizer_bytes);
+        // 推理模型（Model 角色）：三值层写打包形态 + τ（不含训练参数）
+        auto save_result = nn::save_model(cfg.save_path, model, spec, tokenizer_bytes,
+                                          nn::ModelRole::Model);
         NN_EXIT(save_result, 1, "Error: ");
     }
     std::cout << "\n训练完成! 总耗时: " << std::fixed << std::setprecision(1)
