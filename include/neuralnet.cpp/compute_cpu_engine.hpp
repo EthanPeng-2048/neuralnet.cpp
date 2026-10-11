@@ -655,65 +655,77 @@ public:
         Matrix& om = out.cpu_matrix();
         const auto p_span = pm.span();
         const auto s_span = sm.span();
-        const auto b_span = bm.span();
         auto o_span = om.span();
-
-        // 每次调用一次的"一行解码"小缓冲（16 个权重/字，逐行解码一遍即可）
-        std::vector<float> a_row(a_len);
         const std::size_t wpr = nn::trit_pack::words_per_row(a_len);
 
+        // ── 行块解码 + 复用**稠密 SIMD 微内核**（P2 的 CPU 侧性能）────────
+        // 早期版本是逐元素直算（O(M·N·K) 标量三重循环）：解码确实只做一遍，
+        // 但乘加不走分块微内核 —— 实测同形状比稠密路径慢 ~70×（`layer_bench
+        // --op matmul,matmul_q` 配对口径）。解码本身是每权重一次的线性开销
+        // （与稠密路径读一遍权重同量级），故正确做法是把它与乘加**分开**：
+        // 解码一个行块到 f32 scratch，再交给代数层的分块微内核
+        // （`multiply_to` / `transpose_multiply_to`：SIMD + 寄存器分块）。
+        constexpr std::size_t RB = 64;   // 行块（scratch = RB × a_len × 4B）
         if (!transA)
         {
             // C[m,n] = τ_m · Σ_k trit(m,k)·B[k,n]
-            for (std::size_t m = 0; m < M; ++m)
+            for (std::size_t m0 = 0; m0 < M; m0 += RB)
             {
-                const float* pw = p_span.data() + m * wpr;
-                const float tau = s_span[m];
-                for (std::size_t i = 0; i < a_len; ++i)
+                const std::size_t nr = std::min(RB, M - m0);
+                Matrix a_blk = Matrix::make_uninitialized(nr, a_len);
+                auto ab = a_blk.span();
+                for (std::size_t i = 0; i < nr; ++i)
                 {
-                    const std::uint32_t word =
-                        std::bit_cast<std::uint32_t>(pw[i / nn::trit_pack::kPerWord]);
-                    const std::uint32_t code =
-                        (word >> (nn::trit_pack::kBits *
-                                  (i % nn::trit_pack::kPerWord))) &
-                        nn::trit_pack::kMask;
-                    a_row[i] = tau * nn::trit_pack::value_of(code);
+                    const float* pw = p_span.data() + (m0 + i) * wpr;
+                    const float tau = s_span[m0 + i];
+                    float* dst = ab.data() + i * a_len;
+                    for (std::size_t j = 0; j < a_len; ++j)
+                    {
+                        const std::uint32_t word = std::bit_cast<std::uint32_t>(
+                            pw[j / nn::trit_pack::kPerWord]);
+                        const std::uint32_t code =
+                            (word >> (nn::trit_pack::kBits *
+                                      (j % nn::trit_pack::kPerWord))) &
+                            nn::trit_pack::kMask;
+                        dst[j] = tau * nn::trit_pack::value_of(code);
+                    }
                 }
-                for (std::size_t n = 0; n < N; ++n)
-                {
-                    float acc = 0.0f;
-                    for (std::size_t k = 0; k < K; ++k)
-                        acc += a_row[k] * b_span[k * N + n];
-                    o_span[m * N + n] = acc;
-                }
+                Matrix c_blk = Matrix::make_uninitialized(nr, N);
+                a_blk.multiply_to(c_blk, bm);
+                const auto cb = c_blk.span();
+                std::copy(cb.begin(), cb.end(), o_span.begin() + m0 * N);
             }
         }
         else
         {
             // C[m,n] = τ_k · Σ_k trit(k,m)·B[k,n]（A 存为 (K,M)）
-            for (std::size_t m = 0; m < M; ++m)
-                for (std::size_t n = 0; n < N; ++n) o_span[m * N + n] = 0.0f;
-            for (std::size_t k = 0; k < K; ++k)
+            // 按 m 分块解码成 (K × RB) 的 f32 scratch → A^T·B 微内核
+            for (std::size_t m0 = 0; m0 < M; m0 += RB)
             {
-                const float* pw = p_span.data() + k * wpr;
-                const float tau = s_span[k];
-                for (std::size_t i = 0; i < a_len; ++i)
+                const std::size_t nr = std::min(RB, M - m0);
+                Matrix a_blk = Matrix::make_uninitialized(K, nr);
+                auto ab = a_blk.span();
+                for (std::size_t k = 0; k < K; ++k)
                 {
-                    const std::uint32_t word =
-                        std::bit_cast<std::uint32_t>(pw[i / nn::trit_pack::kPerWord]);
-                    const std::uint32_t code =
-                        (word >> (nn::trit_pack::kBits *
-                                  (i % nn::trit_pack::kPerWord))) &
-                        nn::trit_pack::kMask;
-                    a_row[i] = tau * nn::trit_pack::value_of(code);
+                    const float* pw = p_span.data() + k * wpr;
+                    const float tau = s_span[k];
+                    float* dst = ab.data() + k * nr;
+                    for (std::size_t i = 0; i < nr; ++i)
+                    {
+                        const std::size_t m = m0 + i;
+                        const std::uint32_t word = std::bit_cast<std::uint32_t>(
+                            pw[m / nn::trit_pack::kPerWord]);
+                        const std::uint32_t code =
+                            (word >> (nn::trit_pack::kBits *
+                                      (m % nn::trit_pack::kPerWord))) &
+                            nn::trit_pack::kMask;
+                        dst[i] = tau * nn::trit_pack::value_of(code);
+                    }
                 }
-                const float* brow = b_span.data() + k * N;
-                for (std::size_t n = 0; n < N; ++n)
-                {
-                    const float bc = brow[n];
-                    for (std::size_t m = 0; m < M; ++m)
-                        o_span[m * N + n] += a_row[m] * bc;
-                }
+                Matrix c_blk = Matrix::make_uninitialized(nr, N);
+                a_blk.transpose_multiply_to(c_blk, bm);
+                const auto cb = c_blk.span();
+                std::copy(cb.begin(), cb.end(), o_span.begin() + m0 * N);
             }
         }
         return out;

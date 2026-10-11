@@ -535,6 +535,14 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 
 # 引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器
 
+## 三值 P2 收口：分块解码 GEMM 轴向修复 + 窄 N 打包 GEMV + CPU 行块解码（2026-10-11，分支 `wip/t158-tiled-gemm` → 合入 `dev/t1_58`；原位置 `docs/development/21-quantized-weights.md` §4.12 ⑥ 的"待分块解码 GEMM 重新标定"与 §5 的 P2 剩余项）
+- 类型：bug 根因（静默错值）/ 新原语 / 性能 A/B / 口径更正
+- 内容：① **轴向缺陷**（WIP 卡点根因）：分块版 `matmul_q.comp` 的 `WorkGroupID.x → block_col(N)`，而后端 dispatch 写的是 `(ceil(M/64), ceil(N/64))` → M≠N 的形状只算到 `ceil(N/64)·64` 行；`M=N≤64` 的方形小形状恰好只有 1 个 workgroup、两向重叠 → **既有测试全绿**（2B4T 的 lm_head 只写前 256 行 → GPU 训练取值错、CPU/GPU loss 差 1.33）。修法 = 与 `matmul_tiled`/`batched_matmul` 统一为 `x↔N, y↔M`，并写成分块内核的两条不变量。② **新原语 `matmul_q_gemv.comp`**（N ≤ 8 且 transA=0）：subgroup = 4 行、subgroup 内 lane 沿打包字分片（合并访存）、**subgroupAdd 每 (行,列) 一次 + lane r 写第 r 行**（无 barrier/shared/跨 subgroup 串行求和）；后端 `grid.x = ceil(M/(4·(256/subgroup_size)))` 是布局契约。③ 删掉 `kPackedMaxBatch=8` 启发式 → **训练也走打包**。④ **CPU `matmul_q_impl` 重写**：行块（RB=64）解码到 f32 scratch + 复用 `multiply_to`/`transpose_multiply_to` 稠密微内核（原逐元素直算比稠密慢 ~70×）。⑤ `layer_bench` 加 `matmul_q`/`matmul_q_t`（GFLOPS 可比）+ `matmul_q_bw`/`matmul_q_t_bw`（权重带宽口径）+ `--f16` + `--inner`。
+- **实测（102 / 40HX，f16）**：形状表见 §4.14 —— 打包在**任何 n 上都没打赢稠密 f16**（宽 N 持平~+13%、窄 N 1.1–2.3×），收益在存储/带宽（0.25 B/权重）。端到端：训练 60 步 2.0 s（基线 2.0–2.1 s，3 次重复）、训练显存峰值 **570 → 522 MiB（−8.4%）**、解码 128 token **1.0 → 0.7 s（−30%）**、推理显存 **88 → 76 MiB（−13.6%）**、**CPU** t1_58 81.4 s vs f16 稠密 83.1 s（打平）。①③④三项测试：`ternary_gemm_test` 新增 [6] 跨形状对拍（9 形状 × transA × f32/f16 + GPU 的 2B4T 量级）与 [7] BitLinear 跨形状端到端（含 n=4 GEMV 门内 / n=9 门上）；本机与 102 各 ctest **36/36**。
+- **口径更正**：§4.12 记的"解码 27.1 s → 14.1 s"与 §4.14 同模型实测的 1.0 s 不是同一口径（不同配置/内核）；§4.14 表格是同机同语料同天的可比数据。
+- **被实测否决/保留的取舍**：① "1 行/线程的 GEMV"（更省寄存器、归约更便宜）在 n=8 比 4 行版**慢 2×** → 保留 4 行（B 装载摊销 4 次）；② "把 MAX_N 固定 8 路归约跑满" 改为只归约真实列数；③ 打包要在 GPU 上真正打赢稠密，前提是 **P3（激活 int8 + 整数点积）**——BitNet 官方 GPU kernel 走 `ladder_int8xint2`（W2A8 + 张量核），本项目 Vulkan 路径没有张量核（见 §4.14 诚实结论）。
+- **工具修复**：`bench/run_with_vram.ps1` 的采样器从 `Start-Job` 轮询改为**前台轮询 + 被测程序后台**（job 的 PATH/会话与前台不同，本机实测采到 0 条样本 —— 会让峰值静默变成空值）。
+
 ## AdamWQuant：量化状态的 AdamW（2026-10-11，分支 `dev/t1_58`；原位置 `compute_optimizer.hpp`（新类）、`docs/development/21-quantized-weights.md` §4.13 的"F5 待做"）
 - 类型：演进记录 / 性能 A/B / 被否决方案
 - 内容：训练显存的最大单项是优化器状态（m/v 各 f32 = 8 B/权重，三值层账 49%）。新类 `AdamWQuant`：状态存 **f16 + 按行动态缩放**，尺度用**上界估计**推进（`|m_new| ≤ β1|m_old| + (1-β1)|g|`）→ 不需要新状态的 f32 副本，因此**零新原语/零新 shader**（状态写回与参数更新各一趟融合）。`--optimizer adamwquant` + GUI 下拉 + scan 优化器 dry-run 补一条（结构 107 → 113）+ 新测试 `src/adam_quant_test.cpp`（状态账 / 尺度不变式 / 小量级行不下溢 / 零梯度首步 / 与 f32 AdamW 的收敛对齐）。

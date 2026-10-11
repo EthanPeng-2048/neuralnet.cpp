@@ -742,6 +742,10 @@ if(Vulkan_FOUND)
     #     其余 shader 编译参数不变。
     nn_embed_shader(matmul_gemv ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matmul_gemv.comp --target-env=vulkan1.2)
 
+    # 1b'. 三值打包权重的窄 N GEMV（P2/F3）：与 matmul_gemv 同骨（subgroup
+    #      归约）→ 同样需 SPIR-V ≥1.3 的 --target-env=vulkan1.2。
+    nn_embed_shader(matmul_q_gemv ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matmul_q_gemv.comp --target-env=vulkan1.2)
+
     # 1c. reduce：行列归约用 subgroup 蝶式（GL_KHR_shader_subgroup_*，与
     #     DSL 融合归约同配方）→ 同样需 SPIR-V ≥1.3 → --target-env=vulkan1.2
     nn_embed_shader(reduce ${CMAKE_CURRENT_SOURCE_DIR}/shaders/reduce.comp --target-env=vulkan1.2)
@@ -794,6 +798,8 @@ if(Vulkan_FOUND)
     # 训练时激活是 f16 → 不带类型的边界 cast 会为每个 BitLinear 层物化
     # (K,batch)+(M,batch) 两份 f32 临时量（比权重带宽还大），故必须有此变体。
     nn_embed_shader(matmul_q_f16 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matmul_q.comp -DNN_SHADER_F16=1)
+    # 同上：窄 N 打包 GEMV 的 f16 存储变体（解码路的主路径：激活 f16）
+    nn_embed_shader(matmul_q_gemv_f16 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matmul_q_gemv.comp --target-env=vulkan1.2 -DNN_SHADER_F16=1)
 
     # 2. AOT 融合 shader：scan_exprs（**单步** = 收集 + 生成）
     #    收集：FusedAnchor 自登记（按表达式类型）+ dry-run + 模型 pass

@@ -47,9 +47,11 @@ struct BenchConfig
     bool gpu = false;
     bool all = false;
     bool forward_only = false;
+    bool f16 = false;   // 打包算子（matmul_q*）跑 f16 存储变体
     std::vector<std::string> layers;
     int iter = 10;
     int warmup = 2;
+    int inner = 1;   // 每次计时内重复执行次数（摊薄 submit/wait 的固定开销）
 
     // 默认尺寸（GPT 小规模，CPU 秒级可测）
     std::size_t in = 1024, out = 1024;
@@ -87,6 +89,9 @@ Tensor make_input(ComputeEngine& e, std::size_t rows, std::size_t cols)
         std::abort();
     return std::move(*t);
 }
+
+// f16 版输入（定义在后；打包算子与 --f16 的稠密侧共用）
+Tensor make_input_f16(ComputeEngine& e, std::size_t rows, std::size_t cols);
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  LayerSpec — 单个层的构建/输入形状/FLOP 估算
@@ -258,8 +263,10 @@ struct OpSpec
 
 void setup_matmul(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
 {
-    ctx.a = make_input(e, c.m, c.k);
-    ctx.b = make_input(e, c.k, c.n);
+    // --f16：操作数按 f16 上传（= BitLinear 走稠密缓冲时的 compute=f16 形态），
+    // 与打包侧 --f16 同一口径 → 这一对才是"打包 vs 稠密"的公平 A/B。
+    ctx.a = c.f16 ? make_input_f16(e, c.m, c.k) : make_input(e, c.m, c.k);
+    ctx.b = c.f16 ? make_input_f16(e, c.k, c.n) : make_input(e, c.k, c.n);
 }
 // transB=1：B 存储为 (N,K) 按 B^T 使用 → 每个变体独立建自己的操作数（此处
 // (n,k)，不可与 plain 共用 (k,n)）。形状错配的坑：k==n 时方阵恰好掩盖错配，
@@ -279,7 +286,10 @@ void setup_matmul_at(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
 // matmul 系 run：检查 Result（错误时打印并中止，杜绝 *expected UB 静默垃圾值）
 void run_matmul(ComputeEngine& e, const BenchConfig&, OpCtx& ctx)
 {
-    auto r = e.matmul(ctx.a, ctx.b);
+    // 输出精度跟随标记：--f16 时不额外付一次边界 cast（同 BitLinear 的 f16 路径）
+    auto r = e.matmul(ctx.a, ctx.b, false, false,
+                      ctx.a.precision() == nn::Precision::F16 ? nn::Precision::F16
+                                                             : nn::Precision::F32);
     if (!r) { std::printf("matmul error: %s\n", r.error().message.c_str()); std::abort(); }
     ctx.c = std::move(*r);
 }
@@ -352,12 +362,103 @@ void run_scale(ComputeEngine& e, const BenchConfig&, OpCtx& ctx)
     (void)e.scale_inplace(ctx.a, Scalar{0.5f});
 }
 
+// ── 三值打包权重 GEMM（P2 / F3）与稠密 GEMM 的配对 A/B ───────────────────
+// 口径（docs 21 §5 的 P2 准入门槛）：同一 (m,k)·(k,n) 形状、同一份随机数造的
+// latent 权重；稠密侧走 matmul（f16 缓冲），打包侧走 matmul_q（0.25 B/权重）。
+// matmul_q 的 work 记 2*m*n*k，GFLOPS 可与 --op matmul 直接比。
+//
+// matmul_q_bw / matmul_q_t_bw 是**权重带宽口径**（打包权重实际字节 / 时间）：
+// 小 n（自回归解码）下 GEMM 是权重带宽受限，GFLOPS 会随 n 线性掉，带宽口径
+// 才看得出离显存峰值有多远 —— 单列一档，避免用 GFLOPS 掩盖真相。
+//
+// --f16 时打包侧跑 f16 存储变体（B/C 均 half）= BitLinear 的 compute=f16 路径。
+
+// 造 latent (rows,len) → τ 逐行 absmean → 引擎 trit_pack（即被测路径本身）
+void make_packed(ComputeEngine& e, std::size_t rows, std::size_t len,
+                 Tensor& packed, Tensor& tau)
+{
+    if (!e.supports_ternary_gemm())
+    {
+        std::printf("  该引擎不支持三值打包 GEMM（supports_ternary_gemm() == false）\n");
+        std::abort();
+    }
+    Matrix w(rows, len);
+    std::mt19937 g(4321u);
+    std::uniform_real_distribution<Scalar> d(-1.0f, 1.0f);
+    auto s = w.span();
+    for (std::size_t i = 0; i < s.size(); ++i) s[i] = d(g);
+    Matrix tm(rows, 1);
+    for (std::size_t r = 0; r < rows; ++r)
+    {
+        double acc = 0.0;
+        for (std::size_t c = 0; c < len; ++c)
+            acc += std::fabs(static_cast<double>(w.at(r, c)));
+        tm.set_value(r, 0, static_cast<Scalar>(acc / static_cast<double>(len)));
+    }
+    auto wt = e.from_matrix(std::move(w));
+    auto tt = e.from_matrix(std::move(tm));
+    if (!wt || !tt) { std::printf("matmul_q setup: 上传失败\n"); std::abort(); }
+    auto pk = e.trit_pack(*wt, *tt);
+    if (!pk)
+    {
+        std::printf("matmul_q setup: trit_pack 失败: %s\n", pk.error().message.c_str());
+        std::abort();
+    }
+    packed = std::move(*pk);
+    tau = std::move(*tt);
+}
+
+// f16 输入（打包路径的 compute=f16 变体：B 与输出均 half）
+Tensor make_input_f16(ComputeEngine& e, std::size_t rows, std::size_t cols)
+{
+    Matrix m(rows, cols);
+    std::mt19937 g(1234u);
+    std::uniform_real_distribution<Scalar> d(-1.0f, 1.0f);
+    auto s = m.span();
+    for (std::size_t i = 0; i < s.size(); ++i) s[i] = d(g);
+    auto t = e.from_matrix(std::move(m), nn::Precision::F16);
+    if (!t) std::abort();
+    return std::move(*t);
+}
+
+void setup_matmul_q(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
+{
+    make_packed(e, c.m, c.k, ctx.a, ctx.aux);
+    ctx.b = c.f16 ? make_input_f16(e, c.k, c.n) : make_input(e, c.k, c.n);
+}
+void run_matmul_q(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
+{
+    auto r = e.matmul_q(ctx.a, ctx.aux, ctx.b, c.f16 ? nn::Precision::F16 : nn::Precision::F32);
+    if (!r) { std::printf("matmul_q error: %s\n", r.error().message.c_str()); std::abort(); }
+    ctx.c = std::move(*r);
+}
+// A 存 (K,M)：τ 按**存储行** k 取（转发形态，反向 dX 走这条）
+void setup_matmul_q_t(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
+{
+    make_packed(e, c.k, c.m, ctx.a, ctx.aux);
+    ctx.b = c.f16 ? make_input_f16(e, c.k, c.n) : make_input(e, c.k, c.n);
+}
+void run_matmul_q_t(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
+{
+    auto r = e.matmul_q_t(ctx.a, ctx.aux, ctx.b, c.m,
+                          c.f16 ? nn::Precision::F16 : nn::Precision::F32);
+    if (!r) { std::printf("matmul_q_t error: %s\n", r.error().message.c_str()); std::abort(); }
+    ctx.c = std::move(*r);
+}
+// 权重带宽口径：打包 A 的实际字节（m*k/4 B）+ τ（4 B/存储行）
+double bytes_packed(const BenchConfig& c) { return c.m * c.k / 4.0 + 4.0 * c.m; }
+double bytes_packed_t(const BenchConfig& c) { return c.m * c.k / 4.0 + 4.0 * c.k; }
+
 const std::vector<OpSpec>& op_registry()
 {
     static const std::vector<OpSpec> reg = {
         {"matmul", setup_matmul, run_matmul, work_matmul, true},
         {"matmul_bt", setup_matmul_bt, run_matmul_bt, work_matmul, true},
         {"matmul_at", setup_matmul_at, run_matmul_at, work_matmul, true},
+        {"matmul_q", setup_matmul_q, run_matmul_q, work_matmul, true},
+        {"matmul_q_t", setup_matmul_q_t, run_matmul_q_t, work_matmul, true},
+        {"matmul_q_bw", setup_matmul_q, run_matmul_q, bytes_packed, false},
+        {"matmul_q_t_bw", setup_matmul_q_t, run_matmul_q_t, bytes_packed_t, false},
         {"batched_matmul", setup_batched, run_batched, work_batched, true},
         {"add_inplace", setup_add, run_add, bytes_add, false},
         {"row_reduce_sum", setup_exp, run_row_reduce, bytes_row_reduce, false},
@@ -385,8 +486,9 @@ void bench_op(ComputeEngine& engine, const BenchConfig& cfg, const OpSpec& spec)
     for (int i = 0; i < cfg.iter; ++i)
     {
         auto t0 = std::chrono::steady_clock::now();
-        spec.run(engine, cfg, ctx);
-        best = std::min(best, ms_since(t0));
+        for (int j = 0; j < cfg.inner; ++j)
+            spec.run(engine, cfg, ctx);
+        best = std::min(best, ms_since(t0) / static_cast<double>(cfg.inner));
     }
     const double g = (work / (best / 1000.0)) / scale;
     std::printf("  %-14s : %8.3f ms  %10.1f %s\n", spec.name, best, g, unit.data());
@@ -474,8 +576,10 @@ void print_help(const char* prog)
     help.opt("--layer <n>", "指定层 (逗号分隔可多个)");
     help.opt("--op <n>", "指定算子 (matmul 等；all 测试全部算子)");
     help.opt("--forward-only", "仅前向 (默认前向+反向)");
+    help.opt("--f16", "打包算子 (matmul_q*) 跑 f16 存储变体 (B/C 均 half)");
     help.opt("--iter <n>", "迭代次数 (默认: 10)");
     help.opt("--warmup <n>", "预热次数 (默认: 2)");
+    help.opt("--inner <n>", "每次计时内重复执行次数 (默认: 1；小 n 的 GEMM 用它摊薄\nsubmit/wait 固定开销 —— 否则测到的是启动开销不是内核)");
     help.opt("--in/--out <n>", "Linear 输入/输出维度");
     help.opt("--dmodel/--heads/--dff <n>", "序列层维度");
     help.opt("--batch/--seq <n>", "batch / 序列长度");
@@ -491,6 +595,7 @@ void print_help(const char* prog)
     help.section("算子");
     help.text("matmul matmul_bt matmul_at batched_matmul add_inplace");
     help.text("row_reduce_sum col_reduce_sum transpose scale_inplace");
+    help.text("matmul_q matmul_q_t (三值打包 GEMM) matmul_q_bw matmul_q_t_bw (权重带宽口径)");
 }
 
 
@@ -511,6 +616,7 @@ int main(int argc, char* argv[])
         if (a == "--gpu") { cfg.gpu = true; }
         else if (a == "--all") { cfg.all = true; }
         else if (a == "--forward-only") { cfg.forward_only = true; }
+        else if (a == "--f16") { cfg.f16 = true; }
         else if (a == "--layer" && i + 1 < argc)
         {
             std::string val = argv[++i];
@@ -524,6 +630,7 @@ int main(int argc, char* argv[])
         }
         else if (a == "--iter" && i + 1 < argc) { cfg.iter = static_cast<int>(parse_size(argv[++i])); }
         else if (a == "--warmup" && i + 1 < argc) { cfg.warmup = static_cast<int>(parse_size(argv[++i])); }
+        else if (a == "--inner" && i + 1 < argc) { cfg.inner = static_cast<int>(parse_size(argv[++i])); }
         else if (a == "--in") { cfg.in = parse_size(argv[++i]); }
         else if (a == "--out") { cfg.out = parse_size(argv[++i]); }
         else if (a == "--dmodel") { cfg.dmodel = parse_size(argv[++i]); }
@@ -556,6 +663,7 @@ int main(int argc, char* argv[])
     }
 
     // 选择引擎（CPU/GPU），失败硬报错不回退
+    if (cfg.inner < 1) cfg.inner = 1;
     auto engine_r = nn::cli::create_engine(nn::cli::EngineConfig{cfg.gpu});
     NN_EXIT(engine_r, 2, "引擎创建失败: %s\n");
     ComputeEngine& engine = **engine_r;
