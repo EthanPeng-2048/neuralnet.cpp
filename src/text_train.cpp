@@ -348,7 +348,7 @@ struct TrainConfig
     std::size_t num_heads = nn::GPT_NUM_HEADS;
     std::size_t num_layers = nn::GPT_NUM_LAYERS;
     std::size_t d_ff = nn::GPT_D_FF;
-    std::string model_type = "gpt";   // gpt / rapt（zipt 已于 2026-10-01 移除）
+    std::string model_type = "gpt";   // gpt / rapt（zipt 已移除）
     std::size_t log_interval = 50;
     std::size_t save_interval = 100;  // checkpoint 保存间隔（独立于 log_interval）
     std::size_t max_steps = 0;        // 本进程最多训练步数（0 = 不限，按 epoch 跑完）
@@ -519,7 +519,7 @@ TrainConfig parse_args(int argc, char *argv[])
                 std::cerr << "未知模型架构: " << cfg.model_type
                           << ", 可选: gpt, rapt\n";
                 if (cfg.model_type == "zipt")
-                    std::cerr << "（ZiPT 已于 2026-10-01 移除，代码保留在 legacy/zipt 分支；"
+                    std::cerr << "（ZiPT 已移除，代码保留在 legacy/zipt 分支；"
                                  "恢复前提见 docs/history.md）\n";
                 std::exit(1);
             }
@@ -1206,8 +1206,8 @@ int main(int argc, char *argv[])
         sample_indices[i] = i;
 
     // ── 损失覆盖范围 ─────────────────────────────────────────────
-    // 全部 seq_len 位置参与 loss。（原 ZiPT「压缩模式仅窗口位置参与 loss」
-    // 分支已随 ZiPT 于 2026-10-01 移除，见 docs/history.md。）
+    // 全部 seq_len 位置参与 loss。（ZiPT「压缩模式仅窗口位置参与 loss」
+    // 分支已整体移除，见 docs/history.md。）
     const std::size_t eff_seq = cfg.seq_len;
 
     // ── 预分配 batch 缓冲区（末批不满时 resize 到实际 this_bs） ──

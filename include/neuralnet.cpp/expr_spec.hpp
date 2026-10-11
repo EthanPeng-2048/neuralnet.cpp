@@ -430,7 +430,7 @@ struct FoldSpec
 //     逐元素链经 Matmul 操作数读取（matmul 不消耗逐元素寄存器）；
 //     instrs 可为空（输出 = matmul 结果本身）。
 //   - fold 段（可选）：见 FoldSpec；存在时 instrs 必须为空，输出 = fold 输出。
-//   - extras（P2 多输出，2026-10-06）：除主输出（instrs.back().dst）外**额外
+//   - extras（P2 多输出）：除主输出（instrs.back().dst）外**额外
 //     物化**的寄存器列表（槽序 = 输出槽 1..k）。IR-C 写穿物化用：图融合把
 //     状态量（如 Adam 的 m/v）连同其消费链拼进单 kernel 时，状态寄存器经
 //     extras 落回各自张量。**仅纯逐元素 spec**（无 matmul/fold/归约）支持；
@@ -809,6 +809,26 @@ inline constexpr const char* EXPR_PREC_ALU_SUFFIX = "#a";
 // 互不依赖的多实例合成**一次批量派发**（实例表 + buffer device address）。
 // 仅纯逐元素结构、仅 V0 全 f32（见 expr_spec_batchable）。
 inline constexpr const char* EXPR_BATCH_SUFFIX = "#b";
+// matmul 细 tile 变体的 key 后缀（结构 key + "#f"，P0 wgrad 网格饥饿）：
+// 输出块 64×64 → 16×16 的同结构 shader，供 64-tile 网格工作组过少
+// （M/N ≤ 数百的大 K 反传 wgrad 形状）时派发。仅 V0 全 f32、仅纯 matmul
+// 形态（spec.matmul && 无 fold && raxis<0）；未登记/被关闭时运行期留在
+// 64-tile 路径（降级，不是错误）。与 #x/#a/#b 一样是 '#' 后缀——注册门禁
+// 里"带 '#' 需 16 位存储"的判定必须豁免它（它是 f32 变体）。
+inline constexpr const char* EXPR_MM_FINE_SUFFIX = "#f";
+// matmul K 切分变体的 key 后缀（结构 key + "#ks"，wgrad K 切分二次归约）：
+// 细 tile 网格仍饥饿时把求和维 K 切成 S 段、按 (细块网格 × S) 派发——
+// 每 WG 只跑 K/S 段并写**部分和缓冲**（不跑尾链），随后由伴生归约 shader
+// （键 = 结构 key + "#kr"，见 EXPR_MM_KSPLIT_REDUCE_SUFFIX）按段升序求和 +
+// 跑尾链落最终输出。仅 V0 全 f32、仅纯 matmul 形态（与 #f 同判据）。
+// ⚠ K 切分改变**跨段的 K 累加序**（部分和 ≠ 逐 k 串联）→ 结果不再与
+// 64/16-tile 逐位一致，移动 GPU 字节锚（已裁定放行——torch
+// 文档同样不保证数学等价浮点计算逐位一致，见 history「K 切分」条）。
+inline constexpr const char* EXPR_MM_KSPLIT_SUFFIX = "#ks";
+// K 切分的伴生归约 shader 后缀（结构 key + "#kr"）：绑定 = 原输入 0..N-1
+// （尾链读）+ 部分和（binding N）+ 输出（binding N+1）；PC 固定头 6 槽与
+// matmul 同布局（第 4 槽复用为段数 S，kr 不读 mm_k/mm_trans）。
+inline constexpr const char* EXPR_MM_KSPLIT_REDUCE_SUFFIX = "#kr";
 
 // 第 i 个输入是否为 f16 / 输出是否为 f16
 // ⚠ in_f16 必须先与 EXPR_PREC_SIG_INPUT_MASK 相与：EXPR_PREC_SIG_DISPATCH
@@ -965,6 +985,39 @@ inline constexpr std::uint32_t EXPR_FOLD_ROWS_PER_WG = 2;
 // 与生成器必须保持一致。
 inline constexpr std::uint32_t EXPR_MATMUL_TILE   = 16;
 inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
+// ── matmul 细 tile 变体（P0 wgrad 网格饥饿，键后缀 EXPR_MM_FINE_SUFFIX）──
+// 反传 wgrad 形状（M,N = 64..256 × K=16384）在 64-tile 下只派
+// ceil(N/64)×ceil(M/64) = 1~4 个工作组，40HX（34 SM）大面积空转
+// （实测 208~278 GFLOPS vs 同卡方形 2489）。细 tile：输出块 16×16、
+// local_size 8×8=64 线程、**每线程 2×2 输出（R=2）**——网格 = M×N/256
+// （wgrad 形状 48~64 个工作组 ≥ SM 数）、线程总数 = M×N/4、线程内 ILP=4。
+// 两头都要：网格要摊满 SM（WGs ≥ 34）、线程内要有多条独立 K 链
+// （A/B 实测定案：同 48 WG×256 线程下 R=4 比 R=1 快 7×；R=4 网格只有
+// 1~4 个（线程上限 M×N/16）→ 必须降 R 换摊铺，R=2 是摊铺×ILP 的甜点）。
+// ⚠ 设计教训：R=4 等比缩块（16×16 块/4×4 线程）线程数不变、拆成半
+// warp 工作组，169 GFLOPS 比不修还差；R=1（16×16 线程）305~439 也不如
+// R=2 预期。逐输出元素的 K 累加序与 64-tile 一致（逐 k 标量升序 FMA）
+// → 结果逐位一致，字节锚不移动。
+inline constexpr std::uint32_t EXPR_MATMUL_TILE_FINE  = 8;
+inline constexpr std::uint32_t EXPR_MATMUL_BLOCK_FINE = 16;
+// 饥饿判据：64-tile 网格的工作组数（含 batch 维）低于该阈值 → 派细 tile
+// 变体。32 ≈ 40HX 的 SM 数（34）——低于它基本必有一波 SM 空转；高于它
+// 64-tile 的每 WG 效率优势占优（细 tile 每输出 LDS/共享足迹更高）。
+// 设备无关的固定阈值（Vulkan 不暴露 SM 数），可用 NN_MM_NO_FINE=1 关闭
+// 做 A/B；NN_MM_FINE_NAIVE=1 另可强制 OP 级走 matmul.comp 对照。
+inline constexpr std::uint32_t EXPR_MATMUL_FINE_MIN_WGS = 32;
+// ── matmul K 切分（键后缀 #ks/#kr，wgrad 二次归约）────────────────────────
+// 细 tile 网格（M×N/256 个 WG）仍低于该阈值 → 把 K 切成 S 段、网格 × S。
+// 256 ≈ 8×40HX SM 数：细 tile 的 48~64 WG 每 SM 只摊 1~2 个，K 长循环
+// （16384 步 LDS 链）延迟暴露、切换不足——×S 既缩短每 WG 的 K 循环又增加
+// 并发掩盖延迟。S = clamp(ceil(阈值 / 细 tile 网格), 2, MAX_S)。
+// 阈值取值依据（text_train wgrad 形状，NN_MM_KSPLIT_S 强制单窗扫描）：
+// 128（qkv S=3/ffn S=2）step 1516 ms/20 步；S=4 → 1508、S=6 → 1497、
+// S=8 → 1498（6~8 平台期）→ 256 给出 qkv S=6/ffn S=4，贴近平台。
+// 运行期可用 NN_MM_KSPLIT_S=<n> 强制 S（A/B 调参）、NN_MM_NO_KSPLIT=1
+// 关闭（回落细 tile 路径）。
+inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MIN_WGS = 256;
+inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S   = 8;
 
 // ── 校验 ──────────────────────────────────────────────────────────────────
 // 返回 unexpected(Error) 描述首个非法点。Layer 侧可在提交前调用以尽早报错。

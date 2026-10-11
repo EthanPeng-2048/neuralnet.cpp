@@ -11,7 +11,7 @@
      - 若样本带 language/lang 字段 → 按白名单过滤，只保留
        Python/JavaScript/Java/C/C++/Go/Rust/TypeScript；
        无该字段 → 跳过语言过滤（本回退链中 codeparrot 源即如此）；
-     - 2026-10 实测：该仓库 gated，未登录（无 HF token）拉流会 401，
+     - 实测：该仓库 gated，未登录（无 HF token）拉流会 401，
        此时自动落入下一源。
   2. codeparrot/codeparrot-clean-valid（split=train，6.1 万行）
      - 正文字段 content；无语言字段 → 跳过语言过滤。

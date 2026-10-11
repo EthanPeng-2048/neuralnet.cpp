@@ -124,29 +124,47 @@ struct SpecBuilder
         spec.rparams.push_back(v);
         return expr::rval(static_cast<std::uint8_t>(spec.rparams.size() - 1));
     }
-    ExprOperand add_input_linear(const Tensor& t)
+    // ── 中心化输入登记（含去重）─────────────────────────────────────────
+    // 同一张量（same_storage：同设备/精度/存储/形状）+ 同一视图 → 复用已有
+    // 槽，不新增绑定。收益（GPU/IR 路径）：
+    //   ① 归约视图只算一遍——RowReduceMax 这类视图在归约生成器里各占一个
+    //      全矩阵 pass，重复槽 = 白读一遍 S（反传 W 重算的 softmax 实测
+    //      4 槽 → 2 槽、行 max pass 减半，见 docs/history 本条）；
+    //   ② 输入下标一致后 CSE 才能把重复子链合并（两次 leaf(S)-rowmax(S)
+    //      此前因操作数下标不同而永不合并）；
+    //   ③ 绑定/描述符更少。
+    // **仅对有效张量判同**：锚点符号实例（FusedAnchor 的占位张量，无存储）
+    // 一律不合并——锚点侧结构由 dry-run/模型 pass 的真实张量路径覆盖，
+    // 两侧走同一 SpecBuilder，保证扫描期登记与运行期 key 一致。
+    // RowGather 这类"登记后改写视图"的调用方必须传 dedup=false：
+    // 若复用已有槽再覆写 views[i]，会污染原输入的视图。
+    ExprOperand add_input(const Tensor& t, const ExprView& v, bool dedup = true)
     {
-        spec.views.push_back(expr::linear());
+        if (dedup)
+        {
+            for (std::size_t i = 0; i < inputs.size(); ++i)
+                if (spec.views[i] == v && inputs[i].same_storage(t))
+                    return expr::input(static_cast<std::uint8_t>(i));
+        }
+        spec.views.push_back(v);
         inputs.push_back(t);
         return expr::input(static_cast<std::uint8_t>(inputs.size() - 1));
+    }
+    ExprOperand add_input_linear(const Tensor& t, bool dedup = true)
+    {
+        return add_input(t, expr::linear(), dedup);
     }
     ExprOperand add_input_rotate(const Tensor& t, std::uint32_t block)
     {
-        spec.views.push_back(expr::rotate_half(block, /*negate_first_half=*/true));
-        inputs.push_back(t);
-        return expr::input(static_cast<std::uint8_t>(inputs.size() - 1));
+        return add_input(t, expr::rotate_half(block, /*negate_first_half=*/true));
     }
     ExprOperand add_input_rowmod(const Tensor& t, std::uint32_t mod)
     {
-        spec.views.push_back(expr::row_mod(mod));
-        inputs.push_back(t);
-        return expr::input(static_cast<std::uint8_t>(inputs.size() - 1));
+        return add_input(t, expr::row_mod(mod));
     }
     ExprOperand add_input_rowaccess(const Tensor& t, std::uint32_t offset, std::uint32_t mod)
     {
-        spec.views.push_back(expr::row_access(offset, mod));
-        inputs.push_back(t);
-        return expr::input(static_cast<std::uint8_t>(inputs.size() - 1));
+        return add_input(t, expr::row_access(offset, mod));
     }
     // 分组归约视图输入：输出 (G,N)、输入 (G*R,N)，out[r][c] = Σ/max over
     // t<R of in[(r*R+t)][c]。R = 组长度，**运行期视图参数**（vp 槽，不进
@@ -158,9 +176,7 @@ struct SpecBuilder
         v.kind = static_cast<std::uint8_t>(is_max ? ExprViewKind::GroupedReduceMax
                                                    : ExprViewKind::GroupedReduceSum);
         v.param = R;
-        spec.views.push_back(v);
-        inputs.push_back(t);
-        return expr::input(static_cast<std::uint8_t>(inputs.size() - 1));
+        return add_input(t, v);
     }
     // 归约视图输入：该输入被归约为每行/每列一个标量（(rows,1)/(1,cols)），
     // 求值期自动广播——参与算术时按当前 (r,c) 读取对应标量。
@@ -168,9 +184,7 @@ struct SpecBuilder
     {
         ExprView v;
         v.kind = static_cast<std::uint8_t>(kind);
-        spec.views.push_back(v);
-        inputs.push_back(t);
-        return expr::input(static_cast<std::uint8_t>(inputs.size() - 1));
+        return add_input(t, v);
     }
     // 归约指令：对某表达式结果（操作数 a）归约 → 隐式"每行/每列一个标量"
     // 的归约向量，后续指令经 Reduce 操作数按行/列广播访问。
@@ -186,15 +200,11 @@ struct SpecBuilder
     // 广播视图：输入本身已是 (rows,1)/(1,cols) 小向量，按行/列广播
     ExprOperand add_input_rowbroadcast(const Tensor& t)
     {
-        spec.views.push_back(expr::row_broadcast());
-        inputs.push_back(t);
-        return expr::input(static_cast<std::uint8_t>(inputs.size() - 1));
+        return add_input(t, expr::row_broadcast());
     }
     ExprOperand add_input_colbroadcast(const Tensor& t)
     {
-        spec.views.push_back(expr::col_broadcast());
-        inputs.push_back(t);
-        return expr::input(static_cast<std::uint8_t>(inputs.size() - 1));
+        return add_input(t, expr::col_broadcast());
     }
     ExprOperand add_instr(ExprOp op, ExprOperand a, ExprOperand b = {}, ExprOperand c = {})
     {
@@ -660,11 +670,14 @@ struct MatmulRef
     }
     ExprOperand to_spec(SpecBuilder& sb) const
     {
-        // 显式固定登记顺序（A 先 B 后），保证跨编译器确定（同 Binary 约定）
-        const std::uint8_t ai = static_cast<std::uint8_t>(sb.inputs.size());
-        (void)sb.add_input_linear(a);
-        const std::uint8_t bi = static_cast<std::uint8_t>(sb.inputs.size());
-        (void)sb.add_input_linear(b);
+        // 显式固定登记顺序（A 先 B 后），保证跨编译器确定（同 Binary 约定）。
+        // 下标取 add_input_linear 的**返回值**（不能用 inputs.size() 预判）。
+        // A/B **不去重**（dedup=false）：matmul 的 vec4 快路径以 a_slot!=b_slot
+        // 为启用条件（见 expr_glsl_gen vec4_ok）——若 A、B 是同一张量（如
+        // Muon 的 X·Xᵀ）被合并成单槽，快路径整体关闭、标量回退，得不偿失。
+        // 两槽绑同一张量语义等价（a/b 索引公式各按 transA/transB 独立计算）。
+        const std::uint8_t ai = sb.add_input_linear(a, /*dedup=*/false).idx;
+        const std::uint8_t bi = sb.add_input_linear(b, /*dedup=*/false).idx;
         // k = 求和维度：transA=0 → A.cols()（A 存储 (batch*M, K)）；
         // transA=1 → A.rows()/batch（A 存储 (batch*K, M)，每批 (K, M)）
         const std::uint32_t k = static_cast<std::uint32_t>(
@@ -715,12 +728,12 @@ struct RowGatherRef
     [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
     ExprOperand to_spec(SpecBuilder& sb) const
     {
-        const std::uint8_t ti = static_cast<std::uint8_t>(sb.inputs.size());
-        (void)sb.add_input_linear(t);
-        const std::uint8_t li = static_cast<std::uint8_t>(sb.inputs.size());
-        (void)sb.add_input_colbroadcast(labels);
-        sb.spec.views[ti] = expr::row_gather(li);  // RowGather 视图，param=标签槽
-        return expr::input(ti);
+        // 登记后要改写视图为 RowGather → 必须独占新槽（dedup=false）：
+        // 若复用已有 Linear 槽再覆写 views[i]，会污染原输入的视图。
+        const ExprOperand ti = sb.add_input_linear(t, /*dedup=*/false);
+        const std::uint8_t li = sb.add_input_colbroadcast(labels).idx;
+        sb.spec.views[ti.idx] = expr::row_gather(li);  // RowGather 视图，param=标签槽
+        return ti;
     }
 };
 
@@ -732,10 +745,8 @@ struct BatchModRef
     [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
     ExprOperand to_spec(SpecBuilder& sb) const
     {
-        // 直接登记 BatchMod 视图（输入 (1,mod) 小向量，按 batch 取模索引）
-        sb.spec.views.push_back(expr::batch_mod(modulo));
-        sb.inputs.push_back(t);
-        return expr::input(static_cast<std::uint8_t>(sb.inputs.size() - 1));
+        // 登记 BatchMod 视图（输入 (1,mod) 小向量，按 batch 取模索引）
+        return sb.add_input(t, expr::batch_mod(modulo));
     }
 };
 
@@ -748,9 +759,7 @@ struct BatchColRef
     [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
     ExprOperand to_spec(SpecBuilder& sb) const
     {
-        sb.spec.views.push_back(expr::batch_col(per_batch_cols));
-        sb.inputs.push_back(t);
-        return expr::input(static_cast<std::uint8_t>(sb.inputs.size() - 1));
+        return sb.add_input(t, expr::batch_col(per_batch_cols));
     }
 };
 
@@ -1512,7 +1521,7 @@ template <typename E>
     // 表达式文本仍只出现在 Layer；这里登记的是派生物 ExprSpec。
     // 自登记锚点（按类型登记结构）在 scan_register 内统一处理。
     (void)eng;
-    // IR-C（2026-10-06 恢复）：个体结构**恒登记**（录制段内也登记——锚点的
+    // IR-C：个体结构**恒登记**（录制段内也登记——锚点的
     // 符号实例与运行期实例可能折叠出不同 key，双保险；注册表按 key 去重，
     // 冗余无害。P2 教训：只入图不登记会让未融合回退/单节点 kernel 闭合世界
     // miss），录制段内再入图（end_expr 时融合并登记复合 spec）。
@@ -1716,7 +1725,7 @@ template <typename E>
     (void)eng;
     // 个体结构恒登记（录制段内也登记，双保险——见 compute 的说明）
     const ExprSpec reg_spec = scan_register(e);
-    // IR-C（2026-10-06 恢复）：录制段内加入图（归约向量占位 + tag）
+    // IR-C：录制段内加入图（归约向量占位 + tag）
     if (auto* g = fused::recording_graph())
     {
         auto [rspec, rinputs] = to_expr_spec(e);

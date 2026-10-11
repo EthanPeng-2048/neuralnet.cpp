@@ -6,7 +6,7 @@
   1. HuggingFaceFW/OpenWebMath（split=train，正文字段 text）
   2. eleutherai/open-web-math（split=train，正文字段 text）
   3. open-web-math/open-web-math（split=train，631 万条，正文字段 text）
-     ——2026-10 实测：前两个 ID 在 HF 均返回 401（不存在/不可访问），
+     ——实测：前两个 ID 在 HF 均返回 401（不存在/不可访问），
      OpenWebMath 的现行官方仓库是 open-web-math/open-web-math，故追加为
      最终兜底，保证回退链实际可用；前两者保留（若日后恢复/改名则优先命中）。
 
@@ -55,7 +55,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(SCRIPT_DIR, "datasets")
 
 # 回退链（按序尝试；每个源先试首选 split，再退到不指定 split）：
-#   前两个 ID 2026-10 实测为 401（不存在），第三个是现行官方仓库（见文件头）
+#   前两个 ID 实测为 401（不存在），第三个是现行官方仓库（见文件头）
 MATH_SOURCES = (
     {"hf_id": "HuggingFaceFW/OpenWebMath", "split": "train"},
     {"hf_id": "eleutherai/open-web-math", "split": "train"},

@@ -409,7 +409,7 @@ public:
         const std::size_t t_next = t_ + 1;
         const auto [inv_bc1, inv_bc2] = bias_correction_(t_next);
 
-        // IR-C（P2，2026-10-06）：整个步进录制为一张图——每参数的 K1/K2 状态
+        // IR-C（P2）：整个步进录制为一张图——每参数的 K1/K2 状态
         // 写穿 + K3 中间量 + K4 目标传递融合为**每张量一个多输出 kernel**（f32
         // 下 4 节点金刚石单 kernel 3 extras；混精度按门禁自动分裂），替代逐表达式
         // 数百个小 dispatch（P2 前实测 266 设备 kernel/步、host 提交 4.5ms/步）。

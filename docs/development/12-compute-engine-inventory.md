@@ -1,10 +1,10 @@
-# 计算引擎现状盘点（最近复核 2026-09-27）
+# 计算引擎现状盘点
 
 > 本文只记录**当前状态**：引擎接口清单、表达式求值机制、与目标形态的差距。
 > 目的：把当前代码里实际并存的计算 API 与遗留物列清楚，作为事实底座；全部结论来自
 > 当前工作树的源码与构建配置，复现命令见 `bench/doc_inventory.ps1` 与 §9。
 >
-> **当前数字**：引擎 virtual **52 个方法**（`bench/doc_inventory.ps1` 口径；M6 新增 `import_impl` 使其由 48 → 49，2026-10-06 IR-C 恢复新增 `begin_expr/end_expr` 49 → 51、P2 多输出新增 `eval_expr_multi_into_impl` 51 → 52。注意 `grep -c "\bvirtual\b"` 原始计 **54** 处 = 52 方法 + 析构 1 + 注释里的词 1，勿混用口径）；Layer/Loss/Optimizer 直调 **22 个**（含 `begin_expr`——由 `Adam::step`/`AdamW::step` 打开 IR-C 录制段；其余 30 个
+> **当前数字**：引擎 virtual **52 个方法**（`bench/doc_inventory.ps1` 口径。注意 `grep -c "\bvirtual\b"` 原始计 **54** 处 = 52 方法 + 析构 1 + 注释里的词 1，勿混用口径）；Layer/Loss/Optimizer 直调 **22 个**（含 `begin_expr`——由 `Adam::step`/`AdamW::step` 打开 IR-C 录制段；其余 30 个
 > 只服务 DSL lowering / 序列化 / CLI / 适配层 / 测试，见 §2）；CPU 求值机制 **2 套**
 > （DSL 模板路径 + IR 解释器，见 §3）；ctest **29** 个测试（**25** 个测试目标 + `cnn_test_gpu`
 > = `cnn_test --gpu` + `batchnorm_test_gpu` = `batchnorm_test --gpu` + `fusion_custom_layer_example`
@@ -12,13 +12,13 @@
 > 见 `AGENTS.md` §7。其中 `fused_gpu_test` = 融合 shader **逐形态** GPU 对拍；`expr_graph_test` = IR-C 图融合分析（CPU 12 用例）；`error_macro_test`
 > = 错误处理宏族（`NN_CHECK`/`NN_EXIT`/`NN_TRY_MSG`/`NN_FAIL`）；`kvrec_test`/`nnvocab_test`/`dataset_test`
 > = 统一数据集（KVRecord v2 / `.nnvocab` / `.nndataset`，见 `docs/development/19`）；
-> `zipt_test` 随 ZiPT 于 2026-10-01 移除，见 `docs/history.md`）。
+> `zipt_test` 随 ZiPT 移除，见 `docs/history.md`）。
 >
-> 历史演进与收敛记录（2026-09-27 计算类原语全量迁 DSL、2026-09-26 算子收敛与遗留物
-> 清理、接口数字 58→49 / 直调 35→23 的过程）已移入 `docs/history.md`；**M4（2026-09-30）
+> 历史演进与收敛记录（计算类原语全量迁 DSL、算子收敛与遗留物
+> 清理、接口数字 58→49 / 直调 35→23 的过程）已移入 `docs/history.md`；**M4
 > 后直调 23→21**：`from_matrix`/`to_matrix` 退出 L2（铁律 #12 / 17 §3 D11，层自算辅助
 > 数据改走 `detail::upload_span/download_span`，它们是自由函数、不计入 `engine.<op>(` 口径）。
-> **IR-C（2026-09-19 移除 → 2026-10-06 恢复）**：`begin_expr/end_expr` + `expr_graph.hpp` 现行，
+> **IR-C（移除后已恢复）**：`begin_expr/end_expr` + `expr_graph.hpp` 现行，
 > P1/P2 已落地，`Adam::step`/`AdamW::step` 直调 `begin_expr`（直调 21→22）。移除期记录见
 > `docs/history.md`，定位修正与取舍见 `03-ir-optimization.md` §5.3。
 
@@ -27,14 +27,14 @@
 ## 0. 一句话总览
 
 引擎设计历经 5 代（纯 Matrix → forward_gpu 双实现 → eager → begin_expr/end_expr → `dsl::compute`），
-当前仍在编译、被调用的形态（IR-C 录制 2026-10-06 恢复，与 `dsl::compute` 并存）：
+当前仍在编译、被调用的形态（IR-C 录制已恢复，与 `dsl::compute` 并存）：
 
 | 世代 | 现状 |
 |------|------|
 | 纯 Matrix（无 Tensor） | `algebra_*` 在用，是 `Tensor` 的底层存储 + CPU 手写 kernel |
 | `forward_gpu` / `backward_gpu` 双实现 | 不存在（仅注释残留） |
 | eager（直接调引擎算子） | Layer 仍直调 **21 个**算子，且全部是基础设施 / 数据搬运 / 状态扫描 / fold 显式登记（见 §2.1）；计算类原语一律走 DSL |
-| `begin_expr` / `end_expr`（IR-C 录制图） | ✅ 现行（2026-10-06 恢复：P1 机制 + P2 写穿多输出；`expr_graph.hpp`，见 §4.2/§4.3） |
+| `begin_expr` / `end_expr`（IR-C 录制图） | ✅ 现行（P1 机制 + P2 写穿多输出；`expr_graph.hpp`，见 §4.2/§4.3） |
 | `dsl::compute` | ✅ 当前主推，被 Layer 大量使用 |
 
 ---
@@ -146,7 +146,7 @@ scan_suffix_outer/outer_col——顺序状态机，DSL 无此语义）、`eval_e
 
 **现状判定**：机制 1 与机制 2 是 DSL 在 CPU 上的两条路，一条内联、一条解释——**这是全部
 CPU 求值路径**。机制 2 逐元素 switch 分派 + 归约前缀重放，实测比等价原语慢 1.5–3.8 倍
-（2026-09-18 诊断实测，结论数字保留）。
+（诊断实测，结论数字保留）。
 
 ---
 
@@ -158,7 +158,7 @@ dispatch，即"每算子一次 kernel 开销"的求值方式——**计算类原
 DSL 表达式，见 §2.1/§7.2），eager 只剩基础设施、不可约原语与 IR-C 录制段开合。
 
 ### 4.2 `begin_expr` / `end_expr` + `expr_graph.hpp`（IR-C 录制图）
-**现行**（2026-10-06 恢复）。`ComputeEngine::begin_expr/end_expr` 是虚入口（引擎 virtual 52 个
+**现行**。`ComputeEngine::begin_expr/end_expr` 是虚入口（引擎 virtual 52 个
 方法之一），`expr_graph.hpp` 提供 `ExprGraph`/`ExprGraphNode`/`fuse_expr_graph`/
 `recording_graph_owner`、per-graph `node_outputs`、全局唯一占位 tag 分配器 `next_virtual_tag()`，
 以及 P2-12 图级计划缓存（`graph_cache_key`/`FusedKernelPlan`/`instantiate_plan`）。GPU 真录制
@@ -168,10 +168,10 @@ DSL 表达式，见 §2.1/§7.2），eager 只剩基础设施、不可约原语�
 `fuse_expr_graph` 并登记每个融合 kernel 的 spec，使扫描与运行期一致（闭合世界）。P2 还新增
 引擎入口 `eval_expr_multi_into`（NVI + 虚 `eval_expr_multi_into_impl`）与 `ExprSpec.extras`
 （多输出写穿，≤4）。IR 流水线现状 = IR-A/B/C/D（`expr_opt.hpp`/`expr_graph.hpp`/`expr_emitter.hpp`）。
-2026-09-19 的移除记录（原 §4.2.1–§4.2.3 盘点与提交时间线）作为历史见 `docs/history.md`。
+移除记录（原 §4.2.1–§4.2.3 盘点与提交时间线）作为历史见 `docs/history.md`。
 
 ### 4.3 `dsl::start_expr` / `end_expr`（块式语法糖）
-**现行**（2026-10-06 随 IR-C 恢复，`expr_dsl.hpp` 的 `ExprBlock`）：让**单个表达式**跨行书写，
+**现行**（`expr_dsl.hpp` 的 `ExprBlock`）：让**单个表达式**跨行书写，
 `end_expr` 延迟到整块写完再求值。⚠ 与 `ComputeEngine::begin_expr/end_expr`（**跨表达式**图录制）
 不是一回事（历史记录见 `docs/history.md`）。
 
@@ -296,8 +296,7 @@ L3  后端     : SIMD / 线程池 / GLSL kernel
 
 ## 8. 方案：把 IR-C 吸收进 `dsl::compute`（已实现）
 
-2026-09-18 的决策前草案（原 §8.1–§8.10：自动作用域 + 逃逸检测 + 自动 flush）与其后
-2026-09-19 的删除记录作为历史见 `docs/history.md`。**2026-10-06 定位修正（非否决，系当年实现
+决策前草案（原 §8.1–§8.10：自动作用域 + 逃逸检测 + 自动 flush）与其后的删除记录作为历史见 `docs/history.md`。**定位修正（非否决，系当年实现
 不完整）后已恢复并通用化**：现行形态 = 显式录制 API（`engine.begin_expr()/end_expr()` +
 `ExprSegment` RAII 守卫）承载图级融合，P1（链融合）+ P2（写穿多输出）已落地，
 `Adam::step`/`AdamW::step` 为首个生产调用方（见 §4.2 与 `03-ir-optimization.md` §5.3）。

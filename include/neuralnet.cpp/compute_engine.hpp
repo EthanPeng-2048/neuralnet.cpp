@@ -59,7 +59,7 @@
 #include "core_profile.hpp"   // 训练 step 剖析（NN_PROFILE=1 门控；默认零开销）
 #include "compute_tensor.hpp"
 #include "expr_opt.hpp"   // canonicalize_expr_spec（trace 归因用，与 gen_fused 同源 key）
-#include "expr_graph.hpp" // IR-C 录制图（begin_expr/end_expr 图融合，2026-10-06 恢复）
+#include "expr_graph.hpp" // IR-C 录制图（begin_expr/end_expr 图融合）
 #include "expr_spec.hpp"
 
 namespace nn
@@ -243,7 +243,7 @@ public:
     [[nodiscard]] virtual Result<void> begin_batch() = 0;
     [[nodiscard]] virtual Result<void> end_batch() = 0;
 
-    // ── 表达式录制（IR-C 图融合；2026-10-06 恢复，见 docs/history.md
+    // ── 表达式录制（IR-C 图融合；见 docs/history.md
     //    「IR-C 定位修正与恢复立项」）──────────────────────────────────────
     // begin_expr 进入录制；期间 eval_expr/eval_expr_reduce 把节点加入录制图
     // （expr_graph.hpp）并返回携带 virtual_tag 的占位 Tensor；end_expr 融合
@@ -582,8 +582,10 @@ public:
     // ⚠ 本函数（以及下面每一个"写张量存储"的公共入口）首行的
     //   `WriteEpochGuard` 是**契约的一部分**，不要删：参数派生缓冲
     //   （BitLinear 的三值权重）靠写版本判断"要不要重算"，见下方说明。
+    // fresh_dst 语义见 copy_from（默认 false；仅 detail::upload_span 传 true）。
     template <class T>
-    [[nodiscard]] Result<void> write(Tensor& t, std::span<T> src)
+    [[nodiscard]] Result<void> write(Tensor& t, std::span<T> src,
+                                     bool fresh_dst = false)
     {
         NN_PROF_OP("write");
         using Elem = std::remove_cv_t<T>;
@@ -633,7 +635,7 @@ public:
             for (std::size_t i = 0; i < src.size(); ++i)
                 d[i] = static_cast<Scalar>(src[i]);
         }
-        return copy_from(t, m);
+        return copy_from(t, m, fresh_dst);
     }
 
     // 索引读（语法糖：宿主直读 / GPU = 一次批量 read）。行主序 (row, col)；
@@ -823,13 +825,30 @@ public:
     // 将 CPU Matrix 数据写入已有 Tensor（CPU 拷贝 / GPU 上传）
     // 用于序列化加载、Optimizer 参数写回等场景。
     // f16 目标：先按 f32 上传，再 cast_into 写进 dst 的原存储
-    [[nodiscard]] Result<void> copy_from(Tensor& dst, const Matrix& src)
+    //
+    // fresh_dst（默认 false）= 调用方声明 **dst 是刚创建、当前录制帧与在飞
+    // 帧都不可能引用的全新张量**（detail::upload_span 的 create→write 相邻
+    // 形态即此类）。此时 GPU 侧**跳过录制窗口的整条流水线排空**：
+    //   · 不存在"当前帧先前命令写 dst、被先执行的上传覆盖"的反向依赖——
+    //     全新 buffer 无任何已录命令引用（池化复用只在写出方帧完成后还块，
+    //     见 pending_destroys / reap_frame），故无需 wait_in_flight；
+    //   · 上传 → 后续帧读 dst 的正向依赖由 staging 时间线信号量显式保证
+    //     （帧提交时 collect_staging_waits 等待——与 from_matrix 批内上传
+    //     同一条既有机制，GPU 测试已覆盖）。
+    // 训练热路径 labels/mask/doc_ids 全走 upload_span → fresh 路径，每步 ~6
+    // 次全排空被消除（历史画像 copy_from 占墙钟 71.8%，见 docs/history）。
+    // fresh_dst=false（默认）保留原排空语义 → load_model / 测试直写既有张量
+    // 零回归。
+    // ⚠ 契约：fresh_dst=true 仅当 dst 未被任何**已录制或在飞**命令引用；
+    // 误传 = 数据竞争。库内唯一承诺方是 detail::upload_span。
+    [[nodiscard]] Result<void> copy_from(Tensor& dst, const Matrix& src,
+                                         bool fresh_dst = false)
     {
         NN_PROF_OP("copy_from");
         NN_TRY(ec, bind_check_({&dst}));
         WriteEpochGuard wg{dst};
         if (dst.precision() == Precision::F32)
-            return copy_from_impl(dst, src);
+            return copy_from_impl(dst, src, fresh_dst);
         auto t = from_matrix(src, Precision::F32);
         NN_TRY_CHECK(t);
         return cast_into(*t, dst);
@@ -1498,7 +1517,8 @@ protected:
 
     // ── 纯数据搬运 ────────────────────────────────────────────────────────
     [[nodiscard]] virtual Result<Tensor> clone_impl(const Tensor& src) = 0;
-    [[nodiscard]] virtual Result<void> copy_from_impl(Tensor& dst, const Matrix& src) = 0;
+    [[nodiscard]] virtual Result<void> copy_from_impl(Tensor& dst, const Matrix& src,
+                                                      bool fresh_dst) = 0;
     [[nodiscard]] virtual Result<Tensor> slice_rows_impl(
         const Tensor& src, std::size_t start_row, std::size_t count) = 0;
     [[nodiscard]] virtual Result<void> insert_rows_impl(
@@ -1666,7 +1686,7 @@ protected:
         return std::move(r);
     }
 
-    // ── IR-C 录制拦截（2026-10-06 恢复）──────────────────────────────────
+    // ── IR-C 录制拦截──────────────────────────────────
     // begin_expr/end_expr 录制段内，eval_expr/eval_expr_reduce 不求值：表达式
     // 入图（add_node 建依赖边），返回带 virtual_tag 的占位 Tensor（真实存储、
     // 出生即绑定——end_expr 的复合 kernel 经 output_override 直接写回该存储，
@@ -2145,13 +2165,15 @@ namespace detail {
         NN_FAIL("upload_span: 张量分配失败");
     if (P == Precision::F32)
     {
-        NN_TRY(r, engine.write(t, std::span<const Scalar>(src)));
+        // fresh_dst=true：t 刚创建、无任何已录/在飞命令引用 → GPU 侧跳过
+        // 录制窗口排空（见 copy_from 契约）。本函数是库内唯一承诺方。
+        NN_TRY(r, engine.write(t, std::span<const Scalar>(src), /*fresh_dst=*/true));
         return t;
     }
     std::vector<f16> buf(src.size());
     for (std::size_t i = 0; i < src.size(); ++i)
         buf[i] = f16{src[i]};   // RHE 舍入，与 from_matrix 的 f32→f16 同路径
-    NN_TRY(r, engine.write(t, std::span<f16>(buf)));
+    NN_TRY(r, engine.write(t, std::span<f16>(buf), /*fresh_dst=*/true));
     return t;
 }
 
@@ -2179,7 +2201,7 @@ namespace detail {
 
 } // namespace detail
 
-// ── IR-C 录制段 RAII 守卫（P2，2026-10-06）───────────────────────────────
+// ── IR-C 录制段 RAII 守卫（P2）───────────────────────────────
 // 作用域退出（含 NN_TRY 错误早退）自动 end_expr 收口，防录制图悬挂；
 // 正常路径显式 end() 收口并把 end_expr 的错误照常传播（守卫只兜底）。
 class ExprSegment
