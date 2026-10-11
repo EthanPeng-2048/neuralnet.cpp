@@ -1,5 +1,5 @@
 // ── write_epoch_test — 写版本（write epoch）契约 + BitLinear 量化缓存 ──────
-// 设计依据：docs/development/21-quantized-weights.md §4.11（F1/F4/F6 落地）
+// 设计依据：docs/todo/21-quantized-weights.md §4.11（F1/F4/F6 落地）
 //
 // 覆盖：
 //   [1] 逐写入口：每一个"经引擎媒介写入张量存储"的公共入口都推进写版本
@@ -41,7 +41,7 @@ int g_failures = 0;
 nn::Tensor zeros(nn::ComputeEngine& eng, std::size_t rows, std::size_t cols)
 {
     nn::Tensor t = eng.create_tensor(rows, cols, nn::Precision::F32, nn::InitSpec::zero());
-    NN_ASSERT(t.valid(), "create_tensor(zero) failed");
+    NN_ASSERT_ALWAYS(t.valid(), "create_tensor(zero) failed");
     return t;
 }
 
@@ -216,9 +216,9 @@ nn::BitLinear make_bitlinear(nn::ComputeEngine& eng, std::size_t in, std::size_t
     prof.param = nn::Precision::T1_58;
     bl.set_precision_profile(prof);
     auto r = bl.init(eng);
-    NN_ASSERT(r, "BitLinear init failed");
+    NN_ASSERT_ALWAYS(r, "BitLinear init failed");
     auto wr = eng.copy_from(bl.parameters()[0].get(), w);
-    NN_ASSERT(wr, "BitLinear 权重写入失败");
+    NN_ASSERT_ALWAYS(wr, "BitLinear 权重写入失败");
     // 本节测的是**缓存**（与缓冲形态正交）：默认强制 f16 稠密路径，好让
     // `quantized_weights()` 直接可读；打包路径的缓存另有 [7b] 一段。
     bl.set_ternary_pack_enabled(packed);

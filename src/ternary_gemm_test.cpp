@@ -1,5 +1,5 @@
 // ── ternary_gemm_test — 三值打包权重与量化 GEMM（P2 / F3）────────────────────
-// 设计依据：docs/development/21-quantized-weights.md §5 的 P2 验收
+// 设计依据：docs/todo/21-quantized-weights.md §5 的 P2 验收
 //   · 打包往返逐位（编码/解码）
 //   · 数值与 P1 的 f16 稠密缓冲路径一致（同 latent 权重下三值逐位）
 //   · 位宽账：0.25 B/权重（f16 稠密 = 2 B/权重）
@@ -333,9 +333,9 @@ void test_bitlinear_paths(nn::ComputeEngine& eng, const char* tag)
         auto bl = std::make_unique<nn::BitLinear>(IN, OUT);
         bl->set_precision_profile(prof);
         auto r = bl->init(eng);
-        NN_ASSERT(r, "BitLinear init 失败");
+        NN_ASSERT_ALWAYS(r, "BitLinear init 失败");
         auto wr = eng.copy_from(bl->parameters()[0].get(), W);
-        NN_ASSERT(wr, "写入 latent 失败");
+        NN_ASSERT_ALWAYS(wr, "写入 latent 失败");
         bl->set_ternary_pack_enabled(packed);
         return bl;
     };
@@ -544,9 +544,9 @@ void check_bitlinear_shape(nn::ComputeEngine& eng, std::size_t IN, std::size_t O
         auto bl = std::make_unique<nn::BitLinear>(IN, OUT);
         bl->set_precision_profile(prof);
         auto r = bl->init(eng);
-        NN_ASSERT(r, "BitLinear init 失败");
+        NN_ASSERT_ALWAYS(r, "BitLinear init 失败");
         auto wr = eng.copy_from(bl->parameters()[0].get(), W);
-        NN_ASSERT(wr, "写入 latent 失败");
+        NN_ASSERT_ALWAYS(wr, "写入 latent 失败");
         bl->set_ternary_pack_enabled(packed);
         return bl;
     };

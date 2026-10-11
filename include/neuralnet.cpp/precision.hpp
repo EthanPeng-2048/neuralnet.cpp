@@ -14,7 +14,7 @@
 //                （round-half-to-even）；matmul / 归约类算子额外：累加精度 = max(P, f32) = f32
 //   对 P = F32：参考即自身，不舍入
 //
-// **T1_58 是另一种东西（docs/development/21-quantized-weights.md §8）**：它不是"舍入"
+// **T1_58 是另一种东西（docs/todo/21-quantized-weights.md §8）**：它不是"舍入"
 // 而是"离散化"——把权重按统计尺度 γ 投影到 {-1,0,+1}，需要 γ 这个额外元数据，
 // 且只适用于权重（激活保持 f16/f32）。因此：
 //   · T1_58 **不进提升序**（precision_rank 无定义）→ 与 f16/f32 正交；
@@ -78,7 +78,7 @@ enum class Precision : std::uint8_t
 // 元素字节数（f16=2 / f32=4；保留值与 T1_58 返回 0，仅供能力/诊断，不用于存储）
 // T1_58：P1 的量化缓冲用 f16（{-1,0,1} 在 f16 下精确可表示）；P2 的打包位宽
 // 由打包格式表达（行级 base-3 = log2 3 + 16/K ≈ 1.59~1.71 bpw），**不要**塞进
-// "整数字节/元素"。见 docs/development/21-quantized-weights.md §4.1。
+// "整数字节/元素"。见 docs/todo/21-quantized-weights.md §4.1。
 [[nodiscard]] constexpr std::size_t precision_bytes(Precision p) noexcept
 {
     switch (p)
@@ -540,7 +540,7 @@ inline constexpr PrecisionProfile profile_f16() noexcept
 // T1_58 只描述**权重**（不是存储精度：precision_bytes = 0，引擎/DSL 拒绝拿它
 // 建张量），因此持有线性子层的复合层要按 split_ternary_profile() 分流
 // （self = param 归一化为 f32 的那份，linear = param=T1_58 的那份）；
-// 接线范围与 CLI 语义见 docs/development/21-quantized-weights.md §4.10。
+// 接线范围与 CLI 语义见 docs/todo/21-quantized-weights.md §4.10。
 inline constexpr PrecisionProfile profile_t1_58() noexcept
 {
     PrecisionProfile p = profile_f16();   // compute/stable/optimizer 逐字段跟随 --f16

@@ -94,7 +94,7 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
 // 结构：Linear → Norm → GeLU × (N-1) + Linear（最后一层）
 // norm_type 决定归一化层：LayerNorm / RMSNorm / BatchNorm。
 //
-// **三值（T1_58）路径**（docs/development/21-quantized-weights.md §4.8）：
+// **三值（T1_58）路径**（docs/todo/21-quantized-weights.md §4.8）：
 // `precision.param == T1_58` 时线性层换成 `BitLinear`（三值权重 + STE），
 // 其余层（norm / 激活）行为不变。两种 profile 分工：
 //   · BitLinear —— 拿**完整** precision（它的 param 槽只接受 T1_58）；
@@ -238,7 +238,7 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
         if (!spec.is_mlp())
             NN_FAIL("weight_quant=t1_58 该构建入口只支持 MLP 架构：GPT 走 "
                     "build_gpt_model_from_spec，RAPT 与 MNIST Transformer（ViT 风格）"
-                    "的三值接线尚未落地（见 docs/development/21-quantized-weights.md §4.8.3）");
+                    "的三值接线尚未落地（见 docs/todo/21-quantized-weights.md §4.8.3）");
         precision.param = Precision::T1_58;
     }
 

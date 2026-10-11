@@ -61,7 +61,8 @@ public:
     // 构造函数 `Model(ComputeEngine&)`（或移动后沿用既有绑定）。
     [[nodiscard]] ComputeEngine& engine() const noexcept
     {
-        NN_ASSERT(engine_, "Model: engine not bound");
+        // RV-01：失败后紧跟 `return *engine_` → Release 下必须终止（空解引用 = UB）
+        NN_ASSERT_ALWAYS(engine_, "Model: engine not bound");
         return *engine_;
     }
 
@@ -97,7 +98,7 @@ public:
     // 添加已构造的层并**显式**注入给定 profile（跳过 default_precision_）。
     // 用于"同一模型内按层类型分派精度"的场景：三值 MLP 里 BitLinear 要
     // param=T1_58，而非权重层/归一化层的 param 槽不适用（仍走模型默认）。
-    // 见 docs/development/21-quantized-weights.md §4.8。
+    // 见 docs/todo/21-quantized-weights.md §4.8。
     Result<void> add_layer(std::unique_ptr<Layer> layer, const PrecisionProfile& profile)
     {
         layer->set_precision_profile(profile);
@@ -123,7 +124,8 @@ public:
 
     [[nodiscard]] Layer& layer_at(std::size_t index) noexcept
     {
-        NN_ASSERT(index < layers_.size(), "Model::layer_at index out of range");
+        // RV-01：越界后 `*layers_[index]` 是越界读 + 空/错层解引用 → 无条件终止
+        NN_ASSERT_ALWAYS(index < layers_.size(), "Model::layer_at index out of range");
         return *layers_[index];
     }
 

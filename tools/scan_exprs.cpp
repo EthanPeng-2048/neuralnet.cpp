@@ -111,11 +111,11 @@ int main(int argc, char* argv[])
 
     // ── dry-run 主体：跑一遍 Layer 的 forward/backward（只收集**结构**）──
     // engine 是**形参**（遮蔽外层 raw_engine）：f16 边界 cast 由基类 NVI 入口
-    // 统一处理（原 PrecisionEngine 适配层已删除，见 docs/development/15 §4.1）。
+    // 统一处理（原 PrecisionEngine 适配层已删除，见 docs/history.md「15 号归档」 §4.1）。
     [[maybe_unused]] const auto dry_run = [&](nn::ComputeEngine& engine, const nn::PrecisionProfile& prof)
     {
         scan_prof = prof;
-        // M1（docs/development/17 §4.1）：库外不再直构 Tensor——scan 输入经
+        // M1（docs/todo/17 §4.1）：库外不再直构 Tensor——scan 输入经
         // 引擎创建（出生绑定与本段 dry-run 使用的 engine 一致）。
         const auto scan_tensor = [&](std::size_t rows, std::size_t cols)
         {
@@ -176,12 +176,12 @@ int main(int argc, char* argv[])
     // 结构不依赖形状，任取小 R×C 即可（Muon 的 NS 只对 ≥2D 参数生效）。
     {
         const std::size_t R = 8, C = 5;
-        for (const char* name : {"sgd", "sgd_momentum", "adam", "adamw",
-                                 "adamwquant", "muon"})
+        // RV-04：名单来自 nn::optimizer_table()（唯一真源）——新增优化器自动覆盖
+        for (const auto &meta : nn::optimizer_table())
         {
             nn::Tensor p = scan_tensor(R, C);
             nn::Tensor g = scan_tensor(R, C);
-            auto opt = nn::create_optimizer(name, engine,
+            auto opt = nn::create_optimizer(meta.name, engine,
                                             std::vector<nn::TensorRef>{p},
                                             std::vector<nn::TensorRef>{g},
                                             nn::Scalar{1e-3f});
@@ -193,7 +193,7 @@ int main(int argc, char* argv[])
         }
     }
 
-    // ── 算子融合二期（docs/development/02-operator-fusion.md）：matmul 参与 IR 融合 ──
+    // ── 算子融合二期（docs/todo/02-operator-fusion.md）：matmul 参与 IR 融合 ──
     // 结构 = Layer 内 dsl::matmul(A,B)+bias+relu 折叠后的派生物：
     //   前置 matmul 段（MatmulSpec）+ 尾逐元素链（Add + Max）。
     // 这里直接构造折叠后的结构并登记（与 dsl::compute 登记 spec 是同一机制），
@@ -228,7 +228,7 @@ int main(int argc, char* argv[])
         }
     }
 
-    // ── 算子融合二期（docs/development/02-operator-fusion.md S5）：matmul+归约组合（注意力结构）
+    // ── 算子融合二期（docs/todo/02-operator-fusion.md S5）：matmul+归约组合（注意力结构）
     // bmm_reduce / bmm_denom 的 IR 等价物：matmul 段被归约指令消费，
     // 不物化 (M,N) 得分矩阵（kernel 内联点积重算）。结构不依赖形状。
     //   Q (M,K)，K 存储 (N,K)（transB=1）：QK^T = matmul(Q, K, transB)
@@ -329,7 +329,7 @@ int main(int argc, char* argv[])
             attn_ad.set_doc_ids(doc_ids);
             run_csa(attn_ad);
         }
-        // GQA（docs/development/22 §3.2 的 P2）：K/V_t 走 **HeadGroup 视图**
+        // GQA（docs/todo/22 §3.2 的 P2）：K/V_t 走 **HeadGroup 视图**
         //   （头分组比是运行期 vp 参数、**不进 key** → 登记一次覆盖任意 n_rep，
         //   但"视图种类"本身是结构 → 必须是独立一条，否则 GPU 闭合世界对
         //   GQA 的 fold 直接硬报错）。heads=2 / n_head_kv=1 → ratio 2。
@@ -579,7 +579,7 @@ int main(int argc, char* argv[])
         //   出现 → **只由这一条用例产出**；漏掉就是 GPU 闭合世界硬报错
         //   （AGENTS §7：dry-run/模型 pass 是结构的主要来源）。
         //   结构不依赖精度（prof 只决定占位张量精度）→ 与其它用例同处一跑。
-        //   见 docs/development/21-quantized-weights.md §7 第 4 项。
+        //   见 docs/todo/21-quantized-weights.md §7 第 4 项。
         {
             nn::PrecisionProfile t1 = prof;
             t1.param = nn::Precision::T1_58;
@@ -786,7 +786,7 @@ int main(int argc, char* argv[])
                     // kv_ratio=1（MHA）与 >1（GQA，K/V_t 走 HeadGroup 视图）是
                     // **两个结构**（视图种类进 key）；但头分组比本身是运行期 vp
                     // 参数、**不进 key** → 这里登记一次 kv_ratio=2 即覆盖任意
-                    // n_rep（docs/development/22 §3.2 P2）。
+                    // n_rep（docs/todo/22 §3.2 P2）。
                     for (const std::uint32_t kv_ratio : {1u, 2u})
                     {
                         const nn::ExprSpec as =

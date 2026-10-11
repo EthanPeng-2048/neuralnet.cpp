@@ -1,8 +1,12 @@
 # 多精度计算改造（f16 / 混合精度）设计
 
+> **读者**：调用者（库使用者 / 扩展者）——本分册定位见 [`README.md`](README.md)。
+> 本文的语义契约章节（§7.2）与实测限制章节（§12）是写给"要选精度 / 要写层"的人的；
+> 项目内部的路线图 / 盘点在 [`../todo/`](../todo/)，历史在 [`../history.md`](../history.md)。
+
 > **状态**：Phase 1（存储类型化 / cast / f16 GEMM / 类型化 Tensor）与 Phase 2（f16 边界 cast
 >（**P-1 已下沉为 `ComputeEngine` 基类 NVI 入口**，原 `PrecisionEngine` 装饰器已删除，见
-> `docs/development/15` §4.1）+ DSL/Layer/Loss/Optimizer 全链精度接线 + **in-kernel f16 带类型变体（逐元素 /
+> `docs/history.md「15 号归档」` §4.1）+ DSL/Layer/Loss/Optimizer 全链精度接线 + **in-kernel f16 带类型变体（逐元素 /
 > 归约 / matmul 段 / fold）** + **op-level f16 GEMM**）均为**当前实现**；当前 `--f16` 实测峰值显存
 > 低于 f32（§12.11）。当前状态、实测结论与已知问题见 **§12**；各轮实施过程与 A/B 流水见
 > `docs/history.md`。
@@ -377,7 +381,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 - 优化器更新算子全部显式：参数更新 P = `param`（in-place，存储不变），状态更新 P = `optimizer`。
 - **per-layer 覆盖 = Phase 2**：`p_` 本就是每层成员，改成员即覆盖（如末层 head 强制 F32），纯增量。
 - CLI 入口的 `--f16` 标志 = `profile_f16()` = **{param=F16, compute=F16, stable=F32, optimizer=F32}**（§9.4"全 f16（激进）"行）；`text_train`/`mnist_train` 另有 `--precision-param/compute/stable/optimizer` 逐字段覆盖，`mem_probe` 有 `--f16` / `--f16-all`。master-weights 配方 {param=F32, compute=F16, stable=F32, optimizer=F32} 对应 `profile_master_weights()`。
-- **精度预设（2026-10-10 新增）**：CLI `--t1_58` = `profile_t1_58()` = **{param=T1_58, compute=F16, stable=F32, optimizer=F32}** —— 定义上就是 `profile_f16()` 把 `param` 换成三值（另三槽在同一函数里派生 → 不可能与 `--f16` 漂移），即"**其他默认 f16，模型参数 1.58**"。三值只描述**权重**（`T1_58` 不是存储精度），落地点是 `BitLinear`，见 `docs/development/21-quantized-weights.md` §4.10。
+- **精度预设（2026-10-10 新增）**：CLI `--t1_58` = `profile_t1_58()` = **{param=T1_58, compute=F16, stable=F32, optimizer=F32}** —— 定义上就是 `profile_f16()` 把 `param` 换成三值（另三槽在同一函数里派生 → 不可能与 `--f16` 漂移），即"**其他默认 f16，模型参数 1.58**"。三值只描述**权重**（`T1_58` 不是存储精度），落地点是 `BitLinear`，见 `docs/todo/21-quantized-weights.md` §4.10。
 
 ### 9.4 典型配方
 

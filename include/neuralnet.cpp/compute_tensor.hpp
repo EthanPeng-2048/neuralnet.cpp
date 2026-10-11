@@ -11,7 +11,7 @@
 //   - precision_ 与 device_ 共同唯一确定存储的有效类型
 //   - 使用 shared_ptr 内部持有存储，拷贝廉价（零拷贝传递）
 //   - 出生绑定（P1）：engine_ 观察创建本张量的引擎；库内产物出生即绑定，
-//     绑定随拷贝/reshape 传播（docs/development/15 §3.1）
+//     绑定随拷贝/reshape 传播（docs/history.md「15 号归档」 §3.1）
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <algorithm>
@@ -37,14 +37,14 @@ namespace nn
 {
 
 // ComputeEngine 前置声明：Tensor 持有非拥有绑定（observer_ptr，P1 出生绑定，
-// docs/development/15-computeengine-refresh.md §3.1），不能反向 include。
+// docs/history.md「15 号归档」 §3.1），不能反向 include。
 class ComputeEngine;
 class CpuEngine;
 class GpuEngine;
 
 namespace detail
 {
-// 引擎域内通道（M1，docs/development/17 §4.1 豁免之一）：
+// 引擎域内通道（M1，docs/todo/17 §4.1 豁免之一）：
 // Tensor 存储访问器与静态直构工厂私有化后，DSL 求值器（expr_dsl.hpp 的
 // eval_cpu / 扫描占位 / 求值叶子）经此创建与访问 Tensor 存储。
 // 库外（测试/tools/CLI）禁止使用——绕过引擎的编译期强制靠下方访问器私有化。
@@ -75,7 +75,7 @@ private:
     std::size_t rows_ = 0;
     std::size_t cols_ = 0;
 
-    // ── 出生绑定（P1，docs/development/15 §3.1）──────────────────────────
+    // ── 出生绑定（P1，docs/history.md「15 号归档」 §3.1）──────────────────────────
     // 创建本张量的引擎（非拥有观察者；+8B）。未绑定 = nullptr（非绑定态仅剩
     // 库外直构：Tensor{} 空槽、src/ 测试的 Tensor::from_matrix/from_host 之前
     // 的宿主直构）。库内产物出生即绑定——由引擎工厂/算子出口 stamp 或
@@ -89,7 +89,7 @@ private:
     // 纯元数据（不涉及存储访问，铁律 #11 不适用）；非录制张量恒为 0。
     std::uint64_t virtual_tag_ = 0;
 
-    // ── M1 访问收口（docs/development/17 §4.1）：存储与创建只对引擎域内开放 ──
+    // ── M1 访问收口（docs/todo/17 §4.1）：存储与创建只对引擎域内开放 ──
     // 公共面只剩形状/精度/设备查询、bound()/engine()、valid()、shape_str()。
     // 绕过引擎摸存储 = 编译错误（库内豁免：引擎 friend + detail::TensorAccess）。
     friend class ComputeEngine;
@@ -269,11 +269,12 @@ public:
     // ── 出生绑定（P1，§3.1）──────────────────────────────────────────────
     // bound()：是否已 stamp 到某个引擎（未绑定输入在 P1 检查中按库外豁免放行，
     //   仅 NN_BIND_DEBUG=1 时报错——见 ComputeEngine::bind_check_）。
-    // engine()：取绑定引擎；未绑定 → NN_ASSERT 硬失败（勿在未绑定张量上调用）。
+    // engine()：取绑定引擎；未绑定 → NN_ASSERT_ALWAYS 硬失败（勿在未绑定张量上调用）。
+    // Release 也必须终止：失败后紧跟 `return *engine_` 解引用空指针 = UB（RV-01）。
     [[nodiscard]] bool bound() const noexcept { return static_cast<bool>(engine_); }
     [[nodiscard]] ComputeEngine& engine() const
     {
-        NN_ASSERT(engine_, "Tensor::engine(): tensor is not bound to any engine");
+        NN_ASSERT_ALWAYS(engine_, "Tensor::engine(): tensor is not bound to any engine");
         return *engine_;
     }
 
@@ -299,13 +300,22 @@ public:
     // 语义："本张量的存储内容**可能已经变了**"的单调计数（存储对象持有：
     // MatrixT::write_epoch_ / GpuBuffer::write_epoch_，故 Tensor 拷贝/别名
     // 共享同一计数）。用途：派生缓冲（如 BitLinear 的三值权重）判断"输入
-    // 是否变过"，从而**只在必要时**重算 —— 见 docs/development/21 §4.11。
+    // 是否变过"，从而**只在必要时**重算 —— 见 docs/todo/21 §4.11。
     //
     // 契约：只有 **ComputeEngine 的写入口**会推进它（`touch_write_epoch_`
     // 私有，friend 限定）；库外无法直写存储（M1，铁律 #11），因此"版本没变
     // ⇒ 内容没变"成立。注意它是**保守**信号：失败返回、只读地取可变存储等
     // 情形也可能推进（代价 = 多算一次派生缓冲，不会用旧值）。
     [[nodiscard]] std::uint64_t write_epoch() const noexcept;
+
+    // ── 存储标识（RV-03：IR-C 的"同目标写序"依赖分析用）────────────────────
+    // 同一底层存储的所有 Tensor 副本/别名返回**同一个**非零值；无存储 → 0。
+    // 只用于判定"两次写是否落在同一目标"（WAW/WAR 顺序隐患），返回的是不透明
+    // 整数、不是存储句柄——铁律 #11（M1）的访问收口不破。
+    //   · CPU：MatrixT<P> 对象地址（CPU 无零拷贝视图，reshape 会产生新存储）；
+    //   · GPU：底层共享 GpuBuffer 的地址（reshape 只改形状元数据 → 同一标识）。
+    // 唯一性只要求"进程内、同存储同值、不同存储不同值"，不做跨进程承诺。
+    [[nodiscard]] std::uintptr_t storage_id() const noexcept;
 
 private:
     // ── CPU 存储访问（模板化，P 默认 F32，§6.1）──────────────────────────
@@ -317,8 +327,8 @@ private:
         // 用 cpu_get_ptr（不拷贝 shared_ptr）：该函数在逐元素热点上会被按元素
         // 调用，拷贝 shared_ptr 的原子引用计数是实测的主要开销来源。
         MatrixT<P>* p = cpu_get_ptr<P>();
-        NN_ASSERT(device_ == Device::CPU && p,
-                  "cpu_matrix<P>(): tensor has no P-precision CPU storage");
+        NN_ASSERT_ALWAYS(device_ == Device::CPU && p,
+                         "cpu_matrix<P>(): tensor has no P-precision CPU storage");
         return *p;
     }
 
@@ -328,8 +338,8 @@ private:
         static_assert(P == Precision::F16 || P == Precision::F32,
                       "Phase 1 仅支持 F16/F32");
         const MatrixT<P>* p = cpu_get_ptr<P>();
-        NN_ASSERT(device_ == Device::CPU && p,
-                  "cpu_matrix<P>() const: tensor has no P-precision CPU storage");
+        NN_ASSERT_ALWAYS(device_ == Device::CPU && p,
+                         "cpu_matrix<P>() const: tensor has no P-precision CPU storage");
         return *p;
     }
 
@@ -354,8 +364,8 @@ private:
                          static_cast<int>(P), static_cast<int>(precision_),
                          gpu_data_.index(), static_cast<int>(device_),
                          rows_, cols_);
-        NN_ASSERT(device_ == Device::GPU && p,
-                  "gpu_tensor<P>(): tensor has no P-precision GPU storage");
+        NN_ASSERT_ALWAYS(device_ == Device::GPU && p,
+                         "gpu_tensor<P>(): tensor has no P-precision GPU storage");
         return *p;
     }
 
@@ -365,8 +375,8 @@ private:
         static_assert(P == Precision::F16 || P == Precision::F32,
                       "Phase 1 仅支持 F16/F32");
         auto p = gpu_get<P>();
-        NN_ASSERT(device_ == Device::GPU && p,
-                  "gpu_tensor<P>() const: tensor has no P-precision GPU storage");
+        NN_ASSERT_ALWAYS(device_ == Device::GPU && p,
+                         "gpu_tensor<P>() const: tensor has no P-precision GPU storage");
         return *p;
     }
 
@@ -392,15 +402,15 @@ public:
 
 private:
     // ── reshape（GPU 共享底层 buffer；CPU 复制数据）──────────────────────
-    // M1（docs/development/17 §3 D10）：移入引擎——公共入口是
+    // M1（docs/todo/17 §3 D10）：移入引擎——公共入口是
     // ComputeEngine::reshape（bind_check + stamp），本实现只对引擎域内可见。
     // 后端无关入口：上层无需直接访问 gpu_tensor() / cpu_matrix() 即可调整形状。
     // GPU：共享底层 buffer，仅改形状元数据（零拷贝）；CPU：Matrix 无"零拷贝
     // 视图"能力，按 precision_ 复制数据到新形状的 Matrix（§6.1）。
     [[nodiscard]] Tensor reshape(std::size_t new_rows, std::size_t new_cols) const
     {
-        NN_ASSERT(rows_ * cols_ == new_rows * new_cols,
-                  "reshape: element count mismatch");
+        NN_ASSERT_ALWAYS(rows_ * cols_ == new_rows * new_cols,
+                         "reshape: element count mismatch");
         Tensor t;
         t.device_ = device_;
         t.precision_ = precision_;
@@ -464,6 +474,28 @@ inline std::uint64_t Tensor::write_epoch() const noexcept
 #endif
 }
 
+// ── 存储标识（RV-03，声明见类内）──────────────────────────────────────────
+inline std::uintptr_t Tensor::storage_id() const noexcept
+{
+    if (device_ == Device::CPU)
+    {
+        if (precision_ == Precision::F16)
+            return reinterpret_cast<std::uintptr_t>(cpu_get_ptr<Precision::F16>());
+        return reinterpret_cast<std::uintptr_t>(cpu_get_ptr<Precision::F32>());
+    }
+#ifdef NN_HAS_VULKAN
+    if (precision_ == Precision::F16)
+    {
+        auto p = gpu_get<Precision::F16>();
+        return p ? reinterpret_cast<std::uintptr_t>(p->shared_buffer().get()) : 0;
+    }
+    auto p = gpu_get<Precision::F32>();
+    return p ? reinterpret_cast<std::uintptr_t>(p->shared_buffer().get()) : 0;
+#else
+    return 0;
+#endif
+}
+
 inline void Tensor::touch_write_epoch_() noexcept
 {
     if (device_ == Device::CPU)
@@ -486,7 +518,7 @@ inline void Tensor::touch_write_epoch_() noexcept
 #endif
 }
 
-// ── 引擎域内访问通道（M1，docs/development/17 §4.1 豁免之一）──────────────
+// ── 引擎域内访问通道（M1，docs/todo/17 §4.1 豁免之一）──────────────
 // Tensor 的存储访问器/静态直构工厂已私有化；DSL 求值器（expr_dsl.hpp）在
 // friend 关系下经本结构创建与读写存储。库外（测试/tools/CLI）不得使用——
 // 绕过引擎摸张量的正道是 engine.from_matrix / to_matrix / create_tensor。

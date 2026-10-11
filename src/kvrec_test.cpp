@@ -1,5 +1,5 @@
 // ── kvrec_test — KVRecord v1/v2 解析与序列化测试 ───────────────────────────
-// 覆盖（docs/development/19-unified-dataset.md §3 / §9 阶段一验收）：
+// 覆盖（docs/todo/19-unified-dataset.md §3 / §9 阶段一验收）：
 //   1. v1 round-trip（模型 spec 头路径，字节语义不变）
 //   2. 版本自举：无版本字段 = v1、有 = v2（同一入口 parse 分派）
 //   3. v2 round-trip：UInt/Str/UIntArray + 多层嵌套 Record

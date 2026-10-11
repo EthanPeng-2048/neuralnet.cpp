@@ -214,16 +214,17 @@ public:
     // P 由调用方显式指定（§8.5）：无隐式推导，无 Auto
     // ══════════════════════════════════════════════════════════════════════
 
-    [[nodiscard]] Tensor create_tensor_impl(std::size_t rows, std::size_t cols, Precision P) override
+    // RV-02：分配失败原因上抛（旧形态 `if (!r) return Tensor();` 把显存/设备
+    // 错误整块丢弃，调用方只能看到"空张量"）。
+    [[nodiscard]] Result<Tensor> create_tensor_impl(std::size_t rows, std::size_t cols,
+                                                   Precision P) override
     {
         if (P == Precision::F16)
         {
-            auto r = GpuTensorF16::create_empty(rows, cols, backend_);
-            if (!r) return Tensor();
+            NN_TRY(r, GpuTensorF16::create_empty(rows, cols, backend_));
             return Tensor::from_gpu(std::move(*r));
         }
-        auto r = GpuTensor::create_empty(rows, cols, backend_);
-        if (!r) return Tensor();
+        NN_TRY(r, GpuTensor::create_empty(rows, cols, backend_));
         return Tensor::from_gpu(std::move(*r));
     }
 
@@ -1974,6 +1975,12 @@ private:
             }
             kernels = std::move(ordered);
         }
+
+        // RV-03 兜底：顺序隐患（同目标写序 / WAR）必须在**实际执行序**下成立。
+        // 融合侧已拒绝把隐患两端合组（见 expr_graph.hpp has_hazard），这里是
+        // 最后一道闸——任何未来的分组/重排若破坏顺序，在此 fail-fast 而非静默错值。
+        NN_TRY(order_ok, nn::validate_dst_order(g, kernels));
+        (void)order_ok;
 
         // 保留占位集合：kernel tail（输出物化）+ kernel 输入源（融合边界，
         // 其 buffer 被后续 kernel 绑定为输入）+ P2 写穿成员（多输出 kernel 的

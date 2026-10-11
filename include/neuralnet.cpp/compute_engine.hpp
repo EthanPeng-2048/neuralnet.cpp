@@ -45,6 +45,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>   // RV-02：create_tensor 的形状溢出检查
 #include <random>
 #include <source_location>
 #include <span>
@@ -109,7 +110,7 @@ enum class ReduceOp : uint32_t
     return expr_prec_sig_make(bits, P == Precision::F16);
 }
 
-// ── InitSpec — 声明式张量初始化（M2，docs/development/17 §4.4）──────────────
+// ── InitSpec — 声明式张量初始化（M2，docs/todo/17 §4.4）──────────────
 // 分工（铁律 #3）：**层算分布参数**（limit / mean / stddev 这类层语义留在
 // Layer），**引擎负责填数**（只管把 shape×precision×分布的数填出来）。
 // 初始化策略（host 生成后上传 vs 设备端原生生成）由引擎自选，调用方不可见
@@ -359,40 +360,43 @@ public:
 
     // ── 张量工厂（统一接口，§6.4, §6.5）────────────────────────────────
     // P 由调用方显式指定（§8.5）：无隐式推导，无 Auto
-    // P1（docs/development/15 §3.1）：公共非虚入口在尾部统一 stamp 出生绑定，
+    // P1（docs/history.md「15 号归档」 §3.1）：公共非虚入口在尾部统一 stamp 出生绑定，
     // 引擎只实现 create_tensor_impl / from_matrix_impl（protected）——避免
     // 每个 override 各自漏 stamp。to_matrix 输出 Matrix（宿主），不参与 stamp。
-    [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols, Precision P = Precision::F32)
+    // RV-02（工厂错误协议收敛）：错误**结构化**上抛，不再"空张量 + stderr"。
+    //   · 非"存储精度"（BF16/F64 保留值、T1_58 三值声明）→ 拒绝建张量
+    //     （docs 21 §4.1 的落地保证：T1_58 只是层的精度声明，绝不能拿它当
+    //      存储标签）；
+    //   · 形状非法（rows*cols 溢出 size_t）→ 拒绝；
+    //   · 分配失败 → 把实现侧原因（GpuTensor::create_empty 的设备/显存错误）
+    //     原样带上（旧实现连 stderr 都不打印就返回空 Tensor）。
+    // 旧签名 `create_tensor` 保留为 Result 版 + NN_CHECK 解包（失败即终止），
+    // 库内 100+ 调用点无需一次性迁移（分期走 try_create_tensor）。
+    [[nodiscard]] Result<Tensor> try_create_tensor(std::size_t rows, std::size_t cols,
+                                                   Precision P = Precision::F32)
     {
         NN_PROF_OP("create_tensor");
-        // 非"存储精度"（BF16/F64 保留值、T1_58 三值声明）**拒绝建张量**：
-        // 这是 docs 21 §4.1 的落地保证——P1 里 T1_58 只是层的精度声明，
-        // 绝不能有代码拿它当存储标签。契约沿用"失败返回空 Tensor（调用方查
-        // valid()）"，但同时把原因打到 stderr（静默空张量极难定位）。
-        if (auto ok = check_precision_supported(P); !ok)
-        {
-            std::fprintf(stderr, "[engine] create_tensor 拒绝非存储精度: %s\n",
-                         ok.error().message.c_str());
-            return Tensor{};
-        }
+        NN_TRY(pc, check_precision_supported(P));
+        NN_TRY(shape_ok, check_shape_(rows, cols));
         return stamp_(create_tensor_impl(rows, cols, P));
+    }
+    [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols,
+                                       Precision P = Precision::F32)
+    {
+        return NN_CHECK(try_create_tensor(rows, cols, P), "engine.create_tensor");
     }
     // ── 声明式创建/初始化（M2，17 §4.3/§4.4）────────────────────────────
     // InitSpec 指定初值；策略 = 引擎 host 生成后上传（D6：两设备同序列、
     // 调用方不可见；将来设备端原生生成是引擎内部优化，不改本签名）。
-    // 失败返回空 Tensor（与 3 参 create_tensor 同契约，调用方查 valid()）。
+    // 失败返回 Result 错误（与 3 参 try_create_tensor 同协议）。
     // 语义分工：3 参 = 纯分配（沿用现状：CPU Matrix 零填充 / GPU 分配未初始
     // 化，需要零的调用方显式 zero）；"要什么初值"一律走本重载显式声明。
-    [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols, Precision P,
-                                       const InitSpec& spec)
+    [[nodiscard]] Result<Tensor> try_create_tensor(std::size_t rows, std::size_t cols,
+                                                   Precision P, const InitSpec& spec)
     {
         NN_PROF_OP("create_tensor");
-        if (auto ok = check_precision_supported(P); !ok)
-        {
-            std::fprintf(stderr, "[engine] create_tensor 拒绝非存储精度: %s\n",
-                         ok.error().message.c_str());
-            return Tensor{};
-        }
+        NN_TRY(pc, check_precision_supported(P));
+        NN_TRY(shape_ok, check_shape_(rows, cols));
         switch (spec.kind)
         {
         case InitSpec::Kind::Uninitialized:
@@ -401,10 +405,9 @@ public:
         {
             // 分配 + 整张清零（GPU 分配未初始化，zero() 是必要写；CPU 分配
             // 已零填充仍走一遍 zero() 统一契约）。
-            auto t = stamp_(create_tensor_impl(rows, cols, P));
-            if (!t.valid()) return t;
-            if (auto z = zero(t); !z) return Tensor{};
-            return t;
+            NN_TRY(t_r, stamp_(create_tensor_impl(rows, cols, P)));
+            NN_TRY(z, zero(*t_r));
+            return std::move(*t_r);
         }
         default:
             break;
@@ -413,9 +416,13 @@ public:
         // 自带 stamp_；f16 由 from_matrix 做 RHE 舍入，与层手填路径一致）。
         Matrix m(rows, cols, Matrix::uninitialized_tag{});
         fill_host_(m, spec, init_seq_++);
-        auto r = from_matrix(m, P);
-        if (!r) return Tensor{};
-        return std::move(*r);
+        return from_matrix(m, P);
+    }
+    [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols, Precision P,
+                                       const InitSpec& spec)
+    {
+        return NN_CHECK(try_create_tensor(rows, cols, P, spec),
+                        "engine.create_tensor(spec)");
     }
     [[nodiscard]] Result<Tensor> from_matrix(const Matrix& m, Precision P = Precision::F32)
     {
@@ -456,7 +463,7 @@ public:
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // I/O 分组（M3，docs/development/17 §4.3 D3/D9 + §3 D11）：
+    // I/O 分组（M3，docs/todo/17 §4.3 D3/D9 + §3 D11）：
     //   from_matrix / to_matrix / import / read / write / get_index / set_index
     // 宿主数据进出张量只准经本组动词；D9：from_matrix/to_matrix 保留原名
     // （Matrix = 宿主 I/O 载体），批量 read/write 为**本体**，索引级
@@ -519,7 +526,7 @@ protected:
     //
     // 问题：Layer 的"参数派生物"（BitLinear 的 τ/wq）只在**参数变过**时才需要
     // 重算，而 forward 每步都会被调用（梯度累积 N 次、自回归生成每 token 一次
-    // ——见 docs/development/21 §4.11）。判断"变没变"必须有一个便宜且**不漏
+    // ——见 docs/todo/21 §4.11）。判断"变没变"必须有一个便宜且**不漏
     // 报**的信号。
     //
     // 机制：Tensor 的存储对象（MatrixT / GpuBuffer）持有一个单调计数
@@ -696,7 +703,7 @@ public:
         return write(t, std::span<const Scalar>(buf));
     }
 
-    // ── reshape（M1，docs/development/17 §3 D10：修改类操作一律引擎方法）──
+    // ── reshape（M1，docs/todo/17 §3 D10：修改类操作一律引擎方法）──
     // 语义同原 Tensor::reshape：GPU 共享底层 buffer（零拷贝视图）、CPU 按
     // precision_ 复制数据到新形状；绑定随 src 传播（15 §3.1），未出生绑定
     // 的输入由 stamp_ 补绑定。元素数不匹配返回错误（原 NN_ASSERT 升级）。
@@ -1127,7 +1134,7 @@ public:
     //
     // BitLinear 的"有效权重"是 τ∘W（W 三值、τ 逐行 absmean）。打包后权重容器
     // 只占 **0.25 B/权重**（f16 稠密缓冲 2 B/权重），代价是必须由专用内核解码
-    // —— docs/development/21 §4.6 的"T1_58 张量只进量化 GEMM"在这里落地为
+    // —— docs/todo/21 §4.6 的"T1_58 张量只进量化 GEMM"在这里落地为
     // "打包容器只进 matmul_q"（布局见 ternary_pack.hpp）。
     //
     //   trit_pack(w (R,K) f32, τ (R,1) f32) → 容器 (R, ceil(K/16)) f32
@@ -1442,7 +1449,9 @@ public:
     // ══════════════════════════════════════════════════════════════════════
 protected:
     // ── P1 NVI 的引擎侧实现（原公共虚入口下沉至此，stamp 在公共入口统一做）──
-    [[nodiscard]] virtual Tensor create_tensor_impl(std::size_t rows, std::size_t cols, Precision P) = 0;
+    // RV-02：实现侧返回 Result —— 分配失败（GPU 显存/设备）的原因必须能被
+    // 上层拿到，旧形态 `return Tensor();` 把原因整块丢弃。
+    [[nodiscard]] virtual Result<Tensor> create_tensor_impl(std::size_t rows, std::size_t cols, Precision P) = 0;
     [[nodiscard]] virtual Result<Tensor> from_matrix_impl(const Matrix& m, Precision P) = 0;
     // 跨设备/引擎拉取（M6；公共入口 `import` 带 bind_check_ + stamp_）。
     // 默认实现 = 经宿主中转；同设备快路（别名 / 引擎内 cast）也在默认实现内。
@@ -1668,7 +1677,7 @@ protected:
     [[nodiscard]] Tensor adopt(Tensor t) { return stamp_(std::move(t)); }
 
     // ══════════════════════════════════════════════════════════════════════
-    // P1 出生 stamp（docs/development/15 §3.1）：未绑定的产物补上 this；
+    // P1 出生 stamp（docs/history.md「15 号归档」 §3.1）：未绑定的产物补上 this；
     // 已绑定 → 原样（cast 同精度返回 src 等传播场景沿用 src 绑定，不改写）。
     // 只 stamp 有效张量：失败路径返回的 Tensor() 空槽保持不绑定
     // （§3.1：库内非绑定态仅剩空槽；库外直构不受本函数管辖）。
@@ -1684,6 +1693,16 @@ protected:
         if (r && r->valid() && !r->engine_)
             r->engine_ = make_observer(*this);
         return std::move(r);
+    }
+
+    // ── 形状合法性（RV-02）：rows*cols 溢出 size_t 直接拒绝 ────────────────
+    // 溢出后按"回绕后的元素数"分配 = 立即越界，属参数错误而非分配失败，故在
+    // 工厂前置拦下（零尺寸合法：(1,1) dummy 与空批次路径都用到）。
+    [[nodiscard]] static Result<void> check_shape_(std::size_t rows, std::size_t cols)
+    {
+        if (rows != 0 && cols > std::numeric_limits<std::size_t>::max() / rows)
+            NN_FAIL("create_tensor: 形状溢出（rows*cols 超过 size_t 上限）");
+        return {};
     }
 
     // ── IR-C 录制拦截──────────────────────────────────
@@ -1705,9 +1724,9 @@ protected:
             orows = (raxis == 0) ? rows : 1;
             ocols = (raxis == 1) ? cols : 1;
         }
-        Tensor t = create_tensor(orows, ocols, P);
-        if (!t.valid())
-            NN_FAIL("eval_expr: 录制占位张量分配失败");
+        // RV-02：工厂错误上抛（分配失败原因不再被吞成空张量）
+        NN_TRY(t_r, try_create_tensor(orows, ocols, P));
+        Tensor t = std::move(*t_r);
         t.set_virtual_tag(g.tag_of_node[static_cast<std::size_t>(node)]);
         g.node_outputs[node] = t;
         return t;
@@ -1721,7 +1740,10 @@ protected:
         if (g.owner != nullptr && g.owner != this)
             NN_FAIL("eval_expr_into: 录制段内跨引擎求值（段内表达式必须经开启录制的引擎）");
         const int node = g.add_node(spec, inputs, rows, cols,
-                                    /*vector_out=*/false, out.precision());
+                                    /*vector_out=*/false, out.precision(),
+                                    // RV-03：记录写目标存储 —— 同目标的多次写
+                                    // （AdamW 的 decay→update 等）据此建显式顺序边
+                                    out.storage_id());
         g.node_outputs[node] = out;   // 输出 = dst 张量（end_expr 写回其存储）
         return {};
     }
@@ -2139,7 +2161,7 @@ protected:
 
 namespace detail {
 
-// ── L2+ 宿主桥（docs/development/17 §3 D11 / §4.6，AGENTS.md 铁律 #12）────
+// ── L2+ 宿主桥（docs/todo/17 §3 D11 / §4.6，AGENTS.md 铁律 #12）────
 // L2（Layer/Loss/Optimizer/Model）计算路径**不得出现 Matrix 类型**，因此层自算
 // 的辅助数据（索引/位置/掩码/斜率/编码表等——没有对应的引擎侧生成原语）以 span
 // 形态经这三个函数进出；它们内部走 M3 的批量 `write` / `read`（GPU 自动 staging、
@@ -2160,9 +2182,9 @@ namespace detail {
 {
     if (src.size() != rows * cols)
         NN_FAIL("upload_span: 元素数与形状不匹配");
-    Tensor t = engine.create_tensor(rows, cols, P);
-    if (!t.valid())
-        NN_FAIL("upload_span: 张量分配失败");
+    // RV-02：工厂返回 Result —— 分配失败原因原样上抛（含 GPU 侧原因）
+    NN_TRY(t_r, engine.try_create_tensor(rows, cols, P));
+    Tensor t = std::move(*t_r);
     if (P == Precision::F32)
     {
         // fresh_dst=true：t 刚创建、无任何已录/在飞命令引用 → GPU 侧跳过

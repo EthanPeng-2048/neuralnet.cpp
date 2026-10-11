@@ -1,5 +1,8 @@
 # 计算引擎开发指南
 
+> **读者**：调用者（库使用者 / 扩展者）——本分册定位见 [`README.md`](README.md)。
+> 项目内部的设计 / 路线图 / 盘点在 [`../todo/`](../todo/)，历史在 [`../history.md`](../history.md)。
+
 > 面向想要理解或修改计算引擎实现的开发者。本文覆盖 ComputeEngine 接口全解、CPU / GPU 实现模式、以及添加新原语的完整方法。
 
 ## 目录
@@ -246,7 +249,7 @@ auto rg = dsl::compute(engine,                                                  
 ```
 
 > 理由：DSL 与逐元素算子能力完全重叠，且天然融合为单 kernel。
-> 引擎原语盘点见 `development/12-compute-engine-inventory.md`；
+> 引擎原语盘点见 `../todo/12-compute-engine-inventory.md`；
 > 逐元素算子收敛的历史演进记录见 `docs/history.md`。
 
 ### 9. 数据操作原语

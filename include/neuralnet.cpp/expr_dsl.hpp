@@ -89,7 +89,7 @@ concept BoolExpression = requires(const T &t, std::size_t i) {
 namespace nn::dsl
 {
 
-// M1（docs/development/17 §4.1）：Tensor 存储访问已私有化，DSL 求值器经
+// M1（docs/todo/17 §4.1）：Tensor 存储访问已私有化，DSL 求值器经
 // 引擎域内通道 detail::TensorAccess 创建/读写张量（friend 关系，库外禁用）。
 using TensorAccess = ::nn::detail::TensorAccess;
 
@@ -358,8 +358,9 @@ struct CpuViewCache
     }
     [[nodiscard]] Scalar at(std::size_t i) const
     {
-        NN_ASSERT(data != nullptr,
-                  "DSL 叶子 eval 仅适用于 CPU 张量（GPU 路径走 to_spec 折叠）");
+        // RV-01：失败后 `data[i]` 是空指针解引用 → 无条件终止
+        NN_ASSERT_ALWAYS(data != nullptr,
+                         "DSL 叶子 eval 仅适用于 CPU 张量（GPU 路径走 to_spec 折叠）");
         return data[i];
     }
 };
@@ -585,7 +586,7 @@ struct MatmulRef
     bool transA = false;
     bool transB = false;
     std::uint32_t batch = 1;  // 批量数（形状参数，不进 key）
-    // GQA 头分组比（docs/development/22 §3.2 P2）：>1 时该操作数只存
+    // GQA 头分组比（docs/todo/22 §3.2 P2）：>1 时该操作数只存
     // batch/ratio 份行块（多个 query 头共享一个 KV 头）。1 = 恒等。
     std::uint32_t a_kv_ratio = 1;
     std::uint32_t b_kv_ratio = 1;
@@ -977,7 +978,7 @@ inline constexpr bool has_reduction_v<Select<C, T, E>>
 { return MatmulRef{std::move(a), std::move(b), transA, transB, batch}; }
 
 // GQA 变体：a_kv_ratio / b_kv_ratio > 1 时该操作数只存 batch/ratio 份行块
-// （多个连续 query 头共享一个 KV 头；块映射见 docs/development/22 §3.2）。
+// （多个连续 query 头共享一个 KV 头；块映射见 docs/todo/22 §3.2）。
 [[nodiscard]] inline MatmulRef matmul_kv(Tensor a, Tensor b,
                                          bool transA, bool transB,
                                          std::uint32_t batch,
@@ -1650,7 +1651,9 @@ template <typename E>
         if (auto v = validate_expr_spec(tspec, tinputs.size()); !v)
             scan_reject(v.error());
         const int node = g->add_node(tspec, tinputs, dst.rows(), dst.cols(),
-                                     /*vector_out=*/false, dst.precision());
+                                     /*vector_out=*/false, dst.precision(),
+                                     // RV-03：写目标存储标识（同目标写序的显式建边依据）
+                                     dst.storage_id());
         g->node_outputs[node] = dst;
         return {};
     }

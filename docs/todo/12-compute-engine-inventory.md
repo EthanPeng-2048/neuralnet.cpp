@@ -1,5 +1,7 @@
 # 计算引擎现状盘点
 
+> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history.md)。
+
 > 本文只记录**当前状态**：引擎接口清单、表达式求值机制、与目标形态的差距。
 > 目的：把当前代码里实际并存的计算 API 与遗留物列清楚，作为事实底座；全部结论来自
 > 当前工作树的源码与构建配置，复现命令见 `bench/doc_inventory.ps1` 与 §9。
@@ -11,7 +13,7 @@
 > = 库外使用者形态的 AOT 融合端到端门禁 + `expr_fuse_test` = IR-C 图融合 GPU 端到端，
 > 见 `AGENTS.md` §7。其中 `fused_gpu_test` = 融合 shader **逐形态** GPU 对拍；`expr_graph_test` = IR-C 图融合分析（CPU 12 用例）；`error_macro_test`
 > = 错误处理宏族（`NN_CHECK`/`NN_EXIT`/`NN_TRY_MSG`/`NN_FAIL`）；`kvrec_test`/`nnvocab_test`/`dataset_test`
-> = 统一数据集（KVRecord v2 / `.nnvocab` / `.nndataset`，见 `docs/development/19`）；
+> = 统一数据集（KVRecord v2 / `.nnvocab` / `.nndataset`，见 `docs/todo/19`）；
 > `zipt_test` 随 ZiPT 移除，见 `docs/history.md`）。
 >
 > 历史演进与收敛记录（计算类原语全量迁 DSL、算子收敛与遗留物

@@ -1,5 +1,7 @@
 # 三值（1.58-bit）量化权重与 BitLinear 设计
 
+> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history.md)。
+
 > **状态**：**P1 已实施**（2026-10-09 起草；2026-10-10 裁定尺度 / 打包 / 命名；
 > 2026-10-10 落地 P1 全部 5 步并提交，见 §9 提交清单与 §7 实施清单末列）。
 > 本文现在同时是**实现依据**与**实现说明**：§4 是设计，§4.9 是"实现与设计的差异"，
@@ -613,7 +615,7 @@ graph TB
 
 1. **训练期**（P2 打包）：打包只压缩 `wq_` 那一项（2 B → 行级 base-3 ≈ 1.7 bpw），总账
    **10 → ~8.3 B/元素（−17%）**；想再往下必须动 latent/优化器（f16 master、8-bit Adam），
-   与三值本身无关。**所以"训练更省显存"不是三值的卖点**——`docs/development/22` 的 2B4T 目标里
+   与三值本身无关。**所以"训练更省显存"不是三值的卖点**——`docs/todo/22` 的 2B4T 目标里
    显存收益来自 GQA（K/V 头收窄）+ tied embedding（省一份 head），不是 BitLinear。
 2. **推理/部署期**（P2 之后 + 去掉 latent/grad/optimizer）：1.7 bpw vs f16 的 16 bpw ≈ **9.4×**，
    这才是 1.58-bit 的名义收益；本项目当前没有单独的推理权重格式（`load_model` 仍读 latent）。
@@ -847,7 +849,7 @@ ctest **36/36**。
 
 > 本节原描述的 `"NNQT"` 独立 magic / 独立读写器 / `--export-deploy` /
 > `Layer::sub_layers()` / packed-only 载入，已在**库级违规设计清理**
-> （`docs/development/23-library-design-cleanup-and-model-file-roles.md`）中**落地
+> （`docs/todo/23-library-design-cleanup-and-model-file-roles.md`）中**落地
 > 删除**。**base-3 载荷**与 **τ 逐位复现**这两条结论继续有效，只是换了容器。
 > 裁决与迁移步骤见 23；下面只写**现状口径**。
 

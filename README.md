@@ -18,7 +18,7 @@
 
 > AI 仅作为辅助工具，所有代码的所有权与最终版权归本项目作者（EthanPeng-2048）所有，不影响上述 MIT 许可证的效力。
 
-## �📚 文档
+## 📚 文档
 
 | 文档 | 说明 |
 |------|------|
@@ -27,19 +27,18 @@
 | [算法解析](docs/introduction/03-algorithm-reference.md) | 每个 Layer/Loss/Optimizer 的数学原理与原语分解 |
 | [创新设计](docs/introduction/04-innovative-designs.md) | 引擎化、AOT 融合、多精度等创新全景 |
 | [计算引擎开发](docs/development/01-compute-engine-development.md) | ComputeEngine 接口详解、实现模式、添加新原语 |
-| [算子融合](docs/development/02-operator-fusion.md) | 归约语义 IR → 表达式录制 → matmul 融合 → 手写算子收敛为 IR 融合 |
-| [IR 优化](docs/development/03-ir-optimization.md) | IR-A/B/C/D 优化 pass（IR-C = 图 IR + `begin_expr/end_expr` 融合分析，§5.3） |
-| [显存优化](docs/development/04-memory-optimization.md) | 激活重计算、内存池归还 |
-| [多精度计算](docs/development/05-mixed-precision.md) | f16/混合精度设计：Precision 类型系统、PrecisionProfile |
+| [多精度计算](docs/development/05-mixed-precision.md) | f16/混合精度语义契约：Precision 类型系统、PrecisionProfile、已知数值限制 |
 | [线性注意力](docs/development/06-rapt-algorithm.md) | RLA → RAPT → RLA-2 算法谱系 + GPU 扫描原语落地 |
-| [踩坑警示录](docs/development/08-pitfalls-and-lessons.md) | **改代码前读**，历史 bug 分级与根因模式 |
-| [开发规范](docs/development/10-development-standards.md) | C++ 编码规范、模块隔离、内存管理 |
-| [计算引擎盘点](docs/development/12-compute-engine-inventory.md) | 引擎接口全景、表达式求值机制、遗留物清单 |
+| [写自定义层](docs/development/20-custom-layer-ergonomics.md) | 库外使用者视角的接入契约与实测摩擦点 |
 | [快速上手：构建模型](docs/usage/01-quickstart-model.md) | ComputeEngine/Layer/Model 三件套使用教程 |
 | [快速上手：训练与推理](docs/usage/02-quickstart-train-infer.md) | MNIST/GPT 训练推理命令行 + C++ API 示例 + GUI 操作指南 |
 | [计算引擎使用](docs/usage/03-compute-engine-usage.md) | 张量操作、矩阵运算、表达式融合 |
 | [训练包](docs/usage/04-train-package.md) | 用 `.nnpkg` 打包超参+训练集，跨设备一键复现训练 |
-| [统一数据集设计](docs/development/19-unified-dataset.md) | `.nndataset`/`.nnvocab`/KVRecord v2 格式与 `nn::Dataset` |
+| [作为库嵌入](docs/usage/05-consume-as-library.md) | 把本库嵌进自己的工程（`neuralnet::nn` 门面 / FetchContent） |
+
+> **文档分册定位**：`introduction` / `usage` / `development` 写给**调用者**；
+> 项目内部的设计 / 路线图 / 盘点 / 规范 / 踩坑 / 故障 / 整改在 [`docs/todo/`](docs/todo/README.md)；
+> 历史归档在 [`docs/history.md`](docs/history.md)。**总索引见 [`docs/README.md`](docs/README.md)。**
 
 ## 项目结构
 
@@ -48,26 +47,25 @@ neuralnet.cpp/
 ├── CMakeLists.txt
 ├── README.md
 ├── docs/
-│   ├── introduction/          ← 介绍类
+│   ├── README.md             ← 文档总索引与分册定位
+│   ├── history.md            ← 全仓唯一历史归档
+│   ├── introduction/          ← 介绍类（调用者）
 │   │   ├── 01-architecture.md            ← 架构设计文档
 │   │   ├── 02-performance.md             ← 性能优化文档
 │   │   ├── 03-algorithm-reference.md     ← 算法解析参考
 │   │   └── 04-innovative-designs.md      ← 创新设计全景
-│   ├── development/          ← 开发类
-│   │   ├── 01-compute-engine-development.md ← 引擎开发指南
-│   │   ├── 02-operator-fusion.md         ← 算子融合全篇（一期 M + 二期 S）
-│   │   ├── 03-ir-optimization.md         ← IR 优化
-│   │   ├── 04-memory-optimization.md     ← 显存优化
-│   │   ├── 05-mixed-precision.md         ← 多精度计算
+│   ├── development/          ← 开发类（**调用者**：扩展/接入库）
+│   │   ├── 01-compute-engine-development.md ← 引擎开发指南（加新原语）
+│   │   ├── 05-mixed-precision.md         ← 多精度语义契约
 │   │   ├── 06-rapt-algorithm.md          ← RLA / RAPT / RLA-2 算法
-│   │   ├── 08-pitfalls-and-lessons.md    ← 踩坑警示录
-│   │   ├── 10-development-standards.md   ← 开发规范
-│   │   └── 12-compute-engine-inventory.md ← 引擎接口盘点
-│   └── usage/                 ← 使用类
+│   │   └── 20-custom-layer-ergonomics.md ← 写自定义层
+│   ├── usage/                 ← 使用类（调用者）
 │       ├── 01-quickstart-model.md        ← 模型构建教程
 │       ├── 02-quickstart-train-infer.md  ← 训练推理教程
 │       ├── 03-compute-engine-usage.md    ← 引擎使用指南
-│       └── 04-train-package.md           ← .nnpkg 训练包
+│       ├── 04-train-package.md           ← .nnpkg 训练包
+│       └── 05-consume-as-library.md      ← 作为库嵌入自己的工程
+│   └── todo/                  ← 内部工作区（**项目开发者**：设计/路线图/盘点/规范/踩坑/故障/整改）
 ├── gui.py                       ← 图形化操作界面 (CustomTkinter)
 ├── include/neuralnet.cpp/
 │   ├── nn.hpp                   ← 统一入口头文件
@@ -135,7 +133,7 @@ cmake -B build -G Ninja
 - MNIST 数据：`datasets/mnist_data/`（`train.csv` / `test.csv`）
 - 文本语料：使用 `scripts/` 下的 `download_*.py` 脚本下载
 - GPT 训练数据统一为 **`.nndataset`**（token/词表/loss 掩码/test 子集都在生成期定好，
-  见 `docs/development/19-unified-dataset.md`）：
+  见 `docs/todo/19-unified-dataset.md`）：
 
   ```powershell
   ./build/tokenizer_train corpus.txt --vocab-size 10000 --output my_bpe.nnvocab
@@ -296,7 +294,7 @@ python gui.py
 
 ## 📐 开发规范
 
-本项目遵循严格的 C++ 开发规范，详见 [开发规范](docs/development/10-development-standards.md)。
+本项目遵循严格的 C++ 开发规范，详见 [开发规范](docs/todo/10-development-standards.md)。
 
 ### 核心原则
 

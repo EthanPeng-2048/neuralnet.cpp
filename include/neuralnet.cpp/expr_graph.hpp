@@ -10,7 +10,7 @@
 //    2. Tensor 占位标记经公共元数据访问器（virtual_tag/
 //       set_virtual_tag），存储访问收口在引擎域内。
 //
-//  对应文档 `docs/development/03-ir-optimization.md` IR-C：把扁平 ExprSpec 演进为图 IR
+//  对应文档 `docs/todo/03-ir-optimization.md` IR-C：把扁平 ExprSpec 演进为图 IR
 //  （DAG），为 begin_expr/end_expr 提供多表达式融合分析。
 //
 //  图结构：
@@ -68,6 +68,11 @@ struct ExprGraphNode
     std::size_t cols = 0;
     bool        vector_out = false;  // 输出为归约向量（(rows,1)/(1,cols)）
     Precision   prec = Precision::F32;  // 求值精度（恢复时新增：融合成员须一致）
+    // RV-03：本节点的**写目标存储标识**（Tensor::storage_id()）。0 = 本节点输出
+    // 是一块新占位存储（dsl::compute 建的新张量）；非 0 = 目标传递节点
+    // （dsl::compute_into / eval_expr_into 写进既有张量）。用于把"同目标的多次写"
+    // 显式建边——这是纯数据流图看不见的顺序隐患（见 dst_order_constraints）。
+    std::uintptr_t dst_id = 0;
     // 依赖：dep_of_input[k] = 该输入槽依赖的图节点下标；-1 = 外部输入。
     // 长度 == spec.views.size()（与输入一一对应）。
     std::vector<int> dep_of_input;
@@ -99,7 +104,8 @@ struct ExprGraph
                                std::span<const Tensor> inputs,
                                std::size_t rows, std::size_t cols,
                                bool vector_out,
-                               Precision prec = Precision::F32)
+                               Precision prec = Precision::F32,
+                               std::uintptr_t dst_id = 0)
     {
         const ExprSpec spec = canonicalize_expr_spec(raw_spec);
         const int idx = static_cast<int>(nodes.size());
@@ -109,6 +115,7 @@ struct ExprGraph
         nd.cols        = cols;
         nd.vector_out  = vector_out;
         nd.prec        = prec;
+        nd.dst_id      = dst_id;   // RV-03：目标传递节点的写目标（0 = 新占位存储）
         nd.dep_of_input.reserve(spec.views.size());
         nd.input_tensors.reserve(spec.views.size());
         for (std::size_t k = 0; k < spec.views.size(); ++k)
@@ -186,6 +193,91 @@ namespace fused
 
 } // namespace fused
 
+// ── 顺序隐患（RV-03）：同目标存储的写序必须**显式**保序 ────────────────────
+// IR-C 的融合与执行期重排只认显式依赖边（virtual_tag）。有一类顺序关系在纯
+// 数据流图里**看不见**，一旦被分组/重排打破就会静默改变语义：
+//   · WAW：两次目标传递（compute_into）写同一张量 —— AdamW 的
+//     `p = (1−lr·wd)·p` 与随后的 `p += delta` 就是同目标两次写（原注释自陈
+//     "无数据依赖边，正确性靠执行序 = 节点序"）；
+//   · WAR：先读该张量的表达式排在写该张量的表达式之前 —— 稀疏 CE 的
+//     lse / loss_sum 先读 logits，grad 再原地覆写 logits。
+// 本函数把它们抽成显式边 (i, j) = "i 必须先于 j 执行"，供融合侧拒绝把隐患
+// 两端合进同一 kernel，并由 validate_dst_order 在执行期兜底校验。
+[[nodiscard]] inline std::vector<std::pair<int, int>> dst_order_constraints(const ExprGraph& g)
+{
+    std::vector<std::pair<int, int>> out;
+    std::unordered_map<std::uintptr_t, int> last_writer;            // 存储 → 最近写者
+    std::unordered_map<std::uintptr_t, std::vector<int>> readers;   // 存储 → 上次写之后的读者
+    for (int i = 0; i < static_cast<int>(g.nodes.size()); ++i)
+    {
+        const ExprGraphNode& n = g.nodes[static_cast<std::size_t>(i)];
+        // ① 读：该张量此前被本图写过 → 写后读必须保序（跨节点的同存储读写，
+        //    若只由外部输入承载，数据流图上看不见这条边）
+        for (const Tensor& t : n.input_tensors)
+        {
+            if (!t.valid()) continue;          // 依赖输入槽是空占位
+            const std::uintptr_t id = t.storage_id();
+            if (id == 0) continue;             // 无存储（不该发生）
+            const auto w = last_writer.find(id);
+            if (w != last_writer.end() && w->second < i)
+                out.emplace_back(w->second, i);
+            readers[id].push_back(i);
+        }
+        // ② 写：与上一次写（WAW）、以及上次写之后的所有读者（WAR）建边
+        const std::uintptr_t d = n.dst_id;
+        if (d == 0) continue;                  // 新占位存储，无写序隐患
+        const auto w = last_writer.find(d);
+        if (w != last_writer.end() && w->second < i)
+            out.emplace_back(w->second, i);
+        const auto r = readers.find(d);
+        if (r != readers.end())
+        {
+            for (const int rd : r->second)
+                if (rd < i) out.emplace_back(rd, i);
+            r->second.clear();                 // 读者已全部被本次写"消费"
+        }
+        last_writer[d] = i;
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+// RV-03 兜底校验：给定**执行序**下的 kernel 列表，检查每条顺序隐患边都保序。
+// 违反 = 静默错值的隐患已经成真 → fail-fast（绝不静默算错）。
+[[nodiscard]] inline Result<void> validate_dst_order(
+    const ExprGraph& g, std::span<const FusedKernel> ordered_kernels)
+{
+    const std::vector<std::pair<int, int>> edges = dst_order_constraints(g);
+    if (edges.empty()) return {};
+    std::vector<int> kernel_pos(g.nodes.size(), -1);
+    std::vector<int> member_pos(g.nodes.size(), -1);
+    for (std::size_t k = 0; k < ordered_kernels.size(); ++k)
+        for (std::size_t m = 0; m < ordered_kernels[k].members.size(); ++m)
+        {
+            const int node = ordered_kernels[k].members[m];
+            if (node < 0 || static_cast<std::size_t>(node) >= g.nodes.size())
+                continue;
+            kernel_pos[static_cast<std::size_t>(node)] = static_cast<int>(k);
+            member_pos[static_cast<std::size_t>(node)] = static_cast<int>(m);
+        }
+    for (const auto& [i, j] : edges)
+    {
+        const int pi = kernel_pos[static_cast<std::size_t>(i)];
+        const int pj = kernel_pos[static_cast<std::size_t>(j)];
+        if (pi < 0 || pj < 0) continue;        // 未被任何 kernel 覆盖（不该发生）
+        if (pi < pj) continue;                 // i 的 kernel 先执行 → 保序
+        // 同一 kernel 内：成员序必须保持 i 在 j 之前
+        if (pi == pj && member_pos[static_cast<std::size_t>(i)] <
+                        member_pos[static_cast<std::size_t>(j)])
+            continue;
+        NN_FAIL("IR-C 顺序隐患被破坏（同目标写序/WAR 要求节点 i 先于 j 执行）：i="
+                + std::to_string(i) + " j=" + std::to_string(j)
+                + "（分组或重排拆掉了显式顺序边）");
+    }
+    return {};
+}
+
 // ── 融合分析（IR-C 核心，纯函数） ───────────────────────────────────────
 // 贪心按节点序：维护"当前打开的 kernel"（其末尾节点为 tail）。节点 i 若
 // 满足"并入"条件则并入，否则新开 kernel。
@@ -202,6 +294,17 @@ namespace fused
             if (dep >= 0)
                 consumers[static_cast<std::size_t>(dep)].push_back(static_cast<int>(i));
 
+    // RV-03：顺序隐患边（同目标写序 / WAR）——有隐患关系的两个节点**不得**合进
+    // 同一 kernel：同一 dispatch 内的多次写，其先后不再由 kernel 执行序决定。
+    const std::vector<std::pair<int, int>> order_edges = dst_order_constraints(g);
+    const auto has_hazard = [&order_edges](int a, int b) -> bool
+    {
+        if (a == b) return false;
+        if (a > b) std::swap(a, b);
+        return std::binary_search(order_edges.begin(), order_edges.end(),
+                                  std::make_pair(a, b));
+    };
+
     // ── 尝试把节点 bi 并入当前 kernel（cur） ───────────────────────────
     const auto try_append = [&](FusedKernel& cur, int bi) -> bool
     {
@@ -209,6 +312,10 @@ namespace fused
         const int tail = cur.tail;
         const ExprSpec& A = cur.spec;   // 当前复合 spec（含 tail 及之前节点）
         const ExprSpec& Bs = B.spec;
+
+        // 0) RV-03：与已并入成员有顺序隐患 → 不合组（保序优先于省 dispatch）
+        for (const int m : cur.members)
+            if (has_hazard(m, bi)) return false;
 
         // 1) 前置：均逐元素（无归约）、非归约输出、形状相同、精度相同
         if (cur.vector_out || B.vector_out) return false;
@@ -399,8 +506,14 @@ namespace fused
             const int ra = uf_find(d);
             const int rb = uf_find(static_cast<int>(i));
             if (ra != rb)
+            {
+                // RV-03：先检查顺序隐患——有隐患的节点不得进入同一分量
+                // （同一 kernel 内的写序不再由 kernel 执行序决定）
+                if (has_hazard(d, static_cast<int>(i)))
+                    continue;
                 uf_parent[static_cast<std::size_t>(std::max(ra, rb))] =
                     std::min(ra, rb);   // 小根为根：确定性
+            }
         }
     }
 
@@ -457,6 +570,9 @@ namespace fused
         const ExprSpec& Bs = B.spec;
         if (Bs.instrs.empty() || Bs.matmul || Bs.fold)
             return false;
+        // RV-03：同目标写序 / WAR 隐患的两端不合组（见 has_hazard 的说明）
+        for (const int m : mem0)
+            if (has_hazard(m, static_cast<int>(bi))) return false;
         const auto member_idx = [&](int dep) -> int
         {
             for (std::size_t m = 0; m < mem0.size(); ++m)
@@ -674,12 +790,29 @@ struct FusedKernelPlan
         }
     };
     mix_u64(static_cast<std::uint64_t>(g.nodes.size()));
+    // RV-03：写目标按**共享结构**进 key —— 同 dst 的节点归同一个组号（按首次出现
+    // 顺序编号 1,2,…；0 = 新占位存储）。直接用指针值会让"每步新建的目标张量"
+    // （Muon 的临时累加器等）每步产生新 key，白白丢掉 P2-12 的图级计划缓存。
+    std::unordered_map<std::uintptr_t, int> dst_group;
     for (const auto& n : g.nodes)
     {
         mix_u64(static_cast<std::uint64_t>(n.rows));
         mix_u64(static_cast<std::uint64_t>(n.cols));
         mix_u64(n.vector_out ? 1ull : 0ull);
         mix_u64(static_cast<std::uint64_t>(n.prec));
+        // RV-03：融合决策（是否因顺序隐患拆分 kernel）依赖"哪些节点写同一目标"，
+        // 遗漏会让"结构相同但写目标共享关系不同"的图错误命中缓存的合并计划。
+        {
+            int grp = 0;
+            if (n.dst_id != 0)
+            {
+                const auto [it, inserted] = dst_group.emplace(
+                    n.dst_id, static_cast<int>(dst_group.size()) + 1);
+                (void)inserted;
+                grp = it->second;
+            }
+            mix_u64(static_cast<std::uint64_t>(grp));
+        }
         mix_str(expr_spec_key(n.spec));
         mix_u64(static_cast<std::uint64_t>(n.dep_of_input.size()));
         for (const int d : n.dep_of_input)

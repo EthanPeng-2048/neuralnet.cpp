@@ -131,8 +131,8 @@ int run_test()
         NN_EXIT(b, 1, "checkpoint backward failed: ");
 
         const auto& grads = model.param_gradients();
-        NN_ASSERT(grads.size() == baseline_grads.size(),
-                  "gpt_checkpoint_test: grad count mismatch");
+        NN_ASSERT_ALWAYS(grads.size() == baseline_grads.size(),
+                         "gpt_checkpoint_test: grad count mismatch");
         for (std::size_t p = 0; p < grads.size(); ++p)
         {
             auto gm = eng.to_matrix(grads[p].get());

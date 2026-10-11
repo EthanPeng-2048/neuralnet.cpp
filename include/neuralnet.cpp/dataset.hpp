@@ -2,7 +2,7 @@
 
 // ══════════════════════════════════════════════════════════════════════════
 //  dataset.hpp — 统一数据集：.nndataset 读写 + nn::Dataset 只读类
-//  （设计见 docs/development/19-unified-dataset.md §4/§5）
+//  （设计见 docs/todo/19-unified-dataset.md §4/§5）
 //
 //  文件布局（§4.3）：
 //    [label "NNDS" + file_version=1][文件级 kvrec v2][doc 块 arena ...]
@@ -451,7 +451,7 @@ public:
         if (is_vocab_only_)
             NN_FAIL("该文件是 .nnvocab 词表，不含数据集子集: " + path_);
         if (info_.kind != DatasetKind::Text)
-            NN_FAIL("tabular 数据集尚未支持（阶段四预留，见 docs/development/19 §4.4）");
+            NN_FAIL("tabular 数据集尚未支持（阶段四预留，见 docs/todo/19 §4.4）");
         const std::vector<std::uint64_t> &index = test ? test_index_ : train_index_;
         if (test && info_.test_docs == 0)
             NN_FAIL("该数据集没有 test 子集");

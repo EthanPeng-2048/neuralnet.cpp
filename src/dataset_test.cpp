@@ -1,5 +1,5 @@
 // ── dataset_test — .nndataset 统一数据集（nn::Dataset）测试 ─────────────────
-// 覆盖（docs/development/19-unified-dataset.md §8/§9 阶段二验收）：
+// 覆盖（docs/todo/19-unified-dataset.md §8/§9 阶段二验收）：
 //   1. 行 trim 规则与原 read_file_lines 逐字一致
 //   2. 并行 tokenize 保序 = 顺序 encode（任意并行度逐字节一致，铁律 #8）
 //   3. 逐 doc 掩码 = 原全局 mark_assistant_spans（doc 边界重置）逐位一致

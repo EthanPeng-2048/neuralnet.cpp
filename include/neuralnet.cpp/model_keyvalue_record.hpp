@@ -9,7 +9,7 @@
 //    3. 面向 C++ —— set/get 直接对应 uint64_t / std::string / vector<uint64_t>。
 //    4. 版本友好 —— 缺失字段由上层按版本记录默认值；新增字段只需加一条 set/get。
 //
-//  两个版本（设计见 docs/development/19-unified-dataset.md §3）：
+//  两个版本（设计见 docs/todo/19-unified-dataset.md §3）：
 //
 //  ── v1（内联布局，小端）────────────────────────────────────────────────
 //    [field_count u32]

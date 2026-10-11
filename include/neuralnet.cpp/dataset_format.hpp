@@ -2,7 +2,7 @@
 
 // ══════════════════════════════════════════════════════════════════════════
 //  dataset_format.hpp — .nnvocab / .nndataset 文件格式公共件
-//  （设计见 docs/development/19-unified-dataset.md §4）
+//  （设计见 docs/todo/19-unified-dataset.md §4）
 //
 //  文件标签（两类文件通用）：
 //    [label] := [magic 4B][file_version u32]

@@ -106,7 +106,7 @@ nn_enable_gpu_fusion(my_app MAIN ${CMAKE_CURRENT_SOURCE_DIR}/my_app_main.cpp)
   `/std:c++latest`，C++26 预览全开）。MSVC 下消费方源码也须为 UTF-8（`/utf-8` 已传）。
 - **install / `find_package` 尚不支持**：当前只支持源码嵌入（add_subdirectory /
   FetchContent）。`install()`/export 与 `CMakePresets.json` 见
-  `docs/development/18-roadmap.md` P0-4 的剩余部分。
+  `docs/todo/18-roadmap.md` P0-4 的剩余部分。
 - **只支持 CPU / Vulkan 双后端**（无 CUDA）。
 
 ## 6. 故障排查

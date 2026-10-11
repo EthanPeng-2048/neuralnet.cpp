@@ -29,7 +29,7 @@ namespace nn
 
 // 解释器并行门控（eval_expr_impl / 归约预计算共用）。
 // 解释执行的 per-element 成本比向量化逐元素高约一个数量级
-// （docs/development/11 §2.4：解释器 vs 等价串行标量 ~9x），而并行区启动
+// （原 docs/development/11-cpu-performance-diagnosis.md §2.4：解释器 vs 等价串行标量 ~9x；该诊断文档已删，见 docs/history.md「失效文档链接清理」），而并行区启动
 // 开销约 100µs，因此门控远低于 nn::PARALLEL_THRESHOLD(524288)：
 // 65536 元素 × ~10ns/element ≈ 0.65ms ≫ 0.1ms，稳赚。
 inline constexpr std::size_t kExprParallelThreshold = 65536;
@@ -79,7 +79,10 @@ public:
 
     // ── 张量工厂（统一接口，§6.4, §6.5）────────────────────────────────
     // P 由调用方显式指定（§8.5）：无隐式推导，无 Auto
-    [[nodiscard]] Tensor create_tensor_impl(std::size_t rows, std::size_t cols, Precision P) override
+    // RV-02：分配在宿主直配上不会失败（失败 = bad_alloc → abort），故恒成功；
+    // 仍按 Result 形态返回以统一协议。
+    [[nodiscard]] Result<Tensor> create_tensor_impl(std::size_t rows, std::size_t cols,
+                                                   Precision P) override
     {
         if (P == Precision::F16)
             return Tensor::cpu<Precision::F16>(rows, cols);

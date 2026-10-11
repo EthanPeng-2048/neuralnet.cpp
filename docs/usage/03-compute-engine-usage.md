@@ -248,7 +248,7 @@ struct nn::PrecisionProfile {
 //                  / profile_master_weights() / profile_all_f16()
 ```
 
-> **三值 `T1_58` 与 f16/f32 正交（docs/development/21-quantized-weights.md）**：f16 是"换更窄的
+> **三值 `T1_58` 与 f16/f32 正交（docs/todo/21-quantized-weights.md）**：f16 是"换更窄的
 > 容器"（舍入，全算子统一 P）；`T1_58` 是"换一种权重表示"（按逐行 absmean 尺度把权重投影到
 > `{-1,0,+1}`，需要额外尺度 γ）。因此它**不进提升序**（`precision_rank()` 对它无定义，
 > `max_precision` 直接 fail-fast），在 P1 里也只作为 `PrecisionProfile.param` 的一句**声明**
@@ -1680,12 +1680,12 @@ if (nn::dsl::env_flag("NN_PREC_TRACE"))
 | 文档 | 何时读 |
 |---|---|
 | `docs/development/01-compute-engine-development.md` | 想**扩展引擎**（加新原语）而不是使用它 |
-| `docs/development/12-compute-engine-inventory.md` | 引擎 52 个 virtual 方法的盘点与 Layer 直调分类（复现：`bench/doc_inventory.ps1`） |
+| `docs/todo/12-compute-engine-inventory.md` | 引擎 52 个 virtual 方法的盘点与 Layer 直调分类（复现：`bench/doc_inventory.ps1`） |
 | `docs/development/05-mixed-precision.md` | 多精度类型系统、f16 语义锚与实测结论（§12 已知限制） |
-| `docs/development/02-operator-fusion.md` + `03-ir-optimization.md` | 表达式融合与 IR 细节 |
-| `docs/development/17-unified-tensor-engine.md` | 统一张量/引擎总纲：访问不变量（铁律 #11）、Matrix 降级（铁律 #12）、InitSpec、批量读写、内存契约 |
+| `docs/todo/02-operator-fusion.md` + `03-ir-optimization.md` | 表达式融合与 IR 细节 |
+| `docs/todo/17-unified-tensor-engine.md` | 统一张量/引擎总纲：访问不变量（铁律 #11）、Matrix 降级（铁律 #12）、InitSpec、批量读写、内存契约 |
 | `docs/development/06-rapt-algorithm.md` | 扫描原语的算法背景 |
-| `docs/development/08-pitfalls-and-lessons.md` | 踩坑警示录（改代码前读） |
+| `docs/todo/08-pitfalls-and-lessons.md` | 踩坑警示录（改代码前读） |
 | `docs/introduction/01-architecture.md` | 完整分层架构与数据流 |
 | `docs/usage/01-quickstart-model.md` | 用现成 Layer 搭模型的教程 |
 | `docs/usage/02-quickstart-train-infer.md` | 训练/推理 CLI + C++ API + GUI |

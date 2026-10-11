@@ -1,6 +1,6 @@
 // ── gpu_stability_probe.cpp — CPU/GPU 训练 run-to-run 确定性探针 ─────────
 //
-// 用途（ComputeEngine Refresh P0，见 docs/development/15 §4.9 D9 实测）：
+// 用途（ComputeEngine Refresh P0，见 docs/history.md「15 号归档」 §4.9 D9 实测）：
 //   单进程内连续跑两轮完全相同的微型 GPT 训练（每轮独立建引擎、建模型），
 //   比对每步 loss（%.9g，f32 9 位有效数字可往返）与训练后全部参数的
 //   FNV-1a 校验和是否**逐位一致**；同时输出固定前缀行，便于跨进程

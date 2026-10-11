@@ -565,8 +565,9 @@ public:
         ComputeEngine& engine, Tensor& score,
         std::size_t /*BH*/, std::size_t /*seq*/) override
     {
-        NN_ASSERT(slope_row_cache_.valid() && pos_row_cache_.valid(),
-                  "AlibiPositionEncoder: prepare_score_bias 未被调用");
+        // RV-01：缓存未准备时下面的 row_broadcast 会读空张量 → 无条件终止
+        NN_ASSERT_ALWAYS(slope_row_cache_.valid() && pos_row_cache_.valid(),
+                         "AlibiPositionEncoder: prepare_score_bias 未被调用");
         NN_TRY(res, dsl::compute(engine,
             dsl::leaf(score)
                 + dsl::row_broadcast(slope_row_cache_)

@@ -158,7 +158,7 @@ struct TernaryProfileSplit
                  std::string("层 ") + layer_name + "：收到 param=t1_58，但该层不是"
                  "三值模式（weight_quant=None）—— 三值权重只对 BitLinear 有意义；"
                  "请以 weight_quant=t1_58 构造该层，或把 param 改回 f16/f32"
-                 "（docs/development/21-quantized-weights.md §4.8.3）");
+                 "（docs/todo/21-quantized-weights.md §4.8.3）");
     }
     TernaryProfileSplit out{profile, profile};
     if (out.self.param == Precision::T1_58) out.self.param = Precision::F32;
@@ -186,7 +186,7 @@ struct TernaryProfileSplit
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// 参数形态协议（v7 文件角色；docs/development/23 §2.2）
+// 参数形态协议（v7 文件角色；docs/todo/23 §2.2）
 //
 // 一句话：**kind 是参数级的**。序列化层按 `Model::parameters()` 的顺序逐条读写
 //   `[kind][precision][rows][cols][aux][payload]`，由**拥有该参数的那个层**
@@ -270,7 +270,8 @@ protected:
                          "[layer-init] Layer: engine 未绑定（init(engine) 未被调用）"
                          " —— 调用点 %s:%d\n",
                          loc.file_name(), static_cast<int>(loc.line()));
-            NN_ASSERT(false, "Layer: engine 未绑定——先调 init(engine)（Model::add 会自动调）");
+            // RV-01：Release 下 NN_ASSERT 为空 → 紧随其后的 `return *engine_` 是空解引用。
+            NN_FATAL("Layer: engine 未绑定——先调 init(engine)（Model::add 会自动调）");
         }
         return *engine_;
     }
@@ -298,7 +299,7 @@ public:
             NN_CHECK(false,
                      std::string("set_precision_profile: 层已 init，精度 profile 之后不可变（层=")
                          + layer_name() + "）—— 请在 init(engine) 之前注入"
-                         "（docs/development/21-quantized-weights.md §4.3.2(b)）");
+                         "（docs/todo/21-quantized-weights.md §4.3.2(b)）");
         }
         p_ = profile;
     }
@@ -578,7 +579,7 @@ protected:
         NN_FAIL(std::string("精度能力校验失败: 层 ") + layer_name()
                 + " 不支持 " + slot + "=" + precision_name(got)
                 + "（该槽允许: " + allowed.to_string()
-                + "）—— 见 docs/development/21-quantized-weights.md §4.2");
+                + "）—— 见 docs/todo/21-quantized-weights.md §4.2");
     }
 
 public:
@@ -750,7 +751,8 @@ public:
     std::mt19937_64& rng, std::uniform_real_distribution<Scalar>& dist)
 {
     const std::size_t n = logits.size();
-    NN_ASSERT(n > 0, "sample_next_token_: empty logits");
+    // RV-01：n == 0 时下面的 `logits[0]` / max 归约都越界 → 无条件终止
+    NN_ASSERT_ALWAYS(n > 0, "sample_next_token_: empty logits");
     if (temperature > 0.0 && temperature != 1.0)
         for (auto& v : logits) v /= temperature;
 

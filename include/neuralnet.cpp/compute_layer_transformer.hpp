@@ -491,8 +491,9 @@ public:
           d_model_(d_model),
           projection_(patch_dim_, d_model)
     {
-        NN_ASSERT(img_size % patch_size == 0,
-                  "PatchEmbedding: img_size must be divisible by patch_size");
+        // RV-01：不整除 → num_patches_ 少算、后续按错误形状索引 → 无条件终止
+        NN_ASSERT_ALWAYS(img_size % patch_size == 0,
+                         "PatchEmbedding: img_size must be divisible by patch_size");
     }
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override

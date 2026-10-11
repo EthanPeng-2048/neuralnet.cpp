@@ -115,7 +115,7 @@ SPIR-V/Vulkan 并未把 float→float16 的舍入钉死为 round-to-nearest-even
    （而不是 N·ULP），或直接与 CPU 结果逐位对拍。
 4. **文档勘误**：`docs/development/05-mixed-precision.md` §12.5
    “profile_f16 与 f32 轨迹一致” 的结论只在 wd=0/短跑下成立；
-   AGENTS/已交付能力里的 f16 描述与 `docs/development/14` 需要补这条已知问题。
+   AGENTS/已交付能力里的 f16 描述与 `docs/todo/14` 需要补这条已知问题。
 
 ## 7. 材料与复现
 
@@ -238,6 +238,6 @@ CPU/GPU 全部通过。
 - f16 **次正规/溢出**边界：`nn_f16_rne` 已按 f16 网格处理次正规区；`-0.0` 经
   次正规分支可能归一为 `+0.0`（数值等价，不影响训练）。
 - 未做：§6 建议 2（对 f16 参数跳过 decoupled decay）与建议 4 之外的**文档勘误**
-  （`docs/development/05` §12.5、`AGENTS.md` 已知问题、`docs/development/14`）
+  （`docs/development/05` §12.5、`AGENTS.md` 已知问题、`docs/todo/14`）
   仍待补——根修已使原缺陷消失，但"f16 存储下 `lr·wd < 0.5 ULP` 时 decay 为恒等"
   这一语义值得写进精度文档。

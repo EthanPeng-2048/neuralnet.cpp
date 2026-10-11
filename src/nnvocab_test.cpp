@@ -1,5 +1,5 @@
 // ── nnvocab_test — .nnvocab 词表文件（kvrec v2）序列化测试 ─────────────────
-// 覆盖（docs/development/19-unified-dataset.md §9 阶段一验收）：
+// 覆盖（docs/todo/19-unified-dataset.md §9 阶段一验收）：
 //   1. 旧 JSON 词表 → .nnvocab → 加载 语义一致（vocab/merges/markers/编解码）
 //   2. 训练态 tokenizer save/load 往返逐位一致（BPE + CharBPE）
 //   3. 旧 .json 词表文件明确拒绝（错误信息指路 dataset_convert vocab）

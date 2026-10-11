@@ -1,6 +1,6 @@
 // ── GPT 文本生成训练程序（引擎化架构） ──────────────────────────────────────
 //
-// 输入：.nndataset 数据集（docs/development/19-unified-dataset.md）——
+// 输入：.nndataset 数据集（docs/todo/19-unified-dataset.md）——
 //   tokenize、loss 掩码、词表都在生成期（dataset_gen）定好并嵌入数据集。
 //
 // 数据流（滑动窗口，GPT 预训练标准做法）：
@@ -216,7 +216,7 @@ using nn::Scalar;
 namespace fs = std::filesystem;
 
 // ── 数据来源：.nndataset（token 流/掩码在生成期已定好）─────────────────
-// 19 号设计（docs/development/19-unified-dataset.md）落地后，文本读取/trim、
+// 19 号设计（docs/todo/19-unified-dataset.md）落地后，文本读取/trim、
 // 并行 tokenize、assistant 掩码扫描、.tokcache 全部移出本入口：
 //   生成侧 = dataset_gen（nn::read_text_docs / nn::encode_docs_parallel /
 //             nn::mark_assistant_span），读取侧 = nn::Dataset（只读）。
@@ -265,7 +265,10 @@ void print_usage(const char *prog)
     help.opt("--accum-steps <n>", "梯度累积步数 (默认: 1)\n每 n 步 forward/backward 累加梯度后再更新参数，等效放大 batch_size×n");
     help.opt("--seq-len <n>", "序列长度 (默认: 256)");
     help.opt("--stride <n>", "滑动窗口步长 (默认: 等于 --seq-len，即不重叠)\n设小可产生重叠窗口，增加训练样本数");
-    help.opt("--optimizer <name>", "优化器: sgd/sgd_momentum/adam/adamw/adamwquant/muon (默认: adam)\nadamwquant: 量化状态的 AdamW（状态 4 B/权重 vs 8 B；见 docs/development/21 §4.13）");
+    // RV-04：名单文本由 nn::optimizer_table()（唯一真源）生成，不再手抄
+    help.opt("--optimizer <name>",
+             "优化器: " + nn::optimizer_names("/") +
+                 " (默认: adam)\nadamwquant: 量化状态的 AdamW（状态 4 B/权重 vs 8 B；见 docs/todo/21 §4.13）");
     help.opt("--weight-decay <w>", "AdamW 权重衰减系数 (默认: 0.01)");
     help.opt("--beta1 <b>", "Adam/AdamW 一阶动量衰减 β1 (默认: 0.9，sgd/muon 忽略)");
     help.opt("--beta2 <b>", "Adam/AdamW 二阶动量衰减 β2 (默认: 0.999，sgd/muon 忽略)\nLLM 预训练惯例常取 0.95 (GPT-3/LLaMA 配方)");
@@ -305,19 +308,19 @@ void print_usage(const char *prog)
 
     help.section("混合精度 (docs/development/05-mixed-precision.md)");
     help.opt("--f16", "快捷方式: f16 存储 (param/compute=F16，stable/optimizer=F32)");
-    help.opt("--t1_58", "快捷方式: 精度预设 t1_58 = f16 存储 + 三值权重\n(param=T1_58，compute=F16，stable/optimizer=F32；等价于 --f16 再把 param 换成 t1_58)。\n范围与前置拒绝同 --precision-param t1_58（docs/development/21-quantized-weights.md §4.10）");
+    help.opt("--t1_58", "快捷方式: 精度预设 t1_58 = f16 存储 + 三值权重\n(param=T1_58，compute=F16，stable/optimizer=F32；等价于 --f16 再把 param 换成 t1_58)。\n范围与前置拒绝同 --precision-param t1_58（docs/todo/21-quantized-weights.md §4.10）");
     help.opt("--precision-param <f16|f32|t1_58>",
              "权重/参数精度 (默认: f32)；t1_58 = 三值权重（1.58-bit）——\n"
              "GPT 已支持（注意力 4 投影 + fc1/fc2 + 未 tie 的 LM head 全部换成\n"
              "BitLinear；P1.5 落地）；--model rapt 选它会被前置拒绝\n"
-             "(docs/development/21-quantized-weights.md §4.8.3)");
+             "(docs/todo/21-quantized-weights.md §4.8.3)");
     help.opt("--precision-compute <f16|f32>", "常规算子计算精度 (matmul/逐元素/gather，默认: f32)");
     help.opt("--precision-stable <f16|f32>", "数值敏感算子精度 (softmax/LayerNorm/loss，默认: f32)");
     help.opt("--precision-optimizer <f16|f32>", "优化器状态精度 (Adam m/v，默认: f32)");
 }
 
 // ==================== 命令行参数 ====================
-// 训练断点路径（docs/development/23 §2.1）：`--save` 的路径换扩展名为 .nnckpt
+// 训练断点路径（docs/todo/23 §2.1）：`--save` 的路径换扩展名为 .nnckpt
 // （`gpt_model.nnmodel` → `gpt_model.nnckpt`；其它路径则追加 .nnckpt）。
 [[nodiscard]] static std::string ckpt_path_of(const std::string& save_path)
 {
@@ -460,12 +463,11 @@ TrainConfig parse_args(int argc, char *argv[])
         else if (arg == "--optimizer" && i + 1 < argc)
         {
             cfg.optimizer_name = argv[++i];
-            if (cfg.optimizer_name != "sgd" && cfg.optimizer_name != "sgd_momentum" &&
-                cfg.optimizer_name != "adam" && cfg.optimizer_name != "adamw" &&
-                cfg.optimizer_name != "adamwquant" && cfg.optimizer_name != "muon")
+            // RV-04：校验查表（唯一真源）——不再维护第二份硬编码白名单
+            if (nn::find_optimizer(cfg.optimizer_name) == nullptr)
             {
                 std::cerr << "未知优化器: " << cfg.optimizer_name
-                          << "，可选: sgd, sgd_momentum, adam, adamw, adamwquant, muon\n";
+                          << "，可选: " << nn::optimizer_names(", ") << "\n";
                 std::exit(1);
             }
         }
@@ -731,7 +733,7 @@ void log_gradient_stats(nn::ComputeEngine &engine, const std::vector<nn::TensorR
     for (auto& grad_ref : grads)
     {
         const auto& grad = grad_ref.get();
-        // M1（docs/development/17 §4.1）：张量读取一律经引擎下载到宿主
+        // M1（docs/todo/17 §4.1）：张量读取一律经引擎下载到宿主
         // （GPU 直接下载；CPU 同样走 to_matrix，f16 存储也安全）
         nn::Matrix mat;
         {
@@ -858,7 +860,8 @@ int main(int argc, char *argv[])
         std::cout << "  位置编码: RoPE（RLA 强制，施加在 ReLU 之前）\n";
     }
     std::cout << "  优化器: " << cfg.optimizer_name << "  学习率: " << cfg.lr << "\n";
-    if (cfg.optimizer_name == "adam" || cfg.optimizer_name == "adamw")
+    // β1/β2 的消费方 = 表中 beta = true 的优化器（sgd 家族/muon 忽略）
+    if (const auto *om = nn::find_optimizer(cfg.optimizer_name); om != nullptr && om->beta)
     {
         // 前面的计时打印固定过 precision(1)，这里恢复足够位数（0.95 才不会印成 0.9）
         std::cout << std::defaultfloat << std::setprecision(6)
@@ -945,7 +948,7 @@ int main(int argc, char *argv[])
         {
             std::cerr << "RAPT 尚不支持三值权重（--precision-param t1_58）：RLA 注意力的"
                          " 4 个 Linear 还没接 make_linear_layer，\n"
-                         "见 docs/development/21-quantized-weights.md §4.8.3。\n"
+                         "见 docs/todo/21-quantized-weights.md §4.8.3。\n"
                          "  · 三值 GPT：改用 --model gpt\n"
                          "  · 三值 MLP：mnist_train --arch mlp --precision-param t1_58\n";
             std::exit(1);
@@ -978,7 +981,7 @@ int main(int argc, char *argv[])
             std::cout << "[精度] 三值权重已启用（T1_58 / BitLinear：量化 forward + "
                          "STE backward，latent 恒 f32）\n"
                          "  [范围] GPT（注意力 4 投影 + FFN fc1/fc2 + 未 tie 的 LM head）；"
-                         "RAPT/Transformer 见 docs/development/21-quantized-weights.md §4.8.3\n";
+                         "RAPT/Transformer 见 docs/todo/21-quantized-weights.md §4.8.3\n";
         if (pp.param != nn::Precision::F32 || pp.compute != nn::Precision::F32 ||
             pp.stable != nn::Precision::F32 || pp.optimizer != nn::Precision::F32)
         {
@@ -1048,7 +1051,7 @@ int main(int argc, char *argv[])
 
     if (cfg.load_existing)
     {
-        // 角色校验（v7，docs/development/23 §2.1）：`--resume` 只认训练断点。
+        // 角色校验（v7，docs/todo/23 §2.1）：`--resume` 只认训练断点。
         // 推理模型文件（.nnmodel）没有训练参数（三值层只有打包权重）→ 明确拒绝；
         // v5/v6 老 .bin 无 role 字段 → 按"训练文件"处理（零破坏）。
         {

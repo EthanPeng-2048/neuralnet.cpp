@@ -1,5 +1,7 @@
 # IR 优化（IR Optimization）—— 为融合算子引入中间表示
 
+> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history.md)。
+
 > 目标：在**不推翻现有 AOT 闭合世界**的前提下，把 `ExprSpec` 从"直通轻量 IR"演进为带优化 pass 的规范 IR，分阶段提升开发便利与代码质量。
 > 状态：现行优化链 = **IR-A（canonicalize：DCE/常量折叠/代数化简/稳定重编号）+ IR-B（CSE + 寄存器分配 liveness）+ IR-C（图 IR + `begin_expr/end_expr` 融合分析）+ IR-D（后端 emitter 抽象）**，分别由 `expr_opt.hpp` / `expr_graph.hpp` / `expr_emitter.hpp` 承载；**IR-C 已恢复并通用化（P1 机制 + P2 写穿多输出 + Adam 接线，见 §5.3）**。
 > 关联文档：`02-operator-fusion.md`（算子融合）、`10-development-standards.md`（分层铁律）、`08-pitfalls-and-lessons.md`。

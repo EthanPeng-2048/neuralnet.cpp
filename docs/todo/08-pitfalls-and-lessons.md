@@ -1,5 +1,7 @@
 # 踩坑警示录（Pitfalls & Lessons）
 
+> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history.md)。
+
 > 本文档汇总项目开发至今踩过的所有坑，按严重度分级，提炼跨领域的根因模式，并提供开发活动的防坑清单。**每次踩新坑，先补充到本文档，再修复代码。**
 
 ---
@@ -74,7 +76,7 @@
 
 - **症状**：`add_inplace` 断言失败 `lhs=(seq,d_model) rhs=(seq*d_model,1)`。
 - **根因**：`Tensor::reshape()` 是零拷贝视图：共享 `cpu_data_` 只改 Tensor 元数据 `rows_/cols_`，但 CPU 引擎的 `add_inplace` 用底层 `Matrix` 实际 shape 检查 → 不一致。
-- **当前行为**：CPU 分支 reshape 复制数据到新 shape；GPU 分支保持零拷贝（buffer+count 无 shape）。（M1 起公共入口为 `ComputeEngine::reshape`，实现同一份；原 `Tensor::reshape` 私有化，docs/development/17 §3 D10）
+- **当前行为**：CPU 分支 reshape 复制数据到新 shape；GPU 分支保持零拷贝（buffer+count 无 shape）。（M1 起公共入口为 `ComputeEngine::reshape`，实现同一份；原 `Tensor::reshape` 私有化，docs/todo/17 §3 D10）
 - **教训**：**任何"零拷贝视图 + 后端无关"的 Tensor 操作，CPU 与 GPU 语义天然不同**。排查 `add_inplace` 断言：先怀疑 reshape 后共享 Matrix 参与运算。
 
 ### 3.3 缓存 key 冲突：哈希碰撞与位域溢出

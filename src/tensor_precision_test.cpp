@@ -1,5 +1,5 @@
 // ── tensor_precision_test.cpp — D3：Tensor 精度属性 + 引擎 I/O 往返 ──────────
-// M1 访问收口（docs/development/17 §4.1）后，Tensor 存储访问器与静态直构
+// M1 访问收口（docs/todo/17 §4.1）后，Tensor 存储访问器与静态直构
 // 工厂已私有：本测试全部经 ComputeEngine 创建/读写（upload/download/create_tensor/
 // reshape），验收口径同步修订（原 docs/development/05 §13 中依赖 cpu_matrix/
 // cpu_shared 直读的条目改为"经引擎往返"等价验证）：
@@ -13,6 +13,7 @@
 //   8. f16 存储数据经下载升位后与宿主参考逐元素一致（f16→f32 精确无损）
 #include <cstdio>
 #include <cstring>
+#include <limits>   // RV-02：形状溢出负例（size_t 上限）
 #include <memory>
 
 #include "neuralnet.cpp/precision.hpp"
@@ -134,6 +135,28 @@ void test_create_tensor_factory(nn::ComputeEngine& eng)
     // 零填充语义（原 Tensor::cpu 的 Matrix(rows, cols) 零初始化）
     const nn::Matrix z = download(eng, t32);
     CHECK(z.at(0, 0) == 0.0f && z.at(4, 5) == 0.0f, "create zero-filled");
+
+    // ── RV-02：工厂错误协议 = Result（不再"空张量 + 查 valid()"）─────────────
+    // ① 非存储精度（T1_58 三值声明 / BF16 保留值）→ 返回错误，且**不打印 stderr**
+    //    （旧实现在这里 fprintf + 返回空 Tensor，调用方只能"查 valid()"）
+    for (auto P : {nn::Precision::T1_58, nn::Precision::BF16})
+    {
+        auto r = eng.try_create_tensor(2, 2, P);
+        CHECK(!r, "try_create_tensor 拒绝非存储精度");
+        if (!r)
+            CHECK(!r.error().message.empty(), "拒绝原因非空（结构化错误）");
+    }
+    // ② 形状溢出 → 拒绝（rows*cols 超过 size_t），而不是回绕后按错误元素数分配
+    auto ovf = eng.try_create_tensor(std::numeric_limits<std::size_t>::max() / 2 + 1, 4);
+    CHECK(!ovf, "try_create_tensor 拒绝形状溢出");
+    // ③ 正常请求仍返回可用张量（Result 成功路径）
+    auto ok_r = eng.try_create_tensor(2, 3, nn::Precision::F32);
+    CHECK(static_cast<bool>(ok_r) && ok_r->valid() && ok_r->rows() == 2, "try_create_tensor 成功路径");
+    // ④ InitSpec 重载同协议
+    auto z_r = eng.try_create_tensor(2, 3, nn::Precision::F32, nn::InitSpec::zero());
+    CHECK(static_cast<bool>(z_r) && z_r->valid(), "try_create_tensor(InitSpec) 成功路径");
+    auto z_bad = eng.try_create_tensor(2, 3, nn::Precision::T1_58, nn::InitSpec::zero());
+    CHECK(!z_bad, "try_create_tensor(InitSpec) 同样拒绝非存储精度");
 
     std::printf(" done\n");
 }

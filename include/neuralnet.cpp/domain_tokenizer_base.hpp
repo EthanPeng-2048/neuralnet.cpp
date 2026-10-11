@@ -81,7 +81,7 @@ public:
 
     // ── .nnvocab（kvrec v2）词表序列化 ────────────────────────────────
     // 词表文件 = [label "NNVC"][词表 kvrec v2]（设计见
-    // docs/development/19-unified-dataset.md §4.2）。字段：
+    // docs/todo/19-unified-dataset.md §4.2）。字段：
     //   "type"    := Str   "bpe" | "char_bpe"（工厂判别依据）
     //   "vocab"   := Str   词表 blob（dataset_format.hpp，token 原样字节）
     //   "merges"  := UIntArray 展平三元组 (id_a, id_b, new_id) × n

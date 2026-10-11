@@ -91,8 +91,15 @@ endif()
 #   该开关同时也是**接口**选项（见下方 nn_core），否则库外消费者在 cl.exe 下
 #   会拿到失效的 NN_CHECK。
 if(MSVC)
-    add_compile_options(/W4 /permissive- /Zc:preprocessor
-                        /source-charset:utf-8 /execution-charset:utf-8)
+    # ⚠ 字符集只用 **/utf-8 一种写法**（= /source-charset:utf-8 +
+    #   /execution-charset:utf-8）。此前这里写的是那对分开的开关，而
+    #   `neuralnet_cpp` 的 **INTERFACE** 选项又给链接它的目标追加了 /utf-8 →
+    #   同一条命令行同时出现两者 ⇒ cl 直接报
+    #   `D8016: "/source-charset:utf-8"和"/utf-8"命令行选项不兼容`（实测
+    #   MSVC 19.51 / VS18：凡是链接本库的目标全数编译失败，MSVC 配置整体不可用）。
+    #   实测（D:\probe.bat）：`/utf-8 /utf-8` 与「同一对开关重复两遍」都合法，
+    #   只有"混用两种写法"才报冲突——故统一成 /utf-8，目录级与接口级重复无害。
+    add_compile_options(/W4 /permissive- /Zc:preprocessor /utf-8)
 else()
     add_compile_options(-fno-exceptions -Wall -Wextra -Wpedantic -Werror)
 endif()
@@ -314,9 +321,9 @@ target_compile_options(neuralnet_cpp INTERFACE
     $<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:-Wno-pass-failed>
     # MSVC：库头文件是 UTF-8 + 大量中文注释/字符串，不指定字符集时 cl 按
     # 系统 codepage 读 → C4819/C4828 甚至误解析；/utf-8 = source+execution
-    # 都按 UTF-8（= 库内 /source-charset:utf-8 /execution-charset:utf-8 的
-    # 合并等价物）。⚠ 这同时要求消费方源码也是 UTF-8（现代工程默认如此）。
-    # /utf-8 = /source-charset:utf-8 + /execution-charset:utf-8；
+    # 都按 UTF-8（库内目录级选项**同款写法**，见上方公共标志处的 D8016 实测：
+    # 目录级与接口级必须同用 /utf-8，混用分开的两个开关会让 cl 直接拒绝命令行）。
+    # ⚠ 这同时要求消费方源码也是 UTF-8（现代工程默认如此）。
     # /Zc:preprocessor 必须随接口传出去（见上方公共标志处的实测说明：
     # 传统预处理器会让 NN_CHECK/NN_EXIT 的变参分发错位）。
     $<$<CXX_COMPILER_ID:MSVC>:/utf-8>
@@ -566,6 +573,19 @@ if(NN_ENABLE_TESTS)
     # （终止行为经子进程 --expect-abort / --expect-exit <n> 断言，本进程不终止）
     nn_add_executable(error_macro_test src/error_macro_test.cpp)
     list(APPEND NN_TEST_TARGETS error_macro_test)
+
+    # ── RV-01：前置条件校验（NN_ASSERT_ALWAYS / NN_FATAL）在 NDEBUG 下也终止 ──
+    # 负例经子进程断言：越界 at / 未绑定 Tensor::engine() / 空 logits 采样
+    # 必须非零退出、打印 `file:line`、且 tag 是新宏（不是 NDEBUG 下为空的 NN_ASSERT）
+    nn_add_executable(assert_always_test src/assert_always_test.cpp)
+    list(APPEND NN_TEST_TARGETS assert_always_test)
+
+    # ── RV-04 优化器元数据表（唯一真源 ↔ 工厂）+ RV-03 同目标写序回归 ──────
+    # [1] 表内每个 name 都能被 create_optimizer 构造、名单文本与表一致；
+    # [2] AdamW（wd≠0）单步 vs 手写参考 + 顺序对调的负例；
+    # [3] 同目标两次写必须建顺序边、不合组，反序时 validate_dst_order 必须报错
+    nn_add_executable(optimizer_test src/optimizer_test.cpp)
+    list(APPEND NN_TEST_TARGETS optimizer_test)
 
     # ── KVRecord v2（哨兵自举 / 嵌套 / 未知类型跳过 / 搬迁地址校验）─────────
     nn_add_executable(kvrec_test src/kvrec_test.cpp)
@@ -851,7 +871,7 @@ if(Vulkan_FOUND)
     #
     # ⚠ 收集器**必须保留库内收集逻辑**：实测 84 个结构里只有 13 个来自
     #   编译期锚点，71 个来自 dry-run/模型 pass（见 docs/history.md 与
-    #   docs/development/02）。纯锚点收集器会漏掉库自身的结构。
+    #   docs/todo/02）。纯锚点收集器会漏掉库自身的结构。
     #
     # ── 树外可用性（CMake 函数作用域）────────────────────────────────────
     # CMake 函数体在**调用方作用域**求值：消费方在自己的 CMakeLists 里调用

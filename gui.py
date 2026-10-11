@@ -14,6 +14,7 @@ neuralnet.cpp GUI - 基于CustomTkinter的图形界面
 
 import customtkinter as ctk
 import queue
+import subprocess
 import threading
 import time
 import os
@@ -49,7 +50,45 @@ BUILD_DIR = PROJECT_DIR / "build"
 
 # ---------- 枚举选项 ----------
 ARCH_OPTIONS = ["mlp", "transformer", "cnn"]
-OPTIMIZER_OPTIONS = ["sgd", "sgd_momentum", "adam", "adamw", "adamwquant", "muon"]
+# 优化器名单（RV-04）：**唯一真源**在 C++ —— include/neuralnet.cpp/compute_optimizer.hpp
+# 的 kOptimizerTable；CLI 的 --help 文本与 --optimizer 校验都由该表生成。GUI 不再
+# 单独维护这份名单：向对应 CLI 取一次 --help 并解析（按可执行名缓存），取不到
+# （未构建 / 平台无该进程）时退回 _OPTIMIZER_FALLBACK —— bench/gui_cli_audit.py
+# 的 [4] 节会断言退回名单与 CLI 声明逐项一致，故"改了表忘了改 GUI"不会静默通过。
+_OPTIMIZER_FALLBACK = ["sgd", "sgd_momentum", "adam", "adamw", "adamwquant", "muon"]
+_OPTIMIZER_CACHE: Dict[str, List[str]] = {}
+_OPTIMIZER_RE = re.compile(r"优化器:([a-z0-9_/]+)")
+
+
+def cli_help_text(exe_name: str) -> str:
+    """跑一次 CLI 的 --help 取帮助文本；未构建 / 超时 / 异常 → 空串。"""
+    exe = BUILD_DIR / (exe_name + (".exe" if os.name == "nt" else ""))
+    if not exe.exists():
+        return ""
+    try:
+        proc = subprocess.run([str(exe), "--help"], capture_output=True,
+                              text=True, errors="replace", timeout=15)
+    except Exception:
+        return ""
+    return (proc.stdout or "") + (proc.stderr or "")
+
+
+def parse_optimizer_options(help_text: str) -> List[str]:
+    """从帮助文本抽优化器名单（与 bench/gui_cli_audit.py 的 [4] 节同口径）。
+
+    帮助渲染器按宽度折行：先去掉所有空白再匹配 `优化器:<a/b/c>`，
+    折行插入的换行/缩进因此不影响解析。
+    """
+    m = _OPTIMIZER_RE.search(re.sub(r"\s+", "", help_text))
+    return m.group(1).split("/") if m else []
+
+
+def optimizer_options(exe_name: str = "mnist_train") -> List[str]:
+    """GUI 优化器下拉项：CLI 声明优先，取不到时退回 _OPTIMIZER_FALLBACK。"""
+    if exe_name not in _OPTIMIZER_CACHE:
+        parsed = parse_optimizer_options(cli_help_text(exe_name))
+        _OPTIMIZER_CACHE[exe_name] = parsed if parsed else list(_OPTIMIZER_FALLBACK)
+    return _OPTIMIZER_CACHE[exe_name]
 # 后端仅 CPU / Vulkan，**本项目不支持 CUDA**（AGENTS §2）→ 不提供 CUDA 选项
 ENGINE_OPTIONS = ["CPU", "GPU (Vulkan)"]
 LR_SCHEDULE_OPTIONS = ["fixed", "cosine"]
@@ -65,7 +104,7 @@ GPT_NORM_OPTIONS = ["layernorm", "rmsnorm"]  # GPT 仅支持 LayerNorm/RMSNorm
 # 混合精度选项（compute/stable/optimizer 三槽：只接受数值精度）
 PRECISION_OPTIONS = ["f32", "f16"]
 # param 槽额外接受三值权重（1.58-bit，BitLinear）：
-#   t1_58 = 权重三值化 + STE（docs/development/21-quantized-weights.md）。
+#   t1_58 = 权重三值化 + STE（docs/todo/21-quantized-weights.md）。
 #   已接线：文本侧 GPT（--model gpt：4 投影 + fc1/fc2 + 未 tie 的 LM head）、
 #   图像侧 --arch mlp。未接线（选它=明确报错，非静默失效）：--model rapt 前置拒绝，
 #   --arch transformer/cnn 在层能力校验处报错。
@@ -775,7 +814,7 @@ class MnistTrainTab(TabBase):
                                            filetypes=[("训练断点", "*.nnckpt *.bin")]); r += 1
         self.epochs = _make_entry_row(p, "轮数 (epochs)", r, "10"); r += 1
         self.batch_size = _make_entry_row(p, "批大小", r, "64"); r += 1
-        self.optimizer = _make_option_row(p, "优化器", r, OPTIMIZER_OPTIONS, "adam"); r += 1
+        self.optimizer = _make_option_row(p, "优化器", r, optimizer_options("mnist_train"), "adam"); r += 1
         self.weight_decay = _make_entry_row(p, "权重衰减", r, "0.01"); r += 1
         self.engine = _make_option_row(p, "计算引擎", r, ENGINE_OPTIONS, "CPU"); r += 1
         self.max_samples = _make_entry_row(p, "最大样本数 (0=全部)", r, "0"); r += 1
@@ -1394,7 +1433,7 @@ class GptTrainTab(TabBase):
         self.accum_steps = _make_entry_row(p, "梯度累积步数", r, "1"); r += 1
         self.seq_len = _make_entry_row(p, "序列长度", r, "256"); r += 1
         self.stride = _make_entry_row(p, "滑动窗口步长 (0=seq_len)", r, "0"); r += 1
-        self.optimizer = _make_option_row(p, "优化器", r, OPTIMIZER_OPTIONS, "adam"); r += 1
+        self.optimizer = _make_option_row(p, "优化器", r, optimizer_options("text_train"), "adam"); r += 1
         self.weight_decay = _make_entry_row(p, "权重衰减", r, "0.01"); r += 1
         self.beta1 = _make_entry_row(p, "Adam β1 (空=默认 0.9)", r, ""); r += 1
         self.beta2 = _make_entry_row(p, "Adam β2 (空=默认 0.999)", r, ""); r += 1

@@ -83,7 +83,7 @@ cmake --build build --parallel
 ### 准备数据集（dataset_gen）
 
 训练数据统一为 `.nndataset` 文件：token 流、词表、loss 掩码、test 子集都在**生成期**
-定好并嵌入数据集（设计见 `docs/development/19-unified-dataset.md`）：
+定好并嵌入数据集（设计见 `docs/todo/19-unified-dataset.md`）：
 
 ```bash
 # 先训词表（tokenizer_train），再打包数据集（dataset_gen）

@@ -82,7 +82,7 @@ enum class NormPlace : uint32_t
     }
 }
 
-// ── 权重三值量化（docs/development/21-quantized-weights.md §4.7）──────────
+// ── 权重三值量化（docs/todo/21-quantized-weights.md §4.7）──────────
 // 描述"这个模型的线性层是不是 BitLinear（三值权重 1.58-bit + STE）"。
 //   None  = 普通 Linear（f32/f16 权重）
 //   T1_58 = BitLinear（param=T1_58；latent 仍 f32，量化缓冲是派生物、不落盘）
@@ -141,7 +141,7 @@ struct ModelSpec
     NormType norm_type = NormType::LayerNorm;                 // 归一化层类型
     NormPlace norm_place = NormPlace::None;                   // 归一化挂载位置（CNN/ViT）
 
-    // ── BitNet b1.58 2B4T 的结构开关（docs/development/22 §4）──────────────
+    // ── BitNet b1.58 2B4T 的结构开关（docs/todo/22 §4）──────────────
     // 缺键 → 默认值（= 今天的参数布局，旧文件零破坏；无需升 MODEL_VERSION）。
     // subln：每个 block 的 attention/FFN **子层内部**各加一个 norm
     //        （类型 = norm_type；2B4T = RMSNorm，宽 d_model / d_ff）
