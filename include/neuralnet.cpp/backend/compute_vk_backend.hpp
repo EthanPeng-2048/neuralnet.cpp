@@ -4582,8 +4582,12 @@ public:
             VK_SHADER_STAGE_COMPUTE_BIT, 0,
             static_cast<uint32_t>(pc.size()), pc.data());
 
-        const std::uint32_t gx = (M + 7u) / 8u;
-        const std::uint32_t gy = (N + 7u) / 8u;
+        // 分块版 matmul_q.comp：16×16 线程 / 输出块 64×64（BM=BN=64）
+        // ⚠ 这里的网格必须与 shader 的分块常量一致：写少了会漏算，写多了
+        // 会让多个 workgroup 重复算同一块（正确但成倍变慢 —— 实测不改这里
+        // 宽 batch 训练慢 13×）。
+        const std::uint32_t gx = (M + 63u) / 64u;
+        const std::uint32_t gy = (N + 63u) / 64u;
         vkCmdDispatch(cmd, gx < 1u ? 1u : gx, gy < 1u ? 1u : gy, 1u);
         record_output_barrier(cmd, c.impl());
 
