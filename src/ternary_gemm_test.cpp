@@ -13,6 +13,8 @@
 //   [4] matmul_q_t（transA=1）：同上（反向 dX 的形态）
 //   [5] BitLinear 端到端：打包路径 vs 强制退回的 f16 路径（同 latent，前向
 //       与梯度都在容差内一致；三值逐位一致）
+//   [6] 跨形状对拍：分块内核的**形状契约**（轴向 / 尾块 / 单列 × transA × f32/f16）
+//   [7] BitLinear 跨形状端到端：打包 vs 稠密（多块 + 尾块 + 两种 profile）
 //
 // 退出码：0 = 通过，1 = 失败，77 = 跳过（--gpu 且无设备，或引擎无打包能力）
 // ───────────────────────────────────────────────────────────────────────────
@@ -348,6 +350,229 @@ void test_bitlinear_paths(nn::ComputeEngine& eng, const char* tag)
     }
 }
 
+// ── [6] 跨形状对拍：分块内核的"形状契约"（BM=BN=64 / BK=16）───────────────
+// 分块内核的失效模式**只在特定形状下暴露**，方形/极小形状会掩盖它们：
+//   1. **轴向**：dispatch 的 x/y 必须与 shader 的 block_col/block_row 同约定。
+//      写反 → 只算到 ceil(N/64)*64 行 / ceil(M/64)*64 列；M=N≤64 的方形恰好
+//      正确，于是"小形状全绿、真实形状炸"（分块版 matmul_q 第一轮尝试即如此）。
+//   2. **尾块**：M/N 非 64 倍数、K 非 16 倍数（trit 越界必须判 0 = 三值 0）。
+//   3. **单列**：N=1（自回归解码形态；列块大面积空转，网格与守卫都必须对）。
+// 覆盖 transA=0/1 × f32/f16 存储四种组合。
+void check_gemm_shape(nn::ComputeEngine& eng, std::size_t M, std::size_t K,
+                      std::size_t N, bool transA, bool f16_mode)
+{
+    const std::size_t sr = transA ? K : M;   // A 的存储行数
+    const std::size_t al = transA ? M : K;   // A 的存储行长（= 一行三值个数）
+
+    std::vector<float> a_flat(sr * al, 0.0f);
+    for (std::size_t r = 0; r < sr; ++r)
+        for (std::size_t c = 0; c < al; ++c)
+            a_flat[r * al + c] = 0.17f * static_cast<float>((r * 7 + c * 3) % 13) - 0.9f;
+    nn::Matrix A_lat(sr, al);
+    for (std::size_t r = 0; r < sr; ++r)
+        for (std::size_t c = 0; c < al; ++c) A_lat.set_value(r, c, a_flat[r * al + c]);
+
+    // τ = 逐存储行 absmean（宿主；DSL 那条归约由 t1_58_test 覆盖）
+    std::vector<float> tau(sr, 0.0f);
+    for (std::size_t r = 0; r < sr; ++r)
+    {
+        double s = 0.0;
+        for (std::size_t c = 0; c < al; ++c) s += std::fabs(a_flat[r * al + c]);
+        tau[r] = static_cast<float>(s / static_cast<double>(al));
+    }
+    nn::Matrix tau_m(sr, 1);
+    for (std::size_t r = 0; r < sr; ++r) tau_m.set_value(r, 0, tau[r]);
+
+    std::vector<float> trit(sr * al, 0.0f);
+    for (std::size_t r = 0; r < sr; ++r)
+        for (std::size_t c = 0; c < al; ++c)
+            trit[r * al + c] = nn::trit_pack::value_of(
+                nn::trit_pack::code_of(a_flat[r * al + c], tau[r]));
+
+    // B (K,N)：f16 存储时宿主参考必须用**同一批** f16 舍入值，否则容差里混进
+    // "输入表示差"（既会把真实错误判成噪声、也会把噪声判成错误）。
+    nn::Matrix Bm(K, N);
+    for (std::size_t k = 0; k < K; ++k)
+        for (std::size_t n = 0; n < N; ++n)
+        {
+            float v = 0.21f * static_cast<float>((k + 2 * n) % 9) - 0.8f;
+            if (f16_mode) v = static_cast<float>(nn::f16(v));
+            Bm.set_value(k, n, v);
+        }
+
+    nn::Matrix ref(M, N);
+    ref_gemm(trit, tau, sr, al, Bm, transA, ref);
+    if (f16_mode)
+        for (std::size_t m = 0; m < M; ++m)
+            for (std::size_t n = 0; n < N; ++n)
+                ref.set_value(m, n, static_cast<float>(nn::f16(ref.at(m, n))));
+
+    const nn::Precision P = f16_mode ? nn::Precision::F16 : nn::Precision::F32;
+    const nn::Tensor At = upload(eng, A_lat);
+    const nn::Tensor tau_t = upload(eng, tau_m);
+    const nn::Tensor Bt = upload(eng, Bm, P);
+
+    auto packed_r = eng.trit_pack(At, tau_t);
+    CHECK(packed_r.has_value(), "跨形状：trit_pack 成功");
+    if (!packed_r.has_value()) return;
+
+    auto got_r = transA ? eng.matmul_q_t(*packed_r, tau_t, Bt, M, P)
+                        : eng.matmul_q(*packed_r, tau_t, Bt, P);
+    CHECK(got_r.has_value(), "跨形状：matmul_q(_t) 成功");
+    if (!got_r.has_value()) return;
+    CHECK(got_r->rows() == M && got_r->cols() == N, "跨形状：输出形状 (M,N)");
+
+    const nn::Matrix got = download(eng, *got_r);
+    double emax = 0.0, rmax = 0.0;
+    for (std::size_t m = 0; m < M; ++m)
+        for (std::size_t n = 0; n < N; ++n)
+        {
+            emax = std::max(emax, std::fabs(static_cast<double>(got.at(m, n)) -
+                                            static_cast<double>(ref.at(m, n))));
+            rmax = std::max(rmax, std::fabs(static_cast<double>(ref.at(m, n))));
+        }
+    // 容差按**全局幅度**定标：三值点积可正负相消，逐元素相对判据在近零点爆炸
+    const double scale = std::max(1.0, rmax);
+    const double tol = f16_mode ? 4e-3 : 1e-4;
+    std::printf("    M=%-5zu K=%-5zu N=%-4zu transA=%u %-3s max_err=%.3e\n",
+                M, K, N, transA ? 1u : 0u, f16_mode ? "f16" : "f32", emax);
+    CHECK(emax <= tol * scale, "跨形状：matmul_q(_t) = 宿主参考");
+}
+
+void test_shapes(nn::ComputeEngine& eng, const char* tag, bool gpu)
+{
+    std::printf("[6] 跨形状对拍：分块内核形状契约（%s）\n", tag);
+    if (!eng.supports_ternary_gemm())
+    {
+        std::puts("    （引擎无打包能力 → 跳过）");
+        return;
+    }
+    struct Sh { std::size_t M, K, N; };
+    const Sh base[] = {
+        {64, 16, 64},    // 单块方形（旧极小形状 = 掩盖轴向缺陷的那一类）
+        {128, 32, 64},   // 行 2 块 / 列 1 块
+        {64, 32, 128},   // 行 1 块 / 列 2 块 —— 轴向对拍
+        {192, 48, 320},  // 行 3 块 / 列 5 块
+        {65, 17, 65},    // M/N/K 全尾块
+        {129, 33, 7},    // 行尾块 + 列单块
+        {256, 40, 1},    // N=1 解码形态（K 非 16 倍数）
+        {9, 100, 3},     // 小 M + 长行尾块
+        {130, 16, 130},  // 方形但两向都跨块边界（尾块 + 多块同时）
+    };
+    for (const Sh& s : base)
+        for (int ta = 0; ta < 2; ++ta)
+            for (int h = 0; h < 2; ++h)
+                check_gemm_shape(eng, s.M, s.K, s.N, ta != 0, h != 0);
+
+    // 真实规模一档（仅 GPU；宿主参考是 double 逐元素，CPU 上太慢）：
+    // 2B4T 的行/列量级 —— M≫N 正是"轴向写反"最刺眼的形态。
+    if (gpu)
+    {
+        const Sh big[] = {
+            {2048, 2560, 64},   // lm_head / fc2 量级（M≫N）
+            {2560, 2048, 64},   // 转置形态（A 存 (K,M)，M≫N）
+        };
+        for (const Sh& s : big)
+            for (int ta = 0; ta < 2; ++ta)
+                check_gemm_shape(eng, s.M, s.K, s.N, ta != 0, /*f16_mode=*/false);
+    }
+}
+
+// ── [7] BitLinear 跨形状：打包 vs 稠密（多块 + 尾块 + 两种 profile）───────
+// [5] 用的是 OUT=9/IN=24/B=4（两向都只有 1 块）→ 天然测不出分块/网格缺陷。
+// 这里把形状撑过块边界，并**同时覆盖 f32 与 f16 compute**（后者才是训练路径：
+// 2B4T 形状的 GPT 训练发散正发生在 f16 compute 的打包内核上）。
+void check_bitlinear_shape(nn::ComputeEngine& eng, std::size_t IN, std::size_t OUT,
+                           std::size_t B, const nn::PrecisionProfile& prof)
+{
+    nn::Matrix W(OUT, IN);
+    for (std::size_t o = 0; o < OUT; ++o)
+        for (std::size_t k = 0; k < IN; ++k)
+            W.set_value(o, k, 0.17f * static_cast<float>((o * 5 + k * 3) % 13) - 0.9f);
+    nn::Matrix X(IN, B);
+    for (std::size_t k = 0; k < IN; ++k)
+        for (std::size_t b = 0; b < B; ++b)
+            X.set_value(k, b, 0.23f * static_cast<float>((k + b) % 7) - 0.7f);
+
+    const nn::Precision P =
+        (prof.compute == nn::Precision::F16) ? nn::Precision::F16 : nn::Precision::F32;
+    auto make = [&](bool packed) {
+        auto bl = std::make_unique<nn::BitLinear>(IN, OUT);
+        bl->set_precision_profile(prof);
+        auto r = bl->init(eng);
+        NN_ASSERT(r, "BitLinear init 失败");
+        auto wr = eng.copy_from(bl->parameters()[0].get(), W);
+        NN_ASSERT(wr, "写入 latent 失败");
+        bl->set_ternary_pack_enabled(packed);
+        return bl;
+    };
+    auto pk = make(true);
+    auto dn = make(false);
+    CHECK(pk->uses_packed_weights() && !dn->uses_packed_weights(), "两条路径形态正确");
+
+    nn::Tensor Xt = upload(eng, X, P);
+    auto y_pk = pk->forward(Xt);
+    auto y_dn = dn->forward(Xt);
+    CHECK(y_pk.has_value() && y_dn.has_value(), "两条路径 forward 都成功");
+    if (!y_pk.has_value() || !y_dn.has_value()) return;
+
+    auto cmp = [&](const nn::Tensor& a, const nn::Tensor& b, const char* what) {
+        const nn::Matrix am = download(eng, a), bm = download(eng, b);
+        const auto pa = am.span();
+        const auto pb = bm.span();
+        double emax = 0.0, rmax = 0.0;
+        for (std::size_t i = 0; i < pa.size(); ++i)
+        {
+            emax = std::max(emax, std::fabs(static_cast<double>(pa[i]) - pb[i]));
+            rmax = std::max(rmax, std::fabs(static_cast<double>(pb[i])));
+        }
+        const double scale = std::max(1.0, rmax);
+        const double tol = (P == nn::Precision::F16) ? 4e-3 : 1e-5;
+        std::printf("    [%s] IN=%-4zu OUT=%-4zu B=%-4zu max_err=%.3e\n",
+                    what, IN, OUT, B, emax);
+        CHECK(emax <= tol * scale, "BitLinear 跨形状：打包 = 稠密");
+    };
+    cmp(*y_pk, *y_dn, "fwd");
+
+    nn::Matrix G(OUT, B);
+    for (std::size_t o = 0; o < OUT; ++o)
+        for (std::size_t c = 0; c < B; ++c)
+            G.set_value(o, c, 0.31f * static_cast<float>((o + 2 * c) % 5) - 0.5f);
+    nn::Tensor Gt = upload(eng, G, P);
+    auto gx_pk = pk->backward(Gt);
+    auto gx_dn = dn->backward(Gt);
+    CHECK(gx_pk.has_value() && gx_dn.has_value(), "两条路径 backward 都成功");
+    if (gx_pk.has_value() && gx_dn.has_value()) cmp(*gx_pk, *gx_dn, "dX ");
+    cmp(pk->param_gradients()[0].get(), dn->param_gradients()[0].get(), "dW ");
+}
+
+void test_bitlinear_shapes(nn::ComputeEngine& eng, const char* tag)
+{
+    std::printf("[7] BitLinear 跨形状：打包 vs 稠密（%s）\n", tag);
+    if (!eng.supports_ternary_gemm())
+    {
+        std::puts("    （引擎无打包能力 → 跳过）");
+        return;
+    }
+    nn::PrecisionProfile p32;
+    p32.param = nn::Precision::T1_58;
+    const nn::PrecisionProfile profs[2] = {p32, nn::profile_t1_58()};
+    const char* ptags[2] = {"t1_58/f32", "t1_58/f16"};
+    struct Sh { std::size_t IN, OUT, B; };
+    const Sh shapes[] = {
+        {70, 150, 100},   // 两向都多块 + 尾块
+        {256, 64, 9},     // 窄 N 刚过分派门（9 > 8 → 分块内核）+ K 整块
+        {256, 64, 4},     // 窄 N 落在 GEMV 门内（4 ≤ 8 → 打包 GEMV 内核）
+        {17, 65, 520},    // 宽 N + 行尾块
+    };
+    for (int p = 0; p < 2; ++p)
+    {
+        std::printf("  ── profile %s ──\n", ptags[p]);
+        for (const Sh& s : shapes)
+            check_bitlinear_shape(eng, s.IN, s.OUT, s.B, profs[p]);
+    }
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -365,12 +590,16 @@ int main(int argc, char* argv[])
         NN_EXIT(eng_r, 77, "GPU 不可用，跳过: ");
         test_primitives(**eng_r, "GPU");
         test_bitlinear_paths(**eng_r, "GPU");
+        test_shapes(**eng_r, "GPU", /*gpu=*/true);
+        test_bitlinear_shapes(**eng_r, "GPU");
     }
     else
     {
         nn::CpuEngine eng;
         test_primitives(eng, "CPU");
         test_bitlinear_paths(eng, "CPU");
+        test_shapes(eng, "CPU", /*gpu=*/false);
+        test_bitlinear_shapes(eng, "CPU");
     }
 
     if (g_failures == 0)

@@ -265,6 +265,16 @@
 #define NN_MATMUL_Q_F16_SPV_EMBEDDED
 #endif
 
+#if __has_include("matmul_q_gemv_spv.hpp")
+#include "matmul_q_gemv_spv.hpp"
+#define NN_MATMUL_Q_GEMV_SPV_EMBEDDED
+#endif
+
+#if __has_include("matmul_q_gemv_f16_spv.hpp")
+#include "matmul_q_gemv_f16_spv.hpp"
+#define NN_MATMUL_Q_GEMV_F16_SPV_EMBEDDED
+#endif
+
 // AOT 融合 shader 注册表（构建期 scan_exprs 收集 + gen_fused 合成；表达式
 // 只出现在 Layer，本表是折叠后的派生物）。运行时按 expr_spec_key 匹配 dispatch。
 //
@@ -574,6 +584,9 @@ private:
     VulkanPipeline trit_pack_pipeline_;
     VulkanPipeline matmul_q_pipeline_;
     VulkanPipeline matmul_q_f16_pipeline_;
+    // 窄 N（N ≤ 8）打包 GEMV（解码主路径；同 matmul_gemv 的 subgroup 归约）
+    VulkanPipeline matmul_q_gemv_pipeline_;
+    VulkanPipeline matmul_q_gemv_f16_pipeline_;
     // AOT 融合 shader pipelines（key = expr_spec_key → pipeline；由构建期
     // fused_registry.hpp 注册，运行时按 key 匹配后直接 dispatch）
     std::unordered_map<std::string, VulkanPipeline> fused_pipelines_;
@@ -1107,6 +1120,27 @@ private:
     {
 #ifdef NN_MATMUL_Q_F16_SPV_EMBEDDED
         return nn_matmul_q_f16_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    // 窄 N（GEMV）打包内核（P2/F3）：与 matmul_gemv 同骨（subgroup 归约）
+    [[nodiscard]] static const std::vector<uint32_t>& get_matmul_q_gemv_spirv()
+    {
+#ifdef NN_MATMUL_Q_GEMV_SPV_EMBEDDED
+        return nn_matmul_q_gemv_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_matmul_q_gemv_f16_spirv()
+    {
+#ifdef NN_MATMUL_Q_GEMV_F16_SPV_EMBEDDED
+        return nn_matmul_q_gemv_f16_spirv_bytecode();
 #else
         static const std::vector<uint32_t> empty;
         return empty;
@@ -1803,6 +1837,21 @@ public:
                         device_.device(), mq16, 4, 5u * sizeof(uint32_t));
                     if (r) matmul_q_f16_pipeline_ = std::move(*r);
                 }
+                const auto& mqg16 = get_matmul_q_gemv_f16_spirv();
+                if (!mqg16.empty())
+                {
+                    auto r = VulkanPipeline::create_generic(
+                        device_.device(), mqg16, 4, 5u * sizeof(uint32_t));
+                    if (r) matmul_q_gemv_f16_pipeline_ = std::move(*r);
+                }
+            }
+            // 窄 N 打包 GEMV（f32 版；与 matmul_q 同 4 binding / 5×4B push）
+            const auto& mqg = get_matmul_q_gemv_spirv();
+            if (!mqg.empty())
+            {
+                auto r = VulkanPipeline::create_generic(
+                    device_.device(), mqg, 4, 5u * sizeof(uint32_t));
+                if (r) matmul_q_gemv_pipeline_ = std::move(*r);
             }
         }
 
@@ -1942,6 +1991,8 @@ public:
     [[nodiscard]] bool has_trit_pack_pipeline() const noexcept { return trit_pack_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_matmul_q_pipeline() const noexcept { return matmul_q_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_matmul_q_f16_pipeline() const noexcept { return matmul_q_f16_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_matmul_q_gemv_pipeline() const noexcept { return matmul_q_gemv_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_matmul_q_gemv_f16_pipeline() const noexcept { return matmul_q_gemv_f16_pipeline_.handle() != VK_NULL_HANDLE; }
 
     // ── f16 硬件能力查询（§7.1）────────────────────────────────────
     [[nodiscard]] bool has_shader_float16() const noexcept { return has_shader_float16_; }
@@ -4518,8 +4569,31 @@ public:
     {
         if (!initialized_)
             NN_FAIL("GPU backend not initialized");
+        // ── 选址（与稠密 matmul 同口径，实测驱动；docs 21 §4.12）──────────
+        //   窄 N（≤ GEMV_MAX_N）→ **GEMV 内核**：分块版按 64×64 块算，n=1 时
+        //   63/64 列空转（102/40HX 实测打包侧权重带宽只有 2.9 GB/s vs 稠密
+        //   GEMV 97 GB/s）→ 解码路必须走"每线程沿打包字分片 + 只算真实列"。
+        //   宽 N（训练）→ 分块内核（分块解码一次进 shared，计算受限）。
+        //   GEMV 只在 transA=0（转发形态）实现。**布局契约**：shader 里每个
+        //   subgroup 负责 RPS=4 行（`m0 = (WGID.x*gl_NumSubgroups + SubgroupID)*4`），
+        //   故 grid.x 必须 = ceil(M / (4*(256/subgroup_size)))，且 256 必须被
+        //   subgroup_size 整除（否则 gl_NumSubgroups 与 host 侧算出不一致）。
+        //   设备侧 subgroup≥4 是红线（shader 的 subgroupAdd 归约语义）。
+        constexpr std::uint32_t QGEMV_MAX_N = 8u;
+        constexpr std::uint32_t QGEMV_THREADS = 256u;   // 与 matmul_q_gemv.comp 的 local_size_x 一致
+        constexpr std::uint32_t QGEMV_RPS = 4u;         // 与 matmul_q_gemv.comp 的 RPS 一致
+        const std::uint32_t sgs = device_.subgroup_size();
+        const bool qgemv_layout_ok = sgs >= 4u && sgs <= QGEMV_THREADS
+                                     && (QGEMV_THREADS % sgs) == 0u;
+        const std::uint32_t qgemv_rows =
+            qgemv_layout_ok ? (QGEMV_THREADS / sgs) * QGEMV_RPS : 0u;
+        const bool use_gemv = (transA == 0u) && N <= QGEMV_MAX_N && qgemv_layout_ok
+                              && has_matmul_q_gemv_pipeline()
+                              && (!f16 || has_matmul_q_gemv_f16_pipeline());
         const VulkanPipeline* pipe = nullptr;
-        if (f16)
+        if (use_gemv)
+            pipe = f16 ? &matmul_q_gemv_f16_pipeline_ : &matmul_q_gemv_pipeline_;
+        else if (f16)
         {
             if (!has_matmul_q_f16_pipeline())
                 NN_FAIL("matmul_q_gpu: f16 pipeline not available（设备缺 16 位存储？）");
@@ -4582,9 +4656,29 @@ public:
             VK_SHADER_STAGE_COMPUTE_BIT, 0,
             static_cast<uint32_t>(pc.size()), pc.data());
 
-        const std::uint32_t gx = (M + 7u) / 8u;
-        const std::uint32_t gy = (N + 7u) / 8u;
-        vkCmdDispatch(cmd, gx < 1u ? 1u : gx, gy < 1u ? 1u : gy, 1u);
+        // 分块版 matmul_q.comp：16×16 线程 / 输出块 64×64（BM=BN=64）。
+        // ⚠ 两条不变量（分块内核的"形状契约"，漏掉任一条都是**静默错值**）：
+        //   1. 网格必须与 shader 的分块常量一致：写少了漏算、写多了重复算
+        //      （正确但成倍变慢 —— 实测错误网格下宽 batch 训练慢 13×）。
+        //   2. **轴向必须对齐**：shader 里 x → block_col（N 方向）、y →
+        //      block_row（M 方向），与 matmul_tiled / batched_matmul 同一约定
+        //      （两者 dispatch 均为 `(ceil(N/64), ceil(M/64), 1)`）。写成
+        //      `(ceil(M/64), ceil(N/64))` 会让 M≠N 的形状只算到
+        //      `ceil(N/64)*64` 行 / `ceil(M/64)*64` 列 —— 方形小形状
+        //      （M=N≤64，单 workgroup）恰好正确，故此缺陷只在真实形状上暴露
+        //      （2B4T 的 lm_head M=128256 只算到前 256 行）。
+        if (use_gemv)
+        {
+            // 单维 grid.x = ceil(M/qgemv_rows)；qgemv_rows 见上面的布局契约注释
+            const std::uint32_t gw = (M + qgemv_rows - 1u) / qgemv_rows;
+            vkCmdDispatch(cmd, gw < 1u ? 1u : gw, 1u, 1u);
+        }
+        else
+        {
+            const std::uint32_t gx = (N + 63u) / 64u;   // x ↔ 输出列（N）
+            const std::uint32_t gy = (M + 63u) / 64u;   // y ↔ 输出行（M）
+            vkCmdDispatch(cmd, gx < 1u ? 1u : gx, gy < 1u ? 1u : gy, 1u);
+        }
         record_output_barrier(cmd, c.impl());
 
         if (owns_cmd)
