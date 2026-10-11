@@ -18,7 +18,9 @@
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <cmath>
+#include <cstdint>   // RV-04：OptimizerMeta::state_bufs
 #include <optional>
+#include <span>      // RV-04：optimizer_table()
 #include <string>
 #include <string_view>
 #include <utility>
@@ -339,7 +341,7 @@ protected:
         //     但当 param 槽不是"存储精度"时必须以张量自身为准 —— 例如 BitLinear 的
         //     T1_58（latent 恒 f32）：照搬 p_.param 会拿非存储精度去建张量
         //     （CPU 走 f32 兜底、GPU 在 check_precision_supported 处硬报错 =
-        //      两端行为不一致）。见 docs/development/21-quantized-weights.md §4.3.2。
+        //      两端行为不一致）。见 docs/todo/21-quantized-weights.md §4.3.2。
         const Precision upd_prec = (precision_bytes(p_.param) != 0)
                                        ? p_.param
                                        : params_[i].get().precision();
@@ -903,8 +905,67 @@ public:
     }
 };
 
+// ── 优化器元数据表（RV-04：新增一个优化器不再要改 5~6 处）─────────────────
+// **名单的唯一真源**。此前同一份名单散落六处：本文件工厂、text_train 的硬编码
+// 白名单、mnist_train 帮助文本、gui.py 的 OPTIMIZER_OPTIONS、scan_exprs 的
+// dry-run 列表、mem_probe 的状态缓冲分支（AGENTS §3 把"别忘了改这几处"写成提醒
+// ——提醒本身就说明设计有问题）。现在全部查表：
+//   · CLI 校验 / 帮助文本  → find_optimizer / optimizer_names
+//   · scan_exprs dry-run   → optimizer_table() 逐项建优化器
+//   · mem_probe 状态预算   → state_bufs / half_state
+//   · GUI 选项             → CLI --help（由本表生成）+ bench/gui_cli_audit.py 断言
+// 新增优化器只需：① 在本表加一行；② 在下方 create_optimizer 加一个分支
+//（构造器必须手写，无法表驱动）。
+// 字段：
+//   name       CLI/GUI 的稳定标识（与 create_optimizer 的 name 严格同串）
+//   display    人读名（帮助/审计/未来 GUI 显示用）
+//   beta       是否消费 beta1/beta2（sgd 家族与 muon 忽略这两个参数）
+//   state_bufs 每权重**全尺寸**状态缓冲数（显存账：0 = 无状态）
+//   half_state 状态是否减半存储（AdamWQuant：f16 payload + 逐行有界尺度）
+struct OptimizerMeta
+{
+    std::string_view name;
+    std::string_view display;
+    bool             beta;
+    std::uint8_t     state_bufs;
+    bool             half_state;
+};
+
+inline constexpr OptimizerMeta kOptimizerTable[] = {
+    {"sgd",          "SGD",                false, 0, false},
+    {"sgd_momentum", "SGD + Momentum",     false, 1, false},
+    {"adam",         "Adam",               true,  2, false},
+    {"adamw",        "AdamW",              true,  2, false},
+    {"adamwquant",   "AdamW（量化状态）",   true,  2, true },
+    {"muon",         "Muon",               false, 1, false},
+};
+
+[[nodiscard]] constexpr std::span<const OptimizerMeta> optimizer_table() noexcept
+{ return kOptimizerTable; }
+
+// 按 CLI 名查元数据；未知名 → nullptr（调用方负责报错，不静默降级）
+[[nodiscard]] inline const OptimizerMeta *find_optimizer(std::string_view name) noexcept
+{
+    for (const auto &m : kOptimizerTable)
+        if (m.name == name) return &m;
+    return nullptr;
+}
+
+// 名单文本（帮助文本 / 报错提示 / 审计脚本解析共用同一口径）：
+// sep = '/' → "sgd/sgd_momentum/..."；sep = ", " → "sgd, sgd_momentum, ..."
+[[nodiscard]] inline std::string optimizer_names(std::string_view sep)
+{
+    std::string s;
+    for (const auto &m : kOptimizerTable)
+    {
+        if (!s.empty()) s += sep;
+        s += m.name;
+    }
+    return s;
+}
+
 // ── 优化器工厂函数 ────────────────────────────────────────────────────────
-// 根据名称创建对应优化器，支持: "sgd", "sgd_momentum", "adam", "adamw", "muon"。
+// 根据名称创建对应优化器（名单与校验口径见上方 kOptimizerTable）。
 // 未知名称返回 nullptr，由调用方处理。
 // precision：模型级精度配置（§9.1）——状态张量按 p.optimizer 创建，参数更新
 // 走 in-place（存储精度不可变）。默认全 F32。

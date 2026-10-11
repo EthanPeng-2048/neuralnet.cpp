@@ -1,5 +1,5 @@
 // ── adam_quant_test — AdamWQuant（量化状态 AdamW，F5 第一步）───────────────
-// 设计依据：docs/development/21-quantized-weights.md §4.13
+// 设计依据：docs/todo/21-quantized-weights.md §4.13
 //
 // 覆盖：
 //   [1] 状态账：状态字节 = 4 B/权重（+ 每行两个 f32 尺度），对比 f32 Adam 的 8 B/权重

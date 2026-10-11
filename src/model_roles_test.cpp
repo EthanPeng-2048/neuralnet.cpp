@@ -1,5 +1,5 @@
 // ── model_roles_test — 模型文件角色（v7：.nnmodel / .nnckpt）+ 参数形态协议 ──
-// 设计依据：docs/development/23-library-design-cleanup-and-model-file-roles.md §2.1/§2.2
+// 设计依据：docs/todo/23-library-design-cleanup-and-model-file-roles.md §2.1/§2.2
 //
 // 覆盖（取代原 ternary_deploy_test 的部署格式面 —— NNQT 独立格式已删除）：
 //   [1] Model 角色（推理）：三值层的权重以**打包形态**落盘（盘上 base-3）；

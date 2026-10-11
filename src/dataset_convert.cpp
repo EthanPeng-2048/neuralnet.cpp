@@ -1,6 +1,6 @@
 // ── 旧格式转换器（dataset_convert）────────────────────────────────────────
 //
-// 把旧资产迁移到统一数据集格式（docs/development/19-unified-dataset.md）：
+// 把旧资产迁移到统一数据集格式（docs/todo/19-unified-dataset.md）：
 //   dataset_convert vocab <in.json> -o <out.nnvocab>
 //       旧 JSON 词表 → .nnvocab（kvrec v2）。旧 JSON 词表不再被
 //       tokenizer/text_* 直读，迁移后所有入口只吃 .nnvocab。
@@ -132,7 +132,7 @@ int convert_vocab(const Config &cfg)
 int convert_csv(const Config &)
 {
     std::cerr << "dataset_convert csv 尚未实现（tabular 形态为阶段四预留，"
-                 "见 docs/development/19-unified-dataset.md §4.4）\n";
+                 "见 docs/todo/19-unified-dataset.md §4.4）\n";
     return 1;
 }
 

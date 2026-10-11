@@ -276,7 +276,9 @@ void print_usage(const char* prog)
     help.opt("--steps <n>", "训练步数采样 (默认: 2)");
     help.opt("--no-kv", "跳过 KV cache 推理阶段");
     help.opt("--kv-steps <n>", "KV 阶段 forward_step 次数 (默认: 32)");
-    help.opt("--optimizer <name>", "优化器: sgd/sgd_momentum/adam/adamw/muon (默认: adam)");
+    // RV-04：名单文本由 nn::optimizer_table()（唯一真源）生成（此前此处漏了 adamwquant）
+    help.opt("--optimizer <name>",
+             "优化器: " + nn::optimizer_names("/") + " (默认: adam)");
     help.opt("--help, -h", "显示此帮助信息");
 
     help.section("模型尺寸");
@@ -435,11 +437,13 @@ int main(int argc, char* argv[])
             if (d > 0) opt_measured_bytes = static_cast<std::size_t>(d);
         }
     }
-    // 逻辑估算：adam/adamw = m+v（f32 恒定，create_zero_buffers_ 默认 F32）
-    std::size_t opt_buffers = 0;
-    if (opt_name == "adam" || opt_name == "adamw") opt_buffers = 2;
-    else if (opt_name == "sgd_momentum" || opt_name == "muon") opt_buffers = 1;
-    const std::size_t opt_logical_bytes = param_elems * 4 * opt_buffers;
+    // 逻辑估算（RV-04：查 nn::optimizer_table()，唯一真源）：
+    //   state_bufs = 每权重全尺寸状态缓冲数；half_state（AdamWQuant）= 每缓冲 2 B
+    const auto *opt_meta = nn::find_optimizer(opt_name);
+    const std::size_t opt_buffers = (opt_meta != nullptr) ? opt_meta->state_bufs : 0;
+    const std::size_t opt_state_bytes =
+        (opt_meta != nullptr && opt_meta->half_state) ? 2u : 4u;
+    const std::size_t opt_logical_bytes = param_elems * opt_state_bytes * opt_buffers;
 
     // ── 训练阶段采样（镜像 text_train 顺序）────────────────────────────
     nn::Precision elem_prof = f16 ? nn::Precision::F16 : nn::Precision::F32;

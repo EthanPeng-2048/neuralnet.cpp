@@ -280,7 +280,7 @@ private:
     // `effective_weight_quant`）
     WeightQuant weight_quant_ = WeightQuant::None;
 
-    // ── tied embedding（docs/development/22 §3.3）────────────────────────
+    // ── tied embedding（docs/todo/22 §3.3）────────────────────────
     // true：head 复用 token_emb_（logits = W_embᵀ·x），lm_head_ 不建参数、
     //       不进 parameters()；head 侧 dW 累加进 grad_token_emb_（与嵌入侧
     //       的 scatter_add_rows 同一张缓冲，优化器每步只清一次）。
@@ -623,8 +623,9 @@ public:
                 if (checkpoint_every_ > 0 && (idx % checkpoint_every_ == 0))
                 {
                     const std::size_t seg = idx / checkpoint_every_;
-                    NN_ASSERT(seg < checkpoint_inputs_.size(),
-                              "GPTModel backward: checkpoint input missing");
+                    // RV-01：越界索引 checkpoint_inputs_[seg] → 无条件终止
+                    NN_ASSERT_ALWAYS(seg < checkpoint_inputs_.size(),
+                                     "GPTModel backward: checkpoint input missing");
                     NN_TRY(cr, blocks_[idx].forward_recompute(checkpoint_inputs_[seg]));
                 }
                 NN_TRY(br, blocks_[idx].backward(grad_x));

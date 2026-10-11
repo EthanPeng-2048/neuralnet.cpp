@@ -1,9 +1,11 @@
 # 开发路线图与未完成项裁定
 
-> **本文是"下一步该做什么"的唯一入口**：把 `docs/development/13-refactor-backlog.md` 的未完成条目
-> 与未来 6–12 个月的方向合并为一份可执行的裁定台账。
-> 本轮 13 号文档改为重定向 stub；已完成项、被否决方案与历史取舍统一归档在 `docs/history.md`。
-> 底层契约的已落地部分（统一总纲 M1–M6）见 `docs/development/17-unified-tensor-engine.md`。
+> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history.md)。
+
+> **本文是"下一步该做什么"的唯一入口**：把 13 号清单（原 `docs/development/13-refactor-backlog.md`，
+> 现归档于 `docs/history.md`）的未完成条目与未来 6–12 个月的方向合并为一份可执行的裁定台账。
+> 13 号文档已于 2026-10-11 删除（内容全在本文与 `docs/history.md`）；已完成项、被否决方案与历史取舍统一归档在 `docs/history.md`。
+> 底层契约的已落地部分（统一总纲 M1–M6）见 `docs/todo/17-unified-tensor-engine.md`。
 > 写作纪律：只写事实与决定；行号取自实测，行号漂移后以符号名为准，未能确证的位置只给文件名、不给行号。
 
 ## 0. 一句话
@@ -16,10 +18,11 @@
 | 文档 | 角色 | 何时读 |
 |---|---|---|
 | **本文（18）** | 未来 6–12 个月方向 + 未完成项裁定台账 | 想知道"下一个该做什么"时 |
-| `docs/development/13-refactor-backlog.md` | **重定向 stub**：条目原文已合并进本文，历史执行记录在 `docs/history.md` | 只在需要追溯条目来源时 |
+| `docs/todo/00-code-review-remediation.md` | **2026-10-11 代码审查整改立项台账**（RV-01…RV-14）：外部审查发现逐条复核 + 立项（证据/方案/验收/批次） | 接手审查整改时（本文只登记"是否要做"，执行细节在那边） |
+| `docs/history.md`「13 号清单合并归档」节 | 13 号清单（原 13 号文档，**已删除**）的条目原文与历史执行记录 | 只在需要追溯条目来源时 |
 | `docs/history.md` | 全仓唯一历史归档：演进记录 / 已修复勘误 / 被否决方案 / 性能 A/B | 查"为什么当初这么改、旧数字是多少" |
-| `docs/development/17-unified-tensor-engine.md` | **已落地**的底层总纲（M1–M6 全部实施；仅 M7 未立项） | 改 Tensor/Engine/存储前 |
-| `docs/development/15-computeengine-refresh.md`、`16-computeengine-p0-inventory.md` | 17 的前置设计与 P0 盘点，历史引用 | 只做证据追溯 |
+| `docs/todo/17-unified-tensor-engine.md` | **已落地**的底层总纲（M1–M6 全部实施；仅 M7 未立项） | 改 Tensor/Engine/存储前 |
+| `docs/history.md`「docs/development 15 · 16」归档节 | 17 的前置设计（15）与 P0 盘点（16），历史引用 | 只做证据追溯 |
 
 ### 1.1 立项三问（三问都答不上来就不立项）
 
@@ -55,13 +58,13 @@
 
 | 底座 | 状态 | 依据 |
 |---|---|---|
-| 统一 Tensor / ComputeEngine 契约（M1–M6） | 全部实施 | `docs/development/17-unified-tensor-engine.md` §5 |
+| 统一 Tensor / ComputeEngine 契约（M1–M6） | 全部实施 | `docs/todo/17-unified-tensor-engine.md` §5 |
 | 访问不变量（Tensor 存储私有、一切经引擎） | 铁律 #11，编译期强制 | `AGENTS.md` §5 |
 | L2+ 计算路径禁用 `Matrix` | 铁律 #12，审计口径 `L2-VIOLATIONS: 0` | `AGENTS.md` §5；`bench/doc_inventory.ps1` 第 [4] 节 |
-| AOT 闭合世界 + 单 fold 注意力 kernel | 现行；掩码 × 位置偏置两正交维度 | `docs/development/02-operator-fusion.md` |
+| AOT 闭合世界 + 单 fold 注意力 kernel | 现行；掩码 × 位置偏置两正交维度 | `docs/todo/02-operator-fusion.md` |
 | 位置编码多态统一（按注入点分所有权） | 现行；新增 `compute_position_encoding.hpp` | `docs/history.md`「Layer 层简化轮」条 |
 | BPE 保序并行 encode（任意并行度逐字节一致） | 现行 | `AGENTS.md` §12 |
-| 声明式初始化 `InitSpec`（初值跨进程确定） | 现行 | `docs/development/17-unified-tensor-engine.md` §4.4 |
+| 声明式初始化 `InitSpec`（初值跨进程确定） | 现行 | `docs/todo/17-unified-tensor-engine.md` §4.4 |
 | CPU/Vulkan 双后端 + 多设备选择 | 现行 | `AGENTS.md` §2 |
 
 **含义**：本文的路线图不需要再排"底层重构"——底层已完成；缺口集中在工程门禁与上层生态。
@@ -74,7 +77,7 @@
 
 | # | 现象 | 坐标 | 影响面 |
 |---|---|---|---|
-| C1 | GPU `stable=f16` 训练 loss 回读冻结（权重照常更新） | `docs/development/14-f16-stable-gpu-loss-frozen.md` | GPU f16 训练的 loss 曲线不可观测；无对应 ctest 用例 |
+| C1 | GPU `stable=f16` 训练 loss 回读冻结（权重照常更新） | `docs/todo/14-f16-stable-gpu-loss-frozen.md` | GPU f16 训练的 loss 曲线不可观测；无对应 ctest 用例 |
 | C2 | `optimizer=f16` 无 loss scaling 即更新爆炸、`stable=f16` 约 200 步 NaN | `docs/development/05-mixed-precision.md` §12.5；`src/text_train.cpp` 解析处只赋值不校验 | 用户可组合出必崩配置，且无任何启动期提示 |
 | C3 | `NormType::BatchNorm` **静默回落**到 LayerNorm | `compute_layer_mlp.hpp:782`（`make_norm_layer`）；`README.md:248` 声称支持；`gui.py:60` 把 `batchnorm` 列为可选项；`model_spec.hpp:43` 保留枚举 | 模型规格写 batchnorm、实际跑 layernorm，无告警、无日志。**✅ 已解决**：真正实现 `BatchNorm` 层（P0-3），`make_norm_layer` 真分支，见 `docs/history.md` |
 | C4 | checkpoint（`.bin`）不存 Adam m/v | `model_serialization.hpp`（`MODEL_VERSION = 5`，见该文件版本常量注释）；`compute_optimizer.hpp` 无 `save_state/load_state` | TDR 重启 / `--resume` 后动量归零，续训轨迹不连续 |
@@ -93,7 +96,7 @@
 | E4 | 文档内 ctest 计数曾自相矛盾（19 vs 20） | `AGENTS.md` §12 已统一为实测 21（19 目标 + `cnn_test_gpu` + `fusion_custom_layer_example`） | 已修；口径差异来源见 §2 口径说明 |
 | E5 | `src/text_train.cpp` 1746 行、34 处 `std::exit` | 该文件（CLI 解析 + 训练循环 + TDR 恢复 + checkpoint 混杂） | 任一改动牵动全文件；恢复逻辑是 C4 的前置阻塞 |
 | E6 | 单文件多职责：`compute_vk_backend.hpp` 5174 行 | 该文件（fence / staging / dispatch / 算子混装） | header-only 项目里增量编译是主要开发成本 |
-| E7 | `README.md` 与实际不符：死链 `docs/development/07-zipt-algorithm.md`、mojibake、声称链式 `add<LayerType>()`、文档索引缺 13–17 | `README.md:21`、`:35`、`:63`、`:269`、索引表（`:23` 起） | 新用户第一入口即误导；`add<T>(args...)` 是返回 `Result<void>` 的模板方法，**无链式 API** |
+| E7 | `README.md` 与实际不符：死链 `docs/history.md`、mojibake、声称链式 `add<LayerType>()`、文档索引缺 13–17 | `README.md:21`、`:35`、`:63`、`:269`、索引表（`:23` 起） | 新用户第一入口即误导；`add<T>(args...)` 是返回 `Result<void>` 的模板方法，**无链式 API** |
 | E8 | `bench/doc_align_audit.ps1` 的 [A] 只检查**反引号里的文件名**，markdown 链接目标不查 | 该脚本 [A] 段正则 | README 的 `07-zipt-algorithm.md` 死链因此漏检（需扩审计或在文档侧修） |
 | E9 | **归约融合 shader 不支持"归约后逐元素后处理"形态**（`reduce(...) * k + c` 类表达式）：GPU 硬报错拒绝（契约，防静默错值），CPU 已支持 | `GpuEngine::eval_expr_reduce` 的拒绝分支（错误文案即本缺口）；回归锁 `src/ce_fusion_test.cpp`「归约+后处理 (reduce*k+c)」用例（断言 GPU 必须硬报错）；机制背景 `docs/history.md` 同名条目 | 该形态只能拆两步 dispatch（先 `compute_reduce` 再 `dsl::compute` 后处理），多一次 kernel 与中间张量。**支持路径（通用、非单算子）**：归约生成器在归约累加收尾（epilogue）后接逐元素链发射（操作对象是归约结果的广播值），随后放开 `eval_expr_reduce` 的末指令校验；CPU 的指令下标反向切片前置校验已是同语义，可直接对拍 |
 
@@ -102,7 +105,7 @@
 | # | 现象 | 坐标 | 影响面 |
 |---|---|---|---|
 | X1 | 推理无 top-k / top-p 采样截断 | `src/text_infer.cpp` 只有 `--temperature` 与 `--interactive`；`compute_layer_gpt.hpp:622` 的采样入口只吃 temperature | 长文本生成质量不可控；无法做"多轮对话闭环"演示 |
-| X2 | ~~无 Dataset / DataLoader 抽象，文本训练数据加载不成体系~~ **前半已解决（19 号设计阶段一~三）**：`nn::Dataset` + `.nndataset`/`.nnvocab` 统一格式 + `dataset_gen`/`dataset_convert`，text_train 只吃数据集；**剩 DataLoader/流式** | ~~`src/text_train.cpp` 内联数据路径；`train_pkg.py` / `cli_controllers.py` 各自处理~~（已收编，见 `docs/development/19-unified-dataset.md`） | 流式大语料仍不可行（`load_text` 一次性物化，P2-4 后半解决） |
+| X2 | ~~无 Dataset / DataLoader 抽象，文本训练数据加载不成体系~~ **前半已解决（19 号设计阶段一~三）**：`nn::Dataset` + `.nndataset`/`.nnvocab` 统一格式 + `dataset_gen`/`dataset_convert`，text_train 只吃数据集；**剩 DataLoader/流式** | ~~`src/text_train.cpp` 内联数据路径；`train_pkg.py` / `cli_controllers.py` 各自处理~~（已收编，见 `docs/todo/19-unified-dataset.md`） | 流式大语料仍不可行（`load_text` 一次性物化，P2-4 后半解决） |
 | X3 | 无 Python / C 绑定 | 仓库仅有 `gui.py` 这一 Python 入口（subprocess 调 CLI） | 生态集成只能走命令行 + 文件 |
 | X4 | `gui.py` 六个 Tab、7 处手写 `collect_args` | `gui.py`（`def collect_args` 实测 7 处） | 加 CLI 选项要手改多处，漏参风险（13 §4 的"五个 Tab / 1471-1500"坐标已过期） |
 | X5 | GUI 画布拖动全量降采样重绘 | `gui.py:1135`（`_on_draw_move`）；已有节流先例 `gui.py:216`（`_RENDER_MS = 250`） | 快速拖动卡顿 |
@@ -114,8 +117,8 @@
 |---|---|---|---|
 | M1 | 优化器共 **5 个**：SGD / SGDWithMomentum / Adam / **AdamW** / Muon；其中**直接派生自 `Optimizer` 的是 4 个**（SGD/SGDWithMomentum/Adam/Muon），`AdamW` 派生自 `Adam` | `compute_optimizer.hpp:200`（SGD）、`:236`（SGDWithMomentum）、`:294`（Adam）、`:434`（`AdamW : public Adam`）、`:628`（Muon）；工厂注册名 `:723`、创建分支 `:745` | 缺无 m/v 状态的低显存优化器，模型规模受优化器状态限制（P2-2） |
 | M2 | LRLA 仅存在于文档对比表，未实现 | `docs/development/06-rapt-algorithm.md` §LRLA | 线性注意力家族停在本项目基线 RLA-2/RAPT |
-| M3 | ~~IR-C 跨表达式图融合不采用~~ **已恢复并接入训练路径（P1+P2）**：`begin_expr/end_expr` + 图融合（P1 链 / P2 写穿多输出）+ Adam/AdamW 接线；S6 自动窗口仍未接线 | `docs/development/03-ir-optimization.md`；`docs/history.md`「IR-C 定位修正与恢复立项」「IR-C P2 收官」 | S6 之外的"能融的必须写进单个 `dsl::compute`"已放宽（跨表达式经录制段融合）；**P4 CE online-softmax fold 已落地（通用 FoldSpec 机制，5→3 kernel/step，见 `docs/history.md`「CE online-softmax 单趟 fold（P4）」）**；**P3 跨链批量派发已落地（`#b` 批量变体 + BDA 实例表 + 图内同签名分组 CAP 32）**：设备表读数口径 = 批量/非批量分列（用户裁定），`fused@optimizer` 归零、派发计入 `fused_b@optimizer` 行，**合计 1330 → 57 calls/20 步（2.85/step ≤ 6/step）**；批量 vs 逐个逐字节一致（含同组混形状）、字节锚逐位不变，见 `docs/history.md`「P3 跨链批量派发」 |
-| M4 | M7 存储多态未立项 | `docs/development/17-unified-tensor-engine.md` §5 M7 行 | 新增第三后端仍需改 `compute_tensor.hpp` |
+| M3 | ~~IR-C 跨表达式图融合不采用~~ **已恢复并接入训练路径（P1+P2）**：`begin_expr/end_expr` + 图融合（P1 链 / P2 写穿多输出）+ Adam/AdamW 接线；S6 自动窗口仍未接线 | `docs/todo/03-ir-optimization.md`；`docs/history.md`「IR-C 定位修正与恢复立项」「IR-C P2 收官」 | S6 之外的"能融的必须写进单个 `dsl::compute`"已放宽（跨表达式经录制段融合）；**P4 CE online-softmax fold 已落地（通用 FoldSpec 机制，5→3 kernel/step，见 `docs/history.md`「CE online-softmax 单趟 fold（P4）」）**；**P3 跨链批量派发已落地（`#b` 批量变体 + BDA 实例表 + 图内同签名分组 CAP 32）**：设备表读数口径 = 批量/非批量分列（用户裁定），`fused@optimizer` 归零、派发计入 `fused_b@optimizer` 行，**合计 1330 → 57 calls/20 步（2.85/step ≤ 6/step）**；批量 vs 逐个逐字节一致（含同组混形状）、字节锚逐位不变，见 `docs/history.md`「P3 跨链批量派发」 |
+| M4 | M7 存储多态未立项 | `docs/todo/17-unified-tensor-engine.md` §5 M7 行 | 新增第三后端仍需改 `compute_tensor.hpp` |
 | M5 | ZiPT / AttnZip 已整体移除，代码保留在 `legacy/zipt` 分支 | `docs/history.md`「ZiPT 移除」条 | 记忆压缩方向暂缺实现 |
 
 ## 4. 路线图分期
@@ -173,7 +176,7 @@ P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
 | **P2-1 `.bin` 整文件校验和 + 尾部完整性标记** | 版本段之后加校验和；按注释约定升 `MODEL_VERSION` | 截断文件明确报错；合法文件 round-trip SHA256 一致 | 小–中 | P1-2（同一版本段改动，合并做省一次升版） |
 | **P2-2 Adafactor 类无 m/v 优化器** | 新增不物化二阶矩的优化器，训练更大模型 | 同任务对比 Adam 的显存下降与收敛曲线；`create_optimizer` 可创建 | 中 | 无 |
 | **P2-3 RAPT / CNN f16 接线** | RAPT 的 `dsl::compute*` 调用接精度实参；`Conv2D` 权重/梯度去 `Precision::F32` 硬编码 | f16 下 CNN/RAPT 训练健康收敛；CPU/GPU 字节锚按计划内变化流程重立 | 中 | 无（C2 的 fail-fast 先落地，防用户踩坑） |
-| **P2-4 Dataset / DataLoader 抽象 + 流式文本**（**前半 Dataset 已落地** = 19 号设计阶段一~三；本条只剩**流式后半**：DataLoader/分块迭代 `for_each_chunk`，不再把语料整段读进内存） | 流式加载（Dataset 格式与统一只读类见 `docs/development/19-unified-dataset.md`） | 大文件训练内存曲线平稳；`dataset_test` 逐位一致口径回归 | 中 | 无 |
+| **P2-4 Dataset / DataLoader 抽象 + 流式文本**（**前半 Dataset 已落地** = 19 号设计阶段一~三；本条只剩**流式后半**：DataLoader/分块迭代 `for_each_chunk`，不再把语料整段读进内存） | 流式加载（Dataset 格式与统一只读类见 `docs/todo/19-unified-dataset.md`） | 大文件训练内存曲线平稳；`dataset_test` 逐位一致口径回归 | 中 | 无 |
 | **P2-5 Python / C 绑定** | 提供稳定 C ABI 或 pybind 绑定，供生态集成 | 绑定层跑通训练/推理最小示例；ABI 报错信息可读 | 中–大 | **条件触发**（§6） |
 | **P2-6 GUI 声明式字段表 + 绘制节流** | dataclass 元数据自动生成 UI 行与 `collect_args`；画布 motion 按帧节流、dirty 标志跳过空帧 | 现有 Tab 参数零遗漏（`bench/gui_cli_audit.py` 退出码 0）；拖动帧率回升 | 小–中（两项同批） | P0-5（采样新开关先定型，避免二次改字段表） |
 | **P2-7 超大 header 拆分** | backend 拆 fence / staging / dispatch / 算子为独立 TU；`compute_vk_backend.hpp` 瘦身 | 拆分前后 build 全绿 + ctest 全绿 + CPU/GPU 字节锚逐位一致 | 中–大 | **前置 = 先补编译/链接期冒烟**（P0-1 + P1-5），否则拆分无回归网 |
@@ -186,8 +189,8 @@ ZiPT 恢复、LRLA、CUDA、分布式。
 
 ## 5. 13 号清单逐条裁定表
 
-条目编号沿用 13 号原文的章节号（13 号本身已改为 16 行重定向 stub）。
-其原正文的归档位置：**已执行/已否决记录**在 `docs/history.md`「13 号清单合并归档（原 docs/development/13-refactor-backlog.md）」节；
+条目编号沿用 13 号原文的章节号（13 号文档本身已于 2026-10-11 删除）。
+其原正文的归档位置：**已执行/已否决记录**在 `docs/history.md`「13 号清单合并归档」节；
 **仍未决的条目**由下表承接。本节逐条覆盖其**全部 16 条**未决项（含 17 §5 的 M7），一条不漏。
 
 | 条目 | 裁定 | 理由与触发条件 |
@@ -215,10 +218,10 @@ ZiPT 恢复、LRLA、CUDA、分布式。
 
 | 项 | 精确触发条件 | 立项时先读 |
 |---|---|---|
-| IR-C 跨表达式图融合 | 出现真实调用方满足**三条同时**：① 同形状长逐元素链；② 中间量不需留 backward；③ 单个 `dsl::compute` 写不下。**且不得复活录制 API**（记录 API 的历史否证见 `docs/history.md`） | `docs/development/03-ir-optimization.md` §5.3 |
-| S6 自动窗口（跨 kernel 自动融合） | 同 IR-C 的调用方判据；当前"能融的直接写成单个 `dsl::compute`"已覆盖生产路径 | `docs/development/02-operator-fusion.md` |
-| M7 存储多态 | **第三后端出现**（CPU/Vulkan 之外的引擎要落地） | `docs/development/17-unified-tensor-engine.md` §4.2 + §5 M7 |
-| IR-D 第二 emitter | 需要 glsl 之外的代码生成后端，且该后端**必须走 AOT 闭合世界**（表达式结构须被 `scan_exprs` 覆盖） | `docs/development/03-ir-optimization.md` 阶段 D；`expr_emitter.hpp` |
+| IR-C 跨表达式图融合 | 出现真实调用方满足**三条同时**：① 同形状长逐元素链；② 中间量不需留 backward；③ 单个 `dsl::compute` 写不下。**且不得复活录制 API**（记录 API 的历史否证见 `docs/history.md`） | `docs/todo/03-ir-optimization.md` §5.3 |
+| S6 自动窗口（跨 kernel 自动融合） | 同 IR-C 的调用方判据；当前"能融的直接写成单个 `dsl::compute`"已覆盖生产路径 | `docs/todo/02-operator-fusion.md` |
+| M7 存储多态 | **第三后端出现**（CPU/Vulkan 之外的引擎要落地） | `docs/todo/17-unified-tensor-engine.md` §4.2 + §5 M7 |
+| IR-D 第二 emitter | 需要 glsl 之外的代码生成后端，且该后端**必须走 AOT 闭合世界**（表达式结构须被 `scan_exprs` 覆盖） | `docs/todo/03-ir-optimization.md` 阶段 D；`expr_emitter.hpp` |
 | ZiPT 恢复 | ① 压缩向量保证**因果**（压缩器只能看当前位置之前）；② 实现质量对齐 RAPT/GPT（`forward_recompute` 梯度检查点 + activation offload + CLI/序列化/测试齐备）；③ 有同参对比数据 | `docs/history.md`「ZiPT 移除」条；`legacy/zipt` 分支 |
 | LRLA | 先有与 RLA-2 / RAPT 的**同参对比数据**（质量、显存、吞吐），再决定是否实现 | `docs/development/06-rapt-algorithm.md` |
 | Adafactor 类优化器 | 已排 **P2-2**；条件 = 需要训练超出 Adam m/v 显存预算的模型 | 本文 §4.3；`compute_optimizer.hpp` |
@@ -273,11 +276,11 @@ ZiPT 恢复、LRLA、CUDA、分布式。
 3. **行号会腐烂**：行号只作入口线索；引用时优先给文件名 + 符号名，行号在改动后由 `bench/doc_align_audit.ps1` 兜底
    不覆盖的，由自动化测试兜底（新增断言测试优于文档数字）。
 4. **裁定要留反例**：凡"不做"必须写清触发条件或反例（如 H4 的 RAPT 残差相加），否则后人无法判断能否重新立项。
-5. **与 13 的关系已终结**：13 号是 stub，新增条目只进本文，不再往 13 追加。
+5. **与 13 的关系已终结**：13 号文档已删除（内容全在本文与 `docs/history.md`），新增条目只进本文。
 
 ## 9. 仍然生效的工程教训（原 13 §9 承接）
 
-13 号清单的"仍然生效的工程教训"中，以下 2 条在 13 改为 stub 后无处落地，按原义承接。
+13 号清单的"仍然生效的工程教训"中，以下 2 条在 13 删除后无处落地，按原义承接。
 （其余 3 条已由别处覆盖：`dsl::compute` 无 2 参重载见 `AGENTS.md` §7；`max_abs_diff` 计数已入本文 §5 裁定表；
 `gpt_test` 偶发失败已列为本文 P1-4。）
 

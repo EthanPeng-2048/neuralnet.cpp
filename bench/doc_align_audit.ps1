@@ -134,7 +134,7 @@ $removedFlags  = @('--cuda','--tdr-retry','--max-tdr-retries',
                    '--osc-guard','--osc-window','--osc-threshold',
                    '--no-cache','--test-file','--loss-scope',
                    # --export-deploy : NNQT 独立部署格式的导出口，随库级清理
-                   #   （docs/development/23，2026-10-11）删除 → 文件角色
+                   #   （docs/todo/23，2026-10-11）删除 → 文件角色
                    #   .nnmodel/.nnckpt 取代
                    '--export-deploy')
 

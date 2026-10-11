@@ -293,6 +293,28 @@ inline void trace_event(const char* name, const char* cat,
 
 // ── RAII 计时器 ─────────────────────────────────────────────────────────────
 
+namespace detail {
+
+// 收掉栈顶帧并记账（Scope::stop 与 Phase::stop 共用）。
+// 幂等契约：name != nullptr 表示"本句柄仍持有一个未结束的段"；收口后置空
+// （经引用）→ 再次调用（析构后再显式 stop）直接返回。
+inline void close_frame(const char*& name) noexcept
+{
+    if (!g_enabled || name == nullptr) return;
+    name = nullptr;
+    auto& st = stack();
+    const Frame f = st.back();
+    st.pop_back();
+    const std::uint64_t end = now_ns();
+    const std::uint64_t dur = end - f.start_ns;
+    const std::uint64_t excl = dur >= f.child_ns ? dur - f.child_ns : 0;
+    if (!st.empty()) st.back().child_ns += dur;
+    accumulate(f.stage, nullptr, dur, excl);
+    trace_event(f.stage, "stage", f.start_ns / 1000, dur / 1000);
+}
+
+} // namespace detail
+
 // Scope：阶段/层级计时（forward / backward / L3 …），name 必须静态存储。
 // 析构自动停止；跨语句的大区域可用同名变量 + 显式 stop()（幂等）划分
 // 连续阶段（训练 step 里各阶段共享局部变量、不能用花括号块隔开）。
@@ -310,20 +332,7 @@ public:
     Scope& operator=(const Scope&) = delete;
     ~Scope() { stop(); }
 
-    void stop() noexcept
-    {
-        if (!g_enabled || name_ == nullptr) return;
-        name_ = nullptr;
-        auto& st = detail::stack();
-        const detail::Frame f = st.back();
-        st.pop_back();
-        const std::uint64_t end = detail::now_ns();
-        const std::uint64_t dur = end - f.start_ns;
-        const std::uint64_t excl = dur >= f.child_ns ? dur - f.child_ns : 0;
-        if (!st.empty()) st.back().child_ns += dur;
-        detail::accumulate(f.stage, nullptr, dur, excl);
-        detail::trace_event(f.stage, "stage", f.start_ns / 1000, dur / 1000);
-    }
+    void stop() noexcept { detail::close_frame(name_); }
 
 private:
     const char* name_ = nullptr;
@@ -344,12 +353,21 @@ public:
     void start(const char* name)
     {
         stop();
-        s_.emplace(name);
+        if (!g_enabled) return;
+        start_ = detail::now_ns();
+        name_ = name;
+        detail::stack().push_back(detail::Frame{name, nullptr, start_, 0});
     }
-    void stop() { s_.reset(); }
+    void stop() { detail::close_frame(name_); }
 
 private:
-    std::optional<Scope> s_;
+    // ⚠ 不用 `std::optional<Scope>`：GCC 15 的 -Wmaybe-uninitialized 会在
+    //   `~optional` → `_M_destroy` → `~Scope` → stop() 的内联链上误报
+    //   "payload 未初始化"（libstdc++ optional 的 emplace 先置 engaged 后构造
+    //   载荷，GCC 据此认为存在"engaged 但未构造"的路径）→ g++ 的 -Werror 构建
+    //   直接失败。状态内联成两个 POD 成员后语义完全一致（stop 幂等）。
+    const char* name_ = nullptr;
+    std::uint64_t start_ = 0;
 };
 
 // Op：引擎原语计时，归属到最内层 stage（stage::op 聚合），name 必须静态存储。

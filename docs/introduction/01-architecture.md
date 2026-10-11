@@ -275,7 +275,7 @@ class Tensor {
 
 > 引擎共 **52 个 virtual 方法**（复现 `bench/doc_inventory.ps1`）；逐元素/广播/条件选择不设 eager 原语，一律经表达式 DSL
 >（`dsl::compute` / `compute_into` / `compute_reduce`）执行。接口全量清单见
-> `development/12-compute-engine-inventory.md`。
+> `../todo/12-compute-engine-inventory.md`。
 
 **表达式统一入口：**
 

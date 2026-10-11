@@ -1,5 +1,5 @@
 // ── poc_binary_ste.cpp — 纯 1-bit（二值）权重的 STE 训练最小探针 ──────────────
-// 配套报告：research/ternary_ste/REPORT.md；设计文档：docs/development/21-quantized-weights.md
+// 配套报告：research/ternary_ste/REPORT.md；设计文档：docs/todo/21-quantized-weights.md
 //
 // 与 poc_ternary_ste.cpp 的唯一区别：量化器是 sign(W)（值域 {-1,+1}，没有 0），
 // 教师也是二值 {-0.5,+0.5}。用于回答"纯 1-bit 是否同样可行"。

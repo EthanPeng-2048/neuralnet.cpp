@@ -53,7 +53,7 @@ namespace nn
 // ═══════════════════════════════════════════════════════════════════════════
 
 inline constexpr uint32_t MODEL_MAGIC    = 0x4E4E4E4E;  // "NNNN"
-// v7（docs/development/23）：**文件角色**（role 字节：Model=推理 / Checkpoint=训练）
+// v7（docs/todo/23）：**文件角色**（role 字节：Model=推理 / Checkpoint=训练）
 //   + **参数级 kind**（[kind][precision][rows][cols][aux_len][payload_len][aux][payload]）。
 //   · 角色决定"写哪些参数"：`.nnmodel` 写推理所需全部参数（三值层写打包形态）；
 //     `.nnckpt` 写模型 + 训练参数（三值层写 f32 latent）。

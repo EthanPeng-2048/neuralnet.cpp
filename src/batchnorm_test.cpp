@@ -106,10 +106,10 @@ Scalar eval_loss(ComputeEngine &engine, nn::Layer &norm,
                  const Tensor &x, const Tensor &go)
 {
     auto y = norm.forward(x);
-    NN_ASSERT(y, "eval_loss: forward failed");
+    NN_ASSERT_ALWAYS(y, "eval_loss: forward failed");
     auto y_m = engine.to_matrix(*y);
     auto go_m = engine.to_matrix(go);
-    NN_ASSERT(y_m && go_m, "eval_loss: to_matrix failed");
+    NN_ASSERT_ALWAYS(y_m && go_m, "eval_loss: to_matrix failed");
     return dot(*y_m, *go_m);
 }
 

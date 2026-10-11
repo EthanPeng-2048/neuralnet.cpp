@@ -2,7 +2,7 @@
 
 // ── compute_layer_bitlinear.hpp — 三值（1.58-bit）线性层 BitLinear ──────────
 //
-// 设计：docs/development/21-quantized-weights.md §4.4（P1 形态）。
+// 设计：docs/todo/21-quantized-weights.md §4.4（P1 形态）。
 // 前置证据：research/ternary_ste/REPORT.md（同一套 DSL 组合的 STE 训练 PoC）、
 //           research/ternary_scale/REPORT.md（尺度 = 逐行 absmean 的实测依据）。
 //
@@ -520,7 +520,7 @@ private:
     //      必须单独出向量（这条限制与 RParam 无关）。
     //   2) wq ← select(|W|>0.5τ 的正负两侧)      —— compute_into 原地写 f16 缓冲。
     // 合计每步每层 2 次 dispatch（原 3 次）、2 趟权重读（4+4 B/元素）+ 1 趟
-    // f16 写（2 B/元素）；见 docs/development/21 §4.11 的字节账。
+    // f16 写（2 B/元素）；见 docs/todo/21 §4.11 的字节账。
     [[nodiscard]] Result<void> quantize_weights_()
     {
         ComputeEngine& engine = engine_ref();

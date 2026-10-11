@@ -259,7 +259,7 @@ inline void glsl_view_read(std::ostringstream& os,
     return vp;
 }
 
-// ── GQA：操作数"行块号"表达式（docs/development/22 §3.2 P2）──────────────
+// ── GQA：操作数"行块号"表达式（docs/todo/22 §3.2 P2）──────────────
 // 该操作数的视图是 HeadGroup 时，行块号 = base / 头分组比（比走运行期 vp 槽，
 //   param 不进 key → 任意 n_rep 共用一份 shader）；
 // 其余视图原样返回 base → 生成代码与既有逐字节相同（MHA 路径零变化）。
@@ -1174,7 +1174,7 @@ inline void glsl_emit_matmul_tail_fn(std::ostringstream& L, const ExprSpec& spec
 //  PC 形态：{count, cols, rows, vector_out, fold_k} + vp… + consts… + rparams…
 //    cols = 输入列数 K（glsl_view_read 索引用）；fold_k = K（块循环上界）。
 //    与后端 run_fused_gpu 的 fold 形态组包必须逐字段一致（PC 固定头坑，
-//    见 docs/development/08-pitfalls-and-lessons.md §4.10）。
+//    见 docs/todo/08-pitfalls-and-lessons.md §4.10）。
 //  寄存器物化：状态/标量类 = float r{n}；元素类 = float e{n}[BLOCK]（块内每
 //    kb 一值）；块归约 dst = float red{n}（行标量，经 Reduce 操作数广播）。
 //  状态初值一律 bit_cast → uintBitsToFloat 字面量（±inf/任意 float 零精度损失，
@@ -1560,7 +1560,7 @@ inline std::string generate_glsl_fold(const std::string& name, const ExprSpec& s
 //   count, cols(=键长), rows, vector_out(=输出列数，运行时), fold_k,
 //   [mm_k, mm_batch], vp.., c.., rp..
 //   ——创建侧 push range / 写入侧 pc_base / 本声明必须三处同改（不同步 =
-//   PC 错位静默错值；坑记录见 docs/development/08-pitfalls-and-lessons.md §4.10）。
+//   PC 错位静默错值；坑记录见 docs/todo/08-pitfalls-and-lessons.md §4.10）。
 inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec& spec,
                                          ExprPrecSig sig = 0)
 {

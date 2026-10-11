@@ -433,7 +433,7 @@ public:
 protected:
     std::size_t d_model_;
     std::size_t num_heads_;
-    // ── GQA（分组查询注意力，docs/development/22 §3.2）─────────────────────
+    // ── GQA（分组查询注意力，docs/todo/22 §3.2）─────────────────────
     // n_head_kv_ == num_heads_ 时退化为 MHA（既有路径逐位不变）。
     // 头映射 = 块映射：query head h 用 KV head `h / (num_heads_/n_head_kv_)`
     //（llama.cpp FA 内核 `ik2 = iq2 / rk2` 与 HF `repeat_kv` 的 reshape 一致）。
@@ -471,7 +471,7 @@ protected:
     // ── 分数掩码策略（构造期/配置期定型；热路径只调用，不判断变体）──
     std::unique_ptr<AttnScoreMask> mask_;
 
-    // ── SubLN（BitNet b1.58 的"子层归一化"，docs/development/22 §3.1）──────
+    // ── SubLN（BitNet b1.58 的"子层归一化"，docs/todo/22 §3.1）──────
     // **子层内部**的额外归一化：挂在 attention 输出（宽 d_model）与输出投影
     // w_o_ 之间。默认 nullptr = 关（既有路径逐位不变）。类型跟随模型的
     // norm_type（2B4T = RMSNorm）——与 GPTBlock 的 norm1_/norm2_ 同一工厂。
@@ -495,7 +495,8 @@ protected:
 
     [[nodiscard]] AttnScoreMask& score_mask() noexcept
     {
-        NN_ASSERT(mask_ != nullptr, "AttentionBase: score mask not installed");
+        // RV-01：失败后 `return *mask_` 解引用空指针 → 无条件终止
+        NN_ASSERT_ALWAYS(mask_ != nullptr, "AttentionBase: score mask not installed");
         return *mask_;
     }
 
@@ -508,7 +509,8 @@ protected:
     void install_position_encoder(std::unique_ptr<PositionEncoder> enc)
     {
         pos_ = std::move(enc);
-        NN_ASSERT(pos_ != nullptr, "AttentionBase: position encoder required");
+        // RV-01：失败后 `pos_->set_precision_profile` 解引用空指针 → 无条件终止
+        NN_ASSERT_ALWAYS(pos_ != nullptr, "AttentionBase: position encoder required");
         pos_->set_precision_profile(p_);
     }
 
@@ -537,10 +539,10 @@ public:
           w_o_(make_linear_layer(d_model, d_model, weight_quant)),
           weight_quant_(weight_quant)
     {
-        NN_ASSERT(d_model % num_heads == 0,
-                  "AttentionBase: d_model must be divisible by num_heads");
-        NN_ASSERT(n_head_kv_ != 0 && num_heads % n_head_kv_ == 0,
-                  "AttentionBase: num_heads must be divisible by n_head_kv");
+        NN_ASSERT_ALWAYS(d_model % num_heads == 0,
+                         "AttentionBase: d_model must be divisible by num_heads");
+        NN_ASSERT_ALWAYS(n_head_kv_ != 0 && num_heads % n_head_kv_ == 0,
+                         "AttentionBase: num_heads must be divisible by n_head_kv");
         mask_ = std::make_unique<PlainScoreMask>();
         if (subln)
             attn_sub_norm_ = make_norm_layer(d_model, subln_norm_type);

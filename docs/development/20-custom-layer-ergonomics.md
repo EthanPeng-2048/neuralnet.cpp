@@ -1,11 +1,15 @@
 # 自定义层易用性实测报告（库外使用者视角）
 
+> **读者**：调用者（库使用者 / 扩展者）——本分册定位见 [`README.md`](README.md)。
+> 本文是"库外使用者"视角的实测报告：写自定义层时**必须**满足的接入契约与已知摩擦点。
+> 报告登记的问题项由 [`../todo/18-roadmap.md`](../todo/18-roadmap.md) 承接；历史在 [`../history.md`](../history.md)。
+
 > **状态**：实测报告 · 基准版本 v1.7.0（`f20532b`）· 环境：本机 CPU（clang++，Debug）
 > **方法**：以"库外使用者"身份**只写新文件、不改库内任何代码**，从零实现一个自定义层
 > 并把它训起来；记录全部编译失败、契约误解与"必须回读源码才能确定"的点。
 > **证据**：`examples/custom_layer_lowrank.hpp`（层，157 行）+ `examples/custom_layer_train.cpp`
 > （数值梯度检查 + MNIST 训练，277 行）+ `CMakeLists.txt` 的 `custom_layer_example` 目标。
-> **关联**：`docs/development/18-roadmap.md` X6（本文登记的问题项）；X2/P2-4 是数据侧的同类"使用者视角"缺口。
+> **关联**：`docs/todo/18-roadmap.md` X6（本文登记的问题项）；X2/P2-4 是数据侧的同类"使用者视角"缺口。
 > **写作纪律**：行号取自实测；坐标系为 `文件:行`，行号漂移后以符号名为准。
 
 ---
@@ -92,9 +96,9 @@ error: ignoring return value of function declared with 'nodiscard' attribute
     NN_CHECK(model.backward(grad));
 ```
 
-### 2.2 "造张量"存在两套失败协议（严重度：高）
+### 2.2 "造张量"存在两套失败协议（严重度：高）— **已解决（2026-10-11，RV-02）**
 
-同一件事（拿到一个张量）有两套失败约定：
+同一件事（拿到一个张量）曾有两套失败约定：
 
 | 入口 | 签名（实测） | 失败如何表达 |
 |---|---|---|
@@ -109,6 +113,14 @@ error: ignoring return value of function declared with 'nodiscard' attribute
 
 **注**：`.valid()` 协议本身有明确理由（`:305` 注释：失败返回空 Tensor），
 但该理由只在库内注释里，使用文档没有对应段落。
+
+**已解决（2026-10-11，代码审查整改 RV-02）**：工厂统一到 `Result<Tensor>` ——
+新增 `engine.try_create_tensor(rows, cols, P[, InitSpec])`，把"非存储精度 / 形状溢出 /
+分配失败（GPU 侧连原因都带上）"三类错误结构化上抛；**两套旧签名原样保留**为
+`NN_CHECK(try_create_tensor(...))` 转发（失败即终止，不再是"返回空 Tensor 让调用方查
+`valid()`"）。因此本文 §4 的顾虑（"改动波及全部 Layer 与测试"）不成立：迁移是**增量**的，
+旧写法继续编译；想要结构化错误就用 `try_create_tensor`。判据与验收见
+`docs/todo/00-code-review-remediation.md` 的 RV-02 卡（负例在 `tensor_precision_test [5]`）。
 
 ### 2.3 无"写自定义层"文档，四条契约全靠读源码（严重度：高）
 
@@ -220,8 +232,11 @@ CPU 上写完即可跑；切 GPU 需要额外在 CMake 加 `nn_enable_gpu_fusion
 
 **不建议做的**：
 
-- 不建议为 2.2 引入统一协议（`create_tensor` 改返回 `Result`）——`.valid()` 是既有契约，
-  改动会波及全部 Layer 与测试，收益只是"少记一个例外"；文档写清楚即可。
+- ~~不建议为 2.2 引入统一协议~~（**2026-10-11 更新**）：该建议与同期另一份代码审查的
+  P1（工厂错误协议）冲突，后者已按"**增量**落地"处置——`try_create_tensor` 是新增的
+  `Result` 入口，旧 `create_tensor` 两个重载保留为转发，故**不波及**既有 Layer / 测试
+  （本条的"波及全部 Layer"前提不成立）。两套协议不再并存于"同一入口"，而是"旧入口 =
+  新入口 + `NN_CHECK`"。详见 RV-02。
 - 不建议为 2.5 放宽 IR（多 matmul 融合）——这是 AOT 闭合世界的结构性约束，
   触发条件应按 18 号路线图 §6 的 IR-C/S6 判据走，不因"写法不够顺手"立项。
 

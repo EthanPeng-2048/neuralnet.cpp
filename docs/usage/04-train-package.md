@@ -64,7 +64,7 @@ python train_pkg.py new --task mnist -o runs/mnist.json
 
 MNIST 的 `data.train` 是**数据集目录**（如 `datasets/mnist_data`），
 GPT 的 `data.train` 是**`.nndataset` 数据集文件**（token/词表/loss 掩码/test 子集
-都在生成期定好，见 `docs/development/19-unified-dataset.md`；`.nnpkg` 只搬这一个文件）。
+都在生成期定好，见 `docs/todo/19-unified-dataset.md`；`.nnpkg` 只搬这一个文件）。
 
 ## 工作流
 

@@ -2866,7 +2866,7 @@ public:
         constexpr uint32_t GEMV_ROWS = 4;   // 与 matmul_gemv.comp 的 ROWS 一致
         // subgroup≥4 门禁：shader red[..][64] 的容量假设（256/4 = 64 槽）——
         //   更小 subgroup 会溢出 64 槽上限、部分和不落表 → 静默错值
-        //   （"只有 GPU 错"一类，见 docs/development/08-pitfalls-and-lessons.md
+        //   （"只有 GPU 错"一类，见 docs/todo/08-pitfalls-and-lessons.md
         //   §4.10；实测桌面卡恒 ≥8，门禁是保险丝）
         // Phase C2e：f16 也可走 GEMV（f16 变体 pipeline 存在时）——小 N
         //   （n_out≤8）f16 GEMM 直读直写；变体 pipeline 缺失时引擎回退

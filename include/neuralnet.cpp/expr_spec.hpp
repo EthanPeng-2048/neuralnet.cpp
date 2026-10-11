@@ -193,7 +193,7 @@ enum class ExprViewKind : uint8_t
     //   RowAccess 同属"逐元素索引/局部读取"类，走 elementwise 生成路径。
     GroupedReduceSum = 13,
     GroupedReduceMax = 14,
-    // ── GQA 头分组（docs/development/22 §3.2 的 P2 in-kernel 版）──────────
+    // ── GQA 头分组（docs/todo/22 §3.2 的 P2 in-kernel 版）──────────
     // 读取语义**同 Linear**（恒等索引）；区别只在 `param`：它是该操作数的
     // **头分组比**（n_rep > 1 时表示"只存 1/n_rep 份行块、多个连续 query 头
     // 共享一个 KV 头"，块映射同 llama.cpp FA 的 ik2=iq2/rk2 与 HF repeat_kv）。
@@ -540,7 +540,7 @@ inline constexpr std::size_t EXPR_MAX_EXTRA_OUT = 4;
             n += expr_view_runtime_param_slots(static_cast<ExprViewKind>(v.kind));
     return n;
 }
-// ── GQA：该输入的"头分组比"（docs/development/22 §3.2 P2）────────────────
+// ── GQA：该输入的"头分组比"（docs/todo/22 §3.2 P2）────────────────
 // HeadGroup 视图的 param 即该操作数的头分组比 n_rep（1 = 恒等/非 GQA）。
 // GPU 生成器与 CPU 参考都从这里取——单一真源，避免两侧口径漂移。
 [[nodiscard]] inline std::uint32_t gqa_ratio_of(const ExprSpec& s,

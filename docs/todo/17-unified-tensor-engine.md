@@ -1,5 +1,7 @@
 # 统一 Tensor / ComputeEngine / MemoryPool 底层架构总纲
 
+> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history.md)。
+
 > **本文是新总纲**：吸收并取代 `15-computeengine-refresh.md` 未实施的 P2-P6（本文 §5 分期），
 > 并对 `13-refactor-backlog.md` §10.8 增补"访问不变量"注脚。历史归档见 `docs/history.md`。
 > 状态：**设计裁定已完成（§3 共 11 项）；M1 访问收口已实施（验收与

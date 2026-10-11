@@ -102,11 +102,10 @@ private:
     // (1,1) dummy 张量（清零）：空参数占位，规避 0 字节 GPU buffer（铁律 9）
     [[nodiscard]] Result<Tensor> make_dummy_(ComputeEngine& engine)
     {
-        Tensor d = engine.create_tensor(1, 1);
-        // create_tensor 分配失败时返回空 Tensor（非 Result）；此处显式检查，
-        // 否则 zero→import 只会报笼统的 "invalid tensor"，掩盖真实原因（显存/设备）。
-        if (!d.valid())
-            NN_FAIL("make_dummy_: GPU 张量分配失败（显存不足或设备异常）");
+        // RV-02：工厂已是 Result —— 分配失败原因直接上抛，不必再靠 valid() 兜底
+        // （旧形态下 zero→import 只会报笼统的 "invalid tensor"，掩盖显存/设备原因）。
+        NN_TRY(d_r, engine.try_create_tensor(1, 1));
+        Tensor d = std::move(*d_r);
         NN_TRY(r, engine.zero(d));
         return d;
     }
@@ -150,9 +149,9 @@ private:
     {
         const Scalar inv_dk = Scalar{1} / static_cast<Scalar>(dk);
         const Scalar eps = Scalar{1e-5};
-        Tensor output = engine.create_tensor(BH * dk, seq);
-        if (!output.valid())
-            NN_FAIL("rms_norm_forward_: GPU 张量分配失败（显存不足或设备异常）");
+        // RV-02：分配失败原因直接上抛
+        NN_TRY(output_r, engine.try_create_tensor(BH * dk, seq));
+        Tensor output = std::move(*output_r);
         // rms_inv_out == nullptr（checkpoint 模式）：不收集逐头 1/rms 缓存，
         // backward 由 forward_recompute 重建；同时省掉 BH 次 GPU→CPU 下载。
         // 宿主桥（17 §3 D11）：标量缓冲收逐头 1/rms，不经 Matrix。
@@ -203,9 +202,9 @@ private:
         std::size_t BH, std::size_t dk, std::size_t seq)
     {
         const Scalar inv_dk = Scalar{1} / static_cast<Scalar>(dk);
-        Tensor output = engine.create_tensor(BH * dk, seq);
-        if (!output.valid())
-            NN_FAIL("rms_norm_backward_: GPU 张量分配失败（显存不足或设备异常）");
+        // RV-02：分配失败原因直接上抛
+        NN_TRY(output_r, engine.try_create_tensor(BH * dk, seq));
+        Tensor output = std::move(*output_r);
         for (std::size_t bh = 0; bh < BH; ++bh)
         {
             NN_TRY(gy, engine.slice_rows(grad, bh * dk, dk));
@@ -242,10 +241,11 @@ public:
           w_q_(d_model, d_model), w_k_(d_model, d_model),
           w_v_(d_model, d_model), w_o_(d_model, d_model)
     {
-        NN_ASSERT(d_model % num_heads == 0,
-                  "ReLULinearAttention: d_model must be divisible by num_heads");
-        NN_ASSERT(d_model % num_heads == 0 && (d_model / num_heads) % 2 == 0,
-                  "ReLULinearAttention: RoPE requires even d_k");
+        // RV-01：整除不成立 → d_k_ 错值（除零/越界索引）在后续热路径静默发生
+        NN_ASSERT_ALWAYS(d_model % num_heads == 0,
+                         "ReLULinearAttention: d_model must be divisible by num_heads");
+        NN_ASSERT_ALWAYS(d_model % num_heads == 0 && (d_model / num_heads) % 2 == 0,
+                         "ReLULinearAttention: RoPE requires even d_k");
         // 注意力侧位置编码由本层自持（Learned/Sinusoidal 在 Q/K 侧是恒等）
         pos_ = make_attention_position_encoder(pos_enc, d_k_, num_heads_);
     }
@@ -1268,8 +1268,9 @@ public:
             if (checkpoint_every_ > 0 && (idx % checkpoint_every_ == 0))
             {
                 const std::size_t seg = idx / checkpoint_every_;
-                NN_ASSERT(seg < checkpoint_inputs_.size(),
-                          "RAPTModel backward: checkpoint input missing");
+                // RV-01：越界索引 checkpoint_inputs_[seg] → 无条件终止
+                NN_ASSERT_ALWAYS(seg < checkpoint_inputs_.size(),
+                                 "RAPTModel backward: checkpoint input missing");
                 NN_TRY(cr, blocks_[idx].forward_recompute(checkpoint_inputs_[seg]));
             }
             auto br = blocks_[idx].backward(grad_x);

@@ -1,5 +1,7 @@
 # 14 — GPU `stable=f16` 训练 loss 回读冻结
 
+> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history.md)。
+
 > 状态：**未修复（Open）** · 环境：Windows + clang++ 22（Release `-O3`）+ NVIDIA CMP 40HX（Vulkan）· HEAD `4a12876`
 > 发现途径：`docs/benchmarks/*-vulkan-vs-cuda.md`（Vulkan vs CUDA 基准文档）全量重跑（nn 侧）。本报告只记录事实与证据，不实施修复。
 > 关联：issue #13 P0-②（MSVC f16 权重冻结，3c2b9e8 已修，**本缺陷与之不同**）；`docs/development/05-mixed-precision.md` §12.5（四字段全 f16 历史即不可训练）。

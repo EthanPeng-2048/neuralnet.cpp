@@ -3,7 +3,7 @@
 
 复现：`python bench/gui_cli_audit.py`（需先构建 build/ 下的可执行文件）
 
-三节：
+四节：
   [1] GUI → CLI flag：把每个 Tab 可能发出的完整 kwargs 喂给对应 Controller，
       提取生成的 `--flag`，与该可执行文件 `--help` 的 flag 集合求差集。
       → 抓"GUI 会发出的、CLI 不认识的参数"（多余项 / flag 名写错）。
@@ -11,6 +11,9 @@
       → 抓"帮助里有、实际没解析"（用户按帮助用即报未知参数）。
   [3] gui.py 静态属性：每个类里 `self.X` 的读取是否都有赋值（含模块内祖先类）。
       → 抓"控件删了、引用还在"这类只在运行时才炸的错误（无需起 GUI / 装 customtkinter）。
+  [4] 优化器名单一致性（RV-04）：CLI `--help` 声明的名单（唯一真源 =
+      `compute_optimizer.hpp` 的 `kOptimizerTable`）与 gui.py 的兜底名单逐项比对。
+      → 抓"改了表忘了改 GUI"（GUI 的选项运行时从 CLI 派生，兜底只在未构建时生效）。
 
 退出码非 0 = 存在可行动问题。历史/有意为之的差异在此显式登记为白名单。
 """
@@ -48,7 +51,7 @@ EXES = ["mnist_train", "mnist_infer", "text_train", "text_infer",
 #   --interactive : GUI 本身即交互外壳
 #   --t1_58       : 三值预设的**别名**（等价 --precision-param t1_58）；GUI 的
 #                   "精度预设"下拉填的是 precision_param 字段，三条命令在
-#                   docs/development/21 §4.10 里已声明等价，故此处不算缺口
+#                   docs/todo/21 §4.10 里已声明等价，故此处不算缺口
 INTENTIONAL_GAPS = {"--interactive", "--t1_58"}
 
 
@@ -233,8 +236,68 @@ def audit_gui_attrs() -> int:
     return bad
 
 
+# ══════════════════════════════════════════════════════════════════════
+# [4] 优化器名单一致性（RV-04）
+# ══════════════════════════════════════════════════════════════════════
+# 名单的唯一真源 = include/neuralnet.cpp/compute_optimizer.hpp 的 kOptimizerTable：
+#   · CLI --help 的 --optimizer 描述由 nn::optimizer_names("/") 生成；
+#   · gui.py 的优化器下拉项已改为运行时从 CLI --help 解析（optimizer_options()），
+#     仅在取不到可执行文件时退回 _OPTIMIZER_FALLBACK。
+# 本节断言：CLI 确实声明了名单，且退回名单与 CLI 声明逐项一致 —— 兜底只在
+# "未构建"时生效，但一旦漂移就会在门禁里暴露（否则它是最容易腐坏的一份）。
+OPTIMIZER_LIST_RE = re.compile(r"优化器:([a-z0-9_/]+)")
+
+
+def cli_optimizer_names(exe: str) -> list[str]:
+    """CLI --help 声明的优化器名单（与 gui.py::parse_optimizer_options 同口径）。
+    帮助排版器按宽度折行，故先把文本里的空白全部去掉再匹配
+    `优化器:<a/b/c>`；否则跨行的列表会被截断成前缀。
+    """
+    exe_path = ROOT / "build" / f"{exe}.exe"
+    if not exe_path.exists():
+        return []
+    out = subprocess.run([str(exe_path), "--help"], capture_output=True,
+                         text=True, errors="replace")
+    flat = re.sub(r"\s+", "", out.stdout + out.stderr)
+    m = OPTIMIZER_LIST_RE.search(flat)
+    return m.group(1).split("/") if m else []
+
+
+def gui_fallback_optimizers() -> list[str]:
+    """gui.py 的兜底名单（ast 解析；不 import gui.py —— 它需要 customtkinter）。"""
+    tree = ast.parse((ROOT / "gui.py").read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "_OPTIMIZER_FALLBACK":
+                    return [e.value for e in node.value.elts]
+    return []
+
+
+def audit_optimizer_names() -> int:
+    print("\n=== [4] 优化器名单（CLI --help ↔ gui.py 兜底名单）===")
+    fallback = gui_fallback_optimizers()
+    if not fallback:
+        print("  [BAD] gui.py 未找到 _OPTIMIZER_FALLBACK")
+        return 1
+    bad = 0
+    for exe in ("mnist_train", "text_train"):
+        cli = cli_optimizer_names(exe)
+        if not cli:
+            print(f"  [SKIP] {exe}: build/{exe}.exe 不存在或 --help 未声明名单")
+            continue
+        if cli != fallback:
+            print(f"  [BAD] {exe}: CLI={cli} != gui.py 兜底={fallback}"
+                  "（改 kOptimizerTable 后须同步 gui.py 的 _OPTIMIZER_FALLBACK）")
+            bad += 1
+        else:
+            print(f"  [OK ] {exe:16s} 名单={cli}")
+    return bad
+
+
 def main() -> int:
-    bad = audit_gui_to_cli() + audit_phantom_options() + audit_gui_attrs()
+    bad = (audit_gui_to_cli() + audit_phantom_options() + audit_gui_attrs()
+           + audit_optimizer_names())
     print(f"\n{'PASS' if not bad else 'FAIL'}  可行动问题={bad}")
     return 1 if bad else 0
 

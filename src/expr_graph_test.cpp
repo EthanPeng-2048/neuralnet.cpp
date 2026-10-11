@@ -2,7 +2,7 @@
 //  expr_graph_test.cpp — 图 IR + 融合分析（IR-C）单元验证（纯 CPU、无 GPU）
 //
 //  Tensor/Matrix 访问走引擎 API：create_tensor/write/to_matrix——铁律 #11。
-//  验证内容（对应 docs/development/03-ir-optimization.md 的验证策略）：
+//  验证内容（对应 docs/todo/03-ir-optimization.md 的验证策略）：
 //   1. 链融合正确性：A→B 融合成单 kernel 后求值 == 逐节点求值
 //   2. 多节点链融合（3 节点）
 //   3. 融合边界：非链（无消费者 / 多消费者 / 非 Linear 引用）不融合

@@ -1,5 +1,7 @@
 # BitNet b1.58 2B4T 的结构对齐：SubLN / GQA / Tied Embedding
 
+> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history.md)。
+
 > **状态**：**立项 + S1/S2/S3/S4 + P2 全部实施完成**（2026-10-10 立项，同日落地并提交）。
 > 已落地：SubLN、GQA、tied embedding（S1–S3）、**FFN 激活 ReLU²**（S4，官方 `hidden_act`）、
 > **GQA 的 in-kernel 头映射**（P2，省掉 K/V 的头展开物化）。

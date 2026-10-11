@@ -32,7 +32,7 @@
 
 namespace nn
 {
-    // ── 宿主直配账本（M5，docs/development/17 §4.5 D5）──────────────────────
+    // ── 宿主直配账本（M5，docs/todo/17 §4.5 D5）──────────────────────
     // CPU 侧没有内存池：`MatrixT` 的存储走 `std::make_unique_for_overwrite`
     // 直配。为了让 `ComputeEngine::pool_stats()` 在**所有**引擎上语义完整
     // （17 §2 目标 4"内存契约统一"），这里把每一次宿主分配/释放记账：
@@ -80,11 +80,14 @@ namespace nn
     //  Matrix 类 — 矩阵存储与运算原语
     //
     //  错误处理约定（与上层 L2 计算层不同）：
-    //    - L1 代数层使用 NN_ASSERT 进行形状校验（编程错误检查）
+    //    - L1 代数层用 **NN_ASSERT_ALWAYS / NN_FATAL** 做形状与索引校验
+    //      （编程错误检查，Release 也终止——RV-01：断言后仍会按错误形状索引
+    //       = OOB，NN_ASSERT 在 NDEBUG 下展开为空会静默 UB）。
+    //      NN_ASSERT（可选诊断）只保留给"失败不影响后续正确性"的检查。
     //    - L2+ 计算层使用 Result<T> 进行运行时错误处理（用户输入校验）
-    //    - 原因：Matrix 是底层原语，assert 不影响 Release 性能；
+    //    - 原因：Matrix 是底层原语，一次 size_t 比较不影响 Release 性能；
     //            上层需要向用户报告错误，故使用 Result<T>
-    //    - 参见 docs/development/10-development-standards.md "分层职责单一" 章节
+    //    - 参见 docs/todo/10-development-standards.md "分层职责单一" 章节
     // ═══════════════════════════════════════════════════════════════════════
     // ── MatrixT<P> — 类型化矩阵存储（docs/development/05-mixed-precision.md D2：存储精度是 P）──
     // element = elem<P>（f16 / f32）；F32 实例即按 float 连续存储的普通矩阵。
@@ -171,16 +174,18 @@ namespace nn
         {
             if (lhs.rows_ != rhs.rows_ || lhs.cols_ != rhs.cols_)
             {
-                // Debug：NN_ASSERT 打印 file:line 后 abort。
-                // Release（NN_ASSERT 展开为空）：**绝不静默 OOB**——形状不匹配
-                // 在 L1 是编程错误（用户输入已在引擎入口经 Result 校验，
-                // 见 ComputeEngine::add_inplace），此处 fail-fast 中止，
-                // 代价为两次 size_t 比较，不影响热路径。
-                NN_ASSERT(false, message.data());
-                std::fprintf(stderr, "FATAL: Matrix 形状不匹配: %.*s (%zux%zu vs %zux%zu)\n",
-                             static_cast<int>(message.size()), message.data(),
-                             lhs.rows_, lhs.cols_, rhs.rows_, rhs.cols_);
-                std::abort();
+                // **绝不静默 OOB**（RV-01）：形状不匹配在 L1 是编程错误
+                // （用户输入已在引擎入口经 Result 校验，见 ComputeEngine::add_inplace），
+                // 此处 fail-fast 中止，代价为两次 size_t 比较，不影响热路径。
+                // 统一走 NN_FATAL（= 无条件终止 + file:line），不再手抄三段式；
+                // 详情经 snprintf 组装（message 是 string_view，**不保证** NUL 结尾，
+                // 不能直接当 %s 实参）。
+                char detail[192];
+                std::snprintf(detail, sizeof(detail),
+                              "Matrix 形状不匹配: %.*s (%zux%zu vs %zux%zu)",
+                              static_cast<int>(message.size()), message.data(),
+                              lhs.rows_, lhs.cols_, rhs.rows_, rhs.cols_);
+                NN_FATAL(detail);
             }
         }
 
@@ -296,7 +301,7 @@ namespace nn
         {
             if (row >= rows_ || col >= cols_)
             {
-                NN_ASSERT(false, "Matrix index out of range");
+                NN_FATAL("MatrixT::at index out of range");
             }
             return ptr()[index(row, col)];
         }
@@ -304,7 +309,7 @@ namespace nn
         {
             if (row >= rows_ || col >= cols_)
             {
-                NN_ASSERT(false, "Matrix index out of range");
+                NN_FATAL("MatrixT::set_value index out of range");
             }
             ptr()[index(row, col)] = value;
         }
@@ -322,7 +327,7 @@ namespace nn
         // ── 转置到预分配缓冲区（零分配热路径） ─────────────────────────────
         void transpose_to(MatrixT &result) const
         {
-            NN_ASSERT(&result != this, "transpose_to: self-referencing not supported");
+            NN_ASSERT_ALWAYS(&result != this, "transpose_to: self-referencing not supported");
             result.resize(cols_, rows_);
             if (rows_ == 0 || cols_ == 0) return;
 
@@ -425,8 +430,8 @@ namespace nn
             std::span<const element> a, std::size_t /*a_rows*/, std::size_t a_cols,
             std::span<const element> b, std::size_t b_rows, std::size_t b_cols)
         {
-            NN_ASSERT(a_cols == b_rows, "multiply_to_span: inner dimension mismatch");
-            (void)b_rows;  // NN_ASSERT 在 Release 模式下展开为空，参数仅用于断言
+            // RV-01：内维不匹配后**仍会**按 K = a_cols 索引 B → 必须无条件终止
+            NN_ASSERT_ALWAYS(a_cols == b_rows, "multiply_to_span: inner dimension mismatch");
             const std::size_t K = a_cols;
             if (M == 0 || N == 0 || K == 0) return;
 
@@ -523,8 +528,9 @@ namespace nn
             std::span<const element> a, std::size_t /*a_rows*/, std::size_t a_cols,
             std::span<const element> bt, std::size_t /*bt_rows*/, std::size_t bt_cols)
         {
-            NN_ASSERT(a_cols == bt_cols, "multiply_transposed_to_span: inner dimension mismatch");
-            (void)bt_cols;  // NN_ASSERT 在 Release 模式下展开为空，参数仅用于断言
+            // RV-01：同 multiply_to_span——内维不匹配即越界读，必须无条件终止
+            NN_ASSERT_ALWAYS(a_cols == bt_cols,
+                             "multiply_transposed_to_span: inner dimension mismatch");
             const std::size_t K = a_cols;
             if (M == 0 || N == 0 || K == 0) return;
 
@@ -615,8 +621,9 @@ namespace nn
             std::span<const element> a, std::size_t a_rows, std::size_t a_cols,
             std::span<const element> b, std::size_t b_rows, std::size_t b_cols)
         {
-            NN_ASSERT(a_rows == b_rows, "transpose_multiply_to_span: inner dimension mismatch");
-            (void)b_rows;  // NN_ASSERT 在 Release 模式下展开为空，参数仅用于断言
+            // RV-01：同 multiply_to_span——内维不匹配即越界读，必须无条件终止
+            NN_ASSERT_ALWAYS(a_rows == b_rows,
+                             "transpose_multiply_to_span: inner dimension mismatch");
             const std::size_t K = a_rows;  // a is (K, M) stored
             if (M == 0 || N == 0 || K == 0) return;
 
@@ -712,7 +719,7 @@ namespace nn
         // 使用 std::span（C++20）提供类型安全的非拥有视图
         void multiply_to(MatrixT &result, const MatrixT &other) const
         {
-            NN_ASSERT(&result != this, "multiply_to: self-referencing not supported");
+            NN_ASSERT_ALWAYS(&result != this, "multiply_to: self-referencing not supported");
             const std::size_t M = rows_;
             const std::size_t N = other.cols_;
             const std::size_t K = cols_;
@@ -737,8 +744,10 @@ namespace nn
         // 委托给 span 版内核：GEMM 内核只保留一份，避免两处实现漂移。
         void multiply_transposed_to(MatrixT &result, const MatrixT &b_trans) const
         {
-            NN_ASSERT(&result != this && &result != &b_trans, "multiply_transposed_to: self-referencing not supported");
-            NN_ASSERT(cols_ == b_trans.cols_, "multiply_transposed_to: inner dimensions mismatch");
+            NN_ASSERT_ALWAYS(&result != this && &result != &b_trans,
+                             "multiply_transposed_to: self-referencing not supported");
+            NN_ASSERT_ALWAYS(cols_ == b_trans.cols_,
+                             "multiply_transposed_to: inner dimensions mismatch");
             const std::size_t M = rows_;
             const std::size_t K = cols_;
             const std::size_t N = b_trans.rows_;
@@ -758,8 +767,10 @@ namespace nn
         // 委托给 span 版内核：GEMM 内核只保留一份，避免两处实现漂移。
         void transpose_multiply_to(MatrixT &result, const MatrixT &b) const
         {
-            NN_ASSERT(&result != this && &result != &b, "transpose_multiply_to: self-referencing not supported");
-            NN_ASSERT(rows_ == b.rows_, "transpose_multiply_to: inner dimensions mismatch");
+            NN_ASSERT_ALWAYS(&result != this && &result != &b,
+                             "transpose_multiply_to: self-referencing not supported");
+            NN_ASSERT_ALWAYS(rows_ == b.rows_,
+                             "transpose_multiply_to: inner dimensions mismatch");
             const std::size_t K = rows_;  // this is (K, M)
             const std::size_t M = cols_;
             const std::size_t N = b.cols_;

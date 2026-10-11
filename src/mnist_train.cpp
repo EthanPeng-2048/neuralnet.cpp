@@ -43,7 +43,7 @@ using nn::Scalar;
 // ── 精度解析辅助 ─────────────────────────────────────────────────────────
 // allow_t1_58：三值（T1_58）**只适用于 param 槽**（"该层权重是三值"），
 // compute/stable/optimizer 出现它一律在参数解析处拒绝，而不是拖到 init 期才报
-// 能力校验错误（docs/development/21-quantized-weights.md §4.1）。
+// 能力校验错误（docs/todo/21-quantized-weights.md §4.1）。
 nn::Precision parse_precision(const std::string& name, const char* flag,
                               bool allow_t1_58 = false)
 {
@@ -78,7 +78,10 @@ void print_usage(const char *prog)
     help.opt("--epochs <n>", "训练轮数 (默认: 10)");
     help.opt("--lr <lr>", "学习率 (默认: 0.001)");
     help.opt("--batch-size <n>", "批大小 (默认: 64)");
-    help.opt("--optimizer <name>", "优化器: sgd/sgd_momentum/adam/adamw/adamwquant/muon (默认: adam)\nadamwquant: 量化状态的 AdamW（状态 4 B/权重 vs 8 B；见 docs/development/21 §4.13）");
+    // RV-04：名单文本由 nn::optimizer_table()（唯一真源）生成，不再手抄
+    help.opt("--optimizer <name>",
+             "优化器: " + nn::optimizer_names("/") +
+                 " (默认: adam)\nadamwquant: 量化状态的 AdamW（状态 4 B/权重 vs 8 B；见 docs/todo/21 §4.13）");
     help.opt("--weight-decay <w>", "AdamW 权重衰减系数 (默认: 0.01)");
     help.opt("--max-samples <n>", "限制训练样本数 (默认: 全部，用于快速测试)");
     help.opt("--shuffle-steps <true|false>", "每 epoch 打乱 batch 顺序 (默认: true)");
@@ -118,7 +121,7 @@ void print_usage(const char *prog)
     help.opt("--precision-param <f16|f32|t1_58>",
              "权重/参数精度 (默认: f32)；t1_58 = 三值权重 BitLinear（1.58-bit）；"
              "本入口仅 MLP 架构支持（transformer/CNN 由层能力校验报错），"
-             "GPT 见 text_train；docs/development/21-quantized-weights.md");
+             "GPT 见 text_train；docs/todo/21-quantized-weights.md");
     help.opt("--precision-compute <f16|f32>", "常规算子计算精度 (默认: f32)");
     help.opt("--precision-stable <f16|f32>", "数值敏感算子精度 (默认: f32)");
     help.opt("--precision-optimizer <f16|f32>", "优化器状态精度 (默认: f32)");
@@ -541,7 +544,7 @@ int main(int argc, char *argv[])
     // ── 如果 --resume，从文件读取规格覆盖 CLI 参数 ──────────
     if (cfg.load_existing)
     {
-        // 角色校验（v7，docs/development/23 §2.1）：推理模型文件不含训练参数 →
+        // 角色校验（v7，docs/todo/23 §2.1）：推理模型文件不含训练参数 →
         // 明确拒绝；v5/v6 老 .bin 无 role 字段 → 按训练文件处理（零破坏）。
         {
             uint32_t resume_version = 0;
@@ -692,7 +695,7 @@ int main(int argc, char *argv[])
     {
         std::cout << "[精度] 三值权重已启用（T1_58 / BitLinear：量化 forward + STE backward，"
                      "latent 恒 f32）\n"
-                     "  [范围] P1 支持 MLP 路径；docs/development/21-quantized-weights.md\n";
+                     "  [范围] P1 支持 MLP 路径；docs/todo/21-quantized-weights.md\n";
     }
     if (cfg.precision.param == nn::Precision::F16 ||
         cfg.precision.compute == nn::Precision::F16 ||
@@ -735,7 +738,7 @@ int main(int argc, char *argv[])
     // 不在这里再注入：`build_mnist_model_from_spec` 已在 add 之前用
     // `Model::set_default_precision_profile` 注入（权重按精度创建），这里的
     // 二次调用对 MLP 是冗余的；而按 D3(b)，profile 在 init 后**不可变**
-    //（再注入即 fail-fast）。见 docs/development/21-quantized-weights.md §4.3.2。
+    //（再注入即 fail-fast）。见 docs/todo/21-quantized-weights.md §4.3.2。
     {
         const auto& pp = cfg.precision;
         if (pp.param != nn::Precision::F32 || pp.compute != nn::Precision::F32 ||

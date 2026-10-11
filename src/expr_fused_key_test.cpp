@@ -1,5 +1,5 @@
 // ── expr_fused_key_test — "结构 = 表达式类型" 不变量（AOT 自登记的前提）────────
-// 背景（docs/development/02 §自登记锚点）：`FusedAnchor<Expr>` 在构建期按表达式
+// 背景（docs/todo/02 §自登记锚点）：`FusedAnchor<Expr>` 在构建期按表达式
 // **类型**默认构造一个"符号实例"折叠出结构并登记；运行时同一调用点折叠出的 key
 // 必须与它一致，否则闭合世界 miss。成立条件 = **key 只描述结构**：
 //   ① 常量池**值**不进 key（只喂个数；值经 push constant `c<i>` 传给 shader）
