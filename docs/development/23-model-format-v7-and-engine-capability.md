@@ -27,6 +27,17 @@
 - 复合层（为解决"多层激活函数"等而存在）**不属于特例** —— 用它承载结构/转发是正当的。
 - 要求"全链路优化，不管是不是有效"（= 不做"因为预期收益小就不做"的裁剪）。
 
+**第二轮裁决（2026-10-11，逐条）**
+
+1. **kind 粒度 = 参数级**（采纳本稿建议）。
+2. **只读态 = 由 kind 推断**；但**质疑"可训练/不可训练"这一状态本身**：模型文件的可训练性
+   只有在"优化器状态（AdamW 动量）进模型"之后才可能成为问题，**现在不应引入该状态**。
+   → 本稿据此**删除**模型级 `trainable()`／层级"只读态"标志，只保留"结构性事实 + 用点报错"
+   （见 §2.2.1）。
+3. **引擎能力查询**：收 private 并按 `supports_*_` 命名（**尾随下划线 = private 约定**）；
+   **不得出现在基类 `ComputeEngine`**；不得作为"`matmul_q` 支持与否"的标签；只作为
+   **引擎内部分发计算路径**的标签；设备不支持时在引擎内**降级或报错**（见 §2.3）。
+
 ---
 
 ## 1. 问题评估（现状证据，全部可复现）
@@ -176,9 +187,9 @@
   （含层名 + 期望集合 + 实际 kind，措辞沿用 `Layer::init` 的既有风格）；
 - 这比今天"靠 spec 的全局 `weight_quant` + 参数顺序推断"更硬：文件损坏/串味会当场暴露。
 
-**只读态怎么表达**：**由 kind 推断，不另设标志**。规则：某模型若含
-`TernaryPacked*`（无 latent 的形态）→ 该模型为**只读推理态**；`--resume` / 训练入口在
-建立模型后统一检查一次（§2.2 的模型级 `trainable()`），给出明确错误，而不是在层里 abort。
+**只读态怎么表达**：**不表达**。见 §2.2.1 —— 只有"某个参数是打包形态（没有 latent）"
+这一**数据结构事实**，以及它在**用点**（`backward()`）自然产生的错误；**不引入**任何
+"可训练/不可训练"的状态位、标志或模型级 API。
 
 **与我已实现内容的复用**：base-3 编解码（`ternary_pack.hpp` 的 `pack_row_base3`/
 `unpack_row_base3`）、打包 GEMM 内核、GEMV 内核、`BitLinear` 的量化/缓存逻辑**全部保留**；
@@ -209,33 +220,67 @@ virtual Result<void> import_param(std::size_t index, const ParamEntry& entry);
   > 若你更希望保留 `sub_layers()` 作为正式架构能力（它对"结构遍历"类需求更通用），
   > 也可以两者并存；但按约束 3，我建议**只留参数条目协议**。
 
-**只读态**：`Layer` 增加一个**只读**声明（例如 `virtual bool trainable() const noexcept`，
-默认 true；BitLinear 在 packed 载入后返回 false）；`Model::trainable()` 聚合之。训练/优化器
-入口统一按它 fail-fast；`parameters()`/`param_gradients()` 不再 abort。
+#### 2.2.1 为什么**不**需要"可训练 / 不可训练"状态（回应第二轮第 2 条）
 
-### 2.3 引擎能力内敛（要求 4）
+**当时为什么会走到这一步**：打包形态的 `BitLinear` 结构上**没有 f32 latent** —— 而 STE 的
+`dW += (dY·Xᵀ)∘τ` 要落到 latent、优化器也要有参数张量。我当时把这个事实**升级成了状态**
+（层级 `packed_only()` + 模型级 `trainable()` + `parameters()` 里 abort），这是错的一步：
+把"数据形态的事实"包装成了"模型策略"，于是到处都要先问一句"这个模型能不能训"。
 
-**规则（写进 AGENTS 铁律候选）**：能力查询只允许在引擎实现内部使用 —— 形式上全部收为
-`protected`（编译期强制 L2 无法调用），并由引擎的 NVI 入口自行分派。既有三个
-`supports_native_*` / `supports_expr_precision_variant` 一并收紧（现状已只被引擎内部使用，
-收紧是"把既有约定变成编译期约束"）。
+**正确的形态**：只保留事实与用点错误，不引入任何状态。
 
-**BitLinear 侧**：不查任何能力，只有一种形态（打包容器），`forward` 只调
-`engine.matmul_q(...)` / `matmul_q_t(...)`；"该设备有没有打包内核"由 **GPU 引擎内部**决定：
+| 层次 | 正确做法 | 反面（本稿删除的东西） |
+|---|---|---|
+| 文件 | 只记"该参数的**存储形态**"（参数级 kind） | 不记"可训练性"标志 |
+| 层 | 打包形态的层没有 latent ⇒ `backward()` 返回**明确的 Result 错误**（与"必须先 forward"同类的**前置条件**检查，不是策略） | 不用 `packed_only()` 位、不在 `parameters()/param_gradients()` 里 abort |
+| 模型 | 无 `trainable()` —— 模型没有"状态"，只有参数与结构 | 不聚合"只读"标志 |
+| 训练入口 | 不需要提前检查；错误在真正需要 latent 的那一步报出（信息足够定位：层名 + "该文件只含打包权重"） | 不因"文件类型"提前拒绝 |
 
-- 有打包 pipeline → 走打包 GEMM（现状）；
-- 没有（或用户设了逃生阀）→ **引擎内部**用等效实现（例如引擎内解量化到 f16 稠密缓冲再走既有
-  matmul），对 L2 完全透明。**这条回退在引擎内实现，意味着 `BitLinear` 不再需要 `wq_` 稠密
-  缓冲、`use_packed_`/`force_pack_`/`sync_buffer_mode_`/`ensure_quant_buffer_` 的两形态逻辑**
-  （§1.5 的"2 套缓冲形态"随之消失，复杂度下降）。
-- A/B 逃生阀从层 API 改为**引擎级环境变量**（`NN_VULKAN_NO_TERNARY_GEMM` 等），与既有的
-  `NN_VULKAN_NO_16BIT_STORAGE` / `NN_VULKAN_NO_16BIT_ALU` 同一风格（初始化期读一次并缓存）。
-- `supports_int8_dot()` / `int8_dot_accelerated()`（P3 起步新增）同样收进内部；P3 的 int8 内核
-  由引擎内部选址。
+**为什么现在不做、以后可能要做的**：等优化器状态（AdamW 动量）也进模型文件时（roadmap
+P1-2 的 checkpoint 项），"这个模型承载了哪些**训练态数据**"才第一次成为一个真实的模型级
+概念 —— 那时再讨论它的表达；**不提前造**。
 
-**能力信息的对外披露**（需要裁决，见 §3.4）：探针目标（`mem_probe` 一类，`NN_ENABLE_PROBES`
-门下）或日志行，而不是 public API；测试改为**只测行为**（例如"在不支持打包的引擎上
-`matmul_q` 仍给出与 f16 路径一致的数值"），不再断言能力位。
+**可选（不是状态）**：载入器/CLI 可以在载入含打包形态的文件时**打一行日志**（"该文件只含
+打包三值权重，无 latent → 不能继续训练"）作为提示；这只是日志，不改变任何 API 或行为。
+
+### 2.3 引擎能力内敛（要求 4 + 第二轮第 3 条）
+
+**规则（本稿拟写成 AGENTS 铁律）**
+
+1. 能力谓词属于**具体引擎的私有实现细节**：命名 `supports_*_`（**尾随下划线 = private 约定**），
+   **不允许任何外部调用**（Layer / 优化器 / CLI / 测试都不行）。
+2. **不得出现在基类 `ComputeEngine`** —— 它不是引擎接口的一部分。
+3. **不得作为"某原语支持与否"的对外标签**（典型反例：`supports_ternary_gemm()` 被 BitLinear
+   用来决定缓冲形态）。能力谓词**只能**用于**引擎内部分发计算路径**。
+4. 设备不支持某条路径时，由引擎内部**降级**（走等效实现）或**报错**（明确的 `Result` 错误），
+   调用方只看到"成功 / 明确错误"，看不到能力位。
+
+**本轮新增位的处置**
+
+- **删除 `ComputeEngine::supports_ternary_gemm()`**：`BitLinear` 不查能力、缓冲形态单一化
+  （只有打包容器）；`GpuEngine::matmul_q_impl` 内部按私有 `supports_ternary_gemm_()` 分发：
+  有原生打包内核 → 用；没有 → **引擎内降级**（例如引擎内解量化后走既有 matmul，或直接返回
+  明确错误）。这条降级路径必须**有测试**（本机 CPU-only 构建天然覆盖"无打包 pipeline"）。
+- `supports_int8_dot()` / `int8_dot_accelerated()` → 私有化为 `GpuEngine::supports_int8_dot_()`
+  / `int8_dot_accelerated_()`；P3 的 int8 内核只由 `GpuEngine` 内部选址使用。
+- A/B 逃生阀从层 API（`set_ternary_pack_enabled`）改为**引擎级环境变量**
+  （`NN_VULKAN_NO_TERNARY_GEMM` 一类，初始化期读一次并缓存，与既有 `NN_VULKAN_NO_16BIT_*` 同风格）。
+
+**既有三处（`supports_native_data_move` / `supports_native_f16_reduce` /
+`supports_expr_precision_variant`）的两种口径**
+
+| 口径 | 范围 | 代价 / 风险 |
+|---|---|---|
+| **A｜窄口径（本轮做）** | 只处理"新引入且被 L2 使用"的位（ternary / int8）。既有三处保持现状 —— 它们**已经只被基类内部使用**（不违反"不得出现在 Layer/计算调用层"），把"是否也移出基类"单独立项 | 小：一处删除 + 一处分发下沉 + 逃生阀搬家 |
+| **B｜严格口径** | 三处也从基类移出 → 等于把**"f16 精度边界 cast 层"从基类下沉为具体引擎复用件**：基类 NVI 只调 `*_impl`，cast/直通的分支由各引擎在 impl 内用自己的私有 `supports_*_()` 决定（`CpuEngine` 的 impl 已自带精度归一化；`GpuEngine` 需把约 15 个入口的 cast 包装搬进去） | 中-大：触及**精度体系核心**，必须逐入口迁移 + 每步跑精度族测试（`precision_test` / `f16_precision_test` / `gpu_f16_test` / `precision_profile_test` …） |
+
+**建议**：A 立即做；B **单独立项**（把核心精度层与"三值/格式修复"混在一起会失控 —— 约束 3）。
+B 是否本轮一并做，列为待裁决第 1 条。
+
+**能力信息的对外披露**：收 private 后，能力信息只能走**探针通道**（`NN_ENABLE_PROBES` 门下的
+`mem_probe` 一类目标）或**日志**，不回到任何 public API。测试改为**行为断言**，例如
+"在不支持打包的设备上 `matmul_q` 仍给出与 f16 路径一致的数值"（这正是降级路径的验收），
+而不是断言能力位。
 
 ### 2.4 删除/保留清单
 
@@ -251,10 +296,15 @@ virtual Result<void> import_param(std::size_t index, const ParamEntry& entry);
   `peek_model_spec` + `load_model` 单一路径）。
 - `BitLinear` 的 `set_ternary_pack_enabled` / `set_ternary_pack_auto` / `uses_packed_weights`
   / `load_packed_weights` / `packed_only` / `ensure_quantized` / `quantized_weights()`
-  / `quantized_weights_packed()` / `row_scales()`（降级为协议内部实现）。
+  / `quantized_weights_packed()` / `row_scales()`（降级为协议内部实现）；
+  **`parameters()` / `param_gradients()` 在 packed 形态下的 abort 一并删除**（改为
+  `backward()` 的明确 Result 错误，见 §2.2.1）。
 - `Layer::sub_layers()`（被参数条目协议取代；若裁决保留则改为正式能力并补契约与审计）。
-- `ComputeEngine` 的 public `supports_ternary_gemm()` / `supports_int8_dot()` /
-  `int8_dot_accelerated()`（收为 protected；`supports_native_*` 一并收紧）。
+- `ComputeEngine`（基类）的 `supports_ternary_gemm()` / `supports_int8_dot()` /
+  `int8_dot_accelerated()`：**从基类删除**（不是收 protected —— 能力谓词不得进入基类），
+  改为具体引擎私有 `supports_*_()`；`supports_native_*` / `supports_expr_precision_variant`
+  的处置见 §2.3 的口径 A/B。
+- 本稿草案里出现过的"模型级 `trainable()`"：**不再引入**（§2.2.1）。
 - `src/ternary_deploy_test.cpp`（并入 `model_serialization`/`ternary_gemm` 的测试面）。
 
 **保留**
@@ -266,19 +316,23 @@ virtual Result<void> import_param(std::size_t index, const ParamEntry& entry);
 
 ### 2.5 迁移步骤（可独立验收，逐步替换而不是一次性大爆炸）
 
-1. **引擎内敛**（独立、低风险）：把 `supports_*` 收 protected；`BitLinear` 去掉 5 处能力查询，
-   缓冲形态单一化（引擎内部回退）；A/B 改引擎环境变量。验收：ctest 全绿 + `layer_bench`
-   配对 A/B 与今天同值 + 无打包 pipeline 的构建（本机 CPU-only）行为不变。
-2. **参数条目协议**（Layer 侧）：新增 `export_param/import_param` + `trainable()`；复合层转发；
-   `BitLinear` 实现三值三形态；删除 `sub_layers`/特例 API。验收：新增/迁移序列化测试。
+1. **引擎内敛（口径 A）**（独立、低风险）：从基类删除本轮新增的三个能力位；`BitLinear` 去掉
+   5 处能力查询、缓冲形态单一化；`matmul_q` 在 GPU 引擎内部按私有 `supports_ternary_gemm_()`
+   分发（原生内核 / 引擎内降级 / 明确错误）；A/B 改引擎环境变量。验收：ctest 全绿 +
+   `layer_bench` 配对 A/B 与今天同值 + **新增"无打包内核 → 降级"的行为用例** +
+   本机 CPU-only 构建行为不变。
+2. **参数条目协议**（Layer 侧）：新增 `export_param/import_param`（**不带**任何只读态/Trainable
+   标志）；复合层按 `parameters()` 顺序转发；`BitLinear` 实现三值三形态；删除 `sub_layers`
+   （待裁决）与全部特例 API；`backward()` 在无 latent 时返回明确错误。验收：迁移序列化测试 +
+   "packed 载入后 backward 报错"的用例。
 3. **v7 读写**：`save_model`/`load_model` 支持 v7 条目（kind + 精度 + aux/payload），
    v5/v6 仍可读（写一律 v7）；删除 `ternary_deploy.hpp` 与 CLI/GUI 标签。验收：
    "训练检查点往返逐位一致" + "packed 载入前向与原模型逐位一致（沿用今天 11.9×/逐字节等价的
    那组实测）" + v6 老文件可读。
-4. **产出 packed 文件的动作**（需裁决，见 §3.3）：候选 A = 模型级"冻结/推理形态"动作
-   （`Model::freeze_weights()`），之后 `save_model` 自然写 packed；候选 B = `save_model` 的一个
-   存储形态参数；候选 C = 只由载入侧推断（今天这样）。我建议 **A**（"文件形态 = 模型形态"，
-   不引入新的 CLI 标签，也符合"统一 NNNN"）。
+4. **产出 packed 文件的入口**（重开裁决，见 §3.3）：**候选 A = 模型级"冻结"动作被否决**
+   （那就是被否掉的"模型状态"）。剩下：候选 B = `save_model` 的一个**显式存储形态参数**
+   （调用点选择，不是模型状态、不是文件类型标签）；候选 C = 只经库 API 导入形态（把打包
+   `ParamEntry` 交给 `import_param`），CLI 不提供产出入口。
 5. **文档同步**：删掉 21 §4.15 的"独立格式"表述，改写为"NNNN v7 的多精度与形态认定"；
    history 记一条"修复：把 v1 独立格式并入 NNNN v7"；AGENTS 增一条铁律
    （能力查询只在引擎内部）+ 参数条目协议契约。
@@ -294,20 +348,23 @@ virtual Result<void> import_param(std::size_t index, const ParamEntry& entry);
 
 ---
 
-## 3. 待裁决（多轮讨论的输入）
+## 3. 待裁决（第二轮剩余问题）
 
-1. **kind 粒度与取值集合**：参数级（本稿建议）还是层级 + 参数级？`3 = bf16` 保留位是否继续
-   不碰（本稿把 bf16 排除在 kind 之外，因为它不是本项目支持的存储精度）？
-2. **只读态表达**：由 kind 推断（本稿建议）还是 spec 加一个模型级标志？
-3. **产出 packed 文件的动作**：模型级 `freeze/推理形态`（本稿建议 A）／`save_model` 形态参数／
-   只由载入推断（今天）？
-4. **能力披露通道**：`supports_*` 全部收 protected 后，能力信息去哪（探针目标 / 日志 / 都要）？
-   测试是否改为纯行为断言？
-5. **`sub_layers()` 去留**：删掉（本稿建议，参数条目协议已覆盖需求）还是保留为正式架构能力
-   （并补全复合层实现 + 契约 + 审计）？
-6. **"打包/稠密"两条缓冲形态**：删掉层侧形态（本稿建议，回退下沉到引擎内部）还是保留？
+> 第一轮 6 条中已裁决：① kind 粒度 = **参数级**；② 只读态 = **不引入**（由 kind 推断 + 用点报错）；
+> ④ 引擎能力查询 = **具体引擎私有 `supports_*_`、不得进基类、只作内部分发**。
+> ⑤/⑥ 的下文给出我的推导与建议，请确认。
 
----
+1. **既有三个能力位是否本轮一并移出基类**（§2.3 的 A/B 口径）？
+   - A（我建议）：本轮只处理 ternary/int8；既有 `supports_native_*` /
+     `supports_expr_precision_variant` 单独立项、逐入口迁移。
+   - B：本轮一并把"f16 精度边界 cast 层"从基类下沉到具体引擎（触及精度核心，工作量与风险都在这里）。
+2. **`sub_layers()` 去留**：因为 kind 已定为**参数级**、载入走**参数条目协议**，`sub_layers()`
+   再无消费者（它的唯一用途是让序列化层递归找到层）。我建议**删除**；
+   若你认为"层树枚举"作为通用架构能力该留，则需补全所有复合层实现 + 契约 + 审计（那是另一项工作）。
+3. **产出 packed 文件的入口**：A（模型级 freeze）= 已被否决；剩下
+   **B = `save_model` 的显式存储形态参数**（推荐）／**C = 只经库 API 导入形态、CLI 不提供**。
+4. **能力信息披露通道**：探针目标（`NN_ENABLE_PROBES` 门内）／日志／两者。
+   （测试一律改行为断言，不再断言能力位。）
 
 ## 4. 与 P3（全链路优化）的关系
 
