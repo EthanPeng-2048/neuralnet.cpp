@@ -1405,8 +1405,12 @@ namespace expr
     inline constexpr ExprView batch_col(std::uint32_t per_batch_cols)
     { return {11, 0, per_batch_cols}; }
     // 转置读（param = 存储行距；运行期 vp 槽、不进 key）
+    // ⚠ 视图种类**一律用符号名**，不要在这里写数字字面量：本文件合并
+    //   （2026-10-11）时 HeadGroup / Transpose 的枚举值各占 15 → Transpose 顺延
+    //   为 16，写死的 `{15, …}` 会让 trans() 静默构造出 HeadGroup 视图
+    //   （症状 = CE 的 lse fold 在 CPU 端报 "input shape mismatch"）。
     inline constexpr ExprView trans(std::uint32_t row_stride)
-    { return {15, 0, row_stride}; }
+    { return {static_cast<std::uint8_t>(ExprViewKind::Transpose), 0, row_stride}; }
 } // namespace expr
 
 } // namespace nn
