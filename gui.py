@@ -1384,6 +1384,10 @@ class GptTrainTab(TabBase):
                                          default_name="gpt_model.bin"); r += 1
         self.resume_path = _make_file_row(p, "恢复路径", r,
                                            filetypes=[("模型文件", "*.bin *.nnpkg")]); r += 1
+        # 部署文件（P2，可选）：只读推理产物（三值权重打包 + 逐行 τ，0.25 B/权重）。
+        # 留空 = 不导出；只对三值模型（精度预设=1.58-bit）有意义。
+        self.export_deploy = _make_save_row(p, "导出部署文件 (可选)", r,
+                                             default_name="", filetypes=[("部署文件", "*.nnqt")]); r += 1
         self.resume_epoch = _make_entry_row(p, "续训起始 epoch (0-based)", r, "0"); r += 1
         self.resume_step = _make_entry_row(p, "续训起始 step (0-based)", r, "0"); r += 1
 
@@ -1548,6 +1552,7 @@ class GptTrainTab(TabBase):
         args.update(_str(self.text_file, "text_file"))
         args.update(_str(self.save_path, "save"))
         args.update(_str(self.resume_path, "resume"))
+        args.update(_str(self.export_deploy, "export_deploy"))
         args.update(_int(self.resume_epoch, "resume_epoch"))
         args.update(_int(self.resume_step, "resume_step"))
         args.update(_int(self.epochs, "epochs"))

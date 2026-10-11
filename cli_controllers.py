@@ -799,6 +799,10 @@ class GptTrainController(CLIController):
         
         if "resume_step" in kwargs:
             args.extend(["--resume-step", self._format_arg_value(kwargs["resume_step"])])
+
+        # 部署文件导出（P2，可选）：只读推理产物（三值权重打包 + 逐行 τ）
+        if "export_deploy" in kwargs:
+            args.extend(["--export-deploy", self._format_arg_value(kwargs["export_deploy"])])
         
         # 训练参数
         if "epochs" in kwargs:

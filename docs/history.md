@@ -535,6 +535,13 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 
 # 引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器
 
+## 三值 P2 部署格式：base-3 载荷 + packed-only 只读推理文件（2026-10-11，分支 `dev/t1_58`；原位置 `docs/development/21-quantized-weights.md` §4.11 ② 的"部署期 9.4×"与 §5 的 P2 剩余项）
+- 类型：新能力（部署格式）/ 新 Layer 契约 / 性能 A/B
+- 内容：① **base-3 载荷**（`ternary_pack.hpp`）：5 个三值/字节（`3^5 ≤ 256`），`digit = 码 − 1`，字节 = `Σ digit_i·3^i`；2-bit 容器 ↔ base-3 逐位往返（含非 5 倍数与尾部）。② **独立部署文件格式**（新头 `ternary_deploy.hpp`）：magic `"NNQT"` + 版本 + 精度 + spec kvrec + 参数条目（tag 0/2 = f32/f16 矩阵，与 v5/v6 逐字节同款；tag 4 = 打包三值：encoding/rows/k/τ/payload）+ extra state + tokenizer。**为什么独立 magic**：版本号已抢号（v6 = .nnvocab），且部署文件是**只读**语义（与训练检查点混在一个版本会让 `--resume` 误载不可训练的文件）。③ **`BitLinear` packed-only**：`load_packed_weights` 释放 latent/梯度/稠密缓冲 → 推理足迹 4.25 → 0.25 B/权重；τ 随文件按位载入（重新量化会有 `absmean(trit)·τ` 比例差异）；只读是硬约束（backward 返错、parameters/param_gradients fail-fast）。④ **`Layer::sub_layers()`（新虚函数）**：GPT 的三值层藏在 Block→Attention/FeedForward 内，部署条目要落到正确的层必须能递归；契约 = 子层顺序与 `parameters()` 拼接顺序一致 + 自身参数在前，遍历器逐层核对覆盖数（不一致 fail-fast，绝不静默错位）；实现在 AttentionBase / FeedForward / GPTBlock / GPTModel。⑤ CLI：`text_train --export-deploy`（非三值模型显式拒绝）+ `text_infer`/`mnist_infer` 自动识别两类文件。
+- **实测（102 / 40HX，d256·h8·L4·ff688，60 步合成语料）**：文件 **13 436 025 → 1 126 970 B（11.9×）**；载入部署文件后**贪心输出与原文件逐字节相同**；推理峰值显存 76 MiB（**持平** —— 模型仍按规格建 latent 再被接管，见待办）。
+- **测试**：新 `src/ternary_deploy_test.cpp`（CPU + `--gpu`）：magic 分派 / 两种载荷载入后前向逐位相同 / packed-only 只读语义 / 尺寸账 / 训练文件不被误当部署文件 / **GPT 嵌套层**（12 个 BitLinear 全部 packed-only + 前向逐位相同 + 两侧遍历签名一致）。本机与 102 各 ctest **38/38**。
+- **待办**：① **免 latent 构建**（`ModelSpec.deploy_packed` → `make_linear_layer(..., inference_only)` → BitLinear 跳过 latent 分配）—— 现在只降常驻、不降载入期瞬时峰值（2B4T 上瞬时 = 4 B/权重 × 参数量）；② 小模型部署文件被 f32 词表主导（三值只压缩线性层）；③ 文件无校验和（与 `.bin` 同缺口）。
+
 ## 打包 GEMM 的分块改写尝试（2026-10-11，分支 `wip/t158-tiled-gemm`，**未合入主分支**）
 - 类型：性能 A/B / 被否决（暂时）+ bug 根因（两处分块原语的坑）
 - 内容：把 `matmul_q.comp` 改为与 `matmul_tiled.comp` 同构的分块版（A 分块解码一次进共享内存）。**已修**：① 后端 dispatch 网格必须随分块常量改（旧网格 = 64× 多余 workgroup：宽 batch 训练 26.1 s → 2.0 s）；② f16 写出转置错（`acc[j][i]` 应为 `acc[i].x/.y/.z/.w`；f32 路径看不出、f16 训练 loss 炸到 1.4e4）。

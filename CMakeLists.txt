@@ -478,6 +478,10 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(ternary_gemm_test src/ternary_gemm_test.cpp)
     list(APPEND NN_TEST_TARGETS ternary_gemm_test)
 
+    # ── 三值部署格式（P2：packed-only 推理文件 + base-3 载荷）──
+    nn_add_executable(ternary_deploy_test src/ternary_deploy_test.cpp)
+    list(APPEND NN_TEST_TARGETS ternary_deploy_test)
+
     # ── 量化状态优化器 AdamWQuant（F5 第一步，docs 21 §4.13）──
     nn_add_executable(adam_quant_test src/adam_quant_test.cpp)
     list(APPEND NN_TEST_TARGETS adam_quant_test)
@@ -629,6 +633,12 @@ if(NN_ENABLE_TESTS)
     if(TARGET ternary_gemm_test)
         add_test(NAME ternary_gemm_test_gpu COMMAND ternary_gemm_test --gpu)
         set_tests_properties(ternary_gemm_test_gpu PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    # 部署格式的 GPU 变体：packed-only 载入后的前向走设备侧打包 GEMM（同样要求
+    # 引擎支持三值 GEMM，否则用例自行跳过）。无设备 → 77。
+    if(TARGET ternary_deploy_test)
+        add_test(NAME ternary_deploy_test_gpu COMMAND ternary_deploy_test --gpu)
+        set_tests_properties(ternary_deploy_test_gpu PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     # 量化状态优化器的 GPU 变体（状态读写全在设备侧；GPU 上表达式须命中闭合世界）。
     if(TARGET adam_quant_test)

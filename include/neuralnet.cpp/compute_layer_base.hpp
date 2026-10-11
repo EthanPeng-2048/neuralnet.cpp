@@ -263,6 +263,16 @@ public:
     [[nodiscard]] virtual std::vector<TensorRef> parameters() { return {}; }
     [[nodiscard]] virtual std::vector<TensorRef> param_gradients() { return {}; }
 
+    // ── 子层结构（部署格式的完整遍历用，P2；`ternary_deploy.hpp`）─────────
+    // 复合层返回自己持有的子层（**非拥有**裸指针），叶子层返回空。
+    // 契约：返回值顺序 = 本层 `parameters()` 里"子层参数"的出现顺序，且
+    //       `parameters()[0..own)` 是本层**自身**参数（own = 总数 − 子层参数数）。
+    // 为什么需要它：GPT 的三值层（BitLinear）藏在 Block/Attention/FeedForward
+    //       内部，顶层 `Model::layer_at(i)` 拿不到 —— 部署格式要把"打包字 + τ"
+    //       落到正确的层上，就必须能递归到叶子。遍历器会在覆盖数不一致时
+    //       fail-fast（不静默错位），所以"没实现 sub_layers 的复合层"是可诊断的。
+    [[nodiscard]] virtual std::vector<Layer*> sub_layers() noexcept { return {}; }
+
     // 诊断（F2）：梯度缓冲是否已**实际分配**。
     // 采用惰性梯度分配的层（Linear / BitLinear）在 init 后、第一次
     // param_gradients()/backward()/zero_grad() 之前返回 false —— 推理路径

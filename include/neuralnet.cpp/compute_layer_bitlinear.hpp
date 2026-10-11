@@ -74,6 +74,12 @@ private:
     // 初版在宽 batch 下慢 2×（4.0 s），那条启发式已被分块版取代。
     int force_pack_ = -1;
 
+    // ── 部署态（P2 部署格式，ternary_deploy.hpp）──────────────────────────
+    // true = 本层只有"打包字 + τ"（来自部署文件），**没有 latent / 没有梯度**：
+    // 推理足迹 4.25 B/权重 → 0.25 B/权重。代价是只读 —— 反向 / 保存 / 取参数
+    // 全部 fail-fast（见下面的守卫），避免"以为在训练其实在推一个残层"。
+    bool packed_only_ = false;
+
     Tensor input_cache_; // forward 输入缓存（backward 用）
 
     // ── 量化缓存（F1）：只在**权重变过**时重算 τ/wq ──────────────────────
@@ -153,10 +159,15 @@ public:
     // ── 参数视图：latent（f32）+ 偏置（f32）──────────────────────────────
     [[nodiscard]] std::vector<TensorRef> parameters() override
     {
+        NN_CHECK(!packed_only_,
+                 "BitLinear(packed-only)：部署态没有可训练参数（不可保存/训练）；"
+                 "请用训练文件（latent）而不是部署文件");
         return {latent_w_, b_};
     }
     [[nodiscard]] std::vector<TensorRef> param_gradients() override
     {
+        NN_CHECK(!packed_only_,
+                 "BitLinear(packed-only)：部署态没有梯度缓冲（不可训练）");
         ensure_grad_();
         return {grad_w_, grad_b_};
     }
@@ -179,6 +190,50 @@ public:
     }
     // 量化实际执行次数（诊断/测试：缓存是否生效看它，不看 forward 次数）
     [[nodiscard]] std::uint64_t quantize_calls() const noexcept { return quantize_calls_; }
+
+    // ── 部署态（P2 部署格式）──────────────────────────────────────────────
+    // 载入"打包字 + τ"并把本层切成**只读推理**态：释放 latent（这一项就是部署态
+    // 的全部收益：4 B/权重 → 0）、释放梯度与 f16 稠密缓冲。τ 一并载入是为了
+    // **逐位复现**训练时的有效权重 τ∘W（重新量化会得到 mean|trit|·τ 的比例差异）。
+    [[nodiscard]] Result<void> load_packed_weights(Tensor packed_words, Tensor tau)
+    {
+        if (!packed_words.valid() || !tau.valid())
+            NN_FAIL("BitLinear: 部署权重为空张量");
+        if (packed_words.rows() != out_features_ ||
+            packed_words.cols() != nn::trit_pack::words_per_row(in_features_))
+            NN_FAIL("BitLinear: 部署打包字形状与层不匹配（期望 " +
+                    std::to_string(out_features_) + "x" +
+                    std::to_string(nn::trit_pack::words_per_row(in_features_)) + "）");
+        if (tau.rows() != out_features_ || tau.cols() != 1)
+            NN_FAIL("BitLinear: 部署 τ 形状与层不匹配（期望 " +
+                    std::to_string(out_features_) + "x1）");
+        if (!engine_ref().supports_ternary_gemm())
+            NN_FAIL("BitLinear: 部署态需要引擎支持三值 GEMM（supports_ternary_gemm()）");
+        force_pack_ = 1;
+        use_packed_ = true;
+        wq_packed_ = std::move(packed_words);
+        tau_ = std::move(tau);
+        quant_valid_ = true;
+        packed_only_ = true;
+        latent_w_ = Tensor{};   // 免 latent（部署态的核心收益）
+        wq_ = Tensor{};
+        grad_w_ = Tensor{};
+        grad_b_ = Tensor{};
+        return {};
+    }
+
+    // 本层是否处于部署态（无 latent/梯度，只读）
+    [[nodiscard]] bool packed_only() const noexcept { return packed_only_; }
+    [[nodiscard]] std::size_t in_features() const noexcept { return in_features_; }
+    [[nodiscard]] std::size_t out_features() const noexcept { return out_features_; }
+
+    // 导出（部署落盘）用：确保打包派生物与当前 latent 同步。**不改**推理语义，
+    // 只在量化缓存失效时补一次量化（与 forward 里的那条路径同一实现）。
+    [[nodiscard]] Result<void> ensure_quantized()
+    {
+        if (needs_quantize_()) return quantize_weights_();
+        return {};
+    }
 
     void clear_cache() override
     {
@@ -204,6 +259,10 @@ public:
         ComputeEngine& engine = engine_ref();
         if (input.rows() != in_features_)
             NN_FAIL("bitlinear forward: input shape mismatch");
+        // 部署态：只允许"打包字 + τ"这条路（引擎不支持三值 GEMM 就没法跑）
+        if (packed_only_ && !(use_packed_ && wq_packed_.valid() && tau_.valid()))
+            NN_FAIL("BitLinear(packed-only)：部署态需要引擎支持三值 GEMM"
+                    "（supports_ternary_gemm()），当前引擎/设备不支持");
         if (!checkpoint_mode_)
             input_cache_ = input;
         // 缓冲形态：默认跟随引擎能力（分块解码版下训练/解码都不亏，见成员注释）；
@@ -236,6 +295,9 @@ public:
         ComputeEngine& engine = engine_ref();
         if (grad_output.rows() != out_features_)
             NN_FAIL("bitlinear backward: grad_output shape mismatch");
+        if (packed_only_)
+            NN_FAIL("BitLinear(packed-only)：部署态只读（没有 latent 可更新）—— "
+                    "本文件是推理部署文件，请用训练文件恢复训练");
         ensure_grad_();   // 训练路径：首次反向才建梯度缓冲（F2）
         if (!tau_.valid() || !input_cache_.valid())
             NN_FAIL("bitlinear backward: 必须先 forward（τ/输入缓存未建立）");
@@ -287,6 +349,8 @@ private:
     // 按当前模式策略（force_pack_ / 引擎能力）选定缓冲形态。
     void sync_buffer_mode_()
     {
+        // 部署态：形态由文件固定（load_packed_weights 已校验引擎能力）
+        if (packed_only_) return;
         if (!engine_ref().supports_ternary_gemm())
         {
             if (use_packed_)
@@ -308,6 +372,7 @@ private:
     // 用不到的形态付显存）。
     void ensure_quant_buffer_()
     {
+        if (packed_only_) return;   // 部署态：缓冲来自文件，不由本函数建/清
         ComputeEngine& engine = engine_ref();
         if (use_packed_)
         {
@@ -352,6 +417,8 @@ private:
     // 那种情况下算一次比用空张量安全。
     [[nodiscard]] bool needs_quantize_() const noexcept
     {
+        // 部署态：只有文件载入的那一份（永不重算 —— latent 已不存在）
+        if (packed_only_) return !(wq_packed_.valid() && tau_.valid());
         if (!quant_valid_) return true;
         if (!tau_.valid()) return true;
         if (use_packed_ ? !wq_packed_.valid() : !wq_.valid()) return true;

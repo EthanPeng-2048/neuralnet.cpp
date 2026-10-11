@@ -93,5 +93,81 @@ inline void pack_row(const float* w, std::size_t k, float tau,
     return value_of((word >> (kBits * (idx % kPerWord))) & kMask);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  base-3（部署编码，1.6 bpw）
+//
+//  2-bit 定长编码是**运行期**容器（解码只有移位/掩码，喂 `matmul_q`）；部署
+//  文件用 base-3 再省 20%（2.0 → 1.6 bpw）：5 个三值/字节，字节 = Σ digit_i·3^i，
+//  `digit = 码 - 1 ∈ {0,1,2}`（即 trit + 1；与 2-bit 的 `码 = trit + 2` 差一个
+//  偏移，故两者的映射都在本头里唯一）。
+//
+//  为什么 5/字节（243 个状态，1.6 bpw）：`log2(3) = 1.585`，5 位一组是"每字节
+//  不浪费码位"的最大分组（3^5 = 243 ≤ 256、3^6 = 729 > 256）。这条与
+//  microsoft/BitNet 无关，与 llama.cpp `TQ1_0` 的 base-3 分组同源 —— 差别是我们
+//  的块粒度是**行**、尺度是逐行 absmean（`TQ1_0` 是 per-256 + qh 尾巴 + 定点
+//  `(s·3^n·3)>>8`）；部署格式不需要与 GGUF 互读，故不引入 qh/interleave，
+//  尾部直接补零 digit（解码按 k 截断）。
+//
+//  何时用它：**只在部署文件的落盘/读盘路径**（`model_serialization` 的 v6）。
+//  运行期一律转回 2-bit 容器（loosen 一次宿主侧逐位转换，成本一次性）。
+// ═══════════════════════════════════════════════════════════════════════════
+
+inline constexpr std::uint32_t kBase3PerByte = 5;   // 5 个三值/字节
+
+// 每行 base-3 字节数：ceil(K/5)
+[[nodiscard]] inline constexpr std::size_t base3_bytes_per_row(std::size_t k) noexcept
+{
+    return (k + kBase3PerByte - 1) / kBase3PerByte;
+}
+
+// 2-bit 容器行 → base-3 字节（部署落盘方向）。尾部不足 5 个的位置补 digit 0
+// （解码按 k 截断，补位不承载信息）。
+inline void pack_row_base3(const std::uint32_t* words, std::size_t k,
+                           std::uint8_t* out) noexcept
+{
+    const std::size_t bytes = base3_bytes_per_row(k);
+    for (std::size_t b = 0; b < bytes; ++b)
+    {
+        std::uint32_t byte = 0;
+        std::uint32_t pow3 = 1;
+        for (std::uint32_t i = 0; i < kBase3PerByte; ++i)
+        {
+            const std::size_t idx = b * kBase3PerByte + i;
+            const std::uint32_t code = (idx < k)
+                ? ((words[idx / kPerWord] >> (kBits * (idx % kPerWord))) & kMask)
+                : 2u;   // 补位：码 2 → digit 1（无信息，解码截断）
+            byte += (code - 1u) * pow3;
+            pow3 *= 3u;
+        }
+        out[b] = static_cast<std::uint8_t>(byte);
+    }
+}
+
+// base-3 字节行 → 2-bit 容器行（部署读盘方向）。尾部字按既有约定填"码 2 = 三值 0"。
+inline void unpack_row_base3(const std::uint8_t* in, std::size_t k,
+                             std::uint32_t* words) noexcept
+{
+    const std::size_t nwords = words_per_row(k);
+    for (std::size_t wi = 0; wi < nwords; ++wi) words[wi] = 0;
+    for (std::size_t idx = 0; idx < k; ++idx)
+    {
+        std::uint32_t byte = in[idx / kBase3PerByte];
+        for (std::uint32_t i = 0; i < idx % kBase3PerByte; ++i) byte /= 3u;
+        const std::uint32_t code = (byte % 3u) + 1u;   // digit → 码
+        words[idx / kPerWord] |= code << (kBits * (idx % kPerWord));
+    }
+    // 尾部：显式写"码 2"（= 三值 0），与 pack_row 的约定一致（不做则留下码 0 = -2）
+    for (std::size_t idx = k; idx < nwords * kPerWord; ++idx)
+        words[idx / kPerWord] |= 2u << (kBits * (idx % kPerWord));
+}
+
+// 单点解码（参考/测试用）：in 指向该行首字节
+[[nodiscard]] inline float at_base3(const std::uint8_t* in, std::size_t idx) noexcept
+{
+    std::uint32_t byte = in[idx / kBase3PerByte];
+    for (std::uint32_t i = 0; i < idx % kBase3PerByte; ++i) byte /= 3u;
+    return value_of((byte % 3u) + 1u);
+}
+
 } // namespace trit_pack
 } // namespace nn
