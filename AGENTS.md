@@ -38,7 +38,7 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 | 加/改神经网络层（Linear/Attention/Norm/激活…） | `compute_layer.hpp`（聚合头）+ `compute_layer_{base,mlp,bitlinear,conv,softmax,attention,feedforward,transformer,gpt,rapt}.hpp`（`bitlinear` = 三值权重 BitLinear） |
 | 加/改位置编码（Learned/Sinusoidal/RoPE/ALiBi/无） | `compute_position_encoding.hpp`（`PositionEncoder` 基类 + 子类 + 按注入点分开的两个工厂）+ `compute_layer_attention.hpp` 的 `AttnScoreMask` 族（掩码语义） |
 | 加/改损失函数 | `compute_loss.hpp` |
-| 加/改优化器（SGD/Adam/AdamW/Muon） | `compute_optimizer.hpp` |
+| 加/改优化器（SGD/Adam/AdamW/**AdamWQuant**/Muon） | `compute_optimizer.hpp`（`AdamWQuant` = 量化状态 AdamW：状态 f16 + 按行有界尺度，4 B/权重 vs 8 B；新增优化器时**别忘了** `create_optimizer` 工厂 + CLI 的**校验列表**（text_train 里另有一份硬编码白名单，只改 help 会漏）+ GUI `OPTIMIZER_OPTIONS` + `scan_exprs` 的优化器 dry-run 列表） |
 | 加/改引擎原语（CPU 实现） | `compute_engine.hpp`（接口）+ `compute_cpu_engine.hpp` |
 | 加/改引擎原语（GPU 实现） | `compute_gpu_engine.hpp` + `backend/compute_vk_backend.hpp` + `backend/compute_vk_device.hpp` + `shaders/*.comp` |
 | 张量/设备抽象 | `compute_tensor.hpp` |
