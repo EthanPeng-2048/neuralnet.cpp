@@ -83,7 +83,7 @@ public:
         return backend_.end_batch();
     }
 
-    // ── 表达式录制（IR-C，2026-10-06 恢复）──────────────────────────────
+    // ── 表达式录制（IR-C）──────────────────────────────
     // begin_expr 开启录制：期间 eval_expr/eval_expr_reduce 经 NVI 拦截入图
     // （expr_graph.hpp），返回带 virtual_tag 的占位 GPU 张量（真实存储）。
     // end_expr 融合分析（fuse_expr_graph）→ 复合 kernel 直接写回各 tail
@@ -433,7 +433,8 @@ public:
         NN_FAIL("cast_into: unsupported precision conversion");
     }
 
-    [[nodiscard]] Result<void> copy_from_impl(Tensor& dst, const Matrix& src) override
+    [[nodiscard]] Result<void> copy_from_impl(Tensor& dst, const Matrix& src,
+                                              bool fresh_dst) override
     {
         if (dst.rows() != src.rows() || dst.cols() != src.cols())
             NN_FAIL("copy_from: shape mismatch");
@@ -443,12 +444,22 @@ public:
             dst = Tensor::from_matrix(Matrix(src));
             return {};
         }
-        // batch 模式下必须先 drain（提交不等待）：dst 是当前帧已引用的既有
-        // buffer——当前帧尚未提交，若先把上传提交到队列，GPU 会先执行
-        // 上传、后执行当前帧命令 → 本帧后续对 dst 的写入覆盖上传数据。
-        // 故：end_batch 提交当前帧（不等待）→ wait_in_flight 等完 →
-        // 新帧开始录制 → 上传（独立提交，排在新帧之后提交、GPU 先执行）。
-        if (in_batch())
+        // ── 非 fresh（既有张量）：必须先 drain（提交不等待）──────────────
+        // dst 是当前帧已引用的既有 buffer——当前帧尚未提交，若先把上传提交
+        // 到队列，GPU 会先执行上传、后执行当前帧命令 → 本帧后续对 dst 的
+        // 写入覆盖上传数据。故：end_batch 提交当前帧 → wait_in_flight 等完 →
+        // 新帧开始录制 → 上传（独立提交）。
+        //
+        // ── fresh（全新张量，upload_span 的 create→write 相邻形态）：整段
+        // drain 跳过（本条热路径的历史画像 copy_from 121 次 / 步 = 全排空，
+        // 见 docs/history）。安全性：
+        //   · 反向依赖不存在——全新 buffer 无任何已录/在飞命令引用它
+        //     （池化复用只在写出方帧 fence 信号、区间归还之后才可能发生，
+        //     见 flush_pending_destroys）；
+        //   · 正向依赖（本帧及后续帧读 dst）显式保证——upload_blocking 的
+        //     时间线信号量 + 各帧 submit 处 collect_staging_waits 等待
+        //     （与 from_matrix 同一条既有机制）。
+        if (in_batch() && !fresh_dst)
         {
             auto r = end_batch();
             NN_TRY_CHECK(r);
@@ -457,7 +468,25 @@ public:
             auto rb = begin_batch();
             NN_TRY_CHECK(rb);
         }
+        else if (in_batch() && fresh_dst && copy_from_drain_forced())
+        {
+            // A/B 逃生阀：NN_COPY_FROM_DRAIN=1 强制 fresh 也走旧排空路径
+            // （回落对照；进程内静态缓存，同 NN_MM_NO_KSPLIT 口径）。
+            auto r = end_batch();
+            NN_TRY_CHECK(r);
+            auto rw = backend_.wait_in_flight();
+            NN_TRY_CHECK(rw);
+            auto rb = begin_batch();
+            NN_TRY_CHECK(rb);
+        }
         return backend_.upload_blocking(dst.gpu_tensor(), src.span());
+    }
+
+    // A/B 逃生阀：强制 fresh 上传也排空（默认关）。进程内静态缓存一次。
+    [[nodiscard]] static bool copy_from_drain_forced()
+    {
+        static const bool forced = nn::dsl::env_flag("NN_COPY_FROM_DRAIN");
+        return forced;
     }
 
     [[nodiscard]] Result<Tensor> clone_impl(const Tensor& src) override
@@ -1853,7 +1882,7 @@ public:
     }
 
 private:
-    // ── IR-C：融合执行（2026-10-06 恢复）────────────────────────────────
+    // ── IR-C：融合执行────────────────────────────────
     // 图 → 融合分析 → kernel 序列 → 逐个 AOT dispatch。每个 kernel 的输出
     // **直接写入**其 tail 节点的占位 buffer（output_override），使调用方持有
     // 的占位 Tensor 在 end_expr 后物化。被融合的中间节点无独立输出（寄存器

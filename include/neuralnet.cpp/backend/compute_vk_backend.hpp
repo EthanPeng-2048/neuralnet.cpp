@@ -96,6 +96,13 @@
 #define NN_MATMUL_TILED_F16_SPV_EMBEDDED
 #endif
 
+// P0 wgrad 网格饥饿：同一份 matmul_tiled.comp 用 -DNN_MM_FINE=1 编的
+// 16×16 输出块变体（f32 only；逐输出元素 K 累加序与 64-tile 逐位一致）。
+#if __has_include("matmul_tiled_fine_spv.hpp")
+#include "matmul_tiled_fine_spv.hpp"
+#define NN_MATMUL_TILED_FINE_SPV_EMBEDDED
+#endif
+
 #if __has_include("rearrange_3d_spv.hpp")
 #include "rearrange_3d_spv.hpp"
 #define NN_REARRANGE_3D_SPV_EMBEDDED
@@ -287,7 +294,7 @@
 //   因此不变量：**NN_EXPR_SCAN ⇒ 不含 fused_registry**（应用/样例目标不受影响）。
 // ⚠ 守卫必须写成**嵌套 #ifndef**、不能写成 `__has_include(...) && !defined(...)`
 //   （或反过来短路）：clang 21 实测 `#if` 条件里的 `__has_include` **无论是否被
-//   短路求值、都会被 -MD 记进 depfile**（2026-10-03 复现 f093261 后仍存在的依赖环）；
+//   短路求值、都会被 -MD 记进 depfile**（该写法会触发上述依赖环）；
 //   只有把整组条件编译**跳过**（组内不出词法）才不产生探测记录。
 #ifndef NN_EXPR_SCAN
 #if __has_include("fused_registry.hpp")
@@ -565,6 +572,8 @@ private:
     // 精度变体（f16 存储；设备无 storageBuffer16BitAccess 时保持空句柄）
     VulkanPipeline batched_matmul_f16_pipeline_;
     VulkanPipeline matmul_tiled_f16_pipeline_;
+    // P0 细 tile 变体（16×16 输出块，wgrad 网格饥饿；f32 only，恒创建）
+    VulkanPipeline matmul_tiled_fine_pipeline_;
     VulkanPipeline elementwise_v2_pipeline_;
     VulkanPipeline elementwise_v2_f16_pipeline_;   // Phase C1b f16 存储变体
     VulkanPipeline reduce_pipeline_;
@@ -667,11 +676,17 @@ private:
     // 本 dispatch 完成后落笔 ⇒ 每对标记间隔 ≈ 该 kernel 的 GPU 执行时间；
     // dispatch 之间的屏障/空隙不计入任何标号（即"kernel 时间 vs 空隙"口径）。
     static constexpr std::uint32_t kTsPairsPerBlock = 4096;
+    struct TsMark
+    {
+        const char* key;      // 聚合键 "label@stage"（表 4）
+        const char* detail;   // per-key 归因键 "detail@label@stage"（表 5；可空）
+        std::uint32_t pair;   // 查询对号
+    };
     struct TsCursor
     {
         std::uint32_t base = 0;   // 本块首查询号
         std::uint32_t next = 0;   // 已用 pair 数
-        std::vector<std::pair<const char*, std::uint32_t>> marks;  // (标号, pair 号)
+        std::vector<TsMark> marks;
     };
 
     // ── Command Buffer Batching + 多帧流水线─────────────────────
@@ -856,6 +871,17 @@ private:
     {
 #ifdef NN_MATMUL_TILED_F16_SPV_EMBEDDED
         return nn_matmul_tiled_f16_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    // P0 细 tile 变体（16×16 输出块，wgrad 网格饥饿；f32 only）
+    [[nodiscard]] static const std::vector<uint32_t>& get_matmul_tiled_fine_spirv()
+    {
+#ifdef NN_MATMUL_TILED_FINE_SPV_EMBEDDED
+        return nn_matmul_tiled_fine_spirv_bytecode();
 #else
         static const std::vector<uint32_t> empty;
         return empty;
@@ -1575,6 +1601,16 @@ public:
                 matmul_tiled_pipeline_ = std::move(*tp_r);
         }
 
+        // 9'. 创建细 tile 变体 pipeline（P0 wgrad 网格饥饿；f32 only，恒创建：
+        //     是否启用由派发端按网格工作组数 + NN_MM_NO_FINE 决定）
+        const auto& fine_spirv = get_matmul_tiled_fine_spirv();
+        if (!fine_spirv.empty())
+        {
+            auto fp_r = VulkanPipeline::create_matmul(device_.device(), fine_spirv);
+            if (fp_r)
+                matmul_tiled_fine_pipeline_ = std::move(*fp_r);
+        }
+
         // 9a. 创建小 N GEMV pipeline（可选；与 tiled 同 5×4B push / 3 binding，
         //     复用 create_matmul 布局）
         const auto& gemv_spirv = get_matmul_gemv_spirv();
@@ -1967,10 +2003,20 @@ public:
             // P3 批量变体（键 "#b"）：单 binding（实例表），PC 与 V0 同布局
             const bool is_batch =
                 std::string_view(fs.key).ends_with(nn::EXPR_BATCH_SUFFIX);
+            // P0 细 tile 变体（键 "#f"）：V0 同布局（同绑定数、同 PC），
+            // 只是另一套网格粒度（输出块 16×16）的 f32 shader。
+            const bool is_fine =
+                std::string_view(fs.key).ends_with(nn::EXPR_MM_FINE_SUFFIX);
+            // K 切分变体（键 "#ks"，每 WG 一段 K → 部分和）与其伴生归约
+            // （键 "#kr"）：f32 变体，PC/绑定见 EXPR_MM_KSPLIT_SUFFIX 注释。
+            const bool is_ks =
+                std::string_view(fs.key).ends_with(nn::EXPR_MM_KSPLIT_SUFFIX);
+            const bool is_kr =
+                std::string_view(fs.key).ends_with(nn::EXPR_MM_KSPLIT_REDUCE_SUFFIX);
             // 带 '#' 的 f16 变体（#x/#a）需要 SSBO 16 位存储；设备未启用 →
             // 跳过注册（运行时查不到 `#x`/`#a` → 基类 NVI 入口回退边界 cast）。
-            // `#b` 全 f32 无此要求（不得被这条误伤）。
-            if (!is_batch &&
+            // `#b`/`#f`/`#ks`/`#kr` 全 f32 无此要求（不得被这条误伤）。
+            if (!is_batch && !is_fine && !is_ks && !is_kr &&
                 std::string_view(fs.key).find('#') != std::string_view::npos &&
                 !device_.has_16bit_storage())
                 continue;
@@ -2006,7 +2052,8 @@ public:
             //   vkCmdPushConstants 超 range 而被驱动丢弃 → shader 读到未定义
             //   残留（随前序 op 漂移，表现为时对时错的假 PASS，"全绿"验不出）。
             const std::uint32_t pc_base_fixed =
-                (fs.spec.fold && fs.spec.fold->matmul)    ? 7u  // fold+mm 7 槽
+                is_ks                             ? 7u   // K 切分：matmul 6 槽 + ks_span
+              : (fs.spec.fold && fs.spec.fold->matmul)    ? 7u  // fold+mm 7 槽
               : (fs.spec.fold)                            ? 5u
               : (fs.reduce_axis >= 0 && fs.has_matmul)    ? 7u
               : (fs.reduce_axis >= 0)                     ? 4u
@@ -2065,6 +2112,7 @@ public:
     [[nodiscard]] bool is_initialized() const noexcept { return initialized_; }
     [[nodiscard]] bool gpu_available() const noexcept { return initialized_; }
     [[nodiscard]] bool has_tiled_pipeline() const noexcept { return matmul_tiled_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_tiled_fine_pipeline() const noexcept { return matmul_tiled_fine_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_gemv_pipeline() const noexcept { return matmul_gemv_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_gemv_f16_pipeline() const noexcept { return matmul_gemv_f16_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_batched_matmul_pipeline() const noexcept { return batched_matmul_pipeline_.handle() != VK_NULL_HANDLE; }
@@ -2697,7 +2745,10 @@ public:
         const VulkanPipeline& pipeline, std::span<const GpuTensor> inputs,
         const GpuTensor& output, const std::vector<std::uint8_t>& pc,
         std::uint32_t wg_x, std::uint32_t wg_y, std::uint32_t wg_z,
-        const char* ts_label = "dispatch")   // 设备侧计时标号（NN_PROFILE）
+        const char* ts_label = "dispatch",   // 设备侧计时标号（NN_PROFILE）
+        // per-key 归因 detail（NN_PROFILE；变体名如 "tiled"/"gemv"/"fine"，
+        // 进表 5 的 "detail@label@stage" 行；空 = 只进表 4）
+        std::string_view ts_detail = {})
     {
         if (!initialized_)
             NN_FAIL("GPU backend not initialized");
@@ -2745,7 +2796,7 @@ public:
             vkCmdPushConstants(cmd, pipeline.pipeline_layout(),
                 VK_SHADER_STAGE_COMPUTE_BIT, 0,
                 static_cast<uint32_t>(pc.size()), pc.data());
-        ts_dispatch(cmd, ts_label, wg_x, wg_y, wg_z);
+        ts_dispatch(cmd, ts_label, wg_x, wg_y, wg_z, ts_detail);
         record_output_barrier(cmd, output.buffer().impl());
 
         if (owns_cmd)
@@ -2824,9 +2875,33 @@ public:
                               && device_.subgroup_size() >= 4u
                               && (!use_f16 || has_gemv_f16_pipeline());
         const bool use_tiled = (use_f16 || has_tiled_pipeline()) && !use_gemv;
+        // P0 细 tile（wgrad 网格饥饿）：64-tile 网格只有
+        // ceil(N/64)×ceil(M/64) 个工作组——反传 wgrad 形状（M,N=64..256 ×
+        // K=16384）只派 1~4 个，40HX（34 SM）大面积空转（实测 208~278
+        // GFLOPS vs 同卡方形 2489）。低于阈值换 16×16 输出块变体：网格细
+        // 16×、每输出元素 K 累加序不变（逐位一致）。仅 f32（fine 变体无
+        // f16 版），GEMV（N≤8）与 naive 兜底不受影响。
+        bool use_fine = false;
+        bool use_naive_fine = false;
+        if (use_tiled && !use_f16 && !mm_fine_disabled())
+        {
+            const std::uint64_t wg64 =
+                static_cast<std::uint64_t>((N + 63u) / 64u) *
+                ((M + 63u) / 64u);
+            if (wg64 < nn::EXPR_MATMUL_FINE_MIN_WGS)
+            {
+                // NN_MM_FINE_NAIVE=1 → naive（每线程 1 输出：线程数 = M×N，
+                // 是细 tiled 的 16×；无 shared/barrier，靠 warp 切换吃延迟）
+                use_naive_fine = mm_fine_naive() &&
+                                 matmul_pipeline_.handle() != VK_NULL_HANDLE;
+                use_fine = !use_naive_fine && has_tiled_fine_pipeline();
+            }
+        }
         auto& pipeline = use_gemv ? (use_f16 ? matmul_gemv_f16_pipeline_
                                              : matmul_gemv_pipeline_)
                        : use_f16 ? matmul_tiled_f16_pipeline_
+                       : use_naive_fine ? matmul_pipeline_
+                       : use_fine ? matmul_tiled_fine_pipeline_
                        : use_tiled ? matmul_tiled_pipeline_
                                    : matmul_pipeline_;
 
@@ -2844,16 +2919,25 @@ public:
         std::memcpy(pc.data(), push_data, sizeof(push_data));
 
         std::vector<GpuTensor> inputs{A, B};
+        // 设备侧计时 detail：把 matmul 的 pipeline 变体带进 per-key 表
+        // （gemv / tiled / tiled_f16 / fine / naive_fine / naive）
+        const char* mm_variant = use_gemv ? (use_f16 ? "gemv_f16" : "gemv")
+            : use_naive_fine ? "naive_fine"
+            : use_fine ? "fine"
+            : use_tiled ? (use_f16 ? "tiled_f16" : "tiled")
+            : "naive";
         if (use_gemv)
         {
             auto r = dispatch_compute(pipeline, inputs, C, pc,
-                (M + GEMV_ROWS - 1u) / GEMV_ROWS, 1u, 1u, "matmul");
+                (M + GEMV_ROWS - 1u) / GEMV_ROWS, 1u, 1u, "matmul", mm_variant);
             NN_TRY_CHECK(r);
             return C;
         }
-        const uint32_t tile = use_tiled ? 64u : 16u;
+        const uint32_t tile = (use_fine || use_naive_fine) ? 16u
+                             : use_tiled ? 64u : 16u;
         auto r = dispatch_compute(pipeline, inputs, C, pc,
-            (N + tile - 1u) / tile, (M + tile - 1u) / tile, 1u, "matmul");
+            (N + tile - 1u) / tile, (M + tile - 1u) / tile, 1u,
+            "matmul", mm_variant);
         NN_TRY_CHECK(r);
         return C;
     }
@@ -2932,7 +3016,8 @@ public:
         std::vector<GpuTensor> inputs{A, B};
         auto r = dispatch_compute(
             use_f16 ? batched_matmul_f16_pipeline_ : batched_matmul_pipeline_,
-            inputs, C, pc, (N + BN - 1) / BN, (M + BM - 1) / BM, batch, "batched_matmul");
+            inputs, C, pc, (N + BN - 1) / BN, (M + BM - 1) / BM, batch,
+            "batched_matmul", use_f16 ? "f16" : "f32");
         NN_TRY_CHECK(r);
         return C;
     }
@@ -3274,6 +3359,62 @@ public:
         return on;
     }
 
+    // ── P0 细 tile（wgrad 网格饥饿）逃生阀：NN_MM_NO_FINE=1 关闭 ────────────
+    //    A/B 走双进程同窗交错（bench/run_ab_env.ps1 口径），故进程内静态
+    //    缓存即可——避免 run_fused_gpu 热路径每次派发都 getenv。
+    [[nodiscard]] static bool mm_fine_disabled()
+    {
+        static const bool off = []() {
+            const std::string v = VulkanDevice::get_env("NN_MM_NO_FINE");
+            return !v.empty() && v[0] != '0';
+        }();
+        return off;
+    }
+
+    // ── P0 细粒度实验阀：NN_MM_FINE_NAIVE=1 → 饥饿形状改派 naive
+    //    （matmul.comp：16×16 线程、每线程 1 输出、无 shared/barrier——
+    //    线程数 = M×N（细 tiled 的 16×），靠 warp 切换吃满延迟）。
+    //    与 tiled 细变体同窗交错 A/B 定夺最终形态。
+    [[nodiscard]] static bool mm_fine_naive()
+    {
+        static const bool on = []() {
+            const std::string v = VulkanDevice::get_env("NN_MM_FINE_NAIVE");
+            return !v.empty() && v[0] != '0';
+        }();
+        return on;
+    }
+
+    // ── K 切分逃生阀 + 调参（wgrad 二次归约）───────────────────────────────
+    // NN_MM_NO_KSPLIT=1 关闭 K 切分（回落细 tile / 64-tile 路径，A/B 基线）；
+    // NN_MM_KSPLIT_S=<n> 强制段数 S（1=auto，调参用，钳到 [2, MAX_S]）。
+    // 双进程同窗交错 A/B 口径下进程内静态缓存即可（与 mm_fine_disabled 同）。
+    [[nodiscard]] static bool mm_ksplit_disabled()
+    {
+        static const bool off = []() {
+            const std::string v = VulkanDevice::get_env("NN_MM_NO_KSPLIT");
+            return !v.empty() && v[0] != '0';
+        }();
+        return off;
+    }
+
+    [[nodiscard]] static std::uint32_t mm_ksplit_forced_s()
+    {
+        static const std::uint32_t s = []() -> std::uint32_t {
+            const std::string v = VulkanDevice::get_env("NN_MM_KSPLIT_S");
+            if (v.empty() || v[0] == '0')
+                return 0u;   // auto
+            long n = 0;
+            for (char c : v)
+            {
+                if (c < '0' || c > '9') break;
+                n = n * 10 + (c - '0');
+                if (n > 64) break;
+            }
+            return n >= 2 ? static_cast<std::uint32_t>(n) : 0u;
+        }();
+        return s;
+    }
+
     // ── 设备侧计时 helper（口径见成员注释）────────────────────────────
     // 录制块开始：reset 本块查询区间 + 游标复位（帧/solo 通用；上一块内容
     // 必已在其 fence 等待点 resolve，见 reap_frame / submit_and_wait）
@@ -3288,8 +3429,13 @@ public:
     }
 
     // dispatch 前后各写一个 timestamp（见成员注释的口径）
+    // detail：可选的 per-key 归因串（运行期 shader key / 原语变体名；传空跳过）
+    //   —— 录制期驻留进 prof 稳定池，resolve 时与 label@stage 一起回填。
+    // detail_suffix：拼在 detail 后的静态后缀（细 tile 变体 "#f"；调用点零分配）
     void ts_dispatch(VkCommandBuffer cmd, const char* label,
-                     std::uint32_t gx, std::uint32_t gy, std::uint32_t gz)
+                     std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
+                     std::string_view detail = {},
+                     const char* detail_suffix = nullptr)
     {
         const bool mark = ts_enabled_ && ts_cur_ != nullptr &&
                           ts_cur_->next < kTsPairsPerBlock;
@@ -3304,7 +3450,10 @@ public:
             const char* key = (stage != nullptr && stage[0] != '\0')
                                   ? nn::prof::interned_pair(label, stage)
                                   : label;
-            ts_cur_->marks.emplace_back(key, ts_cur_->next);
+            // per-key 细分（"detail[suffix]@label@stage"；detail 空 = 不入细分表）
+            const char* d = detail.empty() ? nullptr
+                : nn::prof::interned_detail(detail, detail_suffix, label, stage);
+            ts_cur_->marks.push_back(TsMark{key, d, ts_cur_->next});
             ++ts_cur_->next;
         }
         vkCmdDispatch(cmd, gx, gy, gz);
@@ -3328,14 +3477,16 @@ public:
             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
         if (r == VK_SUCCESS)
         {
-            for (const auto& [label, p] : cur.marks)
+            for (const auto& m : cur.marks)
             {
+                const std::uint32_t p = m.pair;
                 const std::uint64_t t0 = ts[static_cast<std::size_t>(p) * 2];
                 const std::uint64_t t1 = ts[static_cast<std::size_t>(p) * 2 + 1];
                 if (t1 >= t0)
-                    nn::prof::device_add(label,
+                    nn::prof::device_add(m.key,
                         static_cast<std::uint64_t>(
-                            static_cast<double>(t1 - t0) * ts_period_ns_));
+                            static_cast<double>(t1 - t0) * ts_period_ns_),
+                        m.detail);
             }
         }
         cur.next = 0;
@@ -3682,7 +3833,7 @@ public:
         const auto it = fused_pipelines_.find(shader_name);
         if (it == fused_pipelines_.end())
             NN_FAIL("fused shader not registered: " + shader_name);
-        const VulkanPipeline& pipeline = it->second;
+        // （pipeline 绑定推迟到细 tile 选择之后——基础键必须存在，细变体可选）
         // 运行期精度分派变体（键后缀 "#x"）：描述符 = 2N 输入视图 + 2 输出视图，
         // 且 PC 固定头末尾多一个 `prec` 槽。
         const bool is_disp =
@@ -3712,6 +3863,89 @@ public:
         // 运行时标量参数个数（优化器 lr/eps/β 的 rp 槽）
         const std::uint32_t n_rp = fused_rparam_counts_.count(shader_name)
             ? fused_rparam_counts_.at(shader_name) : 0u;
+
+        // ── P0 细 tile 选择（wgrad 网格饥饿）────────────────────────────────
+        // 纯 matmul 形态（与下方 dispatch 分支同一判据）且 64-tile 网格的
+        // 工作组数（含 batch 维）低于阈值 → 派发同结构的 16×16 输出块变体
+        // （键 = shader_name + "#f"，注册表元数据/PC 布局/绑定数与 V0 完全
+        // 同源，只是网格粒度不同）。`#f` 未登记（f16 精度变体键、设备未注册）
+        // 或 NN_MM_NO_FINE=1 → 留在 64-tile 路径（降级，不是错误）。
+        // 两变体逐输出元素的 K 累加序一致（BK=16 逐块升序 + 同一 vec4 点积
+        // 序）→ 结果逐位一致，字节锚不移动。
+        bool use_fine = false;
+        // ── K 切分选择（wgrad 二次归约，键 #ks+#kr）────────────────────────
+        // 细 tile 网格（m_per/16 × cols/16 × batch 个 WG）仍低于
+        // EXPR_MATMUL_KSPLIT_MIN_WGS → 把 K 切成 S 段：#ks 按列块序号取段
+        // [k_lo, k_lo+span)（dispatch x × S）写 (S·rows, cols) 部分和，
+        // #kr 跨段升序求和 + 跑尾链落最终输出。S = clamp(ceil(阈值/网格),
+        // 2, MAX_S)（NN_MM_KSPLIT_S 可强制，A/B 调参）；span 上取 16 对齐
+        // （生成器 vec4 快路径的段界 k 连续判据依赖它）。
+        // 门槛：V0（#ks/#kr 只注册基础键）、纯 matmul、无 extras、f32、
+        // #ks+#kr 同时注册（配对）、NN_MM_NO_FINE 与 NN_MM_NO_KSPLIT 均未关。
+        // ⚠ 跨段 K 累加序 ≠ 逐 k 串联 → **移动 GPU 字节锚**（已裁定放行，
+        // 与 P2-2 同处置：重测 + 更新 §12 + history 记新旧值）。
+        bool use_ks = false;
+        std::uint32_t ks_s = 0;       // 段数 S
+        std::uint32_t ks_span = 0;    // 段宽（16 对齐）
+        if (has_mm && raxis < 0 && !is_fold && !mm_fine_disabled())
+        {
+            const std::uint32_t rows_u = static_cast<std::uint32_t>(rows);
+            const std::uint32_t m_per = rows_u / matmul_batch;  // rows 按 batch 整除（契约）
+            constexpr std::uint32_t B64 = nn::EXPR_MATMUL_BLOCK;
+            const std::uint64_t wg64 =
+                static_cast<std::uint64_t>(
+                    (static_cast<std::uint32_t>(cols) + B64 - 1u) / B64) *
+                ((m_per + B64 - 1u) / B64) * matmul_batch;
+            if (wg64 < nn::EXPR_MATMUL_FINE_MIN_WGS &&
+                fused_pipelines_.count(shader_name + nn::EXPR_MM_FINE_SUFFIX) != 0)
+                use_fine = true;
+            if (wg64 < nn::EXPR_MATMUL_FINE_MIN_WGS && !is_disp &&
+                !mm_ksplit_disabled() && extra_outs.empty() &&
+                matmul_k && *matmul_k > 0 &&
+                fused_pipelines_.count(
+                    shader_name + nn::EXPR_MM_KSPLIT_SUFFIX) != 0 &&
+                fused_pipelines_.count(
+                    shader_name + nn::EXPR_MM_KSPLIT_REDUCE_SUFFIX) != 0)
+            {
+                constexpr std::uint32_t Bf = nn::EXPR_MATMUL_BLOCK_FINE;
+                const std::uint64_t wg_fine =
+                    static_cast<std::uint64_t>(
+                        (static_cast<std::uint32_t>(cols) + Bf - 1u) / Bf) *
+                    ((m_per + Bf - 1u) / Bf) * matmul_batch;
+                std::uint32_t s = mm_ksplit_forced_s();
+                if (s == 0u)
+                {
+                    if (wg_fine == 0 || wg_fine >= nn::EXPR_MATMUL_KSPLIT_MIN_WGS)
+                        s = 0u;   // 网格够密 → 不切
+                    else
+                        s = static_cast<std::uint32_t>(
+                            (nn::EXPR_MATMUL_KSPLIT_MIN_WGS + wg_fine - 1u)
+                            / wg_fine);
+                }
+                if (s >= 2u)
+                {
+                    if (s > nn::EXPR_MATMUL_KSPLIT_MAX_S)
+                        s = nn::EXPR_MATMUL_KSPLIT_MAX_S;
+                    const std::uint32_t k = *matmul_k;
+                    const std::uint32_t span =
+                        ((k + s - 1u) / s + 15u) & ~15u;   // 上取 16 对齐
+                    // 部分和缓冲 = S·rows·cols 个 float，shader 线性索引是 u32
+                    const std::uint64_t part =
+                        static_cast<std::uint64_t>(s) * rows *
+                        static_cast<std::uint64_t>(cols);
+                    if (span > 0u && part <= 0xFFFFFFFFull)
+                    {
+                        use_ks = true;
+                        use_fine = false;   // K 切分独占派发（不走基础/细 tile）
+                        ks_s = s;
+                        ks_span = span;
+                    }
+                }
+            }
+        }
+        const VulkanPipeline& pipeline =
+            use_fine ? fused_pipelines_.at(shader_name + nn::EXPR_MM_FINE_SUFFIX)
+                     : it->second;
 
         if (inputs.size() + 1 > EXPR_MAX_INPUTS + 1)
             NN_FAIL("run_fused_gpu: too many inputs");
@@ -3791,6 +4025,198 @@ public:
             for (const GpuTensor* eo : extra_outs)
                 if (eo == nullptr)
                     NN_FAIL("run_fused_gpu: 多输出（extras）含空输出指针");
+        }
+
+        // ── K 切分两段派发（use_ks，选择判据见上方）────────────────────────
+        // #ks：细块网格 × S 段（x = 列块序号决定 K 段）→ (S·rows, cols)
+        //      部分和；PC 7 槽 = matmul 头 + ks_span（pc_base_fixed=7）。
+        // #kr：ceil(count/256) 每线程一输出，段升序求和 + 尾链 → 最终输出；
+        //      PC 6 槽 = matmul 同布局（第 4 槽填段数 S，#kr 不读 mm_trans）。
+        // 屏障：inputs 统一就绪 → #ks → partial 写转读（record_output_barrier
+        // 的 src SHADER_WRITE→dst MEMORY_READ 覆盖 compute→compute）→ #kr →
+        // 输出写转读。部分和缓冲局部析构 = 归还池；批量录制模式下块可能被
+        // **录制序更晚**的算子复用——执行序 = 录制序，#kr 的读排在复用写
+        // 之前（同一命令缓冲），故安全（与 owned_output 同一账目）。
+        if (use_ks)
+        {
+            const VulkanPipeline& ks_pipe =
+                fused_pipelines_.at(shader_name + nn::EXPR_MM_KSPLIT_SUFFIX);
+            const VulkanPipeline& kr_pipe =
+                fused_pipelines_.at(shader_name
+                                    + nn::EXPR_MM_KSPLIT_REDUCE_SUFFIX);
+            const std::uint32_t rows32 = static_cast<std::uint32_t>(rows);
+            const std::uint32_t cols32 = static_cast<std::uint32_t>(cols);
+            const std::uint32_t k32 = *matmul_k;
+
+            // 1. 部分和缓冲 (S·rows, cols) f32（选择处已验证 u32 索引上界）
+            auto part_r = GpuTensor::create_empty(
+                static_cast<std::size_t>(ks_s) * rows, cols, *this);
+            NN_TRY_CHECK(part_r);
+            GpuTensor partial = std::move(*part_r);
+
+            // 2. 两份 PC（固定头 + vp + consts + rparams，槽位与生成器逐字段同源）
+            const std::size_t tail_bytes =
+                sizeof(Scalar) * consts.size() + sizeof(Scalar) * rparams.size();
+            std::vector<std::uint8_t> pc_ks(
+                (7u + n_vp) * sizeof(std::uint32_t) + tail_bytes);
+            std::vector<std::uint8_t> pc_kr(
+                (6u + n_vp) * sizeof(std::uint32_t) + tail_bytes);
+            const auto fill_head = [&](std::vector<std::uint8_t>& pc, int slots,
+                                       std::uint32_t slot3, std::uint32_t slot4,
+                                       std::uint32_t slot5)
+            {
+                std::memcpy(pc.data(), &count, sizeof(std::uint32_t));
+                std::memcpy(pc.data() + 4, &cols32, sizeof(std::uint32_t));
+                std::memcpy(pc.data() + 8, &rows32, sizeof(std::uint32_t));
+                std::memcpy(pc.data() + 12, &slot3, sizeof(std::uint32_t));
+                std::memcpy(pc.data() + 16, &slot4, sizeof(std::uint32_t));
+                std::memcpy(pc.data() + 20, &slot5, sizeof(std::uint32_t));
+                const std::size_t vp_off =
+                    static_cast<std::size_t>(slots) * sizeof(std::uint32_t);
+                for (std::uint32_t i = 0; i < n_vp; ++i)
+                    std::memcpy(pc.data() + vp_off + i * sizeof(std::uint32_t),
+                                &view_params[i], sizeof(std::uint32_t));
+                if (!consts.empty())
+                    std::memcpy(pc.data() + vp_off
+                                + n_vp * sizeof(std::uint32_t),
+                                consts.data(), sizeof(Scalar) * consts.size());
+                if (!rparams.empty())
+                    std::memcpy(pc.data() + vp_off
+                                + n_vp * sizeof(std::uint32_t)
+                                + sizeof(Scalar) * consts.size(),
+                                rparams.data(),
+                                sizeof(Scalar) * rparams.size());
+            };
+            fill_head(pc_ks, 7, k32, matmul_batch, matmul_trans);
+            // ks_span 在固定头第 7 槽（offset 24）
+            std::memcpy(pc_ks.data() + 24, &ks_span, sizeof(std::uint32_t));
+            // **有效段数** V = ceil(mm_k / span)（span 16 对齐上取 → 尾部可能
+            // 存在 k_lo ≥ mm_k 的空段：#ks 早退不写部分和，#kr 必须只加这 V
+            // 段，否则读到未初始化缓冲的垃圾——ctest 小形状全挂的教训）。
+            const std::uint32_t ks_valid =
+                (k32 + ks_span - 1u) / ks_span;
+            fill_head(pc_kr, 6, ks_valid, matmul_batch, 0u);
+
+            // 3. 描述符集：#ks = N 输入 + 1 部分和；#kr = N 输入 + 部分和 + 输出
+            const std::size_t n_in = inputs.size();
+            auto ds1_r = alloc_desc_set(ks_pipe.descriptor_layout());
+            NN_TRY_CHECK(ds1_r);
+            VkDescriptorSet ds_ks = *ds1_r;
+            auto ds2_r = alloc_desc_set(kr_pipe.descriptor_layout());
+            if (!ds2_r)
+            {
+                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &ds_ks);
+                NN_TRY_CHECK(ds2_r);
+            }
+            VkDescriptorSet ds_kr = *ds2_r;
+            {
+                // #ks：N 输入 + 部分和（binding N）
+                std::vector<VkDescriptorBufferInfo> infos(n_in + 1);
+                std::vector<VkWriteDescriptorSet> writes(n_in + 1);
+                for (std::size_t i = 0; i < n_in; ++i)
+                    infos[i] = {inputs[i]->impl(), 0, VK_WHOLE_SIZE};
+                infos[n_in] = {partial.buffer().impl(), 0, VK_WHOLE_SIZE};
+                for (std::size_t i = 0; i < infos.size(); ++i)
+                {
+                    writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    writes[i].dstSet = ds_ks;
+                    writes[i].dstBinding = static_cast<std::uint32_t>(i);
+                    writes[i].descriptorCount = 1;
+                    writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    writes[i].pBufferInfo = &infos[i];
+                }
+                vkUpdateDescriptorSets(device_.device(),
+                    static_cast<std::uint32_t>(infos.size()), writes.data(),
+                    0, nullptr);
+            }
+            {
+                // #kr：N 输入 + 部分和（binding N）+ 最终输出（binding N+1）
+                std::vector<VkDescriptorBufferInfo> infos(n_in + 2);
+                std::vector<VkWriteDescriptorSet> writes(n_in + 2);
+                for (std::size_t i = 0; i < n_in; ++i)
+                    infos[i] = {inputs[i]->impl(), 0, VK_WHOLE_SIZE};
+                infos[n_in] = {partial.buffer().impl(), 0, VK_WHOLE_SIZE};
+                infos[n_in + 1] = {output.buffer().impl(), 0, VK_WHOLE_SIZE};
+                for (std::size_t i = 0; i < infos.size(); ++i)
+                {
+                    writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    writes[i].dstSet = ds_kr;
+                    writes[i].dstBinding = static_cast<std::uint32_t>(i);
+                    writes[i].descriptorCount = 1;
+                    writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    writes[i].pBufferInfo = &infos[i];
+                }
+                vkUpdateDescriptorSets(device_.device(),
+                    static_cast<std::uint32_t>(infos.size()), writes.data(),
+                    0, nullptr);
+            }
+
+            // 4. 录制：inputs 屏障 → #ks → partial 屏障 → #kr → 输出屏障
+            auto cmd_r = acquire_cmd();
+            if (!cmd_r)
+            {
+                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &ds_kr);
+                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &ds_ks);
+                NN_TRY_CHECK(cmd_r);
+            }
+            auto [cmd, owns_cmd] = *cmd_r;
+            std::vector<VkBuffer> in_bufs;
+            in_bufs.reserve(inputs.size());
+            for (const auto* b : inputs)
+                in_bufs.push_back(b->impl());
+            record_input_barriers(cmd, in_bufs);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ks_pipe.handle());
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                ks_pipe.pipeline_layout(), 0, 1, &ds_ks, 0, nullptr);
+            vkCmdPushConstants(cmd, ks_pipe.pipeline_layout(),
+                VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                static_cast<std::uint32_t>(pc_ks.size()), pc_ks.data());
+            {
+                constexpr std::uint32_t Bf = nn::EXPR_MATMUL_BLOCK_FINE;
+                const std::uint32_t m_per =
+                    rows32 / matmul_batch;
+                const std::uint32_t ks_valid =
+                    (k32 + ks_span - 1u) / ks_span;
+                // 只派发**有效段**（空段的 WG 会早退且不写部分和 → 派了也是
+                // 白跑）；x = 列块序号决定段号，与生成器 slice = wg.x / nx 同源
+                const std::uint32_t gx =
+                    ((cols32 + Bf - 1u) / Bf) * ks_valid;
+                const std::uint32_t gy = (m_per + Bf - 1u) / Bf;
+                // 段变体计时进同一 "fused_mm" 桶（#ks/#kr 两行与原单发同维对账）
+                ts_dispatch(cmd, "fused_mm", gx, gy, matmul_batch, shader_name,
+                            nn::EXPR_MM_KSPLIT_SUFFIX);
+            }
+            record_output_barrier(cmd, partial.buffer().impl());
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, kr_pipe.handle());
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                kr_pipe.pipeline_layout(), 0, 1, &ds_kr, 0, nullptr);
+            vkCmdPushConstants(cmd, kr_pipe.pipeline_layout(),
+                VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                static_cast<std::uint32_t>(pc_kr.size()), pc_kr.data());
+            ts_dispatch(cmd, "fused_mm", (count + 256u - 1u) / 256u, 1u, 1u,
+                        shader_name, nn::EXPR_MM_KSPLIT_REDUCE_SUFFIX);
+            record_output_barrier(cmd, output.buffer().impl());
+
+            // 5. 提交（独立模式等待后两个描述符集均可回收；批量模式由帧池
+            //    reset 统一回收，与既有路径一致）
+            if (owns_cmd)
+            {
+                auto r = submit_and_wait(cmd, ds_ks);
+                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &ds_kr);
+                NN_TRY_CHECK(r);
+            }
+            if (profile_ops_enabled())
+            {
+                const long long dt = std::chrono::duration_cast<
+                    std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - prof_t0).count();
+                std::fprintf(stderr,
+                    "[gpu-profile] fused fold=0 out=%u total=%lldus key=%.16s ks\n",
+                    static_cast<std::uint32_t>(cols), dt, shader_name.c_str());
+            }
+            return output;
         }
 
         // 2. 分配描述符集（N 输入 + 1 输出；分派变体 = 2N + 2；extras 追加 k 个输出）
@@ -3964,14 +4390,18 @@ public:
         // 与生成器 l/wb/col 结构及 OP 级 reduce.comp 契约同源）；
         // matmul 分块 = (ceil(cols/BLOCK), ceil(m_per/BLOCK), matmul_batch)，
         // BLOCK 与 glsl_gen 生成的输出块一致（EXPR_MATMUL_BLOCK=64：每工作组
-        // 64×64 输出块、16×16 线程、每线程 4×4 寄存器分块）
+        // 64×64 输出块、16×16 线程、每线程 4×4 寄存器分块；网格饥饿时的
+        // 细 tile 变体 BLOCK=EXPR_MATMUL_BLOCK_FINE=16，见上方 use_fine）
         const std::uint32_t vec_width = fused_vec_width_.count(shader_name)
             ? fused_vec_width_.at(shader_name) : 1u;
         if (has_mm && raxis < 0 && !is_fold)
         {
+            // P0 细 tile：use_fine 时输出块 64 → 16（同一 struct 的两个变体，
+            // 只是网格粒度；生成器同源，见 EXPR_MATMUL_BLOCK_FINE）
+            const std::uint32_t mm_block = use_fine
+                ? nn::EXPR_MATMUL_BLOCK_FINE : nn::EXPR_MATMUL_BLOCK;
             const std::uint32_t wg_x =
-                (static_cast<std::uint32_t>(cols) + nn::EXPR_MATMUL_BLOCK - 1u)
-                / nn::EXPR_MATMUL_BLOCK;
+                (static_cast<std::uint32_t>(cols) + mm_block - 1u) / mm_block;
             // batch：dispatch z = 批次，A/B 按 batch 垂直切分 → y 只覆盖
             // **批内**行 m_per = rows/mm_batch（生成器 main/load_tiles 均以 m_per
             // 为界、写回守卫 rr < m_per）。按总 rows 派 y 会把 batch 在 y/z 数
@@ -3980,10 +4410,11 @@ public:
             // batch*M 按契约整除。
             const std::uint32_t rows_u = static_cast<std::uint32_t>(rows);
             const std::uint32_t m_per  = rows_u / matmul_batch;
-            const std::uint32_t wg_y =
-                (m_per + nn::EXPR_MATMUL_BLOCK - 1u) / nn::EXPR_MATMUL_BLOCK;
+            const std::uint32_t wg_y = (m_per + mm_block - 1u) / mm_block;
             // batch：dispatch z = 批次，A/B 按 batch 垂直切分
-            ts_dispatch(cmd, "fused_mm", wg_x, wg_y, matmul_batch);
+            ts_dispatch(cmd, "fused_mm", wg_x, wg_y, matmul_batch,
+                        shader_name,
+                        use_fine ? nn::EXPR_MM_FINE_SUFFIX : nullptr);
         }
         else
         {
@@ -4001,7 +4432,7 @@ public:
                 : (raxis == 0) ? static_cast<std::uint32_t>(rows)
                 : (raxis == 1) ? (static_cast<std::uint32_t>(cols) + 31u) / 32u
                 : (count + 256u * vec_width - 1u) / (256u * vec_width);
-            ts_dispatch(cmd, "fused", wg_count, 1, 1);
+            ts_dispatch(cmd, "fused", wg_count, 1, 1, shader_name);
         }
         record_output_barrier(cmd, output.buffer().impl());
         // P2 多输出：额外输出同样过写后屏障
@@ -4226,7 +4657,8 @@ public:
         // （vec_width=1，与生成器同源）
         const std::uint32_t wg_x = (max_count + 255u) / 256u;
         ts_dispatch(cmd, "fused_b", wg_x,
-                    static_cast<std::uint32_t>(instances.size()), 1);
+                    static_cast<std::uint32_t>(instances.size()), 1,
+                    shader_name);
 
         // 输出屏障（主输出 + 全部 extras，去重）：组内输出互不重叠（引擎保证）
         {

@@ -183,7 +183,7 @@ void test_transpose_variants()
     const std::string k01 = run(false, true);
     const std::string k10 = run(true, false);
     const std::string k11 = run(true, true);
-    // 契约（2026-10-01 起）：transA/transB 是**运行期 operand layout**、不进 key
+    // 契约：transA/transB 是**运行期 operand layout**、不进 key
     // → 4 种转置组合共享同一个融合 shader（GPU 端经 PC `mm_trans` 的两条加载
     // 路径 + uniform 分支选择）。数值正确性由上面 4 次 eval_expr vs eng.matmul
     // 对拍保证；这里锁死"key 必须相同"，防止转置被重新折回结构。

@@ -384,6 +384,131 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     return true;
 }
 
+// ── 尾逐元素链：eval_tail(mm, row, col, batch) 函数体（GLSL 内联发射）────
+// row 为 batch 内行号（全局行 = batch*m_per + row），与 Row 操作数一致。
+// matmul 融合 shader（generate_glsl_matmul，K 循环后逐输出调用）与 K 切分
+// 伴生归约 shader（generate_glsl_matmul_ksplit_reduce，**跨段求和之后**逐
+// 输出调用）共用同一条尾链——两者的输入绑定/PC 布局同源（rows/mm_batch/
+// cols/vp/consts/rparams），故 #ks 只写部分和、#kr 才跑尾链（尾链非线性，
+// 不能逐段先跑再加）。n_inputs = 原结构输入数（跳过 A/B 槽）。
+inline void glsl_emit_matmul_tail_fn(std::ostringstream& L, const ExprSpec& spec,
+                                     ExprPrecSig sig, std::size_t n_inputs)
+{
+    const std::size_t last_dst = spec.instrs.empty()
+        ? 0u : spec.instrs.back().dst;
+    L << "float eval_tail(float mm, uint row, uint col, uint batch)\n{\n";
+    if (!spec.instrs.empty())
+    {
+        const auto operand = [&](const ExprOperand& op) -> std::string
+        {
+            switch (op.kind)
+            {
+            default:
+            case static_cast<uint8_t>(ExprOperandKind::Matmul):
+                return "mm";
+            case static_cast<uint8_t>(ExprOperandKind::Input):
+                return "v" + std::to_string(op.idx);
+            case static_cast<uint8_t>(ExprOperandKind::Reg):
+            case static_cast<uint8_t>(ExprOperandKind::Fanout):
+                return "r" + std::to_string(op.idx);
+            case static_cast<uint8_t>(ExprOperandKind::Const):
+                return "c" + std::to_string(op.idx);
+            case static_cast<uint8_t>(ExprOperandKind::RParam):
+                return "rp" + std::to_string(op.idx);
+            case static_cast<uint8_t>(ExprOperandKind::Row):
+                return "float(row)";  // row 参数已是 batch 内行号
+            case static_cast<uint8_t>(ExprOperandKind::Col):
+                return "float(col)";
+            case static_cast<uint8_t>(ExprOperandKind::Batch):
+                return "float(batch)";
+            }
+        };
+        // 输入读取（跳过 matmul A/B 槽：其形状不是 (rows,cols) 网格）
+        // 行索引视图（Linear/RowBroadcast/RowMod/RotateHalf）必须用**全局行**
+        // grow = batch*m_per + row——CPU 参考（compute_cpu_engine read_input）
+        // 以全局行 r 索引 (rows,·) 全网格输入（如注意力 m/l 的 (BH·seq,1)）；
+        // Row 操作数保持 batch 内行号（上三角掩码 col > row 语义，CPU 端
+        // row() = r % m_per 一致）。
+        L << "    const uint m_per = rows / mm_batch;\n";
+        L << "    const uint grow = batch * m_per + row;\n";
+        for (std::size_t i = 0; i < n_inputs; ++i)
+        {
+            if (i == spec.matmul->a_input || i == spec.matmul->b_input)
+                continue;
+            const std::uint32_t vp = glsl_vp_slot(spec, i);
+            L << "    const float v" << i << " = ";
+            const bool tail_f16 = sig != 0 && expr_prec_sig_in_f16(sig, i);
+            if (tail_f16) L << "float(";   // f16 读 → 显式转 f32（算术仍在 f32）
+            glsl_view_read(L, spec.views[i], static_cast<std::uint32_t>(i),
+                           "grow*cols + col", "grow", "col", vp, sig);
+            if (tail_f16) L << ")";
+            L << ";\n";
+        }
+        if (spec.num_regs > 0)
+        {
+            L << "    float r0";
+            for (std::uint32_t r = 1; r < spec.num_regs; ++r) L << ", r" << r;
+            L << ";\n";
+        }
+        for (const auto& ins : spec.instrs)
+        {
+            const ExprOp op = static_cast<ExprOp>(ins.op);
+            const std::string dst = "r" + std::to_string(ins.dst);
+            const std::string a = operand(ins.a);
+            switch (op)
+            {
+            case ExprOp::Add: case ExprOp::Sub: case ExprOp::Mul: case ExprOp::Div:
+            {
+                bool cmp = false;
+                const char* s = glsl_binary_op(op, cmp);
+                L << "    " << dst << " = " << a << " " << s << " "
+                  << operand(ins.b) << ";\n";
+                break;
+            }
+            case ExprOp::Max: case ExprOp::Min:
+            {
+                const char* s = (op == ExprOp::Max) ? "max" : "min";
+                L << "    " << dst << " = " << s << "(" << a << ", "
+                  << operand(ins.b) << ");\n";
+                break;
+            }
+            case ExprOp::Lt: case ExprOp::Le: case ExprOp::Gt:
+            case ExprOp::Ge: case ExprOp::Eq: case ExprOp::Ne:
+            {
+                bool cmp = false;
+                const char* s = glsl_binary_op(op, cmp);
+                L << "    " << dst << " = (" << a << " " << s << " "
+                  << operand(ins.b) << ") ? 1.0 : 0.0;\n";
+                break;
+            }
+            case ExprOp::Neg:
+                L << "    " << dst << " = -(" << a << ");\n";
+                break;
+            case ExprOp::Exp: case ExprOp::Log: case ExprOp::Sqrt:
+            case ExprOp::Rsqrt: case ExprOp::Abs: case ExprOp::Tanh:
+            {
+                const char* s = glsl_unary_op(op);
+                L << "    " << dst << " = " << s << "(" << a << ");\n";
+                break;
+            }
+            case ExprOp::Select:
+                L << "    " << dst << " = (" << a << " != 0.0) ? "
+                  << operand(ins.b) << " : " << operand(ins.c) << ";\n";
+                break;
+            default:
+                return;  // 归约指令：由 generate_glsl_reduce 处理 → 上层报错
+            }
+        }
+        L << "    return r" << last_dst << ";\n";
+    }
+    else
+    {
+        // 纯 matmul（无逐元素链）：输出 = matmul 结果
+        L << "    return mm;\n";
+    }
+    L << "}\n\n";
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  matmul 融合 shader 生成（matmul 参与融合 + 分块升级：融合分块矩阵乘法）
 //
@@ -410,12 +535,41 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
 //                      [float rp0..]；
 //      dispatch: (ceil(cols/BLOCK), ceil(rows/BLOCK), mm_batch)（见
 //      EXPR_MATMUL_TILE/BLOCK，后端 run_fused_gpu 与生成器共用）。
+//      细 tile 变体（block = EXPR_MATMUL_BLOCK_FINE = 16，键后缀 "#f"）：
+//      输出块 64² → 16²、local_size 16² → 8²、每线程 4×4 → **2×2（R=2）**
+//      ——网格仍 16×16 块（wgrad 形状 48 WG ≥ SM 数、摊满）、线程内 4 条
+//      独立 K 链（ILP）。共享/加载/写回公式全部由 B/T 参数化流出，逐输出
+//      元素的 K 累加序不变（逐 k 标量升序乘加 → 逐位一致）。R 的取舍与
+//      A/B 数据见 EXPR_MATMUL_BLOCK_FINE 注释（R=4 缩块/ R=1 都更差）。
 //    - 归约指令（RowSum/RowMax/...）出现在尾链时属归约组合，由
 //      generate_glsl_reduce 处理（本生成器遇到归约指令返回空 → 上层报错）。
+//    - K 切分变体（k_split = true，block = 细 tile 16，键后缀 "#ks"）：
+//      每 WG 只算 K 的一段 [slice·span, min((slice+1)·span, mm_k))，slice =
+//      gl_WorkGroupID.x / ceil(cols/BLOCK)（dispatch x = 列块数 × S）；PC 多
+//      一槽 `ks_span`（16 对齐 → 段界也是 16 的倍数，vec4 快路径的 k 连续
+//      判据 (kend&3)==0 成立）。**写回 = 原始部分和**（不跑尾链——尾链非
+//      线性，不能逐段先跑），落部分和缓冲 (S·rows, cols)，由伴生归约
+//      shader（generate_glsl_matmul_ksplit_reduce，键 "#kr"）跨段求和 + 跑
+//      尾链。段界替换了全部 k 上界守卫（kend 取代 mm_k）：非末段的上界是
+//      段界而非 mm_k，否则会把下一段的 k 拉进本段的部分和（静默错值）。
 // ═══════════════════════════════════════════════════════════════════════════
 [[nodiscard]] inline std::string generate_glsl_matmul(
-    const std::string& name, const ExprSpec& spec, ExprPrecSig sig = 0)
+    const std::string& name, const ExprSpec& spec, ExprPrecSig sig = 0,
+    std::uint32_t block = EXPR_MATMUL_BLOCK, bool k_split = false)
 {
+    // block = 输出块每维元素数（64 = 默认 / 16 = 细 tile 变体 "#f"）。
+    // T 按 block 选：64 → 16 线程/维（R=4 = 4×4 vec4 寄存器分块）；
+    // 16 → 8 线程/维（R=2 = 2×2 标量分块，EXPR_MATMUL_TILE_FINE）。
+    // R = B/T = 每线程输出边长：R=2 在"网格摊满 SM（48 WG）"与"线程内
+    // ILP（4 条独立 K 链）"之间取甜点（实测见 EXPR_MATMUL_BLOCK_FINE 注释）。
+    // 其余 block 值无对应计算路径 → 拒绝。
+    if (block != EXPR_MATMUL_BLOCK && block != EXPR_MATMUL_BLOCK_FINE)
+        return {};
+    // K 切分变体（键 #ks）：仅细 tile 网格 + 仅 V0 全 f32（sig==0 覆盖分派
+    // 哨兵 0x20000）——资格判据与 fused_generate/运行期派发分支同源，
+    // 防御性拒绝与 PC 多槽/免尾链写回不相容的精度变体。
+    if (k_split && (block != EXPR_MATMUL_BLOCK_FINE || sig != 0))
+        return {};
     const MatmulSpec& mm = *spec.matmul;
     const std::size_t n_inputs = spec.views.size();
     const std::uint32_t a_slot = mm.a_input;
@@ -438,14 +592,22 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     const bool a_f16 = sign_f16 && expr_prec_sig_in_f16(sig, a_slot);
     const bool b_f16 = sign_f16 && expr_prec_sig_in_f16(sig, b_slot);
     const bool out_f16 = sign_f16 && expr_prec_sig_out_f16(sig);
-    constexpr std::uint32_t T = EXPR_MATMUL_TILE;    // 线程（16）
-    constexpr std::uint32_t B = EXPR_MATMUL_BLOCK;   // 输出块（64）
+    // T 按 block 选（见函数头注释）；B = block；R = B/T = 每线程输出边长。
+    // 全部下游公式（local_size、VPT、共享维度 B/4、块锚 wg×B、写回）均以
+    // T/B 为参 → 两个变体共用同一份生成代码，只有网格粒度与寄存器分块不同。
+    const std::uint32_t B = block;             // 输出块每维（64 或 16）
+    const std::uint32_t T = (B == EXPR_MATMUL_BLOCK)
+        ? EXPR_MATMUL_TILE : EXPR_MATMUL_TILE_FINE;   // 16 或 8
+    const std::uint32_t R = B / T;             // 每线程输出边长（4 或 2）
     // BK 取值：16 + 双缓冲（16KB 共享）——同参数四点交错 A/B 全点最优
     // （结论见头注释 trade-off 段）。
     constexpr std::uint32_t BK = 16;                 // K 分块宽度
-    constexpr std::uint32_t BK4 = BK / 4;            // vec4 数/行（8）
-    // 每线程协作加载 vec4 数/矩阵（B×BK4 slots / 256 线程）
-    constexpr std::uint32_t VPT = (B * BK4) / (T * T);  // BK=16 → 1
+    constexpr std::uint32_t BK4 = BK / 4;            // vec4 数/行（4）
+    // 每线程协作加载 vec4 数/矩阵（B×BK4 slots / T² 线程）：R=4 → 1；
+    // R=2 → 1（64 slots = 64 线程，恰满）；为 0 时凑 1 并由 e < tile_v4 守卫。
+    const std::uint32_t vpt_raw = (B * BK4) / (T * T);
+    const std::uint32_t VPT = vpt_raw > 0u ? vpt_raw : 1u;
+    const std::uint32_t tile_v4 = B * BK4;   // tile 的 vec4 总数（256 / 64）
 
     std::ostringstream L;
     L << "// ── 自动生成（AOT 算子融合 · matmul 分块 4×4 双缓冲），请勿手动编辑 ──\n";
@@ -531,6 +693,9 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     L << "    uint mm_k;      // matmul 求和维度（形状参数，运行时填充）\n";
     L << "    uint mm_batch;  // matmul 批量数（形状参数，运行时填充；dispatch z）\n";
     L << "    uint mm_trans;  // bit0=transA, bit1=transB（运行期 operand layout，不进 key）\n";
+    if (k_split)
+        L << "    uint ks_span;   // K 切分段宽（段 k 上界 = 段起点 + 本槽；后端保证 "
+             "16 对齐 → vec4 快路径 k 连续判据成立）\n";
     if (disp)
         L << "    uint prec;      // 运行期精度分派位（bit i=输入 i 为 f16，bit16=输出）\n";
     const std::uint32_t n_vp = expr_spec_runtime_view_param_count(spec);
@@ -591,121 +756,8 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
         return b_f16 ? ("float(" + raw + ")") : raw;
     };
 
-    // ── 尾逐元素链：eval_tail(mm, row, col, batch) 函数（GLSL 内联）──
-    // row 为 batch 内行号（全局行 = batch*m_per + row），与 Row 操作数一致。
-    const std::uint32_t last_dst = spec.instrs.empty()
-        ? 0u : spec.instrs.back().dst;
-    L << "float eval_tail(float mm, uint row, uint col, uint batch)\n{\n";
-    if (!spec.instrs.empty())
-    {
-        const auto operand = [&](const ExprOperand& op) -> std::string
-        {
-            switch (op.kind)
-            {
-            default:
-            case static_cast<uint8_t>(ExprOperandKind::Matmul):
-                return "mm";
-            case static_cast<uint8_t>(ExprOperandKind::Input):
-                return "v" + std::to_string(op.idx);
-            case static_cast<uint8_t>(ExprOperandKind::Reg):
-            case static_cast<uint8_t>(ExprOperandKind::Fanout):
-                return "r" + std::to_string(op.idx);
-            case static_cast<uint8_t>(ExprOperandKind::Const):
-                return "c" + std::to_string(op.idx);
-            case static_cast<uint8_t>(ExprOperandKind::RParam):
-                return "rp" + std::to_string(op.idx);
-            case static_cast<uint8_t>(ExprOperandKind::Row):
-                return "float(row)";  // row 参数已是 batch 内行号
-            case static_cast<uint8_t>(ExprOperandKind::Col):
-                return "float(col)";
-            case static_cast<uint8_t>(ExprOperandKind::Batch):
-                return "float(batch)";
-            }
-        };
-        // 输入读取（跳过 matmul A/B 槽：其形状不是 (rows,cols) 网格）
-        // 行索引视图（Linear/RowBroadcast/RowMod/RotateHalf）必须用**全局行**
-        // grow = batch*m_per + row——CPU 参考（compute_cpu_engine read_input）
-        // 以全局行 r 索引 (rows,·) 全网格输入（如注意力 m/l 的 (BH·seq,1)）；
-        // Row 操作数保持 batch 内行号（上三角掩码 col > row 语义，CPU 端
-        // row() = r % m_per 一致）。
-        L << "    const uint m_per = rows / mm_batch;\n";
-        L << "    const uint grow = batch * m_per + row;\n";
-        for (std::size_t i = 0; i < n_inputs; ++i)
-        {
-            if (i == a_slot || i == b_slot)
-                continue;
-            const std::uint32_t vp = glsl_vp_slot(spec, i);
-            L << "    const float v" << i << " = ";
-            const bool tail_f16 = sign_f16 && expr_prec_sig_in_f16(sig, i);
-            if (tail_f16) L << "float(";   // f16 读 → 显式转 f32（算术仍在 f32）
-            glsl_view_read(L, spec.views[i], static_cast<std::uint32_t>(i),
-                           "grow*cols + col", "grow", "col", vp, sig);
-            if (tail_f16) L << ")";
-            L << ";\n";
-        }
-        if (spec.num_regs > 0)
-        {
-            L << "    float r0";
-            for (std::uint32_t r = 1; r < spec.num_regs; ++r) L << ", r" << r;
-            L << ";\n";
-        }
-        for (const auto& ins : spec.instrs)
-        {
-            const ExprOp op = static_cast<ExprOp>(ins.op);
-            const std::string dst = "r" + std::to_string(ins.dst);
-            const std::string a = operand(ins.a);
-            switch (op)
-            {
-            case ExprOp::Add: case ExprOp::Sub: case ExprOp::Mul: case ExprOp::Div:
-            {
-                bool cmp = false;
-                const char* s = glsl_binary_op(op, cmp);
-                L << "    " << dst << " = " << a << " " << s << " "
-                  << operand(ins.b) << ";\n";
-                break;
-            }
-            case ExprOp::Max: case ExprOp::Min:
-            {
-                const char* s = (op == ExprOp::Max) ? "max" : "min";
-                L << "    " << dst << " = " << s << "(" << a << ", "
-                  << operand(ins.b) << ");\n";
-                break;
-            }
-            case ExprOp::Lt: case ExprOp::Le: case ExprOp::Gt:
-            case ExprOp::Ge: case ExprOp::Eq: case ExprOp::Ne:
-            {
-                bool cmp = false;
-                const char* s = glsl_binary_op(op, cmp);
-                L << "    " << dst << " = (" << a << " " << s << " "
-                  << operand(ins.b) << ") ? 1.0 : 0.0;\n";
-                break;
-            }
-            case ExprOp::Neg:
-                L << "    " << dst << " = -(" << a << ");\n";
-                break;
-            case ExprOp::Exp: case ExprOp::Log: case ExprOp::Sqrt:
-            case ExprOp::Rsqrt: case ExprOp::Abs: case ExprOp::Tanh:
-            {
-                const char* s = glsl_unary_op(op);
-                L << "    " << dst << " = " << s << "(" << a << ");\n";
-                break;
-            }
-            case ExprOp::Select:
-                L << "    " << dst << " = (" << a << " != 0.0) ? "
-                  << operand(ins.b) << " : " << operand(ins.c) << ";\n";
-                break;
-            default:
-                return {};  // 归约指令：由 generate_glsl_reduce 处理 → 上层报错
-            }
-        }
-        L << "    return r" << last_dst << ";\n";
-    }
-    else
-    {
-        // 纯 matmul（无逐元素链）：输出 = matmul 结果
-        L << "    return mm;\n";
-    }
-    L << "}\n\n";
+    // ── 尾逐元素链：eval_tail(mm, row, col, batch)（与 #kr 共用同一实现）──
+    glsl_emit_matmul_tail_fn(L, spec, sig, n_inputs);
 
     // ── load_tiles：协作加载 A/B 分块（BK×B）→ 指定 stage。双缓冲流水的
     //    发射端：前奏调 load_tiles(0,0)，主循环内 if (t+1<num_tiles)
@@ -722,10 +774,34 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     L << "    const uint batch = gl_WorkGroupID.z;\n";
     L << "    const uint m_per = rows / mm_batch;\n";
     L << "    const uint block_row = gl_WorkGroupID.y * " << B << "u;\n";
-    L << "    const uint block_col = gl_WorkGroupID.x * " << B << "u;\n";
+    // K 切分（键 #ks）：本 WG 的 K 段 [k_lo, kend)，slice = 列块序号
+    // （dispatch x = 列块数 × S）。⚠ 列块号必须是 **wg.x % nx**——slice>0 的
+    // wg.x ≥ nx，直接 ×B 会把列块推出 cols、写回被 cc<cols 守卫整块丢弃
+    // （slice≥1 部分和从未写出 → #kr 读池垃圾；K 切分首版 offload/探针
+    // FAIL 的根因）。非切分时 = wg.x/0 偏移退化为原式（编译期折叠）。
+    // 非切分时 k_lo/kend = 0/mm_k（编译期折叠为原式）。
+    // ⚠ vec4 快路径的 (kend&3)==0 判据由后端的 span 16 对齐保证（非末段
+    // 段界必是 16 倍数；末段 = mm_k，回原判据）。
+    if (k_split)
+    {
+        L << "    const uint nx = (cols + " << B << "u - 1u) / " << B << "u;\n";
+        L << "    const uint block_col = (gl_WorkGroupID.x % nx) * " << B << "u;\n";
+        L << "    const uint k_lo = (gl_WorkGroupID.x / nx) * ks_span;\n";
+        L << "    const uint kend = k_lo + ks_span < mm_k ? k_lo + ks_span : mm_k;\n";
+    }
+    else
+    {
+        L << "    const uint block_col = gl_WorkGroupID.x * " << B << "u;\n";
+        L << "    const uint k_lo = 0u;\n";
+        L << "    const uint kend = mm_k;\n";
+    }
     L << "    for (uint l = 0u; l < " << VPT << "u; ++l)\n";
     L << "    {\n";
     L << "    const uint e = tid * " << VPT << "u + l;\n";
+    // 细 tile（R=2，64 线程）：vec4 总数 = B×BK4 = 64，e = tid ∈[0,64)
+    // 恰好全载（守卫兜底）；R=4（256 线程）时 tile_v4=256 守卫恒真、
+    // 编译期消除——两变体共用同一条发射路径。
+    L << "    if (e >= " << tile_v4 << "u) continue;\n";
     // A 的两条加载路径**都发射**，运行时按 mm_trans bit0 选择（转置是运行期
     //    operand layout，不进 key）。两条路径的共享槽位写入集合相同。
     L << "    if ((mm_trans & 1u) != 0u)   // transA: A 存 (K,M)\n";
@@ -733,17 +809,17 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     {
         // A 存 (K,M)：沿行连续 → vec4 整读 4 行同 k，直写共享
         L << "    const uint kAL = e / " << (B / 4u) << "u;\n";
-        L << "    const uint kAG = t * " << BK << "u + kAL;\n";
+        L << "    const uint kAG = k_lo + t * " << BK << "u + kAL;\n";
         L << "    const uint mA4 = e % " << (B / 4u) << "u;\n";
         L << "    const uint arG = block_row + mA4 * 4u;\n";
         L << "    if (" << (vec4_ok ? "((m_per & 3u) == 0u)" : "false")
-          << " && kAG < mm_k && arG < m_per)\n";
+          << " && kAG < kend && arG < m_per)\n";
         L << "    {\n";
         L << "        Ash[stage][kAL][mA4] = "
           << vec4_load(a_slot, "(((" + a_blk + "*mm_k + (kAG))*m_per + (arG))) >> 2") << ";\n";
         L << "    }\n    else\n    {\n";
         L << "        for (uint j = 0u; j < 4u; ++j)\n        {\n";
-        L << "            const float v = (arG + j < m_per && kAG < mm_k) ? "
+        L << "            const float v = (arG + j < m_per && kAG < kend) ? "
           << a_load("arG + j", "kAG", true) << " : 0.0;\n";
         L << "            Ash[stage][kAL][mA4][j] = v;\n";
         L << "        }\n    }\n";
@@ -752,11 +828,17 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     {
         // A 行主序：沿 k 连续 → vec4 散写 4 个共享行（op 级 k_contig 同构）
         L << "    const uint kAL = (e % " << BK4 << "u) * 4u;\n";
-        L << "    const uint kAG = t * " << BK << "u + kAL;\n";
+        L << "    const uint kAG = k_lo + t * " << BK << "u + kAL;\n";
         L << "    const uint arT = e / " << BK4 << "u;\n";
         L << "    const uint arG = block_row + arT;\n";
-        L << "    if (" << (vec4_ok ? "((mm_k & 3u) == 0u)" : "false")
-          << " && arG < m_per && kAG < mm_k)\n";
+        // ⚠ vec4 快路径双重对齐判据：(kend&3)==0 保证段内 k 连续
+        // （kAG..kAG+3 < 段界），(mm_k&3)==0 保证**行基对齐**——该路径的
+        // 别名索引 = grow*mm_k + kAG（>>2），行跨度是 mm_k：K 非 4 倍数时
+        // （如 vocab=257 的 dgrad）只查 kend 会把跨行错位的 vec4 当连续读
+        // （K 切分首版实测 offload 一致性测试全挂的根因）。非切分时
+        // kend==mm_k → 与原判据等价。
+        L << "    if (" << (vec4_ok ? "((mm_k & 3u) == 0u && (kend & 3u) == 0u)" : "false")
+          << " && arG < m_per && kAG < kend)\n";
         L << "    {\n";
         L << "        const vec4 v = "
           << vec4_load(a_slot, "(((" + a_blk + "*m_per + (arG))*mm_k + (kAG))) >> 2") << ";\n";
@@ -766,7 +848,7 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
         L << "        Ash[stage][kAL + 3u][arT >> 2][arT & 3u] = v.w;\n";
         L << "    }\n    else\n    {\n";
         L << "        for (uint j = 0u; j < 4u; ++j)\n        {\n";
-        L << "            const float v = (arG < m_per && kAG + j < mm_k) ? "
+        L << "            const float v = (arG < m_per && kAG + j < kend) ? "
           << a_load("arG", "kAG + j", false) << " : 0.0;\n";
         L << "            Ash[stage][kAL + j][arT >> 2][arT & 3u] = v;\n";
         L << "        }\n    }\n";
@@ -778,11 +860,13 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     {
         // B 存 (N,K)：沿 k 连续 → vec4 散写 4 个共享行
         L << "    const uint kBL = (e % " << BK4 << "u) * 4u;\n";
-        L << "    const uint kBG = t * " << BK << "u + kBL;\n";
+        L << "    const uint kBG = k_lo + t * " << BK << "u + kBL;\n";
         L << "    const uint nT = e / " << BK4 << "u;\n";
         L << "    const uint bcG = block_col + nT;\n";
-        L << "    if (" << (vec4_ok ? "((mm_k & 3u) == 0u)" : "false")
-          << " && bcG < cols && kBG < mm_k)\n";
+        // 同 A 行主序：别名索引 = 行*mm_k + kBG → 行基对齐要 (mm_k&3)==0，
+        // 段内 k 连续要 (kend&3)==0（两者缺一即错读；非切分时等价原判据）
+        L << "    if (" << (vec4_ok ? "((mm_k & 3u) == 0u && (kend & 3u) == 0u)" : "false")
+          << " && bcG < cols && kBG < kend)\n";
         L << "    {\n";
         L << "        const vec4 v = "
           << vec4_load(b_slot, "(((" + b_blk + "*cols + (bcG))*mm_k + (kBG))) >> 2") << ";\n";
@@ -790,7 +874,7 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
         L << "            Bsh[stage][kBL + j][nT >> 2][nT & 3u] = v[j];\n";
         L << "    }\n    else\n    {\n";
         L << "        for (uint j = 0u; j < 4u; ++j)\n        {\n";
-        L << "            const float v = (bcG < cols && kBG + j < mm_k) ? "
+        L << "            const float v = (bcG < cols && kBG + j < kend) ? "
           << b_load("bcG", "kBG + j", true) << " : 0.0;\n";
         L << "            Bsh[stage][kBL + j][nT >> 2][nT & 3u] = v;\n";
         L << "        }\n    }\n";
@@ -799,17 +883,17 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     {
         // B (K,N) 行主序：沿列连续 → vec4 整读 4 列同 k，直写共享
         L << "    const uint kBL = e / " << (B / 4u) << "u;\n";
-        L << "    const uint kBG = t * " << BK << "u + kBL;\n";
+        L << "    const uint kBG = k_lo + t * " << BK << "u + kBL;\n";
         L << "    const uint nB4 = e % " << (B / 4u) << "u;\n";
         L << "    const uint bcG = block_col + nB4 * 4u;\n";
         L << "    if (" << (vec4_ok ? "((cols & 3u) == 0u)" : "false")
-          << " && kBG < mm_k && bcG < cols)\n";
+          << " && kBG < kend && bcG < cols)\n";
         L << "    {\n";
         L << "        Bsh[stage][kBL][nB4] = "
           << vec4_load(b_slot, "(((" + b_blk + "*mm_k + (kBG))*cols + (bcG))) >> 2") << ";\n";
         L << "    }\n    else\n    {\n";
         L << "        for (uint j = 0u; j < 4u; ++j)\n        {\n";
-        L << "            const float v = (kBG < mm_k && bcG + j < cols) ? "
+        L << "            const float v = (kBG < kend && bcG + j < cols) ? "
           << b_load("bcG + j", "kBG", false) << " : 0.0;\n";
         L << "            Bsh[stage][kBL][nB4][j] = v;\n";
         L << "        }\n    }\n";
@@ -826,17 +910,44 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     L << "    const uint batch = gl_WorkGroupID.z;   // 批次下标\n";
     L << "    const uint m_per = rows / mm_batch;    // 每批输出行数\n";
     L << "    const uint block_row = gl_WorkGroupID.y * " << B << "u;\n";
-    L << "    const uint block_col = gl_WorkGroupID.x * " << B << "u;\n";
-    // 4×4 寄存器累加器（本线程负责 16 个输出元素；vec4 acc[i] = 第 i 行的
-    // 4 列 → 内层每 k 4 条 VFMA.128，尾链 acc[i][j] 索引语义不变）
-    L << "    vec4 acc[4];\n";
-    L << "    for (uint i = 0u; i < 4u; ++i)\n";
-    L << "        acc[i] = vec4(0.0);\n";
+    // K 切分（键 #ks）：本 WG 只算 K 段 [k_lo, kend)，slice = 列块序号。
+    // 空段（k_lo ≥ mm_k，段宽 16 对齐 + 段数非整除时可能）整 WG 早退——
+    // 段号只依赖 gl_WorkGroupID → WG 内 uniform，早退先于一切 barrier 安全。
+    // ⚠ 列块 = **wg.x % nx**（slice>0 的 wg.x 直接 ×B 会越界丢写——见
+    // load_tiles 同款注释）。
+    if (k_split)
+    {
+        L << "    const uint nx = (cols + " << B << "u - 1u) / " << B << "u;\n";
+        L << "    const uint slice = gl_WorkGroupID.x / nx;\n";
+        L << "    const uint block_col = (gl_WorkGroupID.x % nx) * " << B << "u;\n";
+        L << "    const uint k_lo = slice * ks_span;\n";
+        L << "    const uint kend = k_lo + ks_span < mm_k ? k_lo + ks_span : mm_k;\n";
+        L << "    if (k_lo >= mm_k) return;\n";
+    }
+    else
+    {
+        L << "    const uint block_col = gl_WorkGroupID.x * " << B << "u;\n";
+        L << "    const uint k_lo = 0u;\n";
+        L << "    const uint kend = mm_k;\n";
+    }
+    // 累加器：R=4 → vec4 acc[4]（16 输出/线程，每 k 4 条 VFMA.128）；
+    // R=2 → 4 个标量（2×2 输出/线程，4 条独立 K 链 = 线程内 ILP）。
+    // 两者每输出都是逐 k 标量升序乘加 → 累加序一致（逐位一致）。
+    if (R == 2)
+    {
+        L << "    float a00 = 0.0, a01 = 0.0, a10 = 0.0, a11 = 0.0;\n";
+    }
+    else
+    {
+        L << "    vec4 acc[4];\n";
+        L << "    for (uint i = 0u; i < 4u; ++i)\n";
+        L << "        acc[i] = vec4(0.0);\n";
+    }
 
     // 前奏：加载 tile 0 → stage 0；此后每迭代发射 t+1 的加载（stage^1），
     // 与 tile t 的计算并行，单 barrier 收口（与 matmul_tiled.comp v2 同构：
     // 暴露的全局加载延迟被 tile t 的计算覆盖）
-    L << "    const uint num_tiles = (mm_k + " << BK - 1 << "u) / " << BK << "u;\n";
+    L << "    const uint num_tiles = (kend - k_lo + " << BK - 1 << "u) / " << BK << "u;\n";
     L << "    load_tiles(0u, 0u);\n";
     L << "    barrier();\n";
     L << "    uint stage = 0u;\n";
@@ -847,6 +958,26 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     L << "            load_tiles(t + 1u, nstage);\n";
     // 内层：每 k 读 2 个 vec4（Ash[k][ty] = 4 行、Bsh[k][tx] = 4 列）+ 4
     // VFMA.128（op 级 matmul_tiled 同款；同槽广播读无 bank 冲突）
+    if (R == 2)
+    {
+        // R=2：行对 ty*2、ty*2+1 → 共享行组 (ty*2)>>2 = ty>>1、组内基
+        // (ty*2)&3 = (ty&1)*2；列对同构。每 k：2 次 vec4 LDS + 4 标量 FMA。
+        L << "        for (uint k = 0u; k < " << BK << "u; ++k)\n";
+        L << "        {\n";
+        L << "            const vec4 av = Ash[stage][k][ty >> 1u];\n";
+        L << "            const vec4 bv = Bsh[stage][k][tx >> 1u];\n";
+        L << "            const float ar0 = av[(ty & 1u) * 2u];\n";
+        L << "            const float ar1 = av[(ty & 1u) * 2u + 1u];\n";
+        L << "            const float bc0 = bv[(tx & 1u) * 2u];\n";
+        L << "            const float bc1 = bv[(tx & 1u) * 2u + 1u];\n";
+        L << "            a00 += ar0 * bc0;\n";
+        L << "            a01 += ar0 * bc1;\n";
+        L << "            a10 += ar1 * bc0;\n";
+        L << "            a11 += ar1 * bc1;\n";
+        L << "        }\n";
+    }
+    else
+    {
     L << "        for (uint k = 0u; k < " << BK << "u; ++k)\n";
     L << "        {\n";
     L << "            const vec4 av = Ash[stage][k][ty];\n";
@@ -856,12 +987,60 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
     L << "            acc[2] += av.z * bv;\n";
     L << "            acc[3] += av.w * bv;\n";
     L << "        }\n";
+    }
     L << "        barrier();\n";
     L << "        stage = nstage;\n";
     L << "    }\n";
 
-    // ── 写回：16 个输出元素，各执行一次尾链（边界守卫；rr 全局行，
+    // ── 写回：各输出元素执行一次尾链（边界守卫；rr 全局行，
     //    eval_tail 的 row 参数 = batch 内行号）──
+    if (R == 2)
+    {
+        // R=2：2×2 每线程 4 输出（行 = ty*2+i、列 = tx*2+j）——
+        // 4 条独立 K 链 = 线程内 ILP，网格保持 16×16 块（48 WG 摊满 SM）
+        L << "    {\n";
+        L << "        const uint r0 = block_row + ty * 2u;\n";
+        L << "        const uint c0 = block_col + tx * 2u;\n";
+        L << "        const float accs[4] = float[4](a00, a01, a10, a11);\n";
+        L << "        for (uint i = 0u; i < 2u; ++i)\n";
+        L << "            for (uint j = 0u; j < 2u; ++j)\n";
+        L << "            {\n";
+        L << "                const uint rr = r0 + i;\n";
+        L << "                const uint cc = c0 + j;\n";
+        L << "                if (rr < m_per && cc < cols)\n";
+        if (k_split)
+        {
+            // #ks：写**原始部分和**到 (S·rows, cols) 部分和缓冲的段行
+            // slice*rows + grow（不跑尾链——尾链非线性，须在 #kr 跨段求和
+            // 之后统一执行）。k_split 恒 V0/f32（上方资格拒绝），无 disp/f16 分支。
+            L << "                    bout[(slice * rows + batch * m_per + rr) * cols + cc] =\n";
+            L << "                        accs[i * 2u + j];\n";
+        }
+        else if (disp)
+        {
+            L << "                {\n";
+            L << "                    const uint oi = (batch * m_per + rr) * cols + cc;\n";
+            L << "                    const float ev = "
+              << "eval_tail(accs[i * 2u + j], rr, cc, batch);\n";
+            L << "                    if ((prec >> 16u & 1u) != 0u)\n";
+            L << "                        bout16[oi] = " << glsl_f16_store("ev") << ";\n";
+            L << "                    else\n";
+            L << "                        bout[oi] = ev;\n";
+            L << "                }\n";
+        }
+        else
+        {
+            L << "                    bout[(batch * m_per + rr) * cols + cc] =\n";
+            L << "                        "
+              << (out_f16 ? glsl_f16_store("eval_tail(accs[i * 2u + j], rr, cc, batch)")
+                          : std::string("eval_tail(accs[i * 2u + j], rr, cc, batch)"))
+              << ";\n";
+        }
+        L << "            }\n";
+        L << "    }\n";
+    }
+    else
+    {
     L << "    #pragma unroll\n";
     L << "    for (uint i = 0u; i < 4u; ++i)\n";
     L << "        for (uint j = 0u; j < 4u; ++j)\n";
@@ -889,6 +1068,92 @@ inline bool glsl_vec4_eligible(const ExprSpec& spec)
           << ";\n";
     }
     L << "        }\n";
+    }
+    L << "}\n";
+    return L.str();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  K 切分伴生归约 shader 生成（键 = 结构 key + "#kr"）
+//
+//  K 切分变体（#ks，generate_glsl_matmul 的 k_split 分支）的第二段派发：
+//  读 (S·rows, cols) 部分和缓冲，按**段号升序左折**求和还原每输出元素的
+//  matmul 值，再跑与 V0/#ks 同一条尾链（glsl_emit_matmul_tail_fn 同源）
+//  写最终输出。
+//    - 绑定：0..N-1 = 原输入（尾链读）+ N = 部分和 + N+1 = 输出。
+//      注册行用「原 spec + 追加一个视图」的合成 spec（fused_generate）→
+//      num_bindings = (N+1)+1 = N+2，与本生成器逐槽同源。
+//    - PC 固定头 6 槽与 matmul 同布局（注册 has_matmul=1 → pc_base_fixed=6）：
+//      {count, cols, rows, **ks_slices（复用 mm_k 槽位置）**, mm_batch,
+//      mm_trans} + vp… + c… + rp…；#kr 不读 mm_trans（后端填 0）。
+//      尾链读 rows/mm_batch/cols/vp/consts/rparams——与 #ks 同一 PC 形态，
+//      故两者元数据（vp/rp/consts 计数）共用基础结构。
+//    - 网格：local_size 256、每线程一个输出元素，dispatch = ceil(count/256)
+//      （与 run_fused_gpu 的 kr 分支同源）。
+//    - 求和序 = 段升序左折（确定性）。**与未切分的逐 k 串联不逐位一致**
+//      （浮点加法不结合）→ 移动 GPU 字节锚；裁定放行（torch 文档同样不保证
+//      数学等价计算逐位一致，见 history「K 切分」条）。
+// ═══════════════════════════════════════════════════════════════════════════
+[[nodiscard]] inline std::string generate_glsl_matmul_ksplit_reduce(
+    const std::string& name, const ExprSpec& spec, ExprPrecSig sig = 0)
+{
+    // 资格 = 与 #ks/细 tile 同源：纯 matmul、无 fold、raxis<0、V0 全 f32、
+    // 无 extras（多输出结构不产 K 切分变体）。防御性拒绝，返回空 → 上层
+    // [skip]，运行期留在细 tile 路径（降级，不是错误）。
+    if (sig != 0 || spec.fold || !spec.matmul ||
+        expr_spec_reduce_axis(spec) != -1 || !spec.extras.empty())
+        return {};
+    const std::size_t n_inputs = spec.views.size();
+    if (n_inputs + 2 > EXPR_MAX_INPUTS + 2)
+        return {};
+
+    std::ostringstream L;
+    L << "// ── 自动生成（AOT 算子融合 · matmul K 切分二次归约），请勿手动编辑 ──\n";
+    L << "// 表达式: " << name << "   [K 切分归约 #kr：段升序求和 + 尾链]\n";
+    L << "#version 450\n\n";
+    L << "layout(local_size_x = 256) in;\n\n";
+    for (std::size_t i = 0; i < n_inputs; ++i)
+        L << "layout(std430, binding = " << i << ") readonly buffer Buf" << i
+          << " { float b" << i << "[]; };\n";
+    L << "layout(std430, binding = " << n_inputs
+      << ") readonly buffer BufPart { float bpart[]; };\n";
+    L << "layout(std430, binding = " << (n_inputs + 1)
+      << ") writeonly buffer BufOut { float bout[]; };\n";
+    L << "\n";
+    // 分组归约视图辅助（尾链含 GroupedReduce 视图时需要；纯 Linear 时为空）
+    glsl_emit_grouped_reduce_helpers(L, spec, sig, /*f16_native=*/false);
+    L << "layout(push_constant) uniform PC {\n";
+    L << "    uint count;\n";
+    L << "    uint cols;\n";
+    L << "    uint rows;\n";
+    L << "    uint ks_slices;  // 有效段数 V = ceil(mm_k/span)（后端在 mm_k 槽位填入；"
+         "空段不派发也不参与求和）\n";
+    L << "    uint mm_batch;   // 批量数（m_per = rows / mm_batch）\n";
+    L << "    uint mm_trans;   // 占位（matmul 同布局固定头；#kr 不读）\n";
+    const std::uint32_t n_vp = expr_spec_runtime_view_param_count(spec);
+    for (std::uint32_t i = 0; i < n_vp; ++i)
+        L << "    uint vp" << i << ";\n";
+    for (std::size_t i = 0; i < spec.consts.size(); ++i)
+        L << "    float c" << i << ";\n";
+    for (std::size_t i = 0; i < spec.rparams.size(); ++i)
+        L << "    float rp" << i << ";\n";
+    L << "};\n\n";
+    // 同一条尾链（在跨段求和之后执行）
+    glsl_emit_matmul_tail_fn(L, spec, sig, n_inputs);
+
+    L << "void main()\n{\n";
+    L << "    const uint gi = gl_GlobalInvocationID.x;\n";
+    L << "    if (gi >= count) return;\n";
+    L << "    const uint m_per = rows / mm_batch;\n";
+    L << "    const uint grow = gi / cols;   // 全局行（batch*m_per + rr）\n";
+    L << "    const uint col = gi - grow * cols;\n";
+    L << "    const uint batch = grow / m_per;\n";
+    L << "    const uint rr = grow - batch * m_per;\n";
+    // 段号升序左折：acc = ((p0 + p1) + p2) + …（确定性；跨段序 ≠ 逐 k 序）
+    L << "    float acc = bpart[grow * cols + col];\n";
+    L << "    for (uint s = 1u; s < ks_slices; ++s)\n";
+    L << "        acc += bpart[(s * rows + grow) * cols + col];\n";
+    L << "    bout[gi] = eval_tail(acc, rr, col, batch);\n";
     L << "}\n";
     return L.str();
 }
@@ -942,7 +1207,7 @@ inline std::string generate_glsl_fold(const std::string& name, const ExprSpec& s
         if (expr_op_is_reduce(static_cast<ExprOp>(ins.op)))
             is_block_reduce[ins.dst] = 1;
 
-    // ── 归约输入内联（通用生成优化，2026-10-06）─────────────────────────
+    // ── 归约输入内联（通用生成优化）─────────────────────────
     // 块归约的元素源若**只被归约消费**（可沿 def 链传递），把其定义表达式
     // 逐 kb 重算、直接内联进归约循环——省掉 e{n}[BLOCK] 物化（动态下标私有
     // 数组在多数驱动落 local memory：实测 CE 的 logsumexp fold 因此慢 2.4×）
@@ -1313,6 +1578,11 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
     // OUTC_MAX 由单一事实源 FOLD_MAX_VEC 派生（1024/256=4；手写 4 会在
     //   抬高 FOLD_MAX_VEC 时让生成的 o[(dd-tid)/256] 静默越界）
     constexpr std::uint32_t OUTC_MAX = (FOLD_MAX_VEC + 255u) / 256u;
+    // vecacc 每线程累加器数（P2-2）：j 按 (j-jlo)%VA_ACC 分组拆掉单累加器
+    //   长链（旧版 256 次 FMA 串行依赖链卡住块间全部屏障）；与 4 路加载
+    //   流水同宽（加载组 = 累加组，尾循环同式）。求和序因此异于旧版左折叠
+    //   → GPU 字节锚移动（已立项批准）；CPU 左折叠不受影响，对拍走容差。
+    constexpr std::uint32_t VA_ACC = 4u;
     const std::size_t n_inputs = spec.views.size();
     const bool has_mm = f.matmul.has_value();
     // 带类型变体：f16 输入直读（读处 float() 转 f32——mm/vecacc/
@@ -1405,6 +1675,10 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
           << (256u / EXPR_FOLD_BLOCK) << "];\n";
         L << "shared float smm[" << EXPR_FOLD_BLOCK << "];\n";
     }
+    if (f.vecacc && !has_mm)
+        // vecacc 末尾跨线程列归约槽（每线程一槽，256 槽）；有 mm 段时复用
+        //   spart（块循环结束后空闲 → 零 shared 增长；注意力 fold 恒带 mm）
+        L << "shared float sva[256];\n";
 
     L << "void main()\n{\n";
     L << "    const uint tid = gl_LocalInvocationID.x;\n";
@@ -1446,12 +1720,23 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
         L << "      r" << static_cast<int>(s) << " = uintBitsToFloat(0x"
           << std::hex << bits << std::dec << "u);\n";
     }
-    // 行向量态（步进分片寄存器；初值恒 0——VecAccSpec 语义）
-    // 数组固定上界 OUTC_MAX=4（veclen ≤ FOLD_MAX_VEC=1024 → oi ≤ 3）
+    // 行向量态（P2-2 双形态）：
+    //   路径 B（0<vs≤256）热路径 = **标量累加器 ob0..**（恒寄存器）。动态
+    //   下标的 o[][] 若被驱动落到 local/scratch，每次累加的 RMW 是 GB 级
+    //   流量——实测把 o 全槽(16)缩放/初始化 + 标量累加换成数组后 fold
+    //   反慢 27%（P2-2 首版 A/B），故数组对路径 B **只作 finalize 接口**：
+    //   收尾各写一次 o[0][0]（下标常量），未初始化槽路径 B 从不读。
+    //   路径 A（vs>256）保留数组（dd 动态分片无法标量化），行首按可达分片
+    //   初始化（× VA_ACC 累加器；收尾崩叠进 [0]，finalize 只读 [0]）。
     if (f.vecacc)
     {
-        L << "      float o[" << OUTC_MAX << "];\n";
-        L << "      for (uint oi = 0u; oi < " << OUTC_MAX << "u; ++oi) o[oi] = 0.0;\n";
+        L << "      float o[" << OUTC_MAX << "][" << VA_ACC << "];\n";
+        L << "      if (vector_out > 256u) {\n";
+        L << "        for (uint oi = 0u; oi < " << OUTC_MAX << "u; ++oi)\n";
+        L << "          for (uint an = 0u; an < " << VA_ACC << "u; ++an) o[oi][an] = 0.0;\n";
+        L << "      }\n";
+        for (std::uint32_t t = 0; t < VA_ACC; ++t)
+            L << "      float ob" << t << " = 0.0;\n";
     }
 
     // ── 操作数 → GLSL 片段。ctx：'E'=链(j 上下文) 'R'=归约源(内层 j)
@@ -1487,9 +1772,11 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
             return "float(batch)";
         case static_cast<uint8_t>(ExprOperandKind::VecState):
         {
-            // finalize：dd 步进分片 → oi = (dd - tid)/256
+            // finalize：dd 步进分片 → oi = (dd - tid)/256；[0] = 崩叠后的
+            //   最终值（收尾段把 VA_ACC 个累加器求和进 [0]，路径 B 还多一道
+            //   跨线程列归约后写 [0]——finalize 只读 [0]）
             (void)ctx;
-            return "o[(dd - tid) / 256u]";
+            return "o[(dd - tid) / 256u][0]";
         }
         case static_cast<uint8_t>(ExprOperandKind::Input):
         {
@@ -1560,6 +1847,14 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
         L << "        const uint qt = row % m_per;\n";
         L << "        const uint valid = min(min(" << EXPR_FOLD_BLOCK
           << "u, fold_k - k0), (k0 > qt ? 0u : qt + 1u - k0));\n";
+        // 整块 skip（此前 tri_skip 只钳 valid、空块仍跑满全部 WG 屏障——本机
+        //   注意力 fwd 实测 (行,块) 的 1/4 命中空块）。恒等论证：空块必在
+        //   block0 之后，而 block0 恒 valid≥1 且含未屏蔽对角 j=qt（causal
+        //   不遮对角、doc 同位置同 id）→ 进入空块时 m 必为有限值，于是
+        //   旧版空块语义 = max(m, lowest)=m、α=exp(0)=1.0（FP 精确）、
+        //   l=l·1.0+0、o×1.0 全部逐位恒等 → 跳过与旧版逐位一致
+        //   （valid 只依赖 row/k0 → 全 WG 均匀，continue 路径一致无发散）。
+        L << "        if (valid == 0u) continue;   // 整块跳过（恒等，见上）\n";
     }
     else
     {
@@ -1605,28 +1900,53 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
     {
         if (chain.empty())
             return;
-        // 元素 j 循环：全量载入元素变量 ← shared、执行链、全量写回 + barrier
-        //   （对称全量读写免 live 分析；读到未初始化 shared 仅在 validate
-        //    漏网时发生且随即被覆盖——链读未定义由 def-before-use 静态拒）
+        // 元素 j 循环：**按读集载入、按写集存回**（不再是全元素寄存器对称
+        //   round-trip）。动机：注意力 chain1 实测 9 次 sreg 载入全为死加载
+        //   （全部覆写前载入 / 本段未用）、chain2 为 9 中 8 死——纯浪费
+        //   shared 读吞吐与发射。语义不变：① 首次访问为读的元素寄存器照旧
+        //   载入（def-before-use 仍由 validate 静态拒）；② 链内被写的照旧
+        //   存回；③ 未触达的不声明也不碰 → 出口处 shared 状态与旧版逐位一致
+        //   （旧版"读到未初始化 shared 仅在 validate 漏网时发生"的情形现在
+        //    连读都不发生，两者随后都被覆盖，无行为差）。
+        //   操作数按 kind 收集：Reg/Fanout/Reduce 在 'E' 上下文渲染为 r{n}
+        //   本地变量（其余渲染为 smm/视图/常量/网格/o[]，无需声明）；
+        //   未用的 b/c 默认 (Reg,0) 而寄存器 0 恒为行标量态 → 不会误判元素。
+        std::vector<bool> need_load(spec.num_regs, false);
+        std::vector<bool> wr(spec.num_regs, false);
+        const auto note_read = [&](const ExprOperand& op)
+        {
+            const bool as_local =
+                op.kind == static_cast<uint8_t>(ExprOperandKind::Reg) ||
+                op.kind == static_cast<uint8_t>(ExprOperandKind::Fanout) ||
+                op.kind == static_cast<uint8_t>(ExprOperandKind::Reduce);
+            if (as_local && is_elem[op.idx] && !wr[op.idx])
+                need_load[op.idx] = true;
+        };
+        for (const auto& ins : chain)
+        {
+            note_read(ins.a);
+            note_read(ins.b);
+            note_read(ins.c);
+            if (is_elem[ins.dst]) wr[ins.dst] = true;
+        }
         L << "        for (uint j = tid; j < valid; j += 256u) {\n";
         for (std::uint32_t r = 0; r < spec.num_regs; ++r)
-            if (is_elem[r])
-                L << "          float r" << r << " = sreg[" << eidx[r]
-                  << "][j];\n";
+        {
+            if (!is_elem[r] || (!need_load[r] && !wr[r]))
+                continue;
+            L << "          float r" << r;
+            if (need_load[r])
+                L << " = sreg[" << eidx[r] << "][j]";
+            L << ";\n";
+        }
         for (const auto& ins : chain)
         {
             const std::string dst = "r" + std::to_string(ins.dst);
             L << emit_assign(ins, dst, 'E', "j");
         }
         for (std::uint32_t r = 0; r < spec.num_regs; ++r)
-            if (is_elem[r])
-            {
-                bool written = false;
-                for (const auto& ins : chain)
-                    if (ins.dst == r) written = true;
-                if (written)
-                    L << "          sreg[" << eidx[r] << "][j] = r" << r << ";\n";
-            }
+            if (wr[r])
+                L << "          sreg[" << eidx[r] << "][j] = r" << r << ";\n";
         L << "        }\n";
         L << "        barrier();\n";
         chain.clear();
@@ -1647,10 +1967,15 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
                 // 归约本体（subgroup shuffle 蝶式，fold v2 吞吐路径）；
                 //   备选的"256 线程各串行扫 valid"有 64 级 shared 依赖链 ×256
                 //   冗余（探针量化占 fold ~11%），故取蝶式：
-                //   ① tid < BLOCK 的线程按 gl_SubgroupSize 步进各持若干 sreg
-                //      （flush 屏障已保证跨线程可见；subgroup0 恰好完整覆盖
-                //      [0, valid) 且不重不漏，任意 subgroup 尺寸成立）；
-                //   ② subgroup 内 shuffleDown 蝶式 log2 归约；lane0 落 sred[0]；
+                //   ① gather 收在 subgroup0（tid < gl_SubgroupSize）：subgroup0
+                //      以 gl_SubgroupSize 步进已完整覆盖 [0, valid) 且不重不漏
+                //      （任意 subgroup 尺寸成立；flush 屏障已保证跨线程可见）——
+                //      其余 subgroup 的 gather 是重复读、其 shuffle 结果全被
+                //      "tid==0 落 sred"丢弃，收紧后 sred 逐位不变；
+                //   ② subgroup 内 shuffleDown 蝶式 log2 归约（同样收在
+                //      subgroup0——shuffle 是 subgroup 内运算，guard 按
+                //      tid<gl_SubgroupSize 对每个 subgroup 均匀，无发散）；
+                //      lane0 落 sred[0]；
                 //   ③ barrier 广播——r{dst} 是每线程副本，标量段全 WG 读。
                 //   跨设备：规范保证 subgroup ⊆ workgroup（AMD wave64 经
                 //   gl_SubgroupSize 泛化，16/32/64/128 皆正确）——"免 subgroup
@@ -1666,18 +1991,20 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
                     is_max ? "uintBitsToFloat(0xFF7FFFFFu)" : "0.0";
                 const std::string eis = std::to_string(eidx[ins.a.idx]);
                 L << "          float v = " << init << ";\n";
-                L << "          if (tid < " << EXPR_FOLD_BLOCK << "u) {\n";
+                L << "          if (tid < gl_SubgroupSize) {\n";
                 L << "            for (uint e = tid; e < valid; e += gl_SubgroupSize)\n";
                 L << "              v = "
                   << (is_max ? ("max(v, sreg[" + eis + "][e])")
                              : ("(v + sreg[" + eis + "][e])"))
                   << ";\n";
                 L << "          }\n";
-                L << "          for (uint off = gl_SubgroupSize >> 1; off > 0u; off >>= 1)\n";
-                L << "            v = "
+                L << "          if (tid < gl_SubgroupSize) {\n";
+                L << "            for (uint off = gl_SubgroupSize >> 1; off > 0u; off >>= 1)\n";
+                L << "              v = "
                   << (is_max ? "max(v, subgroupShuffleDown(v, off))"
                              : "(v + subgroupShuffleDown(v, off))")
                   << ";\n";
+                L << "          }\n";
                 L << "          if (tid == 0u) sred[0] = v;\n";
                 L << "          barrier();   // sred 广播（跨 subgroup → 全 WG）\n";
                 L << "          r" << std::to_string(ins.dst) << " = sred[0];\n";
@@ -1714,15 +2041,37 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
     }
     flush_chain();
 
-    // ── vecacc：O *= scale；O += Σ_j w(j)·b(j, d)（d 步进分片）──
+    // ── vecacc：O *= scale；O += Σ_j w(j)·b(j, d) ──
+    // P2-2 双路径（vector_out 是 push constant → 运行期均匀分支；veclen 不进
+    //   key 的前提下按运行期形状选线程映射，一份 shader 服务任意 d_k）：
+    //   路径 B（0 < vector_out ≤ 256）：**j 分片跨线程**——列 c = tid % vs、
+    //     片号 g = tid / vs、本列线程数 GB = ceil((256-c)/vs)，片内按地板
+    //     划分 [jlo, jhi) 精确覆盖 [0, valid)（ΣΔ⌊·⌋ = valid，恒等划分；
+    //     片可为空、不重不漏）。旧映射 dd=tid 在 d_k=16 时只有 16/256 线程
+    //     参战（半个 warp 单累加器长链 = fold ~57% 消融占比的根因），本路径
+    //     256 线程全忙、每线程链长 = valid/GB（再按 VA_ACC 拆）；列间无共享，
+    //     归约推迟到**块循环之后每行一次**（见下方收尾段）。
+    //   路径 A（vector_out > 256）：保留 dd 步进分片（256 线程已全忙、V 读
+    //     跨线程合并），仅把累加器 1 → VA_ACC 拆单链。
+    //   两路径求和序均异于旧版左折叠 → GPU 字节锚移动（已立项批准）。
     if (f.vecacc)
     {
         const VecAccSpec& va = *f.vecacc;
         if (va.has_scale)
         {
-            L << "        for (uint dd = tid; dd < vector_out; dd += 256u)"
-              << " o[(dd - tid) / 256u] *= r"
+            // 缩放覆盖（与初始化同口径，见行首双形态注释）：路径 B 缩放标量
+            //   累加器（列与 tid 无关，旧 dd 步进覆盖不到）；路径 A 只缩放
+            //   可达分片（与旧版一致 × VA_ACC），绝不对 16 槽全 tile 缩放
+            L << "        if (vector_out > 0u && vector_out <= 256u) {\n";
+            for (std::uint32_t t = 0; t < VA_ACC; ++t)
+                L << "          ob" << t << " *= r"
+                  << static_cast<int>(va.scale_reg) << ";\n";
+            L << "        } else if (vector_out > 256u) {\n";
+            L << "          for (uint dd = tid; dd < vector_out; dd += 256u)\n";
+            L << "            for (uint an = 0u; an < " << VA_ACC << "u; ++an)\n";
+            L << "              o[(dd - tid) / 256u][an] *= r"
               << static_cast<int>(va.scale_reg) << ";\n";
+            L << "        }\n";
         }
         // GQA：vecacc 的 b_input（V_t）行块号同样按其视图的头分组比取
         const std::string b_row = !has_mm ? std::string("0u")
@@ -1734,23 +2083,106 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
         //   串行同序）。runtime valid 由尾循环兜余数；所有权/屏障/shared
         //   布局不动。
         L << "        const uint jr0 = " << b_row << " * fold_k + k0;\n";
-        L << "        for (uint dd = tid; dd < vector_out; dd += 256u) {\n";
-        L << "          uint j = 0u;\n";
-        L << "          for (; j + 4u <= valid; j += 4u) {\n";
-        for (int t = 0; t < 4; ++t)
+        // 路径 B：j 分片（列/片/本列线程数均为运行期均匀量）
+        L << "        if (vector_out > 0u && vector_out <= 256u) {\n";
+        L << "          const uint cB = tid % vector_out;\n";
+        L << "          const uint gB = tid / vector_out;\n";
+        L << "          const uint GB = (256u - cB + vector_out - 1u) / vector_out;\n";
+        L << "          const uint jlo = valid * gB / GB;\n";
+        L << "          const uint jhi = valid * (gB + 1u) / GB;\n";
+        L << "          uint j = jlo;\n";
+        L << "          for (; j + " << VA_ACC << "u <= jhi; j += " << VA_ACC << "u) {\n";
+        for (std::uint32_t t = 0; t < VA_ACC; ++t)
             L << "            const float v" << t << " = " << in_rd(va.b_input,
-                "(jr0 + j + " + std::to_string(t) + "u) * vector_out + dd") << ";\n";
-        for (int t = 0; t < 4; ++t)
-            L << "            o[(dd - tid) / 256u] += sreg["
+                "(jr0 + j + " + std::to_string(t) + "u) * vector_out + cB") << ";\n";
+        for (std::uint32_t t = 0; t < VA_ACC; ++t)
+            L << "            ob" << t << " += sreg["
               << eidx[va.weight_reg] << "][j + " << t << "u] * v" << t << ";\n";
         L << "          }\n";
-        L << "          for (; j < valid; ++j)\n";
-        L << "            o[(dd - tid) / 256u] += sreg["
+        // 尾段（余数 ≤ VA_ACC-1）：主循环出口 (j-jlo) ≡ 0 (mod VA_ACC) →
+        //   按固定累加器序展开（标量无下标，零 dynamic-index）
+        for (std::uint32_t t = 0; t < VA_ACC - 1u; ++t)
+        {
+            L << "          if (j < jhi) {\n";
+            L << "            const float vj = " << in_rd(va.b_input,
+                "(jr0 + j) * vector_out + cB") << ";\n";
+            L << "            ob" << t << " += sreg[" << eidx[va.weight_reg]
+              << "][j] * vj;\n";
+            L << "            ++j;\n";
+            L << "          }\n";
+        }
+        L << "        } else if (vector_out > 256u) {\n";
+        // 路径 A：dd 步进分片 × VA_ACC 累加器（jlo=0 → 尾组 % VA_ACC）
+        L << "          for (uint dd = tid; dd < vector_out; dd += 256u) {\n";
+        L << "            uint j = 0u;\n";
+        L << "            for (; j + " << VA_ACC << "u <= valid; j += " << VA_ACC << "u) {\n";
+        for (std::uint32_t t = 0; t < VA_ACC; ++t)
+            L << "              const float v" << t << " = " << in_rd(va.b_input,
+                "(jr0 + j + " + std::to_string(t) + "u) * vector_out + dd") << ";\n";
+        for (std::uint32_t t = 0; t < VA_ACC; ++t)
+            L << "              o[(dd - tid) / 256u][" << t << "u] += sreg["
+              << eidx[va.weight_reg] << "][j + " << t << "u] * v" << t << ";\n";
+        L << "            }\n";
+        L << "            for (; j < valid; ++j)\n";
+        L << "              o[(dd - tid) / 256u][j % " << VA_ACC << "u] += sreg["
           << eidx[va.weight_reg] << "][j] * " << in_rd(va.b_input,
               "(jr0 + j) * vector_out + dd") << ";\n";
+        L << "          }\n";
         L << "        }\n";
     }
     L << "    }\n";   // 块循环尾
+
+    // ── vecacc 收尾（k0 循环后、finalize 前；每行一次）──
+    // ① 崩叠：路径 B = 标量累加器 ob 求和（热路径零数组访问，见行首双形态
+    //    注释）；路径 A = 数组分片 [s] 内 VA_ACC 求和进 [0]；finalize 只读 [0]；
+    // ② 路径 B 跨线程列归约：线程 tid（g=0 主）收集列 tid 的 GB 个分片部分和
+    //    （槽 = 线程号；有 mm 段复用 spart，否则 sva）。最终值只回写本列主
+    //    自己的 o[0][0]（每行一次），finalize 无线程间读。两次屏障仅在
+    //    路径 B 且 vs<256 时出现（vs=256 → GB=1 免归约；路径 A 无屏障）。
+    if (f.vecacc)
+    {
+        // 归约槽：spart[jm][grp] 的线性重解释（tid = jm + grp*BLOCK）
+        constexpr std::uint32_t LG_SLOT = []() {
+            std::uint32_t v = EXPR_FOLD_BLOCK, g = 0;
+            while (v > 1) { v >>= 1; ++g; }
+            return g;
+        }();
+        const auto slot = [&](const std::string& idx) -> std::string
+        {
+            if (has_mm)
+                return "spart[(" + idx + ") & " + std::to_string(EXPR_FOLD_BLOCK - 1u)
+                     + "u][(" + idx + ") >> " + std::to_string(LG_SLOT) + "u]";
+            return "sva[" + idx + "]";
+        };
+        L << "\n        if (vector_out > 0u && vector_out <= 256u) {\n";
+        L << "          const float pc = ob0";
+        for (std::uint32_t t = 1; t < VA_ACC; ++t)
+            L << " + ob" << t;
+        L << ";\n";
+        L << "          if (vector_out < 256u) {\n";
+        L << "            " << slot("tid") << " = pc;\n";
+        L << "            barrier();\n";
+        L << "            if (tid < vector_out) {\n";
+        L << "              float s = " << slot("tid") << ";\n";
+        L << "              for (uint g = 1u; tid + g * vector_out < 256u; ++g) {\n";
+        L << "                const uint si = tid + g * vector_out;\n";
+        L << "                s += " << slot("si") << ";\n";
+        L << "              }\n";
+        L << "              o[0][0] = s;\n";
+        L << "            }\n";
+        L << "            barrier();   // 归约槽复用（下一行的 vecacc 重写）\n";
+        L << "          } else {\n";
+        L << "            o[0][0] = pc;\n";
+        L << "          }\n";
+        L << "        } else if (vector_out > 256u) {\n";
+        L << "          for (uint s = 0u; s < " << OUTC_MAX << "u; ++s) {\n";
+        L << "            o[s][0] = o[s][0]";
+        for (std::uint32_t t = 1; t < VA_ACC; ++t)
+            L << " + o[s][" << t << "u]";
+        L << ";\n";
+        L << "          }\n";
+        L << "        }\n";
+    }
 
     // ── finalize（向量域）：dd 步进分片逐列执行 → bout[row*vector_out + dd] ──
     L << "\n    for (uint dd = tid; dd < vector_out; dd += 256u) {\n";
@@ -1806,18 +2238,51 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
 //      缓冲声明改为"实例表 + buffer reference + 名字宏"、main 序言按
 //      gl_WorkGroupID.y 取实例、强制标量路径；PC 布局与 V0 完全一致。
 //      仅纯逐元素（expr_spec_batchable）+ V0 全 f32，其余返回空串。
+// mm_fine=true → **matmul 细 tile 变体**（键 = key#f，P0 wgrad 网格饥饿）：
+//      输出块 64×64 → 16×16 的同结构 shader。仅纯 matmul 形态
+//      （spec.matmul、无 fold、raxis<0、V0 全 f32），其余返回空串 →
+//      构建期不产出条目、运行期留在 64-tile 路径（降级，不是错误）。
+// mm_ksplit=true → **matmul K 切分变体**（键 = key#ks，二次归约）：
+//      细 tile 网格上再把 K 切成 S 段（每 WG 一段 → 部分和，不跑尾链）。
+//      资格与 #f 同源（纯 matmul、V0 全 f32），其余返回空串 → 上层 [skip]、
+//      运行期留细 tile 路径（降级，不是错误）。伴生归约（#kr）不经本入口，
+//      由 GlslEmitter 直调 generate_glsl_matmul_ksplit_reduce。
 //
 // native16 恒走**标量 kernel**（vec4 的 f16vec4 向量化路径留作后续优化）——
 // 对应变体的 FusedShader.vec_width 必须为 1（fused_generate.hpp 同源判定）。
 inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
                                  ExprPrecSig sig = 0, bool native16 = false,
-                                 bool batched = false)
+                                 bool batched = false, bool mm_fine = false,
+                                 bool mm_ksplit = false)
 {
     // P3 批量变体（键 = key#b）：纯逐元素 + 仅 V0 全 f32。其余形态返回空串
     // （上层 [skip]，运行期逐 kernel 降级，不是错误）。资格判据与
     // fused_generate / execute_fused_graph 同源（expr_spec_batchable）。
     if (batched && (sig != 0 || native16 || !expr_spec_batchable(spec)))
         return {};
+    if (mm_fine)
+    {
+        // 细 tile 变体（键 = key#f）：资格与 run_fused_gpu 的派发分支同源
+        // （纯 matmul：无 fold、raxis<0、V0 全 f32）。PC 布局与 V0 完全一致
+        // （block 不进 PC）→ 同一固定头、同一绑定数。
+        if (sig != 0 || native16 || batched || spec.fold || !spec.matmul ||
+            expr_spec_reduce_axis(spec) != -1)
+            return {};
+        return generate_glsl_matmul(name, spec, /*sig=*/0,
+                                    EXPR_MATMUL_BLOCK_FINE);
+    }
+    if (mm_ksplit)
+    {
+        // K 切分变体（键 = key#ks）：资格与 run_fused_gpu 的 K 切分派发
+        // 分支同源（纯 matmul：无 fold、raxis<0、V0 全 f32）。block 恒取
+        // 细 tile 16（K 切分只在细 tile 网格仍饥饿时派发）；PC 比 V0 多一
+        // 槽 ks_span（见 generate_glsl_matmul 的 k_split 分支）。
+        if (sig != 0 || native16 || batched || spec.fold || !spec.matmul ||
+            expr_spec_reduce_axis(spec) != -1)
+            return {};
+        return generate_glsl_matmul(name, spec, /*sig=*/0,
+                                    EXPR_MATMUL_BLOCK_FINE, /*k_split=*/true);
+    }
     if (native16 && !expr_prec_sig_native16(spec, sig))
         return {};
     if (sig != 0)
@@ -3062,6 +3527,29 @@ public:
         const std::string& name_, const ExprSpec& spec) const override
     { return nn::generate_glsl(name_, spec, /*sig=*/0, /*native16=*/false,
                                /*batched=*/true); }
+
+    // matmul 细 tile 变体（键 = key#f，P0 wgrad 网格饥饿）：输出块 16×16、
+    // 每线程 2×2 输出（R=2）的同结构 shader。不支持的形态（非纯 matmul）
+    // 返回空串 → 上层跳过该变体，运行期留在 64-tile 路径（降级，不是错误）。
+    [[nodiscard]] std::string generate_matmul_fine(
+        const std::string& name_, const ExprSpec& spec) const override
+    { return nn::generate_glsl(name_, spec, /*sig=*/0, /*native16=*/false,
+                               /*batched=*/false, /*mm_fine=*/true); }
+
+    // matmul K 切分变体（键 = key#ks）：细 tile 网格上把 K 切成 S 段，每 WG
+    // 一段写部分和（不跑尾链）。不支持的形态（非纯 matmul/非 V0）返回空串
+    // → 上层跳过该变体，运行期留在细 tile 路径（降级，不是错误）。
+    [[nodiscard]] std::string generate_matmul_ksplit(
+        const std::string& name_, const ExprSpec& spec) const override
+    { return nn::generate_glsl(name_, spec, /*sig=*/0, /*native16=*/false,
+                               /*batched=*/false, /*mm_fine=*/false,
+                               /*mm_ksplit=*/true); }
+
+    // K 切分伴生归约（键 = key#kr）：跨段升序求和 + 同一条尾链。
+    // 资格判据在 generate_glsl_matmul_ksplit_reduce 内，与 #ks 同源。
+    [[nodiscard]] std::string generate_matmul_ksplit_reduce(
+        const std::string& name_, const ExprSpec& spec) const override
+    { return nn::generate_glsl_matmul_ksplit_reduce(name_, spec); }
 };
 
 // 登记到 emitter 注册表（静态初始化；重复包含无害——同名拒绝覆盖）

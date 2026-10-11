@@ -8,7 +8,9 @@
 //   - transA=1, transB=1: C[M][N] = A^T[K,M] × B^T[N,K]
 //
 // 优化策略：
-//   - WorkGroup：16×16 线程，计算 64×64 输出块（每线程 4×4 元素）
+//   - WorkGroup：16×16 线程，计算 64×64 输出块（每线程 4×4 元素）；
+//     细 tile 变体（-DNN_MM_FINE=1）= 4×4 线程 / 16×16 输出块，每线程仍
+//     4×4 元素（见文件中段开关注释）
 //   - vec4 共享内存：Ash[k][m]（A 转置）/ Bsh[k][n]，每线程每 k 仅 2 次
 //     vec4 LDS + 16 FMA（8:1 计算:加载比），vec4 读沿 lane 连续、消除
 //     标量读的 bank 冲突
@@ -65,7 +67,34 @@
 #define NN_WR(x) x
 #endif
 
-layout(local_size_x = 16, local_size_y = 16) in;
+// ── 网格粒度变体（编译期开关：glslc -DNN_MM_FINE=1）────────────────────────
+// 默认 = 64×64 输出块（16×16 线程，每线程 4×4 寄存器分块）；
+// NN_MM_FINE = 16×16 输出块（**8×8 线程、每线程 2×2 输出 R=2**）——同一份
+// 代码按 BM/BN/T 参数化，逐输出元素的 K 累加序不变（逐 k 标量升序乘加）
+// → 逐位一致。
+// 动机（P0 wgrad 网格饥饿）：反传 wgrad 形状 M,N=64..256 × K=16384 在
+// 64-tile 下只派 ceil(N/64)×ceil(M/64) = 1~4 个工作组，40HX（34 SM）
+// 大面积空转（实测 208~278 GFLOPS vs 同卡方形 2489）。
+// ⚠ R 的取舍（A/B 实测定案，见 expr_spec EXPR_MATMUL_BLOCK_FINE 注释）：
+//   · R=4 缩块不缩线程（16×16 块/4×4 线程）→ 线程数不变、半 warp 工作组
+//     占用崩 → 169 GFLOPS 比不修还差；
+//   · R=1（16×16 线程，M×N 线程）→ 摊满了但每线程 1 条 K 链、指令/输出
+//     2× 于 R=2 → 305~439；
+//   · R=2 = 摊铺（网格仍 16×16 块 → 48 WG ≥ SM 数）× 线程内 ILP=4 的甜点。
+// 后端按 64-tile 网格工作组数低于 EXPR_MATMUL_FINE_MIN_WGS 选本变体。
+#if defined(NN_MM_FINE)
+#define NN_MM_T    8
+#define NN_MM_TU   8u
+#define NN_MM_BM   16u
+#define NN_MM_BN   16u
+#else
+#define NN_MM_T   16
+#define NN_MM_TU  16u
+#define NN_MM_BM  64u
+#define NN_MM_BN  64u
+#endif
+
+layout(local_size_x = NN_MM_T, local_size_y = NN_MM_T) in;
 
 layout(std430, binding = 0) readonly buffer  BufferA { NN_ETYPE A[]; };
 layout(std430, binding = 1) readonly buffer  BufferB { NN_ETYPE B[]; };
@@ -86,20 +115,23 @@ layout(push_constant) uniform PushConstants {
     uint transB; // 1 = B 存储为 (N,K)，按 B^T 使用
 };
 
-// 分块维度常量
-const uint BM = 64u;  // 输出块行数
-const uint BN = 64u;  // 输出块列数
+// 分块维度常量（NN_MM_FINE 变体 = 16×16 输出块，见文件头开关注释）
+const uint BM = NN_MM_BM;  // 输出块行数
+const uint BN = NN_MM_BN;  // 输出块列数
 // BK=16 + 双缓冲：Ash[2][16][16]vec4 8KB + Bsh 8KB = 16KB 共享，保占用率
 //   （BK=32 双缓冲需 32KB，每 SM 只驻 2 个 WG，浅深网格都被占用率卡死——
 //   四点实测全回退：512³ +9%、1024³ +26%、4096³ +29%、batched b8 +29%，
 //   3 样本 best）；OP 级恒取 16，改 BK 前须四点复测。
 const uint BK = 16u; // K 维度分块宽度
 
-// 每线程协作加载元素数（BM*BK/256）。下方按 4 元素组取 groups=EPT/4 →
-// 仅 BK%16==0 才铺满整 tile（BK=8 → groups=0 全不加载；BK=24 → 缺 1/3
-// 垃圾值）——当前 BK=16 安全，改 BK 前先验 EPT%4==0。
-const uint EPT_A = (BM * BK) / 256u;  // BK=16 → 4
-const uint EPT_B = (BK * BN) / 256u;  // BK=16 → 4
+// 每线程协作加载元素数（BM*BK/T² 线程）。下方按 4 元素组取 groups=EPT/4：
+// 默认 64×16/16² → EPT=4（groups=1）；细 tile 16×16/8² → EPT=4（groups=1，
+// g=tid 恰覆盖 tile 的 64 个 vec4，由 g < TILE_V4 守卫兜底）。
+const uint EPT_A = (BM * BK) / (NN_MM_TU * NN_MM_TU);  // 64→4 / 16→4
+const uint EPT_B = (BK * BN) / (NN_MM_TU * NN_MM_TU);  // 64→4 / 16→4
+// 各自 tile 的 vec4 总数（守卫上界；两条路径下 g 都必须落在其内）
+const uint TILE_V4_A = (BM * BK) / 4u;                 // 64→256 / 16→64
+const uint TILE_V4_B = (BK * BN) / 4u;
 
 // Shared Memory（vec4 布局，16B 对齐，双缓冲 [2][...]）：
 //   Ash[stage][k][m]：A^T 分块 —— A[m][k]（转置写共享内存，内层按行连续读）
@@ -121,11 +153,12 @@ void load_A_tile(uint t, uint stage, uint tid, uint block_row)
     // vec4 元素下标 %4==0 的形状条件（uniform 分支）：
     //   沿 k 连续：gr*K%4==0 ∀gr ⇔ K%4==0；沿 m 连续：k*M%4==0 ∀k ⇔ M%4==0
     const bool aligned = k_contig ? ((K & 3u) == 0u) : ((M & 3u) == 0u);
-    const uint groups = EPT_A / 4u;
+    const uint groups = (EPT_A >= 4u) ? (EPT_A / 4u) : 1u;
 
     for (uint vv = 0u; vv < groups; ++vv)
     {
         const uint g = tid * groups + vv;
+        if (g >= TILE_V4_A) continue;   // 细 tile：tid ≥ tile vec4 数不加载
         if (k_contig)
         {
             // ── 沿 k 连续：4 个连续 k，同一行 m ──────────────────────────
@@ -185,11 +218,12 @@ void load_B_tile(uint t, uint stage, uint tid, uint block_col)
     const bool n_contig = (transB == 0u);
     // 沿 n 连续：k*N%4==0 ∀k ⇔ N%4==0；沿 k 连续：n*K%4==0 ∀n ⇔ K%4==0
     const bool aligned = n_contig ? ((N & 3u) == 0u) : ((K & 3u) == 0u);
-    const uint groups = EPT_B / 4u;
+    const uint groups = (EPT_B >= 4u) ? (EPT_B / 4u) : 1u;
 
     for (uint vv = 0u; vv < groups; ++vv)
     {
         const uint g = tid * groups + vv;
+        if (g >= TILE_V4_B) continue;   // 细 tile：tid ≥ tile vec4 数不加载
         if (n_contig)
         {
             // ── 沿 n 连续：4 个连续 n，同一行 k ──────────────────────────
@@ -238,18 +272,25 @@ void load_B_tile(uint t, uint stage, uint tid, uint block_col)
 
 void main()
 {
-    const uint tx = gl_LocalInvocationID.x;   // 0..15
-    const uint ty = gl_LocalInvocationID.y;   // 0..15
-    const uint tid = ty * 16u + tx;           // 线性线程 ID 0..255
+    const uint tx = gl_LocalInvocationID.x;   // 0..T-1
+    const uint ty = gl_LocalInvocationID.y;   // 0..T-1
+    const uint tid = ty * NN_MM_TU + tx;      // 线性线程 ID 0..T²-1
 
     // 当前 WorkGroup 负责的全局输出块起始坐标
     const uint block_row = gl_WorkGroupID.y * BM;
     const uint block_col = gl_WorkGroupID.x * BN;
 
-    // ── 寄存器分块：4×4 累加器（vec4 数组） ─────────────────────────
+    // ── 寄存器分块 ────────────────────────────────────────────────────
+#if defined(NN_MM_FINE)
+    // 细 tile：R=2，每线程 2×2 输出（4 条独立 K 链 = 线程内 ILP；
+    // 网格仍 16×16 块 → 48 WG 摊满 SM；逐 k 标量升序乘加与 64-tile 逐位同序）
+    float a00 = 0.0, a01 = 0.0, a10 = 0.0, a11 = 0.0;
+#else
+    // 4×4 累加器（vec4 数组）
     vec4 acc[4];
     for (uint i = 0u; i < 4u; ++i)
         acc[i] = vec4(0.0);
+#endif
 
     const uint num_tiles = (K + BK - 1u) / BK;
 
@@ -273,11 +314,31 @@ void main()
             load_B_tile(nxt, nstage, tid, block_col);
         }
 
-        // ── vec4 外积累加（每 k：2 次 vec4 LDS + 16 FMA = 8:1） ──────
+        // ── 累加（每 k：2 次 LDS + FMA）──────────────────────────────
+        // ⚠ 曾试「k+1 预取软件流水」（把 k+1 的 LDS 提到 k 的 FMA 前）：
+        // 细 tile 实测 1.33→2.13ms（+60%，寄存器/复制链反而拖累）、64-tile
+        // 持平——**该路径不要加预取**（fold 生成器能加是因为其归约域是
+        // e[n][128] 私有数组，不是 shared LDS 链）。
         #pragma unroll 4
         for (uint k = 0u; k < BK; ++k)
         {
+#if defined(NN_MM_FINE)
+            // R=2：行对 ty*2、ty*2+1 → 共享行组 (ty*2)>>2 = ty>>1、组内
+            // 基 (ty*2)&3 = (ty&1)*2；列对同构。2 次 vec4 LDS + 4 标量 FMA。
+            const vec4 a_vec = Ash[stage][k][ty >> 1u];
+            const vec4 b_vec = Bsh[stage][k][tx >> 1u];
+            const float ar0 = a_vec[(ty & 1u) * 2u];
+            const float ar1 = a_vec[(ty & 1u) * 2u + 1u];
+            const float bc0 = b_vec[(tx & 1u) * 2u];
+            const float bc1 = b_vec[(tx & 1u) * 2u + 1u];
+
+            a00 += ar0 * bc0;
+            a01 += ar0 * bc1;
+            a10 += ar1 * bc0;
+            a11 += ar1 * bc1;
+#else
             // 本线程负责的 4 行（ty*4..ty*4+3）与 4 列（tx*4..tx*4+3）
+            // vec4 外积累加：2 次 vec4 LDS + 16 FMA = 8:1
             const vec4 a_vec = Ash[stage][k][ty];
             const vec4 b_vec = Bsh[stage][k][tx];
 
@@ -285,6 +346,7 @@ void main()
             acc[1] += a_vec.y * b_vec;
             acc[2] += a_vec.z * b_vec;
             acc[3] += a_vec.w * b_vec;
+#endif
         }
 
         barrier();
@@ -292,7 +354,23 @@ void main()
     }
 
     // ── 写入结果 ──────────────────────────────────────────────────────
-#if defined(NN_SHADER_F16)
+#if defined(NN_MM_FINE)
+    // 细 tile：R=2 逐标量写出（线程 (ty,tx) ↔ 输出块内 2×2；warp 内相邻
+    // 列 → 128B 合并写。fine 仅 f32 构建，NN_WR 仍走宏保同形）
+    {
+        const uint r0 = block_row + ty * 2u;
+        const uint c0 = block_col + tx * 2u;
+        const float accs[4] = float[4](a00, a01, a10, a11);
+        for (uint i = 0u; i < 2u; ++i)
+            for (uint j = 0u; j < 2u; ++j)
+            {
+                const uint out_row = r0 + i;
+                const uint out_col = c0 + j;
+                if (out_row < M && out_col < N)
+                    C[out_row * N + out_col] = NN_WR(accs[i * 2u + j]);
+            }
+    }
+#elif defined(NN_SHADER_F16)
     // f16 输出：逐标量写出（C 无 vec4 别名视图），与 f32 的 N%4!=0 分支同构
     for (uint i = 0u; i < 4u; ++i)
     {

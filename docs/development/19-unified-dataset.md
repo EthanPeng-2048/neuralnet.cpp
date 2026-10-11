@@ -1,6 +1,6 @@
 # 统一数据集格式与加载（.nndataset / .nnvocab / KVRecord v2）设计
 
-> **状态**：设计定稿（2026-10-05 对话裁定）；**阶段一~三已实施（2026-10-05/06 落地）**——
+> **状态**：设计定稿；**阶段一~三已实施**——
 > 阶段一 = KVRecord v2 + `.nnvocab` + `tokenizer_train` 切换 + `dataset_convert vocab`；
 > 阶段二 = `.nndataset` + `dataset_gen` + `nn::Dataset` + `text_train` 切换 + 模型 v6 内嵌
 > （`MODEL_VERSION 5→6`，v5 及以下仍读内嵌 JSON）；阶段三 = GUI / 控制器 / `train_pkg` /

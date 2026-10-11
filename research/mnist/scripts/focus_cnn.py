@@ -27,8 +27,8 @@ from concurrent.futures import ThreadPoolExecutor
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 OUT = os.path.join(ROOT, "research", "mnist", "results", "focus_cnn")
-# 必须用 build_rel（Release + 含 NormPlace/BatchNorm 提交的源码）：
-# 仓库里原有的 build/ 是 2026-10-02 的 Debug 产物，早于 --norm-place 特性。
+# 必须用 build_rel（Release + 含 NormPlace/BatchNorm 源码的构建）：
+# 仓库里原有的 build/ 是不含 --norm-place 特性的旧 Debug 产物。
 TRAIN = os.path.join(ROOT, "build_rel", "mnist_train.exe")
 if not os.path.exists(TRAIN):
     TRAIN = os.path.join(ROOT, "build", "mnist_train.exe")

@@ -3,13 +3,12 @@
 // ═══════════════════════════════════════════════════════════════════════════
 //  expr_graph.hpp — 图 IR + 融合分析（IR-C）
 //
-//  2026-10-06 恢复：本文件按 git `8f2990f^`（e936f4d）的旧实现移植回主干
-//  （用户裁定：IR-C 非否决，系当年实现不完整而暂时废弃；取舍记录与恢复立项
-//  见 docs/history.md「IR-C 定位修正与恢复立项」）。相对旧版的差异只有两处：
-//    1. 图节点带 Precision，融合要求成员精度一致（旧版无精度维度，混精度链
-//       拼接会把不同精度语义塞进单 kernel = 静默错值）；
-//    2. Tensor 占位标记经 M1 后的公共元数据访问器（virtual_tag/
-//       set_virtual_tag），存储访问仍收口在引擎域内。
+//  取舍记录与恢复立项见 docs/history.md「IR-C 定位修正与恢复立项」。
+//  两项当前约束：
+//    1. 图节点带 Precision，融合要求成员精度一致（混精度链拼接会把不同精度
+//       语义塞进单 kernel = 静默错值）；
+//    2. Tensor 占位标记经公共元数据访问器（virtual_tag/
+//       set_virtual_tag），存储访问收口在引擎域内。
 //
 //  对应文档 `docs/development/03-ir-optimization.md` IR-C：把扁平 ExprSpec 演进为图 IR
 //  （DAG），为 begin_expr/end_expr 提供多表达式融合分析。

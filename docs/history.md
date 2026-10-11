@@ -33,6 +33,12 @@
 - [分支归档与 legacy 命名空间整理](#分支归档与 legacy 命名空间整理（2026-10-02，v1.6.0 发布时）)（1 条）
 - [统一数据集格式与加载（19 号设计落地）](#统一数据集格式与加载（19 号设计落地，2026-10-05/06）)（1 条）
 - [训练 step 剖析器（NN_PROFILE）](#训练 step 剖析器（NN_PROFILE，2026-10-06）)（1 条）
+- [matmul 细 tile 变体：P0 wgrad 派发饥饿落地](#matmul 细 tile 变体：P0 wgrad 派发饥饿落地（2026-10-07）)（1 条）
+- [设备表 per-key 归因（NN_PROFILE 新增表 5）](#设备表 per-key 归因（NN_PROFILE 新增表 5，2026-10-07）)（1 条）
+- [fold v2 恒等三改（P2-1）与注意力 fold 相位消融](#fold v2 恒等三改（P2-1）与注意力 fold 相位消融（2026-10-07）)（1 条）
+- [fold v2 vecacc 双路径改写（P2-2）](#fold v2 vecacc 双路径改写（P2-2）：j 分片跨线程 + 标量累加器（2026-10-07）)（1 条）
+- [matmul K 切分二次归约（`#ks`/`#kr`）](#matmul K 切分二次归约（`#ks`/`#kr`）：wgrad 派发饥饿第二刀（2026-10-07）)（1 条）
+- [录制窗口排空隐藏 + SpecBuilder 输入槽去重（项目 4/5）](#录制窗口排空隐藏 + SpecBuilder 输入槽去重（项目 4/5，2026-10-08）)（1 条）
 
 ---
 
@@ -2807,6 +2813,365 @@ A1 段改动前为 2424）、`include/neuralnet.cpp/compute_cpu_engine.hpp` **23
   `text_train --f16` 冒烟跑通；registry **93 结构**（92 + LSE trans fold；其 linear
   视图变体未被消费、按不消费不登记处理）；`doc_inventory` / `doc_align_audit` 门禁过。
 
+# matmul 细 tile 变体：P0 wgrad 派发饥饿落地（2026-10-07）
+
+## 承接「设备侧 kernel 表按阶段归因」条的修复方向①（P0）；键后缀 `#f`
+
+- 类型：性能 A/B + 演进记录（含两条被否决设计）
+- **1. 落地形态**：网格饥饿的纯 matmul 结构（spec.matmul、无 fold、raxis<0、
+  仅 V0 f32）在构建期多发一份**细 tile 变体**（键 = `key#f`，
+  `EXPR_MM_FINE_SUFFIX`；`fused_generate` 现打「N 条细 tile 变体」计数）。
+  运行期 `run_fused_gpu` 在 **64-tile 网格工作组数（含 batch 维） <
+  `EXPR_MATMUL_FINE_MIN_WGS`（32 ≈ 40HX SM 数）** 时改派 `key#f` pipeline
+  （同一 spec 元数据/PC 布局/绑定数，仅网格粒度不同；未登记 = f16 精度变体
+  键、设备未注册、或 `NN_MM_NO_FINE=1` → 留在 64-tile 路径，降级非错误）。
+  细 tile：输出块 64×64 → 16×16、local_size 16² → 8²、每线程 4×4 → **2×2
+  （R=2）**。OP 级同病同修：`matmul_tiled.comp` 用 `-DNN_MM_FINE=1` 编第二份
+  （CMake `nn_embed_shader(matmul_tiled_fine …)`），`matmul_gpu` 按同一判据
+  选 pipeline；`NN_MM_FINE_NAIVE=1` 另可强制走 matmul.comp 对照（A/B 用）。
+  注册门禁的「带 `#` 需 16 位存储」判定豁免 `#f`（它是 f32 变体，与 `#b` 同列）。
+- **2. 三轮设计 A/B（`layer_bench --op matmul` 形状探针，同窗交错 2 轮，
+  wgrad.QKV (192,16384)×(16384,64) / ffn1 (256,16384)×(16384,64)）**：
+  | 设计 | 结论（GFLOPS，QKV/ffn1） |
+  |---|---|
+  | 不修（64-tile，1~4 WG） | 205~206 / 274~276（基线） |
+  | ① R=4 等比缩块（16×16 块 / 4×4 线程） | **169 / 222 —— 比不修还差** |
+  | ② R=1（16×16 线程，线程数 = M×N） | 305~415（≈1.5×） |
+  | matmul.comp naive 对照 | 323~440（≈1.6×，略优于②） |
+  | **③ R=2（8×8 线程，定案）** | **302~405（≈1.5×）** |
+  **教训（线程数不变量）**：输出张量固定时，R=4 每线程 16 输出 → 线程总数
+  恒 = M×N/16（wgrad 仅 768）；把块缩成 16² **不会多出线程**，只是把同样的
+  线程拆成更多半 warp 工作组，占用率反崩。R² 与网格是硬取舍：R=4 网格只有
+  1~4 个（M×N/4096），R=1 网格 48 个但每输出指令/ILP 最差；**R=2 = 摊铺
+  （48 WG ≥ SM 数）× 线程内 ILP=4 的甜点**。同 48 WG×256 线程对照（N=1024
+  形状走 64-tile）实测 R=4 比 R=1 每线程快 ~7×——纯吞吐上 R=4 仍是理想，
+  但网格摊不开，无解（保序前提下）。
+- **3. e2e 收益（NN_PROFILE=1 text_train d64/L4/H4/ff256/seq256/B64/adam、
+  20 步，off/fine 交错 2×2）**：
+  | 口径 | off | fine | Δ |
+  |---|---|---|---|
+  | `fused_mm@bwd.blk#0`（设备，ms/20 步） | 222.5（avg） | 171.5（avg） | **−23%** |
+  | step 墙钟（ms/20 步） | 2128.5（avg） | 1961.8（avg） | **−7.8%**（106.4→98.1 ms/step） |
+  | 对照 `fused_mm@fwd.blk#0` / `fwd.layer#0` | 10.5 / 102~103 | 平 | ✓ 只有反传 GEMM 变 |
+  形状探针 controls 不回退：1024³ 2410~2489、fwd.QKV 1525~1560、LM-head wgrad
+  （8208 行网格 129 ≥32 走 64-tile）3189~3588 GFLOPS，与改前同窗持平。
+  对 torch（50.7 ms/step）差距 **2.10× → 1.94×**。
+- **4. 被否决（防重蹈）**：① **k+1 预取软件流水**（把下一轮 LDS 提到本轮
+  FMA 前，曾在 fold 生成器奏效）——细 tile 实测 **1.33→2.13ms（+60%）**、
+  64-tile 持平：该配方的 shared LDS 链**不能**照搬 fold 的私有数组预取，
+  已回退并把结论写进 `matmul_tiled.comp` 注释；② R=4 等比缩块（见上表）。
+  另记录一个**未定位的地板**：细 tile 三设计与 naive 全部在 ~1.2~1.35ms
+  （≈300~440 GFLOPS）平台、耗时对 K 线性——每 k 迭代 ~80~134ns 的串行
+  地板（LDS 链/调度）未能用预取打破，是残余疑点。
+- **5. 残余与下一步**：wgrad 仍 ~1.6× 差距上限（保序设计已榨干）；history
+  P0 原估 −26ms/step 的另一半需要 **K 切分二次归约**（改变累加序 →
+  **动字节锚，需另行裁定**）或 f16 提速兑现（P3）。
+- **6. 验收**：Release 构建（`build/`）字节锚**逐位不变**——CPU
+  `f360f9bdbbfbe12c`、GPU dev2 `4103194cb9e3e230`（`gpu_stability_probe
+  --steps 20`，含 `--gpu 2`）；**ctest 29/29**；`doc_inventory` 三门禁
+  （virtual 52 / L2-VIOLATIONS 0 / HANDWRITTEN-RESIDUE 0）；库内结构 93 不变
+  （注册表 288 行 = 93 + 132 精度 + 54 批量 + **9 细 tile**）；`text_train`
+  交错 A/B 中对照项逐位平。
+- **7. 关键文件**：`expr_spec.hpp`（`EXPR_MM_FINE_SUFFIX`/`EXPR_MATMUL_BLOCK_FINE`/
+  `EXPR_MATMUL_TILE_FINE`/`EXPR_MATMUL_FINE_MIN_WGS`）、`expr_glsl_gen.hpp`
+  （`generate_glsl_matmul` block 变参 + R 分支计算/写回 + `generate_glsl`
+  mm_fine 入口）、`expr_emitter.hpp`（`generate_matmul_fine` 虚接口）、
+  `tools/fused_generate.hpp`（#f 发射）、`backend/compute_vk_backend.hpp`
+  （注册豁免 / run_fused_gpu 选择 / op 级 pipeline + 选择 / 两个逃生阀）、
+  `shaders/matmul_tiled.comp`（`NN_MM_FINE` 参数化）、`CMakeLists.txt`。
+- 产物：`build/prof_wgrad_{off,fine}_20261007.txt`（首轮 A/B）、交错 2×2 在
+  会话内直读；形状探针复现 = 上表。
+
+---
+
+# 设备表 per-key 归因（NN_PROFILE 新增表 5，2026-10-07）
+
+## 承接 wgrad P0 的下一步：定位"forward-fused 17.2 ms/step 桶"的构成
+
+- 类型：演进记录 + 性能归因
+- **背景（缺口）**：设备表（表 4）只按 `label@stage` 聚合——`fused@fwd.blk#*`
+  四行合计 ~17 ms/step 这类大桶看不出由哪些**结构**贡献，无法定点。host 侧
+  op 表也只有 `eval_expr` 汇总。per-key 归因 = 第 5 张表，按
+  `key@label@stage`（运行期 shader key + 变体后缀 + 派发标签 + 阶段）细分。
+- **实现**（零开销、纯观测，不进任何计算路径）：
+  - `core_profile.hpp`：`State.device_keys` 第二张聚合表；`interned_detail()`
+    把运行期 key（`expr_spec_key` 及 `#x/#b/#f` 后缀、原语变体名）拷进稳定池
+    （命名约束：聚合表 key 必须静态存储）；`device_add(name, ns, detail=)`
+    detail 非空时双写；`dump()` 打表 5（top 60 + 总条数）；`reset` 同步清空。
+  - `compute_vk_backend.hpp`：`TsCursor.marks` 改 struct（原 pair →
+    `{key, detail, pair}`）；`ts_dispatch` 增可选 `detail`（string_view）与
+    `detail_suffix`（静态后缀，细 tile 变体 `#f` 调用点零分配）；录制期把
+    `detail[suffix]@label@stage` 驻留，resolve 时随 timestamp 一起回填。
+  - **接线点**：`run_fused_gpu` 两条派发（`fused_mm` 带 `use_fine?#f`、
+    `fused` 带 shader key）、`run_fused_gpu_batch`（`key#b`）、
+    `dispatch_compute` 加 `ts_detail` 形参（op 级 matmul 传变体名
+    `gemv/gemv_f16/tiled/tiled_f16/fine/naive_fine/naive`、batched_matmul 传
+    `f16/f32`）。其余原语 label 已足够细，不加。
+  - **口径**：表 4 完全不变（A/B 可继续对历史报告）；表 5 合计 ≤ 表 4 合计
+    （仅带 detail 的派发入表 5）；解析串用 `@` 分段且 stage 恒为最后一段
+    （key 与 label 本身不含 `@`）。
+- **归因结果（`build/prof_keyattr_20261007.txt`，GPT d64/L4/H4/ff256/seq256/B64
+  adam、20 步、GPU 40HX、Release）**——此前悬置的三个桶全部定位：
+  | 桶 | 归属 key/结构 | 设备耗时（ms/20 步） |
+  |---|---|---|
+  | forward-fused ~17 ms/step | **`f7e6c2bd8e35af36` = 注意力 forward fold（fold v2 双域，4 块各 78.6，占 `fused@fwd.blk` 桶 ~92%）** | 314.4 合计（15.7 ms/step） |
+  | CE 5.9 vs torch 2.7 | `0fdcedce8f01e6ad` lse fold 59.9 + `26c8f729e11e40bd` grad 58.3 | 118.2 合计（5.9 ms/step） |
+  | wgrad 桶（P0 后仍最大） | `71733007a831714a#f` 细 tile（blk 各 ~113）+ 同 key 64-tile 在 layer#0 96.0 + `6996c1ccdb7656fc` dgrad（blk 各 ~46 + layer#0 80.2） | blk 细 tile 451 合计（22.6 ms/step） |
+  | 其余热点 | `c2aca8a29eb4617f` fwd matmul+bias（fwd.layer#0 = LM head 101.5）；`86c84dd0293c4913` bwd 归约（rowmax/exp 链，blk 各 ~21.7）；`907399e90fa111b3` bwd.layer#0 归约 24.7 | — |
+  **读数**：① forward 的 17 ms/step **不是散布的小算子，而是单一注意力
+  fold kernel**（每块 ~3.93 ms/call × 4 块 × 1 call/step）——优化对象明确为
+  fold v2 生成器（doc-mask 分支 + 每 k0 块 3 barrier 的节奏），与 wgrad 一样
+  属"单 kernel 吞吐"而非派发开销；② CE 两个 key 各占一半，lse fold 略贵于
+  grad；③ 设备 busy 91.1%，`copy_from` 1471ms 仍是阻塞等待口径（非 PCIe）。
+- **验收**：字节锚逐位不变（CPU `f360f9bdbbfbe12c` / GPU dev2
+  `4103194cb9e3e230`，剖析纯观测）；**ctest 29/29**；`doc_inventory` 三门禁
+  52 / 0 / 0（exit 0）；表 4 各行与改前同配置读数一致（同窗 ±噪声）。
+- **关键文件**：`core_profile.hpp`（`device_keys`/`interned_detail`/表 5 打印）、
+  `backend/compute_vk_backend.hpp`（`TsMark`、`ts_dispatch` detail 参数、
+  `dispatch_compute` `ts_detail`、6 个接线点）、AGENTS §3/§12 两处描述。
+- 产物：`build/prof_keyattr_20261007.txt`。
+
+---
+
+# fold v2 恒等三改（P2-1）与注意力 fold 相位消融（2026-10-07）
+
+## 承接 per-key 归因：注意力 fwd fold 的第一刀 + P2-2 立项所需的相位硬数据
+
+- 类型：性能 A/B + 演进记录
+- **背景与分期（用户裁定）**：per-key 归因把 forward ~17 ms/step 定位到单
+  kernel `f7e6c2bd8e35af36`（注意力 forward fold，3.93 ms/call × 4 块）。
+  静态解剖（生成 GLSL 实读）后原计划 P0 恒等小改 / P1 vecacc 小改 / P2 全量
+  重写。用户问"P2 会不会让 P0/P1 白做"——裁定：**P1 与 P2 重复 → 取消、并入
+  P2-2**；**P0 以"P2 第一阶段（P2-1 恒等层）"身份执行**（三改在任何重写里
+  都必须保留，不会被扔掉），同时充当周期模型的廉价证伪探针。
+- **P2-1 三改（`expr_glsl_gen.hpp` 的 `generate_glsl_fold_v2`，全部逐位恒等）**：
+  1. **整块 skip**：tri_skip 原先只把 valid 钳成 0，空块内 6 个 WG barrier、
+     空归约、空链照跑（文档"行界整块跳过"名不副实）——现在 `valid == 0`
+     直接 `continue`。恒等论证：空块必晚于 block0，block0 恒 valid≥1 且含
+     未屏蔽对角 j=qt（causal 不遮对角、doc 同位置同 id）→ 进空块时 m 必
+     有限 → 旧空块语义 `max(m, lowest)=m`、`α=exp(0)=1.0`（FP 精确）、
+     `l=l·1.0+0`、`o×1.0` 全部逐位恒等；valid 只依赖 row/k0 → 全 WG 均匀。
+  2. **链读集载入**：flush_chain 原对全部元素寄存器对称 round-trip——注意力
+     chain1 实测 9 次 sreg 载入**全是死加载**（覆写前载入/本段未用）、
+     chain2 9 中 8 死。改"首访为读才载入、链内被写才存回"（按 Reg/Fanout/
+     Reduce 操作数收集读集；未用的 b/c 默认 (Reg,0) 而寄存器 0 恒为行标量态
+     → 不会误判），出口 shared 逐位一致。
+  3. **归约收 subgroup0**：sred 本来就只取 lane0（= subgroup0 蝶式归约结果），
+     其余 subgroup 的 gather 是重复读、shuffle 结果全被丢弃——gather 与
+     shuffle 都加 `tid < gl_SubgroupSize` 守卫（subgroup 内均匀无发散），
+     subgroup0 各 lane 的 v 同线程同序 → sred 逐位不变。
+- **同窗交错 A/B（3 对、方向交替；基线 = 改前 exe 快照 `build/text_train_base.exe`，
+  `NN_PROFILE=1` 同配置 20 步，取 `f7e6c2bd@fused@fwd.blk#*` 四行 avg_us 均值）**：
+  - new：3789 / 3815 / 3794（均 **3799 µs**）；base：3956 / 4033（均 **3995 µs**；
+    首跑 base 5147 为时钟爬坡冷启动，弃——同方法论坑见 development/08 §5）。
+  - 配对 −3.6% / −5.9%，净值 **≈ −4.9%**（墙钟 1895→1885 ms/20 步量级，busy 92% 持平）。
+  - **低于立项预估 −15~25% → 分段周期模型被证伪**：空转块与死加载是小头，
+    成本几乎全在未改动的完整块相位——这正是 P2-1 先行的校准价值。
+- **相位消融探针（临时构建期开关，量完即删）**：在 `generate_glsl_fold_v2`
+  临时加 `NN_PROBE_FOLD_NOVECACC`（省 vecacc V 累加、保留 α rescale 与屏障
+  节奏）/ `NN_PROBE_FOLD_NOMM`（省 mm 的 K 读+Σ_d 收缩、保留 spart/smm/双
+  barrier 结构）两个发射开关，每次改后重建 scan 产物、各跑 2 次取稳态：
+
+  | 消融 | fold avg_us | 归因份额 |
+  |---|---|---|
+  | 全量（P2-1 后基线） | 3799 | — |
+  | 省 vecacc V 累加 | **1646** | **≈57%** |
+  | 省 mm K 读 + 收缩 | 3216 | ≈15% |
+  | 残余（掩码链×2、归约×2、屏障、Ash、收尾） | — | ≈28% |
+
+  **读数：vecacc 是唯一量级大头**（d_k=16 → `dd=tid` 映射塌缩到半个 warp、
+  单累加器 128 FMA 依赖链 ×4 周期 + V 读延迟，且卡住其后全部屏障等待），
+  与静态解剖一致；1646 µs = 除 vecacc 外的地板，即 P2-2 天花板参照。
+- **探针过程坑（记）**：① `std::getenv` 在本机 clang + `-Werror` 挂
+  `-Wdeprecated-declarations`（MSVC CRT 弃用）→ pragma 屏蔽；② **ninja 只看
+  输入变化，env 变了不重跑生成**——探针 B 首次"构建"报 `no work to do`、
+  跑出的其实是探针 A 二进制（靠核对生成 `.comp` 内容才发现，读数已弃），
+  必须 touch 输入或删产物强制重生成；③ 消融读数必须验证生成物确实变了
+  （`Select-String` 查关键代码行），否则"探针"测的是旧 shader。
+- **P2-2 设计约束（供立项，未实施；执行需用户批准——移 GPU 字节锚）**：
+  ① FP 左折和**不可并行保序**（任何 j 分片/多累加器的结合序都不同）→
+  vecacc 展宽必移 GPU dev2 锚（同 wgrad K-split 类处置：重测 + 更新 AGENTS
+  锚行 + 本档记录；CPU 锚不动）；② **veclen 不进 key**（闭合世界，同 key 服务
+  任意 d_k）→ 线程映射不能按 dk 注册期选型，只能运行期 uniform 双路径
+  （vector_out≥256 走现行 `dd=tid`、小 dk 走 j 分片 + 归约）；③ RowSum 归约
+  改序同在移锚范围（RowMax 顺序无关）；④ 通用性：仍是 FoldSpec 通用折叠
+  （CE logsumexp、5 掩码组合共用），**不立注意力专属原语**（用户既定原则）。
+  预期：vecacc 57% → fold 3799 → 约 1.7~2.2 ms/call（P2-2 内再收 mm/屏障）。
+- **验收（P2-1）**：字节锚逐位不变（Release CPU `f360f9bdbbfbe12c`、GPU dev2
+  `4103194cb9e3e230`，`gpu_stability_probe --steps 20 [--gpu 2]` 均 PASS）；
+  **ctest 29/29**；`doc_inventory` 52/0/0 exit 0；`doc_align_audit` exit 0；
+  探针全部撤除后重建，注意力 `.comp` SHA256 回到 P2-1 态逐字节一致
+  （`1D30EE1F…C10F11`）。
+- **关键文件**：`include/neuralnet.cpp/expr_glsl_gen.hpp`（`generate_glsl_fold_v2`
+  三处：tri_skip 分支 continue、flush_chain 读集、归约守卫）；AGENTS §7 fold 段。
+- 产物：`build/ab/run{1..6}_{base,new}.txt`（A/B）、`build/ab/probe{A,B}_run*.txt`（消融）。
+
+---
+
+# fold v2 vecacc 双路径改写（P2-2）：j 分片跨线程 + 标量累加器（2026-10-07）
+
+## 承接 P2-1：vecacc 展宽落地（用户批准移 GPU 字节锚）
+
+- 类型：性能 A/B / 演进记录
+- **立项（用户裁定）**："P2-2，可以批" = 批准 FP 求和序变更移 GPU dev2 字节锚
+  （原 P1 已在 P2-1 节裁定取消并入本项；CPU 锚不动）。
+- **设计（在"veclen 不进 key"约束下的运行期 uniform 双路径，一份 shader 服务
+  任意 d_k；仍是 FoldSpec 通用折叠，零注意力专属原语）**：
+  - **路径 B（0 < vector_out ≤ 256）**：j 分片跨线程——列 `c = tid % vs`、
+    片号 `g = tid / vs`、本列线程数 `GB = ceil((256-c)/vs)`，片内地板划分
+    `[jlo, jhi) = [⌊g·valid/GB⌋, ⌊(g+1)·valid/GB⌋)` 精确覆盖 `[0, valid)`
+    （ΣΔ⌊·⌋ 恒等、不重不漏、片可为空）。旧映射 `dd=tid` 在 d_k=16 时只有
+    16/256 线程参战（半个 warp 单累加器长链），本路径 256 线程全忙。
+    **归约推迟到块循环之后每行一次**：列间部分和经每线程一槽的槽表
+    （有 mm 段复用 `spart` 线性重解释、无 mm 段新增 `sva[256]`——注意力恒带
+    mm → 零 shared 增长），g=0 列主求和后回写**自己的** `o[0][0]`，finalize
+    从不做线程间读；`vs<256` 每行 +2 屏障（vs=256 → GB=1 免归约）。
+  - **路径 A（vs > 256）**：保留 `dd` 步进分片（256 线程已全忙、V 读跨线程
+    合并），累加器 1 → `VA_ACC=4` 拆单依赖链（尾组 `% VA_ACC`）。
+  - 收尾段崩叠：路径 B 标量求和、路径 A 分片内 4 → `[0]`；finalize 只读
+    `o[shard][0]`。行首初始化/缩放与两路径覆盖口径一致（见下"弯路"）。
+  - FP 结合序异于旧左折和 → GPU 锚移动（已批）；CPU 左折不变。
+- **首版弯路（关键教训：动态下标局部数组 = scratch 雷区）**：首版把累加器放
+  `float o[4][4]` 数组、缩放/初始化按 16 槽全 tile 在 256 线程上执行——同窗
+  A/B **反慢 26%**（4839.7 vs 3838.2 µs）。诊断：`o` 带动态下标
+  （`(dd-tid)/256`、`(j-jlo)%4`、循环 `oi/an`）被驱动放进 local/scratch，
+  每次累加 RMW + 256 线程 ×16 槽 ×每块 的缩放/初始化是 GB 级流量——与
+  P2-1 消融"省 vecacc 省出 2153 µs ≈ 2.1 GB o-RMW @ ~1.5 TB/s"的算术互相
+  印证（旧版 o[4] 同样动态下标，本就是 scratch 流量大头）。**改法**：路径 B
+  热路径全部**标量累加器 `ob0..ob3`**（恒寄存器、零数组访问），`o[][]` 降级
+  为 finalize 接口（每行各写一次 `o[0][0]`，路径 B 从不读未写槽 → 不初始化）；
+  尾段按固定累加器序展开（主循环出口 `(j-jlo) ≡ 0 (mod VA_ACC)` → 步 0,1,2
+  依次落 ob0/ob1/ob2，无动态下标）。路径 A 数组保留但只缩放可达分片（×4）。
+- **同窗交错 A/B（3 对；基线 = 改前 exe 快照 `build/ab/text_train_p21.exe`，
+  `NN_PROFILE=1` 同配置 20 步，取 `f7e6c2bd@fused@fwd.blk#*` 四行 avg_us 均值；
+  两 binary 各弃一次冷启动首跑）**：
+
+  | 版本 | fold avg_us（3 对） | 相对基线 |
+  |---|---|---|
+  | P2-1 基线 | 3838.9 / 3820.8 / 3854.8（均 **3838.2**） | — |
+  | P2-2 首版（数组累加，回退弃） | 4845.4 / 4807.2 / 4866.5（均 **4839.7**） | **+26.1%** |
+  | P2-2 终版（标量累加） | 2662.9 / 2634.9 / 2670.8（均 **2656.2**） | **−30.8%**（配对 −30.6/−31.0/−30.7%） |
+
+  - E2E：step 墙钟 1908.27 → 1812.81 ms/20 步（95.4 → 90.6 ms/step，
+    **−5.0%**，与 4×(3838−2656) ≈ 4.7 ms/step 折算吻合）；GPU busy 92.0 →
+    91.8% 持平（copy_from 阻塞等待占比口径不变）。
+  - 分解（按 P2-1 消融份额估算）：vecacc 2153 → **≈900 µs**（mm 583、
+    残余 1170 基本不动）。**预估 1.7~2.2 ms/call 未达**：剩余 vecacc ≈900
+    中 V 读 L2 地板（与 mm 同流量，mm 583）+ 每行归约串行 16 槽求和 + 尾段
+    ——下一步空间 = 归约改同 subgroup 映射（`c = tid/G` 连续线程组 + 块状
+    shuffle 免 shared/屏障）与 mm/掩码链（另案）。
+  - 首版读数记录于本条（其 run 文件已被终版同名覆盖）；终版产物
+    `build/ab/p22v2_{base,new}_run*.txt`。
+- **锚移动（已获批，处置按先例）**：Release GPU dev2
+  `4103194cb9e3e230` → **`e9d6c87973fc01b5`**、Debug GPU dev2
+  `c69a3378c7dcc037` → **`b41790d04e0007a0`**（两口径
+  `gpu_stability_probe --steps 20 --gpu 2` 均 PASS，in-process loss/hash
+  匹配；GPU/CPU loss 差 ~5e-7 = 改序的预期量级）；Debug CPU
+  `8809f07142e29472`、Release CPU `f360f9bdbbfbe12c` **逐位不变**。
+- **验收**：ctest **29/29**（两轮）；`doc_inventory` 52/0/0 exit 0；
+  `doc_align_audit` exit 0；生成 shader 双路径核对
+  （`build/generated/fused_f7e6c2bd8e35af36.comp` SHA256
+  `59EC92A41FB5322AB61ED6035E7638E65A50CDEF89090D504559AF3430E3F511`）；
+  backward fold（无 vecacc）生成路径未动、设备表 71.9 µs 持平。
+- **关键文件**：`include/neuralnet.cpp/expr_glsl_gen.hpp`
+  （`generate_glsl_fold_v2`：`VA_ACC` 常量、双形态初始化/缩放、路径 B 标量
+  累加 + 展开尾段、路径 A 多累加器、收尾崩叠 + 跨线程列归约、`sva` 条件
+  shared、VecState 渲染 `o[shard][0]`）；AGENTS §7 fold 段与 §12 锚行。
+- 产物：`build/ab/ab_p22.ps1`（A/B 脚本）、`build/ab/p22v2_*.txt`。
+
+---
+
+# matmul K 切分二次归约（`#ks`/`#kr`）：wgrad 派发饥饿第二刀（2026-10-07）
+
+## 承接 P0 细 tile（保序设计已榨干）；跨段求和序变更 = 移 GPU 锚（已批）
+
+- 类型：性能 A/B + 演进记录（含实施期三个 bug 的根因与可复现诊断法）。
+- **背景与立项裁定**：P0 细 tile 后 wgrad 仍 ~1.6× 差距上限（保序前提下"网格摊铺
+  × 线程内 ILP"已到甜点，history P0 条原估 −26 ms/step 的另一半就需要 **K 切分
+  二次归约**——改变累加序 → 移字节锚，当时挂起待裁）。2026-10-07 用户裁定先查
+  PyTorch 官方口径：[Reproducibility 文档](https://docs.pytorch.org/docs/main/notes/randomness.html)
+  原文 **"Completely reproducible results are not guaranteed across PyTorch
+  releases, individual commits, or different platforms"**，且数值精度文档明确
+  数学等价的浮点计算不保证逐位一致、换后端归约序不同属正常行为 → **torch 不保证
+  ⇒ 咱们也没必要保证**：顺序变化不构成债务，仅按既定流程重测移锚；run-to-run
+  确定性（探针 run1==run2 逐位）照旧必须保。据此 K-split 获批推进。
+- **1. 落地形态**（闭合世界、keys 不变、通用机制零注意力专属原语）：
+  - 派发判据（run_fused_gpu）：`has_mm && raxis<0 && !fold && 64-tile 网格饥饿
+    (wg64 < EXPR_MATMUL_FINE_MIN_WGS) && !is_disp && 无 extras && #ks+#kr 同时注册
+    && NN_MM_NO_FINE/NN_MM_NO_KSPLIT 均未关`，且细 tile 网格仍 < **256**
+    （EXPR_MATMUL_KSPLIT_MIN_WGS ≈ 8×40HX SM）。S = clamp(⌈256/细网格⌉, 2, 8)。
+  - **`#ks`**（`EXPR_MM_KSPLIT_SUFFIX`）= 细块（16×16，R=2）matmul 的 K 切分版：
+    段号 = wg.x/nx、**列块 = wg.x % nx**、段 [k_lo, min(k_lo+span, K))，span =
+    ⌈K/S⌉ **上取 16 对齐**（非末段段界必是 16 倍数 → 段内 vec4 快路径 k 连续
+    判据成立）；dispatch x = nx·V（**只派有效段**，V = ⌈K/span⌉，空段 WG 会早退
+    且不写）；**写原始部分和**到 (S·rows, cols) 缓冲（不跑尾链——尾链非线性，
+    须在求和后统一执行）；PC 7 槽 = matmul 头 + `ks_span`（注册侧 pc_base_fixed
+    按键后缀特判 7）。全部 k 上界守卫从 mm_k 换段界 kend（非末段越界会把下段
+    的 k 拉进本段部分和 = 静默错值）。
+  - **`#kr`**（`EXPR_MM_KSPLIT_REDUCE_SUFFIX`）= 伴生归约：绑定 = 原输入 0..N-1
+    + 部分和(binding N) + 输出(binding N+1)；注册行用「原 spec + 追加一个 Linear
+    视图」的**合成 spec**（views.size() 决定 num_bindings = N+2，与生成器逐槽
+    同源；owned 先 reserve 保指针稳定）；PC 6 槽与 matmul 同布局（has_matmul=1
+    → 注册 6，第 4 槽复用填**有效段数 V**，mm_trans 占位填 0）；local_size 256、
+    每线程一输出，段号升序左折 `acc = ((p0+p1)+p2)+…` 后跑同一条尾链——尾链
+    从 `generate_glsl_matmul` 抽出共用 helper **`glsl_emit_matmul_tail_fn`**
+    （两处同一实现，字节级同发射）。
+  - 两段派发：两 desc set + 两份 PC + partial 写转读屏障（`record_output_barrier`
+    src SHADER_WRITE→dst MEMORY_READ 覆盖 compute→compute）；partial 局部析构
+    走池回收——批量录制下块只可能被**录制序更晚**的算子复用（执行序 = 录制序，
+    #kr 的读在复用写之前），安全论证写在 run_fused_gpu 注释。仅 V0 f32（精度
+    变体不产 #ks/#kr）。逃生阀：**`NN_MM_NO_KSPLIT=1`**（回落细 tile，A/B 对照）、
+    **`NN_MM_KSPLIT_S=<n>`**（强制 S，调参）。
+- **2. 实施期三个 bug（全修复；③ 是主根因）**：
+  1. **尾空段垃圾读**：span 上取 16 对齐后 (S-1)·span 可 ≥ K → 空段 WG 早退不写
+     部分和，#kr 按 S 全加 → 读池空闲块历史数据（内容随 run1/run2 分配史漂移
+     → 探针 run1≠run2）→ 只派发/只加**有效段 V**。
+  2. **vec4 快路径行基对齐**：段内判据 `(kend&3)==0` 只保证段内 k 连续，丢了原
+     `(mm_k&3)==0` 的**行基对齐**（别名索引 = grow·mm_k + kAG，行跨度是 mm_k）
+     → K 非 4 倍数（vocab=257 的 dgrad K=257）跨行错读 → 双判据并存（非切分时
+     kend==mm_k，与原式等价）。
+  3. **列块未取模（主根因）**：`slice = wg.x/nx` 但 `block_col = wg.x×B` 漏了
+     `% nx` → slice≥1 的 WG 列块整体越出 cols、写回被 `cc<cols` 守卫**整块静默
+     丢弃** → slice≥1 的部分和从未写出。V=1 的小形状（单测覆盖的全是 K=6/8 之类）
+     恒不触发，V≥2 的 gpt/rapt offload 一致性与稳定性探针全挂。
+  **可复现诊断法（vkCmdFillBuffer 二分，诊断码已删）**：部分和缓冲整体清零 →
+  探针 PASS（垃圾变零 → run1==run2）；只清零 [V·rows·cols, S·rows·cols) → 仍
+  FAIL ⇒ 缺口在"已写区"[0,V) 内 ⇒ 网格映射问题而非段数 PC/循环问题。
+- **3. 同窗交错 A/B**（同一 binary、env 开关对照；text_train d64/L4/H4/ff256/
+  seq256/B64、adam、20 步、GPU 40HX、3 对、弃冷启动；NN_PROFILE=1）：
+  | 口径 | OFF（NN_MM_NO_KSPLIT=1，细 tile 基线） | ON（K 切分） | Δ |
+  |---|---|---|---|
+  | step 墙钟 ms/20 步 | 1806.6 / 1822.3 / 1825.7（均 **1818.2**） | 1502.0 / 1502.5 / 1511.8（均 **1505.4**） | −16.9 / −17.6 / −17.2 → **−17.2%**（90.9 → **75.3 ms/step**，−15.6 ms/step） |
+  | wgrad per-key 桶 `71733007a831714a`（ms/20 步） | 458.2 / 462.1 / 464.0（均 **461.4**） | 138.2 / 139.9 / 139.3（均 **139.1**） | **−69.9%** |
+  | 设备表其余全部行 | — | — | 无一行变化 >5 ms（零附带回退） |
+  对 torch fp32 50.7 ms/step 差距 **1.79× → 1.48×**。`#kr` 本体 ≈1.3 ms/20 步
+  （低于 per-key 表显示下限，聚合在 `fused_mm` 桶内账目自洽）。
+  S 调参单窗扫描（`NN_MM_KSPLIT_S`）：S=2 → 1643.6、4 → 1507.5、6 → 1497.3、
+  8 → 1498.0、auto 阈值 128（qkv S3/ffn S2）→ 1516.4 ms/20 步 ⇒ 6~8 平台期 ⇒
+  **阈值 128 → 256**（qkv S=6 / ffn S=4）为定稿参数（取值依据写进 expr_spec 注释）。
+- **4. 验收**：ctest **29/29**（两轮）；稳定性探针 run1==run2 逐位 PASS（四口径）；
+  **CPU 字节锚两口径逐位不变**（Release `f360f9bdbbfbe12c` / Debug
+  `8809f07142e29472`）；**GPU dev2 锚按批移动**：Release `e9d6c87973fc01b5` →
+  **`f1f5de1c4420d565`**、Debug `b41790d04e0007a0` → **`d782e300e340edda`**
+  （`--steps 20 --gpu 2` 均 verdict=PASS）；`doc_inventory` 三门禁
+  （virtual 52 / L2-VIOLATIONS 0 / HANDWRITTEN-RESIDUE 0）exit 0、
+  `doc_align_audit` exit 0；注册表新增 **9 对 `#ks`/`#kr`**（main 100 结构、
+  9 细 tile、9 K 切分对；`expr_fuse_test` 收集器 10 对；`[gen]` 行新增
+  「+N 条 K 切分变体(#ks+#kr)」）。
+- **5. 关键文件**：`expr_spec.hpp`（两个后缀 + KSPLIT_MIN_WGS/MAX_S 与取值依据）、
+  `expr_glsl_gen.hpp`（`glsl_emit_matmul_tail_fn` 抽取共用 / `generate_glsl_matmul`
+  的 k_split 分支（段界守卫、%nx 列块、免尾链写回）/ 新生成器
+  `generate_glsl_matmul_ksplit_reduce` / `generate_glsl` 开关）、`expr_emitter.hpp`
+  （`generate_matmul_ksplit{,_reduce}` 两个虚接口——ExprEmitter 不计入
+  doc_inventory 的 52 口径）、`tools/fused_generate.hpp`（配对发射 + 注册行 +
+  合成 spec）、`backend/compute_vk_backend.hpp`（注册豁免/pc_base_fixed 特判、
+  选择与两段派发、两个 env 阀、批量录制安全注释）。
+- **6. 缓做**：OP 级 `matmul_tiled` 的同机制 K 切分（e2e 瓶颈在 fused 路径，
+  OP 级暂无实测收益证据）。
+- 产物：`build/ab/ab_pks.ps1`（A/B 脚本）、`build/ab/pks_{ks,off,warm}_run*.txt`。
+
+---
+
 # P3 跨链批量派发：`#b` 批量变体 + BDA 实例表 + 图内同签名分组（2026-10-06）
 
 - **类型/机制**：通用机制（闭合世界、可降级、可观测），非单算子特例；数值面零变化
@@ -2903,3 +3268,103 @@ F2 的实测瓶颈是**双份归因**（`supports_expr_precision_variant` 每次
 `src/model_roles_test.cpp`（Model 角色只读态 + 前向逐位一致 / Checkpoint 角色 latent
 逐位一致 + 可续训 / 推理文件小于断点文件 / `peek_model_role` / 只读态按断点角色导出报错）
 取代原 `ternary_deploy_test` 的部署格式面。
+---
+
+# 录制窗口排空隐藏 + SpecBuilder 输入槽去重（项目 4/5，2026-10-08）
+
+## copy_from fresh 上传免排空（项目 4）与输入槽去重（项目 5）
+
+- 类型：性能 A/B + 演进记录（含闭合世界分叉的实测暴露与补登记）。
+- **立项来源**：剖析画像定位的两个瓶颈——① `copy_from` 121 次/20 步、占墙钟
+  71.8%（host 反复 `end_batch → wait_in_flight → begin_batch` 全排空，
+  busy 已 90% ⇒ 收益在"把等待藏掉"）；② 反传注意力 `86c84dd0293c4913`
+  （`recompute_W_` softmax）归约链 4 槽冗余 + `fused@bwd.blk` 家族 10.3 ms/step。
+
+- **项目 5：SpecBuilder 输入槽去重（通用 IR 机制，非注意力专属）**：
+  - 中心化 `SpecBuilder::add_input(t, view, dedup=true)`：同
+    `Tensor::same_storage`（同设备/精度/存储指针/形状）+ 同 `ExprView` →
+    复用已有槽、不新增绑定。全部 `add_input_*` 与 `BatchModRef/BatchColRef`
+    的 `to_spec` 收口到它。
+  - **两处调用方必须独占新槽**（返回值即下标，不能用 `inputs.size()` 预判）：
+    `RowGatherRef`（登记后改写 `views[ti]` 为 RowGather，复用会污染原输入视图
+    → `dedup=false`）；`MatmulNode` A/B（vec4 快路径以 `a_slot != b_slot` 为
+    启用条件，同张量 `matmul(X,X)`（Muon Nesterov/NS）合并成单槽会**整体关闭
+    快路径**、标量回退 → A/B 恒 `dedup=false`）。
+  - `Tensor::same_storage`：新增公开**身份**比较（返回 bool，不暴露存储访问，
+    符合铁律 #11）；**无效张量一律判不等**——锚点符号实例（占位张量）不参与
+    去重，否则扫描期/运行期结构分叉（见下）。
+  - 收益（`recompute_W_` 实测）：4 槽 → 2 槽，归约生成器的 RowReduceMax 全矩阵
+    pass 减半 + 重复 `sub/exp` 链因输入下标一致被 CSE 合并。fold spec、
+    `expr_graph` FusedKernelInput 不走 SpecBuilder，零影响。
+
+- **实施期暴露的闭合世界分叉（已修）**：去重后**运行期真实张量结构 ≠ 锚点符号
+  结构**，同一表达式两个 key。锚点侧登记旧结构、dry-run 侧（真实张量）登记新
+  结构；只被锚点覆盖、dry-run 未执行到的调用点 → 运行期新 key 未登记 → 硬报错。
+  实测中招：**`Softmax::backward`**（`expr_gpu_test`/`fused_gpu_test` 双挂，
+  key=`f017f5936c6a76c1`）——softmax 层不在任何模型主干（注意力走 fold），
+  此前只靠锚点。修法 = `scan_exprs` 补 **Softmax fwd+bwd 真实张量 dry-run**
+  （按既有约定：dry-run 是结构主要来源）。冒烟扫残余 miss：gpt/rapt 训练、
+  mnist mlp/transformer/cnn 训练、`--f16` 分派、text_infer 增量推理、
+  checkpoint-every、Muon（`matmul(X,X)`）**全部无闭合世界报错**。
+  结构数 91 → **99**（去重令部分结构锚点/双侧各一 + Softmax 补登记）。
+  残余风险披露：锚点独有结构中含重复视图者（见 `NN_SCAN_DUMP_SOURCES=1`）若
+  未来新增同张量调用点而无 dry-run 覆盖 → 闭合世界硬报错，届时补 dry-run 即可。
+
+- **项目 4：copy_from fresh 上传免排空**：
+  - `copy_from(dst, src, fresh_dst=false)` / `write(t, span, fresh_dst=false)`
+    新增参数（`copy_from_impl` 虚签名同步；CPU 实现忽略）。
+    `fresh_dst=true` = 调用方声明 dst 是刚创建、当前录制帧与在飞帧都不可能
+    引用的全新张量 → GPU 侧**跳过整段 `end_batch/wait_in_flight/begin_batch`
+    排空**，直接 `upload_blocking`。
+  - 正确性论证：反向依赖（当前帧先前命令写 dst、被先执行的上传覆盖）不存在——
+    全新 buffer 无任何已录命令引用（3 参 `create_tensor` = 纯分配不录命令；
+    池化复用只在写出方帧 fence 信号、`flush_pending_destroys` 归还之后才可能）；
+    正向依赖（后续帧读 dst）由 `upload_blocking` 的时间线信号量 + 各帧 submit
+    处 `collect_staging_waits` 显式保证（与 `from_matrix` 批内上传同一条既有
+    机制）。
+  - **唯一承诺方 = `detail::upload_span`**（create→write 相邻形态），两处
+    `write` 传 `true`；其余调用方（load_model / 测试直写既有张量）默认
+    `false` 保留原排空语义 → **零回归**。
+  - 逃生阀 **`NN_COPY_FROM_DRAIN=1`**（进程内静态缓存，fresh 也强制走旧排空
+    路径，A/B 对照；与 `NN_MM_NO_KSPLIT` 同口径）。
+  - 实施期另一发现：去重把 Muon 的 `matmul(X,X)` 合并成单槽后，K 切分生成器的
+    vec4 别名声明被 `vec4_ok=false` 跳过但 `b0v4` 引用仍在 → `glslc` 12 错；
+    matmul 排除去重后即消失（见上项目 5 两处独占槽）。
+
+- **同窗交错 A/B**（text_train d64/L4/H4/ff256/seq256/B64、adam、20 步、
+  GPU 40HX、3 对、弃冷启动、`NN_PROFILE=1`）：
+  1. **项目 4 单项**（同一 binary，`NN_COPY_FROM_DRAIN` 开关）：
+     | 口径 | OFF（旧排空） | ON（fresh） | Δ |
+     |---|---|---|---|
+     | step 墙钟 ms/20 步 | 1481.8 / 1462.5 / 1477.7（均 **1474.0**） | 1354.6 / 1363.2 / 1353.0（均 **1356.9**） | **−7.9%** |
+     | `copy_from` 合计 ms | ~1076 | **~231** | **−78%** |
+     | GPU busy% | 90.2 | **95.5** | +5.3pt |
+  2. **项目 5 单项**（基线二进制 vs 新二进制，新侧关 fresh 阀 = 只差去重）：
+     | 口径 | 基线 | 去重 | Δ |
+     |---|---|---|---|
+     | step 墙钟 ms/20 步 | 1497.2 / 1494.7 / 1468.0（均 **1486.6**） | 1450.4 / 1456.6 / 1465.2（均 **1457.4**） | **−2.0%** |
+     | softmax 重算桶（`86c84dd`→`b58f7bf1`，4 块合计 ms/20 步） | 88.4（均） | **67.1**（均） | **−24.0%** |
+  3. **总效果**（基线二进制 vs 两改动全开）：
+     | 口径 | 基线 | 全开 | Δ |
+     |---|---|---|---|
+     | step 墙钟 ms/20 步 | 1505.6 / 1489.2 / 1495.0（均 **1496.6**） | 1380.5 / 1366.6 / 1360.9（均 **1369.3**） | **−127.3 ms（−8.5%）** |
+     | E2E ms/step | 74.8 | **68.5** | −6.3 ms/step |
+     | `copy_from` 合计 | ~1100 ms | **~234 ms** | −79% |
+     | GPU busy% | 89.2~90.5 | **95.4~95.6** | +5.3pt |
+     对 torch fp32 50.7 ms/step 差距 **1.48× → 1.35×**。
+
+- **验收**：`cmake --build build` 干净（ninja: no work to do）；ctest
+  **29/29**（去重中途两轮挂 `expr_gpu_test`/`fused_gpu_test` 的 Softmax
+  闭合世界 miss，补 dry-run 后全绿）；**CPU 字节锚 `f360f9bdbbfbe12c` 与
+  GPU dev2 字节锚 `f1f5de1c4420d565` 双双逐位不变**——两改动均数值中性
+  （去重只消冗余同值计算、fresh 只改上传时序，求值序/求和序零变化 ⇒ **锚不
+  移动**，无需按 K-split 先例重测移锚）；`doc_inventory` exit 0
+  （virtual 52 / L2-VIOLATIONS 0 / HANDWRITTEN-RESIDUE 0）、
+  `doc_align_audit` exit 0；多架构冒烟（gpt/rapt/mlp/transformer/cnn/f16/
+  infer/checkpoint/muon）无闭合世界报错。
+- **关键文件**：`expr_dsl.hpp`（`SpecBuilder::add_input` 去重中心 + `RowGather/
+  Matmul` 独占槽）、`compute_tensor.hpp`（`same_storage`）、
+  `compute_engine.hpp`（`copy_from/write` 的 `fresh_dst` 契约 + `upload_span`
+  承诺方）、`compute_cpu_engine.hpp`/`compute_gpu_engine.hpp`（`copy_from_impl`
+  新签名 + fresh 分支 + `NN_COPY_FROM_DRAIN` 阀）、`tools/scan_exprs.cpp`
+  （Softmax dry-run 补登记）、`build/ab/ab_copy.ps1`/`ab_p5.ps1`（A/B 脚本）。

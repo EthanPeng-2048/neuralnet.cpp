@@ -38,7 +38,7 @@ namespace detail {
 // 终止策略：铁律 #1 禁异常，这里只有 abort / exit 两条路，库头不出现 throw。
 // ⚠ Windows：CRT 在 abort() 时弹**模态**"abort() has been called"对话框
 //   （GUI 弹窗不进 stdout/stderr → 日志/审计全看不见，测试与脚本被卡死等人点；
-//   2026-10-06 实测 `error_macro_test` 的 abort 负例子进程即弹了此框）。错误
+//   实测 `error_macro_test` 的 abort 负例子进程即弹了此框）。错误
 //   信息本函数已打印到 stderr，可见性不受影响 → 终止前把 CRT 运行时错误/abort
 //   消息与 WER 上报全部改道/静音，保证 abort 恒为"打印后立即终止"。
 [[noreturn]] inline void fail_abort(const std::string& msg)

@@ -1,8 +1,6 @@
 # 踩坑警示录（Pitfalls & Lessons）
 
 > 本文档汇总项目开发至今踩过的所有坑，按严重度分级，提炼跨领域的根因模式，并提供开发活动的防坑清单。**每次踩新坑，先补充到本文档，再修复代码。**
->
-> 更新频率：随开发持续追加。最近更新：2026-09-27
 
 ---
 
@@ -255,7 +253,7 @@
 ### 4.13 DSL 裸视图根 → 空指令表：只在 GPU 爆（CPU 模板路径不校验）
 
 - **症状**：CNN 前向在 GPU 上硬报错 `validate_expr_spec: empty instruction list`；
-  同规格 CPU 完全正常、ctest 全绿（MaxPool2D 事故，2026-09-27 修复）。
+  同规格 CPU 完全正常、ctest 全绿（MaxPool2D 事故）。
 - **根因**：IR 规定"输出 = 最后一条指令的 dst"，`dsl::compute` 的**根节点是裸视图**
   （`grouped_reduce_max(x, R)`、`row_broadcast(v)` 这类只登记 view/input、不产生指令的
   节点）时，折叠出的 `ExprSpec` 指令表为空 → `validate_expr_spec` 直接拒绝。而 CPU 走
@@ -297,7 +295,7 @@
 | C++ CharBPETokenizer 对中文仍是 UNK | 分词器 | 字节级 BPE 拆中文字节，须改 encode 或换 charbpe |
 | tokenizer_infer 预览截断产生半个 UTF-8 字符（终端 ``） | 分词器 | 按完整字符（首字节宽 1/2/3/4）截断 |
 | Windows CRT `abort()` 弹**模态**"abort() has been called"对话框（GUI 弹窗不进 stdout/stderr → 日志/审计全看不见，ctest/脚本卡死等人点；实测 `error_macro_test` 的 abort 负例子进程弹框） | 工程 | abort 落点（`core_errors.hpp` `fail_abort`）终止前 `_set_abort_behavior(0, _WRITE_ABORT_MSG\|_CALL_REPORTFAULT)` + `_set_error_mode(_OUT_TO_STDERR)`——错误信息本就打 stderr，abort 恒为"打印后立即终止"；**弹窗类报错 grep 不到，只能靠人眼/截图**，遇到"测试全绿但用户看到报错"先想 GUI 弹窗 |
-| **跨时段 GPU 设备计时不可比**：同二进制同 shader（注册表内容跨时段不变证实）的 CE 3 kernel 会话早期测 13.2 ms/step、晚期稳定 5.93 ms/step（2.2×），同时段非 CE kernel 一致 ⇒ 非时钟/热；对照混入过的假设有模型形状（`--d-model` 默认 vs 显式）与精度变体分派（`--f16`）——均已排除仍无法归因（P4 实测，2026-10-06） | 性能测量 | **性能数字只认同窗交错测量**（新旧二进制交替跑、或同窗多复测）；跨时段对比必须先用同窗复测证明口径稳定，否则差异可能是机器状态漂移而非代码收益 |
+| **跨时段 GPU 设备计时不可比**：同二进制同 shader（注册表内容跨时段不变证实）的 CE 3 kernel 会话早期测 13.2 ms/step、晚期稳定 5.93 ms/step（2.2×），同时段非 CE kernel 一致 ⇒ 非时钟/热；对照混入过的假设有模型形状（`--d-model` 默认 vs 显式）与精度变体分派（`--f16`）——均已排除仍无法归因（P4 实测） | 性能测量 | **性能数字只认同窗交错测量**（新旧二进制交替跑、或同窗多复测）；跨时段对比必须先用同窗复测证明口径稳定，否则差异可能是机器状态漂移而非代码收益 |
 | 模型/词表等训练产物进 git（204MB 数据集） | 工程 | .gitignore 只留源码，产物一律忽略 |
 
 ---
@@ -395,5 +393,5 @@ GPU-resident 单算子对、链式错；attn batch=1 对、batch=2 错；gradche
 - `10-development-standards.md`（同目录）— 分层职责规范（"每层只能负责每层的事"）
 - `../introduction/01-architecture.md` — 架构分层
 - `06-rapt-algorithm.md` — 线性注意力家族（RLA / RAPT / RLA-2）的设计与工程约束
-  （原 `07-zipt-algorithm.md` 随 AttnZip 于 2026-10-01 移除，见 `docs/history.md`）
+  （原 `07-zipt-algorithm.md` 已随 AttnZip 移除，见 `docs/history.md`）
 - `../usage/04-train-package.md` — 训练包格式
