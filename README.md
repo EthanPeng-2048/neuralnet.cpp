@@ -26,6 +26,9 @@
 | [性能优化](docs/introduction/02-performance.md) | 自适应并行、线程池、缓存分块、GPU 加速、算子融合等 |
 | [算法解析](docs/introduction/03-algorithm-reference.md) | 每个 Layer/Loss/Optimizer 的数学原理与原语分解 |
 | [创新设计](docs/introduction/04-innovative-designs.md) | 引擎化、AOT 融合、多精度等创新全景 |
+| [C++ API 手册](docs/development/cpp-api-manual.md) | **库使用者首选**：引擎/张量/精度/层/模型/损失/优化器/训练/模型文件/数据集/分词器/生成，每节带代码片段 |
+| [构建集成](docs/development/cmake-integration.md) | 把库接进自己的 CMake 工程：接入两行、全部构建开关、GPU 语义、自研算子融合注册 |
+| [写自定义层](docs/development/write-a-custom-layer.md) | 自定义层的完整示例 + 接入契约 + 数值梯度自检 + GPU 检查清单 |
 | [计算引擎开发](docs/development/01-compute-engine-development.md) | ComputeEngine 接口详解、实现模式、添加新原语 |
 | [多精度计算](docs/development/05-mixed-precision.md) | f16/混合精度语义契约：Precision 类型系统、PrecisionProfile、已知数值限制 |
 | [线性注意力](docs/development/06-rapt-algorithm.md) | RLA → RAPT → RLA-2 算法谱系 + GPU 扫描原语落地 |
@@ -55,10 +58,13 @@ neuralnet.cpp/
 │   │   ├── 03-algorithm-reference.md     ← 算法解析参考
 │   │   └── 04-innovative-designs.md      ← 创新设计全景
 │   ├── development/          ← 开发类（**调用者**：扩展/接入库）
+│   │   ├── cpp-api-manual.md             ← 全功能 C++ API 手册
+│   │   ├── cmake-integration.md          ← 接入与构建（CMake / 开关 / GPU / 融合注册）
+│   │   ├── write-a-custom-layer.md       ← 写自定义层指南
 │   │   ├── 01-compute-engine-development.md ← 引擎开发指南（加新原语）
 │   │   ├── 05-mixed-precision.md         ← 多精度语义契约
 │   │   ├── 06-rapt-algorithm.md          ← RLA / RAPT / RLA-2 算法
-│   │   └── 20-custom-layer-ergonomics.md ← 写自定义层
+│   │   └── 20-custom-layer-ergonomics.md ← 写自定义层实测报告
 │   ├── usage/                 ← 使用类（调用者）
 │       ├── 01-quickstart-model.md        ← 模型构建教程
 │       ├── 02-quickstart-train-infer.md  ← 训练推理教程

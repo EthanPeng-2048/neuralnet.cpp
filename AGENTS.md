@@ -327,10 +327,13 @@ optimizer.step();
 | 文档 | 何时读 |
 |------|--------|
 | `development/README.md` | 本分册定位与索引（明确"写给调用者"） |
+| `development/cpp-api-manual.md` | **全功能 C++ API 手册（库使用者首选）**：错误宏 / 引擎 / 张量 / 精度 / DSL / 层与 Model / 模型工厂 / 损失 / 优化器 / 训练循环 / 模型文件 / 数据集 / 分词器 / 生成 / 剖析，每节带可粘贴代码片段；§0 有"我要做什么 → 看哪节"表 |
+| `development/cmake-integration.md` | **接入与构建**：`add_subdirectory`/`FetchContent`、门面目标 `neuralnet::nn` 传递内容、全部构建开关（`NN_ENABLE_GPU`/`NN_BUILD_APPS`/`NN_ENABLE_TESTS`/`NN_ENABLE_PCH`/`NN_ENABLE_NATIVE`/`NN_ENABLE_PROBES`/`NN_COMPILER_LAUNCHER`）、GPU 语义、`nn_enable_gpu_fusion(target MAIN <main源> [OUT_DIR ...])`、本仓构建/测试、跨平台、故障排查 |
+| `development/write-a-custom-layer.md` | **写自定义层的指南**（P1-6）：完整示例（实测过数值梯度检查 + 训练收敛）+ 七条接入契约 + 精度槽声明 + 可复制的梯度自检片段 + GPU 检查清单 + 常见编译错误对照。背景实测见 `development/20` |
 | `development/01-compute-engine-development.md` | **扩展引擎原语**：接口详解、CPU/GPU 实现模式、添加新原语的完整步骤 |
 | `development/05-mixed-precision.md` | **多精度语义契约（写层 / 选 profile 必读）**：Precision 类型系统、类型化存储、分派、`PrecisionProfile`（param/compute/stable/optimizer）、实测结论与已知数值限制（§12） |
 | `development/06-rapt-algorithm.md` | **线性注意力（RLA → RAPT → RLA-2）**：直观理解 + 数学定义 + 扫描原语工程落地 + 训练显存开关 |
-| `development/20-custom-layer-ergonomics.md` | **写自定义层**：库外使用者视角的接入契约、7 个摩擦点与实测报告 |
+| `development/20-custom-layer-ergonomics.md` | **写自定义层的实测报告**：库外使用者视角的接入契约、7 个摩擦点（是 `write-a-custom-layer.md` 的背景证据，不是操作指南） |
 
 ### 内部工作区（docs/todo/，**给项目开发者**）
 

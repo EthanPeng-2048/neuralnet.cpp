@@ -109,7 +109,7 @@
 | X3 | 无 Python / C 绑定 | 仓库仅有 `gui.py` 这一 Python 入口（subprocess 调 CLI） | 生态集成只能走命令行 + 文件 |
 | X4 | `gui.py` 六个 Tab、7 处手写 `collect_args` | `gui.py`（`def collect_args` 实测 7 处） | 加 CLI 选项要手改多处，漏参风险（13 §4 的"五个 Tab / 1471-1500"坐标已过期） |
 | X5 | GUI 画布拖动全量降采样重绘 | `gui.py:1135`（`_on_draw_move`）；已有节流先例 `gui.py:216`（`_RENDER_MS = 250`） | 快速拖动卡顿 |
-| X6 | **无"写自定义层"使用文档**：层接入的四条契约（`init_impl` NVI / `checkpoint_mode_` 缓存 / `activation_cache` / 精度 profile 用法）只在库内源码里；配套的 2 个易用性隐患（`NN_CHECK` 名为 CHECK 实为 unwrap、"造张量"两套失败协议）也没有成文 | 实测报告与逐条坐标见 `docs/development/20-custom-layer-ergonomics.md`（v1.7.0，库外视角）；最小样例 `examples/custom_layer_lowrank.hpp` + `examples/custom_layer_train.cpp` | 使用者写出"能编译但静默失效"的层（精度硬编码、offload 失效、gradcheck 全无）；库内 C7（Conv2D 硬编码 F32）即同一成因；自定义层是生态缺口的入口，文档缺口直接抬高外部贡献门槛 |
+| X6 | **无"写自定义层"使用文档**（**文档部分已修，2026-10-11**）：层接入的七条契约（`init_impl` NVI / `checkpoint_mode_` 缓存 / `activation_cache` / 精度 profile 用法 …）现成文于 `docs/development/write-a-custom-layer.md`（含自包含、经数值梯度检查实测通过的层模板 + 可复制 gradcheck 片段 + GPU 清单）；`NN_CHECK` 是 unwrap 也已在该文与 `docs/development/cpp-api-manual.md` §1.3 说明 | 指南：`docs/development/write-a-custom-layer.md`；背景实测报告（含逐条坐标）见 `docs/development/20-custom-layer-ergonomics.md`（v1.7.0，库外视角） | 使用者写出"能编译但静默失效"的层（精度硬编码、offload 失效、gradcheck 全无）；库内 C7（Conv2D 硬编码 F32）即同一成因；剩余缺口 = R2（`Layer::init` 精度自检）仍为代码项 |
 
 ### 3.4 模型能力
 
@@ -167,7 +167,7 @@ P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
 | **P1-3 危险精度组合 fail-fast** | 启动期拒绝 `optimizer=f16` / 四字段全 f16 的组合，或明确要求显式确认开关（拟新增，名字待定） | 危险组合直接退出并打印原因；`--f16` 与合法 `--precision-*` 组合不受影响；新增 CLI 断言测试 | 小 | 无。依据 `docs/development/05-mixed-precision.md` §12.5 的实测结论 |
 | **P1-4 `gpt_test` flaky 定位** | 复现并消除偶发失败（或定位为已知资源边界并加显式 skip/重试语义） | 连续大样本直跑零失败；定位结论写入 `docs/history.md` | 小–中（复现成本不确定） | P0-1（需要 CI 反复跑才有样本） |
 | **P1-5 CI 冒烟扩到 MSVC Debug + 权重变化断言** | Debug 构建冒烟；训练 N 步后断言参数**确实变化**（防"loss 不动"类静默失败） | CI 中 MSVC Debug 目标编译通过；权重变化断言可检出冻结；大 TU 若触发 C1128 再出 `/bigobj` | 中 | P0-1。可复用 `f16_writeback_probe` 的"8 步 Adam 参数必须移动"思路 |
-| **P1-6 自定义层使用文档 + 精度自检** | 新增 `docs/usage/06-write-a-custom-layer.md`（层骨架模板 + gradcheck 片段 + 四条隐式契约 + GPU checklist）；`Layer::init` NVI 处加"`profile.param == F16` ⇒ `parameters()` 全为 F16 存储"的统一自检 | 文档：按模板能写出一个可训练的自定义层（样例 `examples/custom_layer_*` 即验收物）；自检：C7 形态的硬编码 F32 层被启动期拒绝，新增断言测试 | 小 | 无。问题清单与逐条坐标见 `docs/development/20-custom-layer-ergonomics.md` §2，修复建议 §4（R1/R2） |
+| **P1-6 自定义层使用文档 + 精度自检**（文档部分 **✅ 已完成 2026-10-11**；精度自检 R2 仍 Open） | ① 文档：已落 `docs/development/write-a-custom-layer.md`（层骨架模板 + 可复制 gradcheck 片段 + 七条契约 + GPU checklist；示例层经数值梯度检查实测通过 `max|num−an| = 4.7e-06`、50 步 Adam 收敛）——落在 `development/` 而非原计划的 `usage/06`（该分册定位即"写自定义层"，见 `docs/README.md` §1.1）；② 代码（未做）：`Layer::init` NVI 处加"`profile.param == F16` ⇒ `parameters()` 全为 F16 存储"的统一自检 | 文档：按模板能写出可训练的自定义层（已由指南 §1/§3 的实测代码满足）；自检：C7 形态的硬编码 F32 层被启动期拒绝，新增断言测试 | 小 | 无。问题清单与逐条坐标见 `docs/development/20-custom-layer-ergonomics.md` §2，修复建议 §4（R1 已完成 / R2 待做） |
 
 ### 4.3 P2（3–6 月：结构优化）
 
