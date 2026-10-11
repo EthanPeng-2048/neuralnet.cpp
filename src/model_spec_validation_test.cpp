@@ -246,7 +246,7 @@ int run_test()
     // ── 6. 已移除模型类型（ZiPT，type=6）必须被明确拒绝 ────────────────
     // AttnZip/ZiPT 已整体移除；ModelType 的 6 号取值保留为
     // Reserved_ZiPT 占位，旧 .bin（type=6）应得到**可读的**错误
-    // （而非含糊的 "Unknown" 或静默误解）。见 docs/history.md「ZiPT 移除」。
+    // （而非含糊的 "Unknown" 或静默误解）。见 docs/history/history.md「ZiPT 移除」。
     std::cout << "\n── 已移除模型类型（type=6）拒绝 ──\n";
     {
         nn::KeyValueRecord kv;

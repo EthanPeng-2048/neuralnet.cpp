@@ -116,6 +116,6 @@ nn_enable_gpu_fusion(my_app MAIN ${CMAKE_CURRENT_SOURCE_DIR}/my_app_main.cpp)
 | `target was not found: Vulkan::Vulkan` | 在自己的 CMakeLists 里直接 `target_link_libraries(... Vulkan::Vulkan)`——imported 目标不可跨目录引用。改为链接 `neuralnet::nn`（Vulkan 作为接口需求传递） |
 | GPU 运行期 `expr_spec_key ... closed world` 硬报错 | 自研 `dsl::compute` 未注册 → 加 `nn_enable_gpu_fusion(...)`（§4） |
 | `nn_enable_gpu_fusion` 报 "Unknown CMake command" | 版本较旧的构建缓存；重新 configure。当前版本在 GPU 不可用时也定义了 stub，会给出指向根因的报错 |
-| 编译报 `cxx_std_26 not known to CXX compiler` | 编译器过旧；本库需 Clang 22+ / GCC 15+ / MSVC（VS2026+，走 `/std:c++latest`） |
+| 编译报 `cxx_std_26 not known to CXX compiler` | 编译器不支持 C++26；换一个支持 C++26 的版本即可（不限厂商/具体版本） |
 | 消费方目标找不到 `neuralnet.cpp/nn.hpp` | 确认链接的是 `neuralnet::nn`（include 目录经它传递），且在 `add_subdirectory` **之后** |
 | 找到了 Vulkan 但想要纯 CPU | `-DNN_ENABLE_GPU=OFF`（在 add_subdirectory 之前或命令行） |

@@ -82,14 +82,14 @@ endif()
 #   cl.exe 默认走传统预处理器，它在把 `__VA_ARGS__` 代入**嵌套宏调用**时
 #   会把整个实参表当成**一个**实参（core_errors.hpp 的 NN_DETAIL_PICK2/3 实参
 #   计数分发因此全部错位）。后果对两种语义都致命：
-#     · `NN_CHECK(cond, "ctx")` → 错选 NN_CHECK_1 → 展开成逗号表达式
+#     · `NN_UNWRAP(cond, "ctx")` → 错选 NN_UNWRAP_1 → 展开成逗号表达式
 #       `check_value((cond, "ctx"), …)` → 条件恒为字符串指针（恒真）
-#       → **检查静默失效且编译通过**（实测：`NN_CHECK(false, "x")` 不 abort）；
+#       → **检查静默失效且编译通过**（实测：`NN_UNWRAP(false, "x")` 不 abort）；
 #     · `NN_EXIT(cond, code, "ctx")` → 错选 NN_PICK_END → C3861 编译失败。
-#   打开 /Zc:preprocessor 后两种形态均按 C++ 标准展开（实测 `NN_CHECK(false,…)`
+#   打开 /Zc:preprocessor 后两种形态均按 C++ 标准展开（实测 `NN_UNWRAP(false,…)`
 #   正常 abort），本仓 500+ 处宏调用点的语义在 MSVC 下才与 clang/GCC 一致。
 #   该开关同时也是**接口**选项（见下方 nn_core），否则库外消费者在 cl.exe 下
-#   会拿到失效的 NN_CHECK。
+#   会拿到失效的 NN_UNWRAP。
 if(MSVC)
     # ⚠ 字符集只用 **/utf-8 一种写法**（= /source-charset:utf-8 +
     #   /execution-charset:utf-8）。此前这里写的是那对分开的开关，而
@@ -325,7 +325,7 @@ target_compile_options(neuralnet_cpp INTERFACE
     # 目录级与接口级必须同用 /utf-8，混用分开的两个开关会让 cl 直接拒绝命令行）。
     # ⚠ 这同时要求消费方源码也是 UTF-8（现代工程默认如此）。
     # /Zc:preprocessor 必须随接口传出去（见上方公共标志处的实测说明：
-    # 传统预处理器会让 NN_CHECK/NN_EXIT 的变参分发错位）。
+    # 传统预处理器会让 NN_UNWRAP/NN_EXIT 的变参分发错位）。
     $<$<CXX_COMPILER_ID:MSVC>:/utf-8>
     $<$<CXX_COMPILER_ID:MSVC>:/Zc:preprocessor>)
 
@@ -440,8 +440,12 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     endif()
 endif()
 
-# ── 测试 / 验证目标（默认关闭，NN_ENABLE_TESTS=ON 时构建）─────────────
-if(NN_ENABLE_TESTS)
+# ── 测试 / 验证目标 ────────────────────────────────────────────────────
+# 构建门 = (NN_BUILD_APPS OR NN_ENABLE_TESTS)：默认（顶层工程 NN_BUILD_APPS=ON）
+#   就把全部回归可执行文件编出来，方便本地**直接跑**（无需每次重配）；
+#   `-DNN_ENABLE_TESTS=OFF -DNN_BUILD_APPS=OFF` 才是"纯库、零测试产物"。
+# （ctest 注册另算，见下方 NN_ENABLE_TESTS 门——只编不注册 = 本地手跑。）
+if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
 
     # ══════════════════════════════════════════════════════════════════════
     # 测试目标（19 个，按功能域分组合并）
@@ -531,7 +535,7 @@ if(NN_ENABLE_TESTS)
     list(APPEND NN_TEST_TARGETS doc_attn_test)
 
     # ── ZiPT / AttnZip 已移除（保留在 legacy/zipt 分支）──
-    #     恢复前提见 docs/history.md「ZiPT 移除」条。
+    #     恢复前提见 docs/history/history.md「ZiPT 移除」条。
 
     # ── RAPT / ReLU 线性注意力（梯度 + 冒烟 + 梯度检查点）──────────────
     nn_add_executable(rapt_test src/rapt_test.cpp)
@@ -542,7 +546,7 @@ if(NN_ENABLE_TESTS)
     list(APPEND NN_TEST_TARGETS expr_cpu_test)
 
     # ── 图 IR + 融合分析（IR-C，纯 CPU：链融合/边界/确定性/matmul 参与）──
-    # 历史归档见 docs/history.md「IR-C 定位修正与恢复立项」
+    # 历史归档见 docs/history/history.md「IR-C 定位修正与恢复立项」
     nn_add_executable(expr_graph_test src/expr_graph_test.cpp)
     list(APPEND NN_TEST_TARGETS expr_graph_test)
 
@@ -568,7 +572,7 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(ce_fusion_test src/ce_fusion_test.cpp)
     list(APPEND NN_TEST_TARGETS ce_fusion_test)
 
-    # ── 错误处理宏族（NN_CHECK / NN_EXIT / NN_TRY_MSG / NN_FAIL）────────────
+    # ── 错误处理宏族（NN_UNWRAP / NN_EXIT / NN_TRY_MSG / NN_FAIL）────────────
     # 覆盖：解值三形态 + 打印格式 + 传播语境前缀 + 终止/退出码
     # （终止行为经子进程 --expect-abort / --expect-exit <n> 断言，本进程不终止）
     nn_add_executable(error_macro_test src/error_macro_test.cpp)
@@ -601,20 +605,24 @@ if(NN_ENABLE_TESTS)
 
 endif()
 
-# ── 测试目标统一处理：输出到 <默认可执行目录>/test，并注册到 ctest ──────────
-# 单一开关 NN_ENABLE_TESTS 同时负责「编译测试程序」与「注册 ctest 测试」：
-#   编译：上面 if(NN_ENABLE_TESTS) 内的 nn_add_executable(...)
-#   注册：这里对 NN_TEST_TARGETS 逐一 add_test
-# 可执行文件位置不硬编码生成器差异，统一设为 ${CMAKE_CURRENT_BINARY_DIR}/test，
-# 由 CMake 自动适配：
+# ── 测试目标统一处理：输出到 <构建根>/test ──────────────────────────────
+# 编译门（上面）与注册门（下方 NN_ENABLE_TESTS）解耦，故输出目录在此统一设置。
+# 可执行文件位置不硬编码生成器差异：
 #   - 单配置生成器（Ninja / Make）：默认可执行目录为 build 根目录 → build/test
 #   - 多配置生成器（MSVC）：CMake 自动追加配置子目录 → build/test/Release(或 Debug)
 # add_test 直接传目标名，CTest 会按当前配置自动解析出真实可执行文件路径。
+foreach(TARGET ${NN_TEST_TARGETS})
+    set_target_properties(${TARGET} PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test)
+endforeach()
+
+# ── ctest 注册（NN_ENABLE_TESTS 门；编译门见上方 NN_BUILD_APPS 块）──────────
+# 注册门与编译门解耦：默认（NN_BUILD_APPS=ON）测试程序**已编译**，但只有
+# NN_ENABLE_TESTS=ON 才把 NN_TEST_TARGETS 逐一 add_test —— 用于「本地直接跑、
+# 不注册 ctest」的场景。输出目录已在上方统一设为 <构建根>/test。
 if(NN_ENABLE_TESTS)
     enable_testing()
     foreach(TARGET ${NN_TEST_TARGETS})
-        set_target_properties(${TARGET} PROPERTIES
-            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test)
         add_test(NAME ${TARGET} COMMAND ${TARGET})
         # 退出码 77 = 依约定"跳过"（如纯 CPU 构建下需要 Vulkan 的测试）：
         # 记 Skipped 而非 FAILED，否则 CPU-only 构建/CI 出现假红。
@@ -870,7 +878,7 @@ if(Vulkan_FOUND)
     #   include path 上即生效"这一既有机制不变。
     #
     # ⚠ 收集器**必须保留库内收集逻辑**：实测 84 个结构里只有 13 个来自
-    #   编译期锚点，71 个来自 dry-run/模型 pass（见 docs/history.md 与
+    #   编译期锚点，71 个来自 dry-run/模型 pass（见 docs/history/history.md 与
     #   docs/todo/02）。纯锚点收集器会漏掉库自身的结构。
     #
     # ── 树外可用性（CMake 函数作用域）────────────────────────────────────
@@ -1003,7 +1011,8 @@ if(Vulkan_FOUND)
         target_link_libraries(neuralnet_cpp INTERFACE Vulkan::Vulkan)
         add_dependencies(neuralnet_cpp compile_gpu_shaders)
 
-        # 为所有实际构建的目标启用 Vulkan（测试目标按 NN_ENABLE_TESTS 决定）
+        # 为所有实际构建的目标启用 Vulkan（含测试目标：它们由上方
+        # NN_BUILD_APPS OR NN_ENABLE_TESTS 门创建）
         set(NN_GPU_TARGETS ${NN_APP_TARGETS})
         if(NN_ENABLE_TESTS)
             list(APPEND NN_GPU_TARGETS ${NN_TEST_TARGETS})

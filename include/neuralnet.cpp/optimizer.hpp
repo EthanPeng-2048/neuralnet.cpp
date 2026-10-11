@@ -9,7 +9,7 @@
 //       （name：sgd / sgd_momentum / adam / adamw / muon）。
 // 用法：
 //     #include <neuralnet.cpp/optimizer.hpp>
-//     auto opt = NN_CHECK(nn::create_optimizer("adamw", engine,
+//     auto opt = NN_UNWRAP(nn::create_optimizer("adamw", engine,
 //                 model.parameters(), model.param_gradients(), /*lr=*/1e-4f, /*wd=*/0.01f));
 
 #include "compute_optimizer.hpp"

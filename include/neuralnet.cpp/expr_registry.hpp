@@ -35,7 +35,7 @@ namespace nn::fused
 // 只装**结构**：精度签名已不是构建期集合（生成阶段对每个结构发运行期精度
 // 分派 shader，键 `key#x`；见 expr_spec.hpp 的 EXPR_PREC_SIG_DISPATCH）。
 // 历史上有过 `variants`（(结构, 签名) 表）与 `contains_variant`——随签名
-// 降级为运行期参数一并删除（docs/history.md）。
+// 降级为运行期参数一并删除（docs/history/history.md）。
 struct ExprRegistry
 {
     std::vector<ExprSpec>       specs;

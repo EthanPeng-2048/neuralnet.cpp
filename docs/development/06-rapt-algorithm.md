@@ -1,7 +1,7 @@
 # 线性注意力家族：RLA / RAPT / RLA-2 与 GPU 落地
 
 > **读者**：调用者（库使用者 / 扩展者）——本分册定位见 [`README.md`](README.md)。
-> 项目内部的设计 / 路线图 / 盘点在 [`../todo/`](../todo/)，历史在 [`../history.md`](../history.md)。
+> 项目内部的设计 / 路线图 / 盘点在 [`../todo/`](../todo/)，历史在 [`../history.md`](../history/history.md)。
 
 > **30 秒了解 RAPT**：标准 Transformer 注意力要算 L×L 的分数矩阵，序列翻倍、开销翻四倍。
 > RAPT 走**线性注意力**路线：利用矩阵结合律，先把历史键值"汇总"成一个固定大小的
@@ -177,7 +177,7 @@ RAPT 是上述算法的工程实现：Layer 用 3 个 op-level 扫描原语 + DS
 `compute_layer_attention.hpp` 头注释）。掩码变体（Plain/Causal/Alibi/Doc/AlibiDoc）经 `FoldSpec`
 登记，漏登记即 GPU 闭合世界硬报错。backward 为 R/X 表达式 + 3 个 `batched_matmul`。
 
-> 与传统两趟式多 kernel 注意力（W 物化供复用）的对照分析已移入 `docs/history.md`。
+> 与传统两趟式多 kernel 注意力（W 物化供复用）的对照分析已移入 `docs/history/history.md`。
 
 ---
 

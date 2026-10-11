@@ -1,6 +1,6 @@
 # 三值（1.58-bit）量化权重与 BitLinear 设计
 
-> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history.md)。
+> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history/history.md)。
 
 > **状态**：**P1 已实施**（2026-10-09 起草；2026-10-10 裁定尺度 / 打包 / 命名；
 > 2026-10-10 落地 P1 全部 5 步并提交，见 §9 提交清单与 §7 实施清单末列）。
@@ -525,7 +525,7 @@ graph TB
     S --> S1["复合层自身（它自建的张量：token 嵌入 / RoPE 表）"]
     S --> S2["norm / 激活 / softmax / 位置编码"]
     L --> L1["BitLinear（4 投影 + fc1/fc2 + LM head）"]
-    P -. "未以三值模式构造却收到 T1_58<br/>→ fail-fast（不静默降级 f32）" .-> F["NN_CHECK 报错"]
+    P -. "未以三值模式构造却收到 T1_58<br/>→ fail-fast（不静默降级 f32）" .-> F["NN_UNWRAP 报错"]
 ```
 
 非三值入参（`param != T1_58`）时 `self == linear == 入参`（恒等）→ 既有路径零变化。
@@ -880,7 +880,7 @@ ctest **36/36**。
 [1] `.nnmodel` 载入后只读态 + 前向与保存前**逐位一致**；[2] `.nnckpt` 载入后 latent
 逐位一致且可继续反向；[3] 推理文件显著小于断点文件（base-3 + 无 latent）；
 [4] `peek_model_role` 与文件头一致；[5] 只读态按断点角色导出 → 明确报错。
-历史数字（NNQT 11.9× 更小 / 峰值显存持平 / 免 latent 构建尚缺）见 `docs/history.md`。
+历史数字（NNQT 11.9× 更小 / 峰值显存持平 / 免 latent 构建尚缺）见 `docs/history/history.md`。
 
 ### 4.16 P3 起步：int8 点积（W2A8）能力探测与路线判定（2026-10-11）
 
@@ -1005,7 +1005,7 @@ GPT 侧已于 **P1.5 落地**（§4.10），RAPT/ViT 仍拒绝（§4.10 边界�
 | 6 | `src/mnist_train.cpp`、`src/text_train.cpp` | `parse_precision` 接受 `t1_58`（**无别名**）；帮助行写明 `t1_58`（实现期细化为只挂 param 行，见 §4.9-1）；删掉 `mnist_train:678` 的冗余 `set_precision_profile`（D3(a) 的连带） | ✅ 步骤 2（删冗余）+ 步骤 4 |
 | 7 | `gui.py` + `bench/gui_cli_audit.py` | 参数精度下拉加 `"t1_58"`（实现期拆成 `PRECISION_PARAM_OPTIONS`，只挂 param 行）；审计脚本跑一遍确认仍退 0（只加**取值**、不加 flag，flag 面无变化） | ✅ 步骤 4 |
 | 8 | 新测试 | ① 能力校验：`param=T1_58` + 普通 `Linear` → **初始化期报错**（反向用例）；`BitLinear` + `param=f16` → 报错；② `BitLinear` 的 latent 梯度 = STE 公式（量化器不可微 → 与宿主解析式对拍）；③ 量化输出逐位符合 τ 规则；④ MLP 端到端小训练收敛（CPU + GPU 各一） | ✅ 步骤 2/3（`src/t1_58_test.cpp`：[1]–[8]）+ 步骤 4（[8] 规格往返） |
-| 9 | 文档 | `AGENTS.md` §3/§4/§11/§12 同步 + `docs/usage/03-compute-engine-usage.md` 的精度表（"仅 F16/F32 可用"）+ `docs/history.md` 条目 + 本文 §8 架构图 | ✅ 步骤 5 |
+| 9 | 文档 | `AGENTS.md` §3/§4/§11/§12 同步 + `docs/usage/03-compute-engine-usage.md` 的精度表（"仅 F16/F32 可用"）+ `docs/history/history.md` 条目 + 本文 §8 架构图 | ✅ 步骤 5 |
 
 **验收口径**（沿用仓库四件套 + 本设计的专属项）：
 
@@ -1129,7 +1129,7 @@ graph LR
 | 2 | `P1-步骤2` | `PrecisionSet`/`PrecisionSupport` + `Layer::layer_name()` + `init` 能力校验 + D3(a)/(b)（复合层 profile 下传 + init 后不可变；删 `mnist_train` 冗余注入） |
 | 3 | `P1-步骤3` | `BitLinear` 层 + MLP 工厂接线 + `ModelSpec.weight_quant` + `scan_exprs` 模型 pass + 三处"非存储精度"硬化（引擎/DSL/优化器） + `t1_58_test`[1–7] |
 | 4 | `P1-步骤4` | CLI/GUI 接入 `t1_58`（param 行）+ `gui_cli_audit` PASS + 规格往返测试 [8] + 层名铺开 |
-| 5 | `P1-步骤5` | 本文（状态/差异/清单/架构图）+ `AGENTS.md` §3/§4/§11/§12 + `docs/usage/03` 精度表 + `docs/history.md` 条目 |
+| 5 | `P1-步骤5` | 本文（状态/差异/清单/架构图）+ `AGENTS.md` §3/§4/§11/§12 + `docs/usage/03` 精度表 + `docs/history/history.md` 条目 |
 
 **未做（明确留待后续）**：P2（行级打包 + `matmul_q` + M7 张量 qparam + `layer_bench` A/B）、
 P1.5 的**剩余边界**（RAPT 的 `ReLULinearAttention`、ViT/MNIST Transformer 的补丁/池化侧张量

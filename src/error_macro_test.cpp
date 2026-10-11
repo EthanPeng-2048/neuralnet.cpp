@@ -1,12 +1,13 @@
 // ── error_macro_test — 错误处理宏族 ────────────────────────────────────────
-// 覆盖：NN_CHECK / NN_EASY_CHECK / NN_EXIT / NN_TRY / NN_TRY_CHECK / NN_TRY_MSG / NN_FAIL
+// 覆盖：NN_UNWRAP / NN_EXIT / NN_TRY / NN_TRY_CHECK / NN_TRY_MSG / NN_FAIL
+//       + 向后兼容别名（NN_CHECK / NN_EASY_CHECK）
 //   · 解值三形态（Result<T> / Result<void> / bool 条件）+ 移动语义
 //   · detail::check_message 打印格式（语境 / 详情 / 表达式 / 文件行号）
 //   · NN_TRY_MSG 的错误语境前缀；NN_TRY 展开后错误消息逐字不变
 //   · **NN_TRY_CHECK 只求值一次 x**（副作用回归：旧展开求值两遍，对
 //     `seg.end()` 这类"失败即已改状态"的调用会在第二遍拿到 success 再调
 //     .error() → MSVC expected 断言 / 读已析构 Error 字符串 → 堆损坏）
-//   · 终止行为：NN_CHECK → 非零退出（abort）、NN_EXIT(code) → 退出码 = code
+//   · 终止行为：NN_UNWRAP → 非零退出（abort）、NN_EXIT(code) → 退出码 = code
 //     （两者经子进程断言，本进程不终止）
 //
 // 子进程模式：--expect-abort / --expect-exit <n>（父进程 std::system 自举）
@@ -49,26 +50,29 @@ void ok(const char* msg) { std::printf("[ OK ] %s\n", msg); }
 // ── ① 解包三形态 ─────────────────────────────────────────────────────────
 void test_unwrap()
 {
-    const int v = NN_CHECK(ok_int());
-    CHECK(v == 42, "NN_CHECK 解出 Result<int> 的值");
+    const int v = NN_UNWRAP(ok_int());
+    CHECK(v == 42, "NN_UNWRAP 解出 Result<int> 的值");
 
-    NN_CHECK(ok_void());   // 失败即终止 → 能执行到这里就是通过
-    ok("NN_CHECK 接受 Result<void>（纯副作用调用）");
+    NN_UNWRAP(ok_void());   // 失败即终止 → 能执行到这里就是通过
+    ok("NN_UNWRAP 接受 Result<void>（纯副作用调用）");
 
-    const int v2 = NN_CHECK(ok_int(), "读取配置");
-    CHECK(v2 == 42, "NN_CHECK(x, msg) 解值");
+    const int v2 = NN_UNWRAP(ok_int(), "读取配置");
+    CHECK(v2 == 42, "NN_UNWRAP(x, msg) 解值");
 
-    const int v3 = NN_EASY_CHECK(ok_int());
-    CHECK(v3 == 42, "NN_EASY_CHECK 别名解值");
+    // 旧名别名：与 NN_UNWRAP 逐字等价（本仓旧代码 47 处仍在用）
+    const int v3 = NN_CHECK(ok_int());
+    CHECK(v3 == 42, "NN_CHECK 兼容别名解值");
+    const int v4 = NN_EASY_CHECK(ok_int());
+    CHECK(v4 == 42, "NN_EASY_CHECK 兼容别名解值");
 
     nn::Result<std::string> s = payload();
-    std::string out = NN_CHECK(std::move(s));
-    CHECK(out == "payload", "NN_CHECK 移动解值（可移动类型）");
+    std::string out = NN_UNWRAP(std::move(s));
+    CHECK(out == "payload", "NN_UNWRAP 移动解值（可移动类型）");
 
     // bool 条件形态：失败即终止，能走到下一行就是通过
-    NN_CHECK(1 + 1 == 2, "算术条件成立");
+    NN_UNWRAP(1 + 1 == 2, "算术条件成立");
     NN_EASY_CHECK(2 * 2 == 4);
-    ok("NN_CHECK 接受 bool 条件（含带语境形态）");
+    ok("NN_UNWRAP 接受 bool 条件（含带语境形态）");
 }
 
 // ── ② 打印格式（可单测部分）──────────────────────────────────────────────
@@ -185,7 +189,7 @@ void test_termination()
 {
     const int aborted = normalize_rc(run_self("--expect-abort"));
     if (aborted != kSkip)
-        CHECK(aborted != 0, "NN_CHECK 失败 → 非零退出（abort）");
+        CHECK(aborted != 0, "NN_UNWRAP 失败 → 非零退出（abort）");
 
     const int rc3 = normalize_rc(run_self("--expect-exit 3"));
     if (rc3 != kSkip)
@@ -205,7 +209,7 @@ int main(int argc, char* argv[])
     // ── 子进程模式：只在父进程经 std::system 自举时进入 ───────────────────
     if (argc >= 2 && std::string(argv[1]) == "--expect-abort")
     {
-        const int v = NN_CHECK(bad_int(), "子进程：abort 路径");
+        const int v = NN_UNWRAP(bad_int(), "子进程：abort 路径");
         std::printf("不应到达 v=%d\n", v);
         return 0;
     }
@@ -217,7 +221,7 @@ int main(int argc, char* argv[])
         return 0;
     }
 
-    std::puts("=== error_macro (NN_CHECK / NN_EXIT / NN_TRY_MSG / NN_FAIL) ===");
+    std::puts("=== error_macro (NN_UNWRAP / NN_EXIT / NN_TRY_MSG / NN_FAIL) ===");
 
     test_unwrap();
     test_message_format();

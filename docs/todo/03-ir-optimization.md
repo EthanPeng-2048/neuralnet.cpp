@@ -1,6 +1,6 @@
 # IR 优化（IR Optimization）—— 为融合算子引入中间表示
 
-> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history.md)。
+> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history/history.md)。
 
 > 目标：在**不推翻现有 AOT 闭合世界**的前提下，把 `ExprSpec` 从"直通轻量 IR"演进为带优化 pass 的规范 IR，分阶段提升开发便利与代码质量。
 > 状态：现行优化链 = **IR-A（canonicalize：DCE/常量折叠/代数化简/稳定重编号）+ IR-B（CSE + 寄存器分配 liveness）+ IR-C（图 IR + `begin_expr/end_expr` 融合分析）+ IR-D（后端 emitter 抽象）**，分别由 `expr_opt.hpp` / `expr_graph.hpp` / `expr_emitter.hpp` 承载；**IR-C 已恢复并通用化（P1 机制 + P2 写穿多输出 + Adam 接线，见 §5.3）**。
@@ -153,7 +153,7 @@ CSE 需处理 `Input/Const/Reduce` 操作数的等价性（视图相同 + 输入
 
 **IR-C（图级跨表达式融合）现行**：`expr_graph.hpp`（`ExprGraph`/`ExprGraphNode`/`fuse_expr_graph`/`recording_graph_owner`、per-graph `node_outputs`、占位 tag 分配器 `next_virtual_tag()`）+ 引擎虚入口 `ComputeEngine::begin_expr()/end_expr()`，配套 `dsl::start_expr/end_expr`（`ExprBlock` 语法糖，单表达式跨行）与 `ExprSegment`（RAII 守卫）。GPU 走真录制（`GpuEngine::execute_fused_graph`），CPU 普通运行 no-op、`NN_EXPR_SCAN` 下 `end_expr` 跑同一套 `fuse_expr_graph`（构建期扫描与运行期一致）。P2 新增 `ExprSpec.extras`（写穿多输出，≤4）与引擎入口 `eval_expr_multi_into`（NVI + 虚 `eval_expr_multi_into_impl`），并落地 P2-12 图级计划缓存（`graph_cache_key`/`FusedKernelPlan`/`instantiate_plan`）。
 
-**定位**：IR-C（图级跨表达式融合）现行为图 IR + `begin_expr/end_expr` 融合分析，P1（链融合机制）与 P2（写穿多输出 + Adam/AdamW 接线）已在训练路径落地；历史取舍正文（移除与否证依据、删除项/保留项清单、恢复流水）见 `docs/history.md`。
+**定位**：IR-C（图级跨表达式融合）现行为图 IR + `begin_expr/end_expr` 融合分析，P1（链融合机制）与 P2（写穿多输出 + Adam/AdamW 接线）已在训练路径落地；历史取舍正文（移除与否证依据、删除项/保留项清单、恢复流水）见 `docs/history/history.md`。
 
 ### 批内上传免 flush（P2，与图 IR 无关）
 
@@ -220,4 +220,4 @@ canonicalization 与优化 pass 的验证重点：
 
 最大成本集中在**确定性 key 验证**。现有 `ExprSpec` 已是合格轻量 IR，直通、简单、确定性是其最大优点；
 IR-C 现以真实调用方（P1 机制 + P2 写穿多输出 + Adam/AdamW 接线）接入训练路径，其约束是**有真实调用方、可安全融合**。
-后续演进以"小步演进、不推翻、有真实调用方"为原则推进；IR-C 的完整历史见 `docs/history.md`。
+后续演进以"小步演进、不推翻、有真实调用方"为原则推进；IR-C 的完整历史见 `docs/history/history.md`。

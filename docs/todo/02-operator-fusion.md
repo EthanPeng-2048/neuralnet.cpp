@@ -1,17 +1,17 @@
 # 算子融合（Operator Fusion）—— 显存下探与手写算子收敛为 IR 融合
 
-> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history.md)。
+> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history/history.md)。
 
 > 本文记录算子融合的**当前形态与设计约束**：一期（M1-M7）建立归约语义 IR 与注意力 / 稀疏 CE 的融合结构，二期（S1-S7）把 **matmul 纳入 IR 融合**，让手写融合原语收敛为 IR 表达——**一期的手写融合原语（M4-M6）已不存在，其结构一律由 IR / fold 承载**。两期服务同一目标：减少 GPT+Vulkan 训练显存，同时严格遵循分层铁律。
 >
-> 状态：二期范围 = S1-S5、S7（**S6 自动窗口不接线**，见 §跨 kernel 自动融合）；**注意力 forward 是单 fold kernel（FoldSpec 分块流式求值）——见"关键算法"章，S7 的 IR 链现仅存于 backward**。分期实施流水、删除清单与否决方案的演进记录见 `docs/history.md`。
+> 状态：二期范围 = S1-S5、S7（**S6 自动窗口不接线**，见 §跨 kernel 自动融合）；**注意力 forward 是单 fold kernel（FoldSpec 分块流式求值）——见"关键算法"章，S7 的 IR 链现仅存于 backward**。分期实施流水、删除清单与否决方案的演进记录见 `docs/history/history.md`。
 > 关联文档：`03-ir-optimization.md`（IR-A/B/C/D；IR-C = 图 IR + `begin_expr/end_expr` 融合分析）。
 
 **怎么读本文（3 条路径）**：
 
 - **只想知道"融合现在怎么工作"** → §总体架构与核心机制 + §构建工具链与闭合世界（现在的机制）；
 - **要改融合/IR 代码** → §合规红线 + §二期关键教训（改前必读） + `03-ir-optimization.md` §5.3；
-- **查历史决策/为什么这么走** → `docs/history.md`（本文摘出的分期实施记录、两趟式设计与否决方案）。
+- **查历史决策/为什么这么走** → `docs/history/history.md`（本文摘出的分期实施记录、两趟式设计与否决方案）。
 
 ## 目录
 
@@ -172,7 +172,7 @@ struct MatmulSpec {
 - **Adam 接线**：`Adam::step`/`AdamW::step` 用 `begin_expr` + `ExprSegment` 录制整个 step；每个参数张量的 K1/K2 m/v 状态写穿 + K3 delta + K4 `p += delta` 目标传递收敛为**一个多输出 kernel**（f32；混合精度自动拆分）。实测（`NN_PROFILE`，GPU NVIDIA CMP 40HX，GPT d_model=64 / 4 层 / heads=4 / seq=256 / batch=64，`adam`，20 步）：`fused@optimizer` 设备 kernel **266 → 66.5 每步**、设备时间 **0.57 → 0.23 ms/step**（设备侧数字与构建配置无关；Debug 构建会放大 host 侧数字）。
 - **闭合世界降级（本轮新增的通用机制）**：融合分组依赖精度（P2 需全 F32 成员、P1 需同精度），混精度 profile 可能产出 f32 构建期扫描从未登记的**复合**结构。构建期不枚举精度组合（2⁴ 爆炸），而是执行期通用降级：复合 kernel 的 AOT shader 未登记（或写穿前置条件不满足——多输出要求输入/输出全 f32）时，`execute_fused_graph` 把该 kernel 拆回逐成员派发——每个成员都是已登记的**单节点**结构，铁律仍成立（只有 AOT 登记的 shader 会跑，未登记的**单节点** spec 仍是硬报错）。降级后即回落到单表达式的常规派发路径。
 
-仍可（且常常更简单）把一条长逐元素链直接写成**一个** `dsl::compute` 表达式（单个 AOT 融合 kernel）——这仍是首选机制；跨表达式录制用于同一 step 内多个表达式共享写穿/多输出目标（优化器步即典型）。**`FusedChainLayer`（旧演示层）不存在**——跨表达式录制只提供机制。取舍记录见 `docs/history.md`，另见 `03-ir-optimization.md` §5.3。
+仍可（且常常更简单）把一条长逐元素链直接写成**一个** `dsl::compute` 表达式（单个 AOT 融合 kernel）——这仍是首选机制；跨表达式录制用于同一 step 内多个表达式共享写穿/多输出目标（优化器步即典型）。**`FusedChainLayer`（旧演示层）不存在**——跨表达式录制只提供机制。取舍记录见 `docs/history/history.md`，另见 `03-ir-optimization.md` §5.3。
 
 ---
 
@@ -187,7 +187,7 @@ struct MatmulSpec {
 - **显存**：`scores`/`masked`/`attn_cache_` 全部不物化，每层注意力激活从 ~3×`BH·seq²` 降到 `O(BH·seq·d_k)`（fold 单遍每块只算一次 QKᵀ，S 从不存在）。
 - **backward**：`recompute_W_` 两步重算 W——① `S = masked(Q·Kᵀ)`（掩码树与 forward 的 fold 变体同构，matmul 分块快路径，S 瞬时物化一遍）② `W = softmax(S)`（单归约表达式，m/l 在 kernel 内部归一化、不作为输入/缓存）；随后 R/X 表达式 + 3×`batched_matmul` 得 grad_Q/K/V，绝不物化概率矩阵。
 
-> 两趟式 forward（`batched_matmul_reduce` / `_softmax_denom` / `_softmax_apply` 三个手写原语）与组合式 `AttnBias` 掩码描述子均不存在，演进记录见 `docs/history.md`。
+> 两趟式 forward（`batched_matmul_reduce` / `_softmax_denom` / `_softmax_apply` 三个手写原语）与组合式 `AttnBias` 掩码描述子均不存在，演进记录见 `docs/history/history.md`。
 
 ### 稀疏交叉熵
 
@@ -215,7 +215,7 @@ struct MatmulSpec {
 
 ## 跨 kernel 自动融合
 
-**当前结论：S6 自动窗口不接线。** `GpuEngine` 没有"自动把相邻 `eval_expr` 并入一个窗口"的机制；**跨表达式融合由显式录制提供**（IR-C：`begin_expr/end_expr`，见 §表达式录制与融合边界），且 P2-12 图级融合计划缓存（`graph_cache_key`/`FusedKernelPlan`/`instantiate_plan`）已随之落地。能不写录制就融的表达式仍可直接写成**单个** `dsl::compute`（单个 AOT 融合 kernel，只有 input/output 落显存）。二期 S6（自动窗口）的取舍记录见 `docs/history.md`；IR-C 的当前形态与历史见 `03-ir-optimization.md` §5.3。
+**当前结论：S6 自动窗口不接线。** `GpuEngine` 没有"自动把相邻 `eval_expr` 并入一个窗口"的机制；**跨表达式融合由显式录制提供**（IR-C：`begin_expr/end_expr`，见 §表达式录制与融合边界），且 P2-12 图级融合计划缓存（`graph_cache_key`/`FusedKernelPlan`/`instantiate_plan`）已随之落地。能不写录制就融的表达式仍可直接写成**单个** `dsl::compute`（单个 AOT 融合 kernel，只有 input/output 落显存）。二期 S6（自动窗口）的取舍记录见 `docs/history/history.md`；IR-C 的当前形态与历史见 `03-ir-optimization.md` §5.3。
 
 ---
 
@@ -296,7 +296,7 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
   [scan] 结构来源：dry-run 侧 78（per-layer+显式 38、模型 pass +32、fold 显式 +8） + 锚点 66（新增 13）= 合计 91（锚点独有 13、dry-run 独有 25）
   ```
   A/B 开关：`-DNN_SCAN_NO_ANCHOR`（关锚点）/ `-DNN_SCAN_NO_DRYRUN`（关 dry-run/模型 pass），均只影响登记集合、不改语义。逐条来源用 `NN_SCAN_DUMP_SOURCES=1` 打印（`[scan][dry-only]` / `[scan][anchor-only]` + 结构摘要）。
-- **run-only 签名回填不存在**（A1e）：该工作流（`--f16` 下用 `NN_PREC_TRACE=1` 的 `[prec][miss]` 收集只有真实训练才暴露的签名、写进 `tools/prec_backfill.txt`）**已整体删除**——V1 分派 shader 覆盖任意签名，f16 训练实测 `miss=0` 且边界 cast 归因表为空。历史清单条目与复现命令归档在 `docs/history.md`。
+- **run-only 签名回填不存在**（A1e）：该工作流（`--f16` 下用 `NN_PREC_TRACE=1` 的 `[prec][miss]` 收集只有真实训练才暴露的签名、写进 `tools/prec_backfill.txt`）**已整体删除**——V1 分派 shader 覆盖任意签名，f16 训练实测 `miss=0` 且边界 cast 归因表为空。历史清单条目与复现命令归档在 `docs/history/history.md`。
 - **契约回归**：上述三条 key 语义 + "符号实例 key ≡ 真实实例 key" 由
   `src/expr_fused_key_test.cpp` 锁定（并入 `expr_cpu_test` 聚合目标，ctest 目标数不变）。
   任一条被违反（有人重新引入"运行期值决定结构"）→ 运行时 key 与登记 key 不一致
@@ -328,7 +328,7 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 | **S6 自动窗口** | **不接线**——没有"自动并入相邻表达式"的窗口；跨表达式融合走显式录制（IR-C，见 §表达式录制与融合边界） | — |
 | **S7 手写融合原语收敛** | 7 个手写融合原语（`batched_matmul_reduce/softmax_denom/softmax_apply`、`batched_matmul_softmax_backward_q/kv`、`col_softmax_denom/col_softmax_sparse_forward`）**均不存在**——结构由 IR 表达。IR 扩展：`MatmulSpec.batch`、`ExprOperandKind::Row/Col/Batch`、`ExprViewKind::RowGather/BatchMod/BatchCol` | 全量 ctest；训练冒烟（CPU+GPU） |
 
-> S1-S7 的实施顺序、依赖关系、删除顺序与当时验收流水见 `docs/history.md`。
+> S1-S7 的实施顺序、依赖关系、删除顺序与当时验收流水见 `docs/history/history.md`。
 
 ### 二期关键教训（改融合/IR 代码前必读）
 
@@ -361,7 +361,7 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 | **M7** | "原语可专、不叫算法名"约定（`10-development-standards.md`） |
 | **S1–S7** | 二期阶段，见 §二期 S1-S7：手写算子收敛为 IR 融合 |
 
-> 分期实施流水、当时验收与被删原语的实施坑见 `docs/history.md`。
+> 分期实施流水、当时验收与被删原语的实施坑见 `docs/history/history.md`。
 
 ### 仍然适用的实施教训（折叠与归约）
 
@@ -378,7 +378,7 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 - **归约向量原生输出 `eval_expr_reduce`/`dsl::compute_reduce`**：表达式在 (rows,cols) 网格求值但输出为归约向量本身。用于归一化的 (1,B) 统计量与 (F,1) 梯度归约。
 - **融合表达式保持 F 无关结构（关键）**：`inv_features=1/F`、`epsilon` 等形状相关常量若折进表达式，key 随 F 漂移 → 硬报错。解法：融合表达式只含 F 无关结构，形状相关标量用引擎原语/`rparam`（运行时值）施加。
 
-> M4/M5/M6 手写原语期的掩码约定、`dispatch_bmm_generic` binding 顺序、kv_backward 索引等实施坑属于已不存在的原语，见 `docs/history.md`。
+> M4/M5/M6 手写原语期的掩码约定、`dispatch_bmm_generic` binding 顺序、kv_backward 索引等实施坑属于已不存在的原语，见 `docs/history/history.md`。
 
 ### 形状无关融合（任意 d_k 适配）
 

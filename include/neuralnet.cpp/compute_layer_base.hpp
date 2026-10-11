@@ -154,7 +154,7 @@ struct TernaryProfileSplit
 {
     if (!ternary && profile.param == Precision::T1_58)
     {
-        NN_CHECK(false,
+        NN_UNWRAP(false,
                  std::string("层 ") + layer_name + "：收到 param=t1_58，但该层不是"
                  "三值模式（weight_quant=None）—— 三值权重只对 BitLinear 有意义；"
                  "请以 weight_quant=t1_58 构造该层，或把 param 改回 f16/f32"
@@ -296,7 +296,7 @@ public:
     {
         if (engine_ != nullptr)
         {
-            NN_CHECK(false,
+            NN_UNWRAP(false,
                      std::string("set_precision_profile: 层已 init，精度 profile 之后不可变（层=")
                          + layer_name() + "）—— 请在 init(engine) 之前注入"
                          "（docs/todo/21-quantized-weights.md §4.3.2(b)）");
@@ -740,7 +740,7 @@ public:
 // GPTModel / RAPTModel 的 generate() 各自逐 token 维护不同的运行态
 // （KV cache / RLA 运行态），但"从末位 logits 选下一 token"这一步两者
 // **逐字相同** → 收敛到本函数（曾有三份拷贝，改一处要改三处；第三份属
-// 于已移除的 ZiPTModel，见 docs/history.md）。
+// 于已移除的 ZiPTModel，见 docs/history/history.md）。
 //
 //   logits        就地变为概率（调用方不需要原值）
 //   temperature   >0 随机采样（1.0 = 不缩放但仍采样）；<=0 贪心

@@ -41,7 +41,7 @@
 
 > **文档分册定位**：`introduction` / `usage` / `development` 写给**调用者**；
 > 项目内部的设计 / 路线图 / 盘点 / 规范 / 踩坑 / 故障 / 整改在 [`docs/todo/`](docs/todo/README.md)；
-> 历史归档在 [`docs/history.md`](docs/history.md)。**总索引见 [`docs/README.md`](docs/README.md)。**
+> 历史归档在 [`docs/history/history.md`](docs/history/history.md)。**总索引见 [`docs/README.md`](docs/README.md)。**
 
 ## 项目结构
 
@@ -51,7 +51,7 @@ neuralnet.cpp/
 ├── README.md
 ├── docs/
 │   ├── README.md             ← 文档总索引与分册定位
-│   ├── history.md            ← 全仓唯一历史归档
+│   ├── history/history.md            ← 全仓唯一历史归档
 │   ├── introduction/          ← 介绍类（调用者）
 │   │   ├── 01-architecture.md            ← 架构设计文档
 │   │   ├── 02-performance.md             ← 性能优化文档
@@ -121,9 +121,9 @@ neuralnet.cpp/
 
 ## 依赖
 
-- **编译器**: LLVM Clang++ 22.1+（`C:/Program Files/LLVM/bin/clang++.exe`）
+- **编译器**: 任意支持 C++26 的编译器（Clang / GCC / MSVC 均可）
 - **C++ 标准**: C++26
-- **构建工具**: CMake 4.x Ninja
+- **构建工具**: CMake ≥ 3.30 + Ninja
 - **GUI** (可选): Python 3.10+，customtkinter（`pip install customtkinter`），Pillow（`pip install Pillow`）
 
 ## 构建与运行
@@ -136,7 +136,8 @@ cmake -B build -G Ninja
 
 ### 准备数据
 
-- MNIST 数据：`datasets/mnist_data/`（`train.csv` / `test.csv`）
+- MNIST 数据：从 [Releases](https://github.com/EthanPeng-2048/neuralnet.cpp/releases)
+  下载 `mnist_data` 压缩包，解压到 `datasets/mnist_data/`（`train.csv` / `test.csv`）
 - 文本语料：使用 `scripts/` 下的 `download_*.py` 脚本下载
 - GPT 训练数据统一为 **`.nndataset`**（token/词表/loss 掩码/test 子集都在生成期定好，
   见 `docs/todo/19-unified-dataset.md`）：
@@ -167,21 +168,18 @@ cmake -B build -G Ninja
 
 ### 运行推理
 
+推理入口接受单张 CSV（`784` 像素一行）；随机试一张自己画/导出的图即可，
+GUI 自带的手写板也能直接识别。
+
 ```bash
-# 推理单张图片
-./build/mnist_infer datasets/test/0/digit_0001.csv
-
-# 批量推理目录下所有 CSV
-./build/mnist_infer datasets/test/0/
-
 # 指定模型文件（架构由模型内自描述的 spec 决定，无需再传类型）
-./build/mnist_infer image.csv --model pretrained/model.bin --topk 3
+./build/mnist_infer my_digit.csv --model mnist_model.bin --topk 3
 
 # 显示 Top-5 预测结果
-./build/mnist_infer image.csv --topk 5
+./build/mnist_infer my_digit.csv --topk 5
 
 # 调试模式：显示像素矩阵
-./build/mnist_infer image.csv --show-pixels
+./build/mnist_infer my_digit.csv --show-pixels
 ```
 
 ### 🖥️ 图形化界面 (GUI)
@@ -241,7 +239,7 @@ python gui.py
 
 支持三种模型架构（通过 `--arch mlp|transformer|cnn` 切换，实现见 `domain_mnist.hpp`）；下面详述 MLP 与 Transformer（CNN 见 `--cnn-*` 系列参数）：
 
-归一化分两维，两者默认 **`auto`（= 按架构取最合适，4 epoch A/B 实测，见 `docs/history.md`）**：**类型** `--norm auto|layernorm|rmsnorm|batchnorm`（auto：MLP/ViT = layernorm、CNN = batchnorm）与**挂载位置** `--norm-place auto|none|conv|head|both|final`（auto：CNN = `conv`、ViT = `final`；`conv`/`head`/`both` 属 CNN、`final` 属 ViT；MLP 的挂载位置由结构固定，只接受 `none`/`auto`）。**旧模型文件没有 `norm_place` 键 → 读回 `none`**：参数布局与旧实现逐位一致，旧 checkpoint 仍可加载。
+归一化分两维，两者默认 **`auto`（= 按架构取最合适，4 epoch A/B 实测，见 `docs/history/history.md`）**：**类型** `--norm auto|layernorm|rmsnorm|batchnorm`（auto：MLP/ViT = layernorm、CNN = batchnorm）与**挂载位置** `--norm-place auto|none|conv|head|both|final`（auto：CNN = `conv`、ViT = `final`；`conv`/`head`/`both` 属 CNN、`final` 属 ViT；MLP 的挂载位置由结构固定，只接受 `none`/`auto`）。**旧模型文件没有 `norm_place` 键 → 读回 `none`**：参数布局与旧实现逐位一致，旧 checkpoint 仍可加载。
 
 ### MLP（默认）
 

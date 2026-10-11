@@ -51,7 +51,7 @@ private:
                                        InitSpec::zero());
         grad_b_ = engine.create_tensor(out_features_, 1, p_.param, InitSpec::zero());
         // 终止式检查（本函数返回 void，不能用 NN_FAIL 的 return 语义）
-        NN_CHECK(grad_w_.valid() && grad_b_.valid(),
+        NN_UNWRAP(grad_w_.valid() && grad_b_.valid(),
                  "Linear: 梯度缓冲（惰性）初始化失败");
     }
 

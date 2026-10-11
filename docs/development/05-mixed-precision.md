@@ -2,14 +2,14 @@
 
 > **读者**：调用者（库使用者 / 扩展者）——本分册定位见 [`README.md`](README.md)。
 > 本文的语义契约章节（§7.2）与实测限制章节（§12）是写给"要选精度 / 要写层"的人的；
-> 项目内部的路线图 / 盘点在 [`../todo/`](../todo/)，历史在 [`../history.md`](../history.md)。
+> 项目内部的路线图 / 盘点在 [`../todo/`](../todo/)，历史在 [`../history.md`](../history/history.md)。
 
 > **状态**：Phase 1（存储类型化 / cast / f16 GEMM / 类型化 Tensor）与 Phase 2（f16 边界 cast
 >（**P-1 已下沉为 `ComputeEngine` 基类 NVI 入口**，原 `PrecisionEngine` 装饰器已删除，见
-> `docs/history.md「15 号归档」` §4.1）+ DSL/Layer/Loss/Optimizer 全链精度接线 + **in-kernel f16 带类型变体（逐元素 /
+> `docs/history/history.md「15 号归档」` §4.1）+ DSL/Layer/Loss/Optimizer 全链精度接线 + **in-kernel f16 带类型变体（逐元素 /
 > 归约 / matmul 段 / fold）** + **op-level f16 GEMM**）均为**当前实现**；当前 `--f16` 实测峰值显存
 > 低于 f32（§12.11）。当前状态、实测结论与已知问题见 **§12**；各轮实施过程与 A/B 流水见
-> `docs/history.md`。
+> `docs/history/history.md`。
 > **范围**：f16 + f32（bf16 / f64 仅枚举占位）。
 > **配套**：`01-compute-engine-development.md`（引擎开发）、`../usage/03-compute-engine-usage.md`（引擎使用）、`08-pitfalls-and-lessons.md`（踩坑）。
 
@@ -475,7 +475,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 
 ## 12. 分期
 
-> **过程记录已移出**：本章各节只保留**当前状态、当前结论与仍然适用的验收标准**；分期实施流水、各轮 A/B 实测与被推翻的中间结论见 `docs/history.md`。
+> **过程记录已移出**：本章各节只保留**当前状态、当前结论与仍然适用的验收标准**；分期实施流水、各轮 A/B 实测与被推翻的中间结论见 `docs/history/history.md`。
 
 ### 12.1 Phase 1 交付物
 
@@ -545,7 +545,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 
 - **边界 cast 的代价**：适配层对**每个**未命中变体的算子把 f16 入参抬成 f32 副本（再按 P 落回）。被 k 个算子读取的张量要 k 份 f32 副本——典型是 `(vocab, batch·seq)` 量级的 logits 被 loss 链读 4~6 次。**LM head 计算精度固定为 `stable`（F32）** → logits 与 f32 基线同构、loss 链零 cast。结论：**边界 cast 只能拿"存储减半"，拿不到"峰值下降"**（训练峰值由 transient 决定）——这是 in-kernel f16（§12.6 起）的存在理由；变体命中时不再走该路径（§11.1 三条路径）。
 - **数值结论（当前）**：GPU 上 `profile_f16`（param+compute f16）与 f32 **轨迹一致**——同初值/同超参 3.4776→3.1822 vs 3.4776→3.1803，最大相对偏差 **6e-4**（§7.2 语义成立）。**四字段全 f16（`profile_all_f16`）不可用于训练**：`optimizer=F16` 时 Adam 的 v≈g²~1e-10 下溢到 0 → 更新爆炸（loss 7.9→3.6e4）；`stable=F16` 时 CE 链 ~200 步 NaN；两者同时 f16 时 loss 恒定（更新被 f16 舍入吃光）。故 CLI `--f16` = `profile_f16()` = {param:F16, compute:F16, stable:F32, optimizer:F32}（§9.4）。
-- 边界 cast 期的分阶段实测 A/B 与探针数据（f32 3069 MiB / f16 4124 MiB 等）见 `docs/history.md`；**当前峰值数字见 §12.11**。
+- 边界 cast 期的分阶段实测 A/B 与探针数据（f32 3069 MiB / f16 4124 MiB 等）见 `docs/history/history.md`；**当前峰值数字见 §12.11**。
 
 **已知问题（当前）**
 
@@ -593,7 +593,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 | 设备 | 仍有效：查询并启用 `storageBuffer16BitAccess`（`NN_VULKAN_NO_16BIT_STORAGE=1` 强制回退）；未启用时后端跳过带 `#` 的键。 |
 | 运行时 | 仍有效的两条经验：① `FusedInputs{owners, bufs}` **必须同时持有 owner**——只存裸 `GpuBuffer*` 会在录制中途释放上传缓冲（铁律 6，实测 `A+=B err=0.5`）；② **f16 输出必须按 2B/元素分配缓冲并重贴 `GpuTensorF16`**（漏了 = shader 只写前半 + f32 标签 → 训练 loss=NaN）。变体选择改为 §12.10 ⑤。 |
 
-纯逐元素变体阶段的实测（f32 / f16 边界 cast / in-kernel 三方对照）与该阶段的"剩余缺口"清单见 `docs/history.md`；**当前数字与下一步见 §12.11**。
+纯逐元素变体阶段的实测（f32 / f16 边界 cast / in-kernel 三方对照）与该阶段的"剩余缺口"清单见 `docs/history/history.md`；**当前数字与下一步见 §12.11**。
 
 ### 12.8 剩余开销归因（当前结论）
 
@@ -606,13 +606,13 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 - **池底材粒度不是峰值杠杆**（同窗交错 A/B 复测，见 §12.9/§12.10）。
 - 数据搬运类原语（`clone/slice_rows/insert_rows/zero`）由 `supports_native_data_move()` 对 f16 直接放行，省 2 份全尺寸临时量；GPT 路径上峰值中性（数据量小），保留（对其它 workload 有净收益）。
 
-逐阶段探针数字与归因过程见 `docs/history.md`；**当前剩余 cast 与下一步见 §12.11**。
+逐阶段探针数字与归因过程见 `docs/history/history.md`；**当前剩余 cast 与下一步见 §12.11**。
 
 ### 12.9 池底材粒度 A/B
 
 **当前结论：池底材粒度不是峰值杠杆。** 同窗交错 A/B 复测三档池配置（默认 12MB 固定块 / `NN_POOL_LADDER_MAX_MB=16` / `NN_POOL_BLOCK_MB=4`）：峰值均值差仅个位数百分比、耗时无差异 → **池保持默认**；`NN_POOL_BLOCK_MB` / `NN_POOL_LADDER_MAX_MB` 只作探针 / 实验旋钮（`text_train` 的提示指向本节）。方法论教训：**跨会话单点 + 不同时段的对照组会被系统漂移误导；机制之争必须用形状/尺寸归因表裁决（§12.10），不要用总量推理。**
 
-> 本节原始 A/B 数据（含一个不可复现的"−21% 峰值 + 2× 耗时"跨会话单点）与复盘见 `docs/history.md`。
+> 本节原始 A/B 数据（含一个不可复现的"−21% 峰值 + 2× 耗时"跨会话单点）与复盘见 `docs/history/history.md`。
 > 仍有效的副产物：`NN_PREC_TRACE=1` 的 `[prec][miss]` 打印——真实 GPT 配置 38 个非零签名请求只 6 个未命中（eval_expr 路径 84% 已原生），说明 cast 大头不在融合路径上。
 
 ---
@@ -644,7 +644,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 
 #### ④ 实测收益
 
-matmul 段 / 归约 / 目标传递三类变体落地后的同窗交错实测（f32 与 f16 峰值、耗时、backward transient 分桶变化）见 `docs/history.md`；**当前（含 op-level f16 GEMM）的最终数字见 §12.11**。
+matmul 段 / 归约 / 目标传递三类变体落地后的同窗交错实测（f32 与 f16 峰值、耗时、backward transient 分桶变化）见 `docs/history/history.md`；**当前（含 op-level f16 GEMM）的最终数字见 §12.11**。
 
 #### ⑤ 运行期精度分派（当前，A1）
 
@@ -702,7 +702,7 @@ matmul 段 / 归约 / 目标传递三类变体落地后的同窗交错实测（f
 
 - **−10.5% 显存（184 MiB）且略快**；f16 峰值完全确定（不再双峰）。batch64 同为 −10.5%（3052 vs 3412 MiB；batch64 不再 OOM）。`f16_precision_test` 覆盖 f32 零回归逐字节 + GPT 逐 step 轨迹对拍。
 - 该数字是 **op-level f16 GEMM 落地时**的记录；其后 fold 带类型变体（Phase D2）、run-only 签名回填（Phase D3，§12.10 ⑤）与更多 op 级 f16 变体继续落地，**当前峰值以 `mem_probe --f16` 同窗复测为准**。
-- 演进全景（f16 峰值如何从"高于 f32"走到"低于 f32"）见 `docs/history.md`。
+- 演进全景（f16 峰值如何从"高于 f32"走到"低于 f32"）见 `docs/history/history.md`。
 
 #### ④ 当前剩余（收益递减，按需再做）
 

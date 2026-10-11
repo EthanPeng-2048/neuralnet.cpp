@@ -26,7 +26,7 @@
 //   compute_layer_rapt.hpp          ReLULinearAttention / RAPTBlock / RAPTModel
 //
 // 注：AttnZip（ZiPT）已整体移除，代码保留在 `legacy/zipt` 分支；
-//     恢复前提见 docs/history.md「ZiPT 移除」条与 AGENTS.md §12。
+//     恢复前提见 docs/history/history.md「ZiPT 移除」条与 AGENTS.md §12。
 // ─────────────────────────────────────────────────────────────────────────
 
 // L2 计算层（引擎化）— 各子文件已自带依赖 include，这里按拓扑序聚合。

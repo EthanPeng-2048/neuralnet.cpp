@@ -29,7 +29,7 @@ namespace nn
 
 // 解释器并行门控（eval_expr_impl / 归约预计算共用）。
 // 解释执行的 per-element 成本比向量化逐元素高约一个数量级
-// （原 docs/development/11-cpu-performance-diagnosis.md §2.4：解释器 vs 等价串行标量 ~9x；该诊断文档已删，见 docs/history.md「失效文档链接清理」），而并行区启动
+// （原 docs/development/11-cpu-performance-diagnosis.md §2.4：解释器 vs 等价串行标量 ~9x；该诊断文档已删，见 docs/history/history.md「失效文档链接清理」），而并行区启动
 // 开销约 100µs，因此门控远低于 nn::PARALLEL_THRESHOLD(524288)：
 // 65536 元素 × ~10ns/element ≈ 0.65ms ≫ 0.1ms，稳赚。
 inline constexpr std::size_t kExprParallelThreshold = 65536;

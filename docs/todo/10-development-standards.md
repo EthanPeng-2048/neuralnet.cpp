@@ -1,6 +1,6 @@
 # C++ 开发规范
 
-> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history.md)。
+> **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history/history.md)。
 
 > 本文档定义 neuralnet.cpp 项目的开发规范，旨在确保代码质量、可维护性和高性能。
 
@@ -626,7 +626,7 @@ nn::parallel_for_blocks(idx.begin(), idx.end(), [&](std::size_t b) noexcept { /*
 [[nodiscard]] constexpr std::size_t cols() const noexcept { return cols_; }
 ```
 
-- **`NN_VECTORIZE_PRAGMA` 必须收进独立的微内核函数**：放进包含其它循环的大函数会拖垮同函数内其它循环的优化（GEMM 4×8 微内核 A/B 教训，数据见 `docs/history.md`）。
+- **`NN_VECTORIZE_PRAGMA` 必须收进独立的微内核函数**：放进包含其它循环的大函数会拖垮同函数内其它循环的优化（GEMM 4×8 微内核 A/B 教训，数据见 `docs/history/history.md`）。
 
 ### 6.4 性能检查清单
 

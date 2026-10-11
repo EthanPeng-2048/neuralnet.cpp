@@ -15,21 +15,21 @@
 //
 //     nn::CpuEngine engine;                       // 或 nn::GpuEngine（NN_HAS_VULKAN）
 //     nn::Model model(engine);
-//     NN_CHECK(model.add<nn::Linear>(784, 256));
-//     NN_CHECK(model.add<nn::ReLU>());
-//     NN_CHECK(model.add<nn::Linear>(256, 10));
+//     NN_UNWRAP(model.add<nn::Linear>(784, 256));
+//     NN_UNWRAP(model.add<nn::ReLU>());
+//     NN_UNWRAP(model.add<nn::Linear>(256, 10));
 //
-//     auto opt = NN_CHECK(nn::create_optimizer("adam", engine,
+//     auto opt = NN_UNWRAP(nn::create_optimizer("adam", engine,
 //                 model.parameters(), model.param_gradients(), 1e-3f, 0.01f));
 //     nn::CrossEntropyLoss loss_fn;
 //
 //     // 每步 = 清零 → 前向 → 损失 → 反向 → 更新（签名细节见 AGENTS.md §8）
-//     NN_CHECK(model.zero_grad());
-//     nn::Tensor logits = NN_CHECK(model.forward(x));
-//     nn::Scalar loss   = NN_CHECK(loss_fn.forward(engine, logits, y));
-//     nn::Tensor grad   = NN_CHECK(loss_fn.backward());
-//     NN_CHECK(model.backward(*grad));
-//     NN_CHECK(opt->step());
+//     NN_UNWRAP(model.zero_grad());
+//     nn::Tensor logits = NN_UNWRAP(model.forward(x));
+//     nn::Scalar loss   = NN_UNWRAP(loss_fn.forward(engine, logits, y));
+//     nn::Tensor grad   = NN_UNWRAP(loss_fn.backward());
+//     NN_UNWRAP(model.backward(*grad));
+//     NN_UNWRAP(opt->step());
 
 #include "engine.hpp"
 #include "layer.hpp"

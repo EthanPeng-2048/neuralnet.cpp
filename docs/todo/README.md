@@ -1,16 +1,16 @@
 # todo/ —— 项目开发者内部工作区
 
 > **本分册写给项目开发者**（改这个库的人），不是给调用者的。
-> 调用者要看的开发文档在 [`../development/`](../development/)；历史归档在 [`../history.md`](../history.md)。
+> 调用者要看的开发文档在 [`../development/`](../development/)；历史归档在 [`../history/history.md`](../history/history.md)。
 
 ## 这里的文档怎么组织
 
 - **一件事一篇**：设计稿（含未实施部分）、路线图与裁定、现状盘点、编码规范、踩坑记录、
   未修故障、审查/评审整改立项。
 - **允许带进度状态**（✅ 已实施 / ⏳ 待做 / ❌ 已否决），但**不写历史叙事**——
-  演进过程、被否决方案的理由、旧数字一律进 `../history.md`。
+  演进过程、被否决方案的理由、旧数字一律进 `../history/history.md`。
 - 编号沿用历史编号（`02`…`23`），**编号缺号是正常的**（`05` `06` `20` 等留在
-  `development/`；`13` 已删除；`15` `16` 已并入 `history.md`）。
+  `development/`；`13` 已删除；`15` `16` 已并入 `history/history.md`）。
 
 ## 分类与索引
 
@@ -47,6 +47,6 @@
 
 | 想去哪 | 文档 |
 |--------|------|
-| 全仓历史归档（演进 / 勘误 / 否决 / A-B） | [`../history.md`](../history.md) |
+| 全仓历史归档（演进 / 勘误 / 否决 / A-B） | [`../history/history.md`](../history/history.md) |
 | 总索引与分册定位 | [`../README.md`](../README.md) |
 | 性能对比基准 | [`../benchmarks/`](../benchmarks/) |
