@@ -159,17 +159,116 @@ public:
     // ── 参数视图：latent（f32）+ 偏置（f32）──────────────────────────────
     [[nodiscard]] std::vector<TensorRef> parameters() override
     {
-        NN_CHECK(!packed_only_,
-                 "BitLinear(packed-only)：部署态没有可训练参数（不可保存/训练）；"
-                 "请用训练文件（latent）而不是部署文件");
         return {latent_w_, b_};
     }
     [[nodiscard]] std::vector<TensorRef> param_gradients() override
     {
-        NN_CHECK(!packed_only_,
-                 "BitLinear(packed-only)：部署态没有梯度缓冲（不可训练）");
         ensure_grad_();
         return {grad_w_, grad_b_};
+    }
+
+    // ── 参数形态协议（v7）────────────────────────────────────────────────
+    // 索引空间恒为 {0 = 权重, 1 = 偏置}（与实例状态无关：打包只读态下 latent
+    // 为空张量，但下标不变）。kind 随**文件角色**分流：
+    //   Checkpoint(.nnckpt) → TernaryLatent（f32 latent，续训用）
+    //   Model(.nnmodel)     → TernaryPacked2（2 bit/权重容器 + τ）
+    // 序列化层负责把容器在盘上编码成 base-3（TernaryPacked3，1.6 bpw）并在载入
+    // 时解回 2-bit 容器——层只认运行期形态（L2 不碰宿主字节/Matrix）。
+    [[nodiscard]] std::size_t param_count() override { return 2; }
+
+    [[nodiscard]] Result<ParamEntry> export_param(std::size_t index, ModelRole role) override
+    {
+        if (index == 1)   // 偏置：恒 Dense（不做三值量化，BitNet 同款）
+            return dense_entry_(b_);
+        if (index != 0)
+            NN_FAIL("BitLinear::export_param: 参数下标越界（期望 0/1，实际 " +
+                    std::to_string(index) + "）");
+        ParamEntry e;
+        e.rows = out_features_;
+        e.cols = in_features_;
+        if (role == ModelRole::Checkpoint)
+        {
+            if (!latent_w_.valid())
+                NN_FAIL("BitLinear::export_param: 打包只读态没有 latent —— "
+                        "本模型来自推理文件（.nnmodel），不能按断点角色（.nnckpt）导出");
+            e.kind = ParamKind::TernaryLatent;
+            e.precision = Precision::F32;
+            e.payload = latent_w_;
+            return e;
+        }
+        // 推理角色：打包形态（0.25 B/权重容器 + τ）
+        NN_TRY(q, ensure_quantized());
+        if (!use_packed_ || !wq_packed_.valid() || !tau_.valid())
+            NN_FAIL("BitLinear::export_param: 打包派生物不可用（缓冲形态被切到 f16 稠密）；"
+                    "推理文件要求打包形态");
+        e.kind = ParamKind::TernaryPacked2;
+        e.precision = Precision::F32;   // 容器按 f32 张量承载原始字
+        e.payload = wq_packed_;
+        e.aux = tau_;
+        return e;
+    }
+
+    [[nodiscard]] Result<void> import_param(std::size_t index, const ParamEntry& entry) override
+    {
+        if (index == 1)
+        {
+            if (entry.kind != ParamKind::Dense)
+                NN_FAIL(std::string("BitLinear::import_param: 偏置必须是 Dense，实际 kind=") +
+                        param_kind_name(entry.kind));
+            return import_into_(b_, entry);
+        }
+        if (index != 0)
+            NN_FAIL("BitLinear::import_param: 参数下标越界（期望 0/1，实际 " +
+                    std::to_string(index) + "）");
+        switch (entry.kind)
+        {
+            case ParamKind::TernaryLatent:
+            {
+                if (!latent_w_.valid())
+                {
+                    // 从打包只读态恢复可训练：重建 f32 latent（零初始化）并回到
+                    // 默认打包缓冲形态；量化缓存作废（首次 forward 会重算）。
+                    latent_w_ = engine_ref().create_tensor(
+                        out_features_, in_features_, Precision::F32, InitSpec::zero());
+                    NN_CHECK(latent_w_.valid(), "BitLinear: latent 恢复失败");
+                    packed_only_ = false;
+                    use_packed_ = true;
+                    ensure_quant_buffer_();
+                }
+                quant_valid_ = false;
+                return import_into_(latent_w_, entry);
+            }
+            case ParamKind::TernaryPacked2:
+            {
+                if (!entry.aux.valid())
+                    NN_FAIL("BitLinear::import_param: 打包形态缺少 τ（aux）");
+                const std::size_t wpr = nn::trit_pack::words_per_row(in_features_);
+                if (entry.rows != out_features_ ||
+                    entry.payload.rows() != out_features_ ||
+                    entry.payload.cols() != wpr)
+                    NN_FAIL("BitLinear::import_param: 打包字形状与层不匹配（期望 " +
+                            std::to_string(out_features_) + "x" + std::to_string(wpr) + "）");
+                if (entry.aux.rows() != out_features_ || entry.aux.cols() != 1)
+                    NN_FAIL("BitLinear::import_param: τ 形状与层不匹配（期望 " +
+                            std::to_string(out_features_) + "x1）");
+                // 打包只读态：只保留打包字 + τ（推理足迹 0.25 B/权重 + τ）
+                force_pack_ = 1;
+                use_packed_ = true;
+                wq_packed_ = entry.payload;
+                tau_ = entry.aux;
+                quant_valid_ = true;
+                packed_only_ = true;
+                latent_w_ = Tensor{};
+                wq_ = Tensor{};
+                grad_w_ = Tensor{};
+                grad_b_ = Tensor{};
+                return {};
+            }
+            default:
+                NN_FAIL(std::string("BitLinear::import_param: 不接受该参数形态（kind=") +
+                        param_kind_name(entry.kind) +
+                        "，可接受 {TernaryLatent, TernaryPacked2}）");
+        }
     }
 
     [[nodiscard]] bool grad_buffers_allocated() const noexcept override

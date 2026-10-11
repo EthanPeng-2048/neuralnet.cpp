@@ -185,6 +185,63 @@ struct TernaryProfileSplit
     return (profile.param == Precision::T1_58) ? WeightQuant::T1_58 : explicit_quant;
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// 参数形态协议（v7 文件角色；docs/development/23 §2.2）
+//
+// 一句话：**kind 是参数级的**。序列化层按 `Model::parameters()` 的顺序逐条读写
+//   `[kind][precision][rows][cols][aux][payload]`，由**拥有该参数的那个层**
+//   决定它落盘/载入的形态（Dense / 三值 latent / 三值打包 …）——取代了原先
+//   "L3 dynamic_cast 到 BitLinear + 层树枚举（sub_layers）"的做法。
+// ══════════════════════════════════════════════════════════════════════════
+
+// 参数级 kind（v7 参数条目第一字节；与 docs 23 §2.1 的表一一对应）
+enum class ParamKind : std::uint8_t
+{
+    Dense = 0,           // 普通浮点参数（Linear 权重/偏置、norm、嵌入、BN 统计…）
+    TernaryLatent = 1,   // BitLinear 的 f32 latent（训练态；写进 .nnckpt）
+    TernaryPacked2 = 2,  // 三值打包（2 bit/权重；运行期容器形态）
+    TernaryPacked3 = 3,  // 三值打包（base-3，1.6 bpw；.nnmodel 的默认载荷）
+    I8Packed4 = 4,       // 预留（P3：激活/张量 int8，4×int8/字）
+};
+
+// 文件角色（v7 文件头的一个字节）：只回答"这份文件是什么"，
+// **不**引入"可训练/不可训练"的模型状态。
+enum class ModelRole : std::uint8_t
+{
+    Model = 0,       // 推理模型（.nnmodel）：写推理所需的全部参数（三值层写打包形态）
+    Checkpoint = 1,  // 训练断点（.nnckpt）：模型 + 训练参数（三值层写 f32 latent）
+};
+
+[[nodiscard]] inline const char* param_kind_name(ParamKind k) noexcept
+{
+    switch (k)
+    {
+        case ParamKind::Dense: return "Dense";
+        case ParamKind::TernaryLatent: return "TernaryLatent";
+        case ParamKind::TernaryPacked2: return "TernaryPacked2";
+        case ParamKind::TernaryPacked3: return "TernaryPacked3";
+        case ParamKind::I8Packed4: return "I8Packed4";
+    }
+    return "?";
+}
+
+[[nodiscard]] inline const char* model_role_name(ModelRole r) noexcept
+{
+    return (r == ModelRole::Checkpoint) ? "checkpoint(.nnckpt)" : "model(.nnmodel)";
+}
+
+// 单个参数条目的形态。载荷是 `Tensor`（**不是** Matrix → 不触 L2 铁律）：
+// 宿主上传/下载与字节编码都在序列化层（L3）。
+struct ParamEntry
+{
+    ParamKind kind = ParamKind::Dense;
+    Precision precision = Precision::F32;
+    std::size_t rows = 0;   // 逻辑形状（= 权重形状，供载入期校验）
+    std::size_t cols = 0;
+    Tensor aux;             // 形态附加载荷（三值：τ，形状 (rows,1)）
+    Tensor payload;         // 主体载荷
+};
+
 class Layer
 {
 protected:
@@ -263,15 +320,61 @@ public:
     [[nodiscard]] virtual std::vector<TensorRef> parameters() { return {}; }
     [[nodiscard]] virtual std::vector<TensorRef> param_gradients() { return {}; }
 
-    // ── 子层结构（部署格式的完整遍历用，P2；`ternary_deploy.hpp`）─────────
-    // 复合层返回自己持有的子层（**非拥有**裸指针），叶子层返回空。
-    // 契约：返回值顺序 = 本层 `parameters()` 里"子层参数"的出现顺序，且
-    //       `parameters()[0..own)` 是本层**自身**参数（own = 总数 − 子层参数数）。
-    // 为什么需要它：GPT 的三值层（BitLinear）藏在 Block/Attention/FeedForward
-    //       内部，顶层 `Model::layer_at(i)` 拿不到 —— 部署格式要把"打包字 + τ"
-    //       落到正确的层上，就必须能递归到叶子。遍历器会在覆盖数不一致时
-    //       fail-fast（不静默错位），所以"没实现 sub_layers 的复合层"是可诊断的。
-    [[nodiscard]] virtual std::vector<Layer*> sub_layers() noexcept { return {}; }
+    // ── 参数形态协议（v7；取代 dynamic_cast 与 sub_layers）────────────────
+    // `index` = 本层（含子层）参数扁平顺序中的下标，与 `parameters()` **同序**。
+    //   · 叶子层：默认实现（Dense 直取 `parameters()[index]`）；
+    //   · 复合层：默认实现按 `param_children()` 顺序转发（与 `parameters()`
+    //     的拼接顺序同形），因此只需覆盖 `param_children()`；
+    //   · 特殊形态的层（BitLinear）覆盖两个方法，按 kind 分派。
+    // 载入时形态不被接受（如把打包形态塞进普通 Linear）→ fail-fast。
+    [[nodiscard]] virtual std::size_t param_count() { return parameters().size(); }
+
+    [[nodiscard]] virtual Result<ParamEntry> export_param(std::size_t index, ModelRole role)
+    {
+        auto children = param_children();
+        const std::size_t own = own_param_count_();
+        if (!children.empty() && index >= own)
+        {
+            index -= own;
+            for (Layer* c : children)
+            {
+                const std::size_t n = c->param_count();
+                if (index < n) return c->export_param(index, role);
+                index -= n;
+            }
+            NN_FAIL(std::string("export_param: 参数下标越界（复合层=") + layer_name() + "）");
+        }
+        (void)role;
+        auto ps = parameters();
+        if (index >= ps.size())
+            NN_FAIL(std::string("export_param: 参数下标越界（层=") + layer_name() + "）");
+        return dense_entry_(ps[index].get());
+    }
+
+    [[nodiscard]] virtual Result<void> import_param(std::size_t index, const ParamEntry& entry)
+    {
+        auto children = param_children();
+        const std::size_t own = own_param_count_();
+        if (!children.empty() && index >= own)
+        {
+            index -= own;
+            for (Layer* c : children)
+            {
+                const std::size_t n = c->param_count();
+                if (index < n) return c->import_param(index, entry);
+                index -= n;
+            }
+            NN_FAIL(std::string("import_param: 参数下标越界（复合层=") + layer_name() + "）");
+        }
+        if (entry.kind != ParamKind::Dense)
+            NN_FAIL(std::string("import_param: 该层不接受此参数形态（层=") + layer_name() +
+                    "，kind=" + param_kind_name(entry.kind) + "，可接受 {Dense}）");
+        auto ps = parameters();
+        if (index >= ps.size())
+            NN_FAIL(std::string("import_param: 参数下标越界（层=") + layer_name() + "）");
+        Tensor& t = ps[index].get();
+        return import_into_(t, entry);
+    }
 
     // 诊断（F2）：梯度缓冲是否已**实际分配**。
     // 采用惰性梯度分配的层（Linear / BitLinear）在 init 后、第一次
@@ -281,6 +384,51 @@ public:
     [[nodiscard]] virtual bool grad_buffers_allocated() const noexcept { return true; }
 
 protected:
+    // 参数归属的子层（复合层覆盖；叶子层默认空 = 本层参数全归自己）。
+    // 契约：顺序 = 本层 `parameters()` 里"子层参数"的出现顺序，且子层参数
+    //       拼接结果与 `parameters()` 完全一致。
+    // ⚠ 这**不是**层树枚举 API（原公开的 `sub_layers()` 已删除）：它只服务于
+    //   参数形态协议的下标转发（export_param / import_param）。
+    [[nodiscard]] virtual std::vector<Layer*> param_children() noexcept { return {}; }
+
+    // 本层**自身**参数个数（= 总数 − 子层参数数）。默认实现按 `parameters()`
+    // 与 `param_children()` 的契约反推；契约被破坏时返回 0（后续下标转发会
+    // 在越界处 fail-fast，不静默错位）。
+    [[nodiscard]] std::size_t own_param_count_()
+    {
+        auto children = param_children();
+        if (children.empty()) return param_count();
+        std::size_t child_total = 0;
+        for (Layer* c : children) child_total += c->param_count();
+        const std::size_t total = param_count();
+        return total >= child_total ? total - child_total : 0;
+    }
+
+    // Dense 条目构造（叶子层的默认导出；特殊形态层导出自己的 Dense 参数时也用它）。
+    // payload **共享**参数张量（零拷贝）——序列化层自行按其 precision 下载。
+    [[nodiscard]] static ParamEntry dense_entry_(Tensor& t)
+    {
+        ParamEntry e;
+        e.kind = ParamKind::Dense;
+        e.precision = t.precision();
+        e.rows = t.rows();
+        e.cols = t.cols();
+        e.payload = t;
+        return e;
+    }
+
+    // 条目 → 目标张量（形状/精度校验；同精度零转换，异精度经引擎 cast）。
+    [[nodiscard]] Result<void> import_into_(Tensor& dst, const ParamEntry& e)
+    {
+        if (e.rows != dst.rows() || e.cols != dst.cols())
+            NN_FAIL(std::string("import_param: 形状不匹配（层=") + layer_name() + "，期望 " +
+                    std::to_string(dst.rows()) + "x" + std::to_string(dst.cols()) + "，实际 " +
+                    std::to_string(e.rows) + "x" + std::to_string(e.cols) + "）");
+        if (e.payload.precision() == dst.precision())
+            return engine_ref().copy_into(dst, e.payload);
+        return engine_ref().cast_into(e.payload, dst);
+    }
+
     // ── 复合层参数收集（消除各复合层 parameters()/param_gradients() 的同构级联）──
     // 按实参顺序拼接若干列表；实参可以是 `Tensor`（隐式变成单元素）或
     // `std::vector<TensorRef>`（子层级联结果）。用法：

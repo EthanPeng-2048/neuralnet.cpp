@@ -543,7 +543,12 @@ void test_model_level(ComputeEngine &eng)
     if (!model2_r) return;
     auto lr = nn::load_model(file, *model2_r);
     CHECK(lr, "load_model");
-    if (!lr) { std::remove(file.c_str()); return; }
+    if (!lr)
+    {
+        std::printf("    load_model 错误: %s\n", lr.error().message.c_str());
+        std::remove(file.c_str());
+        return;
+    }
 
     // 参数逐位一致
     {

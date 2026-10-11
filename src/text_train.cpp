@@ -254,9 +254,8 @@ void print_usage(const char *prog)
     help.item("<dataset.nndataset>", "数据集文件路径 (.nndataset，由 dataset_gen 生成；\n词表/loss 掩码/test 子集都在生成期定好)");
 
     help.section("选项");
-    help.opt("--save <path>", "模型保存路径 (默认: gpt_model.bin)");
-    help.opt("--export-deploy <path>", "额外导出**打包部署文件**（只读推理：三值权重\n按 0.25 B/权重 + 逐行 τ 落盘，含 base-3 载荷；不含 latent/梯度）");
-    help.opt("--resume <path>", "从已有模型恢复训练");
+    help.opt("--save <path>", "推理模型保存路径 (默认: gpt_model.nnmodel；\n只含推理所需参数——三值层写打包形态，不含训练参数)");
+    help.opt("--resume <path>", "从训练断点 (.nnckpt) 恢复训练；\n推理模型文件 (.nnmodel) 没有训练参数，会被明确拒绝");
     help.opt("--resume-epoch <n>", "从第 n 个 epoch 继续 (0-based，需配合 --resume；默认 0)");
     help.opt("--resume-step <n>", "从本 epoch 内第 n 步继续 (0-based，需配合 --resume；默认 0)");
     help.opt("--epochs <n>", "训练轮数 (默认: 10)");
@@ -271,7 +270,7 @@ void print_usage(const char *prog)
     help.opt("--beta2 <b>", "Adam/AdamW 二阶动量衰减 β2 (默认: 0.999，sgd/muon 忽略)\nLLM 预训练惯例常取 0.95 (GPT-3/LLaMA 配方)");
     help.opt("--max-norm <f>", "梯度裁剪最大全局 L2 范数 (默认: 0=不裁剪)");
     help.opt("--log-interval <n>", "每隔多少 step 显示进度 (默认: 50)");
-    help.opt("--save-interval <n>", "每隔多少 step 保存 checkpoint (默认: 100)");
+    help.opt("--save-interval <n>", "每隔多少 step 保存训练断点 .nnckpt (默认: 100；\n文件名 = --save 的路径换 .nnckpt 扩展名)");
     help.opt("--max-steps <n>", "本次运行最多训练多少 step 后停止并保存 (默认: 0=不限)\n按本进程执行的步数计，可与 --resume 组合分段跑；用于吞吐实测/分段训练");
     help.opt("--grad-log", "显示梯度统计 (范数/最大值/均值)");
     help.opt("--gpu [索引|名称]", "启用 GPU 加速 (需要 Vulkan SDK)\n空格形式只收枚举索引；名称子串用 --gpu=<名称>，如 --gpu=NVIDIA / --gpu=40HX");
@@ -317,13 +316,22 @@ void print_usage(const char *prog)
 }
 
 // ==================== 命令行参数 ====================
+// 训练断点路径（docs/development/23 §2.1）：`--save` 的路径换扩展名为 .nnckpt
+// （`gpt_model.nnmodel` → `gpt_model.nnckpt`；其它路径则追加 .nnckpt）。
+[[nodiscard]] static std::string ckpt_path_of(const std::string& save_path)
+{
+    static const std::string kExt = ".nnmodel";
+    if (save_path.size() > kExt.size() &&
+        save_path.compare(save_path.size() - kExt.size(), kExt.size(), kExt) == 0)
+        return save_path.substr(0, save_path.size() - kExt.size()) + ".nnckpt";
+    return save_path + ".nnckpt";
+}
+
 struct TrainConfig
 {
     std::string text_path;
-    std::string save_path = "gpt_model.bin";
-    // 打包部署文件（P2，可选）：三值层以 0.25 B/权重 + τ 落盘（只读推理）。
-    // 与训练文件（f32 latent，可续训）是两种产物，互不影响。
-    std::string deploy_path;
+    // 推理模型（.nnmodel，Model 角色）：只含推理所需参数（三值层写打包形态）。
+    std::string save_path = "gpt_model.nnmodel";
     std::string resume_path;
     std::string optimizer_name = "adam";
     int epochs = 10;
@@ -393,8 +401,6 @@ TrainConfig parse_args(int argc, char *argv[])
         }
         else if (arg == "--save" && i + 1 < argc)
             cfg.save_path = argv[++i];
-        else if (arg == "--export-deploy" && i + 1 < argc)
-            cfg.deploy_path = argv[++i];
         else if (arg == "--resume" && i + 1 < argc)
         {
             cfg.resume_path = argv[++i];
@@ -1041,6 +1047,21 @@ int main(int argc, char *argv[])
 
     if (cfg.load_existing)
     {
+        // 角色校验（v7，docs/development/23 §2.1）：`--resume` 只认训练断点。
+        // 推理模型文件（.nnmodel）没有训练参数（三值层只有打包权重）→ 明确拒绝；
+        // v5/v6 老 .bin 无 role 字段 → 按"训练文件"处理（零破坏）。
+        {
+            uint32_t resume_version = 0;
+            auto role_r = nn::peek_model_role(cfg.resume_path, &resume_version);
+            if (role_r && resume_version >= 7 && *role_r != nn::ModelRole::Checkpoint)
+            {
+                std::cerr << "错误: --resume 需要训练断点文件（.nnckpt，Checkpoint 角色），但 "
+                          << cfg.resume_path << " 是 " << nn::model_role_name(*role_r)
+                          << "；它不含训练参数（三值层只有打包权重）。\n"
+                          << "  请用训练时 --save-interval 产出的 .nnckpt 续训。\n";
+                std::exit(1);
+            }
+        }
         auto spec_result = nn::peek_model_spec(cfg.resume_path);
         if (!spec_result)
         {
@@ -1582,7 +1603,9 @@ int main(int argc, char *argv[])
             if (cfg.save_interval > 0 &&
                 ((step + 1) % cfg.save_interval == 0 || step + 1 == steps_per_epoch))
             {
-                auto save_r = nn::save_model(cfg.save_path, model, spec, tokenizer_bytes);
+                // 训练断点（Checkpoint 角色）：含训练参数（三值层 = f32 latent）
+                auto save_r = nn::save_model(ckpt_path_of(cfg.save_path), model, spec,
+                                             tokenizer_bytes, nn::ModelRole::Checkpoint);
                 if (!save_r)
                     std::cerr << "\n  [ckpt] 保存失败: " << save_r.error().message << "\n";
             }
@@ -1741,26 +1764,10 @@ int main(int argc, char *argv[])
 
     // ── 保存模型（含规格 + 嵌入 tokenizer） ──────────────────
     {
-        auto save_result = nn::save_model(cfg.save_path, model, spec, tokenizer_bytes);
+        // 推理模型（Model 角色）：三值层写打包形态 + τ（不含训练参数）
+        auto save_result = nn::save_model(cfg.save_path, model, spec, tokenizer_bytes,
+                                          nn::ModelRole::Model);
         NN_EXIT(save_result, 1, "Error: ");
-        // 可选：导出只读推理的**打包部署文件**（P2）。只在三值模型上有意义 ——
-        // 非三值模型没有打包权重，导出会退化成"f32 latent 换了个后缀"，故明确拒绝。
-        if (!cfg.deploy_path.empty())
-        {
-            if (spec.weight_quant != nn::WeightQuant::T1_58)
-            {
-                std::cerr << "  [deploy] --export-deploy 需要三值模型"
-                             "（--t1_58 或 --precision-param t1_58）；当前模型不是三值 → 跳过\n";
-            }
-            else
-            {
-                auto dep_r = nn::save_deployment(cfg.deploy_path, model, spec,
-                                                 /*base3=*/true, tokenizer_bytes);
-                NN_EXIT(dep_r, 1, "Error: ");
-                std::cout << "  部署文件已导出: " << cfg.deploy_path
-                          << "（打包三值 + 逐行 τ，base-3 载荷；只读推理）" << std::endl;
-            }
-        }
     }
     std::cout << "\n训练完成! 总耗时: " << std::fixed << std::setprecision(1)
               << total_sec << "s"

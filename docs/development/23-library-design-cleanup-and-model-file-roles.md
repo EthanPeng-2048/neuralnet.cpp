@@ -1,7 +1,7 @@
 # 库级违规设计清理：模型文件角色（`.nnmodel` / `.nnckpt`）· 参数形态协议 · 引擎能力体系
 
-> **状态：讨论稿（未实施）**。三轮裁决已汇总于 §0；本文件先记录**全库审查取证**与**设计**，
-> 等设计确认后再落地。**范围 = 整个库的违规设计清理**（不只三值路径；三值只是触发点）。
+> **状态：已实施（2026-10-11）**。三轮裁决已汇总于 §0；本文件记录**全库审查取证**与**设计**，
+> 以及**落地进度**（§2.5 各步带 ✅ / ⏳ 标记）。**范围 = 整个库的违规设计清理**（不只三值路径；三值只是触发点）。
 > **取代**：本文件替代早先的 `23-model-format-v7-and-engine-capability.md`（那版的"NNQT 独立
 > 格式 + 部署标签"已被裁决取消）。
 
@@ -265,4 +265,32 @@ virtual Result<void>      import_param(std::size_t index, const ParamEntry& entr
 3. **旧 `.bin` 的迁移**：只"读旧写新"（本稿建议）／提供一次性转换工具／`.bin` 直接不再被识别？
 4. **spec-key 缓存方案**（F2 修复的次要项）：按 `ExprSpec` 对象身份缓存（本稿建议）／把 key
    在构建期算好存进 spec／不做缓存只去掉重复。
+
+---
+
+## 4. 落地结果（2026-10-11，本节记录**实施后**的实际形态）
+
+**§3 待裁决的四条，按建议落地**：① `EngineInfo` 结构体 + `text()` 一行摘要，接口名
+`ComputeEngine::describe()`（避开 `*_` 私有约定）；② `.nnmodel` **不保留** latent；
+③ 旧 `.bin` **只读不写**（不提供转换工具：header 无 role 字节 → 按 Model 处理）；
+④ 取消"按 spec 身份缓存"，只**去掉重复归因**（选路+回退合并进 `*_impl`）——实测无回归。
+
+**§2.5 六步**：1（能力体系）✅ / 2（参数形态协议）✅ / 3（v7 + 文件角色）✅ /
+4（删标签）✅ / 5（文档同步）✅ / 6（P3 int8 全链路）**⏳ 未做**（属新功能，见 §2.5-6）。
+
+**落地时的三处实现细节**（与 §2 设计的差异，均已写进代码注释）：
+
+1. **盘上编码 vs 运行期形态**：`export_param(index, Model)` 返回**运行期**形态
+   （`TernaryPacked2`，2 bit 容器）；序列化层（L3）在写 `.nnmodel` 时把它编成
+   `TernaryPacked3`（base-3 1.6 bpw），读回时解成 2-bit 容器再交给层。理由是
+   base-3 编解码需要宿主字节，而 L2 层不得碰 Matrix/宿主 I/O（铁律 12）——
+   **层只认运行期形态**，盘上编码是 L3 的事。
+2. **子层枚举的落点**：公开的 `Layer::sub_layers()` 删除；参数下标转发改由**受保护的**
+   `param_children()` 承担（默认 `export_param`/`import_param` 按"自身参数在前 + 子层
+   顺序"转发），写在 `compute_layer_base.hpp` 的参数形态协议注释里。
+3. **`BitLinear` 的两形态缓冲**：打包是**默认且唯一**的训练/解码形态；`force_pack_`
+   与 `set_ternary_pack_enabled/auto` 保留为 **A/B 与回退**开关（`layer_bench` 的
+   `matmul_q_bw` 口径依赖它），其余特例 API（`load_packed_weights`/`packed_only()`/
+   `ensure_quantized`/`quantized_weights_packed`/`row_scales`）依旧保留给
+   `import_param` 与诊断使用 —— 它们不再是**对外部署格式**的一部分。
 

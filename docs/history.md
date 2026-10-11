@@ -2567,3 +2567,45 @@ A1 段改动前为 2424）、`include/neuralnet.cpp/compute_cpu_engine.hpp` **23
   原「Tokenize: N docs ...」单行提示删除（进度条自身带百分比）。多线程编码本身**未改**——
   `encode_docs_parallel` 的分块并行（`nn::parallel_for_samples` 保序归位）原样保留，输出
   逐字节不变（`dataset_test` 回归锁定）。
+
+## 库级违规设计清理：模型文件角色 + 参数形态协议 + 引擎能力体系（2026-10-11，docs/development/23）
+
+**整改前的原位置**：`include/neuralnet.cpp/compute_engine.hpp`（6 个能力谓词 + 19 处基类
+NVI 能力分支）、`compute_layer_base.hpp` 的 `Layer::sub_layers()`、`compute_layer_bitlinear.hpp`
+（5 处能力查询 + 4 个部署态守卫）、`ternary_deploy.hpp`（整文件）、`model_serialization.hpp`
+（v6 扁平矩阵序列）、`src/{text,mnist}_{train,infer}.cpp`、`gui.py`、`cli_controllers.py`、
+`bench/gui_cli_audit.py`、`src/ternary_deploy_test.cpp`。
+
+**类型**：删除清单 + 演进记录 + 覆盖缺口。
+
+**删除清单**：① 基类 `supports_native_data_move` / `supports_native_f16_reduce` /
+`supports_expr_precision_variant` / `supports_ternary_gemm` / `supports_int8_dot` /
+`int8_dot_accelerated`（能力改由 `describe()` 的 `EngineInfo` 披露；引擎侧落成私有事实 +
+`*_impl` 内部分支）；② `Layer::sub_layers()`（参数下标转发改走受保护的 `param_children()`）；
+③ `include/neuralnet.cpp/ternary_deploy.hpp` + `src/ternary_deploy_test.cpp`（NNQT 独立
+magic/版本/读写器全套）；④ CLI/GUI 的 `--export-deploy` / 「导出部署文件」行 /
+`cli_controllers.py` 透传 / `gui_cli_audit.py` 用例 / 推理 CLI 的 `is_deployment_file`
+分流分支。
+
+**演进记录**：v6 → **v7**（文件头加 `role` 字节；参数区从"扁平矩阵序列"改为
+`[kind][precision][rows][cols][aux_len][payload_len][aux][payload]` 的**参数级 kind**
+条目）。角色：`.nnmodel` = 推理（三值层写打包形态，盘上 base-3 1.6 bpw + τ）、
+`.nnckpt` = 训练断点（写 f32 latent）；`--save` 默认 `gpt_model.nnmodel`、
+`--save-interval` 写 `.nnckpt`、`--resume` 只认 `.nnckpt`。
+
+**被否决/改写的历史**：① 早先"v7 与引擎能力内敛"稿里的 **NNQT 独立格式 + 部署标签**被裁决
+取消（改成单一 NNNN 格式 + 文件角色）；② 「按 `ExprSpec` 对象身份缓存 key」方案未采用 ——
+F2 的实测瓶颈是**双份归因**（`supports_expr_precision_variant` 每次都算一遍 key/签名，
+`eval_expr_impl` 再算一遍），把选路与边界回退下沉进 `*_impl` 后每次求值只归因一次即可；
+③ 原计划的 `supports_*_` 私有化命名（尾随下划线）未沿用 —— 设备事实直接落成
+`backend_.has_*_pipeline()` 查询，避免新增私有谓词层。
+
+**覆盖缺口（未做）**：P3（激活 int8 + 整数点积全链路：`quantize_act_i8` / `matmul_q_i8` /
+端到端对拍）仍是独立新功能，不在本轮清理范围内（能力探测位已就位，102/40HX 实测可用）；
+"免 latent 构建"（载入 `.nnmodel` 时按角色跳过 latent 分配）也未做 —— 峰值显存因此尚未
+下降（老 NNQT 那组"11.9× 更小 / 峰值持平"的实测数字仍然是本项的口径）。
+
+**落地验收**：102（40HX / clang 23 / Release）全量构建 + ctest **37/37**；新增
+`src/model_roles_test.cpp`（Model 角色只读态 + 前向逐位一致 / Checkpoint 角色 latent
+逐位一致 + 可续训 / 推理文件小于断点文件 / `peek_model_role` / 只读态按断点角色导出报错）
+取代原 `ternary_deploy_test` 的部署格式面。
