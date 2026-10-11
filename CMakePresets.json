@@ -1,0 +1,203 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 30,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "NN_BUILD_APPS": "ON",
+        "NN_ENABLE_NATIVE": "ON",
+        "NN_ENABLE_PCH": "ON",
+        "NN_ENABLE_TESTS": "OFF",
+        "NN_ENABLE_PROBES": "OFF",
+        "NN_ENABLE_GPU": "AUTO"
+      }
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "displayName": "Release（本机最优）",
+      "description": "日常开发/跑应用：-O3 -funroll-loops -march=native + PCH + ccache。产物只保证能在本机同代 CPU 上跑（换机/分发用 portable）。对应 AGENTS『cmake -B build -G Ninja』。"
+    },
+    {
+      "name": "dev",
+      "inherits": "release",
+      "displayName": "Release + 测试",
+      "description": "本仓开发主用：在 release 基础上打开 NN_ENABLE_TESTS（build/ 下生成全部 *_test/gradcheck，并注册 ctest）。对应 AGENTS『-DNN_ENABLE_TESTS=ON && ctest』。",
+      "cacheVariables": {
+        "NN_ENABLE_TESTS": "ON"
+      }
+    },
+    {
+      "name": "debug",
+      "inherits": "dev",
+      "displayName": "Debug + 测试",
+      "description": "调试优先：-O0 -g（保留 PCH/ccache）。断点/单步用这个。",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "portable",
+      "inherits": "dev",
+      "displayName": "Release 可移植基线 + 测试",
+      "description": "分发/CI/换机用：NN_ENABLE_NATIVE=OFF（不带 -march=native），产物可在同架构的任意 CPU 上运行。发布构建用这个的口径。",
+      "cacheVariables": {
+        "NN_ENABLE_NATIVE": "OFF"
+      }
+    },
+    {
+      "name": "cpu",
+      "inherits": "dev",
+      "displayName": "纯 CPU + 测试",
+      "description": "NN_ENABLE_GPU=OFF：连 Vulkan/glslc 都不探测、不生成 shader、不编 scan_exprs —— 纯 CPU 的最短构建路径。改 CPU 引擎时用它省时间。",
+      "cacheVariables": {
+        "NN_ENABLE_GPU": "OFF"
+      }
+    },
+    {
+      "name": "probes",
+      "inherits": "dev",
+      "displayName": "Release + 测试 + 诊断探针",
+      "description": "打开 NN_ENABLE_PROBES（热路径扫描/归因代码 + mem_probe/f16_cpu_probe/gpu_stability_probe 目标）。⚠ 库头语义与正常构建不同，二进制/缓存不可混用。",
+      "cacheVariables": {
+        "NN_ENABLE_PROBES": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "displayName": "构建 release"
+    },
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "displayName": "构建 dev"
+    },
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "displayName": "构建 debug"
+    },
+    {
+      "name": "portable",
+      "configurePreset": "portable",
+      "displayName": "构建 portable"
+    },
+    {
+      "name": "cpu",
+      "configurePreset": "cpu",
+      "displayName": "构建 cpu"
+    },
+    {
+      "name": "probes",
+      "configurePreset": "probes",
+      "displayName": "构建 probes"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      },
+      "displayName": "ctest（dev）"
+    },
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      },
+      "displayName": "ctest（debug）"
+    },
+    {
+      "name": "portable",
+      "configurePreset": "portable",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      },
+      "displayName": "ctest（portable）"
+    },
+    {
+      "name": "cpu",
+      "configurePreset": "cpu",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      },
+      "displayName": "ctest（cpu）"
+    },
+    {
+      "name": "probes",
+      "configurePreset": "probes",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      },
+      "displayName": "ctest（probes）"
+    }
+  ],
+  "workflowPresets": [
+    {
+      "name": "dev",
+      "displayName": "配置 + 构建 + 测试（dev）",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "dev"
+        },
+        {
+          "type": "build",
+          "name": "dev"
+        },
+        {
+          "type": "test",
+          "name": "dev"
+        }
+      ]
+    },
+    {
+      "name": "portable",
+      "displayName": "配置 + 构建 + 测试（portable，发布前口径）",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "portable"
+        },
+        {
+          "type": "build",
+          "name": "portable"
+        },
+        {
+          "type": "test",
+          "name": "portable"
+        }
+      ]
+    }
+  ]
+}

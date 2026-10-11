@@ -141,9 +141,28 @@ if(NOT NN_COMPILER_LAUNCHER AND NOT CMAKE_CXX_COMPILER_LAUNCHER AND PROJECT_IS_T
     endif()
 endif()
 if(NN_COMPILER_LAUNCHER AND (NN_COMPILER_LAUNCHER_EXPLICIT OR PROJECT_IS_TOP_LEVEL))
+    # ── ccache × PCH：把 sloppiness 钉进编译命令 ──────────────────────────
+    # ccache 手册《Precompiled headers》要求 Clang 侧**三项同时满足**才能缓存
+    # "用了 PCH 的 TU"：① sloppiness 含 `pch_defines,time_macros`；② 以
+    # `-include-pch` 使用 PCH（CMake 就是这么传的）；③ 编译带
+    # `-fno-pch-timestamp`（见文件末尾 PCH 落地块）。缺 ①/③ 时 ccache 对**每个**
+    # 用 PCH 的 TU 都记 "Could not use precompiled header" → 全部不可缓存，
+    # 而本仓 42+ 个目标的编译**全部**走 PCH，等于缓存形同虚设。
+    # 这里用 `cmake -E env` 把 sloppiness 钉在命令前缀里，**不依赖用户全局
+    # ccache 配置**（避免"换个机器/换个人就悄悄失效，还看不出慢在哪"）。
+    # 两项 sloppiness 对本仓安全：全仓无 `__DATE__` / `__TIME__` / `__TIMESTAMP__`
+    # （`pch_defines` 只在"用 PCH + 源内 #define 影响 PCH 内容"的写法下才有风险，
+    # 而 PCH 是强制前置包含、源内 #define 影响不到它）。
+    if(NN_COMPILER_LAUNCHER MATCHES "ccache")
+        # ⚠ 必须写成**单个**字符串：写成两个相邻的带引号参数会变成 CMake 列表
+        #   （分号连接）→ 命令行里被 `sh` 当成第二个命令，实测报
+        #   `-E env ;CCACHE_SLOPPINESS=...`。
+        set(NN_COMPILER_LAUNCHER "${CMAKE_COMMAND} -E env CCACHE_SLOPPINESS=pch_defines,time_macros ${NN_COMPILER_LAUNCHER}")
+    endif()
     message(STATUS "Compiler launcher: ${NN_COMPILER_LAUNCHER}")
     set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${NN_COMPILER_LAUNCHER}")
-    set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK "${NN_COMPILER_LAUNCHER}")
+    # 不挂 RULE_LAUNCH_LINK：本项目不做 LTO，ccache 对普通链接只有进程开销与
+    # "Called for linking" 统计噪声，没有收益。
 elseif(CMAKE_CXX_COMPILER_LAUNCHER)
     message(STATUS "Compiler launcher: ${CMAKE_CXX_COMPILER_LAUNCHER} "
                    "(来自 CMAKE_CXX_COMPILER_LAUNCHER，用 CMake 原生机制)")
@@ -1114,8 +1133,27 @@ if(NN_ENABLE_PCH AND NN_PCH_CANDIDATES)
     endif()
     target_precompile_headers(nn_pch PRIVATE [["neuralnet.cpp/nn.hpp"]])
 
+    # ── ccache × PCH 的第三项要求：`-fno-pch-timestamp` ────────────────────
+    # ccache 手册（Precompiled headers）明确：Clang 侧必须用该选项编 PCH，否则
+    # ccache 拒绝把"用了 PCH 的编译"入缓存（统计计数 Could not use precompiled
+    # header）。它会让 PCH 不嵌写入时间戳 —— 顺带让 PCH 内容可复现。
+    # ⚠ 这是 cc1 开关：驱动不认 `-fno-pch-timestamp`，必须 `-Xclang` 形式；ccache
+    #   是逐 token 匹配该字面量，`-Xclang -fno-pch-timestamp` 满足它的检查
+    #   （实测：开了之后同一 TU 从 30.2s 掉到 0.11s，见 docs/history/history.md）。
+    # ⚠ PCH 生成方（nn_pch）与所有使用方必须带同一份选项：CMake 的 REUSE_FROM
+    #   要求双方编译选项一致，故下面两处都加（对非同族的 sccache 也无害）。
+    # ⚠ 已知未覆盖：GCC 侧要缓存"用了 PCH 的 TU"须另加 `-fpch-preprocess`（手册），
+    #   它改变预处理输出、影响 depfile 口径，故本轮不擅自打开——GCC + PCH 的编译
+    #   仍不可缓存（CI 用 Clang，不受影响）。要用就显式 -DNN_COMPILER_LAUNCHER 自己加。
+    set(NN_PCH_COMPAT_OPTIONS "")
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+        set(NN_PCH_COMPAT_OPTIONS "-Xclang" "-fno-pch-timestamp")
+    endif()
+    target_compile_options(nn_pch PRIVATE ${NN_PCH_COMPAT_OPTIONS})
+
     set(NN_PCH_OWN_TARGETS "")
     foreach(_pch_tgt IN LISTS NN_PCH_CANDIDATES)
+        target_compile_options(${_pch_tgt} PRIVATE ${NN_PCH_COMPAT_OPTIONS})
         if(_pch_tgt STREQUAL "fusion_custom_layer_example" OR _pch_tgt STREQUAL "expr_fuse_test")
             target_precompile_headers(${_pch_tgt} PRIVATE [["neuralnet.cpp/nn.hpp"]])
             list(APPEND NN_PCH_OWN_TARGETS ${_pch_tgt})
