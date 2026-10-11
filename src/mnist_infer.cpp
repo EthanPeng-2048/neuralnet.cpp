@@ -229,10 +229,12 @@ int main(int argc, char *argv[])
     NN_EXIT(cfg_result, 1, "参数错误: ");
     InferConfig cfg = std::move(*cfg_result);
 
-    // ── 从模型文件读取规格 ─────────────────────────────────
-    auto spec_result = nn::peek_model_spec(cfg.model_path);
+    // ── 从模型文件读取规格（v5/v6/v7 同一 magic，自动按版本分流）──────────
+    auto spec_result = nn::peek_any_model_spec(cfg.model_path);
     NN_EXIT(spec_result, 1, "读取模型文件失败: ");
     nn::ModelSpec spec = spec_result.value();
+    auto role_r = nn::peek_model_role(cfg.model_path);
+    NN_EXIT(role_r, 1, "读取模型文件失败: ");
 
     // 支持的模型类型：MLP、Transformer（ViT）、CNN
     if (spec.type == nn::ModelType::MLP)
@@ -268,9 +270,12 @@ int main(int argc, char *argv[])
     NN_EXIT(build_result, 1, "构建模型失败: ");
     auto model = std::move(*build_result);
 
-    auto load_result = nn::load_model(cfg.model_path, model);
-    NN_EXIT(load_result, 1, "加载模型失败: ");
-    std::cout << "模型已加载: " << cfg.model_path << "\n" << std::endl;
+    {
+        auto load_result = nn::load_any_model(cfg.model_path, model, nullptr, nullptr);
+        NN_EXIT(load_result, 1, "加载模型失败: ");
+        std::cout << "模型已加载（角色: " << nn::model_role_name(*role_r) << "）: "
+                  << cfg.model_path << "\n" << std::endl;
+    }
 
     // 推理模式：BatchNorm 使用保存的 running 统计量（batch 可能为 1，不能算 batch 统计）
     model.set_training(false);

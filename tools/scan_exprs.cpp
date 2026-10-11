@@ -176,7 +176,8 @@ int main(int argc, char* argv[])
     // 结构不依赖形状，任取小 R×C 即可（Muon 的 NS 只对 ≥2D 参数生效）。
     {
         const std::size_t R = 8, C = 5;
-        for (const char* name : {"sgd", "sgd_momentum", "adam", "adamw", "muon"})
+        for (const char* name : {"sgd", "sgd_momentum", "adam", "adamw",
+                                 "adamwquant", "muon"})
         {
             nn::Tensor p = scan_tensor(R, C);
             nn::Tensor g = scan_tensor(R, C);
@@ -404,6 +405,40 @@ int main(int argc, char* argv[])
                 nn::dsl::leaf(x) == nn::dsl::col_broadcast(mx),
                 nn::Scalar{1}, nn::Scalar{0})),
             kk, cols);
+    }
+
+    // ── BitLinear 的**两条量化缓冲路径**（F3 / P2）────────────────────────
+    // 模型 pass 只产出"该引擎默认走的那条"（CPU 引擎 supports_ternary_gemm()
+    // = true → 打包路径），于是稠密路径的 `select → wq_` 与 matmul 尾链**不再
+    // 被任何用例登记**；而未接打包的后端（GPU 未接时）运行期走稠密路径 →
+    // 闭合世界硬报错（t1_58_test_gpu 就是这么暴露的）。两条路径的结构都必须
+    // 登记，故这里各 dry-run 一份（结构不依赖精度）。
+    for (const bool packed : {true, false})
+    {
+        nn::BitLinear bl(4, 3);
+        nn::PrecisionProfile t1 = scan_prof;
+        t1.param = nn::Precision::T1_58;
+        bl.set_precision_profile(t1);
+        (void)bl.init(engine);
+        bl.set_ternary_pack_enabled(packed);
+        nn::Tensor x = scan_tensor(4, 2);
+        auto fr = bl.forward(x);
+        if (!fr)
+        {
+            std::fprintf(stderr, "[scan] BitLinear(%s) forward FAILED: %s\n",
+                         packed ? "packed" : "dense", fr.error().message.c_str());
+            std::fflush(stderr);
+            std::abort();
+        }
+        nn::Tensor g = scan_tensor(3, 2);
+        auto br = bl.backward(g);
+        if (!br)
+        {
+            std::fprintf(stderr, "[scan] BitLinear(%s) backward FAILED: %s\n",
+                         packed ? "packed" : "dense", br.error().message.c_str());
+            std::fflush(stderr);
+            std::abort();
+        }
     }
 
     };   // dry_run 结束

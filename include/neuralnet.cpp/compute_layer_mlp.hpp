@@ -38,6 +38,23 @@ private:
     Tensor grad_b_;      // 偏置梯度
     Tensor input_cache_; // forward 输入缓存（供 backward 使用）
 
+    // ── 梯度缓冲：惰性分配（F2）────────────────────────────────────────────
+    // 只 forward 的推理路径不该为梯度付存储（f16 配置下 = 权重体积的 100%）。
+    // 梯度的唯一消费者是 `param_gradients()`（优化器构造 / 诊断）与
+    // `backward()`，两者都只在训练路径上；TensorRef 是成员引用
+    // （std::reference_wrapper），故"先给引用、后建存储"对优化器透明。
+    void ensure_grad_()
+    {
+        if (grad_w_.valid()) return;
+        ComputeEngine& engine = engine_ref();
+        grad_w_ = engine.create_tensor(out_features_, in_features_, p_.param,
+                                       InitSpec::zero());
+        grad_b_ = engine.create_tensor(out_features_, 1, p_.param, InitSpec::zero());
+        // 终止式检查（本函数返回 void，不能用 NN_FAIL 的 return 语义）
+        NN_CHECK(grad_w_.valid() && grad_b_.valid(),
+                 "Linear: 梯度缓冲（惰性）初始化失败");
+    }
+
 public:
     Linear(std::size_t in_features, std::size_t out_features)
         : in_features_(in_features), out_features_(out_features) {}
@@ -55,10 +72,7 @@ public:
         if (!w_.valid()) NN_FAIL("Linear: 权重初始化失败");
         b_ = engine.create_tensor(out_features_, 1, p_.param, InitSpec::zero());
         if (!b_.valid()) NN_FAIL("Linear: 偏置初始化失败");
-        grad_w_ = engine.create_tensor(out_features_, in_features_, p_.param, InitSpec::zero());
-        grad_b_ = engine.create_tensor(out_features_, 1, p_.param, InitSpec::zero());
-        if (!grad_w_.valid() || !grad_b_.valid())
-            NN_FAIL("Linear: 梯度缓冲初始化失败");
+        // 梯度缓冲**不在此分配**（F2）：惰性 + 只训练时分配，见 ensure_grad_()。
         return {};
     }
 
@@ -69,7 +83,13 @@ public:
 
     [[nodiscard]] std::vector<TensorRef> param_gradients() override
     {
+        ensure_grad_();
         return {grad_w_, grad_b_};
+    }
+
+    [[nodiscard]] bool grad_buffers_allocated() const noexcept override
+    {
+        return grad_w_.valid();
     }
 
     void clear_cache() override { input_cache_ = Tensor{}; }
@@ -108,6 +128,7 @@ public:
         ComputeEngine& engine = engine_ref();
         if (grad_output.rows() != w_.rows())
             NN_FAIL("linear backward: grad_output shape mismatch");
+        ensure_grad_();   // 训练路径：首次反向才建梯度缓冲（F2）
         // 计算精度 = p_.compute（in-place 累加的目标精度 = grad_w_ 的存储精度，
         // compute_into 无需 P：§8.3 in-place 存储精度不可变）
         // grad_input = W^T × grad_output：纯 matmul 段（无尾链），由 dsl::compute

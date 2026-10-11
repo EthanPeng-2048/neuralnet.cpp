@@ -97,6 +97,12 @@ public:
                             norm2_->parameters());
     }
 
+    // 子层结构（部署格式的完整遍历；顺序 = 上面 `parameters()` 的拼接顺序）
+    [[nodiscard]] std::vector<Layer*> param_children() noexcept override
+    {
+        return {&self_attn_, norm1_.get(), &ff_, norm2_.get()};
+    }
+
     // 文档感知：把每样本文档 id 转发给内部自注意力（用于块对角掩码）
     void set_doc_ids(std::span<const std::size_t> ids) override
     {
@@ -446,6 +452,20 @@ public:
             refs.insert(refs.end(), h.begin(), h.end());
         }
         return refs;
+    }
+
+    // 子层结构（部署格式的完整遍历；顺序 = 上面 `parameters()` 的拼接顺序；
+    // token_emb_（Tensor）与 pos_encoder_（PositionEncoder，**不是 Layer**）都是
+    // GPTModel 的"自身参数" → 由遍历器按"自身参数在前"处理，落成普通矩阵条目）
+    [[nodiscard]] std::vector<Layer*> param_children() noexcept override
+    {
+        std::vector<Layer*> r;
+        r.reserve(r.size() + blocks_.size() + 2);
+        for (auto& b : blocks_) r.push_back(static_cast<Layer*>(&b));
+        if (ln_f_) r.push_back(static_cast<Layer*>(ln_f_.get()));
+        if (!tie_embeddings_ && lm_head_)
+            r.push_back(static_cast<Layer*>(lm_head_.get()));
+        return r;
     }
 
     std::vector<TensorRef> param_gradients() override

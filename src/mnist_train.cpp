@@ -72,13 +72,13 @@ void print_usage(const char *prog)
 
     help.section("选项");
     help.opt("--arch <name>", "模型架构: mlp/transformer/cnn (默认: mlp)");
-    help.opt("--resume <path>", "从已有模型恢复训练 (自动读取模型规格与架构)");
-    help.opt("--save <path>", "模型保存路径 (默认: mnist_model.bin)");
+    help.opt("--resume <path>", "从已有模型恢复训练 (自动读取模型规格与架构；\n推理模型 .nnmodel 没有训练参数，会被明确拒绝)");
+    help.opt("--save <path>", "推理模型保存路径 (默认: mnist_model.nnmodel；\n只含推理所需参数——三值层写打包形态，不含训练参数)");
     help.opt("--dataset <path>", "数据集目录 (默认: datasets/mnist_data)");
     help.opt("--epochs <n>", "训练轮数 (默认: 10)");
     help.opt("--lr <lr>", "学习率 (默认: 0.001)");
     help.opt("--batch-size <n>", "批大小 (默认: 64)");
-    help.opt("--optimizer <name>", "优化器: sgd/sgd_momentum/adam/adamw/muon (默认: adam)");
+    help.opt("--optimizer <name>", "优化器: sgd/sgd_momentum/adam/adamw/adamwquant/muon (默认: adam)\nadamwquant: 量化状态的 AdamW（状态 4 B/权重 vs 8 B；见 docs/development/21 §4.13）");
     help.opt("--weight-decay <w>", "AdamW 权重衰减系数 (默认: 0.01)");
     help.opt("--max-samples <n>", "限制训练样本数 (默认: 全部，用于快速测试)");
     help.opt("--shuffle-steps <true|false>", "每 epoch 打乱 batch 顺序 (默认: true)");
@@ -128,7 +128,7 @@ void print_usage(const char *prog)
 struct TrainConfig
 {
     ArchType arch = ArchType::MLP;
-    std::string save_path = "mnist_model.bin";
+    std::string save_path = "mnist_model.nnmodel";
     std::string dataset_path = "datasets/mnist_data";
     std::string resume_path;
     std::string optimizer_name = "adam";
@@ -541,6 +541,19 @@ int main(int argc, char *argv[])
     // ── 如果 --resume，从文件读取规格覆盖 CLI 参数 ──────────
     if (cfg.load_existing)
     {
+        // 角色校验（v7，docs/development/23 §2.1）：推理模型文件不含训练参数 →
+        // 明确拒绝；v5/v6 老 .bin 无 role 字段 → 按训练文件处理（零破坏）。
+        {
+            uint32_t resume_version = 0;
+            auto role_r = nn::peek_model_role(cfg.resume_path, &resume_version);
+            if (role_r && resume_version >= 7 && *role_r != nn::ModelRole::Checkpoint)
+            {
+                std::cerr << "错误: --resume 需要训练断点文件（.nnckpt，Checkpoint 角色），但 "
+                          << cfg.resume_path << " 是 " << nn::model_role_name(*role_r)
+                          << "；它不含训练参数。\n";
+                return 1;
+            }
+        }
         auto spec_result = nn::peek_model_spec(cfg.resume_path);
         if (spec_result)
         {
@@ -923,7 +936,9 @@ int main(int argc, char *argv[])
     Scalar total_sec = std::chrono::duration<Scalar>(t_end - t_start).count();
 
     // ── 保存模型 ─────────────────────────────────────────────
-    auto save_result = nn::save_model(cfg.save_path, model, spec);
+    // 推理模型（Model 角色）：三值层写打包形态 + τ（不含训练参数）
+    auto save_result = nn::save_model(cfg.save_path, model, spec, {},
+                                      nn::ModelRole::Model);
     NN_EXIT(save_result, 1, "保存模型失败: ");
     std::cout << "\n训练完成! 总耗时: " << std::fixed << std::setprecision(1) << total_sec << "s" << std::endl;
 

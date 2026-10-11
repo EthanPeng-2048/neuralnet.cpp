@@ -115,6 +115,34 @@ namespace nn
         std::size_t rows_{0};
         std::size_t cols_{0};
 
+        // ── 写版本（write epoch）────────────────────────────────────────────
+        // 语义：本存储的内容**可能已经变了**的单调计数。唯一的推进入口是
+        // ComputeEngine 的写入口护栏（`WriteEpochGuard`），即"经引擎媒介写入
+        // 张量存储"这件事本身；宿主侧直接摸 span() 不算（铁律 #11 已禁止
+        // 库内那样做）。
+        // 为什么放在**存储对象**上而不是 Tensor 上：Tensor 的拷贝是别名
+        // （共享同一 storage；GPU 还有 with_shape 的零拷贝重贴标签），版本号
+        // 必须随数据走，否则"经别名写入"对原句柄不可见。
+        // 为什么 uint64：量化缓存"变了才重算"的判据是**相等**比较，回绕才会
+        // 出错；2^64 次写实际不可达（即便回绕，也只是多算一次量化，不产生
+        // 错值）。
+        std::uint64_t write_epoch_{0};
+
+    public:
+        [[nodiscard]] std::uint64_t write_epoch() const noexcept { return write_epoch_; }
+
+        // 写版本只前进：整对象替换（拷贝/移动赋值）也必须抬到两端较大者之后，
+        // 否则"替换后恰好等于某个更早的缓存值"会让参数派生物静默用旧值。
+        void mark_content_changed() noexcept { ++write_epoch_; }
+        void inherit_write_epoch_(const MatrixT& other) noexcept
+        {
+            const std::uint64_t base = write_epoch_ > other.write_epoch_ ? write_epoch_
+                                                                        : other.write_epoch_;
+            write_epoch_ = base + 1;
+        }
+
+    private:
+
         [[nodiscard]] constexpr std::size_t index(std::size_t row, std::size_t col) const noexcept
         {
             return row * cols_ + col;
@@ -199,7 +227,8 @@ namespace nn
         }
         MatrixT(MatrixT &&other) noexcept
             : data_(std::move(other.data_)), size_(other.size_),
-              rows_(other.rows_), cols_(other.cols_)
+              rows_(other.rows_), cols_(other.cols_),
+              write_epoch_(other.write_epoch_)
         {
             other.size_ = 0;
             other.rows_ = 0;
@@ -223,6 +252,7 @@ namespace nn
                 size_ = other.size_;
                 rows_ = other.rows_;
                 cols_ = other.cols_;
+                inherit_write_epoch_(other);  // 只前进（见成员注释）
                 other.size_ = 0;
                 other.rows_ = 0;
                 other.cols_ = 0;
@@ -246,6 +276,7 @@ namespace nn
             size_ = n;
             rows_ = rows;
             cols_ = cols;
+            mark_content_changed();           // 内容已变（见 write_epoch_ 注释）
         }
 
         // ── std::span 访问（C++20 现代接口，推荐使用） ────────────────────

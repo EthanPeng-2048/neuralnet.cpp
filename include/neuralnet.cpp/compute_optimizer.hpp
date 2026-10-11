@@ -482,6 +482,186 @@ public:
 };
 
 // ══════════════════════════════════════════════════════════════════════════
+// AdamWQuant — 量化状态的 AdamW（训练显存优化，docs 21 §4.13 的 F5 第一步）
+//
+// **动机**：优化器状态（m/v 各 f32 = 8 B/权重）是训练显存的最大单项 ——
+// 三值层训练账（latent 4 + grad 4 + m/v 8 + 打包权重 0.25 = 16.25 B/权重）里
+// 占 49%。把它砍半，比继续压权重划算得多。
+//
+// **做法（有界尺度 + f16 payload）**：状态只存 f16，但**按行动态缩放**：
+//   m16 = m_real / sm，v16 = v_real / sv（sm/sv 是 (rows,1) f32 尺度）
+// 每步先推进尺度（上界估计，见下），再把新状态一趟融合写回 f16（写回本身
+// 就是 RNE 舍入 → 不需要 DSL 的 round 算子、不需要新的引擎原语）。
+//   · 状态显存：8 B → **4 B/权重**（+ 每行两个 f32 尺度，占 4/cols·2 B/权重，
+//     cols=512 时 0.016 B —— 可忽略）；
+//   · 精度：f16 的 11 bit **相对**精度（处处一致，缩放只为避免"小量级行掉进
+//     非规格化区间"，即 research/f16_weight_decay 否决"直接把状态存 f16"的那
+//     个失效模式）；比 bitsandbytes 的 int8 payload（8 bit 相对精度）更好。
+//
+// **上界估计（为什么不多付一遍遍历）**：m 是凸组合 ⇒
+//     |m_new| ≤ β1·|m_old| + (1-β1)·|g| ⇒ sm_new = β1·sm + (1-β1)·row_max(|g|)·s
+//     v_new   =  β2·v_old + (1-β2)·g²  ⇒ sv_new = β2·sv + (1-β2)·row_max(g²)·s
+// （s = 1.02 安全系数）。尺度**无需先算出新状态**（那需要一个全尺寸 f32 临时量
+// 或一个融合按块内核），只需 g 的行归约（每参数 2 次小 reduce）。
+//
+// **与 bitsandbytes 8-bit Adam 的差别（诚实记录）**：它是 int8 payload + 每块
+// 紧凑 absmax（1 B/状态，需融合按块内核）；本版是 f16 payload + 有界尺度
+// （2 B/状态，零新原语）。再往下的增量是"int8 payload + 打包"：需要 DSL 的
+// `round` 算子（docs 21 §5 的 P3 前置）+ 打包容器（1 字节存储 = M7，或用 f16
+// 容器位打包）。
+//
+// 超参与 AdamW 一致（β1/β2/eps/weight decay 解耦）；`--optimizer adamwquant`。
+// ══════════════════════════════════════════════════════════════════════════
+class AdamWQuant : public Optimizer
+{
+    Scalar lr_;
+    Scalar beta1_;
+    Scalar beta2_;
+    Scalar eps_;
+    Scalar wd_;
+    std::size_t t_ = 0;
+    std::vector<Tensor> m16_;   // f16 一阶矩（按 sm 归一，值域 ≈ [-1,1]）
+    std::vector<Tensor> v16_;   // f16 二阶矩（按 sv 归一，值域 ≈ [0,1]）
+    std::vector<Tensor> sm_;    // (rows,1) f32：|m| 的上界
+    std::vector<Tensor> sv_;    // (rows,1) f32：v 的上界
+    std::size_t state_bytes_ = 0;   // 诊断/实测：状态实际占用（含尺度）
+
+    // 上界安全系数（上界估计的富余；代价 ≤1 bit 精度）与尺度下限（首步 g 全零时
+    // 防 0 除）
+    static constexpr Scalar kSafety = Scalar{1.02};
+    static constexpr Scalar kScaleFloor = Scalar{1e-24};
+
+    [[nodiscard]] Result<void> init_state_()
+    {
+        m16_.reserve(params_.size());
+        v16_.reserve(params_.size());
+        sm_.reserve(params_.size());
+        sv_.reserve(params_.size());
+        for (auto& p : params_)
+        {
+            const std::size_t rows = p.get().rows(), cols = p.get().cols();
+            auto m = engine_.create_tensor(rows, cols, Precision::F16, InitSpec::zero());
+            if (!m.valid()) NN_FAIL("AdamWQuant: 一阶矩状态分配失败");
+            auto v = engine_.create_tensor(rows, cols, Precision::F16, InitSpec::zero());
+            if (!v.valid()) NN_FAIL("AdamWQuant: 二阶矩状态分配失败");
+            auto sm = engine_.create_tensor(rows, 1, Precision::F32, InitSpec::zero());
+            if (!sm.valid()) NN_FAIL("AdamWQuant: 一阶矩尺度分配失败");
+            auto sv = engine_.create_tensor(rows, 1, Precision::F32, InitSpec::zero());
+            if (!sv.valid()) NN_FAIL("AdamWQuant: 二阶矩尺度分配失败");
+            state_bytes_ += rows * cols * 2u * 2u + rows * 4u * 2u;
+            m16_.push_back(std::move(m));
+            v16_.push_back(std::move(v));
+            sm_.push_back(std::move(sm));
+            sv_.push_back(std::move(sv));
+        }
+        return {};
+    }
+
+    // 单个参数的 AdamW 更新（三 K 的结构与 Adam 同族：K1 一阶矩、K2 二阶矩、
+    // K3 参数更新；此处每 K 都多一趟"尺度前进 + f16 归一写回"）
+    [[nodiscard]] Result<void> update_one_(std::size_t i, Scalar inv_bc1, Scalar inv_bc2)
+    {
+        const Tensor& g = grads_[i];
+        const std::size_t rows = g.rows(), cols = g.cols();
+        const Scalar one_m_b1 = Scalar{1} - beta1_;
+        const Scalar one_m_b2 = Scalar{1} - beta2_;
+
+        // ── 尺度前进（上界；只依赖 g，不需要新状态的 f32 副本）──────────────
+        NN_TRY(gabs, dsl::compute_reduce(engine_,
+            dsl::row_reduce_max(dsl::abs(dsl::leaf(g))), rows, cols, Precision::F32));
+        NN_TRY(gmax, dsl::compute_reduce(engine_,
+            dsl::row_reduce_max(dsl::leaf(g) * dsl::leaf(g)), rows, cols, Precision::F32));
+        auto sm_new = dsl::compute(engine_,
+            dsl::max(dsl::leaf(sm_[i]) * dsl::rparam(beta1_)
+                         + dsl::leaf(*gabs) * dsl::rparam(one_m_b1 * kSafety),
+                     kScaleFloor),
+            rows, 1, Precision::F32);
+        NN_TRY_CHECK(sm_new);
+        auto sv_new = dsl::compute(engine_,
+            dsl::max(dsl::leaf(sv_[i]) * dsl::rparam(beta2_)
+                         + dsl::leaf(*gmax) * dsl::rparam(one_m_b2 * kSafety),
+                     kScaleFloor),
+            rows, 1, Precision::F32);
+        NN_TRY_CHECK(sv_new);
+
+        // ── 状态写回（去量化 → 新状态 → ÷新尺度 → f16 RNE 写回，单 dispatch）──
+        auto mw = dsl::compute_into(engine_,
+            (dsl::leaf(m16_[i]) * dsl::row_broadcast(sm_[i]) * dsl::rparam(beta1_)
+             + dsl::leaf(g) * dsl::rparam(one_m_b1))
+                / dsl::row_broadcast(*sm_new),
+            m16_[i]);
+        NN_TRY_CHECK(mw);
+        auto vw = dsl::compute_into(engine_,
+            (dsl::leaf(v16_[i]) * dsl::row_broadcast(sv_[i]) * dsl::rparam(beta2_)
+             + dsl::leaf(g) * dsl::leaf(g) * dsl::rparam(one_m_b2))
+                / dsl::row_broadcast(*sv_new),
+            v16_[i]);
+        NN_TRY_CHECK(vw);
+
+        // ── 尺度提交（写回用的是新尺度，故先换再用）────────────────────────
+        sm_[i] = std::move(*sm_new);
+        sv_[i] = std::move(*sv_new);
+
+        // ── 参数更新（AdamW：weight decay 解耦到 p；偏置修正走 rparam）──────
+        auto upd = dsl::compute_into(engine_,
+            dsl::leaf(params_[i])
+                - dsl::rparam(lr_)
+                      * (dsl::rparam(inv_bc1)
+                             * (dsl::leaf(m16_[i]) * dsl::row_broadcast(sm_[i]))
+                         / (dsl::sqrt(dsl::rparam(inv_bc2)
+                                      * (dsl::leaf(v16_[i]) * dsl::row_broadcast(sv_[i])))
+                            + dsl::rparam(eps_))
+                         + dsl::rparam(wd_) * dsl::leaf(params_[i])),
+            params_[i]);
+        NN_TRY_CHECK(upd);
+        return {};
+    }
+
+public:
+    AdamWQuant(ComputeEngine& engine,
+               std::vector<TensorRef> params,
+               std::vector<TensorRef> grads,
+               Scalar lr,
+               Scalar beta1 = 0.9,
+               Scalar beta2 = 0.999,
+               Scalar eps = 1e-8,
+               Scalar weight_decay = 0.01,
+               PrecisionProfile precision = PrecisionProfile{})
+        : Optimizer(engine, std::move(params), std::move(grads), precision),
+          lr_(lr), beta1_(beta1), beta2_(beta2), eps_(eps), wd_(weight_decay)
+    {
+        auto r = init_state_();
+        if (!r) record_init_error_(r.error());
+    }
+
+    void set_lr(Scalar lr) override { lr_ = lr; }
+
+    [[nodiscard]] Result<void> step() override
+    {
+        NN_TRY(r, check_ready_());
+        NN_TRY(r2, validate_sizes_());
+        const Scalar n = static_cast<Scalar>(t_ + 1);
+        const Scalar inv_bc1 = Scalar{1} / (Scalar{1} - std::pow(beta1_, n));
+        const Scalar inv_bc2 = Scalar{1} / (Scalar{1} - std::pow(beta2_, n));
+        for (std::size_t i = 0; i < params_.size(); ++i)
+        {
+            NN_TRY(u, update_one_(i, inv_bc1, inv_bc2));
+        }
+        ++t_;   // 全部参数成功才推进步数（与 Adam 同款）
+        return {};
+    }
+
+    // ── 诊断 / 测试视图 ───────────────────────────────────────────────────
+    // 状态实际字节数（用于与 f32 Adam 的状态账对拍：后者 = Σ 2·rows·cols·4）
+    [[nodiscard]] std::size_t state_bytes() const noexcept { return state_bytes_; }
+    [[nodiscard]] std::size_t steps() const noexcept { return t_; }
+    [[nodiscard]] const std::vector<Tensor>& moment_state() const noexcept { return m16_; }
+    [[nodiscard]] const std::vector<Tensor>& variance_state() const noexcept { return v16_; }
+    [[nodiscard]] const std::vector<Tensor>& moment_scales() const noexcept { return sm_; }
+    [[nodiscard]] const std::vector<Tensor>& variance_scales() const noexcept { return sv_; }
+};
+
+// ══════════════════════════════════════════════════════════════════════════
 // Newton-Schulz 正交化 — Muon 的核心操作
 //
 // 给定矩阵 G，计算其最近的半正交矩阵 Ortho(G) = U V^T（G = U S V^T 为 SVD）。
@@ -739,6 +919,10 @@ public:
     if (name == "adamw")
         return std::make_unique<AdamW>(engine, std::move(params), std::move(grads), lr,
                                        beta1, beta2, 1e-8, weight_decay, precision);
+    if (name == "adamwquant")
+        return std::make_unique<AdamWQuant>(engine, std::move(params), std::move(grads),
+                                            lr, beta1, beta2, 1e-8, weight_decay,
+                                            precision);
     if (name == "muon")
         return std::make_unique<Muon>(engine, std::move(params), std::move(grads), lr,
                                       0.95f, true, 5, 1e-7f, precision);

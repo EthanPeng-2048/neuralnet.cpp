@@ -535,6 +535,51 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 
 # 引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器
 
+## P3 起步：int8 点积（W2A8）能力探测 + 路线判定（2026-10-11，分支 `dev/t1_58`；原位置 `docs/development/21-quantized-weights.md` §5 的 P3）
+- 类型：能力探测 / 路线判定（先量后承诺）
+- 内容：设备侧查询并启用 `shaderIntegerDotProduct`（Vulkan 1.3 / `VK_KHR_shader_integer_dot_product`），属性位 `integerDotProduct4x8BitPackedSignedAccelerated` 单独记录；暴露 `ComputeEngine::supports_int8_dot()`（门禁）+ `int8_dot_accelerated()`（诊断）+ `NN_VULKAN_NO_INT8_DOT` 逃生阀；dev creation 的 pNext 链改为前插 lambda（原来的多层三元表达式每加一个特性就要重排）。顺带把 `GpuBackend::device()` 只读句柄打开（能力位取值用）。
+- **实测（102/40HX，Turing）：`supports_int8_dot() = true`，硬件加速 = true**（DP4A 可用）。
+- **路线判定（重要，避免走错方向）**：① 本项目 Vulkan 路径**没有张量核**（Turing 不暴露 cooperative matrix）→ BitNet 官方 GPU kernel 的大头收益（int8 wmma）拿不到；② **DP4A 的算力增益为零**（每指令 4 MAC = vec4 FMA 的同量级）→ P3 的收益只能来自"激活 1 B vs f16 2 B"与"把 2-bit 解码折进 DP4A 操作数"；③ 因此准入门槛改为**先做配对微基准**（`matmul_q` vs 未来的 `matmul_q_i8`），量出 (b) 的指令数收益再决定是否写全链路。
+- **设计要点**：激活 int8 沿用三值容器先例（打包字放 f32 张量、`bit_cast` 当原始字）→ **不新增存储精度**（M7 仍不需要）；需要 `quantize_act_i8`（per-列 absmax + round/clamp + 4×int8 打包）+ `matmul_q_i8`（整数累加 + τ_m·s_n 双向量缩放）；文档早先列的"DSL `round` 算子前置"**降级为可选**（手写原语同 `trit_pack` 先例，不需要它）。
+
+## 三值 P2 部署格式：base-3 载荷 + packed-only 只读推理文件（2026-10-11，分支 `dev/t1_58`；原位置 `docs/development/21-quantized-weights.md` §4.11 ② 的"部署期 9.4×"与 §5 的 P2 剩余项）
+- 类型：新能力（部署格式）/ 新 Layer 契约 / 性能 A/B
+- 内容：① **base-3 载荷**（`ternary_pack.hpp`）：5 个三值/字节（`3^5 ≤ 256`），`digit = 码 − 1`，字节 = `Σ digit_i·3^i`；2-bit 容器 ↔ base-3 逐位往返（含非 5 倍数与尾部）。② **独立部署文件格式**（新头 `ternary_deploy.hpp`）：magic `"NNQT"` + 版本 + 精度 + spec kvrec + 参数条目（tag 0/2 = f32/f16 矩阵，与 v5/v6 逐字节同款；tag 4 = 打包三值：encoding/rows/k/τ/payload）+ extra state + tokenizer。**为什么独立 magic**：版本号已抢号（v6 = .nnvocab），且部署文件是**只读**语义（与训练检查点混在一个版本会让 `--resume` 误载不可训练的文件）。③ **`BitLinear` packed-only**：`load_packed_weights` 释放 latent/梯度/稠密缓冲 → 推理足迹 4.25 → 0.25 B/权重；τ 随文件按位载入（重新量化会有 `absmean(trit)·τ` 比例差异）；只读是硬约束（backward 返错、parameters/param_gradients fail-fast）。④ **`Layer::sub_layers()`（新虚函数）**：GPT 的三值层藏在 Block→Attention/FeedForward 内，部署条目要落到正确的层必须能递归；契约 = 子层顺序与 `parameters()` 拼接顺序一致 + 自身参数在前，遍历器逐层核对覆盖数（不一致 fail-fast，绝不静默错位）；实现在 AttentionBase / FeedForward / GPTBlock / GPTModel。⑤ CLI：`text_train --export-deploy`（非三值模型显式拒绝）+ `text_infer`/`mnist_infer` 自动识别两类文件。
+- **实测（102 / 40HX，d256·h8·L4·ff688，60 步合成语料）**：文件 **13 436 025 → 1 126 970 B（11.9×）**；载入部署文件后**贪心输出与原文件逐字节相同**；推理峰值显存 76 MiB（**持平** —— 模型仍按规格建 latent 再被接管，见待办）。
+- **测试**：新 `src/ternary_deploy_test.cpp`（CPU + `--gpu`）：magic 分派 / 两种载荷载入后前向逐位相同 / packed-only 只读语义 / 尺寸账 / 训练文件不被误当部署文件 / **GPT 嵌套层**（12 个 BitLinear 全部 packed-only + 前向逐位相同 + 两侧遍历签名一致）。本机与 102 各 ctest **38/38**。
+- **待办**：① **免 latent 构建**（`ModelSpec.deploy_packed` → `make_linear_layer(..., inference_only)` → BitLinear 跳过 latent 分配）—— 现在只降常驻、不降载入期瞬时峰值（2B4T 上瞬时 = 4 B/权重 × 参数量）；② 小模型部署文件被 f32 词表主导（三值只压缩线性层）；③ 文件无校验和（与 `.bin` 同缺口）。
+
+## 打包 GEMM 的分块改写尝试（2026-10-11，分支 `wip/t158-tiled-gemm`，**未合入主分支**）
+- 类型：性能 A/B / 被否决（暂时）+ bug 根因（两处分块原语的坑）
+- 内容：把 `matmul_q.comp` 改为与 `matmul_tiled.comp` 同构的分块版（A 分块解码一次进共享内存）。**已修**：① 后端 dispatch 网格必须随分块常量改（旧网格 = 64× 多余 workgroup：宽 batch 训练 26.1 s → 2.0 s）；② f16 写出转置错（`acc[j][i]` 应为 `acc[i].x/.y/.z/.w`；f32 路径看不出、f16 训练 loss 炸到 1.4e4）。
+- **性能结论（正向，已实测）**：修正后宽 batch 训练与稠密持平（d256/L4 60 步 2.0 s vs 2.0 s；d512/L8 30 步 5.2 s vs 5.1 s），整卡峰值 570 → 522 MiB（−8.4%）/ 2074 → 1918 MiB（−7.5%）—— "打包在训练期也不亏"的能力已拿到。
+- **未过（阻塞合入）**：`bitnet_struct_test` 的 2B4T 形状 GPT 训练在 GPU 上收敛显著变差（3.49 → 1.35，阈值 0.30）且 CPU/GPU 末步 loss 差 1.33 ⇒ 某些 GPT 形状取值仍错（小形状对拍过了、GPT 形状没过）。故主分支保持"按宽度选址"（宽 batch 走稠密 f16），分块版停 WIP 分支。
+- **教训（协议级）**：闭合世界只保证"结构命中"，不保证"分块 / 网格 / 写出与形状一致" —— 分块原语必须有**跨形状**（尾部块、非整除 K/M/N、GPT 形状）的对拍。
+- **后续（同日，见下一条）**：本条之外还有**第三个**坑 —— dispatch 的**轴向写反**（`gx` 用了 M 而 shader 的 x 是输出列）。修掉后 2B4T 形状 GPT 训练在 GPU 上恢复（3.4447 → 0.0169、CPU/GPU 末步 loss 差 7.7e-4 < 1e-3 阈值），该分支随后合入 `dev/t1_58`；"按宽度选址"被实测结论取代（训练也走打包）。
+
+## 三值 P2 收口：分块解码 GEMM 轴向修复 + 窄 N 打包 GEMV + CPU 行块解码（2026-10-11，分支 `wip/t158-tiled-gemm` → 合入 `dev/t1_58`；原位置 `docs/development/21-quantized-weights.md` §4.12 ⑥ 的"待分块解码 GEMM 重新标定"与 §5 的 P2 剩余项）
+- 类型：bug 根因（静默错值）/ 新原语 / 性能 A/B / 口径更正
+- 内容：① **轴向缺陷**（WIP 卡点根因）：分块版 `matmul_q.comp` 的 `WorkGroupID.x → block_col(N)`，而后端 dispatch 写的是 `(ceil(M/64), ceil(N/64))` → M≠N 的形状只算到 `ceil(N/64)·64` 行；`M=N≤64` 的方形小形状恰好只有 1 个 workgroup、两向重叠 → **既有测试全绿**（2B4T 的 lm_head 只写前 256 行 → GPU 训练取值错、CPU/GPU loss 差 1.33）。修法 = 与 `matmul_tiled`/`batched_matmul` 统一为 `x↔N, y↔M`，并写成分块内核的两条不变量。② **新原语 `matmul_q_gemv.comp`**（N ≤ 8 且 transA=0）：subgroup = 4 行、subgroup 内 lane 沿打包字分片（合并访存）、**subgroupAdd 每 (行,列) 一次 + lane r 写第 r 行**（无 barrier/shared/跨 subgroup 串行求和）；后端 `grid.x = ceil(M/(4·(256/subgroup_size)))` 是布局契约。③ 删掉 `kPackedMaxBatch=8` 启发式 → **训练也走打包**。④ **CPU `matmul_q_impl` 重写**：行块（RB=64）解码到 f32 scratch + 复用 `multiply_to`/`transpose_multiply_to` 稠密微内核（原逐元素直算比稠密慢 ~70×）。⑤ `layer_bench` 加 `matmul_q`/`matmul_q_t`（GFLOPS 可比）+ `matmul_q_bw`/`matmul_q_t_bw`（权重带宽口径）+ `--f16` + `--inner`。
+- **实测（102 / 40HX，f16）**：形状表见 §4.14 —— 打包在**任何 n 上都没打赢稠密 f16**（宽 N 持平~+13%、窄 N 1.1–2.3×），收益在存储/带宽（0.25 B/权重）。端到端：训练 60 步 2.0 s（基线 2.0–2.1 s，3 次重复）、训练显存峰值 **570 → 522 MiB（−8.4%）**、解码 128 token **1.0 → 0.7 s（−30%）**、推理显存 **88 → 76 MiB（−13.6%）**、**CPU** t1_58 81.4 s vs f16 稠密 83.1 s（打平）。①③④三项测试：`ternary_gemm_test` 新增 [6] 跨形状对拍（9 形状 × transA × f32/f16 + GPU 的 2B4T 量级）与 [7] BitLinear 跨形状端到端（含 n=4 GEMV 门内 / n=9 门上）；本机与 102 各 ctest **36/36**。
+- **口径更正**：§4.12 记的"解码 27.1 s → 14.1 s"与 §4.14 同模型实测的 1.0 s 不是同一口径（不同配置/内核）；§4.14 表格是同机同语料同天的可比数据。
+- **被实测否决/保留的取舍**：① "1 行/线程的 GEMV"（更省寄存器、归约更便宜）在 n=8 比 4 行版**慢 2×** → 保留 4 行（B 装载摊销 4 次）；② "把 MAX_N 固定 8 路归约跑满" 改为只归约真实列数；③ 打包要在 GPU 上真正打赢稠密，前提是 **P3（激活 int8 + 整数点积）**——BitNet 官方 GPU kernel 走 `ladder_int8xint2`（W2A8 + 张量核），本项目 Vulkan 路径没有张量核（见 §4.14 诚实结论）。
+- **工具修复**：`bench/run_with_vram.ps1` 的采样器从 `Start-Job` 轮询改为**前台轮询 + 被测程序后台**（job 的 PATH/会话与前台不同，本机实测采到 0 条样本 —— 会让峰值静默变成空值）。
+
+## AdamWQuant：量化状态的 AdamW（2026-10-11，分支 `dev/t1_58`；原位置 `compute_optimizer.hpp`（新类）、`docs/development/21-quantized-weights.md` §4.13 的"F5 待做"）
+- 类型：演进记录 / 性能 A/B / 被否决方案
+- 内容：训练显存的最大单项是优化器状态（m/v 各 f32 = 8 B/权重，三值层账 49%）。新类 `AdamWQuant`：状态存 **f16 + 按行动态缩放**，尺度用**上界估计**推进（`|m_new| ≤ β1|m_old| + (1-β1)|g|`）→ 不需要新状态的 f32 副本，因此**零新原语/零新 shader**（状态写回与参数更新各一趟融合）。`--optimizer adamwquant` + GUI 下拉 + scan 优化器 dry-run 补一条（结构 107 → 113）+ 新测试 `src/adam_quant_test.cpp`（状态账 / 尺度不变式 / 小量级行不下溢 / 零梯度首步 / 与 f32 AdamW 的收敛对齐）。
+- **实测（102 / 40HX，d512·h8·L8·ff2048，t1_58，30 步）**：整卡峰值 **2074 → 1738 MiB（−16.2%）**，墙钟 5.1 → 5.0 s，loss 同量级。
+- **被否决方案（本轮记录）**：① "直接 f16 存 m/v"——绝对值小的状态被舍入吃掉（`research/f16_weight_decay` 已证，本轮设计绕开它的正是按行动态缩放）；② "把状态量化塞进 `Adam` 本身"——改 Adam 会让 f32/f16/t1_58 三条历史基线的数值口径不可复现（docs 21 §4.13 的裁决：开新优化器）。③ "一上来就做 int8 payload + 紧凑 absmax" —— 需要融合的按块内核（新原语 ×2 后端 + 新 shader）与 DSL `round` 算子，先交付"零新原语"的有界尺度版拿到实测数据，再按需推进。
+- **待办**：真实语料上的收敛 A/B（30 步合成语料不是收敛结论）；int8 payload + 打包（状态再砍一半，前置 = DSL `round` + 字节容器）。
+
+## 三值（T1_58）性能优化：写版本缓存 / 惰性梯度 / 打包 GEMM（2026-10-11，分支 `dev/t1_58`；原位置 `docs/development/21-quantized-weights.md` §4.11 的"P1 不省显存"结论、`compute_layer_bitlinear.hpp` 的"每次 forward 重算 τ/wq"、`compute_layer_mlp.hpp` / `compute_layer_bitlinear.hpp` init 里的无条件梯度分配）
+- 类型：演进记录 / 性能 A/B / bug 根因
+- 内容：§4.11 定位出三个代价（每步重算 τ/wq、f16 稠密缓冲 2 B/权重、推理也分配 f32 梯度），本轮四提交落地：**F1** 存储级写版本（`MatrixT`/`GpuBuffer` 持单调 `write_epoch`，`WriteEpochGuard` 覆盖 12 个引擎写入口 + DSL 的 CPU 直写路径经 `TensorAccess::mark_written` 补记）→ τ/wq 只在权重变过时重算；**F4** `1/K` 折进归约操作数（3 pass → 2 pass）；**F6** τ 移出 `activation_cache`（它是权重派生物不是激活）；**F3** 打包三值权重（2 bit/权重、码值 = 三值 + 2，与 microsoft/BitNet `gpu/pack_weight.py` 对齐）+ `trit_pack`/`matmul_q`/`matmul_q_t` 原语 + GPU shader（含 `-DNN_SHADER_F16` 变体）；**F2** 梯度惰性分配（`Linear`/`BitLinear`）。
+- **两个由测试抓到的真 bug**：(a) DSL 在 CPU 上**绕过引擎**直写 dst（`eval_into_tensor_cpu`）→ 优化器更新对量化缓存**不可见**（`write_epoch_test` 的 [1] 逐入口断言抓到）；(b) BitLinear 的 scan dry-run 跑在 CPU 引擎上、默认走打包路径 → **稠密路径的结构不再被任何用例产出**，未接打包的后端（GPU）运行期闭合世界硬报错（`t1_58_test_gpu` 带 key 报错暴露）。修法：scan 里两条路径各 dry-run 一份（结构集回到基线 107 条）。
+- **性能 A/B（102 / 40HX，d256·h8·L4·ff688·seq256·b8 合成语料 60 步）**：训练 2.0 s → 2.0 s、显存 570 → 570 MiB（**零回归**）；解码 128 token **27.1 s → 14.1 s（1.92×）**；推理显存峰值 **88 → 76 MiB（−13.6%）**。
+- **被实测否决/改写的方案**："打包 GEMM 无条件替换 f16 稠密缓冲" —— 强制打包时训练 60 步 **4.0 s vs 基线 2.0 s**（本 shader 按输出元素重复解码，宽 batch 计算受限）。改为**按激活宽度选址**（≤ 8 → 打包，> 8 → 分块 f16 GEMM），阈值是启发式，待分块解码 GEMM 落地后重标定。
+- **F5 裁决**：训练显存的最大单项是优化器状态（m/v = 8 B/权重 = 三值层训练账的 44%），**开新优化器（`AdamW8Bit`）而不是修改 `Adam`** —— 改 Adam 会让 f32/f16/t1_58 三条历史基线的数值口径不可复现（docs 21 §4.13）。
+
 ## 三值（T1_58 / BitLinear）P1 落地（2026-10-10，分支 `dev/t1_58`；原位置 设计文档 `docs/development/21-quantized-weights.md` 的"P1 未实施"状态、`compute_layer_base.hpp` 无能力声明、`compute_optimizer.hpp:344` 用 `p_.param` 建更新量张量）
 - 类型：演进记录 / 设计落地（含 3 处实施期裁定与 1 处缺陷修复）
 - 内容：设计（`21-quantized-weights.md`，2026-10-09 定稿 + 2026-10-10 三项裁定）→ **P1 实施 5 步**：① `Precision::T1_58 = 4` 进枚举并把**提升序从枚举值里拆出**（`precision_rank()`/`precision_has_order()`；`max_precision` 对无序精度 fail-fast）——枚举值从此只是标签；② 层**按槽能力声明**（`PrecisionSet` 位掩码 + `PrecisionSupport` + `Layer::precision_support()` 默认 `{f16,f32}×四槽` + `Layer::layer_name()`），校验落在 `Layer::init` NVI 首步（不兼容 = 初始化期报错：层名+槽位+取值+允许集合），并按 D3(a)/(b) 补 `GPT/RAPT`（含 Block）的 profile 下传、`set_precision_profile` 在已 init 时 fail-fast；③ `BitLinear`（latent/偏置恒 f32、`wq_` f16 三值缓冲 + `tau_` 逐行 absmean 每步重算、forward 去量化点积、backward STE）+ MLP 工厂接线 + `ModelSpec.weight_quant`（KVRecord 追加键，缺键 = None）；④ CLI/GUI 只让 `--precision-param` 收 `t1_58`；⑤ 文档与架构图。
@@ -2522,3 +2567,45 @@ A1 段改动前为 2424）、`include/neuralnet.cpp/compute_cpu_engine.hpp` **23
   原「Tokenize: N docs ...」单行提示删除（进度条自身带百分比）。多线程编码本身**未改**——
   `encode_docs_parallel` 的分块并行（`nn::parallel_for_samples` 保序归位）原样保留，输出
   逐字节不变（`dataset_test` 回归锁定）。
+
+## 库级违规设计清理：模型文件角色 + 参数形态协议 + 引擎能力体系（2026-10-11，docs/development/23）
+
+**整改前的原位置**：`include/neuralnet.cpp/compute_engine.hpp`（6 个能力谓词 + 19 处基类
+NVI 能力分支）、`compute_layer_base.hpp` 的 `Layer::sub_layers()`、`compute_layer_bitlinear.hpp`
+（5 处能力查询 + 4 个部署态守卫）、`ternary_deploy.hpp`（整文件）、`model_serialization.hpp`
+（v6 扁平矩阵序列）、`src/{text,mnist}_{train,infer}.cpp`、`gui.py`、`cli_controllers.py`、
+`bench/gui_cli_audit.py`、`src/ternary_deploy_test.cpp`。
+
+**类型**：删除清单 + 演进记录 + 覆盖缺口。
+
+**删除清单**：① 基类 `supports_native_data_move` / `supports_native_f16_reduce` /
+`supports_expr_precision_variant` / `supports_ternary_gemm` / `supports_int8_dot` /
+`int8_dot_accelerated`（能力改由 `describe()` 的 `EngineInfo` 披露；引擎侧落成私有事实 +
+`*_impl` 内部分支）；② `Layer::sub_layers()`（参数下标转发改走受保护的 `param_children()`）；
+③ `include/neuralnet.cpp/ternary_deploy.hpp` + `src/ternary_deploy_test.cpp`（NNQT 独立
+magic/版本/读写器全套）；④ CLI/GUI 的 `--export-deploy` / 「导出部署文件」行 /
+`cli_controllers.py` 透传 / `gui_cli_audit.py` 用例 / 推理 CLI 的 `is_deployment_file`
+分流分支。
+
+**演进记录**：v6 → **v7**（文件头加 `role` 字节；参数区从"扁平矩阵序列"改为
+`[kind][precision][rows][cols][aux_len][payload_len][aux][payload]` 的**参数级 kind**
+条目）。角色：`.nnmodel` = 推理（三值层写打包形态，盘上 base-3 1.6 bpw + τ）、
+`.nnckpt` = 训练断点（写 f32 latent）；`--save` 默认 `gpt_model.nnmodel`、
+`--save-interval` 写 `.nnckpt`、`--resume` 只认 `.nnckpt`。
+
+**被否决/改写的历史**：① 早先"v7 与引擎能力内敛"稿里的 **NNQT 独立格式 + 部署标签**被裁决
+取消（改成单一 NNNN 格式 + 文件角色）；② 「按 `ExprSpec` 对象身份缓存 key」方案未采用 ——
+F2 的实测瓶颈是**双份归因**（`supports_expr_precision_variant` 每次都算一遍 key/签名，
+`eval_expr_impl` 再算一遍），把选路与边界回退下沉进 `*_impl` 后每次求值只归因一次即可；
+③ 原计划的 `supports_*_` 私有化命名（尾随下划线）未沿用 —— 设备事实直接落成
+`backend_.has_*_pipeline()` 查询，避免新增私有谓词层。
+
+**覆盖缺口（未做）**：P3（激活 int8 + 整数点积全链路：`quantize_act_i8` / `matmul_q_i8` /
+端到端对拍）仍是独立新功能，不在本轮清理范围内（能力探测位已就位，102/40HX 实测可用）；
+"免 latent 构建"（载入 `.nnmodel` 时按角色跳过 latent 分配）也未做 —— 峰值显存因此尚未
+下降（老 NNQT 那组"11.9× 更小 / 峰值持平"的实测数字仍然是本项的口径）。
+
+**落地验收**：102（40HX / clang 23 / Release）全量构建 + ctest **37/37**；新增
+`src/model_roles_test.cpp`（Model 角色只读态 + 前向逐位一致 / Checkpoint 角色 latent
+逐位一致 + 可续训 / 推理文件小于断点文件 / `peek_model_role` / 只读态按断点角色导出报错）
+取代原 `ternary_deploy_test` 的部署格式面。

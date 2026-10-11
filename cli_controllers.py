@@ -799,7 +799,7 @@ class GptTrainController(CLIController):
         
         if "resume_step" in kwargs:
             args.extend(["--resume-step", self._format_arg_value(kwargs["resume_step"])])
-        
+
         # 训练参数
         if "epochs" in kwargs:
             args.extend(["--epochs", self._format_arg_value(kwargs["epochs"])])

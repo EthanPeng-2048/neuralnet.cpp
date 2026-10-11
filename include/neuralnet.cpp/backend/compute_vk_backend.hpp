@@ -248,6 +248,33 @@
 #define NN_CAST_SPV_EMBEDDED
 #endif
 
+// P2/F3：三值打包权重（打包字容器 + 量化 GEMM；见 shaders/trit_pack.comp /
+// matmul_q.comp 与 include/neuralnet.cpp/ternary_pack.hpp）
+#if __has_include("trit_pack_spv.hpp")
+#include "trit_pack_spv.hpp"
+#define NN_TRIT_PACK_SPV_EMBEDDED
+#endif
+
+#if __has_include("matmul_q_spv.hpp")
+#include "matmul_q_spv.hpp"
+#define NN_MATMUL_Q_SPV_EMBEDDED
+#endif
+
+#if __has_include("matmul_q_f16_spv.hpp")
+#include "matmul_q_f16_spv.hpp"
+#define NN_MATMUL_Q_F16_SPV_EMBEDDED
+#endif
+
+#if __has_include("matmul_q_gemv_spv.hpp")
+#include "matmul_q_gemv_spv.hpp"
+#define NN_MATMUL_Q_GEMV_SPV_EMBEDDED
+#endif
+
+#if __has_include("matmul_q_gemv_f16_spv.hpp")
+#include "matmul_q_gemv_f16_spv.hpp"
+#define NN_MATMUL_Q_GEMV_F16_SPV_EMBEDDED
+#endif
+
 // AOT 融合 shader 注册表（构建期 scan_exprs 收集 + gen_fused 合成；表达式
 // 只出现在 Layer，本表是折叠后的派生物）。运行时按 expr_spec_key 匹配 dispatch。
 //
@@ -295,7 +322,18 @@ private:
     MemoryPool::Allocation alloc_;
     observer_ptr<MemoryPool> pool_;
 
+    // ── 写版本（write epoch）──────────────────────────────────────────────
+    // 与 MatrixT 的 write_epoch_ 同义（见 algebra_matrix.hpp 的说明）：内容
+    // "可能已经变了"的单调计数，唯一推进入口 = ComputeEngine 的写入口护栏。
+    // 放在 GpuBuffer（而不是 GpuTensorT）上：GpuTensorT 存在零拷贝重贴标签
+    // （with_shape）与 import 别名，同一块显存可能有多个 GpuTensorT 句柄 ——
+    // 版本必须随真正存放数据的 buffer 走。
+    std::uint64_t write_epoch_{0};
+
 public:
+    [[nodiscard]] std::uint64_t write_epoch() const noexcept { return write_epoch_; }
+    void mark_content_changed() noexcept { ++write_epoch_; }
+
     GpuBuffer() = default;
 
     GpuBuffer(VkDevice device, VkBuffer buffer, const MemoryPool::Allocation& alloc, MemoryPool& pool)
@@ -307,7 +345,8 @@ public:
 
     // 移动语义
     GpuBuffer(GpuBuffer&& o) noexcept
-        : device_(o.device_), buffer_(o.buffer_), alloc_(o.alloc_), pool_(o.pool_)
+        : device_(o.device_), buffer_(o.buffer_), alloc_(o.alloc_), pool_(o.pool_),
+          write_epoch_(o.write_epoch_)
     {
         o.device_ = VK_NULL_HANDLE;
         o.buffer_ = VK_NULL_HANDLE;
@@ -323,6 +362,7 @@ public:
             std::swap(buffer_, o.buffer_);
             std::swap(alloc_, o.alloc_);
             pool_.swap(o.pool_);
+            std::swap(write_epoch_, o.write_epoch_);
         }
         return *this;
     }
@@ -540,6 +580,13 @@ private:
     VulkanPipeline outer_col_f16_pipeline_;
     // 通用精度转换原语（engine.cast 的 GPU 实现；f16↔f32，kind 分派精度对）
     VulkanPipeline cast_pipeline_;
+    // 三值打包原语（P2/F3）：打包字容器 + 量化 GEMM（f32 / f16 存储两版）
+    VulkanPipeline trit_pack_pipeline_;
+    VulkanPipeline matmul_q_pipeline_;
+    VulkanPipeline matmul_q_f16_pipeline_;
+    // 窄 N（N ≤ 8）打包 GEMV（解码主路径；同 matmul_gemv 的 subgroup 归约）
+    VulkanPipeline matmul_q_gemv_pipeline_;
+    VulkanPipeline matmul_q_gemv_f16_pipeline_;
     // AOT 融合 shader pipelines（key = expr_spec_key → pipeline；由构建期
     // fused_registry.hpp 注册，运行时按 key 匹配后直接 dispatch）
     std::unordered_map<std::string, VulkanPipeline> fused_pipelines_;
@@ -1049,6 +1096,57 @@ private:
 #endif
     }
 
+    [[nodiscard]] static const std::vector<uint32_t>& get_trit_pack_spirv()
+    {
+#ifdef NN_TRIT_PACK_SPV_EMBEDDED
+        return nn_trit_pack_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_matmul_q_spirv()
+    {
+#ifdef NN_MATMUL_Q_SPV_EMBEDDED
+        return nn_matmul_q_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_matmul_q_f16_spirv()
+    {
+#ifdef NN_MATMUL_Q_F16_SPV_EMBEDDED
+        return nn_matmul_q_f16_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    // 窄 N（GEMV）打包内核（P2/F3）：与 matmul_gemv 同骨（subgroup 归约）
+    [[nodiscard]] static const std::vector<uint32_t>& get_matmul_q_gemv_spirv()
+    {
+#ifdef NN_MATMUL_Q_GEMV_SPV_EMBEDDED
+        return nn_matmul_q_gemv_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
+    [[nodiscard]] static const std::vector<uint32_t>& get_matmul_q_gemv_f16_spirv()
+    {
+#ifdef NN_MATMUL_Q_GEMV_F16_SPV_EMBEDDED
+        return nn_matmul_q_gemv_f16_spirv_bytecode();
+#else
+        static const std::vector<uint32_t> empty;
+        return empty;
+#endif
+    }
+
     // ── AOT 融合 shader SPIR-V 来自构建期生成的 fused_registry.hpp ────────
     // （FusedShader 直接携带内联 SPIR-V，无需按名 getter；注册在 init 时遍历）
 
@@ -1092,6 +1190,10 @@ public:
     // 设备丢失状态
     bool device_lost_ = false;
     [[nodiscard]] bool is_device_lost() const noexcept { return device_lost_; }
+
+    // ── 设备能力直读（P3 门禁等：int8 点积特性在设备创建时已查询/启用）────
+    // 只读句柄：调用方（GpuEngine）据此暴露 `supports_int8_dot()` 等能力位。
+    [[nodiscard]] const VulkanDevice& device() const noexcept { return device_; }
 
     // 禁止拷贝和移动
     GpuBackend(const GpuBackend&) = delete;
@@ -1712,6 +1814,51 @@ public:
                 cast_pipeline_ = std::move(*cast_r);
         }
 
+        // 15b. 三值打包权重（P2/F3）：trit_pack（3 缓冲 + push{rows,k,wpr}）与
+        //      matmul_q（4 缓冲 + push{M,N,K,transA,wpr}）。f16 存储变体在设备
+        //      支持 16 位存储时才建（否则 BitLinear 走 f16 稠密路径）。
+        {
+            const auto& tp = get_trit_pack_spirv();
+            if (!tp.empty())
+            {
+                auto r = VulkanPipeline::create_generic(
+                    device_.device(), tp, 3, 3u * sizeof(uint32_t));
+                if (r) trit_pack_pipeline_ = std::move(*r);
+            }
+            const auto& mq = get_matmul_q_spirv();
+            if (!mq.empty())
+            {
+                auto r = VulkanPipeline::create_generic(
+                    device_.device(), mq, 4, 5u * sizeof(uint32_t));
+                if (r) matmul_q_pipeline_ = std::move(*r);
+            }
+            if (device_.has_16bit_storage())
+            {
+                const auto& mq16 = get_matmul_q_f16_spirv();
+                if (!mq16.empty())
+                {
+                    auto r = VulkanPipeline::create_generic(
+                        device_.device(), mq16, 4, 5u * sizeof(uint32_t));
+                    if (r) matmul_q_f16_pipeline_ = std::move(*r);
+                }
+                const auto& mqg16 = get_matmul_q_gemv_f16_spirv();
+                if (!mqg16.empty())
+                {
+                    auto r = VulkanPipeline::create_generic(
+                        device_.device(), mqg16, 4, 5u * sizeof(uint32_t));
+                    if (r) matmul_q_gemv_f16_pipeline_ = std::move(*r);
+                }
+            }
+            // 窄 N 打包 GEMV（f32 版；与 matmul_q 同 4 binding / 5×4B push）
+            const auto& mqg = get_matmul_q_gemv_spirv();
+            if (!mqg.empty())
+            {
+                auto r = VulkanPipeline::create_generic(
+                    device_.device(), mqg, 4, 5u * sizeof(uint32_t));
+                if (r) matmul_q_gemv_pipeline_ = std::move(*r);
+            }
+        }
+
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
         // 16. 注册 AOT 融合 shader pipelines（构建期 scan_exprs 收集 +
         //     fused_generate.hpp 合成）。条目形态：
@@ -1844,6 +1991,12 @@ public:
     [[nodiscard]] bool has_outer_col_pipeline() const noexcept { return outer_col_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_outer_col_f16_pipeline() const noexcept { return outer_col_f16_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_cast_pipeline() const noexcept { return cast_pipeline_.handle() != VK_NULL_HANDLE; }
+    // 三值打包能力（P2/F3）：打包 + 量化 GEMM 两个 pipeline 都在才算接通
+    [[nodiscard]] bool has_trit_pack_pipeline() const noexcept { return trit_pack_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_matmul_q_pipeline() const noexcept { return matmul_q_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_matmul_q_f16_pipeline() const noexcept { return matmul_q_f16_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_matmul_q_gemv_pipeline() const noexcept { return matmul_q_gemv_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_matmul_q_gemv_f16_pipeline() const noexcept { return matmul_q_gemv_f16_pipeline_.handle() != VK_NULL_HANDLE; }
 
     // ── f16 硬件能力查询（§7.1）────────────────────────────────────
     [[nodiscard]] bool has_shader_float16() const noexcept { return has_shader_float16_; }
@@ -4332,6 +4485,205 @@ public:
         const std::uint32_t wg = static_cast<std::uint32_t>((pairs + 255u) / 256u);
         vkCmdDispatch(cmd, wg < 1u ? 1u : wg, 1u, 1u);
         record_output_barrier(cmd, dst.impl());
+
+        if (owns_cmd)
+        {
+            auto r = submit_and_wait(cmd, desc_set);
+            NN_TRY_CHECK(r);
+        }
+        return {};
+    }
+
+    // ── 三值打包（P2/F3）：W (rows,k) f32 + τ (rows) f32 → 打包字 (rows,wpr) ──
+    [[nodiscard]] Result<void> trit_pack_gpu(
+        const GpuBuffer& w, const GpuBuffer& tau, const GpuBuffer& packed,
+        std::uint32_t rows, std::uint32_t k, std::uint32_t wpr)
+    {
+        if (!initialized_)
+            NN_FAIL("GPU backend not initialized");
+        if (!has_trit_pack_pipeline())
+            NN_FAIL("trit_pack_gpu: trit_pack pipeline not available");
+        auto ds_r = alloc_desc_set(trit_pack_pipeline_.descriptor_layout());
+        NN_TRY_CHECK(ds_r);
+        VkDescriptorSet desc_set = *ds_r;
+
+        VkDescriptorBufferInfo binfo[3] = {
+            {w.impl(), 0, VK_WHOLE_SIZE},
+            {tau.impl(), 0, VK_WHOLE_SIZE},
+            {packed.impl(), 0, VK_WHOLE_SIZE},
+        };
+        VkWriteDescriptorSet writes[3];
+        for (std::uint32_t i = 0; i < 3; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].pNext = nullptr;
+            writes[i].dstSet = desc_set;
+            writes[i].dstBinding = i;
+            writes[i].dstArrayElement = 0;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pImageInfo = nullptr;
+            writes[i].pBufferInfo = &binfo[i];
+            writes[i].pTexelBufferView = nullptr;
+        }
+        vkUpdateDescriptorSets(device_.device(), 3, writes, 0, nullptr);
+
+        auto cmd_r = acquire_cmd();
+        if (!cmd_r)
+        {
+            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            NN_TRY_CHECK(cmd_r);
+        }
+        auto [cmd, owns_cmd] = *cmd_r;
+
+        std::vector<VkBuffer> in_bufs{w.impl(), tau.impl()};
+        record_input_barriers(cmd, in_bufs);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, trit_pack_pipeline_.handle());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            trit_pack_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+
+        struct Push { std::uint32_t rows; std::uint32_t k; std::uint32_t wpr; };
+        Push push{rows, k, wpr};
+        std::vector<std::uint8_t> pc(sizeof(push));
+        std::memcpy(pc.data(), &push, sizeof(push));
+        vkCmdPushConstants(cmd, trit_pack_pipeline_.pipeline_layout(),
+            VK_SHADER_STAGE_COMPUTE_BIT, 0,
+            static_cast<uint32_t>(pc.size()), pc.data());
+
+        const std::uint32_t total = rows * wpr;
+        const std::uint32_t wg = (total + 255u) / 256u;
+        vkCmdDispatch(cmd, wg < 1u ? 1u : wg, 1u, 1u);
+        record_output_barrier(cmd, packed.impl());
+
+        if (owns_cmd)
+        {
+            auto r = submit_and_wait(cmd, desc_set);
+            NN_TRY_CHECK(r);
+        }
+        return {};
+    }
+
+    // ── 量化 GEMM（P2/F3）：C = (τ∘A)^(T)·B（A 为打包三值）────────────────
+    // f16 = true 时用 f16 存储变体（B/C 均为 half），否则全 f32。
+    [[nodiscard]] Result<void> matmul_q_gpu(
+        const GpuBuffer& packed, const GpuBuffer& tau, const GpuBuffer& b,
+        const GpuBuffer& c, std::uint32_t M, std::uint32_t N, std::uint32_t K,
+        std::uint32_t transA, std::uint32_t wpr, bool f16)
+    {
+        if (!initialized_)
+            NN_FAIL("GPU backend not initialized");
+        // ── 选址（与稠密 matmul 同口径，实测驱动；docs 21 §4.12）──────────
+        //   窄 N（≤ GEMV_MAX_N）→ **GEMV 内核**：分块版按 64×64 块算，n=1 时
+        //   63/64 列空转（102/40HX 实测打包侧权重带宽只有 2.9 GB/s vs 稠密
+        //   GEMV 97 GB/s）→ 解码路必须走"每线程沿打包字分片 + 只算真实列"。
+        //   宽 N（训练）→ 分块内核（分块解码一次进 shared，计算受限）。
+        //   GEMV 只在 transA=0（转发形态）实现。**布局契约**：shader 里每个
+        //   subgroup 负责 RPS=4 行（`m0 = (WGID.x*gl_NumSubgroups + SubgroupID)*4`），
+        //   故 grid.x 必须 = ceil(M / (4*(256/subgroup_size)))，且 256 必须被
+        //   subgroup_size 整除（否则 gl_NumSubgroups 与 host 侧算出不一致）。
+        //   设备侧 subgroup≥4 是红线（shader 的 subgroupAdd 归约语义）。
+        constexpr std::uint32_t QGEMV_MAX_N = 8u;
+        constexpr std::uint32_t QGEMV_THREADS = 256u;   // 与 matmul_q_gemv.comp 的 local_size_x 一致
+        constexpr std::uint32_t QGEMV_RPS = 4u;         // 与 matmul_q_gemv.comp 的 RPS 一致
+        const std::uint32_t sgs = device_.subgroup_size();
+        const bool qgemv_layout_ok = sgs >= 4u && sgs <= QGEMV_THREADS
+                                     && (QGEMV_THREADS % sgs) == 0u;
+        const std::uint32_t qgemv_rows =
+            qgemv_layout_ok ? (QGEMV_THREADS / sgs) * QGEMV_RPS : 0u;
+        const bool use_gemv = (transA == 0u) && N <= QGEMV_MAX_N && qgemv_layout_ok
+                              && has_matmul_q_gemv_pipeline()
+                              && (!f16 || has_matmul_q_gemv_f16_pipeline());
+        const VulkanPipeline* pipe = nullptr;
+        if (use_gemv)
+            pipe = f16 ? &matmul_q_gemv_f16_pipeline_ : &matmul_q_gemv_pipeline_;
+        else if (f16)
+        {
+            if (!has_matmul_q_f16_pipeline())
+                NN_FAIL("matmul_q_gpu: f16 pipeline not available（设备缺 16 位存储？）");
+            pipe = &matmul_q_f16_pipeline_;
+        }
+        else
+        {
+            if (!has_matmul_q_pipeline())
+                NN_FAIL("matmul_q_gpu: matmul_q pipeline not available");
+            pipe = &matmul_q_pipeline_;
+        }
+        auto ds_r = alloc_desc_set(pipe->descriptor_layout());
+        NN_TRY_CHECK(ds_r);
+        VkDescriptorSet desc_set = *ds_r;
+
+        VkDescriptorBufferInfo binfo[4] = {
+            {packed.impl(), 0, VK_WHOLE_SIZE},
+            {tau.impl(), 0, VK_WHOLE_SIZE},
+            {b.impl(), 0, VK_WHOLE_SIZE},
+            {c.impl(), 0, VK_WHOLE_SIZE},
+        };
+        VkWriteDescriptorSet writes[4];
+        for (std::uint32_t i = 0; i < 4; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].pNext = nullptr;
+            writes[i].dstSet = desc_set;
+            writes[i].dstBinding = i;
+            writes[i].dstArrayElement = 0;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pImageInfo = nullptr;
+            writes[i].pBufferInfo = &binfo[i];
+            writes[i].pTexelBufferView = nullptr;
+        }
+        vkUpdateDescriptorSets(device_.device(), 4, writes, 0, nullptr);
+
+        auto cmd_r = acquire_cmd();
+        if (!cmd_r)
+        {
+            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            NN_TRY_CHECK(cmd_r);
+        }
+        auto [cmd, owns_cmd] = *cmd_r;
+
+        std::vector<VkBuffer> in_bufs{packed.impl(), tau.impl(), b.impl()};
+        record_input_barriers(cmd, in_bufs);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->handle());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipe->pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+
+        struct Push {
+            std::uint32_t M, N, K, transA, wpr;
+        };
+        Push push{M, N, K, transA, wpr};
+        std::vector<std::uint8_t> pc(sizeof(push));
+        std::memcpy(pc.data(), &push, sizeof(push));
+        vkCmdPushConstants(cmd, pipe->pipeline_layout(),
+            VK_SHADER_STAGE_COMPUTE_BIT, 0,
+            static_cast<uint32_t>(pc.size()), pc.data());
+
+        // 分块版 matmul_q.comp：16×16 线程 / 输出块 64×64（BM=BN=64）。
+        // ⚠ 两条不变量（分块内核的"形状契约"，漏掉任一条都是**静默错值**）：
+        //   1. 网格必须与 shader 的分块常量一致：写少了漏算、写多了重复算
+        //      （正确但成倍变慢 —— 实测错误网格下宽 batch 训练慢 13×）。
+        //   2. **轴向必须对齐**：shader 里 x → block_col（N 方向）、y →
+        //      block_row（M 方向），与 matmul_tiled / batched_matmul 同一约定
+        //      （两者 dispatch 均为 `(ceil(N/64), ceil(M/64), 1)`）。写成
+        //      `(ceil(M/64), ceil(N/64))` 会让 M≠N 的形状只算到
+        //      `ceil(N/64)*64` 行 / `ceil(M/64)*64` 列 —— 方形小形状
+        //      （M=N≤64，单 workgroup）恰好正确，故此缺陷只在真实形状上暴露
+        //      （2B4T 的 lm_head M=128256 只算到前 256 行）。
+        if (use_gemv)
+        {
+            // 单维 grid.x = ceil(M/qgemv_rows)；qgemv_rows 见上面的布局契约注释
+            const std::uint32_t gw = (M + qgemv_rows - 1u) / qgemv_rows;
+            vkCmdDispatch(cmd, gw < 1u ? 1u : gw, 1u, 1u);
+        }
+        else
+        {
+            const std::uint32_t gx = (N + 63u) / 64u;   // x ↔ 输出列（N）
+            const std::uint32_t gy = (M + 63u) / 64u;   // y ↔ 输出行（M）
+            vkCmdDispatch(cmd, gx < 1u ? 1u : gx, gy < 1u ? 1u : gy, 1u);
+        }
+        record_output_barrier(cmd, c.impl());
 
         if (owns_cmd)
         {

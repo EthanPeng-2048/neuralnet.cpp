@@ -85,6 +85,16 @@ private:
     // 的前提。与 has_16bit_storage_ 独立：只有存储没 ALU 的设备仍走"f16 存储 +
     // f32 算术"变体；两者齐备才启用"f16 直算"变体。
     bool has_shader_float16_ = false;
+    // ── int8 点积（P3，W2A8）───────────────────────────────────────────────
+    // `VK_KHR_shader_integer_dot_product` / Vulkan 1.3 核心特性：shader 里可用
+    // `dotPacked4x8EXT`（DP4A 语义：4×int8 打包点积 → int32）。两个事实分开记：
+    //   · has_int8_dot_        = 特性已查询且已在设备创建时启用（能不能用）
+    //   · int8_dot_accelerated_ = 驱动报告 `integerDotProduct4x8BitPackedSigned
+    //                             Accelerated`（硬件 DP4A 加速，还是软件展开）
+    // 只有前者为真才允许创建 int8 点积 shader 变体；后者用于诊断/选址（软件
+    // 展开的 int8 点积在带宽上仍占优、算力上不占优）。
+    bool has_int8_dot_ = false;
+    bool int8_dot_accelerated_ = false;
     uint32_t subgroup_size_ = 4;  // 计算队列 subgroup 尺寸——matmul_gemv 的
                                   // red[..][64] 容量前提（256/subgroup≤64）；
                                   // VK1.1 查询失败按 4 兜底，见 initialize
@@ -366,6 +376,35 @@ public:
             has_shader_float16_ = false;
         if (!has_shader_float16_)
             f16alu.shaderFloat16 = VK_FALSE;
+
+        // ── int8 点积（P3，W2A8）：查询 + 启用 shaderIntegerDotProduct ──────
+        // VK_KHR_shader_integer_dot_product（Vulkan 1.3 核心）。Turing+ 的 DP4A
+        // 是硬件指令；查询属性区分"硬件加速"与"驱动软件展开"。
+        // 查不到/不加速都不影响正确性 —— 只是决定 P3 内核是否值得创建。
+        VkPhysicalDeviceShaderIntegerDotProductFeatures int8dot{};
+        int8dot.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES;
+        if (app_info.apiVersion >= VK_API_VERSION_1_2)
+        {
+            VkPhysicalDeviceFeatures2 q{};
+            q.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            q.pNext = &int8dot;
+            vkGetPhysicalDeviceFeatures2(physical_device_, &q);
+            has_int8_dot_ = (int8dot.shaderIntegerDotProduct == VK_TRUE);
+
+            VkPhysicalDeviceShaderIntegerDotProductProperties props{};
+            props.sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES;
+            VkPhysicalDeviceProperties2 p2{};
+            p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            p2.pNext = &props;
+            vkGetPhysicalDeviceProperties2(physical_device_, &p2);
+            int8_dot_accelerated_ = (props.integerDotProduct4x8BitPackedSignedAccelerated ==
+                                     VK_TRUE);
+        }
+        if (!get_env("NN_VULKAN_NO_INT8_DOT").empty())
+            has_int8_dot_ = false;
+        if (!has_int8_dot_)
+            int8dot.shaderIntegerDotProduct = VK_FALSE;
         // 查询阶段把整个结构体清零后可能置 VK_TRUE；非启用分支必须显式关掉，
         // 避免把未启用的特性声明进 pNext（校验层 VUID-VkDeviceCreateInfo 系列）。
         f16alu.shaderInt8 = VK_FALSE;   // 本库不用 int8 ALU，恒不启用
@@ -379,30 +418,21 @@ public:
 
         VkDeviceCreateInfo device_info{};
         device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-        // pNext 链：16 位 ALU（若启用）→ 16 位存储（若支持）→ 时间线信号量（若支持）
+        // pNext 链：按需串起"已启用的特性"（链上顺序无语义，这里统一用前插，
+        // 免得每加一个特性都要重排多层三元表达式 —— 之前那种写法已经很难读了）
         VkBaseInStructure* chain = nullptr;
-        storage16.pNext = nullptr;
+        const auto link = [&chain](VkBaseInStructure* node) {
+            node->pNext = chain;
+            chain = node;
+        };
         if (timeline_semaphores_)
-        {
-            timeline_features.pNext = nullptr;
-            // Vulkan 的 pNext 为 void*（非 const）→ 用非 const 指针链入
-            storage16.pNext = reinterpret_cast<VkBaseInStructure*>(&timeline_features);
-        }
-        f16alu.pNext = nullptr;
+            link(reinterpret_cast<VkBaseInStructure*>(&timeline_features));
+        if (has_16bit_storage_)
+            link(reinterpret_cast<VkBaseInStructure*>(&storage16));
         if (has_shader_float16_)
-        {
-            // f16 ALU 头：其后接 storage16（若启用）或 timeline（若启用）
-            f16alu.pNext = has_16bit_storage_
-                ? reinterpret_cast<VkBaseInStructure*>(&storage16)
-                : (timeline_semaphores_
-                       ? reinterpret_cast<VkBaseInStructure*>(&timeline_features)
-                       : nullptr);
-            chain = reinterpret_cast<VkBaseInStructure*>(&f16alu);
-        }
-        else if (has_16bit_storage_)
-            chain = reinterpret_cast<VkBaseInStructure*>(&storage16);
-        else if (timeline_semaphores_)
-            chain = reinterpret_cast<VkBaseInStructure*>(&timeline_features);
+            link(reinterpret_cast<VkBaseInStructure*>(&f16alu));
+        if (has_int8_dot_)
+            link(reinterpret_cast<VkBaseInStructure*>(&int8dot));
         device_info.pNext = chain;
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;
@@ -426,6 +456,10 @@ public:
     [[nodiscard]] bool has_16bit_storage() const noexcept { return has_16bit_storage_; }
     // f16 ALU（shaderFloat16）是否已启用：原生 f16 算术 shader 前提
     [[nodiscard]] bool has_shader_float16() const noexcept { return has_shader_float16_; }
+    // int8 点积（P3/W2A8）：特性已启用（shader 可用 dotPacked4x8EXT）
+    [[nodiscard]] bool has_int8_dot() const noexcept { return has_int8_dot_; }
+    // 硬件 DP4A 加速（false = 驱动软件展开：带宽有收益、算力无收益）
+    [[nodiscard]] bool int8_dot_accelerated() const noexcept { return int8_dot_accelerated_; }
     // 所选物理设备名（"NVIDIA CMP 40HX" 等；初始化前为空）
     [[nodiscard]] const std::string& device_name() const noexcept { return device_name_; }
     // 计算队列 subgroup 尺寸（初始化前 = 兜底值 4；GEMV 分派门禁用）

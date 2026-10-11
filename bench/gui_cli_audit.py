@@ -44,8 +44,12 @@ HELP_CALL_RE = re.compile(r"\bhelp\s*\.\s*(usage|text|section|note|item|opt|flus
 EXES = ["mnist_train", "mnist_infer", "text_train", "text_infer",
         "tokenizer_train", "tokenizer_infer"]
 
-# ── 有意不暴露在 GUI 的 CLI 参数（GUI 本身即交互外壳）──
-INTENTIONAL_GAPS = {"--interactive"}
+# ── 有意不暴露在 GUI 的 CLI 参数 ──
+#   --interactive : GUI 本身即交互外壳
+#   --t1_58       : 三值预设的**别名**（等价 --precision-param t1_58）；GUI 的
+#                   "精度预设"下拉填的是 precision_param 字段，三条命令在
+#                   docs/development/21 §4.10 里已声明等价，故此处不算缺口
+INTENTIONAL_GAPS = {"--interactive", "--t1_58"}
 
 
 def cli_help_flags(exe: str) -> set[str]:
@@ -110,9 +114,6 @@ CASES.append(("text_train", GptTrainController(), dict(
        "lr_per_epoch": "0.001"})))
 CASES.append(("text_train", GptTrainController(), dict(
     model="gpt", text_file="t.txt", f16=True, max_steps=5)))
-CASES.append(("text_train", GptTrainController(), dict(
-    model="gpt", text_file="t.txt", t1_58=True, max_steps=5)))
-
 CASES.append(("text_infer", GptInferController(), dict(
     model="g.bin", vocab="v.json", prompt="hello", max_tokens=200,
     temperature=1.0, gpu=True, show_tokens=True)))
