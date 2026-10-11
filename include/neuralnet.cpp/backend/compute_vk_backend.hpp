@@ -4582,12 +4582,19 @@ public:
             VK_SHADER_STAGE_COMPUTE_BIT, 0,
             static_cast<uint32_t>(pc.size()), pc.data());
 
-        // 分块版 matmul_q.comp：16×16 线程 / 输出块 64×64（BM=BN=64）
-        // ⚠ 这里的网格必须与 shader 的分块常量一致：写少了会漏算，写多了
-        // 会让多个 workgroup 重复算同一块（正确但成倍变慢 —— 实测不改这里
-        // 宽 batch 训练慢 13×）。
-        const std::uint32_t gx = (M + 63u) / 64u;
-        const std::uint32_t gy = (N + 63u) / 64u;
+        // 分块版 matmul_q.comp：16×16 线程 / 输出块 64×64（BM=BN=64）。
+        // ⚠ 两条不变量（分块内核的"形状契约"，漏掉任一条都是**静默错值**）：
+        //   1. 网格必须与 shader 的分块常量一致：写少了漏算、写多了重复算
+        //      （正确但成倍变慢 —— 实测错误网格下宽 batch 训练慢 13×）。
+        //   2. **轴向必须对齐**：shader 里 x → block_col（N 方向）、y →
+        //      block_row（M 方向），与 matmul_tiled / batched_matmul 同一约定
+        //      （两者 dispatch 均为 `(ceil(N/64), ceil(M/64), 1)`）。写成
+        //      `(ceil(M/64), ceil(N/64))` 会让 M≠N 的形状只算到
+        //      `ceil(N/64)*64` 行 / `ceil(M/64)*64` 列 —— 方形小形状
+        //      （M=N≤64，单 workgroup）恰好正确，故此缺陷只在真实形状上暴露
+        //      （2B4T 的 lm_head M=128256 只算到前 256 行）。
+        const std::uint32_t gx = (N + 63u) / 64u;   // x ↔ 输出列（N）
+        const std::uint32_t gy = (M + 63u) / 64u;   // y ↔ 输出行（M）
         vkCmdDispatch(cmd, gx < 1u ? 1u : gx, gy < 1u ? 1u : gy, 1u);
         record_output_barrier(cmd, c.impl());
 
